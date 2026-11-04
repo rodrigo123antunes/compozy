@@ -1,0 +1,214 @@
+package globaldb
+
+import (
+	"database/sql"
+	"encoding/json"
+	"fmt"
+	"time"
+
+	looppkg "github.com/compozy/compozy/internal/loop"
+	"github.com/compozy/compozy/internal/store"
+	"github.com/compozy/compozy/internal/store/globaldb/sqlcgen"
+)
+
+func loopRunInsertParams(
+	run looppkg.Run,
+	inputsJSON []byte,
+	metadataJSON []byte,
+) sqlcgen.InsertLoopRunParams {
+	return sqlcgen.InsertLoopRunParams{
+		GrantCeiling:            run.GrantCeilingSnapshot(),
+		ProfileID:               run.ProfileID,
+		ID:                      string(run.ID),
+		WorkspaceID:             string(run.WorkspaceID),
+		LoopName:                run.LoopName,
+		Status:                  string(run.Status),
+		Historical:              int64(boolToInt(run.Historical)),
+		Generation:              int64(run.Generation),
+		ReattemptStrategy:       string(run.ReattemptStrategy),
+		CreatedAt:               store.FormatTimestamp(run.CreatedAt),
+		StartedAt:               store.FormatTimestamp(run.StartedAt),
+		LastProgressAt:          run.LastProgressAt,
+		DefinitionVersion:       int64(run.DefinitionVersion),
+		DefinitionDigest:        run.DefinitionDigest,
+		ActiveGateID:            string(run.ActiveGateID),
+		ActiveHumanCriteriaJson: string(run.ActiveHumanCriteriaValue()),
+		BudgetApprovalSeq:       int64(run.BudgetApprovalSeq),
+		StartMetadataJson:       string(metadataJSON),
+		IterationCap:            int64(run.IterationCap),
+		BudgetTokens:            int64(run.BudgetTokens),
+		BudgetWallSec:           int64(run.BudgetWallSec),
+		BudgetOnExceeded:        string(run.BudgetOnExceeded),
+		TokensUsed:              run.TokensUsed,
+		ParentLoopRunID:         nullString(string(run.ParentLoopRunID)),
+		PauseRequested:          int64(boolToInt(run.PauseRequested)),
+		InputsJson:              string(inputsJSON),
+		StartedByKind:           string(run.StartedBy.Kind),
+		StartedByRef:            run.StartedBy.Ref,
+		StartedOriginKind:       string(run.StartedOrigin.Kind),
+		StartedOriginRef:        run.StartedOrigin.Ref,
+		GoalContextNudgeRatio:   run.GoalContextNudgeRatio,
+		OriginKind:              string(run.Origin.Kind),
+		OriginSessionID: nullString(
+			run.Origin.SessionID,
+		),
+		OriginCreationProfileRef: nullString(run.Origin.CreationProfileRef),
+		OriginPolicySpecDigest: nullString(
+			run.Origin.PolicySpecDigest,
+		),
+		OriginCreationDigest: nullString(run.Origin.CreationDigest),
+	}
+}
+
+func loopRunFromGenerated(row *sqlcgen.LoopRun) (looppkg.Run, error) {
+	controlRequested := sql.NullString{}
+	if row.ControlRequestedAt.Valid {
+		controlRequested = sql.NullString{String: store.FormatTimestamp(row.ControlRequestedAt.Time), Valid: true}
+	}
+	completedAt := sql.NullString{}
+	if row.CompletedAt.Valid {
+		completedAt = sql.NullString{String: store.FormatTimestamp(row.CompletedAt.Time), Valid: true}
+	}
+	values := loopRunScanValues{
+		grantCeiling: row.GrantCeiling,
+		run: looppkg.Run{
+			ProfileID: row.ProfileID,
+			LoopName:  row.LoopName, Historical: row.Historical != 0, Generation: int(row.Generation),
+			DefinitionVersion: int(row.DefinitionVersion),
+			DefinitionDigest:  row.DefinitionDigest, ActiveGateID: looppkg.NodeID(row.ActiveGateID),
+			BudgetApprovalSeq: int(row.BudgetApprovalSeq),
+			BudgetTokens:      int(row.BudgetTokens), BudgetWallSec: int(row.BudgetWallSec), TokensUsed: row.TokensUsed,
+			IterationCap: int(row.IterationCap), GoalContextNudgeRatio: row.GoalContextNudgeRatio,
+		},
+		runID: row.ID, workspaceID: row.WorkspaceID, status: row.Status, reattempt: row.ReattemptStrategy,
+		completionState:  row.CompletionState,
+		budgetOnExceeded: row.BudgetOnExceeded, createdAtRaw: row.CreatedAt,
+		startedAtRaw: row.StartedAt, lastProgressAtRaw: store.FormatTimestamp(row.LastProgressAt),
+		completedAtRaw: completedAt,
+		activeHumanRaw: row.ActiveHumanCriteriaJson, startMetadataRaw: row.StartMetadataJson,
+		parentID: row.ParentLoopRunID, pauseRequested: int(row.PauseRequested),
+		controlActorKind: row.ControlActorKind, controlActorID: row.ControlActorID,
+		controlRequested: controlRequested, inputsRaw: row.InputsJson,
+		startedByKind: row.StartedByKind, startedByRef: row.StartedByRef,
+		startedOriginKind: row.StartedOriginKind, startedOriginRef: row.StartedOriginRef,
+		originKind: row.OriginKind, originSessionID: row.OriginSessionID,
+		originProfileRef: row.OriginCreationProfileRef, originPolicy: row.OriginPolicySpecDigest,
+		originCreation: row.OriginCreationDigest,
+
+		forkedFromRunID: row.ForkedFromRunID, forkedFromGen: row.ForkedFromGeneration,
+	}
+	run, err := values.toRun()
+	if err != nil {
+		return looppkg.Run{}, err
+	}
+	if err := applyLoopRunBest(&run, row.BestGeneration, row.BestScore); err != nil {
+		return looppkg.Run{}, err
+	}
+	return run, nil
+}
+
+func loopRunEventFromGenerated(row sqlcgen.LoopRunEvent) looppkg.RunEvent {
+	event := looppkg.RunEvent{
+		ID: row.ID, LoopRunID: looppkg.RunID(row.LoopRunID), WorkspaceID: looppkg.WorkspaceID(row.WorkspaceID),
+		Seq: row.Seq, Kind: row.Kind, Payload: json.RawMessage(row.PayloadJson), At: row.At.UTC(),
+	}
+	if row.DeliveryKey.Valid {
+		event.DeliveryKey = row.DeliveryKey.String
+	}
+	return event
+}
+
+func generationOutputFromGenerated(row sqlcgen.ListLoopGenerationOutputsRow) (looppkg.GenerationOutput, error) {
+	output := looppkg.GenerationOutput{
+		Generation: int(row.Generation), NodeID: row.NodeID,
+		ItemIndex: int(row.ItemIndex), Status: row.Status,
+		Attempt: int(row.Attempt), Epoch: row.Epoch,
+	}
+	if row.OutputID.Valid {
+		output.OutputID = row.OutputID.String
+	}
+	if row.ArtifactName.Valid {
+		output.ArtifactName = row.ArtifactName.String
+	}
+	if row.OutputRef.Valid {
+		output.OutputRef = row.OutputRef.String
+	}
+	if row.TaskRunID.Valid {
+		output.TaskRunID = row.TaskRunID.String
+	}
+	if row.ChildLoopRunID.Valid {
+		output.ChildLoopRunID = row.ChildLoopRunID.String
+	}
+	if row.ResolvedRuntimeJson.Valid {
+		var resolved looppkg.ResolvedRuntime
+		if err := json.Unmarshal([]byte(row.ResolvedRuntimeJson.String), &resolved); err != nil {
+			return looppkg.GenerationOutput{}, fmt.Errorf("store: decode resolved runtime: %w", err)
+		}
+		output.ResolvedRuntime = &resolved
+	}
+	output.NextAttemptAt = loopTimePointer(row.NextAttemptAt)
+	output.FirstScheduledAt = loopTimePointer(row.FirstScheduledAt)
+	output.SessionID = row.SessionID
+	return output, nil
+}
+
+func loopConfigFromGenerated(row sqlcgen.GetLoopConfigRow) (looppkg.LoopConfig, error) {
+	return loopConfigScanValues{
+		humanGateEnabled: int(row.HumanGateEnabled), reattempt: row.ReattemptStrategy,
+		enabledChecks: row.EnabledChecksJson, iterationCap: row.IterationCap,
+		budgetTokens: row.BudgetTokens, budgetWallSec: row.BudgetWallSec,
+		budgetOnExceeded: row.BudgetOnExceeded, noProgressWindow: row.NoProgressWindow,
+		fanOutWidth: row.FanOutWidth, gateMaxRevisions: row.GateMaxRevisions,
+		runtimeDefaultsJSON: row.RuntimeDefaultsJson, runtimeRulesJSON: row.RuntimeRulesJson,
+		environmentJSON: row.EnvironmentJson,
+	}.toConfig()
+}
+
+func loopConfigPatchParams(
+	insert sqlcgen.InsertLoopConfigIfMissingParams,
+	patch loopConfigPatchFlags,
+) sqlcgen.PatchLoopConfigParams {
+	return sqlcgen.PatchLoopConfigParams{
+		ProfileID:      insert.ProfileID,
+		PatchHumanGate: int64(boolToInt(patch.HumanGate)), HumanGateEnabled: insert.HumanGateEnabled,
+		PatchReattempt: loopPatchStringFlag(patch.Reattempt), ReattemptStrategy: insert.ReattemptStrategy,
+		PatchEnabledChecks: map[bool]string{false: "0", true: "1"}[patch.EnabledChecks],
+		EnabledChecksJson:  insert.EnabledChecksJson, PatchIterationCap: loopPatchIntFlag(patch.IterationCap),
+		IterationCap: insert.IterationCap, PatchBudgetTokens: loopPatchIntFlag(patch.BudgetTokens),
+		BudgetTokens: insert.BudgetTokens, PatchBudgetWallSec: loopPatchIntFlag(patch.BudgetWallSec),
+		BudgetWallSec: insert.BudgetWallSec, PatchBudgetOnExceeded: loopPatchStringFlag(patch.BudgetOnExceeded),
+		BudgetOnExceeded: insert.BudgetOnExceeded, PatchNoProgressWindow: loopPatchIntFlag(patch.NoProgressWindow),
+		NoProgressWindow: insert.NoProgressWindow, PatchFanOutWidth: loopPatchIntFlag(patch.FanOutWidth),
+		FanOutWidth: insert.FanOutWidth, PatchGateMaxRevisions: loopPatchIntFlag(patch.GateMaxRevisions),
+		GateMaxRevisions:     insert.GateMaxRevisions,
+		PatchRuntimeDefaults: loopPatchStringFlag(patch.RuntimeDefaults),
+		RuntimeDefaultsJson:  insert.RuntimeDefaultsJson,
+		PatchRuntimeRules:    loopPatchStringFlag(patch.RuntimeRules),
+		RuntimeRulesJson:     insert.RuntimeRulesJson,
+		PatchEnvironment:     loopPatchStringFlag(patch.Environment),
+		EnvironmentJson:      insert.EnvironmentJson,
+		WorkspaceID:          insert.WorkspaceID, LoopName: insert.LoopName,
+	}
+}
+
+func nullableLoopTime(value time.Time) sql.NullTime {
+	return sql.NullTime{Time: value.UTC(), Valid: !value.IsZero()}
+}
+
+func loopTimePointer(value sql.NullTime) *time.Time {
+	if !value.Valid {
+		return nil
+	}
+	return new(value.Time.UTC())
+}
+
+func loopPatchIntFlag(value bool) sql.NullInt64 {
+	return sql.NullInt64{Int64: int64(boolToInt(value)), Valid: true}
+}
+
+func loopPatchStringFlag(value bool) sql.NullString {
+	if value {
+		return sql.NullString{String: "1", Valid: true}
+	}
+	return sql.NullString{String: "0", Valid: true}
+}

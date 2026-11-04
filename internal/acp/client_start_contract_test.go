@@ -1,0 +1,2837 @@
+package acp
+
+import (
+	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"log/slog"
+	"maps"
+	"net/http"
+	"net/url"
+	"os"
+	"os/exec"
+	"path/filepath"
+	"runtime"
+	"slices"
+	"strings"
+	"testing"
+	"time"
+
+	acpsdk "github.com/coder/acp-go-sdk"
+	compozyconfig "github.com/compozy/compozy/internal/config"
+	diagcontract "github.com/compozy/compozy/internal/diagnosticcontract"
+	"github.com/compozy/compozy/internal/diagnostics"
+	"github.com/compozy/compozy/internal/mcpbridge"
+	"github.com/compozy/compozy/internal/providers"
+	speedpkg "github.com/compozy/compozy/internal/speed"
+	"github.com/compozy/compozy/internal/store"
+	"github.com/compozy/compozy/internal/testutil"
+	sdkmcp "github.com/modelcontextprotocol/go-sdk/mcp"
+)
+
+func TestStartInitializeContract(t *testing.T) {
+	t.Parallel()
+
+	t.Run("Should send the ACP protocol version as a JSON number", func(t *testing.T) {
+		t.Parallel()
+
+		driver := New()
+		captureFile := filepath.Join(t.TempDir(), "initialize.jsonl")
+		proc := startHelperProcess(t, driver, "initialize_contract", "", StartOpts{
+			Env: helperEnvWithCapture("initialize_contract", "", captureFile),
+		})
+		defer stopProcess(t, driver, proc)
+
+		params := captureRequestParams(t, captureFile, acpsdk.AgentMethodInitialize)
+		protocolVersionJSON, ok := params["protocolVersion"]
+		if !ok {
+			t.Fatal("initialize protocolVersion missing")
+		}
+
+		var protocolVersion int
+		if err := json.Unmarshal(protocolVersionJSON, &protocolVersion); err != nil {
+			t.Fatalf("initialize protocolVersion = %s, want JSON number: %v", protocolVersionJSON, err)
+		}
+		if protocolVersion != acpsdk.ProtocolVersionNumber {
+			t.Fatalf(
+				"initialize protocolVersion = %d, want %d",
+				protocolVersion,
+				acpsdk.ProtocolVersionNumber,
+			)
+		}
+		var capabilities struct {
+			Meta     map[string]any `json:"_meta"`
+			Terminal bool           `json:"terminal"`
+		}
+		if err := json.Unmarshal(params["clientCapabilities"], &capabilities); err != nil {
+			t.Fatalf("decode initialize clientCapabilities: %v", err)
+		}
+		if !capabilities.Terminal {
+			t.Fatal("clientCapabilities.terminal = false, want true")
+		}
+		if value, ok := capabilities.Meta["terminal_output"]; ok {
+			t.Fatalf("clientCapabilities._meta.terminal_output = %#v, want absent", value)
+		}
+	})
+}
+
+func TestStartCapturesPromptCapabilities(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name     string
+		scenario string
+		want     Caps
+	}{
+		{
+			name:     "Should preserve the image prompt capability after session negotiation",
+			scenario: "prompt_capabilities_image",
+			want:     Caps{PromptImage: true},
+		},
+		{
+			name:     "Should preserve the audio prompt capability after session negotiation",
+			scenario: "prompt_capabilities_audio",
+			want:     Caps{PromptAudio: true},
+		},
+		{
+			name:     "Should preserve the embedded-context prompt capability after session negotiation",
+			scenario: "prompt_capabilities_embedded_context",
+			want:     Caps{PromptEmbeddedContext: true},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			driver := New()
+			proc := startHelperProcess(t, driver, tt.scenario, "", StartOpts{})
+			t.Cleanup(func() {
+				stopProcess(t, driver, proc)
+			})
+
+			caps := proc.CapsSnapshot()
+			if got, want := caps.PromptImage, tt.want.PromptImage; got != want {
+				t.Fatalf("Start() PromptImage = %t, want %t", got, want)
+			}
+			if got, want := caps.PromptAudio, tt.want.PromptAudio; got != want {
+				t.Fatalf("Start() PromptAudio = %t, want %t", got, want)
+			}
+			if got, want := caps.PromptEmbeddedContext, tt.want.PromptEmbeddedContext; got != want {
+				t.Fatalf("Start() PromptEmbeddedContext = %t, want %t", got, want)
+			}
+		})
+	}
+}
+
+func TestStartCapturesSessionLifecycleCapabilities(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name       string
+		scenario   string
+		wantFork   bool
+		wantResume bool
+	}{
+		{
+			name:       "Should capture advertised session fork and resume capabilities",
+			scenario:   "fork_session",
+			wantFork:   true,
+			wantResume: true,
+		},
+		{
+			name:     "Should leave fork and resume false when the agent omits them",
+			scenario: "prompt_capabilities_image",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			driver := New()
+			proc := startHelperProcess(t, driver, tt.scenario, "", StartOpts{})
+			t.Cleanup(func() {
+				stopProcess(t, driver, proc)
+			})
+
+			caps := proc.CapsSnapshot()
+			if got := caps.SupportsForkSession; got != tt.wantFork {
+				t.Fatalf("Start() SupportsForkSession = %t, want %t", got, tt.wantFork)
+			}
+			if got := caps.SupportsResumeSession; got != tt.wantResume {
+				t.Fatalf("Start() SupportsResumeSession = %t, want %t", got, tt.wantResume)
+			}
+			cloned := CloneCaps(caps)
+			if cloned.SupportsForkSession != tt.wantFork || cloned.SupportsResumeSession != tt.wantResume {
+				t.Fatalf("CloneCaps() = %+v, want fork=%t resume=%t", cloned, tt.wantFork, tt.wantResume)
+			}
+		})
+	}
+}
+
+func TestStartActivatesMCPAfterInitializeBeforeSessionNegotiation(t *testing.T) {
+	t.Parallel()
+
+	t.Run("Should activate MCP after initialize and before session negotiation", func(t *testing.T) {
+		t.Parallel()
+
+		driver := New()
+		captureFile := filepath.Join(t.TempDir(), "mcp-activation-order.jsonl")
+		activated := false
+		proc := startHelperProcess(t, driver, "stream_updates", "", StartOpts{
+			Env: helperEnvWithCapture("stream_updates", "", captureFile),
+			MCPServers: []compozyconfig.MCPServer{{
+				Name:      "compozy-hosted-tools",
+				Transport: compozyconfig.MCPServerTransportStdio,
+				Command:   "/bin/compozy",
+			}},
+			ActivateMCPServers: func(ctx context.Context) error {
+				if err := ctx.Err(); err != nil {
+					return err
+				}
+				if !captureMethodExists(t, captureFile, acpsdk.AgentMethodInitialize) {
+					t.Fatal("MCP activation ran before ACP initialize completed")
+				}
+				if captureMethodExists(t, captureFile, acpsdk.AgentMethodSessionNew) {
+					t.Fatal("MCP activation ran after ACP session/new")
+				}
+				activated = true
+				return nil
+			},
+		})
+		defer stopProcess(t, driver, proc)
+
+		if !activated {
+			t.Fatal("ActivateMCPServers was not called")
+		}
+		if !captureMethodExists(t, captureFile, acpsdk.AgentMethodSessionNew) {
+			t.Fatal("ACP session/new was not sent after MCP activation")
+		}
+	})
+
+	t.Run("Should stop before session negotiation when MCP activation fails", func(t *testing.T) {
+		t.Parallel()
+
+		activationErr := errors.New("MCP activation failed")
+		driver := New()
+		captureFile := filepath.Join(t.TempDir(), "mcp-activation-failure.jsonl")
+		proc, err := driver.Start(testutil.Context(t), StartOpts{
+			AgentName:   "helper",
+			Command:     helperCommand(t),
+			Cwd:         t.TempDir(),
+			Env:         helperEnvWithCapture("stream_updates", "", captureFile),
+			Permissions: compozyconfig.PermissionModeApproveAll,
+			MCPServers: []compozyconfig.MCPServer{{
+				Name:      "compozy-hosted-tools",
+				Transport: compozyconfig.MCPServerTransportStdio,
+				Command:   "/bin/compozy",
+			}},
+			ActivateMCPServers: func(context.Context) error {
+				return activationErr
+			},
+		})
+		if proc != nil {
+			defer stopProcess(t, driver, proc)
+			t.Fatalf("Start() process = %#v, want nil after activation failure", proc)
+		}
+		if !errors.Is(err, activationErr) {
+			t.Fatalf("Start() error = %v, want wrapped activation error", err)
+		}
+		if !captureMethodExists(t, captureFile, acpsdk.AgentMethodInitialize) {
+			t.Fatal("ACP initialize was not sent before MCP activation")
+		}
+		if captureMethodExists(t, captureFile, acpsdk.AgentMethodSessionNew) {
+			t.Fatal("ACP session/new was sent after MCP activation failed")
+		}
+	})
+}
+
+func TestDaemonMatchedEnvPinsCurrentBinary(t *testing.T) {
+	t.Parallel()
+
+	executable, err := os.Executable()
+	if err != nil {
+		t.Fatalf("os.Executable() error = %v", err)
+	}
+	if resolved, resolveErr := filepath.EvalSymlinks(
+		executable,
+	); resolveErr == nil &&
+		strings.TrimSpace(resolved) != "" {
+		executable = resolved
+	}
+	binDir := filepath.Dir(executable)
+
+	env := DaemonMatchedEnv([]string{
+		"PATH=/should-be-ignored",
+		"FOO=bar",
+		"COMPOZY_BIN=/should-be-replaced",
+		"PATH=/usr/local/bin" + string(os.PathListSeparator) + binDir + string(os.PathListSeparator) + "/usr/bin",
+		"COMPOZY_BIN=/should-also-be-replaced",
+	})
+
+	gotCompozyBin, ok := envValue(env, "COMPOZY_BIN")
+	if !ok || gotCompozyBin != executable {
+		t.Fatalf("DaemonMatchedEnv() COMPOZY_BIN = %q, %v, want %q", gotCompozyBin, ok, executable)
+	}
+
+	gotPath, ok := envValue(env, "PATH")
+	if !ok {
+		t.Fatal("DaemonMatchedEnv() PATH missing")
+	}
+	wantPath := binDir + string(os.PathListSeparator) + "/usr/local/bin" + string(os.PathListSeparator) + "/usr/bin"
+	if gotPath != wantPath {
+		t.Fatalf("DaemonMatchedEnv() PATH = %q, want %q", gotPath, wantPath)
+	}
+
+	pathCount := 0
+	compozyBinCount := 0
+	for _, variable := range env {
+		switch {
+		case strings.HasPrefix(variable, "PATH="):
+			pathCount++
+		case strings.HasPrefix(variable, "COMPOZY_BIN="):
+			compozyBinCount++
+		}
+	}
+	if pathCount != 1 || compozyBinCount != 1 {
+		t.Fatalf(
+			"DaemonMatchedEnv() duplicate entries remain: PATH=%d COMPOZY_BIN=%d env=%#v",
+			pathCount,
+			compozyBinCount,
+			env,
+		)
+	}
+}
+
+func TestStartResumeUsesLoadSession(t *testing.T) {
+	t.Parallel()
+	// Invariant: a resume-only ACP agent retains its native conversation without transcript replay.
+	// Owner: ACP driver; canonical start negotiation suite with a subprocess at the protocol boundary.
+	t.Run("Should use session resume when load is unsupported", func(t *testing.T) {
+		t.Parallel()
+		driver := New()
+		proc := startHelperProcess(t, driver, "resume_session", "", StartOpts{ResumeSessionID: "sess-existing"})
+		defer stopProcess(t, driver, proc)
+		if proc.SessionID != "sess-existing" ||
+			!slices.Equal(proc.CapsSnapshot().SupportedModes, []string{"loaded-mode"}) {
+			t.Fatalf("resume did not preserve native binding and modes: %q %#v", proc.SessionID, proc.CapsSnapshot())
+		}
+	})
+
+	t.Run("Should resume through loadSession when a prior session ID is provided", func(t *testing.T) {
+		t.Parallel()
+
+		driver := New()
+		proc := startHelperProcess(t, driver, "load_session", "", StartOpts{
+			ResumeSessionID: "sess-existing",
+		})
+		defer stopProcess(t, driver, proc)
+
+		if proc.SessionID != "sess-existing" {
+			t.Fatalf("Start() session id = %q, want %q", proc.SessionID, "sess-existing")
+		}
+		caps := proc.CapsSnapshot()
+		if !caps.SupportsLoadSession {
+			t.Fatal("Start() SupportsLoadSession = false, want true")
+		}
+		if !slices.Equal(caps.SupportedModes, []string{"loaded-mode"}) {
+			t.Fatalf("Start() supported modes = %#v, want %#v", caps.SupportedModes, []string{"loaded-mode"})
+		}
+	})
+}
+
+func TestStartApproveAllSetsPermissiveSessionModeWhenSupported(t *testing.T) {
+	t.Parallel()
+
+	driver := New()
+	captureFile := filepath.Join(t.TempDir(), "session-set-mode-new.jsonl")
+	proc := startHelperProcess(t, driver, "mode_mapping", "", StartOpts{
+		Permissions: compozyconfig.PermissionModeApproveAll,
+		Env:         helperEnvWithCapture("mode_mapping", "", captureFile),
+	})
+	defer stopProcess(t, driver, proc)
+
+	params := captureRequestParams(t, captureFile, acpsdk.AgentMethodSessionSetMode)
+	request := decodeCapturedSetSessionModeRequest(t, params)
+	if got, want := request.SessionID, "sess-new"; got != want {
+		t.Fatalf("set-mode session id = %q, want %q", got, want)
+	}
+	if got, want := request.ModeID, "bypassPermissions"; got != want {
+		t.Fatalf("set-mode mode id = %q, want %q", got, want)
+	}
+}
+
+func TestProviderNativePermissionRequestMarksShellExecution(t *testing.T) {
+	t.Parallel()
+	title := "Run gh pr checks 1 --watch"
+	permissionRequest := func(kind acpsdk.ToolKind) acpsdk.RequestPermissionRequest {
+		return acpsdk.RequestPermissionRequest{ToolCall: acpsdk.ToolCallUpdate{Title: &title, Kind: &kind}}
+	}
+
+	t.Run("Should mark an execute permission whatever its provider title", func(t *testing.T) {
+		t.Parallel()
+		request, handled, err := decodeProviderNativePermissionRequest(permissionRequest(acpsdk.ToolKindExecute))
+		if err != nil || !handled || !request.Execute {
+			t.Fatalf("decode = %+v, %v, %v, want a handled execute request", request, handled, err)
+		}
+		if clone := cloneToolExecutionRequest(request); !clone.Execute {
+			t.Fatalf("clone = %+v, want Execute preserved", clone)
+		}
+	})
+
+	t.Run("Should leave a file permission unmarked", func(t *testing.T) {
+		t.Parallel()
+		request, _, err := decodeProviderNativePermissionRequest(permissionRequest(acpsdk.ToolKindRead))
+		if err != nil || request.Execute {
+			t.Fatalf("decode = %+v, %v, want an unmarked read", request, err)
+		}
+	})
+}
+
+func TestStartWithToolGatewayPreservesPermissiveSessionMode(t *testing.T) {
+	t.Parallel()
+
+	t.Run("Should keep approve-all semantics when tool execution is intercepted", func(t *testing.T) {
+		t.Parallel()
+
+		driver := New()
+		captureFile := filepath.Join(t.TempDir(), "session-set-mode-gateway.jsonl")
+		proc := startHelperProcess(t, driver, "mode_mapping", "", StartOpts{
+			Permissions: compozyconfig.PermissionModeApproveAll,
+			Env:         helperEnvWithCapture("mode_mapping", "", captureFile),
+			ToolGateway: toolExecutionGatewayFunc(
+				func(_ context.Context, req ToolExecutionRequest) (ToolExecutionRequest, error) {
+					return req, nil
+				},
+			),
+		})
+		defer stopProcess(t, driver, proc)
+
+		params := captureRequestParams(t, captureFile, acpsdk.AgentMethodSessionSetMode)
+		request := decodeCapturedSetSessionModeRequest(t, params)
+		if got, want := request.SessionID, "sess-new"; got != want {
+			t.Fatalf("set-mode session id = %q, want %q", got, want)
+		}
+		if got, want := request.ModeID, "bypassPermissions"; got != want {
+			t.Fatalf("set-mode mode id = %q, want %q", got, want)
+		}
+	})
+
+	t.Run("Should select Cursor agent mode and expose it as current", func(t *testing.T) {
+		t.Parallel()
+
+		driver := New()
+		captureFile := filepath.Join(t.TempDir(), "session-set-mode-cursor.jsonl")
+		proc := startHelperProcess(t, driver, "cursor_mode_mapping", "", StartOpts{
+			Permissions: compozyconfig.PermissionModeApproveAll,
+			Env:         helperEnvWithCapture("cursor_mode_mapping", "", captureFile),
+			ToolGateway: toolExecutionGatewayFunc(
+				func(_ context.Context, req ToolExecutionRequest) (ToolExecutionRequest, error) {
+					return req, nil
+				},
+			),
+		})
+		defer stopProcess(t, driver, proc)
+
+		request := decodeCapturedSetSessionModeRequest(
+			t,
+			captureRequestParams(t, captureFile, acpsdk.AgentMethodSessionSetMode),
+		)
+		if got, want := request.ModeID, "agent"; got != want {
+			t.Fatalf("set-mode mode id = %q, want %q", got, want)
+		}
+		assertConfigOption(t, proc.CapsSnapshot().ConfigOptions, "mode", "agent", "agent", "plan", "ask")
+	})
+
+	t.Run("Should avoid changing Cursor when its native mode is already agent", func(t *testing.T) {
+		t.Parallel()
+
+		driver := New()
+		captureFile := filepath.Join(t.TempDir(), "session-current-agent-cursor.jsonl")
+		proc := startHelperProcess(t, driver, "cursor_mode_current_agent", "", StartOpts{
+			Permissions: compozyconfig.PermissionModeApproveAll,
+			Env:         helperEnvWithCapture("cursor_mode_current_agent", "", captureFile),
+			ToolGateway: toolExecutionGatewayFunc(
+				func(_ context.Context, req ToolExecutionRequest) (ToolExecutionRequest, error) {
+					return req, nil
+				},
+			),
+		})
+		defer stopProcess(t, driver, proc)
+
+		if captureMethodExists(t, captureFile, acpsdk.AgentMethodSessionSetMode) {
+			t.Fatal("set_mode was sent when Cursor already reported agent mode")
+		}
+		assertConfigOption(t, proc.CapsSnapshot().ConfigOptions, "mode", "agent", "agent", "plan", "ask")
+	})
+}
+
+func TestStartResumeApproveReadsSetsReadOnlyLikeSessionModeWhenSupported(t *testing.T) {
+	t.Parallel()
+
+	driver := New()
+	captureFile := filepath.Join(t.TempDir(), "session-set-mode-load.jsonl")
+	proc := startHelperProcess(t, driver, "load_mode_mapping", "", StartOpts{
+		ResumeSessionID: "sess-existing",
+		Permissions:     compozyconfig.PermissionModeApproveReads,
+		Env:             helperEnvWithCapture("load_mode_mapping", "", captureFile),
+	})
+	defer stopProcess(t, driver, proc)
+
+	params := captureRequestParams(t, captureFile, acpsdk.AgentMethodSessionSetMode)
+	request := decodeCapturedSetSessionModeRequest(t, params)
+	if got, want := request.SessionID, "sess-existing"; got != want {
+		t.Fatalf("set-mode session id = %q, want %q", got, want)
+	}
+	if got, want := request.ModeID, "plan"; got != want {
+		t.Fatalf("set-mode mode id = %q, want %q", got, want)
+	}
+}
+
+func TestStartResumeWithToolGatewayPrefersApprovalMediatedMode(t *testing.T) {
+	t.Parallel()
+
+	driver := New()
+	captureFile := filepath.Join(t.TempDir(), "session-set-mode-load-gateway.jsonl")
+	proc := startHelperProcess(t, driver, "load_mode_mapping", "", StartOpts{
+		ResumeSessionID: "sess-existing",
+		Permissions:     compozyconfig.PermissionModeApproveReads,
+		Env:             helperEnvWithCapture("load_mode_mapping", "", captureFile),
+		ToolGateway: toolExecutionGatewayFunc(
+			func(_ context.Context, req ToolExecutionRequest) (ToolExecutionRequest, error) {
+				return req, nil
+			},
+		),
+	})
+	defer stopProcess(t, driver, proc)
+
+	params := captureRequestParams(t, captureFile, acpsdk.AgentMethodSessionSetMode)
+	request := decodeCapturedSetSessionModeRequest(t, params)
+	if got, want := request.SessionID, "sess-existing"; got != want {
+		t.Fatalf("set-mode session id = %q, want %q", got, want)
+	}
+	if got, want := request.ModeID, "default"; got != want {
+		t.Fatalf("set-mode mode id = %q, want %q", got, want)
+	}
+}
+
+func TestStartDenyAllWithToolGatewayPrefersApprovalMediatedSessionMode(t *testing.T) {
+	t.Parallel()
+
+	driver := New()
+	captureFile := filepath.Join(t.TempDir(), "session-set-mode-deny-gateway.jsonl")
+	proc := startHelperProcess(t, driver, "mode_mapping", "", StartOpts{
+		Permissions: compozyconfig.PermissionModeDenyAll,
+		Env:         helperEnvWithCapture("mode_mapping", "", captureFile),
+		ToolGateway: toolExecutionGatewayFunc(
+			func(_ context.Context, req ToolExecutionRequest) (ToolExecutionRequest, error) {
+				return req, nil
+			},
+		),
+	})
+	defer stopProcess(t, driver, proc)
+
+	params := captureRequestParams(t, captureFile, acpsdk.AgentMethodSessionSetMode)
+	request := decodeCapturedSetSessionModeRequest(t, params)
+	if got, want := request.SessionID, "sess-new"; got != want {
+		t.Fatalf("set-mode session id = %q, want %q", got, want)
+	}
+	if got, want := request.ModeID, "default"; got != want {
+		t.Fatalf("set-mode mode id = %q, want %q", got, want)
+	}
+}
+
+func TestStartCapturesSessionConfigOptions(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name          string
+		scenario      string
+		resumeSession string
+		wantModel     string
+		wantReasoning string
+	}{
+		{
+			name:          "Should capture config options from session new",
+			scenario:      "config_options",
+			wantModel:     "new-model",
+			wantReasoning: "medium",
+		},
+		{
+			name:          "Should capture config options from session load",
+			scenario:      "load_config_options",
+			resumeSession: "sess-existing",
+			wantModel:     "loaded-model",
+			wantReasoning: "high",
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			driver := New()
+			proc := startHelperProcess(t, driver, tc.scenario, "", StartOpts{
+				ResumeSessionID: tc.resumeSession,
+			})
+			defer stopProcess(t, driver, proc)
+
+			caps := proc.CapsSnapshot()
+			assertConfigOption(t, caps.ConfigOptions, "model", tc.wantModel, "new-model", "loaded-model", "other-model")
+			assertConfigOption(t, caps.ConfigOptions, "reasoning_effort", tc.wantReasoning, "minimal", "high", "xhigh")
+		})
+	}
+}
+
+// TestInspectSessionConfigOptionsDoesNotMutateTheACPNewSession verifies inspection isolation and per-model discovery.
+func TestInspectSessionConfigOptionsDoesNotMutateTheACPNewSession(t *testing.T) {
+	t.Parallel()
+
+	t.Run("Should inspect options without mutating the new ACP session", func(t *testing.T) {
+		t.Parallel()
+
+		captureFile := filepath.Join(t.TempDir(), "session-inspection.jsonl")
+		options, err := InspectSessionConfigOptions(testutil.Context(t), SessionInspectionRequest{
+			AgentName: "helper",
+			Command:   helperCommand(t),
+			Cwd:       t.TempDir(),
+			Env:       helperEnvWithCapture("config_options", "", captureFile),
+		})
+		if err != nil {
+			t.Fatalf("InspectSessionConfigOptions() error = %v", err)
+		}
+		assertConfigOption(t, options, "model", "new-model", "new-model", "loaded-model", "other-model")
+		if !captureMethodExists(t, captureFile, acpsdk.AgentMethodSessionNew) {
+			t.Fatal("session/new was not sent during ACP inspection")
+		}
+		if captureMethodExists(t, captureFile, acpsdk.AgentMethodSessionSetMode) {
+			t.Fatal("session/set_mode was sent during ACP inspection")
+		}
+		if captureMethodExists(t, captureFile, acpsdk.AgentMethodSessionSetConfigOption) {
+			t.Fatal("session/set_config_option was sent during ACP inspection")
+		}
+		if captureMethodExists(t, captureFile, acpsdk.AgentMethodSessionCancel) {
+			t.Fatal("session/cancel was sent during ACP inspection")
+		}
+		if captureMethodExists(t, captureFile, acpsdk.AgentMethodSessionClose) {
+			t.Fatal("session/close was sent without an advertised close capability")
+		}
+	})
+
+	t.Run("Should keep the inspected options when session/close outlasts its budget", func(t *testing.T) {
+		t.Parallel()
+
+		captureFile := filepath.Join(t.TempDir(), "session-inspection-slow-close.jsonl")
+		options, err := InspectSessionConfigOptions(testutil.Context(t), SessionInspectionRequest{
+			AgentName: "helper",
+			Command:   helperCommand(t),
+			Cwd:       t.TempDir(),
+			Env:       helperEnvWithCapture("config_options_slow_close", "", captureFile),
+		})
+		if err != nil {
+			t.Fatalf("InspectSessionConfigOptions(slow close) error = %v", err)
+		}
+		assertConfigOption(t, options, "model", "new-model", "new-model", "loaded-model", "other-model")
+		if !captureMethodExists(t, captureFile, acpsdk.AgentMethodSessionClose) {
+			t.Fatal("session/close was not sent for an agent that advertises it")
+		}
+	})
+}
+
+// Invariant: discovery retains each model's acknowledged options without prompting.
+// Owning layer and canonical suite: ACP session lifecycle contract.
+func TestInspectSessionModels(t *testing.T) {
+	t.Parallel()
+	t.Run("Should isolate model-specific options and models without effort", func(t *testing.T) {
+		t.Parallel()
+		captureFile := filepath.Join(t.TempDir(), "model-inspection.jsonl")
+		inspection, err := InspectSessionModels(testutil.Context(t), SessionInspectionRequest{
+			AgentName: "helper", Command: helperCommand(t), Cwd: t.TempDir(),
+			Env: helperEnvWithCapture("model_specific_config_options", "", captureFile),
+		})
+		if err != nil {
+			t.Fatalf("InspectSessionModels() error = %v", err)
+		}
+		if len(inspection.Models) != 3 {
+			t.Fatalf("inspected models = %v, want 3", inspection.Models)
+		}
+		assertConfigOption(t, inspection.Models["new-model"], "effort", "low", "low")
+		assertConfigOption(t, inspection.Models["other-model"], "effort", "none", "none", "max")
+		_, found := ReasoningConfigOption(inspection.Models["loaded-model"])
+		if found {
+			t.Fatal("model without effort inherited another model's effort")
+		}
+		if captureMethodExists(t, captureFile, acpsdk.AgentMethodSessionPrompt) {
+			t.Fatal("discovery submitted a prompt")
+		}
+	})
+	t.Run("Should keep advertised models when a model selection is not acknowledged", func(t *testing.T) {
+		t.Parallel()
+		inspection, err := InspectSessionModels(testutil.Context(t), SessionInspectionRequest{
+			AgentName: "helper", Command: helperCommand(t), Cwd: t.TempDir(),
+			Env: helperEnv("config_options_unconfirmed", ""),
+		})
+		if err != nil {
+			t.Fatalf("InspectSessionModels() error = %v, want advertised options despite one rejected model", err)
+		}
+		assertConfigOption(t, inspection.Options, "model", "new-model", "new-model", "loaded-model", "other-model")
+		for _, rejected := range []string{"loaded-model", "other-model"} {
+			if _, published := inspection.Models[rejected]; published {
+				t.Fatalf("unacknowledged model %q published options: %v", rejected, inspection.Models[rejected])
+			}
+			if err := inspection.ModelErrors[rejected]; err == nil ||
+				!strings.Contains(err.Error(), "did not confirm") {
+				t.Fatalf("ModelErrors[%q] = %v, want unconfirmed configuration failure", rejected, err)
+			}
+		}
+		if _, confirmed := inspection.Models["new-model"]; !confirmed {
+			t.Fatalf("acknowledged model options missing: %v", inspection.Models)
+		}
+	})
+	for _, tc := range []struct {
+		name     string
+		scenario string
+		probes   int
+	}{
+		{"Should return cancellation during the first model probe", "stall_config", 1},
+		{"Should return cancellation during the final model probe", "stall_last_config", 3},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			ctx, cancel := context.WithCancel(t.Context())
+			defer cancel()
+			captureFile := filepath.Join(t.TempDir(), "cancel-inspection.jsonl")
+			req := SessionInspectionRequest{
+				AgentName: "helper", Command: helperCommand(t), Cwd: t.TempDir(),
+				Env: helperEnvWithCapture(tc.scenario, "", captureFile),
+			}
+			done := make(chan struct{})
+			var inspection SessionModelInspection
+			var err error
+			go func() {
+				defer close(done)
+				inspection, err = InspectSessionModels(ctx, req)
+			}()
+			t.Cleanup(func() {
+				cancel()
+				<-done
+			})
+			waitForCapturedNotifications(t, captureFile, acpsdk.AgentMethodSessionSetConfigOption, tc.probes)
+			cancel()
+			<-done
+			if !errors.Is(err, context.Canceled) {
+				t.Fatalf("InspectSessionModels() error = %v, want caller cancellation", err)
+			}
+			if len(inspection.Options) != 0 || len(inspection.Models) != 0 {
+				t.Fatalf("canceled inspection published partial results: %#v", inspection)
+			}
+		})
+	}
+	t.Run("Should return advertised models when the probe budget is exhausted", func(t *testing.T) {
+		t.Parallel()
+		ctx, cancel := context.WithTimeout(testutil.Context(t), 2*time.Second)
+		defer cancel()
+		inspection, err := InspectSessionModels(ctx, SessionInspectionRequest{
+			AgentName: "helper", Command: helperCommand(t), Cwd: t.TempDir(),
+			Env: helperEnv("stall_config", ""),
+		})
+		if err != nil {
+			t.Fatalf("InspectSessionModels() error = %v, want advertised options after deadline", err)
+		}
+		if _, ok := ModelConfigOption(inspection.Options); !ok {
+			t.Fatalf("advertised model option missing after deadline: %#v", inspection.Options)
+		}
+		if len(inspection.Models) != 0 {
+			t.Fatalf("stalled probes published model options: %v", inspection.Models)
+		}
+		model, _ := ModelConfigOption(inspection.Options)
+		for _, value := range model.Values {
+			if err := inspection.ModelErrors[value.Value]; !errors.Is(err, context.DeadlineExceeded) {
+				t.Fatalf("ModelErrors[%q] = %v, want unobserved options recorded as deadline", value.Value, err)
+			}
+		}
+	})
+}
+
+func TestStopCancelsANonInspectionSession(t *testing.T) {
+	t.Parallel()
+
+	t.Run("Should cancel a non-inspection session", func(t *testing.T) {
+		t.Parallel()
+
+		driver := New()
+		captureFile := filepath.Join(t.TempDir(), "session-stop-cancel.jsonl")
+		proc := startHelperProcess(t, driver, "config_options", "", StartOpts{
+			Env: helperEnvWithCapture("config_options", "", captureFile),
+		})
+		if err := driver.Stop(testutil.Context(t), proc); err != nil {
+			t.Fatalf("Stop() error = %v", err)
+		}
+		if got := len(captureRequestParamsForMethod(t, captureFile, acpsdk.AgentMethodSessionCancel)); got != 1 {
+			t.Fatalf("session/cancel notifications for a non-inspection session = %d, want 1", got)
+		}
+	})
+}
+
+func TestStartUsesSetConfigOptionForPreferredModelWhenAvailable(t *testing.T) {
+	t.Parallel()
+
+	driver := New()
+	captureFile := filepath.Join(t.TempDir(), "session-set-config-model.jsonl")
+	proc := startHelperProcess(t, driver, "config_options", "", StartOpts{
+		PreferredModel: "other-model",
+		Env:            helperEnvWithCapture("config_options", "", captureFile),
+	})
+	defer stopProcess(t, driver, proc)
+
+	request := decodeCapturedSetSessionConfigOptionRequest(
+		t,
+		captureRequestParams(t, captureFile, acpsdk.AgentMethodSessionSetConfigOption),
+	)
+	if got := request.SessionID; got != "sess-new" {
+		t.Fatalf("set-config session id = %q, want sess-new", got)
+	}
+	if got := request.ConfigID; got != "model" {
+		t.Fatalf("set-config config id = %q, want model", got)
+	}
+	if got := request.Value; got != "other-model" {
+		t.Fatalf("set-config value = %q, want other-model", got)
+	}
+	if request.Type != "" {
+		t.Fatalf("set-config type = %q, want omitted for select value", request.Type)
+	}
+	assertConfigOption(t, proc.CapsSnapshot().ConfigOptions, "model", "other-model", "other-model")
+}
+
+func TestStartHandlesCurrentSessionConfigValues(t *testing.T) {
+	t.Parallel()
+
+	t.Run("Should explicitly apply a preferred model that is already current", func(t *testing.T) {
+		t.Parallel()
+
+		driver := New()
+		captureFile := filepath.Join(t.TempDir(), "session-current-model.jsonl")
+		proc := startHelperProcess(t, driver, "config_options", "", StartOpts{
+			PreferredModel: "new-model",
+			Env:            helperEnvWithCapture("config_options", "", captureFile),
+		})
+		defer stopProcess(t, driver, proc)
+
+		request := decodeCapturedSetSessionConfigOptionRequest(
+			t,
+			captureRequestParams(t, captureFile, acpsdk.AgentMethodSessionSetConfigOption),
+		)
+		if request.ConfigID != "model" || request.Value != "new-model" {
+			t.Fatalf("set-config request = %#v, want explicit current model", request)
+		}
+	})
+
+	t.Run("Should skip an explicit reasoning effort that is already current", func(t *testing.T) {
+		t.Parallel()
+
+		driver := New()
+		captureFile := filepath.Join(t.TempDir(), "session-current-reasoning.jsonl")
+		proc := startHelperProcess(t, driver, "config_options", "", StartOpts{
+			ReasoningEffort: "medium",
+			ProviderConfig:  reasoningACPProviderConfig(),
+			Env:             helperEnvWithCapture("config_options", "", captureFile),
+		})
+		defer stopProcess(t, driver, proc)
+
+		if captureMethodExists(t, captureFile, acpsdk.AgentMethodSessionSetConfigOption) {
+			t.Fatal("set_config_option was sent when the requested reasoning effort was already current")
+		}
+		assertConfigOption(t, proc.CapsSnapshot().ConfigOptions, "reasoning_effort", "medium", "medium")
+	})
+}
+
+func TestStartUsesSetConfigOptionForReasoningEffortWhenAvailable(t *testing.T) {
+	t.Parallel()
+
+	t.Run("Should apply reasoning effort through session/set_config_option", func(t *testing.T) {
+		t.Parallel()
+
+		driver := New()
+		captureFile := filepath.Join(t.TempDir(), "session-set-config-reasoning.jsonl")
+		proc := startHelperProcess(t, driver, "config_options", "", StartOpts{
+			ReasoningEffort: "high",
+			ProviderConfig:  reasoningACPProviderConfig(),
+			Env:             helperEnvWithCapture("config_options", "", captureFile),
+		})
+		defer stopProcess(t, driver, proc)
+
+		request := decodeCapturedSetSessionConfigOptionRequest(
+			t,
+			captureRequestParams(t, captureFile, acpsdk.AgentMethodSessionSetConfigOption),
+		)
+		if got := request.ConfigID; got != "reasoning_effort" {
+			t.Fatalf("set-config config id = %q, want reasoning_effort", got)
+		}
+		if got := request.Value; got != "high" {
+			t.Fatalf("set-config value = %q, want high", got)
+		}
+		assertConfigOption(t, proc.CapsSnapshot().ConfigOptions, "reasoning_effort", "high", "high")
+	})
+}
+
+func TestStartNegotiatesRequestedSpeed(t *testing.T) {
+	t.Parallel()
+
+	t.Run("Should apply fast speed through session config", func(t *testing.T) {
+		t.Parallel()
+
+		driver := New()
+		captureFile := filepath.Join(t.TempDir(), "session-set-config-speed.jsonl")
+		proc := startHelperProcess(t, driver, "config_options", "", StartOpts{
+			Speed: speedpkg.SpeedFast,
+			Env:   helperEnvWithCapture("config_options", "", captureFile),
+		})
+		defer stopProcess(t, driver, proc)
+
+		request := decodeCapturedSetSessionConfigOptionRequest(
+			t,
+			captureRequestParams(t, captureFile, acpsdk.AgentMethodSessionSetConfigOption),
+		)
+		if request.ConfigID != "speed" || request.Value != "fast" {
+			t.Fatalf("set-config request = %#v, want speed=fast", request)
+		}
+		resolution := proc.CapsSnapshot().SpeedResolution
+		if resolution == nil ||
+			resolution.Requested != speedpkg.SpeedFast ||
+			resolution.Status != speedpkg.ResolutionApplied {
+			t.Fatalf("speed resolution = %#v, want applied fast", resolution)
+		}
+	})
+
+	t.Run("Should continue with an unsupported outcome when speed is absent", func(t *testing.T) {
+		t.Parallel()
+
+		driver := New()
+		captureFile := filepath.Join(t.TempDir(), "session-speed-unsupported.jsonl")
+		proc := startHelperProcess(t, driver, "config_options_no_model", "", StartOpts{
+			Speed: speedpkg.SpeedFast,
+			Env:   helperEnvWithCapture("config_options_no_model", "", captureFile),
+		})
+		defer stopProcess(t, driver, proc)
+
+		if captureMethodExists(t, captureFile, acpsdk.AgentMethodSessionSetConfigOption) {
+			t.Fatal("set_config_option was sent without an advertised speed option")
+		}
+		resolution := proc.CapsSnapshot().SpeedResolution
+		if resolution == nil ||
+			resolution.Status != speedpkg.ResolutionUnsupported ||
+			resolution.Reason != speedpkg.ReasonCapabilityAbsent {
+			t.Fatalf("speed resolution = %#v, want unsupported capability_absent", resolution)
+		}
+	})
+}
+
+func TestStartReportsAcceptanceInTheStartError(t *testing.T) { // UT-031
+	t.Parallel()
+
+	t.Run("Should retain acceptance when startup finalization fails", func(t *testing.T) {
+		t.Parallel()
+		cause := errors.New("startup assembly failed")
+		launcher := &recordingLauncher{delegate: NewLocalLauncher(testDiscardLogger(), time.Second)}
+		driver := New(WithLauncher(launcher))
+		proc, err := driver.Start(t.Context(), StartOpts{
+			AgentName:       "helper",
+			Command:         helperCommand(t),
+			Cwd:             t.TempDir(),
+			Env:             helperEnv("initialize_contract", ""),
+			FinalizeStartup: func(context.Context) (string, StartupManifest, error) { return "", StartupManifest{}, cause },
+		})
+		if proc != nil {
+			t.Fatal("failed startup retained a process")
+		}
+		launcher.mu.Lock()
+		handle := launcher.launched
+		launcher.mu.Unlock()
+		if handle == nil {
+			t.Fatal("helper subprocess was not launched")
+		}
+		t.Cleanup(func() {
+			ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+			defer cancel()
+			if err := handle.Stop(ctx); err != nil {
+				t.Errorf("helper cleanup: %v", err)
+			}
+		})
+		select {
+		case <-handle.Done():
+		default:
+			t.Fatal("accepted-start failure returned before its helper subprocess exited")
+		}
+
+		id, accepted := AcceptedSessionID(err)
+		if !accepted || id != "sess-new" || !errors.Is(err, cause) {
+			t.Fatalf("finalizer failure lost acceptance or cause: %v (%s)", err, id)
+		}
+	})
+
+	t.Run("Should carry the accepted session id through failed-start cleanup", func(t *testing.T) {
+		t.Parallel()
+
+		driver := New()
+		proc, err := driver.Start(testutil.Context(t), StartOpts{
+			AgentName:   "helper",
+			Command:     helperCommand(t),
+			Cwd:         t.TempDir(),
+			Env:         helperEnv("config_options_reject_speed", ""),
+			Permissions: compozyconfig.PermissionModeApproveAll,
+			Speed:       speedpkg.SpeedFast,
+		})
+		if proc != nil {
+			t.Fatal("Start() process != nil, want failed setup cleanup")
+		}
+		accepted, ok := errors.AsType[*AcceptedStartError](err)
+		if !ok || accepted.SessionID != "sess-new" {
+			t.Fatalf("Start() error = %v, want AcceptedStartError for sess-new", err)
+		}
+		negotiationErr, negotiationMatched := errors.AsType[*NegotiationError](err)
+		if !negotiationMatched || negotiationErr.Code != NegotiationCodeSpeedRejected ||
+			negotiationErr.Stage != "speed" || negotiationErr.Requested != "fast" {
+			t.Fatalf("Start() error = %v, want the speed_rejected negotiation cause preserved", err)
+		}
+		if !strings.HasPrefix(err.Error(), "acp: start failed after session acceptance: ") {
+			t.Fatalf("Start() error text = %q, want the acceptance prefix", err.Error())
+		}
+	})
+
+	t.Run("Should report no acceptance when session negotiation fails", func(t *testing.T) {
+		t.Parallel()
+
+		driver := New()
+		proc, err := driver.Start(testutil.Context(t), StartOpts{
+			AgentName:       "helper",
+			Command:         helperCommand(t),
+			Cwd:             t.TempDir(),
+			Env:             helperEnv("load_session_error", ""),
+			ResumeSessionID: "sess-missing",
+		})
+		if proc != nil {
+			t.Fatal("Start() process != nil, want failed load cleanup")
+		}
+		if err == nil {
+			t.Fatal("Start() error = nil, want session/load failure")
+		}
+		if id, accepted := AcceptedSessionID(err); accepted || id != "" {
+			t.Fatalf("AcceptedSessionID() = (%q, %t), want (\"\", false)", id, accepted)
+		}
+	})
+
+	t.Run("Should find the acceptance fact through joined and wrapped errors", func(t *testing.T) {
+		t.Parallel()
+
+		base := WrapAcceptedStart("acp_1", errors.New("configure failed"))
+		for _, wrapped := range []error{
+			fmt.Errorf("session: start: %w", base),
+			errors.Join(errors.New("cleanup failed"), base),
+		} {
+			if id, ok := AcceptedSessionID(wrapped); !ok || id != "acp_1" {
+				t.Fatalf("AcceptedSessionID(%v) = (%q, %t), want (acp_1, true)", wrapped, id, ok)
+			}
+		}
+		if WrapAcceptedStart("acp_2", base) != base {
+			t.Fatal("WrapAcceptedStart() rewrapped an error that already carries acceptance")
+		}
+	})
+}
+
+func TestMatchSpeedConfigRejectsAmbiguity(t *testing.T) {
+	t.Parallel()
+
+	t.Run("Should reject multiple speed capabilities", func(t *testing.T) {
+		t.Parallel()
+
+		option := sessionConfigOptionFromSDKForTest(t, helperSpeedConfigOption("normal"))
+		match, reason := matchSpeedConfig(speedpkg.SpeedFast, []SessionConfigOption{option, option})
+		if match != nil || reason != speedpkg.ReasonCapabilityAmbiguous {
+			t.Fatalf("matchSpeedConfig() = %#v, %q, want capability ambiguity", match, reason)
+		}
+	})
+
+	t.Run("Should reject speed values without one normal and one fast choice", func(t *testing.T) {
+		t.Parallel()
+
+		option := sessionConfigOptionFromSDKForTest(t, helperSpeedConfigOption("normal"))
+		option.Values = option.Values[:1]
+		match, reason := matchSpeedConfig(speedpkg.SpeedFast, []SessionConfigOption{option})
+		if match != nil || reason != speedpkg.ReasonValueAmbiguous {
+			t.Fatalf("matchSpeedConfig() = %#v, %q, want value ambiguity", match, reason)
+		}
+	})
+}
+
+func TestStartRejectsReasoningWithoutAnApplyStrategyBeforeLaunch(t *testing.T) {
+	t.Parallel()
+
+	t.Run("Should return a typed error without launching the provider", func(t *testing.T) {
+		t.Parallel()
+
+		launcher := &recordingLauncher{err: errors.New("provider must not launch")}
+		driver := New(WithLauncher(launcher))
+		proc, err := driver.Start(testutil.Context(t), StartOpts{
+			AgentName:       "helper",
+			Command:         "helper",
+			Cwd:             t.TempDir(),
+			Permissions:     compozyconfig.PermissionModeApproveAll,
+			ReasoningEffort: "high",
+			ProviderConfig: &compozyconfig.ProviderConfig{Models: compozyconfig.ProviderModelsConfig{
+				Reasoning: compozyconfig.ProviderReasoningConfig{Apply: compozyconfig.ReasoningApplyNone},
+			}},
+		})
+		if proc != nil {
+			t.Fatal("Start() process != nil, want no launched process")
+		}
+		negotiationErr, negotiationErrMatched := errors.AsType[*NegotiationError](err)
+		if !negotiationErrMatched || negotiationErr.Code != NegotiationCodeReasoningOptionMissing {
+			t.Fatalf("Start() error = %v, want reasoning_option_missing NegotiationError", err)
+		}
+		if _, called := launcher.lastSpec(); called {
+			t.Fatal("provider launcher was called before reasoning strategy validation")
+		}
+	})
+}
+
+func TestStartPassesThroughEveryAdvertisedCanonicalReasoningEffort(t *testing.T) {
+	t.Parallel()
+
+	for _, effort := range []string{"minimal", "low", "xhigh", "max", "ultra"} {
+		t.Run("Should pass through "+effort, func(t *testing.T) {
+			t.Parallel()
+
+			driver := New()
+			captureFile := filepath.Join(t.TempDir(), "session-reasoning-"+effort+".jsonl")
+			proc := startHelperProcess(t, driver, "config_options", "", StartOpts{
+				ReasoningEffort: effort,
+				ProviderConfig:  reasoningACPProviderConfig(),
+				Env:             helperEnvWithCapture("config_options", "", captureFile),
+			})
+			defer stopProcess(t, driver, proc)
+
+			request := decodeCapturedSetSessionConfigOptionRequest(
+				t,
+				captureRequestParams(t, captureFile, acpsdk.AgentMethodSessionSetConfigOption),
+			)
+			if got := request.Value; got != effort {
+				t.Fatalf("set-config value = %q, want %q", got, effort)
+			}
+		})
+	}
+}
+
+func TestStartDistinguishesProviderDefaultFromExplicitNone(t *testing.T) {
+	t.Parallel()
+
+	t.Run("Should skip effort RPC for empty provider default", func(t *testing.T) {
+		t.Parallel()
+
+		driver := New()
+		captureFile := filepath.Join(t.TempDir(), "session-default-reasoning.jsonl")
+		proc := startHelperProcess(t, driver, "config_options", "", StartOpts{
+			ProviderConfig: reasoningACPProviderConfig(),
+			Env:            helperEnvWithCapture("config_options", "", captureFile),
+		})
+		defer stopProcess(t, driver, proc)
+
+		if captureMethodExists(t, captureFile, acpsdk.AgentMethodSessionSetConfigOption) {
+			t.Fatal("set_config_option was sent for empty provider-default effort")
+		}
+	})
+
+	t.Run("Should send explicit none when advertised", func(t *testing.T) {
+		t.Parallel()
+
+		driver := New()
+		captureFile := filepath.Join(t.TempDir(), "session-none-reasoning.jsonl")
+		proc := startHelperProcess(t, driver, "config_options", "", StartOpts{
+			ReasoningEffort: "none",
+			ProviderConfig:  reasoningACPProviderConfig(),
+			Env:             helperEnvWithCapture("config_options", "", captureFile),
+		})
+		defer stopProcess(t, driver, proc)
+
+		request := decodeCapturedSetSessionConfigOptionRequest(
+			t,
+			captureRequestParams(t, captureFile, acpsdk.AgentMethodSessionSetConfigOption),
+		)
+		if got, want := request.Value, "none"; got != want {
+			t.Fatalf("set-config value = %q, want %q", got, want)
+		}
+	})
+}
+
+func TestStartAppliesModelBeforeModelSpecificReasoning(t *testing.T) {
+	t.Parallel()
+
+	t.Run("Should apply mode then model then refreshed model-specific effort", func(t *testing.T) {
+		t.Parallel()
+
+		driver := New()
+		captureFile := filepath.Join(t.TempDir(), "session-model-specific-reasoning.jsonl")
+		proc := startHelperProcess(t, driver, "model_specific_config_options", "", StartOpts{
+			Permissions:     compozyconfig.PermissionModeApproveAll,
+			PreferredModel:  "other-model",
+			ReasoningEffort: "max",
+			ProviderConfig:  reasoningACPProviderConfig(),
+			Env:             helperEnvWithCapture("model_specific_config_options", "", captureFile),
+		})
+		defer stopProcess(t, driver, proc)
+		got := captureNegotiationSequence(t, captureFile)
+		want := []string{"mode:bypassPermissions", "model:other-model", "effort:max"}
+		if !slices.Equal(got, want) {
+			t.Fatalf("negotiation sequence = %#v, want %#v", got, want)
+		}
+
+		requests := captureRequestParamsForMethod(t, captureFile, acpsdk.AgentMethodSessionSetConfigOption)
+		if got, want := len(requests), 2; got != want {
+			t.Fatalf("set_config_option request count = %d, want %d", got, want)
+		}
+		modelRequest := decodeCapturedSetSessionConfigOptionRequest(t, requests[0])
+		reasoningRequest := decodeCapturedSetSessionConfigOptionRequest(t, requests[1])
+		if modelRequest.ConfigID != "model" || modelRequest.Value != "other-model" {
+			t.Fatalf("first set-config request = %#v, want model=other-model", modelRequest)
+		}
+		if reasoningRequest.ConfigID != "effort" || reasoningRequest.Value != "max" {
+			t.Fatalf("second set-config request = %#v, want effort=max", reasoningRequest)
+		}
+	})
+}
+
+// TestConfigureRuntime verifies ordered negotiation, acknowledgement, and preservation after rejection.
+func TestConfigureRuntime(t *testing.T) {
+	t.Parallel()
+
+	// Invariant: requested intent is not effective until provider readback confirms it.
+	t.Run("Should preserve prior effort when the provider does not confirm a change", func(t *testing.T) {
+		t.Parallel()
+		driver := New()
+		proc := startHelperProcess(t, driver, "config_options_unconfirmed", "", StartOpts{})
+		defer stopProcess(t, driver, proc)
+		err := driver.ConfigureRuntime(testutil.Context(t), proc, RuntimeConfig{ReasoningEffort: "high"})
+		if err == nil || !strings.Contains(err.Error(), "did not confirm") {
+			t.Fatalf("error = %v, want unconfirmed configuration failure", err)
+		}
+		assertConfigOption(t, proc.CapsSnapshot().ConfigOptions, "reasoning_effort", "medium", "high")
+	})
+
+	t.Run("Should apply model then refreshed reasoning effort then speed", func(t *testing.T) {
+		t.Parallel()
+
+		driver := New()
+		captureFile := filepath.Join(t.TempDir(), "configure-runtime.jsonl")
+		proc := startHelperProcess(t, driver, "runtime_config_options", "", StartOpts{
+			Env: helperEnvWithCapture("runtime_config_options", "", captureFile),
+		})
+		defer stopProcess(t, driver, proc)
+
+		err := driver.ConfigureRuntime(testutil.Context(t), proc, RuntimeConfig{
+			Model:           "other-model",
+			ReasoningEffort: "max",
+			Speed:           speedpkg.SpeedFast,
+			ACPOptions: []SessionConfigOptionSelection{
+				{ID: "thinking", BoolValue: new(true)},
+				{ID: "context", ValueID: "large"},
+			},
+		})
+		if err != nil {
+			t.Fatalf("ConfigureRuntime() error = %v", err)
+		}
+
+		got := captureNegotiationSequence(t, captureFile)
+		want := []string{"model:other-model", "effort:max", "speed:fast", "context:large", "thinking:true"}
+		if !slices.Equal(got, want) {
+			t.Fatalf("runtime configuration sequence = %#v, want %#v", got, want)
+		}
+
+		caps := proc.CapsSnapshot()
+		assertConfigOption(t, caps.ConfigOptions, "model", "other-model", "other-model")
+		assertConfigOption(t, caps.ConfigOptions, "effort", "max", "none", "max")
+		assertConfigOption(t, caps.ConfigOptions, "speed", "fast", "normal", "fast")
+		assertConfigOption(t, caps.ConfigOptions, "context", "large", "standard", "large")
+		thinking, ok := findConfigOptionByID(caps.ConfigOptions, "thinking")
+		if !ok || thinking.CurrentBool == nil || !*thinking.CurrentBool {
+			t.Fatalf("thinking option = %#v, want true", thinking)
+		}
+		requests := captureRequestParamsForMethod(t, captureFile, acpsdk.AgentMethodSessionSetConfigOption)
+		contextRequest := decodeCapturedSetSessionConfigOptionRequest(t, requests[len(requests)-2])
+		if contextRequest.ConfigID != "context" || contextRequest.Type != "" ||
+			contextRequest.Value != "large" {
+			t.Fatalf("context request = %#v, want ACP select large without type", contextRequest)
+		}
+		thinkingRequest := decodeCapturedSetSessionConfigOptionRequest(t, requests[len(requests)-1])
+		if thinkingRequest.Type != "boolean" || thinkingRequest.BoolValue == nil || !*thinkingRequest.BoolValue {
+			t.Fatalf("thinking request = %#v, want ACP boolean true", thinkingRequest)
+		}
+		if caps.SpeedResolution == nil ||
+			caps.SpeedResolution.Requested != speedpkg.SpeedFast ||
+			caps.SpeedResolution.Status != speedpkg.ResolutionApplied {
+			t.Fatalf("speed resolution = %#v, want applied fast", caps.SpeedResolution)
+		}
+	})
+
+	t.Run("Should return a typed failure when the provider rejects speed", func(t *testing.T) {
+		t.Parallel()
+
+		driver := New()
+		captureFile := filepath.Join(t.TempDir(), "configure-runtime-speed-rejected.jsonl")
+		proc := startHelperProcess(t, driver, "config_options_reject_speed", "", StartOpts{
+			Env: helperEnvWithCapture("config_options_reject_speed", "", captureFile),
+		})
+		defer stopProcess(t, driver, proc)
+
+		err := driver.ConfigureRuntime(testutil.Context(t), proc, RuntimeConfig{Speed: speedpkg.SpeedFast})
+		negotiationErr, negotiationErrMatched := errors.AsType[*NegotiationError](err)
+		if !negotiationErrMatched ||
+			negotiationErr.Code != NegotiationCodeSpeedRejected ||
+			negotiationErr.Stage != "speed" ||
+			negotiationErr.Requested != string(speedpkg.SpeedFast) {
+			t.Fatalf("ConfigureRuntime() error = %v, want speed_rejected NegotiationError", err)
+		}
+		if !captureMethodExists(t, captureFile, acpsdk.AgentMethodSessionSetConfigOption) {
+			t.Fatal("ConfigureRuntime() did not send the advertised speed config option")
+		}
+		resolution := proc.CapsSnapshot().SpeedResolution
+		if resolution == nil || resolution.Status != speedpkg.ResolutionRejected ||
+			resolution.Reason != speedpkg.ReasonProviderRejected {
+			t.Fatalf("speed resolution = %#v, want rejected by provider", resolution)
+		}
+	})
+}
+
+func TestStartRejectsReasoningEffortWhenConfigOptionIsAbsent(t *testing.T) {
+	t.Parallel()
+
+	t.Run("Should fail before prompting when the effort option is absent", func(t *testing.T) {
+		t.Parallel()
+
+		driver := New()
+		captureFile := filepath.Join(t.TempDir(), "session-no-reasoning-config.jsonl")
+		proc, err := driver.Start(testutil.Context(t), StartOpts{
+			AgentName:       "helper",
+			Command:         helperCommand(t),
+			Cwd:             t.TempDir(),
+			Permissions:     compozyconfig.PermissionModeApproveAll,
+			ReasoningEffort: "xhigh",
+			ProviderConfig:  reasoningACPProviderConfig(),
+			Env:             helperEnvWithCapture("config_options_no_reasoning", "", captureFile),
+		})
+		if proc != nil {
+			defer stopProcess(t, driver, proc)
+		}
+		if err == nil {
+			t.Fatal("Start() error = nil, want reasoning_option_missing")
+		}
+		negotiationErr, negotiationErrMatched := errors.AsType[*NegotiationError](err)
+		if !negotiationErrMatched || negotiationErr.Code != NegotiationCodeReasoningOptionMissing {
+			t.Fatalf("Start() error = %v, want reasoning_option_missing NegotiationError", err)
+		}
+
+		if captureMethodExists(t, captureFile, acpsdk.AgentMethodSessionSetConfigOption) {
+			t.Fatal("set_config_option was sent without a reasoning config option")
+		}
+	})
+}
+
+func TestStartRejectsPreferredModelWhenModelConfigOptionIsAbsent(t *testing.T) {
+	t.Parallel()
+
+	t.Run("Should reject preferred model without ACP model config option", func(t *testing.T) {
+		t.Parallel()
+
+		driver := New()
+		captureFile := filepath.Join(t.TempDir(), "session-no-model-config.jsonl")
+		proc, err := driver.Start(testutil.Context(t), StartOpts{
+			AgentName:      "helper",
+			Command:        helperCommand(t),
+			Cwd:            t.TempDir(),
+			Env:            helperEnvWithCapture("config_options_no_model", "", captureFile),
+			Permissions:    compozyconfig.PermissionModeApproveAll,
+			PreferredModel: "new-model",
+		})
+		if proc != nil {
+			defer stopProcess(t, driver, proc)
+		}
+		if err == nil {
+			t.Fatal("Start() error = nil, want missing model config option error")
+		}
+		if !errors.Is(err, errModelConfigOptionRequired) {
+			t.Fatalf("Start() error = %v, want model config option required", err)
+		}
+		if captureMethodExists(t, captureFile, acpsdk.AgentMethodSessionSetConfigOption) {
+			t.Fatal("set_config_option was sent when no model config option was available")
+		}
+	})
+}
+
+func TestStartDoesNotRenegotiateLaunchBoundRuntimeAgainstSessionConfig(t *testing.T) {
+	t.Parallel()
+
+	t.Run("Should trust the prevalidated launch binding when ACP reports shared model state", func(t *testing.T) {
+		t.Parallel()
+
+		driver := New()
+		captureFile := filepath.Join(t.TempDir(), "launch-bound-session-config.jsonl")
+		proc, err := driver.Start(testutil.Context(t), StartOpts{
+			AgentName:       "helper",
+			Command:         helperCommand(t),
+			Cwd:             t.TempDir(),
+			Env:             helperEnvWithCapture("launch_bound_model", "", captureFile),
+			Permissions:     compozyconfig.PermissionModeApproveAll,
+			PreferredModel:  "requested-logical-model",
+			RuntimeStrategy: RuntimeApplicationLaunchArg,
+			LaunchModelID:   "private-launch-alias",
+		})
+		if err != nil {
+			t.Fatalf("Start() error = %v", err)
+		}
+		defer stopProcess(t, driver, proc)
+		if captureMethodExists(t, captureFile, acpsdk.AgentMethodSessionSetConfigOption) {
+			t.Fatal("set_config_option was sent for a launch-bound runtime")
+		}
+	})
+}
+
+func TestStartRejectsUnavailableSessionConfigOptionValues(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name            string
+		opts            StartOpts
+		wantCode        string
+		forbiddenMethod string
+	}{
+		{
+			name: "Should reject preferred model absent from model config option values",
+			opts: StartOpts{
+				PreferredModel: "missing-model",
+			},
+			wantCode:        NegotiationCodeModelUnavailable,
+			forbiddenMethod: acpsdk.AgentMethodSessionSetConfigOption,
+		},
+		{
+			name: "Should reject reasoning effort absent from reasoning config option values",
+			opts: StartOpts{
+				ReasoningEffort: "turbo",
+			},
+			wantCode:        NegotiationCodeReasoningEffortUnsupported,
+			forbiddenMethod: acpsdk.AgentMethodSessionSetConfigOption,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			driver := New()
+			captureFile := filepath.Join(t.TempDir(), "session-unavailable-config-option.jsonl")
+			opts := StartOpts{
+				AgentName:   "helper",
+				Command:     helperCommand(t),
+				Cwd:         t.TempDir(),
+				Env:         helperEnvWithCapture("config_options", "", captureFile),
+				Permissions: compozyconfig.PermissionModeApproveAll,
+			}
+			opts.PreferredModel = tc.opts.PreferredModel
+			opts.ReasoningEffort = tc.opts.ReasoningEffort
+			if opts.ReasoningEffort != "" {
+				opts.ProviderConfig = reasoningACPProviderConfig()
+			}
+			proc, err := driver.Start(testutil.Context(t), opts)
+			if proc != nil {
+				defer stopProcess(t, driver, proc)
+				t.Fatalf("Start() process = %#v, want nil after membership rejection", proc)
+			}
+			if err == nil {
+				t.Fatal("Start() error = nil, want unavailable config option error")
+			}
+			negotiationErr, negotiationErrMatched := errors.AsType[*NegotiationError](err)
+			if !negotiationErrMatched || negotiationErr.Code != tc.wantCode {
+				t.Fatalf("Start() error = %v, want NegotiationError code %q", err, tc.wantCode)
+			}
+			if captureMethodExists(t, captureFile, tc.forbiddenMethod) {
+				t.Fatalf("forbidden method %q was sent after unavailable config value", tc.forbiddenMethod)
+			}
+		})
+	}
+}
+
+func TestSessionConfigOptionUpdateMutatesCaps(t *testing.T) {
+	t.Parallel()
+
+	driver := New()
+	proc := startHelperProcess(t, driver, "config_option_update", "", StartOpts{Speed: speedpkg.SpeedFast})
+	defer stopProcess(t, driver, proc)
+
+	events, err := driver.Prompt(testutil.Context(t), proc, PromptRequest{
+		TurnID:  "turn-config-options",
+		Message: "update config",
+	})
+	if err != nil {
+		t.Fatalf("Prompt() error = %v", err)
+	}
+	collectEvents(t, events)
+
+	caps := proc.CapsSnapshot()
+	assertConfigOption(t, caps.ConfigOptions, "model", "other-model", "other-model")
+	assertConfigOption(t, caps.ConfigOptions, "reasoning_effort", "xhigh", "xhigh")
+	if resolution := caps.SpeedResolution; resolution == nil || resolution.Status != speedpkg.ResolutionRejected ||
+		resolution.Requested != speedpkg.SpeedFast || resolution.Reason != speedpkg.ReasonProviderRejected {
+		t.Fatalf("speed resolution after provider update = %#v, want Fast rejected", resolution)
+	}
+	if err := driver.ConfigureRuntime(testutil.Context(t), proc, RuntimeConfig{Speed: speedpkg.SpeedFast}); err != nil {
+		t.Fatal(err)
+	}
+	if resolution := proc.CapsSnapshot().SpeedResolution; resolution.Status != speedpkg.ResolutionApplied {
+		t.Fatalf("speed resolution after reapplication = %#v, want applied", resolution)
+	}
+}
+
+func TestStartWithEmptyAdditionalDirsKeepsBaselinePayload(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name string
+		opts StartOpts
+	}{
+		{
+			name: "nil additional dirs",
+			opts: StartOpts{},
+		},
+		{
+			name: "explicit empty additional dirs",
+			opts: StartOpts{AdditionalDirs: []string{}},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			driver := New()
+			captureFile := filepath.Join(t.TempDir(), strings.ReplaceAll(tt.name, " ", "-")+".jsonl")
+			opts := tt.opts
+			opts.Env = helperEnvWithCapture("stream_updates", "", captureFile)
+
+			proc := startHelperProcess(t, driver, "stream_updates", "", opts)
+			defer stopProcess(t, driver, proc)
+
+			params := captureRequestParams(t, captureFile, acpsdk.AgentMethodSessionNew)
+			if _, exists := params["additional_dirs"]; exists {
+				t.Fatalf("session/new params include additional_dirs for %s: %#v", tt.name, params)
+			}
+		})
+	}
+}
+
+func TestStartIncludesAdditionalDirsInNewSessionPayload(t *testing.T) {
+	t.Parallel()
+
+	driver := New()
+	root := t.TempDir()
+	additionalOne := t.TempDir()
+	additionalTwo := t.TempDir()
+	captureFile := filepath.Join(t.TempDir(), "session-new.jsonl")
+
+	proc := startHelperProcess(t, driver, "stream_updates", "", StartOpts{
+		Cwd:            root,
+		AdditionalDirs: []string{additionalOne, additionalTwo},
+		Env:            helperEnvWithCapture("stream_updates", "", captureFile),
+	})
+	defer stopProcess(t, driver, proc)
+
+	params := captureRequestParams(t, captureFile, acpsdk.AgentMethodSessionNew)
+	request := decodeCapturedNewSessionRequest(t, params)
+	if got, want := request.Cwd, mustCanonicalDir(t, root); got != want {
+		t.Fatalf("session/new cwd = %q, want %q", got, want)
+	}
+	if got, want := request.AdditionalDirs, []string{
+		mustCanonicalDir(t, additionalOne),
+		mustCanonicalDir(t, additionalTwo),
+	}; !slices.Equal(
+		got,
+		want,
+	) {
+		t.Fatalf("session/new additional_dirs = %#v, want %#v", got, want)
+	}
+}
+
+func TestStartIncludesAdditionalDirsInLoadSessionPayload(t *testing.T) {
+	t.Parallel()
+
+	driver := New()
+	root := t.TempDir()
+	additionalOne := t.TempDir()
+	additionalTwo := t.TempDir()
+	captureFile := filepath.Join(t.TempDir(), "session-load.jsonl")
+
+	proc := startHelperProcess(t, driver, "load_session", "", StartOpts{
+		Cwd:             root,
+		AdditionalDirs:  []string{additionalOne, additionalTwo},
+		ResumeSessionID: "sess-existing",
+		Env:             helperEnvWithCapture("load_session", "", captureFile),
+	})
+	defer stopProcess(t, driver, proc)
+
+	params := captureRequestParams(t, captureFile, acpsdk.AgentMethodSessionLoad)
+	request := decodeCapturedLoadSessionRequest(t, params)
+	if got, want := request.Cwd, mustCanonicalDir(t, root); got != want {
+		t.Fatalf("session/load cwd = %q, want %q", got, want)
+	}
+	if request.SessionID != "sess-existing" {
+		t.Fatalf("session/load sessionId = %q, want %q", request.SessionID, "sess-existing")
+	}
+	if got, want := request.AdditionalDirs, []string{
+		mustCanonicalDir(t, additionalOne),
+		mustCanonicalDir(t, additionalTwo),
+	}; !slices.Equal(
+		got,
+		want,
+	) {
+		t.Fatalf("session/load additional_dirs = %#v, want %#v", got, want)
+	}
+}
+
+func TestStartMCPServersSkipsRemoteTransports(t *testing.T) {
+	t.Parallel()
+
+	for _, route := range []struct{ name, scenario, resumeID, method string }{
+		{"Should preserve stdio wire shape on new sessions", "stream_updates", "", acpsdk.AgentMethodSessionNew},
+		{"Should preserve stdio wire shape on loaded sessions", "load_session", "sess-existing", acpsdk.AgentMethodSessionLoad},
+	} {
+		t.Run(route.name, func(t *testing.T) {
+			t.Parallel()
+
+			var logs lockedBuffer
+			driver := New(
+				WithLogger(slog.New(slog.NewTextHandler(&logs, &slog.HandlerOptions{Level: slog.LevelDebug}))),
+			)
+			captureFile := filepath.Join(t.TempDir(), "session-new-mcp.jsonl")
+			proc := startHelperProcess(t, driver, route.scenario, "", StartOpts{
+				ResumeSessionID: route.resumeID,
+				Cwd:             t.TempDir(),
+				Env:             helperEnvWithCapture(route.scenario, "", captureFile),
+				MCPServers: []compozyconfig.MCPServer{
+					{
+						Name:      "compozy-hosted-tools",
+						Transport: compozyconfig.MCPServerTransportStdio,
+						Command:   "/bin/compozy",
+						Args:      []string{"tool", "mcp", "--session", "sess-1", "--bind-nonce", "nonce"},
+						Env:       map[string]string{"COMPOZY_HOME": "/tmp/compozy-home"},
+					},
+					{
+						Name:      "remote-http",
+						Transport: compozyconfig.MCPServerTransportHTTP,
+						URL:       "https://example.test/mcp",
+					},
+				},
+			})
+			defer stopProcess(t, driver, proc)
+
+			var diagnostic string
+			for line := range strings.SplitSeq(logs.String(), "\n") {
+				if strings.Contains(line, "msg=acp.session.mcp_server method="+route.method) {
+					diagnostic = line
+					break
+				}
+			}
+			for _, field := range []string{"transport=stdio", "command_fingerprint=" + compozyconfig.CommandFingerprint("/bin/compozy")} {
+				if !strings.Contains(diagnostic, field) {
+					t.Fatalf("MCP diagnostic for %s missing %q: %s", route.method, field, diagnostic)
+				}
+			}
+			params := captureRequestParams(t, captureFile, route.method)
+			var wireServers []map[string]json.RawMessage
+			if err := json.Unmarshal(params["mcpServers"], &wireServers); err != nil {
+				t.Fatal(err)
+			}
+			if len(wireServers) != 1 {
+				t.Fatalf("wire servers = %d, want one stdio server", len(wireServers))
+			}
+			if _, present := wireServers[0]["type"]; present {
+				t.Fatal("stdio wire entry must omit the transport discriminator")
+			}
+			request := decodeCapturedNewSessionRequest(t, params)
+			if got, want := len(request.MCPServers), 1; got != want {
+				t.Fatalf("session/new mcpServers = %#v, want only hosted stdio entry", request.MCPServers)
+			}
+			stdio := request.MCPServers[0].Stdio
+			if stdio == nil {
+				t.Fatalf("session/new mcpServers[0] = %#v, want stdio variant", request.MCPServers[0])
+			}
+			if stdio.Name != "compozy-hosted-tools" || stdio.Command != "/bin/compozy" {
+				t.Fatalf("hosted stdio entry = %#v, want hosted command", stdio)
+			}
+			if !slices.Equal(stdio.Args, []string{"tool", "mcp", "--session", "sess-1", "--bind-nonce", "nonce"}) {
+				t.Fatalf("hosted stdio args = %#v, want tool mcp bind args", stdio.Args)
+			}
+			if got, want := len(stdio.Env), 1; got != want || stdio.Env[0].Name != "COMPOZY_HOME" {
+				t.Fatalf("hosted stdio env = %#v, want COMPOZY_HOME only", stdio.Env)
+			}
+		})
+	}
+}
+
+func TestStartMCPServersBridgeOverHTTP(t *testing.T) {
+	t.Parallel()
+
+	t.Run("Should deliver the bridged server on session/load too", func(t *testing.T) {
+		t.Parallel()
+
+		driver := New()
+		captureFile := filepath.Join(t.TempDir(), "session-load-mcp.jsonl")
+		bin, err := os.Executable()
+		if err != nil {
+			t.Fatal(err)
+		}
+		proc := startHelperProcess(t, driver, "load_session", "", StartOpts{
+			ResumeSessionID: "sess-existing",
+			Cwd:             t.TempDir(),
+			Env:             helperEnvWithCapture("load_session", "", captureFile),
+			ProviderConfig:  &compozyconfig.ProviderConfig{SessionMCPTransport: compozyconfig.MCPServerTransportHTTP},
+			MCPServers: []compozyconfig.MCPServer{{
+				Name:      "compozy-hosted-tools",
+				Transport: compozyconfig.MCPServerTransportStdio,
+				Command:   bin,
+				Args:      []string{"-test.run=^TestACPBridgedMCPHelperProcess$"},
+				Env:       map[string]string{bridgedMCPHelperEnvKey: "1"},
+			}},
+		})
+		defer stopProcess(t, driver, proc)
+		params := captureRequestParams(t, captureFile, acpsdk.AgentMethodSessionLoad)
+		request := decodeCapturedNewSessionRequest(t, params)
+		if len(request.MCPServers) != 1 || request.MCPServers[0].Http == nil || request.MCPServers[0].Stdio != nil {
+			t.Fatalf("session/load mcpServers = %#v, want one bridged HTTP server", request.MCPServers)
+		}
+		server := request.MCPServers[0].Http
+		endpoint, err := url.Parse(server.Url)
+		if err != nil || endpoint.Hostname() != "127.0.0.1" || server.Name != "compozy-hosted-tools" {
+			t.Fatalf("session/load bridged server = %#v, want named loopback endpoint", server)
+		}
+		if len(server.Headers) != 1 || server.Headers[0].Name != "Authorization" ||
+			!strings.HasPrefix(server.Headers[0].Value, "Bearer ") {
+			t.Fatalf("session/load bridged headers = %#v, want one bearer Authorization header", server.Headers)
+		}
+		client := sdkmcp.NewClient(&sdkmcp.Implementation{Name: "agent", Version: "1.0.0"}, nil)
+		session, err := client.Connect(testutil.Context(t), &sdkmcp.StreamableClientTransport{
+			Endpoint:   server.Url,
+			HTTPClient: &http.Client{Transport: bearerRoundTripper{value: server.Headers[0].Value}},
+		}, nil)
+		if err != nil {
+			t.Fatalf("connect to bridged server on session/load: %v", err)
+		}
+		defer func() { _ = session.Close() }()
+		tools, err := session.ListTools(testutil.Context(t), nil)
+		if err != nil || len(tools.Tools) != 1 || tools.Tools[0].Name != "bridged_ping" {
+			t.Fatalf("session/load bridged tools = %#v, %v; want the stdio server tool", tools, err)
+		}
+	})
+
+	t.Run(
+		"Should deliver a stdio server as an authorized loopback HTTP server and close it with the process",
+		func(t *testing.T) {
+			t.Parallel()
+
+			var logs lockedBuffer
+			driver := New(
+				WithLogger(slog.New(slog.NewTextHandler(&logs, &slog.HandlerOptions{Level: slog.LevelDebug}))),
+			)
+			captureFile := filepath.Join(t.TempDir(), "session-new-mcp.jsonl")
+			bin, err := os.Executable()
+			if err != nil {
+				t.Fatal(err)
+			}
+			proc := startHelperProcess(t, driver, "stream_updates", "", StartOpts{
+				Cwd: t.TempDir(),
+				Env: helperEnvWithCapture("stream_updates", "", captureFile),
+				ProviderConfig: &compozyconfig.ProviderConfig{
+					SessionMCPTransport: compozyconfig.MCPServerTransportHTTP,
+				},
+				MCPServers: []compozyconfig.MCPServer{{
+					Name:      "compozy-hosted-tools",
+					Transport: compozyconfig.MCPServerTransportStdio,
+					Command:   bin,
+					Args:      []string{"-test.run=^TestACPBridgedMCPHelperProcess$"},
+					Env:       map[string]string{bridgedMCPHelperEnvKey: "1"},
+				}},
+			})
+			params := captureRequestParams(t, captureFile, acpsdk.AgentMethodSessionNew)
+			request := decodeCapturedNewSessionRequest(t, params)
+			if len(request.MCPServers) != 1 || request.MCPServers[0].Http == nil {
+				t.Fatalf("session/new mcpServers = %#v, want one HTTP server", request.MCPServers)
+			}
+			server := request.MCPServers[0].Http
+			endpoint, err := url.Parse(server.Url)
+			if err != nil || endpoint.Hostname() != "127.0.0.1" || server.Name != "compozy-hosted-tools" {
+				t.Fatalf("bridged server = %#v, want named loopback endpoint", server)
+			}
+			if len(server.Headers) != 1 || server.Headers[0].Name != "Authorization" ||
+				!strings.HasPrefix(server.Headers[0].Value, "Bearer ") {
+				t.Fatalf("bridged headers = %#v, want one bearer Authorization header", server.Headers)
+			}
+			token := strings.TrimPrefix(server.Headers[0].Value, "Bearer ")
+			if strings.Contains(logs.String(), token) {
+				t.Fatal("driver logs leak the bridge bearer token")
+			}
+
+			client := sdkmcp.NewClient(&sdkmcp.Implementation{Name: "agent", Version: "1.0.0"}, nil)
+			session, err := client.Connect(testutil.Context(t), &sdkmcp.StreamableClientTransport{
+				Endpoint:   server.Url,
+				HTTPClient: &http.Client{Transport: bearerRoundTripper{value: server.Headers[0].Value}},
+			}, nil)
+			if err != nil {
+				t.Fatalf("connect to bridged server: %v", err)
+			}
+			tools, err := session.ListTools(testutil.Context(t), nil)
+			if err != nil || len(tools.Tools) != 1 || tools.Tools[0].Name != "bridged_ping" {
+				t.Fatalf("bridged tools = %#v, %v; want the stdio server tool", tools, err)
+			}
+			_ = session.Close()
+
+			stopProcess(t, driver, proc)
+			probe, err := http.NewRequestWithContext(testutil.Context(t), http.MethodPost, server.Url, http.NoBody)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if response, err := http.DefaultClient.Do(probe); err == nil {
+				_ = response.Body.Close()
+				t.Fatalf("bridge still serving after process stop: status %d", response.StatusCode)
+			}
+		},
+	)
+}
+
+func TestAgentProcessClosesBridgesRegisteredAfterExit(t *testing.T) {
+	t.Parallel()
+
+	t.Run("Should close a bridge that finishes starting after its agent exited", func(t *testing.T) {
+		t.Parallel()
+
+		bin, err := os.Executable()
+		if err != nil {
+			t.Fatal(err)
+		}
+		bridge, err := mcpbridge.Start(testutil.Context(t), mcpbridge.Spec{
+			Name:    "compozy-hosted-tools",
+			Command: bin,
+			Args:    []string{"-test.run=^TestACPBridgedMCPHelperProcess$"},
+			Env:     append(os.Environ(), bridgedMCPHelperEnvKey+"=1"),
+			Dir:     t.TempDir(),
+		}, nil)
+		if err != nil {
+			t.Fatalf("mcpbridge.Start() error = %v", err)
+		}
+		t.Cleanup(func() { _ = bridge.Close() })
+		process := &AgentProcess{}
+		if err := process.closeMCPBridges(); err != nil {
+			t.Fatalf("closeMCPBridges() error = %v", err)
+		}
+		err = process.setSessionMCPServers(nil, []*mcpbridge.Bridge{bridge})
+		if !errors.Is(err, errAgentExitedBeforeMCPBridge) {
+			t.Fatalf("setSessionMCPServers() error = %v, want late-bridge refusal", err)
+		}
+		probe, err := http.NewRequestWithContext(testutil.Context(t), http.MethodPost, bridge.URL(), http.NoBody)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if response, err := http.DefaultClient.Do(probe); err == nil {
+			_ = response.Body.Close()
+			t.Fatalf("late bridge still serving: status %d", response.StatusCode)
+		}
+	})
+}
+
+const bridgedMCPHelperEnvKey = "COMPOZY_ACP_BRIDGED_MCP_HELPER"
+
+// TestACPBridgedMCPHelperProcess is the stdio MCP server bridged above.
+func TestACPBridgedMCPHelperProcess(t *testing.T) {
+	if os.Getenv(bridgedMCPHelperEnvKey) != "1" {
+		t.Skip("helper process only")
+	}
+	server := sdkmcp.NewServer(&sdkmcp.Implementation{Name: "bridged", Version: "1.0.0"}, nil)
+	server.AddTool(&sdkmcp.Tool{Name: "bridged_ping", InputSchema: json.RawMessage(`{"type":"object"}`)},
+		func(context.Context, *sdkmcp.CallToolRequest) (*sdkmcp.CallToolResult, error) {
+			return &sdkmcp.CallToolResult{}, nil
+		})
+	if err := server.Run(context.Background(), &sdkmcp.StdioTransport{}); err != nil {
+		os.Exit(1)
+	}
+	os.Exit(0)
+}
+
+type bearerRoundTripper struct{ value string }
+
+func (b bearerRoundTripper) RoundTrip(request *http.Request) (*http.Response, error) {
+	clone := request.Clone(request.Context())
+	clone.Header.Set("Authorization", b.value)
+	return http.DefaultTransport.RoundTrip(clone)
+}
+
+func TestStartClassifiesSessionNewAuthRefusal(t *testing.T) {
+	t.Parallel()
+
+	t.Run("Should report a provider sign-in failure with login guidance", func(t *testing.T) {
+		t.Parallel()
+
+		driver := New()
+		_, err := driver.Start(testutil.Context(t), StartOpts{
+			AgentName:   "helper",
+			Command:     helperCommand(t),
+			Cwd:         t.TempDir(),
+			Env:         helperEnv("new_session_auth_required", ""),
+			Permissions: compozyconfig.PermissionModeApproveAll,
+		})
+		failure, ok := errors.AsType[*FailureError](err)
+		if !ok || failure.Kind != store.FailureProviderAuth {
+			t.Fatalf("Start() error = %v, want provider-auth failure", err)
+		}
+		item, ok := diagnostics.ItemFromError(err)
+		if !ok || item.Code != diagcontract.CodeProviderNotAuthenticated ||
+			!strings.Contains(item.Message, "compozy provider auth login helper") {
+			t.Fatalf("Start() diagnostic = %#v, %t; want not-authenticated login guidance", item, ok)
+		}
+	})
+}
+
+func TestProviderSignInRequiredFailure(t *testing.T) {
+	t.Parallel()
+
+	t.Run("Should name the provider rather than the agent in login guidance", func(t *testing.T) {
+		t.Parallel()
+
+		cause := &acpsdk.RequestError{Code: -32000, Message: "Authentication required"}
+		err := providerSignInRequiredFailure(StartOpts{ProviderName: "copilot", AgentName: "reviewer"}, cause)
+		item, ok := diagnostics.ItemFromError(err)
+		if !ok || !strings.Contains(item.Message, "compozy provider auth login copilot") {
+			t.Fatalf("diagnostic = %#v, %t; want the provider login command", item, ok)
+		}
+	})
+}
+
+func TestStartResumeReturnsSentinelErrors(t *testing.T) {
+	t.Parallel()
+
+	tests := map[string]struct {
+		envScenario string
+		wantErr     error
+	}{
+		"load session failure": {
+			envScenario: "load_session_error",
+			wantErr:     ErrLoadSessionFailed,
+		},
+		"agent missing load session support": {
+			envScenario: "stream_updates",
+			wantErr:     ErrAgentDoesNotSupportSession,
+		},
+	}
+
+	for name, tc := range tests {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+
+			driver := New()
+			_, err := driver.Start(testutil.Context(t), StartOpts{
+				AgentName:       "helper",
+				Command:         helperCommand(t),
+				Cwd:             t.TempDir(),
+				Env:             helperEnv(tc.envScenario, ""),
+				Permissions:     compozyconfig.PermissionModeApproveAll,
+				ResumeSessionID: "sess-existing",
+			})
+			if err == nil {
+				t.Fatalf("Start(%s) error = nil, want non-nil", tc.envScenario)
+			}
+			if !errors.Is(err, tc.wantErr) {
+				t.Fatalf("Start(%s) error = %v, want errors.Is(..., %v)", tc.envScenario, err, tc.wantErr)
+			}
+		})
+	}
+}
+
+func TestStartIncludesAgentContextInLaunchErrors(t *testing.T) {
+	t.Parallel()
+
+	driver := New()
+	_, err := driver.Start(testutil.Context(t), StartOpts{
+		AgentName:   "missing-helper",
+		Command:     "/definitely/missing-binary",
+		Cwd:         t.TempDir(),
+		Permissions: compozyconfig.PermissionModeApproveAll,
+	})
+	if err == nil {
+		t.Fatal("Start() error = nil, want non-nil")
+	}
+	if !strings.Contains(err.Error(), `start agent "missing-helper" subprocess "/definitely/missing-binary"`) {
+		t.Fatalf("Start() error = %q, want agent and command context", err)
+	}
+}
+
+func TestIsLoadSessionResourceMissing(t *testing.T) {
+	t.Parallel()
+
+	tests := map[string]struct {
+		err  error
+		want bool
+	}{
+		"ShouldDetectResourceMissingRequestError": {
+			err: fmt.Errorf(
+				"%w: load session %q for %q: %w",
+				ErrLoadSessionFailed,
+				"sess-existing",
+				"helper",
+				&acpsdk.RequestError{
+					Code:    requestErrorResourceNotFoundCode,
+					Message: "Resource not found: sess-existing",
+				},
+			),
+			want: true,
+		},
+		"ShouldRejectDifferentRequestError": {
+			err: fmt.Errorf(
+				"%w: load session %q for %q: %w",
+				ErrLoadSessionFailed,
+				"sess-existing",
+				"helper",
+				&acpsdk.RequestError{Code: -32603, Message: "Internal error"},
+			),
+			want: false,
+		},
+		"ShouldRejectNonLoadSessionError": {
+			err:  errors.New("boom"),
+			want: false,
+		},
+	}
+
+	for name, tc := range tests {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+
+			if got := IsLoadSessionResourceMissing(tc.err); got != tc.want {
+				t.Fatalf("IsLoadSessionResourceMissing() = %v, want %v", got, tc.want)
+			}
+		})
+	}
+}
+
+func TestCleanupFailedStartReturnsJoinedErrorWhenStopFails(t *testing.T) {
+	t.Parallel()
+
+	t.Run("Should preserve start and cleanup failures", func(t *testing.T) {
+		t.Parallel()
+
+		driver := New()
+		proc := &AgentProcess{done: make(chan struct{}), stderr: &lockedBuffer{}}
+		stopErr := errors.New("stop failed")
+		proc.setWaitError(stopErr)
+		close(proc.done)
+
+		startErr := fmt.Errorf(
+			"%w: load session %q for %q: %w",
+			ErrLoadSessionFailed,
+			"sess-existing",
+			"helper",
+			errors.New("load failed"),
+		)
+		err := driver.cleanupFailedStart(proc, startErr)
+		assertACPErrorContains(t, err, "stop failed while cleaning up failed start")
+		if !errors.Is(err, ErrLoadSessionFailed) {
+			t.Fatalf("cleanupFailedStart() error = %v, want ErrLoadSessionFailed", err)
+		}
+		if !errors.Is(err, stopErr) {
+			t.Fatalf("cleanupFailedStart() error = %v, want stopErr", err)
+		}
+	})
+}
+
+func TestCleanupFailedStartIncludesRedactedBoundedStderr(t *testing.T) {
+	t.Parallel()
+
+	t.Run("Should redact and bound startup stderr", func(t *testing.T) {
+		t.Parallel()
+
+		const secret = "hermes-cleanup-secret"
+		process := &AgentProcess{done: make(chan struct{}), stderr: &lockedBuffer{}}
+		if _, err := process.stderr.Write(
+			[]byte("token=" + secret + " " + strings.Repeat("startup context ", 400)),
+		); err != nil {
+			t.Fatalf("stderr.Write() error = %v", err)
+		}
+		close(process.done)
+
+		err := New().cleanupFailedStart(process, errors.New("session setup failed"))
+		assertACPErrorContains(t, err, "stderr=")
+		if strings.Contains(err.Error(), secret) {
+			t.Fatalf("cleanupFailedStart() leaked secret: %v", err)
+		}
+		// The cleanup stop may join its own verification error after the start error;
+		// only the attached stderr segment (which carries no newline here) is bounded.
+		stderrIndex := strings.Index(err.Error(), "stderr=")
+		attached, _, _ := strings.Cut(err.Error()[stderrIndex+len("stderr="):], "\n")
+		if got := len(attached); got > maxFailureSummaryBytes {
+			t.Fatalf("attached stderr length = %d, want <= %d", got, maxFailureSummaryBytes)
+		}
+		if !strings.Contains(err.Error(), "startup context") {
+			t.Fatalf("cleanupFailedStart() dropped startup stderr: %v", err)
+		}
+	})
+}
+
+func TestStartCapturesHermesModelStateAsTypedConfigOption(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name              string
+		payload           string
+		wantModel         string
+		wantValues        []string
+		wantOptionIDs     []string
+		wantModelReadOnly bool
+		wantReasoning     string
+		wantBooleanID     string
+		wantBooleanValue  bool
+	}{
+		{
+			name:              "Should capture models from session new when config options omit a model",
+			payload:           `{"sessionId":"sess-new","models":{"currentModelId":"openrouter:grok-4.6","availableModels":[{"modelId":"openrouter:grok-4.6","name":"Grok 4.6","description":"fast"},{"modelId":"openrouter:opus-5","name":"Opus 5"}]},"configOptions":[{"type":"select","id":"reasoning_effort","name":"Reasoning","currentValue":"high","options":[{"value":"high","name":"High"}]}]}`,
+			wantModel:         "openrouter:grok-4.6",
+			wantValues:        []string{"openrouter:grok-4.6", "openrouter:opus-5"},
+			wantOptionIDs:     []string{"reasoning_effort", "model"},
+			wantModelReadOnly: true,
+			wantReasoning:     "high",
+		},
+		{
+			name:              "Should capture models from session load when config options omit a model",
+			payload:           `{"models":{"currentModelId":"anthropic:claude-opus-5","availableModels":[{"modelId":"anthropic:claude-opus-5","name":"Claude Opus 5"}]},"configOptions":[{"type":"boolean","id":"thinking","name":"Thinking","currentValue":true}]}`,
+			wantModel:         "anthropic:claude-opus-5",
+			wantValues:        []string{"anthropic:claude-opus-5"},
+			wantOptionIDs:     []string{"thinking", "model"},
+			wantModelReadOnly: true,
+			wantBooleanID:     "thinking",
+			wantBooleanValue:  true,
+		},
+		{
+			name:             "Should preserve an advertised model config option over the session models state",
+			payload:          `{"models":{"currentModelId":"hermes:extension-model","availableModels":[{"modelId":"hermes:extension-model","name":"Extension model"}]},"configOptions":[{"type":"select","id":"model","name":"Model","currentValue":"provider:configured-model","options":[{"value":"provider:configured-model","name":"Configured model"}]},{"type":"boolean","id":"thinking","name":"Thinking","currentValue":false}]}`,
+			wantModel:        "provider:configured-model",
+			wantValues:       []string{"provider:configured-model"},
+			wantOptionIDs:    []string{"model", "thinking"},
+			wantBooleanID:    "thinking",
+			wantBooleanValue: false,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			var response wireSessionSetupResponse
+			if err := json.Unmarshal([]byte(tc.payload), &response); err != nil {
+				t.Fatalf("json.Unmarshal() error = %v", err)
+			}
+			caps := captureSessionSetupCaps(Caps{}, response)
+
+			if got, want := configOptionIDs(caps.ConfigOptions), tc.wantOptionIDs; !slices.Equal(got, want) {
+				t.Fatalf("config option ids = %#v, want %#v", got, want)
+			}
+			model, ok := ModelConfigOption(caps.ConfigOptions)
+			if !ok {
+				t.Fatal("ModelConfigOption() ok = false, want true")
+			}
+			if model.CurrentValueID != tc.wantModel {
+				t.Fatalf("model current value = %q, want %q", model.CurrentValueID, tc.wantModel)
+			}
+			if model.ReadOnly != tc.wantModelReadOnly {
+				t.Fatalf("model read-only = %t, want %t", model.ReadOnly, tc.wantModelReadOnly)
+			}
+			values := make([]string, 0, len(model.Values))
+			for _, value := range model.Values {
+				values = append(values, value.Value)
+			}
+			if !slices.Equal(values, tc.wantValues) {
+				t.Fatalf("model values = %#v, want %#v", values, tc.wantValues)
+			}
+			if tc.wantReasoning != "" {
+				reasoning, ok := findConfigOptionByID(caps.ConfigOptions, "reasoning_effort")
+				if !ok || reasoning.CurrentValueID != tc.wantReasoning {
+					t.Fatalf("reasoning option = %#v, %v, want current %q", reasoning, ok, tc.wantReasoning)
+				}
+			}
+			if tc.wantBooleanID != "" {
+				boolean, ok := findConfigOptionByID(caps.ConfigOptions, tc.wantBooleanID)
+				if !ok || boolean.CurrentBool == nil || *boolean.CurrentBool != tc.wantBooleanValue {
+					t.Fatalf("boolean option = %#v, %v, want current %t", boolean, ok, tc.wantBooleanValue)
+				}
+			}
+		})
+	}
+}
+
+func configOptionIDs(options []SessionConfigOption) []string {
+	ids := make([]string, 0, len(options))
+	for _, option := range options {
+		ids = append(ids, option.ID)
+	}
+	return ids
+}
+
+func TestHermesDiscoveryModelIsReadOnlyForModernACP(t *testing.T) {
+	t.Parallel()
+
+	t.Run("Should reject writes to the synthetic discovery model", func(t *testing.T) {
+		t.Parallel()
+
+		modelOption, ok := sessionModelConfigOption(&wireSessionModelState{
+			CurrentModelID: "openrouter:grok-4.6",
+			AvailableModels: []wireSessionModelInfo{
+				{ModelID: "openrouter:grok-4.6", Name: "Grok 4.6"},
+			},
+		})
+		if !ok {
+			t.Fatal("sessionModelConfigOption() ok = false, want true")
+		}
+		if !modelOption.ReadOnly {
+			t.Fatal("discovered model option read-only = false, want true")
+		}
+
+		process := &AgentProcess{
+			conn: &acpsdk.Connection{},
+			caps: Caps{ConfigOptions: []SessionConfigOption{modelOption}},
+		}
+		applied, err := New().applySessionModel(
+			t.Context(),
+			process,
+			"openrouter:grok-4.6",
+		)
+		if applied {
+			t.Fatal("applySessionModel() applied = true, want false for discovery-only model")
+		}
+		assertACPErrorContains(t, err, "session/set_model")
+		if !errors.Is(err, errModelConfigOptionReadOnly) {
+			t.Fatalf("applySessionModel() error = %v, want read-only diagnostic", err)
+		}
+	})
+}
+
+func TestAttachStderrRedactsAndBoundsSetupDiagnostics(t *testing.T) {
+	t.Parallel()
+
+	t.Run("Should redact secrets and bound setup diagnostics", func(t *testing.T) {
+		t.Parallel()
+
+		const secret = "super-secret-hermes-token"
+		rawStderr := "token=" + secret + " " + strings.Repeat("startup context ", 400)
+		err := attachStderr(errors.New("ACP initialize handshake failed"), rawStderr)
+		assertACPErrorContains(t, err, "[REDACTED]")
+		assertACPErrorContains(t, err, "stderr=")
+		if strings.Contains(err.Error(), secret) {
+			t.Fatalf("attachStderr() leaked secret: %v", err)
+		}
+		stderrIndex := strings.Index(err.Error(), "stderr=")
+		if got := len(err.Error()[stderrIndex+len("stderr="):]); got > maxFailureSummaryBytes {
+			t.Fatalf("attached stderr length = %d, want <= %d", got, maxFailureSummaryBytes)
+		}
+	})
+}
+
+func assertACPErrorContains(t *testing.T, err error, fragment string) {
+	t.Helper()
+	if err == nil {
+		t.Fatalf("error = nil, want error containing %q", fragment)
+	}
+	if !strings.Contains(err.Error(), fragment) {
+		t.Fatalf("error = %v, want fragment %q", err, fragment)
+	}
+}
+
+func TestSteerCapabilityResolution(t *testing.T) {
+	t.Parallel()
+	cases := []struct {
+		name      string
+		provider  string
+		announced []string
+		override  compozyconfig.SteerCapability
+		want      compozyconfig.SteerCapability
+	}{
+		{
+			name:     "Should fall back for an unproven provider binary",
+			provider: "codex",
+			want:     compozyconfig.SteerCapabilityNone,
+		},
+		{name: "Should fall back for an unknown provider", provider: "custom", want: compozyconfig.SteerCapabilityNone},
+		{
+			name:      "Should prefer the announced extension over an explicit none override",
+			provider:  "codex",
+			announced: []string{steerExtensionMethod},
+			override:  compozyconfig.SteerCapabilityNone,
+			want:      compozyconfig.SteerCapabilityExtension,
+		},
+		{
+			name:     "Should use an explicit concurrent prompt override without an announcement",
+			provider: "custom",
+			override: compozyconfig.SteerCapabilityConcurrentPrompt,
+			want:     compozyconfig.SteerCapabilityConcurrentPrompt,
+		},
+		{
+			name:      "Should ignore unrelated extension announcements",
+			provider:  "custom",
+			announced: []string{"_session/other"},
+			want:      compozyconfig.SteerCapabilityNone,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			if got := ResolveSteerCapability(tc.provider, tc.announced, tc.override); got != tc.want {
+				t.Fatalf("ResolveSteerCapability() = %q, want %q", got, tc.want)
+			}
+		})
+	}
+}
+
+func TestStartCapturesSteerCapability(t *testing.T) {
+	t.Parallel()
+	cases := []struct {
+		name     string
+		scenario string
+		override compozyconfig.SteerCapability
+		want     compozyconfig.SteerCapability
+	}{
+		{
+			"Should capture the top-level steering announcement",
+			"steering_capability",
+			compozyconfig.SteerCapabilityNone,
+			compozyconfig.SteerCapabilityExtension,
+		},
+		{
+			"Should preserve an explicit override without an announcement",
+			"initialize_contract",
+			compozyconfig.SteerCapabilityConcurrentPrompt,
+			compozyconfig.SteerCapabilityConcurrentPrompt,
+		},
+		{
+			"Should not infer steering from ordinary prompt support",
+			"initialize_contract",
+			"",
+			compozyconfig.SteerCapabilityNone,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			driver := New(WithProviderPreStarter(providers.NewPreStarter()))
+			proc := startHelperProcess(t, driver, tc.scenario, "", StartOpts{
+				ProviderName:   "custom",
+				ProviderConfig: &compozyconfig.ProviderConfig{SteerCapability: tc.override},
+			})
+			defer stopProcess(t, driver, proc)
+			if got := proc.CapsSnapshot().SteerCapability; got != tc.want {
+				t.Fatalf("negotiated steering = %q, want %q", got, tc.want)
+			}
+		})
+	}
+}
+
+func TestStartWithUnconfiguredAttempts(t *testing.T) {
+	t.Parallel()
+	for _, count := range []int{0, -1} {
+		name := "Should launch when the driver attempt count is zero"
+		if count < 0 {
+			name = "Should launch when the driver attempt count is negative"
+		}
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+			launchErr := errors.New("launch rejected")
+			launcher := &recordingLauncher{err: launchErr}
+			driver := &Driver{startAttempts: count}
+			proc, err := driver.Start(t.Context(), StartOpts{
+				AgentName: "helper",
+				Command:   helperCommand(t),
+				Cwd:       t.TempDir(),
+				Launcher:  launcher,
+			})
+			if proc != nil || !errors.Is(err, launchErr) {
+				t.Fatalf("Start() = %v, %v, want launch failure", proc, err)
+			}
+			if _, launched := launcher.lastSpec(); !launched {
+				t.Fatal("Start() never attempted process launch")
+			}
+		})
+	}
+}
+
+func TestStartDisablesClaudeProviderInternalBackgroundWakes(t *testing.T) {
+	t.Parallel()
+
+	// The helper ignores trailing arguments; the adapter token is what classifies the bridge.
+	claudeBridge := helperCommand(t) + " @agentclientprotocol/claude-agent-acp@latest"
+	assertClaudeOptions := func(t *testing.T, method string, params map[string]json.RawMessage) {
+		t.Helper()
+		var meta struct {
+			ClaudeCode struct {
+				EmitRawSDKMessages []map[string]string `json:"emitRawSDKMessages"`
+				Options            struct {
+					DisallowedTools []string          `json:"disallowedTools"`
+					Env             map[string]string `json:"env"`
+					Settings        struct {
+						Hooks struct {
+							PreToolUse []struct {
+								Matcher string `json:"matcher"`
+								Hooks   []struct {
+									Type    string `json:"type"`
+									Command string `json:"command"`
+								} `json:"hooks"`
+							} `json:"PreToolUse"`
+						} `json:"hooks"`
+					} `json:"settings"`
+				} `json:"options"`
+			} `json:"claudeCode"`
+		}
+		if err := json.Unmarshal(params["_meta"], &meta); err != nil {
+			t.Fatalf("%s _meta = %s, decode error = %v", method, params["_meta"], err)
+		}
+		options := meta.ClaudeCode.Options
+		for _, tool := range []string{"Monitor", "ScheduleWakeup", "CronCreate"} {
+			if !slices.Contains(options.DisallowedTools, tool) {
+				t.Fatalf(
+					"%s _meta.claudeCode.options.disallowedTools = %#v, want %s",
+					method,
+					options.DisallowedTools,
+					tool,
+				)
+			}
+		}
+		// Background Agent subagents keep working: the bridge holds the prompt until they settle.
+		if env := options.Env; env["CLAUDE_CODE_DISABLE_MCP_TASK_BACKGROUND"] != "1" ||
+			env["CLAUDE_CODE_DISABLE_CRON"] != "1" || env["CLAUDE_CODE_DISABLE_BACKGROUND_TASKS"] != "" {
+			t.Fatalf(
+				"%s _meta.claudeCode.options.env = %#v, want MCP/cron backgrounding off and subagents on",
+				method,
+				env,
+			)
+		}
+		hooks := options.Settings.Hooks.PreToolUse
+		if len(hooks) != 1 || hooks[0].Matcher != "Bash|PowerShell" || len(hooks[0].Hooks) != 1 ||
+			hooks[0].Hooks[0].Type != "command" ||
+			!strings.Contains(hooks[0].Hooks[0].Command, "run_in_background") ||
+			!strings.Contains(hooks[0].Hooks[0].Command, `"permissionDecision":"deny"`) {
+			t.Fatalf("%s PreToolUse hooks = %#v, want one shell run_in_background deny hook", method, hooks)
+		}
+		// Only the four SDK task lifecycle messages are forwarded, never every raw SDK message.
+		wantFilters := []map[string]string{
+			{"type": "system", "subtype": "task_started"},
+			{"type": "system", "subtype": "task_progress"},
+			{"type": "system", "subtype": "task_updated"},
+			{"type": "system", "subtype": "task_notification"},
+		}
+		if !slices.EqualFunc(meta.ClaudeCode.EmitRawSDKMessages, wantFilters, maps.Equal) {
+			t.Fatalf("%s emitRawSDKMessages = %#v, want %#v", method, meta.ClaudeCode.EmitRawSDKMessages, wantFilters)
+		}
+	}
+
+	t.Run("Should send Claude background-wake options on session/new", func(t *testing.T) {
+		t.Parallel()
+		captureFile := filepath.Join(t.TempDir(), "session-new.jsonl")
+		proc := startHelperProcess(t, New(), "stream_updates", "", StartOpts{
+			Command: claudeBridge,
+			Env:     helperEnvWithCapture("stream_updates", "", captureFile),
+		})
+		defer stopProcess(t, New(), proc)
+		assertClaudeOptions(t, "session/new", captureRequestParams(t, captureFile, acpsdk.AgentMethodSessionNew))
+		if !proc.claudeTasks.enabled.Load() {
+			t.Fatal("Claude bridge process does not accept the task messages it requested")
+		}
+	})
+
+	t.Run("Should send Claude background-wake options on session/load", func(t *testing.T) {
+		t.Parallel()
+		captureFile := filepath.Join(t.TempDir(), "session-load.jsonl")
+		proc := startHelperProcess(t, New(), "load_session", "", StartOpts{
+			Command:         claudeBridge,
+			ResumeSessionID: "sess-existing",
+			Env:             helperEnvWithCapture("load_session", "", captureFile),
+		})
+		defer stopProcess(t, New(), proc)
+		assertClaudeOptions(t, "session/load", captureRequestParams(t, captureFile, acpsdk.AgentMethodSessionLoad))
+	})
+
+	t.Run("Should send Claude options and task filters on session/resume", func(t *testing.T) {
+		t.Parallel()
+		captureFile := filepath.Join(t.TempDir(), "session-resume.jsonl")
+		proc := startHelperProcess(t, New(), "resume_session", "", StartOpts{
+			Command:         claudeBridge,
+			ResumeSessionID: "sess-existing",
+			Env:             helperEnvWithCapture("resume_session", "", captureFile),
+		})
+		defer stopProcess(t, New(), proc)
+		assertClaudeOptions(t, "session/resume", captureRequestParams(t, captureFile, acpsdk.AgentMethodSessionResume))
+	})
+
+	t.Run("Should launch an input-only child without the operator's Claude Code environment", func(t *testing.T) {
+		t.Parallel()
+		captureFile := filepath.Join(t.TempDir(), "session-new.jsonl")
+		proc := startHelperProcess(t, New(), "stream_updates", "", StartOpts{
+			Command:   claudeBridge,
+			InputOnly: true,
+			Env:       helperEnvWithCapture("stream_updates", "", captureFile),
+		})
+		defer stopProcess(t, New(), proc)
+		params := captureRequestParams(t, captureFile, acpsdk.AgentMethodSessionNew)
+		var meta struct {
+			SystemPrompt string `json:"systemPrompt"`
+			ClaudeCode   struct {
+				Options struct {
+					Tools           *[]string         `json:"tools"`
+					StrictMCPConfig bool              `json:"strictMcpConfig"`
+					Plugins         *[]any            `json:"plugins"`
+					Skills          *[]string         `json:"skills"`
+					Env             map[string]string `json:"env"`
+					Settings        struct {
+						DisableAllHooks bool `json:"disableAllHooks"`
+					} `json:"settings"`
+				} `json:"options"`
+			} `json:"claudeCode"`
+		}
+		if err := json.Unmarshal(params["_meta"], &meta); err != nil {
+			t.Fatalf("session/new _meta = %s, decode error = %v", params["_meta"], err)
+		}
+		options := meta.ClaudeCode.Options
+		if options.Tools == nil || len(*options.Tools) != 0 || !options.StrictMCPConfig ||
+			options.Plugins == nil || len(*options.Plugins) != 0 || options.Skills == nil ||
+			len(*options.Skills) != 0 || !options.Settings.DisableAllHooks {
+			t.Fatalf("input-only options = %+v, want no tools, strict MCP, no plugins or skills, hooks off", options)
+		}
+		for _, key := range []string{"CLAUDE_CODE_DISABLE_AUTO_MEMORY", "CLAUDE_CODE_DISABLE_CLAUDE_MDS"} {
+			if options.Env[key] != "1" {
+				t.Fatalf("input-only env %s = %q, want 1", key, options.Env[key])
+			}
+		}
+		if options.Env["ENABLE_CLAUDEAI_MCP_SERVERS"] != "false" {
+			t.Fatalf("input-only env = %#v, want claude.ai MCP connectors off", options.Env)
+		}
+		if meta.SystemPrompt != claudeInputOnlySystemPrompt {
+			t.Fatalf("input-only systemPrompt = %q, want the text-only override %q",
+				meta.SystemPrompt, claudeInputOnlySystemPrompt)
+		}
+		if mcpServers := string(params["mcpServers"]); mcpServers != "[]" {
+			t.Fatalf("input-only mcpServers = %s, want []", mcpServers)
+		}
+	})
+
+	t.Run("Should give Windows a PowerShell hook that does not need Git Bash", func(t *testing.T) {
+		t.Parallel()
+		hook := claudeBackgroundShellDenyHook("windows")
+		command, _ := hook["command"].(string)
+		if hook["shell"] != "powershell" || !strings.Contains(command, "[Console]::In.ReadToEnd()") ||
+			!strings.Contains(command, `"permissionDecision":"deny"`) {
+			t.Fatalf("windows hook = %#v, want a PowerShell deny hook", hook)
+		}
+		if _, ok := claudeBackgroundShellDenyHook("darwin")["shell"]; ok {
+			t.Fatal("POSIX hook must use the default shell")
+		}
+	})
+
+	t.Run("Should add the shell-wait guard only when the session can redirect", func(t *testing.T) {
+		t.Parallel()
+		if got := claudePreToolUseHooks(StartOpts{}); len(got) != 1 {
+			t.Fatalf("unguarded hooks = %#v, want only the background deny", got)
+		}
+		hooks := claudePreToolUseHooks(StartOpts{ShellWaitGuard: true})
+		if len(hooks) != 2 {
+			t.Fatalf("guarded hooks = %#v, want the background deny and the wait guard", hooks)
+		}
+		guard, ok := hooks[1].(map[string]any)
+		if !ok || !strings.Contains(guard["command"].(string), "__internal shell-wait-hook") {
+			t.Fatalf("guard hook = %#v, want the hidden compozy verb", hooks[1])
+		}
+		if meta := claudeCodeSessionMeta(StartOpts{
+			Command: claudeBridge, InputOnly: true, ShellWaitGuard: true,
+		}); strings.Contains(fmt.Sprint(meta), "shell-wait-hook") {
+			t.Fatalf("input-only meta = %#v, want no hooks", meta)
+		}
+	})
+
+	t.Run("Should give Windows a shell-wait hook that does not need Git Bash", func(t *testing.T) {
+		t.Parallel()
+		hook := claudeShellWaitDenyHook("windows")
+		command, _ := hook["command"].(string)
+		if hook["shell"] != "powershell" || !strings.Contains(command, "[Console]::In.ReadToEnd()") ||
+			!strings.Contains(command, "$env:COMPOZY_BIN") {
+			t.Fatalf("windows hook = %#v, want a PowerShell hook calling the daemon binary", hook)
+		}
+	})
+
+	t.Run("Should run the POSIX shell-wait hook cheaply and fail open", func(t *testing.T) {
+		t.Parallel()
+		if runtime.GOOS == "windows" {
+			t.Skip("POSIX hook")
+		}
+		dir := t.TempDir()
+		marker := filepath.Join(dir, "called")
+		compozy := filepath.Join(dir, "compozy")
+		script := "#!/bin/sh\ncat > '" + marker + "'\nprintf 'decision'\n"
+		if err := os.WriteFile(compozy, []byte(script), 0o700); err != nil {
+			t.Fatalf("WriteFile() error = %v", err)
+		}
+		command, _ := claudeShellWaitDenyHook(runtime.GOOS)["command"].(string)
+		run := func(bin string, input string) string {
+			t.Helper()
+			cmd := exec.CommandContext(t.Context(), "/bin/sh", "-c", command)
+			cmd.Env = []string{"COMPOZY_BIN=" + bin, "PATH=/usr/bin:/bin"}
+			cmd.Stdin = strings.NewReader(input)
+			output, err := cmd.Output()
+			if err != nil {
+				t.Fatalf("hook error = %v, want exit 0", err)
+			}
+			return string(output)
+		}
+
+		if output := run(compozy, `{"tool_input":{"command":"git status"}}`); output != "" {
+			t.Fatalf("output = %q, want silence", output)
+		}
+		if _, err := os.Stat(marker); !errors.Is(err, os.ErrNotExist) {
+			t.Fatalf("binary ran for a command with no wait words: %v", err)
+		}
+		input := `{"tool_input":{"command":"echo \"sleep\" 'x' \\n"}}`
+		if output := run(compozy, input); output != "decision" {
+			t.Fatalf("output = %q, want the binary's decision", output)
+		}
+		forwarded, err := os.ReadFile(marker)
+		if err != nil || string(forwarded) != input {
+			t.Fatalf("forwarded = %q, %v, want %q", forwarded, err, input)
+		}
+		if output := run(filepath.Join(dir, "missing"), `{"tool_input":{"command":"sleep 60"}}`); output != "" {
+			t.Fatalf("missing binary output = %q, want silence", output)
+		}
+	})
+
+	t.Run("Should keep other providers' session/new payload free of Claude options", func(t *testing.T) {
+		t.Parallel()
+		captureFile := filepath.Join(t.TempDir(), "session-new.jsonl")
+		proc := startHelperProcess(t, New(), "stream_updates", "", StartOpts{
+			Command: helperCommand(t) + " @agentclientprotocol/codex-acp@latest",
+			Env:     helperEnvWithCapture("stream_updates", "", captureFile),
+		})
+		defer stopProcess(t, New(), proc)
+		if meta, exists := captureRequestParams(t, captureFile, acpsdk.AgentMethodSessionNew)["_meta"]; exists {
+			t.Fatalf("session/new _meta = %#v, want absent for codex-acp", meta)
+		}
+		if proc.claudeTasks.enabled.Load() {
+			t.Fatal("non-Claude process accepts Claude task messages")
+		}
+	})
+}
+
+func TestStartFinalizesRuntimeGuidance(t *testing.T) {
+	t.Parallel()
+	t.Run("Should deliver finalized guidance on the first prompt", func(t *testing.T) {
+		t.Parallel()
+		driver := New()
+		proc := startHelperProcess(t, driver, "initialize_contract", "", StartOpts{
+			SystemPrompt: "unconfirmed tools",
+			FinalizeStartup: func(context.Context) (string, StartupManifest, error) {
+				return "confirmed runtime guidance", OpaqueStartupManifest("confirmed runtime guidance", false), nil
+			},
+		})
+		defer stopProcess(t, driver, proc)
+		text, included, _ := proc.nextPromptText("hello", false)
+		if !included || strings.Contains(text, "unconfirmed tools") ||
+			!strings.Contains(text, "confirmed runtime guidance") {
+			t.Fatalf("first prompt = %q", text)
+		}
+		proc.systemPromptMu.Lock()
+		manifest := CloneStartupManifest(proc.startupManifest)
+		proc.systemPromptMu.Unlock()
+		if len(manifest.Spans) != 1 || manifest.Spans[0].Key != "system_prompt" ||
+			manifest.Spans[0].Bytes != int64(len("confirmed runtime guidance")) {
+			t.Fatalf("finalized manifest = %#v", manifest)
+		}
+	})
+}
+
+func TestTriageStartup(t *testing.T) {
+	for _, tc := range []struct {
+		name, provider, scenario string
+		allowed                  bool
+	}{
+		{"Should select the verified Claude planning mode", "claude", "mode_mapping", true},
+		{"Should confirm a config-only planning mode", "opencode", "triage_config_mode", true},
+		{"Should reject an unverified Kimi planning mode", "kimi-cli", "triage_config_mode", false},
+		{"Should reject an unconfirmed planning mode", "opencode", "triage_config_unconfirmed", false},
+		{"Should reject an unknown providers planning mode", "unknown", "triage_config_mode", false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			driver := New(WithProviderPreStarter(providers.NewPreStarter()))
+			process, err := driver.Start(t.Context(), StartOpts{
+				ProviderConfig: &compozyconfig.ProviderConfig{AuthMode: compozyconfig.ProviderAuthModeNone},
+				AgentName:      "helper",
+				ProviderName:   tc.provider,
+				Command:        helperCommand(t),
+				Cwd:            t.TempDir(),
+				Env: helperEnv(
+					tc.scenario,
+					"",
+				),
+				PermissionPolicy: &StartPermissionPolicy{ExecutionPolicy: ExecutionPolicyTriage},
+				Permissions:      compozyconfig.PermissionModeApproveAll,
+			})
+			if process != nil {
+				defer stopProcess(t, driver, process)
+			}
+			if (err == nil) != tc.allowed {
+				t.Fatalf("triage startup: %v", err)
+			}
+			if tc.allowed && tc.scenario == "triage_config_mode" {
+				option, ok := findSelectConfigOption(process.CapsSnapshot().ConfigOptions, "mode")
+				if !ok || option.CurrentValueID != "plan" {
+					t.Fatalf("confirmed mode = %+v", option)
+				}
+			}
+		})
+	}
+	t.Run("Should reject a provider without an explicit read only mode", func(t *testing.T) {
+		t.Parallel()
+		driver := New(WithProviderPreStarter(providers.NewPreStarter()))
+		process, err := driver.Start(t.Context(), StartOpts{
+			ProviderConfig: &compozyconfig.ProviderConfig{AuthMode: compozyconfig.ProviderAuthModeNone},
+			AgentName:      "helper",
+			ProviderName:   "helper",
+			Command:        helperCommand(t),
+			Cwd:            t.TempDir(),
+			Env: helperEnv(
+				"mode_mapping",
+				"",
+			),
+			PermissionPolicy: &StartPermissionPolicy{ExecutionPolicy: ExecutionPolicyTriage},
+			Permissions:      compozyconfig.PermissionModeApproveAll,
+		})
+		if process != nil {
+			stopProcess(t, driver, process)
+		}
+		if !errors.Is(err, ErrTriageUnsupported) {
+			t.Fatalf("startup error=%v, want triage_unsupported", err)
+		}
+	})
+}
+
+func TestSessionModeTransport(t *testing.T) {
+	t.Parallel()
+	gateway := toolExecutionGatewayFunc(
+		func(_ context.Context, req ToolExecutionRequest) (ToolExecutionRequest, error) {
+			return req, nil
+		},
+	)
+	assertModeConfigOption := func(t *testing.T, captureFile, want string) {
+		t.Helper()
+		request := decodeCapturedSetSessionConfigOptionRequest(
+			t,
+			captureRequestParams(t, captureFile, acpsdk.AgentMethodSessionSetConfigOption),
+		)
+		if request.ConfigID != "mode" || request.Value != want {
+			t.Fatalf("set_config_option = %+v, want mode=%s", request, want)
+		}
+	}
+
+	t.Run("Should send session/set_mode for a mode advertised as session mode and config option", func(t *testing.T) {
+		t.Parallel()
+		driver := New()
+		captureFile := filepath.Join(t.TempDir(), "mode-dual.jsonl")
+		proc := startHelperProcess(t, driver, "cursor_mode_mapping", "", StartOpts{
+			Env:         helperEnvWithCapture("cursor_mode_mapping", "", captureFile),
+			ToolGateway: gateway,
+		})
+		defer stopProcess(t, driver, proc)
+
+		request := decodeCapturedSetSessionModeRequest(
+			t,
+			captureRequestParams(t, captureFile, acpsdk.AgentMethodSessionSetMode),
+		)
+		if request.SessionID != "sess-new" || request.ModeID != "agent" {
+			t.Fatalf("set_mode = %+v, want sess-new agent", request)
+		}
+		if captureMethodExists(t, captureFile, acpsdk.AgentMethodSessionSetConfigOption) {
+			t.Fatal("set_config_option was sent for an advertised session mode")
+		}
+		assertConfigOption(t, proc.CapsSnapshot().ConfigOptions, "mode", "agent", "agent", "plan", "ask")
+	})
+
+	t.Run("Should send session/set_config_option for a mode only in config options", func(t *testing.T) {
+		t.Parallel()
+		driver := New()
+		captureFile := filepath.Join(t.TempDir(), "mode-config-only.jsonl")
+		proc := startHelperProcess(t, driver, "cursor_mode_config_only", "", StartOpts{
+			Env:         helperEnvWithCapture("cursor_mode_config_only", "", captureFile),
+			ToolGateway: gateway,
+		})
+		defer stopProcess(t, driver, proc)
+
+		assertModeConfigOption(t, captureFile, "agent")
+		if captureMethodExists(t, captureFile, acpsdk.AgentMethodSessionSetMode) {
+			t.Fatal("set_mode was sent for a mode the provider does not advertise as a session mode")
+		}
+		assertConfigOption(t, proc.CapsSnapshot().ConfigOptions, "mode", "agent", "agent", "plan", "ask")
+	})
+
+	t.Run(
+		"Should keep the config option transport for triage even when the mode is a session mode",
+		func(t *testing.T) {
+			t.Parallel()
+			driver := New(WithProviderPreStarter(providers.NewPreStarter()))
+			captureFile := filepath.Join(t.TempDir(), "mode-triage-dual.jsonl")
+			proc, err := driver.Start(t.Context(), StartOpts{
+				ProviderConfig:   &compozyconfig.ProviderConfig{AuthMode: compozyconfig.ProviderAuthModeNone},
+				AgentName:        "helper",
+				ProviderName:     "opencode",
+				Command:          helperCommand(t),
+				Cwd:              t.TempDir(),
+				Env:              helperEnvWithCapture("triage_dual_mode", "", captureFile),
+				PermissionPolicy: &StartPermissionPolicy{ExecutionPolicy: ExecutionPolicyTriage},
+				Permissions:      compozyconfig.PermissionModeApproveAll,
+			})
+			if err != nil {
+				t.Fatalf("triage startup: %v", err)
+			}
+			defer stopProcess(t, driver, proc)
+
+			assertModeConfigOption(t, captureFile, "plan")
+			if captureMethodExists(t, captureFile, acpsdk.AgentMethodSessionSetMode) {
+				t.Fatal("set_mode was sent for triage")
+			}
+			assertConfigOption(t, proc.CapsSnapshot().ConfigOptions, "mode", "plan", "default", "plan")
+		},
+	)
+}
+
+func TestPermissionLevelModeSelection(t *testing.T) {
+	t.Parallel()
+	for _, tc := range []struct {
+		name     string
+		provider string
+		reviewer string
+		level    compozyconfig.PermissionMode
+		modes    []string
+		want     string
+	}{
+		{"Should reject mixed case bypass reviewer", "claude", "BYPASSPERMISSIONS", compozyconfig.PermissionModeAuto, []string{"bypassPermissions", "acceptEdits"}, "acceptEdits"},
+		{"Should reject mixed case full access advertisement", "custom", "full-access", compozyconfig.PermissionModeAuto, []string{"FULL-ACCESS", "acceptEdits"}, "acceptEdits"},
+		{"Should select mixed case Claude auto", "Claude", "AUTO", compozyconfig.PermissionModeAuto, []string{"Auto", "acceptEdits"}, "Auto"},
+		{"Should select Claude reviewer", "claude", "auto", compozyconfig.PermissionModeAuto, []string{"auto", "acceptEdits", "default"}, "auto"},
+		{"Should select Codex reviewer", "codex", "agent", compozyconfig.PermissionModeAuto, []string{"agent", "workspace-write", "default"}, "agent"},
+		{"Should fall back when reviewer is unadvertised", "custom", "smart", compozyconfig.PermissionModeAuto, []string{"auto", "acceptEdits", "default"}, "acceptEdits"},
+		{"Should never infer an undeclared reviewer", "custom", "", compozyconfig.PermissionModeAuto, []string{"auto", "workspace-write", "default"}, "workspace-write"},
+		{"Should reject an unrestricted reviewer", "custom", "auto", compozyconfig.PermissionModeAuto, []string{"auto", "acceptEdits"}, "acceptEdits"},
+		{"Should select Claude edit mode", "claude", "auto", compozyconfig.PermissionModeApproveEdits, []string{"auto", "acceptEdits", "default"}, "acceptEdits"},
+		{"Should select Codex sandbox edits", "codex", "agent", compozyconfig.PermissionModeApproveEdits, []string{"agent", "workspace-write", "default"}, "workspace-write"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			for _, gateway := range []bool{false, true} {
+				got := preferredSessionMode(tc.modes, tc.level, gateway, tc.provider, tc.reviewer)
+				if got != tc.want {
+					t.Fatalf("gateway=%v mode=%q, want %q", gateway, got, tc.want)
+				}
+			}
+		})
+	}
+}

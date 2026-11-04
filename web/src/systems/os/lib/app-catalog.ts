@@ -1,0 +1,201 @@
+import {
+  Bot,
+  Gauge,
+  KeyRound,
+  LayoutDashboard,
+  ListChecks,
+  MessagesSquare,
+  Plus,
+  Repeat2,
+  Settings,
+  SquareTerminal,
+  Store,
+  Zap,
+  type LucideIcon,
+} from "@compozy/ui/icons";
+
+import { OS_WINDOW_MIN_HEIGHT, OS_WINDOW_MIN_WIDTH, type OsAppId } from "./os-types";
+import type { PixelSize } from "./window-manager-types";
+
+export interface OsAppDescriptor {
+  id: OsAppId;
+  title: string;
+  icon: LucideIcon;
+  /** Route prefixes owned by this app's window subtree. */
+  paths: readonly string[];
+  /** Optional measured product floor; the shared frame floor is the conservative fallback. */
+  minimumSize?: PixelSize;
+  /** Dock strip group, sessions launcher, or null for menubar-only settings. */
+  dock: { group: 1 | 2 | 3 | 4 } | "sessions-launcher" | null;
+  badge?: "sessions" | "tasks" | "terminal";
+  /** Extracts the multi-instance key from a pathname (session and terminal windows). */
+  matchInstance?: (pathname: string) => string | null;
+}
+
+const SESSION_PATH_PATTERN = /^\/agents\/[^/]+\/sessions\/([^/]+)/;
+const TERMINAL_PATH_PATTERN = /^\/terminal\/([^/]+)/;
+
+/** In-window landing after delete or a session window with no selected session. */
+export const SESSION_EMPTY_PATH = "/sessions";
+
+export function matchSessionInstance(pathname: string): string | null {
+  const match = SESSION_PATH_PATTERN.exec(pathname);
+  return match ? decodeURIComponent(match[1]) : null;
+}
+
+export function matchTerminalInstance(pathname: string): string | null {
+  const match = TERMINAL_PATH_PATTERN.exec(pathname);
+  return match ? decodeURIComponent(match[1]) : null;
+}
+
+export const OS_APP_DESCRIPTORS: Record<OsAppId, OsAppDescriptor> = {
+  dashboard: {
+    id: "dashboard",
+    title: "Dashboard",
+    icon: LayoutDashboard,
+    paths: ["/", "/activity"],
+    dock: { group: 1 },
+  },
+  session: {
+    id: "session",
+    title: "Session",
+    icon: MessagesSquare,
+    paths: [SESSION_EMPTY_PATH],
+    dock: "sessions-launcher",
+    badge: "sessions",
+    matchInstance: matchSessionInstance,
+  },
+  terminal: {
+    id: "terminal",
+    title: "Terminal",
+    icon: SquareTerminal,
+    paths: ["/terminal"],
+    minimumSize: { width: OS_WINDOW_MIN_WIDTH, height: OS_WINDOW_MIN_HEIGHT },
+    dock: { group: 1 },
+    badge: "terminal",
+    matchInstance: matchTerminalInstance,
+  },
+  "new-tab": {
+    id: "new-tab",
+    title: "New tab",
+    icon: Plus,
+    paths: ["/new-tab"],
+    dock: null,
+  },
+  agents: {
+    id: "agents",
+    title: "Agents",
+    icon: Bot,
+    paths: ["/agents"],
+    dock: { group: 2 },
+  },
+  tasks: {
+    id: "tasks",
+    title: "Tasks",
+    icon: ListChecks,
+    paths: ["/tasks"],
+    dock: { group: 2 },
+    badge: "tasks",
+  },
+  loops: {
+    id: "loops",
+    title: "Loops",
+    icon: Repeat2,
+    paths: ["/loops", "/loop-runs"],
+    dock: { group: 2 },
+  },
+  automations: {
+    id: "automations",
+    title: "Automations",
+    icon: Zap,
+    paths: ["/automations"],
+    dock: { group: 2 },
+  },
+  marketplace: {
+    id: "marketplace",
+    title: "Marketplace",
+    icon: Store,
+    paths: ["/marketplace"],
+    dock: { group: 3 },
+  },
+  vault: {
+    id: "vault",
+    title: "Vault",
+    icon: KeyRound,
+    paths: ["/vault"],
+    dock: { group: 4 },
+  },
+  usage: {
+    id: "usage",
+    title: "Usage",
+    icon: Gauge,
+    paths: ["/usage"],
+    dock: null,
+  },
+  settings: {
+    id: "settings",
+    title: "Settings",
+    icon: Settings,
+    paths: ["/settings"],
+    dock: null,
+  },
+};
+
+export function getOsAppDescriptor(id: OsAppId): OsAppDescriptor {
+  return OS_APP_DESCRIPTORS[id];
+}
+
+/** Narrows a persisted app string to a registered app; null for apps this build does not know. */
+export function osAppId(value: string): OsAppId | null {
+  return Object.hasOwn(OS_APP_DESCRIPTORS, value) ? (value as OsAppId) : null;
+}
+
+export const OS_WINDOW_CONSERVATIVE_MINIMUM: PixelSize = {
+  width: OS_WINDOW_MIN_WIDTH,
+  height: OS_WINDOW_MIN_HEIGHT,
+};
+
+/** One source for both interactive resize limits and viewport projection minima. */
+export function getOsAppMinimum(id: OsAppId): PixelSize {
+  const minimum = OS_APP_DESCRIPTORS[id].minimumSize ?? OS_WINDOW_CONSERVATIVE_MINIMUM;
+  return { width: minimum.width, height: minimum.height };
+}
+
+/** The rail's order: catalog order by group, with the Sessions launcher in the first group. */
+export function dockStripDescriptors(): OsAppDescriptor[] {
+  const group = ({ dock }: OsAppDescriptor) =>
+    dock === "sessions-launcher" ? 1 : (dock?.group ?? 0);
+  return Object.values(OS_APP_DESCRIPTORS)
+    .filter(app => app.dock !== null)
+    .sort((left, right) => group(left) - group(right));
+}
+
+/** Dock strip order: group 1..4 in catalog order. */
+export function dockAppDescriptors(): OsAppDescriptor[][] {
+  const groups: OsAppDescriptor[][] = [[], [], [], []];
+  for (const app of Object.values(OS_APP_DESCRIPTORS)) {
+    if (app.dock && app.dock !== "sessions-launcher") groups[app.dock.group - 1].push(app);
+  }
+  return groups.filter(group => group.length > 0);
+}
+
+function ownsPath(prefix: string, pathname: string): boolean {
+  if (prefix === "/") return pathname === "/";
+  return pathname === prefix || pathname.startsWith(`${prefix}/`);
+}
+
+/** Maps a pathname to its lightweight app descriptor without loading app controllers. */
+export function resolveAppDescriptorForPath(
+  pathname: string
+): { app: OsAppDescriptor; instanceKey: string | null } | null {
+  for (const app of Object.values(OS_APP_DESCRIPTORS)) {
+    const instanceKey = app.matchInstance?.(pathname) ?? null;
+    if (instanceKey !== null) return { app, instanceKey };
+  }
+  for (const app of Object.values(OS_APP_DESCRIPTORS)) {
+    if (app.paths.some(prefix => ownsPath(prefix, pathname))) {
+      return { app, instanceKey: null };
+    }
+  }
+  return null;
+}

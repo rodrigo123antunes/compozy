@@ -1,0 +1,34 @@
+package daemon
+
+import hookspkg "github.com/compozy/compozy/internal/hooks"
+
+func (d *Daemon) initializeHookObservers(
+	state *bootState,
+) ([]hookspkg.HookDecl, map[string]hookspkg.Executor) {
+	state.lifecycleObservers = newSessionLifecycleFanout()
+	if state.observer != nil {
+		state.lifecycleObservers.Add(state.observer)
+	}
+	if state.harnessRecorder != nil {
+		state.lifecycleObservers.Add(state.harnessRecorder)
+	}
+	if state.clarify != nil {
+		state.lifecycleObservers.Add(state.clarify)
+	}
+	if state.sessionMonitors != nil {
+		state.lifecycleObservers.Add(monitorLifecycleObserver{
+			monitors: state.sessionMonitors, restarting: d.restartInProgress,
+		})
+	}
+	if state.accessConsent != nil {
+		state.lifecycleObservers.Add(state.accessConsent)
+	}
+	state.hookTelemetrySinks = newHookTelemetryFanout()
+	if sink, ok := state.observer.(hookspkg.TelemetrySink); ok {
+		state.hookTelemetrySinks.Add(sink)
+	}
+	return daemonNativeHooks(
+		state.lifecycleObservers,
+		state.runtimeWorkers.autoTitle,
+	)
+}

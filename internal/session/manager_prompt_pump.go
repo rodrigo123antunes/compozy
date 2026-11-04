@@ -1,0 +1,335 @@
+package session
+
+import (
+	"context"
+	"time"
+
+	"github.com/compozy/compozy/internal/profiling"
+
+	"github.com/compozy/compozy/internal/acp"
+	"github.com/compozy/compozy/internal/store"
+)
+
+type promptPumpFatal struct {
+	failure           *store.SessionFailure
+	errorText         string
+	finalizationOwned bool
+	waitErr           error
+}
+
+func (f *promptPumpFatal) capture(failure *store.SessionFailure, errorText string) {
+	if f == nil || failure == nil {
+		return
+	}
+	f.failure = failure
+	f.errorText = errorText
+}
+
+func (f *promptPumpFatal) ownFinalization(waitErr error) {
+	if f == nil {
+		return
+	}
+	f.finalizationOwned = true
+	f.waitErr = waitErr
+}
+
+type promptPumpRun struct {
+	lifecycleCtx context.Context
+	deliveryCtx  context.Context
+	session      *Session
+	turnState    *promptTurnDispatchState
+	source       <-chan acp.AgentEvent
+	runtime      <-chan acp.AgentEvent
+	out          chan<- acp.AgentEvent
+	activity     *promptActivitySupervisor
+	fatal        *promptPumpFatal
+}
+
+func (m *Manager) runPromptPumpLoop(run *promptPumpRun) {
+	loop := promptPumpLoopState{source: run.source, runtime: run.runtime, activity: run.activity}
+	coalescer := &promptChunkCoalescer{}
+	for {
+		for loop.active() {
+			event, runtimeEvent, ok, flushOnly := m.nextPromptPumpEventWithPendingChunk(
+				run.lifecycleCtx,
+				&loop,
+				coalescer,
+			)
+			if flushOnly {
+				if m.flushPromptPumpRun(run, &loop, coalescer) {
+					return
+				}
+				continue
+			}
+			if !ok {
+				if m.flushPromptPumpRun(run, &loop, coalescer) {
+					return
+				}
+				break
+			}
+			if coalescer.append(event, runtimeEvent) {
+				if !coalescer.shouldFlush() {
+					continue
+				}
+				if m.flushPromptPumpRun(run, &loop, coalescer) {
+					return
+				}
+				continue
+			}
+			if m.flushPromptPumpRun(run, &loop, coalescer) {
+				return
+			}
+			if coalescer.append(event, runtimeEvent) {
+				if !coalescer.shouldFlush() {
+					continue
+				}
+				if m.flushPromptPumpRun(run, &loop, coalescer) {
+					return
+				}
+				continue
+			}
+			if m.handlePromptPumpRun(run, &loop, event, runtimeEvent) {
+				return
+			}
+		}
+		terminal, ok := promptStreamFailureWithoutTerminal(run, &loop)
+		if !ok {
+			return
+		}
+		if m.handlePromptPumpRun(run, &loop, terminal, false) {
+			return
+		}
+		if !loop.active() {
+			return
+		}
+	}
+}
+
+func promptStreamFailureWithoutTerminal(
+	run *promptPumpRun,
+	loop *promptPumpLoopState,
+) (acp.AgentEvent, bool) {
+	if run == nil || loop == nil || run.lifecycleCtx.Err() != nil || loop.turnEnded {
+		return acp.AgentEvent{}, false
+	}
+	if run.session == nil {
+		return acp.PromptStreamIncompleteEvent(), true
+	}
+	if run.turnState != nil && run.session.promptCancellationRequested(run.turnState.turnID) {
+		return promptCancellationTerminalEvent(), true
+	}
+	info := run.session.Info()
+	if info == nil || info.State != StateActive {
+		return acp.AgentEvent{}, false
+	}
+	proc := run.session.processHandle()
+	if isProcessDone(proc) {
+		return promptProcessExitEvent(proc), true
+	}
+	return acp.PromptStreamIncompleteEvent(), true
+}
+
+func promptCancellationTerminalEvent() acp.AgentEvent {
+	return acp.AgentEvent{
+		Type:             acp.EventTypeDone,
+		StopReason:       string(acp.PromptStopReasonCancelled),
+		PromptStopReason: acp.PromptStopReasonCancelled,
+	}
+}
+
+func (m *Manager) flushPromptPumpRun(
+	run *promptPumpRun,
+	loop *promptPumpLoopState,
+	coalescer *promptChunkCoalescer,
+) bool {
+	if !coalescer.hasPending() {
+		return false
+	}
+	return m.profilePromptPumpRun(run, func(run *promptPumpRun) bool {
+		failure, errorText, stop := m.flushPromptChunkCoalescer(
+			run.lifecycleCtx,
+			run.deliveryCtx,
+			run.session,
+			run.turnState,
+			run.out,
+			loop,
+			coalescer,
+			run.fatal,
+		)
+		run.fatal.capture(failure, errorText)
+		return stop
+	})
+}
+
+func (m *Manager) handlePromptPumpRun(
+	run *promptPumpRun,
+	loop *promptPumpLoopState,
+	event acp.AgentEvent,
+	runtimeEvent bool,
+) bool {
+	return m.profilePromptPumpRun(run, func(run *promptPumpRun) bool {
+		return m.handleLabeledPromptPumpRun(run, loop, event, runtimeEvent)
+	})
+}
+
+func (m *Manager) profilePromptPumpRun(run *promptPumpRun, consume func(*promptPumpRun) bool) bool {
+	if !profiling.Enabled() {
+		return consume(run)
+	}
+	run.session.mu.RLock()
+	sessionID, provider := run.session.ID, run.session.Provider
+	run.session.mu.RUnlock()
+	var stop bool
+	profiling.Do(run.lifecycleCtx, func(ctx context.Context) {
+		labeled := *run
+		labeled.lifecycleCtx = ctx
+		stop = consume(&labeled)
+	}, "session_id", sessionID, "provider", provider)
+	return stop
+}
+
+func (m *Manager) handleLabeledPromptPumpRun(
+	run *promptPumpRun,
+	loop *promptPumpLoopState,
+	event acp.AgentEvent,
+	runtimeEvent bool,
+) bool {
+	failure, errorText, stop := m.handlePromptPumpEvent(
+		run.lifecycleCtx,
+		run.deliveryCtx,
+		run.session,
+		run.turnState,
+		run.out,
+		loop,
+		event,
+		runtimeEvent,
+		run.fatal,
+	)
+	run.fatal.capture(failure, errorText)
+	return stop
+}
+
+// finishPromptPump settles prompt activity and attention before publishing the final lifecycle edge.
+func (m *Manager) finishPromptPump(
+	lifecycleCtx context.Context,
+	session *Session,
+	turnState *promptTurnDispatchState,
+	activity *promptActivitySupervisor,
+	releaseExecution context.CancelFunc,
+	out chan<- acp.AgentEvent,
+	fatal *promptPumpFatal,
+) {
+	var before *Info
+	if session != nil {
+		session.supervisionInspectMu.Lock()
+		before = session.Info()
+	}
+	identity, identityErr := promptRunIdentity(session, turnState)
+	m.releaseHostedPromptRun(session, turnState)
+	var fatalPromptFailure *store.SessionFailure
+	if fatal != nil {
+		fatalPromptFailure = fatal.failure
+	}
+	if releaseExecution != nil {
+		releaseExecution()
+	}
+	if activity != nil {
+		activity.stop()
+	}
+	m.revalidateSettledWorkSignals(lifecycleCtx, session)
+	if activity != nil {
+		activity.finish(m.now())
+	}
+	if fatalPromptFailure == nil {
+		m.recordTurnEndedEarly(lifecycleCtx, session, turnState)
+	}
+	m.settlePromptAttention(lifecycleCtx, session, before, turnState)
+	if session != nil {
+		session.supervisionInspectMu.Unlock()
+	}
+	if fatalPromptFailure == nil {
+		m.finishPromptMessage(lifecycleCtx, turnState, time.Time{})
+		m.dispatchTurnEnd(lifecycleCtx, turnState, time.Time{})
+	}
+	m.finishManagedInputPrompt(lifecycleCtx, session, turnState)
+	if identityErr == nil {
+		m.clearActivePromptRun(identity)
+	}
+	if turnState != nil {
+		clearPromptState(session, turnState.turnID)
+	}
+	if identityErr == nil {
+		if fatalPromptFailure == nil {
+			notifier := m.currentTurnEndNotifier()
+			if notifier != nil {
+				notifier(lifecycleCtx, identity)
+			}
+		}
+	}
+	if session != nil && turnState != nil {
+		if service := m.ReplyWatches(); service != nil {
+			service.OnTurnSettled(lifecycleCtx, session.ID, turnState.turnID)
+		}
+	}
+	if session == nil {
+		closePromptOutput(out)
+		return
+	}
+	if fatalPromptFailure != nil {
+		if fatal.finalizationOwned {
+			m.finalizeSessionAfterFatalPromptFailure(lifecycleCtx, session, fatal)
+			closePromptOutput(out)
+			return
+		}
+		m.stopSessionAfterFatalPromptFailure(lifecycleCtx, session, fatal.failure, fatal.errorText)
+		closePromptOutput(out)
+		return
+	}
+	closePromptOutput(out)
+	m.startNextQueuedInputPrompt(session.ID)
+}
+
+// promptTurnWasCanceled reports whether the finishing turn is still fenced as a
+// canceled turn, which is observable until clearPromptState retires the marker.
+func promptTurnID(turnState *promptTurnDispatchState) string {
+	if turnState == nil {
+		return ""
+	}
+	return turnState.turnID
+}
+
+func promptTurnWasCanceled(session *Session, turnState *promptTurnDispatchState) bool {
+	return session != nil && turnState != nil && session.promptCancellationRequested(turnState.turnID)
+}
+
+func closePromptOutput(out chan<- acp.AgentEvent) {
+	if out != nil {
+		close(out)
+	}
+}
+
+func (m *Manager) revalidateSettledWorkSignals(ctx context.Context, target *Session) {
+	if target == nil || !m.workSignals.hasExternalSources() {
+		return
+	}
+	state := m.workSignals.Inspect(ctx, target.ID, m.now().UTC())
+	target.mu.Lock()
+	target.supervisionState = state
+	target.mu.Unlock()
+}
+
+func (m *Manager) settlePromptAttention(
+	ctx context.Context,
+	target *Session,
+	before *Info,
+	turnState *promptTurnDispatchState,
+) {
+	if target == nil {
+		return
+	}
+	if err := m.settleSessionAttention(ctx, target.ID, m.now().UTC()); err != nil {
+		m.sessionLogger(target).Error("session: persist terminal attention failed", "error", err)
+	}
+	m.publishLifecycleAttentionTransitionWake(ctx, before, target.Info(),
+		!promptTurnWasCanceled(target, turnState), promptTurnID(turnState))
+}

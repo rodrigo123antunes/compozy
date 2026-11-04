@@ -1,0 +1,125 @@
+package daemon
+
+import (
+	"bytes"
+	"context"
+	"encoding/json"
+	"fmt"
+	"strings"
+
+	"github.com/compozy/compozy/internal/acp"
+	eventspkg "github.com/compozy/compozy/internal/events"
+	looppkg "github.com/compozy/compozy/internal/loop"
+	"github.com/compozy/compozy/internal/store"
+	"github.com/compozy/compozy/internal/transcript"
+)
+
+func readManagedGoalPromptOutput(
+	ctx context.Context,
+	reader loopSessionEventReader,
+	entry *store.SessionInputQueueEntry,
+	result looppkg.ActionPromptResult,
+) (string, json.RawMessage, error) {
+	events, err := reader.Events(ctx, entry.SessionID, store.EventQuery{TurnID: entry.PromptID})
+	if err != nil {
+		return "", nil, fmt.Errorf("daemon: read managed Goal prompt events: %w", err)
+	}
+	if len(events) == 0 {
+		return "", nil, fmt.Errorf("%w: managed Goal terminal has no correlated events", looppkg.ErrTransitionConflict)
+	}
+	var text strings.Builder
+	var structured json.RawMessage
+	terminalCount := 0
+	previousSequence := int64(0)
+	firstSequence := int64(0)
+	terminalSequence := int64(0)
+	for _, event := range events {
+		if event.TurnID != entry.PromptID ||
+			event.Sequence <= 0 ||
+			(previousSequence > 0 && event.Sequence <= previousSequence) {
+			return "", nil, fmt.Errorf("%w: managed Goal event correlation changed", looppkg.ErrTransitionConflict)
+		}
+		previousSequence = event.Sequence
+		agentEvent, decodeErr := transcript.UnmarshalAgentEvent(event.Content)
+		if decodeErr != nil {
+			return "", nil, fmt.Errorf("daemon: decode managed Goal prompt event %d: %w", event.Sequence, decodeErr)
+		}
+		if isManagedGoalProofAuxiliaryEvent(agentEvent.Type) {
+			continue
+		}
+		if terminalCount > 0 {
+			if isManagedGoalTrailingMetadata(agentEvent.Type) {
+				continue
+			}
+			return "", nil, fmt.Errorf("%w: managed Goal terminal event is not final: %s at sequence %d",
+				looppkg.ErrTransitionConflict, agentEvent.Type, event.Sequence)
+		}
+		if firstSequence == 0 {
+			firstSequence = event.Sequence
+		}
+		if agentEvent.Type == acp.EventTypeAgentMessage {
+			text.WriteString(agentEvent.Text)
+		}
+		if isManagedGoalTerminalEvent(agentEvent.Type) {
+			terminalCount++
+			terminalSequence = event.Sequence
+		}
+	}
+	if terminalCount != 1 {
+		return "", nil, fmt.Errorf("%w: managed Goal event range requires one terminal", looppkg.ErrTransitionConflict)
+	}
+	if firstSequence != result.EventStartSeq || terminalSequence != result.EventEndSeq {
+		return "", nil, fmt.Errorf("%w: managed Goal event range changed", looppkg.ErrTransitionConflict)
+	}
+	candidate := bytes.TrimSpace([]byte(text.String()))
+	if json.Valid(candidate) {
+		structured = append(structured[:0], candidate...)
+	}
+	return text.String(), structured, nil
+}
+
+func isManagedGoalTerminalEvent(eventType string) bool {
+	return eventType == acp.EventTypeDone || eventType == acp.EventTypeError
+}
+
+func isManagedGoalTrailingMetadata(eventType string) bool {
+	return eventType == acp.EventTypeUsage || eventType == acp.EventTypeSystem ||
+		eventType == acp.EventTypeAvailableCommands
+}
+
+func isManagedGoalProofAuxiliaryEvent(eventType string) bool {
+	return eventType == eventspkg.TranscriptMarkerCreated || eventType == eventspkg.TranscriptMarkerRedacted ||
+		eventType == eventspkg.SessionTurnQuiesced ||
+		eventType == eventspkg.SessionCompactionFired ||
+		eventType == "session.compaction.requested"
+}
+
+func readManagedGoalCompaction(
+	ctx context.Context,
+	reader loopSessionEventReader,
+	entry *store.SessionInputQueueEntry,
+	result looppkg.ActionPromptResult,
+) (*looppkg.ActionCompactionOutcome, error) {
+	rows, err := reader.Events(ctx, entry.SessionID, store.EventQuery{TurnID: entry.PromptID})
+	if err != nil {
+		return nil, err
+	}
+	var outcome *looppkg.ActionCompactionOutcome
+	for _, row := range rows {
+		if row.Sequence < result.EventStartSeq || row.Sequence > result.EventEndSeq ||
+			row.Type != acp.EventTypeCompaction {
+			continue
+		}
+		event, err := transcript.UnmarshalAgentEvent(row.Content)
+		if err != nil {
+			return nil, err
+		}
+		if event.Compaction != nil {
+			outcome = &looppkg.ActionCompactionOutcome{
+				CompactionID: event.Compaction.CompactionID,
+				Status:       event.Compaction.Status,
+			}
+		}
+	}
+	return outcome, nil
+}

@@ -1,0 +1,439 @@
+package daemon
+
+import (
+	"context"
+	"fmt"
+	"log/slog"
+	"os"
+	"strings"
+
+	compozyconfig "github.com/compozy/compozy/internal/config"
+	looppkg "github.com/compozy/compozy/internal/loop"
+	loopdsl "github.com/compozy/compozy/internal/loop/dsl"
+	"github.com/compozy/compozy/internal/loop/gate"
+	watchpkg "github.com/compozy/compozy/internal/loop/watch"
+	taskpkg "github.com/compozy/compozy/internal/task"
+	toolspkg "github.com/compozy/compozy/internal/tools"
+	workspacepkg "github.com/compozy/compozy/internal/workspace"
+)
+
+func bootHarnessReentryBridge(
+	ctx context.Context,
+	state *bootState,
+) (*harnessReentryBridge, error) {
+	reentrySessions, ok := state.sessions.(harnessReentrySessionManager)
+	if !ok {
+		if state != nil && state.logger != nil {
+			state.logger.Warn(
+				"daemon: synthetic reentry bridge disabled because session manager support is unavailable",
+			)
+		}
+		return nil, nil
+	}
+	reentryStore, ok := state.registry.(harnessReentryStore)
+	if !ok {
+		if state != nil && state.logger != nil {
+			state.logger.Warn(
+				"daemon: synthetic reentry bridge disabled because registry support is unavailable",
+			)
+		}
+		return nil, nil
+	}
+	return newHarnessReentryBridge(
+		ctx,
+		state.harnessResolver,
+		state.harnessRecorder,
+		reentryStore,
+		reentrySessions,
+		state.logger,
+		withHarnessHeartbeatWake(state.registry, reentrySessions, state.cfg.Agents.Heartbeat),
+	)
+}
+
+func (d *Daemon) bootSpawnReaper(
+	ctx context.Context,
+	state *bootState,
+	cleanup *bootCleanup,
+) error {
+	if state == nil || state.sessions == nil || state.tasks == nil || state.tasks.manager == nil {
+		return nil
+	}
+	logger := state.logger
+	if logger == nil {
+		logger = slog.Default()
+	}
+	reaper, err := newSpawnReaper(
+		ctx,
+		state.sessions,
+		state.tasks.manager,
+		state.notifier,
+		logger.With("component", "spawn_reaper"),
+		d.now,
+		defaultSpawnReaperInterval,
+	)
+	if err != nil {
+		return err
+	}
+	report, err := reaper.Sweep(ctx)
+	if err != nil {
+		return err
+	}
+	if report.Reaped > 0 {
+		logger.Info(
+			"daemon: spawn reaper boot sweep complete",
+			"reaped", report.Reaped,
+			"released_leases", report.ReleasedLeases,
+			"ttl_expired", report.TTLExpired,
+			"parent_stopped", report.ParentStopped,
+			"orphaned", report.Orphaned,
+		)
+	}
+	reaper.start()
+	state.spawnReaper = reaper
+	if cleanup != nil {
+		cleanup.add(func(cleanupCtx context.Context) error {
+			return reaper.shutdown(cleanupCtx)
+		})
+	}
+	return nil
+}
+
+func (d *Daemon) bootTaskRoles(ctx context.Context, state *bootState) error {
+	if state == nil || state.tasks == nil || state.tasks.store == nil || state.sessions == nil {
+		return nil
+	}
+	registerTaskClaimHandoffTurnEnd(state.sessions, state.tasks.claimHandoff)
+	runtime, err := newTaskRoleRuntime(
+		state.tasks.store,
+		state.sessions,
+		state.logger,
+		d.now,
+	)
+	if err != nil {
+		return err
+	}
+	dispatcher, err := newTaskRunActivationDispatcher(
+		state.tasks.store,
+		runtime,
+		state.tasks.loopActions,
+		state.logger,
+	)
+	if err != nil {
+		return err
+	}
+	if state.notifier != nil {
+		state.notifier.AddTaskRunEnqueuedObserver(dispatcher)
+	}
+	state.tasks.activation.Store(dispatcher)
+	dispatcher.Recover(ctx)
+	state.tasks.roles.Store(runtime)
+	return nil
+}
+
+func taskManagerOptions(
+	store taskStore,
+	bridge taskpkg.SessionExecutor,
+	wakeNotifier taskpkg.WakeNotifier,
+	events taskpkg.EventObserver,
+	hooks *hooksNotifier,
+	reviewRequests taskpkg.RunReviewRequestedObserver,
+	coordinatorRunner taskpkg.CoordinatorRunner,
+	generationFinalizer taskpkg.GenerationStateFinalizer,
+	recovery compozyconfig.TaskRecoveryConfig,
+	scheduler compozyconfig.SchedulerConfig,
+	blockRecurrenceLimit int,
+	workspaceActiveRunCap int,
+) []taskpkg.Option {
+	options := []taskpkg.Option{
+		taskpkg.WithStore(store),
+		taskpkg.WithSessionExecutor(bridge),
+		taskpkg.WithWakeNotifier(wakeNotifier),
+		taskpkg.WithEventObserver(events),
+		taskpkg.WithRunReviewRequestedObserver(reviewRequests),
+		taskpkg.WithCancelGracePeriod(defaultTaskCancelGrace),
+		taskpkg.WithForceRecoveryOptions(taskpkg.ForceRecoveryOptions{
+			AllowAgentForce: recovery.AllowAgentForce,
+		}),
+		taskpkg.WithStarvationAge(scheduler.MinQueuedAge),
+		taskpkg.WithBlockRecurrenceLimit(blockRecurrenceLimit),
+		taskpkg.WithWorkspaceActiveRunCap(workspaceActiveRunCap),
+		taskpkg.WithCoordinatorTerminalStatusValidator(func(status string) bool {
+			return looppkg.Status(strings.TrimSpace(status)).Valid()
+		}),
+		taskpkg.WithCoordinatorTerminalHookStatusValidator(func(status string) bool {
+			return looppkg.Status(strings.TrimSpace(status)).Terminal()
+		}),
+	}
+	if coordinatorRunner != nil {
+		options = append(options, taskpkg.WithCoordinatorRunner(coordinatorRunner))
+	}
+	if generationFinalizer != nil {
+		options = append(options, taskpkg.WithGenerationStateFinalizer(generationFinalizer))
+	}
+	if hooks != nil {
+		options = append(options, taskpkg.WithTaskRunHooks(hooks))
+	}
+	if reader, ok := store.(taskpkg.InspectStateReader); ok {
+		options = append(options, taskpkg.WithInspectStateReader(reader))
+	}
+	return options
+}
+
+func newLoopCoordinatorRunner(
+	store taskStore,
+	hooks looppkg.HookDispatcher,
+	watchPoller watchpkg.Poller,
+	gateEvaluator gate.GateEvaluator,
+	actions *looppkg.ActionRegistry,
+	runtimeCatalog looppkg.WorkspaceRuntimeCatalog,
+	targetHealth looppkg.TargetHealth,
+	candidateVerifier looppkg.WorktreeCandidateVerifier,
+	logger *slog.Logger,
+) (*looppkg.CoordinatorRunner, error) {
+	loopStore, ok := requireStoreCapability[looppkg.Store](store, logger, "loop store")
+	if !ok {
+		return nil, nil
+	}
+	outputs, ok := requireStoreCapability[looppkg.GenerationOutputReader](
+		store,
+		logger,
+		"generation output reader",
+	)
+	if !ok {
+		return nil, nil
+	}
+	verdicts, ok := requireStoreCapability[gate.VerdictReader](store, logger, "verdict reader")
+	if !ok {
+		return nil, nil
+	}
+	options := []looppkg.CoordinatorRunnerOption{
+		looppkg.WithCoordinatorHookDispatcher(hooks),
+		looppkg.WithCoordinatorVerdictReader(verdicts),
+		looppkg.WithCoordinatorWorktreeCandidateVerifier(candidateVerifier),
+	}
+	if watchPoller != nil {
+		options = append(options, looppkg.WithCoordinatorWatchPoller(watchPoller))
+	}
+	if watchEventsLedger, ledgerOK := store.(looppkg.WatchEventsLedger); ledgerOK {
+		options = append(options, looppkg.WithCoordinatorWatchEventsLedger(watchEventsLedger))
+	} else if logger != nil {
+		logger.Warn("daemon: loop coordinator watch-events ledger unavailable")
+	}
+	if gateEvaluator != nil {
+		options = append(options, looppkg.WithCoordinatorGateEvaluator(gateEvaluator))
+	}
+	if actions != nil {
+		options = append(options, looppkg.WithCoordinatorActionRegistry(actions))
+	}
+	if runtimeCatalog != nil {
+		options = append(options, looppkg.WithCoordinatorRuntimeCatalog(runtimeCatalog))
+	}
+	if targetHealth != nil {
+		options = append(options, looppkg.WithCoordinatorTargetHealth(targetHealth))
+	}
+	return looppkg.NewCoordinatorRunner(
+		store,
+		loopStore,
+		outputs,
+		logger,
+		options...,
+	)
+}
+
+func requireStoreCapability[T any](
+	store taskStore,
+	logger *slog.Logger,
+	capability string,
+) (T, bool) {
+	value, ok := any(store).(T)
+	if !ok && logger != nil {
+		logger.Warn("daemon: loop coordinator disabled because registry does not implement " + capability)
+	}
+	return value, ok
+}
+
+func newBootLoopCoordinatorRunner(
+	store taskStore,
+	state *bootState,
+	homePaths compozyconfig.HomePaths,
+) (*looppkg.CoordinatorRunner, error) {
+	runner, _, err := newBootLoopCoordinatorRuntime(store, state, homePaths)
+	return runner, err
+}
+
+func newBootLoopCoordinatorRuntime(
+	store taskStore,
+	state *bootState,
+	homePaths compozyconfig.HomePaths,
+) (*looppkg.CoordinatorRunner, *loopGateJudgeRunner, error) {
+	var hooks looppkg.HookDispatcher
+	if state.notifier != nil {
+		hooks = state.notifier
+	}
+	var workspaceResolver workspacepkg.RuntimeResolver
+	if state.workspaceResolver != nil {
+		workspaceResolver = state.workspaceResolver
+	}
+	toolRegistry := lazyToolRegistry{current: func() toolspkg.Registry {
+		if state == nil {
+			return nil
+		}
+		return state.deps.ToolRegistry
+	}}
+	policyGate := &loopSessionPolicyGate{
+		profileNames:      bootProfileNameResolver{state: state},
+		workspaceResolver: workspaceResolver,
+		agentResolver: agentCatalogDependency(state.agentCatalog, agentSidecarCatalogs{
+			soul:      state.soulCatalog,
+			heartbeat: state.heartbeatCatalog,
+		}),
+	}
+	judgeRunner := &loopGateJudgeRunner{
+		sessions: state.sessions,
+
+		policyGate: policyGate,
+		executions: newLoopJudgeExecutionRegistry(),
+	}
+	gateEvaluator := gate.NewEvaluator(
+		gate.WithCommandRunner(loopGateCommandRunner{workspaceResolver: workspaceResolver}),
+		gate.WithJudgeRunner(judgeRunner),
+		gate.WithToolCaller(toolRegistry),
+	)
+	actions, err := newBootLoopActionRegistry(
+		store,
+		state,
+		toolRegistry,
+		policyGate,
+		gateEvaluator,
+		judgeRunner.executions,
+	)
+	if err != nil {
+		return nil, nil, err
+	}
+	runner, err := newLoopCoordinatorRunner(
+		store,
+		hooks,
+		daemonExtensionWatchPoller{runtime: state.currentExtensionRuntime},
+		gateEvaluator,
+		actions,
+		loopRuntimeCatalogFactory{
+			homePaths: homePaths, workspaceResolver: workspaceResolver,
+		},
+		state.loopTargetHealth,
+		daemonReviewCandidateVerifier{state: state},
+		state.logger,
+	)
+	if err != nil {
+		return nil, nil, err
+	}
+	return runner, judgeRunner, nil
+}
+
+type daemonExtensionWatchPoller struct {
+	runtime func() extensionRuntime
+}
+
+var _ watchpkg.Poller = daemonExtensionWatchPoller{}
+
+func (p daemonExtensionWatchPoller) Poll(
+	ctx context.Context,
+	req watchpkg.PollRequest,
+) (watchpkg.PollResponse, error) {
+	if p.runtime == nil {
+		return watchpkg.PollResponse{}, fmt.Errorf(
+			"%w: extension runtime resolver is unavailable",
+			watchpkg.ErrPollerRequired,
+		)
+	}
+	runtime := p.runtime()
+	poller, ok := runtime.(watchpkg.Poller)
+	if !ok || poller == nil {
+		return watchpkg.PollResponse{}, fmt.Errorf(
+			"%w: extension runtime does not provide watch poller",
+			watchpkg.ErrPollerRequired,
+		)
+	}
+	return poller.Poll(ctx, req)
+}
+
+type daemonLoopDefinitionResolver struct {
+	catalog         *resourceCatalog[looppkg.ResourceSpec]
+	compilerFactory func(context.Context, looppkg.WorkspaceID, string) *looppkg.Compiler
+	profiles        loopProfileNameResolver
+}
+
+var _ looppkg.DefinitionResolver = (*daemonLoopDefinitionResolver)(nil)
+
+func (r *daemonLoopDefinitionResolver) ResolveLoop(
+	ctx context.Context,
+	ws looppkg.WorkspaceID,
+	profileID string,
+	name string,
+) (*looppkg.ResolvedDefinition, error) {
+	if r == nil || r.catalog == nil || r.compilerFactory == nil {
+		return nil, fmt.Errorf(
+			"%w: loop definition resolver is not initialized",
+			looppkg.ErrValidation,
+		)
+	}
+	trimmedName := strings.TrimSpace(name)
+	if trimmedName == "" {
+		return nil, fmt.Errorf("%w: loop name is required", looppkg.ErrValidation)
+	}
+	lens, err := resolveLoopResourceLens(ctx, r.profiles, string(ws), profileID)
+	if err != nil {
+		return nil, err
+	}
+	records := looppkg.ResolveEffectiveResources(r.catalog.Snapshot(), lens)
+	for _, record := range records {
+		if strings.TrimSpace(record.Spec.Name) != trimmedName {
+			continue
+		}
+		definition, err := daemonLoopDefinitionFromSpec(record.Spec)
+		if err != nil {
+			return nil, err
+		}
+		resolved, err := r.compilerFactory(ctx, ws, profileID).Compile(definition)
+		if err != nil {
+			return nil, err
+		}
+		resolved.InstalledFromExtension = strings.TrimSpace(record.Spec.InstalledFromExtension)
+		resolved.ExtensionOwner = strings.TrimSpace(record.Spec.ExtensionOwner)
+		return resolved, nil
+	}
+	return nil, fmt.Errorf("%w: loop definition %q not found", looppkg.ErrDefinitionNotFound, trimmedName)
+}
+
+func daemonLoopDefinitionFromSpec(spec looppkg.ResourceSpec) (loopdsl.Definition, error) {
+	source := spec.Source.Normalize()
+	filePath := strings.TrimSpace(spec.FilePath)
+	if filePath == "" {
+		return loopdsl.Definition{}, fmt.Errorf(
+			"%w: loop %q has no file_path",
+			looppkg.ErrValidation,
+			spec.Name,
+		)
+	}
+	data, err := os.ReadFile(filePath)
+	if err != nil {
+		return loopdsl.Definition{}, fmt.Errorf(
+			"daemon: read loop definition %q: %w",
+			filePath,
+			err,
+		)
+	}
+	_, definition, err := looppkg.ParseResource(data, looppkg.ResourceParseOptions{
+		Source:                 source,
+		Dir:                    strings.TrimSpace(spec.Dir),
+		FilePath:               filePath,
+		InstalledFromExtension: strings.TrimSpace(spec.InstalledFromExtension),
+	})
+	if err != nil {
+		return loopdsl.Definition{}, fmt.Errorf(
+			"daemon: parse loop definition %q: %w",
+			filePath,
+			err,
+		)
+	}
+	return definition, nil
+}

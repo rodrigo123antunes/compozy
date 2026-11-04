@@ -1,0 +1,480 @@
+package workspace
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"log/slog"
+	"path/filepath"
+	"slices"
+	"strings"
+	"sync"
+	"time"
+
+	compozyconfig "github.com/compozy/compozy/internal/config"
+	"github.com/compozy/compozy/internal/filesnap"
+)
+
+// RegisterOptions describes a workspace registration request.
+type RegisterOptions struct {
+	RootDir        string
+	Name           string
+	AdditionalDirs []string
+	DefaultAgent   string
+}
+
+// UpdateOptions describes mutable workspace registration fields.
+type UpdateOptions struct {
+	Name           *string
+	AdditionalDirs *[]string
+	DefaultAgent   *string
+}
+
+// Resolver resolves persisted workspaces into runtime workspace snapshots.
+type Resolver struct {
+	store               Store
+	homePaths           compozyconfig.HomePaths
+	loadConfig          ConfigLoader
+	loadProfileConfig   ProfileConfigLoader
+	profileAvailability ProfileAvailabilityChecker
+	logger              *slog.Logger
+	now                 func() time.Time
+	cacheTTL            time.Duration
+	snapshotTTL         time.Duration
+	idGenerator         idGenerator
+	changeHook          ChangeHook
+	operatorHomeDir     string
+
+	registrationMu        sync.Mutex
+	reconcileMu           sync.Mutex
+	unregister            *unregisterCoordinator
+	mu                    sync.RWMutex
+	cache                 map[string]*cachedEntry
+	agentConfigCache      map[string]*cachedAgentConfig
+	agentConfigGeneration uint64
+}
+
+var _ RuntimeResolver = (*Resolver)(nil)
+var _ ProfileRuntimeResolver = (*Resolver)(nil)
+
+type cachedEntry struct {
+	workspace    Workspace
+	resolved     ResolvedWorkspace
+	snapshots    map[string]filesnap.Snapshot
+	skillSources map[string]workspaceSkillScan
+	lastAccess   time.Time
+	validatedAt  time.Time
+}
+
+const rollbackDeleteTimeout = 2 * time.Second
+
+// NewResolver constructs a workspace resolver backed by the supplied store.
+func NewResolver(store Store, opts ...Option) (*Resolver, error) {
+	if store == nil {
+		return nil, errors.New("workspace: store is required")
+	}
+
+	resolvedOpts, err := resolveOptions(opts)
+	if err != nil {
+		return nil, err
+	}
+
+	return &Resolver{
+		store:               store,
+		homePaths:           resolvedOpts.homePaths,
+		loadConfig:          resolvedOpts.loadConfig,
+		loadProfileConfig:   resolvedOpts.loadProfileConfig,
+		profileAvailability: resolvedOpts.profileAvailability,
+		logger:              resolvedOpts.logger,
+		now:                 resolvedOpts.now,
+		cacheTTL:            resolvedOpts.cacheTTL,
+		snapshotTTL:         resolvedOpts.snapshotTTL,
+		idGenerator:         resolvedOpts.idGenerator,
+		changeHook:          resolvedOpts.changeHook,
+		operatorHomeDir:     resolvedOpts.operatorHomeDir,
+		unregister:          newUnregisterCoordinator(),
+		cache:               make(map[string]*cachedEntry),
+		agentConfigCache:    make(map[string]*cachedAgentConfig),
+	}, nil
+}
+
+// Resolve loads and caches the effective runtime snapshot for a workspace.
+func (r *Resolver) Resolve(ctx context.Context, idOrNameOrPath string) (resolved ResolvedWorkspace, err error) {
+	return r.resolve(ctx, idOrNameOrPath, "", "")
+}
+
+// ResolveForProfile loads the workspace with personal and project profile roots.
+func (r *Resolver) ResolveForProfile(
+	ctx context.Context,
+	idOrNameOrPath string,
+	profileName string,
+) (resolved ResolvedWorkspace, err error) {
+	trimmedProfile, profileID, err := r.resolveProfileIdentity(ctx, profileName)
+	if err != nil {
+		return ResolvedWorkspace{}, err
+	}
+	return r.resolve(ctx, idOrNameOrPath, trimmedProfile, profileID)
+}
+
+// resolve revalidates identity and resource dependencies before returning an isolated workspace snapshot.
+func (r *Resolver) resolve(
+	ctx context.Context,
+	idOrNameOrPath string,
+	profileName string,
+	profileID string,
+) (resolved ResolvedWorkspace, err error) {
+	start := r.now()
+	cacheHit := false
+	workspaceID := ""
+	defer r.observeResolve(start, &workspaceID, &cacheHit, &resolved, &err)
+
+	ws, identity, err := r.resolveRegistration(ctx, idOrNameOrPath)
+	workspaceID = ws.ID
+	if err != nil {
+		return ResolvedWorkspace{}, err
+	}
+	workspaceID = identity.WorkspaceID
+
+	cacheKey := workspaceProfileCacheKey(ws.ID, profileName)
+	if cached, ok := r.freshSnapshot(cacheKey, ws, identity.WorkspaceID, profileName, profileID); ok {
+		cacheHit = true
+		return cached, nil
+	}
+	r.mu.RLock()
+	generation := r.agentConfigGeneration
+	r.mu.RUnlock()
+	cfg, hadCachedConfig, err := r.configForSkillScan(ws, profileName, cacheKey)
+	if err != nil {
+		return ResolvedWorkspace{}, err
+	}
+	scan, err := r.scanWorkspace(ctx, ws, profileName, &cfg.Skills)
+	if err != nil {
+		return ResolvedWorkspace{}, err
+	}
+
+	now := r.now()
+
+	r.mu.Lock()
+	r.evictExpiredLocked(now)
+	if cached := r.cache[cacheKey]; cached != nil && cached.canReuse(ws, scan) {
+		cached.lastAccess = now
+		cached.validatedAt = now
+		cached.skillSources = scan.skillSources
+		cacheHit = true
+		resolved = cloneResolvedWorkspace(&cached.resolved)
+		resolved.Workspace = cloneWorkspace(ws)
+		resolved.WorkspaceID = identity.WorkspaceID
+		r.mu.Unlock()
+		return resolved, nil
+	}
+	r.mu.Unlock()
+	if hadCachedConfig {
+		cfg, scan, err = r.refreshSkillScanConfig(ctx, ws, profileName, &cfg, scan)
+		if err != nil {
+			return ResolvedWorkspace{}, err
+		}
+	}
+
+	resolved, err = r.buildResolvedWorkspace(ctx, ws, scan, profileName, &cfg)
+	if err != nil {
+		return ResolvedWorkspace{}, err
+	}
+	resolved.WorkspaceID = identity.WorkspaceID
+	resolved.ProfileID = strings.TrimSpace(profileID)
+
+	r.mu.Lock()
+	r.evictExpiredLocked(now)
+	if generation == r.agentConfigGeneration {
+		r.cache[cacheKey] = &cachedEntry{
+			workspace:    cloneWorkspace(ws),
+			resolved:     cloneResolvedWorkspace(&resolved),
+			snapshots:    cloneSnapshots(scan.snapshots),
+			skillSources: scan.skillSources,
+			lastAccess:   now,
+			validatedAt:  now,
+		}
+	}
+	r.mu.Unlock()
+
+	return resolved, nil
+}
+
+func (r *Resolver) observeResolve(
+	start time.Time,
+	workspaceID *string,
+	cacheHit *bool,
+	resolved *ResolvedWorkspace,
+	err *error,
+) {
+	if *err == nil {
+		r.logger.Debug("workspace.resolve",
+			"workspace_id", *workspaceID,
+			"cache_hit", *cacheHit,
+			"agents_count", len(resolved.Agents),
+			"skills_count", len(resolved.Skills),
+			"duration_ms", durationMillis(r.now().Sub(start)),
+		)
+		return
+	}
+
+	level := slog.LevelWarn
+	if errors.Is(*err, context.Canceled) {
+		level = slog.LevelDebug
+	}
+	r.logger.Log(context.Background(), level, "workspace.resolve.error",
+		"workspace_id", *workspaceID,
+		"error_type", errorType(*err),
+		"duration_ms", durationMillis(r.now().Sub(start)),
+		"error", *err,
+	)
+}
+
+// ResolveOrRegister resolves an existing workspace by canonical path or auto-registers it.
+func (r *Resolver) ResolveOrRegister(ctx context.Context, path string) (ResolvedWorkspace, error) {
+	return r.resolveOrRegisterForProfile(ctx, path, "", "")
+}
+
+// ResolveOrRegisterForProfile resolves or registers a workspace path and loads
+// its profile-bound resource layers without a second public resolution.
+func (r *Resolver) ResolveOrRegisterForProfile(
+	ctx context.Context,
+	path string,
+	profileName string,
+) (ResolvedWorkspace, error) {
+	trimmedProfile := strings.TrimSpace(profileName)
+	if err := compozyconfig.ValidateResourceProfileName(trimmedProfile); err != nil {
+		return ResolvedWorkspace{}, fmt.Errorf("workspace: resolve profile resources: %w", err)
+	}
+	profileID := ""
+	if r.profileAvailability != nil {
+		resolvedProfileID, err := r.profileAvailability.AvailableProfileID(ctx, trimmedProfile)
+		if err != nil {
+			return ResolvedWorkspace{}, fmt.Errorf("workspace: resolve profile resources: %w", err)
+		}
+		profileID = resolvedProfileID
+	}
+	return r.resolveOrRegisterForProfile(ctx, path, trimmedProfile, profileID)
+}
+
+func (r *Resolver) resolveOrRegisterForProfile(
+	ctx context.Context,
+	path string,
+	profileName string,
+	profileID string,
+) (ResolvedWorkspace, error) {
+	if err := checkContext(ctx); err != nil {
+		return ResolvedWorkspace{}, err
+	}
+
+	canonicalRoot, err := canonicalRoot(path)
+	if err != nil {
+		return ResolvedWorkspace{}, err
+	}
+	if err := r.rejectOperatorHomeRegistration(canonicalRoot); err != nil {
+		return ResolvedWorkspace{}, err
+	}
+
+	ws, created, err := r.resolveOrCreateRegistration(ctx, canonicalRoot)
+	if err != nil {
+		return ResolvedWorkspace{}, err
+	}
+	if !created {
+		return r.resolve(ctx, ws.ID, profileName, profileID)
+	}
+
+	resolved, err := r.resolve(ctx, ws.ID, profileName, profileID)
+	if err != nil {
+		deleteErr := r.rollbackDeleteWorkspace(ctx, ws.ID)
+		if deleteErr != nil && !errors.Is(deleteErr, ErrWorkspaceNotFound) {
+			return ResolvedWorkspace{}, errors.Join(
+				err,
+				fmt.Errorf("workspace: rollback auto-registered workspace %q: %w", ws.ID, deleteErr),
+			)
+		}
+		return ResolvedWorkspace{}, err
+	}
+	if err := r.notifyChangeHook(ctx, "auto-register", ws.ID); err != nil {
+		deleteErr := r.rollbackDeleteWorkspace(ctx, ws.ID)
+		if deleteErr != nil && !errors.Is(deleteErr, ErrWorkspaceNotFound) {
+			return ResolvedWorkspace{}, errors.Join(
+				err,
+				fmt.Errorf("workspace: rollback auto-registered workspace %q: %w", ws.ID, deleteErr),
+			)
+		}
+		return ResolvedWorkspace{}, err
+	}
+
+	r.logger.Info("workspace.register",
+		"workspace_id", resolved.ID,
+		"root_dir", resolved.RootDir,
+		"name", resolved.Name,
+	)
+
+	return resolved, nil
+}
+
+func (r *Resolver) resolveOrCreateRegistration(
+	ctx context.Context,
+	canonicalRoot string,
+) (Workspace, bool, error) {
+	r.registrationMu.Lock()
+	defer r.registrationMu.Unlock()
+
+	if err := checkContext(ctx); err != nil {
+		return Workspace{}, false, err
+	}
+	ws, err := r.lookupWorkspaceByCanonicalPath(ctx, canonicalRoot)
+	if err == nil {
+		return ws, false, nil
+	}
+	if !errors.Is(err, ErrWorkspaceNotFound) {
+		return Workspace{}, false, err
+	}
+	ws, err = r.createWorkspaceRegistration(ctx, RegisterOptions{RootDir: canonicalRoot})
+	if err == nil {
+		return ws, true, nil
+	}
+	if !errors.Is(err, ErrWorkspacePathTaken) {
+		return Workspace{}, false, err
+	}
+	existing, lookupErr := r.store.GetWorkspaceByPath(ctx, canonicalRoot)
+	if lookupErr != nil {
+		return Workspace{}, false, fmt.Errorf(
+			"workspace: reload concurrent workspace registration for %q: %w",
+			canonicalRoot,
+			lookupErr,
+		)
+	}
+	return existing, false, nil
+}
+
+func (r *Resolver) rollbackDeleteWorkspace(ctx context.Context, workspaceID string) error {
+	rollbackCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), rollbackDeleteTimeout)
+	defer cancel()
+
+	return r.store.DeleteWorkspace(rollbackCtx, workspaceID)
+}
+
+// Invalidate deletes one workspace snapshot from the in-memory cache.
+func (r *Resolver) Invalidate(workspaceID string) {
+	if r == nil {
+		return
+	}
+	trimmedID := strings.TrimSpace(workspaceID)
+	if trimmedID == "" {
+		return
+	}
+
+	r.mu.Lock()
+	r.agentConfigGeneration++
+	for key := range r.cache {
+		if key == trimmedID || strings.HasPrefix(key, trimmedID+"\x00") {
+			delete(r.cache, key)
+		}
+	}
+	for key := range r.agentConfigCache {
+		if key == trimmedID || strings.HasPrefix(key, trimmedID+"\x00") {
+			delete(r.agentConfigCache, key)
+		}
+	}
+	r.mu.Unlock()
+}
+
+// InvalidateAll clears every cached runtime snapshot after a global dependency changes.
+func (r *Resolver) InvalidateAll() {
+	if r == nil {
+		return
+	}
+	r.mu.Lock()
+	r.agentConfigGeneration++
+	clear(r.cache)
+	clear(r.agentConfigCache)
+	r.mu.Unlock()
+}
+
+func (r *Resolver) notifyChangeHook(ctx context.Context, operation string, workspaceID string) error {
+	if r == nil || r.changeHook == nil {
+		return nil
+	}
+	if err := r.changeHook(ctx); err != nil {
+		return fmt.Errorf("workspace: %s workspace %q change hook: %w", operation, workspaceID, err)
+	}
+	return nil
+}
+
+// buildResolvedWorkspace validates agent state and isolates the merged runtime resources.
+func (r *Resolver) buildResolvedWorkspace(
+	ctx context.Context,
+	ws Workspace,
+	scan workspaceScan,
+	profileName string,
+	cfg *compozyconfig.Config,
+) (ResolvedWorkspace, error) {
+	if err := checkContext(ctx); err != nil {
+		return ResolvedWorkspace{}, err
+	}
+	if cfg == nil {
+		return ResolvedWorkspace{}, errors.New("workspace: config is required")
+	}
+
+	state, err := buildWorkspaceAgentState(ctx, ws, cfg, scan.agents)
+	if err != nil {
+		return ResolvedWorkspace{}, err
+	}
+
+	skills := mergeSkillPaths(scan.skills)
+
+	return ResolvedWorkspace{
+		Scope:               ScopeWorkspace,
+		Workspace:           cloneWorkspace(ws),
+		ProfileName:         profileName,
+		ProfileRoot:         resolvedProfileRoot(r.homePaths.ProfilesDir, profileName),
+		ProfileDeclarations: append([]ProfileDeclaration(nil), scan.profileDeclarations...),
+		Config:              compozyconfig.CloneConfig(cfg),
+		Agents:              cloneAgentDefs(state.agents),
+		AgentDiagnostics:    append([]AgentDiagnostic(nil), state.diagnostics...),
+		Skills:              cloneSkillPaths(skills),
+		ResolvedAt:          r.now(),
+	}, nil
+}
+
+func resolvedProfileRoot(profilesDir, profileName string) string {
+	if strings.TrimSpace(profileName) == "" || strings.TrimSpace(profilesDir) == "" {
+		return ""
+	}
+	return filepath.Join(profilesDir, profileName)
+}
+
+func workspaceProfileCacheKey(workspaceID, profileName string) string {
+	trimmedProfile := strings.TrimSpace(profileName)
+	if trimmedProfile == "" {
+		return strings.TrimSpace(workspaceID)
+	}
+	return strings.TrimSpace(workspaceID) + "\x00" + trimmedProfile
+}
+
+// canReuse requires matching dependency snapshots, merged skills, and workspace runtime overrides.
+func (c *cachedEntry) canReuse(ws Workspace, scan workspaceScan) bool {
+	if c == nil {
+		return false
+	}
+	if !filesnap.Equal(c.snapshots, scan.snapshots) || !slices.Equal(c.resolved.Skills, mergeSkillPaths(scan.skills)) {
+		return false
+	}
+	return sameWorkspaceRuntimeInputs(c.workspace, ws)
+}
+
+// evictExpiredLocked expires both resolver caches by last access while the resolver mutex is held.
+func (r *Resolver) evictExpiredLocked(now time.Time) {
+	cutoff := now.Add(-r.cacheTTL)
+	r.evictAgentConfigCacheLocked(cutoff)
+	for workspaceID, entry := range r.cache {
+		if entry.lastAccess.Before(cutoff) {
+			r.logger.Debug("workspace.cache.evict",
+				"workspace_id", workspaceID,
+				"age_minutes", int(now.Sub(entry.lastAccess).Minutes()),
+			)
+			delete(r.cache, workspaceID)
+		}
+	}
+}

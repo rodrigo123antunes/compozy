@@ -1,0 +1,2310 @@
+package automation
+
+import (
+	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"slices"
+	"strings"
+	"testing"
+	"time"
+
+	compozyconfig "github.com/compozy/compozy/internal/config"
+	"github.com/compozy/compozy/internal/profile"
+	"github.com/compozy/compozy/internal/resources"
+	"github.com/compozy/compozy/internal/store"
+	taskpkg "github.com/compozy/compozy/internal/task"
+	"github.com/compozy/compozy/internal/testutil"
+	"github.com/compozy/compozy/internal/vault"
+)
+
+func TestAutomationResourceCodecsRejectInvalidSpecs(t *testing.T) {
+	t.Parallel()
+
+	jobCodec, err := NewJobResourceCodec()
+	if err != nil {
+		t.Fatalf("NewJobResourceCodec() error = %v", err)
+	}
+	triggerCodec, err := NewTriggerResourceCodec()
+	if err != nil {
+		t.Fatalf("NewTriggerResourceCodec() error = %v", err)
+	}
+
+	ctx := testutil.Context(t)
+	workspaceScope := resources.ResourceScope{Kind: resources.ResourceScopeKindWorkspace, ID: "ws-resource"}
+
+	validJob := testJob(AutomationScopeWorkspace, "resource-job", "ws-resource")
+	jobWithScopeMismatch := validJob
+	jobWithScopeMismatch.WorkspaceID = "ws-other"
+	if _, err := jobCodec.DecodeAndValidate(
+		ctx,
+		workspaceScope,
+		mustAutomationJSON(t, jobWithScopeMismatch),
+	); !errors.Is(
+		err,
+		resources.ErrInvalidScopeBinding,
+	) {
+		t.Fatalf("job scope mismatch error = %v, want ErrInvalidScopeBinding", err)
+	} else if !strings.Contains(err.Error(), "automation: bind job resource scope") {
+		t.Fatalf("job scope mismatch error = %v, want bind job resource scope context", err)
+	}
+
+	malformedJob := validJob
+	malformedJob.Schedule = &ScheduleSpec{Mode: ScheduleModeEvery, Interval: "0s"}
+	if _, err := jobCodec.DecodeAndValidate(ctx, workspaceScope, mustAutomationJSON(t, malformedJob)); err == nil {
+		t.Fatal("job codec accepted malformed schedule")
+	} else if !strings.Contains(err.Error(), "automation: validate job resource spec") {
+		t.Fatalf("malformed job error = %v, want validate job resource spec context", err)
+	}
+
+	validTrigger := Trigger{
+		Scope:       AutomationScopeWorkspace,
+		Name:        "resource-trigger",
+		AgentName:   "reviewer",
+		WorkspaceID: "ws-resource",
+		Prompt:      `Review {{ index .Data "session_id" }}`,
+		Event:       "session.stopped",
+		Enabled:     true,
+		Retry:       DefaultRetryConfig(),
+		FireLimit:   DefaultFireLimitConfig(),
+		Source:      JobSourceDynamic,
+	}
+	triggerWithBadFilter := validTrigger
+	triggerWithBadFilter.Filter = map[string]string{"unsupported": "value"}
+	if _, err := triggerCodec.DecodeAndValidate(
+		ctx,
+		workspaceScope,
+		mustAutomationJSON(t, triggerWithBadFilter),
+	); err == nil {
+		t.Fatal("trigger codec accepted malformed filter")
+	} else if !strings.Contains(err.Error(), "automation: validate trigger resource spec") {
+		t.Fatalf("trigger filter error = %v, want validate trigger resource spec context", err)
+	}
+
+	t.Run("Should reject a padded event in the trigger codec", func(t *testing.T) {
+		triggerWithPaddedEvent := validTrigger
+		triggerWithPaddedEvent.Event = " session.stopped"
+		if _, err := triggerCodec.DecodeAndValidate(
+			ctx,
+			workspaceScope,
+			mustAutomationJSON(t, triggerWithPaddedEvent),
+		); err == nil {
+			t.Fatal("trigger codec accepted a padded event")
+		} else if !strings.Contains(err.Error(), "surrounding whitespace") {
+			t.Fatalf("padded trigger event error = %v, want surrounding whitespace validation", err)
+		}
+	})
+
+	webhookWithoutEndpoint := validTrigger
+	webhookWithoutEndpoint.Event = "webhook"
+	if _, err := triggerCodec.DecodeAndValidate(
+		ctx,
+		workspaceScope,
+		mustAutomationJSON(t, webhookWithoutEndpoint),
+	); err == nil {
+		t.Fatal("trigger codec accepted webhook without endpoint_slug or webhook_id")
+	} else if !strings.Contains(err.Error(), "automation: validate trigger resource spec") {
+		t.Fatalf("webhook trigger error = %v, want validate trigger resource spec context", err)
+	}
+
+	t.Run("Should bind profile ownership from profile resource scopes", func(t *testing.T) {
+		t.Parallel()
+
+		profileJob := testJob(AutomationScopeGlobal, "profile-resource-job", "")
+		profileJob.ProfileID = ""
+		boundJob, err := jobCodec.DecodeAndValidate(
+			ctx,
+			resources.ResourceScope{Kind: resources.ResourceScopeKindProfile, ID: "profile-marketing"},
+			mustAutomationJSON(t, profileJob),
+		)
+		if err != nil {
+			t.Fatalf("jobCodec.DecodeAndValidate(profile scope) error = %v", err)
+		}
+		if got, want := boundJob.ProfileID, "profile-marketing"; got != want {
+			t.Fatalf("boundJob.ProfileID = %q, want %q", got, want)
+		}
+
+		workspaceProfileTrigger := validTrigger
+		workspaceProfileTrigger.ProfileID = "profile-marketing"
+		boundTrigger, err := triggerCodec.DecodeAndValidate(
+			ctx,
+			resources.ResourceScope{
+				Kind: resources.ResourceScopeKindWorkspaceProfile,
+				ID:   "ws-resource@pf:marketing",
+			},
+			mustAutomationJSON(t, workspaceProfileTrigger),
+		)
+		if err != nil {
+			t.Fatalf("triggerCodec.DecodeAndValidate(workspace profile scope) error = %v", err)
+		}
+		if got, want := boundTrigger.ProfileID, "profile-marketing"; got != want {
+			t.Fatalf("boundTrigger.ProfileID = %q, want %q", got, want)
+		}
+		if got, want := boundTrigger.WorkspaceID, "ws-resource"; got != want {
+			t.Fatalf("boundTrigger.WorkspaceID = %q, want %q", got, want)
+		}
+	})
+}
+
+func TestManagerStartRegistersResourceDefinitionsAtStartup(t *testing.T) {
+	t.Parallel()
+
+	h := newManagerResourceHarness(t)
+	jobRecord := h.putJobResource(t, "job-startup", "startup-job")
+	triggerRecord := h.putTriggerResource(t, "trigger-startup", "startup-trigger")
+	manager := h.newResourceManager(t)
+	if err := manager.Start(h.ctx); err != nil {
+		t.Fatalf("manager.Start() error = %v", err)
+	}
+	t.Cleanup(func() {
+		if err := manager.Shutdown(testutil.Context(t)); err != nil {
+			t.Errorf("manager.Shutdown() error = %v", err)
+		}
+	})
+
+	jobs, err := manager.Jobs(h.ctx)
+	if err != nil {
+		t.Fatalf("manager.Jobs() error = %v", err)
+	}
+	if got := findJobByID(jobs, jobRecord.ID); got == nil {
+		t.Fatalf("jobs missing resource-backed job %q after Start", jobRecord.ID)
+	}
+	if got, want := len(manager.scheduler.States()), 1; got != want {
+		t.Fatalf("len(manager.scheduler.States()) = %d, want %d", got, want)
+	}
+
+	triggers, err := manager.Triggers(h.ctx)
+	if err != nil {
+		t.Fatalf("manager.Triggers() error = %v", err)
+	}
+	if got := findTriggerByID(triggers, triggerRecord.ID); got == nil {
+		t.Fatalf("triggers missing resource-backed trigger %q after Start", triggerRecord.ID)
+	}
+	manager.triggers.mu.RLock()
+	registered := len(manager.triggers.registrations)
+	manager.triggers.mu.RUnlock()
+	if got, want := registered, 1; got != want {
+		t.Fatalf("len(manager.triggers.registrations) = %d, want %d", got, want)
+	}
+
+	t.Run("Should preserve live runtimes when boot reconciliation repeats the loaded snapshot", func(t *testing.T) {
+		liveScheduler := manager.scheduler
+		liveTriggerEngine := manager.triggers
+
+		jobPlan, err := manager.BuildJobResourceState(h.ctx, []resources.Record[Job]{jobRecord})
+		if err != nil {
+			t.Fatalf("BuildJobResourceState(unchanged) error = %v", err)
+		}
+		if got := jobPlan.OperationCount(); got != 0 {
+			t.Fatalf("unchanged job plan operations = %d, want 0", got)
+		}
+		if err := manager.ApplyJobResourceState(h.ctx, jobPlan); err != nil {
+			t.Fatalf("ApplyJobResourceState(unchanged) error = %v", err)
+		}
+		if manager.scheduler != liveScheduler {
+			t.Fatal("unchanged job projection replaced the live scheduler")
+		}
+
+		triggerPlan, err := manager.BuildTriggerResourceState(h.ctx, []resources.Record[Trigger]{triggerRecord})
+		if err != nil {
+			t.Fatalf("BuildTriggerResourceState(unchanged) error = %v", err)
+		}
+		if got := triggerPlan.OperationCount(); got != 0 {
+			t.Fatalf("unchanged trigger plan operations = %d, want 0", got)
+		}
+		if err := manager.ApplyTriggerResourceState(h.ctx, triggerPlan); err != nil {
+			t.Fatalf("ApplyTriggerResourceState(unchanged) error = %v", err)
+		}
+		if manager.triggers != liveTriggerEngine {
+			t.Fatal("unchanged trigger projection replaced the live trigger engine")
+		}
+	})
+}
+
+func TestManagerResourceListsSearchSortAndPage(t *testing.T) {
+	t.Parallel()
+
+	t.Run("Should filter the effective source union before the page cut", func(t *testing.T) {
+		t.Parallel()
+
+		h := newManagerResourceHarness(t)
+		configJob := h.putJobResourceWithSource(t, "job-union-config", "needle-config", JobSourceConfig)
+		packageJob := h.putJobResourceWithSource(t, "job-union-package", "needle-package", JobSourcePackage)
+		h.putJobResourceWithSource(t, "job-union-dynamic", "needle-dynamic", JobSourceDynamic)
+		configTrigger := h.putTriggerResourceWithSource(
+			t,
+			"trigger-union-config",
+			"needle-config",
+			JobSourceConfig,
+		)
+		packageTrigger := h.putTriggerResourceWithSource(
+			t,
+			"trigger-union-package",
+			"needle-package",
+			JobSourcePackage,
+		)
+		h.putTriggerResourceWithSource(
+			t,
+			"trigger-union-dynamic",
+			"needle-dynamic",
+			JobSourceDynamic,
+		)
+		if _, err := h.db.SetJobEnabledOverlay(h.ctx, JobEnabledOverlay{
+			JobID:           configJob.ID,
+			EnabledOverride: false,
+		}); err != nil {
+			t.Fatalf("SetJobEnabledOverlay(config) error = %v", err)
+		}
+		if _, err := h.db.SetJobEnabledOverlay(h.ctx, JobEnabledOverlay{
+			JobID:           packageJob.ID,
+			EnabledOverride: false,
+		}); err != nil {
+			t.Fatalf("SetJobEnabledOverlay(package) error = %v", err)
+		}
+		if _, err := h.db.SetTriggerEnabledOverlay(h.ctx, TriggerEnabledOverlay{
+			TriggerID:       configTrigger.ID,
+			EnabledOverride: false,
+		}); err != nil {
+			t.Fatalf("SetTriggerEnabledOverlay(config) error = %v", err)
+		}
+		if _, err := h.db.SetTriggerEnabledOverlay(h.ctx, TriggerEnabledOverlay{
+			TriggerID:       packageTrigger.ID,
+			EnabledOverride: false,
+		}); err != nil {
+			t.Fatalf("SetTriggerEnabledOverlay(package) error = %v", err)
+		}
+
+		manager := h.newResourceManager(t)
+		if err := manager.Start(h.ctx); err != nil {
+			t.Fatalf("manager.Start() error = %v", err)
+		}
+		t.Cleanup(func() {
+			if err := manager.Shutdown(testutil.Context(t)); err != nil {
+				t.Errorf("manager.Shutdown() error = %v", err)
+			}
+		})
+		disabled := false
+		jobQuery := JobListQuery{
+			ReadScope: store.ReadScope{AllProfiles: true}, Search: "needle", Enabled: &disabled, Limit: 1,
+		}
+		jobPage, err := manager.ListJobs(h.ctx, jobQuery)
+		if err != nil {
+			t.Fatalf("manager.ListJobs(first) error = %v", err)
+		}
+		if jobPage.Total != 2 || len(jobPage.Jobs) != 1 || jobPage.Jobs[0].ID != configJob.ID ||
+			!jobPage.HasMore || jobPage.NextCursor == "" {
+			t.Fatalf("manager.ListJobs(first) = %#v, want config-first effective union page", jobPage)
+		}
+		jobQuery.Cursor = jobPage.NextCursor
+		jobPage, err = manager.ListJobs(h.ctx, jobQuery)
+		if err != nil {
+			t.Fatalf("manager.ListJobs(second) error = %v", err)
+		}
+		if jobPage.Total != 2 || len(jobPage.Jobs) != 1 || jobPage.Jobs[0].ID != packageJob.ID || jobPage.HasMore {
+			t.Fatalf("manager.ListJobs(second) = %#v, want package terminal page", jobPage)
+		}
+
+		triggerQuery := TriggerListQuery{
+			ReadScope: store.ReadScope{AllProfiles: true}, Search: "needle", Enabled: &disabled, Limit: 1,
+		}
+		triggerPage, err := manager.ListTriggers(h.ctx, triggerQuery)
+		if err != nil {
+			t.Fatalf("manager.ListTriggers(first) error = %v", err)
+		}
+		if triggerPage.Total != 2 || len(triggerPage.Triggers) != 1 ||
+			triggerPage.Triggers[0].ID != configTrigger.ID || !triggerPage.HasMore ||
+			triggerPage.NextCursor == "" {
+			t.Fatalf("manager.ListTriggers(first) = %#v, want config-first effective union page", triggerPage)
+		}
+		triggerQuery.Cursor = triggerPage.NextCursor
+		triggerPage, err = manager.ListTriggers(h.ctx, triggerQuery)
+		if err != nil {
+			t.Fatalf("manager.ListTriggers(second) error = %v", err)
+		}
+		if triggerPage.Total != 2 || len(triggerPage.Triggers) != 1 ||
+			triggerPage.Triggers[0].ID != packageTrigger.ID || triggerPage.HasMore {
+			t.Fatalf("manager.ListTriggers(second) = %#v, want package terminal page", triggerPage)
+		}
+	})
+
+	t.Run("Should walk matching jobs and triggers with one canonical order", func(t *testing.T) {
+		t.Parallel()
+
+		h := newManagerResourceHarness(t)
+		sources := []JobSource{JobSourceDynamic, JobSourceConfig, JobSourcePackage}
+		expectedJobs := make([]Job, 0, 13)
+		expectedTriggers := make([]Trigger, 0, 13)
+		for index := range 13 {
+			jobRecord := h.putJobResourceWithSource(
+				t,
+				fmt.Sprintf("job-list-%02d", index),
+				fmt.Sprintf("needle-job-%02d", 12-index),
+				sources[index%len(sources)],
+			)
+			expectedJobs = append(expectedJobs, Job{
+				ID:     jobRecord.ID,
+				Name:   jobRecord.Spec.Name,
+				Source: jobRecord.Spec.Source,
+			})
+			triggerRecord := h.putTriggerResourceWithSource(
+				t,
+				fmt.Sprintf("trigger-list-%02d", index),
+				fmt.Sprintf("needle-trigger-%02d", 12-index),
+				sources[index%len(sources)],
+			)
+			expectedTriggers = append(expectedTriggers, Trigger{
+				ID:     triggerRecord.ID,
+				Name:   triggerRecord.Spec.Name,
+				Source: triggerRecord.Spec.Source,
+			})
+		}
+		h.putJobResource(t, "job-list-decoy", "unrelated-job")
+		h.putTriggerResource(t, "trigger-list-decoy", "unrelated-trigger")
+
+		manager := h.newResourceManager(t)
+		if err := manager.Start(h.ctx); err != nil {
+			t.Fatalf("manager.Start() error = %v", err)
+		}
+		t.Cleanup(func() {
+			if err := manager.Shutdown(testutil.Context(t)); err != nil {
+				t.Fatalf("manager.Shutdown() error = %v", err)
+			}
+		})
+
+		SortJobsForList(expectedJobs)
+		jobQuery := JobListQuery{ReadScope: store.ReadScope{AllProfiles: true}, Search: " NeEdLe ", Limit: 4}
+		walkedJobIDs := make([]string, 0, len(expectedJobs))
+		for {
+			page, err := manager.ListJobs(h.ctx, jobQuery)
+			if err != nil {
+				t.Fatalf("manager.ListJobs(cursor=%q) error = %v", jobQuery.Cursor, err)
+			}
+			if got, want := page.Total, len(expectedJobs); got != want {
+				t.Fatalf("manager.ListJobs().Total = %d, want %d", got, want)
+			}
+			for _, job := range page.Jobs {
+				walkedJobIDs = append(walkedJobIDs, job.ID)
+			}
+			if !page.HasMore {
+				break
+			}
+			jobQuery.Cursor = page.NextCursor
+		}
+		for index, job := range expectedJobs {
+			if got, want := walkedJobIDs[index], job.ID; got != want {
+				t.Fatalf("walked job %d = %q, want %q", index, got, want)
+			}
+		}
+
+		SortTriggersForList(expectedTriggers)
+		triggerQuery := TriggerListQuery{ReadScope: store.ReadScope{AllProfiles: true}, Search: "needle", Limit: 5}
+		walkedTriggerIDs := make([]string, 0, len(expectedTriggers))
+		for {
+			page, err := manager.ListTriggers(h.ctx, triggerQuery)
+			if err != nil {
+				t.Fatalf("manager.ListTriggers(cursor=%q) error = %v", triggerQuery.Cursor, err)
+			}
+			if got, want := page.Total, len(expectedTriggers); got != want {
+				t.Fatalf("manager.ListTriggers().Total = %d, want %d", got, want)
+			}
+			for _, trigger := range page.Triggers {
+				walkedTriggerIDs = append(walkedTriggerIDs, trigger.ID)
+			}
+			if !page.HasMore {
+				break
+			}
+			triggerQuery.Cursor = page.NextCursor
+		}
+		for index, trigger := range expectedTriggers {
+			if got, want := walkedTriggerIDs[index], trigger.ID; got != want {
+				t.Fatalf("walked trigger %d = %q, want %q", index, got, want)
+			}
+		}
+	})
+}
+
+func TestAutomationJobResourceBuildDoesNotMutateLiveRuntime(t *testing.T) {
+	t.Parallel()
+
+	h := newManagerResourceHarness(t)
+	manager := h.newResourceManager(t)
+	if err := manager.Start(h.ctx); err != nil {
+		t.Fatalf("manager.Start() error = %v", err)
+	}
+	t.Cleanup(func() {
+		if err := manager.Shutdown(testutil.Context(t)); err != nil {
+			t.Fatalf("manager.Shutdown() error = %v", err)
+		}
+	})
+
+	record := h.putJobResource(t, "job-side-effect", "side-effect-job")
+	plan, err := manager.BuildJobResourceState(h.ctx, []resources.Record[Job]{record})
+	if err != nil {
+		t.Fatalf("BuildJobResourceState() error = %v", err)
+	}
+	if plan.Kind() != JobResourceKind || plan.Revision() != record.Version || plan.OperationCount() != 1 {
+		t.Fatalf(
+			"job plan metadata = kind:%q revision:%d operations:%d",
+			plan.Kind(),
+			plan.Revision(),
+			plan.OperationCount(),
+		)
+	}
+	shutdownJobResourcePlan(t, manager, plan)
+
+	jobs, err := manager.Jobs(h.ctx)
+	if err != nil {
+		t.Fatalf("manager.Jobs() error = %v", err)
+	}
+	if len(jobs) != 0 {
+		t.Fatalf("manager.Jobs() after Build = %d, want 0", len(jobs))
+	}
+	if got := manager.scheduler.States(); len(got) != 0 {
+		t.Fatalf("scheduler states after Build = %d, want 0", len(got))
+	}
+}
+
+func TestAutomationTriggerResourceBuildDoesNotMutateLiveRuntime(t *testing.T) {
+	t.Parallel()
+
+	h := newManagerResourceHarness(t)
+	manager := h.newResourceManager(t)
+	if err := manager.Start(h.ctx); err != nil {
+		t.Fatalf("manager.Start() error = %v", err)
+	}
+	t.Cleanup(func() {
+		if err := manager.Shutdown(testutil.Context(t)); err != nil {
+			t.Fatalf("manager.Shutdown() error = %v", err)
+		}
+	})
+
+	record := h.putTriggerResource(t, "trigger-side-effect", "side-effect-trigger")
+	plan, err := manager.BuildTriggerResourceState(h.ctx, []resources.Record[Trigger]{record})
+	if err != nil {
+		t.Fatalf("BuildTriggerResourceState() error = %v", err)
+	}
+	if plan.Kind() != TriggerResourceKind || plan.Revision() != record.Version || plan.OperationCount() != 1 {
+		t.Fatalf(
+			"trigger plan metadata = kind:%q revision:%d operations:%d",
+			plan.Kind(),
+			plan.Revision(),
+			plan.OperationCount(),
+		)
+	}
+	shutdownTriggerResourcePlan(t, manager, plan)
+
+	triggers, err := manager.Triggers(h.ctx)
+	if err != nil {
+		t.Fatalf("manager.Triggers() error = %v", err)
+	}
+	if len(triggers) != 0 {
+		t.Fatalf("manager.Triggers() after Build = %d, want 0", len(triggers))
+	}
+	manager.triggers.mu.RLock()
+	registered := len(manager.triggers.registrations)
+	manager.triggers.mu.RUnlock()
+	if registered != 0 {
+		t.Fatalf("trigger registrations after Build = %d, want 0", registered)
+	}
+}
+
+func TestAutomationJobResourceApplyFailurePreservesPreviousRuntime(t *testing.T) {
+	t.Parallel()
+
+	t.Run("Should preserve the previous runtime when applying a canceled plan", func(t *testing.T) {
+		t.Parallel()
+
+		h := newManagerResourceHarness(t)
+		manager := h.newResourceManager(t)
+		if err := manager.Start(h.ctx); err != nil {
+			t.Fatalf("manager.Start() error = %v", err)
+		}
+		t.Cleanup(func() {
+			if err := manager.Shutdown(testutil.Context(t)); err != nil {
+				t.Errorf("manager.Shutdown() error = %v", err)
+			}
+		})
+
+		first := h.putJobResource(t, "job-previous", "previous-job")
+		firstPlan, err := manager.BuildJobResourceState(h.ctx, []resources.Record[Job]{first})
+		if err != nil {
+			t.Fatalf("BuildJobResourceState(previous) error = %v", err)
+		}
+		if err := manager.ApplyJobResourceState(h.ctx, firstPlan); err != nil {
+			t.Fatalf("ApplyJobResourceState(previous) error = %v", err)
+		}
+
+		next := h.putJobResource(t, "job-next", "next-job")
+		nextPlan, err := manager.BuildJobResourceState(h.ctx, []resources.Record[Job]{next})
+		if err != nil {
+			t.Fatalf("BuildJobResourceState(next) error = %v", err)
+		}
+		canceledCtx, cancel := context.WithCancel(h.ctx)
+		cancel()
+		if err := manager.ApplyJobResourceState(canceledCtx, nextPlan); !errors.Is(err, context.Canceled) {
+			t.Fatalf("ApplyJobResourceState(canceled) error = %v, want context.Canceled", err)
+		}
+
+		jobs, err := manager.Jobs(h.ctx)
+		if err != nil {
+			t.Fatalf("manager.Jobs() error = %v", err)
+		}
+		if got := findJobByID(jobs, first.ID); got == nil {
+			t.Fatalf("previous job %q missing after failed Apply", first.ID)
+		}
+		if got := findJobByID(jobs, next.ID); got != nil {
+			t.Fatalf("next job %q applied after failed Apply", next.ID)
+		}
+	})
+
+	t.Run("Should restore pruned overlays and join delete and restore failures", func(t *testing.T) {
+		t.Parallel()
+
+		h := newManagerResourceHarness(t)
+		deleteErr := errors.New("delete later overlay")
+		restoreErr := errors.New("report restored overlay")
+		store := &overlayFailureStore{
+			Store: h.db,
+		}
+		manager := h.newResourceManager(t, WithStore(store))
+		records := []resources.Record[Job]{
+			h.putJobResourceWithSource(t, "job-overlay-a", "overlay-a", JobSourceConfig),
+			h.putJobResourceWithSource(t, "job-overlay-b", "overlay-b", JobSourceConfig),
+		}
+		initialPlan, err := manager.BuildJobResourceState(h.ctx, records)
+		if err != nil {
+			t.Fatalf("BuildJobResourceState(initial) error = %v", err)
+		}
+		if err := manager.ApplyJobResourceState(h.ctx, initialPlan); err != nil {
+			t.Fatalf("ApplyJobResourceState(initial) error = %v", err)
+		}
+		for _, record := range records {
+			if _, err := h.db.SetJobEnabledOverlay(h.ctx, JobEnabledOverlay{
+				JobID:           record.ID,
+				EnabledOverride: false,
+			}); err != nil {
+				t.Fatalf("SetJobEnabledOverlay(%q) error = %v", record.ID, err)
+			}
+		}
+
+		retirePlan, err := manager.BuildJobResourceState(h.ctx, nil)
+		if err != nil {
+			t.Fatalf("BuildJobResourceState(retire) error = %v", err)
+		}
+		store.failJobDeleteID = records[1].ID
+		store.jobDeleteErr = deleteErr
+		store.failJobRestoreID = records[0].ID
+		store.jobRestoreErr = restoreErr
+		err = manager.ApplyJobResourceState(h.ctx, retirePlan)
+		if !errors.Is(err, deleteErr) || !errors.Is(err, restoreErr) {
+			t.Fatalf("ApplyJobResourceState(retire) error = %v, want joined delete and restore errors", err)
+		}
+		for _, record := range records {
+			overlay, getErr := h.db.GetJobEnabledOverlay(h.ctx, record.ID)
+			if getErr != nil {
+				t.Fatalf("GetJobEnabledOverlay(%q) error = %v", record.ID, getErr)
+			}
+			if overlay.EnabledOverride {
+				t.Fatalf("GetJobEnabledOverlay(%q) enabled_override = true, want restored false", record.ID)
+			}
+		}
+	})
+}
+
+func TestAutomationTriggerResourceApplyFailurePreservesPreviousRuntime(t *testing.T) {
+	t.Parallel()
+
+	h := newManagerResourceHarness(t)
+	manager := h.newResourceManager(t)
+	if err := manager.Start(h.ctx); err != nil {
+		t.Fatalf("manager.Start() error = %v", err)
+	}
+	t.Cleanup(func() {
+		if err := manager.Shutdown(testutil.Context(t)); err != nil {
+			t.Fatalf("manager.Shutdown() error = %v", err)
+		}
+	})
+
+	first := h.putTriggerResource(t, "trigger-previous", "previous-trigger")
+	firstPlan, err := manager.BuildTriggerResourceState(h.ctx, []resources.Record[Trigger]{first})
+	if err != nil {
+		t.Fatalf("BuildTriggerResourceState(previous) error = %v", err)
+	}
+	if err := manager.ApplyTriggerResourceState(h.ctx, firstPlan); err != nil {
+		t.Fatalf("ApplyTriggerResourceState(previous) error = %v", err)
+	}
+
+	next := h.putTriggerResource(t, "trigger-next", "next-trigger")
+	nextPlan, err := manager.BuildTriggerResourceState(h.ctx, []resources.Record[Trigger]{next})
+	if err != nil {
+		t.Fatalf("BuildTriggerResourceState(next) error = %v", err)
+	}
+	canceledCtx, cancel := context.WithCancel(h.ctx)
+	cancel()
+	if err := manager.ApplyTriggerResourceState(canceledCtx, nextPlan); !errors.Is(err, context.Canceled) {
+		t.Fatalf("ApplyTriggerResourceState(canceled) error = %v, want context.Canceled", err)
+	}
+
+	triggers, err := manager.Triggers(h.ctx)
+	if err != nil {
+		t.Fatalf("manager.Triggers() error = %v", err)
+	}
+	if got := findTriggerByID(triggers, first.ID); got == nil {
+		t.Fatalf("previous trigger %q missing after failed Apply", first.ID)
+	}
+	if got := findTriggerByID(triggers, next.ID); got != nil {
+		t.Fatalf("next trigger %q applied after failed Apply", next.ID)
+	}
+}
+
+func TestLegacyAutomationDefinitionWritesDoNotDriveResourceManager(t *testing.T) {
+	t.Parallel()
+
+	h := newManagerResourceHarness(t)
+	manager := h.newResourceManager(t)
+	if err := manager.Start(h.ctx); err != nil {
+		t.Fatalf("manager.Start() error = %v", err)
+	}
+	t.Cleanup(func() {
+		if err := manager.Shutdown(testutil.Context(t)); err != nil {
+			t.Fatalf("manager.Shutdown() error = %v", err)
+		}
+	})
+
+	legacyJob, err := h.db.CreateJob(h.ctx, testJob(AutomationScopeGlobal, "legacy-job", ""))
+	if err != nil {
+		t.Fatalf("CreateJob(legacy) error = %v", err)
+	}
+	if _, err := manager.GetJob(h.ctx, legacyJob.ID); !errors.Is(err, ErrJobNotFound) {
+		t.Fatalf("manager.GetJob(legacy) error = %v, want ErrJobNotFound", err)
+	}
+
+	resourceRecord := h.putJobResource(t, "job-resource", "resource-job")
+	plan, err := manager.BuildJobResourceState(h.ctx, []resources.Record[Job]{resourceRecord})
+	if err != nil {
+		t.Fatalf("BuildJobResourceState(resource) error = %v", err)
+	}
+	if err := manager.ApplyJobResourceState(h.ctx, plan); err != nil {
+		t.Fatalf("ApplyJobResourceState(resource) error = %v", err)
+	}
+	if _, err := manager.GetJob(h.ctx, resourceRecord.ID); err != nil {
+		t.Fatalf("manager.GetJob(resource) error = %v", err)
+	}
+}
+
+func TestAutomationResourceProjectionRejectsInvalidInputs(t *testing.T) {
+	t.Parallel()
+
+	h := newManagerResourceHarness(t)
+	manager := h.newResourceManager(t)
+
+	if _, err := manager.BuildJobResourceState(nilAutomationResourceContext(), nil); err == nil {
+		t.Fatal("BuildJobResourceState(nil context) error = nil, want error")
+	}
+	var nilManager *Manager
+	if _, err := nilManager.BuildJobResourceState(h.ctx, nil); err == nil {
+		t.Fatal("nil manager BuildJobResourceState() error = nil, want error")
+	}
+	if err := manager.ApplyJobResourceState(nilAutomationResourceContext(), nil); err == nil {
+		t.Fatal("ApplyJobResourceState(nil context) error = nil, want error")
+	}
+	if err := nilManager.ApplyJobResourceState(h.ctx, nil); err == nil {
+		t.Fatal("nil manager ApplyJobResourceState() error = nil, want error")
+	}
+	if err := manager.ApplyJobResourceState(h.ctx, &triggerResourceProjectionPlan{}); err == nil {
+		t.Fatal("ApplyJobResourceState(wrong plan type) error = nil, want error")
+	}
+	if err := manager.ApplyJobResourceState(h.ctx, &jobResourceProjectionPlan{}); err == nil {
+		t.Fatal("ApplyJobResourceState(missing scheduler) error = nil, want error")
+	}
+
+	if _, err := manager.BuildTriggerResourceState(nilAutomationResourceContext(), nil); err == nil {
+		t.Fatal("BuildTriggerResourceState(nil context) error = nil, want error")
+	}
+	if _, err := nilManager.BuildTriggerResourceState(h.ctx, nil); err == nil {
+		t.Fatal("nil manager BuildTriggerResourceState() error = nil, want error")
+	}
+	if err := manager.ApplyTriggerResourceState(nilAutomationResourceContext(), nil); err == nil {
+		t.Fatal("ApplyTriggerResourceState(nil context) error = nil, want error")
+	}
+	if err := nilManager.ApplyTriggerResourceState(h.ctx, nil); err == nil {
+		t.Fatal("nil manager ApplyTriggerResourceState() error = nil, want error")
+	}
+	if err := manager.ApplyTriggerResourceState(h.ctx, &jobResourceProjectionPlan{}); err == nil {
+		t.Fatal("ApplyTriggerResourceState(wrong plan type) error = nil, want error")
+	}
+	if err := manager.ApplyTriggerResourceState(h.ctx, &triggerResourceProjectionPlan{}); err == nil {
+		t.Fatal("ApplyTriggerResourceState(missing engine) error = nil, want error")
+	}
+}
+
+func TestAutomationResourceManagerCRUDUsesTypedResourceStores(t *testing.T) {
+	t.Parallel()
+
+	t.Run("Should persist typed resource definitions and preserve Loop target execution", func(t *testing.T) {
+		t.Parallel()
+
+		h := newManagerResourceHarness(t)
+		loopStarter := &recordingLoopStarter{}
+		manager := h.newResourceManager(t, WithLoopStarter(loopStarter))
+		if err := manager.Start(h.ctx); err != nil {
+			t.Fatalf("manager.Start() error = %v", err)
+		}
+		t.Cleanup(func() {
+			if err := manager.Shutdown(testutil.Context(t)); err != nil {
+				t.Fatalf("manager.Shutdown() error = %v", err)
+			}
+		})
+
+		createdJob, err := manager.CreateJob(h.ctx, testJob(AutomationScopeGlobal, "resource-crud-job", ""))
+		if err != nil {
+			t.Fatalf("CreateJob(resource) error = %v", err)
+		}
+		if createdJob.Source != JobSourceDynamic {
+			t.Fatalf("created job source = %q, want %q", createdJob.Source, JobSourceDynamic)
+		}
+		jobRecord, err := h.jobStore.Get(h.ctx, h.actor, createdJob.ID)
+		if err != nil {
+			t.Fatalf("jobStore.Get(created) error = %v", err)
+		}
+		if jobRecord.Spec.Name != createdJob.Name {
+			t.Fatalf("job resource name = %q, want %q", jobRecord.Spec.Name, createdJob.Name)
+		}
+		changedTarget := createdJob
+		changedTarget.AgentName = "other-agent"
+		if _, err := manager.UpdateJob(h.ctx, changedTarget); !errors.Is(err, ErrTargetIdentityImmutable) {
+			t.Fatalf("UpdateJob(resource changed target) error = %v, want ErrTargetIdentityImmutable", err)
+		}
+		blockedLifecycle := createdJob
+		blockedLifecycle.Prompt = "Run `compozy daemon stop` now."
+		if _, err := manager.UpdateJob(h.ctx, blockedLifecycle); !errors.Is(
+			err,
+			ErrDaemonLifecycleCommandBlocked,
+		) {
+			t.Fatalf(
+				"UpdateJob(resource lifecycle command) error = %v, want ErrDaemonLifecycleCommandBlocked",
+				err,
+			)
+		}
+		jobRecord, err = h.jobStore.Get(h.ctx, h.actor, createdJob.ID)
+		if err != nil {
+			t.Fatalf("jobStore.Get(after blocked update) error = %v", err)
+		}
+		if jobRecord.Spec.Prompt != createdJob.Prompt {
+			t.Fatalf(
+				"job resource prompt after blocked update = %q, want unchanged %q",
+				jobRecord.Spec.Prompt,
+				createdJob.Prompt,
+			)
+		}
+
+		nextJob := createdJob
+		nextJob.Prompt = "Review the resource-backed scheduler"
+		updatedJob, err := manager.UpdateJob(h.ctx, nextJob)
+		if err != nil {
+			t.Fatalf("UpdateJob(resource) error = %v", err)
+		}
+		if updatedJob.Prompt != nextJob.Prompt {
+			t.Fatalf("updated job prompt = %q, want %q", updatedJob.Prompt, nextJob.Prompt)
+		}
+		disabledJob, err := manager.SetJobEnabled(h.ctx, createdJob.ID, false)
+		if err != nil {
+			t.Fatalf("SetJobEnabled(resource) error = %v", err)
+		}
+		if disabledJob.Enabled {
+			t.Fatal("SetJobEnabled(resource) returned enabled job, want disabled")
+		}
+		jobRecord, err = h.jobStore.Get(h.ctx, h.actor, createdJob.ID)
+		if err != nil {
+			t.Fatalf("jobStore.Get(disabled) error = %v", err)
+		}
+		if jobRecord.Spec.Enabled {
+			t.Fatal("resource job spec enabled = true, want false")
+		}
+		if err := manager.DeleteJob(h.ctx, createdJob.ID); err != nil {
+			t.Fatalf("DeleteJob(resource) error = %v", err)
+		}
+		if _, err := manager.GetJob(h.ctx, createdJob.ID); !errors.Is(err, ErrJobNotFound) {
+			t.Fatalf("GetJob(deleted resource) error = %v, want ErrJobNotFound", err)
+		}
+		if _, err := h.jobStore.Get(h.ctx, h.actor, createdJob.ID); !errors.Is(err, resources.ErrNotFound) {
+			t.Fatalf("jobStore.Get(deleted) error = %v, want resources.ErrNotFound", err)
+		}
+
+		trigger := testTrigger(AutomationScopeGlobal, "resource-crud-trigger", "")
+		trigger.Event = "session.stopped"
+		trigger.WebhookID = ""
+		trigger.EndpointSlug = ""
+		createdTrigger, err := manager.CreateTrigger(h.ctx, trigger, WebhookSecretWrite{})
+		if err != nil {
+			t.Fatalf("CreateTrigger(resource) error = %v", err)
+		}
+		triggerRecord, err := h.triggerStore.Get(h.ctx, h.actor, createdTrigger.ID)
+		if err != nil {
+			t.Fatalf("triggerStore.Get(created) error = %v", err)
+		}
+		if triggerRecord.Spec.Event != "session.stopped" {
+			t.Fatalf("trigger resource event = %q, want session.stopped", triggerRecord.Spec.Event)
+		}
+
+		nextTrigger := createdTrigger
+		nextTrigger.Prompt = `Review stopped session {{ index .Data "session_id" }}`
+		updatedTrigger, err := manager.UpdateTrigger(h.ctx, nextTrigger, nil)
+		if err != nil {
+			t.Fatalf("UpdateTrigger(resource) error = %v", err)
+		}
+		if updatedTrigger.Prompt != nextTrigger.Prompt {
+			t.Fatalf("updated trigger prompt = %q, want %q", updatedTrigger.Prompt, nextTrigger.Prompt)
+		}
+		disabledTrigger, err := manager.SetTriggerEnabled(h.ctx, createdTrigger.ID, false)
+		if err != nil {
+			t.Fatalf("SetTriggerEnabled(resource) error = %v", err)
+		}
+		if disabledTrigger.Enabled {
+			t.Fatal("SetTriggerEnabled(resource) returned enabled trigger, want disabled")
+		}
+		triggerRecord, err = h.triggerStore.Get(h.ctx, h.actor, createdTrigger.ID)
+		if err != nil {
+			t.Fatalf("triggerStore.Get(disabled) error = %v", err)
+		}
+		if triggerRecord.Spec.Enabled {
+			t.Fatal("resource trigger spec enabled = true, want false")
+		}
+		if err := manager.DeleteTrigger(h.ctx, createdTrigger.ID); err != nil {
+			t.Fatalf("DeleteTrigger(resource) error = %v", err)
+		}
+		if _, err := manager.GetTrigger(h.ctx, createdTrigger.ID); !errors.Is(err, ErrTriggerNotFound) {
+			t.Fatalf("GetTrigger(deleted resource) error = %v, want ErrTriggerNotFound", err)
+		}
+		if _, err := h.triggerStore.Get(h.ctx, h.actor, createdTrigger.ID); !errors.Is(err, resources.ErrNotFound) {
+			t.Fatalf("triggerStore.Get(deleted) error = %v, want resources.ErrNotFound", err)
+		}
+
+		loopTrigger := testTrigger(AutomationScopeWorkspace, "resource-crud-loop-trigger", h.workspace.ID)
+		loopTrigger.AgentName = ""
+		loopTrigger.Prompt = ""
+		loopTrigger.Event = "ext.qa.loop-ready"
+		loopTrigger.WebhookID = ""
+		loopTrigger.EndpointSlug = ""
+		loopTrigger.WebhookSecretRef = ""
+		loopTrigger.TargetKind = TargetKindLoop
+		loopTrigger.LoopTarget = &LoopTarget{
+			WorkspaceID: h.workspace.ID,
+			LoopName:    "review-and-fix",
+			Inputs:      map[string]any{"pr": float64(2)},
+		}
+		createdLoopTrigger, err := manager.CreateTrigger(h.ctx, loopTrigger, WebhookSecretWrite{})
+		if err != nil {
+			t.Fatalf("CreateTrigger(resource loop target) error = %v", err)
+		}
+		if createdLoopTrigger.TargetKind != TargetKindLoop || createdLoopTrigger.LoopTarget == nil {
+			t.Fatalf(
+				"created Loop trigger target = kind:%q target:%#v",
+				createdLoopTrigger.TargetKind,
+				createdLoopTrigger.LoopTarget,
+			)
+		}
+		if got, want := createdLoopTrigger.LoopTarget.Inputs["pr"], float64(2); got != want {
+			t.Fatalf("created Loop trigger input pr = %#v, want %#v", got, want)
+		}
+		loopTriggerRecord, err := h.triggerStore.Get(h.ctx, h.actor, createdLoopTrigger.ID)
+		if err != nil {
+			t.Fatalf("triggerStore.Get(created Loop target) error = %v", err)
+		}
+		if loopTriggerRecord.Spec.LoopTarget == nil ||
+			loopTriggerRecord.Spec.LoopTarget.WorkspaceID != h.workspace.ID {
+			t.Fatalf("stored Loop trigger target = %#v", loopTriggerRecord.Spec.LoopTarget)
+		}
+		loopStartErr := errors.New("Loop start integration probe")
+		loopStarter.startErr = loopStartErr
+		fired, err := manager.FireExtensionTrigger(h.ctx, ExtensionTriggerRequest{
+			Event:       loopTrigger.Event,
+			Scope:       AutomationScopeWorkspace,
+			WorkspaceID: h.workspace.ID,
+			Payload:     map[string]any{"source": "qa"},
+		})
+		if !errors.Is(err, loopStartErr) {
+			t.Fatalf("FireExtensionTrigger(resource Loop target) error = %v, want Loop starter error", err)
+		}
+		if got, want := fired.Matched, 1; got != want {
+			t.Fatalf("FireExtensionTrigger(resource Loop target).Matched = %d, want %d", got, want)
+		}
+		startCalls := loopStarter.startCallSnapshot()
+		if got, want := len(startCalls), 1; got != want {
+			t.Fatalf("len(StartLoop calls) = %d, want %d", got, want)
+		}
+		if got, want := startCalls[0].WorkspaceID, h.workspace.ID; got != want {
+			t.Fatalf("StartLoop().WorkspaceID = %q, want %q", got, want)
+		}
+		if got, want := startCalls[0].Inputs["pr"], float64(2); got != want {
+			t.Fatalf("StartLoop().Inputs[pr] = %#v, want %#v", got, want)
+		}
+
+		crossWorkspace := cloneTrigger(loopTrigger)
+		crossWorkspace.ID = "trigger-resource-crud-loop-cross-workspace"
+		crossWorkspace.Name = "resource-crud-loop-cross-workspace"
+		crossWorkspace.LoopTarget.WorkspaceID = "ws-other"
+		if _, err := manager.CreateTrigger(h.ctx, crossWorkspace, WebhookSecretWrite{}); err == nil {
+			t.Fatal("CreateTrigger(cross-workspace Loop target) error = nil, want validation error")
+		} else if !strings.Contains(
+			err.Error(),
+			"trigger.loop_target.workspace_id must equal automation workspace_id",
+		) {
+			t.Fatalf("CreateTrigger(cross-workspace Loop target) error = %v, want workspace mismatch", err)
+		}
+		if _, err := h.triggerStore.Get(h.ctx, h.actor, crossWorkspace.ID); !errors.Is(err, resources.ErrNotFound) {
+			t.Fatalf("triggerStore.Get(cross-workspace Loop target) error = %v, want resources.ErrNotFound", err)
+		}
+
+		loopStarter.validateErr = errors.New("start_kind_not_allowed: trigger not declared")
+		incompatible := cloneTrigger(loopTrigger)
+		incompatible.ID = "trigger-resource-crud-loop-incompatible"
+		incompatible.Name = "resource-crud-loop-incompatible"
+		if _, err := manager.CreateTrigger(h.ctx, incompatible, WebhookSecretWrite{}); err == nil {
+			t.Fatal("CreateTrigger(incompatible Loop target) error = nil, want start kind error")
+		} else if !strings.Contains(err.Error(), "start_kind_not_allowed") {
+			t.Fatalf("CreateTrigger(incompatible Loop target) error = %v, want start_kind_not_allowed", err)
+		}
+		if _, err := h.triggerStore.Get(h.ctx, h.actor, incompatible.ID); !errors.Is(err, resources.ErrNotFound) {
+			t.Fatalf("triggerStore.Get(incompatible Loop target) error = %v, want resources.ErrNotFound", err)
+		}
+	})
+}
+
+func TestAutomationResourceManagerCRUDRollsBackCommittedMutationsOnApplyFailure(t *testing.T) {
+	t.Parallel()
+
+	t.Run("Should rollback created job resources when projection apply fails", func(t *testing.T) {
+		t.Parallel()
+
+		h := newManagerResourceHarness(t)
+		ctx, cancel := context.WithCancel(h.ctx)
+		jobStore := &cancelAfterMutationStore[Job]{
+			store:       h.jobStore,
+			cancel:      cancel,
+			cancelOnPut: true,
+		}
+		manager := h.newResourceManager(t, WithResourceDefinitions(jobStore, h.triggerStore, h.actor, nil))
+
+		job := testJob(AutomationScopeGlobal, "rollback-created-job", "")
+		_, err := manager.CreateJob(ctx, job)
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("manager.CreateJob() error = %v, want context.Canceled", err)
+		}
+		if _, err := h.jobStore.Get(h.ctx, h.actor, job.ID); !errors.Is(err, resources.ErrNotFound) {
+			t.Fatalf("jobStore.Get(created rollback) error = %v, want resources.ErrNotFound", err)
+		}
+		if _, err := manager.GetJob(h.ctx, job.ID); !errors.Is(err, ErrJobNotFound) {
+			t.Fatalf("manager.GetJob(created rollback) error = %v, want ErrJobNotFound", err)
+		}
+	})
+
+	t.Run("Should rollback updated job resources when projection apply fails", func(t *testing.T) {
+		t.Parallel()
+
+		h := newManagerResourceHarness(t)
+		jobStore := &cancelAfterMutationStore[Job]{store: h.jobStore}
+		manager := h.newResourceManager(t, WithResourceDefinitions(jobStore, h.triggerStore, h.actor, nil))
+
+		current := h.putJobResource(t, "job-rollback-update", "rollback-update-job")
+		if err := manager.applyJobResourcesFromStore(h.ctx); err != nil {
+			t.Fatalf("manager.applyJobResourcesFromStore() error = %v", err)
+		}
+
+		ctx, cancel := context.WithCancel(h.ctx)
+		jobStore.cancel = cancel
+		jobStore.cancelOnPut = true
+		next := cloneJob(current.Spec)
+		next.ID = current.ID
+		next.Prompt = "Review the updated rollback prompt"
+		_, err := manager.UpdateJob(ctx, next)
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("manager.UpdateJob() error = %v, want context.Canceled", err)
+		}
+
+		stored, err := h.jobStore.Get(h.ctx, h.actor, current.ID)
+		if err != nil {
+			t.Fatalf("jobStore.Get(updated rollback) error = %v", err)
+		}
+		if stored.Spec.Prompt != current.Spec.Prompt {
+			t.Fatalf("stored job prompt after rollback = %q, want %q", stored.Spec.Prompt, current.Spec.Prompt)
+		}
+		effective, err := manager.GetJob(h.ctx, current.ID)
+		if err != nil {
+			t.Fatalf("manager.GetJob(updated rollback) error = %v", err)
+		}
+		if effective.Prompt != current.Spec.Prompt {
+			t.Fatalf("effective job prompt after rollback = %q, want %q", effective.Prompt, current.Spec.Prompt)
+		}
+	})
+
+	t.Run("Should rollback deleted job resources when projection apply fails", func(t *testing.T) {
+		t.Parallel()
+
+		h := newManagerResourceHarness(t)
+		jobStore := &cancelAfterMutationStore[Job]{store: h.jobStore}
+		manager := h.newResourceManager(t, WithResourceDefinitions(jobStore, h.triggerStore, h.actor, nil))
+
+		current := h.putJobResource(t, "job-rollback-delete", "rollback-delete-job")
+		if err := manager.applyJobResourcesFromStore(h.ctx); err != nil {
+			t.Fatalf("manager.applyJobResourcesFromStore() error = %v", err)
+		}
+
+		ctx, cancel := context.WithCancel(h.ctx)
+		jobStore.cancel = cancel
+		jobStore.cancelOnDelete = true
+		err := manager.DeleteJob(ctx, current.ID)
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("manager.DeleteJob() error = %v, want context.Canceled", err)
+		}
+
+		if _, err := h.jobStore.Get(h.ctx, h.actor, current.ID); err != nil {
+			t.Fatalf("jobStore.Get(deleted rollback) error = %v", err)
+		}
+		if _, err := manager.GetJob(h.ctx, current.ID); err != nil {
+			t.Fatalf("manager.GetJob(deleted rollback) error = %v", err)
+		}
+	})
+
+	t.Run(
+		"Should rollback created trigger resources and owned secrets when projection apply fails",
+		func(t *testing.T) {
+			t.Parallel()
+
+			h := newManagerResourceHarness(t)
+			ctx, cancel := context.WithCancel(h.ctx)
+			triggerStore := &cancelAfterMutationStore[Trigger]{
+				store:       h.triggerStore,
+				cancel:      cancel,
+				cancelOnPut: true,
+			}
+			manager := h.newResourceManager(t, WithResourceDefinitions(h.jobStore, triggerStore, h.actor, nil))
+
+			trigger := testWebhookTrigger(AutomationScopeGlobal, "rollback-created-trigger", "")
+			trigger.WebhookSecretRef = ""
+			secretRef := defaultAutomationWebhookSecretRef(trigger.ID)
+			_, err := manager.CreateTrigger(ctx, trigger, webhookSecretWrite("secret-v1"))
+			if !errors.Is(err, context.Canceled) {
+				t.Fatalf("manager.CreateTrigger() error = %v, want context.Canceled", err)
+			}
+			if _, err := h.triggerStore.Get(h.ctx, h.actor, trigger.ID); !errors.Is(err, resources.ErrNotFound) {
+				t.Fatalf("triggerStore.Get(created rollback) error = %v, want resources.ErrNotFound", err)
+			}
+			h.assertWebhookSecretMissing(t, secretRef)
+			if _, err := manager.GetTrigger(h.ctx, trigger.ID); !errors.Is(err, ErrTriggerNotFound) {
+				t.Fatalf("manager.GetTrigger(created rollback) error = %v, want ErrTriggerNotFound", err)
+			}
+		},
+	)
+
+	t.Run(
+		"Should rollback updated trigger resources and owned secret deletion when projection apply fails",
+		func(t *testing.T) {
+			t.Parallel()
+
+			h := newManagerResourceHarness(t)
+			secretStore := &cancelAfterWebhookSecretStore{
+				store:          h.webhookSecretStore(t),
+				cancelOnDelete: false,
+			}
+			manager := h.newResourceManager(t, WithWebhookSecretStore(secretStore))
+
+			current := h.putOwnedWebhookTriggerResource(
+				t,
+				"trigger-rollback-update",
+				"rollback-update-trigger",
+				"secret-v1",
+			)
+			if err := manager.applyTriggerResourcesFromStore(h.ctx); err != nil {
+				t.Fatalf("manager.applyTriggerResourcesFromStore() error = %v", err)
+			}
+
+			ctx, cancel := context.WithCancel(h.ctx)
+			secretStore.cancel = cancel
+			secretStore.cancelOnDelete = true
+			next := cloneTrigger(current.Spec)
+			next.ID = current.ID
+			next.Event = "session.stopped"
+			next.EndpointSlug = ""
+			next.WebhookID = ""
+			next.WebhookSecretRef = ""
+			_, err := manager.UpdateTrigger(ctx, next, nil)
+			if !errors.Is(err, context.Canceled) {
+				t.Fatalf("manager.UpdateTrigger() error = %v, want context.Canceled", err)
+			}
+
+			stored, err := h.triggerStore.Get(h.ctx, h.actor, current.ID)
+			if err != nil {
+				t.Fatalf("triggerStore.Get(updated rollback) error = %v", err)
+			}
+			if stored.Spec.Event != current.Spec.Event ||
+				stored.Spec.WebhookSecretRef != current.Spec.WebhookSecretRef {
+				t.Fatalf(
+					"stored trigger after rollback = %#v, want event %q secret ref %q",
+					stored.Spec,
+					current.Spec.Event,
+					current.Spec.WebhookSecretRef,
+				)
+			}
+			if got := h.resolveWebhookSecret(t, current.Spec.WebhookSecretRef); got != "secret-v1" {
+				t.Fatalf("restored webhook secret = %q, want %q", got, "secret-v1")
+			}
+			effective, err := manager.GetTrigger(h.ctx, current.ID)
+			if err != nil {
+				t.Fatalf("manager.GetTrigger(updated rollback) error = %v", err)
+			}
+			if effective.Event != current.Spec.Event || effective.WebhookSecretRef != current.Spec.WebhookSecretRef {
+				t.Fatalf(
+					"effective trigger after rollback = %#v, want event %q secret ref %q",
+					effective,
+					current.Spec.Event,
+					current.Spec.WebhookSecretRef,
+				)
+			}
+		},
+	)
+
+	t.Run(
+		"Should rollback deleted trigger resources and owned secret deletion when projection apply fails",
+		func(t *testing.T) {
+			t.Parallel()
+
+			h := newManagerResourceHarness(t)
+			secretStore := &cancelAfterWebhookSecretStore{
+				store: h.webhookSecretStore(t),
+			}
+			manager := h.newResourceManager(t, WithWebhookSecretStore(secretStore))
+
+			current := h.putOwnedWebhookTriggerResource(
+				t,
+				"trigger-rollback-delete",
+				"rollback-delete-trigger",
+				"secret-v1",
+			)
+			if err := manager.applyTriggerResourcesFromStore(h.ctx); err != nil {
+				t.Fatalf("manager.applyTriggerResourcesFromStore() error = %v", err)
+			}
+
+			ctx, cancel := context.WithCancel(h.ctx)
+			secretStore.cancel = cancel
+			secretStore.cancelOnDelete = true
+			err := manager.DeleteTrigger(ctx, current.ID)
+			if !errors.Is(err, context.Canceled) {
+				t.Fatalf("manager.DeleteTrigger() error = %v, want context.Canceled", err)
+			}
+
+			if _, err := h.triggerStore.Get(h.ctx, h.actor, current.ID); err != nil {
+				t.Fatalf("triggerStore.Get(deleted rollback) error = %v", err)
+			}
+			if got := h.resolveWebhookSecret(t, current.Spec.WebhookSecretRef); got != "secret-v1" {
+				t.Fatalf("restored deleted webhook secret = %q, want %q", got, "secret-v1")
+			}
+			if _, err := manager.GetTrigger(h.ctx, current.ID); err != nil {
+				t.Fatalf("manager.GetTrigger(deleted rollback) error = %v", err)
+			}
+		},
+	)
+}
+
+func TestAutomationResourceSyncManagedDefinitionsPublishesAndPrunesSourceRecords(t *testing.T) {
+	t.Parallel()
+
+	h := newManagerResourceHarness(t)
+	var triggered []resources.ResourceKind
+	manager := h.newResourceManager(t, WithResourceDefinitions(
+		h.jobStore,
+		h.triggerStore,
+		h.actor,
+		func(_ context.Context, kind resources.ResourceKind, _ resources.ReconcileReason) error {
+			triggered = append(triggered, kind.Normalize())
+			return nil
+		},
+	))
+
+	job := testJob(AutomationScopeGlobal, "managed-resource-job", "")
+	trigger := testTrigger(AutomationScopeGlobal, "managed-resource-trigger", "")
+	trigger.Event = "session.stopped"
+	trigger.WebhookID = ""
+	trigger.EndpointSlug = ""
+	trigger.WebhookSecretRef = ""
+
+	stats, err := manager.SyncManagedDefinitions(
+		h.ctx,
+		JobSourceConfig,
+		[]Job{job},
+		[]Trigger{trigger},
+	)
+	if err != nil {
+		t.Fatalf("SyncManagedDefinitions(create) error = %v", err)
+	}
+	if stats.JobsSynced != 1 || stats.TriggersSynced != 1 || stats.JobsRemoved != 0 || stats.TriggersRemoved != 0 {
+		t.Fatalf("create stats = %#v", stats)
+	}
+
+	configActor := manager.resourceActorForSource(JobSourceConfig)
+	jobRecord, err := h.jobStore.Get(h.ctx, configActor, job.ID)
+	if err != nil {
+		t.Fatalf("jobStore.Get(config) error = %v", err)
+	}
+	if jobRecord.Spec.Source != JobSourceConfig || jobRecord.Spec.Name != job.Name {
+		t.Fatalf("config job resource = %#v", jobRecord.Spec)
+	}
+	triggerRecord, err := h.triggerStore.Get(h.ctx, configActor, trigger.ID)
+	if err != nil {
+		t.Fatalf("triggerStore.Get(config) error = %v", err)
+	}
+	if triggerRecord.Spec.Source != JobSourceConfig || triggerRecord.Spec.Event != "session.stopped" {
+		t.Fatalf("config trigger resource = %#v", triggerRecord.Spec)
+	}
+
+	job.Prompt = "Review the updated config resource"
+	stats, err = manager.SyncManagedDefinitions(h.ctx, JobSourceConfig, []Job{job}, nil)
+	if err != nil {
+		t.Fatalf("SyncManagedDefinitions(update) error = %v", err)
+	}
+	if stats.JobsSynced != 1 || stats.TriggersSynced != 0 || stats.JobsRemoved != 0 || stats.TriggersRemoved != 1 {
+		t.Fatalf("update stats = %#v", stats)
+	}
+	jobRecord, err = h.jobStore.Get(h.ctx, configActor, job.ID)
+	if err != nil {
+		t.Fatalf("jobStore.Get(updated config) error = %v", err)
+	}
+	if jobRecord.Spec.Prompt != job.Prompt {
+		t.Fatalf("updated config job prompt = %q, want %q", jobRecord.Spec.Prompt, job.Prompt)
+	}
+	if _, err := h.triggerStore.Get(h.ctx, configActor, trigger.ID); !errors.Is(err, resources.ErrNotFound) {
+		t.Fatalf("triggerStore.Get(pruned config) error = %v, want resources.ErrNotFound", err)
+	}
+	if len(triggered) != 4 {
+		t.Fatalf("resource reconcile triggers = %#v, want two kinds for each sync", triggered)
+	}
+}
+
+func TestAutomationResourceSyncManagedDefinitionsSkipsUnchangedTaskBackedJob(t *testing.T) {
+	t.Parallel()
+
+	h := newManagerResourceHarness(t)
+	manager := h.newResourceManager(t)
+
+	job := testJob(AutomationScopeWorkspace, "task-backed-resource-job", "ws-1")
+	job.AgentName = ""
+	job.Prompt = ""
+	job.Retry = RetryConfig{Strategy: RetryStrategyNone}
+	job.Task = &JobTaskConfig{
+		Title:       "Run task-backed automation",
+		Description: "Exercise task equality in managed resource sync",
+		Owner:       &taskpkg.Ownership{Kind: taskpkg.OwnerKindPool, Ref: "ops"},
+	}
+
+	if _, err := manager.SyncManagedDefinitions(h.ctx, JobSourceConfig, []Job{job}, nil); err != nil {
+		t.Fatalf("SyncManagedDefinitions(first) error = %v", err)
+	}
+	configActor := manager.resourceActorForSource(JobSourceConfig)
+	firstRecord, err := h.jobStore.Get(h.ctx, configActor, job.ID)
+	if err != nil {
+		t.Fatalf("jobStore.Get(first) error = %v", err)
+	}
+
+	stats, err := manager.SyncManagedDefinitions(h.ctx, JobSourceConfig, []Job{job}, nil)
+	if err != nil {
+		t.Fatalf("SyncManagedDefinitions(second) error = %v", err)
+	}
+	if stats.JobsSynced != 1 || stats.JobsRemoved != 0 || stats.TriggersSynced != 0 || stats.TriggersRemoved != 0 {
+		t.Fatalf("second sync stats = %#v", stats)
+	}
+	secondRecord, err := h.jobStore.Get(h.ctx, configActor, job.ID)
+	if err != nil {
+		t.Fatalf("jobStore.Get(second) error = %v", err)
+	}
+	if secondRecord.Version != firstRecord.Version {
+		t.Fatalf("unchanged task-backed job version = %d, want %d", secondRecord.Version, firstRecord.Version)
+	}
+	if secondRecord.Spec.Task == nil || secondRecord.Spec.Task.Owner == nil {
+		t.Fatalf("task-backed job resource lost task owner: %#v", secondRecord.Spec.Task)
+	}
+}
+
+func TestAutomationResourceConfigEnabledChangesUseOperationalOverlays(t *testing.T) {
+	t.Parallel()
+
+	h := newManagerResourceHarness(t)
+	manager := h.newResourceManager(t)
+	if err := manager.Start(h.ctx); err != nil {
+		t.Fatalf("manager.Start() error = %v", err)
+	}
+	t.Cleanup(func() {
+		if err := manager.Shutdown(testutil.Context(t)); err != nil {
+			t.Fatalf("manager.Shutdown() error = %v", err)
+		}
+	})
+
+	job := testJob(AutomationScopeGlobal, "config-resource-job", "")
+	trigger := testTrigger(AutomationScopeGlobal, "config-resource-trigger", "")
+	trigger.Event = "session.stopped"
+	trigger.WebhookID = ""
+	trigger.EndpointSlug = ""
+	trigger.WebhookSecretRef = ""
+	if _, err := manager.SyncManagedDefinitions(
+		h.ctx,
+		JobSourceConfig,
+		[]Job{job},
+		[]Trigger{trigger},
+	); err != nil {
+		t.Fatalf("SyncManagedDefinitions(config) error = %v", err)
+	}
+	if err := manager.applyJobResourcesFromStore(h.ctx); err != nil {
+		t.Fatalf("applyJobResourcesFromStore() error = %v", err)
+	}
+	if err := manager.applyTriggerResourcesFromStore(h.ctx); err != nil {
+		t.Fatalf("applyTriggerResourcesFromStore() error = %v", err)
+	}
+
+	disabledJob, err := manager.SetJobEnabled(h.ctx, job.ID, false)
+	if err != nil {
+		t.Fatalf("SetJobEnabled(config resource) error = %v", err)
+	}
+	if disabledJob.Enabled {
+		t.Fatal("config resource job effective enabled = true, want false overlay")
+	}
+	configActor := manager.resourceActorForSource(JobSourceConfig)
+	jobRecord, err := h.jobStore.Get(h.ctx, configActor, job.ID)
+	if err != nil {
+		t.Fatalf("jobStore.Get(config resource) error = %v", err)
+	}
+	if !jobRecord.Spec.Enabled {
+		t.Fatal("config resource job spec enabled = false, want unchanged true")
+	}
+	jobOverlay, err := h.db.GetJobEnabledOverlay(h.ctx, job.ID)
+	if err != nil {
+		t.Fatalf("GetJobEnabledOverlay(config resource) error = %v", err)
+	}
+	if jobOverlay.EnabledOverride {
+		t.Fatal("config job overlay enabled_override = true, want false")
+	}
+
+	disabledTrigger, err := manager.SetTriggerEnabled(h.ctx, trigger.ID, false)
+	if err != nil {
+		t.Fatalf("SetTriggerEnabled(config resource) error = %v", err)
+	}
+	if disabledTrigger.Enabled {
+		t.Fatal("config resource trigger effective enabled = true, want false overlay")
+	}
+	triggerRecord, err := h.triggerStore.Get(h.ctx, configActor, trigger.ID)
+	if err != nil {
+		t.Fatalf("triggerStore.Get(config resource) error = %v", err)
+	}
+	if !triggerRecord.Spec.Enabled {
+		t.Fatal("config resource trigger spec enabled = false, want unchanged true")
+	}
+	triggerOverlay, err := h.db.GetTriggerEnabledOverlay(h.ctx, trigger.ID)
+	if err != nil {
+		t.Fatalf("GetTriggerEnabledOverlay(config resource) error = %v", err)
+	}
+	if triggerOverlay.EnabledOverride {
+		t.Fatal("config trigger overlay enabled_override = true, want false")
+	}
+
+	if _, err := manager.SyncManagedDefinitions(h.ctx, JobSourceConfig, nil, nil); err != nil {
+		t.Fatalf("SyncManagedDefinitions(remove config resources) error = %v", err)
+	}
+	if err := manager.applyJobResourcesFromStore(h.ctx); err != nil {
+		t.Fatalf("applyJobResourcesFromStore(remove) error = %v", err)
+	}
+	if err := manager.applyTriggerResourcesFromStore(h.ctx); err != nil {
+		t.Fatalf("applyTriggerResourcesFromStore(remove) error = %v", err)
+	}
+	if _, err := h.db.GetJobEnabledOverlay(h.ctx, job.ID); !errors.Is(err, ErrJobOverlayNotFound) {
+		t.Fatalf("GetJobEnabledOverlay(after removal) error = %v, want overlay GC", err)
+	}
+	if _, err := h.db.GetTriggerEnabledOverlay(h.ctx, trigger.ID); !errors.Is(err, ErrTriggerOverlayNotFound) {
+		t.Fatalf("GetTriggerEnabledOverlay(after removal) error = %v, want overlay GC", err)
+	}
+}
+
+func TestProfileDeleteResourceAutomations(t *testing.T) {
+	t.Parallel()
+	for _, source := range []JobSource{JobSourceDynamic, JobSourceConfig, JobSourcePackage} {
+		t.Run("Should protect "+string(source)+" automation ownership through deletion", func(t *testing.T) {
+			t.Parallel()
+			h := newManagerResourceHarness(t)
+			profiles, err := profile.NewManager(profile.WithStore(h.db), profile.WithHomePaths(h.homePaths))
+			if err != nil {
+				t.Fatalf("profile.NewManager() error = %v", err)
+			}
+			owner, err := profiles.Create(h.ctx, profile.CreateInput{Name: "release-drafts"})
+			if err != nil {
+				t.Fatalf("Create() error = %v", err)
+			}
+			job := testJob(AutomationScopeWorkspace, "release-job", h.workspace.ID)
+			job.ProfileID, job.Source, job.Enabled = owner.ID, source, false
+			scope := resources.ResourceScope{Kind: resources.ResourceScopeKindWorkspace, ID: h.workspace.ID}
+			if _, err := h.jobStore.Put(h.ctx, h.actor, resources.Draft[Job]{
+				ID: job.ID, Scope: scope, Spec: job,
+			}); err != nil {
+				t.Fatalf("Put(job) error = %v", err)
+			}
+			trigger := testTrigger(AutomationScopeWorkspace, "release-trigger", h.workspace.ID)
+			trigger.ProfileID, trigger.Source, trigger.Event = owner.ID, source, "session.stopped"
+			trigger.WebhookID, trigger.EndpointSlug, trigger.WebhookSecretRef = "", "", ""
+			if _, err := h.triggerStore.Put(h.ctx, h.actor, resources.Draft[Trigger]{
+				ID: trigger.ID, Scope: scope, Spec: trigger,
+			}); err != nil {
+				t.Fatalf("Put(trigger) error = %v", err)
+			}
+			other := h.putJobResource(t, "other-profile-job", "other-profile-job")
+			assertProfileAutomationWork(t, h, profiles, owner.Name, 2)
+			if _, err := h.db.CreateJob(h.ctx, job); err != nil {
+				t.Fatalf("CreateJob(legacy shadow) error = %v", err)
+			}
+			if _, err := h.db.CreateTrigger(h.ctx, trigger); err != nil {
+				t.Fatalf("CreateTrigger(legacy shadow) error = %v", err)
+			}
+			assertProfileAutomationWork(t, h, profiles, owner.Name, 2)
+			if err := h.db.DeleteJob(h.ctx, job.ID); err != nil {
+				t.Fatalf("DeleteJob(legacy shadow) error = %v", err)
+			}
+			if err := h.db.DeleteTrigger(h.ctx, trigger.ID); err != nil {
+				t.Fatalf("DeleteTrigger(legacy shadow) error = %v", err)
+			}
+			archive, err := profiles.PrepareArchive(h.ctx, owner.Name)
+			if err != nil {
+				t.Fatalf("PrepareArchive() error = %v", err)
+			}
+			if _, err := profiles.Archive(h.ctx, owner.Name, archive.Revision); err != nil {
+				t.Fatalf("Archive() error = %v", err)
+			}
+			assertProfileAutomationWork(t, h, profiles, owner.Name, 2)
+			persistedJob, err := h.jobStore.Get(h.ctx, h.actor, job.ID)
+			if err != nil {
+				t.Fatalf("Get(job after refused delete) error = %v", err)
+			}
+			if err := h.jobStore.Delete(h.ctx, h.actor, job.ID, persistedJob.Version); err != nil {
+				t.Fatalf("Delete(job resource) error = %v", err)
+			}
+			assertProfileAutomationWork(t, h, profiles, owner.Name, 1)
+			persistedTrigger, err := h.triggerStore.Get(h.ctx, h.actor, trigger.ID)
+			if err != nil {
+				t.Fatalf("Get(trigger after refused delete) error = %v", err)
+			}
+			if err := h.triggerStore.Delete(h.ctx, h.actor, trigger.ID, persistedTrigger.Version); err != nil {
+				t.Fatalf("Delete(trigger resource) error = %v", err)
+			}
+			plan, err := profiles.PrepareDelete(h.ctx, owner.Name)
+			if err != nil {
+				t.Fatalf("PrepareDelete(empty) error = %v", err)
+			}
+			if _, err := profiles.Delete(h.ctx, owner.Name, plan.Revision); err != nil {
+				t.Fatalf("Delete(empty) error = %v", err)
+			}
+			if _, err := profiles.GetByName(h.ctx, owner.Name); !errors.Is(err, profile.ErrNotFound) {
+				t.Fatalf("GetByName(deleted) error = %v, want ErrNotFound", err)
+			}
+			if _, err := h.jobStore.Get(h.ctx, h.actor, other.ID); err != nil {
+				t.Fatalf("Get(other profile job) error = %v", err)
+			}
+		})
+	}
+}
+
+func assertProfileAutomationWork(
+	t *testing.T,
+	h *managerResourceHarness,
+	profiles *profile.Manager,
+	name string,
+	want int,
+) {
+	t.Helper()
+	detail, err := profiles.GetWithCounts(h.ctx, name)
+	if err != nil || detail.WorkItems != want {
+		t.Fatalf("GetWithCounts(%s) = %#v, error = %v, want %d work items", name, detail, err, want)
+	}
+	catalog, err := profiles.List(h.ctx)
+	if err != nil {
+		t.Fatalf("List() error = %v", err)
+	}
+	for _, owner := range catalog {
+		wantCount := want
+		if owner.ID == store.DefaultProfileID {
+			wantCount = 1
+		}
+		if owner.WorkItems != wantCount {
+			t.Fatalf("List() profile %s has %d work items, want %d", owner.Name, owner.WorkItems, wantCount)
+		}
+	}
+	plan, err := profiles.PrepareDelete(h.ctx, name)
+	if err != nil {
+		t.Fatalf("PrepareDelete() error = %v", err)
+	}
+	if _, err := profiles.Delete(h.ctx, name, plan.Revision); !errors.Is(err, profile.ErrOwnsWork) {
+		t.Fatalf("Delete(nonempty) error = %v, want ErrOwnsWork", err)
+	}
+}
+
+func TestProfileArchiveResourceAutomations(t *testing.T) {
+	t.Parallel()
+	for _, source := range []JobSource{JobSourceDynamic, JobSourceConfig, JobSourcePackage} {
+		t.Run("Should retain explicit pauses across profile restore for "+string(source), func(t *testing.T) {
+			t.Parallel()
+			h := newManagerResourceHarness(t)
+			manager := h.newResourceManager(t)
+			profiles, err := profile.NewManager(
+				profile.WithStore(h.db), profile.WithHomePaths(h.homePaths), profile.WithAutomationReconciler(manager),
+			)
+			if err != nil {
+				t.Fatalf("profile.NewManager() error = %v", err)
+			}
+			owner, err := profiles.Create(h.ctx, profile.CreateInput{Name: "release-drafts"})
+			if err != nil {
+				t.Fatalf("Create() error = %v", err)
+			}
+			emptyPlan, err := profiles.PrepareArchive(h.ctx, owner.Name)
+			if err != nil {
+				t.Fatalf("PrepareArchive(empty) error = %v", err)
+			}
+			for _, fixture := range []struct {
+				id, profileID string
+				enabled       bool
+			}{
+				{"release-job", owner.ID, true},
+				{"already-paused", owner.ID, false},
+				{"other-profile", store.DefaultProfileID, true},
+			} {
+				_, err := h.jobStore.Put(h.ctx, h.actor, resources.Draft[Job]{
+					ID:    fixture.id,
+					Scope: resources.ResourceScope{Kind: resources.ResourceScopeKindWorkspace, ID: h.workspace.ID},
+					Spec: Job{
+						ProfileID:   fixture.profileID,
+						Scope:       AutomationScopeWorkspace,
+						WorkspaceID: h.workspace.ID,
+						Name:        fixture.id,
+						AgentName:   "reviewer",
+						Prompt:      "Prepare release notes",
+						Schedule:    &ScheduleSpec{Mode: ScheduleModeCron, Expr: "0 9 1 * *"},
+						Enabled:     fixture.enabled,
+						Source:      source,
+						Retry:       DefaultRetryConfig(),
+						FireLimit:   DefaultFireLimitConfig(),
+					},
+				})
+				if err != nil {
+					t.Fatalf("Put(job %s) error = %v", fixture.id, err)
+				}
+			}
+			_, err = h.triggerStore.Put(h.ctx, h.actor, resources.Draft[Trigger]{
+				ID:    "release-trigger",
+				Scope: resources.ResourceScope{Kind: resources.ResourceScopeKindWorkspace, ID: h.workspace.ID},
+				Spec: Trigger{
+					ProfileID:   owner.ID,
+					Scope:       AutomationScopeWorkspace,
+					WorkspaceID: h.workspace.ID,
+					Name:        "release-trigger",
+					AgentName:   "reviewer",
+					Prompt:      "Review source notes",
+					Event:       "session.stopped",
+					Enabled:     true,
+					Source:      source,
+					Retry:       DefaultRetryConfig(),
+					FireLimit:   DefaultFireLimitConfig(),
+				},
+			})
+			if err != nil {
+				t.Fatalf("Put(trigger) error = %v", err)
+			}
+			if isOverlayManagedSource(source) {
+				if _, err := h.db.SetJobEnabledOverlay(
+					h.ctx,
+					JobEnabledOverlay{JobID: "already-paused", EnabledOverride: false},
+				); err != nil {
+					t.Fatalf("SetJobEnabledOverlay(already paused) error = %v", err)
+				}
+			}
+			if err := manager.Start(h.ctx); err != nil {
+				t.Fatalf("Start() error = %v", err)
+			}
+			t.Cleanup(func() {
+				if err := manager.Shutdown(context.Background()); err != nil {
+					t.Errorf("Shutdown() error = %v", err)
+				}
+			})
+			plan, err := profiles.PrepareArchive(h.ctx, owner.Name)
+			if err != nil {
+				t.Fatalf("PrepareArchive() error = %v", err)
+			}
+			want := []string{"job:release-job", "trigger:release-trigger"}
+			if !slices.Equal(plan.AutomationsToPause, want) {
+				t.Fatalf("AutomationsToPause = %v, want %v", plan.AutomationsToPause, want)
+			}
+			if _, err := profiles.Archive(
+				h.ctx,
+				owner.Name,
+				emptyPlan.Revision,
+			); !errors.Is(
+				err,
+				profile.ErrPlanStale,
+			) {
+				t.Fatalf("Archive(stale) error = %v, want ErrPlanStale", err)
+			}
+			job, err := manager.GetJob(h.ctx, "release-job")
+			if err != nil || !job.Enabled {
+				t.Fatalf("job after stale archive = %#v, error = %v", job, err)
+			}
+			archived, err := profiles.Archive(h.ctx, owner.Name, plan.Revision)
+			if err != nil || !slices.Equal(archived.PausedAutomations, want) {
+				t.Fatalf("Archive() = %#v, error = %v", archived, err)
+			}
+			assertProfileResourceAutomationsPaused(t, h, manager)
+			persisted, err := h.jobStore.Get(h.ctx, h.actor, "release-job")
+			if err != nil || persisted.Spec.Enabled != isOverlayManagedSource(source) {
+				t.Fatalf("canonical job after archive = %#v, error = %v", persisted, err)
+			}
+			repeated, err := profiles.Archive(h.ctx, owner.Name, plan.Revision)
+			if err != nil || !slices.Equal(repeated.PausedAutomations, want) {
+				t.Fatalf("Archive(repeated) = %#v, error = %v", repeated, err)
+			}
+			restored, err := profiles.Unarchive(h.ctx, owner.Name)
+			if err != nil || !slices.Equal(restored.PausedAutomations, want) {
+				t.Fatalf("Unarchive() = %#v, error = %v", restored, err)
+			}
+			assertProfileResourceAutomationsPaused(t, h, manager)
+			if err := manager.Shutdown(h.ctx); err != nil {
+				t.Fatalf("Shutdown(before restart) error = %v", err)
+			}
+			manager = h.newResourceManager(t)
+			if err := manager.Start(h.ctx); err != nil {
+				t.Fatalf("Start(reopened) error = %v", err)
+			}
+			assertProfileResourceAutomationsPaused(t, h, manager)
+			if _, err := manager.SetJobEnabled(h.ctx, "release-job", true); err != nil {
+				t.Fatalf("SetJobEnabled(explicit) error = %v", err)
+			}
+			if _, err := manager.SetTriggerEnabled(h.ctx, "release-trigger", true); err != nil {
+				t.Fatalf("SetTriggerEnabled(explicit) error = %v", err)
+			}
+			status, err := manager.Status(h.ctx)
+			if err != nil || len(status.ScheduledJobs) != 2 || status.Triggers.Enabled != 1 {
+				t.Fatalf("Status(explicit enable) = %#v, error = %v", status, err)
+			}
+			failure := errors.New("scheduler synchronization unavailable")
+			profiles, err = profile.NewManager(
+				profile.WithStore(h.db),
+				profile.WithHomePaths(h.homePaths),
+				profile.WithAutomationReconciler(
+					profileAutomationReconcilerFunc(func(ctx context.Context, profileID string) error {
+						if failure != nil {
+							return failure
+						}
+						return manager.ReconcileProfileAutomations(ctx, profileID)
+					}),
+				),
+			)
+			if err != nil {
+				t.Fatalf("NewManager(failure boundary) error = %v", err)
+			}
+			plan, err = profiles.PrepareArchive(h.ctx, owner.Name)
+			if err != nil {
+				t.Fatalf("PrepareArchive(second cycle) error = %v", err)
+			}
+			if _, err := profiles.Archive(h.ctx, owner.Name, plan.Revision); !errors.Is(err, failure) {
+				t.Fatalf("Archive(failed sync) error = %v, want %v", err, failure)
+			}
+			if _, err := profiles.Archive(h.ctx, owner.Name, plan.Revision); !errors.Is(err, profile.ErrUnavailable) {
+				t.Fatalf("Archive(incomplete) error = %v, want ErrUnavailable", err)
+			}
+			ops, err := profiles.ListOps(h.ctx)
+			if err != nil {
+				t.Fatalf("ListOps() error = %v", err)
+			}
+			failed := slices.IndexFunc(ops, func(op profile.LifecycleOp) bool { return op.Status == "failed" })
+			if failed < 0 || !strings.Contains(ops[failed].Error, failure.Error()) {
+				t.Fatalf("ListOps() = %#v, want recorded synchronization failure", ops)
+			}
+			failure = nil
+			retried, err := profiles.RetryOp(h.ctx, ops[failed].ID)
+			if err != nil || retried.Status != "done" {
+				t.Fatalf("RetryOp() = %#v, error = %v", retried, err)
+			}
+			assertProfileResourceAutomationsPaused(t, h, manager)
+		})
+	}
+}
+
+func assertProfileResourceAutomationsPaused(t *testing.T, h *managerResourceHarness, manager *Manager) {
+	t.Helper()
+	for _, id := range []string{"release-job", "already-paused", "other-profile"} {
+		job, err := manager.GetJob(h.ctx, id)
+		if err != nil || job.Enabled != (id == "other-profile") {
+			t.Fatalf("GetJob(%s) = %#v, error = %v", id, job, err)
+		}
+	}
+	trigger, err := manager.GetTrigger(h.ctx, "release-trigger")
+	if err != nil || trigger.Enabled {
+		t.Fatalf("GetTrigger() = %#v, error = %v", trigger, err)
+	}
+	status, err := manager.Status(h.ctx)
+	if err != nil || len(status.ScheduledJobs) != 1 || status.ScheduledJobs[0].JobID != "other-profile" {
+		t.Fatalf("Status(paused) = %#v, error = %v", status, err)
+	}
+	result, err := manager.triggerEngineSnapshot().Fire(h.ctx, ActivationEnvelope{
+		Kind: "session.stopped", Scope: AutomationScopeWorkspace, WorkspaceID: h.workspace.ID,
+		Source: ActivationSourceObserver,
+	})
+	if err != nil || result.Matched != 0 {
+		t.Fatalf("Fire(paused) = %#v, error = %v", result, err)
+	}
+}
+
+type profileAutomationReconcilerFunc func(context.Context, string) error
+
+func (f profileAutomationReconcilerFunc) ReconcileProfileAutomations(ctx context.Context, profileID string) error {
+	return f(ctx, profileID)
+}
+
+type managerResourceHarness struct {
+	*managerHarness
+	jobStore     resources.Store[Job]
+	triggerStore resources.Store[Trigger]
+	actor        resources.MutationActor
+}
+
+func newManagerResourceHarness(t *testing.T) *managerResourceHarness {
+	t.Helper()
+
+	base := newManagerHarness(t)
+	kernel, err := resources.NewKernel(base.db.DB())
+	if err != nil {
+		t.Fatalf("resources.NewKernel() error = %v", err)
+	}
+	jobCodec, err := NewJobResourceCodec()
+	if err != nil {
+		t.Fatalf("NewJobResourceCodec() error = %v", err)
+	}
+	jobStore, err := resources.NewStore(kernel, jobCodec)
+	if err != nil {
+		t.Fatalf("resources.NewStore(job) error = %v", err)
+	}
+	triggerCodec, err := NewTriggerResourceCodec()
+	if err != nil {
+		t.Fatalf("NewTriggerResourceCodec() error = %v", err)
+	}
+	triggerStore, err := resources.NewStore(kernel, triggerCodec)
+	if err != nil {
+		t.Fatalf("resources.NewStore(trigger) error = %v", err)
+	}
+
+	return &managerResourceHarness{
+		managerHarness: base,
+		jobStore:       jobStore,
+		triggerStore:   triggerStore,
+		actor: resources.MutationActor{
+			Kind: resources.MutationActorKindDaemon,
+			ID:   "automation-resource-test",
+			Source: resources.ResourceSource{
+				Kind: resources.ResourceSourceKind("daemon"),
+				ID:   "automation-resource-test",
+			},
+			MaxScope: resources.ResourceScope{Kind: resources.ResourceScopeKindUser},
+		},
+	}
+}
+
+func (h *managerResourceHarness) newResourceManager(t *testing.T, opts ...Option) *Manager {
+	t.Helper()
+
+	resourceOpts := []Option{
+		WithResourceDefinitions(h.jobStore, h.triggerStore, h.actor, nil),
+	}
+	resourceOpts = append(resourceOpts, opts...)
+	return h.newManager(t, defaultAutomationTestConfig(), resourceOpts...)
+}
+
+func (h *managerResourceHarness) putJobResource(t *testing.T, id string, name string) resources.Record[Job] {
+	t.Helper()
+	return h.putJobResourceWithSource(t, id, name, JobSourceDynamic)
+}
+
+func (h *managerResourceHarness) putJobResourceWithSource(
+	t *testing.T,
+	id string,
+	name string,
+	source JobSource,
+) resources.Record[Job] {
+	t.Helper()
+
+	runAt := time.Now().UTC().Add(time.Hour).Format(time.RFC3339)
+	job := Job{
+		Scope:     AutomationScopeGlobal,
+		Name:      name,
+		AgentName: "reviewer",
+		Prompt:    "Review repository",
+		Schedule:  &ScheduleSpec{Mode: ScheduleModeAt, Time: runAt},
+		Enabled:   true,
+		Retry:     DefaultRetryConfig(),
+		FireLimit: DefaultFireLimitConfig(),
+		Source:    source,
+	}
+	record, err := h.jobStore.Put(testutil.Context(t), h.actor, resources.Draft[Job]{
+		ID:              id,
+		Scope:           ResourceScopeForAutomation(job.Scope, job.WorkspaceID),
+		ExpectedVersion: 0,
+		Spec:            job,
+	})
+	if err != nil {
+		t.Fatalf("jobStore.Put(%q) error = %v", id, err)
+	}
+	return record
+}
+
+func (h *managerResourceHarness) putTriggerResource(t *testing.T, id string, name string) resources.Record[Trigger] {
+	t.Helper()
+	return h.putTriggerResourceWithSource(t, id, name, JobSourceDynamic)
+}
+
+func (h *managerResourceHarness) putTriggerResourceWithSource(
+	t *testing.T,
+	id string,
+	name string,
+	source JobSource,
+) resources.Record[Trigger] {
+	t.Helper()
+
+	trigger := Trigger{
+		Scope:     AutomationScopeGlobal,
+		Name:      name,
+		AgentName: "reviewer",
+		Prompt:    `Review {{ index .Data "session_id" }}`,
+		Event:     "session.stopped",
+		Enabled:   true,
+		Retry:     DefaultRetryConfig(),
+		FireLimit: DefaultFireLimitConfig(),
+		Source:    source,
+	}
+	record, err := h.triggerStore.Put(testutil.Context(t), h.actor, resources.Draft[Trigger]{
+		ID:              id,
+		Scope:           ResourceScopeForAutomation(trigger.Scope, trigger.WorkspaceID),
+		ExpectedVersion: 0,
+		Spec:            trigger,
+	})
+	if err != nil {
+		t.Fatalf("triggerStore.Put(%q) error = %v", id, err)
+	}
+	return record
+}
+
+func (h *managerResourceHarness) putOwnedWebhookTriggerResource(
+	t *testing.T,
+	id string,
+	name string,
+	secret string,
+) resources.Record[Trigger] {
+	t.Helper()
+
+	trigger := testWebhookTrigger(AutomationScopeGlobal, name, "")
+	trigger.ID = id
+	trigger.Name = name
+	trigger.WebhookID = "wbh_" + name
+	trigger.WebhookSecretRef = defaultAutomationWebhookSecretRef(id)
+	record, err := h.triggerStore.Put(testutil.Context(t), h.actor, resources.Draft[Trigger]{
+		ID:              trigger.ID,
+		Scope:           ResourceScopeForAutomation(trigger.Scope, trigger.WorkspaceID),
+		ExpectedVersion: 0,
+		Spec:            trigger,
+	})
+	if err != nil {
+		t.Fatalf("triggerStore.Put(%q) error = %v", id, err)
+	}
+	h.putWebhookSecret(t, trigger.WebhookSecretRef, secret)
+	return record
+}
+
+func defaultAutomationTestConfig() compozyconfig.AutomationConfig {
+	return compozyconfig.AutomationConfig{
+		Enabled:           true,
+		Timezone:          DefaultTimezone,
+		MaxConcurrentJobs: DefaultMaxConcurrentJobs,
+		DefaultFireLimit:  DefaultFireLimitConfig(),
+		Suggestions: compozyconfig.AutomationSuggestionsConfig{
+			PendingCap: DefaultSuggestionPendingCap,
+		},
+	}
+}
+
+func mustAutomationJSON(t *testing.T, value any) []byte {
+	t.Helper()
+	raw, err := json.Marshal(value)
+	if err != nil {
+		t.Fatalf("json.Marshal() error = %v", err)
+	}
+	return raw
+}
+
+func nilAutomationResourceContext() context.Context {
+	return nil
+}
+
+func shutdownJobResourcePlan(t *testing.T, manager *Manager, plan resources.ProjectionPlan) {
+	t.Helper()
+	typed, ok := plan.(*jobResourceProjectionPlan)
+	if !ok || typed.scheduler == nil {
+		return
+	}
+	if err := manager.shutdownRuntimeComponent(testutil.Context(t), "scheduler", typed.scheduler); err != nil {
+		t.Fatalf("shutdown job resource plan scheduler error = %v", err)
+	}
+}
+
+func shutdownTriggerResourcePlan(t *testing.T, manager *Manager, plan resources.ProjectionPlan) {
+	t.Helper()
+	typed, ok := plan.(*triggerResourceProjectionPlan)
+	if !ok || typed.engine == nil {
+		return
+	}
+	if err := manager.shutdownRuntimeComponent(testutil.Context(t), "trigger engine", typed.engine); err != nil {
+		t.Fatalf("shutdown trigger resource plan engine error = %v", err)
+	}
+}
+
+type cancelAfterMutationStore[T any] struct {
+	store          resources.Store[T]
+	cancel         context.CancelFunc
+	cancelOnPut    bool
+	cancelOnDelete bool
+}
+
+type overlayFailureStore struct {
+	Store
+	failJobDeleteID  string
+	jobDeleteErr     error
+	failJobRestoreID string
+	jobRestoreErr    error
+}
+
+var _ Store = (*overlayFailureStore)(nil)
+
+func (s *overlayFailureStore) DeleteJobEnabledOverlay(ctx context.Context, jobID string) error {
+	if jobID == s.failJobDeleteID {
+		return s.jobDeleteErr
+	}
+	return s.Store.DeleteJobEnabledOverlay(ctx, jobID)
+}
+
+func (s *overlayFailureStore) SetJobEnabledOverlay(
+	ctx context.Context,
+	overlay JobEnabledOverlay,
+) (JobEnabledOverlay, error) {
+	stored, err := s.Store.SetJobEnabledOverlay(ctx, overlay)
+	if err != nil {
+		return JobEnabledOverlay{}, err
+	}
+	if overlay.JobID == s.failJobRestoreID {
+		return stored, s.jobRestoreErr
+	}
+	return stored, nil
+}
+
+var _ resources.Store[Job] = (*cancelAfterMutationStore[Job])(nil)
+
+func (s *cancelAfterMutationStore[T]) Put(
+	ctx context.Context,
+	actor resources.MutationActor,
+	draft resources.Draft[T],
+) (resources.Record[T], error) {
+	record, err := s.store.Put(ctx, actor, draft)
+	if err == nil && s.cancelOnPut && s.cancel != nil {
+		s.cancel()
+	}
+	return record, err
+}
+
+func (s *cancelAfterMutationStore[T]) Delete(
+	ctx context.Context,
+	actor resources.MutationActor,
+	id string,
+	expectedVersion int64,
+) error {
+	err := s.store.Delete(ctx, actor, id, expectedVersion)
+	if err == nil && s.cancelOnDelete && s.cancel != nil {
+		s.cancel()
+	}
+	return err
+}
+
+func (s *cancelAfterMutationStore[T]) Get(
+	ctx context.Context,
+	actor resources.MutationActor,
+	id string,
+) (resources.Record[T], error) {
+	return s.store.Get(ctx, actor, id)
+}
+
+func (s *cancelAfterMutationStore[T]) List(
+	ctx context.Context,
+	actor resources.MutationActor,
+	filter resources.ResourceFilter,
+) ([]resources.Record[T], error) {
+	return s.store.List(ctx, actor, filter)
+}
+
+type cancelAfterWebhookSecretStore struct {
+	store          WebhookSecretStore
+	cancel         context.CancelFunc
+	cancelOnPut    bool
+	cancelOnDelete bool
+}
+
+var _ WebhookSecretStore = (*cancelAfterWebhookSecretStore)(nil)
+
+func (s *cancelAfterWebhookSecretStore) ResolveRef(ctx context.Context, ref string) (string, error) {
+	return s.store.ResolveRef(ctx, ref)
+}
+
+func (s *cancelAfterWebhookSecretStore) PutSecret(
+	ctx context.Context,
+	ref string,
+	kind string,
+	value string,
+) (vault.Metadata, error) {
+	metadata, err := s.store.PutSecret(ctx, ref, kind, value)
+	if err == nil && s.cancelOnPut && s.cancel != nil {
+		s.cancel()
+	}
+	return metadata, err
+}
+
+func (s *cancelAfterWebhookSecretStore) DeleteSecret(ctx context.Context, ref string) error {
+	err := s.store.DeleteSecret(ctx, ref)
+	if err == nil && s.cancelOnDelete && s.cancel != nil {
+		s.cancel()
+	}
+	return err
+}
+
+// Invariant: archive and resource-backed automation admission serialize on the persisted effective state.
+func TestResourceWorkspaceArchiveAdmission(t *testing.T) {
+	for _, kind := range []string{"job", "trigger"} {
+		for _, source := range []JobSource{JobSourceDynamic, JobSourceConfig} {
+			t.Run(kind+"/"+string(source), func(t *testing.T) {
+				t.Parallel()
+				h := newManagerResourceHarness(t)
+				scope := ResourceScopeForAutomation(AutomationScopeWorkspace, h.workspace.ID)
+				put := func(id string, version int64, enabled bool) (int64, error) {
+					if kind == "job" {
+						spec := testJob(AutomationScopeWorkspace, id, h.workspace.ID)
+						spec.Enabled, spec.Source = enabled, source
+						record, err := h.jobStore.Put(
+							h.ctx,
+							h.actor,
+							resources.Draft[Job]{ID: id, Scope: scope, ExpectedVersion: version, Spec: spec},
+						)
+						return record.Version, err
+					}
+					spec := Trigger{Scope: AutomationScopeWorkspace, WorkspaceID: h.workspace.ID, Name: id,
+						AgentName: "reviewer", Prompt: "Review", Event: "session.stopped", Enabled: enabled,
+						Retry: DefaultRetryConfig(), FireLimit: DefaultFireLimitConfig(), Source: source}
+					record, err := h.triggerStore.Put(
+						h.ctx,
+						h.actor,
+						resources.Draft[Trigger]{ID: id, Scope: scope, ExpectedVersion: version, Spec: spec},
+					)
+					return record.Version, err
+				}
+				setOverride := func(enabled bool) error {
+					if kind == "job" {
+						_, err := h.db.SetJobEnabledOverlay(
+							h.ctx,
+							JobEnabledOverlay{JobID: "archive-resource", EnabledOverride: enabled},
+						)
+						return err
+					}
+					_, err := h.db.SetTriggerEnabledOverlay(
+						h.ctx,
+						TriggerEnabledOverlay{TriggerID: "archive-resource", EnabledOverride: enabled},
+					)
+					return err
+				}
+				version, err := put("archive-resource", 0, true)
+				if err != nil {
+					t.Fatal(err)
+				}
+				if _, err := h.db.SetWorkspaceArchived(h.ctx, h.workspace.ID, true); err == nil {
+					t.Fatal("enabled resource did not block archive")
+				}
+				if source == JobSourceConfig {
+					if err := setOverride(false); err != nil {
+						t.Fatal(err)
+					}
+				} else {
+					version, err = put("archive-resource", version, false)
+					if err != nil {
+						t.Fatal(err)
+					}
+				}
+				if _, err := h.db.SetWorkspaceArchived(h.ctx, h.workspace.ID, true); err != nil {
+					t.Fatal(err)
+				}
+				if _, err := put("new-archived-resource", 0, true); !errors.Is(err, store.ErrWorkspaceArchived) {
+					t.Fatalf("new resource error = %v", err)
+				}
+				if source == JobSourceConfig {
+					version, err = put("archive-resource", version, true)
+					if err != nil {
+						t.Fatalf("disabled config reload: %v", err)
+					}
+					if err := setOverride(true); !errors.Is(err, store.ErrWorkspaceArchived) {
+						t.Fatalf("enable override = %v", err)
+					}
+				} else if _, err := put("archive-resource", version, true); !errors.Is(err, store.ErrWorkspaceArchived) {
+					t.Fatalf("enable resource = %v", err)
+				}
+				if _, err := h.db.SetWorkspaceArchived(h.ctx, h.workspace.ID, false); err != nil {
+					t.Fatal(err)
+				}
+				if source == JobSourceConfig {
+					if err := setOverride(true); err != nil {
+						t.Fatal(err)
+					}
+				} else {
+					if _, err := put("archive-resource", version, true); err != nil {
+						t.Fatal(err)
+					}
+				}
+			})
+		}
+	}
+}
+
+// Invariant: managed source reload defers archived targets without aborting unrelated definitions.
+func TestManagedDefinitionSyncDefersArchivedWorkspace(t *testing.T) {
+	t.Parallel()
+	for _, resourceBacked := range []bool{false, true} {
+		for _, source := range []JobSource{JobSourceConfig, JobSourcePackage} {
+			t.Run(fmt.Sprintf("resources=%t/source=%s", resourceBacked, source), func(t *testing.T) {
+				h := newManagerResourceHarness(t)
+				manager := h.newManager(t, defaultAutomationTestConfig())
+				if resourceBacked {
+					manager = h.newResourceManager(t)
+				}
+				job := testJob(AutomationScopeWorkspace, "deferred-job", h.workspace.ID)
+				trigger := testTrigger(AutomationScopeWorkspace, "deferred-trigger", h.workspace.ID)
+				trigger.Event = "session.stopped"
+				trigger.WebhookID, trigger.EndpointSlug, trigger.WebhookSecretRef = "", "", ""
+				healthy := testJob(AutomationScopeGlobal, "healthy-job", "")
+				if _, err := h.db.SetWorkspaceArchived(h.ctx, h.workspace.ID, true); err != nil {
+					t.Fatal(err)
+				}
+				stats, err := manager.SyncManagedDefinitions(h.ctx, source, []Job{job, healthy}, []Trigger{trigger})
+				if err != nil || stats.JobsSynced != 1 || stats.TriggersSynced != 0 {
+					t.Fatalf("archived sync = %#v, %v", stats, err)
+				}
+				if _, err := h.db.SetWorkspaceArchived(h.ctx, h.workspace.ID, false); err != nil {
+					t.Fatal(err)
+				}
+				stats, err = manager.SyncManagedDefinitions(h.ctx, source, []Job{job, healthy}, []Trigger{trigger})
+				if err != nil || stats.JobsSynced != 2 || stats.TriggersSynced != 1 {
+					t.Fatalf("restored sync = %#v, %v", stats, err)
+				}
+			})
+		}
+	}
+}
+
+func TestManagedDefinitionReplacementPausesArchivedTarget(t *testing.T) {
+	for _, resourceBacked := range []bool{false, true} {
+		for _, source := range []JobSource{JobSourceConfig, JobSourcePackage} {
+			t.Run(
+				fmt.Sprintf("Should pause rejected replacements resources=%t source=%s", resourceBacked, source),
+				func(t *testing.T) {
+					h := newManagerResourceHarness(t)
+					newManager := func() *Manager {
+						if resourceBacked {
+							return h.newResourceManager(t, WithLoopStarter(&recordingLoopStarter{}))
+						}
+						return h.newManager(t, defaultAutomationTestConfig(), WithLoopStarter(&recordingLoopStarter{}))
+					}
+					manager := newManager()
+					job := testJob(AutomationScopeGlobal, "replacement-job", "")
+					trigger := testTrigger(AutomationScopeGlobal, "replacement-trigger", "")
+					trigger.Event = "session.stopped"
+					trigger.WebhookID, trigger.EndpointSlug, trigger.WebhookSecretRef = "", "", ""
+					if _, err := manager.SyncManagedDefinitions(
+						h.ctx,
+						source,
+						[]Job{job},
+						[]Trigger{trigger},
+					); err != nil {
+						t.Fatal(err)
+					}
+					if _, err := h.db.SetWorkspaceArchived(h.ctx, h.workspace.ID, true); err != nil {
+						t.Fatal(err)
+					}
+					job.TargetKind, trigger.TargetKind = TargetKindLoop, TargetKindLoop
+					job.AgentName, job.Prompt, trigger.AgentName, trigger.Prompt = "", "", "", ""
+					job.LoopTarget = &LoopTarget{WorkspaceID: h.workspace.ID, LoopName: "archived-loop"}
+					trigger.LoopTarget = cloneLoopTarget(job.LoopTarget)
+					if _, err := manager.SyncManagedDefinitions(
+						h.ctx,
+						source,
+						[]Job{job},
+						[]Trigger{trigger},
+					); err != nil {
+						t.Fatal(err)
+					}
+					restarted := newManager()
+					if source == JobSourcePackage {
+						if err := restarted.Start(h.ctx); err != nil {
+							t.Fatal(err)
+						}
+						t.Cleanup(func() {
+							if err := restarted.Shutdown(context.Background()); err != nil {
+								t.Error(err)
+							}
+						})
+						status, err := restarted.Status(h.ctx)
+						if err != nil || status.Jobs.Enabled != 0 || status.Triggers.Enabled != 0 {
+							t.Fatalf("runtime retained an enabled replacement: %#v, %v", status, err)
+						}
+					}
+					jobs, triggers, err := restarted.loadStartupDefinitionsLocked(h.ctx)
+					if err != nil {
+						t.Fatal(err)
+					}
+					gotJob, gotTrigger := findJobByID(jobs, job.ID), findTriggerByID(triggers, trigger.ID)
+					if gotJob == nil || gotJob.Enabled || gotTrigger == nil || gotTrigger.Enabled {
+						t.Fatalf(
+							"rejected replacements remain enabled after restart: job=%#v trigger=%#v",
+							gotJob,
+							gotTrigger,
+						)
+					}
+					if _, err := h.db.SetWorkspaceArchived(h.ctx, h.workspace.ID, false); err != nil {
+						t.Fatal(err)
+					}
+					if _, err := restarted.SyncManagedDefinitions(
+						h.ctx,
+						source,
+						[]Job{job},
+						[]Trigger{trigger},
+					); err != nil {
+						t.Fatal(err)
+					}
+					jobs, triggers, err = restarted.loadStartupDefinitionsLocked(h.ctx)
+					if err != nil {
+						t.Fatal(err)
+					}
+					gotJob, gotTrigger = findJobByID(jobs, job.ID), findTriggerByID(triggers, trigger.ID)
+					if gotJob == nil || gotTrigger == nil || gotJob.LoopTarget == nil || gotTrigger.LoopTarget == nil ||
+						gotJob.LoopTarget.WorkspaceID != h.workspace.ID ||
+						gotTrigger.LoopTarget.WorkspaceID != h.workspace.ID {
+						t.Fatalf("restored source intent: job=%#v trigger=%#v", gotJob, gotTrigger)
+					}
+					if _, err := restarted.SetJobEnabled(h.ctx, job.ID, true); err != nil {
+						t.Fatal(err)
+					}
+					if _, err := restarted.SetTriggerEnabled(h.ctx, trigger.ID, true); err != nil {
+						t.Fatal(err)
+					}
+				},
+			)
+		}
+	}
+}

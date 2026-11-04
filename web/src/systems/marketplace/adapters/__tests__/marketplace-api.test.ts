@@ -1,0 +1,383 @@
+import {
+  listMarketplaceSources,
+  previewMarketplaceSource,
+  addMarketplaceSource,
+  updateMarketplaceSource,
+  removeMarketplaceSource,
+  refreshMarketplaceSource,
+} from "../marketplace-sources-api";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+
+import { expectFetchRequest, mockJsonResponse } from "@/test/fetch-test-utils";
+import {
+  browseMarketplace,
+  getMarketplaceCatalogEntry,
+} from "@/systems/marketplace/adapters/marketplace-api";
+import {
+  updateMarketplaceExtensions,
+  installMarketplaceExtension,
+  refreshMarketplaceCatalog,
+} from "@/systems/marketplace/adapters/marketplace-actions-api";
+
+beforeEach(() => {
+  vi.stubGlobal("fetch", vi.fn());
+});
+
+afterEach(() => {
+  vi.restoreAllMocks();
+  vi.unstubAllGlobals();
+});
+
+describe("marketplace acquisition transport", () => {
+  it("Should refresh the unified feed catalog", async () => {
+    mockJsonResponse({
+      sources: [{ entry_count: 4, source: "compozy-catalog", outcome: "refreshed", stale: false }],
+    });
+
+    await refreshMarketplaceCatalog();
+
+    await expectFetchRequest({
+      method: "POST",
+      path: "/api/marketplace/refresh",
+    });
+  });
+
+  it("Should install extensions through the source-union mutation", async () => {
+    const extensionBody: Parameters<typeof installMarketplaceExtension>[0] = {
+      allow_unverified: true,
+      ref: "review-pack",
+      source: "curated",
+      version: "2.0.0",
+    };
+    mockJsonResponse({ extension: { name: "review-pack" } }, { status: 201 });
+    await installMarketplaceExtension(extensionBody);
+    await expectFetchRequest({
+      body: extensionBody,
+      method: "POST",
+      path: "/api/extensions",
+    });
+  });
+
+  it.each([
+    ["refresh", () => refreshMarketplaceCatalog()],
+    [
+      "extension install",
+      () => installMarketplaceExtension({ ref: "review-pack", source: "curated" }),
+    ],
+  ])("Should preserve typed daemon errors for %s failures", async (_label, request) => {
+    mockJsonResponse({ error: "catalog mutation rejected" }, { status: 409 });
+
+    await expect(request()).rejects.toMatchObject({
+      message: "catalog mutation rejected",
+      status: 409,
+    });
+  });
+
+  it("Should preserve the installed acquisition when another catalog claims its name", async () => {
+    const installedOrigin = {
+      source: "team",
+      source_ref: "https://example.com/catalog",
+      entry_id: "team/review-pack",
+    };
+    mockJsonResponse(
+      {
+        error: "instance name belongs to another origin",
+        code: "extension_name_conflict",
+        installed_origin: installedOrigin,
+      },
+      { status: 409 }
+    );
+    await expect(
+      installMarketplaceExtension({ ref: "review-pack", source: "curated" })
+    ).rejects.toMatchObject({
+      status: 409,
+      diagnosticCode: "extension_name_conflict",
+      installedOrigin,
+    });
+  });
+
+  it("Should preserve the daemon diagnostic code for extension consent decisions", async () => {
+    mockJsonResponse(
+      {
+        diagnostic: { code: "extension_checksum_unverified" },
+        error: "extension checksum is not registry-verified",
+      },
+      { status: 422 }
+    );
+
+    await expect(
+      installMarketplaceExtension({ ref: "/srv/hello", source: "local_path" })
+    ).rejects.toMatchObject({
+      diagnosticCode: "extension_checksum_unverified",
+      status: 422,
+    });
+  });
+
+  // Invariant: install consent and input remediation retain structured daemon evidence at the HTTP boundary.
+  it("Should send the approved digest and inputs and preserve a source-changed refusal", async () => {
+    const listedDigest = "a".repeat(64);
+    const fetchedDigest = "b".repeat(64);
+    const body = {
+      source: "curated" as const,
+      ref: "compozy/sentry",
+      expected_digest: listedDigest,
+      inputs: { token: { vault_ref: "vault:mcp/shared/TOKEN" }, region: { value: "eu" } },
+    };
+    mockJsonResponse(
+      {
+        code: "extension_source_changed",
+        error: "source changed",
+        listed_digest: listedDigest,
+        fetched_digest: fetchedDigest,
+      },
+      { status: 409 }
+    );
+    await expect(installMarketplaceExtension(body)).rejects.toMatchObject({
+      status: 409,
+      diagnosticCode: "extension_source_changed",
+      listedDigest,
+      fetchedDigest,
+    });
+    await expectFetchRequest({ method: "POST", path: "/api/extensions", body });
+  });
+
+  it("Should expose candidate input definitions without unrecognized value fields", async () => {
+    const definition = {
+      id: "token",
+      prompt: "API key",
+      type: "secret",
+      required: true,
+      binding: { type: "env", name: "TOKEN" },
+    };
+    mockJsonResponse(
+      {
+        code: "extension_inputs_required",
+        error: "configuration required",
+        inputs: ["token"],
+        input_definitions: [{ ...definition, value: "must-not-be-retained" }],
+      },
+      { status: 422 }
+    );
+    await expect(
+      installMarketplaceExtension({ source: "curated", ref: "compozy/kit" })
+    ).rejects.toHaveProperty("inputDefinitions", [definition]);
+  });
+
+  it.each([
+    { id: "region", type: "identifier" },
+    {
+      id: "token",
+      prompt: "API key",
+      type: "secret",
+      required: true,
+      binding: { type: "env", name: "TOKEN" },
+      default: "forbidden",
+    },
+    {
+      id: "enabled",
+      prompt: "Enabled",
+      type: "boolean",
+      required: true,
+      binding: { type: "env", name: "ENABLED" },
+      default: "false",
+    },
+  ])("Should reject malformed candidate definitions %#", async definition => {
+    mockJsonResponse(
+      {
+        code: "extension_inputs_required",
+        error: "configuration required",
+        inputs: [definition.id],
+        input_definitions: [definition],
+      },
+      { status: 422 }
+    );
+    await expect(
+      installMarketplaceExtension({ source: "curated", ref: "compozy/kit" })
+    ).rejects.toMatchObject({ inputDefinitions: undefined, requiredInputs: [definition.id] });
+  });
+
+  it("Should retain an invalid input id without treating a malformed input list as configuration", async () => {
+    mockJsonResponse(
+      { code: "extension_input_invalid", error: "invalid input", input_id: "region", inputs: [42] },
+      { status: 422 }
+    );
+    await expect(
+      installMarketplaceExtension({ source: "curated", ref: "compozy/sentry" })
+    ).rejects.toMatchObject({ inputId: "region", requiredInputs: undefined, status: 422 });
+  });
+});
+
+// Invariant: one-catalog transport preserves envelope, scoped identity, cancellation and cursor restart errors.
+// Owning layer: HTTP adapter; canonical suite: marketplace-api.test.ts.
+describe("one catalog transport", () => {
+  it("Should preserve a degraded envelope and send the source-independent scoped cursor", async () => {
+    const envelope = {
+      total: 0,
+      revision: "revision-a",
+      stale: true,
+      sources: [{ name: "compozy-catalog", kind: "feed", state: "degraded", count: 0 }],
+      items: [],
+    };
+    mockJsonResponse(envelope);
+    const controller = new AbortController();
+    const signal = controller.signal;
+    await expect(
+      browseMarketplace(
+        {
+          q: " audit ",
+          cursor: " cursor-a ",
+          limit: 50,
+          workspaceId: " ws-a ",
+          profileName: " work ",
+        },
+        signal
+      )
+    ).resolves.toEqual(envelope);
+    await expectFetchRequest({
+      path: "/api/marketplace?q=audit&limit=50&cursor=cursor-a&profile=work&scope=workspace&workspace_id=ws-a",
+    });
+    const request = vi.mocked(fetch).mock.calls[0]?.[0] as Request;
+    controller.abort();
+    expect(request.signal.aborted).toBe(true);
+  });
+
+  it("Should preserve a typed restart instruction without treating other conflicts as cursor resets", async () => {
+    mockJsonResponse(
+      { error: "Catalog changed", code: "marketplace_cursor_stale", restart: true },
+      { status: 409 }
+    );
+    await expect(browseMarketplace({ cursor: "old" })).rejects.toMatchObject({
+      status: 409,
+      diagnosticCode: "marketplace_cursor_stale",
+      restart: true,
+    });
+  });
+
+  it("Should qualify detail by source and installed name inside the selected profile", async () => {
+    const response = { entry: { entry_id: "entry-a", installed: true } };
+    mockJsonResponse(response);
+    await expect(
+      getMarketplaceCatalogEntry({
+        entryId: " entry-a ",
+        source: " compozy-catalog ",
+        installedName: " local-name ",
+        profileName: " work ",
+        workspaceId: " ws-a ",
+      })
+    ).resolves.toEqual(response);
+    await expectFetchRequest({
+      path: "/api/marketplace/entries/entry-a?source=compozy-catalog&installed_name=local-name&profile=work&scope=workspace&workspace_id=ws-a",
+    });
+  });
+});
+
+// Invariant: batch update results retain individual failures instead of claiming atomic success.
+// Owning layer: extension update transport; canonical suite: marketplace-api.test.ts (IT-007 wire coverage).
+describe("marketplace batch update transport", () => {
+  it("Should send the exact names once and preserve mixed server outcomes", async () => {
+    const body = {
+      names: ["first", "second"],
+      scope: "workspace" as const,
+      workspace_id: "ws-scoped",
+      profile: "marketing",
+    };
+    const response = {
+      updates: [
+        { name: "first", status: "updated", latest_version: "2.0.0" },
+        { name: "second", status: "failed", error: { message: "Artifact unavailable" } },
+      ],
+    };
+    mockJsonResponse(response);
+    await expect(updateMarketplaceExtensions(body)).resolves.toEqual(response);
+    await expectFetchRequest({ path: "/api/extensions/update", method: "POST", body });
+  });
+});
+
+// Invariant: global source requests retain the server envelope and actionable error metadata.
+// Owner: Marketplace API adapter; canonical acquisition transport suite.
+describe("marketplace source transport", () => {
+  const source = {
+    name: "team",
+    kind: "custom",
+    source: "github:team/plugins",
+    enabled: true,
+    state: "ok",
+    plugins: 2,
+    installable: 1,
+    stability: "experimental",
+    diagnostics: [],
+  };
+  it("Should preserve source ordering and diagnostics without adding workspace scope", async () => {
+    const body = { sources: [source] };
+    mockJsonResponse(body);
+    const controller = new AbortController();
+    await expect(listMarketplaceSources(controller.signal)).resolves.toEqual(body);
+    await expectFetchRequest({ method: "GET", path: "/api/marketplace/sources" });
+  });
+  it("Should keep preview and registration responses distinct", async () => {
+    const body = { ref: "team/plugins", name: "team" };
+    const preview = {
+      name: "team",
+      plugins: 2,
+      installable: 1,
+      diagnostics: [],
+      document_path: "marketplace.json",
+    };
+    mockJsonResponse(preview);
+    await expect(previewMarketplaceSource(body)).resolves.toEqual(preview);
+    await expectFetchRequest({
+      method: "POST",
+      path: "/api/marketplace/sources?dry_run=true",
+      body,
+    });
+    mockJsonResponse({ source }, { status: 201 });
+    await expect(addMarketplaceSource(body)).resolves.toEqual({ source });
+    await expectFetchRequest({
+      callIndex: 1,
+      method: "POST",
+      path: "/api/marketplace/sources",
+      body,
+    });
+  });
+  it("Should send an explicit false toggle and support refresh and removal", async () => {
+    mockJsonResponse({ source: { ...source, enabled: false, state: "off" } });
+    await updateMarketplaceSource("team", { enabled: false });
+    await expectFetchRequest({
+      method: "PATCH",
+      path: "/api/marketplace/sources/team",
+      body: { enabled: false },
+    });
+    mockJsonResponse({ source });
+    await refreshMarketplaceSource("team");
+    await expectFetchRequest({
+      callIndex: 1,
+      method: "POST",
+      path: "/api/marketplace/sources/team/refresh",
+    });
+    vi.mocked(fetch).mockResolvedValueOnce(new Response(null, { status: 204 }));
+    await expect(removeMarketplaceSource("team")).resolves.toBeUndefined();
+    await expectFetchRequest({
+      callIndex: 2,
+      method: "DELETE",
+      path: "/api/marketplace/sources/team",
+    });
+  });
+  it.each([
+    [{ code: "marketplace_source_name_retained", retained_by: ["tool"] }, { retainedBy: ["tool"] }],
+    [{ code: "marketplace_source_exists", suggested_name: "team-2" }, { suggestedName: "team-2" }],
+    [
+      {
+        code: "marketplace_not_a_marketplace",
+        checked: ["marketplace.json", ".claude-plugin/marketplace.json"],
+      },
+      { checked: ["marketplace.json", ".claude-plugin/marketplace.json"] },
+    ],
+  ])("Should retain structured source errors: %s", async (body, expected) => {
+    mockJsonResponse({ error: "Source rejected", ...body }, { status: 409 });
+    await expect(addMarketplaceSource({ ref: "team/plugins" })).rejects.toMatchObject({
+      status: 409,
+      diagnosticCode: body.code,
+      ...expected,
+    });
+  });
+});

@@ -1,0 +1,144 @@
+//go:build integration
+
+package core_test
+
+import (
+	"context"
+	"testing"
+	"time"
+
+	"github.com/compozy/compozy/internal/api/testutil"
+	"github.com/compozy/compozy/internal/store"
+	taskpkg "github.com/compozy/compozy/internal/task"
+	workspacepkg "github.com/compozy/compozy/internal/workspace"
+	"github.com/gin-gonic/gin"
+)
+
+func TestTaskHandlersCreateTaskAndListFiltersReachManagerIntegration(t *testing.T) {
+	t.Parallel()
+	const profileID = "profile-marketing"
+
+	var capturedCreate taskpkg.CreateTask
+	var capturedCreateActor taskpkg.ActorContext
+	var capturedList taskpkg.Query
+	var capturedListActor taskpkg.ActorContext
+
+	tasks := &testutil.StubTaskManager{
+		CreateTaskFn: func(_ context.Context, spec taskpkg.CreateTask, actor taskpkg.ActorContext) (*taskpkg.Task, error) {
+			capturedCreate = spec
+			capturedCreateActor = actor
+			return &taskpkg.Task{
+				ID:          "task-1",
+				ProfileID:   spec.ProfileID,
+				Identifier:  spec.Identifier,
+				Scope:       spec.Scope,
+				WorkspaceID: spec.WorkspaceID,
+				Title:       spec.Title,
+				Description: spec.Description,
+				Status:      taskpkg.TaskStatusPending,
+				Owner:       spec.Owner,
+				CreatedBy:   actor.Actor,
+				Origin:      actor.Origin,
+				CreatedAt:   time.Date(2026, 4, 14, 12, 0, 0, 0, time.UTC),
+				UpdatedAt:   time.Date(2026, 4, 14, 12, 0, 0, 0, time.UTC),
+				Metadata:    spec.Metadata,
+			}, nil
+		},
+		ListTasksFn: func(_ context.Context, query taskpkg.Query, actor taskpkg.ActorContext) ([]taskpkg.Summary, error) {
+			capturedList = query
+			capturedListActor = actor
+			return []taskpkg.Summary{{
+				ID:        "task-1",
+				ProfileID: query.ReadScope.ProfileID,
+				Scope:     query.Scope,
+				Title:     "Review task API",
+				Status:    query.Status,
+				CreatedBy: actor.Actor,
+				Origin:    actor.Origin,
+				CreatedAt: time.Date(2026, 4, 14, 12, 0, 0, 0, time.UTC),
+				UpdatedAt: time.Date(2026, 4, 14, 12, 0, 0, 0, time.UTC),
+			}}, nil
+		},
+	}
+	workspaces := testutil.StubWorkspaceService{
+		GetFn: func(_ context.Context, ref string) (workspacepkg.Workspace, error) {
+			if ref != "alpha" {
+				t.Fatalf("workspace ref = %q, want %q", ref, "alpha")
+			}
+			return workspacepkg.Workspace{ID: "ws-alpha", Name: "alpha"}, nil
+		},
+	}
+
+	fixture := newHandlerFixtureWithTasks(
+		t,
+		&testutil.StubSessionManager{},
+		testutil.StubObserver{},
+		tasks,
+		workspaces,
+	)
+	fixture.Handlers.Profiles = sessionProfileServiceStub{}
+	fixture.Handlers.TaskActorContextResolver = func(_ *gin.Context, action string) (taskpkg.ActorContext, error) {
+		actor, err := taskpkg.DeriveHumanActorContext("user-1", taskpkg.OriginKindHTTP, "tasks."+action)
+		actor.ReadScope = store.ReadScope{ProfileID: profileID}
+		return actor, err
+	}
+
+	createResp := performRequest(
+		t,
+		fixture.Engine,
+		"POST",
+		"/tasks?profile=marketing",
+		[]byte(
+			`{"scope":"workspace","workspace":"alpha","identifier":"TASK-1","title":"Review task API","description":"Check handler wiring","auto_enqueue_on_ready":true,"owner":{"kind":"pool","ref":"reviewers"},"metadata":{"priority":"high"}}`,
+		),
+	)
+	if createResp.Code != 201 {
+		t.Fatalf("create status = %d, want %d; body=%s", createResp.Code, 201, createResp.Body.String())
+	}
+
+	if capturedCreate.Scope != taskpkg.ScopeWorkspace || capturedCreate.WorkspaceID != "ws-alpha" {
+		t.Fatalf("create spec = %#v", capturedCreate)
+	}
+	if capturedCreate.ProfileID != profileID ||
+		capturedCreateActor.ReadScope != (store.ReadScope{ProfileID: profileID}) {
+		t.Fatalf("create profile scope = %#v / %#v", capturedCreate, capturedCreateActor.ReadScope)
+	}
+	if capturedCreate.Owner == nil || capturedCreate.Owner.Ref != "reviewers" {
+		t.Fatalf("create spec = %#v", capturedCreate)
+	}
+	if !capturedCreate.AutoEnqueueOnReady {
+		t.Fatalf("create spec auto_enqueue_on_ready = false, want true; spec=%#v", capturedCreate)
+	}
+	if capturedCreateActor.Actor.Ref != "user-1" || capturedCreateActor.Origin.Ref != "tasks.create" {
+		t.Fatalf("create actor = %#v", capturedCreateActor)
+	}
+
+	listResp := performRequest(
+		t,
+		fixture.Engine,
+		"GET",
+		"/tasks?profile=marketing&scope=workspace&workspace=alpha&status=ready&owner_kind=pool&owner_ref=reviewers&parent_task_id=task-root&limit=5",
+		nil,
+	)
+	if listResp.Code != 200 {
+		t.Fatalf("list status = %d, want %d; body=%s", listResp.Code, 200, listResp.Body.String())
+	}
+
+	if capturedList.Scope != taskpkg.ScopeWorkspace || capturedList.WorkspaceID != "ws-alpha" {
+		t.Fatalf("list query = %#v", capturedList)
+	}
+	if capturedList.ReadScope != (store.ReadScope{ProfileID: profileID}) ||
+		capturedListActor.ReadScope != (store.ReadScope{ProfileID: profileID}) {
+		t.Fatalf("list profile scope = %#v / %#v", capturedList.ReadScope, capturedListActor.ReadScope)
+	}
+	if capturedList.Status != taskpkg.TaskStatusReady || capturedList.OwnerKind != taskpkg.OwnerKindPool ||
+		capturedList.OwnerRef != "reviewers" {
+		t.Fatalf("list query = %#v", capturedList)
+	}
+	if capturedList.ParentTaskID != "task-root" || capturedList.Limit != 5 {
+		t.Fatalf("list query = %#v", capturedList)
+	}
+	if capturedListActor.Actor.Ref != "user-1" || capturedListActor.Origin.Ref != "tasks.list" {
+		t.Fatalf("list actor = %#v", capturedListActor)
+	}
+}

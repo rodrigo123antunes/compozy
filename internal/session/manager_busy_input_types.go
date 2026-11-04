@@ -1,0 +1,133 @@
+package session
+
+import (
+	"context"
+	"encoding/json"
+	"time"
+
+	"github.com/compozy/compozy/internal/acp"
+	commandpkg "github.com/compozy/compozy/internal/command"
+	"github.com/compozy/compozy/internal/mention"
+	"github.com/compozy/compozy/internal/store"
+)
+
+// PendingInput is one daemon-owned operator input waiting for dispatch.
+type PendingInput struct {
+	Held             bool
+	Origin           json.RawMessage
+	ID               string
+	SessionID        string
+	OwnerKind        string
+	OwnerID          string
+	MessageID        string
+	IdempotencyKey   string
+	TargetTurnID     string
+	Status           string
+	Mode             BusyInputMode
+	Delivery         string
+	SteerDelivery    store.SteerDeliveryMode
+	Text             string
+	QueueGeneration  int64
+	EnqueuedAt       time.Time
+	Runtime          *RuntimeSelection
+	SkillInvocations []commandpkg.Invocation
+	Mentions         []mention.Mention
+	Attachments      []AttachmentMeta
+	// CoalescedWakes counts the wakes a coalesced row carries; zero for any other row.
+	CoalescedWakes int
+}
+
+type ClearPendingInputsResult struct {
+	Inputs          []PendingInput
+	ClearedCount    int
+	QueueGeneration int64
+}
+
+// ReplacePendingInputOpts carries an atomic queued-input replacement.
+type ReplacePendingInputOpts struct {
+	Text           string
+	MessageID      string
+	IdempotencyKey string
+	AllowCommands  bool
+	Caller         PromptCaller
+}
+
+// PromotePendingInputOpts carries an atomic queue-to-steer replacement.
+type PromotePendingInputOpts struct {
+	Text           string
+	MessageID      string
+	IdempotencyKey string
+	ExpectedTurnID string
+	AllowCommands  bool
+	Caller         PromptCaller
+}
+
+// BusyInputMode selects how a user-facing prompt behaves while a session is busy.
+type BusyInputMode string
+
+const (
+	BusyInputModeQueue     BusyInputMode = "queue"
+	BusyInputModeInterrupt BusyInputMode = "interrupt"
+	BusyInputModeSteer     BusyInputMode = "steer"
+)
+
+// SendPromptOpts carries one user-facing prompt plus optional busy-input mode.
+type SendPromptOpts struct {
+	InstanceTarget *store.InstancePromptTarget
+	// humanSpawnOrigin is attested by SendSpawnPrompt, never by a public request.
+	humanSpawnOrigin bool
+	Origin           *acp.PromptOriginMeta
+	NotifyOnComplete bool
+	// Supersede replaces the same sender's older queued entry to the same target.
+	Supersede       bool
+	Message         string
+	MessageID       string
+	IdempotencyKey  string
+	Mode            BusyInputMode
+	Runtime         *RuntimeSelection
+	ExpectedTurnID  string
+	DeliveryContext context.Context
+	Caller          PromptCaller
+	AllowCommands   bool
+	Attachments     []AttachmentMeta
+}
+
+// ReplyWatchRef identifies the optional reply watch registered by the admission owner.
+type ReplyWatchRef struct{ ID, State string }
+
+// SendPromptResult reports how and when the daemon accepted input for delivery.
+type SendPromptResult struct {
+	TargetSessionID       string
+	TargetWorkspaceID     string
+	ReplyWatch            *ReplyWatchRef
+	Status                string
+	Mode                  BusyInputMode
+	Delivery              string
+	SteerDelivery         store.SteerDeliveryMode
+	MessageID             string
+	IdempotencyKey        string
+	Replayed              bool
+	Events                <-chan acp.AgentEvent
+	QueueEntryID          string
+	QueuePosition         int
+	QueueGeneration       int64
+	EstimatedSendAt       *time.Time
+	PreviousTurnID        string
+	NewTurnID             string
+	CanceledQueuedEntries int
+	Goal                  *GoalCommandResult
+	// TargetInLater marks an agent message queued for a session parked in Later.
+	TargetInLater bool
+}
+
+// SteerPromptOpts carries one explicitly identified steering command.
+type SteerPromptOpts struct {
+	Attachments    []AttachmentMeta
+	Message        string
+	MessageID      string
+	IdempotencyKey string
+	ExpectedTurnID string
+	Runtime        *RuntimeSelection
+	AllowCommands  bool
+	Caller         PromptCaller
+}

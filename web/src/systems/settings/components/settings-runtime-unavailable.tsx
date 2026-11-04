@@ -1,0 +1,23 @@
+import { AlertTriangle } from "@compozy/ui/icons";
+
+export function SettingsRuntimeUnavailable({
+  slug,
+  description = "Live runtime data is unavailable. Saved configuration remains editable.",
+}: {
+  slug: string;
+  description?: string;
+}) {
+  return (
+    <div
+      className="flex items-start gap-2.5 rounded-md bg-warning-tint px-3.5 py-3 text-form-label leading-normal text-muted-foreground"
+      data-testid={`settings-page-${slug}-runtime-unavailable`}
+      role="status"
+    >
+      <AlertTriangle aria-hidden="true" className="mt-0.5 size-3.5 shrink-0 text-warning" />
+      <div className="min-w-0">
+        <span className="block text-body font-medium text-fg">Runtime data unavailable</span>
+        {description}
+      </div>
+    </div>
+  );
+}

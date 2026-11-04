@@ -1,0 +1,165 @@
+package cli
+
+import (
+	"cmp"
+	"encoding/json"
+	"errors"
+	"fmt"
+
+	"maps"
+
+	"path/filepath"
+	"slices"
+	"strings"
+
+	"github.com/compozy/compozy/internal/skills"
+)
+
+func normalizeSkillName(name string) (string, error) {
+	trimmed := strings.TrimSpace(name)
+	switch {
+	case trimmed == "":
+		return "", errors.New("skill name is required")
+	case trimmed == ".", trimmed == "..":
+		return "", errors.New("skill name must not be a relative path segment")
+	case filepath.IsAbs(trimmed):
+		return "", errors.New("skill name must be relative")
+	case strings.Contains(trimmed, "/"), strings.Contains(trimmed, `\`):
+		return "", errors.New("skill name must not include path separators")
+	case strings.HasPrefix(trimmed, "."):
+		return "", errors.New("skill name must not be hidden")
+	case trimmed == nodeModulesDirectoryName:
+		return "", fmt.Errorf("skill name must not use reserved directory %s", nodeModulesDirectoryName)
+	case !validSkillNamePattern.MatchString(trimmed):
+		return "", errors.New("skill name must contain only letters, numbers, dots, underscores, and hyphens")
+	default:
+		return trimmed, nil
+	}
+}
+
+func normalizeSkillGroup(group string) (string, error) {
+	trimmed := strings.TrimSpace(group)
+	switch {
+	case trimmed == "":
+		return "", errors.New("skill group is required")
+	case filepath.IsAbs(trimmed):
+		return "", errors.New("skill group must be relative")
+	case strings.Contains(trimmed, `\`):
+		return "", errors.New("skill group must use forward slash separators")
+	}
+
+	segments := strings.Split(trimmed, "/")
+	for index, segment := range segments {
+		if segment == "" {
+			return "", errors.New("skill group must not contain empty segments")
+		}
+		normalized, err := normalizeSkillName(segment)
+		if err != nil {
+			return "", fmt.Errorf("skill group segment %q: %w", segment, err)
+		}
+		segments[index] = normalized
+	}
+	return strings.Join(segments, "/"), nil
+}
+
+func defaultSkillTemplate(name string) string {
+	trimmedName := cmp.Or(strings.TrimSpace(name), defaultSkillName)
+
+	return fmt.Sprintf(`---
+name: %q
+description: Describe when to use this skill.
+---
+
+# %s
+
+Describe the workflow, constraints, and expected outcome for this skill.
+`, trimmedName, titleizeSkillName(trimmedName))
+}
+
+func titleizeSkillName(name string) string {
+	parts := strings.FieldsFunc(name, func(r rune) bool {
+		return r == '-' || r == '_' || r == ' '
+	})
+	if len(parts) == 0 {
+		return "New Skill"
+	}
+
+	titled := make([]string, 0, len(parts))
+	for _, part := range parts {
+		if part == "" {
+			continue
+		}
+
+		lower := strings.ToLower(part)
+		titled = append(titled, strings.ToUpper(lower[:1])+lower[1:])
+	}
+	if len(titled) == 0 {
+		return "New Skill"
+	}
+	return strings.Join(titled, " ")
+}
+
+func skillSourceLabel(source skills.SkillSource) string {
+	switch source {
+	case skills.SourceBundled:
+		return bundledSkillSource
+	case skills.SourceMarketplace:
+		return marketplaceSkillSource
+	case skills.SourceUser:
+		return userSkillSource
+	case skills.SourceProfile:
+		return profileSkillSource
+	case skills.SourceAdditional:
+		return additionalSkillSource
+	case skills.SourceWorkspace:
+		return workspaceSkillSource
+	case skills.SourceWorkspaceProfile:
+		return workspaceProfileSkillSource
+	case skills.SourceAgentLocal:
+		return agentLocalSkillSource
+	default:
+		return providerModelAvailabilityUnknown
+	}
+}
+
+func sortedSkillMetadataEntries(metadata map[string]any) []keyValue {
+	if len(metadata) == 0 {
+		return nil
+	}
+
+	keys := slices.Sorted(maps.Keys(metadata))
+
+	entries := make([]keyValue, 0, len(keys))
+	for _, key := range keys {
+		entries = append(entries, keyValue{
+			Label: key,
+			Value: formatSkillMetadataValue(metadata[key]),
+		})
+	}
+	return entries
+}
+
+func formatSkillMetadataValue(value any) string {
+	switch typed := value.(type) {
+	case nil:
+		return ""
+	case string:
+		return typed
+	default:
+		payload, err := json.Marshal(typed)
+		if err != nil {
+			return fmt.Sprint(typed)
+		}
+		return compactJSON(payload)
+	}
+}
+
+func cloneMetadata(metadata map[string]any) map[string]any {
+	if metadata == nil {
+		return nil
+	}
+
+	clone := make(map[string]any, len(metadata))
+	maps.Copy(clone, metadata)
+	return clone
+}

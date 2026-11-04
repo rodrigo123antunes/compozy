@@ -1,0 +1,415 @@
+package builtin
+
+import (
+	"encoding/json"
+
+	toolspkg "github.com/compozy/compozy/internal/tools"
+)
+
+const (
+	extensionsMarketplaceKey = "marketplace"
+)
+
+const (
+	extensionsExtensionsKey = "extensions"
+)
+
+const (
+	extensionsAuthoringKey   = "authoring"
+	extensionsCatalogKey     = "catalog"
+	extensionsDevelopmentKey = "development"
+	extensionsMutationKey    = "mutation"
+	extensionsStatusKey      = "status"
+)
+
+var extensionTools = []toolspkg.Descriptor{
+	nativeExtensionDescriptor(
+		toolspkg.ToolIDExtensionsInit,
+		"extensions_init",
+		"Extensions Init",
+		"Create an extension project from an embedded SDK template.",
+		extensionInitInputSchema,
+		toolspkg.RiskMutating,
+		false,
+		false,
+		[]string{extensionsExtensionsKey, extensionsAuthoringKey, "init"},
+		[]string{"create extension project", "scaffold extension"},
+	),
+	nativeInteractiveExtensionDescriptor(
+		toolspkg.ToolIDExtensionsBuild,
+		"extensions_build",
+		"Extensions Build",
+		"Build source into an immutable content-hash extension generation.",
+		extensionBuildInputSchema,
+		toolspkg.RiskMutating,
+		false,
+		false,
+		[]string{extensionsExtensionsKey, extensionsAuthoringKey, "build"},
+		[]string{"build extension", "compile extension"},
+	),
+	nativeExtensionDescriptorWithOutput(
+		toolspkg.ToolIDExtensionsValidate,
+		"extensions_validate",
+		"Extensions Validate",
+		"Validate an extension bundle without executing extension code.",
+		extensionValidateInputSchema,
+		extensionValidateOutputSchema,
+		toolspkg.RiskRead,
+		true,
+		[]string{extensionsExtensionsKey, extensionsAuthoringKey, descriptorKeywordValidate},
+		[]string{"validate extension", "check extension bundle"},
+	),
+	nativeInteractiveExtensionDescriptor(
+		toolspkg.ToolIDExtensionsDev,
+		"extensions_dev",
+		"Extensions Dev",
+		"Link an immutable extension generation to the trusted workspace.",
+		extensionDevInputSchema,
+		toolspkg.RiskMutating,
+		false,
+		false,
+		[]string{extensionsExtensionsKey, extensionsDevelopmentKey, extensionsMutationKey},
+		[]string{"link development extension", "dev extension"},
+	),
+	nativeInteractiveExtensionDescriptor(
+		toolspkg.ToolIDExtensionsReload,
+		"extensions_reload",
+		"Extensions Reload",
+		"Atomically reload a dev-linked extension from an immutable generation.",
+		extensionReloadInputSchema,
+		toolspkg.RiskMutating,
+		false,
+		false,
+		[]string{extensionsExtensionsKey, extensionsDevelopmentKey, "reload"},
+		[]string{"reload extension", "restart dev extension"},
+	),
+	nativeExtensionDescriptorWithOutput(
+		toolspkg.ToolIDExtensionsLogs,
+		"extensions_logs",
+		"Extensions Logs",
+		"Read retained redacted stderr for the trusted extension instance.",
+		extensionLogsInputSchema,
+		extensionLogsOutputSchema,
+		toolspkg.RiskRead,
+		true,
+		[]string{extensionsExtensionsKey, extensionsDevelopmentKey, "logs"},
+		[]string{"extension logs", "extension stderr"},
+	),
+	nativeExtensionDescriptorWithOutput(
+		toolspkg.ToolIDExtensionsList,
+		"extensions_list",
+		"Extensions List",
+		"List installed extensions through the daemon extension registry.",
+		extensionOwnerInputSchema,
+		extensionListOutputSchema,
+		toolspkg.RiskRead,
+		true,
+		[]string{extensionsExtensionsKey, "installed", extensionsCatalogKey},
+		[]string{"installed extensions", "extension status"},
+	),
+	nativeExtensionDescriptorWithOutput(
+		toolspkg.ToolIDExtensionsInfo,
+		"extensions_info",
+		"Extensions Info",
+		"Read one installed extension status and runtime projection.",
+		extensionNameInputSchema,
+		extensionSingleOutputSchema,
+		toolspkg.RiskRead,
+		true,
+		[]string{extensionsExtensionsKey, extensionsStatusKey},
+		[]string{"extension info", "extension status"},
+	),
+	nativeExtensionDescriptorWithOutput(
+		toolspkg.ToolIDExtensionsInventory,
+		"extensions_inventory",
+		"Extensions Inventory",
+		"Read shipped and live resources for one installed extension.",
+		extensionNameInputSchema,
+		extensionInventoryOutputSchema,
+		toolspkg.RiskRead,
+		true,
+		[]string{extensionsExtensionsKey, extensionsStatusKey, "inventory", "resources"},
+		[]string{"extension inventory", "extension resources"},
+	),
+	nativeExtensionDescriptorWithOutput(
+		toolspkg.ToolIDExtensionsInstall,
+		"extensions_install",
+		"Extensions Install",
+		"Install one extension through the managed local or marketplace lifecycle.",
+		extensionInstallInputSchema,
+		extensionSingleOutputSchema,
+		toolspkg.RiskMutating,
+		false,
+		[]string{extensionsExtensionsKey, "install", extensionsMarketplaceKey, extensionsMutationKey},
+		[]string{"install extension", "add extension"},
+	),
+	nativeExtensionDescriptorWithOutput(
+		toolspkg.ToolIDExtensionsUpdate,
+		"extensions_update",
+		"Extensions Update",
+		"Update marketplace-installed extensions through the managed lifecycle.",
+		extensionUpdateInputSchema,
+		extensionUpdateOutputSchema,
+		toolspkg.RiskMutating,
+		false,
+		[]string{extensionsExtensionsKey, descriptorKeywordUpdate, extensionsMarketplaceKey, extensionsMutationKey},
+		[]string{"update extension", "upgrade extension"},
+	),
+	nativeExtensionDescriptor(
+		toolspkg.ToolIDExtensionsRemove,
+		"extensions_remove",
+		"Extensions Remove",
+		"Remove one managed installed extension with rollback on reload failure.",
+		extensionNameInputSchema,
+		toolspkg.RiskDestructive,
+		false,
+		true,
+		[]string{extensionsExtensionsKey, "remove", extensionsMutationKey},
+		[]string{"remove extension", "uninstall extension"},
+	),
+	nativeExtensionDescriptor(
+		toolspkg.ToolIDExtensionsEnable,
+		"extensions_enable",
+		"Extensions Enable",
+		"Enable one installed extension for the caller's active profile.",
+		extensionNameInputSchema,
+		toolspkg.RiskMutating,
+		false,
+		false,
+		[]string{extensionsExtensionsKey, "enable", extensionsMutationKey},
+		[]string{"enable extension", "activate extension"},
+	),
+	nativeExtensionDescriptor(
+		toolspkg.ToolIDExtensionsDisable,
+		"extensions_disable",
+		"Extensions Disable",
+		"Disable one installed extension for the caller's active profile.",
+		extensionNameInputSchema,
+		toolspkg.RiskMutating,
+		false,
+		false,
+		[]string{extensionsExtensionsKey, "disable", extensionsMutationKey},
+		[]string{"disable extension", "deactivate extension"},
+	),
+}
+
+func nativeInteractiveExtensionDescriptor(
+	id toolspkg.ToolID,
+	nativeName string,
+	title string,
+	description string,
+	inputSchema string,
+	risk toolspkg.RiskClass,
+	readOnly bool,
+	destructive bool,
+	tags []string,
+	searchHints []string,
+) toolspkg.Descriptor {
+	descriptor := nativeExtensionDescriptor(
+		id,
+		nativeName,
+		title,
+		description,
+		inputSchema,
+		risk,
+		readOnly,
+		destructive,
+		tags,
+		searchHints,
+	)
+	descriptor.RequiresInteraction = true
+	return descriptor
+}
+
+func extensionDescriptors() []toolspkg.Descriptor {
+	items := make([]toolspkg.Descriptor, 0, len(extensionTools)+len(extensionDistributionTools))
+	items = append(items, extensionTools...)
+	items = append(items, extensionDistributionTools...)
+	return items
+}
+
+func nativeExtensionDescriptor(
+	id toolspkg.ToolID,
+	nativeName string,
+	title string,
+	description string,
+	inputSchema string,
+	risk toolspkg.RiskClass,
+	readOnly bool,
+	destructive bool,
+	tags []string,
+	searchHints []string,
+) toolspkg.Descriptor {
+	return nativeDescriptor(
+		id,
+		nativeName,
+		title,
+		description,
+		inputSchema,
+		risk,
+		readOnly,
+		destructive,
+		false,
+		[]toolspkg.ToolsetID{toolspkg.ToolsetIDExtensions},
+		tags,
+		searchHints,
+	)
+}
+
+func nativeExtensionDescriptorWithOutput(
+	id toolspkg.ToolID,
+	nativeName string,
+	title string,
+	description string,
+	inputSchema string,
+	outputSchema string,
+	risk toolspkg.RiskClass,
+	readOnly bool,
+	tags []string,
+	searchHints []string,
+) toolspkg.Descriptor {
+	descriptor := nativeExtensionDescriptor(
+		id, nativeName, title, description, inputSchema, risk, readOnly, false, tags, searchHints,
+	)
+	descriptor.OutputSchema = json.RawMessage(outputSchema)
+	return descriptor
+}
+
+const extensionOwnerPattern = `^extension:[a-zA-Z0-9][a-zA-Z0-9._-]*$`
+
+const extensionOwnerInputSchema = `{
+ "type":"object","properties":{
+  "owner":{"type":"string","pattern":"` + extensionOwnerPattern + `"}
+ },"additionalProperties":false
+}`
+
+const extensionNameInputSchema = `{
+	"type":"object",
+	"required":["name"],
+	"properties":{
+		"owner":{"type":"string","pattern":"` + extensionOwnerPattern + `",
+			"description":"Definition owner; must equal extension:<name>."},
+		"name":{"type":"string"}
+	},
+	"additionalProperties":false
+}`
+
+const extensionInstallInputSchema = `{
+	"type":"object",
+	"required":["source","ref"],
+	"properties":{
+		"source":{"type":"string","enum":["curated","marketplace","github","git","local_path"]},
+		"ref":{"type":"string","minLength":1},
+		"scope":{"type":"string","enum":["global","workspace"],
+			"description":"Overrides manifest defaults; required when server defaults differ."},
+		"workspace":{"type":"string"},
+		"profile":{"type":"string"},
+		"version":{"type":"string"},
+		"asset":{"type":"string"},
+		"inputs":` + extensionValuesInputSchema + `,
+		"expected_digest":{"type":"string","pattern":"^[a-fA-F0-9]{64}$"},
+		"allow_unverified":{"type":"boolean"},
+		"confirm_gateway_digest":{"type":"string","pattern":"^[a-f0-9]{64}$"}
+	},
+	"additionalProperties":false
+}`
+
+const extensionUpdateInputSchema = `{
+	"type":"object",
+	"properties":{
+		"owner":{"type":"string","pattern":"` + extensionOwnerPattern + `",
+			"description":"Definition owner; must equal extension:<name>."},
+		"name":{"type":"string"},
+		"scope":{"type":"string","enum":["global","workspace"]},
+		"workspace":{"type":"string"},
+		"profile":{"type":"string"},
+		"all":{"type":"boolean"},
+		"check_only":{"type":"boolean"},
+		"version":{"type":"string"},
+		"inputs":` + extensionValuesInputSchema + `,
+		"allow_unverified":{"type":"boolean"},
+		"confirm_gateway_digest":{"type":"string","pattern":"^[a-f0-9]{64}$"}
+	},
+	"additionalProperties":false
+}`
+
+const extensionValuesInputSchema = `{
+	"type":"object",
+	"additionalProperties":{
+		"oneOf":[
+			{"type":"object","required":["value"],
+			 "properties":{"value":{"type":["string","boolean"]}},"additionalProperties":false},
+			{"type":"object","required":["vault_ref"],
+			 "properties":{"vault_ref":{"type":"string","minLength":1,"pattern":"^vault:extensions/.+$"}},
+			 "additionalProperties":false}
+		]
+	}
+}`
+
+const extensionInitInputSchema = `{
+	"type":"object",
+	"required":["name"],
+	"properties":{
+		"name":{"type":"string","minLength":1},
+		"template":{"type":"string"},
+		"directory":{"type":"string"}
+	},
+	"additionalProperties":false
+}`
+
+const extensionBuildInputSchema = `{
+	"type":"object",
+	"required":["source_dir"],
+	"properties":{
+		"source_dir":{"type":"string","minLength":1},
+		"output_dir":{"type":"string"},
+		"build_command":{"type":"array","items":{"type":"string"}},
+		"timeout_ms":{"type":"integer","minimum":1}
+	},
+	"additionalProperties":false
+}`
+
+const extensionValidateInputSchema = `{
+	"type":"object",
+	"required":["path"],
+	"properties":{"path":{"type":"string","minLength":1}},
+	"additionalProperties":false
+}`
+
+const extensionDevInputSchema = `{
+	"type":"object",
+	"required":["origin_path","generation_hash"],
+	"properties":{
+		"origin_path":{"type":"string","minLength":1},
+		"generation_hash":{"type":"string","pattern":"^[a-f0-9]{64}$"},
+		"confirm_gateway_digest":{"type":"string","pattern":"^[a-f0-9]{64}$"}
+	},
+	"additionalProperties":false
+}`
+
+const extensionReloadInputSchema = `{
+	"type":"object",
+	"required":["name","generation_hash"],
+	"properties":{
+		"owner":{"type":"string","pattern":"` + extensionOwnerPattern + `",
+			"description":"Definition owner; must equal extension:<name>."},
+		"name":{"type":"string","minLength":1},
+		"generation_hash":{"type":"string","pattern":"^[a-f0-9]{64}$"},
+		"confirm_gateway_digest":{"type":"string","pattern":"^[a-f0-9]{64}$"}
+	},
+	"additionalProperties":false
+}`
+
+const extensionLogsInputSchema = `{
+	"type":"object",
+	"required":["name"],
+	"properties":{
+		"owner":{"type":"string","pattern":"` + extensionOwnerPattern + `",
+			"description":"Definition owner; must equal extension:<name>."},
+		"name":{"type":"string","minLength":1},
+		"after":{"type":"integer","minimum":0,"description":"Return entries after this sequence within stream_epoch"},
+		"stream_epoch":{"type":"string","minLength":1,"description":` +
+	`"Opaque ring identity returned by an earlier log read; required when after is greater than zero"}
+	},
+	"additionalProperties":false
+}`

@@ -1,15 +1,402 @@
 package httpapi
 
-import (
-	"github.com/gin-gonic/gin"
+import "github.com/gin-gonic/gin"
 
-	"github.com/compozy/compozy/internal/api/core"
-)
+// RegisterRoutes registers the shared Compozy API routes on the supplied Gin router.
+func RegisterRoutes(router gin.IRouter, handlers *Handlers) {
+	RegisterSurfaceRoutes(router, handlers, SurfaceSetLocal)
+}
 
-// RegisterRoutes registers the shared daemon API routes on the supplied router.
-func RegisterRoutes(router gin.IRouter, handlers *core.Handlers, noRoute ...gin.HandlerFunc) {
-	core.RegisterRoutes(router, handlers)
-	if engine, ok := router.(*gin.Engine); ok && len(noRoute) > 0 && noRoute[0] != nil {
-		engine.NoRoute(noRoute[0])
+func registerLocalRoutes(router gin.IRouter, handlers *Handlers) {
+	if handlers == nil {
+		return
 	}
+
+	api := router.Group("/api")
+	api.Use(handlers.WorkspaceReferenceGuard)
+	api.Use(localListenerTierMiddleware())
+	registerWebhookRoutes(api, handlers)
+	api.GET("/mcp/oauth/callback", handlers.completeMCPAuthCallback)
+	api.Use(browserRequestProtectionMiddleware(handlers.boundHost))
+
+	if !isLoopbackHost(canonicalHost(handlers.boundHost)) {
+		api = api.Group("", loopbackAPIGuard(handlers.boundHost))
+	}
+
+	registerAppSDKRoutes(api, handlers)
+	registerOperatorRoutes(api, handlers, true)
+	registerAgentKernelRoutes(api, handlers)
+	registerResourceRoutes(api, handlers)
+	registerGatewayRedeemRoute(api, handlers)
+	registerGatewayManagementRoutes(api, handlers, false)
+
+	if engine, ok := router.(*gin.Engine); ok {
+		engine.NoRoute(handlers.serveStaticRoute)
+	}
+}
+
+func registerStatusRoutes(api gin.IRouter, handlers *Handlers) {
+	api.GET("/status", handlers.GetStatus)
+	api.GET("/status/identity", handlers.GetRuntimeIdentity)
+	api.GET("/doctor", handlers.GetDoctor)
+	privileged := handlers.privilegedMutationGuard()
+	api.POST("/drain", privileged, handlers.DrainDaemon)
+	api.POST("/undrain", privileged, handlers.UndrainDaemon)
+}
+
+func registerOnboardingRoutes(api gin.IRouter, handlers *Handlers) {
+	privileged := handlers.privilegedMutationGuard()
+	onboarding := api.Group("/onboarding")
+	onboarding.GET("", handlers.GetOnboardingStatus)
+	onboarding.POST("/complete", privileged, handlers.CompleteOnboarding)
+	onboarding.DELETE("", privileged, handlers.ResetOnboarding)
+}
+
+func registerFilesystemRoutes(api gin.IRouter, handlers *Handlers) {
+	fsGroup := api.Group("/fs")
+	fsGroup.GET("/browse", handlers.BrowseDirectory)
+}
+
+func registerWorkspaceRoutes(api gin.IRouter, handlers *Handlers) {
+	workspaces := api.Group("/workspaces")
+	workspaces.POST("", handlers.CreateWorkspace)
+	workspaces.GET("", handlers.ListWorkspaces)
+	workspaces.GET("/:workspace_id", handlers.GetWorkspace)
+	workspaces.PATCH("/:workspace_id", handlers.UpdateWorkspace)
+	workspaces.DELETE("/:workspace_id", handlers.DeleteWorkspace)
+	workspaces.POST("/:workspace_id/archive", handlers.ArchiveWorkspace)
+	workspaces.POST("/:workspace_id/unarchive", handlers.UnarchiveWorkspace)
+	workspaces.POST("/resolve", handlers.ResolveWorkspace)
+}
+
+func registerLogsRoutes(api gin.IRouter, handlers *Handlers) {
+	api.GET("/logs", handlers.ListLogs)
+	api.GET("/logs/stream", handlers.StreamLogs)
+}
+
+func registerSupportRoutes(api gin.IRouter, handlers *Handlers) {
+	support := api.Group("/support")
+	support.POST("/bundles", handlers.CreateSupportBundle)
+	support.GET("/bundles/:operation_id", handlers.GetSupportBundle)
+	support.GET("/bundles/:operation_id/download", handlers.DownloadSupportBundle)
+}
+
+func registerObserveRoutes(api gin.IRouter, handlers *Handlers) {
+	api.GET("/permissions/rollup", handlers.PermissionRollup)
+	api.GET("/permissions", handlers.PermissionEntries)
+	observeGroup := api.Group("/observe")
+	observeGroup.GET("/overview", handlers.ObserveOverview)
+
+	taskObserveGroup := observeGroup.Group("/tasks")
+	taskObserveGroup.GET("/dashboard", handlers.TaskDashboard)
+	taskObserveGroup.GET("/inbox", handlers.TaskInbox)
+}
+
+func registerHookRoutes(api gin.IRouter, handlers *Handlers) {
+	hooksGroup := api.Group("/hooks")
+	hooksGroup.GET("/catalog", handlers.HookCatalog)
+	hooksGroup.GET("/events", handlers.HookEvents)
+
+	workspaceHooksGroup := api.Group("/workspaces/:workspace_id/hooks")
+	workspaceHooksGroup.GET("/runs", handlers.HookRuns)
+}
+
+func registerResourceRoutes(api gin.IRouter, handlers *Handlers) {
+	if handlers == nil {
+		return
+	}
+
+	auth := handlers.resourceAuthMiddleware()
+	if len(auth) == 0 {
+		return
+	}
+
+	resourcesGroup := api.Group("/resources", auth...)
+	resourcesGroup.GET("", handlers.ListResources)
+	resourcesGroup.GET("/:kind", handlers.ListResources)
+	resourcesGroup.GET("/:kind/:id", handlers.GetResource)
+	resourcesGroup.PUT("/:kind/:id", handlers.PutResource)
+	resourcesGroup.DELETE("/:kind/:id", handlers.DeleteResource)
+}
+
+func registerRemoteResourceReadRoutes(api gin.IRouter, handlers *Handlers) {
+	if handlers == nil {
+		return
+	}
+	resourcesGroup := api.Group("/resources")
+	resourcesGroup.GET("", handlers.ListResources)
+	resourcesGroup.GET("/:kind", handlers.ListResources)
+	resourcesGroup.GET("/:kind/:id", handlers.GetResource)
+}
+
+func registerToolRoutes(api gin.IRouter, handlers *Handlers) {
+	privileged := handlers.privilegedMutationGuard()
+	tools := api.Group("/tools")
+	tools.GET("", handlers.ListTools)
+	tools.POST("/search", handlers.SearchTools)
+	tools.POST("/:id/approvals", privileged, handlers.CreateToolApproval)
+	tools.POST("/:id/invoke", privileged, handlers.InvokeTool)
+	tools.GET("/:id", handlers.GetTool)
+
+	workspaceSessions := api.Group("/workspaces/:workspace_id/sessions")
+	workspaceSessions.GET("/:session_id/tools", handlers.ListSessionTools)
+	workspaceSessions.POST("/:session_id/tools/search", handlers.SearchSessionTools)
+	workspaceArtifacts := api.Group("/workspaces/:workspace_id/tool-artifacts")
+	workspaceArtifacts.GET("/:artifact_id", handlers.ReadToolArtifact)
+
+	toolsets := api.Group("/toolsets")
+	toolsets.GET("", handlers.ListToolsets)
+	toolsets.GET("/:id", handlers.GetToolset)
+
+	approvalGrants := api.Group("/tool-approval-grants")
+	approvalGrants.PUT("", handlers.privilegedMutationGuard(), handlers.SetToolApprovalGrant)
+	approvalGrants.GET("", handlers.ListToolApprovalGrants)
+	approvalGrants.DELETE("/:id", handlers.privilegedMutationGuard(), handlers.RevokeToolApprovalGrant)
+}
+
+func registerTaskRoutes(api gin.IRouter, handlers *Handlers, includeTaskMutations bool) {
+	tasks := api.Group("/tasks")
+	tasks.GET("", handlers.ListTasks)
+	tasks.GET("/:id", handlers.GetTask)
+	tasks.GET("/:id/inspect", handlers.InspectTask)
+	tasks.GET("/:id/execution-profile", handlers.GetTaskExecutionProfile)
+	tasks.GET("/:id/reviews", handlers.ListTaskReviews)
+	tasks.GET("/:id/blocks", handlers.ListTaskBlocks)
+	tasks.GET("/:id/timeline", handlers.TaskTimeline)
+	tasks.GET("/:id/stream", handlers.StreamTask)
+	tasks.GET("/:id/tree", handlers.TaskTree)
+	tasks.GET("/:id/runs", handlers.ListTaskRuns)
+	if includeTaskMutations {
+		registerTaskMutationRoutes(tasks, handlers)
+	}
+
+	taskRuns := api.Group("/task-runs")
+	taskRuns.GET("/:id", handlers.GetTaskRun)
+	taskRuns.GET("/:id/result", handlers.ReadTaskRunResult)
+	taskRuns.GET("/:id/reviews", handlers.ListTaskRunReviews)
+	if includeTaskMutations {
+		taskRuns.POST("/:id/reviews", handlers.RequestTaskRunReview)
+		taskRuns.POST("/:id/start", handlers.StartTaskRun)
+		taskRuns.POST("/:id/attach-session", handlers.AttachTaskRunSession)
+		taskRuns.POST("/:id/complete", handlers.CompleteTaskRun)
+		taskRuns.POST("/:id/fail", handlers.FailTaskRun)
+		taskRuns.POST("/:id/cancel", handlers.CancelTaskRun)
+	}
+
+	runs := api.Group("/runs")
+	runs.GET("/:id/inspect", handlers.InspectRun)
+	if includeTaskMutations {
+		registerRunMutationRoutes(runs, handlers)
+	}
+
+	if includeTaskMutations {
+		registerSchedulerRoutes(api, handlers)
+	}
+
+	taskReviews := api.Group("/task-reviews")
+	taskReviews.GET("/:id", handlers.GetTaskRunReview)
+	if includeTaskMutations {
+		taskReviews.POST("/:id/verdict", handlers.SubmitTaskRunReviewVerdict)
+	}
+}
+
+func registerTaskMutationRoutes(tasks *gin.RouterGroup, handlers *Handlers) {
+	tasks.POST("", handlers.CreateTask)
+	tasks.DELETE("/:id", handlers.DeleteTask)
+	tasks.PATCH("/:id", handlers.UpdateTask)
+	tasks.PUT("/:id/execution-profile", handlers.SetTaskExecutionProfile)
+	tasks.PATCH("/:id/execution-profile/worktree", handlers.SetTaskWorktreePolicy)
+	tasks.DELETE("/:id/execution-profile", handlers.DeleteTaskExecutionProfile)
+	tasks.POST("/:id/publish", handlers.PublishTask)
+	tasks.POST("/:id/start", handlers.StartTask)
+	tasks.POST("/:id/cancel", handlers.CancelTask)
+	tasks.POST("/:id/pause", handlers.PauseTask)
+	tasks.POST("/:id/resume", handlers.ResumeTask)
+	tasks.POST("/:id/blocks", handlers.BlockTask)
+	tasks.POST("/:id/blocks/:block_id/clear", handlers.ClearTaskBlock)
+	tasks.POST("/:id/recover", handlers.RecoverTask)
+	tasks.POST("/:id/children", handlers.CreateChildTask)
+	tasks.POST("/:id/dependencies", handlers.AddTaskDependency)
+	tasks.DELETE("/:id/dependencies/:depends_on_id", handlers.RemoveTaskDependency)
+	tasks.POST("/:id/approve", handlers.ApproveTask)
+	tasks.POST("/:id/reject", handlers.RejectTask)
+	tasks.POST("/:id/triage/read", handlers.MarkTaskRead)
+	tasks.POST("/:id/triage/archive", handlers.ArchiveTask)
+	tasks.POST("/:id/triage/dismiss", handlers.DismissTask)
+	tasks.POST("/:id/runs", handlers.EnqueueTaskRun)
+	tasks.POST("/:id/runs/fan-out", handlers.FanOutTaskRuns)
+}
+
+func registerRunMutationRoutes(runs *gin.RouterGroup, handlers *Handlers) {
+	runs.POST("/bulk/release", handlers.BulkForceReleaseTaskRuns)
+	runs.POST("/bulk/fail", handlers.BulkForceFailTaskRuns)
+	runs.POST("/:id/release", handlers.ForceReleaseTaskRun)
+	runs.POST("/:id/fail", handlers.ForceFailTaskRun)
+	runs.POST("/:id/retry", handlers.RetryTaskRun)
+	runs.POST("/:id/recover", handlers.RecoverTaskRun)
+}
+
+func registerSchedulerRoutes(api gin.IRouter, handlers *Handlers) {
+	scheduler := api.Group("/scheduler")
+	scheduler.GET("", handlers.GetScheduler)
+	scheduler.GET("/backlog", handlers.GetSchedulerBacklog)
+	scheduler.POST("/pause", handlers.PauseScheduler)
+	scheduler.POST("/resume", handlers.ResumeScheduler)
+	scheduler.POST("/drain", handlers.DrainScheduler)
+}
+
+func registerSkillRoutes(api gin.IRouter, handlers *Handlers) {
+	skillsGroup := api.Group("/skills")
+	skillsGroup.GET("", handlers.ListSkills)
+	skillsGroup.GET("/:name", handlers.GetSkill)
+	skillsGroup.GET("/:name/content", handlers.GetSkillContent)
+	skillsGroup.GET("/:name/shadows", handlers.GetSkillShadows)
+	skillsGroup.POST("/:name/expose", handlers.ExposeSkill)
+	skillsGroup.POST("/:name/unexpose", handlers.UnexposeSkill)
+	skillsGroup.POST("/:name/enable", handlers.EnableSkill)
+	skillsGroup.POST("/:name/disable", handlers.DisableSkill)
+}
+
+func registerMarketplaceRoutes(api gin.IRouter, handlers *Handlers) {
+	marketplace := api.Group("/marketplace")
+	marketplace.GET("", handlers.ListMarketplace)
+	marketplace.GET("/entries/:entry_id", handlers.GetMarketplaceCatalogEntry)
+	marketplace.POST("/refresh", handlers.privilegedMutationGuard(), handlers.RefreshMarketplaceCatalog)
+	marketplace.GET("/sources", handlers.ListMarketplaceSources)
+	marketplace.POST("/sources", handlers.privilegedMutationGuard(), handlers.AddMarketplaceSource)
+	marketplace.PATCH("/sources/:name", handlers.privilegedMutationGuard(), handlers.UpdateMarketplaceSource)
+	marketplace.DELETE("/sources/:name", handlers.privilegedMutationGuard(), handlers.RemoveMarketplaceSource)
+	marketplace.POST("/sources/:name/refresh", handlers.privilegedMutationGuard(), handlers.RefreshMarketplaceSource)
+}
+
+func registerExtensionRoutes(api gin.IRouter, handlers *Handlers, localOnly bool) {
+	privileged := handlers.privilegedMutationGuard()
+	profileWrite := privileged
+	if !localOnly {
+		profileWrite = handlers.ProfileRemoteWriteForbidden
+	}
+	extensions := api.Group("/extensions")
+	extensions.GET("", handlers.ListExtensions)
+	extensions.GET("/search", handlers.SearchExtensions)
+	extensions.GET("/commands", handlers.ExtensionCommands)
+	extensions.POST("/preview-install", privileged, handlers.PreviewExtensionInstall)
+	extensions.POST("", privileged, handlers.InstallExtension)
+	extensions.POST("/dev", privileged, handlers.DevExtension)
+	extensions.POST("/update", privileged, handlers.UpdateExtensions)
+	extensions.PUT("/:name", privileged, handlers.UpdateExtension)
+	extensions.DELETE("/:name", privileged, handlers.RemoveExtension)
+	extensions.GET("/:name/provenance", handlers.ExtensionProvenance)
+	extensions.GET("/:name/secrets", handlers.ListExtensionSecrets)
+	extensions.PUT("/:name/secrets", privileged, handlers.SetExtensionSecrets)
+	extensions.DELETE("/:name/secrets/:env_name", privileged, handlers.DeleteExtensionSecret)
+	extensions.GET("/:name/inventory", handlers.ExtensionInventory)
+	extensions.GET("/:name", handlers.ExtensionStatus)
+	extensions.POST("/:name/reload", privileged, handlers.ReloadDevExtension)
+	extensions.GET("/:name/logs", handlers.ExtensionLogs)
+	extensions.GET("/:name/enablement", handlers.ListExtensionEnablement)
+	extensions.PUT("/:name/enablement", profileWrite, handlers.SetExtensionEnablement)
+	extensions.GET("/:name/preview", handlers.PreviewExtensionEnable)
+}
+
+func registerSettingsRoutes(api gin.IRouter, handlers *Handlers) {
+	privileged := handlers.privilegedMutationGuard()
+	settings := api.Group("/settings")
+
+	settings.GET("/apply", handlers.ListSettingsApplyRecords)
+	settings.POST("/reload", privileged, handlers.ReloadSettings)
+	settings.GET("/general", handlers.GetSettingsGeneral)
+	settings.GET("/persona", handlers.GetSettingsPersona)
+	settings.GET("/update", handlers.GetSettingsUpdate)
+	settings.POST("/update/check", privileged, handlers.CheckSettingsUpdate)
+	settings.POST("/update/apply", privileged, handlers.ApplySettingsUpdate)
+	settings.POST("/update/cancel", privileged, handlers.CancelSettingsUpdate)
+	settings.PATCH("/general", privileged, handlers.UpdateSettingsGeneral)
+	settings.PATCH("/persona", privileged, handlers.UpdateSettingsPersona)
+	settings.GET("/roles", handlers.GetSettingsRoles)
+	settings.PATCH("/roles", privileged, handlers.UpdateSettingsRoles)
+	settings.GET("/skills", handlers.GetSettingsSkills)
+	settings.PATCH("/skills", privileged, handlers.UpdateSettingsSkills)
+	settings.GET("/automation", handlers.GetSettingsAutomation)
+	settings.PATCH("/automation", privileged, handlers.UpdateSettingsAutomation)
+	settings.GET("/window-manager", handlers.GetSettingsWindowManager)
+	settings.PATCH("/window-manager", privileged, handlers.UpdateSettingsWindowManager)
+	settings.GET("/cmd-palette", handlers.GetSettingsCmdPalette)
+	settings.PATCH("/cmd-palette", privileged, handlers.UpdateSettingsCmdPalette)
+	settings.GET("/attention", handlers.GetSettingsAttention)
+	settings.PATCH("/attention", privileged, handlers.UpdateSettingsAttention)
+	settings.GET("/provider-usage", handlers.GetSettingsProviderUsage)
+	settings.PATCH("/provider-usage", privileged, handlers.UpdateSettingsProviderUsage)
+	settings.GET("/shell", handlers.GetSettingsShell)
+	settings.PATCH("/shell", privileged, handlers.UpdateSettingsShell)
+
+	observability := settings.Group("/observability")
+	observability.GET("", handlers.GetSettingsObservability)
+	observability.PATCH("", privileged, handlers.UpdateSettingsObservability)
+	observability.GET("/log-tail", privileged, handlers.StreamSettingsObservabilityLogTail)
+
+	settings.GET("/hooks-extensions", handlers.GetSettingsHooksExtensions)
+	settings.GET("/marketplace", handlers.GetSettingsMarketplace)
+	settings.PATCH("/marketplace", privileged, handlers.UpdateSettingsMarketplace)
+	settings.PATCH("/hooks-extensions", privileged, handlers.UpdateSettingsHooksExtensions)
+
+	settings.GET("/providers", handlers.ListSettingsProviders)
+	settings.GET("/providers/:name", handlers.GetSettingsProvider)
+	settings.PUT("/providers/:name", privileged, handlers.PutSettingsProvider)
+	settings.DELETE("/providers/:name", privileged, handlers.DeleteSettingsProvider)
+
+	settings.GET("/mcp-servers", handlers.ListSettingsMCPServers)
+	settings.GET("/mcp-servers/:name", handlers.GetSettingsMCPServer)
+	settings.GET("/mcp-servers/:name/auth/status", handlers.GetSettingsMCPAuthStatus)
+	settings.POST("/mcp-servers/:name/auth/begin", privileged, handlers.BeginSettingsMCPAuth)
+	settings.POST("/mcp-servers/:name/auth/exchange", privileged, handlers.ExchangeSettingsMCPAuth)
+	settings.POST("/mcp-servers/:name/auth/logout", privileged, handlers.LogoutSettingsMCPAuth)
+	settings.PUT("/mcp-servers/:name", privileged, handlers.PutSettingsMCPServer)
+	settings.DELETE("/mcp-servers/:name", privileged, handlers.DeleteSettingsMCPServer)
+
+	settings.GET("/hooks", handlers.ListSettingsHooks)
+	settings.PUT("/hooks/:name", privileged, handlers.PutSettingsHook)
+	settings.DELETE("/hooks/:name", privileged, handlers.DeleteSettingsHook)
+
+	actions := settings.Group("/actions")
+	actions.POST("/restart", privileged, handlers.TriggerSettingsRestart)
+	actions.GET("/restart/:operation_id", handlers.GetSettingsRestartStatus)
+}
+
+func registerVaultRoutes(api gin.IRouter, handlers *Handlers) {
+	privileged := handlers.privilegedMutationGuard()
+	vaultGroup := api.Group("/vault")
+	vaultGroup.GET("/secrets", privileged, handlers.ListVaultSecrets)
+	vaultGroup.GET("/secrets/metadata", privileged, handlers.GetVaultSecretMetadata)
+	vaultGroup.PUT("/secrets", privileged, handlers.PutVaultSecret)
+	vaultGroup.DELETE("/secrets", privileged, handlers.DeleteVaultSecret)
+}
+
+func registerProviderRoutes(api gin.IRouter, handlers *Handlers) {
+	providers := api.Group("/providers")
+	providers.GET("", handlers.ListProviders)
+	providers.GET("/:provider_id", handlers.GetProvider)
+	providers.POST("/:provider_id/auth/probe", handlers.ProbeProviderAuth)
+}
+
+func registerModelCatalogRoutes(api gin.IRouter, handlers *Handlers) {
+	modelCatalog := api.Group("/model-catalog")
+	modelCatalog.GET("/*catalog_path", handlers.ModelCatalogRoute)
+	modelCatalog.POST("/*catalog_path", handlers.ModelCatalogRoute)
+}
+
+func registerOpenAIModelRoutes(api gin.IRouter, handlers *Handlers) {
+	api.GET("/openai/v1/models", handlers.OpenAIModels)
+}
+
+func registerWebhookRoutes(api gin.IRouter, handlers *Handlers) {
+	webhooks := api.Group("/webhooks", handlers.gatewayIngressRateLimitMiddleware())
+	webhooks.POST("/global/:endpoint", handlers.DeliverGlobalWebhook)
+	webhooks.POST("/workspaces/:workspace_id/:endpoint", handlers.DeliverWorkspaceWebhook)
+}
+
+func registerProviderUsageRoutes(api gin.IRouter, handlers *Handlers) {
+	api.GET("/provider-usage", handlers.ListProviderUsage)
+	api.GET("/provider-usage/providers/:provider_id", handlers.ListProviderUsage)
+	api.POST("/provider-usage/refresh", handlers.RefreshProviderUsage)
+	api.GET("/provider-usage/stream", handlers.StreamProviderUsage)
 }

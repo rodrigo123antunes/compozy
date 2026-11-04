@@ -1,0 +1,372 @@
+// Suite: Extensions management transport
+// Invariant: Every management action uses its generated HTTP route and preserves daemon errors.
+// Boundary IN: Generated OpenAPI client requests and typed management payloads.
+// Boundary OUT: Query-cache behavior and visible lifecycle feedback, owned by hook/component suites.
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+
+import {
+  ExtensionsApiError,
+  getExtensionInventory,
+  getExtensionProvenance,
+  listExtensionLogs,
+  listExtensions,
+  previewExtensionInstall,
+  removeExtension,
+  setExtensionEnablement,
+  updateExtension,
+} from "../extensions-api";
+import {
+  extensionFixtures,
+  extensionInventoryFixtures,
+  extensionProvenanceFixtures,
+} from "../../mocks/fixtures";
+import { expectFetchRequest, mockEmptyResponse, mockJsonResponse } from "@/test/fetch-test-utils";
+
+beforeEach(() => {
+  vi.stubGlobal("fetch", vi.fn());
+});
+
+afterEach(() => {
+  vi.restoreAllMocks();
+  vi.unstubAllGlobals();
+});
+
+describe("extensions management reads", () => {
+  it("Should read extension inventory and provenance with abortable generated requests", async () => {
+    const controller = new AbortController();
+    const ownedServer = {
+      name: "remote",
+      owner: "extension:otel-bridge",
+      runtime_name: "otel-bridge.remote",
+      scope: "workspace",
+      workspace_id: "workspace-a",
+      profile: "growth",
+      transport: "http",
+      launch: "https://mcp.example.com",
+      status: "needs_authorization",
+      auth: {
+        method: "oauth",
+        registration: "dynamic",
+        issuer_url: "https://issuer.example.com",
+        scopes: ["read"],
+      },
+    };
+    const installed = [{ ...extensionFixtures[0]!, mcp_servers: [ownedServer] }];
+    mockJsonResponse({ extensions: installed });
+    await expect(listExtensions({}, controller.signal)).resolves.toEqual(installed);
+    await expectFetchRequest({ path: "/api/extensions", signal: controller.signal });
+
+    mockJsonResponse({ provenance: extensionProvenanceFixtures["otel-bridge"] });
+    await expect(getExtensionProvenance("otel-bridge")).resolves.toEqual(
+      extensionProvenanceFixtures["otel-bridge"]
+    );
+    await expectFetchRequest({ callIndex: 1, path: "/api/extensions/otel-bridge/provenance" });
+  });
+
+  it("Should read kit inventory for the selected workspace and profile", async () => {
+    const items = extensionInventoryFixtures["dep-kit-ops"]!;
+    const payload = { enabled: false, extension: "dep-kit-ops", items };
+    mockJsonResponse(payload);
+
+    await expect(
+      getExtensionInventory("dep-kit-ops", { workspaceId: "ws-a", profileName: "research" })
+    ).resolves.toEqual(payload);
+    await expectFetchRequest({
+      path: "/api/extensions/dep-kit-ops/inventory?profile=research&workspace=ws-a",
+    });
+  });
+
+  it.each([false, true])(
+    "Should normalize omitted arrays and send a profile-only selector (omitted=%s)",
+    async omitted => {
+      const extensions = extensionFixtures.map(extension => ({
+        ...extension,
+        mcp_servers: [],
+        inputs: [],
+        missing_inputs: [],
+      }));
+      const wire = extensions.map(extension =>
+        omitted
+          ? { ...extension, mcp_servers: undefined, inputs: undefined, missing_inputs: undefined }
+          : extension
+      );
+      mockJsonResponse({ extensions: wire });
+
+      await expect(listExtensions({ profileName: "growth" })).resolves.toEqual(extensions);
+      await expectFetchRequest({ path: "/api/extensions?profile=growth" });
+    }
+  );
+});
+
+describe("extensions management mutations", () => {
+  // Invariant: update recovery retains the requested input IDs at the owning HTTP adapter boundary.
+  it("Should preserve required input ids and send typed values when retrying an update", async () => {
+    const inputDefinitions = [
+      {
+        id: "region",
+        prompt: "Region",
+        type: "identifier",
+        required: true,
+        binding: { type: "url_query", name: "region" },
+        default: "eu",
+      },
+    ];
+    mockJsonResponse(
+      {
+        code: "extension_inputs_required",
+        error: "configuration required",
+        inputs: ["region"],
+        input_definitions: inputDefinitions,
+      },
+      { status: 422 }
+    );
+    await expect(updateExtension("sentry", {})).rejects.toMatchObject({
+      status: 422,
+      code: "extension_inputs_required",
+      requiredInputs: ["region"],
+      inputDefinitions,
+    });
+    const body = {
+      scope: "workspace" as const,
+      workspace_id: "ws-scoped",
+      profile: "marketing",
+      inputs: { region: { value: "eu" }, tracing: { value: false } },
+    };
+    mockJsonResponse({});
+    await updateExtension("sentry", body);
+    await expectFetchRequest({ callIndex: 1, method: "PUT", path: "/api/extensions/sentry", body });
+  });
+  it("Should set one profile's extension enablement through the dedicated route", async () => {
+    const controller = new AbortController();
+    const result = { enabled: false, profile: "growth" };
+    mockJsonResponse(result);
+    await expect(
+      setExtensionEnablement("otel-bridge", "growth", false, controller.signal)
+    ).resolves.toEqual(result);
+    await expectFetchRequest({
+      body: { enabled: false, profile: "growth" },
+      method: "PUT",
+      path: "/api/extensions/otel-bridge/enablement",
+      signal: controller.signal,
+    });
+  });
+
+  it("Should preview an install before committing it", async () => {
+    const request = { ref: "dep-kit-ops", source: "curated" as const, version: "1.1.0" };
+    const preview = {
+      inputs: [],
+      declared_profiles: [{ create: true, credentials: [], name: "operations" }],
+      name: "dep-kit-ops",
+      gateway_requirement_digest: "sha256:6f1c0a94d3b27e58",
+      placements: [],
+    };
+    mockJsonResponse(preview);
+
+    await expect(previewExtensionInstall(request)).resolves.toEqual(preview);
+    await expectFetchRequest({
+      body: request,
+      method: "POST",
+      path: "/api/extensions/preview-install",
+    });
+  });
+
+  it.each([
+    ["name", { declared_profiles: [], placements: [] }],
+    ["declared_profiles", { name: "dep-kit-ops", placements: [] }],
+    ["placements", { name: "dep-kit-ops", declared_profiles: [] }],
+    ["inputs", { name: "dep-kit-ops", declared_profiles: [], placements: [] }],
+  ])("Should reject a preview missing %s", async (field, payload) => {
+    mockJsonResponse(payload);
+
+    const error = await previewExtensionInstall({
+      ref: "dep-kit-ops",
+      source: "curated",
+    }).catch(reason => reason);
+
+    expect(error).toBeInstanceOf(ExtensionsApiError);
+    expect(error).toMatchObject({
+      kind: "malformed_response",
+      message: expect.stringContaining(`missing ${field}`),
+    });
+  });
+
+  it("Should update and remove one extension through generated management routes", async () => {
+    const controller = new AbortController();
+    mockEmptyResponse();
+    await expect(updateExtension("otel-bridge", {}, controller.signal)).resolves.toBeUndefined();
+    await expectFetchRequest({
+      body: {},
+      method: "PUT",
+      path: "/api/extensions/otel-bridge",
+      signal: controller.signal,
+    });
+
+    mockEmptyResponse({ status: 204 });
+    await expect(removeExtension("otel-bridge", {}, controller.signal)).resolves.toBeUndefined();
+    await expectFetchRequest({
+      callIndex: 1,
+      method: "DELETE",
+      path: "/api/extensions/otel-bridge",
+      signal: controller.signal,
+    });
+  });
+
+  it("Should bind the profile and workspace instance on scoped reads, removal, and log history", async () => {
+    mockJsonResponse({ extensions: extensionFixtures });
+    await listExtensions({ profileName: "growth", workspaceId: "ws_northstar" });
+    await expectFetchRequest({ path: "/api/extensions?profile=growth&workspace=ws_northstar" });
+
+    mockEmptyResponse({ status: 204 });
+    await removeExtension("otel-bridge", { workspaceId: "ws_northstar" });
+    await expectFetchRequest({
+      callIndex: 1,
+      method: "DELETE",
+      path: "/api/extensions/otel-bridge?workspace=ws_northstar",
+    });
+
+    mockJsonResponse({ logs: [], stream_epoch: "epoch-northstar" });
+    await expect(
+      listExtensionLogs("otel-bridge", {
+        after: 12,
+        streamEpoch: "epoch-northstar",
+        workspaceId: "ws_northstar",
+        profileName: "growth",
+      })
+    ).resolves.toEqual({ logs: [], stream_epoch: "epoch-northstar" });
+    await expectFetchRequest({
+      callIndex: 2,
+      path: "/api/extensions/otel-bridge/logs?profile=growth&workspace=ws_northstar&after=12&stream_epoch=epoch-northstar",
+    });
+  });
+
+  it("Should address the global instance when no workspace is active", async () => {
+    mockJsonResponse({ logs: [], stream_epoch: "epoch-global" });
+    await expect(listExtensionLogs("otel-bridge", { workspaceId: "   " })).resolves.toEqual({
+      logs: [],
+      stream_epoch: "epoch-global",
+    });
+    await expectFetchRequest({ path: "/api/extensions/otel-bridge/logs" });
+  });
+
+  it("Should ratify the exact digest on the update route", async () => {
+    const digest = "sha256:6f1c0a94d3b27e58";
+    mockEmptyResponse();
+    await updateExtension("dep-kit-ops", {
+      allow_unverified: true,
+      confirm_gateway_digest: digest,
+      version: "1.1.0",
+    });
+    await expectFetchRequest({
+      body: { allow_unverified: true, confirm_gateway_digest: digest, version: "1.1.0" },
+      method: "PUT",
+      path: "/api/extensions/dep-kit-ops",
+    });
+  });
+});
+
+describe("extensions management failures", () => {
+  it("Should surface the daemon error body for a rejected mutation", async () => {
+    mockJsonResponse({ error: "extension files are locked by another operation" }, { status: 409 });
+
+    const error = await removeExtension("slack-notify").catch(reason => reason);
+    expect(error).toBeInstanceOf(ExtensionsApiError);
+    expect(error).toMatchObject({
+      kind: "daemon",
+      message: "extension files are locked by another operation",
+      status: 409,
+    });
+  });
+
+  /**
+   * The digest is the whole remediation: without it the operator cannot ratify what the daemon
+   * refused, so the typed error has to carry it rather than flatten to a message.
+   */
+  it("Should expose the daemon code and current digest from a gateway-confirmation refusal", async () => {
+    mockJsonResponse(
+      {
+        code: "extension_gateway_confirmation_required",
+        current_digest: "sha256:6f1c0a94d3b27e58",
+        error: "dep-kit-ops declares gateway control permissions that has not been confirmed",
+      },
+      { status: 409 }
+    );
+
+    const error = await updateExtension("dep-kit-ops", {}).catch((reason: unknown) => reason);
+    expect(error).toBeInstanceOf(ExtensionsApiError);
+    expect(error).toMatchObject({
+      code: "extension_gateway_confirmation_required",
+      currentDigest: "sha256:6f1c0a94d3b27e58",
+      kind: "daemon",
+      status: 409,
+    });
+  });
+
+  it("Should fall back to operation and status when the daemon has no error body", async () => {
+    mockEmptyResponse({ status: 503 });
+
+    const error = await getExtensionInventory("dep-kit-ops").catch((reason: unknown) => reason);
+    expect(error).toBeInstanceOf(ExtensionsApiError);
+    expect(error).toMatchObject({
+      kind: "transport",
+      message: "Failed to load kit inventory for dep-kit-ops (503)",
+      status: 503,
+    });
+  });
+
+  it("Should reject a successful response that omits required data", async () => {
+    mockEmptyResponse();
+
+    const error = await listExtensions().catch(reason => reason);
+    expect(error).toBeInstanceOf(ExtensionsApiError);
+    expect(error).toMatchObject({
+      kind: "malformed_response",
+      message: "Failed to list extensions: empty response (200)",
+      status: 200,
+    });
+  });
+
+  it("Should reject a log snapshot without its stream identity", async () => {
+    mockJsonResponse({ logs: [] });
+
+    const error = await listExtensionLogs("otel-bridge").catch(reason => reason);
+    expect(error).toBeInstanceOf(ExtensionsApiError);
+    expect(error).toMatchObject({
+      kind: "malformed_response",
+      message: expect.stringContaining("missing stream_epoch"),
+      status: 200,
+    });
+  });
+
+  it.each([
+    ["extension inventory", "extensions", () => listExtensions()],
+    ["extension provenance", "provenance", () => getExtensionProvenance("otel-bridge")],
+    [
+      "extension enablement",
+      "profile",
+      () => setExtensionEnablement("otel-bridge", "growth", true),
+    ],
+    ["kit inventory", "items", () => getExtensionInventory("dep-kit-ops")],
+  ])("Should reject a successful empty %s envelope", async (_name, field, invoke) => {
+    mockJsonResponse({});
+
+    const error = await invoke().catch(reason => reason);
+    expect(error).toBeInstanceOf(ExtensionsApiError);
+    expect(error).toMatchObject({
+      kind: "malformed_response",
+      message: expect.stringContaining(`missing ${field}`),
+      status: 200,
+    });
+  });
+
+  it("Should reject kit inventory for a different extension identity", async () => {
+    mockJsonResponse({ enabled: false, extension: "otel-bridge", items: [] });
+
+    const error = await getExtensionInventory("dep-kit-ops").catch(reason => reason);
+    expect(error).toBeInstanceOf(ExtensionsApiError);
+    expect(error).toMatchObject({
+      kind: "malformed_response",
+      message: "Failed to load kit inventory for dep-kit-ops: extension identity mismatch (200)",
+      status: 200,
+    });
+  });
+});

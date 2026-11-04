@@ -1,0 +1,239 @@
+package extensionpkg
+
+import (
+	"context"
+	"database/sql"
+
+	"errors"
+	"fmt"
+
+	"time"
+
+	"github.com/compozy/compozy/internal/store"
+)
+
+var (
+	// ErrExtensionNotFound reports that no installed extension matched the lookup.
+	ErrExtensionNotFound = errors.New("extension: extension not found")
+	// ErrExtensionExists reports that an extension name is already installed.
+	ErrExtensionExists = errors.New("extension: extension already exists")
+	// ErrExtensionChecksumMismatch reports that the provided checksum does not
+	// match the on-disk extension artifact.
+	ErrExtensionChecksumMismatch = errors.New("extension: checksum mismatch")
+)
+
+const (
+	registrySelectColumns = `
+		SELECT
+			name,
+			version,
+			source,
+			EXISTS (
+				SELECT 1
+				FROM profiles
+				WHERE profiles.state = 'active'
+					AND NOT EXISTS (
+						SELECT 1
+						FROM extension_profile_enablement
+						WHERE extension_name = extensions.name
+							AND profile_id = profiles.id
+							AND enabled = 0
+					)
+			),
+			manifest_path,
+			format,
+			ingest_diagnostics_json,
+			installed_at,
+			provides_json,
+			permissions_json,
+			checksum,
+			lifecycle_token,
+			registry_slug,
+			registry_name,
+			remote_version,
+			provenance_json,
+			gateway_requirement_digest,
+			gateway_confirmed_by,
+			gateway_confirmed_at
+	`
+	registryInsertColumns = `
+			name,
+			version,
+			source,
+			manifest_path,
+			format,
+			ingest_diagnostics_json,
+			installed_at,
+			provides_json,
+			permissions_json,
+			checksum,
+			lifecycle_token,
+			registry_slug,
+			registry_name,
+			remote_version,
+			provenance_json,
+			gateway_requirement_digest,
+			gateway_confirmed_by,
+			gateway_confirmed_at
+	`
+)
+
+// NewRegistry constructs a registry over an existing SQLite connection.
+func NewRegistry(db *sql.DB, options ...RegistryOption) *Registry {
+	registry := &Registry{
+		db: db, readDB: db,
+		now: func() time.Time {
+			return time.Now().UTC()
+		},
+	}
+	for _, option := range options {
+		option(registry)
+	}
+	return registry
+}
+
+// RegistryOption configures the database pools owned by the composition root.
+type RegistryOption func(*Registry)
+
+// WithRegistryReadDB keeps catalog reads independent of the write connection.
+func WithRegistryReadDB(db *sql.DB) RegistryOption {
+	return func(r *Registry) {
+		if db != nil {
+			r.readDB = db
+		}
+	}
+}
+
+func (r *Registry) execWrite(ctx context.Context, operation, query string, args ...any) (sql.Result, error) {
+	var result sql.Result
+	err := store.ExecuteWriteOperation(ctx, r.db, operation, func(ctx context.Context, tx *store.WriteTx) error {
+		var err error
+		result, err = tx.ExecContext(ctx, query, args...)
+		return err
+	})
+	if err != nil {
+		return nil, err
+	}
+	return result, nil
+}
+
+// DB exposes the backing SQLite handle for composition-root integrations that
+// need to build additional stores over the same registry database.
+func (r *Registry) DB() *sql.DB {
+	if r == nil {
+		return nil
+	}
+	return r.db
+}
+
+// Install verifies the extension artifact checksum and persists the install as
+// a user-sourced extension.
+func (r *Registry) Install(manifest *Manifest, path string, checksum string, opts ...InstallOption) error {
+	config := installConfig{
+		source:  SourceUser,
+		enabled: true,
+	}
+	applyInstallOptions(&config, opts...)
+
+	return r.installWithConfig(manifest, path, checksum, config)
+}
+
+// Uninstall removes one extension from the registry.
+func (r *Registry) Uninstall(name string) error {
+	if err := r.checkReady("uninstall extension"); err != nil {
+		return err
+	}
+
+	trimmedName, err := normalizeExtensionName(name)
+	if err != nil {
+		return err
+	}
+	result, err := r.execWrite(
+		registryContext(),
+		"uninstall extension",
+		`DELETE FROM extensions WHERE name = ?`,
+		trimmedName,
+	)
+	if err != nil {
+		return fmt.Errorf("extension: uninstall %q: %w", trimmedName, err)
+	}
+
+	if err := rowsAffectedNotFound(result, trimmedName); err != nil {
+		return err
+	}
+	r.invalidateEnabledBundledNames()
+	return nil
+}
+
+// Enable removes the disabled exception for the default profile.
+func (r *Registry) Enable(name string) error {
+	return r.SetEnabledForProfile(name, store.DefaultProfileID, true)
+}
+
+// Disable records a disabled exception for the default profile.
+func (r *Registry) Disable(name string) error {
+	return r.SetEnabledForProfile(name, store.DefaultProfileID, false)
+}
+
+// List returns every installed extension ordered by name.
+func (r *Registry) List() (extensions []ExtensionInfo, err error) {
+	if err := r.checkReady("list extensions"); err != nil {
+		return nil, err
+	}
+
+	rows, err := r.readDB.QueryContext(registryContext(), `
+`+registrySelectColumns+`
+		FROM extensions
+		ORDER BY name ASC
+	`)
+	if err != nil {
+		return nil, fmt.Errorf("extension: list extensions: %w", err)
+	}
+	defer func() {
+		if closeErr := rows.Close(); closeErr != nil {
+			err = errors.Join(err, fmt.Errorf("extension: close extension list rows: %w", closeErr))
+		}
+	}()
+
+	extensions = make([]ExtensionInfo, 0)
+	for rows.Next() {
+		info, err := scanExtensionInfo(rows)
+		if err != nil {
+			return nil, err
+		}
+		extensions = append(extensions, *info)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("extension: iterate extensions: %w", err)
+	}
+
+	return extensions, nil
+}
+
+// Get returns one installed extension by name.
+func (r *Registry) Get(name string) (*ExtensionInfo, error) {
+	if err := r.checkReady("get extension"); err != nil {
+		return nil, err
+	}
+
+	trimmedName, err := normalizeExtensionName(name)
+	if err != nil {
+		return nil, err
+	}
+
+	row := r.readDB.QueryRowContext(registryContext(), `
+`+registrySelectColumns+`
+		FROM extensions
+		WHERE name = ?
+	`, trimmedName)
+
+	info, err := scanExtensionInfo(row)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, &ExtensionNotFoundError{Name: trimmedName}
+	}
+	if err != nil {
+		return nil, err
+	}
+
+	return info, nil
+}

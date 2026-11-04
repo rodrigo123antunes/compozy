@@ -1,0 +1,465 @@
+package httpapi
+
+import (
+	"errors"
+	"log/slog"
+	"net"
+	"net/http"
+	"net/url"
+	"strings"
+	"time"
+
+	"github.com/compozy/compozy/internal/api/contract"
+	"github.com/compozy/compozy/internal/api/core"
+	"github.com/gin-gonic/gin"
+)
+
+const (
+	ipv4WildcardBind                 = "0.0.0.0"
+	sessionAttachmentUploadRoutePath = "/api/workspaces/:workspace_id/sessions/:session_id/attachments"
+)
+
+var errLoopbackMutationRequired = errors.New(
+	"remote HTTP settings and extension mutations are disabled in v1 unless the daemon is bound to a loopback host",
+)
+
+var errLoopbackAPIRequired = errors.New(
+	"remote HTTP API access is disabled unless the daemon is bound to a loopback host",
+)
+
+var (
+	errOriginNotAllowed      = errors.New("origin not allowed")
+	errRequestHostNotAllowed = errors.New("request host not allowed")
+	errCrossOriginNotAllowed = errors.New("cross-origin request not allowed")
+)
+
+var errRequestBodyTooLarge = core.ErrRequestBodyTooLarge
+
+const maxAPIRequestBodyBytes int64 = 4 << 20
+
+func requestLoggingMiddleware(logger *slog.Logger) gin.HandlerFunc {
+	if logger == nil {
+		logger = slog.Default()
+	}
+
+	return func(c *gin.Context) {
+		started := time.Now()
+		c.Next()
+
+		logger.Log(
+			c.Request.Context(), requestLogLevel(c.Request.Method, c.Writer.Status()),
+			"httpapi: request",
+			"method", c.Request.Method,
+			"path", c.FullPath(),
+			"status", c.Writer.Status(),
+			"latency_ms", time.Since(started).Milliseconds(),
+			"client_ip", c.ClientIP(),
+			"client_id", requestClientID(c.GetHeader("X-Compozy-Client-ID")),
+			"app_token_id", c.GetString(appTokenIDKey),
+		)
+	}
+}
+
+func requestLogLevel(method string, status int) slog.Level {
+	switch {
+	case status >= http.StatusInternalServerError:
+		return slog.LevelError
+	case status >= http.StatusBadRequest:
+		return slog.LevelWarn
+	case method == http.MethodGet || method == http.MethodHead || method == http.MethodOptions:
+		return slog.LevelDebug
+	default:
+		return slog.LevelInfo
+	}
+}
+
+// Client IDs are opaque labels, never credentials or arbitrary log content.
+func requestClientID(value string) string {
+	if value == "" || len(value) > 80 {
+		return "unidentified"
+	}
+	for _, char := range value {
+		switch {
+		case char >= 'a' && char <= 'z', char >= 'A' && char <= 'Z',
+			char >= '0' && char <= '9', char == '-', char == '_':
+		default:
+			return "unidentified"
+		}
+	}
+	return value
+}
+
+func corsMiddleware(boundHost string) gin.HandlerFunc {
+	return corsMiddlewareWithForwardedTarget(boundHost, false)
+}
+
+func corsMiddlewareWithForwardedTarget(boundHost string, allowForwardedTarget bool) gin.HandlerFunc {
+	return func(c *gin.Context) {
+		origin := strings.TrimSpace(c.GetHeader("Origin"))
+		headers := c.Writer.Header()
+		setBrowserAccessHeaders(headers)
+		if origin != "" {
+			allowedOrigin, ok := resolveAllowedOriginForTarget(
+				origin,
+				requestSchemeForTarget(c.Request, allowForwardedTarget),
+				c.Request.Host,
+				boundHost,
+				allowForwardedTarget,
+			)
+			if appOrigin := c.GetString(appTokenOriginKey); appOrigin != "" {
+				allowedOrigin, ok = appOrigin, true
+			}
+			if !ok {
+				abortForbiddenRequest(c, errOriginNotAllowed)
+				return
+			}
+			headers.Set("Access-Control-Allow-Origin", allowedOrigin)
+		}
+
+		if c.Request.Method == http.MethodOptions {
+			c.AbortWithStatus(http.StatusNoContent)
+			return
+		}
+		c.Next()
+	}
+}
+
+func setBrowserAccessHeaders(headers http.Header) {
+	headers.Set(
+		"Access-Control-Allow-Headers",
+		"Authorization, Content-Type, Last-Event-ID, Accept, X-Compozy-Client-ID",
+	)
+	headers.Set("Access-Control-Allow-Methods", "GET, POST, PUT, PATCH, DELETE, OPTIONS")
+	headers.Set(
+		"Access-Control-Expose-Headers",
+		"Content-Type, Last-Event-ID, x-vercel-ai-ui-message-stream, "+gatewayTierHeader,
+	)
+	headers.Set("Vary", "Origin")
+}
+
+func resolveAllowedOrigin(origin string, requestScheme string, requestHost string, boundHost string) (string, bool) {
+	return resolveAllowedOriginForTarget(origin, requestScheme, requestHost, boundHost, false)
+}
+
+func resolveAllowedOriginForTarget(
+	origin string,
+	requestScheme string,
+	requestHost string,
+	boundHost string,
+	allowForwardedTarget bool,
+) (string, bool) {
+	parsed, err := url.Parse(strings.TrimSpace(origin))
+	if err != nil || parsed.Scheme == "" || parsed.Host == "" {
+		return "", false
+	}
+
+	originSpec, ok := canonicalOriginFromURL(parsed)
+	if !ok {
+		return "", false
+	}
+
+	requestSpec, ok := canonicalOriginFromHost(requestHost, requestScheme, "")
+	if !ok {
+		return "", false
+	}
+
+	if originSpec.canonical == requestSpec.canonical && allowForwardedTarget {
+		return origin, true
+	}
+	boundSpec, ok := canonicalOriginFromHost(boundHost, requestSpec.scheme, requestSpec.port)
+	if !ok || !requestTargetCompatible(requestSpec, boundSpec) {
+		return "", false
+	}
+	switch {
+	case originSpec.canonical == requestSpec.canonical:
+		return origin, true
+	case !boundSpec.wildcard && originSpec.canonical == boundSpec.canonical:
+		return origin, true
+	default:
+		return "", false
+	}
+}
+
+func browserRequestProtectionMiddleware(boundHost string) gin.HandlerFunc {
+	return browserRequestProtectionMiddlewareWithForwardedTarget(boundHost, false)
+}
+
+func browserRequestProtectionMiddlewareWithForwardedTarget(
+	boundHost string,
+	allowForwardedTarget bool,
+) gin.HandlerFunc {
+	protection := http.NewCrossOriginProtection()
+	return func(c *gin.Context) {
+		if hasBrowserRequestMetadata(c.Request) &&
+			!requestTargetAllowedForMode(c.Request, boundHost, allowForwardedTarget) {
+			abortForbiddenRequest(c, errRequestHostNotAllowed)
+			return
+		}
+		if c.GetString(appTokenOriginKey) != "" {
+			c.Next()
+			return
+		}
+		if err := protection.Check(c.Request); err != nil {
+			abortForbiddenRequest(c, errCrossOriginNotAllowed)
+			return
+		}
+		c.Next()
+	}
+}
+
+func hasBrowserRequestMetadata(request *http.Request) bool {
+	if request == nil {
+		return false
+	}
+	return strings.TrimSpace(request.Header.Get("Origin")) != "" ||
+		strings.TrimSpace(request.Header.Get("Sec-Fetch-Site")) != ""
+}
+
+func requestTargetAllowedForMode(request *http.Request, boundHost string, allowForwardedTarget bool) bool {
+	if request == nil {
+		return false
+	}
+	requestSpec, ok := canonicalOriginFromHost(request.Host, requestSchemeForTarget(request, allowForwardedTarget), "")
+	if !ok {
+		return false
+	}
+	if allowForwardedTarget {
+		return true
+	}
+	boundSpec, ok := canonicalOriginFromHost(boundHost, requestSpec.scheme, requestSpec.port)
+	return ok && requestTargetCompatible(requestSpec, boundSpec)
+}
+
+func requestTargetCompatible(requestSpec canonicalOrigin, boundSpec canonicalOrigin) bool {
+	if requestSpec.scheme != boundSpec.scheme || requestSpec.port != boundSpec.port {
+		return false
+	}
+	switch {
+	case boundSpec.wildcard:
+		return true
+	case boundSpec.loopback:
+		return requestSpec.loopback
+	default:
+		return requestSpec.hostname == boundSpec.hostname
+	}
+}
+
+func abortForbiddenRequest(c *gin.Context, err error) {
+	if isOpenAICompatiblePath(c) {
+		core.RespondOpenAIError(c, http.StatusForbidden, err, false)
+	} else {
+		c.AbortWithStatusJSON(http.StatusForbidden, contract.ErrorPayload{Error: err.Error()})
+	}
+	c.Abort()
+}
+
+type canonicalOrigin struct {
+	scheme    string
+	hostname  string
+	port      string
+	canonical string
+	loopback  bool
+	wildcard  bool
+}
+
+const (
+	defaultRequestScheme = "http"
+	secureRequestScheme  = "https"
+)
+
+func requestSchemeForTarget(r *http.Request, allowForwardedTarget bool) string {
+	if r == nil {
+		return defaultRequestScheme
+	}
+	peer, _, err := net.SplitHostPort(r.RemoteAddr)
+	if allowForwardedTarget && err == nil && net.ParseIP(peer).IsLoopback() {
+		forwarded := strings.ToLower(strings.TrimSpace(r.Header.Get("X-Forwarded-Proto")))
+		if forwarded == secureRequestScheme || forwarded == defaultRequestScheme {
+			return forwarded
+		}
+	}
+	if r.TLS != nil {
+		return secureRequestScheme
+	}
+	if scheme := strings.TrimSpace(r.URL.Scheme); scheme != "" {
+		return strings.ToLower(scheme)
+	}
+	return defaultRequestScheme
+}
+
+func canonicalOriginFromURL(parsed *url.URL) (canonicalOrigin, bool) {
+	scheme := strings.ToLower(strings.TrimSpace(parsed.Scheme))
+	hostname := canonicalHost(parsed.Hostname())
+	port := normalizePort(scheme, parsed.Port())
+	if scheme == "" || hostname == "" || port == "" {
+		return canonicalOrigin{}, false
+	}
+
+	return canonicalOrigin{
+		scheme:    scheme,
+		hostname:  hostname,
+		port:      port,
+		canonical: scheme + "://" + net.JoinHostPort(hostname, port),
+		loopback:  isLoopbackHost(hostname),
+		wildcard:  isWildcardHost(hostname),
+	}, true
+}
+
+func canonicalOriginFromHost(host string, scheme string, fallbackPort string) (canonicalOrigin, bool) {
+	trimmedHost := strings.TrimSpace(host)
+	scheme = strings.ToLower(strings.TrimSpace(scheme))
+	if trimmedHost == "" || scheme == "" {
+		return canonicalOrigin{}, false
+	}
+
+	hostname := canonicalHost(trimmedHost)
+	port := ""
+	if parsedHost, parsedPort, err := net.SplitHostPort(trimmedHost); err == nil {
+		hostname = canonicalHost(parsedHost)
+		port = parsedPort
+	}
+	if hostname == "" {
+		return canonicalOrigin{}, false
+	}
+
+	port = normalizePort(scheme, firstNonEmptyString(port, fallbackPort))
+	if port == "" {
+		return canonicalOrigin{}, false
+	}
+
+	return canonicalOrigin{
+		scheme:    scheme,
+		hostname:  hostname,
+		port:      port,
+		canonical: scheme + "://" + net.JoinHostPort(hostname, port),
+		loopback:  isLoopbackHost(hostname),
+		wildcard:  isWildcardHost(hostname),
+	}, true
+}
+
+func normalizePort(scheme string, port string) string {
+	trimmed := strings.TrimSpace(port)
+	if trimmed != "" {
+		return trimmed
+	}
+
+	switch strings.ToLower(strings.TrimSpace(scheme)) {
+	case "http":
+		return "80"
+	case "https":
+		return "443"
+	default:
+		return ""
+	}
+}
+
+func firstNonEmptyString(values ...string) string {
+	for _, value := range values {
+		if trimmed := strings.TrimSpace(value); trimmed != "" {
+			return trimmed
+		}
+	}
+	return ""
+}
+
+func canonicalHost(value string) string {
+	host := strings.TrimSpace(value)
+	if host == "" {
+		return ""
+	}
+	if strings.Contains(host, "://") {
+		if parsed, err := url.Parse(host); err == nil {
+			host = parsed.Hostname()
+		}
+	} else if parsedHost, _, err := net.SplitHostPort(host); err == nil {
+		host = parsedHost
+	}
+	return strings.Trim(strings.TrimSpace(host), "[]")
+}
+
+func isLoopbackHost(host string) bool {
+	if strings.EqualFold(host, "localhost") {
+		return true
+	}
+	ip := net.ParseIP(host)
+	return ip != nil && ip.IsLoopback()
+}
+
+func isWildcardHost(host string) bool {
+	switch host {
+	case "", ipv4WildcardBind, "::":
+		return true
+	default:
+		return false
+	}
+}
+
+func errorMiddleware() gin.HandlerFunc {
+	return func(c *gin.Context) {
+		c.Next()
+		if len(c.Errors) == 0 || c.Writer.Written() {
+			return
+		}
+		core.RespondError(c, http.StatusInternalServerError, c.Errors.Last(), true)
+	}
+}
+
+func requestBodyLimitMiddleware(maxBytes int64) gin.HandlerFunc {
+	return requestBodyLimitMiddlewareWithUploadLimit(maxBytes, 0)
+}
+
+func requestBodyLimitMiddlewareWithUploadLimit(maxBytes int64, uploadMaxBytes int64) gin.HandlerFunc {
+	return func(c *gin.Context) {
+		if maxBytes <= 0 || c.Request == nil || c.Request.Body == nil || c.Request.Body == http.NoBody {
+			c.Next()
+			return
+		}
+		if !strings.HasPrefix(c.Request.URL.Path, "/api/") {
+			c.Next()
+			return
+		}
+		limit := maxBytes
+		if c.Request.Method == http.MethodPost && c.FullPath() == sessionAttachmentUploadRoutePath &&
+			uploadMaxBytes > 0 {
+			limit = uploadMaxBytes
+		}
+		if c.Request.ContentLength > limit {
+			core.RespondError(c, http.StatusRequestEntityTooLarge, errRequestBodyTooLarge, false)
+			c.Abort()
+			return
+		}
+		c.Request.Body = http.MaxBytesReader(c.Writer, c.Request.Body, limit)
+		c.Next()
+	}
+}
+
+func loopbackAPIGuard(boundHost string) gin.HandlerFunc {
+	return loopbackGuard(boundHost, errLoopbackAPIRequired, true)
+}
+
+func loopbackMutationGuard(boundHost string) gin.HandlerFunc {
+	return loopbackGuard(boundHost, errLoopbackMutationRequired, false)
+}
+
+func loopbackGuard(boundHost string, guardErr error, openAICompatible bool) gin.HandlerFunc {
+	allowed := isLoopbackHost(canonicalHost(boundHost))
+	return func(c *gin.Context) {
+		if allowed {
+			c.Next()
+			return
+		}
+		if openAICompatible && isOpenAICompatiblePath(c) {
+			core.RespondOpenAIError(c, http.StatusForbidden, guardErr, false)
+		} else {
+			core.RespondError(c, http.StatusForbidden, guardErr, false)
+		}
+		c.Abort()
+	}
+}
+
+func isOpenAICompatiblePath(c *gin.Context) bool {
+	if c == nil || c.Request == nil || c.Request.URL == nil {
+		return false
+	}
+	return strings.HasPrefix(c.Request.URL.Path, "/api/openai/")
+}

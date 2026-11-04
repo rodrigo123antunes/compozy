@@ -1,0 +1,214 @@
+import { useNavigate } from "@tanstack/react-router";
+
+import { useCurrentWindowLiveDataEnabled } from "../../hooks/use-window-live-data-enabled";
+import { useWindowBindingSearch } from "@/systems/workspace";
+import {
+  comparableGenerations,
+  type LoopDiffView,
+  type LoopRun,
+  type LoopRunDiffRouteSearch,
+  type LoopRunRecord,
+  LoopTimetravelError,
+  loopRunDiffQuery,
+  projectLoopDiff,
+  useLoopRun,
+  useLoopRunDiff,
+  useLoopRuns,
+} from "@/systems/loops";
+
+const SIBLING_RUN_LIMIT = 50;
+
+export type LoopRunDiffMode = "generation" | "run";
+
+export interface LoopRunDiffRunOption {
+  id: string;
+  label: string;
+}
+
+export interface LoopRunDiffPageModel {
+  againstGeneration: number | null;
+  againstRunId: string;
+  baseGeneration: number | null;
+
+  diffError?: string;
+  diffView: LoopDiffView | null;
+  generations: readonly number[];
+  goToLoop: () => void;
+  goToLoops: () => void;
+  goToRun: () => void;
+  goToRuns: () => void;
+
+  hasComparison: boolean;
+  isDiffLoading: boolean;
+  isRunLoading: boolean;
+  loopName: string;
+  mode: LoopRunDiffMode;
+  onAgainstGenerationChange: (generation: number) => void;
+  onAgainstRunChange: (runId: string) => void;
+  onBaseGenerationChange: (generation: number) => void;
+  onModeChange: (mode: LoopRunDiffMode) => void;
+  run?: LoopRunRecord;
+  runError: Error | null;
+  runOptions: LoopRunDiffRunOption[];
+}
+
+export function useLoopRunDiffPage(
+  workspaceId: string,
+  runId: string,
+  search: LoopRunDiffRouteSearch
+): LoopRunDiffPageModel {
+  const navigate = useNavigate();
+  const bindingSearch = useWindowBindingSearch();
+  const liveDataEnabled = useCurrentWindowLiveDataEnabled();
+  const runQuery = useLoopRun(workspaceId, runId, liveDataEnabled);
+  const run = runQuery.data?.run;
+  const loopName = run?.loop_name ?? "";
+  const generations = comparableGenerations(runQuery.data?.generations ?? []);
+
+  const siblingsQuery = useLoopRuns(
+    workspaceId,
+    { limit: SIBLING_RUN_LIMIT, loop: loopName },
+    liveDataEnabled && loopName !== ""
+  );
+  const runOptions = siblingRunOptions(siblingsQuery.data?.runs, runId);
+
+  const baseGeneration = resolveBaseGeneration(search, generations, run);
+  const query = loopRunDiffQuery(search);
+  const diffQuery = useLoopRunDiff(
+    workspaceId,
+    runId,
+    query ?? {},
+    query !== null && liveDataEnabled
+  );
+
+  const applySearch = (patch: LoopRunDiffRouteSearch) => {
+    void navigate({
+      params: { runId },
+      replace: true,
+      search: { ...search, ...patch },
+      to: "/loop-runs/$runId/diff",
+    });
+  };
+
+  return {
+    ...comparisonSelection(search),
+    ...comparisonView(query !== null, diffQuery, siblingsQuery.error),
+    baseGeneration,
+    generations,
+    goToLoop: () => {
+      void navigate({ params: { name: loopName }, search: bindingSearch, to: "/loops/$name" });
+    },
+    goToLoops: () => {
+      void navigate({ to: "/loops" });
+    },
+    goToRun: () => {
+      void navigate({ params: { runId }, search: bindingSearch, to: "/loop-runs/$runId" });
+    },
+    goToRuns: () => {
+      void navigate({ to: "/loop-runs" });
+    },
+    // A suspended window disables the read; waiting is not a missing run.
+    isRunLoading: workspaceId !== "" && runId !== "" && runQuery.isPending,
+    loopName,
+    onAgainstGenerationChange: generation => {
+      applySearch({
+        against_generation: generation,
+        against_run: undefined,
+        generation: baseGeneration ?? undefined,
+      });
+    },
+    onAgainstRunChange: againstRunId => {
+      applySearch({
+        against_generation: undefined,
+        against_run: againstRunId || undefined,
+        generation: baseGeneration ?? undefined,
+      });
+    },
+    onBaseGenerationChange: generation => {
+      applySearch({ generation });
+    },
+    onModeChange: mode => {
+      applySearch(
+        mode === "run"
+          ? {
+              against_generation: undefined,
+              against_run: runOptions[0]?.id,
+              generation: baseGeneration ?? undefined,
+            }
+          : {
+              against_generation: otherGeneration(generations, baseGeneration),
+              against_run: undefined,
+              generation: baseGeneration ?? undefined,
+            }
+      );
+    },
+    run,
+    runError: runQuery.error,
+    runOptions,
+  };
+}
+
+function resolveBaseGeneration(
+  search: LoopRunDiffRouteSearch,
+  generations: readonly number[],
+  run: LoopRunRecord | undefined
+): number | null {
+  return search.generation ?? generations[0] ?? run?.generation ?? null;
+}
+
+/** The comparison the route search currently names. */
+function comparisonSelection(
+  search: LoopRunDiffRouteSearch
+): Pick<LoopRunDiffPageModel, "againstGeneration" | "againstRunId" | "mode"> {
+  return {
+    againstGeneration: search.against_generation ?? null,
+    againstRunId: search.against_run ?? "",
+    mode: search.against_run === undefined ? "generation" : "run",
+  };
+}
+
+/** The diff read's projection; without a comparison nothing is loading or refused. */
+function comparisonView(
+  hasComparison: boolean,
+  diffQuery: ReturnType<typeof useLoopRunDiff>,
+  siblingsError: Error | null
+): Pick<LoopRunDiffPageModel, "diffError" | "diffView" | "hasComparison" | "isDiffLoading"> {
+  if (!hasComparison) {
+    return { diffError: undefined, diffView: null, hasComparison, isDiffLoading: false };
+  }
+  return {
+    diffError: diffRefusal(diffQuery.error) ?? diffRefusal(siblingsError),
+    diffView: diffQuery.data ? projectLoopDiff(diffQuery.data) : null,
+    hasComparison,
+    // "No comparison yet", not "fetching": a suspended window has not started the read.
+    isDiffLoading: diffQuery.isPending,
+  };
+}
+
+function siblingRunOptions(
+  runs: readonly LoopRun[] | undefined,
+  runId: string
+): LoopRunDiffRunOption[] {
+  const options: LoopRunDiffRunOption[] = [];
+  for (const entry of runs ?? []) {
+    if (entry.id === runId) continue;
+    options.push({ id: entry.id, label: `${entry.id} · generation ${entry.generation}` });
+  }
+  return options;
+}
+
+function diffRefusal(error: Error | null): string | undefined {
+  if (!error) {
+    return undefined;
+  }
+  return error instanceof LoopTimetravelError && error.code !== ""
+    ? `${error.code} · ${error.message}`
+    : error.message;
+}
+
+function otherGeneration(
+  generations: readonly number[],
+  baseGeneration: number | null
+): number | undefined {
+  return generations.find(generation => generation !== baseGeneration);
+}

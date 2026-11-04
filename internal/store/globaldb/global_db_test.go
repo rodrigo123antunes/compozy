@@ -1,0 +1,7870 @@
+package globaldb
+
+import (
+	"bytes"
+	"context"
+	"database/sql"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"io/fs"
+	"math"
+	"net/url"
+	"os"
+	"path/filepath"
+	"reflect"
+	"slices"
+	"strconv"
+	"strings"
+	"sync/atomic"
+	"testing"
+	"time"
+
+	"github.com/compozy/compozy/internal/workspaceaccess"
+
+	"github.com/compozy/compozy/internal/agentinstance"
+	automation "github.com/compozy/compozy/internal/automation/model"
+	"github.com/compozy/compozy/internal/extensionenv"
+	"github.com/compozy/compozy/internal/heartbeat"
+	looppkg "github.com/compozy/compozy/internal/loop"
+	"github.com/compozy/compozy/internal/loop/dsl"
+	mcpauth "github.com/compozy/compozy/internal/mcp/auth"
+	speedpkg "github.com/compozy/compozy/internal/speed"
+	"github.com/compozy/compozy/internal/store"
+	globalschema "github.com/compozy/compozy/internal/store/globaldb/schema"
+	"github.com/compozy/compozy/internal/store/sessiondb"
+	"github.com/compozy/compozy/internal/store/workspacedb"
+	taskpkg "github.com/compozy/compozy/internal/task"
+	"github.com/compozy/compozy/internal/testutil"
+	"github.com/compozy/compozy/internal/vault"
+	compozyworkspace "github.com/compozy/compozy/internal/workspace"
+	worktreepkg "github.com/compozy/compozy/internal/worktree"
+	"github.com/pressly/goose/v3"
+)
+
+func eventSummaryWithContent(summary EventSummary, content json.RawMessage) EventSummary {
+	summary.SetContent(content)
+	return summary
+}
+
+type SessionInfo = store.SessionInfo
+type SessionStateUpdate = store.SessionStateUpdate
+type SessionListQuery = store.SessionListQuery
+type EventSummary = store.EventSummary
+type EventSummaryQuery = store.EventSummaryQuery
+type TokenStats = store.TokenStats
+type TokenStatsUpdate = store.TokenStatsUpdate
+type TokenStatsQuery = store.TokenStatsQuery
+type PermissionLogEntry = store.PermissionLogEntry
+type PermissionLogQuery = store.PermissionLogQuery
+
+const GlobalDatabaseName = store.GlobalDatabaseName
+const defaultSessionType = "user"
+
+const globalDBExtensionProvenanceJSONKey = "provenance_json"
+const sqliteDriverName = "sqlite"
+
+var testGlobalDBCurrentSchemaSeedPath string
+var testGlobalDBMigrationTemplatePaths map[string]string
+
+func formatTimestamp(value time.Time) string {
+	return store.FormatTimestamp(value)
+}
+
+func sqliteDSN(path string) string {
+	return (&url.URL{Scheme: "file", Path: filepath.ToSlash(path)}).String()
+}
+
+func SessionMetaFile(sessionDir string) string {
+	return store.SessionMetaFile(sessionDir)
+}
+
+func ReadSessionMeta(path string) (store.SessionMeta, error) {
+	return store.ReadSessionMeta(path)
+}
+
+func TestMain(m *testing.M) {
+	code := runGlobalDBTests(m)
+	os.Exit(code)
+}
+
+func runGlobalDBTests(m *testing.M) (code int) {
+	dir, err := os.MkdirTemp("", "compozy-globaldb-current-schema-*")
+	if err != nil {
+		reportTestMainError("MkdirTemp(globaldb seed) error = %v", err)
+		return 1
+	}
+	defer func() {
+		if err := os.RemoveAll(dir); err != nil {
+			reportTestMainError("RemoveAll(globaldb seed) error = %v", err)
+			if code == 0 {
+				code = 1
+			}
+		}
+	}()
+
+	ctx := context.Background()
+	_, migrationTemplates, err := buildGlobalMigrationTestSeeds(ctx, dir)
+	if err != nil {
+		reportTestMainError("build global migration seeds error = %v", err)
+		return 1
+	}
+	// Historical SQL prefixes remain migration fixtures. The current family is
+	// created by its production owner, including the cross-file identity.
+	path := filepath.Join(dir, "current-"+GlobalDatabaseName)
+	globalDB, err := OpenGlobalDB(ctx, path)
+	if err != nil {
+		reportTestMainError("OpenGlobalDB(globaldb seed) error = %v", err)
+		return 1
+	}
+	if err := globalDB.Close(ctx); err != nil {
+		reportTestMainError("Close(globaldb seed) error = %v", err)
+		return 1
+	}
+
+	testGlobalDBCurrentSchemaSeedPath = path
+	testGlobalDBMigrationTemplatePaths = migrationTemplates
+	return m.Run()
+}
+
+func reportTestMainError(format string, args ...any) {
+	if _, err := fmt.Fprintf(os.Stderr, format+"\n", args...); err != nil {
+		panic(err)
+	}
+}
+
+func TestOpenGlobalDBAppliesGlobalMigrationsAndEnablesWAL(t *testing.T) {
+	t.Parallel()
+	t.Run("Should keep request reads independent of an exhausted writer pool", func(t *testing.T) {
+		t.Parallel()
+		g := openTestGlobalDB(t)
+		workspaceID := registerWorkspaceForGlobalTests(t, g, "read-isolation", t.TempDir())
+		g.db.SetMaxOpenConns(1)
+		conn, err := g.db.Conn(t.Context())
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer func() {
+			if err := conn.Close(); err != nil {
+				t.Error(err)
+			}
+		}()
+		if _, err := conn.ExecContext(t.Context(), "BEGIN IMMEDIATE"); err != nil {
+			t.Fatal(err)
+		}
+		defer func() {
+			if _, err := conn.ExecContext(testutil.Context(t), "ROLLBACK"); err != nil {
+				t.Error(err)
+			}
+		}()
+		ctx, cancel := context.WithTimeout(t.Context(), time.Second)
+		defer cancel()
+		workspace, err := g.GetWorkspace(ctx, workspaceID)
+		if err != nil || workspace.ID != workspaceID {
+			t.Fatalf("workspace read while writer held: %+v, %v", workspace, err)
+		}
+		page, err := g.PageSessions(ctx, store.SessionCatalogPageQuery{
+			ReadScope: store.ReadScope{ProfileID: store.DefaultProfileID}, Limit: 30, Sort: sessionCatalogSortRecent,
+		})
+		if err != nil || len(page.Sessions) != 0 || page.Total != 0 {
+			t.Fatalf("catalog read while writer held: %+v, %v", page, err)
+		}
+		if _, err := g.GetSessionHealth(ctx, "missing-session"); !errors.Is(err, heartbeat.ErrSessionHealthNotFound) {
+			t.Fatalf("health read while writer held: %v", err)
+		}
+		if _, err := g.readDB.ExecContext(ctx, "DELETE FROM workspaces"); err == nil {
+			t.Fatal("read pool allowed a mutation")
+		}
+	})
+
+	t.Run("Should verify the permanent default profile without repairing invalid identity", func(t *testing.T) {
+		t.Parallel()
+
+		globalDB := openFreshTestGlobalDB(t)
+		ctx := testutil.Context(t)
+		if err := globalDB.VerifyDefaultProfile(ctx); err != nil {
+			t.Fatalf("VerifyDefaultProfile() error = %v", err)
+		}
+		var handoffTables int
+		if err := globalDB.db.QueryRowContext(
+			ctx,
+			`SELECT COUNT(*) FROM sqlite_master
+			 WHERE type = 'table' AND name = 'phase0_operator_home_context'`,
+		).Scan(&handoffTables); err != nil {
+			t.Fatalf("inspect operator-home handoff table error = %v", err)
+		}
+		if handoffTables != 0 {
+			t.Fatalf("operator-home handoff table count = %d, want migration-only state", handoffTables)
+		}
+		if _, err := globalDB.db.ExecContext(
+			ctx,
+			`UPDATE profiles SET name = 'renamed-default' WHERE id = ?`,
+			store.DefaultProfileID,
+		); err != nil {
+			t.Fatalf("corrupt default profile fixture error = %v", err)
+		}
+		if err := globalDB.VerifyDefaultProfile(ctx); err == nil || !strings.Contains(
+			err.Error(),
+			"does not match the permanent identity",
+		) {
+			t.Fatalf("VerifyDefaultProfile(corrupt) error = %v, want permanent identity mismatch", err)
+		}
+		var name string
+		if err := globalDB.db.QueryRowContext(
+			ctx,
+			`SELECT name FROM profiles WHERE id = ?`,
+			store.DefaultProfileID,
+		).Scan(&name); err != nil {
+			t.Fatalf("read corrupt default profile error = %v", err)
+		}
+		if name != "renamed-default" {
+			t.Fatalf("VerifyDefaultProfile() repaired name = %q, want verify-only state", name)
+		}
+	})
+
+	for _, tc := range []struct {
+		name  string
+		query string
+		want  string
+	}{
+		{name: "Should reject a missing permanent default profile", query: `DELETE FROM profiles WHERE id = ?`, want: "default profile seed is missing"},
+		{name: "Should reject an archived permanent default profile", query: `UPDATE profiles SET state = 'archived', archived_at = '2026-10-28T12:00:00Z' WHERE id = ?`, want: "does not match the permanent identity"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			ctx := t.Context()
+			globalDB := openFreshTestGlobalDB(t)
+			if _, err := globalDB.db.ExecContext(ctx, tc.query, store.DefaultProfileID); err != nil {
+				t.Fatalf("prepare invalid default profile: %v", err)
+			}
+			if err := globalDB.VerifyDefaultProfile(ctx); err == nil || !strings.Contains(err.Error(), tc.want) {
+				t.Fatalf("VerifyDefaultProfile() = %v, want %q", err, tc.want)
+			}
+		})
+	}
+
+	for _, tc := range []struct {
+		name  string
+		color string
+		icon  sql.NullString
+		emoji sql.NullString
+	}{
+		{name: "Should preserve customized default profile color", color: "#4cb782", icon: sql.NullString{String: "circle", Valid: true}},
+		{name: "Should preserve customized default profile icon", color: "#8E8EB5", icon: sql.NullString{String: "apple", Valid: true}},
+		{name: "Should preserve customized default profile color and icon", color: "#4cb782", icon: sql.NullString{String: "apple", Valid: true}},
+		{name: "Should preserve customized default profile emoji", color: "#4cb782", emoji: sql.NullString{String: "🍎", Valid: true}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			ctx := t.Context()
+			path := filepath.Join(t.TempDir(), GlobalDatabaseName)
+			globalDB := openGlobalDBForTest(t, path)
+			if _, err := globalDB.db.ExecContext(ctx,
+				`UPDATE profiles SET color = ?, icon = ?, emoji = ? WHERE id = ?`,
+				tc.color, tc.icon, tc.emoji, store.DefaultProfileID,
+			); err != nil {
+				t.Fatalf("customize default profile: %v", err)
+			}
+			if err := globalDB.Close(ctx); err != nil {
+				t.Fatalf("close customized database: %v", err)
+			}
+			reopened := openGlobalDBForTest(t, path)
+			if err := reopened.VerifyDefaultProfile(ctx); err != nil {
+				t.Fatalf("verify customized default profile after reopen: %v", err)
+			}
+			var color string
+			var icon, emoji sql.NullString
+			if err := reopened.db.QueryRowContext(ctx,
+				`SELECT color, icon, emoji FROM profiles WHERE id = ?`, store.DefaultProfileID,
+			).Scan(&color, &icon, &emoji); err != nil {
+				t.Fatalf("read customized default profile: %v", err)
+			}
+			if color != tc.color || icon != tc.icon || emoji != tc.emoji {
+				t.Fatalf(
+					"presentation = (%q, %+v, %+v), want (%q, %+v, %+v)",
+					color,
+					icon,
+					emoji,
+					tc.color,
+					tc.icon,
+					tc.emoji,
+				)
+			}
+		})
+	}
+
+	t.Run("Should apply the complete global migration stream before repository use", func(t *testing.T) {
+		t.Parallel()
+
+		globalDB := openFreshTestGlobalDB(t)
+
+		assertTablesPresent(
+			t,
+			globalDB.db,
+			globalMigrationVersionTable,
+			"workspaces",
+			"sessions",
+			"session_pending_interactions",
+			"event_summary_outbox",
+			"telemetry_deleted_scopes",
+			"token_stats",
+			"permission_log",
+			"extensions",
+			"extension_dev_links",
+			"config_apply_records",
+			"scheduler_pause",
+			"task_run_terminal_commands",
+			"worktrees",
+			"worktree_status",
+			"worktree_forge_status_legacy",
+			"forge_pull_requests",
+			"worktree_exit_ops",
+		)
+		assertTableHasColumns(t, globalDB.db, "sessions", []string{
+			"worktree_id",
+			"notify_creator",
+			"pending_permission_count",
+			"pending_clarify_count",
+			"attention_revision",
+			"last_settled_revision",
+			"last_seen_revision",
+			"last_seen_at",
+			"attention_changed_at",
+		})
+		assertTableHasColumns(t, globalDB.db, "session_pending_interactions", []string{
+			"interaction_id",
+			"session_id",
+			"kind",
+			"provider_request_id",
+			"payload_json",
+			"status",
+			"resolution",
+		})
+		assertIndexesPresent(
+			t,
+			globalDB.db,
+			"session_pending_interactions",
+			"idx_session_pending_interactions_session_status",
+			"uq_session_pending_interactions_active_provider_request",
+		)
+		assertTableHasColumns(t, globalDB.telemetry.DB(), "event_summaries", []string{"worktree_id"})
+		assertTableHasColumns(t, globalDB.db, "extensions", []string{"format", "ingest_diagnostics_json"})
+		assertTableHasColumns(
+			t,
+			globalDB.db,
+			"extension_dev_links",
+			[]string{"format", "ingest_diagnostics_json"},
+		)
+		assertTableHasColumns(t, globalDB.db, "extension_env_bindings", []string{"mcp_server", "header_name"})
+		for _, table := range []string{"sessions", "task_runs", "loop_runs"} {
+			assertTableExcludesColumns(t, globalDB.db, table, []string{
+				"network_spec_json",
+				"network_mode",
+				"network_channel",
+				"network_source",
+			})
+		}
+		assertTableExcludesColumns(t, globalDB.db, "sessions", []string{"channel"})
+		assertTableExcludesColumns(t, globalDB.db, "task_runs", []string{"coordination_channel_id"})
+		assertTableHasColumns(t, globalDB.telemetry.DB(), "event_summaries", []string{
+			"provider",
+			"outcome",
+		})
+		assertTableHasColumns(t, globalDB.db, "model_catalog_rows", []string{
+			"cost_cache_read_per_million",
+			"cost_cache_write_per_million",
+			"cost_reasoning_per_million",
+		})
+		for _, absent := range []string{"schema_migrations", "memory_events", "goose_db_version_memory", "worktree_forge_status"} {
+			exists, err := tableExists(testutil.Context(t), globalDB.db, absent)
+			if err != nil {
+				t.Fatalf("tableExists(%q) error = %v", absent, err)
+			}
+			if exists {
+				t.Fatalf("global stream unexpectedly owns table %q", absent)
+			}
+		}
+		assertTableColumns(t, globalDB.db, "config_apply_records", []string{
+			"id",
+			"desired_config_hash",
+			"active_config_hash",
+			"generation",
+			"actor",
+			"write_target",
+			"write_path",
+			"diff_class",
+			"status",
+			"diagnostic_json",
+			"created_at",
+			"applied_at",
+			"updated_at",
+		})
+		assertIndexesPresent(
+			t,
+			globalDB.db,
+			"config_apply_records",
+			"idx_config_apply_records_desired",
+			"idx_config_apply_records_active",
+			"idx_config_apply_records_generation",
+			"idx_config_apply_records_actor",
+			"idx_config_apply_records_status",
+		)
+		assertTableColumns(t, globalDB.db, "task_run_terminal_commands", []string{
+			"command_id",
+			"run_id",
+			"task_id",
+			"workspace_id",
+			"kind",
+			"phase",
+			"source_status",
+			"source_session_id",
+			"source_claim_token_hash",
+			"source_lease_until",
+			"intent_json",
+			"actor_json",
+			"command_at",
+			"admitted_at",
+			"updated_at",
+		})
+		assertIndexesPresent(
+			t,
+			globalDB.db,
+			"task_run_terminal_commands",
+			"idx_task_run_terminal_commands_phase",
+		)
+		var terminalGuardCount int
+		if err := globalDB.db.QueryRowContext(
+			testutil.Context(t),
+			`SELECT COUNT(*) FROM sqlite_master
+			 WHERE type = 'trigger'
+			   AND name IN (
+				   'trg_task_runs_terminal_command_guard',
+				   'trg_task_runs_terminal_command_delete_guard',
+				   'trg_tasks_terminal_command_delete_guard'
+			   )`,
+		).Scan(&terminalGuardCount); err != nil {
+			t.Fatalf("query terminal command guard trigger error = %v", err)
+		}
+		if terminalGuardCount != 3 {
+			t.Fatalf("terminal command guard trigger count = %d, want 3", terminalGuardCount)
+		}
+		assertJournalModeWAL(t, globalDB.db)
+		assertSynchronousNormal(t, globalDB.db)
+		status, err := store.Status(testutil.Context(t), globalDB.db, MigrationStream())
+		if err != nil {
+			t.Fatalf("Status(global) error = %v", err)
+		}
+		assertCompleteMigrationStream(t, status, MigrationStream())
+		workspaces, err := globalDB.ListWorkspaces(testutil.Context(t))
+		if err != nil {
+			t.Fatalf("ListWorkspaces() error = %v", err)
+		}
+		if len(workspaces) != 0 {
+			t.Fatalf("ListWorkspaces() = %#v, want empty fresh repository", workspaces)
+		}
+	})
+}
+
+func TestGlobalDBRepositoryComposition(t *testing.T) {
+	t.Run("Should expose unique repository methods without lifecycle ownership", func(t *testing.T) {
+		t.Parallel()
+
+		facadeType := reflect.TypeFor[GlobalDB]()
+		methodOwners := make(map[string]string)
+		repositoryCount := 0
+		for field := range facadeType.Fields() {
+			if !isRepositoryField(field) {
+				continue
+			}
+			repositoryCount++
+			repositoryType := field.Type
+			for method := range repositoryType.Methods() {
+				if method.Name == "Close" || method.Name == "Path" || method.Name == "Checkpoint" {
+					t.Fatalf("repository %s owns facade lifecycle method %s", field.Name, method.Name)
+				}
+				if owner, exists := methodOwners[method.Name]; exists {
+					t.Fatalf("repository method %s is ambiguous between %s and %s", method.Name, owner, field.Name)
+				}
+				methodOwners[method.Name] = field.Name
+			}
+		}
+		if repositoryCount == 0 {
+			t.Fatal("repository reflection found no embedded repositories")
+		}
+	})
+
+	t.Run("Should initialize every embedded repository after open", func(t *testing.T) {
+		t.Parallel()
+
+		globalDB := openTestGlobalDB(t)
+		facadeType := reflect.TypeFor[GlobalDB]()
+		facadeValue := reflect.ValueOf(globalDB).Elem()
+		for field := range facadeType.Fields() {
+			if !isRepositoryField(field) {
+				continue
+			}
+			if facadeValue.FieldByIndex(field.Index).IsNil() {
+				t.Fatalf("embedded repository %s is nil after OpenGlobalDB", field.Name)
+			}
+		}
+	})
+}
+
+func isRepositoryField(field reflect.StructField) bool {
+	return field.Anonymous &&
+		field.Type.Kind() == reflect.Pointer &&
+		strings.HasSuffix(field.Type.Elem().Name(), "Repo")
+}
+
+func TestOpenGlobalDBReopenPreservesRowsAndStatus(t *testing.T) {
+	// IT-024: v0.4.8 ends at migration 163. Preserve its heartbeat wake state,
+	// permission history and automation trigger through the real upgrade and reopen.
+	t.Run("Should preserve script approvals through cascade migration and reopen", func(t *testing.T) {
+		t.Parallel()
+		ctx := globalMigrationTestContext(t)
+		path := filepath.Join(t.TempDir(), GlobalDatabaseName)
+		prior, err := openGlobalMigrationPrefixDatabase(t, path, globalMigrationPrefixBefore(t, "00188_schema.sql"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := prior.ExecContext(
+			ctx,
+			`INSERT INTO heartbeat_source_script_approvals VALUES ('00000000000000000000000000','/definition','poll','approved-hash','2026-11-03','cli')`,
+		); err != nil {
+			t.Fatal(err)
+		}
+		if err := prior.Close(); err != nil {
+			t.Fatal(err)
+		}
+		for range 2 {
+			db := openGlobalDBForTest(t, path)
+			var hash string
+			if err := db.DB().
+				QueryRowContext(ctx, `SELECT sha256 FROM heartbeat_source_script_approvals WHERE script_name='poll'`).
+				Scan(&hash); err != nil ||
+				hash != "approved-hash" {
+				t.Fatalf("hash=%s err=%v", hash, err)
+			}
+			assertGlobalMigrationIntegrity(ctx, t, db.DB())
+			if err := db.Close(ctx); err != nil {
+				t.Fatal(err)
+			}
+		}
+	})
+	t.Run("Should preserve v0.4.8 wake permission and trigger data through hardening", func(t *testing.T) {
+		t.Parallel()
+		ctx := globalMigrationTestContext(t)
+		path := filepath.Join(t.TempDir(), GlobalDatabaseName)
+		prior, err := openGlobalMigrationPrefixDatabase(t, path, globalMigrationPrefixBefore(t, "00164_schema.sql"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, statement := range []string{
+			`INSERT INTO workspaces(id,root_dir,name,created_at,updated_at) VALUES ('upgrade-ws','/upgrade-ws','Upgrade','2026-11-01T00:00:00Z','2026-11-01T00:00:00Z')`,
+			`INSERT INTO sessions(id,profile_id,agent_name,workspace_id,state,created_at,updated_at) VALUES ('upgrade-session','00000000000000000000000000','coder','upgrade-ws','stopped','2026-11-01T00:00:00Z','2026-11-01T00:00:00Z')`,
+			`INSERT INTO agent_heartbeat_wake_state(workspace_id,agent_name,session_id,last_wake_at,next_allowed_at,coalesced_count,last_result,last_reason,updated_at) VALUES ('upgrade-ws','coder','upgrade-session','2026-11-01T01:00:00Z','2026-11-04T00:00:00Z',7,'sent','wake_sent','2026-11-01T01:00:00Z')`,
+			`INSERT INTO permission_log(id,session_id,agent_name,action,resource,decision,policy_used,timestamp) VALUES ('upgrade-permission','upgrade-session','coder','edit','docs/guide.md','allow_once','operator','2026-11-01T01:00:00Z')`,
+			`INSERT INTO automation_triggers(id,profile_id,scope,name,agent_name,prompt,event,enabled,retry,fire_limit,source,target_kind,created_at,updated_at) VALUES ('upgrade-trigger','00000000000000000000000000','global','Upgrade trigger','coder','Review event','webhook',1,'{}','{}','dynamic','agent','2026-11-01T00:00:00Z','2026-11-01T00:00:00Z')`,
+		} {
+			if _, err := prior.ExecContext(ctx, statement); err != nil {
+				_ = prior.Close()
+				t.Fatal(err)
+			}
+		}
+		if err := prior.Close(); err != nil {
+			t.Fatal(err)
+		}
+		for pass := range 2 {
+			upgraded := openGlobalDBForTest(t, path)
+			var next, resource, scope string
+			var count int64
+			if err := upgraded.DB().
+				QueryRowContext(ctx, `SELECT next_allowed_at,coalesced_count FROM agent_heartbeat_wake_state WHERE session_id='upgrade-session'`).
+				Scan(&next, &count); err != nil {
+				t.Fatal(err)
+			}
+			if next != "2026-11-04T00:00:00Z" || count != 7 {
+				t.Fatalf("wake after reopen %d=%q/%d", pass, next, count)
+			}
+			if err := upgraded.DB().
+				QueryRowContext(ctx, `SELECT resource FROM permission_log WHERE id='upgrade-permission'`).
+				Scan(&resource); err != nil ||
+				resource != "docs/guide.md" {
+				t.Fatalf("permission=%q %v", resource, err)
+			}
+			if err := upgraded.DB().
+				QueryRowContext(ctx, `SELECT target_instance_scope FROM automation_triggers WHERE id='upgrade-trigger'`).
+				Scan(&scope); err != nil ||
+				scope != "" {
+				t.Fatalf("trigger=%q %v", scope, err)
+			}
+			assertGlobalMigrationIntegrity(ctx, t, upgraded.DB())
+			if err := upgraded.Close(ctx); err != nil {
+				t.Fatal(err)
+			}
+		}
+	})
+	t.Run("Should preserve instance wakes and reports while adding exhaustion rotation state", func(t *testing.T) {
+		t.Parallel()
+		ctx := globalMigrationTestContext(t)
+		path := filepath.Join(t.TempDir(), GlobalDatabaseName)
+		prior, err := openGlobalMigrationPrefixDatabase(t, path, globalMigrationPrefixBefore(t, "00179_schema.sql"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() {
+			if err := prior.Close(); err != nil {
+				t.Error(err)
+			}
+		})
+		for _, statement := range []string{
+			`INSERT INTO agent_instances (id,profile_id,agent_name,state,created_by_kind,created_by_id,created_at,updated_at)
+ VALUES ('retained-instance','00000000000000000000000000','coder','active','human','operator','2026-11-03T00:00:00Z','2026-11-03T00:00:00Z')`,
+			`INSERT INTO agent_instance_wake_state (instance_id,next_wake_at,last_digest,quiet_streak)
+ VALUES ('retained-instance','2026-11-04T00:00:00Z','retained-digest',3)`,
+			`INSERT INTO agent_instance_reports (id,instance_id,source_key,kind,payload,created_at)
+ VALUES ('retained-report','retained-instance','retained-source','failure','{"reason":"retained"}','2026-11-03T00:00:00Z')`,
+		} {
+			if _, err := prior.ExecContext(ctx, statement); err != nil {
+				t.Fatal(err)
+			}
+		}
+		if err := prior.Close(); err != nil {
+			t.Fatal(err)
+		}
+		upgraded := openGlobalDBForTest(t, path)
+		state, err := upgraded.Instances().WakeState(ctx, "retained-instance")
+		if err != nil || state.RotationDueSession != "" || state.NextWakeAt != "2026-11-04T00:00:00Z" ||
+			state.LastDigest != "retained-digest" || state.QuietStreak != 3 {
+			t.Fatalf("upgraded wake = %+v, %v", state, err)
+		}
+		reports, err := upgraded.InstanceReports().
+			ListReports(ctx, agentinstance.ReportQuery{InstanceID: "retained-instance", Limit: 100})
+		if err != nil || len(reports) != 1 || reports[0].ID != "retained-report" {
+			t.Fatalf("upgraded reports = %+v, %v", reports, err)
+		}
+	})
+
+	// Invariant: closing preserves committed rows without waiting for an external reader's snapshot.
+	t.Run("Should close with a retained reader and preserve committed metadata across reopen", func(t *testing.T) {
+		t.Parallel()
+		ctx := t.Context()
+		globalDB := openTestGlobalDB(t)
+		const key = "close.snapshot"
+		if err := globalDB.SetAppMetadata(ctx, key, "before"); err != nil {
+			t.Fatal(err)
+		}
+		externalDB, err := sql.Open(sqliteDriverName, sqliteDSN(globalDB.Path()))
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() {
+			if err := externalDB.Close(); err != nil {
+				t.Error(err)
+			}
+		})
+		reader, err := externalDB.BeginTx(ctx, &sql.TxOptions{ReadOnly: true})
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() {
+			if err := reader.Rollback(); err != nil && !errors.Is(err, sql.ErrTxDone) {
+				t.Error(err)
+			}
+		})
+		var snapshot string
+		if err := reader.QueryRowContext(ctx, "SELECT value FROM app_metadata WHERE key = ?", key).
+			Scan(&snapshot); err != nil || snapshot != "before" {
+			t.Fatalf("initial reader snapshot = %q, error = %v, want before", snapshot, err)
+		}
+		if err := globalDB.SetAppMetadata(ctx, key, "after"); err != nil {
+			t.Fatal(err)
+		}
+		closeCtx, cancel := context.WithTimeout(ctx, time.Second)
+		defer cancel()
+		if err := globalDB.Close(closeCtx); err != nil {
+			t.Fatalf("Close with retained reader error = %v", err)
+		}
+		if err := reader.QueryRowContext(ctx, "SELECT value FROM app_metadata WHERE key = ?", key).
+			Scan(&snapshot); err != nil || snapshot != "before" {
+			t.Fatalf("retained reader snapshot = %q, error = %v, want before", snapshot, err)
+		}
+		if err := reader.Rollback(); err != nil {
+			t.Fatal(err)
+		}
+		reopened := openGlobalDBForTest(t, globalDB.Path())
+		value, found, err := reopened.GetAppMetadata(ctx, key)
+		if err != nil || !found || value != "after" {
+			t.Fatalf("metadata after reopen = %q, found = %t, error = %v, want after", value, found, err)
+		}
+	})
+
+	// Invariant: adding the Goal batch boundary preserves authored queue state across upgrade and reopen.
+	t.Run("Should preserve queued inputs while adding Goal batch boundaries", func(t *testing.T) {
+		t.Parallel()
+		ctx := globalMigrationTestContext(t)
+		path := filepath.Join(t.TempDir(), GlobalDatabaseName)
+		prior, err := openGlobalMigrationPrefixDatabase(t, path, globalMigrationPrefixBefore(t, "00137_schema.sql"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() {
+			if err := prior.Close(); err != nil {
+				t.Error(err)
+			}
+		})
+		for _, statement := range []string{
+			`INSERT INTO workspaces (id, root_dir, name, created_at, updated_at)
+			 VALUES ('queue-ws', '/queue', 'queue', '2026-10-16', '2026-10-16')`,
+			`INSERT INTO sessions (id, profile_id, agent_name, workspace_id, state, created_at, updated_at)
+			 VALUES ('queue-session', '00000000000000000000000000', 'coder', 'queue-ws', 'stopped', '2026-10-16', '2026-10-16')`,
+			`INSERT INTO session_input_queue (id, session_id, status, mode, text, origin_json, runtime_provider, enqueued_at, updated_at)
+			 VALUES ('queue-input', 'queue-session', 'queued', 'queue', 'Retained message', '{"sender_session_id":"sender"}', 'codex', '2026-10-16', '2026-10-16')`,
+		} {
+			if _, err := prior.ExecContext(ctx, statement); err != nil {
+				t.Fatal(err)
+			}
+		}
+		const retained = `SELECT json_array(text,status,mode,origin_json,runtime_provider,enqueued_at,updated_at)
+			FROM session_input_queue WHERE id='queue-input'`
+		var before string
+		if err := prior.QueryRowContext(ctx, retained).Scan(&before); err != nil {
+			t.Fatal(err)
+		}
+		if err := prior.Close(); err != nil {
+			t.Fatal(err)
+		}
+		for range 2 {
+			upgraded, err := openGlobalMigrationUpgrade(t, path)
+			if err != nil {
+				t.Fatal(err)
+			}
+			var after string
+			var boundary sql.NullInt64
+			if err := upgraded.db.QueryRowContext(ctx, retained).Scan(&after); err != nil {
+				t.Fatal(err)
+			}
+			if err := upgraded.db.QueryRowContext(ctx,
+				`SELECT goal_input_batch_max_rowid FROM session_input_queue WHERE id='queue-input'`,
+			).Scan(&boundary); err != nil {
+				t.Fatal(err)
+			}
+			if after != before || boundary.Valid {
+				t.Fatalf("queue changed across upgrade: before %s, after %s, boundary %#v", before, after, boundary)
+			}
+			if err := upgraded.Close(ctx); err != nil {
+				t.Fatal(err)
+			}
+		}
+	})
+	// Invariant: classifying queue origins and widening reply-watch outcomes keeps every row across upgrade.
+	t.Run("Should keep rowids, Goal cutoffs and reply watches across 00138", func(t *testing.T) {
+		t.Parallel()
+		ctx := globalMigrationTestContext(t)
+		path := filepath.Join(t.TempDir(), GlobalDatabaseName)
+		prior, err := openGlobalMigrationPrefixDatabase(t, path, globalMigrationPrefixBefore(t, "00138_schema.sql"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() {
+			if err := prior.Close(); err != nil {
+				t.Error(err)
+			}
+		})
+		for _, statement := range []string{
+			`INSERT INTO workspaces (id, root_dir, name, created_at, updated_at)
+			 VALUES ('origin-ws', '/origin', 'origin', '2026-10-16', '2026-10-16')`,
+			`INSERT INTO sessions (id, profile_id, agent_name, workspace_id, state, created_at, updated_at)
+			 VALUES ('origin-session', '00000000000000000000000000', 'coder', 'origin-ws', 'stopped', '2026-10-16', '2026-10-16')`,
+			`INSERT INTO session_input_queue (id, session_id, status, mode, text, enqueued_at, updated_at)
+			 VALUES ('human-input', 'origin-session', 'queued', 'queue', 'Human message', '2026-10-16', '2026-10-16')`,
+			// A deleted row leaves a rowid gap; Goal batch cutoffs refer to rowids, so the rebuild must keep them.
+			`INSERT INTO session_input_queue (id, session_id, status, mode, text, enqueued_at, updated_at)
+			 VALUES ('deleted-input', 'origin-session', 'queued', 'queue', 'Deleted', '2026-10-16', '2026-10-16')`,
+			`INSERT INTO session_input_queue (id, session_id, status, mode, text, origin_json, enqueued_at, updated_at)
+			 VALUES ('agent-input', 'origin-session', 'queued', 'queue', 'Agent message',
+			         '{"kind":"session","session_id":"sess-sender","workspace_id":"origin-ws","hop":1}', '2026-10-16', '2026-10-16')`,
+			`INSERT INTO session_input_queue (id, session_id, status, mode, text, owner_kind, priority, enqueued_at, updated_at)
+			 VALUES ('wake-input', 'origin-session', 'queued', 'queue', 'Wake', 'synthetic', 1, '2026-10-16', '2026-10-16')`,
+			`DELETE FROM session_input_queue WHERE id = 'deleted-input'`,
+			`UPDATE session_input_queue SET goal_input_batch_max_rowid = (
+			   SELECT rowid FROM session_input_queue WHERE id = 'agent-input') WHERE id = 'human-input'`,
+			`INSERT INTO session_prompt_reply_watches (id, workspace_id, sender_session_id, target_workspace_id,
+			   target_session_id, message_id, admission_id, hop, state, outcome, created_at)
+			 VALUES ('watch-1', 'origin-ws', 'sess-sender', 'origin-ws', 'origin-session', 'msg-1', 'adm-1', 1,
+			   'fired', 'unknown', '2026-10-16')`,
+		} {
+			if _, err := prior.ExecContext(ctx, statement); err != nil {
+				t.Fatal(err)
+			}
+		}
+		const retainedQueue = `SELECT json_group_array(json_array(rowid, id, text, status, origin_json, owner_kind, priority,
+			goal_input_batch_max_rowid)) FROM (SELECT rowid, * FROM session_input_queue ORDER BY id)`
+		const retainedWatches = `SELECT json_group_array(json_array(id, state, outcome, sender_session_id, message_id))
+			FROM session_prompt_reply_watches`
+		var beforeQueue, beforeWatches string
+		if err := prior.QueryRowContext(ctx, retainedQueue).Scan(&beforeQueue); err != nil {
+			t.Fatal(err)
+		}
+		if err := prior.QueryRowContext(ctx, retainedWatches).Scan(&beforeWatches); err != nil {
+			t.Fatal(err)
+		}
+		if err := prior.Close(); err != nil {
+			t.Fatal(err)
+		}
+		for range 2 {
+			upgraded, err := openGlobalMigrationUpgrade(t, path)
+			if err != nil {
+				t.Fatal(err)
+			}
+			var afterQueue, afterWatches, classes string
+			if err := upgraded.db.QueryRowContext(ctx, retainedQueue).Scan(&afterQueue); err != nil {
+				t.Fatal(err)
+			}
+			if err := upgraded.db.QueryRowContext(ctx, retainedWatches).Scan(&afterWatches); err != nil {
+				t.Fatal(err)
+			}
+			if err := upgraded.db.QueryRowContext(ctx, `SELECT json_group_array(json_array(id, origin_class, origin_session_id))
+				FROM (SELECT * FROM session_input_queue ORDER BY id)`).
+				Scan(&classes); err != nil {
+				t.Fatal(err)
+			}
+			if afterQueue != beforeQueue || afterWatches != beforeWatches {
+				t.Fatalf("rows changed across upgrade: queue %s -> %s, watches %s -> %s",
+					beforeQueue, afterQueue, beforeWatches, afterWatches)
+			}
+			const wantClasses = `[["agent-input","agent","sess-sender"],["human-input","human",""],["wake-input","synthetic",""]]`
+			if classes != wantClasses {
+				t.Fatalf("origin classes = %s, want %s", classes, wantClasses)
+			}
+			for _, outcome := range []string{"expired", "unknown"} {
+				if _, err := upgraded.db.ExecContext(ctx,
+					`UPDATE session_prompt_reply_watches SET outcome = ? WHERE id = 'watch-1'`, outcome,
+				); err != nil {
+					t.Fatalf("outcome %q rejected after upgrade: %v", outcome, err)
+				}
+			}
+			if err := upgraded.Close(ctx); err != nil {
+				t.Fatal(err)
+			}
+		}
+	})
+	// Invariant: adding mentions_json and human_ingress keeps every admission and queue row and defaults
+	// them to no mentions and unknown (not human) authorship.
+	t.Run("Should keep admissions and queue rows with empty mentions across 00142 and 00143", func(t *testing.T) {
+		t.Parallel()
+		ctx := globalMigrationTestContext(t)
+		path := filepath.Join(t.TempDir(), GlobalDatabaseName)
+		prior, err := openGlobalMigrationPrefixDatabase(t, path, globalMigrationPrefixBefore(t, "00142_schema.sql"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() {
+			if err := prior.Close(); err != nil {
+				t.Error(err)
+			}
+		})
+		for _, statement := range []string{
+			`INSERT INTO workspaces (id, root_dir, name, created_at, updated_at)
+			 VALUES ('mention-ws', '/mention', 'mention', '2026-10-19', '2026-10-19')`,
+			`INSERT INTO sessions (id, profile_id, agent_name, workspace_id, state, created_at, updated_at)
+			 VALUES ('mention-session', '00000000000000000000000000', 'coder', 'mention-ws', 'stopped', '2026-10-19', '2026-10-19')`,
+			`INSERT INTO session_prompt_admissions (id, workspace_id, session_id, message_id, idempotency_key, operation,
+			   fingerprint_version, request_fingerprint, state, authored_text, skill_invocations_json, turn_id, event_id,
+			   created_at, updated_at)
+			 VALUES ('mention-admission', 'mention-ws', 'mention-session', 'msg-1', 'key-1', 'prompt', 'v1', 'fp',
+			   'reserved', 'Read @docs/a.md', '[{"name":"review"}]', 'turn-1', 'event-1', '2026-10-19', '2026-10-19')`,
+			`INSERT INTO session_input_queue (id, session_id, prompt_admission_id, status, mode, text, enqueued_at, updated_at)
+			 VALUES ('mention-input', 'mention-session', 'mention-admission', 'queued', 'queue', 'Read @docs/a.md',
+			   '2026-10-19', '2026-10-19')`,
+		} {
+			if _, err := prior.ExecContext(ctx, statement); err != nil {
+				t.Fatal(err)
+			}
+		}
+		const retainedAdmissions = `SELECT json_group_array(json_array(id, message_id, state, authored_text,
+			skill_invocations_json)) FROM session_prompt_admissions`
+		const retainedQueue = `SELECT json_group_array(json_array(rowid, id, prompt_admission_id, status, text))
+			FROM session_input_queue`
+		var beforeAdmissions, beforeQueue string
+		if err := prior.QueryRowContext(ctx, retainedAdmissions).Scan(&beforeAdmissions); err != nil {
+			t.Fatal(err)
+		}
+		if err := prior.QueryRowContext(ctx, retainedQueue).Scan(&beforeQueue); err != nil {
+			t.Fatal(err)
+		}
+		if err := prior.Close(); err != nil {
+			t.Fatal(err)
+		}
+		upgraded, err := openGlobalMigrationUpgrade(t, path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var afterAdmissions, afterQueue, admissionMentions, queueMentions string
+		if err := upgraded.db.QueryRowContext(ctx, retainedAdmissions).Scan(&afterAdmissions); err != nil {
+			t.Fatal(err)
+		}
+		if err := upgraded.db.QueryRowContext(ctx, retainedQueue).Scan(&afterQueue); err != nil {
+			t.Fatal(err)
+		}
+		if afterAdmissions != beforeAdmissions || afterQueue != beforeQueue {
+			t.Fatalf("rows changed across upgrade: admissions %s -> %s, queue %s -> %s",
+				beforeAdmissions, afterAdmissions, beforeQueue, afterQueue)
+		}
+		if err := upgraded.db.QueryRowContext(ctx,
+			`SELECT mentions_json FROM session_prompt_admissions WHERE id = 'mention-admission'`,
+		).Scan(&admissionMentions); err != nil {
+			t.Fatal(err)
+		}
+		if err := upgraded.db.QueryRowContext(ctx,
+			`SELECT mentions_json FROM session_input_queue WHERE id = 'mention-input'`,
+		).Scan(&queueMentions); err != nil {
+			t.Fatal(err)
+		}
+		if admissionMentions != "[]" || queueMentions != "[]" {
+			t.Fatalf("mentions_json defaults = admission %q, queue %q, want []", admissionMentions, queueMentions)
+		}
+		var admissionHuman, queueHuman int
+		if err := upgraded.db.QueryRowContext(ctx, `SELECT
+			(SELECT human_ingress FROM session_prompt_admissions WHERE id = 'mention-admission'),
+			(SELECT human_ingress FROM session_input_queue WHERE id = 'mention-input')`,
+		).Scan(&admissionHuman, &queueHuman); err != nil {
+			t.Fatal(err)
+		}
+		if admissionHuman != 0 || queueHuman != 0 {
+			t.Fatalf("human_ingress defaults = admission %d, queue %d, want 0", admissionHuman, queueHuman)
+		}
+		if _, err := upgraded.db.ExecContext(ctx,
+			`UPDATE session_input_queue SET mentions_json = 'not json' WHERE id = 'mention-input'`,
+		); err == nil {
+			t.Fatal("invalid mentions_json accepted after upgrade")
+		}
+		if err := upgraded.Close(ctx); err != nil {
+			t.Fatal(err)
+		}
+	})
+	// Invariant: contention indexes preserve session, task, and observability history across upgrades.
+	t.Run("Should preserve history while adding contention indexes", func(t *testing.T) {
+		t.Parallel()
+		ctx := globalMigrationTestContext(t)
+		path := filepath.Join(t.TempDir(), GlobalDatabaseName)
+		prior, err := openGlobalMigrationPrefixDatabase(t, path, globalMigrationPrefixBefore(t, "00132_schema.sql"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() {
+			if err := prior.Close(); err != nil {
+				t.Error(err)
+			}
+		})
+		const at = "2026-10-09T12:00:00Z"
+		for _, statement := range []string{
+			`INSERT INTO workspaces (id, root_dir, name, created_at, updated_at)
+			 VALUES ('retained-ws', '/retained', 'retained', '` + at + `', '` + at + `')`,
+			`INSERT INTO sessions (id, profile_id, agent_name, workspace_id, state, created_at, updated_at)
+			 VALUES ('retained-session', '00000000000000000000000000', 'coder', 'retained-ws', 'stopped', '` + at + `', '` + at + `')`,
+			`INSERT INTO session_input_queue (id, session_id, status, mode, text, enqueued_at, updated_at)
+			 VALUES ('retained-input', 'retained-session', 'canceled', 'queue', 'Keep authored text', '` + at + `', '` + at + `')`,
+			`INSERT INTO session_input_clear_traces (entry_id, session_id, turn_id, actor_kind, actor_id, queue_generation, created_at, projected_at)
+			 VALUES ('retained-input', 'retained-session', 'turn', 'user', 'operator', 7, '` + at + `', '` + at + `')`,
+			`INSERT INTO agent_heartbeat_wake_events (id, workspace_id, agent_name, session_id, source, result, reason, created_at, expires_at)
+			 VALUES ('retained-event', 'retained-ws', 'coder', 'retained-session', 'manual', 'sent', 'wake_sent', '` + at + `', '` + at + `')`,
+			`INSERT INTO agent_heartbeat_wake_state (workspace_id, agent_name, session_id, coalesced_count, last_result, updated_at)
+			 VALUES ('retained-ws', 'coder', 'retained-session', 3, 'coalesced', '` + at + `')`,
+			`INSERT INTO token_stats (id, session_id, agent_name, input_tokens, total_tokens, turn_count, updated_at)
+			 VALUES ('retained-stats', 'retained-session', 'coder', 42, 42, 2, '` + at + `')`,
+			`INSERT INTO permission_log (id, session_id, agent_name, action, resource, decision, policy_used, timestamp)
+			 VALUES ('retained-permission', 'retained-session', 'coder', 'read', '/retained', 'allow', 'read-only', '` + at + `')`,
+			`INSERT INTO tasks (id, profile_id, scope, title, status, created_by_kind, created_by_ref, origin_kind, origin_ref, created_at, updated_at)
+			 VALUES ('retained-task', '00000000000000000000000000', 'global', 'Keep task', 'completed', 'daemon', 'fixture', 'daemon', 'fixture', '` + at + `', '` + at + `')`,
+			`INSERT INTO task_blocks (id, task_id, kind, reason, created_by_kind, created_by_ref, created_at, cleared_at)
+			 VALUES ('retained-block', 'retained-task', 'needs_input', 'Keep reason', 'daemon', 'fixture', '` + at + `', '` + at + `')`,
+			`INSERT INTO task_designation_rollups (designation_group_id, task_id, summary_json, created_at)
+			 VALUES ('retained-group', 'retained-task', '{"completed":1}', '` + at + `')`,
+			`INSERT INTO session_subagent_wakes (wake_message_id, workspace_id, parent_session_id, state, route, created_at, updated_at)
+			 VALUES ('retained-wake', 'retained-ws', 'retained-session', 'settled', 'queue', '` + at + `', '` + at + `')`,
+			`INSERT INTO session_subagents (id, workspace_id, parent_session_id, parent_turn_id, origin, idempotency_key, request_fingerprint,
+			 title, task_chars, depth, status, work_state, result, wake_policy, delivery, wake_message_id, created_at, updated_at)
+			 VALUES ('retained-subagent', 'retained-ws', 'retained-session', 'turn', 'delegated', 'key', 'fingerprint',
+			 'Keep result', 10, 1, 'completed', 'result_available', 'Retained result', 'always', 'delivered', 'retained-wake', '` + at + `', '` + at + `')`,
+		} {
+			if _, err := prior.ExecContext(ctx, statement); err != nil {
+				t.Fatal(err)
+			}
+		}
+		const historyQuery = `SELECT json_array(
+			(SELECT json_array(text, status) FROM session_input_queue WHERE id='retained-input'),
+			(SELECT json_array(actor_id, queue_generation, projected_at) FROM session_input_clear_traces WHERE entry_id='retained-input'),
+			(SELECT json_array(session_id, result, reason) FROM agent_heartbeat_wake_events WHERE id='retained-event'),
+			(SELECT json_array(coalesced_count, last_result) FROM agent_heartbeat_wake_state WHERE session_id='retained-session'),
+			(SELECT json_array(input_tokens, total_tokens, turn_count) FROM token_stats WHERE id='retained-stats'),
+			(SELECT json_array(resource, decision, policy_used) FROM permission_log WHERE id='retained-permission'),
+			(SELECT json_array(reason, cleared_at) FROM task_blocks WHERE id='retained-block'),
+			(SELECT summary_json FROM task_designation_rollups WHERE designation_group_id='retained-group'),
+			(SELECT json_array(result, status, delivery, wake_message_id) FROM session_subagents WHERE id='retained-subagent'))`
+		var before string
+		if err := prior.QueryRowContext(ctx, historyQuery).Scan(&before); err != nil {
+			t.Fatal(err)
+		}
+		if err := prior.Close(); err != nil {
+			t.Fatal(err)
+		}
+		for range 2 {
+			upgraded, err := openGlobalMigrationUpgrade(t, path)
+			if err != nil {
+				t.Fatal(err)
+			}
+			var after string
+			if err := upgraded.db.QueryRowContext(ctx, historyQuery).Scan(&after); err != nil {
+				t.Fatal(err)
+			}
+			if after != before {
+				t.Fatalf("history changed across index upgrade: before %s, after %s", before, after)
+			}
+			status, err := store.Status(ctx, upgraded.db, MigrationStream())
+			if err != nil {
+				t.Fatal(err)
+			}
+			assertCompleteMigrationStream(t, status, MigrationStream())
+			if err := upgraded.Close(ctx); err != nil {
+				t.Fatal(err)
+			}
+		}
+	})
+	// Invariant: palette retirement merges counts and pins per workspace/profile exactly once; the reopen suite owns upgrades.
+	t.Run("Should preserve palette personalization across app retirement [IT-012]", func(t *testing.T) {
+		t.Parallel()
+		ctx := globalMigrationTestContext(t)
+		path := filepath.Join(t.TempDir(), GlobalDatabaseName)
+		prior, err := openGlobalMigrationPrefixDatabase(
+			t,
+			path,
+			globalMigrationPrefixBefore(t, "00129_automations_palette.sql"),
+		)
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() {
+			if err := prior.Close(); err != nil {
+				t.Error(err)
+			}
+		})
+		otherProfile := "11111111111111111111111111"
+		if _, err := prior.ExecContext(
+			ctx,
+			`INSERT INTO profiles (id,name,color,icon,created_at) VALUES (?, 'Palette other', 'blue', 'bot', '2026-10-08T00:00:00Z')`,
+			otherProfile,
+		); err != nil {
+			t.Fatal(err)
+		}
+		for _, workspace := range []string{"", "workspace-other"} {
+			for _, profile := range []string{store.DefaultProfileID, otherProfile} {
+				for _, prefix := range []string{"app.open.", "palette.view."} {
+					for i, app := range []string{"jobs", "triggers", "automations"} {
+						count := []int{3, 2, 4}[i]
+						weight := []float64{1.5, 2, 1}[i]
+						last := []int{10, 20, 15}[i]
+						if _, err := prior.ExecContext(
+							ctx,
+							`INSERT INTO cmd_palette_usage VALUES (?,?,?,?,?,?,?)`,
+							workspace,
+							profile,
+							prefix+app,
+							count,
+							weight,
+							last,
+							last,
+						); err != nil {
+							t.Fatal(err)
+						}
+						if _, err := prior.ExecContext(
+							ctx,
+							`INSERT INTO cmd_palette_query_hits VALUES (?,?,?,?,?,?)`,
+							workspace,
+							profile,
+							"jo",
+							prefix+app,
+							weight,
+							last,
+						); err != nil {
+							t.Fatal(err)
+						}
+						if _, err := prior.ExecContext(
+							ctx,
+							`INSERT INTO cmd_palette_pins VALUES (?,?,?,?)`,
+							workspace,
+							profile,
+							prefix+app,
+							last,
+						); err != nil {
+							t.Fatal(err)
+						}
+					}
+				}
+				if _, err := prior.ExecContext(
+					ctx,
+					`INSERT INTO cmd_palette_usage VALUES (?,?, 'app.open.tasks',7,3,30,30)`,
+					workspace,
+					profile,
+				); err != nil {
+					t.Fatal(err)
+				}
+			}
+		}
+		if err := prior.Close(); err != nil {
+			t.Fatal(err)
+		}
+		for range 2 {
+			upgraded, err := openGlobalMigrationUpgrade(t, path)
+			if err != nil {
+				t.Fatal(err)
+			}
+			for _, workspace := range []string{"", "workspace-other"} {
+				for _, profile := range []string{store.DefaultProfileID, otherProfile} {
+					var total int
+					if err := upgraded.db.QueryRowContext(ctx, `SELECT sum(use_count) FROM cmd_palette_usage WHERE workspace_id=? AND profile_lens_id=?`, workspace, profile).
+						Scan(&total); err != nil {
+						t.Fatal(err)
+					}
+					if total != 25 {
+						t.Fatalf("per-lens use_count=%d, want 25", total)
+					}
+					for _, prefix := range []string{"app.open.", "palette.view."} {
+						var count, last, updated, pinned, hitLast int
+						var frequency, weight float64
+						if err := upgraded.db.QueryRowContext(ctx, `SELECT use_count,frecency_weight,last_used_at,updated_at FROM cmd_palette_usage WHERE workspace_id=? AND profile_lens_id=? AND command_id=?`, workspace, profile, prefix+"automations").
+							Scan(&count, &frequency, &last, &updated); err != nil {
+							t.Fatal(err)
+						}
+						if err := upgraded.db.QueryRowContext(ctx, `SELECT pinned_at FROM cmd_palette_pins WHERE workspace_id=? AND profile_lens_id=? AND command_id=?`, workspace, profile, prefix+"automations").
+							Scan(&pinned); err != nil {
+							t.Fatal(err)
+						}
+						if err := upgraded.db.QueryRowContext(ctx, `SELECT weight,last_used_at FROM cmd_palette_query_hits WHERE workspace_id=? AND profile_lens_id=? AND command_id=? AND query='jo'`, workspace, profile, prefix+"automations").
+							Scan(&weight, &hitLast); err != nil {
+							t.Fatal(err)
+						}
+						if count != 9 || frequency != 2 || last != 20 || updated != 20 || pinned != 10 ||
+							weight != 4.5 ||
+							hitLast != 20 {
+							t.Fatalf(
+								"merged signals = %d %g %d %d %d %g %d",
+								count,
+								frequency,
+								last,
+								updated,
+								pinned,
+								weight,
+								hitLast,
+							)
+						}
+					}
+				}
+			}
+			var retired int
+			if err := upgraded.db.QueryRowContext(ctx, `SELECT count(*) FROM (SELECT command_id FROM cmd_palette_usage UNION ALL SELECT command_id FROM cmd_palette_query_hits UNION ALL SELECT command_id FROM cmd_palette_pins) WHERE command_id IN ('app.open.jobs','app.open.triggers','palette.view.jobs','palette.view.triggers')`).
+				Scan(&retired); err != nil {
+				t.Fatal(err)
+			}
+			if retired != 0 {
+				t.Fatalf("retired rows=%d", retired)
+			}
+			status, err := store.Status(ctx, upgraded.db, MigrationStream())
+			if err != nil {
+				t.Fatal(err)
+			}
+			assertCompleteMigrationStream(t, status, MigrationStream())
+			if err := upgraded.Close(ctx); err != nil {
+				t.Fatal(err)
+			}
+		}
+	})
+	t.Run("Should backfill automation catalog targets and preserve run history across reopen", func(t *testing.T) {
+		t.Parallel()
+		ctx := globalMigrationTestContext(t)
+		path := filepath.Join(t.TempDir(), GlobalDatabaseName)
+		prior, err := openGlobalMigrationPrefixDatabase(
+			t,
+			path,
+			globalMigrationPrefixBefore(t, "00128_automation_latest_runs.sql"),
+		)
+		if err != nil {
+			t.Fatal(err)
+		}
+		priorClosed := false
+		t.Cleanup(func() {
+			if !priorClosed {
+				if err := prior.Close(); err != nil {
+					t.Errorf("close prior: %v", err)
+				}
+			}
+		})
+		for _, target := range []string{"agent", "loop", "task"} {
+			kind := target
+			var task any
+			if target == "task" {
+				kind = "agent"
+				task = `{"title":"Retained task"}`
+			}
+			if _, err := prior.ExecContext(ctx, `INSERT INTO automation_jobs
+    (id, profile_id, scope, name, agent_name, prompt, task, retry, fire_limit, target_kind, created_at, updated_at)
+    VALUES (?, ?, 'global', ?, 'agent', 'Retained prompt', ?, '{}', '{}', ?, '2026-10-08T00:00:00Z', '2026-10-08T00:00:00Z')`, target, store.DefaultProfileID, target, task, kind); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := prior.ExecContext(ctx, `INSERT INTO automation_job_catalog_entries
+    (job_id, scope, source, source_rank, name, enabled, search_name, search_agent_name, search_prompt, search_scope,
+    search_source, search_schedule_mode, search_schedule_expr, search_schedule_interval, search_schedule_time)
+    VALUES (?, 'global', 'dynamic', 2, ?, 1, '', '', '', '', '', '', '', '', '')`, target, target); err != nil {
+				t.Fatal(err)
+			}
+			if target == "task" {
+				continue
+			}
+			if _, err := prior.ExecContext(ctx, `INSERT INTO automation_triggers
+    (id, profile_id, scope, name, agent_name, prompt, event, retry, fire_limit, target_kind, created_at, updated_at)
+    VALUES (?, ?, 'global', ?, 'agent', 'Retained trigger prompt', 'session.stopped', '{}', '{}', ?, '2026-10-08T00:00:00Z', '2026-10-08T00:00:00Z')`, target, store.DefaultProfileID, target, kind); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := prior.ExecContext(ctx, `INSERT INTO automation_trigger_catalog_entries
+    (trigger_id, scope, event, source, source_rank, name, enabled, search_name, search_agent_name, search_prompt,
+    search_scope, search_source, search_event, search_endpoint_slug, search_webhook_id)
+    VALUES (?, 'global', 'session.stopped', 'dynamic', 2, ?, 1, '', '', '', '', '', '', '', '')`, target, target); err != nil {
+				t.Fatal(err)
+			}
+		}
+		if _, err := prior.ExecContext(
+			ctx,
+			`INSERT INTO automation_runs (id, profile_id, job_id, status, started_at, metadata_json)
+    VALUES ('retained', ?, 'task', 'canceled', '2026-10-08T00:00:00Z', '{"reason":"self_overlap"}')`,
+			store.DefaultProfileID,
+		); err != nil {
+			t.Fatal(err)
+		}
+		if err := prior.Close(); err != nil {
+			t.Fatal(err)
+		}
+		priorClosed = true
+		for range 2 {
+			upgraded, err := openGlobalMigrationUpgrade(t, path)
+			if err != nil {
+				t.Fatal(err)
+			}
+			closed := false
+			t.Cleanup(func() {
+				if !closed {
+					if err := upgraded.Close(ctx); err != nil {
+						t.Errorf("close upgraded: %v", err)
+					}
+				}
+			})
+			for _, target := range []string{"agent", "loop", "task"} {
+				var projected, prompt string
+				if err := upgraded.db.QueryRowContext(ctx, `SELECT c.target, j.prompt FROM automation_job_catalog_entries c JOIN automation_jobs j ON j.id=c.job_id WHERE c.job_id=?`, target).
+					Scan(&projected, &prompt); err != nil {
+					t.Fatal(err)
+				}
+				if projected != target || prompt != "Retained prompt" {
+					t.Fatalf("job %s = %q/%q", target, projected, prompt)
+				}
+				if target == "task" {
+					continue
+				}
+				if err := upgraded.db.QueryRowContext(ctx, `SELECT target FROM automation_trigger_catalog_entries WHERE trigger_id=?`, target).
+					Scan(&projected); err != nil {
+					t.Fatal(err)
+				}
+				if projected != target {
+					t.Fatalf("trigger %s = %q", target, projected)
+				}
+			}
+			var reason string
+			if err := upgraded.db.QueryRowContext(ctx, `SELECT json_extract(metadata_json, '$.reason') FROM automation_runs WHERE id='retained'`).
+				Scan(&reason); err != nil {
+				t.Fatal(err)
+			}
+			if reason != "self_overlap" {
+				t.Fatalf("retained run reason = %q", reason)
+			}
+			status, err := store.Status(ctx, upgraded.db, MigrationStream())
+			if err != nil {
+				t.Fatal(err)
+			}
+			assertCompleteMigrationStream(t, status, MigrationStream())
+			if err := upgraded.Close(ctx); err != nil {
+				t.Fatal(err)
+			}
+			closed = true
+		}
+	})
+
+	// Invariant: reconciliation indexes upgrade existing task history losslessly; the reopen suite owns it.
+	t.Run("Should preserve settled task history while adding reconciliation indexes", func(t *testing.T) {
+		t.Parallel()
+		ctx := globalMigrationTestContext(t)
+		path := filepath.Join(t.TempDir(), GlobalDatabaseName)
+		prior, err := openGlobalMigrationPrefixDatabase(t, path, globalMigrationPrefixBefore(t, "00126_schema.sql"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() {
+			if err := prior.Close(); err != nil {
+				t.Error(err)
+			}
+		})
+		for _, statement := range []string{
+			`INSERT INTO tasks (id, profile_id, scope, title, status, created_by_kind, created_by_ref,
+    origin_kind, origin_ref, created_at, updated_at, metadata_json)
+    VALUES ('history-task', '00000000000000000000000000', 'global', 'Retained task', 'completed',
+    'daemon', 'fixture', 'daemon', 'fixture', '2026-10-03T12:00:00Z', '2026-10-03T12:00:00Z', '{"keep":true}')`,
+			`INSERT INTO task_runs (id, task_id, status, attempt, origin_kind, origin_ref, queued_at, loop_run_id, result_json)
+    VALUES ('history-run', 'history-task', 'completed', 1, 'daemon', 'fixture', '2026-10-03T12:00:00Z',
+    'retained-loop', '{"value":{"answer":42}}')`,
+		} {
+			if _, err := prior.ExecContext(ctx, statement); err != nil {
+				t.Fatal(err)
+			}
+		}
+		if err := prior.Close(); err != nil {
+			t.Fatal(err)
+		}
+		for range 2 {
+			upgraded, err := openGlobalMigrationUpgrade(t, path)
+			if err != nil {
+				t.Fatal(err)
+			}
+			var metadata, result string
+			if err := upgraded.db.QueryRowContext(ctx, `SELECT t.metadata_json, r.result_json FROM tasks t
+    JOIN task_runs r ON r.task_id = t.id WHERE r.id = 'history-run'`).Scan(&metadata, &result); err != nil {
+				t.Fatal(err)
+			}
+			if metadata != `{"keep":true}` || result != `{"value":{"answer":42}}` {
+				t.Fatalf("history changed: %s %s", metadata, result)
+			}
+			status, err := store.Status(ctx, upgraded.db, MigrationStream())
+			if err != nil {
+				t.Fatal(err)
+			}
+			assertCompleteMigrationStream(t, status, MigrationStream())
+			if err := upgraded.Close(ctx); err != nil {
+				t.Fatal(err)
+			}
+		}
+	})
+
+	t.Run("Should preserve legacy profile markers without inventing creation provenance", func(t *testing.T) {
+		t.Parallel()
+		ctx := globalMigrationTestContext(t)
+		path := filepath.Join(t.TempDir(), GlobalDatabaseName)
+		prior, err := openGlobalMigrationPrefixDatabase(t, path,
+			globalMigrationPrefixBefore(t, "00127_schema.sql"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		priorClosed := false
+		t.Cleanup(func() {
+			if !priorClosed {
+				if err := prior.Close(); err != nil {
+					t.Errorf("Close(prior) error = %v", err)
+				}
+			}
+		})
+		const timestamp = "2026-10-04T10:00:00Z"
+		if _, err := prior.ExecContext(ctx, `
+			INSERT INTO extensions (name, version, source, manifest_path, installed_at, checksum)
+			VALUES ('retained-kit', '1.0.0', 'user', '/kit/extension.toml', ?, 'checksum')`, timestamp); err != nil {
+			t.Fatal(err)
+		}
+		for _, name := range []string{"retained", "deleted"} {
+			if _, err := prior.ExecContext(ctx, `
+				INSERT INTO extension_profile_markers (extension_name, profile_name, created_profile_id, created_at)
+				VALUES ('retained-kit', ?, ?, ?)`, name, name+"-profile-id", timestamp); err != nil {
+				t.Fatal(err)
+			}
+		}
+		if err := prior.Close(); err != nil {
+			t.Fatal(err)
+		}
+		priorClosed = true
+		for range 2 {
+			upgraded, err := openGlobalMigrationUpgrade(t, path)
+			if err != nil {
+				t.Fatal(err)
+			}
+			closed := false
+			t.Cleanup(func() {
+				if !closed {
+					if err := upgraded.Close(testutil.Context(t)); err != nil {
+						t.Errorf("Close(upgraded) error = %v", err)
+					}
+				}
+			})
+			for _, name := range []string{"retained", "deleted"} {
+				var id, createdAt string
+				var creator sql.NullBool
+				if err := upgraded.db.QueryRowContext(ctx, `
+					SELECT created_profile_id, created_at, created_by_extension FROM extension_profile_markers
+					WHERE extension_name = 'retained-kit' AND profile_name = ?`, name).
+					Scan(&id, &createdAt, &creator); err != nil {
+					t.Fatal(err)
+				}
+				if id != name+"-profile-id" || createdAt != timestamp || creator.Valid {
+					t.Fatalf("marker %s = %q, %q, %#v, want preserved identity and unknown provenance",
+						name, id, createdAt, creator)
+				}
+			}
+			status, err := store.Status(ctx, upgraded.db, MigrationStream())
+			if err != nil {
+				t.Fatal(err)
+			}
+			assertCompleteMigrationStream(t, status, MigrationStream())
+			if err := upgraded.Close(ctx); err != nil {
+				t.Fatal(err)
+			}
+			closed = true
+		}
+	})
+
+	// Invariant: feature retirement preserves retained runtime state and authored context across upgrades.
+	// Owner: global persistence; canonical suite: reopen and migration preservation.
+	t.Run("Should retire remote features while preserving local runtime and authored context", func(t *testing.T) {
+		t.Parallel()
+		ctx := globalMigrationTestContext(t)
+		path := filepath.Join(t.TempDir(), GlobalDatabaseName)
+		prior, err := openGlobalMigrationPrefixDatabase(t, path,
+			globalMigrationPrefixBefore(t, "00121_retire_network_bridges_sandbox.sql"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		const timestamp = "2026-09-27T10:00:00Z"
+		for _, statement := range []string{
+			`INSERT INTO workspaces (id, root_dir, name, add_dirs, created_at, updated_at, sandbox_ref)
+			 VALUES ('retained-ws', '/retained', 'retained', '[]', '` + timestamp + `', '` + timestamp + `', 'retired-sandbox')`,
+			`INSERT INTO agent_soul_snapshots (id, workspace_id, agent_name, source_path, digest, body, created_at)
+			 VALUES ('retained-soul', 'retained-ws', 'coder', '/SOUL.md', 'soul-digest', 'Keep persona', '` + timestamp + `')`,
+			`INSERT INTO agent_heartbeat_snapshots (id, workspace_id, agent_name, source_path, digest, config_digest,
+			 body, frontmatter_json, resolved_json, diagnostics_json, created_at)
+			 VALUES ('retained-heartbeat', 'retained-ws', 'coder', '/HEARTBEAT.md', 'heartbeat-digest', 'config-digest',
+			 'Keep wake policy', '{}', '{}', '[]', '` + timestamp + `')`,
+			`INSERT INTO sessions (id, profile_id, agent_name, workspace_id, state, created_at, updated_at,
+			 soul_snapshot_id, soul_digest, sandbox_id, sandbox_backend, attention_revision, last_seen_revision)
+			 VALUES ('retained-session', '00000000000000000000000000', 'coder', 'retained-ws', 'stopped',
+			 '` + timestamp + `', '` + timestamp + `', 'retained-soul', 'soul-digest', 'retired-sandbox', 'daytona', 7, 4)`,
+			`INSERT INTO session_health (session_id, workspace_id, agent_name, state, health, active_prompt,
+			 attachable, eligible_for_wake, updated_at) VALUES ('retained-session', 'retained-ws', 'coder',
+			 'stopped', 'healthy', 0, 1, 0, '` + timestamp + `')`,
+			`INSERT INTO tasks (id, profile_id, scope, workspace_id, title, status, created_by_kind, created_by_ref,
+			 origin_kind, origin_ref, created_at, updated_at, owner_kind, owner_ref)
+			 VALUES ('retained-task', '00000000000000000000000000', 'workspace', 'retained-ws', 'Keep task', 'open',
+			 'network_peer', 'remote-peer', 'network', 'remote-origin', '` + timestamp + `', '` + timestamp + `', 'network_peer', 'remote-peer')`,
+			`INSERT INTO task_triage_state (task_id, actor_kind, actor_id, is_read, archived, dismissed, updated_at)
+			 VALUES ('retained-task', 'daemon', 'shared-actor', 1, 0, 1, '` + timestamp + `'),
+			 ('retained-task', 'network_peer', 'shared-actor', 0, 1, 0, '` + timestamp + `'),
+			 ('retained-task', 'network_peer', 'retired-actor', 0, 1, 0, '` + timestamp + `')`,
+			`INSERT INTO task_runs (id, task_id, workspace_id, status, attempt, origin_kind, origin_ref, queued_at)
+			 VALUES ('retained-run', 'retained-task', 'retained-ws', 'queued', 1, 'network', 'remote-origin', '` + timestamp + `')`,
+			`INSERT INTO task_runs (id, workspace_id, status, attempt, origin_kind, origin_ref, queued_at, run_kind,
+			 network_wake_id, network_target_session_id, network_owner_key)
+			 VALUES ('retired-wake', 'retained-ws', 'queued', 1, 'network', 'wake', '` + timestamp + `', 'network_wake',
+			 'wake', 'retained-session', 'retired-owner')`,
+			`INSERT INTO notification_cursors (scope_kind, profile_id, workspace_id, consumer_id, stream_name,
+			 subject_id, last_sequence, updated_at) VALUES ('workspace', '00000000000000000000000000',
+			 'retained-ws', 'task-status', 'task.events', 'retained-task', 12, '` + timestamp + `')`,
+			`INSERT INTO task_designation_rollups (designation_group_id, task_id, summary_json, created_at)
+			 VALUES ('retained-group', 'retained-task', '{"completed":1}', '` + timestamp + `')`,
+			`INSERT INTO vault_secrets (ref, kind, encrypted_value, created_at, updated_at) VALUES
+			 ('vault:providers/retained/token', 'provider', 'retained-ciphertext', '` + timestamp + `', '` + timestamp + `'),
+			 ('vault:bridges/retired/token', 'bridge', 'retired-ciphertext', '` + timestamp + `', '` + timestamp + `'),
+			 ('vault:sandbox/retired/token', 'sandbox', 'retired-ciphertext', '` + timestamp + `', '` + timestamp + `')`,
+			`INSERT INTO resource_records (kind, id, version, scope_kind, owner_kind, owner_id, source_kind, source_id,
+			 spec_json, created_at, updated_at) VALUES ('bridge.instance', 'retired-resource', 1, 'user', 'user', 'operator',
+			 'user', 'operator', '{}', '` + timestamp + `', '` + timestamp + `')`,
+			`INSERT INTO extensions (name, version, source, manifest_path, installed_at, checksum,
+			 network_requirement_digest, network_confirmed_by, network_confirmed_at)
+			 VALUES ('retained-gateway', '1.0.0', 'user', '/gateway/extension.toml', '` + timestamp + `', 'checksum',
+			 'gateway-digest', 'operator', '` + timestamp + `')`,
+		} {
+			if _, err := prior.ExecContext(ctx, statement); err != nil {
+				t.Fatalf("seed retirement fixture: %v", err)
+			}
+		}
+		if err := prior.Close(); err != nil {
+			t.Fatal(err)
+		}
+		for range 2 {
+			upgraded, err := openGlobalMigrationUpgrade(t, path)
+			if err != nil {
+				t.Fatal(err)
+			}
+			for _, retained := range []struct{ query, want string }{
+				{`SELECT soul_snapshot_id || ':' || soul_digest || ':' || attention_revision || ':' || last_seen_revision FROM sessions WHERE id='retained-session'`, "retained-soul:soul-digest:7:4"},
+				{`SELECT encrypted_value FROM vault_secrets WHERE ref='vault:providers/retained/token'`, "retained-ciphertext"},
+				{`SELECT body FROM agent_soul_snapshots WHERE id='retained-soul'`, "Keep persona"},
+				{`SELECT body FROM agent_heartbeat_snapshots WHERE id='retained-heartbeat'`, "Keep wake policy"},
+				{`SELECT health FROM session_health WHERE session_id='retained-session'`, "healthy"},
+				{`SELECT title || ':' || created_by_kind || ':' || origin_kind || ':' || COALESCE(owner_kind,'') FROM tasks WHERE id='retained-task'`, "Keep task:daemon:daemon:"},
+				{`SELECT actor_kind || ':' || actor_id || ':' || is_read || ':' || archived || ':' || dismissed FROM task_triage_state WHERE task_id='retained-task'`, "daemon:shared-actor:1:0:1"},
+				{`SELECT CAST(COUNT(*) AS TEXT) FROM task_triage_state WHERE task_id='retained-task'`, "1"},
+				{`SELECT origin_kind || ':' || run_kind FROM task_runs WHERE id='retained-run'`, "daemon:worker"},
+				{`SELECT CAST(last_sequence AS TEXT) FROM notification_cursors WHERE subject_id='retained-task'`, "12"},
+				{`SELECT summary_json FROM task_designation_rollups WHERE designation_group_id='retained-group'`, `{"completed":1}`},
+				{`SELECT gateway_requirement_digest || ':' || gateway_confirmed_by || ':' || gateway_confirmed_at FROM extensions WHERE name='retained-gateway'`, "gateway-digest:operator:" + timestamp},
+			} {
+				var got string
+				if err := upgraded.db.QueryRowContext(ctx, retained.query).Scan(&got); err != nil {
+					t.Fatal(err)
+				}
+				if got != retained.want {
+					t.Fatalf("retained state = %q, want %q", got, retained.want)
+				}
+			}
+			var wakeCount, retiredTables, retiredResources, retiredCredentials int
+			if err := upgraded.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM task_runs WHERE id='retired-wake'`).
+				Scan(&wakeCount); err != nil {
+				t.Fatal(err)
+			}
+			if err := upgraded.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND
+			 (name GLOB 'network_*' OR name GLOB 'bridge_*' OR name IN ('notification_presets','notification_delivery_permits',
+			 'notification_preset_enablement','task_network_coordination','workspace_network_coordination','task_profile_channels','task_profile_peers'))`).Scan(&retiredTables); err != nil {
+				t.Fatal(err)
+			}
+			if err := upgraded.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM resource_records WHERE kind='bridge.instance'`).
+				Scan(&retiredResources); err != nil {
+				t.Fatal(err)
+			}
+			if retiredResources != 0 {
+				t.Fatalf("retired resource count = %d, want zero", retiredResources)
+			}
+			if err := upgraded.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM vault_secrets WHERE ref GLOB 'vault:bridges/*' OR ref GLOB 'vault:sandbox/*'`).
+				Scan(&retiredCredentials); err != nil {
+				t.Fatal(err)
+			}
+			if retiredCredentials != 0 {
+				t.Fatalf("retired credential count = %d, want zero", retiredCredentials)
+			}
+			if wakeCount != 0 || retiredTables != 0 {
+				t.Fatalf("retired wake/table counts = %d/%d, want zero", wakeCount, retiredTables)
+			}
+			assertTableExcludesColumns(t, upgraded.db, "sessions", []string{"network_spec_json", "sandbox_id"})
+			assertTableExcludesColumns(
+				t,
+				upgraded.db,
+				"task_runs",
+				[]string{"network_mode", "network_wake_id", "claimed_peer_id"},
+			)
+			var violations int
+			if err := upgraded.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM pragma_foreign_key_check`).
+				Scan(&violations); err != nil {
+				t.Fatal(err)
+			}
+			if violations != 0 {
+				t.Fatalf("foreign-key violations = %d, want zero", violations)
+			}
+			status, err := store.Status(ctx, upgraded.db, MigrationStream())
+			if err != nil {
+				t.Fatal(err)
+			}
+			assertCompleteMigrationStream(t, status, MigrationStream())
+			if err := upgraded.Close(ctx); err != nil {
+				t.Fatal(err)
+			}
+		}
+	})
+
+	// Invariant: attachment migration preserves every installed package and its global/all-profile reach.
+	// Owner: global database upgrade. Canonical suite: reopen/preservation tests.
+	t.Run(
+		"Should backfill global extension installations without changing package or enablement state",
+		func(t *testing.T) {
+			t.Parallel()
+			ctx := t.Context()
+			path := filepath.Join(t.TempDir(), GlobalDatabaseName)
+			prior, err := openGlobalMigrationPrefixDatabase(t, path, globalMigrationPrefixBefore(t, "00114_schema.sql"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			const installedAt = "2026-09-01T00:00:00Z"
+			for _, name := range []string{"first", "second"} {
+				if _, err := prior.ExecContext(ctx, `INSERT INTO extensions
+   (name, version, source, manifest_path, installed_at, checksum) VALUES (?, '1.0.0', 'user', '/fixture/extension.toml', ?, 'digest')`, name, installedAt); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if _, err := prior.ExecContext(ctx, `INSERT INTO extension_profile_enablement
+   (extension_name, profile_id, enabled) VALUES ('second', ?, 0)`, store.DefaultProfileID); err != nil {
+				t.Fatal(err)
+			}
+			if err := prior.Close(); err != nil {
+				t.Fatal(err)
+			}
+			for range 2 {
+				upgraded, err := OpenGlobalDB(ctx, path)
+				if err != nil {
+					t.Fatal(err)
+				}
+				for _, name := range []string{"first", "second"} {
+					var profile, workspace, createdAt, version, checksum string
+					if err := upgraded.db.QueryRowContext(ctx, `SELECT i.profile_id, i.workspace_id, i.created_at, e.version, e.checksum
+     FROM extension_installations i JOIN extensions e ON e.name = i.extension_name WHERE e.name = ?`, name).
+						Scan(&profile, &workspace, &createdAt, &version, &checksum); err != nil {
+						t.Fatal(err)
+					}
+					if profile != "" || workspace != "" || createdAt != installedAt || version != "1.0.0" ||
+						checksum != "digest" {
+						t.Fatalf("migrated %s = %q %q %q %q %q", name, profile, workspace, createdAt, version, checksum)
+					}
+				}
+				var count, disabled int
+				if err := upgraded.db.QueryRowContext(ctx, `SELECT count(*) FROM extension_installations`).
+					Scan(&count); err != nil {
+					t.Fatal(err)
+				}
+				if err := upgraded.db.QueryRowContext(ctx, `SELECT enabled FROM extension_profile_enablement WHERE extension_name = 'second'`).
+					Scan(&disabled); err != nil {
+					t.Fatal(err)
+				}
+				if count != 2 || disabled != 0 {
+					t.Fatalf("count/disabled = %d/%d", count, disabled)
+				}
+				status, err := store.Status(ctx, upgraded.db, MigrationStream())
+				if err != nil {
+					t.Fatal(err)
+				}
+				assertCompleteMigrationStream(t, status, MigrationStream())
+				if err := upgraded.Close(ctx); err != nil {
+					t.Fatal(err)
+				}
+			}
+		},
+	)
+	t.Run("Should migrate historical token totals without inventing cache reports", func(t *testing.T) {
+		t.Parallel()
+		ctx := globalMigrationTestContext(t)
+		path := filepath.Join(t.TempDir(), GlobalDatabaseName)
+		prior, err := openGlobalMigrationPrefixDatabase(t, path, globalMigrationPrefixBefore(t, "00110_schema.sql"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, statement := range []string{
+			`INSERT INTO workspaces(id,root_dir,name,created_at,updated_at) VALUES ('ws-cache','/cache','cache','2026-09-11T00:00:00Z','2026-09-11T00:00:00Z')`,
+			`INSERT INTO sessions(id,profile_id,agent_name,workspace_id,state,created_at,updated_at) SELECT 'sess-cache',id,'coder','ws-cache','stopped','2026-09-11T00:00:00Z','2026-09-11T00:00:00Z' FROM profiles LIMIT 1`,
+			`INSERT INTO token_stats(id,session_id,agent_name,input_tokens,output_tokens,total_tokens,turn_count,updated_at) VALUES ('tok-cache','sess-cache','coder',10,2,12,1,'2026-09-11T00:00:00Z')`,
+		} {
+			if _, err := prior.ExecContext(ctx, statement); err != nil {
+				t.Fatal(err)
+			}
+		}
+		if err := prior.Close(); err != nil {
+			t.Fatal(err)
+		}
+		upgraded, err := OpenGlobalDB(ctx, path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() {
+			if err := upgraded.Close(testutil.Context(t)); err != nil {
+				t.Error(err)
+			}
+		})
+		rows, err := upgraded.ListTokenStats(ctx, TokenStatsQuery{SessionID: "sess-cache"})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(rows) != 1 || rows[0].CacheReadTokens != nil || rows[0].CacheWriteTokens != nil ||
+			rows[0].InputTokens == nil ||
+			*rows[0].InputTokens != 10 ||
+			rows[0].TotalTokens == nil ||
+			*rows[0].TotalTokens != 12 ||
+			rows[0].TurnCount != 1 {
+			t.Fatalf("historical stats = %#v", rows)
+		}
+		status, err := store.Status(ctx, upgraded.db, MigrationStream())
+		if err != nil {
+			t.Fatal(err)
+		}
+		assertCompleteMigrationStream(t, status, MigrationStream())
+		var count int
+		if err := upgraded.db.QueryRowContext(ctx, `SELECT count(*) FROM pragma_table_info('token_usage_daily') WHERE name IN ('cache_read_tokens','cache_write_tokens')`).
+			Scan(&count); err != nil {
+			t.Fatal(err)
+		}
+		if count != 0 {
+			t.Fatal("daily rollup unexpectedly changed")
+		}
+	})
+
+	for _, migration := range []string{"00102_schema.sql", "00103_schema.sql", "00104_schema.sql", "00105_schema.sql"} {
+		t.Run("Should preserve sessions and queued inputs through "+migration, func(t *testing.T) {
+			t.Parallel()
+			ctx := globalMigrationTestContext(t)
+			path := filepath.Join(t.TempDir(), GlobalDatabaseName)
+			prior, err := openGlobalMigrationPrefixDatabase(t, path, globalMigrationPrefixBefore(t, migration))
+			if err != nil {
+				t.Fatal(err)
+			}
+			for _, statement := range []string{
+				`INSERT INTO workspaces(id, root_dir, name, created_at, updated_at) VALUES ('ws-escalation', '/escalation', 'escalation', '2026-09-05T00:00:00Z', '2026-09-05T00:00:00Z')`,
+				`INSERT INTO sessions(id, profile_id, agent_name, workspace_id, state, created_at, updated_at) SELECT 'sess-escalation', id, 'coder', 'ws-escalation', 'stopped', '2026-09-05T00:00:00Z', '2026-09-05T00:00:00Z' FROM profiles LIMIT 1`,
+				`INSERT INTO session_input_queue(id, session_id, status, mode, text, enqueued_at, updated_at) VALUES ('queued-escalation', 'sess-escalation', 'queued', 'queue', 'preserved input', '2026-09-05T00:00:00Z', '2026-09-05T00:00:00Z')`,
+			} {
+				if _, err := prior.ExecContext(ctx, statement); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if migration == "00103_schema.sql" {
+				if _, err := prior.ExecContext(ctx, "UPDATE sessions SET stop_escalated = 1"); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if err := prior.Close(); err != nil {
+				t.Fatal(err)
+			}
+			upgraded, err := OpenGlobalDB(ctx, path)
+			if err != nil {
+				t.Fatal(err)
+			}
+			t.Cleanup(func() {
+				if err := upgraded.Close(testutil.Context(t)); err != nil {
+					t.Error(err)
+				}
+			})
+			var escalated, verificationFailed bool
+			if err := upgraded.db.QueryRowContext(ctx, "SELECT stop_escalated, stop_verification_failed FROM sessions WHERE id = 'sess-escalation'").
+				Scan(&escalated, &verificationFailed); err != nil {
+				t.Fatal(err)
+			}
+			if escalated != (migration == "00103_schema.sql") || verificationFailed {
+				t.Fatal("historical stop flags changed during upgrade")
+			}
+			var queuedText string
+			if err := upgraded.db.QueryRowContext(ctx, "SELECT text FROM session_input_queue WHERE id = 'queued-escalation'").
+				Scan(&queuedText); err != nil {
+				t.Fatal(err)
+			}
+			if queuedText != "preserved input" {
+				t.Fatalf("queued text = %q", queuedText)
+			}
+			if err := upgraded.UpdateSessionState(ctx, SessionStateUpdate{
+				ID:                     "sess-escalation",
+				State:                  "stopped",
+				StopReasonSet:          true,
+				StopEscalated:          true,
+				StopVerificationFailed: true,
+				UpdatedAt:              time.Now().UTC(),
+			}); err != nil {
+				t.Fatal(err)
+			}
+			if err := upgraded.Close(ctx); err != nil {
+				t.Fatal(err)
+			}
+			upgraded, err = OpenGlobalDB(ctx, path)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := upgraded.db.QueryRowContext(ctx, "SELECT stop_escalated, stop_verification_failed FROM sessions WHERE id = 'sess-escalation'").
+				Scan(&escalated, &verificationFailed); err != nil {
+				t.Fatal(err)
+			}
+			if !escalated || !verificationFailed {
+				t.Fatal("stop flags lost across reopen")
+			}
+		})
+	}
+	t.Run("Should preserve loop config rows while adding environment storage", func(t *testing.T) {
+		t.Parallel()
+
+		// Invariant: migration 00068 preserves prior loop config rows, initializes the
+		// new environment column empty, and persists it across reopen.
+		// Owning layer: GlobalDB migration stream. Canonical suite: global_db_test.go.
+		path := filepath.Join(t.TempDir(), GlobalDatabaseName)
+		prefixDB, err := openGlobalMigrationPrefixDatabase(
+			t,
+			path,
+			globalMigrationPrefixBefore(t, "00068_schema.sql"),
+		)
+		if err != nil {
+			t.Fatalf("open prior global migration prefix error = %v", err)
+		}
+		prefixClosed := false
+		t.Cleanup(func() {
+			if !prefixClosed {
+				if closeErr := prefixDB.Close(); closeErr != nil {
+					t.Errorf("Close(prior prefix cleanup) error = %v", closeErr)
+				}
+			}
+		})
+		ctx := globalMigrationTestContext(t)
+		if _, err := prefixDB.ExecContext(ctx, `INSERT INTO loop_config (
+			workspace_id, loop_name, human_gate_enabled, enabled_checks_json, iteration_cap
+		) VALUES ('ws-loop-environment', 'delivery', 0, '{}', 7)`); err != nil {
+			t.Fatalf("seed prior loop config error = %v", err)
+		}
+		if err := prefixDB.Close(); err != nil {
+			t.Fatalf("Close(prior prefix) error = %v", err)
+		}
+		prefixClosed = true
+
+		upgraded, err := OpenGlobalDB(ctx, path)
+		if err != nil {
+			t.Fatalf("OpenGlobalDB(upgrade) error = %v", err)
+		}
+		upgradedClosed := false
+		t.Cleanup(func() {
+			if !upgradedClosed {
+				if closeErr := upgraded.Close(testutil.Context(t)); closeErr != nil {
+					t.Errorf("Close(upgraded cleanup) error = %v", closeErr)
+				}
+			}
+		})
+		preserved, err := upgraded.GetLoopConfig(ctx, "ws-loop-environment", "", "delivery")
+		if err != nil {
+			t.Fatalf("GetLoopConfig(preserved) error = %v", err)
+		}
+		if preserved.IterationCap == nil || *preserved.IterationCap != 7 || preserved.Environment != nil {
+			t.Fatalf("preserved loop config = %#v, want iteration cap 7 and no environment", preserved)
+		}
+		environment := dsl.EnvironmentSpec{Mode: dsl.EnvironmentPerRun}
+		if err := upgraded.UpsertLoopConfig(ctx, "ws-loop-environment", "", "delivery", looppkg.LoopConfig{
+			Environment: &environment,
+		}); err != nil {
+			t.Fatalf("UpsertLoopConfig(environment) error = %v", err)
+		}
+		if err := upgraded.Close(ctx); err != nil {
+			t.Fatalf("Close(upgraded) error = %v", err)
+		}
+		upgradedClosed = true
+
+		reopened, err := OpenGlobalDB(ctx, path)
+		if err != nil {
+			t.Fatalf("OpenGlobalDB(reopened) error = %v", err)
+		}
+		t.Cleanup(func() {
+			if closeErr := reopened.Close(testutil.Context(t)); closeErr != nil {
+				t.Errorf("Close(reopened cleanup) error = %v", closeErr)
+			}
+		})
+		stored, err := reopened.GetLoopConfig(ctx, "ws-loop-environment", "", "delivery")
+		if err != nil {
+			t.Fatalf("GetLoopConfig(reopened) error = %v", err)
+		}
+		if stored.Environment == nil || *stored.Environment != environment {
+			t.Fatalf("Environment(after reopen) = %#v, want %#v", stored.Environment, environment)
+		}
+		status, err := store.Status(ctx, reopened.db, MigrationStream())
+		if err != nil {
+			t.Fatalf("Status(reopened) error = %v", err)
+		}
+		assertCompleteMigrationStream(t, status, MigrationStream())
+	})
+
+	t.Run("Should preserve rows and migration status across reopen", func(t *testing.T) {
+		t.Parallel()
+
+		ctx := testutil.Context(t)
+		path := filepath.Join(t.TempDir(), GlobalDatabaseName)
+		first, err := OpenGlobalDB(ctx, path)
+		if err != nil {
+			t.Fatalf("OpenGlobalDB(first) error = %v", err)
+		}
+		firstStatus, err := store.Status(ctx, first.db, MigrationStream())
+		if err != nil {
+			t.Fatalf("Status(first) error = %v", err)
+		}
+		root := t.TempDir()
+		workspace := compozyworkspace.Workspace{
+			ID:        "ws-reopen",
+			RootDir:   root,
+			Name:      "reopen",
+			CreatedAt: time.Date(2026, 7, 12, 12, 0, 0, 0, time.UTC),
+			UpdatedAt: time.Date(2026, 7, 12, 12, 0, 0, 0, time.UTC),
+		}
+		if err := first.InsertWorkspace(ctx, workspace); err != nil {
+			t.Fatalf("InsertWorkspace() error = %v", err)
+		}
+		worktree := worktreepkg.Worktree{
+			ID: "wt-reopen", WorkspaceID: workspace.ID, Name: "reopen-worktree",
+			Branch: "feature/reopen", Path: filepath.Join(t.TempDir(), "reopen-worktree"),
+			State: worktreepkg.StateReady, Origin: worktreepkg.OriginManual, SetupState: worktreepkg.SetupNone,
+			ProfileID: store.DefaultProfileID,
+			CreatedAt: workspace.CreatedAt, UpdatedAt: workspace.UpdatedAt,
+		}
+		if err := first.Worktrees.Insert(ctx, worktree); err != nil {
+			t.Fatalf("Worktrees.Insert() error = %v", err)
+		}
+		if err := first.Close(ctx); err != nil {
+			t.Fatalf("Close(first) error = %v", err)
+		}
+
+		second, err := OpenGlobalDB(ctx, path)
+		if err != nil {
+			t.Fatalf("OpenGlobalDB(second) error = %v", err)
+		}
+		t.Cleanup(func() {
+			if err := second.Close(testutil.Context(t)); err != nil {
+				t.Fatalf("Close(second) error = %v", err)
+			}
+		})
+		secondStatus, err := store.Status(ctx, second.db, MigrationStream())
+		if err != nil {
+			t.Fatalf("Status(second) error = %v", err)
+		}
+		if secondStatus != firstStatus {
+			t.Fatalf("Status(second) = %#v, want unchanged %#v", secondStatus, firstStatus)
+		}
+		loaded, err := second.GetWorkspace(ctx, workspace.ID)
+		if err != nil {
+			t.Fatalf("GetWorkspace(after reopen) error = %v", err)
+		}
+		if loaded.ID != workspace.ID || loaded.RootDir != workspace.RootDir || loaded.Name != workspace.Name {
+			t.Fatalf("GetWorkspace(after reopen) = %#v, want %#v", loaded, workspace)
+		}
+		loadedWorktree, err := second.Worktrees.Get(ctx, workspace.ID, worktree.ID)
+		if err != nil {
+			t.Fatalf("Worktrees.Get(after reopen) error = %v", err)
+		}
+		if loadedWorktree.ID != worktree.ID || loadedWorktree.Path != worktree.Path ||
+			loadedWorktree.State != worktreepkg.StateReady {
+			t.Fatalf("Worktrees.Get(after reopen) = %#v, want %#v", loadedWorktree, worktree)
+		}
+	})
+
+	t.Run("Should apply destructive cuts once and remove pre-lineage loop history", func(t *testing.T) {
+		t.Parallel()
+
+		ctx := globalMigrationTestContext(t)
+		path := filepath.Join(t.TempDir(), GlobalDatabaseName)
+		createHistoricalGlobalSchemaFixture(ctx, t, path)
+
+		first, err := openGlobalMigrationUpgrade(t, path)
+		if err != nil {
+			t.Fatalf("OpenGlobalDB(first post-cut) error = %v", err)
+		}
+		firstClosed := false
+		t.Cleanup(func() {
+			if firstClosed {
+				return
+			}
+			if err := first.Close(testutil.Context(t)); err != nil {
+				t.Fatalf("Close(first post-cut cleanup) error = %v", err)
+			}
+		})
+		assertPostCutHistoricalGlobalSchemaFixture(t, first)
+		firstStatus, err := store.Status(ctx, first.db, MigrationStream())
+		if err != nil {
+			t.Fatalf("Status(first post-cut) error = %v", err)
+		}
+		assertCompleteMigrationStream(t, firstStatus, MigrationStream())
+		if err := first.Close(ctx); err != nil {
+			t.Fatalf("Close(first post-cut) error = %v", err)
+		}
+		firstClosed = true
+
+		second, err := OpenGlobalDB(ctx, path)
+		if err != nil {
+			t.Fatalf("OpenGlobalDB(second post-cut) error = %v", err)
+		}
+		t.Cleanup(func() {
+			if err := second.Close(testutil.Context(t)); err != nil {
+				t.Fatalf("Close(second post-cut) error = %v", err)
+			}
+		})
+		assertPostCutHistoricalGlobalSchemaFixture(t, second)
+		secondStatus, err := store.Status(ctx, second.db, MigrationStream())
+		if err != nil {
+			t.Fatalf("Status(second post-cut) error = %v", err)
+		}
+		if secondStatus != firstStatus {
+			t.Fatalf("Status(second post-cut) = %#v, want unchanged %#v", secondStatus, firstStatus)
+		}
+	})
+}
+
+func TestGlobalDBPhase0HomeWorkspaceMigration(t *testing.T) {
+	t.Parallel()
+	t.Run("Should re-home synthetic workspace data without cascade loss", func(t *testing.T) {
+		t.Parallel()
+
+		path := filepath.Join(t.TempDir(), GlobalDatabaseName)
+		homeDir := t.TempDir()
+		prefixDB, err := openGlobalMigrationPrefixDatabase(
+			t,
+			path,
+			globalMigrationPrefixBefore(t, "00085_schema.sql"),
+		)
+		if err != nil {
+			t.Fatalf("open migration 00084 fixture error = %v", err)
+		}
+		prefixClosed := false
+		t.Cleanup(func() {
+			if prefixClosed {
+				return
+			}
+			if closeErr := prefixDB.Close(); closeErr != nil {
+				t.Errorf("Close(phase0 fixture cleanup) error = %v", closeErr)
+			}
+		})
+		ctx := globalMigrationTestContext(t)
+		seedPhase0HomeWorkspaceFixture(ctx, t, prefixDB, homeDir)
+		if err := prepareOperatorHomeMigrationContext(ctx, prefixDB, homeDir); err != nil {
+			t.Fatalf("prepare phase0 migration context error = %v", err)
+		}
+		if err := applyGlobalMigrationPrefix(
+			t,
+			prefixDB,
+			globalMigrationPrefixBefore(t, "00086_schema.sql"),
+		); err != nil {
+			t.Fatalf("apply migration through 00085 error = %v", err)
+		}
+		assertPhase0HomeWorkspaceDisposition(ctx, t, prefixDB)
+		assertPhase0RebuiltGuards(ctx, t, prefixDB)
+		if err := prefixDB.Close(); err != nil {
+			t.Fatalf("Close(phase0 fixture) error = %v", err)
+		}
+		prefixClosed = true
+
+		reopened, err := sql.Open(sqliteDriverName, path)
+		if err != nil {
+			t.Fatalf("sql.Open(phase0 reopen) error = %v", err)
+		}
+		t.Cleanup(func() {
+			if closeErr := reopened.Close(); closeErr != nil {
+				t.Errorf("Close(phase0 reopen) error = %v", closeErr)
+			}
+		})
+		assertPhase0HomeWorkspaceDisposition(ctx, t, reopened)
+		healthRepo := &HeartbeatRepo{repoBase: newRepoBase(reopened, reopened, nil, new(atomic.Int32))}
+		health, err := healthRepo.GetSessionHealth(ctx, "home-session")
+		if err != nil {
+			t.Fatalf("GetSessionHealth(migrated Global session) error = %v", err)
+		}
+		if health.SessionID != "home-session" || health.WorkspaceID != "" || health.AgentName != "default" {
+			t.Fatalf("migrated session health = %#v, want the preserved Global owner", health)
+		}
+		recovery, err := healthRepo.ListSessionHealthRecoveryInputs(ctx, 0)
+		if err != nil {
+			t.Fatalf("ListSessionHealthRecoveryInputs(migrated Global session) error = %v", err)
+		}
+		if len(recovery) != 1 || recovery[0].SessionID != health.SessionID || recovery[0].WorkspaceID != "" {
+			t.Fatalf("recovery inputs = %#v, want the migrated Global session", recovery)
+		}
+		health.UpdatedAt = health.UpdatedAt.Add(time.Minute)
+		if _, err := healthRepo.UpsertSessionHealth(ctx, health); err != nil {
+			t.Fatalf("UpsertSessionHealth(migrated Global session) error = %v", err)
+		}
+		updated, err := healthRepo.GetSessionHealth(ctx, health.SessionID)
+		if err != nil {
+			t.Fatalf("GetSessionHealth(updated Global session) error = %v", err)
+		}
+		if updated.WorkspaceID != "" || !updated.UpdatedAt.Equal(health.UpdatedAt) {
+			t.Fatalf("updated health = %#v, want preserved ownership and the new timestamp", updated)
+		}
+	})
+
+	t.Run("Should abort atomically when the home workspace owns a worktree", func(t *testing.T) {
+		t.Parallel()
+
+		path := filepath.Join(t.TempDir(), GlobalDatabaseName)
+		homeDir := t.TempDir()
+		prefixDB, err := openGlobalMigrationPrefixDatabase(
+			t,
+			path,
+			globalMigrationPrefixBefore(t, "00085_schema.sql"),
+		)
+		if err != nil {
+			t.Fatalf("open migration 00084 worktree fixture error = %v", err)
+		}
+		ctx := globalMigrationTestContext(t)
+		if _, err := prefixDB.ExecContext(ctx, `INSERT INTO workspaces (
+			id, root_dir, add_dirs, name, created_at, updated_at
+		) VALUES ('home-workspace', ?, '[]', 'home', ?, ?)`, homeDir, phase0FixtureTime, phase0FixtureTime); err != nil {
+			t.Fatalf("seed home workspace error = %v", err)
+		}
+		if _, err := prefixDB.ExecContext(ctx, `INSERT INTO worktrees (
+			id, workspace_id, name, branch, path, state, origin, setup_state, created_at, updated_at
+		) VALUES (
+			'home-worktree', 'home-workspace', 'home', 'main', ?, 'ready', 'manual', 'none', ?, ?
+		)`, filepath.Join(homeDir, "worktree"), phase0FixtureTime, phase0FixtureTime); err != nil {
+			t.Fatalf("seed home worktree error = %v", err)
+		}
+		if err := prefixDB.Close(); err != nil {
+			t.Fatalf("Close(worktree fixture) error = %v", err)
+		}
+
+		_, err = openGlobalMigrationUpgradeWithOptions(t, path, WithOperatorHomeDir(homeDir))
+		if err == nil || !strings.Contains(err.Error(), "worktrees") {
+			t.Fatalf("OpenGlobalDB(worktree fixture) error = %v, want worktrees assertion", err)
+		}
+
+		inspection, err := sql.Open(sqliteDriverName, path)
+		if err != nil {
+			t.Fatalf("sql.Open(worktree inspection) error = %v", err)
+		}
+		t.Cleanup(func() {
+			if closeErr := inspection.Close(); closeErr != nil {
+				t.Errorf("Close(worktree inspection) error = %v", closeErr)
+			}
+		})
+		assertSQLInt64(ctx, t, inspection, `SELECT COUNT(*) FROM workspaces WHERE id = 'home-workspace'`, 1)
+		assertSQLInt64(ctx, t, inspection, `SELECT COUNT(*) FROM worktrees WHERE id = 'home-worktree'`, 1)
+		status, err := store.Status(ctx, inspection, MigrationStream())
+		if err != nil {
+			t.Fatalf("Status(worktree assertion) error = %v", err)
+		}
+		if status.Version != 84 {
+			t.Fatalf("Status(worktree assertion).Version = %d, want 84", status.Version)
+		}
+	})
+}
+
+const phase0FixtureTime = "2026-08-21T12:00:00Z"
+
+func seedPhase0HomeWorkspaceFixture(ctx context.Context, t *testing.T, db *sql.DB, homeDir string) {
+	t.Helper()
+
+	statements := []struct {
+		name  string
+		query string
+		args  []any
+	}{
+		{name: "workspace", query: `INSERT INTO workspaces (
+			id, root_dir, add_dirs, name, created_at, updated_at
+		) VALUES ('home-workspace', ?, '[]', 'home', ?, ?)`, args: []any{homeDir, phase0FixtureTime, phase0FixtureTime}},
+		{name: "session", query: `INSERT INTO sessions (
+			id, agent_name, workspace_id, state, created_at, updated_at
+		) VALUES ('home-session', 'default', 'home-workspace', 'idle', ?, ?)`, args: []any{phase0FixtureTime, phase0FixtureTime}},
+		{name: "session health", query: `INSERT INTO session_health (
+			session_id, workspace_id, agent_name, state, health, active_prompt,
+			attachable, eligible_for_wake, updated_at
+		) VALUES ('home-session', 'home-workspace', 'default', 'idle', 'healthy', 0, 1, 1, ?)`, args: []any{phase0FixtureTime}},
+		{name: "session prompt admission", query: `INSERT INTO session_prompt_admissions (
+			id, workspace_id, session_id, message_id, idempotency_key, operation,
+			fingerprint_version, request_fingerprint, state, turn_id, event_id, created_at, updated_at
+		) VALUES (
+			'home-admission', 'home-workspace', 'home-session', 'message-1', 'key-1', 'prompt',
+			'v1', 'digest-1', 'reserved', 'turn-1', 'event-1', ?, ?
+		)`, args: []any{phase0FixtureTime, phase0FixtureTime}},
+		{name: "task", query: `INSERT INTO tasks (
+			id, scope, workspace_id, title, status, created_by_kind, created_by_ref,
+			origin_kind, origin_ref, created_at, updated_at
+		) VALUES (
+			'home-task', 'workspace', 'home-workspace', 'Home task', 'ready',
+			'daemon', 'phase0', 'daemon', 'phase0', ?, ?
+		)`, args: []any{phase0FixtureTime, phase0FixtureTime}},
+		{name: "task run", query: `INSERT INTO task_runs (
+			id, task_id, workspace_id, status, attempt, origin_kind, origin_ref, queued_at
+		) VALUES ('home-run', 'home-task', 'home-workspace', 'queued', 1, 'daemon', 'phase0', ?)`, args: []any{phase0FixtureTime}},
+		{name: "task block", query: `INSERT INTO task_blocks (
+			id, workspace_id, task_id, kind, reason, created_by_kind, created_by_ref, created_at
+		) VALUES ('home-block', 'home-workspace', 'home-task', 'needs_input', 'input', 'daemon', 'phase0', ?)`, args: []any{phase0FixtureTime}},
+		{name: "automation job", query: `INSERT INTO automation_jobs (
+			id, scope, name, agent_name, workspace_id, prompt, enabled, retry, fire_limit, created_at, updated_at
+		) VALUES ('home-job', 'workspace', 'home-job', 'default', 'home-workspace', 'run', 1, '{}', '{}', ?, ?)`, args: []any{phase0FixtureTime, phase0FixtureTime}},
+		{name: "automation trigger", query: `INSERT INTO automation_triggers (
+			id, scope, name, agent_name, workspace_id, prompt, event, enabled, retry, fire_limit, created_at, updated_at
+		) VALUES ('home-trigger', 'workspace', 'home-trigger', 'default', 'home-workspace', 'run', 'push', 1, '{}', '{}', ?, ?)`, args: []any{phase0FixtureTime, phase0FixtureTime}},
+		{name: "automation suggestion", query: `INSERT INTO automation_suggestions (
+			id, workspace_id, source, dedup_key, status, payload, created_at
+		) VALUES ('home-suggestion', 'home-workspace', 'catalog', 'daily', 'pending', '{}', ?)`, args: []any{phase0FixtureTime}},
+		{
+			name: "automation run",
+			query: `INSERT INTO automation_runs (id, job_id, session_id, task_id, task_run_id, status, attempt)
+		VALUES ('home-automation-run', 'home-job', 'home-session', 'home-task', 'home-run', 'completed', 1)`,
+		},
+		{name: "bridge instance", query: `INSERT INTO bridge_instances (
+			id, scope, workspace_id, platform, extension_name, display_name, status,
+			routing_policy, created_at, updated_at
+		) VALUES (
+			'home-bridge', 'workspace', 'home-workspace', 'test', 'test.extension',
+			'Home bridge', 'active', '{}', ?, ?
+		)`, args: []any{phase0FixtureTime, phase0FixtureTime}},
+		{name: "bridge route", query: `INSERT INTO bridge_routes (
+			routing_key_hash, scope, workspace_id, bridge_instance_id, session_id,
+			agent_name, last_activity_at, created_at, updated_at
+		) VALUES (
+			'home-route', 'workspace', 'home-workspace', 'home-bridge', 'home-session',
+			'default', ?, ?, ?
+		)`, args: []any{phase0FixtureTime, phase0FixtureTime, phase0FixtureTime}},
+		{name: "loop config", query: `INSERT INTO loop_config (
+			workspace_id, loop_name, human_gate_enabled, enabled_checks_json, iteration_cap
+		) VALUES ('home-workspace', 'home-loop', 0, '{}', 3)`},
+		{name: "agent soul snapshot", query: `INSERT INTO agent_soul_snapshots (
+			id, workspace_id, agent_name, source_path, digest, created_at
+		) VALUES ('home-soul-snapshot', 'home-workspace', 'default', 'SOUL.md', 'soul-digest', ?)`, args: []any{phase0FixtureTime}},
+		{name: "agent soul revision", query: `INSERT INTO agent_soul_revisions (
+			id, workspace_id, agent_name, source_path, action, created_at
+		) VALUES ('home-soul-revision', 'home-workspace', 'default', 'SOUL.md', 'put', ?)`, args: []any{phase0FixtureTime}},
+		{name: "agent heartbeat snapshot", query: `INSERT INTO agent_heartbeat_snapshots (
+			id, workspace_id, agent_name, source_path, digest, config_digest, body,
+			frontmatter_json, resolved_json, diagnostics_json, created_at
+		) VALUES (
+			'home-heartbeat-snapshot', 'home-workspace', 'default', 'HEARTBEAT.md',
+			'heartbeat-digest', 'config-digest', '', '{}', '{}', '[]', ?
+		)`, args: []any{phase0FixtureTime}},
+		{name: "agent heartbeat revision", query: `INSERT INTO agent_heartbeat_revisions (
+			id, workspace_id, agent_name, source_path, operation, new_snapshot_id,
+			actor_kind, actor_id, created_at
+		) VALUES (
+			'home-heartbeat-revision', 'home-workspace', 'default', 'HEARTBEAT.md',
+			'write', 'home-heartbeat-snapshot', 'system', 'phase0', ?
+		)`, args: []any{phase0FixtureTime}},
+		{name: "agent heartbeat wake event", query: `INSERT INTO agent_heartbeat_wake_events (
+			id, workspace_id, agent_name, session_id, policy_snapshot_id, source,
+			result, reason, created_at, expires_at
+		) VALUES (
+			'home-heartbeat-event', 'home-workspace', 'default', 'home-session',
+			'home-heartbeat-snapshot', 'manual', 'sent', 'wake_sent', ?, ?
+		)`, args: []any{phase0FixtureTime, "2026-08-22T12:00:00Z"}},
+		{name: "agent heartbeat wake state", query: `INSERT INTO agent_heartbeat_wake_state (
+			workspace_id, agent_name, session_id, policy_snapshot_id, last_result, updated_at
+		) VALUES (
+			'home-workspace', 'default', 'home-session', 'home-heartbeat-snapshot', 'sent', ?
+		)`, args: []any{phase0FixtureTime}},
+		{name: "tool approval grant", query: `INSERT INTO tool_approval_grants (
+			id, workspace_id, agent_name, tool_id, decision, created_at, last_used_at
+		) VALUES ('home-grant', 'home-workspace', 'default', 'test_tool', 'allow', ?, ?)`, args: []any{phase0FixtureTime, phase0FixtureTime}},
+		{name: "dead entity", query: `INSERT INTO dead_entities (workspace_id, kind, entity_id, reason, marked_at)
+		VALUES ('home-workspace', 'extension', 'dead-extension', 'removed', ?)`, args: []any{phase0FixtureTime}},
+		{name: "pending tool approval", query: `INSERT INTO tool_approval_pending (
+			approval_id, workspace_id, invocation_id, target_kind, tool_id, args_json,
+			approval_status, requested_at, expires_at
+		) VALUES (
+			'apr_home', 'home-workspace', 'invocation-home', 'tool', 'test_tool', '{}',
+			'pending', 1, 2
+		)`},
+		{name: "pre-existing aggregate command palette usage", query: `INSERT INTO cmd_palette_usage (
+			workspace_id, command_id, use_count, frecency_weight, last_used_at, updated_at
+		) VALUES ('', 'home.command', 5, 1.5, 20, 9)`},
+		{name: "command palette usage", query: `INSERT INTO cmd_palette_usage (
+			workspace_id, command_id, use_count, frecency_weight, last_used_at, updated_at
+		) VALUES ('home-workspace', 'home.command', 3, 2.5, 10, 10)`},
+		{name: "pre-existing aggregate command palette query hit", query: `INSERT INTO cmd_palette_query_hits (
+			workspace_id, query, command_id, weight, last_used_at
+		) VALUES ('', 'home', 'home.command', 1.5, 20)`},
+		{name: "command palette query hit", query: `INSERT INTO cmd_palette_query_hits (
+			workspace_id, query, command_id, weight, last_used_at
+		) VALUES ('home-workspace', 'home', 'home.command', 4.5, 10)`},
+		{name: "pre-existing aggregate command palette pin", query: `INSERT INTO cmd_palette_pins (
+			workspace_id, command_id, pinned_at
+		) VALUES ('', 'home.command', 5)`},
+		{name: "command palette pin", query: `INSERT INTO cmd_palette_pins (workspace_id, command_id, pinned_at)
+		VALUES ('home-workspace', 'home.command', 10)`},
+		{name: "event summary", query: `INSERT INTO event_summaries (id, workspace_id, type, timestamp)
+		VALUES ('home-summary', 'home-workspace', 'phase0', ?)`, args: []any{phase0FixtureTime}},
+		{name: "pre-existing aggregate daily token usage", query: `INSERT INTO token_usage_daily (
+			day, workspace_id, agent_name, input_tokens, output_tokens, total_tokens,
+			total_cost, cost_currency, cost_status, cost_source, turn_count, updated_at
+		) VALUES (
+			'2026-08-21', '', 'default', 7, 11, 18,
+			1.25, 'USD', 'estimated', 'catalog_config', 2, '2026-08-20T12:00:00Z'
+		)`},
+		{name: "daily token usage", query: `INSERT INTO token_usage_daily (
+			day, workspace_id, agent_name, input_tokens, output_tokens, total_tokens, turn_count, updated_at
+		) VALUES ('2026-08-21', 'home-workspace', 'default', 2, 3, 5, 1, ?)`, args: []any{phase0FixtureTime}},
+		{name: "network channel", query: `INSERT INTO network_channels (
+			workspace_id, channel, purpose, created_at, updated_at
+		) VALUES ('home-workspace', 'general', 'coordination', ?, ?)`, args: []any{phase0FixtureTime, phase0FixtureTime}},
+		{name: "network channel stats", query: `INSERT INTO network_channel_stats (workspace_id, channel)
+		VALUES ('home-workspace', 'general')`},
+		{
+			name: "network channel kind count",
+			query: `INSERT INTO network_channel_kind_counts (workspace_id, channel, kind, message_count)
+		VALUES ('home-workspace', 'general', 'say', 2)`,
+		},
+		{name: "network audit log", query: `INSERT INTO network_audit_log (
+			id, session_id, workspace_id, direction, kind, channel, peer_from,
+			message_id, size, timestamp
+		) VALUES (
+			'home-audit', 'home-session', 'home-workspace', 'outbound', 'say', 'general',
+			'peer-a', 'message-home', 5, ?
+		)`, args: []any{phase0FixtureTime}},
+		{name: "workspace network coordination", query: `INSERT INTO workspace_network_coordination (
+			workspace_id, enabled, revision, updated_at, updated_by
+		) VALUES ('home-workspace', 1, 1, ?, 'phase0')`, args: []any{phase0FixtureTime}},
+		{name: "task network coordination", query: `INSERT INTO task_network_coordination (
+			task_id, workspace_id, enabled, revision, updated_at, updated_by
+		) VALUES ('home-task', 'home-workspace', 1, 1, ?, 'phase0')`, args: []any{phase0FixtureTime}},
+		{name: "pre-existing aggregate notification cursor", query: `INSERT INTO notification_cursors (
+			scope_kind, workspace_id, consumer_id, stream_name, subject_id,
+			last_sequence, last_delivery_id, last_delivered_at, last_error, updated_at
+		) VALUES (
+			'global', '', 'consumer', 'events', '', 11, 'aggregate-delivery',
+			'2026-08-22T12:00:00Z', 'aggregate-error', '2026-08-22T12:00:00Z'
+		)`},
+		{name: "notification cursor", query: `INSERT INTO notification_cursors (
+			scope_kind, workspace_id, consumer_id, stream_name, last_sequence, updated_at
+		) VALUES ('workspace', 'home-workspace', 'consumer', 'events', 7, ?)`, args: []any{phase0FixtureTime}},
+		{name: "extension environment binding", query: `INSERT INTO extension_env_bindings (
+			extension_name, workspace_id, env_name, secret_ref, kind, created_at, updated_at
+		) VALUES ('test.extension', 'home-workspace', 'TOKEN', 'vault:extensions/test/token', 'extension_env', ?, ?)`, args: []any{phase0FixtureTime, phase0FixtureTime}},
+		{name: "extension development link", query: `INSERT INTO extension_dev_links (
+			extension_name, workspace_id, origin_path, bundle_generation, linked_at
+		) VALUES ('test.extension', 'home-workspace', '/tmp/test-extension', '1', ?)`, args: []any{phase0FixtureTime}},
+	}
+	for _, statement := range statements {
+		if _, err := db.ExecContext(ctx, statement.query, statement.args...); err != nil {
+			t.Fatalf("seed phase0 fixture %s error = %v", statement.name, err)
+		}
+	}
+}
+
+func assertPhase0HomeWorkspaceDisposition(ctx context.Context, t *testing.T, db *sql.DB) {
+	t.Helper()
+
+	stringCases := []struct {
+		name  string
+		query string
+		want  string
+	}{
+		{
+			name:  "session scope",
+			query: `SELECT scope || ':' || workspace_id FROM sessions WHERE id = 'home-session'`,
+			want:  "global:",
+		},
+		{
+			name:  "prompt admission",
+			query: `SELECT workspace_id FROM session_prompt_admissions WHERE id = 'home-admission'`,
+			want:  "",
+		},
+		{
+			name:  "session health",
+			query: `SELECT workspace_id FROM session_health WHERE session_id = 'home-session'`,
+			want:  "",
+		},
+		{
+			name:  "task scope",
+			query: `SELECT scope || ':' || coalesce(workspace_id, '') FROM tasks WHERE id = 'home-task'`,
+			want:  "global:",
+		},
+		{name: "task run", query: `SELECT coalesce(workspace_id, '') FROM task_runs WHERE id = 'home-run'`, want: ""},
+		{
+			name:  "automation job",
+			query: `SELECT scope || ':' || coalesce(workspace_id, '') FROM automation_jobs WHERE id = 'home-job'`,
+			want:  "global:",
+		},
+		{
+			name:  "automation trigger",
+			query: `SELECT scope || ':' || coalesce(workspace_id, '') FROM automation_triggers WHERE id = 'home-trigger'`,
+			want:  "global:",
+		},
+		{
+			name:  "automation suggestion",
+			query: `SELECT coalesce(workspace_id, '') FROM automation_suggestions WHERE id = 'home-suggestion'`,
+			want:  "",
+		},
+		{
+			name:  "bridge instance",
+			query: `SELECT scope || ':' || coalesce(workspace_id, '') FROM bridge_instances WHERE id = 'home-bridge'`,
+			want:  "global:",
+		},
+		{name: "loop config", query: `SELECT workspace_id FROM loop_config WHERE loop_name = 'home-loop'`, want: ""},
+		{
+			name:  "soul snapshot",
+			query: `SELECT workspace_id FROM agent_soul_snapshots WHERE id = 'home-soul-snapshot'`,
+			want:  "",
+		},
+		{
+			name:  "heartbeat snapshot",
+			query: `SELECT workspace_id FROM agent_heartbeat_snapshots WHERE id = 'home-heartbeat-snapshot'`,
+			want:  "",
+		},
+		{name: "tool grant", query: `SELECT workspace_id FROM tool_approval_grants WHERE id = 'home-grant'`, want: ""},
+		{
+			name:  "dead entity",
+			query: `SELECT workspace_id FROM dead_entities WHERE entity_id = 'dead-extension'`,
+			want:  "",
+		},
+		{
+			name:  "pending approval",
+			query: `SELECT coalesce(workspace_id, '') FROM tool_approval_pending WHERE approval_id = 'apr_home'`,
+			want:  "",
+		},
+		{
+			name:  "palette usage",
+			query: `SELECT workspace_id FROM cmd_palette_usage WHERE command_id = 'home.command'`,
+			want:  "",
+		},
+		{name: "event summary", query: `SELECT workspace_id FROM event_summaries WHERE id = 'home-summary'`, want: ""},
+		{name: "token usage", query: `SELECT workspace_id FROM token_usage_daily WHERE day = '2026-08-21'`, want: ""},
+		{
+			name:  "network channel",
+			query: `SELECT workspace_id FROM network_channels WHERE channel = 'general'`,
+			want:  "",
+		},
+		{name: "network audit", query: `SELECT workspace_id FROM network_audit_log WHERE id = 'home-audit'`, want: ""},
+		{
+			name:  "task coordination",
+			query: `SELECT workspace_id FROM task_network_coordination WHERE task_id = 'home-task'`,
+			want:  "",
+		},
+		{
+			name:  "notification cursor",
+			query: `SELECT scope_kind || ':' || workspace_id FROM notification_cursors WHERE consumer_id = 'consumer'`,
+			want:  "global:",
+		},
+	}
+	for _, testCase := range stringCases {
+		var got string
+		if err := db.QueryRowContext(ctx, testCase.query).Scan(&got); err != nil {
+			t.Fatalf("query %s error = %v", testCase.name, err)
+		}
+		if got != testCase.want {
+			t.Fatalf("%s = %q, want %q", testCase.name, got, testCase.want)
+		}
+	}
+
+	var usageCount, usageLastUsedAt, usageUpdatedAt int64
+	var usageWeight float64
+	if err := db.QueryRowContext(ctx, `SELECT use_count, frecency_weight, last_used_at, updated_at
+		FROM cmd_palette_usage WHERE workspace_id = '' AND command_id = 'home.command'`).Scan(
+		&usageCount, &usageWeight, &usageLastUsedAt, &usageUpdatedAt,
+	); err != nil {
+		t.Fatalf("query merged command palette usage error = %v", err)
+	}
+	if usageCount != 8 || usageWeight != 4 || usageLastUsedAt != 20 || usageUpdatedAt != 10 {
+		t.Fatalf("merged command palette usage = (%d, %v, %d, %d), want (8, 4, 20, 10)",
+			usageCount, usageWeight, usageLastUsedAt, usageUpdatedAt)
+	}
+
+	var queryWeight float64
+	var queryLastUsedAt int64
+	if err := db.QueryRowContext(ctx, `SELECT weight, last_used_at FROM cmd_palette_query_hits
+		WHERE workspace_id = '' AND query = 'home' AND command_id = 'home.command'`).Scan(
+		&queryWeight, &queryLastUsedAt,
+	); err != nil {
+		t.Fatalf("query merged command palette hit error = %v", err)
+	}
+	if queryWeight != 6 || queryLastUsedAt != 20 {
+		t.Fatalf("merged command palette hit = (%v, %d), want (6, 20)", queryWeight, queryLastUsedAt)
+	}
+	assertSQLInt64(ctx, t, db, `SELECT pinned_at FROM cmd_palette_pins
+		WHERE workspace_id = '' AND command_id = 'home.command'`, 5)
+
+	var inputTokens, outputTokens, totalTokens, turnCount int64
+	var totalCost float64
+	var currency, costStatus, costSource, usageTimestamp string
+	if err := db.QueryRowContext(ctx, `SELECT input_tokens, output_tokens, total_tokens, total_cost,
+		cost_currency, cost_status, cost_source, turn_count, updated_at
+		FROM token_usage_daily WHERE day = '2026-08-21' AND workspace_id = '' AND agent_name = 'default'`).Scan(
+		&inputTokens, &outputTokens, &totalTokens, &totalCost, &currency, &costStatus, &costSource,
+		&turnCount, &usageTimestamp,
+	); err != nil {
+		t.Fatalf("query merged token usage error = %v", err)
+	}
+	if inputTokens != 9 || outputTokens != 14 || totalTokens != 23 || totalCost != 1.25 ||
+		currency != "USD" || costStatus != "unknown" || costSource != "none" || turnCount != 3 ||
+		usageTimestamp != phase0FixtureTime {
+		t.Fatalf(
+			"merged token usage = (%d, %d, %d, %v, %q, %q, %q, %d, %q), want preserved aggregate",
+			inputTokens,
+			outputTokens,
+			totalTokens,
+			totalCost,
+			currency,
+			costStatus,
+			costSource,
+			turnCount,
+			usageTimestamp,
+		)
+	}
+
+	var cursorSequence int64
+	var deliveryID, deliveredAt, lastError, cursorUpdatedAt string
+	if err := db.QueryRowContext(ctx, `SELECT last_sequence, last_delivery_id, last_delivered_at, last_error, updated_at
+		FROM notification_cursors
+		WHERE scope_kind = 'global' AND workspace_id = '' AND consumer_id = 'consumer'
+		AND stream_name = 'events' AND subject_id = ''`).Scan(
+		&cursorSequence, &deliveryID, &deliveredAt, &lastError, &cursorUpdatedAt,
+	); err != nil {
+		t.Fatalf("query merged notification cursor error = %v", err)
+	}
+	if cursorSequence != 11 || deliveryID != "aggregate-delivery" || deliveredAt != "2026-08-22T12:00:00Z" ||
+		lastError != "aggregate-error" || cursorUpdatedAt != "2026-08-22T12:00:00Z" {
+		t.Fatalf("merged notification cursor = (%d, %q, %q, %q, %q), want latest aggregate cursor",
+			cursorSequence, deliveryID, deliveredAt, lastError, cursorUpdatedAt)
+	}
+
+	assertSQLInt64(ctx, t, db, `SELECT COUNT(*) FROM workspaces WHERE id = 'home-workspace'`, 0)
+	assertSQLInt64(
+		ctx,
+		t,
+		db,
+		`SELECT COUNT(*) FROM workspace_network_coordination WHERE workspace_id = 'home-workspace'`,
+		0,
+	)
+	assertSQLInt64(ctx, t, db, `SELECT COUNT(*) FROM extension_env_bindings WHERE workspace_id = 'home-workspace'`, 0)
+	assertSQLInt64(ctx, t, db, `SELECT COUNT(*) FROM extension_dev_links WHERE workspace_id = 'home-workspace'`, 0)
+	assertNoForeignKeyViolations(ctx, t, db)
+}
+
+func assertPhase0RebuiltGuards(ctx context.Context, t *testing.T, db *sql.DB) {
+	t.Helper()
+
+	if _, err := db.ExecContext(ctx, `INSERT INTO sessions (
+		id, agent_name, scope, workspace_id, state, created_at, updated_at
+	) VALUES ('phase0-empty-workspace-session', 'default', 'global', '', 'idle', ?, ?)`,
+		phase0FixtureTime, phase0FixtureTime,
+	); err != nil {
+		t.Fatalf("insert phase0 empty-workspace sentinel session error = %v", err)
+	}
+
+	for _, testCase := range []struct {
+		name  string
+		query string
+		args  []any
+		want  string
+	}{
+		{
+			name: "session insert workspace guard",
+			query: `INSERT INTO sessions (
+				id, agent_name, scope, workspace_id, state, created_at, updated_at
+			) VALUES ('phase0-missing-workspace-session', 'default', 'workspace', 'missing-workspace', 'idle', ?, ?)`,
+			args: []any{phase0FixtureTime, phase0FixtureTime}, want: "workspace not found",
+		},
+		{
+			name: "session update workspace guard",
+			query: `UPDATE sessions SET workspace_id = 'missing-workspace'
+				WHERE id = 'phase0-empty-workspace-session'`,
+			want: "workspace not found",
+		},
+		{
+			name: "task coordination insert workspace guard",
+			query: `INSERT INTO task_network_coordination (
+				task_id, workspace_id, enabled, revision, updated_at, updated_by
+			) VALUES ('phase0-missing-task', 'missing-workspace', 1, 1, ?, 'phase0')`,
+			args: []any{phase0FixtureTime}, want: "workspace not found",
+		},
+		{
+			name:  "task coordination update workspace guard",
+			query: `UPDATE task_network_coordination SET workspace_id = 'missing-workspace' WHERE task_id = 'home-task'`,
+			want:  "workspace not found",
+		},
+		{
+			name: "approval grant insert workspace guard",
+			query: `INSERT INTO tool_approval_grants (
+				id, workspace_id, agent_name, tool_id, decision, created_at, last_used_at
+			) VALUES ('phase0-missing-grant', 'missing-workspace', 'default', 'test_tool', 'allow', ?, ?)`,
+			args: []any{phase0FixtureTime, phase0FixtureTime}, want: "workspace not found",
+		},
+		{
+			name:  "approval grant update workspace guard",
+			query: `UPDATE tool_approval_grants SET workspace_id = 'missing-workspace' WHERE id = 'home-grant'`,
+			want:  "workspace not found",
+		},
+		{
+			name: "session archive insert guard",
+			query: `INSERT INTO sessions (
+				id, agent_name, scope, workspace_id, state, archived_at, created_at, updated_at
+			) VALUES ('phase0-archived-session', 'default', 'global', '', 'idle', ?, ?, ?)`,
+			args: []any{phase0FixtureTime, phase0FixtureTime, phase0FixtureTime}, want: "session is archived",
+		},
+		{
+			name:  "session archive update guard",
+			query: `UPDATE sessions SET archived_at = ? WHERE id = 'phase0-empty-workspace-session'`,
+			args:  []any{phase0FixtureTime}, want: "session is archived",
+		},
+	} {
+		if _, err := db.ExecContext(ctx, testCase.query, testCase.args...); err == nil ||
+			!strings.Contains(err.Error(), testCase.want) {
+			t.Fatalf("%s error = %v, want %q", testCase.name, err, testCase.want)
+		}
+	}
+
+	if _, err := db.ExecContext(ctx, `INSERT INTO task_run_terminal_commands (
+		command_id, run_id, task_id, workspace_id, kind, phase, source_status,
+		source_session_id, source_claim_token_hash, intent_json, actor_json,
+		command_at, admitted_at, updated_at
+	) VALUES (
+		'phase0-terminal-command', 'home-run', 'home-task', '', 'needs_attention', 'admitted', 'queued',
+		'', '', '{}', '{}', ?, ?, ?
+	)`, phase0FixtureTime, phase0FixtureTime, phase0FixtureTime); err != nil {
+		t.Fatalf("insert phase0 terminal command error = %v", err)
+	}
+	for _, testCase := range []struct {
+		name  string
+		query string
+	}{
+		{name: "terminal command update guard", query: `UPDATE task_runs SET status = 'claimed' WHERE id = 'home-run'`},
+		{name: "terminal command delete guard", query: `DELETE FROM task_runs WHERE id = 'home-run'`},
+	} {
+		if _, err := db.ExecContext(ctx, testCase.query); err == nil ||
+			!strings.Contains(err.Error(), terminalRunCommandGuardMessage) {
+			t.Fatalf("%s error = %v, want %q", testCase.name, err, terminalRunCommandGuardMessage)
+		}
+	}
+	if _, err := db.ExecContext(ctx, `DELETE FROM task_run_terminal_commands
+		WHERE command_id = 'phase0-terminal-command'`); err != nil {
+		t.Fatalf("delete phase0 terminal command fixture error = %v", err)
+	}
+	if _, err := db.ExecContext(ctx, `DELETE FROM sessions
+		WHERE id = 'phase0-empty-workspace-session'`); err != nil {
+		t.Fatalf("delete phase0 empty-workspace sentinel fixture error = %v", err)
+	}
+}
+
+func assertSQLInt64(ctx context.Context, t *testing.T, db *sql.DB, query string, want int64) {
+	t.Helper()
+
+	var got int64
+	if err := db.QueryRowContext(ctx, query).Scan(&got); err != nil {
+		t.Fatalf("query %q error = %v", query, err)
+	}
+	if got != want {
+		t.Fatalf("query %q = %d, want %d", query, got, want)
+	}
+}
+
+func assertNoForeignKeyViolations(ctx context.Context, t *testing.T, db *sql.DB) {
+	t.Helper()
+
+	rows, err := db.QueryContext(ctx, `PRAGMA foreign_key_check`)
+	if err != nil {
+		t.Fatalf("query foreign_key_check error = %v", err)
+	}
+	defer func() {
+		if closeErr := rows.Close(); closeErr != nil {
+			t.Errorf("close foreign_key_check rows error = %v", closeErr)
+		}
+	}()
+	if !rows.Next() {
+		return
+	}
+	var table, parent string
+	var rowID sql.NullInt64
+	var foreignKeyID int
+	if err := rows.Scan(&table, &rowID, &parent, &foreignKeyID); err != nil {
+		t.Fatalf("scan foreign_key_check result error = %v", err)
+	}
+	t.Fatalf("foreign_key_check violation: table=%q row_id=%v parent=%q foreign_key_id=%d",
+		table, rowID, parent, foreignKeyID)
+}
+
+func TestGlobalDBTerminalRunCommandMigrationPreservesRowsAcrossReopen(t *testing.T) {
+	t.Parallel()
+	t.Run("Should preserve task runs and terminal-command guards across migration reopen", func(t *testing.T) {
+		t.Parallel()
+
+		// Invariant: migration 00042 is append-only over the prior head, preserves
+		// task-run rows, and keeps the terminal-command guard effective after reopen.
+		// Owning layer: GlobalDB migration stream. Canonical suite: global_db_test.go.
+		path := filepath.Join(t.TempDir(), GlobalDatabaseName)
+		prefixDB, err := openGlobalMigrationPrefixDatabase(
+			t,
+			path,
+			globalMigrationPrefixBefore(t, "00042_schema.sql"),
+		)
+		if err != nil {
+			t.Fatalf("open prior global migration prefix error = %v", err)
+		}
+		ctx := globalMigrationTestContext(t)
+		statements := []string{
+			`INSERT INTO workspaces (
+			id, root_dir, add_dirs, name, created_at, updated_at
+		) VALUES (
+			'workspace-terminal-migration', '/tmp/workspace-terminal-migration', '[]',
+			'workspace-terminal-migration', '2026-08-02T11:59:00Z', '2026-08-02T11:59:00Z'
+		)`,
+			`INSERT INTO tasks (
+			id, scope, workspace_id, title, status, created_by_kind, created_by_ref,
+			origin_kind, origin_ref, created_at, updated_at
+		) VALUES (
+			'task-terminal-migration', 'workspace', 'workspace-terminal-migration',
+			'Terminal migration', 'ready',
+			'daemon', 'migration', 'daemon', 'migration',
+			'2026-08-02T12:00:00Z', '2026-08-02T12:00:00Z'
+		)`,
+			`INSERT INTO task_runs (
+			id, task_id, workspace_id, status, attempt, origin_kind, origin_ref, queued_at
+		) VALUES (
+			'run-terminal-migration', 'task-terminal-migration', 'workspace-terminal-migration',
+			'queued', 1,
+			'daemon', 'migration', '2026-08-02T12:01:00Z'
+		)`,
+		}
+		for _, statement := range statements {
+			if _, err := prefixDB.ExecContext(ctx, statement); err != nil {
+				t.Fatalf("seed prior terminal migration fixture error = %v", err)
+			}
+		}
+		if err := prefixDB.Close(); err != nil {
+			t.Fatalf("Close(prior prefix) error = %v", err)
+		}
+
+		first, err := openGlobalMigrationUpgrade(t, path)
+		if err != nil {
+			t.Fatalf("OpenGlobalDB(first migration 00042) error = %v", err)
+		}
+		ctx = globalMigrationTestContext(t)
+		commandAt := "2026-08-02T12:02:00Z"
+		if _, err := first.db.ExecContext(ctx, `INSERT INTO task_run_terminal_commands (
+		command_id, run_id, task_id, workspace_id, kind, phase,
+		source_status, source_session_id, source_claim_token_hash,
+		intent_json, actor_json, command_at, admitted_at, updated_at
+	) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+			"terminal-command-migration",
+			"run-terminal-migration",
+			"task-terminal-migration",
+			"workspace-terminal-migration",
+			"needs_attention",
+			"admitted",
+			"queued",
+			"",
+			"",
+			`{"version":2,"event_ids":["evt-terminal-migration"],`+
+				`"diagnostic":"migration fixture","stop_required":false}`,
+			`{"actor":{"kind":"daemon","ref":"migration"},"origin":{"kind":"daemon","ref":"migration"}}`,
+			commandAt,
+			commandAt,
+			commandAt,
+		); err != nil {
+			t.Fatalf("insert migrated terminal command error = %v", err)
+		}
+		if err := first.Close(ctx); err != nil {
+			t.Fatalf("Close(first migration 00042) error = %v", err)
+		}
+
+		second, err := openGlobalMigrationUpgrade(t, path)
+		if err != nil {
+			t.Fatalf("OpenGlobalDB(reopen migration 00042) error = %v", err)
+		}
+		ctx = globalMigrationTestContext(t)
+		t.Cleanup(func() {
+			if err := second.Close(testutil.Context(t)); err != nil {
+				t.Errorf("Close(reopened migration 00042) error = %v", err)
+			}
+		})
+		run, err := second.GetTaskRun(ctx, "run-terminal-migration")
+		if err != nil {
+			t.Fatalf("GetTaskRun(after migration reopen) error = %v", err)
+		}
+		if run.Status != taskpkg.TaskRunStatusQueued {
+			t.Fatalf("migrated run status = %q, want queued", run.Status)
+		}
+		if run.WorkspaceID != "workspace-terminal-migration" {
+			t.Fatalf("migrated run workspace = %q, want workspace-terminal-migration", run.WorkspaceID)
+		}
+		var commandCount int
+		if err := second.db.QueryRowContext(
+			ctx,
+			`SELECT COUNT(*) FROM task_run_terminal_commands WHERE run_id = ?`,
+			run.ID,
+		).Scan(&commandCount); err != nil {
+			t.Fatalf("count terminal commands after reopen error = %v", err)
+		}
+		if commandCount != 1 {
+			t.Fatalf("terminal command count after reopen = %d, want 1", commandCount)
+		}
+		if _, err := second.db.ExecContext(
+			ctx,
+			`UPDATE task_runs SET status = 'claimed' WHERE id = ?`,
+			run.ID,
+		); err == nil || !strings.Contains(err.Error(), terminalRunCommandGuardMessage) {
+			t.Fatalf("guarded task-run update error = %v, want terminal command guard", err)
+		}
+		if _, err := second.db.ExecContext(
+			ctx,
+			`DELETE FROM task_runs WHERE id = ?`,
+			run.ID,
+		); err == nil || !strings.Contains(err.Error(), terminalRunCommandGuardMessage) {
+			t.Fatalf("guarded task-run delete error = %v, want terminal command guard", err)
+		}
+		if _, err := second.db.ExecContext(
+			ctx,
+			`DELETE FROM tasks WHERE id = ?`,
+			"task-terminal-migration",
+		); err == nil || !strings.Contains(err.Error(), terminalRunCommandGuardMessage) {
+			t.Fatalf("guarded task delete error = %v, want terminal command guard", err)
+		}
+		if err := second.DeleteWorkspace(ctx, "workspace-terminal-migration"); !errors.Is(
+			err,
+			taskpkg.ErrTerminalRunCommandInProgress,
+		) {
+			t.Fatalf(
+				"DeleteWorkspace(guarded) error = %v, want %v",
+				err,
+				taskpkg.ErrTerminalRunCommandInProgress,
+			)
+		}
+	})
+}
+
+func assertCompleteMigrationStream(t *testing.T, status store.StreamStatus, stream store.MigrationStream) {
+	t.Helper()
+
+	entries, err := fs.ReadDir(stream.FS, stream.Dir)
+	if err != nil {
+		t.Fatalf("read %s migration directory: %v", stream.Name, err)
+	}
+	wantVersion := int64(0)
+	wantAppliedCount := 0
+	for _, entry := range entries {
+		if entry.IsDir() || filepath.Ext(entry.Name()) != ".sql" {
+			continue
+		}
+		separator := strings.IndexByte(entry.Name(), '_')
+		if separator <= 0 {
+			t.Fatalf("%s migration filename %q has no version prefix", stream.Name, entry.Name())
+		}
+		version, err := strconv.ParseInt(entry.Name()[:separator], 10, 64)
+		if err != nil {
+			t.Fatalf("parse %s migration version: %v", stream.Name, err)
+		}
+		wantVersion = max(wantVersion, version)
+		wantAppliedCount++
+	}
+	if status.Version != wantVersion || status.AppliedCount != wantAppliedCount {
+		t.Fatalf(
+			"Status(%s) = %#v, want version %d with %d applied migrations",
+			stream.Name,
+			status,
+			wantVersion,
+			wantAppliedCount,
+		)
+	}
+}
+
+func createHistoricalGlobalSchemaFixture(ctx context.Context, t *testing.T, path string) {
+	t.Helper()
+
+	legacyDB, err := sql.Open(sqliteDriverName, path)
+	if err != nil {
+		t.Fatalf("sql.Open(pre-cut fixture) error = %v", err)
+	}
+	legacyClosed := false
+	t.Cleanup(func() {
+		if legacyClosed {
+			return
+		}
+		if err := legacyDB.Close(); err != nil {
+			t.Fatalf("Close(pre-cut fixture cleanup) error = %v", err)
+		}
+	})
+	migrationFS, err := fs.Sub(globalschema.Files, "migrations")
+	if err != nil {
+		t.Fatalf("fs.Sub(global migrations) error = %v", err)
+	}
+	provider, err := goose.NewProvider(
+		goose.DialectSQLite3,
+		legacyDB,
+		migrationFS,
+		goose.WithTableName(globalMigrationVersionTable),
+		goose.WithDisableGlobalRegistry(true),
+	)
+	if err != nil {
+		t.Fatalf("goose.NewProvider(pre-cut fixture) error = %v", err)
+	}
+	if _, err := provider.UpTo(ctx, 1); err != nil {
+		t.Fatalf("provider.UpTo(pre-cut fixture, 1) error = %v", err)
+	}
+
+	statements := []struct {
+		name string
+		sql  string
+	}{
+		{
+			name: "workspace",
+			sql: `INSERT INTO workspaces (
+				id, root_dir, name, created_at, updated_at
+			) VALUES (
+				'ws-precut', '/tmp/compozy-precut', 'precut',
+				'2026-07-13T10:00:00Z', '2026-07-13T10:00:00Z'
+			)`,
+		},
+		{
+			name: "session",
+			sql: `INSERT INTO sessions (
+				id, agent_name, workspace_id, channel, state, created_at, updated_at
+			) VALUES (
+				'sess-precut', 'coder', 'ws-precut', 'coord-run-precut', 'stopped',
+				'2026-07-13T10:01:00Z', '2026-07-13T10:02:00Z'
+			)`,
+		},
+		{
+			name: "task",
+			sql: `INSERT INTO tasks (
+				id, scope, workspace_id, network_channel, title, status,
+				created_by_kind, created_by_ref, origin_kind, origin_ref, created_at, updated_at
+			) VALUES (
+				'task-precut', 'workspace', 'ws-precut', 'coord-run-precut', 'Pre-cut task', 'completed',
+				'daemon', 'scheduler', 'daemon', 'scheduler',
+				'2026-07-13T10:03:00Z', '2026-07-13T10:04:00Z'
+			)`,
+		},
+		{
+			name: "task run",
+			sql: `INSERT INTO task_runs (
+				id, task_id, status, attempt, origin_kind, origin_ref,
+				network_channel, coordination_channel_id, loop_run_id, queued_at
+			) VALUES (
+				'run-precut', 'task-precut', 'completed', 1, 'daemon', 'scheduler',
+				'coord-run-precut', 'coord-run-precut', 'loop-precut', '2026-07-13T10:05:00Z'
+			)`,
+		},
+		{
+			name: "queued loop worker",
+			sql: `INSERT INTO task_runs (
+				id, task_id, status, attempt, origin_kind, origin_ref, run_kind,
+				loop_run_id, metadata_json, queued_at
+			) VALUES (
+				'run-precut-loop-worker', 'task-precut', 'queued', 1, 'daemon', 'loop', 'worker',
+				'loop-precut', '{"generation":1,"node_id":"work","item_index":0}',
+				'2026-07-13T10:05:00Z'
+			)`,
+		},
+		{
+			name: "queued loop coordinator",
+			sql: `INSERT INTO task_runs (
+				id, task_id, status, attempt, origin_kind, origin_ref, run_kind,
+				loop_run_id, queued_at
+			) VALUES (
+				'run-precut-loop-coordinator', 'task-precut', 'queued', 1, 'daemon', 'loop', 'coordinator',
+				'loop-precut', '2026-07-13T10:05:00Z'
+			)`,
+		},
+		{
+			name: "delegated loop automation run",
+			sql: `INSERT INTO automation_runs (
+				id, status, attempt, loop_run_id, metadata_json
+			) VALUES (
+				'automation-precut-loop', 'delegated', 1, 'loop-precut', '{}'
+			)`,
+		},
+		{
+			name: "loop run",
+			sql: `INSERT INTO loop_runs (
+				id, workspace_id, loop_name, status, last_progress_at, inputs_json
+			) VALUES (
+				'loop-precut', 'ws-precut', 'precut-loop', 'done',
+				'2026-07-13T10:06:00Z', '{}'
+			)`,
+		},
+		{
+			name: "loop definition snapshot",
+			sql: `INSERT INTO loop_definition_snapshots (
+				workspace_id, definition_digest, definition_version, definition_json, byte_size, created_at, last_used_at
+			) VALUES (
+				'ws-precut', 'digest-precut', 1, '{"kind":"loop"}', 15,
+				'2026-07-13T10:06:00Z', '2026-07-13T10:06:00Z'
+			)`,
+		},
+		{
+			name: "loop configuration",
+			sql: `INSERT INTO loop_config (workspace_id, loop_name, enabled_checks_json)
+				VALUES ('ws-precut', 'precut-loop', '{"input-default":true}')`,
+		},
+		{
+			name: "loop output blob",
+			sql: `INSERT INTO loop_output_blobs (output_ref, payload_json, byte_size, created_at, last_used_at)
+				VALUES ('blob-precut', '{"result":"old"}', 16, '2026-07-13T10:06:00Z', '2026-07-13T10:06:00Z')`,
+		},
+		{
+			name: "loop generation output",
+			sql: `INSERT INTO loop_generation_outputs (
+				loop_run_id, generation, node_id, item_index, status, output_ref
+			) VALUES ('loop-precut', 1, 'node-precut', 0, 'succeeded', 'blob-precut')`,
+		},
+		{
+			name: "loop gate decision",
+			sql: `INSERT INTO loop_gate_decisions (
+				workspace_id, loop_run_id, generation, gate_id, criterion_id, decision,
+				actor_kind, actor_ref, origin_kind, origin_ref, decided_at
+			) VALUES (
+				'ws-precut', 'loop-precut', 1, 'gate-precut', 'criterion-precut', 'approve',
+				'human', 'operator', 'cli', 'loop approve', '2026-07-13T10:06:00Z'
+			)`,
+		},
+		{
+			name: "loop run event",
+			sql: `INSERT INTO loop_run_events (id, loop_run_id, workspace_id, seq, kind, payload_json, at)
+				VALUES ('event-precut', 'loop-precut', 'ws-precut', 1, 'status_changed', '{}', '2026-07-13T10:06:00Z')`,
+		},
+		{
+			name: "loop goal checkpoint",
+			sql: `INSERT INTO loop_goal_checkpoints (
+				loop_run_id, generation, node_id, phase, goal_status, turn_limit, context_nudge_ratio, updated_at
+			) VALUES ('loop-precut', 1, 'node-precut', 'idle', 'active', 1, 0.8, '2026-07-13T10:06:00Z')`,
+		},
+		{
+			name: "loop goal turn",
+			sql: `INSERT INTO loop_goal_turns (
+				loop_run_id, seq, generation, node_id, item_index, turn, session_id, binding_handle,
+				binding_epoch, prompt_id, actor_kind, actor_id, started_at
+			) VALUES (
+				'loop-precut', 1, 1, 'node-precut', 0, 1, 'sess-precut', 'handle-precut',
+				1, 'prompt-precut', 'daemon', 'loop', '2026-07-13T10:06:00Z'
+			)`,
+		},
+		{
+			name: "loop session binding",
+			sql: `INSERT INTO loop_session_bindings (
+				loop_run_id, handle, binding_epoch, binding_attempt_id, session_id, workspace_id,
+				creation_profile_ref, policy_spec_digest, creation_digest, ownership, state, created_at, activated_at
+			) VALUES (
+				'loop-precut', 'handle-precut', 1, 'binding-attempt-precut', 'sess-precut', 'ws-precut',
+				'profile-precut', 'policy-precut', 'creation-precut', 'run-owned', 'active',
+				'2026-07-13T10:06:00Z', '2026-07-13T10:06:00Z'
+			)`,
+		},
+		{
+			name: "loop session cleanup",
+			sql: `INSERT INTO loop_goal_session_cleanup (
+				cleanup_id, workspace_id, loop_run_id, handle, binding_epoch, session_id, cause, created_at
+			) VALUES (
+				'cleanup-precut', 'ws-precut', 'loop-precut', 'handle-precut', 1, 'sess-precut', 'terminal',
+				'2026-07-13T10:06:00Z'
+			)`,
+		},
+		{
+			name: "loop goal outbox",
+			sql: `INSERT INTO loop_goal_session_outbox (
+				event_id, workspace_id, origin_session_id, loop_run_id, cause, created_at
+			) VALUES ('outbox-precut', 'ws-precut', 'sess-precut', 'loop-precut', 'start', '2026-07-13T10:06:00Z')`,
+		},
+		{
+			name: "loop goal judge attempt",
+			sql: `INSERT INTO loop_goal_judge_attempts (
+				attempt_id, loop_run_id, generation, node_id, item_index, turn, judge_digest, status, started_at
+			) VALUES (
+				'judge-precut', 'loop-precut', 1, 'node-precut', 0, 1, 'judge-digest-precut', 'running',
+				'2026-07-13T10:06:00Z'
+			)`,
+		},
+		{
+			name: "loop binding retry witness",
+			sql: `INSERT INTO loop_goal_binding_retry_witnesses (
+				loop_run_id, handle, failed_binding_epoch, request_digest, created_at
+			) VALUES (
+				'loop-precut', 'handle-precut', 1,
+				'0000000000000000000000000000000000000000000000000000000000000000', '2026-07-13T10:06:00Z'
+			)`,
+		},
+		{
+			name: "loop-owned input queue entry",
+			sql: `INSERT INTO session_input_queue (
+				id, session_id, status, mode, text, enqueued_at, updated_at, loop_run_id
+			) VALUES (
+				'input-precut', 'sess-precut', 'queued', 'queue', 'obsolete loop input',
+				'2026-07-13T10:06:00Z', '2026-07-13T10:06:00Z', 'loop-precut'
+			)`,
+		},
+		{
+			name: "auto-created coordination channel",
+			sql: `INSERT INTO network_channels (
+				workspace_id, channel, purpose, created_by, created_at, updated_at
+			) VALUES (
+				'ws-precut', 'coord-run-precut', 'task_run_coordination', 'scheduler',
+				'2026-07-13T10:07:00Z', '2026-07-13T10:07:00Z'
+			)`,
+		},
+		{
+			name: "peer channel participant",
+			sql: `INSERT INTO network_channel_participants (
+				workspace_id, channel, peer_id
+			) VALUES ('ws-precut', 'coord-run-precut', 'peer-a')`,
+		},
+		{
+			name: "peer direct room",
+			sql: `INSERT INTO network_direct_rooms (
+				workspace_id, channel, direct_id, peer_a, peer_b, opened_at, last_activity_at
+			) VALUES (
+				'ws-precut', 'coord-run-precut', 'direct-precut', 'peer-a', 'peer-b',
+				'2026-07-13T10:08:00Z', '2026-07-13T10:08:00Z'
+			)`,
+		},
+		{
+			name: "thread",
+			sql: `INSERT INTO network_threads (
+				workspace_id, channel, thread_id, root_message_id, opened_at, last_activity_at
+			) VALUES (
+				'ws-precut', 'coord-run-precut', 'thread-precut', 'msg-root',
+				'2026-07-13T10:09:00Z', '2026-07-13T10:09:00Z'
+			)`,
+		},
+		{
+			name: "peer subscription",
+			sql: `INSERT INTO network_subscriptions (
+				workspace_id, channel, thread_id, peer_id, mode, created_at, updated_at
+			) VALUES (
+				'ws-precut', 'coord-run-precut', 'thread-precut', 'peer-a', 'full',
+				'2026-07-13T10:10:00Z', '2026-07-13T10:10:00Z'
+			)`,
+		},
+		{
+			name: "peer thread participant",
+			sql: `INSERT INTO network_thread_participants (
+				workspace_id, channel, thread_id, peer_id, first_message_id, first_seen_at, last_seen_at
+			) VALUES (
+				'ws-precut', 'coord-run-precut', 'thread-precut', 'peer-a', 'msg-root',
+				'2026-07-13T10:11:00Z', '2026-07-13T10:11:00Z'
+			)`,
+		},
+		{
+			name: "delivery guidance state",
+			sql: `INSERT INTO network_delivery_guidance_state (
+				session_id, reply_guidance_delivered, protocol_guidance_delivered, created_at, updated_at
+			) VALUES (
+				'sess-precut', 1, 1, '2026-07-13T10:12:00Z', '2026-07-13T10:12:00Z'
+			)`,
+		},
+	}
+	for _, statement := range statements {
+		if _, err := legacyDB.ExecContext(ctx, statement.sql); err != nil {
+			t.Fatalf("seed pre-cut %s error = %v", statement.name, err)
+		}
+	}
+	if err := legacyDB.Close(); err != nil {
+		t.Fatalf("Close(pre-cut fixture) error = %v", err)
+	}
+	legacyClosed = true
+}
+
+func assertPostCutHistoricalGlobalSchemaFixture(t *testing.T, globalDB *GlobalDB) {
+	t.Helper()
+
+	ctx := testutil.Context(t)
+	for _, table := range []string{"sessions", "task_runs"} {
+		assertRetainedOwnerWithoutNetwork(t, globalDB.db, table)
+	}
+	var loopRunCount int
+	if err := globalDB.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM loop_runs`).Scan(&loopRunCount); err != nil {
+		t.Fatalf("count loop_runs after lineage cut error = %v", err)
+	}
+	if loopRunCount != 0 {
+		t.Fatalf("loop_runs row count after lineage cut = %d, want 0", loopRunCount)
+	}
+	for _, table := range []string{
+		"loop_generation_outputs",
+		"loop_gate_decisions",
+		"loop_run_events",
+		"loop_goal_session_outbox",
+		"loop_session_cleanup",
+		"loop_goal_judge_attempts",
+		"loop_goal_turns",
+		"loop_goal_checkpoints",
+		"loop_goal_binding_retry_witnesses",
+		"loop_session_bindings",
+		"loop_output_blobs",
+		"session_input_queue",
+	} {
+		var count int
+		if err := globalDB.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM `+table).Scan(&count); err != nil {
+			t.Fatalf("count %s after lineage cut error = %v", table, err)
+		}
+		if count != 0 {
+			t.Fatalf("%s row count after lineage cut = %d, want 0", table, count)
+		}
+	}
+	var loopRunID sql.NullString
+	if err := globalDB.db.QueryRowContext(
+		ctx,
+		`SELECT loop_run_id FROM task_runs WHERE id = 'run-precut'`,
+	).Scan(&loopRunID); err != nil {
+		t.Fatalf("read task run loop link after lineage cut error = %v", err)
+	}
+	if loopRunID.Valid {
+		t.Fatalf("task run loop_run_id after lineage cut = %q, want NULL", loopRunID.String)
+	}
+	for _, orphanID := range []string{"run-precut-loop-worker", "run-precut-loop-coordinator"} {
+		var count int
+		if err := globalDB.db.QueryRowContext(
+			ctx,
+			`SELECT COUNT(*) FROM task_runs WHERE id = ?`,
+			orphanID,
+		).Scan(&count); err != nil {
+			t.Fatalf("count obsolete loop task run %q error = %v", orphanID, err)
+		}
+		if count != 0 {
+			t.Fatalf("obsolete loop task run %q count = %d, want 0", orphanID, count)
+		}
+	}
+	var delegatedOrphanCount int
+	if err := globalDB.db.QueryRowContext(
+		ctx,
+		`SELECT COUNT(*) FROM automation_runs WHERE id = 'automation-precut-loop'`,
+	).Scan(&delegatedOrphanCount); err != nil {
+		t.Fatalf("count obsolete delegated loop automation run error = %v", err)
+	}
+	if delegatedOrphanCount != 0 {
+		t.Fatalf("obsolete delegated loop automation run count = %d, want 0", delegatedOrphanCount)
+	}
+	var definitionJSON string
+	if err := globalDB.db.QueryRowContext(
+		ctx,
+		`SELECT definition_json FROM loop_definition_snapshots
+		 WHERE workspace_id = 'ws-precut' AND definition_digest = 'digest-precut'`,
+	).Scan(&definitionJSON); err != nil {
+		t.Fatalf("read preserved loop definition snapshot error = %v", err)
+	}
+	if definitionJSON != `{"kind":"loop"}` {
+		t.Fatalf("preserved definition snapshot = %q, want loop definition", definitionJSON)
+	}
+	var loopConfig string
+	if err := globalDB.db.QueryRowContext(
+		ctx,
+		`SELECT enabled_checks_json FROM loop_config
+		 WHERE workspace_id = 'ws-precut' AND loop_name = 'precut-loop'`,
+	).Scan(&loopConfig); err != nil {
+		t.Fatalf("read preserved loop configuration error = %v", err)
+	}
+	if loopConfig != `{"input-default":true}` {
+		t.Fatalf("preserved loop configuration = %q, want configured checks", loopConfig)
+	}
+	assertTableExcludesColumns(t, globalDB.db, "sessions", []string{"channel"})
+	assertTableExcludesColumns(t, globalDB.db, "tasks", []string{"network_channel"})
+	assertTableExcludesColumns(t, globalDB.db, "task_runs", []string{"coordination_channel_id"})
+	sessions, err := globalDB.ListSessions(ctx, store.SessionListQuery{
+		ReadScope: store.ReadScope{ProfileID: store.DefaultProfileID},
+		ID:        "sess-precut",
+		Limit:     10,
+	})
+	if err != nil {
+		t.Fatalf("ListSessions(pre-cut history) error = %v", err)
+	}
+	if len(sessions) != 1 || sessions[0].ID != "sess-precut" {
+		t.Fatalf("ListSessions(pre-cut history) = %#v, want retained historical session", sessions)
+	}
+	taskRun, err := globalDB.GetTaskRun(ctx, "run-precut")
+	if err != nil {
+		t.Fatalf("GetTaskRun(pre-cut history) error = %v", err)
+	}
+	if taskRun.ID != "run-precut" {
+		t.Fatalf("GetTaskRun(pre-cut history) = %#v, want retained historical run", taskRun)
+	}
+	if _, err := globalDB.GetLoopRun(
+		ctx,
+		looppkg.WorkspaceID("ws-precut"),
+		looppkg.RunID("loop-precut"),
+	); !errors.Is(
+		err,
+		looppkg.ErrRunNotFound,
+	) {
+		t.Fatalf("GetLoopRun(pre-lineage history) error = %v, want ErrRunNotFound", err)
+	}
+}
+
+func assertRetainedOwnerWithoutNetwork(t *testing.T, db *sql.DB, table string) {
+	t.Helper()
+	assertTableExcludesColumns(
+		t,
+		db,
+		table,
+		[]string{"network_spec_json", "network_mode", "network_channel", "network_source"},
+	)
+	if table != "sessions" && table != "task_runs" {
+		t.Fatalf("unsupported owner table %q", table)
+	}
+	var count int
+	if err := db.QueryRowContext(testutil.Context(t), "SELECT COUNT(*) FROM "+table).Scan(&count); err != nil {
+		t.Fatal(err)
+	}
+	if count != 1 {
+		t.Fatalf("%s retained owner count = %d, want 1", table, count)
+	}
+}
+
+func TestOpenGlobalDBRefusesLegacyDatabaseWithoutMutation(t *testing.T) {
+	t.Run("Should return ErrLegacyDatabase without changing the database file", func(t *testing.T) {
+		t.Parallel()
+
+		ctx := testutil.Context(t)
+		path := filepath.Join(t.TempDir(), GlobalDatabaseName)
+		legacy, err := sql.Open("sqlite", path)
+		if err != nil {
+			t.Fatalf("sql.Open(legacy) error = %v", err)
+		}
+		if _, err := legacy.ExecContext(ctx, `CREATE TABLE schema_migrations (
+		version INTEGER PRIMARY KEY,
+		name TEXT NOT NULL,
+		checksum TEXT NOT NULL,
+		applied_at TEXT NOT NULL
+	)`); err != nil {
+			t.Fatalf("create legacy schema_migrations error = %v", err)
+		}
+		if _, err := legacy.ExecContext(ctx, `WITH RECURSIVE versions(version) AS (
+		SELECT 1 UNION ALL SELECT version + 1 FROM versions WHERE version < 61
+	) INSERT INTO schema_migrations (version, name, checksum, applied_at)
+	SELECT version,
+		CASE WHEN version = 1 THEN 'create_global_schema' ELSE printf('legacy_%02d', version) END,
+		printf('checksum-%02d', version),
+		'2026-07-10T00:00:00Z'
+	FROM versions`); err != nil {
+			t.Fatalf("seed legacy schema_migrations error = %v", err)
+		}
+		if err := legacy.Close(); err != nil {
+			t.Fatalf("Close(legacy) error = %v", err)
+		}
+		before, err := os.ReadFile(path)
+		if err != nil {
+			t.Fatalf("ReadFile(before) error = %v", err)
+		}
+
+		_, openErr := OpenGlobalDB(ctx, path)
+		if !errors.Is(openErr, store.ErrLegacyDatabase) {
+			t.Fatalf("OpenGlobalDB(legacy) error = %v, want ErrLegacyDatabase", openErr)
+		}
+		canonicalPath, err := filepath.EvalSymlinks(path)
+		if err != nil {
+			t.Fatalf("EvalSymlinks(legacy path) error = %v", err)
+		}
+		if !strings.Contains(openErr.Error(), canonicalPath) ||
+			!strings.Contains(openErr.Error(), "complete COMPOZY_HOME or workspace .compozy directory") {
+			t.Fatalf("OpenGlobalDB(legacy) error = %q, want path and whole-family remediation", openErr)
+		}
+		after, err := os.ReadFile(path)
+		if err != nil {
+			t.Fatalf("ReadFile(after) error = %v", err)
+		}
+		if !bytes.Equal(after, before) {
+			t.Fatal("legacy database bytes changed after refused open")
+		}
+	})
+}
+
+func TestSweepObservabilityDeletesOnlyRowsOlderThanCutoff(t *testing.T) {
+	t.Parallel()
+
+	t.Run("Should avoid waiting for the writer when no observability rows have expired", func(t *testing.T) {
+		t.Parallel()
+		ctx := t.Context()
+		db := openTestGlobalDB(t)
+		writer, err := db.DB().Conn(ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() {
+			if err := writer.Close(); err != nil {
+				t.Error(err)
+			}
+		})
+		// Initialize the second reader before measuring contention, including under the race detector.
+		if _, err := db.SweepObservability(ctx, time.Date(2026, 10, 9, 12, 0, 0, 0, time.UTC)); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := writer.ExecContext(ctx, "BEGIN IMMEDIATE"); err != nil {
+			t.Fatal(err)
+		}
+		sweepCtx, cancel := context.WithTimeout(ctx, 100*time.Millisecond)
+		defer cancel()
+		result, sweepErr := db.SweepObservability(sweepCtx, time.Date(2026, 10, 9, 12, 0, 0, 0, time.UTC))
+		if _, err := writer.ExecContext(ctx, "ROLLBACK"); err != nil {
+			t.Fatal(err)
+		}
+		if sweepErr != nil || result.DeletedEventSummaries != 0 || result.DeletedTokenStats != 0 ||
+			result.DeletedPermissionLogs != 0 || result.DeletedTokenUsageDaily != 0 {
+			t.Fatalf("empty sweep = %#v, %v", result, sweepErr)
+		}
+	})
+
+	ctx := testutil.Context(t)
+	globalDB := openTestGlobalDB(t)
+	registerSessionForGlobalTests(t, globalDB, "sess-retention")
+
+	cutoff := time.Date(2026, 4, 24, 12, 0, 0, 0, time.UTC)
+	old := cutoff.Add(-time.Nanosecond)
+	boundary := cutoff
+	fresh := cutoff.Add(time.Nanosecond)
+
+	for _, event := range []EventSummary{
+		{ProfileID: store.DefaultProfileID, ID: "sum-old", SessionID: "sess-retention", Type: "agent_message", AgentName: "coder", Timestamp: old},
+		{ProfileID: store.DefaultProfileID, ID: "sum-boundary", SessionID: "sess-retention", Type: "agent_message", AgentName: "coder", Timestamp: boundary},
+		{ProfileID: store.DefaultProfileID, ID: "sum-fresh", SessionID: "sess-retention", Type: "agent_message", AgentName: "coder", Timestamp: fresh},
+	} {
+		if err := globalDB.WriteEventSummary(ctx, event); err != nil {
+			t.Fatalf("WriteEventSummary(%q) error = %v", event.ID, err)
+		}
+	}
+
+	for _, update := range []TokenStatsUpdate{
+		{SessionID: "sess-retention", AgentName: "coder-old", CostStatus: "unknown", CostSource: "none", Turns: 1, UpdatedAt: old},
+		{SessionID: "sess-retention", AgentName: "coder-boundary", CostStatus: "unknown", CostSource: "none", Turns: 1, UpdatedAt: boundary},
+		{SessionID: "sess-retention", AgentName: "coder-fresh", CostStatus: "unknown", CostSource: "none", Turns: 1, UpdatedAt: fresh},
+	} {
+		if err := globalDB.UpdateTokenStats(ctx, update); err != nil {
+			t.Fatalf("UpdateTokenStats(%q) error = %v", update.AgentName, err)
+		}
+	}
+
+	for _, entry := range []PermissionLogEntry{
+		{
+			ID: "perm-old", SessionID: "sess-retention", AgentName: "coder", Action: "fs/read",
+			Resource: "old.md", Decision: "allow", PolicyUsed: "approve-all", Timestamp: old,
+		},
+		{
+			ID: "perm-boundary", SessionID: "sess-retention", AgentName: "coder", Action: "fs/read",
+			Resource: "boundary.md", Decision: "allow", PolicyUsed: "approve-all", Timestamp: boundary,
+		},
+		{
+			ID: "perm-fresh", SessionID: "sess-retention", AgentName: "coder", Action: "fs/read",
+			Resource: "fresh.md", Decision: "allow", PolicyUsed: "approve-all", Timestamp: fresh,
+		},
+	} {
+		if err := globalDB.WritePermissionLog(ctx, entry); err != nil {
+			t.Fatalf("WritePermissionLog(%q) error = %v", entry.ID, err)
+		}
+	}
+
+	result, err := globalDB.SweepObservability(ctx, cutoff)
+	if err != nil {
+		t.Fatalf("SweepObservability() error = %v", err)
+	}
+	if result.DeletedEventSummaries != 1 || result.DeletedTokenStats != 1 || result.DeletedPermissionLogs != 1 {
+		t.Fatalf("SweepObservability() = %#v, want one deleted row per observe table", result)
+	}
+	if !result.CutoffAt.Equal(cutoff) {
+		t.Fatalf("SweepObservability().CutoffAt = %s, want %s", result.CutoffAt, cutoff)
+	}
+
+	assertEventSummaryIDs(t, globalDB, []string{"sum-boundary", "sum-fresh"})
+	assertTokenStatAgents(t, globalDB, []string{"coder-boundary", "coder-fresh"})
+	assertPermissionLogIDs(t, globalDB, []string{"perm-boundary", "perm-fresh"})
+}
+
+// Invariant: a freshly migrated extension schema retains its exact shape on reopen.
+// Owner: global database integration; canonical suite: extension schema lifecycle.
+func TestOpenGlobalDBExtensionsSchemaIsIdempotent(t *testing.T) {
+	t.Run("Should create the extension schema and preserve it across reopen", func(t *testing.T) {
+		t.Parallel()
+
+		first := openFreshTestGlobalDB(t)
+		assertExtensionTableColumns(t, first)
+		dbPath := first.Path()
+		if err := first.Close(testutil.Context(t)); err != nil {
+			t.Fatalf("Close(first) error = %v", err)
+		}
+		second, err := OpenGlobalDB(testutil.Context(t), dbPath)
+		if err != nil {
+			t.Fatalf("OpenGlobalDB(second) error = %v", err)
+		}
+		t.Cleanup(func() {
+			if err := second.Close(testutil.Context(t)); err != nil {
+				t.Errorf("Close(second) error = %v", err)
+			}
+		})
+		assertExtensionTableColumns(t, second)
+	})
+}
+
+func assertExtensionTableColumns(t *testing.T, globalDB *GlobalDB) {
+	t.Helper()
+
+	assertTableColumns(t, globalDB.db, "extensions", []string{
+		"name",
+		"version",
+		"source",
+		"manifest_path",
+		"format",
+		"ingest_diagnostics_json",
+		"installed_at",
+		"provides_json",
+		"permissions_json",
+		"checksum",
+		"lifecycle_token",
+		"registry_slug",
+		"registry_name",
+		"remote_version",
+		globalDBExtensionProvenanceJSONKey,
+		"gateway_requirement_digest",
+		"gateway_confirmed_by",
+		"gateway_confirmed_at",
+	})
+	assertTableColumns(t, globalDB.db, "extension_profile_enablement", []string{
+		"extension_name",
+		"profile_id",
+		"enabled",
+	})
+	assertTableColumns(t, globalDB.db, "extension_dev_links", []string{
+		"extension_name",
+		"workspace_id",
+		"origin_path",
+		"bundle_generation",
+		"linked_at",
+		"format",
+		"ingest_diagnostics_json",
+		"gateway_requirement_digest",
+		"gateway_confirmed_by",
+		"gateway_confirmed_at",
+	})
+	assertTableColumns(t, globalDB.db, "extension_env_bindings", []string{
+		"extension_name",
+		"profile_id",
+		"workspace_id",
+		"env_name",
+		"secret_ref",
+		"input_id",
+		"active",
+		"mcp_server",
+		"header_name",
+		"kind",
+		"created_at",
+		"updated_at",
+	})
+}
+
+func TestRepositoryCheckReady(t *testing.T) {
+	t.Run("Should accept a valid repository and reject a nil context", func(t *testing.T) {
+		t.Parallel()
+
+		globalDB := openTestGlobalDB(t)
+		nilContext := func() context.Context { return nil }
+		if err := globalDB.SessionRepo.checkReady(nilContext(), "list sessions"); err == nil {
+			t.Fatal("checkReady(nil context) error = nil, want non-nil")
+		}
+		if err := globalDB.SessionRepo.checkReady(testutil.Context(t), "list sessions"); err != nil {
+			t.Fatalf("checkReady(valid) error = %v", err)
+		}
+	})
+
+	t.Run("Should reject a repository after its database closes", func(t *testing.T) {
+		t.Parallel()
+
+		globalDB := openTestGlobalDB(t)
+		if err := globalDB.Close(testutil.Context(t)); err != nil {
+			t.Fatalf("Close() error = %v", err)
+		}
+		if err := globalDB.SessionRepo.checkReady(
+			testutil.Context(t),
+			"list sessions",
+		); !errors.Is(err, store.ErrClosed) {
+			t.Fatalf("checkReady(after close) error = %v, want ErrClosed", err)
+		}
+	})
+}
+
+func TestGlobalDBRegisterUpdateAndListSessions(t *testing.T) {
+	t.Run("Should retain Global sessions without exposing them in project listings", func(t *testing.T) {
+		t.Parallel()
+		ctx := t.Context()
+		globalDB := openTestGlobalDB(t)
+		workspaceID := registerWorkspaceForGlobalTests(t, globalDB, "project", t.TempDir())
+		createdAt := time.Date(2026, 8, 21, 12, 0, 0, 0, time.UTC)
+		for _, entry := range []struct{ id, workspaceID string }{
+			{id: "sess-global-retained"},
+			{id: "sess-project-retained", workspaceID: workspaceID},
+		} {
+			if err := globalDB.RegisterSession(ctx, new(SessionInfo{
+				ID: entry.id, WorkspaceID: entry.workspaceID, ProfileID: store.DefaultProfileID,
+				AgentName: "general", Provider: "codex", RuntimeStatus: store.SessionRuntimeUnbound,
+				State: "stopped", CreatedAt: createdAt, UpdatedAt: createdAt,
+			})); err != nil {
+				t.Fatalf("RegisterSession(%q) error = %v", entry.id, err)
+			}
+		}
+		path := globalDB.Path()
+		if err := globalDB.Close(ctx); err != nil {
+			t.Fatalf("Close(before Global session reopen) error = %v", err)
+		}
+		globalDB = openGlobalDBForTest(t, path)
+		sessions, err := globalDB.ListSessions(ctx, SessionListQuery{
+			ReadScope: store.ReadScope{ProfileID: store.DefaultProfileID},
+		})
+		if err != nil {
+			t.Fatalf("ListSessions(Global) error = %v", err)
+		}
+		if len(sessions) != 2 || !slices.ContainsFunc(sessions, func(info SessionInfo) bool {
+			return info.ID == "sess-global-retained" && info.WorkspaceID == "" &&
+				info.ProfileID == store.DefaultProfileID
+		}) {
+			t.Fatalf("Global sessions = %#v, want the retained unscoped session and project session", sessions)
+		}
+		projectSessions, err := globalDB.ListSessions(ctx, SessionListQuery{
+			ReadScope: store.ReadScope{ProfileID: store.DefaultProfileID}, WorkspaceID: workspaceID,
+		})
+		if err != nil {
+			t.Fatalf("ListSessions(project) error = %v", err)
+		}
+		if len(projectSessions) != 1 || projectSessions[0].ID != "sess-project-retained" {
+			t.Fatalf("project sessions = %#v, want only the project-owned session", projectSessions)
+		}
+	})
+
+	t.Run("Should persist recovery state and preserve workspace-scoped listing", func(t *testing.T) {
+		t.Parallel()
+
+		globalDB := openTestGlobalDB(t)
+		createdAt := time.Date(2026, 4, 3, 13, 0, 0, 0, time.UTC)
+		workspaceID := registerWorkspaceForGlobalTests(
+			t,
+			globalDB,
+			"sess-global-workspace",
+			filepath.Join(t.TempDir(), "workspace-global"),
+		)
+		session := SessionInfo{
+			ProfileID:         store.DefaultProfileID,
+			ID:                "sess-global",
+			Name:              "Alpha",
+			AgentName:         "coder",
+			Provider:          "claude",
+			Model:             "claude-opus-4",
+			ReasoningEffort:   "high",
+			Speed:             speedpkg.SpeedFast,
+			SpeedResolution:   &speedpkg.Resolution{Requested: speedpkg.SpeedFast, Status: speedpkg.ResolutionApplied},
+			RuntimeStatus:     store.SessionRuntimeRecovering,
+			RuntimeTransition: store.SessionRuntimeTransitionAutomaticRecovery,
+			RuntimeGeneration: 3,
+			SessionRuntimeDetails: &store.SessionRuntimeDetails{
+				RuntimeRecovery: &store.SessionRuntimeRecovery{
+					Attempt:       1,
+					MaxAttempts:   3,
+					Generation:    4,
+					StartedAt:     createdAt,
+					LastAttemptAt: createdAt.Add(time.Second),
+				},
+			},
+			SelectedRuntime: &store.SessionRuntimeSelection{
+				Provider:        "claude",
+				Model:           "claude-fable-5",
+				ReasoningEffort: "max",
+				Speed:           speedpkg.SpeedFast,
+			},
+			RuntimeSelectionRevision: 4,
+			WorkspaceID:              workspaceID,
+			SessionType:              "dream",
+			State:                    "active",
+			CreatedAt:                createdAt,
+			UpdatedAt:                createdAt,
+		}
+
+		if err := globalDB.RegisterSession(testutil.Context(t), &(session)); err != nil {
+			t.Fatalf("RegisterSession() error = %v", err)
+		}
+		databasePath := globalDB.Path()
+		if err := globalDB.Close(testutil.Context(t)); err != nil {
+			t.Fatalf("Close(before recovery reopen) error = %v", err)
+		}
+		globalDB = openGlobalDBForTest(t, databasePath)
+
+		registered, err := globalDB.ListSessions(testutil.Context(t), SessionListQuery{
+			ReadScope: store.ReadScope{ProfileID: store.DefaultProfileID},
+			ID:        session.ID,
+		})
+		if err != nil {
+			t.Fatalf("ListSessions(registered recovery) error = %v", err)
+		}
+		if len(registered) != 1 {
+			t.Fatalf("ListSessions(registered recovery) = %#v, want one session", registered)
+		}
+		registeredRecovery := registered[0].RuntimeRecoveryValue()
+		if registered[0].RuntimeGeneration != 3 ||
+			registeredRecovery == nil || registeredRecovery.Generation != 4 {
+			t.Fatalf("ListSessions(registered recovery) = %#v, want durable generation 3 recovering into 4", registered)
+		}
+
+		acpSessionID := "acp-123"
+		if err := globalDB.UpdateSessionState(testutil.Context(t), SessionStateUpdate{
+			ID:                session.ID,
+			State:             "stopped",
+			ACPSessionID:      &acpSessionID,
+			RuntimeSet:        true,
+			Provider:          "codex",
+			Model:             "gpt-5.6",
+			ReasoningEffort:   "medium",
+			Speed:             speedpkg.SpeedNormal,
+			RuntimeStatus:     store.SessionRuntimeReady,
+			RuntimeTransition: store.SessionRuntimeTransitionProcessReplacement,
+			RuntimeGeneration: 4,
+			UpdatedAt:         createdAt.Add(2 * time.Minute),
+		}); err != nil {
+			t.Fatalf("UpdateSessionState() error = %v", err)
+		}
+
+		foreignWorkspaceID := registerWorkspaceForGlobalTests(
+			t,
+			globalDB,
+			"sess-global-foreign-workspace",
+			filepath.Join(t.TempDir(), "workspace-global-foreign"),
+		)
+		if err := globalDB.RegisterSession(testutil.Context(t), new(SessionInfo{
+			ProfileID:         store.DefaultProfileID,
+			ID:                "sess-global-foreign",
+			AgentName:         "coder",
+			Provider:          "foreign-provider",
+			Model:             "foreign-model",
+			RuntimeStatus:     store.SessionRuntimeReady,
+			RuntimeTransition: store.SessionRuntimeTransitionInitialBind,
+			WorkspaceID:       foreignWorkspaceID,
+			State:             "stopped",
+			CreatedAt:         createdAt,
+			UpdatedAt:         createdAt,
+		})); err != nil {
+			t.Fatalf("RegisterSession(foreign) error = %v", err)
+		}
+
+		sessions, err := globalDB.ListSessions(testutil.Context(t), SessionListQuery{
+			ReadScope:   store.ReadScope{ProfileID: store.DefaultProfileID},
+			State:       "stopped",
+			WorkspaceID: workspaceID,
+		})
+		if err != nil {
+			t.Fatalf("ListSessions() error = %v", err)
+		}
+		if got, want := len(sessions), 1; got != want {
+			t.Fatalf("len(sessions) = %d, want %d", got, want)
+		}
+		if sessions[0].State != "stopped" {
+			t.Fatalf("sessions[0].State = %q, want stopped", sessions[0].State)
+		}
+		if sessions[0].SessionType != "dream" {
+			t.Fatalf("sessions[0].SessionType = %q, want dream", sessions[0].SessionType)
+		}
+		if sessions[0].WorkspaceID != workspaceID {
+			t.Fatalf("sessions[0].WorkspaceID = %q, want %q", sessions[0].WorkspaceID, workspaceID)
+		}
+		if sessions[0].Provider != "codex" {
+			t.Fatalf("sessions[0].Provider = %q, want codex", sessions[0].Provider)
+		}
+		sessionRecovery := sessions[0].RuntimeRecoveryValue()
+		if sessions[0].RuntimeGeneration != 4 || sessionRecovery != nil {
+			t.Fatalf(
+				"session runtime after recovery = generation %d, recovery %#v; want generation 4 without recovery",
+				sessions[0].RuntimeGeneration,
+				sessionRecovery,
+			)
+		}
+		if sessions[0].Model != "gpt-5.6" || sessions[0].ReasoningEffort != "medium" ||
+			sessions[0].Speed != speedpkg.SpeedNormal || sessions[0].SpeedResolution != nil ||
+			sessions[0].RuntimeStatus != store.SessionRuntimeReady ||
+			sessions[0].RuntimeTransition != store.SessionRuntimeTransitionProcessReplacement {
+			t.Fatalf("sessions[0] runtime projection = %#v", sessions[0])
+		}
+		if sessions[0].SelectedRuntime == nil || sessions[0].SelectedRuntime.Provider != "claude" ||
+			sessions[0].SelectedRuntime.Model != "claude-fable-5" ||
+			sessions[0].SelectedRuntime.ReasoningEffort != "max" ||
+			sessions[0].SelectedRuntime.Speed != speedpkg.SpeedFast ||
+			sessions[0].RuntimeSelectionRevision != 4 {
+			t.Fatalf(
+				"sessions[0] selected runtime = %#v revision %d, want durable Claude selection at revision 4",
+				sessions[0].SelectedRuntime,
+				sessions[0].RuntimeSelectionRevision,
+			)
+		}
+		if sessions[0].ACPSessionID == nil || *sessions[0].ACPSessionID != "acp-123" {
+			t.Fatalf("sessions[0].ACPSessionID = %#v, want acp-123", sessions[0].ACPSessionID)
+		}
+	})
+}
+
+func TestGlobalDBRegisterSessionUpsertsProvider(t *testing.T) {
+	t.Parallel()
+
+	globalDB := openTestGlobalDB(t)
+	workspaceID := registerWorkspaceForGlobalTests(
+		t,
+		globalDB,
+		"provider-upsert-workspace",
+		filepath.Join(t.TempDir(), "provider-upsert"),
+	)
+	createdAt := time.Date(2026, 4, 3, 13, 0, 0, 0, time.UTC)
+
+	session := SessionInfo{
+		ProfileID:     store.DefaultProfileID,
+		ID:            "sess-provider-upsert",
+		AgentName:     "coder",
+		Provider:      "claude",
+		RuntimeStatus: store.SessionRuntimeUnbound,
+		WorkspaceID:   workspaceID,
+		State:         "active",
+		CreatedAt:     createdAt,
+		UpdatedAt:     createdAt,
+	}
+	if err := globalDB.RegisterSession(testutil.Context(t), &(session)); err != nil {
+		t.Fatalf("RegisterSession(initial) error = %v", err)
+	}
+
+	session.Provider = "codex"
+	session.UpdatedAt = createdAt.Add(time.Minute)
+	if err := globalDB.RegisterSession(testutil.Context(t), &(session)); err != nil {
+		t.Fatalf("RegisterSession(update) error = %v", err)
+	}
+
+	sessions, err := globalDB.ListSessions(testutil.Context(t), SessionListQuery{
+		ReadScope: store.ReadScope{ProfileID: store.DefaultProfileID},
+	})
+	if err != nil {
+		t.Fatalf("ListSessions() error = %v", err)
+	}
+	if got, want := len(sessions), 1; got != want {
+		t.Fatalf("len(sessions) = %d, want %d", got, want)
+	}
+	if got, want := sessions[0].Provider, "codex"; got != want {
+		t.Fatalf("sessions[0].Provider = %q, want %q", got, want)
+	}
+
+	var provider string
+	if err := globalDB.db.QueryRowContext(
+		testutil.Context(t),
+		`SELECT provider FROM sessions WHERE id = ?`,
+		session.ID,
+	).Scan(&provider); err != nil {
+		t.Fatalf("QueryRowContext(provider) error = %v", err)
+	}
+	if got, want := provider, "codex"; got != want {
+		t.Fatalf("stored provider = %q, want %q", got, want)
+	}
+}
+
+func TestGlobalDBRegisterSessionPersistsStopFields(t *testing.T) {
+	t.Parallel()
+
+	for _, tc := range []struct {
+		name           string
+		stopReason     store.StopReason
+		stopDetail     string
+		wantStopReason *string
+		wantStopDetail *string
+	}{
+		{
+			name: "empty stop reason stores nulls",
+		},
+		{
+			name:           "valid stop reason stores values",
+			stopReason:     store.StopTimeout,
+			stopDetail:     "deadline exceeded",
+			wantStopReason: stringPointerForTest(string(store.StopTimeout)),
+			wantStopDetail: stringPointerForTest("deadline exceeded"),
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			globalDB := openTestGlobalDB(t)
+			workspaceID := registerWorkspaceForGlobalTests(
+				t,
+				globalDB,
+				"persist-stop-workspace-"+strings.ReplaceAll(tc.name, " ", "-"),
+				filepath.Join(t.TempDir(), "workspace"),
+			)
+			session := SessionInfo{
+				ProfileID:     store.DefaultProfileID,
+				ID:            "sess-" + strings.ReplaceAll(tc.name, " ", "-"),
+				AgentName:     "coder",
+				RuntimeStatus: store.SessionRuntimeUnbound,
+				WorkspaceID:   workspaceID,
+				State:         "stopped",
+				StopReason:    tc.stopReason,
+				StopEscalated: tc.stopReason != "",
+				StopDetail:    tc.stopDetail,
+				CreatedAt:     time.Date(2026, 4, 3, 13, 0, 0, 0, time.UTC),
+				UpdatedAt:     time.Date(2026, 4, 3, 13, 0, 0, 0, time.UTC),
+			}
+
+			if err := globalDB.RegisterSession(testutil.Context(t), &(session)); err != nil {
+				t.Fatalf("RegisterSession() error = %v", err)
+			}
+
+			gotStopReason, gotStopDetail := queryStoredSessionStopFields(t, globalDB.db, session.ID)
+			assertOptionalStringEqual(t, gotStopReason, tc.wantStopReason, "stop_reason")
+			assertOptionalStringEqual(t, gotStopDetail, tc.wantStopDetail, "stop_detail")
+
+			sessions, err := globalDB.ListSessions(testutil.Context(t), SessionListQuery{
+				ReadScope: store.ReadScope{ProfileID: store.DefaultProfileID},
+			})
+			if err != nil {
+				t.Fatalf("ListSessions() error = %v", err)
+			}
+			if got, want := len(sessions), 1; got != want {
+				t.Fatalf("len(sessions) = %d, want %d", got, want)
+			}
+			if sessions[0].StopEscalated != session.StopEscalated {
+				t.Fatalf("stop escalation = %t, want %t", sessions[0].StopEscalated, session.StopEscalated)
+			}
+			if got, want := sessions[0].StopReason, tc.stopReason; got != want {
+				t.Fatalf("sessions[0].StopReason = %q, want %q", got, want)
+			}
+			if got, want := sessions[0].StopDetail, tc.stopDetail; got != want {
+				t.Fatalf("sessions[0].StopDetail = %q, want %q", got, want)
+			}
+		})
+	}
+}
+
+func TestGlobalDBRegisterSessionDefaultsTypeToUser(t *testing.T) {
+	t.Parallel()
+
+	globalDB := openTestGlobalDB(t)
+	workspaceID := registerWorkspaceForGlobalTests(
+		t,
+		globalDB,
+		"sess-default-type-workspace",
+		filepath.Join(t.TempDir(), "workspace-default-type"),
+	)
+	session := SessionInfo{
+		ProfileID:     store.DefaultProfileID,
+		ID:            "sess-default-type",
+		AgentName:     "coder",
+		RuntimeStatus: store.SessionRuntimeUnbound,
+		WorkspaceID:   workspaceID,
+		State:         "active",
+		CreatedAt:     time.Date(2026, 4, 3, 13, 0, 0, 0, time.UTC),
+		UpdatedAt:     time.Date(2026, 4, 3, 13, 0, 0, 0, time.UTC),
+	}
+
+	if err := globalDB.RegisterSession(testutil.Context(t), &(session)); err != nil {
+		t.Fatalf("RegisterSession() error = %v", err)
+	}
+
+	sessions, err := globalDB.ListSessions(testutil.Context(t), SessionListQuery{
+		ReadScope: store.ReadScope{ProfileID: store.DefaultProfileID},
+	})
+	if err != nil {
+		t.Fatalf("ListSessions() error = %v", err)
+	}
+	if got, want := len(sessions), 1; got != want {
+		t.Fatalf("len(sessions) = %d, want %d", got, want)
+	}
+	if got, want := sessions[0].SessionType, defaultSessionType; got != want {
+		t.Fatalf("sessions[0].SessionType = %q, want %q", got, want)
+	}
+}
+
+func TestGlobalDBTaskEventSequenceReads(t *testing.T) {
+	t.Parallel()
+
+	globalDB := openTestGlobalDB(t)
+	ctx := testutil.Context(t)
+	createdAt := time.Date(2026, 4, 17, 12, 0, 0, 0, time.UTC)
+	actor := taskpkg.ActorIdentity{Kind: taskpkg.ActorKindHuman, Ref: "user-1"}
+	origin := taskpkg.Origin{Kind: taskpkg.OriginKindCLI, Ref: "compozy task test"}
+
+	if err := globalDB.CreateTask(ctx, taskpkg.Task{
+		ID:             "task-seq",
+		Scope:          taskpkg.ScopeGlobal,
+		Title:          "Sequence task",
+		Priority:       taskpkg.DefaultPriority,
+		MaxAttempts:    taskpkg.DefaultTaskMaxAttempts,
+		Status:         taskpkg.TaskStatusReady,
+		ApprovalPolicy: taskpkg.ApprovalPolicyNone,
+		ApprovalState:  taskpkg.ApprovalStateNotRequired,
+		CreatedBy:      actor,
+		Origin:         origin,
+		CreatedAt:      createdAt,
+		ProfileID:      store.DefaultProfileID,
+		UpdatedAt:      createdAt,
+	}); err != nil {
+		t.Fatalf("CreateTask() error = %v", err)
+	}
+	if err := globalDB.CreateTaskRun(ctx, taskpkg.Run{
+		ID:        "run-seq",
+		TaskID:    "task-seq",
+		Status:    taskpkg.TaskRunStatusRunning,
+		Attempt:   1,
+		Origin:    origin,
+		QueuedAt:  createdAt,
+		ProfileID: store.DefaultProfileID,
+		StartedAt: createdAt.Add(time.Minute),
+	}); err != nil {
+		t.Fatalf("CreateTaskRun() error = %v", err)
+	}
+	emptyTask, err := globalDB.GetTask(ctx, "task-seq")
+	if err != nil {
+		t.Fatalf("GetTask(empty) error = %v", err)
+	}
+	if emptyTask.LatestEventSeq != 0 {
+		t.Fatalf("LatestEventSeq before events = %d, want 0", emptyTask.LatestEventSeq)
+	}
+
+	for _, event := range []taskpkg.Event{
+		{
+			ID:        "evt-1",
+			TaskID:    "task-seq",
+			EventType: "task.created",
+			Actor:     actor,
+			Origin:    origin,
+			Timestamp: createdAt,
+		},
+		{
+			ID:        "evt-2",
+			TaskID:    "task-seq",
+			RunID:     "run-seq",
+			EventType: "task.run_started",
+			Actor:     actor,
+			Origin:    origin,
+			Timestamp: createdAt,
+		},
+		{
+			ID:        "evt-3",
+			TaskID:    "task-seq",
+			EventType: "task.updated",
+			Actor:     actor,
+			Origin:    origin,
+			Timestamp: createdAt,
+		},
+	} {
+		if err := globalDB.CreateTaskEvent(ctx, event); err != nil {
+			t.Fatalf("CreateTaskEvent(%q) error = %v", event.ID, err)
+		}
+	}
+
+	record, err := globalDB.GetTaskEventRecord(ctx, "evt-2")
+	if err != nil {
+		t.Fatalf("GetTaskEventRecord() error = %v", err)
+	}
+	if got, want := record.Sequence, int64(2); got != want {
+		t.Fatalf("record.Sequence = %d, want %d", got, want)
+	}
+	if got, want := record.Event.RunID, "run-seq"; got != want {
+		t.Fatalf("record.Event.RunID = %q, want %q", got, want)
+	}
+
+	records, err := globalDB.ListTaskEventRecords(ctx, taskpkg.EventRecordQuery{
+		TaskID:        "task-seq",
+		AfterSequence: 1,
+		Limit:         2,
+	})
+	if err != nil {
+		t.Fatalf("ListTaskEventRecords() error = %v", err)
+	}
+	if got, want := len(records), 2; got != want {
+		t.Fatalf("len(records) = %d, want %d", got, want)
+	}
+	if got, want := []string{
+		records[0].Event.ID,
+		records[1].Event.ID,
+	}, []string{
+		"evt-2",
+		"evt-3",
+	}; !testutil.EqualStringSlices(
+		got,
+		want,
+	) {
+		t.Fatalf("record ids = %#v, want %#v", got, want)
+	}
+	if got, want := []int64{
+		records[0].Sequence,
+		records[1].Sequence,
+	}, []int64{
+		2,
+		3,
+	}; got[0] != want[0] ||
+		got[1] != want[1] {
+		t.Fatalf("record sequences = %#v, want %#v", got, want)
+	}
+
+	taskRecord, err := globalDB.GetTask(ctx, "task-seq")
+	if err != nil {
+		t.Fatalf("GetTask(after events) error = %v", err)
+	}
+	if taskRecord.LatestEventSeq != 3 {
+		t.Fatalf("LatestEventSeq after events = %d, want 3", taskRecord.LatestEventSeq)
+	}
+	summaries, err := globalDB.ListTasks(ctx, taskpkg.Query{})
+	if err != nil {
+		t.Fatalf("ListTasks() error = %v", err)
+	}
+	if len(summaries) != 1 || summaries[0].LatestEventSeq != 3 {
+		t.Fatalf("ListTasks() = %#v, want latest_event_seq=3", summaries)
+	}
+	descRecords, err := globalDB.ListTaskEventRecords(ctx, taskpkg.EventRecordQuery{
+		TaskID:     "task-seq",
+		Limit:      2,
+		Descending: true,
+	})
+	if err != nil {
+		t.Fatalf("ListTaskEventRecords(descending) error = %v", err)
+	}
+	if len(descRecords) != 2 {
+		t.Fatalf("len(descRecords) = %d, want 2", len(descRecords))
+	}
+	if got, want := []string{
+		descRecords[0].Event.ID,
+		descRecords[1].Event.ID,
+	}, []string{
+		"evt-3",
+		"evt-2",
+	}; !testutil.EqualStringSlices(
+		got,
+		want,
+	) {
+		t.Fatalf("descending record ids = %#v, want %#v", got, want)
+	}
+}
+
+func TestGlobalDBWorkspaceCRUDAndLookups(t *testing.T) {
+	t.Run("Should persist workspace changes and resolve canonical lookups", func(t *testing.T) {
+		t.Parallel()
+
+		globalDB := openTestGlobalDB(t)
+		rootParent := t.TempDir()
+		rootDir := filepath.Join(rootParent, "workspace-root")
+		if err := os.MkdirAll(rootDir, 0o755); err != nil {
+			t.Fatalf("MkdirAll(rootDir) error = %v", err)
+		}
+		symlinkPath := filepath.Join(t.TempDir(), "workspace-link")
+		if err := os.Symlink(rootDir, symlinkPath); err != nil {
+			t.Fatalf("Symlink() error = %v", err)
+		}
+
+		canonicalRoot, err := filepath.EvalSymlinks(symlinkPath)
+		if err != nil {
+			t.Fatalf("EvalSymlinks() error = %v", err)
+		}
+
+		createdAt := time.Date(2026, 4, 3, 12, 0, 0, 0, time.UTC)
+		ws := compozyworkspace.Workspace{
+			ID:             "ws-primary",
+			RootDir:        canonicalRoot,
+			AdditionalDirs: []string{filepath.Join(rootDir, "a"), "", filepath.Join(rootDir, "b")},
+			Name:           "alpha",
+			DefaultAgent:   "coder",
+			CreatedAt:      createdAt,
+			UpdatedAt:      createdAt,
+		}
+		if err := globalDB.InsertWorkspace(testutil.Context(t), ws); err != nil {
+			t.Fatalf("InsertWorkspace() error = %v", err)
+		}
+
+		byID, err := globalDB.GetWorkspace(testutil.Context(t), ws.ID)
+		if err != nil {
+			t.Fatalf("GetWorkspace() error = %v", err)
+		}
+		assertWorkspaceEqual(t, byID, compozyworkspace.Workspace{
+			ID:             ws.ID,
+			RootDir:        canonicalRoot,
+			AdditionalDirs: []string{filepath.Join(rootDir, "a"), filepath.Join(rootDir, "b")},
+			Name:           "alpha",
+			DefaultAgent:   "coder",
+			CreatedAt:      createdAt,
+			UpdatedAt:      createdAt,
+		})
+
+		byPath, err := globalDB.GetWorkspaceByPath(testutil.Context(t), canonicalRoot)
+		if err != nil {
+			t.Fatalf("GetWorkspaceByPath() error = %v", err)
+		}
+		assertWorkspaceEqual(t, byPath, byID)
+
+		byName, err := globalDB.GetWorkspaceByName(testutil.Context(t), "alpha")
+		if err != nil {
+			t.Fatalf("GetWorkspaceByName() error = %v", err)
+		}
+		assertWorkspaceEqual(t, byName, byID)
+
+		updated := byID
+		updated.Name = "beta"
+		updated.DefaultAgent = "reviewer"
+		updated.AdditionalDirs = []string{filepath.Join(rootDir, "tools")}
+		updated.UpdatedAt = createdAt.Add(5 * time.Minute)
+		if err := globalDB.UpdateWorkspace(testutil.Context(t), updated); err != nil {
+			t.Fatalf("UpdateWorkspace() error = %v", err)
+		}
+
+		gotUpdated, err := globalDB.GetWorkspace(testutil.Context(t), updated.ID)
+		if err != nil {
+			t.Fatalf("GetWorkspace(updated) error = %v", err)
+		}
+		assertWorkspaceEqual(t, gotUpdated, updated)
+
+		if err := globalDB.DeleteWorkspace(testutil.Context(t), updated.ID); err != nil {
+			t.Fatalf("DeleteWorkspace() error = %v", err)
+		}
+		if _, err := globalDB.GetWorkspace(
+			testutil.Context(t),
+			updated.ID,
+		); !errors.Is(
+			err,
+			compozyworkspace.ErrWorkspaceNotFound,
+		) {
+			t.Fatalf("GetWorkspace(deleted) error = %v, want ErrWorkspaceNotFound", err)
+		}
+	})
+}
+
+func TestGlobalDBWorkspaceArchive(t *testing.T) {
+	t.Run("Should reconcile observed non-stopped metadata without starting archived work", func(t *testing.T) {
+		t.Parallel()
+		db := openTestGlobalDB(t)
+		id := registerWorkspaceForGlobalTests(t, db, "recovery-project", t.TempDir())
+		healthyID := registerWorkspaceForGlobalTests(t, db, "healthy-project", t.TempDir())
+		if _, err := db.SetWorkspaceArchived(t.Context(), id, true); err != nil {
+			t.Fatal(err)
+		}
+		rows := []SessionInfo{}
+		for i, workspaceID := range []string{id, healthyID} {
+			rows = append(rows, SessionInfo{
+				ID: fmt.Sprintf("recovered-%d", i), WorkspaceID: workspaceID,
+				AgentName: "coder", Provider: "codex", State: "idle",
+				RuntimeStatus: store.SessionRuntimeUnbound, ProfileID: store.DefaultProfileID,
+				CreatedAt: time.Now(), UpdatedAt: time.Now(),
+			})
+		}
+		if _, err := db.ReconcileSessions(t.Context(), rows); err != nil {
+			t.Fatal(err)
+		}
+		got, err := db.ListSessions(
+			t.Context(),
+			SessionListQuery{WorkspaceID: id, ReadScope: store.ReadScope{AllProfiles: true}},
+		)
+		if err != nil || len(got) != 1 || got[0].State != "idle" || got[0].WorkspaceID != id {
+			t.Fatalf("recovered row = %#v, %v", got, err)
+		}
+		if err := db.RegisterSession(t.Context(), &(rows[0])); !errors.Is(err, store.ErrWorkspaceArchived) {
+			t.Fatalf("new admission = %v", err)
+		}
+	})
+
+	t.Run("Should prevent new work and reactivation through automation overlays", func(t *testing.T) {
+		t.Parallel()
+		ctx := t.Context()
+		db := openTestGlobalDB(t)
+		id := registerWorkspaceForGlobalTests(t, db, "disabled-project", t.TempDir())
+		job, err := db.CreateJob(ctx, automationJobForTest(automation.AutomationScopeWorkspace,
+			"disabled-job", id, automation.JobSourceConfig))
+		if err != nil {
+			t.Fatal(err)
+		}
+		trigger, err := db.CreateTrigger(ctx, automationNonWebhookTriggerForTest(automation.AutomationScopeWorkspace,
+			"disabled-trigger", id, automation.JobSourceConfig))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := db.SetJobEnabledOverlay(
+			ctx,
+			JobEnabledOverlay{JobID: job.ID, EnabledOverride: false},
+		); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := db.SetTriggerEnabledOverlay(
+			ctx,
+			TriggerEnabledOverlay{TriggerID: trigger.ID, EnabledOverride: false},
+		); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := db.SetWorkspaceArchived(ctx, id, true); err != nil {
+			t.Fatal(err)
+		}
+		checks := map[string]func() error{
+			"enable job": func() error {
+				_, err := db.SetJobEnabledOverlay(ctx, JobEnabledOverlay{JobID: job.ID, EnabledOverride: true})
+				return err
+			},
+			"enable trigger": func() error {
+				_, err := db.SetTriggerEnabledOverlay(
+					ctx,
+					TriggerEnabledOverlay{TriggerID: trigger.ID, EnabledOverride: true},
+				)
+				return err
+			},
+			"clear job override":     func() error { return db.DeleteJobEnabledOverlay(ctx, job.ID) },
+			"clear trigger override": func() error { return db.DeleteTriggerEnabledOverlay(ctx, trigger.ID) },
+			"start loop": func() error {
+				run := testLoopRun("archived-loop", time.Date(2026, 10, 28, 0, 0, 0, 0, time.UTC), looppkg.StatusQueued)
+				run.WorkspaceID = looppkg.WorkspaceID(id)
+				_, err := db.CreateLoopRunForStart(ctx, run, dsl.ConcurrencyAllow)
+				return err
+			},
+		}
+		for name, check := range checks {
+			t.Run("Should refuse "+name, func(t *testing.T) {
+				if err := check(); !errors.Is(err, store.ErrWorkspaceArchived) {
+					t.Fatalf("admission = %v", err)
+				}
+			})
+		}
+		// Definition reload retains the disabled overlay even when config says enabled.
+		job.Name = "reloaded-job"
+		if _, err := db.UpdateJob(ctx, job); err != nil {
+			t.Fatalf("reload disabled job: %v", err)
+		}
+		trigger.Name = "reloaded-trigger"
+		if _, err := db.UpdateTrigger(ctx, trigger); err != nil {
+			t.Fatalf("reload disabled trigger: %v", err)
+		}
+		if _, err := db.SetWorkspaceArchived(ctx, id, false); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := db.SetJobEnabledOverlay(ctx, JobEnabledOverlay{JobID: job.ID, EnabledOverride: true}); err != nil {
+			t.Fatalf("enable after unarchive: %v", err)
+		}
+		if _, err := db.SetTriggerEnabledOverlay(
+			ctx,
+			TriggerEnabledOverlay{TriggerID: trigger.ID, EnabledOverride: true},
+		); err != nil {
+			t.Fatalf("enable after unarchive: %v", err)
+		}
+		if _, err := db.SetJobEnabledOverlay(
+			ctx,
+			JobEnabledOverlay{JobID: job.ID, EnabledOverride: false},
+		); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := db.SetTriggerEnabledOverlay(
+			ctx,
+			TriggerEnabledOverlay{TriggerID: trigger.ID, EnabledOverride: false},
+		); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := db.SetWorkspaceArchived(ctx, id, true); err != nil {
+			t.Fatal(err)
+		}
+		if err := db.DeleteWorkspace(ctx, id); err != nil {
+			t.Fatalf("remove archived project with disabled config automations: %v", err)
+		}
+		if _, err := db.GetJob(ctx, job.ID); !errors.Is(err, automation.ErrJobNotFound) {
+			t.Fatalf("job survived removal: %v", err)
+		}
+		if _, err := db.GetTrigger(ctx, trigger.ID); !errors.Is(err, automation.ErrTriggerNotFound) {
+			t.Fatalf("trigger survived removal: %v", err)
+		}
+	})
+	for _, kind := range []string{"loop", "job", "trigger"} {
+		t.Run("Should refuse archive with a live "+kind, func(t *testing.T) {
+			t.Parallel()
+			ctx := t.Context()
+			db := openTestGlobalDB(t)
+			id := registerWorkspaceForGlobalTests(t, db, "busy-project", t.TempDir())
+			switch kind {
+			case "loop":
+				run := testLoopRun(
+					"archive-live-loop",
+					time.Date(2026, 10, 28, 0, 0, 0, 0, time.UTC),
+					looppkg.StatusRunning,
+				)
+				run.WorkspaceID = looppkg.WorkspaceID(id)
+				if _, err := db.CreateLoopRunForStart(ctx, run, dsl.ConcurrencyAllow); err != nil {
+					t.Fatal(err)
+				}
+			case "job":
+				if _, err := db.CreateJob(ctx, automationJobForTest(automation.AutomationScopeWorkspace,
+					"archive-live-job", id, automation.JobSourceDynamic)); err != nil {
+					t.Fatal(err)
+				}
+			case "trigger":
+				if _, err := db.CreateTrigger(
+					ctx,
+					automationNonWebhookTriggerForTest(automation.AutomationScopeWorkspace,
+						"archive-live-trigger", id, automation.JobSourceDynamic),
+				); err != nil {
+					t.Fatal(err)
+				}
+			}
+			_, err := db.SetWorkspaceArchived(ctx, id, true)
+			busy, ok := errors.AsType[*compozyworkspace.BusyError](err)
+			if !ok || len(busy.Blockers) != 1 || busy.Blockers[0].Kind != kind {
+				t.Fatalf("missing %s blocker: %v", kind, err)
+			}
+		})
+	}
+
+	t.Run("Should preserve identity and stopped history while refusing new sessions", func(t *testing.T) {
+		t.Parallel()
+		ctx := t.Context()
+		db := openTestGlobalDB(t)
+		id := registerWorkspaceForGlobalTests(t, db, "archive-project", t.TempDir())
+		original, err := db.GetWorkspace(ctx, id)
+		if err != nil {
+			t.Fatal(err)
+		}
+		session := SessionInfo{ID: "archive-history", ProfileID: store.DefaultProfileID,
+			AgentName: "coder", WorkspaceID: id, State: "stopped", RuntimeStatus: store.SessionRuntimeUnbound,
+			CreatedAt: original.CreatedAt, UpdatedAt: original.UpdatedAt}
+		if err := db.RegisterSession(ctx, &(session)); err != nil {
+			t.Fatal(err)
+		}
+		worktree := worktreepkg.Worktree{
+			ID: "wt-archive", WorkspaceID: id, Name: "preserved-worktree",
+			Branch: "feature/preserved", Path: filepath.Join(t.TempDir(), "preserved-worktree"),
+			State: worktreepkg.StateReady, Origin: worktreepkg.OriginManual, SetupState: worktreepkg.SetupNone,
+			ProfileID: store.DefaultProfileID, CreatedAt: original.CreatedAt, UpdatedAt: original.UpdatedAt,
+		}
+		if err := db.Worktrees.Insert(ctx, worktree); err != nil {
+			t.Fatal(err)
+		}
+		assertWorktreePreserved := func() {
+			t.Helper()
+			loaded, err := db.Worktrees.Get(ctx, id, worktree.ID)
+			if err != nil || loaded.ID != worktree.ID || loaded.Path != worktree.Path ||
+				loaded.Branch != worktree.Branch || loaded.State != worktree.State {
+				t.Fatalf("worktree changed: %#v, %v", loaded, err)
+			}
+		}
+		archived, err := db.SetWorkspaceArchived(ctx, id, true)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if archived.ArchivedAt == nil || archived.ID != id || archived.RootDir != original.RootDir {
+			t.Fatalf("archive lost identity: %#v", archived)
+		}
+		assertWorktreePreserved()
+		again, err := db.SetWorkspaceArchived(ctx, id, true)
+		if err != nil || again.ArchivedAt == nil || !again.ArchivedAt.Equal(*archived.ArchivedAt) {
+			t.Fatalf("archive is not idempotent: %#v, %v", again, err)
+		}
+		session.ID, session.State = "archive-new", "active"
+		if err := db.RegisterSession(ctx, &(session)); !errors.Is(err, store.ErrWorkspaceArchived) {
+			t.Fatalf("new session error = %v", err)
+		}
+		if err := db.UpdateSessionState(
+			ctx,
+			SessionStateUpdate{ID: "archive-history", State: "active"},
+		); !errors.Is(err, store.ErrWorkspaceArchived) ||
+			strings.Contains(err.Error(), "constraint failed") {
+			t.Fatalf("resume error must be typed without SQLite detail: %v", err)
+		}
+		history, err := db.ListSessions(ctx, SessionListQuery{
+			ReadScope: store.ReadScope{ProfileID: store.DefaultProfileID}, WorkspaceID: id,
+		})
+		if err != nil || len(history) != 1 || history[0].ID != "archive-history" {
+			t.Fatalf("history changed: %#v, %v", history, err)
+		}
+		restored, err := db.SetWorkspaceArchived(ctx, id, false)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if restored.ArchivedAt != nil || restored.ID != id || restored.Name != original.Name {
+			t.Fatalf("restore lost identity: %#v", restored)
+		}
+		assertWorktreePreserved()
+		if err := db.RegisterSession(ctx, &(session)); err != nil {
+			t.Fatal(err)
+		}
+		_, err = db.SetWorkspaceArchived(ctx, id, true)
+		busy, ok := errors.AsType[*compozyworkspace.BusyError](err)
+		if !ok || len(busy.Blockers) != 1 || busy.Blockers[0].ID != session.ID {
+			t.Fatalf("archive did not report active session: %v", err)
+		}
+		current, err := db.GetWorkspace(ctx, id)
+		if err != nil || current.ArchivedAt != nil {
+			t.Fatalf("refusal changed workspace: %#v, %v", current, err)
+		}
+	})
+	t.Run("Should upgrade existing registrations losslessly and retain archive across reopen", func(t *testing.T) {
+		t.Parallel()
+		ctx := t.Context()
+		path := filepath.Join(t.TempDir(), GlobalDatabaseName)
+		prior, err := openGlobalMigrationPrefixDatabase(t, path, globalMigrationPrefixBefore(t, "00155_schema.sql"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		_, insertErr := prior.ExecContext(ctx, `INSERT INTO workspaces
+ (id, root_dir, add_dirs, name, default_agent, created_at, updated_at)
+ VALUES ('ws-upgrade-archive', '/archive-upgrade', '["/extra"]', 'archive-upgrade', 'coder',
+ '2026-10-28T00:00:00Z', '2026-10-28T00:00:00Z')`)
+		closeErr := prior.Close()
+		if insertErr != nil || closeErr != nil {
+			t.Fatalf("seed: %v; close: %v", insertErr, closeErr)
+		}
+		upgraded, err := OpenGlobalDB(ctx, path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		archived, archiveErr := upgraded.SetWorkspaceArchived(ctx, "ws-upgrade-archive", true)
+		closeErr = upgraded.Close(ctx)
+		if archiveErr != nil || closeErr != nil {
+			t.Fatalf("archive: %v; close: %v", archiveErr, closeErr)
+		}
+		reopened := openGlobalDBForTest(t, path)
+		got, err := reopened.GetWorkspace(ctx, archived.ID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got.ArchivedAt == nil || !got.ArchivedAt.Equal(*archived.ArchivedAt) ||
+			got.Name != "archive-upgrade" || got.DefaultAgent != "coder" || !slices.Equal(got.AdditionalDirs, []string{"/extra"}) {
+			t.Fatalf("upgrade/reopen lost workspace state: %#v", got)
+		}
+		status, err := store.Status(ctx, reopened.db, MigrationStream())
+		if err != nil {
+			t.Fatal(err)
+		}
+		assertCompleteMigrationStream(t, status, MigrationStream())
+	})
+}
+
+func TestGlobalDBDeleteWorkspaceCascadeDeletesStoppedSessions(t *testing.T) {
+	t.Parallel()
+
+	globalDB := openTestGlobalDB(t)
+	workspaceID := registerWorkspaceForGlobalTests(
+		t,
+		globalDB,
+		"workspace-delete-guard",
+		filepath.Join(t.TempDir(), "workspace-delete-guard"),
+	)
+	if err := globalDB.RegisterSession(testutil.Context(t), new(SessionInfo{
+		ProfileID:     store.DefaultProfileID,
+		ID:            "sess-delete-guard",
+		AgentName:     "coder",
+		RuntimeStatus: store.SessionRuntimeUnbound,
+		WorkspaceID:   workspaceID,
+		State:         "stopped",
+		CreatedAt:     time.Date(2026, 4, 3, 14, 0, 0, 0, time.UTC),
+		UpdatedAt:     time.Date(2026, 4, 3, 14, 0, 0, 0, time.UTC),
+	})); err != nil {
+		t.Fatalf("RegisterSession() error = %v", err)
+	}
+
+	if err := globalDB.DeleteWorkspace(testutil.Context(t), workspaceID); err != nil {
+		t.Fatalf("DeleteWorkspace() error = %v, want nil", err)
+	}
+
+	sessions, err := globalDB.ListSessions(testutil.Context(t), SessionListQuery{
+		ReadScope:   store.ReadScope{ProfileID: store.DefaultProfileID},
+		WorkspaceID: workspaceID,
+	})
+	if err != nil {
+		t.Fatalf("ListSessions() error = %v", err)
+	}
+	if len(sessions) != 0 {
+		t.Fatalf("ListSessions() = %d sessions, want 0 (cascade delete)", len(sessions))
+	}
+}
+
+func TestGlobalDBDeleteWorkspaceWithoutSessions(t *testing.T) {
+	t.Parallel()
+
+	t.Run("Should retain the complete deletion intent across reopen until finalization", func(t *testing.T) {
+		t.Parallel()
+
+		ctx := testutil.Context(t)
+		path := filepath.Join(t.TempDir(), GlobalDatabaseName)
+		copyCurrentSchemaGlobalDBSeed(t, path)
+		globalDB := openGlobalDBForTest(t, path)
+		workspaceID := registerWorkspaceForGlobalTests(
+			t,
+			globalDB,
+			"ws-durable-deletion-intent",
+			filepath.Join(t.TempDir(), "ws-durable-deletion-intent"),
+		)
+		workspace, err := globalDB.GetWorkspace(ctx, workspaceID)
+		if err != nil {
+			t.Fatalf("GetWorkspace() error = %v", err)
+		}
+		if err := globalDB.StageWorkspaceDeletion(ctx, workspaceID); err != nil {
+			t.Fatalf("StageWorkspaceDeletion() error = %v", err)
+		}
+		if _, err := globalDB.GetWorkspace(ctx, workspaceID); !errors.Is(
+			err, compozyworkspace.ErrWorkspaceNotFound,
+		) {
+			t.Fatalf("GetWorkspace(staged) error = %v, want ErrWorkspaceNotFound", err)
+		}
+		if err := globalDB.Close(ctx); err != nil {
+			t.Fatalf("Close() error = %v", err)
+		}
+
+		reopened := openGlobalDBForTest(t, path)
+		intent, err := reopened.GetWorkspaceDeletionIntent(ctx, workspaceID)
+		if err != nil {
+			t.Fatalf("GetWorkspaceDeletionIntent() error = %v", err)
+		}
+		if intent.Workspace.ID != workspace.ID || intent.Workspace.RootDir != workspace.RootDir ||
+			intent.Workspace.Name != workspace.Name || intent.RequestedAt.IsZero() {
+			t.Fatalf("deletion intent = %#v, want complete snapshot %#v", intent, workspace)
+		}
+		if err := reopened.InsertWorkspace(ctx, workspace); !errors.Is(
+			err, compozyworkspace.ErrWorkspaceDeletionPending,
+		) {
+			t.Fatalf("InsertWorkspace(pending deletion) error = %v, want ErrWorkspaceDeletionPending", err)
+		}
+		if err := reopened.CompleteWorkspaceDeletion(ctx, workspaceID); err != nil {
+			t.Fatalf("CompleteWorkspaceDeletion() error = %v", err)
+		}
+		if _, err := reopened.GetWorkspaceDeletionIntent(
+			ctx, workspaceID,
+		); !errors.Is(err, compozyworkspace.ErrWorkspaceDeletionIntentNotFound) {
+			t.Fatalf("GetWorkspaceDeletionIntent(completed) error = %v, want not found", err)
+		}
+	})
+
+	t.Run("Should delete a workspace without sessions", func(t *testing.T) {
+		t.Parallel()
+
+		globalDB := openTestGlobalDB(t)
+		workspaceID := registerWorkspaceForGlobalTests(
+			t,
+			globalDB,
+			"ws-no-sessions",
+			filepath.Join(t.TempDir(), "ws-no-sessions"),
+		)
+
+		if err := globalDB.DeleteWorkspace(testutil.Context(t), workspaceID); err != nil {
+			t.Fatalf("DeleteWorkspace() error = %v, want nil", err)
+		}
+		if _, err := globalDB.GetWorkspace(testutil.Context(t), workspaceID); !errors.Is(
+			err,
+			compozyworkspace.ErrWorkspaceNotFound,
+		) {
+			t.Fatalf("GetWorkspace(deleted) error = %v, want ErrWorkspaceNotFound", err)
+		}
+	})
+
+	t.Run("Should delete scoped extension bindings and prevent same ID recovery", func(t *testing.T) {
+		t.Parallel()
+
+		ctx := testutil.Context(t)
+		globalDB := openTestGlobalDB(t)
+		workspaceID := registerWorkspaceForGlobalTests(
+			t,
+			globalDB,
+			"ws-extension-secret-delete",
+			filepath.Join(t.TempDir(), "ws-extension-secret-delete"),
+		)
+		siblingID := registerWorkspaceForGlobalTests(
+			t,
+			globalDB,
+			"ws-extension-secret-sibling",
+			filepath.Join(t.TempDir(), "ws-extension-secret-sibling"),
+		)
+		deletedWorkspace, err := globalDB.GetWorkspace(ctx, workspaceID)
+		if err != nil {
+			t.Fatalf("GetWorkspace(before extension binding delete) error = %v", err)
+		}
+		bindings := []extensionenv.Binding{
+			{
+				ExtensionName: "kit", WorkspaceID: workspaceID, EnvName: "API_KEY",
+				SecretRef: vault.ExtensionSecretRef("kit", workspaceID, "API_KEY"), Kind: extensionenv.BindingKind,
+			},
+			{
+				ExtensionName: "kit", WorkspaceID: siblingID, EnvName: "API_KEY",
+				SecretRef: vault.ExtensionSecretRef("kit", siblingID, "API_KEY"), Kind: extensionenv.BindingKind,
+			},
+			{
+				ExtensionName: "kit", EnvName: "API_KEY",
+				SecretRef: vault.ExtensionSecretRef("kit", "", "API_KEY"), Kind: extensionenv.BindingKind,
+			},
+		}
+		for _, binding := range bindings {
+			if err := globalDB.PutEnvBinding(ctx, binding); err != nil {
+				t.Fatalf("PutEnvBinding(%#v) error = %v", binding, err)
+			}
+		}
+
+		// Invariant: deleting a scope retires both persisted inputs and sticky MCP overrides.
+		// Owner: GlobalDB workspace lifecycle; canonical suite: this scoped deletion case.
+		for _, binding := range bindings {
+			if _, err := globalDB.db.ExecContext(ctx, `INSERT INTO extension_inputs
+				(extension, workspace_id, input_id, type, value_json, updated_at)
+				VALUES ('kit', ?, 'region', 'string', '"west"', '2026-09-14T00:00:00Z')`, binding.WorkspaceID); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := globalDB.db.ExecContext(ctx, `INSERT INTO extension_mcp_overrides
+				(extension, workspace_id, server, runtime_name, updated_at)
+				VALUES ('kit', ?, 'api', 'kit.api', '2026-09-14T00:00:00Z')`, binding.WorkspaceID); err != nil {
+				t.Fatal(err)
+			}
+		}
+
+		transaction, err := globalDB.db.BeginTx(ctx, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() {
+			if err := transaction.Rollback(); err != nil && !errors.Is(err, sql.ErrTxDone) {
+				t.Error(err)
+			}
+		})
+		if _, err := transaction.ExecContext(ctx, "DELETE FROM workspaces WHERE id = ?", workspaceID); err != nil {
+			t.Fatal(err)
+		}
+		for _, table := range []string{"extension_inputs", "extension_mcp_overrides"} {
+			var count int
+			if err := transaction.QueryRowContext(ctx, "SELECT COUNT(*) FROM "+table+" WHERE workspace_id = ?", workspaceID).
+				Scan(&count); err != nil {
+				t.Fatal(err)
+			}
+			if count != 0 {
+				t.Fatalf("transaction retained %d scoped %s rows", count, table)
+			}
+		}
+		if err := transaction.Rollback(); err != nil {
+			t.Fatal(err)
+		}
+		for _, table := range []string{"extension_inputs", "extension_mcp_overrides"} {
+			var count int
+			if err := globalDB.db.QueryRowContext(ctx, "SELECT COUNT(*) FROM "+table+" WHERE workspace_id = ?", workspaceID).
+				Scan(&count); err != nil {
+				t.Fatal(err)
+			}
+			if count != 1 {
+				t.Fatalf("rollback restored %d scoped %s rows, want one", count, table)
+			}
+		}
+
+		if err := globalDB.DeleteWorkspace(ctx, workspaceID); err != nil {
+			t.Fatalf("DeleteWorkspace() error = %v", err)
+		}
+		deleted, err := globalDB.ListEnvBindings(ctx, "kit", "", workspaceID)
+		if err != nil || len(deleted) != 0 {
+			t.Fatalf("deleted workspace bindings = %#v, %v; want empty", deleted, err)
+		}
+		for _, preservedWorkspaceID := range []string{"", siblingID} {
+			preserved, listErr := globalDB.ListEnvBindings(ctx, "kit", "", preservedWorkspaceID)
+			if listErr != nil || len(preserved) != 1 {
+				t.Fatalf("preserved bindings for %q = %#v, %v; want one", preservedWorkspaceID, preserved, listErr)
+			}
+		}
+		for _, table := range []string{"extension_inputs", "extension_mcp_overrides"} {
+			for _, binding := range bindings {
+				want := 1
+				if binding.WorkspaceID == workspaceID {
+					want = 0
+				}
+				var count int
+				if err := globalDB.db.QueryRowContext(ctx, "SELECT COUNT(*) FROM "+table+" WHERE extension = 'kit' AND workspace_id = ?", binding.WorkspaceID).
+					Scan(&count); err != nil {
+					t.Fatal(err)
+				}
+				if count != want {
+					t.Fatalf("%s rows for workspace %q = %d, want %d", table, binding.WorkspaceID, count, want)
+				}
+			}
+		}
+
+		if err := globalDB.InsertWorkspace(ctx, deletedWorkspace); err != nil {
+			t.Fatalf("InsertWorkspace(same ID) error = %v", err)
+		}
+		reused, err := globalDB.ListEnvBindings(ctx, "kit", "", workspaceID)
+		if err != nil || len(reused) != 0 {
+			t.Fatalf("reused workspace bindings = %#v, %v; want no recovered secrets", reused, err)
+		}
+		for _, table := range []string{"extension_inputs", "extension_mcp_overrides"} {
+			var count int
+			if err := globalDB.db.QueryRowContext(ctx, "SELECT COUNT(*) FROM "+table+" WHERE workspace_id = ?", workspaceID).
+				Scan(&count); err != nil {
+				t.Fatal(err)
+			}
+			if count != 0 {
+				t.Fatalf("reused workspace recovered %d stale %s rows", count, table)
+			}
+		}
+
+		if err := globalDB.PutEnvBinding(ctx, bindings[0]); err != nil {
+			t.Fatalf("PutEnvBinding(raw cascade fixture) error = %v", err)
+		}
+		if _, err := globalDB.db.ExecContext(ctx, `DELETE FROM workspaces WHERE id = ?`, workspaceID); err != nil {
+			t.Fatalf("raw workspace delete error = %v", err)
+		}
+		cascaded, err := globalDB.ListEnvBindings(ctx, "kit", "", workspaceID)
+		if err != nil || len(cascaded) != 0 {
+			t.Fatalf("raw-delete cascaded bindings = %#v, %v; want empty", cascaded, err)
+		}
+	})
+
+	t.Run("Should delete only scoped MCP credentials and prevent same ID recovery", func(t *testing.T) {
+		t.Parallel()
+
+		ctx := testutil.Context(t)
+		globalDB := openTestGlobalDB(t)
+		workspaceID := registerWorkspaceForGlobalTests(
+			t,
+			globalDB,
+			"ws-oauth-delete",
+			filepath.Join(t.TempDir(), "ws-oauth-delete"),
+		)
+		siblingID := registerWorkspaceForGlobalTests(
+			t,
+			globalDB,
+			"ws-oauth-sibling",
+			filepath.Join(t.TempDir(), "ws-oauth-sibling"),
+		)
+		deletedWorkspace, err := globalDB.GetWorkspace(ctx, workspaceID)
+		if err != nil {
+			t.Fatalf("GetWorkspace(before delete) error = %v", err)
+		}
+		targets := []mcpauth.Target{
+			{Scope: mcpauth.ScopeWorkspace, WorkspaceID: workspaceID, ServerName: "linear"},
+			{Scope: mcpauth.ScopeWorkspace, WorkspaceID: siblingID, ServerName: "linear"},
+			userMCPAuthTarget("linear"),
+		}
+		issuedAt := time.Date(2026, 7, 16, 18, 0, 0, 0, time.UTC)
+		for index, target := range targets {
+			if err := globalDB.SaveMCPAuthToken(ctx, mcpauth.TokenRecord{
+				Target:                target,
+				DefinitionFingerprint: testMCPDefinitionFingerprint,
+				ClientID:              "client-id",
+				AccessToken:           fmt.Sprintf("access-%d", index),
+				RefreshToken:          fmt.Sprintf("refresh-%d", index),
+				ObtainedAt:            issuedAt,
+				UpdatedAt:             issuedAt,
+			}); err != nil {
+				t.Fatalf("SaveMCPAuthToken(%#v) error = %v", target, err)
+			}
+		}
+		registrations := make([]mcpauth.ClientRegistration, 0, len(targets))
+		for _, target := range targets {
+			registration := mcpOAuthRegistrationRecord(t, target, issuedAt)
+			saved, err := globalDB.SaveMCPAuthRegistration(ctx, registration, mcpOAuthRegistrationSecrets())
+			if err != nil {
+				t.Fatalf("SaveMCPAuthRegistration(%#v) error = %v", target, err)
+			}
+			registrations = append(registrations, saved)
+		}
+		var accessRef, refreshRef string
+		if err := globalDB.db.QueryRowContext(
+			ctx,
+			`SELECT access_token_ref, refresh_token_ref FROM mcp_auth_tokens
+			 WHERE scope = ? AND workspace_id = ? AND server_name = ?`,
+			string(mcpauth.ScopeWorkspace),
+			workspaceID,
+			"linear",
+		).Scan(&accessRef, &refreshRef); err != nil {
+			t.Fatalf("query deleted workspace token refs error = %v", err)
+		}
+
+		if err := globalDB.DeleteWorkspace(ctx, workspaceID); err != nil {
+			t.Fatalf("DeleteWorkspace() error = %v", err)
+		}
+		if _, err := globalDB.GetMCPAuthToken(ctx, targets[0]); !errors.Is(err, mcpauth.ErrTokenNotFound) {
+			t.Fatalf("GetMCPAuthToken(deleted workspace) error = %v, want ErrTokenNotFound", err)
+		}
+		for _, ref := range []string{accessRef, refreshRef} {
+			assertVaultRefPresence(ctx, t, globalDB.db, ref, false)
+		}
+		if _, err := globalDB.GetMCPAuthRegistration(ctx, targets[0]); !errors.Is(
+			err,
+			mcpauth.ErrRegistrationNotFound,
+		) {
+			t.Fatalf("GetMCPAuthRegistration(deleted workspace) error = %v, want ErrRegistrationNotFound", err)
+		}
+		for _, ref := range []string{
+			registrations[0].ClientSecretRef,
+			registrations[0].RegistrationAccessTokenRef,
+		} {
+			assertVaultRefPresence(ctx, t, globalDB.db, ref, false)
+		}
+		for _, target := range targets[1:] {
+			if _, err := globalDB.GetMCPAuthToken(ctx, target); err != nil {
+				t.Fatalf("GetMCPAuthToken(preserved %#v) error = %v", target, err)
+			}
+		}
+		for _, target := range targets[1:] {
+			if _, err := globalDB.GetMCPAuthRegistration(ctx, target); err != nil {
+				t.Fatalf("GetMCPAuthRegistration(preserved %#v) error = %v", target, err)
+			}
+		}
+
+		if err := globalDB.InsertWorkspace(ctx, deletedWorkspace); err != nil {
+			t.Fatalf("InsertWorkspace(same ID) error = %v", err)
+		}
+		if _, err := globalDB.GetMCPAuthToken(ctx, targets[0]); !errors.Is(err, mcpauth.ErrTokenNotFound) {
+			t.Fatalf("GetMCPAuthToken(re-registered workspace) error = %v, want ErrTokenNotFound", err)
+		}
+	})
+
+	t.Run("Should roll back workspace deletion when MCP secret cleanup fails", func(t *testing.T) {
+		t.Parallel()
+
+		ctx := testutil.Context(t)
+		globalDB := openTestGlobalDB(t)
+		workspaceID := registerWorkspaceForGlobalTests(
+			t,
+			globalDB,
+			"ws-oauth-rollback",
+			filepath.Join(t.TempDir(), "ws-oauth-rollback"),
+		)
+		target := mcpauth.Target{
+			Scope: mcpauth.ScopeWorkspace, WorkspaceID: workspaceID, ServerName: "linear",
+		}
+		issuedAt := time.Date(2026, 7, 16, 18, 30, 0, 0, time.UTC)
+		if err := globalDB.SaveMCPAuthToken(ctx, mcpauth.TokenRecord{
+			Target:                target,
+			DefinitionFingerprint: testMCPDefinitionFingerprint,
+			ClientID:              "client-id",
+			AccessToken:           "access-token",
+			RefreshToken:          "refresh-token",
+			ObtainedAt:            issuedAt,
+			UpdatedAt:             issuedAt,
+		}); err != nil {
+			t.Fatalf("SaveMCPAuthToken() error = %v", err)
+		}
+		registration, err := globalDB.SaveMCPAuthRegistration(
+			ctx,
+			mcpOAuthRegistrationRecord(t, target, issuedAt),
+			mcpOAuthRegistrationSecrets(),
+		)
+		if err != nil {
+			t.Fatalf("SaveMCPAuthRegistration() error = %v", err)
+		}
+		var accessRef, refreshRef string
+		if err := globalDB.db.QueryRowContext(
+			ctx,
+			`SELECT access_token_ref, refresh_token_ref FROM mcp_auth_tokens
+			 WHERE scope = ? AND workspace_id = ? AND server_name = ?`,
+			string(mcpauth.ScopeWorkspace),
+			workspaceID,
+			"linear",
+		).Scan(&accessRef, &refreshRef); err != nil {
+			t.Fatalf("query rollback token refs error = %v", err)
+		}
+		if _, err := globalDB.db.ExecContext(
+			ctx,
+			`CREATE TRIGGER fail_workspace_mcp_dcr_secret_cleanup
+			 BEFORE DELETE ON vault_secrets
+			 WHEN OLD.kind = 'mcp_oauth_dcr_client_secret'
+			 BEGIN
+			   SELECT RAISE(ABORT, 'forced MCP DCR secret cleanup failure');
+			 END`,
+		); err != nil {
+			t.Fatalf("create cleanup failure trigger error = %v", err)
+		}
+
+		err = globalDB.DeleteWorkspace(ctx, workspaceID)
+		if err == nil || !strings.Contains(err.Error(), "forced MCP DCR secret cleanup failure") {
+			t.Fatalf("DeleteWorkspace() error = %v, want forced cleanup failure", err)
+		}
+		if _, err := globalDB.GetWorkspace(ctx, workspaceID); err != nil {
+			t.Fatalf("GetWorkspace(after rollback) error = %v", err)
+		}
+		if _, err := globalDB.GetMCPAuthToken(ctx, target); err != nil {
+			t.Fatalf("GetMCPAuthToken(after rollback) error = %v", err)
+		}
+		if _, err := globalDB.GetMCPAuthRegistration(ctx, target); err != nil {
+			t.Fatalf("GetMCPAuthRegistration(after rollback) error = %v", err)
+		}
+		for _, ref := range []string{accessRef, refreshRef} {
+			assertVaultRefPresence(ctx, t, globalDB.db, ref, true)
+		}
+		for _, ref := range []string{registration.ClientSecretRef, registration.RegistrationAccessTokenRef} {
+			assertVaultRefPresence(ctx, t, globalDB.db, ref, true)
+		}
+	})
+}
+
+func TestGlobalDBDeleteWorkspaceRejectsActiveSessions(t *testing.T) {
+	t.Parallel()
+
+	globalDB := openTestGlobalDB(t)
+	workspaceID := registerWorkspaceForGlobalTests(
+		t,
+		globalDB,
+		"ws-active-sessions",
+		filepath.Join(t.TempDir(), "ws-active-sessions"),
+	)
+	if err := globalDB.RegisterSession(testutil.Context(t), new(SessionInfo{
+		ProfileID:     store.DefaultProfileID,
+		ID:            "sess-active-guard",
+		AgentName:     "coder",
+		RuntimeStatus: store.SessionRuntimeUnbound,
+		WorkspaceID:   workspaceID,
+		State:         "active",
+		CreatedAt:     time.Date(2026, 4, 3, 14, 0, 0, 0, time.UTC),
+		UpdatedAt:     time.Date(2026, 4, 3, 14, 0, 0, 0, time.UTC),
+	})); err != nil {
+		t.Fatalf("RegisterSession() error = %v", err)
+	}
+
+	err := globalDB.StageWorkspaceDeletion(testutil.Context(t), workspaceID)
+	if !errors.Is(err, compozyworkspace.ErrWorkspaceHasActiveSessions) {
+		t.Fatalf("StageWorkspaceDeletion() error = %v, want ErrWorkspaceHasActiveSessions", err)
+	}
+	if _, err := globalDB.GetWorkspace(testutil.Context(t), workspaceID); err != nil {
+		t.Fatalf("GetWorkspace(after rejected stage) error = %v", err)
+	}
+	if _, err := globalDB.GetWorkspaceDeletionIntent(
+		testutil.Context(t), workspaceID,
+	); !errors.Is(err, compozyworkspace.ErrWorkspaceDeletionIntentNotFound) {
+		t.Fatalf("GetWorkspaceDeletionIntent(after rejected stage) error = %v, want not found", err)
+	}
+}
+
+func TestGlobalDBWorkspaceConstraintViolations(t *testing.T) {
+	t.Parallel()
+
+	globalDB := openTestGlobalDB(t)
+	rootA := filepath.Join(t.TempDir(), "root-a")
+	rootB := filepath.Join(t.TempDir(), "root-b")
+	if err := os.MkdirAll(rootA, 0o755); err != nil {
+		t.Fatalf("MkdirAll(rootA) error = %v", err)
+	}
+	if err := os.MkdirAll(rootB, 0o755); err != nil {
+		t.Fatalf("MkdirAll(rootB) error = %v", err)
+	}
+
+	base := compozyworkspace.Workspace{
+		ID:        "ws-base",
+		RootDir:   rootA,
+		Name:      "alpha",
+		CreatedAt: time.Date(2026, 4, 3, 12, 0, 0, 0, time.UTC),
+		UpdatedAt: time.Date(2026, 4, 3, 12, 0, 0, 0, time.UTC),
+	}
+	if err := globalDB.InsertWorkspace(testutil.Context(t), base); err != nil {
+		t.Fatalf("InsertWorkspace(base) error = %v", err)
+	}
+
+	t.Run("Should preserve an untyped error that only mentions workspace deletion pending", func(t *testing.T) {
+		cause := errors.New("remote audit: workspace deletion pending review failed")
+		err := mapWorkspaceWriteConstraintError(testutil.Context(t), globalDB.db, base, cause)
+		if !errors.Is(err, cause) || errors.Is(err, compozyworkspace.ErrWorkspaceDeletionPending) {
+			t.Fatalf("mapWorkspaceWriteConstraintError() = %v, want original untyped error", err)
+		}
+	})
+
+	tests := []struct {
+		name string
+		ws   compozyworkspace.Workspace
+		want error
+	}{
+		{
+			name: "Should reject a duplicate root directory",
+			ws: compozyworkspace.Workspace{
+				ID:        "ws-duplicate-root",
+				RootDir:   rootA,
+				Name:      "beta",
+				CreatedAt: base.CreatedAt,
+				UpdatedAt: base.UpdatedAt,
+			},
+			want: compozyworkspace.ErrWorkspacePathTaken,
+		},
+		{
+			name: "Should reject a duplicate name",
+			ws: compozyworkspace.Workspace{
+				ID:        "ws-duplicate-name",
+				RootDir:   rootB,
+				Name:      "alpha",
+				CreatedAt: base.CreatedAt,
+				UpdatedAt: base.UpdatedAt,
+			},
+			want: compozyworkspace.ErrWorkspaceNameTaken,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			err := globalDB.InsertWorkspace(testutil.Context(t), tt.ws)
+			if !errors.Is(err, tt.want) {
+				t.Fatalf("InsertWorkspace() error = %v, want %v", err, tt.want)
+			}
+		})
+	}
+}
+
+func TestGlobalDBWorkspaceNotFoundErrors(t *testing.T) {
+	t.Parallel()
+
+	globalDB := openTestGlobalDB(t)
+
+	if _, err := globalDB.GetWorkspace(
+		testutil.Context(t),
+		"ws-missing",
+	); !errors.Is(
+		err,
+		compozyworkspace.ErrWorkspaceNotFound,
+	) {
+		t.Fatalf("GetWorkspace(missing) error = %v, want ErrWorkspaceNotFound", err)
+	}
+	if _, err := globalDB.GetWorkspaceByPath(
+		testutil.Context(t),
+		filepath.Join(t.TempDir(), "missing"),
+	); !errors.Is(
+		err,
+		compozyworkspace.ErrWorkspaceNotFound,
+	) {
+		t.Fatalf("GetWorkspaceByPath(missing) error = %v, want ErrWorkspaceNotFound", err)
+	}
+	if _, err := globalDB.GetWorkspaceByName(
+		testutil.Context(t),
+		"missing",
+	); !errors.Is(
+		err,
+		compozyworkspace.ErrWorkspaceNotFound,
+	) {
+		t.Fatalf("GetWorkspaceByName(missing) error = %v, want ErrWorkspaceNotFound", err)
+	}
+	if err := globalDB.UpdateWorkspace(testutil.Context(t), compozyworkspace.Workspace{
+		ID:        "ws-missing",
+		RootDir:   filepath.Join(t.TempDir(), "missing"),
+		Name:      "missing",
+		UpdatedAt: time.Date(2026, 4, 3, 13, 0, 0, 0, time.UTC),
+	}); !errors.Is(err, compozyworkspace.ErrWorkspaceNotFound) {
+		t.Fatalf("UpdateWorkspace(missing) error = %v, want ErrWorkspaceNotFound", err)
+	}
+	if err := globalDB.DeleteWorkspace(
+		testutil.Context(t),
+		"ws-missing",
+	); !errors.Is(
+		err,
+		compozyworkspace.ErrWorkspaceNotFound,
+	) {
+		t.Fatalf("DeleteWorkspace(missing) error = %v, want ErrWorkspaceNotFound", err)
+	}
+}
+
+func TestGlobalDBWorkspaceValidationAndDefaulting(t *testing.T) {
+	t.Parallel()
+
+	t.Run("Should not persist a workspace when generated ID entropy fails", func(t *testing.T) {
+		t.Parallel()
+
+		entropyErr := errors.New("entropy unavailable")
+		globalDB := openTestGlobalDB(t)
+		globalDB.generateID = func() (string, error) {
+			return "", entropyErr
+		}
+		rootDir := filepath.Join(t.TempDir(), "workspace-entropy-failure")
+		if err := os.MkdirAll(rootDir, 0o755); err != nil {
+			t.Fatalf("MkdirAll() error = %v", err)
+		}
+
+		err := globalDB.InsertWorkspace(testutil.Context(t), compozyworkspace.Workspace{
+			RootDir: rootDir,
+			Name:    "entropy-failure",
+		})
+		if !errors.Is(err, entropyErr) {
+			t.Fatalf("InsertWorkspace() error = %v, want %v", err, entropyErr)
+		}
+		workspaces, listErr := globalDB.ListWorkspaces(testutil.Context(t))
+		if listErr != nil {
+			t.Fatalf("ListWorkspaces() error = %v", listErr)
+		}
+		if len(workspaces) != 0 {
+			t.Fatalf("len(workspaces) = %d, want 0", len(workspaces))
+		}
+	})
+
+	var nilCtx context.Context
+	if _, err := OpenGlobalDB(nilCtx, filepath.Join(t.TempDir(), GlobalDatabaseName)); err == nil {
+		t.Fatal("OpenGlobalDB(nil) error = nil, want non-nil")
+	}
+
+	var nilGlobalDB *GlobalDB
+	if got := nilGlobalDB.Path(); got != "" {
+		t.Fatalf("(*GlobalDB)(nil).Path() = %q, want empty", got)
+	}
+
+	globalDB := openTestGlobalDB(t)
+	rootDir := filepath.Join(t.TempDir(), "workspace-defaulted")
+	if err := os.MkdirAll(rootDir, 0o755); err != nil {
+		t.Fatalf("MkdirAll() error = %v", err)
+	}
+
+	if err := globalDB.InsertWorkspace(testutil.Context(t), compozyworkspace.Workspace{
+		RootDir: rootDir,
+		Name:    "defaulted",
+	}); err != nil {
+		t.Fatalf("InsertWorkspace(defaulted) error = %v", err)
+	}
+
+	workspaces, err := globalDB.ListWorkspaces(testutil.Context(t))
+	if err != nil {
+		t.Fatalf("ListWorkspaces() error = %v", err)
+	}
+	if got, want := len(workspaces), 1; got != want {
+		t.Fatalf("len(workspaces) = %d, want %d", got, want)
+	}
+	if !compozyworkspace.IsWorkspaceID(workspaces[0].ID) {
+		t.Fatalf("workspaces[0].ID = %q, want workspace_id ULID", workspaces[0].ID)
+	}
+	if workspaces[0].CreatedAt.IsZero() || workspaces[0].UpdatedAt.IsZero() {
+		t.Fatalf("workspace timestamps = %#v, want non-zero", workspaces[0])
+	}
+
+	tests := []struct {
+		name string
+		run  func() error
+	}{
+		{
+			name: "insert missing root",
+			run: func() error {
+				return globalDB.InsertWorkspace(testutil.Context(t), compozyworkspace.Workspace{Name: "missing-root"})
+			},
+		},
+		{
+			name: "insert missing name",
+			run: func() error {
+				return globalDB.InsertWorkspace(testutil.Context(t), compozyworkspace.Workspace{RootDir: rootDir})
+			},
+		},
+		{
+			name: "update missing id",
+			run: func() error {
+				return globalDB.UpdateWorkspace(
+					testutil.Context(t),
+					compozyworkspace.Workspace{RootDir: rootDir, Name: "missing-id"},
+				)
+			},
+		},
+		{
+			name: "delete missing id",
+			run: func() error {
+				return globalDB.DeleteWorkspace(testutil.Context(t), "")
+			},
+		},
+		{
+			name: "get missing id",
+			run: func() error {
+				_, err := globalDB.GetWorkspace(testutil.Context(t), "")
+				return err
+			},
+		},
+		{
+			name: "get by missing path",
+			run: func() error {
+				_, err := globalDB.GetWorkspaceByPath(testutil.Context(t), "")
+				return err
+			},
+		},
+		{
+			name: "get by missing name",
+			run: func() error {
+				_, err := globalDB.GetWorkspaceByName(testutil.Context(t), "")
+				return err
+			},
+		},
+		{
+			name: "list nil context",
+			run: func() error {
+				var nilCtx context.Context
+				_, err := globalDB.ListWorkspaces(nilCtx)
+				return err
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if err := tt.run(); err == nil {
+				t.Fatal("error = nil, want non-nil")
+			}
+		})
+	}
+}
+
+func TestGlobalDBListWorkspacesStableOrder(t *testing.T) {
+	t.Parallel()
+
+	globalDB := openTestGlobalDB(t)
+	first := insertWorkspaceForGlobalTests(t, globalDB, compozyworkspace.Workspace{
+		ID:        "ws-zeta",
+		RootDir:   filepath.Join(t.TempDir(), "workspace-zeta"),
+		Name:      "zeta",
+		CreatedAt: time.Date(2026, 4, 3, 10, 0, 0, 0, time.UTC),
+		UpdatedAt: time.Date(2026, 4, 3, 10, 0, 0, 0, time.UTC),
+	})
+	second := insertWorkspaceForGlobalTests(t, globalDB, compozyworkspace.Workspace{
+		ID:        "ws-alpha",
+		RootDir:   filepath.Join(t.TempDir(), "workspace-alpha"),
+		Name:      "alpha",
+		CreatedAt: time.Date(2026, 4, 3, 10, 1, 0, 0, time.UTC),
+		UpdatedAt: time.Date(2026, 4, 3, 10, 1, 0, 0, time.UTC),
+	})
+
+	workspaces, err := globalDB.ListWorkspaces(testutil.Context(t))
+	if err != nil {
+		t.Fatalf("ListWorkspaces() error = %v", err)
+	}
+
+	if got, want := len(workspaces), 2; got != want {
+		t.Fatalf("len(workspaces) = %d, want %d", got, want)
+	}
+	assertWorkspaceEqual(t, workspaces[0], second)
+	assertWorkspaceEqual(t, workspaces[1], first)
+}
+
+func TestGlobalDBRegisterAndListSessionsUseWorkspaceID(t *testing.T) {
+	t.Parallel()
+
+	globalDB := openTestGlobalDB(t)
+	workspaceID := registerWorkspaceForGlobalTests(
+		t,
+		globalDB,
+		"session-workspace",
+		filepath.Join(t.TempDir(), "session-workspace"),
+	)
+
+	session := SessionInfo{
+		ProfileID:     store.DefaultProfileID,
+		ID:            "sess-workspace-id",
+		AgentName:     "coder",
+		RuntimeStatus: store.SessionRuntimeUnbound,
+		WorkspaceID:   workspaceID,
+		State:         "active",
+		Liveness: &store.SessionLivenessMeta{
+			SubprocessPID: 77,
+			LastUpdateAt:  ptrTime(time.Date(2026, 4, 3, 13, 1, 0, 0, time.UTC)),
+			StallState:    store.SessionStallStateDetected,
+			StallReason:   store.SessionStallReasonActivityTimeout,
+		},
+		CreatedAt: time.Date(2026, 4, 3, 13, 0, 0, 0, time.UTC),
+		UpdatedAt: time.Date(2026, 4, 3, 13, 0, 0, 0, time.UTC),
+	}
+	if err := globalDB.RegisterSession(testutil.Context(t), &(session)); err != nil {
+		t.Fatalf("RegisterSession() error = %v", err)
+	}
+
+	sessions, err := globalDB.ListSessions(testutil.Context(t), SessionListQuery{
+		ReadScope: store.ReadScope{ProfileID: store.DefaultProfileID},
+	})
+	if err != nil {
+		t.Fatalf("ListSessions() error = %v", err)
+	}
+	if got, want := len(sessions), 1; got != want {
+		t.Fatalf("len(sessions) = %d, want %d", got, want)
+	}
+	if got, want := sessions[0].WorkspaceID, workspaceID; got != want {
+		t.Fatalf("sessions[0].WorkspaceID = %q, want %q", got, want)
+	}
+	if sessions[0].Liveness == nil {
+		t.Fatal("sessions[0].Liveness = nil, want liveness metadata")
+	}
+	if got, want := sessions[0].Liveness.SubprocessPID, 77; got != want {
+		t.Fatalf("sessions[0].Liveness.SubprocessPID = %d, want %d", got, want)
+	}
+	if sessions[0].Liveness.LastUpdateAt == nil ||
+		!sessions[0].Liveness.LastUpdateAt.Equal(*session.Liveness.LastUpdateAt) {
+		t.Fatalf(
+			"sessions[0].Liveness.LastUpdateAt = %#v, want %s",
+			sessions[0].Liveness.LastUpdateAt,
+			session.Liveness.LastUpdateAt,
+		)
+	}
+	if got, want := sessions[0].Liveness.StallState, store.SessionStallStateDetected; got != want {
+		t.Fatalf("sessions[0].Liveness.StallState = %q, want %q", got, want)
+	}
+	if got, want := sessions[0].Liveness.StallReason, store.SessionStallReasonActivityTimeout; got != want {
+		t.Fatalf("sessions[0].Liveness.StallReason = %q, want %q", got, want)
+	}
+
+	t.Run("Should expose the complete sessions schema", func(t *testing.T) {
+		t.Parallel()
+
+		assertTableColumns(
+			t,
+			globalDB.db,
+			"sessions",
+			[]string{
+				"id",
+				"profile_id",
+				"name",
+				"agent_name",
+				"provider",
+				"model",
+				"reasoning_effort",
+				"speed",
+				"acp_options_json",
+				"speed_resolution_json",
+				"runtime_status",
+				"runtime_transition",
+				"runtime_failure",
+				"runtime_generation",
+				"runtime_recovery_json",
+				"selected_provider",
+				"selected_model",
+				"selected_reasoning_effort",
+				"selected_speed",
+				"selected_acp_options_json",
+				"runtime_selection_revision",
+				"workspace_id",
+				"scope",
+				"worktree_id",
+				"session_type",
+				"state",
+				"archived_at",
+				"acp_session_id",
+				"stop_reason",
+				"stop_escalated",
+				"stop_verification_failed",
+				"stop_detail",
+				"subprocess_pid",
+				"subprocess_started_at",
+				"last_update_at",
+				"stall_state",
+				"stall_reason",
+				"activity_json",
+				"attached_to",
+				"attach_expires_at",
+				"transcript_epoch",
+				"pending_permission_count",
+				"pending_clarify_count",
+				"attention_revision",
+				"last_settled_revision",
+				"last_seen_revision",
+				"last_seen_at",
+				"attention_changed_at",
+				"created_at",
+				"updated_at",
+				"failure_kind",
+				"failure_summary",
+				"crash_bundle_path",
+				"parent_session_id",
+				"root_session_id",
+				"spawn_depth",
+				"spawn_role",
+				"ttl_expires_at",
+				"auto_stop_on_parent",
+				"notify_creator",
+				"spawn_budget_json",
+				"permission_policy_json",
+				"soul_snapshot_id",
+				"soul_digest",
+				"parent_soul_digest",
+				sessionInputGenerationColumn,
+				"creation_digest",
+				"policy_spec_digest",
+				"creation_profile_ref",
+				"lineage_kind",
+				"origin_message_id",
+				"origin_agent_name",
+				"effective_workspace_access",
+				"branch",
+				"ended_early_turn_id",
+				"parked_at",
+				"park_reason",
+				"park_until",
+				"later_returned_at",
+				"instance_id",
+				"initiator_kind",
+				"initiator_id",
+				"failure_seen_at",
+			},
+		)
+	})
+}
+
+func TestGlobalDBRegisterSessionRejectsStallStateWithoutReason(t *testing.T) {
+	t.Parallel()
+
+	globalDB := openTestGlobalDB(t)
+	workspaceID := registerWorkspaceForGlobalTests(
+		t,
+		globalDB,
+		"invalid-stall-session",
+		filepath.Join(t.TempDir(), "invalid-stall-session"),
+	)
+
+	err := globalDB.RegisterSession(testutil.Context(t), new(SessionInfo{
+		ProfileID:     store.DefaultProfileID,
+		ID:            "sess-invalid-stall",
+		AgentName:     "coder",
+		RuntimeStatus: store.SessionRuntimeUnbound,
+		WorkspaceID:   workspaceID,
+		State:         "active",
+		Liveness: &store.SessionLivenessMeta{
+			SubprocessPID: 77,
+			StallState:    store.SessionStallStateDetected,
+		},
+		CreatedAt: time.Date(2026, 4, 3, 13, 0, 0, 0, time.UTC),
+		UpdatedAt: time.Date(2026, 4, 3, 13, 0, 0, 0, time.UTC),
+	}))
+	if err == nil {
+		t.Fatal("RegisterSession() error = nil, want invalid stall reason failure")
+	}
+	if got, want := err.Error(), "store: session stall reason required when stall state is set"; !strings.Contains(
+		got,
+		want,
+	) {
+		t.Fatalf("RegisterSession() error = %v, want substring %q", err, want)
+	}
+}
+
+func TestGlobalDBRegisterSessionRejectsUnmarshalableActivity(t *testing.T) {
+	t.Run("Should reject unmarshalable session activity without writing a row", func(t *testing.T) {
+		t.Parallel()
+
+		globalDB := openTestGlobalDB(t)
+		workspaceID := registerWorkspaceForGlobalTests(
+			t,
+			globalDB,
+			"invalid-activity-session",
+			filepath.Join(t.TempDir(), "invalid-activity-session"),
+		)
+		unmarshalableTime := time.Date(10000, 1, 1, 0, 0, 0, 0, time.UTC)
+
+		err := globalDB.RegisterSession(testutil.Context(t), new(SessionInfo{
+			ProfileID:     store.DefaultProfileID,
+			ID:            "sess-invalid-activity",
+			AgentName:     "coder",
+			RuntimeStatus: store.SessionRuntimeUnbound,
+			WorkspaceID:   workspaceID,
+			State:         "active",
+			Liveness: &store.SessionLivenessMeta{
+				Activity: &store.SessionActivityMeta{
+					TurnStartedAt: &unmarshalableTime,
+				},
+			},
+			CreatedAt: time.Date(2026, 4, 3, 13, 0, 0, 0, time.UTC),
+			UpdatedAt: time.Date(2026, 4, 3, 13, 0, 0, 0, time.UTC),
+		}))
+		if err == nil {
+			t.Fatal("RegisterSession(unmarshalable activity) error = nil, want marshal failure")
+		}
+		if !strings.Contains(err.Error(), "store: session liveness activity marshal") {
+			t.Fatalf("RegisterSession(unmarshalable activity) error = %v, want activity marshal context", err)
+		}
+
+		sessions, err := globalDB.ListSessions(testutil.Context(t), SessionListQuery{
+			ReadScope: store.ReadScope{ProfileID: store.DefaultProfileID},
+		})
+		if err != nil {
+			t.Fatalf("ListSessions() error = %v", err)
+		}
+		if len(sessions) != 0 {
+			t.Fatalf("len(sessions) = %d, want failed register to skip write", len(sessions))
+		}
+	})
+}
+
+func TestGlobalDBWriteEventSummary(t *testing.T) {
+	t.Parallel()
+
+	globalDB := openTestGlobalDB(t)
+	registerSessionForGlobalTests(t, globalDB, "sess-summary")
+
+	if err := globalDB.WriteEventSummary(testutil.Context(t), EventSummary{
+		ProfileID:     store.DefaultProfileID,
+		SessionID:     "sess-summary",
+		Type:          "agent_message",
+		AgentName:     "coder",
+		RootSessionID: "sess-summary",
+		Summary:       "assistant replied",
+		Timestamp:     time.Date(2026, 4, 3, 14, 0, 0, 0, time.UTC),
+	}); err != nil {
+		t.Fatalf("WriteEventSummary() error = %v", err)
+	}
+
+	summaries, err := globalDB.ListEventSummaries(
+		testutil.Context(t),
+		EventSummaryQuery{ReadScope: store.ReadScope{AllProfiles: true}, SessionID: "sess-summary"},
+	)
+	if err != nil {
+		t.Fatalf("ListEventSummaries() error = %v", err)
+	}
+	if got, want := len(summaries), 1; got != want {
+		t.Fatalf("len(summaries) = %d, want %d", got, want)
+	}
+	if summaries[0].Summary != "assistant replied" {
+		t.Fatalf("summaries[0].Summary = %q, want %q", summaries[0].Summary, "assistant replied")
+	}
+	if got, want := summaries[0].RootSessionID, "sess-summary"; got != want {
+		t.Fatalf("summaries[0].RootSessionID = %q, want %q", got, want)
+	}
+	if got, want := summaries[0].Provider, "claude"; got != want {
+		t.Fatalf("summaries[0].Provider = %q, want %q", got, want)
+	}
+	if got, want := summaries[0].Outcome, "info"; got != want {
+		t.Fatalf("summaries[0].Outcome = %q, want %q", got, want)
+	}
+
+	providerFiltered, err := globalDB.ListEventSummaries(
+		testutil.Context(t),
+		EventSummaryQuery{ReadScope: store.ReadScope{AllProfiles: true},
+			Provider:  "claude",
+			Component: "session",
+		},
+	)
+	if err != nil {
+		t.Fatalf("ListEventSummaries(provider component) error = %v", err)
+	}
+	if got, want := len(providerFiltered), 1; got != want {
+		t.Fatalf("len(providerFiltered) = %d, want %d", got, want)
+	}
+
+	if err := globalDB.WriteEventSummary(testutil.Context(t), EventSummary{
+		ProfileID: store.DefaultProfileID,
+		SessionID: "sess-summary",
+		Type:      "task.run_failed",
+		AgentName: "coder",
+		Summary:   "task run failed",
+		Timestamp: time.Date(2026, 4, 3, 14, 1, 0, 0, time.UTC),
+	}); err != nil {
+		t.Fatalf("WriteEventSummary(failed task run) error = %v", err)
+	}
+	errorOnly, err := globalDB.ListEventSummaries(
+		testutil.Context(t),
+		EventSummaryQuery{ReadScope: store.ReadScope{AllProfiles: true},
+			Provider:  "claude",
+			Component: "task",
+			ErrorOnly: true,
+		},
+	)
+	if err != nil {
+		t.Fatalf("ListEventSummaries(error only) error = %v", err)
+	}
+	if got, want := len(errorOnly), 1; got != want {
+		t.Fatalf("len(errorOnly) = %d, want %d", got, want)
+	}
+	if got, want := errorOnly[0].Outcome, "failure"; got != want {
+		t.Fatalf("errorOnly[0].Outcome = %q, want %q", got, want)
+	}
+
+	for _, testCase := range []struct {
+		name    string
+		summary EventSummary
+	}{
+		{
+			name: "workspace",
+			summary: EventSummary{
+				ProfileID: store.DefaultProfileID,
+				SessionID: "sess-summary", WorkspaceID: "different-workspace",
+				Type: "agent_message", AgentName: "coder", Summary: "invalid workspace",
+			},
+		},
+		{
+			name: "provider",
+			summary: EventSummary{
+				ProfileID: store.DefaultProfileID,
+				SessionID: "sess-summary", Provider: "different-provider",
+				Type: "agent_message", AgentName: "coder", Summary: "invalid provider",
+			},
+		},
+		{
+			name: "worktree",
+			summary: EventSummary{
+				ProfileID: store.DefaultProfileID,
+				SessionID: "sess-summary", EventCorrelation: store.EventCorrelation{WorktreeID: "different-worktree"},
+				Type: "agent_message", AgentName: "coder", Summary: "invalid worktree",
+			},
+		},
+	} {
+		t.Run("Should reject conflicting session "+testCase.name+" projections", func(t *testing.T) {
+			err := globalDB.WriteEventSummary(testutil.Context(t), testCase.summary)
+			if err == nil || !strings.Contains(err.Error(), testCase.name) {
+				t.Fatalf("WriteEventSummary(conflicting %s) error = %v", testCase.name, err)
+			}
+		})
+	}
+}
+
+func TestGlobalDBWriteEventSummariesAtomic(t *testing.T) {
+	t.Parallel()
+
+	globalDB := openTestGlobalDB(t)
+	timestamp := time.Date(2026, 8, 2, 18, 0, 0, 0, time.UTC)
+	err := globalDB.WriteEventSummaries(testutil.Context(t), []EventSummary{
+		{
+			ProfileID: store.DefaultProfileID,
+			ID:        "duplicate-summary",
+			Type:      "settings.changed",
+			Summary:   "first",
+			Timestamp: timestamp,
+		},
+		{
+			ProfileID: store.DefaultProfileID,
+			ID:        "duplicate-summary",
+			Type:      "settings.changed",
+			Summary:   "second",
+			Timestamp: timestamp,
+		},
+	})
+	if !isSQLiteUniqueConstraint(err) {
+		t.Fatalf("WriteEventSummaries(duplicate id) error = %v, want unique identity constraint", err)
+	}
+	summaries, listErr := globalDB.ListEventSummaries(
+		testutil.Context(t),
+		EventSummaryQuery{ReadScope: store.ReadScope{AllProfiles: true}},
+	)
+	if listErr != nil {
+		t.Fatalf("ListEventSummaries() error = %v", listErr)
+	}
+	if len(summaries) != 0 {
+		t.Fatalf("ListEventSummaries() = %#v, want no partial batch writes", summaries)
+	}
+}
+
+func TestGlobalDBWriteEventSummaryAllowsGlobalEvents(t *testing.T) {
+	t.Parallel()
+
+	const skillShadowedBody = "" +
+		`{"skill_name":"review","old_source":"workspace","new_source":"agent-local",` +
+		`"layer_pair":"agent-local>workspace","shadow_kind":"logical_path",` +
+		`"resolution_scope":"agent","agent_name":"reviewer"}`
+
+	tests := []struct {
+		name      string
+		summary   EventSummary
+		wantType  string
+		wantAgent string
+		wantBody  string
+	}{
+		{
+			name: "Should persist settings changed events with content",
+			summary: eventSummaryWithContent(EventSummary{
+				ProfileID: store.DefaultProfileID,
+				Type:      "settings.changed",
+				Summary:   "skills settings changed",
+				Timestamp: time.Date(2026, 5, 4, 14, 5, 0, 0, time.UTC),
+			}, json.RawMessage(`{"section":"skills","source":"http","operation":"patch"}`)),
+			wantType: "settings.changed",
+			wantBody: `{"section":"skills","source":"http","operation":"patch"}`,
+		},
+		{
+			name: "Should persist skill shadowed events without a session",
+			summary: eventSummaryWithContent(EventSummary{
+				ProfileID: store.DefaultProfileID,
+				Type:      "skill.shadowed",
+				AgentName: "reviewer",
+				Summary:   "skill review shadowed workspace with agent-local",
+				Timestamp: time.Date(2026, 5, 4, 14, 6, 0, 0, time.UTC),
+			}, json.RawMessage(skillShadowedBody)),
+			wantType:  "skill.shadowed",
+			wantAgent: "reviewer",
+			wantBody:  skillShadowedBody,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			globalDB := openTestGlobalDB(t)
+
+			if err := globalDB.WriteEventSummary(testutil.Context(t), tt.summary); err != nil {
+				t.Fatalf("WriteEventSummary(global event) error = %v", err)
+			}
+
+			summaries, err := globalDB.ListEventSummaries(
+				testutil.Context(t),
+				EventSummaryQuery{ReadScope: store.ReadScope{AllProfiles: true}},
+			)
+			if err != nil {
+				t.Fatalf("ListEventSummaries() error = %v", err)
+			}
+			if got, want := len(summaries), 1; got != want {
+				t.Fatalf("len(summaries) = %d, want %d", got, want)
+			}
+			if got := summaries[0].SessionID; got != "" {
+				t.Fatalf("summaries[0].SessionID = %q, want empty for global event", got)
+			}
+			if got, want := summaries[0].Type, tt.wantType; got != want {
+				t.Fatalf("summaries[0].Type = %q, want %q", got, want)
+			}
+			if got, want := summaries[0].AgentName, tt.wantAgent; got != want {
+				t.Fatalf("summaries[0].AgentName = %q, want %q", got, want)
+			}
+			if got, want := string(
+				summaries[0].ContentValue(),
+			), tt.wantBody; got != want {
+				t.Fatalf("summaries[0].Content = %q, want %q", got, want)
+			}
+		})
+	}
+}
+
+func TestGlobalDBUpdateTokenStatsAggregation(t *testing.T) {
+	t.Parallel()
+	t.Run("Should accumulate cache totals while preserving unreported and explicit zero values", func(t *testing.T) {
+		t.Parallel()
+		db := openTestGlobalDB(t)
+		registerSessionForGlobalTests(t, db, "sess-cache")
+		ctx := testutil.Context(t)
+		for i, tc := range []struct {
+			read, write         *int64
+			wantRead, wantWrite *int64
+		}{
+			{nil, nil, nil, nil},
+			{new(int64(4)), nil, new(int64(4)), nil},
+			{nil, new(int64(0)), new(int64(4)), new(int64(0))},
+			{new(int64(7)), new(int64(5)), new(int64(11)), new(int64(5))},
+		} {
+			if err := db.UpdateTokenStats(
+				ctx,
+				TokenStatsUpdate{
+					SessionID:        "sess-cache",
+					AgentName:        "coder",
+					CacheReadTokens:  tc.read,
+					CacheWriteTokens: tc.write,
+					CostStatus:       "unknown",
+					CostSource:       "none",
+					Turns:            1,
+				},
+			); err != nil {
+				t.Fatal(err)
+			}
+			rows, err := db.ListTokenStats(ctx, TokenStatsQuery{SessionID: "sess-cache"})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if len(rows) != 1 || !reflect.DeepEqual(rows[0].CacheReadTokens, tc.wantRead) ||
+				!reflect.DeepEqual(rows[0].CacheWriteTokens, tc.wantWrite) ||
+				rows[0].TurnCount != int64(i+1) {
+				t.Fatalf("step %d rows = %#v", i, rows)
+			}
+		}
+	})
+
+	globalDB := openTestGlobalDB(t)
+	registerSessionForGlobalTests(t, globalDB, "sess-stats")
+
+	currency := "USD"
+	inputA := int64(10)
+	outputA := int64(20)
+	totalA := int64(30)
+	costA := 1.25
+	if err := globalDB.UpdateTokenStats(testutil.Context(t), TokenStatsUpdate{
+		SessionID:    "sess-stats",
+		AgentName:    "coder",
+		InputTokens:  &inputA,
+		OutputTokens: &outputA,
+		TotalTokens:  &totalA,
+		CostAmount:   &costA,
+		CostCurrency: &currency,
+		CostStatus:   "actual",
+		CostSource:   "agent_reported",
+		Turns:        1,
+	}); err != nil {
+		t.Fatalf("UpdateTokenStats() error = %v", err)
+	}
+
+	outputB := int64(5)
+	totalB := int64(5)
+	costB := 0.75
+	if err := globalDB.UpdateTokenStats(testutil.Context(t), TokenStatsUpdate{
+		SessionID:    "sess-stats",
+		AgentName:    "coder",
+		OutputTokens: &outputB,
+		TotalTokens:  &totalB,
+		CostAmount:   &costB,
+		CostCurrency: &currency,
+		CostStatus:   "actual",
+		CostSource:   "agent_reported",
+		Turns:        1,
+	}); err != nil {
+		t.Fatalf("UpdateTokenStats() error = %v", err)
+	}
+
+	stats, err := globalDB.ListTokenStats(testutil.Context(t), TokenStatsQuery{SessionID: "sess-stats"})
+	if err != nil {
+		t.Fatalf("ListTokenStats() error = %v", err)
+	}
+	if got, want := len(stats), 1; got != want {
+		t.Fatalf("len(stats) = %d, want %d", got, want)
+	}
+	if stats[0].InputTokens == nil || *stats[0].InputTokens != 10 {
+		t.Fatalf("InputTokens = %#v, want 10", stats[0].InputTokens)
+	}
+	if stats[0].OutputTokens == nil || *stats[0].OutputTokens != 25 {
+		t.Fatalf("OutputTokens = %#v, want 25", stats[0].OutputTokens)
+	}
+	if stats[0].TotalTokens == nil || *stats[0].TotalTokens != 35 {
+		t.Fatalf("TotalTokens = %#v, want 35", stats[0].TotalTokens)
+	}
+	if stats[0].TotalCost == nil || *stats[0].TotalCost != 2.0 {
+		t.Fatalf("TotalCost = %#v, want 2.0", stats[0].TotalCost)
+	}
+	if stats[0].CostCurrency == nil || *stats[0].CostCurrency != "USD" {
+		t.Fatalf("CostCurrency = %#v, want USD", stats[0].CostCurrency)
+	}
+	if stats[0].CostStatus != "actual" || stats[0].CostSource != "agent_reported" {
+		t.Fatalf("cost provenance = %q/%q, want actual/agent_reported", stats[0].CostStatus, stats[0].CostSource)
+	}
+	if stats[0].TurnCount != 2 {
+		t.Fatalf("TurnCount = %d, want 2", stats[0].TurnCount)
+	}
+
+	outputC := int64(1)
+	totalC := int64(1)
+	costC := 0.05
+	if err := globalDB.UpdateTokenStats(testutil.Context(t), TokenStatsUpdate{
+		SessionID:    "sess-stats",
+		AgentName:    "coder",
+		OutputTokens: &outputC,
+		TotalTokens:  &totalC,
+		CostAmount:   &costC,
+		CostCurrency: &currency,
+		CostStatus:   "estimated",
+		CostSource:   "catalog_config",
+		Turns:        1,
+	}); err != nil {
+		t.Fatalf("UpdateTokenStats(conflicting provenance) error = %v", err)
+	}
+	stats, err = globalDB.ListTokenStats(testutil.Context(t), TokenStatsQuery{SessionID: "sess-stats"})
+	if err != nil {
+		t.Fatalf("ListTokenStats(after provenance conflict) error = %v", err)
+	}
+	if stats[0].TotalTokens == nil || *stats[0].TotalTokens != 36 || stats[0].TurnCount != 3 {
+		t.Fatalf("token aggregate after provenance conflict = %#v, want 36 tokens over 3 turns", stats[0])
+	}
+	if stats[0].TotalCost != nil || stats[0].CostCurrency != nil ||
+		stats[0].CostStatus != "unknown" || stats[0].CostSource != "none" {
+		t.Fatalf("cost aggregate after provenance conflict = %#v, want fail-closed unknown/none", stats[0])
+	}
+
+	registerSessionForGlobalTests(t, globalDB, "sess-stats-overflow")
+	oneToken := int64(1)
+	maxCost := math.MaxFloat64
+	for range 2 {
+		if err := globalDB.UpdateTokenStats(testutil.Context(t), TokenStatsUpdate{
+			SessionID:    "sess-stats-overflow",
+			AgentName:    "coder",
+			TotalTokens:  &oneToken,
+			CostAmount:   &maxCost,
+			CostCurrency: &currency,
+			CostStatus:   "actual",
+			CostSource:   "agent_reported",
+			Turns:        1,
+		}); err != nil {
+			t.Fatalf("UpdateTokenStats(overflow) error = %v", err)
+		}
+	}
+	overflowStats, err := globalDB.ListTokenStats(
+		testutil.Context(t),
+		TokenStatsQuery{SessionID: "sess-stats-overflow"},
+	)
+	if err != nil {
+		t.Fatalf("ListTokenStats(after overflow) error = %v", err)
+	}
+	if len(overflowStats) != 1 || overflowStats[0].TotalTokens == nil ||
+		*overflowStats[0].TotalTokens != 2 || overflowStats[0].TurnCount != 2 {
+		t.Fatalf("token aggregate after overflow = %#v, want 2 tokens over 2 turns", overflowStats)
+	}
+	if overflowStats[0].TotalCost != nil || overflowStats[0].CostCurrency != nil ||
+		overflowStats[0].CostStatus != "unknown" || overflowStats[0].CostSource != "none" {
+		t.Fatalf("cost aggregate after overflow = %#v, want fail-closed unknown/none", overflowStats[0])
+	}
+}
+
+func TestGlobalDBUpdateTokenStatsKeepsPerAgentRows(t *testing.T) {
+	t.Parallel()
+
+	globalDB := openTestGlobalDB(t)
+	registerSessionForGlobalTests(t, globalDB, "sess-multi-agent")
+
+	input := int64(10)
+	if err := globalDB.UpdateTokenStats(testutil.Context(t), TokenStatsUpdate{
+		SessionID:   "sess-multi-agent",
+		AgentName:   "coder",
+		InputTokens: &input,
+		CostStatus:  "unknown",
+		CostSource:  "none",
+	}); err != nil {
+		t.Fatalf("UpdateTokenStats(coder) error = %v", err)
+	}
+	if err := globalDB.UpdateTokenStats(testutil.Context(t), TokenStatsUpdate{
+		SessionID:   "sess-multi-agent",
+		AgentName:   "reviewer",
+		InputTokens: &input,
+		CostStatus:  "unknown",
+		CostSource:  "none",
+	}); err != nil {
+		t.Fatalf("UpdateTokenStats(reviewer) error = %v", err)
+	}
+
+	stats, err := globalDB.ListTokenStats(testutil.Context(t), TokenStatsQuery{SessionID: "sess-multi-agent"})
+	if err != nil {
+		t.Fatalf("ListTokenStats() error = %v", err)
+	}
+	if got := len(stats); got != 2 {
+		t.Fatalf("len(stats) = %d, want 2", got)
+	}
+
+	byAgent := make(map[string]TokenStats, len(stats))
+	for _, stat := range stats {
+		byAgent[stat.AgentName] = stat
+	}
+	if _, ok := byAgent["coder"]; !ok {
+		t.Fatalf("missing coder stats: %#v", stats)
+	}
+	if _, ok := byAgent["reviewer"]; !ok {
+		t.Fatalf("missing reviewer stats: %#v", stats)
+	}
+}
+
+func TestGlobalDBUpdateSessionStateReturnsNotFoundForMissingSession(t *testing.T) {
+	t.Parallel()
+
+	globalDB := openTestGlobalDB(t)
+
+	err := globalDB.UpdateSessionState(testutil.Context(t), SessionStateUpdate{
+		ID:    "missing",
+		State: "stopped",
+	})
+	if err == nil || !strings.Contains(err.Error(), `session "missing" not found`) {
+		t.Fatalf("UpdateSessionState(missing) error = %v, want missing session error", err)
+	}
+}
+
+func TestGlobalDBUpdateSessionStateRejectsUnmarshalableActivity(t *testing.T) {
+	t.Parallel()
+
+	globalDB := openTestGlobalDB(t)
+	registerSessionForGlobalTests(t, globalDB, "sess-update-invalid-activity")
+	unmarshalableTime := time.Date(10000, 1, 1, 0, 0, 0, 0, time.UTC)
+
+	err := globalDB.UpdateSessionState(testutil.Context(t), SessionStateUpdate{
+		ID:    "sess-update-invalid-activity",
+		State: "active",
+		Liveness: &store.SessionLivenessMeta{
+			Activity: &store.SessionActivityMeta{
+				TurnStartedAt: &unmarshalableTime,
+			},
+		},
+	})
+	if err == nil {
+		t.Fatal("UpdateSessionState(unmarshalable activity) error = nil, want marshal failure")
+	}
+	if !strings.Contains(err.Error(), "store: build update session state") ||
+		!strings.Contains(err.Error(), "store: session liveness activity marshal") {
+		t.Fatalf("UpdateSessionState(unmarshalable activity) error = %v, want activity marshal context", err)
+	}
+
+	sessions, err := globalDB.ListSessions(testutil.Context(t), SessionListQuery{
+		ReadScope: store.ReadScope{ProfileID: store.DefaultProfileID},
+	})
+	if err != nil {
+		t.Fatalf("ListSessions() error = %v", err)
+	}
+	if got, want := len(sessions), 1; got != want {
+		t.Fatalf("len(sessions) = %d, want %d", got, want)
+	}
+	if sessions[0].Liveness != nil && sessions[0].Liveness.Activity != nil {
+		t.Fatalf(
+			"sessions[0].Liveness.Activity = %#v, want failed update to skip activity write",
+			sessions[0].Liveness.Activity,
+		)
+	}
+}
+
+func TestGlobalDBListSessionsWrapsInvalidActivityJSONValidation(t *testing.T) {
+	t.Parallel()
+
+	globalDB := openTestGlobalDB(t)
+	registerSessionForGlobalTests(t, globalDB, "sess-invalid-activity-json")
+	if _, err := globalDB.DB().ExecContext(
+		testutil.Context(t),
+		`UPDATE sessions SET activity_json = ? WHERE id = ?`,
+		`{"idle_seconds":-1}`,
+		"sess-invalid-activity-json",
+	); err != nil {
+		t.Fatalf("update invalid activity_json error = %v", err)
+	}
+
+	_, err := globalDB.ListSessions(testutil.Context(t), SessionListQuery{
+		ReadScope: store.ReadScope{ProfileID: store.DefaultProfileID},
+	})
+	if err == nil {
+		t.Fatal("ListSessions(invalid activity_json) error = nil, want validation error")
+	}
+	if !strings.Contains(err.Error(), "store: validate session activity json") ||
+		!strings.Contains(err.Error(), "store: session activity idle seconds must be zero or positive") {
+		t.Fatalf("ListSessions(invalid activity_json) error = %v, want validation context", err)
+	}
+}
+
+func TestGlobalDBUpdateSessionStateHandlesStopFields(t *testing.T) {
+	t.Parallel()
+
+	t.Run("Should update columns when stop reason is set", func(t *testing.T) {
+		t.Parallel()
+
+		globalDB := openTestGlobalDB(t)
+		workspaceID := registerWorkspaceForGlobalTests(
+			t,
+			globalDB,
+			"update-stop-reason",
+			filepath.Join(t.TempDir(), "workspace"),
+		)
+		if err := globalDB.RegisterSession(testutil.Context(t), new(SessionInfo{
+			ProfileID:     store.DefaultProfileID,
+			ID:            "sess-update-stop",
+			AgentName:     "coder",
+			RuntimeStatus: store.SessionRuntimeUnbound,
+			WorkspaceID:   workspaceID,
+			State:         "active",
+			CreatedAt:     time.Date(2026, 4, 3, 13, 0, 0, 0, time.UTC),
+			UpdatedAt:     time.Date(2026, 4, 3, 13, 0, 0, 0, time.UTC),
+		})); err != nil {
+			t.Fatalf("RegisterSession() error = %v", err)
+		}
+
+		stopReason := string(store.StopUserCanceled)
+		if err := globalDB.UpdateSessionState(testutil.Context(t), SessionStateUpdate{
+			ID:            "sess-update-stop",
+			State:         "stopped",
+			StopReasonSet: true,
+			StopReason:    &stopReason,
+			StopDetail:    "requested by user",
+			UpdatedAt:     time.Date(2026, 4, 3, 13, 2, 0, 0, time.UTC),
+		}); err != nil {
+			t.Fatalf("UpdateSessionState() error = %v", err)
+		}
+
+		gotStopReason, gotStopDetail := queryStoredSessionStopFields(t, globalDB.db, "sess-update-stop")
+		assertOptionalStringEqual(t, gotStopReason, stringPointerForTest(string(store.StopUserCanceled)), "stop_reason")
+		assertOptionalStringEqual(t, gotStopDetail, stringPointerForTest("requested by user"), "stop_detail")
+	})
+
+	t.Run("Should leave existing columns unchanged when stop reason is missing", func(t *testing.T) {
+		t.Parallel()
+
+		globalDB := openTestGlobalDB(t)
+		workspaceID := registerWorkspaceForGlobalTests(
+			t,
+			globalDB,
+			"preserve-stop-reason",
+			filepath.Join(t.TempDir(), "workspace"),
+		)
+		if err := globalDB.RegisterSession(testutil.Context(t), new(SessionInfo{
+			ProfileID:     store.DefaultProfileID,
+			ID:            "sess-preserve-stop",
+			AgentName:     "coder",
+			RuntimeStatus: store.SessionRuntimeUnbound,
+			WorkspaceID:   workspaceID,
+			State:         "stopped",
+			StopReason:    store.StopTimeout,
+			StopDetail:    "deadline exceeded",
+			CreatedAt:     time.Date(2026, 4, 3, 13, 0, 0, 0, time.UTC),
+			UpdatedAt:     time.Date(2026, 4, 3, 13, 0, 0, 0, time.UTC),
+		})); err != nil {
+			t.Fatalf("RegisterSession() error = %v", err)
+		}
+
+		if err := globalDB.UpdateSessionState(testutil.Context(t), SessionStateUpdate{
+			ID:        "sess-preserve-stop",
+			State:     "orphaned",
+			UpdatedAt: time.Date(2026, 4, 3, 13, 5, 0, 0, time.UTC),
+		}); err != nil {
+			t.Fatalf("UpdateSessionState() error = %v", err)
+		}
+
+		gotStopReason, gotStopDetail := queryStoredSessionStopFields(t, globalDB.db, "sess-preserve-stop")
+		assertOptionalStringEqual(t, gotStopReason, stringPointerForTest(string(store.StopTimeout)), "stop_reason")
+		assertOptionalStringEqual(t, gotStopDetail, stringPointerForTest("deadline exceeded"), "stop_detail")
+	})
+
+	t.Run("Should clear existing columns when stop reason is explicitly nil", func(t *testing.T) {
+		t.Parallel()
+
+		globalDB := openTestGlobalDB(t)
+		workspaceID := registerWorkspaceForGlobalTests(
+			t,
+			globalDB,
+			"clear-stop-reason",
+			filepath.Join(t.TempDir(), "workspace"),
+		)
+		if err := globalDB.RegisterSession(testutil.Context(t), new(SessionInfo{
+			ProfileID:     store.DefaultProfileID,
+			ID:            "sess-clear-stop",
+			AgentName:     "coder",
+			RuntimeStatus: store.SessionRuntimeUnbound,
+			WorkspaceID:   workspaceID,
+			State:         "stopped",
+			StopReason:    store.StopTimeout,
+			StopDetail:    "deadline exceeded",
+			CreatedAt:     time.Date(2026, 4, 3, 13, 0, 0, 0, time.UTC),
+			UpdatedAt:     time.Date(2026, 4, 3, 13, 0, 0, 0, time.UTC),
+		})); err != nil {
+			t.Fatalf("RegisterSession() error = %v", err)
+		}
+
+		if err := globalDB.UpdateSessionState(testutil.Context(t), SessionStateUpdate{
+			ID:            "sess-clear-stop",
+			State:         "active",
+			StopReasonSet: true,
+			UpdatedAt:     time.Date(2026, 4, 3, 13, 5, 0, 0, time.UTC),
+		}); err != nil {
+			t.Fatalf("UpdateSessionState() error = %v", err)
+		}
+
+		gotStopReason, gotStopDetail := queryStoredSessionStopFields(t, globalDB.db, "sess-clear-stop")
+		assertOptionalStringEqual(t, gotStopReason, nil, "stop_reason")
+		assertOptionalStringEqual(t, gotStopDetail, nil, "stop_detail")
+	})
+}
+
+func TestGlobalDBWritePermissionLogEntry(t *testing.T) {
+	t.Parallel()
+
+	globalDB := openTestGlobalDB(t)
+	registerSessionForGlobalTests(t, globalDB, "sess-perm")
+
+	if err := globalDB.WritePermissionLog(testutil.Context(t), PermissionLogEntry{
+		SessionID:  "sess-perm",
+		AgentName:  "coder",
+		Action:     "bash",
+		Resource:   "/tmp/project",
+		Decision:   "allow",
+		PolicyUsed: "approve-reads",
+		Timestamp:  time.Date(2026, 4, 3, 15, 0, 0, 0, time.UTC),
+	}); err != nil {
+		t.Fatalf("WritePermissionLog() error = %v", err)
+	}
+
+	entries, err := globalDB.ListPermissionLog(testutil.Context(t), PermissionLogQuery{SessionID: "sess-perm"})
+	if err != nil {
+		t.Fatalf("ListPermissionLog() error = %v", err)
+	}
+	if got, want := len(entries), 1; got != want {
+		t.Fatalf("len(entries) = %d, want %d", got, want)
+	}
+	if entries[0].Decision != "allow" || entries[0].PolicyUsed != "approve-reads" {
+		t.Fatalf("entry = %#v, want allow/approve-reads", entries[0])
+	}
+}
+
+func TestGlobalDBReconcileSessions(t *testing.T) {
+	t.Parallel()
+
+	globalDB := openTestGlobalDB(t)
+	keepWorkspaceID := registerSessionForGlobalTests(t, globalDB, "sess-keep")
+	registerSessionForGlobalTests(t, globalDB, "sess-orphan")
+
+	onDisk := []SessionInfo{
+		{
+			ID:            "sess-keep",
+			AgentName:     "coder",
+			Provider:      "claude",
+			RuntimeStatus: store.SessionRuntimeUnbound,
+			WorkspaceID:   keepWorkspaceID,
+			State:         "stopped",
+			StopReason:    store.StopCompleted,
+			CreatedAt:     time.Date(2026, 4, 3, 16, 0, 0, 0, time.UTC),
+			ProfileID:     store.DefaultProfileID,
+			UpdatedAt:     time.Date(2026, 4, 3, 16, 0, 0, 0, time.UTC),
+		},
+		{
+			ID:            "sess-new",
+			AgentName:     "reviewer",
+			Provider:      "codex",
+			RuntimeStatus: store.SessionRuntimeUnbound,
+			WorkspaceID: registerWorkspaceForGlobalTests(
+				t,
+				globalDB,
+				"sess-new-reconciled-workspace",
+				filepath.Join(t.TempDir(), "sess-new"),
+			),
+			State:      "stopped",
+			StopReason: store.StopUserCanceled,
+			StopDetail: "requested by API",
+			CreatedAt:  time.Date(2026, 4, 3, 16, 0, 0, 0, time.UTC),
+			ProfileID:  store.DefaultProfileID,
+			UpdatedAt:  time.Date(2026, 4, 3, 16, 0, 0, 0, time.UTC),
+		},
+	}
+
+	result, err := globalDB.ReconcileSessions(testutil.Context(t), onDisk)
+	if err != nil {
+		t.Fatalf("ReconcileSessions() error = %v", err)
+	}
+	slices.Sort(result.Indexed)
+	slices.Sort(result.Orphaned)
+	if !testutil.EqualStringSlices(result.Indexed, []string{"sess-new"}) {
+		t.Fatalf("Indexed = %#v, want %#v", result.Indexed, []string{"sess-new"})
+	}
+	if !testutil.EqualStringSlices(result.Orphaned, []string{"sess-orphan"}) {
+		t.Fatalf("Orphaned = %#v, want %#v", result.Orphaned, []string{"sess-orphan"})
+	}
+
+	sessions, err := globalDB.ListSessions(testutil.Context(t), SessionListQuery{
+		ReadScope: store.ReadScope{ProfileID: store.DefaultProfileID},
+	})
+	if err != nil {
+		t.Fatalf("ListSessions() error = %v", err)
+	}
+	stateByID := make(map[string]string, len(sessions))
+	stopReasonByID := make(map[string]store.StopReason, len(sessions))
+	providerByID := make(map[string]string, len(sessions))
+	for _, session := range sessions {
+		stateByID[session.ID] = session.State
+		stopReasonByID[session.ID] = session.StopReason
+		providerByID[session.ID] = session.Provider
+	}
+	if stateByID["sess-new"] != "stopped" {
+		t.Fatalf("stateByID[sess-new] = %q, want stopped", stateByID["sess-new"])
+	}
+	if stopReasonByID["sess-new"] != store.StopUserCanceled {
+		t.Fatalf("stopReasonByID[sess-new] = %q, want %q", stopReasonByID["sess-new"], store.StopUserCanceled)
+	}
+	if providerByID["sess-new"] != "codex" {
+		t.Fatalf("providerByID[sess-new] = %q, want codex", providerByID["sess-new"])
+	}
+	if stateByID["sess-orphan"] != "orphaned" {
+		t.Fatalf("stateByID[sess-orphan] = %q, want orphaned", stateByID["sess-orphan"])
+	}
+}
+
+func TestGlobalDBReconcileSessionsSkipsDuplicateIDsAndDefaultsTimestamps(t *testing.T) {
+	t.Parallel()
+
+	globalDB := openTestGlobalDB(t)
+	reconciledAt := time.Date(2026, 4, 3, 16, 30, 0, 0, time.UTC)
+	globalDB.now = func() time.Time {
+		return reconciledAt
+	}
+
+	workspaceID := registerWorkspaceForGlobalTests(
+		t,
+		globalDB,
+		"sess-duplicate-reconciled-workspace",
+		filepath.Join(t.TempDir(), "sess-duplicate"),
+	)
+	onDisk := []SessionInfo{
+		{
+			ID:            "sess-duplicate",
+			AgentName:     "coder",
+			Provider:      "claude",
+			RuntimeStatus: store.SessionRuntimeUnbound,
+			WorkspaceID:   workspaceID,
+			ProfileID:     store.DefaultProfileID,
+			State:         "stopped",
+		},
+		{
+			ID:            "sess-duplicate",
+			AgentName:     "coder",
+			Provider:      "codex",
+			RuntimeStatus: store.SessionRuntimeUnbound,
+			WorkspaceID:   workspaceID,
+			ProfileID:     store.DefaultProfileID,
+			State:         "orphaned",
+		},
+	}
+
+	result, err := globalDB.ReconcileSessions(testutil.Context(t), onDisk)
+	if err != nil {
+		t.Fatalf("ReconcileSessions() error = %v", err)
+	}
+	if !testutil.EqualStringSlices(result.Indexed, []string{"sess-duplicate"}) {
+		t.Fatalf("Indexed = %#v, want %#v", result.Indexed, []string{"sess-duplicate"})
+	}
+	if len(result.Orphaned) != 0 {
+		t.Fatalf("Orphaned = %#v, want empty", result.Orphaned)
+	}
+
+	sessions, err := globalDB.ListSessions(testutil.Context(t), SessionListQuery{
+		ReadScope: store.ReadScope{ProfileID: store.DefaultProfileID},
+	})
+	if err != nil {
+		t.Fatalf("ListSessions() error = %v", err)
+	}
+	if got, want := len(sessions), 1; got != want {
+		t.Fatalf("len(sessions) = %d, want %d", got, want)
+	}
+
+	got := sessions[0]
+	if got.Provider != "claude" {
+		t.Fatalf("sessions[0].Provider = %q, want claude from first reconcile entry", got.Provider)
+	}
+	if got.State != "stopped" {
+		t.Fatalf("sessions[0].State = %q, want stopped from first reconcile entry", got.State)
+	}
+	if !got.CreatedAt.Equal(reconciledAt) {
+		t.Fatalf("sessions[0].CreatedAt = %v, want %v", got.CreatedAt, reconciledAt)
+	}
+	if !got.UpdatedAt.Equal(reconciledAt) {
+		t.Fatalf("sessions[0].UpdatedAt = %v, want %v", got.UpdatedAt, reconciledAt)
+	}
+}
+
+func openTestGlobalDB(t *testing.T) *GlobalDB {
+	t.Helper()
+
+	path := filepath.Join(t.TempDir(), GlobalDatabaseName)
+	copyCurrentSchemaGlobalDBSeed(t, path)
+	return openGlobalDBForTest(t, path)
+}
+
+func openFreshTestGlobalDB(t *testing.T) *GlobalDB {
+	t.Helper()
+
+	return openGlobalDBForTest(t, filepath.Join(t.TempDir(), GlobalDatabaseName))
+}
+
+func openGlobalDBForTest(t *testing.T, path string) *GlobalDB {
+	t.Helper()
+
+	sessionsDir := filepath.Join(filepath.Dir(path), "sessions")
+	globalDB, err := OpenGlobalDB(
+		testutil.Context(t),
+		path,
+		WithSessionEventMetadataOpener(sessiondb.NewEventMetadataOpener(sessionsDir)),
+	)
+	if err != nil {
+		t.Fatalf("OpenGlobalDB() error = %v", err)
+	}
+	t.Cleanup(func() {
+		if err := globalDB.Close(testutil.Context(t)); err != nil {
+			t.Errorf("Close() error = %v", err)
+		}
+	})
+	return globalDB
+}
+
+func copyCurrentSchemaGlobalDBSeed(t *testing.T, targetPath string) {
+	t.Helper()
+
+	if testGlobalDBCurrentSchemaSeedPath == "" {
+		t.Fatal("globaldb current schema seed path is empty")
+	}
+	for _, suffix := range []string{"", "-wal", "-shm", ".telemetry.db", ".telemetry.db-wal", ".telemetry.db-shm"} {
+		sourcePath := testGlobalDBCurrentSchemaSeedPath + suffix
+		data, err := os.ReadFile(sourcePath)
+		if err != nil {
+			if suffix != "" && errors.Is(err, os.ErrNotExist) {
+				continue
+			}
+			t.Fatalf("ReadFile(%q) error = %v", sourcePath, err)
+		}
+		if err := os.WriteFile(targetPath+suffix, data, 0o600); err != nil {
+			t.Fatalf("WriteFile(%q) error = %v", targetPath+suffix, err)
+		}
+	}
+}
+
+func registerSessionForGlobalTests(t *testing.T, globalDB *GlobalDB, sessionID string) string {
+	t.Helper()
+
+	now := time.Date(2026, 4, 3, 13, 0, 0, 0, time.UTC)
+	workspaceID := registerWorkspaceForGlobalTests(
+		t,
+		globalDB,
+		sessionID+"-workspace",
+		filepath.Join(t.TempDir(), sessionID),
+	)
+	if err := globalDB.RegisterSession(testutil.Context(t), new(SessionInfo{
+		ID:            sessionID,
+		ProfileID:     store.DefaultProfileID,
+		AgentName:     "coder",
+		Provider:      "claude",
+		RuntimeStatus: store.SessionRuntimeUnbound,
+		WorkspaceID:   workspaceID,
+		State:         "active",
+		CreatedAt:     now,
+		UpdatedAt:     now,
+	})); err != nil {
+		t.Fatalf("RegisterSession(%q) error = %v", sessionID, err)
+	}
+	return workspaceID
+}
+
+func insertWorkspaceForGlobalTests(
+	t *testing.T,
+	globalDB *GlobalDB,
+	ws compozyworkspace.Workspace,
+) compozyworkspace.Workspace {
+	t.Helper()
+
+	if strings.TrimSpace(ws.RootDir) == "" {
+		t.Fatal("insertWorkspaceForGlobalTests() requires RootDir")
+	}
+	if err := os.MkdirAll(ws.RootDir, 0o755); err != nil {
+		t.Fatalf("MkdirAll(%q) error = %v", ws.RootDir, err)
+	}
+	if ws.CreatedAt.IsZero() {
+		ws.CreatedAt = time.Date(2026, 4, 3, 9, 0, 0, 0, time.UTC)
+	}
+	if ws.UpdatedAt.IsZero() {
+		ws.UpdatedAt = ws.CreatedAt
+	}
+	if err := globalDB.InsertWorkspace(testutil.Context(t), ws); err != nil {
+		t.Fatalf("InsertWorkspace(%q) error = %v", ws.ID, err)
+	}
+	return ws
+}
+
+func registerWorkspaceForGlobalTests(t *testing.T, globalDB *GlobalDB, name string, rootDir string) string {
+	t.Helper()
+
+	workspace := insertWorkspaceForGlobalTests(t, globalDB, compozyworkspace.Workspace{
+		ID:        "ws-" + strings.ReplaceAll(name, " ", "-"),
+		RootDir:   rootDir,
+		Name:      name,
+		CreatedAt: time.Date(2026, 4, 3, 9, 0, 0, 0, time.UTC),
+		UpdatedAt: time.Date(2026, 4, 3, 9, 0, 0, 0, time.UTC),
+	})
+	return workspace.ID
+}
+
+func assertEventSummaryIDs(t *testing.T, globalDB *GlobalDB, want []string) {
+	t.Helper()
+
+	events, err := globalDB.ListEventSummaries(
+		testutil.Context(t),
+		EventSummaryQuery{ReadScope: store.ReadScope{AllProfiles: true}},
+	)
+	if err != nil {
+		t.Fatalf("ListEventSummaries() error = %v", err)
+	}
+	got := make([]string, 0, len(events))
+	for _, event := range events {
+		got = append(got, event.ID)
+	}
+	slices.Sort(got)
+	slices.Sort(want)
+	if !slices.Equal(got, want) {
+		t.Fatalf("event summary ids = %#v, want %#v", got, want)
+	}
+}
+
+func assertTokenStatAgents(t *testing.T, globalDB *GlobalDB, want []string) {
+	t.Helper()
+
+	stats, err := globalDB.ListTokenStats(testutil.Context(t), TokenStatsQuery{})
+	if err != nil {
+		t.Fatalf("ListTokenStats() error = %v", err)
+	}
+	got := make([]string, 0, len(stats))
+	for _, stat := range stats {
+		got = append(got, stat.AgentName)
+	}
+	slices.Sort(got)
+	slices.Sort(want)
+	if !slices.Equal(got, want) {
+		t.Fatalf("token stat agents = %#v, want %#v", got, want)
+	}
+}
+
+func assertPermissionLogIDs(t *testing.T, globalDB *GlobalDB, want []string) {
+	t.Helper()
+
+	entries, err := globalDB.ListPermissionLog(testutil.Context(t), PermissionLogQuery{})
+	if err != nil {
+		t.Fatalf("ListPermissionLog() error = %v", err)
+	}
+	got := make([]string, 0, len(entries))
+	for _, entry := range entries {
+		got = append(got, entry.ID)
+	}
+	slices.Sort(got)
+	slices.Sort(want)
+	if !slices.Equal(got, want) {
+		t.Fatalf("permission log ids = %#v, want %#v", got, want)
+	}
+}
+
+func assertWorkspaceEqual(t *testing.T, got compozyworkspace.Workspace, want compozyworkspace.Workspace) {
+	t.Helper()
+
+	if got.ID != want.ID ||
+		got.RootDir != want.RootDir ||
+		got.Name != want.Name ||
+		got.DefaultAgent != want.DefaultAgent ||
+		!got.CreatedAt.Equal(want.CreatedAt) ||
+		!got.UpdatedAt.Equal(want.UpdatedAt) ||
+		!testutil.EqualStringSlices(got.AdditionalDirs, want.AdditionalDirs) {
+		t.Fatalf("workspace = %#v, want %#v", got, want)
+	}
+}
+
+func assertTableColumns(t *testing.T, db *sql.DB, table string, want []string) {
+	t.Helper()
+
+	rows, err := db.QueryContext(testutil.Context(t), "PRAGMA table_info("+table+")")
+	if err != nil {
+		t.Fatalf("QueryContext(table_info %q) error = %v", table, err)
+	}
+	defer func() {
+		if closeErr := rows.Close(); closeErr != nil {
+			t.Fatalf("rows.Close(table_info %q) error = %v", table, closeErr)
+		}
+	}()
+
+	got := make([]string, 0)
+	for rows.Next() {
+		var (
+			cid        int
+			name       string
+			columnType string
+			notNull    int
+			defaultVal sql.NullString
+			primaryKey int
+		)
+		if err := rows.Scan(&cid, &name, &columnType, &notNull, &defaultVal, &primaryKey); err != nil {
+			t.Fatalf("Scan(table_info %q) error = %v", table, err)
+		}
+		got = append(got, name)
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatalf("rows.Err(table_info %q) error = %v", table, err)
+	}
+
+	if !testutil.EqualStringSlices(got, want) {
+		t.Fatalf("columns(%s) = %#v, want %#v", table, got, want)
+	}
+}
+
+func queryStoredSessionStopFields(t *testing.T, db *sql.DB, sessionID string) (*string, *string) {
+	t.Helper()
+
+	var stopReason sql.NullString
+	var stopDetail sql.NullString
+	if err := db.QueryRowContext(testutil.Context(t), `SELECT stop_reason, stop_detail FROM sessions WHERE id = ?`, sessionID).
+		Scan(&stopReason, &stopDetail); err != nil {
+		t.Fatalf("QueryRowContext(stop fields %q) error = %v", sessionID, err)
+	}
+	return store.NullString(stopReason), store.NullString(stopDetail)
+}
+
+func assertOptionalStringEqual(t *testing.T, got *string, want *string, field string) {
+	t.Helper()
+
+	switch {
+	case got == nil && want == nil:
+		return
+	case got == nil || want == nil:
+		t.Fatalf("%s = %#v, want %#v", field, got, want)
+	case *got != *want:
+		t.Fatalf("%s = %q, want %q", field, *got, *want)
+	}
+}
+
+func stringPointerForTest(value string) *string {
+	if strings.TrimSpace(value) == "" {
+		return nil
+	}
+
+	return new(value)
+}
+
+func ptrTime(value time.Time) *time.Time {
+	return new(value.UTC())
+}
+
+func assertTablesPresent(t *testing.T, db *sql.DB, want ...string) {
+	t.Helper()
+
+	rows, err := db.QueryContext(testutil.Context(t), `SELECT name FROM sqlite_master WHERE type = 'table'`)
+	if err != nil {
+		t.Fatalf("QueryContext(sqlite_master) error = %v", err)
+	}
+	defer func() {
+		if closeErr := rows.Close(); closeErr != nil {
+			t.Errorf("rows.Close() error = %v", closeErr)
+		}
+	}()
+
+	got := make(map[string]struct{})
+	for rows.Next() {
+		var name string
+		if scanErr := rows.Scan(&name); scanErr != nil {
+			t.Fatalf("rows.Scan() error = %v", scanErr)
+		}
+		got[name] = struct{}{}
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatalf("rows.Err() = %v", err)
+	}
+
+	for _, table := range want {
+		if _, ok := got[table]; !ok {
+			t.Fatalf("table %q missing from sqlite_master: %#v", table, got)
+		}
+	}
+}
+
+func assertJournalModeWAL(t *testing.T, db *sql.DB) {
+	t.Helper()
+
+	var journalMode string
+	if err := db.QueryRowContext(testutil.Context(t), `PRAGMA journal_mode`).Scan(&journalMode); err != nil {
+		t.Fatalf("QueryRowContext(PRAGMA journal_mode) error = %v", err)
+	}
+	if !strings.EqualFold(journalMode, "wal") {
+		t.Fatalf("PRAGMA journal_mode = %q, want wal", journalMode)
+	}
+}
+
+func assertSynchronousNormal(t *testing.T, db *sql.DB) {
+	t.Helper()
+
+	var synchronous int
+	if err := db.QueryRowContext(testutil.Context(t), `PRAGMA synchronous`).Scan(&synchronous); err != nil {
+		t.Fatalf("QueryRowContext(PRAGMA synchronous) error = %v", err)
+	}
+	if synchronous != 1 {
+		t.Fatalf("PRAGMA synchronous = %d, want 1 (NORMAL)", synchronous)
+	}
+}
+
+// Invariants IT-001/003/008: retirement preserves active state, removes derived memory
+// and legacy internal sessions, and keeps all nine session FK sites consistent.
+// Owner: global SQLite upgrade. Canonical suite: global DB retirement/preservation.
+func TestGlobalDBMemoryRetirementMigration(t *testing.T) {
+	t.Parallel()
+	for _, fixture := range []struct {
+		name   string
+		memory bool
+	}{
+		{"Should retire populated memory state and legacy sessions while preserving active state", true},
+		{"Should upgrade databases without a memory stream without changing kept schema", false},
+	} {
+		t.Run(fixture.name, func(t *testing.T) {
+			t.Parallel()
+			ctx := globalMigrationTestContext(t)
+			path := filepath.Join(t.TempDir(), GlobalDatabaseName)
+			prior, err := openGlobalMigrationPrefixDatabase(
+				t,
+				path,
+				globalMigrationPrefixBefore(t, "00130_retire_memory.sql"),
+			)
+			if err != nil {
+				t.Fatal(err)
+			}
+			seedMemoryRetirementKeptState(t, prior)
+			if fixture.memory {
+				fixtureSQL, err := os.ReadFile("testdata/retired_memory_v3.sql")
+				if err != nil {
+					t.Fatal(err)
+				}
+				if _, err := prior.ExecContext(ctx, string(fixtureSQL)); err != nil {
+					t.Fatal(err)
+				}
+				seedMemoryRetirementStream(t, prior)
+			}
+			keptQueries := []string{
+				`SELECT * FROM sessions WHERE id IN ('kept-user','kept-title','kept-reviewer') ORDER BY id`,
+				`SELECT * FROM tasks WHERE id='kept-task'`,
+				`SELECT * FROM loop_runs WHERE id='kept-loop'`,
+				`SELECT * FROM agent_soul_revisions WHERE id='kept-soul'`,
+				`SELECT * FROM automation_triggers WHERE id='kept-trigger'`,
+				`SELECT type,name,tbl_name,sql FROM sqlite_master WHERE name NOT GLOB 'memory_*' AND tbl_name NOT GLOB 'memory_*' AND name <> 'goose_db_version_memory' ORDER BY name`,
+			}
+			before := make([]string, len(keptQueries))
+			for i, query := range keptQueries {
+				before[i] = memoryRetirementRows(t, prior, query)
+			}
+			if err := prior.Close(); err != nil {
+				t.Fatal(err)
+			}
+			retirement := globalMigrationPrefixThrough(t, "00130_retire_memory.sql")
+			for range 2 {
+				upgraded, err := openGlobalMigrationPrefixDatabase(t, path, retirement)
+				if err != nil {
+					t.Fatal(err)
+				}
+				for i, query := range keptQueries {
+					if got := memoryRetirementRows(t, upgraded, query); got != before[i] {
+						t.Fatalf("kept state changed for %s", query)
+					}
+				}
+				for _, query := range []string{
+					`SELECT count(*) FROM sqlite_master WHERE name GLOB 'memory_*' OR name = 'goose_db_version_memory'`,
+					`SELECT count(*) FROM sessions WHERE session_type='dream' OR spawn_role IN ('memory-extractor','checkpoint-summary')`,
+					`SELECT count(*) FROM sessions WHERE parent_session_id='kept-user' AND id NOT IN ('kept-title','kept-reviewer')`,
+					`SELECT count(*) FROM pragma_foreign_key_check`,
+				} {
+					var count int
+					if err := upgraded.QueryRowContext(ctx, query).Scan(&count); err != nil {
+						t.Fatal(err)
+					}
+					if count != 0 {
+						t.Fatalf("%s = %d, want zero", query, count)
+					}
+				}
+				for _, eventID := range []string{"retired-wake", "retired-checkpoint-wake"} {
+					var eventSession sql.NullString
+					if err := upgraded.QueryRowContext(ctx, `SELECT session_id FROM agent_heartbeat_wake_events WHERE id=?`, eventID).
+						Scan(&eventSession); err != nil {
+						t.Fatal(err)
+					}
+					if eventSession.Valid {
+						t.Fatalf("heartbeat audit %s retains deleted session %q", eventID, eventSession.String)
+					}
+				}
+				status, err := store.Status(ctx, upgraded, retirement)
+				if err != nil {
+					t.Fatal(err)
+				}
+				assertCompleteMigrationStream(t, status, retirement)
+				if err := upgraded.Close(); err != nil {
+					t.Fatal(err)
+				}
+			}
+		})
+	}
+}
+
+func seedMemoryRetirementKeptState(t *testing.T, db *sql.DB) {
+	t.Helper()
+	for _, statement := range []string{
+		`INSERT INTO workspaces (id,root_dir,name,add_dirs,created_at,updated_at) VALUES ('retirement-ws','/retirement','Retirement','[]','2026-10-07','2026-10-07')`,
+		`INSERT INTO sessions (id,profile_id,agent_name,scope,workspace_id,state,session_type,spawn_role,parent_session_id,attention_revision,pending_permission_count,created_at,updated_at) VALUES
+		('kept-user','00000000000000000000000000','coder','workspace','retirement-ws','stopped','user',NULL,NULL,7,0,'2026-10-07','2026-10-07'),
+		('retired-dream','00000000000000000000000000','coder','workspace','retirement-ws','stopped','dream',NULL,NULL,3,1,'2026-10-07','2026-10-07'),
+		('retired-extractor','00000000000000000000000000','coder','workspace','retirement-ws','stopped','user','memory-extractor','kept-user',4,1,'2026-10-07','2026-10-07'),
+		('retired-checkpoint','00000000000000000000000000','coder','workspace','retirement-ws','stopped','user','checkpoint-summary','kept-user',4,1,'2026-10-07','2026-10-07'),
+		('retired-checkpoint-dream','00000000000000000000000000','coder','workspace','retirement-ws','stopped','dream','checkpoint-summary','kept-user',4,1,'2026-10-07','2026-10-07'),
+		('kept-reviewer','00000000000000000000000000','coder','workspace','retirement-ws','stopped','user','reviewer','kept-user',0,0,'2026-10-07','2026-10-07'),
+		('kept-title','00000000000000000000000000','coder','workspace','retirement-ws','stopped','user','auto-title','kept-user',0,0,'2026-10-07','2026-10-07')`,
+		`INSERT INTO tasks (id,profile_id,scope,workspace_id,title,status,created_by_kind,created_by_ref,origin_kind,origin_ref,created_at,updated_at) VALUES ('kept-task','00000000000000000000000000','workspace','retirement-ws','Keep task','open','daemon','daemon','daemon','daemon','2026-10-07','2026-10-07')`,
+		`INSERT INTO loop_runs (id,profile_id,workspace_id,loop_name,status,last_progress_at,inputs_json) VALUES ('kept-loop','00000000000000000000000000','retirement-ws','kept','done','2026-10-07','{}')`,
+		`INSERT INTO agent_soul_revisions (id,workspace_id,agent_name,source_path,action,created_at) VALUES ('kept-soul','retirement-ws','coder','SOUL.md','put','2026-10-07')`,
+		`INSERT INTO automation_triggers (id,profile_id,scope,name,agent_name,prompt,event,retry,fire_limit,created_at,updated_at) VALUES ('kept-trigger','00000000000000000000000000','global','Kept','coder','Keep','session.created','{}','{}','2026-10-07','2026-10-07')`,
+	} {
+		if _, err := db.ExecContext(t.Context(), statement); err != nil {
+			t.Fatalf("seed kept state: %v", err)
+		}
+	}
+	for _, id := range []string{"retired-dream", "retired-extractor", "retired-checkpoint", "retired-checkpoint-dream"} {
+		for _, statement := range []string{
+			`INSERT INTO session_health (session_id,workspace_id,agent_name,state,health,active_prompt,attachable,eligible_for_wake,updated_at) VALUES (?,'retirement-ws','coder','stopped','healthy',0,1,0,'2026-10-07')`,
+			`INSERT INTO token_stats (id,session_id,agent_name,input_tokens,output_tokens,updated_at) VALUES (?,?,'coder',21,8,'2026-10-07')`,
+			`INSERT INTO permission_log (id,session_id,agent_name,action,resource,decision,policy_used,timestamp) VALUES (?,?,'coder','read','file','allow','policy','2026-10-07')`,
+			`INSERT INTO session_pending_interactions (interaction_id,session_id,kind,provider_request_id,status,created_at) VALUES (?,?,'permission','request','pending','2026-10-07')`,
+			`INSERT INTO session_prompt_admissions (id,workspace_id,session_id,message_id,idempotency_key,operation,fingerprint_version,request_fingerprint,state,turn_id,event_id,created_at,updated_at) VALUES (?,'retirement-ws',?,'message','key','prompt','v1','fingerprint','reserved','turn','event','2026-10-07','2026-10-07')`,
+			`INSERT INTO session_input_queue (id,session_id,prompt_admission_id,status,mode,text,enqueued_at,updated_at) VALUES (?,?,?,'queued','queue','prompt','2026-10-07','2026-10-07')`,
+			`INSERT INTO session_input_clear_traces (entry_id,session_id,turn_id,actor_kind,actor_id,queue_generation,created_at) VALUES (?,?,'turn','user','operator',0,'2026-10-07')`,
+			`INSERT INTO agent_heartbeat_wake_state (workspace_id,agent_name,session_id,last_result,updated_at) VALUES ('retirement-ws',?,?,'sent','2026-10-07')`,
+		} {
+			args := make([]any, strings.Count(statement, "?"))
+			for i := range args {
+				args[i] = id
+			}
+			if _, err := db.ExecContext(t.Context(), statement, args...); err != nil {
+				t.Fatalf("seed session dependent %s: %v", statement, err)
+			}
+		}
+	}
+	if _, err := db.ExecContext(
+		t.Context(),
+		`INSERT INTO agent_heartbeat_wake_events (id,workspace_id,agent_name,session_id,source,result,reason,created_at,expires_at) VALUES ('retired-wake','retirement-ws','coder','retired-dream','manual','sent','wake_sent','2026-10-07','2026-10-08'), ('retired-checkpoint-wake','retirement-ws','coder','retired-checkpoint','manual','sent','wake_sent','2026-10-07','2026-10-08')`,
+	); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func seedMemoryRetirementStream(t *testing.T, db *sql.DB) {
+	t.Helper()
+	for _, statement := range []string{
+		`INSERT INTO memory_catalog_entries (id,scope,type,slug,filename,content_hash,mtime_ms,indexed_at,updated_at) VALUES ('file','profile','project','fixture','project_fixture.md','hash',1,1,'2026-10-07')`,
+		`INSERT INTO memory_chunks (id,file_id,content,content_hash,start_line,end_line,indexed_at) VALUES ('chunk','file','Remember','hash',1,1,1)`,
+		`INSERT INTO memory_recall_signals (chunk_id,updated_at) VALUES ('chunk',1)`,
+		`INSERT INTO memory_catalog_state (key,value) VALUES ('fixture','value')`,
+		`INSERT INTO memory_consolidations (id,scope,started_at,status) VALUES ('consolidation','profile',1,'running')`,
+		`INSERT INTO memory_decisions (id,candidate_hash,idempotency_key,frontmatter_hash,scope,op,target_filename,confidence,source,rule_trace,decided_at) VALUES ('pending','hash','key','hash','profile','add','project_fixture.md',1,'rule','trace',1)`,
+		`INSERT INTO memory_events (op,actor_kind,ts_ms) VALUES ('memory.write.committed','user',1)`,
+		`UPDATE memory_maintenance_ops SET status='pending' WHERE op='move_global_dir'`,
+	} {
+		if _, err := db.ExecContext(t.Context(), statement); err != nil {
+			t.Fatalf("seed memory stream: %v", err)
+		}
+	}
+}
+
+func memoryRetirementRows(t *testing.T, db *sql.DB, query string) string {
+	t.Helper()
+	rows, err := db.QueryContext(t.Context(), query)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() {
+		if err := rows.Close(); err != nil {
+			t.Error(err)
+		}
+	}()
+	columns, err := rows.Columns()
+	if err != nil {
+		t.Fatal(err)
+	}
+	var result [][]any
+	for rows.Next() {
+		values := make([]any, len(columns))
+		pointers := make([]any, len(columns))
+		for i := range values {
+			pointers[i] = &values[i]
+		}
+		if err := rows.Scan(pointers...); err != nil {
+			t.Fatal(err)
+		}
+		result = append(result, values)
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatal(err)
+	}
+	contents, err := json.Marshal(result)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return string(contents)
+}
+
+// Invariant: widening credential kinds preserves every device column; owner: global migration/open suite.
+func TestGlobalDBAppTokenMigration(t *testing.T) {
+	t.Parallel()
+	t.Run("Should preserve active CLI and revoked device rows through the app token migration", func(t *testing.T) {
+		t.Parallel()
+		ctx := globalMigrationTestContext(t)
+		path := filepath.Join(t.TempDir(), GlobalDatabaseName)
+		prior, err := openGlobalMigrationPrefixDatabase(t, path, globalMigrationPrefixBefore(t, "00141_schema.sql"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() {
+			if err := prior.Close(); err != nil {
+				t.Errorf("Close(prior): %v", err)
+			}
+		})
+		type deviceRow struct {
+			id, name, hash, kind, origin, created string
+			epoch                                 int64
+			seen, revoked                         sql.NullString
+		}
+		rows := []deviceRow{
+			{
+				id:      "device-active",
+				name:    "Desktop",
+				hash:    strings.Repeat("a", 64),
+				kind:    "operator_device",
+				origin:  "private",
+				created: "2026-10-01T12:00:00Z",
+				seen:    sql.NullString{String: "2026-10-02T12:00:00Z", Valid: true},
+			},
+			{
+				id:      "cli-active",
+				name:    "CLI",
+				hash:    strings.Repeat("b", 64),
+				kind:    "cli_profile",
+				origin:  "local",
+				created: "2026-10-03T12:00:00Z",
+				epoch:   2,
+			},
+			{
+				id:      "device-revoked",
+				name:    "Retired",
+				hash:    strings.Repeat("c", 64),
+				kind:    "operator_device",
+				origin:  "private",
+				created: "2026-10-04T12:00:00Z",
+				epoch:   4,
+				seen:    sql.NullString{String: "2026-10-05T12:00:00Z", Valid: true},
+				revoked: sql.NullString{String: "2026-10-06T12:00:00Z", Valid: true},
+			},
+		}
+		for _, row := range rows {
+			if _, err := prior.ExecContext(ctx, `INSERT INTO gateway_device_sessions
+				(id, name, token_hash, actor_kind, pairing_origin, revoke_epoch, created_at, last_seen_at, revoked_at)
+				VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`, row.id, row.name, row.hash, row.kind, row.origin, row.epoch, row.created, row.seen, row.revoked); err != nil {
+				t.Fatal(err)
+			}
+		}
+		if err := prior.Close(); err != nil {
+			t.Fatal(err)
+		}
+		upgraded, err := openGlobalMigrationUpgrade(t, path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() {
+			if err := upgraded.Close(testutil.Context(t)); err != nil {
+				t.Errorf("Close(upgraded): %v", err)
+			}
+		})
+		for _, want := range rows {
+			var got deviceRow
+			if err := upgraded.db.QueryRowContext(ctx, `SELECT id, name, token_hash, actor_kind, pairing_origin,
+				revoke_epoch, created_at, last_seen_at, revoked_at FROM gateway_device_sessions WHERE id = ?`, want.id).
+				Scan(&got.id, &got.name, &got.hash, &got.kind, &got.origin, &got.epoch, &got.created, &got.seen, &got.revoked); err != nil {
+				t.Fatal(err)
+			}
+			if got != want {
+				t.Fatalf("device row after migration = %#v, want %#v", got, want)
+			}
+		}
+		service := appTokenServiceForTest(t, upgraded)
+		issued, err := service.CreateAppToken(ctx, "Migrated application", []string{"https://app.test"})
+		if err != nil {
+			t.Fatalf("new app token kind rejected after migration: %v", err)
+		}
+		if err := upgraded.Close(ctx); err != nil {
+			t.Fatal(err)
+		}
+		reopened, err := openGlobalMigrationUpgrade(t, path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() {
+			if err := reopened.Close(testutil.Context(t)); err != nil {
+				t.Errorf("Close(reopened): %v", err)
+			}
+		})
+		restarted := appTokenServiceForTest(t, reopened)
+		persisted, err := restarted.AuthenticateAppToken(ctx, issued.Secret)
+		if err != nil || persisted.Session.ID != issued.Token.Session.ID || len(persisted.Origins) != 1 ||
+			persisted.Origins[0] != "https://app.test" {
+			t.Fatalf("token did not survive reopen: %#v, %v", persisted, err)
+		}
+		devices, err := restarted.ListDevices(ctx)
+		if err != nil || len(devices) != 3 {
+			t.Fatalf("device inventory after reopen: %#v, %v", devices, err)
+		}
+		status, err := store.Status(ctx, reopened.db, MigrationStream())
+		if err != nil {
+			t.Fatal(err)
+		}
+		assertCompleteMigrationStream(t, status, MigrationStream())
+	})
+}
+
+func TestUserScopeMigration(t *testing.T) {
+	t.Run("Should reopen a home workspace upgrade after telemetry relocation", func(t *testing.T) {
+		t.Parallel()
+		home := t.TempDir()
+		path := filepath.Join(home, GlobalDatabaseName)
+		db, err := openGlobalMigrationPrefixDatabase(t, path, globalMigrationPrefixBefore(t, "00151_schema.sql"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() {
+			if err := db.Close(); err != nil {
+				t.Error(err)
+			}
+		})
+		if _, err := db.ExecContext(
+			t.Context(),
+			`INSERT INTO workspaces(id,root_dir,name,created_at,updated_at) VALUES ('legacy',?,'home','2026-01-01','2026-01-01')`,
+			home,
+		); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := db.ExecContext(
+			t.Context(),
+			`INSERT INTO event_summaries(seq,id,profile_id,workspace_id,type,timestamp) VALUES(123,'legacy-event',?,'legacy','settings.changed','2026-01-01T00:00:00Z')`,
+			store.DefaultProfileID,
+		); err != nil {
+			t.Fatal(err)
+		}
+		if err := db.Close(); err != nil {
+			t.Fatal(err)
+		}
+		for range 2 {
+			upgraded, err := openGlobalMigrationUpgrade(t, path)
+			if err != nil {
+				t.Fatalf("open legacy home upgrade: %v", err)
+			}
+			rows, err := upgraded.ListEventSummaries(t.Context(), store.EventSummaryQuery{
+				ReadScope: store.ReadScope{AllProfiles: true}, AfterSequence: 122,
+			})
+			closeErr := upgraded.Close(context.Background())
+			if err != nil || closeErr != nil {
+				t.Fatalf("read upgraded summaries: %v; close: %v", err, closeErr)
+			}
+			if len(rows) != 1 || rows[0].ID != "legacy-event" || rows[0].Sequence != 123 || rows[0].WorkspaceID != "" {
+				t.Fatalf("legacy home summaries changed: %#v", rows)
+			}
+		}
+	})
+	t.Run("Should preserve profiles collisions aliases and registration until verification", func(t *testing.T) {
+		t.Parallel()
+		home := t.TempDir()
+		path := filepath.Join(home, GlobalDatabaseName)
+		db, err := openGlobalMigrationPrefixDatabase(t, path, globalMigrationPrefixBefore(t, "00151_schema.sql"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		statements := []string{
+			`INSERT INTO workspaces(id,root_dir,name,created_at,updated_at) VALUES ('legacy',?, 'user','2026-01-01','2026-01-01')`,
+			`INSERT INTO loop_config(workspace_id,profile_id,loop_name,iteration_cap) VALUES ('legacy','','shared',5),('','','shared',3)`,
+			`INSERT INTO sessions(id,profile_id,agent_name,workspace_id,state,created_at,updated_at) SELECT 's',id,'general','legacy','idle','2026-01-01','2026-01-01' FROM profiles WHERE name='default'`,
+			`INSERT INTO session_health(session_id,workspace_id,agent_name,state,health,active_prompt,attachable,eligible_for_wake,updated_at) VALUES ('s','legacy','general','idle','healthy',0,1,1,'2026-01-01')`,
+			`INSERT INTO cmd_palette_usage SELECT 'legacy',id,'cmd',2,2,10,10 FROM profiles WHERE name='default' UNION ALL SELECT '',id,'cmd',3,3,20,20 FROM profiles WHERE name='default'`,
+			`INSERT INTO profiles(id,name,color,icon,created_at) VALUES ('22222222222222222222222222','second','blue','user','2026-01-01T00:00:00Z')`,
+			`INSERT INTO sessions(id,profile_id,agent_name,workspace_id,state,created_at,updated_at) VALUES ('s2','22222222222222222222222222','general','legacy','idle','2026-01-01','2026-01-01')`,
+			`INSERT INTO session_folders(id,profile_id,workspace_id,name,position,created_at,updated_at) SELECT 'folder',id,'legacy','Folder',0,'2026-01-01','2026-01-01' FROM profiles WHERE name='default'`,
+			`INSERT INTO session_placements(session_id,profile_id,workspace_id,folder_id,position,updated_at) SELECT 's',id,'legacy','folder',0,'2026-01-01' FROM profiles WHERE name='default'`,
+			`INSERT INTO tasks(id,profile_id,scope,workspace_id,title,status,created_by_kind,created_by_ref,origin_kind,origin_ref,created_at,updated_at) SELECT 'task',id,'workspace','legacy','Migrate','ready','daemon','test','daemon','test','2026-01-01','2026-01-01' FROM profiles WHERE name='default'`,
+			`INSERT INTO task_runs(id,task_id,workspace_id,status,attempt,origin_kind,origin_ref,queued_at) VALUES ('run','task','legacy','running',1,'daemon','test','2026-01-01')`,
+			`INSERT INTO task_run_terminal_commands(command_id,run_id,task_id,workspace_id,kind,phase,source_status,source_session_id,source_claim_token_hash,intent_json,actor_json,command_at,admitted_at,updated_at) VALUES ('command','run','task','legacy','completed','admitted','running','s','hash','{}','{}','2026-01-01','2026-01-01','2026-01-01')`,
+			`INSERT INTO automation_jobs(id,profile_id,scope,workspace_id,name,agent_name,prompt,retry,fire_limit,created_at,updated_at) SELECT 'incoming',id,'workspace','legacy','collision','general','run','{}','{}','2026-01-01','2026-01-01' FROM profiles WHERE name='default'`,
+			`INSERT INTO automation_jobs(id,profile_id,scope,name,agent_name,prompt,retry,fire_limit,created_at,updated_at) SELECT 'existing',id,'global','collision','general','run','{}','{}','2026-01-01','2026-01-01' FROM profiles WHERE name='default'`,
+			`INSERT INTO automation_runs(id,job_id,status,workspace_id,attribution) VALUES ('legacy-run','incoming','completed','legacy','derived'),('user-run',NULL,'completed','','recorded'),('unknown-run',NULL,'completed',NULL,'unknown')`,
+			`UPDATE sessions SET effective_workspace_access='unrestricted' WHERE id='s'`,
+			`UPDATE tasks SET grant_ceiling='unrestricted' WHERE id='task'`,
+			`UPDATE automation_jobs SET grant_ceiling='unrestricted' WHERE id='incoming'`,
+			`INSERT INTO automation_triggers(id,profile_id,scope,workspace_id,name,agent_name,prompt,event,retry,fire_limit,created_at,updated_at,grant_ceiling) SELECT 'trigger',id,'workspace','legacy','Trigger','general','run','session.created','{}','{}','2026-01-01','2026-01-01','unrestricted' FROM profiles WHERE name='default'`,
+			`INSERT INTO loop_runs(id,profile_id,workspace_id,loop_name,status,last_progress_at,inputs_json,grant_ceiling) SELECT 'loop-run',id,'legacy','shared','done','2026-01-01','{}','unrestricted' FROM profiles WHERE name='default'`,
+			`INSERT INTO extension_inputs(extension,workspace_id,input_id,type,value_json,updated_at) VALUES ('example','legacy','input','string','"preserved"','2026-01-01')`,
+			`INSERT INTO token_usage_daily(day,profile_id,workspace_id,agent_name,total_tokens,total_cost,updated_at) SELECT '2026-01-01',id,'legacy','general',7,2,'2026-01-01' FROM profiles WHERE name='default' UNION ALL SELECT '2026-01-01',id,'','general',3,1,'2026-01-01' FROM profiles WHERE name='default'`,
+			`INSERT INTO notification_cursors(scope_kind,profile_id,workspace_id,consumer_id,stream_name,last_sequence,updated_at) SELECT 'workspace',id,'legacy','consumer','events',9,'2026-01-01' FROM profiles WHERE name='default' UNION ALL SELECT 'global',id,'','consumer','events',4,'2026-01-01' FROM profiles WHERE name='default'`,
+		}
+		for i, query := range statements {
+			var args []any
+			if i == 0 {
+				args = []any{home}
+			}
+			if _, err := db.ExecContext(t.Context(), query, args...); err != nil {
+				t.Fatal(err)
+			}
+		}
+		if _, err := db.ExecContext(
+			t.Context(),
+			`INSERT INTO profiles(id,name,color,icon,created_at) VALUES ('33333333333333333333333333','journal-only','blue','user','2026-01-01T00:00:00Z')`,
+		); err != nil {
+			t.Fatal(err)
+		}
+		journal, err := workspacedb.Open(
+			t.Context(),
+			workspacedb.Options{HomeDir: home, WorkspaceID: "legacy", WorkspaceRoot: home},
+		)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := journal.DB().
+			ExecContext(t.Context(), `INSERT INTO terminal_recordings(id,terminal_id,profile_id,digest,path,started_at,bytes,expires_at) VALUES ('recording','terminal','33333333333333333333333333','digest','/fixture',1,0,2)`); err != nil {
+			t.Fatal(err)
+		}
+		if err := journal.Close(t.Context()); err != nil {
+			t.Fatal(err)
+		}
+
+		if err := prepareUserScopeMigrationContext(t.Context(), db, home, ""); err != nil {
+			t.Fatal(err)
+		}
+		if err := applyGlobalMigrationPrefix(
+			t,
+			db,
+			globalMigrationPrefixThrough(t, "00152_user_scope_data.sql"),
+		); err != nil {
+			t.Fatal(err)
+		}
+		g := &GlobalDB{db: db, readDB: db}
+		t.Cleanup(func() {
+			if err := db.Close(); err != nil {
+				t.Error(err)
+			}
+		})
+		var workspace string
+		if err := db.QueryRowContext(t.Context(), "SELECT workspace_id FROM session_health WHERE session_id='s'").
+			Scan(&workspace); err != nil ||
+			workspace != "" {
+			t.Fatalf("workspace=%q err=%v", workspace, err)
+		}
+		var uses int
+		if err := db.QueryRowContext(t.Context(), "SELECT use_count FROM cmd_palette_usage WHERE workspace_id=''").
+			Scan(&uses); err != nil ||
+			uses != 5 {
+			t.Fatalf("uses=%d err=%v", uses, err)
+		}
+		var name string
+		if err := db.QueryRowContext(t.Context(), "SELECT name FROM workspaces WHERE id='legacy'").
+			Scan(&name); err != nil ||
+			name != "user-project" {
+			t.Fatalf("name=%q err=%v", name, err)
+		}
+		var iterationCap int
+		if err := db.QueryRowContext(t.Context(), "SELECT iteration_cap FROM loop_config WHERE workspace_id='' AND profile_id<>'' ORDER BY profile_id LIMIT 1").
+			Scan(&iterationCap); err != nil ||
+			iterationCap != 3 {
+			t.Fatalf("cap=%d err=%v", iterationCap, err)
+		}
+		for _, check := range []struct {
+			query string
+			want  int
+		}{
+			{"SELECT count(*) FROM loop_config WHERE workspace_id='' AND iteration_cap=3", 3},
+			{"SELECT count(*) FROM session_placements WHERE workspace_id='' AND folder_id='folder'", 1},
+			{"SELECT count(*) FROM tasks WHERE workspace_id IS NULL AND scope='global'", 1},
+			{"SELECT count(*) FROM task_runs WHERE workspace_id IS NULL", 1},
+			{"SELECT count(*) FROM task_run_terminal_commands WHERE workspace_id=''", 1},
+			{"SELECT count(*) FROM sessions WHERE id='s' AND workspace_id='' AND effective_workspace_access='unrestricted'", 1},
+			{"SELECT count(*) FROM sessions WHERE id='s2' AND workspace_id='' AND effective_workspace_access=''", 1},
+			{"SELECT count(*) FROM tasks WHERE id='task' AND workspace_id IS NULL AND grant_ceiling='unrestricted'", 1},
+			{"SELECT count(*) FROM automation_jobs WHERE id='incoming' AND workspace_id IS NULL AND grant_ceiling='unrestricted'", 1},
+			{"SELECT count(*) FROM automation_triggers WHERE id='trigger' AND workspace_id IS NULL AND grant_ceiling='unrestricted'", 1},
+			{"SELECT count(*) FROM loop_runs WHERE id='loop-run' AND workspace_id='' AND grant_ceiling='unrestricted'", 1},
+			{"SELECT count(*) FROM automation_runs WHERE id='legacy-run' AND workspace_id='' AND attribution='derived'", 1},
+			{"SELECT count(*) FROM automation_runs WHERE id='user-run' AND workspace_id='' AND attribution='recorded'", 1},
+			{"SELECT count(*) FROM automation_runs WHERE id='unknown-run' AND workspace_id IS NULL AND attribution='unknown'", 1},
+			{"SELECT count(*) FROM automation_jobs WHERE name='collision (migrated)' AND scope='global'", 1},
+			{"SELECT count(*) FROM user_scope_migration_archive WHERE table_name='extension_inputs' AND json_extract(row_json,'$.value_json')='\"preserved\"'", 1},
+			{"SELECT total_tokens FROM token_usage_daily WHERE workspace_id=''", 10},
+			{"SELECT last_sequence FROM notification_cursors WHERE workspace_id=''", 9},
+		} {
+			var got int
+			if err := db.QueryRowContext(t.Context(), check.query).Scan(&got); err != nil || got != check.want {
+				t.Fatalf("%s = %d want %d err=%v", check.query, got, check.want, err)
+			}
+		}
+		if _, err := db.ExecContext(t.Context(), "UPDATE task_runs SET status='completed' WHERE id='run'"); err == nil {
+			t.Fatal("terminal command guard was not restored")
+		}
+
+		if err := g.CompleteUserScopeMigration(t.Context(), "legacy"); err == nil {
+			t.Fatal("removed before verification")
+		}
+		for _, kind := range []string{"journal", "layout"} {
+			if err := g.MarkUserScopeStoreVerified(t.Context(), "legacy", kind); err != nil {
+				t.Fatal(err)
+			}
+		}
+		if _, err := db.ExecContext(
+			t.Context(),
+			"CREATE TABLE unexpected_reference(workspace_id TEXT); INSERT INTO unexpected_reference VALUES ('legacy')",
+		); err != nil {
+			t.Fatal(err)
+		}
+		if err := g.CompleteUserScopeMigration(
+			t.Context(),
+			"legacy",
+		); err == nil ||
+			!strings.Contains(err.Error(), "unexpected_reference") {
+			t.Fatalf("unknown reference error=%v", err)
+		}
+		if _, err := db.ExecContext(t.Context(), "DELETE FROM unexpected_reference"); err != nil {
+			t.Fatal(err)
+		}
+		if err := g.CompleteUserScopeMigration(t.Context(), "legacy"); err != nil {
+			t.Fatal(err)
+		}
+		var remaining int
+		if err := db.QueryRowContext(t.Context(), "SELECT count(*) FROM workspaces WHERE id='legacy'").
+			Scan(&remaining); err != nil ||
+			remaining != 0 {
+			t.Fatalf("remaining=%d err=%v", remaining, err)
+		}
+	})
+	t.Run("Should account for every workspace reference in the migration inventory", func(t *testing.T) {
+		t.Parallel()
+		g, err := OpenGlobalDB(t.Context(), filepath.Join(t.TempDir(), GlobalDatabaseName))
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() {
+			if err := g.Close(context.Background()); err != nil {
+				t.Error(err)
+			}
+		})
+		tx, err := g.DB().BeginTx(t.Context(), nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer tx.Rollback()
+		references, err := workspaceReferenceColumns(t.Context(), tx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		listed := map[string]bool{}
+		for _, table := range userScopeMigrationInventory {
+			listed[table] = true
+		}
+		for table := range references {
+			if !listed[table] {
+				t.Errorf("unlisted workspace table %s", table)
+			}
+		}
+	})
+}
+
+func TestUserScopeMigrationNamesAndKeepProject(t *testing.T) {
+	t.Run(
+		"Should rename reserved names deterministically and resolve aliases through the boundary",
+		func(t *testing.T) {
+			t.Parallel()
+			path := filepath.Join(t.TempDir(), GlobalDatabaseName)
+			db, err := openGlobalMigrationPrefixDatabase(t, path, globalMigrationPrefixBefore(t, "00151_schema.sql"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			for i, name := range []string{"user-project", "user", "global", "@x", workspaceaccess.UserSelector} {
+				if _, err := db.ExecContext(
+					t.Context(),
+					`INSERT INTO workspaces(id,root_dir,name,created_at,updated_at) VALUES (?,?,?,?,?)`,
+					fmt.Sprint(i),
+					t.TempDir(),
+					name,
+					fmt.Sprintf("2026-01-01T00:00:0%dZ", i),
+					fmt.Sprintf("2026-01-01T00:00:0%dZ", i),
+				); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if err := prepareUserScopeMigrationContext(t.Context(), db, filepath.Dir(path), ""); err != nil {
+				t.Fatal(err)
+			}
+			if err := applyGlobalMigrationPrefix(
+				t,
+				db,
+				globalMigrationPrefixThrough(t, "00152_user_scope_data.sql"),
+			); err != nil {
+				t.Fatal(err)
+			}
+			t.Cleanup(func() {
+				if err := db.Close(); err != nil {
+					t.Error(err)
+				}
+			})
+			// Boundary reads use the current repository after the historical upgrade.
+			if err := applyGlobalMigrationPrefix(t, db, MigrationStream()); err != nil {
+				t.Fatal(err)
+			}
+			repo := &WorkspaceRepo{repoBase: newRepoBase(db, db, nil, new(atomic.Int32))}
+			for old, want := range map[string]string{"user": "user-project-2", "global": "global-project", "@x": "x"} {
+				got, err := repo.GetWorkspaceByName(t.Context(), old)
+				if err != nil || got.Name != want {
+					t.Fatalf("alias %s=%#v err=%v", old, got, err)
+				}
+			}
+			got, err := repo.GetWorkspace(t.Context(), "4")
+			if err != nil || got.Name != "user-project-3" {
+				t.Fatalf("@user project=%#v err=%v", got, err)
+			}
+			if _, err := repo.GetWorkspaceByName(
+				t.Context(),
+				workspaceaccess.UserSelector,
+			); !errors.Is(
+				err,
+				compozyworkspace.ErrWorkspaceNotFound,
+			) {
+				t.Fatalf("@user alias error=%v", err)
+			}
+			if _, err := db.ExecContext(
+				t.Context(),
+				"DELETE FROM workspace_name_aliases WHERE old_name='global'",
+			); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := repo.GetWorkspaceByName(
+				t.Context(),
+				"global",
+			); !errors.Is(
+				err,
+				compozyworkspace.ErrWorkspaceReserved,
+			) {
+				t.Fatalf("global without alias error=%v", err)
+			}
+		},
+	)
+	t.Run("Should keep a pseudo workspace targeted by a Loop automation", func(t *testing.T) {
+		t.Parallel()
+		home := t.TempDir()
+		path := filepath.Join(home, GlobalDatabaseName)
+		db, err := openGlobalMigrationPrefixDatabase(t, path, globalMigrationPrefixBefore(t, "00151_schema.sql"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() {
+			if err := db.Close(); err != nil {
+				t.Error(err)
+			}
+		})
+		if _, err := db.ExecContext(
+			t.Context(),
+			`INSERT INTO workspaces(id,root_dir,name,created_at,updated_at) VALUES ('keep',?,'legacy','2026-01-01','2026-01-01')`,
+			home,
+		); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := db.ExecContext(
+			t.Context(),
+			`INSERT INTO automation_jobs(id,profile_id,scope,name,agent_name,prompt,retry,fire_limit,target_kind,loop_workspace_id,loop_name,created_at,updated_at) SELECT 'job',id,'global','keep','general','','{}','{}','loop','keep','review','2026-01-01','2026-01-01' FROM profiles WHERE name='default'`,
+		); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := db.ExecContext(
+			t.Context(),
+			`INSERT INTO loop_config(workspace_id,loop_name) VALUES ('keep','review')`,
+		); err != nil {
+			t.Fatal(err)
+		}
+		if err := prepareUserScopeMigrationContext(t.Context(), db, home, ""); err != nil {
+			t.Fatal(err)
+		}
+		if err := applyGlobalMigrationPrefix(
+			t,
+			db,
+			globalMigrationPrefixThrough(t, "00152_user_scope_data.sql"),
+		); err != nil {
+			t.Fatal(err)
+		}
+		var disposition string
+		if err := db.QueryRowContext(t.Context(), "SELECT disposition FROM user_scope_migrations WHERE source_workspace_id='keep'").
+			Scan(&disposition); err != nil ||
+			disposition != "keep_project" {
+			t.Fatalf("disposition=%s err=%v", disposition, err)
+		}
+		var count int
+		if err := db.QueryRowContext(t.Context(), "SELECT count(*) FROM loop_config WHERE workspace_id='keep'").
+			Scan(&count); err != nil ||
+			count != 1 {
+			t.Fatalf("count=%d err=%v", count, err)
+		}
+	})
+}
+
+func TestPermissionInitiatorSnapshot(t *testing.T) {
+	t.Parallel()
+	t.Run("Should preserve unknown defaults and snapshot the session initiator", func(t *testing.T) {
+		t.Parallel()
+		db := openTestGlobalDB(t)
+		_, id := registerHeartbeatWorkspaceAndSession(t, db, "initiator", "initiator-session")
+		var kind, actor string
+		if err := db.DB().
+			QueryRowContext(t.Context(), `SELECT initiator_kind, initiator_id FROM sessions WHERE id=?`, id).
+			Scan(&kind, &actor); err != nil {
+			t.Fatal(err)
+		}
+		if kind != "" || actor != "" {
+			t.Fatalf("unknown initiator = %q/%q", kind, actor)
+		}
+		write := func(key string) {
+			t.Helper()
+			if err := db.WritePermissionLog(
+				t.Context(),
+				store.PermissionLogEntry{
+					ID:         key,
+					SessionID:  id,
+					AgentName:  "coder",
+					Action:     "execute",
+					Resource:   "terminal",
+					Decision:   "reject_once",
+					PolicyUsed: "interactive",
+				},
+			); err != nil {
+				t.Fatal(err)
+			}
+		}
+		write("unknown-decision")
+		if _, err := db.DB().
+			ExecContext(t.Context(), `UPDATE sessions SET initiator_kind='automation', initiator_id='automation-1' WHERE id=?`, id); err != nil {
+			t.Fatal(err)
+		}
+		write("automated-decision")
+		if _, err := db.DB().
+			ExecContext(t.Context(), `UPDATE sessions SET initiator_kind='human', initiator_id='operator-1' WHERE id=?`, id); err != nil {
+			t.Fatal(err)
+		}
+		rows, err := db.ListPermissionLog(t.Context(), store.PermissionLogQuery{SessionID: id, Limit: 10})
+		if err != nil || len(rows) != 2 {
+			t.Fatalf("permission rows = %#v, %v", rows, err)
+		}
+		for _, row := range rows {
+			if row.ID == "automated-decision" {
+				if row.InitiatorKind != "automation" || row.InitiatorID != "automation-1" {
+					t.Fatalf("snapshot = %#v", row)
+				}
+			} else if row.InitiatorKind != "" || row.InitiatorID != "" {
+				t.Fatalf("unknown snapshot = %#v", row)
+			}
+		}
+	})
+}
+
+func TestPermissionLogUnattended(t *testing.T) {
+	t.Parallel()
+	t.Run("Should filter persisted initiators before applying the limit", func(t *testing.T) {
+		t.Parallel()
+		db := openTestGlobalDB(t)
+		_, id := registerHeartbeatWorkspaceAndSession(t, db, "unattended", "unattended-session")
+		kinds := []string{"", "human", "app", "agent_session", "automation", "daemon", "extension"}
+		for i, kind := range kinds {
+			if _, err := db.DB().
+				ExecContext(t.Context(), `UPDATE sessions SET initiator_kind=?, initiator_id=? WHERE id=?`, kind, kind, id); err != nil {
+				t.Fatal(err)
+			}
+			if err := db.WritePermissionLog(t.Context(), store.PermissionLogEntry{
+				ID: fmt.Sprintf(
+					"decision-%d",
+					i,
+				),
+				SessionID:  id,
+				AgentName:  "coder",
+				Action:     "execute",
+				Resource:   "terminal",
+				Decision:   "reject_once",
+				PolicyUsed: "interactive",
+				Timestamp:  time.Date(2026, 1, 1, 0, 0, i, 0, time.UTC),
+			}); err != nil {
+				t.Fatal(err)
+			}
+		}
+		rows, err := db.ListPermissionLog(
+			t.Context(),
+			store.PermissionLogQuery{SessionID: id, Unattended: true, Limit: 3},
+		)
+		if err != nil || len(rows) != 3 {
+			t.Fatalf("unattended rows = %#v, %v", rows, err)
+		}
+		for i, row := range rows {
+			if row.InitiatorKind != kinds[i+4] {
+				t.Fatalf("row %d initiator = %q, want %q", i, row.InitiatorKind, kinds[i+4])
+			}
+		}
+		rows, err = db.ListPermissionLog(t.Context(), store.PermissionLogQuery{SessionID: id, Limit: 10})
+		if err != nil || len(rows) != len(kinds) {
+			t.Fatalf("unfiltered rows = %#v, %v", rows, err)
+		}
+		rows, err = db.ListPermissionLog(
+			t.Context(),
+			store.PermissionLogQuery{SessionID: id, Unattended: true, Decision: "allow_once", Limit: 3},
+		)
+		if err != nil || len(rows) != 0 {
+			t.Fatalf("decision-filtered rows = %#v, %v", rows, err)
+		}
+	})
+}
+
+func TestPermissionDailyRollups(t *testing.T) {
+	t.Parallel()
+	t.Run("Should aggregate the complete scoped population by UTC day agent and decision", func(t *testing.T) {
+		t.Parallel()
+		db := openTestGlobalDB(t)
+		workspace, id := registerHeartbeatWorkspaceAndSession(t, db, "rollup", "rollup-session")
+		start := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
+		for i, kind := range []string{"automation", "daemon", "human", "extension"} {
+			if _, err := db.DB().
+				ExecContext(t.Context(), `UPDATE sessions SET initiator_kind=? WHERE id=?`, kind, id); err != nil {
+				t.Fatal(err)
+			}
+			if err := db.WritePermissionLog(
+				t.Context(),
+				store.PermissionLogEntry{
+					ID:         fmt.Sprintf("rollup-%d", i),
+					SessionID:  id,
+					AgentName:  "coder",
+					Action:     "execute",
+					Resource:   "terminal",
+					Decision:   "deny",
+					PolicyUsed: "interactive",
+					Timestamp:  start.Add(time.Duration(i) * time.Hour),
+				},
+			); err != nil {
+				t.Fatal(err)
+			}
+		}
+		query := store.PermissionRollupQuery{
+			ReadScope:   store.ReadScope{ProfileID: store.DefaultProfileID},
+			WorkspaceID: workspace,
+			Since:       start,
+			Until:       start.Add(24 * time.Hour),
+		}
+		rows, err := db.PermissionDailyRollups(t.Context(), query)
+		if err != nil || len(rows) != 1 || rows[0].Count != 4 || rows[0].Day != "2026-01-01" ||
+			rows[0].AgentName != "coder" ||
+			rows[0].Decision != "deny" {
+			t.Fatalf("rollups = %#v, %v", rows, err)
+		}
+		query.Unattended = true
+		rows, err = db.PermissionDailyRollups(t.Context(), query)
+		if err != nil || len(rows) != 1 || rows[0].Count != 3 {
+			t.Fatalf("unattended rollups = %#v, %v", rows, err)
+		}
+		entries, err := db.PermissionEntries(
+			t.Context(),
+			store.PermissionEntriesQuery{PermissionRollupQuery: query, Limit: 2},
+		)
+		if err != nil || len(entries) != 2 || entries[0].ID != "rollup-3" || entries[0].InitiatorKind != "extension" {
+			t.Fatalf("unattended entries = %#v, %v", entries, err)
+		}
+		foreign, err := db.PermissionEntries(
+			t.Context(),
+			store.PermissionEntriesQuery{
+				ReadScope: store.ReadScope{ProfileID: "other-profile"},
+				Since:     start,
+				Until:     start.Add(24 * time.Hour),
+				Limit:     10,
+			},
+		)
+		if err != nil || len(foreign) != 0 {
+			t.Fatalf("foreign entries = %#v, %v", foreign, err)
+		}
+		query.ReadScope.ProfileID = "other-profile"
+		rows, err = db.PermissionDailyRollups(t.Context(), query)
+		if err != nil || len(rows) != 0 {
+			t.Fatalf("foreign profile rollups = %#v, %v", rows, err)
+		}
+		query.ReadScope = store.ReadScope{}
+		if _, err := db.PermissionDailyRollups(t.Context(), query); err == nil {
+			t.Fatal("implicit profile scope accepted")
+		}
+	})
+}
+
+func TestReleasedSpecCycleReferenceUpgrade(t *testing.T) {
+	t.Run("Should preserve v0.4.8 references through the current migration stream", func(t *testing.T) {
+		t.Parallel()
+		path := filepath.Join(t.TempDir(), GlobalDatabaseName)
+		prior, err := openGlobalMigrationPrefixDatabase(t, path, globalMigrationPrefixBefore(t, "00164_schema.sql"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		ctx := globalMigrationTestContext(t)
+		now := "2026-11-02T12:00:00Z"
+		statements := []struct {
+			query string
+			args  []any
+		}{
+			{
+				`INSERT INTO workspaces(id,root_dir,add_dirs,name,created_at,updated_at) VALUES('ws-upgrade',?,'[]','upgrade',?,?)`,
+				[]any{t.TempDir(), now, now},
+			},
+			{
+				`INSERT INTO sessions(id,name,agent_name,workspace_id,session_type,state,created_at,updated_at,profile_id) VALUES('sess-upgrade','Saved','review_fixer','ws-upgrade','user','stopped',?,?,?)`,
+				[]any{now, now, store.DefaultProfileID},
+			},
+			{
+				`INSERT INTO automation_jobs(id,profile_id,scope,name,agent_name,workspace_id,prompt,schedule,retry,fire_limit,source,created_at,updated_at) VALUES('job-upgrade',?,'workspace','Saved job','review_fixer','ws-upgrade','Saved prompt','{"mode":"every","interval":"24h"}','{"strategy":"none"}','{"max":12,"window":"1h"}','dynamic',?,?)`,
+				[]any{store.DefaultProfileID, now, now},
+			},
+			{
+				`INSERT INTO automation_triggers(id,profile_id,scope,name,agent_name,workspace_id,prompt,event,retry,fire_limit,source,target_kind,loop_workspace_id,loop_name,created_at,updated_at) VALUES('trg-upgrade',?,'workspace','Saved trigger','','ws-upgrade','','ext.saved','{"strategy":"none"}','{"max":12,"window":"1h"}','dynamic','loop','ws-upgrade','implement-tasks',?,?)`,
+				[]any{store.DefaultProfileID, now, now},
+			},
+			{
+				`INSERT INTO loop_config(workspace_id,profile_id,loop_name,iteration_cap) VALUES('ws-upgrade',?,'implement-tasks',17)`,
+				[]any{store.DefaultProfileID},
+			},
+		}
+		for _, statement := range statements {
+			if _, err := prior.ExecContext(ctx, statement.query, statement.args...); err != nil {
+				t.Fatal(err)
+			}
+		}
+		if err := prior.Close(); err != nil {
+			t.Fatal(err)
+		}
+		upgraded, err := openGlobalMigrationUpgrade(t, path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() {
+			if err := upgraded.Close(testutil.Context(t)); err != nil {
+				t.Error(err)
+			}
+		})
+		for _, tc := range []struct{ query, want string }{
+			{`SELECT agent_name FROM sessions WHERE id='sess-upgrade'`, "review_fixer"},
+			{`SELECT agent_name FROM automation_jobs WHERE id='job-upgrade'`, "review_fixer"},
+			{`SELECT loop_name FROM automation_triggers WHERE id='trg-upgrade'`, "implement-tasks"},
+			{`SELECT loop_name FROM loop_config WHERE workspace_id='ws-upgrade'`, "implement-tasks"},
+		} {
+			var value string
+			if err := upgraded.db.QueryRowContext(ctx, tc.query).Scan(&value); err != nil {
+				t.Fatal(err)
+			}
+			if value != tc.want {
+				t.Fatalf("saved reference = %q, want %q", value, tc.want)
+			}
+		}
+		var kind, workspace, loopName string
+		if err := upgraded.db.QueryRowContext(ctx, `SELECT target_kind, loop_workspace_id, loop_name FROM automation_triggers WHERE id='trg-upgrade'`).
+			Scan(&kind, &workspace, &loopName); err != nil {
+			t.Fatal(err)
+		}
+		if kind != "loop" || workspace != "ws-upgrade" || loopName != "implement-tasks" {
+			t.Fatalf("saved trigger = %q/%q/%q", kind, workspace, loopName)
+		}
+	})
+}
+
+// Invariant: upgrading captures proven automation history ownership and preserves
+// orphan rows without exposing them through any profile-scoped catalog.
+// Owning layer: global migration stream; canonical suite: this file.
+func TestGlobalAutomationRunProfileMigrationTail(t *testing.T) {
+	t.Parallel()
+	t.Run("Should preserve proven ownership and orphan history", func(t *testing.T) {
+		t.Parallel()
+		ctx, cancel := context.WithTimeout(t.Context(), 3*time.Minute)
+		defer cancel()
+		db, err := openGlobalMigrationPrefixDatabase(t, filepath.Join(t.TempDir(), GlobalDatabaseName),
+			globalMigrationPrefixBefore(t, "00108_schema.sql"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() {
+			if err := db.Close(); err != nil {
+				t.Error(err)
+			}
+		})
+		stream := MigrationStream()
+		const secondary = "01K00000000000000000000091"
+		if _, err := db.ExecContext(ctx, `INSERT INTO profiles (id, name, color, icon, state, created_at)
+ VALUES (?, 'history', '#8E8EB5', 'circle', 'active', '2026-09-10T00:00:00Z')`, secondary); err != nil {
+			t.Fatalf("seed secondary profile: %v", err)
+		}
+		for _, fixture := range []struct{ kind, id, profile string }{
+			{"automation.job", "job-history", store.DefaultProfileID},
+			{"automation.trigger", "trigger-history", secondary},
+		} {
+			if _, err := db.ExecContext(ctx, `INSERT INTO resource_records
+   (kind, id, version, scope_kind, owner_kind, owner_id, source_kind, source_id, spec_json, created_at, updated_at)
+   VALUES (?, ?, 1, 'user', 'operator', 'operator', 'dynamic', ?, json_object('profile_id', ?),
+    '2026-09-10T00:00:00Z', '2026-09-10T00:00:00Z')`, fixture.kind, fixture.id, fixture.id, fixture.profile); err != nil {
+				t.Fatalf("seed %s: %v", fixture.id, err)
+			}
+		}
+		if _, err := db.ExecContext(ctx, `INSERT INTO automation_runs (id, job_id, trigger_id, status, metadata_json)
+ VALUES ('run-job', 'job-history', NULL, 'completed', '{"preserved":true}'),
+        ('run-trigger', NULL, 'trigger-history', 'failed', '{"preserved":true}'),
+        ('run-orphan', 'deleted-job', NULL, 'completed', '{"preserved":true}')`); err != nil {
+			t.Fatalf("seed historical runs: %v", err)
+		}
+		if err := store.Apply(ctx, db, stream); err != nil {
+			t.Fatalf("Apply(global owner tail): %v", err)
+		}
+		if _, err := db.ExecContext(
+			ctx,
+			`DELETE FROM resource_records WHERE id IN ('job-history', 'trigger-history')`,
+		); err != nil {
+			t.Fatalf("delete historical parents: %v", err)
+		}
+		for _, fixture := range []struct{ id, profile, status string }{
+			{"run-job", store.DefaultProfileID, "completed"},
+			{"run-trigger", secondary, "failed"},
+			{"run-orphan", "", "completed"},
+		} {
+			var owner sql.NullString
+			var status, metadata string
+			if err := db.QueryRowContext(ctx, `SELECT profile_id, status, metadata_json FROM automation_runs WHERE id = ?`, fixture.id).
+				Scan(&owner, &status, &metadata); err != nil {
+				t.Fatalf("read %s: %v", fixture.id, err)
+			}
+			if owner.String != fixture.profile || owner.Valid != (fixture.profile != "") || status != fixture.status ||
+				metadata != `{"preserved":true}` {
+				t.Fatalf(
+					"run %s = %v/%s/%s; want owner %q and unchanged history",
+					fixture.id,
+					owner,
+					status,
+					metadata,
+					fixture.profile,
+				)
+			}
+		}
+		assertGlobalMigrationIntegrity(ctx, t, db)
+	})
+}
+
+func TestGlobalAgentSnapshotProfileMigrationConvergesUniqueKeyShapes(t *testing.T) {
+	t.Parallel()
+	for _, tc := range []struct {
+		name        string
+		autoindexed bool
+	}{
+		{name: "Should migrate a home carrying named unique indexes"},
+		{name: "Should migrate a home bootstrapped with autoindexed unique keys", autoindexed: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			ctx, cancel := context.WithTimeout(t.Context(), 3*time.Minute)
+			defer cancel()
+			db, err := openGlobalMigrationPrefixDatabase(t, filepath.Join(t.TempDir(), GlobalDatabaseName),
+				globalMigrationPrefixBefore(t, "00172_schema.sql"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			t.Cleanup(func() {
+				if err := db.Close(); err != nil {
+					t.Error(err)
+				}
+			})
+			stream := MigrationStream()
+			if tc.autoindexed {
+				for _, name := range []string{
+					"agent_heartbeat_snapshots_workspace_id_agent_name_digest",
+					"agent_soul_snapshots_workspace_id_agent_name_digest",
+				} {
+					if _, err := db.ExecContext(ctx, `DROP INDEX `+name); err != nil {
+						t.Fatalf("drop %s: %v", name, err)
+					}
+				}
+			}
+			if _, err := db.ExecContext(ctx, `INSERT INTO agent_soul_snapshots
+ (id, workspace_id, agent_name, source_path, digest, created_at)
+ VALUES ('soul-1', '', 'general', '/home/agents/general/SOUL.md', 'digest-1', '2026-10-01T00:00:00Z')`); err != nil {
+				t.Fatalf("seed soul snapshot: %v", err)
+			}
+			if _, err := db.ExecContext(ctx, `INSERT INTO agent_heartbeat_snapshots
+ (id, workspace_id, agent_name, source_path, digest, config_digest, body, frontmatter_json, resolved_json,
+  diagnostics_json, created_at)
+ VALUES ('beat-1', '', 'general', '/home/agents/general/HEARTBEAT.md', 'digest-1', 'config-1', 'body', '{}', '{}',
+  '[]', '2026-10-01T00:00:00Z')`); err != nil {
+				t.Fatalf("seed heartbeat snapshot: %v", err)
+			}
+			if _, err := db.ExecContext(ctx, `INSERT INTO agent_heartbeat_revisions
+ (id, workspace_id, agent_name, source_path, operation, new_snapshot_id, actor_kind, actor_id, created_at)
+ VALUES ('revision-1', '', 'general', '/home/agents/general/HEARTBEAT.md', 'write', 'beat-1', 'system', 'qa',
+  '2026-10-01T00:00:00Z')`); err != nil {
+				t.Fatalf("seed heartbeat revision: %v", err)
+			}
+			if err := store.Apply(ctx, db, stream); err != nil {
+				t.Fatalf("Apply(global head): %v", err)
+			}
+			var snapshotID, owner string
+			if err := db.QueryRowContext(ctx, `SELECT r.new_snapshot_id, s.profile_id FROM agent_heartbeat_revisions r
+ JOIN agent_heartbeat_snapshots s ON s.id = r.new_snapshot_id WHERE r.id = 'revision-1'`).
+				Scan(&snapshotID, &owner); err != nil {
+				t.Fatalf("read migrated heartbeat snapshot: %v", err)
+			}
+			if snapshotID != "beat-1" || owner != store.DefaultProfileID {
+				t.Fatalf("heartbeat snapshot = %q/%q; want beat-1 owned by the default profile", snapshotID, owner)
+			}
+			if _, err := db.ExecContext(ctx, `INSERT INTO agent_soul_snapshots
+ (id, workspace_id, profile_id, agent_name, source_path, digest, created_at)
+ VALUES ('soul-2', '', '01K00000000000000000000091', 'general', '/other/SOUL.md', 'digest-1', '2026-10-02T00:00:00Z')`); err != nil {
+				t.Fatalf("same digest under another profile must be allowed: %v", err)
+			}
+			if _, err := db.ExecContext(ctx, `INSERT INTO agent_heartbeat_snapshots
+ (id, workspace_id, profile_id, agent_name, source_path, digest, config_digest, body, frontmatter_json, resolved_json,
+  diagnostics_json, created_at)
+ VALUES ('beat-2', '', '01K00000000000000000000091', 'general', '/other/HEARTBEAT.md', 'digest-1', 'config-1', 'body',
+  '{}', '{}', '[]', '2026-10-02T00:00:00Z')`); err != nil {
+				t.Fatalf("same heartbeat digest under another profile must be allowed: %v", err)
+			}
+			assertGlobalMigrationIntegrity(ctx, t, db)
+		})
+	}
+}
+
+// Invariant: widening Goal phases preserves every existing checkpoint across upgrade and reopen.
+// Owner: global user-state migration; canonical open/reopen suite.
+func TestGlobalDBGoalWaitMigration(t *testing.T) {
+	for _, migration := range []string{"00176_schema.sql"} {
+		t.Run("Should preserve in-flight Goal checkpoints through "+migration, func(t *testing.T) {
+			t.Parallel()
+			ctx := globalMigrationTestContext(t)
+			path := filepath.Join(t.TempDir(), GlobalDatabaseName)
+			prior, err := openGlobalMigrationPrefixDatabase(t, path, globalMigrationPrefixBefore(t, migration))
+			if err != nil {
+				t.Fatal(err)
+			}
+			t.Cleanup(func() {
+				if err := prior.Close(); err != nil {
+					t.Error(err)
+				}
+			})
+			if _, err := prior.ExecContext(ctx, `INSERT INTO loop_runs
+			(id, profile_id, workspace_id, loop_name, status, last_progress_at, inputs_json, origin_kind)
+			VALUES ('wait-upgrade', '00000000000000000000000000', '', 'goal-wait', 'running', '2026-11-02T12:00:00Z', '{}', 'catalog')`); err != nil {
+				t.Fatal(err)
+			}
+			const retainedColumns = `loop_run_id,generation,node_id,item_index,control_epoch,
+			control_actor_kind,control_actor_id,control_requested_at,phase,goal_status,
+			turns_used,turn_limit,broken_streak,recovery_streak,task_run_id,queue_entry_id,prompt_id,prompt_kind,prompt_attempt,
+			context_state,usage_sequence,usage_pending_after_sequence,session_id,binding_handle,binding_epoch,context_nudge_ratio,
+			control_grant_id,control_grant_kind,control_grant_cause,control_grant_turn,control_grant_scope,control_grant_consumed,
+			judge_attempt_id,compaction_cancel_prompt_id,compaction_cancel_cause,compaction_cancel_requested_at,
+			report_prompt_id,report_status,report_evidence_ref,report_binding_epoch,report_actor_kind,report_actor_id,report_recorded_at,
+			updated_at,control_cause,compaction_baseline_used,compaction_recovery_required`
+			stamp := "2026-11-02T12:00:00Z"
+			values := []any{
+				"wait-upgrade", 1, "goal", 2, 7, "user", "operator", stamp, "judging", "active",
+				3, 8, 1, 2, "task", "queue", "prompt", "continuation", 1,
+				"pending", 5, 5, "session", "goal:handle", 4, 0.7,
+				1, "turn-extension", "operator", 3, "turn-limit", 0,
+				"judge", "cancel-prompt", "timeout", stamp,
+				"report-prompt", "complete", "evidence:1", 4, "agent", "agent-1", stamp,
+				stamp, "goal_prompt_request_failed", 8, 0,
+			}
+			placeholders := strings.TrimSuffix(strings.Repeat("?,", len(values)), ",")
+			if _, err := prior.ExecContext(
+				ctx,
+				"INSERT INTO loop_goal_checkpoints ("+retainedColumns+") VALUES ("+placeholders+")",
+				values...); err != nil {
+				t.Fatal(err)
+			}
+			const retained = "SELECT json_array(" + retainedColumns + ") FROM loop_goal_checkpoints WHERE loop_run_id='wait-upgrade'"
+			var before string
+			if err := prior.QueryRowContext(ctx, retained).Scan(&before); err != nil {
+				t.Fatal(err)
+			}
+			if err := prior.Close(); err != nil {
+				t.Fatal(err)
+			}
+			for range 2 {
+				upgraded, err := openGlobalMigrationUpgrade(t, path)
+				if err != nil {
+					t.Fatal(err)
+				}
+				var after string
+				var started sql.NullTime
+				var pending bool
+				if err := upgraded.db.QueryRowContext(ctx, "SELECT pending_compaction FROM loop_goal_checkpoints WHERE loop_run_id='wait-upgrade'").
+					Scan(&pending); err != nil {
+					t.Fatal(err)
+				}
+				if pending {
+					t.Fatal("pending compaction = true, want the false default")
+				}
+				if err := upgraded.db.QueryRowContext(ctx, retained).Scan(&after); err != nil {
+					t.Fatal(err)
+				}
+				if err := upgraded.db.QueryRowContext(ctx, `SELECT wait_started_at FROM loop_goal_checkpoints WHERE loop_run_id='wait-upgrade'`).
+					Scan(&started); err != nil {
+					t.Fatal(err)
+				}
+				if after != before || started.Valid {
+					t.Fatalf("checkpoint changed: before=%s after=%s wait=%#v", before, after, started)
+				}
+				status, err := store.Status(ctx, upgraded.db, MigrationStream())
+				if err != nil {
+					t.Fatal(err)
+				}
+				assertCompleteMigrationStream(t, status, MigrationStream())
+				if err := upgraded.Close(ctx); err != nil {
+					t.Fatal(err)
+				}
+			}
+		})
+	}
+}

@@ -1,0 +1,139 @@
+"use client";
+
+import * as React from "react";
+
+import { cn } from "../../lib/utils";
+
+type IconComponent = React.ComponentType<{ className?: string; size?: number }>;
+type RadioCardIconWellSize = "default" | "lg";
+
+export interface RadioCardProps extends Omit<React.ComponentProps<"button">, "value" | "title"> {
+  selected: boolean;
+  onSelect: () => void;
+  title: React.ReactNode;
+  description?: React.ReactNode;
+  icon?: IconComponent;
+  /**
+   * Icon-well geometry. `default` is the 20px glyph slot; `lg` is the 28px
+   * tinted well from the modal RadioCard contract. Opt-in — do not change
+   * existing pickers silently.
+   */
+  iconWellSize?: RadioCardIconWellSize;
+  badge?: React.ReactNode;
+  /** Optional className merged onto the title slot. */
+  titleClassName?: string;
+}
+
+function radioCardIconWellClass(size: RadioCardIconWellSize, selected: boolean): string {
+  if (size === "lg") {
+    return cn(
+      "size-7 rounded-sm bg-surface-2",
+      selected
+        ? "text-fg-strong shadow-inset-strong"
+        : "text-muted-foreground shadow-hairline-inset"
+    );
+  }
+  return cn("size-5", selected ? "text-fg-strong" : "text-muted-foreground");
+}
+
+function RadioCardIconWell({
+  icon: Icon,
+  selected,
+  size,
+}: {
+  icon: IconComponent;
+  selected: boolean;
+  size: RadioCardIconWellSize;
+}) {
+  return (
+    <span
+      aria-hidden="true"
+      data-icon-well-size={size}
+      data-slot="radio-card-icon-well"
+      className={cn(
+        "inline-flex shrink-0 items-center justify-center",
+        radioCardIconWellClass(size, selected)
+      )}
+    >
+      <Icon className={size === "lg" ? "size-3.5" : "size-3"} />
+    </span>
+  );
+}
+
+/**
+ * Single radio choice rendered as a card.:
+ * - resting state: `--canvas-soft` surface, no border (flat-depth).
+ * - selected state: `--selected` background + `box-shadow: 0 0 0 1px var(--color-line-strong) inset`.
+ *   No accent border, no `--color-brand-tint` fill — accent stays reserved for true CTAs.
+ */
+function RadioCard({
+  selected,
+  onSelect,
+  title,
+  description,
+  icon: Icon,
+  iconWellSize = "default",
+  badge,
+  titleClassName,
+  className,
+  type = "button",
+  onClick,
+  onKeyDown,
+  ...props
+}: RadioCardProps) {
+  const selectRadioCard = (event: React.MouseEvent<HTMLButtonElement>) => {
+    onClick?.(event);
+    if (!event.defaultPrevented) onSelect();
+  };
+  const handleKeyDown = (event: React.KeyboardEvent<HTMLButtonElement>) => {
+    onKeyDown?.(event);
+    if (event.defaultPrevented) return;
+    if (event.key === " " || event.key === "Enter") {
+      event.preventDefault();
+      onSelect();
+    }
+  };
+  return (
+    <button
+      type={type}
+      role="radio"
+      aria-checked={selected}
+      data-slot="radio-card"
+      data-selected={selected ? "true" : undefined}
+      onClick={selectRadioCard}
+      onKeyDown={handleKeyDown}
+      className={cn(
+        "group flex w-full min-w-0 flex-col gap-1.5 rounded-lg bg-card px-3 py-2.5 text-left transition-colors duration-base ease-out focus-visible:outline-none focus-visible:shadow-focus-ring",
+        selected ? "bg-selected shadow-inset-strong" : "shadow-card hover:bg-surface-2",
+        className
+      )}
+      {...props}
+    >
+      <div className="flex min-w-0 items-center gap-2">
+        {Icon ? <RadioCardIconWell icon={Icon} selected={selected} size={iconWellSize} /> : null}
+        <span
+          data-slot="radio-card-title"
+          className={cn(
+            "min-w-0 flex-1 text-small-body font-medium tracking-eyebrow",
+            selected ? "text-fg-strong" : "text-fg",
+            titleClassName ?? "truncate"
+          )}
+        >
+          {title}
+        </span>
+        {badge ? (
+          <span data-slot="radio-card-badge" className="ml-auto inline-flex shrink-0 items-center">
+            {badge}
+          </span>
+        ) : null}
+      </div>
+      {description ? (
+        <p data-slot="radio-card-description" className="text-form-label text-muted-foreground">
+          {description}
+        </p>
+      ) : null}
+    </button>
+  );
+}
+
+export { RadioCard };

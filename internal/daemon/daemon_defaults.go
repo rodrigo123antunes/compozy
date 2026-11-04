@@ -1,0 +1,70 @@
+package daemon
+
+import (
+	"context"
+
+	"os"
+
+	"github.com/compozy/compozy/internal/api/httpapi"
+	"github.com/compozy/compozy/internal/api/udsapi"
+
+	compozyconfig "github.com/compozy/compozy/internal/config"
+
+	"github.com/compozy/compozy/internal/procutil"
+)
+
+func (d *Daemon) applyServerFactoryDefaults() {
+	if d.httpFactory == nil {
+		d.httpFactory = func(_ context.Context, deps RuntimeDeps) (Server, error) {
+			return httpapi.New(httpServerOptions(&deps)...)
+		}
+	}
+	if d.udsFactory == nil {
+		d.udsFactory = func(_ context.Context, deps RuntimeDeps) (Server, error) {
+			return udsapi.New(udsServerOptions(&deps)...)
+		}
+	}
+	if d.gatewayTierFactory == nil {
+		d.gatewayTierFactory = defaultGatewayTierServerFactory
+	}
+}
+
+func (d *Daemon) applySystemDefaults() {
+	if d.signalProcess == nil {
+		d.signalProcess = procutil.Signal
+	}
+	if d.processAlive == nil {
+		d.processAlive = procutil.Alive
+	}
+	if d.executable == nil {
+		// Renaming an executing binary changes os.Executable on Linux; restart must use the install path.
+		binary, err := os.Executable()
+		d.executable = func() (string, error) { return binary, err }
+	}
+	if d.startDetached == nil {
+		d.startDetached = defaultDetachedStart
+	}
+	if d.getenv == nil {
+		d.getenv = os.Getenv
+	}
+	if d.closeLogger == nil {
+		d.closeLogger = func() error { return nil }
+	}
+	if d.loadConfig == nil {
+		d.loadConfig = func() (compozyconfig.Config, error) {
+			return loadConfigFromHome(d.homePaths, d.getenv)
+		}
+	}
+}
+
+func (d *Daemon) startObserverRetention(ctx context.Context) error {
+	d.mu.Lock()
+	observer := d.observer
+	d.mu.Unlock()
+
+	starter, ok := observer.(observerRetentionStarter)
+	if !ok {
+		return nil
+	}
+	return starter.StartRetention(ctx)
+}

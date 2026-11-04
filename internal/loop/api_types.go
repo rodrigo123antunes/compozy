@@ -1,0 +1,149 @@
+package loop
+
+import (
+	"context"
+	"encoding/json"
+	"errors"
+	"time"
+
+	"github.com/compozy/compozy/internal/store"
+)
+
+// ErrInvalidRunListCursor reports a malformed or filter-incompatible run-list cursor.
+var ErrInvalidRunListCursor = errors.New("invalid_cursor")
+
+// RunListQuery filters loop run listings within one explicit profile read
+// lens and workspace. AllProfiles is reserved for intentional aggregates.
+type RunListQuery struct {
+	AllWorkspaces    bool
+	WorkspaceIDs     []string
+	ReadScope        store.ReadScope
+	WorkspaceID      WorkspaceID
+	LoopName         string
+	Status           Status
+	OriginKind       string
+	OriginSessionID  string
+	Live             *bool
+	Limit            int
+	CreatedAfter     time.Time
+	OperationalOrder bool
+	// After resumes operational ordering and must come from the same active filters.
+	After *RunListPosition
+}
+
+// RunListPosition identifies one run by operational rank, creation time, and ID.
+type RunListPosition struct {
+	Rank      int
+	CreatedAt time.Time
+	ID        RunID
+}
+
+// RunEventQuery filters retained loop run events.
+type RunEventQuery struct {
+	ReadScope   store.ReadScope
+	WorkspaceID WorkspaceID
+	RunID       RunID
+	AfterSeq    int64
+	Limit       int
+}
+
+// RunEventBackwardQuery identifies one snapshot-fenced reverse event page.
+type RunEventBackwardQuery struct {
+	WorkspaceID  WorkspaceID
+	RunID        RunID
+	FixedHeadSeq int64
+	BeforeSeq    int64
+	Limit        int
+}
+
+// RunEvent is one retained loop_run_events row.
+type RunEvent struct {
+	ID          string
+	LoopRunID   RunID
+	WorkspaceID WorkspaceID
+	Seq         int64
+	Kind        string
+	Payload     json.RawMessage
+	At          time.Time
+	DeliveryKey string
+}
+
+// RouteCause is one workspace-scoped route_taken projection.
+type RouteCause struct {
+	Generation  int64
+	NodeID      NodeID
+	ItemIndex   int
+	Route       NodeID
+	Cause       string
+	MatchedWhen string
+	Default     bool
+	At          time.Time
+}
+
+// RouteCauseReader loads durable route decisions for one generation.
+type RouteCauseReader interface {
+	ListRouteCauses(
+		ctx context.Context,
+		workspaceID WorkspaceID,
+		runID RunID,
+		generation int64,
+	) ([]RouteCause, error)
+}
+
+// UIAnnotation is one editor sidecar position for a loop node.
+type UIAnnotation struct {
+	NodeID NodeID
+	X      float64
+	Y      float64
+}
+
+// RunReader exposes read-model operations outside the aggregate mutation service.
+type RunReader interface {
+	ListLoopRuns(ctx context.Context, query RunListQuery) ([]Run, error)
+	ListLoopRunEvents(ctx context.Context, query RunEventQuery) ([]RunEvent, error)
+	ListGenerationOutputs(
+		ctx context.Context,
+		workspaceID WorkspaceID,
+		runID RunID,
+		generation int,
+	) ([]GenerationOutput, error)
+}
+
+// AnnotationStore persists workspace-scoped loop editor sidecars.
+type AnnotationStore interface {
+	ListLoopUIAnnotations(
+		ctx context.Context,
+		ws WorkspaceID,
+		profileID string,
+		loopName string,
+	) ([]UIAnnotation, error)
+	ReplaceLoopUIAnnotations(
+		ctx context.Context,
+		ws WorkspaceID,
+		profileID string,
+		loopName string,
+		annotations []UIAnnotation,
+	) error
+}
+
+// DefinitionState contains mutable sidecars owned by one file-backed Loop definition.
+type DefinitionState struct {
+	Config      *LoopConfig
+	Annotations []UIAnnotation
+}
+
+// DefinitionStateStore owns atomic removal and restoration of definition sidecars.
+type DefinitionStateStore interface {
+	DeleteLoopDefinitionState(
+		ctx context.Context,
+		ws WorkspaceID,
+		profileID string,
+		loopName string,
+	) (DefinitionState, error)
+	RestoreLoopDefinitionState(
+		ctx context.Context,
+		ws WorkspaceID, profileID string,
+		loopName string,
+		state DefinitionState,
+	) error
+}

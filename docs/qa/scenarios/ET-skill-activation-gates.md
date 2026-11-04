@@ -1,0 +1,63 @@
+---
+id: ET-skill-activation-gates
+area: ET
+title: Offer only skills whose runtime activation gates pass
+persona: Ada
+journey: J-offer-runnable-capabilities
+expected: A skill with satisfied metadata.compozy.when gates appears in startup and current-turn catalogs; one with an unmet platform, environment, tool, or authored-capability gate remains manageable with structured inactive reasons but is absent from both catalogs; restoring a required callable tool makes the next catalog projection offer it without restarting CompozyOS.
+entry_points: SKILL.md metadata.compozy.when; agent startup and current-turn prompt catalogs; GET /api/skills; compozy skill list|inspect|view; compozy__skill_list|view; Web /skills
+qa_status: pass
+bug_ids:
+fix_status:
+retest_status:
+fix_commits:
+evidence: .cache/qa-labs/compozy-pr-531-profile-scopes-20260902-170122-478233-lab/qa-artifacts/qa/notes/skill-gate.md; .cache/gate/logs/go-test-1788369547-28708.log; docs/qa/reports/artifacts/2026-11-03-stays-on-hardening-qa/ (2026-11-03 always-on QA walk)
+last_report: docs/qa/reports/2026-11-03-stays-on-hardening-qa.md
+overlaps: ET-001; ET-002; ET-003
+---
+
+Exercise gate-family AND composition, any-of platform/environment matching, all-of tool/capability
+matching, and fail-closed unavailable contexts. Confirm unknown `when` keys and malformed values fail
+parsing. Verify administrative enabled state remains independent from runtime activation in CLI,
+HTTP/UDS, native tools, and Web detail/list views. Explicit skill reads must continue to work for an
+inactive skill.
+
+QA impact 2026-07-18: new offer-time skill activation behavior and public inactive diagnostics.
+Planning flag only; no QA session ran in this implementation slice.
+
+Phase C planning 2026-07-19: persona normalized to Ada and linked to J-offer-runnable-capabilities;
+settles the skills half of US-011 (ADR-009 §2) — RT-mcp-dead-recovery owns the dead-entity half.
+
+Forensic evidence contract (SD-006) — each item cites timestamp, exact command, observed output:
+
+- Advertised-set token assertion on the gated fixture (measured drop) and the agent-prompt
+  exclusion capture.
+- Inactive-with-reason listing across CLI, HTTP/UDS, native, and Web.
+- The revive-without-restart capture after the required tool becomes available, and the
+  unknown-`when`-key parse error.
+
+src: .compozy/tasks/hermes-comparison/_user_stories.md#us-011-only-runnable-skills-are-offered-dead-sidecars-self-recover
+
+QA impact 2026-07-26: activation metadata and CLI entry points hard-cut to Compozy.
+Status remains untested; the next QA cycle owns live retesting.
+
+QA impact 2026-09-02: profile-aware extension tool discovery changed the `requires_tools` activation input; reset for a focused named-Profile re-walk.
+
+2026-09-02: `pass` — the named-Profile catalog offered the skill, the default Profile reported the exact missing-tool reason, and disable/enable changed the following catalog projection without restarting the daemon.
+
+Always-on hardening, 2026-11-03 — operator review before discovery:
+
+1. In an isolated always-on session, call `compozy__agent_skill_propose` with a new procedure.
+2. Confirm the native review is pending and the instance has a linked proposal report. Neither
+   the session catalog nor the workspace skill scan may offer the pending draft.
+3. Inspect it with `compozy agent skill review show`. Confirm automatic contents and exact files
+   are visible. An agent-authenticated approve or reject must return `skill_review_operator_only`.
+4. Approve over HTTP using the shown digest. A stale digest must return `skill_review_stale`.
+5. Create a fresh real ACP session and confirm its catalog offers the approved skill. Re-propose
+   rejected contents and confirm rejection persists until the contents change.
+
+Focused backend owner: `TestInstanceSkillApprovalIntegration` (native proposal, HTTP approval,
+real ACP session and canonical offer-time catalog). Shared HTTP/UDS decision and paging boundaries:
+`TestAgentSkillReviews`. Web report-card interaction remains a separate UI scenario check.
+
+QA verification 2026-11-03 (always-on hardening, soh/qa 583415ef5, isolated acpmock lab): Pass. An always-on main called `compozy__agent_skill_propose` (`release-checklist` with `scripts/verify.sh`), which produced pending review `skr-c8734f73f505256e` with `runs_automatically.scripts=1` and a linked proposal card. `compozy agent skill review show` listed SKILL.md, references/notes.md and scripts/verify.sh. Pending drafts were absent from `compozy skill list`. With the main's agent credentials, approve and reject both returned 403 `skill_review_operator_only`. A stale digest returned `skill_review_stale` (CLI, and HTTP 409). An HTTP approve with the shown digest approved `deploy-notes`, and a fresh `curator` session's commands offered it. A rejected `scratch-notes`, proposed again with the same contents, stayed `rejected` with no new pending review. Evidence: `skill-decisions.txt`, `skill-catalog.txt`.

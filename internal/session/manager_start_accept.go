@@ -1,0 +1,169 @@
+package session
+
+import (
+	"context"
+	"errors"
+	"fmt"
+
+	workspacepkg "github.com/compozy/compozy/internal/workspace"
+)
+
+type acceptedSessionStart struct {
+	spec           *sessionStartSpec
+	runtime        sessionStartRuntime
+	session        *Session
+	storage        sessionStartStorage
+	run            *sessionStartRun
+	proc           *AgentProcess
+	async          bool
+	persistFailure bool
+}
+
+// acceptSessionStart resolves routing before persistence so invalid configuration cannot create sessions.
+func (m *Manager) acceptSessionStart(
+	acceptCtx context.Context,
+	runBaseCtx context.Context,
+	spec *sessionStartSpec,
+) (_ *acceptedSessionStart, err error) {
+	if acceptCtx == nil || runBaseCtx == nil {
+		return nil, errors.New("session: accept start contexts are required")
+	}
+	if spec == nil {
+		return nil, errors.New("session: start spec is required")
+	}
+
+	runtime, err := m.resolveAcceptedStartRuntime(acceptCtx, spec)
+	if err != nil {
+		return nil, err
+	}
+	releaseLifecycle, err := m.reserveStartLifecycle(acceptCtx, spec.sessionID, spec.workspace.ID)
+	if err != nil {
+		return nil, fmt.Errorf("session: reserve %s session %q: %w", spec.startAction, spec.sessionID, err)
+	}
+	defer releaseLifecycle()
+	if spec.worktreeID != "" && m.worktreeDeliveryFences[spec.workspace.ID+"\x00"+spec.worktreeID] {
+		m.releaseReservation(spec.sessionID)
+		return nil, fmt.Errorf("%w: worktree delivery is in progress", ErrValidation)
+	}
+	defer func() {
+		if err != nil {
+			m.releaseReservation(spec.sessionID)
+		}
+	}()
+
+	if err := m.refreshAcceptedStartAuthority(acceptCtx, spec, &runtime); err != nil {
+		return nil, err
+	}
+
+	storage, err := m.prepareSessionStartStorage(spec)
+	if err != nil {
+		return nil, fmt.Errorf("session: prepare %s storage for %q: %w", spec.startAction, spec.sessionID, err)
+	}
+	run, err := m.newSessionStartRun(runBaseCtx, spec.sessionID)
+	if err != nil {
+		cleanupErr := m.cleanupFailedStart(storage.sessionDir, storage.recorder, nil)
+		return nil, errors.Join(err, cleanupErr)
+	}
+	defer func() {
+		if err == nil {
+			return
+		}
+		m.finishSessionStartRun(spec.sessionID, run, err)
+	}()
+	if err := m.revalidateSpawnedLineageForStart(acceptCtx, spec); err != nil {
+		cleanupErr := m.cleanupFailedStart(storage.sessionDir, storage.recorder, nil)
+		return nil, errors.Join(err, cleanupErr)
+	}
+
+	spec.resolveDefinitionPermissionPolicy(runtime.agentDef)
+	session := spec.newStartingSession(runtime.agent, runtime.agentDef, storage, m.now())
+	session.followUpMode = m.busyInputDefaultMode
+	session.pendingDeriveReceipt = cloneDerivationReceipt(spec.deriveReceipt)
+	if err := m.registerStarting(session); err != nil {
+		cleanupErr := m.cleanupFailedStart(storage.sessionDir, storage.recorder, nil)
+		return nil, errors.Join(err, cleanupErr)
+	}
+	if err := m.persistAcceptedStart(acceptCtx, spec, session); err != nil {
+		m.remove(session.ID)
+		cleanupErr := m.cleanupFailedStart(storage.sessionDir, storage.recorder, nil)
+		return nil, errors.Join(
+			fmt.Errorf("session: persist accepted start for %q: %w", spec.sessionID, err),
+			cleanupErr,
+		)
+	}
+
+	return &acceptedSessionStart{
+		spec: spec, runtime: runtime, session: session, storage: storage, run: run,
+	}, nil
+}
+
+// resolveAcceptedStartRuntime resolves and validates the start's runtime and pins its
+// creation identity before anything is persisted.
+func (m *Manager) resolveAcceptedStartRuntime(
+	acceptCtx context.Context,
+	spec *sessionStartSpec,
+) (sessionStartRuntime, error) {
+	runtime, err := m.resolveSessionStartRuntime(acceptCtx, spec, true)
+	if err != nil {
+		spec.startLogger(m).Warn(
+			"session.start.runtime_prepare_failed",
+			"phase", spec.startAction,
+			"error", err,
+		)
+		return sessionStartRuntime{}, fmt.Errorf(
+			"session: resolve %s runtime for %q: %w", spec.startAction, spec.sessionID, err,
+		)
+	}
+	if !spec.deferRuntimeValidation {
+		if err := m.validateExplicitStartModel(acceptCtx, &runtime, spec); err != nil {
+			return sessionStartRuntime{}, err
+		}
+	}
+	if spec.creationIdentityPinned || spec.workspace.Scope == workspacepkg.ScopeUser {
+		if err := prepareStartCreationIdentityIfEnabled(spec, runtime.agent); err != nil {
+			return sessionStartRuntime{}, fmt.Errorf(
+				"session: prepare creation identity for %q: %w",
+				spec.sessionID,
+				err,
+			)
+		}
+	}
+	return runtime, nil
+}
+
+// persistAcceptedStart writes the accepted start. A derived child only writes its meta
+// here: its catalog row is committed later together with its derive receipt, so
+// nothing publishes the child before that transaction.
+func (m *Manager) persistAcceptedStart(ctx context.Context, spec *sessionStartSpec, session *Session) error {
+	if spec.instanceID != "" && spec.sessionType != SessionTypeTriage {
+		return m.persistInstanceAcceptedStart(ctx, spec.instanceID, session)
+	}
+	if spec.deriveReceipt != nil {
+		return m.persistSessionMetadataOnly(session)
+	}
+	return m.persistSessionLifecycleState(ctx, session, true)
+}
+
+func (m *Manager) refreshAcceptedStartAuthority(
+	acceptCtx context.Context,
+	spec *sessionStartSpec,
+	runtime *sessionStartRuntime,
+) error {
+	if err := m.refreshStartLineage(acceptCtx, spec); err != nil {
+		return err
+	}
+	if err := m.applyInstanceCeiling(acceptCtx, spec, &runtime.agent); err != nil {
+		return err
+	}
+	// Refresh reads persisted lineage on resume; materialize afterwards so legacy
+	// derived sessions are repaired without treating computed grants as create input.
+	if err := spec.materializeRootDelegationPolicy(
+		runtime.agentDef,
+		runtime.agent,
+		m.toolsetCatalog,
+		m.toolUniverse,
+	); err != nil {
+		return fmt.Errorf("session: materialize delegation tools for %q: %w", spec.sessionID, err)
+	}
+	return nil
+}

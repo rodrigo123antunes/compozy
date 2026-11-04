@@ -1,0 +1,319 @@
+package config
+
+import (
+	"errors"
+	"os"
+	"path/filepath"
+	"strings"
+	"testing"
+)
+
+func TestResolveAgentNameFallsBackToDefaults(t *testing.T) {
+	t.Parallel()
+
+	cfg := Config{
+		Defaults: DefaultsConfig{Agent: DefaultAgentName},
+	}
+
+	resolved, err := ResolveAgentName("", cfg.Defaults)
+	if err != nil {
+		t.Fatalf("ResolveAgentName() error = %v", err)
+	}
+	if resolved != DefaultAgentName {
+		t.Fatalf("ResolveAgentName() = %q, want %q", resolved, DefaultAgentName)
+	}
+}
+
+func TestDefaultsAgentNameValidation(t *testing.T) {
+	t.Parallel()
+
+	for _, test := range []struct {
+		name  string
+		agent string
+	}{
+		{name: "Should reject an empty default agent"},
+		{name: "Should reject a whitespace-only default agent", agent: " \t\n"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+
+			defaults := DefaultsConfig{Agent: test.agent}
+			err := defaults.Validate()
+			validationErr, validationErrOK := errors.AsType[ValidationError](err)
+			if !validationErrOK {
+				t.Fatalf("DefaultsConfig.Validate() error = %T, want ValidationError", err)
+			}
+			if got, want := validationErr.Path, "defaults.agent"; got != want {
+				t.Fatalf("DefaultsConfig.Validate() path = %q, want %q", got, want)
+			}
+			if got, want := validationErr.Message, "is required"; got != want {
+				t.Fatalf("DefaultsConfig.Validate() message = %q, want %q", got, want)
+			}
+			_, err = ResolveAgentName("", defaults)
+			const wantErr = "agent name is required; run `compozy install` or set defaults.agent"
+			if err == nil || err.Error() != wantErr {
+				t.Fatalf("ResolveAgentName() error = %v, want %q", err, wantErr)
+			}
+		})
+	}
+
+	t.Run("Should reject an invalid explicit or default agent name", func(t *testing.T) {
+		t.Parallel()
+
+		const invalidName = "audio designer"
+		wantErr := `agent name "audio designer" must start with a lowercase letter, use only lowercase letters, numbers, hyphens, or underscores, and be at most 106 characters`
+		for _, tc := range []struct {
+			name     string
+			explicit string
+			defaults DefaultsConfig
+		}{
+			{name: "Should reject explicit", explicit: invalidName, defaults: DefaultsConfig{Agent: DefaultAgentName}},
+			{name: "Should reject default", defaults: DefaultsConfig{Agent: invalidName}},
+		} {
+			t.Run(tc.name, func(t *testing.T) {
+				t.Parallel()
+
+				_, err := ResolveAgentName(tc.explicit, tc.defaults)
+				if err == nil || err.Error() != wantErr {
+					t.Fatalf("ResolveAgentName() error = %v, want %q", err, wantErr)
+				}
+			})
+		}
+	})
+
+	t.Run("Should return a structured defaults path for an invalid name", func(t *testing.T) {
+		t.Parallel()
+
+		err := (DefaultsConfig{Agent: "audio designer"}).Validate()
+		validationErr, validationErrOK := errors.AsType[ValidationError](err)
+		if !validationErrOK {
+			t.Fatalf("DefaultsConfig.Validate() error = %T, want ValidationError", err)
+		}
+		if got, want := validationErr.Path, "defaults.agent"; got != want {
+			t.Fatalf("DefaultsConfig.Validate() path = %q, want %q", got, want)
+		}
+		wantMessage := `agent name "audio designer" must start with a lowercase letter, use only lowercase letters, numbers, hyphens, or underscores, and be at most 106 characters`
+		if got := validationErr.Message; got != wantMessage {
+			t.Fatalf("DefaultsConfig.Validate() message = %q, want %q", got, wantMessage)
+		}
+	})
+}
+
+func TestSaveBootstrapConfigWritesManagedDefaults(t *testing.T) {
+	t.Parallel()
+
+	homePaths, err := ResolveHomePathsFrom(filepath.Join(t.TempDir(), "home"))
+	if err != nil {
+		t.Fatalf("ResolveHomePathsFrom() error = %v", err)
+	}
+
+	writeFile(t, homePaths.ConfigFile, `
+# bootstrap comment
+[http]
+	port = 3030
+
+	[providers.claude]
+	auth_mode = "bound_secret"
+	# keep credential slot comment
+	[[providers.claude.credential_slots]]
+	name = "api_key"
+	target_env = "ANTHROPIC_KEY"
+	secret_ref = "env:ANTHROPIC_KEY"
+	kind = "api_key"
+	required = true
+	`)
+
+	cfg, err := SaveBootstrapConfig(homePaths, "claude", "claude-sonnet-4-6")
+	if err != nil {
+		t.Fatalf("SaveBootstrapConfig() error = %v", err)
+	}
+	if cfg.Defaults.Agent != DefaultAgentName {
+		t.Fatalf("SaveBootstrapConfig() Defaults.Agent = %q, want %q", cfg.Defaults.Agent, DefaultAgentName)
+	}
+	if cfg.Defaults.Provider != "claude" {
+		t.Fatalf("SaveBootstrapConfig() Defaults.Provider = %q, want %q", cfg.Defaults.Provider, "claude")
+	}
+	if cfg.Permissions.Mode != PermissionModeApproveAll {
+		t.Fatalf("SaveBootstrapConfig() Permissions.Mode = %q, want %q", cfg.Permissions.Mode, PermissionModeApproveAll)
+	}
+
+	reloaded, err := LoadGlobalConfig(homePaths)
+	if err != nil {
+		t.Fatalf("LoadGlobalConfig() error = %v", err)
+	}
+	if reloaded.HTTP.Port != 3030 {
+		t.Fatalf("LoadGlobalConfig() HTTP.Port = %d, want 3030", reloaded.HTTP.Port)
+	}
+	slots := reloaded.Providers["claude"].EffectiveCredentialSlots()
+	if len(slots) != 1 || slots[0].TargetEnv != "ANTHROPIC_KEY" || slots[0].SecretRef != "env:ANTHROPIC_KEY" {
+		t.Fatalf(
+			"LoadGlobalConfig() Providers[claude].CredentialSlots = %#v, want ANTHROPIC_KEY slot",
+			slots,
+		)
+	}
+	if reloaded.Providers["claude"].Models.Default != "claude-sonnet-4-6" {
+		t.Fatalf(
+			"LoadGlobalConfig() Providers[claude].Models.Default = %q, want %q",
+			reloaded.Providers["claude"].Models.Default,
+			"claude-sonnet-4-6",
+		)
+	}
+
+	contents, err := os.ReadFile(homePaths.ConfigFile)
+	if err != nil {
+		t.Fatalf("ReadFile(config) error = %v", err)
+	}
+	text := string(contents)
+	for _, want := range []string{
+		`# bootstrap comment`,
+		`# keep credential slot comment`,
+		`agent = "general"`,
+		`provider = "claude"`,
+		`mode = "approve-all"`,
+		`default = "claude-sonnet-4-6"`,
+		`port = 3030`,
+		`secret_ref = "env:ANTHROPIC_KEY"`,
+	} {
+		if !strings.Contains(text, want) {
+			t.Fatalf("config contents missing %q\n%s", want, text)
+		}
+	}
+}
+
+func TestSaveBootstrapConfigAllowsProviderManagedModel(t *testing.T) {
+	t.Parallel()
+
+	t.Run("Should save a provider-managed model without a default", func(t *testing.T) {
+		t.Parallel()
+		homePaths, err := ResolveHomePathsFrom(filepath.Join(t.TempDir(), "home"))
+		if err != nil {
+			t.Fatalf("ResolveHomePathsFrom() error = %v", err)
+		}
+
+		cfg, err := SaveBootstrapConfig(homePaths, "copilot", "")
+		if err != nil {
+			t.Fatalf("SaveBootstrapConfig() error = %v", err)
+		}
+		if cfg.Defaults.Provider != "copilot" {
+			t.Fatalf("SaveBootstrapConfig() Defaults.Provider = %q, want copilot", cfg.Defaults.Provider)
+		}
+		if got := cfg.Providers["copilot"].Models.Default; got != "" {
+			t.Fatalf("SaveBootstrapConfig() Providers[copilot].Models.Default = %q, want empty", got)
+		}
+
+		contents, err := os.ReadFile(homePaths.ConfigFile)
+		if err != nil {
+			t.Fatalf("ReadFile(config) error = %v", err)
+		}
+		text := string(contents)
+		if strings.Contains(text, `default_model =`) {
+			t.Fatalf("config contents wrote provider-managed default model:\n%s", text)
+		}
+	})
+}
+
+func TestSaveBootstrapConfigRequiresModelForPiProviders(t *testing.T) {
+	t.Parallel()
+
+	homePaths, err := ResolveHomePathsFrom(filepath.Join(t.TempDir(), "home"))
+	if err != nil {
+		t.Fatalf("ResolveHomePathsFrom() error = %v", err)
+	}
+
+	_, err = SaveBootstrapConfig(homePaths, "openrouter", "")
+	if err == nil {
+		t.Fatal("SaveBootstrapConfig() error = nil, want model required error")
+	}
+	wantErr := `bootstrap model is required for provider "openrouter"`
+	if err.Error() != wantErr {
+		t.Fatalf("SaveBootstrapConfig() error = %q, want %q", err.Error(), wantErr)
+	}
+}
+
+func TestEnsureBootstrapAgentCreatesAndPreservesManagedAgent(t *testing.T) {
+	t.Parallel()
+	t.Run("Should create a private managed agent and preserve authored content", func(t *testing.T) {
+		t.Parallel()
+		homePaths, err := ResolveHomePathsFrom(filepath.Join(t.TempDir(), "home"))
+		if err != nil {
+			t.Fatalf("ResolveHomePathsFrom() error = %v", err)
+		}
+
+		path, created, err := EnsureBootstrapAgent(homePaths)
+		if err != nil {
+			t.Fatalf("EnsureBootstrapAgent() error = %v", err)
+		}
+		if !created {
+			t.Fatal("EnsureBootstrapAgent() created = false, want true")
+		}
+
+		assertConfigPathMode(t, filepath.Dir(path), 0o700)
+		assertConfigPathMode(t, path, 0o600)
+
+		contents, err := os.ReadFile(path)
+		if err != nil {
+			t.Fatalf("ReadFile(agent) error = %v", err)
+		}
+		if !strings.Contains(string(contents), "name: "+DefaultAgentName) {
+			t.Fatalf("agent contents = %q, want default agent name", string(contents))
+		}
+		if strings.Contains(string(contents), "provider:") {
+			t.Fatalf("agent contents = %q, want provider omitted", string(contents))
+		}
+
+		if err := os.WriteFile(path, []byte("custom"), 0o644); err != nil {
+			t.Fatalf("WriteFile(agent) error = %v", err)
+		}
+		againPath, createdAgain, err := EnsureBootstrapAgent(homePaths)
+		if err != nil {
+			t.Fatalf("EnsureBootstrapAgent() second error = %v", err)
+		}
+		if createdAgain {
+			t.Fatal("EnsureBootstrapAgent() second created = true, want false")
+		}
+		if againPath != path {
+			t.Fatalf("EnsureBootstrapAgent() path = %q, want %q", againPath, path)
+		}
+
+		preserved, err := os.ReadFile(path)
+		if err != nil {
+			t.Fatalf("ReadFile(agent second) error = %v", err)
+		}
+		if string(preserved) != "custom" {
+			t.Fatalf("agent contents after second ensure = %q, want custom", string(preserved))
+		}
+	})
+}
+
+func TestSaveBootstrapConfigReplacesSessionRuntimeDefaults(t *testing.T) {
+	t.Parallel()
+
+	homePaths, err := ResolveHomePathsFrom(filepath.Join(t.TempDir(), "home"))
+	if err != nil {
+		t.Fatalf("ResolveHomePathsFrom() error = %v", err)
+	}
+	writeFile(t, homePaths.ConfigFile, `
+[defaults]
+agent = "general"
+provider = "codex"
+model = "gpt-5.6-terra"
+reasoning_effort = "high"
+`)
+
+	// Install's model choice lands on the provider default; a session default
+	// saved earlier would otherwise keep overriding it.
+	cfg, err := SaveBootstrapConfig(homePaths, "codex", "gpt-5.6-luna")
+	if err != nil {
+		t.Fatalf("SaveBootstrapConfig() error = %v", err)
+	}
+	if cfg.Defaults.Model != "" || cfg.Defaults.ReasoningEffort != "" {
+		t.Fatalf("SaveBootstrapConfig() Defaults = %#v, want no session model or reasoning", cfg.Defaults)
+	}
+	resolved, err := cfg.ResolveAgent(AgentDef{Name: DefaultAgentName, Prompt: "prompt"})
+	if err != nil {
+		t.Fatalf("ResolveAgent() error = %v", err)
+	}
+	if resolved.Model != "gpt-5.6-luna" {
+		t.Fatalf("ResolveAgent() Model = %q, want the installed gpt-5.6-luna", resolved.Model)
+	}
+}

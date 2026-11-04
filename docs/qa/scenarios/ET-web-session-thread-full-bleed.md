@@ -1,0 +1,41 @@
+---
+id: ET-web-session-thread-full-bleed
+area: ET
+title: Session transcript and composer span the full window width
+persona: Bruno
+journey: J-12
+expected: In an open Session window, the message transcript rail and the composer textbox share only horizontal inset padding (px-4/px-8) and span the full window content width; neither surface is capped by a centered max-width reading column; resizing the window wider keeps both surfaces edge-to-edge with the window body (minus inset).
+entry_points: web desktop Session window; ThreadContentRail; session composer
+qa_status: untested
+bug_ids:
+fix_status:
+retest_status:
+fix_commits:
+evidence: /Users/pedronauck/dev/qa-labs/compozy-session-sidebar-parent-20260806-212647-734931-lab/qa-artifacts/qa/journey-log.jsonl
+last_report: docs/qa/reports/2026-10-02-untested.md
+overlaps: ET-web-dock-default-window-size; RT-session-lifecycle-affordances
+---
+
+story: As a builder I use a wide Session window and the chat transcript plus composer fill the available width instead of sitting in a narrow centered column.
+
+qa-impact: Removed ThreadContentRail max-width/centering so session chat is full-bleed (2026-07-22). Flag only; the next QA cycle owns live retesting.
+2026-08-06 session-sidebar impact flag: the session window gains a left sessions rail (closed by default, PanelLeft topbar toggle); full-bleed remains the default state but the layout is now conditional. Reset to untested for the next QA cycle.
+
+2026-08-06 re-walked live: session window opens with the sessions rail closed (width 0) and the transcript+composer full-bleed; closing the rail after use restores full width. Evidence: lab journey-log.jsonl. Verdict: pass.
+
+2026-09-30 shell-rail polish impact (P5): the shell-rail branch had capped the transcript and composer at a centered `max-w-transcript` column; that cap is removed and both surfaces are full-bleed again (inset padding only). The sessions rail now opens by default, so the full-bleed check runs beside the open rail and again after closing it. Reset for a live re-walk.
+
+2026-10-05: Deferred from this QA cycle by the user's explicit scope reduction.
+Coverage remains outstanding; this skip is not a passing result. Resume from the dated
+report's session matrix in a future QA cycle.
+
+2026-10-19 issue #836 impact flag: the sessions rail is resizable (200–480 px,
+pane keeps at least half the window). Full-bleed now applies to whatever width
+the rail leaves; re-check it beside a widened rail in the next QA cycle.
+
+2026-10-22 issue #897 impact: the rail was full-bleed, but `StreamMarkdown` still capped
+every Markdown message at a fixed `72ch`, so agent prose, tables, code blocks, and the
+user bubble's text stopped around 600 px on wide windows. The cap is gone: agent messages
+now fill the rail, and the user bubble grows to its existing 80% column. Re-walk at
+1440/1920/2560 px with the sessions rail and inspector open and closed, then at 390–834 px
+for page-level horizontal overflow. Wide tables and code may still scroll inside their own box.

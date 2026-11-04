@@ -1,63 +1,13 @@
-export { cn } from "./lib/utils";
-
-export { UIProvider, type UIProviderProps } from "./components/ui-provider";
-
-export { Alert, alertVariants, type AlertProps } from "./components/alert";
-export {
-  AlertDialog,
-  AlertDialogBackdrop,
-  AlertDialogClose,
-  AlertDialogContent,
-  AlertDialogDescription,
-  AlertDialogFooter,
-  AlertDialogHeader,
-  AlertDialogPopup,
-  AlertDialogPortal,
-  AlertDialogTitle,
-  AlertDialogTrigger,
-  AlertDialogViewport,
-} from "./components/alert-dialog";
-
-export { Skeleton, SkeletonRow, SkeletonText, type SkeletonProps } from "./components/skeleton";
-
-export { EmptyState, type EmptyStateProps } from "./components/empty-state";
-
-export { Metric, type MetricProps } from "./components/metric";
-
-export { Markdown, type MarkdownProps } from "./components/markdown";
-
-export { Button, buttonVariants, type ButtonProps } from "./components/button";
-
-export { Logo, type LogoProps } from "./components/logo";
-
-export {
-  StatusBadge,
-  type StatusBadgeProps,
-  type StatusBadgeTone,
-} from "./components/status-badge";
-
-export {
-  SurfaceCard,
-  SurfaceCardBody,
-  SurfaceCardDescription,
-  SurfaceCardEyebrow,
-  SurfaceCardFooter,
-  SurfaceCardHeader,
-  SurfaceCardTitle,
-} from "./components/surface-card";
-
-export { SectionHeading, type SectionHeadingProps } from "./components/section-heading";
-
-export {
-  AppShell,
-  AppShellBrand,
-  AppShellContent,
-  AppShellHeader,
-  AppShellMain,
-  AppShellNavItem,
-  AppShellNavSection,
-  AppShellSidebar,
-  type AppShellBrandProps,
-  type AppShellNavItemProps,
-  type AppShellNavSectionProps,
-} from "./components/app-shell";
+// Surface contract for @compozy/ui. The primitive inventory lives in
+// `primitives.ts` (core shadcn/base-nova primitives) plus one named-re-export
+// file per domain under `exports/` — every symbol a consumer can import is
+// spelled out in exactly one of those files.
+export * from "./primitives";
+export * from "./exports/shell";
+export * from "./exports/menus";
+export * from "./exports/listing";
+export * from "./exports/viz";
+export * from "./exports/editors";
+export * from "./exports/conversation";
+export * from "./exports/foundation";
+export * from "./exports/terminal";

@@ -1,10 +1,10 @@
 ---
 name: releasepr
-description: "Guides adoption and day-to-day use of the pr-release CLI in a consuming GitHub repository: installing the binary, wiring the release GitHub Actions workflow, authoring .pr-release.yaml, following conventional commits for semantic versioning, adding custom release notes with add-note, validating with dry-run, and understanding the release-PR then merge then production-release lifecycle. Use when a project depends on compozy/releasepr (pr-release) and needs to configure, run, or troubleshoot its release automation. Not for editing the pr-release Go source itself, and not a general changelog or semantic-versioning tutorial."
+description: "Adopt, configure, run, or troubleshoot compozy/releasepr in a consuming repository, including Actions, beta/stable/legacy plans, notes, dry-runs, and publication. Excludes pr-release internals and general versioning advice."
 license: MIT
 metadata:
   domain: release-automation
-  triggers: pr-release, releasepr, release PR, changelog, conventional commits, git-cliff, GoReleaser, .pr-release.yaml, add-note, dry-run
+  triggers: pr-release, releasepr, release PR, release plan, beta release, changelog, conventional commits, git-cliff, GoReleaser, .pr-release.yaml, add-note, dry-run
   role: specialist
   scope: integration
 ---
@@ -33,6 +33,7 @@ output or running commands. They are load-bearing, not appendices.
 | Run or script a CLI command, choose flags                     | `references/commands.md`                                           |
 | Understand or debug the release lifecycle / CI behavior       | `references/release-workflow.md`                                   |
 | Write commit messages or add custom release notes             | `references/release-notes.md`                                      |
+| Correct notes for an already-published release                | `references/published-release-repair.md` + `references/release-workflow.md` |
 | A release step failed or behaved unexpectedly                 | `references/troubleshooting.md`                                    |
 
 ## Reference Index
@@ -43,7 +44,7 @@ output or running commands. They are load-bearing, not appendices.
 - `references/configuration.md` — every `.pr-release.yaml` field, defaults,
   validation rules, the full environment-variable alias matrix, and
   `release_artifacts` constraints.
-- `references/commands.md` — `pr-release`, `dry-run`, `add-note`, `version`:
+- `references/commands.md` — `pr-release`, `plan`, `release-body`, `dry-run`, `add-note`, `version`:
   every flag and its exact behavior.
 - `references/release-workflow.md` — the end-to-end lifecycle: which commits
   trigger what, release branch/PR naming, dry-run checks, and how a merge
@@ -81,7 +82,7 @@ output or running commands. They are load-bearing, not appendices.
    `go run "<module>@<pinned tag>"`. `--force` makes it idempotent, not "release
    with no changes".
    **STOP. Read `references/commands.md` in full before running `pr-release`,
-   `dry-run`, or `add-note`, or adding any flag to a script.** The flag list
+   `plan`, `release-body`, `dry-run`, or `add-note`, or adding any flag to a script.** The flag list
    here is a tripwire; semantics (e.g. `--rollback`, `--session-id`,
    `--skip-pr`) are only correct in that file.
 

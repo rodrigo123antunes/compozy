@@ -1,0 +1,123 @@
+package automation
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"reflect"
+	"strings"
+)
+
+var ErrLoopTargetUnavailable = errors.New("automation: loop target dependency removed")
+
+var ErrLoopTargetNotFound = errors.New("automation: loop target not found")
+
+// WithLoopStarter injects the loop start boundary used for loop-target automations.
+func WithLoopStarter(starter LoopStarter) Option {
+	return func(opts *managerOptions) {
+		opts.loopStarter = starter
+	}
+}
+
+func (m *Manager) validateJobLoopTarget(ctx context.Context, job Job) error {
+	if !job.IsLoopTarget() {
+		return nil
+	}
+	return m.validateLoopTarget(ctx, job.ProfileID, job.LoopTarget, loopStartKindForAutomation(&job, nil))
+}
+
+func (m *Manager) validateTriggerLoopTarget(ctx context.Context, trigger Trigger) error {
+	if !trigger.IsLoopTarget() {
+		return nil
+	}
+	return m.validateLoopTarget(ctx, trigger.ProfileID, trigger.LoopTarget, loopStartKindForAutomation(nil, &trigger))
+}
+
+func (m *Manager) validateLoopTarget(
+	ctx context.Context,
+	profileID string,
+	target *LoopTarget,
+	kind LoopStartKind,
+) error {
+	if target == nil {
+		return nil
+	}
+	if m == nil || m.loopStarter == nil {
+		return fmt.Errorf("%w: loop target validation requires loop starter", ErrManagerNotRunning)
+	}
+	return validateLoopTargetWithStarter(ctx, m.loopStarter, profileID, target, kind)
+}
+
+func (m *Manager) defaultSchedulerCatchUpPolicy(
+	ctx context.Context,
+	job Job,
+) (SchedulerCatchUpPolicy, error) {
+	if !job.IsLoopTarget() {
+		return SchedulerCatchUpPolicySkipMissed, nil
+	}
+	resolver, ok := m.loopStarter.(LoopCatchUpPolicyResolver)
+	if !ok || resolver == nil || job.LoopTarget == nil {
+		return SchedulerCatchUpPolicySkipMissed, nil
+	}
+	policy, err := resolver.DefaultLoopCatchUpPolicy(ctx, LoopCatchUpPolicyRequest{
+		ProfileID:   strings.TrimSpace(job.ProfileID),
+		WorkspaceID: strings.TrimSpace(job.LoopTarget.WorkspaceID),
+		LoopName:    strings.TrimSpace(job.LoopTarget.LoopName),
+		Kind:        loopStartKindForAutomation(&job, nil),
+	})
+	if isUnavailableSavedLoopTarget(err) {
+		return SchedulerCatchUpPolicySkipMissed, nil
+	}
+	return policy, err
+}
+
+func targetKindOrDefault(kind TargetKind, target *LoopTarget) TargetKind {
+	normalized := TargetKind(strings.TrimSpace(string(kind)))
+	if normalized != "" {
+		return normalized
+	}
+	if target != nil {
+		return TargetKindLoop
+	}
+	return TargetKindAgent
+}
+
+func cloneLoopTarget(target *LoopTarget) *LoopTarget {
+	if target == nil {
+		return nil
+	}
+	cloned := *target
+	cloned.Inputs = cloneJSONMap(target.Inputs)
+	cloned.InputMapping = cloneStringMap(target.InputMapping)
+	return &cloned
+}
+
+func sameLoopTarget(left *LoopTarget, right *LoopTarget) bool {
+	switch {
+	case left == nil && right == nil:
+		return true
+	case left == nil || right == nil:
+		return false
+	default:
+		return left.WorkspaceID == right.WorkspaceID &&
+			left.LoopName == right.LoopName &&
+			sameJSONMap(left.Inputs, right.Inputs) &&
+			sameStringMap(left.InputMapping, right.InputMapping)
+	}
+}
+
+func sameJSONMap(left map[string]any, right map[string]any) bool {
+	if len(left) != len(right) {
+		return false
+	}
+	for key, value := range left {
+		if !reflect.DeepEqual(value, right[key]) {
+			return false
+		}
+	}
+	return true
+}
+
+func isUnavailableSavedLoopTarget(err error) bool {
+	return errors.Is(err, ErrLoopTargetNotFound) || errors.Is(err, ErrLoopTargetUnavailable)
+}

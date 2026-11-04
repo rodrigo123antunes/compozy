@@ -1,0 +1,2159 @@
+package situation
+
+import (
+	"context"
+	"encoding/json"
+	"errors"
+	"slices"
+	"strings"
+	"testing"
+	"time"
+	"unicode/utf8"
+
+	"github.com/compozy/compozy/internal/api/contract"
+	compozyconfig "github.com/compozy/compozy/internal/config"
+
+	"github.com/compozy/compozy/internal/session"
+	skillspkg "github.com/compozy/compozy/internal/skills"
+	"github.com/compozy/compozy/internal/soul"
+	"github.com/compozy/compozy/internal/store"
+	taskpkg "github.com/compozy/compozy/internal/task"
+	workspacepkg "github.com/compozy/compozy/internal/workspace"
+)
+
+func TestRenderPromptPreservesSectionOrderAndOmitsUnavailableSections(t *testing.T) {
+	t.Parallel()
+
+	payload := contract.AgentContextPayload{
+		Self: contract.AgentIdentityPayload{
+			SessionID: "sess-1",
+			AgentName: "coder",
+			Provider:  "codex",
+		},
+		Workspace: contract.AgentWorkspacePayload{
+			ID:      "ws-1",
+			Name:    "compozy",
+			RootDir: "/work/compozy",
+		},
+		Session: contract.AgentSessionPayload{
+			ID:        "sess-1",
+			Type:      session.SessionTypeUser,
+			State:     session.StateActive,
+			CreatedAt: fixedTime(),
+			UpdatedAt: fixedTime(),
+		},
+		Capabilities: contract.AgentCapabilitySectionPayload{
+			Section: contract.AgentContextSectionMetaPayload{Limit: 2},
+		},
+		Limits: contract.AgentLimitsPayload{
+			MaxChildren:         5,
+			MaxSpawnDepth:       1,
+			MaxActiveTaskLeases: 1,
+			ContextSectionLimit: 2,
+		},
+		Provenance: contract.AgentContextProvenancePayload{
+			GeneratedAt: fixedTime(),
+			Source:      ProvenanceSource,
+		},
+	}
+
+	rendered, err := RenderPrompt(&payload)
+	if err != nil {
+		t.Fatalf("RenderPrompt() error = %v", err)
+	}
+
+	wantOrder := []string{
+		`"self"`,
+		`"workspace"`,
+		`"session"`,
+		`"capabilities"`,
+		"\n  \"limits\"",
+		`"provenance"`,
+	}
+	assertOrder(t, rendered, wantOrder)
+	for _, omitted := range []string{`"task"`} {
+		if strings.Contains(rendered, omitted) {
+			t.Fatalf("RenderPrompt() included unavailable section %s: %s", omitted, rendered)
+		}
+	}
+}
+
+func TestRenderPromptProvenanceCacheStability(t *testing.T) {
+	t.Parallel()
+
+	t.Run("Should omit generated_at from prompt while preserving context payload provenance", func(t *testing.T) {
+		t.Parallel()
+
+		service := NewService(Deps{Now: fixedNow})
+		payload, err := service.ContextForSession(t.Context(), &session.Info{
+			ID:           "sess-1",
+			AgentName:    "coder",
+			Provider:     "codex",
+			Type:         session.SessionTypeUser,
+			State:        session.StateActive,
+			ACPSessionID: "acp-1",
+			CreatedAt:    fixedTime(),
+			UpdatedAt:    fixedTime(),
+		})
+		if err != nil {
+			t.Fatalf("ContextForSession() error = %v", err)
+		}
+		if got, want := payload.Provenance.GeneratedAt, fixedTime(); !got.Equal(want) {
+			t.Fatalf("Provenance.GeneratedAt = %s, want %s", got, want)
+		}
+		if got, want := payload.Provenance.Source, ProvenanceSource; got != want {
+			t.Fatalf("Provenance.Source = %q, want %q", got, want)
+		}
+
+		rendered, err := RenderPrompt(&payload)
+		if err != nil {
+			t.Fatalf("RenderPrompt() error = %v", err)
+		}
+		if strings.Contains(rendered, "generated_at") {
+			t.Fatalf("RenderPrompt() = %s, want no generated_at", rendered)
+		}
+		if !strings.Contains(rendered, `"source":"daemon.situation"`) {
+			t.Fatalf("RenderPrompt() = %s, want provenance source", rendered)
+		}
+
+		payload.Provenance.GeneratedAt = fixedTime().Add(time.Hour)
+		renderedLater, err := RenderPrompt(&payload)
+		if err != nil {
+			t.Fatalf("RenderPrompt(later generated_at) error = %v", err)
+		}
+		if renderedLater != rendered {
+			t.Fatalf(
+				"RenderPrompt() changed after generated_at-only change\nbefore: %s\nafter:  %s",
+				rendered,
+				renderedLater,
+			)
+		}
+	})
+}
+
+func TestContextForSessionRuntimeIdentity(t *testing.T) {
+	t.Parallel()
+
+	t.Run("Should prefer the bound model over agent defaults and pending selection", func(t *testing.T) {
+		t.Parallel()
+
+		service := NewService(Deps{
+			Now: fixedNow,
+			AgentResolver: agentResolverFunc(
+				func(string, *workspacepkg.ResolvedWorkspace) (compozyconfig.AgentDef, error) {
+					return compozyconfig.AgentDef{Name: "coder", Provider: "codex", Model: "default-model"}, nil
+				},
+			),
+		})
+		payload, err := service.ContextForSession(t.Context(), &session.Info{
+			ID:        "sess-1",
+			AgentName: "coder",
+			Provider:  "codex",
+			Model:     "bound-model",
+			SelectedRuntime: &session.RuntimeSelection{
+				Provider: "claude",
+				Model:    "next-model",
+			},
+			State:     session.StateActive,
+			CreatedAt: fixedTime(),
+			UpdatedAt: fixedTime(),
+		})
+		if err != nil {
+			t.Fatalf("ContextForSession() error = %v", err)
+		}
+		if got, want := payload.Self.Model, "bound-model"; got != want {
+			t.Fatalf("Self.Model = %q, want %q", got, want)
+		}
+		if got, want := payload.Self.Provider, "codex"; got != want {
+			t.Fatalf("Self.Provider = %q, want %q", got, want)
+		}
+	})
+
+	t.Run("Should report the startup runtime over the agent definition defaults", func(t *testing.T) {
+		t.Parallel()
+
+		service := NewService(Deps{
+			Now: fixedNow,
+			AgentResolver: agentResolverFunc(
+				func(string, *workspacepkg.ResolvedWorkspace) (compozyconfig.AgentDef, error) {
+					return compozyconfig.AgentDef{Name: "general", Provider: "claude", Model: "claude-opus-5-5"}, nil
+				},
+			),
+		})
+		payload, err := service.ContextForStartup(
+			t.Context(),
+			session.StartupPromptContext{
+				SessionID: "sess-1", AgentName: "general", Provider: "codex", Model: "gpt-6-astra",
+				SessionType: session.SessionTypeUser,
+			},
+			compozyconfig.AgentDef{Name: "general", Provider: "claude", Model: "claude-opus-5-5"},
+			nil,
+		)
+		if err != nil {
+			t.Fatalf("ContextForStartup() error = %v", err)
+		}
+		if payload.Self.Provider != "codex" || payload.Self.Model != "gpt-6-astra" {
+			t.Fatalf("Self = %#v, want the codex runtime the startup prompt is built for", payload.Self)
+		}
+	})
+}
+
+func TestContextReportsEnforcedSpawnBudget(t *testing.T) {
+	t.Parallel()
+
+	sessionInfo := func(sessionType session.Type, lineage *store.SessionLineage) *session.Info {
+		return &session.Info{
+			ID: "sess-1", AgentName: "coder", Provider: "codex", Type: sessionType, Lineage: lineage,
+			State: session.StateActive, CreatedAt: fixedTime(), UpdatedAt: fixedTime(),
+		}
+	}
+	tests := []struct {
+		name           string
+		info           *session.Info
+		wantChildren   int
+		wantActive     int
+		wantDepth      int
+		wantCanSpawn   bool
+		wantReasonPart string
+	}{
+		{
+			name: "Should resolve an unset provenance budget to the enforced defaults",
+			info: sessionInfo(session.SessionTypeUser, &store.SessionLineage{
+				ParentSessionID: "sess-parent", RootSessionID: "sess-root", SpawnDepth: 2,
+				Kind: store.LineageKindProvenance,
+			}),
+			wantChildren: store.DefaultSpawnMaxChildren,
+			wantCanSpawn: true,
+		},
+		{
+			name: "Should report a coordinator budget from its lineage",
+			info: sessionInfo(session.SessionTypeCoordinator, &store.SessionLineage{
+				SpawnRole:   string(session.SessionTypeCoordinator),
+				SpawnBudget: store.SessionSpawnBudget{MaxChildren: 3, MaxActivePerWorkspace: 4},
+			}),
+			wantChildren: 3,
+			wantActive:   4,
+			wantCanSpawn: true,
+		},
+		{
+			name: "Should block governed spawns from a spawned child at the depth cap",
+			info: sessionInfo(session.SessionTypeSpawned, &store.SessionLineage{
+				ParentSessionID: "sess-parent", RootSessionID: "sess-parent", SpawnDepth: 1,
+				SpawnBudget: store.SessionSpawnBudget{MaxChildren: 5, MaxDepth: 1, TTLSeconds: 3600},
+			}),
+			wantChildren:   store.DefaultSpawnMaxChildren,
+			wantDepth:      1,
+			wantCanSpawn:   false,
+			wantReasonPart: "compozy__subagent_delegate",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			payload, err := NewService(Deps{Now: fixedNow}).ContextForSession(t.Context(), tt.info)
+			if err != nil {
+				t.Fatalf("ContextForSession() error = %v", err)
+			}
+			limits := payload.Limits
+			if limits.GovernedSpawnDepth != tt.wantDepth {
+				t.Fatalf("Limits.GovernedSpawnDepth = %d, want %d", limits.GovernedSpawnDepth, tt.wantDepth)
+			}
+			if limits.MaxChildren != tt.wantChildren || limits.MaxSpawnDepth != store.DefaultSpawnMaxDepth ||
+				limits.MaxActivePerWorkspace != tt.wantActive || limits.CanSpawnChildren != tt.wantCanSpawn {
+				t.Fatalf("Limits = %#v, want max_children %d, depth %d, active %d, can_spawn %t",
+					limits, tt.wantChildren, store.DefaultSpawnMaxDepth, tt.wantActive, tt.wantCanSpawn)
+			}
+			if !strings.Contains(limits.SpawnBlockedReason, tt.wantReasonPart) ||
+				(tt.wantCanSpawn && limits.SpawnBlockedReason != "") {
+				t.Fatalf(
+					"Limits.SpawnBlockedReason = %q, want substring %q",
+					limits.SpawnBlockedReason,
+					tt.wantReasonPart,
+				)
+			}
+			budget := payload.Session.Lineage.SpawnBudget
+			if budget.MaxChildren != limits.MaxChildren || budget.MaxDepth != limits.MaxSpawnDepth {
+				t.Fatalf("Session.Lineage.SpawnBudget = %#v, want the enforced limits %#v", budget, limits)
+			}
+			rendered, err := RenderPrompt(&payload)
+			if err != nil {
+				t.Fatalf("RenderPrompt() error = %v", err)
+			}
+			for _, unenforced := range []string{`"max_children":0`, `"max_depth":0`} {
+				if strings.Contains(rendered, unenforced) {
+					t.Fatalf("RenderPrompt() = %s, must not expose unenforced %s", rendered, unenforced)
+				}
+			}
+		})
+	}
+
+	t.Run("Should prefer the engine's ancestor walk and never claim eligibility without it", func(t *testing.T) {
+		t.Parallel()
+
+		info := sessionInfo(session.SessionTypeSpawned, &store.SessionLineage{
+			ParentSessionID: "sess-parent", SpawnBudget: store.SessionSpawnBudget{MaxDepth: 3},
+		})
+		resolved := session.ChildSpawnAllowance{
+			Budget:        store.SessionSpawnBudget{MaxChildren: 5, MaxDepth: 3},
+			GovernedDepth: 2,
+			Allowed:       true,
+		}
+		tests := []struct {
+			name        string
+			resolver    spawnAllowanceResolverFunc
+			wantDepth   int
+			wantBlocked bool
+			wantErr     error
+		}{
+			{
+				name: "resolved",
+				resolver: func(context.Context, *session.Info) (session.ChildSpawnAllowance, error) {
+					return resolved, nil
+				},
+				wantDepth: 2,
+			},
+			{
+				name: "fallback",
+				resolver: func(context.Context, *session.Info) (session.ChildSpawnAllowance, error) {
+					return session.ChildSpawnAllowance{}, errors.New("ancestor lookup failed")
+				},
+				wantDepth:   1,
+				wantBlocked: true,
+			},
+			{
+				name: "canceled",
+				resolver: func(context.Context, *session.Info) (session.ChildSpawnAllowance, error) {
+					return session.ChildSpawnAllowance{}, context.Canceled
+				},
+				wantErr: context.Canceled,
+			},
+		}
+		for _, tt := range tests {
+			payload, err := NewService(Deps{Now: fixedNow, SpawnAllowance: tt.resolver}).
+				ContextForSession(t.Context(), info)
+			if !errors.Is(err, tt.wantErr) {
+				t.Fatalf("%s: ContextForSession() error = %v, want %v", tt.name, err, tt.wantErr)
+			}
+			if tt.wantErr == nil && (payload.Limits.GovernedSpawnDepth != tt.wantDepth ||
+				payload.Limits.CanSpawnChildren == tt.wantBlocked) {
+				t.Fatalf("%s: Limits = %#v, want governed depth %d and blocked %t",
+					tt.name, payload.Limits, tt.wantDepth, tt.wantBlocked)
+			}
+		}
+	})
+
+	t.Run("Should block governed spawns in a spawned child's startup context", func(t *testing.T) {
+		t.Parallel()
+
+		payload, err := NewService(Deps{Now: fixedNow}).ContextForStartup(
+			t.Context(),
+			session.StartupPromptContext{
+				SessionID: "sess-child", AgentName: "coder", Provider: "codex",
+				SessionType: session.SessionTypeSpawned,
+				Lineage: &store.SessionLineage{
+					ParentSessionID: "sess-parent", SpawnBudget: store.SessionSpawnBudget{MaxChildren: 5, MaxDepth: 1},
+				},
+			},
+			compozyconfig.AgentDef{Name: "coder", Provider: "codex"},
+			nil,
+		)
+		if err != nil {
+			t.Fatalf("ContextForStartup() error = %v", err)
+		}
+		if payload.Limits.CanSpawnChildren || payload.Limits.SpawnBlockedReason == "" {
+			t.Fatalf("Limits = %#v, want a blocked spawn with a reason", payload.Limits)
+		}
+	})
+}
+
+func TestContextForSessionBoundsListsAndIncludesTaskProvenance(t *testing.T) {
+	t.Parallel()
+
+	taskRecord := taskpkg.Task{
+		ID: "task-1", ProfileID: store.DefaultProfileID,
+		Identifier:  "AUTO-1",
+		Scope:       taskpkg.ScopeWorkspace,
+		WorkspaceID: "ws-1",
+		Title:       "Implement context",
+		Status:      taskpkg.TaskStatusInProgress,
+		Priority:    taskpkg.PriorityHigh,
+		Owner:       &taskpkg.Ownership{Kind: taskpkg.OwnerKindAgentSession, Ref: "sess-1"},
+		UpdatedAt:   fixedTime().Add(time.Minute),
+	}
+	run := taskpkg.Run{
+		ID:        "run-1",
+		TaskID:    "task-1",
+		Status:    taskpkg.TaskRunStatusRunning,
+		Attempt:   1,
+		ClaimedBy: &taskpkg.ActorIdentity{Kind: taskpkg.ActorKindAgentSession, Ref: "sess-1"},
+		SessionID: "sess-1",
+
+		Metadata:  jsonRaw(t, `{"workflow_id":"wf-1"}`),
+		QueuedAt:  fixedTime(),
+		StartedAt: fixedTime().Add(time.Minute),
+	}
+
+	service := NewService(Deps{
+		Now:          fixedNow,
+		SectionLimit: 2,
+		WorkspaceResolver: workspaceResolverFunc(func(context.Context, string) (workspacepkg.ResolvedWorkspace, error) {
+			return workspacepkg.ResolvedWorkspace{
+				ID: "ws-1", Name: "Compozy", RootDir: "/work/compozy",
+				Config: compozyconfig.Config{Defaults: compozyconfig.DefaultsConfig{Provider: "codex"}},
+			}, nil
+		}),
+		AgentResolver: agentResolverFunc(func(string, *workspacepkg.ResolvedWorkspace) (compozyconfig.AgentDef, error) {
+			return compozyconfig.AgentDef{
+				Name:     "coder",
+				Provider: "codex",
+				Model:    "gpt-test",
+				Capabilities: &compozyconfig.CapabilityCatalog{Capabilities: []compozyconfig.CapabilityDef{
+					{ID: "build", Summary: "Build code"},
+					{ID: "review", Summary: "Review code"},
+				}},
+			}, nil
+		}),
+		SkillRegistry: skillRegistryFunc(
+			func(context.Context, *workspacepkg.ResolvedWorkspace) ([]*skillspkg.Skill, error) {
+				return []*skillspkg.Skill{
+					{Meta: skillspkg.SkillMeta{Name: "alpha", Description: "Alpha skill"}, Enabled: true},
+					{Meta: skillspkg.SkillMeta{Name: "beta", Description: "Beta skill"}, Enabled: true},
+				}, nil
+			},
+		),
+		TaskStore: taskStoreStub{
+			tasks: map[string]taskpkg.Task{"task-1": taskRecord},
+			runs:  []taskpkg.Run{run},
+		},
+	})
+
+	payload, err := service.ContextForSession(t.Context(), &session.Info{
+		ID:          "sess-1",
+		ProfileID:   store.DefaultProfileID,
+		Name:        "Coding Session",
+		AgentName:   "coder",
+		Provider:    "codex",
+		WorkspaceID: "ws-1",
+		Workspace:   "/work/compozy",
+		Type:        session.SessionTypeUser,
+		Lineage: &store.SessionLineage{
+			ParentSessionID: "sess-parent",
+			RootSessionID:   "sess-root",
+			SpawnDepth:      1,
+			SpawnRole:       "worker",
+			SpawnBudget:     store.SessionSpawnBudget{MaxChildren: 3},
+		},
+		State: session.StateActive,
+
+		CreatedAt: fixedTime(),
+		UpdatedAt: fixedTime(),
+	})
+	if err != nil {
+		t.Fatalf("ContextForSession() error = %v", err)
+	}
+
+	if got, want := payload.Self.Model, "gpt-test"; got != want {
+		t.Fatalf("Self.Model = %q, want %q", got, want)
+	}
+	if payload.Session.Lineage == nil ||
+		payload.Session.Lineage.ParentSessionID != "sess-parent" ||
+		payload.Session.Lineage.RootSessionID != "sess-root" ||
+		payload.Session.Lineage.SpawnDepth != 1 {
+		t.Fatalf("Session.Lineage = %#v, want spawned lineage projection", payload.Session.Lineage)
+	}
+	if payload.Task.Task == nil || payload.Task.Task.ID != "task-1" {
+		t.Fatalf("Task section = %#v, want task-1", payload.Task)
+	}
+
+	if payload.Task.Lease == nil || payload.Task.Lease.RunID != "run-1" {
+		t.Fatalf("Task lease = %#v, want run-1", payload.Task.Lease)
+	}
+	if payload.Task.Bundle == nil ||
+		payload.Task.Bundle.CurrentRun == nil ||
+		payload.Task.Bundle.CurrentRun.ID != "run-1" {
+		t.Fatalf("Task bundle = %#v, want current run context", payload.Task.Bundle)
+	}
+
+	if got := payload.Capabilities.Section; got.Limit != 2 || got.Returned != 2 || !got.Truncated {
+		t.Fatalf("Capability section = %#v, want truncated limit 2", got)
+	}
+	if got, want := payload.Limits.MaxChildren, 3; got != want {
+		t.Fatalf("Limits.MaxChildren = %d, want %d", got, want)
+	}
+	if !payload.Limits.CanSpawnChildren {
+		t.Fatalf("Limits.CanSpawnChildren = false, want true for a provenance-linked user session")
+	}
+	if got, want := payload.Provenance.Source, ProvenanceSource; got != want {
+		t.Fatalf("Provenance.Source = %q, want %q", got, want)
+	}
+
+	rendered, err := RenderPrompt(&payload)
+	if err != nil {
+		t.Fatalf("RenderPrompt(context) error = %v", err)
+	}
+	assertOrder(t, rendered, []string{
+		`"self"`,
+		`"workspace"`,
+		`"session"`,
+		`"task"`,
+		`"capabilities"`,
+		"\n  \"limits\"",
+		`"provenance"`,
+	})
+	if strings.Contains(rendered, "claim_token") {
+		t.Fatalf("RenderPrompt() leaked raw claim token field: %s", rendered)
+	}
+}
+
+func TestContextForSessionProfileLeakProbe(t *testing.T) {
+	t.Parallel()
+	t.Run("Should omit foreign-profile task context", func(t *testing.T) {
+		t.Parallel()
+		testContextForSessionProfileLeakProbe(t)
+	})
+}
+
+func testContextForSessionProfileLeakProbe(t *testing.T) {
+	const foreignProfileID = "01ARZ3NDEKTSV4RRFFQ69G5FAV"
+	queries := []taskpkg.RunQuery{}
+	ownedTask := taskpkg.Task{
+		ID: "task-owned", ProfileID: store.DefaultProfileID, Scope: taskpkg.ScopeWorkspace,
+		WorkspaceID: "ws-1", Title: "owned context", Status: taskpkg.TaskStatusInProgress,
+	}
+	foreignTask := taskpkg.Task{
+		ID: "task-foreign", ProfileID: foreignProfileID, Scope: taskpkg.ScopeWorkspace,
+		WorkspaceID: "ws-1", Title: "FOREIGN_PROFILE_SECRET", Status: taskpkg.TaskStatusInProgress,
+	}
+	service := NewService(Deps{
+		Now: fixedNow,
+		WorkspaceResolver: workspaceResolverFunc(func(context.Context, string) (workspacepkg.ResolvedWorkspace, error) {
+			return workspacepkg.ResolvedWorkspace{
+				ID: "ws-1", Name: "Compozy", RootDir: "/work/compozy",
+			}, nil
+		}),
+		TaskStore: taskStoreStub{
+			tasks: map[string]taskpkg.Task{ownedTask.ID: ownedTask, foreignTask.ID: foreignTask},
+			runs: []taskpkg.Run{
+				{ID: "run-owned", TaskID: ownedTask.ID, SessionID: "sess-1", Status: taskpkg.TaskRunStatusRunning},
+				{ID: "run-foreign", TaskID: foreignTask.ID, SessionID: "sess-1", Status: taskpkg.TaskRunStatusRunning},
+			},
+			runQueries: &queries,
+		},
+	})
+
+	payload, err := service.ContextForSession(t.Context(), &session.Info{
+		ID: "sess-1", ProfileID: store.DefaultProfileID, AgentName: "coder", Provider: "codex",
+		WorkspaceID: "ws-1", Workspace: "/work/compozy", Type: session.SessionTypeUser,
+		State: session.StateActive, CreatedAt: fixedTime(), UpdatedAt: fixedTime(),
+	})
+	if err != nil {
+		t.Fatalf("ContextForSession() error = %v", err)
+	}
+	if !payload.Task.Available || payload.Task.Task == nil || payload.Task.Task.ID != ownedTask.ID {
+		t.Fatalf("Task context = %#v, want owned task only", payload.Task)
+	}
+	encoded, err := json.Marshal(payload)
+	if err != nil {
+		t.Fatalf("json.Marshal(payload) error = %v", err)
+	}
+	if strings.Contains(string(encoded), "FOREIGN_PROFILE_SECRET") ||
+		strings.Contains(string(encoded), foreignTask.ID) {
+		t.Fatalf("situation payload leaked foreign profile data: %s", encoded)
+	}
+	if len(queries) == 0 {
+		t.Fatal("task store received no scoped run query")
+	}
+	for _, query := range queries {
+		if query.ReadScope != (store.ReadScope{ProfileID: store.DefaultProfileID}) {
+			t.Fatalf("run query ReadScope = %#v, want session profile", query.ReadScope)
+		}
+	}
+}
+
+func TestContextBundleRedactsReviewContinuationAndRawClaimTokens(t *testing.T) {
+	t.Parallel()
+
+	t.Run("Should redact raw claim tokens from continuation text and event payloads", func(t *testing.T) {
+		t.Parallel()
+
+		taskRecord := taskpkg.Task{
+			ID: "task-redact", ProfileID: store.DefaultProfileID,
+			Identifier:   "ORCH-23",
+			Scope:        taskpkg.ScopeWorkspace,
+			WorkspaceID:  "ws-redact",
+			Title:        "Continue after review",
+			Status:       taskpkg.TaskStatusInProgress,
+			Priority:     taskpkg.PriorityHigh,
+			MaxAttempts:  3,
+			CurrentRunID: "run-cont",
+		}
+		review := taskpkg.RunReview{
+			ReviewID:    "review-1",
+			TaskID:      taskRecord.ID,
+			RunID:       "run-reviewed",
+			ReviewRound: 1,
+			Attempt:     1,
+			Status:      taskpkg.RunReviewStatusRecorded,
+			Outcome:     taskpkg.RunReviewOutcomeRejected,
+			Reason:      "Reviewer found compozy_claim_REVIEW_SECRET in the output",
+			MissingWork: jsonRaw(
+				t,
+				`["remove compozy_claim_MISSING_SECRET from docs","add regression coverage"]`,
+			),
+			NextRoundGuidance: "Continue without compozy_claim_GUIDANCE_SECRET",
+			ReviewerAgentName: "reviewer",
+			ReviewerSessionID: "sess-reviewer",
+			ReviewedAt:        fixedTime().Add(10 * time.Minute),
+		}
+		currentRun := taskpkg.Run{
+			ID:        "run-cont",
+			TaskID:    taskRecord.ID,
+			Status:    taskpkg.TaskRunStatusRunning,
+			Attempt:   2,
+			SessionID: "sess-worker",
+			Review: &taskpkg.RunReviewLineage{
+				ParentRunID:        review.RunID,
+				ReviewID:           review.ReviewID,
+				ReviewRound:        2,
+				ContinuationReason: "review_rejected",
+				MissingWork:        review.MissingWork,
+				NextRoundGuidance:  review.NextRoundGuidance,
+			},
+			QueuedAt:  fixedTime().Add(20 * time.Minute),
+			StartedAt: fixedTime().Add(21 * time.Minute),
+			Error:     "do not leak compozy_claim_RUN_SECRET",
+		}
+		priorRun := taskpkg.Run{
+			ID:        review.RunID,
+			TaskID:    taskRecord.ID,
+			Status:    taskpkg.TaskRunStatusCompleted,
+			Attempt:   1,
+			SessionID: "sess-original",
+			QueuedAt:  fixedTime(),
+			StartedAt: fixedTime().Add(time.Minute),
+			EndedAt:   fixedTime().Add(5 * time.Minute),
+			Error:     "prior error had compozy_claim_PRIOR_SECRET",
+		}
+		service := NewService(Deps{
+			Now: fixedNow,
+			WorkspaceResolver: workspaceResolverFunc(
+				func(context.Context, string) (workspacepkg.ResolvedWorkspace, error) {
+					return workspacepkg.ResolvedWorkspace{
+						ID: "ws-redact", Name: "Compozy", RootDir: "/work/compozy",
+						Config: workspaceConfigWithTaskDefaults(),
+					}, nil
+				},
+			),
+			TaskStore: taskStoreStub{
+				tasks: map[string]taskpkg.Task{taskRecord.ID: taskRecord},
+				runs:  []taskpkg.Run{priorRun, currentRun},
+				events: []taskpkg.Event{
+					{
+						ID:        "evt-1",
+						TaskID:    taskRecord.ID,
+						RunID:     currentRun.ID,
+						EventType: "task.run.continued",
+						Payload: jsonRaw(
+							t,
+							`{"message":"saw compozy_claim_EVENT_SECRET","claim_token":"raw","mcp_auth_token":"mcp-secret","oauth_code":"oauth-secret","pkce_verifier":"pkce-secret","nested":{"token":"compozy_claim_NESTED_SECRET","secret_binding":"vault-ref","session_secret":"super-secret"}}`,
+						),
+						Timestamp: fixedTime().Add(22 * time.Minute),
+					},
+				},
+				reviews: map[string]taskpkg.RunReview{review.ReviewID: review},
+			},
+		})
+
+		bundle, err := service.BundleForActiveLease(t.Context(), taskpkg.ContextRequest{
+			ProfileID: store.DefaultProfileID,
+			SessionID: currentRun.SessionID,
+			RunID:     currentRun.ID,
+			Now:       fixedTime().Add(30 * time.Minute),
+		})
+		if err != nil {
+			t.Fatalf("BundleForActiveLease() error = %v", err)
+		}
+		if bundle.ReviewContinuation == nil {
+			t.Fatalf("ReviewContinuation = nil, want rejected-review continuation")
+		}
+		if bundle.LatestEventSeq != 1 || bundle.Task.LatestEventSeq != 1 {
+			t.Fatalf("LatestEventSeq bundle=%d task=%d, want 1", bundle.LatestEventSeq, bundle.Task.LatestEventSeq)
+		}
+		if len(bundle.RecentEvents) != 1 || bundle.RecentEvents[0].Sequence != 1 {
+			t.Fatalf("RecentEvents = %#v, want one sequenced event", bundle.RecentEvents)
+		}
+		if got := bundle.ReviewContinuation.Reason; strings.Contains(got, "REVIEW_SECRET") ||
+			!strings.Contains(got, "compozy_claim_[REDACTED]") {
+			t.Fatalf("ReviewContinuation.Reason = %q, want redacted reviewer reason", got)
+		}
+		encoded, err := json.Marshal(bundle)
+		if err != nil {
+			t.Fatalf("json.Marshal(bundle) error = %v", err)
+		}
+		encodedText := string(encoded)
+		for _, leaked := range []string{
+			"REVIEW_SECRET",
+			"MISSING_SECRET",
+			"GUIDANCE_SECRET",
+			"RUN_SECRET",
+			"PRIOR_SECRET",
+			"EVENT_SECRET",
+			"NESTED_SECRET",
+			"mcp-secret",
+			"oauth-secret",
+			"pkce-secret",
+			"vault-ref",
+			"super-secret",
+			`"claim_token"`,
+			`"mcp_auth_token"`,
+			`"oauth_code"`,
+			`"pkce_verifier"`,
+			`"secret_binding"`,
+			`"session_secret"`,
+		} {
+			if strings.Contains(encodedText, leaked) {
+				t.Fatalf("ContextBundle leaked %q: %s", leaked, encodedText)
+			}
+		}
+		if !strings.Contains(encodedText, "compozy_claim_[REDACTED]") {
+			t.Fatalf("ContextBundle = %s, want redaction marker", encodedText)
+		}
+	})
+}
+
+func TestTaskRunPromptOverlayByIDRejectsMismatchedRunTaskPair(t *testing.T) {
+	t.Parallel()
+
+	t.Run("Should reject run ids that belong to another task", func(t *testing.T) {
+		t.Parallel()
+
+		taskRecord := taskpkg.Task{
+			ID: "task-overlay", ProfileID: store.DefaultProfileID,
+			Scope:       taskpkg.ScopeWorkspace,
+			WorkspaceID: "ws-overlay",
+			Title:       "Overlay task",
+			Status:      taskpkg.TaskStatusInProgress,
+		}
+		mismatchedRun := taskpkg.Run{
+			ID:         "run-other-task",
+			TaskID:     "task-other",
+			Status:     taskpkg.TaskRunStatusRunning,
+			SessionID:  "sess-overlay",
+			QueuedAt:   fixedTime(),
+			ClaimedAt:  fixedTime(),
+			StartedAt:  fixedTime(),
+			LeaseUntil: fixedTime().Add(time.Minute),
+		}
+		cfg := workspaceConfigWithTaskDefaults()
+		service := NewService(Deps{
+			Now: fixedNow,
+			WorkspaceResolver: workspaceResolverFunc(
+				func(context.Context, string) (workspacepkg.ResolvedWorkspace, error) {
+					return workspacepkg.ResolvedWorkspace{
+						ID: "ws-overlay", Name: "Compozy", RootDir: "/work/compozy",
+						Config: cfg,
+					}, nil
+				},
+			),
+			TaskStore: taskStoreStub{
+				tasks: map[string]taskpkg.Task{taskRecord.ID: taskRecord},
+				runs:  []taskpkg.Run{mismatchedRun},
+			},
+		})
+
+		_, err := service.TaskRunPromptOverlayByID(t.Context(), taskRecord.ID, mismatchedRun.ID)
+		if !errors.Is(err, taskpkg.ErrValidation) {
+			t.Fatalf("TaskRunPromptOverlayByID() error = %v, want %v", err, taskpkg.ErrValidation)
+		}
+		if err == nil || !strings.Contains(err.Error(), "belongs to task") {
+			t.Fatalf("TaskRunPromptOverlayByID() error = %v, want mismatched task detail", err)
+		}
+	})
+}
+
+func TestBundleForOperatorTaskRejectsOversizedUntrimmableBundle(t *testing.T) {
+	t.Parallel()
+
+	taskRecord := taskpkg.Task{
+		ID: "task-oversized-bundle", ProfileID: store.DefaultProfileID,
+		Scope:       taskpkg.ScopeWorkspace,
+		WorkspaceID: "ws-oversized-bundle",
+		Title:       strings.Repeat("x", 256),
+		Status:      taskpkg.TaskStatusReady,
+	}
+	cfg := workspaceConfigWithTaskDefaults()
+	cfg.Task.Orchestration.ContextBodyMaxBytes = 64
+	service := NewService(Deps{
+		Now: fixedNow,
+		WorkspaceResolver: workspaceResolverFunc(
+			func(context.Context, string) (workspacepkg.ResolvedWorkspace, error) {
+				return workspacepkg.ResolvedWorkspace{
+					ID:      taskRecord.WorkspaceID,
+					Name:    "Compozy",
+					RootDir: "/work/compozy",
+					Config:  cfg,
+				}, nil
+			},
+		),
+		TaskStore: taskStoreStub{
+			tasks: map[string]taskpkg.Task{taskRecord.ID: taskRecord},
+		},
+	})
+
+	_, err := service.BundleForOperatorTask(t.Context(), taskpkg.OperatorTaskContextRequest{
+		ReadScope: store.ReadScope{ProfileID: store.DefaultProfileID},
+		TaskID:    taskRecord.ID,
+		Now:       fixedTime(),
+	})
+	if !errors.Is(err, taskpkg.ErrPayloadTooLarge) {
+		t.Fatalf("BundleForOperatorTask() error = %v, want %v", err, taskpkg.ErrPayloadTooLarge)
+	}
+	if err == nil || !strings.Contains(err.Error(), "exceeds 64 bytes after trimming") {
+		t.Fatalf("BundleForOperatorTask() error = %v, want oversized bundle detail", err)
+	}
+}
+
+func TestContextForSessionIncludesReviewerTaskBundleWithoutActiveLease(t *testing.T) {
+	t.Parallel()
+
+	t.Run("Should expose review-bound task context without a worker lease", func(t *testing.T) {
+		t.Parallel()
+
+		taskRecord := taskpkg.Task{
+			ID: "task-review", ProfileID: store.DefaultProfileID,
+			Scope:       taskpkg.ScopeWorkspace,
+			WorkspaceID: "ws-review",
+			Title:       "Review context",
+			Status:      taskpkg.TaskStatusInProgress,
+		}
+		run := taskpkg.Run{
+			ID:        "run-reviewed",
+			TaskID:    taskRecord.ID,
+			Status:    taskpkg.TaskRunStatusCompleted,
+			SessionID: "sess-worker",
+
+			StartedAt: fixedTime(),
+			EndedAt:   fixedTime().Add(10 * time.Minute),
+		}
+		review := taskpkg.RunReview{
+			ReviewID:          "review-bound",
+			TaskID:            taskRecord.ID,
+			RunID:             run.ID,
+			Status:            taskpkg.RunReviewStatusInReview,
+			Policy:            taskpkg.ReviewPolicyAlways,
+			ReviewRound:       1,
+			Attempt:           1,
+			ReviewerSessionID: "sess-reviewer",
+			ReviewerAgentName: "reviewer",
+		}
+		service := NewService(Deps{
+			Now: fixedNow,
+			WorkspaceResolver: workspaceResolverFunc(
+				func(context.Context, string) (workspacepkg.ResolvedWorkspace, error) {
+					return workspacepkg.ResolvedWorkspace{
+						ID: "ws-review", Name: "Compozy", RootDir: "/work/compozy",
+						Config: workspaceConfigWithTaskDefaults(),
+					}, nil
+				},
+			),
+			AgentResolver: agentResolverFunc(
+				func(string, *workspacepkg.ResolvedWorkspace) (compozyconfig.AgentDef, error) {
+					return compozyconfig.AgentDef{Name: "reviewer", Provider: "codex", Model: "gpt-review"}, nil
+				},
+			),
+			TaskStore: taskStoreStub{
+				tasks:   map[string]taskpkg.Task{taskRecord.ID: taskRecord},
+				runs:    []taskpkg.Run{run},
+				reviews: map[string]taskpkg.RunReview{review.ReviewID: review},
+			},
+		})
+
+		payload, err := service.ContextForSession(t.Context(), &session.Info{
+			ID:          "sess-reviewer",
+			ProfileID:   store.DefaultProfileID,
+			AgentName:   "reviewer",
+			Provider:    "codex",
+			WorkspaceID: "ws-review",
+			Workspace:   "/work/compozy",
+
+			Type:      session.SessionTypeSystem,
+			State:     session.StateActive,
+			CreatedAt: fixedTime(),
+			UpdatedAt: fixedTime(),
+		})
+		if err != nil {
+			t.Fatalf("ContextForSession(reviewer) error = %v", err)
+		}
+		if !payload.Task.Available || payload.Task.Task == nil || payload.Task.Task.ID != taskRecord.ID {
+			t.Fatalf("Task context = %#v, want review-bound task", payload.Task)
+		}
+		if payload.Task.Lease != nil {
+			t.Fatalf("Task lease = %#v, want no worker lease for reviewer binding", payload.Task.Lease)
+		}
+		if payload.Task.Bundle == nil ||
+			payload.Task.Bundle.CurrentRun == nil ||
+			payload.Task.Bundle.CurrentRun.ID != run.ID {
+			t.Fatalf("Task bundle = %#v, want reviewed run context", payload.Task.Bundle)
+		}
+	})
+
+	t.Run("Should skip review-bound context when the stored run belongs to another task", func(t *testing.T) {
+		t.Parallel()
+
+		taskRecord := taskpkg.Task{
+			ID: "task-review", ProfileID: store.DefaultProfileID,
+			Scope:       taskpkg.ScopeWorkspace,
+			WorkspaceID: "ws-review",
+			Title:       "Review context",
+			Status:      taskpkg.TaskStatusInProgress,
+		}
+		run := taskpkg.Run{
+			ID:        "run-mismatched",
+			TaskID:    "task-other",
+			Status:    taskpkg.TaskRunStatusCompleted,
+			SessionID: "sess-worker",
+
+			StartedAt: fixedTime(),
+			EndedAt:   fixedTime().Add(10 * time.Minute),
+		}
+		review := taskpkg.RunReview{
+			ReviewID:          "review-bound",
+			TaskID:            taskRecord.ID,
+			RunID:             run.ID,
+			Status:            taskpkg.RunReviewStatusInReview,
+			Policy:            taskpkg.ReviewPolicyAlways,
+			ReviewRound:       1,
+			Attempt:           1,
+			ReviewerSessionID: "sess-reviewer",
+			ReviewerAgentName: "reviewer",
+		}
+		service := NewService(Deps{
+			Now: fixedNow,
+			WorkspaceResolver: workspaceResolverFunc(
+				func(context.Context, string) (workspacepkg.ResolvedWorkspace, error) {
+					return workspacepkg.ResolvedWorkspace{
+						ID: "ws-review", Name: "Compozy", RootDir: "/work/compozy",
+						Config: workspaceConfigWithTaskDefaults(),
+					}, nil
+				},
+			),
+			AgentResolver: agentResolverFunc(
+				func(string, *workspacepkg.ResolvedWorkspace) (compozyconfig.AgentDef, error) {
+					return compozyconfig.AgentDef{Name: "reviewer", Provider: "codex", Model: "gpt-review"}, nil
+				},
+			),
+			TaskStore: taskStoreStub{
+				tasks:   map[string]taskpkg.Task{taskRecord.ID: taskRecord},
+				runs:    []taskpkg.Run{run},
+				reviews: map[string]taskpkg.RunReview{review.ReviewID: review},
+			},
+		})
+
+		payload, err := service.ContextForSession(t.Context(), &session.Info{
+			ID:          "sess-reviewer",
+			ProfileID:   store.DefaultProfileID,
+			AgentName:   "reviewer",
+			Provider:    "codex",
+			WorkspaceID: "ws-review",
+			Workspace:   "/work/compozy",
+
+			Type:      session.SessionTypeSystem,
+			State:     session.StateActive,
+			CreatedAt: fixedTime(),
+			UpdatedAt: fixedTime(),
+		})
+		if err != nil {
+			t.Fatalf("ContextForSession(reviewer mismatch) error = %v", err)
+		}
+		if payload.Task.Available || payload.Task.Task != nil || payload.Task.Bundle != nil ||
+			payload.Task.Lease != nil {
+			t.Fatalf("Task context = %#v, want no mismatched review-bound task context", payload.Task)
+		}
+	})
+}
+
+func TestContextForSessionKeepsTaskContextWhenBundleEnrichmentFails(t *testing.T) {
+	t.Parallel()
+
+	t.Run("Should keep active-lease task context when bundle enrichment fails", func(t *testing.T) {
+		t.Parallel()
+
+		taskRecord := taskpkg.Task{
+			ID: "task-bundle-active", ProfileID: store.DefaultProfileID,
+			Scope:       taskpkg.ScopeWorkspace,
+			WorkspaceID: "ws-bundle-active",
+			Title:       "Active lease context",
+			Status:      taskpkg.TaskStatusInProgress,
+		}
+		run := taskpkg.Run{
+			ID:        "run-bundle-active",
+			TaskID:    taskRecord.ID,
+			Status:    taskpkg.TaskRunStatusRunning,
+			SessionID: "sess-active",
+
+			QueuedAt:  fixedTime(),
+			StartedAt: fixedTime().Add(time.Minute),
+		}
+		service := NewService(Deps{
+			Now: fixedNow,
+			WorkspaceResolver: workspaceResolverFunc(
+				func(context.Context, string) (workspacepkg.ResolvedWorkspace, error) {
+					return workspacepkg.ResolvedWorkspace{
+						ID:      taskRecord.WorkspaceID,
+						Name:    "Compozy",
+						RootDir: "/work/compozy",
+						Config:  workspaceConfigWithTaskDefaults(),
+					}, nil
+				},
+			),
+			TaskStore: taskStoreStub{
+				tasks:                   map[string]taskpkg.Task{taskRecord.ID: taskRecord},
+				runs:                    []taskpkg.Run{run},
+				listTaskEventRecordsErr: errors.New("historical event projection broke"),
+			},
+		})
+
+		payload, err := service.ContextForSession(t.Context(), &session.Info{
+			ID:          "sess-active",
+			ProfileID:   store.DefaultProfileID,
+			AgentName:   "coder",
+			Provider:    "codex",
+			WorkspaceID: taskRecord.WorkspaceID,
+			Workspace:   "/work/compozy",
+
+			Type:      session.SessionTypeSystem,
+			State:     session.StateActive,
+			CreatedAt: fixedTime(),
+			UpdatedAt: fixedTime(),
+		})
+		if err != nil {
+			t.Fatalf("ContextForSession(active lease) error = %v", err)
+		}
+		if !payload.Task.Available || payload.Task.Task == nil || payload.Task.Task.ID != taskRecord.ID {
+			t.Fatalf("Task context = %#v, want active task context", payload.Task)
+		}
+		if payload.Task.Bundle != nil {
+			t.Fatalf("Task.Bundle = %#v, want nil optional bundle on enrichment failure", payload.Task.Bundle)
+		}
+		if payload.Task.Lease == nil || payload.Task.Lease.RunID != run.ID {
+			t.Fatalf("Task.Lease = %#v, want active run lease", payload.Task.Lease)
+		}
+	})
+
+	t.Run("Should keep review-bound task context when bundle enrichment fails", func(t *testing.T) {
+		t.Parallel()
+
+		taskRecord := taskpkg.Task{
+			ID: "task-bundle-review", ProfileID: store.DefaultProfileID,
+			Scope:       taskpkg.ScopeWorkspace,
+			WorkspaceID: "ws-bundle-review",
+			Title:       "Review context",
+			Status:      taskpkg.TaskStatusInProgress,
+		}
+		run := taskpkg.Run{
+			ID:        "run-bundle-review",
+			TaskID:    taskRecord.ID,
+			Status:    taskpkg.TaskRunStatusCompleted,
+			SessionID: "sess-worker",
+
+			StartedAt: fixedTime(),
+			EndedAt:   fixedTime().Add(10 * time.Minute),
+		}
+		review := taskpkg.RunReview{
+			ReviewID:          "review-bundle",
+			TaskID:            taskRecord.ID,
+			RunID:             run.ID,
+			Status:            taskpkg.RunReviewStatusInReview,
+			ReviewerSessionID: "sess-reviewer",
+			ReviewerAgentName: "reviewer",
+		}
+		service := NewService(Deps{
+			Now: fixedNow,
+			WorkspaceResolver: workspaceResolverFunc(
+				func(context.Context, string) (workspacepkg.ResolvedWorkspace, error) {
+					return workspacepkg.ResolvedWorkspace{
+						ID:      taskRecord.WorkspaceID,
+						Name:    "Compozy",
+						RootDir: "/work/compozy",
+						Config:  workspaceConfigWithTaskDefaults(),
+					}, nil
+				},
+			),
+			TaskStore: taskStoreStub{
+				tasks:                   map[string]taskpkg.Task{taskRecord.ID: taskRecord},
+				runs:                    []taskpkg.Run{run},
+				reviews:                 map[string]taskpkg.RunReview{review.ReviewID: review},
+				listTaskEventRecordsErr: errors.New("historical event projection broke"),
+			},
+		})
+
+		payload, err := service.ContextForSession(t.Context(), &session.Info{
+			ID:          "sess-reviewer",
+			ProfileID:   store.DefaultProfileID,
+			AgentName:   "reviewer",
+			Provider:    "codex",
+			WorkspaceID: taskRecord.WorkspaceID,
+			Workspace:   "/work/compozy",
+
+			Type:      session.SessionTypeSystem,
+			State:     session.StateActive,
+			CreatedAt: fixedTime(),
+			UpdatedAt: fixedTime(),
+		})
+		if err != nil {
+			t.Fatalf("ContextForSession(review binding) error = %v", err)
+		}
+		if !payload.Task.Available || payload.Task.Task == nil || payload.Task.Task.ID != taskRecord.ID {
+			t.Fatalf("Task context = %#v, want review-bound task context", payload.Task)
+		}
+		if payload.Task.Bundle != nil {
+			t.Fatalf("Task.Bundle = %#v, want nil optional bundle on enrichment failure", payload.Task.Bundle)
+		}
+	})
+}
+
+func TestContextForSessionIncludesCompactSoulProjection(t *testing.T) {
+	t.Parallel()
+
+	t.Run("Should expose compact soul before task without full body", func(t *testing.T) {
+		t.Parallel()
+
+		snapshot := testSituationSoulSnapshot(t, "body-secret-marker")
+		taskRecord := taskpkg.Task{
+			ID: "task-soul", ProfileID: store.DefaultProfileID,
+			Identifier:  "SOUL-1",
+			Scope:       taskpkg.ScopeWorkspace,
+			WorkspaceID: "ws-1",
+			Title:       "Use soul context",
+			Status:      taskpkg.TaskStatusInProgress,
+			Priority:    taskpkg.PriorityMedium,
+			Owner:       &taskpkg.Ownership{Kind: taskpkg.OwnerKindAgentSession, Ref: "sess-1"},
+			UpdatedAt:   fixedTime().Add(time.Minute),
+		}
+		run := taskpkg.Run{
+			ID:        "run-soul",
+			TaskID:    taskRecord.ID,
+			Status:    taskpkg.TaskRunStatusRunning,
+			SessionID: "sess-1",
+			QueuedAt:  fixedTime(),
+			StartedAt: fixedTime().Add(time.Minute),
+		}
+		service := NewService(Deps{
+			Now:          fixedNow,
+			SectionLimit: 3,
+			WorkspaceResolver: workspaceResolverFunc(
+				func(context.Context, string) (workspacepkg.ResolvedWorkspace, error) {
+					return workspacepkg.ResolvedWorkspace{
+						ID: "ws-1", Name: "Compozy", RootDir: "/work/compozy",
+						Config: compozyconfig.Config{Defaults: compozyconfig.DefaultsConfig{Provider: "codex"}},
+					}, nil
+				},
+			),
+			AgentResolver: agentResolverFunc(
+				func(string, *workspacepkg.ResolvedWorkspace) (compozyconfig.AgentDef, error) {
+					return compozyconfig.AgentDef{Name: "coder", Provider: "codex", Model: "gpt-test"}, nil
+				},
+			),
+			TaskStore: taskStoreStub{
+				tasks: map[string]taskpkg.Task{taskRecord.ID: taskRecord},
+				runs:  []taskpkg.Run{run},
+			},
+			SoulSnapshots: soulSnapshotStoreStub{
+				snapshots: map[string]soul.Snapshot{snapshot.ID: snapshot},
+			},
+		})
+
+		payload, err := service.ContextForSession(t.Context(), &session.Info{
+			ID:             "sess-1",
+			ProfileID:      store.DefaultProfileID,
+			AgentName:      "coder",
+			Provider:       "codex",
+			WorkspaceID:    "ws-1",
+			Workspace:      "/work/compozy",
+			Type:           session.SessionTypeUser,
+			State:          session.StateActive,
+			SoulSnapshotID: snapshot.ID,
+			SoulDigest:     snapshot.Digest,
+			CreatedAt:      fixedTime(),
+			UpdatedAt:      fixedTime(),
+		})
+		if err != nil {
+			t.Fatalf("ContextForSession() error = %v", err)
+		}
+
+		if !payload.Soul.Present || !payload.Soul.Active || !payload.Soul.Valid {
+			t.Fatalf("Soul flags = %#v, want present active valid", payload.Soul)
+		}
+		if got, want := payload.Soul.SnapshotID, snapshot.ID; got != want {
+			t.Fatalf("Soul.SnapshotID = %q, want %q", got, want)
+		}
+		if got, want := payload.Soul.Role, "Reviewer"; got != want {
+			t.Fatalf("Soul.Role = %q, want %q", got, want)
+		}
+		if got, want := payload.Soul.Tone, []string{"direct"}; !slices.Equal(got, want) {
+			t.Fatalf("Soul.Tone = %#v, want %#v", got, want)
+		}
+		if got, want := payload.Soul.Principles, []string{"protect correctness"}; !slices.Equal(got, want) {
+			t.Fatalf("Soul.Principles = %#v, want %#v", got, want)
+		}
+		encodedSoul, err := json.Marshal(payload.Soul)
+		if err != nil {
+			t.Fatalf("json.Marshal(Soul) error = %v", err)
+		}
+		if strings.Contains(string(encodedSoul), "body-secret-marker") ||
+			strings.Contains(string(encodedSoul), `"body":`) {
+			t.Fatalf("Soul compact payload leaked full body data: %s", encodedSoul)
+		}
+
+		rendered, err := RenderPrompt(&payload)
+		if err != nil {
+			t.Fatalf("RenderPrompt(context) error = %v", err)
+		}
+		assertOrder(t, rendered, []string{
+			`"self"`,
+			`"workspace"`,
+			`"session"`,
+			`"soul"`,
+			`"task"`,
+			`"capabilities"`,
+			"\n  \"limits\"",
+			`"provenance"`,
+		})
+		if strings.Contains(rendered, "body-secret-marker") || strings.Contains(rendered, `"body":`) {
+			t.Fatalf("RenderPrompt() leaked full soul body: %s", rendered)
+		}
+	})
+}
+
+func TestContextForSessionMissingOptionalServicesOmitsUnavailableSections(t *testing.T) {
+	t.Parallel()
+
+	service := NewService(Deps{
+		Now:          fixedNow,
+		SectionLimit: 3,
+	})
+
+	payload, err := service.ContextForSession(t.Context(), &session.Info{
+		ID:          "sess-1",
+		AgentName:   "coder",
+		Provider:    "codex",
+		WorkspaceID: "ws-1",
+		Workspace:   "/work/compozy",
+		Type:        session.SessionTypeUser,
+		State:       session.StateActive,
+		CreatedAt:   fixedTime(),
+		UpdatedAt:   fixedTime(),
+	})
+	if err != nil {
+		t.Fatalf("ContextForSession() error = %v", err)
+	}
+	if payload.Task.Available {
+		t.Fatalf("Task.Available = true, want false without task store")
+	}
+
+	rendered, err := RenderPrompt(&payload)
+	if err != nil {
+		t.Fatalf("RenderPrompt() error = %v", err)
+	}
+	for _, omitted := range []string{`"task"`} {
+		if strings.Contains(rendered, omitted) {
+			t.Fatalf("RenderPrompt() included unavailable section %s: %s", omitted, rendered)
+		}
+	}
+}
+
+func TestPromptStartupSectionIncludesStartupIdentity(t *testing.T) {
+	t.Parallel()
+
+	service := NewService(Deps{Now: fixedNow, SectionLimit: 4})
+	workspace := &workspacepkg.ResolvedWorkspace{
+		ID: "ws-1", Name: "Compozy", RootDir: "/work/compozy",
+		Config: compozyconfig.Config{Defaults: compozyconfig.DefaultsConfig{Provider: "codex"}},
+	}
+
+	rendered, err := service.PromptStartupSection(
+		t.Context(),
+		session.StartupPromptContext{
+			SessionID:   "sess-start",
+			SessionName: "Startup",
+			AgentName:   "coder",
+			Provider:    "codex",
+			WorkspaceID: "ws-1",
+			Workspace:   "/work/compozy",
+			SessionType: session.SessionTypeUser,
+			CreatedAt:   fixedTime(),
+			UpdatedAt:   fixedTime(),
+		},
+		compozyconfig.AgentDef{Name: "coder", Provider: "codex", Model: "gpt-test"},
+		workspace,
+	)
+	if err != nil {
+		t.Fatalf("PromptStartupSection() error = %v", err)
+	}
+	for _, want := range []string{
+		`"session_id":"sess-start"`,
+		`"agent_name":"coder"`,
+		`"model":"gpt-test"`,
+		`"workspace"`,
+		`"provenance"`,
+	} {
+		if !strings.Contains(rendered, want) {
+			t.Fatalf("PromptStartupSection() = %s, want substring %q", rendered, want)
+		}
+	}
+}
+
+func TestAugmentPrefixesFreshSituationWithoutRewritingMessage(t *testing.T) {
+	t.Parallel()
+
+	service := NewService(Deps{Now: fixedNow, SectionLimit: 2})
+	augmented, err := service.Augment(
+		t.Context(),
+		&session.Session{
+			ID:        "sess-1",
+			AgentName: "coder",
+			Provider:  "codex",
+			Type:      session.SessionTypeUser,
+			State:     session.StateActive,
+			CreatedAt: fixedTime(),
+			UpdatedAt: fixedTime(),
+		},
+		"original prompt",
+	)
+	if err != nil {
+		t.Fatalf("Augment() error = %v", err)
+	}
+	if !strings.HasPrefix(augmented, promptContextOpen) {
+		t.Fatalf("Augment() = %q, want situation context prefix", augmented)
+	}
+	if !strings.HasSuffix(augmented, "original prompt") {
+		t.Fatalf("Augment() = %q, want original message suffix", augmented)
+	}
+	if got := strings.Count(augmented, promptContextOpen); got != 1 {
+		t.Fatalf("situation context occurrences = %d, want 1", got)
+	}
+}
+
+func TestAugmentCompactsRepeatedSituationSections(t *testing.T) {
+	t.Parallel()
+
+	t.Run("Should remind the main once at threshold and rearm after a usage drop", func(t *testing.T) {
+		t.Parallel()
+		observation := ContextObservation{Known: true, Main: true, Size: 100, Threshold: .8}
+		service := NewService(
+			Deps{
+				Now:          fixedNow,
+				ContextUsage: func(context.Context, *session.Info) (ContextObservation, error) { return observation, nil },
+			},
+		)
+		sess := newSituationCompactionSession()
+		for _, step := range []struct {
+			used                      int64
+			known, main, remind, full bool
+		}{
+			{79, true, true, false, true}, {80, true, true, true, false}, {90, true, true, false, false},
+			{20, true, true, false, true}, {80, true, true, true, false}, {99, false, true, false, false},
+			{99, true, false, false, false},
+		} {
+			observation.Used, observation.Known, observation.Main = step.used, step.known, step.main
+			got, err := service.Augment(t.Context(), sess, "continue")
+			if err != nil {
+				t.Fatal(err)
+			}
+			if strings.Contains(got, "<compozy-context-reminder>") != step.remind {
+				t.Fatalf("reminder mismatch at %+v: %s", step, got)
+			}
+			if strings.Contains(got, `"unchanged":true`) == step.full {
+				t.Fatalf("full sections mismatch at %+v: %s", step, got)
+			}
+		}
+	})
+
+	t.Run("Should restore full sections once after each completed compaction", func(t *testing.T) {
+		t.Parallel()
+		var boundary int64
+		service := NewService(
+			Deps{
+				Now:                fixedNow,
+				CompactionBoundary: func(context.Context, string) (*int64, error) { return new(boundary), nil },
+			},
+		)
+		sess := newSituationCompactionSession()
+		for _, step := range []struct {
+			boundary     int64
+			full, notice bool
+		}{
+			{0, true, false}, {0, false, false}, {42, true, true}, {42, false, false}, {84, true, true},
+		} {
+			boundary = step.boundary
+			got, err := service.Augment(t.Context(), sess, "continue")
+			if err != nil {
+				t.Fatal(err)
+			}
+			if strings.Contains(got, `"unchanged":true`) == step.full {
+				t.Fatalf("full sections mismatch at boundary %d: %s", boundary, got)
+			}
+			if strings.Contains(got, "<compozy-context-notice>") != step.notice {
+				t.Fatalf("notice mismatch at boundary %d: %s", boundary, got)
+			}
+			if !strings.HasSuffix(got, "continue") {
+				t.Fatal("original input lost")
+			}
+		}
+	})
+
+	t.Run("Should compact unchanged sections for the same ACP session and workspace", func(t *testing.T) {
+		t.Parallel()
+
+		service := NewService(Deps{Now: fixedNow, SectionLimit: 2})
+		sess := newSituationCompactionSession()
+		first, err := service.Augment(t.Context(), sess, "first prompt")
+		if err != nil {
+			t.Fatalf("Augment(first) error = %v", err)
+		}
+		if strings.Contains(first, `"unchanged":true`) {
+			t.Fatalf("Augment(first) = %s, want full sections", first)
+		}
+		if !strings.Contains(first, `"agent_name":"coder"`) {
+			t.Fatalf("Augment(first) = %s, want full self section", first)
+		}
+
+		second, err := service.Augment(t.Context(), sess, "second prompt")
+		if err != nil {
+			t.Fatalf("Augment(second) error = %v", err)
+		}
+		for _, want := range []string{
+			`"unchanged":true`,
+			`"section":"self"`,
+			`"reuse":"previous_full_section_same_acp_session"`,
+		} {
+			if !strings.Contains(second, want) {
+				t.Fatalf("Augment(second) = %s, want %q", second, want)
+			}
+		}
+		if strings.Contains(second, `"agent_name":"coder"`) {
+			t.Fatalf("Augment(second) = %s, want compact self section", second)
+		}
+		if !strings.HasSuffix(second, "second prompt") {
+			t.Fatalf("Augment(second) = %q, want second prompt suffix", second)
+		}
+	})
+
+	t.Run("Should refresh changed sections while compacting stable identity", func(t *testing.T) {
+		t.Parallel()
+
+		service := NewService(Deps{Now: fixedNow, SectionLimit: 2})
+		sess := newSituationCompactionSession()
+		if _, err := service.Augment(t.Context(), sess, "first prompt"); err != nil {
+			t.Fatalf("Augment(first) error = %v", err)
+		}
+		sess.UpdatedAt = fixedTime().Add(time.Minute)
+
+		second, err := service.Augment(t.Context(), sess, "second prompt")
+		if err != nil {
+			t.Fatalf("Augment(second) error = %v", err)
+		}
+		if !strings.Contains(second, `"section":"self"`) {
+			t.Fatalf("Augment(second) = %s, want stable self section compacted", second)
+		}
+		if strings.Contains(second, `"section":"session"`) {
+			t.Fatalf("Augment(second) = %s, want changed session section refreshed", second)
+		}
+		if !strings.Contains(second, `"updated_at":"2026-04-26T12:01:00Z"`) {
+			t.Fatalf("Augment(second) = %s, want refreshed session updated_at", second)
+		}
+	})
+
+	t.Run("Should reset compaction when ACP session changes", func(t *testing.T) {
+		t.Parallel()
+
+		service := NewService(Deps{Now: fixedNow, SectionLimit: 2})
+		sess := newSituationCompactionSession()
+		if _, err := service.Augment(t.Context(), sess, "first prompt"); err != nil {
+			t.Fatalf("Augment(first) error = %v", err)
+		}
+		sess.ACPSessionID = "acp-2"
+
+		second, err := service.Augment(t.Context(), sess, "second prompt")
+		if err != nil {
+			t.Fatalf("Augment(second) error = %v", err)
+		}
+		if strings.Contains(second, `"unchanged":true`) {
+			t.Fatalf("Augment(second after ACP reset) = %s, want full sections", second)
+		}
+		if !strings.Contains(second, `"agent_name":"coder"`) {
+			t.Fatalf("Augment(second after ACP reset) = %s, want full self section", second)
+		}
+	})
+}
+
+func TestSituationHelperBranches(t *testing.T) {
+	t.Parallel()
+
+	service := NewService(Deps{Now: fixedNow})
+	if got, err := service.Augment(t.Context(), nil, "message"); err != nil || got != "message" {
+		t.Fatalf("Augment(nil session) = %q, %v; want original message", got, err)
+	}
+	canceledCtx, cancel := context.WithCancel(t.Context())
+	cancel()
+	if _, err := service.ContextForSession(canceledCtx, &session.Info{ID: "sess-1"}); err == nil {
+		t.Fatal("ContextForSession(canceled ctx) error = nil, want validation error")
+	}
+	if !isContextError(context.Canceled) {
+		t.Fatal("isContextError(context.Canceled) = false, want true")
+	}
+	if !isContextError(context.DeadlineExceeded) {
+		t.Fatal("isContextError(context.DeadlineExceeded) = false, want true")
+	}
+}
+
+func TestSelectionPreviewAndBoundingHelpers(t *testing.T) {
+	t.Parallel()
+
+	queuedAt := fixedTime()
+	runs := []taskpkg.Run{
+		{ID: "done", Status: taskpkg.TaskRunStatusCompleted, QueuedAt: queuedAt.Add(4 * time.Minute)},
+		{ID: "queued", Status: taskpkg.TaskRunStatusQueued, QueuedAt: queuedAt.Add(3 * time.Minute)},
+		{ID: "claimed", Status: taskpkg.TaskRunStatusClaimed, QueuedAt: queuedAt.Add(2 * time.Minute)},
+		{ID: "starting", Status: taskpkg.TaskRunStatusStarting, QueuedAt: queuedAt.Add(time.Minute)},
+		{ID: "running", Status: taskpkg.TaskRunStatusRunning, StartedAt: queuedAt.Add(5 * time.Minute)},
+	}
+	selected, ok := selectActiveRun(runs)
+	if !ok || selected.ID != "running" {
+		t.Fatalf("selectActiveRun() = %#v, %v; want running", selected, ok)
+	}
+	if _, ok := selectActiveRun([]taskpkg.Run{{ID: "done", Status: taskpkg.TaskRunStatusCompleted}}); ok {
+		t.Fatal("selectActiveRun(terminal) ok = true, want false")
+	}
+	if got := activeRunRank(taskpkg.TaskRunStatusCanceled); got != -1 {
+		t.Fatalf("activeRunRank(canceled) = %d, want -1", got)
+	}
+	if got := runActivityTime(taskpkg.Run{QueuedAt: queuedAt, StartedAt: queuedAt.Add(time.Minute)}); !got.Equal(
+		queuedAt.Add(time.Minute),
+	) {
+		t.Fatalf("runActivityTime() = %s, want latest start", got)
+	}
+
+	long := strings.Repeat("x", 30)
+	if got := truncateRunes(long, 12); utf8.RuneCountInString(got) != 12 || !strings.HasSuffix(got, "...") {
+		t.Fatalf("truncateRunes() = %q, want 12-rune ellipsized value", got)
+	}
+	if got, want := truncateRunes("abcdef", 2), ".."; got != want {
+		t.Fatalf("truncateRunes(short limit) = %q, want %q", got, want)
+	}
+}
+
+func assertOrder(t *testing.T, value string, tokens []string) {
+	t.Helper()
+
+	last := -1
+	for _, token := range tokens {
+		index := strings.Index(value, token)
+		if index < 0 {
+			t.Fatalf("missing token %q in %s", token, value)
+		}
+		if index <= last {
+			t.Fatalf("token %q appeared out of order in %s", token, value)
+		}
+		last = index
+	}
+}
+
+func fixedNow() time.Time {
+	return fixedTime()
+}
+
+func fixedTime() time.Time {
+	return time.Date(2026, 4, 26, 12, 0, 0, 0, time.UTC)
+}
+
+func newSituationCompactionSession() *session.Session {
+	return &session.Session{
+		ID:           "sess-compact",
+		Name:         "Compaction Session",
+		AgentName:    "coder",
+		Provider:     "codex",
+		WorkspaceID:  "ws-compact",
+		Workspace:    "/work/compozy",
+		Type:         session.SessionTypeUser,
+		State:        session.StateActive,
+		ACPSessionID: "acp-1",
+		CreatedAt:    fixedTime(),
+		UpdatedAt:    fixedTime(),
+	}
+}
+
+func jsonRaw(t *testing.T, value string) json.RawMessage {
+	t.Helper()
+
+	if !json.Valid([]byte(value)) {
+		t.Fatalf("invalid JSON fixture: %s", value)
+	}
+	return json.RawMessage(value)
+}
+
+func workspaceConfigWithTaskDefaults() compozyconfig.Config {
+	return compozyconfig.Config{
+		Defaults: compozyconfig.DefaultsConfig{Provider: "codex"},
+		Task:     compozyconfig.DefaultTaskConfig(),
+	}
+}
+
+type workspaceResolverFunc func(context.Context, string) (workspacepkg.ResolvedWorkspace, error)
+
+func (fn workspaceResolverFunc) Resolve(
+	ctx context.Context,
+	idOrPath string,
+) (workspacepkg.ResolvedWorkspace, error) {
+	return fn(ctx, idOrPath)
+}
+
+type agentResolverFunc func(string, *workspacepkg.ResolvedWorkspace) (compozyconfig.AgentDef, error)
+
+func (fn agentResolverFunc) ResolveAgent(
+	name string,
+	workspace *workspacepkg.ResolvedWorkspace,
+) (compozyconfig.AgentDef, error) {
+	return fn(name, workspace)
+}
+
+type skillRegistryFunc func(context.Context, *workspacepkg.ResolvedWorkspace) ([]*skillspkg.Skill, error)
+
+func (fn skillRegistryFunc) ForWorkspace(
+	ctx context.Context,
+	workspace *workspacepkg.ResolvedWorkspace,
+) ([]*skillspkg.Skill, error) {
+	return fn(ctx, workspace)
+}
+
+func (fn skillRegistryFunc) ForAgent(
+	ctx context.Context,
+	workspace *workspacepkg.ResolvedWorkspace,
+	_ string,
+) ([]*skillspkg.Skill, error) {
+	return fn(ctx, workspace)
+}
+
+type spawnAllowanceResolverFunc func(context.Context, *session.Info) (session.ChildSpawnAllowance, error)
+
+func (fn spawnAllowanceResolverFunc) ChildSpawnAllowance(
+	ctx context.Context,
+	info *session.Info,
+) (session.ChildSpawnAllowance, error) {
+	return fn(ctx, info)
+}
+
+type taskStoreStub struct {
+	tasks                   map[string]taskpkg.Task
+	runs                    []taskpkg.Run
+	events                  []taskpkg.Event
+	profiles                map[string]taskpkg.ExecutionProfile
+	reviews                 map[string]taskpkg.RunReview
+	getTaskErr              error
+	listTaskRunsErr         error
+	getTaskRunErr           error
+	listTaskEventsErr       error
+	listTaskEventRecordsErr error
+	getExecutionProfileErr  error
+	getRunReviewErr         error
+	lookupRunReviewErr      error
+	listRunReviewsErr       error
+	runQueries              *[]taskpkg.RunQuery
+}
+
+func (s taskStoreStub) GetTask(_ context.Context, id string) (taskpkg.Task, error) {
+	if s.getTaskErr != nil {
+		return taskpkg.Task{}, s.getTaskErr
+	}
+	taskRecord, ok := s.tasks[id]
+	if !ok {
+		return taskpkg.Task{}, errors.New("missing task")
+	}
+	taskRecord.LatestEventSeq = s.latestEventSeq(taskRecord.ID)
+	return taskRecord, nil
+}
+
+func (s taskStoreStub) ListTaskRuns(_ context.Context, query taskpkg.RunQuery) ([]taskpkg.Run, error) {
+	if s.runQueries != nil {
+		*s.runQueries = append(*s.runQueries, query)
+	}
+	if err := query.ReadScope.Validate(); err != nil {
+		return nil, err
+	}
+	if s.listTaskRunsErr != nil {
+		return nil, s.listTaskRunsErr
+	}
+	runs := make([]taskpkg.Run, 0, len(s.runs))
+	for _, run := range s.runs {
+		taskRecord, ok := s.tasks[run.TaskID]
+		if !ok {
+			continue
+		}
+		if !query.ReadScope.Matches(taskRecord.ProfileID) {
+			continue
+		}
+		if strings.TrimSpace(query.TaskID) != "" &&
+			strings.TrimSpace(run.TaskID) != strings.TrimSpace(query.TaskID) {
+			continue
+		}
+		if query.Status != taskpkg.TaskRunStatusUnknown && run.Status.Normalize() != query.Status.Normalize() {
+			continue
+		}
+		if strings.TrimSpace(query.SessionID) != "" &&
+			strings.TrimSpace(run.SessionID) != strings.TrimSpace(query.SessionID) {
+			continue
+		}
+		runs = append(runs, run)
+	}
+	if query.Limit > 0 && len(runs) > query.Limit {
+		runs = runs[len(runs)-query.Limit:]
+	}
+	return runs, nil
+}
+
+func (s taskStoreStub) GetTaskRun(_ context.Context, id string) (taskpkg.Run, error) {
+	if s.getTaskRunErr != nil {
+		return taskpkg.Run{}, s.getTaskRunErr
+	}
+	for _, run := range s.runs {
+		if strings.TrimSpace(run.ID) == strings.TrimSpace(id) {
+			return run, nil
+		}
+	}
+	return taskpkg.Run{}, taskpkg.ErrTaskRunNotFound
+}
+
+func (s taskStoreStub) ListTaskEvents(_ context.Context, query taskpkg.EventQuery) ([]taskpkg.Event, error) {
+	if s.listTaskEventsErr != nil {
+		return nil, s.listTaskEventsErr
+	}
+	events := make([]taskpkg.Event, 0, len(s.events))
+	for _, event := range s.events {
+		if strings.TrimSpace(query.TaskID) != "" &&
+			strings.TrimSpace(event.TaskID) != strings.TrimSpace(query.TaskID) {
+			continue
+		}
+		if strings.TrimSpace(query.RunID) != "" &&
+			strings.TrimSpace(event.RunID) != strings.TrimSpace(query.RunID) {
+			continue
+		}
+		if strings.TrimSpace(query.EventType) != "" &&
+			strings.TrimSpace(event.EventType) != strings.TrimSpace(query.EventType) {
+			continue
+		}
+		events = append(events, event)
+	}
+	if query.Limit > 0 && len(events) > query.Limit {
+		events = events[len(events)-query.Limit:]
+	}
+	return events, nil
+}
+
+func (s taskStoreStub) TaskWakeEventExists(context.Context, string, string) (bool, error) {
+	return false, nil
+}
+
+func (s taskStoreStub) ListTaskEventRecords(
+	_ context.Context,
+	query taskpkg.EventRecordQuery,
+) ([]taskpkg.EventRecord, error) {
+	if err := query.Validate("task_event_record_query"); err != nil {
+		return nil, err
+	}
+	if s.listTaskEventRecordsErr != nil {
+		return nil, s.listTaskEventRecordsErr
+	}
+	records := make([]taskpkg.EventRecord, 0, len(s.events))
+	for idx, event := range s.events {
+		if strings.TrimSpace(event.TaskID) != strings.TrimSpace(query.TaskID) {
+			continue
+		}
+		sequence := int64(idx + 1)
+		if sequence <= query.AfterSequence {
+			continue
+		}
+		records = append(records, taskpkg.EventRecord{
+			Sequence: sequence,
+			Event:    event,
+		})
+	}
+	slices.SortStableFunc(records, func(left, right taskpkg.EventRecord) int {
+		if query.Descending {
+			if left.Sequence > right.Sequence {
+				return -1
+			}
+			if left.Sequence < right.Sequence {
+				return 1
+			}
+			return 0
+		}
+		if left.Sequence < right.Sequence {
+			return -1
+		}
+		if left.Sequence > right.Sequence {
+			return 1
+		}
+		return 0
+	})
+	if query.Limit > 0 && len(records) > query.Limit {
+		return append([]taskpkg.EventRecord(nil), records[:query.Limit]...), nil
+	}
+	return records, nil
+}
+
+func (s taskStoreStub) latestEventSeq(taskID string) int64 {
+	var latest int64
+	trimmedTaskID := strings.TrimSpace(taskID)
+	for idx, event := range s.events {
+		if strings.TrimSpace(event.TaskID) != trimmedTaskID {
+			continue
+		}
+		latest = int64(idx + 1)
+	}
+	return latest
+}
+
+func (s taskStoreStub) GetExecutionProfile(_ context.Context, taskID string) (taskpkg.ExecutionProfile, error) {
+	if s.getExecutionProfileErr != nil {
+		return taskpkg.ExecutionProfile{}, s.getExecutionProfileErr
+	}
+	profile, ok := s.profiles[strings.TrimSpace(taskID)]
+	if !ok {
+		return taskpkg.ExecutionProfile{}, taskpkg.ErrExecutionProfileNotFound
+	}
+	return profile, nil
+}
+
+func (s taskStoreStub) GetRunReview(_ context.Context, reviewID string) (taskpkg.RunReview, error) {
+	if s.getRunReviewErr != nil {
+		return taskpkg.RunReview{}, s.getRunReviewErr
+	}
+	review, ok := s.reviews[strings.TrimSpace(reviewID)]
+	if !ok {
+		return taskpkg.RunReview{}, taskpkg.ErrRunReviewNotFound
+	}
+	return review, nil
+}
+
+func (s taskStoreStub) LookupRunReviewBySession(_ context.Context, sessionID string) (taskpkg.RunReview, error) {
+	if s.lookupRunReviewErr != nil {
+		return taskpkg.RunReview{}, s.lookupRunReviewErr
+	}
+	for _, review := range s.reviews {
+		if strings.TrimSpace(review.ReviewerSessionID) == strings.TrimSpace(sessionID) {
+			return review, nil
+		}
+	}
+	return taskpkg.RunReview{}, taskpkg.ErrRunReviewNotFound
+}
+
+func (s taskStoreStub) ListRunReviews(_ context.Context, query taskpkg.RunReviewQuery) ([]taskpkg.RunReview, error) {
+	if s.listRunReviewsErr != nil {
+		return nil, s.listRunReviewsErr
+	}
+	reviews := make([]taskpkg.RunReview, 0, len(s.reviews))
+	for _, review := range s.reviews {
+		if strings.TrimSpace(query.TaskID) != "" &&
+			strings.TrimSpace(review.TaskID) != strings.TrimSpace(query.TaskID) {
+			continue
+		}
+		if strings.TrimSpace(query.RunID) != "" &&
+			strings.TrimSpace(review.RunID) != strings.TrimSpace(query.RunID) {
+			continue
+		}
+		if query.Status != "" && review.Status.Normalize() != query.Status.Normalize() {
+			continue
+		}
+		if strings.TrimSpace(query.ReviewerSessionID) != "" &&
+			strings.TrimSpace(review.ReviewerSessionID) != strings.TrimSpace(query.ReviewerSessionID) {
+			continue
+		}
+		reviews = append(reviews, review)
+	}
+	slices.SortFunc(reviews, func(left, right taskpkg.RunReview) int {
+		switch {
+		case left.UpdatedAt.After(right.UpdatedAt):
+			return -1
+		case left.UpdatedAt.Before(right.UpdatedAt):
+			return 1
+		default:
+			return strings.Compare(right.ReviewID, left.ReviewID)
+		}
+	})
+	if query.Limit > 0 && len(reviews) > query.Limit {
+		reviews = reviews[:query.Limit]
+	}
+	return reviews, nil
+}
+
+type soulSnapshotStoreStub struct {
+	snapshots map[string]soul.Snapshot
+}
+
+func (s soulSnapshotStoreStub) GetSoulSnapshot(_ context.Context, id string) (soul.Snapshot, error) {
+	snapshot, ok := s.snapshots[strings.TrimSpace(id)]
+	if !ok {
+		return soul.Snapshot{}, soul.ErrSnapshotNotFound
+	}
+	return snapshot, nil
+}
+
+func testSituationSoulSnapshot(t *testing.T, body string) soul.Snapshot {
+	t.Helper()
+
+	cfg := compozyconfig.DefaultSoulConfig()
+	resolved, err := soul.Parse(t.Context(), soul.ParseRequest{
+		SourcePath:    "/work/compozy/.compozy/agents/coder/SOUL.md",
+		WorkspaceRoot: "/work/compozy",
+		Content: []byte(strings.Join([]string{
+			"---",
+			"role: Reviewer",
+			"tone:",
+			"  - direct",
+			"principles:",
+			"  - protect correctness",
+			"---",
+			body,
+		}, "\n")),
+		Config: cfg,
+	})
+	if err != nil {
+		t.Fatalf("soul.Parse() error = %v", err)
+	}
+	provenance, err := soul.NewConfigProvenance(cfg, "test")
+	if err != nil {
+		t.Fatalf("NewConfigProvenance() error = %v", err)
+	}
+	snapshot, err := soul.SnapshotFromResolved(
+		"soul-situation",
+		"ws-1",
+		"coder",
+		&resolved,
+		provenance,
+		fixedTime(),
+		"",
+	)
+	if err != nil {
+		t.Fatalf("SnapshotFromResolved() error = %v", err)
+	}
+	return snapshot
+}
+
+// UT-044: the situation layer renders current depth/live counts only when relevant.
+func TestSubagentSituation(t *testing.T) {
+	for _, tc := range []struct {
+		name        string
+		depth, live int
+		want        string
+	}{
+		{"Should render depth and live children", 1, 2, "Subagents: depth 1 · live 2"},
+		{"Should render parent live children", 0, 2, "Subagents: depth 0 · live 2"},
+		{"Should omit unrelated sessions", 0, 0, ""},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			provider := subagentSituationStub{depth: tc.depth, live: tc.live}
+			service := NewService(Deps{Subagents: func() SubagentProvider { return provider }})
+			rendered, err := service.Augment(
+				t.Context(),
+				&session.Session{
+					ID:          "sess",
+					WorkspaceID: "ws",
+					AgentName:   "coder",
+					Provider:    "codex",
+					State:       session.StateActive,
+				},
+				"work",
+			)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if tc.want == "" && strings.Contains(rendered, "Subagents:") ||
+				tc.want != "" && !strings.Contains(rendered, tc.want) {
+				t.Fatalf("rendered = %q", rendered)
+			}
+		})
+	}
+}
+
+type subagentSituationStub struct{ depth, live int }
+
+var _ SubagentProvider = subagentSituationStub{}
+
+func (p subagentSituationStub) GetSubagentByChild(context.Context, string) (store.SessionSubagent, error) {
+	if p.depth == 0 {
+		return store.SessionSubagent{}, store.ErrSubagentNotFound
+	}
+	return store.SessionSubagent{WorkspaceID: "ws", Depth: p.depth}, nil
+}
+func (p subagentSituationStub) Summaries(_ context.Context, ids []string) (map[string]store.SubagentSummary, error) {
+	return map[string]store.SubagentSummary{ids[0]: {Live: p.live}}, nil
+}
+
+func TestContextForSessionReportsTheSessionDefaultModel(t *testing.T) {
+	t.Parallel()
+
+	contextFor := func(t *testing.T, agent compozyconfig.AgentDef, provider string) contract.AgentIdentityPayload {
+		t.Helper()
+		service := NewService(Deps{
+			Now: fixedNow,
+			WorkspaceResolver: workspaceResolverFunc(
+				func(context.Context, string) (workspacepkg.ResolvedWorkspace, error) {
+					return workspacepkg.ResolvedWorkspace{
+						ID: "ws-1", Name: "Compozy", RootDir: "/work/compozy",
+						Config: compozyconfig.Config{Defaults: compozyconfig.DefaultsConfig{
+							Provider: "codex", Model: "gpt-5.6-terra", ReasoningEffort: "high",
+						}},
+					}, nil
+				},
+			),
+			AgentResolver: agentResolverFunc(
+				func(string, *workspacepkg.ResolvedWorkspace) (compozyconfig.AgentDef, error) {
+					return agent, nil
+				},
+			),
+		})
+		payload, err := service.ContextForSession(t.Context(), &session.Info{
+			ID: "sess-1", ProfileID: store.DefaultProfileID, AgentName: agent.Name, Provider: provider,
+			WorkspaceID: "ws-1", Workspace: "/work/compozy", Type: session.SessionTypeUser,
+			State: session.StateActive, CreatedAt: fixedTime(), UpdatedAt: fixedTime(),
+		})
+		if err != nil {
+			t.Fatalf("ContextForSession() error = %v", err)
+		}
+		return payload.Self
+	}
+
+	t.Run("Should report the saved model for a default-provider session", func(t *testing.T) {
+		t.Parallel()
+
+		self := contextFor(t, compozyconfig.AgentDef{Name: "general"}, "codex")
+		if self.Provider != "codex" || self.Model != "gpt-5.6-terra" {
+			t.Fatalf("Self = %s/%s, want codex/gpt-5.6-terra", self.Provider, self.Model)
+		}
+	})
+
+	t.Run("Should keep the saved model off an agent-authored provider", func(t *testing.T) {
+		t.Parallel()
+
+		self := contextFor(t, compozyconfig.AgentDef{Name: "coder", Provider: "claude"}, "claude")
+		if self.Provider != "claude" || self.Model == "gpt-5.6-terra" {
+			t.Fatalf("Self = %s/%s, want claude without the codex session model", self.Provider, self.Model)
+		}
+	})
+}
+
+func TestCapabilitiesForSession(t *testing.T) {
+	t.Parallel()
+	t.Run("Should preserve capability resolution and bounds without unrelated context reads", func(t *testing.T) {
+		t.Parallel()
+		info := &session.Info{
+			ID:          "sess-capabilities",
+			ProfileID:   store.DefaultProfileID,
+			AgentName:   "coder",
+			WorkspaceID: "ws-capabilities",
+			Provider:    "codex",
+		}
+		deps := Deps{
+			SectionLimit: 2,
+			WorkspaceResolver: workspaceResolverFunc(
+				func(_ context.Context, id string) (workspacepkg.ResolvedWorkspace, error) {
+					if id != info.WorkspaceID {
+						t.Fatalf("workspace = %q", id)
+					}
+					return workspacepkg.ResolvedWorkspace{ID: id}, nil
+				},
+			),
+			AgentResolver: agentResolverFunc(
+				func(name string, resolved *workspacepkg.ResolvedWorkspace) (compozyconfig.AgentDef, error) {
+					if name != info.AgentName || resolved.ID != info.WorkspaceID {
+						t.Fatal("capability resolution lost session scope")
+					}
+					return compozyconfig.AgentDef{
+						Name: name,
+						Capabilities: &compozyconfig.CapabilityCatalog{Capabilities: []compozyconfig.CapabilityDef{
+							{ID: " review ", Summary: " Review code "}, {ID: "build", Summary: "Build code"},
+						}},
+					}, nil
+				},
+			),
+			SkillRegistry: skillRegistryFunc(
+				func(_ context.Context, resolved *workspacepkg.ResolvedWorkspace) ([]*skillspkg.Skill, error) {
+					if resolved.ID != info.WorkspaceID {
+						t.Fatal("skill resolution lost workspace")
+					}
+					return []*skillspkg.Skill{{Meta: skillspkg.SkillMeta{Name: "test"}, Enabled: true}}, nil
+				},
+			),
+		}
+		full, err := NewService(deps).ContextForSession(t.Context(), info)
+		if err != nil {
+			t.Fatal(err)
+		}
+		deps.TaskStoreFunc = func() TaskStore { t.Error("capability read resolved task context"); return nil }
+		deps.SoulSnapshotsFunc = func() SoulSnapshotStore { t.Error("capability read resolved soul context"); return nil }
+		deps.SpawnAllowanceFunc = func() SpawnAllowanceResolver { t.Error("capability read resolved spawn limits"); return nil }
+		capabilities, err := NewService(deps).CapabilitiesForSession(t.Context(), info)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if capabilities.Section != full.Capabilities.Section ||
+			!slices.Equal(capabilities.Capabilities, full.Capabilities.Capabilities) {
+			t.Fatalf("capabilities = %#v, full context = %#v", capabilities, full.Capabilities)
+		}
+		if capabilities.Section.Returned != 2 || !capabilities.Section.Truncated ||
+			capabilities.Capabilities[0].ID != "build" {
+			t.Fatalf("capabilities lost ordering or bounds: %#v", capabilities)
+		}
+	})
+	t.Run("Should retain fresh agent capabilities across reads", func(t *testing.T) {
+		t.Parallel()
+		capability := "build"
+		service := NewService(
+			Deps{
+				AgentResolver: agentResolverFunc(
+					func(string, *workspacepkg.ResolvedWorkspace) (compozyconfig.AgentDef, error) {
+						return compozyconfig.AgentDef{
+							Name: "coder",
+							Capabilities: &compozyconfig.CapabilityCatalog{
+								Capabilities: []compozyconfig.CapabilityDef{{ID: capability}},
+							},
+						}, nil
+					},
+				),
+			},
+		)
+		info := &session.Info{AgentName: "coder"}
+		for _, expected := range []string{"build", "review"} {
+			capability = expected
+			result, err := service.CapabilitiesForSession(t.Context(), info)
+			if err != nil || len(result.Capabilities) != 1 || result.Capabilities[0].ID != expected {
+				t.Fatalf("capabilities = %#v, %v", result, err)
+			}
+		}
+	})
+	t.Run("Should propagate cancellation and dependency failures", func(t *testing.T) {
+		t.Parallel()
+		ctx, cancel := context.WithCancel(t.Context())
+		cancel()
+		service := NewService(Deps{})
+		if _, err := service.CapabilitiesForSession(ctx, &session.Info{}); !errors.Is(err, context.Canceled) {
+			t.Fatalf("cancellation = %v", err)
+		}
+		service = NewService(Deps{SkillRegistry: contextErrorSkillRegistry{err: context.DeadlineExceeded}})
+		if _, err := service.CapabilitiesForSession(
+			t.Context(),
+			&session.Info{},
+		); !errors.Is(
+			err,
+			context.DeadlineExceeded,
+		) {
+			t.Fatalf("registry error = %v", err)
+		}
+		if _, err := service.CapabilitiesForSession(t.Context(), nil); err == nil ||
+			err.Error() != "situation: session info is required" {
+			t.Fatalf("nil session error = %v, want situation: session info is required", err)
+		}
+	})
+}

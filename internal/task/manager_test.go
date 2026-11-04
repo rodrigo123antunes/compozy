@@ -1,0 +1,14220 @@
+package task
+
+import (
+	"cmp"
+	"context"
+	"encoding/base64"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"maps"
+	"math"
+	"reflect"
+	"slices"
+	"strconv"
+	"strings"
+	"testing"
+	"time"
+
+	"github.com/compozy/compozy/internal/admission"
+	"github.com/compozy/compozy/internal/diagnostics"
+	hookspkg "github.com/compozy/compozy/internal/hooks"
+
+	storepkg "github.com/compozy/compozy/internal/store"
+	"github.com/compozy/compozy/internal/workspaceaccess"
+)
+
+type inMemoryManagerStore struct {
+	tasks                     map[string]Task
+	blocks                    map[string]map[string]TaskBlock
+	blockRecurrences          map[string]BlockRecurrence
+	dependencies              map[string]map[string]Dependency
+	runs                      map[string]Run
+	externalRunResults        map[string][]byte
+	terminalCommands          map[string]TerminalRunCommand
+	claimTokens               map[string]string
+	triageStates              map[string]TriageState
+	profiles                  map[string]ExecutionProfile
+	reviews                   map[string]RunReview
+	events                    []Event
+	eventSequenceByID         map[string]int64
+	nextEventSequence         int64
+	idempotencyByKey          map[string]RunIdempotency
+	coordinatorCompletionErr  error
+	coordinatorPreCommitErrs  []error
+	coordinatorCompletions    []CoordinatorCompletion
+	coordinatorPublicationErr error
+	coordinatorCompleted      bool
+	coordinatorPlanSuperseded bool
+	lastClaimCriteria         ClaimCriteria
+}
+
+func TestManagerClaimNextRunInjectsTrustedWorkspaceCapacity(t *testing.T) {
+	t.Parallel()
+
+	t.Run("Should replace caller input with manager-owned workspace capacity", func(t *testing.T) {
+		t.Parallel()
+
+		store := newInMemoryManagerStore()
+		manager := newTaskManagerForTestWithOptions(t, store, WithWorkspaceActiveRunCap(16))
+		actor := validActorContext()
+		taskRecord, err := manager.CreateTask(t.Context(), CreateTask{
+			ProfileID: storepkg.DefaultProfileID,
+			Scope:     ScopeGlobal,
+			Title:     "Trusted claim capacity",
+		}, actor)
+		if err != nil {
+			t.Fatalf("CreateTask() error = %v", err)
+		}
+		run, err := manager.EnqueueRun(t.Context(), EnqueueRun{TaskID: taskRecord.ID}, actor)
+		if err != nil {
+			t.Fatalf("EnqueueRun() error = %v", err)
+		}
+
+		if _, err := manager.ClaimNextRun(t.Context(), ClaimCriteria{
+			RunID:                 run.ID,
+			Scope:                 ScopeGlobal,
+			ClaimerSessionID:      "sess-trusted-cap",
+			WorkspaceActiveRunCap: 99,
+		}, actor); err != nil {
+			t.Fatalf("ClaimNextRun() error = %v", err)
+		}
+		if got, want := store.lastClaimCriteria.WorkspaceActiveRunCap, 16; got != want {
+			t.Fatalf("store claim capacity = %d, want trusted manager value %d", got, want)
+		}
+	})
+}
+
+func TestManagerWorkAdmission(t *testing.T) {
+	t.Parallel()
+
+	gate := &admission.Gate{}
+	store := newInMemoryManagerStore()
+	manager := newTaskManagerForTestWithOptions(
+		t,
+		store,
+		WithWorkAdmissionChecker(gate),
+	)
+	operator := validActorContext()
+	worker := agentSessionActorContext("sess-drain-worker")
+
+	claimedTask, err := manager.CreateTask(t.Context(), CreateTask{
+		ProfileID: storepkg.DefaultProfileID,
+		Scope:     ScopeGlobal,
+		Title:     "Already admitted run",
+	}, operator)
+	if err != nil {
+		t.Fatalf("CreateTask(claimed) error = %v", err)
+	}
+	claimedRun, err := manager.EnqueueRun(
+		t.Context(),
+		EnqueueRun{TaskID: claimedTask.ID},
+		operator,
+	)
+	if err != nil {
+		t.Fatalf("EnqueueRun(claimed) error = %v", err)
+	}
+	claimed, err := manager.ClaimNextRun(t.Context(), ClaimCriteria{
+		RunID:            claimedRun.ID,
+		Scope:            ScopeGlobal,
+		ClaimerSessionID: "sess-drain-worker",
+		LeaseDuration:    time.Minute,
+	}, worker)
+	if err != nil {
+		t.Fatalf("ClaimNextRun(claimed) error = %v", err)
+	}
+
+	queuedTask, err := manager.CreateTask(t.Context(), CreateTask{
+		ProfileID: storepkg.DefaultProfileID,
+		Scope:     ScopeGlobal,
+		Title:     "Queued before drain",
+	}, operator)
+	if err != nil {
+		t.Fatalf("CreateTask(queued) error = %v", err)
+	}
+	queuedRun, err := manager.EnqueueRun(
+		t.Context(),
+		EnqueueRun{TaskID: queuedTask.ID},
+		operator,
+	)
+	if err != nil {
+		t.Fatalf("EnqueueRun(queued) error = %v", err)
+	}
+	retryTask, err := manager.CreateTask(t.Context(), CreateTask{
+		ProfileID: storepkg.DefaultProfileID,
+		Scope:     ScopeGlobal,
+		Title:     "Retry source before drain",
+	}, operator)
+	if err != nil {
+		t.Fatalf("CreateTask(retry source) error = %v", err)
+	}
+	retryRun, err := manager.EnqueueRun(
+		t.Context(),
+		EnqueueRun{TaskID: retryTask.ID},
+		operator,
+	)
+	if err != nil {
+		t.Fatalf("EnqueueRun(retry source) error = %v", err)
+	}
+	retrySource := store.runs[retryRun.ID]
+	retrySource.Status = TaskRunStatusFailed
+	store.runs[retryRun.ID] = retrySource
+
+	recoverTask, err := manager.CreateTask(t.Context(), CreateTask{
+		ProfileID: storepkg.DefaultProfileID,
+		Scope:     ScopeGlobal,
+		Title:     "Recovery source before drain",
+	}, operator)
+	if err != nil {
+		t.Fatalf("CreateTask(recovery source) error = %v", err)
+	}
+	recoverRun, err := manager.EnqueueRun(
+		t.Context(),
+		EnqueueRun{TaskID: recoverTask.ID},
+		operator,
+	)
+	if err != nil {
+		t.Fatalf("EnqueueRun(recovery source) error = %v", err)
+	}
+	recoverSource := store.runs[recoverRun.ID]
+	recoverSource.Status = TaskRunStatusNeedsAttention
+	store.runs[recoverRun.ID] = recoverSource
+	runCountBeforeDrain := len(store.runs)
+	gate.Drain()
+
+	if _, err := manager.ClaimNextRun(t.Context(), ClaimCriteria{
+		RunID:            queuedRun.ID,
+		Scope:            ScopeGlobal,
+		ClaimerSessionID: "sess-drain-worker",
+		LeaseDuration:    time.Minute,
+	}, worker); !errors.Is(
+		err,
+		admission.ErrDraining,
+	) {
+		t.Fatalf("ClaimNextRun(draining) error = %v, want ErrDraining", err)
+	}
+	if _, err := manager.EnqueueRun(
+		t.Context(),
+		EnqueueRun{TaskID: queuedTask.ID},
+		operator,
+	); !errors.Is(err, admission.ErrDraining) {
+		t.Fatalf("EnqueueRun(draining) error = %v, want ErrDraining", err)
+	}
+	if _, err := manager.RetryRun(
+		t.Context(),
+		retryRun.ID,
+		RetryRunRequest{},
+		operator,
+	); !errors.Is(err, admission.ErrDraining) {
+		t.Fatalf("RetryRun(draining) error = %v, want ErrDraining", err)
+	}
+	if _, err := manager.RecoverRun(
+		t.Context(),
+		recoverRun.ID,
+		RecoverRunRequest{Reason: "operator recovery"},
+		operator,
+	); !errors.Is(err, admission.ErrDraining) {
+		t.Fatalf("RecoverRun(draining) error = %v, want ErrDraining", err)
+	}
+	if got := len(store.runs); got != runCountBeforeDrain {
+		t.Fatalf("run count after blocked retry/recovery = %d, want unchanged %d", got, runCountBeforeDrain)
+	}
+
+	if _, err := manager.CompleteRunLease(
+		t.Context(),
+		LeaseCompletion{
+			RunID:      claimed.Run.ID,
+			ClaimToken: claimed.ClaimToken,
+			Result:     RunResult{},
+		},
+		worker,
+	); err != nil {
+		t.Fatalf("CompleteRunLease(admitted) error = %v", err)
+	}
+
+	gate.Undrain()
+	if _, err := manager.ClaimNextRun(t.Context(), ClaimCriteria{
+		RunID:            queuedRun.ID,
+		Scope:            ScopeGlobal,
+		ClaimerSessionID: "sess-drain-worker",
+		LeaseDuration:    time.Minute,
+	}, worker); err != nil {
+		t.Fatalf("ClaimNextRun(after undrain) error = %v", err)
+	}
+}
+
+type forceInputStore struct {
+	*inMemoryManagerStore
+	advanceCalls        []string
+	cancelCalls         []forceInputCancelCall
+	nextGeneration      int64
+	pendingCancelCounts map[string]int
+}
+
+type forceInputCancelCall struct {
+	SessionID      string
+	Generation     int64
+	CanceledInputs int
+}
+
+type inMemoryManagerSnapshot struct {
+	tasks             map[string]Task
+	blocks            map[string]map[string]TaskBlock
+	blockRecurrences  map[string]BlockRecurrence
+	dependencies      map[string]map[string]Dependency
+	runs              map[string]Run
+	terminalCommands  map[string]TerminalRunCommand
+	claimTokens       map[string]string
+	triageStates      map[string]TriageState
+	profiles          map[string]ExecutionProfile
+	reviews           map[string]RunReview
+	events            []Event
+	eventSequenceByID map[string]int64
+	nextEventSequence int64
+	idempotencyByKey  map[string]RunIdempotency
+	lastClaimCriteria ClaimCriteria
+}
+
+type testSessionExecutor struct{}
+
+func (testSessionExecutor) StartTaskSession(
+	context.Context,
+	*StartTaskSession,
+) (*SessionRef, error) {
+	return &SessionRef{SessionID: "sess-test"}, nil
+}
+
+func (testSessionExecutor) AttachTaskSession(context.Context, string, string) (*SessionRef, error) {
+	return &SessionRef{SessionID: "sess-test"}, nil
+}
+
+func (testSessionExecutor) RequestTaskStop(context.Context, string, StopReason) error {
+	return nil
+}
+
+func (testSessionExecutor) ForceTaskStop(context.Context, string, StopReason) error {
+	return nil
+}
+
+type forbiddenSessionExecutor struct {
+	startCalls int
+}
+
+func (e *forbiddenSessionExecutor) StartTaskSession(
+	context.Context,
+	*StartTaskSession,
+) (*SessionRef, error) {
+	e.startCalls++
+	return nil, errors.New("session executor must not be called")
+}
+
+func (e *forbiddenSessionExecutor) AttachTaskSession(context.Context, string, string) (*SessionRef, error) {
+	return nil, errors.New("session executor must not be called")
+}
+
+func (e *forbiddenSessionExecutor) RequestTaskStop(context.Context, string, StopReason) error {
+	return nil
+}
+
+func (e *forbiddenSessionExecutor) ForceTaskStop(context.Context, string, StopReason) error {
+	return nil
+}
+
+type recordingCoordinatorRunner struct {
+	calls []RunID
+	plan  CoordinatorCompletionPlan
+	err   error
+}
+
+type recordingCoordinatorPostCommitHandler struct {
+	calls [][]CoordinatorParentCloseSpec
+}
+
+func (h *recordingCoordinatorPostCommitHandler) ApplyCoordinatorPostCommit(
+	_ context.Context,
+	specs []CoordinatorParentCloseSpec,
+	_ []CoordinatorLaneCancelSpec,
+	_ ActorContext,
+) error {
+	h.calls = append(h.calls, append([]CoordinatorParentCloseSpec(nil), specs...))
+	return nil
+}
+
+type recordingCoordinatorTimerArmer struct {
+	timers []CoordinatorTimerSpec
+}
+
+func (a *recordingCoordinatorTimerArmer) ArmCoordinatorTimer(
+	_ context.Context,
+	timer CoordinatorTimerSpec,
+	_ ActorContext,
+) error {
+	a.timers = append(a.timers, timer)
+	return nil
+}
+
+func (r *recordingCoordinatorRunner) Run(_ context.Context, taskRunID RunID) (CoordinatorCompletionPlan, error) {
+	r.calls = append(r.calls, taskRunID)
+	if r.err != nil {
+		return CoordinatorCompletionPlan{}, r.err
+	}
+	return r.plan, nil
+}
+
+type noopLoopFinalizer struct{}
+
+func (noopLoopFinalizer) WriteGenerationSnapshot(context.Context, Tx, GenerationSnapshot) error {
+	return nil
+}
+
+type sessionStopCall struct {
+	SessionID string
+	Reason    StopReason
+}
+
+type attachSessionCall struct {
+	RunID     string
+	SessionID string
+}
+
+type recordingSessionExecutor struct {
+	startCalls   []StartTaskSession
+	attachCalls  []attachSessionCall
+	cleanupCalls []struct {
+		run Run
+		ref SessionRef
+	}
+	requestStopCalls []sessionStopCall
+	forceStopCalls   []sessionStopCall
+	startRef         *SessionRef
+	onStart          func(context.Context, *StartTaskSession)
+	returnNilStart   bool
+	startErr         error
+	attachErr        error
+	requestStopErr   error
+	forceStopErr     error
+	cleanupErr       error
+}
+
+type testRuntimeViewReader struct {
+	sessions map[string]*RunSessionRef
+	events   map[string][]storepkg.SessionEvent
+	stats    map[string][]storepkg.TokenStats
+}
+
+type contextSensitiveEventStore struct {
+	*inMemoryManagerStore
+	getTaskEventRecordCanceled []bool
+	getTaskEventRecordDeadline []bool
+}
+
+type contextSensitiveRunStore struct {
+	*inMemoryManagerStore
+}
+
+type taskMutationDeadlineStore struct {
+	*inMemoryManagerStore
+	deadlines []bool
+}
+
+type adjacentRecoveredEventStore struct {
+	*inMemoryManagerStore
+	adjacent EventRecord
+}
+
+type deleteTaskStore struct {
+	*inMemoryManagerStore
+	getTaskErrByID             map[string]error
+	countDirectChildrenErrByID map[string]error
+	listTaskRunsErrByID        map[string]error
+	listDependentsErrByID      map[string]error
+	deleteTaskErrByID          map[string]error
+}
+
+type recordingTaskEventObserver struct {
+	records []EventRecord
+}
+
+type panickingTaskEventObserver struct {
+	panicValue any
+}
+
+func (r testRuntimeViewReader) GetSession(
+	_ context.Context,
+	sessionID string,
+) (*RunSessionRef, error) {
+	session, ok := r.sessions[strings.TrimSpace(sessionID)]
+	if !ok || session == nil {
+		return nil, ErrTaskRunNotFound
+	}
+	return new(*session), nil
+}
+
+func (r testRuntimeViewReader) ListSessionEvents(
+	_ context.Context,
+	sessionID string,
+	_ storepkg.EventQuery,
+) ([]storepkg.SessionEvent, error) {
+	return append([]storepkg.SessionEvent(nil), r.events[strings.TrimSpace(sessionID)]...), nil
+}
+
+func (r testRuntimeViewReader) ListSessionTokenStats(
+	_ context.Context,
+	sessionID string,
+) ([]storepkg.TokenStats, error) {
+	return append([]storepkg.TokenStats(nil), r.stats[strings.TrimSpace(sessionID)]...), nil
+}
+
+func (s *contextSensitiveEventStore) GetTaskEventRecord(
+	ctx context.Context,
+	eventID string,
+) (EventRecord, error) {
+	s.getTaskEventRecordCanceled = append(
+		s.getTaskEventRecordCanceled,
+		ctx != nil && ctx.Err() != nil,
+	)
+	_, hasDeadline := ctx.Deadline()
+	s.getTaskEventRecordDeadline = append(s.getTaskEventRecordDeadline, hasDeadline)
+	if ctx != nil && ctx.Err() != nil {
+		return EventRecord{}, ctx.Err()
+	}
+	return s.inMemoryManagerStore.GetTaskEventRecord(ctx, eventID)
+}
+
+func (s *contextSensitiveRunStore) UpdateNonTerminalTaskRun(ctx context.Context, run Run) error {
+	if ctx != nil && ctx.Err() != nil {
+		return ctx.Err()
+	}
+	return s.inMemoryManagerStore.UpdateNonTerminalTaskRun(ctx, run)
+}
+
+func (s *taskMutationDeadlineStore) WithTaskMutationTransaction(
+	ctx context.Context,
+	action string,
+	mutation RunMutation,
+) error {
+	_, hasDeadline := ctx.Deadline()
+	s.deadlines = append(s.deadlines, hasDeadline)
+	return s.inMemoryManagerStore.WithTaskMutationTransaction(ctx, action, mutation)
+}
+
+func (s *adjacentRecoveredEventStore) ClearTaskNeedsAttention(
+	ctx context.Context,
+	mutation NeedsAttentionClearMutation,
+) (NeedsAttentionClearResult, error) {
+	result, err := s.inMemoryManagerStore.ClearTaskNeedsAttention(ctx, mutation)
+	if err != nil {
+		return NeedsAttentionClearResult{}, err
+	}
+	adjacentAt := result.Event.Event.Timestamp.Add(time.Nanosecond)
+	if err := s.appendTaskEventForTest(
+		result.Task.ID,
+		"",
+		taskWatchEventRecovered,
+		mutation.Actor,
+		map[string]any{"at": adjacentAt},
+		adjacentAt,
+	); err != nil {
+		return NeedsAttentionClearResult{}, err
+	}
+	adjacentID := fmt.Sprintf("evt-%d", s.nextEventSequence)
+	s.adjacent, err = s.GetTaskEventRecord(ctx, adjacentID)
+	if err != nil {
+		return NeedsAttentionClearResult{}, err
+	}
+	return result, nil
+}
+
+func (o *recordingTaskEventObserver) OnTaskEvent(_ context.Context, record EventRecord) {
+	o.records = append(o.records, record)
+}
+
+func (o *panickingTaskEventObserver) OnTaskEvent(_ context.Context, _ EventRecord) {
+	panic(o.panicValue)
+}
+
+func newDeleteTaskStore() *deleteTaskStore {
+	return &deleteTaskStore{
+		inMemoryManagerStore:       newInMemoryManagerStore(),
+		getTaskErrByID:             make(map[string]error),
+		countDirectChildrenErrByID: make(map[string]error),
+		listTaskRunsErrByID:        make(map[string]error),
+		listDependentsErrByID:      make(map[string]error),
+		deleteTaskErrByID:          make(map[string]error),
+	}
+}
+
+func (s *deleteTaskStore) WithDeleteTaskTransaction(
+	_ context.Context,
+	fn func(DeleteTaskMutationStore) error,
+) error {
+	snapshot := s.snapshot()
+	if err := fn(s); err != nil {
+		s.restore(snapshot)
+		return err
+	}
+	return nil
+}
+
+func (s *deleteTaskStore) GetTask(ctx context.Context, id string) (Task, error) {
+	if err, ok := s.getTaskErrByID[strings.TrimSpace(id)]; ok {
+		return Task{}, err
+	}
+	return s.inMemoryManagerStore.GetTask(ctx, id)
+}
+
+func (s *deleteTaskStore) CountDirectChildren(
+	ctx context.Context,
+	parentTaskID string,
+) (int, error) {
+	if err, ok := s.countDirectChildrenErrByID[strings.TrimSpace(parentTaskID)]; ok {
+		return 0, err
+	}
+	return s.inMemoryManagerStore.CountDirectChildren(ctx, parentTaskID)
+}
+
+func (s *deleteTaskStore) ListTaskRuns(ctx context.Context, query RunQuery) ([]Run, error) {
+	if err, ok := s.listTaskRunsErrByID[strings.TrimSpace(query.TaskID)]; ok {
+		return nil, err
+	}
+	return s.inMemoryManagerStore.ListTaskRuns(ctx, query)
+}
+
+func (s *deleteTaskStore) ListDependents(
+	ctx context.Context,
+	dependsOnTaskID string,
+) ([]Dependency, error) {
+	if err, ok := s.listDependentsErrByID[strings.TrimSpace(dependsOnTaskID)]; ok {
+		return nil, err
+	}
+	return s.inMemoryManagerStore.ListDependents(ctx, dependsOnTaskID)
+}
+
+func (s *deleteTaskStore) DeleteTask(ctx context.Context, id string) error {
+	if err, ok := s.deleteTaskErrByID[strings.TrimSpace(id)]; ok {
+		return err
+	}
+	return s.inMemoryManagerStore.DeleteTask(ctx, id)
+}
+
+func (e *recordingSessionExecutor) StartTaskSession(
+	ctx context.Context,
+	spec *StartTaskSession,
+) (*SessionRef, error) {
+	if spec == nil {
+		return nil, fmtTestError("%w: start task session spec is required", ErrValidation)
+	}
+	e.startCalls = append(e.startCalls, *spec)
+	if e.onStart != nil {
+		e.onStart(ctx, spec)
+	}
+	if e.startErr != nil {
+		return nil, e.startErr
+	}
+	if e.returnNilStart {
+		return nil, nil
+	}
+	if e.startRef != nil {
+		return new(*e.startRef), nil
+	}
+	return &SessionRef{SessionID: "sess-start-" + strconv.Itoa(len(e.startCalls))}, nil
+}
+
+func (e *recordingSessionExecutor) AttachTaskSession(
+	_ context.Context,
+	runID string,
+	sessionID string,
+) (*SessionRef, error) {
+	e.attachCalls = append(e.attachCalls, attachSessionCall{RunID: runID, SessionID: sessionID})
+	if e.attachErr != nil {
+		return nil, e.attachErr
+	}
+	return &SessionRef{SessionID: sessionID}, nil
+}
+
+func (e *recordingSessionExecutor) RequestTaskStop(
+	_ context.Context,
+	sessionID string,
+	reason StopReason,
+) error {
+	e.requestStopCalls = append(
+		e.requestStopCalls,
+		sessionStopCall{SessionID: sessionID, Reason: reason},
+	)
+	return e.requestStopErr
+}
+
+func (e *recordingSessionExecutor) ForceTaskStop(
+	_ context.Context,
+	sessionID string,
+	reason StopReason,
+) error {
+	e.forceStopCalls = append(
+		e.forceStopCalls,
+		sessionStopCall{SessionID: sessionID, Reason: reason},
+	)
+	return e.forceStopErr
+}
+
+func (e *recordingSessionExecutor) CleanupUnboundTaskSession(
+	_ context.Context,
+	run Run,
+	ref SessionRef,
+) error {
+	e.cleanupCalls = append(e.cleanupCalls, struct {
+		run Run
+		ref SessionRef
+	}{run: run, ref: ref})
+	return e.cleanupErr
+}
+
+func newInMemoryManagerStore() *inMemoryManagerStore {
+	return &inMemoryManagerStore{
+		tasks:              make(map[string]Task),
+		blocks:             make(map[string]map[string]TaskBlock),
+		blockRecurrences:   make(map[string]BlockRecurrence),
+		dependencies:       make(map[string]map[string]Dependency),
+		runs:               make(map[string]Run),
+		externalRunResults: make(map[string][]byte),
+		terminalCommands:   make(map[string]TerminalRunCommand),
+		claimTokens:        make(map[string]string),
+		triageStates:       make(map[string]TriageState),
+		profiles:           make(map[string]ExecutionProfile),
+		reviews:            make(map[string]RunReview),
+		events:             make([]Event, 0),
+		eventSequenceByID:  make(map[string]int64),
+		idempotencyByKey:   make(map[string]RunIdempotency),
+	}
+}
+
+func newForceInputStore() *forceInputStore {
+	return &forceInputStore{
+		inMemoryManagerStore: newInMemoryManagerStore(),
+		pendingCancelCounts:  make(map[string]int),
+	}
+}
+
+func (s *forceInputStore) AdvanceSessionInputGeneration(
+	_ context.Context,
+	sessionID string,
+	_ time.Time,
+) (int64, error) {
+	s.nextGeneration++
+	s.advanceCalls = append(s.advanceCalls, strings.TrimSpace(sessionID))
+	return s.nextGeneration, nil
+}
+
+func (s *forceInputStore) CancelPendingSessionInputs(
+	_ context.Context,
+	sessionID string,
+	generation int64,
+	_ time.Time,
+) (int, error) {
+	trimmed := strings.TrimSpace(sessionID)
+	canceled := s.pendingCancelCounts[trimmed]
+	s.pendingCancelCounts[trimmed] = 0
+	s.cancelCalls = append(s.cancelCalls, forceInputCancelCall{
+		SessionID:      trimmed,
+		Generation:     generation,
+		CanceledInputs: canceled,
+	})
+	return canceled, nil
+}
+
+func (s *forceInputStore) InvalidateForceRunInputs(
+	ctx context.Context,
+	sessionID string,
+	now time.Time,
+) (ForceRunInputInvalidation, error) {
+	generation, err := s.AdvanceSessionInputGeneration(ctx, sessionID, now)
+	if err != nil {
+		return ForceRunInputInvalidation{}, err
+	}
+	canceled, err := s.CancelPendingSessionInputs(ctx, sessionID, generation, now)
+	if err != nil {
+		return ForceRunInputInvalidation{}, err
+	}
+	return ForceRunInputInvalidation{QueueGeneration: generation, CanceledInputs: canceled}, nil
+}
+
+func (s *forceInputStore) WithTaskMutationTransaction(
+	_ context.Context,
+	_ string,
+	mutation RunMutation,
+) error {
+	storeSnapshot := s.snapshot()
+	advanceCalls := slices.Clone(s.advanceCalls)
+	cancelCalls := slices.Clone(s.cancelCalls)
+	nextGeneration := s.nextGeneration
+	pendingCancelCounts := maps.Clone(s.pendingCancelCounts)
+	if err := mutation(s); err != nil {
+		s.restore(storeSnapshot)
+		s.advanceCalls = advanceCalls
+		s.cancelCalls = cancelCalls
+		s.nextGeneration = nextGeneration
+		s.pendingCancelCounts = pendingCancelCounts
+		return err
+	}
+	return nil
+}
+
+func (s *inMemoryManagerStore) WithDeleteTaskTransaction(
+	_ context.Context,
+	fn func(DeleteTaskMutationStore) error,
+) error {
+	snapshot := s.snapshot()
+	if err := fn(s); err != nil {
+		s.restore(snapshot)
+		return err
+	}
+	return nil
+}
+
+func (s *inMemoryManagerStore) WithLeaseSettlementTransaction(
+	_ context.Context,
+	_ string,
+	fn func(LeaseSettlementMutationStore) error,
+) error {
+	snapshot := s.snapshot()
+	if err := fn(s); err != nil {
+		s.restore(snapshot)
+		return err
+	}
+	return nil
+}
+
+func (s *inMemoryManagerStore) WithTaskExecutionTransaction(
+	_ context.Context,
+	fn func(ExecutionMutationStore) error,
+) error {
+	snapshot := s.snapshot()
+	if err := fn(s); err != nil {
+		s.restore(snapshot)
+		return err
+	}
+	return nil
+}
+
+func (s *inMemoryManagerStore) WithTaskMutationTransaction(
+	_ context.Context,
+	_ string,
+	mutation RunMutation,
+) error {
+	snapshot := s.snapshot()
+	if err := mutation(s); err != nil {
+		s.restore(snapshot)
+		return err
+	}
+	return nil
+}
+
+func (s *inMemoryManagerStore) snapshot() inMemoryManagerSnapshot {
+	tasks := make(map[string]Task, len(s.tasks))
+	for id, record := range s.tasks {
+		tasks[id] = cloneTask(record)
+	}
+
+	blocks := make(map[string]map[string]TaskBlock, len(s.blocks))
+	for taskID, taskBlocks := range s.blocks {
+		copiedBlocks := make(map[string]TaskBlock, len(taskBlocks))
+		for blockID, block := range taskBlocks {
+			copiedBlocks[blockID] = cloneTaskBlock(block)
+		}
+		blocks[taskID] = copiedBlocks
+	}
+
+	blockRecurrences := make(map[string]BlockRecurrence, len(s.blockRecurrences))
+	maps.Copy(blockRecurrences, s.blockRecurrences)
+
+	dependencies := make(map[string]map[string]Dependency, len(s.dependencies))
+	for taskID, edges := range s.dependencies {
+		copiedEdges := make(map[string]Dependency, len(edges))
+		maps.Copy(copiedEdges, edges)
+		dependencies[taskID] = copiedEdges
+	}
+
+	runs := make(map[string]Run, len(s.runs))
+	for id, record := range s.runs {
+		runs[id] = cloneTaskRun(record)
+	}
+	terminalCommands := maps.Clone(s.terminalCommands)
+	claimTokens := maps.Clone(s.claimTokens)
+
+	triageStates := make(map[string]TriageState, len(s.triageStates))
+	for key, record := range s.triageStates {
+		triageStates[key] = cloneTriageState(record)
+	}
+
+	profiles := make(map[string]ExecutionProfile, len(s.profiles))
+	for key := range s.profiles {
+		record := s.profiles[key]
+		profiles[key] = cloneExecutionProfile(&record)
+	}
+
+	reviews := make(map[string]RunReview, len(s.reviews))
+	for key := range s.reviews {
+		record := s.reviews[key]
+		reviews[key] = cloneRunReview(&record)
+	}
+
+	events := make([]Event, 0, len(s.events))
+	for _, event := range s.events {
+		events = append(events, cloneTaskEvent(event))
+	}
+
+	eventSequenceByID := make(map[string]int64, len(s.eventSequenceByID))
+	maps.Copy(eventSequenceByID, s.eventSequenceByID)
+
+	idempotencyByKey := make(map[string]RunIdempotency, len(s.idempotencyByKey))
+	maps.Copy(idempotencyByKey, s.idempotencyByKey)
+
+	return inMemoryManagerSnapshot{
+		tasks:             tasks,
+		blocks:            blocks,
+		blockRecurrences:  blockRecurrences,
+		dependencies:      dependencies,
+		runs:              runs,
+		terminalCommands:  terminalCommands,
+		claimTokens:       claimTokens,
+		triageStates:      triageStates,
+		profiles:          profiles,
+		reviews:           reviews,
+		events:            events,
+		eventSequenceByID: eventSequenceByID,
+		nextEventSequence: s.nextEventSequence,
+		idempotencyByKey:  idempotencyByKey,
+		lastClaimCriteria: s.lastClaimCriteria,
+	}
+}
+
+func (s *inMemoryManagerStore) restore(snapshot inMemoryManagerSnapshot) {
+	s.tasks = snapshot.tasks
+	s.blocks = snapshot.blocks
+	s.blockRecurrences = snapshot.blockRecurrences
+	s.dependencies = snapshot.dependencies
+	s.runs = snapshot.runs
+	s.terminalCommands = snapshot.terminalCommands
+	s.claimTokens = snapshot.claimTokens
+	s.triageStates = snapshot.triageStates
+	s.profiles = snapshot.profiles
+	s.reviews = snapshot.reviews
+	s.events = snapshot.events
+	s.eventSequenceByID = snapshot.eventSequenceByID
+	s.nextEventSequence = snapshot.nextEventSequence
+	s.idempotencyByKey = snapshot.idempotencyByKey
+	s.lastClaimCriteria = snapshot.lastClaimCriteria
+}
+
+func (s *inMemoryManagerStore) CreateTask(_ context.Context, taskRecord Task) error {
+	if _, exists := s.tasks[taskRecord.ID]; exists {
+		return fmtTestError("%w: duplicate task %q", ErrValidation, taskRecord.ID)
+	}
+	s.tasks[taskRecord.ID] = cloneTask(taskRecord)
+	return nil
+}
+
+func (s *inMemoryManagerStore) DeleteTask(_ context.Context, id string) error {
+	taskID := strings.TrimSpace(id)
+	if _, exists := s.tasks[taskID]; !exists {
+		return ErrTaskNotFound
+	}
+
+	delete(s.tasks, taskID)
+	delete(s.blocks, taskID)
+	delete(s.dependencies, taskID)
+	delete(s.profiles, taskID)
+	for reviewID, review := range s.reviews {
+		if review.TaskID == taskID {
+			delete(s.reviews, reviewID)
+		}
+	}
+	triagePrefix := taskID + "|"
+	for key := range s.triageStates {
+		if strings.HasPrefix(key, triagePrefix) {
+			delete(s.triageStates, key)
+		}
+	}
+
+	for dependentID, edges := range s.dependencies {
+		delete(edges, taskID)
+		if len(edges) == 0 {
+			delete(s.dependencies, dependentID)
+		}
+	}
+
+	for runID, run := range s.runs {
+		if run.TaskID == taskID {
+			delete(s.runs, runID)
+		}
+	}
+
+	filteredEvents := s.events[:0]
+	for _, event := range s.events {
+		if event.TaskID == taskID {
+			delete(s.eventSequenceByID, event.ID)
+			continue
+		}
+		filteredEvents = append(filteredEvents, event)
+	}
+	s.events = filteredEvents
+
+	for key, record := range s.idempotencyByKey {
+		if run, ok := s.runs[record.RunID]; !ok || run.TaskID == taskID {
+			delete(s.idempotencyByKey, key)
+		}
+	}
+
+	return nil
+}
+
+func (s *inMemoryManagerStore) UpdateTask(_ context.Context, taskRecord Task, _ ActorContext) error {
+	if _, exists := s.tasks[taskRecord.ID]; !exists {
+		return ErrTaskNotFound
+	}
+	s.tasks[taskRecord.ID] = cloneTask(taskRecord)
+	return nil
+}
+
+func (s *inMemoryManagerStore) GetTask(_ context.Context, id string) (Task, error) {
+	if s.coordinatorCompleted && s.coordinatorPublicationErr != nil {
+		return Task{}, s.coordinatorPublicationErr
+	}
+	record, ok := s.tasks[strings.TrimSpace(id)]
+	if !ok {
+		return Task{}, ErrTaskNotFound
+	}
+	cloned := cloneTask(record)
+	cloned.LatestEventSeq = s.latestEventSeq(cloned.ID)
+	return cloned, nil
+}
+
+func (s *inMemoryManagerStore) ListTasks(_ context.Context, query Query) ([]Summary, error) {
+	if err := query.Validate("task_query"); err != nil {
+		return nil, err
+	}
+
+	normalized := query
+	normalized.Scope = normalized.Scope.Normalize()
+	normalized.WorkspaceID = strings.TrimSpace(normalized.WorkspaceID)
+	normalized.Status = normalized.Status.Normalize()
+	normalized.Priority = normalized.Priority.Normalize()
+	normalized.ApprovalState = normalized.ApprovalState.Normalize()
+	normalized.OwnerKind = normalized.OwnerKind.Normalize()
+	normalized.OwnerRef = strings.TrimSpace(normalized.OwnerRef)
+	normalized.ParentTaskID = strings.TrimSpace(normalized.ParentTaskID)
+	normalized.Search = strings.ToLower(strings.TrimSpace(normalized.Search))
+
+	summaries := make([]Summary, 0)
+	for _, record := range s.tasks {
+		if normalized.Scope.Normalize() != "" && record.Scope != normalized.Scope {
+			continue
+		}
+		if normalized.WorkspaceID != "" && record.WorkspaceID != normalized.WorkspaceID {
+			continue
+		}
+		if normalized.Status.Normalize() != "" && record.Status != normalized.Status {
+			continue
+		}
+		if normalized.Priority.Normalize() != "" && record.Priority != normalized.Priority {
+			continue
+		}
+		if normalized.ApprovalState.Normalize() != "" &&
+			record.ApprovalState != normalized.ApprovalState {
+			continue
+		}
+		if normalized.OwnerKind.Normalize() != "" {
+			if record.Owner == nil || record.Owner.Kind != normalized.OwnerKind {
+				continue
+			}
+		}
+		if normalized.OwnerRef != "" {
+			if record.Owner == nil || record.Owner.Ref != normalized.OwnerRef {
+				continue
+			}
+		}
+		if normalized.ParentTaskID != "" && record.ParentTaskID != normalized.ParentTaskID {
+			continue
+		}
+		if normalized.Search != "" {
+			title := strings.ToLower(strings.TrimSpace(record.Title))
+			identifier := strings.ToLower(strings.TrimSpace(record.Identifier))
+			if !strings.Contains(title, normalized.Search) &&
+				!strings.Contains(identifier, normalized.Search) {
+				continue
+			}
+		}
+		summaries = append(summaries, Summary{
+			ID:             record.ID,
+			ProfileID:      record.ProfileID,
+			Identifier:     record.Identifier,
+			Scope:          record.Scope,
+			WorkspaceID:    record.WorkspaceID,
+			ParentTaskID:   record.ParentTaskID,
+			Title:          record.Title,
+			Priority:       record.Priority,
+			MaxAttempts:    record.MaxAttempts,
+			Status:         record.Status,
+			ApprovalPolicy: record.ApprovalPolicy,
+			ApprovalState:  record.ApprovalState,
+			Draft:          record.Status.Normalize() == TaskStatusDraft,
+			Owner:          cloneOwnership(record.Owner),
+			CurrentRunID:   record.CurrentRunID,
+			LatestEventSeq: s.latestEventSeq(record.ID),
+			CreatedBy:      record.CreatedBy,
+			Origin:         record.Origin,
+			CreatedAt:      record.CreatedAt,
+			UpdatedAt:      record.UpdatedAt,
+			ClosedAt:       record.ClosedAt,
+			LastActivityAt: record.UpdatedAt,
+		})
+	}
+
+	slices.SortFunc(summaries, func(a, b Summary) int {
+		return cmp.Or(
+			inMemoryTaskLatestActivity(&b, s.runs, s.events).Compare(inMemoryTaskLatestActivity(&a, s.runs, s.events)),
+			b.UpdatedAt.Compare(a.UpdatedAt),
+			b.CreatedAt.Compare(a.CreatedAt),
+			cmp.Compare(b.ID, a.ID),
+		)
+	})
+	if normalized.Limit > 0 && len(summaries) > normalized.Limit {
+		return append([]Summary(nil), summaries[:normalized.Limit]...), nil
+	}
+	return append([]Summary(nil), summaries...), nil
+}
+
+func (s *inMemoryManagerStore) latestEventSeq(taskID string) int64 {
+	var latest int64
+	trimmedTaskID := strings.TrimSpace(taskID)
+	for _, event := range s.events {
+		if strings.TrimSpace(event.TaskID) != trimmedTaskID {
+			continue
+		}
+		if sequence := s.eventSequenceByID[event.ID]; sequence > latest {
+			latest = sequence
+		}
+	}
+	return latest
+}
+
+func (s *inMemoryManagerStore) CountDirectChildren(
+	_ context.Context,
+	parentTaskID string,
+) (int, error) {
+	count := 0
+	for _, record := range s.tasks {
+		if record.ParentTaskID == strings.TrimSpace(parentTaskID) {
+			count++
+		}
+	}
+	return count, nil
+}
+
+func (s *inMemoryManagerStore) ListTaskBlocks(
+	_ context.Context,
+	taskID string,
+	includeCleared bool,
+) ([]TaskBlock, error) {
+	trimmedTaskID := strings.TrimSpace(taskID)
+	if _, ok := s.tasks[trimmedTaskID]; !ok {
+		return nil, ErrTaskNotFound
+	}
+	now := time.Date(2026, 4, 14, 15, 0, 0, 0, time.UTC)
+	blocks := make([]TaskBlock, 0, len(s.blocks[trimmedTaskID]))
+	for _, block := range s.blocks[trimmedTaskID] {
+		if !includeCleared && !taskBlockOpenAt(block, now) {
+			continue
+		}
+		blocks = append(blocks, cloneTaskBlock(block))
+	}
+	slices.SortFunc(blocks, func(a, b TaskBlock) int {
+		return cmp.Or(a.CreatedAt.Compare(b.CreatedAt), cmp.Compare(a.ID, b.ID))
+	})
+	return blocks, nil
+}
+
+func (s *inMemoryManagerStore) HasOpenTaskBlocks(_ context.Context, taskID string) (bool, error) {
+	trimmedTaskID := strings.TrimSpace(taskID)
+	if _, ok := s.tasks[trimmedTaskID]; !ok {
+		return false, ErrTaskNotFound
+	}
+	now := time.Date(2026, 4, 14, 15, 0, 0, 0, time.UTC)
+	for _, block := range s.blocks[trimmedTaskID] {
+		if taskBlockOpenAt(block, now) {
+			return true, nil
+		}
+	}
+	return false, nil
+}
+
+func (s *inMemoryManagerStore) CreateTaskBlock(
+	_ context.Context,
+	mutation CreateTaskBlockMutation,
+) (BlockMutationResult, error) {
+	result, err := s.createTaskBlockForTest(mutation.Block, mutation.RecurrenceLimit)
+	if err != nil {
+		return BlockMutationResult{}, err
+	}
+	if err := s.appendTaskEventForTest(
+		result.Block.TaskID,
+		"",
+		string(hookspkg.HookTaskBlocked),
+		mutation.Actor,
+		map[string]any{"block_id": result.Block.ID},
+		result.Block.CreatedAt,
+	); err != nil {
+		return BlockMutationResult{}, err
+	}
+	if result.EscalatedTask != nil {
+		needsAttention := result.EscalatedTask.NeedsAttention
+		if needsAttention != nil {
+			if err := s.appendTaskEventForTest(
+				result.EscalatedTask.ID,
+				"",
+				taskWatchEventNeedsAttention,
+				mutation.Actor,
+				map[string]any{
+					"status":   TaskStatusNeedsAttention,
+					"reason":   needsAttention.Reason,
+					"block_id": result.Block.ID,
+				},
+				needsAttention.At,
+			); err != nil {
+				return BlockMutationResult{}, err
+			}
+		}
+	}
+	return result, nil
+}
+
+func (s *inMemoryManagerStore) createTaskBlockForTest(
+	block TaskBlock,
+	recurrenceLimit int,
+) (BlockMutationResult, error) {
+	trimmedTaskID := strings.TrimSpace(block.TaskID)
+	taskRecord, ok := s.tasks[trimmedTaskID]
+	if !ok {
+		return BlockMutationResult{}, ErrTaskNotFound
+	}
+	hadClearedPrior := s.hasClearedTaskBlockKindForTest(trimmedTaskID, block.Kind)
+	created := cloneTaskBlock(block)
+	created.ID = strings.TrimSpace(created.ID)
+	created.TaskID = trimmedTaskID
+	created.WorkspaceID = strings.TrimSpace(taskRecord.WorkspaceID)
+	created.Kind = created.Kind.Normalize()
+	created.Reason = strings.TrimSpace(created.Reason)
+	created.CreatedBy.Kind = created.CreatedBy.Kind.Normalize()
+	created.CreatedBy.Ref = strings.TrimSpace(created.CreatedBy.Ref)
+	created.ClearedAt = time.Time{}
+	created.ClearedBy = ActorIdentity{}
+	created.ClearNote = ""
+	if created.ID == "" {
+		return BlockMutationResult{}, ErrValidation
+	}
+	if err := created.Kind.Validate("task_block.kind"); err != nil {
+		return BlockMutationResult{}, err
+	}
+	if created.Reason == "" {
+		return BlockMutationResult{}, ErrValidation
+	}
+	if s.blocks[trimmedTaskID] == nil {
+		s.blocks[trimmedTaskID] = make(map[string]TaskBlock)
+	}
+	s.blocks[trimmedTaskID][created.ID] = cloneTaskBlock(created)
+	result := BlockMutationResult{
+		Block: cloneTaskBlock(created),
+		Recurrence: BlockRecurrence{
+			TaskID: created.TaskID,
+			Kind:   created.Kind,
+		},
+	}
+	if !hadClearedPrior {
+		return result, nil
+	}
+	key := blockRecurrenceTestKey(created.TaskID, created.Kind)
+	recurrence := s.blockRecurrences[key]
+	recurrence.TaskID = created.TaskID
+	recurrence.Kind = created.Kind
+	recurrence.Count++
+	recurrence.UpdatedAt = created.CreatedAt.UTC()
+	s.blockRecurrences[key] = recurrence
+	result.Recurrence = recurrence
+	if recurrenceLimit > 0 && recurrence.Count >= recurrenceLimit {
+		escalated := s.tasks[created.TaskID]
+		if escalated.NeedsAttention == nil {
+			needsAttention := NeedsAttention{
+				Reason: fmt.Sprintf(
+					"task re-blocked %d times with %q blocks",
+					recurrence.Count,
+					recurrence.Kind.Normalize(),
+				),
+				At: created.CreatedAt.UTC(),
+				By: created.CreatedBy,
+			}
+			escalated.NeedsAttention = &needsAttention
+			escalated.UpdatedAt = created.CreatedAt.UTC()
+			s.tasks[escalated.ID] = cloneTask(escalated)
+			result.EscalatedTask = &escalated
+		}
+	}
+	return result, nil
+}
+
+func (s *inMemoryManagerStore) hasClearedTaskBlockKindForTest(taskID string, kind BlockKind) bool {
+	for _, block := range s.blocks[strings.TrimSpace(taskID)] {
+		if block.Kind.Normalize() == kind.Normalize() && !block.ClearedAt.IsZero() {
+			return true
+		}
+	}
+	return false
+}
+
+func (s *inMemoryManagerStore) ClearTaskBlock(
+	_ context.Context,
+	mutation ClearTaskBlockMutation,
+) (TaskBlock, error) {
+	trimmedTaskID := strings.TrimSpace(mutation.TaskID)
+	taskBlocks := s.blocks[trimmedTaskID]
+	if taskBlocks == nil {
+		return TaskBlock{}, ErrTaskBlockNotFound
+	}
+	blockID := strings.TrimSpace(mutation.BlockID)
+	block, ok := taskBlocks[blockID]
+	if !ok {
+		return TaskBlock{}, ErrTaskBlockNotFound
+	}
+	if !block.ClearedAt.IsZero() {
+		return TaskBlock{}, fmt.Errorf("%w: task block %q is already cleared", ErrConflict, blockID)
+	}
+	block.ClearedAt = mutation.ClearedAt.UTC()
+	block.ClearedBy = ActorIdentity{
+		Kind: mutation.ClearedBy.Kind.Normalize(),
+		Ref:  strings.TrimSpace(mutation.ClearedBy.Ref),
+	}
+	block.ClearNote = strings.TrimSpace(mutation.ClearNote)
+	taskBlocks[blockID] = cloneTaskBlock(block)
+	if err := s.appendTaskEventForTest(
+		block.TaskID,
+		"",
+		string(hookspkg.HookTaskUnblocked),
+		mutation.Actor,
+		map[string]any{"block_id": block.ID},
+		block.ClearedAt,
+	); err != nil {
+		return TaskBlock{}, err
+	}
+	return cloneTaskBlock(block), nil
+}
+
+func (s *inMemoryManagerStore) ClearTaskNeedsAttention(
+	_ context.Context,
+	mutation NeedsAttentionClearMutation,
+) (NeedsAttentionClearResult, error) {
+	trimmedTaskID := strings.TrimSpace(mutation.TaskID)
+	taskRecord, ok := s.tasks[trimmedTaskID]
+	if !ok {
+		return NeedsAttentionClearResult{}, ErrTaskNotFound
+	}
+	if taskRecord.NeedsAttention == nil {
+		return NeedsAttentionClearResult{}, fmt.Errorf(
+			"%w: task %q is not escalated",
+			ErrInvalidStatusTransition,
+			trimmedTaskID,
+		)
+	}
+	taskRecord.NeedsAttention = nil
+	taskRecord.UpdatedAt = mutation.ClearedAt.UTC()
+	s.tasks[trimmedTaskID] = cloneTask(taskRecord)
+	eventID := fmt.Sprintf("evt-%d", s.nextEventSequence+1)
+	if err := s.appendTaskEventForTest(
+		taskRecord.ID,
+		"",
+		taskWatchEventRecovered,
+		mutation.Actor,
+		map[string]any{
+			"status": TaskStatusReady,
+			"note":   strings.TrimSpace(mutation.Note),
+			"at":     mutation.ClearedAt.UTC(),
+		},
+		mutation.ClearedAt.UTC(),
+	); err != nil {
+		return NeedsAttentionClearResult{}, err
+	}
+	event, err := s.GetTaskEventRecord(context.Background(), eventID)
+	if err != nil {
+		return NeedsAttentionClearResult{}, err
+	}
+	return NeedsAttentionClearResult{Task: cloneTask(taskRecord), Event: event}, nil
+}
+
+func (s *inMemoryManagerStore) ExpireTaskBlocks(
+	_ context.Context,
+	mutation ExpireTaskBlocksMutation,
+) (ExpireTaskBlocksResult, error) {
+	now := mutation.Now.UTC()
+	if now.IsZero() {
+		now = time.Date(2026, 4, 14, 15, 0, 0, 0, time.UTC)
+	}
+	expired := make([]TaskBlock, 0, len(mutation.Targets))
+	for _, target := range mutation.Targets {
+		taskBlocks := s.blocks[strings.TrimSpace(target.TaskID)]
+		blockID := strings.TrimSpace(target.BlockID)
+		block, ok := taskBlocks[blockID]
+		if !ok || !block.ClearedAt.IsZero() || block.ExpiresAt.IsZero() || block.ExpiresAt.After(now) {
+			continue
+		}
+		block.ClearedAt = now
+		block.ClearedBy = ActorIdentity{
+			Kind: mutation.ClearedBy.Kind.Normalize(),
+			Ref:  strings.TrimSpace(mutation.ClearedBy.Ref),
+		}
+		block.ClearNote = ""
+		taskBlocks[blockID] = cloneTaskBlock(block)
+		expired = append(expired, cloneTaskBlock(block))
+	}
+	return ExpireTaskBlocksResult{Blocks: expired}, nil
+}
+
+func (s *inMemoryManagerStore) ListExpiredTaskBlockTargets(
+	_ context.Context,
+	now time.Time,
+) ([]BlockExpiryTarget, error) {
+	cutoff := now.UTC()
+	targets := make([]BlockExpiryTarget, 0)
+	for taskID, taskBlocks := range s.blocks {
+		for blockID, block := range taskBlocks {
+			if block.ClearedAt.IsZero() && !block.ExpiresAt.IsZero() && !block.ExpiresAt.After(cutoff) {
+				targets = append(targets, BlockExpiryTarget{TaskID: taskID, BlockID: blockID})
+			}
+		}
+	}
+	slices.SortFunc(targets, func(a, b BlockExpiryTarget) int {
+		return cmp.Or(cmp.Compare(a.TaskID, b.TaskID), cmp.Compare(a.BlockID, b.BlockID))
+	})
+	return targets, nil
+}
+
+func (s *inMemoryManagerStore) BlockTaskAndReleaseRun(
+	_ context.Context,
+	mutation BlockTaskAndReleaseRunMutation,
+) (BlockTaskAndReleaseRunResult, error) {
+	run, err := s.requireCurrentTestLease(mutation.RunID, mutation.ClaimToken, mutation.Now)
+	if err != nil {
+		return BlockTaskAndReleaseRunResult{}, err
+	}
+	if strings.TrimSpace(run.TaskID) != strings.TrimSpace(mutation.Block.TaskID) {
+		return BlockTaskAndReleaseRunResult{}, ErrInvalidStatusTransition
+	}
+	blockResult, err := s.createTaskBlockForTest(mutation.Block, mutation.RecurrenceLimit)
+	if err != nil {
+		return BlockTaskAndReleaseRunResult{}, err
+	}
+
+	updated := requeuedTestRun(run)
+	s.runs[updated.ID] = cloneTaskRun(updated)
+	taskRecord := s.tasks[updated.TaskID]
+	if strings.TrimSpace(taskRecord.CurrentRunID) == updated.ID {
+		taskRecord.CurrentRunID = ""
+		s.tasks[taskRecord.ID] = cloneTask(taskRecord)
+	}
+	if err := s.appendTaskEventForTest(
+		blockResult.Block.TaskID,
+		updated.ID,
+		string(hookspkg.HookTaskBlocked),
+		mutation.Actor,
+		map[string]any{"block_id": blockResult.Block.ID},
+		blockResult.Block.CreatedAt,
+	); err != nil {
+		return BlockTaskAndReleaseRunResult{}, err
+	}
+	if blockResult.EscalatedTask != nil {
+		needsAttention := blockResult.EscalatedTask.NeedsAttention
+		if needsAttention != nil {
+			if err := s.appendTaskEventForTest(
+				blockResult.EscalatedTask.ID,
+				"",
+				taskWatchEventNeedsAttention,
+				mutation.Actor,
+				map[string]any{
+					"status":   TaskStatusNeedsAttention,
+					"reason":   needsAttention.Reason,
+					"block_id": blockResult.Block.ID,
+				},
+				needsAttention.At,
+			); err != nil {
+				return BlockTaskAndReleaseRunResult{}, err
+			}
+		}
+	}
+	return BlockTaskAndReleaseRunResult{
+		Block:          cloneTaskBlock(blockResult.Block),
+		Run:            cloneTaskRun(updated),
+		Recurrence:     blockResult.Recurrence,
+		EscalatedTask:  blockResult.EscalatedTask,
+		ReleaseReason:  "blocked",
+		PreviousRun:    cloneTaskRun(run),
+		ClaimTokenHash: run.ClaimTokenHash,
+	}, nil
+}
+
+func blockRecurrenceTestKey(taskID string, kind BlockKind) string {
+	return strings.TrimSpace(taskID) + "\x00" + string(kind.Normalize())
+}
+
+func taskBlockOpenAt(block TaskBlock, now time.Time) bool {
+	if !block.ClearedAt.IsZero() {
+		return false
+	}
+	return block.ExpiresAt.IsZero() || block.ExpiresAt.After(now)
+}
+
+func (s *inMemoryManagerStore) CreateDependency(_ context.Context, dependency Dependency) error {
+	if _, ok := s.tasks[dependency.TaskID]; !ok {
+		return ErrTaskNotFound
+	}
+	if _, ok := s.tasks[dependency.DependsOnTaskID]; !ok {
+		return ErrTaskNotFound
+	}
+	if s.dependencies[dependency.TaskID] == nil {
+		s.dependencies[dependency.TaskID] = make(map[string]Dependency)
+	}
+	s.dependencies[dependency.TaskID][dependency.DependsOnTaskID] = dependency
+	return nil
+}
+
+func (s *inMemoryManagerStore) DeleteDependency(
+	_ context.Context,
+	taskID string,
+	dependsOnID string,
+) error {
+	taskDeps := s.dependencies[strings.TrimSpace(taskID)]
+	if taskDeps == nil {
+		return ErrTaskDependencyNotFound
+	}
+	if _, ok := taskDeps[strings.TrimSpace(dependsOnID)]; !ok {
+		return ErrTaskDependencyNotFound
+	}
+	delete(taskDeps, strings.TrimSpace(dependsOnID))
+	return nil
+}
+
+func (s *inMemoryManagerStore) ListDependencies(
+	_ context.Context,
+	taskID string,
+) ([]Dependency, error) {
+	taskDeps := s.dependencies[strings.TrimSpace(taskID)]
+	if len(taskDeps) == 0 {
+		return nil, nil
+	}
+
+	dependencies := slices.AppendSeq(make([]Dependency, 0, len(taskDeps)), maps.Values(taskDeps))
+	slices.SortFunc(dependencies, func(a, b Dependency) int {
+		return cmp.Compare(a.DependsOnTaskID, b.DependsOnTaskID)
+	})
+	return dependencies, nil
+}
+
+func (s *inMemoryManagerStore) ListDependents(
+	_ context.Context,
+	dependsOnTaskID string,
+) ([]Dependency, error) {
+	if s.coordinatorCompleted && s.coordinatorPublicationErr != nil {
+		return nil, s.coordinatorPublicationErr
+	}
+	dependents := make([]Dependency, 0)
+	for _, taskDeps := range s.dependencies {
+		if dependency, ok := taskDeps[strings.TrimSpace(dependsOnTaskID)]; ok {
+			dependents = append(dependents, dependency)
+		}
+	}
+	slices.SortFunc(dependents, func(a, b Dependency) int {
+		return cmp.Compare(a.TaskID, b.TaskID)
+	})
+	return dependents, nil
+}
+
+func (s *inMemoryManagerStore) CountDependencies(_ context.Context, taskID string) (int, error) {
+	return len(s.dependencies[strings.TrimSpace(taskID)]), nil
+}
+
+func (s *inMemoryManagerStore) HasDependencyPath(
+	_ context.Context,
+	fromTaskID string,
+	toTaskID string,
+) (bool, error) {
+	visited := make(map[string]struct{})
+	var walk func(string) bool
+	walk = func(current string) bool {
+		if current == strings.TrimSpace(toTaskID) {
+			return true
+		}
+		if _, seen := visited[current]; seen {
+			return false
+		}
+		visited[current] = struct{}{}
+		for _, dependency := range s.dependencies[current] {
+			if walk(dependency.DependsOnTaskID) {
+				return true
+			}
+		}
+		return false
+	}
+	return walk(strings.TrimSpace(fromTaskID)), nil
+}
+
+func (s *inMemoryManagerStore) CreateTaskRun(_ context.Context, run Run) error {
+	s.runs[run.ID] = cloneTaskRun(run)
+	return nil
+}
+
+func (s *inMemoryManagerStore) UpdateNonTerminalTaskRun(_ context.Context, run Run) error {
+	s.runs[run.ID] = cloneTaskRun(run)
+	return nil
+}
+
+func (s *inMemoryManagerStore) SettleCompletedTaskHierarchy(
+	context.Context,
+	string,
+	ActorContext,
+	time.Time,
+) (CompletedRunSettlement, error) {
+	return CompletedRunSettlement{}, nil
+}
+
+func (s *inMemoryManagerStore) AdmitRunDirectExecution(
+	_ context.Context,
+	mutation RunDirectExecutionAdmissionMutation,
+) (NominalRunMutationResult, error) {
+	current, err := s.requireNominalRunFixture(mutation.Fence())
+	if err != nil {
+		return NominalRunMutationResult{}, err
+	}
+	actor := mutation.Actor()
+	if err := actor.Validate(); err != nil {
+		return NominalRunMutationResult{}, err
+	}
+	if current.Status.Normalize() != TaskRunStatusQueued ||
+		current.RunKind.Normalize() != RunKindWorker || strings.TrimSpace(current.LoopRunID) != "" {
+		return NominalRunMutationResult{}, ErrInvalidStatusTransition
+	}
+	updated := cloneTaskRun(current)
+	updated.Status = TaskRunStatusClaimed
+	updated.ClaimedBy = cloneActorIdentity(&actor.Actor)
+	updated.ClaimedAt = mutation.ClaimedAt().UTC()
+	updated.ClaimTokenHash = ""
+	updated.LeaseUntil = time.Time{}
+	updated.HeartbeatAt = time.Time{}
+	s.runs[updated.ID] = cloneTaskRun(updated)
+	return NominalRunMutationResult{Previous: current, Run: updated}, nil
+}
+
+func (s *inMemoryManagerStore) TransitionRunStarting(
+	_ context.Context,
+	mutation RunStartingMutation,
+) (NominalRunMutationResult, error) {
+	current, err := s.requireLeaseAuthorizedRunFixture(mutation)
+	if err != nil {
+		return NominalRunMutationResult{}, err
+	}
+	if current.Status.Normalize() != TaskRunStatusClaimed {
+		return NominalRunMutationResult{}, ErrInvalidStatusTransition
+	}
+	updated := cloneTaskRun(current)
+	updated.Status = TaskRunStatusStarting
+	s.runs[updated.ID] = cloneTaskRun(updated)
+	return NominalRunMutationResult{Previous: current, Run: updated}, nil
+}
+
+func (s *inMemoryManagerStore) BindRunSession(
+	_ context.Context,
+	mutation RunSessionBindingMutation,
+) (NominalRunMutationResult, error) {
+	current, err := s.requireLeaseAuthorizedRunFixture(mutation)
+	if err != nil {
+		return NominalRunMutationResult{}, err
+	}
+	status := current.Status.Normalize()
+	if status != TaskRunStatusClaimed && status != TaskRunStatusStarting {
+		return NominalRunMutationResult{}, ErrInvalidStatusTransition
+	}
+	for id, run := range s.runs {
+		if id != current.ID && strings.TrimSpace(run.SessionID) == mutation.SessionID() &&
+			isNominalActiveRunFixture(run.Status) {
+			return NominalRunMutationResult{}, ErrSessionAlreadyBound
+		}
+	}
+	updated := cloneTaskRun(current)
+	updated.Status = TaskRunStatusStarting
+	updated.SessionID = mutation.SessionID()
+	updated.SetWorktreeID(mutation.WorktreeID())
+	s.runs[updated.ID] = cloneTaskRun(updated)
+	return NominalRunMutationResult{Previous: current, Run: updated}, nil
+}
+
+func (s *inMemoryManagerStore) TransitionRunRunning(
+	_ context.Context,
+	mutation RunRunningMutation,
+) (NominalRunMutationResult, error) {
+	current, err := s.requireLeaseAuthorizedRunFixture(mutation)
+	if err != nil {
+		return NominalRunMutationResult{}, err
+	}
+	if current.Status.Normalize() != TaskRunStatusStarting {
+		return NominalRunMutationResult{}, ErrInvalidStatusTransition
+	}
+	updated := cloneTaskRun(current)
+	updated.Status = TaskRunStatusRunning
+	updated.StartedAt = mutation.StartedAt().UTC()
+	s.runs[updated.ID] = cloneTaskRun(updated)
+	return NominalRunMutationResult{Previous: current, Run: updated}, nil
+}
+
+func (s *inMemoryManagerStore) RecoverTaskRunOnBoot(
+	_ context.Context,
+	mutation RunBootRecoveryMutation,
+) (NominalRunMutationResult, error) {
+	current, err := s.requireNominalRunFixture(mutation.Fence())
+	if err != nil {
+		return NominalRunMutationResult{}, err
+	}
+	updated, err := applyBootRecoveryFixture(current, mutation.Action(), mutation.StartedAt())
+	if err != nil {
+		return NominalRunMutationResult{}, err
+	}
+	s.runs[updated.ID] = cloneTaskRun(updated)
+	return NominalRunMutationResult{Previous: current, Run: updated}, nil
+}
+
+func (s *inMemoryManagerStore) requireNominalRunFixture(fence RunMutationFence) (Run, error) {
+	current, ok := s.runs[fence.RunID()]
+	if !ok {
+		return Run{}, ErrTaskRunNotFound
+	}
+	if !fence.Matches(current) {
+		return Run{}, ErrInvalidStatusTransition
+	}
+	return cloneTaskRun(current), nil
+}
+
+type leaseAuthorizedMutationFixture interface {
+	Fence() RunMutationFence
+	MatchesSource(Run) bool
+	ClaimToken() string
+	CommandAt() time.Time
+}
+
+func (s *inMemoryManagerStore) requireLeaseAuthorizedRunFixture(
+	mutation leaseAuthorizedMutationFixture,
+) (Run, error) {
+	current, ok := s.runs[mutation.Fence().RunID()]
+	if !ok {
+		return Run{}, ErrTaskRunNotFound
+	}
+	if !mutation.MatchesSource(current) {
+		return Run{}, ErrInvalidStatusTransition
+	}
+	if err := ValidateRunLeaseMutation(current, mutation.ClaimToken(), mutation.CommandAt()); err != nil {
+		return Run{}, err
+	}
+	return cloneTaskRun(current), nil
+}
+
+func applyBootRecoveryFixture(run Run, action RunBootRecoveryAction, startedAt time.Time) (Run, error) {
+	switch action.Normalize() {
+	case RunBootRecoveryRequeue:
+		return requeueSessionRunLease(run), nil
+	case RunBootRecoveryMarkRunning:
+		if strings.TrimSpace(run.SessionID) == "" {
+			return Run{}, ErrInvalidStatusTransition
+		}
+		run.Status = TaskRunStatusRunning
+		run.StartedAt = startedAt.UTC()
+		return run, nil
+	default:
+		return Run{}, ErrInvalidStatusTransition
+	}
+}
+
+func isNominalActiveRunFixture(status RunStatus) bool {
+	switch status.Normalize() {
+	case TaskRunStatusClaimed, TaskRunStatusStarting, TaskRunStatusRunning:
+		return true
+	default:
+		return false
+	}
+}
+
+func (s *inMemoryManagerStore) UpdateTaskRunMetadata(
+	_ context.Context,
+	mutation RunMetadataMutation,
+) (Run, error) {
+	run, ok := s.runs[strings.TrimSpace(mutation.RunID)]
+	if !ok {
+		return Run{}, ErrTaskRunNotFound
+	}
+	if !sameRawJSON(run.Metadata, mutation.ExpectedMetadata) {
+		return Run{}, ErrInvalidStatusTransition
+	}
+	run.Metadata = cloneRawJSON(mutation.Metadata)
+	if err := run.Validate(); err != nil {
+		return Run{}, err
+	}
+	s.runs[run.ID] = cloneTaskRun(run)
+	return cloneTaskRun(run), nil
+}
+
+func (s *inMemoryManagerStore) TransitionTerminalRun(
+	_ context.Context,
+	mutation TerminalRunMutation,
+) (Run, error) {
+	next := mutation.NextRun()
+	current, ok := s.runs[strings.TrimSpace(next.ID)]
+	if !ok {
+		return Run{}, ErrTaskRunNotFound
+	}
+	if !mutation.Fence().Matches(current) {
+		return Run{}, ErrInvalidStatusTransition
+	}
+	if !allowsRunTransition(current.Status, next.Status) {
+		return Run{}, ErrInvalidStatusTransition
+	}
+	if err := ValidateImmutableRunFields(current, next); err != nil {
+		return Run{}, err
+	}
+	updated := cloneTaskRun(next)
+	updated.LeaseUntil = time.Time{}
+	updated.HeartbeatAt = time.Time{}
+	s.runs[current.ID] = updated
+	return cloneTaskRun(updated), nil
+}
+
+func (s *inMemoryManagerStore) GetTaskRun(_ context.Context, id string) (Run, error) {
+	run, ok := s.runs[strings.TrimSpace(id)]
+	if !ok {
+		return Run{}, ErrTaskRunNotFound
+	}
+	return cloneTaskRun(run), nil
+}
+
+func (s *inMemoryManagerStore) ReadTaskRunResultPage(
+	_ context.Context,
+	runID string,
+	offset int64,
+	limit int64,
+) (RunResultPage, error) {
+	run, ok := s.runs[strings.TrimSpace(runID)]
+	if !ok {
+		return RunResultPage{}, ErrTaskRunResultNotFound
+	}
+	content, ok := s.externalRunResults[run.ID]
+	if !ok {
+		return RunResultPage{}, ErrTaskRunResultNotFound
+	}
+	return PageRunResult(run.ID, run.ResultReference(), content, offset, limit)
+}
+
+func (s *inMemoryManagerStore) ListTaskRuns(_ context.Context, query RunQuery) ([]Run, error) {
+	if err := query.Validate("task_run_query"); err != nil {
+		return nil, err
+	}
+
+	normalized := query
+	normalized.TaskID = strings.TrimSpace(normalized.TaskID)
+	normalized.Status = normalized.Status.Normalize()
+	normalized.SessionID = strings.TrimSpace(normalized.SessionID)
+
+	runs := make([]Run, 0)
+	for _, run := range s.runs {
+		if normalized.TaskID != "" && run.TaskID != normalized.TaskID {
+			continue
+		}
+		if normalized.Status.Normalize() != TaskRunStatusUnknown && run.Status != normalized.Status {
+			continue
+		}
+		if normalized.SessionID != "" && run.SessionID != normalized.SessionID {
+			continue
+		}
+		runs = append(runs, cloneTaskRun(run))
+	}
+	slices.SortFunc(runs, func(a, b Run) int {
+		return cmp.Compare(a.ID, b.ID)
+	})
+	if normalized.Limit > 0 && len(runs) > normalized.Limit {
+		return append([]Run(nil), runs[:normalized.Limit]...), nil
+	}
+	return append([]Run(nil), runs...), nil
+}
+
+func (s *inMemoryManagerStore) ListTaskRunsByStatus(
+	_ context.Context,
+	statuses []RunStatus,
+) ([]Run, error) {
+	allowed := make(map[RunStatus]struct{}, len(statuses))
+	for _, status := range statuses {
+		allowed[status.Normalize()] = struct{}{}
+	}
+	runs := make([]Run, 0)
+	for _, run := range s.runs {
+		if _, ok := allowed[run.Status.Normalize()]; ok {
+			runs = append(runs, cloneTaskRun(run))
+		}
+	}
+	return runs, nil
+}
+
+func (s *inMemoryManagerStore) GetTaskTriageState(
+	_ context.Context,
+	taskID string,
+	actor ActorIdentity,
+) (TriageState, error) {
+	record, ok := s.triageStates[triageKey(taskID, actor)]
+	if !ok {
+		return TriageState{}, ErrTaskTriageStateNotFound
+	}
+	return cloneTriageState(record), nil
+}
+
+func (s *inMemoryManagerStore) UpsertTaskTriageState(_ context.Context, state TriageState) error {
+	if _, ok := s.tasks[strings.TrimSpace(state.TaskID)]; !ok {
+		return ErrTaskNotFound
+	}
+	s.triageStates[triageKey(state.TaskID, state.Actor)] = cloneTriageState(state)
+	return nil
+}
+
+func (s *inMemoryManagerStore) GetExecutionProfile(
+	_ context.Context,
+	taskID string,
+) (ExecutionProfile, error) {
+	profile, ok := s.profiles[strings.TrimSpace(taskID)]
+	if !ok {
+		return ExecutionProfile{}, ErrExecutionProfileNotFound
+	}
+	return cloneExecutionProfile(&profile), nil
+}
+
+func (s *inMemoryManagerStore) UpsertExecutionProfile(
+	_ context.Context,
+	profile *ExecutionProfile,
+) (ExecutionProfile, error) {
+	if profile == nil {
+		return ExecutionProfile{}, ErrValidation
+	}
+	if _, ok := s.tasks[strings.TrimSpace(profile.TaskID)]; !ok {
+		return ExecutionProfile{}, ErrTaskNotFound
+	}
+	s.profiles[profile.TaskID] = cloneExecutionProfile(profile)
+	return cloneExecutionProfile(profile), nil
+}
+
+func (s *inMemoryManagerStore) DeleteExecutionProfile(_ context.Context, taskID string) error {
+	trimmedID := strings.TrimSpace(taskID)
+	if _, ok := s.profiles[trimmedID]; !ok {
+		return ErrExecutionProfileNotFound
+	}
+	delete(s.profiles, trimmedID)
+	return nil
+}
+
+func (s *inMemoryManagerStore) CreateTaskDefinition(
+	ctx context.Context,
+	mutation *CreateTaskDefinitionMutation,
+) error {
+	if err := s.CreateTask(ctx, mutation.Task); err != nil {
+		return err
+	}
+	if mutation.Profile != nil {
+		if _, err := s.UpsertExecutionProfile(ctx, mutation.Profile); err != nil {
+			return err
+		}
+	}
+	for _, event := range mutation.Events {
+		if err := s.CreateTaskEvent(ctx, event); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (s *inMemoryManagerStore) UpdateTaskDefinition(
+	ctx context.Context,
+	mutation *UpdateTaskDefinitionMutation,
+) (ExecutionProfile, error) {
+	if mutation.UpdateTaskRow {
+		if err := s.UpdateTask(ctx, mutation.Task, mutation.Actor); err != nil {
+			return ExecutionProfile{}, err
+		}
+	}
+	stored := ExecutionProfile{}
+
+	for _, event := range mutation.Events {
+		if err := s.CreateTaskEvent(ctx, event); err != nil {
+			return ExecutionProfile{}, err
+		}
+	}
+	return stored, nil
+}
+
+func (s *inMemoryManagerStore) SetTaskExecutionProfile(
+	ctx context.Context,
+	mutation *ExecutionProfileMutation,
+) (ExecutionProfile, error) {
+	stored, err := s.UpsertExecutionProfile(ctx, &mutation.Profile)
+	if err != nil {
+		return ExecutionProfile{}, err
+	}
+	if err := s.CreateTaskEvent(ctx, mutation.Event); err != nil {
+		return ExecutionProfile{}, err
+	}
+	return stored, nil
+}
+
+func (s *inMemoryManagerStore) SetTaskWorktreePolicy(
+	ctx context.Context,
+	mutation *WorktreePolicyMutation,
+) (ExecutionProfile, error) {
+	profile, err := s.GetExecutionProfile(ctx, mutation.TaskID)
+	if errors.Is(err, ErrExecutionProfileNotFound) {
+		profile = DefaultExecutionProfile(mutation.TaskID)
+	} else if err != nil {
+		return ExecutionProfile{}, err
+	}
+	profile.Worktree = mutation.Policy
+	stored, err := s.UpsertExecutionProfile(ctx, &profile)
+	if err != nil {
+		return ExecutionProfile{}, err
+	}
+	if err := s.CreateTaskEvent(ctx, mutation.Event); err != nil {
+		return ExecutionProfile{}, err
+	}
+	return stored, nil
+}
+
+func (s *inMemoryManagerStore) DeleteTaskExecutionProfile(
+	ctx context.Context,
+	mutation ExecutionProfileDeleteMutation,
+) error {
+	if err := s.DeleteExecutionProfile(ctx, mutation.TaskID); err != nil {
+		return err
+	}
+	return s.CreateTaskEvent(ctx, mutation.Event)
+}
+
+func (s *inMemoryManagerStore) CountActiveSessionBindings(
+	_ context.Context,
+	sessionID string,
+) (int, error) {
+	count := 0
+	for _, run := range s.runs {
+		if run.SessionID == strings.TrimSpace(sessionID) && run.EndedAt.IsZero() {
+			count++
+		}
+	}
+	return count, nil
+}
+
+func (s *inMemoryManagerStore) ListAutonomyLeaseHandles(
+	_ context.Context,
+	sessionID string,
+) ([]AutonomyLeaseHandle, error) {
+	normalizedSessionID := strings.TrimSpace(sessionID)
+	handles := make([]AutonomyLeaseHandle, 0)
+	for _, run := range s.runs {
+		if strings.TrimSpace(run.SessionID) != normalizedSessionID ||
+			strings.TrimSpace(run.ClaimTokenHash) == "" {
+			continue
+		}
+		handle := AutonomyLeaseHandle{
+			RunID:          strings.TrimSpace(run.ID),
+			TaskID:         strings.TrimSpace(run.TaskID),
+			SessionID:      strings.TrimSpace(run.SessionID),
+			Status:         run.Status,
+			ClaimedBy:      cloneActorIdentity(run.ClaimedBy),
+			ClaimToken:     strings.TrimSpace(s.claimTokens[run.ID]),
+			ClaimTokenHash: strings.TrimSpace(run.ClaimTokenHash),
+			LeaseUntil:     run.LeaseUntil,
+			HeartbeatAt:    run.HeartbeatAt,
+		}
+		handles = append(handles, handle)
+	}
+	slices.SortFunc(handles, func(a, b AutonomyLeaseHandle) int {
+		return cmp.Compare(a.RunID, b.RunID)
+	})
+	return handles, nil
+}
+
+func (s *inMemoryManagerStore) ClaimNextRun(
+	_ context.Context,
+	criteria ClaimCriteria,
+) (ClaimResult, error) {
+	s.lastClaimCriteria = criteria
+	normalized, err := criteria.Normalize(time.Now().UTC())
+	if err != nil {
+		return ClaimResult{}, err
+	}
+	for _, run := range s.runs {
+		if run.SessionID == normalized.ClaimerSessionID &&
+			(run.Status == TaskRunStatusClaimed || run.Status == TaskRunStatusStarting || run.Status == TaskRunStatusRunning) &&
+			(run.LeaseUntil.IsZero() || run.LeaseUntil.After(normalized.Now)) {
+			return ClaimResult{}, ErrActiveRunLease
+		}
+	}
+
+	candidates := make([]Run, 0)
+	for _, run := range s.runs {
+		taskRecord, ok := s.tasks[run.TaskID]
+		if !ok || run.Status.Normalize() != TaskRunStatusQueued {
+			continue
+		}
+		if normalized.RunID != "" && run.ID != normalized.RunID {
+			continue
+		}
+		switch taskRecord.Status.Normalize() {
+		case TaskStatusDraft, TaskStatusBlocked, TaskStatusNeedsAttention, TaskStatusCanceled:
+			continue
+		}
+		if normalized.RunID != "" && normalized.WorkspaceID != "" {
+			if taskRecord.Scope.Normalize() == ScopeWorkspace && taskRecord.WorkspaceID != normalized.WorkspaceID {
+				continue
+			}
+		} else {
+			if taskRecord.Scope.Normalize() != normalized.Scope {
+				continue
+			}
+			if normalized.Scope == ScopeWorkspace && taskRecord.WorkspaceID != normalized.WorkspaceID {
+				continue
+			}
+		}
+		if !testClaimOwnerEligible(taskRecord, normalized) {
+			continue
+		}
+		if testTaskPriorityValue(taskRecord.Priority) < normalized.PriorityMin {
+			continue
+		}
+		if !capabilitySetContainsAll(normalized.RequiredCapabilities, run.RequiredCapabilities) {
+			continue
+		}
+		candidates = append(candidates, cloneTaskRun(run))
+	}
+	slices.SortFunc(candidates, func(a, b Run) int {
+		return cmp.Or(
+			cmp.Compare(
+				testTaskPriorityValue(s.tasks[b.TaskID].Priority),
+				testTaskPriorityValue(s.tasks[a.TaskID].Priority),
+			),
+			a.QueuedAt.Compare(b.QueuedAt),
+			cmp.Compare(a.ID, b.ID),
+		)
+	})
+	if len(candidates) == 0 {
+		return ClaimResult{}, ErrNoClaimableRun
+	}
+
+	token, err := NewClaimToken()
+	if err != nil {
+		return ClaimResult{}, err
+	}
+	tokenHash, err := ClaimTokenHash(token)
+	if err != nil {
+		return ClaimResult{}, err
+	}
+	run := candidates[0]
+	run.Status = TaskRunStatusClaimed
+	run.ClaimedBy = cloneActorIdentity(normalized.ClaimedBy)
+	run.SessionID = normalized.ClaimerSessionID
+	run.ClaimTokenHash = tokenHash
+	s.claimTokens[run.ID] = token
+	run.ClaimedAt = normalized.Now
+	run.HeartbeatAt = normalized.Now
+	run.LeaseUntil = normalized.Now.Add(normalized.LeaseDuration)
+	s.runs[run.ID] = cloneTaskRun(run)
+	var taskRecord *Task
+	if strings.TrimSpace(run.TaskID) != "" {
+		taskRecord = new(cloneTask(s.tasks[run.TaskID]))
+	}
+	return ClaimResult{
+		Task:       taskRecord,
+		Run:        cloneTaskRun(run),
+		ClaimToken: token,
+		LeaseUntil: run.LeaseUntil,
+	}, nil
+}
+
+func testClaimOwnerEligible(taskRecord Task, criteria ClaimCriteria) bool {
+	if taskRecord.Owner == nil || taskRecord.Owner.IsZero() {
+		return true
+	}
+	ownerKind := taskRecord.Owner.Kind.Normalize()
+	ownerRef := strings.TrimSpace(taskRecord.Owner.Ref)
+	if strings.TrimSpace(criteria.RunID) == "" {
+		switch ownerKind {
+		case OwnerKindPool:
+			return ownerRef == strings.TrimSpace(criteria.AgentName)
+		case OwnerKindAgentSession:
+			return ownerRef == strings.TrimSpace(criteria.ClaimerSessionID)
+		default:
+			return false
+		}
+	}
+
+	switch ownerKind {
+	case OwnerKindHuman, OwnerKindAutomation, OwnerKindExtension:
+		return true
+	case OwnerKindPool:
+		return ownerRef == strings.TrimSpace(criteria.AgentName)
+	case OwnerKindAgentSession:
+		return ownerRef == strings.TrimSpace(criteria.ClaimerSessionID) ||
+			(criteria.ClaimedBy != nil && criteria.ClaimedBy.Kind.Normalize() == ActorKindDaemon)
+	default:
+		return false
+	}
+}
+
+func testTaskPriorityValue(priority Priority) int {
+	switch priority.Normalize() {
+	case PriorityUrgent:
+		return 40
+	case PriorityHigh:
+		return 30
+	case PriorityMedium:
+		return 20
+	case PriorityLow:
+		return 10
+	default:
+		return 0
+	}
+}
+
+func (s *inMemoryManagerStore) HeartbeatRunLease(
+	_ context.Context,
+	heartbeat LeaseHeartbeat,
+) (Run, error) {
+	normalized, err := heartbeat.Normalize(time.Now().UTC())
+	if err != nil {
+		return Run{}, err
+	}
+	run, err := s.requireCurrentTestLease(normalized.RunID, normalized.ClaimToken, normalized.Now)
+	if err != nil {
+		return Run{}, err
+	}
+	run.HeartbeatAt = normalized.Now
+	run.LeaseUntil = normalized.Now.Add(normalized.LeaseDuration)
+	if normalized.TokensUsed > run.TokensUsed {
+		run.TokensUsed = normalized.TokensUsed
+	}
+	s.runs[run.ID] = cloneTaskRun(run)
+	return cloneTaskRun(run), nil
+}
+
+func (s *inMemoryManagerStore) BindLeasedRunSession(
+	_ context.Context,
+	binding LeaseSessionBinding,
+) (Run, error) {
+	normalized, err := binding.Normalize(time.Now().UTC())
+	if err != nil {
+		return Run{}, err
+	}
+	run, err := s.requireCurrentTestLease(normalized.RunID, normalized.ClaimToken, normalized.Now)
+	if err != nil {
+		return Run{}, err
+	}
+	run.SessionID = normalized.SessionID
+	s.runs[run.ID] = cloneTaskRun(run)
+	return cloneTaskRun(run), nil
+}
+
+func (s *inMemoryManagerStore) ReleaseRunLease(
+	_ context.Context,
+	release LeaseRelease,
+) (Run, error) {
+	normalized, err := release.Normalize(time.Now().UTC())
+	if err != nil {
+		return Run{}, err
+	}
+	run, err := s.requireCurrentTestLease(normalized.RunID, normalized.ClaimToken, normalized.Now)
+	if err != nil {
+		return Run{}, err
+	}
+	run = requeuedTestRun(run)
+	s.runs[run.ID] = cloneTaskRun(run)
+	return cloneTaskRun(run), nil
+}
+
+func (s *inMemoryManagerStore) ListActiveSessionRunLeases(
+	_ context.Context,
+	sessionID string,
+) ([]Run, error) {
+	normalizedSessionID := strings.TrimSpace(sessionID)
+	if err := ValidateReferenceSize(normalizedSessionID, "session_lease_release.session_id"); err != nil {
+		return nil, err
+	}
+
+	runs := make([]Run, 0)
+	for _, run := range s.runs {
+		if strings.TrimSpace(run.SessionID) != normalizedSessionID || strings.TrimSpace(run.ClaimTokenHash) == "" {
+			continue
+		}
+		switch run.Status.Normalize() {
+		case TaskRunStatusClaimed, TaskRunStatusStarting, TaskRunStatusRunning:
+			runs = append(runs, cloneTaskRun(run))
+		}
+	}
+	slices.SortFunc(runs, func(a, b Run) int {
+		return cmp.Compare(a.ID, b.ID)
+	})
+	return runs, nil
+}
+
+func (s *inMemoryManagerStore) ReleaseSessionRunLease(
+	_ context.Context,
+	previous Run,
+	release SessionLeaseRelease,
+	actor ActorContext,
+) (Run, error) {
+	if err := actor.Validate(); err != nil {
+		return Run{}, err
+	}
+	if err := release.Validate("session_lease_release"); err != nil {
+		return Run{}, err
+	}
+	current, ok := s.runs[previous.ID]
+	if !ok || current.Status.Normalize() != previous.Status.Normalize() ||
+		current.SessionID != previous.SessionID || current.ClaimTokenHash != previous.ClaimTokenHash ||
+		!current.LeaseUntil.Equal(previous.LeaseUntil) {
+		return Run{}, ErrTaskRunNotFound
+	}
+	updated := requeueSessionRunLease(current)
+	s.runs[updated.ID] = cloneTaskRun(updated)
+	return cloneTaskRun(updated), nil
+}
+
+func (s *inMemoryManagerStore) CompleteRunLease(
+	_ context.Context,
+	completion LeaseCompletion,
+) (Run, error) {
+	normalized, err := completion.Normalize(time.Now().UTC())
+	if err != nil {
+		return Run{}, err
+	}
+	run, err := s.requireCurrentTestLease(normalized.RunID, normalized.ClaimToken, normalized.Now)
+	if err != nil {
+		return Run{}, err
+	}
+	if err := s.verifyCompletionCreatedTaskClaimsForTest(run, normalized.CreatedTaskIDs); err != nil {
+		return Run{}, err
+	}
+	run.Status = TaskRunStatusCompleted
+	run.SetResult(normalized.Result.Value)
+	run.Error = ""
+	run.TokensUsed = normalized.TokensUsed
+	run.LeaseUntil = time.Time{}
+	run.HeartbeatAt = time.Time{}
+	run.EndedAt = normalized.Now
+	s.runs[run.ID] = cloneTaskRun(run)
+	for key, recurrence := range s.blockRecurrences {
+		if strings.TrimSpace(recurrence.TaskID) == strings.TrimSpace(run.TaskID) {
+			delete(s.blockRecurrences, key)
+		}
+	}
+	if err := s.appendTaskEventForTest(
+		run.TaskID,
+		run.ID,
+		taskWatchEventRunCompleted,
+		normalized.Actor,
+		map[string]any{"status": run.Status},
+		normalized.Now,
+	); err != nil {
+		return Run{}, err
+	}
+	return cloneTaskRun(run), nil
+}
+
+func (s *inMemoryManagerStore) CompleteRunLeaseSettlement(
+	ctx context.Context,
+	completion LeaseCompletion,
+) (CompletedRunSettlement, error) {
+	run, err := s.CompleteRunLease(ctx, completion)
+	if err != nil {
+		return CompletedRunSettlement{}, err
+	}
+	taskRecord, ok := s.tasks[run.TaskID]
+	if !ok {
+		return CompletedRunSettlement{}, ErrTaskNotFound
+	}
+	previousStatus := taskRecord.Status
+	taskRecord.Status = TaskStatusCompleted
+	taskRecord.UpdatedAt = run.EndedAt
+	taskRecord.ClosedAt = run.EndedAt
+	s.tasks[taskRecord.ID] = cloneTask(taskRecord)
+	return CompletedRunSettlement{
+		Run:  cloneTaskRun(run),
+		Task: cloneTask(taskRecord),
+		StatusTransitions: []StatusTransition{{
+			Task:           cloneTask(taskRecord),
+			PreviousStatus: previousStatus,
+		}},
+	}, nil
+}
+
+func (s *inMemoryManagerStore) verifyCompletionCreatedTaskClaimsForTest(
+	run Run,
+	claimedTaskIDs []string,
+) error {
+	if len(claimedTaskIDs) == 0 {
+		return nil
+	}
+	taskRecord, ok := s.tasks[strings.TrimSpace(run.TaskID)]
+	if !ok {
+		return ErrTaskNotFound
+	}
+	sessionID := strings.TrimSpace(run.SessionID)
+	invalidTaskIDs := make([]string, 0)
+	for _, claimedTaskID := range claimedTaskIDs {
+		record, exists := s.tasks[strings.TrimSpace(claimedTaskID)]
+		matches := exists &&
+			strings.TrimSpace(record.WorkspaceID) == strings.TrimSpace(taskRecord.WorkspaceID) &&
+			record.CreatedBy.Kind.Normalize() == ActorKindAgentSession &&
+			strings.TrimSpace(record.CreatedBy.Ref) == sessionID &&
+			sessionID != ""
+		if !matches {
+			invalidTaskIDs = append(invalidTaskIDs, claimedTaskID)
+		}
+	}
+	if len(invalidTaskIDs) > 0 {
+		return NewHallucinatedTaskRefsError(run, claimedTaskIDs, invalidTaskIDs)
+	}
+	return nil
+}
+
+func (s *inMemoryManagerStore) FailRunLease(_ context.Context, failure LeaseFailure) (Run, error) {
+	normalized, err := failure.Normalize(time.Now().UTC())
+	if err != nil {
+		return Run{}, err
+	}
+	mutation, err := s.failRunLeaseMutation(normalized)
+	if err != nil {
+		return Run{}, err
+	}
+	if err := s.appendTaskEventForTest(
+		mutation.Run.TaskID,
+		mutation.Run.ID,
+		taskWatchEventRunFailed,
+		normalized.Actor,
+		NewRunLeaseFailedEventPayload(&mutation),
+		normalized.Now,
+	); err != nil {
+		return Run{}, err
+	}
+	return mutation.Run, nil
+}
+
+func (s *inMemoryManagerStore) FailRunLeaseMutation(
+	_ context.Context,
+	failure LeaseFailure,
+) (FailedRunLeaseMutation, error) {
+	normalized, err := failure.Normalize(time.Now().UTC())
+	if err != nil {
+		return FailedRunLeaseMutation{}, err
+	}
+	return s.failRunLeaseMutation(normalized)
+}
+
+func (s *inMemoryManagerStore) failRunLeaseMutation(
+	normalized LeaseFailure,
+) (FailedRunLeaseMutation, error) {
+	run, err := s.requireCurrentTestLease(normalized.RunID, normalized.ClaimToken, normalized.Now)
+	if err != nil {
+		return FailedRunLeaseMutation{}, err
+	}
+
+	if run.RunKind.Normalize() == RunKindCoordinator {
+		normalized.Failure = CanonicalCoordinatorRunFailure(normalized.Failure)
+	}
+	run.Status = TaskRunStatusFailed
+	run.Error = normalized.Failure.Error
+	run.ClearResult()
+	run.TokensUsed = normalized.TokensUsed
+	run.LeaseUntil = time.Time{}
+	run.HeartbeatAt = time.Time{}
+	run.EndedAt = normalized.Now
+	s.runs[run.ID] = cloneTaskRun(run)
+	delete(s.claimTokens, run.ID)
+	return FailedRunLeaseMutation{
+		Run:     cloneTaskRun(run),
+		Failure: normalized.Failure,
+	}, nil
+}
+
+func (s *inMemoryManagerStore) CompleteCoordinatorAndEnqueueNext(
+	ctx context.Context,
+	completion CoordinatorCompletion,
+	_ GenerationStateFinalizer,
+) (CoordinatorCompletionResult, error) {
+	s.coordinatorCompletions = append(s.coordinatorCompletions, completion)
+	if len(s.coordinatorPreCommitErrs) > 0 {
+		err := s.coordinatorPreCommitErrs[0]
+		s.coordinatorPreCommitErrs = s.coordinatorPreCommitErrs[1:]
+		if err != nil {
+			return CoordinatorCompletionResult{}, err
+		}
+	}
+	normalized, err := completion.Normalize(time.Now().UTC())
+	if err != nil {
+		return CoordinatorCompletionResult{}, err
+	}
+	run, err := s.requireCurrentTestLease(normalized.RunID, normalized.ClaimToken, normalized.Now)
+	if err != nil {
+		return CoordinatorCompletionResult{}, err
+	}
+	run.Status = TaskRunStatusCompleted
+	run.Error = ""
+	run.SetResult(CoordinatorCompletedRunResult())
+	run.LeaseUntil = time.Time{}
+	run.HeartbeatAt = time.Time{}
+	run.EndedAt = normalized.Now
+	s.runs[run.ID] = cloneTaskRun(run)
+	taskRecord, ok := s.tasks[run.TaskID]
+	if !ok {
+		return CoordinatorCompletionResult{}, ErrTaskNotFound
+	}
+	previousStatus := taskRecord.Status
+	taskRecord.Status = TaskStatusCompleted
+	taskRecord.CurrentRunID = ""
+	taskRecord.UpdatedAt = normalized.Now
+	taskRecord.ClosedAt = normalized.Now
+	s.tasks[taskRecord.ID] = taskRecord
+	settlement := CompletedRunSettlement{Run: cloneTaskRun(run), Task: taskRecord}
+	if previousStatus.Normalize() != taskRecord.Status.Normalize() {
+		settlement.StatusTransitions = []StatusTransition{{
+			Task:           taskRecord,
+			PreviousStatus: previousStatus,
+		}}
+	}
+	completionEvent, err := NewCoordinatorRunCompletedEvent(
+		fmt.Sprintf("evt-%d", s.nextEventSequence+1),
+		run,
+		taskRecord,
+		normalized.Actor,
+		normalized.Now,
+	)
+	if err != nil {
+		return CoordinatorCompletionResult{}, err
+	}
+	if err := s.CreateTaskEvent(ctx, completionEvent); err != nil {
+		return CoordinatorCompletionResult{}, err
+	}
+	result := CoordinatorCompletionResult{
+		Run:             cloneTaskRun(run),
+		LoopRunID:       run.LoopRunID,
+		PlanSuperseded:  s.coordinatorPlanSuperseded,
+		Settlement:      &settlement,
+		CompletionEvent: completionEvent,
+	}
+	if normalized.Plan.Terminal != nil {
+		contextPayload, marshalErr := json.Marshal(coordinatorResultContext{
+			Status: normalized.Plan.Terminal.Status,
+		})
+		if marshalErr != nil {
+			return CoordinatorCompletionResult{}, fmt.Errorf(
+				"marshal coordinator result context: %w",
+				marshalErr,
+			)
+		}
+		result.Context = contextPayload
+		result.Terminal = true
+	}
+	s.coordinatorCompleted = true
+	return result, s.coordinatorCompletionErr
+}
+
+func (s *inMemoryManagerStore) ForceReleaseTaskRun(
+	_ context.Context,
+	release ForceReleaseRunMutation,
+) (ForceRunMutationResult, error) {
+	fence := release.Fence()
+	run, ok := s.runs[strings.TrimSpace(fence.RunID())]
+	if !ok {
+		return ForceRunMutationResult{}, ErrTaskRunNotFound
+	}
+	if !fence.Matches(run) {
+		return ForceRunMutationResult{}, ErrInvalidStatusTransition
+	}
+	if run.Status.Normalize() != TaskRunStatusClaimed {
+		return ForceRunMutationResult{}, ErrInvalidStatusTransition
+	}
+	previous := cloneTaskRun(run)
+	run = requeuedTestRun(run)
+	s.runs[run.ID] = cloneTaskRun(run)
+	return ForceRunMutationResult{Previous: previous, Run: cloneTaskRun(run)}, nil
+}
+
+func (s *inMemoryManagerStore) ForceFailTaskRun(
+	_ context.Context,
+	failure ForceFailRunMutation,
+) (ForceRunMutationResult, error) {
+	fence := failure.Fence()
+	run, ok := s.runs[strings.TrimSpace(fence.RunID())]
+	if !ok {
+		return ForceRunMutationResult{}, ErrTaskRunNotFound
+	}
+	if !fence.Matches(run) {
+		return ForceRunMutationResult{}, ErrInvalidStatusTransition
+	}
+	switch run.Status.Normalize() {
+	case TaskRunStatusQueued, TaskRunStatusClaimed:
+	default:
+		return ForceRunMutationResult{}, ErrInvalidStatusTransition
+	}
+	previous := cloneTaskRun(run)
+	run.Status = TaskRunStatusFailed
+	run.Error = strings.TrimSpace(failure.Reason())
+	run.FailureKind = FailureKindOperatorForced
+	run.ClearResult()
+	run.ClaimTokenHash = ""
+	run.LeaseUntil = time.Time{}
+	run.HeartbeatAt = time.Time{}
+	run.EndedAt = failure.Now().UTC()
+	if run.EndedAt.IsZero() {
+		run.EndedAt = time.Now().UTC()
+	}
+	s.runs[run.ID] = cloneTaskRun(run)
+	return ForceRunMutationResult{Previous: previous, Run: cloneTaskRun(run)}, nil
+}
+
+func (s *inMemoryManagerStore) InvalidateForceRunInputs(
+	context.Context,
+	string,
+	time.Time,
+) (ForceRunInputInvalidation, error) {
+	return ForceRunInputInvalidation{}, nil
+}
+
+func (s *inMemoryManagerStore) RetryTaskRun(
+	_ context.Context,
+	retry RetryRunMutation,
+) (RetryRunResult, error) {
+	fence := retry.Fence()
+	source, ok := s.runs[strings.TrimSpace(fence.RunID())]
+	if !ok {
+		return RetryRunResult{}, ErrTaskRunNotFound
+	}
+	if !fence.Matches(source) {
+		return RetryRunResult{}, ErrInvalidStatusTransition
+	}
+	if source.Status.Normalize() != TaskRunStatusFailed {
+		return RetryRunResult{}, ErrInvalidStatusTransition
+	}
+	for _, run := range s.runs {
+		if strings.TrimSpace(run.PreviousRunID) == source.ID {
+			return RetryRunResult{}, ErrInvalidStatusTransition
+		}
+	}
+	taskRecord, ok := s.tasks[source.TaskID]
+	if !ok {
+		return RetryRunResult{}, ErrTaskNotFound
+	}
+	attempt := 1
+	for _, run := range s.runs {
+		if run.TaskID == source.TaskID && int(run.Attempt) >= attempt {
+			attempt = int(run.Attempt) + 1
+		}
+	}
+	if attempt > taskRecord.MaxAttempts {
+		return RetryRunResult{}, ErrInvalidStatusTransition
+	}
+	queuedAt := retry.QueuedAt().UTC()
+	if queuedAt.IsZero() {
+		queuedAt = time.Now().UTC()
+	}
+	run := Run{
+		ID:            strings.TrimSpace(retry.NewRunID()),
+		TaskID:        source.TaskID,
+		Status:        TaskRunStatusQueued,
+		Attempt:       int32(attempt),
+		PreviousRunID: source.ID,
+		Origin:        retry.Origin(),
+
+		Metadata: cloneRawJSON(retry.Metadata()),
+		QueuedAt: queuedAt,
+	}
+	s.runs[run.ID] = cloneTaskRun(run)
+	return RetryRunResult{PreviousRun: cloneTaskRun(source), Run: cloneTaskRun(run)}, nil
+}
+
+func (s *inMemoryManagerStore) RecoverTaskRun(
+	_ context.Context,
+	mutation RecoverRunMutation,
+) (RetryRunResult, error) {
+	fence := mutation.Fence()
+	source, ok := s.runs[strings.TrimSpace(fence.RunID())]
+	if !ok {
+		return RetryRunResult{}, ErrTaskRunNotFound
+	}
+	if !fence.Matches(source) {
+		return RetryRunResult{}, ErrInvalidStatusTransition
+	}
+	if source.Status.Normalize() != TaskRunStatusNeedsAttention {
+		return RetryRunResult{}, ErrInvalidStatusTransition
+	}
+	for _, run := range s.runs {
+		if strings.TrimSpace(run.PreviousRunID) == source.ID {
+			return RetryRunResult{}, ErrInvalidStatusTransition
+		}
+	}
+	taskRecord, ok := s.tasks[source.TaskID]
+	if !ok {
+		return RetryRunResult{}, ErrTaskNotFound
+	}
+	attempt := 1
+	for _, run := range s.runs {
+		if run.TaskID == source.TaskID && int(run.Attempt) >= attempt {
+			attempt = int(run.Attempt) + 1
+		}
+	}
+	if attempt > taskRecord.MaxAttempts {
+		return RetryRunResult{}, ErrInvalidStatusTransition
+	}
+	queuedAt := mutation.QueuedAt().UTC()
+	if queuedAt.IsZero() {
+		queuedAt = time.Now().UTC()
+	}
+	failed := source
+	failed.Status = TaskRunStatusFailed
+	failed.FailureKind = FailureKindOperatorForced
+	failed.Error = strings.TrimSpace(mutation.Reason())
+	failed.EndedAt = queuedAt
+	s.runs[failed.ID] = cloneTaskRun(failed)
+	run := Run{
+		ID:            strings.TrimSpace(mutation.NewRunID()),
+		TaskID:        source.TaskID,
+		Status:        TaskRunStatusQueued,
+		Attempt:       int32(attempt),
+		PreviousRunID: source.ID,
+		Origin:        mutation.Origin(),
+
+		Metadata: cloneRawJSON(mutation.Metadata()),
+		QueuedAt: queuedAt,
+	}
+	s.runs[run.ID] = cloneTaskRun(run)
+	return RetryRunResult{PreviousRun: cloneTaskRun(failed), Run: cloneTaskRun(run)}, nil
+}
+
+func (s *inMemoryManagerStore) MarkRunNeedsAttentionMutation(
+	_ context.Context,
+	command RunNeedsAttentionCommand,
+) (RunNeedsAttentionMutation, error) {
+	run, ok := s.runs[command.Fence().RunID()]
+	if !ok {
+		return RunNeedsAttentionMutation{}, ErrTaskRunNotFound
+	}
+	previous := cloneTaskRun(run)
+	if !command.Fence().Matches(previous) {
+		return RunNeedsAttentionMutation{}, ErrInvalidStatusTransition
+	}
+	if previous.Status.Normalize() == TaskRunStatusNeedsAttention {
+		return RunNeedsAttentionMutation{Previous: previous, Run: previous}, nil
+	}
+	if !runStatusAllowsNeedsAttention(previous.Status) {
+		return RunNeedsAttentionMutation{}, ErrInvalidStatusTransition
+	}
+	run.Status = TaskRunStatusNeedsAttention
+	run.Error = command.Diagnostic()
+	s.runs[run.ID] = cloneTaskRun(run)
+	return RunNeedsAttentionMutation{
+		Previous: previous,
+		Run:      cloneTaskRun(run),
+		Applied:  true,
+	}, nil
+}
+
+func (s *inMemoryManagerStore) RecoverExpiredRunLeases(
+	_ context.Context,
+	recovery ExpiredLeaseRecovery,
+) ([]ExpiredLeaseRecoveryResult, error) {
+	normalized, err := recovery.Normalize(time.Now().UTC())
+	if err != nil {
+		return nil, err
+	}
+	results := make([]ExpiredLeaseRecoveryResult, 0)
+	for _, run := range s.runs {
+		if run.LeaseUntil.IsZero() || run.LeaseUntil.After(normalized.Now) {
+			continue
+		}
+		switch run.Status.Normalize() {
+		case TaskRunStatusClaimed, TaskRunStatusStarting, TaskRunStatusRunning:
+		default:
+			continue
+		}
+		previous := run
+		exhausted := false
+		taskRecord := s.tasks[run.TaskID]
+		exhausted = int(run.Attempt)+int(run.RecoveryCount) >=
+			normalizeTaskMaxAttemptsOrDefault(taskRecord.MaxAttempts)
+		if exhausted {
+			run.Status = TaskRunStatusNeedsAttention
+			run.ClaimedBy = nil
+			run.SessionID = ""
+			run.ClaimTokenHash = ""
+			run.LeaseUntil = time.Time{}
+			run.HeartbeatAt = time.Time{}
+			run.EndedAt = normalized.Now
+			run.Error = LeaseRecoveryExhaustedReason
+			taskRecord.NeedsAttention = &NeedsAttention{
+				Reason: LeaseRecoveryExhaustedReason,
+				At:     normalized.Now,
+				By:     normalized.Actor.Actor,
+			}
+			s.tasks[run.TaskID] = cloneTask(taskRecord)
+		} else {
+			run = requeuedTestRun(run)
+			run.RecoveryCount++
+		}
+		s.runs[run.ID] = cloneTaskRun(run)
+		results = append(results, ExpiredLeaseRecoveryResult{
+			Run:                    cloneTaskRun(run),
+			PreviousRunStatus:      previous.Status,
+			PreviousSessionID:      previous.SessionID,
+			PreviousLeaseUntil:     previous.LeaseUntil,
+			PreviousClaimTokenHash: previous.ClaimTokenHash,
+			Reason:                 normalized.Reason,
+			Exhausted:              exhausted,
+		})
+	}
+	return results, nil
+}
+
+func (s *inMemoryManagerStore) requireCurrentTestLease(
+	runID string,
+	claimToken string,
+	now time.Time,
+) (Run, error) {
+	run, ok := s.runs[strings.TrimSpace(runID)]
+	if !ok {
+		return Run{}, ErrTaskRunNotFound
+	}
+	if !VerifyClaimToken(claimToken, run.ClaimTokenHash) {
+		return Run{}, ErrInvalidClaimToken
+	}
+	switch run.Status.Normalize() {
+	case TaskRunStatusClaimed, TaskRunStatusStarting, TaskRunStatusRunning:
+	default:
+		return Run{}, ErrInvalidStatusTransition
+	}
+	if run.LeaseUntil.IsZero() || !run.LeaseUntil.After(now) {
+		return Run{}, ErrLeaseExpired
+	}
+	return cloneTaskRun(run), nil
+}
+
+func capabilitySetContainsAll(have []string, required []string) bool {
+	if len(required) == 0 {
+		return true
+	}
+	capabilities := make(map[string]struct{}, len(have))
+	for _, capability := range have {
+		capabilities[strings.TrimSpace(capability)] = struct{}{}
+	}
+	for _, capability := range required {
+		if _, ok := capabilities[strings.TrimSpace(capability)]; !ok {
+			return false
+		}
+	}
+	return true
+}
+
+func requeuedTestRun(run Run) Run {
+	run.Status = TaskRunStatusQueued
+	run.ClaimedBy = nil
+	run.SessionID = ""
+	run.ClaimTokenHash = ""
+	run.LeaseUntil = time.Time{}
+	run.HeartbeatAt = time.Time{}
+	run.ClaimedAt = time.Time{}
+	run.StartedAt = time.Time{}
+	run.EndedAt = time.Time{}
+	run.Error = ""
+	run.ClearResult()
+	return run
+}
+
+func (s *inMemoryManagerStore) ReserveQueuedRun(
+	_ context.Context,
+	reservation QueueRunReservation,
+) (Task, Run, bool, error) {
+	normalizedReservation := reservation
+	normalizedReservation.TaskID = strings.TrimSpace(normalizedReservation.TaskID)
+	normalizedReservation.RunID = strings.TrimSpace(normalizedReservation.RunID)
+	normalizedReservation.RunKind = normalizeRunKindOrDefault(normalizedReservation.RunKind)
+	normalizedReservation.LoopRunID = strings.TrimSpace(normalizedReservation.LoopRunID)
+	normalizedReservation.IdempotencyKey = strings.TrimSpace(normalizedReservation.IdempotencyKey)
+	normalizedReservation.DesignationGroupID = strings.TrimSpace(normalizedReservation.DesignationGroupID)
+	normalizedReservation.Metadata = normalizeRawJSON(normalizedReservation.Metadata)
+	if err := normalizedReservation.Validate("queue_run_reservation"); err != nil {
+		return Task{}, Run{}, false, err
+	}
+	taskRecord, ok := s.tasks[normalizedReservation.TaskID]
+	if !ok {
+		return Task{}, Run{}, false, ErrTaskNotFound
+	}
+	taskRecord = cloneTask(taskRecord)
+	if err := validateTaskForEnqueue(taskRecord); err != nil {
+		return Task{}, Run{}, false, err
+	}
+
+	trimmedKey := normalizedReservation.IdempotencyKey
+	if trimmedKey != "" {
+		if record, ok := s.idempotencyByKey[idempotencyKey(normalizedReservation.Origin, trimmedKey)]; ok {
+			existingRun, err := s.GetTaskRun(context.Background(), record.RunID)
+			if err != nil {
+				return Task{}, Run{}, false, err
+			}
+			if existingRun.TaskID != taskRecord.ID {
+				return Task{}, Run{}, false, fmtTestError(
+					"%w: idempotency key %q is already bound to task %q",
+					ErrValidation,
+					trimmedKey,
+					existingRun.TaskID,
+				)
+			}
+			return taskRecord, existingRun, true, nil
+		}
+	}
+
+	existingRuns, err := s.ListTaskRuns(context.Background(), RunQuery{TaskID: taskRecord.ID})
+	if err != nil {
+		return Task{}, Run{}, false, err
+	}
+	requestedDesignationGroupID := normalizedReservation.DesignationGroupID
+	if hasBlockingOpenRunForDesignation(existingRuns, requestedDesignationGroupID) {
+		return Task{}, Run{}, false, fmtTestError(
+			"%w: task %q has open run; finish or cancel it before enqueueing another run",
+			ErrInvalidStatusTransition,
+			taskRecord.ID,
+		)
+	}
+	nextAttempt := nextRunAttempt(existingRuns)
+	maxAttempts := normalizeTaskMaxAttemptsOrDefault(taskRecord.MaxAttempts)
+	if nextAttempt > maxAttempts {
+		return Task{}, Run{}, false, fmtTestError(
+			"%w: task %q exhausted max_attempts=%d",
+			ErrInvalidStatusTransition,
+			taskRecord.ID,
+			maxAttempts,
+		)
+	}
+
+	run := Run{
+		ID:                 normalizedReservation.RunID,
+		TaskID:             taskRecord.ID,
+		RunKind:            normalizedReservation.RunKind,
+		LoopRunID:          normalizedReservation.LoopRunID,
+		Status:             TaskRunStatusQueued,
+		Attempt:            int32(nextAttempt),
+		Origin:             normalizedReservation.Origin,
+		IdempotencyKey:     trimmedKey,
+		DesignationGroupID: requestedDesignationGroupID,
+		RunWorktreeState: &RunWorktreeState{
+			ResolvedWorktreeMode: normalizedReservation.ResolvedWorktreeMode,
+			ResolvedWorktreeRef:  normalizedReservation.ResolvedWorktreeRef,
+		},
+		Metadata: normalizedReservation.Metadata,
+		QueuedAt: normalizedReservation.QueuedAt.UTC(),
+	}
+
+	if err := s.CreateTaskRun(context.Background(), run); err != nil {
+		return Task{}, Run{}, false, err
+	}
+	if trimmedKey != "" {
+		if err := s.SaveTaskRunIdempotency(context.Background(), RunIdempotency{
+			IdempotencyKey: trimmedKey,
+			RunID:          run.ID,
+			Origin:         normalizedReservation.Origin,
+			CreatedAt:      normalizedReservation.QueuedAt.UTC(),
+		}); err != nil {
+			return Task{}, Run{}, false, err
+		}
+	}
+	return taskRecord, run, false, nil
+}
+
+func hasBlockingOpenRunForDesignation(runs []Run, designationGroupID string) bool {
+	targetDesignationGroupID := strings.TrimSpace(designationGroupID)
+	for _, run := range runs {
+		if isTerminalRunStatus(run.Status) {
+			continue
+		}
+		if targetDesignationGroupID != "" &&
+			strings.TrimSpace(run.DesignationGroupID) == targetDesignationGroupID {
+			continue
+		}
+		return true
+	}
+	return false
+}
+
+func (s *inMemoryManagerStore) CreateTaskEvent(_ context.Context, event Event) error {
+	if _, ok := s.tasks[event.TaskID]; !ok {
+		return ErrTaskNotFound
+	}
+	s.events = append(s.events, event)
+	s.nextEventSequence++
+	s.eventSequenceByID[event.ID] = s.nextEventSequence
+	slices.SortFunc(s.events, func(a, b Event) int {
+		return cmp.Or(b.Timestamp.Compare(a.Timestamp), cmp.Compare(b.ID, a.ID))
+	})
+	return nil
+}
+
+func (s *inMemoryManagerStore) appendTaskEventForTest(
+	taskID string,
+	runID string,
+	eventType string,
+	actor ActorContext,
+	payload any,
+	timestamp time.Time,
+) error {
+	rawPayload, err := marshalTaskEventPayload(payload)
+	if err != nil {
+		return err
+	}
+	if timestamp.IsZero() {
+		timestamp = time.Date(2026, 4, 14, 15, 0, 0, 0, time.UTC)
+	}
+	return s.CreateTaskEvent(context.Background(), Event{
+		ID:        fmt.Sprintf("evt-%d", s.nextEventSequence+1),
+		TaskID:    strings.TrimSpace(taskID),
+		RunID:     strings.TrimSpace(runID),
+		EventType: strings.TrimSpace(eventType),
+		Actor:     actor.Actor,
+		Origin:    actor.Origin,
+		Payload:   rawPayload,
+		Timestamp: timestamp.UTC(),
+	})
+}
+
+func (s *inMemoryManagerStore) ListTaskEvents(
+	_ context.Context,
+	query EventQuery,
+) ([]Event, error) {
+	if err := query.Validate("task_event_query"); err != nil {
+		return nil, err
+	}
+	events := make([]Event, 0)
+	for _, event := range s.events {
+		if query.TaskID != "" && event.TaskID != strings.TrimSpace(query.TaskID) {
+			continue
+		}
+		if query.RunID != "" && event.RunID != strings.TrimSpace(query.RunID) {
+			continue
+		}
+		if query.EventType != "" && event.EventType != strings.TrimSpace(query.EventType) {
+			continue
+		}
+		events = append(events, event)
+	}
+	if query.Limit > 0 && len(events) > query.Limit {
+		return append([]Event(nil), events[:query.Limit]...), nil
+	}
+	return append([]Event(nil), events...), nil
+}
+
+func (s *inMemoryManagerStore) TaskWakeEventExists(
+	_ context.Context,
+	taskID string,
+	wakeEventID string,
+) (bool, error) {
+	trimmedTaskID := strings.TrimSpace(taskID)
+	trimmedWakeEventID := strings.TrimSpace(wakeEventID)
+	if trimmedTaskID == "" || trimmedWakeEventID == "" {
+		return false, ErrValidation
+	}
+	for _, event := range s.events {
+		if event.TaskID != trimmedTaskID {
+			continue
+		}
+		switch strings.TrimSpace(event.EventType) {
+		case taskEventWakeDelivered, taskEventWakeSuppressed:
+		default:
+			continue
+		}
+		var payload wakeTaskPayload
+		if err := json.Unmarshal(event.Payload, &payload); err != nil {
+			return false, fmt.Errorf("decode wake audit payload %q: %w", event.ID, err)
+		}
+		if strings.TrimSpace(payload.WakeEventID) == trimmedWakeEventID {
+			return true, nil
+		}
+	}
+	return false, nil
+}
+
+func (s *inMemoryManagerStore) GetTaskEventRecord(
+	_ context.Context,
+	eventID string,
+) (EventRecord, error) {
+	trimmedEventID := strings.TrimSpace(eventID)
+	sequence, ok := s.eventSequenceByID[trimmedEventID]
+	if !ok {
+		return EventRecord{}, ErrTaskEventNotFound
+	}
+	for _, event := range s.events {
+		if event.ID == trimmedEventID {
+			return EventRecord{Sequence: sequence, Event: event}, nil
+		}
+	}
+	return EventRecord{}, ErrTaskEventNotFound
+}
+
+func (s *inMemoryManagerStore) ListTaskEventRecords(
+	_ context.Context,
+	query EventRecordQuery,
+) ([]EventRecord, error) {
+	if err := query.Validate("task_event_record_query"); err != nil {
+		return nil, err
+	}
+
+	records := make([]EventRecord, 0)
+	for _, event := range s.events {
+		if event.TaskID != strings.TrimSpace(query.TaskID) {
+			continue
+		}
+		sequence := s.eventSequenceByID[event.ID]
+		if sequence <= query.AfterSequence {
+			continue
+		}
+		records = append(records, EventRecord{
+			Sequence: sequence,
+			Event:    event,
+		})
+	}
+
+	slices.SortStableFunc(records, func(a, b EventRecord) int {
+		if query.Descending {
+			return cmp.Compare(b.Sequence, a.Sequence)
+		}
+		return cmp.Compare(a.Sequence, b.Sequence)
+	})
+	if query.Limit > 0 && len(records) > query.Limit {
+		return append([]EventRecord(nil), records[:query.Limit]...), nil
+	}
+	return append([]EventRecord(nil), records...), nil
+}
+
+func (s *inMemoryManagerStore) GetTaskRunByIdempotencyKey(
+	_ context.Context,
+	key string,
+	origin Origin,
+) (Run, error) {
+	record, ok := s.idempotencyByKey[idempotencyKey(origin, key)]
+	if !ok {
+		return Run{}, ErrTaskRunIdempotencyNotFound
+	}
+	return s.GetTaskRun(context.Background(), record.RunID)
+}
+
+func (s *inMemoryManagerStore) SaveTaskRunIdempotency(
+	_ context.Context,
+	record RunIdempotency,
+) error {
+	s.idempotencyByKey[idempotencyKey(record.Origin, record.IdempotencyKey)] = record
+	return nil
+}
+
+func TestDeriveActorContextsForSupportedSurfaces(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name    string
+		derive  func() (ActorContext, error)
+		want    ActorContext
+		wantErr error
+	}{
+		{
+			name: "human cli",
+			derive: func() (ActorContext, error) {
+				return DeriveHumanActorContext("user-1", OriginKindCLI, "compozy task create")
+			},
+			want: ActorContext{
+				Actor:     ActorIdentity{Kind: ActorKindHuman, Ref: "user-1"},
+				Origin:    Origin{Kind: OriginKindCLI, Ref: "compozy task create"},
+				Authority: FullAccessAuthority(),
+				Scope:     CallerScope{Operator: true},
+			},
+		},
+		{
+			name: "agent session",
+			derive: func() (ActorContext, error) {
+				return DeriveAgentSessionActorContext("sess-1", "ws-1")
+			},
+			want: ActorContext{
+				Actor:     ActorIdentity{Kind: ActorKindAgentSession, Ref: "sess-1"},
+				Origin:    Origin{Kind: OriginKindAgentSession, Ref: "sess-1"},
+				Authority: FullAccessAuthority(),
+				Scope:     CallerScope{SessionID: "sess-1", WorkspaceID: "ws-1"},
+			},
+		},
+		{
+			name: "automation-linked agent session",
+			derive: func() (ActorContext, error) {
+				return DeriveAutomationLinkedAgentSessionActorContext("sess-1", "ws-1", "run:run-1")
+			},
+			want: ActorContext{
+				Actor:     ActorIdentity{Kind: ActorKindAgentSession, Ref: "sess-1"},
+				Origin:    Origin{Kind: OriginKindAutomation, Ref: "run:run-1"},
+				Authority: FullAccessAuthority(),
+				Scope:     CallerScope{SessionID: "sess-1", WorkspaceID: "ws-1"},
+			},
+		},
+		{
+			name: "automation",
+			derive: func() (ActorContext, error) {
+				return DeriveAutomationActorContext("rule:nightly", "")
+			},
+			want: ActorContext{
+				Actor:     ActorIdentity{Kind: ActorKindAutomation, Ref: "rule:nightly"},
+				Origin:    Origin{Kind: OriginKindAutomation, Ref: "rule:nightly"},
+				Authority: FullAccessAuthority(),
+			},
+		},
+		{
+			name: "Should derive workspace automation with its policy home",
+			derive: func() (ActorContext, error) {
+				return DeriveAutomationActorContextForWorkspace("job:nightly", "ws-1", "run:run-1")
+			},
+			want: ActorContext{
+				Actor:     ActorIdentity{Kind: ActorKindAutomation, Ref: "job:nightly"},
+				Origin:    Origin{Kind: OriginKindAutomation, Ref: "run:run-1"},
+				Authority: FullAccessAuthority(),
+				Scope:     CallerScope{WorkspaceID: "ws-1"},
+			},
+		},
+		{
+			name: "extension",
+			derive: func() (ActorContext, error) {
+				return DeriveExtensionActorContext("ext.telegram", "cap.task.write")
+			},
+			want: ActorContext{
+				Actor:     ActorIdentity{Kind: ActorKindExtension, Ref: "ext.telegram"},
+				Origin:    Origin{Kind: OriginKindExtension, Ref: "cap.task.write"},
+				Authority: FullAccessAuthority(),
+			},
+		},
+
+		{
+			name: "human invalid origin",
+			derive: func() (ActorContext, error) {
+				return DeriveHumanActorContext("user-1", OriginKindAutomation, "rule:nightly")
+			},
+			wantErr: ErrValidation,
+		},
+		{
+			name: "manual actor origin mismatch rejected",
+			derive: func() (ActorContext, error) {
+				ctx := validActorContext()
+				ctx.Actor.Kind = ActorKindHuman
+				ctx.Origin.Kind = OriginKindAutomation
+				return ctx, ctx.Validate()
+			},
+			wantErr: ErrValidation,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			got, err := tt.derive()
+			if tt.wantErr == nil {
+				if err != nil {
+					t.Fatalf("derive() error = %v", err)
+				}
+				if got != tt.want {
+					t.Fatalf("derive() = %#v, want %#v", got, tt.want)
+				}
+				return
+			}
+			if err == nil {
+				t.Fatal("derive() error = nil, want non-nil")
+			}
+			if !errors.Is(err, tt.wantErr) {
+				t.Fatalf("derive() error = %v, want %v", err, tt.wantErr)
+			}
+		})
+	}
+}
+
+func TestManagerTimelineSupportsStableOrderingAndWindows(t *testing.T) {
+	t.Parallel()
+
+	ctx := t.Context()
+	store := newInMemoryManagerStore()
+	manager := newTaskManagerForTest(t, store)
+	actor := validActorContext()
+	base := time.Date(2026, 4, 17, 9, 0, 0, 0, time.UTC)
+
+	taskRecord := Task{
+		ID:             "task-root",
+		Scope:          ScopeGlobal,
+		Title:          "Root task",
+		Priority:       DefaultPriority,
+		MaxAttempts:    DefaultTaskMaxAttempts,
+		Status:         TaskStatusReady,
+		ApprovalPolicy: ApprovalPolicyNone,
+		ApprovalState:  ApprovalStateNotRequired,
+		CreatedBy:      actor.Actor,
+		Origin:         actor.Origin,
+		CreatedAt:      base,
+		UpdatedAt:      base,
+	}
+	if err := store.CreateTask(ctx, taskRecord); err != nil {
+		t.Fatalf("CreateTask() error = %v", err)
+	}
+	if err := store.CreateTaskRun(ctx, Run{
+		ID:        "run-1",
+		TaskID:    taskRecord.ID,
+		Status:    TaskRunStatusRunning,
+		Attempt:   1,
+		SessionID: "sess-1",
+		Origin:    actor.Origin,
+		QueuedAt:  base,
+		StartedAt: base.Add(30 * time.Second),
+	}); err != nil {
+		t.Fatalf("CreateTaskRun() error = %v", err)
+	}
+
+	sameTimestamp := base.Add(time.Minute)
+	for _, event := range []Event{
+		{
+			ID:        "evt-z",
+			TaskID:    taskRecord.ID,
+			EventType: taskEventUpdated,
+			Actor:     actor.Actor,
+			Origin:    actor.Origin,
+			Payload:   json.RawMessage(`{"reason":"reconciled_run_terminal"}`),
+			Timestamp: sameTimestamp,
+		},
+		{
+			ID:        "evt-a",
+			TaskID:    taskRecord.ID,
+			RunID:     "run-1",
+			EventType: taskEventRunEnqueued,
+			Actor:     actor.Actor,
+			Origin:    actor.Origin,
+			Timestamp: sameTimestamp,
+		},
+		{
+			ID:        "evt-b",
+			TaskID:    taskRecord.ID,
+			RunID:     "run-1",
+			EventType: taskEventRunStarted,
+			Actor:     actor.Actor,
+			Origin:    actor.Origin,
+			Timestamp: sameTimestamp,
+		},
+	} {
+		if err := store.CreateTaskEvent(ctx, event); err != nil {
+			t.Fatalf("CreateTaskEvent(%q) error = %v", event.ID, err)
+		}
+	}
+
+	window, err := manager.Timeline(ctx, taskRecord.ID, TimelineQuery{Limit: 2}, actor)
+	if err != nil {
+		t.Fatalf("Timeline(window) error = %v", err)
+	}
+	if got, want := len(window), 2; got != want {
+		t.Fatalf("len(window) = %d, want %d", got, want)
+	}
+	if got, want := []string{window[0].EventID, window[1].EventID}, []string{"evt-z", "evt-a"}; !equalStringSlices(
+		got,
+		want,
+	) {
+		t.Fatalf("window event ids = %#v, want %#v", got, want)
+	}
+	if got, want := []int64{window[0].Sequence, window[1].Sequence}, []int64{1, 2}; !equalInt64Slices(
+		got,
+		want,
+	) {
+		t.Fatalf("window sequences = %#v, want %#v", got, want)
+	}
+	if window[0].Run != nil {
+		t.Fatalf("window[0].Run = %#v, want nil", window[0].Run)
+	}
+	if window[1].Run == nil || window[1].Run.ID != "run-1" {
+		t.Fatalf("window[1].Run = %#v, want run-1 summary", window[1].Run)
+	}
+
+	tail, err := manager.Timeline(ctx, taskRecord.ID, TimelineQuery{
+		AfterSequence: window[len(window)-1].Sequence,
+		Limit:         2,
+	}, actor)
+	if err != nil {
+		t.Fatalf("Timeline(tail) error = %v", err)
+	}
+	if got, want := len(tail), 1; got != want {
+		t.Fatalf("len(tail) = %d, want %d", got, want)
+	}
+	if got, want := tail[0].EventID, "evt-b"; got != want {
+		t.Fatalf("tail[0].EventID = %q, want %q", got, want)
+	}
+	if got, want := tail[0].Sequence, int64(3); got != want {
+		t.Fatalf("tail[0].Sequence = %d, want %d", got, want)
+	}
+
+	all, err := manager.Timeline(ctx, taskRecord.ID, TimelineQuery{}, actor)
+	if err != nil {
+		t.Fatalf("Timeline(all) error = %v", err)
+	}
+	if got, want := []string{
+		all[0].EventID,
+		all[1].EventID,
+		all[2].EventID,
+	}, []string{
+		"evt-z",
+		"evt-a",
+		"evt-b",
+	}; !equalStringSlices(
+		got,
+		want,
+	) {
+		t.Fatalf("all event ids = %#v, want %#v", got, want)
+	}
+	if got, want := all[0].Reason, "reconciled_run_terminal"; got != want {
+		t.Fatalf("all[0].Reason = %q, want %q", got, want)
+	}
+}
+
+func TestManagerRunDetailAggregatesRuntimeContextAndOmitsOptionalFields(t *testing.T) {
+	t.Parallel()
+
+	t.Run("Should aggregates session and usage data", func(t *testing.T) {
+		t.Parallel()
+
+		ctx := t.Context()
+		store := newInMemoryManagerStore()
+		base := time.Date(2026, 4, 17, 10, 0, 0, 0, time.UTC)
+		actor := validActorContext()
+
+		runtimeReader := testRuntimeViewReader{
+			sessions: map[string]*RunSessionRef{
+				"sess-runtime": {
+					SessionID:   "sess-runtime",
+					WorkspaceID: "ws-1",
+					AgentName:   "codex",
+					Name:        "Run session",
+					State:       "running",
+					CreatedAt:   base,
+					UpdatedAt:   base.Add(10 * time.Minute),
+				},
+			},
+			events: map[string][]storepkg.SessionEvent{
+				"sess-runtime": {
+					{
+						ID:        "sess-event-1",
+						SessionID: "sess-runtime",
+						Sequence:  1,
+						TurnID:    "turn-1",
+						Type:      "agent_message",
+						AgentName: "codex",
+						Content:   `{"text":"working"}`,
+						Timestamp: base.Add(time.Minute),
+					},
+					{
+						ID:        "sess-event-2",
+						SessionID: "sess-runtime",
+						Sequence:  2,
+						TurnID:    "turn-1",
+						Type:      sessionEventTypeToolCall,
+						AgentName: "codex",
+						Content:   `{"tool_call_id":"tool-1"}`,
+						Timestamp: base.Add(2 * time.Minute),
+					},
+					{
+						ID:        "sess-event-3",
+						SessionID: "sess-runtime",
+						Sequence:  3,
+						TurnID:    "turn-1",
+						Type:      sessionEventTypeToolResult,
+						AgentName: "codex",
+						Content:   `{"tool_call_id":"tool-1"}`,
+						Timestamp: base.Add(3 * time.Minute),
+					},
+					{
+						ID:        "sess-event-4",
+						SessionID: "sess-runtime",
+						Sequence:  4,
+						TurnID:    "turn-2",
+						Type:      sessionEventTypeToolCall,
+						AgentName: "codex",
+						Content:   `{"toolCallId":"tool-2"}`,
+						Timestamp: base.Add(4 * time.Minute),
+					},
+				},
+			},
+			stats: map[string][]storepkg.TokenStats{
+				"sess-runtime": {
+					{
+						ID:           "stats-1",
+						SessionID:    "sess-runtime",
+						AgentName:    "codex",
+						InputTokens:  new(int64(10)),
+						OutputTokens: new(int64(5)),
+						TotalTokens:  new(int64(15)),
+						TotalCost:    new(0.25),
+						CostCurrency: new("USD"),
+						CostStatus:   "actual",
+						CostSource:   "agent_reported",
+						TurnCount:    1,
+						UpdatedAt:    base.Add(5 * time.Minute),
+					},
+					{
+						ID:           "stats-2",
+						SessionID:    "sess-runtime",
+						AgentName:    "reviewer",
+						InputTokens:  new(int64(3)),
+						TotalTokens:  new(int64(3)),
+						TotalCost:    new(0.10),
+						CostCurrency: new("USD"),
+						CostStatus:   "actual",
+						CostSource:   "agent_reported",
+						TurnCount:    2,
+						UpdatedAt:    base.Add(6 * time.Minute),
+					},
+				},
+			},
+		}
+		manager := newTaskManagerForTestWithOptions(t, store, WithRuntimeViewReader(runtimeReader))
+
+		taskRecord := Task{
+			ID:             "task-runtime",
+			Scope:          ScopeWorkspace,
+			WorkspaceID:    "ws-1",
+			Title:          "Runtime detail task",
+			Priority:       DefaultPriority,
+			MaxAttempts:    DefaultTaskMaxAttempts,
+			Status:         TaskStatusReady,
+			ApprovalPolicy: ApprovalPolicyNone,
+			ApprovalState:  ApprovalStateNotRequired,
+			CreatedBy:      actor.Actor,
+			Origin:         actor.Origin,
+			CreatedAt:      base,
+			UpdatedAt:      base,
+		}
+		if err := store.CreateTask(ctx, taskRecord); err != nil {
+			t.Fatalf("CreateTask() error = %v", err)
+		}
+		run := Run{
+			ID:        "run-runtime",
+			TaskID:    taskRecord.ID,
+			Status:    TaskRunStatusRunning,
+			Attempt:   1,
+			SessionID: "sess-runtime",
+			Origin:    actor.Origin,
+			QueuedAt:  base,
+			StartedAt: base.Add(30 * time.Second),
+		}
+		if err := store.CreateTaskRun(ctx, run); err != nil {
+			t.Fatalf("CreateTaskRun() error = %v", err)
+		}
+
+		detail, err := manager.RunDetail(ctx, run.ID, actor)
+		if err != nil {
+			t.Fatalf("RunDetail() error = %v", err)
+		}
+		if detail.Task == nil {
+			t.Fatal("detail.Task = nil, want task reference")
+		}
+		if got, want := detail.Task.ID, taskRecord.ID; got != want {
+			t.Fatalf("detail.Task.ID = %q, want %q", got, want)
+		}
+		if got, want := detail.Task.Status, TaskStatusInProgress; got != want {
+			t.Fatalf("detail.Task.Status = %q, want %q", got, want)
+		}
+		if detail.Session == nil {
+			t.Fatal("detail.Session = nil, want enriched session reference")
+		}
+		if got, want := detail.Session.AgentName, "codex"; got != want {
+			t.Fatalf("detail.Session.AgentName = %q, want %q", got, want)
+		}
+		if got, want := detail.Session.WorkspaceID, "ws-1"; got != want {
+			t.Fatalf("detail.Session.WorkspaceID = %q, want %q", got, want)
+		}
+		if detail.Summary.ToolCallCount == nil || *detail.Summary.ToolCallCount != 2 {
+			t.Fatalf("detail.Summary.ToolCallCount = %#v, want 2", detail.Summary.ToolCallCount)
+		}
+		if detail.Summary.InputTokens == nil || *detail.Summary.InputTokens != 13 {
+			t.Fatalf("detail.Summary.InputTokens = %#v, want 13", detail.Summary.InputTokens)
+		}
+		if detail.Summary.OutputTokens == nil || *detail.Summary.OutputTokens != 5 {
+			t.Fatalf("detail.Summary.OutputTokens = %#v, want 5", detail.Summary.OutputTokens)
+		}
+		if detail.Summary.TotalTokens == nil || *detail.Summary.TotalTokens != 18 {
+			t.Fatalf("detail.Summary.TotalTokens = %#v, want 18", detail.Summary.TotalTokens)
+		}
+		if detail.Summary.TurnCount == nil || *detail.Summary.TurnCount != 3 {
+			t.Fatalf("detail.Summary.TurnCount = %#v, want 3", detail.Summary.TurnCount)
+		}
+		if detail.Summary.CostCurrency == nil || *detail.Summary.CostCurrency != "USD" {
+			t.Fatalf("detail.Summary.CostCurrency = %#v, want USD", detail.Summary.CostCurrency)
+		}
+		if detail.Summary.TotalCost == nil || math.Abs(*detail.Summary.TotalCost-0.35) > 1e-9 {
+			t.Fatalf("detail.Summary.TotalCost = %#v, want 0.35", detail.Summary.TotalCost)
+		}
+		if detail.Summary.CostStatus != "actual" || detail.Summary.CostSource != "agent_reported" {
+			t.Fatalf(
+				"detail.Summary cost provenance = %q/%q, want actual/agent_reported",
+				detail.Summary.CostStatus,
+				detail.Summary.CostSource,
+			)
+		}
+		if got, want := detail.Summary.LastEventType, sessionEventTypeToolCall; got != want {
+			t.Fatalf("detail.Summary.LastEventType = %q, want %q", got, want)
+		}
+		if got, want := detail.Summary.LastActivityAt, base.Add(6*time.Minute); !got.Equal(want) {
+			t.Fatalf("detail.Summary.LastActivityAt = %s, want %s", got, want)
+		}
+	})
+
+	t.Run("Should keeps optional fields empty when runtime data is absent", func(t *testing.T) {
+		t.Parallel()
+
+		ctx := t.Context()
+		store := newInMemoryManagerStore()
+		manager := newTaskManagerForTest(t, store)
+		actor := validActorContext()
+		base := time.Date(2026, 4, 17, 11, 0, 0, 0, time.UTC)
+
+		taskRecord := Task{
+			ID:             "task-no-runtime",
+			Scope:          ScopeGlobal,
+			Title:          "No runtime detail task",
+			Priority:       DefaultPriority,
+			MaxAttempts:    DefaultTaskMaxAttempts,
+			Status:         TaskStatusReady,
+			ApprovalPolicy: ApprovalPolicyNone,
+			ApprovalState:  ApprovalStateNotRequired,
+			CreatedBy:      actor.Actor,
+			Origin:         actor.Origin,
+			CreatedAt:      base,
+			UpdatedAt:      base,
+		}
+		if err := store.CreateTask(ctx, taskRecord); err != nil {
+			t.Fatalf("CreateTask() error = %v", err)
+		}
+		run := Run{
+			ID:       "run-no-runtime",
+			TaskID:   taskRecord.ID,
+			Status:   TaskRunStatusQueued,
+			Attempt:  1,
+			Origin:   actor.Origin,
+			QueuedAt: base,
+		}
+		if err := store.CreateTaskRun(ctx, run); err != nil {
+			t.Fatalf("CreateTaskRun() error = %v", err)
+		}
+
+		detail, err := manager.RunDetail(ctx, run.ID, actor)
+		if err != nil {
+			t.Fatalf("RunDetail() error = %v", err)
+		}
+		if detail.Session != nil {
+			t.Fatalf("detail.Session = %#v, want nil", detail.Session)
+		}
+		if !detail.Summary.LastActivityAt.IsZero() {
+			t.Fatalf("detail.Summary.LastActivityAt = %s, want zero", detail.Summary.LastActivityAt)
+		}
+		if detail.Summary.ToolCallCount != nil {
+			t.Fatalf("detail.Summary.ToolCallCount = %#v, want nil", detail.Summary.ToolCallCount)
+		}
+	})
+
+	t.Run("Should page exact run result bytes and mask foreign workspace access", func(t *testing.T) {
+		t.Parallel()
+
+		ctx := t.Context()
+		store := newInMemoryManagerStore()
+		manager := newTaskManagerForTest(t, store)
+		owner := agentSessionActorContextForWorkspace("sess-owner", "ws-alpha")
+		foreign := agentSessionActorContextForWorkspace("sess-foreign", "ws-beta")
+		now := time.Date(2026, 8, 31, 12, 0, 0, 0, time.UTC)
+		taskRecord := Task{
+			ID: "task-result-page", Scope: ScopeWorkspace, WorkspaceID: "ws-alpha",
+			Title: "Paged result", Priority: DefaultPriority, MaxAttempts: DefaultTaskMaxAttempts,
+			Status: TaskStatusCompleted, ApprovalPolicy: ApprovalPolicyNone,
+			ApprovalState: ApprovalStateNotRequired, CreatedBy: owner.Actor, Origin: owner.Origin,
+			CreatedAt: now, UpdatedAt: now,
+		}
+		if err := store.CreateTask(ctx, taskRecord); err != nil {
+			t.Fatalf("CreateTask() error = %v", err)
+		}
+		content := []byte(`{"summary":"ação界complete"}`)
+		run := Run{
+			ID: "run-result-page", TaskID: taskRecord.ID, WorkspaceID: taskRecord.WorkspaceID,
+			Status: TaskRunStatusCompleted, Attempt: 1, Origin: owner.Origin, QueuedAt: now, EndedAt: now,
+		}
+		run.SetExternalResult("sha256:result-page", int64(len(content)))
+		if err := store.CreateTaskRun(ctx, run); err != nil {
+			t.Fatalf("CreateTaskRun() error = %v", err)
+		}
+		store.externalRunResults[run.ID] = content
+
+		page, err := manager.ReadTaskRunResult(ctx, run.ID, 10, 5, owner)
+		if err != nil {
+			t.Fatalf("ReadTaskRunResult() error = %v", err)
+		}
+		decoded, err := base64.StdEncoding.DecodeString(page.DataBase64)
+		if err != nil {
+			t.Fatalf("DecodeString(page) error = %v", err)
+		}
+		if got, want := string(decoded), string(content[10:15]); got != want {
+			t.Fatalf("page bytes = %q, want %q", got, want)
+		}
+		if _, err := manager.ReadTaskRunResult(ctx, run.ID, 0, 5, foreign); !errors.Is(
+			err,
+			ErrTaskRunResultNotFound,
+		) {
+			t.Fatalf("ReadTaskRunResult(foreign) error = %v, want masked not found", err)
+		}
+	})
+}
+
+func TestManagerTreeIncludesDescendantsActiveRunsAndLatestActivity(t *testing.T) {
+	t.Parallel()
+
+	ctx := t.Context()
+	store := newInMemoryManagerStore()
+	manager := newTaskManagerForTest(t, store)
+	actor := validActorContext()
+	base := time.Date(2026, 4, 17, 12, 0, 0, 0, time.UTC)
+
+	root := Task{
+		ID:             "task-root",
+		Scope:          ScopeGlobal,
+		Title:          "Root",
+		Priority:       DefaultPriority,
+		MaxAttempts:    DefaultTaskMaxAttempts,
+		Status:         TaskStatusReady,
+		ApprovalPolicy: ApprovalPolicyNone,
+		ApprovalState:  ApprovalStateNotRequired,
+		CreatedBy:      actor.Actor,
+		Origin:         actor.Origin,
+		CreatedAt:      base,
+		UpdatedAt:      base,
+	}
+	childActive := root
+	childActive.ID = "task-child-active"
+	childActive.ParentTaskID = root.ID
+	childActive.Title = "Child active"
+	childActive.CreatedAt = base.Add(time.Minute)
+	childActive.UpdatedAt = base.Add(time.Minute)
+
+	childIdle := root
+	childIdle.ID = "task-child-idle"
+	childIdle.ParentTaskID = root.ID
+	childIdle.Title = "Child idle"
+	childIdle.CreatedAt = base.Add(2 * time.Minute)
+	childIdle.UpdatedAt = base.Add(2 * time.Minute)
+
+	grandchild := root
+	grandchild.ID = "task-grandchild"
+	grandchild.ParentTaskID = childActive.ID
+	grandchild.Title = "Grandchild"
+	grandchild.CreatedAt = base.Add(3 * time.Minute)
+	grandchild.UpdatedAt = base.Add(3 * time.Minute)
+
+	for _, record := range []Task{root, childActive, childIdle, grandchild} {
+		if err := store.CreateTask(ctx, record); err != nil {
+			t.Fatalf("CreateTask(%q) error = %v", record.ID, err)
+		}
+	}
+
+	for _, run := range []Run{
+		{
+			ID:        "run-active",
+			TaskID:    childActive.ID,
+			Status:    TaskRunStatusRunning,
+			Attempt:   1,
+			SessionID: "sess-child-active",
+			Origin:    actor.Origin,
+			QueuedAt:  base.Add(4 * time.Minute),
+			StartedAt: base.Add(5 * time.Minute),
+		},
+		{
+			ID:       "run-grandchild-complete",
+			TaskID:   grandchild.ID,
+			Status:   TaskRunStatusCompleted,
+			Attempt:  1,
+			Origin:   actor.Origin,
+			QueuedAt: base.Add(2 * time.Minute),
+			EndedAt:  base.Add(3 * time.Minute),
+		},
+	} {
+		if err := store.CreateTaskRun(ctx, run); err != nil {
+			t.Fatalf("CreateTaskRun(%q) error = %v", run.ID, err)
+		}
+	}
+
+	for _, event := range []Event{
+		{
+			ID:        "root-event",
+			TaskID:    root.ID,
+			EventType: taskEventUpdated,
+			Actor:     actor.Actor,
+			Origin:    actor.Origin,
+			Timestamp: base.Add(30 * time.Second),
+		},
+		{
+			ID:        "child-active-event",
+			TaskID:    childActive.ID,
+			RunID:     "run-active",
+			EventType: taskEventRunStarted,
+			Actor:     actor.Actor,
+			Origin:    actor.Origin,
+			Timestamp: base.Add(6 * time.Minute),
+		},
+		{
+			ID:        "child-idle-event",
+			TaskID:    childIdle.ID,
+			EventType: taskEventUpdated,
+			Actor:     actor.Actor,
+			Origin:    actor.Origin,
+			Timestamp: base.Add(4 * time.Minute),
+		},
+		{
+			ID:        "grandchild-event",
+			TaskID:    grandchild.ID,
+			RunID:     "run-grandchild-complete",
+			EventType: taskEventRunCompleted,
+			Actor:     actor.Actor,
+			Origin:    actor.Origin,
+			Timestamp: base.Add(3 * time.Minute),
+		},
+	} {
+		if err := store.CreateTaskEvent(ctx, event); err != nil {
+			t.Fatalf("CreateTaskEvent(%q) error = %v", event.ID, err)
+		}
+	}
+
+	tree, err := manager.Tree(ctx, root.ID, actor)
+	if err != nil {
+		t.Fatalf("Tree() error = %v", err)
+	}
+	if got, want := tree.Root.Task.ID, root.ID; got != want {
+		t.Fatalf("tree.Root.Task.ID = %q, want %q", got, want)
+	}
+	if got, want := tree.Root.ChildCount, 2; got != want {
+		t.Fatalf("tree.Root.ChildCount = %d, want %d", got, want)
+	}
+	if got, want := len(tree.Descendants), 3; got != want {
+		t.Fatalf("len(tree.Descendants) = %d, want %d", got, want)
+	}
+	if got, want := []string{
+		tree.Descendants[0].Task.ID,
+		tree.Descendants[1].Task.ID,
+		tree.Descendants[2].Task.ID,
+	}, []string{childActive.ID, childIdle.ID, grandchild.ID}; !equalStringSlices(got, want) {
+		t.Fatalf("tree.Descendants order = %#v, want %#v", got, want)
+	}
+
+	activeNode := tree.Descendants[0]
+	if got, want := activeNode.ParentTaskID, root.ID; got != want {
+		t.Fatalf("activeNode.ParentTaskID = %q, want %q", got, want)
+	}
+	if got, want := activeNode.Depth, 1; got != want {
+		t.Fatalf("activeNode.Depth = %d, want %d", got, want)
+	}
+	if got, want := activeNode.ChildCount, 1; got != want {
+		t.Fatalf("activeNode.ChildCount = %d, want %d", got, want)
+	}
+	if activeNode.ActiveRun == nil || activeNode.ActiveRun.ID != "run-active" {
+		t.Fatalf("activeNode.ActiveRun = %#v, want run-active", activeNode.ActiveRun)
+	}
+	if got, want := activeNode.LastActivityAt, base.Add(6*time.Minute); !got.Equal(want) {
+		t.Fatalf("activeNode.LastActivityAt = %s, want %s", got, want)
+	}
+
+	grandchildNode := tree.Descendants[2]
+	if got, want := grandchildNode.ParentTaskID, childActive.ID; got != want {
+		t.Fatalf("grandchildNode.ParentTaskID = %q, want %q", got, want)
+	}
+	if got, want := grandchildNode.Depth, 2; got != want {
+		t.Fatalf("grandchildNode.Depth = %d, want %d", got, want)
+	}
+	if grandchildNode.ActiveRun != nil {
+		t.Fatalf("grandchildNode.ActiveRun = %#v, want nil", grandchildNode.ActiveRun)
+	}
+}
+
+func TestManagerStreamReplaysStableBacklogAndLiveDescendantEvents(t *testing.T) {
+	t.Parallel()
+
+	ctx := t.Context()
+	store := newInMemoryManagerStore()
+	manager := newTaskManagerForTest(t, store)
+	actor := validActorContext()
+	base := time.Date(2026, 4, 17, 13, 0, 0, 0, time.UTC)
+
+	root := Task{
+		ID:             "task-root",
+		Scope:          ScopeGlobal,
+		Title:          "Root",
+		Priority:       DefaultPriority,
+		MaxAttempts:    DefaultTaskMaxAttempts,
+		Status:         TaskStatusReady,
+		ApprovalPolicy: ApprovalPolicyNone,
+		ApprovalState:  ApprovalStateNotRequired,
+		CreatedBy:      actor.Actor,
+		Origin:         actor.Origin,
+		CreatedAt:      base,
+		UpdatedAt:      base,
+	}
+	child := root
+	child.ID = "task-child"
+	child.ParentTaskID = root.ID
+	child.Title = "Child"
+	child.CreatedAt = base.Add(time.Minute)
+	child.UpdatedAt = child.CreatedAt
+	for _, record := range []Task{root, child} {
+		if err := store.CreateTask(ctx, record); err != nil {
+			t.Fatalf("CreateTask(%q) error = %v", record.ID, err)
+		}
+	}
+
+	if err := manager.recordTaskEvent(
+		ctx,
+		root.ID,
+		"",
+		taskEventUpdated,
+		actor,
+		map[string]any{"source": "root"},
+	); err != nil {
+		t.Fatalf("recordTaskEvent(root) error = %v", err)
+	}
+	if err := manager.recordTaskEvent(
+		ctx,
+		child.ID,
+		"",
+		taskEventUpdated,
+		actor,
+		map[string]any{"source": "child"},
+	); err != nil {
+		t.Fatalf("recordTaskEvent(child) error = %v", err)
+	}
+
+	streamCtx, cancel := context.WithCancel(ctx)
+	stream, err := manager.Stream(streamCtx, root.ID, StreamQuery{AfterSequence: 1}, actor)
+	if err != nil {
+		t.Fatalf("Stream(first) error = %v", err)
+	}
+
+	backlog := awaitTaskStreamEvent(t, stream)
+	if got, want := backlog.Sequence, int64(2); got != want {
+		t.Fatalf("backlog.Sequence = %d, want %d", got, want)
+	}
+	if got, want := backlog.Timeline.Task.ID, child.ID; got != want {
+		t.Fatalf("backlog.Timeline.Task.ID = %q, want %q", got, want)
+	}
+	if got, want := backlog.Type, taskEventUpdated; got != want {
+		t.Fatalf("backlog.Type = %q, want %q", got, want)
+	}
+
+	if err := manager.recordTaskEvent(
+		ctx,
+		child.ID,
+		"",
+		taskEventRunEnqueued,
+		actor,
+		map[string]any{"attempt": 1},
+	); err != nil {
+		t.Fatalf("recordTaskEvent(live child) error = %v", err)
+	}
+	liveChild := awaitTaskStreamEvent(t, stream)
+	if got, want := liveChild.Sequence, int64(3); got != want {
+		t.Fatalf("liveChild.Sequence = %d, want %d", got, want)
+	}
+	if got, want := liveChild.Timeline.Task.ID, child.ID; got != want {
+		t.Fatalf("liveChild.Timeline.Task.ID = %q, want %q", got, want)
+	}
+	if got, want := liveChild.Type, taskEventRunEnqueued; got != want {
+		t.Fatalf("liveChild.Type = %q, want %q", got, want)
+	}
+
+	cancel()
+
+	reconnectCtx, reconnectCancel := context.WithCancel(ctx)
+	defer reconnectCancel()
+	reconnected, err := manager.Stream(
+		reconnectCtx,
+		root.ID,
+		StreamQuery{AfterSequence: liveChild.Sequence},
+		actor,
+	)
+	if err != nil {
+		t.Fatalf("Stream(reconnected) error = %v", err)
+	}
+	assertNoTaskStreamEvent(t, reconnected, 150*time.Millisecond)
+
+	if err := manager.recordTaskEvent(
+		ctx,
+		root.ID,
+		"",
+		taskEventCanceled,
+		actor,
+		map[string]any{"reason": "done"},
+	); err != nil {
+		t.Fatalf("recordTaskEvent(root live) error = %v", err)
+	}
+	liveRoot := awaitTaskStreamEvent(t, reconnected)
+	if got, want := liveRoot.Sequence, int64(4); got != want {
+		t.Fatalf("liveRoot.Sequence = %d, want %d", got, want)
+	}
+	if got, want := liveRoot.Timeline.Task.ID, root.ID; got != want {
+		t.Fatalf("liveRoot.Timeline.Task.ID = %q, want %q", got, want)
+	}
+	if got, want := liveRoot.Type, taskEventCanceled; got != want {
+		t.Fatalf("liveRoot.Type = %q, want %q", got, want)
+	}
+}
+
+func TestManagerTaskStreamUsesLatestEventSequenceSeed(t *testing.T) {
+	t.Parallel()
+
+	t.Run(
+		"Should replay terminal review and notification events recorded after snapshot",
+		func(t *testing.T) {
+			t.Parallel()
+
+			ctx := t.Context()
+			store := newInMemoryManagerStore()
+			manager := newTaskManagerForTest(t, store)
+			actor := validActorContext()
+			taskRecord, err := manager.CreateTask(ctx, CreateTask{
+				ProfileID: storepkg.DefaultProfileID,
+				Scope:     ScopeGlobal,
+				Title:     "Latest sequence replay",
+			}, actor)
+			if err != nil {
+				t.Fatalf("CreateTask() error = %v", err)
+			}
+			run := Run{
+				ID:        "run-latest-seq",
+				TaskID:    taskRecord.ID,
+				Status:    TaskRunStatusCompleted,
+				Attempt:   1,
+				Origin:    actor.Origin,
+				QueuedAt:  time.Date(2026, 4, 17, 14, 0, 0, 0, time.UTC),
+				StartedAt: time.Date(2026, 4, 17, 14, 1, 0, 0, time.UTC),
+				EndedAt:   time.Date(2026, 4, 17, 14, 2, 0, 0, time.UTC),
+			}
+			if err := store.CreateTaskRun(ctx, run); err != nil {
+				t.Fatalf("CreateTaskRun() error = %v", err)
+			}
+
+			view, err := manager.GetTask(ctx, taskRecord.ID, actor)
+			if err != nil {
+				t.Fatalf("GetTask() error = %v", err)
+			}
+			seed := view.Summary.LatestEventSeq
+			if seed == 0 || view.Task.LatestEventSeq != seed {
+				t.Fatalf(
+					"latest_event_seq summary=%d task=%d, want non-zero match",
+					seed,
+					view.Task.LatestEventSeq,
+				)
+			}
+
+			for _, eventType := range []string{
+				taskEventRunCompleted,
+				taskEventRunReviewRequested,
+				"task.notification_delivered",
+			} {
+				if err := manager.recordTaskEvent(
+					ctx,
+					taskRecord.ID,
+					run.ID,
+					eventType,
+					actor,
+					map[string]string{"source": eventType},
+				); err != nil {
+					t.Fatalf("recordTaskEvent(%q) error = %v", eventType, err)
+				}
+			}
+
+			streamCtx, cancel := context.WithCancel(ctx)
+			defer cancel()
+			stream, err := manager.Stream(
+				streamCtx,
+				taskRecord.ID,
+				StreamQuery{AfterSequence: seed},
+				actor,
+			)
+			if err != nil {
+				t.Fatalf("Stream() error = %v", err)
+			}
+			for idx, wantType := range []string{
+				taskEventRunCompleted,
+				taskEventRunReviewRequested,
+				"task.notification_delivered",
+			} {
+				event := awaitTaskStreamEvent(t, stream)
+				if event.Type != wantType {
+					t.Fatalf("stream event %d type = %q, want %q", idx, event.Type, wantType)
+				}
+				wantSequence := seed + int64(idx) + 1
+				if event.Sequence != wantSequence {
+					t.Fatalf(
+						"stream event %d sequence = %d, want %d",
+						idx,
+						event.Sequence,
+						wantSequence,
+					)
+				}
+			}
+		},
+	)
+
+	t.Run("Should deliver terminal event recorded after stream subscription", func(t *testing.T) {
+		t.Parallel()
+
+		ctx := t.Context()
+		store := newInMemoryManagerStore()
+		manager := newTaskManagerForTest(t, store)
+		actor := validActorContext()
+		taskRecord, err := manager.CreateTask(ctx, CreateTask{
+			ProfileID: storepkg.DefaultProfileID,
+			Scope:     ScopeGlobal,
+			Title:     "Concurrent terminal stream",
+		}, actor)
+		if err != nil {
+			t.Fatalf("CreateTask() error = %v", err)
+		}
+		view, err := manager.GetTask(ctx, taskRecord.ID, actor)
+		if err != nil {
+			t.Fatalf("GetTask() error = %v", err)
+		}
+		streamCtx, cancel := context.WithCancel(ctx)
+		defer cancel()
+		stream, err := manager.Stream(
+			streamCtx,
+			taskRecord.ID,
+			StreamQuery{AfterSequence: view.Task.LatestEventSeq},
+			actor,
+		)
+		if err != nil {
+			t.Fatalf("Stream() error = %v", err)
+		}
+		if err := manager.recordTaskEvent(
+			ctx,
+			taskRecord.ID,
+			"",
+			taskEventRunCompleted,
+			actor,
+			map[string]string{"source": "concurrent-terminal"},
+		); err != nil {
+			t.Fatalf("recordTaskEvent(concurrent terminal) error = %v", err)
+		}
+		event := awaitTaskStreamEvent(t, stream)
+		if event.Type != taskEventRunCompleted {
+			t.Fatalf("event.Type = %q, want %q", event.Type, taskEventRunCompleted)
+		}
+		if event.Sequence != view.Task.LatestEventSeq+1 {
+			t.Fatalf("event.Sequence = %d, want %d", event.Sequence, view.Task.LatestEventSeq+1)
+		}
+	})
+}
+
+func TestManagerRecordTaskEventRejectsTransactionalWatchKinds(t *testing.T) {
+	t.Parallel()
+
+	ctx := t.Context()
+	store := newInMemoryManagerStore()
+	manager := newTaskManagerForTest(t, store)
+	actor := validActorContext()
+	taskRecord, err := manager.CreateTask(ctx, CreateTask{
+		ProfileID: storepkg.DefaultProfileID,
+		Scope:     ScopeGlobal,
+		Title:     "Watch kind guard",
+	}, actor)
+	if err != nil {
+		t.Fatalf("CreateTask() error = %v", err)
+	}
+
+	for _, eventType := range []string{
+		taskWatchEventBlocked,
+		taskWatchEventUnblocked,
+		taskWatchEventNeedsAttention,
+		taskWatchEventRecovered,
+		taskWatchEventStatusChanged,
+		taskWatchEventRunCompleted,
+		taskWatchEventRunFailed,
+	} {
+		t.Run("Should reject "+eventType, func(t *testing.T) {
+			t.Parallel()
+
+			err := manager.recordTaskEvent(
+				ctx,
+				taskRecord.ID,
+				"",
+				eventType,
+				actor,
+				map[string]string{"source": eventType},
+			)
+			if !errors.Is(err, ErrValidation) {
+				t.Fatalf("recordTaskEvent(%q) error = %v, want ErrValidation", eventType, err)
+			}
+		})
+	}
+}
+
+func TestManagerDeleteTask(t *testing.T) {
+	t.Parallel()
+
+	buildTask := func(id string, actor ActorContext) Task {
+		now := time.Date(2026, 4, 14, 15, 0, 0, 0, time.UTC)
+		return Task{
+			ID:             id,
+			Scope:          ScopeGlobal,
+			Title:          id,
+			Priority:       DefaultPriority,
+			MaxAttempts:    1,
+			Status:         TaskStatusReady,
+			ApprovalPolicy: ApprovalPolicyNone,
+			ApprovalState:  ApprovalStateNotRequired,
+			CreatedBy:      actor.Actor,
+			Origin:         actor.Origin,
+			CreatedAt:      now,
+			UpdatedAt:      now,
+		}
+	}
+
+	t.Run("ShouldRemoveAllActorTriageStateEntriesForTheDeletedTask", func(t *testing.T) {
+		t.Parallel()
+
+		actor := validActorContext()
+		store := newDeleteTaskStore()
+		manager := newTaskManagerForTest(t, store)
+		record := buildTask("task-delete", actor)
+		now := time.Date(2026, 4, 14, 16, 0, 0, 0, time.UTC)
+
+		if err := store.CreateTask(t.Context(), record); err != nil {
+			t.Fatalf("CreateTask() error = %v", err)
+		}
+		if err := store.UpsertTaskTriageState(t.Context(), TriageState{
+			TaskID:             record.ID,
+			Actor:              actor.Actor,
+			Read:               true,
+			LastSeenActivityAt: now,
+			UpdatedAt:          now,
+		}); err != nil {
+			t.Fatalf("UpsertTaskTriageState(primary actor) error = %v", err)
+		}
+		if err := store.UpsertTaskTriageState(t.Context(), TriageState{
+			TaskID: record.ID,
+			Actor: ActorIdentity{
+				Kind: ActorKindHuman,
+				Ref:  "user-2",
+			},
+			Archived:           true,
+			LastSeenActivityAt: now,
+			UpdatedAt:          now,
+		}); err != nil {
+			t.Fatalf("UpsertTaskTriageState(second actor) error = %v", err)
+		}
+
+		if err := manager.DeleteTask(t.Context(), record.ID, actor); err != nil {
+			t.Fatalf("DeleteTask() error = %v", err)
+		}
+		if got := len(store.triageStates); got != 0 {
+			t.Fatalf("len(triageStates) = %d, want 0; states=%#v", got, store.triageStates)
+		}
+	})
+
+	t.Run("ShouldWrapDeletePathFailuresWithOperationContext", func(t *testing.T) {
+		t.Parallel()
+
+		loadErr := ErrTaskNotFound
+		countErr := errors.New("count failed")
+		listRunsErr := errors.New("list runs failed")
+		listDependentsErr := errors.New("list dependents failed")
+		deleteErr := errors.New("delete failed")
+		reconcileErr := errors.New("dependent load failed")
+
+		cases := []struct {
+			name          string
+			configure     func(*deleteTaskStore)
+			wantSubstring string
+			wantErr       error
+		}{
+			{
+				name: "ShouldWrapTaskLoadFailures",
+				configure: func(store *deleteTaskStore) {
+					store.getTaskErrByID["task-primary"] = loadErr
+				},
+				wantSubstring: `task: load task "task-primary" for delete`,
+				wantErr:       loadErr,
+			},
+			{
+				name: "ShouldWrapChildCountFailures",
+				configure: func(store *deleteTaskStore) {
+					store.countDirectChildrenErrByID["task-primary"] = countErr
+				},
+				wantSubstring: `task: count child tasks for delete "task-primary"`,
+				wantErr:       countErr,
+			},
+			{
+				name: "ShouldWrapRunLookupFailures",
+				configure: func(store *deleteTaskStore) {
+					store.listTaskRunsErrByID["task-primary"] = listRunsErr
+				},
+				wantSubstring: `task: list runs for delete "task-primary"`,
+				wantErr:       listRunsErr,
+			},
+			{
+				name: "ShouldWrapDependentLookupFailures",
+				configure: func(store *deleteTaskStore) {
+					store.listDependentsErrByID["task-primary"] = listDependentsErr
+				},
+				wantSubstring: `task: list dependents for task "task-primary" delete`,
+				wantErr:       listDependentsErr,
+			},
+			{
+				name: "ShouldWrapStoreDeleteFailures",
+				configure: func(store *deleteTaskStore) {
+					store.deleteTaskErrByID["task-primary"] = deleteErr
+				},
+				wantSubstring: `task: delete task "task-primary"`,
+				wantErr:       deleteErr,
+			},
+			{
+				name: "ShouldWrapDependentReconcileFailures",
+				configure: func(store *deleteTaskStore) {
+					store.getTaskErrByID["task-dependent"] = reconcileErr
+				},
+				wantSubstring: `task: reconcile dependent task "task-dependent" after deleting "task-primary"`,
+				wantErr:       reconcileErr,
+			},
+		}
+
+		for _, tc := range cases {
+			t.Run(tc.name, func(t *testing.T) {
+				t.Parallel()
+
+				actor := validActorContext()
+				store := newDeleteTaskStore()
+				manager := newTaskManagerForTest(t, store)
+				primary := buildTask("task-primary", actor)
+				dependent := buildTask("task-dependent", actor)
+				dependencyTime := time.Date(2026, 4, 14, 16, 30, 0, 0, time.UTC)
+
+				if err := store.CreateTask(t.Context(), primary); err != nil {
+					t.Fatalf("CreateTask(primary) error = %v", err)
+				}
+				if err := store.CreateTask(t.Context(), dependent); err != nil {
+					t.Fatalf("CreateTask(dependent) error = %v", err)
+				}
+				if err := store.CreateDependency(t.Context(), Dependency{
+					TaskID:          dependent.ID,
+					DependsOnTaskID: primary.ID,
+					Kind:            DependencyKindBlocks,
+					CreatedAt:       dependencyTime,
+				}); err != nil {
+					t.Fatalf("CreateDependency() error = %v", err)
+				}
+
+				tc.configure(store)
+
+				err := manager.DeleteTask(t.Context(), primary.ID, actor)
+				if err == nil {
+					t.Fatal("DeleteTask() error = nil, want wrapped error")
+				}
+				if !errors.Is(err, tc.wantErr) {
+					t.Fatalf("DeleteTask() error = %v, want wrapped %v", err, tc.wantErr)
+				}
+				if !strings.Contains(err.Error(), tc.wantSubstring) {
+					t.Fatalf(
+						"DeleteTask() error = %q, want substring %q",
+						err.Error(),
+						tc.wantSubstring,
+					)
+				}
+
+				if _, getErr := store.inMemoryManagerStore.GetTask(t.Context(), primary.ID); getErr != nil {
+					t.Fatalf(
+						"GetTask(primary after failed delete) error = %v, want task preserved",
+						getErr,
+					)
+				}
+				dependents, depErr := store.inMemoryManagerStore.ListDependents(
+					t.Context(),
+					primary.ID,
+				)
+				if depErr != nil {
+					t.Fatalf("ListDependents(primary after failed delete) error = %v", depErr)
+				}
+				if got, want := len(dependents), 1; got != want {
+					t.Fatalf(
+						"len(ListDependents(primary after failed delete)) = %d, want %d",
+						got,
+						want,
+					)
+				}
+			})
+		}
+	})
+}
+
+func TestManagerCreateTaskUsesTrustedActorContext(t *testing.T) {
+	t.Parallel()
+
+	store := newInMemoryManagerStore()
+	manager := newTaskManagerForTest(t, store)
+	actor, err := DeriveUserSessionActorContextForOrigin(
+		"sess-123",
+		storepkg.DefaultProfileID,
+		OriginKindAgentSession,
+		"",
+	)
+	if err != nil {
+		t.Fatalf("DeriveAgentSessionActorContext() error = %v", err)
+	}
+
+	created, err := manager.CreateTask(t.Context(), CreateTask{
+		ProfileID: storepkg.DefaultProfileID,
+		Scope:     ScopeGlobal,
+		Title:     "Investigate task manager",
+	}, actor)
+	if err != nil {
+		t.Fatalf("CreateTask() error = %v", err)
+	}
+
+	if got, want := created.CreatedBy, actor.Actor; got != want {
+		t.Fatalf("created.CreatedBy = %#v, want %#v", got, want)
+	}
+	if got, want := created.Origin, actor.Origin; got != want {
+		t.Fatalf("created.Origin = %#v, want %#v", got, want)
+	}
+	if created.Owner != nil {
+		t.Fatalf("created.Owner = %#v, want nil", created.Owner)
+	}
+	if got, want := created.Status, TaskStatusReady; got != want {
+		t.Fatalf("created.Status = %q, want %q", got, want)
+	}
+	if got, want := created.Priority, DefaultPriority; got != want {
+		t.Fatalf("created.Priority = %q, want %q", got, want)
+	}
+	if got, want := created.MaxAttempts, DefaultTaskMaxAttempts; got != want {
+		t.Fatalf("created.MaxAttempts = %d, want %d", got, want)
+	}
+	if got, want := created.ApprovalPolicy, ApprovalPolicyNone; got != want {
+		t.Fatalf("created.ApprovalPolicy = %q, want %q", got, want)
+	}
+	if got, want := created.ApprovalState, ApprovalStateNotRequired; got != want {
+		t.Fatalf("created.ApprovalState = %q, want %q", got, want)
+	}
+
+	events, err := store.ListTaskEvents(t.Context(), EventQuery{TaskID: created.ID})
+	if err != nil {
+		t.Fatalf("ListTaskEvents() error = %v", err)
+	}
+	if len(events) != 1 {
+		t.Fatalf("len(events) = %d, want 1", len(events))
+	}
+	if got, want := events[0].EventType, taskEventCreated; got != want {
+		t.Fatalf("events[0].EventType = %q, want %q", got, want)
+	}
+	if got, want := events[0].Actor, actor.Actor; got != want {
+		t.Fatalf("events[0].Actor = %#v, want %#v", got, want)
+	}
+	if got, want := events[0].Origin, actor.Origin; got != want {
+		t.Fatalf("events[0].Origin = %#v, want %#v", got, want)
+	}
+}
+
+func TestManagerCreateTaskRecordsIntentWithoutRuns(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name  string
+		actor func(t *testing.T) ActorContext
+		spec  CreateTask
+	}{
+		{
+			name: "user-created ready task",
+			actor: func(t *testing.T) ActorContext {
+				t.Helper()
+				return validActorContext()
+			},
+			spec: CreateTask{
+				ProfileID: storepkg.DefaultProfileID,
+				Scope:     ScopeGlobal,
+				Title:     "User intent only",
+			},
+		},
+		{
+			name: "agent-created approval task",
+			actor: func(t *testing.T) ActorContext {
+				t.Helper()
+				actor, err := DeriveUserSessionActorContextForOrigin(
+					"sess-agent-create",
+					storepkg.DefaultProfileID,
+					OriginKindAgentSession,
+					"",
+				)
+				if err != nil {
+					t.Fatalf("DeriveAgentSessionActorContext() error = %v", err)
+				}
+				return actor
+			},
+			spec: CreateTask{
+				ProfileID:      storepkg.DefaultProfileID,
+				Scope:          ScopeGlobal,
+				Title:          "Agent intent only",
+				ApprovalPolicy: ApprovalPolicyManual,
+			},
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			store := newInMemoryManagerStore()
+			manager := newTaskManagerForTest(t, store)
+			actor := tc.actor(t)
+
+			created, err := manager.CreateTask(t.Context(), tc.spec, actor)
+			if err != nil {
+				t.Fatalf("CreateTask() error = %v", err)
+			}
+			runs, err := store.ListTaskRuns(t.Context(), RunQuery{TaskID: created.ID})
+			if err != nil {
+				t.Fatalf("ListTaskRuns() error = %v", err)
+			}
+			if len(runs) != 0 {
+				t.Fatalf("len(runs) = %d, want 0", len(runs))
+			}
+			if got, want := created.CreatedBy, actor.Actor; got != want {
+				t.Fatalf("created.CreatedBy = %#v, want %#v", got, want)
+			}
+			if got, want := created.Origin, actor.Origin; got != want {
+				t.Fatalf("created.Origin = %#v, want %#v", got, want)
+			}
+		})
+	}
+}
+
+func TestManagerCreateTaskAppliesSemanticDefaultsAndDraftStatus(t *testing.T) {
+	t.Parallel()
+
+	store := newInMemoryManagerStore()
+	manager := newTaskManagerForTestWithOptions(
+		t,
+		store,
+		WithSessionExecutor(testSessionExecutor{}),
+	)
+	actor := validActorContext()
+
+	draftCreated, err := manager.CreateTask(t.Context(), CreateTask{
+		ProfileID: storepkg.DefaultProfileID,
+		Scope:     ScopeGlobal,
+		Title:     "Draft task",
+		Draft:     true,
+	}, actor)
+	if err != nil {
+		t.Fatalf("CreateTask(draft) error = %v", err)
+	}
+
+	if got, want := draftCreated.Status, TaskStatusDraft; got != want {
+		t.Fatalf("draftCreated.Status = %q, want %q", got, want)
+	}
+	if got, want := draftCreated.Priority, DefaultPriority; got != want {
+		t.Fatalf("draftCreated.Priority = %q, want %q", got, want)
+	}
+	if got, want := draftCreated.MaxAttempts, DefaultTaskMaxAttempts; got != want {
+		t.Fatalf("draftCreated.MaxAttempts = %d, want %d", got, want)
+	}
+	if got, want := draftCreated.ApprovalPolicy, ApprovalPolicyNone; got != want {
+		t.Fatalf("draftCreated.ApprovalPolicy = %q, want %q", got, want)
+	}
+	if got, want := draftCreated.ApprovalState, ApprovalStateNotRequired; got != want {
+		t.Fatalf("draftCreated.ApprovalState = %q, want %q", got, want)
+	}
+}
+
+func TestManagerDraftPublicationReconcilesIntoReadyOrBlocked(t *testing.T) {
+	t.Parallel()
+
+	t.Run("Should draft stays non runnable until published", func(t *testing.T) {
+		t.Parallel()
+
+		store := newInMemoryManagerStore()
+		manager := newTaskManagerForTest(t, store)
+		actor := validActorContext()
+
+		draftTask, err := manager.CreateTask(t.Context(), CreateTask{
+			ProfileID: storepkg.DefaultProfileID,
+			Scope:     ScopeGlobal,
+			Title:     "Draft task",
+			Draft:     true,
+		}, actor)
+		if err != nil {
+			t.Fatalf("CreateTask(draft) error = %v", err)
+		}
+
+		// Draft admission is owned here with the publication lifecycle: rejection
+		// must return no run and leave the run store untouched.
+		run, err := manager.EnqueueRun(t.Context(), EnqueueRun{TaskID: draftTask.ID}, actor)
+		if !errors.Is(err, ErrInvalidStatusTransition) {
+			t.Fatalf("EnqueueRun(draft) error = %v, want %v", err, ErrInvalidStatusTransition)
+		}
+		if run != nil {
+			t.Fatalf("EnqueueRun(draft) run = %#v, want nil", run)
+		}
+		if got := len(store.runs); got != 0 {
+			t.Fatalf("len(store.runs) = %d, want 0", got)
+		}
+
+		published, err := manager.PublishTask(
+			t.Context(),
+			draftTask.ID,
+			ExecutionRequest{},
+			actor,
+		)
+		if err != nil {
+			t.Fatalf("PublishTask() error = %v", err)
+		}
+		if got, want := published.Task.Status, TaskStatusReady; got != want {
+			t.Fatalf("published.Task.Status = %q, want %q", got, want)
+		}
+		if got, want := published.Run.TaskID, draftTask.ID; got != want {
+			t.Fatalf("published.Run.TaskID = %q, want %q", got, want)
+		}
+		if got, want := published.Run.Status, TaskRunStatusQueued; got != want {
+			t.Fatalf("published.Run.Status = %q, want %q", got, want)
+		}
+
+		events, err := store.ListTaskEvents(t.Context(), EventQuery{TaskID: draftTask.ID})
+		if err != nil {
+			t.Fatalf("ListTaskEvents() error = %v", err)
+		}
+		if !containsEventType(events, taskEventPublished) {
+			t.Fatalf("event types = %#v, want %q", sortedEventTypes(events), taskEventPublished)
+		}
+	})
+
+	t.Run(
+		"Should draft with unresolved dependencies cannot publish into execution",
+		func(t *testing.T) {
+			t.Parallel()
+
+			store := newInMemoryManagerStore()
+			manager := newTaskManagerForTest(t, store)
+			actor := validActorContext()
+
+			blocker, err := manager.CreateTask(t.Context(), CreateTask{
+				ProfileID: storepkg.DefaultProfileID,
+				Scope:     ScopeGlobal,
+				Title:     "Blocker",
+			}, actor)
+			if err != nil {
+				t.Fatalf("CreateTask(blocker) error = %v", err)
+			}
+			target, err := manager.CreateTask(t.Context(), CreateTask{
+				ProfileID: storepkg.DefaultProfileID,
+				Scope:     ScopeGlobal,
+				Title:     "Target draft",
+				Draft:     true,
+			}, actor)
+			if err != nil {
+				t.Fatalf("CreateTask(target) error = %v", err)
+			}
+			if err := manager.AddDependency(t.Context(), AddDependency{
+				TaskID:          target.ID,
+				DependsOnTaskID: blocker.ID,
+				Kind:            DependencyKindBlocks,
+			}, actor); err != nil {
+				t.Fatalf("AddDependency() error = %v", err)
+			}
+			if got, want := store.tasks[target.ID].Status, TaskStatusDraft; got != want {
+				t.Fatalf("target.Status before publish = %q, want %q", got, want)
+			}
+
+			if _, err := manager.PublishTask(
+				t.Context(),
+				target.ID,
+				ExecutionRequest{},
+				actor,
+			); !errors.Is(err, ErrInvalidStatusTransition) {
+				t.Fatalf(
+					"PublishTask(blocked) error = %v, want %v",
+					err,
+					ErrInvalidStatusTransition,
+				)
+			}
+			if got, want := store.tasks[target.ID].Status, TaskStatusDraft; got != want {
+				t.Fatalf("target.Status after failed publish = %q, want %q", got, want)
+			}
+		},
+	)
+}
+
+func TestManagerPublishTaskRejectsNonDraftTasks(t *testing.T) {
+	t.Parallel()
+
+	t.Run("Should ready task cannot publish", func(t *testing.T) {
+		t.Parallel()
+
+		store := newInMemoryManagerStore()
+		manager := newTaskManagerForTest(t, store)
+		actor := validActorContext()
+
+		taskRecord, err := manager.CreateTask(t.Context(), CreateTask{
+			ProfileID: storepkg.DefaultProfileID,
+			Scope:     ScopeGlobal,
+			Title:     "Already runnable",
+		}, actor)
+		if err != nil {
+			t.Fatalf("CreateTask() error = %v", err)
+		}
+
+		if _, err := manager.PublishTask(
+			t.Context(),
+			taskRecord.ID,
+			ExecutionRequest{},
+			actor,
+		); !errors.Is(
+			err,
+			ErrInvalidStatusTransition,
+		) {
+			t.Fatalf("PublishTask(ready) error = %v, want %v", err, ErrInvalidStatusTransition)
+		}
+	})
+
+	t.Run("Should already published draft cannot publish again", func(t *testing.T) {
+		t.Parallel()
+
+		store := newInMemoryManagerStore()
+		manager := newTaskManagerForTest(t, store)
+		actor := validActorContext()
+
+		draftTask, err := manager.CreateTask(t.Context(), CreateTask{
+			ProfileID: storepkg.DefaultProfileID,
+			Scope:     ScopeGlobal,
+			Title:     "Draft once",
+			Draft:     true,
+		}, actor)
+		if err != nil {
+			t.Fatalf("CreateTask(draft) error = %v", err)
+		}
+
+		first, err := manager.PublishTask(
+			t.Context(),
+			draftTask.ID,
+			ExecutionRequest{},
+			actor,
+		)
+		if err != nil {
+			t.Fatalf("PublishTask(first) error = %v", err)
+		}
+		second, err := manager.PublishTask(
+			t.Context(),
+			draftTask.ID,
+			ExecutionRequest{},
+			actor,
+		)
+		if err != nil {
+			t.Fatalf("PublishTask(second) error = %v", err)
+		}
+		if !second.ExistingRun {
+			t.Fatalf("PublishTask(second).ExistingRun = false, want true")
+		}
+		if got, want := second.Run.ID, first.Run.ID; got != want {
+			t.Fatalf("PublishTask(second).Run.ID = %q, want %q", got, want)
+		}
+	})
+}
+
+func TestManagerExecutionBoundaryStartPublishApprovalIdempotency(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name    string
+		prepare func(t *testing.T, manager *Service, actor ActorContext) string
+		execute func(*Service, context.Context, string, ExecutionRequest, ActorContext) (*Execution, error)
+	}{
+		{
+			name: "Should retain start ownership on an idempotent retry",
+			prepare: func(t *testing.T, manager *Service, actor ActorContext) string {
+				t.Helper()
+				taskRecord, err := manager.CreateTask(t.Context(), CreateTask{
+					ProfileID: "profile-editorial",
+					Scope:     ScopeGlobal,
+					Title:     "Start boundary",
+				}, actor)
+				if err != nil {
+					t.Fatalf("CreateTask() error = %v", err)
+				}
+				return taskRecord.ID
+			},
+			execute: (*Service).StartTask,
+		},
+		{
+			name: "Should retain publish ownership on an idempotent retry",
+			prepare: func(t *testing.T, manager *Service, actor ActorContext) string {
+				t.Helper()
+				taskRecord, err := manager.CreateTask(t.Context(), CreateTask{
+					ProfileID: "profile-editorial",
+					Scope:     ScopeGlobal,
+					Title:     "Publish boundary",
+					Draft:     true,
+				}, actor)
+				if err != nil {
+					t.Fatalf("CreateTask() error = %v", err)
+				}
+				return taskRecord.ID
+			},
+			execute: (*Service).PublishTask,
+		},
+		{
+			name: "Should retain approval ownership on an idempotent retry",
+			prepare: func(t *testing.T, manager *Service, actor ActorContext) string {
+				t.Helper()
+				taskRecord, err := manager.CreateTask(t.Context(), CreateTask{
+					ProfileID:      "profile-editorial",
+					Scope:          ScopeGlobal,
+					Title:          "Approval boundary",
+					ApprovalPolicy: ApprovalPolicyManual,
+				}, actor)
+				if err != nil {
+					t.Fatalf("CreateTask() error = %v", err)
+				}
+				return taskRecord.ID
+			},
+			execute: (*Service).ApproveTask,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			store := newInMemoryManagerStore()
+			manager := newTaskManagerForTest(t, store)
+			actor := validActorContext()
+			taskID := tc.prepare(t, manager, actor)
+
+			first, err := tc.execute(
+				manager,
+				t.Context(),
+				taskID,
+				ExecutionRequest{IdempotencyKey: "same-start-request"},
+				actor,
+			)
+			if err != nil {
+				t.Fatalf("%s first execution error = %v", tc.name, err)
+			}
+			second, err := tc.execute(
+				manager,
+				t.Context(),
+				taskID,
+				ExecutionRequest{IdempotencyKey: "same-start-request"},
+				actor,
+			)
+			if err != nil {
+				t.Fatalf("%s second execution error = %v", tc.name, err)
+			}
+			for _, execution := range []*Execution{first, second} {
+				if execution.Run.ProfileID != "profile-editorial" {
+					t.Fatalf("execution run owner = %q, want editorial", execution.Run.ProfileID)
+				}
+			}
+			if !second.ExistingRun {
+				t.Fatalf("%s second execution ExistingRun = false, want true", tc.name)
+			}
+			if got, want := second.Run.ID, first.Run.ID; got != want {
+				t.Fatalf("%s second run = %q, want %q", tc.name, got, want)
+			}
+
+			runs, err := store.ListTaskRuns(t.Context(), RunQuery{TaskID: taskID})
+			if err != nil {
+				t.Fatalf("ListTaskRuns() error = %v", err)
+			}
+			if len(runs) != 1 {
+				t.Fatalf("len(runs) = %d, want 1", len(runs))
+			}
+			if got, want := runs[0].Status, TaskRunStatusQueued; got != want {
+				t.Fatalf("runs[0].Status = %q, want %q", got, want)
+			}
+		})
+	}
+}
+
+func TestManagerCreateTaskEnforcesScopeAuthority(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name  string
+		spec  CreateTask
+		actor ActorContext
+	}{
+		{
+			name: "global create denied without global authority",
+			spec: CreateTask{ProfileID: storepkg.DefaultProfileID, Scope: ScopeGlobal, Title: "Global task"},
+			actor: ActorContext{
+				Actor:     ActorIdentity{Kind: ActorKindHuman, Ref: "user-1"},
+				Origin:    Origin{Kind: OriginKindCLI, Ref: "compozy task create"},
+				Scope:     CallerScope{Operator: true},
+				Authority: Authority{Read: true, Write: true, CreateWorkspace: true},
+			},
+		},
+		{
+			name: "workspace create denied without workspace authority",
+			spec: CreateTask{
+				ProfileID:   storepkg.DefaultProfileID,
+				Scope:       ScopeWorkspace,
+				WorkspaceID: "ws-1",
+				Title:       "Workspace task",
+			},
+			actor: ActorContext{
+				Actor:     ActorIdentity{Kind: ActorKindHuman, Ref: "user-1"},
+				Origin:    Origin{Kind: OriginKindCLI, Ref: "compozy task create"},
+				Scope:     CallerScope{WorkspaceID: "ws-1", Operator: true},
+				Authority: Authority{Read: true, Write: true, CreateGlobal: true},
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			manager := newTaskManagerForTest(t, newInMemoryManagerStore())
+			_, err := manager.CreateTask(t.Context(), tt.spec, tt.actor)
+			if !errors.Is(err, ErrPermissionDenied) {
+				t.Fatalf("CreateTask() error = %v, want %v", err, ErrPermissionDenied)
+			}
+		})
+	}
+}
+
+func TestManagerCreateTaskRejectsInvalidSemanticInputsBeforePersistence(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name string
+		spec CreateTask
+	}{
+		{
+			name: "invalid priority",
+			spec: CreateTask{
+				ProfileID: storepkg.DefaultProfileID,
+				Scope:     ScopeGlobal,
+				Title:     "Bad priority",
+				Priority:  Priority("rush"),
+			},
+		},
+		{
+			name: "invalid max attempts",
+			spec: CreateTask{
+				ProfileID:   storepkg.DefaultProfileID,
+				Scope:       ScopeGlobal,
+				Title:       "Bad attempts",
+				MaxAttempts: new(0),
+			},
+		},
+		{
+			name: "invalid approval policy",
+			spec: CreateTask{
+				ProfileID:      storepkg.DefaultProfileID,
+				Scope:          ScopeGlobal,
+				Title:          "Bad approval",
+				ApprovalPolicy: ApprovalPolicy("auto"),
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			store := newInMemoryManagerStore()
+			manager := newTaskManagerForTest(t, store)
+
+			_, err := manager.CreateTask(t.Context(), tt.spec, validActorContext())
+			if err == nil {
+				t.Fatal("CreateTask() error = nil, want non-nil")
+			}
+			if !errors.Is(err, ErrValidation) {
+				t.Fatalf("CreateTask() error = %v, want %v", err, ErrValidation)
+			}
+			if got := len(store.tasks); got != 0 {
+				t.Fatalf("len(store.tasks) = %d, want 0", got)
+			}
+		})
+	}
+}
+
+func TestManagerUpdateTaskAllowsMutableFieldsAndOwnership(t *testing.T) {
+	t.Parallel()
+
+	store := newInMemoryManagerStore()
+	manager := newTaskManagerForTestWithOptions(
+		t,
+		store,
+		WithSessionExecutor(testSessionExecutor{}),
+	)
+	actor := validActorContext()
+
+	created, err := manager.CreateTask(t.Context(), CreateTask{
+		ProfileID:   storepkg.DefaultProfileID,
+		Scope:       ScopeWorkspace,
+		WorkspaceID: "ws-1",
+		Title:       "Queue task",
+		Description: "Unassigned",
+	}, actor)
+	if err != nil {
+		t.Fatalf("CreateTask() error = %v", err)
+	}
+
+	title := "Claimed task"
+	description := "Assigned to triage"
+	priority := PriorityUrgent
+	maxAttempts := 5
+	approvalPolicy := ApprovalPolicyManual
+	updated, err := manager.UpdateTask(t.Context(), created.ID, Patch{
+		Title:          &title,
+		Description:    &description,
+		Priority:       &priority,
+		MaxAttempts:    &maxAttempts,
+		ApprovalPolicy: &approvalPolicy,
+		Owner:          &Ownership{Kind: OwnerKindPool, Ref: "triage"},
+		Metadata:       new(json.RawMessage(`{"source":"ui"}`)),
+	}, actor)
+	if err != nil {
+		t.Fatalf("UpdateTask(assign) error = %v", err)
+	}
+
+	if got, want := updated.Title, title; got != want {
+		t.Fatalf("updated.Title = %q, want %q", got, want)
+	}
+	if got, want := updated.Description, description; got != want {
+		t.Fatalf("updated.Description = %q, want %q", got, want)
+	}
+	if got, want := updated.Priority, priority; got != want {
+		t.Fatalf("updated.Priority = %q, want %q", got, want)
+	}
+	if got, want := updated.MaxAttempts, maxAttempts; got != want {
+		t.Fatalf("updated.MaxAttempts = %d, want %d", got, want)
+	}
+	if got, want := updated.ApprovalPolicy, approvalPolicy; got != want {
+		t.Fatalf("updated.ApprovalPolicy = %q, want %q", got, want)
+	}
+	if got, want := updated.ApprovalState, ApprovalStatePending; got != want {
+		t.Fatalf("updated.ApprovalState = %q, want %q", got, want)
+	}
+	if got, want := updated.Status, TaskStatusBlocked; got != want {
+		t.Fatalf("updated.Status = %q, want %q", got, want)
+	}
+	if updated.Owner == nil || updated.Owner.Kind != OwnerKindPool ||
+		updated.Owner.Ref != "triage" {
+		t.Fatalf("updated.Owner = %#v, want pool/triage", updated.Owner)
+	}
+	if got, want := updated.Scope, created.Scope; got != want {
+		t.Fatalf("updated.Scope = %q, want %q", got, want)
+	}
+	if got, want := updated.WorkspaceID, created.WorkspaceID; got != want {
+		t.Fatalf("updated.WorkspaceID = %q, want %q", got, want)
+	}
+	if got, want := updated.ParentTaskID, created.ParentTaskID; got != want {
+		t.Fatalf("updated.ParentTaskID = %q, want %q", got, want)
+	}
+	if got, want := updated.CreatedBy, created.CreatedBy; got != want {
+		t.Fatalf("updated.CreatedBy = %#v, want %#v", got, want)
+	}
+	if got, want := updated.Origin, created.Origin; got != want {
+		t.Fatalf("updated.Origin = %#v, want %#v", got, want)
+	}
+
+	cleared, err := manager.UpdateTask(t.Context(), created.ID, Patch{
+		ClearOwner: true,
+	}, actor)
+	if err != nil {
+		t.Fatalf("UpdateTask(clear) error = %v", err)
+	}
+	if cleared.Owner != nil {
+		t.Fatalf("cleared.Owner = %#v, want nil", cleared.Owner)
+	}
+}
+
+func TestManagerUpdateTaskTogglesAutoEnqueueOnReady(t *testing.T) {
+	t.Parallel()
+
+	store := newInMemoryManagerStore()
+	manager := newTaskManagerForTest(t, store)
+	actor := validActorContext()
+
+	created, err := manager.CreateTask(
+		t.Context(),
+		CreateTask{ProfileID: storepkg.DefaultProfileID, Scope: ScopeGlobal, Title: "Toggle"},
+		actor,
+	)
+	if err != nil {
+		t.Fatalf("CreateTask() error = %v", err)
+	}
+	if created.AutoEnqueueOnReady {
+		t.Fatal("created.AutoEnqueueOnReady = true, want false default")
+	}
+
+	// Ordered, state-sharing subtests: each step depends on the prior patch, so they
+	// run serially (no t.Parallel) to prove that omitting the field preserves it.
+	t.Run("Should enable the flag when patched to true", func(t *testing.T) {
+		enable := true
+		updated, err := manager.UpdateTask(
+			t.Context(),
+			created.ID,
+			Patch{AutoEnqueueOnReady: &enable},
+			actor,
+		)
+		if err != nil {
+			t.Fatalf("UpdateTask(enable) error = %v", err)
+		}
+		if !updated.AutoEnqueueOnReady {
+			t.Fatal("updated.AutoEnqueueOnReady = false, want true")
+		}
+	})
+
+	t.Run("Should preserve the flag when the patch omits it", func(t *testing.T) {
+		updated, err := manager.UpdateTask(
+			t.Context(),
+			created.ID,
+			Patch{Title: new("Renamed but auto-enqueue untouched")},
+			actor,
+		)
+		if err != nil {
+			t.Fatalf("UpdateTask(omit) error = %v", err)
+		}
+		if !updated.AutoEnqueueOnReady {
+			t.Fatal("updated.AutoEnqueueOnReady = false after omitted patch, want preserved true")
+		}
+	})
+
+	t.Run("Should disable the flag when patched to false", func(t *testing.T) {
+		disable := false
+		updated, err := manager.UpdateTask(
+			t.Context(),
+			created.ID,
+			Patch{AutoEnqueueOnReady: &disable},
+			actor,
+		)
+		if err != nil {
+			t.Fatalf("UpdateTask(disable) error = %v", err)
+		}
+		if updated.AutoEnqueueOnReady {
+			t.Fatal("updated.AutoEnqueueOnReady = true, want false")
+		}
+	})
+}
+
+func TestManagerUpdateTaskPreservesCanonicalBlockedStatus(t *testing.T) {
+	t.Parallel()
+
+	store := newInMemoryManagerStore()
+	manager := newTaskManagerForTest(t, store)
+	actor := validActorContext()
+
+	taskA, err := manager.CreateTask(
+		t.Context(),
+		CreateTask{ProfileID: storepkg.DefaultProfileID, Scope: ScopeGlobal, Title: "task A"},
+		actor,
+	)
+	if err != nil {
+		t.Fatalf("CreateTask(taskA) error = %v", err)
+	}
+	taskB, err := manager.CreateTask(
+		t.Context(),
+		CreateTask{ProfileID: storepkg.DefaultProfileID, Scope: ScopeGlobal, Title: "task B"},
+		actor,
+	)
+	if err != nil {
+		t.Fatalf("CreateTask(taskB) error = %v", err)
+	}
+	if err := manager.AddDependency(t.Context(), AddDependency{
+		TaskID:          taskA.ID,
+		DependsOnTaskID: taskB.ID,
+		Kind:            DependencyKindBlocks,
+	}, actor); err != nil {
+		t.Fatalf("AddDependency() error = %v", err)
+	}
+
+	updated, err := manager.UpdateTask(t.Context(), taskA.ID, Patch{
+		Title: new("task A renamed"),
+	}, actor)
+	if err != nil {
+		t.Fatalf("UpdateTask() error = %v", err)
+	}
+	if got, want := updated.Status, TaskStatusBlocked; got != want {
+		t.Fatalf("updated.Status = %q, want %q", got, want)
+	}
+}
+
+func TestManagerApprovalGateBlocksExecutionUntilApproved(t *testing.T) {
+	t.Parallel()
+
+	store := newInMemoryManagerStore()
+	manager := newTaskManagerForTest(t, store)
+	actor := validActorContext()
+
+	taskRecord, err := manager.CreateTask(t.Context(), CreateTask{
+		ProfileID:      storepkg.DefaultProfileID,
+		Scope:          ScopeGlobal,
+		Title:          "Manual approval task",
+		ApprovalPolicy: ApprovalPolicyManual,
+	}, actor)
+	if err != nil {
+		t.Fatalf("CreateTask() error = %v", err)
+	}
+	if got, want := taskRecord.Status, TaskStatusBlocked; got != want {
+		t.Fatalf("taskRecord.Status = %q, want %q", got, want)
+	}
+
+	runsBeforeApproval, err := store.ListTaskRuns(
+		t.Context(),
+		RunQuery{TaskID: taskRecord.ID},
+	)
+	if err != nil {
+		t.Fatalf("ListTaskRuns(before approval) error = %v", err)
+	}
+	if len(runsBeforeApproval) != 0 {
+		t.Fatalf("runs before approval = %d, want 0", len(runsBeforeApproval))
+	}
+
+	approved, err := manager.ApproveTask(
+		t.Context(),
+		taskRecord.ID,
+		ExecutionRequest{},
+		actor,
+	)
+	if err != nil {
+		t.Fatalf("ApproveTask() error = %v", err)
+	}
+	if got, want := approved.Task.ApprovalState, ApprovalStateApproved; got != want {
+		t.Fatalf("approved.Task.ApprovalState = %q, want %q", got, want)
+	}
+	if got, want := approved.Task.Status, TaskStatusReady; got != want {
+		t.Fatalf("approved.Task.Status = %q, want %q", got, want)
+	}
+	if got, want := approved.Run.Status, TaskRunStatusQueued; got != want {
+		t.Fatalf("approved.Run.Status = %q, want %q", got, want)
+	}
+
+	claimed, err := claimExactRunForTest(t.Context(), manager, approved.Run.ID, actor)
+	if err != nil {
+		t.Fatalf("ClaimNextRun(approved) error = %v", err)
+	}
+	if got, want := claimed.Status, TaskRunStatusClaimed; got != want {
+		t.Fatalf("claimed.Status = %q, want %q", got, want)
+	}
+	if got, want := store.tasks[taskRecord.ID].Status, TaskStatusReady; got != want {
+		t.Fatalf("task.Status after claim = %q, want %q", got, want)
+	}
+
+	events, err := store.ListTaskEvents(t.Context(), EventQuery{TaskID: taskRecord.ID})
+	if err != nil {
+		t.Fatalf("ListTaskEvents() error = %v", err)
+	}
+	if !containsEventType(events, taskEventApproved) {
+		t.Fatalf("event types = %v, want %q", sortedEventTypes(events), taskEventApproved)
+	}
+
+	t.Run("Should reuse a pre-enqueued gated run instead of creating a second run", func(t *testing.T) {
+		t.Parallel()
+
+		store := newInMemoryManagerStore()
+		manager := newTaskManagerForTest(t, store)
+		actor := validActorContext()
+		gatedTask, err := manager.CreateTask(t.Context(), CreateTask{
+			ProfileID:      storepkg.DefaultProfileID,
+			Scope:          ScopeGlobal,
+			Title:          "Pre-enqueued manual approval task",
+			ApprovalPolicy: ApprovalPolicyManual,
+		}, actor)
+		if err != nil {
+			t.Fatalf("CreateTask() error = %v", err)
+		}
+		pendingRun, err := manager.EnqueueRun(
+			t.Context(),
+			EnqueueRun{TaskID: gatedTask.ID},
+			actor,
+		)
+		if err != nil {
+			t.Fatalf("EnqueueRun() error = %v", err)
+		}
+
+		approvedExecution, err := manager.ApproveTask(
+			t.Context(),
+			gatedTask.ID,
+			ExecutionRequest{},
+			actor,
+		)
+		if err != nil {
+			t.Fatalf("ApproveTask() error = %v", err)
+		}
+		if got, want := approvedExecution.Run.ID, pendingRun.ID; got != want {
+			t.Fatalf("ApproveTask().Run.ID = %q, want existing %q", got, want)
+		}
+		if !approvedExecution.ExistingRun {
+			t.Fatal("ApproveTask().ExistingRun = false, want true")
+		}
+		if got, want := approvedExecution.Task.Status, TaskStatusReady; got != want {
+			t.Fatalf("ApproveTask().Task.Status = %q, want %q", got, want)
+		}
+		if got, want := len(store.runs), 1; got != want {
+			t.Fatalf("runs after approval = %d, want %d", got, want)
+		}
+	})
+}
+
+func TestManagerRejectTaskKeepsManualApprovalBlocked(t *testing.T) {
+	t.Parallel()
+
+	store := newInMemoryManagerStore()
+	manager := newTaskManagerForTest(t, store)
+	actor := validActorContext()
+
+	taskRecord, err := manager.CreateTask(t.Context(), CreateTask{
+		ProfileID:      storepkg.DefaultProfileID,
+		Scope:          ScopeGlobal,
+		Title:          "Manual rejection task",
+		ApprovalPolicy: ApprovalPolicyManual,
+	}, actor)
+	if err != nil {
+		t.Fatalf("CreateTask() error = %v", err)
+	}
+	run, err := manager.EnqueueRun(t.Context(), EnqueueRun{TaskID: taskRecord.ID}, actor)
+	if err != nil {
+		t.Fatalf("EnqueueRun() error = %v", err)
+	}
+
+	rejected, err := manager.RejectTask(t.Context(), taskRecord.ID, actor)
+	if err != nil {
+		t.Fatalf("RejectTask() error = %v", err)
+	}
+	if got, want := rejected.ApprovalState, ApprovalStateRejected; got != want {
+		t.Fatalf("rejected.ApprovalState = %q, want %q", got, want)
+	}
+	if got, want := rejected.Status, TaskStatusBlocked; got != want {
+		t.Fatalf("rejected.Status = %q, want %q", got, want)
+	}
+	if _, err := claimExactRunForTest(t.Context(), manager, run.ID, actor); !errors.Is(
+		err,
+		ErrNoClaimableRun,
+	) {
+		t.Fatalf("exact claim of rejected run error = %v, want %v", err, ErrNoClaimableRun)
+	}
+
+	events, err := store.ListTaskEvents(t.Context(), EventQuery{TaskID: taskRecord.ID})
+	if err != nil {
+		t.Fatalf("ListTaskEvents() error = %v", err)
+	}
+	if !containsEventType(events, taskEventRejected) {
+		t.Fatalf("event types = %v, want %q", sortedEventTypes(events), taskEventRejected)
+	}
+}
+
+func TestManagerTaskTriageMutationsPersistActorScopedStateWithoutTaskEvents(t *testing.T) {
+	t.Parallel()
+
+	store := newInMemoryManagerStore()
+	manager := newTaskManagerForTest(t, store)
+	alice := validActorContext()
+	bob := validActorContext()
+	bob.Actor.Ref = "user-bob"
+
+	taskRecord, err := manager.CreateTask(t.Context(), CreateTask{
+		ProfileID: storepkg.DefaultProfileID,
+		Scope:     ScopeGlobal,
+		Title:     "Inbox triage target",
+	}, alice)
+	if err != nil {
+		t.Fatalf("CreateTask() error = %v", err)
+	}
+	eventsBefore, err := store.ListTaskEvents(
+		t.Context(),
+		EventQuery{TaskID: taskRecord.ID},
+	)
+	if err != nil {
+		t.Fatalf("ListTaskEvents(before) error = %v", err)
+	}
+	if got, want := len(eventsBefore), 1; got != want {
+		t.Fatalf("len(eventsBefore) = %d, want %d", got, want)
+	}
+
+	readState, err := manager.MarkTaskRead(t.Context(), taskRecord.ID, alice)
+	if err != nil {
+		t.Fatalf("MarkTaskRead() error = %v", err)
+	}
+	if !readState.Read || readState.Archived || readState.Dismissed {
+		t.Fatalf("readState = %#v, want read-only triage state", readState)
+	}
+	if !readState.LastSeenActivityAt.Equal(taskRecord.UpdatedAt) {
+		t.Fatalf(
+			"readState.LastSeenActivityAt = %v, want %v",
+			readState.LastSeenActivityAt,
+			taskRecord.UpdatedAt,
+		)
+	}
+
+	dismissedState, err := manager.DismissTask(t.Context(), taskRecord.ID, bob)
+	if err != nil {
+		t.Fatalf("DismissTask() error = %v", err)
+	}
+	if !dismissedState.Read || !dismissedState.Dismissed || dismissedState.Archived {
+		t.Fatalf(
+			"dismissedState = %#v, want dismissed unread-clearing triage state",
+			dismissedState,
+		)
+	}
+
+	archivedState, err := manager.ArchiveTask(t.Context(), taskRecord.ID, alice)
+	if err != nil {
+		t.Fatalf("ArchiveTask() error = %v", err)
+	}
+	if !archivedState.Read || !archivedState.Archived || archivedState.Dismissed {
+		t.Fatalf("archivedState = %#v, want archived triage state", archivedState)
+	}
+
+	storedAlice, err := store.GetTaskTriageState(t.Context(), taskRecord.ID, alice.Actor)
+	if err != nil {
+		t.Fatalf("GetTaskTriageState(alice) error = %v", err)
+	}
+	if storedAlice != archivedState {
+		t.Fatalf("storedAlice = %#v, want %#v", storedAlice, archivedState)
+	}
+	storedBob, err := store.GetTaskTriageState(t.Context(), taskRecord.ID, bob.Actor)
+	if err != nil {
+		t.Fatalf("GetTaskTriageState(bob) error = %v", err)
+	}
+	if storedBob != dismissedState {
+		t.Fatalf("storedBob = %#v, want %#v", storedBob, dismissedState)
+	}
+
+	eventsAfter, err := store.ListTaskEvents(
+		t.Context(),
+		EventQuery{TaskID: taskRecord.ID},
+	)
+	if err != nil {
+		t.Fatalf("ListTaskEvents(after) error = %v", err)
+	}
+	if got, want := len(eventsAfter), len(eventsBefore); got != want {
+		t.Fatalf(
+			"len(eventsAfter) = %d, want %d; event types=%v",
+			got,
+			want,
+			sortedEventTypes(eventsAfter),
+		)
+	}
+}
+
+func TestManagerAttemptExhaustionBlocksFurtherRetries(t *testing.T) {
+	t.Parallel()
+
+	store := newInMemoryManagerStore()
+	manager := newTaskManagerForTestWithOptions(
+		t,
+		store,
+		WithSessionExecutor(testSessionExecutor{}),
+	)
+	actor := validActorContext()
+
+	taskRecord, err := manager.CreateTask(t.Context(), CreateTask{
+		ProfileID:   storepkg.DefaultProfileID,
+		Scope:       ScopeGlobal,
+		Title:       "Retry budget task",
+		MaxAttempts: new(2),
+	}, actor)
+	if err != nil {
+		t.Fatalf("CreateTask() error = %v", err)
+	}
+
+	firstRun, err := manager.EnqueueRun(
+		t.Context(),
+		EnqueueRun{TaskID: taskRecord.ID},
+		actor,
+	)
+	if err != nil {
+		t.Fatalf("EnqueueRun(first) error = %v", err)
+	}
+	firstRun, err = admitRunDirectlyForTest(t.Context(), manager, firstRun.ID, actor)
+	if err != nil {
+		t.Fatalf("ClaimNextRun(first) error = %v", err)
+	}
+	firstRun, err = manager.StartRun(t.Context(), firstRun.ID, StartRun{}, actor)
+	if err != nil {
+		t.Fatalf("StartRun(first) error = %v", err)
+	}
+	if _, err := manager.FailRun(t.Context(), firstRun.ID, RunFailure{
+		Error: "boom-1",
+	}, actor); err != nil {
+		t.Fatalf("FailRun(first) error = %v", err)
+	}
+	if got, want := store.tasks[taskRecord.ID].Status, TaskStatusReady; got != want {
+		t.Fatalf("task.Status after first failure = %q, want %q", got, want)
+	}
+
+	secondRun, err := manager.EnqueueRun(
+		t.Context(),
+		EnqueueRun{TaskID: taskRecord.ID},
+		actor,
+	)
+	if err != nil {
+		t.Fatalf("EnqueueRun(second) error = %v", err)
+	}
+	secondRun, err = admitRunDirectlyForTest(t.Context(), manager, secondRun.ID, actor)
+	if err != nil {
+		t.Fatalf("ClaimNextRun(second) error = %v", err)
+	}
+	secondRun, err = manager.StartRun(t.Context(), secondRun.ID, StartRun{}, actor)
+	if err != nil {
+		t.Fatalf("StartRun(second) error = %v", err)
+	}
+	if _, err := manager.FailRun(t.Context(), secondRun.ID, RunFailure{
+		Error: "boom-2",
+	}, actor); err != nil {
+		t.Fatalf("FailRun(second) error = %v", err)
+	}
+	if got, want := store.tasks[taskRecord.ID].Status, TaskStatusFailed; got != want {
+		t.Fatalf("task.Status after second failure = %q, want %q", got, want)
+	}
+
+	if _, err := manager.EnqueueRun(
+		t.Context(),
+		EnqueueRun{TaskID: taskRecord.ID},
+		actor,
+	); !errors.Is(err, ErrInvalidStatusTransition) {
+		t.Fatalf("EnqueueRun(exhausted) error = %v, want %v", err, ErrInvalidStatusTransition)
+	}
+}
+
+func TestManagerEnqueueRunRejectsConcurrentOpenRun(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name     string
+		openRun  func(context.Context, *testing.T, *Service, Run, ActorContext) Run
+		wantOpen RunStatus
+	}{
+		{
+			name: "queued",
+			openRun: func(_ context.Context, _ *testing.T, _ *Service, run Run, _ ActorContext) Run {
+				return run
+			},
+			wantOpen: TaskRunStatusQueued,
+		},
+		{
+			name: "running",
+			openRun: func(ctx context.Context, t *testing.T, manager *Service, run Run, actor ActorContext) Run {
+				t.Helper()
+				claimed, err := admitRunDirectlyForTest(ctx, manager, run.ID, actor)
+				if err != nil {
+					t.Fatalf("ClaimNextRun() error = %v", err)
+				}
+				running, err := manager.StartRun(ctx, claimed.ID, StartRun{}, actor)
+				if err != nil {
+					t.Fatalf("StartRun() error = %v", err)
+				}
+				return *running
+			},
+			wantOpen: TaskRunStatusRunning,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			ctx := t.Context()
+			store := newInMemoryManagerStore()
+			manager := newTaskManagerForTestWithOptions(
+				t,
+				store,
+				WithSessionExecutor(testSessionExecutor{}),
+			)
+			actor := validActorContext()
+
+			taskRecord, err := manager.CreateTask(ctx, CreateTask{
+				ProfileID: storepkg.DefaultProfileID,
+				Scope:     ScopeGlobal,
+				Title:     "Concurrent run guard",
+			}, actor)
+			if err != nil {
+				t.Fatalf("CreateTask() error = %v", err)
+			}
+
+			firstRun, err := manager.EnqueueRun(ctx, EnqueueRun{
+				TaskID:         taskRecord.ID,
+				IdempotencyKey: "same-logical-run",
+			}, actor)
+			if err != nil {
+				t.Fatalf("EnqueueRun(first) error = %v", err)
+			}
+			openRun := tt.openRun(ctx, t, manager, *firstRun, actor)
+			if got := openRun.Status.Normalize(); got != tt.wantOpen {
+				t.Fatalf("openRun.Status = %q, want %q", got, tt.wantOpen)
+			}
+
+			duplicate, err := manager.EnqueueRun(ctx, EnqueueRun{
+				TaskID:         taskRecord.ID,
+				IdempotencyKey: "same-logical-run",
+			}, actor)
+			if err != nil {
+				t.Fatalf("EnqueueRun(idempotent duplicate) error = %v", err)
+			}
+			if got, want := duplicate.ID, firstRun.ID; got != want {
+				t.Fatalf("EnqueueRun(idempotent duplicate).ID = %q, want %q", got, want)
+			}
+
+			secondRun, err := manager.EnqueueRun(ctx, EnqueueRun{
+				TaskID:         taskRecord.ID,
+				IdempotencyKey: "new-logical-run",
+			}, actor)
+			if secondRun != nil {
+				t.Fatalf("EnqueueRun(second) run = %#v, want nil", secondRun)
+			}
+			if !errors.Is(err, ErrInvalidStatusTransition) {
+				t.Fatalf("EnqueueRun(second) error = %v, want %v", err, ErrInvalidStatusTransition)
+			}
+
+			runs, err := store.ListTaskRuns(ctx, RunQuery{TaskID: taskRecord.ID})
+			if err != nil {
+				t.Fatalf("ListTaskRuns() error = %v", err)
+			}
+			if got, want := len(runs), 1; got != want {
+				t.Fatalf("len(ListTaskRuns()) = %d, want %d", got, want)
+			}
+		})
+	}
+}
+
+func TestManagerCreateChildTaskEnforcesParentRulesAndEmitsAudit(t *testing.T) {
+	t.Parallel()
+
+	t.Run("Should global parent allows workspace child and emits parent event", func(t *testing.T) {
+		t.Parallel()
+
+		store := newInMemoryManagerStore()
+		manager := newTaskManagerForTest(t, store)
+		actor := validActorContext()
+
+		parent, err := manager.CreateTask(t.Context(), CreateTask{
+			ProfileID: storepkg.DefaultProfileID,
+			Scope:     ScopeGlobal,
+			Title:     "Coordinator",
+		}, actor)
+		if err != nil {
+			t.Fatalf("CreateTask(parent) error = %v", err)
+		}
+
+		child, err := manager.CreateChildTask(t.Context(), parent.ID, CreateTask{
+			ProfileID:   storepkg.DefaultProfileID,
+			Scope:       ScopeWorkspace,
+			WorkspaceID: "ws-1",
+			Title:       "Workspace child",
+		}, actor)
+		if err != nil {
+			t.Fatalf("CreateChildTask() error = %v", err)
+		}
+		if got, want := child.ParentTaskID, parent.ID; got != want {
+			t.Fatalf("child.ParentTaskID = %q, want %q", got, want)
+		}
+
+		events, err := store.ListTaskEvents(t.Context(), EventQuery{TaskID: parent.ID})
+		if err != nil {
+			t.Fatalf("ListTaskEvents(parent) error = %v", err)
+		}
+		if len(events) != 2 {
+			t.Fatalf("len(parent events) = %d, want 2", len(events))
+		}
+		if got, want := events[0].EventType, taskEventChildCreated; got != want {
+			t.Fatalf("parent event type = %q, want %q", got, want)
+		}
+	})
+
+	t.Run(
+		"Should workspace parent rejects cross scope or cross workspace children",
+		func(t *testing.T) {
+			t.Parallel()
+
+			store := newInMemoryManagerStore()
+			manager := newTaskManagerForTest(t, store)
+			actor := validActorContext()
+
+			parent, err := manager.CreateTask(t.Context(), CreateTask{
+				ProfileID:   storepkg.DefaultProfileID,
+				Scope:       ScopeWorkspace,
+				WorkspaceID: "ws-parent",
+				Title:       "Workspace parent",
+			}, actor)
+			if err != nil {
+				t.Fatalf("CreateTask(parent) error = %v", err)
+			}
+
+			_, err = manager.CreateChildTask(t.Context(), parent.ID, CreateTask{
+				ProfileID: storepkg.DefaultProfileID,
+				Scope:     ScopeGlobal,
+				Title:     "Invalid global child",
+			}, actor)
+			if !errors.Is(err, ErrValidation) {
+				t.Fatalf("CreateChildTask(global child) error = %v, want %v", err, ErrValidation)
+			}
+
+			_, err = manager.CreateChildTask(t.Context(), parent.ID, CreateTask{
+				ProfileID:   storepkg.DefaultProfileID,
+				Scope:       ScopeWorkspace,
+				WorkspaceID: "ws-other",
+				Title:       "Wrong workspace child",
+			}, actor)
+			if !errors.Is(err, ErrValidation) {
+				t.Fatalf(
+					"CreateChildTask(other workspace child) error = %v, want %v",
+					err,
+					ErrValidation,
+				)
+			}
+		},
+	)
+}
+
+func TestManagerGlobalTaskWorkspaceIsolation(t *testing.T) {
+	t.Parallel()
+
+	ctx, cancel := context.WithCancel(t.Context())
+	t.Cleanup(cancel)
+	store := newInMemoryManagerStore()
+	manager := newTaskManagerForTest(t, store)
+	operator := validActorContext()
+	workspaceActor := agentSessionActorContext("sess-ws-a")
+
+	root, err := manager.CreateTask(
+		ctx,
+		CreateTask{ProfileID: storepkg.DefaultProfileID, Scope: ScopeGlobal, Title: "Global root"},
+		operator,
+	)
+	if err != nil {
+		t.Fatalf("CreateTask(root) error = %v", err)
+	}
+	foreignChild, err := manager.CreateChildTask(ctx, root.ID, CreateTask{
+		ProfileID: storepkg.DefaultProfileID,
+		Scope:     ScopeWorkspace, WorkspaceID: "ws-b", Title: "Foreign child",
+	}, operator)
+	if err != nil {
+		t.Fatalf("CreateChildTask(foreign child) error = %v", err)
+	}
+
+	detail, err := manager.GetTask(ctx, root.ID, workspaceActor)
+	if err != nil {
+		t.Fatalf("GetTask(root) error = %v", err)
+	}
+	if len(detail.Children) != 0 {
+		t.Fatalf("GetTask(root).Children = %#v, want foreign child hidden", detail.Children)
+	}
+	tree, err := manager.Tree(ctx, root.ID, workspaceActor)
+	if err != nil {
+		t.Fatalf("Tree(root) error = %v", err)
+	}
+	if len(tree.Descendants) != 0 || tree.Root.ChildCount != 0 {
+		t.Fatalf("Tree(root) = %#v, want foreign subtree hidden", tree)
+	}
+
+	afterSequence := store.nextEventSequence
+	stream, err := manager.Stream(ctx, root.ID, StreamQuery{AfterSequence: afterSequence}, workspaceActor)
+	if err != nil {
+		t.Fatalf("Stream(root) error = %v", err)
+	}
+	if _, err := manager.UpdateTask(
+		ctx,
+		foreignChild.ID,
+		Patch{Title: new("Foreign child updated")},
+		operator,
+	); err != nil {
+		t.Fatalf("UpdateTask(foreign child) error = %v", err)
+	}
+	if _, err := manager.UpdateTask(ctx, root.ID, Patch{Title: new("Global root updated")}, operator); err != nil {
+		t.Fatalf("UpdateTask(root) error = %v", err)
+	}
+	streamEvent := awaitTaskStreamEvent(t, stream)
+	if got, want := streamEvent.Timeline.Task.ID, root.ID; got != want {
+		t.Fatalf("Stream() task id = %q, want visible root %q", got, want)
+	}
+
+	if _, err := manager.CancelTask(ctx, root.ID, CancelTask{Reason: "cancel tree"}, workspaceActor); !errors.Is(
+		err,
+		ErrPermissionDenied,
+	) {
+		t.Fatalf("CancelTask(root) error = %v, want %v", err, ErrPermissionDenied)
+	}
+	storedRoot, err := store.GetTask(ctx, root.ID)
+	if err != nil {
+		t.Fatalf("GetTask(stored root) error = %v", err)
+	}
+	storedChild, err := store.GetTask(ctx, foreignChild.ID)
+	if err != nil {
+		t.Fatalf("GetTask(stored child) error = %v", err)
+	}
+	if storedRoot.Status == TaskStatusCanceled || storedChild.Status == TaskStatusCanceled {
+		t.Fatalf(
+			"CancelTask() mutated tree before authorization: root=%q child=%q",
+			storedRoot.Status,
+			storedChild.Status,
+		)
+	}
+
+	beforeTasks := len(store.tasks)
+	if _, err := manager.CreateChildTask(ctx, root.ID, CreateTask{
+		ProfileID: storepkg.DefaultProfileID,
+		Scope:     ScopeWorkspace, WorkspaceID: "ws-b", Title: "Unauthorized child",
+	}, workspaceActor); !errors.Is(err, ErrPermissionDenied) {
+		t.Fatalf("CreateChildTask(foreign workspace) error = %v, want %v", err, ErrPermissionDenied)
+	}
+	if got := len(store.tasks); got != beforeTasks {
+		t.Fatalf("task count = %d, want unchanged %d", got, beforeTasks)
+	}
+
+	foreignRun := Run{
+		ID: "run-ws-b", TaskID: root.ID, WorkspaceID: "ws-b", Attempt: 1,
+		Status: TaskRunStatusQueued, Origin: Origin{Kind: OriginKindAutomation, Ref: "job:ws-b"},
+		QueuedAt: time.Date(2026, 7, 17, 17, 0, 0, 0, time.UTC),
+	}
+
+	if err := store.CreateTaskRun(ctx, foreignRun); err != nil {
+		t.Fatalf("CreateTaskRun(foreign run) error = %v", err)
+	}
+	runs, err := manager.ListTaskRuns(ctx, root.ID, RunQuery{}, workspaceActor)
+	if err != nil {
+		t.Fatalf("ListTaskRuns(root) error = %v", err)
+	}
+	if len(runs) != 0 {
+		t.Fatalf("ListTaskRuns(root) = %#v, want foreign run hidden", runs)
+	}
+	if _, err := manager.RunDetail(ctx, foreignRun.ID, workspaceActor); !errors.Is(err, ErrTaskRunNotFound) {
+		t.Fatalf("RunDetail(foreign run) error = %v, want %v", err, ErrTaskRunNotFound)
+	}
+	if _, err := manager.CancelRun(
+		ctx,
+		foreignRun.ID,
+		CancelRun{Reason: "unauthorized"},
+		workspaceActor,
+	); !errors.Is(err, ErrPermissionDenied) {
+		t.Fatalf("CancelRun(foreign run) error = %v, want %v", err, ErrPermissionDenied)
+	}
+	if _, err := manager.MarkRunNeedsAttention(
+		ctx,
+		foreignRun.ID,
+		"unauthorized escalation",
+		workspaceActor,
+	); !errors.Is(err, ErrPermissionDenied) {
+		t.Fatalf("MarkRunNeedsAttention(foreign run) error = %v, want %v", err, ErrPermissionDenied)
+	}
+	if got, want := store.runs[foreignRun.ID].Status.Normalize(), TaskRunStatusQueued; got != want {
+		t.Fatalf("foreign run status = %q, want authorization failure to preserve %q", got, want)
+	}
+
+	store.reviews["review-ws-b"] = RunReview{
+		ReviewID: "review-ws-b", TaskID: root.ID, RunID: foreignRun.ID,
+		Policy: ReviewPolicyAlways, ReviewRound: 1, Attempt: 1, Status: RunReviewStatusRequested,
+	}
+	if _, err := manager.GetRunReview(ctx, "review-ws-b", workspaceActor); !errors.Is(
+		err,
+		ErrPermissionDenied,
+	) {
+		t.Fatalf("GetRunReview(foreign run) error = %v, want %v", err, ErrPermissionDenied)
+	}
+	reviews, err := manager.ListRunReviews(ctx, RunReviewQuery{TaskID: root.ID}, workspaceActor)
+	if err != nil {
+		t.Fatalf("ListRunReviews(root) error = %v", err)
+	}
+	if len(reviews) != 0 {
+		t.Fatalf("ListRunReviews(root) = %#v, want foreign review hidden", reviews)
+	}
+}
+
+func TestManagerAddAndRemoveDependencyReconcileStatusAndEvents(t *testing.T) {
+	t.Parallel()
+
+	store := newInMemoryManagerStore()
+	manager := newTaskManagerForTest(t, store)
+	actor := validActorContext()
+
+	taskA, err := manager.CreateTask(
+		t.Context(),
+		CreateTask{ProfileID: storepkg.DefaultProfileID, Scope: ScopeGlobal, Title: "task A"},
+		actor,
+	)
+	if err != nil {
+		t.Fatalf("CreateTask(taskA) error = %v", err)
+	}
+	taskB, err := manager.CreateTask(
+		t.Context(),
+		CreateTask{ProfileID: storepkg.DefaultProfileID, Scope: ScopeGlobal, Title: "task B"},
+		actor,
+	)
+	if err != nil {
+		t.Fatalf("CreateTask(taskB) error = %v", err)
+	}
+
+	if err := manager.AddDependency(t.Context(), AddDependency{
+		TaskID:          taskA.ID,
+		DependsOnTaskID: taskB.ID,
+		Kind:            DependencyKindBlocks,
+	}, actor); err != nil {
+		t.Fatalf("AddDependency() error = %v", err)
+	}
+
+	blocked, err := store.GetTask(t.Context(), taskA.ID)
+	if err != nil {
+		t.Fatalf("GetTask(blocked) error = %v", err)
+	}
+	if got, want := blocked.Status, TaskStatusBlocked; got != want {
+		t.Fatalf("blocked.Status = %q, want %q", got, want)
+	}
+
+	if err := manager.RemoveDependency(t.Context(), taskA.ID, taskB.ID, actor); err != nil {
+		t.Fatalf("RemoveDependency() error = %v", err)
+	}
+
+	ready, err := store.GetTask(t.Context(), taskA.ID)
+	if err != nil {
+		t.Fatalf("GetTask(ready) error = %v", err)
+	}
+	if got, want := ready.Status, TaskStatusReady; got != want {
+		t.Fatalf("ready.Status = %q, want %q", got, want)
+	}
+
+	events, err := store.ListTaskEvents(t.Context(), EventQuery{TaskID: taskA.ID})
+	if err != nil {
+		t.Fatalf("ListTaskEvents(taskA) error = %v", err)
+	}
+	if len(events) != 3 {
+		t.Fatalf("len(taskA events) = %d, want 3", len(events))
+	}
+	if got, want := events[0].EventType, taskEventDependencyRemoved; got != want {
+		t.Fatalf("events[0].EventType = %q, want %q", got, want)
+	}
+	if got, want := events[1].EventType, taskEventDependencyAdded; got != want {
+		t.Fatalf("events[1].EventType = %q, want %q", got, want)
+	}
+
+	t.Run("Should reject oversized dependency references before mutating", func(t *testing.T) {
+		t.Parallel()
+
+		oversizedID := strings.Repeat("d", MaxReferenceBytes+1)
+		eventsBefore, err := store.ListTaskEvents(t.Context(), EventQuery{TaskID: taskA.ID})
+		if err != nil {
+			t.Fatalf("ListTaskEvents(before) error = %v", err)
+		}
+
+		if err := manager.AddDependency(t.Context(), AddDependency{
+			TaskID:          taskA.ID,
+			DependsOnTaskID: oversizedID,
+			Kind:            DependencyKindBlocks,
+		}, actor); !errors.Is(err, ErrValidation) {
+			t.Fatalf("AddDependency() error = %v, want %v", err, ErrValidation)
+		}
+		if err := manager.AddDependency(t.Context(), AddDependency{
+			TaskID:          oversizedID,
+			DependsOnTaskID: taskB.ID,
+			Kind:            DependencyKindBlocks,
+		}, actor); !errors.Is(err, ErrValidation) {
+			t.Fatalf("AddDependency(oversized task id) error = %v, want %v", err, ErrValidation)
+		}
+		if err := manager.RemoveDependency(t.Context(), taskA.ID, oversizedID, actor); !errors.Is(
+			err,
+			ErrValidation,
+		) {
+			t.Fatalf("RemoveDependency() error = %v, want %v", err, ErrValidation)
+		}
+		if err := manager.RemoveDependency(t.Context(), oversizedID, taskB.ID, actor); !errors.Is(
+			err,
+			ErrValidation,
+		) {
+			t.Fatalf("RemoveDependency(oversized task id) error = %v, want %v", err, ErrValidation)
+		}
+
+		dependencies, err := store.ListDependencies(t.Context(), taskA.ID)
+		if err != nil {
+			t.Fatalf("ListDependencies() error = %v", err)
+		}
+		if len(dependencies) != 0 {
+			t.Fatalf("len(dependencies) = %d, want 0", len(dependencies))
+		}
+		stored, err := store.GetTask(t.Context(), taskA.ID)
+		if err != nil {
+			t.Fatalf("GetTask() error = %v", err)
+		}
+		if got, want := stored.Status, TaskStatusReady; got != want {
+			t.Fatalf("stored.Status = %q, want %q", got, want)
+		}
+		eventsAfter, err := store.ListTaskEvents(t.Context(), EventQuery{TaskID: taskA.ID})
+		if err != nil {
+			t.Fatalf("ListTaskEvents(after) error = %v", err)
+		}
+		if got, want := len(eventsAfter), len(eventsBefore); got != want {
+			t.Fatalf("len(events) = %d, want unchanged %d", got, want)
+		}
+	})
+}
+
+func TestManagerTaskBlockStatusDerivation(t *testing.T) {
+	t.Parallel()
+
+	t.Run("Should derive blocked when a task holds any open block", func(t *testing.T) {
+		t.Parallel()
+
+		store := newInMemoryManagerStore()
+		manager := newTaskManagerForTest(t, store)
+		actor := validActorContext()
+		taskRecord, err := manager.CreateTask(t.Context(), CreateTask{
+			ProfileID:   storepkg.DefaultProfileID,
+			Scope:       ScopeWorkspace,
+			WorkspaceID: "ws-blocked",
+			Title:       "Blocked by runtime condition",
+		}, actor)
+		if err != nil {
+			t.Fatalf("CreateTask() error = %v", err)
+		}
+
+		store.blocks[taskRecord.ID] = map[string]TaskBlock{
+			"block-open": {
+				ID:          "block-open",
+				WorkspaceID: taskRecord.WorkspaceID,
+				TaskID:      taskRecord.ID,
+				Kind:        BlockKindNeedsInput,
+				Reason:      "creator input required",
+				CreatedBy:   ActorIdentity{Kind: ActorKindAgentSession, Ref: "sess-worker"},
+				CreatedAt:   time.Date(2026, 4, 14, 14, 55, 0, 0, time.UTC),
+			},
+		}
+
+		reconciled, err := manager.reconcileTaskCascade(t.Context(), taskRecord.ID, actor)
+		if err != nil {
+			t.Fatalf("reconcileTaskCascade() error = %v", err)
+		}
+		if got, want := reconciled.Status, TaskStatusBlocked; got != want {
+			t.Fatalf("reconciled.Status = %q, want %q", got, want)
+		}
+		if got, want := store.tasks[taskRecord.ID].Status, TaskStatusBlocked; got != want {
+			t.Fatalf("stored task status = %q, want %q", got, want)
+		}
+	})
+
+	t.Run(
+		"Should treat a block expiring at derivation time as cleared without a sweep",
+		func(t *testing.T) {
+			t.Parallel()
+
+			store := newInMemoryManagerStore()
+			manager := newTaskManagerForTest(t, store)
+			actor := validActorContext()
+			taskRecord, err := manager.CreateTask(t.Context(), CreateTask{
+				ProfileID:   storepkg.DefaultProfileID,
+				Scope:       ScopeWorkspace,
+				WorkspaceID: "ws-expired",
+				Title:       "Expired transient block",
+			}, actor)
+			if err != nil {
+				t.Fatalf("CreateTask() error = %v", err)
+			}
+			store.blocks[taskRecord.ID] = map[string]TaskBlock{
+				"block-expired": {
+					ID:          "block-expired",
+					WorkspaceID: taskRecord.WorkspaceID,
+					TaskID:      taskRecord.ID,
+					Kind:        BlockKindTransient,
+					Reason:      "external service recovered",
+					CreatedBy:   ActorIdentity{Kind: ActorKindAgentSession, Ref: "sess-worker"},
+					CreatedAt:   time.Date(2026, 4, 14, 14, 50, 0, 0, time.UTC),
+					ExpiresAt:   time.Date(2026, 4, 14, 15, 0, 0, 0, time.UTC),
+				},
+			}
+
+			reconciled, err := manager.reconcileTaskCascade(t.Context(), taskRecord.ID, actor)
+			if err != nil {
+				t.Fatalf("reconcileTaskCascade() error = %v", err)
+			}
+			if got, want := reconciled.Status, TaskStatusReady; got != want {
+				t.Fatalf("reconciled.Status = %q, want %q", got, want)
+			}
+		},
+	)
+
+	t.Run(
+		"Should stay blocked until all block dependency approval and pause sources clear",
+		func(t *testing.T) {
+			t.Parallel()
+
+			store := newInMemoryManagerStore()
+			manager := newTaskManagerForTest(t, store)
+			actor := validActorContext()
+			dependency, err := manager.CreateTask(t.Context(), CreateTask{
+				ProfileID:   storepkg.DefaultProfileID,
+				Scope:       ScopeWorkspace,
+				WorkspaceID: "ws-multi",
+				Title:       "Dependency",
+			}, actor)
+			if err != nil {
+				t.Fatalf("CreateTask(dependency) error = %v", err)
+			}
+			target, err := manager.CreateTask(t.Context(), CreateTask{
+				ProfileID:      storepkg.DefaultProfileID,
+				Scope:          ScopeWorkspace,
+				WorkspaceID:    "ws-multi",
+				Title:          "Multi-source blocked target",
+				ApprovalPolicy: ApprovalPolicyManual,
+			}, actor)
+			if err != nil {
+				t.Fatalf("CreateTask(target) error = %v", err)
+			}
+			if err := manager.AddDependency(t.Context(), AddDependency{
+				TaskID:          target.ID,
+				DependsOnTaskID: dependency.ID,
+				Kind:            DependencyKindBlocks,
+			}, actor); err != nil {
+				t.Fatalf("AddDependency() error = %v", err)
+			}
+			store.blocks[target.ID] = map[string]TaskBlock{
+				"block-input": {
+					ID:          "block-input",
+					WorkspaceID: target.WorkspaceID,
+					TaskID:      target.ID,
+					Kind:        BlockKindNeedsInput,
+					Reason:      "missing instructions",
+					CreatedBy:   ActorIdentity{Kind: ActorKindAgentSession, Ref: "sess-worker"},
+					CreatedAt:   time.Date(2026, 4, 14, 14, 50, 0, 0, time.UTC),
+				},
+				"block-capability": {
+					ID:          "block-capability",
+					WorkspaceID: target.WorkspaceID,
+					TaskID:      target.ID,
+					Kind:        BlockKindCapability,
+					Reason:      "missing connector",
+					CreatedBy:   ActorIdentity{Kind: ActorKindAgentSession, Ref: "sess-worker"},
+					CreatedAt:   time.Date(2026, 4, 14, 14, 51, 0, 0, time.UTC),
+				},
+			}
+			blockedRecord := store.tasks[target.ID]
+			blockedRecord.Paused = true
+			blockedRecord.PausedBy = "operator"
+			blockedRecord.PausedAt = time.Date(2026, 4, 14, 14, 52, 0, 0, time.UTC)
+			blockedRecord.PausedReason = "operator hold"
+			store.tasks[target.ID] = blockedRecord
+
+			first, err := manager.reconcileTaskCascade(t.Context(), target.ID, actor)
+			if err != nil {
+				t.Fatalf("reconcileTaskCascade(first) error = %v", err)
+			}
+			if got, want := first.Status, TaskStatusBlocked; got != want {
+				t.Fatalf("first.Status = %q, want %q", got, want)
+			}
+
+			inputBlock := store.blocks[target.ID]["block-input"]
+			inputBlock.ClearedAt = time.Date(2026, 4, 14, 14, 53, 0, 0, time.UTC)
+			inputBlock.ClearedBy = ActorIdentity{Kind: ActorKindHuman, Ref: "operator"}
+			store.blocks[target.ID]["block-input"] = inputBlock
+			partiallyCleared, err := manager.reconcileTaskCascade(t.Context(), target.ID, actor)
+			if err != nil {
+				t.Fatalf("reconcileTaskCascade(partial) error = %v", err)
+			}
+			if got, want := partiallyCleared.Status, TaskStatusBlocked; got != want {
+				t.Fatalf("partiallyCleared.Status = %q, want %q", got, want)
+			}
+
+			capabilityBlock := store.blocks[target.ID]["block-capability"]
+			capabilityBlock.ClearedAt = time.Date(2026, 4, 14, 14, 54, 0, 0, time.UTC)
+			capabilityBlock.ClearedBy = ActorIdentity{Kind: ActorKindHuman, Ref: "operator"}
+			store.blocks[target.ID]["block-capability"] = capabilityBlock
+			delete(store.dependencies[target.ID], dependency.ID)
+			readyRecord := store.tasks[target.ID]
+			readyRecord.ApprovalState = ApprovalStateApproved
+			readyRecord.Paused = false
+			readyRecord.PausedBy = ""
+			readyRecord.PausedAt = time.Time{}
+			readyRecord.PausedReason = ""
+			store.tasks[target.ID] = readyRecord
+
+			ready, err := manager.reconcileTaskCascade(t.Context(), target.ID, actor)
+			if err != nil {
+				t.Fatalf("reconcileTaskCascade(ready) error = %v", err)
+			}
+			if got, want := ready.Status, TaskStatusReady; got != want {
+				t.Fatalf("ready.Status = %q, want %q", got, want)
+			}
+		},
+	)
+}
+
+func TestManagerBlockTaskServiceValidation(t *testing.T) {
+	t.Parallel()
+
+	t.Run(
+		"Should reject empty reason and unsupported kind before inserting a block",
+		func(t *testing.T) {
+			t.Parallel()
+
+			tests := []struct {
+				name string
+				req  func(taskID string) BlockRequest
+			}{
+				{
+					name: "empty reason",
+					req: func(taskID string) BlockRequest {
+						return BlockRequest{TaskID: taskID, Kind: BlockKindNeedsInput, Reason: " "}
+					},
+				},
+				{
+					name: "unsupported kind",
+					req: func(taskID string) BlockRequest {
+						return BlockRequest{
+							TaskID: taskID,
+							Kind:   BlockKind("operator"),
+							Reason: "waiting",
+						}
+					},
+				},
+			}
+
+			for _, tt := range tests {
+				t.Run(tt.name, func(t *testing.T) {
+					t.Parallel()
+
+					store := newInMemoryManagerStore()
+					manager := newTaskManagerForTest(t, store)
+					actor := validActorContext()
+					taskRecord, err := manager.CreateTask(t.Context(), CreateTask{
+						ProfileID:   storepkg.DefaultProfileID,
+						Scope:       ScopeWorkspace,
+						WorkspaceID: "ws-block-validation-" + strings.ReplaceAll(tt.name, " ", "-"),
+						Title:       "Block validation",
+					}, actor)
+					if err != nil {
+						t.Fatalf("CreateTask() error = %v", err)
+					}
+
+					if _, err := manager.BlockTask(
+						t.Context(),
+						tt.req(taskRecord.ID),
+						actor,
+					); !errors.Is(err, ErrValidation) {
+						t.Fatalf("BlockTask() error = %v, want %v", err, ErrValidation)
+					}
+					blocks, err := manager.ListTaskBlocks(
+						t.Context(),
+						taskRecord.ID,
+						true,
+						actor,
+					)
+					if err != nil {
+						t.Fatalf("ListTaskBlocks() error = %v", err)
+					}
+					if len(blocks) != 0 {
+						t.Fatalf("len(blocks) = %d, want 0", len(blocks))
+					}
+				})
+			}
+		},
+	)
+
+	t.Run("Should accept expires_at only for transient blocks", func(t *testing.T) {
+		t.Parallel()
+
+		expiresAt := time.Date(2026, 4, 14, 16, 0, 0, 0, time.UTC)
+		for _, kind := range []BlockKind{BlockKindNeedsInput, BlockKindCapability} {
+			t.Run(string(kind), func(t *testing.T) {
+				t.Parallel()
+
+				store := newInMemoryManagerStore()
+				manager := newTaskManagerForTest(t, store)
+				actor := validActorContext()
+				taskRecord, err := manager.CreateTask(t.Context(), CreateTask{
+					ProfileID:   storepkg.DefaultProfileID,
+					Scope:       ScopeWorkspace,
+					WorkspaceID: "ws-block-expiry-" + string(kind),
+					Title:       "Block expiry rejection",
+				}, actor)
+				if err != nil {
+					t.Fatalf("CreateTask() error = %v", err)
+				}
+
+				_, err = manager.BlockTask(t.Context(), BlockRequest{
+					TaskID:    taskRecord.ID,
+					Kind:      kind,
+					Reason:    "waiting for non-transient condition",
+					ExpiresAt: expiresAt,
+				}, actor)
+				if !errors.Is(err, ErrValidation) {
+					t.Fatalf(
+						"BlockTask(non-transient expires_at) error = %v, want %v",
+						err,
+						ErrValidation,
+					)
+				}
+			})
+		}
+
+		store := newInMemoryManagerStore()
+		manager := newTaskManagerForTest(t, store)
+		actor := validActorContext()
+		taskRecord, err := manager.CreateTask(t.Context(), CreateTask{
+			ProfileID:   storepkg.DefaultProfileID,
+			Scope:       ScopeWorkspace,
+			WorkspaceID: "ws-block-expiry-transient",
+			Title:       "Transient block expiry",
+		}, actor)
+		if err != nil {
+			t.Fatalf("CreateTask() error = %v", err)
+		}
+
+		block, err := manager.BlockTask(t.Context(), BlockRequest{
+			TaskID:    taskRecord.ID,
+			Kind:      BlockKindTransient,
+			Reason:    "external service outage",
+			ExpiresAt: expiresAt,
+		}, actor)
+		if err != nil {
+			t.Fatalf("BlockTask(transient expires_at) error = %v", err)
+		}
+		if !block.ExpiresAt.Equal(expiresAt) {
+			t.Fatalf("block.ExpiresAt = %v, want %v", block.ExpiresAt, expiresAt)
+		}
+	})
+}
+
+func TestManagerTaskBlockAgentSessionScope(t *testing.T) {
+	t.Parallel()
+
+	t.Run(
+		"Should constrain agent-session block lifecycle to the active leased task",
+		func(t *testing.T) {
+			t.Parallel()
+
+			ctx := t.Context()
+			store := newInMemoryManagerStore()
+			manager := newTaskManagerForTest(t, store)
+			operator := validActorContext()
+			agent := agentSessionActorContext("sess-block-scope")
+
+			leasedTask, err := manager.CreateTask(
+				ctx,
+				CreateTask{ProfileID: storepkg.DefaultProfileID, Scope: ScopeGlobal, Title: "leased task"},
+				operator,
+			)
+			if err != nil {
+				t.Fatalf("CreateTask(leased) error = %v", err)
+			}
+			foreignTask, err := manager.CreateTask(
+				ctx,
+				CreateTask{ProfileID: storepkg.DefaultProfileID, Scope: ScopeGlobal, Title: "foreign task"},
+				operator,
+			)
+			if err != nil {
+				t.Fatalf("CreateTask(foreign) error = %v", err)
+			}
+			if _, err := manager.EnqueueRun(ctx, EnqueueRun{TaskID: leasedTask.ID}, operator); err != nil {
+				t.Fatalf("EnqueueRun(leased) error = %v", err)
+			}
+			claim, err := manager.ClaimNextRun(ctx, ClaimCriteria{
+				Scope:            ScopeGlobal,
+				ClaimerSessionID: "sess-block-scope",
+				LeaseDuration:    time.Minute,
+			}, agent)
+			if err != nil {
+				t.Fatalf("ClaimNextRun() error = %v", err)
+			}
+
+			leasedBlock, err := manager.BlockTask(ctx, BlockRequest{
+				TaskID: leasedTask.ID,
+				Kind:   BlockKindNeedsInput,
+				Reason: "missing input",
+			}, agent)
+			if err != nil {
+				t.Fatalf("BlockTask(leased agent) error = %v", err)
+			}
+			blocks, err := manager.ListTaskBlocks(ctx, leasedTask.ID, true, agent)
+			if err != nil {
+				t.Fatalf("ListTaskBlocks(leased agent) error = %v", err)
+			}
+			if got, want := len(blocks), 1; got != want {
+				t.Fatalf("len(leased blocks) = %d, want %d", got, want)
+			}
+			if blocks[0].ID != leasedBlock.ID {
+				t.Fatalf("leased block id = %q, want %q", blocks[0].ID, leasedBlock.ID)
+			}
+			if _, err := manager.ClearTaskBlock(
+				ctx,
+				leasedTask.ID,
+				leasedBlock.ID,
+				"leased task resolved",
+				agent,
+			); err != nil {
+				t.Fatalf("ClearTaskBlock(leased agent) error = %v", err)
+			}
+
+			_, err = manager.BlockTask(ctx, BlockRequest{
+				TaskID:     foreignTask.ID,
+				Kind:       BlockKindNeedsInput,
+				Reason:     "foreign input",
+				RunID:      claim.Run.ID,
+				ClaimToken: claim.ClaimToken,
+			}, agent)
+			if !errors.Is(err, ErrInvalidStatusTransition) {
+				t.Fatalf("BlockTask(foreign run) error = %v, want %v", err, ErrInvalidStatusTransition)
+			}
+
+			foreignBlock, err := manager.BlockTask(ctx, BlockRequest{
+				TaskID: foreignTask.ID,
+				Kind:   BlockKindNeedsInput,
+				Reason: "operator block",
+			}, operator)
+			if err != nil {
+				t.Fatalf("BlockTask(operator foreign) error = %v", err)
+			}
+			if _, err := manager.ListTaskBlocks(ctx, foreignTask.ID, true, agent); err == nil {
+				t.Fatal("ListTaskBlocks(foreign agent) error = nil, want permission error")
+			} else {
+				assertAutonomyReason(t, err, AutonomyForeignRun)
+			}
+			if _, err := manager.ClearTaskBlock(
+				ctx,
+				foreignTask.ID,
+				foreignBlock.ID,
+				"agent tried",
+				agent,
+			); err == nil {
+				t.Fatal("ClearTaskBlock(foreign agent) error = nil, want permission error")
+			} else {
+				assertAutonomyReason(t, err, AutonomyForeignRun)
+			}
+			if _, err := manager.RecoverTask(
+				ctx,
+				foreignTask.ID,
+				"agent tried recover",
+				agent,
+			); err == nil {
+				t.Fatal("RecoverTask(agent) error = nil, want permission error")
+			} else {
+				assertAutonomyReason(t, err, AutonomyForeignRun)
+			}
+		},
+	)
+}
+
+func TestManagerClearAndListTaskBlocks(t *testing.T) {
+	t.Parallel()
+
+	store := newInMemoryManagerStore()
+	manager := newTaskManagerForTest(t, store)
+	actor := validActorContext()
+	target, err := manager.CreateTask(t.Context(), CreateTask{
+		ProfileID:   storepkg.DefaultProfileID,
+		Scope:       ScopeWorkspace,
+		WorkspaceID: "ws-block-list-target",
+		Title:       "Block list target",
+	}, actor)
+	if err != nil {
+		t.Fatalf("CreateTask(target) error = %v", err)
+	}
+	other, err := manager.CreateTask(t.Context(), CreateTask{
+		ProfileID:   storepkg.DefaultProfileID,
+		Scope:       ScopeWorkspace,
+		WorkspaceID: "ws-block-list-other",
+		Title:       "Other workspace task",
+	}, actor)
+	if err != nil {
+		t.Fatalf("CreateTask(other) error = %v", err)
+	}
+
+	openBlock, err := manager.BlockTask(t.Context(), BlockRequest{
+		TaskID: target.ID,
+		Kind:   BlockKindNeedsInput,
+		Reason: "creator input required",
+	}, actor)
+	if err != nil {
+		t.Fatalf("BlockTask(open) error = %v", err)
+	}
+	clearable, err := manager.BlockTask(t.Context(), BlockRequest{
+		TaskID: target.ID,
+		Kind:   BlockKindCapability,
+		Reason: "missing connector",
+	}, actor)
+	if err != nil {
+		t.Fatalf("BlockTask(clearable) error = %v", err)
+	}
+	if _, err := manager.BlockTask(t.Context(), BlockRequest{
+		TaskID: other.ID,
+		Kind:   BlockKindNeedsInput,
+		Reason: "other workspace block",
+	}, actor); err != nil {
+		t.Fatalf("BlockTask(other) error = %v", err)
+	}
+
+	cleared, err := manager.ClearTaskBlock(
+		t.Context(),
+		target.ID,
+		clearable.ID,
+		"connector restored",
+		actor,
+	)
+	if err != nil {
+		t.Fatalf("ClearTaskBlock() error = %v", err)
+	}
+	if cleared.ClearedAt.IsZero() {
+		t.Fatal("ClearTaskBlock().ClearedAt is zero, want stamped clear time")
+	}
+	if got, want := cleared.ClearedBy, actor.Actor; got != want {
+		t.Fatalf("ClearTaskBlock().ClearedBy = %#v, want %#v", got, want)
+	}
+	if got, want := cleared.ClearNote, "connector restored"; got != want {
+		t.Fatalf("ClearTaskBlock().ClearNote = %q, want %q", got, want)
+	}
+	if _, err := manager.ClearTaskBlock(
+		t.Context(),
+		target.ID,
+		clearable.ID,
+		"again",
+		actor,
+	); !errors.Is(err, ErrConflict) {
+		t.Fatalf("ClearTaskBlock(second) error = %v, want %v", err, ErrConflict)
+	}
+
+	openOnly, err := manager.ListTaskBlocks(t.Context(), target.ID, false, actor)
+	if err != nil {
+		t.Fatalf("ListTaskBlocks(open) error = %v", err)
+	}
+	if got, want := len(openOnly), 1; got != want {
+		t.Fatalf("len(openOnly) = %d, want %d: %#v", got, want, openOnly)
+	}
+	if got, want := openOnly[0].ID, openBlock.ID; got != want {
+		t.Fatalf("openOnly[0].ID = %q, want %q", got, want)
+	}
+
+	withCleared, err := manager.ListTaskBlocks(t.Context(), target.ID, true, actor)
+	if err != nil {
+		t.Fatalf("ListTaskBlocks(includeCleared) error = %v", err)
+	}
+	if got, want := len(withCleared), 2; got != want {
+		t.Fatalf("len(withCleared) = %d, want %d: %#v", got, want, withCleared)
+	}
+	for _, block := range withCleared {
+		if block.TaskID != target.ID || block.WorkspaceID != target.WorkspaceID {
+			t.Fatalf(
+				"listed block = %#v, want only target task/workspace %q/%q",
+				block,
+				target.ID,
+				target.WorkspaceID,
+			)
+		}
+	}
+}
+
+func TestManagerTaskBlockBreakerEscalatesAtLimit(t *testing.T) {
+	t.Run(
+		"Should escalate at the recurrence limit exactly once while already escalated",
+		func(t *testing.T) {
+			t.Parallel()
+
+			store := newInMemoryManagerStore()
+			needsAttentionHooks := 0
+			manager := newTaskManagerForTestWithOptions(
+				t,
+				store,
+				WithTaskRunHooks(recordingTaskRunHooks{
+					needsAttention: func(
+						_ context.Context,
+						payload hookspkg.TaskNeedsAttentionPayload,
+					) (hookspkg.TaskNeedsAttentionPayload, error) {
+						needsAttentionHooks++
+						return payload, nil
+					},
+				}),
+			)
+			actor := validActorContext()
+			taskRecord, err := manager.CreateTask(t.Context(), CreateTask{
+				ProfileID:   storepkg.DefaultProfileID,
+				Scope:       ScopeWorkspace,
+				WorkspaceID: "ws-block-breaker",
+				Title:       "Breaker target",
+			}, actor)
+			if err != nil {
+				t.Fatalf("CreateTask() error = %v", err)
+			}
+
+			first, err := manager.BlockTask(t.Context(), BlockRequest{
+				TaskID: taskRecord.ID,
+				Kind:   BlockKindNeedsInput,
+				Reason: "waiting for creator",
+			}, actor)
+			if err != nil {
+				t.Fatalf("BlockTask(first) error = %v", err)
+			}
+			if got, want := store.blockRecurrences[blockRecurrenceTestKey(taskRecord.ID, BlockKindNeedsInput)].Count, 0; got != want {
+				t.Fatalf("first recurrence count = %d, want %d", got, want)
+			}
+			if _, err := manager.ClearTaskBlock(
+				t.Context(),
+				taskRecord.ID,
+				first.ID,
+				"resolved once",
+				actor,
+			); err != nil {
+				t.Fatalf("ClearTaskBlock(first) error = %v", err)
+			}
+
+			second, err := manager.BlockTask(t.Context(), BlockRequest{
+				TaskID: taskRecord.ID,
+				Kind:   BlockKindNeedsInput,
+				Reason: "waiting again",
+			}, actor)
+			if err != nil {
+				t.Fatalf("BlockTask(second) error = %v", err)
+			}
+			if got, want := store.blockRecurrences[blockRecurrenceTestKey(taskRecord.ID, BlockKindNeedsInput)].Count, 1; got != want {
+				t.Fatalf("second recurrence count = %d, want %d", got, want)
+			}
+			if store.tasks[taskRecord.ID].NeedsAttention != nil {
+				t.Fatalf(
+					"second block escalated task: %#v",
+					store.tasks[taskRecord.ID].NeedsAttention,
+				)
+			}
+			if _, err := manager.ClearTaskBlock(
+				t.Context(),
+				taskRecord.ID,
+				second.ID,
+				"resolved twice",
+				actor,
+			); err != nil {
+				t.Fatalf("ClearTaskBlock(second) error = %v", err)
+			}
+
+			third, err := manager.BlockTask(t.Context(), BlockRequest{
+				TaskID: taskRecord.ID,
+				Kind:   BlockKindNeedsInput,
+				Reason: "waiting third time",
+			}, actor)
+			if err != nil {
+				t.Fatalf("BlockTask(third) error = %v", err)
+			}
+			if got, want := store.blockRecurrences[blockRecurrenceTestKey(taskRecord.ID, BlockKindNeedsInput)].Count, 2; got != want {
+				t.Fatalf("third recurrence count = %d, want %d", got, want)
+			}
+			escalated := store.tasks[taskRecord.ID]
+			if escalated.NeedsAttention == nil {
+				t.Fatal("NeedsAttention = nil, want breaker escalation")
+			}
+			if got, want := escalated.Status, TaskStatusNeedsAttention; got != want {
+				t.Fatalf("Status = %q, want %q", got, want)
+			}
+			if needsAttentionHooks != 1 {
+				t.Fatalf("needs_attention hooks = %d, want 1", needsAttentionHooks)
+			}
+			if got, want := countTaskEventsByType(store.events, taskWatchEventNeedsAttention), 1; got != want {
+				t.Fatalf("task.needs_attention events = %d, want %d", got, want)
+			}
+
+			if _, err := manager.ClearTaskBlock(
+				t.Context(),
+				taskRecord.ID,
+				third.ID,
+				"resolved third",
+				actor,
+			); err != nil {
+				t.Fatalf("ClearTaskBlock(third) error = %v", err)
+			}
+			if _, err := manager.BlockTask(t.Context(), BlockRequest{
+				TaskID: taskRecord.ID,
+				Kind:   BlockKindNeedsInput,
+				Reason: "waiting fourth time",
+			}, actor); err != nil {
+				t.Fatalf("BlockTask(fourth) error = %v", err)
+			}
+			if needsAttentionHooks != 1 {
+				t.Fatalf(
+					"needs_attention hooks after fourth block = %d, want 1",
+					needsAttentionHooks,
+				)
+			}
+			if got, want := countTaskEventsByType(store.events, taskWatchEventNeedsAttention), 1; got != want {
+				t.Fatalf("task.needs_attention events after fourth block = %d, want %d", got, want)
+			}
+		},
+	)
+}
+
+func TestManagerTaskBlockBreakerReEscalatesAfterRecover(t *testing.T) {
+	t.Run(
+		"Should escalate again after recover without resetting recurrence counters",
+		func(t *testing.T) {
+			t.Parallel()
+
+			store := newInMemoryManagerStore()
+			needsAttentionHooks := 0
+			manager := newTaskManagerForTestWithOptions(
+				t,
+				store,
+				WithTaskRunHooks(recordingTaskRunHooks{
+					needsAttention: func(
+						_ context.Context,
+						payload hookspkg.TaskNeedsAttentionPayload,
+					) (hookspkg.TaskNeedsAttentionPayload, error) {
+						needsAttentionHooks++
+						return payload, nil
+					},
+				}),
+			)
+			actor := validActorContext()
+			taskRecord, err := manager.CreateTask(t.Context(), CreateTask{
+				ProfileID:   storepkg.DefaultProfileID,
+				Scope:       ScopeWorkspace,
+				WorkspaceID: "ws-block-breaker-recover",
+				Title:       "Breaker recover target",
+			}, actor)
+			if err != nil {
+				t.Fatalf("CreateTask() error = %v", err)
+			}
+
+			var latest TaskBlock
+			for idx := range 3 {
+				latest, err = manager.BlockTask(t.Context(), BlockRequest{
+					TaskID: taskRecord.ID,
+					Kind:   BlockKindNeedsInput,
+					Reason: fmt.Sprintf("input loop %d", idx),
+				}, actor)
+				if err != nil {
+					t.Fatalf("BlockTask(%d) error = %v", idx, err)
+				}
+				if _, err := manager.ClearTaskBlock(
+					t.Context(),
+					taskRecord.ID,
+					latest.ID,
+					"resolved",
+					actor,
+				); err != nil {
+					t.Fatalf("ClearTaskBlock(%d) error = %v", idx, err)
+				}
+			}
+			if needsAttentionHooks != 1 {
+				t.Fatalf("needs_attention hooks before recover = %d, want 1", needsAttentionHooks)
+			}
+			if got, want := countTaskEventsByType(store.events, taskWatchEventNeedsAttention), 1; got != want {
+				t.Fatalf("task.needs_attention events before recover = %d, want %d", got, want)
+			}
+
+			if _, err := manager.RecoverTask(
+				t.Context(),
+				taskRecord.ID,
+				"operator recovered",
+				actor,
+			); err != nil {
+				t.Fatalf("RecoverTask() error = %v", err)
+			}
+			recurrenceKey := blockRecurrenceTestKey(taskRecord.ID, BlockKindNeedsInput)
+			if got, want := store.blockRecurrences[recurrenceKey].Count, 2; got != want {
+				t.Fatalf("recurrence count after recover = %d, want %d", got, want)
+			}
+			if store.tasks[taskRecord.ID].NeedsAttention != nil {
+				t.Fatalf(
+					"NeedsAttention after recover = %#v, want nil",
+					store.tasks[taskRecord.ID].NeedsAttention,
+				)
+			}
+
+			if _, err := manager.BlockTask(t.Context(), BlockRequest{
+				TaskID: taskRecord.ID,
+				Kind:   BlockKindNeedsInput,
+				Reason: "input loop after recover",
+			}, actor); err != nil {
+				t.Fatalf("BlockTask(after recover) error = %v", err)
+			}
+			if needsAttentionHooks != 2 {
+				t.Fatalf(
+					"needs_attention hooks after recover re-block = %d, want 2",
+					needsAttentionHooks,
+				)
+			}
+			if got, want := countTaskEventsByType(store.events, taskWatchEventNeedsAttention), 2; got != want {
+				t.Fatalf(
+					"task.needs_attention events after recover re-block = %d, want %d",
+					got,
+					want,
+				)
+			}
+			if got, want := store.blockRecurrences[blockRecurrenceTestKey(taskRecord.ID, BlockKindNeedsInput)].Count, 3; got != want {
+				t.Fatalf("recurrence count after recover re-block = %d, want %d", got, want)
+			}
+		},
+	)
+}
+
+func TestManagerTaskBlockBreakerCanBeDisabled(t *testing.T) {
+	t.Run(
+		"Should keep recurrence accounting but skip escalation when disabled",
+		func(t *testing.T) {
+			t.Parallel()
+
+			store := newInMemoryManagerStore()
+			manager := newTaskManagerForTestWithOptions(t, store, WithBlockRecurrenceLimit(0))
+			actor := validActorContext()
+			taskRecord, err := manager.CreateTask(t.Context(), CreateTask{
+				ProfileID:   storepkg.DefaultProfileID,
+				Scope:       ScopeWorkspace,
+				WorkspaceID: "ws-block-breaker-disabled",
+				Title:       "Breaker disabled",
+			}, actor)
+			if err != nil {
+				t.Fatalf("CreateTask() error = %v", err)
+			}
+
+			for idx := range 3 {
+				block, err := manager.BlockTask(t.Context(), BlockRequest{
+					TaskID: taskRecord.ID,
+					Kind:   BlockKindCapability,
+					Reason: fmt.Sprintf("missing capability %d", idx),
+				}, actor)
+				if err != nil {
+					t.Fatalf("BlockTask(%d) error = %v", idx, err)
+				}
+				if idx < 2 {
+					if _, err := manager.ClearTaskBlock(
+						t.Context(),
+						taskRecord.ID,
+						block.ID,
+						"capability restored",
+						actor,
+					); err != nil {
+						t.Fatalf("ClearTaskBlock(%d) error = %v", idx, err)
+					}
+				}
+			}
+			if got, want := store.blockRecurrences[blockRecurrenceTestKey(taskRecord.ID, BlockKindCapability)].Count, 2; got != want {
+				t.Fatalf("recurrence count = %d, want %d", got, want)
+			}
+			if store.tasks[taskRecord.ID].NeedsAttention != nil {
+				t.Fatalf(
+					"NeedsAttention = %#v, want disabled breaker to skip escalation",
+					store.tasks[taskRecord.ID].NeedsAttention,
+				)
+			}
+		},
+	)
+}
+
+func TestManagerExpireTaskBlocksDoesNotIncrementRecurrenceOnClear(t *testing.T) {
+	t.Run(
+		"Should leave recurrence unchanged for expiry clear then increment on re-block",
+		func(t *testing.T) {
+			t.Parallel()
+
+			now := time.Date(2026, 4, 14, 15, 0, 0, 0, time.UTC)
+			store := newInMemoryManagerStore()
+			manager := newTaskManagerForTestWithOptions(
+				t,
+				store,
+				WithManagerNow(func() time.Time { return now }),
+			)
+			actor := validActorContext()
+			taskRecord, err := manager.CreateTask(t.Context(), CreateTask{
+				ProfileID:   storepkg.DefaultProfileID,
+				Scope:       ScopeWorkspace,
+				WorkspaceID: "ws-transient-expiry",
+				Title:       "Transient expiry",
+			}, actor)
+			if err != nil {
+				t.Fatalf("CreateTask() error = %v", err)
+			}
+			block, err := manager.BlockTask(t.Context(), BlockRequest{
+				TaskID:    taskRecord.ID,
+				Kind:      BlockKindTransient,
+				Reason:    "temporary outage",
+				ExpiresAt: now.Add(time.Minute),
+			}, actor)
+			if err != nil {
+				t.Fatalf("BlockTask(transient) error = %v", err)
+			}
+
+			daemon, err := DeriveDaemonActorContext("scheduler", "daemon.scheduler")
+			if err != nil {
+				t.Fatalf("DeriveDaemonActorContext() error = %v", err)
+			}
+			result, err := manager.ExpireTaskBlocks(
+				t.Context(),
+				now.Add(2*time.Minute),
+				daemon,
+			)
+			if err != nil {
+				t.Fatalf("ExpireTaskBlocks() error = %v", err)
+			}
+			if got, want := len(result.Blocks), 1; got != want {
+				t.Fatalf("expired blocks = %d, want %d", got, want)
+			}
+			if result.Blocks[0].ID != block.ID {
+				t.Fatalf("expired block ID = %q, want %q", result.Blocks[0].ID, block.ID)
+			}
+			if got, want := store.blockRecurrences[blockRecurrenceTestKey(taskRecord.ID, BlockKindTransient)].Count, 0; got != want {
+				t.Fatalf("recurrence count after expiry clear = %d, want %d", got, want)
+			}
+
+			if _, err := manager.BlockTask(t.Context(), BlockRequest{
+				TaskID: taskRecord.ID,
+				Kind:   BlockKindTransient,
+				Reason: "temporary outage again",
+			}, actor); err != nil {
+				t.Fatalf("BlockTask(reblock transient) error = %v", err)
+			}
+			if got, want := store.blockRecurrences[blockRecurrenceTestKey(taskRecord.ID, BlockKindTransient)].Count, 1; got != want {
+				t.Fatalf("recurrence count after reblock = %d, want %d", got, want)
+			}
+		},
+	)
+
+	t.Run("Should reserve every expiry event ID before clearing any block", func(t *testing.T) {
+		t.Parallel()
+
+		now := time.Date(2026, 4, 14, 16, 0, 0, 0, time.UTC)
+		store := newInMemoryManagerStore()
+		manager := newTaskManagerForTestWithOptions(
+			t,
+			store,
+			WithManagerNow(func() time.Time { return now }),
+		)
+		actor := validActorContext()
+		blocks := make([]TaskBlock, 0, 2)
+		for index := range 2 {
+			taskRecord, err := manager.CreateTask(t.Context(), CreateTask{
+				ProfileID:   storepkg.DefaultProfileID,
+				Scope:       ScopeWorkspace,
+				WorkspaceID: fmt.Sprintf("ws-transient-expiry-entropy-%d", index),
+				Title:       fmt.Sprintf("Transient expiry entropy %d", index),
+			}, actor)
+			if err != nil {
+				t.Fatalf("CreateTask(%d) error = %v", index, err)
+			}
+			block, err := manager.BlockTask(t.Context(), BlockRequest{
+				TaskID:    taskRecord.ID,
+				Kind:      BlockKindTransient,
+				Reason:    fmt.Sprintf("temporary outage %d", index),
+				ExpiresAt: now.Add(time.Minute),
+			}, actor)
+			if err != nil {
+				t.Fatalf("BlockTask(%d) error = %v", index, err)
+			}
+			blocks = append(blocks, block)
+		}
+
+		eventsBefore := len(store.events)
+		entropyErr := errors.New("second expiry identity unavailable")
+		idCalls := 0
+		manager.newID = func(prefix string) (string, error) {
+			idCalls++
+			if idCalls == 2 {
+				return "", entropyErr
+			}
+			return fmt.Sprintf("%s-expiry-entropy-%d", prefix, idCalls), nil
+		}
+		daemon, err := DeriveDaemonActorContext("scheduler", "daemon.scheduler")
+		if err != nil {
+			t.Fatalf("DeriveDaemonActorContext() error = %v", err)
+		}
+
+		result, err := manager.ExpireTaskBlocks(t.Context(), now.Add(2*time.Minute), daemon)
+		if !errors.Is(err, entropyErr) {
+			t.Fatalf("ExpireTaskBlocks() error = %v, want errors.Is(entropyErr)", err)
+		}
+		if len(result.Blocks) != 0 {
+			t.Fatalf("ExpireTaskBlocks() blocks = %#v, want none", result.Blocks)
+		}
+		if got, want := idCalls, 2; got != want {
+			t.Fatalf("ID generation calls = %d, want %d", got, want)
+		}
+		if got := len(store.events); got != eventsBefore {
+			t.Fatalf("event count after entropy failure = %d, want %d", got, eventsBefore)
+		}
+		for _, block := range blocks {
+			stored := store.blocks[block.TaskID][block.ID]
+			if !stored.ClearedAt.IsZero() {
+				t.Fatalf("block %q cleared_at = %v, want zero", block.ID, stored.ClearedAt)
+			}
+		}
+	})
+}
+
+func TestManagerRecoverTaskClearsEscalationAndAutoEnqueuesReadyTask(t *testing.T) {
+	t.Run("Should recover an escalated task and auto-enqueue when ready", func(t *testing.T) {
+		t.Parallel()
+
+		store := &adjacentRecoveredEventStore{inMemoryManagerStore: newInMemoryManagerStore()}
+		recoveredHooks := 0
+		eventObserver := &recordingTaskEventObserver{}
+		manager := newTaskManagerForTestWithOptions(
+			t,
+			store,
+			WithEventObserver(eventObserver),
+			WithTaskRunHooks(recordingTaskRunHooks{
+				taskRecovered: func(
+					_ context.Context,
+					payload hookspkg.TaskRecoveredPayload,
+				) (hookspkg.TaskRecoveredPayload, error) {
+					recoveredHooks++
+					return payload, nil
+				},
+			}),
+		)
+		actor := validActorContext()
+		taskRecord, err := manager.CreateTask(t.Context(), CreateTask{
+			ProfileID:          storepkg.DefaultProfileID,
+			Scope:              ScopeWorkspace,
+			WorkspaceID:        "ws-block-recover",
+			Title:              "Recover target",
+			AutoEnqueueOnReady: true,
+		}, actor)
+		if err != nil {
+			t.Fatalf("CreateTask() error = %v", err)
+		}
+
+		var latest TaskBlock
+		for idx := range 3 {
+			latest, err = manager.BlockTask(t.Context(), BlockRequest{
+				TaskID: taskRecord.ID,
+				Kind:   BlockKindNeedsInput,
+				Reason: fmt.Sprintf("input loop %d", idx),
+			}, actor)
+			if err != nil {
+				t.Fatalf("BlockTask(%d) error = %v", idx, err)
+			}
+			if idx < 2 {
+				if _, err := manager.ClearTaskBlock(
+					t.Context(),
+					taskRecord.ID,
+					latest.ID,
+					"resolved",
+					actor,
+				); err != nil {
+					t.Fatalf("ClearTaskBlock(%d) error = %v", idx, err)
+				}
+			}
+		}
+		if store.tasks[taskRecord.ID].NeedsAttention == nil {
+			t.Fatal("NeedsAttention = nil before RecoverTask, want escalation")
+		}
+		if _, err := manager.ClearTaskBlock(
+			t.Context(),
+			taskRecord.ID,
+			latest.ID,
+			"resolved final",
+			actor,
+		); err != nil {
+			t.Fatalf("ClearTaskBlock(final) error = %v", err)
+		}
+		view, err := manager.GetTask(t.Context(), taskRecord.ID, actor)
+		if err != nil {
+			t.Fatalf("GetTask(before recover) error = %v", err)
+		}
+		firstStreamCtx, cancelFirstStream := context.WithCancel(t.Context())
+		defer cancelFirstStream()
+		firstStream, err := manager.Stream(
+			firstStreamCtx,
+			taskRecord.ID,
+			StreamQuery{AfterSequence: view.Task.LatestEventSeq},
+			actor,
+		)
+		if err != nil {
+			t.Fatalf("Stream(first observer) error = %v", err)
+		}
+		secondStreamCtx, cancelSecondStream := context.WithCancel(t.Context())
+		defer cancelSecondStream()
+		secondStream, err := manager.Stream(
+			secondStreamCtx,
+			taskRecord.ID,
+			StreamQuery{AfterSequence: view.Task.LatestEventSeq},
+			actor,
+		)
+		if err != nil {
+			t.Fatalf("Stream(second observer) error = %v", err)
+		}
+		observerBaseline := len(eventObserver.records)
+
+		recovered, err := manager.RecoverTask(
+			t.Context(),
+			taskRecord.ID,
+			"operator recovered",
+			actor,
+		)
+		if err != nil {
+			t.Fatalf("RecoverTask() error = %v", err)
+		}
+		if recovered.NeedsAttention != nil {
+			t.Fatalf("RecoverTask().NeedsAttention = %#v, want nil", recovered.NeedsAttention)
+		}
+		if recoveredHooks != 1 {
+			t.Fatalf("task.recovered hooks = %d, want 1", recoveredHooks)
+		}
+		if got, want := countTaskEventsByType(store.events, taskWatchEventRecovered), 2; got != want {
+			t.Fatalf("task.recovered events = %d, want %d", got, want)
+		}
+		if got, want := len(eventObserver.records), observerBaseline+1; got != want {
+			t.Fatalf("task event observer records = %d, want %d", got, want)
+		}
+		deliveredRecord := eventObserver.records[observerBaseline]
+		persistedRecord, err := store.GetTaskEventRecord(t.Context(), deliveredRecord.Event.ID)
+		if err != nil {
+			t.Fatalf("GetTaskEventRecord(recovered) error = %v", err)
+		}
+		assertTaskEventRecordEqual(t, deliveredRecord, persistedRecord)
+		if deliveredRecord.Event.ID == store.adjacent.Event.ID {
+			t.Fatalf("delivered recovered event id = adjacent id %q", deliveredRecord.Event.ID)
+		}
+		for subscriberIndex, stream := range []<-chan StreamEvent{firstStream, secondStream} {
+			event := awaitTaskStreamEvent(t, stream)
+			assertTaskStreamEventMatchesRecord(t, subscriberIndex, event, deliveredRecord)
+		}
+		if got, want := len(store.runs), 1; got != want {
+			t.Fatalf("runs after recover auto-enqueue = %d, want %d", got, want)
+		}
+		if got, want := countTaskEventsByType(store.events, taskEventAutoEnqueueTriggered), 1; got != want {
+			t.Fatalf("task.auto_enqueue.triggered events = %d, want %d", got, want)
+		}
+		if _, err := manager.RecoverTask(
+			t.Context(),
+			taskRecord.ID,
+			"again",
+			actor,
+		); !errors.Is(err, ErrInvalidStatusTransition) {
+			t.Fatalf("RecoverTask(non-escalated) error = %v, want ErrInvalidStatusTransition", err)
+		}
+	})
+}
+
+func countTaskEventsByType(events []Event, eventType string) int {
+	count := 0
+	for _, event := range events {
+		if event.EventType == eventType {
+			count++
+		}
+	}
+	return count
+}
+
+func TestManagerStickyTaskBlockNeverAutoClears(t *testing.T) {
+	t.Parallel()
+
+	store := newInMemoryManagerStore()
+	manager := newTaskManagerForTest(t, store)
+	actor := validActorContext()
+	taskRecord, err := manager.CreateTask(t.Context(), CreateTask{
+		ProfileID:   storepkg.DefaultProfileID,
+		Scope:       ScopeWorkspace,
+		WorkspaceID: "ws-sticky-block",
+		Title:       "Sticky block",
+	}, actor)
+	if err != nil {
+		t.Fatalf("CreateTask() error = %v", err)
+	}
+
+	block, err := manager.BlockTask(t.Context(), BlockRequest{
+		TaskID: taskRecord.ID,
+		Kind:   BlockKindNeedsInput,
+		Reason: "waiting for creator",
+	}, actor)
+	if err != nil {
+		t.Fatalf("BlockTask() error = %v", err)
+	}
+	reconciled, err := manager.reconcileTaskCascade(t.Context(), taskRecord.ID, actor)
+	if err != nil {
+		t.Fatalf("reconcileTaskCascade() error = %v", err)
+	}
+	if got, want := reconciled.Status, TaskStatusBlocked; got != want {
+		t.Fatalf("reconciled.Status = %q, want %q", got, want)
+	}
+	openBlocks, err := manager.ListTaskBlocks(t.Context(), taskRecord.ID, false, actor)
+	if err != nil {
+		t.Fatalf("ListTaskBlocks() error = %v", err)
+	}
+	if len(openBlocks) != 1 || openBlocks[0].ID != block.ID || !openBlocks[0].ClearedAt.IsZero() {
+		t.Fatalf("openBlocks = %#v, want sticky block %q still open", openBlocks, block.ID)
+	}
+}
+
+func TestTaskStatusFromPolicySnapshotPrecedence(t *testing.T) {
+	t.Parallel()
+
+	base := time.Date(2026, 4, 14, 16, 0, 0, 0, time.UTC)
+	tests := []struct {
+		name                   string
+		currentStatus          Status
+		unresolvedDependencies bool
+		approvalBlocked        bool
+		pausedBlocked          bool
+		openBlocks             bool
+		needsAttention         bool
+		attemptsExhausted      bool
+		runs                   []Run
+		want                   Status
+	}{
+		{
+			name:           "Should keep terminal task status above needs attention",
+			currentStatus:  TaskStatusCompleted,
+			openBlocks:     true,
+			needsAttention: true,
+			want:           TaskStatusCompleted,
+		},
+		{
+			name:          "Should keep the umbrella task in progress after a completed coordinator pulse",
+			currentStatus: TaskStatusInProgress,
+			runs: []Run{{
+				ID:       "run-coordinator-pulse",
+				RunKind:  RunKindCoordinator,
+				Status:   TaskRunStatusCompleted,
+				Attempt:  3,
+				QueuedAt: base,
+			}},
+			want: TaskStatusInProgress,
+		},
+		{
+			name:          "Should keep the umbrella task in progress after a canceled coordinator pulse",
+			currentStatus: TaskStatusInProgress,
+			runs: []Run{{
+				ID:       "run-coordinator-canceled-pulse",
+				RunKind:  RunKindCoordinator,
+				Status:   TaskRunStatusCanceled,
+				Attempt:  4,
+				QueuedAt: base,
+			}},
+			want: TaskStatusInProgress,
+		},
+		{
+			name:          "Should keep an explicitly closed coordinator task completed",
+			currentStatus: TaskStatusCompleted,
+			runs: []Run{{
+				ID:       "run-coordinator-final",
+				RunKind:  RunKindCoordinator,
+				Status:   TaskRunStatusCompleted,
+				Attempt:  6,
+				QueuedAt: base,
+			}},
+			want: TaskStatusCompleted,
+		},
+		{
+			name:          "Should complete a worker task from its completed terminal run",
+			currentStatus: TaskStatusInProgress,
+			runs: []Run{{
+				ID:       "run-worker-done",
+				RunKind:  RunKindWorker,
+				Status:   TaskRunStatusCompleted,
+				Attempt:  1,
+				QueuedAt: base,
+			}},
+			want: TaskStatusCompleted,
+		},
+		{
+			name:          "Should cancel a worker task from its canceled terminal run",
+			currentStatus: TaskStatusInProgress,
+			runs: []Run{{
+				ID:       "run-worker-canceled",
+				RunKind:  RunKindWorker,
+				Status:   TaskRunStatusCanceled,
+				Attempt:  1,
+				QueuedAt: base,
+			}},
+			want: TaskStatusCanceled,
+		},
+		{
+			name:              "Should keep exhausted failed terminal run above needs attention",
+			currentStatus:     TaskStatusReady,
+			needsAttention:    true,
+			attemptsExhausted: true,
+			runs: []Run{{
+				ID:       "run-failed",
+				Status:   TaskRunStatusFailed,
+				Attempt:  2,
+				QueuedAt: base,
+			}},
+			want: TaskStatusFailed,
+		},
+		{
+			name:           "Should put needs attention above open blocks and queued readiness",
+			currentStatus:  TaskStatusReady,
+			openBlocks:     true,
+			needsAttention: true,
+			runs: []Run{{
+				ID:       "run-queued",
+				Status:   TaskRunStatusQueued,
+				Attempt:  1,
+				QueuedAt: base,
+			}},
+			want: TaskStatusNeedsAttention,
+		},
+		{
+			name:          "Should put blocked above ready",
+			currentStatus: TaskStatusReady,
+			openBlocks:    true,
+			want:          TaskStatusBlocked,
+		},
+		{
+			name:          "Should derive ready when no blocking inputs remain",
+			currentStatus: TaskStatusBlocked,
+			want:          TaskStatusReady,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			got := taskStatusFromPolicySnapshot(
+				tt.currentStatus,
+				tt.unresolvedDependencies,
+				tt.approvalBlocked,
+				tt.pausedBlocked,
+				tt.openBlocks,
+				tt.needsAttention,
+				tt.attemptsExhausted,
+				tt.runs,
+			)
+			if got != tt.want {
+				t.Fatalf("taskStatusFromPolicySnapshot() = %q, want %q", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestManagerBlockedReasonsProjection(t *testing.T) {
+	t.Parallel()
+
+	store := newInMemoryManagerStore()
+	manager := newTaskManagerForTest(t, store)
+	actor := validActorContext()
+	rawClaimToken := "compozy_claim_reason_SECRET123"
+	dependency, err := manager.CreateTask(t.Context(), CreateTask{
+		ProfileID:   storepkg.DefaultProfileID,
+		Scope:       ScopeWorkspace,
+		WorkspaceID: "ws-reasons",
+		Title:       "Dependency",
+	}, actor)
+	if err != nil {
+		t.Fatalf("CreateTask(dependency) error = %v", err)
+	}
+	target, err := manager.CreateTask(t.Context(), CreateTask{
+		ProfileID:      storepkg.DefaultProfileID,
+		Scope:          ScopeWorkspace,
+		WorkspaceID:    "ws-reasons",
+		Title:          "Reasoned target",
+		ApprovalPolicy: ApprovalPolicyManual,
+	}, actor)
+	if err != nil {
+		t.Fatalf("CreateTask(target) error = %v", err)
+	}
+	if err := manager.AddDependency(t.Context(), AddDependency{
+		TaskID:          target.ID,
+		DependsOnTaskID: dependency.ID,
+		Kind:            DependencyKindBlocks,
+	}, actor); err != nil {
+		t.Fatalf("AddDependency() error = %v", err)
+	}
+	targetRecord := store.tasks[target.ID]
+	targetRecord.Paused = true
+	targetRecord.PausedBy = "operator"
+	targetRecord.PausedAt = time.Date(2026, 4, 14, 14, 52, 0, 0, time.UTC)
+	targetRecord.PausedReason = "manual hold " + rawClaimToken
+	store.tasks[target.ID] = targetRecord
+	store.blocks[target.ID] = map[string]TaskBlock{
+		"block-current": {
+			ID:          "block-current",
+			WorkspaceID: target.WorkspaceID,
+			TaskID:      target.ID,
+			Kind:        BlockKindCapability,
+			Reason:      "missing database access " + rawClaimToken,
+			CreatedBy:   ActorIdentity{Kind: ActorKindAgentSession, Ref: "sess-worker"},
+			CreatedAt:   time.Date(2026, 4, 14, 14, 55, 0, 0, time.UTC),
+		},
+		"block-expired": {
+			ID:          "block-expired",
+			WorkspaceID: target.WorkspaceID,
+			TaskID:      target.ID,
+			Kind:        BlockKindTransient,
+			Reason:      "already expired",
+			CreatedBy:   ActorIdentity{Kind: ActorKindAgentSession, Ref: "sess-worker"},
+			CreatedAt:   time.Date(2026, 4, 14, 14, 50, 0, 0, time.UTC),
+			ExpiresAt:   time.Date(2026, 4, 14, 15, 0, 0, 0, time.UTC),
+		},
+	}
+
+	view, err := manager.GetTask(t.Context(), target.ID, actor)
+	if err != nil {
+		t.Fatalf("GetTask() error = %v", err)
+	}
+	if view.Summary.BlockedReasons == nil {
+		t.Fatal("BlockedReasons = nil, want four derived sources")
+	}
+	reasons := *view.Summary.BlockedReasons
+	if len(reasons) != 4 {
+		t.Fatalf("len(BlockedReasons) = %d, want 4: %#v", len(reasons), reasons)
+	}
+	if got, want := reasons[0].Source, BlockedSourceDependency; got != want {
+		t.Fatalf("dependency source = %q, want %q", got, want)
+	}
+	if got, want := reasons[0].DependsOnTaskIDs, []string{dependency.ID}; !slices.Equal(got, want) {
+		t.Fatalf("dependency ids = %#v, want %#v", got, want)
+	}
+	if got, want := reasons[1].Source, BlockedSourceApproval; got != want {
+		t.Fatalf("approval source = %q, want %q", got, want)
+	}
+	if got, want := reasons[2].Source, BlockedSourcePaused; got != want {
+		t.Fatalf("paused source = %q, want %q", got, want)
+	}
+	if got, want := reasons[2].Reason, "manual hold compozy_claim_[REDACTED]"; got != want {
+		t.Fatalf("paused reason = %q, want %q", got, want)
+	}
+	if got, want := reasons[3].Source, BlockedSourceBlock; got != want {
+		t.Fatalf("block source = %q, want %q", got, want)
+	}
+	if got, want := reasons[3].BlockID, "block-current"; got != want {
+		t.Fatalf("block id = %q, want %q", got, want)
+	}
+	if got, want := reasons[3].Kind, BlockKindCapability; got != want {
+		t.Fatalf("block kind = %q, want %q", got, want)
+	}
+	if got, want := reasons[3].Reason, "missing database access compozy_claim_[REDACTED]"; got != want {
+		t.Fatalf("block reason = %q, want %q", got, want)
+	}
+	for _, reason := range reasons {
+		if strings.Contains(reason.Reason, rawClaimToken) {
+			t.Fatalf("blocked reason leaked raw claim token: %#v", reason)
+		}
+	}
+}
+
+func TestManagerReconcilePersistsNeedsAttentionStatus(t *testing.T) {
+	t.Parallel()
+
+	store := newInMemoryManagerStore()
+	manager := newTaskManagerForTest(t, store)
+	actor := validActorContext()
+	taskRecord, err := manager.CreateTask(t.Context(), CreateTask{
+		ProfileID:   storepkg.DefaultProfileID,
+		Scope:       ScopeWorkspace,
+		WorkspaceID: "ws-attention",
+		Title:       "Escalated target",
+	}, actor)
+	if err != nil {
+		t.Fatalf("CreateTask() error = %v", err)
+	}
+	escalated := store.tasks[taskRecord.ID]
+	escalated.Status = TaskStatusReady
+	escalated.NeedsAttention = &NeedsAttention{
+		Reason: "unblock loop detected",
+		At:     time.Date(2026, 4, 14, 14, 59, 0, 0, time.UTC),
+		By:     ActorIdentity{Kind: ActorKindDaemon, Ref: "breaker"},
+	}
+	store.tasks[taskRecord.ID] = escalated
+
+	reconciled, err := manager.reconcileTaskCascade(t.Context(), taskRecord.ID, actor)
+	if err != nil {
+		t.Fatalf("reconcileTaskCascade() error = %v", err)
+	}
+	if got, want := reconciled.Status, TaskStatusNeedsAttention; got != want {
+		t.Fatalf("reconciled.Status = %q, want %q", got, want)
+	}
+	if got, want := store.tasks[taskRecord.ID].Status, TaskStatusNeedsAttention; got != want {
+		t.Fatalf("stored task status = %q, want %q", got, want)
+	}
+	if store.tasks[taskRecord.ID].NeedsAttention == nil {
+		t.Fatal("stored NeedsAttention = nil, want escalation metadata preserved")
+	}
+}
+
+func TestManagerGetAndListTasksRequireReadAuthorityAndBuildView(t *testing.T) {
+	t.Parallel()
+
+	store := newInMemoryManagerStore()
+	manager := newTaskManagerForTest(t, store)
+	actor := validActorContext()
+
+	parent, err := manager.CreateTask(t.Context(), CreateTask{
+		ProfileID: storepkg.DefaultProfileID,
+		Scope:     ScopeGlobal,
+		Title:     "Parent task",
+	}, actor)
+	if err != nil {
+		t.Fatalf("CreateTask(parent) error = %v", err)
+	}
+	child, err := manager.CreateChildTask(t.Context(), parent.ID, CreateTask{
+		ProfileID: storepkg.DefaultProfileID,
+		Scope:     ScopeGlobal,
+		Title:     "Child task",
+	}, actor)
+	if err != nil {
+		t.Fatalf("CreateChildTask() error = %v", err)
+	}
+	dependency, err := manager.CreateTask(t.Context(), CreateTask{
+		ProfileID: storepkg.DefaultProfileID,
+		Scope:     ScopeGlobal,
+		Title:     "Dependency",
+	}, actor)
+	if err != nil {
+		t.Fatalf("CreateTask(dependency) error = %v", err)
+	}
+	if err := manager.AddDependency(t.Context(), AddDependency{
+		TaskID:          child.ID,
+		DependsOnTaskID: dependency.ID,
+		Kind:            DependencyKindBlocks,
+	}, actor); err != nil {
+		t.Fatalf("AddDependency() error = %v", err)
+	}
+
+	store.runs["run-active"] = Run{
+		ID:     "run-active",
+		TaskID: child.ID,
+		RunWorktreeState: &RunWorktreeState{
+			WorktreeID:           "wt-run-active",
+			ResolvedWorktreeMode: WorktreeModePerRun,
+		},
+		Status:   TaskRunStatusRunning,
+		Attempt:  1,
+		Origin:   Origin{Kind: OriginKindAutomation, Ref: "rule:nightly"},
+		QueuedAt: time.Date(2026, 4, 14, 13, 0, 0, 0, time.UTC),
+	}
+
+	view, err := manager.GetTask(t.Context(), child.ID, actor)
+	if err != nil {
+		t.Fatalf("GetTask() error = %v", err)
+	}
+	if got, want := view.Task.Status, TaskStatusInProgress; got != want {
+		t.Fatalf("view.Task.Status = %q, want %q", got, want)
+	}
+	if len(view.Dependencies) != 1 {
+		t.Fatalf("len(view.Dependencies) = %d, want 1", len(view.Dependencies))
+	}
+	if len(view.Runs) != 1 {
+		t.Fatalf("len(view.Runs) = %d, want 1", len(view.Runs))
+	}
+	if got, want := view.Runs[0].ProfileID, child.ProfileID; got != want {
+		t.Fatalf("view.Runs[0].ProfileID = %q, want inherited owner %q", got, want)
+	}
+	if len(view.Events) < 2 {
+		t.Fatalf("len(view.Events) = %d, want at least 2", len(view.Events))
+	}
+	if got, want := view.Summary.DependencyCount, int32(1); got != want {
+		t.Fatalf("view.Summary.DependencyCount = %d, want %d", got, want)
+	}
+	if got, want := view.Summary.ChildCount, int32(0); got != want {
+		t.Fatalf("view.Summary.ChildCount = %d, want %d", got, want)
+	}
+	if view.Summary.ActiveRun == nil || view.Summary.ActiveRun.ID != "run-active" {
+		t.Fatalf("view.Summary.ActiveRun = %#v, want run-active", view.Summary.ActiveRun)
+	}
+	if view.Summary.ActiveRun.WorktreeID != "wt-run-active" ||
+		view.Summary.ActiveRun.ResolvedWorktreeMode != WorktreeModePerRun {
+		t.Fatalf("view.Summary.ActiveRun worktree = %#v, want per-run binding", view.Summary.ActiveRun)
+	}
+	if view.Summary.LastActivityAt.IsZero() {
+		t.Fatal("view.Summary.LastActivityAt is zero, want latest activity timestamp")
+	}
+	if len(view.DependencyReferences) != 1 {
+		t.Fatalf("len(view.DependencyReferences) = %d, want 1", len(view.DependencyReferences))
+	}
+	if got, want := view.DependencyReferences[0].DependsOn.Title, dependency.Title; got != want {
+		t.Fatalf("view.DependencyReferences[0].DependsOn.Title = %q, want %q", got, want)
+	}
+
+	summaries, err := manager.ListTasks(t.Context(), Query{ParentTaskID: parent.ID}, actor)
+	if err != nil {
+		t.Fatalf("ListTasks() error = %v", err)
+	}
+	if len(summaries) != 1 || summaries[0].ID != child.ID {
+		t.Fatalf("ListTasks(parent filter) = %#v, want only child %q", summaries, child.ID)
+	}
+	if got, want := summaries[0].DependencyCount, int32(1); got != want {
+		t.Fatalf("summaries[0].DependencyCount = %d, want %d", got, want)
+	}
+	if len(summaries[0].Dependencies) != 1 {
+		t.Fatalf("len(summaries[0].Dependencies) = %d, want 1", len(summaries[0].Dependencies))
+	}
+	if got, want := summaries[0].Dependencies[0].DependsOn.Identifier, dependency.Identifier; got != want {
+		t.Fatalf("summaries[0].Dependencies[0].DependsOn.Identifier = %q, want %q", got, want)
+	}
+	if summaries[0].ActiveRun == nil || summaries[0].ActiveRun.Status != TaskRunStatusRunning {
+		t.Fatalf("summaries[0].ActiveRun = %#v, want running summary", summaries[0].ActiveRun)
+	}
+	runs, err := manager.ListTaskRuns(t.Context(), child.ID, RunQuery{}, actor)
+	if err != nil {
+		t.Fatalf("ListTaskRuns() error = %v", err)
+	}
+	if len(runs) != 1 || runs[0].ID != "run-active" {
+		t.Fatalf("ListTaskRuns() = %#v, want only run-active", runs)
+	}
+	if got, want := runs[0].ProfileID, child.ProfileID; got != want {
+		t.Fatalf("ListTaskRuns()[0].ProfileID = %q, want inherited owner %q", got, want)
+	}
+
+	t.Run("Should preserve owner visibility and reject reads outside the actor profile scope", func(t *testing.T) {
+		t.Parallel()
+
+		ownerActor := actor
+		ownerActor.ReadScope = storepkg.ReadScope{ProfileID: storepkg.DefaultProfileID}
+		ownerSummaries, err := manager.ListTasks(
+			t.Context(),
+			Query{ParentTaskID: parent.ID},
+			ownerActor,
+		)
+		if err != nil {
+			t.Fatalf("ListTasks(owner profile) error = %v", err)
+		}
+		if len(ownerSummaries) != 1 || ownerSummaries[0].ID != child.ID {
+			t.Fatalf("ListTasks(owner profile) = %#v, want child %q", ownerSummaries, child.ID)
+		}
+
+		foreignActor := actor
+		foreignActor.ReadScope = storepkg.ReadScope{ProfileID: strings.Repeat("f", 26)}
+		if _, err := manager.GetTask(t.Context(), child.ID, foreignActor); !errors.Is(
+			err,
+			ErrTaskNotFound,
+		) {
+			t.Fatalf("GetTask(foreign profile) error = %v, want %v", err, ErrTaskNotFound)
+		}
+		if _, err := manager.ListTaskRuns(
+			t.Context(),
+			child.ID,
+			RunQuery{},
+			foreignActor,
+		); !errors.Is(err, ErrTaskNotFound) {
+			t.Fatalf("ListTaskRuns(foreign profile) error = %v, want %v", err, ErrTaskNotFound)
+		}
+
+		aggregateActor := actor
+		aggregateActor.ReadScope = storepkg.ReadScope{AllProfiles: true}
+		if _, err := manager.GetTask(t.Context(), child.ID, aggregateActor); err != nil {
+			t.Fatalf("GetTask(aggregate) error = %v", err)
+		}
+	})
+
+	noRead := actor
+	noRead.Authority.Read = false
+	if _, err := manager.GetTask(t.Context(), child.ID, noRead); !errors.Is(
+		err,
+		ErrPermissionDenied,
+	) {
+		t.Fatalf("GetTask(no read) error = %v, want %v", err, ErrPermissionDenied)
+	}
+	if _, err := manager.ListTasks(t.Context(), Query{}, noRead); !errors.Is(
+		err,
+		ErrPermissionDenied,
+	) {
+		t.Fatalf("ListTasks(no read) error = %v, want %v", err, ErrPermissionDenied)
+	}
+	if _, err := manager.ListTaskRuns(
+		t.Context(),
+		child.ID,
+		RunQuery{},
+		noRead,
+	); !errors.Is(
+		err,
+		ErrPermissionDenied,
+	) {
+		t.Fatalf("ListTaskRuns(no read) error = %v, want %v", err, ErrPermissionDenied)
+	}
+}
+
+func TestManagerTaskResourceAuthorityFencesWorkspaces(t *testing.T) {
+	t.Parallel()
+
+	t.Run("Should expose own-workspace tasks without leaking User or foreign tasks", func(t *testing.T) {
+		t.Parallel()
+
+		store := newInMemoryManagerStore()
+		manager := newTaskManagerForTest(t, store)
+		operator := validActorContext()
+		globalTask, err := manager.CreateTask(t.Context(), CreateTask{
+			ProfileID: storepkg.DefaultProfileID,
+			Scope:     ScopeGlobal,
+			Title:     "Global task",
+		}, operator)
+		if err != nil {
+			t.Fatalf("CreateTask(global) error = %v", err)
+		}
+		workspaceTask, err := manager.CreateTask(t.Context(), CreateTask{
+			ProfileID:   storepkg.DefaultProfileID,
+			Scope:       ScopeWorkspace,
+			WorkspaceID: "ws-a",
+			Title:       "Workspace A task",
+		}, operator)
+		if err != nil {
+			t.Fatalf("CreateTask(workspace a) error = %v", err)
+		}
+		foreignTask, err := manager.CreateTask(t.Context(), CreateTask{
+			ProfileID:   storepkg.DefaultProfileID,
+			Scope:       ScopeWorkspace,
+			WorkspaceID: "ws-b",
+			Title:       "Workspace B task",
+			Owner: &Ownership{
+				Kind: OwnerKindAgentSession,
+				Ref:  "sess-a",
+			},
+		}, operator)
+		if err != nil {
+			t.Fatalf("CreateTask(workspace b) error = %v", err)
+		}
+
+		agent := agentSessionActorContextForWorkspace("sess-a", "ws-a")
+		summaries, err := manager.ListTasks(t.Context(), Query{}, agent)
+		if err != nil {
+			t.Fatalf("ListTasks(agent) error = %v", err)
+		}
+		gotIDs := make([]string, 0, len(summaries))
+		for _, summary := range summaries {
+			gotIDs = append(gotIDs, summary.ID)
+		}
+		slices.Sort(gotIDs)
+		wantIDs := []string{workspaceTask.ID}
+		if _, err := manager.GetTask(t.Context(), globalTask.ID, agent); !errors.Is(err, ErrPermissionDenied) {
+			t.Fatalf("GetTask(User) = %v, want scope denial", err)
+		}
+		slices.Sort(wantIDs)
+		if !slices.Equal(gotIDs, wantIDs) {
+			t.Fatalf("ListTasks(agent) ids = %#v, want %#v", gotIDs, wantIDs)
+		}
+		if _, err := manager.GetTask(t.Context(), foreignTask.ID, agent); !errors.Is(
+			err,
+			ErrPermissionDenied,
+		) {
+			t.Fatalf("GetTask(foreign) error = %v, want %v", err, ErrPermissionDenied)
+		}
+		newTitle := "Leaked mutation"
+		if _, err := manager.UpdateTask(t.Context(), foreignTask.ID, Patch{
+			Title: &newTitle,
+		}, agent); !errors.Is(err, ErrPermissionDenied) {
+			t.Fatalf("UpdateTask(foreign) error = %v, want %v", err, ErrPermissionDenied)
+		}
+		if got := store.tasks[foreignTask.ID].Title; got != foreignTask.Title {
+			t.Fatalf("foreign task title = %q, want unchanged %q", got, foreignTask.Title)
+		}
+	})
+
+	t.Run("Should delegate foreign workspace access to the injected policy", func(t *testing.T) {
+		t.Parallel()
+
+		agent := agentSessionActorContextForWorkspace("sess-a", "ws-a")
+		agent.ReadScope = storepkg.ReadScope{ProfileID: "profile-default"}
+		allowedPolicy := &recordingTaskWorkspaceAccessPolicy{decision: workspaceaccess.Decision{Allowed: true}}
+		allowed := scopedTaskResourceAuthorizer{workspaceAccess: allowedPolicy}
+		if err := allowed.AuthorizeTaskScope(t.Context(), agent, ScopeWorkspace, "ws-b"); err != nil {
+			t.Fatalf("AuthorizeTaskScope(allow) error = %v", err)
+		}
+		wantRequest := workspaceaccess.Request{
+			Actor: workspaceaccess.ActorRef{
+				Kind:        workspaceaccess.ActorAgentSession,
+				SessionID:   "sess-a",
+				WorkspaceID: "ws-a",
+			},
+			Target: workspaceaccess.ScopeTarget("ws-b", "profile-default"),
+			Seam:   workspaceaccess.SeamTask,
+		}
+		if allowedPolicy.calls != 1 || allowedPolicy.last != wantRequest {
+			t.Fatalf(
+				"policy calls/request = %d/%#v, want 1/%#v",
+				allowedPolicy.calls,
+				allowedPolicy.last,
+				wantRequest,
+			)
+		}
+
+		denied := scopedTaskResourceAuthorizer{workspaceAccess: &recordingTaskWorkspaceAccessPolicy{}}
+		if err := denied.AuthorizeTaskScope(t.Context(), agent, ScopeWorkspace, "ws-b"); !errors.Is(
+			err,
+			ErrPermissionDenied,
+		) {
+			t.Fatalf("AuthorizeTaskScope(deny) error = %v, want ErrPermissionDenied", err)
+		}
+
+		policyErr := errors.New("workspace policy unavailable")
+		failed := scopedTaskResourceAuthorizer{workspaceAccess: &recordingTaskWorkspaceAccessPolicy{err: policyErr}}
+		err := failed.AuthorizeTaskScope(t.Context(), agent, ScopeWorkspace, "ws-b")
+		if !errors.Is(err, ErrPermissionDenied) || !errors.Is(err, policyErr) {
+			t.Fatalf("AuthorizeTaskScope(policy failure) error = %v, want denial joined with cause", err)
+		}
+	})
+
+	t.Run("Should authorize same-project sessions through their authenticated profile policy", func(t *testing.T) {
+		t.Parallel()
+		actor := agentSessionActorContextForWorkspace("sess-a", "ws-a")
+		actor.ReadScope = storepkg.ReadScope{ProfileID: "profile-b"}
+		policy := &recordingTaskWorkspaceAccessPolicy{}
+		authorizer := scopedTaskResourceAuthorizer{workspaceAccess: policy}
+		err := authorizer.AuthorizeTask(t.Context(), actor, Task{
+			Scope: ScopeWorkspace, WorkspaceID: "ws-a", ProfileID: "profile-b",
+		})
+		if !errors.Is(err, ErrPermissionDenied) || policy.calls != 1 {
+			t.Fatalf("same-project policy denial = %v, calls = %d", err, policy.calls)
+		}
+		if policy.last.Target != workspaceaccess.ScopeTarget("ws-a", "profile-b") {
+			t.Fatalf("policy target = %#v", policy.last.Target)
+		}
+		policy.decision = workspaceaccess.Decision{Allowed: true, Source: workspaceaccess.SourceAgentGrant}
+		if err := authorizer.AuthorizeTask(t.Context(), actor, Task{
+			Scope: ScopeWorkspace, WorkspaceID: "ws-a", ProfileID: "profile-b",
+		}); err != nil {
+			t.Fatalf("granted cross-profile task read = %v", err)
+		}
+	})
+
+	t.Run("Should deny workspace resource reads and mutations from unscoped automation", func(t *testing.T) {
+		t.Parallel()
+
+		store := newInMemoryManagerStore()
+		policy := &recordingTaskWorkspaceAccessPolicy{}
+		manager := newTaskManagerForTestWithOptions(t, store, WithWorkspaceAccessPolicy(policy))
+		foreignTask, err := manager.CreateTask(t.Context(), CreateTask{
+			ProfileID:   storepkg.DefaultProfileID,
+			Scope:       ScopeWorkspace,
+			WorkspaceID: "ws-b",
+			Title:       "Automation must not cross workspace boundaries",
+		}, validActorContext())
+		if err != nil {
+			t.Fatalf("CreateTask() error = %v", err)
+		}
+		automation, err := DeriveAutomationActorContext("rule:nightly", "task.resource.test")
+		if err != nil {
+			t.Fatalf("DeriveAutomationActorContext() error = %v", err)
+		}
+		if _, err := manager.GetTask(t.Context(), foreignTask.ID, automation); !errors.Is(err, ErrPermissionDenied) {
+			t.Fatalf("GetTask(automation) error = %v, want ErrPermissionDenied", err)
+		}
+		newTitle := "Unauthorized mutation"
+		if _, err := manager.UpdateTask(t.Context(), foreignTask.ID, Patch{Title: &newTitle}, automation); !errors.Is(
+			err,
+			ErrPermissionDenied,
+		) {
+			t.Fatalf("UpdateTask(automation) error = %v, want ErrPermissionDenied", err)
+		}
+		if policy.calls != 2 || policy.last.Actor.Kind != workspaceaccess.ActorAutomation ||
+			policy.last.Actor.WorkspaceID != "" || policy.last.Target.WorkspaceID != "ws-b" {
+			t.Fatalf("policy calls/request = %d/%#v, want two unscoped automation denials", policy.calls, policy.last)
+		}
+	})
+
+	t.Run("Should preserve the run not found mask for policy denials", func(t *testing.T) {
+		t.Parallel()
+
+		policy := &recordingTaskWorkspaceAccessPolicy{}
+		authorizer := scopedTaskResourceAuthorizer{workspaceAccess: policy}
+		runAuthorizer := taskRunReadAuthorizer{tasks: authorizer}
+		taskRecord := &Task{Scope: ScopeWorkspace, WorkspaceID: "ws-b"}
+		err := runAuthorizer.AuthorizeRunRead(
+			t.Context(),
+			agentSessionActorContextForWorkspace("sess-a", "ws-a"),
+			Run{WorkspaceID: "ws-b"},
+			taskRecord,
+		)
+		if !errors.Is(err, ErrTaskRunNotFound) {
+			t.Fatalf("AuthorizeRunRead() error = %v, want ErrTaskRunNotFound", err)
+		}
+		if policy.calls != 1 {
+			t.Fatalf("policy calls = %d, want 1", policy.calls)
+		}
+	})
+
+	t.Run("Should let operators short circuit before the policy", func(t *testing.T) {
+		t.Parallel()
+
+		policy := &recordingTaskWorkspaceAccessPolicy{}
+		authorizer := scopedTaskResourceAuthorizer{workspaceAccess: policy}
+		if err := authorizer.AuthorizeTaskScope(
+			t.Context(),
+			validActorContext(),
+			ScopeWorkspace,
+			"ws-b",
+		); err != nil {
+			t.Fatalf("AuthorizeTaskScope(operator) error = %v", err)
+		}
+		if policy.calls != 0 {
+			t.Fatalf("policy calls = %d, want 0", policy.calls)
+		}
+	})
+}
+
+type recordingTaskWorkspaceAccessPolicy struct {
+	decision workspaceaccess.Decision
+	err      error
+	calls    int
+	last     workspaceaccess.Request
+}
+
+func (p *recordingTaskWorkspaceAccessPolicy) Authorize(
+	_ context.Context,
+	req workspaceaccess.Request,
+) (workspaceaccess.Decision, error) {
+	p.calls++
+	p.last = req
+	return p.decision, p.err
+}
+
+func TestManagerListTasksCombinedFiltersPreserveEnrichedFields(t *testing.T) {
+	t.Parallel()
+
+	store := newInMemoryManagerStore()
+	manager := newTaskManagerForTest(t, store)
+	actor := validActorContext()
+
+	parent, err := manager.CreateTask(t.Context(), CreateTask{
+		ProfileID:   storepkg.DefaultProfileID,
+		Scope:       ScopeWorkspace,
+		WorkspaceID: "ws-1",
+		Title:       "Alpha parent",
+	}, actor)
+	if err != nil {
+		t.Fatalf("CreateTask(parent) error = %v", err)
+	}
+	blocker, err := manager.CreateTask(t.Context(), CreateTask{
+		ProfileID:   storepkg.DefaultProfileID,
+		Scope:       ScopeWorkspace,
+		WorkspaceID: "ws-1",
+		Title:       "Ops blocker",
+		Identifier:  "OPS-999",
+	}, actor)
+	if err != nil {
+		t.Fatalf("CreateTask(blocker) error = %v", err)
+	}
+	matching, err := manager.CreateChildTask(t.Context(), parent.ID, CreateTask{
+		ProfileID:   storepkg.DefaultProfileID,
+		Scope:       ScopeWorkspace,
+		WorkspaceID: "ws-1",
+		Title:       "Alpha child rollout",
+		Identifier:  "OPS-300",
+	}, actor)
+	if err != nil {
+		t.Fatalf("CreateChildTask(matching) error = %v", err)
+	}
+	if err := manager.AddDependency(t.Context(), AddDependency{
+		TaskID:          matching.ID,
+		DependsOnTaskID: blocker.ID,
+		Kind:            DependencyKindBlocks,
+	}, actor); err != nil {
+		t.Fatalf("AddDependency(matching) error = %v", err)
+	}
+
+	if _, err := manager.CreateChildTask(t.Context(), parent.ID, CreateTask{
+		ProfileID:   storepkg.DefaultProfileID,
+		Scope:       ScopeWorkspace,
+		WorkspaceID: "ws-1",
+		Title:       "Alpha child ready",
+		Identifier:  "OPS-301",
+	}, actor); err != nil {
+		t.Fatalf("CreateChildTask(ready sibling) error = %v", err)
+	}
+	if _, err := manager.CreateTask(t.Context(), CreateTask{
+		ProfileID:   storepkg.DefaultProfileID,
+		Scope:       ScopeWorkspace,
+		WorkspaceID: "ws-2",
+		Title:       "Alpha child rollout",
+		Identifier:  "OPS-300",
+	}, actor); err != nil {
+		t.Fatalf("CreateTask(other workspace) error = %v", err)
+	}
+
+	summaries, err := manager.ListTasks(t.Context(), Query{
+		WorkspaceID:  "ws-1",
+		Status:       TaskStatusBlocked,
+		ParentTaskID: parent.ID,
+		Search:       "ops-300",
+	}, actor)
+	if err != nil {
+		t.Fatalf("ListTasks(combined filters) error = %v", err)
+	}
+	if len(summaries) != 1 || summaries[0].ID != matching.ID {
+		t.Fatalf("ListTasks(combined filters) = %#v, want only %q", summaries, matching.ID)
+	}
+	if got, want := summaries[0].Status, TaskStatusBlocked; got != want {
+		t.Fatalf("summaries[0].Status = %q, want %q", got, want)
+	}
+	if got, want := summaries[0].DependencyCount, int32(1); got != want {
+		t.Fatalf("summaries[0].DependencyCount = %d, want %d", got, want)
+	}
+	if got, want := summaries[0].ChildCount, int32(0); got != want {
+		t.Fatalf("summaries[0].ChildCount = %d, want %d", got, want)
+	}
+	if len(summaries[0].Dependencies) != 1 {
+		t.Fatalf("len(summaries[0].Dependencies) = %d, want 1", len(summaries[0].Dependencies))
+	}
+	if got, want := summaries[0].Dependencies[0].DependsOn.Title, blocker.Title; got != want {
+		t.Fatalf("summaries[0].Dependencies[0].DependsOn.Title = %q, want %q", got, want)
+	}
+	if summaries[0].LastActivityAt.IsZero() {
+		t.Fatal("summaries[0].LastActivityAt is zero, want latest activity timestamp")
+	}
+}
+
+func TestManagerReadPathsDoNotPersistDependencyReconciliation(t *testing.T) {
+	t.Parallel()
+
+	t.Run("Should GetTask derives dependency status without writes", func(t *testing.T) {
+		t.Parallel()
+
+		manager, store, actor, blockerID, targetID := setupStaleDependencyReadScenario(t)
+
+		view, err := manager.GetTask(t.Context(), targetID, actor)
+		if err != nil {
+			t.Fatalf("GetTask() error = %v", err)
+		}
+
+		if got, want := view.Summary.Status, TaskStatusBlocked; got != want {
+			t.Fatalf("view.Summary.Status = %q, want %q", got, want)
+		}
+		if got, want := view.Task.Status, TaskStatusBlocked; got != want {
+			t.Fatalf("view.Task.Status = %q, want %q", got, want)
+		}
+		if len(view.DependencyReferences) != 1 {
+			t.Fatalf("len(view.DependencyReferences) = %d, want 1", len(view.DependencyReferences))
+		}
+		if got, want := view.DependencyReferences[0].DependsOn.Status, TaskStatusBlocked; got != want {
+			t.Fatalf("view.DependencyReferences[0].DependsOn.Status = %q, want %q", got, want)
+		}
+		if got, want := store.tasks[blockerID].Status, TaskStatusReady; got != want {
+			t.Fatalf("stored blocker status after GetTask = %q, want unchanged %q", got, want)
+		}
+	})
+
+	t.Run("Should ListTasks derives dependency status without writes", func(t *testing.T) {
+		t.Parallel()
+
+		manager, store, actor, blockerID, targetID := setupStaleDependencyReadScenario(t)
+
+		summaries, err := manager.ListTasks(t.Context(), Query{}, actor)
+		if err != nil {
+			t.Fatalf("ListTasks() error = %v", err)
+		}
+
+		var target Summary
+		found := false
+		for _, summary := range summaries {
+			if summary.ID == targetID {
+				target = summary
+				found = true
+				break
+			}
+		}
+		if !found {
+			t.Fatalf("ListTasks() did not return target %q", targetID)
+		}
+		if got, want := target.Status, TaskStatusBlocked; got != want {
+			t.Fatalf("target.Status = %q, want %q", got, want)
+		}
+		if len(target.Dependencies) != 1 {
+			t.Fatalf("len(target.Dependencies) = %d, want 1", len(target.Dependencies))
+		}
+		if got, want := target.Dependencies[0].DependsOn.Status, TaskStatusBlocked; got != want {
+			t.Fatalf("target.Dependencies[0].DependsOn.Status = %q, want %q", got, want)
+		}
+		if got, want := store.tasks[blockerID].Status, TaskStatusReady; got != want {
+			t.Fatalf("stored blocker status after ListTasks = %q, want unchanged %q", got, want)
+		}
+	})
+}
+
+func TestManagerRunLifecycleRejectsInvalidTransitions(t *testing.T) {
+	t.Parallel()
+
+	store := newInMemoryManagerStore()
+	executor := &recordingSessionExecutor{}
+	manager := newTaskManagerForTestWithOptions(t, store, WithSessionExecutor(executor))
+	actor := validActorContext()
+
+	taskRecord, err := manager.CreateTask(t.Context(), CreateTask{
+		ProfileID: storepkg.DefaultProfileID,
+		Scope:     ScopeGlobal,
+		Title:     "Lifecycle transitions",
+	}, actor)
+	if err != nil {
+		t.Fatalf("CreateTask() error = %v", err)
+	}
+
+	queuedRun, err := manager.EnqueueRun(
+		t.Context(),
+		EnqueueRun{TaskID: taskRecord.ID},
+		actor,
+	)
+	if err != nil {
+		t.Fatalf("EnqueueRun() error = %v", err)
+	}
+
+	if _, err := manager.CompleteRun(t.Context(), queuedRun.ID, RunResult{
+		Value: json.RawMessage(`{"ok":true}`),
+	}, actor); !errors.Is(err, ErrInvalidStatusTransition) {
+		t.Fatalf("CompleteRun(queued) error = %v, want %v", err, ErrInvalidStatusTransition)
+	}
+
+	claim, err := claimExactRunResultForTest(t.Context(), manager, queuedRun.ID, actor)
+	if err != nil {
+		t.Fatalf("ClaimNextRun() error = %v", err)
+	}
+	claimedRun := &claim.Run
+	runningRun, err := manager.StartRun(t.Context(), claimedRun.ID, StartRun{
+		ClaimToken: claim.ClaimToken,
+	}, actor)
+	if err != nil {
+		t.Fatalf("StartRun() error = %v", err)
+	}
+	if got, want := runningRun.SessionID, claimedRun.SessionID; got != want {
+		t.Fatalf("StartRun().SessionID = %q, want claimed binding %q", got, want)
+	}
+	if got := len(executor.startCalls); got != 0 {
+		t.Fatalf("StartTaskSession calls for pre-bound claim = %d, want 0", got)
+	}
+
+	if _, err := claimExactRunForTest(t.Context(), manager, runningRun.ID, actor); !errors.Is(
+		err,
+		ErrActiveRunLease,
+	) {
+		t.Fatalf("exact claim of leased running run error = %v, want %v", err, ErrActiveRunLease)
+	}
+}
+
+func TestManagerTerminalRunStopsBackingSession(t *testing.T) {
+	t.Parallel()
+
+	t.Run("Should stop completed run session", func(t *testing.T) {
+		t.Parallel()
+
+		store := newInMemoryManagerStore()
+		executor := &recordingSessionExecutor{}
+		manager := newTaskManagerForTestWithOptions(
+			t,
+			store,
+			WithSessionExecutor(executor),
+			WithCancelGracePeriod(0),
+		)
+		actor := validActorContext()
+		runningRun := createRunningRunForTest(t, manager, actor)
+
+		if _, err := manager.CompleteRun(t.Context(), runningRun.ID, RunResult{
+			Value: json.RawMessage(`{"ok":true}`),
+		}, actor); err != nil {
+			t.Fatalf("CompleteRun() error = %v", err)
+		}
+
+		assertSessionStopCalls(t, executor, runningRun.SessionID, StopReasonCompleted)
+	})
+
+	t.Run("Should stop failed run session", func(t *testing.T) {
+		t.Parallel()
+
+		store := newInMemoryManagerStore()
+		executor := &recordingSessionExecutor{}
+		manager := newTaskManagerForTestWithOptions(
+			t,
+			store,
+			WithSessionExecutor(executor),
+			WithCancelGracePeriod(0),
+		)
+		actor := validActorContext()
+		runningRun := createRunningRunForTest(t, manager, actor)
+
+		if _, err := manager.FailRun(t.Context(), runningRun.ID, RunFailure{
+			Error: "release validation failed",
+		}, actor); err != nil {
+			t.Fatalf("FailRun() error = %v", err)
+		}
+
+		assertSessionStopCalls(t, executor, runningRun.SessionID, StopReasonFailed)
+	})
+
+	t.Run("Should reject oversized failure diagnostics before stopping or mutating the run", func(t *testing.T) {
+		t.Parallel()
+
+		store := newInMemoryManagerStore()
+		executor := &recordingSessionExecutor{}
+		manager := newTaskManagerForTestWithOptions(
+			t,
+			store,
+			WithSessionExecutor(executor),
+			WithCancelGracePeriod(0),
+		)
+		actor := validActorContext()
+		runningRun := createRunningRunForTest(t, manager, actor)
+
+		_, err := manager.FailRun(t.Context(), runningRun.ID, RunFailure{
+			Error: strings.Repeat("x", MaxPayloadBytes),
+		}, actor)
+		if !errors.Is(err, ErrPayloadTooLarge) {
+			t.Fatalf("FailRun(oversized error) error = %v, want %v", err, ErrPayloadTooLarge)
+		}
+		stored := store.runs[runningRun.ID]
+		if got, want := stored.Status.Normalize(), TaskRunStatusRunning; got != want {
+			t.Fatalf("stored run status = %q, want %q after rejected failure", got, want)
+		}
+		if got := len(executor.requestStopCalls) + len(executor.forceStopCalls); got != 0 {
+			t.Fatalf("session stop call count = %d, want 0 after rejected failure", got)
+		}
+	})
+
+	// Invariant: an event payload rejected by the canonical event guard never
+	// reserves a terminal command or stops the backing session.
+	// Owning layer: task service terminal-command preflight.
+	// Canonical suite: TestManagerTerminalRunStopsBackingSession.
+	t.Run("Should reject an oversized completion event before stopping", func(t *testing.T) {
+		t.Parallel()
+
+		baseStore := newInMemoryManagerStore()
+		store := &taskMutationDeadlineStore{inMemoryManagerStore: baseStore}
+		executor := &recordingSessionExecutor{}
+		manager := newTaskManagerForTestWithOptions(
+			t,
+			store,
+			WithSessionExecutor(executor),
+			WithCancelGracePeriod(0),
+		)
+		actor := validActorContext()
+		runningRun := createRunningRunForTest(t, manager, actor)
+		store.deadlines = nil
+		storedResult := json.RawMessage(`"` + strings.Repeat("<", 12*1024) + `"`)
+		if err := ValidatePayloadSize(storedResult, "test.result"); err != nil {
+			t.Fatalf("ValidatePayloadSize(storage-valid result) error = %v", err)
+		}
+
+		_, err := manager.CompleteRun(t.Context(), runningRun.ID, RunResult{Value: storedResult}, actor)
+		if !errors.Is(err, ErrPayloadTooLarge) {
+			t.Fatalf("CompleteRun(oversized event) error = %v, want %v", err, ErrPayloadTooLarge)
+		}
+		stored := baseStore.runs[runningRun.ID]
+		if got, want := stored.Status.Normalize(), TaskRunStatusRunning; got != want {
+			t.Fatalf("stored run status = %q, want %q after preflight rejection", got, want)
+		}
+		if len(stored.ResultValue()) != 0 || !stored.EndedAt.IsZero() {
+			t.Fatalf(
+				"stored run terminal fields = result:%s ended_at:%s, want rollback",
+				stored.ResultValue(),
+				stored.EndedAt,
+			)
+		}
+		if stored.Error != "" {
+			t.Fatalf("stored run error = %q, want empty", stored.Error)
+		}
+		if got := len(executor.requestStopCalls) + len(executor.forceStopCalls); got != 0 {
+			t.Fatalf("session stop calls = %d, want 0", got)
+		}
+		if got, want := len(store.deadlines), 0; got != want {
+			t.Fatalf("task mutation transaction contexts = %d, want %d", got, want)
+		}
+		if got := len(baseStore.terminalCommands); got != 0 {
+			t.Fatalf("terminal commands = %d, want 0", got)
+		}
+	})
+
+	t.Run("Should keep run non-terminal when completed stop request fails", func(t *testing.T) {
+		t.Parallel()
+
+		assertTerminalStopFailureLeavesRunActive(t, errors.New("stop failed"), nil, func(
+			ctx context.Context,
+			manager *Service,
+			runID string,
+			actor ActorContext,
+		) error {
+			_, err := manager.CompleteRun(ctx, runID, RunResult{
+				Value: json.RawMessage(`{"ok":true}`),
+			}, actor)
+			return err
+		})
+	})
+
+	t.Run("Should keep run non-terminal when completed force stop fails", func(t *testing.T) {
+		t.Parallel()
+
+		assertTerminalStopFailureLeavesRunActive(t, nil, errors.New("force failed"), func(
+			ctx context.Context,
+			manager *Service,
+			runID string,
+			actor ActorContext,
+		) error {
+			_, err := manager.CompleteRun(ctx, runID, RunResult{
+				Value: json.RawMessage(`{"ok":true}`),
+			}, actor)
+			return err
+		})
+	})
+
+	t.Run("Should keep run non-terminal when failed stop request fails", func(t *testing.T) {
+		t.Parallel()
+
+		assertTerminalStopFailureLeavesRunActive(t, errors.New("stop failed"), nil, func(
+			ctx context.Context,
+			manager *Service,
+			runID string,
+			actor ActorContext,
+		) error {
+			_, err := manager.FailRun(ctx, runID, RunFailure{
+				Error: "release validation failed",
+			}, actor)
+			return err
+		})
+	})
+
+	t.Run("Should keep run non-terminal when failed force stop fails", func(t *testing.T) {
+		t.Parallel()
+
+		assertTerminalStopFailureLeavesRunActive(t, nil, errors.New("force failed"), func(
+			ctx context.Context,
+			manager *Service,
+			runID string,
+			actor ActorContext,
+		) error {
+			_, err := manager.FailRun(ctx, runID, RunFailure{
+				Error: "release validation failed",
+			}, actor)
+			return err
+		})
+	})
+
+	t.Run("Should keep run active when cancel stop request fails", func(t *testing.T) {
+		t.Parallel()
+
+		assertTerminalStopFailureLeavesRunActive(t, errors.New("stop failed"), nil, func(
+			ctx context.Context,
+			manager *Service,
+			runID string,
+			actor ActorContext,
+		) error {
+			_, err := manager.CancelRun(ctx, runID, CancelRun{Reason: "stop"}, actor)
+			return err
+		})
+	})
+
+	t.Run("Should keep run active when cancel force stop fails", func(t *testing.T) {
+		t.Parallel()
+
+		assertTerminalStopFailureLeavesRunActive(t, nil, errors.New("force failed"), func(
+			ctx context.Context,
+			manager *Service,
+			runID string,
+			actor ActorContext,
+		) error {
+			_, err := manager.CancelRun(ctx, runID, CancelRun{Reason: "stop"}, actor)
+			return err
+		})
+	})
+}
+
+func createRunningRunForTest(t *testing.T, manager *Service, actor ActorContext) *Run {
+	t.Helper()
+
+	taskRecord, err := manager.CreateTask(t.Context(), CreateTask{
+		ProfileID: storepkg.DefaultProfileID,
+		Scope:     ScopeGlobal,
+		Title:     "Terminal session cleanup",
+	}, actor)
+	if err != nil {
+		t.Fatalf("CreateTask() error = %v", err)
+	}
+	queuedRun, err := manager.EnqueueRun(
+		t.Context(),
+		EnqueueRun{TaskID: taskRecord.ID},
+		actor,
+	)
+	if err != nil {
+		t.Fatalf("EnqueueRun() error = %v", err)
+	}
+	claimedRun, err := admitRunDirectlyForTest(t.Context(), manager, queuedRun.ID, actor)
+	if err != nil {
+		t.Fatalf("ClaimNextRun() error = %v", err)
+	}
+	runningRun, err := manager.StartRun(t.Context(), claimedRun.ID, StartRun{}, actor)
+	if err != nil {
+		t.Fatalf("StartRun() error = %v", err)
+	}
+	if strings.TrimSpace(runningRun.SessionID) == "" {
+		t.Fatal("StartRun().SessionID is empty")
+	}
+	return runningRun
+}
+
+func assertSessionStopCalls(
+	t *testing.T,
+	executor *recordingSessionExecutor,
+	sessionID string,
+	reason StopReason,
+) {
+	t.Helper()
+
+	if len(executor.requestStopCalls) != 1 {
+		t.Fatalf("len(requestStopCalls) = %d, want 1", len(executor.requestStopCalls))
+	}
+	if got, want := executor.requestStopCalls[0].SessionID, sessionID; got != want {
+		t.Fatalf("requestStopCalls[0].SessionID = %q, want %q", got, want)
+	}
+	if got, want := executor.requestStopCalls[0].Reason, reason; got != want {
+		t.Fatalf("requestStopCalls[0].Reason = %q, want %q", got, want)
+	}
+	if len(executor.forceStopCalls) != 1 {
+		t.Fatalf("len(forceStopCalls) = %d, want 1", len(executor.forceStopCalls))
+	}
+	if got, want := executor.forceStopCalls[0].SessionID, sessionID; got != want {
+		t.Fatalf("forceStopCalls[0].SessionID = %q, want %q", got, want)
+	}
+	if got, want := executor.forceStopCalls[0].Reason, reason; got != want {
+		t.Fatalf("forceStopCalls[0].Reason = %q, want %q", got, want)
+	}
+}
+
+func assertTerminalStopFailureLeavesRunActive(
+	t *testing.T,
+	requestStopErr error,
+	forceStopErr error,
+	transition func(context.Context, *Service, string, ActorContext) error,
+) {
+	t.Helper()
+
+	store := newInMemoryManagerStore()
+	executor := &recordingSessionExecutor{
+		requestStopErr: requestStopErr,
+		forceStopErr:   forceStopErr,
+	}
+	manager := newTaskManagerForTestWithOptions(
+		t,
+		store,
+		WithSessionExecutor(executor),
+		WithCancelGracePeriod(0),
+	)
+	actor := validActorContext()
+	runningRun := createRunningRunForTest(t, manager, actor)
+
+	err := transition(t.Context(), manager, runningRun.ID, actor)
+	if err == nil {
+		t.Fatal("transition() error = nil, want stop failure")
+	}
+
+	storedRun, getRunErr := store.GetTaskRun(t.Context(), runningRun.ID)
+	if getRunErr != nil {
+		t.Fatalf("GetTaskRun() error = %v", getRunErr)
+	}
+	if got, want := storedRun.Status, TaskRunStatusRunning; got != want {
+		t.Fatalf("storedRun.Status = %q, want %q", got, want)
+	}
+	if !storedRun.EndedAt.IsZero() {
+		t.Fatalf("storedRun.EndedAt = %v, want zero", storedRun.EndedAt)
+	}
+	if got, want := store.tasks[storedRun.TaskID].Status, TaskStatusInProgress; got != want {
+		t.Fatalf("task.Status = %q, want %q", got, want)
+	}
+	if len(executor.requestStopCalls) != 1 {
+		t.Fatalf("len(requestStopCalls) = %d, want 1", len(executor.requestStopCalls))
+	}
+	if requestStopErr != nil {
+		if len(executor.forceStopCalls) != 0 {
+			t.Fatalf("len(forceStopCalls) = %d, want 0", len(executor.forceStopCalls))
+		}
+		return
+	}
+	if len(executor.forceStopCalls) != 1 {
+		t.Fatalf("len(forceStopCalls) = %d, want 1", len(executor.forceStopCalls))
+	}
+}
+
+func TestManagerTaskReconciliationAcrossDependenciesAndRuns(t *testing.T) {
+	t.Parallel()
+
+	store := newInMemoryManagerStore()
+	executor := &recordingSessionExecutor{}
+	manager := newTaskManagerForTestWithOptions(t, store, WithSessionExecutor(executor))
+	actor := validActorContext()
+
+	blocker, err := manager.CreateTask(t.Context(), CreateTask{
+		ProfileID: storepkg.DefaultProfileID,
+		Scope:     ScopeGlobal,
+		Title:     "Blocking task",
+	}, actor)
+	if err != nil {
+		t.Fatalf("CreateTask(blocker) error = %v", err)
+	}
+	target, err := manager.CreateTask(t.Context(), CreateTask{
+		ProfileID: storepkg.DefaultProfileID,
+		Scope:     ScopeGlobal,
+		Title:     "Target task",
+	}, actor)
+	if err != nil {
+		t.Fatalf("CreateTask(target) error = %v", err)
+	}
+
+	if err := manager.AddDependency(t.Context(), AddDependency{
+		TaskID:          target.ID,
+		DependsOnTaskID: blocker.ID,
+		Kind:            DependencyKindBlocks,
+	}, actor); err != nil {
+		t.Fatalf("AddDependency() error = %v", err)
+	}
+	if got, want := store.tasks[target.ID].Status, TaskStatusBlocked; got != want {
+		t.Fatalf("target.Status after blocker add = %q, want %q", got, want)
+	}
+
+	blockerRun, err := manager.EnqueueRun(
+		t.Context(),
+		EnqueueRun{TaskID: blocker.ID},
+		actor,
+	)
+	if err != nil {
+		t.Fatalf("EnqueueRun(blocker) error = %v", err)
+	}
+	blockerRun, err = admitRunDirectlyForTest(t.Context(), manager, blockerRun.ID, actor)
+	if err != nil {
+		t.Fatalf("ClaimNextRun(blocker) error = %v", err)
+	}
+	blockerRun, err = manager.StartRun(t.Context(), blockerRun.ID, StartRun{}, actor)
+	if err != nil {
+		t.Fatalf("StartRun(blocker) error = %v", err)
+	}
+	if _, err := manager.CompleteRun(t.Context(), blockerRun.ID, RunResult{
+		Value: json.RawMessage(`{"state":"done"}`),
+	}, actor); err != nil {
+		t.Fatalf("CompleteRun(blocker) error = %v", err)
+	}
+	if got, want := store.tasks[blocker.ID].Status, TaskStatusCompleted; got != want {
+		t.Fatalf("blocker.Status after complete = %q, want %q", got, want)
+	}
+	if got, want := store.tasks[target.ID].Status, TaskStatusReady; got != want {
+		t.Fatalf("target.Status after blocker complete = %q, want %q", got, want)
+	}
+
+	targetRun, err := manager.EnqueueRun(t.Context(), EnqueueRun{TaskID: target.ID}, actor)
+	if err != nil {
+		t.Fatalf("EnqueueRun(target) error = %v", err)
+	}
+	targetRun, err = admitRunDirectlyForTest(t.Context(), manager, targetRun.ID, actor)
+	if err != nil {
+		t.Fatalf("ClaimNextRun(target) error = %v", err)
+	}
+	targetRun, err = manager.StartRun(t.Context(), targetRun.ID, StartRun{}, actor)
+	if err != nil {
+		t.Fatalf("StartRun(target) error = %v", err)
+	}
+	if got, want := store.tasks[target.ID].Status, TaskStatusInProgress; got != want {
+		t.Fatalf("target.Status after start = %q, want %q", got, want)
+	}
+	if _, err := manager.CompleteRun(t.Context(), targetRun.ID, RunResult{
+		Value: json.RawMessage(`{"state":"done"}`),
+	}, actor); err != nil {
+		t.Fatalf("CompleteRun(target) error = %v", err)
+	}
+	if got, want := store.tasks[target.ID].Status, TaskStatusCompleted; got != want {
+		t.Fatalf("target.Status after complete = %q, want %q", got, want)
+	}
+
+	failedTask, err := manager.CreateTask(t.Context(), CreateTask{
+		ProfileID:   storepkg.DefaultProfileID,
+		Scope:       ScopeGlobal,
+		Title:       "Failure task",
+		MaxAttempts: new(1),
+	}, actor)
+	if err != nil {
+		t.Fatalf("CreateTask(failedTask) error = %v", err)
+	}
+	failedRun, err := manager.EnqueueRun(
+		t.Context(),
+		EnqueueRun{TaskID: failedTask.ID},
+		actor,
+	)
+	if err != nil {
+		t.Fatalf("EnqueueRun(failedTask) error = %v", err)
+	}
+	failedRun, err = admitRunDirectlyForTest(t.Context(), manager, failedRun.ID, actor)
+	if err != nil {
+		t.Fatalf("ClaimNextRun(failedTask) error = %v", err)
+	}
+	failedRun, err = manager.StartRun(t.Context(), failedRun.ID, StartRun{}, actor)
+	if err != nil {
+		t.Fatalf("StartRun(failedTask) error = %v", err)
+	}
+	if _, err := manager.FailRun(t.Context(), failedRun.ID, RunFailure{
+		Error: "boom",
+	}, actor); err != nil {
+		t.Fatalf("FailRun() error = %v", err)
+	}
+	if got, want := store.tasks[failedTask.ID].Status, TaskStatusFailed; got != want {
+		t.Fatalf("failedTask.Status = %q, want %q", got, want)
+	}
+
+	cancelledTask, err := manager.CreateTask(t.Context(), CreateTask{
+		ProfileID: storepkg.DefaultProfileID,
+		Scope:     ScopeGlobal,
+		Title:     "Canceled task",
+	}, actor)
+	if err != nil {
+		t.Fatalf("CreateTask(cancelledTask) error = %v", err)
+	}
+	cancelledRun, err := manager.EnqueueRun(
+		t.Context(),
+		EnqueueRun{TaskID: cancelledTask.ID},
+		actor,
+	)
+	if err != nil {
+		t.Fatalf("EnqueueRun(cancelledTask) error = %v", err)
+	}
+	cancelledRun, err = admitRunDirectlyForTest(t.Context(), manager, cancelledRun.ID, actor)
+	if err != nil {
+		t.Fatalf("ClaimNextRun(cancelledTask) error = %v", err)
+	}
+	cancelledRun, err = manager.StartRun(t.Context(), cancelledRun.ID, StartRun{}, actor)
+	if err != nil {
+		t.Fatalf("StartRun(cancelledTask) error = %v", err)
+	}
+	if _, err := manager.CancelRun(t.Context(), cancelledRun.ID, CancelRun{
+		Reason: "stop",
+	}, actor); err != nil {
+		t.Fatalf("CancelRun() error = %v", err)
+	}
+	if got, want := store.tasks[cancelledTask.ID].Status, TaskStatusCanceled; got != want {
+		t.Fatalf("cancelledTask.Status = %q, want %q", got, want)
+	}
+}
+
+func TestManagerCancelTaskPropagatesAcrossTree(t *testing.T) {
+	t.Parallel()
+
+	t.Run("Should cancel every nonterminal task and run in the tree", func(t *testing.T) {
+		t.Parallel()
+		testManagerCancelTaskPropagatesAcrossTree(t)
+	})
+
+	t.Run("Should reject the whole tree before mutation when a later ID fails", func(t *testing.T) {
+		t.Parallel()
+
+		store := newInMemoryManagerStore()
+		executor := &recordingSessionExecutor{}
+		manager := newTaskManagerForTestWithOptions(t, store, WithSessionExecutor(executor))
+		actor := validActorContext()
+		parent, err := manager.CreateTask(
+			t.Context(),
+			CreateTask{ProfileID: storepkg.DefaultProfileID, Scope: ScopeGlobal, Title: "Parent"},
+			actor,
+		)
+		if err != nil {
+			t.Fatalf("CreateTask(parent) error = %v", err)
+		}
+		firstChild, err := manager.CreateChildTask(
+			t.Context(),
+			parent.ID,
+			CreateTask{ProfileID: storepkg.DefaultProfileID, Scope: ScopeGlobal, Title: "First child"},
+			actor,
+		)
+		if err != nil {
+			t.Fatalf("CreateChildTask(first) error = %v", err)
+		}
+		secondChild, err := manager.CreateChildTask(
+			t.Context(),
+			parent.ID,
+			CreateTask{ProfileID: storepkg.DefaultProfileID, Scope: ScopeGlobal, Title: "Second child"},
+			actor,
+		)
+		if err != nil {
+			t.Fatalf("CreateChildTask(second) error = %v", err)
+		}
+		firstRun, err := manager.EnqueueRun(t.Context(), EnqueueRun{TaskID: firstChild.ID}, actor)
+		if err != nil {
+			t.Fatalf("EnqueueRun(first) error = %v", err)
+		}
+		secondRun, err := manager.EnqueueRun(t.Context(), EnqueueRun{TaskID: secondChild.ID}, actor)
+		if err != nil {
+			t.Fatalf("EnqueueRun(second) error = %v", err)
+		}
+		taskStatuses := map[string]Status{
+			parent.ID:      store.tasks[parent.ID].Status,
+			firstChild.ID:  store.tasks[firstChild.ID].Status,
+			secondChild.ID: store.tasks[secondChild.ID].Status,
+		}
+		runStatuses := map[string]RunStatus{
+			firstRun.ID:  store.runs[firstRun.ID].Status,
+			secondRun.ID: store.runs[secondRun.ID].Status,
+		}
+		eventsBefore := len(store.events)
+		entropyErr := errors.New("later cancellation identity unavailable")
+		idCalls := 0
+		manager.newID = func(prefix string) (string, error) {
+			idCalls++
+			if idCalls == 3 {
+				return "", entropyErr
+			}
+			return fmt.Sprintf("%s-cancel-entropy-%d", prefix, idCalls), nil
+		}
+
+		canceled, err := manager.CancelTask(
+			t.Context(),
+			parent.ID,
+			CancelTask{Reason: "cancel all"},
+			actor,
+		)
+		if !errors.Is(err, entropyErr) {
+			t.Fatalf("CancelTask() error = %v, want errors.Is(entropyErr)", err)
+		}
+		if canceled != nil {
+			t.Fatalf("CancelTask() = %#v, want nil", canceled)
+		}
+		if got, want := idCalls, 3; got != want {
+			t.Fatalf("ID generation calls = %d, want %d", got, want)
+		}
+		for taskID, want := range taskStatuses {
+			if got := store.tasks[taskID].Status; got != want {
+				t.Fatalf("task %q status after entropy failure = %q, want %q", taskID, got, want)
+			}
+		}
+		for runID, want := range runStatuses {
+			if got := store.runs[runID].Status; got != want {
+				t.Fatalf("run %q status after entropy failure = %q, want %q", runID, got, want)
+			}
+		}
+		if got := len(store.events); got != eventsBefore {
+			t.Fatalf("event count after entropy failure = %d, want %d", got, eventsBefore)
+		}
+		if got := len(store.terminalCommands); got != 0 {
+			t.Fatalf("terminal command count after entropy failure = %d, want 0", got)
+		}
+		if len(executor.requestStopCalls) != 0 || len(executor.forceStopCalls) != 0 {
+			t.Fatalf(
+				"session stop calls after entropy failure = request:%d force:%d, want zero",
+				len(executor.requestStopCalls),
+				len(executor.forceStopCalls),
+			)
+		}
+	})
+}
+
+func testManagerCancelTaskPropagatesAcrossTree(t *testing.T) {
+	t.Helper()
+
+	store := newInMemoryManagerStore()
+	executor := &recordingSessionExecutor{}
+	manager := newTaskManagerForTestWithOptions(
+		t,
+		store,
+		WithSessionExecutor(executor),
+		WithCancelGracePeriod(0),
+	)
+	actor := validActorContext()
+
+	parent, err := manager.CreateTask(t.Context(), CreateTask{
+		ProfileID: storepkg.DefaultProfileID,
+		Scope:     ScopeGlobal,
+		Title:     "Parent task",
+	}, actor)
+	if err != nil {
+		t.Fatalf("CreateTask(parent) error = %v", err)
+	}
+	queuedChild, err := manager.CreateChildTask(t.Context(), parent.ID, CreateTask{
+		ProfileID: storepkg.DefaultProfileID,
+		Scope:     ScopeGlobal,
+		Title:     "Queued child",
+	}, actor)
+	if err != nil {
+		t.Fatalf("CreateChildTask(queued child) error = %v", err)
+	}
+	activeChild, err := manager.CreateChildTask(t.Context(), parent.ID, CreateTask{
+		ProfileID: storepkg.DefaultProfileID,
+		Scope:     ScopeGlobal,
+		Title:     "Active child",
+	}, actor)
+	if err != nil {
+		t.Fatalf("CreateChildTask(active child) error = %v", err)
+	}
+
+	queuedRun, err := manager.EnqueueRun(
+		t.Context(),
+		EnqueueRun{TaskID: queuedChild.ID},
+		actor,
+	)
+	if err != nil {
+		t.Fatalf("EnqueueRun(queued child) error = %v", err)
+	}
+	activeRun, err := manager.EnqueueRun(
+		t.Context(),
+		EnqueueRun{TaskID: activeChild.ID},
+		actor,
+	)
+	if err != nil {
+		t.Fatalf("EnqueueRun(active child) error = %v", err)
+	}
+	activeRun, err = admitRunDirectlyForTest(t.Context(), manager, activeRun.ID, actor)
+	if err != nil {
+		t.Fatalf("ClaimNextRun(active child) error = %v", err)
+	}
+	activeRun, err = manager.StartRun(t.Context(), activeRun.ID, StartRun{}, actor)
+	if err != nil {
+		t.Fatalf("StartRun(active child) error = %v", err)
+	}
+
+	cancelledParent, err := manager.CancelTask(t.Context(), parent.ID, CancelTask{
+		Reason: "parent requested stop",
+	}, actor)
+	if err != nil {
+		t.Fatalf("CancelTask() error = %v", err)
+	}
+	if got, want := cancelledParent.Status, TaskStatusCanceled; got != want {
+		t.Fatalf("cancelledParent.Status = %q, want %q", got, want)
+	}
+	if got, want := store.tasks[parent.ID].Status, TaskStatusCanceled; got != want {
+		t.Fatalf("parent.Status = %q, want %q", got, want)
+	}
+	if got, want := store.tasks[queuedChild.ID].Status, TaskStatusCanceled; got != want {
+		t.Fatalf("queuedChild.Status = %q, want %q", got, want)
+	}
+	if got, want := store.tasks[activeChild.ID].Status, TaskStatusCanceled; got != want {
+		t.Fatalf("activeChild.Status = %q, want %q", got, want)
+	}
+	if got, want := store.runs[queuedRun.ID].Status, TaskRunStatusCanceled; got != want {
+		t.Fatalf("queuedRun.Status = %q, want %q", got, want)
+	}
+	if got, want := store.runs[activeRun.ID].Status, TaskRunStatusCanceled; got != want {
+		t.Fatalf("activeRun.Status = %q, want %q", got, want)
+	}
+	if len(executor.requestStopCalls) != 1 {
+		t.Fatalf("len(requestStopCalls) = %d, want 1", len(executor.requestStopCalls))
+	}
+	if got, want := executor.requestStopCalls[0].SessionID, activeRun.SessionID; got != want {
+		t.Fatalf("requestStopCalls[0].SessionID = %q, want %q", got, want)
+	}
+	if len(executor.forceStopCalls) != 1 {
+		t.Fatalf("len(forceStopCalls) = %d, want 1", len(executor.forceStopCalls))
+	}
+	if got, want := executor.forceStopCalls[0].Reason, StopReasonCancellation; got != want {
+		t.Fatalf("forceStopCalls[0].Reason = %q, want %q", got, want)
+	}
+
+	parentEvents, err := store.ListTaskEvents(t.Context(), EventQuery{TaskID: parent.ID})
+	if err != nil {
+		t.Fatalf("ListTaskEvents(parent) error = %v", err)
+	}
+	if !containsEventType(parentEvents, taskEventCanceled) {
+		t.Fatalf("parent events = %#v, want %q", sortedEventTypes(parentEvents), taskEventCanceled)
+	}
+
+	activeChildEvents, err := store.ListTaskEvents(
+		t.Context(),
+		EventQuery{TaskID: activeChild.ID},
+	)
+	if err != nil {
+		t.Fatalf("ListTaskEvents(active child) error = %v", err)
+	}
+	if !containsEventType(activeChildEvents, taskEventRunCanceled) {
+		t.Fatalf(
+			"active child events = %#v, want %q",
+			sortedEventTypes(activeChildEvents),
+			taskEventRunCanceled,
+		)
+	}
+}
+
+func TestManagerAttachRunSessionAndRetryLatestRunOutcome(t *testing.T) {
+	t.Parallel()
+
+	store := newInMemoryManagerStore()
+	executor := &recordingSessionExecutor{}
+	manager := newTaskManagerForTestWithOptions(t, store, WithSessionExecutor(executor))
+	actor := validActorContext()
+
+	taskRecord, err := manager.CreateTask(t.Context(), CreateTask{
+		ProfileID:   storepkg.DefaultProfileID,
+		Scope:       ScopeGlobal,
+		Title:       "Attach and retry",
+		MaxAttempts: new(2),
+	}, actor)
+	if err != nil {
+		t.Fatalf("CreateTask() error = %v", err)
+	}
+
+	firstRun, err := manager.EnqueueRun(
+		t.Context(),
+		EnqueueRun{TaskID: taskRecord.ID},
+		actor,
+	)
+	if err != nil {
+		t.Fatalf("EnqueueRun(first) error = %v", err)
+	}
+
+	firstRun, err = admitRunDirectlyForTest(t.Context(), manager, firstRun.ID, actor)
+	if err != nil {
+		t.Fatalf("ClaimNextRun(first) error = %v", err)
+	}
+	firstRun, err = manager.StartRun(t.Context(), firstRun.ID, StartRun{}, actor)
+	if err != nil {
+		t.Fatalf("StartRun(first) error = %v", err)
+	}
+	if _, err := manager.CompleteRun(t.Context(), firstRun.ID, RunResult{
+		Value: json.RawMessage(`{"result":"ok"}`),
+	}, actor); err != nil {
+		t.Fatalf("CompleteRun(first) error = %v", err)
+	}
+	if got, want := store.tasks[taskRecord.ID].Status, TaskStatusCompleted; got != want {
+		t.Fatalf("task.Status after first completion = %q, want %q", got, want)
+	}
+
+	retryRun, err := manager.EnqueueRun(t.Context(), EnqueueRun{TaskID: taskRecord.ID}, actor)
+	if err != nil {
+		t.Fatalf("EnqueueRun(retry) error = %v", err)
+	}
+	if got, want := retryRun.Attempt, int32(2); got != want {
+		t.Fatalf("retryRun.Attempt = %d, want %d", got, want)
+	}
+
+	if got, want := store.tasks[taskRecord.ID].Status, TaskStatusReady; got != want {
+		t.Fatalf("task.Status after retry enqueue = %q, want %q", got, want)
+	}
+
+	retryRun, err = admitRunDirectlyForTest(t.Context(), manager, retryRun.ID, actor)
+	if err != nil {
+		t.Fatalf("ClaimNextRun(retry) error = %v", err)
+	}
+	retryRun, err = manager.AttachRunSession(
+		t.Context(),
+		retryRun.ID,
+		"sess-resume",
+		actor,
+	)
+	if err != nil {
+		t.Fatalf("AttachRunSession() error = %v", err)
+	}
+	if got, want := retryRun.Status, TaskRunStatusStarting; got != want {
+		t.Fatalf("retryRun.Status after attach = %q, want %q", got, want)
+	}
+	if got, want := retryRun.SessionID, "sess-resume"; got != want {
+		t.Fatalf("retryRun.SessionID after attach = %q, want %q", got, want)
+	}
+	if got, want := store.tasks[taskRecord.ID].Status, TaskStatusInProgress; got != want {
+		t.Fatalf("task.Status after attach = %q, want %q", got, want)
+	}
+
+	retryRun, err = manager.StartRun(t.Context(), retryRun.ID, StartRun{}, actor)
+	if err != nil {
+		t.Fatalf("StartRun(retry) error = %v", err)
+	}
+	if got, want := len(executor.attachCalls), 1; got != want {
+		t.Fatalf("len(attachCalls) = %d, want %d", got, want)
+	}
+	if got, want := len(executor.startCalls), 1; got != want {
+		t.Fatalf("len(startCalls) = %d, want %d", got, want)
+	}
+	if _, err := manager.AttachRunSession(
+		t.Context(),
+		retryRun.ID,
+		"sess-other",
+		actor,
+	); !errors.Is(
+		err,
+		ErrSessionAlreadyBound,
+	) {
+		t.Fatalf("AttachRunSession(running) error = %v, want %v", err, ErrSessionAlreadyBound)
+	}
+
+	if _, err := manager.FailRun(t.Context(), retryRun.ID, RunFailure{
+		Error: "resume failed",
+	}, actor); err != nil {
+		t.Fatalf("FailRun(retry) error = %v", err)
+	}
+	if got, want := store.tasks[taskRecord.ID].Status, TaskStatusFailed; got != want {
+		t.Fatalf("task.Status after retry failure = %q, want %q", got, want)
+	}
+}
+
+func TestManagerForceRunOperations(t *testing.T) {
+	t.Parallel()
+
+	t.Run("Should publish Loop worker failure only after forced failure commits", func(t *testing.T) {
+		t.Parallel()
+		store := newInMemoryManagerStore()
+		var observed Run
+		var calls, eventCount int
+		manager := newTaskManagerForTestWithOptions(t, store, WithTaskRunHooks(recordingTaskRunHooks{
+			failed: func(ctx context.Context, payload hookspkg.TaskRunFailedPayload) (hookspkg.TaskRunFailedPayload, error) {
+				calls++
+				var err error
+				observed, err = store.GetTaskRun(ctx, payload.RunID)
+				if err != nil {
+					return payload, err
+				}
+				events, err := store.ListTaskEvents(
+					ctx,
+					EventQuery{TaskID: payload.TaskID, RunID: payload.RunID, EventType: taskWatchEventRunFailed},
+				)
+				if err != nil {
+					return payload, err
+				}
+				eventCount = len(events)
+				return payload, nil
+			},
+		}))
+		actor := validActorContext()
+		taskRecord, err := manager.CreateTask(
+			t.Context(),
+			CreateTask{ProfileID: storepkg.DefaultProfileID, Scope: ScopeGlobal, Title: "Recover Loop worker"},
+			actor,
+		)
+		if err != nil {
+			t.Fatal(err)
+		}
+		run, err := manager.EnqueueRun(t.Context(), EnqueueRun{TaskID: taskRecord.ID}, actor)
+		if err != nil {
+			t.Fatal(err)
+		}
+		run.LoopRunID = "looprun-forced-failure"
+		if err := store.CreateTaskRun(t.Context(), *run); err != nil {
+			t.Fatal(err)
+		}
+		failed, err := manager.ForceFailRun(t.Context(), run.ID, ForceFailRun{Reason: "operator recovery"}, actor)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if calls != 1 || eventCount != 1 || observed.ID != failed.ID || observed.Status != TaskRunStatusFailed {
+			t.Fatalf(
+				"failure hook calls/events/run = %d/%d/%#v, want one committed failed worker and event",
+				calls,
+				eventCount,
+				observed,
+			)
+		}
+	})
+
+	t.Run(
+		"Should force release claimed run and invalidate queued session input",
+		func(t *testing.T) {
+			t.Parallel()
+
+			const rawToken = "compozy_claim_force-release-secret"
+			metadata := json.RawMessage(
+				`{"safe":"release-audit","note":"worker returned ` + rawToken + `"}`,
+			)
+			store := newForceInputStore()
+			store.pendingCancelCounts["sess-force"] = 2
+			var releasedHook hookspkg.TaskRunReleasedPayload
+			manager := newTaskManagerForTestWithOptions(
+				t,
+				store,
+				WithTaskRunHooks(recordingTaskRunHooks{
+					released: func(
+						_ context.Context,
+						payload hookspkg.TaskRunReleasedPayload,
+					) (hookspkg.TaskRunReleasedPayload, error) {
+						releasedHook = payload
+						return payload, nil
+					},
+				}),
+			)
+			actor := validActorContext()
+
+			taskRecord, err := manager.CreateTask(t.Context(), CreateTask{
+				ProfileID: storepkg.DefaultProfileID,
+				Scope:     ScopeGlobal,
+				Title:     "Force release",
+			}, actor)
+			if err != nil {
+				t.Fatalf("CreateTask() error = %v", err)
+			}
+			run, err := manager.EnqueueRun(
+				t.Context(),
+				EnqueueRun{TaskID: taskRecord.ID},
+				actor,
+			)
+			if err != nil {
+				t.Fatalf("EnqueueRun() error = %v", err)
+			}
+			run, err = claimExactRunForTest(t.Context(), manager, run.ID, actor)
+			if err != nil {
+				t.Fatalf("ClaimNextRun() error = %v", err)
+			}
+			storedRun := store.runs[run.ID]
+			storedRun.SessionID = "sess-force"
+			store.runs[run.ID] = storedRun
+
+			released, err := manager.ForceReleaseRun(t.Context(), run.ID, ForceReleaseRun{
+				Reason:   "handoff " + rawToken,
+				Metadata: metadata,
+			}, actor)
+			if err != nil {
+				t.Fatalf("ForceReleaseRun() error = %v", err)
+			}
+			if got, want := released.Status, TaskRunStatusQueued; got != want {
+				t.Fatalf("ForceReleaseRun().Status = %q, want %q", got, want)
+			}
+			if released.SessionID != "" || released.ClaimTokenHash != "" ||
+				!released.LeaseUntil.IsZero() {
+				t.Fatalf("released run retained claim fields: %#v", released)
+			}
+			if len(released.Metadata) != 0 {
+				t.Fatalf("released run metadata = %s, want operational metadata unchanged", released.Metadata)
+			}
+			if len(store.advanceCalls) != 1 || store.advanceCalls[0] != "sess-force" {
+				t.Fatalf("advanceCalls = %#v, want sess-force", store.advanceCalls)
+			}
+			if len(store.cancelCalls) != 1 ||
+				store.cancelCalls[0].SessionID != "sess-force" ||
+				store.cancelCalls[0].Generation != 1 ||
+				store.cancelCalls[0].CanceledInputs != 2 {
+				t.Fatalf(
+					"cancelCalls = %#v, want session generation cancellation",
+					store.cancelCalls,
+				)
+			}
+
+			events, err := store.ListTaskEvents(t.Context(), EventQuery{
+				TaskID:    taskRecord.ID,
+				RunID:     run.ID,
+				EventType: taskEventRunReleased,
+			})
+			if err != nil {
+				t.Fatalf("ListTaskEvents(released) error = %v", err)
+			}
+			if got, want := len(events), 1; got != want {
+				t.Fatalf("released event count = %d, want %d", got, want)
+			}
+			var payload releasedRunPayload
+			if err := json.Unmarshal(events[0].Payload, &payload); err != nil {
+				t.Fatalf("json.Unmarshal(release payload) error = %v", err)
+			}
+			if payload.Reason != "handoff compozy_claim_[REDACTED]" || payload.QueueGeneration != 1 ||
+				payload.CanceledQueuedInputs != 2 {
+				t.Fatalf(
+					"release payload = %#v, want reason and input cancellation evidence",
+					payload,
+				)
+			}
+			if strings.Contains(string(events[0].Payload), rawToken) {
+				t.Fatalf("task.run.released payload leaked raw bearer: %s", events[0].Payload)
+			}
+			var audit struct {
+				Metadata json.RawMessage `json:"metadata"`
+			}
+			if err := json.Unmarshal(events[0].Payload, &audit); err != nil {
+				t.Fatalf("json.Unmarshal(release audit metadata) error = %v", err)
+			}
+			if !strings.Contains(string(audit.Metadata), `"safe":"release-audit"`) ||
+				strings.Contains(string(audit.Metadata), rawToken) {
+				t.Fatalf("release audit metadata = %s, want safe content without raw bearer", audit.Metadata)
+			}
+			if strings.Contains(releasedHook.RecoveryReason, rawToken) ||
+				strings.Contains(releasedHook.ReleaseReason, rawToken) {
+				t.Fatalf("task.run_released hook leaked raw bearer: %#v", releasedHook)
+			}
+			if got, want := releasedHook.RecoveryReason, "handoff compozy_claim_[REDACTED]"; got != want {
+				t.Fatalf("released hook RecoveryReason = %q, want %q", got, want)
+			}
+		},
+	)
+
+	t.Run("Should preserve sanitized release metadata through bulk audit events", func(t *testing.T) {
+		t.Parallel()
+
+		const rawToken = "compozy_claim_bulk-release-secret"
+		store := newForceInputStore()
+		manager := newTaskManagerForTest(t, store)
+		actor := validActorContext()
+		taskRecord, err := manager.CreateTask(t.Context(), CreateTask{
+			ProfileID: storepkg.DefaultProfileID,
+			Scope:     ScopeGlobal,
+			Title:     "Bulk force release",
+		}, actor)
+		if err != nil {
+			t.Fatalf("CreateTask() error = %v", err)
+		}
+		run, err := manager.EnqueueRun(
+			t.Context(),
+			EnqueueRun{TaskID: taskRecord.ID},
+			actor,
+		)
+		if err != nil {
+			t.Fatalf("EnqueueRun() error = %v", err)
+		}
+		run, err = claimExactRunForTest(t.Context(), manager, run.ID, actor)
+		if err != nil {
+			t.Fatalf("ClaimNextRun() error = %v", err)
+		}
+
+		result, err := manager.BulkForceReleaseRuns(t.Context(), BulkForceRunRequest{
+			RunIDs: []string{run.ID},
+			Reason: "bulk handoff",
+			Metadata: json.RawMessage(
+				`{"safe":"bulk-release-audit","note":"worker returned ` + rawToken + `"}`,
+			),
+		}, actor)
+		if err != nil {
+			t.Fatalf("BulkForceReleaseRuns() error = %v", err)
+		}
+		if len(result.Items) != 1 || !result.Items[0].OK {
+			t.Fatalf("BulkForceReleaseRuns().Items = %#v, want one successful item", result.Items)
+		}
+		events, err := store.ListTaskEvents(t.Context(), EventQuery{
+			TaskID:    taskRecord.ID,
+			RunID:     run.ID,
+			EventType: taskEventRunReleased,
+		})
+		if err != nil {
+			t.Fatalf("ListTaskEvents(released) error = %v", err)
+		}
+		if got, want := len(events), 1; got != want {
+			t.Fatalf("released event count = %d, want %d", got, want)
+		}
+		var audit struct {
+			Metadata json.RawMessage `json:"metadata"`
+		}
+		if err := json.Unmarshal(events[0].Payload, &audit); err != nil {
+			t.Fatalf("json.Unmarshal(release audit metadata) error = %v", err)
+		}
+		if !strings.Contains(string(audit.Metadata), `"safe":"bulk-release-audit"`) ||
+			strings.Contains(string(audit.Metadata), rawToken) {
+			t.Fatalf("bulk release audit metadata = %s, want safe content without raw bearer", audit.Metadata)
+		}
+	})
+
+	t.Run("Should force fail require reason and record operator evidence", func(t *testing.T) {
+		t.Parallel()
+
+		store := newInMemoryManagerStore()
+		manager := newTaskManagerForTest(t, store)
+		actor := validActorContext()
+		taskRecord, err := manager.CreateTask(t.Context(), CreateTask{
+			ProfileID: storepkg.DefaultProfileID,
+			Scope:     ScopeGlobal,
+			Title:     "Force fail",
+		}, actor)
+		if err != nil {
+			t.Fatalf("CreateTask() error = %v", err)
+		}
+		run, err := manager.EnqueueRun(
+			t.Context(),
+			EnqueueRun{TaskID: taskRecord.ID},
+			actor,
+		)
+		if err != nil {
+			t.Fatalf("EnqueueRun() error = %v", err)
+		}
+		if _, err := manager.ForceFailRun(t.Context(), run.ID, ForceFailRun{}, actor); !errors.Is(
+			err,
+			ErrForceOpRequiresReason,
+		) {
+			t.Fatalf("ForceFailRun(no reason) error = %v, want %v", err, ErrForceOpRequiresReason)
+		}
+
+		failed, err := manager.ForceFailRun(t.Context(), run.ID, ForceFailRun{
+			Reason: "operator recovery",
+		}, actor)
+		if err != nil {
+			t.Fatalf("ForceFailRun() error = %v", err)
+		}
+		if got, want := failed.Status, TaskRunStatusFailed; got != want {
+			t.Fatalf("ForceFailRun().Status = %q, want %q", got, want)
+		}
+		if got, want := failed.FailureKind, FailureKindOperatorForced; got != want {
+			t.Fatalf("ForceFailRun().FailureKind = %q, want %q", got, want)
+		}
+		if got, want := failed.Error, "operator recovery"; got != want {
+			t.Fatalf("ForceFailRun().Error = %q, want %q", got, want)
+		}
+		events, err := store.ListTaskEvents(t.Context(), EventQuery{
+			TaskID:    taskRecord.ID,
+			RunID:     run.ID,
+			EventType: taskEventRunOperatorForcedFail,
+		})
+		if err != nil {
+			t.Fatalf("ListTaskEvents(force fail) error = %v", err)
+		}
+		if got, want := len(events), 1; got != want {
+			t.Fatalf("force-fail event count = %d, want %d", got, want)
+		}
+		var payload operatorForcedFailPayload
+		if err := json.Unmarshal(events[0].Payload, &payload); err != nil {
+			t.Fatalf("json.Unmarshal(force fail payload) error = %v", err)
+		}
+		if payload.Reason != "operator recovery" || payload.PreviousStatus != TaskRunStatusQueued {
+			t.Fatalf("force-fail payload = %#v, want reason and previous queued status", payload)
+		}
+	})
+
+	t.Run("Should suggest recovery only for a needs_attention run", func(t *testing.T) {
+		t.Parallel()
+
+		needsAttention := Run{ID: "run-attention", Status: TaskRunStatusNeedsAttention}
+		attentionItem, ok := diagnostics.ItemFromError(requireForceFailStatus(needsAttention))
+		if !ok {
+			t.Fatal("requireForceFailStatus(needs_attention) diagnostic = false, want structured item")
+		}
+		if got, want := attentionItem.SuggestedCommand,
+			`compozy task run recover run-attention --reason "operator recovery"`; got != want {
+			t.Fatalf("needs_attention suggested command = %q, want %q", got, want)
+		}
+
+		active := Run{ID: "run-active", Status: TaskRunStatusRunning}
+		activeItem, ok := diagnostics.ItemFromError(requireForceFailStatus(active))
+		if !ok {
+			t.Fatal("requireForceFailStatus(running) diagnostic = false, want structured item")
+		}
+		if got, want := activeItem.SuggestedCommand,
+			`compozy task run cancel run-active --reason "stop before force fail"`; got != want {
+			t.Fatalf("running suggested command = %q, want %q", got, want)
+		}
+	})
+
+	t.Run("Should redact raw claim bearers from forced failure state and audit", func(t *testing.T) {
+		t.Parallel()
+
+		const rawToken = "compozy_claim_force-fail-secret"
+		store := newInMemoryManagerStore()
+		manager := newTaskManagerForTest(t, store)
+		actor := validActorContext()
+		taskRecord, err := manager.CreateTask(t.Context(), CreateTask{
+			ProfileID: storepkg.DefaultProfileID,
+			Scope:     ScopeGlobal,
+			Title:     "Sanitized force fail",
+		}, actor)
+		if err != nil {
+			t.Fatalf("CreateTask() error = %v", err)
+		}
+		run, err := manager.EnqueueRun(
+			t.Context(),
+			EnqueueRun{TaskID: taskRecord.ID},
+			actor,
+		)
+		if err != nil {
+			t.Fatalf("EnqueueRun() error = %v", err)
+		}
+
+		failed, err := manager.ForceFailRun(t.Context(), run.ID, ForceFailRun{
+			Reason: "operator observed " + rawToken,
+			Metadata: json.RawMessage(
+				`{"detail":"worker returned ` + rawToken + `","claim_token":"` + rawToken + `","safe":"preserved"}`,
+			),
+		}, actor)
+		if err != nil {
+			t.Fatalf("ForceFailRun() error = %v", err)
+		}
+		if strings.Contains(failed.Error, rawToken) {
+			t.Fatalf("ForceFailRun().Error = %q, want raw bearer redacted", failed.Error)
+		}
+		if got, want := failed.Error, "operator observed compozy_claim_[REDACTED]"; got != want {
+			t.Fatalf("ForceFailRun().Error = %q, want %q", got, want)
+		}
+
+		events, err := store.ListTaskEvents(t.Context(), EventQuery{
+			TaskID:    taskRecord.ID,
+			RunID:     run.ID,
+			EventType: taskEventRunOperatorForcedFail,
+		})
+		if err != nil {
+			t.Fatalf("ListTaskEvents(force fail) error = %v", err)
+		}
+		if got, want := len(events), 1; got != want {
+			t.Fatalf("force-fail event count = %d, want %d", got, want)
+		}
+		if strings.Contains(string(events[0].Payload), rawToken) {
+			t.Fatalf("force-fail payload leaked raw bearer: %s", events[0].Payload)
+		}
+		var payload operatorForcedFailPayload
+		if err := json.Unmarshal(events[0].Payload, &payload); err != nil {
+			t.Fatalf("json.Unmarshal(force fail payload) error = %v", err)
+		}
+		if got, want := payload.Reason, "operator observed compozy_claim_[REDACTED]"; got != want {
+			t.Fatalf("force-fail payload reason = %q, want %q", got, want)
+		}
+		if strings.Contains(string(payload.Metadata), `"claim_token"`) ||
+			!strings.Contains(string(payload.Metadata), `"safe":"preserved"`) {
+			t.Fatalf(
+				"force-fail payload metadata = %s, want secret field removed and safe content preserved",
+				payload.Metadata,
+			)
+		}
+	})
+
+	t.Run("Should reject expanded force fail metadata before mutating the run", func(t *testing.T) {
+		t.Parallel()
+
+		store := newInMemoryManagerStore()
+		manager := newTaskManagerForTest(t, store)
+		actor := validActorContext()
+		taskRecord, err := manager.CreateTask(t.Context(), CreateTask{
+			ProfileID: storepkg.DefaultProfileID,
+			Scope:     ScopeGlobal,
+			Title:     "Bounded force fail",
+		}, actor)
+		if err != nil {
+			t.Fatalf("CreateTask() error = %v", err)
+		}
+		run, err := manager.EnqueueRun(
+			t.Context(),
+			EnqueueRun{TaskID: taskRecord.ID},
+			actor,
+		)
+		if err != nil {
+			t.Fatalf("EnqueueRun() error = %v", err)
+		}
+
+		expandingMetadata := json.RawMessage(
+			`{"note":"` + strings.Repeat("<", 11_000) +
+				`","secret":"compozy_claim_force-size-secret"}`,
+		)
+		if len(expandingMetadata) >= MaxMetadataBytes {
+			t.Fatalf("expanding metadata input = %d bytes, want below %d", len(expandingMetadata), MaxMetadataBytes)
+		}
+		_, err = manager.ForceFailRun(t.Context(), run.ID, ForceFailRun{
+			Reason:   "operator recovery",
+			Metadata: expandingMetadata,
+		}, actor)
+		if !errors.Is(err, ErrPayloadTooLarge) {
+			t.Fatalf("ForceFailRun(expanding metadata) error = %v, want %v", err, ErrPayloadTooLarge)
+		}
+		if got, want := store.runs[run.ID].Status.Normalize(), TaskRunStatusQueued; got != want {
+			t.Fatalf("stored run status = %q, want %q after rejected input", got, want)
+		}
+		events, listErr := store.ListTaskEvents(t.Context(), EventQuery{
+			TaskID:    taskRecord.ID,
+			RunID:     run.ID,
+			EventType: taskEventRunOperatorForcedFail,
+		})
+		if listErr != nil {
+			t.Fatalf("ListTaskEvents(force fail) error = %v", listErr)
+		}
+		if len(events) != 0 {
+			t.Fatalf("force-fail event count = %d, want 0 after rejected input", len(events))
+		}
+	})
+
+	t.Run("Should reject oversized force fail reason before mutating the run", func(t *testing.T) {
+		t.Parallel()
+
+		store := newInMemoryManagerStore()
+		manager := newTaskManagerForTest(t, store)
+		actor := validActorContext()
+		taskRecord, err := manager.CreateTask(t.Context(), CreateTask{
+			ProfileID: storepkg.DefaultProfileID,
+			Scope:     ScopeGlobal,
+			Title:     "Bounded force fail reason",
+		}, actor)
+		if err != nil {
+			t.Fatalf("CreateTask() error = %v", err)
+		}
+		run, err := manager.EnqueueRun(
+			t.Context(),
+			EnqueueRun{TaskID: taskRecord.ID},
+			actor,
+		)
+		if err != nil {
+			t.Fatalf("EnqueueRun() error = %v", err)
+		}
+
+		_, err = manager.ForceFailRun(t.Context(), run.ID, ForceFailRun{
+			Reason: strings.Repeat("x", MaxPayloadBytes),
+		}, actor)
+		if !errors.Is(err, ErrPayloadTooLarge) {
+			t.Fatalf("ForceFailRun(oversized reason) error = %v, want %v", err, ErrPayloadTooLarge)
+		}
+		if got, want := store.runs[run.ID].Status.Normalize(), TaskRunStatusQueued; got != want {
+			t.Fatalf("stored run status = %q, want %q after rejected reason", got, want)
+		}
+		events, listErr := store.ListTaskEvents(t.Context(), EventQuery{
+			TaskID:    taskRecord.ID,
+			RunID:     run.ID,
+			EventType: taskEventRunOperatorForcedFail,
+		})
+		if listErr != nil {
+			t.Fatalf("ListTaskEvents(force fail) error = %v", listErr)
+		}
+		if len(events) != 0 {
+			t.Fatalf("force-fail event count = %d, want 0 after rejected reason", len(events))
+		}
+	})
+
+	t.Run("Should retry failed run once and link previous run id", func(t *testing.T) {
+		t.Parallel()
+
+		const rawToken = "compozy_claim_retry-secret"
+		store := newInMemoryManagerStore()
+		enqueuedPayloads := make([]hookspkg.TaskRunEnqueuedPayload, 0)
+		manager := newTaskManagerForTestWithOptions(
+			t,
+			store,
+			WithTaskRunHooks(recordingTaskRunHooks{
+				enqueued: func(
+					_ context.Context,
+					payload hookspkg.TaskRunEnqueuedPayload,
+				) (hookspkg.TaskRunEnqueuedPayload, error) {
+					enqueuedPayloads = append(enqueuedPayloads, payload)
+					return payload, nil
+				},
+			}),
+		)
+		actor := validActorContext()
+		maxAttempts := 3
+		taskRecord, err := manager.CreateTask(t.Context(), CreateTask{
+			ProfileID:   storepkg.DefaultProfileID,
+			Scope:       ScopeGlobal,
+			Title:       "Retry failed",
+			MaxAttempts: &maxAttempts,
+		}, actor)
+		if err != nil {
+			t.Fatalf("CreateTask() error = %v", err)
+		}
+		run, err := manager.EnqueueRun(
+			t.Context(),
+			EnqueueRun{TaskID: taskRecord.ID},
+			actor,
+		)
+		if err != nil {
+			t.Fatalf("EnqueueRun() error = %v", err)
+		}
+		failed, err := manager.ForceFailRun(t.Context(), run.ID, ForceFailRun{
+			Reason: "operator recovery",
+		}, actor)
+		if err != nil {
+			t.Fatalf("ForceFailRun() error = %v", err)
+		}
+		enqueuedPayloads = enqueuedPayloads[:0]
+
+		retry, err := manager.RetryRun(t.Context(), failed.ID, RetryRunRequest{
+			Metadata: json.RawMessage(
+				`{"source":"operator","agent_name":"` + rawToken + `","workflow_id":"` + rawToken +
+					`","soul":{"snapshot_id":"` + rawToken + `","digest":"` + rawToken +
+					`"},"claim_token":"` + rawToken + `"}`,
+			),
+		}, actor)
+		if err != nil {
+			t.Fatalf("RetryRun() error = %v", err)
+		}
+		if retry.PreviousRun.ID != failed.ID {
+			t.Fatalf("RetryRun().PreviousRun.ID = %q, want %q", retry.PreviousRun.ID, failed.ID)
+		}
+		if retry.Run.PreviousRunID != failed.ID || retry.Run.Status != TaskRunStatusQueued {
+			t.Fatalf("RetryRun().Run = %#v, want queued run linked to previous", retry.Run)
+		}
+		if strings.Contains(string(retry.Run.Metadata), rawToken) ||
+			strings.Contains(string(retry.Run.Metadata), `"claim_token"`) {
+			t.Fatalf("RetryRun().Run.Metadata leaked raw bearer: %s", retry.Run.Metadata)
+		}
+		if !strings.Contains(string(retry.Run.Metadata), `"source":"operator"`) {
+			t.Fatalf("RetryRun().Run.Metadata = %s, want safe metadata preserved", retry.Run.Metadata)
+		}
+		if got, want := len(enqueuedPayloads), 1; got != want {
+			t.Fatalf("enqueued hook payload count = %d, want %d", got, want)
+		}
+		hookPayload, err := json.Marshal(enqueuedPayloads[0])
+		if err != nil {
+			t.Fatalf("json.Marshal(enqueued hook) error = %v", err)
+		}
+		if strings.Contains(string(hookPayload), rawToken) {
+			t.Fatalf("task.run_enqueued hook leaked raw bearer: %s", hookPayload)
+		}
+		assertTaskRunEnqueuedPayload(
+			t,
+			enqueuedPayloads[0],
+			store.tasks[taskRecord.ID],
+			retry.Run,
+			actor,
+		)
+		if _, err := manager.RetryRun(t.Context(), failed.ID, RetryRunRequest{}, actor); !errors.Is(
+			err,
+			ErrInvalidStatusTransition,
+		) {
+			t.Fatalf("RetryRun(duplicate) error = %v, want %v", err, ErrInvalidStatusTransition)
+		}
+		events, err := store.ListTaskEvents(t.Context(), EventQuery{
+			TaskID:    taskRecord.ID,
+			RunID:     retry.Run.ID,
+			EventType: taskEventRunOperatorRetry,
+		})
+		if err != nil {
+			t.Fatalf("ListTaskEvents(retry) error = %v", err)
+		}
+		if got, want := len(events), 1; got != want {
+			t.Fatalf("retry event count = %d, want %d", got, want)
+		}
+	})
+
+	t.Run(
+		"Should recover a needs_attention run and reject non-needs_attention sources",
+		func(t *testing.T) {
+			t.Parallel()
+
+			const rawToken = "compozy_claim_recover-secret"
+			store := newForceInputStore()
+			store.pendingCancelCounts["sess-recover"] = 3
+			enqueuedPayloads := make([]hookspkg.TaskRunEnqueuedPayload, 0)
+			manager := newTaskManagerForTestWithOptions(
+				t,
+				store,
+				WithTaskRunHooks(recordingTaskRunHooks{
+					enqueued: func(
+						_ context.Context,
+						payload hookspkg.TaskRunEnqueuedPayload,
+					) (hookspkg.TaskRunEnqueuedPayload, error) {
+						enqueuedPayloads = append(enqueuedPayloads, payload)
+						return payload, nil
+					},
+				}),
+			)
+			actor := validActorContext()
+			maxAttempts := 3
+			taskRecord, err := manager.CreateTask(t.Context(), CreateTask{
+				ProfileID:   storepkg.DefaultProfileID,
+				Scope:       ScopeGlobal,
+				Title:       "Recover needs_attention",
+				MaxAttempts: &maxAttempts,
+			}, actor)
+			if err != nil {
+				t.Fatalf("CreateTask() error = %v", err)
+			}
+			run, err := manager.EnqueueRun(
+				t.Context(),
+				EnqueueRun{TaskID: taskRecord.ID},
+				actor,
+			)
+			if err != nil {
+				t.Fatalf("EnqueueRun() error = %v", err)
+			}
+			if _, err := manager.RecoverRun(t.Context(), run.ID, RecoverRunRequest{}, actor); !errors.Is(
+				err,
+				ErrInvalidStatusTransition,
+			) {
+				t.Fatalf(
+					"RecoverRun(queued source) error = %v, want %v",
+					err,
+					ErrInvalidStatusTransition,
+				)
+			}
+			// A needs_attention run is produced by the scheduler convergence backstop; simulate it here.
+			escalated := store.runs[run.ID]
+			escalated.Status = TaskRunStatusNeedsAttention
+			escalated.SessionID = "sess-recover"
+			store.runs[run.ID] = escalated
+			enqueuedPayloads = enqueuedPayloads[:0]
+
+			recovered, err := manager.RecoverRun(t.Context(), run.ID, RecoverRunRequest{
+				Reason: "operator unblocked " + rawToken,
+				Metadata: json.RawMessage(
+					`{"source":"operator","agent_name":"` + rawToken + `","workflow_id":"` + rawToken +
+						`","claim_token":"` + rawToken + `"}`,
+				),
+			}, actor)
+			if err != nil {
+				t.Fatalf("RecoverRun() error = %v", err)
+			}
+			if recovered.PreviousRun.ID != run.ID ||
+				recovered.PreviousRun.Status != TaskRunStatusFailed {
+				t.Fatalf(
+					"RecoverRun().PreviousRun = %#v, want failed source",
+					recovered.PreviousRun,
+				)
+			}
+			if strings.Contains(recovered.PreviousRun.Error, rawToken) {
+				t.Fatalf("RecoverRun().PreviousRun.Error leaked raw bearer: %q", recovered.PreviousRun.Error)
+			}
+			if got, want := recovered.PreviousRun.Error, "operator unblocked compozy_claim_[REDACTED]"; got != want {
+				t.Fatalf("RecoverRun().PreviousRun.Error = %q, want %q", got, want)
+			}
+			if recovered.Run.PreviousRunID != run.ID ||
+				recovered.Run.Status != TaskRunStatusQueued {
+				t.Fatalf(
+					"RecoverRun().Run = %#v, want queued child linked to source",
+					recovered.Run,
+				)
+			}
+			if strings.Contains(string(recovered.Run.Metadata), rawToken) ||
+				strings.Contains(string(recovered.Run.Metadata), `"claim_token"`) {
+				t.Fatalf("RecoverRun().Run.Metadata leaked raw bearer: %s", recovered.Run.Metadata)
+			}
+			if !strings.Contains(string(recovered.Run.Metadata), `"source":"operator"`) {
+				t.Fatalf("RecoverRun().Run.Metadata = %s, want safe metadata preserved", recovered.Run.Metadata)
+			}
+			if recovered.Run.Attempt != run.Attempt+1 {
+				t.Fatalf(
+					"RecoverRun().Run.Attempt = %d, want %d",
+					recovered.Run.Attempt,
+					run.Attempt+1,
+				)
+			}
+			if got, want := store.advanceCalls, []string{"sess-recover"}; !slices.Equal(got, want) {
+				t.Fatalf("advanceCalls = %#v, want %#v", got, want)
+			}
+			if len(store.cancelCalls) != 1 ||
+				store.cancelCalls[0].SessionID != "sess-recover" ||
+				store.cancelCalls[0].Generation != 1 ||
+				store.cancelCalls[0].CanceledInputs != 3 {
+				t.Fatalf("cancelCalls = %#v, want recovered-session invalidation", store.cancelCalls)
+			}
+			if got, want := len(enqueuedPayloads), 1; got != want {
+				t.Fatalf("enqueued hook payload count = %d, want %d", got, want)
+			}
+			hookPayload, err := json.Marshal(enqueuedPayloads[0])
+			if err != nil {
+				t.Fatalf("json.Marshal(enqueued hook) error = %v", err)
+			}
+			if strings.Contains(string(hookPayload), rawToken) {
+				t.Fatalf("task.run_enqueued hook leaked raw bearer: %s", hookPayload)
+			}
+			assertTaskRunEnqueuedPayload(
+				t,
+				enqueuedPayloads[0],
+				store.tasks[taskRecord.ID],
+				recovered.Run,
+				actor,
+			)
+			events, err := store.ListTaskEvents(t.Context(), EventQuery{
+				TaskID:    taskRecord.ID,
+				RunID:     recovered.Run.ID,
+				EventType: taskEventRunRecoveredFromAttention,
+			})
+			if err != nil {
+				t.Fatalf("ListTaskEvents(recover) error = %v", err)
+			}
+			if got, want := len(events), 1; got != want {
+				t.Fatalf("recover event count = %d, want %d", got, want)
+			}
+			var payload recoveredFromAttentionPayload
+			if err := json.Unmarshal(events[0].Payload, &payload); err != nil {
+				t.Fatalf("json.Unmarshal(recover payload) error = %v", err)
+			}
+			if payload.PreviousStatus != TaskRunStatusNeedsAttention ||
+				payload.SourceRunID != run.ID ||
+				payload.SessionID != "sess-recover" ||
+				payload.QueueGeneration != 1 ||
+				payload.CanceledQueuedInputs != 3 {
+				t.Fatalf("recover payload = %#v, want previous needs_attention + source", payload)
+			}
+			if strings.Contains(string(events[0].Payload), rawToken) {
+				t.Fatalf("task.run_recovered_from_attention payload leaked raw bearer: %s", events[0].Payload)
+			}
+			if got, want := payload.Reason, "operator unblocked compozy_claim_[REDACTED]"; got != want {
+				t.Fatalf("recover payload Reason = %q, want %q", got, want)
+			}
+		},
+	)
+
+	t.Run(
+		"Should record a starved signal and mark a queued run needs_attention idempotently",
+		func(t *testing.T) {
+			t.Parallel()
+
+			store := newInMemoryManagerStore()
+			manager := newTaskManagerForTest(t, store)
+			actor := validActorContext()
+			taskRecord, err := manager.CreateTask(t.Context(), CreateTask{
+				ProfileID: storepkg.DefaultProfileID,
+				Scope:     ScopeGlobal,
+				Title:     "Starved",
+			}, actor)
+			if err != nil {
+				t.Fatalf("CreateTask() error = %v", err)
+			}
+			run, err := manager.EnqueueRun(
+				t.Context(),
+				EnqueueRun{TaskID: taskRecord.ID},
+				actor,
+			)
+			if err != nil {
+				t.Fatalf("EnqueueRun() error = %v", err)
+			}
+
+			err = manager.RecordRunStarved(
+				t.Context(),
+				run.ID,
+				run.QueuedAt,
+				3*time.Minute,
+				actor,
+			)
+			if err != nil {
+				t.Fatalf("RecordRunStarved() error = %v", err)
+			}
+			starvedEvents, err := store.ListTaskEvents(t.Context(), EventQuery{
+				TaskID:    taskRecord.ID,
+				RunID:     run.ID,
+				EventType: taskEventRunStarved,
+			})
+			if err != nil {
+				t.Fatalf("ListTaskEvents(starved) error = %v", err)
+			}
+			if got, want := len(starvedEvents), 1; got != want {
+				t.Fatalf("starved event count = %d, want %d", got, want)
+			}
+
+			marked, err := manager.MarkRunNeedsAttention(
+				t.Context(),
+				run.ID,
+				"no eligible worker after starvation budget",
+				actor,
+			)
+			if err != nil {
+				t.Fatalf("MarkRunNeedsAttention() error = %v", err)
+			}
+			if marked.Status.Normalize() != TaskRunStatusNeedsAttention {
+				t.Fatalf("MarkRunNeedsAttention().Status = %q, want needs_attention", marked.Status)
+			}
+			again, err := manager.MarkRunNeedsAttention(
+				t.Context(),
+				run.ID,
+				"second call",
+				actor,
+			)
+			if err != nil {
+				t.Fatalf("MarkRunNeedsAttention(idempotent) error = %v", err)
+			}
+			if again.Status.Normalize() != TaskRunStatusNeedsAttention {
+				t.Fatalf(
+					"idempotent MarkRunNeedsAttention().Status = %q, want needs_attention",
+					again.Status,
+				)
+			}
+			naEvents, err := store.ListTaskEvents(t.Context(), EventQuery{
+				TaskID:    taskRecord.ID,
+				RunID:     run.ID,
+				EventType: taskEventRunNeedsAttention,
+			})
+			if err != nil {
+				t.Fatalf("ListTaskEvents(needs_attention) error = %v", err)
+			}
+			if got, want := len(naEvents), 1; got != want {
+				t.Fatalf(
+					"needs_attention event count = %d, want %d (idempotent must not re-emit)",
+					got,
+					want,
+				)
+			}
+		},
+	)
+
+	t.Run("Should reject needs_attention without write authority", func(t *testing.T) {
+		t.Parallel()
+
+		store := newInMemoryManagerStore()
+		manager := newTaskManagerForTest(t, store)
+		writer := validActorContext()
+		taskRecord, err := manager.CreateTask(t.Context(), CreateTask{
+			ProfileID: storepkg.DefaultProfileID,
+			Scope:     ScopeGlobal,
+			Title:     "Read-only escalation",
+		}, writer)
+		if err != nil {
+			t.Fatalf("CreateTask() error = %v", err)
+		}
+		run, err := manager.EnqueueRun(
+			t.Context(),
+			EnqueueRun{TaskID: taskRecord.ID},
+			writer,
+		)
+		if err != nil {
+			t.Fatalf("EnqueueRun() error = %v", err)
+		}
+		reader := writer
+		reader.Authority.Write = false
+		reader.Authority.CreateGlobal = false
+		reader.Authority.CreateWorkspace = false
+
+		_, err = manager.MarkRunNeedsAttention(
+			t.Context(),
+			run.ID,
+			"reader cannot escalate",
+			reader,
+		)
+		if !errors.Is(err, ErrPermissionDenied) {
+			t.Fatalf("MarkRunNeedsAttention(read-only) error = %v, want %v", err, ErrPermissionDenied)
+		}
+		if got, want := store.runs[run.ID].Status.Normalize(), TaskRunStatusQueued; got != want {
+			t.Fatalf("stored run status = %q, want %q", got, want)
+		}
+		if got := countTaskEventsByType(store.events, taskEventRunNeedsAttention); got != 0 {
+			t.Fatalf("needs_attention events = %d, want 0", got)
+		}
+	})
+
+	t.Run("Should reject uppercase claim tokens in needs_attention diagnostics", func(t *testing.T) {
+		t.Parallel()
+
+		store := newInMemoryManagerStore()
+		manager := newTaskManagerForTest(t, store)
+		actor := validActorContext()
+		taskRecord, err := manager.CreateTask(t.Context(), CreateTask{
+			ProfileID: storepkg.DefaultProfileID,
+			Scope:     ScopeGlobal,
+			Title:     "Sensitive diagnostic",
+		}, actor)
+		if err != nil {
+			t.Fatalf("CreateTask() error = %v", err)
+		}
+		run, err := manager.EnqueueRun(
+			t.Context(),
+			EnqueueRun{TaskID: taskRecord.ID},
+			actor,
+		)
+		if err != nil {
+			t.Fatalf("EnqueueRun() error = %v", err)
+		}
+
+		_, err = manager.MarkRunNeedsAttention(
+			t.Context(),
+			run.ID,
+			"worker exposed COMPOZY_CLAIM_NEEDS_ATTENTION_SECRET",
+			actor,
+		)
+		if err == nil || !strings.Contains(err.Error(), "claim token") {
+			t.Fatalf("MarkRunNeedsAttention() error = %v, want claim token rejection", err)
+		}
+		if got, want := store.runs[run.ID].Status.Normalize(), TaskRunStatusQueued; got != want {
+			t.Fatalf("stored run status = %q, want %q", got, want)
+		}
+		events, listErr := store.ListTaskEvents(t.Context(), EventQuery{
+			TaskID:    taskRecord.ID,
+			RunID:     run.ID,
+			EventType: taskEventRunNeedsAttention,
+		})
+		if listErr != nil {
+			t.Fatalf("ListTaskEvents(needs_attention) error = %v", listErr)
+		}
+		if len(events) != 0 {
+			t.Fatalf("needs_attention event count = %d, want 0", len(events))
+		}
+	})
+
+	t.Run("Should reject oversized needs_attention audit payloads before mutating the run", func(t *testing.T) {
+		t.Parallel()
+
+		store := newInMemoryManagerStore()
+		manager := newTaskManagerForTest(t, store)
+		actor := validActorContext()
+		taskRecord, err := manager.CreateTask(t.Context(), CreateTask{
+			ProfileID: storepkg.DefaultProfileID,
+			Scope:     ScopeGlobal,
+			Title:     "Bounded needs attention diagnostic",
+		}, actor)
+		if err != nil {
+			t.Fatalf("CreateTask() error = %v", err)
+		}
+		run, err := manager.EnqueueRun(
+			t.Context(),
+			EnqueueRun{TaskID: taskRecord.ID},
+			actor,
+		)
+		if err != nil {
+			t.Fatalf("EnqueueRun() error = %v", err)
+		}
+
+		diagnostic := "worker output: " + strings.Repeat("<", 12*1024)
+		_, err = manager.MarkRunNeedsAttention(t.Context(), run.ID, diagnostic, actor)
+		if !errors.Is(err, ErrPayloadTooLarge) {
+			t.Fatalf(
+				"MarkRunNeedsAttention(oversized diagnostic) error = %v, want %v",
+				err,
+				ErrPayloadTooLarge,
+			)
+		}
+		if got, want := store.runs[run.ID].Status.Normalize(), TaskRunStatusQueued; got != want {
+			t.Fatalf("stored run status = %q, want %q after rejected diagnostic", got, want)
+		}
+		events, listErr := store.ListTaskEvents(t.Context(), EventQuery{
+			TaskID:    taskRecord.ID,
+			RunID:     run.ID,
+			EventType: taskEventRunNeedsAttention,
+		})
+		if listErr != nil {
+			t.Fatalf("ListTaskEvents(needs_attention) error = %v", listErr)
+		}
+		if len(events) != 0 {
+			t.Fatalf("needs_attention event count = %d, want 0 after rejected diagnostic", len(events))
+		}
+	})
+
+	t.Run("Should reject disabled agent force and rate limit noisy agents", func(t *testing.T) {
+		t.Parallel()
+
+		store := newInMemoryManagerStore()
+		disabledManager := newTaskManagerForTestWithOptions(
+			t,
+			store,
+			WithForceRecoveryOptions(ForceRecoveryOptions{AllowAgentForce: false}),
+		)
+		operator := validActorContext()
+		agent, err := DeriveUserSessionActorContextForOrigin(
+			"sess-force-agent",
+			storepkg.DefaultProfileID,
+			OriginKindAgentSession,
+			"",
+		)
+		if err != nil {
+			t.Fatalf("DeriveAgentSessionActorContext() error = %v", err)
+		}
+		taskRecord, err := disabledManager.CreateTask(t.Context(), CreateTask{
+			ProfileID: storepkg.DefaultProfileID,
+			Scope:     ScopeGlobal,
+			Title:     "Agent force disabled",
+		}, operator)
+		if err != nil {
+			t.Fatalf("CreateTask() error = %v", err)
+		}
+		run, err := disabledManager.EnqueueRun(
+			t.Context(),
+			EnqueueRun{TaskID: taskRecord.ID},
+			operator,
+		)
+		if err != nil {
+			t.Fatalf("EnqueueRun() error = %v", err)
+		}
+		if _, err := disabledManager.ForceFailRun(t.Context(), run.ID, ForceFailRun{
+			Reason: "agent blocked",
+		}, agent); !errors.Is(err, ErrForbiddenOperatorAction) {
+			t.Fatalf(
+				"ForceFailRun(agent disabled) error = %v, want %v",
+				err,
+				ErrForbiddenOperatorAction,
+			)
+		}
+
+		rateStore := newInMemoryManagerStore()
+		rateManager := newTaskManagerForTestWithOptions(
+			t,
+			rateStore,
+			WithForceRecoveryOptions(
+				ForceRecoveryOptions{AllowAgentForce: true, RateLimitPerMinute: 1},
+			),
+		)
+		rateTask, err := rateManager.CreateTask(t.Context(), CreateTask{
+			ProfileID: storepkg.DefaultProfileID,
+			Scope:     ScopeGlobal,
+			Title:     "Agent force rate",
+		}, operator)
+		if err != nil {
+			t.Fatalf("CreateTask(rate) error = %v", err)
+		}
+		rateRun, err := rateManager.EnqueueRun(
+			t.Context(),
+			EnqueueRun{TaskID: rateTask.ID},
+			operator,
+		)
+		if err != nil {
+			t.Fatalf("EnqueueRun(rate) error = %v", err)
+		}
+		if _, err := rateManager.ForceFailRun(t.Context(), rateRun.ID, ForceFailRun{
+			Reason: "first recovery",
+		}, agent); err != nil {
+			t.Fatalf("ForceFailRun(first) error = %v", err)
+		}
+		if _, err := rateManager.RetryRun(t.Context(), rateRun.ID, RetryRunRequest{}, agent); !errors.Is(
+			err,
+			ErrForceOpRateLimited,
+		) {
+			t.Fatalf("RetryRun(rate limited) error = %v, want %v", err, ErrForceOpRateLimited)
+		}
+	})
+}
+
+func TestManagerNonHumanIdempotencyAndExecutionGuards(t *testing.T) {
+	t.Parallel()
+
+	store := newInMemoryManagerStore()
+	manager := newTaskManagerForTest(t, store)
+	automationActor, err := DeriveAutomationActorContext("rule:nightly", "")
+	if err != nil {
+		t.Fatalf("DeriveAutomationActorContext() error = %v", err)
+	}
+
+	taskOne, err := manager.CreateTask(t.Context(), CreateTask{
+		ProfileID: storepkg.DefaultProfileID,
+		Scope:     ScopeGlobal,
+		Title:     "Idempotent task one",
+	}, automationActor)
+	if err != nil {
+		t.Fatalf("CreateTask(taskOne) error = %v", err)
+	}
+	taskTwo, err := manager.CreateTask(t.Context(), CreateTask{
+		ProfileID: storepkg.DefaultProfileID,
+		Scope:     ScopeGlobal,
+		Title:     "Idempotent task two",
+	}, automationActor)
+	if err != nil {
+		t.Fatalf("CreateTask(taskTwo) error = %v", err)
+	}
+
+	if _, err := manager.EnqueueRun(
+		t.Context(),
+		EnqueueRun{TaskID: taskOne.ID},
+		automationActor,
+	); !errors.Is(
+		err,
+		ErrValidation,
+	) {
+		t.Fatalf("EnqueueRun(no idempotency) error = %v, want %v", err, ErrValidation)
+	}
+
+	runOne, err := manager.EnqueueRun(t.Context(), EnqueueRun{
+		TaskID:         taskOne.ID,
+		IdempotencyKey: "idem-1",
+	}, automationActor)
+	if err != nil {
+		t.Fatalf("EnqueueRun(taskOne) error = %v", err)
+	}
+	runAgain, err := manager.EnqueueRun(t.Context(), EnqueueRun{
+		TaskID:         taskOne.ID,
+		IdempotencyKey: "idem-1",
+	}, automationActor)
+	if err != nil {
+		t.Fatalf("EnqueueRun(taskOne duplicate) error = %v", err)
+	}
+	if got, want := runAgain.ID, runOne.ID; got != want {
+		t.Fatalf("duplicate enqueue run id = %q, want %q", got, want)
+	}
+	if got, want := len(store.runs), 1; got != want {
+		t.Fatalf("len(store.runs) = %d, want %d", got, want)
+	}
+
+	if _, err := manager.EnqueueRun(t.Context(), EnqueueRun{
+		TaskID:         taskTwo.ID,
+		IdempotencyKey: "idem-1",
+	}, automationActor); !errors.Is(err, ErrValidation) {
+		t.Fatalf("EnqueueRun(taskTwo duplicate key) error = %v, want %v", err, ErrValidation)
+	}
+
+	claimedRun, err := admitRunDirectlyForTest(t.Context(), manager, runOne.ID, automationActor)
+	if err != nil {
+		t.Fatalf("claimExactRunForTest() error = %v", err)
+	}
+	if _, err := manager.StartRun(
+		t.Context(),
+		claimedRun.ID,
+		StartRun{},
+		automationActor,
+	); !errors.Is(
+		err,
+		ErrValidation,
+	) {
+		t.Fatalf("StartRun(no idempotency) error = %v, want %v", err, ErrValidation)
+	}
+	if _, err := manager.StartRun(t.Context(), claimedRun.ID, StartRun{
+		IdempotencyKey: "start-idem",
+	}, automationActor); !errors.Is(err, ErrValidation) {
+		t.Fatalf("StartRun(no session executor) error = %v, want %v", err, ErrValidation)
+	}
+}
+
+func TestManagerStartRunShouldExecuteCoordinatorInDaemonWithoutSession(t *testing.T) {
+	t.Parallel()
+
+	t.Run("Should fail closed when committed timers have no armer", func(t *testing.T) {
+		t.Parallel()
+
+		const timerKey = "loop.retry.run-1.1.fetch.0.a1.e1"
+		service := &Service{}
+		err := service.armCoordinatorTimers(t.Context(), []CoordinatorTimerSpec{{
+			LoopRunID: "run-1", Generation: 1, NodeID: "fetch", ItemIndex: 0,
+			Attempt: 1, IssuedEpoch: 1, FireAt: time.Now().UTC(), IdempotencyKey: timerKey,
+		}}, ActorContext{})
+		if !errors.Is(err, ErrValidation) || !strings.Contains(err.Error(), timerKey) {
+			t.Fatalf("armCoordinatorTimers() error = %v, want ErrValidation with timer key", err)
+		}
+	})
+
+	t.Run("Should execute coordinator in daemon without session", func(t *testing.T) {
+		t.Parallel()
+		testManagerStartRunShouldExecuteCoordinatorInDaemonWithoutSession(t, nil, nil, false)
+	})
+
+	t.Run("Should return the committed coordinator run with a post-commit wake error", func(t *testing.T) {
+		t.Parallel()
+		testManagerStartRunShouldExecuteCoordinatorInDaemonWithoutSession(
+			t,
+			errors.New("forced post-commit wake failure"),
+			nil,
+			false,
+		)
+	})
+
+	t.Run("Should dispatch terminal hooks after a publication failure", func(t *testing.T) {
+		t.Parallel()
+		testManagerStartRunShouldExecuteCoordinatorInDaemonWithoutSession(
+			t,
+			nil,
+			errors.New("forced coordinator publication failure"),
+			false,
+		)
+	})
+
+	t.Run("Should suppress post-commit effects when cancellation supersedes the plan", func(t *testing.T) {
+		t.Parallel()
+		testManagerStartRunShouldExecuteCoordinatorInDaemonWithoutSession(t, nil, nil, true)
+	})
+
+	t.Run("Should settle the running lease when the coordinator plan is invalid", func(t *testing.T) {
+		t.Parallel()
+
+		testManagerStartCoordinatorFailureSettlesLease(
+			t,
+			&recordingCoordinatorRunner{},
+			nil,
+			ErrValidation,
+		)
+	})
+
+	t.Run("Should settle the running lease when coordinator completion fails before commit", func(t *testing.T) {
+		t.Parallel()
+
+		completionErr := errors.New("forced coordinator completion failure")
+		testManagerStartCoordinatorFailureSettlesLease(
+			t,
+			&recordingCoordinatorRunner{plan: CoordinatorCompletionPlan{Yield: true}},
+			[]error{completionErr},
+			completionErr,
+		)
+	})
+
+	t.Run("Should settle the running lease when superseded reconciliation fails", func(t *testing.T) {
+		t.Parallel()
+
+		reconciliationErr := errors.New("forced superseded reconciliation failure")
+		testManagerStartCoordinatorFailureSettlesLease(
+			t,
+			&recordingCoordinatorRunner{plan: CoordinatorCompletionPlan{
+				Snapshot: GenerationSnapshot{LoopRunID: "loop-run-failure", Generation: 3},
+				Yield:    true,
+			}},
+			[]error{staleCoordinatorPlanTestError{}, reconciliationErr},
+			reconciliationErr,
+		)
+	})
+
+	t.Run("Should reconcile a superseded coordinator plan without failing the Loop", func(t *testing.T) {
+		t.Parallel()
+
+		store := newInMemoryManagerStore()
+		store.coordinatorPreCommitErrs = []error{staleCoordinatorPlanTestError{}}
+		completed, err := testManagerStartCoordinatorWithStore(
+			t,
+			store,
+			&recordingCoordinatorRunner{plan: CoordinatorCompletionPlan{
+				Snapshot: GenerationSnapshot{LoopRunID: "loop-run-superseded", Generation: 3},
+				Yield:    true,
+			}},
+			"superseded",
+		)
+		if err != nil {
+			t.Fatalf("StartRun(superseded coordinator) error = %v", err)
+		}
+		if got, want := completed.Status.Normalize(), TaskRunStatusCompleted; got != want {
+			t.Fatalf("StartRun(superseded coordinator).Status = %q, want %q", got, want)
+		}
+		if got, want := len(store.coordinatorCompletions), 2; got != want {
+			t.Fatalf("coordinator completion attempts = %d, want %d", got, want)
+		}
+		reconciliation := store.coordinatorCompletions[1].Plan
+		if !reconciliation.Yield || !reconciliation.GenerationInFlight ||
+			len(reconciliation.PostCommitWakes) != 1 ||
+			reconciliation.Snapshot.Generation != 3 {
+			t.Fatalf("superseded coordinator reconciliation = %#v", reconciliation)
+		}
+		events, err := store.ListTaskEvents(t.Context(), EventQuery{
+			RunID:     completed.ID,
+			EventType: taskWatchEventRunFailed,
+		})
+		if err != nil {
+			t.Fatalf("ListTaskEvents(run failed) error = %v", err)
+		}
+		if len(events) != 0 {
+			t.Fatalf("superseded coordinator failed events = %d, want 0", len(events))
+		}
+	})
+
+	t.Run("Should reserve every publication event ID before coordinator completion", func(t *testing.T) {
+		t.Parallel()
+
+		store := newInMemoryManagerStore()
+		now := time.Date(2026, 7, 4, 13, 0, 0, 0, time.UTC)
+		taskRecord := Task{
+			ID:             "task-loop-coordinator-entropy",
+			Scope:          ScopeGlobal,
+			Title:          "Loop coordinator entropy",
+			Priority:       PriorityMedium,
+			MaxAttempts:    DefaultTaskMaxAttempts,
+			Status:         TaskStatusReady,
+			ApprovalPolicy: ApprovalPolicyNone,
+			ApprovalState:  ApprovalStateNotRequired,
+			CreatedBy:      ActorIdentity{Kind: ActorKindDaemon, Ref: "loop"},
+			Origin:         Origin{Kind: OriginKindDaemon, Ref: "loop"},
+			CreatedAt:      now,
+			UpdatedAt:      now,
+		}
+		if err := store.CreateTask(t.Context(), taskRecord); err != nil {
+			t.Fatalf("CreateTask() error = %v", err)
+		}
+		run := Run{
+			ID:             "run-loop-coordinator-entropy",
+			TaskID:         taskRecord.ID,
+			RunKind:        RunKindCoordinator,
+			LoopRunID:      "loop-run-entropy",
+			Status:         TaskRunStatusQueued,
+			Attempt:        1,
+			IdempotencyKey: "coordinator:entropy",
+			Origin:         Origin{Kind: OriginKindDaemon, Ref: "loop"},
+			QueuedAt:       now,
+		}
+		if err := store.CreateTaskRun(t.Context(), run); err != nil {
+			t.Fatalf("CreateTaskRun() error = %v", err)
+		}
+		manager := newTaskManagerForTestWithOptions(
+			t,
+			store,
+			WithGenerationStateFinalizer(noopLoopFinalizer{}),
+			WithManagerNow(func() time.Time { return now }),
+		)
+		actor, err := DeriveDaemonActorContext("loop", "daemon.loop")
+		if err != nil {
+			t.Fatalf("DeriveDaemonActorContext() error = %v", err)
+		}
+		claim, err := manager.ClaimNextRun(t.Context(), ClaimCriteria{
+			Scope:            ScopeGlobal,
+			ClaimerSessionID: "daemon-loop",
+			ClaimedBy:        &ActorIdentity{Kind: ActorKindDaemon, Ref: "loop"},
+			LeaseDuration:    time.Minute,
+			Now:              now,
+		}, actor)
+		if err != nil {
+			t.Fatalf("ClaimNextRun() error = %v", err)
+		}
+		eventsBefore := len(store.events)
+		taskBefore := store.tasks[taskRecord.ID]
+		runBefore := store.runs[run.ID]
+		entropyErr := errors.New("second coordinator publication identity unavailable")
+		idCalls := 0
+		manager.newID = func(prefix string) (string, error) {
+			idCalls++
+			if idCalls == 2 {
+				return "", entropyErr
+			}
+			return fmt.Sprintf("%s-coordinator-entropy-%d", prefix, idCalls), nil
+		}
+
+		completed, err := manager.completeCoordinatorRun(
+			t.Context(),
+			claim.Run,
+			claim.ClaimToken,
+			CoordinatorCompletionPlan{NodeRuns: []EnqueueSpec{
+				{TaskID: "task-node-one", RunID: "run-node-one"},
+				{TaskID: "task-node-two", RunID: "run-node-two"},
+			}},
+			actor,
+		)
+		if !errors.Is(err, entropyErr) {
+			t.Fatalf("completeCoordinatorRun() error = %v, want errors.Is(entropyErr)", err)
+		}
+		if completed != nil {
+			t.Fatalf("completeCoordinatorRun() = %#v, want nil", completed)
+		}
+		if got, want := idCalls, 2; got != want {
+			t.Fatalf("ID generation calls = %d, want %d", got, want)
+		}
+		if got := len(store.events); got != eventsBefore {
+			t.Fatalf("event count after entropy failure = %d, want %d", got, eventsBefore)
+		}
+		if got := store.tasks[taskRecord.ID]; !reflect.DeepEqual(got, taskBefore) {
+			t.Fatalf("task after entropy failure = %#v, want %#v", got, taskBefore)
+		}
+		if got := store.runs[run.ID]; !reflect.DeepEqual(got, runBefore) {
+			t.Fatalf("run after entropy failure = %#v, want %#v", got, runBefore)
+		}
+		if store.coordinatorCompleted {
+			t.Fatal("coordinator completion reached the store after entropy failure")
+		}
+	})
+
+	t.Run("Should reserve an event ID for a possible concurrent-progress wake", func(t *testing.T) {
+		t.Parallel()
+
+		plan := CoordinatorCompletionPlan{
+			GenerationInFlight: true,
+			NodeRuns: []EnqueueSpec{
+				{TaskID: "task-node-one"},
+				{TaskID: "task-node-two"},
+			},
+		}
+
+		if got, want := coordinatorPublicationEventCount(plan), 3; got != want {
+			t.Fatalf("coordinatorPublicationEventCount() = %d, want %d", got, want)
+		}
+	})
+}
+
+func TestManagerCoordinatorTerminalValidatorShouldFailClosed(t *testing.T) {
+	t.Parallel()
+
+	t.Run("Should reject terminal status when validator is unset", func(t *testing.T) {
+		t.Parallel()
+
+		manager, err := NewManager(WithStore(newInMemoryManagerStore()))
+		if err != nil {
+			t.Fatalf("NewManager() error = %v", err)
+		}
+		plan := CoordinatorCompletionPlan{
+			Terminal: &CoordinatorTerminal{Status: "done"},
+		}
+
+		err = manager.validateCoordinatorPlan(plan, "coordinator_completion.plan")
+		if !errors.Is(err, ErrValidation) {
+			t.Fatalf("validateCoordinatorPlan() error = %v, want ErrValidation", err)
+		}
+		if !strings.Contains(err.Error(), "must be accepted by the coordinator owner") {
+			t.Fatalf("validateCoordinatorPlan() error = %v, want owner validator message", err)
+		}
+	})
+}
+
+func TestManagerCoordinatorTerminalValidatorShouldUseInjectedVocabulary(t *testing.T) {
+	t.Parallel()
+
+	manager, err := NewManager(
+		WithStore(newInMemoryManagerStore()),
+		WithCoordinatorTerminalStatusValidator(func(status string) bool {
+			switch strings.TrimSpace(status) {
+			case "watching", "needs-approval":
+				return true
+			default:
+				return false
+			}
+		}),
+	)
+	if err != nil {
+		t.Fatalf("NewManager() error = %v", err)
+	}
+
+	tests := []struct {
+		name    string
+		status  string
+		wantErr bool
+	}{
+		{name: "Should accept watching", status: "watching"},
+		{name: "Should accept needs approval", status: "needs-approval"},
+		{name: "Should reject status outside injected set", status: "done", wantErr: true},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			plan := CoordinatorCompletionPlan{
+				Terminal: &CoordinatorTerminal{Status: tc.status},
+			}
+			err := manager.validateCoordinatorPlan(plan, "coordinator_completion.plan")
+			if tc.wantErr {
+				if !errors.Is(err, ErrValidation) {
+					t.Fatalf("validateCoordinatorPlan() error = %v, want ErrValidation", err)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("validateCoordinatorPlan() error = %v", err)
+			}
+		})
+	}
+}
+
+func testManagerStartRunShouldExecuteCoordinatorInDaemonWithoutSession(
+	t *testing.T,
+	postCommitErr error,
+	publicationErr error,
+	planSuperseded bool,
+) {
+	t.Helper()
+
+	store := newInMemoryManagerStore()
+	store.coordinatorCompletionErr = postCommitErr
+	store.coordinatorPublicationErr = publicationErr
+	store.coordinatorPlanSuperseded = planSuperseded
+	now := time.Date(2026, 7, 4, 12, 0, 0, 0, time.UTC)
+	taskRecord := Task{
+		ID:             "task-loop-coordinator",
+		Scope:          ScopeGlobal,
+		Title:          "Loop coordinator",
+		Priority:       PriorityMedium,
+		MaxAttempts:    DefaultTaskMaxAttempts,
+		Status:         TaskStatusReady,
+		ApprovalPolicy: ApprovalPolicyNone,
+		ApprovalState:  ApprovalStateNotRequired,
+		CreatedBy:      ActorIdentity{Kind: ActorKindDaemon, Ref: "loop"},
+		Origin:         Origin{Kind: OriginKindDaemon, Ref: "loop"},
+		CreatedAt:      now,
+		UpdatedAt:      now,
+	}
+	if err := store.CreateTask(t.Context(), taskRecord); err != nil {
+		t.Fatalf("CreateTask() error = %v", err)
+	}
+	run := Run{
+		ID:             "run-loop-coordinator",
+		TaskID:         taskRecord.ID,
+		RunKind:        RunKindCoordinator,
+		LoopRunID:      "loop-run-1",
+		Status:         TaskRunStatusQueued,
+		Attempt:        1,
+		IdempotencyKey: "coordinator:test",
+		Origin:         Origin{Kind: OriginKindDaemon, Ref: "loop"},
+		QueuedAt:       now,
+	}
+	if err := store.CreateTaskRun(t.Context(), run); err != nil {
+		t.Fatalf("CreateTaskRun() error = %v", err)
+	}
+	sessionExecutor := &forbiddenSessionExecutor{}
+	runner := &recordingCoordinatorRunner{plan: CoordinatorCompletionPlan{
+		ParentCloses: []CoordinatorParentCloseSpec{{
+			ParentLoopRunID: "loop-run-1", ChildLoopRunID: "child-loop-run-1",
+			Policy: "cancel", ParentStatus: "no-op",
+		}},
+		Snapshot: GenerationSnapshot{LoopRunID: "loop-run-1", Generation: 1},
+		PostCommitTimers: []CoordinatorTimerSpec{{
+			LoopRunID: "loop-run-1", Generation: 1, NodeID: "node-1", Attempt: 1,
+			IssuedEpoch: 1, FireAt: now.Add(time.Minute), IdempotencyKey: "timer-1",
+		}},
+		Terminal: &CoordinatorTerminal{
+			Status: "no-op",
+			Cause:  "contract",
+		},
+	}}
+	var dependentID string
+	completedHookCalls := 0
+	terminalHookCalls := 0
+	postCommitHandler := &recordingCoordinatorPostCommitHandler{}
+	timerArmer := &recordingCoordinatorTimerArmer{}
+	manager, err := NewManager(
+		WithStore(store),
+		WithSessionExecutor(sessionExecutor),
+		WithCoordinatorRunner(runner),
+		WithCoordinatorPostCommitHandler(postCommitHandler),
+		WithCoordinatorTimerArmer(timerArmer),
+		WithGenerationStateFinalizer(noopLoopFinalizer{}),
+		WithCoordinatorTerminalStatusValidator(testCoordinatorTerminalStatusValidator),
+		WithCoordinatorTerminalHookStatusValidator(testCoordinatorTerminalHookStatusValidator),
+		WithTaskRunHooks(recordingTaskRunHooks{
+			enqueued: func(_ context.Context, payload hookspkg.TaskRunEnqueuedPayload) (hookspkg.TaskRunEnqueuedPayload, error) {
+				if payload.TaskID == dependentID && (completedHookCalls != 1 || terminalHookCalls != 1) {
+					t.Error("dependent enqueue preceded coordinator completion notifications")
+				}
+				return payload, nil
+			},
+			completed: func(
+				_ context.Context,
+				payload hookspkg.TaskRunCompletedPayload,
+			) (hookspkg.TaskRunCompletedPayload, error) {
+				completedHookCalls++
+				return payload, nil
+			},
+			loopTerminal: func(
+				_ context.Context,
+				payload hookspkg.LoopTerminalPayload,
+			) (hookspkg.LoopTerminalPayload, error) {
+				terminalHookCalls++
+				return payload, nil
+			},
+		}),
+		WithManagerNow(func() time.Time { return now }),
+	)
+	if err != nil {
+		t.Fatalf("NewManager() error = %v", err)
+	}
+	actor, err := DeriveDaemonActorContext("loop", "daemon.loop")
+	if err != nil {
+		t.Fatalf("DeriveDaemonActorContext() error = %v", err)
+	}
+	dependent, err := manager.CreateTask(t.Context(), CreateTask{
+		ProfileID:          storepkg.DefaultProfileID,
+		Scope:              ScopeGlobal,
+		Title:              "Coordinator dependent",
+		AutoEnqueueOnReady: true,
+	}, actor)
+	if err != nil {
+		t.Fatalf("CreateTask(dependent) error = %v", err)
+	}
+	dependentID = dependent.ID
+	if err := manager.AddDependency(t.Context(), AddDependency{
+		TaskID: dependent.ID, DependsOnTaskID: taskRecord.ID, Kind: DependencyKindBlocks,
+	}, actor); err != nil {
+		t.Fatalf("AddDependency(coordinator) error = %v", err)
+	}
+	claim, err := manager.ClaimNextRun(t.Context(), ClaimCriteria{
+		Scope:            ScopeGlobal,
+		ClaimerSessionID: "daemon-loop",
+		ClaimedBy:        &ActorIdentity{Kind: ActorKindDaemon, Ref: "loop"},
+		LeaseDuration:    time.Minute,
+		Now:              now,
+	}, actor)
+	if err != nil {
+		t.Fatalf("ClaimNextRun() error = %v", err)
+	}
+
+	started, err := manager.StartRun(t.Context(), claim.Run.ID, StartRun{
+		ClaimToken:     claim.ClaimToken,
+		IdempotencyKey: claim.Run.IdempotencyKey,
+	}, actor)
+	if postCommitErr == nil && publicationErr == nil && err != nil {
+		t.Fatalf("StartRun(coordinator) error = %v", err)
+	}
+	if postCommitErr != nil && !errors.Is(err, postCommitErr) {
+		t.Fatalf("StartRun(coordinator) error = %v, want %v", err, postCommitErr)
+	}
+	if publicationErr != nil && !errors.Is(err, publicationErr) {
+		t.Fatalf("StartRun(coordinator) error = %v, want %v", err, publicationErr)
+	}
+	if started == nil {
+		t.Fatal("StartRun(coordinator) run = nil, want committed run")
+	}
+	if started.Status != TaskRunStatusCompleted {
+		t.Fatalf("StartRun(coordinator).Status = %q, want %q", started.Status, TaskRunStatusCompleted)
+	}
+	if got, want := string(started.ResultValue()), string(CoordinatorCompletedRunResult()); got != want {
+		t.Fatalf(
+			"StartRun(coordinator).Result = %s, want %s",
+			started.ResultValue(),
+			CoordinatorCompletedRunResult(),
+		)
+	}
+	if postCommitErr == nil && publicationErr == nil {
+		completedEvents, eventErr := store.ListTaskEvents(t.Context(), EventQuery{
+			TaskID:    taskRecord.ID,
+			RunID:     started.ID,
+			EventType: taskEventRunCompleted,
+		})
+		if eventErr != nil {
+			t.Fatalf("ListTaskEvents(completed) error = %v", eventErr)
+		}
+		if got, want := len(completedEvents), 1; got != want {
+			t.Fatalf("completed event count = %d, want %d", got, want)
+		}
+		var payload completedRunPayload
+		if err := json.Unmarshal(completedEvents[0].Payload, &payload); err != nil {
+			t.Fatalf("json.Unmarshal(completed event payload) error = %v", err)
+		}
+		if got, want := string(payload.Result), string(CoordinatorCompletedRunResult()); got != want {
+			t.Fatalf("completed event result = %s, want %s", payload.Result, CoordinatorCompletedRunResult())
+		}
+	}
+	if publicationErr == nil {
+		runs, err := store.ListTaskRuns(t.Context(), RunQuery{TaskID: dependent.ID})
+		if err != nil {
+			t.Fatalf("ListTaskRuns(dependent) error = %v", err)
+		}
+		if len(runs) != 1 {
+			t.Fatalf("coordinator dependent runs = %d, want 1", len(runs))
+		}
+		if got, want := runs[0].Status, TaskRunStatusQueued; got != want {
+			t.Fatalf("dependent run status = %q, want %q", got, want)
+		}
+	}
+	if sessionExecutor.startCalls != 0 {
+		t.Fatalf("StartTaskSession calls = %d, want 0", sessionExecutor.startCalls)
+	}
+	if got, want := len(runner.calls), 1; got != want {
+		t.Fatalf("CoordinatorRunner calls = %d, want %d", got, want)
+	}
+	if got, want := string(runner.calls[0]), claim.Run.ID; got != want {
+		t.Fatalf("CoordinatorRunner taskRunID = %q, want %q", got, want)
+	}
+	wantPostCommitCalls := 1
+	if planSuperseded {
+		wantPostCommitCalls = 0
+	}
+	if got := len(postCommitHandler.calls); got != wantPostCommitCalls {
+		t.Fatalf("coordinator post-commit calls = %d, want %d", got, wantPostCommitCalls)
+	}
+	if got := len(timerArmer.timers); got != wantPostCommitCalls {
+		t.Fatalf("coordinator timer calls = %d, want %d", got, wantPostCommitCalls)
+	}
+	if completedHookCalls != 1 {
+		t.Fatalf("task.run.completed hooks = %d, want 1", completedHookCalls)
+	}
+	if terminalHookCalls != 1 {
+		t.Fatalf("loop.terminal hooks = %d, want 1", terminalHookCalls)
+	}
+}
+
+func testManagerStartCoordinatorFailureSettlesLease(
+	t *testing.T,
+	runner *recordingCoordinatorRunner,
+	completionErrs []error,
+	wantErr error,
+) {
+	t.Helper()
+
+	store := newInMemoryManagerStore()
+	store.coordinatorPreCommitErrs = completionErrs
+	failed, err := testManagerStartCoordinatorWithStore(t, store, runner, "failure")
+	if !errors.Is(err, wantErr) {
+		t.Fatalf("StartRun(coordinator failure) error = %v, want errors.Is(%v)", err, wantErr)
+	}
+	if got, want := failed.Status.Normalize(), TaskRunStatusFailed; got != want {
+		t.Fatalf("StartRun(coordinator failure).Status = %q, want %q", got, want)
+	}
+	stored := store.runs[failed.ID]
+	if got, want := stored.Status.Normalize(), TaskRunStatusFailed; got != want {
+		t.Fatalf("stored coordinator status = %q, want %q", got, want)
+	}
+	if !stored.LeaseUntil.IsZero() {
+		t.Fatalf("stored coordinator lease_until = %s, want zero", stored.LeaseUntil)
+	}
+	if _, active := store.claimTokens[failed.ID]; active {
+		t.Fatal("stored coordinator claim token remains active after failure")
+	}
+	events, eventErr := store.ListTaskEvents(t.Context(), EventQuery{
+		RunID:     failed.ID,
+		EventType: taskWatchEventRunFailed,
+	})
+	if eventErr != nil {
+		t.Fatalf("ListTaskEvents(run failed) error = %v", eventErr)
+	}
+	if got, want := len(events), 1; got != want {
+		t.Fatalf("run failed event count = %d, want %d", got, want)
+	}
+}
+
+type staleCoordinatorPlanTestError struct{}
+
+func (staleCoordinatorPlanTestError) Error() string {
+	return "forced superseded coordinator plan"
+}
+
+func (staleCoordinatorPlanTestError) CoordinatorPlanSuperseded() {}
+
+func testManagerStartCoordinatorWithStore(
+	t *testing.T,
+	store *inMemoryManagerStore,
+	runner *recordingCoordinatorRunner,
+	suffix string,
+) (*Run, error) {
+	t.Helper()
+
+	ctx := t.Context()
+	now := time.Date(2026, 7, 4, 12, 30, 0, 0, time.UTC)
+	taskRecord := Task{
+		ID:             "task-loop-coordinator-" + suffix,
+		Scope:          ScopeGlobal,
+		Title:          "Loop coordinator failure",
+		Priority:       PriorityMedium,
+		MaxAttempts:    DefaultTaskMaxAttempts,
+		Status:         TaskStatusReady,
+		ApprovalPolicy: ApprovalPolicyNone,
+		ApprovalState:  ApprovalStateNotRequired,
+		CreatedBy:      ActorIdentity{Kind: ActorKindDaemon, Ref: "loop"},
+		Origin:         Origin{Kind: OriginKindDaemon, Ref: "loop"},
+		CreatedAt:      now,
+		UpdatedAt:      now,
+	}
+	if err := store.CreateTask(ctx, taskRecord); err != nil {
+		t.Fatalf("CreateTask() error = %v", err)
+	}
+	run := Run{
+		ID:             "run-loop-coordinator-" + suffix,
+		TaskID:         taskRecord.ID,
+		RunKind:        RunKindCoordinator,
+		LoopRunID:      "loop-run-" + suffix,
+		Status:         TaskRunStatusQueued,
+		Attempt:        1,
+		IdempotencyKey: "coordinator:" + suffix,
+		Origin:         Origin{Kind: OriginKindDaemon, Ref: "loop"},
+		QueuedAt:       now,
+	}
+	if err := store.CreateTaskRun(ctx, run); err != nil {
+		t.Fatalf("CreateTaskRun() error = %v", err)
+	}
+	manager := newTaskManagerForTestWithOptions(
+		t,
+		store,
+		WithCoordinatorRunner(runner),
+		WithGenerationStateFinalizer(noopLoopFinalizer{}),
+		WithManagerNow(func() time.Time { return now }),
+	)
+	actor, err := DeriveDaemonActorContext("loop", "daemon.loop")
+	if err != nil {
+		t.Fatalf("DeriveDaemonActorContext() error = %v", err)
+	}
+	claim, err := manager.ClaimNextRun(ctx, ClaimCriteria{
+		Scope:            ScopeGlobal,
+		ClaimerSessionID: "daemon-loop",
+		ClaimedBy:        &ActorIdentity{Kind: ActorKindDaemon, Ref: "loop"},
+		LeaseDuration:    time.Minute,
+		Now:              now,
+	}, actor)
+	if err != nil {
+		t.Fatalf("ClaimNextRun() error = %v", err)
+	}
+
+	result, err := manager.StartRun(ctx, claim.Run.ID, StartRun{
+		ClaimToken:     claim.ClaimToken,
+		IdempotencyKey: claim.Run.IdempotencyKey,
+	}, actor)
+	if result == nil {
+		t.Fatalf("StartRun(coordinator %s) run = nil", suffix)
+	}
+	return result, err
+}
+
+func TestManagerStartRunShouldRejectCoordinatorClaimTokenMismatch(t *testing.T) {
+	t.Parallel()
+
+	t.Run("Should reject coordinator claim token mismatch before runner starts", func(t *testing.T) {
+		t.Parallel()
+
+		store := newInMemoryManagerStore()
+		now := time.Date(2026, 7, 4, 12, 0, 0, 0, time.UTC)
+		taskRecord := Task{
+			ID:             "task-loop-coordinator-mismatch",
+			Scope:          ScopeGlobal,
+			Title:          "Loop coordinator",
+			Priority:       PriorityMedium,
+			MaxAttempts:    DefaultTaskMaxAttempts,
+			Status:         TaskStatusReady,
+			ApprovalPolicy: ApprovalPolicyNone,
+			ApprovalState:  ApprovalStateNotRequired,
+			CreatedBy:      ActorIdentity{Kind: ActorKindDaemon, Ref: "loop"},
+			Origin:         Origin{Kind: OriginKindDaemon, Ref: "loop"},
+			CreatedAt:      now,
+			UpdatedAt:      now,
+		}
+		if err := store.CreateTask(t.Context(), taskRecord); err != nil {
+			t.Fatalf("CreateTask() error = %v", err)
+		}
+		run := Run{
+			ID:             "run-loop-coordinator-mismatch",
+			TaskID:         taskRecord.ID,
+			RunKind:        RunKindCoordinator,
+			LoopRunID:      "loop-run-mismatch",
+			Status:         TaskRunStatusQueued,
+			Attempt:        1,
+			IdempotencyKey: "coordinator:mismatch",
+			Origin:         Origin{Kind: OriginKindDaemon, Ref: "loop"},
+			QueuedAt:       now,
+		}
+		if err := store.CreateTaskRun(t.Context(), run); err != nil {
+			t.Fatalf("CreateTaskRun() error = %v", err)
+		}
+		runner := &recordingCoordinatorRunner{plan: CoordinatorCompletionPlan{
+			Snapshot: GenerationSnapshot{LoopRunID: "loop-run-mismatch", Generation: 1},
+			Terminal: &CoordinatorTerminal{
+				Status: "no-op",
+				Cause:  "contract",
+			},
+		}}
+		manager, err := NewManager(
+			WithStore(store),
+			WithSessionExecutor(&forbiddenSessionExecutor{}),
+			WithCoordinatorRunner(runner),
+			WithGenerationStateFinalizer(noopLoopFinalizer{}),
+			WithCoordinatorTerminalStatusValidator(testCoordinatorTerminalStatusValidator),
+			WithCoordinatorTerminalHookStatusValidator(testCoordinatorTerminalHookStatusValidator),
+			WithManagerNow(func() time.Time { return now }),
+		)
+		if err != nil {
+			t.Fatalf("NewManager() error = %v", err)
+		}
+		actor, err := DeriveDaemonActorContext("loop", "daemon.loop")
+		if err != nil {
+			t.Fatalf("DeriveDaemonActorContext() error = %v", err)
+		}
+		claim, err := manager.ClaimNextRun(t.Context(), ClaimCriteria{
+			Scope:            ScopeGlobal,
+			ClaimerSessionID: "daemon-loop",
+			ClaimedBy:        &ActorIdentity{Kind: ActorKindDaemon, Ref: "loop"},
+			LeaseDuration:    time.Minute,
+			Now:              now,
+		}, actor)
+		if err != nil {
+			t.Fatalf("ClaimNextRun() error = %v", err)
+		}
+
+		started, err := manager.StartRun(t.Context(), claim.Run.ID, StartRun{
+			ClaimToken:     "wrong-token",
+			IdempotencyKey: claim.Run.IdempotencyKey,
+		}, actor)
+		if !errors.Is(err, ErrInvalidClaimToken) {
+			t.Fatalf("StartRun(coordinator token mismatch) error = %v, want %v", err, ErrInvalidClaimToken)
+		}
+		if started != nil {
+			t.Fatalf("StartRun(coordinator token mismatch) returned run = %#v, want nil", started)
+		}
+		if got := len(runner.calls); got != 0 {
+			t.Fatalf("CoordinatorRunner calls = %d, want 0", got)
+		}
+		storedRun, err := store.GetTaskRun(t.Context(), claim.Run.ID)
+		if err != nil {
+			t.Fatalf("GetTaskRun() error = %v", err)
+		}
+		if got, want := storedRun.Status, TaskRunStatusClaimed; got != want {
+			t.Fatalf("stored run status = %q, want %q", got, want)
+		}
+	})
+}
+
+func TestManagerEnqueueRunPreservesMetadataAcrossIdempotentDuplicates(t *testing.T) {
+	t.Parallel()
+
+	t.Run("Should preserve metadata across idempotent duplicates", func(t *testing.T) {
+		t.Parallel()
+
+		store := newInMemoryManagerStore()
+		manager := newTaskManagerForTest(t, store)
+		actor, err := DeriveAutomationActorContext(
+			"rule:harness-detached",
+			"daemon.harness.detached",
+		)
+		if err != nil {
+			t.Fatalf("DeriveAutomationActorContext() error = %v", err)
+		}
+
+		taskRecord, err := manager.CreateTask(t.Context(), CreateTask{
+			ProfileID: storepkg.DefaultProfileID,
+			Scope:     ScopeGlobal,
+			Title:     "Detached metadata task",
+		}, actor)
+		if err != nil {
+			t.Fatalf("CreateTask() error = %v", err)
+		}
+
+		metadata := json.RawMessage(
+			`{"schema":"compozy.harness.detached.v1","owner_session_id":"sess-owner","wake_target":{"session_id":"sess-wake"}}`,
+		)
+		firstRun, err := manager.EnqueueRun(t.Context(), EnqueueRun{
+			TaskID:         taskRecord.ID,
+			IdempotencyKey: "detached-metadata-1",
+			Metadata:       metadata,
+		}, actor)
+		if err != nil {
+			t.Fatalf("EnqueueRun(first) error = %v", err)
+		}
+		if got, want := string(firstRun.Metadata), string(metadata); got != want {
+			t.Fatalf("firstRun.Metadata = %s, want %s", got, want)
+		}
+
+		storedRun, err := store.GetTaskRun(t.Context(), firstRun.ID)
+		if err != nil {
+			t.Fatalf("GetTaskRun() error = %v", err)
+		}
+		if got, want := string(storedRun.Metadata), string(metadata); got != want {
+			t.Fatalf("storedRun.Metadata = %s, want %s", got, want)
+		}
+
+		duplicateRun, err := manager.EnqueueRun(t.Context(), EnqueueRun{
+			TaskID:         taskRecord.ID,
+			IdempotencyKey: "detached-metadata-1",
+			Metadata:       metadata,
+		}, actor)
+		if err != nil {
+			t.Fatalf("EnqueueRun(duplicate) error = %v", err)
+		}
+		if got, want := duplicateRun.ID, firstRun.ID; got != want {
+			t.Fatalf("duplicateRun.ID = %q, want %q", got, want)
+		}
+		if got, want := string(duplicateRun.Metadata), string(metadata); got != want {
+			t.Fatalf("duplicateRun.Metadata = %s, want %s", got, want)
+		}
+		if got, want := len(store.runs), 1; got != want {
+			t.Fatalf("len(store.runs) = %d, want %d", got, want)
+		}
+
+		conflictingMetadata := json.RawMessage(
+			`{"schema":"compozy.harness.detached.v1","owner_session_id":"sess-other","wake_target":{"session_id":"sess-other","channel":"ops"}}`,
+		)
+		conflictingDuplicate, err := manager.EnqueueRun(t.Context(), EnqueueRun{
+			TaskID:         taskRecord.ID,
+			IdempotencyKey: "detached-metadata-1",
+			Metadata:       conflictingMetadata,
+		}, actor)
+		if err != nil {
+			t.Fatalf("EnqueueRun(conflicting duplicate) error = %v", err)
+		}
+		if got, want := conflictingDuplicate.ID, firstRun.ID; got != want {
+			t.Fatalf("conflictingDuplicate.ID = %q, want %q", got, want)
+		}
+		if got, want := string(conflictingDuplicate.Metadata), string(metadata); got != want {
+			t.Fatalf("conflictingDuplicate.Metadata = %s, want original %s", got, want)
+		}
+
+		storedRun, err = store.GetTaskRun(t.Context(), firstRun.ID)
+		if err != nil {
+			t.Fatalf("GetTaskRun(conflicting duplicate) error = %v", err)
+		}
+		if got, want := string(storedRun.Metadata), string(metadata); got != want {
+			t.Fatalf(
+				"storedRun.Metadata after conflicting duplicate = %s, want original %s",
+				got,
+				want,
+			)
+		}
+	})
+}
+
+func TestManagerRecordTaskEventPostCommitNotifications(t *testing.T) {
+	t.Parallel()
+
+	t.Run("Should detach post-commit notifications from caller context", func(t *testing.T) {
+		t.Parallel()
+
+		store := &contextSensitiveEventStore{inMemoryManagerStore: newInMemoryManagerStore()}
+		observer := &recordingTaskEventObserver{}
+		manager := newTaskManagerForTestWithOptions(t, store, WithEventObserver(observer))
+		actor := validActorContext()
+
+		taskRecord, err := manager.CreateTask(t.Context(), CreateTask{
+			ProfileID: storepkg.DefaultProfileID,
+			Scope:     ScopeGlobal,
+			Title:     "Detached post-commit notifications",
+		}, actor)
+		if err != nil {
+			t.Fatalf("CreateTask() error = %v", err)
+		}
+		observer.records = nil
+		store.getTaskEventRecordCanceled = nil
+		store.getTaskEventRecordDeadline = nil
+
+		streamCtx := t.Context()
+
+		stream, err := manager.Stream(
+			streamCtx,
+			taskRecord.ID,
+			StreamQuery{AfterSequence: 1},
+			actor,
+		)
+		if err != nil {
+			t.Fatalf("Stream() error = %v", err)
+		}
+
+		canceledCtx, cancel := context.WithCancel(t.Context())
+		cancel()
+
+		if err := manager.recordTaskEvent(
+			canceledCtx,
+			taskRecord.ID,
+			"",
+			taskEventUpdated,
+			actor,
+			map[string]any{"source": "post-commit"},
+		); err != nil {
+			t.Fatalf("recordTaskEvent() error = %v", err)
+		}
+
+		live := awaitTaskStreamEvent(t, stream)
+		if got, want := live.Type, taskEventUpdated; got != want {
+			t.Fatalf("live.Type = %q, want %q", got, want)
+		}
+		if got, want := live.Timeline.EventID, "evt-test-3"; got != want {
+			t.Fatalf("live.Timeline.EventID = %q, want %q", got, want)
+		}
+		if got, want := len(observer.records), 1; got != want {
+			t.Fatalf("len(observer.records) = %d, want %d", got, want)
+		}
+		if got, want := observer.records[0].Event.EventType, taskEventUpdated; got != want {
+			t.Fatalf("observer.records[0].Event.EventType = %q, want %q", got, want)
+		}
+		if got, want := len(store.getTaskEventRecordCanceled), 1; got != want {
+			t.Fatalf("len(store.getTaskEventRecordCanceled) = %d, want %d", got, want)
+		}
+		if store.getTaskEventRecordCanceled[0] {
+			t.Fatal(
+				"GetTaskEventRecord() observed a canceled context, want detached post-commit context",
+			)
+		}
+		if got, want := store.getTaskEventRecordDeadline, []bool{true}; !slices.Equal(got, want) {
+			t.Fatalf("GetTaskEventRecord() deadlines = %v, want %v", got, want)
+		}
+	})
+
+	t.Run("Should continue live fanout when the observer panics", func(t *testing.T) {
+		t.Parallel()
+
+		store := newInMemoryManagerStore()
+		manager := newTaskManagerForTestWithOptions(
+			t,
+			store,
+			WithEventObserver(&panickingTaskEventObserver{panicValue: "observer boom"}),
+		)
+		actor := validActorContext()
+
+		taskRecord, err := manager.CreateTask(t.Context(), CreateTask{
+			ProfileID: storepkg.DefaultProfileID,
+			Scope:     ScopeGlobal,
+			Title:     "Observer panic notifications",
+		}, actor)
+		if err != nil {
+			t.Fatalf("CreateTask() error = %v", err)
+		}
+
+		stream, err := manager.Stream(
+			t.Context(),
+			taskRecord.ID,
+			StreamQuery{AfterSequence: 1},
+			actor,
+		)
+		if err != nil {
+			t.Fatalf("Stream() error = %v", err)
+		}
+
+		func() {
+			defer func() {
+				if recovered := recover(); recovered != nil {
+					t.Fatalf(
+						"recordTaskEvent() panic = %v, want recovered observer panic",
+						recovered,
+					)
+				}
+			}()
+
+			if err := manager.recordTaskEvent(
+				t.Context(),
+				taskRecord.ID,
+				"",
+				taskEventUpdated,
+				actor,
+				map[string]any{"source": "observer-panic"},
+			); err != nil {
+				t.Fatalf("recordTaskEvent() error = %v", err)
+			}
+		}()
+
+		live := awaitTaskStreamEvent(t, stream)
+		if got, want := live.Type, taskEventUpdated; got != want {
+			t.Fatalf("live.Type = %q, want %q", got, want)
+		}
+		if got, want := live.Timeline.EventID, "evt-test-3"; got != want {
+			t.Fatalf("live.Timeline.EventID = %q, want %q", got, want)
+		}
+	})
+}
+
+func assertTaskRunEnqueuedPayload(
+	t *testing.T,
+	payload hookspkg.TaskRunEnqueuedPayload,
+	taskRecord Task,
+	run Run,
+	actor ActorContext,
+) {
+	t.Helper()
+	if payload.Event != hookspkg.HookTaskRunEnqueued {
+		t.Fatalf("enqueued hook event = %q, want %q", payload.Event, hookspkg.HookTaskRunEnqueued)
+	}
+	if payload.Timestamp.IsZero() {
+		t.Fatal("enqueued hook timestamp = zero, want dispatch timestamp")
+	}
+	if payload.IdempotencyKey != "" {
+		t.Fatalf(
+			"enqueued hook idempotency key = %q, want empty force-op key",
+			payload.IdempotencyKey,
+		)
+	}
+	runKind := run.RunKind.Normalize().String()
+
+	var metadata struct {
+		WorkflowID string `json:"workflow_id"`
+		AgentName  string `json:"agent_name"`
+		Soul       *struct {
+			SnapshotID string `json:"snapshot_id"`
+			Digest     string `json:"digest"`
+		} `json:"soul"`
+	}
+	if len(run.Metadata) > 0 {
+		if err := json.Unmarshal(run.Metadata, &metadata); err != nil {
+			t.Fatalf("json.Unmarshal(run metadata) error = %v", err)
+		}
+	}
+	agentName := strings.TrimSpace(metadata.AgentName)
+	if agentName == "" && actor.Actor.Kind.Normalize() == ActorKindAgentSession {
+		agentName = strings.TrimSpace(actor.Actor.Ref)
+	}
+	want := hookspkg.TaskRunContext{
+		ProfileID:   strings.TrimSpace(taskRecord.ProfileID),
+		TaskID:      strings.TrimSpace(run.TaskID),
+		RunID:       strings.TrimSpace(run.ID),
+		WorkspaceID: strings.TrimSpace(taskRecord.WorkspaceID),
+		WorkflowID:  strings.TrimSpace(metadata.WorkflowID),
+
+		AgentName:  agentName,
+		SessionID:  strings.TrimSpace(run.SessionID),
+		ActorKind:  string(actor.Actor.Kind.Normalize()),
+		ActorID:    strings.TrimSpace(actor.Actor.Ref),
+		OriginKind: string(actor.Origin.Kind.Normalize()),
+		OriginRef:  strings.TrimSpace(actor.Origin.Ref),
+		TaskStatus: string(taskRecord.Status.Normalize()),
+		RunStatus:  run.Status.Normalize().String(),
+		Attempt:    int(run.Attempt),
+		LeaseUntil: run.LeaseUntil,
+		Error:      strings.TrimSpace(run.Error),
+	}
+	if metadata.Soul != nil {
+		want.SoulSnapshotID = strings.TrimSpace(metadata.Soul.SnapshotID)
+		want.SoulDigest = strings.TrimSpace(metadata.Soul.Digest)
+	}
+	if payload.RunKind == nil || *payload.RunKind != runKind {
+		t.Fatalf("enqueued hook run_kind = %#v, want %q", payload.RunKind, runKind)
+	}
+	want.RunKind = payload.RunKind
+
+	got := payload.TaskRunContext
+
+	if got != want {
+		t.Fatalf("enqueued hook context = %#v, want %#v", got, want)
+	}
+}
+
+func TestManagerBlockedExecutionAndFailureGuardrails(t *testing.T) {
+	t.Parallel()
+
+	store := newInMemoryManagerStore()
+	executor := &recordingSessionExecutor{startErr: errors.New("boot failed")}
+	manager := newTaskManagerForTestWithOptions(
+		t,
+		store,
+		WithSessionExecutor(executor),
+		WithCancelGracePeriod(time.Millisecond),
+	)
+	actor := validActorContext()
+
+	blocker, err := manager.CreateTask(t.Context(), CreateTask{
+		ProfileID: storepkg.DefaultProfileID,
+		Scope:     ScopeGlobal,
+		Title:     "Blocker",
+	}, actor)
+	if err != nil {
+		t.Fatalf("CreateTask(blocker) error = %v", err)
+	}
+	target, err := manager.CreateTask(t.Context(), CreateTask{
+		ProfileID: storepkg.DefaultProfileID,
+		Scope:     ScopeGlobal,
+		Title:     "Target",
+	}, actor)
+	if err != nil {
+		t.Fatalf("CreateTask(target) error = %v", err)
+	}
+	if err := manager.AddDependency(t.Context(), AddDependency{
+		TaskID:          target.ID,
+		DependsOnTaskID: blocker.ID,
+		Kind:            DependencyKindBlocks,
+	}, actor); err != nil {
+		t.Fatalf("AddDependency() error = %v", err)
+	}
+
+	blockedRun, err := manager.EnqueueRun(
+		t.Context(),
+		EnqueueRun{TaskID: target.ID},
+		actor,
+	)
+	if err != nil {
+		t.Fatalf("EnqueueRun(blocked target) error = %v", err)
+	}
+	if _, err := claimExactRunForTest(t.Context(), manager, blockedRun.ID, actor); !errors.Is(
+		err,
+		ErrNoClaimableRun,
+	) {
+		t.Fatalf("exact claim of blocked target error = %v, want %v", err, ErrNoClaimableRun)
+	}
+
+	failingTask, err := manager.CreateTask(t.Context(), CreateTask{
+		ProfileID:   storepkg.DefaultProfileID,
+		Scope:       ScopeGlobal,
+		Title:       "Failing start task",
+		MaxAttempts: new(1),
+	}, actor)
+	if err != nil {
+		t.Fatalf("CreateTask(failingTask) error = %v", err)
+	}
+	failingRun, err := manager.EnqueueRun(
+		t.Context(),
+		EnqueueRun{TaskID: failingTask.ID},
+		actor,
+	)
+	if err != nil {
+		t.Fatalf("EnqueueRun(failingTask) error = %v", err)
+	}
+	failingRun, err = admitRunDirectlyForTest(t.Context(), manager, failingRun.ID, actor)
+	if err != nil {
+		t.Fatalf("ClaimNextRun(failingTask) error = %v", err)
+	}
+	failedRun, err := manager.StartRun(t.Context(), failingRun.ID, StartRun{}, actor)
+	if err == nil {
+		t.Fatal("StartRun(failingTask) error = nil, want non-nil")
+	}
+	if failedRun == nil || failedRun.Status != TaskRunStatusFailed {
+		t.Fatalf("failedRun = %#v, want failed status", failedRun)
+	}
+	if got, want := store.tasks[failingTask.ID].Status, TaskStatusFailed; got != want {
+		t.Fatalf("failingTask.Status = %q, want %q", got, want)
+	}
+
+	completedTask, err := manager.CreateTask(t.Context(), CreateTask{
+		ProfileID: storepkg.DefaultProfileID,
+		Scope:     ScopeGlobal,
+		Title:     "Completed task",
+	}, actor)
+	if err != nil {
+		t.Fatalf("CreateTask(completedTask) error = %v", err)
+	}
+	completedRun, err := manager.EnqueueRun(
+		t.Context(),
+		EnqueueRun{TaskID: completedTask.ID},
+		actor,
+	)
+	if err != nil {
+		t.Fatalf("EnqueueRun(completedTask) error = %v", err)
+	}
+	completedRun, err = admitRunDirectlyForTest(t.Context(), manager, completedRun.ID, actor)
+	if err != nil {
+		t.Fatalf("ClaimNextRun(completedTask) error = %v", err)
+	}
+	executor.startErr = nil
+	completedRun, err = manager.StartRun(t.Context(), completedRun.ID, StartRun{}, actor)
+	if err != nil {
+		t.Fatalf("StartRun(completedTask) error = %v", err)
+	}
+	if _, err := manager.CompleteRun(t.Context(), completedRun.ID, RunResult{
+		Value: json.RawMessage(`{"ok":true}`),
+	}, actor); err != nil {
+		t.Fatalf("CompleteRun(completedTask) error = %v", err)
+	}
+	if _, err := manager.CancelTask(t.Context(), completedTask.ID, CancelTask{
+		Reason: "too late",
+	}, actor); !errors.Is(err, ErrInvalidStatusTransition) {
+		t.Fatalf("CancelTask(completedTask) error = %v, want %v", err, ErrInvalidStatusTransition)
+	}
+}
+
+func TestManagerHelperCoverage(t *testing.T) {
+	t.Parallel()
+
+	if !hasOpenRun([]Run{{Status: TaskRunStatusQueued}}) {
+		t.Fatal("hasOpenRun(queued) = false, want true")
+	}
+	if hasOpenRun([]Run{{Status: TaskRunStatusCompleted}}) {
+		t.Fatal("hasOpenRun(completed) = true, want false")
+	}
+	if !runComesAfter(
+		Run{ID: "run-2", Attempt: 2, QueuedAt: time.Date(2026, 4, 14, 16, 0, 0, 0, time.UTC)},
+		Run{ID: "run-1", Attempt: 1, QueuedAt: time.Date(2026, 4, 14, 15, 0, 0, 0, time.UTC)},
+	) {
+		t.Fatal("runComesAfter(later, earlier) = false, want true")
+	}
+	if allowsRunTransition(TaskRunStatusCompleted, TaskRunStatusRunning) {
+		t.Fatal("allowsRunTransition(completed, running) = true, want false")
+	}
+	if activeRunRank(TaskRunStatusRunning) <= activeRunRank(TaskRunStatusClaimed) {
+		t.Fatal("activeRunRank(running) should outrank claimed")
+	}
+	if !prefersActiveRun(
+		Run{ID: "run-running", Status: TaskRunStatusRunning},
+		Run{ID: "run-claimed", Status: TaskRunStatusClaimed},
+	) {
+		t.Fatal("prefersActiveRun(running, claimed) = false, want true")
+	}
+	if !prefersActiveRun(
+		Run{
+			ID:       "run-b",
+			Status:   TaskRunStatusQueued,
+			QueuedAt: time.Date(2026, 4, 14, 17, 0, 0, 0, time.UTC),
+		},
+		Run{
+			ID:       "run-a",
+			Status:   TaskRunStatusQueued,
+			QueuedAt: time.Date(2026, 4, 14, 17, 0, 0, 0, time.UTC),
+		},
+	) {
+		t.Fatal("prefersActiveRun() should break equal activity ties by id")
+	}
+	if got := taskRunMetadataStringList(
+		json.RawMessage(`{"required_capabilities":["golang",42,"sqlite"]}`),
+		"required_capabilities",
+	); len(got) != 2 || got[0] != "golang" || got[1] != "sqlite" {
+		t.Fatalf("taskRunMetadataStringList() = %#v, want golang/sqlite", got)
+	}
+
+	joined := errorsJoin(nil, ErrValidation)
+	if !errors.Is(joined, ErrValidation) {
+		t.Fatalf("errorsJoin(nil, ErrValidation) = %v, want ErrValidation", joined)
+	}
+
+	executor := &recordingSessionExecutor{}
+	manager := newTaskManagerForTestWithOptions(
+		t,
+		newInMemoryManagerStore(),
+		WithSessionExecutor(executor),
+		WithCancelGracePeriod(time.Millisecond),
+	)
+
+	if err := manager.waitAndForceStopRun(t.Context(), "sess-helper", StopReasonCancellation); err != nil {
+		t.Fatalf("waitAndForceStopRun() error = %v", err)
+	}
+	if len(executor.forceStopCalls) != 1 {
+		t.Fatalf("len(forceStopCalls) = %d, want 1", len(executor.forceStopCalls))
+	}
+
+	cancelledCtx, cancel := context.WithCancel(t.Context())
+	cancel()
+	if err := manager.waitAndForceStopRun(cancelledCtx, "sess-canceled", StopReasonCancellation); err == nil {
+		t.Fatal("waitAndForceStopRun(canceled) error = nil, want non-nil")
+	}
+}
+
+func TestTaskStatusFromSnapshot(t *testing.T) {
+	t.Parallel()
+
+	base := time.Date(2026, 4, 14, 16, 0, 0, 0, time.UTC)
+	tests := []struct {
+		name                   string
+		currentStatus          Status
+		unresolvedDependencies bool
+		runs                   []Run
+		want                   Status
+	}{
+		{
+			name:          "canceled task stays canceled",
+			currentStatus: TaskStatusCanceled,
+			runs: []Run{{
+				Status: TaskRunStatusRunning,
+			}},
+			want: TaskStatusCanceled,
+		},
+		{
+			name:          "active run wins immediately",
+			currentStatus: TaskStatusReady,
+			runs: []Run{
+				{Status: TaskRunStatusCompleted, Attempt: 1, QueuedAt: base},
+				{Status: TaskRunStatusRunning, Attempt: 2, QueuedAt: base.Add(time.Second)},
+			},
+			want: TaskStatusInProgress,
+		},
+		{
+			name:                   "queued run with unresolved dependency is blocked",
+			currentStatus:          TaskStatusReady,
+			unresolvedDependencies: true,
+			runs: []Run{{
+				Status: TaskRunStatusQueued,
+			}},
+			want: TaskStatusBlocked,
+		},
+		{
+			name:          "queued run without unresolved dependency is ready",
+			currentStatus: TaskStatusBlocked,
+			runs: []Run{{
+				Status: TaskRunStatusClaimed,
+			}},
+			want: TaskStatusReady,
+		},
+		{
+			name:          "latest completed terminal run wins",
+			currentStatus: TaskStatusReady,
+			runs: []Run{
+				{ID: "run-1", Status: TaskRunStatusFailed, Attempt: 1, QueuedAt: base},
+				{
+					ID:       "run-2",
+					Status:   TaskRunStatusCompleted,
+					Attempt:  2,
+					QueuedAt: base.Add(time.Second),
+				},
+			},
+			want: TaskStatusCompleted,
+		},
+		{
+			name:                   "no runs with unresolved dependency is blocked",
+			currentStatus:          TaskStatusReady,
+			unresolvedDependencies: true,
+			want:                   TaskStatusBlocked,
+		},
+		{
+			name:          "terminal status with no runs is preserved",
+			currentStatus: TaskStatusFailed,
+			want:          TaskStatusFailed,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			if got := taskStatusFromSnapshot(tt.currentStatus, tt.unresolvedDependencies, tt.runs); got != tt.want {
+				t.Fatalf("taskStatusFromSnapshot() = %q, want %q", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestNormalizeRawJSONAndSameRawJSONTrimWhitespace(t *testing.T) {
+	t.Parallel()
+
+	trimmed := json.RawMessage(`{"ok":true}`)
+	spaced := json.RawMessage(" \n\t" + string(trimmed) + "\n\t ")
+
+	if got := normalizeRawJSON(nil); got != nil {
+		t.Fatalf("normalizeRawJSON(nil) = %q, want nil", string(got))
+	}
+	if got := normalizeRawJSON(json.RawMessage(" \n\t ")); got != nil {
+		t.Fatalf("normalizeRawJSON(blank) = %q, want nil", string(got))
+	}
+	if got := normalizeRawJSON(spaced); string(got) != string(trimmed) {
+		t.Fatalf("normalizeRawJSON(spaced) = %q, want %q", string(got), string(trimmed))
+	}
+	if !sameRawJSON(spaced, trimmed) {
+		t.Fatal("sameRawJSON(spaced, trimmed) = false, want true")
+	}
+	if sameRawJSON(trimmed, json.RawMessage(`{"ok":false}`)) {
+		t.Fatal("sameRawJSON(trimmed, changed) = true, want false")
+	}
+}
+
+func TestNormalizeRunResultShouldRemoveRawClaimTokens(t *testing.T) {
+	t.Parallel()
+
+	t.Run("Should redact claim tokens from ordinary result JSON", func(t *testing.T) {
+		t.Parallel()
+
+		const rawToken = "compozy_claim_result-secret"
+		normalized, err := normalizeRunResult(RunResult{Value: json.RawMessage(
+			`{"keep":"safe","note":"` + rawToken + `","items":["` + rawToken + `"],"` + rawToken + `":"discard"}`,
+		)})
+		if err != nil {
+			t.Fatalf("normalizeRunResult() error = %v", err)
+		}
+		if got := string(normalized.Value); strings.Contains(got, rawToken) {
+			t.Fatalf("normalizeRunResult() value = %s, want raw claim token removed", got)
+		}
+		if got := string(normalized.Value); !strings.Contains(got, `"keep":"safe"`) {
+			t.Fatalf("normalizeRunResult() value = %s, want safe result preserved", got)
+		}
+	})
+
+	t.Run("Should redact claim tokens from coordinator payload JSON", func(t *testing.T) {
+		t.Parallel()
+
+		const rawToken = "compozy_claim_coordinator-secret"
+		normalized, err := normalizeRunResult(RunResult{CoordinatorControl: &CoordinatorControlResult{
+			Kind:    "continue",
+			Payload: json.RawMessage(`{"note":"` + rawToken + `"}`),
+		}})
+		if err != nil {
+			t.Fatalf("normalizeRunResult() error = %v", err)
+		}
+		if got := string(normalized.CoordinatorControl.Payload); strings.Contains(got, rawToken) {
+			t.Fatalf("normalizeRunResult() payload = %s, want raw claim token removed", got)
+		}
+	})
+
+	t.Run("Should reject a claim token in the coordinator discriminator", func(t *testing.T) {
+		t.Parallel()
+
+		_, err := normalizeRunResult(RunResult{CoordinatorControl: &CoordinatorControlResult{
+			Kind:    "compozy_claim_kind-secret",
+			Payload: json.RawMessage(`{"ok":true}`),
+		}})
+		if !errors.Is(err, ErrValidation) {
+			t.Fatalf("normalizeRunResult() error = %v, want %v", err, ErrValidation)
+		}
+	})
+}
+
+func TestManagerStartRunPersistsDedicatedSessionAfterCallerCancellation(t *testing.T) {
+	t.Parallel()
+
+	baseStore := newInMemoryManagerStore()
+	store := &contextSensitiveRunStore{inMemoryManagerStore: baseStore}
+	startCtx, cancelStart := context.WithCancel(t.Context())
+	executor := &recordingSessionExecutor{
+		startRef: &SessionRef{SessionID: "sess-dedicated-start"},
+		onStart: func(context.Context, *StartTaskSession) {
+			cancelStart()
+		},
+	}
+	manager := newTaskManagerForTestWithOptions(t, store, WithSessionExecutor(executor))
+	actor := validActorContext()
+
+	taskRecord, err := manager.CreateTask(t.Context(), CreateTask{
+		ProfileID: storepkg.DefaultProfileID,
+		Scope:     ScopeGlobal,
+		Title:     "Cancelable start run",
+	}, actor)
+	if err != nil {
+		t.Fatalf("CreateTask() error = %v", err)
+	}
+	run, err := manager.EnqueueRun(t.Context(), EnqueueRun{TaskID: taskRecord.ID}, actor)
+	if err != nil {
+		t.Fatalf("EnqueueRun() error = %v", err)
+	}
+	run, err = admitRunDirectlyForTest(t.Context(), manager, run.ID, actor)
+	if err != nil {
+		t.Fatalf("ClaimNextRun() error = %v", err)
+	}
+
+	running, err := manager.StartRun(startCtx, run.ID, StartRun{}, actor)
+	if err != nil {
+		t.Fatalf("StartRun(canceled caller) error = %v", err)
+	}
+	if startCtx.Err() == nil {
+		t.Fatal("startCtx.Err() = nil, want caller context canceled during session start")
+	}
+	if got, want := running.Status, TaskRunStatusRunning; got != want {
+		t.Fatalf("running.Status = %q, want %q", got, want)
+	}
+	if got, want := running.SessionID, "sess-dedicated-start"; got != want {
+		t.Fatalf("running.SessionID = %q, want %q", got, want)
+	}
+	storedRun, err := store.GetTaskRun(t.Context(), run.ID)
+	if err != nil {
+		t.Fatalf("GetTaskRun() error = %v", err)
+	}
+	if got, want := storedRun.Status, TaskRunStatusRunning; got != want {
+		t.Fatalf("storedRun.Status = %q, want %q", got, want)
+	}
+	if got, want := storedRun.SessionID, "sess-dedicated-start"; got != want {
+		t.Fatalf("storedRun.SessionID = %q, want %q", got, want)
+	}
+	events, err := store.ListTaskEvents(t.Context(), EventQuery{TaskID: taskRecord.ID})
+	if err != nil {
+		t.Fatalf("ListTaskEvents() error = %v", err)
+	}
+	for _, eventType := range []string{
+		taskEventRunStarting,
+		taskEventRunSessionBound,
+		taskEventRunStarted,
+	} {
+		if !containsEventType(events, eventType) {
+			t.Fatalf("event types = %#v, want %q", sortedEventTypes(events), eventType)
+		}
+	}
+	if len(executor.requestStopCalls) != 0 || len(executor.forceStopCalls) != 0 {
+		t.Fatalf(
+			"session stop calls = request:%#v force:%#v, want none",
+			executor.requestStopCalls,
+			executor.forceStopCalls,
+		)
+	}
+}
+
+func TestManagerStartRunTransfersClaimedPerRunExecutionToDedicatedSession(t *testing.T) {
+	t.Parallel()
+
+	store := newInMemoryManagerStore()
+	executor := &recordingSessionExecutor{
+		startRef: &SessionRef{SessionID: "sess-per-run", WorktreeID: "wt-per-run"},
+	}
+	manager := newTaskManagerForTestWithOptions(t, store, WithSessionExecutor(executor))
+	actor := validActorContext()
+	claimer := agentSessionActorContextForWorkspace("sess-claimer", "ws-test")
+
+	taskRecord, err := manager.CreateTask(t.Context(), CreateTask{
+		ProfileID:   storepkg.DefaultProfileID,
+		Scope:       ScopeWorkspace,
+		WorkspaceID: "ws-test",
+		Title:       "Per-run claimed transfer",
+	}, actor)
+	if err != nil {
+		t.Fatalf("CreateTask() error = %v", err)
+	}
+	store.profiles[taskRecord.ID] = ExecutionProfile{
+		TaskID:   taskRecord.ID,
+		Worktree: WorktreePolicy{Mode: WorktreeModePerRun},
+	}
+	run, err := manager.EnqueueRun(t.Context(), EnqueueRun{TaskID: taskRecord.ID}, actor)
+	if err != nil {
+		t.Fatalf("EnqueueRun() error = %v", err)
+	}
+	claim, err := claimExactRunResultForTest(t.Context(), manager, run.ID, claimer)
+	if err != nil {
+		t.Fatalf("claimExactRunForTest() error = %v", err)
+	}
+	claimed := &claim.Run
+	if claimed.SessionID != "sess-claimer" {
+		t.Fatalf("claimed SessionID = %q, want claimer session", claimed.SessionID)
+	}
+
+	running, err := manager.StartRun(t.Context(), run.ID, StartRun{
+		ClaimToken: claim.ClaimToken,
+	}, actor)
+	if err != nil {
+		t.Fatalf("StartRun() error = %v", err)
+	}
+	if running.SessionID != "sess-per-run" || running.WorktreeIDValue() != "wt-per-run" {
+		t.Fatalf(
+			"running binding = session %q worktree %q, want dedicated per-run binding",
+			running.SessionID,
+			running.WorktreeIDValue(),
+		)
+	}
+	if got, want := len(executor.startCalls), 1; got != want {
+		t.Fatalf("StartTaskSession calls = %d, want %d", got, want)
+	}
+	if executor.startCalls[0].Run.ResolvedWorktreeModeValue() != WorktreeModePerRun {
+		t.Fatalf("StartTaskSession run snapshot = %#v, want per_run", executor.startCalls[0].Run)
+	}
+}
+
+func TestManagerStartRunExecutionProfile(t *testing.T) {
+	t.Parallel()
+
+	t.Run(
+		"Should pass the persisted execution profile to the session executor",
+		func(t *testing.T) {
+			t.Parallel()
+
+			store := newInMemoryManagerStore()
+			executor := &recordingSessionExecutor{
+				startRef: &SessionRef{SessionID: "sess-profiled-worker"},
+			}
+			manager := newTaskManagerForTestWithOptions(t, store, WithSessionExecutor(executor))
+			actor := validActorContext()
+
+			taskRecord, err := manager.CreateTask(t.Context(), CreateTask{
+				ProfileID: "profile-editorial",
+				Scope:     ScopeGlobal,
+				Title:     "Profiled start run",
+			}, actor)
+			if err != nil {
+				t.Fatalf("CreateTask() error = %v", err)
+			}
+			_, err = manager.SetExecutionProfile(
+				t.Context(),
+				taskRecord.ID,
+				&ExecutionProfile{
+					Worker: WorkerProfile{
+						Mode:      WorkerModeSelect,
+						AgentName: "builder",
+						Provider:  "codex",
+						Model:     "gpt-5.4",
+					},
+				},
+				actor,
+			)
+			if err != nil {
+				t.Fatalf("SetExecutionProfile() error = %v", err)
+			}
+			run, err := manager.EnqueueRun(
+				t.Context(),
+				EnqueueRun{TaskID: taskRecord.ID},
+				actor,
+			)
+			if err != nil {
+				t.Fatalf("EnqueueRun() error = %v", err)
+			}
+			run, err = admitRunDirectlyForTest(t.Context(), manager, run.ID, actor)
+			if err != nil {
+				t.Fatalf("ClaimNextRun() error = %v", err)
+			}
+
+			started, err := manager.StartRun(t.Context(), run.ID, StartRun{}, actor)
+			if err != nil {
+				t.Fatalf("StartRun() error = %v", err)
+			}
+			if started.ProfileID != taskRecord.ProfileID {
+				t.Fatalf("started.ProfileID = %q, want task owner %q", started.ProfileID, taskRecord.ProfileID)
+			}
+			if got, want := len(executor.startCalls), 1; got != want {
+				t.Fatalf("len(startCalls) = %d, want %d", got, want)
+			}
+			profile := executor.startCalls[0].ExecutionProfile
+			if profile == nil {
+				t.Fatal("startCalls[0].ExecutionProfile = nil, want persisted profile")
+			}
+			if got, want := profile.Worker.AgentName, "builder"; got != want {
+				t.Fatalf("ExecutionProfile.Worker.AgentName = %q, want %q", got, want)
+			}
+			if got, want := profile.Worker.Provider, "codex"; got != want {
+				t.Fatalf("ExecutionProfile.Worker.Provider = %q, want %q", got, want)
+			}
+			if got, want := profile.Worker.Model, "gpt-5.4"; got != want {
+				t.Fatalf("ExecutionProfile.Worker.Model = %q, want %q", got, want)
+			}
+		},
+	)
+}
+
+func TestManagerStartRunAndAttachErrorBranches(t *testing.T) {
+	t.Parallel()
+
+	t.Run("Should stop the session and clean up its worktree when binding loses the run fence", func(t *testing.T) {
+		t.Parallel()
+
+		store := newInMemoryManagerStore()
+		executor := &recordingSessionExecutor{
+			startRef: &SessionRef{SessionID: "sess-stale-bind", WorktreeID: "wt-stale-bind"},
+		}
+		executor.onStart = func(_ context.Context, spec *StartTaskSession) {
+			current := cloneTaskRun(store.runs[spec.Run.ID])
+			current.Status = TaskRunStatusRunning
+			store.runs[current.ID] = current
+		}
+		manager := newTaskManagerForTestWithOptions(t, store, WithSessionExecutor(executor))
+		actor := validActorContext()
+
+		taskRecord, err := manager.CreateTask(t.Context(), CreateTask{
+			ProfileID: storepkg.DefaultProfileID,
+			Scope:     ScopeGlobal,
+			Title:     "Stale session binding",
+		}, actor)
+		if err != nil {
+			t.Fatalf("CreateTask() error = %v", err)
+		}
+		if _, err := manager.SetExecutionProfile(t.Context(), taskRecord.ID, &ExecutionProfile{
+			Worktree: WorktreePolicy{Mode: WorktreeModePerRun},
+		}, actor); err != nil {
+			t.Fatalf("SetExecutionProfile() error = %v", err)
+		}
+		run, err := manager.EnqueueRun(t.Context(), EnqueueRun{TaskID: taskRecord.ID}, actor)
+		if err != nil {
+			t.Fatalf("EnqueueRun() error = %v", err)
+		}
+		run, err = admitRunDirectlyForTest(t.Context(), manager, run.ID, actor)
+		if err != nil {
+			t.Fatalf("admitRunDirectlyForTest() error = %v", err)
+		}
+
+		if _, err := manager.StartRun(t.Context(), run.ID, StartRun{}, actor); !errors.Is(
+			err,
+			ErrInvalidStatusTransition,
+		) {
+			t.Fatalf("StartRun() error = %v, want ErrInvalidStatusTransition", err)
+		}
+		if got, want := len(executor.requestStopCalls), 1; got != want {
+			t.Fatalf("RequestTaskStop() calls = %d, want %d", got, want)
+		}
+		if got, want := len(executor.forceStopCalls), 1; got != want {
+			t.Fatalf("ForceTaskStop() calls = %d, want %d", got, want)
+		}
+		if got, want := len(executor.cleanupCalls), 1; got != want {
+			t.Fatalf("CleanupUnboundTaskSession() calls = %d, want %d", got, want)
+		}
+		cleanup := executor.cleanupCalls[0]
+		if cleanup.run.ID != run.ID || cleanup.run.ResolvedWorktreeModeValue() != WorktreeModePerRun ||
+			cleanup.ref.SessionID != "sess-stale-bind" || cleanup.ref.WorktreeID != "wt-stale-bind" {
+			t.Fatalf("CleanupUnboundTaskSession() call = %#v, want exact run/session worktree", cleanup)
+		}
+		stored, err := store.GetTaskRun(t.Context(), run.ID)
+		if err != nil {
+			t.Fatalf("GetTaskRun() error = %v", err)
+		}
+		if stored.SessionID != "" || stored.WorktreeIDValue() != "" {
+			t.Fatalf(
+				"stored binding = session %q worktree %q, want unchanged",
+				stored.SessionID,
+				stored.WorktreeIDValue(),
+			)
+		}
+	})
+	t.Run("Should accept a heartbeat extension while materializing before session binding", func(t *testing.T) {
+		t.Parallel()
+
+		ctx := t.Context()
+		now := time.Date(2026, 4, 14, 15, 0, 0, 0, time.UTC)
+		store := newInMemoryManagerStore()
+		executor := &recordingSessionExecutor{
+			startRef: &SessionRef{SessionID: "sess-heartbeat-bind", WorktreeID: "wt-heartbeat-bind"},
+		}
+		manager := newTaskManagerForTestWithOptions(t, store, WithSessionExecutor(executor))
+		operator := validActorContext()
+		agent := agentSessionActorContext("sess-heartbeat-owner")
+
+		taskRecord, err := manager.CreateTask(ctx, CreateTask{
+			ProfileID: storepkg.DefaultProfileID,
+			Scope:     ScopeGlobal,
+			Title:     "Heartbeat during materialization",
+		}, operator)
+		if err != nil {
+			t.Fatalf("CreateTask() error = %v", err)
+		}
+		if _, err := manager.SetWorktreePolicy(
+			ctx,
+			taskRecord.ID,
+			WorktreePolicy{Mode: WorktreeModePerRun},
+			operator,
+		); err != nil {
+			t.Fatalf("SetWorktreePolicy() error = %v", err)
+		}
+		run, err := manager.EnqueueRun(ctx, EnqueueRun{TaskID: taskRecord.ID}, operator)
+		if err != nil {
+			t.Fatalf("EnqueueRun() error = %v", err)
+		}
+		claim, err := manager.ClaimNextRun(ctx, ClaimCriteria{
+			RunID:            run.ID,
+			Scope:            ScopeGlobal,
+			ClaimerSessionID: agent.Scope.SessionID,
+			LeaseDuration:    time.Minute,
+			Now:              now,
+		}, agent)
+		if err != nil {
+			t.Fatalf("ClaimNextRun() error = %v", err)
+		}
+		executor.onStart = func(_ context.Context, spec *StartTaskSession) {
+			heartbeat, heartbeatErr := store.HeartbeatRunLease(ctx, LeaseHeartbeat{
+				RunID:         spec.Run.ID,
+				ClaimToken:    claim.ClaimToken,
+				LeaseDuration: 2 * time.Minute,
+				Now:           now.Add(30 * time.Second),
+			})
+			if heartbeatErr != nil {
+				t.Fatalf("HeartbeatRunLease() error = %v", heartbeatErr)
+			}
+			if got, want := heartbeat.LeaseUntil, now.Add(150*time.Second); !got.Equal(want) {
+				t.Fatalf("heartbeat lease_until = %s, want %s", got, want)
+			}
+		}
+
+		started, err := manager.StartRun(ctx, run.ID, StartRun{
+			IdempotencyKey: "start-heartbeat-materialization",
+			ClaimToken:     claim.ClaimToken,
+		}, agent)
+		if err != nil {
+			t.Fatalf("StartRun() error = %v", err)
+		}
+		if started.Status != TaskRunStatusRunning || started.SessionID != "sess-heartbeat-bind" ||
+			started.WorktreeIDValue() != "wt-heartbeat-bind" || !started.LeaseUntil.Equal(now.Add(150*time.Second)) {
+			t.Fatalf("StartRun() = %#v, want heartbeat-refreshed session binding", started)
+		}
+	})
+
+	t.Run("Should fail a materialization under the heartbeat-refreshed lease", func(t *testing.T) {
+		t.Parallel()
+
+		ctx := t.Context()
+		base := time.Date(2026, 4, 14, 15, 0, 0, 0, time.UTC)
+		clockNow := base
+		store := newInMemoryManagerStore()
+		materializationErr := errors.New("materialization failed after heartbeat")
+		executor := &recordingSessionExecutor{startErr: materializationErr}
+		manager := newTaskManagerForTestWithOptions(
+			t,
+			store,
+			WithSessionExecutor(executor),
+			WithManagerNow(func() time.Time { return clockNow }),
+		)
+		operator := validActorContext()
+		agent := agentSessionActorContext("sess-heartbeat-failure")
+
+		taskRecord, err := manager.CreateTask(ctx, CreateTask{
+			ProfileID: storepkg.DefaultProfileID,
+			Scope:     ScopeGlobal,
+			Title:     "Heartbeat-fenced materialization failure",
+		}, operator)
+		if err != nil {
+			t.Fatalf("CreateTask() error = %v", err)
+		}
+		if _, err := manager.SetWorktreePolicy(
+			ctx,
+			taskRecord.ID,
+			WorktreePolicy{Mode: WorktreeModePerRun},
+			operator,
+		); err != nil {
+			t.Fatalf("SetWorktreePolicy() error = %v", err)
+		}
+		run, err := manager.EnqueueRun(ctx, EnqueueRun{TaskID: taskRecord.ID}, operator)
+		if err != nil {
+			t.Fatalf("EnqueueRun() error = %v", err)
+		}
+		claim, err := manager.ClaimNextRun(ctx, ClaimCriteria{
+			RunID:            run.ID,
+			Scope:            ScopeGlobal,
+			ClaimerSessionID: agent.Scope.SessionID,
+			LeaseDuration:    time.Minute,
+			Now:              base,
+		}, agent)
+		if err != nil {
+			t.Fatalf("ClaimNextRun() error = %v", err)
+		}
+		executor.onStart = func(_ context.Context, spec *StartTaskSession) {
+			clockNow = base.Add(30 * time.Second)
+			if _, heartbeatErr := store.HeartbeatRunLease(ctx, LeaseHeartbeat{
+				RunID:         spec.Run.ID,
+				ClaimToken:    claim.ClaimToken,
+				LeaseDuration: 2 * time.Minute,
+				Now:           clockNow,
+			}); heartbeatErr != nil {
+				t.Fatalf("HeartbeatRunLease() error = %v", heartbeatErr)
+			}
+		}
+
+		failed, err := manager.StartRun(ctx, run.ID, StartRun{
+			IdempotencyKey: "start-heartbeat-failure",
+			ClaimToken:     claim.ClaimToken,
+		}, agent)
+		if !errors.Is(err, materializationErr) {
+			t.Fatalf("StartRun() error = %v, want materialization failure", err)
+		}
+		if failed == nil || failed.Status != TaskRunStatusFailed ||
+			failed.ClaimTokenHash != claim.Run.ClaimTokenHash || !failed.LeaseUntil.IsZero() {
+			t.Fatalf("StartRun() failed run = %#v, want token-fenced terminal failure", failed)
+		}
+	})
+
+	t.Run("Should refuse a materialization failure after the lease expires", func(t *testing.T) {
+		t.Parallel()
+
+		ctx := t.Context()
+		base := time.Date(2026, 4, 14, 15, 0, 0, 0, time.UTC)
+		clockNow := base
+		store := newInMemoryManagerStore()
+		materializationErr := errors.New("materialization failed after lease expiry")
+		executor := &recordingSessionExecutor{startErr: materializationErr}
+		manager := newTaskManagerForTestWithOptions(
+			t,
+			store,
+			WithSessionExecutor(executor),
+			WithManagerNow(func() time.Time { return clockNow }),
+		)
+		operator := validActorContext()
+		agent := agentSessionActorContext("sess-expired-failure")
+
+		taskRecord, err := manager.CreateTask(ctx, CreateTask{
+			ProfileID: storepkg.DefaultProfileID,
+			Scope:     ScopeGlobal,
+			Title:     "Expired materialization failure",
+		}, operator)
+		if err != nil {
+			t.Fatalf("CreateTask() error = %v", err)
+		}
+		if _, err := manager.SetWorktreePolicy(
+			ctx,
+			taskRecord.ID,
+			WorktreePolicy{Mode: WorktreeModePerRun},
+			operator,
+		); err != nil {
+			t.Fatalf("SetWorktreePolicy() error = %v", err)
+		}
+		run, err := manager.EnqueueRun(ctx, EnqueueRun{TaskID: taskRecord.ID}, operator)
+		if err != nil {
+			t.Fatalf("EnqueueRun() error = %v", err)
+		}
+		claim, err := manager.ClaimNextRun(ctx, ClaimCriteria{
+			RunID:            run.ID,
+			Scope:            ScopeGlobal,
+			ClaimerSessionID: agent.Scope.SessionID,
+			LeaseDuration:    time.Minute,
+			Now:              base,
+		}, agent)
+		if err != nil {
+			t.Fatalf("ClaimNextRun() error = %v", err)
+		}
+		executor.onStart = func(context.Context, *StartTaskSession) {
+			clockNow = base.Add(2 * time.Minute)
+		}
+
+		failed, err := manager.StartRun(ctx, run.ID, StartRun{
+			IdempotencyKey: "start-expired-failure",
+			ClaimToken:     claim.ClaimToken,
+		}, agent)
+		if failed != nil || !errors.Is(err, ErrLeaseExpired) || !errors.Is(err, materializationErr) {
+			t.Fatalf("StartRun() = %#v, %v; want nil plus materialization and lease errors", failed, err)
+		}
+		stored, err := store.GetTaskRun(ctx, run.ID)
+		if err != nil {
+			t.Fatalf("GetTaskRun() error = %v", err)
+		}
+		if stored.Status != TaskRunStatusStarting || stored.SessionID != agent.Scope.SessionID ||
+			stored.ClaimTokenHash == "" {
+			t.Fatalf("expired stored run = %#v, want starting run owned by the expired claimant", stored)
+		}
+	})
+
+	t.Run("Should unwind an expired materialization before a recovered run starts cleanly", func(t *testing.T) {
+		t.Parallel()
+
+		ctx := t.Context()
+		now := time.Date(2026, 4, 14, 15, 0, 0, 0, time.UTC)
+		store := newInMemoryManagerStore()
+		executor := &recordingSessionExecutor{
+			startRef: &SessionRef{SessionID: "sess-expired-bind", WorktreeID: "wt-expired-bind"},
+		}
+		manager := newTaskManagerForTestWithOptions(t, store, WithSessionExecutor(executor))
+		operator := validActorContext()
+		agent := agentSessionActorContext("sess-expired-owner")
+
+		taskRecord, err := manager.CreateTask(ctx, CreateTask{
+			ProfileID: storepkg.DefaultProfileID,
+			Scope:     ScopeGlobal,
+			Title:     "Expired materialization",
+		}, operator)
+		if err != nil {
+			t.Fatalf("CreateTask() error = %v", err)
+		}
+		if _, err := manager.SetWorktreePolicy(
+			ctx,
+			taskRecord.ID,
+			WorktreePolicy{Mode: WorktreeModePerRun},
+			operator,
+		); err != nil {
+			t.Fatalf("SetWorktreePolicy() error = %v", err)
+		}
+		run, err := manager.EnqueueRun(ctx, EnqueueRun{TaskID: taskRecord.ID}, operator)
+		if err != nil {
+			t.Fatalf("EnqueueRun() error = %v", err)
+		}
+		claim, err := manager.ClaimNextRun(ctx, ClaimCriteria{
+			RunID:            run.ID,
+			Scope:            ScopeGlobal,
+			ClaimerSessionID: agent.Scope.SessionID,
+			LeaseDuration:    time.Minute,
+			Now:              now,
+		}, agent)
+		if err != nil {
+			t.Fatalf("ClaimNextRun() error = %v", err)
+		}
+		executor.onStart = func(_ context.Context, spec *StartTaskSession) {
+			current := cloneTaskRun(store.runs[spec.Run.ID])
+			current.HeartbeatAt = now
+			current.LeaseUntil = now
+			store.runs[current.ID] = current
+		}
+
+		if _, err := manager.StartRun(
+			ctx,
+			run.ID,
+			StartRun{
+				IdempotencyKey: "start-expired-materialization",
+				ClaimToken:     claim.ClaimToken,
+			},
+			agent,
+		); !errors.Is(err, ErrLeaseExpired) {
+			t.Fatalf("StartRun(expired) error = %v, want %v", err, ErrLeaseExpired)
+		}
+		if got, want := len(executor.cleanupCalls), 1; got != want {
+			t.Fatalf("CleanupUnboundTaskSession() calls = %d, want %d", got, want)
+		}
+		stored, err := store.GetTaskRun(ctx, run.ID)
+		if err != nil {
+			t.Fatalf("GetTaskRun(expired) error = %v", err)
+		}
+		if stored.SessionID != agent.Scope.SessionID || stored.WorktreeIDValue() != "" ||
+			stored.Status != TaskRunStatusStarting {
+			t.Fatalf("expired stored run = %#v, want original claimant without worktree binding", stored)
+		}
+
+		recoveries, err := manager.RecoverExpiredRunLeases(ctx, ExpiredLeaseRecovery{
+			Now:    now.Add(time.Second),
+			Reason: "materialization lease expired",
+		}, operator)
+		if err != nil {
+			t.Fatalf("RecoverExpiredRunLeases() error = %v", err)
+		}
+		if len(recoveries) != 1 || recoveries[0].Run.Status != TaskRunStatusQueued {
+			t.Fatalf("recoveries = %#v, want one requeued run", recoveries)
+		}
+		reclaimed, err := manager.ClaimNextRun(ctx, ClaimCriteria{
+			RunID:            run.ID,
+			Scope:            ScopeGlobal,
+			ClaimerSessionID: agent.Scope.SessionID,
+			LeaseDuration:    time.Minute,
+			Now:              now.Add(2 * time.Second),
+		}, agent)
+		if err != nil {
+			t.Fatalf("ClaimNextRun(recovered) error = %v", err)
+		}
+		executor.onStart = nil
+		executor.startRef = &SessionRef{SessionID: "sess-recovered-bind", WorktreeID: "wt-recovered-bind"}
+		started, err := manager.StartRun(
+			ctx,
+			run.ID,
+			StartRun{
+				IdempotencyKey: "start-recovered-materialization",
+				ClaimToken:     reclaimed.ClaimToken,
+			},
+			agent,
+		)
+		if err != nil {
+			t.Fatalf("StartRun(recovered) error = %v", err)
+		}
+		if started.Status != TaskRunStatusRunning || started.WorktreeIDValue() != "wt-recovered-bind" {
+			t.Fatalf("StartRun(recovered) = %#v, want new running materialization", started)
+		}
+	})
+
+	t.Run(
+		"Should start run fails closed when executor returns nil session ref",
+		func(t *testing.T) {
+			t.Parallel()
+
+			store := newInMemoryManagerStore()
+			executor := &recordingSessionExecutor{returnNilStart: true}
+			manager := newTaskManagerForTestWithOptions(t, store, WithSessionExecutor(executor))
+			actor := validActorContext()
+
+			taskRecord, err := manager.CreateTask(t.Context(), CreateTask{
+				ProfileID: storepkg.DefaultProfileID,
+				Scope:     ScopeGlobal,
+				Title:     "Nil session ref task",
+			}, actor)
+			if err != nil {
+				t.Fatalf("CreateTask() error = %v", err)
+			}
+			run, err := manager.EnqueueRun(
+				t.Context(),
+				EnqueueRun{TaskID: taskRecord.ID},
+				actor,
+			)
+			if err != nil {
+				t.Fatalf("EnqueueRun() error = %v", err)
+			}
+			run, err = admitRunDirectlyForTest(t.Context(), manager, run.ID, actor)
+			if err != nil {
+				t.Fatalf("ClaimNextRun() error = %v", err)
+			}
+
+			failedRun, err := manager.StartRun(t.Context(), run.ID, StartRun{}, actor)
+			if err == nil {
+				t.Fatal("StartRun() error = nil, want non-nil")
+			}
+			if failedRun == nil || failedRun.Status != TaskRunStatusFailed {
+				t.Fatalf("failedRun = %#v, want failed run", failedRun)
+			}
+		},
+	)
+
+	t.Run("Should redact claim bearers from session start failure records", func(t *testing.T) {
+		t.Parallel()
+
+		const rawToken = "compozy_claim_session-start-secret"
+		store := newInMemoryManagerStore()
+		startErr := errors.New("provider returned " + rawToken)
+		executor := &recordingSessionExecutor{
+			startErr: startErr,
+		}
+		manager := newTaskManagerForTestWithOptions(t, store, WithSessionExecutor(executor))
+		actor := validActorContext()
+		ctx := t.Context()
+
+		taskRecord, err := manager.CreateTask(ctx, CreateTask{
+			ProfileID: storepkg.DefaultProfileID,
+			Scope:     ScopeGlobal,
+			Title:     "Sanitized start failure",
+		}, actor)
+		if err != nil {
+			t.Fatalf("CreateTask() error = %v", err)
+		}
+		run, err := manager.EnqueueRun(ctx, EnqueueRun{TaskID: taskRecord.ID}, actor)
+		if err != nil {
+			t.Fatalf("EnqueueRun() error = %v", err)
+		}
+		run, err = admitRunDirectlyForTest(ctx, manager, run.ID, actor)
+		if err != nil {
+			t.Fatalf("ClaimNextRun() error = %v", err)
+		}
+
+		failedRun, err := manager.StartRun(ctx, run.ID, StartRun{}, actor)
+		if err == nil {
+			t.Fatal("StartRun() error = nil, want non-nil")
+		}
+		if strings.Contains(err.Error(), rawToken) {
+			t.Fatalf("StartRun() returned error leaked raw bearer: %q", err)
+		}
+		if !errors.Is(err, startErr) {
+			t.Fatalf("StartRun() error = %v, want to preserve session-start error identity", err)
+		}
+		if failedRun == nil || failedRun.Status != TaskRunStatusFailed {
+			t.Fatalf("StartRun() run = %#v, want failed run", failedRun)
+		}
+		if strings.Contains(failedRun.Error, rawToken) {
+			t.Fatalf("StartRun().Error = %q, want raw bearer redacted", failedRun.Error)
+		}
+		if got, want := failedRun.Error, "start task session: provider returned compozy_claim_[REDACTED]"; got != want {
+			t.Fatalf("StartRun().Error = %q, want %q", got, want)
+		}
+
+		events, err := store.ListTaskEvents(ctx, EventQuery{
+			TaskID:    taskRecord.ID,
+			RunID:     run.ID,
+			EventType: taskEventRunFailed,
+		})
+		if err != nil {
+			t.Fatalf("ListTaskEvents() error = %v", err)
+		}
+		if got, want := len(events), 1; got != want {
+			t.Fatalf("failed event count = %d, want %d", got, want)
+		}
+		if strings.Contains(string(events[0].Payload), rawToken) {
+			t.Fatalf("task.run.failed payload leaked raw bearer: %s", events[0].Payload)
+		}
+	})
+
+	t.Run("Should attach run rejects active session reuse", func(t *testing.T) {
+		t.Parallel()
+
+		store := newInMemoryManagerStore()
+		executor := &recordingSessionExecutor{}
+		manager := newTaskManagerForTestWithOptions(t, store, WithSessionExecutor(executor))
+		actor := validActorContext()
+
+		taskRecord, err := manager.CreateTask(t.Context(), CreateTask{
+			ProfileID: storepkg.DefaultProfileID,
+			Scope:     ScopeGlobal,
+			Title:     "Shared session guard",
+		}, actor)
+		if err != nil {
+			t.Fatalf("CreateTask() error = %v", err)
+		}
+		runOne, err := manager.EnqueueRun(
+			t.Context(),
+			EnqueueRun{TaskID: taskRecord.ID},
+			actor,
+		)
+		if err != nil {
+			t.Fatalf("EnqueueRun(runOne) error = %v", err)
+		}
+		runOne, err = admitRunDirectlyForTest(t.Context(), manager, runOne.ID, actor)
+		if err != nil {
+			t.Fatalf("ClaimNextRun(runOne) error = %v", err)
+		}
+		if _, err := manager.AttachRunSession(t.Context(), runOne.ID, "sess-shared", actor); err != nil {
+			t.Fatalf("AttachRunSession(runOne) error = %v", err)
+		}
+
+		taskRecordTwo, err := manager.CreateTask(t.Context(), CreateTask{
+			ProfileID: storepkg.DefaultProfileID,
+			Scope:     ScopeGlobal,
+			Title:     "Second task sharing session",
+		}, actor)
+		if err != nil {
+			t.Fatalf("CreateTask(taskRecordTwo) error = %v", err)
+		}
+		runTwo, err := manager.EnqueueRun(
+			t.Context(),
+			EnqueueRun{TaskID: taskRecordTwo.ID},
+			actor,
+		)
+		if err != nil {
+			t.Fatalf("EnqueueRun(runTwo) error = %v", err)
+		}
+		runTwo, err = admitRunDirectlyForTest(t.Context(), manager, runTwo.ID, actor)
+		if err != nil {
+			t.Fatalf("ClaimNextRun(runTwo) error = %v", err)
+		}
+		if _, err := manager.AttachRunSession(
+			t.Context(),
+			runTwo.ID,
+			"sess-shared",
+			actor,
+		); !errors.Is(
+			err,
+			ErrSessionAlreadyBound,
+		) {
+			t.Fatalf(
+				"AttachRunSession(runTwo shared session) error = %v, want %v",
+				err,
+				ErrSessionAlreadyBound,
+			)
+		}
+	})
+
+	t.Run("Should validate executor and session id before admitting queued run", func(t *testing.T) {
+		t.Parallel()
+
+		store := newInMemoryManagerStore()
+		managerWithoutExecutor := newTaskManagerForTest(t, store)
+		actor := validActorContext()
+
+		taskRecord, err := managerWithoutExecutor.CreateTask(t.Context(), CreateTask{
+			ProfileID: storepkg.DefaultProfileID,
+			Scope:     ScopeGlobal,
+			Title:     "Attach validation task",
+		}, actor)
+		if err != nil {
+			t.Fatalf("CreateTask() error = %v", err)
+		}
+		run, err := managerWithoutExecutor.EnqueueRun(
+			t.Context(),
+			EnqueueRun{TaskID: taskRecord.ID},
+			actor,
+		)
+		if err != nil {
+			t.Fatalf("EnqueueRun() error = %v", err)
+		}
+		run, err = admitRunDirectlyForTest(t.Context(), managerWithoutExecutor, run.ID, actor)
+		if err != nil {
+			t.Fatalf("ClaimNextRun() error = %v", err)
+		}
+		if _, err := managerWithoutExecutor.AttachRunSession(
+			t.Context(),
+			run.ID,
+			"sess-1",
+			actor,
+		); !errors.Is(
+			err,
+			ErrValidation,
+		) {
+			t.Fatalf("AttachRunSession(no executor) error = %v, want %v", err, ErrValidation)
+		}
+
+		executorStore := newInMemoryManagerStore()
+		managerWithExecutor := newTaskManagerForTestWithOptions(
+			t,
+			executorStore,
+			WithSessionExecutor(&recordingSessionExecutor{}),
+		)
+		taskRecord, err = managerWithExecutor.CreateTask(t.Context(), CreateTask{
+			ProfileID: storepkg.DefaultProfileID,
+			Scope:     ScopeGlobal,
+			Title:     "Attach session id validation",
+		}, actor)
+		if err != nil {
+			t.Fatalf("CreateTask(with executor) error = %v", err)
+		}
+		run, err = managerWithExecutor.EnqueueRun(
+			t.Context(),
+			EnqueueRun{TaskID: taskRecord.ID},
+			actor,
+		)
+		if err != nil {
+			t.Fatalf("EnqueueRun(with executor) error = %v", err)
+		}
+		if _, err := managerWithExecutor.AttachRunSession(
+			t.Context(),
+			run.ID,
+			"",
+			actor,
+		); !errors.Is(
+			err,
+			ErrValidation,
+		) {
+			t.Fatalf("AttachRunSession(empty session id) error = %v, want %v", err, ErrValidation)
+		}
+		attached, err := managerWithExecutor.AttachRunSession(
+			t.Context(),
+			run.ID,
+			"sess-2",
+			actor,
+		)
+		if err != nil {
+			t.Fatalf("AttachRunSession(queued run) error = %v", err)
+		}
+		if got, want := attached.Status.Normalize(), TaskRunStatusStarting; got != want {
+			t.Fatalf("AttachRunSession(queued run).Status = %q, want %q", got, want)
+		}
+		if got, want := attached.SessionID, "sess-2"; got != want {
+			t.Fatalf("AttachRunSession(queued run).SessionID = %q, want %q", got, want)
+		}
+		stored := executorStore.runs[run.ID]
+		if got := stored.ClaimTokenHash; got != "" {
+			t.Fatalf("stored queued admission claim token hash = %q, want empty", got)
+		}
+		if !stored.LeaseUntil.IsZero() {
+			t.Fatalf("stored queued admission lease until = %s, want zero", stored.LeaseUntil)
+		}
+	})
+
+	t.Run("Should reject session attach for a run escalated to needs attention", func(t *testing.T) {
+		t.Parallel()
+
+		ctx := t.Context()
+		store := newInMemoryManagerStore()
+		manager := newTaskManagerForTestWithOptions(
+			t,
+			store,
+			WithSessionExecutor(&recordingSessionExecutor{}),
+		)
+		actor := validActorContext()
+
+		taskRecord, err := manager.CreateTask(ctx, CreateTask{
+			ProfileID: storepkg.DefaultProfileID,
+			Scope:     ScopeGlobal,
+			Title:     "Attach status guard",
+		}, actor)
+		if err != nil {
+			t.Fatalf("CreateTask() error = %v", err)
+		}
+		run, err := manager.EnqueueRun(ctx, EnqueueRun{TaskID: taskRecord.ID}, actor)
+		if err != nil {
+			t.Fatalf("EnqueueRun() error = %v", err)
+		}
+		if _, err := admitRunDirectlyForTest(ctx, manager, run.ID, actor); err != nil {
+			t.Fatalf("admitRunDirectlyForTest() error = %v", err)
+		}
+		escalated, err := manager.MarkRunNeedsAttention(ctx, run.ID, "worker unreachable", actor)
+		if err != nil {
+			t.Fatalf("MarkRunNeedsAttention() error = %v", err)
+		}
+		if got, want := escalated.Status.Normalize(), TaskRunStatusNeedsAttention; got != want {
+			t.Fatalf("MarkRunNeedsAttention().Status = %q, want %q", got, want)
+		}
+		if got := strings.TrimSpace(escalated.SessionID); got != "" {
+			t.Fatalf("escalated run session id = %q, want empty so the status guard is exercised", got)
+		}
+
+		if _, err := manager.AttachRunSession(
+			ctx,
+			run.ID,
+			"sess-escalated",
+			actor,
+		); !errors.Is(err, ErrSessionAttachNotAllowed) {
+			t.Fatalf(
+				"AttachRunSession(needs_attention run) error = %v, want %v",
+				err,
+				ErrSessionAttachNotAllowed,
+			)
+		}
+	})
+}
+
+func TestManagerRecoverRunOnBoot(t *testing.T) {
+	t.Parallel()
+
+	daemonActor, err := DeriveDaemonActorContext("boot-recovery", "daemon.boot")
+	if err != nil {
+		t.Fatalf("DeriveDaemonActorContext() error = %v", err)
+	}
+
+	t.Run("Should claimed run requeues and records recovery event", func(t *testing.T) {
+		t.Parallel()
+
+		store := newInMemoryManagerStore()
+		manager := newTaskManagerForTest(t, store)
+		actor := validActorContext()
+
+		taskRecord, err := manager.CreateTask(t.Context(), CreateTask{
+			ProfileID: storepkg.DefaultProfileID,
+			Scope:     ScopeGlobal,
+			Title:     "Claimed recovery",
+		}, actor)
+		if err != nil {
+			t.Fatalf("CreateTask() error = %v", err)
+		}
+		run, err := manager.EnqueueRun(
+			t.Context(),
+			EnqueueRun{TaskID: taskRecord.ID},
+			actor,
+		)
+		if err != nil {
+			t.Fatalf("EnqueueRun() error = %v", err)
+		}
+		run, err = admitRunDirectlyForTest(t.Context(), manager, run.ID, actor)
+		if err != nil {
+			t.Fatalf("ClaimNextRun() error = %v", err)
+		}
+
+		recovered, err := manager.RecoverRunOnBoot(t.Context(), run.ID, RunBootRecovery{
+			Action:       RunBootRecoveryRequeue,
+			Reason:       "orphaned_on_boot",
+			SessionState: "missing",
+		}, daemonActor)
+		if err != nil {
+			t.Fatalf("RecoverRunOnBoot(requeue) error = %v", err)
+		}
+		if got, want := recovered.Status, TaskRunStatusQueued; got != want {
+			t.Fatalf("recovered.Status = %q, want %q", got, want)
+		}
+		if recovered.ClaimedBy != nil {
+			t.Fatalf("recovered.ClaimedBy = %#v, want nil", recovered.ClaimedBy)
+		}
+		if !store.runs[run.ID].ClaimedAt.IsZero() {
+			t.Fatalf(
+				"store.runs[%q].ClaimedAt = %v, want zero",
+				run.ID,
+				store.runs[run.ID].ClaimedAt,
+			)
+		}
+
+		events, err := store.ListTaskEvents(t.Context(), EventQuery{TaskID: taskRecord.ID})
+		if err != nil {
+			t.Fatalf("ListTaskEvents() error = %v", err)
+		}
+		if !containsEventType(events, taskEventRunRecovered) {
+			t.Fatalf("events = %#v, want %q", sortedEventTypes(events), taskEventRunRecovered)
+		}
+	})
+
+	t.Run("Should starting run is promoted to running when session is live", func(t *testing.T) {
+		t.Parallel()
+
+		store := newInMemoryManagerStore()
+		executor := &recordingSessionExecutor{}
+		manager := newTaskManagerForTestWithOptions(t, store, WithSessionExecutor(executor))
+		actor := validActorContext()
+
+		taskRecord, err := manager.CreateTask(t.Context(), CreateTask{
+			ProfileID: storepkg.DefaultProfileID,
+			Scope:     ScopeGlobal,
+			Title:     "Starting recovery",
+		}, actor)
+		if err != nil {
+			t.Fatalf("CreateTask() error = %v", err)
+		}
+		run, err := manager.EnqueueRun(
+			t.Context(),
+			EnqueueRun{TaskID: taskRecord.ID},
+			actor,
+		)
+		if err != nil {
+			t.Fatalf("EnqueueRun() error = %v", err)
+		}
+		run, err = admitRunDirectlyForTest(t.Context(), manager, run.ID, actor)
+		if err != nil {
+			t.Fatalf("ClaimNextRun() error = %v", err)
+		}
+		run, err = manager.AttachRunSession(t.Context(), run.ID, "sess-live", actor)
+		if err != nil {
+			t.Fatalf("AttachRunSession() error = %v", err)
+		}
+
+		recovered, err := manager.RecoverRunOnBoot(t.Context(), run.ID, RunBootRecovery{
+			Action:       RunBootRecoveryMarkRunning,
+			Reason:       "orphaned_on_boot",
+			SessionState: "active",
+		}, daemonActor)
+		if err != nil {
+			t.Fatalf("RecoverRunOnBoot(mark running) error = %v", err)
+		}
+		if got, want := recovered.Status, TaskRunStatusRunning; got != want {
+			t.Fatalf("recovered.Status = %q, want %q", got, want)
+		}
+		if recovered.StartedAt.IsZero() {
+			t.Fatal("recovered.StartedAt = zero, want recovery timestamp")
+		}
+	})
+
+	t.Run(
+		"Should running run fails closed when the attached session is not live",
+		func(t *testing.T) {
+			t.Parallel()
+
+			store := newInMemoryManagerStore()
+			executor := &recordingSessionExecutor{}
+			manager := newTaskManagerForTestWithOptions(t, store, WithSessionExecutor(executor))
+			actor := validActorContext()
+
+			taskRecord, err := manager.CreateTask(t.Context(), CreateTask{
+				ProfileID: storepkg.DefaultProfileID,
+				Scope:     ScopeGlobal,
+				Title:     "Running recovery",
+			}, actor)
+			if err != nil {
+				t.Fatalf("CreateTask() error = %v", err)
+			}
+			run, err := manager.EnqueueRun(
+				t.Context(),
+				EnqueueRun{TaskID: taskRecord.ID},
+				actor,
+			)
+			if err != nil {
+				t.Fatalf("EnqueueRun() error = %v", err)
+			}
+			run, err = admitRunDirectlyForTest(t.Context(), manager, run.ID, actor)
+			if err != nil {
+				t.Fatalf("ClaimNextRun() error = %v", err)
+			}
+			run, err = manager.StartRun(t.Context(), run.ID, StartRun{}, actor)
+			if err != nil {
+				t.Fatalf("StartRun() error = %v", err)
+			}
+
+			recovered, err := manager.RecoverRunOnBoot(
+				t.Context(),
+				run.ID,
+				RunBootRecovery{
+					Action:       RunBootRecoveryFail,
+					Reason:       "orphaned_on_boot",
+					SessionState: "missing",
+				},
+				daemonActor,
+			)
+			if err != nil {
+				t.Fatalf("RecoverRunOnBoot(fail) error = %v", err)
+			}
+			if got, want := recovered.Status, TaskRunStatusFailed; got != want {
+				t.Fatalf("recovered.Status = %q, want %q", got, want)
+			}
+			if !strings.Contains(recovered.Error, "orphaned on boot") {
+				t.Fatalf("recovered.Error = %q, want orphaned-on-boot detail", recovered.Error)
+			}
+			if got, want := len(executor.requestStopCalls), 0; got != want {
+				t.Fatalf("len(requestStopCalls) = %d, want %d", got, want)
+			}
+			if got, want := len(executor.forceStopCalls), 0; got != want {
+				t.Fatalf("len(forceStopCalls) = %d, want %d", got, want)
+			}
+
+			events, err := store.ListTaskEvents(
+				t.Context(),
+				EventQuery{TaskID: taskRecord.ID},
+			)
+			if err != nil {
+				t.Fatalf("ListTaskEvents() error = %v", err)
+			}
+			if !containsEventType(events, taskEventRunFailed) ||
+				!containsEventType(events, taskEventRunRecovered) {
+				t.Fatalf(
+					"events = %#v, want %q and %q",
+					sortedEventTypes(events),
+					taskEventRunFailed,
+					taskEventRunRecovered,
+				)
+			}
+		},
+	)
+
+	t.Run(
+		"Should claimed run cannot recover to running without a session binding",
+		func(t *testing.T) {
+			t.Parallel()
+
+			store := newInMemoryManagerStore()
+			manager := newTaskManagerForTest(t, store)
+			actor := validActorContext()
+
+			taskRecord, err := manager.CreateTask(t.Context(), CreateTask{
+				ProfileID: storepkg.DefaultProfileID,
+				Scope:     ScopeGlobal,
+				Title:     "Claimed without session",
+			}, actor)
+			if err != nil {
+				t.Fatalf("CreateTask() error = %v", err)
+			}
+			run, err := manager.EnqueueRun(
+				t.Context(),
+				EnqueueRun{TaskID: taskRecord.ID},
+				actor,
+			)
+			if err != nil {
+				t.Fatalf("EnqueueRun() error = %v", err)
+			}
+			run, err = admitRunDirectlyForTest(t.Context(), manager, run.ID, actor)
+			if err != nil {
+				t.Fatalf("ClaimNextRun() error = %v", err)
+			}
+
+			if _, err := manager.RecoverRunOnBoot(t.Context(), run.ID, RunBootRecovery{
+				Action:       RunBootRecoveryMarkRunning,
+				Reason:       "orphaned_on_boot",
+				SessionState: "missing",
+			}, daemonActor); !errors.Is(err, ErrInvalidStatusTransition) {
+				t.Fatalf(
+					"RecoverRunOnBoot(mark running without session) error = %v, want %v",
+					err,
+					ErrInvalidStatusTransition,
+				)
+			}
+		},
+	)
+
+	t.Run(
+		"Should running run remains unchanged when recovery confirms it is still live",
+		func(t *testing.T) {
+			t.Parallel()
+
+			store := newInMemoryManagerStore()
+			executor := &recordingSessionExecutor{}
+			manager := newTaskManagerForTestWithOptions(t, store, WithSessionExecutor(executor))
+			actor := validActorContext()
+
+			taskRecord, err := manager.CreateTask(t.Context(), CreateTask{
+				ProfileID: storepkg.DefaultProfileID,
+				Scope:     ScopeGlobal,
+				Title:     "Running still live",
+			}, actor)
+			if err != nil {
+				t.Fatalf("CreateTask() error = %v", err)
+			}
+			run, err := manager.EnqueueRun(
+				t.Context(),
+				EnqueueRun{TaskID: taskRecord.ID},
+				actor,
+			)
+			if err != nil {
+				t.Fatalf("EnqueueRun() error = %v", err)
+			}
+			run, err = admitRunDirectlyForTest(t.Context(), manager, run.ID, actor)
+			if err != nil {
+				t.Fatalf("ClaimNextRun() error = %v", err)
+			}
+			run, err = manager.StartRun(t.Context(), run.ID, StartRun{}, actor)
+			if err != nil {
+				t.Fatalf("StartRun() error = %v", err)
+			}
+
+			eventsBefore, err := store.ListTaskEvents(
+				t.Context(),
+				EventQuery{TaskID: taskRecord.ID},
+			)
+			if err != nil {
+				t.Fatalf("ListTaskEvents(before) error = %v", err)
+			}
+
+			recovered, err := manager.RecoverRunOnBoot(
+				t.Context(),
+				run.ID,
+				RunBootRecovery{
+					Action:       RunBootRecoveryMarkRunning,
+					Reason:       "orphaned_on_boot",
+					SessionState: "active",
+				},
+				daemonActor,
+			)
+			if err != nil {
+				t.Fatalf("RecoverRunOnBoot(mark running while already running) error = %v", err)
+			}
+			if got, want := recovered.Status, TaskRunStatusRunning; got != want {
+				t.Fatalf("recovered.Status = %q, want %q", got, want)
+			}
+
+			eventsAfter, err := store.ListTaskEvents(
+				t.Context(),
+				EventQuery{TaskID: taskRecord.ID},
+			)
+			if err != nil {
+				t.Fatalf("ListTaskEvents(after) error = %v", err)
+			}
+			if got, want := len(eventsAfter), len(eventsBefore); got != want {
+				t.Fatalf("event count after noop recovery = %d, want %d", got, want)
+			}
+		},
+	)
+
+	t.Run("Should starting run cannot be requeued on boot", func(t *testing.T) {
+		t.Parallel()
+
+		store := newInMemoryManagerStore()
+		executor := &recordingSessionExecutor{}
+		manager := newTaskManagerForTestWithOptions(t, store, WithSessionExecutor(executor))
+		actor := validActorContext()
+
+		taskRecord, err := manager.CreateTask(t.Context(), CreateTask{
+			ProfileID: storepkg.DefaultProfileID,
+			Scope:     ScopeGlobal,
+			Title:     "Starting cannot requeue",
+		}, actor)
+		if err != nil {
+			t.Fatalf("CreateTask() error = %v", err)
+		}
+		run, err := manager.EnqueueRun(
+			t.Context(),
+			EnqueueRun{TaskID: taskRecord.ID},
+			actor,
+		)
+		if err != nil {
+			t.Fatalf("EnqueueRun() error = %v", err)
+		}
+		run, err = admitRunDirectlyForTest(t.Context(), manager, run.ID, actor)
+		if err != nil {
+			t.Fatalf("ClaimNextRun() error = %v", err)
+		}
+		run, err = manager.AttachRunSession(t.Context(), run.ID, "sess-bound", actor)
+		if err != nil {
+			t.Fatalf("AttachRunSession() error = %v", err)
+		}
+
+		if _, err := manager.RecoverRunOnBoot(t.Context(), run.ID, RunBootRecovery{
+			Action:       RunBootRecoveryRequeue,
+			Reason:       "orphaned_on_boot",
+			SessionState: "missing",
+		}, daemonActor); !errors.Is(err, ErrInvalidStatusTransition) {
+			t.Fatalf(
+				"RecoverRunOnBoot(requeue starting) error = %v, want %v",
+				err,
+				ErrInvalidStatusTransition,
+			)
+		}
+	})
+}
+
+func TestManagerGetTaskAndFailRunGuardrails(t *testing.T) {
+	t.Parallel()
+
+	manager := newTaskManagerForTest(t, newInMemoryManagerStore())
+	actor := validActorContext()
+
+	if _, err := manager.GetTask(t.Context(), "", actor); !errors.Is(err, ErrValidation) {
+		t.Fatalf("GetTask(empty id) error = %v, want %v", err, ErrValidation)
+	}
+	if _, err := manager.GetTask(t.Context(), "missing-task", actor); !errors.Is(
+		err,
+		ErrTaskNotFound,
+	) {
+		t.Fatalf("GetTask(missing) error = %v, want %v", err, ErrTaskNotFound)
+	}
+
+	taskRecord, err := manager.CreateTask(t.Context(), CreateTask{
+		ProfileID: storepkg.DefaultProfileID,
+		Scope:     ScopeGlobal,
+		Title:     "Queued fail guard",
+	}, actor)
+	if err != nil {
+		t.Fatalf("CreateTask() error = %v", err)
+	}
+	run, err := manager.EnqueueRun(t.Context(), EnqueueRun{TaskID: taskRecord.ID}, actor)
+	if err != nil {
+		t.Fatalf("EnqueueRun() error = %v", err)
+	}
+	if _, err := manager.FailRun(t.Context(), run.ID, RunFailure{
+		Error: "cannot fail queued run",
+	}, actor); !errors.Is(err, ErrInvalidStatusTransition) {
+		t.Fatalf("FailRun(queued) error = %v, want %v", err, ErrInvalidStatusTransition)
+	}
+}
+
+func TestManagerTaskMutationTransactionRollsBackWhenAuditAppendFails(t *testing.T) {
+	t.Parallel()
+
+	// Invariant: an authoritative run mutation, its task projection, and its audit
+	// record share one rollback boundary. Owning layer: task service. Canonical
+	// suite: manager_test.go, with SQLite commit-boundary coverage in global_db_task_event_tx_test.go.
+	ctx := t.Context()
+	sentinel := errors.New("record task run completion audit")
+	base := newInMemoryManagerStore()
+	store := &failingTaskEventStore{Store: base, fail: true, err: sentinel}
+	manager := newTaskManagerForTest(t, store)
+	actor := validActorContext()
+
+	taskRecord := validTask()
+	taskRecord.Status = TaskStatusInProgress
+	taskRecord.CurrentRunID = "run-task-mutation-rollback"
+	if err := base.CreateTask(ctx, taskRecord); err != nil {
+		t.Fatalf("CreateTask() error = %v", err)
+	}
+	run := validRun()
+	run.ID = taskRecord.CurrentRunID
+	run.TaskID = taskRecord.ID
+	run.Status = TaskRunStatusRunning
+	run.StartedAt = run.QueuedAt.Add(time.Minute)
+	run.ClearResult()
+	if err := base.CreateTaskRun(ctx, run); err != nil {
+		t.Fatalf("CreateTaskRun() error = %v", err)
+	}
+
+	_, err := manager.CompleteRun(ctx, run.ID, RunResult{Value: json.RawMessage(`{"ok":true}`)}, actor)
+	if !errors.Is(err, sentinel) {
+		t.Fatalf("CompleteRun() error = %v, want identity %v", err, sentinel)
+	}
+	storedRun, err := base.GetTaskRun(ctx, run.ID)
+	if err != nil {
+		t.Fatalf("GetTaskRun() error = %v", err)
+	}
+	if got, want := storedRun.Status, TaskRunStatusRunning; got != want {
+		t.Fatalf("stored run status = %q, want rollback to %q", got, want)
+	}
+	if len(storedRun.ResultValue()) != 0 || !storedRun.EndedAt.IsZero() {
+		t.Fatalf(
+			"stored completion fields = result %s ended_at %v, want rollback",
+			storedRun.ResultValue(),
+			storedRun.EndedAt,
+		)
+	}
+	storedTask, err := base.GetTask(ctx, taskRecord.ID)
+	if err != nil {
+		t.Fatalf("GetTask() error = %v", err)
+	}
+	if got, want := storedTask.Status, TaskStatusInProgress; got != want {
+		t.Fatalf("stored task status = %q, want rollback to %q", got, want)
+	}
+	if got, want := storedTask.CurrentRunID, run.ID; got != want {
+		t.Fatalf("stored task CurrentRunID = %q, want rollback to %q", got, want)
+	}
+	if got := len(base.events); got != 0 {
+		t.Fatalf("len(events) after rollback = %d, want 0", got)
+	}
+}
+
+func TestRunBootRecoveryHelpersAndWriteAuthority(t *testing.T) {
+	t.Parallel()
+
+	t.Run("Should formats recovery errors for bound and missing sessions", func(t *testing.T) {
+		t.Parallel()
+
+		if got, want := runBootRecoveryError(Run{
+			ID:        "run-active",
+			SessionID: "sess-active",
+		}, RunBootRecovery{
+			SessionState: "stopped",
+		}), `orphaned on boot: session "sess-active" is stopped`; got != want {
+			t.Fatalf("runBootRecoveryError(bound+state) = %q, want %q", got, want)
+		}
+		if got, want := runBootRecoveryError(Run{
+			ID:        "run-bound",
+			SessionID: "sess-bound",
+		}, RunBootRecovery{}), `orphaned on boot: session "sess-bound" is not live`; got != want {
+			t.Fatalf("runBootRecoveryError(bound) = %q, want %q", got, want)
+		}
+		if got, want := runBootRecoveryError(
+			Run{ID: "run-missing"},
+			RunBootRecovery{},
+		), "orphaned on boot: run has no live session"; got != want {
+			t.Fatalf("runBootRecoveryError(missing) = %q, want %q", got, want)
+		}
+	})
+
+	t.Run("Should normalizes recovery metadata reason", func(t *testing.T) {
+		t.Parallel()
+
+		metadata, err := runBootRecoveryMetadata(Run{
+			ID:        "run-meta",
+			Status:    TaskRunStatusStarting,
+			SessionID: "sess-meta",
+		}, RunBootRecovery{
+			Reason:       "   ",
+			SessionState: "missing",
+		})
+		if err != nil {
+			t.Fatalf("runBootRecoveryMetadata() error = %v", err)
+		}
+
+		var payload map[string]string
+		if err := json.Unmarshal(metadata, &payload); err != nil {
+			t.Fatalf("json.Unmarshal(metadata) error = %v", err)
+		}
+		if got, want := payload["reason"], "orphaned_on_boot"; got != want {
+			t.Fatalf("payload[reason] = %q, want %q", got, want)
+		}
+		if got, want := payload["previous_status"], TaskRunStatusStarting.String(); got != want {
+			t.Fatalf("payload[previous_status] = %q, want %q", got, want)
+		}
+	})
+
+	t.Run("Should write authority rejects read-only actors", func(t *testing.T) {
+		t.Parallel()
+
+		actor := validActorContext()
+		actor.Authority.Write = false
+		actor.Authority.CreateGlobal = false
+		actor.Authority.CreateWorkspace = false
+		if err := requireWriteAuthority(actor); !errors.Is(err, ErrPermissionDenied) {
+			t.Fatalf(
+				"requireWriteAuthority(read-only) error = %v, want %v",
+				err,
+				ErrPermissionDenied,
+			)
+		}
+	})
+}
+
+func TestManagerAdditionalBranchCoverage(t *testing.T) {
+	t.Parallel()
+
+	t.Run("Should constructor validates required dependencies", func(t *testing.T) {
+		t.Parallel()
+
+		if _, err := NewManager(); err == nil {
+			t.Fatal("NewManager() error = nil, want non-nil")
+		}
+		if _, err := NewManager(WithStore(newInMemoryManagerStore()), WithManagerNow(nil)); err == nil {
+			t.Fatal("NewManager(nil clock) error = nil, want non-nil")
+		}
+		if _, err := NewManager(WithStore(newInMemoryManagerStore()), WithIDGenerator(nil)); err == nil {
+			t.Fatal("NewManager(nil generator) error = nil, want non-nil")
+		}
+
+		manager, err := NewManager(
+			WithStore(newInMemoryManagerStore()),
+			WithSessionExecutor(testSessionExecutor{}),
+		)
+		if err != nil {
+			t.Fatalf("NewManager(with session executor) error = %v", err)
+		}
+		if manager.sessions == nil {
+			t.Fatal("manager.sessions = nil, want non-nil")
+		}
+	})
+
+	t.Run("Should reject task creation before persistence when identifier generation fails", func(t *testing.T) {
+		t.Parallel()
+
+		store := newInMemoryManagerStore()
+		entropyErr := errors.New("entropy unavailable")
+		manager, err := NewManager(
+			WithStore(store),
+			WithIDGenerator(func(string) (string, error) {
+				return "", entropyErr
+			}),
+		)
+		if err != nil {
+			t.Fatalf("NewManager() error = %v", err)
+		}
+
+		created, err := manager.CreateTask(t.Context(), CreateTask{
+			ProfileID: storepkg.DefaultProfileID,
+			Scope:     ScopeGlobal,
+			Title:     "Entropy failure",
+		}, validActorContext())
+		if !errors.Is(err, entropyErr) {
+			t.Fatalf("CreateTask() error = %v, want %v", err, entropyErr)
+		}
+		if created != nil {
+			t.Fatalf("CreateTask() = %#v, want nil", created)
+		}
+		if len(store.tasks) != 0 || len(store.events) != 0 {
+			t.Fatalf(
+				"store mutations after identifier failure = tasks:%d events:%d, want zero",
+				len(store.tasks),
+				len(store.events),
+			)
+		}
+	})
+
+	t.Run("Should surface helpers default origin refs", func(t *testing.T) {
+		t.Parallel()
+
+		extension, err := DeriveExtensionActorContext("ext-1", "")
+		if err != nil {
+			t.Fatalf("DeriveExtensionActorContext() error = %v", err)
+		}
+		if got, want := extension.Origin.Ref, "ext-1"; got != want {
+			t.Fatalf("extension.Origin.Ref = %q, want %q", got, want)
+		}
+
+		daemon, err := DeriveDaemonActorContext("scheduler", "")
+		if err != nil {
+			t.Fatalf("DeriveDaemonActorContext() error = %v", err)
+		}
+		if got, want := daemon.Origin.Ref, "scheduler"; got != want {
+			t.Fatalf("daemon.Origin.Ref = %q, want %q", got, want)
+		}
+	})
+
+	t.Run("Should task depth detects cycles", func(t *testing.T) {
+		t.Parallel()
+
+		store := newInMemoryManagerStore()
+		manager := newTaskManagerForTest(t, store)
+		taskA := validTask()
+		taskA.ID = "task-a"
+		taskA.Status = TaskStatusReady
+		taskA.ParentTaskID = "task-b"
+		taskB := validTask()
+		taskB.ID = "task-b"
+		taskB.Status = TaskStatusReady
+		taskB.ParentTaskID = "task-a"
+		store.tasks[taskA.ID] = taskA
+		store.tasks[taskB.ID] = taskB
+
+		_, err := manager.taskDepth(t.Context(), taskA)
+		if !errors.Is(err, ErrValidation) {
+			t.Fatalf("taskDepth(cycle) error = %v, want %v", err, ErrValidation)
+		}
+	})
+
+	t.Run("Should create child rejects mismatched parent field", func(t *testing.T) {
+		t.Parallel()
+
+		manager := newTaskManagerForTest(t, newInMemoryManagerStore())
+		actor := validActorContext()
+		parent, err := manager.CreateTask(t.Context(), CreateTask{
+			ProfileID: storepkg.DefaultProfileID,
+			Scope:     ScopeGlobal,
+			Title:     "Parent",
+		}, actor)
+		if err != nil {
+			t.Fatalf("CreateTask(parent) error = %v", err)
+		}
+
+		_, err = manager.CreateChildTask(t.Context(), parent.ID, CreateTask{
+			ProfileID:    storepkg.DefaultProfileID,
+			Scope:        ScopeGlobal,
+			ParentTaskID: "different-parent",
+			Title:        "Child",
+		}, actor)
+		if !errors.Is(err, ErrValidation) {
+			t.Fatalf("CreateChildTask(mismatch) error = %v, want %v", err, ErrValidation)
+		}
+	})
+
+	t.Run(
+		"Should remove dependency validates ids and nil payload marshals cleanly",
+		func(t *testing.T) {
+			t.Parallel()
+
+			manager := newTaskManagerForTest(t, newInMemoryManagerStore())
+			actor := validActorContext()
+			if err := manager.RemoveDependency(t.Context(), "", "task-b", actor); !errors.Is(
+				err,
+				ErrValidation,
+			) {
+				t.Fatalf("RemoveDependency(empty task) error = %v, want %v", err, ErrValidation)
+			}
+			if err := manager.RemoveDependency(t.Context(), "task-a", "", actor); !errors.Is(
+				err,
+				ErrValidation,
+			) {
+				t.Fatalf(
+					"RemoveDependency(empty depends_on) error = %v, want %v",
+					err,
+					ErrValidation,
+				)
+			}
+
+			raw, err := marshalTaskEventPayload(nil)
+			if err != nil {
+				t.Fatalf("marshalTaskEventPayload(nil) error = %v", err)
+			}
+			if raw != nil {
+				t.Fatalf("marshalTaskEventPayload(nil) = %q, want nil", string(raw))
+			}
+		},
+	)
+
+	t.Run("Should ownership helpers cover nil and zero values", func(t *testing.T) {
+		t.Parallel()
+
+		if got := normalizeOwnership(nil); got != nil {
+			t.Fatalf("normalizeOwnership(nil) = %#v, want nil", got)
+		}
+		if got := normalizeOwnership(&Ownership{}); got != nil {
+			t.Fatalf("normalizeOwnership(zero) = %#v, want nil", got)
+		}
+		if sameOwnership(nil, &Ownership{Kind: OwnerKindPool, Ref: "triage"}) {
+			t.Fatal("sameOwnership(nil, owner) = true, want false")
+		}
+		if !isTerminalTaskStatus(TaskStatusFailed) {
+			t.Fatal("isTerminalTaskStatus(failed) = false, want true")
+		}
+	})
+}
+
+type recordedWakeCall struct {
+	CreatorSessionID string
+	Event            WakeEvent
+}
+
+type recordingWakeNotifier struct {
+	calls          []recordedWakeCall
+	err            error
+	errByWakeEvent map[string]error
+}
+
+type wakeAuditLockProbeStore struct {
+	*inMemoryManagerStore
+	onTaskWakeEventLookup func()
+}
+
+func (n *recordingWakeNotifier) WakeCreator(
+	ctx context.Context,
+	creatorSessionID string,
+	event WakeEvent,
+) error {
+	if ctx == nil {
+		return errors.New("wake notifier context is required")
+	}
+	normalized := event.Normalize()
+	n.calls = append(n.calls, recordedWakeCall{
+		CreatorSessionID: strings.TrimSpace(creatorSessionID),
+		Event:            normalized,
+	})
+	if n.errByWakeEvent != nil {
+		if err, ok := n.errByWakeEvent[normalized.WakeEventID]; ok {
+			return err
+		}
+	}
+	return n.err
+}
+
+func (s *wakeAuditLockProbeStore) TaskWakeEventExists(
+	ctx context.Context,
+	taskID string,
+	wakeEventID string,
+) (bool, error) {
+	if s.onTaskWakeEventLookup != nil {
+		s.onTaskWakeEventLookup()
+	}
+	return s.inMemoryManagerStore.TaskWakeEventExists(ctx, taskID, wakeEventID)
+}
+
+func TestManagerWakeCreatorDispatchesEligibleTransitions(t *testing.T) {
+	t.Parallel()
+
+	store := newInMemoryManagerStore()
+	executor := &recordingSessionExecutor{startRef: &SessionRef{SessionID: "sess-worker"}}
+	wakes := &recordingWakeNotifier{}
+	manager := newTaskManagerForTestWithOptions(
+		t,
+		store,
+		WithSessionExecutor(executor),
+		WithWakeNotifier(wakes),
+		WithBlockRecurrenceLimit(1),
+	)
+	creator := agentSessionActorContext("sess-creator")
+	worker := agentSessionActorContext("sess-worker")
+	operator := validActorContext()
+
+	terminalTask, terminalRun := createRunningRunForWakeTest(t, manager, creator, worker)
+	if _, err := manager.CompleteRun(t.Context(), terminalRun.ID, RunResult{
+		Value: json.RawMessage(`{"ok":true}`),
+	}, worker); err != nil {
+		t.Fatalf("CompleteRun() error = %v", err)
+	}
+
+	blockedTask, err := manager.CreateTask(t.Context(), CreateTask{
+		ProfileID: storepkg.DefaultProfileID,
+		Scope:     ScopeGlobal,
+		Title:     "Blocked child",
+	}, creator)
+	if err != nil {
+		t.Fatalf("CreateTask(blocked) error = %v", err)
+	}
+	if _, err := manager.BlockTask(t.Context(), BlockRequest{
+		TaskID: blockedTask.ID,
+		Kind:   BlockKindNeedsInput,
+		Reason: "waiting for delegated input",
+	}, operator); err != nil {
+		t.Fatalf("BlockTask(blocked) error = %v", err)
+	}
+
+	attentionTask, err := manager.CreateTask(t.Context(), CreateTask{
+		ProfileID: storepkg.DefaultProfileID,
+		Scope:     ScopeGlobal,
+		Title:     "Needs attention child",
+	}, creator)
+	if err != nil {
+		t.Fatalf("CreateTask(attention) error = %v", err)
+	}
+	firstBlock, err := manager.BlockTask(t.Context(), BlockRequest{
+		TaskID: attentionTask.ID,
+		Kind:   BlockKindNeedsInput,
+		Reason: "first missing input",
+	}, operator)
+	if err != nil {
+		t.Fatalf("BlockTask(first attention) error = %v", err)
+	}
+	if _, err := manager.ClearTaskBlock(
+		t.Context(),
+		attentionTask.ID,
+		firstBlock.ID,
+		"input arrived",
+		operator,
+	); err != nil {
+		t.Fatalf("ClearTaskBlock(first attention) error = %v", err)
+	}
+	if _, err := manager.BlockTask(t.Context(), BlockRequest{
+		TaskID: attentionTask.ID,
+		Kind:   BlockKindNeedsInput,
+		Reason: "second missing input",
+	}, operator); err != nil {
+		t.Fatalf("BlockTask(second attention) error = %v", err)
+	}
+
+	assertWakeCallForTask(t, wakes.calls, terminalTask.ID, WakeReasonTerminal, terminalRun.ID)
+	assertWakeCallForTask(t, wakes.calls, blockedTask.ID, WakeReasonBlocked, "")
+	assertWakeCallForTask(t, wakes.calls, attentionTask.ID, WakeReasonNeedsAttention, "")
+	assertWakeEventCount(t, store, terminalTask.ID, taskEventWakeDelivered, 1)
+	assertWakeEventCount(t, store, blockedTask.ID, taskEventWakeDelivered, 1)
+	assertWakeEventCount(t, store, attentionTask.ID, taskEventWakeDelivered, 3)
+}
+
+func TestManagerWakeCreatorDeliversOncePerWakeEventID(t *testing.T) {
+	t.Parallel()
+
+	t.Run("Should deduplicate repeated delivery from the bounded cache", func(t *testing.T) {
+		t.Parallel()
+
+		store := newInMemoryManagerStore()
+		wakes := &recordingWakeNotifier{}
+		manager := newTaskManagerForTestWithOptions(t, store, WithWakeNotifier(wakes))
+		creator := agentSessionActorContext("sess-creator")
+		taskRecord, err := manager.CreateTask(t.Context(), CreateTask{
+			ProfileID: storepkg.DefaultProfileID,
+			Scope:     ScopeGlobal,
+			Title:     "Dedupe child",
+		}, creator)
+		if err != nil {
+			t.Fatalf("CreateTask() error = %v", err)
+		}
+		run := Run{
+			ID: "run-dedupe", TaskID: taskRecord.ID,
+			Status: TaskRunStatusCompleted, SessionID: "sess-worker",
+		}
+
+		manager.dispatchTerminalWake(t.Context(), *taskRecord, run, creator)
+		manager.dispatchTerminalWake(t.Context(), *taskRecord, run, creator)
+
+		if got, want := len(wakes.calls), 1; got != want {
+			t.Fatalf("len(wake calls) = %d, want %d", got, want)
+		}
+		assertWakeEventCount(t, store, taskRecord.ID, taskEventWakeDelivered, 1)
+	})
+
+	t.Run("Should fall back to the authoritative ledger after cache eviction", func(t *testing.T) {
+		t.Parallel()
+
+		store := newInMemoryManagerStore()
+		wakes := &recordingWakeNotifier{}
+		manager := newTaskManagerForTestWithOptions(t, store, WithWakeNotifier(wakes))
+		creator := agentSessionActorContext("sess-creator-eviction")
+		taskRecord, err := manager.CreateTask(t.Context(), CreateTask{
+			ProfileID: storepkg.DefaultProfileID,
+			Scope:     ScopeGlobal,
+			Title:     "Dedupe after eviction",
+		}, creator)
+		if err != nil {
+			t.Fatalf("CreateTask() error = %v", err)
+		}
+		for index := range 1024 {
+			if err := store.appendTaskEventForTest(
+				taskRecord.ID,
+				"",
+				taskEventUpdated,
+				creator,
+				map[string]any{"sequence": index},
+				time.Time{},
+			); err != nil {
+				t.Fatalf("appendTaskEventForTest(%d) error = %v", index, err)
+			}
+		}
+		run := Run{
+			ID: "run-dedupe-eviction", TaskID: taskRecord.ID,
+			Status: TaskRunStatusCompleted, SessionID: "sess-worker",
+		}
+		manager.dispatchTerminalWake(t.Context(), *taskRecord, run, creator)
+		for index := range wakeEventCacheMaxEntries {
+			reserved, reserveErr := manager.reserveWakeEvent(
+				t.Context(),
+				taskRecord.ID,
+				fmt.Sprintf("eviction-filler-%d", index),
+			)
+			if reserveErr != nil {
+				t.Fatalf("reserveWakeEvent(%d) error = %v", index, reserveErr)
+			}
+			if !reserved {
+				t.Fatalf("reserveWakeEvent(%d) = false, want true", index)
+			}
+		}
+
+		manager.dispatchTerminalWake(t.Context(), *taskRecord, run, creator)
+
+		if got, want := len(wakes.calls), 1; got != want {
+			t.Fatalf("len(wake calls) = %d, want %d after ledger dedup", got, want)
+		}
+		assertWakeEventCount(t, store, taskRecord.ID, taskEventWakeDelivered, 1)
+	})
+}
+
+func TestManagerWakeCreatorQueriesAuditIdentityOutsideWakeLock(t *testing.T) {
+	t.Parallel()
+
+	t.Run("Should release wake lock before querying the audit identity", func(t *testing.T) {
+		t.Parallel()
+
+		store := &wakeAuditLockProbeStore{inMemoryManagerStore: newInMemoryManagerStore()}
+		wakes := &recordingWakeNotifier{}
+		manager := newTaskManagerForTestWithOptions(t, store, WithWakeNotifier(wakes))
+		lookupCalls := 0
+		store.onTaskWakeEventLookup = func() {
+			lookupCalls++
+			if !manager.wakeMu.TryLock() {
+				t.Fatal("wakeMu is locked during audit identity lookup")
+			}
+			manager.wakeMu.Unlock()
+		}
+		creator := agentSessionActorContext("sess-creator")
+		taskRecord, err := manager.CreateTask(t.Context(), CreateTask{
+			ProfileID: storepkg.DefaultProfileID,
+			Scope:     ScopeGlobal,
+			Title:     "Audit scan child",
+		}, creator)
+		if err != nil {
+			t.Fatalf("CreateTask() error = %v", err)
+		}
+
+		manager.dispatchTerminalWake(t.Context(), *taskRecord, Run{
+			ID:        "run-audit-scan",
+			TaskID:    taskRecord.ID,
+			Status:    TaskRunStatusCompleted,
+			SessionID: "sess-worker",
+		}, creator)
+
+		if got, want := lookupCalls, 1; got != want {
+			t.Fatalf("TaskWakeEventExists calls = %d, want %d", got, want)
+		}
+		if got, want := len(wakes.calls), 1; got != want {
+			t.Fatalf("len(wake calls) = %d, want %d", got, want)
+		}
+		assertWakeEventCount(t, store.inMemoryManagerStore, taskRecord.ID, taskEventWakeDelivered, 1)
+	})
+}
+
+func TestManagerWakeCreatorSuppressesIneligibleDelivery(t *testing.T) {
+	t.Parallel()
+
+	t.Run("Should suppress dead creator sessions after auditing", func(t *testing.T) {
+		t.Parallel()
+
+		store := newInMemoryManagerStore()
+		wakes := &recordingWakeNotifier{err: ErrSessionNotLive}
+		manager := newTaskManagerForTestWithOptions(t, store, WithWakeNotifier(wakes))
+		creator := agentSessionActorContext("sess-dead")
+		taskRecord, err := manager.CreateTask(t.Context(), CreateTask{
+			ProfileID: storepkg.DefaultProfileID,
+			Scope:     ScopeGlobal,
+			Title:     "Dead creator child",
+		}, creator)
+		if err != nil {
+			t.Fatalf("CreateTask() error = %v", err)
+		}
+
+		manager.dispatchTerminalWake(t.Context(), *taskRecord, Run{
+			ID:        "run-dead",
+			TaskID:    taskRecord.ID,
+			Status:    TaskRunStatusCompleted,
+			SessionID: "sess-worker",
+		}, creator)
+
+		if got, want := len(wakes.calls), 1; got != want {
+			t.Fatalf("len(wake calls) = %d, want %d", got, want)
+		}
+		payload := singleWakePayloadForTest(t, store, taskRecord.ID, taskEventWakeSuppressed)
+		if got, want := payload.SuppressionReason, wakeSuppressionSessionNotLive; got != want {
+			t.Fatalf("suppression reason = %q, want %q", got, want)
+		}
+	})
+
+	t.Run("Should suppress opt-out tasks before delivery", func(t *testing.T) {
+		t.Parallel()
+
+		store := newInMemoryManagerStore()
+		wakes := &recordingWakeNotifier{}
+		manager := newTaskManagerForTestWithOptions(t, store, WithWakeNotifier(wakes))
+		creator := agentSessionActorContext("sess-creator")
+		taskRecord, err := manager.CreateTask(t.Context(), CreateTask{
+			ProfileID: storepkg.DefaultProfileID,
+			Scope:     ScopeGlobal,
+			Title:     "Opt-out child",
+		}, creator)
+		if err != nil {
+			t.Fatalf("CreateTask() error = %v", err)
+		}
+		disabled := store.tasks[taskRecord.ID]
+		disabled.WakeCreator = false
+		store.tasks[taskRecord.ID] = disabled
+
+		manager.dispatchTerminalWake(t.Context(), disabled, Run{
+			ID:        "run-opt-out",
+			TaskID:    taskRecord.ID,
+			Status:    TaskRunStatusCompleted,
+			SessionID: "sess-worker",
+		}, creator)
+
+		if got, want := len(wakes.calls), 0; got != want {
+			t.Fatalf("len(wake calls) = %d, want %d", got, want)
+		}
+		payload := singleWakePayloadForTest(t, store, taskRecord.ID, taskEventWakeSuppressed)
+		if got, want := payload.SuppressionReason, wakeSuppressionOptOut; got != want {
+			t.Fatalf("suppression reason = %q, want %q", got, want)
+		}
+	})
+
+	t.Run("Should suppress self wake", func(t *testing.T) {
+		t.Parallel()
+
+		store := newInMemoryManagerStore()
+		wakes := &recordingWakeNotifier{}
+		manager := newTaskManagerForTestWithOptions(t, store, WithWakeNotifier(wakes))
+		creator := agentSessionActorContext("sess-self")
+		taskRecord, err := manager.CreateTask(t.Context(), CreateTask{
+			ProfileID: storepkg.DefaultProfileID,
+			Scope:     ScopeGlobal,
+			Title:     "Self child",
+		}, creator)
+		if err != nil {
+			t.Fatalf("CreateTask() error = %v", err)
+		}
+
+		manager.dispatchTerminalWake(t.Context(), *taskRecord, Run{
+			ID:        "run-self",
+			TaskID:    taskRecord.ID,
+			Status:    TaskRunStatusCompleted,
+			SessionID: "sess-self",
+		}, creator)
+
+		if got, want := len(wakes.calls), 0; got != want {
+			t.Fatalf("len(wake calls) = %d, want %d", got, want)
+		}
+		payload := singleWakePayloadForTest(t, store, taskRecord.ID, taskEventWakeSuppressed)
+		if got, want := payload.SuppressionReason, wakeSuppressionSelfWake; got != want {
+			t.Fatalf("suppression reason = %q, want %q", got, want)
+		}
+	})
+
+	t.Run("Should ignore non agent-session creators", func(t *testing.T) {
+		t.Parallel()
+
+		store := newInMemoryManagerStore()
+		wakes := &recordingWakeNotifier{}
+		manager := newTaskManagerForTestWithOptions(t, store, WithWakeNotifier(wakes))
+		actor := validActorContext()
+		taskRecord, err := manager.CreateTask(t.Context(), CreateTask{
+			ProfileID: storepkg.DefaultProfileID,
+			Scope:     ScopeGlobal,
+			Title:     "Human child",
+		}, actor)
+		if err != nil {
+			t.Fatalf("CreateTask() error = %v", err)
+		}
+
+		manager.dispatchTerminalWake(t.Context(), *taskRecord, Run{
+			ID:        "run-human",
+			TaskID:    taskRecord.ID,
+			Status:    TaskRunStatusCompleted,
+			SessionID: "sess-worker",
+		}, actor)
+
+		if got, want := len(wakes.calls), 0; got != want {
+			t.Fatalf("len(wake calls) = %d, want %d", got, want)
+		}
+		assertWakeEventCount(t, store, taskRecord.ID, taskEventWakeDelivered, 0)
+		assertWakeEventCount(t, store, taskRecord.ID, taskEventWakeSuppressed, 0)
+	})
+}
+
+func TestManagerWakeCreatorRedactsSecretsFromSummaryAndPayload(t *testing.T) {
+	t.Parallel()
+
+	t.Run("Should redact claim tokens and project-wide secret shapes", func(t *testing.T) {
+		t.Parallel()
+
+		rawClaimToken := "compozy_claim_secret123"
+		rawAccessToken := "oauth-secret-123456"
+		rawBearerToken := "ya29.wake-secret-token"
+		rawPKCEVerifier := "pkce-secret-123456"
+		dynamicSecret := "runtime-provider-secret-123456"
+		cleanup := diagnostics.RegisterDynamicSecret(dynamicSecret)
+		t.Cleanup(cleanup)
+		rawSecrets := []string{
+			rawClaimToken,
+			rawAccessToken,
+			rawBearerToken,
+			rawPKCEVerifier,
+			dynamicSecret,
+		}
+		store := newInMemoryManagerStore()
+		executor := &recordingSessionExecutor{startRef: &SessionRef{SessionID: "sess-worker"}}
+		wakes := &recordingWakeNotifier{}
+		manager := newTaskManagerForTestWithOptions(
+			t,
+			store,
+			WithSessionExecutor(executor),
+			WithWakeNotifier(wakes),
+		)
+		creator := agentSessionActorContext("sess-creator")
+		worker := agentSessionActorContext("sess-worker")
+		taskRecord, runningRun := createRunningRunForWakeTestWithTitle(
+			t,
+			manager,
+			"Delegated "+rawClaimToken+" access_token="+rawAccessToken,
+			creator,
+			worker,
+		)
+
+		if _, err := manager.FailRun(t.Context(), runningRun.ID, RunFailure{
+			Error: "failed with Bearer " + rawBearerToken +
+				" code_verifier=" + rawPKCEVerifier +
+				" " + dynamicSecret,
+		}, worker); err != nil {
+			t.Fatalf("FailRun() error = %v", err)
+		}
+
+		if got, want := len(wakes.calls), 1; got != want {
+			t.Fatalf("len(wake calls) = %d, want %d", got, want)
+		}
+		summary := wakes.calls[0].Event.Summary
+		payload := singleWakePayloadForTest(t, store, taskRecord.ID, taskEventWakeDelivered)
+		encoded, err := json.Marshal(payload)
+		if err != nil {
+			t.Fatalf("Marshal(wake payload) error = %v", err)
+		}
+		for _, rawSecret := range rawSecrets {
+			if strings.Contains(summary, rawSecret) {
+				t.Fatalf("wake summary contains raw secret %q: %q", rawSecret, summary)
+			}
+			if strings.Contains(string(encoded), rawSecret) {
+				t.Fatalf("wake payload contains raw secret %q: %s", rawSecret, encoded)
+			}
+		}
+		if !strings.Contains(summary, "[REDACTED]") {
+			t.Fatalf("wake summary = %q, want redaction marker", summary)
+		}
+		if !strings.Contains(string(encoded), "[REDACTED]") {
+			t.Fatalf("wake payload = %s, want redaction marker", encoded)
+		}
+	})
+}
+
+func TestManagerWakeCreatorSummarizesFailedRunsByTaskTerminalState(t *testing.T) {
+	t.Parallel()
+
+	t.Run("Should describe retryable failed runs as run-level wakes", func(t *testing.T) {
+		t.Parallel()
+
+		store := newInMemoryManagerStore()
+		executor := &recordingSessionExecutor{startRef: &SessionRef{SessionID: "sess-worker"}}
+		wakes := &recordingWakeNotifier{}
+		manager := newTaskManagerForTestWithOptions(
+			t,
+			store,
+			WithSessionExecutor(executor),
+			WithWakeNotifier(wakes),
+		)
+		creator := agentSessionActorContext("sess-creator")
+		worker := agentSessionActorContext("sess-worker")
+		_, runningRun := createRunningRunForWakeTestWithTitle(
+			t,
+			manager,
+			"Retry child",
+			creator,
+			worker,
+		)
+
+		if _, err := manager.FailRun(t.Context(), runningRun.ID, RunFailure{
+			Error: "temporary failure",
+		}, worker); err != nil {
+			t.Fatalf("FailRun() error = %v", err)
+		}
+
+		if got, want := len(wakes.calls), 1; got != want {
+			t.Fatalf("len(wake calls) = %d, want %d", got, want)
+		}
+		if summary := wakes.calls[0].Event.Summary; !strings.HasPrefix(summary, "Run for task ") {
+			t.Fatalf("wake summary = %q, want run-level failure wording", summary)
+		}
+	})
+
+	t.Run("Should describe exhausted failed runs as task-level wakes", func(t *testing.T) {
+		t.Parallel()
+
+		store := newInMemoryManagerStore()
+		executor := &recordingSessionExecutor{startRef: &SessionRef{SessionID: "sess-worker"}}
+		wakes := &recordingWakeNotifier{}
+		manager := newTaskManagerForTestWithOptions(
+			t,
+			store,
+			WithSessionExecutor(executor),
+			WithWakeNotifier(wakes),
+		)
+		creator := agentSessionActorContext("sess-creator")
+		worker := agentSessionActorContext("sess-worker")
+		_, runningRun := createRunningRunForWakeTestWithMaxAttempts(
+			t,
+			manager,
+			"Terminal failure child",
+			1,
+			creator,
+			worker,
+		)
+
+		if _, err := manager.FailRun(t.Context(), runningRun.ID, RunFailure{
+			Error: "final failure",
+		}, worker); err != nil {
+			t.Fatalf("FailRun() error = %v", err)
+		}
+
+		if got, want := len(wakes.calls), 1; got != want {
+			t.Fatalf("len(wake calls) = %d, want %d", got, want)
+		}
+		if summary := wakes.calls[0].Event.Summary; !strings.HasPrefix(summary, "Task ") {
+			t.Fatalf("wake summary = %q, want task-level failure wording", summary)
+		}
+	})
+}
+
+func agentSessionActorContext(sessionID string) ActorContext {
+	actor := agentSessionActorContextForWorkspace(sessionID, "")
+	actor.Scope.UserProfileID = storepkg.DefaultProfileID
+	actor.ReadScope = storepkg.ReadScope{ProfileID: storepkg.DefaultProfileID}
+	return actor
+}
+
+func agentSessionActorContextForWorkspace(sessionID string, workspaceID string) ActorContext {
+	actor := validActorContext()
+	trimmedSessionID := strings.TrimSpace(sessionID)
+	actor.Actor = ActorIdentity{Kind: ActorKindAgentSession, Ref: trimmedSessionID}
+	actor.Origin = Origin{Kind: OriginKindAgentSession, Ref: trimmedSessionID}
+	actor.Scope = CallerScope{
+		SessionID:   trimmedSessionID,
+		WorkspaceID: strings.TrimSpace(workspaceID),
+	}
+	return actor
+}
+
+func assertAutonomyReason(t *testing.T, err error, want AutonomyReasonCode) {
+	t.Helper()
+	reason, ok := AutonomyReasonOf(err)
+	if !ok || reason != want {
+		t.Fatalf("AutonomyReasonOf(%v) = %q/%v, want %q", err, reason, ok, want)
+	}
+}
+
+func createRunningRunForWakeTest(
+	t *testing.T,
+	manager *Service,
+	creator ActorContext,
+	worker ActorContext,
+) (*Task, *Run) {
+	t.Helper()
+	return createRunningRunForWakeTestWithTitle(t, manager, "Wake child", creator, worker)
+}
+
+func createRunningRunForWakeTestWithTitle(
+	t *testing.T,
+	manager *Service,
+	title string,
+	creator ActorContext,
+	worker ActorContext,
+) (*Task, *Run) {
+	t.Helper()
+
+	return createRunningRunForWakeTestWithMaxAttempts(
+		t,
+		manager,
+		title,
+		DefaultTaskMaxAttempts,
+		creator,
+		worker,
+	)
+}
+
+func createRunningRunForWakeTestWithMaxAttempts(
+	t *testing.T,
+	manager *Service,
+	title string,
+	maxAttempts int,
+	creator ActorContext,
+	worker ActorContext,
+) (*Task, *Run) {
+	t.Helper()
+
+	taskRecord, err := manager.CreateTask(t.Context(), CreateTask{
+		ProfileID:   storepkg.DefaultProfileID,
+		Scope:       ScopeGlobal,
+		Title:       title,
+		MaxAttempts: &maxAttempts,
+	}, creator)
+	if err != nil {
+		t.Fatalf("CreateTask() error = %v", err)
+	}
+	queuedRun, err := manager.EnqueueRun(t.Context(), EnqueueRun{
+		TaskID:         taskRecord.ID,
+		IdempotencyKey: "enqueue-" + taskRecord.ID,
+	}, worker)
+	if err != nil {
+		t.Fatalf("EnqueueRun() error = %v", err)
+	}
+	claimedRun, err := admitRunDirectlyForTest(t.Context(), manager, queuedRun.ID, worker)
+	if err != nil {
+		t.Fatalf("claimExactRunForTest() error = %v", err)
+	}
+	runningRun, err := manager.StartRun(t.Context(), claimedRun.ID, StartRun{
+		IdempotencyKey: "start-" + taskRecord.ID,
+	}, worker)
+	if err != nil {
+		t.Fatalf("StartRun() error = %v", err)
+	}
+	if strings.TrimSpace(runningRun.SessionID) == "" {
+		t.Fatal("StartRun().SessionID is empty")
+	}
+	return taskRecord, runningRun
+}
+
+func assertWakeCallForTask(
+	t *testing.T,
+	calls []recordedWakeCall,
+	taskID string,
+	reason WakeReason,
+	runID string,
+) {
+	t.Helper()
+
+	for _, call := range calls {
+		if call.Event.TaskID != strings.TrimSpace(taskID) {
+			continue
+		}
+		if call.Event.Reason.Normalize() != reason.Normalize() {
+			continue
+		}
+		if strings.TrimSpace(runID) != "" && call.Event.RunID != strings.TrimSpace(runID) {
+			continue
+		}
+		if call.CreatorSessionID != "sess-creator" {
+			t.Fatalf("CreatorSessionID = %q, want sess-creator", call.CreatorSessionID)
+		}
+		if strings.TrimSpace(call.Event.WakeEventID) == "" {
+			t.Fatal("WakeEventID is empty")
+		}
+		if strings.TrimSpace(call.Event.Summary) == "" {
+			t.Fatal("Summary is empty")
+		}
+		return
+	}
+	t.Fatalf(
+		"wake call for task %q reason %q run %q not found in %#v",
+		taskID,
+		reason,
+		runID,
+		calls,
+	)
+}
+
+func assertWakeEventCount(
+	t *testing.T,
+	store *inMemoryManagerStore,
+	taskID string,
+	eventType string,
+	want int,
+) {
+	t.Helper()
+
+	events, err := store.ListTaskEvents(t.Context(), EventQuery{
+		TaskID:    taskID,
+		EventType: eventType,
+	})
+	if err != nil {
+		t.Fatalf("ListTaskEvents(%s) error = %v", eventType, err)
+	}
+	if got := len(events); got != want {
+		t.Fatalf("len(%s events for %s) = %d, want %d", eventType, taskID, got, want)
+	}
+}
+
+func singleWakePayloadForTest(
+	t *testing.T,
+	store *inMemoryManagerStore,
+	taskID string,
+	eventType string,
+) wakeTaskPayload {
+	t.Helper()
+
+	events, err := store.ListTaskEvents(t.Context(), EventQuery{
+		TaskID:    taskID,
+		EventType: eventType,
+	})
+	if err != nil {
+		t.Fatalf("ListTaskEvents(%s) error = %v", eventType, err)
+	}
+	if got, want := len(events), 1; got != want {
+		t.Fatalf("len(%s events for %s) = %d, want %d", eventType, taskID, got, want)
+	}
+	var payload wakeTaskPayload
+	if err := json.Unmarshal(events[0].Payload, &payload); err != nil {
+		t.Fatalf("Unmarshal(wake payload) error = %v", err)
+	}
+	return payload
+}
+
+func newTaskManagerForTest(t *testing.T, store Store) *Service {
+	t.Helper()
+	return newTaskManagerForTestWithOptions(t, store)
+}
+
+func newTaskManagerForTestWithOptions(t *testing.T, store Store, extraOpts ...Option) *Service {
+	t.Helper()
+
+	now := time.Date(2026, 4, 14, 15, 0, 0, 0, time.UTC)
+	counter := 0
+	options := []Option{
+		WithStore(store),
+		WithCoordinatorTerminalStatusValidator(testCoordinatorTerminalStatusValidator),
+		WithCoordinatorTerminalHookStatusValidator(testCoordinatorTerminalHookStatusValidator),
+		WithManagerNow(func() time.Time { return now }),
+		WithIDGenerator(func(prefix string) (string, error) {
+			counter++
+			return prefix + "-test-" + strconv.Itoa(counter), nil
+		}),
+	}
+	options = append(options, extraOpts...)
+	manager, err := NewManager(options...)
+	if err != nil {
+		t.Fatalf("NewManager() error = %v", err)
+	}
+	return manager
+}
+
+func testCoordinatorTerminalStatusValidator(status string) bool {
+	switch strings.TrimSpace(status) {
+	case "queued",
+		"running",
+		"watching",
+		"needs-approval",
+		"paused",
+		"done",
+		"no-op",
+		"blocked",
+		"failed",
+		"exhausted",
+		"stalled":
+		return true
+	default:
+		return false
+	}
+}
+
+func testCoordinatorTerminalHookStatusValidator(status string) bool {
+	switch strings.TrimSpace(status) {
+	case "done",
+		"no-op",
+		"blocked",
+		"failed",
+		"exhausted",
+		"stalled":
+		return true
+	default:
+		return false
+	}
+}
+
+func setupStaleDependencyReadScenario(
+	t *testing.T,
+) (*Service, *inMemoryManagerStore, ActorContext, string, string) {
+	t.Helper()
+
+	store := newInMemoryManagerStore()
+	manager := newTaskManagerForTest(t, store)
+	actor := validActorContext()
+
+	upstream, err := manager.CreateTask(t.Context(), CreateTask{
+		ProfileID: storepkg.DefaultProfileID,
+		Scope:     ScopeGlobal,
+		Title:     "Upstream dependency",
+	}, actor)
+	if err != nil {
+		t.Fatalf("CreateTask(upstream) error = %v", err)
+	}
+	blocker, err := manager.CreateTask(t.Context(), CreateTask{
+		ProfileID: storepkg.DefaultProfileID,
+		Scope:     ScopeGlobal,
+		Title:     "Intermediate blocker",
+	}, actor)
+	if err != nil {
+		t.Fatalf("CreateTask(blocker) error = %v", err)
+	}
+	target, err := manager.CreateTask(t.Context(), CreateTask{
+		ProfileID: storepkg.DefaultProfileID,
+		Scope:     ScopeGlobal,
+		Title:     "Blocked target",
+	}, actor)
+	if err != nil {
+		t.Fatalf("CreateTask(target) error = %v", err)
+	}
+
+	if err := manager.AddDependency(t.Context(), AddDependency{
+		TaskID:          blocker.ID,
+		DependsOnTaskID: upstream.ID,
+		Kind:            DependencyKindBlocks,
+	}, actor); err != nil {
+		t.Fatalf("AddDependency(blocker) error = %v", err)
+	}
+	if err := manager.AddDependency(t.Context(), AddDependency{
+		TaskID:          target.ID,
+		DependsOnTaskID: blocker.ID,
+		Kind:            DependencyKindBlocks,
+	}, actor); err != nil {
+		t.Fatalf("AddDependency(target) error = %v", err)
+	}
+
+	record := store.tasks[blocker.ID]
+	record.Status = TaskStatusReady
+	store.tasks[blocker.ID] = record
+
+	return manager, store, actor, blocker.ID, target.ID
+}
+
+func cloneTask(record Task) Task {
+	cloned := record
+	cloned.Owner = cloneOwnership(record.Owner)
+	cloned.NeedsAttention = cloneNeedsAttention(record.NeedsAttention)
+	cloned.Metadata = cloneRawJSON(record.Metadata)
+	return cloned
+}
+
+func cloneTaskBlock(record TaskBlock) TaskBlock {
+	cloned := record
+	cloned.Details = cloneRawJSON(record.Details)
+	return cloned
+}
+
+func cloneTaskRun(record Run) Run {
+	cloned := record
+
+	if record.ClaimedBy != nil {
+		cloned.ClaimedBy = new(*record.ClaimedBy)
+	}
+	cloned.Metadata = cloneRawJSON(record.Metadata)
+	cloned.RunResultState = cloneRunResultState(record.RunResultState)
+	if record.Review != nil {
+		review := *record.Review
+		review.MissingWork = cloneRawJSON(record.Review.MissingWork)
+		cloned.Review = &review
+	}
+	cloned.RequiredCapabilities = append([]string(nil), record.RequiredCapabilities...)
+	cloned.PreferredCapabilities = append([]string(nil), record.PreferredCapabilities...)
+	return cloned
+}
+
+func inMemoryTaskLatestActivity(summary *Summary, runs map[string]Run, events []Event) time.Time {
+	taskRuns := make([]Run, 0)
+	for _, run := range runs {
+		if run.TaskID == summary.ID {
+			taskRuns = append(taskRuns, run)
+		}
+	}
+	taskEvents := make([]Event, 0)
+	for _, event := range events {
+		if event.TaskID == summary.ID {
+			taskEvents = append(taskEvents, event)
+		}
+	}
+	return latestTaskActivityAt(taskRecordFromSummary(summary), taskRuns, taskEvents)
+}
+
+func cloneTriageState(record TriageState) TriageState {
+	cloned := record
+	cloned.Actor = record.Actor
+	return cloned
+}
+
+func cloneExecutionProfile(record *ExecutionProfile) ExecutionProfile {
+	if record == nil {
+		return ExecutionProfile{}
+	}
+	cloned := *record
+	cloned.Worker.AllowedAgentNames = append([]string(nil), record.Worker.AllowedAgentNames...)
+	cloned.Worker.PreferredAgentNames = append([]string(nil), record.Worker.PreferredAgentNames...)
+	cloned.Worker.RequiredCapabilities = append(
+		[]string(nil),
+		record.Worker.RequiredCapabilities...)
+	cloned.Worker.PreferredCapabilities = append(
+		[]string(nil),
+		record.Worker.PreferredCapabilities...)
+	cloned.Review.AllowedAgentNames = append([]string(nil), record.Review.AllowedAgentNames...)
+	cloned.Review.PreferredAgentNames = append([]string(nil), record.Review.PreferredAgentNames...)
+
+	cloned.Review.RequiredCapabilities = append(
+		[]string(nil),
+		record.Review.RequiredCapabilities...)
+	cloned.Review.PreferredCapabilities = append(
+		[]string(nil),
+		record.Review.PreferredCapabilities...)
+
+	cloned.Participants.AllowedAgentNames = append(
+		[]string(nil),
+		record.Participants.AllowedAgentNames...)
+	cloned.Participants.PreferredAgentNames = append(
+		[]string(nil),
+		record.Participants.PreferredAgentNames...)
+	cloned.Participants.RequiredCapabilities = append(
+		[]string(nil),
+		record.Participants.RequiredCapabilities...)
+	cloned.Participants.PreferredCapabilities = append(
+		[]string(nil),
+		record.Participants.PreferredCapabilities...)
+	return cloned
+}
+
+func cloneTaskEvent(record Event) Event {
+	cloned := record
+	cloned.Payload = cloneRawJSON(record.Payload)
+	return cloned
+}
+
+func sortedEventTypes(events []Event) []string {
+	types := make([]string, 0, len(events))
+	for _, event := range events {
+		types = append(types, event.EventType)
+	}
+	slices.Sort(types)
+	return types
+}
+
+func equalStringSlices(left []string, right []string) bool {
+	if len(left) != len(right) {
+		return false
+	}
+	for idx := range left {
+		if left[idx] != right[idx] {
+			return false
+		}
+	}
+	return true
+}
+
+func equalInt64Slices(left []int64, right []int64) bool {
+	if len(left) != len(right) {
+		return false
+	}
+	for idx := range left {
+		if left[idx] != right[idx] {
+			return false
+		}
+	}
+	return true
+}
+
+func assertTaskEventRecordEqual(t *testing.T, got EventRecord, want EventRecord) {
+	t.Helper()
+
+	if got.Sequence != want.Sequence ||
+		got.Event.ID != want.Event.ID ||
+		got.Event.TaskID != want.Event.TaskID ||
+		got.Event.RunID != want.Event.RunID ||
+		got.Event.EventType != want.Event.EventType ||
+		got.Event.Actor != want.Event.Actor ||
+		got.Event.Origin != want.Event.Origin ||
+		string(got.Event.Payload) != string(want.Event.Payload) ||
+		!got.Event.Timestamp.Equal(want.Event.Timestamp) {
+		t.Fatalf("task event record = %#v, want %#v", got, want)
+	}
+}
+
+func assertTaskStreamEventMatchesRecord(
+	t *testing.T,
+	subscriberIndex int,
+	got StreamEvent,
+	want EventRecord,
+) {
+	t.Helper()
+
+	if got.Sequence != want.Sequence ||
+		got.Type != want.Event.EventType ||
+		got.Timeline.Sequence != want.Sequence ||
+		got.Timeline.EventID != want.Event.ID ||
+		got.Timeline.EventType != want.Event.EventType ||
+		got.Timeline.Actor != want.Event.Actor ||
+		got.Timeline.Origin != want.Event.Origin ||
+		string(got.Timeline.Payload) != string(want.Event.Payload) ||
+		!got.Timeline.Timestamp.Equal(want.Event.Timestamp) {
+		t.Fatalf(
+			"subscriber %d stream event = %#v, want record %#v",
+			subscriberIndex,
+			got,
+			want,
+		)
+	}
+}
+
+func awaitTaskStreamEvent(t *testing.T, stream <-chan StreamEvent) StreamEvent {
+	t.Helper()
+
+	select {
+	case event, ok := <-stream:
+		if !ok {
+			t.Fatal("stream closed before event was available")
+		}
+		return event
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for task stream event")
+		return StreamEvent{}
+	}
+}
+
+func assertNoTaskStreamEvent(t *testing.T, stream <-chan StreamEvent, wait time.Duration) {
+	t.Helper()
+
+	select {
+	case event, ok := <-stream:
+		if !ok {
+			return
+		}
+		t.Fatalf("unexpected task stream event = %#v", event)
+	case <-time.After(wait):
+	}
+}
+
+func containsEventType(events []Event, want string) bool {
+	for _, event := range events {
+		if event.EventType == want {
+			return true
+		}
+	}
+	return false
+}
+
+func idempotencyKey(origin Origin, key string) string {
+	return string(
+		origin.Kind.Normalize(),
+	) + "|" + strings.TrimSpace(
+		origin.Ref,
+	) + "|" + strings.TrimSpace(
+		key,
+	)
+}
+
+func triageKey(taskID string, actor ActorIdentity) string {
+	return strings.TrimSpace(
+		taskID,
+	) + "|" + string(
+		actor.Kind.Normalize(),
+	) + "|" + strings.TrimSpace(
+		actor.Ref,
+	)
+}
+
+func fmtTestError(format string, args ...any) error {
+	return fmt.Errorf(format, args...)
+}

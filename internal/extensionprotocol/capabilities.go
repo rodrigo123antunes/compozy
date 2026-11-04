@@ -1,0 +1,153 @@
+package protocol
+
+import (
+	"maps"
+	"slices"
+	"strings"
+)
+
+const (
+	// CapabilityToolProvider is the provide surface for executable extension-host tools.
+	CapabilityToolProvider = "tool.provider"
+	// CapabilityProvideModelSource is the provide surface for model catalog source rows.
+	CapabilityProvideModelSource = "model.source"
+	// CapabilityProvideWatchSource is the provide surface for loop watch-source polling.
+	CapabilityProvideWatchSource     = "loop.watch_source"
+	CapabilityProvideHeartbeatSource = "heartbeat.source"
+	// CapabilityProvideConnectivityProvider is the public provide surface for daemon reachability providers.
+	CapabilityProvideConnectivityProvider = "connectivity.provider"
+	// CapabilityProvideForgeProvider is the provide surface for remote code-forge operations.
+	CapabilityProvideForgeProvider = "forge.provider"
+	// CapabilityProvideViewProvider is the provide surface for programmable command-palette views.
+	CapabilityProvideViewProvider = "view.provider"
+)
+
+// ExtensionServiceMethod identifies one Compozy -> extension capability service request.
+type ExtensionServiceMethod string
+
+const (
+	ExtensionServiceMethodProvideTools          ExtensionServiceMethod = "provide_tools"
+	ExtensionServiceMethodToolsCall             ExtensionServiceMethod = "tools/call"
+	ExtensionServiceMethodModelsList            ExtensionServiceMethod = "models/list"
+	ExtensionServiceMethodWatchPoll             ExtensionServiceMethod = "watch/poll"
+	ExtensionServiceMethodHeartbeatSourcePoll   ExtensionServiceMethod = "heartbeat/source_poll"
+	ExtensionServiceMethodConnectivityEstablish ExtensionServiceMethod = "connectivity/establish"
+	ExtensionServiceMethodConnectivityStatus    ExtensionServiceMethod = "connectivity/status"
+	ExtensionServiceMethodConnectivityTeardown  ExtensionServiceMethod = "connectivity/teardown"
+	ExtensionServiceMethodForgeCapabilities     ExtensionServiceMethod = "forge/capabilities"
+	ExtensionServiceMethodForgeStatus           ExtensionServiceMethod = "forge/status"
+	ExtensionServiceMethodForgePRSearch         ExtensionServiceMethod = "forge/pr_search"
+	ExtensionServiceMethodForgePRRead           ExtensionServiceMethod = "forge/pr_read"
+	ExtensionServiceMethodForgePRCreate         ExtensionServiceMethod = "forge/pr_create"
+	ExtensionServiceMethodViewOpen              ExtensionServiceMethod = "view/open"
+	ExtensionServiceMethodViewEvent             ExtensionServiceMethod = "view/event"
+	ExtensionServiceMethodViewClose             ExtensionServiceMethod = "view/close"
+)
+
+var capabilityServiceMethods = map[string][]ExtensionServiceMethod{
+	CapabilityToolProvider: {
+		ExtensionServiceMethodProvideTools,
+		ExtensionServiceMethodToolsCall,
+	},
+	CapabilityProvideModelSource: {
+		ExtensionServiceMethodModelsList,
+	},
+	CapabilityProvideHeartbeatSource: {ExtensionServiceMethodHeartbeatSourcePoll},
+	CapabilityProvideWatchSource: {
+		ExtensionServiceMethodWatchPoll,
+	},
+	CapabilityProvideConnectivityProvider: {
+		ExtensionServiceMethodConnectivityEstablish,
+		ExtensionServiceMethodConnectivityStatus,
+		ExtensionServiceMethodConnectivityTeardown,
+	},
+	CapabilityProvideForgeProvider: {
+		ExtensionServiceMethodForgeCapabilities,
+		ExtensionServiceMethodForgeStatus,
+		ExtensionServiceMethodForgePRCreate,
+	},
+	CapabilityProvideViewProvider: {
+		ExtensionServiceMethodViewOpen,
+		ExtensionServiceMethodViewEvent,
+		ExtensionServiceMethodViewClose,
+	},
+}
+
+// ProvideCapabilities returns every daemon-recognized provide capability in stable order.
+func ProvideCapabilities() []string {
+	provides := slices.AppendSeq(make([]string, 0, len(capabilityServiceMethods)), maps.Keys(capabilityServiceMethods))
+	slices.Sort(provides)
+	return provides
+}
+
+// RequiredServiceMethods returns the service methods required by one provide capability.
+func RequiredServiceMethods(provide string) []string {
+	methods := capabilityServiceMethods[strings.TrimSpace(provide)]
+	if len(methods) == 0 {
+		return nil
+	}
+	result := make([]string, 0, len(methods))
+	for _, method := range methods {
+		result = append(result, string(method))
+	}
+	slices.Sort(result)
+	return result
+}
+
+// CapabilityServiceMethods returns the negotiated Compozy -> extension service methods
+// enabled by the declared provide surfaces.
+func CapabilityServiceMethods(provides []string) []string {
+	if len(provides) == 0 {
+		return nil
+	}
+
+	seen := make(map[string]struct{})
+	methods := make([]string, 0)
+	for _, provide := range normalizeUniqueStrings(provides) {
+		methodsForProvide := RequiredServiceMethods(provide)
+		if provide == CapabilityProvideForgeProvider {
+			methodsForProvide = append(
+				methodsForProvide,
+				string(ExtensionServiceMethodForgePRSearch),
+				string(ExtensionServiceMethodForgePRRead),
+			)
+		}
+		for _, method := range methodsForProvide {
+			if _, ok := seen[method]; ok {
+				continue
+			}
+			seen[method] = struct{}{}
+			methods = append(methods, method)
+		}
+	}
+	if len(methods) == 0 {
+		return nil
+	}
+	slices.Sort(methods)
+	return methods
+}
+
+func normalizeUniqueStrings(values []string) []string {
+	if len(values) == 0 {
+		return nil
+	}
+
+	seen := make(map[string]struct{}, len(values))
+	normalized := make([]string, 0, len(values))
+	for _, value := range values {
+		trimmed := strings.TrimSpace(value)
+		if trimmed == "" {
+			continue
+		}
+		if _, ok := seen[trimmed]; ok {
+			continue
+		}
+		seen[trimmed] = struct{}{}
+		normalized = append(normalized, trimmed)
+	}
+	if len(normalized) == 0 {
+		return nil
+	}
+	slices.Sort(normalized)
+	return normalized
+}

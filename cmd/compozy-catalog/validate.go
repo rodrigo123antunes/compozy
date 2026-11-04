@@ -1,0 +1,236 @@
+package main
+
+import (
+	"bytes"
+	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"os"
+	"path/filepath"
+	"reflect"
+	"strings"
+
+	extensionpkg "github.com/compozy/compozy/internal/extension"
+	"github.com/compozy/compozy/internal/extension/agentplugin"
+	"github.com/compozy/compozy/internal/marketplace"
+	registrypkg "github.com/compozy/compozy/internal/registry"
+)
+
+// validateCatalogForPublication verifies feed, compatibility metadata, and archives before publication.
+func validateCatalogForPublication(ctx context.Context, directory string) (err error) {
+	if ctx == nil {
+		return errors.New("compozy-catalog: validation context is required")
+	}
+	if err := ctx.Err(); err != nil {
+		return fmt.Errorf("compozy-catalog: validate catalog: %w", err)
+	}
+	if err := marketplace.ValidateCatalogDirectory(directory); err != nil {
+		return err
+	}
+	feedPath := filepath.Join(directory, "v3", "extensions.json")
+	// #nosec G703 -- validation intentionally reads the explicit local catalog directory selected by the operator.
+	raw, err := os.ReadFile(feedPath)
+	if err != nil {
+		return fmt.Errorf("compozy-catalog: read extension feed: %w", err)
+	}
+	document, err := marketplace.DecodeDocument(raw)
+	if err != nil {
+		return fmt.Errorf("compozy-catalog: decode extension feed: %w", err)
+	}
+	// #nosec G703 -- directory is the explicit catalog root selected by the publishing operator.
+	metadata, err := os.ReadFile(filepath.Join(directory, "v3", "compatibility.json"))
+	if err != nil {
+		return fmt.Errorf("compozy-catalog: read compatibility metadata: %w", err)
+	}
+	if err := marketplace.ApplyCompatibility(document, raw, metadata); err != nil {
+		return err
+	}
+	temporaryRoot, err := os.MkdirTemp("", "compozy-catalog-validation-*")
+	if err != nil {
+		return fmt.Errorf("compozy-catalog: create artifact validation directory: %w", err)
+	}
+	defer func() {
+		err = errors.Join(err, removeCatalogTemporaryDirectory(temporaryRoot))
+	}()
+	for _, entry := range document.Entries {
+		if err := validateExtensionArtifact(
+			ctx,
+			directory,
+			temporaryRoot,
+			entry,
+		); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// validateExtensionArtifact checks pinned package bytes against their feed metadata and available source manifest.
+func validateExtensionArtifact(
+	ctx context.Context,
+	catalogDir string,
+	temporaryRoot string,
+	entry marketplace.Entry,
+) error {
+	details, err := marketplace.ProjectEntry(entry)
+	if err != nil {
+		return fmt.Errorf("compozy-catalog: project extension %q: %w", entry.EntryID, err)
+	}
+	if details.Extension == nil {
+		return fmt.Errorf("compozy-catalog: extension %q has no acquisition metadata", entry.EntryID)
+	}
+	artifactName, err := curatedArtifactFilename(details.Extension.ArtifactURL)
+	if err != nil {
+		return fmt.Errorf("compozy-catalog: extension %q: %w", entry.EntryID, err)
+	}
+	artifactPath := filepath.Join(catalogDir, "artifacts", artifactName)
+	result, err := registrypkg.NewInstaller(&catalogFileDownloader{
+		path: artifactPath, version: entry.Version,
+	}).Install(
+		ctx,
+		entry.InstallSlug,
+		registrypkg.DownloadOpts{Version: entry.Version, ExpectedSHA256: entry.DigestSHA256},
+		filepath.Join(temporaryRoot, entry.EntryID),
+	)
+	if err != nil {
+		return fmt.Errorf("compozy-catalog: install extension artifact %q: %w", artifactName, err)
+	}
+	if err := validateArtifactSource(catalogDir, entry.EntryID, result.InstallPath); err != nil {
+		return err
+	}
+	manifest, err := extensionpkg.LoadManifest(result.InstallPath)
+	if err != nil {
+		return fmt.Errorf("compozy-catalog: load extension artifact %q: %w", artifactName, err)
+	}
+	if manifest.MinCompozyVersion != details.Extension.MinCompozyVersion {
+		return fmt.Errorf(
+			"compozy-catalog: extension %q compatibility requirement differs from packaged manifest",
+			entry.EntryID,
+		)
+	}
+	if manifest.Version != entry.Version {
+		return fmt.Errorf(
+			"compozy-catalog: extension artifact %q version %q does not match feed version %q",
+			artifactName,
+			manifest.Version,
+			entry.Version,
+		)
+	}
+
+	var payload struct {
+		Inputs []marketplace.EntryInput `json:"inputs"`
+	}
+	if err := json.Unmarshal(entry.Payload, &payload); err != nil {
+		return err
+	}
+	if !reflect.DeepEqual(payload.Inputs, manifest.Inputs) {
+		return fmt.Errorf("compozy-catalog: extension %q feed inputs differ from packaged manifest", entry.EntryID)
+	}
+	return nil
+}
+
+func curatedArtifactFilename(rawURL string) (string, error) {
+	trimmed := strings.TrimSpace(rawURL)
+	_, filename, found := strings.CutLast(trimmed, "/")
+	if !found || filename == "" {
+		return "", errors.New("artifact_url must end with a versioned .tar.gz filename")
+	}
+	if !strings.HasSuffix(strings.ToLower(filename), ".tar.gz") || strings.ContainsAny(filename, "?#") {
+		return "", errors.New("artifact_url must end with a versioned .tar.gz filename")
+	}
+	return filename, nil
+}
+
+type catalogFileDownloader struct {
+	path    string
+	version string
+}
+
+func (d *catalogFileDownloader) Download(
+	ctx context.Context,
+	slug string,
+	_ registrypkg.DownloadOpts,
+) (*registrypkg.DownloadResult, error) {
+	if ctx == nil {
+		return nil, errors.New("compozy-catalog: download context is required")
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, fmt.Errorf("compozy-catalog: download artifact: %w", err)
+	}
+	file, err := os.Open(d.path)
+	if err != nil {
+		return nil, fmt.Errorf("compozy-catalog: open artifact %q: %w", d.path, err)
+	}
+	info, err := file.Stat()
+	if err != nil {
+		return nil, errors.Join(
+			fmt.Errorf("compozy-catalog: stat artifact %q: %w", d.path, err),
+			file.Close(),
+		)
+	}
+	return &registrypkg.DownloadResult{
+		Reader: file, Slug: strings.TrimSpace(slug), Version: d.version,
+		ContentSize: info.Size(), ContentType: "application/gzip",
+	}, nil
+}
+
+// removeCatalogTemporaryDirectory reports cleanup failures alongside publication validation errors.
+func removeCatalogTemporaryDirectory(path string) error {
+	if err := os.RemoveAll(path); err != nil {
+		return fmt.Errorf("compozy-catalog: remove catalog temporary directory: %w", err)
+	}
+	return nil
+}
+
+// validateArtifactSource rejects source/archive drift while allowing source-free publication staging.
+func validateArtifactSource(catalogDir, entryID, installedPath string) error {
+	packages := filepath.Join(catalogDir, "packages")
+	// #nosec G703 -- packages is beneath the explicit operator-selected catalog directory.
+	if _, err := os.Stat(packages); errors.Is(err, os.ErrNotExist) {
+		return nil
+	} else if err != nil {
+		return fmt.Errorf("compozy-catalog: inspect package sources: %w", err)
+	}
+	for _, filename := range []string{"extension.toml", "extension.json"} {
+		// #nosec G703 -- entryID is validated by the catalog decoder; filename is a fixed manifest name.
+		source, err := os.ReadFile(filepath.Join(packages, entryID, filename))
+		if errors.Is(err, os.ErrNotExist) {
+			continue
+		}
+		if err != nil {
+			return fmt.Errorf("compozy-catalog: read source manifest for %q: %w", entryID, err)
+		}
+		return compareSourceManifest(entryID, source, filepath.Join(installedPath, filename))
+	}
+	root := filepath.Join(packages, entryID)
+	path, _, err := agentplugin.LocateManifest(root)
+	if err != nil {
+		return fmt.Errorf("compozy-catalog: locate source manifest for %q: %w", entryID, err)
+	}
+	relative, err := filepath.Rel(root, path)
+	if err != nil {
+		return err
+	}
+	// #nosec G703 -- LocateManifest selects a supported manifest inside the operator-selected package root.
+	source, err := os.ReadFile(path)
+	if err != nil {
+		return fmt.Errorf("compozy-catalog: read source manifest for %q: %w", entryID, err)
+	}
+	return compareSourceManifest(entryID, source, filepath.Join(installedPath, relative))
+}
+
+// compareSourceManifest requires byte-for-byte identity with the manifest selected from the source package.
+func compareSourceManifest(entryID string, source []byte, packagedPath string) error {
+	packaged, err := os.ReadFile(packagedPath)
+	if err != nil {
+		return fmt.Errorf("compozy-catalog: read packaged manifest for %q: %w", entryID, err)
+	}
+	if !bytes.Equal(source, packaged) {
+		return fmt.Errorf(
+			"compozy-catalog: extension %q packaged manifest differs from source; regenerate with publish",
+			entryID,
+		)
+	}
+	return nil
+}

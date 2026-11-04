@@ -1,0 +1,312 @@
+"use client";
+
+import { Dialog as DialogPrimitive } from "@base-ui/react/dialog";
+import { useMergedRefs } from "@base-ui/utils/useMergedRefs";
+import * as React from "react";
+
+import { XIcon } from "../icons";
+import { defaultDialogInitialFocus } from "../lib/dialog-initial-focus";
+import { DIALOG_CLOSE_BUTTON_CLASS } from "../lib/dialog-shell";
+import { cn } from "../lib/utils";
+import { Button } from "./button";
+import { DialogContext, useDialogContext } from "./hooks/use-dialog-context";
+import { useInitialState } from "./use-initial-state";
+import { useOverlayContainer } from "./hooks/use-overlay-container";
+
+type DialogRootProps = DialogPrimitive.Root.Props;
+
+function Dialog({
+  open: controlledOpen,
+  defaultOpen = false,
+  modal,
+  disablePointerDismissal,
+  onOpenChange,
+  children,
+  ...props
+}: DialogRootProps) {
+  const overlayContainer = useOverlayContainer();
+  const windowScoped = overlayContainer !== null;
+  const [uncontrolledOpen, setUncontrolledOpen] = useInitialState(defaultOpen);
+  const isControlled = controlledOpen !== undefined;
+  const open = isControlled ? Boolean(controlledOpen) : uncontrolledOpen;
+  const openTooltipCount = React.useRef(0);
+  const registerOpenTooltip = () => {
+    openTooltipCount.current += 1;
+    return () => {
+      openTooltipCount.current -= 1;
+    };
+  };
+
+  const handleOpenChange: NonNullable<DialogRootProps["onOpenChange"]> = (next, details) => {
+    if (!next && details.reason === "escape-key" && openTooltipCount.current > 0) {
+      // A hovered tooltip may leave focus in a sibling field. Let its document
+      // listener handle Escape before this dialog can discard the form.
+      details.cancel();
+      details.allowPropagation();
+      return;
+    }
+    if (!isControlled) setUncontrolledOpen(next);
+    onOpenChange?.(next, details);
+  };
+
+  return (
+    <DialogPrimitive.Root
+      data-slot="dialog"
+      open={open}
+      defaultOpen={defaultOpen}
+      modal={modal ?? (windowScoped ? false : true)}
+      disablePointerDismissal={disablePointerDismissal ?? windowScoped}
+      onOpenChange={handleOpenChange}
+      {...props}
+    >
+      <DialogContext value={{ open, registerOpenTooltip }}>
+        {children as React.ReactNode}
+      </DialogContext>
+    </DialogPrimitive.Root>
+  );
+}
+
+function DialogTrigger({ ...props }: DialogPrimitive.Trigger.Props) {
+  return <DialogPrimitive.Trigger data-slot="dialog-trigger" {...props} />;
+}
+
+function DialogPortal({ container, ...props }: DialogPrimitive.Portal.Props) {
+  const overlayContainer = useOverlayContainer();
+  return (
+    <DialogPrimitive.Portal
+      data-slot="dialog-portal"
+      container={container !== undefined ? container : (overlayContainer ?? undefined)}
+      {...props}
+    />
+  );
+}
+
+function DialogClose({ ...props }: DialogPrimitive.Close.Props) {
+  return <DialogPrimitive.Close data-slot="dialog-close" {...props} />;
+}
+
+function DialogOverlay({ className, style, ...props }: DialogPrimitive.Backdrop.Props) {
+  useDialogContext();
+  return (
+    <DialogPrimitive.Backdrop
+      data-slot="dialog-overlay"
+      className={cn("fixed inset-0 isolate z-50 bg-overlay-scrim", className)}
+      style={{ backdropFilter: "blur(var(--overlay-blur))", ...style }}
+      {...props}
+    />
+  );
+}
+
+type DialogChromeVariant = "default" | "ruled";
+
+const DIALOG_CONTENT_BASE =
+  "fixed top-1/2 left-1/2 z-50 grid w-full max-w-[calc(100%-2rem)] grid-cols-[minmax(0,1fr)] -translate-x-1/2 -translate-y-1/2 rounded-lg bg-popover text-small-body text-fg shadow-overlay outline-none sm:max-w-sm";
+const DIALOG_CONTENT_FRAMED = "gap-4 p-4";
+const DIALOG_CONTENT_UNFRAMED = "gap-0 p-0";
+
+const DIALOG_HEADER_DEFAULT = "flex flex-col gap-2";
+// The 20px gutter is shared by the mode toolbar, body, and footer; do not align
+// it to the 24px route gutter, which belongs to page content.
+const DIALOG_HEADER_RULED = "flex flex-col gap-2 border-b border-line bg-popover px-5 py-4";
+
+const DIALOG_FOOTER_DEFAULT =
+  "-mx-4 -mb-4 flex min-w-0 flex-col-reverse gap-2 rounded-b-lg border-t border-line-soft p-4 sm:flex-row sm:justify-end";
+// Ruled chrome is one dialog surface: the same `popover` (elevated) fill as the
+// header and unframed body. A second fill here made entity editors look two-toned.
+const DIALOG_FOOTER_RULED =
+  "flex min-w-0 flex-col-reverse gap-2 border-t border-line-soft bg-popover px-5 py-3 sm:flex-row sm:justify-end";
+
+interface DialogContentProps extends DialogPrimitive.Popup.Props {
+  showCloseButton?: boolean;
+  /**
+   * When `true`, drops the default `gap-4 p-4` chrome so callers can compose
+   * flush headers, bodies, and footers (typically alongside `DialogHeader`/
+   * `DialogFooter` `variant="ruled"`).
+   */
+  unframed?: boolean;
+}
+
+function DialogContent(props: DialogContentProps) {
+  const { open } = useDialogContext();
+  return open ? (
+    <DialogPortal>
+      <DialogOverlay />
+      <DialogContentPopup {...props} />
+    </DialogPortal>
+  ) : null;
+}
+
+function DialogContentPopup({
+  className,
+  children,
+  showCloseButton = true,
+  unframed = false,
+  style,
+  initialFocus,
+  finalFocus,
+  ref,
+  ...props
+}: DialogContentProps) {
+  const overlayContainer = useOverlayContainer();
+  const windowScoped = overlayContainer !== null;
+  const popupRef = React.useRef<HTMLDivElement | null>(null);
+  const openerRef = React.useRef<HTMLElement | null>(null);
+  const mergedPopupRef = useMergedRefs(popupRef, ref);
+  const resolvedInitialFocus = initialFocus ?? (() => defaultDialogInitialFocus(popupRef.current));
+  React.useLayoutEffect(() => {
+    const popup = popupRef.current;
+    // Preserve the opener before moving focus: Base UI may initialize its
+    // previously-focused-element tracking after this layout effect.
+    const active = popup?.ownerDocument.activeElement;
+    if (active instanceof HTMLElement && !popup?.contains(active)) openerRef.current = active;
+    // Transfer our default/ref target before the passive isolation effect.
+    // Boolean and interaction-dependent policies remain owned by Base UI.
+    if (!popup || typeof initialFocus === "boolean" || typeof initialFocus === "function") return;
+    const target = initialFocus?.current ?? defaultDialogInitialFocus(popup);
+    if (target instanceof HTMLElement) target.focus({ preventScroll: true });
+  }, [initialFocus]);
+  const resolveFinalFocus: NonNullable<DialogContentProps["finalFocus"]> = closeType => {
+    if (finalFocus && typeof finalFocus === "object") return finalFocus.current;
+    const requested = typeof finalFocus === "function" ? finalFocus(closeType) : finalFocus;
+    if (requested !== true && (requested !== undefined || finalFocus !== undefined))
+      return requested;
+    const popup = popupRef.current;
+    const active = popup?.ownerDocument.activeElement;
+    // Default restoration must not steal focus that already moved elsewhere.
+    if (
+      finalFocus === undefined &&
+      active &&
+      active !== popup?.ownerDocument.body &&
+      !popup?.contains(active)
+    )
+      return false;
+    return openerRef.current?.isConnected ? openerRef.current : requested;
+  };
+  return (
+    <DialogPrimitive.Popup
+      ref={mergedPopupRef}
+      data-slot="dialog-content"
+      data-frame={unframed ? "unframed" : "framed"}
+      initialFocus={resolvedInitialFocus}
+      finalFocus={resolveFinalFocus}
+      className={cn(
+        DIALOG_CONTENT_BASE,
+        unframed ? DIALOG_CONTENT_UNFRAMED : DIALOG_CONTENT_FRAMED,
+        unframed && "overflow-hidden",
+        className
+      )}
+      style={{
+        // Host % ceilings only — never force maxWidth here: inline wins over
+        // preferred classes (sm:max-w-*, dialogShellClass) and stretches w-full
+        // panels to nearly the full OS window.
+        ...(windowScoped
+          ? {
+              maxHeight: "calc(100% - 2rem)",
+              overflowY: unframed ? undefined : "auto",
+            }
+          : undefined),
+        ...style,
+      }}
+      {...props}
+    >
+      {children}
+      {showCloseButton ? (
+        <DialogPrimitive.Close
+          data-slot="dialog-close"
+          render={
+            <Button
+              variant="quiet"
+              className={cn("absolute top-2 right-2", DIALOG_CLOSE_BUTTON_CLASS)}
+              size="icon-sm"
+            />
+          }
+        >
+          <XIcon />
+          <span className="sr-only">Close</span>
+        </DialogPrimitive.Close>
+      ) : null}
+    </DialogPrimitive.Popup>
+  );
+}
+
+interface DialogHeaderProps extends React.ComponentProps<"div"> {
+  variant?: DialogChromeVariant;
+}
+
+function DialogHeader({ className, variant = "default", ...props }: DialogHeaderProps) {
+  return (
+    <div
+      data-slot="dialog-header"
+      data-variant={variant}
+      className={cn(variant === "ruled" ? DIALOG_HEADER_RULED : DIALOG_HEADER_DEFAULT, className)}
+      {...props}
+    />
+  );
+}
+
+interface DialogFooterProps extends React.ComponentProps<"div"> {
+  showCloseButton?: boolean;
+  variant?: DialogChromeVariant;
+}
+
+function DialogFooter({
+  className,
+  showCloseButton = false,
+  variant = "default",
+  children,
+  ...props
+}: DialogFooterProps) {
+  return (
+    <div
+      data-slot="dialog-footer"
+      data-variant={variant}
+      className={cn(variant === "ruled" ? DIALOG_FOOTER_RULED : DIALOG_FOOTER_DEFAULT, className)}
+      {...props}
+    >
+      {children}
+      {showCloseButton ? (
+        <DialogClose render={<Button variant="outline" />}>Close</DialogClose>
+      ) : null}
+    </div>
+  );
+}
+
+function DialogTitle({ className, ...props }: DialogPrimitive.Title.Props) {
+  return (
+    <DialogPrimitive.Title
+      data-slot="dialog-title"
+      className={cn(
+        "text-item-title leading-none font-medium tracking-tight text-fg-strong",
+        className
+      )}
+      {...props}
+    />
+  );
+}
+
+function DialogDescription({ className, ...props }: DialogPrimitive.Description.Props) {
+  return (
+    <DialogPrimitive.Description
+      data-slot="dialog-description"
+      className={cn(
+        "text-small-body text-muted-foreground *:[a]:underline *:[a]:underline-offset-3 *:[a]:hover:text-fg-strong",
+        className
+      )}
+      {...props}
+    />
+  );
+}
+
+export {
+  Dialog,
+  DialogClose,
+  DialogContent,
+  DialogDescription,
+  DialogFooter,
+  DialogHeader,
+  DialogOverlay,
+  DialogPortal,
+  DialogTitle,
+  DialogTrigger,
+};
+export type { DialogChromeVariant, DialogContentProps, DialogFooterProps, DialogHeaderProps };

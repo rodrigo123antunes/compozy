@@ -1,0 +1,272 @@
+package daemon
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"log/slog"
+	"strings"
+	"time"
+
+	acpsdk "github.com/coder/acp-go-sdk"
+	"github.com/compozy/compozy/internal/acp"
+	toolspkg "github.com/compozy/compozy/internal/tools"
+	"github.com/compozy/compozy/internal/workspaceaccess"
+)
+
+const (
+	workspaceAccessAllowOnceID     acpsdk.PermissionOptionId = "allow_once"
+	workspaceAccessAllowSessionID  acpsdk.PermissionOptionId = "allow_session"
+	workspaceAccessAllowAlwaysID   acpsdk.PermissionOptionId = "allow_always"
+	workspaceAccessRejectOnceID    acpsdk.PermissionOptionId = "reject_once"
+	workspaceAccessRejectSessionID acpsdk.PermissionOptionId = "reject_session"
+)
+
+type workspaceAccessPrompter interface {
+	RequestWorkspaceAccess(
+		ctx context.Context,
+		scope toolspkg.Scope,
+		call toolspkg.CallRequest,
+		descriptor toolspkg.Descriptor,
+		prompt workspaceAccessPrompt,
+	) (bool, error)
+}
+
+// workspaceAccessPrompt is one consent question. A read crossing offers "Always allow"; grant is
+// the durable key that answer leaves for the same agent, tool, and target scope. A target that
+// resolves to no owner has no key, yet asks the same question so the prompt reveals nothing.
+type workspaceAccessPrompt struct {
+	unresolvedTarget bool
+	targetWorkspace  string
+	label            string
+	remember         bool
+	grant            *toolspkg.ApprovalGrantKey
+}
+
+type workspaceAccessPromptBridge struct {
+	sessions func() sessionPermissionRequester
+	timeout  time.Duration
+	consent  workspaceaccess.SessionConsentCache
+	grants   toolspkg.ApprovalGrantStore
+	logger   *slog.Logger
+}
+
+var _ workspaceAccessPrompter = (*workspaceAccessPromptBridge)(nil)
+
+func newWorkspaceAccessPromptBridge(
+	sessions func() sessionPermissionRequester,
+	timeout time.Duration,
+	consent workspaceaccess.SessionConsentCache,
+	grants toolspkg.ApprovalGrantStore,
+	logger *slog.Logger,
+) *workspaceAccessPromptBridge {
+	if logger == nil {
+		logger = slog.Default()
+	}
+	return &workspaceAccessPromptBridge{
+		sessions: sessions,
+		timeout:  timeout,
+		consent:  consent,
+		grants:   grants,
+		logger:   logger,
+	}
+}
+
+func (b *workspaceAccessPromptBridge) RequestWorkspaceAccess(
+	ctx context.Context,
+	scope toolspkg.Scope,
+	call toolspkg.CallRequest,
+	descriptor toolspkg.Descriptor,
+	prompt workspaceAccessPrompt,
+) (bool, error) {
+	if ctx == nil {
+		return false, errors.New("daemon: workspace access prompt context is required")
+	}
+	if b == nil {
+		return false, errors.New("daemon: workspace access prompt channel is unavailable")
+	}
+	remember := b.grants != nil && prompt.remember && descriptor.ReadOnly &&
+		(prompt.grant != nil || prompt.unresolvedTarget)
+	var grant *toolspkg.ApprovalGrantKey
+	if remember {
+		grant = prompt.grant
+	}
+	if b.rememberedAllow(ctx, grant) {
+		return true, nil
+	}
+	if b.sessions == nil {
+		return false, errors.New("daemon: workspace access prompt channel is unavailable")
+	}
+	sessions := b.sessions()
+	if sessions == nil {
+		return false, errors.New("daemon: workspace access prompt channel is unavailable")
+	}
+	sessionID := strings.TrimSpace(call.SessionID)
+	if sessionID == "" {
+		sessionID = strings.TrimSpace(scope.SessionID)
+	}
+	if sessionID == "" {
+		return false, errors.New("daemon: workspace access prompt session is unavailable")
+	}
+	timeout := b.timeout
+	if timeout <= 0 {
+		timeout = 120 * time.Second
+	}
+	detached := context.WithoutCancel(ctx)
+	promptCtx, cancel := context.WithTimeout(detached, timeout)
+	defer cancel()
+	title := workspaceAccessPromptTitle(prompt.label, descriptor.ReadOnly)
+	input := workspaceAccessPromptInput(descriptor.ID, prompt.label)
+	if prompt.targetWorkspace != "" {
+		if prompt.targetWorkspace == workspaceaccess.UserSelector {
+			title += " in User scope"
+		} else {
+			title += " in workspace " + prompt.targetWorkspace
+		}
+		input["target_workspace_id"] = prompt.targetWorkspace
+	}
+	response, err := sessions.RequestPermission(promptCtx, sessionID, acp.RequestPermissionRequest{
+		SessionId: acpsdk.SessionId(sessionID),
+		ToolCall: acpsdk.ToolCallUpdate{
+			ToolCallId: acpsdk.ToolCallId(toolApprovalCallID(call)),
+			Title:      new(title),
+			RawInput:   input,
+			Status:     acpsdk.Ptr(acpsdk.ToolCallStatusPending),
+		},
+		Options: workspaceAccessPromptOptions(remember),
+	})
+	if err != nil {
+		if errors.Is(promptCtx.Err(), context.DeadlineExceeded) {
+			return false, fmt.Errorf("daemon: workspace access prompt timed out: %w", promptCtx.Err())
+		}
+		return false, fmt.Errorf("daemon: workspace access prompt failed: %w", err)
+	}
+	return b.applyWorkspaceAccessOutcome(promptCtx, sessionID, workspaceAccessAnswer{
+		remember: remember, grant: grant,
+	}, response.Outcome)
+}
+
+// workspaceAccessAnswer is what an "Always allow" answer to one prompt may leave behind.
+type workspaceAccessAnswer struct {
+	remember bool
+	grant    *toolspkg.ApprovalGrantKey
+}
+
+func (b *workspaceAccessPromptBridge) applyWorkspaceAccessOutcome(
+	ctx context.Context,
+	sessionID string,
+	answer workspaceAccessAnswer,
+	outcome acpsdk.RequestPermissionOutcome,
+) (bool, error) {
+	if err := outcome.Validate(); err != nil {
+		return false, fmt.Errorf("daemon: validate workspace access prompt outcome: %w", err)
+	}
+	if outcome.Selected == nil {
+		return false, errors.New("daemon: workspace access prompt returned no selected outcome")
+	}
+	switch outcome.Selected.OptionId {
+	case workspaceAccessAllowOnceID:
+		return true, nil
+	case workspaceAccessRejectOnceID:
+		return false, nil
+	case workspaceAccessAllowAlwaysID:
+		if !answer.remember {
+			return false, errors.New("daemon: workspace access prompt selected an unavailable option")
+		}
+		if answer.grant == nil {
+			// An unresolved target has no scope to remember; the handler reports it as not found.
+			return true, nil
+		}
+		if err := b.rememberAllow(ctx, *answer.grant); err != nil {
+			return false, err
+		}
+		return true, nil
+	case workspaceAccessAllowSessionID:
+		if answer.remember {
+			return false, errors.New("daemon: workspace access prompt selected an unavailable option")
+		}
+		if b.consent == nil {
+			return false, errors.New("daemon: workspace access consent cache is unavailable")
+		}
+		b.consent.PutConsent(ctx, sessionID, workspaceaccess.ConsentAllow)
+		return true, nil
+	case workspaceAccessRejectSessionID:
+		if b.consent == nil {
+			return false, errors.New("daemon: workspace access consent cache is unavailable")
+		}
+		b.consent.PutConsent(ctx, sessionID, workspaceaccess.ConsentReject)
+		return false, nil
+	default:
+		return false, errors.New("daemon: workspace access prompt selected an unknown option")
+	}
+}
+
+// workspaceAccessPromptOptions offers a remembered "Always allow" for a read crossing; writes keep
+// the per-session answer.
+func workspaceAccessPromptOptions(remember bool) []acpsdk.PermissionOption {
+	allow := acpsdk.PermissionOption{
+		Kind:     acpsdk.PermissionOptionKindAllowAlways,
+		Name:     "Allow for this session",
+		OptionId: workspaceAccessAllowSessionID,
+	}
+	if remember {
+		allow.Name, allow.OptionId = "Always allow", workspaceAccessAllowAlwaysID
+	}
+	return []acpsdk.PermissionOption{
+		{Kind: acpsdk.PermissionOptionKindAllowOnce, Name: "Allow once", OptionId: workspaceAccessAllowOnceID},
+		allow,
+		{Kind: acpsdk.PermissionOptionKindRejectOnce, Name: "Reject once", OptionId: workspaceAccessRejectOnceID},
+		{
+			Kind:     acpsdk.PermissionOptionKindRejectAlways,
+			Name:     "Reject for this session",
+			OptionId: workspaceAccessRejectSessionID,
+		},
+	}
+}
+
+// nativeAccessPromptSessionPrefix marks a prompt target that names a session rather than a
+// workspace. The prompt never shows where the session lives, so it reads the same whether the
+// session exists or not.
+const nativeAccessPromptSessionPrefix = "session "
+
+const workspaceAccessPromptToolIDKey = "tool_id"
+
+// nativeAccessPromptProfilePrefix marks a prompt target that names another profile.
+const nativeAccessPromptProfilePrefix = "profile "
+
+// workspaceAccessPromptTitle names the operation, so approving a write is never presented as a read.
+func workspaceAccessPromptTitle(target string, readOnly bool) string {
+	target = strings.TrimSpace(target)
+	verb := "Change"
+	if readOnly {
+		verb = "Read"
+	}
+	if sessionID, ok := strings.CutPrefix(target, nativeAccessPromptSessionPrefix); ok {
+		return fmt.Sprintf("%s session %s outside this workspace or profile", verb, sessionID)
+	}
+	if profile, ok := strings.CutPrefix(target, nativeAccessPromptProfilePrefix); ok {
+		return fmt.Sprintf("%s %s", verb, workspaceAccessProfileSubject(profile))
+	}
+	if !readOnly {
+		return fmt.Sprintf("Change workspace %s", target)
+	}
+	return fmt.Sprintf("Access workspace %s", target)
+}
+
+func workspaceAccessPromptInput(id toolspkg.ToolID, target string) map[string]any {
+	target = strings.TrimSpace(target)
+	if sessionID, ok := strings.CutPrefix(target, nativeAccessPromptSessionPrefix); ok {
+		return map[string]any{workspaceAccessPromptToolIDKey: id.String(), "target_session_id": sessionID}
+	}
+	if profile, ok := strings.CutPrefix(target, nativeAccessPromptProfilePrefix); ok {
+		return map[string]any{workspaceAccessPromptToolIDKey: id.String(), "target_profile": profile}
+	}
+	return map[string]any{workspaceAccessPromptToolIDKey: id.String(), "target_workspace_id": target}
+}
+
+func workspaceAccessProfileSubject(profile string) string {
+	if profile == "all profiles" {
+		return "all profiles"
+	}
+	return "profile " + profile
+}

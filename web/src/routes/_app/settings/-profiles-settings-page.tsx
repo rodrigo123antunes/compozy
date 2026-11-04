@@ -1,0 +1,95 @@
+import { Plus } from "@compozy/ui/icons";
+
+import { Button } from "@compozy/ui";
+
+import {
+  PROFILE_REMOTE_MANAGEMENT_LINE,
+  PROFILE_SEPARATION_LINE,
+  ProfileSettingsList,
+  useProfilesSettingsPage,
+} from "@/systems/profiles";
+import {
+  SettingsAdvancedFold,
+  SettingsPageFrame,
+  SettingsPageState,
+  useSettingsTopbar,
+} from "@/systems/settings";
+
+const TEST_PREFIX = "settings-page-profiles";
+
+/**
+ * Settings → Profiles.
+ *
+ * The default read is the active list plus one honest sentence. Everything an
+ * operator asks less often — the archived list — sits one disclosure deeper.
+ */
+export function ProfilesSettingsPage() {
+  const page = useProfilesSettingsPage();
+  useSettingsTopbar();
+  const lifecycleActions = {
+    onEditIdentity: (name: string) => page.open({ flow: "update", profile: name }),
+    onRename: (name: string) => page.open({ flow: "rename", profile: name }),
+    onArchive: (name: string) => page.open({ flow: "archive", profile: name }),
+    onUnarchive: (name: string) => page.open({ flow: "unarchive", profile: name }),
+    onDelete: (name: string) => page.open({ flow: "delete", profile: name }),
+  };
+
+  if (page.isLoading) {
+    return <SettingsPageState slug="profiles" state="loading" />;
+  }
+
+  if (page.errorMessage !== null) {
+    return (
+      <SettingsPageState
+        error={page.errorMessage}
+        onRetry={page.refetch}
+        slug="profiles"
+        state="error"
+      />
+    );
+  }
+
+  return (
+    <SettingsPageFrame slug="profiles">
+      <div className="flex flex-col gap-4" data-testid={`${TEST_PREFIX}-content`}>
+        <div className="flex items-center gap-2">
+          <p className="flex-1 text-small-body text-subtle" data-testid={`${TEST_PREFIX}-line`}>
+            {page.manageable ? PROFILE_SEPARATION_LINE : PROFILE_REMOTE_MANAGEMENT_LINE}
+          </p>
+          {page.manageable ? (
+            <Button
+              size="sm"
+              onClick={() => page.open({ flow: "create" })}
+              data-testid="profile-create-open"
+            >
+              <Plus aria-hidden="true" />
+              Create profile
+            </Button>
+          ) : null}
+        </div>
+        <ProfileSettingsList
+          profiles={page.active}
+          currentName={page.currentName}
+          manageable={page.manageable}
+          variant="active"
+          {...lifecycleActions}
+        />
+        {page.archived.length > 0 ? (
+          <SettingsAdvancedFold
+            data-testid={`${TEST_PREFIX}-archived`}
+            label={`Archived (${page.archived.length})`}
+            bare
+          >
+            <ProfileSettingsList
+              profiles={page.archived}
+              currentName={page.currentName}
+              manageable={page.manageable}
+              variant="archived"
+              {...lifecycleActions}
+            />
+          </SettingsAdvancedFold>
+        ) : null}
+      </div>
+    </SettingsPageFrame>
+  );
+}

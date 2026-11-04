@@ -1,0 +1,1108 @@
+package daemon
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"os"
+	"path/filepath"
+	"slices"
+	"strings"
+	"sync/atomic"
+	"testing"
+
+	"github.com/compozy/compozy/internal/acp"
+	commandpkg "github.com/compozy/compozy/internal/command"
+	compozyconfig "github.com/compozy/compozy/internal/config"
+	"github.com/compozy/compozy/internal/resources"
+	"github.com/compozy/compozy/internal/session"
+	skillspkg "github.com/compozy/compozy/internal/skills"
+	"github.com/compozy/compozy/internal/store"
+	toolspkg "github.com/compozy/compozy/internal/tools"
+	workspacepkg "github.com/compozy/compozy/internal/workspace"
+)
+
+func TestNewSkillsCatalogAugmenterUsesCurrentRegistryStatePerPrompt(t *testing.T) {
+	t.Run("Should retain full context until transport delivery is confirmed", func(t *testing.T) {
+		t.Parallel()
+		_, augmenter := newPromptSkillsAugmenterForTest(t, []*skillspkg.Skill{
+			{Meta: skillspkg.SkillMeta{Name: "qa-marker-skill", Description: "Shows up while enabled."}, Enabled: true},
+		})
+		sess := newPromptSkillsSession("sess-compact")
+		for _, message := range []string{"first request", "retry request"} {
+			ctx, sections := acp.CollectPromptSections(t.Context())
+			prompt, err := augmenter(ctx, sess, message)
+			if err != nil {
+				t.Fatal(err)
+			}
+			registered := sections()
+			if len(registered) != 1 || !strings.Contains(prompt, registered[0].Content) ||
+				!strings.Contains(prompt, `name="qa-marker-skill"`) || !strings.HasSuffix(prompt, message) {
+				t.Fatalf("prompt lost its full retryable catalog: %q (%#v)", prompt, registered)
+			}
+			if registered[0].StartupContent != skillspkg.BuildCatalogWithinBudget([]*skillspkg.Skill{
+				{
+					Meta:    skillspkg.SkillMeta{Name: "qa-marker-skill", Description: "Shows up while enabled."},
+					Enabled: true,
+				},
+			}, startupSkillsSectionBudget) || registered[0].UnchangedContent != skillspkg.BuildCurrentCatalogUnchanged() {
+				t.Fatalf("registered section does not match startup and current catalog semantics: %#v", registered)
+			}
+		}
+	})
+
+	t.Run("Should emit refreshed full catalog when registry state changes", func(t *testing.T) {
+		t.Parallel()
+
+		registry, augmenter := newPromptSkillsAugmenterForTest(t, []*skillspkg.Skill{
+			{
+				Meta: skillspkg.SkillMeta{
+					Name:        "qa-marker-skill",
+					Description: "Shows up while enabled.",
+				},
+				Enabled: true,
+			},
+		})
+		sess := newPromptSkillsSession("sess-refresh")
+
+		first, err := augmenter(t.Context(), sess, "list current skills")
+		if err != nil {
+			t.Fatalf("augmenter(first) error = %v", err)
+		}
+		if !strings.Contains(first, `name="qa-marker-skill"`) {
+			t.Fatalf("first prompt = %q, want enabled skill entry", first)
+		}
+
+		registry.skillsByAgent["general"] = []*skillspkg.Skill{
+			{
+				Meta: skillspkg.SkillMeta{
+					Name:        "qa-marker-skill",
+					Description: "Now disabled.",
+				},
+				Enabled: false,
+			},
+			{
+				Meta: skillspkg.SkillMeta{
+					Name:        "replacement-skill",
+					Description: "Still enabled after refresh.",
+				},
+				Enabled: true,
+			},
+		}
+
+		second, err := augmenter(t.Context(), sess, "list current skills")
+		if err != nil {
+			t.Fatalf("augmenter(second) error = %v, want live refresh", err)
+		}
+		if strings.Contains(second, `name="qa-marker-skill"`) {
+			t.Fatalf("second prompt = %q, want disabled skill removed from current catalog", second)
+		}
+		if !strings.Contains(second, `name="replacement-skill"`) {
+			t.Fatalf("second prompt = %q, want refreshed enabled skill in current catalog", second)
+		}
+		if !strings.Contains(
+			second,
+			"The <current-available-skills> block above is the authoritative current skill state for this turn.",
+		) {
+			t.Fatalf("second prompt = %q, want authoritative current-catalog guidance", second)
+		}
+		if strings.Contains(second, `<catalog-state unchanged="true">`) {
+			t.Fatalf("second prompt = %q, want full refreshed catalog instead of unchanged marker", second)
+		}
+		if !strings.HasSuffix(second, "list current skills") {
+			t.Fatalf("second prompt = %q, want original prompt preserved", second)
+		}
+	})
+
+	t.Run("Should replay the full catalog after the ACP session changes", func(t *testing.T) {
+		t.Parallel()
+
+		registry, augmenter := newPromptSkillsAugmenterForTest(t, []*skillspkg.Skill{
+			{
+				Meta: skillspkg.SkillMeta{
+					Name:        "qa-marker-skill",
+					Description: "Shows up while enabled.",
+				},
+				Enabled: true,
+			},
+		})
+		_ = registry
+		sess := newPromptSkillsSession("sess-resume")
+		sess.ACPSessionID = "acp-1"
+
+		first, err := augmenter(t.Context(), sess, "list current skills")
+		if err != nil {
+			t.Fatalf("augmenter(first) error = %v", err)
+		}
+		if !strings.Contains(first, `name="qa-marker-skill"`) {
+			t.Fatalf("first prompt = %q, want enabled skill entry", first)
+		}
+
+		second, err := augmenter(t.Context(), sess, "list current skills again")
+		if err != nil {
+			t.Fatalf("augmenter(second) error = %v", err)
+		}
+		if !strings.Contains(second, `name="qa-marker-skill"`) {
+			t.Fatalf("second prompt = %q, want full context pending delivery", second)
+		}
+
+		sess.ACPSessionID = "acp-2"
+		third, err := augmenter(t.Context(), sess, "list current skills after resume")
+		if err != nil {
+			t.Fatalf("augmenter(third) error = %v", err)
+		}
+		if strings.Contains(third, `<catalog-state unchanged="true">`) {
+			t.Fatalf("third prompt = %q, want full catalog after ACP session reset", third)
+		}
+		if !strings.Contains(third, `name="qa-marker-skill"`) {
+			t.Fatalf("third prompt = %q, want enabled skill entry after ACP session reset", third)
+		}
+		if !strings.HasSuffix(third, "list current skills after resume") {
+			t.Fatalf("third prompt = %q, want original prompt preserved", third)
+		}
+	})
+
+	t.Run("Should activate a Profile tool-gated skill on the next prompt without restart", func(t *testing.T) {
+		t.Parallel()
+
+		userDir := t.TempDir()
+		skillDir := filepath.Join(userDir, "tool-gated")
+		if err := os.MkdirAll(skillDir, 0o755); err != nil {
+			t.Fatalf("MkdirAll() error = %v", err)
+		}
+		content := strings.Join([]string{
+			"---",
+			"name: tool-gated",
+			"description: Needs the canonical skill tool.",
+			"metadata:",
+			"  compozy:",
+			"    when:",
+			"      requires_tools: [compozy__skill_view]",
+			"---",
+			"body",
+		}, "\n")
+		if err := os.WriteFile(filepath.Join(skillDir, "SKILL.md"), []byte(content), 0o600); err != nil {
+			t.Fatalf("WriteFile() error = %v", err)
+		}
+
+		var toolAvailable atomic.Bool
+		toolRegistry := &promptSkillsToolRegistry{
+			profileID:   "profile-work",
+			workspaceID: "ws-1",
+			sessionID:   "sess-tool-gate",
+			agentName:   "coordinator",
+			available:   &toolAvailable,
+		}
+		registry := skillspkg.NewRegistry(
+			skillspkg.RegistryConfig{GlobalSkillRoots: compozyconfig.ResolveGlobalSkillRoots(
+				&compozyconfig.SkillsConfig{},
+				compozyconfig.HomePaths{SkillsDir: userDir},
+			)},
+			skillspkg.WithActivationContextProvider(newSkillActivationContextProvider(
+				&bootState{toolRegistry: toolRegistry},
+			)),
+		)
+		if err := registry.LoadAll(t.Context()); err != nil {
+			t.Fatalf("LoadAll() error = %v", err)
+		}
+		resolver := &stubPromptSkillsWorkspaceResolver{resolved: workspacepkg.ResolvedWorkspace{
+			ProfileID: "profile-work",
+			ID:        "ws-1", RootDir: "/tmp/ws-1",
+		}}
+		augmenter := newSkillsCatalogAugmenter(
+			registry, nil, func() promptSkillsWorkspaceResolver { return resolver }, nil,
+		)
+		sess := newPromptSkillsSession("sess-tool-gate")
+		sess.AgentName = "coordinator"
+
+		first, err := augmenter(t.Context(), sess, "first")
+		if err != nil {
+			t.Fatalf("augmenter(first) error = %v", err)
+		}
+		if strings.Contains(first, "tool-gated") {
+			t.Fatalf("first prompt = %q, want inactive skill omitted", first)
+		}
+
+		toolAvailable.Store(true)
+		second, err := augmenter(t.Context(), sess, "second")
+		if err != nil {
+			t.Fatalf("augmenter(second) error = %v", err)
+		}
+		if !strings.Contains(second, `name="tool-gated"`) {
+			t.Fatalf("second prompt = %q, want active skill advertised", second)
+		}
+		if len(second) <= len(first) {
+			t.Fatalf("prompt bytes inactive=%d active=%d, want measured catalog growth", len(first), len(second))
+		}
+	})
+
+	t.Run("Should refresh authored agents by name while preserving package-owned snapshots", func(t *testing.T) {
+		t.Parallel()
+
+		registry, _ := newPromptSkillsAugmenterForTest(t, nil)
+		augmenter := &skillsCatalogAugmenter{registry: registry}
+		workspace := &workspacepkg.ResolvedWorkspace{
+			ID: "ws-1", RootDir: "/tmp/ws-1",
+		}
+		if _, err := augmenter.skillsForSessionAgent(
+			t.Context(),
+			workspace,
+			compozyconfig.AgentDef{Name: "authored", SourcePath: "/tmp/ws-1/.compozy/agents/authored/AGENT.md"},
+			"sess-authored",
+		); err != nil {
+			t.Fatalf("skillsForSessionAgent(authored) error = %v", err)
+		}
+		if _, err := augmenter.skillsForSessionAgent(
+			t.Context(),
+			workspace,
+			compozyconfig.AgentDef{Name: "packaged"},
+			"sess-packaged",
+		); err != nil {
+			t.Fatalf("skillsForSessionAgent(packaged) error = %v", err)
+		}
+		if got, want := registry.resolvedNames, []string{"authored"}; !slices.Equal(got, want) {
+			t.Fatalf("resolved agent names = %#v, want %#v", got, want)
+		}
+		if got, want := registry.concreteNames, []string{"packaged"}; !slices.Equal(got, want) {
+			t.Fatalf("concrete agent names = %#v, want %#v", got, want)
+		}
+	})
+
+	t.Run("Should resolve an extension agent after the authored lookup reports it absent", func(t *testing.T) {
+		t.Parallel()
+
+		registry := &stubPromptSkillsRegistry{
+			skillsByAgent: map[string][]*skillspkg.Skill{
+				"reviewer": {{Meta: skillspkg.SkillMeta{Name: "cy-review-round"}, Enabled: true}},
+			},
+			nameErr: skillspkg.ErrAgentNotFound,
+		}
+		workspace := &workspacepkg.ResolvedWorkspace{
+			ID: "ws-extension", RootDir: "/workspace",
+		}
+		var resolver session.AgentResolver
+		augmenter := &skillsCatalogAugmenter{
+			registry:      registry,
+			agentResolver: func() session.AgentResolver { return resolver },
+		}
+		agent := compozyconfig.AgentDef{
+			Name: "reviewer", SourcePath: "/extensions/spec-cycle/agents/reviewer/AGENT.md",
+		}
+		if _, err := augmenter.skillsForSessionAgent(
+			t.Context(), workspace, agent, "sess-extension",
+		); !errors.Is(err, skillspkg.ErrAgentNotFound) {
+			t.Fatalf("skillsForSessionAgent(before resolver) error = %v, want ErrAgentNotFound", err)
+		}
+		resolver = stubSessionCommandAgentResolver(func(
+			name string,
+			resolved *workspacepkg.ResolvedWorkspace,
+		) (compozyconfig.AgentDef, error) {
+			if name != "reviewer" || resolved.ID != "ws-extension" {
+				return compozyconfig.AgentDef{}, workspacepkg.ErrAgentNotAvailable
+			}
+			return compozyconfig.AgentDef{
+				Name:       name,
+				SourcePath: "/extensions/spec-cycle/agents/reviewer/AGENT.md",
+			}, nil
+		})
+
+		got, err := augmenter.skillsForSessionAgent(
+			t.Context(),
+			workspace,
+			agent,
+			"sess-extension",
+		)
+		if err != nil {
+			t.Fatalf("skillsForSessionAgent(extension) error = %v", err)
+		}
+		if len(got) != 1 || got[0].Meta.Name != "cy-review-round" {
+			t.Fatalf("skillsForSessionAgent(extension) = %#v, want cy-review-round", got)
+		}
+		if got, want := registry.resolvedNames, []string{"reviewer", "reviewer"}; !slices.Equal(got, want) {
+			t.Fatalf("resolved agent names = %#v, want %#v", got, want)
+		}
+		if got, want := registry.concreteNames, []string{"reviewer"}; !slices.Equal(got, want) {
+			t.Fatalf("concrete agent names = %#v, want %#v", got, want)
+		}
+	})
+
+	t.Run("Should preserve authored lookup failures without consulting the extension catalog", func(t *testing.T) {
+		t.Parallel()
+
+		registryErr := fmt.Errorf("%w: reviewer", skillspkg.ErrAgentLocalInvalid)
+		registry := &stubPromptSkillsRegistry{nameErr: registryErr}
+		resolverCalled := false
+		augmenter := &skillsCatalogAugmenter{
+			registry: registry,
+			agentResolver: func() session.AgentResolver {
+				resolverCalled = true
+				return nil
+			},
+		}
+
+		_, err := augmenter.skillsForSessionAgent(
+			t.Context(),
+			nil,
+			compozyconfig.AgentDef{Name: "reviewer", SourcePath: "/workspace/.compozy/agents/reviewer/AGENT.md"},
+			"sess-authored",
+		)
+		if !errors.Is(err, registryErr) {
+			t.Fatalf("skillsForSessionAgent(authored failure) error = %v, want %v", err, registryErr)
+		}
+		if resolverCalled {
+			t.Fatal("skillsForSessionAgent(authored failure) consulted the extension catalog")
+		}
+	})
+}
+
+type promptSkillsToolRegistry struct {
+	profileID   string
+	workspaceID string
+	sessionID   string
+	agentName   string
+	available   *atomic.Bool
+}
+
+func (r *promptSkillsToolRegistry) List(
+	ctx context.Context,
+	scope toolspkg.Scope,
+) ([]toolspkg.ToolView, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	if scope.ProfileID != r.profileID {
+		return nil, fmt.Errorf("profile id = %q, want %q", scope.ProfileID, r.profileID)
+	}
+	if scope.WorkspaceID != r.workspaceID {
+		return nil, fmt.Errorf("workspace id = %q, want %q", scope.WorkspaceID, r.workspaceID)
+	}
+	if scope.SessionID != r.sessionID {
+		return nil, fmt.Errorf("session id = %q, want %q", scope.SessionID, r.sessionID)
+	}
+	if scope.AgentName != r.agentName {
+		return nil, fmt.Errorf("agent name = %q, want %q", scope.AgentName, r.agentName)
+	}
+	if !r.available.Load() {
+		return []toolspkg.ToolView{}, nil
+	}
+	return []toolspkg.ToolView{{Descriptor: toolspkg.Descriptor{ID: "compozy__skill_view"}}}, nil
+}
+
+func (*promptSkillsToolRegistry) Search(
+	context.Context,
+	toolspkg.Scope,
+	toolspkg.SearchQuery,
+) ([]toolspkg.ToolView, error) {
+	return nil, errors.New("unexpected Search call")
+}
+
+func (*promptSkillsToolRegistry) Get(
+	context.Context,
+	toolspkg.Scope,
+	toolspkg.ToolID,
+) (toolspkg.ToolView, error) {
+	return toolspkg.ToolView{}, errors.New("unexpected Get call")
+}
+
+func (*promptSkillsToolRegistry) Call(
+	context.Context,
+	toolspkg.Scope,
+	toolspkg.CallRequest,
+) (toolspkg.ToolResult, error) {
+	return toolspkg.ToolResult{}, errors.New("unexpected Call call")
+}
+
+func TestSkillsCatalogAugmenterFiltersBeforeCatalogSignature(t *testing.T) {
+	t.Parallel()
+	t.Run("Should compute the signature after provider-native filtering", func(t *testing.T) {
+		t.Parallel()
+
+		registry := &stubPromptSkillsRegistry{skillsByAgent: map[string][]*skillspkg.Skill{
+			"general": {
+				{Meta: skillspkg.SkillMeta{Name: "native", Description: "Native"}, Enabled: true},
+				{Meta: skillspkg.SkillMeta{Name: "managed", Description: "Managed"}, Enabled: true},
+			},
+		}}
+		resolver := &stubPromptSkillsWorkspaceResolver{resolved: workspacepkg.ResolvedWorkspace{
+			ID: "ws-filter", RootDir: t.TempDir(),
+		}}
+		augmenter := newSkillsCatalogAugmenterState(
+			registry, nil, func() promptSkillsWorkspaceResolver { return resolver }, nil,
+		)
+		sess := newPromptSkillsSession("sess-filter-signature")
+
+		full, err := augmenter.Augment(t.Context(), sess, "first")
+		if err != nil {
+			t.Fatalf("Augment(full) error = %v", err)
+		}
+		if !strings.Contains(full, `name="native"`) {
+			t.Fatalf("full catalog = %q, want native skill", full)
+		}
+		policy := ResolvedHarnessContext{Policy: ResolvedHarnessPolicy{
+			SkillInjectionFilter: func(skill *skillspkg.Skill) bool { return skill.Meta.Name != "native" },
+		}}
+		filtered, err := augmenter.AugmentWithPolicy(t.Context(), sess, "second", &policy)
+		if err != nil {
+			t.Fatalf("AugmentWithPolicy(filtered) error = %v", err)
+		}
+		if strings.Contains(filtered, `name="native"`) || !strings.Contains(filtered, `name="managed"`) {
+			t.Fatalf("filtered catalog = %q, want only managed skill", filtered)
+		}
+		if strings.Contains(filtered, `unchanged="true"`) {
+			t.Fatalf("filtered catalog = %q, signature was computed before filtering", filtered)
+		}
+		repeat, err := augmenter.AugmentWithPolicy(t.Context(), sess, "third", &policy)
+		if err != nil {
+			t.Fatalf("AugmentWithPolicy(repeat) error = %v", err)
+		}
+		if repeat != strings.Replace(filtered, "second", "third", 1) {
+			t.Fatalf("repeat catalog = %q, want the same filtered transport input", repeat)
+		}
+	})
+}
+
+func TestSessionCommandServiceProjectsAndRevalidatesExactSkillSources(t *testing.T) {
+	t.Parallel()
+
+	t.Run("Should project and revalidate exact skill sources", func(t *testing.T) {
+		t.Parallel()
+
+		workspaceSkill := &skillspkg.Skill{
+			Meta:   skillspkg.SkillMeta{Name: "review", Description: "Workspace review"},
+			Source: skillspkg.SourceWorkspace, CommandScope: "workspace", Enabled: true,
+			FilePath: "/workspace/review/SKILL.md",
+		}
+		extensionSkill := &skillspkg.Skill{
+			Meta:   skillspkg.SkillMeta{Name: "review", Description: "Extension review"},
+			Source: skillspkg.SourceBundled, CommandScope: "workspace", Enabled: true,
+			InstalledFromExtension: "ops", FilePath: "/extension/review/SKILL.md",
+		}
+		registry := &stubSessionCommandSkills{
+			candidates: []skillspkg.CommandCandidate{
+				{
+					Skill: workspaceSkill, SourceKind: "workspace", Scope: "workspace", Available: true,
+				},
+				{
+					Skill: extensionSkill, SourceKind: "extension", SourceID: "ops", SourceKey: "ops",
+					Scope: "workspace", Qualified: true, Available: true,
+				},
+			},
+			content: map[string]string{
+				workspaceSkill.FilePath: "Workspace instructions.",
+				extensionSkill.FilePath: "Extension instructions.",
+			},
+		}
+		resolver := &stubPromptSkillsWorkspaceResolver{resolved: workspacepkg.ResolvedWorkspace{
+			ID: "ws-command", RootDir: "/workspace",
+		}}
+		service := newSessionCommandService(
+			registry, nil, func() promptSkillsWorkspaceResolver { return resolver }, nil,
+		)
+		info := &session.Info{
+			ID: "sess-command", AgentName: "coder", WorkspaceID: "ws-command", Workspace: "/workspace",
+			AdvertisedCommands: []store.SessionAdvertisedCommand{{Name: "compact", Description: "Compact context"}},
+		}
+		agent := compozyconfig.AgentDef{Name: "coder"}
+		catalog, err := service.Catalog(t.Context(), info, agent)
+		if err != nil {
+			t.Fatalf("Catalog() error = %v", err)
+		}
+		tokens := make([]string, 0, len(catalog.Commands))
+		for _, descriptor := range catalog.Commands {
+			tokens = append(tokens, descriptor.CanonicalToken)
+		}
+		if got, want := strings.Join(tokens, ","), "/goal,/worktree,/compact,/ops:review,/review"; got != want {
+			t.Fatalf("Catalog() tokens = %q, want %q", got, want)
+		}
+		invocations, err := commandpkg.ParseSkillInvocations("Please /ops:review this", catalog)
+		if err != nil {
+			t.Fatalf("ParseSkillInvocations() error = %v", err)
+		}
+		expanded, err := service.Expand(t.Context(), info, agent, invocations, "Please /ops:review this")
+		if err != nil {
+			t.Fatalf("Expand() error = %v", err)
+		}
+		if !strings.Contains(expanded, "Extension instructions.") ||
+			!strings.HasSuffix(expanded, "Please /ops:review this") {
+			t.Fatalf("Expand() = %q, want verified instructions plus authored text", expanded)
+		}
+
+		registry.candidates = registry.candidates[:1]
+		_, err = service.Expand(t.Context(), info, agent, invocations, "Please /ops:review this")
+		if !errors.Is(err, commandpkg.ErrUnavailable) {
+			t.Fatalf("Expand(stale source) error = %v, want ErrUnavailable", err)
+		}
+	})
+
+	t.Run("Should expand an admitted root skill after an unrelated registry reload", func(t *testing.T) {
+		t.Parallel()
+
+		skillDir := filepath.Join(t.TempDir(), "orchestrate")
+		if err := os.MkdirAll(skillDir, 0o755); err != nil {
+			t.Fatalf("MkdirAll() error = %v", err)
+		}
+		skillFile := filepath.Join(skillDir, "SKILL.md")
+		content := "---\nname: orchestrate\ndescription: Orchestrate the issue.\n---\nOrchestration body."
+		if err := os.WriteFile(skillFile, []byte(content), 0o600); err != nil {
+			t.Fatalf("WriteFile() error = %v", err)
+		}
+		records := []resources.Record[skillspkg.SkillResourceSpec]{{
+			ID: "agents:orchestrate", Scope: resources.ResourceScope{Kind: resources.ResourceScopeKindUser},
+			Spec: skillspkg.SkillResourceSpec{
+				Name: "orchestrate", Description: "Orchestrate the issue.", Source: "user",
+				Origin: "agents", RootID: "root_agents", FilePath: skillFile, Enabled: true,
+			},
+		}}
+		registry := skillspkg.NewRegistry(skillspkg.RegistryConfig{})
+		if err := registry.ApplyResourceRecords(t.Context(), 1, records); err != nil {
+			t.Fatalf("ApplyResourceRecords(1) error = %v", err)
+		}
+		service := newSessionCommandService(registry, nil, nil, nil)
+		info := &session.Info{ID: "sess-reload", AgentName: "coder"}
+		agent := compozyconfig.AgentDef{Name: "coder"}
+		catalog, err := service.Catalog(t.Context(), info, agent)
+		if err != nil {
+			t.Fatalf("Catalog() error = %v", err)
+		}
+		invocations, err := commandpkg.ParseSkillInvocations("/agents:orchestrate go", catalog)
+		if err != nil || len(invocations) != 1 {
+			t.Fatalf("ParseSkillInvocations() = %#v, %v; want one admitted invocation", invocations, err)
+		}
+
+		// Any reload (profile selection, resource sync) lands between admission and dispatch.
+		if err := registry.ApplyResourceRecords(t.Context(), 2, records); err != nil {
+			t.Fatalf("ApplyResourceRecords(2) error = %v", err)
+		}
+		expanded, err := service.Expand(t.Context(), info, agent, invocations, "/agents:orchestrate go")
+		if err != nil {
+			t.Fatalf("Expand(after reload) error = %v, want the admitted skill expanded", err)
+		}
+		if !strings.Contains(expanded, "Orchestration body.") {
+			t.Fatalf("Expand(after reload) = %q, want the skill body", expanded)
+		}
+	})
+
+	t.Run("Should keep every physical homonym invocable by its qualified root identity", func(t *testing.T) {
+		t.Parallel()
+
+		agentsSkill := &skillspkg.Skill{
+			Meta:   skillspkg.SkillMeta{Name: "review", Description: "Agents review"},
+			Source: skillspkg.SourceUser, Origin: "agents", RootID: "root_agents",
+			FilePath: "/agents/review/SKILL.md", Enabled: true,
+		}
+		claudeSkill := &skillspkg.Skill{
+			Meta:   skillspkg.SkillMeta{Name: "review", Description: "Claude review"},
+			Source: skillspkg.SourceWorkspace, Origin: "claude", RootID: "root_claude",
+			FilePath: "/claude/review/SKILL.md", Enabled: true,
+		}
+		registry := &stubSessionCommandSkills{
+			candidates: []skillspkg.CommandCandidate{
+				{
+					Skill: claudeSkill, SourceKind: "workspace", SourceID: "claude",
+					SourceKey: "root_claude", Scope: "workspace", Origin: "claude", Available: true,
+				},
+				{
+					Skill: agentsSkill, SourceKind: "user", SourceID: "agents",
+					SourceKey: "root_agents", Scope: "global", Origin: "agents",
+					Qualified: true, Available: true,
+				},
+				{
+					Skill: claudeSkill, SourceKind: "workspace", SourceID: "claude",
+					SourceKey: "root_claude", Scope: "workspace", Origin: "claude",
+					Qualified: true, Available: true,
+				},
+			},
+			content: map[string]string{
+				agentsSkill.FilePath: "Agents body.", claudeSkill.FilePath: "Claude body.",
+			},
+		}
+		service := newSessionCommandService(registry, nil, nil, nil)
+		info := &session.Info{ID: "sess-roots", AgentName: "coder"}
+		agent := compozyconfig.AgentDef{Name: "coder"}
+		catalog, err := service.Catalog(t.Context(), info, agent)
+		if err != nil {
+			t.Fatalf("Catalog() error = %v", err)
+		}
+		for token, body := range map[string]string{
+			"/review": "Claude body.", "/agents:review": "Agents body.", "/claude:review": "Claude body.",
+		} {
+			invocations, parseErr := commandpkg.ParseSkillInvocations("Use "+token, catalog)
+			if parseErr != nil {
+				t.Fatalf("ParseSkillInvocations(%q) error = %v", token, parseErr)
+			}
+			expanded, expandErr := service.Expand(t.Context(), info, agent, invocations, "Use "+token)
+			if expandErr != nil {
+				t.Fatalf("Expand(%q) error = %v", token, expandErr)
+			}
+			if !strings.Contains(expanded, body) {
+				t.Fatalf("Expand(%q) = %q, want %q", token, expanded, body)
+			}
+		}
+
+		staleCatalog := catalog
+		registry.candidates[0].SourceKey = "root_claude_relocated"
+		registry.candidates[2].SourceKey = "root_claude_relocated"
+		stale, err := commandpkg.ParseSkillInvocations("Use /review", staleCatalog)
+		if err != nil {
+			t.Fatalf("ParseSkillInvocations(stale) error = %v", err)
+		}
+		if _, err := service.Expand(
+			t.Context(),
+			info,
+			agent,
+			stale,
+			"Use /review",
+		); !errors.Is(
+			err,
+			commandpkg.ErrUnavailable,
+		) {
+			t.Fatalf("Expand(relocated source root) error = %v, want ErrUnavailable", err)
+		}
+	})
+
+	t.Run("Should derive every command projection from the immutable session profile", func(t *testing.T) {
+		t.Parallel()
+
+		const sessionProfileID = "profile-marketing"
+		registry := &stubSessionCommandSkills{}
+		resolver := &stubPromptSkillsWorkspaceResolver{
+			resolved: workspacepkg.ResolvedWorkspace{ProfileID: "profile-sales"},
+			profiles: map[string]workspacepkg.ResolvedWorkspace{
+				"marketing": {ProfileID: sessionProfileID, ProfileName: "marketing"},
+			},
+		}
+		service := newSessionCommandService(
+			registry,
+			nil,
+			func() promptSkillsWorkspaceResolver { return resolver },
+			promptSkillsProfileNameResolver{sessionProfileID: "marketing"},
+		)
+		info := &session.Info{
+			ID: "sess-profile", ProfileID: sessionProfileID, AgentName: "coder",
+			WorkspaceID: "ws-profile", Workspace: "/workspace",
+		}
+
+		if _, err := service.Catalog(t.Context(), info, compozyconfig.AgentDef{Name: "coder"}); err != nil {
+			t.Fatalf("Catalog() error = %v", err)
+		}
+		if got, want := resolver.requestedProfile, "marketing"; got != want {
+			t.Fatalf("ResolveForProfile() profile = %q, want %q", got, want)
+		}
+		if got, want := registry.resolvedProfileID, sessionProfileID; got != want {
+			t.Fatalf("registry resolved profile = %q, want session profile %q", got, want)
+		}
+	})
+
+	t.Run("Should resolve default-profile commands through the profile layer", func(t *testing.T) {
+		t.Parallel()
+
+		registry := &stubSessionCommandSkills{}
+		resolver := &stubPromptSkillsWorkspaceResolver{
+			resolved: workspacepkg.ResolvedWorkspace{ProfileID: "unscoped"},
+			profiles: map[string]workspacepkg.ResolvedWorkspace{
+				daemonDefaultProfileName: {
+					ProfileID: store.DefaultProfileID, ProfileName: daemonDefaultProfileName,
+				},
+			},
+		}
+		service := newSessionCommandService(
+			registry,
+			nil,
+			func() promptSkillsWorkspaceResolver { return resolver },
+			promptSkillsProfileNameResolver{store.DefaultProfileID: daemonDefaultProfileName},
+		)
+		info := &session.Info{
+			ID: "sess-default-profile", ProfileID: store.DefaultProfileID, AgentName: "coder",
+			WorkspaceID: "ws-default", Workspace: "/workspace",
+		}
+
+		if _, err := service.Catalog(t.Context(), info, compozyconfig.AgentDef{Name: "coder"}); err != nil {
+			t.Fatalf("Catalog() error = %v", err)
+		}
+		if got, want := resolver.requestedProfile, daemonDefaultProfileName; got != want {
+			t.Fatalf("ResolveForProfile() profile = %q, want %q", got, want)
+		}
+		if got, want := registry.resolvedProfileID, store.DefaultProfileID; got != want {
+			t.Fatalf("registry resolved profile = %q, want default profile %q", got, want)
+		}
+	})
+
+	t.Run("Should resolve an extension agent only after the authored lookup reports it absent", func(t *testing.T) {
+		t.Parallel()
+
+		reviewSkill := &skillspkg.Skill{
+			Meta: skillspkg.SkillMeta{Name: "review", Description: "Review changes."},
+		}
+		registry := &stubSessionCommandSkills{
+			candidates: []skillspkg.CommandCandidate{{
+				Skill: reviewSkill, SourceKind: "extension", SourceID: "spec-cycle", Available: true,
+			}},
+			nameErr: fmt.Errorf("%w: %q", skillspkg.ErrAgentNotFound, "reviewer"),
+		}
+		workspaceResolver := &stubPromptSkillsWorkspaceResolver{resolved: workspacepkg.ResolvedWorkspace{
+			ID: "ws-extension", RootDir: "/workspace",
+		}}
+		service := newSessionCommandService(
+			registry,
+			func() session.AgentResolver {
+				return stubSessionCommandAgentResolver(func(
+					name string,
+					_ *workspacepkg.ResolvedWorkspace,
+				) (compozyconfig.AgentDef, error) {
+					if name != "reviewer" {
+						return compozyconfig.AgentDef{}, workspacepkg.ErrAgentNotAvailable
+					}
+					return compozyconfig.AgentDef{Name: name}, nil
+				})
+			},
+			func() promptSkillsWorkspaceResolver { return workspaceResolver },
+			nil,
+		)
+		info := &session.Info{
+			ID: "sess-extension", AgentName: "reviewer", WorkspaceID: "ws-extension", Workspace: "/workspace",
+		}
+		catalog, err := service.Catalog(t.Context(), info, compozyconfig.AgentDef{
+			Name: "reviewer", SourcePath: "/extensions/spec-cycle/agents/reviewer/AGENT.md",
+		})
+		if err != nil {
+			t.Fatalf("Catalog() error = %v", err)
+		}
+		var found *commandpkg.Descriptor
+		for index := range catalog.Commands {
+			if catalog.Commands[index].Skill != nil && catalog.Commands[index].Skill.Name == "review" {
+				found = &catalog.Commands[index]
+				break
+			}
+		}
+		if found == nil || found.Source.Kind != "extension" || found.Source.ID != "spec-cycle" {
+			t.Fatalf("Catalog() commands = %+v, want extension spec-cycle review skill", catalog.Commands)
+		}
+	})
+
+	t.Run("Should preserve authored agent validation errors without consulting the catalog", func(t *testing.T) {
+		t.Parallel()
+
+		registry := &stubSessionCommandSkills{
+			nameErr: fmt.Errorf("%w: agent %q", skillspkg.ErrAgentLocalInvalid, "reviewer"),
+		}
+		resolverCalled := false
+		workspaceResolver := &stubPromptSkillsWorkspaceResolver{resolved: workspacepkg.ResolvedWorkspace{
+			ID: "ws-authored", RootDir: "/workspace",
+		}}
+		service := newSessionCommandService(
+			registry,
+			func() session.AgentResolver {
+				return stubSessionCommandAgentResolver(func(
+					string,
+					*workspacepkg.ResolvedWorkspace,
+				) (compozyconfig.AgentDef, error) {
+					resolverCalled = true
+					return compozyconfig.AgentDef{Name: "reviewer"}, nil
+				})
+			},
+			func() promptSkillsWorkspaceResolver { return workspaceResolver },
+			nil,
+		)
+		info := &session.Info{ID: "sess-authored", AgentName: "reviewer", WorkspaceID: "ws-authored"}
+		_, err := service.Catalog(t.Context(), info, compozyconfig.AgentDef{
+			Name: "reviewer", SourcePath: "/workspace/.compozy/agents/reviewer/AGENT.md",
+		})
+		if !errors.Is(err, skillspkg.ErrAgentLocalInvalid) {
+			t.Fatalf("Catalog() error = %v, want ErrAgentLocalInvalid", err)
+		}
+		if resolverCalled {
+			t.Fatal("Catalog() consulted the catalog after authored validation failed")
+		}
+	})
+
+	t.Run("Should surface catalog failures after an extension fallback", func(t *testing.T) {
+		t.Parallel()
+
+		registry := &stubSessionCommandSkills{nameErr: skillspkg.ErrAgentNotFound}
+		resolverErr := errors.New("catalog unavailable")
+		workspaceResolver := &stubPromptSkillsWorkspaceResolver{resolved: workspacepkg.ResolvedWorkspace{
+			ID: "ws-extension", RootDir: "/workspace",
+		}}
+		service := newSessionCommandService(
+			registry,
+			func() session.AgentResolver {
+				return stubSessionCommandAgentResolver(func(
+					string,
+					*workspacepkg.ResolvedWorkspace,
+				) (compozyconfig.AgentDef, error) {
+					return compozyconfig.AgentDef{}, resolverErr
+				})
+			},
+			func() promptSkillsWorkspaceResolver { return workspaceResolver },
+			nil,
+		)
+		info := &session.Info{ID: "sess-extension", AgentName: "reviewer", WorkspaceID: "ws-extension"}
+		_, err := service.Catalog(t.Context(), info, compozyconfig.AgentDef{})
+		if !errors.Is(err, resolverErr) {
+			t.Fatalf("Catalog() error = %v, want catalog resolver error", err)
+		}
+	})
+
+	t.Run("Should use the lazy catalog resolver once it becomes available", func(t *testing.T) {
+		t.Parallel()
+
+		reviewSkill := &skillspkg.Skill{Meta: skillspkg.SkillMeta{Name: "review"}}
+		registry := &stubSessionCommandSkills{
+			candidates: []skillspkg.CommandCandidate{{
+				Skill: reviewSkill, SourceKind: "extension", SourceID: "spec-cycle", Available: true,
+			}},
+			nameErr: skillspkg.ErrAgentNotFound,
+		}
+		workspaceResolver := &stubPromptSkillsWorkspaceResolver{resolved: workspacepkg.ResolvedWorkspace{
+			ID: "ws-extension", RootDir: "/workspace",
+		}}
+		var resolver session.AgentResolver
+		service := newSessionCommandService(
+			registry,
+			func() session.AgentResolver { return resolver },
+			func() promptSkillsWorkspaceResolver { return workspaceResolver },
+			nil,
+		)
+		info := &session.Info{ID: "sess-extension", AgentName: "reviewer", WorkspaceID: "ws-extension"}
+		if _, err := service.Catalog(t.Context(), info, compozyconfig.AgentDef{}); !errors.Is(
+			err,
+			skillspkg.ErrAgentNotFound,
+		) {
+			t.Fatalf("Catalog(before resolver) error = %v, want ErrAgentNotFound", err)
+		}
+		resolver = stubSessionCommandAgentResolver(func(
+			name string,
+			_ *workspacepkg.ResolvedWorkspace,
+		) (compozyconfig.AgentDef, error) {
+			return compozyconfig.AgentDef{Name: name}, nil
+		})
+		catalog, err := service.Catalog(t.Context(), info, compozyconfig.AgentDef{})
+		if err != nil {
+			t.Fatalf("Catalog(after resolver) error = %v", err)
+		}
+		foundExtensionSkill := false
+		for _, descriptor := range catalog.Commands {
+			if descriptor.Skill != nil && descriptor.Source.Kind == "extension" &&
+				descriptor.Source.ID == "spec-cycle" {
+				foundExtensionSkill = true
+				break
+			}
+		}
+		if !foundExtensionSkill {
+			t.Fatalf("Catalog(after resolver) commands = %+v, want extension spec-cycle skill", catalog.Commands)
+		}
+	})
+}
+
+type stubSessionCommandSkills struct {
+	candidates        []skillspkg.CommandCandidate
+	content           map[string]string
+	nameErr           error
+	resolvedProfileID string
+}
+
+func (s *stubSessionCommandSkills) CommandCandidatesForAgentSession(
+	_ context.Context,
+	resolved *workspacepkg.ResolvedWorkspace,
+	_ string,
+	_ string,
+) ([]skillspkg.CommandCandidate, error) {
+	if resolved != nil {
+		s.resolvedProfileID = resolved.ProfileID
+	}
+	if s.nameErr != nil {
+		return nil, s.nameErr
+	}
+	return append([]skillspkg.CommandCandidate(nil), s.candidates...), nil
+}
+
+func (s *stubSessionCommandSkills) CommandCandidatesForAgentDefSession(
+	_ context.Context,
+	resolved *workspacepkg.ResolvedWorkspace,
+	_ compozyconfig.AgentDef,
+	_ string,
+) ([]skillspkg.CommandCandidate, error) {
+	if resolved != nil {
+		s.resolvedProfileID = resolved.ProfileID
+	}
+	return append([]skillspkg.CommandCandidate(nil), s.candidates...), nil
+}
+
+func (s *stubSessionCommandSkills) LoadContent(_ context.Context, skill *skillspkg.Skill) (string, error) {
+	content, ok := s.content[skill.FilePath]
+	if !ok {
+		return "", fmt.Errorf("missing content for %s", skill.FilePath)
+	}
+	return content, nil
+}
+
+type stubSessionCommandAgentResolver func(
+	name string,
+	resolved *workspacepkg.ResolvedWorkspace,
+) (compozyconfig.AgentDef, error)
+
+func (f stubSessionCommandAgentResolver) ResolveAgent(
+	name string,
+	resolved *workspacepkg.ResolvedWorkspace,
+) (compozyconfig.AgentDef, error) {
+	return f(name, resolved)
+}
+
+func BenchmarkSkillsCatalogAugmenterCatalogReplayModes(b *testing.B) {
+	registry, augmenter := newPromptSkillsAugmenterForTest(b, []*skillspkg.Skill{
+		{
+			Meta: skillspkg.SkillMeta{
+				Name:        "qa-marker-skill",
+				Description: "Shows up while enabled.",
+			},
+			Enabled: true,
+		},
+	})
+	_ = registry
+	sess := newPromptSkillsSession("sess-bench")
+
+	full, err := augmenter(b.Context(), sess, "network note")
+	if err != nil {
+		b.Fatalf("augmenter(full) error = %v", err)
+	}
+	compact, err := augmenter(b.Context(), sess, "network note")
+	if err != nil {
+		b.Fatalf("augmenter(compact) error = %v", err)
+	}
+	fullBytes := len(full)
+	compactBytes := len(compact)
+	promptSuffixBytes := len("\n\nnetwork note")
+	b.ReportAllocs()
+	b.ResetTimer()
+	for b.Loop() {
+		if _, err := augmenter(b.Context(), sess, "network note"); err != nil {
+			b.Fatalf("augmenter(repeated) error = %v", err)
+		}
+	}
+	b.ReportMetric(float64(fullBytes-promptSuffixBytes), "full-catalog-bytes/op")
+	b.ReportMetric(float64(compactBytes-promptSuffixBytes), "compact-catalog-bytes/op")
+	b.ReportMetric(float64(fullBytes-compactBytes), "saved-catalog-bytes/op")
+	b.ReportMetric(float64(fullBytes), "full-bytes/op")
+	b.ReportMetric(float64(compactBytes), "compact-bytes/op")
+	b.ReportMetric(float64(fullBytes-compactBytes), "saved-prompt-bytes/op")
+}
+
+func newPromptSkillsAugmenterForTest(
+	t testing.TB,
+	skills []*skillspkg.Skill,
+) (*stubPromptSkillsRegistry, session.PromptInputAugmenter) {
+	t.Helper()
+
+	registry := &stubPromptSkillsRegistry{
+		skillsByAgent: map[string][]*skillspkg.Skill{
+			"general": skills,
+		},
+	}
+	resolver := &stubPromptSkillsWorkspaceResolver{
+		resolved: workspacepkg.ResolvedWorkspace{
+			ID:      "ws-1",
+			RootDir: "/tmp/ws-1",
+		},
+	}
+	augmenter := newSkillsCatalogAugmenter(registry, nil, func() promptSkillsWorkspaceResolver {
+		return resolver
+	}, nil)
+	if augmenter == nil {
+		t.Fatal("newSkillsCatalogAugmenter() = nil, want augmenter")
+	}
+	return registry, augmenter
+}
+
+func newPromptSkillsSession(sessionID string) *session.Session {
+	return &session.Session{
+		ID:          sessionID,
+		AgentName:   "general",
+		WorkspaceID: "ws-1",
+		Workspace:   "/tmp/ws-1",
+	}
+}
+
+type stubPromptSkillsRegistry struct {
+	skillsByAgent map[string][]*skillspkg.Skill
+	resolvedNames []string
+	concreteNames []string
+	nameErr       error
+}
+
+func (s *stubPromptSkillsRegistry) ForWorkspace(
+	_ context.Context,
+	_ *workspacepkg.ResolvedWorkspace,
+) ([]*skillspkg.Skill, error) {
+	return nil, nil
+}
+
+func (s *stubPromptSkillsRegistry) ForAgentDefSession(
+	_ context.Context,
+	_ *workspacepkg.ResolvedWorkspace,
+	agent compozyconfig.AgentDef,
+	_ string,
+) ([]*skillspkg.Skill, error) {
+	if s == nil {
+		return nil, nil
+	}
+	s.concreteNames = append(s.concreteNames, agent.Name)
+	return append([]*skillspkg.Skill(nil), s.skillsByAgent[agent.Name]...), nil
+}
+
+func (s *stubPromptSkillsRegistry) ForAgentSession(
+	_ context.Context,
+	_ *workspacepkg.ResolvedWorkspace,
+	agentName string,
+	_ string,
+) ([]*skillspkg.Skill, error) {
+	if s == nil {
+		return nil, nil
+	}
+	s.resolvedNames = append(s.resolvedNames, agentName)
+	if s.nameErr != nil {
+		return nil, s.nameErr
+	}
+	return append([]*skillspkg.Skill(nil), s.skillsByAgent[agentName]...), nil
+}
+
+type stubPromptSkillsWorkspaceResolver struct {
+	resolved         workspacepkg.ResolvedWorkspace
+	profiles         map[string]workspacepkg.ResolvedWorkspace
+	requestedProfile string
+}
+
+func (s *stubPromptSkillsWorkspaceResolver) ResolveForProfile(
+	_ context.Context,
+	_ string,
+	profileName string,
+) (workspacepkg.ResolvedWorkspace, error) {
+	if s == nil {
+		return workspacepkg.ResolvedWorkspace{}, nil
+	}
+	s.requestedProfile = profileName
+	resolved, ok := s.profiles[profileName]
+	if !ok {
+		return workspacepkg.ResolvedWorkspace{}, fmt.Errorf("unknown profile %q", profileName)
+	}
+	return resolved, nil
+}
+
+type promptSkillsProfileNameResolver map[string]string
+
+func (r promptSkillsProfileNameResolver) ProfileName(_ context.Context, profileID string) (string, error) {
+	name, ok := r[profileID]
+	if !ok {
+		return "", fmt.Errorf("unknown profile id %q", profileID)
+	}
+	return name, nil
+}
+
+func (s *stubPromptSkillsWorkspaceResolver) Resolve(
+	_ context.Context,
+	_ string,
+) (workspacepkg.ResolvedWorkspace, error) {
+	if s == nil {
+		return workspacepkg.ResolvedWorkspace{}, nil
+	}
+	return s.resolved, nil
+}

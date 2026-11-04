@@ -1,0 +1,166 @@
+package spec
+
+import (
+	"reflect"
+
+	"github.com/compozy/compozy/internal/api/contract"
+	compozyconfig "github.com/compozy/compozy/internal/config"
+	"github.com/compozy/compozy/internal/extensioninput"
+	"github.com/compozy/compozy/internal/loop/dsl"
+	terminalpkg "github.com/compozy/compozy/internal/terminal"
+	"github.com/compozy/compozy/internal/windowmanager"
+	"github.com/getkin/kin-openapi/openapi3"
+)
+
+const schemaStabilityExperimental = "experimental"
+
+var schemaCustomizers = map[reflect.Type]func(*openapi3.Schema){
+	reflect.TypeFor[contract.PromptStreamChunk](): func(schema *openapi3.Schema) { schema.WithAnyAdditionalProperties() },
+	reflect.TypeFor[contract.SessionCompactionContextAfterPayload](): func(schema *openapi3.Schema) {
+		schema.Extensions = map[string]any{"x-stability": schemaStabilityExperimental}
+		schema.Description = "Experimental: first occupancy observation after this compaction's first terminal snapshot " +
+			"and before the next compaction's first terminal boundary; " +
+			"counter-only events and later corrections do not change it. Omitted until observed."
+	},
+	reflect.TypeFor[contract.SessionContextClearedByPayload](): func(schema *openapi3.Schema) {
+		schema.Extensions = map[string]any{"x-stability": schemaStabilityExperimental}
+		schema.Description = "Experimental: compaction id and first terminal snapshot sequence that cleared occupancy. " +
+			"Present only while context is unknown awaiting a later occupancy observation."
+	},
+	reflect.TypeFor[contract.ResolveToolApprovalRequest](): func(schema *openapi3.Schema) {
+		customizeClosedObjectSchema(schema)
+		schema.Properties["decision"] = &openapi3.SchemaRef{
+			Value: openapi3.NewStringSchema().WithEnum("approved", "denied"),
+		}
+	},
+	reflect.TypeFor[extensioninput.Value]():             customizeExtensionInputValueSchema,
+	reflect.TypeFor[contract.InstallExtensionRequest](): customizeExtensionInstallRequestSchema,
+	reflect.TypeFor[contract.UpdateExtensionRequest]():  customizeExtensionUpdateRequestSchema,
+	reflect.TypeFor[contract.UpdateExtensionsRequest](): customizeExtensionUpdateRequestSchema,
+	reflect.TypeFor[binaryResponse](): func(schema *openapi3.Schema) {
+		*schema = *openapi3.NewStringSchema()
+		schema.Format = schemaFormatBinary
+	},
+	reflect.TypeFor[contract.TerminalSequence](): func(schema *openapi3.Schema) {
+		*schema = *openapi3.NewStringSchema()
+		schema.Pattern = terminalpkg.DecimalUint64Pattern
+		maxLength := terminalpkg.DecimalUint64MaxLength
+		schema.MaxLength = &maxLength
+	},
+	reflect.TypeFor[dsl.Graph]():        customizeLoopGraphSchema,
+	reflect.TypeFor[dsl.StopWhenSpec](): customizeStopWhenSpecSchema,
+	reflect.TypeFor[dsl.EffectSpec](): func(schema *openapi3.Schema) {
+		*schema = *loopEffectSchema()
+	},
+	reflect.TypeFor[dsl.EvalErrorPolicy](): func(schema *openapi3.Schema) {
+		*schema = *openapi3.NewStringSchema().WithEnum(
+			string(dsl.EvalErrorFail),
+			string(dsl.EvalErrorExit),
+		)
+	},
+	reflect.TypeFor[contract.LoopEffectSpec](): func(schema *openapi3.Schema) {
+		*schema = *loopEffectSchema()
+	},
+	reflect.TypeFor[contract.LoopRunEventPayload]():                  customizeLoopRunEventPayloadSchema,
+	reflect.TypeFor[contract.LoopGenerationStartedRunEventPayload](): customizeLoopGenerationStartedRunEventPayloadSchema,
+	reflect.TypeFor[contract.LoopGateVerdictRunEventPayload]():       customizeLoopGateVerdictRunEventPayloadSchema,
+	reflect.TypeFor[contract.WindowManagerRevision](): func(schema *openapi3.Schema) {
+		*schema = *openapi3.NewIntegerSchema().
+			WithMin(0).
+			WithMax(float64(contract.WindowManagerMaxSafeRevision))
+	},
+	reflect.TypeFor[contract.WindowManagerSnapshotFrame](): func(schema *openapi3.Schema) {
+		customizeWindowManagerFrameSchema(schema, contract.WindowManagerFrameSnapshot)
+	},
+	reflect.TypeFor[contract.WindowManagerEventFrame](): func(schema *openapi3.Schema) {
+		customizeWindowManagerFrameSchema(schema, contract.WindowManagerFrameEvent)
+	},
+	reflect.TypeFor[contract.WindowManagerClientFrame](): func(schema *openapi3.Schema) {
+		customizeWindowManagerFrameSchema(schema, contract.WindowManagerFrameClient)
+	},
+	reflect.TypeFor[contract.WindowManagerErrorFrame](): func(schema *openapi3.Schema) {
+		customizeWindowManagerFrameSchema(schema, contract.WindowManagerFrameError)
+	},
+	reflect.TypeFor[contract.WindowManagerHeartbeatFrame](): func(schema *openapi3.Schema) {
+		customizeWindowManagerFrameSchema(schema, contract.WindowManagerFrameHeartbeat)
+	},
+	reflect.TypeFor[contract.WindowManagerLayoutNode]():                customizeClosedObjectSchema,
+	reflect.TypeFor[contract.UpdateSettingsWindowManagerRequest]():     customizeClosedObjectSchema,
+	reflect.TypeFor[contract.SettingsWindowManagerResponse]():          customizeClosedObjectSchema,
+	reflect.TypeFor[contract.SettingsWindowManagerConfigPayload]():     customizeClosedObjectSchema,
+	reflect.TypeFor[contract.SettingsWindowManagerGapsPayload]():       customizeClosedObjectSchema,
+	reflect.TypeFor[contract.SettingsWindowManagerSnapPayload]():       customizeClosedObjectSchema,
+	reflect.TypeFor[contract.SettingsWindowManagerBindingPayload]():    customizeClosedObjectSchema,
+	reflect.TypeFor[contract.SettingsWindowManagerCommandPayload]():    customizeClosedObjectSchema,
+	reflect.TypeFor[contract.SettingsWindowManagerDefaultPayload]():    customizeClosedObjectSchema,
+	reflect.TypeFor[contract.SettingsWindowManagerDiagnosticPayload](): customizeClosedObjectSchema,
+	reflect.TypeFor[contract.SettingsWindowManagerMutationError]():     customizeClosedObjectSchema,
+	reflect.TypeFor[contract.UpdateSettingsCmdPaletteRequest]():        customizeClosedObjectSchema,
+	reflect.TypeFor[contract.SettingsCmdPaletteResponse]():             customizeClosedObjectSchema,
+	reflect.TypeFor[windowmanager.ShortcutBinding](): func(schema *openapi3.Schema) {
+		*schema = openapi3.Schema{Nullable: schema.Nullable, OneOf: openapi3.SchemaRefs{
+			{Value: openapi3.NewStringSchema()},
+			{Value: openapi3.NewArraySchema().WithItems(openapi3.NewStringSchema())},
+		}}
+	},
+	reflect.TypeFor[contract.UpdateSettingsAttentionRequest](): customizeClosedObjectSchema,
+	reflect.TypeFor[contract.SettingsAttentionResponse]():      customizeClosedObjectSchema,
+	reflect.TypeFor[contract.SettingsAttentionPayload]():       customizeClosedObjectSchema,
+	reflect.TypeFor[contract.UpdateSettingsShellRequest]():     customizeClosedObjectSchema,
+	reflect.TypeFor[contract.SettingsShellResponse]():          customizeClosedObjectSchema,
+	reflect.TypeFor[contract.SettingsShellPayload]():           customizeClosedObjectSchema,
+	reflect.TypeFor[contract.OptionalStringList](): func(schema *openapi3.Schema) {
+		*schema = *openapi3.NewArraySchema().WithItems(openapi3.NewStringSchema())
+		schema.Nullable = true
+	},
+	reflect.TypeFor[contract.UpdateSettingsSkillsRequest]():    customizeClosedObjectSchema,
+	reflect.TypeFor[contract.SettingsSkillsOverridePayload]():  customizeClosedObjectSchema,
+	reflect.TypeFor[contract.SettingsShellSessionsPayload]():   customizeClosedObjectSchema,
+	reflect.TypeFor[contract.SettingsShellAppearancePayload](): customizeSettingsShellAppearanceSchema,
+	reflect.TypeFor[contract.SettingsUpdateApplyRequest]():     customizeSettingsUpdateApplyRequestSchema,
+	reflect.TypeFor[contract.SettingsUpdateApplyResponse]():    customizeSettingsUpdateApplyResponseSchema,
+	reflect.TypeFor[contract.SettingsMCPAuthExchangeRequest](): customizeSettingsMCPAuthExchangeRequestSchema,
+	reflect.TypeFor[contract.AttachSessionRequest]():           customizeAttachSessionRequestSchema,
+	reflect.TypeFor[contract.CreateAgentPayload]():             customizeCreateAgentPayloadSchema,
+	reflect.TypeFor[contract.DuplicateAgentRequest]():          customizeDuplicateAgentRequestSchema,
+	reflect.TypeFor[contract.DuplicateAgentOverrides]():        customizeDuplicateAgentOverridesSchema,
+	reflect.TypeFor[contract.AgentSpawnRequest]():              customizeAgentSpawnRequestSchema,
+	reflect.TypeFor[contract.AgentNotifyRequest]():             customizeAgentNotifyRequestSchema,
+	reflect.TypeFor[contract.CreateSessionRequest]():           customizeCreateSessionRequestSchema,
+	reflect.TypeFor[contract.CreateWorkspaceRequest]():         customizeWorkspaceAgentNameSchema,
+	reflect.TypeFor[contract.UpdateWorkspaceRequest]():         customizeWorkspaceAgentNameSchema,
+	reflect.TypeFor[contract.CreateTaskRequest]():              customizeUserScopeInputSchema,
+	reflect.TypeFor[contract.CreateTaskChildRequest]():         customizeUserScopeInputSchema,
+	reflect.TypeFor[contract.CreateJobRequest]():               customizeJobAgentNameSchema,
+	reflect.TypeFor[contract.CreateTriggerRequest]():           customizeTriggerAgentNameSchema,
+	reflect.TypeFor[contract.SettingsDefaultsPayload]():        customizeSettingsDefaultsSchema,
+	reflect.TypeFor[contract.SettingsRoleConfigPayload]():      customizeSettingsRoleSchema,
+	reflect.TypeFor[contract.SettingsGeneralConfigPayload]():   customizeSettingsGeneralConfigSchema,
+	reflect.TypeFor[contract.ForkSessionWorktreeRequest]():     customizeClosedObjectSchema,
+	reflect.TypeFor[contract.NewSessionWorktreeRequest]():      customizeClosedObjectSchema,
+	reflect.TypeFor[contract.SchedulerDrainRequest]():          customizeSchedulerDrainRequestSchema,
+	rawMessageType: func(schema *openapi3.Schema) {
+		*schema = *openapi3.NewSchema()
+	},
+	reflect.TypeFor[contract.TaskPayload]():        describeTaskBlockedReasonsProperty,
+	reflect.TypeFor[contract.TaskSummaryPayload](): describeTaskBlockedReasonsProperty,
+}
+
+func customizeClosedObjectSchema(schema *openapi3.Schema) {
+	if schema != nil {
+		schema.WithoutAdditionalProperties()
+	}
+}
+
+func customizeSettingsShellAppearanceSchema(schema *openapi3.Schema) {
+	customizeClosedObjectSchema(schema)
+	if schema == nil {
+		return
+	}
+	maxLength := uint64(compozyconfig.ShellFontFamilyMaxLen)
+	for _, property := range []string{"ui_font", "mono_font"} {
+		if ref := schema.Properties[property]; ref != nil && ref.Value != nil {
+			ref.Value.MaxLength = &maxLength
+		}
+	}
+}

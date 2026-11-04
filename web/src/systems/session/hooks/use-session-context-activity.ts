@@ -1,0 +1,86 @@
+import { useSecondClock } from "@/hooks/use-second-clock";
+import { lastSettledTurn } from "@/systems/session/lib/session-thread-status";
+import { toTimelineParts } from "@/systems/session/lib/timeline-message-parts";
+import { useSessionTranscriptThreadMessages } from "./use-session-transcript-thread-messages";
+import { useSubagentRoster } from "./use-subagent-roster";
+import { deriveWorkingStatus } from "../lib/session-working-status";
+import {
+  deriveSessionActivityView,
+  describeTotalWork,
+  type SessionActivityView,
+} from "../lib/session-activity-view";
+import { isAgentEventPayload } from "../lib/message-parts";
+import { isRuntimeActivityEvent } from "@/systems/session/lib/runtime-activity-notice";
+import type { SessionGoalSnapshot, SessionPayload, SessionUsagePayload } from "../types";
+
+export interface SessionContextActivitySource {
+  session: SessionPayload;
+  running: boolean;
+  live: boolean;
+  queued: number | undefined;
+  goal: SessionGoalSnapshot | null;
+}
+
+export function useSessionContextActivity(
+  session: SessionPayload,
+  running: boolean,
+  live: boolean,
+  queued: number | undefined,
+  goal: SessionGoalSnapshot | null,
+  workTime?: SessionUsagePayload["work_time"]
+): SessionActivityView {
+  const messages = useSessionTranscriptThreadMessages();
+  const nowMs = useSecondClock(running && live);
+  const lastTurn = running ? null : lastSettledTurn(messages, session);
+  // The same roster the status line counts from, so both read one agents-running number.
+  const roster = useSubagentRoster(session.workspace_id ?? "", session.id);
+  const status = deriveWorkingStatus({
+    session,
+    running,
+    thinking: false,
+    lastTurn,
+    nowMs,
+    subagents: roster.rows,
+  });
+  // The compiler caches this pure calculation by message identity, outside the leaf clock.
+  const summary = activityTranscriptSummary(messages);
+  return {
+    ...deriveSessionActivityView({
+      status,
+      lastTurn,
+      ...summary,
+      queued,
+      goal,
+      stopped: session.state === "stopped",
+    }),
+    totalWork: describeTotalWork(
+      workTime,
+      session.activity?.turn_id,
+      status.kind === "working" ? status.startedAtMs : null,
+      nowMs
+    ),
+  };
+}
+
+function activityTranscriptSummary(
+  messages: ReturnType<typeof useSessionTranscriptThreadMessages>
+) {
+  const parts = messages.flatMap(message => toTimelineParts(message));
+  const latestWarning = [...parts]
+    .reverse()
+    .find(
+      part =>
+        part.kind === "data" &&
+        isAgentEventPayload(part.data) &&
+        part.data.type === "runtime_warning" &&
+        isRuntimeActivityEvent(part.data)
+    );
+  return {
+    toolCount: parts.filter(part => part.kind === "tool").length,
+    thoughts: parts.filter(part => part.kind === "reasoning").length,
+    warning:
+      latestWarning?.kind === "data" && isAgentEventPayload(latestWarning.data)
+        ? latestWarning.data.text || latestWarning.data.runtime?.last_activity_detail
+        : undefined,
+  };
+}

@@ -1,0 +1,153 @@
+package cli
+
+import (
+	"strconv"
+	"time"
+)
+
+func automationTriggerBundle(item TriggerRecord) outputBundle {
+	return outputBundle{
+		jsonValue: item,
+		human: func() (string, error) {
+			return renderHumanBlocks(
+				renderHumanSection("Automation Trigger", automationTriggerHumanValues(item)),
+				renderHumanSection(
+					"Prompt",
+					[]keyValue{{Label: automationBodyValue, Value: stringOrDash(item.Prompt)}},
+				),
+				renderHumanTable(
+					"Filters",
+					[]string{automationPathValue, "Value"},
+					automationFilterRows(item.Filter),
+				),
+			), nil
+		},
+		toon: func() (string, error) {
+			return renderHumanBlocks(
+				renderToonObject(
+					"automation_trigger", automationTriggerToonFields(), automationTriggerToonValues(item),
+				),
+				renderToonArray(
+					"filters",
+					[]string{automationPathKey, hooksValueKey},
+					automationFilterRows(item.Filter),
+				),
+			), nil
+		},
+	}
+}
+
+func automationTriggerHumanValues(item TriggerRecord) []keyValue {
+	return []keyValue{
+		{Label: "ID", Value: stringOrDash(item.ID)},
+		{Label: sessionProfileValue, Value: stringOrDash(item.ProfileName)},
+		{Label: automationNameValue, Value: stringOrDash(item.Name)},
+		{Label: automationScopeValue, Value: stringOrDash(string(item.Scope))},
+		{Label: automationWorkspaceValue, Value: stringOrDash(item.WorkspaceID)},
+		{Label: automationAgentValue, Value: stringOrDash(item.AgentName)},
+		{Label: automationEventValue, Value: stringOrDash(item.Event)},
+		{Label: automationEnabledValue, Value: strconv.FormatBool(item.Enabled)},
+		{Label: automationSourceValue, Value: stringOrDash(string(item.Source))},
+		{Label: "Retry", Value: stringOrDash(formatAutomationRetry(item.Retry))},
+		{Label: "Fire Limit", Value: stringOrDash(formatAutomationFireLimit(item.FireLimit))},
+		{Label: "Webhook ID", Value: stringOrDash(item.WebhookID)},
+		{Label: "Endpoint Slug", Value: stringOrDash(item.EndpointSlug)},
+		{Label: "Webhook Path", Value: stringOrDash(displayTriggerEndpoint(item))},
+		{Label: automationCreatedValue, Value: stringOrDash(formatTime(item.CreatedAt))},
+		{Label: automationUpdatedValue, Value: stringOrDash(formatTime(item.UpdatedAt))},
+	}
+}
+
+func automationTriggerToonFields() []string {
+	return []string{
+		"id", profileNameOutputKey, automationNameKey, automationScopeKey, automationWorkspaceIDKey,
+		automationAgentNameKey, automationEventKey, automationEnabledKey, automationSourceKey, automationRetryKey,
+		"fire_limit", "webhook_id", "endpoint_slug", cliOutputSetupWebhookPathKey, automationCreatedAtKey,
+		automationUpdatedAtKey, automationPromptKey,
+		lastRunStatusKey, lastRunStartedAtKey,
+	}
+}
+
+func automationTriggerToonValues(item TriggerRecord) []string {
+	return []string{
+		item.ID, item.ProfileName, item.Name, string(item.Scope), item.WorkspaceID, item.AgentName, item.Event,
+		strconv.FormatBool(item.Enabled), string(item.Source), formatAutomationRetry(item.Retry),
+		formatAutomationFireLimit(item.FireLimit), item.WebhookID, item.EndpointSlug, displayTriggerEndpoint(item),
+		formatTime(item.CreatedAt), formatTime(item.UpdatedAt), item.Prompt,
+		automationLastRunStatus(item.LastRun), automationLastRunStartedAt(item.LastRun),
+	}
+}
+
+func automationTriggerListBundle(
+	page AutomationTriggerListRecord,
+	now func() time.Time,
+	projectLabels ...map[string]string,
+) outputBundle {
+	projectHeader := automationWorkspaceValue
+	projectName := stringOrDash
+	if len(projectLabels) > 0 {
+		projectHeader = cliProjectHeader
+		projectName = func(id string) string { return aggregateProjectName(projectLabels[0], id) }
+	}
+	items := page.Triggers
+	return listBundle(
+		page,
+		items,
+		"Automation Triggers",
+		[]string{
+			"ID",
+			sessionProfileValue,
+			automationNameValue,
+			automationEventValue,
+			automationScopeValue,
+			projectHeader,
+			automationAgentValue,
+			automationEnabledValue,
+			automationSourceValue,
+			lastRunLabel,
+		},
+		"automation_triggers",
+		[]string{
+			"id",
+			profileNameOutputKey,
+			automationNameKey,
+			automationEventKey,
+			automationScopeKey,
+			automationWorkspaceIDKey,
+			automationAgentNameKey,
+			automationEnabledKey,
+			automationSourceKey,
+			lastRunStatusKey,
+			lastRunStartedAtKey,
+		},
+		func(item TriggerRecord) []string {
+			return []string{
+				stringOrDash(item.ID),
+				stringOrDash(item.ProfileName),
+				stringOrDash(item.Name),
+				stringOrDash(item.Event),
+				stringOrDash(string(item.Scope)),
+				projectName(item.WorkspaceID),
+				stringOrDash(item.AgentName),
+				strconv.FormatBool(item.Enabled),
+				stringOrDash(string(item.Source)),
+				formatAutomationLastRun(item.LastRun, now),
+			}
+		},
+		func(item TriggerRecord) []string {
+			return []string{
+				item.ID,
+				item.ProfileName,
+				item.Name,
+				item.Event,
+				string(item.Scope),
+				item.WorkspaceID,
+				item.AgentName,
+				strconv.FormatBool(item.Enabled),
+				string(item.Source),
+				automationLastRunStatus(item.LastRun),
+				automationLastRunStartedAt(item.LastRun),
+			}
+		},
+	)
+}

@@ -1,0 +1,279 @@
+import { useState } from "react";
+import type { Meta, StoryObj } from "@storybook/react-vite";
+import { expect, fn, userEvent, waitFor, within } from "storybook/test";
+
+import { Command, CommandInput } from "@compozy/ui";
+import { CenteredSurface } from "@/storybook/story-layout";
+import { storyAgentNames } from "@/storybook/fintech-scenario";
+import { agentFixtures } from "@/systems/agent/mocks";
+import type { AgentPayload } from "@/systems/agent/types";
+
+import { AgentCommandSelect } from "../agent-command-select";
+import { AgentCommandMultiSelect } from "../agent-command-multi-select";
+import { AgentCommandList } from "../agent-command-list";
+
+const categoryByName: Record<string, string[]> = {
+  [storyAgentNames.cto]: ["Engineering", "Leadership"],
+  [storyAgentNames.platform]: ["Engineering", "Platform"],
+  [storyAgentNames.frontend]: ["Engineering", "Platform"],
+  [storyAgentNames.release]: ["Engineering", "Platform"],
+  [storyAgentNames.cfo]: ["Finance"],
+  [storyAgentNames.marketing]: ["Marketing", "Campaigns"],
+  [storyAgentNames.copywriter]: ["Marketing", "Campaigns"],
+  [storyAgentNames.product]: ["Product"],
+  [storyAgentNames.support]: ["Support"],
+  [storyAgentNames.fraud]: ["Risk", "Fraud"],
+  [storyAgentNames.compliance]: ["Risk", "Compliance"],
+};
+
+export function withStoryAgentCategories(agents: AgentPayload[]): AgentPayload[] {
+  return agents.map(agent => {
+    const categoryPath = categoryByName[agent.name];
+    return categoryPath ? { ...agent, category_path: categoryPath } : agent;
+  });
+}
+
+export const categorizedAgents: AgentPayload[] = withStoryAgentCategories(agentFixtures);
+
+const flatAgents: AgentPayload[] = agentFixtures.slice(0, 4);
+const groupedAgents: AgentPayload[] = [
+  {
+    ...agentFixtures[0],
+    name: "launch-ops",
+    prompt: "Coordinate uncategorized launch escalations and operator follow-up.",
+  },
+  ...categorizedAgents,
+];
+
+/** The trigger lives in the canvas; the popover content is portaled to the document body. */
+function storyScopes(canvasElement: HTMLElement) {
+  return { canvas: within(canvasElement), popover: within(canvasElement.ownerDocument.body) };
+}
+
+interface FrameProps {
+  children: React.ReactNode;
+}
+
+function Frame({ children }: FrameProps) {
+  return (
+    <CenteredSurface>
+      <div className="w-full max-w-md">{children}</div>
+    </CenteredSurface>
+  );
+}
+
+const meta: Meta<typeof AgentCommandSelect> = {
+  title: "systems/agent/components/AgentCommandSelect",
+  component: AgentCommandSelect,
+  parameters: {
+    layout: "fullscreen",
+  },
+};
+
+export default meta;
+type Story = StoryObj<typeof meta>;
+
+/**
+ * Trigger displays the selected agent's name + provider + formatted category label.
+ */
+export const Selected: Story = {
+  args: {
+    agents: categorizedAgents,
+    value: storyAgentNames.cto,
+    onChange: fn(),
+    triggerTestId: "agent-command-select-trigger",
+  },
+  render: args => (
+    <Frame>
+      <AgentCommandSelect {...args} />
+    </Frame>
+  ),
+};
+
+/**
+ * Empty value: the trigger shows the placeholder.
+ */
+export const Empty: Story = {
+  args: {
+    agents: flatAgents,
+    value: null,
+    onChange: fn(),
+    triggerTestId: "agent-command-select-trigger",
+    placeholder: "Select an agent",
+  },
+  render: args => (
+    <Frame>
+      <AgentCommandSelect {...args} />
+    </Frame>
+  ),
+};
+
+/**
+ * The catalog has not answered: the trigger holds a text bar (still named "Loading agents") and
+ * stays disabled until the first page lands.
+ */
+export const Loading: Story = {
+  args: {
+    agents: [],
+    value: null,
+    loading: true,
+    onChange: fn(),
+    triggerTestId: "agent-command-select-trigger",
+  },
+  render: args => (
+    <Frame>
+      <AgentCommandSelect {...args} />
+    </Frame>
+  ),
+};
+
+/**
+ * A configured name is known before its agent is: the trigger shows the name with only the
+ * provider as a placeholder, never "Not available" while the catalog is still being read.
+ */
+export const LoadingConfiguredName: Story = {
+  args: { ...Loading.args, value: storyAgentNames.cto },
+  render: args => (
+    <Frame>
+      <AgentCommandSelect {...args} />
+    </Frame>
+  ),
+};
+
+/** The composer's chromeless pill while its catalog loads, with and without a default agent. */
+export const LoadingComposer: Story = {
+  args: { ...Loading.args, variant: "composer", placeholder: "Choose an agent" },
+  render: args => (
+    <Frame>
+      <div className="flex flex-col items-start gap-3">
+        <AgentCommandSelect {...args} />
+        <AgentCommandSelect {...args} value={storyAgentNames.cto} />
+      </div>
+    </Frame>
+  ),
+};
+
+/**
+ * Grouped: opening the popover reveals one CommandGroup per category and a
+ * root-level "Agents" group for uncategorized entries.
+ */
+export const Grouped: Story = {
+  args: {
+    agents: groupedAgents,
+    value: null,
+    onChange: fn(),
+    triggerTestId: "agent-command-select-trigger",
+  },
+  render: args => (
+    <Frame>
+      <AgentCommandSelect {...args} />
+    </Frame>
+  ),
+  play: async ({ canvasElement }) => {
+    const { canvas, popover } = storyScopes(canvasElement);
+    await userEvent.click(await canvas.findByTestId("agent-command-select-trigger"));
+    await waitFor(() => {
+      expect(popover.getByTestId("agent-command-group-agents:root")).toHaveTextContent("Agents");
+      expect(
+        popover.getByTestId("agent-command-group-category:Engineering/Platform")
+      ).toBeInTheDocument();
+      expect(
+        popover.getByTestId("agent-command-group-category:Marketing/Campaigns")
+      ).toBeInTheDocument();
+    });
+  },
+};
+
+/**
+ * No-match: typing a query that matches no agent renders the empty state.
+ */
+export const NoMatch: Story = {
+  args: {
+    agents: flatAgents,
+    value: null,
+    onChange: fn(),
+    triggerTestId: "agent-command-select-trigger",
+  },
+  render: args => (
+    <Frame>
+      <AgentCommandSelect {...args} />
+    </Frame>
+  ),
+  play: async ({ canvasElement }) => {
+    const { canvas, popover } = storyScopes(canvasElement);
+    await userEvent.click(await canvas.findByTestId("agent-command-select-trigger"));
+    await userEvent.type(await popover.findByTestId("agent-command-input"), "nonexistent-agent");
+    await waitFor(() => expect(popover.getByTestId("agent-command-empty")).toBeInTheDocument());
+  },
+};
+
+/**
+ * Base command list renders grouped agents without the popover wrapper used by
+ * the single and multi-select controls.
+ */
+export const CommandList: StoryObj<typeof AgentCommandList> = {
+  args: {},
+  render: () => (
+    <Frame>
+      <Command>
+        <CommandInput placeholder="Search agents..." data-testid="agent-command-input" />
+        <AgentCommandList agents={groupedAgents} isSelected={() => false} onSelect={fn()} />
+      </Command>
+    </Frame>
+  ),
+};
+
+/** The list on its own while the catalog loads: group and row placeholders, no empty claim. */
+export const LoadingList: StoryObj<typeof AgentCommandList> = {
+  args: {},
+  render: () => (
+    <Frame>
+      <Command>
+        <CommandInput placeholder="Search agents..." data-testid="agent-command-input" />
+        <AgentCommandList agents={[]} isSelected={() => false} loading onSelect={fn()} />
+      </Command>
+    </Frame>
+  ),
+};
+
+/**
+ * Multi-select harness: keeps the popover open across selections, marks each
+ * picked item with `data-checked=true`, and surfaces a selected count.
+ */
+export const MultiSelect: StoryObj<typeof AgentCommandMultiSelect> = {
+  args: {},
+  render: () => {
+    function Harness() {
+      const [value, setValue] = useState<string[]>([storyAgentNames.cto]);
+      return (
+        <Frame>
+          <AgentCommandMultiSelect
+            agents={categorizedAgents}
+            value={value}
+            onToggle={setValue}
+            triggerTestId="agent-command-multi-trigger"
+          />
+        </Frame>
+      );
+    }
+    return <Harness />;
+  },
+  play: async ({ canvasElement }) => {
+    const { canvas, popover } = storyScopes(canvasElement);
+    await userEvent.click(await canvas.findByTestId("agent-command-multi-trigger"));
+    await waitFor(() =>
+      expect(popover.getByTestId(`agent-command-item-${storyAgentNames.cto}`)).toHaveAttribute(
+        "data-checked",
+        "true"
+      )
+    );
+    await userEvent.click(popover.getByTestId(`agent-command-item-${storyAgentNames.cfo}`));
+    await waitFor(() =>
+      expect(popover.getByTestId(`agent-command-item-${storyAgentNames.cfo}`)).toHaveAttribute(
+        "data-checked",
+        "true"
+      )
+    );
+    await expect(popover.getByTestId("agent-command-input")).toBeInTheDocument();
+  },
+};

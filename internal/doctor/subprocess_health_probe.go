@@ -1,0 +1,115 @@
+package doctor
+
+import (
+	"cmp"
+	"context"
+	"slices"
+	"strings"
+	"time"
+
+	"github.com/compozy/compozy/internal/api/contract"
+	"github.com/compozy/compozy/internal/diagnostics"
+	"github.com/compozy/compozy/internal/session"
+	"github.com/compozy/compozy/internal/subprocess"
+)
+
+const (
+	SubprocessHealthProbeID      = "runtime.subprocess_health"
+	maxSubprocessHealthReasonLen = 1024
+)
+
+// SubprocessHealthSnapshotSource returns immutable active-process health observations.
+type SubprocessHealthSnapshotSource interface {
+	SubprocessHealthSnapshots() []session.SubprocessHealthSnapshot
+}
+
+// SubprocessHealthProbe projects failed active-process health verdicts into doctor diagnostics.
+type SubprocessHealthProbe struct {
+	Source SubprocessHealthSnapshotSource
+}
+
+var _ Probe = (*SubprocessHealthProbe)(nil)
+
+func (*SubprocessHealthProbe) ID() string { return SubprocessHealthProbeID }
+
+func (*SubprocessHealthProbe) Category() string { return contract.CategoryDaemon }
+
+func (p *SubprocessHealthProbe) Run(
+	_ context.Context,
+	_ *ProbeEnv,
+) ([]contract.DiagnosticItem, error) {
+	if p == nil || p.Source == nil {
+		return []contract.DiagnosticItem{subprocessHealthUnavailableItem()}, nil
+	}
+
+	snapshots := p.Source.SubprocessHealthSnapshots()
+	slices.SortFunc(snapshots, func(left, right session.SubprocessHealthSnapshot) int {
+		return cmp.Compare(left.SessionID, right.SessionID)
+	})
+	failed := make([]session.SubprocessHealthSnapshot, 0, len(snapshots))
+	for _, snapshot := range snapshots {
+		if subprocess.HealthFailureDetected(snapshot.Health) {
+			failed = append(failed, snapshot)
+		}
+	}
+	if len(failed) == 0 {
+		return []contract.DiagnosticItem{diagnostics.NewItem(diagnostics.ItemSpec{
+			ID:            SubprocessHealthProbeID,
+			Code:          contract.CodeDaemonStatusOK,
+			Category:      contract.CategoryDaemon,
+			Title:         "Subprocess health is OK",
+			Message:       "No active subprocess reports a failed health verdict.",
+			Severity:      contract.SeverityOK,
+			DataFreshness: contract.FreshnessLive,
+		},
+			diagnostics.WithEvidence(map[string]any{"monitored_count": len(snapshots)}),
+		)}, nil
+	}
+
+	first := failed[0]
+	reason := diagnostics.RedactAndBound(
+		subprocess.HealthFailureReason(first.Health),
+		maxSubprocessHealthReasonLen,
+	)
+	if strings.TrimSpace(reason) == "" {
+		reason = "the subprocess reported an unhealthy verdict"
+	}
+	return []contract.DiagnosticItem{diagnostics.NewItem(diagnostics.ItemSpec{
+		ID:            SubprocessHealthProbeID,
+		Code:          contract.CodeDaemonHealthUnavailable,
+		Category:      contract.CategoryDaemon,
+		Title:         "Subprocess health is degraded",
+		Message:       reason,
+		Severity:      contract.SeverityWarn,
+		DataFreshness: contract.FreshnessLive,
+	},
+		diagnostics.WithEvidence(map[string]any{
+			"session_id":           strings.TrimSpace(first.SessionID),
+			"workspace_id":         strings.TrimSpace(first.WorkspaceID),
+			"agent_name":           strings.TrimSpace(first.AgentName),
+			"last_checked_at":      subprocessHealthTimestamp(first.Health.LastCheckedAt),
+			"consecutive_failures": first.Health.ConsecutiveFailures,
+			"monitored_count":      len(snapshots),
+			"unhealthy_count":      len(failed),
+		}),
+	)}, nil
+}
+
+func subprocessHealthUnavailableItem() contract.DiagnosticItem {
+	return diagnostics.NewItem(diagnostics.ItemSpec{
+		ID:            SubprocessHealthProbeID,
+		Code:          contract.CodeDaemonHealthUnavailable,
+		Category:      contract.CategoryDaemon,
+		Title:         "Subprocess health is unavailable",
+		Message:       "The session runtime does not expose subprocess health snapshots.",
+		Severity:      contract.SeverityWarn,
+		DataFreshness: contract.FreshnessLive,
+	})
+}
+
+func subprocessHealthTimestamp(value time.Time) string {
+	if value.IsZero() {
+		return ""
+	}
+	return value.UTC().Format(time.RFC3339Nano)
+}

@@ -1,0 +1,145 @@
+import type { FetchSessionEventsParams, SessionListFilters } from "../types";
+import { normalizeSessionListFilters } from "./session-list-query";
+
+function normalizedEventParams(params: FetchSessionEventsParams = {}): FetchSessionEventsParams {
+  const normalized: FetchSessionEventsParams = {};
+  const since = params.since?.trim();
+  const type = params.type?.trim();
+  const agentName = params.agent_name?.trim();
+  const turnID = params.turn_id?.trim();
+  if (since) normalized.since = since;
+  if (params.limit !== undefined) normalized.limit = params.limit;
+  if (params.after_sequence !== undefined) normalized.after_sequence = params.after_sequence;
+  if (type) normalized.type = type;
+  if (agentName) normalized.agent_name = agentName;
+  if (turnID) normalized.turn_id = turnID;
+  return normalized;
+}
+
+export const sessionKeys = {
+  all: ["sessions"] as const,
+  deletions: () => [...sessionKeys.all, "delete"] as const,
+  commandsRoot: ["session-commands"] as const,
+  workspaceCommands: (workspace: string) =>
+    [...sessionKeys.commandsRoot, workspace.trim()] as const,
+  commands: (workspace: string, id: string) =>
+    [...sessionKeys.workspaceCommands(workspace), id.trim()] as const,
+  lists: () => [...sessionKeys.all, "list"] as const,
+  /** Exact cross-workspace attention counts — operator scope, no workspace segment. */
+  attentionSummary: () => [...sessionKeys.all, "attention-summary"] as const,
+  /**
+   * The catalog stream's connection status for one stream scope, written by the stream
+   * and read by the polls it covers. The stream URL carries the profile scope.
+   */
+  catalogStreamStatus: (streamUrl: string) =>
+    [...sessionKeys.all, "catalog-stream-status", streamUrl] as const,
+  /** Processes left running by stopped, archived, or unknown sessions — operator scope. */
+  processesLeftRunning: () => [...sessionKeys.all, "processes-left-running"] as const,
+  workspaceLists: (workspace: string) => [...sessionKeys.lists(), workspace.trim()] as const,
+  /** One profile's session folders in a workspace; under the list family so catalog wakes reread it. */
+  folders: (workspace: string, profile: string) =>
+    [...sessionKeys.workspaceLists(workspace), "folders", profile.trim()] as const,
+  /** Every profile's project folders (issue #1044); a layout change rereads them all. */
+  workspaceLayouts: () => [...sessionKeys.all, "workspace-layout"] as const,
+  /** One profile's project folders and project order in All projects. */
+  workspaceLayout: (profile: string) =>
+    [...sessionKeys.workspaceLayouts(), profile.trim()] as const,
+  workspaceActivity: (workspace: string) =>
+    [...sessionKeys.workspaceLists(workspace), "activity"] as const,
+  list: (filters: SessionListFilters = {}) => {
+    const normalized = normalizeSessionListFilters(filters);
+    return [...sessionKeys.workspaceLists(normalized.workspace_id ?? ""), normalized] as const;
+  },
+  workspace: (workspace: string) => [...sessionKeys.all, "workspace", workspace] as const,
+  /**
+   * By-id reads use the same explicit profile lens as the catalog list family.
+   *
+   * The id comes before the lens so `byIdRoot` prefix-invalidates every lens for
+   * one session — a mutation knows the session it changed, not which lens some
+   * other surface is looking through. It sits outside the workspace tree because
+   * it answers "may I see this at all", which no workspace-scoped invalidation
+   * should disturb.
+   */
+  byIdAll: () => [...sessionKeys.all, "by-id"] as const,
+  byIdRoot: (id: string) => [...sessionKeys.byIdAll(), id.trim()] as const,
+  byId: (id: string, profileKey: string) =>
+    [...sessionKeys.byIdRoot(id), profileKey.trim()] as const,
+  descendants: (id: string, profile: string) =>
+    [...sessionKeys.byIdRoot(id), "descendants", profile.trim()] as const,
+  detail: (workspace: string, id: string) =>
+    [...sessionKeys.workspace(workspace), "detail", id] as const,
+  events: (workspace: string, id: string) =>
+    [...sessionKeys.detail(workspace, id), "events"] as const,
+  eventsList: (workspace: string, id: string, params: FetchSessionEventsParams = {}) =>
+    [...sessionKeys.events(workspace, id), normalizedEventParams(params)] as const,
+  history: (workspace: string, id: string) =>
+    [...sessionKeys.detail(workspace, id), "history"] as const,
+  clearConversation: (workspace: string) =>
+    [...sessionKeys.workspace(workspace), "clear-conversation"] as const,
+  rewindConversation: (workspace: string) =>
+    [...sessionKeys.workspace(workspace), "rewind-conversation"] as const,
+  transcript: (workspace: string, id: string) =>
+    [...sessionKeys.detail(workspace, id), "transcript"] as const,
+  /** Operator-message outline over full retained history (S9). */
+  transcriptOutline: (workspace: string, id: string) =>
+    [...sessionKeys.detail(workspace, id), "transcript-outline"] as const,
+  /** Every committed full-history search of one session (S8). */
+  transcriptSearchRoot: (workspace: string, id: string) =>
+    [...sessionKeys.detail(workspace, id), "transcript-search"] as const,
+  transcriptSearch: (workspace: string, id: string, query: string, limit: number) =>
+    [...sessionKeys.transcriptSearchRoot(workspace, id), { limit, q: query }] as const,
+  /** Mention-picker file search over the session's working directory; one entry per query. */
+  fileSearchRoot: (workspace: string, id: string) =>
+    [...sessionKeys.detail(workspace, id), "files"] as const,
+  fileSearch: (workspace: string, id: string, query: string, limit: number) =>
+    [...sessionKeys.fileSearchRoot(workspace, id), { limit, q: query }] as const,
+  goal: (workspace: string, id: string) => [...sessionKeys.detail(workspace, id), "goal"] as const,
+  clarifications: (workspace: string, id: string) =>
+    [...sessionKeys.detail(workspace, id), "clarifications"] as const,
+  /** Restart-durable interaction records read by one explicit daemon status. */
+  interactions: (workspace: string, id: string, status: string) =>
+    [...sessionKeys.detail(workspace, id), "interactions", status] as const,
+  inputQueue: (workspace: string, id: string) =>
+    [...sessionKeys.detail(workspace, id), "input-queue"] as const,
+  recap: (workspace: string, id: string, limit?: number) =>
+    [...sessionKeys.detail(workspace, id), "recap", limit ?? "default"] as const,
+  usage: (workspace: string, id: string) =>
+    [...sessionKeys.detail(workspace, id), "usage"] as const,
+  usageTurns: (workspace: string, id: string) =>
+    [...sessionKeys.detail(workspace, id), "usage-turns"] as const,
+  /** What a continue/fork would carry; `""` is the whole-session cut. */
+  derivePreview: (workspace: string, id: string, messageId = "") =>
+    [...sessionKeys.detail(workspace, id), "derive-preview", messageId.trim()] as const,
+  /** Client-held roster the session stream writes (`subagents_snapshot` / `subagent_updated`). */
+  subagentRoster: (workspace: string, id: string) =>
+    [...sessionKeys.detail(workspace, id), "subagent-roster"] as const,
+  /** The bounded mid-prompt read that feeds the roster while the session SSE is closed. */
+  subagentRosterPoll: (workspace: string, id: string) =>
+    [...sessionKeys.detail(workspace, id), "subagent-roster-poll"] as const,
+  /** A parent's direct subagents, every page of the list route (S10, chip preview). */
+  subagents: (workspace: string, id: string) =>
+    [...sessionKeys.detail(workspace, id), "subagents"] as const,
+  /** Short pages of the same list for a session row's subagent branch; parent invalidation reaches it. */
+  subagentBranch: (workspace: string, id: string) =>
+    [...sessionKeys.subagents(workspace, id), "branch"] as const,
+  /** The session's daemon-owned monitors (composer monitor popover). */
+  monitors: (workspace: string, id: string) =>
+    [...sessionKeys.detail(workspace, id), "monitors"] as const,
+  /** Processes the session started that are still running (composer processes popover). */
+  processes: (workspace: string, id: string) =>
+    [...sessionKeys.detail(workspace, id), "processes"] as const,
+  processesForProfile: (workspace: string, id: string, profile: string) =>
+    [...sessionKeys.processes(workspace, id), profile] as const,
+  /** Everything linked to the session: under `detail`, so a detail sweep reaches it. */
+  linkedWork: (workspace: string, id: string) =>
+    [...sessionKeys.detail(workspace, id), "linked-work"] as const,
+  /** Server pages of what this session could link, one entry per search. */
+  linkCandidatesRoot: (workspace: string, id: string) =>
+    [...sessionKeys.detail(workspace, id), "link-candidates"] as const,
+  linkCandidates: (workspace: string, id: string, kind: string, query: string) =>
+    [...sessionKeys.linkCandidatesRoot(workspace, id), { kind, q: query }] as const,
+  contextReset: (workspace: string, id: string) =>
+    [...sessionKeys.detail(workspace, id), "context-reset"] as const,
+  toolArtifact: (workspace: string, artifactURI: string) =>
+    [...sessionKeys.workspace(workspace), "tool-artifact", artifactURI] as const,
+};

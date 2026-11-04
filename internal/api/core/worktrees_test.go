@@ -1,0 +1,2100 @@
+package core
+
+import (
+	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"log/slog"
+	"net/http"
+	"net/http/httptest"
+	"reflect"
+	"strings"
+	"testing"
+	"time"
+
+	"github.com/compozy/compozy/internal/agentidentity"
+	"github.com/compozy/compozy/internal/api/contract"
+	profilepkg "github.com/compozy/compozy/internal/profile"
+	"github.com/compozy/compozy/internal/session"
+	"github.com/compozy/compozy/internal/store"
+	toolspkg "github.com/compozy/compozy/internal/tools"
+	workspacepkg "github.com/compozy/compozy/internal/workspace"
+	"github.com/compozy/compozy/internal/worktree"
+	"github.com/gin-gonic/gin"
+	"github.com/gorilla/websocket"
+)
+
+func TestNativeRegisteredDomainErrors(t *testing.T) {
+	t.Parallel()
+	for _, registered := range worktreeErrorCodes {
+		t.Run("Should preserve registered domain code "+registered.code, func(t *testing.T) {
+			t.Parallel()
+			cause := fmt.Errorf("operation: %w", registered.err)
+			wrapped := toolspkg.NewToolError(toolspkg.ErrorCodeConflict, toolspkg.ToolIDWorktreeCreate,
+				"tool conflict", cause, toolspkg.ReasonConflictedID)
+			mapped := NativeToolError(toolspkg.ToolIDWorktreeCreate, wrapped)
+			status := StatusForToolError(mapped)
+			payload := ToolErrorResponseForError(mapped, status, false).Error
+			if string(payload.Code) != registered.code || payload.Message != cause.Error() ||
+				status != StatusForWorktreeError(cause) || len(payload.ReasonCodes) != 0 {
+				t.Fatalf("mapped error = %#v status=%d, want %s status=%d", payload, status,
+					registered.code, StatusForWorktreeError(cause))
+			}
+			if !errors.Is(mapped, registered.err) {
+				t.Fatal("domain error identity lost")
+			}
+		})
+	}
+}
+
+type worktreeServiceStub struct {
+	dismiss         func(context.Context, string, string) error
+	resolve         func(context.Context, string, string) (*worktree.Worktree, error)
+	create          func(context.Context, string, worktree.CreateOptions) (*worktree.Worktree, error)
+	createAccepted  func(context.Context, string, worktree.CreateOptions) (*worktree.Worktree, error)
+	adopt           func(context.Context, string, string, string) (*worktree.Worktree, error)
+	listDetails     func(context.Context, string, bool) (*worktree.DetailedListing, error)
+	listAggregate   func(context.Context, store.ReadScope, map[string]bool) (*worktree.DetailedListing, error)
+	remove          func(context.Context, string, string, bool) (*worktree.RemovalRefusal, error)
+	removeFound     func(context.Context, string, string, bool) (*worktree.RemovalRefusal, error)
+	deleteBranch    func(context.Context, string, string, bool) (worktree.BranchOutcome, error)
+	inspect         func(context.Context, string, string) (*worktree.Inspection, error)
+	prepareExitPlan func(context.Context, string, string) (*worktree.ExitPlan, error)
+	exitPlan        func(context.Context, string, string) (*worktree.ExitPlan, error)
+	exitPlanPaths   func(context.Context, string, string, []string) (*worktree.ExitPlan, error)
+	runExit         func(context.Context, string, string, worktree.ExitActionRequest) (string, error)
+	cancelExit      func(context.Context, string, string, string) error
+	catalogEvents   <-chan worktree.CatalogEvent
+}
+
+func worktreeEventSummaryWithContent(summary store.EventSummary, content json.RawMessage) store.EventSummary {
+	summary.SetContent(content)
+	return summary
+}
+
+func TestWorktreeOwnerProjection(t *testing.T) {
+	t.Parallel()
+
+	t.Run("Should enrich handler responses with the named profile owner", func(t *testing.T) {
+		t.Parallel()
+
+		item := &worktree.Worktree{ID: "wt-profile-owner", ProfileID: "profile-marketing"}
+		handlers := &BaseHandlers{Profiles: worktreeProfileServiceStub{}}
+		if err := handlers.enrichWorktreeOwner(t.Context(), item); err != nil {
+			t.Fatalf("enrichWorktreeOwner() error = %v", err)
+		}
+		if item.ProfileID != "profile-marketing" || item.ProfileName != "marketing" {
+			t.Fatalf("enriched worktree = %#v, want marketing owner", item)
+		}
+	})
+
+	t.Run("Should project the complete owner label", func(t *testing.T) {
+		t.Parallel()
+
+		payload := WorktreePayloadFromInspection(worktree.Inspection{Worktree: worktree.Worktree{
+			ID: "wt-profile-owner", ProfileID: "profile-owner", ProfileName: "Platform",
+			ProfileColor: "#5FBF85", ProfileIcon: "circle", ProfileEmoji: "🛠️", ProfileArchived: true,
+		}})
+		if payload.ProfileID != "profile-owner" || payload.ProfileName != "Platform" ||
+			payload.ProfileColor != "#5FBF85" || payload.ProfileIcon != "circle" ||
+			payload.ProfileEmoji != "🛠️" || !payload.ProfileArchived {
+			t.Fatalf("WorktreePayloadFromInspection() owner = %#v, want complete owner label", payload)
+		}
+	})
+}
+
+func TestProfileAwareWorktreeHandlers(t *testing.T) {
+	t.Parallel()
+
+	const (
+		profileID   = "profile-marketing"
+		profileName = "marketing"
+	)
+	profiles := worktreeProfileServiceStub{state: profilepkg.StateActive}
+	workspaces := workspaceServiceStub{resolve: func(
+		_ context.Context,
+		ref string,
+	) (workspacepkg.ResolvedWorkspace, error) {
+		if ref != "alpha" {
+			t.Fatalf("Resolve() ref = %q, want alpha", ref)
+		}
+		return workspacepkg.ResolvedWorkspace{
+			ID: "registry-alpha", Name: "alpha",
+			WorkspaceID: "workspace-alpha",
+		}, nil
+	}}
+	assertOwner := func(t *testing.T, payload contract.WorktreePayload, wantArchived bool) {
+		t.Helper()
+		if payload.ProfileID != profileID || payload.ProfileName != profileName ||
+			payload.ProfileColor != "#E8572A" || payload.ProfileIcon != "megaphone" ||
+			payload.ProfileEmoji != "📣" || payload.ProfileArchived != wantArchived {
+			t.Fatalf("worktree owner = %#v, want complete marketing owner", payload)
+		}
+	}
+	ownedWorktree := func(id string) worktree.Worktree {
+		return worktree.Worktree{ID: id, ProfileID: profileID, WorkspaceID: "registry-alpha"}
+	}
+
+	t.Run("Should propagate the selected profile when creating", func(t *testing.T) {
+		t.Parallel()
+		service := worktreeServiceStub{createAccepted: func(
+			_ context.Context,
+			workspaceID string,
+			opts worktree.CreateOptions,
+		) (*worktree.Worktree, error) {
+			if workspaceID != "registry-alpha" || opts.ProfileID != profileID {
+				t.Fatalf(
+					"CreateAccepted() scope = %q/%q, want registry-alpha/%s",
+					workspaceID,
+					opts.ProfileID,
+					profileID,
+				)
+			}
+			item := ownedWorktree("wt-created")
+			return &item, nil
+		}}
+		handlers := &BaseHandlers{Worktrees: service, Workspaces: workspaces, Profiles: profiles}
+		router := gin.New()
+		router.POST("/workspaces/:workspace_id/worktrees", handlers.CreateWorktree)
+		request := httptest.NewRequestWithContext(
+			t.Context(), http.MethodPost, "/workspaces/alpha/worktrees?profile=marketing",
+			strings.NewReader(`{"name":"review"}`),
+		)
+		request.Header.Set("Content-Type", "application/json")
+		response := httptest.NewRecorder()
+		router.ServeHTTP(response, request)
+		if response.Code != http.StatusAccepted {
+			t.Fatalf("create status = %d, want %d; body=%s", response.Code, http.StatusAccepted, response.Body.String())
+		}
+		var payload contract.WorktreeResponse
+		if err := json.Unmarshal(response.Body.Bytes(), &payload); err != nil {
+			t.Fatalf("decode create response: %v", err)
+		}
+		assertOwner(t, payload.Worktree, false)
+	})
+
+	t.Run("Should propagate the selected profile when adopting", func(t *testing.T) {
+		t.Parallel()
+		service := worktreeServiceStub{adopt: func(
+			_ context.Context,
+			gotProfileID, workspaceID, path string,
+		) (*worktree.Worktree, error) {
+			if gotProfileID != profileID || workspaceID != "registry-alpha" || path != "/tmp/review" {
+				t.Fatalf("Adopt() scope = %q/%q/%q", gotProfileID, workspaceID, path)
+			}
+			item := ownedWorktree("wt-adopted")
+			return &item, nil
+		}}
+		handlers := &BaseHandlers{Worktrees: service, Workspaces: workspaces, Profiles: profiles}
+		router := gin.New()
+		router.POST("/workspaces/:workspace_id/worktrees/adopt", handlers.AdoptWorktree)
+		request := httptest.NewRequestWithContext(
+			t.Context(), http.MethodPost, "/workspaces/alpha/worktrees/adopt?profile=marketing",
+			strings.NewReader(`{"path":"/tmp/review"}`),
+		)
+		request.Header.Set("Content-Type", "application/json")
+		response := httptest.NewRecorder()
+		router.ServeHTTP(response, request)
+		if response.Code != http.StatusOK {
+			t.Fatalf("adopt status = %d, want %d; body=%s", response.Code, http.StatusOK, response.Body.String())
+		}
+		var payload contract.WorktreeResponse
+		if err := json.Unmarshal(response.Body.Bytes(), &payload); err != nil {
+			t.Fatalf("decode adopt response: %v", err)
+		}
+		assertOwner(t, payload.Worktree, false)
+	})
+
+	t.Run("Should hydrate named-profile owners when inspecting and listing", func(t *testing.T) {
+		t.Parallel()
+		service := worktreeServiceStub{
+			inspect: func(_ context.Context, workspaceID, id string) (*worktree.Inspection, error) {
+				if workspaceID != "registry-alpha" || id != "wt-existing" {
+					t.Fatalf("Inspect() scope = %q/%q", workspaceID, id)
+				}
+				return &worktree.Inspection{Worktree: ownedWorktree(id)}, nil
+			},
+			listDetails: func(_ context.Context, workspaceID string, refresh bool) (*worktree.DetailedListing, error) {
+				if workspaceID != "registry-alpha" || refresh {
+					t.Fatalf("ListDetails() scope = %q refresh=%t", workspaceID, refresh)
+				}
+				return &worktree.DetailedListing{
+					Worktrees: []worktree.Inspection{{Worktree: ownedWorktree("wt-existing")}},
+				}, nil
+			},
+		}
+		handlers := &BaseHandlers{
+			Worktrees: service, Workspaces: workspaces,
+			Profiles: worktreeProfileServiceStub{state: profilepkg.StateArchived},
+		}
+		router := gin.New()
+		router.GET("/workspaces/:workspace_id/worktrees", handlers.ListWorktrees)
+		router.GET("/workspaces/:workspace_id/worktrees/:worktree_id", handlers.InspectWorktree)
+
+		inspectResponse := httptest.NewRecorder()
+		router.ServeHTTP(inspectResponse, httptest.NewRequestWithContext(
+			t.Context(), http.MethodGet, "/workspaces/alpha/worktrees/wt-existing", http.NoBody,
+		))
+		if inspectResponse.Code != http.StatusOK {
+			t.Fatalf(
+				"inspect status = %d, want %d; body=%s",
+				inspectResponse.Code,
+				http.StatusOK,
+				inspectResponse.Body.String(),
+			)
+		}
+		var inspection contract.WorktreeInspectionResponse
+		if err := json.Unmarshal(inspectResponse.Body.Bytes(), &inspection); err != nil {
+			t.Fatalf("decode inspect response: %v", err)
+		}
+		assertOwner(t, inspection.Worktree, true)
+
+		listResponse := httptest.NewRecorder()
+		router.ServeHTTP(listResponse, httptest.NewRequestWithContext(
+			t.Context(), http.MethodGet, "/workspaces/alpha/worktrees", http.NoBody,
+		))
+		if listResponse.Code != http.StatusOK {
+			t.Fatalf("list status = %d, want %d; body=%s", listResponse.Code, http.StatusOK, listResponse.Body.String())
+		}
+		var listing contract.WorktreesResponse
+		if err := json.Unmarshal(listResponse.Body.Bytes(), &listing); err != nil {
+			t.Fatalf("decode list response: %v", err)
+		}
+		if len(listing.Worktrees) != 1 {
+			t.Fatalf("list worktrees = %#v, want one", listing.Worktrees)
+		}
+		assertOwner(t, listing.Worktrees[0], true)
+	})
+}
+
+func TestWorktreeAggregate(t *testing.T) {
+	t.Parallel()
+	for _, test := range []struct {
+		name       string
+		query      string
+		allowed    map[string]bool
+		catalogErr error
+		status     int
+	}{
+		{
+			name:    "Should select registered workspaces before hydration",
+			query:   "&workspace_ids=ws-visible&workspace_ids=ws-unregistered",
+			allowed: map[string]bool{"ws-visible": true}, status: http.StatusOK,
+		},
+		{
+			name:  "Should preserve an empty workspace selection",
+			query: "&workspace_ids=ws-unregistered", allowed: map[string]bool{}, status: http.StatusOK,
+		},
+		{
+			name:  "Should stop before hydration when workspace selection fails",
+			query: "&workspace_ids=ws-visible", catalogErr: errors.New("catalog unavailable"),
+			status: http.StatusInternalServerError,
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+			called := false
+			handlers := &BaseHandlers{
+				Profiles: worktreeProfileServiceStub{},
+				Workspaces: workspaceServiceStub{list: func(context.Context) ([]workspacepkg.Workspace, error) {
+					return []workspacepkg.Workspace{{ID: "ws-visible"}, {ID: "ws-other"}}, test.catalogErr
+				}},
+				Worktrees: worktreeServiceStub{listAggregate: func(
+					_ context.Context, scope store.ReadScope, allowed map[string]bool,
+				) (*worktree.DetailedListing, error) {
+					called = true
+					if scope.ProfileID != "profile-marketing" || scope.AllProfiles ||
+						!reflect.DeepEqual(allowed, test.allowed) {
+						t.Fatalf("aggregate selection = %#v/%v, want marketing/%v", scope, allowed, test.allowed)
+					}
+					listing := &worktree.DetailedListing{Worktrees: []worktree.Inspection{}}
+					if allowed["ws-visible"] {
+						listing.Worktrees = append(listing.Worktrees, worktree.Inspection{Worktree: worktree.Worktree{
+							ID: "wt-visible", WorkspaceID: "ws-visible", ProfileID: scope.ProfileID,
+						}})
+					}
+					return listing, nil
+				}},
+			}
+			router := gin.New()
+			router.GET("/worktrees", handlers.ListWorktreeAggregate)
+			response := httptest.NewRecorder()
+			router.ServeHTTP(response, httptest.NewRequestWithContext(t.Context(), http.MethodGet,
+				"/worktrees?all_workspaces=true&profile=marketing"+test.query, http.NoBody))
+			if response.Code != test.status || called != (test.catalogErr == nil) {
+				t.Fatalf("aggregate status/called = %d/%t; body=%s", response.Code, called, response.Body.String())
+			}
+			if test.status != http.StatusOK {
+				var payload contract.ErrorPayload
+				if err := json.Unmarshal(response.Body.Bytes(), &payload); err != nil {
+					t.Fatalf("decode aggregate error: %v", err)
+				}
+				if payload.Error != test.catalogErr.Error() {
+					t.Fatalf("aggregate error = %q, want %q", payload.Error, test.catalogErr.Error())
+				}
+				return
+			}
+			var listing contract.WorktreesResponse
+			if err := json.Unmarshal(response.Body.Bytes(), &listing); err != nil {
+				t.Fatal(err)
+			}
+			if len(listing.Worktrees) != len(test.allowed) {
+				t.Fatalf("worktrees = %#v, want %d", listing.Worktrees, len(test.allowed))
+			}
+			if len(listing.Worktrees) > 0 && listing.Worktrees[0].ProfileName != "marketing" {
+				t.Fatalf("worktree owner = %#v, want marketing", listing.Worktrees[0])
+			}
+		})
+	}
+}
+
+type worktreeProfileServiceStub struct {
+	ProfileService
+	state profilepkg.State
+}
+
+func (s worktreeProfileServiceStub) profileState() profilepkg.State {
+	if s.state == "" {
+		return profilepkg.StateActive
+	}
+	return s.state
+}
+
+func (s worktreeProfileServiceStub) Resolve(
+	_ context.Context,
+	input profilepkg.ResolveInput,
+) (profilepkg.Resolution, error) {
+	if input.Flag != "marketing" {
+		return profilepkg.Resolution{}, profilepkg.ErrNotFound
+	}
+	return profilepkg.Resolution{Profile: profilepkg.Profile{
+		ID: "profile-marketing", Name: "marketing", Color: "#E8572A", Icon: "megaphone", Emoji: "📣",
+		State: s.profileState(),
+	}}, nil
+}
+
+func (s worktreeProfileServiceStub) List(context.Context) ([]profilepkg.WithCounts, error) {
+	return []profilepkg.WithCounts{
+		{
+			ID: "profile-marketing", Name: "marketing", Color: "#E8572A", Icon: "megaphone", Emoji: "📣",
+			State: s.profileState()},
+	}, nil
+}
+
+func (s worktreeServiceStub) Create(
+	ctx context.Context,
+	workspaceID string,
+	opts worktree.CreateOptions,
+) (*worktree.Worktree, error) {
+	if s.create != nil {
+		return s.create(ctx, workspaceID, opts)
+	}
+	return nil, fmt.Errorf("unexpected Create call")
+}
+
+type worktreeObserverStub struct {
+	Observer
+	queryEvents func(context.Context, store.EventSummaryQuery) ([]store.EventSummary, error)
+}
+
+type worktreeSessionAcceptanceFunc func(
+	context.Context,
+	*session.CreateAcceptedOpts,
+) (*session.Info, error)
+
+func (fn worktreeSessionAcceptanceFunc) CreateAccepted(
+	ctx context.Context,
+	optsInput *session.CreateAcceptedOpts,
+) (*session.Info, error) {
+	opts := *optsInput
+
+	return fn(ctx, &(opts))
+}
+
+type promptingSessionManager struct {
+	sessionManagerStub
+	createAccepted     func(context.Context, *session.CreateAcceptedOpts) (*session.Info, error)
+	isPrompting        func(string) bool
+	worktreeForkOrigin string
+}
+
+func (m *promptingSessionManager) IsPrompting(sessionID string) bool {
+	return m.isPrompting != nil && m.isPrompting(sessionID)
+}
+
+func (m *promptingSessionManager) CreateAccepted(
+	ctx context.Context,
+	optsInput *session.CreateAcceptedOpts,
+) (*session.Info, error) {
+	opts := *optsInput
+
+	return m.createAccepted(ctx, &(opts))
+}
+
+func (m *promptingSessionManager) CreateWorktreeForkAccepted(
+	ctx context.Context,
+	originSessionID string,
+	optsInput *session.CreateAcceptedOpts,
+) (*session.Info, error) {
+	opts := *optsInput
+
+	m.worktreeForkOrigin = originSessionID
+	return m.createAccepted(ctx, &(opts))
+}
+
+func (s worktreeObserverStub) QueryEvents(
+	ctx context.Context,
+	query store.EventSummaryQuery,
+) ([]store.EventSummary, error) {
+	return s.queryEvents(ctx, query)
+}
+
+func (s worktreeServiceStub) CreateAccepted(
+	ctx context.Context,
+	workspaceID string,
+	opts worktree.CreateOptions,
+) (*worktree.Worktree, error) {
+	if s.createAccepted != nil {
+		return s.createAccepted(ctx, workspaceID, opts)
+	}
+	return nil, fmt.Errorf("unexpected CreateAccepted call")
+}
+
+func (s worktreeServiceStub) CreateReady(
+	ctx context.Context,
+	workspaceID string,
+	opts worktree.CreateOptions,
+) (*worktree.Worktree, error) {
+	if s.create != nil {
+		return s.create(ctx, workspaceID, opts)
+	}
+	return nil, fmt.Errorf("unexpected CreateReady call")
+}
+
+func (s worktreeServiceStub) CancelCreate(context.Context, string, string) error {
+	return fmt.Errorf("unexpected CancelCreate call")
+}
+
+func (s worktreeServiceStub) Adopt(
+	ctx context.Context,
+	profileID, workspaceID, path string,
+) (*worktree.Worktree, error) {
+	if s.adopt != nil {
+		return s.adopt(ctx, profileID, workspaceID, path)
+	}
+	return nil, fmt.Errorf("unexpected Adopt call")
+}
+
+func (s worktreeServiceStub) ListDetails(
+	ctx context.Context,
+	workspaceID string,
+	refresh bool,
+) (*worktree.DetailedListing, error) {
+	if s.listDetails != nil {
+		return s.listDetails(ctx, workspaceID, refresh)
+	}
+	return nil, fmt.Errorf("unexpected ListDetails call")
+}
+
+func (s worktreeServiceStub) ListAggregate(
+	ctx context.Context,
+	scope store.ReadScope,
+	allowed map[string]bool,
+) (*worktree.DetailedListing, error) {
+	if s.listAggregate != nil {
+		return s.listAggregate(ctx, scope, allowed)
+	}
+	return nil, fmt.Errorf("unexpected ListAggregate call")
+}
+
+func (s worktreeServiceStub) Resolve(ctx context.Context, workspaceID, ref string) (*worktree.Worktree, error) {
+	if s.resolve != nil {
+		return s.resolve(ctx, workspaceID, ref)
+	}
+	return nil, fmt.Errorf("unexpected Resolve call")
+}
+
+func (s worktreeServiceStub) Inspect(
+	ctx context.Context,
+	workspaceID string,
+	worktreeID string,
+) (*worktree.Inspection, error) {
+	if s.inspect != nil {
+		return s.inspect(ctx, workspaceID, worktreeID)
+	}
+	return nil, fmt.Errorf("unexpected Inspect call")
+}
+
+func (s worktreeServiceStub) StatusDetails(
+	context.Context,
+	string,
+	string,
+	bool,
+	bool,
+) (*worktree.StatusDetails, error) {
+	return nil, fmt.Errorf("unexpected StatusDetails call")
+}
+
+func (s worktreeServiceStub) PrepareExitPlan(ctx context.Context, workspaceID, id string) (*worktree.ExitPlan, error) {
+	if s.prepareExitPlan != nil {
+		return s.prepareExitPlan(ctx, workspaceID, id)
+	}
+	return nil, fmt.Errorf("unexpected PrepareExitPlan call")
+}
+
+func (s worktreeServiceStub) ExitPlan(
+	ctx context.Context,
+	workspaceID string,
+	worktreeID string,
+) (*worktree.ExitPlan, error) {
+	if s.exitPlan != nil {
+		return s.exitPlan(ctx, workspaceID, worktreeID)
+	}
+	return nil, fmt.Errorf("unexpected ExitPlan call")
+}
+
+func (s worktreeServiceStub) ExitPlanForPaths(
+	ctx context.Context,
+	workspaceID, worktreeID string,
+	paths []string,
+) (*worktree.ExitPlan, error) {
+	if s.exitPlanPaths != nil {
+		return s.exitPlanPaths(ctx, workspaceID, worktreeID, paths)
+	}
+	return nil, fmt.Errorf("unexpected ExitPlanForPaths call")
+}
+
+func (s worktreeServiceStub) RunExitAction(
+	ctx context.Context,
+	workspaceID string,
+	worktreeID string,
+	request worktree.ExitActionRequest,
+) (string, error) {
+	if s.runExit != nil {
+		return s.runExit(ctx, workspaceID, worktreeID, request)
+	}
+	return "", fmt.Errorf("unexpected RunExitAction call")
+}
+
+func (s worktreeServiceStub) CancelExitAction(
+	ctx context.Context,
+	workspaceID string,
+	worktreeID string,
+	opID string,
+) error {
+	if s.cancelExit != nil {
+		return s.cancelExit(ctx, workspaceID, worktreeID, opID)
+	}
+	return fmt.Errorf("unexpected CancelExitAction call")
+}
+
+func (s worktreeServiceStub) RemoveDiscovered(
+	ctx context.Context,
+	workspaceID string,
+	path string,
+	options worktree.RemoveDiscoveredOptions,
+) (*worktree.RemovalRefusal, error) {
+	if s.removeFound == nil {
+		return nil, fmt.Errorf("unexpected RemoveDiscovered call")
+	}
+	return s.removeFound(ctx, workspaceID, path, options.Force)
+}
+
+func (s worktreeServiceStub) Remove(
+	ctx context.Context,
+	workspaceID string,
+	worktreeID string,
+	force bool,
+) (*worktree.RemovalRefusal, error) {
+	if s.remove == nil {
+		return nil, fmt.Errorf("unexpected Remove call")
+	}
+	return s.remove(ctx, workspaceID, worktreeID, force)
+}
+
+func (s worktreeServiceStub) Dismiss(ctx context.Context, workspaceID, id string) error {
+	if s.dismiss != nil {
+		return s.dismiss(ctx, workspaceID, id)
+	}
+	return fmt.Errorf("unexpected Dismiss call")
+}
+
+func (s worktreeServiceStub) DeleteLocalBranch(
+	ctx context.Context,
+	workspaceID, id string,
+	force bool,
+) (worktree.BranchOutcome, error) {
+	if s.deleteBranch != nil {
+		return s.deleteBranch(ctx, workspaceID, id, force)
+	}
+	return worktree.BranchOutcome{}, fmt.Errorf("unexpected DeleteLocalBranch call")
+}
+
+func (s worktreeServiceStub) SubscribeWorktreeCatalogEvents(
+	context.Context,
+) (<-chan worktree.CatalogEvent, func(), error) {
+	return s.catalogEvents, func() {}, nil
+}
+
+func TestCreateSessionWorktreeBinding(t *testing.T) {
+	t.Parallel()
+
+	accepted := make([]session.CreateOpts, 0, 2)
+	acceptFailure := false
+	manager := worktreeSessionAcceptanceFunc(
+		func(_ context.Context, optsInput *session.CreateAcceptedOpts) (*session.Info, error) {
+			opts := *optsInput
+
+			accepted = append(accepted, opts.Session)
+			if acceptFailure {
+				return nil, errors.New("accept failed")
+			}
+			return &session.Info{
+				ID: "sess-worktree", AgentName: opts.Session.AgentName,
+				WorkspaceID: "ws-stable", WorktreeID: opts.Session.Worktree,
+				State: session.StateActive,
+			}, nil
+		},
+	)
+	createdWorktrees := 0
+	removedWorktrees := 0
+	handlers := &BaseHandlers{
+		TransportName:     "api-worktree-test",
+		Sessions:          sessionManagerStub{},
+		SessionAcceptance: manager,
+		Workspaces: workspaceServiceStub{get: func(
+			_ context.Context,
+			ref string,
+		) (workspacepkg.Workspace, error) {
+			if ref != "workspace-ref" {
+				t.Fatalf("Get() ref = %q, want %q", ref, "workspace-ref")
+			}
+			return workspacepkg.Workspace{ID: "ws-stable"}, nil
+		}},
+		Worktrees: worktreeServiceStub{
+			create: func(
+				_ context.Context,
+				workspaceID string,
+				opts worktree.CreateOptions,
+			) (*worktree.Worktree, error) {
+				createdWorktrees++
+				if workspaceID != "ws-stable" || opts.Name != "feature-session" ||
+					opts.Origin != worktree.OriginManual {
+					t.Fatalf("Create() = workspace %q opts %#v", workspaceID, opts)
+				}
+				return &worktree.Worktree{ID: "wt-created", WorkspaceID: workspaceID}, nil
+			},
+			remove: func(
+				_ context.Context,
+				workspaceID string,
+				worktreeID string,
+				force bool,
+			) (*worktree.RemovalRefusal, error) {
+				removedWorktrees++
+				if workspaceID != "ws-stable" || worktreeID != "wt-created" || !force {
+					t.Fatalf("Remove() = workspace %q worktree %q force %v", workspaceID, worktreeID, force)
+				}
+				return nil, nil
+			},
+		},
+	}
+	router := gin.New()
+	router.POST("/sessions", handlers.CreateSession)
+	request := func(body string) *httptest.ResponseRecorder {
+		t.Helper()
+		req := httptest.NewRequestWithContext(t.Context(), http.MethodPost, "/sessions", strings.NewReader(body))
+		req.Header.Set("Content-Type", "application/json")
+		response := httptest.NewRecorder()
+		router.ServeHTTP(response, req)
+		return response
+	}
+
+	direct := request(`{"agent_name":"coder","workspace":"workspace-ref","worktree":"branch-ref"}`)
+	if direct.Code != http.StatusCreated {
+		t.Fatalf("direct binding status = %d, want %d; body=%s", direct.Code, http.StatusCreated, direct.Body.String())
+	}
+	if len(accepted) != 1 || accepted[0].Worktree != "branch-ref" {
+		t.Fatalf("direct binding accepted opts = %#v, want worktree ref", accepted)
+	}
+	var directPayload contract.SessionResponse
+	if err := json.Unmarshal(direct.Body.Bytes(), &directPayload); err != nil {
+		t.Fatalf("json.Unmarshal(direct response) error = %v", err)
+	}
+	if directPayload.Session.WorktreeID != "branch-ref" {
+		t.Fatalf("direct response worktree_id = %q, want %q", directPayload.Session.WorktreeID, "branch-ref")
+	}
+
+	materialized := request(
+		`{"agent_name":"coder","workspace":"workspace-ref","new_worktree":{"name":"feature-session"}}`,
+	)
+	if materialized.Code != http.StatusCreated {
+		t.Fatalf(
+			"new worktree status = %d, want %d; body=%s",
+			materialized.Code,
+			http.StatusCreated,
+			materialized.Body.String(),
+		)
+	}
+	if createdWorktrees != 1 || len(accepted) != 2 || accepted[1].Worktree != "wt-created" {
+		t.Fatalf("new worktree calls = %d accepted = %#v", createdWorktrees, accepted)
+	}
+
+	invalid := []string{
+		`{"workspace":"workspace-ref","worktree":"wt-a","new_worktree":{}}`,
+		`{"workspace_path":"/tmp/project","worktree":"wt-a"}`,
+		`{"workspace_path":"/tmp/project","new_worktree":{}}`,
+	}
+	for _, body := range invalid {
+		beforeAccepted := len(accepted)
+		beforeCreated := createdWorktrees
+		response := request(body)
+		if response.Code != http.StatusBadRequest {
+			t.Fatalf(
+				"invalid binding status = %d, want %d; body=%s",
+				response.Code,
+				http.StatusBadRequest,
+				response.Body.String(),
+			)
+		}
+		if len(accepted) != beforeAccepted || createdWorktrees != beforeCreated {
+			t.Fatalf("invalid binding caused mutation: accepted=%d worktrees=%d", len(accepted), createdWorktrees)
+		}
+	}
+
+	acceptFailure = true
+	failed := request(
+		`{"agent_name":"coder","workspace":"workspace-ref","new_worktree":{"name":"feature-session"}}`,
+	)
+	if failed.Code != http.StatusInternalServerError || removedWorktrees != 1 {
+		t.Fatalf(
+			"failed session status/removals = %d/%d, want 500/1; body=%s",
+			failed.Code,
+			removedWorktrees,
+			failed.Body.String(),
+		)
+	}
+}
+
+func TestForkSessionToWorktree(t *testing.T) {
+	t.Parallel()
+
+	newHandlers := func(
+		t *testing.T,
+		prompting func(string) bool,
+		createWorktree func(context.Context, string, worktree.CreateOptions) (*worktree.Worktree, error),
+		removeWorktree func(context.Context, string, string, bool) (*worktree.RemovalRefusal, error),
+		accept func(context.Context, *session.CreateAcceptedOpts) (*session.Info, error),
+	) *BaseHandlers {
+		t.Helper()
+		if removeWorktree == nil {
+			removeWorktree = func(context.Context, string, string, bool) (*worktree.RemovalRefusal, error) {
+				return nil, nil
+			}
+		}
+		manager := &promptingSessionManager{
+			status: func(_ context.Context, id string) (*session.Info, error) {
+				if id != "sess-origin" {
+					t.Fatalf("Status() id = %q, want sess-origin", id)
+				}
+				return &session.Info{
+					ID: "sess-origin", AgentName: "coder", WorkspaceID: "registry-a",
+					State: session.StateActive,
+				}, nil
+			},
+			createAccepted: accept,
+			isPrompting:    prompting,
+		}
+		return &BaseHandlers{
+			Sessions:          manager,
+			SessionAcceptance: manager,
+			Workspaces: workspaceServiceStub{resolve: func(
+				_ context.Context,
+				ref string,
+			) (workspacepkg.ResolvedWorkspace, error) {
+				if ref != "workspace-a" {
+					t.Fatalf("Resolve() ref = %q, want workspace-a", ref)
+				}
+				return workspacepkg.ResolvedWorkspace{
+					ID:          "registry-a",
+					WorkspaceID: "workspace-a",
+				}, nil
+			}},
+			Worktrees: worktreeServiceStub{create: createWorktree, remove: removeWorktree},
+		}
+	}
+	request := func(t *testing.T, handlers *BaseHandlers, body string) *httptest.ResponseRecorder {
+		t.Helper()
+		router := gin.New()
+		router.POST(
+			"/workspaces/:workspace_id/sessions/:session_id/worktree-fork",
+			handlers.ForkSessionToWorktree,
+		)
+		req := httptest.NewRequestWithContext(
+			t.Context(),
+			http.MethodPost,
+			"/workspaces/workspace-a/sessions/sess-origin/worktree-fork",
+			strings.NewReader(body),
+		)
+		req.Header.Set("Content-Type", "application/json")
+		response := httptest.NewRecorder()
+		router.ServeHTTP(response, req)
+		return response
+	}
+
+	t.Run("Should require explicit confirmation before creating anything", func(t *testing.T) {
+		t.Parallel()
+		accepted := 0
+		handlers := newHandlers(t, nil, nil, nil, func(
+			context.Context,
+			*session.CreateAcceptedOpts,
+		) (*session.Info, error) {
+			accepted++
+			return nil, nil
+		})
+		response := request(t, handlers, `{"worktree":"wt-existing","confirmed":false}`)
+		if response.Code != http.StatusBadRequest || accepted != 0 {
+			t.Fatalf("status/accepted = %d/%d, want 400/0; body=%s", response.Code, accepted, response.Body.String())
+		}
+	})
+
+	t.Run("Should create one clean child session in an existing worktree", func(t *testing.T) {
+		t.Parallel()
+		var accepted session.CreateOpts
+		promptChecks := 0
+		handlers := newHandlers(t, func(id string) bool {
+			if id != "sess-origin" {
+				t.Fatalf("IsPrompting() id = %q, want sess-origin", id)
+			}
+			promptChecks++
+			return false
+		}, nil, nil, func(_ context.Context, optsInput *session.CreateAcceptedOpts) (*session.Info, error) {
+			opts := *optsInput
+
+			accepted = opts.Session
+			return &session.Info{
+				ID: "sess-child", AgentName: accepted.AgentName, WorkspaceID: accepted.Workspace,
+				WorktreeID: accepted.Worktree, State: session.StateActive, Lineage: accepted.Lineage,
+			}, nil
+		})
+		response := request(t, handlers, `{"worktree":"wt-existing","confirmed":true}`)
+		if response.Code != http.StatusCreated {
+			t.Fatalf("status = %d, want 201; body=%s", response.Code, response.Body.String())
+		}
+		if promptChecks != 2 || accepted.AgentName != "coder" || accepted.Workspace != "registry-a" ||
+			accepted.Worktree != "wt-existing" || accepted.Type != session.SessionTypeUser ||
+			accepted.Lineage == nil || accepted.Lineage.ParentSessionID != "sess-origin" ||
+			accepted.CWD != "" || accepted.Name != "" || accepted.Provider != "" {
+			t.Fatalf("accepted fork = %#v; prompt checks = %d", accepted, promptChecks)
+		}
+		manager := handlers.SessionAcceptance.(*promptingSessionManager)
+		if manager.worktreeForkOrigin != "sess-origin" {
+			t.Fatalf("fork origin = %q, want sess-origin", manager.worktreeForkOrigin)
+		}
+	})
+
+	t.Run("Should materialize a new target before accepting the child session", func(t *testing.T) {
+		t.Parallel()
+		created := 0
+		accepted := 0
+		handlers := newHandlers(t, func(string) bool { return false }, func(
+			_ context.Context,
+			workspaceID string,
+			opts worktree.CreateOptions,
+		) (*worktree.Worktree, error) {
+			created++
+			if workspaceID != "registry-a" || opts.Name != "fork-target" || opts.Origin != worktree.OriginManual {
+				t.Fatalf("CreateReady() workspace/options = %q/%#v", workspaceID, opts)
+			}
+			return &worktree.Worktree{ID: "wt-created", WorkspaceID: workspaceID, State: worktree.StateReady}, nil
+		}, nil, func(_ context.Context, optsInput *session.CreateAcceptedOpts) (*session.Info, error) {
+			opts := *optsInput
+
+			accepted++
+			return &session.Info{
+				ID: "sess-child", AgentName: opts.Session.AgentName, WorkspaceID: opts.Session.Workspace,
+				WorktreeID: opts.Session.Worktree, State: session.StateActive,
+			}, nil
+		})
+		response := request(t, handlers, `{"new_worktree":{"name":"fork-target"},"confirmed":true}`)
+		if response.Code != http.StatusCreated || created != 1 || accepted != 1 {
+			t.Fatalf(
+				"status/created/accepted = %d/%d/%d, want 201/1/1; body=%s",
+				response.Code,
+				created,
+				accepted,
+				response.Body.String(),
+			)
+		}
+	})
+
+	t.Run("Should recheck prompt activity after materialization and refuse the race", func(t *testing.T) {
+		t.Parallel()
+		promptChecks := 0
+		accepted := 0
+		handlers := newHandlers(t, func(string) bool {
+			promptChecks++
+			return promptChecks == 2
+		}, func(
+			context.Context,
+			string,
+			worktree.CreateOptions,
+		) (*worktree.Worktree, error) {
+			return &worktree.Worktree{ID: "wt-created", State: worktree.StateReady}, nil
+		}, nil, func(context.Context, *session.CreateAcceptedOpts) (*session.Info, error) {
+			accepted++
+			return nil, nil
+		})
+		response := request(t, handlers, `{"new_worktree":{},"confirmed":true}`)
+		if response.Code != http.StatusConflict || promptChecks != 2 || accepted != 0 {
+			t.Fatalf(
+				"status/checks/accepted = %d/%d/%d, want 409/2/0; body=%s",
+				response.Code,
+				promptChecks,
+				accepted,
+				response.Body.String(),
+			)
+		}
+	})
+
+	t.Run("Should roll back a newly materialized target when child acceptance fails", func(t *testing.T) {
+		t.Parallel()
+		removed := 0
+		handlers := newHandlers(t, func(string) bool { return false }, func(
+			context.Context,
+			string,
+			worktree.CreateOptions,
+		) (*worktree.Worktree, error) {
+			return &worktree.Worktree{ID: "wt-created", WorkspaceID: "registry-a", State: worktree.StateReady}, nil
+		}, func(
+			_ context.Context,
+			workspaceID string,
+			worktreeID string,
+			force bool,
+		) (*worktree.RemovalRefusal, error) {
+			removed++
+			if workspaceID != "registry-a" || worktreeID != "wt-created" || !force {
+				t.Fatalf("Remove() = workspace %q worktree %q force %v", workspaceID, worktreeID, force)
+			}
+			return nil, nil
+		}, func(context.Context, *session.CreateAcceptedOpts) (*session.Info, error) {
+			return nil, errors.New("accept failed")
+		})
+		response := request(t, handlers, `{"new_worktree":{},"confirmed":true}`)
+		if response.Code != http.StatusInternalServerError || removed != 1 {
+			t.Fatalf("status/removed = %d/%d, want 500/1; body=%s", response.Code, removed, response.Body.String())
+		}
+	})
+}
+
+func TestWorktreeErrorCodes(t *testing.T) {
+	t.Parallel()
+
+	t.Run("Should preserve missing workspace roots returned by worktree resolution", func(t *testing.T) {
+		t.Parallel()
+		cause := fmt.Errorf("resolve worktree workspace: %w", workspacepkg.ErrWorkspaceRootMissing)
+		status := StatusForWorktreeError(cause)
+		payload := ErrorPayloadForStatus(status, cause, false)
+		if status != http.StatusGone || payload.Code != "workspace_root_missing" {
+			t.Fatalf("response = %d %+v, want 410 workspace_root_missing", status, payload)
+		}
+	})
+
+	t.Run("Should map every sentinel to one unique wire code", func(t *testing.T) {
+		t.Parallel()
+
+		expected := []struct {
+			err  error
+			code string
+		}{
+			{worktree.ErrGitUnavailable, "worktree_git_unavailable"},
+			{worktree.ErrGitVersionUnsupported, "worktree_git_version_unsupported"},
+			{worktree.ErrWorkspaceNotGitBacked, "workspace_not_git_backed"},
+			{worktree.ErrNameTaken, "worktree_name_taken"},
+			{worktree.ErrPathExists, "worktree_path_exists"},
+			{worktree.ErrBranchHeld, "branch_held_by_worktree"},
+			{worktree.ErrBranchCheckedOutAtRoot, "branch_checked_out_at_root"},
+			{worktree.ErrBaseRefNotFound, "base_ref_not_found"},
+			{worktree.ErrRepoHasNoCommits, "repo_has_no_commits"},
+			{worktree.ErrNotFound, "worktree_not_found"},
+			{worktree.ErrNotReady, "worktree_not_ready"},
+			{worktree.ErrPending, "worktree_pending"},
+			{worktree.ErrMissing, "worktree_missing"},
+			{worktree.ErrRefInvalid, "worktree_ref_invalid"},
+			{worktree.ErrAdoptionMainCheckout, "adoption_main_checkout"},
+			{worktree.ErrAdoptionForeignRepo, "adoption_foreign_repository"},
+			{worktree.ErrAdoptionUnreadable, "adoption_unreadable"},
+			{worktree.ErrDiscoveredRegistered, "worktree_registered"},
+			{worktree.ErrDiscoveredChanged, "worktree_discovered_changed"},
+			{worktree.ErrOperationInProgress, "worktree_operation_in_progress"},
+			{worktree.ErrSessionActive, "worktree_session_active"},
+			{worktree.ErrStatusUnreadable, "worktree_status_unreadable"},
+			{worktree.ErrDirtyRequiresForce, "worktree_dirty_requires_force"},
+			{worktree.ErrUnpushedRequiresForce, "worktree_unpushed_requires_force"},
+			{worktree.ErrSafetyCheckFailed, "worktree_safety_check_failed"},
+			{worktree.ErrRemovalFailed, "worktree_removal_failed"},
+			{worktree.ErrCheckoutOrphaned, "worktree_checkout_orphaned"},
+			{worktree.ErrPerRunMaterialization, "per_run_materialization_failed"},
+			{worktree.ErrConfigInvalid, "worktree_config_invalid"},
+			{worktree.ErrDeniedByHook, "worktree_denied_by_hook"},
+			{worktree.ErrNotPending, "worktree_not_pending"},
+			{worktree.ErrForgeUnavailable, "forge_unavailable"},
+			{worktree.ErrForge, "forge_error"},
+			{worktree.ErrExitActionInvalid, "worktree_exit_action_invalid"},
+		}
+
+		if len(worktreeErrorCodes) != len(expected) {
+			t.Fatalf("worktree error map count = %d, want %d", len(worktreeErrorCodes), len(expected))
+		}
+		seen := make(map[string]error, len(expected))
+		for _, item := range expected {
+			got := WorktreeErrorCode(fmt.Errorf("wrapped: %w", item.err))
+			if got != item.code {
+				t.Fatalf("WorktreeErrorCode(%v) = %q, want %q", item.err, got, item.code)
+			}
+			if previous, exists := seen[got]; exists {
+				t.Fatalf("wire code %q maps both %v and %v", got, previous, item.err)
+			}
+			seen[got] = item.err
+		}
+	})
+
+	t.Run("Should expose a safe machine-readable forge failure cause", func(t *testing.T) {
+		t.Parallel()
+		failure := worktree.NewForgeFailure(
+			worktree.ErrForge, "rate_limited", errors.New("provider internal detail"),
+		)
+		payload := ErrorPayloadForStatus(http.StatusBadGateway, failure, true)
+		if payload.Error != "forge_error" || payload.Code != "forge_error" ||
+			payload.Details["cause"] != "rate_limited" || strings.Contains(payload.Error, "internal") {
+			t.Fatalf("forge failure payload = %#v, want masked error with typed cause", payload)
+		}
+	})
+}
+
+func TestWorktreeExitHandlers(t *testing.T) {
+	t.Parallel()
+
+	var runRequest worktree.ExitActionRequest
+	var canceledOperation string
+	handlers := &BaseHandlers{
+		Workspaces: workspaceServiceStub{resolve: func(
+			_ context.Context,
+			ref string,
+		) (workspacepkg.ResolvedWorkspace, error) {
+			if ref != "workspace-a" {
+				t.Fatalf("Resolve() ref = %q, want workspace-a", ref)
+			}
+			return workspacepkg.ResolvedWorkspace{
+				ID: "registry-a", WorkspaceID: "workspace-a",
+			}, nil
+		}},
+		Worktrees: worktreeServiceStub{
+			prepareExitPlan: func(_ context.Context, workspaceID, worktreeID string) (*worktree.ExitPlan, error) {
+				if workspaceID != "registry-a" || worktreeID != "wt-a" {
+					t.Fatalf("prepare scope=%s/%s", workspaceID, worktreeID)
+				}
+				return &worktree.ExitPlan{
+					WorktreeID: worktreeID,
+					Forge:      &worktree.ForgeCapabilities{Provider: "github"},
+					PRPrefill:  &worktree.ExitPRPrefill{Title: "Prepared"},
+				}, nil
+			},
+			exitPlanPaths: func(_ context.Context, workspaceID, worktreeID string, paths []string) (*worktree.ExitPlan, error) {
+				if workspaceID != "registry-a" || worktreeID != "wt-a" ||
+					!reflect.DeepEqual(paths, []string{"src/change.go", "docs/change.md"}) {
+					t.Fatalf("scoped plan inputs=%q/%q/%#v", workspaceID, worktreeID, paths)
+				}
+				return &worktree.ExitPlan{
+					WorktreeID:  worktreeID,
+					CommitScope: worktree.ExitCommitScope{IncludePaths: paths, Fingerprint: "reviewed", Complete: true},
+				}, nil
+			},
+
+			exitPlan: func(_ context.Context, workspaceID, worktreeID string) (*worktree.ExitPlan, error) {
+				if workspaceID != "registry-a" || worktreeID != "wt-a" {
+					t.Fatalf("ExitPlan() args = %q, %q", workspaceID, worktreeID)
+				}
+				return &worktree.ExitPlan{
+					WorktreeID: worktreeID, Primary: worktree.ExitActionCommitPush, Base: "main",
+					Actions: []worktree.ExitActionPlan{{
+						Action: worktree.ExitActionCommitPush, Label: "Commit and push", Enabled: true, Publish: true,
+					}},
+					CommitScope: worktree.ExitCommitScope{
+						ChangedFiles: 2, Insertions: 3, Deletions: 1, UntrackedFiles: []string{"new.txt"},
+						UntrackedTotal: 1,
+					},
+					Forge: &worktree.ForgeCapabilities{
+						Provider: "github", RequestNoun: "PR", OpenActionLabel: "Open PR",
+						ViewActionLabel: "View PR", SupportsDraft: true, CredentialSource: "binding",
+					},
+					PRPrefill:  &worktree.ExitPRPrefill{Title: "feature/exit", Body: "## Summary\nReady."},
+					Cleanup:    worktree.ExitCleanupEvidence{ForgeState: "open", Safe: true, Source: "forge"},
+					RemoteURLs: []string{"https://token@github.com/acme/repo.git"},
+				}, nil
+			},
+			runExit: func(
+				_ context.Context,
+				workspaceID, worktreeID string,
+				request worktree.ExitActionRequest,
+			) (string, error) {
+				if workspaceID != "registry-a" || worktreeID != "wt-a" {
+					t.Fatalf("RunExitAction() args = %q, %q", workspaceID, worktreeID)
+				}
+				runRequest = request
+				return "op-exit", nil
+			},
+			cancelExit: func(_ context.Context, workspaceID, worktreeID, opID string) error {
+				if workspaceID != "registry-a" || worktreeID != "wt-a" {
+					t.Fatalf("CancelExitAction() args = %q, %q", workspaceID, worktreeID)
+				}
+				canceledOperation = opID
+				return nil
+			},
+		},
+	}
+	router := gin.New()
+	path := "/workspaces/:workspace_id/worktrees/:worktree_id/exit"
+	router.GET(path, handlers.GetWorktreeExitPlan)
+	router.POST(path+"/prepare", handlers.PrepareWorktreeExitPlan)
+	router.POST(path+"/actions", handlers.RunWorktreeExitAction)
+	router.POST(path+"/cancel", handlers.CancelWorktreeExitAction)
+
+	t.Run("Should prepare forge capabilities through the explicit action boundary", func(t *testing.T) {
+		t.Parallel()
+		response := httptest.NewRecorder()
+		router.ServeHTTP(
+			response,
+			httptest.NewRequestWithContext(
+				t.Context(),
+				http.MethodPost,
+				"/workspaces/workspace-a/worktrees/wt-a/exit/prepare",
+				http.NoBody,
+			),
+		)
+		var payload contract.WorktreeExitPlanResponse
+		if err := json.Unmarshal(response.Body.Bytes(), &payload); err != nil {
+			t.Fatal(err)
+		}
+		if response.Code != http.StatusOK || payload.WorktreeID != "wt-a" || payload.Forge == nil ||
+			payload.PRPrefill == nil ||
+			payload.PRPrefill.Title != "Prepared" {
+			t.Fatalf("prepare=%d/%s", response.Code, response.Body.String())
+		}
+	})
+
+	t.Run("Should return the complete plan without internal remote URLs", func(t *testing.T) {
+		request := httptest.NewRequestWithContext(
+			t.Context(), http.MethodGet, "/workspaces/workspace-a/worktrees/wt-a/exit", http.NoBody,
+		)
+		response := httptest.NewRecorder()
+		router.ServeHTTP(response, request)
+		var payload contract.WorktreeExitPlanResponse
+		if err := json.Unmarshal(response.Body.Bytes(), &payload); err != nil {
+			t.Fatalf("decode exit plan: %v", err)
+		}
+		if response.Code != http.StatusOK || payload.WorktreeID != "wt-a" || payload.Primary != "commit_push" ||
+			len(payload.Actions) != 1 || payload.CommitScope.UntrackedTotal != 1 || payload.Forge == nil ||
+			payload.Forge.Provider != "github" || payload.PRPrefill == nil || payload.PRPrefill.Title != "feature/exit" ||
+			payload.PRPrefill.Body != "## Summary\nReady." || !payload.Cleanup.Safe ||
+			strings.Contains(response.Body.String(), "token@") {
+			t.Fatalf("exit plan status/body = %d/%s", response.Code, response.Body.String())
+		}
+	})
+
+	t.Run("Should serialize an empty untracked scope as an array", func(t *testing.T) {
+		t.Parallel()
+		payload := WorktreeExitPlanPayload(&worktree.ExitPlan{})
+		encoded, err := json.Marshal(payload)
+		if err != nil {
+			t.Fatalf("marshal exit plan: %v", err)
+		}
+		if !strings.Contains(string(encoded), `"untracked_files":[]`) {
+			t.Fatalf("empty exit plan = %s, want untracked_files array", encoded)
+		}
+	})
+
+	t.Run("Should return the effective complete scope for repeated include parameters", func(t *testing.T) {
+		request := httptest.NewRequestWithContext(
+			t.Context(),
+			http.MethodGet,
+			"/workspaces/workspace-a/worktrees/wt-a/exit?include=src%2Fchange.go&include=docs%2Fchange.md",
+			http.NoBody,
+		)
+		response := httptest.NewRecorder()
+		router.ServeHTTP(response, request)
+		var payload contract.WorktreeExitPlanResponse
+		if err := json.Unmarshal(response.Body.Bytes(), &payload); err != nil {
+			t.Fatal(err)
+		}
+		if response.Code != http.StatusOK || !payload.CommitScope.Complete ||
+			payload.CommitScope.Fingerprint != "reviewed" ||
+			len(payload.CommitScope.IncludePaths) != 2 {
+			t.Fatalf("scoped plan status/body=%d/%s", response.Code, response.Body.String())
+		}
+	})
+
+	t.Run("Should accept an action with snake-case options", func(t *testing.T) {
+		body := `{"action":"open_pr","message":"Commit","title":"Exit","body":"Ready","draft":true,"base":"trunk"}`
+		request := httptest.NewRequestWithContext(
+			t.Context(),
+			http.MethodPost, "/workspaces/workspace-a/worktrees/wt-a/exit/actions", strings.NewReader(body),
+		)
+		request.Header.Set("Content-Type", "application/json")
+		response := httptest.NewRecorder()
+		router.ServeHTTP(response, request)
+		if response.Code != http.StatusAccepted || response.Body.String() != `{"op_id":"op-exit"}` ||
+			runRequest.Action != worktree.ExitActionOpenPR || runRequest.Message != "Commit" ||
+			runRequest.Title != "Exit" || runRequest.Body != "Ready" || !runRequest.Draft || runRequest.Base != "trunk" {
+			t.Fatalf("action status/body/request = %d/%s/%#v", response.Code, response.Body.String(), runRequest)
+		}
+	})
+
+	t.Run("Should retain the reviewed selective scope at the action boundary", func(t *testing.T) {
+		request := httptest.NewRequestWithContext(
+			t.Context(),
+			http.MethodPost,
+			"/workspaces/workspace-a/worktrees/wt-a/exit/actions",
+			strings.NewReader(`{"action":"commit_push","include_paths":["src/change.go"],"expected_scope":"reviewed"}`),
+		)
+		request.Header.Set("Content-Type", "application/json")
+		response := httptest.NewRecorder()
+		router.ServeHTTP(response, request)
+		if response.Code != http.StatusAccepted || response.Body.String() != `{"op_id":"op-exit"}` ||
+			!reflect.DeepEqual(runRequest.IncludePaths, []string{"src/change.go"}) ||
+			runRequest.ExpectedScope != "reviewed" {
+			t.Fatalf("scope status/body/request=%d/%s/%#v", response.Code, response.Body.String(), runRequest)
+		}
+	})
+
+	t.Run("Should reject an unknown action before mutation", func(t *testing.T) {
+		before := runRequest
+		request := httptest.NewRequestWithContext(
+			t.Context(),
+			http.MethodPost, "/workspaces/workspace-a/worktrees/wt-a/exit/actions",
+			strings.NewReader(`{"action":"publish_everything"}`),
+		)
+		request.Header.Set("Content-Type", "application/json")
+		response := httptest.NewRecorder()
+		router.ServeHTTP(response, request)
+		if response.Code != http.StatusBadRequest || !reflect.DeepEqual(runRequest, before) {
+			t.Fatalf("invalid action status/request = %d/%#v", response.Code, runRequest)
+		}
+	})
+
+	t.Run("Should cancel the named operation", func(t *testing.T) {
+		request := httptest.NewRequestWithContext(
+			t.Context(),
+			http.MethodPost, "/workspaces/workspace-a/worktrees/wt-a/exit/cancel",
+			strings.NewReader(`{"op_id":" op-exit "}`),
+		)
+		request.Header.Set("Content-Type", "application/json")
+		response := httptest.NewRecorder()
+		router.ServeHTTP(response, request)
+		if response.Code != http.StatusNoContent || canceledOperation != "op-exit" {
+			t.Fatalf("cancel status/op = %d/%q", response.Code, canceledOperation)
+		}
+	})
+}
+
+func TestRemoveWorktreeRefusal(t *testing.T) {
+	t.Parallel()
+
+	t.Run("Should reject foreign and archived ownership before lifecycle mutation", func(t *testing.T) {
+		t.Parallel()
+		for _, tc := range []struct {
+			name, owner string
+			archived    bool
+			status      int
+		}{
+			{name: "Should reject another owner", owner: store.DefaultProfileID, status: http.StatusNotFound},
+			{name: "Should reject an archived owner", owner: "profile-marketing", archived: true, status: http.StatusForbidden},
+		} {
+			t.Run(tc.name, func(t *testing.T) {
+				t.Parallel()
+				state := profilepkg.StateActive
+				if tc.archived {
+					state = profilepkg.StateArchived
+				}
+				h := &BaseHandlers{
+					Profiles: worktreeProfileServiceStub{state: state},
+					Workspaces: workspaceServiceStub{
+						resolve: func(_ context.Context, ref string) (workspacepkg.ResolvedWorkspace, error) {
+							return workspacepkg.ResolvedWorkspace{
+								ID: "registry-alpha", Name: ref,
+								WorkspaceID: "registry-alpha",
+							}, nil
+						},
+					},
+					Worktrees: worktreeServiceStub{
+						resolve: func(_ context.Context, workspaceID, id string) (*worktree.Worktree, error) {
+							return &worktree.Worktree{ID: id, WorkspaceID: workspaceID, ProfileID: tc.owner}, nil
+						},
+					},
+				}
+				router := gin.New()
+				router.DELETE("/workspaces/:workspace_id/worktrees/:worktree_id", h.RemoveWorktree)
+				router.POST("/workspaces/:workspace_id/worktrees/:worktree_id/dismiss", h.DismissWorktree)
+				for _, route := range []struct{ method, suffix string }{{http.MethodDelete, ""}, {http.MethodPost, "/dismiss"}} {
+					response := httptest.NewRecorder()
+					request := httptest.NewRequestWithContext(t.Context(), route.method,
+						"/workspaces/registry-alpha/worktrees/wt-owned"+route.suffix+"?profile=marketing", http.NoBody)
+					router.ServeHTTP(response, request)
+					if response.Code != tc.status || !strings.Contains(response.Body.String(), "worktree") {
+						t.Fatalf("%s response = %d %s", route.method, response.Code, response.Body.String())
+					}
+				}
+			})
+		}
+	})
+
+	t.Run(
+		"Should preserve selector-free operator calls without bypassing agent or archived ownership",
+		func(t *testing.T) {
+			t.Parallel()
+			for _, tc := range []struct {
+				name   string
+				state  profilepkg.State
+				agent  bool
+				status int
+			}{
+				{name: "Should infer an active owner for legacy operators", state: profilepkg.StateActive, status: http.StatusNoContent},
+				{name: "Should refuse an archived owner without a selector", state: profilepkg.StateArchived, status: http.StatusForbidden},
+				{name: "Should authenticate agent credentials without a selector", state: profilepkg.StateActive, agent: true, status: http.StatusServiceUnavailable},
+			} {
+				t.Run(tc.name, func(t *testing.T) {
+					t.Parallel()
+					mutated := 0
+					mutation := func(_ context.Context, workspaceID, id string) error {
+						if workspaceID != "registry-alpha" || id != "wt-owned" {
+							t.Fatalf("retargeted mutation: %s/%s", workspaceID, id)
+						}
+						mutated++
+						return nil
+					}
+					h := &BaseHandlers{
+						Profiles: worktreeProfileServiceStub{state: tc.state},
+						Workspaces: workspaceServiceStub{
+							resolve: func(_ context.Context, ref string) (workspacepkg.ResolvedWorkspace, error) {
+								return workspacepkg.ResolvedWorkspace{
+									ID: "registry-alpha", Name: ref,
+									WorkspaceID: "registry-alpha",
+								}, nil
+							},
+						},
+						Worktrees: worktreeServiceStub{
+							resolve: func(_ context.Context, workspaceID, _ string) (*worktree.Worktree, error) {
+								return &worktree.Worktree{
+									ID:          "wt-owned",
+									WorkspaceID: workspaceID,
+									ProfileID:   "profile-marketing",
+								}, nil
+							},
+							remove: func(ctx context.Context, workspaceID, id string, force bool) (*worktree.RemovalRefusal, error) {
+								if force {
+									t.Fatal("unexpected force")
+								}
+								return nil, mutation(ctx, workspaceID, id)
+							},
+							dismiss: mutation,
+						},
+					}
+					router := gin.New()
+					router.DELETE("/workspaces/:workspace_id/worktrees/:worktree_id", h.RemoveWorktree)
+					router.POST("/workspaces/:workspace_id/worktrees/:worktree_id/dismiss", h.DismissWorktree)
+					for _, route := range []struct{ method, suffix string }{{http.MethodDelete, ""}, {http.MethodPost, "/dismiss"}} {
+						response := httptest.NewRecorder()
+						request := httptest.NewRequestWithContext(
+							t.Context(),
+							route.method,
+							"/workspaces/registry-alpha/worktrees/named-target"+route.suffix,
+							http.NoBody,
+						)
+						if tc.agent {
+							request.Header.Set("X-Compozy-Session-ID", "sess-unresolved")
+						}
+						router.ServeHTTP(response, request)
+						if response.Code != tc.status {
+							t.Fatalf("%s response = %d %s", route.method, response.Code, response.Body.String())
+						}
+					}
+					expected := 0
+					if tc.status == http.StatusNoContent {
+						expected = 2
+					}
+					if mutated != expected {
+						t.Fatalf("mutations = %d, want %d", mutated, expected)
+					}
+				})
+			}
+		},
+	)
+
+	t.Run("Should delete the local branch only after a successful opted-in cleanup", func(t *testing.T) {
+		t.Parallel()
+		for _, tc := range []struct {
+			name, method, suffix, query string
+			refuse, missingRoot         bool
+			branchErr                   error
+			wantStatus                  int
+			wantBody                    string
+			wantForce                   bool
+			wantDeletions               int
+		}{
+			{
+				name: "Should reach guarded removal when the parent root is missing", method: http.MethodDelete,
+				missingRoot: true, wantStatus: http.StatusNoContent,
+			},
+			{
+				name: "Should keep plain removal on 204", method: http.MethodDelete,
+				wantStatus: http.StatusNoContent,
+			},
+			{
+				name: "Should report the removal branch outcome", method: http.MethodDelete,
+				query: "?delete_branch=true&force=true", wantStatus: http.StatusOK, wantForce: true,
+				wantBody: `{"branch":{"name":"fix/a","deleted":true}}`,
+			},
+			{
+				name: "Should report a kept branch after dismissal", method: http.MethodPost, suffix: "/dismiss",
+				query: "?delete_branch=true", wantStatus: http.StatusOK,
+				wantBody: `{"branch":{"name":"fix/a","deleted":false,"reason":"not_fully_merged"}}`,
+			},
+			{
+				name: "Should not touch the branch when removal is refused", method: http.MethodDelete,
+				query: "?delete_branch=true", refuse: true, wantStatus: http.StatusConflict,
+			},
+			{
+				name: "Should report a failed branch step as kept without failing the cleanup", method: http.MethodDelete,
+				query: "?delete_branch=true", branchErr: worktree.ErrOperationInProgress, wantStatus: http.StatusOK,
+				wantBody: `{"branch":{"name":"fix/a","deleted":false,"reason":"delete_failed",` +
+					`"detail":"worktree_operation_in_progress"}}`,
+			},
+			{
+				name: "Should keep a branch precondition failure as an error", method: http.MethodDelete,
+				query: "?delete_branch=true", branchErr: worktree.ErrNotReady, wantStatus: http.StatusConflict,
+				wantDeletions: 1,
+			},
+		} {
+			t.Run(tc.name, func(t *testing.T) {
+				t.Parallel()
+				deletions := 0
+				h := &BaseHandlers{
+					Workspaces: workspaceServiceStub{
+						get: func(context.Context, string) (workspacepkg.Workspace, error) {
+							return workspacepkg.Workspace{ID: "registry-alpha"}, nil
+						},
+						resolve: func(_ context.Context, ref string) (workspacepkg.ResolvedWorkspace, error) {
+							if tc.missingRoot {
+								return workspacepkg.ResolvedWorkspace{}, workspacepkg.ErrWorkspaceRootMissing
+							}
+							return workspacepkg.ResolvedWorkspace{
+								ID: "registry-alpha", Name: ref, WorkspaceID: "registry-alpha",
+							}, nil
+						},
+					},
+					Worktrees: worktreeServiceStub{
+						resolve: func(_ context.Context, workspaceID, id string) (*worktree.Worktree, error) {
+							return &worktree.Worktree{
+								ID: id, WorkspaceID: workspaceID, ProfileID: store.DefaultProfileID,
+							}, nil
+						},
+						remove: func(context.Context, string, string, bool) (*worktree.RemovalRefusal, error) {
+							if tc.refuse {
+								return &worktree.RemovalRefusal{Code: worktree.ErrDirtyRequiresForce.Error()},
+									worktree.ErrDirtyRequiresForce
+							}
+							return nil, nil
+						},
+						dismiss: func(context.Context, string, string) error { return nil },
+						deleteBranch: func(
+							_ context.Context,
+							workspaceID, id string,
+							force bool,
+						) (worktree.BranchOutcome, error) {
+							deletions++
+							if workspaceID != "registry-alpha" || id != "wt-a" || force != tc.wantForce {
+								t.Fatalf("DeleteLocalBranch() args = %q, %q, %t", workspaceID, id, force)
+							}
+							if tc.branchErr != nil {
+								return worktree.BranchOutcome{Name: "fix/a"}, tc.branchErr
+							}
+							if tc.method == http.MethodPost {
+								return worktree.BranchOutcome{
+									Name: "fix/a", Reason: worktree.BranchKeptNotFullyMerged,
+								}, nil
+							}
+							return worktree.BranchOutcome{Name: "fix/a", Deleted: true}, nil
+						},
+					},
+				}
+				router := gin.New()
+				router.GET("/workspaces/:workspace_id/worktrees/:worktree_id", h.InspectWorktree)
+				if tc.missingRoot {
+					inspection := httptest.NewRecorder()
+					router.ServeHTTP(
+						inspection,
+						httptest.NewRequestWithContext(
+							t.Context(),
+							http.MethodGet,
+							"/workspaces/registry-alpha/worktrees/wt-a",
+							http.NoBody,
+						),
+					)
+					if inspection.Code != http.StatusOK ||
+						!strings.Contains(inspection.Body.String(), "workspace_root_missing") {
+						t.Fatalf("missing-root inspection = %d %s", inspection.Code, inspection.Body)
+					}
+				}
+
+				router.DELETE("/workspaces/:workspace_id/worktrees/:worktree_id", h.RemoveWorktree)
+				router.POST("/workspaces/:workspace_id/worktrees/:worktree_id/dismiss", h.DismissWorktree)
+				response := httptest.NewRecorder()
+				router.ServeHTTP(response, httptest.NewRequestWithContext(
+					t.Context(), tc.method, "/workspaces/registry-alpha/worktrees/wt-a"+tc.suffix+tc.query, http.NoBody,
+				))
+				if response.Code != tc.wantStatus {
+					t.Fatalf("status = %d, want %d; body=%s", response.Code, tc.wantStatus, response.Body.String())
+				}
+				if tc.wantBody != "" && response.Body.String() != tc.wantBody {
+					t.Fatalf("body = %s, want %s", response.Body.String(), tc.wantBody)
+				}
+				wantDeletions := tc.wantDeletions
+				if tc.wantBody != "" {
+					wantDeletions = 1
+				}
+				if deletions != wantDeletions {
+					t.Fatalf("branch deletions = %d, want %d", deletions, wantDeletions)
+				}
+			})
+		}
+	})
+
+	t.Run("Should return the exact risk inventory and reason with status 409", func(t *testing.T) {
+		t.Parallel()
+
+		testCases := []struct {
+			name    string
+			refusal worktree.RemovalRefusal
+			err     error
+			want    string
+		}{
+			{
+				name: "dirty",
+				refusal: worktree.RemovalRefusal{
+					Code: worktree.ErrDirtyRequiresForce.Error(),
+					Risk: worktree.RemovalRisk{ChangedFiles: 2, Insertions: 4, Deletions: 1, UnpushedCommits: 3},
+				},
+				err: worktree.ErrDirtyRequiresForce,
+				want: `{"code":"worktree_dirty_requires_force","error":"The worktree has uncommitted changes. ` +
+					`Force removal discards them.","risk":{"changed_files":2,"insertions":4,"deletions":1,` +
+					`"unpushed_commits":3,"exists_on_remote":false,"leftover_files":0},"downgrade":false}`,
+			},
+			{
+				name: "orphaned",
+				refusal: worktree.RemovalRefusal{
+					Code: worktree.ErrCheckoutOrphaned.Error(),
+					Risk: worktree.RemovalRisk{LeftoverFiles: 7, UnpushedCommits: 1},
+				},
+				err: worktree.ErrCheckoutOrphaned,
+				want: `{"code":"worktree_checkout_orphaned","error":"The checkout's Git metadata (.git) is ` +
+					`missing; the directory is left over from an interrupted removal. Force removal deletes ` +
+					`the leftover files and clears Git's entry.","risk":{"changed_files":0,"insertions":0,` +
+					`"deletions":0,"unpushed_commits":1,"exists_on_remote":false,"leftover_files":7},"downgrade":false}`,
+			},
+		}
+		for _, testCase := range testCases {
+			t.Run("Should answer the "+testCase.name+" refusal", func(t *testing.T) {
+				t.Parallel()
+				handlers := &BaseHandlers{
+					Workspaces: workspaceServiceStub{resolve: func(
+						_ context.Context,
+						ref string,
+					) (workspacepkg.ResolvedWorkspace, error) {
+						return workspacepkg.ResolvedWorkspace{
+							ID: "registry-a", Name: ref,
+							WorkspaceID: "workspace-a",
+						}, nil
+					}},
+					Worktrees: worktreeServiceStub{
+						resolve: func(_ context.Context, workspaceID, id string) (*worktree.Worktree, error) {
+							return &worktree.Worktree{
+								ID:          id,
+								WorkspaceID: workspaceID,
+								ProfileID:   store.DefaultProfileID,
+							}, nil
+						},
+						remove: func(
+							_ context.Context,
+							workspaceID string,
+							worktreeID string,
+							force bool,
+						) (*worktree.RemovalRefusal, error) {
+							if workspaceID != "registry-a" || worktreeID != "wt-a" || force {
+								t.Fatalf("Remove() args = %q, %q, %t", workspaceID, worktreeID, force)
+							}
+							refusal := testCase.refusal
+							return &refusal, testCase.err
+						},
+					},
+				}
+				router := gin.New()
+				router.DELETE("/workspaces/:workspace_id/worktrees/:worktree_id", handlers.RemoveWorktree)
+				request := httptest.NewRequestWithContext(
+					t.Context(),
+					http.MethodDelete,
+					"/workspaces/workspace-a/worktrees/wt-a",
+					http.NoBody,
+				)
+				response := httptest.NewRecorder()
+				router.ServeHTTP(response, request)
+
+				if response.Code != http.StatusConflict {
+					t.Fatalf(
+						"status = %d, want %d; body=%s",
+						response.Code,
+						http.StatusConflict,
+						response.Body.String(),
+					)
+				}
+				if got := response.Body.String(); got != testCase.want {
+					t.Fatalf("body = %s, want %s", got, testCase.want)
+				}
+			})
+		}
+	})
+
+	t.Run("Should log the cause behind a 500 removal failure", func(t *testing.T) {
+		t.Parallel()
+
+		var logs strings.Builder
+		handlers := &BaseHandlers{
+			Logger:             slog.New(slog.NewTextHandler(&logs, nil)),
+			MaskInternalErrors: true,
+			Workspaces: workspaceServiceStub{resolve: func(
+				_ context.Context,
+				ref string,
+			) (workspacepkg.ResolvedWorkspace, error) {
+				return workspacepkg.ResolvedWorkspace{ID: "registry-a", Name: ref, WorkspaceID: "workspace-a"}, nil
+			}},
+			Worktrees: worktreeServiceStub{
+				resolve: func(_ context.Context, workspaceID, id string) (*worktree.Worktree, error) {
+					return &worktree.Worktree{ID: id, WorkspaceID: workspaceID, ProfileID: store.DefaultProfileID}, nil
+				},
+				remove: func(context.Context, string, string, bool) (*worktree.RemovalRefusal, error) {
+					return nil, fmt.Errorf("%w: git exploded on checkout", worktree.ErrRemovalFailed)
+				},
+			},
+		}
+		router := gin.New()
+		router.DELETE("/workspaces/:workspace_id/worktrees/:worktree_id", handlers.RemoveWorktree)
+		request := httptest.NewRequestWithContext(
+			t.Context(), http.MethodDelete, "/workspaces/workspace-a/worktrees/wt-a", http.NoBody,
+		)
+		response := httptest.NewRecorder()
+		router.ServeHTTP(response, request)
+
+		if response.Code != http.StatusInternalServerError ||
+			strings.Contains(response.Body.String(), "git exploded") {
+			t.Fatalf("response = %d %s, want a masked 500", response.Code, response.Body.String())
+		}
+		if got := logs.String(); !strings.Contains(got, "api: request failed") ||
+			!strings.Contains(got, "git exploded on checkout") {
+			t.Fatalf("server log = %q, want the 500 cause", got)
+		}
+	})
+}
+
+func TestWorktreeStreams(t *testing.T) {
+	t.Parallel()
+
+	t.Run("Should preserve worktree attribution on upgraded catalog streams", func(t *testing.T) {
+		t.Parallel()
+		events := make(chan worktree.CatalogEvent, 1)
+		events <- worktree.CatalogEvent{Kind: worktree.CatalogEventUpserted, WorkspaceID: "registry-a", WorktreeID: "wt-a"}
+		handlers := NewBaseHandlers(&BaseHandlerConfig{Worktrees: worktreeServiceStub{catalogEvents: events}})
+		router := gin.New()
+		router.GET("/worktrees/catalog-stream", handlers.StreamWorktreeCatalog)
+		server := httptest.NewServer(router)
+		t.Cleanup(server.Close)
+		dialer := websocket.Dialer{HandshakeTimeout: time.Second}
+		connection, response, err := dialer.DialContext(t.Context(),
+			"ws"+strings.TrimPrefix(server.URL, "http")+"/worktrees/catalog-stream", nil)
+		if response != nil && response.Body != nil {
+			if closeErr := response.Body.Close(); closeErr != nil {
+				t.Errorf("close upgrade response: %v", closeErr)
+			}
+		}
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() {
+			if err := connection.Close(); err != nil {
+				t.Errorf("close catalog connection: %v", err)
+			}
+		})
+		if response.StatusCode != http.StatusSwitchingProtocols {
+			t.Fatalf("upgrade status = %d", response.StatusCode)
+		}
+		if err := connection.SetReadDeadline(time.Now().Add(time.Second)); err != nil {
+			t.Fatal(err)
+		}
+		for _, want := range []string{": worktree catalog stream ready\n\n", "event: worktree_catalog_changed\n"} {
+			kind, payload, err := connection.ReadMessage()
+			if err != nil || kind != websocket.TextMessage || !strings.Contains(string(payload), want) {
+				t.Fatalf("catalog frame = %d %q, error = %v", kind, payload, err)
+			}
+			if strings.Contains(want, "event:") && (!strings.Contains(string(payload), `"workspace_id":"registry-a"`) ||
+				!strings.Contains(string(payload), `"worktree_id":"wt-a"`)) {
+				t.Fatalf("worktree attribution missing: %s", payload)
+			}
+		}
+		ctx, cancel := context.WithTimeout(t.Context(), time.Second)
+		defer cancel()
+		if err := handlers.ShutdownEventStreams(ctx); err != nil {
+			t.Fatal(err)
+		}
+	})
+
+	t.Run("Should replay canonical worktree events by name in order after the requested sequence", func(t *testing.T) {
+		t.Parallel()
+
+		events := []store.EventSummary{
+			worktreeEventSummaryWithContent(
+				store.EventSummary{Sequence: 1, Type: worktree.EventCreated},
+				json.RawMessage(`{"state":"ready"}`),
+			),
+			worktreeEventSummaryWithContent(
+				store.EventSummary{Sequence: 2, Type: worktree.EventStatusRefreshed},
+				json.RawMessage(`{"dirty":true}`),
+			),
+			worktreeEventSummaryWithContent(
+				store.EventSummary{Sequence: 3, Type: worktree.EventRemoved},
+				json.RawMessage(`{"state":"removed"}`),
+			),
+		}
+		stream := func(afterSequence int64) string {
+			t.Helper()
+			requestContext, cancelRequest := context.WithCancel(t.Context())
+			observer := worktreeObserverStub{queryEvents: func(
+				_ context.Context,
+				query store.EventSummaryQuery,
+			) ([]store.EventSummary, error) {
+				if query.WorkspaceID != "registry-a" || query.WorktreeID != "wt-a" ||
+					!query.ReadScope.AllProfiles || query.ReadScope.ProfileID != "" ||
+					query.AfterSequence != afterSequence || query.Limit != worktreeReplayLimit {
+					t.Fatalf("worktree stream query = %#v", query)
+				}
+				result := make([]store.EventSummary, 0, len(events))
+				for _, event := range events {
+					if event.Sequence > query.AfterSequence {
+						result = append(result, event)
+					}
+				}
+				cancelRequest()
+				return result, nil
+			}}
+			handlers := &BaseHandlers{
+				PollInterval: time.Hour,
+				Observer:     observer,
+				Workspaces: workspaceServiceStub{resolve: func(
+					_ context.Context,
+					ref string,
+				) (workspacepkg.ResolvedWorkspace, error) {
+					return workspacepkg.ResolvedWorkspace{
+						ID: "registry-a", Name: ref,
+						WorkspaceID: "workspace-a",
+					}, nil
+				}},
+				Worktrees: worktreeServiceStub{inspect: func(
+					_ context.Context,
+					workspaceID string,
+					worktreeRef string,
+				) (*worktree.Inspection, error) {
+					if worktreeRef != "parity" {
+						t.Fatalf("Inspect() ref = %q, want name parity", worktreeRef)
+					}
+					return &worktree.Inspection{Worktree: worktree.Worktree{
+						ID: "wt-a", WorkspaceID: workspaceID,
+					}}, nil
+				}},
+			}
+			router := gin.New()
+			router.GET("/workspaces/:workspace_id/worktrees/:worktree_id/stream", handlers.StreamWorktree)
+			request := httptest.NewRequestWithContext(
+				requestContext,
+				http.MethodGet,
+				fmt.Sprintf("/workspaces/workspace-a/worktrees/parity/stream?after_sequence=%d", afterSequence),
+				http.NoBody,
+			)
+			response := httptest.NewRecorder()
+			router.ServeHTTP(response, request)
+			if response.Code != http.StatusOK {
+				t.Fatalf("stream status = %d, want %d; body=%s", response.Code, http.StatusOK, response.Body.String())
+			}
+			return response.Body.String()
+		}
+
+		initial := stream(0)
+		for sequence := int64(1); sequence <= 3; sequence++ {
+			if count := strings.Count(initial, fmt.Sprintf("id: %d\n", sequence)); count != 1 {
+				t.Fatalf("initial stream sequence %d count = %d; body=%s", sequence, count, initial)
+			}
+		}
+		if strings.Index(initial, "id: 1\n") >= strings.Index(initial, "id: 2\n") ||
+			strings.Index(initial, "id: 2\n") >= strings.Index(initial, "id: 3\n") {
+			t.Fatalf("initial stream order is not monotonic: %s", initial)
+		}
+
+		replayed := stream(1)
+		if strings.Contains(replayed, "id: 1\n") ||
+			strings.Count(replayed, "id: 2\n") != 1 ||
+			strings.Count(replayed, "id: 3\n") != 1 {
+			t.Fatalf("replayed stream has a gap or duplicate: %s", replayed)
+		}
+	})
+
+	t.Run("Should emit workspace-attributed catalog changes", func(t *testing.T) {
+		t.Parallel()
+
+		events := make(chan worktree.CatalogEvent, 1)
+		events <- worktree.CatalogEvent{
+			Kind: worktree.CatalogEventUpserted, WorkspaceID: "registry-a", WorktreeID: "wt-a",
+		}
+		close(events)
+		handlers := &BaseHandlers{Worktrees: worktreeServiceStub{catalogEvents: events}}
+		router := gin.New()
+		router.GET("/worktrees/catalog-stream", handlers.StreamWorktreeCatalog)
+		request := httptest.NewRequestWithContext(
+			t.Context(), http.MethodGet, "/worktrees/catalog-stream", http.NoBody,
+		)
+		response := httptest.NewRecorder()
+		router.ServeHTTP(response, request)
+
+		body := response.Body.String()
+		if response.Code != http.StatusOK ||
+			!strings.Contains(body, "event: worktree_catalog_changed\n") ||
+			!strings.Contains(body, `"workspace_id":"registry-a"`) ||
+			!strings.Contains(body, `"worktree_id":"wt-a"`) {
+			t.Fatalf("catalog stream status/body = %d/%s", response.Code, body)
+		}
+	})
+}
+
+// Invariant: delivery actor identity comes exclusively from daemon-validated
+// transport credentials, never a caller-selected JSON session. Owner: API boundary.
+func TestWorktreeManagedDeliveryCallerIdentity(t *testing.T) {
+	t.Parallel()
+	for _, test := range []struct {
+		name, headerSession, headerAgent, workspace string
+		state                                       session.State
+		want                                        int
+	}{
+		{"Should use validated caller despite a spoofed body", "managed-caller", "coder", "registry-a", session.StateActive, http.StatusAccepted},
+		{"Should reject body-only caller impersonation", "", "", "registry-a", session.StateActive, http.StatusUnauthorized},
+		{"Should reject mismatched agent credentials", "managed-caller", "other-agent", "registry-a", session.StateActive, http.StatusUnauthorized},
+		{"Should reject a caller from another workspace", "managed-caller", "coder", "registry-other", session.StateActive, http.StatusForbidden},
+		{"Should reject a stopped caller", "managed-caller", "coder", "registry-a", session.StateStopped, http.StatusUnauthorized},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+			calls := 0
+			handlers := &BaseHandlers{
+				TransportName: "uds",
+				Sessions: worktreeDeliveryIdentitySessions{
+					info: &session.Info{
+						ID:          "managed-caller",
+						ProfileID:   testWorktreeProfileIDForAPI,
+						AgentName:   "coder",
+						WorkspaceID: test.workspace,
+						WorktreeID:  "wt-a",
+						State:       test.state,
+					},
+				},
+				Workspaces: workspaceServiceStub{
+					resolve: func(context.Context, string) (workspacepkg.ResolvedWorkspace, error) {
+						return workspacepkg.ResolvedWorkspace{
+							ID:          "registry-a",
+							WorkspaceID: "workspace-a",
+						}, nil
+					},
+				},
+				Worktrees: worktreeManagedDeliveryStub{
+					submit: func(_ context.Context, workspace, ref, caller string, request worktree.ExitActionRequest) (string, error) {
+						calls++
+						if caller != "managed-caller" || workspace != "registry-a" || ref != "wt-a" ||
+							request.DeliveryID != "intent" ||
+							request.ExpectedHead != "reviewed-head" {
+							t.Fatalf("delivery admission=%q/%q/%q/%#v", workspace, ref, caller, request)
+						}
+						return "managed-op", nil
+					},
+				},
+			}
+			router := gin.New()
+			router.POST("/workspaces/:workspace_id/worktrees/:worktree_id/exit/actions", handlers.RunWorktreeExitAction)
+			request := httptest.NewRequestWithContext(
+				t.Context(),
+				http.MethodPost,
+				"/workspaces/workspace-a/worktrees/wt-a/exit/actions",
+				strings.NewReader(
+					`{"action":"deliver","delivery_id":"intent","expected_head":"reviewed-head","session_id":"spoofed-caller"}`,
+				),
+			)
+			request.Header.Set("Content-Type", "application/json")
+			request.Header.Set(agentidentity.HeaderSessionID, test.headerSession)
+			request.Header.Set(agentidentity.HeaderAgent, test.headerAgent)
+			recorder := httptest.NewRecorder()
+			router.ServeHTTP(recorder, request)
+			if recorder.Code != test.want {
+				t.Fatalf("delivery status=%d body=%s want=%d", recorder.Code, recorder.Body.String(), test.want)
+			}
+			if test.want == http.StatusAccepted {
+				var payload contract.WorktreeExitOperationResponse
+				if err := json.Unmarshal(recorder.Body.Bytes(), &payload); err != nil {
+					t.Fatal(err)
+				}
+				if payload.OperationID != "managed-op" || calls != 1 {
+					t.Fatalf("payload=%#v calls=%d", payload, calls)
+				}
+			} else if calls != 0 {
+				t.Fatal("unauthorized caller reached delivery service")
+			}
+		})
+	}
+}
+
+const testWorktreeProfileIDForAPI = "00000000000000000000000000"
+
+type worktreeDeliveryIdentitySessions struct {
+	SessionManager
+	info *session.Info
+}
+
+func (s worktreeDeliveryIdentitySessions) Status(context.Context, string) (*session.Info, error) {
+	return s.info, nil
+}
+
+type worktreeManagedDeliveryStub struct {
+	worktreeServiceStub
+	submit func(context.Context, string, string, string, worktree.ExitActionRequest) (string, error)
+}
+
+func (s worktreeManagedDeliveryStub) SubmitManagedDelivery(
+	ctx context.Context,
+	workspace, ref, caller string,
+	request worktree.ExitActionRequest,
+) (string, error) {
+	return s.submit(ctx, workspace, ref, caller, request)
+}
+
+func (s worktreeProfileServiceStub) ListIdentities(ctx context.Context) ([]profilepkg.Profile, error) {
+	items, err := s.List(ctx)
+	if err != nil {
+		return nil, err
+	}
+	profiles := make([]profilepkg.Profile, 0, len(items))
+	for _, item := range items {
+		profiles = append(profiles, item.Profile)
+	}
+	return profiles, nil
+}
+
+// Invariant: the binding HTTP boundary preserves identity, strict input, and
+// conflict semantics. Owner: shared API handlers; canonical worktree suite.
+func TestChangeSessionWorktreeBinding(t *testing.T) {
+	t.Parallel()
+	for _, tc := range []struct {
+		name, method, query, body, target, expected, code string
+		cause                                             error
+		status                                            int
+		called                                            bool
+	}{
+		{name: "bind", method: http.MethodPut, body: `{"worktree":"wt-ready","expected_worktree_id":""}`, target: "wt-ready", status: 200, called: true},
+		{name: "unbind", method: http.MethodDelete, query: "?expected_worktree_id=wt-old", expected: "wt-old", status: 200, called: true},
+		{name: "stale binding", method: http.MethodPut, body: `{"worktree":"wt-ready","expected_worktree_id":"wt-old"}`, target: "wt-ready", expected: "wt-old", cause: store.ErrSessionWorktreeConflict, code: "session_worktree_conflict", status: 409, called: true},
+		{name: "busy", method: http.MethodPut, body: `{"worktree":"wt-ready","expected_worktree_id":""}`, target: "wt-ready", cause: session.ErrPromptInProgress, code: "session_busy", status: 409, called: true},
+		{name: "unknown field", method: http.MethodPut, body: `{"worktree":"wt-ready","fork":true}`, status: 400},
+		{name: "empty target", method: http.MethodPut, body: `{"worktree":" "}`, status: 400},
+		{name: "repeated fence", method: http.MethodDelete, query: "?expected_worktree_id=a&expected_worktree_id=b", status: 400},
+	} {
+		t.Run("Should handle "+tc.name, func(t *testing.T) {
+			t.Parallel()
+			called := false
+			manager := worktreeBindingSessions{
+				status: func(context.Context, string) (*session.Info, error) {
+					return &session.Info{
+						ID:          "sess-same",
+						WorkspaceID: "ws-a",
+						ProfileID:   store.DefaultProfileID,
+						State:       session.StateActive,
+					}, nil
+				},
+				change: func(_ context.Context, id, ref string, expected *string) (*session.Info, error) {
+					called = true
+					if id != "sess-same" || ref != tc.target || expected == nil || *expected != tc.expected {
+						t.Fatalf("mutation=(%q,%q,%v)", id, ref, expected)
+					}
+					return &session.Info{
+						ID:          id,
+						WorkspaceID: "ws-a",
+						ProfileID:   store.DefaultProfileID,
+						WorktreeID:  ref,
+						State:       session.StateActive,
+					}, tc.cause
+				},
+			}
+			h := &BaseHandlers{
+				Sessions: manager,
+				Workspaces: workspaceServiceStub{
+					resolve: func(context.Context, string) (workspacepkg.ResolvedWorkspace, error) {
+						return workspacepkg.ResolvedWorkspace{ID: "ws-a", WorkspaceID: "workspace-a"}, nil
+					},
+				},
+			}
+			router := gin.New()
+			route := "/workspaces/:workspace_id/sessions/:session_id/worktree"
+			router.PUT(route, h.BindSessionWorktree)
+			router.DELETE(route, h.UnbindSessionWorktree)
+			request := httptest.NewRequestWithContext(
+				t.Context(),
+				tc.method,
+				"/workspaces/workspace-a/sessions/sess-same/worktree"+tc.query,
+				strings.NewReader(tc.body),
+			)
+			request.Header.Set("Content-Type", "application/json")
+			response := httptest.NewRecorder()
+			router.ServeHTTP(response, request)
+			if response.Code != tc.status || called != tc.called {
+				t.Fatalf("status=%d called=%v body=%s", response.Code, called, response.Body.String())
+			}
+			if tc.code != "" {
+				var failure contract.ErrorPayload
+				if err := json.Unmarshal(response.Body.Bytes(), &failure); err != nil || failure.Code != tc.code {
+					t.Fatalf("error code=%q err=%v want %q", failure.Code, err, tc.code)
+				}
+			}
+			if tc.status == http.StatusOK {
+				var payload contract.SessionResponse
+				if err := json.Unmarshal(response.Body.Bytes(), &payload); err != nil {
+					t.Fatal(err)
+				}
+				if payload.Session.ID != "sess-same" || payload.Session.WorktreeID != tc.target {
+					t.Fatalf("response=%#v", payload)
+				}
+			}
+		})
+	}
+}
+
+type worktreeBindingSessions struct {
+	sessionManagerStub
+	change func(context.Context, string, string, *string) (*session.Info, error)
+}
+
+func (s worktreeBindingSessions) ChangeWorktreeBinding(
+	ctx context.Context,
+	id, ref string,
+	expected *string,
+) (*session.Info, error) {
+	return s.change(ctx, id, ref, expected)
+}

@@ -1,0 +1,127 @@
+package builtin
+
+const loopStatusOutputSchema = `{
+	"type":"object",
+	"required":["run","materialized_contract","effective_config","node_controls","waits","requests","amendments"],
+	"properties":{
+		"run":{
+			"type":"object",
+			"required":["id","completion_state"],
+			"properties":{
+				"id":{"type":"string","minLength":1},
+				"completion_state":{"type":"string","enum":["complete","partial"]},
+				"best_generation":{"type":"integer","minimum":1},
+				"best_score":{"type":"number"}
+			},
+			"additionalProperties":true
+		},
+		"executed_definition":{"type":"object"},
+		"materialized_contract":{"type":"object"},
+		"effective_config":{
+			"type":"object",
+			"properties":{
+				"sources":{"type":"object","additionalProperties":{"type":"string"}}
+			},
+			"additionalProperties":true
+		},
+		"generations":{
+			"type":"array",
+			"items":{
+				"type":"object",
+			"required":["generation","parent_generation","origin","route_causes","verdicts","outputs"],
+				"properties":{
+					"generation":{"type":"integer","minimum":1},
+					"parent_generation":{"type":"integer","minimum":0},
+					"origin":{
+						"type":"string",
+						"enum":[
+							"initial","stop_when","reattempt","gate_revise",
+							"gate_next_generation","dod_retry","ratchet_restore","requeue"
+						]
+					},
+					"route_causes":{"type":"array","items":{
+						"type":"object",
+						"required":["node_id","item_index","route","cause","at"],
+						"properties":{
+							"node_id":{"type":"string","minLength":1},
+							"item_index":{"type":"integer","minimum":0},
+							"route":{"type":"string","minLength":1},
+							"cause":{"type":"string","minLength":1},
+							"matched_when":{"type":"string"},
+							"default":{"type":"boolean"},
+							"at":{"type":"string","format":"date-time"}
+						},
+						"additionalProperties":false
+					}},
+					"verdicts":{
+						"type":"array",
+						"items":{
+							"type":"object",
+							"required":["gate_id","outcome"],
+							"properties":{
+								"gate_id":{"type":"string","minLength":1},
+								"outcome":{
+									"type":"string",
+									"enum":[
+										"approved","rejected","awaiting_approval","blocked",
+										"error","timeout","invalid_output"
+									]
+								},
+								"score":{"type":"number"},
+								"route_cause_rank":{"type":"integer","minimum":0},
+								"blocking_issues":{"type":"array","items":{"type":"object"}},
+								"criteria":{"type":"array","items":{"type":"object"}}
+							},
+							"additionalProperties":false
+						}
+					},
+					"outputs":{"type":"array","items":` + loopGenerationOutputSchema + `}
+				},
+				"additionalProperties":false
+			}
+		},
+		"node_controls":{"type":"array","items":{"type":"object","additionalProperties":true}},
+		"waits":{"type":"array","items":{"type":"object","additionalProperties":true}},
+		"requests":{"type":"array","items":` + loopRequestPayloadSchema + `},
+		"amendments":{"type":"array","items":` + loopAmendmentPayloadSchema + `},
+		"watch_events":{"type":"object"}
+	},
+	"additionalProperties":false
+}`
+
+const loopRunsOutputSchema = `{
+	"type":"object",
+	"required":["runs","aggregates"],
+	"properties":{
+		"runs":{
+			"type":"array",
+			"items":{
+				"type":"object",
+				"not":{"required":["generations"]},
+				"required":["id","completion_state"],
+				"properties":{
+					"id":{"type":"string","minLength":1},
+					"completion_state":{"type":"string","enum":["complete","partial"]},
+					"best_generation":{"type":"integer","minimum":1},
+					"best_score":{"type":"number"}
+				},
+				"additionalProperties":true
+			}
+		},
+		"aggregates":{
+			"type":"object",
+			"required":["total","live","terminal","succeeded","failed"],
+			"properties":{
+				"total":{"type":"integer","minimum":0},
+				"live":{"type":"integer","minimum":0},
+				"terminal":{"type":"integer","minimum":0},
+				"succeeded":{"type":"integer","minimum":0},
+				"failed":{"type":"integer","minimum":0}
+			},
+			"additionalProperties":false
+		},
+		"next_cursor":{"type":"string","description":"Opaque continuation cursor for the next page; ` +
+	`omitted when no further page exists."}
+	},
+	"additionalProperties":false
+}`

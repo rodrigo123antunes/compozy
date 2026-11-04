@@ -1,0 +1,255 @@
+package daemon
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"maps"
+	"slices"
+	"strings"
+	"time"
+
+	core "github.com/compozy/compozy/internal/api/core"
+	extensionpkg "github.com/compozy/compozy/internal/extension"
+	toolspkg "github.com/compozy/compozy/internal/tools"
+	builtintools "github.com/compozy/compozy/internal/tools/builtin"
+	"github.com/compozy/compozy/internal/workspaceaccess"
+)
+
+const (
+	daemonBlockKey          = "block"
+	daemonTimeoutKey        = "timeout"
+	nativeToolsClaimedKey   = "claimed"
+	nativeToolsEventsKey    = "events"
+	nativeToolsHealthKey    = "health"
+	nativeToolsHistoryKey   = "history"
+	nativeToolsLeaseKey     = "lease"
+	nativeToolsLogsKey      = "logs"
+	nativeToolsNoteKey      = "note"
+	nativeToolsProvidersKey = "providers"
+	nativeToolsRedactedKey  = "redacted"
+	nativeToolsRunsKey      = "runs"
+	nativeToolsScopeKey     = "scope"
+	nativeToolsSessionKey   = "session"
+	nativeToolsSessionsKey  = "sessions"
+	nativeToolsSkillsKey    = "skills"
+	nativeToolsTaskKey      = "task"
+	nativeToolsTextKey      = "text"
+	nativeToolsWorkspaceKey = "workspace"
+	nativeToolsAgentsKey    = "agents"
+	nativeToolsArgsKey      = "args"
+	nativeToolsContentKey   = "content"
+)
+
+type daemonNativeTools struct {
+	deps *daemonNativeToolsDeps
+	// goalAvailability is nil when no projection epoch is wired, which keeps Goal availability live.
+	goalAvailability *nativeGoalAvailabilityCache
+}
+
+type nativeToolBinding struct {
+	call         toolspkg.NativeToolFunc
+	availability toolspkg.NativeAvailabilityFunc
+}
+
+const defaultNativeWakeEventLimit = 10
+
+func newDaemonNativeProvider(deps *daemonNativeToolsDeps) (toolspkg.Provider, error) {
+	if deps == nil {
+		return nil, errors.New("daemon: native tool dependencies are required")
+	}
+	adapter := &daemonNativeTools{
+		deps:             deps,
+		goalAvailability: newNativeGoalAvailabilityCache(deps.ProjectionEpoch, nil),
+	}
+	bindings := adapter.bindings()
+	descriptors := builtintools.NativeDescriptors()
+	if err := validateNativeToolBindings(descriptors, bindings); err != nil {
+		return nil, err
+	}
+	nativeTools := make([]toolspkg.NativeTool, 0, len(descriptors))
+	for _, descriptor := range descriptors {
+		binding := bindings[descriptor.ID]
+		if binding.call != nil {
+			call := binding.call
+			binding.call = func(
+				ctx context.Context,
+				scope toolspkg.Scope,
+				req toolspkg.CallRequest,
+			) (result toolspkg.ToolResult, callErr error) {
+				defer func() { callErr = core.NativeToolError(req.ToolID, callErr) }()
+				effectiveScope, err := adapter.nativeEffectiveScope(ctx, scope)
+				if err != nil {
+					return toolspkg.ToolResult{}, err
+				}
+				origin := workspaceaccess.Origin{}
+				if effectiveScope.Operator {
+					origin.Kind = workspaceaccess.ActorHuman
+				}
+				if effectiveScope.SessionID != "" {
+					info, err := adapter.deps.Sessions.Status(ctx, effectiveScope.SessionID)
+					if err != nil {
+						return toolspkg.ToolResult{}, err
+					}
+					origin = workspaceaccess.Origin{
+						Kind:    workspaceaccess.ActorAgentSession,
+						ID:      info.ID,
+						Ceiling: info.EffectiveWorkspaceAccess,
+					}
+				}
+				effectiveScope, req, err = adapter.nativeProfileSelection(ctx, effectiveScope, req, descriptor)
+				if err != nil {
+					return toolspkg.ToolResult{}, err
+				}
+				return call(workspaceaccess.WithOrigin(ctx, origin), effectiveScope, req)
+			}
+		}
+		nativeTools = append(nativeTools, toolspkg.NativeTool{
+			Descriptor:   descriptor,
+			Call:         binding.call,
+			Availability: binding.availability,
+		})
+	}
+	return toolspkg.NewNativeProvider(builtintools.Source(), nativeTools...)
+}
+
+func (n *daemonNativeTools) nativeEffectiveScope(
+	ctx context.Context,
+	scope toolspkg.Scope,
+) (toolspkg.Scope, error) {
+	profileID, _, workspaceID, err := n.nativeCurrentProfileIdentity(ctx, scope)
+	if err != nil {
+		return toolspkg.Scope{}, err
+	}
+	scope.ProfileID = strings.TrimSpace(profileID)
+	if strings.TrimSpace(scope.WorkspaceID) == "" {
+		scope.WorkspaceID = strings.TrimSpace(workspaceID)
+	}
+	return scope, nil
+}
+
+func validateNativeToolBindings(
+	descriptors []toolspkg.Descriptor,
+	bindings map[toolspkg.ToolID]nativeToolBinding,
+) error {
+	descriptorIDs := make(map[toolspkg.ToolID]struct{}, len(descriptors))
+	duplicateDescriptors := make([]toolspkg.ToolID, 0)
+	missing := make([]toolspkg.ToolID, 0)
+	nilCalls := make([]toolspkg.ToolID, 0)
+	nilAvailability := make([]toolspkg.ToolID, 0)
+	for _, descriptor := range descriptors {
+		if _, exists := descriptorIDs[descriptor.ID]; exists {
+			duplicateDescriptors = append(duplicateDescriptors, descriptor.ID)
+		}
+		descriptorIDs[descriptor.ID] = struct{}{}
+		binding, ok := bindings[descriptor.ID]
+		if !ok {
+			missing = append(missing, descriptor.ID)
+			continue
+		}
+		if binding.call == nil {
+			nilCalls = append(nilCalls, descriptor.ID)
+		}
+		if binding.availability == nil {
+			nilAvailability = append(nilAvailability, descriptor.ID)
+		}
+	}
+	extra := make([]toolspkg.ToolID, 0)
+	for id := range bindings {
+		if _, ok := descriptorIDs[id]; !ok {
+			extra = append(extra, id)
+		}
+	}
+	slices.Sort(duplicateDescriptors)
+	slices.Sort(missing)
+	slices.Sort(extra)
+	slices.Sort(nilCalls)
+	slices.Sort(nilAvailability)
+	if len(duplicateDescriptors) > 0 ||
+		len(missing) > 0 ||
+		len(extra) > 0 ||
+		len(nilCalls) > 0 ||
+		len(nilAvailability) > 0 {
+		return fmt.Errorf(
+			"daemon: invalid native tool bindings: duplicate_descriptors=%v missing=%v extra=%v "+
+				"nil_calls=%v nil_availability=%v",
+			duplicateDescriptors,
+			missing,
+			extra,
+			nilCalls,
+			nilAvailability,
+		)
+	}
+	return nil
+}
+
+func appendToolEventSinkOption(
+	lifetime context.Context,
+	options []toolspkg.RegistryOption,
+	registry extensionLifecycleEventWriter,
+	now func() time.Time,
+	profileForSession func(context.Context, string) (string, error),
+) []toolspkg.RegistryOption {
+	writer := extensionEventSummaryStore(registry)
+	if writer == nil {
+		return options
+	}
+	return append(options, toolspkg.WithToolEventSink(&daemonToolEventSink{
+		writer: writer, lifetime: lifetime, now: now, profileForSession: profileForSession,
+	}))
+}
+
+func newDaemonExtensionToolProvider(state *bootState) (toolspkg.Provider, error) {
+	if state == nil || state.registry == nil {
+		return nil, nil
+	}
+	dbSource, ok := state.registry.(extensionDBSource)
+	if !ok || dbSource.DB() == nil {
+		return nil, nil
+	}
+	provider, err := extensionpkg.NewExtensionToolProvider(
+		extensionpkg.NewRegistry(dbSource.DB(), extensionpkg.WithRegistryReadDB(dbSource.ReadDB())),
+		func() extensionpkg.ExtensionToolRuntime {
+			runtime := state.currentExtensionRuntime()
+			if runtime == nil {
+				return nil
+			}
+			toolRuntime, ok := runtime.(extensionpkg.ExtensionToolRuntime)
+			if !ok {
+				return nil
+			}
+			return toolRuntime
+		},
+		extensionpkg.WithToolProviderLogger(state.logger),
+		extensionpkg.WithToolProviderProfileNameResolver(state.profiles),
+	)
+	if err != nil {
+		return nil, err
+	}
+	return newDaemonScopedExtensionToolProvider(provider, state.workspaceResolver), nil
+}
+
+func (n *daemonNativeTools) loopService() core.LoopService {
+	if n == nil || n.deps == nil || n.deps.Loops == nil {
+		return nil
+	}
+	return n.deps.Loops()
+}
+
+func extensionRegistryDependency(registry Registry) *extensionpkg.Registry {
+	if registry == nil {
+		return nil
+	}
+	dbSource, ok := registry.(extensionDBSource)
+	if !ok || dbSource.DB() == nil {
+		return nil
+	}
+	return extensionpkg.NewRegistry(dbSource.DB(), extensionpkg.WithRegistryReadDB(dbSource.ReadDB()))
+}
+
+func addNativeToolBindings(
+	dst map[toolspkg.ToolID]nativeToolBinding,
+	src map[toolspkg.ToolID]nativeToolBinding,
+) {
+	maps.Copy(dst, src)
+}

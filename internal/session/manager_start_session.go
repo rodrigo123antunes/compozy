@@ -1,0 +1,59 @@
+package session
+
+import (
+	"strings"
+	"time"
+
+	"github.com/compozy/compozy/internal/acp"
+	compozyconfig "github.com/compozy/compozy/internal/config"
+	"github.com/compozy/compozy/internal/store"
+)
+
+// newStartingSession retains routing in memory so later configuration edits cannot redirect children.
+func (s *sessionStartSpec) newStartingSession(
+	resolved compozyconfig.ResolvedAgent,
+	agentDef compozyconfig.AgentDef,
+	storage sessionStartStorage,
+	now time.Time,
+) *Session {
+	createdAt := s.createdAt
+	if createdAt.IsZero() {
+		createdAt = now
+	}
+
+	return &Session{
+		InitiatorKind: s.initiatorKind, InitiatorID: s.initiatorID,
+		EffectiveWorkspaceAccess: s.effectiveWorkspaceAccess,
+		EffectiveSessionApproval: s.effectiveSessionApproval,
+		PermissionRules:          append([]store.SessionPermissionRule(nil), s.permissionRules...),
+		ID:                       s.sessionID, ProfileID: s.profileID, Name: s.sessionName, AgentName: resolved.Name,
+		Provider: strings.TrimSpace(resolved.Provider), Model: strings.TrimSpace(resolved.Model),
+		ReasoningEffort: strings.TrimSpace(s.reasoningEffort), Speed: s.speed,
+		ACPOptions: acp.CloneSessionConfigOptionSelections(s.acpOptions), WorkspaceID: s.workspace.ID,
+		RuntimeStatus:             RuntimeStatusBinding,
+		SelectedRuntime:           cloneRuntimeSelection(s.selectedRuntime),
+		RuntimeSelectionRevision:  s.runtimeSelectionRevision,
+		effectiveProviderAuthMode: resolved.AuthMode,
+		providerHomePolicy:        resolved.HomePolicy,
+		Workspace:                 s.workspace.RootDir, WorktreeID: s.worktreeID, CWD: s.cwd,
+		Type:    normalizeSessionType(s.sessionType),
+		Lineage: store.CloneSessionLineage(s.lineage), State: StateStarting,
+		stopReason: s.stopReason, stopDetail: s.stopDetail, failure: store.CloneSessionFailure(s.failure),
+		ACPSessionID:        s.acpSessionID,
+		acceptedRoute:       store.CloneSessionAcceptedRoute(s.acceptedRoute),
+		restartBoundary:     store.CloneSessionRestartCheckpoint(s.restartBoundary),
+		derivation:          store.CloneSessionDerivation(s.derivation),
+		importedContext:     store.CloneSessionImportedContext(s.importedContext),
+		pendingResumeReplay: s.resumeReplayBlock,
+		worktreeTransition:  store.CloneSessionWorktreeTransition(s.worktreeTransition),
+		acceptedCommand:     s.command,
+		SoulSnapshotID:      s.soulSnapshotID, SoulDigest: s.soulDigest, ParentSoulDigest: s.parentSoulDigest,
+		AdvertisedCommands: store.CloneSessionAdvertisedCommands(s.advertisedCommands),
+		CreatedAt:          createdAt, UpdatedAt: now, creationProfile: cloneCreationProfile(s.creationProfile),
+		creationOptions:  cloneCreationOptions(s.creationOptions),
+		creationIdentity: cloneCreationIdentity(s.creationIdentity), sessionDir: storage.sessionDir,
+		metaPath: storage.metaPath, dbPath: storage.dbPath, recorder: storage.recorder,
+		providerRoute: resolved,
+		agentDef:      compozyconfig.CloneAgentDef(agentDef),
+	}
+}

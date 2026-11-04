@@ -1,0 +1,242 @@
+package daemon
+
+import (
+	"context"
+
+	"fmt"
+	"strings"
+
+	compozyconfig "github.com/compozy/compozy/internal/config"
+
+	toolspkg "github.com/compozy/compozy/internal/tools"
+)
+
+const (
+	nativeConfigHookToolsDeclarationsKey  = "declarations"
+	nativeConfigHookToolsDeletedKey       = "deleted"
+	nativeConfigHookToolsDiffKey          = "diff"
+	nativeConfigHookToolsEventsKey        = "events"
+	nativeAppliedValue                    = "applied"
+	nativeConfigHookToolsHookKey          = "hook"
+	nativeConfigHookToolsLifecycleKey     = "lifecycle"
+	nativeConfigHookToolsHooksKey         = "hooks"
+	nativeConfigHookToolsNameKey          = "name"
+	nativeConfigHookToolsNextActionKey    = "next_action"
+	nativeConfigHookToolsPathKey          = "path"
+	nativeConfigHookToolsRedactedKey      = "redacted"
+	nativeConfigHookToolsRunsKey          = "runs"
+	nativeConfigHookToolsScopeKey         = "scope"
+	nativeConfigHookToolsTargetKey        = "target"
+	nativeConfigHookToolsTokenKey         = "token"
+	nativeConfigHookToolsValueKey         = "value"
+	nativeConfigHookToolsWorkspaceRootKey = "workspace_root"
+)
+
+const (
+	hookActionDisabled = "disabled"
+	hookActionEnabled  = "enabled"
+	hookEnabledKey     = "enabled"
+)
+
+func (n *daemonNativeTools) configShow(
+	ctx context.Context,
+	_ toolspkg.Scope,
+	req toolspkg.CallRequest,
+) (toolspkg.ToolResult, error) {
+	var input configReadInput
+	if err := decodeNativeInput(req, &input); err != nil {
+		return toolspkg.ToolResult{}, err
+	}
+	workspaceRoot, err := n.nativeWorkspaceRoot(ctx, req.ToolID, input.WorkspaceRoot)
+	if err != nil {
+		return toolspkg.ToolResult{}, err
+	}
+	cfg, workspaceRoot, err := n.loadNativeConfig(workspaceRoot)
+	if err != nil {
+		return toolspkg.ToolResult{}, nativeConfigValidationError(req.ToolID, err)
+	}
+	configMap := compozyconfig.RedactedConfigMap(&cfg)
+	return structuredResult(map[string]any{
+		nativeConfigHookToolsScopeKey:         nativeScopeForWorkspace(workspaceRoot),
+		nativeConfigHookToolsWorkspaceRootKey: workspaceRoot,
+		nativeConfigHookToolsRedactedKey:      true,
+		"config":                              configMap,
+	}, "config")
+}
+
+func (n *daemonNativeTools) configList(
+	ctx context.Context,
+	_ toolspkg.Scope,
+	req toolspkg.CallRequest,
+) (toolspkg.ToolResult, error) {
+	var input configReadInput
+	if err := decodeNativeInput(req, &input); err != nil {
+		return toolspkg.ToolResult{}, err
+	}
+	workspaceRoot, err := n.nativeWorkspaceRoot(ctx, req.ToolID, input.WorkspaceRoot)
+	if err != nil {
+		return toolspkg.ToolResult{}, err
+	}
+	cfg, workspaceRoot, err := n.loadNativeConfig(workspaceRoot)
+	if err != nil {
+		return toolspkg.ToolResult{}, nativeConfigValidationError(req.ToolID, err)
+	}
+	entries := compozyconfig.FlattenConfigEntries(compozyconfig.RedactedConfigMap(&cfg))
+	return structuredResult(map[string]any{
+		nativeConfigHookToolsScopeKey:         nativeScopeForWorkspace(workspaceRoot),
+		nativeConfigHookToolsWorkspaceRootKey: workspaceRoot,
+		nativeConfigHookToolsRedactedKey:      true,
+		"entries":                             entries,
+	}, fmt.Sprintf("%d config entries", len(entries)))
+}
+
+func (n *daemonNativeTools) configGet(
+	ctx context.Context,
+	_ toolspkg.Scope,
+	req toolspkg.CallRequest,
+) (toolspkg.ToolResult, error) {
+	var input configGetInput
+	if err := decodeNativeInput(req, &input); err != nil {
+		return toolspkg.ToolResult{}, err
+	}
+	workspaceRoot, err := n.nativeWorkspaceRoot(ctx, req.ToolID, input.WorkspaceRoot)
+	if err != nil {
+		return toolspkg.ToolResult{}, err
+	}
+	cfg, workspaceRoot, err := n.loadNativeConfig(workspaceRoot)
+	if err != nil {
+		return toolspkg.ToolResult{}, nativeConfigValidationError(req.ToolID, err)
+	}
+	entries := compozyconfig.FlattenConfigEntries(compozyconfig.RedactedConfigMap(&cfg))
+	path, deprecated := compozyconfig.CanonicalDottedConfigPath(input.Path)
+	if deprecated {
+		compozyconfig.LogConfigPathAlias(strings.Split(path, "."))
+	}
+	entry, ok := compozyconfig.EntryByPath(entries, path)
+	if !ok {
+		return toolspkg.ToolResult{}, toolspkg.NewToolError(
+			toolspkg.ErrorCodeNotFound,
+			req.ToolID,
+			fmt.Sprintf("config path %q not found", strings.TrimSpace(input.Path)),
+			toolspkg.ErrToolNotFound,
+			toolspkg.ReasonConfigPathNotFound,
+		)
+	}
+	return structuredResult(map[string]any{
+		nativeConfigHookToolsScopeKey:         nativeScopeForWorkspace(workspaceRoot),
+		nativeConfigHookToolsWorkspaceRootKey: workspaceRoot,
+		"entry":                               entry,
+	}, entry.Path)
+}
+
+func (n *daemonNativeTools) configDiff(
+	ctx context.Context,
+	_ toolspkg.Scope,
+	req toolspkg.CallRequest,
+) (toolspkg.ToolResult, error) {
+	var input configReadInput
+	if err := decodeNativeInput(req, &input); err != nil {
+		return toolspkg.ToolResult{}, err
+	}
+	workspaceRoot, err := n.nativeWorkspaceRoot(ctx, req.ToolID, input.WorkspaceRoot)
+	if err != nil {
+		return toolspkg.ToolResult{}, err
+	}
+	workspaceRoot, err = nativeOptionalWorkspaceRoot(workspaceRoot)
+	if err != nil {
+		return toolspkg.ToolResult{}, nativeConfigScopeError(req.ToolID, err)
+	}
+	var beforeCfg compozyconfig.Config
+	if workspaceRoot == "" {
+		beforeCfg = compozyconfig.DefaultWithHome(n.deps.HomePaths)
+	} else {
+		beforeCfg, err = compozyconfig.LoadForHome(n.deps.HomePaths)
+		if err != nil {
+			return toolspkg.ToolResult{}, nativeConfigValidationError(req.ToolID, err)
+		}
+	}
+	loadOptions := []compozyconfig.LoadOption{}
+	if workspaceRoot != "" {
+		loadOptions = append(loadOptions, compozyconfig.WithWorkspaceRoot(workspaceRoot))
+	}
+	afterCfg, err := compozyconfig.LoadForHome(n.deps.HomePaths, loadOptions...)
+	if err != nil {
+		return toolspkg.ToolResult{}, nativeConfigValidationError(req.ToolID, err)
+	}
+	before := compozyconfig.FlattenConfigEntries(compozyconfig.RedactedConfigMap(&beforeCfg))
+	after := compozyconfig.FlattenConfigEntries(compozyconfig.RedactedConfigMap(&afterCfg))
+	diff := compozyconfig.DiffConfigEntries(before, after)
+	return structuredResult(map[string]any{
+		nativeConfigHookToolsScopeKey:         nativeScopeForWorkspace(workspaceRoot),
+		nativeConfigHookToolsWorkspaceRootKey: workspaceRoot,
+		nativeConfigHookToolsRedactedKey:      true,
+		nativeConfigHookToolsDiffKey:          diff,
+	}, fmt.Sprintf("%d config differences", len(diff)))
+}
+
+func (n *daemonNativeTools) configPath(
+	ctx context.Context,
+	_ toolspkg.Scope,
+	req toolspkg.CallRequest,
+) (toolspkg.ToolResult, error) {
+	var input configPathInput
+	if err := decodeNativeInput(req, &input); err != nil {
+		return toolspkg.ToolResult{}, err
+	}
+	scope, err := nativeWriteScope(input.Scope)
+	if err != nil {
+		return toolspkg.ToolResult{}, nativeConfigScopeError(req.ToolID, err)
+	}
+	globalConfig, err := compozyconfig.ResolveConfigWriteTarget(n.deps.HomePaths, "", compozyconfig.WriteScopeUser, "")
+	if err != nil {
+		return toolspkg.ToolResult{}, nativeConfigScopeError(req.ToolID, err)
+	}
+	globalMCP, err := compozyconfig.ResolveMCPSidecarWriteTarget(n.deps.HomePaths, "", compozyconfig.WriteScopeUser, "")
+	if err != nil {
+		return toolspkg.ToolResult{}, nativeConfigScopeError(req.ToolID, err)
+	}
+	selected := globalConfig
+	record := map[string]any{
+		"home_dir":                    n.deps.HomePaths.HomeDir,
+		"global_config":               globalConfig.Path(),
+		"global_mcp_json":             globalMCP.Path(),
+		nativeConfigHookToolsScopeKey: string(scope),
+		"selected_config_target":      selected.Path(),
+	}
+	if scope == compozyconfig.WriteScopeWorkspace || strings.TrimSpace(input.WorkspaceRoot) != "" {
+		workspaceRoot, err := n.nativeWorkspaceRoot(ctx, req.ToolID, input.WorkspaceRoot)
+		if err != nil {
+			return toolspkg.ToolResult{}, err
+		}
+		workspaceRoot, err = nativeRequiredWorkspaceRoot(workspaceRoot)
+		if err != nil {
+			return toolspkg.ToolResult{}, nativeConfigScopeError(req.ToolID, err)
+		}
+		workspaceConfig, err := compozyconfig.ResolveConfigWriteTarget(
+			n.deps.HomePaths,
+			workspaceRoot,
+			compozyconfig.WriteScopeWorkspace,
+			"",
+		)
+		if err != nil {
+			return toolspkg.ToolResult{}, nativeConfigScopeError(req.ToolID, err)
+		}
+		workspaceMCP, err := compozyconfig.ResolveMCPSidecarWriteTarget(
+			n.deps.HomePaths,
+			workspaceRoot,
+			compozyconfig.WriteScopeWorkspace,
+			"",
+		)
+		if err != nil {
+			return toolspkg.ToolResult{}, nativeConfigScopeError(req.ToolID, err)
+		}
+		record[nativeConfigHookToolsWorkspaceRootKey] = workspaceRoot
+		record["workspace_config"] = workspaceConfig.Path()
+		record["workspace_mcp_json"] = workspaceMCP.Path()
+		if scope == compozyconfig.WriteScopeWorkspace {
+			selected = workspaceConfig
+			record["selected_config_target"] = selected.Path()
+		}
+	}
+	return structuredResult(record, fmt.Sprint(record["selected_config_target"]))
+}

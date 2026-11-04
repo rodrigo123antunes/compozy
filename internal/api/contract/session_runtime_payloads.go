@@ -1,0 +1,294 @@
+package contract
+
+import (
+	"encoding/json"
+	"time"
+
+	"github.com/compozy/compozy/internal/session"
+	"github.com/compozy/compozy/internal/store"
+	"github.com/compozy/compozy/internal/transcript"
+)
+
+const (
+	// SessionAttachDefaultTTLSeconds is the lease duration used when attach omits a positive TTL.
+	SessionAttachDefaultTTLSeconds = 15 * 60
+	// SessionAttachMaxTTLSeconds is the largest attach lease accepted by the daemon.
+	SessionAttachMaxTTLSeconds = 24 * 60 * 60
+)
+
+// CreateSessionRequest is the shared session creation request payload.
+type CreateSessionRequest struct {
+	Scope         string                     `json:"scope,omitempty"`
+	AgentName     string                     `json:"agent_name,omitempty"`
+	Name          string                     `json:"name,omitempty"`
+	Workspace     string                     `json:"workspace,omitempty"`
+	WorkspacePath string                     `json:"workspace_path,omitempty"`
+	Worktree      string                     `json:"worktree,omitempty"`
+	NewWorktree   *NewSessionWorktreeRequest `json:"new_worktree,omitzero"`
+	// ParentSessionID records creation provenance; the parent must live in the
+	// target workspace and the link never narrows the child's lifecycle.
+	ParentSessionID string `json:"parent_session_id,omitempty"`
+	// LineageKind names the relation to ParentSessionID: "provenance" (default)
+	// or "recovery". It is accepted only together with parent_session_id.
+	LineageKind string `json:"lineage_kind,omitempty"`
+	// FolderID places the new session at the end of one of the caller's
+	// session folders in the target workspace.
+	FolderID string `json:"folder_id,omitempty"`
+}
+
+// RenameSessionRequest changes the durable display name of one user session.
+type RenameSessionRequest struct {
+	Name string `json:"name"`
+}
+
+// SetSessionParentRequest adopts a parentless user session as a provenance
+// child of another user session in the same workspace and profile.
+type SetSessionParentRequest struct {
+	ParentSessionID string `json:"parent_session_id"`
+}
+
+// NewSessionWorktreeRequest materializes one worktree before the session starts.
+type NewSessionWorktreeRequest struct {
+	Name string `json:"name,omitempty"`
+}
+
+// ForkSessionWorktreeRequest creates a clean child session in one worktree.
+// Confirmed is mandatory because the origin session is never moved in place.
+type ForkSessionWorktreeRequest struct {
+	Worktree    string                     `json:"worktree,omitempty"`
+	NewWorktree *NewSessionWorktreeRequest `json:"new_worktree,omitzero"`
+	Confirmed   bool                       `json:"confirmed"`
+}
+
+// ApproveSessionRequest is the interactive permission approval payload.
+type ApproveSessionRequest struct {
+	RequestID string `json:"request_id"`
+	TurnID    string `json:"turn_id"`
+	Decision  string `json:"decision"`
+}
+
+// SessionPayload is the shared session response payload.
+type ReplyWatchPayload struct {
+	ID              string    `json:"id"`
+	TargetSessionID string    `json:"target_session_id"`
+	MessageID       string    `json:"message_id"`
+	State           string    `json:"state"`
+	CreatedAt       time.Time `json:"created_at"`
+}
+
+type SessionPayload struct {
+	EffectivePermissions     string                               `json:"effective_permissions"`
+	PermissionModeDegraded   bool                                 `json:"permission_mode_degraded"`
+	LinkedWork               *SessionLinkedWorkSummary            `json:"linked_work,omitempty"`
+	InstanceID               string                               `json:"instance_id,omitempty"`
+	Diagnostics              []DiagnosticItem                     `json:"diagnostics,omitempty"`
+	WorktreeBinding          *session.WorktreeBindingAvailability `json:"worktree_binding,omitempty"`
+	Branch                   string                               `json:"branch,omitempty"`
+	PullRequest              *SessionPullRequestPayload           `json:"pull_request"`
+	PullRequestLookup        *SessionPullRequestLookupPayload     `json:"pull_request_lookup"`
+	BoardColumn              session.BoardColumn                  `json:"board_column"`
+	ParentTitle              string                               `json:"parent_title,omitempty"`
+	WaitingOn                session.WaitingOn                    `json:"waiting_on,omitempty"`
+	Children                 *SessionChildrenPayload              `json:"children,omitzero"`
+	EffectiveWorkspaceAccess string                               `json:"effective_workspace_access"`
+	Scope                    string                               `json:"scope"`
+	ReplyWatches             []ReplyWatchPayload                  `json:"reply_watches,omitempty"`
+	SubagentSummary          *SubagentSummaryPayload              `json:"subagent_summary,omitzero"`
+	ProcessSummary           *SessionProcessSummaryPayload        `json:"process_summary,omitzero"`
+	MonitorSummary           *SessionMonitorSummaryPayload        `json:"monitor_summary,omitzero"`
+	Queue                    *SessionQueueSummaryPayload          `json:"queue,omitzero"`
+	Supervision              *session.SupervisionState            `json:"supervision"`
+	BusyInput                *session.BusyInputState              `json:"busy_input,omitzero"`
+	ID                       string                               `json:"id"`
+	ProfileID                string                               `json:"profile_id"`
+	ProfileName              string                               `json:"profile_name"`
+	ProfileColor             string                               `json:"profile_color,omitempty"`
+	ProfileIcon              string                               `json:"profile_icon,omitempty"`
+	ProfileEmoji             string                               `json:"profile_emoji,omitempty"`
+	ProfileArchived          bool                                 `json:"profile_archived,omitzero"`
+	Name                     string                               `json:"name,omitempty"`
+	AgentName                string                               `json:"agent_name"`
+	Runtime                  SessionRuntimePayload                `json:"runtime"`
+	WorkspaceID              string                               `json:"workspace_id,omitempty"`
+	WorkspacePath            string                               `json:"workspace_path,omitempty"`
+	WorktreeID               string                               `json:"worktree_id,omitempty"`
+	WorkingDir               string                               `json:"working_dir,omitempty"`
+	Type                     session.Type                         `json:"type,omitempty"`
+	State                    session.State                        `json:"state"`
+	Badge                    session.Badge                        `json:"badge"`
+	Attachable               bool                                 `json:"attachable"`
+	AttachedTo               string                               `json:"attached_to,omitempty"`
+	AttachExpiresAt          *time.Time                           `json:"attach_expires_at,omitempty"`
+	TranscriptEpoch          int64                                `json:"transcript_epoch,omitzero"`
+	AttentionChangedAt       *time.Time                           `json:"attention_changed_at,omitempty"`
+	PendingInteractions      []PendingInteractionPayload          `json:"pending_interactions"`
+	ArchivedAt               *time.Time                           `json:"archived_at"`
+	Later                    *SessionLaterPayload                 `json:"later,omitempty"`
+	ReturnedFromLaterAt      *time.Time                           `json:"returned_from_later_at,omitempty"`
+	// StopReason is the session-level stop classification, distinct from AgentEventPayload.StopReason.
+	StopReason store.StopReason `json:"stop_reason,omitempty"`
+	StopCause  string           `json:"stop_cause,omitempty"`
+	Attention  string           `json:"attention,omitempty"`
+	// AttentionDismissible reports a Needs you the operator can mark as seen; it is
+	// false while the session waits on an answer, a sign-in, or a stop.
+	AttentionDismissible bool  `json:"attention_dismissible,omitzero"`
+	Verified             *bool `json:"verified,omitzero"`
+	Escalated            *bool `json:"escalated,omitzero"`
+	// StopDetail is the session-level stop context paired with StopReason.
+	StopDetail        string                       `json:"stop_detail,omitempty"`
+	Failure           *SessionFailurePayload       `json:"failure,omitzero"`
+	AvailableCommands []ACPAvailableCommandPayload `json:"available_commands"`
+	Activity          *RuntimeActivityPayload      `json:"activity,omitzero"`
+	Lineage           *SessionLineagePayload       `json:"lineage,omitzero"`
+	Derivation        *SessionDerivationPayload    `json:"derivation,omitzero"`
+	// FolderID is the session folder holding this session in catalog list
+	// responses; it is omitted for sessions in the workspace root.
+	FolderID  string                `json:"folder_id,omitempty"`
+	Health    *SessionHealthPayload `json:"health,omitzero"`
+	CreatedAt time.Time             `json:"created_at"`
+	UpdatedAt time.Time             `json:"updated_at"`
+}
+
+// SessionRuntimePayload reports the current ACP binding and its effective runtime.
+type SessionRuntimePayload struct {
+	Status            session.RuntimeStatus             `json:"status"`
+	Transition        session.RuntimeTransitionStrategy `json:"transition,omitempty"`
+	Failure           string                            `json:"failure,omitempty"`
+	Generation        int64                             `json:"generation,omitempty"`
+	Recovery          *SessionRuntimeRecoveryPayload    `json:"recovery,omitempty"`
+	Selected          *PromptRuntimeSelectionPayload    `json:"selected,omitempty"`
+	SelectionRevision int64                             `json:"selection_revision"`
+	Effective         *RuntimeSelectionPayload          `json:"effective,omitempty"`
+	// Requested preserves binding intent when the provider reports a different effective value.
+	Requested *PromptRuntimeSelectionPayload `json:"requested,omitempty"`
+	// LastKnown preserves the recorded runtime identity independently of the current ACP binding.
+	LastKnown    *RuntimeSelectionPayload `json:"last_known,omitempty"`
+	ACPSessionID string                   `json:"acp_session_id,omitempty"`
+	ACPCaps      *ACPCapsPayload          `json:"acp_caps,omitempty"`
+}
+
+// SessionRuntimeRecoveryPayload reports bounded automatic recovery progress.
+type SessionRuntimeRecoveryPayload struct {
+	// Reason is runtime_exit while a replacement runtime starts, or provider_auth while the
+	// provider sign-in is missing; absent on recoveries recorded before the field existed.
+	Reason        store.SessionRuntimeRecoveryReason `json:"reason,omitempty"`
+	Attempt       int                                `json:"attempt"`
+	MaxAttempts   int                                `json:"max_attempts"`
+	Generation    int64                              `json:"generation"`
+	StartedAt     time.Time                          `json:"started_at"`
+	LastAttemptAt time.Time                          `json:"last_attempt_at"`
+	NextAttemptAt *time.Time                         `json:"next_attempt_at,omitempty"`
+	LastError     string                             `json:"last_error,omitempty"`
+}
+
+// SetSessionRuntimeRequest durably selects the default runtime for future prompts.
+type SetSessionRuntimeRequest struct {
+	Runtime          PromptRuntimeSelectionPayload `json:"runtime"`
+	ExpectedRevision *int64                        `json:"expected_revision"`
+}
+
+// RuntimeSelectionPayload is the effective runtime bound to a logical session.
+type RuntimeSelectionPayload struct {
+	Provider        string                    `json:"provider"`
+	Model           string                    `json:"model,omitempty"`
+	ReasoningEffort ReasoningEffort           `json:"reasoning_effort,omitempty"`
+	Speed           Speed                     `json:"speed,omitempty"`
+	ACPOptions      []AgentACPOptionSelection `json:"acp_options,omitempty"`
+	SpeedResolution *SpeedResolution          `json:"speed_resolution,omitempty"`
+}
+
+// PromptRuntimeSelectionPayload is the caller-selected runtime for one prompt.
+type PromptRuntimeSelectionPayload struct {
+	Provider        string                    `json:"provider"`
+	Model           string                    `json:"model,omitempty"`
+	ReasoningEffort ReasoningEffort           `json:"reasoning_effort,omitempty"`
+	Speed           Speed                     `json:"speed,omitempty"`
+	ACPOptions      []AgentACPOptionSelection `json:"acp_options,omitempty"`
+}
+
+// SessionFailurePayload is the redacted lifecycle failure diagnostic shared by
+// session read paths, event streams, and health summaries.
+type SessionFailurePayload struct {
+	Kind            store.FailureKind       `json:"kind"`
+	ReasonCode      store.FailureReasonCode `json:"reason_code,omitempty"`
+	Summary         string                  `json:"summary,omitempty"`
+	CrashBundlePath string                  `json:"crash_bundle_path,omitempty"`
+}
+
+// RuntimeActivityPayload is the shared JSON representation of active prompt supervision state.
+type RuntimeActivityPayload struct {
+	TurnID             string     `json:"turn_id,omitempty"`
+	TurnSource         string     `json:"turn_source,omitempty"`
+	TurnStartedAt      *time.Time `json:"turn_started_at,omitempty"`
+	DeadlineAt         *time.Time `json:"deadline_at,omitempty"`
+	LastActivityAt     *time.Time `json:"last_activity_at,omitempty"`
+	LastActivityKind   string     `json:"last_activity_kind,omitempty"`
+	LastActivityDetail string     `json:"last_activity_detail,omitempty"`
+	CurrentTool        string     `json:"current_tool,omitempty"`
+	ToolCallID         string     `json:"tool_call_id,omitempty"`
+	LastProgressAt     *time.Time `json:"last_progress_at,omitempty"`
+	IterationCurrent   int        `json:"iteration_current"`
+	IterationMax       int        `json:"iteration_max"`
+	IdleSeconds        int64      `json:"idle_seconds"`
+	ElapsedSeconds     int64      `json:"elapsed_seconds"`
+	ElapsedMS          int64      `json:"elapsed_ms"`
+}
+
+// AttachSessionRequest captures explicit attach-lock options.
+type AttachSessionRequest struct {
+	AttachedTo string `json:"attached_to,omitempty"`
+	TTLSeconds int    `json:"ttl_seconds,omitzero"`
+}
+
+// SessionAttachPayload reports the attach lease acquired by one caller.
+type SessionAttachPayload struct {
+	SessionID       string    `json:"session_id"`
+	AttachedTo      string    `json:"attached_to"`
+	AttachExpiresAt time.Time `json:"attach_expires_at"`
+	AttachedAt      time.Time `json:"attached_at"`
+}
+
+// TranscriptMarkerPayload is the typed transcript marker shape shared by logs,
+// recap, and transcript UI projections.
+type TranscriptMarkerPayload struct {
+	Kind       string          `json:"kind"`
+	OccurredAt time.Time       `json:"occurred_at"`
+	Summary    string          `json:"summary"`
+	Evidence   map[string]any  `json:"evidence,omitempty"`
+	Diagnostic json.RawMessage `json:"diagnostic,omitempty"`
+}
+
+// RecapSnapshotPayload records the consistent read boundary for one recap.
+type RecapSnapshotPayload struct {
+	GeneratedAt      time.Time `json:"generated_at"`
+	EventCursor      int64     `json:"event_cursor"`
+	TranscriptCursor int64     `json:"transcript_cursor"`
+	QueueGeneration  int64     `json:"queue_generation"`
+	Consistency      string    `json:"consistency"`
+}
+
+// RecapPayload is a deterministic session recap composed from persisted daemon state.
+type RecapPayload struct {
+	Session        SessionPayload            `json:"session"`
+	ActiveRun      *TaskRunPayload           `json:"active_run,omitzero"`
+	RecentMarkers  []TranscriptMarkerPayload `json:"recent_markers"`
+	RecentMessages []transcript.UIMessage    `json:"recent_messages"`
+	PendingInputs  int                       `json:"pending_inputs"`
+	PendingMarkers int                       `json:"pending_markers"`
+	Snapshot       RecapSnapshotPayload      `json:"snapshot"`
+}
+
+// MoveSessionToProfileRequest copies a stopped user session into another profile
+// and archives the original. TargetProfile is the target profile's name.
+type MoveSessionToProfileRequest struct {
+	TargetProfile string `json:"target_profile"`
+}
+
+// MoveSessionToProfileResponse is a completed move: the copy in the target profile,
+// the archived original, and the copy's new worktree when the original had one.
+type MoveSessionToProfileResponse struct {
+	Session    SessionPayload `json:"session"`
+	Original   SessionPayload `json:"original"`
+	WorktreeID string         `json:"worktree_id,omitempty"`
+	Branch     string         `json:"branch,omitempty"`
+}

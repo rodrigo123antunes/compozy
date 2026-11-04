@@ -1,0 +1,397 @@
+package globaldb
+
+import (
+	"context"
+	"database/sql"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"strings"
+	"time"
+
+	automation "github.com/compozy/compozy/internal/automation/model"
+	"github.com/compozy/compozy/internal/store"
+	"github.com/compozy/compozy/internal/store/globaldb/sqlcgen"
+)
+
+type suggestionTransitionContent struct {
+	WorkspaceID  string                      `json:"workspace_id"`
+	SuggestionID string                      `json:"suggestion_id"`
+	Source       automation.SuggestionSource `json:"source"`
+	DedupKey     string                      `json:"dedup_key"`
+	JobID        string                      `json:"job_id,omitempty"`
+}
+
+func (g *AutomationRepo) CreateSuggestion(
+	ctx context.Context,
+	suggestion automation.Suggestion,
+	pendingCap int,
+) (created automation.Suggestion, err error) {
+	if err := g.checkReady(ctx, "create automation suggestion"); err != nil {
+		return automation.Suggestion{}, err
+	}
+	if pendingCap <= 0 {
+		return automation.Suggestion{}, fmt.Errorf(
+			"store: automation suggestion pending cap must be positive: %d",
+			pendingCap,
+		)
+	}
+	normalized, payloadJSON, err := g.normalizeSuggestionForCreate(suggestion)
+	if err != nil {
+		return automation.Suggestion{}, err
+	}
+
+	err = store.ExecuteWrite(ctx, g.db, func(ctx context.Context, tx *store.WriteTx) error {
+		queries := sqlcgen.New(tx)
+		existing, lookupErr := queries.GetAutomationSuggestionByDedupKey(
+			ctx,
+			sqlcgen.GetAutomationSuggestionByDedupKeyParams{
+				ProfileID:   normalized.ProfileID,
+				WorkspaceID: nullableAutomationString(normalized.WorkspaceID),
+				DedupKey:    normalized.DedupKey,
+			},
+		)
+		if lookupErr == nil {
+			mapped, mapErr := automationSuggestionFromGenerated(existing)
+			if mapErr != nil {
+				return mapErr
+			}
+			created = mapped
+			return nil
+		}
+		if !errors.Is(lookupErr, sql.ErrNoRows) {
+			return fmt.Errorf("store: find automation suggestion dedup latch: %w", lookupErr)
+		}
+
+		pending, countErr := queries.CountPendingAutomationSuggestions(
+			ctx,
+			sqlcgen.CountPendingAutomationSuggestionsParams{
+				ProfileID: normalized.ProfileID, WorkspaceID: nullableAutomationString(normalized.WorkspaceID),
+			},
+		)
+		if countErr != nil {
+			return fmt.Errorf("store: count pending automation suggestions: %w", countErr)
+		}
+		if pending >= int64(pendingCap) {
+			return automation.ErrSuggestionPendingCap
+		}
+		if insertErr := queries.InsertAutomationSuggestion(ctx, sqlcgen.InsertAutomationSuggestionParams{
+			ProfileID: normalized.ProfileID,
+			ID:        normalized.ID, WorkspaceID: nullableAutomationString(normalized.WorkspaceID),
+			Source:   string(normalized.Source),
+			DedupKey: normalized.DedupKey, Status: string(normalized.Status), Payload: payloadJSON,
+			CreatedAt: store.FormatTimestamp(normalized.CreatedAt), ResolvedAt: nullableAutomationTime(nil),
+		}); insertErr != nil {
+			return fmt.Errorf("store: insert automation suggestion %q: %w", normalized.ID, insertErr)
+		}
+		created = normalized
+		return nil
+	})
+	if err != nil {
+		return automation.Suggestion{}, err
+	}
+	return created, nil
+}
+
+func (g *AutomationRepo) GetSuggestion(
+	ctx context.Context,
+	profileID string,
+	workspaceID string,
+	id string,
+) (automation.Suggestion, error) {
+	if err := g.checkReady(ctx, "get automation suggestion"); err != nil {
+		return automation.Suggestion{}, err
+	}
+	profileID, workspaceID, id, err := requireSuggestionIdentity(profileID, workspaceID, id)
+	if err != nil {
+		return automation.Suggestion{}, err
+	}
+	row, err := g.readQueries.GetAutomationSuggestion(ctx, sqlcgen.GetAutomationSuggestionParams{
+		ProfileID:   profileID,
+		WorkspaceID: nullableAutomationString(workspaceID),
+		ID:          id,
+	})
+	if errors.Is(err, sql.ErrNoRows) {
+		return automation.Suggestion{}, automation.ErrSuggestionNotFound
+	}
+	if err != nil {
+		return automation.Suggestion{}, fmt.Errorf("store: get automation suggestion %q: %w", id, err)
+	}
+	return automationSuggestionFromGenerated(row)
+}
+
+func (g *AutomationRepo) ListSuggestions(
+	ctx context.Context,
+	readScope store.ReadScope,
+	workspaceID string,
+	status automation.SuggestionStatus,
+) ([]automation.Suggestion, error) {
+	if err := g.checkReady(ctx, "list automation suggestions"); err != nil {
+		return nil, err
+	}
+	if err := readScope.Validate(); err != nil {
+		return nil, err
+	}
+	workspaceID = strings.TrimSpace(workspaceID)
+	if status != "" {
+		if err := status.Validate("suggestion.status"); err != nil {
+			return nil, err
+		}
+	}
+	var rows []sqlcgen.AutomationSuggestion
+	var err error
+	if readScope.AllProfiles {
+		rows, err = g.readQueries.ListAutomationSuggestionsAllProfiles(
+			ctx,
+			sqlcgen.ListAutomationSuggestionsAllProfilesParams{
+				WorkspaceID: nullableAutomationString(workspaceID), Status: string(status),
+			},
+		)
+	} else {
+		rows, err = g.readQueries.ListAutomationSuggestions(ctx, sqlcgen.ListAutomationSuggestionsParams{
+			ProfileID: readScope.ProfileID, WorkspaceID: nullableAutomationString(workspaceID), Status: string(status),
+		})
+	}
+	if err != nil {
+		return nil, fmt.Errorf("store: list automation suggestions: %w", err)
+	}
+	return automationSuggestionsFromGenerated(rows)
+}
+
+func (g *AutomationRepo) ListAcceptedSuggestions(ctx context.Context) ([]automation.Suggestion, error) {
+	if err := g.checkReady(ctx, "list accepted automation suggestions"); err != nil {
+		return nil, err
+	}
+	rows, err := g.readQueries.ListAcceptedAutomationSuggestionsAllProfiles(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("store: list accepted automation suggestions: %w", err)
+	}
+	return automationSuggestionsFromGenerated(rows)
+}
+
+func (g *AutomationRepo) ResolveSuggestion(
+	ctx context.Context,
+	profileID string,
+	workspaceID string,
+	id string,
+	to automation.SuggestionStatus,
+) (resolved automation.Suggestion, err error) {
+	if err := g.checkReady(ctx, "resolve automation suggestion"); err != nil {
+		return automation.Suggestion{}, err
+	}
+	profileID, workspaceID, id, err = requireSuggestionIdentity(profileID, workspaceID, id)
+	if err != nil {
+		return automation.Suggestion{}, err
+	}
+	if to != automation.SuggestionStatusAccepted && to != automation.SuggestionStatusDismissed {
+		return automation.Suggestion{}, fmt.Errorf(
+			"store: suggestion resolution status must be accepted or dismissed: %q",
+			to,
+		)
+	}
+	resolvedAt := g.now().UTC()
+	var observation store.EventSummary
+	if to == automation.SuggestionStatusDismissed {
+		// Source, dedup key and payload are immutable. Prepare the event before
+		// taking the writer; the conditional UPDATE still owns resolution races.
+		current, err := g.GetSuggestion(ctx, profileID, workspaceID, id)
+		if err != nil {
+			return automation.Suggestion{}, err
+		}
+		current.Status, current.ResolvedAt = to, &resolvedAt
+		observation, err = g.prepareSuggestionTransition(ctx, current, "")
+		if err != nil {
+			return automation.Suggestion{}, err
+		}
+		finishPublication := g.summaryPublications.begin(observation.ProfileID, observation.WorkspaceID)
+		defer finishPublication()
+	}
+	err = store.ExecuteWrite(ctx, g.db, func(ctx context.Context, tx *store.WriteTx) error {
+		queries := sqlcgen.New(tx)
+		affected, updateErr := queries.ResolveAutomationSuggestion(ctx, sqlcgen.ResolveAutomationSuggestionParams{
+			Status: string(to), ResolvedAt: nullableAutomationTime(&resolvedAt),
+			ProfileID: profileID, WorkspaceID: nullableAutomationString(workspaceID), ID: id,
+		})
+		if updateErr != nil {
+			return fmt.Errorf("store: resolve automation suggestion %q: %w", id, updateErr)
+		}
+		if affected == 0 {
+			return suggestionResolutionConflict(ctx, queries, profileID, workspaceID, id)
+		}
+		row, lookupErr := queries.GetAutomationSuggestion(ctx, sqlcgen.GetAutomationSuggestionParams{
+			ProfileID:   profileID,
+			WorkspaceID: nullableAutomationString(workspaceID),
+			ID:          id,
+		})
+		if lookupErr != nil {
+			return fmt.Errorf("store: reload resolved automation suggestion %q: %w", id, lookupErr)
+		}
+		mapped, mapErr := automationSuggestionFromGenerated(row)
+		if mapErr != nil {
+			return mapErr
+		}
+		resolved = mapped
+		if to == automation.SuggestionStatusDismissed {
+			return insertEventSummary(ctx, queries, observation)
+		}
+		return nil
+	})
+	if err != nil {
+		return automation.Suggestion{}, err
+	}
+	if to == automation.SuggestionStatusDismissed {
+		g.drainCommittedEventSummaries(ctx, observation)
+	}
+	return resolved, nil
+}
+
+func suggestionResolutionConflict(
+	ctx context.Context,
+	queries *sqlcgen.Queries,
+	profileID, workspaceID, id string,
+) error {
+	_, err := queries.GetAutomationSuggestion(ctx, sqlcgen.GetAutomationSuggestionParams{
+		ProfileID: profileID, WorkspaceID: nullableAutomationString(workspaceID), ID: id,
+	})
+	if errors.Is(err, sql.ErrNoRows) {
+		return automation.ErrSuggestionNotFound
+	}
+	if err != nil {
+		return fmt.Errorf("store: verify automation suggestion resolution %q: %w", id, err)
+	}
+	return automation.ErrSuggestionResolved
+}
+
+func (g *AutomationRepo) RollbackSuggestionAcceptance(
+	ctx context.Context,
+	profileID string,
+	workspaceID string,
+	id string,
+	resolvedAt time.Time,
+) error {
+	if err := g.checkReady(ctx, "rollback automation suggestion acceptance"); err != nil {
+		return err
+	}
+	profileID, workspaceID, id, err := requireSuggestionIdentity(profileID, workspaceID, id)
+	if err != nil {
+		return err
+	}
+	if resolvedAt.IsZero() {
+		return errors.New("store: automation suggestion resolved timestamp is required")
+	}
+	affected, err := executeWriteQueryResult(
+		ctx,
+		g.repoBase,
+		"globaldb.RollbackAutomationSuggestionAcceptance",
+		func(ctx context.Context, queries *sqlcgen.Queries) (int64, error) {
+			return queries.RollbackAutomationSuggestionAcceptance(
+				ctx,
+				sqlcgen.RollbackAutomationSuggestionAcceptanceParams{
+					ProfileID:   profileID,
+					WorkspaceID: nullableAutomationString(workspaceID),
+					ID:          id,
+					ResolvedAt:  nullableAutomationTime(&resolvedAt),
+				},
+			)
+		},
+	)
+	if err != nil {
+		return fmt.Errorf("store: rollback automation suggestion acceptance %q: %w", id, err)
+	}
+	if affected == 0 {
+		return automation.ErrSuggestionResolved
+	}
+	return nil
+}
+
+func (g *AutomationRepo) normalizeSuggestionForCreate(
+	suggestion automation.Suggestion,
+) (automation.Suggestion, string, error) {
+	normalized := suggestion
+	normalized.ID = strings.TrimSpace(normalized.ID)
+	normalized.ProfileID = strings.TrimSpace(normalized.ProfileID)
+	if normalized.ID == "" {
+		generatedID, err := store.NewID("sug")
+		if err != nil {
+			return automation.Suggestion{}, "", fmt.Errorf("store: generate automation suggestion id: %w", err)
+		}
+		normalized.ID = generatedID
+	}
+	normalized.WorkspaceID = strings.TrimSpace(normalized.WorkspaceID)
+	normalized.Source = automation.SuggestionSource(strings.TrimSpace(string(normalized.Source)))
+	normalized.DedupKey = strings.TrimSpace(normalized.DedupKey)
+	if normalized.Status == "" {
+		normalized.Status = automation.SuggestionStatusPending
+	}
+	if normalized.Status != automation.SuggestionStatusPending {
+		return automation.Suggestion{}, "", errors.New("store: new automation suggestion must be pending")
+	}
+	normalized.ResolvedAt = nil
+	if normalized.CreatedAt.IsZero() {
+		normalized.CreatedAt = g.now().UTC()
+	} else {
+		normalized.CreatedAt = normalized.CreatedAt.UTC()
+	}
+	if err := normalized.Validate("suggestion"); err != nil {
+		return automation.Suggestion{}, "", err
+	}
+	payload, err := json.Marshal(normalized.Payload)
+	if err != nil {
+		return automation.Suggestion{}, "", fmt.Errorf("store: marshal automation suggestion payload: %w", err)
+	}
+	return normalized, string(payload), nil
+}
+
+func automationSuggestionFromGenerated(row sqlcgen.AutomationSuggestion) (automation.Suggestion, error) {
+	createdAt, err := store.ParseTimestamp(row.CreatedAt)
+	if err != nil {
+		return automation.Suggestion{}, fmt.Errorf("store: parse automation suggestion created_at: %w", err)
+	}
+	var resolvedAt *time.Time
+	if row.ResolvedAt.Valid {
+		parsed, parseErr := store.ParseTimestamp(row.ResolvedAt.String)
+		if parseErr != nil {
+			return automation.Suggestion{}, fmt.Errorf("store: parse automation suggestion resolved_at: %w", parseErr)
+		}
+		resolvedAt = &parsed
+	}
+	var payload automation.Job
+	if err := json.Unmarshal([]byte(row.Payload), &payload); err != nil {
+		return automation.Suggestion{}, fmt.Errorf("store: decode automation suggestion payload: %w", err)
+	}
+	suggestion := automation.Suggestion{
+		ID: row.ID, ProfileID: row.ProfileID, WorkspaceID: row.WorkspaceID.String,
+		Source:   automation.SuggestionSource(row.Source),
+		DedupKey: row.DedupKey, Status: automation.SuggestionStatus(row.Status), Payload: payload,
+		CreatedAt: createdAt, ResolvedAt: resolvedAt,
+	}
+	if err := suggestion.Validate("suggestion"); err != nil {
+		return automation.Suggestion{}, fmt.Errorf("store: invalid automation suggestion row: %w", err)
+	}
+	return suggestion, nil
+}
+
+func automationSuggestionsFromGenerated(rows []sqlcgen.AutomationSuggestion) ([]automation.Suggestion, error) {
+	suggestions := make([]automation.Suggestion, 0, len(rows))
+	for _, row := range rows {
+		suggestion, err := automationSuggestionFromGenerated(row)
+		if err != nil {
+			return nil, err
+		}
+		suggestions = append(suggestions, suggestion)
+	}
+	return suggestions, nil
+}
+
+func requireSuggestionIdentity(profileID string, workspaceID string, id string) (string, string, string, error) {
+	profileID = strings.TrimSpace(profileID)
+	workspaceID = strings.TrimSpace(workspaceID)
+	id = strings.TrimSpace(id)
+	if profileID == "" {
+		return "", "", "", errors.New("store: automation suggestion profile id is required")
+	}
+	if id == "" {
+		return "", "", "", errors.New("store: automation suggestion id is required")
+	}
+	return profileID, workspaceID, id, nil
+}

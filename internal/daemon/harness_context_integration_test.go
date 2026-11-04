@@ -1,0 +1,1325 @@
+//go:build integration
+
+package daemon
+
+import (
+	"context"
+	"encoding/json"
+	"fmt"
+	"os"
+	"os/exec"
+	"path/filepath"
+	"reflect"
+	"slices"
+	"strings"
+	"sync"
+	"testing"
+	"time"
+
+	"github.com/compozy/compozy/internal/acp"
+	compozyconfig "github.com/compozy/compozy/internal/config"
+	hookspkg "github.com/compozy/compozy/internal/hooks"
+	"github.com/compozy/compozy/internal/providerexec"
+	"github.com/compozy/compozy/internal/session"
+	skillspkg "github.com/compozy/compozy/internal/skills"
+	"github.com/compozy/compozy/internal/store"
+	"github.com/compozy/compozy/internal/store/sessiondb"
+	taskpkg "github.com/compozy/compozy/internal/task"
+	"github.com/compozy/compozy/internal/testutil"
+	"github.com/compozy/compozy/internal/testutil/acpmock"
+	toolspkg "github.com/compozy/compozy/internal/tools"
+	"github.com/compozy/compozy/internal/transcript"
+	workspacepkg "github.com/compozy/compozy/internal/workspace"
+	skillbundled "github.com/compozy/compozy/skills"
+)
+
+func TestHarnessContextIntegrationStartupAndPromptShareResolverPolicy(t *testing.T) {
+	t.Run(
+		"Should share one resolver policy across startup and live prompts",
+		testHarnessContextIntegrationStartupAndPromptShareResolverPolicy,
+	)
+}
+
+func testHarnessContextIntegrationStartupAndPromptShareResolverPolicy(t *testing.T) {
+	homePaths := integrationHomePaths(t)
+	cfg := testConfig(t, homePaths)
+	workspaceRoot := homePaths.HomeDir + "/workspace"
+	resolvedWorkspace := newHarnessIntegrationWorkspace(t, homePaths, cfg, workspaceRoot)
+	const gatedSkillName = "integration-platform-gated"
+	writeDaemonFile(
+		t,
+		filepath.Join(homePaths.SkillsDir, gatedSkillName, "SKILL.md"),
+		strings.Join([]string{
+			"---",
+			"name: " + gatedSkillName,
+			"description: Must never be advertised by this integration fixture.",
+			"metadata:",
+			"  compozy:",
+			"    when:",
+			"      platforms: [compozy-integration-impossible]",
+			"---",
+			"body",
+		}, "\n"),
+	)
+
+	daemonInstance, capturedDeps := bootHarnessPolicyDaemon(t, homePaths, &cfg)
+	t.Cleanup(func() {
+		if err := daemonInstance.Shutdown(testutil.Context(t)); err != nil {
+			t.Errorf("Shutdown() error = %v", err)
+		}
+	})
+
+	if daemonInstance.harnessResolver == nil {
+		t.Fatal("boot() did not retain the harness resolver")
+	}
+	if _, ok := capturedDeps.PromptAssembler.(session.StartupPromptAssembler); !ok {
+		t.Fatal("boot() did not inject a startup-aware prompt assembler")
+	}
+	if capturedDeps.StartupPromptOverlay == nil {
+		t.Fatal("boot() did not inject the Compozy runtime startup prompt overlay")
+	}
+	if capturedDeps.PromptInputAugmenter == nil {
+		t.Fatal("boot() did not inject the prompt input augmenter")
+	}
+
+	driver := newHarnessIntegrationDriver()
+	workspaceResolver := &harnessIntegrationWorkspaceResolver{resolved: resolvedWorkspace}
+	composite, err := newPromptInputCompositeAugmenter(
+		discardLogger(),
+		daemonInstance.harnessResolver,
+		nil,
+		defaultPromptInputAugmenterDescriptors(
+			newSkillsCatalogAugmenter(daemonInstance.skillsRegistry, nil, func() promptSkillsWorkspaceResolver {
+				return workspaceResolver
+			}, nil),
+			daemonInstance.situationContext.Augment,
+		)...,
+	)
+	if err != nil {
+		t.Fatalf("newPromptInputCompositeAugmenter() error = %v", err)
+	}
+	capturedDeps.PromptInputAugmenter = composite
+	manager := newHarnessIntegrationManager(t, homePaths, capturedDeps, resolvedWorkspace, driver)
+
+	created, err := manager.Create(testutil.Context(t), new(session.CreateOpts{
+		AgentName: resolvedWorkspace.Agents[0].Name,
+		Name:      "user session",
+		Workspace: resolvedWorkspace.ID,
+	}))
+	if err != nil {
+		t.Fatalf("Create() error = %v", err)
+	}
+	t.Cleanup(func() {
+		if err := manager.Stop(testutil.Context(t), created.ID); err != nil {
+			t.Errorf("Stop() error = %v", err)
+		}
+	})
+	waitForCondition(t, "current skills catalog ready", func() bool {
+		info := created.Info()
+		if info == nil || daemonInstance.skillsRegistry == nil {
+			return false
+		}
+		resolved, err := workspaceResolver.Resolve(testutil.Context(t), info.WorkspaceID)
+		if err != nil {
+			return false
+		}
+		projectedSkills, err := daemonInstance.skillsRegistry.ForAgent(
+			testutil.Context(t),
+			&resolved,
+			info.AgentName,
+		)
+		if err != nil {
+			return false
+		}
+		return strings.Contains(skillspkg.BuildCurrentCatalog(projectedSkills), "<current-available-skills>")
+	})
+
+	startupResolved, err := daemonInstance.harnessResolver.ResolveStartup(session.StartupPromptContext{
+		SessionType: created.Info().Type,
+		WorkspaceID: created.Info().WorkspaceID,
+		Workspace:   created.Info().Workspace,
+		AgentName:   created.Info().AgentName,
+	})
+	if err != nil {
+		t.Fatalf("ResolveStartup() error = %v", err)
+	}
+	if !containsHarnessSection(startupResolved.Policy.IncludeSections, HarnessPromptSectionTools) {
+		t.Fatalf("startup IncludeSections = %#v, want tools section", startupResolved.Policy.IncludeSections)
+	}
+	if !containsHarnessSection(startupResolved.Policy.IncludeSections, HarnessPromptSectionRuntimeIdentity) {
+		t.Fatalf("startup IncludeSections = %#v, want runtime identity section", startupResolved.Policy.IncludeSections)
+	}
+
+	toolRouter, err := skillbundled.LoadContent(bundledCompozySkillName)
+	if err != nil {
+		t.Fatalf("LoadContent(%q) error = %v", bundledCompozySkillName, err)
+	}
+	toolRouter = strings.TrimSpace(toolRouter)
+	if got := driver.startCalls[0].SystemPrompt; !strings.Contains(got, toolRouter) {
+		t.Fatalf("start system prompt = %q, want bundled tool router content", got)
+	}
+	if got := strings.Count(driver.startCalls[0].SystemPrompt, toolRouter); got != 1 {
+		t.Fatalf("tool router occurrences = %d, want 1", got)
+	}
+	gatedCatalogEntry := `name="` + gatedSkillName + `"`
+	if got := driver.startCalls[0].SystemPrompt; strings.Contains(got, gatedCatalogEntry) {
+		t.Fatalf("start system prompt advertised gated skill %q", gatedSkillName)
+	}
+	// Count rendered sections, not documentation mentions.
+	if got := strings.Count(driver.startCalls[0].SystemPrompt, "</compozy-situation-context>"); got != 1 {
+		t.Fatalf("situation context section occurrences = %d, want 1", got)
+	}
+	if got := strings.Count(driver.startCalls[0].SystemPrompt, compozyRuntimeEnvelopeStart); got != 1 {
+		t.Fatalf("Compozy runtime envelope occurrences = %d, want 1", got)
+	}
+	if got := driver.startCalls[0].SystemPrompt; !strings.Contains(got, "You are running inside Compozy") ||
+		!strings.Contains(got, "Compozy is a local-first daemon") ||
+		!strings.Contains(got, "- workspace_id: ws-harness") {
+		t.Fatalf("start system prompt = %q, want Compozy runtime envelope with workspace facts", got)
+	}
+	assertPromptContainsInOrder(
+		t,
+		driver.startCalls[0].SystemPrompt,
+		compozyRuntimeEnvelopeStart,
+		"# Compozy Runtime",
+		"canonical registry IDs",
+		"<compozy-situation-context>",
+		"You are a coding assistant.",
+		"<available-skills>",
+		toolRouter,
+	)
+
+	userResolved, err := daemonInstance.harnessResolver.ResolvePrompt(
+		created.Info(),
+		session.TurnSourceUser,
+		acp.PromptMeta{},
+	)
+	if err != nil {
+		t.Fatalf("ResolvePrompt(user) error = %v", err)
+	}
+	if !slices.Equal(
+		userResolved.Policy.EnableAugmenters,
+		[]HarnessAugmenter{
+			HarnessAugmenterSkills,
+			HarnessAugmenterSituation,
+		},
+	) {
+		t.Fatalf(
+			"user EnableAugmenters = %#v, want skills and situation",
+			userResolved.Policy.EnableAugmenters,
+		)
+	}
+
+	seedHarnessSituationTaskRun(t, daemonInstance, created.Info().WorkspaceID, created.Info().Workspace, created.ID)
+
+	userEvents, err := manager.PromptWithOpts(testutil.Context(t), created.ID, session.PromptOpts{
+		Message:    "workspace note",
+		TurnSource: session.TurnSourceUser,
+	})
+	if err != nil {
+		t.Fatalf("PromptWithOpts(user) error = %v", err)
+	}
+	drainHarnessIntegrationEvents(userEvents)
+	if got := driver.promptCalls[0].Message; !strings.Contains(got, "<current-available-skills>") {
+		t.Fatalf("user prompt message = %q, want current skills augmentation", got)
+	}
+	if got := driver.promptCalls[0].Message; !strings.Contains(got, "<compozy-situation-context>") {
+		t.Fatalf("user prompt message = %q, want situation context augmentation", got)
+	}
+	if got := strings.Count(driver.promptCalls[0].Message, "<compozy-situation-context>"); got != 1 {
+		t.Fatalf("user prompt situation context occurrences = %d, want 1", got)
+	}
+	if got := driver.promptCalls[0].Message; strings.Contains(got, gatedCatalogEntry) {
+		t.Fatalf("user prompt advertised gated skill %q", gatedSkillName)
+	}
+
+}
+
+func TestHarnessContextIntegrationResolverStableAcrossResume(t *testing.T) {
+	t.Run(
+		"Should preserve resolver policy across session resume",
+		testHarnessContextIntegrationResolverStableAcrossResume,
+	)
+}
+
+func testHarnessContextIntegrationResolverStableAcrossResume(t *testing.T) {
+	homePaths := integrationHomePaths(t)
+	cfg := testConfig(t, homePaths)
+	workspaceRoot := homePaths.HomeDir + "/workspace"
+	resolvedWorkspace := newHarnessIntegrationWorkspace(t, homePaths, cfg, workspaceRoot)
+
+	daemonInstance, capturedDeps := bootHarnessPolicyDaemon(t, homePaths, &cfg)
+	t.Cleanup(func() {
+		if err := daemonInstance.Shutdown(testutil.Context(t)); err != nil {
+			t.Errorf("Shutdown() error = %v", err)
+		}
+	})
+
+	driver := newHarnessIntegrationDriver()
+	manager := newHarnessIntegrationManager(t, homePaths, capturedDeps, resolvedWorkspace, driver)
+
+	created, err := manager.Create(testutil.Context(t), new(session.CreateOpts{
+		AgentName: resolvedWorkspace.Agents[0].Name,
+		Name:      "user session",
+		Workspace: resolvedWorkspace.ID,
+	}))
+	if err != nil {
+		t.Fatalf("Create() error = %v", err)
+	}
+
+	beforeResume, err := daemonInstance.harnessResolver.ResolvePrompt(
+		created.Info(),
+		session.TurnSourceUser,
+		acp.PromptMeta{},
+	)
+	if err != nil {
+		t.Fatalf("ResolvePrompt(before resume) error = %v", err)
+	}
+
+	if err := manager.Stop(testutil.Context(t), created.ID); err != nil {
+		t.Fatalf("Stop() error = %v", err)
+	}
+
+	resumed, err := manager.Resume(testutil.Context(t), created.ID)
+	if err != nil {
+		t.Fatalf("Resume() error = %v", err)
+	}
+	t.Cleanup(func() {
+		if err := manager.Stop(testutil.Context(t), resumed.ID); err != nil {
+			t.Errorf("Stop() error = %v", err)
+		}
+	})
+
+	afterResume, err := daemonInstance.harnessResolver.ResolvePrompt(
+		resumed.Info(),
+		session.TurnSourceUser,
+		acp.PromptMeta{},
+	)
+	if err != nil {
+		t.Fatalf("ResolvePrompt(after resume) error = %v", err)
+	}
+
+	beforeFilter, afterFilter := beforeResume.Policy.SkillInjectionFilter, afterResume.Policy.SkillInjectionFilter
+	if beforeFilter == nil || afterFilter == nil {
+		t.Fatal("resume policy must retain skill filtering")
+	}
+	for _, skill := range daemonInstance.skillsRegistry.List() {
+		if beforeFilter(skill) != afterFilter(skill) {
+			t.Fatalf("resume changed filtering for skill %q", skill.Meta.Name)
+		}
+	}
+	beforePolicy, afterPolicy := beforeResume.Policy, afterResume.Policy
+	beforePolicy.SkillInjectionFilter, afterPolicy.SkillInjectionFilter = nil, nil
+	if !reflect.DeepEqual(beforePolicy, afterPolicy) {
+		t.Fatalf(
+			"resolved policy changed across resume\nbefore=%#v\nafter=%#v",
+			beforeResume.Policy,
+			afterResume.Policy,
+		)
+	}
+
+	toolRouter, err := skillbundled.LoadContent(bundledCompozySkillName)
+	if err != nil {
+		t.Fatalf("LoadContent(%q) error = %v", bundledCompozySkillName, err)
+	}
+	toolRouter = strings.TrimSpace(toolRouter)
+	if got := strings.Count(driver.startCalls[1].SystemPrompt, toolRouter); got != 1 {
+		t.Fatalf("resume prompt tool router occurrences = %d, want 1", got)
+	}
+	if got := strings.Count(driver.startCalls[1].SystemPrompt, compozyRuntimeEnvelopeStart); got != 1 {
+		t.Fatalf("resume prompt Compozy runtime envelope occurrences = %d, want 1", got)
+	}
+}
+
+func TestHarnessContextIntegrationScopesToolGuidanceForInternalCallers(t *testing.T) {
+	for _, skillsEnabled := range []bool{true, false} {
+		t.Run(
+			fmt.Sprintf(
+				"Should preserve role guidance through creation and resume with skills enabled %t",
+				skillsEnabled,
+			),
+			func(t *testing.T) {
+				homePaths := integrationHomePaths(t)
+				cfg := testConfig(t, homePaths)
+				cfg.Skills.Enabled = skillsEnabled
+				workspace := newHarnessIntegrationWorkspace(
+					t,
+					homePaths,
+					cfg,
+					filepath.Join(homePaths.HomeDir, "workspace"),
+				)
+				daemonInstance, deps := bootHarnessPolicyDaemon(t, homePaths, &cfg)
+				t.Cleanup(func() {
+					if err := daemonInstance.Shutdown(testutil.Context(t)); err != nil {
+						t.Errorf("Shutdown: %v", err)
+					}
+				})
+				driver := newHarnessIntegrationDriver()
+				manager := newHarnessIntegrationManager(t, homePaths, deps, workspace, driver)
+				router, err := skillbundled.LoadContent(bundledCompozySkillName)
+				if err != nil {
+					t.Fatal(err)
+				}
+				router = strings.TrimSpace(router)
+				assertLatestPrompt := func(label string, wantRouter bool) {
+					t.Helper()
+					driver.mu.Lock()
+					prompt := driver.startCalls[len(driver.startCalls)-1].SystemPrompt
+					driver.mu.Unlock()
+					t.Logf("%s assembled startup bytes=%d router bytes=%d", label, len(prompt), len(router))
+					wantCount := 0
+					if wantRouter && skillsEnabled {
+						wantCount = 1
+					}
+					if count := strings.Count(prompt, router); count != wantCount {
+						t.Fatalf("%s router occurrences=%d want router=%t", label, count, wantRouter)
+					}
+					for _, path := range []string{bundledToolsReference, bundledNativeToolsReference} {
+						manual, loadErr := skillbundled.LoadResource(bundledCompozySkillName, path)
+						if loadErr != nil {
+							t.Fatal(loadErr)
+						}
+						wantManual := wantRouter && !skillsEnabled
+						if strings.Contains(prompt, strings.TrimSpace(manual)) != wantManual {
+							t.Fatalf("%s inline %s presence differs from expected %t", label, path, wantManual)
+						}
+					}
+				}
+				stop := func(sess *session.Session) {
+					t.Helper()
+					t.Cleanup(func() {
+						if err := manager.Stop(testutil.Context(t), sess.ID); err != nil {
+							t.Errorf("Stop(%s): %v", sess.ID, err)
+						}
+					})
+				}
+				agentName := workspace.Agents[0].Name
+				parent, err := manager.Create(
+					t.Context(),
+					new(session.CreateOpts{AgentName: agentName, Workspace: workspace.ID}),
+				)
+				if err != nil {
+					t.Fatal(err)
+				}
+				stop(parent)
+				assertLatestPrompt("interactive", true)
+				for _, sessionType := range []session.Type{session.SessionTypeSystem} {
+					created, createErr := manager.Create(
+						t.Context(),
+						new(session.CreateOpts{AgentName: agentName, Workspace: workspace.ID, Type: sessionType}),
+					)
+					if createErr != nil {
+						t.Fatal(createErr)
+					}
+					stop(created)
+					assertLatestPrompt(string(sessionType), true)
+				}
+				worker, err := manager.Spawn(
+					t.Context(),
+					session.SpawnOpts{ParentSessionID: parent.ID, AgentName: agentName, TTL: time.Minute},
+				)
+				if err != nil {
+					t.Fatal(err)
+				}
+				stop(worker)
+				assertLatestPrompt("spawned worker", true)
+				child, err := manager.Spawn(t.Context(), session.SpawnOpts{
+					ParentSessionID: parent.ID,
+					AgentName:       agentName,
+					SpawnRole:       session.SpawnRoleAutoTitle,
+					TTL:             time.Minute,
+				})
+				if err != nil {
+					t.Fatal(err)
+				}
+				if child.Info().Type != session.SessionTypeSpawned {
+					t.Fatal("auto-title must exercise Spawn")
+				}
+				assertLatestPrompt("spawned auto-title", false)
+				if err := manager.Stop(t.Context(), child.ID); err != nil {
+					t.Fatal(err)
+				}
+				resumed, err := manager.Resume(t.Context(), child.ID)
+				if err != nil {
+					t.Fatal(err)
+				}
+				stop(resumed)
+				assertLatestPrompt("resumed auto-title", false)
+				resolved, err := daemonInstance.harnessResolver.ResolvePrompt(
+					resumed.Info(),
+					session.TurnSourceUser,
+					acp.PromptMeta{},
+				)
+				if err != nil {
+					t.Fatal(err)
+				}
+				if containsHarnessSection(resolved.Policy.IncludeSections, HarnessPromptSectionTools) {
+					t.Fatal("resume lost auto-title role")
+				}
+
+			},
+		)
+	}
+}
+
+func TestHarnessContextIntegrationMeasuresDeliveredSkillCatalogs(t *testing.T) {
+	t.Run(
+		"Should load a managed skill resource while session health writes recover from contention",
+		func(t *testing.T) {
+			// integrationHomePaths sets COMPOZY_HOME for the subprocess fixture.
+			driverPath := acpmock.RequireDriver(t)
+			homePaths := integrationHomePaths(t)
+			cfg := testConfig(t, homePaths)
+			workspace := newHarnessIntegrationWorkspace(
+				t,
+				homePaths,
+				cfg,
+				filepath.Join(homePaths.HomeDir, "workspace"),
+			)
+			workspace.Agents[0].Model = ""
+			workspace.Config.Providers[acpmock.ProviderName] = acpmock.ProviderConfig(acpmock.BuildCommand(
+				driverPath, mockFixturePath(t, "browser_skills_context_fixture.json"),
+				"skills-context-agent", filepath.Join(t.TempDir(), "driver.jsonl")))
+			workspace.Agents[0].Provider = acpmock.ProviderName
+			globalDB := openDaemonTestGlobalDB(t)
+			globalDB.DB().SetMaxOpenConns(2)
+			if err := globalDB.InsertWorkspace(t.Context(), workspace.Workspace); err != nil {
+				t.Fatal(err)
+			}
+			daemonInstance, deps := bootHarnessPolicyDaemon(t, homePaths, &cfg)
+			t.Cleanup(func() {
+				if err := daemonInstance.Shutdown(context.Background()); err != nil {
+					t.Error(err)
+				}
+			})
+			manager := newHarnessIntegrationManager(
+				t,
+				homePaths,
+				deps,
+				workspace,
+				session.NewACPDriverAdapter(
+					acp.New(acp.WithProviderPreStarter(daemonInstance.providerPreStarter)),
+				),
+				session.WithSessionCatalog(globalDB),
+				session.WithSessionHealthStore(globalDB),
+			)
+			t.Cleanup(func() {
+				if err := manager.Shutdown(context.Background()); err != nil {
+					t.Error(err)
+				}
+			})
+			created, err := manager.Create(t.Context(), new(session.CreateOpts{
+				AgentName: workspace.Agents[0].Name, Workspace: workspace.ID, ProfileID: store.DefaultProfileID,
+			}))
+			if err != nil {
+				t.Fatal(err)
+			}
+			skills := newLoadedNativeSkillRegistry(t)
+			registry := newDaemonNativeRegistryWithPolicyResolverAndWorkspaceAccess(t,
+				&daemonNativeToolsDeps{Skills: skills, Sessions: manager, HomePaths: homePaths,
+					WorkspaceResolver: &harnessIntegrationWorkspaceResolver{resolved: workspace}},
+				toolspkg.NewStaticPolicyInputResolver(nativeApproveAllPolicyInputs()), nil,
+				toolspkg.WithToolEventSink(&daemonToolEventSink{writer: globalDB}))
+			ctx := t.Context()
+			locked, release := make(chan struct{}), make(chan struct{})
+			writerDone := make(chan error, 1)
+			go func() {
+				writerDone <- store.ExecuteWriteOperation(ctx, globalDB.DB(), "contention reproduction owner", func(ctx context.Context, tx *store.WriteTx) error {
+					close(locked)
+					select {
+					case <-release:
+						return nil
+					case <-ctx.Done():
+						return ctx.Err()
+					}
+				})
+			}()
+			<-locked
+			healthDone := make(chan error, 1)
+			go func() {
+				err := manager.Supervise(ctx, time.Now().UTC())
+				if err == nil {
+					_, err = manager.TouchSessionPresence(ctx, created.ID)
+				}
+				healthDone <- err
+			}()
+			type skillResponse struct {
+				result toolspkg.ToolResult
+				err    error
+			}
+			skillDone := make(chan skillResponse, 1)
+			go func() {
+				result, err := registry.Call(ctx, toolspkg.Scope{SessionID: created.ID,
+					AgentName: workspace.Agents[0].Name, ProfileID: store.DefaultProfileID}, toolspkg.CallRequest{
+					ToolID: toolspkg.ToolIDSkillView,
+					Input:  json.RawMessage(`{"name":"compozy","file":"references/terminal.md"}`),
+				})
+				skillDone <- skillResponse{result, err}
+			}()
+			// The fixture owner deliberately outlives one retry interval, then releases
+			// its lock; neither waiting operation should reserve the remaining pool slot.
+			releaseTimer := time.NewTimer(200 * time.Millisecond)
+			select {
+			case <-releaseTimer.C:
+			case <-ctx.Done():
+			}
+			releaseTimer.Stop()
+			close(release)
+			ownerErr, healthErr, response := <-writerDone, <-healthDone, <-skillDone
+			if ownerErr != nil || healthErr != nil || response.err != nil {
+				t.Fatalf("concurrent owner=%v health=%v skill=%v", ownerErr, healthErr, response.err)
+			}
+			if len(response.result.Content) == 0 || response.result.Content[0].Text == "" {
+				t.Fatal("skill resource returned no content")
+			}
+			if _, err := globalDB.GetSessionHealth(ctx, created.ID); err != nil {
+				t.Fatal(err)
+			}
+		},
+	)
+
+	t.Run("Should deliver current catalogs once and omit input-only context", func(t *testing.T) {
+		driverPath := acpmock.RequireDriver(t)
+		homePaths := integrationHomePaths(t)
+		cfg := testConfig(t, homePaths)
+		workspace := newHarnessIntegrationWorkspace(t, homePaths, cfg, filepath.Join(homePaths.HomeDir, "workspace"))
+		workspace.Agents[0].Model = "" // The receipt fixture advertises no selectable model.
+		// The bundled spec-cycle extension contributes cy-create-spec and git-rebase to every workspace.
+		expectedSkills := []string{"compozy", "cy-create-spec", "git-rebase"}
+		for index := range 23 {
+			name := fmt.Sprintf("measured-skill-%02d", index)
+			expectedSkills = append(expectedSkills, name)
+			writeDaemonFile(
+				t,
+				filepath.Join(homePaths.SkillsDir, name, "SKILL.md"),
+				"---\nname: "+name+"\ndescription: A representative skill for prompt delivery measurement.\n---\nRead this skill when requested.\n",
+			)
+		}
+		daemonInstance, deps := bootHarnessPolicyDaemon(t, homePaths, &cfg)
+		t.Cleanup(func() {
+			if err := daemonInstance.Shutdown(context.Background()); err != nil {
+				t.Errorf("Shutdown: %v", err)
+			}
+		})
+		resolver := &harnessIntegrationWorkspaceResolver{resolved: workspace}
+		skillsAugmenter := newSkillsCatalogAugmenter(
+			daemonInstance.skillsRegistry,
+			nil,
+			func() promptSkillsWorkspaceResolver { return resolver },
+			nil,
+		)
+		composite, err := newPromptInputCompositeAugmenter(
+			discardLogger(),
+			daemonInstance.harnessResolver,
+			nil,
+			defaultPromptInputAugmenterDescriptors(
+				skillsAugmenter,
+				daemonInstance.situationContext.Augment,
+			)...)
+		if err != nil {
+			t.Fatal(err)
+		}
+		deps.PromptInputAugmenter = composite
+		diagnostics := filepath.Join(t.TempDir(), "prompts.jsonl")
+		command := acpmock.BuildCommand(
+			driverPath,
+			mockFixturePath(t, "browser_skills_context_fixture.json"),
+			"skills-context-agent",
+			diagnostics,
+		)
+		workspace.Config.Providers[acpmock.ProviderName] = acpmock.ProviderConfig(command)
+		workspace.Agents[0].Provider = acpmock.ProviderName
+		manager := newHarnessIntegrationManager(
+			t,
+			homePaths,
+			deps,
+			workspace,
+			session.NewACPDriverAdapter(acp.New(acp.WithProviderPreStarter(daemonInstance.providerPreStarter))),
+		)
+		send := func(sess *session.Session, label string) string {
+			t.Helper()
+			events, err := manager.Prompt(t.Context(), sess.ID, "Measure this prompt.")
+			if err != nil {
+				t.Fatal(err)
+			}
+			var receipt *acp.DeliveryManifest
+			done := false
+			for event := range events {
+				if event.Type == acp.EventTypeError {
+					t.Fatalf("%s: %s", label, event.Error)
+				}
+				if event.Type == acp.EventTypePromptDelivery {
+					if receipt != nil {
+						t.Fatal("duplicate receipt")
+					}
+					receipt = event.DeliveryManifest()
+				}
+				done = done || event.Type == acp.EventTypeDone
+			}
+			if !done {
+				t.Fatalf("%s did not complete", label)
+			}
+			if receipt == nil || receipt.Estimate != acp.TextEstimateMethod || receipt.SentAt.IsZero() {
+				t.Fatalf("%s missing receipt: %#v", label, receipt)
+			}
+			deliveries, err := manager.Deliveries(t.Context(), sess.ID)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if len(deliveries) == 0 || !reflect.DeepEqual(deliveries[len(deliveries)-1].Manifest, *receipt) {
+				t.Fatalf("%s persisted receipt differs", label)
+			}
+			ledger, err := manager.Events(
+				t.Context(),
+				sess.ID,
+				store.EventQuery{Type: acp.EventTypePromptDelivery},
+			)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if len(ledger) != len(deliveries) {
+				t.Fatal("receipt read lost ledger rows")
+			}
+			decoded, err := transcript.UnmarshalAgentEvent(ledger[len(ledger)-1].Content)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !reflect.DeepEqual(decoded.DeliveryManifest(), receipt) {
+				t.Fatal("canonical codec lost receipt")
+			}
+			var skills []acp.DeliveredSpan
+			for _, span := range receipt.Spans {
+				if span.Key == "skills" {
+					skills = append(skills, span)
+				}
+			}
+			switch label {
+			case "first":
+				if len(skills) != 2 || skills[0].Unchanged || skills[0].Delivery != "first_turn_prefix" ||
+					!skills[1].StartupDedup ||
+					!skills[1].Unchanged {
+					t.Fatalf("startup skills receipt: %#v", skills)
+				}
+			case "unchanged":
+				if len(skills) != 1 || !skills[0].Unchanged || skills[0].StartupDedup ||
+					skills[0].Bytes != int64(len(skillspkg.BuildCurrentCatalogUnchanged())) {
+					t.Fatalf("unchanged receipt: %#v", skills)
+				}
+			case "changed":
+				if len(skills) != 1 || skills[0].Unchanged || skills[0].StartupDedup {
+					t.Fatalf("changed receipt: %#v", skills)
+				}
+			case "hook":
+				if len(receipt.Spans) < 2 || receipt.Spans[0].Key != "system_prompt" ||
+					!receipt.Spans[0].HookModified ||
+					len(skills) != 1 ||
+					!skills[0].StartupDedup {
+					t.Fatalf("opaque receipt: %#v", receipt)
+				}
+			}
+
+			records, err := acpmock.ReadDiagnostics(diagnostics)
+			if err != nil {
+				t.Fatal(err)
+			}
+			prompts := acpmock.PromptDiagnostics(records)
+			if len(prompts) == 0 {
+				t.Fatal("no receiver diagnostics")
+			}
+			prompt := prompts[len(prompts)-1].Prompt
+			t.Logf(
+				"payload %s bytes=%d skills=%d unchanged=%t situation=%t",
+				label,
+				len(prompt),
+				strings.Count(prompt, "<skill name="),
+				strings.Contains(prompt, `<catalog-state unchanged="true">`),
+				strings.Contains(prompt, "<compozy-situation-context>"),
+			)
+			return prompt
+		}
+		var parent *session.Session
+		create := func(role string) *session.Session {
+			t.Helper()
+			var created *session.Session
+			var err error
+			if role == session.SpawnRoleAutoTitle {
+				created, err = manager.Spawn(t.Context(), session.SpawnOpts{
+					ParentSessionID: parent.ID, AgentName: workspace.Agents[0].Name, SpawnRole: role, TTL: time.Minute,
+				})
+			} else {
+				sessionType := session.SessionTypeUser
+				created, err = manager.Create(t.Context(), new(session.CreateOpts{
+					AgentName: workspace.Agents[0].Name, Workspace: workspace.ID, Type: sessionType,
+					Lineage: &store.SessionLineage{SpawnRole: role},
+				}))
+			}
+			if err != nil {
+				t.Fatal(err)
+			}
+			owner := manager
+			t.Cleanup(func() {
+				if err := owner.Stop(context.Background(), created.ID); err != nil {
+					t.Errorf("Stop: %v", err)
+				}
+			})
+			return created
+		}
+		ordinary := create("")
+		parent = ordinary
+		first := send(ordinary, "first")
+		second := send(ordinary, "unchanged")
+		writeDaemonFile(
+			t,
+			filepath.Join(homePaths.SkillsDir, "measured-added", "SKILL.md"),
+			"---\nname: measured-added\ndescription: Added during the session.\n---\nRead when requested.\n",
+		)
+		waitForConditionWithin(t, "added catalog entry", 10*time.Second, func() bool {
+			entries, err := daemonInstance.skillsRegistry.ForWorkspace(t.Context(), &workspace)
+			return err == nil && strings.Contains(skillspkg.BuildCurrentCatalog(entries), `name="measured-added"`)
+		})
+		changed := send(ordinary, "changed")
+		assertCatalog := func(label, prompt string, expected []string) {
+			t.Helper()
+			var names []string
+			for _, match := range extensionPromptSkillNamePattern.FindAllStringSubmatch(prompt, -1) {
+				names = append(names, match[1])
+			}
+			assertSkillNames(t, label, names, expected)
+		}
+		assertCatalog("first payload", first, expectedSkills)
+		assertCatalog("unchanged payload", second, nil)
+		assertCatalog("changed payload", changed, append(slices.Clone(expectedSkills), "measured-added"))
+		if !strings.Contains(first, `<catalog-state unchanged="true">`) {
+			t.Errorf("first payload must contain the startup catalog once and the live marker")
+		}
+		if !strings.Contains(second, `<catalog-state unchanged="true">`) {
+			t.Errorf("unchanged payload must contain only the marker")
+		}
+		if strings.Contains(changed, `<catalog-state unchanged="true">`) {
+			t.Errorf("changed payload must contain the new full catalog")
+		}
+		for _, role := range []string{session.SpawnRoleAutoTitle} {
+			prompt := send(create(role), role)
+			for _, section := range []string{"<available-skills>", "<current-available-skills>", "<compozy-situation-context>"} {
+				if strings.Contains(prompt, section) {
+					t.Errorf("%s contains unusable %s", role, section)
+				}
+			}
+			if !strings.Contains(prompt, "<compozy-runtime-context>") ||
+				!strings.Contains(prompt, "You are a coding assistant.") ||
+				!strings.HasSuffix(prompt, "Measure this prompt.") {
+				t.Errorf("%s lost its runtime, instructions, or input", role)
+			}
+		}
+		logical, err := manager.CreateAccepted(t.Context(), new(session.CreateAcceptedOpts{
+			Session: session.CreateOpts{AgentName: workspace.Agents[0].Name, Workspace: workspace.ID},
+		}))
+		if err != nil {
+			t.Fatal(err)
+		}
+		logicalSession, ok := manager.Get(logical.ID)
+		if !ok {
+			t.Fatal("accepted session missing")
+		}
+		logicalOwner := manager
+		t.Cleanup(func() {
+			if err := logicalOwner.Stop(context.Background(), logical.ID); err != nil {
+				t.Errorf("Stop logical: %v", err)
+			}
+		})
+		logicalPrompt := send(logicalSession, "first")
+		assertCatalog("logical first payload", logicalPrompt, append(slices.Clone(expectedSkills), "measured-added"))
+		beforeStop, err := manager.Deliveries(t.Context(), ordinary.ID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := manager.Stop(t.Context(), ordinary.ID); err != nil {
+			t.Fatal(err)
+		}
+		afterStop, err := manager.Deliveries(t.Context(), ordinary.ID)
+		if err != nil || !reflect.DeepEqual(beforeStop, afterStop) {
+			t.Fatalf("stopped receipts changed: %v", err)
+		}
+		runtimeHooks := hookspkg.NewHooks(
+			hookspkg.WithLogger(discardLogger()),
+			hookspkg.WithNativeDeclarations(
+				[]hookspkg.HookDecl{
+					{
+						Name:         "replace-startup",
+						Event:        hookspkg.HookPromptPostAssemble,
+						Mode:         hookspkg.HookModeSync,
+						ExecutorKind: hookspkg.HookExecutorNative,
+					},
+				},
+			),
+			hookspkg.WithExecutorResolver(
+				daemonExecutorResolver(
+					map[string]hookspkg.Executor{
+						"replace-startup": hookspkg.NewTypedNativeExecutor(
+							func(_ context.Context, _ hookspkg.RegisteredHook, payload hookspkg.PromptPayload) (hookspkg.PromptPatch, error) {
+								text := "Hook replacement\n\n" + payload.Prompt
+								return hookspkg.PromptPatch{Prompt: &text}, nil
+							},
+						),
+					},
+				),
+			),
+		)
+		t.Cleanup(runtimeHooks.Close)
+		if err := runtimeHooks.Rebuild(t.Context()); err != nil {
+			t.Fatal(err)
+		}
+		manager = newHarnessIntegrationManager(
+			t,
+			homePaths,
+			deps,
+			workspace,
+			session.NewACPDriverAdapter(acp.New(acp.WithProviderPreStarter(daemonInstance.providerPreStarter))),
+			session.WithHookSet(session.HookSet{Prompt: runtimeHooks}),
+		)
+		send(create(""), "hook")
+
+	})
+}
+
+func seedHarnessSituationTaskRun(
+	t *testing.T,
+	daemonInstance *Daemon,
+	workspaceID string,
+	workspaceRoot string,
+	sessionID string,
+) {
+	t.Helper()
+
+	if daemonInstance.tasks == nil || daemonInstance.tasks.store == nil {
+		t.Fatal("daemon task store is unavailable")
+	}
+	now := time.Date(2026, 4, 26, 12, 0, 0, 0, time.UTC)
+	if err := daemonInstance.registry.InsertWorkspace(testutil.Context(t), workspacepkg.Workspace{
+		ID:        workspaceID,
+		RootDir:   workspaceRoot,
+		Name:      "workspace",
+		CreatedAt: now,
+		UpdatedAt: now,
+	}); err != nil {
+		t.Fatalf("InsertWorkspace() error = %v", err)
+	}
+	taskRecord := taskpkg.Task{
+		ID:          "task-run-context",
+		ProfileID:   store.DefaultProfileID,
+		Identifier:  "AUTO-CTX",
+		Scope:       taskpkg.ScopeWorkspace,
+		WorkspaceID: workspaceID,
+		Title:       "Render situation context",
+		Status:      taskpkg.TaskStatusInProgress,
+		Priority:    taskpkg.PriorityHigh,
+		CreatedBy:   taskpkg.ActorIdentity{Kind: taskpkg.ActorKindDaemon, Ref: "test"},
+		Origin:      taskpkg.Origin{Kind: taskpkg.OriginKindDaemon, Ref: "test"},
+		CreatedAt:   now,
+		UpdatedAt:   now,
+	}
+	if err := daemonInstance.tasks.store.CreateTask(testutil.Context(t), taskRecord); err != nil {
+		t.Fatalf("CreateTask() error = %v", err)
+	}
+	run := taskpkg.Run{
+		ID:        "run-context",
+		TaskID:    taskRecord.ID,
+		Status:    taskpkg.TaskRunStatusRunning,
+		Attempt:   1,
+		SessionID: sessionID,
+		Origin:    taskpkg.Origin{Kind: taskpkg.OriginKindDaemon, Ref: "test"},
+		Metadata:  json.RawMessage(`{"workflow_id":"wf-run-1"}`),
+		QueuedAt:  now,
+		StartedAt: now.Add(time.Minute),
+	}
+	seedDaemonTaskRunLifecycle(t, daemonInstance.tasks.store, run)
+}
+
+func bootHarnessPolicyDaemon(
+	t *testing.T,
+	homePaths compozyconfig.HomePaths,
+	cfg *compozyconfig.Config,
+) (*Daemon, SessionManagerDeps) {
+	t.Helper()
+
+	var capturedDeps SessionManagerDeps
+
+	d, err := New(
+		WithHomePaths(homePaths),
+		WithConfig(cfg),
+		WithLogger(discardLogger()),
+	)
+	if err != nil {
+		t.Fatalf("New() error = %v", err)
+	}
+	d.newSessionManager = func(_ context.Context, deps SessionManagerDeps) (SessionManager, error) {
+		capturedDeps = deps
+		return &fakeSessionManager{}, nil
+	}
+	d.newObserver = func(context.Context, RuntimeDeps) (Observer, error) {
+		return &fakeObserver{}, nil
+	}
+	d.httpFactory = func(context.Context, RuntimeDeps) (Server, error) {
+		return &fakeServer{name: "http"}, nil
+	}
+	d.udsFactory = func(context.Context, RuntimeDeps) (Server, error) {
+		return &fakeServer{name: "uds"}, nil
+	}
+
+	if err := d.boot(testutil.Context(t)); err != nil {
+		t.Fatalf("boot() error = %v", err)
+	}
+	return d, capturedDeps
+}
+
+func newHarnessIntegrationManager(
+	t *testing.T,
+	homePaths compozyconfig.HomePaths,
+	deps SessionManagerDeps,
+	resolvedWorkspace workspacepkg.ResolvedWorkspace,
+	driver session.AgentDriver,
+	extraOpts ...session.Option,
+) *session.Manager {
+	t.Helper()
+
+	opts := []session.Option{
+		session.WithHomePaths(homePaths),
+		session.WithDriver(driver),
+		session.WithWorkspaceResolver(&harnessIntegrationWorkspaceResolver{resolved: resolvedWorkspace}),
+		session.WithStore(
+			func(ctx context.Context, owner store.SessionDBOwner, path string) (session.EventRecorder, error) {
+				return sessiondb.OpenSessionDB(ctx, owner, path)
+			},
+		),
+		session.WithLogger(discardLogger()),
+		session.WithPromptAssembler(deps.PromptAssembler),
+		session.WithStartupPromptOverlay(deps.StartupPromptOverlay),
+		session.WithPromptInputAugmenter(deps.PromptInputAugmenter),
+		session.WithSkillRegistry(deps.SkillRegistry),
+		session.WithMCPResolver(deps.MCPResolver),
+	}
+	opts = append(opts, extraOpts...)
+	manager, err := session.NewManager(opts...)
+	if err != nil {
+		t.Fatalf("session.NewManager() error = %v", err)
+	}
+	return manager
+}
+
+func drainHarnessIntegrationEvents(events <-chan acp.AgentEvent) {
+	for range events {
+	}
+}
+
+func newHarnessIntegrationWorkspace(
+	t *testing.T,
+	homePaths compozyconfig.HomePaths,
+	cfg compozyconfig.Config,
+	root string,
+) workspacepkg.ResolvedWorkspace {
+	t.Helper()
+	cfg.Providers = compozyconfig.CloneProviderConfigs(cfg.Providers)
+	builtinProviders := compozyconfig.BuiltinProviders()
+	for name := range builtinProviders {
+		provider, err := cfg.ResolveProvider(name)
+		if err != nil {
+			t.Fatalf("ResolveProvider(%q) error = %v", name, err)
+		}
+		if providerexec.StrategyFor(provider).Kind != providerexec.StrategyNativeCLIBridge {
+			continue
+		}
+		provider.Command = "test-acp-driver"
+		cfg.Providers[name] = provider
+	}
+	for name, provider := range cfg.Providers {
+		if _, builtin := builtinProviders[name]; builtin {
+			continue
+		}
+		if providerexec.StrategyFor(provider).Kind != providerexec.StrategyNativeCLIBridge {
+			continue
+		}
+		provider.Command = "test-acp-driver"
+		cfg.Providers[name] = provider
+	}
+
+	if err := compozyconfig.EnsureHomeLayout(homePaths); err != nil {
+		t.Fatalf("EnsureHomeLayout() error = %v", err)
+	}
+	if err := os.MkdirAll(root, 0o755); err != nil {
+		t.Fatalf("os.MkdirAll(%q) error = %v", root, err)
+	}
+
+	return workspacepkg.ResolvedWorkspace{
+		ID:      "ws-harness",
+		RootDir: root,
+		Name:    "workspace",
+		Config:  cfg,
+		Agents: []compozyconfig.AgentDef{
+			{
+				Name:     "coder",
+				Provider: "claude",
+				Model:    "test-model",
+				Prompt:   "You are a coding assistant.",
+			},
+		},
+	}
+}
+
+type harnessIntegrationWorkspaceResolver struct {
+	resolved workspacepkg.ResolvedWorkspace
+}
+
+var _ workspacepkg.ProfileRegistrationResolver = (*harnessIntegrationWorkspaceResolver)(nil)
+
+func (r *harnessIntegrationWorkspaceResolver) Resolve(
+	_ context.Context,
+	idOrPath string,
+) (workspacepkg.ResolvedWorkspace, error) {
+	target := strings.TrimSpace(idOrPath)
+	switch target {
+	case r.resolved.ID, r.resolved.Name, r.resolved.RootDir:
+		return r.resolved, nil
+	default:
+		return workspacepkg.ResolvedWorkspace{}, workspacepkg.ErrWorkspaceNotFound
+	}
+}
+
+func (r *harnessIntegrationWorkspaceResolver) ResolveForProfile(
+	ctx context.Context,
+	idOrPath string,
+	profileName string,
+) (workspacepkg.ResolvedWorkspace, error) {
+	resolved, err := r.Resolve(ctx, idOrPath)
+	if err != nil {
+		return workspacepkg.ResolvedWorkspace{}, err
+	}
+	resolved.ProfileName = strings.TrimSpace(profileName)
+	return resolved, nil
+}
+
+func (r *harnessIntegrationWorkspaceResolver) ResolveOrRegister(
+	_ context.Context,
+	path string,
+) (workspacepkg.ResolvedWorkspace, error) {
+	if strings.TrimSpace(path) == strings.TrimSpace(r.resolved.RootDir) {
+		return r.resolved, nil
+	}
+	return workspacepkg.ResolvedWorkspace{}, workspacepkg.ErrWorkspaceNotFound
+}
+
+func (r *harnessIntegrationWorkspaceResolver) ResolveOrRegisterForProfile(
+	ctx context.Context,
+	path string,
+	profileName string,
+) (workspacepkg.ResolvedWorkspace, error) {
+	resolved, err := r.ResolveOrRegister(ctx, path)
+	if err != nil {
+		return workspacepkg.ResolvedWorkspace{}, err
+	}
+	resolved.ProfileName = strings.TrimSpace(profileName)
+	return resolved, nil
+}
+
+type harnessIntegrationDriver struct {
+	mu          sync.Mutex
+	startCalls  []acp.StartOpts
+	promptCalls []acp.PromptRequest
+	processes   map[*session.AgentProcess]*harnessIntegrationProcess
+	sequence    int
+	startHook   func(acp.StartOpts, int) error
+	promptHook  func(context.Context, *session.AgentProcess, acp.PromptRequest) (<-chan acp.AgentEvent, error)
+	cancelHook  func(context.Context, *session.AgentProcess) error
+	// exitedPID/exitedStartedAt name a real process that already exited, so the
+	// fake's recorded identity is provably dead wherever the daemon verifies exit
+	// from persisted liveness instead of the driver seam.
+	exitedPID       int
+	exitedStartedAt time.Time
+}
+
+// exitedHarnessProcessIdentity runs the test binary as an immediately exiting
+// helper and returns its identity; a placeholder PID would be unverifiable.
+func exitedHarnessProcessIdentity() (int, time.Time) {
+	startedAt := time.Now().UTC()
+	binary, err := os.Executable()
+	if err != nil {
+		return 1, startedAt
+	}
+	cmd := exec.Command(binary, "-test.run=^$")
+	cmd.Env = append(os.Environ(), "COMPOZY_TEST_DAEMON_SESSION_STOP_HELPER=1")
+	if err := cmd.Run(); err != nil || cmd.Process == nil {
+		return 1, startedAt
+	}
+	return cmd.Process.Pid, startedAt
+}
+
+type harnessIntegrationProcess struct {
+	done   chan struct{}
+	closed bool
+	handle *session.AgentProcess
+}
+
+func newHarnessIntegrationDriver() *harnessIntegrationDriver {
+	exitedPID, exitedStartedAt := exitedHarnessProcessIdentity()
+	return &harnessIntegrationDriver{
+		processes:       make(map[*session.AgentProcess]*harnessIntegrationProcess),
+		exitedPID:       exitedPID,
+		exitedStartedAt: exitedStartedAt,
+	}
+}
+
+func (d *harnessIntegrationDriver) Start(_ context.Context, opts acp.StartOpts) (*session.AgentProcess, error) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+
+	d.sequence++
+	copied := opts
+	copied.AdditionalDirs = append([]string(nil), opts.AdditionalDirs...)
+	copied.Env = append([]string(nil), opts.Env...)
+	copied.MCPServers = append([]compozyconfig.MCPServer(nil), opts.MCPServers...)
+	d.startCalls = append(d.startCalls, copied)
+	if d.startHook != nil {
+		if err := d.startHook(copied, d.sequence); err != nil {
+			return nil, err
+		}
+	}
+
+	sessionID := fmt.Sprintf("acp-%d", d.sequence)
+	if copied.ResumeSessionID != "" {
+		sessionID = copied.ResumeSessionID
+	}
+
+	proc := newHarnessIntegrationProcess(
+		copied.AgentName, copied.Command, copied.Cwd, sessionID, d.exitedPID, d.exitedStartedAt,
+	)
+	d.processes[proc.handle] = proc
+	return proc.handle, nil
+}
+
+func (d *harnessIntegrationDriver) Prompt(
+	ctx context.Context,
+	proc *session.AgentProcess,
+	req acp.PromptRequest,
+) (<-chan acp.AgentEvent, error) {
+	d.mu.Lock()
+	if d.processes[proc] == nil {
+		d.mu.Unlock()
+		return nil, fmt.Errorf("test: unknown process")
+	}
+	d.promptCalls = append(d.promptCalls, req)
+	hook := d.promptHook
+	d.mu.Unlock()
+	if hook != nil {
+		return hook(ctx, proc, req)
+	}
+
+	events := make(chan acp.AgentEvent, 2)
+	go func() {
+		defer close(events)
+		ts := time.Now().UTC()
+		totalTokens := int64(3)
+		events <- acp.AgentEvent{
+			Type:      acp.EventTypeAgentMessage,
+			SessionID: proc.SessionID,
+			TurnID:    req.TurnID,
+			Timestamp: ts,
+			Text:      "reply",
+		}
+		events <- acp.AgentEvent{
+			Type:             acp.EventTypeDone,
+			SessionID:        proc.SessionID,
+			TurnID:           req.TurnID,
+			Timestamp:        ts,
+			StopReason:       string(acp.PromptStopReasonEndTurn),
+			PromptStopReason: acp.PromptStopReasonEndTurn,
+			Usage: &acp.TokenUsage{
+				TurnID:      req.TurnID,
+				TotalTokens: &totalTokens,
+				Timestamp:   ts,
+			},
+		}
+	}()
+	return events, nil
+}
+
+func (d *harnessIntegrationDriver) Cancel(ctx context.Context, proc *session.AgentProcess) error {
+	d.mu.Lock()
+	hook := d.cancelHook
+	d.mu.Unlock()
+	if hook != nil {
+		return hook(ctx, proc)
+	}
+	return nil
+}
+
+func (d *harnessIntegrationDriver) Stop(_ context.Context, proc *session.AgentProcess) error {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+
+	fakeProc := d.processes[proc]
+	if fakeProc == nil {
+		return nil
+	}
+	fakeProc.exit()
+	return nil
+}
+
+// VerifyExit is the fake's OS-identity seam: the placeholder PID never maps to
+// a host process, so exit is proven by the done channel alone.
+func (d *harnessIntegrationDriver) VerifyExit(proc *session.AgentProcess) (bool, error) {
+	if proc == nil {
+		return true, nil
+	}
+	select {
+	case <-proc.Done():
+		return true, nil
+	default:
+		return false, nil
+	}
+}
+
+func newHarnessIntegrationProcess(
+	agentName string,
+	command string,
+	cwd string,
+	sessionID string,
+	pid int,
+	startedAt time.Time,
+) *harnessIntegrationProcess {
+	proc := &harnessIntegrationProcess{
+		done: make(chan struct{}),
+	}
+	proc.handle = session.NewAgentProcess(session.AgentProcessOptions{
+		PID:       pid,
+		AgentName: agentName,
+		Command:   command,
+		Cwd:       cwd,
+		SessionID: sessionID,
+		Caps: acp.Caps{
+			SupportsLoadSession: true,
+			SupportedModes:      []string{"chat"},
+		},
+		StartedAt: startedAt,
+		Done:      proc.done,
+		Wait: func() error {
+			<-proc.done
+			return nil
+		},
+	})
+	return proc
+}
+
+func (p *harnessIntegrationProcess) exit() {
+	if p == nil || p.closed {
+		return
+	}
+	p.closed = true
+	close(p.done)
+}
+
+func (r *harnessIntegrationWorkspaceResolver) Get(ctx context.Context, ref string) (workspacepkg.Workspace, error) {
+	resolved, err := r.Resolve(ctx, ref)
+	if err != nil {
+		return workspacepkg.Workspace{}, err
+	}
+	return workspacepkg.Workspace{ID: resolved.ID, Name: resolved.Name, RootDir: resolved.RootDir}, nil
+}

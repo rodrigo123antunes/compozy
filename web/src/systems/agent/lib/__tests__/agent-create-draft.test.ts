@@ -1,0 +1,344 @@
+import { describe, expect, it } from "vitest";
+
+import type { RuntimeProviderOption } from "@/systems/runtime";
+
+import {
+  buildCreateAgentParams,
+  buildDraftFromAgentPayload,
+  buildDuplicateAgentParams,
+  createDefaultAgentCreateDraft,
+  validateAgentCreateDraft,
+  type AgentCreateDialogDraft,
+  type AgentCreateValidationContext,
+} from "../agent-create-draft";
+import {
+  agentIdentityPatchPayload,
+  withAutoAvatarColor,
+  type AgentIdentityPatch,
+} from "../agent-create-identity";
+import type { AgentPayload } from "../../types";
+
+const providerOptions: readonly RuntimeProviderOption[] = [{ id: "codex", name: "Codex" }];
+
+const context: AgentCreateValidationContext = {
+  hasActiveWorkspace: false,
+  providerOptions,
+  providersError: null,
+  providersLoading: false,
+};
+
+// Invariant: agent create and duplicate payloads preserve typed ACP option
+// selections while omitting absent overrides and never stringifying booleans.
+// Owning layer: agent draft and request mappers.
+// Canonical suite: agent-create-draft unit suite.
+
+/** A globally-scoped draft that is valid apart from the reasoning field under test. */
+function baseDraft(reasoningEffort: string): AgentCreateDialogDraft {
+  return {
+    ...createDefaultAgentCreateDraft(false),
+    scope: "global",
+    name: "release-captain",
+    provider: "codex",
+    prompt: "Own release readiness.",
+    reasoningEffort: reasoningEffort as AgentCreateDialogDraft["reasoningEffort"],
+  };
+}
+
+describe("agent-create-draft name validation", () => {
+  it.each(["designer", "designer2", "audio-designer", "audio_designer", "a".repeat(106)])(
+    "Should accept the canonical agent name %s",
+    name => {
+      const validation = validateAgentCreateDraft({ ...baseDraft(""), name }, context);
+
+      expect(validation.fields.name).toBeUndefined();
+      expect(validation.simpleValid).toBe(true);
+      expect(validation.canSubmit).toBe(true);
+    }
+  );
+
+  it.each([
+    "audio designer",
+    "AudioDesigner",
+    "2designer",
+    "audio.designer",
+    "áudio_designer",
+    "a".repeat(107),
+  ])("Should reject the noncanonical agent name %s", name => {
+    const draft = { ...baseDraft(""), name };
+    const validation = validateAgentCreateDraft(draft, context);
+
+    expect(validation.fields.name).toBe(
+      "Start with a lowercase letter, use only lowercase letters, numbers, hyphens, or underscores, and use at most 106 characters."
+    );
+    expect(validation.simpleValid).toBe(false);
+    expect(validation.canSubmit).toBe(false);
+    expect(buildCreateAgentParams(draft, null, context)).toBeNull();
+  });
+});
+
+describe("agent-create-draft reasoning effort validation", () => {
+  it("Should inherit project runtime when no provider override is authored", () => {
+    const draft = {
+      ...baseDraft(""),
+      provider: "",
+      model: "",
+    };
+
+    const validation = validateAgentCreateDraft(draft, context);
+    expect(validation.fields.provider).toBeUndefined();
+    expect(validation.simpleValid).toBe(true);
+
+    const params = buildCreateAgentParams(draft, null, context);
+    expect(params).not.toBeNull();
+    expect(params?.agent).not.toHaveProperty("provider");
+    expect(params?.agent).not.toHaveProperty("model");
+    expect(params?.agent).not.toHaveProperty("reasoning_effort");
+  });
+
+  it("Should flag an off-contract reasoning effort as a runtime-step field error", () => {
+    const validation = validateAgentCreateDraft(baseDraft("invalid effort"), context);
+
+    expect(validation.fields.reasoningEffort).toBe("Choose a valid reasoning effort.");
+    expect(validation.simpleValid).toBe(false);
+    expect(validation.canSubmit).toBe(false);
+  });
+
+  it("Should return null from buildCreateAgentParams for an off-contract reasoning effort", () => {
+    expect(buildCreateAgentParams(baseDraft("invalid effort"), null, context)).toBeNull();
+  });
+
+  it("Should accept the canonical empty effort as provider default and omit it from the request", () => {
+    const validation = validateAgentCreateDraft(baseDraft(""), context);
+    expect(validation.fields.reasoningEffort).toBeUndefined();
+    expect(validation.simpleValid).toBe(true);
+
+    const params = buildCreateAgentParams(baseDraft(""), null, context);
+    expect(params).not.toBeNull();
+    expect(params?.agent).not.toHaveProperty("reasoning_effort");
+  });
+
+  it("Should carry a canonical reasoning effort through to the built request", () => {
+    const params = buildCreateAgentParams(baseDraft("high"), null, context);
+    expect(params?.agent.reasoning_effort).toBe("high");
+  });
+
+  it("Should carry the agent Fast default through to the built request", () => {
+    const params = buildCreateAgentParams({ ...baseDraft("high"), speed: "fast" }, null, context);
+
+    expect(params?.agent.speed).toBe("fast");
+  });
+
+  it("Should carry typed ACP selections through to the create request", () => {
+    const params = buildCreateAgentParams(
+      {
+        ...baseDraft(""),
+        acpOptions: [
+          { id: "context", value_id: "1m" },
+          { id: "thinking", bool_value: true },
+        ],
+      },
+      null,
+      context
+    );
+
+    expect(params?.agent.acp_options).toEqual([
+      { id: "context", value_id: "1m" },
+      { id: "thinking", bool_value: true },
+    ]);
+  });
+});
+
+describe("agent-create-draft disclosure tiers", () => {
+  it("Should isolate an advanced-only failure from the Simple tier so submit can reveal it", () => {
+    const validation = validateAgentCreateDraft({ ...baseDraft(""), tools: ["  "] }, context);
+
+    expect(validation.fields.tools).toBe("Tool entries cannot be blank.");
+    expect(validation.advancedValid).toBe(false);
+    expect(validation.simpleValid).toBe(true);
+    expect(validation.canSubmit).toBe(false);
+  });
+
+  it("Should keep an invalid group out of the Simple tier so submit can reveal it", () => {
+    const validation = validateAgentCreateDraft(
+      { ...baseDraft(""), categoryPath: "operations//incident" },
+      context
+    );
+
+    expect(validation.fields.categoryPath).toBe("Group can't contain empty parts between slashes.");
+    expect(validation.advancedValid).toBe(false);
+    expect(validation.simpleValid).toBe(true);
+    expect(validation.canSubmit).toBe(false);
+  });
+
+  it("Should split the mono category path into contract segments at the adapter boundary", () => {
+    const params = buildCreateAgentParams(
+      { ...baseDraft(""), categoryPath: " operations / incident " },
+      null,
+      context
+    );
+
+    expect(params?.agent.category_path).toEqual(["operations", "incident"]);
+  });
+
+  it("Should never emit an mcp_servers field, which the create payload cannot accept", () => {
+    const params = buildCreateAgentParams(baseDraft("high"), null, context);
+
+    expect(params?.agent).not.toHaveProperty("mcp_servers");
+    expect(JSON.stringify(params)).not.toContain("mcp");
+  });
+});
+
+describe("duplicate draft mapping", () => {
+  const source: AgentPayload = {
+    label: "Release Captain",
+    kind: "on_demand",
+    resolved_appearance: {
+      version: 1,
+      avatar: "generated",
+      seed: "release-captain",
+      generation: 1,
+      color: "#7c5cff",
+    },
+    name: "release-captain",
+    provider: "codex",
+    prompt: "Own release readiness.",
+    model: "gpt-5.4",
+    tools: ["compozy__skill_view"],
+    toolsets: ["compozy__catalog"],
+    deny_tools: ["compozy__task_*"],
+    origin: "workspace",
+    definition_digest: "d".repeat(64),
+    category_path: ["Engineering", "Release"],
+    skills: { disabled: ["copywriting"] },
+  };
+
+  it("Should map payload into a blank-name draft", () => {
+    const draft = buildDraftFromAgentPayload(source, true);
+    expect(draft.name).toBe("");
+    expect(draft.scope).toBe("workspace");
+    expect(draft.provider).toBe("codex");
+    expect(draft.model).toBe("gpt-5.4");
+    expect(draft.tools).toEqual(["compozy__skill_view"]);
+    expect(draft.categoryPath).toBe("Engineering/Release");
+    expect(draft.disabledSkills).toEqual(["copywriting"]);
+  });
+
+  it("Should build override-diff duplicate params and never a create body", () => {
+    const draft = {
+      ...buildDraftFromAgentPayload(source, true),
+      name: "release-captain-copy",
+      prompt: "Own release readiness, carefully.",
+    };
+    const workspaceContext: AgentCreateValidationContext = {
+      ...context,
+      hasActiveWorkspace: true,
+      providerOptions,
+    };
+    const params = buildDuplicateAgentParams(source, draft, "ws_alpha", workspaceContext);
+    expect(params).toEqual({
+      name: "release-captain-copy",
+      scope: "workspace",
+      workspace: "ws_alpha",
+      overrides: {
+        prompt: "Own release readiness, carefully.",
+      },
+    });
+    expect(params).not.toHaveProperty("agent");
+  });
+
+  it("Should include changed typed ACP selections in duplicate overrides", () => {
+    const sourceWithOptions = {
+      ...source,
+      acp_options: [{ id: "thinking", bool_value: true }],
+    } as AgentPayload;
+    const draft = {
+      ...buildDraftFromAgentPayload(sourceWithOptions, true),
+      name: "release-captain-copy",
+      acpOptions: [{ id: "thinking", bool_value: false }],
+    };
+    const workspaceContext: AgentCreateValidationContext = {
+      ...context,
+      hasActiveWorkspace: true,
+      providerOptions,
+    };
+
+    const params = buildDuplicateAgentParams(
+      sourceWithOptions,
+      draft,
+      "ws_alpha",
+      workspaceContext
+    );
+    expect(params?.overrides).toEqual({ acp_options: [{ id: "thinking", bool_value: false }] });
+  });
+
+  it("Should include a changed Fast default in duplicate overrides", () => {
+    const draft = {
+      ...buildDraftFromAgentPayload(source, true),
+      name: "release-captain-copy",
+      speed: "fast" as const,
+    };
+    const workspaceContext: AgentCreateValidationContext = {
+      ...context,
+      hasActiveWorkspace: true,
+      providerOptions,
+    };
+
+    const params = buildDuplicateAgentParams(source, draft, "ws_alpha", workspaceContext);
+    expect(params?.overrides).toEqual({ speed: "fast" });
+  });
+
+  it("Should return null when the duplicate name is noncanonical", () => {
+    const draft = {
+      ...buildDraftFromAgentPayload(source, true),
+      name: "release captain copy",
+    };
+    const workspaceContext: AgentCreateValidationContext = {
+      ...context,
+      hasActiveWorkspace: true,
+      providerOptions,
+    };
+
+    expect(buildDuplicateAgentParams(source, draft, "ws_alpha", workspaceContext)).toBeNull();
+  });
+});
+
+// Invariant: every face the profile header's avatar editor saves goes out with `version: 1`
+// and a `#rrggbb` color, the block `ValidateAgentAppearance` in internal/config accepts (#1204).
+describe("profile identity patch mapping", () => {
+  const colors = ["#2aa8a8", "#e5484d"];
+  const saved = (appearance: AgentIdentityPatch["appearance"]) =>
+    agentIdentityPatchPayload({ appearance }, colors).appearance;
+
+  it("Should give an Auto generated face a version and a seeded color", () => {
+    expect(saved({ avatar: "generated", seed: "issue-watch.2", generation: 1 })).toEqual({
+      version: 1,
+      avatar: "generated",
+      seed: "issue-watch.2",
+      generation: 1,
+      color: expect.stringMatching(/^#[0-9a-f]{6}$/u),
+    });
+  });
+
+  it("Should save an Auto face with the color its preview shows", () => {
+    const face = { avatar: "generated", seed: "issue-watch.4", generation: 1 } as const;
+    expect(saved(face)?.color).toBe(withAutoAvatarColor(face, colors).color);
+  });
+
+  it.each([
+    [{ avatar: "generated", seed: "issue-watch", generation: 1, color: "#e5484d" }],
+    [{ avatar: "icon", icon: "radar", color: "#2aa8a8" }],
+    [{ avatar: "emoji", emoji: "🦊", color: "#e5484d" }],
+    [{ avatar: "icon", icon: "radar", color: "#2aa8a8", background: "none" }],
+  ] as const)("Should keep a picked face and version it: %o", appearance => {
+    expect(saved(appearance as AgentIdentityPatch["appearance"])).toEqual({
+      version: 1,
+      ...appearance,
+    });
+  });
+
+  it("Should leave the saved face alone when only the words change", () => {
+    expect(agentIdentityPatchPayload({ display_name: "Issue Watch" }, colors)).toEqual({
+      display_name: "Issue Watch",
+    });
+  });
+});

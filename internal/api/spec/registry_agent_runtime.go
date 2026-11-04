@@ -1,0 +1,355 @@
+package spec
+
+import "github.com/compozy/compozy/internal/api/contract"
+
+func registryAgentRuntimeOperations() []OperationSpec {
+	return []OperationSpec{
+		getAgentMeOperationSpec(),
+		getAgentContextOperationSpec(),
+		claimNextAgentTaskOperationSpec(),
+		startAgentTaskRunOperationSpec(),
+		heartbeatAgentTaskRunOperationSpec(),
+		completeAgentTaskRunOperationSpec(),
+		failAgentTaskRunOperationSpec(),
+		releaseAgentTaskRunOperationSpec(),
+		spawnAgentSessionOperationSpec(),
+		notifyOperatorOperationSpec(),
+		getAgentCoordinatorConfigOperationSpec(),
+	}
+}
+
+func notifyOperatorOperationSpec() OperationSpec {
+	return OperationSpec{
+		Method: httpMethodPost, Path: "/api/agent/notify",
+		AppAccess:   AppAccessDenied,
+		OperationID: "notifyOperator", Summary: "Notify live operator clients from the calling agent",
+		Tags: []string{specAgentKey}, Transports: []Transport{TransportHTTP, TransportUDS},
+		RequestBody: contract.AgentNotifyRequest{},
+		Responses: []ResponseSpec{
+			{Status: 200, Description: "Notification outcome", Body: contract.AgentNotifyResponse{}},
+			{
+				Status:      401,
+				Description: specAgentCallerIdentityIsMissingDescription,
+				Body:        contract.ErrorPayload{},
+			},
+			{
+				Status:      403,
+				Description: specForbiddenWorkspaceOrPermissionMismatchDescription,
+				Body:        contract.ErrorPayload{},
+			},
+			{Status: 422, Description: "Invalid notification", Body: contract.ErrorPayload{}},
+			{
+				Status:      503,
+				Description: specServiceUnavailableDependentServiceMissingDescription,
+				Body:        contract.ErrorPayload{},
+			},
+			{Status: 500, Description: specInternalServerErrorDescription, Body: contract.ErrorPayload{}},
+		},
+	}
+}
+
+func startAgentTaskRunOperationSpec() OperationSpec {
+	return OperationSpec{
+		Method:      httpMethodPost,
+		Path:        "/api/agent/tasks/{run_id}/start",
+		AppAccess:   AppAccessDenied,
+		OperationID: "startAgentTaskRun",
+		Summary:     "Start a claimed task run under the calling agent's lease",
+		Tags:        []string{specAgentKey, specTasksKey},
+		Transports:  []Transport{TransportHTTP, TransportUDS},
+		Parameters: []ParameterSpec{
+			pathParam("run_id", "Task run id"),
+		},
+		RequestBody: contract.StartTaskRunRequest{},
+		Responses: []ResponseSpec{
+			{Status: 200, Description: "OK", Body: contract.TaskRunResponse{}},
+			{Status: 401, Description: specAgentCallerIdentityIsMissingDescription, Body: contract.ErrorPayload{}},
+			{
+				Status:      403,
+				Description: specForbiddenWorkspaceOrPermissionMismatchDescription,
+				Body:        contract.ErrorPayload{},
+			},
+			{Status: 404, Description: specTaskRunNotFoundDescription, Body: contract.ErrorPayload{}},
+			{Status: 409, Description: "Task-run start conflict", Body: contract.ErrorPayload{}},
+			{Status: 422, Description: "Invalid start request", Body: contract.ErrorPayload{}},
+			{
+				Status:      503,
+				Description: specServiceUnavailableDependentServiceMissingDescription,
+				Body:        contract.ErrorPayload{},
+			},
+			{Status: 500, Description: specInternalServerErrorDescription, Body: contract.ErrorPayload{}},
+		},
+	}
+}
+
+func getAgentMeOperationSpec() OperationSpec {
+	return OperationSpec{
+		Method:      httpMethodGet,
+		Path:        "/api/agent/me",
+		AppAccess:   AppAccessDenied,
+		OperationID: "getAgentMe",
+		Summary:     "Resolve the calling agent session",
+		Tags:        []string{specAgentKey},
+		Transports:  []Transport{TransportHTTP, TransportUDS},
+		Responses: []ResponseSpec{
+			{Status: 200, Description: "OK", Body: contract.AgentMeResponse{}},
+			{Status: 401, Description: specAgentCallerIdentityIsMissingDescription, Body: contract.ErrorPayload{}},
+			{
+				Status:      403,
+				Description: specForbiddenWorkspaceOrPermissionMismatchDescription,
+				Body:        contract.ErrorPayload{},
+			},
+			{Status: 404, Description: "Caller session not found", Body: contract.ErrorPayload{}},
+			{
+				Status:      503,
+				Description: specServiceUnavailableDependentServiceMissingDescription,
+				Body:        contract.ErrorPayload{},
+			},
+			{Status: 500, Description: specInternalServerErrorDescription, Body: contract.ErrorPayload{}},
+		},
+	}
+}
+func getAgentContextOperationSpec() OperationSpec {
+	return OperationSpec{
+		Method:      httpMethodGet,
+		Path:        "/api/agent/context",
+		AppAccess:   AppAccessDenied,
+		OperationID: "getAgentContext",
+		Summary:     "Return the bounded calling-agent situation context",
+		Tags:        []string{specAgentKey},
+		Transports:  []Transport{TransportHTTP, TransportUDS},
+		Responses: []ResponseSpec{
+			{Status: 200, Description: "OK", Body: contract.AgentContextResponse{}},
+			{Status: 401, Description: specAgentCallerIdentityIsMissingDescription, Body: contract.ErrorPayload{}},
+			{
+				Status:      403,
+				Description: specForbiddenWorkspaceOrPermissionMismatchDescription,
+				Body:        contract.ErrorPayload{},
+			},
+			{Status: 404, Description: "Caller session not found", Body: contract.ErrorPayload{}},
+			{
+				Status:      503,
+				Description: specServiceUnavailableDependentServiceMissingDescription,
+				Body:        contract.ErrorPayload{},
+			},
+			{Status: 500, Description: specInternalServerErrorDescription, Body: contract.ErrorPayload{}},
+		},
+	}
+}
+func claimNextAgentTaskOperationSpec() OperationSpec {
+	return OperationSpec{
+		Method:      httpMethodPost,
+		Path:        specAgentTaskClaimNextPath,
+		AppAccess:   AppAccessDenied,
+		OperationID: "claimNextAgentTask",
+		Summary:     "Atomically claim the next matching task run for the calling agent",
+		Tags:        []string{specAgentKey, specTasksKey},
+		Transports:  []Transport{TransportHTTP, TransportUDS},
+		RequestBody: contract.AgentTaskClaimNextRequest{},
+		Responses: []ResponseSpec{
+			{Status: 200, Description: "OK", Body: contract.AgentTaskClaimResponse{}},
+			{Status: 204, Description: "No matching task run is currently claimable"},
+			{Status: 401, Description: specAgentCallerIdentityIsMissingDescription, Body: contract.ErrorPayload{}},
+			{
+				Status:      403,
+				Description: specForbiddenWorkspaceOrPermissionMismatchDescription,
+				Body:        contract.ErrorPayload{},
+			},
+			{Status: 409, Description: "Task-run claim conflict", Body: contract.ErrorPayload{}},
+			{Status: 422, Description: "Invalid claim criteria", Body: contract.ErrorPayload{}},
+			{
+				Status:      503,
+				Description: specTaskAdmissionUnavailableDescription,
+				Body:        contract.ErrorPayload{},
+			},
+			{Status: 500, Description: specInternalServerErrorDescription, Body: contract.ErrorPayload{}},
+		},
+	}
+}
+func heartbeatAgentTaskRunOperationSpec() OperationSpec {
+	return OperationSpec{
+		Method:      httpMethodPost,
+		Path:        "/api/agent/tasks/{run_id}/heartbeat",
+		AppAccess:   AppAccessDenied,
+		OperationID: "heartbeatAgentTaskRun",
+		Summary:     "Extend a claimed task-run lease for the calling agent",
+		Tags:        []string{specAgentKey, specTasksKey},
+		Transports:  []Transport{TransportHTTP, TransportUDS},
+		Parameters: []ParameterSpec{
+			pathParam("run_id", "Task run id"),
+		},
+		RequestBody: contract.AgentTaskHeartbeatRequest{},
+		Responses: []ResponseSpec{
+			{Status: 200, Description: "OK", Body: contract.AgentTaskLeaseResponse{}},
+			{Status: 401, Description: specAgentCallerIdentityIsMissingDescription, Body: contract.ErrorPayload{}},
+			{
+				Status:      403,
+				Description: specForbiddenWorkspaceOrPermissionMismatchDescription,
+				Body:        contract.ErrorPayload{},
+			},
+			{Status: 404, Description: specTaskRunNotFoundDescription, Body: contract.ErrorPayload{}},
+			{Status: 409, Description: "Task-run lease conflict", Body: contract.ErrorPayload{}},
+			{Status: 422, Description: "Invalid heartbeat request", Body: contract.ErrorPayload{}},
+			{
+				Status:      503,
+				Description: specServiceUnavailableDependentServiceMissingDescription,
+				Body:        contract.ErrorPayload{},
+			},
+			{Status: 500, Description: specInternalServerErrorDescription, Body: contract.ErrorPayload{}},
+		},
+	}
+}
+func completeAgentTaskRunOperationSpec() OperationSpec {
+	return OperationSpec{
+		Method:      httpMethodPost,
+		Path:        "/api/agent/tasks/{run_id}/complete",
+		AppAccess:   AppAccessDenied,
+		OperationID: "completeAgentTaskRun",
+		Summary:     "Complete a claimed task run for the calling agent",
+		Tags:        []string{specAgentKey, specTasksKey},
+		Transports:  []Transport{TransportHTTP, TransportUDS},
+		Parameters: []ParameterSpec{
+			pathParam("run_id", "Task run id"),
+		},
+		RequestBody: contract.AgentTaskCompleteRequest{},
+		Responses: []ResponseSpec{
+			{Status: 200, Description: "OK", Body: contract.AgentTaskLeaseResponse{}},
+			{Status: 401, Description: specAgentCallerIdentityIsMissingDescription, Body: contract.ErrorPayload{}},
+			{
+				Status:      403,
+				Description: specForbiddenWorkspaceOrPermissionMismatchDescription,
+				Body:        contract.ErrorPayload{},
+			},
+			{Status: 404, Description: specTaskRunNotFoundDescription, Body: contract.ErrorPayload{}},
+			{Status: 409, Description: "Task-run completion conflict", Body: contract.ErrorPayload{}},
+			{Status: 422, Description: "Invalid completion request", Body: contract.ErrorPayload{}},
+			{
+				Status:      503,
+				Description: specServiceUnavailableDependentServiceMissingDescription,
+				Body:        contract.ErrorPayload{},
+			},
+			{Status: 500, Description: specInternalServerErrorDescription, Body: contract.ErrorPayload{}},
+		},
+	}
+}
+func failAgentTaskRunOperationSpec() OperationSpec {
+	return OperationSpec{
+		Method:      httpMethodPost,
+		Path:        "/api/agent/tasks/{run_id}/fail",
+		AppAccess:   AppAccessDenied,
+		OperationID: "failAgentTaskRun",
+		Summary:     "Fail a claimed task run for the calling agent",
+		Tags:        []string{specAgentKey, specTasksKey},
+		Transports:  []Transport{TransportHTTP, TransportUDS},
+		Parameters: []ParameterSpec{
+			pathParam("run_id", "Task run id"),
+		},
+		RequestBody: contract.AgentTaskFailRequest{},
+		Responses: []ResponseSpec{
+			{Status: 200, Description: "OK", Body: contract.AgentTaskLeaseResponse{}},
+			{Status: 401, Description: specAgentCallerIdentityIsMissingDescription, Body: contract.ErrorPayload{}},
+			{
+				Status:      403,
+				Description: specForbiddenWorkspaceOrPermissionMismatchDescription,
+				Body:        contract.ErrorPayload{},
+			},
+			{Status: 404, Description: specTaskRunNotFoundDescription, Body: contract.ErrorPayload{}},
+			{Status: 409, Description: "Task-run failure conflict", Body: contract.ErrorPayload{}},
+			{Status: 422, Description: "Invalid failure request", Body: contract.ErrorPayload{}},
+			{
+				Status:      503,
+				Description: specServiceUnavailableDependentServiceMissingDescription,
+				Body:        contract.ErrorPayload{},
+			},
+			{Status: 500, Description: specInternalServerErrorDescription, Body: contract.ErrorPayload{}},
+		},
+	}
+}
+func releaseAgentTaskRunOperationSpec() OperationSpec {
+	return OperationSpec{
+		Method:      httpMethodPost,
+		Path:        "/api/agent/tasks/{run_id}/release",
+		AppAccess:   AppAccessDenied,
+		OperationID: "releaseAgentTaskRun",
+		Summary:     "Release a claimed task run for the calling agent",
+		Tags:        []string{specAgentKey, specTasksKey},
+		Transports:  []Transport{TransportHTTP, TransportUDS},
+		Parameters: []ParameterSpec{
+			pathParam("run_id", "Task run id"),
+		},
+		RequestBody: contract.AgentTaskReleaseRequest{},
+		Responses: []ResponseSpec{
+			{Status: 200, Description: "OK", Body: contract.AgentTaskLeaseResponse{}},
+			{Status: 401, Description: specAgentCallerIdentityIsMissingDescription, Body: contract.ErrorPayload{}},
+			{
+				Status:      403,
+				Description: specForbiddenWorkspaceOrPermissionMismatchDescription,
+				Body:        contract.ErrorPayload{},
+			},
+			{Status: 404, Description: specTaskRunNotFoundDescription, Body: contract.ErrorPayload{}},
+			{Status: 409, Description: "Task-run release conflict", Body: contract.ErrorPayload{}},
+			{Status: 422, Description: "Invalid release request", Body: contract.ErrorPayload{}},
+			{
+				Status:      503,
+				Description: specServiceUnavailableDependentServiceMissingDescription,
+				Body:        contract.ErrorPayload{},
+			},
+			{Status: 500, Description: specInternalServerErrorDescription, Body: contract.ErrorPayload{}},
+		},
+	}
+}
+func spawnAgentSessionOperationSpec() OperationSpec {
+	return OperationSpec{
+		Method:      httpMethodPost,
+		Path:        "/api/agent/spawn",
+		AppAccess:   AppAccessDenied,
+		OperationID: "spawnAgentSession",
+		Summary:     "Spawn a narrowed child session for the calling agent",
+		Tags:        []string{specAgentKey, specSessionsKey},
+		Transports:  []Transport{TransportHTTP, TransportUDS},
+		RequestBody: contract.AgentSpawnRequest{},
+		Responses: []ResponseSpec{
+			{Status: 201, Description: specCreatedDescription, Body: contract.AgentSpawnResponse{}},
+			{Status: 401, Description: specAgentCallerIdentityIsMissingDescription, Body: contract.ErrorPayload{}},
+			{Status: 403, Description: "Spawn permission denied", Body: contract.ErrorPayload{}},
+			{Status: 409, Description: "Spawn limit conflict", Body: contract.ErrorPayload{}},
+			{Status: 422, Description: "Invalid spawn request", Body: contract.ErrorPayload{}},
+			{
+				Status:      503,
+				Description: specServiceUnavailableDependentServiceMissingDescription,
+				Body:        contract.ErrorPayload{},
+			},
+			{Status: 500, Description: specInternalServerErrorDescription, Body: contract.ErrorPayload{}},
+		},
+	}
+}
+func getAgentCoordinatorConfigOperationSpec() OperationSpec {
+	return OperationSpec{
+		Method:      httpMethodGet,
+		Path:        "/api/agent/coordinator/config",
+		AppAccess:   AppAccessDenied,
+		OperationID: "getAgentCoordinatorConfig",
+		Summary:     "Read resolved coordinator config for the calling agent workspace",
+		Tags:        []string{specAgentKey},
+		Transports:  []Transport{TransportHTTP, TransportUDS},
+		Parameters: []ParameterSpec{
+			queryParam(specWorkspaceKey, "Workspace id or path", false),
+		},
+		Responses: []ResponseSpec{
+			{Status: 200, Description: "OK", Body: contract.AgentCoordinatorConfigResponse{}},
+			{Status: 401, Description: specAgentCallerIdentityIsMissingDescription, Body: contract.ErrorPayload{}},
+			{
+				Status:      403,
+				Description: specForbiddenWorkspaceOrPermissionMismatchDescription,
+				Body:        contract.ErrorPayload{},
+			},
+			{Status: 404, Description: specWorkspaceNotFoundDescription, Body: contract.ErrorPayload{}},
+			{
+				Status:      503,
+				Description: specServiceUnavailableDependentServiceMissingDescription,
+				Body:        contract.ErrorPayload{},
+			},
+			{Status: 500, Description: specInternalServerErrorDescription, Body: contract.ErrorPayload{}},
+		},
+	}
+}

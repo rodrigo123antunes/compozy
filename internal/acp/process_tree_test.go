@@ -1,0 +1,254 @@
+//go:build !windows
+
+package acp
+
+import (
+	"context"
+	"errors"
+	"os"
+	"path/filepath"
+	"strconv"
+	"strings"
+	"syscall"
+	"testing"
+	"time"
+
+	shellquote "github.com/kballard/go-shellquote"
+
+	acpsdk "github.com/coder/acp-go-sdk"
+	compozyconfig "github.com/compozy/compozy/internal/config"
+)
+
+func TestStopTerminatesWrappedProcessTree(t *testing.T) {
+	t.Run("Should stop wrapped runtime process trees", func(t *testing.T) {
+		t.Parallel()
+
+		driver := New(WithStopTimeout(100 * time.Millisecond))
+		pidFile := filepath.Join(t.TempDir(), "runtime-child.pid")
+
+		proc := startHelperProcess(t, driver, "", "", StartOpts{
+			Command: helperWrapperCommand(t),
+			Env: append(
+				helperEnv("stream_updates", ""),
+				testWrapperEnvKey+"=1",
+				testWrapperPIDFileEnvKey+"="+pidFile,
+			),
+		})
+
+		childPID := waitForWrapperChildPID(t, pidFile)
+
+		stopCtx, cancel := context.WithTimeout(t.Context(), 2*time.Second)
+		defer cancel()
+
+		startedAt := time.Now()
+		if err := driver.Stop(stopCtx, proc); err != nil {
+			t.Fatalf("Stop() error = %v", err)
+		}
+		if elapsed := time.Since(startedAt); elapsed > time.Second {
+			t.Fatalf("Stop() elapsed = %v, want <= 1s", elapsed)
+		}
+
+		waitForProcessExit(t, childPID, time.Second)
+	})
+}
+
+func TestTerminalKillTerminatesWrappedProcessTree(t *testing.T) {
+	t.Run("Should kill wrapped terminal process trees", func(t *testing.T) {
+		t.Parallel()
+
+		proc := newDirectProcess(t, compozyconfig.PermissionModeApproveAll)
+		beginACPTestRun(t, proc, "turn-process-tree")
+		pidFile := filepath.Join(t.TempDir(), "terminal-child.pid")
+
+		createResult, reqErr := proc.handleInbound(
+			t.Context(),
+			acpsdk.ClientMethodTerminalCreate,
+			mustMarshalJSON(acpsdk.CreateTerminalRequest{
+				SessionId: "sess-direct",
+				Command:   "sh",
+				Args:      wrappedCommandArgs("sleep", "30"),
+				Cwd:       new(proc.Cwd),
+				Env: []acpsdk.EnvVariable{
+					{Name: testWrapperPIDFileEnvKey, Value: pidFile},
+				},
+			}),
+		)
+		if reqErr != nil {
+			t.Fatalf("handleInbound(create wrapped terminal) error = %v", reqErr)
+		}
+		createResponse, ok := createResult.(acpsdk.CreateTerminalResponse)
+		if !ok {
+			t.Fatalf("handleInbound(create wrapped terminal) type = %T, want CreateTerminalResponse", createResult)
+		}
+
+		childPID := waitForWrapperChildPID(t, pidFile)
+
+		if _, reqErr := proc.handleInbound(
+			t.Context(),
+			acpsdk.ClientMethodTerminalKill,
+			mustMarshalJSON(acpsdk.KillTerminalRequest{
+				SessionId:  "sess-direct",
+				TerminalId: createResponse.TerminalId,
+			}),
+		); reqErr != nil {
+			t.Fatalf("handleInbound(kill wrapped terminal) error = %v", reqErr)
+		}
+
+		waitCtx, cancel := context.WithTimeout(t.Context(), time.Second)
+		defer cancel()
+		if _, err := proc.terminals.wait(waitCtx, createResponse.TerminalId); err != nil {
+			t.Fatalf("terminals.wait() error = %v", err)
+		}
+
+		waitForProcessExit(t, childPID, time.Second)
+	})
+}
+
+func helperWrapperCommand(t *testing.T) string {
+	t.Helper()
+
+	bin, err := os.Executable()
+	if err != nil {
+		t.Fatalf("os.Executable() error = %v", err)
+	}
+
+	return shellquote.Join(bin, "-test.run=TestACPWrapperProcess")
+}
+
+func wrappedCommandArgs(command string, args ...string) []string {
+	wrapped := []string{
+		"-c",
+		wrappedCommandScript(),
+		"sh",
+		command,
+	}
+	return append(wrapped, args...)
+}
+
+func wrappedCommandScript() string {
+	return strings.Join([]string{
+		`"$@" &`,
+		`child=$!`,
+		`printf '%s\n' "$child" > "$` + testWrapperPIDFileEnvKey + `"`,
+		`wait "$child"`,
+	}, "\n")
+}
+
+func waitForWrapperChildPID(t *testing.T, path string) int {
+	t.Helper()
+
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		data, err := os.ReadFile(path)
+		if err == nil {
+			text := strings.TrimSpace(string(data))
+			if text == "" {
+				time.Sleep(10 * time.Millisecond)
+				continue
+			}
+			pid, convErr := strconv.Atoi(text)
+			if convErr != nil {
+				t.Fatalf("strconv.Atoi(%q) error = %v", string(data), convErr)
+			}
+			if pid <= 0 {
+				t.Fatalf("wrapper child pid = %d, want > 0", pid)
+			}
+			return pid
+		}
+		if !errors.Is(err, os.ErrNotExist) {
+			t.Fatalf("os.ReadFile(%q) error = %v", path, err)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+
+	t.Fatalf("timed out waiting for wrapper child pid file %q", path)
+	return 0
+}
+
+func waitForProcessExit(t *testing.T, pid int, timeout time.Duration) {
+	t.Helper()
+
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		if !processAlive(pid) {
+			return
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+
+	t.Fatalf("process %d is still alive after %v", pid, timeout)
+}
+
+func processAlive(pid int) bool {
+	if pid <= 0 {
+		return false
+	}
+
+	err := syscall.Kill(pid, 0)
+	return err == nil || errors.Is(err, syscall.EPERM)
+}
+
+func TestForcedStopProcessIdentity(t *testing.T) {
+	t.Parallel()
+	t.Run("Should leave a reused process group running", func(t *testing.T) {
+		t.Parallel()
+		driver := New()
+		unrelated := startHelperProcess(t, driver, "echo_prompt", "", StartOpts{})
+		t.Cleanup(func() { stopProcess(t, driver, unrelated) })
+		stale := &AgentProcess{
+			PID:       unrelated.PID,
+			StartedAt: unrelated.StartedAt.Add(-time.Hour),
+			done:      make(chan struct{}),
+		}
+		if err := driver.forceStoppedProcess(stale); err != nil {
+			t.Fatal(err)
+		}
+		events, err := driver.Prompt(
+			t.Context(),
+			unrelated,
+			PromptRequest{TurnID: "unrelated-turn", Message: "still alive"},
+		)
+		if err != nil {
+			t.Fatal(err)
+		}
+		received := collectEvents(t, events)
+		if len(received) == 0 || received[0].Type != EventTypeAgentMessage || received[0].Text != "still alive" {
+			t.Fatalf("unrelated process response = %#v, want echoed agent message", received)
+		}
+	})
+	t.Run("Should skip an exited leader while post-exit cleanup is pending", func(t *testing.T) {
+		t.Parallel()
+		driver := New()
+		original := startHelperProcess(t, driver, "echo_prompt", "", StartOpts{})
+		stopProcess(t, driver, original)
+		pending := &AgentProcess{
+			PID:       original.PID,
+			StartedAt: original.StartedAt,
+			done:      make(chan struct{}),
+		}
+		if err := driver.forceStoppedProcess(pending); err != nil {
+			t.Fatal(err)
+		}
+	})
+	t.Run("Should force the owned live wrapper and its children on cancellation", func(t *testing.T) {
+		t.Parallel()
+		driver := New()
+		pidFile := filepath.Join(t.TempDir(), "owned-child.pid")
+		proc := startHelperProcess(t, driver, "echo_prompt", "", StartOpts{
+			Command: helperWrapperCommand(t),
+			Env: append(helperEnv("echo_prompt", ""),
+				testWrapperEnvKey+"=1",
+				testWrapperPIDFileEnvKey+"="+pidFile,
+			),
+		})
+		t.Cleanup(func() { stopProcess(t, driver, proc) })
+		childPID := waitForWrapperChildPID(t, pidFile)
+		ctx, cancel := context.WithCancel(t.Context())
+		cancel()
+		if err := driver.Stop(ctx, proc); !errors.Is(err, context.Canceled) {
+			t.Fatalf("Stop() = %v, want caller cancellation", err)
+		}
+		waitForProcessExit(t, childPID, time.Second)
+		waitForProcessExit(t, proc.PID, time.Second)
+	})
+}

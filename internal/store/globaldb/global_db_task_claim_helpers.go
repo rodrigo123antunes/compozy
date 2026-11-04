@@ -1,0 +1,193 @@
+package globaldb
+
+import (
+	"context"
+	"encoding/json"
+	"fmt"
+	"strings"
+	"time"
+
+	"github.com/compozy/compozy/internal/store/globaldb/sqlcgen"
+	taskpkg "github.com/compozy/compozy/internal/task"
+)
+
+func requireCurrentRunLease(run taskpkg.Run, rawToken string, now time.Time) error {
+	if strings.TrimSpace(run.ClaimTokenHash) == "" {
+		return fmt.Errorf(
+			"%w: task run %q has no current claim token hash",
+			taskpkg.ErrInvalidClaimToken,
+			run.ID,
+		)
+	}
+	if !taskpkg.VerifyClaimToken(rawToken, run.ClaimTokenHash) {
+		return fmt.Errorf("%w: task run %q token mismatch", taskpkg.ErrInvalidClaimToken, run.ID)
+	}
+	switch run.Status.Normalize() {
+	case taskpkg.TaskRunStatusClaimed, taskpkg.TaskRunStatusStarting, taskpkg.TaskRunStatusRunning:
+	default:
+		return fmt.Errorf(
+			"%w: task run %q is not actively leased",
+			taskpkg.ErrInvalidStatusTransition,
+			run.ID,
+		)
+	}
+	if run.LeaseUntil.IsZero() || !run.LeaseUntil.After(now.UTC()) {
+		return fmt.Errorf("%w: task run %q lease expired", taskpkg.ErrLeaseExpired, run.ID)
+	}
+	return nil
+}
+
+func requireLeaseTerminalTransition(run taskpkg.Run, target taskpkg.RunStatus) error {
+	switch run.Status.Normalize() {
+	case taskpkg.TaskRunStatusClaimed, taskpkg.TaskRunStatusStarting, taskpkg.TaskRunStatusRunning:
+		return nil
+	default:
+		return fmt.Errorf(
+			"%w: task run %q cannot transition from %q to %q",
+			taskpkg.ErrInvalidStatusTransition,
+			run.ID,
+			run.Status.Normalize(),
+			target.Normalize(),
+		)
+	}
+}
+
+func requeueLeasedRun(ctx context.Context, exec taskSQLExecutor, runID string) error {
+	affected, err := sqlcgen.New(exec).RequeueTaskRunLease(ctx, sqlcgen.RequeueTaskRunLeaseParams{
+		Status: taskpkg.TaskRunStatusQueued.String(), ID: runID,
+	})
+	if err != nil {
+		return fmt.Errorf("store: requeue task run lease %q: %w", runID, err)
+	}
+	if affected == 0 {
+		return fmt.Errorf("store: task run lease %q: %w", runID, taskpkg.ErrTaskRunNotFound)
+	}
+	return nil
+}
+
+func (g *TaskRunRepo) expiredLeaseRunIDs(
+	ctx context.Context,
+	exec taskSQLExecutor,
+	recovery taskpkg.ExpiredLeaseRecovery,
+) ([]string, error) {
+	reserved, err := json.Marshal(g.leaseSettlements)
+	if err != nil {
+		return nil, fmt.Errorf("store: encode reserved task run leases: %w", err)
+	}
+	rows, err := sqlcgen.New(exec).ListExpiredTaskRunLeaseIDs(ctx, sqlcgen.ListExpiredTaskRunLeaseIDsParams{
+		ReservedLeases: string(reserved),
+		ClaimedStatus:  taskpkg.TaskRunStatusClaimed.String(),
+		StartingStatus: taskpkg.TaskRunStatusStarting.String(),
+		RunningStatus:  taskpkg.TaskRunStatusRunning.String(),
+		Now:            nullableTaskTime(recovery.Now),
+		ResultLimit:    taskQueryLimit(recovery.Limit),
+	})
+	if err != nil {
+		return nil, fmt.Errorf("store: query expired task run leases: %w", err)
+	}
+	return rows, nil
+}
+
+func requeueExpiredLease(
+	ctx context.Context,
+	exec taskSQLExecutor,
+	run taskpkg.Run,
+	snapshot taskRunLeaseSnapshot,
+	recoveryIncrement int64,
+) error {
+	affected, err := sqlcgen.New(exec).RequeueExpiredTaskRunLease(
+		ctx,
+		sqlcgen.RequeueExpiredTaskRunLeaseParams{
+			QueuedStatus:      taskpkg.TaskRunStatusQueued.String(),
+			ID:                run.ID,
+			PreviousStatus:    snapshot.status.Normalize().String(),
+			SessionID:         nullableTaskString(strings.TrimSpace(snapshot.sessionID)),
+			ClaimTokenHash:    nullableTaskString(strings.TrimSpace(snapshot.claimTokenHash)),
+			LeaseUntil:        nullableTaskTime(snapshot.leaseUntil),
+			RecoveryIncrement: recoveryIncrement,
+		},
+	)
+	if err != nil {
+		return fmt.Errorf("store: recover expired task run lease %q: %w", run.ID, err)
+	}
+	if affected == 0 {
+		return fmt.Errorf("store: expired task run lease %q: %w", run.ID, taskpkg.ErrTaskRunNotFound)
+	}
+	return nil
+}
+
+func exhaustExpiredLease(
+	ctx context.Context,
+	exec taskSQLExecutor,
+	run taskpkg.Run,
+	snapshot taskRunLeaseSnapshot,
+	now time.Time,
+) error {
+	affected, err := sqlcgen.New(exec).ExhaustExpiredTaskRunLease(
+		ctx,
+		sqlcgen.ExhaustExpiredTaskRunLeaseParams{
+			NeedsAttentionStatus: taskpkg.TaskRunStatusNeedsAttention.String(),
+			EndedAt:              nullableTaskTime(now),
+			Error:                nullableTaskString(taskpkg.LeaseRecoveryExhaustedReason),
+			ID:                   run.ID,
+			PreviousStatus:       snapshot.status.Normalize().String(),
+			SessionID:            nullableTaskString(strings.TrimSpace(snapshot.sessionID)),
+			ClaimTokenHash:       nullableTaskString(strings.TrimSpace(snapshot.claimTokenHash)),
+			LeaseUntil:           nullableTaskTime(snapshot.leaseUntil),
+		},
+	)
+	if err != nil {
+		return fmt.Errorf("store: exhaust expired task run lease %q: %w", run.ID, err)
+	}
+	if affected == 0 {
+		return fmt.Errorf("store: expired task run lease %q: %w", run.ID, taskpkg.ErrTaskRunNotFound)
+	}
+	return nil
+}
+
+func missingCapabilityPredicate(capabilities []string) string {
+	return missingCapabilityPredicateFor("req.capability_id", capabilities)
+}
+
+func missingCapabilityPredicateFor(column string, capabilities []string) string {
+	if len(capabilities) == 0 {
+		return ""
+	}
+	return " AND " + column + " NOT IN (" + claimPlaceholders(len(capabilities)) + ")"
+}
+
+func missingCapabilityArgs(capabilities []string) []any {
+	if len(capabilities) == 0 {
+		return nil
+	}
+	args := make([]any, 0, len(capabilities))
+	for _, capability := range capabilities {
+		args = append(args, capability)
+	}
+	return args
+}
+
+func preferredCapabilityOrder(capabilities []string) string {
+	if len(capabilities) == 0 {
+		return "(SELECT 0) DESC,"
+	}
+	return `(SELECT COUNT(1)
+		          FROM task_run_preferred_capabilities pref
+		         WHERE pref.run_id = tr.id
+		           AND pref.capability_id IN (` + claimPlaceholders(len(capabilities)) + `)) DESC,`
+}
+
+func preferredCapabilityArgs(capabilities []string) []any {
+	return missingCapabilityArgs(capabilities)
+}
+
+func claimPlaceholders(count int) string {
+	if count <= 0 {
+		return ""
+	}
+	values := make([]string, 0, count)
+	for range count {
+		values = append(values, "?")
+	}
+	return strings.Join(values, ", ")
+}

@@ -1,0 +1,47 @@
+// Package ginutil owns process-wide Gin runtime coordination shared by Compozy transports.
+package ginutil
+
+import (
+	"net/http"
+	"net/url"
+	"sync"
+
+	"github.com/gin-gonic/gin"
+)
+
+var debugModeMu sync.Mutex
+
+// NewEngine constructs a Gin engine without emitting debug-mode setup output.
+func NewEngine() *gin.Engine {
+	var engine *gin.Engine
+	QuietDebug(func() { engine = gin.New() })
+	engine.UseEscapedPath = true
+	engine.UnescapePathValues = false
+	engine.Use(decodeEscapedPathParams)
+	return engine
+}
+
+func decodeEscapedPathParams(context *gin.Context) {
+	for index := range context.Params {
+		decoded, err := url.PathUnescape(context.Params[index].Value)
+		if err != nil {
+			context.AbortWithStatus(http.StatusBadRequest)
+			return
+		}
+		context.Params[index].Value = decoded
+	}
+	context.Next()
+}
+
+// QuietDebug suppresses Gin's debug-mode setup output while fn constructs or registers a router.
+func QuietDebug(fn func()) {
+	debugModeMu.Lock()
+	defer debugModeMu.Unlock()
+
+	previousMode := gin.Mode()
+	if previousMode == gin.DebugMode {
+		gin.SetMode(gin.ReleaseMode)
+		defer gin.SetMode(previousMode)
+	}
+	fn()
+}

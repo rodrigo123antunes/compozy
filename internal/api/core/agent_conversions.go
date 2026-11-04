@@ -1,0 +1,305 @@
+package core
+
+import (
+	"strings"
+
+	"github.com/compozy/compozy/internal/api/contract"
+	compozyconfig "github.com/compozy/compozy/internal/config"
+	workspacepkg "github.com/compozy/compozy/internal/workspace"
+)
+
+// AgentPayloadFromDef converts an agent definition into the shared payload.
+func AgentPayloadFromDef(agent compozyconfig.AgentDef) contract.AgentPayload {
+	return AgentPayloadFromEntry(&AgentCatalogEntry{
+		Def:    agent,
+		Origin: contract.AgentOriginGlobal,
+	})
+}
+
+// AgentCatalogEntryFromDef attaches origin truth to one disk-loaded definition.
+func AgentCatalogEntryFromDef(
+	home compozyconfig.HomePaths,
+	agent compozyconfig.AgentDef,
+	workspaceID string,
+) AgentCatalogEntry {
+	origin, _ := compozyconfig.AgentOriginFor(home, agent.SourcePath)
+	entry := AgentCatalogEntry{Def: compozyconfig.CloneAgentDef(agent)}
+	if origin == compozyconfig.AgentOriginWorkspace || (origin == "" && workspaceID != "") {
+		entry.Origin = contract.AgentOriginWorkspace
+		entry.WorkspaceID = workspaceID
+		return entry
+	}
+	entry.Origin = contract.AgentOriginGlobal
+	return entry
+}
+
+// AgentPayloadFromEntry converts an origin-aware catalog entry into the shared payload.
+func AgentPayloadFromEntry(entry *AgentCatalogEntry) contract.AgentPayload {
+	agent := entry.Def
+	shadows := make([]contract.AgentDefinitionShadowPayload, 0, len(agent.ShadowedDefinitions))
+	for _, shadow := range agent.ShadowedDefinitions {
+		shadows = append(shadows, contract.AgentDefinitionShadowPayload{
+			Layer: shadow.Layer,
+			Path:  shadow.Path,
+		})
+	}
+	mcpServers := make([]contract.AgentMCPServerJSON, 0, len(agent.MCPServers))
+	for _, server := range agent.MCPServers {
+		redacted := compozyconfig.RedactedMCPServer(server)
+		mcpServers = append(mcpServers, contract.AgentMCPServerJSON{
+			Name:      redacted.Name,
+			Transport: string(redacted.Transport),
+			Command:   redacted.Command,
+			Args:      append([]string(nil), redacted.Args...),
+			Env:       redacted.Env,
+			SecretEnv: redacted.SecretEnv,
+			URL:       redacted.URL,
+			Auth:      agentMCPAuthPayload(redacted.Auth),
+		})
+	}
+	digest, digestErr := compozyconfig.AgentDefinitionDigest(agent)
+	diagnostics := make([]contract.AgentDiagnosticPayload, 0, 1)
+	if digestErr != nil {
+		diagnostics = append(diagnostics, contract.AgentDiagnosticPayload{
+			Path:      agent.SourcePath,
+			ErrorKind: "definition_digest",
+			Message:   digestErr.Error(),
+		})
+	}
+	appearance, appearanceErr := agent.ResolveAppearance()
+	if appearanceErr != nil {
+		diagnostics = append(
+			diagnostics,
+			contract.AgentDiagnosticPayload{
+				Path:      agent.SourcePath,
+				ErrorKind: "agent_appearance_invalid",
+				Message:   appearanceErr.Error(),
+			},
+		)
+	}
+	disabledSkills := append([]string(nil), agent.Skills.Disabled...)
+	return contract.AgentPayload{
+		Name:               agent.Name,
+		DisplayName:        agent.DisplayName,
+		Description:        agent.Description,
+		Kind:               agent.EffectiveKind(),
+		Label:              agent.Label(),
+		Appearance:         compozyconfig.CloneAgentAppearance(agent.Appearance),
+		ResolvedAppearance: appearance,
+		Provider:           agent.Provider,
+		Command:            agent.Command,
+		SessionEnv:         SessionEnvToPayload(agent.SessionEnv),
+		Model:              agent.Model,
+		ReasoningEffort:    contract.ReasoningEffort(agent.ReasoningEffort),
+		Speed:              agent.SpeedValue(),
+		ACPOptions:         agentACPOptionsToContract(agent.ACPOptionsValue()),
+		Tools:              append([]string(nil), agent.Tools...),
+		Toolsets:           append([]string(nil), agent.Toolsets...),
+		DenyTools:          append([]string(nil), agent.DenyTools...),
+		WorkspaceAccess:    agent.WorkspaceAccess,
+		SessionApproval:    agent.SessionApproval,
+		PermissionRules:    permissionRulesPayload(agent.PermissionRules),
+		Permissions:        agent.Permissions,
+		CategoryPath:       append([]string(nil), agent.CategoryPath...),
+		MCPServers:         mcpServers,
+		Origin:             entry.Origin,
+		PackageOwned:       entry.PackageOwned,
+		WorkspaceID:        entry.WorkspaceID,
+		Layer:              agent.SourceLayer,
+		Shadows:            shadows,
+		Skills:             &contract.CreateAgentSkillsConfig{Disabled: disabledSkills},
+		FallbackChain:      agentFallbackChainToContract(agent.FallbackChain),
+		DefinitionDigest:   digest,
+		Prompt:             agent.Prompt,
+		Diagnostics:        diagnostics,
+	}
+}
+
+// AgentPayloadFromEntryWithConfig attaches a runtime projection resolved from
+// the requested workspace/global config without mutating authored fields.
+func AgentPayloadFromEntryWithConfig(
+	entry *AgentCatalogEntry,
+	cfg *compozyconfig.Config,
+) contract.AgentPayload {
+	payload := AgentPayloadFromEntry(entry)
+	if cfg == nil || payload.DefinitionDigest == "" {
+		return payload
+	}
+	resolved, err := cfg.ResolveAgent(entry.Def)
+	if err != nil {
+		return payload
+	}
+	permissions, permissionsSource := effectivePermissions(entry.Def, &resolved)
+	payload.EffectiveRuntime = &contract.AgentEffectiveRuntimePayload{
+		SessionEnv:      SessionEnvToPayload(resolved.SessionEnv),
+		Provider:        resolved.Provider,
+		Model:           resolved.Model,
+		ReasoningEffort: contract.ReasoningEffort(resolved.ReasoningEffort),
+		Speed:           resolved.SpeedValue(),
+		ACPOptions:      agentACPOptionsToContract(resolved.ACPOptionsValue()),
+		Permissions:     permissions,
+		Sources: contract.AgentEffectiveRuntimeSources{
+			Provider:        contract.AgentRuntimeValueSource(resolved.RuntimeSources.Provider.String()),
+			Model:           contract.AgentRuntimeValueSource(resolved.RuntimeSources.Model.String()),
+			ReasoningEffort: contract.AgentRuntimeValueSource(resolved.RuntimeSources.ReasoningEffort.String()),
+			Speed:           contract.AgentRuntimeValueSource(resolved.RuntimeSources.Speed.String()),
+			Permissions:     permissionsSource,
+		},
+	}
+	return payload
+}
+
+func agentACPOptionsToContract(
+	options []compozyconfig.ACPOptionSelection,
+) []contract.AgentACPOptionSelection {
+	if len(options) == 0 {
+		return nil
+	}
+	projected := make([]contract.AgentACPOptionSelection, len(options))
+	for index, option := range options {
+		projected[index] = contract.AgentACPOptionSelection{
+			ID:      option.ID,
+			ValueID: option.ValueID,
+		}
+		if option.BoolValue != nil {
+			projected[index].BoolValue = new(*option.BoolValue)
+		}
+	}
+	return projected
+}
+
+func agentACPOptionsFromContract(
+	options []contract.AgentACPOptionSelection,
+) []compozyconfig.ACPOptionSelection {
+	if len(options) == 0 {
+		return nil
+	}
+	projected := make([]compozyconfig.ACPOptionSelection, len(options))
+	for index, option := range options {
+		projected[index] = compozyconfig.ACPOptionSelection{
+			ID:      option.ID,
+			ValueID: option.ValueID,
+		}
+		if option.BoolValue != nil {
+			projected[index].BoolValue = new(*option.BoolValue)
+		}
+	}
+	return projected
+}
+
+// AgentPayloadsFromEntries converts origin-aware catalog entries into response payloads.
+func AgentPayloadsFromEntries(entries []AgentCatalogEntry) []contract.AgentPayload {
+	payloads := make([]contract.AgentPayload, 0, len(entries))
+	for i := range entries {
+		entry := &entries[i]
+		payloads = append(payloads, AgentPayloadFromEntry(entry))
+	}
+	return payloads
+}
+
+// AgentPayloadFromDiagnostic converts a malformed workspace agent diagnostic into a payload row.
+func AgentPayloadFromDiagnostic(
+	diagnostic workspacepkg.AgentDiagnostic,
+	workspaceID ...string,
+) contract.AgentPayload {
+	fallback := compozyconfig.AgentDef{Name: diagnostic.Name}
+	appearance, appearanceErr := fallback.ResolveAppearance()
+	if appearanceErr != nil {
+		diagnostic.Message += ": " + appearanceErr.Error()
+	}
+	resolvedWorkspaceID := ""
+	if len(workspaceID) > 0 {
+		resolvedWorkspaceID = workspaceID[0]
+	}
+	return contract.AgentPayload{
+		Name:  diagnostic.Name,
+		Label: fallback.Label(), Kind: fallback.EffectiveKind(), ResolvedAppearance: appearance,
+		Provider:    "",
+		Origin:      contract.AgentOriginWorkspace,
+		WorkspaceID: resolvedWorkspaceID,
+		Prompt:      "",
+		Diagnostics: []contract.AgentDiagnosticPayload{{
+			Path:      diagnostic.Path,
+			ErrorKind: diagnostic.ErrorKind,
+			Message:   diagnostic.Message,
+		}},
+	}
+}
+
+// agentFallbackChainToContract projects an authored chain; command_fingerprint is set
+// exactly when a route declares command.
+func agentFallbackChainToContract(chain []compozyconfig.RoleFallback) []contract.RoleFallbackStatus {
+	if len(chain) == 0 {
+		return nil
+	}
+	projected := make([]contract.RoleFallbackStatus, 0, len(chain))
+	for _, route := range chain {
+		command := strings.TrimSpace(route.Command)
+		projected = append(projected, contract.RoleFallbackStatus{
+			Provider:           strings.TrimSpace(route.Provider),
+			Model:              strings.TrimSpace(route.Model),
+			ReasoningEffort:    strings.TrimSpace(route.ReasoningEffort),
+			Speed:              route.Speed,
+			ACPOptions:         agentACPOptionsToContract(route.ACPOptions),
+			Command:            command,
+			SessionEnv:         SessionEnvToPayload(route.SessionEnv),
+			CommandFingerprint: compozyconfig.CommandFingerprint(command),
+		})
+	}
+	return projected
+}
+
+// agentFallbackChainFromContract converts an authored request chain.
+func agentFallbackChainFromContract(chain []contract.AgentFallbackRoutePayload) []compozyconfig.RoleFallback {
+	if len(chain) == 0 {
+		return nil
+	}
+	converted := make([]compozyconfig.RoleFallback, 0, len(chain))
+	for _, route := range chain {
+		converted = append(converted, compozyconfig.RoleFallback{
+			Provider:        strings.TrimSpace(route.Provider),
+			Model:           strings.TrimSpace(route.Model),
+			ReasoningEffort: strings.TrimSpace(string(route.ReasoningEffort)),
+			Speed:           route.Speed,
+			ACPOptions:      agentACPOptionsFromContract(route.ACPOptions),
+			Command:         strings.TrimSpace(route.Command),
+			SessionEnv:      sessionEnvFromPayload(route.SessionEnv),
+		})
+	}
+	return converted
+}
+
+func permissionRulesFromPayload(rules []contract.AgentPermissionRulePayload) []compozyconfig.PermissionRule {
+	if rules == nil {
+		return nil
+	}
+	result := make([]compozyconfig.PermissionRule, len(rules))
+	for i, rule := range rules {
+		result[i] = compozyconfig.PermissionRule(rule)
+	}
+	return result
+}
+
+func permissionRulesPayload(rules []compozyconfig.PermissionRule) []contract.AgentPermissionRulePayload {
+	if rules == nil {
+		return nil
+	}
+	result := make([]contract.AgentPermissionRulePayload, len(rules))
+	for i, rule := range rules {
+		result[i] = contract.AgentPermissionRulePayload(rule)
+	}
+	return result
+}
+
+// effectivePermissions reports the level a new session of the definition starts at. An always-on
+// definition with no authored or overridden level runs its instance at the always-on default
+// rather than [permissions].mode.
+func effectivePermissions(
+	agent compozyconfig.AgentDef,
+	resolved *compozyconfig.ResolvedAgent,
+) (string, contract.AgentRuntimeValueSource) {
+	if agent.EffectiveKind() == compozyconfig.AgentKindAlwaysOn && !resolved.PermissionsConfigured {
+		return string(compozyconfig.AlwaysOnDefaultPermissionMode), contract.AgentRuntimeValueSourceAlwaysOnDefault
+	}
+	return resolved.Permissions, contract.AgentRuntimeValueSource(resolved.RuntimeSources.Permissions.String())
+}

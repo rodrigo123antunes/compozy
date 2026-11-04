@@ -1,0 +1,230 @@
+package core
+
+import (
+	"errors"
+	"fmt"
+	"net/http"
+	"strings"
+
+	"github.com/compozy/compozy/internal/api/contract"
+	"github.com/compozy/compozy/internal/session"
+	"github.com/compozy/compozy/internal/store"
+	"github.com/gin-gonic/gin"
+)
+
+var errSessionListWorkspaceResolution = errors.New("api: session list workspace resolution failed")
+
+// ListSessions returns one bounded page from the shared public session catalog.
+func (h *BaseHandlers) ListSessions(c *gin.Context) {
+	if !h.requireOperatorOrGrantedAgent(c, "session catalog") {
+		return
+	}
+	query, includeHealth, err := h.parseSessionListQuery(c)
+	if err != nil {
+		if isProfileDomainError(err) {
+			respondProfileError(c, err)
+			return
+		}
+		status := http.StatusBadRequest
+		if isSessionListWorkspaceError(err) {
+			status = StatusForWorkspaceError(err)
+		}
+		h.respondError(c, status, err)
+		return
+	}
+	pager, ok := h.Sessions.(SessionPageManager)
+	if !ok {
+		h.respondError(c, http.StatusServiceUnavailable, errors.New("api: paged session catalog is required"))
+		return
+	}
+	query.ExcludeInstanceMain, err = parseBoolQuery(c, "exclude_instance_main")
+	if err != nil {
+		h.respondError(c, http.StatusBadRequest, err)
+		return
+	}
+	if query.ExcludeInstanceMain {
+		instances, err := h.instanceFacetRows(c, query)
+		if err != nil {
+			h.instanceError(c, err)
+			return
+		}
+		query.InstanceMainIDs = instanceMainIDs(instances)
+	}
+	page, err := pager.ListPage(c.Request.Context(), query)
+	if err != nil {
+		status := http.StatusInternalServerError
+		if errors.Is(err, session.ErrListQueryInvalid) || errors.Is(err, session.ErrListCursorInvalid) {
+			status = http.StatusBadRequest
+		}
+		h.respondError(c, status, err)
+		return
+	}
+	payloads, err := h.sessionPayloadsWithOptionalHealth(c.Request.Context(), page.Sessions, includeHealth)
+	if err != nil {
+		h.respondError(c, StatusForHeartbeatError(err), err)
+		return
+	}
+	ApplySessionPlacements(payloads, page.Placements)
+	var total *int
+	if !query.SkipTotal {
+		total = &page.Total
+	}
+	c.JSON(http.StatusOK, contract.SessionCatalogResponse{
+		Sessions: payloads,
+		Page: contract.SessionCatalogPagePayload{
+			NextCursor: page.NextCursor,
+			HasMore:    page.HasMore,
+			Total:      total,
+			Limit:      page.Limit,
+		},
+	})
+}
+
+func isSessionListWorkspaceError(err error) bool {
+	return errors.Is(err, errSessionListWorkspaceResolution)
+}
+
+func (h *BaseHandlers) parseSessionListQuery(c *gin.Context) (session.ListQuery, bool, error) {
+	readScope, allWorkspaces, workspaceID, err := h.parseSessionCatalogReadScope(c)
+	if err != nil {
+		if errors.Is(err, session.ErrCatalogScopeInvalid) {
+			return session.ListQuery{}, false, fmt.Errorf("%w: %v", session.ErrListQueryInvalid, err)
+		}
+		if isProfileDomainError(err) {
+			return session.ListQuery{}, false, err
+		}
+		return session.ListQuery{}, false, fmt.Errorf("%w: %w", errSessionListWorkspaceResolution, err)
+	}
+	workspaceIDs, err := h.parseSessionListWorkspaceIDs(c, allWorkspaces)
+	if err != nil {
+		return session.ListQuery{}, false, err
+	}
+	skipTotal, err := parseBoolQuery(c, "skip_total")
+	if err != nil {
+		return session.ListQuery{}, false, err
+	}
+	includeHealth, err := parseBoolQuery(c, "include_health")
+	if err != nil {
+		return session.ListQuery{}, false, err
+	}
+	resumable, err := parseBoolQuery(c, "resumable")
+	if err != nil {
+		return session.ListQuery{}, false, err
+	}
+	attentionOnly, err := parseBoolQuery(c, "attention")
+	if err != nil {
+		return session.ListQuery{}, false, err
+	}
+	badges, err := session.ParseBadgeFilters(c.QueryArray("badge"))
+	if err != nil {
+		return session.ListQuery{}, false, fmt.Errorf("%w: %w", session.ErrListQueryInvalid, err)
+	}
+	limit, err := ParseOptionalInt(c.Query("limit"))
+	if err != nil {
+		return session.ListQuery{}, false, err
+	}
+	sessionType, err := parseSessionListType(c.Query("type"))
+	if err != nil {
+		return session.ListQuery{}, false, err
+	}
+	subagents, err := parseSessionListSubagents(c.Query("subagents"))
+	if err != nil {
+		return session.ListQuery{}, false, err
+	}
+	board, err := parseSessionListBoardFilters(c)
+	if err != nil {
+		return session.ListQuery{}, false, err
+	}
+	query := session.ListQuery{
+		ExcludeFinishedAutomation: board.excludeFinishedAutomation,
+
+		Columns:         board.columns,
+		HideChildren:    board.hideChildren,
+		Subagents:       subagents,
+		SkipTotal:       skipTotal,
+		ReadScope:       readScope,
+		WorkspaceID:     workspaceID,
+		AllWorkspaces:   allWorkspaces,
+		WorkspaceIDs:    workspaceIDs,
+		WorktreeID:      strings.TrimSpace(c.Query("worktree")),
+		State:           strings.TrimSpace(c.Query("state")),
+		SessionType:     sessionType,
+		AgentName:       strings.TrimSpace(c.Query("agent")),
+		ParentSessionID: strings.TrimSpace(c.Query("parent")),
+		RootSessionID:   strings.TrimSpace(c.Query("root")),
+		SearchFields:    strings.TrimSpace(c.Query("search_fields")),
+		Search:          strings.TrimSpace(c.Query("q")),
+		Resumable:       resumable,
+		AttentionOnly:   attentionOnly,
+		Badges:          badges,
+		Archive:         store.SessionArchiveFilter(strings.TrimSpace(c.Query("archive"))),
+		Later:           store.SessionLaterFilter(strings.TrimSpace(c.Query("later"))),
+		Sort:            strings.TrimSpace(c.Query("sort")),
+		Cursor:          strings.TrimSpace(c.Query("cursor")),
+		Limit:           limit,
+	}
+	return query, includeHealth, nil
+}
+
+type sessionListBoardFilters struct {
+	columns                   []string
+	hideChildren              bool
+	excludeFinishedAutomation bool
+}
+
+func parseSessionListBoardFilters(c *gin.Context) (sessionListBoardFilters, error) {
+	columns, err := session.ParseBoardColumns(c.QueryArray("board_column"))
+	if err != nil {
+		return sessionListBoardFilters{}, err
+	}
+	hideChildren, err := session.ParseChildrenFilter(c.Query("children"))
+	if err != nil {
+		return sessionListBoardFilters{}, err
+	}
+	excludeFinished, err := parseBoolQuery(c, "exclude_finished_automation")
+	if err != nil {
+		return sessionListBoardFilters{}, err
+	}
+	return sessionListBoardFilters{columns, hideChildren, excludeFinished}, nil
+}
+
+// parseSessionListWorkspaceIDs resolves the All projects narrowing, mapping the legacy global alias.
+func (h *BaseHandlers) parseSessionListWorkspaceIDs(c *gin.Context, allWorkspaces bool) ([]string, error) {
+	raw := c.QueryArray("workspace_ids")
+	for index, value := range raw {
+		resolved, err := resolveLegacyGlobalSelector(c, strings.TrimSpace(value), h.Workspaces)
+		if err != nil {
+			return nil, fmt.Errorf("%w: %w", session.ErrWorkspaceSelectionReserved, err)
+		}
+		raw[index] = resolved
+	}
+	if allWorkspaces {
+		var err error
+		raw, err = defaultActiveWorkspaceIDs(c.Request.Context(), h.Workspaces, raw)
+		if err != nil {
+			return nil, err
+		}
+	}
+	return session.NormalizeWorkspaceIDs(raw, allWorkspaces)
+}
+
+func parseSessionListSubagents(raw string) (string, error) {
+	subagents := strings.TrimSpace(raw)
+	switch subagents {
+	case "", "include", "exclude", "only":
+		return subagents, nil
+	default:
+		return "", fmt.Errorf("%w: unsupported subagents %q", session.ErrListQueryInvalid, subagents)
+	}
+}
+
+func parseSessionListType(raw string) (session.Type, error) {
+	sessionType := session.Type(strings.TrimSpace(raw))
+	switch sessionType {
+	case "", session.SessionTypeUser, session.SessionTypeSystem,
+		session.SessionTypeCoordinator, session.SessionTypeSpawned:
+		return sessionType, nil
+	default:
+		return "", fmt.Errorf("%w: unsupported type %q", session.ErrListQueryInvalid, sessionType)
+	}
+}

@@ -1,0 +1,3010 @@
+package settings
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"maps"
+	"os"
+	"path/filepath"
+	"reflect"
+	"slices"
+	"strings"
+	"sync"
+	"testing"
+
+	"time"
+
+	"github.com/pelletier/go-toml/v2"
+
+	automationmodel "github.com/compozy/compozy/internal/automation/model"
+	compozyconfig "github.com/compozy/compozy/internal/config"
+	"github.com/compozy/compozy/internal/config/lifecycle"
+	diagnosticcontract "github.com/compozy/compozy/internal/diagnosticcontract"
+	"github.com/compozy/compozy/internal/diagnostics"
+	"github.com/compozy/compozy/internal/extensionmcp"
+	"github.com/compozy/compozy/internal/modelcatalog"
+	speedpkg "github.com/compozy/compozy/internal/speed"
+	"github.com/compozy/compozy/internal/store"
+	"github.com/compozy/compozy/internal/store/globaldb"
+	globalseed "github.com/compozy/compozy/internal/testutil/storeseed/global"
+	"github.com/compozy/compozy/internal/windowmanager"
+	workspacepkg "github.com/compozy/compozy/internal/workspace"
+)
+
+func TestConfigApplyServiceRecordsLiveApplyAndAdvancesGeneration(t *testing.T) {
+	t.Parallel()
+
+	t.Run("Should repair MCP definitions and add servers while existing auth status fails", func(t *testing.T) {
+		t.Parallel()
+		ctx := t.Context()
+		homePaths := testHomePaths(t)
+		writeFile(t, homePaths.ConfigFile, baseSettingsConfig()+`
+[[mcp_servers]]
+name = "repair-cloud"
+transport = "http"
+url = "https://mcp.example.test/mcp"
+[mcp_servers.auth]
+registration = "pre_registered"
+issuer_url = "https://login.example.test"
+client_id = "desktop"
+client_secret_ref = "vault:mcp/profile/foreign/repair-cloud/oauth/client-secret"
+`)
+		db, err := openSettingsTestGlobalDB(ctx, t, homePaths.DatabaseFile)
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() {
+			if err := db.Close(context.Background()); err != nil {
+				t.Error(err)
+			}
+		})
+		statusErr := errors.New("credential belongs to another owner")
+		service := testService(t, homePaths, Dependencies{
+			MCPAuth:      &recordingMCPAuthRuntime{statusErr: statusErr},
+			ApplyRecords: NewConfigApplyRecordRepository(db.DB(), nil),
+		})
+		if _, err := service.ListCollection(
+			ctx,
+			CollectionRequest{Collection: CollectionMCPServers},
+		); !errors.Is(
+			err,
+			statusErr,
+		) {
+			t.Fatalf("expected unavailable auth status before repair: %v", err)
+		}
+		for _, name := range []string{"repair-cloud", "new-cloud"} {
+			result, err := service.ApplyCollectionItem(ctx, CollectionItemPutRequest{
+				Collection: CollectionMCPServers,
+				Name:       name,
+				MCPServer: &compozyconfig.MCPServer{
+					Name: name, Transport: compozyconfig.MCPServerTransportHTTP, URL: "https://mcp.example.test/mcp",
+					Auth: compozyconfig.MCPAuthConfig{
+						Registration: compozyconfig.MCPAuthRegistrationPreRegistered,
+						IssuerURL:    "https://login.example.test", ClientID: "desktop",
+						ClientSecretRef: "env:REPAIRED_CLIENT_SECRET",
+					},
+				},
+			})
+			if err != nil {
+				t.Fatalf("apply %s with unavailable prior auth status: %v", name, err)
+			}
+			wantLifecycle := lifecycle.LiveAdd
+			if name == "repair-cloud" {
+				wantLifecycle = lifecycle.RestartRequired
+			}
+			if result.Record.Lifecycle != wantLifecycle {
+				t.Fatalf("%s lifecycle = %s, want %s", name, result.Record.Lifecycle, wantLifecycle)
+			}
+			cfg, err := compozyconfig.LoadForHome(homePaths)
+			if err != nil {
+				t.Fatal(err)
+			}
+			index := slices.IndexFunc(
+				cfg.MCPServers,
+				func(server compozyconfig.MCPServer) bool { return server.Name == name },
+			)
+			if index < 0 || cfg.MCPServers[index].Auth.ClientSecretRef != "env:REPAIRED_CLIENT_SECRET" {
+				t.Fatalf("%s repaired definition was not persisted", name)
+			}
+		}
+	})
+
+	// Invariant: extension override applies live without activating unrelated pending config; DELETE resets only the override.
+	// Owner: Settings config-apply coordinator; canonical suite: config_apply_service_test.go with real apply records.
+	t.Run("Should record extension overrides without applying pending config changes", func(t *testing.T) {
+		t.Parallel()
+		ctx := t.Context()
+		homePaths := testHomePaths(t)
+		writeFile(t, homePaths.ConfigFile, baseSettingsConfig())
+		db, err := openSettingsTestGlobalDB(ctx, t, homePaths.DatabaseFile)
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() {
+			if err := db.Close(context.Background()); err != nil {
+				t.Error(err)
+			}
+		})
+		var written []extensionmcp.Override
+		management := &fakeMCPExtensionManagement{
+			update: func(_ context.Context, req MCPAuthTargetRequest, override extensionmcp.Override) (MCPExtensionDefinition, error) {
+				if req.Owner != "extension:linear" || req.Name != "linear" || req.Scope != ScopeUser {
+					t.Fatalf("wrong mutation identity: %#v", req)
+				}
+				target, base, _, err := (extensionMCPDefinitionStub{}).ResolveMCPExtensionDefinition(ctx, req)
+				if err != nil {
+					return MCPExtensionDefinition{}, err
+				}
+				server, err := override.Apply(base)
+				if err != nil {
+					return MCPExtensionDefinition{}, err
+				}
+				written = append(written, override)
+				return MCPExtensionDefinition{Target: target, Server: server, Override: override}, nil
+			},
+		}
+		service := testService(
+			t,
+			homePaths,
+			Dependencies{
+				MCPExtensions:          extensionMCPDefinitionStub{},
+				MCPExtensionManagement: management,
+				ApplyRecords:           NewConfigApplyRecordRepository(db.DB(), nil),
+			},
+		)
+		active, err := service.ActiveConfig(ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		writeFile(
+			t,
+			homePaths.ConfigFile,
+			strings.Replace(baseSettingsConfig(), "max_concurrent_agents = 11", "max_concurrent_agents = 17", 1),
+		)
+		pending := readFile(t, homePaths.ConfigFile)
+		put, err := service.ApplyCollectionItem(ctx, CollectionItemPutRequest{
+			Collection: CollectionMCPServers,
+			Owner:      "extension:linear",
+			Name:       "linear",
+			MCPServer:  &compozyconfig.MCPServer{URL: "https://extension.example/changed"},
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !put.Applied || put.RestartRequired || put.Record.Lifecycle != lifecycle.Live || put.MCPServer == nil ||
+			put.MCPServer.URL != "https://extension.example/changed" {
+			t.Fatalf("wrong live result: %#v", put)
+		}
+		after, err := service.ActiveConfig(ctx)
+		if err != nil || after.Limits.MaxConcurrentAgents != active.Limits.MaxConcurrentAgents ||
+			put.Record.ActiveHash == put.Record.DesiredHash {
+			t.Fatalf("MCP override activated pending config: %#v %v", put.Record, err)
+		}
+		reset, err := service.ApplyCollectionDelete(
+			ctx,
+			CollectionItemDeleteRequest{
+				Collection: CollectionMCPServers, Owner: "extension:linear",
+				Name: "linear",
+			},
+		)
+		if err != nil || !reset.Applied || reset.RestartRequired || reset.MCPServer == nil ||
+			reset.MCPServer.URL != "https://extension.example/mcp" {
+			t.Fatalf("DELETE failed to reset the same extension override: %#v %v", reset, err)
+		}
+		if len(written) != 2 || written[1].URL != "" || readFile(t, homePaths.ConfigFile) != pending {
+			t.Fatal("override reset changed config or did not clear the override")
+		}
+		_, err = service.PutCollectionItem(ctx, CollectionItemPutRequest{
+			Collection: CollectionMCPServers,
+			Owner:      "extension:linear",
+			Name:       "linear",
+			MCPServer:  &compozyconfig.MCPServer{Command: "forbidden"},
+		})
+		if !errors.Is(err, ErrValidation) || len(written) != 2 {
+			t.Fatalf("package field reached mutation: %v", err)
+		}
+	})
+
+	t.Run("Should persist and apply follow-up preferences without restarting", func(t *testing.T) {
+		t.Parallel()
+		ctx := t.Context()
+		homePaths := testHomePaths(t)
+		writeFile(t, homePaths.ConfigFile, baseSettingsConfig())
+		db, err := openSettingsTestGlobalDB(ctx, t, homePaths.DatabaseFile)
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() {
+			if err := db.Close(context.Background()); err != nil {
+				t.Error(err)
+			}
+		})
+		service := testService(t, homePaths, Dependencies{ApplyRecords: NewConfigApplyRecordRepository(db.DB(), nil)})
+		cfg, err := compozyconfig.LoadForHome(homePaths)
+		if err != nil {
+			t.Fatal(err)
+		}
+		general := generalSettingsFromConfig(&cfg)
+		general.FollowUpMode = new("queue")
+		result, err := service.ApplySection(WithMutationSource(ctx, "http"), SectionUpdateRequest{
+			Section: SectionGeneral, General: &general,
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !result.Applied || result.Record.Lifecycle != lifecycle.Live || result.Record.Generation != 1 {
+			t.Fatalf("follow-up apply = %#v", result)
+		}
+		updated, err := compozyconfig.LoadForHome(homePaths)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if updated.Session.BusyInput.DefaultMode != "queue" ||
+			updated.Session.BusyInput.QueueCap != cfg.Session.BusyInput.QueueCap {
+			t.Fatalf("persisted busy input = %#v", updated.Session.BusyInput)
+		}
+		// An older client omitting the new preference must preserve the persisted value.
+		general.FollowUpMode = nil
+		if _, err := service.UpdateSection(
+			ctx,
+			SectionUpdateRequest{Section: SectionGeneral, General: &general},
+		); err != nil {
+			t.Fatal(err)
+		}
+		replayed, err := compozyconfig.LoadForHome(homePaths)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if replayed.Session.BusyInput.DefaultMode != "queue" {
+			t.Fatalf("legacy writer erased preference: %#v", replayed.Session.BusyInput)
+		}
+	})
+
+	t.Run("Should persist and apply the desktop editor command live [IT-001]", func(t *testing.T) {
+		t.Parallel()
+		ctx := t.Context()
+		homePaths := testHomePaths(t)
+		writeFile(t, homePaths.ConfigFile, baseSettingsConfig())
+		db, err := openSettingsTestGlobalDB(ctx, t, homePaths.DatabaseFile)
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() {
+			if err := db.Close(context.Background()); err != nil {
+				t.Error(err)
+			}
+		})
+		service := testService(t, homePaths, Dependencies{ApplyRecords: NewConfigApplyRecordRepository(db.DB(), nil)})
+		cfg, err := compozyconfig.LoadForHome(homePaths)
+		if err != nil {
+			t.Fatal(err)
+		}
+		general := generalSettingsFromConfig(&cfg)
+		general.Desktop = &compozyconfig.DesktopConfig{EditorCommand: "zed {path}"}
+		if changed := diffGeneralSettings(&cfg, general); !slices.Equal(changed, []string{"desktop.editor_command"}) {
+			t.Fatalf("diffGeneralSettings() = %v, want [desktop.editor_command]", changed)
+		}
+		result, err := service.ApplySection(WithMutationSource(ctx, "http"), SectionUpdateRequest{
+			Section: SectionGeneral, General: &general,
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !result.Applied || result.RestartRequired || result.Record.Lifecycle != lifecycle.Live {
+			t.Fatalf("desktop apply = %#v, want live apply without restart", result)
+		}
+		updated, err := compozyconfig.LoadForHome(homePaths)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if updated.Desktop.EditorCommand != "zed {path}" {
+			t.Fatalf("persisted desktop.editor_command = %q", updated.Desktop.EditorCommand)
+		}
+		// A client omitting the desktop block keeps the persisted command.
+		general.Desktop = nil
+		if _, err := service.UpdateSection(
+			ctx,
+			SectionUpdateRequest{Section: SectionGeneral, General: &general},
+		); err != nil {
+			t.Fatal(err)
+		}
+		replayed, err := compozyconfig.LoadForHome(homePaths)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if replayed.Desktop.EditorCommand != "zed {path}" {
+			t.Fatalf("omitted desktop block erased editor command: %q", replayed.Desktop.EditorCommand)
+		}
+	})
+
+	t.Run("Should keep user and profile writes in one provenance timeline [IT-046]", func(t *testing.T) {
+		t.Parallel()
+
+		ctx := t.Context()
+		homePaths := testHomePaths(t)
+		writeFile(t, homePaths.ConfigFile, baseSettingsConfig())
+		db, err := openSettingsTestGlobalDB(ctx, t, homePaths.DatabaseFile)
+		if err != nil {
+			t.Fatalf("OpenGlobalDB() error = %v", err)
+		}
+		t.Cleanup(func() {
+			if err := db.Close(context.Background()); err != nil {
+				t.Fatalf("Close() error = %v", err)
+			}
+		})
+
+		service := testService(t, homePaths, Dependencies{
+			ApplyRecords: NewConfigApplyRecordRepository(db.DB(), nil),
+		})
+		for _, request := range []SectionUpdateRequest{
+			{
+				Section: SectionPersona, Scope: ScopeUser,
+				Persona: &compozyconfig.DefaultsConfig{
+					Agent: "user-agent", Provider: "codex",
+				},
+			},
+			{
+				Section: SectionPersona, Scope: ScopeProfile, ProfileName: "marketing",
+				Persona: &compozyconfig.DefaultsConfig{
+					Agent: "profile-agent", Provider: "codex",
+				},
+			},
+		} {
+			if _, err := service.ApplySection(WithMutationSource(ctx, "http"), request); err != nil {
+				t.Fatalf("ApplySection(%s) error = %v", request.Scope, err)
+			}
+		}
+
+		records, err := service.ListApplyRecords(ctx, ApplyRecordFilter{})
+		if err != nil {
+			t.Fatalf("ListApplyRecords() error = %v", err)
+		}
+		if len(records) != 2 {
+			t.Fatalf("ListApplyRecords() len = %d, want 2", len(records))
+		}
+		pathsByTarget := make(map[WriteTargetKind]string, len(records))
+		for _, record := range records {
+			pathsByTarget[record.WriteTarget] = record.WritePath
+		}
+		if got, want := pathsByTarget[WriteTargetGlobalConfig], homePaths.ConfigFile; got != want {
+			t.Fatalf("user apply path = %q, want %q", got, want)
+		}
+		if got, want := pathsByTarget[WriteTargetProfileConfig], filepath.Join(
+			homePaths.ProfilesDir, "marketing", compozyconfig.ConfigName,
+		); got != want {
+			t.Fatalf("profile apply path = %q, want %q", got, want)
+		}
+	})
+
+	t.Run("Should persist applied live record and advance active generation", func(t *testing.T) {
+		t.Parallel()
+
+		ctx := context.Background()
+		homePaths := testHomePaths(t)
+		writeFile(t, homePaths.ConfigFile, baseSettingsConfig())
+		db, err := openSettingsTestGlobalDB(ctx, t, homePaths.DatabaseFile)
+		if err != nil {
+			t.Fatalf("OpenGlobalDB() error = %v", err)
+		}
+		t.Cleanup(func() {
+			if err := db.Close(ctx); err != nil {
+				t.Fatalf("Close() error = %v", err)
+			}
+		})
+
+		service := testService(t, homePaths, Dependencies{
+			SkillsRuntime: newFakeSkillsRuntime(testSkill("alpha", false)),
+			ApplyRecords:  NewConfigApplyRecordRepository(db.DB(), nil),
+		})
+
+		cfg, err := compozyconfig.LoadForHome(homePaths)
+		if err != nil {
+			t.Fatalf("LoadForHome() error = %v", err)
+		}
+		cfg.Skills.DisabledSkills = []string{"alpha"}
+
+		result, err := service.ApplySection(WithMutationSource(ctx, "http"), SectionUpdateRequest{
+			Section: SectionSkills,
+			Skills:  &cfg.Skills,
+		})
+		if err != nil {
+			t.Fatalf("ApplySection(skills) error = %v", err)
+		}
+		if !result.Applied {
+			t.Fatal("ApplySection(skills).Applied = false, want true")
+		}
+		if got, want := result.Record.Lifecycle, lifecycle.Live; got != want {
+			t.Fatalf("Lifecycle = %q, want %q", got, want)
+		}
+		if got, want := result.Record.Status, lifecycle.StatusApplied; got != want {
+			t.Fatalf("Status = %q, want %q", got, want)
+		}
+		if got, want := result.Record.Generation, int64(1); got != want {
+			t.Fatalf("Generation = %d, want %d", got, want)
+		}
+		active, err := service.ActiveConfig(ctx)
+		if err != nil {
+			t.Fatalf("ActiveConfig() error = %v", err)
+		}
+		if len(active.Skills.DisabledSkills) != 1 || active.Skills.DisabledSkills[0] != "alpha" {
+			t.Fatalf("ActiveConfig().Skills.DisabledSkills = %#v, want [alpha]", active.Skills.DisabledSkills)
+		}
+
+		records, err := service.ListApplyRecords(ctx, ApplyRecordFilter{Status: lifecycle.StatusApplied})
+		if err != nil {
+			t.Fatalf("ListApplyRecords(applied) error = %v", err)
+		}
+		if len(records) != 1 {
+			t.Fatalf("ListApplyRecords(applied) len = %d, want 1", len(records))
+		}
+		if got, want := records[0].Actor, "http"; got != want {
+			t.Fatalf("Actor = %q, want %q", got, want)
+		}
+	})
+
+	t.Run("Should persist role routing as a live apply with history", func(t *testing.T) {
+		t.Parallel()
+
+		ctx := t.Context()
+		homePaths := testHomePaths(t)
+		writeFile(t, homePaths.ConfigFile, baseSettingsConfig())
+		db, err := openSettingsTestGlobalDB(ctx, t, homePaths.DatabaseFile)
+		if err != nil {
+			t.Fatalf("OpenGlobalDB() error = %v", err)
+		}
+		t.Cleanup(func() {
+			if err := db.Close(context.Background()); err != nil {
+				t.Errorf("Close() error = %v", err)
+			}
+		})
+
+		service := testService(t, homePaths, Dependencies{
+			ApplyRecords: NewConfigApplyRecordRepository(db.DB(), nil),
+		})
+		cfg, err := compozyconfig.LoadForHome(homePaths)
+		if err != nil {
+			t.Fatalf("LoadForHome() error = %v", err)
+		}
+		roles := cfg.Roles
+		roles.AutoTitle.Model = "anthropic/claude-sonnet-4"
+		roles.AutoTitle.Speed = "fast"
+		roles.AutoTitle.ACPOptions = []compozyconfig.ACPOptionSelection{{ID: "thinking", BoolValue: new(true)}}
+
+		result, err := service.ApplySection(WithMutationSource(ctx, "http"), SectionUpdateRequest{
+			Section: SectionRoles,
+			Roles:   &roles,
+		})
+		if err != nil {
+			t.Fatalf("ApplySection(roles) error = %v", err)
+		}
+		if !result.Applied || result.Record.Lifecycle != lifecycle.Live ||
+			result.Record.Status != lifecycle.StatusApplied {
+			t.Fatalf("ApplySection(roles) = %#v, want applied live record", result)
+		}
+
+		var persistedTables map[string]any
+		if err := toml.Unmarshal([]byte(readFile(t, homePaths.ConfigFile)), &persistedTables); err != nil {
+			t.Fatalf("decode persisted config tables: %v", err)
+		}
+		roleTables, ok := persistedTables["roles"].(map[string]any)
+		if !ok {
+			t.Fatalf("persisted roles = %#v, want role tables", persistedTables["roles"])
+		}
+		if got, want := slices.Sorted(
+			maps.Keys(roleTables),
+		), []string{
+			"auto_title",
+			"coordinator",
+		}; !slices.Equal(
+			got,
+			want,
+		) {
+			t.Fatalf("persisted role roster = %q, want %q", got, want)
+		}
+
+		persisted, err := compozyconfig.LoadForHome(homePaths)
+		if err != nil {
+			t.Fatalf("LoadForHome(persisted) error = %v", err)
+		}
+		if got, want := persisted.Roles.AutoTitle.Model, "anthropic/claude-sonnet-4"; got != want {
+			t.Fatalf("persisted roles.auto_title.model = %q, want %q", got, want)
+		}
+		if got, want := persisted.Roles.AutoTitle.Speed, speedpkg.SpeedFast; got != want {
+			t.Fatalf("persisted roles.auto_title.speed = %q, want %q", got, want)
+		}
+		persistedOption := persisted.Roles.AutoTitle.ACPOptions
+		if len(persistedOption) != 1 || persistedOption[0].ID != "thinking" ||
+			persistedOption[0].BoolValue == nil || !*persistedOption[0].BoolValue {
+			t.Fatalf("persisted roles.auto_title.acp_options = %#v, want thinking=true", persistedOption)
+		}
+		active, err := service.ActiveConfig(ctx)
+		if err != nil {
+			t.Fatalf("ActiveConfig() error = %v", err)
+		}
+		if active.Roles.AutoTitle.Model != persisted.Roles.AutoTitle.Model {
+			t.Fatalf(
+				"active roles.auto_title.model = %q, want persisted %q",
+				active.Roles.AutoTitle.Model,
+				persisted.Roles.AutoTitle.Model,
+			)
+		}
+		active.Roles.AutoTitle.FallbackChain = append(
+			active.Roles.AutoTitle.FallbackChain,
+			compozyconfig.RoleFallback{Provider: "mutated", Model: "mutated"},
+		)
+		active.RoleSources[compozyconfig.RoleAutoTitle]["model"] = "mutated"
+		isolated, err := service.ActiveConfig(ctx)
+		if err != nil {
+			t.Fatalf("ActiveConfig(after caller mutation) error = %v", err)
+		}
+		if slices.ContainsFunc(isolated.Roles.AutoTitle.FallbackChain, func(
+			fallback compozyconfig.RoleFallback,
+		) bool {
+			return fallback.Provider == "mutated"
+		}) || isolated.RoleSources[compozyconfig.RoleAutoTitle]["model"] == "mutated" {
+			t.Fatalf("ActiveConfig() retained caller-owned role state: %#v", isolated)
+		}
+		records, err := service.ListApplyRecords(ctx, ApplyRecordFilter{})
+		if err != nil {
+			t.Fatalf("ListApplyRecords() error = %v", err)
+		}
+		if len(records) != 1 || records[0].Actor != "http" || records[0].Lifecycle != lifecycle.Live {
+			t.Fatalf("role apply records = %#v, want one HTTP live record", records)
+		}
+	})
+
+	t.Run("Should replace workspace role fallbacks through the scoped section contract", func(t *testing.T) {
+		t.Parallel()
+
+		ctx := context.Background()
+		homePaths := testHomePaths(t)
+		writeFile(t, homePaths.ConfigFile, baseSettingsConfig())
+		workspaceRoot := filepath.Join(t.TempDir(), "workspace")
+		workspaceID := "ws-roles"
+		db, err := openSettingsTestGlobalDB(ctx, t, homePaths.DatabaseFile)
+		if err != nil {
+			t.Fatalf("OpenGlobalDB() error = %v", err)
+		}
+		t.Cleanup(func() {
+			if err := db.Close(ctx); err != nil {
+				t.Fatalf("Close() error = %v", err)
+			}
+		})
+
+		service := testService(t, homePaths, Dependencies{
+			ApplyRecords: NewConfigApplyRecordRepository(db.DB(), nil),
+			WorkspaceResolver: fakeWorkspaceResolver{resolved: map[string]workspacepkg.ResolvedWorkspace{
+				workspaceID: {
+					ID: workspaceID, RootDir: workspaceRoot,
+				},
+			}},
+		})
+		cfg, err := compozyconfig.LoadForHome(homePaths, compozyconfig.WithWorkspaceRoot(workspaceRoot))
+		if err != nil {
+			t.Fatalf("LoadForHome(workspace) error = %v", err)
+		}
+		roles := cfg.Roles
+		roles.AutoTitle.FallbackChain = []compozyconfig.RoleFallback{{
+			Provider: "codex", Model: "gpt-5-mini", ReasoningEffort: "medium", Speed: "fast",
+			ACPOptions: []compozyconfig.ACPOptionSelection{{ID: "context", ValueID: "1m"}},
+			Command:    "CODEX_HOME=/Users/ada/.codex-work codex acp",
+		}}
+
+		result, err := service.ApplySection(WithMutationSource(ctx, "uds"), SectionUpdateRequest{
+			Section: SectionRoles, Scope: ScopeWorkspace, WorkspaceID: workspaceID,
+			Roles: &roles,
+		})
+		if err != nil {
+			t.Fatalf("ApplySection(workspace roles) error = %v", err)
+		}
+		if !result.Applied || result.Scope != ScopeWorkspace || result.WorkspaceID != workspaceID ||
+			result.WriteTarget != WriteTargetWorkspaceConfig {
+			t.Fatalf("ApplySection(workspace roles) = %#v, want applied workspace config", result)
+		}
+
+		persisted, err := compozyconfig.LoadForHome(homePaths, compozyconfig.WithWorkspaceRoot(workspaceRoot))
+		if err != nil {
+			t.Fatalf("LoadForHome(persisted workspace) error = %v", err)
+		}
+		if !reflect.DeepEqual(persisted.Roles.AutoTitle.FallbackChain, roles.AutoTitle.FallbackChain) {
+			t.Fatalf(
+				"workspace fallback chain = %#v, want %#v",
+				persisted.Roles.AutoTitle.FallbackChain,
+				roles.AutoTitle.FallbackChain,
+			)
+		}
+
+		envelope, err := service.GetSection(ctx, SectionRequest{
+			Section: SectionRoles, Scope: ScopeWorkspace, WorkspaceID: workspaceID,
+		})
+		if err != nil {
+			t.Fatalf("GetSection(workspace roles) error = %v", err)
+		}
+		if envelope.Scope != ScopeWorkspace ||
+			!reflect.DeepEqual(envelope.AvailableScopes, []ScopeKind{ScopeUser, ScopeWorkspace}) {
+			t.Fatalf("GetSection(workspace roles) envelope = %#v", envelope)
+		}
+	})
+
+	t.Run("Should list the fallback chain when only a route command changes", func(t *testing.T) { // UT-019
+		t.Parallel()
+
+		current := compozyconfig.DefaultRolesConfig()
+		current.AutoTitle.FallbackChain = []compozyconfig.RoleFallback{{Provider: "claude", Model: "haiku-4-5"}}
+		desired := compozyconfig.CloneRolesConfig(&current)
+		desired.AutoTitle.FallbackChain[0].Command = "CLAUDE_CONFIG_DIR=/Users/ada/.claude-work claude --acp"
+		if changed := diffRolesSettings(&current, &desired); !reflect.DeepEqual(
+			changed,
+			[]string{"roles.auto_title.fallback_chain"},
+		) {
+			t.Fatalf("diffRolesSettings() = %#v, want only roles.auto_title.fallback_chain", changed)
+		}
+		tables := roleFallbackTables(desired.AutoTitle.FallbackChain)
+		if len(tables) != 1 || tables[0]["command"] != desired.AutoTitle.FallbackChain[0].Command {
+			t.Fatalf("roleFallbackTables() = %#v, want the route command persisted", tables)
+		}
+		if _, persisted := roleFallbackTables(current.AutoTitle.FallbackChain)[0]["command"]; persisted {
+			t.Fatal("roleFallbackTables() persisted an empty inherit command")
+		}
+	})
+
+	t.Run("Should treat nil and empty role fallback chains as unchanged", func(t *testing.T) {
+		t.Parallel()
+
+		current := compozyconfig.DefaultRolesConfig()
+		desired := compozyconfig.CloneRolesConfig(&current)
+		desired.Coordinator.FallbackChain = make([]compozyconfig.RoleFallback, 0)
+		desired.AutoTitle.FallbackChain = make([]compozyconfig.RoleFallback, 0)
+		if changed := diffRolesSettings(&current, &desired); len(changed) != 0 {
+			t.Fatalf("diffRolesSettings() = %#v, want no changes", changed)
+		}
+	})
+
+	t.Run("Should return provider snapshots without shared nested state", func(t *testing.T) {
+		t.Parallel()
+
+		ctx := t.Context()
+		homePaths := testHomePaths(t)
+		writeFile(t, homePaths.ConfigFile, baseSettingsConfig()+`
+
+[providers.custom]
+command = "custom-acp"
+session_mcp = true
+
+[providers.custom.models]
+default = "custom-model"
+
+[providers.custom.models.discovery]
+enabled = true
+command = "custom-acp models"
+
+[providers.custom.models.reasoning]
+apply = "acp_option"
+
+[[providers.custom.models.curated]]
+id = "custom-model"
+reasoning_efforts = ["low", "max"]
+hidden = false
+release_date = "2026-07-10"
+cost_cache_read_per_million = 0.5
+cost_cache_write_per_million = 6
+cost_reasoning_per_million = 30
+`)
+		service := testService(t, homePaths, Dependencies{})
+
+		first, err := service.ActiveConfig(ctx)
+		if err != nil {
+			t.Fatalf("ActiveConfig(first) error = %v", err)
+		}
+		provider := first.Providers["custom"]
+		provider.Models.Curated[0].ReasoningEfforts[0] = "mutated"
+		*provider.Models.Curated[0].Hidden = true
+		*provider.Models.Curated[0].CostCacheReadPerMillion = 99
+		*provider.Models.Curated[0].CostCacheWritePerMillion = 99
+		*provider.Models.Curated[0].CostReasoningPerMillion = 99
+		*provider.Models.Discovery.Enabled = false
+		*provider.SessionMCP = false
+
+		second, err := service.ActiveConfig(ctx)
+		if err != nil {
+			t.Fatalf("ActiveConfig(second) error = %v", err)
+		}
+		provider = second.Providers["custom"]
+		if got, want := provider.Models.Curated[0].ReasoningEfforts, []string{
+			"low",
+			string(modelcatalog.ReasoningEffortMax),
+		}; !slices.Equal(got, want) {
+			t.Fatalf("second reasoning efforts = %#v, want %#v", got, want)
+		}
+		if provider.Models.Curated[0].Hidden == nil || *provider.Models.Curated[0].Hidden {
+			t.Fatalf("second hidden = %#v, want explicit false", provider.Models.Curated[0].Hidden)
+		}
+		if provider.Models.Curated[0].CostCacheReadPerMillion == nil ||
+			*provider.Models.Curated[0].CostCacheReadPerMillion != 0.5 ||
+			provider.Models.Curated[0].CostCacheWritePerMillion == nil ||
+			*provider.Models.Curated[0].CostCacheWritePerMillion != 6 ||
+			provider.Models.Curated[0].CostReasoningPerMillion == nil ||
+			*provider.Models.Curated[0].CostReasoningPerMillion != 30 {
+			t.Fatalf("second five-rate pricing = %#v, want immutable snapshot", provider.Models.Curated[0])
+		}
+		if provider.Models.Discovery.Enabled == nil || !*provider.Models.Discovery.Enabled {
+			t.Fatalf("second discovery enabled = %#v, want true", provider.Models.Discovery.Enabled)
+		}
+		if provider.SessionMCP == nil || !*provider.SessionMCP {
+			t.Fatalf("second session_mcp = %#v, want true", provider.SessionMCP)
+		}
+	})
+
+	t.Run("Should live-apply window-manager config without sharing nested state", func(t *testing.T) {
+		t.Parallel()
+
+		ctx := WithMutationSource(context.Background(), "http")
+		homePaths := testHomePaths(t)
+		writeFile(t, homePaths.ConfigFile, baseSettingsConfig())
+		db, err := openSettingsTestGlobalDB(ctx, t, homePaths.DatabaseFile)
+		if err != nil {
+			t.Fatalf("OpenGlobalDB() error = %v", err)
+		}
+		t.Cleanup(func() {
+			if err := db.Close(ctx); err != nil {
+				t.Fatalf("Close() error = %v", err)
+			}
+		})
+
+		applier := &fakeConfigRuntimeApplier{}
+		service := testService(t, homePaths, Dependencies{
+			RuntimeApplier: applier,
+			ApplyRecords:   NewConfigApplyRecordRepository(db.DB(), nil),
+		})
+		initialActive, err := service.ActiveConfig(ctx)
+		if err != nil {
+			t.Fatalf("ActiveConfig(initial) error = %v", err)
+		}
+		pendingRestartConfig := strings.Replace(
+			baseSettingsConfig(),
+			`provider = "codex"`,
+			`provider = "claude"`,
+			1,
+		)
+		writeFile(t, homePaths.ConfigFile, pendingRestartConfig)
+		desired := testWindowManagerConfig()
+
+		result, err := service.ApplySection(ctx, SectionUpdateRequest{
+			Section:       SectionWindowManager,
+			WindowManager: &desired,
+		})
+		if err != nil {
+			t.Fatalf("ApplySection(window-manager) error = %v", err)
+		}
+		if !result.Applied || result.RestartRequired {
+			t.Fatalf("ApplySection(window-manager) = %#v, want live applied result", result)
+		}
+		if got, want := result.Record.Lifecycle, lifecycle.Live; got != want {
+			t.Fatalf("Lifecycle = %q, want %q", got, want)
+		}
+		if got, want := result.Record.Status, lifecycle.StatusApplied; got != want {
+			t.Fatalf("Status = %q, want %q", got, want)
+		}
+		if got, want := result.Record.Generation, int64(1); got != want {
+			t.Fatalf("Generation = %d, want %d", got, want)
+		}
+		if result.Record.DesiredHash == result.Record.ActiveHash {
+			t.Fatalf(
+				"window-manager hashes = desired %q active %q, want pending restart drift",
+				result.Record.DesiredHash,
+				result.Record.ActiveHash,
+			)
+		}
+		if got, want := applier.calls, 1; got != want {
+			t.Fatalf("ApplyActiveConfig() calls = %d, want %d", got, want)
+		}
+		if got, want := len(applier.snapshots), 1; got != want {
+			t.Fatalf("runtime snapshots = %d, want %d", got, want)
+		}
+		if got := applier.snapshots[0].WindowManager; !reflect.DeepEqual(got, desired) {
+			t.Fatalf("runtime WindowManager = %#v, want %#v", got, desired)
+		}
+		if got, want := applier.snapshots[0].Defaults.Provider, initialActive.Defaults.Provider; got != want {
+			t.Fatalf("runtime defaults.provider = %q, want pending restart value %q excluded", got, want)
+		}
+
+		desired.Snap.RepeatRatios[0] = 0.9
+		desired.Shortcuts["desktop.switch.next"][0] = "Meta+ArrowDown"
+		first, err := service.ActiveConfig(ctx)
+		if err != nil {
+			t.Fatalf("ActiveConfig(first) error = %v", err)
+		}
+		first.WindowManager.Snap.RepeatRatios[0] = 0.8
+		first.WindowManager.Shortcuts["desktop.switch.next"][0] = "Meta+ArrowUp"
+		second, err := service.ActiveConfig(ctx)
+		if err != nil {
+			t.Fatalf("ActiveConfig(second) error = %v", err)
+		}
+		if got, want := second.WindowManager.Snap.RepeatRatios[0], 0.4; got != want {
+			t.Fatalf("active repeat ratio = %v, want %v", got, want)
+		}
+		if got, want := second.WindowManager.Shortcuts["desktop.switch.next"], (windowmanager.ShortcutBinding{"Meta+ArrowRight"}); !slices.Equal(
+			got,
+			want,
+		) {
+			t.Fatalf("active desktop.switch.next shortcut = %q, want %q", got, want)
+		}
+		if got, want := second.Defaults.Provider, initialActive.Defaults.Provider; got != want {
+			t.Fatalf("active defaults.provider = %q, want pending restart value %q excluded", got, want)
+		}
+		pendingRestart, err := service.HasPendingConfigRestart(ctx)
+		if err != nil {
+			t.Fatalf("HasPendingConfigRestart() error = %v", err)
+		}
+		if !pendingRestart {
+			t.Fatal("HasPendingConfigRestart() = false, want pending provider drift")
+		}
+	})
+
+	t.Run("Should live-apply attention config without leaking pending restart fields", func(t *testing.T) {
+		t.Parallel()
+
+		ctx := WithMutationSource(context.Background(), "uds")
+		homePaths := testHomePaths(t)
+		writeFile(t, homePaths.ConfigFile, baseSettingsConfig())
+		db, err := openSettingsTestGlobalDB(ctx, t, homePaths.DatabaseFile)
+		if err != nil {
+			t.Fatalf("OpenGlobalDB() error = %v", err)
+		}
+		t.Cleanup(func() {
+			if err := db.Close(ctx); err != nil {
+				t.Fatalf("Close() error = %v", err)
+			}
+		})
+
+		applier := &fakeConfigRuntimeApplier{}
+		service := testService(t, homePaths, Dependencies{
+			RuntimeApplier: applier,
+			ApplyRecords:   NewConfigApplyRecordRepository(db.DB(), nil),
+		})
+		initialActive, err := service.ActiveConfig(ctx)
+		if err != nil {
+			t.Fatalf("ActiveConfig(initial) error = %v", err)
+		}
+		pendingRestartConfig := strings.Replace(
+			baseSettingsConfig(),
+			`provider = "codex"`,
+			`provider = "claude"`,
+			1,
+		)
+		writeFile(t, homePaths.ConfigFile, pendingRestartConfig)
+		desired := AttentionSettings{
+			Toasts:          false,
+			Sound:           false,
+			System:          true,
+			MutedWorkspaces: []string{"ws_0123456789abcdef"},
+		}
+
+		result, err := service.ApplySection(ctx, SectionUpdateRequest{
+			Section:                        SectionAttention,
+			Attention:                      &desired,
+			ReplaceAttentionWorkspaceMutes: true,
+		})
+		if err != nil {
+			t.Fatalf("ApplySection(attention) error = %v", err)
+		}
+		if !result.Applied || result.RestartRequired {
+			t.Fatalf("ApplySection(attention) = %#v, want live applied result", result)
+		}
+		if got, want := applier.calls, 1; got != want {
+			t.Fatalf("ApplyActiveConfig() calls = %d, want %d", got, want)
+		}
+		wantRuntime := compozyconfig.AttentionConfig{Toasts: false, Sound: false, System: true}
+		if got := applier.snapshots[0].Attention; !reflect.DeepEqual(got, wantRuntime) {
+			t.Fatalf("runtime Attention = %#v, want %#v", got, wantRuntime)
+		}
+		if got, want := applier.snapshots[0].Defaults.Provider, initialActive.Defaults.Provider; got != want {
+			t.Fatalf("runtime defaults.provider = %q, want pending restart value %q excluded", got, want)
+		}
+
+		desired.MutedWorkspaces[0] = "ws_abcdef0123456789"
+		section, err := service.GetSection(ctx, SectionRequest{Section: SectionAttention})
+		if err != nil {
+			t.Fatalf("GetSection(attention) error = %v", err)
+		}
+		if got, want := section.Attention.Config.MutedWorkspaces[0], "ws_0123456789abcdef"; got != want {
+			t.Fatalf("stored muted workspace = %q, want %q", got, want)
+		}
+	})
+
+	t.Run("Should live-apply shell preferences without leaking pending restart fields", func(t *testing.T) {
+		t.Parallel()
+
+		ctx := WithMutationSource(context.Background(), "uds")
+		homePaths := testHomePaths(t)
+		writeFile(t, homePaths.ConfigFile, baseSettingsConfig())
+		db, err := openSettingsTestGlobalDB(ctx, t, homePaths.DatabaseFile)
+		if err != nil {
+			t.Fatalf("OpenGlobalDB() error = %v", err)
+		}
+		t.Cleanup(func() {
+			if err := db.Close(ctx); err != nil {
+				t.Errorf("Close() error = %v", err)
+			}
+		})
+
+		applier := &fakeConfigRuntimeApplier{}
+		service := testService(t, homePaths, Dependencies{
+			RuntimeApplier: applier,
+			ApplyRecords:   NewConfigApplyRecordRepository(db.DB(), nil),
+		})
+		initialActive, err := service.ActiveConfig(ctx)
+		if err != nil {
+			t.Fatalf("ActiveConfig(initial) error = %v", err)
+		}
+		pendingRestartConfig := strings.Replace(
+			baseSettingsConfig(),
+			`provider = "codex"`,
+			`provider = "claude"`,
+			1,
+		)
+		writeFile(t, homePaths.ConfigFile, pendingRestartConfig)
+		desired := compozyconfig.ShellConfig{Sessions: compozyconfig.ShellSessionsConfig{
+			Sort:  compozyconfig.ShellSessionSortAttention,
+			Scope: compozyconfig.ShellSessionScopeAllWorkspaces,
+		}}
+
+		result, err := service.ApplySection(ctx, SectionUpdateRequest{
+			Section: SectionShell,
+			Shell:   &desired,
+		})
+		if err != nil {
+			t.Fatalf("ApplySection(shell) error = %v", err)
+		}
+		if !result.Applied || result.RestartRequired {
+			t.Fatalf("ApplySection(shell) = %#v, want live applied result", result)
+		}
+		if got, want := applier.calls, 1; got != want {
+			t.Fatalf("ApplyActiveConfig() calls = %d, want %d", got, want)
+		}
+		desired.Sessions.GroupBy = compozyconfig.ShellSessionGroupByProject
+		desired.Sessions.ScopeExplicit = true
+		if got := applier.snapshots[0].Shell; !reflect.DeepEqual(got, desired) {
+			t.Fatalf("runtime Shell = %#v, want %#v", got, desired)
+		}
+		if got, want := applier.snapshots[0].Defaults.Provider, initialActive.Defaults.Provider; got != want {
+			t.Fatalf("runtime defaults.provider = %q, want pending restart value %q excluded", got, want)
+		}
+	})
+
+	t.Run("Should isolate profile mutes without writing them to config", func(t *testing.T) {
+		t.Parallel()
+
+		ctx := WithMutationSource(context.Background(), "http")
+		homePaths := testHomePaths(t)
+		const removedID = "ws_0123456789abcdef"
+		const retainedID = "ws_abcdef0123456789"
+		writeFile(t, homePaths.ConfigFile, baseSettingsConfig())
+		db, err := openSettingsTestGlobalDB(ctx, t, homePaths.DatabaseFile)
+		if err != nil {
+			t.Fatalf("OpenGlobalDB() error = %v", err)
+		}
+		t.Cleanup(func() {
+			if err := db.Close(ctx); err != nil {
+				t.Errorf("Close() error = %v", err)
+			}
+		})
+		mutes := &settingsTestAttentionMuteStore{byProfile: map[string][]string{
+			store.DefaultProfileID: {removedID, retainedID},
+			"profile-marketing":    {removedID},
+		}}
+		service := testService(t, homePaths, Dependencies{
+			RuntimeApplier:          &fakeConfigRuntimeApplier{},
+			ApplyRecords:            NewConfigApplyRecordRepository(db.DB(), nil),
+			AttentionWorkspaceMutes: mutes,
+		})
+
+		desired := AttentionSettings{Toasts: true, Sound: true, MutedWorkspaces: []string{retainedID}}
+		if _, err := service.ApplySection(ctx, SectionUpdateRequest{
+			Section:                        SectionAttention,
+			Attention:                      &desired,
+			ReplaceAttentionWorkspaceMutes: true,
+		}); err != nil {
+			t.Fatalf("ApplySection(attention mutes) error = %v", err)
+		}
+		defaultSection, err := service.GetSection(ctx, SectionRequest{Section: SectionAttention})
+		if err != nil {
+			t.Fatalf("GetSection(default attention) error = %v", err)
+		}
+		marketingSection, err := service.GetSection(ctx, SectionRequest{
+			Section: SectionAttention, Scope: ScopeProfile, ProfileName: "marketing",
+		})
+		if err != nil {
+			t.Fatalf("GetSection(marketing attention) error = %v", err)
+		}
+		if got := defaultSection.Attention.Config.MutedWorkspaces; !reflect.DeepEqual(got, []string{retainedID}) {
+			t.Fatalf("default muted workspaces = %#v, want retained only", got)
+		}
+		if got := marketingSection.Attention.Config.MutedWorkspaces; !reflect.DeepEqual(got, []string{removedID}) {
+			t.Fatalf("marketing muted workspaces = %#v, want unchanged", got)
+		}
+		if configText := readFile(t, homePaths.ConfigFile); strings.Contains(configText, "muted_workspaces") {
+			t.Fatalf("config contains retired muted_workspaces key:\n%s", configText)
+		}
+	})
+
+	t.Run("Should serialize concurrent attention writers without a torn config", func(t *testing.T) {
+		t.Parallel()
+
+		ctx := WithMutationSource(context.Background(), "http")
+		homePaths := testHomePaths(t)
+		writeFile(t, homePaths.ConfigFile, baseSettingsConfig())
+		db, err := openSettingsTestGlobalDB(ctx, t, homePaths.DatabaseFile)
+		if err != nil {
+			t.Fatalf("OpenGlobalDB() error = %v", err)
+		}
+		t.Cleanup(func() {
+			if err := db.Close(ctx); err != nil {
+				t.Errorf("Close() error = %v", err)
+			}
+		})
+		service := testService(t, homePaths, Dependencies{
+			RuntimeApplier: &fakeConfigRuntimeApplier{},
+			ApplyRecords:   NewConfigApplyRecordRepository(db.DB(), nil),
+		})
+		candidates := []AttentionSettings{
+			{Toasts: true, Sound: false, MutedWorkspaces: []string{"ws_0123456789abcdef"}},
+			{Toasts: false, Sound: true, System: true, MutedWorkspaces: []string{"ws_abcdef0123456789"}},
+			{Toasts: true, Sound: true, System: true, MutedWorkspaces: []string{"ws_1111111111111111"}},
+		}
+		errorsByWriter := make(chan error, len(candidates))
+		var writers sync.WaitGroup
+		for index := range candidates {
+			candidate := normalizeAttentionSettings(candidates[index])
+			writers.Go(func() {
+				_, applyErr := service.ApplySection(ctx, SectionUpdateRequest{
+					Section:                        SectionAttention,
+					Attention:                      &candidate,
+					ReplaceAttentionWorkspaceMutes: true,
+				})
+				errorsByWriter <- applyErr
+			})
+		}
+		writers.Wait()
+		close(errorsByWriter)
+		for writerErr := range errorsByWriter {
+			if writerErr != nil {
+				t.Fatalf("ApplySection(concurrent attention) error = %v", writerErr)
+			}
+		}
+		envelope, err := service.GetSection(ctx, SectionRequest{Section: SectionAttention})
+		if err != nil {
+			t.Fatalf("GetSection(concurrent attention) error = %v", err)
+		}
+		if !slices.ContainsFunc(candidates, func(candidate AttentionSettings) bool {
+			return reflect.DeepEqual(normalizeAttentionSettings(candidate), envelope.Attention.Config)
+		}) {
+			t.Fatalf("concurrent attention = %#v, want one complete candidate", envelope.Attention.Config)
+		}
+	})
+
+	t.Run("Should keep concurrent window-manager shortcuts and aliases atomic (IT013)", func(t *testing.T) {
+		t.Parallel()
+
+		ctx := WithMutationSource(context.Background(), "http")
+		homePaths := testHomePaths(t)
+		writeFile(t, homePaths.ConfigFile, baseSettingsConfig())
+		db, err := openSettingsTestGlobalDB(ctx, t, homePaths.DatabaseFile)
+		if err != nil {
+			t.Fatalf("OpenGlobalDB() error = %v", err)
+		}
+		t.Cleanup(func() {
+			if err := db.Close(ctx); err != nil {
+				t.Errorf("Close() error = %v", err)
+			}
+		})
+		service := testService(t, homePaths, Dependencies{
+			RuntimeApplier: &fakeConfigRuntimeApplier{},
+			ApplyRecords:   NewConfigApplyRecordRepository(db.DB(), nil),
+		})
+		type candidate struct {
+			windowManager compozyconfig.WindowManagerConfig
+			aliases       map[string]string
+		}
+		candidates := make([]candidate, 3)
+		for index := range candidates {
+			windowManagerConfig := testWindowManagerConfig()
+			windowManagerConfig.HistoryLimit += index
+			windowManagerConfig.Shortcuts = map[string]windowmanager.ShortcutBinding{
+				"desktop.switch.next": {fmt.Sprintf("Meta+Alt+Shift+Digit%d", index+1)},
+			}
+			candidates[index] = candidate{
+				windowManager: windowManagerConfig,
+				aliases: map[string]string{
+					"desktop.switch.next": fmt.Sprintf("next%d", index+1),
+				},
+			}
+		}
+
+		errorsByWriter := make(chan error, len(candidates))
+		var writers sync.WaitGroup
+		for index := range candidates {
+			windowManagerConfig := cloneWindowManagerConfig(candidates[index].windowManager)
+			aliases := cloneAliases(candidates[index].aliases)
+			writers.Go(func() {
+				_, applyErr := service.ApplySection(ctx, SectionUpdateRequest{
+					Section:              SectionWindowManager,
+					WindowManager:        &windowManagerConfig,
+					WindowManagerAliases: &aliases,
+				})
+				errorsByWriter <- applyErr
+			})
+		}
+		writers.Wait()
+		close(errorsByWriter)
+		for writerErr := range errorsByWriter {
+			if writerErr != nil {
+				t.Fatalf("ApplySection(concurrent window-manager) error = %v", writerErr)
+			}
+		}
+
+		loaded, err := compozyconfig.LoadForHome(homePaths)
+		if err != nil {
+			t.Fatalf("LoadForHome(concurrent window-manager) error = %v", err)
+		}
+		if !slices.ContainsFunc(candidates, func(candidate candidate) bool {
+			return reflect.DeepEqual(candidate.windowManager, loaded.WindowManager) &&
+				reflect.DeepEqual(candidate.aliases, loaded.CmdPalette.Aliases)
+		}) {
+			t.Fatalf(
+				"concurrent window-manager = %#v aliases = %#v, want one complete candidate",
+				loaded.WindowManager,
+				loaded.CmdPalette.Aliases,
+			)
+		}
+	})
+
+	t.Run(
+		"Should preserve pending gateway ports while applying the ceiling live",
+		func(t *testing.T) {
+			t.Parallel()
+
+			ctx := WithMutationSource(context.Background(), "http")
+			homePaths := testHomePaths(t)
+			writeFile(t, homePaths.ConfigFile, baseSettingsConfig())
+			db, err := openSettingsTestGlobalDB(ctx, t, homePaths.DatabaseFile)
+			if err != nil {
+				t.Fatalf("OpenGlobalDB() error = %v", err)
+			}
+			t.Cleanup(func() {
+				if err := db.Close(ctx); err != nil {
+					t.Errorf("Close() error = %v", err)
+				}
+			})
+
+			applier := &fakeConfigRuntimeApplier{}
+			service := testService(t, homePaths, Dependencies{
+				RuntimeApplier: applier,
+				ApplyRecords:   NewConfigApplyRecordRepository(db.DB(), nil),
+			})
+			initial, err := service.ActiveConfig(ctx)
+			if err != nil {
+				t.Fatalf("ActiveConfig(initial) error = %v", err)
+			}
+			pendingGateway := initial.Gateway
+			pendingGateway.PrivatePort = 43210
+			pending, err := service.ApplySection(ctx, SectionUpdateRequest{
+				Section: SectionGateway,
+				Gateway: &pendingGateway,
+			})
+			if err != nil {
+				t.Fatalf("ApplySection(pending gateway port) error = %v", err)
+			}
+			if pending.Applied || !pending.RestartRequired || pending.Record.Status != lifecycle.StatusBlocked {
+				t.Fatalf("pending gateway apply = %#v, want blocked restart-required result", pending)
+			}
+
+			desired, err := compozyconfig.LoadForHome(homePaths)
+			if err != nil {
+				t.Fatalf("LoadForHome(pending) error = %v", err)
+			}
+			desired.Gateway.Enabled = !initial.Gateway.Enabled
+			live, err := service.ApplySection(ctx, SectionUpdateRequest{
+				Section: SectionGateway,
+				Gateway: &desired.Gateway,
+			})
+			if err != nil {
+				t.Fatalf("ApplySection(gateway ceiling) error = %v", err)
+			}
+			if !live.Applied || live.RestartRequired || live.Record.Lifecycle != lifecycle.Live {
+				t.Fatalf("gateway ceiling apply = %#v, want live applied result", live)
+			}
+			if live.Record.DesiredHash == live.Record.ActiveHash {
+				t.Fatalf(
+					"gateway hashes = desired %q active %q, want pending restart drift",
+					live.Record.DesiredHash,
+					live.Record.ActiveHash,
+				)
+			}
+			if got, want := applier.calls, 1; got != want {
+				t.Fatalf("ApplyActiveConfig() calls = %d, want %d", got, want)
+			}
+			runtimeGateway := applier.snapshots[0].Gateway
+			if runtimeGateway.Enabled != desired.Gateway.Enabled {
+				t.Fatalf("runtime gateway.enabled = %t, want %t", runtimeGateway.Enabled, desired.Gateway.Enabled)
+			}
+			if runtimeGateway.PrivatePort != initial.Gateway.PrivatePort {
+				t.Fatalf(
+					"runtime gateway.private_port = %d, want prior active %d",
+					runtimeGateway.PrivatePort,
+					initial.Gateway.PrivatePort,
+				)
+			}
+			active, err := service.ActiveConfig(ctx)
+			if err != nil {
+				t.Fatalf("ActiveConfig(after live projection) error = %v", err)
+			}
+			if !reflect.DeepEqual(active.Gateway, runtimeGateway) {
+				t.Fatalf("active gateway = %#v, want runtime projection %#v", active.Gateway, runtimeGateway)
+			}
+		},
+	)
+}
+
+func TestConfigApplyServiceRecordsRestartRequiredWithoutAdvancingGeneration(t *testing.T) {
+	t.Parallel()
+
+	// Invariant: a scoped restart requirement survives unrelated live writes until daemon boot.
+	// Owner: Settings config-apply coordinator; canonical suite: this real-repository lifecycle suite.
+	t.Run("Should retain profile restart requirements until a new runtime starts", func(t *testing.T) {
+		t.Parallel()
+		ctx := t.Context()
+		homePaths := testHomePaths(t)
+		writeFile(t, homePaths.ConfigFile, baseSettingsConfig())
+		db, err := openSettingsTestGlobalDB(ctx, t, homePaths.DatabaseFile)
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() {
+			if err := db.Close(context.Background()); err != nil {
+				t.Error(err)
+			}
+		})
+		deps := Dependencies{ApplyRecords: NewConfigApplyRecordRepository(db.DB(), nil)}
+		svc := testService(t, homePaths, deps)
+		initial, err := svc.ActiveConfig(ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		skills := initial.Skills
+		skills.PollInterval += time.Second
+		pending, err := svc.ApplySection(ctx, SectionUpdateRequest{
+			Section: SectionSkills, Scope: ScopeProfile, ProfileName: "marketing",
+			Skills: &skills,
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if pending.Record.WriteTarget != WriteTargetProfileConfig || !pending.RestartRequired ||
+			pending.Record.DesiredHash != pending.Record.ActiveHash {
+			t.Fatalf("profile change should require restart without global hash drift: %#v", pending)
+		}
+		if required, err := svc.HasPendingConfigRestart(ctx); err != nil || !required {
+			t.Fatalf("profile restart requirement = %t, error = %v", required, err)
+		}
+		live, err := svc.ApplySection(ctx, SectionUpdateRequest{
+			Section: SectionShell, Scope: ScopeUser,
+			Shell: &compozyconfig.ShellConfig{Sessions: compozyconfig.ShellSessionsConfig{
+				Sort:  compozyconfig.ShellSessionSortAttention,
+				Scope: compozyconfig.ShellSessionScopeAllWorkspaces,
+			}},
+		})
+		if err != nil || !live.Applied || live.RestartRequired {
+			t.Fatalf("unrelated live write = %#v, error = %v", live, err)
+		}
+		if required, err := svc.HasPendingConfigRestart(ctx); err != nil || !required {
+			t.Fatalf("live write lost profile restart requirement: %t, error = %v", required, err)
+		}
+		restarted := testService(t, homePaths, deps)
+		if required, err := restarted.HasPendingConfigRestart(ctx); err != nil || required {
+			t.Fatalf("new runtime retained an applied profile restart requirement: %t, error = %v", required, err)
+		}
+		section, err := restarted.GetSection(ctx, SectionRequest{
+			Section: SectionSkills, Scope: ScopeProfile, ProfileName: "marketing",
+		})
+		if err != nil || section.Skills == nil || section.Skills.Config.PollInterval != skills.PollInterval {
+			t.Fatalf("profile value did not survive new runtime: %#v, error = %v", section, err)
+		}
+	})
+
+	t.Run("Should persist blocked record for restart-required change", func(t *testing.T) {
+		t.Parallel()
+
+		ctx := context.Background()
+		homePaths := testHomePaths(t)
+		writeFile(t, homePaths.ConfigFile, baseSettingsConfig())
+		db, err := openSettingsTestGlobalDB(ctx, t, homePaths.DatabaseFile)
+		if err != nil {
+			t.Fatalf("OpenGlobalDB() error = %v", err)
+		}
+		t.Cleanup(func() {
+			if err := db.Close(ctx); err != nil {
+				t.Fatalf("Close() error = %v", err)
+			}
+		})
+
+		service := testService(t, homePaths, Dependencies{
+			ApplyRecords: NewConfigApplyRecordRepository(db.DB(), nil),
+		})
+
+		cfg, err := compozyconfig.LoadForHome(homePaths)
+		if err != nil {
+			t.Fatalf("LoadForHome() error = %v", err)
+		}
+		general := GeneralSettings{
+			Limits:         cfg.Limits,
+			Permissions:    cfg.Permissions,
+			SessionTimeout: cfg.Session.Limits.Timeout,
+			HTTP:           cfg.HTTP,
+			Daemon:         cfg.Daemon,
+		}
+		general.HTTP.Port = 2124
+
+		result, err := service.ApplySection(WithMutationSource(ctx, "uds"), SectionUpdateRequest{
+			Section: SectionGeneral,
+			General: &general,
+		})
+		if err != nil {
+			t.Fatalf("ApplySection(general) error = %v", err)
+		}
+		if result.Applied {
+			t.Fatal("ApplySection(general).Applied = true, want false")
+		}
+		if got, want := result.Record.Lifecycle, lifecycle.RestartRequired; got != want {
+			t.Fatalf("Lifecycle = %q, want %q", got, want)
+		}
+		if got, want := result.Record.Status, lifecycle.StatusBlocked; got != want {
+			t.Fatalf("Status = %q, want %q", got, want)
+		}
+		if got, want := result.NextAction, lifecycle.NextActionRestartDaemon; got != want {
+			t.Fatalf("NextAction = %q, want %q", got, want)
+		}
+		if got, want := result.Record.Generation, int64(0); got != want {
+			t.Fatalf("Generation = %d, want %d", got, want)
+		}
+
+		records, err := service.ListApplyRecords(ctx, ApplyRecordFilter{Status: lifecycle.StatusBlocked})
+		if err != nil {
+			t.Fatalf("ListApplyRecords(blocked) error = %v", err)
+		}
+		if len(records) != 1 {
+			t.Fatalf("ListApplyRecords(blocked) len = %d, want 1", len(records))
+		}
+		if len(records[0].Diagnostics) == 0 {
+			t.Fatal("Diagnostics len = 0, want restart-required diagnostic")
+		}
+	})
+}
+
+func TestConfigApplyServiceProviderOverlayForBuiltinRequiresRestart(t *testing.T) {
+	t.Parallel()
+
+	t.Run("Should block active generation when provider overlay replaces builtin provider", func(t *testing.T) {
+		t.Parallel()
+
+		ctx := context.Background()
+		homePaths := testHomePaths(t)
+		writeFile(t, homePaths.ConfigFile, baseSettingsConfig())
+		db, err := openSettingsTestGlobalDB(ctx, t, homePaths.DatabaseFile)
+		if err != nil {
+			t.Fatalf("OpenGlobalDB() error = %v", err)
+		}
+		t.Cleanup(func() {
+			if err := db.Close(ctx); err != nil {
+				t.Fatalf("Close() error = %v", err)
+			}
+		})
+
+		service := testService(t, homePaths, Dependencies{
+			ApplyRecords: NewConfigApplyRecordRepository(db.DB(), nil),
+		})
+
+		result, err := service.ApplyCollectionItem(
+			WithMutationSource(ctx, "http"),
+			CollectionItemPutRequest{
+				Collection: CollectionProviders,
+				Name:       "codex",
+				Provider: &ProviderSettings{
+					Command: "codex-browser",
+				},
+			},
+		)
+		if err != nil {
+			t.Fatalf("ApplyCollectionItem(provider codex) error = %v", err)
+		}
+		if result.Applied {
+			t.Fatal("ApplyCollectionItem(provider codex).Applied = true, want false")
+		}
+		if !result.RestartRequired {
+			t.Fatal("ApplyCollectionItem(provider codex).RestartRequired = false, want true")
+		}
+		if got, want := result.Record.Lifecycle, lifecycle.RestartRequired; got != want {
+			t.Fatalf("Lifecycle = %q, want %q", got, want)
+		}
+		if got, want := result.Record.Status, lifecycle.StatusBlocked; got != want {
+			t.Fatalf("Status = %q, want %q", got, want)
+		}
+		if got, want := result.Record.Generation, int64(0); got != want {
+			t.Fatalf("Generation = %d, want %d", got, want)
+		}
+	})
+}
+
+func TestConfigApplyServiceAppliesProviderModelOnlyChangesLive(t *testing.T) {
+	t.Parallel()
+
+	t.Run("Should persist explicit five-rate changes without catalog defaults", func(t *testing.T) {
+		t.Parallel()
+
+		ctx := t.Context()
+		service, homePaths, catalog, _ := providerModelCurationTestService(t)
+		writeFile(t, homePaths.ConfigFile, baseSettingsConfig()+`
+
+[[providers.codex.models.curated]]
+id = "gpt-5.6-luna"
+default_reasoning_effort = "high"
+`)
+		catalog.mu.Lock()
+		catalog.models["codex"] = append(catalog.models["codex"], modelcatalog.Model{
+			ProviderID:               "codex",
+			ModelID:                  "gpt-5.6-luna",
+			DisplayName:              "GPT-5.6 Luna",
+			CostInputPerMillion:      new(1.0),
+			CostOutputPerMillion:     new(6.0),
+			CostCacheReadPerMillion:  new(0.1),
+			CostCacheWritePerMillion: new(1.25),
+			DefaultReasoningEffort:   nil,
+			Curated:                  true,
+		})
+		catalog.mu.Unlock()
+		envelope, err := service.ListCollection(ctx, CollectionRequest{Collection: CollectionProviders})
+		if err != nil {
+			t.Fatalf("ListCollection(providers) error = %v", err)
+		}
+		provider := mustFindProviderItem(t, envelope.Providers, "codex")
+		var projectedModel *compozyconfig.ProviderModelConfig
+		for index := range provider.Settings.Models.Curated {
+			if provider.Settings.Models.Curated[index].ID == "gpt-5.6-sol" {
+				projectedModel = &provider.Settings.Models.Curated[index]
+				break
+			}
+		}
+		if projectedModel == nil || projectedModel.CostInputPerMillion == nil ||
+			*projectedModel.CostInputPerMillion != 5 ||
+			projectedModel.CostOutputPerMillion == nil ||
+			*projectedModel.CostOutputPerMillion != 30 ||
+			projectedModel.CostCacheReadPerMillion == nil ||
+			*projectedModel.CostCacheReadPerMillion != 0.5 ||
+			projectedModel.CostCacheWritePerMillion == nil ||
+			*projectedModel.CostCacheWritePerMillion != 6 ||
+			projectedModel.CostReasoningPerMillion == nil ||
+			*projectedModel.CostReasoningPerMillion != 30 {
+			t.Fatalf("provider settings five-rate catalog metadata = %#v", projectedModel)
+		}
+		settings := mustFindProviderItem(t, envelope.Providers, "codex").Settings
+		settings.ModelsSet = true
+		model := requireConfiguredProviderModel(t, settings.Models.Curated, "gpt-5.6-luna")
+		costInput := 1.1
+		costOutput := 2.2
+		costCacheRead := 0.11
+		costCacheWrite := 0.22
+		costReasoning := 3.3
+		model.CostInputPerMillion = &costInput
+		model.CostOutputPerMillion = &costOutput
+		model.CostCacheReadPerMillion = &costCacheRead
+		model.CostCacheWritePerMillion = &costCacheWrite
+		model.CostReasoningPerMillion = &costReasoning
+		for index := range settings.Models.Curated {
+			if settings.Models.Curated[index].ID == model.ID {
+				settings.Models.Curated[index] = model
+				break
+			}
+		}
+
+		result, err := service.ApplyCollectionItem(
+			WithMutationSource(ctx, "http"),
+			CollectionItemPutRequest{
+				Collection: CollectionProviders,
+				Name:       "codex",
+				Provider:   &settings,
+			},
+		)
+		if err != nil {
+			t.Fatalf("ApplyCollectionItem(provider five-rate change) error = %v", err)
+		}
+		if !result.Applied || result.RestartRequired || result.Skipped {
+			t.Fatalf("apply result = %#v, want applied live change", result)
+		}
+
+		cfg, err := compozyconfig.LoadForHome(homePaths)
+		if err != nil {
+			t.Fatalf("LoadForHome(after five-rate change) error = %v", err)
+		}
+		persisted := requireConfiguredProviderModel(t, cfg.Providers["codex"].Models.Curated, model.ID)
+		if persisted.CostInputPerMillion == nil || *persisted.CostInputPerMillion != costInput ||
+			persisted.CostOutputPerMillion == nil || *persisted.CostOutputPerMillion != costOutput ||
+			persisted.CostCacheReadPerMillion == nil || *persisted.CostCacheReadPerMillion != costCacheRead ||
+			persisted.CostCacheWritePerMillion == nil || *persisted.CostCacheWritePerMillion != costCacheWrite ||
+			persisted.CostReasoningPerMillion == nil || *persisted.CostReasoningPerMillion != costReasoning {
+			t.Fatalf("persisted provider model five-rate override = %#v", persisted)
+		}
+		if persisted.DisplayName != "" || persisted.ContextWindow != nil || persisted.ReleaseDate != "" {
+			t.Fatalf("five-rate override materialized unchanged catalog metadata: %#v", persisted)
+		}
+	})
+
+	t.Run("Should reject negative provider model pricing without mutating config", func(t *testing.T) {
+		t.Parallel()
+
+		ctx := t.Context()
+		service, homePaths, _, _ := providerModelCurationTestService(t)
+		envelope, err := service.ListCollection(ctx, CollectionRequest{Collection: CollectionProviders})
+		if err != nil {
+			t.Fatalf("ListCollection(providers) error = %v", err)
+		}
+		settings := mustFindProviderItem(t, envelope.Providers, "codex").Settings
+		settings.ModelsSet = true
+		for index := range settings.Models.Curated {
+			if settings.Models.Curated[index].ID == "gpt-5.6-sol" {
+				settings.Models.Curated[index].CostInputPerMillion = new(-1.0)
+				break
+			}
+		}
+		before := readFile(t, homePaths.ConfigFile)
+		_, err = service.ApplyCollectionItem(
+			WithMutationSource(ctx, "http"),
+			CollectionItemPutRequest{
+				Collection: CollectionProviders,
+				Name:       "codex",
+				Provider:   &settings,
+			},
+		)
+		if err == nil {
+			t.Fatal("ApplyCollectionItem(negative provider model price) error = nil")
+		}
+		if !errors.Is(err, ErrValidation) {
+			t.Fatalf("ApplyCollectionItem(negative provider model price) error = %v, want ErrValidation", err)
+		}
+		if after := readFile(t, homePaths.ConfigFile); after != before {
+			t.Fatalf("negative provider model price mutated config:\n%s", after)
+		}
+	})
+
+	t.Run("Should skip an unchanged builtin projection without applying runtime config", func(t *testing.T) {
+		t.Parallel()
+
+		ctx := context.Background()
+		homePaths := testHomePaths(t)
+		writeFile(t, homePaths.ConfigFile, baseSettingsConfig())
+		db, err := openSettingsTestGlobalDB(ctx, t, homePaths.DatabaseFile)
+		if err != nil {
+			t.Fatalf("OpenGlobalDB() error = %v", err)
+		}
+		t.Cleanup(func() {
+			if err := db.Close(ctx); err != nil {
+				t.Fatalf("Close() error = %v", err)
+			}
+		})
+
+		applier := &fakeConfigRuntimeApplier{}
+		eventStore := &recordingEventSummaryStore{}
+		service := testService(t, homePaths, Dependencies{
+			ApplyRecords: NewConfigApplyRecordRepository(db.DB(), nil),
+			ModelCatalog: &settingsModelCatalogStub{models: map[string][]modelcatalog.Model{
+				"claude": {{ProviderID: "claude", ModelID: "claude-sonnet-5", Curated: true}},
+			}},
+			RuntimeApplier: applier,
+			EventSummaries: eventStore,
+		})
+		envelope, err := service.ListCollection(ctx, CollectionRequest{Collection: CollectionProviders})
+		if err != nil {
+			t.Fatalf("ListCollection(providers) error = %v", err)
+		}
+		settings := mustFindProviderItem(t, envelope.Providers, "claude").Settings
+		settings.ModelsSet = true
+		before := readFile(t, homePaths.ConfigFile)
+		result, err := service.ApplyCollectionItem(
+			WithMutationSource(ctx, "http"),
+			CollectionItemPutRequest{
+				Collection: CollectionProviders,
+				Name:       "claude",
+				Provider:   &settings,
+			},
+		)
+		if err != nil {
+			t.Fatalf("ApplyCollectionItem(unchanged builtin projection) error = %v", err)
+		}
+		if !result.Applied || result.RestartRequired || !result.Skipped {
+			t.Fatalf(
+				"apply result = %#v, want applied skipped no-op without restart; config:\n%s",
+				result,
+				readFile(t, homePaths.ConfigFile),
+			)
+		}
+		if got, want := result.SkippedReason, configApplyNoChangesReason; got != want {
+			t.Fatalf("SkippedReason = %q, want %q", got, want)
+		}
+		if got := applier.calls; got != 0 {
+			t.Fatalf("ApplyActiveConfig() calls = %d, want 0", got)
+		}
+		summaries, err := eventStore.ListEventSummaries(
+			ctx,
+			store.EventSummaryQuery{ReadScope: store.ReadScope{AllProfiles: true}},
+		)
+		if err != nil {
+			t.Fatalf("ListEventSummaries() error = %v", err)
+		}
+		if got := len(summaries); got != 0 {
+			t.Fatalf("settings.changed summaries = %d, want 0", got)
+		}
+		if after := readFile(t, homePaths.ConfigFile); after != before {
+			t.Fatalf("unchanged builtin projection rewrote config:\n%s", after)
+		}
+	})
+
+	t.Run("Should reconcile the catalog without requiring a daemon restart", func(t *testing.T) {
+		t.Parallel()
+
+		ctx := context.Background()
+		homePaths := testHomePaths(t)
+		writeFile(t, homePaths.ConfigFile, baseSettingsConfig())
+		db, err := openSettingsTestGlobalDB(ctx, t, homePaths.DatabaseFile)
+		if err != nil {
+			t.Fatalf("OpenGlobalDB() error = %v", err)
+		}
+		t.Cleanup(func() {
+			if err := db.Close(ctx); err != nil {
+				t.Fatalf("Close() error = %v", err)
+			}
+		})
+
+		applier := &fakeConfigRuntimeApplier{}
+		service := testService(t, homePaths, Dependencies{
+			ApplyRecords: NewConfigApplyRecordRepository(db.DB(), nil),
+			ModelCatalog: &settingsModelCatalogStub{models: map[string][]modelcatalog.Model{
+				"codex": {{ProviderID: "codex", ModelID: "gpt-5.6-terra", Curated: true}},
+			}},
+			RuntimeApplier: applier,
+		})
+		result, err := service.ApplyCollectionItem(
+			WithMutationSource(ctx, "http"),
+			CollectionItemPutRequest{
+				Collection: CollectionProviders,
+				Name:       "codex",
+				Provider: &ProviderSettings{
+					ModelsSet: true,
+					Models: compozyconfig.ProviderModelsConfig{
+						Default: "gpt-5.6-terra",
+						Reasoning: compozyconfig.ProviderReasoningConfig{
+							Apply: compozyconfig.ReasoningApplyACPOption,
+						},
+						Curated: []compozyconfig.ProviderModelConfig{{
+							ID: "gpt-5.6-terra",
+							ReasoningEfforts: []string{
+								"none",
+								"low",
+								"medium",
+								"high",
+								"xhigh",
+								string(modelcatalog.ReasoningEffortMax),
+							},
+							DefaultReasoningEffort: "high",
+						}},
+					},
+				},
+			},
+		)
+		if err != nil {
+			t.Fatalf("ApplyCollectionItem(provider models) error = %v", err)
+		}
+		if !result.Applied || result.RestartRequired {
+			t.Fatalf("apply result = %#v, want applied live without restart", result)
+		}
+		if got, want := result.Record.Lifecycle, lifecycle.Live; got != want {
+			t.Fatalf("Lifecycle = %q, want %q", got, want)
+		}
+		if got, want := result.Record.Status, lifecycle.StatusApplied; got != want {
+			t.Fatalf("Status = %q, want %q", got, want)
+		}
+		if got, want := applier.calls, 1; got != want {
+			t.Fatalf("ApplyActiveConfig() calls = %d, want %d", got, want)
+		}
+		active, err := service.ActiveConfig(ctx)
+		if err != nil {
+			t.Fatalf("ActiveConfig() error = %v", err)
+		}
+		provider, err := active.ResolveProvider("codex")
+		if err != nil {
+			t.Fatalf("ResolveProvider(codex) error = %v", err)
+		}
+		if got, want := provider.Models.Default, "gpt-5.6-terra"; got != want {
+			t.Fatalf("active codex model default = %q, want %q", got, want)
+		}
+	})
+}
+
+func TestConfigApplyServiceAppliesExtensionSideLoadPolicyLive(t *testing.T) {
+	t.Parallel()
+	t.Run("Should apply extension side-load policy without a restart", func(t *testing.T) {
+		t.Parallel()
+
+		ctx := context.Background()
+		homePaths := testHomePaths(t)
+		writeFile(t, homePaths.ConfigFile, baseSettingsConfig())
+		db, err := openSettingsTestGlobalDB(ctx, t, homePaths.DatabaseFile)
+		if err != nil {
+			t.Fatalf("OpenGlobalDB() error = %v", err)
+		}
+		t.Cleanup(func() {
+			if err := db.Close(ctx); err != nil {
+				t.Fatalf("Close() error = %v", err)
+			}
+		})
+
+		applier := &fakeConfigRuntimeApplier{}
+		service := testService(t, homePaths, Dependencies{
+			ApplyRecords:   NewConfigApplyRecordRepository(db.DB(), nil),
+			RuntimeApplier: applier,
+		})
+		cfg, err := compozyconfig.LoadForHome(homePaths)
+		if err != nil {
+			t.Fatalf("LoadForHome() error = %v", err)
+		}
+		cfg.Extensions.Trust.AllowUnverified = false
+		result, err := service.ApplySection(WithMutationSource(ctx, "http"), SectionUpdateRequest{
+			Section:         SectionHooksExtensions,
+			HooksExtensions: &cfg.Extensions,
+		})
+		if err != nil {
+			t.Fatalf("ApplySection(hooks-extensions) error = %v", err)
+		}
+		if !result.Applied || result.RestartRequired {
+			t.Fatalf("ApplySection(hooks-extensions) = %#v, want live applied", result)
+		}
+		if result.Record.Lifecycle != lifecycle.Live || applier.calls != 1 {
+			t.Fatalf("Lifecycle = %q, applier calls = %d, want live and one", result.Record.Lifecycle, applier.calls)
+		}
+		active, err := service.ActiveConfig(ctx)
+		if err != nil {
+			t.Fatalf("ActiveConfig() error = %v", err)
+		}
+		if active.Extensions.Trust.AllowUnverified {
+			t.Fatal("ActiveConfig() extension trust policy = true, want false")
+		}
+	})
+}
+
+func TestReloadChangedPaths(t *testing.T) {
+	t.Parallel()
+
+	baseProvider := compozyconfig.ProviderConfig{
+		Command: "codex",
+		Models:  compozyconfig.ProviderModelsConfig{Default: "gpt-5.6-sol"},
+	}
+	tests := []struct {
+		name            string
+		desiredProvider compozyconfig.ProviderConfig
+		want            []string
+	}{
+		{
+			name: "Should emit only the live model path for model-only changes",
+			desiredProvider: compozyconfig.ProviderConfig{
+				Command: "codex",
+				Models:  compozyconfig.ProviderModelsConfig{Default: "gpt-5.6-terra"},
+			},
+			want: []string{"providers.codex.models"},
+		},
+		{
+			name: "Should emit restart and live paths for mixed provider changes",
+			desiredProvider: compozyconfig.ProviderConfig{
+				Command: "codex-browser",
+				Models:  compozyconfig.ProviderModelsConfig{Default: "gpt-5.6-terra"},
+			},
+			want: []string{"providers.codex", "providers.codex.models"},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			current := &compozyconfig.Config{Providers: map[string]compozyconfig.ProviderConfig{"codex": baseProvider}}
+			desired := &compozyconfig.Config{
+				Providers: map[string]compozyconfig.ProviderConfig{"codex": tt.desiredProvider},
+			}
+			if got := reloadChangedPaths(current, desired); !slices.Equal(got, tt.want) {
+				t.Fatalf("reloadChangedPaths() = %#v, want %#v", got, tt.want)
+			}
+		})
+	}
+
+	t.Run("Should classify a new built-in model override as live", func(t *testing.T) {
+		t.Parallel()
+
+		disabled := false
+		current := &compozyconfig.Config{}
+		desired := &compozyconfig.Config{Providers: map[string]compozyconfig.ProviderConfig{
+			"cursor": {
+				Models: compozyconfig.ProviderModelsConfig{
+					Discovery: compozyconfig.ProviderModelsDiscoveryConfig{Enabled: &disabled},
+				},
+			},
+		}}
+		want := []string{"providers.cursor.models"}
+		if got := reloadChangedPaths(current, desired); !slices.Equal(got, want) {
+			t.Fatalf("reloadChangedPaths() = %#v, want %#v", got, want)
+		}
+		if got := classifyReloadLifecycle(current, desired); got != lifecycle.Live {
+			t.Fatalf("classifyReloadLifecycle() = %q, want %q", got, lifecycle.Live)
+		}
+	})
+
+	t.Run("Should classify removal of a model-only override as live", func(t *testing.T) {
+		t.Parallel()
+
+		disabled := false
+		current := &compozyconfig.Config{Providers: map[string]compozyconfig.ProviderConfig{
+			"cursor": {
+				Models: compozyconfig.ProviderModelsConfig{
+					Discovery: compozyconfig.ProviderModelsDiscoveryConfig{Enabled: &disabled},
+				},
+			},
+		}}
+		desired := &compozyconfig.Config{}
+		want := []string{"providers.cursor.models"}
+		if got := reloadChangedPaths(current, desired); !slices.Equal(got, want) {
+			t.Fatalf("reloadChangedPaths() = %#v, want %#v", got, want)
+		}
+		if got := classifyReloadLifecycle(current, desired); got != lifecycle.Live {
+			t.Fatalf("classifyReloadLifecycle() = %q, want %q", got, lifecycle.Live)
+		}
+	})
+
+	t.Run("Should keep a new provider runtime override restart required", func(t *testing.T) {
+		t.Parallel()
+
+		current := &compozyconfig.Config{}
+		desired := &compozyconfig.Config{Providers: map[string]compozyconfig.ProviderConfig{
+			"custom": {
+				Command: "custom-acp",
+				Models:  compozyconfig.ProviderModelsConfig{Default: "custom-model"},
+			},
+		}}
+		want := []string{"providers.custom", "providers.custom.models"}
+		if got := reloadChangedPaths(current, desired); !slices.Equal(got, want) {
+			t.Fatalf("reloadChangedPaths() = %#v, want %#v", got, want)
+		}
+		if got := classifyReloadLifecycle(current, desired); got != lifecycle.RestartRequired {
+			t.Fatalf("classifyReloadLifecycle() = %q, want %q", got, lifecycle.RestartRequired)
+		}
+	})
+
+	t.Run("Should emit every live Marketplace catalog path", func(t *testing.T) {
+		t.Parallel()
+
+		current := &compozyconfig.Config{Marketplace: compozyconfig.DefaultMarketplaceRuntimeConfig()}
+		desired := *current
+		desired.Marketplace.Catalog.BaseURL = "https://catalog.example.test"
+		desired.Marketplace.Catalog.TTL = "30m"
+		desired.Marketplace.Catalog.Timeout = "5s"
+
+		want := []string{
+			"marketplace.catalog.base_url",
+			"marketplace.catalog.ttl",
+			"marketplace.catalog.timeout",
+		}
+		if got := reloadChangedPaths(current, &desired); !slices.Equal(got, want) {
+			t.Fatalf("reloadChangedPaths() = %#v, want %#v", got, want)
+		}
+	})
+
+	t.Run("Should classify role mutations as live", func(t *testing.T) {
+		t.Parallel()
+
+		current := compozyconfig.DefaultWithHome(compozyconfig.HomePaths{})
+		desired := current
+		desired.Roles.AutoTitle.Enabled = false
+
+		want := []string{"roles.auto_title.enabled"}
+		if got := reloadChangedPaths(&current, &desired); !slices.Equal(got, want) {
+			t.Fatalf("reloadChangedPaths() = %#v, want %#v", got, want)
+		}
+		if got := classifyReloadLifecycle(&current, &desired); got != lifecycle.Live {
+			t.Fatalf("classifyReloadLifecycle() = %q, want %q", got, lifecycle.Live)
+		}
+	})
+
+	t.Run("Should classify client-only gateway profile changes as live", func(t *testing.T) {
+		t.Parallel()
+		current := compozyconfig.DefaultWithHome(compozyconfig.HomePaths{})
+		desired := current
+		desired.Gateway.Connections = []compozyconfig.GatewayConnectionConfig{{
+			Name: "remote", Scheme: "ssh", Host: "gateway.example.test", Port: 22,
+		}}
+		desired.Gateway.ActiveConnection = "remote"
+		if got := reloadChangedPaths(&current, &desired); len(got) != 0 {
+			t.Fatalf("reloadChangedPaths() = %#v, want no daemon runtime paths", got)
+		}
+		if got := classifyReloadLifecycle(&current, &desired); got != lifecycle.Live {
+			t.Fatalf("classifyReloadLifecycle() = %q, want %q", got, lifecycle.Live)
+		}
+	})
+
+	t.Run("Should emit the restart-required automation suggestion cap path", func(t *testing.T) {
+		t.Parallel()
+
+		current := &compozyconfig.Config{}
+		current.Automation.Suggestions.PendingCap = automationmodel.DefaultSuggestionPendingCap
+		desired := *current
+		desired.Automation.Suggestions.PendingCap = automationmodel.DefaultSuggestionPendingCap + 1
+
+		want := []string{"automation.suggestions.pending_cap"}
+		if got := reloadChangedPaths(current, &desired); !slices.Equal(got, want) {
+			t.Fatalf("reloadChangedPaths() = %#v, want %#v", got, want)
+		}
+		if got := classifyReloadLifecycle(current, &desired); got != lifecycle.RestartRequired {
+			t.Fatalf("classifyReloadLifecycle() = %q, want %q", got, lifecycle.RestartRequired)
+		}
+	})
+
+	t.Run("Should emit a live window manager path", func(t *testing.T) {
+		t.Parallel()
+
+		current := &compozyconfig.Config{WindowManager: compozyconfig.DefaultWindowManagerConfig()}
+		desired := *current
+		desired.WindowManager.HistoryLimit++
+		desired.WindowManager.NavStackLimit++
+		desired.WindowManager.ClosedEntryLimit++
+
+		want := []string{
+			"window_manager.history_limit",
+			"window_manager.nav_stack_limit",
+			"window_manager.closed_entry_limit",
+		}
+		if got := reloadChangedPaths(current, &desired); !slices.Equal(got, want) {
+			t.Fatalf("reloadChangedPaths() = %#v, want %#v", got, want)
+		}
+		if got := classifyReloadLifecycle(current, &desired); got != lifecycle.Live {
+			t.Fatalf("classifyReloadLifecycle() = %q, want %q", got, lifecycle.Live)
+		}
+	})
+}
+
+func TestConfigApplyServiceCuratesProviderModelsLive(t *testing.T) {
+	t.Parallel()
+
+	t.Run("Should persist exact curation and return the reconciled catalog row", func(t *testing.T) {
+		t.Parallel()
+
+		service, homePaths, _, applier := providerModelCurationTestService(t)
+		hidden := true
+		featured := false
+		deprecated := false
+		defaultEffort := modelcatalog.ReasoningEffortMax
+		defaultSpeed := speedpkg.SpeedFast
+		result, err := service.ApplyProviderModelCuration(
+			WithMutationSource(t.Context(), "cli"),
+			ProviderModelCurationRequest{
+				ProviderID:             "codex",
+				ModelID:                "gpt-5.6-sol",
+				Hidden:                 &hidden,
+				Featured:               &featured,
+				Deprecated:             &deprecated,
+				DefaultReasoningEffort: &defaultEffort,
+				DefaultSpeed:           &defaultSpeed,
+			},
+		)
+		if err != nil {
+			t.Fatalf("ApplyProviderModelCuration() error = %v", err)
+		}
+		if applier.err != nil {
+			t.Fatalf("runtime applier reconciliation error = %v", applier.err)
+		}
+		if got, want := applier.calls, 1; got != want {
+			t.Fatalf("ApplyActiveConfig() calls = %d, want %d", got, want)
+		}
+		if !result.Apply.Applied || result.Apply.RestartRequired {
+			t.Fatalf("apply result = %#v, want live applied curation", result.Apply)
+		}
+		if got, want := result.Apply.Record.Lifecycle, lifecycle.Live; got != want {
+			t.Fatalf("Lifecycle = %q, want %q", got, want)
+		}
+		if !result.Model.Hidden || result.Model.Featured || result.Model.Deprecated {
+			t.Fatalf("effective curation flags = %#v, want hidden only", result.Model)
+		}
+		if result.Model.DefaultReasoningEffort == nil ||
+			*result.Model.DefaultReasoningEffort != modelcatalog.ReasoningEffortMax {
+			t.Fatalf("DefaultReasoningEffort = %#v, want max", result.Model.DefaultReasoningEffort)
+		}
+		if got := result.DefaultSpeed; got != speedpkg.SpeedFast {
+			t.Fatalf("DefaultSpeed = %q, want fast", got)
+		}
+
+		configText := readFile(t, homePaths.ConfigFile)
+		for _, want := range []string{
+			`[[providers.codex.models.curated]]`,
+			`id = "gpt-5.6-sol"`,
+			`hidden = true`,
+			`default_reasoning_effort = "max"`,
+			`default_speed = "fast"`,
+		} {
+			if !strings.Contains(configText, want) {
+				t.Fatalf("config is missing %q:\n%s", want, configText)
+			}
+		}
+		curatedTable := tomlTableForTest(t, configText, `[[providers.codex.models.curated]]`)
+		if strings.Contains(curatedTable, `featured = true`) || strings.Contains(curatedTable, `deprecated = true`) {
+			t.Fatalf("config persisted false curation flags as true:\n%s", configText)
+		}
+		for _, forbidden := range []string{
+			`display_name =`,
+			`context_window =`,
+			`max_output_tokens =`,
+			`supports_tools =`,
+			`reasoning_efforts =`,
+			`cost_input_per_million =`,
+			`cost_output_per_million =`,
+			`cost_cache_read_per_million =`,
+			`cost_cache_write_per_million =`,
+			`cost_reasoning_per_million =`,
+			`release_date =`,
+		} {
+			if strings.Contains(curatedTable, forbidden) {
+				t.Fatalf("config froze catalog enrichment %q:\n%s", forbidden, configText)
+			}
+		}
+	})
+
+	t.Run("Should reject Fast when the model advertises only normal configurations", func(t *testing.T) {
+		t.Parallel()
+
+		service, homePaths, catalog, applier := providerModelCurationTestService(t)
+		catalog.mu.Lock()
+		model := catalog.models["codex"][0]
+		model.TransportBindings = []modelcatalog.ModelTransportBinding{{
+			TransportModelID: "gpt-5.6-sol",
+		}}
+		catalog.models["codex"] = []modelcatalog.Model{model}
+		catalog.mu.Unlock()
+		before := readFile(t, homePaths.ConfigFile)
+		fast := speedpkg.SpeedFast
+
+		_, err := service.ApplyProviderModelCuration(t.Context(), ProviderModelCurationRequest{
+			ProviderID:   "codex",
+			ModelID:      "gpt-5.6-sol",
+			DefaultSpeed: &fast,
+		})
+		if err == nil {
+			t.Fatal("ApplyProviderModelCuration(fast) error = nil, want speed_rejected")
+		}
+		item, ok := diagnostics.ItemFromError(err)
+		if !ok || item.Code != diagnosticcontract.CodeSpeedRejected {
+			t.Fatalf("diagnostic = %#v, %v; want speed_rejected", item, ok)
+		}
+		if got := readFile(t, homePaths.ConfigFile); got != before {
+			t.Fatalf("unsupported-speed curation changed config:\n%s", got)
+		}
+		if applier.calls != 0 {
+			t.Fatalf("ApplyActiveConfig() calls = %d, want 0", applier.calls)
+		}
+	})
+
+	t.Run("Should preserve only pre-existing operator-authored model metadata", func(t *testing.T) {
+		t.Parallel()
+
+		service, homePaths, _, applier := providerModelCurationTestService(t)
+		writeFile(t, homePaths.ConfigFile, readFile(t, homePaths.ConfigFile)+`
+
+[[providers.codex.models.curated]]
+id = "gpt-5.6-sol"
+display_name = "Operator Sol"
+context_window = 4242
+reasoning_efforts = ["low", "max"]
+featured = true
+`)
+		hidden := true
+		if _, err := service.ApplyProviderModelCuration(
+			WithMutationSource(t.Context(), "cli"),
+			ProviderModelCurationRequest{
+				ProviderID: "codex",
+				ModelID:    "gpt-5.6-sol",
+				Hidden:     &hidden,
+			},
+		); err != nil {
+			t.Fatalf("ApplyProviderModelCuration() error = %v", err)
+		}
+		if applier.err != nil {
+			t.Fatalf("runtime applier reconciliation error = %v", applier.err)
+		}
+
+		configText := readFile(t, homePaths.ConfigFile)
+		for _, want := range []string{
+			`display_name = "Operator Sol"`,
+			`context_window = 4242`,
+			`reasoning_efforts = ["low", "max"]`,
+			`featured = true`,
+			`hidden = true`,
+		} {
+			if !strings.Contains(configText, want) {
+				t.Fatalf("config is missing preserved operator field %q:\n%s", want, configText)
+			}
+		}
+		for _, forbidden := range []string{
+			`display_name = "GPT-5.6 Sol"`,
+			`max_output_tokens = 128000`,
+			`cost_input_per_million = 5`,
+			`cost_cache_read_per_million = 0.5`,
+			`cost_cache_write_per_million = 6`,
+			`cost_reasoning_per_million = 30`,
+			`release_date = "2026-06-26"`,
+		} {
+			if strings.Contains(configText, forbidden) {
+				t.Fatalf("config replaced operator row with catalog enrichment %q:\n%s", forbidden, configText)
+			}
+		}
+	})
+
+	t.Run("Should preserve pending restart-required provider fields while applying models live", func(t *testing.T) {
+		t.Parallel()
+
+		ctx := WithMutationSource(t.Context(), "cli")
+		service, homePaths, _, applier := providerModelCurationTestService(t)
+		initialActive, err := service.ActiveConfig(ctx)
+		if err != nil {
+			t.Fatalf("ActiveConfig(initial) error = %v", err)
+		}
+		initialProvider, err := initialActive.ResolveProvider("codex")
+		if err != nil {
+			t.Fatalf("ResolveProvider(initial codex) error = %v", err)
+		}
+
+		const pendingCommand = "codex-pending-restart"
+		pending, err := service.ApplyCollectionItem(ctx, CollectionItemPutRequest{
+			Collection: CollectionProviders,
+			Name:       "codex",
+			Provider:   &ProviderSettings{Command: pendingCommand},
+		})
+		if err != nil {
+			t.Fatalf("ApplyCollectionItem(pending command) error = %v", err)
+		}
+		if pending.Applied || !pending.RestartRequired ||
+			pending.Record.Status != lifecycle.StatusBlocked {
+			t.Fatalf("pending command apply = %#v, want blocked restart-required result", pending)
+		}
+
+		hidden := true
+		curated, err := service.ApplyProviderModelCuration(ctx, ProviderModelCurationRequest{
+			ProviderID: "codex",
+			ModelID:    "gpt-5.6-sol",
+			Hidden:     &hidden,
+		})
+		if err != nil {
+			t.Fatalf("ApplyProviderModelCuration() error = %v", err)
+		}
+		if !curated.Apply.Applied || curated.Apply.RestartRequired ||
+			curated.Apply.Record.Lifecycle != lifecycle.Live {
+			t.Fatalf("curation apply = %#v, want live applied result", curated.Apply)
+		}
+		if applier.err != nil {
+			t.Fatalf("runtime applier reconciliation error = %v", applier.err)
+		}
+		if curated.Apply.Record.DesiredHash == curated.Apply.Record.ActiveHash {
+			t.Fatalf(
+				"curation hashes = desired %q active %q, want pending restart drift",
+				curated.Apply.Record.DesiredHash,
+				curated.Apply.Record.ActiveHash,
+			)
+		}
+		if len(applier.snapshots) != 1 {
+			t.Fatalf("runtime snapshots = %d, want 1", len(applier.snapshots))
+		}
+		runtimeProvider, err := applier.snapshots[0].ResolveProvider("codex")
+		if err != nil {
+			t.Fatalf("ResolveProvider(runtime codex) error = %v", err)
+		}
+		if runtimeProvider.Command != initialProvider.Command {
+			t.Fatalf(
+				"runtime command = %q, want prior active command %q",
+				runtimeProvider.Command,
+				initialProvider.Command,
+			)
+		}
+		assertProviderModelHidden(t, runtimeProvider.Models, "gpt-5.6-sol")
+
+		active, err := service.ActiveConfig(ctx)
+		if err != nil {
+			t.Fatalf("ActiveConfig(after curation) error = %v", err)
+		}
+		activeProvider, err := active.ResolveProvider("codex")
+		if err != nil {
+			t.Fatalf("ResolveProvider(active codex) error = %v", err)
+		}
+		if activeProvider.Command != initialProvider.Command {
+			t.Fatalf("active command = %q, want %q", activeProvider.Command, initialProvider.Command)
+		}
+		assertProviderModelHidden(t, activeProvider.Models, "gpt-5.6-sol")
+
+		desired, err := compozyconfig.LoadForHome(homePaths)
+		if err != nil {
+			t.Fatalf("LoadForHome(desired) error = %v", err)
+		}
+		desiredProvider, err := desired.ResolveProvider("codex")
+		if err != nil {
+			t.Fatalf("ResolveProvider(desired codex) error = %v", err)
+		}
+		if desiredProvider.Command != pendingCommand {
+			t.Fatalf("desired command = %q, want pending %q", desiredProvider.Command, pendingCommand)
+		}
+		assertProviderModelHidden(t, desiredProvider.Models, "gpt-5.6-sol")
+
+		reload, err := service.Reload(ctx)
+		if err != nil {
+			t.Fatalf("Reload() error = %v", err)
+		}
+		if reload.Applied || !reload.RestartRequired || reload.Record.Status != lifecycle.StatusBlocked {
+			t.Fatalf("Reload() = %#v, want pending restart-required result", reload)
+		}
+	})
+
+	t.Run("Should reject an unknown canonical model without writing config", func(t *testing.T) {
+		t.Parallel()
+
+		service, homePaths, _, applier := providerModelCurationTestService(t)
+		before := readFile(t, homePaths.ConfigFile)
+		_, err := service.ApplyProviderModelCuration(t.Context(), ProviderModelCurationRequest{
+			ProviderID: "codex",
+			ModelID:    "gpt-sol",
+		})
+		if err == nil {
+			t.Fatal("ApplyProviderModelCuration(unknown) error = nil, want model_not_found")
+		}
+		item, ok := diagnostics.ItemFromError(err)
+		if !ok || item.Code != diagnosticcontract.CodeModelNotFound {
+			t.Fatalf("diagnostic = %#v, %v; want model_not_found", item, ok)
+		}
+		if got := readFile(t, homePaths.ConfigFile); got != before {
+			t.Fatalf("unknown-model curation changed config:\n%s", got)
+		}
+		if applier.calls != 0 {
+			t.Fatalf("ApplyActiveConfig() calls = %d, want 0", applier.calls)
+		}
+	})
+
+	t.Run("Should reject a canonical effort outside the model subset", func(t *testing.T) {
+		t.Parallel()
+
+		service, homePaths, _, applier := providerModelCurationTestService(t)
+		before := readFile(t, homePaths.ConfigFile)
+		unsupported := modelcatalog.ReasoningEffortMinimal
+		_, err := service.ApplyProviderModelCuration(t.Context(), ProviderModelCurationRequest{
+			ProviderID:             "codex",
+			ModelID:                "gpt-5.6-sol",
+			DefaultReasoningEffort: &unsupported,
+		})
+		if err == nil {
+			t.Fatal("ApplyProviderModelCuration(minimal) error = nil, want reasoning_effort_unsupported")
+		}
+		item, ok := diagnostics.ItemFromError(err)
+		if !ok || item.Code != diagnosticcontract.CodeReasoningEffortUnsupported {
+			t.Fatalf("diagnostic = %#v, %v; want reasoning_effort_unsupported", item, ok)
+		}
+		if got := readFile(t, homePaths.ConfigFile); got != before {
+			t.Fatalf("unsupported-effort curation changed config:\n%s", got)
+		}
+		if applier.calls != 0 {
+			t.Fatalf("ApplyActiveConfig() calls = %d, want 0", applier.calls)
+		}
+	})
+}
+
+func tomlTableForTest(t *testing.T, document string, header string) string {
+	t.Helper()
+
+	start := strings.Index(document, header)
+	if start < 0 {
+		t.Fatalf("TOML document is missing table %q:\n%s", header, document)
+	}
+	table := document[start:]
+	if next := strings.Index(table[len(header):], "\n["); next >= 0 {
+		table = table[:len(header)+next]
+	}
+	return table
+}
+
+func TestConfigApplyServiceReloadClassifiesUnknownPathsConservatively(t *testing.T) {
+	t.Parallel()
+
+	t.Run("Should block reload when desired config changed outside explicit diff coverage", func(t *testing.T) {
+		t.Parallel()
+
+		ctx := context.Background()
+		homePaths := testHomePaths(t)
+		writeFile(t, homePaths.ConfigFile, baseSettingsConfig())
+		db, err := openSettingsTestGlobalDB(ctx, t, homePaths.DatabaseFile)
+		if err != nil {
+			t.Fatalf("OpenGlobalDB() error = %v", err)
+		}
+		t.Cleanup(func() {
+			if err := db.Close(ctx); err != nil {
+				t.Errorf("Close() error = %v", err)
+			}
+		})
+
+		service := testService(t, homePaths, Dependencies{
+			ApplyRecords: NewConfigApplyRecordRepository(db.DB(), nil),
+		})
+		initial, err := service.Reload(WithMutationSource(ctx, "boot"))
+		if err != nil {
+			t.Fatalf("Reload(initial) error = %v", err)
+		}
+		if !initial.Skipped {
+			t.Fatal("Reload(initial).Skipped = false, want true")
+		}
+		records, err := service.ListApplyRecords(ctx, ApplyRecordFilter{})
+		if err != nil {
+			t.Fatalf("ListApplyRecords(initial) error = %v", err)
+		}
+		if len(records) != 0 {
+			t.Fatalf("initial apply records len = %d, want 0", len(records))
+		}
+
+		writeFile(t, homePaths.ConfigFile, baseSettingsConfig()+`
+[log]
+level = "debug"
+`)
+
+		result, err := service.Reload(WithMutationSource(ctx, "cli"))
+		if err != nil {
+			t.Fatalf("Reload(log-level) error = %v", err)
+		}
+		if result.Applied {
+			t.Fatal("Reload(log-level).Applied = true, want false")
+		}
+		if got, want := result.Record.Lifecycle, lifecycle.RestartRequired; got != want {
+			t.Fatalf("Lifecycle = %q, want %q", got, want)
+		}
+		if got, want := result.Record.Status, lifecycle.StatusBlocked; got != want {
+			t.Fatalf("Status = %q, want %q", got, want)
+		}
+		if got, want := result.Record.Generation, int64(0); got != want {
+			t.Fatalf("Generation = %d, want %d", got, want)
+		}
+	})
+}
+
+func TestConfigApplyServiceReloadUsesBootedConfigAsActiveState(t *testing.T) {
+	t.Parallel()
+
+	t.Run("Should not skip restart-required reload after booting a blocked config", func(t *testing.T) {
+		t.Parallel()
+
+		ctx := context.Background()
+		homePaths := testHomePaths(t)
+		writeFile(t, homePaths.ConfigFile, baseSettingsConfig())
+		db, err := openSettingsTestGlobalDB(ctx, t, homePaths.DatabaseFile)
+		if err != nil {
+			t.Fatalf("OpenGlobalDB() error = %v", err)
+		}
+		t.Cleanup(func() {
+			if err := db.Close(ctx); err != nil {
+				t.Errorf("Close() error = %v", err)
+			}
+		})
+
+		service := testService(t, homePaths, Dependencies{
+			SkillsRuntime: newFakeSkillsRuntime(testSkill("alpha", false)),
+			ApplyRecords:  NewConfigApplyRecordRepository(db.DB(), nil),
+		})
+
+		cfg, err := compozyconfig.LoadForHome(homePaths)
+		if err != nil {
+			t.Fatalf("LoadForHome(initial) error = %v", err)
+		}
+		cfg.Skills.DisabledSkills = []string{"alpha"}
+		applied, err := service.ApplySection(WithMutationSource(ctx, "http"), SectionUpdateRequest{
+			Section: SectionSkills,
+			Skills:  &cfg.Skills,
+		})
+		if err != nil {
+			t.Fatalf("ApplySection(skills) error = %v", err)
+		}
+		if !applied.Applied {
+			t.Fatal("ApplySection(skills).Applied = false, want true")
+		}
+
+		cfg, err = compozyconfig.LoadForHome(homePaths)
+		if err != nil {
+			t.Fatalf("LoadForHome(before automation) error = %v", err)
+		}
+		automation := automationSettingsFromConfig(&cfg)
+		automation.Enabled = false
+		blocked, err := service.ApplySection(WithMutationSource(ctx, "http"), SectionUpdateRequest{
+			Section:    SectionAutomation,
+			Automation: &automation,
+		})
+		if err != nil {
+			t.Fatalf("ApplySection(automation) error = %v", err)
+		}
+		if blocked.Applied {
+			t.Fatal("ApplySection(automation).Applied = true, want false")
+		}
+
+		restarted := testService(t, homePaths, Dependencies{
+			SkillsRuntime: newFakeSkillsRuntime(testSkill("alpha", false)),
+			ApplyRecords:  NewConfigApplyRecordRepository(db.DB(), nil),
+		})
+		active, err := restarted.ActiveConfig(ctx)
+		if err != nil {
+			t.Fatalf("ActiveConfig(after restart) error = %v", err)
+		}
+		if active.Automation.Enabled {
+			t.Fatal("ActiveConfig(after restart).Automation.Enabled = true, want false")
+		}
+		target, err := compozyconfig.ResolveConfigWriteTarget(homePaths, "", compozyconfig.WriteScopeUser, "")
+		if err != nil {
+			t.Fatalf("ResolveConfigWriteTarget() error = %v", err)
+		}
+		if _, err := compozyconfig.EditConfigOverlay(
+			homePaths,
+			"",
+			target,
+			func(editor *compozyconfig.OverlayEditor) error {
+				return editor.SetValue([]string{"automation", "enabled"}, true)
+			},
+		); err != nil {
+			t.Fatalf("EditConfigOverlay(automation.enabled=true) error = %v", err)
+		}
+
+		result, err := restarted.Reload(WithMutationSource(ctx, "cli"))
+		if err != nil {
+			t.Fatalf("Reload(after booted blocked config) error = %v", err)
+		}
+		if result.Applied {
+			t.Fatal("Reload(after booted blocked config).Applied = true, want false")
+		}
+		if !result.RestartRequired {
+			t.Fatal("Reload(after booted blocked config).RestartRequired = false, want true")
+		}
+		if got, want := result.Record.Lifecycle, lifecycle.RestartRequired; got != want {
+			t.Fatalf("Lifecycle = %q, want %q", got, want)
+		}
+		if got, want := result.Record.Status, lifecycle.StatusBlocked; got != want {
+			t.Fatalf("Status = %q, want %q", got, want)
+		}
+	})
+}
+
+// TestConfigApplyServiceRecordsRuntimeReconcileFailures preserves failure receipts
+// and retries only pending projections.
+func TestConfigApplyServiceRecordsRuntimeReconcileFailures(t *testing.T) {
+	t.Parallel()
+
+	t.Run("Should retry a persisted layout without applying unrelated pending config", func(t *testing.T) {
+		t.Parallel()
+		ctx := t.Context()
+		homePaths := testHomePaths(t)
+		writeFile(t, homePaths.ConfigFile, baseSettingsConfig())
+		db, err := openSettingsTestGlobalDB(ctx, t, homePaths.DatabaseFile)
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() {
+			if err := db.Close(context.Background()); err != nil {
+				t.Error(err)
+			}
+		})
+		applier := &fakeConfigRuntimeApplier{failures: []ApplyFailure{{
+			Subsystem: "window-manager",
+			Diagnostic: diagnostics.NewItem(diagnostics.ItemSpec{
+				ID: "config.apply.layout_failure", Code: diagnosticcontract.CodeConfigPartialFailure,
+				Category: diagnosticcontract.CategoryConfig, Title: "Layout apply failed",
+				Message: "Runtime unavailable", Severity: diagnosticcontract.SeverityError,
+				DataFreshness: diagnosticcontract.FreshnessLive,
+			}),
+		}}}
+		service := testService(t, homePaths, Dependencies{
+			ApplyRecords: NewConfigApplyRecordRepository(db.DB(), nil), RuntimeApplier: applier,
+		})
+		cfg, err := compozyconfig.LoadForHome(homePaths)
+		if err != nil {
+			t.Fatal(err)
+		}
+		desired := cfg.WindowManager
+		desired.Gaps.Inner = 6
+		request := SectionUpdateRequest{Section: SectionWindowManager,
+			WindowManager: &desired, WindowManagerPreserveShortcuts: true}
+		failed, err := service.ApplySection(ctx, request)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if failed.Applied || failed.NextAction != lifecycle.NextActionRetry || applier.calls != 1 {
+			t.Fatalf("failed layout apply = %#v, calls = %d", failed, applier.calls)
+		}
+		persisted, err := compozyconfig.LoadForHome(homePaths)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if persisted.WindowManager.Gaps.Inner != 6 {
+			t.Fatal("failed runtime apply lost the persisted gap")
+		}
+		general := generalSettingsFromConfig(&persisted)
+		general.HTTP.Port++
+		if _, err := service.UpdateSection(ctx, SectionUpdateRequest{
+			Section: SectionGeneral, General: &general,
+		}); err != nil {
+			t.Fatal(err)
+		}
+		applier.failures = nil
+		retried, err := service.ApplySection(ctx, request)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !retried.Applied || retried.Skipped || applier.calls != 2 {
+			t.Fatalf("retry skipped pending runtime apply: %#v, calls = %d", retried, applier.calls)
+		}
+		active := applier.snapshots[1]
+		if active.WindowManager.Gaps.Inner != 6 || active.HTTP.Port != cfg.HTTP.Port {
+			t.Fatalf(
+				"retry applied the wrong projection: gaps=%#v port=%d",
+				active.WindowManager.Gaps,
+				active.HTTP.Port,
+			)
+		}
+		repeated, err := service.ApplySection(ctx, request)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !repeated.Skipped || applier.calls != 2 || repeated.Record.Generation != retried.Record.Generation {
+			t.Fatalf("unchanged active layout reapplied: %#v, calls = %d", repeated, applier.calls)
+		}
+	})
+
+	t.Run("Should fail apply record without advancing generation when runtime reconcile fails", func(t *testing.T) {
+		t.Parallel()
+
+		ctx := context.Background()
+		homePaths := testHomePaths(t)
+		writeFile(t, homePaths.ConfigFile, baseSettingsConfig())
+		db, err := openSettingsTestGlobalDB(ctx, t, homePaths.DatabaseFile)
+		if err != nil {
+			t.Fatalf("OpenGlobalDB() error = %v", err)
+		}
+		t.Cleanup(func() {
+			if err := db.Close(ctx); err != nil {
+				t.Errorf("Close() error = %v", err)
+			}
+		})
+
+		applier := &fakeConfigRuntimeApplier{
+			failures: []ApplyFailure{{
+				Subsystem: "mcp",
+				Diagnostic: diagnostics.NewItem(diagnostics.ItemSpec{
+					ID:            "config.apply.test_failure",
+					Code:          diagnosticcontract.CodeConfigPartialFailure,
+					Category:      diagnosticcontract.CategoryMCP,
+					Title:         "Test runtime reconcile failed",
+					Message:       "runtime reconcile failed",
+					Severity:      diagnosticcontract.SeverityError,
+					DataFreshness: diagnosticcontract.FreshnessLive,
+				}),
+			}},
+		}
+		service := testService(t, homePaths, Dependencies{
+			SkillsRuntime:  newFakeSkillsRuntime(testSkill("alpha", false)),
+			ApplyRecords:   NewConfigApplyRecordRepository(db.DB(), nil),
+			RuntimeApplier: applier,
+		})
+
+		cfg, err := compozyconfig.LoadForHome(homePaths)
+		if err != nil {
+			t.Fatalf("LoadForHome() error = %v", err)
+		}
+		cfg.Skills.DisabledSkills = []string{"alpha"}
+
+		result, err := service.ApplySection(WithMutationSource(ctx, "http"), SectionUpdateRequest{
+			Section: SectionSkills,
+			Skills:  &cfg.Skills,
+		})
+		if err != nil {
+			t.Fatalf("ApplySection(skills) error = %v", err)
+		}
+		if result.Applied {
+			t.Fatal("ApplySection(skills).Applied = true, want false")
+		}
+		if got, want := applier.calls, 1; got != want {
+			t.Fatalf("runtime applier calls = %d, want %d", got, want)
+		}
+		if got, want := result.Record.Status, lifecycle.StatusFailed; got != want {
+			t.Fatalf("Status = %q, want %q", got, want)
+		}
+		if got, want := result.Record.Lifecycle, lifecycle.Live; got != want {
+			t.Fatalf("Lifecycle = %q, want %q", got, want)
+		}
+		if got, want := result.Record.Generation, int64(0); got != want {
+			t.Fatalf("Generation = %d, want %d", got, want)
+		}
+		if result.Record.AppliedAt != nil {
+			t.Fatalf("AppliedAt = %v, want nil", result.Record.AppliedAt)
+		}
+		if len(result.PartialFailures) != 1 {
+			t.Fatalf("PartialFailures len = %d, want 1", len(result.PartialFailures))
+		}
+	})
+}
+
+func TestConfigApplyServiceFailedRecordsPreserveLifecycleIntent(t *testing.T) {
+	t.Parallel()
+
+	t.Run("Should record skills validation failure as live lifecycle", func(t *testing.T) {
+		t.Parallel()
+
+		ctx := context.Background()
+		homePaths := testHomePaths(t)
+		writeFile(t, homePaths.ConfigFile, baseSettingsConfig())
+		db, err := openSettingsTestGlobalDB(ctx, t, homePaths.DatabaseFile)
+		if err != nil {
+			t.Fatalf("OpenGlobalDB() error = %v", err)
+		}
+		t.Cleanup(func() {
+			if err := db.Close(ctx); err != nil {
+				t.Errorf("Close() error = %v", err)
+			}
+		})
+
+		service := testService(t, homePaths, Dependencies{
+			ApplyRecords: NewConfigApplyRecordRepository(db.DB(), nil),
+		})
+
+		result, err := service.ApplySection(WithMutationSource(ctx, "cli"), SectionUpdateRequest{
+			Section: SectionSkills,
+		})
+		if err == nil {
+			t.Fatal("ApplySection(skills nil payload) error = nil, want validation error")
+		}
+		if result.Applied {
+			t.Fatal("ApplySection(skills nil payload).Applied = true, want false")
+		}
+		if got, want := result.Record.Status, lifecycle.StatusFailed; got != want {
+			t.Fatalf("Status = %q, want %q", got, want)
+		}
+		if got, want := result.Record.Lifecycle, lifecycle.Live; got != want {
+			t.Fatalf("Lifecycle = %q, want %q", got, want)
+		}
+	})
+}
+
+type fakeConfigRuntimeApplier struct {
+	failures  []ApplyFailure
+	calls     int
+	snapshots []compozyconfig.Config
+}
+
+type providerModelCurationRuntimeApplier struct {
+	catalog   *settingsModelCatalogStub
+	calls     int
+	err       error
+	snapshots []compozyconfig.Config
+}
+
+func (a *providerModelCurationRuntimeApplier) ApplyActiveConfig(
+	_ context.Context,
+	cfg *compozyconfig.Config,
+) []ApplyFailure {
+	a.calls++
+	if cfg == nil {
+		return a.fail(fmt.Errorf("active config is nil"))
+	}
+	a.snapshots = append(a.snapshots, cloneActiveConfig(cfg))
+	provider, err := cfg.ResolveProvider("codex")
+	if err != nil {
+		return a.fail(err)
+	}
+	a.catalog.mu.Lock()
+	defer a.catalog.mu.Unlock()
+	models := a.catalog.models["codex"]
+	for _, curated := range provider.Models.Curated {
+		for index := range models {
+			if models[index].ModelID != curated.ID {
+				continue
+			}
+			if curated.Hidden != nil {
+				models[index].Hidden = *curated.Hidden
+			}
+			if curated.Featured != nil {
+				models[index].Featured = *curated.Featured
+			}
+			if curated.Deprecated != nil {
+				models[index].Deprecated = *curated.Deprecated
+			}
+			models[index].Curated = !models[index].Hidden && !models[index].Deprecated
+			if curated.DefaultReasoningEffort != "" {
+				models[index].DefaultReasoningEffort = new(modelcatalog.ReasoningEffort(curated.DefaultReasoningEffort))
+			}
+			if curated.CostInputPerMillion != nil {
+				models[index].CostInputPerMillion = cloneFloat64Ptr(curated.CostInputPerMillion)
+			}
+			if curated.CostOutputPerMillion != nil {
+				models[index].CostOutputPerMillion = cloneFloat64Ptr(curated.CostOutputPerMillion)
+			}
+			if curated.CostCacheReadPerMillion != nil {
+				models[index].CostCacheReadPerMillion = cloneFloat64Ptr(curated.CostCacheReadPerMillion)
+			}
+			if curated.CostCacheWritePerMillion != nil {
+				models[index].CostCacheWritePerMillion = cloneFloat64Ptr(curated.CostCacheWritePerMillion)
+			}
+			if curated.CostReasoningPerMillion != nil {
+				models[index].CostReasoningPerMillion = cloneFloat64Ptr(curated.CostReasoningPerMillion)
+			}
+			break
+		}
+	}
+	a.catalog.models["codex"] = models
+	return nil
+}
+
+func (a *providerModelCurationRuntimeApplier) fail(err error) []ApplyFailure {
+	a.err = err
+	return []ApplyFailure{{
+		Subsystem: "model_catalog",
+		Diagnostic: diagnostics.NewItem(diagnostics.ItemSpec{
+			ID:            "config.apply.model_catalog_sync_failed",
+			Code:          diagnosticcontract.CodeConfigPartialFailure,
+			Category:      diagnosticcontract.CategoryConfig,
+			Title:         "Model catalog sync failed",
+			Message:       err.Error(),
+			Severity:      diagnosticcontract.SeverityError,
+			DataFreshness: diagnosticcontract.FreshnessLive,
+		}),
+	}}
+}
+
+func assertProviderModelHidden(
+	t *testing.T,
+	models compozyconfig.ProviderModelsConfig,
+	modelID string,
+) {
+	t.Helper()
+	for _, model := range models.Curated {
+		if model.ID == modelID {
+			if model.Hidden == nil || !*model.Hidden {
+				t.Fatalf("provider model %q hidden = false, want true", modelID)
+			}
+			return
+		}
+	}
+	t.Fatalf("provider model %q is missing from curated config", modelID)
+}
+
+func providerModelCurationTestService(
+	t *testing.T,
+) (Service, compozyconfig.HomePaths, *settingsModelCatalogStub, *providerModelCurationRuntimeApplier) {
+	t.Helper()
+
+	ctx := context.Background()
+	homePaths := testHomePaths(t)
+	writeFile(t, homePaths.ConfigFile, baseSettingsConfig())
+	db, err := openSettingsTestGlobalDB(ctx, t, homePaths.DatabaseFile)
+	if err != nil {
+		t.Fatalf("OpenGlobalDB() error = %v", err)
+	}
+	t.Cleanup(func() {
+		if err := db.Close(ctx); err != nil {
+			t.Errorf("Close() error = %v", err)
+		}
+	})
+	defaultEffort := modelcatalog.ReasoningEffortMedium
+	contextWindow := int64(1_050_000)
+	maxOutputTokens := int64(128_000)
+	supportsTools := true
+	costInput := 5.0
+	costOutput := 30.0
+	costCacheRead := 0.5
+	costCacheWrite := 6.0
+	costReasoning := 30.0
+	releaseDate := "2026-06-26"
+	catalog := &settingsModelCatalogStub{models: map[string][]modelcatalog.Model{
+		"codex": {
+			{
+				ProviderID:  "codex",
+				ModelID:     "gpt-5.6-sol",
+				DisplayName: "GPT-5.6 Sol",
+				ReasoningEfforts: []modelcatalog.ReasoningEffort{
+					modelcatalog.ReasoningEffortNone,
+					modelcatalog.ReasoningEffortLow,
+					modelcatalog.ReasoningEffortMedium,
+					modelcatalog.ReasoningEffortHigh,
+					modelcatalog.ReasoningEffortXHigh,
+					modelcatalog.ReasoningEffortMax,
+				},
+				DefaultReasoningEffort: &defaultEffort,
+				TransportBindings: []modelcatalog.ModelTransportBinding{
+					{Fast: new(false)},
+					{Fast: new(true)},
+				},
+				ContextWindow:            &contextWindow,
+				MaxOutputTokens:          &maxOutputTokens,
+				SupportsTools:            &supportsTools,
+				CostInputPerMillion:      &costInput,
+				CostOutputPerMillion:     &costOutput,
+				CostCacheReadPerMillion:  &costCacheRead,
+				CostCacheWritePerMillion: &costCacheWrite,
+				CostReasoningPerMillion:  &costReasoning,
+				Featured:                 true,
+				Curated:                  true,
+				ReleaseDate:              &releaseDate,
+			},
+		},
+	}}
+	applier := &providerModelCurationRuntimeApplier{catalog: catalog}
+	service := testService(t, homePaths, Dependencies{
+		ModelCatalog:   catalog,
+		RuntimeApplier: applier,
+		ApplyRecords:   NewConfigApplyRecordRepository(db.DB(), nil),
+	})
+	return service, homePaths, catalog, applier
+}
+
+func (f *fakeConfigRuntimeApplier) ApplyActiveConfig(
+	_ context.Context,
+	cfg *compozyconfig.Config,
+) []ApplyFailure {
+	f.calls++
+	if cfg != nil {
+		f.snapshots = append(f.snapshots, cloneActiveConfig(cfg))
+	}
+	return append([]ApplyFailure(nil), f.failures...)
+}
+
+// Settings assertions own config-apply behavior, not migration replay. Each
+// service still gets an isolated writable database copied from the closed seed.
+var (
+	settingsTestGlobalSeed     *globalseed.Seed
+	settingsTestGlobalSeedErr  error
+	settingsTestGlobalSeedOnce sync.Once
+)
+
+func TestMain(m *testing.M) {
+	os.Exit(runSettingsTests(m))
+}
+
+func runSettingsTests(m *testing.M) (code int) {
+	defer func() {
+		if err := settingsTestGlobalSeed.Close(); err != nil {
+			reportSettingsTestMainError("close global seed: %v", err)
+			if code == 0 {
+				code = 1
+			}
+		}
+	}()
+	return m.Run()
+}
+
+func reportSettingsTestMainError(format string, args ...any) {
+	if _, err := fmt.Fprintf(os.Stderr, "settings tests: "+format+"\n", args...); err != nil {
+		panic(err)
+	}
+}
+
+func openSettingsTestGlobalDB(ctx context.Context, t *testing.T, path string) (*globaldb.GlobalDB, error) {
+	t.Helper()
+	// Lazy setup keeps the MCP stdio helper subprocess free of database state.
+	settingsTestGlobalSeedOnce.Do(func() {
+		settingsTestGlobalSeed, settingsTestGlobalSeedErr = globalseed.New(context.Background())
+	})
+	if settingsTestGlobalSeedErr != nil {
+		return nil, fmt.Errorf("create settings global store seed: %w", settingsTestGlobalSeedErr)
+	}
+	if err := settingsTestGlobalSeed.Clone(path); err != nil {
+		return nil, fmt.Errorf("clone settings global store seed: %w", err)
+	}
+	return globaldb.OpenGlobalDB(ctx, path)
+}
+
+func TestProviderUsageSettingsApply(t *testing.T) {
+	t.Parallel()
+	t.Run(
+		"Should persist and apply provider usage live without activating pending settings IT-006",
+		func(t *testing.T) {
+			t.Parallel()
+			ctx := WithMutationSource(t.Context(), "http")
+			home := testHomePaths(t)
+			writeFile(t, home.ConfigFile, baseSettingsConfig())
+			db, err := openSettingsTestGlobalDB(ctx, t, home.DatabaseFile)
+			if err != nil {
+				t.Fatal(err)
+			}
+			t.Cleanup(func() {
+				if err := db.Close(context.Background()); err != nil {
+					t.Error(err)
+				}
+			})
+			applier := &fakeConfigRuntimeApplier{}
+			svc := testService(
+				t,
+				home,
+				Dependencies{RuntimeApplier: applier, ApplyRecords: NewConfigApplyRecordRepository(db.DB(), nil)},
+			)
+			initial, err := svc.ActiveConfig(ctx)
+			if err != nil {
+				t.Fatal(err)
+			}
+			writeFile(
+				t,
+				home.ConfigFile,
+				strings.Replace(baseSettingsConfig(), `provider = "codex"`, `provider = "claude"`, 1),
+			)
+			desired := compozyconfig.DefaultProviderUsageConfig()
+			desired.Enabled = false
+			desired.RefreshInterval = 10 * time.Minute
+			desired.Providers = map[string]compozyconfig.ProviderUsageProviderConfig{
+				"cursor": {Enabled: false}, "claude": {Enabled: true, KeychainAccess: true},
+			}
+			result, err := svc.ApplySection(
+				ctx,
+				SectionUpdateRequest{Section: SectionProviderUsage, ProviderUsage: &desired},
+			)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !result.Applied || result.RestartRequired || result.Record.Lifecycle != lifecycle.Live ||
+				applier.calls != 1 {
+				t.Fatalf("apply = %#v, calls %d", result, applier.calls)
+			}
+			if !reflect.DeepEqual(applier.snapshots[0].ProviderUsage, desired) ||
+				applier.snapshots[0].Defaults.Provider != initial.Defaults.Provider {
+				t.Fatalf("runtime snapshot = %#v", applier.snapshots[0].ProviderUsage)
+			}
+			envelope, err := svc.GetSection(ctx, SectionRequest{Section: SectionProviderUsage})
+			if err != nil || envelope.ProviderUsage == nil ||
+				!reflect.DeepEqual(envelope.ProviderUsage.Config, desired) {
+				t.Fatalf("read = %#v, %v", envelope, err)
+			}
+			bad := desired.Clone()
+			bad.RefreshInterval = 10 * time.Second
+			if _, err := svc.ApplySection(
+				ctx,
+				SectionUpdateRequest{Section: SectionProviderUsage, ProviderUsage: &bad},
+			); !errors.Is(err, ErrValidation) || !strings.Contains(err.Error(), "provider_usage.refresh_interval") {
+				t.Fatalf("invalid interval error = %v, want refresh_interval validation", err)
+			}
+			persisted, err := compozyconfig.LoadForHome(home)
+			if err != nil || !reflect.DeepEqual(persisted.ProviderUsage, desired) {
+				t.Fatalf("persisted = %#v, %v", persisted.ProviderUsage, err)
+			}
+			desired.Providers = nil
+			if _, err := svc.ApplySection(
+				ctx,
+				SectionUpdateRequest{Section: SectionProviderUsage, ProviderUsage: &desired},
+			); err != nil {
+				t.Fatal(err)
+			}
+			persisted, err = compozyconfig.LoadForHome(home)
+			if err != nil || len(persisted.ProviderUsage.Providers) != 0 {
+				t.Fatalf("removed overrides = %#v, %v", persisted.ProviderUsage, err)
+			}
+			if got := classifyReloadLifecycle(&initial, &persisted); got != lifecycle.Live {
+				t.Fatalf("reload lifecycle = %s", got)
+			}
+		},
+	)
+	t.Run("Should reject provider usage settings outside user scope", func(t *testing.T) {
+		t.Parallel()
+		home := testHomePaths(t)
+		writeFile(t, home.ConfigFile, baseSettingsConfig())
+		svc := testService(t, home, Dependencies{})
+		desired := compozyconfig.DefaultProviderUsageConfig()
+		for _, scope := range []ScopeKind{ScopeWorkspace, ScopeProfile, ScopeAgent} {
+			if _, err := svc.UpdateSection(
+				t.Context(),
+				SectionUpdateRequest{Section: SectionProviderUsage, Scope: scope, ProviderUsage: &desired},
+			); !errors.Is(err, ErrConflict) || !strings.Contains(err.Error(), "does not support "+string(scope)+" scope") {
+				t.Fatalf("scope %s error = %v, want unsupported scope conflict", scope, err)
+			}
+		}
+	})
+}

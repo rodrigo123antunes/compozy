@@ -1,0 +1,17 @@
+package globaldb
+
+import automation "github.com/compozy/compozy/internal/automation/model"
+
+type automationCatalogCandidate struct {
+	ID        string
+	ProfileID string
+	Source    automation.JobSource
+	Name      string
+}
+
+func appendAutomationCatalogPredicate(where string, predicate string) string {
+	if where == "" {
+		return " WHERE " + predicate
+	}
+	return where + " AND " + predicate
+}

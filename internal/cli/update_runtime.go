@@ -1,0 +1,348 @@
+package cli
+
+import (
+	"cmp"
+	"context"
+	"errors"
+	"fmt"
+	"os"
+	"strings"
+	"time"
+
+	"github.com/Masterminds/semver/v3"
+
+	"github.com/compozy/compozy/internal/api/contract"
+	compozyconfig "github.com/compozy/compozy/internal/config"
+	compozydaemon "github.com/compozy/compozy/internal/daemon"
+	"github.com/compozy/compozy/internal/procutil"
+	compozyupdate "github.com/compozy/compozy/internal/update"
+)
+
+type cliUpdateRuntime struct {
+	deps               commandDeps
+	homePaths          compozyconfig.HomePaths
+	daemonBeforeUpdate compozydaemon.Info
+	// restartProgress receives replacement data-migration progress while RestartDaemon waits.
+	restartProgress func(contract.RestartProgress)
+}
+
+var _ compozyupdate.CoordinatorRuntime = (*cliUpdateRuntime)(nil)
+
+func newCLIUpdateRuntime(deps commandDeps, homePaths compozyconfig.HomePaths) *cliUpdateRuntime {
+	return &cliUpdateRuntime{deps: deps, homePaths: homePaths}
+}
+
+func (r *cliUpdateRuntime) captureDaemonBeforeAppUpdate(
+	request compozyupdate.OperationRequest,
+	runtime compozyupdate.RuntimeTrackState,
+) {
+	if request.App == nil || request.Runtime != nil || runtime.Managed ||
+		runtime.InstallMethod != string(compozyupdate.InstallMethodDesktopApp) {
+		return
+	}
+	info, running, err := daemonInfo(r.homePaths, r.deps)
+	if err != nil || !running {
+		// A missing baseline cannot establish a restart; readiness is verified after installation.
+		return
+	}
+	r.daemonBeforeUpdate = info
+}
+
+func newUpdateHolder(surface compozyupdate.Actor, now time.Time) (compozyupdate.Holder, error) {
+	startedAt, err := procutil.StartedAt(os.Getpid())
+	if err != nil {
+		return compozyupdate.Holder{}, fmt.Errorf("cli: resolve update executor identity: %w", err)
+	}
+	token := procutil.CreationProcessToken(os.Getpid())
+	generation, err := compozyupdate.NewExecutorGeneration()
+	if err != nil {
+		return compozyupdate.Holder{}, err
+	}
+	return compozyupdate.Holder{
+		PID: os.Getpid(), PIDStartTime: startedAt, ProcessToken: token, Surface: surface,
+		ExecutorGeneration: generation, LeaseExpiresAt: now.UTC().Add(compozyupdate.DefaultLeaseDuration),
+	}, nil
+}
+
+func (r *cliUpdateRuntime) AcquireMutationLock(context.Context) (compozyupdate.MutationLock, error) {
+	startedAt, err := procutil.StartedAt(os.Getpid())
+	if err != nil {
+		return nil, fmt.Errorf("cli: resolve update mutation identity: %w", err)
+	}
+	lock, err := compozydaemon.AcquireUpdateLock(
+		daemonStartUpdateLockPath(r.homePaths),
+		compozydaemon.UpdateLockOwner{PID: os.Getpid(), StartedAt: startedAt},
+	)
+	if err != nil {
+		return nil, err
+	}
+	return lock, nil
+}
+
+// RestartDaemon observes the durable restart operation while the replacement API is unavailable.
+// The caller owns cancellation; elapsed polling windows do not establish boot failure, while a
+// replacement migration that stops advancing for the idle window does.
+func (r *cliUpdateRuntime) RestartDaemon(ctx context.Context) error {
+	_, running, err := daemonInfo(r.homePaths, r.deps)
+	if err != nil {
+		return err
+	}
+	if !running {
+		_, err = runDaemonDetached(ctx, r.deps)
+		return err
+	}
+	target, err := resolveLocalClientTarget(r.deps, r.homePaths)
+	if err != nil {
+		return err
+	}
+	client, err := r.deps.newClient(target)
+	if err != nil {
+		return err
+	}
+	action, err := client.TriggerSettingsRestart(ctx)
+	if err != nil {
+		return err
+	}
+	progress := newRestartProgressWatch(r.deps, r.restartProgress)
+	for {
+		_, err = waitForSettingsRestart(
+			ctx,
+			r.deps,
+			localRestartStatusClient{homePaths: r.homePaths, remote: client},
+			action.OperationID,
+			progress,
+		)
+		if !errors.Is(err, context.DeadlineExceeded) || ctx.Err() != nil {
+			return err
+		}
+		operation, readErr := compozydaemon.ReadRestartOperation(r.homePaths, action.OperationID)
+		if readErr != nil {
+			return errors.Join(err, readErr)
+		}
+		switch operation.Status {
+		case compozydaemon.RestartStatusReady:
+			return nil
+		case compozydaemon.RestartStatusFailed:
+			return errors.New(operation.FailureReason)
+		}
+	}
+}
+
+type localRestartStatusClient struct {
+	homePaths compozyconfig.HomePaths
+	remote    settingsRestartStatusClient
+}
+
+var _ settingsRestartStatusClient = localRestartStatusClient{}
+
+// GetSettingsRestartStatus reads the local validated journal and falls back remotely only when it is absent.
+func (c localRestartStatusClient) GetSettingsRestartStatus(
+	ctx context.Context,
+	operationID string,
+) (SettingsRestartStatusRecord, error) {
+	operation, err := compozydaemon.ReadRestartOperation(c.homePaths, operationID)
+	if errors.Is(err, compozydaemon.ErrRestartOperationNotFound) {
+		return c.remote.GetSettingsRestartStatus(ctx, operationID)
+	}
+	if err != nil {
+		return SettingsRestartStatusRecord{}, err
+	}
+	return SettingsRestartStatusRecord{
+		OperationID:        operation.OperationID,
+		Status:             contract.RestartOperationStatus(operation.Status),
+		OldPID:             operation.OldPID,
+		OldStartedAt:       operation.OldStartedAt,
+		OldSocketPath:      operation.OldSocketPath,
+		NewPID:             operation.NewPID,
+		ActiveSessionCount: operation.ActiveSessionCount,
+		FailureReason:      operation.FailureReason,
+		StartedAt:          operation.StartedAt,
+		UpdatedAt:          operation.UpdatedAt,
+		CompletedAt:        operation.CompletedAt,
+		Progress:           restartProgressRecord(operation.Progress),
+	}, nil
+}
+
+func restartProgressRecord(progress *compozydaemon.RestartProgress) *contract.RestartProgress {
+	if progress == nil {
+		return nil
+	}
+	return &contract.RestartProgress{
+		Phase:     contract.RestartProgressPhase(progress.Phase),
+		Stage:     progress.Stage,
+		Completed: progress.Completed,
+		Total:     progress.Total,
+		UpdatedAt: progress.UpdatedAt,
+	}
+}
+
+func (r *cliUpdateRuntime) HealthCheck(ctx context.Context) error {
+	client, err := clientFromDeps(r.deps)
+	if err != nil {
+		return err
+	}
+	status, err := client.DaemonStatus(ctx)
+	if err != nil {
+		return err
+	}
+	if status.PID <= 0 || strings.TrimSpace(status.Status) != daemonRunningStatus {
+		return fmt.Errorf("cli: replacement daemon is not healthy (status=%q pid=%d)", status.Status, status.PID)
+	}
+	return nil
+}
+
+func (r *cliUpdateRuntime) InstalledApp(ctx context.Context) (compozyupdate.InstalledApp, error) {
+	if r.deps.resolveAppInstallation == nil {
+		return compozyupdate.InstalledApp{}, errors.New("cli: app installation resolver is required")
+	}
+	installation, err := r.deps.resolveAppInstallation(ctx, r.homePaths)
+	if err != nil {
+		return compozyupdate.InstalledApp{}, err
+	}
+	return compozyupdate.InstalledApp{
+		Present: installation.Installed,
+		Version: strings.TrimSpace(installation.Version),
+	}, nil
+}
+
+// waitForBundledRuntime observes bootstrap completion without assuming the app replaced a newer runtime.
+func (r *cliUpdateRuntime) waitForBundledRuntime(
+	ctx context.Context,
+	releaseVersion string,
+	deadline time.Time,
+) (compozyupdate.RuntimeTrackState, error) {
+	wanted, err := semver.NewVersion(strings.TrimSpace(releaseVersion))
+	if err != nil {
+		return compozyupdate.RuntimeTrackState{}, fmt.Errorf("cli: parse bundled runtime version: %w", err)
+	}
+	target, err := resolveLocalClientTarget(r.deps, r.homePaths)
+	if err != nil {
+		return compozyupdate.RuntimeTrackState{}, err
+	}
+	client, err := r.deps.newClient(target)
+	if err != nil {
+		return compozyupdate.RuntimeTrackState{}, err
+	}
+	probeDeps := r.deps
+	probeDeps.newClient = func(ClientTarget) (DaemonClient, error) { return client, nil }
+	timeout := time.Until(deadline)
+	if r.deps.now != nil {
+		timeout = deadline.Sub(r.deps.now())
+	}
+	pollCtx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
+	return pollUntil(
+		pollCtx, timeout, r.deps.pollInterval, nil,
+		"cli: bundled runtime did not become ready before the update deadline",
+		func(pollCtx context.Context, _ pollEvent) (compozyupdate.RuntimeTrackState, bool, error) {
+			status, running, err := probeBootstrapDaemon(pollCtx, probeDeps, r.homePaths)
+			if err != nil || !running || !bootstrapRuntimeAcceptsApp(status.MinAppVersion, releaseVersion) {
+				return compozyupdate.RuntimeTrackState{}, false, nil
+			}
+			runningVersion, err := semver.NewVersion(strings.TrimSpace(status.Version))
+			if err != nil {
+				return compozyupdate.RuntimeTrackState{}, true, fmt.Errorf(
+					"cli: parse running runtime version: %w",
+					err,
+				)
+			}
+			if runningVersion.LessThan(wanted) {
+				return compozyupdate.RuntimeTrackState{}, false, nil
+			}
+			snapshot, err := client.GetSettingsUpdate(pollCtx)
+			if pollCtx.Err() != nil || isDaemonUnavailableTransportError(err) {
+				return compozyupdate.RuntimeTrackState{}, false, nil
+			}
+			if err != nil {
+				return compozyupdate.RuntimeTrackState{}, true, err
+			}
+			current, err := semver.NewVersion(strings.TrimSpace(snapshot.Runtime.CurrentVersion))
+			if err != nil {
+				return compozyupdate.RuntimeTrackState{}, true, fmt.Errorf(
+					"cli: parse observed runtime version: %w",
+					err,
+				)
+			}
+			if !current.Equal(runningVersion) {
+				return compozyupdate.RuntimeTrackState{}, false, nil
+			}
+			state := snapshot.Runtime
+			return compozyupdate.RuntimeTrackState{
+				CheckedAt: state.CheckedAt, Status: compozyupdate.Status(state.Status),
+				InstallMethod: string(state.InstallMethod), Managed: state.Managed,
+				CurrentVersion: state.CurrentVersion, LatestVersion: state.LatestVersion,
+				ReleaseURL: state.ReleaseURL, Recommendation: state.Recommendation,
+				RestoredVersion: state.RestoredVersion,
+				DaemonRestarted: r.daemonBeforeUpdate.PID > 0 &&
+					(status.PID != r.daemonBeforeUpdate.PID || !status.StartedAt.Equal(r.daemonBeforeUpdate.StartedAt)),
+				Message: state.Message, LastError: state.LastError,
+			}, true, nil
+		},
+	)
+}
+
+func waitForAppUpdateCompletion(
+	ctx context.Context,
+	deps commandDeps,
+	store *compozyupdate.OperationStore,
+	operationID string,
+	deadline time.Time,
+) (*compozyupdate.Operation, error) {
+	if store == nil {
+		return nil, errors.New("cli: update operation store is required")
+	}
+	timeout := time.Until(deadline)
+	if deps.now != nil {
+		timeout = deadline.Sub(deps.now())
+	}
+	return pollUntil(
+		ctx,
+		timeout,
+		deps.pollInterval,
+		nil,
+		"cli: desktop app update did not complete before its deadline",
+		func(pollCtx context.Context, _ pollEvent) (*compozyupdate.Operation, bool, error) {
+			if archived, done, err := readArchivedAppCompletion(pollCtx, store, operationID); done || err != nil {
+				return archived, done, err
+			}
+			live, err := store.Read(pollCtx)
+			if err != nil {
+				return nil, true, err
+			}
+			if live == nil || live.ID != operationID {
+				if archived, done, archiveErr := readArchivedAppCompletion(
+					pollCtx,
+					store,
+					operationID,
+				); done || archiveErr != nil {
+					return archived, done, archiveErr
+				}
+				return nil, true, errors.New("cli: update operation disappeared before archival")
+			}
+			return nil, false, nil
+		},
+	)
+}
+
+func readArchivedAppCompletion(
+	ctx context.Context,
+	store *compozyupdate.OperationStore,
+	operationID string,
+) (*compozyupdate.Operation, bool, error) {
+	archived, err := store.ReadArchived(ctx, operationID)
+	if err != nil {
+		return nil, true, err
+	}
+	if archived == nil {
+		return nil, false, nil
+	}
+	return archivedAppCompletion(archived)
+}
+
+func archivedAppCompletion(operation *compozyupdate.Operation) (*compozyupdate.Operation, bool, error) {
+	if operation.App != nil && operation.App.Phase == compozyupdate.PhaseFailed {
+		message := cmp.Or(strings.TrimSpace(operation.LastError), "desktop app update failed")
+		return operation, true, errors.New("cli: " + message)
+	}
+	return operation, true, nil
+}

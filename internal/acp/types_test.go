@@ -1,0 +1,824 @@
+package acp
+
+import (
+	"cmp"
+	"encoding/json"
+	"errors"
+	"reflect"
+	"strconv"
+	"strings"
+	"testing"
+	"time"
+
+	compozyconfig "github.com/compozy/compozy/internal/config"
+	speedpkg "github.com/compozy/compozy/internal/speed"
+)
+
+func TestStartOptsUnrestrictedModesRequireApproveAll(t *testing.T) {
+	t.Parallel()
+	t.Run("Should allow only the verified Claude auto reviewer below approve-all", func(t *testing.T) {
+		t.Parallel()
+		for _, provider := range []string{"claude", "codex", "custom", ""} {
+			base := StartOpts{
+				AgentName: "reviewer", Command: "adapter", Cwd: t.TempDir(),
+				ProviderName: provider, Permissions: compozyconfig.PermissionModeAuto,
+				ACPOptions: []SessionConfigOptionSelection{{ID: "mode", ValueID: "auto"}},
+			}
+			wantAllowed := provider == "claude"
+			if err := base.Validate(); (err == nil) != wantAllowed {
+				t.Fatalf("Validate(provider=%q) = %v, want allowed=%v", provider, err, wantAllowed)
+			}
+			if _, err := normalizeStartOpts(base); (err == nil) != wantAllowed {
+				t.Fatalf("normalizeStartOpts(provider=%q) = %v, want allowed=%v", provider, err, wantAllowed)
+			}
+		}
+	})
+
+	for _, tc := range []struct {
+		name     string
+		optionID string
+		mode     string
+	}{
+		{name: "Should require approval for Codex full access", mode: "agent-full-access"},
+		{name: "Should require approval for Claude bypass permissions", mode: "bypassPermissions"},
+		{name: "Should require approval for YOLO mode", mode: "yolo"},
+		{name: "Should require approval for auto mode", mode: "auto"},
+		{
+			name: "Should require approval for Copilot autopilot mode",
+			mode: "https://agentclientprotocol.com/protocol/session-modes#autopilot",
+		},
+		{name: "Should require approval for Copilot allow-all", optionID: "allow_all", mode: "on"},
+		{name: "Should require approval for mixed case bypass permissions", mode: "BypassPermissions"},
+		{name: "Should require approval for mixed case Copilot allow-all", optionID: "Allow_All", mode: "ON"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			base := StartOpts{
+				AgentName: "codex",
+				Command:   "codex-acp",
+				Cwd:       t.TempDir(),
+				ACPOptions: []SessionConfigOptionSelection{{
+					ID: cmp.Or(tc.optionID, "mode"), ValueID: tc.mode,
+				}},
+			}
+			if err := base.Validate(); err == nil || !strings.Contains(err.Error(), "requires approve-all") {
+				t.Fatalf("Validate() with default permissions = %v, want full-access refusal", err)
+			}
+			if _, err := normalizeStartOpts(
+				base,
+			); err == nil ||
+				!strings.Contains(err.Error(), "requires approve-all") {
+				t.Fatalf("normalizeStartOpts() with default permissions = %v, want full-access refusal", err)
+			}
+			// The ACP start boundary must reject provider bypass options at every
+			// level below approve-all, including the two added permission levels.
+			for _, level := range []compozyconfig.PermissionMode{
+				compozyconfig.PermissionModeDenyAll, compozyconfig.PermissionModeApproveReads,
+				compozyconfig.PermissionModeApproveEdits, compozyconfig.PermissionModeAuto,
+			} {
+				base.Permissions = level
+				if err := base.Validate(); err == nil || !strings.Contains(err.Error(), "requires approve-all") {
+					t.Fatalf("Validate() with %s = %v, want full-access refusal", level, err)
+				}
+			}
+			base.Permissions = compozyconfig.PermissionModeApproveAll
+			if err := base.Validate(); err != nil {
+				t.Fatalf("Validate() with approve-all = %v, want success", err)
+			}
+			if _, err := normalizeStartOpts(base); err != nil {
+				t.Fatalf("normalizeStartOpts() with approve-all = %v, want success", err)
+			}
+		})
+	}
+}
+
+func TestAgentEventToolPayloadPreservesValueSemantics(t *testing.T) {
+	t.Parallel()
+
+	t.Run("Should return zero tool values when the payload is absent", func(t *testing.T) {
+		t.Parallel()
+
+		event := AgentEvent{}
+		if event.HasToolPayload() {
+			t.Fatal("HasToolPayload() = true, want false")
+		}
+		if event.ToolName() != "" || len(event.ToolInput()) != 0 ||
+			event.ToolError() || event.ToolErrorDetail() != "" {
+			t.Fatalf(
+				"zero tool payload = (%q, %s, %t, %q), want empty values",
+				event.ToolName(),
+				event.ToolInput(),
+				event.ToolError(),
+				event.ToolErrorDetail(),
+			)
+		}
+	})
+
+	t.Run("Should isolate tool input and copied event payloads", func(t *testing.T) {
+		t.Parallel()
+
+		input := json.RawMessage(`{"command":"original"}`)
+		event := (AgentEvent{Type: EventTypeToolCall}).WithToolDetail(
+			"compozy__terminal",
+			input,
+			true,
+			"command failed",
+		)
+		if !event.HasToolPayload() {
+			t.Fatal("HasToolPayload() = false, want true")
+		}
+		copied := event
+
+		input[2] = 'X'
+		returned := event.ToolInput()
+		returned[2] = 'Y'
+		copied = copied.WithTool("compozy__read", json.RawMessage(`{"path":"README.md"}`), false)
+
+		if got, want := event.ToolName(), "compozy__terminal"; got != want {
+			t.Fatalf("original tool name = %q, want %q", got, want)
+		}
+		if got, want := string(event.ToolInput()), `{"command":"original"}`; got != want {
+			t.Fatalf("original tool input = %s, want %s", got, want)
+		}
+		if !event.ToolError() {
+			t.Fatal("original tool error = false, want true")
+		}
+		if got, want := event.ToolErrorDetail(), "command failed"; got != want {
+			t.Fatalf("original tool error detail = %q, want %q", got, want)
+		}
+		if got, want := copied.ToolName(), "compozy__read"; got != want {
+			t.Fatalf("copied tool name = %q, want %q", got, want)
+		}
+	})
+}
+
+func TestAgentEventPromptRuntimePreservesValueSemantics(t *testing.T) {
+	t.Parallel()
+
+	t.Run("Should isolate prompt runtime snapshots across event copies", func(t *testing.T) {
+		t.Parallel()
+
+		runtime := &PromptRuntime{
+			Provider:        "openai",
+			Model:           "gpt-5.6",
+			ReasoningEffort: "high",
+			Speed:           speedpkg.SpeedFast,
+			ACPOptions: []SessionConfigOptionSelection{{
+				ID: "thinking", BoolValue: new(true),
+			}},
+		}
+		event := (AgentEvent{Type: EventTypeAgentMessage}).WithPromptRuntime(runtime)
+		copied := event.WithTool("compozy__read", json.RawMessage(`{"path":"README.md"}`), false)
+
+		runtime.Provider = "mutated"
+		*runtime.ACPOptions[0].BoolValue = false
+		snapshot := event.PromptRuntimeSnapshot()
+		snapshot.Model = "mutated"
+		*snapshot.ACPOptions[0].BoolValue = false
+
+		if got, want := event.PromptRuntimeSnapshot(), (&PromptRuntime{
+			Provider:        "openai",
+			Model:           "gpt-5.6",
+			ReasoningEffort: "high",
+			Speed:           speedpkg.SpeedFast,
+			ACPOptions: []SessionConfigOptionSelection{{
+				ID: "thinking", BoolValue: new(true),
+			}},
+		}); got == nil || !reflect.DeepEqual(got, want) {
+			t.Fatalf("original prompt runtime = %#v, want %#v", got, want)
+		}
+		if got, want := copied.PromptRuntimeSnapshot(), event.PromptRuntimeSnapshot(); got == nil ||
+			!reflect.DeepEqual(got, want) {
+			t.Fatalf("copied prompt runtime = %#v, want %#v", got, want)
+		}
+	})
+}
+
+func TestPromptMetaToMap(t *testing.T) {
+	t.Parallel()
+
+	t.Run("Should convert normalized prompt metadata", func(t *testing.T) {
+		t.Parallel()
+
+		metaMap, err := (PromptMeta{
+			TurnSource: PromptTurnSourceSynthetic,
+			Synthetic: &PromptSyntheticMeta{
+				Reason: "wake",
+			},
+		}).ToMap()
+		if err != nil {
+			t.Fatalf("ToMap() error = %v", err)
+		}
+		if metaMap["turn_source"] != PromptTurnSourceSynthetic {
+			t.Fatalf("ToMap() turn_source = %#v", metaMap["turn_source"])
+		}
+		synthetic, ok := metaMap["synthetic"].(map[string]any)
+		if !ok || synthetic["reason"] != "wake" {
+			t.Fatalf("ToMap() synthetic = %#v", metaMap["synthetic"])
+		}
+	})
+
+	t.Run("Should return nil for empty metadata", func(t *testing.T) {
+		t.Parallel()
+
+		metaMap, err := (PromptMeta{}).ToMap()
+		if err != nil {
+			t.Fatalf("ToMap(empty) error = %v", err)
+		}
+		if metaMap != nil {
+			t.Fatalf("ToMap(empty) = %#v, want nil", metaMap)
+		}
+	})
+}
+
+func TestAgentProcessCapsSnapshotClonesConfigOptions(t *testing.T) {
+	t.Parallel()
+
+	t.Run("Should clone config options snapshots", func(t *testing.T) {
+		t.Parallel()
+
+		proc := &AgentProcess{}
+		proc.setCaps(Caps{
+			ConfigOptions: []SessionConfigOption{
+				{
+					ID:             "model",
+					Kind:           SessionConfigOptionKindSelect,
+					CurrentValueID: "model-a",
+					Values:         []SessionConfigOptionValue{{Value: "model-a"}},
+				},
+			},
+		})
+
+		first := proc.CapsSnapshot()
+		first.ConfigOptions[0].CurrentValueID = "mutated"
+		first.ConfigOptions[0].Values[0].Value = "mutated"
+
+		second := proc.CapsSnapshot()
+		if second.ConfigOptions[0].CurrentValueID != "model-a" ||
+			second.ConfigOptions[0].Values[0].Value != "model-a" {
+			t.Fatalf("CapsSnapshot() leaked mutable config options: %#v", second.ConfigOptions)
+		}
+	})
+
+	t.Run("Should replace config options through setConfigOptions", func(t *testing.T) {
+		t.Parallel()
+
+		proc := &AgentProcess{}
+		proc.setCaps(Caps{
+			ConfigOptions: []SessionConfigOption{
+				{
+					ID:             "model",
+					Kind:           SessionConfigOptionKindSelect,
+					CurrentValueID: "model-a",
+					Values:         []SessionConfigOptionValue{{Value: "model-a"}},
+				},
+			},
+		})
+
+		proc.setConfigOptions([]SessionConfigOption{{ID: "reasoning_effort", Kind: SessionConfigOptionKindSelect}})
+		updated := proc.CapsSnapshot()
+		if len(updated.ConfigOptions) != 1 || updated.ConfigOptions[0].ID != "reasoning_effort" {
+			t.Fatalf("setConfigOptions() = %#v", updated.ConfigOptions)
+		}
+	})
+}
+
+func TestEndPromptClearsActivePromptWhileEmitterIsBackpressured(t *testing.T) {
+	t.Parallel()
+
+	proc := &AgentProcess{}
+	active, err := proc.beginPrompt("turn-1", 1)
+	if err != nil {
+		t.Fatalf("beginPrompt() error = %v", err)
+	}
+
+	active.events <- AgentEvent{Type: EventTypeAgentMessage, TurnID: "turn-1"}
+
+	emitterStarted := make(chan struct{})
+	emitterDone := make(chan struct{})
+	go func() {
+		active.sendMu.Lock()
+		close(emitterStarted)
+		active.events <- AgentEvent{Type: EventTypeDone, TurnID: "turn-1"}
+		select {
+		case active.activity <- struct{}{}:
+		default:
+		}
+		active.sendMu.Unlock()
+		close(emitterDone)
+	}()
+	<-emitterStarted
+
+	endDone := make(chan struct{})
+	go func() {
+		proc.endPrompt(active)
+		close(endDone)
+	}()
+
+	select {
+	case <-active.detached:
+	case <-time.After(200 * time.Millisecond):
+		t.Fatal("timed out waiting for endPrompt() to detach the active prompt")
+	}
+	if proc.currentPrompt() != nil {
+		t.Fatal("currentPrompt() remained non-nil while endPrompt waited on a backpressured sender")
+	}
+
+	select {
+	case <-endDone:
+		t.Fatal("endPrompt() returned before the blocked emitPromptEvent() send was able to flush")
+	default:
+	}
+
+	first := <-active.events
+	if first.Type != EventTypeAgentMessage {
+		t.Fatalf("first queued event = %q, want %q", first.Type, EventTypeAgentMessage)
+	}
+
+	select {
+	case second, ok := <-active.events:
+		if !ok {
+			t.Fatal("active.events closed before backpressured event was delivered")
+		}
+		if second.Type != EventTypeDone {
+			t.Fatalf("second queued event = %q, want %q", second.Type, EventTypeDone)
+		}
+	case <-time.After(200 * time.Millisecond):
+		t.Fatal("timed out waiting for backpressured emitPromptEvent() send to complete")
+	}
+
+	select {
+	case <-emitterDone:
+	case <-time.After(200 * time.Millisecond):
+		t.Fatal("emitPromptEvent() did not return after the queue drained")
+	}
+
+	select {
+	case <-endDone:
+	case <-time.After(200 * time.Millisecond):
+		t.Fatal("endPrompt() did not finish after the queue drained")
+	}
+
+	if _, ok := <-active.events; ok {
+		t.Fatal("active.events remained open after endPrompt()")
+	}
+}
+
+func TestEmitPromptEventDefersToolResultUntilToolCall(t *testing.T) {
+	t.Parallel()
+
+	t.Run("Should defer tool results until the tool call", func(t *testing.T) {
+		t.Parallel()
+
+		proc := &AgentProcess{}
+		active, err := proc.beginPrompt("turn-1", 4)
+		if err != nil {
+			t.Fatalf("beginPrompt() error = %v", err)
+		}
+
+		proc.emitPromptEvent(AgentEvent{Type: EventTypeToolResult, TurnID: "turn-1", ToolCallID: "tool-1"})
+
+		select {
+		case event := <-active.events:
+			t.Fatalf("deferred tool result emitted early: %#v", event)
+		default:
+		}
+
+		proc.emitPromptEvent(AgentEvent{Type: EventTypeToolCall, TurnID: "turn-1", ToolCallID: "tool-1"})
+
+		first := <-active.events
+		if first.Type != EventTypeToolCall {
+			t.Fatalf("first event = %q, want %q", first.Type, EventTypeToolCall)
+		}
+		second := <-active.events
+		if second.Type != EventTypeToolResult {
+			t.Fatalf("second event = %q, want %q", second.Type, EventTypeToolResult)
+		}
+	})
+}
+
+func TestEmitPromptEventFlushesDeferredToolResultsBeforeDone(t *testing.T) {
+	t.Parallel()
+
+	t.Run("Should flush deferred tool results before done", func(t *testing.T) {
+		t.Parallel()
+
+		proc := &AgentProcess{}
+		active, err := proc.beginPrompt("turn-1", 4)
+		if err != nil {
+			t.Fatalf("beginPrompt() error = %v", err)
+		}
+
+		proc.emitPromptEvent(AgentEvent{Type: EventTypeToolResult, TurnID: "turn-1", ToolCallID: "tool-1"})
+		proc.emitPromptEvent(AgentEvent{Type: EventTypeDone, TurnID: "turn-1"})
+
+		first := <-active.events
+		if first.Type != EventTypeToolResult {
+			t.Fatalf("first event = %q, want %q", first.Type, EventTypeToolResult)
+		}
+		second := <-active.events
+		if second.Type != EventTypeDone {
+			t.Fatalf("second event = %q, want %q", second.Type, EventTypeDone)
+		}
+	})
+}
+
+func TestEmitPromptEventCoalescesRedundantToolCalls(t *testing.T) {
+	t.Parallel()
+
+	t.Run("Should keep a repeated tool update burst within the event buffer", func(t *testing.T) {
+		t.Parallel()
+
+		proc := &AgentProcess{}
+		active, err := proc.beginPrompt("turn-1", 2)
+		if err != nil {
+			t.Fatalf("beginPrompt() error = %v", err)
+		}
+		defer proc.endPrompt(active)
+
+		emitted := make(chan struct{})
+		go func() {
+			defer close(emitted)
+			toolCall := AgentEvent{Type: EventTypeToolCall, TurnID: "turn-1", ToolCallID: "tool-1"}
+			proc.emitPromptEvent(toolCall)
+			for range 1_025 {
+				proc.emitPromptEvent(toolCall)
+			}
+			proc.emitPromptEvent(AgentEvent{Type: EventTypeToolResult, TurnID: "turn-1", ToolCallID: "tool-1"})
+		}()
+
+		timer := time.NewTimer(2 * time.Second)
+		defer timer.Stop()
+		select {
+		case <-emitted:
+		case <-timer.C:
+			for {
+				select {
+				case <-active.events:
+				case <-emitted:
+					t.Fatal("tool update burst blocked on the bounded prompt event channel")
+				}
+			}
+		}
+
+		first := <-active.events
+		if first.Type != EventTypeToolCall {
+			t.Fatalf("first event = %q, want %q", first.Type, EventTypeToolCall)
+		}
+		second := <-active.events
+		if second.Type != EventTypeToolResult {
+			t.Fatalf("second event = %q, want %q", second.Type, EventTypeToolResult)
+		}
+		select {
+		case event := <-active.events:
+			t.Fatalf("unexpected redundant tool event = %#v", event)
+		default:
+		}
+	})
+
+	t.Run("Should emit canonical tool call enrichments once", func(t *testing.T) {
+		t.Parallel()
+
+		proc := &AgentProcess{}
+		active, err := proc.beginPrompt("turn-1", 8)
+		if err != nil {
+			t.Fatalf("beginPrompt() error = %v", err)
+		}
+		defer proc.endPrompt(active)
+
+		sparse := AgentEvent{Type: EventTypeToolCall, TurnID: "turn-1", ToolCallID: "tool-1"}
+		proc.emitPromptEvent(sparse)
+		proc.emitPromptEvent(sparse)
+		proc.emitPromptEvent(AgentEvent{
+			Type: EventTypeToolCall, TurnID: "turn-1", ToolCallID: "tool-1", Title: "Read file",
+		})
+		proc.emitPromptEvent(AgentEvent{
+			Type: EventTypeToolCall, TurnID: "turn-1", ToolCallID: "tool-1", Title: "Read file",
+		})
+		proc.emitPromptEvent((AgentEvent{
+			Type: EventTypeToolCall, TurnID: "turn-1", ToolCallID: "tool-1",
+		}).WithToolKind("read"))
+		proc.emitPromptEvent((AgentEvent{
+			Type: EventTypeToolCall, TurnID: "turn-1", ToolCallID: "tool-1",
+		}).WithTool("read_file", json.RawMessage(`{"path":"README.md"}`), false))
+		proc.emitPromptEvent((AgentEvent{
+			Type: EventTypeToolCall, TurnID: "turn-1", ToolCallID: "tool-1",
+		}).WithToolPrechecked())
+		proc.emitPromptEvent(AgentEvent{Type: EventTypeToolResult, TurnID: "turn-1", ToolCallID: "tool-1"})
+
+		wantTypes := []string{
+			EventTypeToolCall,
+			EventTypeToolCall,
+			EventTypeToolCall,
+			EventTypeToolCall,
+			EventTypeToolCall,
+			EventTypeToolResult,
+		}
+		for index, want := range wantTypes {
+			event := <-active.events
+			if event.Type != want {
+				t.Fatalf("event %d type = %q, want %q", index, event.Type, want)
+			}
+		}
+		select {
+		case event := <-active.events:
+			t.Fatalf("unexpected duplicate enrichment event = %#v", event)
+		default:
+		}
+	})
+
+	t.Run("Should preserve tool calls without an identifier", func(t *testing.T) {
+		t.Parallel()
+
+		proc := &AgentProcess{}
+		active, err := proc.beginPrompt("turn-1", 2)
+		if err != nil {
+			t.Fatalf("beginPrompt() error = %v", err)
+		}
+		defer proc.endPrompt(active)
+
+		toolCall := AgentEvent{Type: EventTypeToolCall, TurnID: "turn-1"}
+		proc.emitPromptEvent(toolCall)
+		proc.emitPromptEvent(toolCall)
+
+		for range 2 {
+			if event := <-active.events; event.Type != EventTypeToolCall {
+				t.Fatalf("event type = %q, want %q", event.Type, EventTypeToolCall)
+			}
+		}
+	})
+}
+
+func TestEmitPromptEventDeferredToolResultsStayBounded(t *testing.T) {
+	t.Parallel()
+
+	t.Run("Should dedupe deferred tool results by tool call id", func(t *testing.T) {
+		t.Parallel()
+
+		proc := &AgentProcess{}
+		active, err := proc.beginPrompt("turn-1", 8)
+		if err != nil {
+			t.Fatalf("beginPrompt() error = %v", err)
+		}
+
+		proc.emitPromptEvent(AgentEvent{Type: EventTypeToolResult, TurnID: "turn-1", ToolCallID: "tool-1"})
+		proc.emitPromptEvent(AgentEvent{Type: EventTypeToolResult, TurnID: "turn-1", ToolCallID: "tool-1"})
+
+		if got, want := len(active.pendingToolResults), 1; got != want {
+			t.Fatalf("len(active.pendingToolResults) = %d, want %d", got, want)
+		}
+
+		proc.emitPromptEvent(AgentEvent{Type: EventTypeToolCall, TurnID: "turn-1", ToolCallID: "tool-1"})
+
+		first := <-active.events
+		if first.Type != EventTypeToolCall {
+			t.Fatalf("first event = %q, want %q", first.Type, EventTypeToolCall)
+		}
+		second := <-active.events
+		if second.Type != EventTypeToolResult {
+			t.Fatalf("second event = %q, want %q", second.Type, EventTypeToolResult)
+		}
+
+		select {
+		case event := <-active.events:
+			t.Fatalf("unexpected extra deferred event = %#v", event)
+		default:
+		}
+	})
+
+	t.Run("Should preserve accepted deferred results before terminating a saturated prompt", func(t *testing.T) {
+		t.Parallel()
+		proc := &AgentProcess{SessionID: "sess-deferred"}
+		active, err := proc.beginPrompt("turn-1", maxPendingToolResults*2)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer proc.endPrompt(active)
+		for i := range maxPendingToolResults + 1 {
+			proc.emitPromptEvent(
+				AgentEvent{Type: EventTypeToolResult, TurnID: "turn-1", ToolCallID: "tool-" + strconv.Itoa(i)},
+			)
+		}
+		for i := range maxPendingToolResults {
+			event, open := <-active.events
+			if !open || event.Type != EventTypeToolResult || event.ToolCallID != "tool-"+strconv.Itoa(i) {
+				t.Fatalf("accepted result %d = %#v, open=%v", i, event, open)
+			}
+		}
+		failure, open := <-active.events
+		if !open || failure.Type != EventTypeError || !strings.Contains(failure.Error, ErrIngestSaturated.Error()) {
+			t.Fatalf("saturation failure = %#v, open=%v", failure, open)
+		}
+		if _, open := <-active.events; open {
+			t.Fatal("saturated prompt remained open")
+		}
+	})
+}
+
+func TestLockedBufferRetainsOnlyTheLatestBytes(t *testing.T) {
+	t.Parallel()
+
+	buffer := &lockedBuffer{}
+	payload := strings.Repeat("a", defaultTerminalOutputLimit) + "tail"
+	if _, err := buffer.Write([]byte(payload)); err != nil {
+		t.Fatalf("lockedBuffer.Write() error = %v", err)
+	}
+
+	got := buffer.String()
+	if len(got) != defaultTerminalOutputLimit {
+		t.Fatalf("len(buffer.String()) = %d, want %d", len(got), defaultTerminalOutputLimit)
+	}
+	if !strings.HasSuffix(got, "tail") {
+		t.Fatalf("buffer.String() suffix = %q, want tail", got[len(got)-4:])
+	}
+	if strings.HasPrefix(got, "aa") {
+		t.Logf("buffer head retained latest window as expected")
+	}
+}
+
+func TestWaitForPromptQuiescenceHasMaximumDuration(t *testing.T) {
+	t.Parallel()
+
+	driver := New(WithPromptDrainWait(20 * time.Millisecond))
+	active := &activePromptState{
+		activity: make(chan struct{}, 1),
+	}
+
+	stop := make(chan struct{})
+	go func() {
+		ticker := time.NewTicker(5 * time.Millisecond)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-stop:
+				return
+			case <-ticker.C:
+				select {
+				case active.activity <- struct{}{}:
+				default:
+				}
+			}
+		}
+	}()
+	defer close(stop)
+
+	started := time.Now()
+	driver.waitForPromptQuiescence(active)
+	elapsed := time.Since(started)
+
+	if elapsed > 120*time.Millisecond {
+		t.Fatalf("waitForPromptQuiescence() took %v, want bounded wait", elapsed)
+	}
+}
+
+func TestPromptMetaValidateSyntheticRequiresWakeupReason(t *testing.T) {
+	t.Parallel()
+
+	err := (PromptMeta{
+		TurnSource: PromptTurnSourceSynthetic,
+		Synthetic: &PromptSyntheticMeta{
+			TaskRunID: "run-1",
+		},
+	}).Validate()
+	if err == nil {
+		t.Fatal("PromptMeta.Validate() error = nil, want synthetic validation failure")
+	}
+	if !errors.Is(err, ErrInvalidPromptMetadata) {
+		t.Fatalf("PromptMeta.Validate() error = %v, want ErrInvalidPromptMetadata", err)
+	}
+	if !strings.Contains(err.Error(), "requires a reason") {
+		t.Fatalf("PromptMeta.Validate() error = %v, want missing-reason detail", err)
+	}
+}
+
+func TestPromptMetaValidateRejectsSyntheticFieldsOnUserTurns(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name string
+		meta PromptMeta
+		want string
+	}{
+		{
+			name: "Should reject synthetic fields on user turns",
+			meta: PromptMeta{
+				TurnSource: PromptTurnSourceUser,
+				Synthetic:  &PromptSyntheticMeta{Reason: "wake"},
+			},
+			want: "cannot include synthetic fields",
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			err := tc.meta.Validate()
+			if err == nil {
+				t.Fatal("PromptMeta.Validate() error = nil, want validation failure")
+			}
+			if !errors.Is(err, ErrInvalidPromptMetadata) {
+				t.Fatalf("PromptMeta.Validate() error = %v, want ErrInvalidPromptMetadata", err)
+			}
+			if !strings.Contains(err.Error(), tc.want) {
+				t.Fatalf("PromptMeta.Validate() error = %v, want substring %q", err, tc.want)
+			}
+		})
+	}
+}
+
+func TestPromptSyntheticMetaNormalizeAndValidate(t *testing.T) {
+	t.Parallel()
+
+	meta := PromptSyntheticMeta{
+		TaskID:         " task-1 ",
+		TaskRunID:      " run-1 ",
+		ChildSessionID: " child-1 ",
+		ChildAgentName: " researcher ",
+		Badge:          " waiting-for-input ",
+		Reason:         " task_run_completed ",
+		Summary:        " ready ",
+	}
+	normalized := meta.Normalize()
+
+	if got, want := normalized.TaskID, "task-1"; got != want {
+		t.Fatalf("Normalize().TaskID = %q, want %q", got, want)
+	}
+	if got, want := normalized.TaskRunID, "run-1"; got != want {
+		t.Fatalf("Normalize().TaskRunID = %q, want %q", got, want)
+	}
+	if got, want := normalized.ChildSessionID, "child-1"; got != want {
+		t.Fatalf("Normalize().ChildSessionID = %q, want %q", got, want)
+	}
+	if got, want := normalized.ChildAgentName, "researcher"; got != want {
+		t.Fatalf("Normalize().ChildAgentName = %q, want %q", got, want)
+	}
+	if got, want := normalized.Badge, "waiting-for-input"; got != want {
+		t.Fatalf("Normalize().Badge = %q, want %q", got, want)
+	}
+	if got, want := normalized.Reason, "task_run_completed"; got != want {
+		t.Fatalf("Normalize().Reason = %q, want %q", got, want)
+	}
+	if got, want := normalized.Summary, "ready"; got != want {
+		t.Fatalf("Normalize().Summary = %q, want %q", got, want)
+	}
+	if normalized.IsZero() {
+		t.Fatal("Normalize().IsZero() = true, want false")
+	}
+	if err := normalized.Validate(); err != nil {
+		t.Fatalf("Validate() error = %v", err)
+	}
+	if err := (PromptSyntheticMeta{}).Validate(); err == nil {
+		t.Fatal("Validate(empty) error = nil, want validation failure")
+	}
+}
+
+func TestPromptStopReasonShouldRequireExactWireValue(t *testing.T) {
+	t.Parallel()
+
+	t.Run("Should accept a canonical stop reason", func(t *testing.T) {
+		t.Parallel()
+
+		if !PromptStopReasonEndTurn.Valid() {
+			t.Fatal("PromptStopReasonEndTurn.Valid() = false, want true")
+		}
+	})
+
+	t.Run("Should reject whitespace around a stop reason", func(t *testing.T) {
+		t.Parallel()
+
+		if PromptStopReason(" end_turn ").Valid() {
+			t.Fatal("PromptStopReason(whitespace).Valid() = true, want false")
+		}
+	})
+}
+
+func TestAutoPermissionDegradation(t *testing.T) {
+	t.Parallel()
+	for _, tc := range []struct {
+		name     string
+		provider string
+		reviewer string
+		current  string
+		degraded bool
+	}{
+		{"Should preserve Claude reviewer after negotiation", "claude", "auto", "auto", false},
+		{"Should detect adapter fallback to edit mode", "claude", "auto", "acceptEdits", true},
+		{"Should preserve Codex reviewer after negotiation", "codex", "agent", "agent", false},
+		{"Should reject an undeclared reviewer", "custom", "", "auto", true},
+		{"Should reject unrestricted reviewer pairs", "custom", "auto", "auto", true},
+		{"Should degrade without current mode evidence", "custom", "smart", "", true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			proc := &AgentProcess{
+				providerName: tc.provider, reviewerMode: tc.reviewer,
+				permissions: permissionPolicy{mode: compozyconfig.PermissionModeAuto},
+				caps:        Caps{ConfigOptions: []SessionConfigOption{{ID: "mode", CurrentValueID: tc.current}}},
+			}
+			if got := proc.CapsSnapshot().PermissionModeDegraded; got != tc.degraded {
+				t.Fatalf("degraded=%v, want %v", got, tc.degraded)
+			}
+		})
+	}
+}

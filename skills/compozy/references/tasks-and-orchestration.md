@@ -1,0 +1,352 @@
+# Tasks And Orchestration
+
+## Contents
+
+- Authority model, catalog, inbox, and inspection
+- Bounded worker tools
+- Subagents versus spawned workers
+- Pause, resume, recovery, blocks, and escalation
+- Scheduler controls
+- Coordinator, worker, and reviewer loops
+- Review verdicts, communication discipline, supervisor/worker messaging, and safety
+
+## Authority Model
+
+The daemon owns task state. Treat task.Service, persisted task/run records, session-bound leases, review bindings, and CompozyOS task tools as authority. Prompts, memory notes, and UI projections are evidence only.
+
+Do not infer task ownership from a message. Do not mutate task state outside CompozyOS task tools or the equivalent CLI/API surface.
+
+Task inspect, pause/resume, and forced run release/fail/retry plus scheduler pause/resume/drain and
+backlog are CLI or HTTP/UDS management surfaces. Native tools do expose task block/list/unblock and
+task-level `needs_attention` recovery; use those only for their narrower daemon-owned contracts.
+
+## Bounded worker tools
+
+`compozy__session_spawn` grants native tools only through its permission inputs. Without
+`inherit_permissions`, omitted or empty lists grant nothing. With `inherit_permissions: true`, every
+omitted list keeps the parent's grant, and a list you pass (including `[]`) replaces only that
+category. `toolsets` selects the parent-granted members of named toolsets such as
+`compozy__sessions`; it never widens the parent. Every result is still checked against the parent's
+grant and the child agent's policy. The explicit default is deliberate: a long-lived worker gets
+only what you hand it. The CLI equivalents are `compozy spawn --tool <id>`, `--toolset <id>`, and
+`--inherit-permissions`. A refusal names the field, the refused value, the rule, and a recovery hint.
+
+These grants govern CompozyOS-native tools (`compozy__*`) only. The provider's own shell, file-edit,
+and search tools run under the child's provider sandbox and permission mode. A missing native grant
+is not a reason to stop using the provider's own tools for ordinary work in the child's checkout.
+What a missing grant forbids is using a filesystem or CLI path to reach the CompozyOS capability that
+was withheld, such as editing daemon state or calling `compozy` verbs on the withheld surface.
+When a worker should rely on its provider shell, say so in `prompt_overlay` or the first prompt.
+
+## Ask an existing session and wait for its reply
+
+## Ask an existing session and wait for its reply
+
+Use `compozy__session_prompt` with `notify_on_complete: true` when you need an answer from an
+existing session. Save `reply_watch.id`, finish the steps that do not need the answer, then end your
+turn and let the reply wake resume your work. The watch follows the message through queued or steered delivery, not an unrelated turn.
+Inspect `compozy__session_status.reply_watches` when diagnosing outstanding requests. While the target
+is live, your open watch is an `awaiting_reply` work signal, so you are not stopped for inactivity while
+you wait. An unanswered watch expires after `session.messaging.reply_watch_ttl` (24h by default) with
+the `expired` outcome. Once you end your turn you are idle, and an idle session is never stopped for
+inactivity; your runtime may be released and the reply rebinds it transparently. A stopped target
+keeps queued messages and their watches. If CompozyOS stopped you (restart, crash, or an inactivity
+stop of a hung turn), the reply resumes you; an operator stop waits for the operator's resume.
+Ask with `notify_on_complete` whenever you need the answer: without it nothing wakes you when the
+other session finishes.
+
+A child session (any session with a parent) that ends a turn on its own with no linked pull request,
+no open work signal (monitor, subagent, reply watch, task lease, Loop run, scheduled wait), no pending
+interaction, and no reply watch from you on that turn is marked `needs-attention` with
+`attention: "ended_early"` instead of `done`. The parent receives one wake with the child's final
+answer even when the child was created with `notify_creator: false`. Prompt the child to continue,
+or stop it; its next prompt clears the mark. Subagents report through `compozy__subagent_status`
+instead and are never marked.
+Read `references/native-tools.md` for reply outcomes and truncation. A reply is communication and does
+not confer a task claim, permission, or approval.
+
+## Subagents Versus Spawned Workers
+
+Use `compozy__subagent_delegate` when your current turn needs one self-contained answer or change
+from another agent, provider, or model: a second opinion, parallel research, a review round, or a
+bounded implementation slice. The subagent inherits your permission budget unless you narrow it, has
+no TTL, appears as a live card in your transcript, and wakes you with a pointer when it settles. Follow
+the protocol in `references/native-tools.md`: capabilities → delegate async → end turn → woken →
+`compozy__subagent_status` → answer.
+
+Use `compozy__session_spawn` for a long-lived governed worker that outlives your turn, needs an
+explicit TTL and governed permissions, or is driven by repeated `session_prompt` calls. Pass
+`worktree` or `new_worktree` to give the worker its own checkout, and `prompt` to send its first
+task with a reply watch in the same call. Use tasks when the work needs daemon-owned state, leases,
+review verdicts, or a scheduler.
+
+The two delegation paths have different limits. A spawned child counts against the parent's
+`max_children` (5 by default) and spawn depth (1), and has a TTL. Only live children
+(starting, active, or stopping) hold a slot: a stopped or TTL-reaped child frees it, and subagents
+never count. Read your own budget from the situation context `limits` section: `max_children`,
+`max_spawn_depth`, `governed_spawn_depth`, and `can_spawn_children` are the values the daemon
+enforces for you. Only spawned-type ancestors count toward depth, so a user session with a
+`--parent`, fork, or continue lineage has `governed_spawn_depth: 0` and can spawn even when its
+display `lineage.spawn_depth` is above 0; a spawned child cannot
+(`can_spawn_children: false`), so it delegates subagents instead. An exhausted budget fails with
+reason `spawn_budget_exhausted`, whose cause names the cap (`max_children`,
+`max_active_per_workspace`, or `max_depth`), its value, and the live count; stop a finished child
+to free a slot. Only coordinator sessions take their caps from `roles.coordinator.*` config. A subagent is bounded by
+the caller's active turn instead: no TTL, depth, or count cap. Pick spawn for a fleet of governed
+workers, and subagents for answers your current turn waits on.
+
+Subagents are not task authority. A subagent's result is evidence for your turn; it does not complete,
+claim, or review a task run. Subagents share your workspace and worktree by default, so concurrent
+shared subagents must use disjoint paths or read-only tasks. For independent code changes, delegate
+with `isolation: "worktree"`; see `references/worktrees.md` for bases, delivery and retention.
+
+## Catalog And Inbox Reads
+
+Use `compozy task list -o json`, HTTP/UDS `GET /api/tasks`, or native `compozy__task_list`. Loop execution records are excluded by default on every surface. Opt in with CLI `--include-loop`, HTTP/UDS or native `include_loop=true`; scope to one run with CLI `--loop-run <id>` or `loop_run_id`, which implies inclusion. Included catalog and single-task reads carry structured `loop` provenance; do not parse task IDs or titles. An explicit parent filter still returns that parent's children.
+
+Other filters cover scope/workspace, canonical status, priority, draft inclusion, approval state, owner kind/reference, parent task, title/identifier search, sort (`recent` or `priority`), cursor, and limit. All surfaces accept `worktree` to scope the catalog to tasks whose active run is bound to that worktree; the CLI flag is `--worktree`. CLI omits draft/approval filters, requires both owner fields together, and spells parent/search as `--parent`/`--query`; HTTP uses `workspace`/`query`, while native uses `workspace`/`search`.
+
+A bound session inherits its own workspace when the native task catalog target is omitted.
+An explicit foreign workspace must pass the shared workspace-access policy and then selects that
+workspace's records; it never falls back to the caller's inventory. The acting profile still owns
+the read scope. Native `global` and `all` scope remain operator-only for bound sessions.
+
+CLI `task publish`, `task start`, `task approve`, `task reject`, pause/resume/cancel, block/unblock,
+block listing and task recovery use the selected profile. The same selection applies to task
+update/delete, dependencies, run enqueue/start/attach/complete/fail/cancel/recover, fan-out,
+release, forced failure, retry, and review request/submit,
+including `--profile`, `COMPOZY_PROFILE`, and remembered selection. Use the task owner's profile;
+a foreign profile receives not found, just as it does for the detail read.
+
+Task inspection, update, start, publish and approval responses retain the owner's profile identity, including
+the returned run. Run start preserves that identity too. Dedicated and automatically activated
+task sessions belong to the task's profile; inspect them with that same profile selection.
+Scheduler backlog JSON labels both
+the task and run with the same profile ID, name, color and icon, including queued work frozen by
+an archived profile. Use `scheduler backlog --include-paused` to inspect that frozen work.
+
+Use `compozy task run list <task-id> -o json`, HTTP/UDS `GET /api/tasks/{id}/runs`, or native `compozy__task_run_list` for run history. All three filter by status, attached session, and limit; filtering happens before the limit is applied.
+
+Run payloads carry either an inline `result` or an external `result_ref` plus exact `result_bytes`.
+Read either form with `compozy__task_run_result`, CLI `compozy task run result <run-id>`, HTTP/UDS
+`GET /api/task-runs/{id}/result`, or Host API `tasks/runs/result`. Page by byte offset from
+`next_offset` until `eof`; the default and maximum page is 64 KiB. Structured pages carry base64.
+Join bytes before decoding UTF-8 text because a character may cross a page boundary. Missing,
+no-result, and foreign-workspace reads share not-found behavior.
+
+The catalog returns lean `tasks`, exact fully filtered `facets.statuses/owners`, and counted `page` (`total`, normalized `limit`, `has_more`, `next_cursor`). Canonical status is derived before filtering. Pages default to 50, cap at 200, and sort by latest durable activity or by priority then activity. Opaque cursors bind normalized scope, workspace, filters, and sort, but not limit; use task get/inspect for dependency, pause/block, and other rich detail omitted from list rows.
+
+The full actor inbox has no CLI or native tool; use HTTP/UDS `GET /api/observe/tasks/inbox`. It filters by scope/workspace, owner kind/reference, lane (`my_work`, `approvals`, `failed_runs`, `blocked`, `archived`), canonical status, priority, unread state, title/identifier query, cursor, and limit.
+
+Its `inbox` envelope contains `unread_total`, `archived_total`, lane `groups`, exact fully filtered status/priority `facets`, and counted `page`. The cut is global across lanes and orders unread first, then activity, priority, and ID: `groups[].count` and `unread_count` describe the complete filtered lane, while `items` contain only that lane's rows from the current page. The opaque cursor binds actor identity and normalized query, but not limit; pages default to 50 and cap at 200.
+
+## Task Inspection
+
+Use `compozy task inspect <id> -o json` before changing orchestration state when the next action is unclear. It accepts task ids with `task_` / `task-` prefixes and run ids with `run_` / `run-` prefixes. Unknown id formats return deterministic diagnostics instead of requiring guesswork.
+
+Use inspection to read task/run health, ownership, queue status, actor context, and suggested next action. Do not replace inspection with prompt text or UI state.
+
+`compozy task run show <run-id> -o json` includes the operational token/cost summary. Apply the status
+semantics in `runtime-operations.md`'s Usage cost truth section: estimates remain projections,
+`included`/`unknown` carry no amount, and incompatible aggregate provenance suppresses only money,
+not token totals.
+
+For web operators, task detail has **Overview**, **Runs**, and **Activity** views. Task-specific execution policy lives in the **Task setup** sheet; SSE resume state, and raw diagnostics live behind **Inspect**. The task stream emits standard SSE `message` frames; dispatch the parsed payload by its `type` field.
+
+## Task Pause, Resume, And Force Recovery
+
+`compozy task pause <task-id> --reason <reason>` pauses new runs for one task while current claims finish. `compozy task resume <task-id>` re-enables scheduler claims for that task. A pause reason is required and should name the operational cause, not a prompt-level preference.
+
+`compozy task release <run-id> [run-id...]` force releases claimed runs back to the queue without requiring the raw claim token. `compozy task fail <run-id> [run-id...] --reason <reason>` force fails queued or claimed runs as an operator recovery path. `compozy task fail <run-id> --error <message>` is the session-bound failure path for the current claimant; do not confuse it with forced failure.
+
+Forced recovery is authority-gated and rate-limited for agent actors. Treat denial, conflict, or rate-limit diagnostics as authoritative. Do not retry blindly and never ask another agent to reveal a raw claim token.
+
+For a non-leased run with an active session, direct `task run complete`, `task run fail`, and `task run cancel` actions are durable before CompozyOS stops the session. Final run state, task reconciliation, and the canonical event commit only after the stop succeeds. A `409` means a terminal action is already underway: inspect the run and wait instead of switching actions or retrying blindly. If the daemon restarts, it resumes the recorded action before ordinary run recovery. Session-bound leased runs continue to use the native autonomy tools or their token-fenced CLI equivalents.
+
+When the scheduler's convergence backstop cannot get a claimable run picked up, it parks the run as `needs_attention` — a non-claimable run status — and emits `task.run_needs_attention`. `compozy task run recover <run-id> [--reason <reason>] -o json` is the operator/agent recovery path: it terminalizes the parked run and queues a fresh linked child (`previous_run_id`, next attempt) for re-dispatch. Recover applies only to `needs_attention` runs; a still-queued or failed run returns a deterministic `task_run_not_recoverable` diagnostic (use `compozy task retry` for a failed run). This run-level recovery is distinct from task-level `compozy task recover <task-id>`, which clears a task escalated by the unblock-loop breaker (see Task Blocks And Escalation).
+
+For a Loop-owned worker, run-level recovery also advances the exact bound node cell to the linked
+child with the next attempt and epoch. It preserves the Loop run, workspace, designation, worktree,
+capability selectors, and node metadata; clears node attention; and emits the matching Loop
+attention-cleared and resumed events. A confirmed process crash follows the Loop's bounded
+death-resume path instead of generic task-run escalation.
+
+## Task Blocks And Escalation
+
+Declare _why_ a task cannot proceed with a typed block instead of leaving it silently stuck. Kinds are `needs_input` (waiting on a human or agent), `capability` (missing a skill, tool, or credential), and `transient` (a recoverable external failure, optionally self-expiring). Dependency waits, pending approval, and pause are not block kinds; they surface only in the read-only `blocked_reasons` projection on task read payloads.
+
+- `compozy task block <task-id> --kind <kind> --reason <reason> [--details <json>] [--expires-in <dur>] -o json` opens a block. `compozy task blocks <task-id> [--all] -o json` lists open (or all) blocks. `compozy task unblock <task-id> --block <block-id> [--note <note>] -o json` clears one block.
+- To block a task you are actively running, pass `--run-id <run-id> --as-agent` so CompozyOS resolves your active lease token server-side, records the block, and releases the lease in one atomic transaction. The run returns to `queued` with no attempt consumed.
+- Clearing the last blocking cause returns the task to `ready`. If the task opted into auto-enqueue, block-clear, transient-expiry, and approval-granted each enqueue the next run automatically through the same conservative one-open-run path as dependency completion.
+
+An automation that keeps clearing a block a worker keeps re-declaring is a thrash loop. CompozyOS counts same-kind re-blocks per task and, at `[autonomy].block_recurrence_limit` (default 2; 0 disables), escalates the task to a first-class `needs_attention` status that is excluded from claim selection. The counter resets only on successful task completion. `compozy task recover <task-id> [--note <note>] -o json` clears the escalation, records the actor, and re-admits an opted-in task to the claimable set. Recovering a non-escalated task is rejected as an invalid status transition. Do not loop clearing a block that immediately re-blocks — fix the underlying cause or hand the task to an operator.
+
+When an agent session creates a task, CompozyOS wakes that creator session on the child's terminal, blocked, and `needs_attention` transitions by default, delivering a synthetic queued turn (never an interrupt). This is the delegation feedback path — prefer it over polling. Opt a task out at create time with `compozy task create … --no-wake-creator`. Wake fires at most once per transition, is suppressed for a dead creator session and for a self-wake, and never carries a raw claim token; it is meaningful only for agent-created tasks.
+
+Governed child sessions have the parallel session-level feedback path. `compozy spawn` and
+`compozy__session_spawn` default `notify_creator` to true, then queue one sanitized synthetic turn on
+the parent when the child completes a turn, stops, fails, or enters a needs-you state. A canceled
+child turn sends no completed wake. When the parent holds an open reply watch on the child (a spawn
+`prompt`, or `session_prompt` with `notify_on_complete`), the reply wake carries the child's final
+answer and the bare completed wake is skipped. Otherwise the completed wake points at
+`compozy__session_history` for the answer; pass `type: "agent_message"` and the reply's `turn_id`
+to omit tool payloads. Use CLI
+`--no-notify-creator` or explicit `notify_creator: false` on the API/tool request for a child that
+must not wake its parent. The default is fixed in v1 and has no `config.toml` key. Delivery never
+interrupts the parent's active prompt, is suppressed when the parent is not live or the child would
+wake itself, and carries no raw interaction content or claim token.
+
+When you complete a run that created child tasks, list exactly the task ids you created this run in the completion's `created_task_ids`. CompozyOS verifies each id (exists, same workspace, created by your session) before the terminal write; a phantom or cross-session id rejects the completion and leaves your run running with its lease intact so you can correct the claim and complete again. Never claim tasks created by another session, and never fabricate task ids in the result prose — an advisory scan flags task-id-shaped tokens absent from the store.
+
+A parent task stays nonterminal while any direct child is not completed. The successful completion of the final direct child completes the parent exactly once and settles an eligible parent run parked in `needs_attention`; repeated or concurrent child completion delivery does not create another parent transition or wake. Failed or canceled children do not satisfy successful parent rollup, so recover or resolve those children according to their existing terminal-state contract.
+
+## Scheduler Controls
+
+`compozy scheduler status -o json` reports pause state, active claims, queued runs, and paused-task pressure. `compozy scheduler pause --reason <reason>` stops new dispatch while active claims continue. `compozy scheduler resume` reopens dispatch.
+
+`compozy scheduler drain` pauses dispatch and waits for active claims to finish. Its default timeout is `60s`; `--timeout` accepts whole-second durations from `0s` through `9223372036s`, and `0s` returns immediately after pausing. `compozy scheduler backlog --last 50 -o json` lists queued runs visible to dispatch; `--include-paused` includes runs blocked by task pause.
+
+Scheduler controls are daemon-wide. The active Web Dashboard refreshes externally changed pause
+state and backlog automatically. Run detail, inspection, history and result reads retain the selected
+profile; the explicit all-profiles view remains a separate read scope.
+Opening or reloading the Web app restores the remembered profile before reading work. A failure
+to recover that selection uses the route's Retry action rather than querying the default profile.
+
+Scheduler controls affect dispatch, not task truth. They do not complete work, approve reviews, or transfer ownership.
+
+A claimable run that no eligible session claims past `[autonomy.scheduler].min_queued_age` escalates on a bounded ladder: fan-out wake to every eligible session, then a capability-matched worker spawn, then the `task.run_starved` event (once), then `needs_attention`. Compatible sessions that are starting, prompting, already processing a run, or reserved for an earlier run in the same scheduler cycle are capacity, not absence. Their queued work remains queued without consuming the escalation budget; the daemon records `scheduler.capacity_waiting` diagnostics until capacity becomes available.
+
+`compozy scheduler status -o json` surfaces `starved_run_count` as the number of queued, claimable runs with an active durable escalation episode. Queue age alone does not increment it, and capacity-waiting runs remain visible through `queued_run_count`. `needs_attention_run_count` reports runs already parked by the ladder. The scheduler never claims — spawned `system` workers self-claim through the hosted `compozy__task_run_claim_next` tool and are TTL-reaped. Tune the ladder under `[autonomy.scheduler]`.
+
+## Coordinator Loop
+
+Use this guidance only inside a daemon-managed coordinator session.
+
+1. Read compozy me context or the provided task context bundle first.
+2. Identify task id, run id, workflow id, execution profile, review policy, and latest events.
+3. Inspect ambiguous task/run ids with `compozy task inspect <id> -o json` before routing.
+4. Break the objective into bounded worker prompts with acceptance criteria.
+5. Create child tasks only when durable task intent is needed. Creation alone is not execution.
+6. When the objective requires work to begin now, start each executable task through the task start path so CompozyOS enqueues a run and can route matching worker agents.
+7. Spawn or route only within daemon permissions and configured execution profile.
+8. Watch persisted task/run state rather than chat activity.
+9. Pause a task or scheduler only for real operational gating, then record the reason and planned resume condition.
+10. Request or route reviews through the daemon review path.
+11. On rejection, continue from persisted missing_work and next_round_guidance.
+
+Do not leave ready tasks idle after telling the operator that work has been orchestrated. Either start the task runs or report that the tasks were created but not started.
+
+When one task should run as several scoped sibling assignments, use the designated fan-out surface:
+
+    compozy task fan-out <task-id> --idempotency-key <stable-key> --designation "Inspect data path" --designation "Validate UI and docs" -o json
+
+Fan-out is bounded by `task.orchestration.designated_run_max`, and every sibling assignment must
+carry a non-empty designation and idempotency identity before CompozyOS enqueues any run. The CLI
+derives per-designation identities from the required `--idempotency-key`. Each sibling run gets a
+shared `designation_group_id` and one assignment brief. Read aggregated designation results from task detail JSON
+(`compozy task get <id> -o json`, field `designation_rollups`).
+
+Task execution profiles accept worktree modes `inherit`, `none`, `ref`, and `per_run`. Set only that
+block with `compozy task profile set-worktree <task-id> --mode <mode> [--ref <worktree>]` or
+`compozy__task_worktree_policy_set`; the dedicated mutation preserves the profile's other blocks. An
+enqueued run keeps its resolved policy even after later profile edits. A removed `ref` fails run start
+as `worktree_ref_invalid`; it never falls back to the workspace root. Add `--worktree-per-run` or
+`worktree_per_run: true` to fan-out when every sibling needs its own fresh worktree.
+
+For dependency DAGs, opt a dependent task into auto-enqueue so it starts on its own the moment its blockers finish: `compozy task create … --auto-enqueue-on-ready`, or toggle it on an assembled tree with `compozy task update <id> --auto-enqueue-on-ready` (`--auto-enqueue-on-ready=false` turns it off). When set, a blocking dependency completing and the task reaching `ready` enqueues exactly one run through the canonical path — no manual start. It is conservative by design: a failed or expired blocker never triggers it, paused dependents are skipped, and the open-run reservation guarantees one queued run even under concurrent blocker completions. Read the flag back from `compozy task inspect <id> -o json` (`auto_enqueue_on_ready`).
+
+Never spawn another coordinator unless the runtime explicitly supports that delegation. Never use prompt text as task ownership state.
+
+## Worker Loop
+
+Use this guidance only inside a worker session with an active task claim or while entering the session-bound claim loop.
+
+1. Inspect the agent context bundle before changing files.
+2. Confirm task id, run id, objective, acceptance criteria, lease status, and available task tools.
+3. Use the hosted task read tools when lease or run health is ambiguous.
+4. Claim the assigned run with `compozy__task_run_claim_next`, passing the runtime-provided `run_id` and any required capabilities. The tool also starts worker execution. If its returned `session_id` differs from this session, the run was transferred to a dedicated session; end this turn without doing task work. Do not use the CLI for session-bound lease operations.
+5. Keep the lease current with `compozy__task_run_heartbeat`.
+6. Complete, fail, or release only through `compozy__task_run_complete`, `compozy__task_run_fail`, or `compozy__task_run_release` from the same session.
+7. Include changed files, verification commands, and residual risks in the run summary.
+
+When a run includes a designation, follow only your own `designation.brief`; do not merge sibling
+assignments into your scope.
+
+Native task claims accept an explicit registered workspace ID, stable workspace ID, name, or path and select the same workspace work as the CLI/API. A denied cross-workspace claim includes the permission-mode guidance; do not retry without an operator policy change or applicable consent.
+
+The native tool scope supplies the caller session and workspace identity. A provider shell may intentionally omit daemon identity, so a CLI subprocess is not an equivalent claim path.
+
+Workspace-scoped worker and coordinator claims are bounded by
+`task.orchestration.max_active_runs_per_workspace` (default `16`; `0` disables). When capacity is
+full, the run stays queued and the native claim returns the typed reason `autonomy_workspace_capacity`.
+Wait for the next runtime wake instead of releasing
+an unrelated lease. Global task runs do not consume this workspace limit.
+
+Action nodes have no inherited duration limit. Only `timeout` or lifecycle deadlines written on the
+node bound execution time; the Loop silence window raises attention without canceling work.
+Session supervision independently stops a session whose in-flight turn stays silent after its
+evidence expires, once configured `stop_grace` elapses; idle sessions are never stopped for
+inactivity. After verified exit, owned task work consumes the next available attempt,
+preserving its task identity and linking the new run. Exhaustion becomes `needs_attention` with
+`supervised_silence_exhausted`; explicit cancellation is never retried. Recovered expired leases
+increment the run's `recovery_count`; once `attempt + recovery_count` reaches `max_attempts`, the run
+and task move to `needs_attention` with `lease_recovery_exhausted` instead of reclaiming forever.
+Inspect the run before retrying.
+
+## Reviewer Loop
+
+Use this guidance only when the daemon has bound the current session to an active review request. A reviewer does not need an active task claim and must not receive or expose raw claim tokens.
+
+Before deciding, read:
+
+1. Task objective and acceptance criteria.
+2. Terminal run status, result summary, error summary, and provenance.
+3. Relevant events, artifacts, changed files, and verification commands.
+4. Prior review history, continuation lineage, and current review_id.
+5. Coordinator notes or session discussion only as evidence.
+
+Inspect the target run with `compozy task inspect <run-id> -o json` when terminal status, verification evidence, or next action is ambiguous. Submit exactly one typed verdict through submit_run_review for the bound request. Use daemon-provided review_id, run_id, and delivery_id.
+
+## Review Verdicts
+
+Use outcomes honestly:
+
+- approved: the terminal run satisfies the objective and constraints with adequate verification.
+- rejected: work is incomplete or wrong and a continuation run should address bounded missing_work.
+- blocked: external information, credentials, environment, or policy blocks a fair verdict.
+- error: review execution failed in a way that invalidates the verdict.
+- timeout: review could not complete within the expected window.
+- invalid_output: run output is malformed, missing required evidence, or violates the expected contract.
+
+Rejected verdicts must include bounded missing_work and actionable next_round_guidance. Approval must not hide TODOs. Low confidence is not approval.
+
+## Communication Discipline
+
+Use task state and session surfaces for clarification and handoff. Include the run ID, state,
+blocker, next action, and relevant persisted IDs.
+
+If a direct room produced a conclusion, summarize back to the public thread without leaking private details or raw tokens.
+
+## Supervisor And Worker Messaging Protocol
+
+When a supervisor session dispatches workers (executors, children), keep messaging cheap and
+attributable.
+
+- Use `compozy__session_prompt` on both sides, never the CLI. Put the supervisor's session ID in the
+  worker briefing so the worker can report back.
+- Workers report milestones only: plan ready, blocked, PR opened, CI diagnosis, final result. They set
+  `supersede: true` on status updates so only the latest is delivered, and `notify_on_complete` only
+  when they need an answer.
+- The supervisor answers with `in_reply_to` set to the worker's `message_id`. Urgent corrections use
+  `mode: "steer"`; routine additions can be queued, and a long-running worker still receives them
+  through `session.messaging.queue_promote_after`.
+- Workers do not co-edit shared files such as `docs/_memory/change-impact.md`; impact notes go in the PR
+  body and the supervisor consolidates them.
+- A `message_rate_limited` or `message_hop_limit` error means too many messages or a forwarding chain,
+  not an outage: batch updates or ask the operator.
+
+## Safety
+
+Never print, store, forward, or summarize raw claim tokens, provider secrets, MCP credentials, OAuth material, or private provider state. Use redacted ids, hashes, task ids, run ids, review ids, event ids, and file paths.
+
+Workers do not approve their own work. Coordinators do not convert session replies into verdicts. Reviewers persist decisions only through the review tool.

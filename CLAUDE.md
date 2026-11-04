@@ -1,202 +1,71 @@
-# CLAUDE.md
+# CompozyOS
 
-This file provides project guidance for coding agents working in this repository.
+CompozyOS is a Go daemon managing ACP agents over JSON-RPC/stdio, SQLite state, HTTP/SSE, UDS, and a web UI. Capabilities must be extensible and manageable by agents through structured CLI/HTTP/UDS surfaces.
 
-## HIGH PRIORITY
+## Compatibility Policy
 
-- **IF YOU DON'T CHECK SKILLS** your task will be invalidated and we will generate rework
-- **YOU CAN ONLY** finish a task if `make verify` passes at 100% (runs `fmt + lint + test + build`). No exceptions — failing any of these commands means the task is **NOT COMPLETE**
-- **`make lint` has zero tolerance**. **Zero issues allowed** — any golangci-lint issue is a blocking failure
-- **ALWAYS** check dependent package APIs before writing integration code or tests to avoid writing wrong code
-- **NEVER** use workarounds — always use the `no-workarounds` skill for any fix/debug task + `testing-anti-patterns` for tests
-- **ALWAYS** use the `no-workarounds` and `systematic-debugging` skills when fixing bugs or complex issues
-- **NEVER** use web search tools to search local project code — for local code, use Grep/Glob instead
-- **YOU SHOULD NEVER** add dependencies by hand in `go.mod` — always use `go get` instead
+Real users run every release. Preserve the three regimes from SD-013 and L-040:
 
-## MANDATORY REQUIREMENTS
+- **User state:** SQLite, `config.toml`, workspace files, and persisted layouts upgrade losslessly; every shape change ships its migration. Data loss requires the user's recorded ADR sign-off and a release-note migration block.
+- **Public surfaces:** CLI verbs/flags/output, HTTP/UDS routes and DTOs, hooks, extension SDKs, config keys, and `compozy__*` IDs auto-migrate losslessly where possible; otherwise retain the old shape for one release after the replacement ships, warn with the replacement, then delete. Only surfaces documented `experimental` may break without that window.
+- **Internal code:** Go packages, `web/`, `@compozy/ui`, specs, RFCs, and `.compozy/tasks/*` rename every consumer together; delete obsolete code without aliases or legacy branches.
+- Compatibility translation belongs in boundary loaders/decoders/alias tables/migration SQL, with one shim generation and a named removal release. Breaking-change specs list delete targets and the regime of each. Read `docs/_memory/standing_directives.md` §SD-013 when designing a compatibility change; its planned gates are not implemented guarantees.
 
-- **MUST** run `make verify` before completing ANY subtask
-- **ALWAYS USE** the `golang-pro` skill before writing any Go code
-- **ALWAYS USE** the `systematic-debugging` + `no-workarounds` skills before fixing any bug
-- **ALWAYS USE** the `testing-anti-patterns` skill before writing or modifying tests
-- **ALWAYS USE** the `cy-final-verify` skill before claiming any task is done
-- **Skipping any verification check will result in IMMEDIATE TASK REJECTION**
+## Working Rules
 
-## Project Overview
+- Preserve unrelated work. Destructive Git (`restore`, `checkout`, `reset`, `clean`, `rm`, `stash`) requires explicit user permission.
+- Conversation in Brazilian Portuguese; code, docs, specs, commits, GitHub issues, and memory artifacts in English.
+- All file changes happen in a worktree and the root checkout stays clean. Gitignored runtime files such as spec directories under `.compozy/tasks` and `.compozy/work-log.md` live in the workspace root.
+- Use `go get` for Go dependencies and `bun add` for JS dependencies; generated files change through their owning generator.
+- Keep production source files cohesive and at most 500 lines; extract before growing an oversized file.
+- Before changing a test, identify its invariant, owning layer, and existing suite. Reuse that suite and suitable utilities. Add coverage for observable behavior; prose/CSS/config/snapshot assertions need an actual artifact contract without a stronger owning check. Fix production regressions without weakening tests.
+- Ask decisions as numbered `Q1 - a` questions: a plain question, a short why-it-matters summary without jargon, and lettered options with a recommended one (`cy-create-spec` `references/grill-protocol.md`).
+- Follow the user's authorized scope. Reuse current research, decisions, and verification; ask only when an unresolved decision blocks correct work. Avoid unrelated cleanup.
 
-Compozy is a Go module and CLI that drives the full lifecycle of AI-assisted development. It covers product ideation (PRD creation), technical specification, task breakdown with codebase-informed enrichment, and automated execution of each task via AI coding agents (Claude Code, Codex, Droid, Cursor). It also handles PR review remediation workflows.
+## Surface Instructions and Skills
 
-## Package Layout
+Read the relevant subtree instructions before working there:
 
-| Path                          | Responsibility                                                             |
-| ----------------------------- | -------------------------------------------------------------------------- |
-| `cmd/compozy`                 | Standalone CLI entry point                                                 |
-| `compozy.go`                  | Public Go API — `NewCommand()` embeds the CLI as a Cobra subcommand        |
-| `agents`                      | Bundled council agent definitions (embedded via `embed.go`)                |
-| `internal/cli`                | Cobra flags, interactive form collection, CLI glue                         |
-| `internal/core`               | Internal facade for reusable preparation and execution                     |
-| `internal/core/agent`         | IDE command validation and process command construction                    |
-| `internal/core/agents`        | Reusable agent discovery, validation, MCP merge, and catalog               |
-| `internal/core/extension`     | Extension manifest, discovery, lifecycle, Host API, review provider bridge |
-| `internal/core/kernel`        | Typed command dispatcher, handler registry, and legacy adapters            |
-| `internal/core/model`         | Shared runtime data structures                                             |
-| `internal/core/modelprovider` | Model provider alias discovery and resolution                              |
-| `internal/core/plan`          | Input discovery, filtering, grouping, and batch prep                       |
-| `internal/core/prompt`        | Thin prompt builders that emit runtime context and skill names             |
-| `internal/core/run`           | Execution pipeline, logging, shutdown, and Bubble Tea UI                   |
-| `internal/core/run/exec`      | Ad-hoc single-prompt execution pipeline with extension hooks               |
-| `internal/core/run/executor`  | Workflow execution engine, event streaming, and lifecycle                  |
-| `internal/core/run/journal`   | Durable append-before-publish event journal for run artifacts              |
-| `internal/core/provider`      | Review provider abstraction, overlay registry, and CodeRabbit adapter      |
-| `pkg/compozy/events`          | Public event envelope, kind constants, and documented payload API          |
-| `pkg/compozy/runs`            | Public run reader library for list/open/replay/tail/watch flows            |
-| `sdk/extension`               | Go SDK for extension authors (hooks, Host API, review providers)           |
-| `sdk/extension-sdk-ts`        | TypeScript SDK for extension authors                                       |
-| `skills`                      | Bundled installable skills (creation + execution workflows)                |
-| `.compozy/tasks`              | Default workflow artifact root (PRD, TechSpec, ADR, reviews)               |
-| `internal/version`            | Build metadata                                                             |
+| Surface                    | Instructions              |
+| -------------------------- | ------------------------- |
+| `cmd/compozy`, `internal/` | `internal/CLAUDE.md`      |
+| `web/`                     | `web/CLAUDE.md`           |
+| `packages/site`            | `packages/site/CLAUDE.md` |
+| `packages/ui`              | `packages/ui/CLAUDE.md`   |
 
-## Build & Development Commands
+Load a skill when the user names it or its procedure resolves a task-specific need; start with the owning skill.
 
-```bash
-# Full verification pipeline (BLOCKING GATE for any change)
-make verify              # Serial: fmt -> lint -> test -> build
+- Go conventions: `eng-code-guidelines`; Go tests: `eng-test-conventions`. Use `eng-consolidate-test-suites` when placement is unclear, and language/debugging references when the problem needs them.
+- SQLite changes: `eng-schema-migration`; wire changes: `eng-contract-codegen-coship`; authorization/pagination/cache boundaries: `eng-data-boundaries`.
+- Dispatching or supervising sessions, filing an issue, opening or updating a PR, handling review feedback or CI, or declaring work done: `eng-delivery`.
+- Specs: `cy-create-spec` owns authoring, `_slices.md`, and opt-in peer review; `docs/_memory/spec-authoring-playbook.md` owns Compozy compatibility, contract, and lesson rules. Reuse approved research.
+- Design-system/redesign: `eng-design`; visual-reference comparison: `eng-ui-screenshot`. Use additional design skills for the dimension being changed, and delegate design work when a suitable agent is available and useful.
+- Agent instruction edits: `writing-agents-md`; skill edits: `writing-skills`; incident lessons: `lesson-learned`.
+- Resolve bundled skill helpers from the skill's actual root, such as `.agents/skills/<skill>/scripts/`; never depend on an ambiguous working directory.
 
-# Individual steps
-make fmt                 # Format with gofmt
-make lint                # Strict golangci-lint (zero issues tolerance)
-make test                # Run tests with -race flag
-make build               # Compile binary
+## Verification and Delivery
 
-# Dependency management
-make deps                # Tidy and verify modules
-```
+Use the cheapest check that can expose the changed behavior. CI owns the delivery gates.
 
-## CRITICAL: Git Commands Restriction
+- `make gate`, `make gate-full`, repository-wide lint, full test or `-race` suites, and E2E run only in CI, unless the operator asks for that local run; concurrent local runs saturate the machine. Before commit/push, run focused tests and focused lint for what you changed, with zero warnings/errors.
+- PR delivery requires the CI checks named in `eng-delivery` green for the current head. Diagnose finished failures while other jobs run. A draft PR with pending/red checks remains in progress. Local full/E2E runs share a machine lock, so do not kill a queued run.
+- Frontend validation runs through Turborepo from the repo root, with affected-package filters during iteration. Package-local test/typecheck runs are not delivery evidence.
+- Commits: `<type>: <description>` with `feat|fix|refactor|perf|docs|test|build|ci`, no scopes. A failed pre-commit hook is repaired in a new commit, not an amend.
 
-- **ABSOLUTELY FORBIDDEN**: **NEVER** run `git restore`, `git checkout`, `git reset`, `git clean`, `git rm`, or any other git commands that modify or discard working directory changes **WITHOUT EXPLICIT USER PERMISSION**
-- **DATA LOSS RISK**: These commands can **PERMANENTLY LOSE CODE CHANGES** and cannot be easily recovered
-- **REQUIRED ACTION**: If you need to revert or discard changes, **YOU MUST ASK THE USER FIRST**
-- If the worktree contains unexpected edits, read them and work around them; do not revert them
+## Compozy Cross-Surface Impact Audit
 
-## Code Search and Discovery
+For behavior/contract changes, record the affected native tools, extensibility/hooks/config, workspace data isolation, and official skill (`skills/compozy/`), including Web/Docs impact. Use `docs/_memory/change-impact.md` once at the owning spec/task/PR; downstream tasks cite and update it rather than restating it. Editorial instruction changes may state `not applicable — editorial only`.
 
-- **TOOL HIERARCHY**: Use tools in this order:
-  1. **Grep** / **Glob** — preferred for local project code
-  2. **`find-docs` skill** — for external Go libraries and framework documentation
-  3. **Web search tools** — for web research, latest news, code examples
-- **FORBIDDEN**: Never use web search tools for local project code
+## QA
 
-## Coding Style
+Changed user-visible behavior updates the affected `docs/qa/scenarios/` files and verifies those scenarios before delivery. Spec delivery collects slice evidence and verifies remaining integration journeys once, after integration; slices flag affected scenarios.
 
-- Format with `make fmt` and lint with `make lint`.
-- Prefer explicit error returns with wrapped context using `fmt.Errorf("context: %w", err)`.
-- Use `errors.Is()` and `errors.As()` for error matching; do not compare error strings.
-- No `panic()` or `log.Fatal()` in production paths; reserve these for truly unrecoverable startup failures only.
-- Use `log/slog` for structured logging. Do not use `log.Printf` or `fmt.Println` for operational output.
-- Pass `context.Context` as the first argument to all functions crossing runtime boundaries; avoid `context.Background()` outside `main` and focused tests.
-- Design small, focused interfaces; accept interfaces, return structs.
-- Use functional options pattern for complex constructors.
-- Use compile-time interface verification: `var _ Interface = (*Type)(nil)`.
-- Do not use `interface{}`/`any` when a concrete type is known.
-- Do not use reflection without performance justification.
-- Keep comments short and focused on intent, invariants, or protocol edge cases.
+For release/scenario labs, use `eng-qa-bootstrap` and the applicable `qa-report`/`qa-execution` branches; the skill owns manifest, teardown, and `make qa-reap` semantics. Parallel labs require unique homes, ports, and sockets. Failed walks require repair and re-walk; only documented external/decision blockers may remain unverified.
 
-## Testing
+## Design, Copy, and Memory
 
-- Table-driven tests with subtests (`t.Run`) as the default pattern.
-- Use `t.Parallel()` for independent subtests.
-- Use `t.TempDir()` for filesystem isolation instead of manual temp directory management.
-- Mark test helper functions with `t.Helper()` so stack traces point to the caller.
-- Run tests with `-race` flag; the race detector must pass before committing.
-- Mock dependencies via interfaces, not test-only methods in production code.
-- Prefer root-cause fixes in failing tests over workarounds that mask the real issue.
+- **Compose `@compozy/ui` before writing a component.** The inventory is `packages/ui/src/index.ts` plus the `primitives.ts` and `exports/*.ts` files it re-exports. Decide in order: compose an existing primitive; a domain-prefixed variant only for behavior the primitive cannot express, since a prefixed or restyled copy is still a duplicate; a new generic primitive lands in `packages/ui` with story and test, migrating every callsite in the same change. `compozy-ui-reuse/no-shadow-ui-primitive` catches same-name shadows only. Rationale: L-031 in `docs/_memory/lessons/`.
+- `packages/ui/src/tokens.css` and generated `DESIGN.md` own visual values; regenerate tokens with `make codegen`, never edit generated regions. Runtime truth owns content and controls; named references own visual language.
+- Read `COPY.md` for product-facing text and `docs/_memory/glossary.md` for domain naming. Add supporting UI copy only when requested or needed to prevent error.
 
-## Architecture
-
-### Concurrency discipline
-
-- Every goroutine must have explicit ownership and shutdown via `context.Context` cancellation.
-- No fire-and-forget goroutines; track all goroutines with `sync.WaitGroup` or equivalent.
-- Use `select` with `ctx.Done()` in all long-running goroutine loops.
-- Prefer channel-based communication over shared memory with mutexes when practical.
-- Use `sync.RWMutex` for read-heavy shared state, `sync.Mutex` for write-heavy.
-
-### Runtime discipline
-
-- Keep the system single-binary and local-first.
-- Introduce sidecars or external control planes only with a written techspec.
-- Keep execution paths deterministic and observable.
-
-## Agent Skill Dispatch Protocol
-
-Every agent MUST follow this protocol before writing code:
-
-### Step 1: Identify Task Domain
-
-Scan the task description and target files to determine which domains are involved:
-
-- **Go / Runtime** keywords: package, struct, interface, goroutine, channel, context, slog, functional options, constructor, error handling
-- **Config** keywords: config, TOML, environment, validation, settings
-- **Logging** keywords: logger, logging, slog, log level, observer
-- **Bug fix** keywords: bug, fix, error, failure, crash, unexpected, broken, regression
-- **Writing tests** keywords: test, spec, mock, stub, fixture, assertion, coverage, table-driven
-- **Task completion** keywords: done, complete, finished, ship
-- **Architecture audit** keywords: architecture, dead code, code smell, anti-pattern, duplication
-- **Creative / new features** keywords: new, feature, design, add, create, implement
-- **Frontend / React** keywords: react, component, jsx, tsx, hook, props, state, render, virtual DOM
-- **Frontend stack** keywords: shadcn, tailwind, tanstack, router, query, vitest, storybook, zod, zustand, vite, ai-sdk
-- **TypeScript** keywords: typescript, type, generic, interface, utility type, tsx, ts
-- **UI / UX design** keywords: design, layout, spacing, typography, color, visual, hierarchy, mockup, interface, minimalist, redesign, logo, brand
-
-### Step 2: Activate All Matching Skills
-
-Use the `Skill` tool to activate every skill that matches the identified domains:
-
-| Domain                  | Required Skills                                                                 | Conditional Skills                                                                   |
-| ----------------------- | ------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------ |
-| Go / Runtime            | `golang-pro`                                                                    | `find-docs`                                                                          |
-| Config                  | `golang-pro`                                                                    |                                                                                      |
-| Logging                 | `golang-pro`                                                                    |                                                                                      |
-| Bug fix                 | `systematic-debugging` + `no-workarounds`                                       | `testing-anti-patterns`                                                              |
-| Writing tests           | `testing-anti-patterns` + `golang-pro`                                          | `vitest` (frontend)                                                                  |
-| Task completion         | `cy-final-verify`                                                               |                                                                                      |
-| Architecture audit      | `architectural-analysis`                                                        | `adversarial-review`                                                                 |
-| Creative / new features | `brainstorming`                                                                 |                                                                                      |
-| Git rebase/conflicts    | `git-rebase`                                                                    |                                                                                      |
-| Frontend / React        | `react` + `typescript-advanced`                                                 | `vercel-react-best-practices`, `vercel-composition-patterns`, `app-renderer-systems` |
-| shadcn / Tailwind UI    | `shadcn` + `shadcn-ui` + `tailwindcss`                                          | `storybook-stories`                                                                  |
-| TanStack stack          | `tanstack` + `tanstack-query-best-practices` + `tanstack-router-best-practices` | `tanstack-start-best-practices`                                                      |
-| Frontend state / schema | `zustand` + `zod`                                                               |                                                                                      |
-| Frontend testing        | `vitest` + `testing-anti-patterns`                                              | `storybook-stories`                                                                  |
-| AI-powered UI           | `ai-sdk`                                                                        | `react`                                                                              |
-| UI / UX design          | `frontend-design` + `design-taste-frontend` + `interface-design`                | `minimalist-ui`, `redesign-existing-projects`, `tech-logos`, `ubs`                   |
-
-### Step 3: Verify Before Completion
-
-Before any agent marks a task as complete:
-
-1. Activate `cy-final-verify` skill
-2. Run `make verify`
-3. Read and verify the full output — no skipping
-4. Only then claim completion
-
-## Anti-Patterns for Agents
-
-**NEVER do these:**
-
-1. **Skip skill activation** because "it's a small change" — every domain change requires its skill
-2. **Activate only one skill** when the code touches multiple domains
-3. **Forget `cy-final-verify`** before marking tasks done
-4. **Write tests without `testing-anti-patterns`** — leads to mock-testing-mocks and production pollution
-5. **Fix bugs without `systematic-debugging`** — leads to symptom-patching instead of root cause fixes
-6. **Apply workarounds without `no-workarounds`** — type assertions, lint suppressions, error swallowing are rejected
-7. **Claim task is done when any check has warnings or errors** — zero warnings, zero errors. No exceptions
-8. **Add dependencies by hand in go.mod** — always use `go get`
-9. **Use web search tools for local code** — only for external library documentation
-10. **Run destructive git commands without permission** — `git restore`, `git reset`, `git clean` require explicit user approval
-11. **Use `panic()` or `log.Fatal()` in production handlers** — leads to unrecoverable crashes without cleanup
-12. **Fire-and-forget goroutines** — every goroutine must have explicit ownership and shutdown handling
-13. **Use `time.Sleep()` in orchestration** — use proper synchronization primitives instead
-14. **Ignore errors with `_`** — every error must be handled or have a written justification
-15. **Hardcode configuration** — use TOML config or functional options
+Read the matching entry in `docs/_memory/lessons/README.md` for an incident class, and applicable standing directives for design decisions. Lessons explain evidence and scoped constraints; historical process descriptions do not add new mandatory stages. Spec authoring uses `docs/_memory/spec-authoring-playbook.md`.

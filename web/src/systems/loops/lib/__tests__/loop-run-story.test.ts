@@ -1,0 +1,133 @@
+import { describe, expect, it } from "vitest";
+
+import type { LoopTimelineEntry } from "../../types";
+// Straight from the module that owns it; the retired story projection only
+// re-exported it.
+import { humanizeLoopNodeId } from "../loop-node-labels";
+import { buildStoryBeats } from "../loop-run-story-beats";
+
+describe("humanizeLoopNodeId", () => {
+  it("Should collapse mixed separators, trim edges, and space snake and kebab ids", () => {
+    expect(humanizeLoopNodeId("fix_batches")).toBe("fix batches");
+    expect(humanizeLoopNodeId("archive-event")).toBe("archive event");
+    // Consecutive and mixed separators collapse to a single space.
+    expect(humanizeLoopNodeId("fix__batches")).toBe("fix batches");
+    expect(humanizeLoopNodeId("resolve-_review__threads")).toBe("resolve review threads");
+    // Leading and trailing separators are trimmed, not rendered as gaps.
+    expect(humanizeLoopNodeId("_watch_pr_")).toBe("watch pr");
+  });
+});
+
+// The durable story: the paged timeline that survives a reload, where the daemon
+// has already written each title and the client's job is register and arithmetic.
+// The live SSE narration this file used to cover left with the cockpit that read
+// it — nothing renders a client-built story any more.
+describe("buildStoryBeats", () => {
+  function entry(overrides: Partial<LoopTimelineEntry> & Pick<LoopTimelineEntry, "seq" | "kind">) {
+    return {
+      at: "2026-08-19T18:43:38Z",
+      title: "",
+      ...overrides,
+    } as LoopTimelineEntry;
+  }
+
+  // UT-044
+  it("Should render the served meaning title and never leak the event kind", () => {
+    const [beat] = buildStoryBeats([
+      entry({
+        seq: 84,
+        kind: "node_failed",
+        node_id: "revisor-perf",
+        generation: 1,
+        attempt: 3,
+        title: "step revisor-perf failed",
+      }),
+    ]);
+
+    expect(beat.title).toBe("step revisor-perf failed");
+    expect(beat.title).not.toContain("node_failed");
+    expect(beat.tone).toBe("destructive");
+    expect(beat.icon).toBe("node-failed");
+    // The attempt rides along as metadata; it is not a beat of its own.
+    expect(beat.attemptLabel).toBe("attempt 3");
+    expect(beat.count).toBe(1);
+  });
+
+  it("Should write a plain sentence rather than print the kind when a title is missing", () => {
+    // Whitespace, not an empty string: an implementation that stopped trimming
+    // would still pass the falsy case while leaking a blank title.
+    const [beat] = buildStoryBeats([entry({ seq: 12, kind: "node_quarantined", title: "   " })]);
+    // Vague but honest beats mechanical and precise: an operator reading
+    // "node_quarantined" has been handed the wire, not the story.
+    expect(beat.title).toBe("A step was quarantined");
+    expect(beat.title).not.toContain("_");
+  });
+
+  it("Should fold a coalesced heartbeat run into one beat carrying its count", () => {
+    const [beat] = buildStoryBeats([
+      entry({ seq: 220, first_seq: 79, kind: "token_tick", title: "progress heartbeats" }),
+    ]);
+
+    // 79..220 inclusive. The count is the span, so resuming after seq 220 skips
+    // every folded event instead of replaying 142 of them.
+    expect(beat.count).toBe(142);
+    expect(beat.firstSeq).toBe(79);
+    expect(beat.seq).toBe(220);
+  });
+
+  it("Should order beats newest first and keep one beat per sequence", () => {
+    const beats = buildStoryBeats([
+      entry({ seq: 84, kind: "node_succeeded", title: "step revisor-estilo succeeded" }),
+      entry({ seq: 90, kind: "gate_verdict", title: "gate approved" }),
+      // The seam between the durable page and the live stream overlaps by
+      // design; the same sequence arriving twice must still be one beat — and
+      // the later writer wins, because a live frame is fresher than the page
+      // that preceded it.
+      entry({ seq: 90, kind: "gate_verdict", title: "gate approved after refresh" }),
+    ]);
+
+    expect(beats.map(beat => beat.seq)).toEqual([90, 84]);
+    expect(beats[0].title).toBe("gate approved after refresh");
+  });
+
+  it("Should carry a fork beat in the informational register", () => {
+    const [beat] = buildStoryBeats([
+      entry({ seq: 1, kind: "run_forked", title: "forked from round 1 of an earlier run" }),
+    ]);
+    expect(beat.icon).toBe("forked");
+    expect(beat.tone).toBe("info");
+  });
+
+  // US-009.EC-3: the story records the fork point AND links the related run. The
+  // timeline entry does not carry that id — the branch is recorded on the run —
+  // so the round is what ties a beat to one side of the run's own lineage.
+  it("Should resolve a fork beat's related run from the run's lineage by round", () => {
+    const lineage = {
+      forkedFrom: { run_id: "r-parent", generation: 1 },
+      forks: [{ run_id: "r-child", generation: 3 }],
+    };
+    const beats = buildStoryBeats(
+      [
+        entry({ seq: 9, kind: "run_forked", generation: 3 }),
+        entry({ seq: 4, kind: "run_forked", generation: 1 }),
+        // A round with no fork on either side of the lineage.
+        entry({ seq: 2, kind: "run_forked", generation: 2 }),
+        // Not a fork at all: lineage must not leak onto ordinary beats.
+        entry({ seq: 1, kind: "node_succeeded", generation: 1 }),
+      ],
+      lineage
+    );
+    const bySeq = new Map(beats.map(beat => [beat.seq, beat]));
+    expect(bySeq.get(9)?.relatedRunId).toBe("r-child");
+    expect(bySeq.get(4)?.relatedRunId).toBe("r-parent");
+    // No match is no link. A fork beat pointing at a guessed run is worse than
+    // one that only names the fork.
+    expect(bySeq.get(2)?.relatedRunId).toBeNull();
+    expect(bySeq.get(1)?.relatedRunId).toBeNull();
+  });
+
+  it("Should leave fork beats unlinked when the run has no lineage to resolve", () => {
+    const [beat] = buildStoryBeats([entry({ seq: 1, kind: "run_forked", generation: 1 })]);
+    expect(beat.relatedRunId).toBeNull();
+  });
+});

@@ -1,0 +1,41 @@
+package daemon
+
+import (
+	"context"
+	"database/sql"
+	"fmt"
+
+	"github.com/compozy/compozy/internal/api/core"
+	"github.com/compozy/compozy/internal/store"
+	"github.com/compozy/compozy/internal/store/globaldb"
+)
+
+type daemonSchemaStreamStatusReader struct {
+	db *sql.DB
+}
+
+var _ core.SchemaStreamStatusReader = (*daemonSchemaStreamStatusReader)(nil)
+
+func newDaemonSchemaStreamStatusReader(registry Registry) core.SchemaStreamStatusReader {
+	if source, ok := registry.(core.SchemaStreamStatusReader); ok {
+		return source
+	}
+	source, ok := registry.(extensionDBSource)
+	if !ok {
+		return nil
+	}
+	return &daemonSchemaStreamStatusReader{db: source.ReadDB()}
+}
+
+func (r *daemonSchemaStreamStatusReader) SchemaStreamStatuses(ctx context.Context) ([]store.StreamStatus, error) {
+	streams := []store.MigrationStream{globaldb.MigrationStream()}
+	statuses := make([]store.StreamStatus, 0, len(streams))
+	for _, stream := range streams {
+		status, err := store.Status(ctx, r.db, stream)
+		if err != nil {
+			return nil, fmt.Errorf("daemon: read migration stream %q status: %w", stream.Name, err)
+		}
+		statuses = append(statuses, status)
+	}
+	return statuses, nil
+}

@@ -1,0 +1,36 @@
+# Open Design prototypes
+
+HTML prototypes and design handoffs for Compozy web surfaces. Organized by product domain.
+
+New design work should prefer gallery prototypes over HTML boards: see [`../prototyping.md`](../prototyping.md).
+
+**Canonical design system:** [`design-system/`](design-system/) — start at [`GUIDE.md`](design-system/GUIDE.md) / [`index.html`](design-system/index.html). On conflict: production (`packages/ui` + `web/`) > `design-system/` > older prototypes.
+
+| Domain | Path | Primary entry |
+| --- | --- | --- |
+| Design system | [`design-system/`](design-system/) | [`design-system/index.html`](design-system/index.html) |
+| Landing (compozy.com) | [`landing/`](landing/) | [`landing/landing-page.html`](landing/landing-page.html) · notes [`DESIGN-NOTES.md`](landing/DESIGN-NOTES.md) |
+| Modals | [`modals/`](modals/) | [`modals/index.html`](modals/index.html) · contract [`MODAL-STANDARD.md`](modals/MODAL-STANDARD.md) |
+| OS shell | [`os/`](os/) | [`os/compozy-os-v2.html`](os/compozy-os-v2.html) |
+| Dashboard | [`dashboard/`](dashboard/) | [`dashboard/dashboard.html`](dashboard/dashboard.html) |
+| Tasks | [`tasks/`](tasks/) | [`tasks/task-detail.html`](tasks/task-detail.html) |
+| Settings | [`settings/`](settings/) | [`settings/settings-general.html`](settings/settings-general.html) |
+| Electron shell updates | [`electron-shell/`](electron-shell/) | [`electron-shell/index.html`](electron-shell/index.html) |
+| Loops (active) | [`loops/`](loops/) | [`loops/index.html`](loops/index.html) · final pages + labs |
+| Loop graph | [`graph-eng/`](graph-eng/) | [`graph-eng/index.html`](graph-eng/index.html) |
+| Command palette | [`command-palette/`](command-palette/) | [`command-palette/index.html`](command-palette/index.html) |
+| Profiles | [`profiles/`](profiles/) | [`profiles/index.html`](profiles/index.html) · contract [`DESIGN-NOTES.md`](profiles/DESIGN-NOTES.md) |
+| Sessions stability (active) | [`sessions-stability/`](sessions-stability/) | [`sessions-stability/index.html`](sessions-stability/index.html) · contract [`DESIGN-NOTES.md`](sessions-stability/DESIGN-NOTES.md) |
+| Marketplace catalog (active · for approval) | [`marketplace-catalog/`](marketplace-catalog/) | [`marketplace-catalog/index.html`](marketplace-catalog/index.html) · contract [`DESIGN-NOTES.md`](marketplace-catalog/DESIGN-NOTES.md) |
+| Session context (active · for approval) | [`session-context/`](session-context/) | [`session-context/index.html`](session-context/index.html) · contract [`DESIGN-NOTES.md`](session-context/DESIGN-NOTES.md) |
+| Session continue & fork (active · for approval) | [`session-continue-fork/`](session-continue-fork/) | [`session-continue-fork/index.html`](session-continue-fork/index.html) · contract [`DESIGN-NOTES.md`](session-continue-fork/DESIGN-NOTES.md) |
+| Sessions bulk actions (active · for approval) | [`sessions-bulk-actions/`](sessions-bulk-actions/) | [`sessions-bulk-actions/index.html`](sessions-bulk-actions/index.html) · single board, contract block inline |
+| Sessions Kanban (active · for approval) | [`sessions-kanban/`](sessions-kanban/) | [`sessions-kanban/index.html`](sessions-kanban/index.html) · single board, contract block inline · spec `.compozy/tasks/sessions-kanban` |
+| Session (retired → `_done/session/`) | [`_done/session/`](_done/session/) | [`_done/session/index.html`](_done/session/index.html) · spec [`SESSION-REDESIGN-SPEC.md`](_done/session/SESSION-REDESIGN-SPEC.md) |
+| Systems (vault) | [`systems/`](systems/) | [`systems/vault.html`](systems/vault.html) |
+| Shipped archives | [`_done/`](_done/) | agents · loops · marketplace · shell |
+
+Tooling (not product surfaces):
+
+- [`.od-skills/`](.od-skills/) — Open Design skill assets
+- [`plugin-source/`](plugin-source/) — imported plugin/skill sources

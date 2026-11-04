@@ -1,0 +1,88 @@
+package daemon
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"strings"
+	"time"
+
+	settingspkg "github.com/compozy/compozy/internal/settings"
+)
+
+func (d *Daemon) bootSettings(ctx context.Context, state *bootState) error {
+	if state == nil {
+		return errors.New("daemon: boot settings state is required")
+	}
+
+	surface, err := newSettingsRuntimeSurface(d, state)
+	if err != nil {
+		return fmt.Errorf("daemon: create settings runtime surface: %w", err)
+	}
+	var applyRecords settingspkg.ApplyRecordStore
+	if dbSource, ok := state.registry.(settingspkg.ApplyRecordDBSource); ok {
+		applyRecords = settingspkg.NewConfigApplyRecordRepository(
+			dbSource.DB(),
+			time.Now,
+			settingspkg.WithConfigApplyReadDB(dbSource.ReadDB()),
+		)
+	}
+	scopeRevisions, ok := state.registry.(settingspkg.ShellScopeRevisionStore)
+	if !ok {
+		return errors.New("daemon: shell scope revision store is required")
+	}
+	service, err := settingspkg.NewService(d.homePaths, settingspkg.Dependencies{
+		WorkspaceResolver:       state.workspaceResolver,
+		ProfileResolver:         state.profiles,
+		AttentionWorkspaceMutes: state.registry,
+		ShellScopeRevisions:     scopeRevisions,
+		GeneralRuntime:          surface,
+		SkillsRuntime:           state.skillsRegistry,
+		AutomationRuntime:       surface,
+		ObservabilityRuntime:    surface,
+		Extensions:              surface,
+		TransportParity:         surface,
+		CmdPalette:              state.cmdPalette,
+		MCPAuth:                 surface,
+		MCPRuntime:              surface,
+		MCPExtensions:           settingsMCPExtensionDefinitions{state: state},
+		MCPExtensionManagement:  settingsMCPExtensionDefinitions{state: state, auth: surface},
+		MCPDefinitionRetirer:    state.mcpToolProvider,
+		ModelCatalog:            state.modelCatalog,
+		ProviderAuthVerdicts:    d.providerAuthVerdicts,
+		RuntimeApplier: daemonSettingsRuntimeApplier{
+			daemon: d,
+			state:  state,
+		},
+		ProviderSecrets:        settingsProviderVaultDependency(state.providerVault),
+		EventSummaries:         state.registry,
+		ApplyRecords:           applyRecords,
+		RestartActionAvailable: true,
+		LogTailAvailable:       strings.TrimSpace(d.homePaths.LogFile) != "",
+	})
+	if err != nil {
+		return fmt.Errorf("daemon: create settings service: %w", err)
+	}
+	if applyRecords != nil {
+		if _, err := service.Reload(settingspkg.WithMutationSource(ctx, "boot")); err != nil {
+			return fmt.Errorf("daemon: reconcile desired config with active generation: %w", err)
+		}
+	}
+
+	updateManager, err := newSettingsUpdateManager(d, state.logger)
+	if err != nil {
+		return fmt.Errorf("daemon: create settings update manager: %w", err)
+	}
+	if err := updateManager.PrimeInstallDetection(ctx); err != nil {
+		return fmt.Errorf("daemon: detect settings update install method: %w", err)
+	}
+
+	if extensions, ok := state.deps.Extensions.(*daemonExtensionService); ok && extensions.mcpDetails != nil {
+		extensions.mcpDetails.auth = surface
+	}
+	state.deps.Settings = service
+	state.deps.SettingsRestart = settingsRestartController{daemon: d}
+	state.deps.SettingsUpdate = newSettingsUpdateController(d, updateManager)
+	state.updateManager = updateManager
+	return nil
+}

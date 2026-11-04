@@ -1,0 +1,740 @@
+---
+title: Migration guide
+description: Breaking-change migration guidance for current CompozyOS releases and the v0.2.15 to v0.3 transition.
+---
+
+# CompozyOS Migration Guide
+
+v0.4.0 is the first stable CompozyOS release. It follows the v0.3.0 beta line, and Homebrew and npm `latest` move from v0.2.15 to v0.4.0.
+
+- **From v0.5.0:** update in place, then follow [Stays on is now Always-on](#always-on-vocabulary) before v0.5.2.
+- **From any v0.3.0 beta:** update in place from the app's Update action or with `compozy update`; no reinstall is needed. The first start applies [User scope and All projects](#user-scope-and-all-projects). Before that, follow [Memory removal](#memory-removal), then [Networks, Bridges, and Sandbox removal](#networks-bridges-and-sandbox-removal), if you are upgrading from a beta that predates them.
+- **From v0.2:** v0.2 has reached end of life and receives no further releases. The numbered sections below describe the v0.2.15 clean-state transition.
+
+CompozyOS v0.3 is a hard cut, not an in-place compatibility release. It keeps the `compozy` binary
+and the `.compozy/tasks/` task format, but replaces the workflow runner with a daemon-owned
+environment for creating, automating, and supervising agent work. Runtime databases, command names,
+extension contracts, and review behavior do not carry forward automatically.
+
+This guide uses v0.2.15 (`8f8908afd70c731b815e20282bacad05aa026827`) as the legacy baseline.
+Back up your global and workspace `.compozy/` directories before changing installations.
+
+<a id="always-on-vocabulary"></a>
+
+## Stays on is now Always-on (v0.5.1)
+
+v0.5.1 upgrades in place. The agent kind `stays_on` is now `always_on`, and the app reads
+"Always-on" and "On-demand". Every v0.5.0 file, config table, request value, and stored row keeps
+working through v0.5.1; readers of emitted `kind`, reason, and error values must update now. Update
+the inputs before v0.5.2, which removes every alias below. Update the daemon and the
+CLI together: a v0.5.1 CLI sends `always_on`, which a v0.5.0 daemon rejects.
+
+| v0.5.0                                                        | v0.5.1                                     | Through v0.5.1                                                                                                                                                                                                                                         |
+| ------------------------------------------------------------- | ------------------------------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| AGENT.md `kind: stays_on`                                     | `kind: always_on`                          | Accepted with a daemon warning. Files under `$COMPOZY_HOME/agents` and `$COMPOZY_HOME/profiles/<p>/agents` are rewritten at boot                                                                                                                       |
+| `[agents.stays_on]` and `agents.stays_on.*` config paths      | `[agents.always_on]`, `agents.always_on.*` | Read with a warning; `agents.always_on` wins per key                                                                                                                                                                                                   |
+| `--kind stays_on`, request `kind: "stays_on"`                 | `always_on`                                | Accepted with a warning                                                                                                                                                                                                                                |
+| Emitted `kind: "stays_on"` in responses, events, and the SDKs | `kind: "always_on"`                        | Changed at once. Readers that compare `stays_on` break                                                                                                                                                                                                 |
+| Reason `definition_not_stays_on`                              | `definition_not_always_on`                 | Changed at once in the instance `pause_reason`, the instance check `gate` (`compozy agent instance check`, `compozy__agent_instance_check`), the check-in history `reason`, and the `agent.instance.*` hook payload `reason`; stored rows are migrated |
+| Error `agent_not_stays_on`                                    | `agent_not_always_on`                      | Changed at once. The experimental memory routes have no window                                                                                                                                                                                         |
+| Startup section `stays_on_doctrine`                           | `always_on_doctrine`                       | Changed at once                                                                                                                                                                                                                                        |
+
+AGENT.md files in a repository, a workspace profile, or an extension are never rewritten. Change
+`kind: stays_on` to `kind: always_on` in them yourself; the daemon log names each file it reads
+through the alias.
+
+The permission labels in the app also changed. The values did not, so nothing needs editing:
+**Accept edits** (`approve-edits`), **Auto-review** (`auto`), and **Full access** (`approve-all`).
+
+<a id="spec-cycle-simplification"></a>
+
+## Spec delivery moves from Loops to agents
+
+This release upgrades in place, with no manual step. The daemon starts normally, nothing under
+`~/.compozy` needs deleting, and no file under `.compozy/tasks` changes. The `spec-cycle` extension now
+ships 4 agents and 2 skills, with no Loops and no tools. Older sections of this guide name these
+resources as they existed then.
+
+| Removed                                                                             | Use instead                               |
+| ----------------------------------------------------------------------------------- | ----------------------------------------- |
+| Loop `implement-tasks`                                                              | Agent `spec_conductor`                    |
+| Loop `review-and-fix`                                                               | Agent `reviewer`, then `code_implementer` |
+| Agent `review_fixer`                                                                | Agent `code_implementer`                  |
+| `ext__spec_cycle__import_tasks`                                                     | `_slices.md` read by `spec_conductor`     |
+| `ext__spec_cycle__write_review_artifacts`, `ext__spec_cycle__finalize_review_round` | Agent `reviewer` findings file            |
+| Skill `cy-create-tasks`                                                             | `_slices.md` in `cy-create-spec`          |
+| Skills `cy-execute-task`, `cy-final-verify`, `cy-workflow-memory`                   | Agent `code_implementer`                  |
+| Skill `cy-orchestrate-tasks`                                                        | Agent `spec_conductor`                    |
+| Skills `cy-review-round`, `cy-fix-reviews`                                          | Agents `reviewer` and `code_implementer`  |
+
+Deliver a spec by starting `spec_conductor`:
+
+```bash
+compozy session new --agent spec_conductor --workspace acme --name "Deliver billing-export"
+compozy session prompt <session-id> "Deliver .compozy/tasks/billing-export"
+```
+
+Hand small work to the always-on `orchestrator`:
+
+```bash
+compozy agent instance create orchestrator --workspace acme
+compozy session prompt <main-session-id> "Fix the login redirect on expired sessions"
+```
+
+### What happens to saved references
+
+- **Automations and sessions stay.** An automation that targets a removed Loop or agent stays saved, and
+  its own run fails with a clear error. Sessions on a removed agent stay readable, and resuming one
+  fails with a clear error.
+- **Loop overrides stay.** A stored override for a removed Loop is kept and never read.
+- **Removed Loop runs stop.** A run of a removed Loop that is active during the upgrade fails at its first removed step with a clear error. Its history stays, and other runs are unaffected.
+- **Same-name workspace Loops keep working.** Only the bundled definitions left.
+- **Always-on instances pause.** An instance of a removed agent pauses as `definition_missing`.
+- **Batuta leaves the catalog.** An installed copy keeps loading, and only `batuta-deliver` fails when
+  run.
+
+Running a removed Loop, starting a session with a removed agent, or calling a removed tool fails
+with a not found error.
+
+<a id="user-scope-and-all-projects"></a>
+
+## User scope and All projects (v0.4.0)
+
+v0.4.0 upgrades in place. Nothing needs editing by hand and no data is deleted. Stop the daemon and
+back up `COMPOZY_HOME` (including `compozy.db`, its SQLite sidecars, and `workspaces/`) before the
+first start, as for any release.
+
+### What the first start changes
+
+- **The hidden `COMPOZY_HOME` project becomes User.** Earlier releases ran personal tasks,
+  automations, Loop judges, and managed Goals inside a hidden project registered at `COMPOZY_HOME`
+  (usually `~/.compozy`). The upgrade moves that work, and any leftover home-folder registration, into
+  the User scope of each profile that owns it. Session identities and creation stamps are unchanged.
+  Terminal history and retained recordings are copied per profile and verified before the old journal
+  folder is renamed with a `.migrated` suffix. Desktop layouts are copied when no User layout exists.
+  The hidden project is removed only after every store reports completion and no table still
+  references it. An interrupted upgrade resumes on the next start.
+- **Exceptions stay projects.** A hidden project that has worktrees, or that a Loop-targeting
+  automation points at, stays an ordinary project (`keep_project`, logged once). Reach it by its ID or
+  name.
+- **Nothing is dropped.** Rows that cannot move (name collisions with existing User rows,
+  coordination rows, extension bindings and dev links, model discovery contexts) are kept in the
+  `user_scope_migration_archive` table with their original JSON and source identity; progress is in
+  `user_scope_migrations`. Colliding automation names are renamed `<name> (migrated)`. Keep `.migrated`
+  folders until you no longer need a rollback.
+- **Reserved project names are renamed.** `user`, `global`, and names starting with `@` are reserved.
+  Existing projects with those names are renamed deterministically (leading `@` stripped, `-project`
+  appended when the result is empty or reserved, then the usual uniqueness suffix). Workspace IDs never
+  change.
+- **Automation run history gains attribution.** Older runs whose job or trigger still exists record
+  its project as `derived`; the rest stay `unknown` and read "Unknown project".
+
+### Update scripts and integrations
+
+| Before                                                       | After                                                                | Until                                                             |
+| ------------------------------------------------------------ | -------------------------------------------------------------------- | ----------------------------------------------------------------- |
+| Old name of a renamed project as a selector                  | The project's ID or new name                                         | Alias works with a warning through v0.4.0; removed in v0.5.0      |
+| `workspace_id=global` or `--workspace global` on data routes | `@user` for User, `all_workspaces=true` for every project            | Rejected with `workspace_reserved` unless it is a migration alias |
+| `shell.sessions.scope`                                       | `shell.sessions.group_by` for grouping; the topbar globe for breadth | Works with a warning through v0.4.0; dropped tolerantly in v0.5.0 |
+| Bell `workspace_label` `"Global"`                            | `"User"` (display string)                                            | Changed in v0.4.0; match on `workspace_id` instead                |
+| Registering `COMPOZY_HOME` as a project                      | Run that work in User (`--user`, `@user`)                            | Refused with `workspace_home_forbidden`                           |
+
+To move off `shell.sessions.scope` now:
+
+```bash
+compozy config unset shell.sessions.scope
+compozy config set shell.sessions.group_by project
+```
+
+In v0.5.0 the daemon converts `scope = "all-workspaces"` into `group_by = "project"` when grouping is
+unset, drops the key with a logged notice, and removes it from `config.toml` on the next apply.
+
+### Agent definitions with `workspace_access`
+
+`workspace_access: unrestricted` is a new AGENT.md field. Daemons older than v0.4.0 decode AGENT.md
+strictly and refuse files that contain it, so upgrade every daemon that reads a shared agents folder
+before adding the field. The field reintroduces a grant for this one purpose, superseding the earlier
+rule that cross-workspace access has no grant vocabulary. Tasks, automations, and Loop runs saved
+before v0.4.0 carry no grant ceiling; save them again as the operator if a granted agent should keep
+its access when they run.
+
+<a id="memory-removal"></a>
+
+## Memory removal
+
+The memory removal release removes the memory feature family from CompozyOS: agent memory, Dream
+consolidation, the Knowledge app, and the workspace `knowledge/` prompt injector. It also removes
+CompozyOS's own session compaction, which relied on the memory checkpoint service. The removal
+covers the daemon, CLI, HTTP/UDS, native tools, MCP, the extension Host API and SDKs, configuration,
+Web UI, and documentation. This is an intentional breaking change with no compatibility aliases or
+deprecation window. It does not block the upgrade: the daemon starts on an upgraded home without any
+manual step, and leftovers in your own files are archived or ignored instead of rejected.
+
+No replacement memory or knowledge feature is provided. Authored context remains `AGENT.md`,
+`SOUL.md`, `HEARTBEAT.md`, and skills. Sessions, agents, Loops, Tasks, and Goals keep working.
+
+### Before upgrading
+
+Stop the daemon and back up `compozy.db` together with the global state directory, workspace
+`.compozy/` directories, and `config.toml`. Memory database state is dropped permanently and the new
+release has no reader or export command for it: the index, decision log, recall signals, Dream run
+history, and extractor state. Export anything you need to retain with the previous release first.
+The Markdown memory files are not database state and stay on disk. Do not run an older binary against
+the upgraded databases; restore the complete pre-upgrade backup to roll back.
+
+### What the first start changes
+
+Nothing needs editing by hand. On the first start:
+
+- **Global database migration 00130.** `00130_retire_memory.sql` drops the memory tables, their
+  full-text indexes, and `goose_db_version_memory`; deletes `memory.consolidated` automation triggers
+  together with their overlays, catalog rows, gateway ingress bindings, and owned secret refs (run
+  history stays); and deletes legacy `dream` sessions and the `memory-extractor` and
+  `checkpoint-summary` child sessions with their dependent rows. Session directories on disk are not
+  removed.
+- **Session database migration 00009.** `00009_unarchive_compaction_spans.sql` restores the events
+  that the removed CompozyOS compaction had archived, together with their transcript entries and tool
+  routes, so old compacted sessions show their full history again in the transcript, search, outline,
+  and fork and rewind anchors. Events archived by a conversation rewind stay archived.
+- **Config archive.** When the global, profile, or workspace `config.toml` contains `[memory]` (every
+  sub-table), `[roles.dream]`, `[roles.checkpoint_summary]`, `[roles.memory_extractor]`,
+  `[roles.memory_controller]`, `[session.compaction]`, an `[[automation.triggers]]` entry with
+  `event = "memory.consolidated"`, or hook-matcher keys `compaction_reason` / `compaction_strategy`,
+  the daemon removes them and appends them, commented, at the end of the same file under
+  `# Archived retired memory and compaction settings; these values are inactive.`. The rewrite is
+  atomic and lossless, logged once as `config.retired_keys_archived`, and a second start changes
+  nothing. Archiving these memory and compaction settings never blocks a start: if the file changes while it is being rewritten, or the
+  daemon cannot write it (for example a read-only directory), the daemon logs a
+  `config.retired_keys_archive_failed` warning with the path and the reason, loads with the retired
+  values inactive, leaves the file untouched, and tries again on the next load. Explicitly setting a
+  retired key (`compozy config set memory.enabled true`) is still refused.
+- **Ignored leftovers.** `memory_policy` in a `SOUL.md` is ignored: it is not rendered, never raises a
+  diagnostic, and the file is not rewritten (the Web editor drops it on the next save). Retired
+  `compozy__memory*` tool and toolset IDs in an agent, profile, or session tool policy are dropped
+  with a `tools.retired_ids_ignored` warning. An extension manifest that declares `memory.backend`,
+  `memory/recall|store|forget`, or the `memory.read|write` consent still loads with those entries
+  dropped and one `extension.retired_entries_ignored` warning; an extension automation resource whose
+  trigger event is `memory.consolidated` is skipped with the same warning and the rest of the
+  extension loads. The hook-matcher keys `compaction_reason` and `compaction_strategy` in `AGENT.md`
+  and `SKILL.md` hook declarations are ignored with one `agent.retired_entries_ignored` or
+  `skills.retired_entries_ignored` warning per file, and the file is left untouched.
+- **Saved desktop layouts.** The Knowledge window is dropped from saved layouts, including persisted
+  layout resources, a Settings window on `/settings/memory` moves to `/settings`, and the reconciled
+  layout is saved once.
+- **Files stay.** No file is deleted or rewritten: Markdown memory under
+  `~/.compozy/profiles/<name>/memory/`, `<workspace>/.compozy/memory/`, and agent `memory/`
+  directories (including `_inbox/` candidates the extractor never consumed), `<workspace>/knowledge/`
+  directories, and `ledger.jsonl` session files. Nothing reads them any more. Copy what you want to
+  keep and delete the rest whenever you like. The session directories of the deleted legacy sessions
+  also stay in place; the daemon never recatalogs them and logs `observe.session_recovery_skipped`
+  once per session.
+
+### Removed surfaces
+
+- **CLI:** the whole `compozy memory` tree (`list`, `show`, `write`, `edit`, `delete`, `search`,
+  `reindex`, `history`, `health`, `promote`, `reset`, `reload`, `scope-show`, `decisions`, `recall`,
+  `dream`, `daily`, `extractor`, `provider`, `adhoc`). `compozy status -o json` no longer has a
+  `memory` object and its `schema_version` is `2026-10-07`. `compozy roles list` shows `coordinator`
+  and `auto_title` only; `compozy profile delete --dry-run` has no `memory_entries`;
+  `compozy extension init --template memory-backend-ts` is gone.
+- **HTTP/UDS:** the 40 `/api/memory*`, `/api/settings/memory`, and
+  `/api/workspaces/{id}/memory/**` operations answer `404` like any unknown path. `dream` leaves the
+  session `type` enum, the four memory roles leave the settings and roles payloads, and
+  `component=memory` is an invalid event filter.
+- **Native tools and MCP:** the 35 `compozy__memory_*` tools, the `compozy__memory` and
+  `compozy__memory_admin` toolsets, and `compozy_host__memory__recall|store|forget`. These IDs are
+  retired permanently.
+- **Extensions and SDKs:** the Host API `memory/recall|store|forget` (JSON-RPC `-32601`), the
+  `memory.backend` capability, consent atoms `memory:read|write`, the marketplace ceiling
+  `memory.read`, the `memory-backend-ts` scaffold, and the TypeScript and Go SDK memory members and
+  types. Rebuild extensions against the current SDK.
+- **Configuration and automation:** `[memory]`, `[session.compaction]`, the four memory roles, and
+  the `memory.consolidated` trigger event (creating a trigger on it fails validation). The
+  auto-title role keeps working; its deadline is a fixed 60 seconds.
+- **Web:** the Knowledge app and `/knowledge`, Settings → Memory, the Home Memory tile, and the memory
+  role panels. Settings now has 18 sections.
+- **Prompts:** agents no longer receive memory startup content, per-turn recall, or the
+  `<workspace-knowledge-snapshot>` block.
+
+### Compaction changes
+
+CompozyOS no longer compacts a session itself: no threshold, timer, or usage reading makes it
+summarize, archive, or start a child session. The agent owns its context window.
+
+- **Bounded rebuilds.** Every replay of a transcript into a new agent session (resume without native
+  load, runtime or model replacement, account fallback, prompt recovery, continue/fork) is bounded by
+  `[session.derive] max_replay_bytes` and `max_message_bytes`, keeps the newest messages, pins the
+  earliest user message, states that the workspace is authoritative, and points to
+  `compozy__session_history` for the omitted history.
+- **Observed agent compaction (experimental).** When the agent supports the ACP compaction
+  capability, each compaction appears as one `compaction` item in the session transcript and Web
+  timeline, as `compaction` snapshot rows plus one `session.compaction_fired` event with the new
+  payload (`compaction_id`, `trigger`, `context_used`, `context_size`) in `compozy session events`
+  and `compozy session history`, and as one usage marker. `pressure_threshold` and the marker fields
+  `from_sequence`, `to_sequence`, `pressure`, `strategy`, and `span_archived` are removed. Events
+  recorded before the upgrade stay in the ledger as opaque history and never produce a marker.
+- **Compact now (experimental).** `compozy session compact <session-id>`,
+  `POST /api/workspaces/{workspace_id}/sessions/{session_id}/compact`, the native tool
+  `compozy__session_compact`, and the Compact now button in the Web context rail ask the agent to
+  compact through the command it advertises (`/compact` or `/compress`). The Goal executor uses the same command. See
+  [Context compaction](https://compozy.com/docs/sessions/compaction).
+- **Hooks.** `context.pre_compact` and `context.post_compact` are observation-only: only `labels`
+  can be patched, and the `deny`, `summary`, and `context_blocks` patches are removed. The matcher
+  keys `compaction_reason` and `compaction_strategy` become `compaction_trigger`
+  (`requested` or `agent`).
+
+### Update scripts, extensions, and automation
+
+Stop calling the removed commands, routes, tools, and SDK members; there are no aliases. Remove memory
+tool entries from `AGENT.md` `toolsets`/`tools` and from profile and session tool policies when
+convenient, delete `memory_policy` from `SOUL.md`, remove `memory.backend` and `memory/*` entries from
+extension manifests, and replace `compaction_reason` / `compaction_strategy` hook matchers with
+`compaction_trigger`; `AGENT.md` and `SKILL.md` hook matchers are ignored with a warning for now, but
+an `AGENT.md` hook cannot target the context events at all, so declare those hooks in `config.toml`, an
+extension manifest, or a skill. Tool-policy wildcards such as `compozy__memory*` are not rewritten;
+they simply match nothing. The leftovers are tolerated for now but not forever.
+
+### Temporary compatibility
+
+The config archive, the `memory_policy` ignore rule, the retired tool-ID filter, the extension
+manifest and automation-resource filters, and the `AGENT.md` and `SKILL.md` hook-matcher filters are
+one shim generation. They are removed in v0.6.0. Run at least one release that
+contains them before upgrading to v0.6.0, and clean the leftovers listed above so nothing depends on
+them.
+
+<a id="networks-bridges-and-sandbox-removal"></a>
+
+## Networks, Bridges, and Sandbox removal
+
+The package cleanup release removes the CompozyOS Network, Bridges, and managed Sandbox products
+across the daemon, CLI, HTTP/UDS, native tools, SDKs, configuration, Web UI, and documentation. This
+is an intentional breaking change with no compatibility aliases or deprecation window.
+
+### Before upgrading
+
+Stop the daemon and back up its global state directory, workspace `.compozy/` directories, and
+`config.toml`. Export any Network messages or Bridge delivery records you need to retain using the
+previous release. The new release has no reader or recovery command for retired state. Do not run
+an older binary against the upgraded database; restore the complete pre-upgrade backup to roll back.
+
+### Database migration 00121
+
+Opening an existing database applies `00121_retire_network_bridges_sandbox.sql` transactionally.
+It permanently drops Network channels, threads, messages, subscriptions, participation, coordination,
+audit/timeline projections, and wake queues; Bridge instances, routes, delivery history, secret
+bindings, target directories, and task subscriptions; and notification presets and their delivery
+permits. Network wake runs, their dependent records, and triage state owned by retired Network
+actors are removed; triage state belonging to retained actors is preserved. References from retained Tasks
+and task events to those removed runs are cleared. Product-specific Network, Bridge, and Sandbox
+fields are removed from retained runtime records. Historical Loop channel-message events are removed.
+
+Ordinary sessions and their local histories, Tasks and ordinary task runs, execution profiles,
+Loops and Goal nodes, memory, workspaces, attention notifications, and task status cursors remain.
+Agent `SOUL.md` and `HEARTBEAT.md` documents, revisions, schedules, and wake policy remain supported.
+Session supervision and task lease heartbeats also remain supported.
+
+### Update configuration and integrations
+
+Remove product configuration for Network, Bridges, and managed Sandboxes, including default Sandbox
+selection and remote Sandbox drivers. Remove retired fields from session, Task, profile, job, and
+Loop requests. Scripts must stop calling retired CLI commands, routes, native tools, and SDK methods;
+there are no aliases. Rebuild extensions against the current SDK. Agent capability catalogs remain
+local authoring inputs for Task worker selection.
+
+Gateway and webhooks remain supported. Extensions declare their reachability requirement with
+`[gateway]` and explicit permission atoms:
+
+```toml
+[gateway]
+permissions = ["gateway.private", "gateway.public"]
+```
+
+Declare only the permissions the extension needs. Install, update, and development-link callers
+confirm the returned `gateway_requirement_digest` using `--confirm-gateway-requirement` in the CLI
+or `confirm_gateway_digest` in the request. The database migration retains the recorded digest,
+confirmer, and confirmation time under the Gateway names. A changed requirement requires a matching
+confirmation; removal of Network must not grant public ingress implicitly. Legacy
+`network_participation` manifests are not converted or accepted as Gateway declarations. Rebuild
+those extensions with `[gateway]`, inspect the new requirement digest, and confirm it before
+using Gateway capabilities. The retained database tuple preserves the previous consent record;
+it does not authorize a different manifest or bypass confirmation after this hardcut.
+
+Provider-native execution permissions and sandbox policies, operating-system isolation, MCP/ACP
+stdio adapters, and the Herdr hook IPC bridge are independent of the removed products.
+
+<a id="command-map"></a>
+
+## 1. Command map
+
+Install the current release through one of these paths:
+
+```bash
+brew install compozy/compozy/compozy
+
+npm install -g @compozy/cli
+
+curl -fsSL https://compozy.com/install.sh | sh
+
+go install github.com/compozy/compozy@<release-tag>
+```
+
+The hosted installer pins the latest published release for you. For `go install`, copy the exact
+pinned tag from the [latest release](https://github.com/compozy/compozy/releases/latest) notes.
+
+Workspace-scoped v0.3 commands infer the active workspace in this order: positional workspace ref,
+`--workspace`, `COMPOZY_WORKSPACE`, validated session identity, then the current working directory.
+Run commands anywhere under a registered workspace root. Use `--workspace <id|name|path>` only to
+override that context.
+
+The primary delivery mappings are:
+
+| v0.2.15                                                                             | v0.4                                                                              | Notes                                                                                                                                                                                                           |
+| ----------------------------------------------------------------------------------- | --------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `compozy tasks run demo`                                                            | `compozy loop run --name implement-tasks --input slug=demo`                       | Run from the project tree. Uses the bundled task implementation Loop and the existing `.compozy/tasks/demo/` tree.                                                                                              |
+| `--task-runtime type=frontend,ide=codex,model=gpt-5.5-codex,reasoning-effort=xhigh` | `--runtime type=frontend:codex/gpt-5.5-codex@xhigh`                               | `--runtime` is repeatable. It also accepts `worker=`, `judge=`, `id=`, and `complexity=` selectors.                                                                                                             |
+| `--dry-run`                                                                         | `--dry-run`                                                                       | The v0.3 plan reports effective input values and origins and creates no run.                                                                                                                                    |
+| `--auto-commit`                                                                     | `--input auto_commit=true`                                                        | Supported by both bundled dev-cycle Loops. Neither Loop pushes.                                                                                                                                                 |
+| `compozy reviews fix <task>`                                                        | `compozy loop run --name review-and-fix --input task_name=<task>`                 | Run from the project tree. A CompozyOS reviewer agent authors a new round before fixers run; provider-fetched rounds are not imported.                                                                          |
+| `compozy reviews watch <task> --pr <N>`                                             | Same `review-and-fix` command above                                               | Semantic change: there is no PR polling, CodeRabbit fetch, thread resolution, or push tail. `--pr` and `--provider` have no replacement.                                                                        |
+| `compozy exec "prompt"`                                                             | `compozy session new --agent <name>`, then `compozy session prompt <id> "prompt"` | Run from the project tree. v0.3 makes the durable session explicit. Use `resume` only to attach another client while the session is live; after `stop`, a normal prompt continues the same session and history. |
+| `compozy agents list` / `agents inspect <name>`                                     | `compozy agent list` / `compozy agent info <name>`                                | v0.3 agent definitions are daemon-managed resources, not setup assets.                                                                                                                                          |
+| `compozy mcp-serve`                                                                 | `compozy mcp serve`                                                               | Run from the project tree. The relay binds the inferred workspace; `--workspace` overrides it.                                                                                                                  |
+| `compozy workspaces list/show/register/unregister`                                  | `compozy workspace list/info/add/remove`                                          | Use IDs or explicit roots returned by the daemon. The old `resolve` verb has no direct command replacement.                                                                                                     |
+| `compozy daemon start`                                                              | `compozy install` once, then `compozy daemon start`                               | `install` bootstraps config and the default agent; it does not start the daemon. Use `compozy status` after startup.                                                                                            |
+| `compozy daemon status/stop`                                                        | `compozy status` / `compozy daemon stop`                                          | Structured output is available with `-o json`.                                                                                                                                                                  |
+| `compozy upgrade`                                                                   | `compozy update`                                                                  | Installs the latest stable release; it never returns to the v0.2 line.                                                                                                                                          |
+| `compozy ext list/install/enable/disable/doctor`                                    | `compozy extension list/install/enable/disable/status` plus `compozy doctor`      | Extension manifests and SDK contracts are API-incompatible; reinstall or port extensions instead of reusing old directories.                                                                                    |
+| `compozy runs watch <id>`                                                           | `compozy loop status --run-id <id>` or the printed `/loop-runs/<id>` URL          | Run from the project tree. Legacy run IDs do not exist in the new database; for sessions use `status`, `events`, and `wait`.                                                                                    |
+| `compozy runs attach <id>`                                                          | No TUI replacement                                                                | Use structured status/events and the web run page.                                                                                                                                                              |
+| `compozy runs purge`                                                                | No bulk compatibility verb                                                        | Start with clean v0.3 runtime state. Remove individual session history with `session remove` when appropriate.                                                                                                  |
+| `compozy sync`                                                                      | No replacement required                                                           | Loop task import and daemon resource registration happen through their owning runtime surfaces.                                                                                                                 |
+| `compozy archive`                                                                   | No replacement                                                                    | Move completed task folders manually only after preserving the evidence your repository requires.                                                                                                               |
+| `compozy tasks validate`                                                            | Removed; no `loop validate` replacement                                           | `loop validate` validates a Loop definition, not legacy task files. Do not substitute it in scripts or bundled process guidance.                                                                                |
+| `compozy migrate`                                                                   | Run the v0.2 command before upgrading, only for XML-era task/review artifacts     | This is the old XML-to-frontmatter converter. It is not `compozy migrate config`.                                                                                                                               |
+
+The complete v0.2 flag-family disposition is:
+
+| Legacy flag family                                                                                                                                                          | v0.3 disposition                                                                                                                                                      |
+| --------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `tasks run`: positional slug, `--name`                                                                                                                                      | `--name implement-tasks --input slug=<slug>`; the Loop name and task slug are separate values.                                                                        |
+| `--ide`, `--model`, `--reasoning-effort`, repeatable `--task-runtime`                                                                                                       | Express worker/judge or task rules with repeatable `--runtime`. Unsupported legacy providers are not aliased.                                                         |
+| `--format`, common structured output                                                                                                                                        | Use global `-o` with `human`, `json`, `jsonl`, or `toon`.                                                                                                             |
+| `--dry-run`, `--auto-commit`                                                                                                                                                | Retained as `--dry-run` and `--input auto_commit=<bool>`.                                                                                                             |
+| `--multiple`, `--parallel`, `--parallel-limit`                                                                                                                              | Deferred. Start separate Loop runs in explicitly isolated workspaces/worktrees.                                                                                       |
+| `--parallel-tasks` and hidden conflict-resolver flags                                                                                                                       | Deferred. The bundled Loop intentionally executes its task fan-out with `max_parallel: 1`.                                                                            |
+| `--include-completed`, `--recursive`, `--skip-validation`, `--force`                                                                                                        | Removed. The bundled importer owns task selection; there is no bypass flag. Fork and publish a custom Loop when a different contract is required.                     |
+| `--attach`, `--ui`, `--stream`, `--detach`                                                                                                                                  | TUI attach is removed. Use the final-line web URL, `loop status`, run events over HTTP/UDS/SSE, or structured output.                                                 |
+| `--add-dir`, `--tail-lines`, `--access-mode`, `--timeout`, `--max-retries`, `--retry-backoff-multiplier`                                                                    | No direct invocation flags. Model execution policy in agent definitions, configuration policy, or a custom Loop node's `timeout` and `retry`.                         |
+| `--recovery`, `--no-recovery`, `--recovery-ide`, `--recovery-model`, `--recovery-reasoning`, `--recovery-max-attempts`                                                      | Removed. The legacy recovery agent has no v0.3 replacement. Use Loop retry/no-progress/terminal state and operator-driven reruns.                                     |
+| `reviews fetch`: `--provider`, `--pr`, `--name`, `--round`                                                                                                                  | External fetch is removed. `task_name` is the only required review target; round allocation is automatic.                                                             |
+| `reviews fix`: `--name`, `--round`, `--agent`, `--batch-size`, `--concurrent`, `--include-resolved`, common runtime/recovery/attach flags                                   | Use `task_name`, optional `fixer`, optional `auto_commit`, and `--runtime`; other flags have no direct replacement.                                                   |
+| `reviews watch`: fetch flags plus `--auto-push`, `--push-remote`, `--push-branch`, `--poll-interval`, `--quiet-period`, `--max-rounds`, `--review-timeout`, `--until-clean` | Removed with provider watch semantics. Run `review-and-fix` once; push is operator or outer-Loop work.                                                                |
+| `exec`: prompt/stdin, `--agent`, `--prompt-file`, `--format`, `--persist`, `--run-id`, `--tui`, `--extensions`, runtime/retry/stall flags                                   | Split across `session new`, `session prompt`, session lifecycle commands, agent/provider config, and extension policy. There is no flag-for-flag compatibility layer. |
+| `setup`: `--agent`, `--skill`, `--global`, `--copy`, `--list`, `--yes`                                                                                                      | The external-CLI symlink/copy installer is removed. Use daemon-managed agent/skill surfaces and the bundled dev-cycle extension.                                      |
+| `migrate`, `sync`, `archive`: `--root-dir`, `--name`, `--tasks-dir`, `--reviews-dir`, `--dry-run`, `--format`                                                               | Only the old XML converter remains relevant before upgrade. Sync/archive behavior has no v0.3 command equivalent.                                                     |
+
+<a id="config-translation"></a>
+
+## 2. Configuration translation contract
+
+No live config migrator ships in the current release. This section is the manual translation
+contract. Apply global and workspace changes separately. v0.3 precedence is per-run value, then
+workspace `[loops.inputs.<loop>]`, then global input default, then the Loop definition default.
+Explicit `false`, `0`, and valid empty strings remain present values.
+
+| v0.2.15 source                                                                                                                                                 | v0.3 target or disposition                                                                                                                                           |
+| -------------------------------------------------------------------------------------------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `defaults.ide`                                                                                                                                                 | Expand, after provider mapping, to `loops.defaults.{delivery,watch}.runtime_defaults.{worker,judge}.provider`.                                                       |
+| `defaults.model`                                                                                                                                               | Expand to `loops.defaults.{delivery,watch}.runtime_defaults.{worker,judge}.model`.                                                                                   |
+| `defaults.reasoning_effort`                                                                                                                                    | Expand to `loops.defaults.{delivery,watch}.runtime_defaults.{worker,judge}.reasoning` for `low`, `medium`, `high`, `xhigh`, or `max`.                                |
+| `defaults.timeout`                                                                                                                                             | `session.limits.timeout`.                                                                                                                                            |
+| `defaults.auto_commit`                                                                                                                                         | `loops.inputs.implement-tasks.auto_commit` and `loops.inputs.review-and-fix.auto_commit`.                                                                            |
+| `defaults.by_complexity.<level>.<field>`                                                                                                                       | Ordered delivery `runtime_rules` with `match.complexity`; levels are `low`, `medium`, `high`, and `critical`, and fields are `ide`, `model`, and `reasoning_effort`. |
+| `tasks.run.task_runtime_rules[]`                                                                                                                               | Ordered delivery `runtime_rules` with `match.type`. The persisted legacy schema supported type selectors only.                                                       |
+| `defaults.{output_format,access_mode,tail_lines,add_dirs,max_retries,retry_backoff_multiplier}`                                                                | Dropped; no runtime-config destination.                                                                                                                              |
+| `defaults.stall.{enabled,timeout,child_timeout,terminal_command_timeout,retries}`                                                                              | Dropped; use Loop retry/no-progress/terminal-state contracts instead.                                                                                                |
+| `tasks.types`                                                                                                                                                  | Dropped.                                                                                                                                                             |
+| `tasks.run.{include_completed,recursive,output_format,run_multiple_mode,run_multiple_parallel_limit,tui}`                                                      | Dropped; the bundled Loop owns task selection and has no TUI.                                                                                                        |
+| `tasks.run.parallel.{enabled,max_concurrency}`                                                                                                                 | Dropped; dependency-wave execution is deferred.                                                                                                                      |
+| `tasks.run.parallel.conflict_resolver.{enabled,ide,model,reasoning_effort,max_attempts,validation_command}`                                                    | Dropped; the worktree conflict resolver is deferred with parallel task execution.                                                                                    |
+| `fix_reviews.{concurrent,batch_size,include_resolved,output_format,tui}`                                                                                       | Dropped; v0.3 review is agent-authored and the bundled Loop owns batching.                                                                                           |
+| `fetch_reviews.{provider,nitpicks}`                                                                                                                            | Dropped; v0.3 fetches no external reviews.                                                                                                                           |
+| `watch_reviews.{auto_push,push_remote,poll_interval,quiet_period,max_rounds,review_timeout,until_clean,push_branch}`                                           | Dropped; there is no provider watch, thread resolution, or push tail.                                                                                                |
+| `exec.{ide,model,output_format,reasoning_effort,access_mode,timeout,tail_lines,add_dirs,auto_commit,max_retries,retry_backoff_multiplier,verbose,tui,persist}` | Dropped; create and configure explicit sessions instead.                                                                                                             |
+| `exec.stall.{enabled,timeout,child_timeout,terminal_command_timeout,retries}`                                                                                  | Dropped.                                                                                                                                                             |
+| `runs.{default_attach_mode,keep_terminal_days,keep_max,shutdown_drain_timeout}`                                                                                | Dropped; legacy history is not imported.                                                                                                                             |
+| `recovery.{enabled,ide,model,reasoning_effort,max_attempts}`                                                                                                   | Dropped; the recovery agent is removed.                                                                                                                              |
+| `sound.{enabled,on_completed,on_failed,on_parked}`                                                                                                             | Dropped; no v0.3 destination.                                                                                                                                        |
+
+Provider mapping is exact: `codex → codex`, `claude → claude`, `cursor-agent → cursor`,
+`opencode → opencode`, `pi → pi`, `gemini → gemini`, and `copilot → copilot`.
+Drop `droid`, `devin`, `kiro`, and legacy-only reasoning `ultra` as
+`unsupported_destination_value`; never silently alias or weaken them. `kiro` is no longer a
+built-in provider; an operator who still uses Kiro CLI can declare it as a
+[custom provider](https://compozy.com/docs/agents/providers#run-another-acp-cli) with `command = "kiro-cli-chat acp"`. The v0.2 schema had no
+persisted `defaults.provider` or `defaults.pr`, so do not fabricate either.
+
+You can manage an input default manually now:
+
+```bash
+cd /absolute/project/root
+
+compozy config set loops.inputs.implement-tasks.auto_commit false \
+  --scope workspace
+
+compozy config get loops.inputs.implement-tasks.auto_commit
+
+compozy config unset loops.inputs.implement-tasks.auto_commit \
+  --scope workspace
+```
+
+These commands use cwd discovery. Set `COMPOZY_WORKSPACE` for a shell-wide override or pass
+`--workspace <id|name|path>` for a one-command override.
+
+HTTP and UDS expose exact-scope inspect, replace, set, and delete operations under
+`/api/workspaces/{workspace_id}/loops/{name}/input-defaults`. Configured values are checked against
+the named Loop only during dry-run or submission, because Loops can enroll dynamically.
+
+<a id="config-migrator"></a>
+
+## 3. Config migrator status
+
+`compozy migrate config` does **not** ship in the current release. Do not run that command, build
+automation around it, or assume the daemon will read v0.2 config as a fallback.
+
+To move from v0.2:
+
+1. Back up `~/.compozy/` and each `<workspace>/.compozy/` directory.
+2. Translate the config manually with the table above into a fresh v0.3 config.
+3. Move legacy-owned `agents/` and `extensions/` directories out of the colliding `.compozy/`
+   namespace. Do not let v0.3 enroll their old formats.
+4. Start v0.3 with clean runtime state; do not copy `global.db`, daemon sockets, locks, logs, run
+   directories, or other v0.2 state into the new runtime.
+5. Keep the backup until the new journey and required task evidence have been verified.
+
+The old v0.2 `compozy migrate` command is unrelated. It converts XML-tagged task and review
+artifacts into frontmatter. If your task tree still contains `<task_context>` or `<review_context>`,
+run the v0.2.15 converter **before** replacing the CLI. No v0.3 config command replaces that artifact
+conversion.
+
+<a id="skills"></a>
+
+## 4. Where the skills went
+
+The v0.3 `dev-cycle` extension bundles exactly eight retained process skills:
+
+- `cy-create-spec`
+- `cy-create-tasks`
+- `cy-execute-task`
+- `cy-workflow-memory`
+- `cy-review-round`
+- `cy-fix-reviews`
+- `cy-final-verify`
+- `git-rebase`
+
+They are versioned resources of the extension and are exposed through the runtime's skill/resource
+surfaces. The legacy `compozy` skill is retired; the new official `skills/compozy/` guide is the
+runtime and contributor manual, not one of the nine dev-cycle process skills.
+
+The v0.2 `compozy setup` helper copied or symlinked public skills and reusable `AGENT.md` files into
+external agent-CLI homes. v0.3 has no equivalent external-CLI installer. Use `compozy skill` for
+daemon-managed local or marketplace skills, `compozy agent` for runtime agent definitions, and
+`compozy extension` for versioned extension resources. Copying the old installed files forward does
+not make them compatible.
+
+Process guidance must not call `tasks validate`: that command is removed and `loop validate` checks
+Loop definitions, not task artifacts. Use the validation gates that the selected Loop and repository
+actually provide.
+
+<a id="deferred-and-removed"></a>
+
+## 5. Deferred and removed surfaces
+
+This table is the exhaustive legacy-surface ledger. “Removed” means no compatibility alias, route,
+loader, or hidden fallback ships in v0.3.
+
+| v0.2.15 surface                                                                                | Status in v0.3                | Successor or workaround                                                                                  |
+| ---------------------------------------------------------------------------------------------- | ----------------------------- | -------------------------------------------------------------------------------------------------------- |
+| `tasks run` basic delivery                                                                     | Replaced                      | Bundled `implement-tasks` Loop.                                                                          |
+| `--parallel-tasks` dependency waves                                                            | Deferred                      | Run serially; a custom Loop may model explicit safe fan-out.                                             |
+| `--multiple` / `--parallel` worktree isolation                                                 | Deferred                      | Create explicit worktrees/workspaces and start separate runs.                                            |
+| Tasks-run five-step wizard                                                                     | Removed                       | Supply explicit `loop run` flags and inspect `--dry-run -o json`.                                        |
+| TUI cockpit, `runs attach`, and `--attach ui`                                                  | Removed                       | Use the web run page, structured CLI, HTTP/UDS, and SSE.                                                 |
+| `tasks validate`                                                                               | Removed                       | No substitute. `loop validate` is a different invariant.                                                 |
+| `reviews fetch/list/show/fix/watch` verb family                                                | Removed as commands           | `review-and-fix` is the only bundled review journey; inspect its `reviews-NNN/` files and run status.    |
+| External review fetch/resolve, CodeRabbit/nitpicks, provider provenance, PR polling, auto-push | Removed                       | Reviews are authored by a CompozyOS reviewer agent. Push manually or from an outer Loop after review.    |
+| Legacy review-provider extension abstraction and hooks                                         | Removed                       | No v0.3 external review-provider API.                                                                    |
+| Recovery agent and recovery flags/config                                                       | Removed                       | Use Loop retry/no-progress/terminal outcomes and an explicit rerun or operator intervention.             |
+| Cost-aware task budgets                                                                        | Deferred                      | Loop token/wall-clock budgets exist, but no legacy cost-aware per-task compatibility mapping exists.     |
+| Agent-per-task rules                                                                           | Deferred                      | Use imported task `runtime` frontmatter or `--runtime id=<task>:...`; agent identity remains Loop-owned. |
+| External-CLI skill/setup installer                                                             | Removed                       | Use daemon-managed `skill`, `agent`, and extension-resource surfaces.                                    |
+| Reusable-agent `setup` assets                                                                  | Removed                       | Re-author runtime agent definitions through `compozy agent`; do not copy legacy setup state.             |
+| `compozy ext` command and old manifest API                                                     | Replaced incompatibly         | Port to the v0.3 manifest/SDK and manage with `compozy extension`.                                       |
+| `compozy migrate` XML converter                                                                | Legacy-only                   | Run v0.2.15 before upgrading when XML-era artifacts exist.                                               |
+| `compozy migrate config`                                                                       | Not available                 | Use the manual matrix and clean-state procedure in this guide.                                           |
+| `sync` / `archive`                                                                             | Removed                       | Runtime owners ingest their own resources; archive task folders manually when safe.                      |
+| `runs watch` / `runs purge`                                                                    | Removed                       | Use Loop/session-specific lifecycle surfaces; legacy run history restarts cleanly.                       |
+| `exec` ad-hoc runner                                                                           | Replaced by explicit sessions | Use `session new` plus `session prompt` and lifecycle commands.                                          |
+| `/` legacy workflow dashboard                                                                  | Replaced                      | The v0.3 root is the operating-system home.                                                              |
+| `/memory` and `/memory/:slug`                                                                  | Removed                       | The memory removal release deleted the memory pages; old page URLs do not redirect.                      |
+| `/reviews`, `/reviews/:slug/:round`, `/reviews/:slug/:round/:issueId`                          | Removed                       | Use `/loops/review-and-fix`, `/loop-runs/:runId`, and on-disk review artifacts.                          |
+| `/runs` and `/runs/:runId`                                                                     | Replaced incompatibly         | Use `/loop-runs`, `/loop-runs/:runId`, `/session/:id`, or task-run routes according to owner.            |
+| `/workflows`                                                                                   | Replaced                      | `/loops`.                                                                                                |
+| `/workflows/:slug/spec`                                                                        | Replaced                      | `/loops/:name` and `/loops/:name/editor`.                                                                |
+| `/workflows/:slug/tasks` and `/workflows/:slug/tasks/:taskId`                                  | Replaced incompatibly         | `/tasks` and `/tasks/:id`; Loop definitions and durable tasks are separate resources.                    |
+| Public Go facade `compozy.go` and `pkg/compozy/{events,runs}`                                  | Removed                       | Pin v0.2.x for library use; v0.3 is an executable/runtime product.                                       |
+| `cy-capture-decisions` extension and skill                                                     | Removed                       | No bundled v0.3 successor; preserve its decision files as repository artifacts if still useful.          |
+| `cy-idea-factory` extension and skill                                                          | Removed                       | No bundled v0.3 successor. Recreate the process outside the runtime if required.                         |
+| `cy-qa-workflow` extension                                                                     | Removed                       | Use the repository's current QA skills/process; no compatibility extension is enrolled.                  |
+| Legacy `compozy` bundled skill                                                                 | Retired                       | Use the new official runtime guide plus the nine dev-cycle skills.                                       |
+| Nine retained process skills                                                                   | Moved                         | Bundled resources of the `dev-cycle` extension.                                                          |
+| Legacy daemon DB, run artifacts, sockets, locks, logs, and state directories                   | Not migrated                  | Start with clean v0.3 state; retain backups only for forensic reference.                                 |
+
+The web route mapping is a semantic mapping, not a redirect promise. v0.3 intentionally ships no
+legacy route aliases.
+
+### Legacy README anchor disposition
+
+The v0.2 README accumulated inbound links from package registries, search results, and external
+articles. The v0.3 front door keeps each semantic successor at the matching heading. Removed
+pipeline-era sections have no empty heading stub; their disposition is explicit here.
+
+| v0.2 heading                  | Inbound anchor                | v0.3 disposition                                                                           |
+| ----------------------------- | ----------------------------- | ------------------------------------------------------------------------------------------ |
+| Highlights                    | `#-highlights`                | Preserved at README **Highlights**.                                                        |
+| Installation                  | `#-installation`              | Preserved at README **Installation**.                                                      |
+| Homebrew                      | `#homebrew`                   | Preserved at README **Homebrew**; the formula serves the current stable release.           |
+| NPM                           | `#npm`                        | Preserved at README **NPM**, now `@compozy/cli`.                                           |
+| Go                            | `#go`                         | Preserved at README **Go**, with the explicit release tag.                                 |
+| From Source                   | `#from-source`                | Preserved at README **From Source**, using the root build target.                          |
+| How It Works                  | `#-how-it-works`              | Preserved at README **How It Works**.                                                      |
+| Daemon Runtime Model          | `#daemon-runtime-model`       | Preserved at the daemon-owned runtime explanation.                                         |
+| Task Schema v2                | `#task-schema-v2`             | Preserved at the task-to-Loop migration explanation.                                       |
+| Config Files                  | `#-config-files`              | Preserved at README **Config Files**.                                                      |
+| Reusable Agents               | `#reusable-agents`            | Preserved at README **Reusable Agents**.                                                   |
+| Extensions                    | `#-extensions`                | Preserved at README **Extensions**.                                                        |
+| SDK support                   | `#sdk-support`                | Preserved at the v0.3 SDK boundary.                                                        |
+| Extension CLI                 | `#extension-cli`              | Preserved at the current extension commands.                                               |
+| Learn more                    | `#learn-more`                 | Preserved at the extension documentation links.                                            |
+| Ad Hoc Exec                   | `#-ad-hoc-exec`               | **No successor.** Use explicit durable sessions; see the removed-surface ledger above.     |
+| Quick Start                   | `#-quick-start`               | Preserved at the v0.3 first-session flow.                                                  |
+| 1. Install skills             | `#1-install-skills`           | **No successor as a numbered pipeline step.** Skills are daemon-managed resources in v0.3. |
+| 2. (Optional) Create an Issue | `#2-optional-create-an-issue` | **No successor.** Issue creation is outside the v0.3 runtime quick start.                  |
+| 3. Create a PRD               | `#3-create-a-prd`             | **No successor in the README.** The retained dev-cycle skill owns this optional process.   |
+| 4. Create a TechSpec          | `#4-create-a-techspec`        | **No successor in the README.** The retained dev-cycle skill owns this optional process.   |
+| 5. Break down into tasks      | `#5-break-down-into-tasks`    | **No successor in the README.** Durable tasks are created through current task surfaces.   |
+| 6. Execute tasks              | `#6-execute-tasks`            | **No successor.** The v0.2 pipeline runner is replaced by Loops.                           |
+| 7. Review                     | `#7-review`                   | **No successor.** Provider-backed review commands were removed.                            |
+| 8. Fix review issues          | `#8-fix-review-issues`        | **No successor.** Use the bundled `review-and-fix` Loop.                                   |
+| 9. Iterate and ship           | `#9-iterate-and-ship`         | **No successor.** Shipping policy belongs to each repository.                              |
+| Skills                        | `#-skills`                    | Preserved at README **Skills**.                                                            |
+| Workflow Memory               | `#-workflow-memory`           | Preserved at README **Workflow Memory**, which describes plain repository files.           |
+| Supported Agents              | `#-supported-agents`          | Preserved at the runtime/provider explanation.                                             |
+| CLI Reference                 | `#-cli-reference`             | Preserved at the generated CLI reference link.                                             |
+| Development                   | `#-development`               | Preserved at README **Development**.                                                       |
+| Star History                  | `#star-history`               | Preserved at the repository widget.                                                        |
+| Contributing                  | `#-contributing`              | Preserved at README **Contributing**.                                                      |
+| License                       | `#-license`                   | Preserved at README **License**.                                                           |
+
+<a id="license"></a>
+
+## 6. License metadata correction
+
+CompozyOS remained MIT-licensed. Some old distribution metadata incorrectly stamped artifacts as
+`BSL-1.1`; v0.3 corrects that metadata to match the repository's MIT license. This is a distribution
+metadata correction, **not a relicense**.
+
+<a id="go-library"></a>
+
+## 7. Go library and SDK close-out
+
+v0.3 is distributed as the CompozyOS binary and runtime, not as a compatibility release of the old
+public Go library. Code importing the root facade, `pkg/compozy/events`, `pkg/compozy/runs`, or the old
+Go extension SDK will not compile against v0.3. Pin the final v0.2.x module while you maintain that
+integration, or redesign it against v0.3 CLI/HTTP/UDS/tool/extension contracts.
+
+Extension authors use the published `@compozy/extension-sdk` npm package or the
+`github.com/compozy/compozy/sdk/go` module. Both are version-matched to the daemon. Scaffold current
+projects with `compozy extension init`.
+
+<a id="domain-and-clean-state"></a>
+
+## 8. Domain, channels, and clean state
+
+`https://compozy.com` serves the v0.3 site from the single cut. The former domain retires without a
+redirect layer. Legacy source and release collateral remain frozen on the `legacy/v0.2` branch;
+v0.2 has reached end of life and receives no further releases.
+
+Release channels:
+
+- Homebrew (`compozy/compozy/compozy`), npm `@compozy/cli`, the hosted installer, and versioned
+  `go install` all serve the current stable release, starting with v0.4.0;
+- an install on any v0.3.0 beta updates in place to the latest stable release from the app's
+  Update action or `compozy update`.
+
+Start runtime history clean. Preserve committable task artifacts under `.compozy/tasks/`, translate
+configuration manually, and do not carry daemon databases or legacy extension/setup directories
+into the new runtime. The task schema remains useful; runtime state does not.
+
+For Git, keep authored task/config artifacts according to your repository policy and ignore runtime
+state inside the shared directory. At minimum, review rules for:
+
+```text
+.compozy/compozy.db
+.compozy/workspace.toml
+.compozy/daemon.sock
+.compozy/daemon.lock
+.compozy/logs/
+.compozy/cache/
+```
+
+Do not ignore the entire `.compozy/` directory when the repository commits `.compozy/tasks/`, Loop
+definitions, skills, agents, or workspace configuration. After backup and manual translation, run a
+dry delivery plan first, inspect the reported input origins/runtime provenance, then start the real
+run and follow the final-line `/loop-runs/<id>` URL.
+
+## Authoring portable Agent Plugins
+
+For new cross-client packages, keep the standard Agent Plugins `1.0.0` layout:
+a root `plugin.json` with its canonical `$schema`, `skills/` and optional `mcp.json`.
+CompozyOS also loads client manifests under `.claude-plugin/`, `.codex-plugin/` and
+`.cursor-plugin/` through adapters. Existing client packages do not need to be rewritten
+for installation; only supported skills and MCP declarations are loaded, and unsupported
+commands, agents and hooks are reported as `client_component_ignored`.
+See [Agent Plugins interoperability](https://compozy.com/docs/extensions/agent-plugins).
+
+<a id="marketplace-acquisition-hard-cut"></a>
+
+## Marketplace acquisition hard cut
+
+MCP servers embedded in previously installed ClawHub/Marketplace skills are disabled. Their skill
+files and provenance remain readable; manual MCPs and extension-provided MCPs are unaffected.
+`skills.allowed_marketplace_mcp` is retired and archived as inactive comments on config load;
+remove it from scripts that write config or Settings payloads. The archive does not grant runtime access.
+
+Marketplace discovery now uses `compozy marketplace search [query]`,
+`compozy marketplace info <entry_id>` and `compozy marketplace refresh`.
+Remove `--kind` and the kind argument previously passed to `info`. HTTP and UDS clients
+use `GET /api/marketplace`, `GET /api/marketplace/entries/{entry_id}` and
+`POST /api/marketplace/refresh`; old kind and grouped-search routes are removed.
+Native `compozy__marketplace_search` no longer accepts `kind`.
+
+Install packaged resources through the existing extension install surfaces. The old
+`compozy mcp install`, remote `compozy skill search|install|update|remove` commands and
+`POST /api/settings/mcp-servers/install` are removed. Existing extension packages,
+identities, acquisition references, credentials and management remain supported.
+Installed skill files and provenance remain readable through local skill commands;
+manual MCP configuration and authorization remain supported.
+
+Remove active `skills.marketplace.registry` and `skills.marketplace.base_url` settings
+from configuration templates. Existing files are migrated once by archiving those values
+as inactive comments in the same atomic config write; unrelated settings are preserved.
+The active runtime and `config set` no longer consume these acquisition settings.
+Catalog mirrors must serve `v3/extensions.json` and `v3/marketplaces.json`; missing v3
+reports a source failure rather than reading a root feed.
+
+Extension installation no longer accepts `runtime_name` or `--runtime-name`.
+Runtime names are allocated automatically. Extension inputs use their own credential
+namespace; manual MCP Vault references cannot be imported into extension inputs.
+See the Unreleased migration block in [release notes](https://github.com/compozy/compozy/blob/main/RELEASE_NOTES.md) for the
+append-only database upgrades and preserved state.

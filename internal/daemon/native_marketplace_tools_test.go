@@ -1,0 +1,398 @@
+package daemon
+
+import (
+	"context"
+	"encoding/json"
+	"errors"
+	"strings"
+	"testing"
+
+	"github.com/compozy/compozy/internal/api/contract"
+	extensionpkg "github.com/compozy/compozy/internal/extension"
+	marketplacepkg "github.com/compozy/compozy/internal/marketplace"
+	profilepkg "github.com/compozy/compozy/internal/profile"
+	"github.com/compozy/compozy/internal/store"
+	taskpkg "github.com/compozy/compozy/internal/task"
+	toolspkg "github.com/compozy/compozy/internal/tools"
+)
+
+type lateBootMarketplaceCatalog struct {
+	states []marketplacepkg.SourceState
+	entry  marketplacepkg.Entry
+}
+
+func lateBootMarketplaceEntry() marketplacepkg.Entry {
+	return marketplacepkg.Entry{
+		EntryID:      "late-boot-extension",
+		Name:         "Late boot extension",
+		Description:  "Attached after the native registry",
+		Version:      "1.0.0",
+		InstallSlug:  "acme/late-boot-extension",
+		DigestSHA256: strings.Repeat("a", 64),
+		Tier:         extensionpkg.ExtensionRegistryTierOfficial,
+		Payload: json.RawMessage(
+			`{"entry_id":"late-boot-extension","name":"Late boot extension","description":"Attached after the native registry","version":"1.0.0","install_slug":"acme/late-boot-extension","artifact_url":"https://downloads.example.test/late-boot-extension-v1.0.0.tar.gz","digest_sha256":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}`,
+		),
+	}
+}
+
+func (c lateBootMarketplaceCatalog) Browse(
+	context.Context,
+	string,
+	int,
+	int,
+) (marketplacepkg.BrowseResult, error) {
+	return marketplacepkg.BrowseResult{
+		Entries: []marketplacepkg.Entry{c.entry},
+		Sources: []marketplacepkg.SourceState{
+			{Source: marketplacepkg.CompozyCatalogSource, Kind: marketplacepkg.SourceKindFeed, Enabled: true},
+		},
+	}, nil
+}
+
+func (c lateBootMarketplaceCatalog) Detail(
+	context.Context,
+	string,
+	string,
+) (*marketplacepkg.Entry, error) {
+	return &c.entry, nil
+}
+
+func (c lateBootMarketplaceCatalog) Entry(context.Context, marketplacepkg.Origin) (*marketplacepkg.Entry, error) {
+	return &c.entry, nil
+}
+
+func (lateBootMarketplaceCatalog) ResolveExtensionInstall(
+	context.Context,
+	string,
+	string,
+) (*marketplacepkg.Entry, error) {
+	return nil, errors.New("unexpected ResolveExtensionInstall call")
+}
+
+func (lateBootMarketplaceCatalog) Refresh(
+	context.Context,
+	...string,
+) (marketplacepkg.RefreshReport, error) {
+	return marketplacepkg.RefreshReport{}, errors.New("unexpected Refresh call")
+}
+
+func (c lateBootMarketplaceCatalog) Status(context.Context) ([]marketplacepkg.SourceState, error) {
+	if c.states != nil {
+		return c.states, nil
+	}
+	return nil, errors.New("unexpected Status call")
+}
+
+type lateBootExtensionService struct{}
+
+func (lateBootExtensionService) List(context.Context) ([]contract.ExtensionPayload, error) {
+	return []contract.ExtensionPayload{}, nil
+}
+
+func (lateBootExtensionService) Search(
+	context.Context,
+	contract.ExtensionSearchRequest,
+) (contract.ExtensionSearchResponse, error) {
+	return contract.ExtensionSearchResponse{}, nil
+}
+
+func (lateBootExtensionService) MarketplaceTrust(
+	context.Context,
+	extensionpkg.MarketplaceTrustEvidence,
+) (contract.ExtensionTrustReportPayload, error) {
+	return contract.ExtensionTrustReportPayload{
+		Decision:         extensionpkg.ExtensionTrustDecisionVerified,
+		RegistryTier:     extensionpkg.ExtensionRegistryTierOfficial,
+		ChecksumVerified: true,
+	}, nil
+}
+
+func (lateBootExtensionService) Install(
+	context.Context,
+	contract.InstallExtensionRequest,
+	taskpkg.ActorContext,
+) (contract.ExtensionPayload, error) {
+	return contract.ExtensionPayload{}, errors.New("unexpected Install call")
+}
+
+func (lateBootExtensionService) Update(
+	context.Context,
+	string,
+	contract.UpdateExtensionRequest,
+	taskpkg.ActorContext,
+) (contract.ManagedExtensionUpdatePayload, error) {
+	return contract.ManagedExtensionUpdatePayload{}, errors.New("unexpected Update call")
+}
+
+func (lateBootExtensionService) UpdateBatch(
+	context.Context,
+	contract.UpdateExtensionsRequest,
+	taskpkg.ActorContext,
+) ([]contract.ManagedExtensionUpdatePayload, error) {
+	return nil, errors.New("unexpected UpdateBatch call")
+}
+
+func (lateBootExtensionService) Remove(
+	context.Context,
+	string,
+	taskpkg.ActorContext,
+) (contract.ManagedExtensionRemovePayload, error) {
+	return contract.ManagedExtensionRemovePayload{}, errors.New("unexpected Remove call")
+}
+
+func (lateBootExtensionService) Enable(
+	context.Context,
+	string,
+	contract.EnableExtensionRequest,
+	taskpkg.ActorContext,
+) (contract.ExtensionEnableResult, error) {
+	return contract.ExtensionEnableResult{}, errors.New("unexpected Enable call")
+}
+
+func (lateBootExtensionService) Disable(
+	context.Context,
+	string,
+	taskpkg.ActorContext,
+) (contract.ExtensionPayload, error) {
+	return contract.ExtensionPayload{}, errors.New("unexpected Disable call")
+}
+
+func (lateBootExtensionService) Status(context.Context, string) (contract.ExtensionPayload, error) {
+	return contract.ExtensionPayload{}, errors.New("unexpected Status call")
+}
+
+func (lateBootExtensionService) InventoryScoped(
+	context.Context,
+	string,
+	taskpkg.ActorContext,
+) (contract.ExtensionInventoryPayload, error) {
+	return contract.ExtensionInventoryPayload{}, errors.New("unexpected InventoryScoped call")
+}
+
+func (lateBootExtensionService) Preview(context.Context, string) (contract.ExtensionEnablePreviewPayload, error) {
+	return contract.ExtensionEnablePreviewPayload{}, errors.New("unexpected Preview call")
+}
+
+func (lateBootExtensionService) Provenance(
+	context.Context,
+	string,
+) (contract.ExtensionProvenancePayload, error) {
+	return contract.ExtensionProvenancePayload{}, errors.New("unexpected Provenance call")
+}
+
+func (lateBootExtensionService) ListExtensionSecrets(
+	context.Context,
+	string,
+	taskpkg.ActorContext,
+) (contract.ExtensionSecretsPayload, error) {
+	return contract.ExtensionSecretsPayload{}, errors.New("unexpected ListExtensionSecrets call")
+}
+
+func (lateBootExtensionService) SetExtensionSecrets(
+	context.Context,
+	string,
+	contract.SetExtensionSecretsRequest,
+	taskpkg.ActorContext,
+) (contract.ExtensionSecretsPayload, error) {
+	return contract.ExtensionSecretsPayload{}, errors.New("unexpected SetExtensionSecrets call")
+}
+
+func (lateBootExtensionService) DeleteExtensionSecret(
+	context.Context,
+	string,
+	string,
+	taskpkg.ActorContext,
+) error {
+	return errors.New("unexpected DeleteExtensionSecret call")
+}
+
+type scopedLateBootExtensionService struct {
+	lateBootExtensionService
+	listScopedFn func(context.Context, taskpkg.ActorContext) ([]contract.ExtensionPayload, error)
+}
+
+func (s scopedLateBootExtensionService) ListScoped(
+	ctx context.Context,
+	actor taskpkg.ActorContext,
+) ([]contract.ExtensionPayload, error) {
+	return s.listScopedFn(ctx, actor)
+}
+
+func (scopedLateBootExtensionService) StatusScoped(
+	context.Context,
+	string,
+	taskpkg.ActorContext,
+) (contract.ExtensionPayload, error) {
+	return contract.ExtensionPayload{}, errors.New("unexpected StatusScoped call")
+}
+
+func TestMarketplaceNativeSearch(t *testing.T) {
+	t.Parallel()
+	t.Run("Should list experimental sources with diagnostics through the native registry", func(t *testing.T) {
+		t.Parallel()
+		registry := newDaemonNativeRegistry(t, &daemonNativeToolsDeps{
+			MarketplaceCatalog: lateBootMarketplaceCatalog{states: []marketplacepkg.SourceState{
+				{Source: "compozy-catalog", SourceRef: "catalog:compozy", Kind: "feed", Enabled: true},
+				{Source: "team", SourceRef: "github:team/plugins", Kind: "custom", Enabled: false},
+			}},
+		}, nativeApproveAllPolicyInputs())
+		result, err := registry.Call(t.Context(), toolspkg.Scope{Operator: true}, toolspkg.CallRequest{
+			ToolID: toolspkg.ToolIDMarketplaceSources, Input: json.RawMessage(`{}`),
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		raw := result.Structured
+		var response contract.MarketplaceSourcesResponse
+		if err := json.Unmarshal(raw, &response); err != nil {
+			t.Fatal(err)
+		}
+		if len(response.Sources) != 2 || response.Sources[1].State != "off" || response.Sources[1].Diagnostics == nil ||
+			response.Sources[0].Stability != "experimental" {
+			t.Fatalf("native sources = %s", raw)
+		}
+	})
+
+	t.Run("Should reject obsolete kind before catalog discovery", func(t *testing.T) {
+		t.Parallel()
+
+		registry := newDaemonNativeRegistry(t, &daemonNativeToolsDeps{
+			MarketplaceCatalog: lateBootMarketplaceCatalog{},
+		}, nativeApproveAllPolicyInputs())
+		_, err := registry.Call(
+			t.Context(),
+			toolspkg.Scope{Operator: true},
+			toolspkg.CallRequest{
+				ToolID: toolspkg.ToolIDMarketplaceSearch,
+				Input:  json.RawMessage(`{"kind":"extension"}`),
+			},
+		)
+		if err == nil || !errors.Is(err, toolspkg.ErrToolInvalidInput) {
+			t.Fatalf("Registry.Call(obsolete kind) error = %v, want invalid input", err)
+		}
+	})
+
+	t.Run("Should resolve extensions attached after the native registry boots", func(t *testing.T) {
+		t.Parallel()
+
+		homePaths := testHomePaths(t)
+		cfg := testConfig(t, homePaths)
+		entry := lateBootMarketplaceEntry()
+		state := &bootState{
+			cfg: cfg,
+			deps: RuntimeDeps{
+				MarketplaceCatalog: lateBootMarketplaceCatalog{entry: entry},
+			},
+		}
+		daemon := &Daemon{homePaths: homePaths}
+		deps := daemon.nativeToolsDeps(state, func() toolspkg.Registry { return nil })
+		nativeTools := &daemonNativeTools{deps: &deps}
+
+		state.deps.Extensions = lateBootExtensionService{}
+		result, err := nativeTools.marketplaceSearch(
+			t.Context(),
+			toolspkg.Scope{Operator: true},
+			toolspkg.CallRequest{
+				ToolID: toolspkg.ToolIDMarketplaceSearch,
+				Input:  json.RawMessage(`{}`),
+			},
+		)
+		if err != nil {
+			t.Fatalf("Registry.Call(marketplace_search) error = %v", err)
+		}
+		requireNativeStructuredContains(t, result, []byte(`"entry_id":"late-boot-extension"`))
+	})
+
+	t.Run("Should preserve the trusted workspace actor for scoped extension discovery", func(t *testing.T) {
+		t.Parallel()
+
+		homePaths := testHomePaths(t)
+		cfg := testConfig(t, homePaths)
+		entry := lateBootMarketplaceEntry()
+		var capturedActor taskpkg.ActorContext
+		service := scopedLateBootExtensionService{
+			listScopedFn: func(
+				_ context.Context,
+				actor taskpkg.ActorContext,
+			) ([]contract.ExtensionPayload, error) {
+				capturedActor = actor
+				return []contract.ExtensionPayload{
+					{
+						Name:        "workspace-extension",
+						Version:     "1.0.0",
+						WorkspaceID: "ws-native",
+						Provenance:  &contract.ExtensionProvenancePayload{CatalogEntryID: entry.EntryID},
+						// The scoped inventory owns the exact acquisition origin in the unified catalog contract.
+						Origin: &contract.MarketplaceOriginPayload{
+							Source:    "compozy-catalog",
+							SourceRef: marketplacepkg.CompozyCatalogRef,
+							EntryID:   entry.EntryID,
+						},
+					},
+				}, nil
+			},
+		}
+		state := &bootState{
+			cfg: cfg,
+			deps: RuntimeDeps{
+				MarketplaceCatalog: lateBootMarketplaceCatalog{entry: entry},
+				Extensions:         service,
+			},
+		}
+		daemon := &Daemon{homePaths: homePaths}
+		deps := daemon.nativeToolsDeps(state, func() toolspkg.Registry { return nil })
+		nativeTools := &daemonNativeTools{deps: &deps}
+
+		result, err := nativeTools.marketplaceSearch(
+			t.Context(),
+			toolspkg.Scope{
+				ProfileID:   store.DefaultProfileID,
+				WorkspaceID: "ws-native",
+				SessionID:   "session-native",
+				AgentName:   "marketplace-agent",
+				ActorKind:   string(taskpkg.ActorKindAgentSession),
+			},
+			toolspkg.CallRequest{
+				ToolID: toolspkg.ToolIDMarketplaceSearch,
+				Input:  json.RawMessage(`{}`),
+			},
+		)
+		if err != nil {
+			t.Fatalf("marketplaceSearch(workspace agent) error = %v", err)
+		}
+		if capturedActor.Actor.Kind != taskpkg.ActorKindAgentSession ||
+			capturedActor.Actor.Ref != "session-native" ||
+			capturedActor.Scope.WorkspaceID != "ws-native" ||
+			!capturedActor.Authority.Read {
+			t.Fatalf("scoped marketplace actor = %#v, want readable native agent actor", capturedActor)
+		}
+		requireNativeStructuredContains(t, result, []byte(`"installed":true`))
+	})
+
+	t.Run("Should resolve a named profile scope for installed-state projection", func(t *testing.T) {
+		t.Parallel()
+
+		const profileID = "01ARZ3NDEKTSV4RRFFQ69G5FAV"
+		nativeTools := &daemonNativeTools{deps: &daemonNativeToolsDeps{
+			Profiles: nativeProfileReaderStub{profiles: []profilepkg.WithCounts{{
+				ID: profileID, Name: "marketing",
+			}}},
+		}}
+		scope, workspaceID, profileName, err := nativeTools.marketplaceToolScope(
+			t.Context(),
+			toolspkg.Scope{ProfileID: profileID},
+		)
+		if err != nil {
+			t.Fatalf("marketplaceToolScope(profile) error = %v", err)
+		}
+		if scope != contract.MarketplaceScopeProfile || workspaceID != "" || profileName != "marketing" {
+			t.Fatalf(
+				"marketplaceToolScope(profile) = %q/%q/%q, want profile//marketing",
+				scope,
+				workspaceID,
+				profileName,
+			)
+		}
+	})
+}

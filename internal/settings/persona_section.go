@@ -1,0 +1,73 @@
+package settings
+
+import (
+	"context"
+	"errors"
+
+	compozyconfig "github.com/compozy/compozy/internal/config"
+)
+
+func diffPersonaSettings(current compozyconfig.DefaultsConfig, desired compozyconfig.DefaultsConfig) []string {
+	changed := make([]string, 0, 4)
+	if current.Agent != desired.Agent {
+		changed = append(changed, "defaults.agent")
+	}
+	if current.Provider != desired.Provider {
+		changed = append(changed, "defaults.provider")
+	}
+	if current.Model != desired.Model {
+		changed = append(changed, "defaults.model")
+	}
+	if current.ReasoningEffort != desired.ReasoningEffort {
+		changed = append(changed, "defaults.reasoning_effort")
+	}
+	return changed
+}
+
+func applyPersonaSettings(editor *compozyconfig.OverlayEditor, desired compozyconfig.DefaultsConfig) error {
+	return applyValueUpdates(editor, []struct {
+		path  []string
+		value any
+	}{
+		{path: []string{sectionsDefaultsKey, "agent"}, value: desired.Agent},
+		// The provider goes first: changing it clears the stored model and
+		// reasoning, which the next two writes then replace.
+		{path: []string{sectionsDefaultsKey, sectionsProviderKey}, value: desired.Provider},
+		{path: []string{sectionsDefaultsKey, "model"}, value: desired.Model},
+		{path: []string{sectionsDefaultsKey, "reasoning_effort"}, value: desired.ReasoningEffort},
+	})
+}
+
+func (s *service) updatePersonaSection(ctx context.Context, req SectionUpdateRequest) (MutationResult, error) {
+	if req.Persona == nil {
+		return MutationResult{}, validationError(errors.New("settings: persona section payload is required"))
+	}
+	desired := *req.Persona
+	if err := desired.Validate(); err != nil {
+		return MutationResult{}, validationError(err)
+	}
+	loaded, err := s.loadScopedSectionUpdateForProfile(
+		ctx,
+		req.Section,
+		req.Scope,
+		req.WorkspaceID,
+		req.ProfileName,
+		ScopeUser,
+		ScopeProfile,
+		ScopeWorkspace,
+	)
+	if err != nil {
+		return MutationResult{}, err
+	}
+	changed := diffPersonaSettings(loaded.config.Defaults, desired)
+	return s.updateScopedConfigSectionForProfile(
+		req.Section,
+		changed,
+		loaded.target,
+		loaded.scope,
+		loaded.workspaceID,
+		loaded.profileName,
+		loaded.workspaceRoot,
+		func(editor *compozyconfig.OverlayEditor) error { return applyPersonaSettings(editor, desired) },
+	)
+}

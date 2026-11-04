@@ -1,0 +1,58 @@
+export {
+  settingsAppliedMutationFixture,
+  settingsAutomationSectionFixture,
+  settingsAttentionSectionFixture,
+  settingsCmdPaletteSectionFixture,
+  settingsGeneralSectionFixture,
+  settingsHooksExtensionsSectionFixture,
+  settingsHookFixtures,
+  mcpAuthBeginFixture,
+  mcpAuthStatusAuthenticatedFixture,
+  mcpExtensionServerFixtures,
+  mcpManagementCollectionFixture,
+  mcpManagementServerFixtures,
+  mcpOwnerCollectionFixture,
+  settingsMCPServersCollectionFixture,
+  settingsMCPServerFixtures,
+  settingsMarketplaceSectionFixture,
+  settingsProviderUsageSectionFixture,
+  settingsObservabilitySectionFixture,
+  settingsProvidersCollectionFixture,
+  settingsProviderFixtures,
+  settingsRestartRequiredMutationFixture,
+  settingsRestartResponseFixture,
+  settingsRestartStatusFixture,
+  settingsSkillSourcesFixture,
+  settingsSkillsSectionFixture,
+} from "./fixtures";
+export { settingsHooksCollectionFixture, settingsPersonaSectionFixture } from "./layered-fixtures";
+export {
+  rolesStatusFixture,
+  rolesStatusWithDiagnosticFixture,
+  settingsRolesConfigFixture,
+  settingsRolesConfigWithFallbackFixture,
+  settingsRolesSectionFixture,
+  settingsRolesSectionWithFallbackFixture,
+} from "./roles-fixtures";
+export {
+  settingsUpdateAppAvailableFixture,
+  settingsUpdateApplyingFixture,
+  settingsUpdateBlockedFixture,
+  settingsUpdateBothAvailableFixture,
+  settingsUpdateManagedFixture,
+  settingsUpdateNoAppFixture,
+  settingsUpdateRolledBackFixture,
+  settingsUpdateRuntimeAvailableFixture,
+  settingsUpdateStagedFixture,
+  settingsUpdateStatusFixture,
+} from "./settings-update-fixture";
+export { handlers } from "./handlers";
+export {
+  settingsWindowManagerDesktopIds,
+  settingsWindowManagerSectionFixture,
+  settingsWindowManagerSnapshotFixture,
+  windowManagerLayoutDocumentFixture,
+  windowManagerLayoutResourceFixture,
+} from "./window-manager-fixtures";
+
+export { resetWindowManagerSettingsMockState } from "./window-manager-settings-handlers";

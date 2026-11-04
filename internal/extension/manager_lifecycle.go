@@ -1,0 +1,283 @@
+package extensionpkg
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"maps"
+	"slices"
+	"sync"
+)
+
+// Start loads every enabled extension through the six-phase pipeline.
+func (m *Manager) Start(ctx context.Context) error {
+	if ctx == nil {
+		return ErrContextRequired
+	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if m == nil {
+		return ErrManagerRequired
+	}
+
+	m.lifecycleMu.Lock()
+	defer m.lifecycleMu.Unlock()
+	return m.startLocked(ctx)
+}
+
+// Unselected activation failures stay visible in snapshots while selected mutation errors propagate.
+func (m *Manager) startLocked(ctx context.Context, targets ...string) error {
+	if err := m.prepareStart(ctx); err != nil {
+		return err
+	}
+
+	m.mu.Lock()
+	lifecycleCtx, cancel := context.WithCancel(context.WithoutCancel(ctx))
+	m.lifecycleCtx = lifecycleCtx
+	m.cancel = cancel
+	m.started = true
+	m.stopping = false
+	m.devOperations = 0
+	m.devOperationsDone = nil
+	m.extensions = make(map[string]*managedExtension)
+	m.devExtensions = make(map[InstanceKey]*managedExtension)
+	m.scopedExtensions = make(map[InstanceKey]*managedExtension)
+	m.devCoordinators = make(map[InstanceKey]*sync.Mutex)
+	m.profileCoordinators = make(map[InstanceKey]*sync.Mutex)
+	m.devLogs = make(map[InstanceKey]*ExtensionLogRing)
+	m.mu.Unlock()
+
+	infos, err := m.registry.List()
+	if err != nil {
+		cancel()
+		m.mu.Lock()
+		m.started = false
+		m.lifecycleCtx = nil
+		m.cancel = nil
+		m.devOperations = 0
+		m.devOperationsDone = nil
+		m.extensions = make(map[string]*managedExtension)
+		m.devExtensions = make(map[InstanceKey]*managedExtension)
+		m.scopedExtensions = make(map[InstanceKey]*managedExtension)
+		m.devCoordinators = make(map[InstanceKey]*sync.Mutex)
+		m.profileCoordinators = make(map[InstanceKey]*sync.Mutex)
+		m.devLogs = make(map[InstanceKey]*ExtensionLogRing)
+		m.mu.Unlock()
+		return fmt.Errorf("extension: list registry entries: %w", err)
+	}
+
+	var errs []error
+	for infoIndex := range infos {
+		if err := m.startInstalledPackage(ctx, &infos[infoIndex]); err != nil {
+			if len(targets) == 0 || slices.Contains(targets, infos[infoIndex].Name) {
+				errs = append(errs, err)
+			}
+		}
+	}
+
+	links, err := m.registry.ListDevLinks()
+	if err != nil {
+		errs = append(errs, fmt.Errorf("extension: list development links: %w", err))
+	} else {
+		for i := range links {
+			m.startDevLinkOnBoot(ctx, links[i])
+		}
+	}
+
+	return errors.Join(ctx.Err(), errors.Join(errs...))
+}
+
+func (m *Manager) prepareStart(ctx context.Context) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if m.registry == nil {
+		return ErrRegistryRequired
+	}
+
+	m.mu.Lock()
+	if m.started {
+		m.mu.Unlock()
+		return errors.New("extension: manager already started")
+	}
+	m.mu.Unlock()
+	if err := m.retryPendingCleanups(ctx); err != nil {
+		return fmt.Errorf("extension: drain pending cleanup before start: %w", err)
+	}
+	return nil
+}
+
+// Stop gracefully drains all active extension subprocesses.
+func (m *Manager) Stop(ctx context.Context) error {
+	if ctx == nil {
+		return ErrContextRequired
+	}
+	if m == nil {
+		return ErrManagerRequired
+	}
+
+	m.lifecycleMu.Lock()
+	defer m.lifecycleMu.Unlock()
+	return m.stopLocked(ctx)
+}
+
+// Manager-wide drain and cleanup failures remain fatal even when per-package shutdown errors are scoped.
+func (m *Manager) stopLocked(ctx context.Context, targets ...string) error {
+	m.mu.Lock()
+	if !m.started {
+		m.mu.Unlock()
+		return m.retryPendingCleanups(ctx)
+	}
+	m.stopping = true
+	cancel := m.cancel
+	devOperationsDone := m.devOperationsDone
+	m.mu.Unlock()
+
+	if cancel != nil {
+		cancel()
+	}
+	// A drain that never settles must not strand extension subprocesses, so teardown continues.
+	var drainErr error
+	if err := m.waitForDevOperationsDuringShutdown(ctx, devOperationsDone); err != nil {
+		drainErr = fmt.Errorf("extension: wait for admitted development operations: %w", err)
+	}
+	pendingCleanupErr := m.retryPendingCleanups(ctx)
+
+	names, instanceKeys := m.stopTargets()
+
+	errCh := make(chan error, len(names)+len(instanceKeys))
+	var stopWG sync.WaitGroup
+	for _, name := range names {
+		ext, ok := m.lookupManaged(name)
+		if !ok {
+			continue
+		}
+
+		stopWG.Go(func() {
+			if err := m.stopManagedForTargets(ctx, ext, targets); err != nil {
+				errCh <- err
+			}
+		})
+	}
+	for _, key := range instanceKeys {
+		ext, ok := m.lookupInstance(key)
+		if !ok {
+			continue
+		}
+		stopWG.Go(func() {
+			if err := m.stopManagedForTargets(ctx, ext, targets); err != nil {
+				errCh <- err
+			}
+		})
+	}
+	stopWG.Wait()
+	close(errCh)
+
+	m.wg.Wait()
+
+	m.mu.Lock()
+	m.started = false
+	m.stopping = false
+	m.cancel = nil
+	m.lifecycleCtx = nil
+	m.mu.Unlock()
+
+	errs := []error{drainErr}
+	for err := range errCh {
+		errs = append(errs, err)
+	}
+	if pendingCleanupErr != nil {
+		errs = append(errs, pendingCleanupErr)
+	}
+	return errors.Join(errs...)
+}
+
+// Unrelated shutdown failures remain logged; manager-wide cleanup failures still abort reload.
+func (m *Manager) stopManagedForTargets(ctx context.Context, ext *managedExtension, targets []string) error {
+	err := m.stopManagedExtension(ctx, ext)
+	if err != nil {
+		m.logger.Error("extension.lifecycle.shutdown.failed", "extension", ext.info.Name, "error", err)
+	}
+	if len(targets) == 0 || slices.Contains(targets, ext.info.Name) {
+		return err
+	}
+	return nil
+}
+
+func (m *Manager) stopTargets() ([]string, []InstanceKey) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	names := slices.AppendSeq(make([]string, 0, len(m.extensions)), maps.Keys(m.extensions))
+	slices.Sort(names)
+	instanceKeys := make([]InstanceKey, 0, len(m.devExtensions)+len(m.scopedExtensions))
+	for key := range m.devExtensions {
+		instanceKeys = append(instanceKeys, key)
+	}
+	for key := range m.scopedExtensions {
+		instanceKeys = append(instanceKeys, key)
+	}
+	slices.SortFunc(instanceKeys, compareInstanceKeys)
+	return names, instanceKeys
+}
+
+func (m *Manager) stopManagedExtension(ctx context.Context, item *managedExtension) error {
+	if item == nil {
+		return nil
+	}
+	m.mu.RLock()
+	proc := item.process
+	m.mu.RUnlock()
+	var itemErr error
+	if proc != nil {
+		if err := shutdownProcessWithTimeout(ctx, proc, m.defaultShutdownTimeout); err != nil {
+			itemErr = errors.Join(itemErr, fmt.Errorf("extension %q stop: %w", item.info.Name, err))
+		}
+	}
+
+	if err := m.unregisterResources(ctx, item); err != nil {
+		itemErr = errors.Join(itemErr, err)
+	}
+
+	m.mu.Lock()
+	item.process = nil
+	item.active = false
+	item.awaitingStability = false
+	item.phase = ExtensionPhaseStop
+	cleanups := item.redactionCleanups
+	item.redactionCleanups = nil
+	m.mu.Unlock()
+	if processTerminal(proc) {
+		runExtensionRedactionCleanups(cleanups)
+	} else if proc != nil {
+		m.retainPendingCleanup(pendingExtensionCleanup{
+			key:               item.instanceKey(),
+			process:           proc,
+			redactionCleanups: cleanups,
+		})
+	}
+
+	m.logger.Info("extension.lifecycle.shutdown", managerExtensionKey, item.info.Name)
+	return itemErr
+}
+
+// Reload restarts the manager from the current registry state as one lifecycle operation.
+func (m *Manager) Reload(ctx context.Context) error {
+	return m.ReloadForExtensions(ctx, nil)
+}
+
+// ReloadForExtensions retains unrelated activation failures in status without aborting the selected mutation.
+func (m *Manager) ReloadForExtensions(ctx context.Context, names []string) error {
+	if ctx == nil {
+		return ErrContextRequired
+	}
+	if m == nil {
+		return ErrManagerRequired
+	}
+
+	m.lifecycleMu.Lock()
+	defer m.lifecycleMu.Unlock()
+	stopErr := m.stopLocked(ctx, names...)
+	startErr := m.startLocked(ctx, names...)
+	return errors.Join(stopErr, startErr)
+}

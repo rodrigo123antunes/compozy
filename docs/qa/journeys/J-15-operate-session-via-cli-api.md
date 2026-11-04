@@ -1,0 +1,139 @@
+# J-15 — Operate a session via CLI / API
+
+An agent drives and reads sessions deterministically over any surface (`_qa.md` §3 J-E). A headless actor creates a session, sends a prompt, reads the bounded transcript tail and older REST pages, follows `frames=transcript` with `after_sequence` plus `epoch`/`generation` fences, stops the session, and confirms list/detail/status agree — CLI ↔ HTTP ↔ UDS parity is the point (RT-042 canary). The bugs live in unbounded reads, stale fences, ignored reset reasons, dropped empty-delta cursors, keep-alive gaps, stop-race recorder errors, and lifecycle desync.
+
+```mermaid
+flowchart TD
+    E1[Entry: compozy CLI] --> C[Create session + send prompt]
+    E2[Entry: HTTP client] --> C
+    E3[Entry: UDS client] --> C
+    E4[Entry: compozy__ native tools] --> C
+    C --> REST[Read bounded transcript tail + older pages via before_sequence]
+    C --> STRM[Subscribe SSE: frames=transcript + after_sequence + epoch + generation]
+    C -->|provider repeats one in-progress tool update| BURST[Keep the first call and meaningful enrichments; discard identical repeats]
+    BURST --> STRM
+    C -->|ACP process disconnects mid-response| PFAIL[Persist delivered chunks + start bounded recovery]
+    C --> W[Wait on an exact badge set without polling]
+    W -->|state reached| CTRL[Stop or cancel another session through governed native tools]
+    W -->|timeout with resume_id| W
+    W -->|gone, canceled, overflow, or cap| OUT[Return one deterministic structured outcome]
+    CTRL --> LS
+    OUT --> LS
+    PFAIL --> REC{Replacement starts within 3 attempts?}
+    REC -->|yes| REPLAY[Load or rebuild context + replay same turn]
+    REPLAY --> STRM
+    REC -->|no| DIAG[Emit one terminal failure + preserve diagnostics]
+    DIAG --> RECAP[Read recap and transcript again]
+    RECAP --> FORK[Fork child session with parent provenance]
+    FORK --> C
+    STRM -->|no cursor| SNAP[Bounded snapshot, reset=false]
+    STRM -->|missing/stale fence or reset cursor| RESET[Reset snapshot + explicit reason]
+    STRM -->|empty delta with newer cursor| ADV[Advance safe cursor without adding an entry]
+    STRM -->|idle| KA[Keep-alive comment frames ≤ heartbeat interval]
+    REST --> RD[Read events/history: bounded defaults + cursor pages]
+    RD --> RC[Recap: bounded, byte-identical payload]
+    C --> STOP[Stop session]
+    STOP --> DR[Read during stop/finalize: persisted transcript, never a recorder error]
+    DR --> LS[List + detail + status agree on state, incl. after daemon restart]
+    STRM -.->|client killed mid-stream| AB[Abandon: reconnect with cursor + epoch/generation fences]
+    AB -.-> STRM
+    LS --> DV[Preview derive: message_count, replay_bytes, source_message_count, native_fork_possible, fences]
+    DV --> DC[session continue --agent / session fork --message-id with an idempotency key]
+    DC -->|idle bound source advertising session/fork + session/load| NAT[Child seed native_fork: pending → loaded at first bind, or failed + carried context]
+    DC -->|otherwise| REPL[Child seed replay: carried context rides the first prompt]
+    DC -->|same key again| RPLY[Recorded outcome, replayed true; child_deleted after delete; no second child]
+    DC -->|stale fences, unsettled cut, key reused with another request| DREF[409 refusal, nothing created]
+    NAT --> DSRC[Source max_sequence, fences, and events unchanged; no clone traffic]
+    REPL --> DSRC
+    DSRC --> LS
+    LS --> TE[True end: complete gap-free transcript, lifecycle state consistent across surfaces, HTTP/UDS parity]
+```
+
+```yaml
+journey:
+  id: J-15
+  name: "Operate a session via CLI / API (headless, cross-surface parity)"
+  value_statement: "An agent can drive and read sessions deterministically over CLI, HTTP, or UDS — bounded REST history, fenced transcript deltas, explicit resets, keep-alive, gap-free reconnect, and identical lifecycle state everywhere."
+  personas: [Ada]
+  entry_points:
+    - url: "CLI: compozy session ... (create/prompt/events --follow/status/stop)"
+      origin: direct
+    - url: "CLI: compozy session list --attention/--badge/--all-workspaces/--summary; interactions; wait --until/--timeout/--unbounded; prompt-cancel; spawn --no-notify-creator; notify"
+      origin: direct
+    - url: "HTTP: POST/GET /api/.../sessions/:id/{prompt,stream,transcript,events,recap,stop}"
+      origin: direct
+    - url: "HTTP: presence, interactions, attention-summary, wait, notify, spawn, and prompt-cancel routes"
+      origin: direct
+    - url: "UDS: same verb set over the CLI socket"
+      origin: direct
+    - url: "native: compozy__notify and compozy__session_{wait,spawn,stop,approve,clarify_answer,prompt_cancel}"
+      origin: direct
+  actions:
+    - step: 1
+      verb: "Create a session and send a prompt over a surface"
+      expected_observable: "201 session; prompt streams Vercel-AI-UI SSE (`frames=transcript`) or byte-identical raw event rows (`frames=raw`) for CLI follow; repeated in-progress updates for one tool keep the first call, each meaningful enrichment, the terminal result, and prompt completion without disconnecting"
+    - step: 2
+      verb: "Subscribe to the stream and read bounded history"
+      expected_observable: "Transcript REST returns a bounded tail and older pages via `before_sequence`; transcript SSE reconnects with `after_sequence`, `epoch`, and `generation`, emits bounded deltas for matching fences, emits an explicit reset snapshot for `fence_missing`, `epoch_mismatch`, `generation_mismatch`, or `sequence_reset`, and may advance the cursor with an empty delta; idle streams emit keep-alive comments ≤ heartbeat"
+    - step: 3
+      verb: "Handle an ACP process disconnect during a prompt"
+      expected_observable: "Already delivered chunks remain persisted; status and events report bounded recovery; a replacement loads or rebuilds context and completes the same turn; only three failed replacements produce one terminal error and process_exit diagnostics"
+    - step: 4
+      verb: "Stop the session and read during finalize"
+      expected_observable: "Reads racing the stop return the persisted transcript, never a recorder-unavailable error; recap is byte-identical to the streamed payload"
+    - step: 5
+      verb: "Compare list, detail, and status across surfaces"
+      expected_observable: "State is identical across `list`, `detail`, and `status` through spawn → background → stop (and after a daemon restart); HTTP and UDS agree byte-for-byte on the same inputs"
+    - step: 6
+      verb: "Wait for and control another same-workspace session without polling or shell access"
+      expected_observable: "Wait, stop, prompt cancel, spawn, approval, clarification answer, and notify return deterministic structured winners; self and foreign-workspace targets are denied"
+    - step: 7
+      verb: "Continue a session with another agent or fork it (whole or through a user message)"
+      expected_observable: "Exactly one child per idempotency key with lineage.kind continue|fork and a derivation read; native clone on an idle bound source whose agent advertises session/fork + session/load, carried context otherwise; retries return the recorded outcome; stale fences and unsettled cuts refuse with 409; the source never changes (session-continue-fork, 2026-09-28)"
+  goal:
+    observable: "The agent reads a complete, gap-free transcript and drives the session to a terminal outcome deterministically, with lifecycle state consistent across every surface"
+    side_effects: [session-created, prompt-streamed, tool-update-burst-coalesced, partial-output-persisted, session-stopped]
+  true_end_state: "Older REST pages remain loaded; reconnect after killing the client resumes from `after_sequence` with matching `epoch`/`generation`, or replaces the bounded tail only on an explicit reset; empty deltas still advance the cursor; repeated in-progress updates for one tool do not exhaust the prompt queue and still end with the tool result before prompt completion; an ACP process disconnect keeps the same turn alive through bounded recovery, while three failed replacements produce one terminal failure and a forkable original; waits and governed native mutations settle once; list/detail/status agree after a daemon restart; HTTP and UDS return identical structured output."
+  exit:
+    natural: "The agent has a terminal outcome + a complete transcript and hands off / records the result."
+  abandonment:
+    - at_step: 2
+      how: "The client is killed mid-stream (crash, network)."
+      resume: "Reconnect with `after_sequence`, `epoch`, and `generation`; matching fences resume with bounded deltas, while a reset snapshot names why the cached tail must be replaced; an empty delta still advances the safe cursor."
+    - at_step: 3
+      how: "The ACP provider process disconnects after delivering part of the final response."
+      resume: "Wait for bounded automatic recovery. If all three replacements fail, inspect the persisted transcript and `process_exit` diagnostics, then fork a child with the original as parent. Replay may repeat an external side effect when the provider cannot prove completion."
+    - at_step: 4
+      how: "A read races the stop and hits a recorder-unavailable error, so the agent aborts."
+      resume: "Reads during stop/finalize must degrade to the persisted transcript; the finding is any recorder error surfaced to the caller."
+    - at_step: 7
+      how: "The derive request's response is lost (network drop or daemon restart right after it returned)."
+      resume: "Repeat the same command with the same idempotency key: the recorded outcome returns with replayed true and a staged first message is dispatched exactly once."
+  crosses: [CLI, HTTP, UDS, native-tool-registry, session-store, SSE-broadcaster, RT-042-parity-canary]
+
+design_reference:
+  screens:
+    - "structured surface only — no web UI (Ada never sees the SPA)"
+  truthful_ui_checks:
+    - "`frames=raw` follow is byte-compatible with the pre-program CLI contract (task 44)."
+    - "Older transcript entries come from bounded REST pages using `before_sequence`; forward changes come from `frames=transcript` SSE."
+    - "Reconnects carry `after_sequence`, `epoch`, and `generation`; reset snapshots name `fence_missing`, `epoch_mismatch`, `generation_mismatch`, or `sequence_reset`."
+    - "An empty `transcript_delta` may advance the safe cursor without adding a visible entry."
+    - "Reads during stop/finalize return the persisted transcript, never a recorder error (task 21)."
+    - "An ACP process disconnect preserves delivered chunks, reports recovery progress, replaces the runtime, and continues the same turn; after three failures it emits one terminal error, records `process_exit` diagnostics, and permits an explicit child-session fork."
+    - "List/detail/status agree through spawn→background→stop→restart (task 22); HTTP↔UDS byte parity (RT-042)."
+
+e2e_backbone:
+  runtime:
+    - "E2E-runtime 1: long-session bounded REST pagination under lane latency (task 14)."
+    - "E2E-runtime 3: reconnect with matching and stale transcript fences, including explicit reset reasons and empty-delta cursor advancement (task 17)."
+    - "E2E-runtime 4: consistent state across list and detail through spawn → background → stop (task 22)."
+    - "ACP subprocess contract: more than 1,024 repeated in-progress updates for one tool yield one canonical tool call, one terminal result, and prompt completion through a two-event prompt buffer."
+    - "E2E-runtime fault path: a real ACP subprocess disconnect after a partial response is projected through HTTP, UDS, CLI JSONL, `compozy__session_prompt`, persisted transcript, recovery events, replacement generation, and the exhausted read-only/fork branch."
+  manual:
+    - "Manual §9.6: raw-stream contiguity — `compozy session events --follow` against a busy session, disconnect during a large output burst, reconnect; the printed sequence is contiguous with no skipped `sequence` (tasks 42/43)."
+  telemetry:
+    - "Task 40 daemon slog/counters: stream open/close, catch-up batch size, transcript assembly duration — the agent-side observability of the same stream."
+  followups:
+    - "AB-008 — keep-alive proxy soak (environment-specific, task 20) has no automated assertion; the cross-surface parity harness (see AB-003 pattern for Loops) is not yet extended to the session verb set."
+```

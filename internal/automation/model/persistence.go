@@ -1,0 +1,133 @@
+package model
+
+import (
+	"errors"
+	"time"
+
+	"github.com/compozy/compozy/internal/store"
+)
+
+var (
+	// ErrJobNotFound reports that the requested automation job does not exist.
+	ErrJobNotFound = errors.New("automation: job not found")
+	// ErrTriggerNotFound reports that the requested automation trigger does not exist.
+	ErrTriggerNotFound = errors.New("automation: trigger not found")
+	// ErrRunNotFound reports that the requested automation run does not exist.
+	ErrRunNotFound = errors.New("automation: run not found")
+	// ErrRunAlreadyExists reports that an automation run identity has already been claimed.
+	ErrRunAlreadyExists = errors.New("automation: run already exists")
+	// ErrRunReservationConflict reports that an existing run changed before dispatch activation.
+	ErrRunReservationConflict = errors.New("automation: run reservation conflict")
+	// ErrSchedulerStateNotFound reports that no durable scheduler cursor exists for a job.
+	ErrSchedulerStateNotFound = errors.New("automation: scheduler state not found")
+	// ErrScheduledFireAlreadyClaimed reports that a scheduled fire identity was already claimed.
+	ErrScheduledFireAlreadyClaimed = errors.New("automation: scheduled fire already claimed")
+	// ErrJobNameTaken reports a duplicate job name within the same automation scope.
+	ErrJobNameTaken = errors.New("automation: job name already exists in scope")
+	// ErrTriggerNameTaken reports a duplicate trigger name within the same automation scope.
+	ErrTriggerNameTaken = errors.New("automation: trigger name already exists in scope")
+	// ErrTriggerWebhookIDTaken reports a duplicate stable webhook identifier.
+	ErrTriggerWebhookIDTaken = errors.New("automation: trigger webhook id already exists")
+	// ErrOverlayRequiresConfigSource reports that enabled overlays only apply to config- or package-backed definitions.
+	ErrOverlayRequiresConfigSource = errors.New("automation: enabled overlays require config or package source")
+	// ErrJobOverlayNotFound reports that a job enabled overlay row does not exist.
+	ErrJobOverlayNotFound = errors.New("automation: job enabled overlay not found")
+	// ErrTriggerOverlayNotFound reports that a trigger enabled overlay row does not exist.
+	ErrTriggerOverlayNotFound = errors.New("automation: trigger enabled overlay not found")
+)
+
+// RunOwnerKind selects the independent automation run owner namespace.
+type RunOwnerKind string
+
+const (
+	RunOwnerJob     RunOwnerKind = "job"
+	RunOwnerTrigger RunOwnerKind = "trigger"
+)
+
+// JobListQuery filters persisted automation job listings.
+type JobListQuery struct {
+	AllWorkspaces bool            `json:"all_workspaces,omitempty"`
+	WorkspaceIDs  []string        `json:"workspace_ids,omitempty"`
+	ReadScope     store.ReadScope `json:"read_scope"`
+	Scope         Scope           `json:"scope,omitempty"`
+	WorkspaceID   string          `json:"workspace_id,omitempty"`
+	Source        JobSource       `json:"source,omitempty"`
+	LoopName      string          `json:"loop_name,omitempty"`
+	Target        string          `json:"target,omitempty"`
+	Enabled       *bool           `json:"enabled,omitzero"`
+	Search        string          `json:"q,omitempty"`
+	Cursor        string          `json:"cursor,omitempty"`
+	Limit         int             `json:"limit,omitzero"`
+}
+
+// TriggerListQuery filters persisted automation trigger listings.
+type TriggerListQuery struct {
+	AllWorkspaces bool            `json:"all_workspaces,omitempty"`
+	WorkspaceIDs  []string        `json:"workspace_ids,omitempty"`
+	ReadScope     store.ReadScope `json:"read_scope"`
+	Scope         Scope           `json:"scope,omitempty"`
+	WorkspaceID   string          `json:"workspace_id,omitempty"`
+	Event         string          `json:"event,omitempty"`
+	Source        JobSource       `json:"source,omitempty"`
+	LoopName      string          `json:"loop_name,omitempty"`
+	Target        string          `json:"target,omitempty"`
+	Enabled       *bool           `json:"enabled,omitzero"`
+	Search        string          `json:"q,omitempty"`
+	Cursor        string          `json:"cursor,omitempty"`
+	Limit         int             `json:"limit,omitzero"`
+}
+
+// RunQuery filters automation run history and fire-limit window lookups.
+type RunQuery struct {
+	AllWorkspaces bool            `json:"all_workspaces,omitempty"`
+	WorkspaceID   string          `json:"workspace_id,omitempty"`
+	WorkspaceIDs  []string        `json:"workspace_ids,omitempty"`
+	Cursor        string          `json:"cursor,omitempty"`
+	ReadScope     store.ReadScope `json:"read_scope"`
+	JobID         string          `json:"job_id,omitempty"`
+	TriggerID     string          `json:"trigger_id,omitempty"`
+	Status        RunStatus       `json:"status,omitempty"`
+	ExcludeID     string          `json:"exclude_id,omitempty"`
+	Since         time.Time       `json:"since"`
+	Until         time.Time       `json:"until"`
+	Limit         int             `json:"limit,omitzero"`
+}
+
+// RunReservation atomically evaluates one rolling fire-limit window and, when
+// capacity remains, reserves the supplied run. ExistingRunID identifies a run
+// already created by the scheduler; that row is excluded from the window and
+// verified instead of inserted again.
+type RunReservation struct {
+	Run             Run
+	ExistingRunID   string
+	ExpectedStatus  RunStatus
+	ExpectedAttempt int
+	Since           time.Time
+	Until           time.Time
+	Window          time.Duration
+	Limit           int
+	CountedStatuses []RunStatus
+}
+
+// RunReservationResult reports the durable fire-limit decision. Count is the
+// number of matching runs observed before any new run was inserted.
+type RunReservationResult struct {
+	Run      Run
+	Reserved bool
+	Count    int64
+	RetryAt  time.Time
+}
+
+// JobEnabledOverlay stores the runtime enabled override for a config-backed job.
+type JobEnabledOverlay struct {
+	JobID           string    `json:"job_id"`
+	EnabledOverride bool      `json:"enabled_override"`
+	UpdatedAt       time.Time `json:"updated_at"`
+}
+
+// TriggerEnabledOverlay stores the runtime enabled override for a config-backed trigger.
+type TriggerEnabledOverlay struct {
+	TriggerID       string    `json:"trigger_id"`
+	EnabledOverride bool      `json:"enabled_override"`
+	UpdatedAt       time.Time `json:"updated_at"`
+}

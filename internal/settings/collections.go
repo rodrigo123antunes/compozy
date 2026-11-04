@@ -1,0 +1,388 @@
+package settings
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"os"
+	"slices"
+	"strings"
+
+	compozyconfig "github.com/compozy/compozy/internal/config"
+
+	"github.com/compozy/compozy/internal/providerauth"
+	authproviders "github.com/compozy/compozy/internal/providers"
+	"github.com/compozy/compozy/internal/vault"
+)
+
+const settingsCredentialSourceEnv = "env"
+
+func (s *service) ListCollection(ctx context.Context, req CollectionRequest) (CollectionEnvelope, error) {
+	scope, workspaceID, err := s.normalizeReadScope(req.Scope, req.WorkspaceID)
+	if err != nil {
+		return CollectionEnvelope{}, fmt.Errorf("settings: list collection %q: %w", req.Collection, err)
+	}
+	profileName, err := normalizeSettingsProfileName(scope, req.ProfileName)
+	if err != nil {
+		return CollectionEnvelope{}, err
+	}
+	availableScopes, err := validateCollectionScope(req.Collection, scope)
+	if err != nil {
+		return CollectionEnvelope{}, err
+	}
+
+	cfg, resolved, err := s.loadConfig(ctx, scope, workspaceID, profileName)
+	if err != nil {
+		return CollectionEnvelope{}, fmt.Errorf("settings: load collection %q config: %w", req.Collection, err)
+	}
+
+	envelope := CollectionEnvelope{
+		Collection:      req.Collection,
+		Scope:           scope,
+		WorkspaceID:     workspaceID,
+		ProfileName:     profileName,
+		AvailableScopes: availableScopes,
+	}
+
+	switch req.Collection {
+	case CollectionProviders:
+		items, buildErr := s.buildProviderItems(ctx, &cfg)
+		if buildErr != nil {
+			return CollectionEnvelope{}, buildErr
+		}
+		envelope.Providers = items
+	case CollectionMCPServers:
+		items, buildErr := s.buildMCPServerItems(ctx, scope, workspaceID, profileName, resolved)
+		if buildErr != nil {
+			return CollectionEnvelope{}, buildErr
+		}
+		envelope.MCPServers = items
+	case CollectionHooks:
+		workspaceRoot := ""
+		if resolved != nil {
+			workspaceRoot = resolved.RootDir
+		}
+		items, buildErr := s.buildHookItems(scope, workspaceID, profileName, workspaceRoot)
+		if buildErr != nil {
+			return CollectionEnvelope{}, buildErr
+		}
+		envelope.Hooks = items
+	default:
+		return CollectionEnvelope{}, notFoundError(fmt.Errorf("settings: unknown collection %q", req.Collection))
+	}
+
+	return envelope, nil
+}
+
+func (s *service) PutCollectionItem(ctx context.Context, req CollectionItemPutRequest) (MutationResult, error) {
+	finalize := func(result MutationResult, err error) (MutationResult, error) {
+		return s.finalizeCommittedCollectionMutation(ctx, result, err, "replace", true)
+	}
+
+	scope, workspaceID, err := s.normalizeReadScope(req.Scope, req.WorkspaceID)
+	if err != nil {
+		return MutationResult{}, fmt.Errorf("settings: put collection item %q: %w", req.Collection, err)
+	}
+	profileName, err := normalizeSettingsProfileName(scope, req.ProfileName)
+	if err != nil {
+		return MutationResult{}, err
+	}
+	name := strings.TrimSpace(req.Name)
+	if name == "" {
+		return MutationResult{}, validationError(errors.New("settings: collection item name is required"))
+	}
+	if _, err := validateCollectionScope(req.Collection, scope); err != nil {
+		return MutationResult{}, err
+	}
+
+	switch req.Collection {
+	case CollectionProviders:
+		if req.Provider == nil {
+			return MutationResult{}, validationError(errors.New("settings: provider payload is required"))
+		}
+		return finalize(s.putProvider(
+			ctx,
+			name,
+			*req.Provider,
+			req.ProviderModelCuration,
+			req.ProviderSecrets,
+		))
+	case CollectionMCPServers:
+		req.ProfileName = profileName
+		return finalize(s.putMCPCollectionItem(ctx, scope, workspaceID, name, req))
+	case CollectionHooks:
+		if req.Hook == nil {
+			return MutationResult{}, validationError(errors.New("settings: hook payload is required"))
+		}
+		return finalize(s.putHook(ctx, scope, workspaceID, profileName, name, *req.Hook))
+	default:
+		return MutationResult{}, notFoundError(fmt.Errorf("settings: unknown collection %q", req.Collection))
+	}
+}
+
+func (s *service) DeleteCollectionItem(ctx context.Context, req CollectionItemDeleteRequest) (MutationResult, error) {
+	finalize := func(result MutationResult, err error) (MutationResult, error) {
+		return s.finalizeCommittedCollectionMutation(ctx, result, err, "delete", false)
+	}
+
+	scope, workspaceID, err := s.normalizeReadScope(req.Scope, req.WorkspaceID)
+	if err != nil {
+		return MutationResult{}, fmt.Errorf("settings: delete collection item %q: %w", req.Collection, err)
+	}
+	profileName, err := normalizeSettingsProfileName(scope, req.ProfileName)
+	if err != nil {
+		return MutationResult{}, err
+	}
+	name := strings.TrimSpace(req.Name)
+	if name == "" {
+		return MutationResult{}, validationError(errors.New("settings: collection item name is required"))
+	}
+	if _, err := validateCollectionScope(req.Collection, scope); err != nil {
+		return MutationResult{}, err
+	}
+
+	switch req.Collection {
+	case CollectionProviders:
+		return finalize(s.deleteProvider(name))
+	case CollectionMCPServers:
+		return finalize(s.deleteMCPCollectionItem(ctx, scope, workspaceID, profileName, name, req))
+	case CollectionHooks:
+		return finalize(s.deleteHook(ctx, scope, workspaceID, profileName, name))
+	default:
+		return MutationResult{}, notFoundError(fmt.Errorf("settings: unknown collection %q", req.Collection))
+	}
+}
+
+func (s *service) buildProviderItems(ctx context.Context, cfg *compozyconfig.Config) ([]ProviderItem, error) {
+	builtins := compozyconfig.BuiltinProviders()
+	names := make([]string, 0, len(builtins)+len(cfg.Providers))
+	seen := make(map[string]struct{}, len(builtins)+len(cfg.Providers))
+	for name := range builtins {
+		names = append(names, name)
+		seen[name] = struct{}{}
+	}
+	for name := range cfg.Providers {
+		if _, ok := seen[name]; ok {
+			continue
+		}
+		names = append(names, name)
+	}
+	slices.Sort(names)
+
+	items := make([]ProviderItem, 0, len(names))
+	for _, name := range names {
+		resolved, err := cfg.ResolveProvider(name)
+		if err != nil {
+			return nil, fmt.Errorf("settings: resolve provider %q: %w", name, err)
+		}
+
+		settings, err := s.providerSettingsFromConfig(ctx, name, resolved)
+		if err != nil {
+			return nil, err
+		}
+		credentials, err := s.providerCredentialStatuses(ctx, resolved)
+		if err != nil {
+			return nil, fmt.Errorf("settings: provider %q credential status: %w", name, err)
+		}
+		authStatus, err := providerAuthStatus(
+			ctx,
+			s.homePaths,
+			name,
+			resolved,
+			credentials,
+			s.providerAuthCommandResolver,
+			s.providerAuthVerdicts,
+		)
+		if err != nil {
+			return nil, fmt.Errorf("settings: provider %q auth status: %w", name, err)
+		}
+		item := ProviderItem{
+			Name:             name,
+			Settings:         settings,
+			Default:          strings.TrimSpace(cfg.Defaults.Provider) == name,
+			CommandAvailable: s.providerLaunchAvailable(name, resolved),
+			Credentials:      credentials,
+			AuthStatus:       authStatus,
+		}
+		item.SessionEnvStatus, err = s.sessionEnvironmentStatuses(ctx, resolved.SessionEnv)
+		if err != nil {
+			return nil, fmt.Errorf("settings: provider %q session environment status: %w", name, err)
+		}
+
+		if overlay, ok := cfg.Providers[name]; ok {
+			item.SourceMetadata = SourceMetadata{
+				EffectiveSource:  sourceRefForWriteTarget(WriteTargetGlobalConfig, "", ""),
+				AvailableTargets: []WriteTargetKind{WriteTargetGlobalConfig},
+			}
+			if builtin, builtinOK := builtins[name]; builtinOK {
+				item.SourceMetadata.ShadowedSources = []SourceRef{builtinProviderSource()}
+				item.Fallback = providerFallbackFromBuiltin(name, builtin)
+			}
+			if strings.TrimSpace(overlay.Command) == "" && item.Settings.Command == "" {
+				item.CommandAvailable = false
+			}
+		} else {
+			item.SourceMetadata = SourceMetadata{
+				EffectiveSource:  builtinProviderSource(),
+				AvailableTargets: []WriteTargetKind{WriteTargetGlobalConfig},
+			}
+		}
+
+		items = append(items, cloneProviderItem(&item))
+	}
+	return items, nil
+}
+
+func providerAuthStatus(
+	ctx context.Context,
+	homePaths compozyconfig.HomePaths,
+	providerName string,
+	provider compozyconfig.ProviderConfig,
+	credentials []ProviderCredentialStatus,
+	resolver authproviders.ProviderAuthCommandResolver,
+	verdicts *authproviders.AuthVerdicts,
+) (ProviderAuthStatus, error) {
+	status := ProviderAuthStatus{
+		Mode:       provider.EffectiveAuthMode(),
+		EnvPolicy:  provider.EffectiveEnvPolicy(),
+		HomePolicy: provider.EffectiveHomePolicy(),
+		StatusCmd:  strings.TrimSpace(provider.AuthStatusCmd),
+	}
+	probeEnv, err := providerAuthStatusProbeEnv(
+		homePaths,
+		providerName,
+		provider,
+		credentials,
+		resolver,
+	)
+	if err != nil {
+		return ProviderAuthStatus{}, err
+	}
+	declared, err := authproviders.ClassifyDeclared(ctx, provider, probeEnv)
+	if err != nil {
+		return ProviderAuthStatus{}, err
+	}
+	// Settings reads never run a status command; they report the last live verdict, if any.
+	classification, checkedAt := verdicts.Apply(providerName, provider, declared)
+	status.CheckedAt = checkedAt
+	status.State = string(classification.State)
+	status.Code = classification.Code
+	status.Message = classification.Message
+	status.Login = authproviders.DescribeProviderLogin(provider, nil, classification)
+	switch status.Mode {
+	case compozyconfig.ProviderAuthModeBoundSecret:
+		return status, nil
+	case compozyconfig.ProviderAuthModeNone:
+		return status, nil
+	default:
+		nativeCLI, err := authproviders.NativeCLIStatus(ctx, provider, probeEnv)
+		if err != nil {
+			return ProviderAuthStatus{}, err
+		}
+		status.Login = authproviders.DescribeProviderLogin(provider, nativeCLI, classification)
+	}
+	return status, nil
+}
+
+func providerAuthStatusProbeEnv(
+	homePaths compozyconfig.HomePaths,
+	providerName string,
+	provider compozyconfig.ProviderConfig,
+	credentials []ProviderCredentialStatus,
+	resolver authproviders.ProviderAuthCommandResolver,
+) (*authproviders.ProbeEnv, error) {
+	commandEnv, err := providerauth.DiagnosticCommandEnv(homePaths, providerName, provider, os.Environ())
+	if err != nil {
+		return nil, err
+	}
+	return &authproviders.ProbeEnv{
+		ProviderName:   strings.TrimSpace(providerName),
+		CommandEnv:     commandEnv,
+		ResolveCommand: resolver,
+		LookupEnv: func(key string) (string, bool) {
+			for _, credential := range credentials {
+				if credential.Source != settingsCredentialSourceEnv || !credential.Present {
+					continue
+				}
+				envName, err := vault.EnvNameFromRef(credential.SecretRef)
+				if err == nil && envName == key {
+					return "present", true
+				}
+			}
+			return "", false
+		},
+		Vault: providerAuthStatusCredentialVault(credentials),
+	}, nil
+}
+
+type providerAuthStatusCredentialVault []ProviderCredentialStatus
+
+func (v providerAuthStatusCredentialVault) GetMetadata(_ context.Context, ref string) (vault.Metadata, error) {
+	normalized := vault.NormalizeRef(ref)
+	for _, credential := range v {
+		if vault.NormalizeRef(credential.SecretRef) != normalized {
+			continue
+		}
+		if !credential.Present {
+			return vault.Metadata{}, vault.ErrSecretNotFound
+		}
+		return vault.Metadata{Ref: normalized, Present: true, Kind: strings.TrimSpace(credential.Kind)}, nil
+	}
+	return vault.Metadata{}, vault.ErrSecretNotFound
+}
+
+func (s *service) providerCredentialStatuses(
+	ctx context.Context,
+	provider compozyconfig.ProviderConfig,
+) ([]ProviderCredentialStatus, error) {
+	slots := provider.EffectiveCredentialSlots()
+	if len(slots) == 0 {
+		return nil, nil
+	}
+	statuses := make([]ProviderCredentialStatus, 0, len(slots))
+	for _, slot := range slots {
+		status, err := s.providerCredentialStatus(ctx, slot)
+		if err != nil {
+			return nil, err
+		}
+		statuses = append(statuses, status)
+	}
+	return statuses, nil
+}
+
+func (s *service) providerCredentialStatus(
+	ctx context.Context,
+	slot compozyconfig.ProviderCredentialSlot,
+) (ProviderCredentialStatus, error) {
+	secretRef := vault.NormalizeRef(slot.SecretRef)
+	status := ProviderCredentialStatus{
+		Name:      strings.TrimSpace(slot.Name),
+		TargetEnv: strings.TrimSpace(slot.TargetEnv),
+		SecretRef: secretRef,
+		Kind:      strings.TrimSpace(slot.Kind),
+		Required:  slot.Required,
+	}
+	switch {
+	case vault.IsEnvRef(secretRef):
+		status.Source = settingsCredentialSourceEnv
+		status.Present = s.envPresent(strings.TrimSpace(strings.TrimPrefix(secretRef, "env:")))
+		return status, nil
+	case vault.IsSecretRef(secretRef):
+		status.Source = "vault"
+		if s.providerSecrets == nil {
+			return status, nil
+		}
+		metadata, err := s.providerSecrets.GetMetadata(ctx, secretRef)
+		if err != nil {
+			if errors.Is(err, vault.ErrSecretNotFound) {
+				return status, nil
+			}
+			return ProviderCredentialStatus{}, err
+		}
+		status.Present = metadata.Present
+		return status, nil
+	default:
+		status.Source = "unsupported"
+		return status, nil
+	}
+}

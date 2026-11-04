@@ -1,0 +1,231 @@
+package daemon
+
+import (
+	"log/slog"
+	"os"
+	"sync"
+	"time"
+
+	"github.com/compozy/compozy/internal/api/udsapi"
+	compozyconfig "github.com/compozy/compozy/internal/config"
+	extensionpkg "github.com/compozy/compozy/internal/extension"
+	"github.com/compozy/compozy/internal/extensioninput"
+	"github.com/compozy/compozy/internal/extensionmcp"
+	marketplacepkg "github.com/compozy/compozy/internal/marketplace"
+	"github.com/compozy/compozy/internal/marketplace/pluginsource"
+	mcppkg "github.com/compozy/compozy/internal/mcp"
+	profilepkg "github.com/compozy/compozy/internal/profile"
+	"github.com/compozy/compozy/internal/resources"
+	workspacepkg "github.com/compozy/compozy/internal/workspace"
+)
+
+type daemonExtensionService struct {
+	marketplaceMu       sync.RWMutex
+	searchMu            sync.Mutex
+	consumerSyncOnce    sync.Once
+	consumerSyncGate    chan struct{}
+	searchCache         map[string]extensionSearchSnapshot
+	registry            *extensionpkg.Registry
+	runtime             extensionRuntime
+	hookBinds           hookBindingPublisher
+	agentSkill          agentSkillPublisher
+	toolMCP             toolMCPPublisher
+	loops               loopResourcePublisher
+	sessions            SessionManager
+	extensionKit        extensionKitResourcePublisher
+	homePaths           compozyconfig.HomePaths
+	logger              *slog.Logger
+	now                 func() time.Time
+	getenv              func(string) string
+	extensionConfig     compozyconfig.ExtensionsConfig
+	marketplaceLoader   extensionMarketplaceSourceLoader
+	marketplaceCatalog  marketplacepkg.Service
+	marketplaceAcquirer extensionpkg.MarketplacePackageAcquirer
+	marketplaceCache    *pluginsource.PackageCache
+	eventWriter         extensionLifecycleEventWriter
+	workspaceResolver   workspacepkg.RuntimeResolver
+	envBindings         extensionpkg.EnvBindingLifecycleStore
+	inputs              extensioninput.Store
+	mcpAllocations      extensionmcp.Store
+	mcpDetails          *extensionMCPDetails
+	secretVault         extensionSecretVault
+	automation          extensionAutomationPreviewer
+	lifecycle           *extensionLifecycleCoordinator
+	resourceStore       resources.RawStore
+	resourceActor       resources.MutationActor
+	resourceCodecs      *resources.CodecRegistry
+	mcpRuntimeHealth    *mcppkg.RuntimeHealthRegistry
+	paletteNotifier     *extensionPaletteNotifier
+	profiles            *profilepkg.Manager
+}
+
+var _ udsapi.ExtensionService = (*daemonExtensionService)(nil)
+
+type daemonExtensionServiceDeps struct {
+	Registry     *extensionpkg.Registry
+	Runtime      extensionRuntime
+	HookBindings hookBindingPublisher
+	AgentSkill   agentSkillPublisher
+	ToolMCP      toolMCPPublisher
+	Loops        loopResourcePublisher
+	Sessions     SessionManager
+	Profiles     *profilepkg.Manager
+	HomePaths    compozyconfig.HomePaths
+	Logger       *slog.Logger
+	Now          func() time.Time
+	Getenv       func(string) string
+}
+
+type daemonExtensionServiceOption func(*daemonExtensionService)
+
+func withDaemonExtensionMarketplace(
+	cfg compozyconfig.ExtensionsConfig,
+	loader extensionMarketplaceSourceLoader,
+) daemonExtensionServiceOption {
+	return func(service *daemonExtensionService) {
+		service.extensionConfig = cfg
+		service.marketplaceLoader = loader
+	}
+}
+
+func withDaemonExtensionCatalog(catalog marketplacepkg.Service) daemonExtensionServiceOption {
+	return func(service *daemonExtensionService) {
+		service.marketplaceCatalog = catalog
+	}
+}
+
+func withDaemonMarketplacePackageAcquirer(
+	acquirer extensionpkg.MarketplacePackageAcquirer,
+) daemonExtensionServiceOption {
+	return func(service *daemonExtensionService) { service.marketplaceAcquirer = acquirer }
+}
+
+func withDaemonMarketplacePackageCache(cache *pluginsource.PackageCache) daemonExtensionServiceOption {
+	return func(service *daemonExtensionService) { service.marketplaceCache = cache }
+}
+
+func withDaemonExtensionEventWriter(writer extensionLifecycleEventWriter) daemonExtensionServiceOption {
+	return func(service *daemonExtensionService) {
+		service.eventWriter = writer
+	}
+}
+
+func withDaemonExtensionWorkspaceResolver(
+	resolver workspacepkg.RuntimeResolver,
+) daemonExtensionServiceOption {
+	return func(service *daemonExtensionService) {
+		service.workspaceResolver = resolver
+	}
+}
+
+func withDaemonExtensionKitPublisher(publisher extensionKitResourcePublisher) daemonExtensionServiceOption {
+	return func(service *daemonExtensionService) {
+		service.extensionKit = publisher
+	}
+}
+
+func withDaemonExtensionSecrets(
+	bindings extensionpkg.EnvBindingLifecycleStore,
+	secretVault extensionSecretVault,
+) daemonExtensionServiceOption {
+	return func(service *daemonExtensionService) {
+		service.envBindings = bindings
+		service.secretVault = secretVault
+	}
+}
+
+func withDaemonExtensionAutomation(reader extensionAutomationPreviewer) daemonExtensionServiceOption {
+	return func(service *daemonExtensionService) {
+		service.automation = reader
+	}
+}
+
+func withDaemonExtensionResources(
+	store resources.RawStore,
+	actor resources.MutationActor,
+	codecs *resources.CodecRegistry,
+) daemonExtensionServiceOption {
+	return func(service *daemonExtensionService) {
+		service.resourceStore = store
+		service.resourceActor = actor
+		service.resourceCodecs = codecs
+	}
+}
+
+func withDaemonExtensionMCPRuntimeHealth(registry *mcppkg.RuntimeHealthRegistry) daemonExtensionServiceOption {
+	return func(service *daemonExtensionService) {
+		service.mcpRuntimeHealth = registry
+	}
+}
+
+func withDaemonExtensionPaletteNotifier(notifier *extensionPaletteNotifier) daemonExtensionServiceOption {
+	return func(service *daemonExtensionService) {
+		service.paletteNotifier = notifier
+	}
+}
+
+func newDaemonExtensionService(
+	deps *daemonExtensionServiceDeps,
+	opts ...daemonExtensionServiceOption,
+) udsapi.ExtensionService {
+	if deps == nil || deps.Registry == nil {
+		return nil
+	}
+	normalized := *deps
+	if normalized.Logger == nil {
+		normalized.Logger = slog.Default()
+	}
+	if normalized.Now == nil {
+		normalized.Now = func() time.Time {
+			return time.Now().UTC()
+		}
+	}
+	if normalized.Getenv == nil {
+		normalized.Getenv = os.Getenv
+	}
+	service := &daemonExtensionService{
+		registry:   normalized.Registry,
+		runtime:    normalized.Runtime,
+		hookBinds:  normalized.HookBindings,
+		agentSkill: normalized.AgentSkill,
+		toolMCP:    normalized.ToolMCP,
+		loops:      normalized.Loops,
+		sessions:   normalized.Sessions,
+		profiles:   normalized.Profiles,
+		homePaths:  normalized.HomePaths,
+		logger:     normalized.Logger,
+		now:        normalized.Now,
+		getenv:     normalized.Getenv,
+		lifecycle:  newExtensionLifecycleCoordinator(),
+	}
+	for _, opt := range opts {
+		if opt != nil {
+			opt(service)
+		}
+	}
+	return service
+}
+
+func (s *daemonExtensionService) extensionConsumerSyncGate() chan struct{} {
+	s.consumerSyncOnce.Do(func() {
+		s.consumerSyncGate = make(chan struct{}, 1)
+		s.consumerSyncGate <- struct{}{}
+	})
+	return s.consumerSyncGate
+}
+
+func (s *daemonExtensionService) marketplaceConfig() compozyconfig.ExtensionsConfig {
+	s.marketplaceMu.RLock()
+	defer s.marketplaceMu.RUnlock()
+	return s.extensionConfig
+}
+
+func (s *daemonExtensionService) reconcileMarketplaceConfig(cfg compozyconfig.ExtensionsConfig) {
+	s.marketplaceMu.Lock()
+	s.extensionConfig = cfg
+	s.marketplaceMu.Unlock()
+}
+
+func withDaemonExtensionMCPAllocations(allocations extensionmcp.Store) daemonExtensionServiceOption {
+	return func(service *daemonExtensionService) { service.mcpAllocations = allocations }
+}

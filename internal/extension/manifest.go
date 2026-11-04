@@ -1,0 +1,294 @@
+package extensionpkg
+
+import (
+	"encoding/json"
+	"errors"
+	"time"
+
+	diagnosticcontract "github.com/compozy/compozy/internal/diagnosticcontract"
+	extensioncontract "github.com/compozy/compozy/internal/extension/contract"
+	"github.com/compozy/compozy/internal/resources"
+	toolspkg "github.com/compozy/compozy/internal/tools"
+)
+
+const (
+	manifestMustBeASemanticVersionValue = "must be a semantic version"
+	manifestArgsKey                     = "args"
+	manifestAgentsKey                   = "agents"
+	manifestAutomationKey               = "automation"
+	manifestBackendKey                  = "backend"
+	manifestCommandKey                  = "command"
+	manifestCommandGroupsKey            = "command_groups"
+	manifestCmdPaletteKey               = "cmd_palette"
+	manifestCapabilitiesKey             = "capabilities"
+	manifestDescriptionKey              = "description"
+	manifestEnvKey                      = "env"
+	manifestEventKey                    = "event"
+	manifestExecutorKey                 = "executor"
+	manifestExtensionKey                = "extension"
+	manifestHandlerKey                  = "handler"
+	manifestHooksKey                    = "hooks"
+	manifestInputSchemaKey              = "input_schema"
+	manifestKindKey                     = "kind"
+	manifestLayoutsKey                  = "layouts"
+	manifestLoopsKey                    = "loops"
+	manifestMinCompozyVersionKey        = "min_compozy_version"
+	manifestMCPServersKey               = "mcp_servers"
+	manifestModeKey                     = "mode"
+	manifestNameKey                     = "name"
+	manifestNullKey                     = "null"
+	manifestOutputSchemaKey             = "output_schema"
+	manifestPathKey                     = "path"
+	manifestPermissionsKey              = "permissions"
+	manifestPublishKey                  = "publish"
+	manifestReadOnlyKey                 = "read_only"
+	manifestRequiredKey                 = "required"
+	manifestResourcesKey                = "resources"
+	manifestResourcesPublishPath        = "resources.publish"
+	manifestRiskKey                     = "risk"
+	manifestSubprocessKey               = "subprocess"
+	manifestSummaryKey                  = "summary"
+	manifestSkillsKey                   = "skills"
+	manifestToolsKey                    = "tools"
+	manifestVersionKey                  = "version"
+	manifestVisibilityKey               = "visibility"
+	validationStatusInvalid             = "invalid"
+	agentPluginMCPKind                  = "mcp"
+	agentPluginMCPServerKind            = "mcp_server"
+	agentPluginSkillKind                = "skill"
+	agentPluginStdioTransport           = "stdio"
+	agentPluginStreamableHTTPTransport  = "streamable-http"
+	diagnosticEvidenceScopeKey          = "scope"
+	diagnosticEvidenceComponentKey      = "component"
+	marketplaceCleanupTargetKey         = "cleanup_target"
+	installedInfoProvenanceField        = "provenance"
+)
+
+type manifestCommandSpec = toolspkg.ExtensionCommandSpec
+type manifestCommandGroupSpec = extensioncontract.ExtensionCommandGroupSpec
+type CmdPaletteConfig = extensioncontract.CmdPaletteConfig
+type CmdPaletteCommand = extensioncontract.CmdPaletteCommand
+type CmdPaletteArgument = extensioncontract.CmdPaletteArgument
+type CmdPaletteAction = extensioncontract.CmdPaletteAction
+type CmdPaletteConfirmation = extensioncontract.CmdPaletteConfirmation
+type CmdPaletteExecutionPolicy = extensioncontract.CmdPaletteExecutionPolicy
+type CmdPaletteView = extensioncontract.CmdPaletteView
+type CmdPaletteViewSource = extensioncontract.CmdPaletteViewSource
+
+const (
+	manifestTOMLFileName        = "extension.toml"
+	manifestJSONFileName        = "extension.json"
+	agentPluginManifestFileName = "plugin.json"
+)
+
+var (
+	// ErrManifestNotFound reports that an extension directory does not contain
+	// either supported manifest file.
+	ErrManifestNotFound = errors.New("extension: manifest not found")
+	// ErrManifestInvalid reports that the manifest schema or content is invalid.
+	ErrManifestInvalid = errors.New("extension: invalid manifest")
+	// ErrManifestIncompatible reports that the manifest requires a newer daemon
+	// version than the current build provides.
+	ErrManifestIncompatible = errors.New("extension: incompatible manifest")
+)
+
+// Manifest describes one extension without executing any extension code.
+type Manifest struct {
+	Layout            string                              `toml:"-" json:"-"`
+	Format            ExtensionFormat                     `toml:"-" json:"-"`
+	IngestDiagnostics []diagnosticcontract.DiagnosticItem `toml:"-" json:"-"`
+
+	Name        string `toml:"name"                  json:"name"`
+	Version     string `toml:"version"               json:"version"`
+	Description string `toml:"description,omitempty" json:"description,omitempty"`
+
+	MinCompozyVersion string `toml:"min_compozy_version" json:"min_compozy_version"`
+
+	Inputs       []ManifestInput     `toml:"inputs,omitempty"       json:"inputs,omitempty"`
+	RequiresEnv  []string            `toml:"requires_env,omitempty" json:"requires_env,omitempty"`
+	Gateway      *GatewayRequirement `toml:"gateway,omitempty"      json:"gateway,omitzero"`
+	Resources    ResourcesConfig     `toml:"resources"              json:"resources"`
+	Capabilities CapabilitiesConfig  `toml:"capabilities"           json:"capabilities"`
+	Permissions  PermissionsConfig   `toml:"permissions"            json:"permissions"`
+	Subprocess   SubprocessConfig    `toml:"subprocess"             json:"subprocess"`
+	Profiles     []ManifestProfile   `toml:"profiles,omitempty"     json:"profiles,omitempty"`
+}
+
+// ResourcesConfig declares static assets packaged with an extension.
+type ResourcesConfig struct {
+	Skills        []ManifestResourcePath     `toml:"skills,omitempty"         json:"skills,omitempty"`
+	Loops         []ManifestResourcePath     `toml:"loops,omitempty"          json:"loops,omitempty"`
+	Agents        []ManifestResourcePath     `toml:"agents,omitempty"         json:"agents,omitempty"`
+	Automation    []ManifestResourcePath     `toml:"automation,omitempty"     json:"automation,omitempty"`
+	Layouts       []ManifestResourcePath     `toml:"layouts,omitempty"        json:"layouts,omitempty"`
+	Hooks         []HookConfig               `toml:"hooks,omitempty"          json:"hooks,omitempty"`
+	Tools         map[string]ToolConfig      `toml:"tools,omitempty"          json:"tools,omitempty"`
+	CommandGroups []manifestCommandGroupSpec `toml:"command_groups,omitempty" json:"command_groups,omitempty"`
+	CmdPalette    CmdPaletteConfig           `toml:"cmd_palette,omitempty"    json:"cmd_palette,omitzero"`
+	MCPServers    map[string]MCPServerConfig `toml:"mcp_servers,omitempty"    json:"mcp_servers,omitempty"`
+	Publish       ResourceGrantRequest       `toml:"publish,omitempty"        json:"publish"`
+}
+
+// ResourceGrantRequest declares the resource families and scope ceiling an extension requests.
+type ResourceGrantRequest struct {
+	Families []string                    `toml:"families,omitempty"  json:"families,omitempty"`
+	MaxScope resources.ResourceScopeKind `toml:"max_scope,omitempty" json:"max_scope,omitempty"`
+}
+
+// CapabilitiesConfig declares the runtime interfaces the extension provides.
+type CapabilitiesConfig struct {
+	Provides []string `toml:"provides,omitempty" json:"provides,omitempty"`
+}
+
+// PermissionsConfig declares Host API methods the extension wants to call.
+type PermissionsConfig struct {
+	Requires []string `toml:"requires,omitempty" json:"requires,omitempty"`
+}
+
+// SubprocessConfig describes how to launch and monitor the extension process.
+type SubprocessConfig struct {
+	Command             string            `toml:"command,omitempty"               json:"command,omitempty"`
+	Args                []string          `toml:"args,omitempty"                  json:"args,omitempty"`
+	Env                 map[string]string `toml:"env,omitempty"                   json:"env,omitempty"`
+	SecretEnv           map[string]string `toml:"secret_env,omitempty"            json:"secret_env,omitempty"`
+	HealthCheckInterval Duration          `toml:"health_check_interval,omitempty" json:"health_check_interval,omitempty"`
+	ShutdownTimeout     Duration          `toml:"shutdown_timeout,omitempty"      json:"shutdown_timeout,omitempty"`
+}
+
+// HookConfig mirrors the hook declaration shape accepted from extension manifests.
+type HookConfig struct {
+	Profile   string             `toml:"profile,omitempty"    json:"profile,omitempty"`
+	Name      string             `toml:"name"                 json:"name"`
+	Event     string             `toml:"event"                json:"event"`
+	Mode      string             `toml:"mode,omitempty"       json:"mode,omitempty"`
+	Required  bool               `toml:"required,omitempty"   json:"required,omitzero"`
+	Priority  *int               `toml:"priority,omitempty"   json:"priority,omitzero"`
+	Timeout   Duration           `toml:"timeout,omitempty"    json:"timeout,omitempty"`
+	Matcher   HookMatcherConfig  `toml:"matcher,omitempty"    json:"matcher"`
+	Command   string             `toml:"command,omitempty"    json:"command,omitempty"`
+	Args      []string           `toml:"args,omitempty"       json:"args,omitempty"`
+	Env       map[string]string  `toml:"env,omitempty"        json:"env,omitempty"`
+	SecretEnv map[string]string  `toml:"secret_env,omitempty" json:"secret_env,omitempty"`
+	Executor  HookExecutorConfig `toml:"executor,omitempty"   json:"executor"`
+}
+
+// HookExecutorConfig selects the hook execution boundary and command.
+type HookExecutorConfig struct {
+	Kind      string            `toml:"kind,omitempty"       json:"kind,omitempty"`
+	Command   string            `toml:"command,omitempty"    json:"command,omitempty"`
+	Args      []string          `toml:"args,omitempty"       json:"args,omitempty"`
+	Env       map[string]string `toml:"env,omitempty"        json:"env,omitempty"`
+	SecretEnv map[string]string `toml:"secret_env,omitempty" json:"secret_env,omitempty"`
+}
+
+// HookMatcherConfig narrows when a hook is eligible to run.
+type HookMatcherConfig struct {
+	AgentName          string `toml:"agent_name,omitempty"          json:"agent_name,omitempty"`
+	AgentType          string `toml:"agent_type,omitempty"          json:"agent_type,omitempty"`
+	WorkspaceID        string `toml:"workspace_id,omitempty"        json:"workspace_id,omitempty"`
+	WorkspaceRoot      string `toml:"workspace_root,omitempty"      json:"workspace_root,omitempty"`
+	SessionType        string `toml:"session_type,omitempty"        json:"session_type,omitempty"`
+	InputClass         string `toml:"input_class,omitempty"         json:"input_class,omitempty"`
+	ACPEventType       string `toml:"acp_event_type,omitempty"      json:"acp_event_type,omitempty"`
+	TurnID             string `toml:"turn_id,omitempty"             json:"turn_id,omitempty"`
+	ToolID             string `toml:"tool_id,omitempty"             json:"tool_id,omitempty"`
+	ToolName           string `toml:"tool_name,omitempty"           json:"tool_name,omitempty"`
+	ToolReadOnly       *bool  `toml:"tool_read_only,omitempty"      json:"tool_read_only,omitzero"`
+	DecisionClass      string `toml:"decision_class,omitempty"      json:"decision_class,omitempty"`
+	MessageRole        string `toml:"message_role,omitempty"        json:"message_role,omitempty"`
+	MessageDeltaType   string `toml:"message_delta_type,omitempty"  json:"message_delta_type,omitempty"`
+	CompactionTrigger  string `toml:"compaction_trigger,omitempty"  json:"compaction_trigger,omitempty"`
+	CompactionReason   string `toml:"compaction_reason,omitempty"   json:"compaction_reason,omitempty"`
+	CompactionStrategy string `toml:"compaction_strategy,omitempty" json:"compaction_strategy,omitempty"`
+}
+
+// MCPServerConfig declares one MCP server packaged with the extension.
+type MCPServerConfig struct {
+	Auth         *MCPServerAuthConfig `toml:"auth,omitempty"          json:"auth,omitzero"`
+	DefaultScope string               `toml:"default_scope,omitempty" json:"default_scope,omitempty"`
+	Profile      string               `toml:"profile,omitempty"       json:"profile,omitempty"`
+	Command      string               `toml:"command,omitempty"       json:"command,omitempty"`
+	CWD          string               `toml:"-"                       json:"-"`
+	Args         []string             `toml:"args,omitempty"          json:"args,omitempty"`
+	Env          map[string]string    `toml:"env,omitempty"           json:"env,omitempty"`
+	SecretEnv    map[string]string    `toml:"secret_env,omitempty"    json:"secret_env,omitempty"`
+	Transport    string               `toml:"transport,omitempty"     json:"transport,omitempty"`
+	URL          string               `toml:"url,omitempty"           json:"url,omitempty"`
+	Headers      map[string]string    `toml:"headers,omitempty"       json:"headers,omitempty"`
+}
+
+// MCPServerAuthConfig declares authentication policy without embedding credentials.
+type MCPServerAuthConfig struct {
+	Method       string   `toml:"method"                 json:"method"`
+	Registration string   `toml:"registration,omitempty" json:"registration,omitempty"`
+	IssuerURL    string   `toml:"issuer_url,omitempty"   json:"issuer_url,omitempty"`
+	ClientID     string   `toml:"client_id,omitempty"    json:"client_id,omitempty"`
+	Scopes       []string `toml:"scopes,omitempty"       json:"scopes,omitempty"`
+}
+
+// ToolConfig declares one static tool packaged with the extension.
+type ToolConfig struct {
+	Profile              string            `toml:"profile,omitempty"               json:"profile,omitempty"`
+	ID                   string            `toml:"id,omitempty"                    json:"id,omitempty"`
+	DisplayTitle         string            `toml:"display_title,omitempty"         json:"display_title,omitempty"`
+	FriendlyVerb         string            `toml:"friendly_verb,omitempty"         json:"friendly_verb,omitempty"`
+	Preview              string            `toml:"preview,omitempty"               json:"preview,omitempty"`
+	Description          string            `toml:"description,omitempty"           json:"description,omitempty"`
+	Handler              string            `toml:"handler,omitempty"               json:"handler,omitempty"`
+	Backend              ToolBackendConfig `toml:"backend,omitempty"               json:"backend"`
+	InputSchema          json.RawMessage   `toml:"input_schema,omitempty"          json:"input_schema,omitempty"`
+	OutputSchema         json.RawMessage   `toml:"output_schema,omitempty"         json:"output_schema,omitempty"`
+	Risk                 string            `toml:"risk,omitempty"                  json:"risk,omitempty"`
+	ReadOnly             bool              `toml:"read_only,omitempty"             json:"read_only,omitzero"`
+	Destructive          bool              `toml:"destructive,omitempty"           json:"destructive,omitzero"`
+	OpenWorld            bool              `toml:"open_world,omitempty"            json:"open_world,omitzero"`
+	RequiresInteraction  bool              `toml:"requires_interaction,omitempty"  json:"requires_interaction,omitzero"`
+	ConcurrencySafe      bool              `toml:"concurrency_safe,omitempty"      json:"concurrency_safe,omitzero"`
+	MaxResultBytes       int64             `toml:"max_result_bytes,omitempty"      json:"max_result_bytes,omitzero"`
+	Toolsets             []string          `toml:"toolsets,omitempty"              json:"toolsets,omitempty"`
+	Tags                 []string          `toml:"tags,omitempty"                  json:"tags,omitempty"`
+	SearchHints          []string          `toml:"search_hints,omitempty"          json:"search_hints,omitempty"`
+	RequiresEnv          []string          `toml:"requires_env,omitempty"          json:"requires_env,omitempty"`
+	RequiredCapabilities []string          `toml:"required_capabilities,omitempty" json:"required_capabilities,omitempty"`
+	Visibility           string            `toml:"visibility,omitempty"            json:"visibility,omitempty"`
+
+	Command *manifestCommandSpec `toml:"command,omitempty" json:"command,omitzero"`
+}
+
+// ToolBackendConfig binds a manifest tool to its backend metadata.
+type ToolBackendConfig struct {
+	Kind    string `toml:"kind,omitempty"    json:"kind,omitempty"`
+	Handler string `toml:"handler,omitempty" json:"handler,omitempty"`
+	Server  string `toml:"server,omitempty"  json:"server,omitempty"`
+	Tool    string `toml:"tool,omitempty"    json:"tool,omitempty"`
+}
+
+// Duration stores time.Duration values while decoding TOML strings and JSON
+// strings consistently.
+type Duration time.Duration
+
+type manifestDocument struct {
+	Extension   manifestCore `toml:"extension"             json:"extension"`
+	Name        string       `toml:"name"                  json:"name"`
+	Version     string       `toml:"version"               json:"version"`
+	Description string       `toml:"description,omitempty" json:"description,omitempty"`
+
+	MinCompozyVersion string `toml:"min_compozy_version" json:"min_compozy_version"`
+
+	Inputs       []manifestInputDocument `toml:"inputs,omitempty"       json:"inputs,omitempty"`
+	RequiresEnv  []string                `toml:"requires_env,omitempty" json:"requires_env,omitempty"`
+	Gateway      *GatewayRequirement     `toml:"gateway,omitempty"      json:"gateway,omitzero"`
+	Resources    ResourcesConfig         `toml:"resources"              json:"resources"`
+	Capabilities CapabilitiesConfig      `toml:"capabilities"           json:"capabilities"`
+	Permissions  PermissionsConfig       `toml:"permissions"            json:"permissions"`
+	Subprocess   SubprocessConfig        `toml:"subprocess"             json:"subprocess"`
+	Profiles     []ManifestProfile       `toml:"profiles,omitempty"     json:"profiles,omitempty"`
+}
+
+type manifestCore struct {
+	Name              string   `toml:"name"                   json:"name"`
+	Version           string   `toml:"version"                json:"version"`
+	Description       string   `toml:"description,omitempty"  json:"description,omitempty"`
+	MinCompozyVersion string   `toml:"min_compozy_version"    json:"min_compozy_version"`
+	RequiresEnv       []string `toml:"requires_env,omitempty" json:"requires_env,omitempty"`
+}

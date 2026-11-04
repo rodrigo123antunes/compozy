@@ -1,102 +1,430 @@
 package cli
 
 import (
-	"log/slog"
-	"sync"
+	"context"
+	"encoding/json"
+	"fmt"
+	"io"
+	"strings"
+	"syscall"
+	"time"
 
-	extcli "github.com/compozy/compozy/internal/cli/extension"
-	"github.com/compozy/compozy/internal/core/agent"
-
-	// Register the extension-backed run-scope factory used by kernel dispatchers.
-	_ "github.com/compozy/compozy/internal/core/extension"
-	"github.com/compozy/compozy/internal/core/kernel"
-	"github.com/compozy/compozy/internal/core/workspace"
-	"github.com/compozy/compozy/pkg/compozy/events"
+	"github.com/compozy/compozy/internal/acp"
+	"github.com/compozy/compozy/internal/api/contract"
+	compozyconfig "github.com/compozy/compozy/internal/config"
+	compozydaemon "github.com/compozy/compozy/internal/daemon"
+	diagnosticspkg "github.com/compozy/compozy/internal/diagnostics"
+	authproviders "github.com/compozy/compozy/internal/providers"
+	"github.com/compozy/compozy/internal/vault"
+	"github.com/compozy/compozy/internal/version"
 	"github.com/spf13/cobra"
 )
 
-type commandKind string
-
 const (
-	commandKindFetchReviews commandKind = "reviews fetch"
-	commandKindFixReviews   commandKind = "reviews fix"
-	commandKindWatchReviews commandKind = "reviews watch"
-	commandKindExec         commandKind = "exec"
-	commandKindArchive      commandKind = "archive"
-	commandKindTasksRun     commandKind = "tasks run"
-	commandKindSync         commandKind = "sync"
+	rootCompozyKey   = "compozy"
+	rootVersionKey   = "version"
+	cliCodeKey       = "code"
+	cliBytesKey      = "bytes"
+	cliFieldKey      = "field"
+	cliFieldValue    = "Field"
+	cliGetKey        = "get"
+	cliKeyKey        = "key"
+	cliKeyValue      = "Key"
+	cliRevisionValue = "Revision"
+	cliSnapshotKey   = "snapshot"
 )
 
-var validateRootDispatcher = kernel.ValidateDefaultRegistry
+const (
+	outputFlagName = "output"
+	jsonFlagName   = "json"
+	yesFlagName    = "yes"
+	outputFlagArg  = "--" + outputFlagName
+	jsonFlagArg    = "--" + jsonFlagName
 
-func newRootDispatcher() *kernel.Dispatcher {
-	deps := kernel.KernelDeps{
-		Logger:        slog.Default(),
-		EventBus:      events.New[events.Event](0),
-		Workspace:     workspace.Context{},
-		AgentRegistry: agent.DefaultRegistry(),
-	}
+	defaultPollInterval = 100 * time.Millisecond
+	defaultStartTimeout = 15 * time.Second
+	defaultStopTimeout  = 15 * time.Second
+)
 
-	dispatcher := kernel.BuildDefault(deps)
-	if err := validateRootDispatcher(dispatcher); err != nil {
-		slog.Default().Error("kernel dispatcher validation failed", "error", err)
-	}
-	return dispatcher
+type daemonRunner interface {
+	Run(ctx context.Context) error
 }
 
-func newLazyRootDispatcher() func() *kernel.Dispatcher {
-	return sync.OnceValue(newRootDispatcher)
+type runtimeContext struct {
+	HomePaths compozyconfig.HomePaths
+	Config    compozyconfig.Config
+	Target    ClientTarget
 }
 
-// NewRootCommand returns the reusable compozy Cobra command.
+type installWizardRunner func(context.Context, installWizardInput) (installWizardSelection, error)
+
+type mcpServeRunner func(context.Context, mcpServeOptions) error
+
+type commandDeps struct {
+	restartMigrationIdleTimeout time.Duration
+	vaultKeyring                vault.Keyring
+	commandContext              func() context.Context
+	loadConfig                  func() (compozyconfig.Config, error)
+	resolveHome                 func() (compozyconfig.HomePaths, error)
+	resolveHomeForWorkspace     func(workspaceRoot string) (compozyconfig.HomePaths, error)
+	ensureHome                  func(compozyconfig.HomePaths) error
+	runInstallWizard            installWizardRunner
+	newClient                   func(target ClientTarget) (DaemonClient, error)
+	writeGatewayCredential      func(string, string, string) (string, error)
+	readGatewayCredential       func(string, string) (string, error)
+	removeGatewayCredential     func(string, string) error
+	setActiveGatewayProfile     func(compozyconfig.HomePaths, string) error
+	applyGatewayProfileState    func(compozyconfig.HomePaths, string, *compozyconfig.GatewayConnectionConfig, string) error
+	newSSHExecutor              func() sshExecutor
+	reportClientTarget          func(ClientTarget) error
+	newDaemon                   func() (daemonRunner, error)
+	runRelaunchHelper           func(context.Context, *compozydaemon.RelaunchHelperConfig) error
+	readDaemonInfo              func(path string) (compozydaemon.Info, error)
+	signalProcess               func(pid int, sig syscall.Signal) error
+	processAlive                func(pid int) bool
+	processMatchesStartTime     func(pid int, startedAt time.Time) bool
+	processOwnsFileLock         func(pid int, path string) (bool, error)
+	inspectDaemonLock           func(path string) (compozydaemon.LockOwner, error)
+	executable                  func() (string, error)
+	getwd                       func() (string, error)
+	getenv                      func(string) string
+	lookPath                    func(string) (string, error)
+	removeFile                  func(string) error
+	openBrowser                 func(context.Context, string) error
+	resolveAppInstallation      func(context.Context, compozyconfig.HomePaths) (appInstallation, error)
+	callAppControl              appControlCaller
+	now                         func() time.Time
+	pollInterval                time.Duration
+	startTimeout                time.Duration
+	stopTimeout                 time.Duration
+	spawnDetached               func(context.Context, compozyconfig.HomePaths) (daemonProcess, error)
+	spawnBootstrapRuntime       func(context.Context, compozyconfig.HomePaths, string) (daemonProcess, error)
+	bootstrapAttachTimeout      time.Duration
+	newUpdateManager            func(compozyconfig.HomePaths) (updateManager, error)
+	runProviderAuthCommand      providerAuthCommandRunner
+	runProviderAuthLoginCommand providerAuthCommandRunner
+	resolveProviderAuthCommand  authproviders.ProviderAuthCommandResolver
+	runACPProbe                 func(context.Context, acp.SessionInspectionRequest) error
+	runACPLogin                 func(context.Context, acp.AuthenticationRequest) error
+	acpLoginStderr              io.Writer
+	inputIsTerminal             func(io.Reader) bool
+	runMCPServe                 mcpServeRunner
+}
+
+// NewRootCommand constructs the CompozyOS v1 CLI command tree.
 func NewRootCommand() *cobra.Command {
-	return newRootCommandWithDefaults(newLazyRootDispatcher(), defaultCommandStateDefaults())
+	return newRootCommand(commandDeps{})
 }
 
-func newRootCommandWithDefaults(dispatcher func() *kernel.Dispatcher, defaults commandStateDefaults) *cobra.Command {
-	root := &cobra.Command{
-		Use:          "compozy",
-		Short:        "Run AI review remediation and PRD task workflows",
-		SilenceUsage: true,
-		Long: `Compozy manages review rounds and PRD execution workflows.
+func newRootCommand(deps commandDeps) *cobra.Command {
+	deps = deps.withDefaults()
 
-Defaults can be stored in ~/.compozy/config.toml and overridden per workspace in
-.compozy/config.toml. Explicit CLI flags always override values loaded from config files.
+	cmd := &cobra.Command{
+		Use:     rootCompozyKey,
+		Version: version.Current().Version,
+		Short:   "CompozyOS — the system around your agents, already built",
+		Example: `  # Start the daemon and create a session in the current workspace
+  compozy daemon start
+  compozy session new --agent general
 
-Use explicit workflow subcommands:
-  compozy setup         Install bundled public skills for supported agents
-  compozy agents        Discover and inspect reusable agents
-  compozy upgrade       Update the CLI to the latest release
-  compozy ext           Manage bundled, user, and workspace extensions
-  compozy migrate       Convert legacy workflow artifacts to frontmatter
-  compozy daemon        Manage the home-scoped daemon bootstrap lifecycle
-  compozy workspaces    Inspect daemon workspace registrations
-  compozy tasks         Inspect, validate, and run task workflows
-  compozy reviews       Fetch, inspect, and remediate review workflows
-  compozy runs          Inspect and clean persisted daemon run artifacts
-  compozy sync          Reconcile workflow artifacts into global.db
-  compozy archive       Move fully completed workflows into .compozy/tasks/_archived/
-  compozy exec          Execute one ad hoc prompt through the shared ACP runtime`,
+  # Print machine-readable output for automation
+  compozy session list -o json`,
+		SilenceUsage:  true,
+		SilenceErrors: true,
 		RunE: func(cmd *cobra.Command, _ []string) error {
 			return cmd.Help()
 		},
 	}
+	cmd.SetVersionTemplate("compozy {{.Version}}\n")
+	cmd.InitDefaultVersionFlag()
+	if deps.commandContext == nil {
+		deps.commandContext = cmd.Context
+	}
+	configureRootClientTargetReporting(cmd, &deps)
+	configureRootFlags(cmd)
+	registerRootCommands(cmd, deps)
+	configureProfileIndependentCompletionCommands(cmd)
 
-	root.AddCommand(
-		newSetupCommand(nil),
-		newAgentsCommand(),
-		newUpgradeCommand(),
-		extcli.NewExtCommand(nil),
-		newMigrateCommand(dispatcher),
-		newDaemonCommand(),
-		newWorkspacesCommand(),
-		newTasksCommand(nil, defaults),
-		newReviewsCommandWithDefaults(defaults),
-		newRunsCommandWithDefaults(defaults),
-		newSyncCommand(dispatcher),
-		newArchiveCommand(dispatcher),
-		newExecCommandWithDefaults(defaults),
-		newMCPServeCommand(),
-	)
-	return root
+	return cmd
+}
+
+func configureRootClientTargetReporting(cmd *cobra.Command, deps *commandDeps) {
+	if deps.reportClientTarget != nil {
+		return
+	}
+	var pendingTarget *ClientTarget
+	deps.reportClientTarget = func(target ClientTarget) error {
+		if !target.isRemoteGateway() || pendingTarget != nil {
+			return nil
+		}
+		pendingTarget = new(target)
+		return nil
+	}
+	cmd.PersistentPostRunE = func(command *cobra.Command, _ []string) error {
+		if pendingTarget == nil {
+			return nil
+		}
+		if _, err := fmt.Fprintf(command.ErrOrStderr(), "target: %s\n", pendingTarget.displayName()); err != nil {
+			return fmt.Errorf("cli: report remote target: %w", err)
+		}
+		pendingTarget = nil
+		return nil
+	}
+}
+
+func configureRootFlags(cmd *cobra.Command) {
+	cmd.PersistentFlags().
+		StringP(outputFlagName, "o", string(OutputHuman), "Output format: human, json, jsonl, or toon")
+	cmd.PersistentFlags().Bool(jsonFlagName, false, "Emit JSON output")
+	configureRootProfileFlag(cmd)
+}
+
+func newVersionCommand() *cobra.Command {
+	return &cobra.Command{
+		Use:   rootVersionKey,
+		Short: "Print the CompozyOS version",
+		RunE: func(cmd *cobra.Command, _ []string) error {
+			return writeCommandOutput(cmd, outputBundle{
+				jsonValue: version.Current(),
+				human: func() (string, error) {
+					return fmt.Sprintf("compozy %s", version.Current().Version), nil
+				},
+				toon: func() (string, error) {
+					info := version.Current()
+					return renderToonObject(rootVersionKey, []string{rootVersionKey, "commit", "build_date"}, []string{
+						info.Version,
+						info.Commit,
+						info.BuildDate,
+					}), nil
+				},
+			})
+		},
+	}
+}
+
+func ExecuteContext(ctx context.Context, args []string, stdout io.Writer, stderr io.Writer) int {
+	cmd := NewRootCommand()
+	cmd.SetArgs(args)
+	cmd.SetOut(stdout)
+	cmd.SetErr(stderr)
+
+	if err := cmd.ExecuteContext(ctx); err != nil {
+		return writeExecutionError(stderr, args, err)
+	}
+	return 0
+}
+
+func writeExecutionError(stderr io.Writer, args []string, err error) int {
+	exitCode := cliExitCodeForError(err)
+	if payload, ok := marshalStructuredExecutionError(args, err); ok {
+		if _, writeErr := stderr.Write(payload); writeErr == nil {
+			if len(payload) == 0 || payload[len(payload)-1] != '\n' {
+				if _, newlineErr := fmt.Fprintln(stderr); newlineErr != nil {
+					return exitCode
+				}
+			}
+			return exitCode
+		}
+	}
+
+	if rendered, ok := renderHumanExecutionError(err); ok {
+		if _, writeErr := fmt.Fprintln(stderr, rendered); writeErr != nil {
+			return exitCode
+		}
+		return exitCode
+	}
+	if _, writeErr := fmt.Fprintf(stderr, "error: %v\n", err); writeErr != nil {
+		return exitCode
+	}
+	return exitCode
+}
+
+func renderHumanExecutionError(err error) (string, bool) {
+	if rendered, ok := renderAppTokenExecutionError(err); ok {
+		return rendered, true
+	}
+	if rendered, ok := renderSkillExposureExecutionError(err); ok {
+		return rendered, true
+	}
+	if rendered, ok := renderSkillSourceExecutionError(err); ok {
+		return rendered, true
+	}
+	if rendered, ok := renderProfileExecutionError(err); ok {
+		return rendered, true
+	}
+	if rendered, ok := renderTerminalExecutionError(err); ok {
+		return rendered, true
+	}
+	item, ok := diagnosticspkg.ItemFromError(err)
+	if !ok {
+		return "", false
+	}
+
+	title := strings.TrimSpace(item.Title)
+	if title == "" {
+		title = diagnosticspkg.Redact(err.Error())
+	}
+	lines := []string{"error: " + title}
+	if detail := strings.TrimSpace(item.Message); detail != "" && detail != title {
+		lines = append(lines, "  "+detail)
+	}
+	if command := strings.TrimSpace(item.SuggestedCommand); command != "" {
+		lines = append(lines, "try: "+command)
+	}
+	return strings.Join(lines, "\n"), true
+}
+
+func marshalWorktreeRemovalExecutionError(
+	args []string,
+	payload contract.WorktreeRemovalRefusalPayload,
+) ([]byte, bool) {
+	switch requestedOutputFormat(args) {
+	case OutputJSON:
+		encoded, err := json.Marshal(payload)
+		return encoded, err == nil
+	case OutputJSONL:
+		encoded, err := json.Marshal(payload)
+		return append(encoded, '\n'), err == nil
+	case OutputToon:
+		return []byte(renderToonObject(
+			"worktree_removal_refusal",
+			[]string{
+				cliCodeKey,
+				"changed_files",
+				"insertions",
+				"deletions",
+				"unpushed_commits",
+				"exists_on_remote",
+				"leftover_files",
+				"downgrade",
+			},
+			[]string{
+				payload.Code,
+				fmt.Sprintf("%d", payload.Risk.ChangedFiles),
+				fmt.Sprintf("%d", payload.Risk.Insertions),
+				fmt.Sprintf("%d", payload.Risk.Deletions),
+				fmt.Sprintf("%d", payload.Risk.UnpushedCommits),
+				fmt.Sprintf("%t", payload.Risk.ExistsOnRemote),
+				fmt.Sprintf("%d", payload.Risk.LeftoverFiles),
+				fmt.Sprintf("%t", payload.Downgrade),
+			},
+		)), true
+	default:
+		return nil, false
+	}
+}
+
+func marshalExtensionOperationExecutionError(
+	args []string,
+	payload contract.ExtensionOperationErrorPayload,
+) ([]byte, bool) {
+	switch requestedOutputFormat(args) {
+	case OutputJSON:
+		encoded, err := json.Marshal(payload)
+		return encoded, err == nil
+	case OutputJSONL:
+		encoded, err := json.Marshal(struct {
+			Type  string                                  `json:"type"`
+			Error contract.ExtensionOperationErrorPayload `json:"error"`
+		}{Type: clientErrorKey, Error: payload})
+		return append(encoded, '\n'), err == nil
+	case OutputToon:
+		return []byte(renderToonObject(
+			"error",
+			[]string{cliCodeKey, "current_digest", cliAgentsKey, "env_name", "declared_env", clientMessageKey},
+			[]string{
+				payload.Code,
+				payload.CurrentDigest,
+				strings.Join(payload.Agents, "|"),
+				payload.EnvName,
+				strings.Join(payload.DeclaredEnv, "|"),
+				payload.Error,
+			},
+		)), true
+	default:
+		return nil, false
+	}
+}
+
+func marshalWindowManagerExecutionError(
+	args []string,
+	payload contract.WindowManagerErrorPayload,
+) ([]byte, bool) {
+	switch requestedOutputFormat(args) {
+	case OutputJSON:
+		encoded, err := json.Marshal(payload)
+		return encoded, err == nil
+	case OutputJSONL:
+		encoded, err := json.Marshal(payload)
+		return append(encoded, '\n'), err == nil
+	case OutputToon:
+		currentRevision := ""
+		if payload.CurrentRevision != nil {
+			currentRevision = fmt.Sprintf("%d", *payload.CurrentRevision)
+		}
+		return []byte(renderToonObject(
+			"error",
+			[]string{cliCodeKey, automationWorkspaceIDKey, "current_revision", clientMessageKey},
+			[]string{string(payload.Code), string(payload.WorkspaceID), currentRevision, payload.Error},
+		)), true
+	default:
+		return nil, false
+	}
+}
+
+func marshalDaemonAPIExecutionError(args []string, payload contract.ErrorPayload) ([]byte, bool) {
+	switch requestedOutputFormat(args) {
+	case OutputJSON:
+		encoded, err := json.Marshal(payload)
+		return encoded, err == nil
+	case OutputJSONL:
+		encoded, err := json.Marshal(struct {
+			Type  string                `json:"type"`
+			Error contract.ErrorPayload `json:"error"`
+		}{Type: automationErrorKey, Error: payload})
+		return append(encoded, '\n'), err == nil
+	case OutputToon:
+		return []byte(renderToonObject("error", []string{clientMessageKey}, []string{payload.Error})), true
+	default:
+		return nil, false
+	}
+}
+
+func marshalDiagnosticExecutionError(args []string, err error) ([]byte, bool) {
+	item, ok := diagnosticspkg.ItemFromError(err)
+	// Terminal's public contract requires JSON even for Cobra validation errors,
+	// which do not carry a diagnostic item. Keep every other command's existing
+	// human/JSONL error contract unchanged.
+	if !ok && (requestedOutputFormat(args) != OutputJSON || len(args) == 0 || args[0] != terminalCommandKey) {
+		return nil, false
+	}
+	if encoded, terminalError := marshalTerminalDiagnosticExecutionError(args, err); terminalError {
+		return encoded, true
+	}
+	payload := contract.ErrorPayload{Error: diagnosticspkg.Redact(err.Error())}
+	if ok {
+		payload.Diagnostic = &item
+	}
+	switch requestedOutputFormat(args) {
+	case OutputJSON:
+		encoded, marshalErr := json.Marshal(payload)
+		if marshalErr != nil {
+			return nil, false
+		}
+		return encoded, true
+	case OutputJSONL:
+		encoded, marshalErr := json.Marshal(struct {
+			Type  string                `json:"type"`
+			Error contract.ErrorPayload `json:"error"`
+		}{
+			Type:  clientErrorKey,
+			Error: payload,
+		})
+		if marshalErr != nil {
+			return nil, false
+		}
+		return append(encoded, '\n'), true
+	default:
+		return nil, false
+	}
 }

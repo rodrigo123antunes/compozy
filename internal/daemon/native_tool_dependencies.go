@@ -1,0 +1,149 @@
+package daemon
+
+import (
+	"context"
+	"log/slog"
+
+	"github.com/compozy/compozy/internal/agentmemory"
+
+	core "github.com/compozy/compozy/internal/api/core"
+	attachmentspkg "github.com/compozy/compozy/internal/attachments"
+	"github.com/compozy/compozy/internal/cmdpalette"
+	compozyconfig "github.com/compozy/compozy/internal/config"
+	extensionpkg "github.com/compozy/compozy/internal/extension"
+	monitorpkg "github.com/compozy/compozy/internal/monitor"
+	profilepkg "github.com/compozy/compozy/internal/profile"
+	sessionpkg "github.com/compozy/compozy/internal/session"
+	skillspkg "github.com/compozy/compozy/internal/skills"
+	"github.com/compozy/compozy/internal/store"
+	taskpkg "github.com/compozy/compozy/internal/task"
+	terminalpkg "github.com/compozy/compozy/internal/terminal"
+	toolspkg "github.com/compozy/compozy/internal/tools"
+	workspacepkg "github.com/compozy/compozy/internal/workspace"
+	"github.com/compozy/compozy/internal/workspaceaccess"
+)
+
+type daemonNativeSkillsRegistry interface {
+	core.SkillsRegistry
+	ForAgentSession(
+		ctx context.Context,
+		resolved *workspacepkg.ResolvedWorkspace,
+		agentName string,
+		sessionID string,
+	) ([]*skillspkg.Skill, error)
+	ForAgentDefSession(
+		ctx context.Context,
+		resolved *workspacepkg.ResolvedWorkspace,
+		agent compozyconfig.AgentDef,
+		sessionID string,
+	) ([]*skillspkg.Skill, error)
+}
+
+type nativeSkillDiagnosticsRegistry interface {
+	SkillDiagnostics(
+		ctx context.Context,
+		resolved *workspacepkg.ResolvedWorkspace,
+		agentName string,
+	) ([]skillspkg.SkillDiagnostic, error)
+}
+
+type extensionPublishSecretResolver interface {
+	ResolveRef(context.Context, string) (string, error)
+}
+
+type nativeProfileReader interface {
+	List(context.Context) ([]profilepkg.WithCounts, error)
+	ListIdentities(context.Context) ([]profilepkg.Profile, error)
+	ProfileName(context.Context, string) (string, error)
+}
+
+type daemonNativeToolsDeps struct {
+	AgentInstances  func() *core.AgentInstanceAPI
+	AgentMemory     *agentmemory.Store
+	WorkspaceAccess workspaceaccess.Policy
+	// WorkspaceAccessPrompter asks the operator when approve-reads meets a profile selection.
+	WorkspaceAccessPrompter workspaceAccessPrompter
+	Subagents               func() sessionpkg.SubagentService
+	Logger                  *slog.Logger
+	Registry                func() toolspkg.Registry
+	CmdPalette              func() cmdpalette.Registry
+	ToolArtifacts           toolspkg.ToolArtifactStore
+	Config                  compozyconfig.Config
+	Skills                  daemonNativeSkillsRegistry
+	SkillExposures          store.SkillExposureRepository
+	SkillExposureEvents     store.EventSummaryStore
+	Sessions                core.SessionManager
+	Profiles                nativeProfileReader
+	ProfileManager          *profilepkg.Manager
+	SessionAttachments      attachmentspkg.Store
+	Workspaces              core.WorkspaceService
+	Worktrees               core.WorktreeService
+	WorkspaceResolver       workspacepkg.RuntimeResolver
+	ModelCatalog            core.ModelCatalogService
+	ProviderUsage           core.ProviderUsageService
+	MarketplaceCatalog      core.MarketplaceCatalogService
+	Settings                func() core.SettingsService
+
+	Tasks            taskpkg.Manager
+	TaskDesignations core.TaskDesignationStore
+	TaskClaimHandoff taskClaimHandoffCoordinator
+	Roles            core.RolesStatusProvider
+
+	Gateway               func() core.GatewayService
+	GatewayPermissionMode func(context.Context, string) (string, error)
+	HomePaths             compozyconfig.HomePaths
+	Observer              core.Observer
+	HookBindings          hookBindingPublisher
+	AgentCatalog          core.AgentCatalog
+	Vault                 core.VaultService
+	AgentResolver         sessionpkg.AgentResolver
+	HeartbeatStatus       core.HeartbeatStatusService
+	HeartbeatWake         core.HeartbeatWakeService
+	SessionHealth         core.SessionHealthReader
+	WakeEvents            core.HeartbeatWakeEventReader
+	Automation            core.AutomationManager
+	AutomationRuntime     func() core.AutomationManager
+	ExtensionRegistry     *extensionpkg.Registry
+	Extensions            func() core.ExtensionService
+	ExtensionRuntime      func() extensionRuntime
+	ExtensionConfig       compozyconfig.ExtensionsConfig
+	ExtensionSources      extensionMarketplaceSourceLoader
+	ExtensionEvents       extensionLifecycleEventWriter
+	ExtensionSecrets      extensionPublishSecretResolver
+	AgentSkills           agentSkillPublisher
+	AgentSkillsRuntime    func() agentSkillPublisher
+	ToolMCP               toolMCPPublisher
+	MCPAuth               func() toolspkg.MCPAuthStatusProvider
+	ApprovalGrants        toolspkg.ApprovalGrantStore
+	Clarify               func() toolspkg.ClarifyBroker
+	LoopResources         loopResourcePublisher
+	Loops                 func() core.LoopService
+	Resources             core.ResourceService
+	WindowManagers        windowManagerProvider
+	Terminals             func() terminalpkg.Manager
+	TerminalExecApprover  terminalExecApprover
+	Monitors              func() *monitorpkg.Service
+	Processes             func() core.SessionProcessService
+
+	// ProjectionEpoch reports the daemon tool projection epoch that invalidates cached Goal availability.
+	ProjectionEpoch func() uint64
+}
+
+func (d *daemonNativeToolsDeps) agentSkills() agentSkillPublisher {
+	if d == nil {
+		return nil
+	}
+	if d.AgentSkillsRuntime != nil {
+		if publisher := d.AgentSkillsRuntime(); publisher != nil {
+			return publisher
+		}
+	}
+	return d.AgentSkills
+}
+
+func (d *daemonNativeToolsDeps) gatewayService() core.GatewayService {
+	if d == nil || d.Gateway == nil {
+		return nil
+	}
+	return d.Gateway()
+}

@@ -1,0 +1,79 @@
+package cli
+
+import "github.com/spf13/cobra"
+
+func newSessionCommand(deps commandDeps) *cobra.Command {
+	cmd := &cobra.Command{
+		Use:   sessionSessionKey,
+		Short: "Manage CompozyOS sessions",
+	}
+
+	cmd.AddCommand(newSessionCreateCommand(deps))
+	cmd.AddCommand(newSessionListCommand(deps))
+	cmd.AddCommand(newSessionSubagentsCommand(deps))
+	cmd.AddCommand(newSessionInteractionsCommand(deps))
+	cmd.AddCommand(newSessionPendingCommand(deps))
+	cmd.AddCommand(newSessionStopCommand(deps))
+	cmd.AddCommand(newSessionProcessesCommand(deps))
+	cmd.AddCommand(newSessionRenameCommand(deps))
+	cmd.AddCommand(newSessionWorkLinkCommand(deps, false))
+	cmd.AddCommand(newSessionWorkLinkCommand(deps, true))
+	cmd.AddCommand(newSessionReparentCommand(deps))
+	cmd.AddCommand(newSessionMoveToProfileCommand(deps))
+	cmd.AddCommand(newSessionFolderCommand(deps))
+	cmd.AddCommand(newSessionMoveCommand(deps))
+	cmd.AddCommand(newSessionReorderCommand(deps))
+	cmd.AddCommand(newSessionArchiveCommand(deps))
+	cmd.AddCommand(newSessionUnarchiveCommand(deps))
+	cmd.AddCommand(newSessionLaterCommand(deps))
+	cmd.AddCommand(newSessionResumeLaterCommand(deps))
+	cmd.AddCommand(newSessionMarkSeenCommand(deps))
+	cmd.AddCommand(newSessionRemoveCommand(deps))
+	cmd.AddCommand(newSessionSoulCommand(deps))
+	cmd.AddCommand(newSessionHealthCommand(deps))
+	cmd.AddCommand(newSessionStatusCommand(deps))
+	cmd.AddCommand(newSessionCommandsCommand(deps))
+	cmd.AddCommand(newSessionCompactCommand(deps))
+	cmd.AddCommand(newSessionUsageCommand(deps))
+	cmd.AddCommand(newSessionPRCommand(deps))
+	cmd.AddCommand(newSessionInspectCommand(deps))
+	cmd.AddCommand(newSessionResumeCommand(deps))
+	cmd.AddCommand(newSessionRecapCommand(deps))
+	cmd.AddCommand(newSessionRepairCommand(deps))
+	cmd.AddCommand(newSessionRewindCommand(deps))
+	cmd.AddCommand(newSessionApproveCommand(deps))
+	cmd.AddCommand(newSessionClarifyCommand(deps))
+	cmd.AddCommand(newSessionWaitCommand(deps))
+	cmd.AddCommand(newSessionPromptCancelCommand(deps))
+	cmd.AddCommand(newSessionPromptCommand(deps))
+	cmd.AddCommand(newSessionInputCommand(deps))
+	cmd.AddCommand(newSessionAttachmentsCommand(deps))
+	cmd.AddCommand(newSessionEventsCommand(deps))
+	cmd.AddCommand(newSessionHistoryCommand(deps))
+	cmd.AddCommand(newSessionSearchCommand(deps))
+	cmd.AddCommand(newSessionOutlineCommand(deps))
+	cmd.AddCommand(newSessionRuntimeCommand(deps))
+	cmd.AddCommand(newSessionWorktreeCommand(deps))
+	cmd.AddCommand(newSessionGoalCommand(deps))
+	configureSessionProfileCommands(cmd, deps)
+	// Continue and fork are not profile-scoped reads (the new session inherits the
+	// source's profile), and the profile read step resolves the cwd workspace through
+	// a detail read that lists, and so repairs, its sessions: the source must stay
+	// unchanged, so they resolve their source themselves.
+	cmd.AddCommand(newSessionContinueCommand(deps))
+	cmd.AddCommand(newSessionForkCommand(deps))
+
+	return cmd
+}
+
+func configureSessionProfileCommands(cmd *cobra.Command, deps commandDeps) {
+	for _, child := range cmd.Commands() {
+		if child.HasSubCommands() {
+			configureSessionProfileCommands(child, deps)
+		}
+		if child.RunE == nil || child.Flags().Lookup(allProfilesFlagName) != nil {
+			continue
+		}
+		configureSingleProfileCommand(child, deps)
+	}
+}

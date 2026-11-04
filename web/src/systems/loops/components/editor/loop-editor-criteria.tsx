@@ -1,0 +1,263 @@
+import { Plus, X } from "@compozy/ui/icons";
+
+import { Button, Input, Label, NativeSelect, NativeSelectOption, Pill } from "@compozy/ui";
+
+import { useLocalRowKeys } from "@/hooks/use-local-row-keys";
+
+import type { LoopReferenceSuggestion } from "../../lib/loop-references";
+import { LoopReferenceInput } from "./loop-reference-input";
+
+type Criterion = Record<string, unknown> & { id?: string; type?: string };
+
+interface LoopEditorCriteriaProps {
+  value: unknown;
+  onChange: (criteria: Criterion[]) => void;
+  suggestions?: readonly LoopReferenceSuggestion[];
+  disabled?: boolean;
+  allowedTypes?: readonly CriterionType[];
+}
+
+const CRITERION_TYPES = ["command", "agent-judge", "human", "extension"] as const;
+type CriterionType = (typeof CRITERION_TYPES)[number];
+
+/** Display-only labels; the submitted `type` / `expect` values stay canonical. */
+const CRITERION_TYPE_LABEL: Record<CriterionType, string> = {
+  command: "Command",
+  "agent-judge": "Agent review",
+  human: "You approve",
+  extension: "Extension check",
+};
+
+const COMMAND_EXPECT_OPTIONS = [
+  { value: "exit_zero", label: "Finishes without errors" },
+  { value: "stdout_match", label: "Output matches" },
+] as const;
+
+function criterionTypeLabel(type: string): string {
+  return CRITERION_TYPE_LABEL[type as CriterionType] ?? type;
+}
+
+function asCriteria(value: unknown): Criterion[] {
+  return Array.isArray(value)
+    ? (value.filter(item => item && typeof item === "object") as Criterion[])
+    : [];
+}
+
+function str(value: unknown): string {
+  return typeof value === "string" ? value : "";
+}
+
+function nextCriterionId(criteria: readonly Criterion[]): string {
+  const maxSuffix = criteria.reduce((max, criterion) => {
+    const match = /^criterion_(\d+)$/.exec(str(criterion.id));
+    return match ? Math.max(max, Number(match[1])) : max;
+  }, 0);
+  return `criterion_${maxSuffix + 1}`;
+}
+
+function criterionForType(id: string, type: CriterionType): Criterion {
+  switch (type) {
+    case "command":
+      return { id, type, check: "", expect: "exit_zero" };
+    case "agent-judge":
+      return { id, type, agent: "", rubric: "" };
+    case "human":
+      return { id, type, prompt: "" };
+    case "extension":
+      return { id, type, tool: "" };
+  }
+}
+
+export function LoopEditorCriteria({
+  value,
+  onChange,
+  suggestions = [],
+  disabled = false,
+  allowedTypes = CRITERION_TYPES,
+}: LoopEditorCriteriaProps) {
+  const defaultType = allowedTypes[0];
+  const allowedTypeSet = new Set(allowedTypes);
+  const criteria = asCriteria(value).map(criterion => {
+    const type = str(criterion.type) as CriterionType;
+    return defaultType && !allowedTypeSet.has(type)
+      ? { ...criterion, type: defaultType }
+      : criterion;
+  });
+  const rowKeys = useLocalRowKeys(criteria, "criterion");
+
+  const update = (index: number, patch: Record<string, unknown>) => {
+    onChange(
+      criteria.map((criterion, i) => (i === index ? { ...criterion, ...patch } : criterion))
+    );
+  };
+  const remove = (index: number) => {
+    rowKeys.remove(index);
+    onChange(criteria.filter((_, i) => i !== index));
+  };
+  const add = () => {
+    if (!defaultType) return;
+    rowKeys.append();
+    onChange([...criteria, criterionForType(nextCriterionId(criteria), defaultType)]);
+  };
+
+  return (
+    <div className="flex flex-col gap-2" data-testid="loop-editor-criteria">
+      {criteria.map((criterion, index) => (
+        <div key={rowKeys.keys[index]} className="rounded-md bg-sunken p-3">
+          <div className="mb-2 flex items-center gap-2">
+            <span className="font-mono text-mono-id text-fg-strong">
+              {str(criterion.id) || "criterion"}
+            </span>
+            <Pill size="xs" tone="neutral" className="ml-auto">
+              {criterionTypeLabel(str(criterion.type) || "command")}
+            </Pill>
+            <Button
+              type="button"
+              variant="ghost"
+              size="icon-sm"
+              disabled={disabled}
+              onClick={() => remove(index)}
+              aria-label={`Remove criterion ${str(criterion.id) || index + 1}`}
+            >
+              <X aria-hidden="true" />
+            </Button>
+          </div>
+          <CriterionBody
+            criterion={criterion}
+            disabled={disabled}
+            suggestions={suggestions}
+            allowedTypes={allowedTypes}
+            onChange={patch => update(index, patch)}
+          />
+        </div>
+      ))}
+      <Button
+        type="button"
+        variant="quiet"
+        size="sm"
+        disabled={disabled || !defaultType}
+        onClick={add}
+        data-testid="loop-editor-criteria-add"
+      >
+        <Plus aria-hidden="true" />
+        Add criterion
+      </Button>
+    </div>
+  );
+}
+
+interface CriterionBodyProps {
+  criterion: Criterion;
+  disabled: boolean;
+  suggestions: readonly LoopReferenceSuggestion[];
+  onChange: (patch: Record<string, unknown>) => void;
+  allowedTypes: readonly CriterionType[];
+}
+
+const fieldClass = "px-2.5 font-mono text-form-input";
+
+function CriterionBody({
+  criterion,
+  disabled,
+  suggestions,
+  onChange,
+  allowedTypes,
+}: CriterionBodyProps) {
+  const type = str(criterion.type);
+  return (
+    <div className="flex flex-col gap-2">
+      <NativeSelect
+        value={type}
+        disabled={disabled}
+        onChange={event => onChange({ type: event.target.value })}
+        aria-label="Criterion type"
+      >
+        {allowedTypes.map(option => (
+          <NativeSelectOption key={option} value={option}>
+            {criterionTypeLabel(option)}
+          </NativeSelectOption>
+        ))}
+      </NativeSelect>
+      {type === "command" ? (
+        <div className="flex gap-2">
+          <div className="flex-1">
+            <LoopReferenceInput
+              value={str(criterion.check)}
+              onChange={next => onChange({ check: next })}
+              suggestions={suggestions}
+              disabled={disabled}
+              mono
+              placeholder="{{ .inputs.verify_command }}"
+              ariaLabel="Command check"
+            />
+          </div>
+          <NativeSelect
+            className="w-44 shrink-0"
+            value={str(criterion.expect) || "exit_zero"}
+            disabled={disabled}
+            onChange={event => onChange({ expect: event.target.value })}
+            aria-label="Passes when"
+          >
+            {COMMAND_EXPECT_OPTIONS.map(option => (
+              <NativeSelectOption key={option.value} value={option.value}>
+                {option.label}
+              </NativeSelectOption>
+            ))}
+          </NativeSelect>
+        </div>
+      ) : null}
+      {type === "agent-judge" ? (
+        <>
+          <Input
+            className={fieldClass}
+            value={str(criterion.agent)}
+            disabled={disabled}
+            placeholder="reviewer"
+            onChange={event => onChange({ agent: event.target.value })}
+            aria-label="Judge agent"
+          />
+          <LoopReferenceInput
+            value={str(criterion.rubric)}
+            onChange={next => onChange({ rubric: next })}
+            suggestions={suggestions}
+            disabled={disabled}
+            multiline
+            placeholder="Judge the diff against each task's acceptance…"
+            ariaLabel="Rubric"
+          />
+        </>
+      ) : null}
+      {type === "human" ? (
+        <LoopReferenceInput
+          value={str(criterion.prompt)}
+          onChange={next => onChange({ prompt: next })}
+          suggestions={suggestions}
+          disabled={disabled}
+          mono
+          placeholder="Approve the delivered work?"
+          ariaLabel="Human prompt"
+        />
+      ) : null}
+      {type === "extension" ? (
+        <Input
+          className={fieldClass}
+          value={str(criterion.tool)}
+          disabled={disabled}
+          placeholder="ext__gate_check"
+          onChange={event => onChange({ tool: event.target.value })}
+          aria-label="Extension tool"
+        />
+      ) : null}
+      <Label className="text-badge text-faint">
+        id
+        <Input
+          className={`${fieldClass} mt-1`}
+          value={str(criterion.id)}
+          disabled={disabled}
+          onChange={event => onChange({ id: event.target.value })}
+          aria-label="Criterion id"
+        />
+      </Label>
+    </div>
+  );
+}

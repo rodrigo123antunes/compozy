@@ -1,0 +1,463 @@
+@import "tailwindcss";
+@import "fumadocs-ui/css/preset.css";
+@import "fumadocs-ui/css/neutral.css";
+/*
+ * fumadocs-openapi renders precompiled components whose Tailwind classes live
+ * outside this app's source scan; its preset registers them via @source inline.
+ * Without this import every API-reference component ships unstyled.
+ */
+@import "fumadocs-openapi/css/preset.css";
+@import "@compozy/ui/tokens.css";
+@import "./styles/docs.css";
+@import "./styles/docs-api.css";
+@import "./styles/site-graphics.css";
+
+/*
+ * Tailwind v4 JIT scans source files relative to this stylesheet and ignores
+ * node_modules by default. The @compozy/ui workspace package contains components
+ * (Button, Badge, etc.) that use utilities like `bg-primary` — register its
+ * sources explicitly so those classes get emitted in this app's CSS.
+ */
+@source "../../ui/src/**/*.{ts,tsx}";
+
+/*
+ * Wire Next.js font variables into Tailwind's font tokens.
+ * `--font-geist`, `--font-jetbrains-mono`, and `--font-playfair` are injected
+ * by next/font in app/layout.tsx via the html className.
+ */
+@theme inline {
+  /* D9: the site keeps its own type and geometry. The shared ui tokens moved
+     to Inter 425/500/600, a 14.5px body and tighter radii for the product;
+     these pins hold the site on its Geist ladder and prior sizes. */
+  --font-weight-normal: 400;
+  --font-weight-medium: 510;
+  --font-weight-bold: 700;
+  --text-kbd: 0.65625rem;
+  --text-kbd--line-height: 0.75rem;
+  --text-kbd--font-weight: 510;
+  --text-item-title: 1rem;
+  --text-compact-h1: 1.1rem;
+  --text-form-label: 0.78125rem;
+  --tracking-body: -0.006em;
+  --radius-md: 10px;
+  --radius-lg: 14px;
+  /* Compact rows and inline chips hold the 8px corner the bare `rounded` gave them. */
+  --radius-site-row: 8px;
+  --height-button-default: 30px;
+  /* The hero's floating product window. The shared tokens retired the window
+     radius and shadow with the flat shell; the site keeps them for its mock. */
+  --radius-window: 12px;
+  /* Blog wire card (BlogWireCard): capped narrower than the prose column. */
+  --max-width-wire-card: 520px;
+  --shadow-window: 0 40px 90px -30px rgba(0, 0, 0, 0.7), 0 10px 30px -12px rgba(0, 0, 0, 0.55);
+  /* Button labels moved to the 14.5px product body; the site keeps 12.5px. */
+  --text-body: 0.78125rem;
+  --text-empty-h1: 1.125rem;
+  --text-modal-title: 0.84375rem;
+  --text-form-input: 0.78125rem;
+  --text-form-hint: 0.78125rem;
+  --text-code-block: 0.78125rem;
+  --text-code-block--line-height: 1.5;
+  /* The product's primary action is inverted (near-white on dark); the site
+     keeps its brand-orange CTA. */
+  --color-primary: var(--color-brand);
+  --color-primary-hover: var(--color-brand-hover);
+  --color-primary-foreground: var(--color-brand-ink);
+  --font-sans: var(--font-geist), "Geist", -apple-system, BlinkMacSystemFont, sans-serif;
+  --font-display: var(--font-playfair), "Playfair Display", serif;
+  --font-mono:
+    var(--font-jetbrains-mono), "JetBrains Mono Variable", "JetBrains Mono", "Courier New",
+    monospace;
+  --text-inline-code: 0.9em;
+  --text-accent-glyph: 0.85em;
+  --text-ui-title-lg: 1.35rem;
+  --text-site-hero: clamp(2.6rem, 5vw, 4.5rem);
+  --text-site-error-title: clamp(2.6rem, 6vw, 4.8rem);
+  --text-site-hero-section: clamp(2.6rem, 5.5vw, 4.2rem);
+  --text-site-blog-title: clamp(2.6rem, 5.4vw, 4.6rem);
+  --text-site-doc-title: clamp(2.4rem, 4vw, 3.4rem);
+  --text-site-doc-lead: 1.125rem;
+  --text-site-doc-lead--line-height: 1.65;
+  --text-site-doc-prose: 1rem;
+  --text-site-doc-prose--line-height: var(--leading-doc-body);
+  --text-site-doc-prose-compact: 0.95rem;
+  --text-site-doc-prose-compact--line-height: 1.75;
+  --text-site-doc-subheading: 1.25rem;
+  --text-site-doc-subheading--line-height: 1.25;
+  --text-site-api-body: 0.9375rem;
+  --text-site-api-body--line-height: 1.65;
+  --text-site-api-heading: 1.625rem;
+  --text-site-api-heading--line-height: 1.15;
+  --text-site-api-subheading: 1.125rem;
+  --text-site-api-code: 0.8125rem;
+  --text-site-protocol-title: clamp(2.4rem, 5vw, 3.8rem);
+  --text-site-page-title: clamp(2.4rem, 4.4vw, 4rem);
+  --text-site-article-title: clamp(2.4rem, 4.4vw, 3.6rem);
+  --text-site-section-title: clamp(2.2rem, 4.6vw, 3.6rem);
+  --text-site-category-title: clamp(2.2rem, 4vw, 3.4rem);
+  --text-site-cta-title: clamp(2rem, 4.5vw, 3.2rem);
+  --text-site-feature-title: clamp(2rem, 3.4vw, 2.8rem);
+  --text-site-subsection-title: clamp(1.9rem, 3.4vw, 2.6rem);
+  --text-site-doc-heading: clamp(1.6rem, 2.6vw, 2.15rem);
+  --text-group-label: 0.625rem;
+  --text-group-label--line-height: 0.75rem;
+  --text-site-release-title: clamp(1.6rem, 3vw, 2.1rem);
+  --text-site-empty-title: clamp(1.55rem, 3vw, 2rem);
+  --text-site-quote: clamp(1.5rem, 2.4vw, 1.95rem);
+  --text-site-card-title: clamp(1.45rem, 3vw, 1.9rem);
+  --text-site-subheading: clamp(1.25rem, 1.7vw, 1.45rem);
+  --text-site-bento-2xl: 2.5rem;
+  --text-site-bento-xl: 2.35rem;
+  --text-site-bento-lg: 2rem;
+  --text-site-bento-md: 1.9rem;
+  --text-site-bento-sm: 1.8rem;
+  --text-site-bento-xs: 1.65rem;
+  --leading-small-body: var(--text-small-body--line-height);
+  --leading-doc-body: 1.8;
+  --radius-chip: var(--radius-chip);
+  --radius-mono-badge: var(--radius-mono-badge);
+  --radius-diagram: var(--radius-xl);
+  --radius-icon-well: 0.75rem;
+  --container-site-layout-width: var(--site-layout-width);
+  --spacing-site-doc-sidebar-section-label-offset: var(--site-doc-sidebar-section-label-offset);
+  --spacing-site-doc-sidebar-group-gap: var(--site-doc-sidebar-group-gap);
+  --tracking-site-doc-sidebar-section-label: var(--site-doc-sidebar-section-label-tracking);
+  --tracking-site-doc-sidebar-group-label: var(--site-doc-sidebar-group-label-tracking);
+  --color-site-doc-sidebar-section-label: var(--site-doc-sidebar-section-label-color);
+  --color-site-doc-sidebar-group-label: var(--site-doc-sidebar-group-label-color);
+}
+
+/*
+ * D9 palette pins. The shared ui tokens moved the product to a neutral ramp
+ * with opaque hairlines; the site keeps its warm dark ramp. Values are the
+ * pre-shell-rail tokens. The roles the ui primitives adopted since (surface-2,
+ * selected, sunken, code-bg, fg-2/3, well, card/pop shadows) map onto the warm
+ * equivalents of what those primitives painted before, so site renders of
+ * `@compozy/ui` keep their look. Unlayered, so it wins over the token theme.
+ */
+:root {
+  --color-rail: #0c0b0b;
+  --color-canvas: #171615;
+  --color-canvas-soft: #1f1e1c;
+  --color-canvas-tint: #232220;
+  --color-sidebar: #1f1e1c;
+  --color-elevated: #2a2927;
+  --color-disabled: #4a4847;
+  --color-line: rgba(255, 255, 255, 0.055);
+  --color-line-soft: rgba(255, 255, 255, 0.03);
+  --color-line-strong: rgba(255, 255, 255, 0.09);
+  --color-line-focus: rgba(255, 255, 255, 0.14);
+  --color-fg: #eeedeb;
+  --color-fg-strong: #f7f6f4;
+  --color-muted-foreground: #a4a29e;
+  --color-subtle: oklch(0.663 0.004 75);
+  --color-faint: oklch(0.638 0.003 75);
+  --color-success: #5fbf85;
+  --color-success-tint: rgba(95, 191, 133, 0.08);
+  --color-warning: #d6a647;
+  --color-warning-tint: rgba(214, 166, 71, 0.08);
+  --color-destructive: #e0635a;
+  --color-destructive-tint: rgba(224, 99, 90, 0.09);
+  --color-popover: var(--color-canvas-soft);
+  /* The shared --hover steps to surface-2; the site keeps its row glaze. */
+  --color-hover: rgba(255, 255, 255, 0.045);
+  /* Roles the primitives adopted, on the warm ramp. */
+  --color-desk: var(--color-rail);
+  --color-surface-2: var(--color-canvas-tint);
+  --color-selected: var(--color-elevated);
+  --color-sunken: var(--color-rail);
+  --color-code-bg: var(--color-canvas-soft);
+  --color-fg-2: color-mix(in srgb, var(--color-muted-foreground) 60%, var(--color-fg));
+  --color-fg-3: color-mix(in srgb, var(--color-fg) 70%, var(--color-muted-foreground));
+  --color-well: color-mix(in srgb, var(--color-success) 14%, var(--color-canvas));
+  /* The site's surfaces stay flat: cards had no lift, popups a hairline. */
+  --theme-shadow-card: none;
+  --theme-shadow-elevated: none;
+  --theme-shadow-pop: 0 0 0 1px var(--color-line-soft);
+}
+
+:root {
+  --site-layout-width: 1200px;
+  --site-doc-layout-width: 96rem;
+  --site-doc-sidebar-width: 16rem;
+  --site-doc-toc-width: 14rem;
+  --site-doc-sidebar-marker-offset: 0.75rem;
+  --site-doc-sidebar-marker-inset: 0.375rem;
+  --site-doc-sidebar-nested-marker-offset: 0.6875rem;
+  --site-doc-sidebar-tree-indent: 0.875rem;
+  --site-doc-sidebar-tree-gutter: 0.625rem;
+  --site-doc-sidebar-tree-line-inset: 0.25rem;
+  --site-doc-sidebar-first-group-gap: 0.375rem;
+  --site-doc-toc-gutter: 1rem;
+  --site-doc-index-label-width: 11.875rem;
+  --site-doc-hairline: 1px;
+  --site-doc-sidebar-section-label-offset: 1.625rem;
+  --site-doc-sidebar-section-label-tracking: 0.09em;
+  --site-doc-sidebar-section-label-color: color-mix(
+    in srgb,
+    var(--color-brand) 65%,
+    var(--color-muted-foreground)
+  );
+  --site-doc-sidebar-group-gap: 0.4375rem;
+  --site-doc-sidebar-group-label-tracking: 0.08em;
+  --site-doc-sidebar-group-label-color: color-mix(in srgb, var(--color-subtle) 72%, transparent);
+  --site-doc-masthead-context-gap: 1rem;
+  --site-doc-masthead-context-height: 1.75rem;
+  --site-doc-masthead-crumb-gap: 0.5rem;
+  --site-doc-masthead-crumb-tracking: 0.08em;
+  --site-doc-masthead-crumb-rule-width: 0.875rem;
+  --site-doc-masthead-action-gap: 0.375rem;
+  --site-doc-masthead-title-offset: 1.125rem;
+  --site-doc-masthead-title-leading: 1.02;
+  --site-doc-masthead-title-tracking: -0.02em;
+  --site-doc-masthead-lead-offset: 1rem;
+  --site-doc-masthead-lead-width: 64ch;
+  --site-doc-masthead-meta-gap: 1.25rem;
+  --site-doc-masthead-meta-offset: 1.5rem;
+  --site-doc-masthead-meta-rule-gap: 0.875rem;
+  --site-doc-inline-gap: 0.4375rem;
+  --site-doc-meta-icon-opacity: 0.7;
+  --site-doc-action-padding-inline: 0.625rem;
+  --site-doc-action-success-border: color-mix(in srgb, var(--color-success) 35%, transparent);
+  --site-doc-action-success-background: color-mix(in srgb, var(--color-success) 10%, transparent);
+  --site-doc-section-offset: 4rem;
+  --site-doc-section-rule-gap: 1rem;
+  --site-doc-section-leading: 1.1;
+  --site-doc-subsection-offset: 2.25rem;
+  --site-doc-prose-width: 72ch;
+  --site-doc-list-indent: 1.3rem;
+  --site-doc-code-padding-inline: 0.38rem;
+  --site-doc-code-padding-block: 0.12rem;
+  --site-doc-link-underline-offset: 0.24em;
+  --site-doc-section-offset-compact: 3.25rem;
+  --site-api-content-width: 90rem;
+  --site-api-operation-separation: 3rem;
+  --site-api-column-gap: 2rem;
+  --site-api-column-gap-medium: 2.5rem;
+  --site-api-column-gap-wide: 3.5rem;
+  --site-api-sticky-row-fallback: 2rem;
+  --site-api-sticky-offset: 1rem;
+  --site-api-example-width: 22rem;
+  --site-api-example-width-wide: 26rem;
+  --site-api-content-gap: 1.25rem;
+  --site-api-heading-content-gap: 0.875rem;
+  --site-api-subheading-offset: 2.5rem;
+  --site-api-schema-min-width: 18rem;
+  --site-diagram-node-stroke-width: 1.4px;
+  --site-bento-overlay-runtime: linear-gradient(
+    180deg,
+    color-mix(in srgb, var(--color-rail) 68%, transparent) 0%,
+    color-mix(in srgb, var(--color-rail) 18%, transparent) 42%,
+    transparent 68%
+  );
+  --site-bento-overlay-extensibility: linear-gradient(
+    180deg,
+    color-mix(in srgb, var(--color-rail) 92%, transparent) 0%,
+    color-mix(in srgb, var(--color-rail) 66%, transparent) 26%,
+    transparent 58%
+  );
+}
+
+/*
+ * Override Fumadocs UI tokens with the DESIGN.md dark operator palette.
+ * The root layout pins `.dark` on <html>; docs routes additionally mount
+ * Fumadocs RootProvider with forced dark theme. Canvas → Surface → Elevated,
+ * single warm accent #E8572A.
+ */
+.dark {
+  --color-fd-background: var(--color-canvas);
+  --color-fd-foreground: var(--color-fg);
+  --color-fd-muted: var(--color-canvas-soft);
+  --color-fd-muted-foreground: var(--color-muted-foreground);
+  --color-fd-popover: var(--color-elevated);
+  --color-fd-popover-foreground: var(--color-fg);
+  --color-fd-card: var(--color-canvas-soft);
+  --color-fd-card-foreground: var(--color-fg);
+  --color-fd-border: var(--color-line);
+  --color-fd-primary: var(--color-brand);
+  --color-fd-primary-foreground: #ffffff;
+  --color-fd-secondary: var(--color-canvas-soft);
+  --color-fd-secondary-foreground: var(--color-fg);
+  --color-fd-accent: var(--color-elevated);
+  --color-fd-accent-foreground: var(--color-fg);
+  --color-fd-ring: var(--color-brand);
+  --color-fd-info: var(--color-info);
+  --color-fd-warning: var(--color-warning);
+  --color-fd-error: var(--color-destructive);
+  --color-fd-success: var(--color-success);
+  --color-fd-idea: var(--color-brand);
+  --color-fd-diff-remove: var(--color-destructive-tint);
+  --color-fd-diff-remove-symbol: var(--color-destructive);
+  --color-fd-diff-add: var(--color-success-tint);
+  --color-fd-diff-add-symbol: var(--color-success);
+}
+
+/* Remove fumadocs banner wrapper padding on landing page only */
+body:has(.site-home) .bg-fd-secondary\/50.p-3 {
+  padding: 0;
+  background: transparent;
+}
+
+/* neutral.css ships a sidebar-specific override; realign it to DESIGN.md. */
+.dark #nd-sidebar {
+  --color-fd-muted: var(--color-canvas-soft);
+  --color-fd-secondary: var(--color-canvas-soft);
+  --color-fd-muted-foreground: var(--color-muted-foreground);
+}
+
+body {
+  background: var(--color-canvas);
+  color: var(--color-fg);
+  font-size: 0.9375rem;
+  font-weight: 400;
+  line-height: 1.55;
+  letter-spacing: -0.006em;
+  font-feature-settings: normal;
+  text-rendering: optimizeLegibility;
+}
+
+/* D9: the site still ships JetBrains Mono, which needs its native stroke
+   rendering instead of the grayscale smoothing the body baseline applies. The
+   shared ui baseline dropped this rule when the product moved to Geist Mono. */
+.font-mono,
+[class*="font-mono"],
+code,
+kbd,
+samp,
+pre {
+  -webkit-font-smoothing: subpixel-antialiased;
+  -moz-osx-font-smoothing: auto;
+}
+
+a {
+  text-underline-offset: 0.24em;
+}
+
+::selection {
+  background: color-mix(in srgb, var(--color-brand) 28%, transparent);
+  color: var(--color-fg);
+}
+
+#nd-sidebar {
+  width: var(--fd-sidebar-width);
+  border-inline-end: 1px solid var(--color-line);
+  border-color: var(--color-line);
+  background: color-mix(in srgb, var(--color-canvas-soft) 55%, var(--color-canvas)) !important;
+}
+
+#nd-sidebar [data-active="true"] {
+  background: var(--color-brand-tint);
+  color: var(--color-brand);
+}
+
+#nd-sidebar .docs-sb-item[data-active="true"]::before {
+  content: "";
+  position: absolute;
+  inset-inline-start: calc(-1 * var(--site-doc-sidebar-marker-offset));
+  top: var(--site-doc-sidebar-marker-inset);
+  bottom: var(--site-doc-sidebar-marker-inset);
+  width: 2px;
+  border-radius: 1px;
+  background: var(--color-brand);
+}
+
+#nd-sidebar .docs-sb-kids .docs-sb-item[data-active="true"]::before {
+  inset-inline-start: calc(-1 * var(--site-doc-sidebar-nested-marker-offset));
+}
+
+#nd-sidebar .docs-sb-folder[data-state="open"] > .docs-sb-folder-head:not([data-active="true"]) {
+  color: var(--color-fg);
+}
+
+#nd-sidebar .docs-sb-item svg:not([data-icon]) {
+  stroke-width: 1.6;
+}
+
+#nd-sidebar .docs-sb-folder-head svg[data-icon] {
+  transition: transform var(--duration-base) var(--ease-out);
+}
+
+#nd-sidebar .docs-sb-kids {
+  position: relative;
+  margin-inline-start: var(--site-doc-sidebar-tree-indent);
+  padding-inline-start: var(--site-doc-sidebar-tree-gutter);
+}
+
+#nd-sidebar .docs-sb-kids::before {
+  content: "";
+  position: absolute;
+  inset-inline-start: 0;
+  top: var(--site-doc-sidebar-tree-line-inset);
+  bottom: var(--site-doc-sidebar-tree-line-inset);
+  width: 1px;
+  background: var(--color-line-strong);
+}
+
+#nd-sidebar .docs-sb-kids > .docs-sb-group:first-child {
+  margin-top: var(--site-doc-sidebar-first-group-gap);
+}
+
+#nd-sidebar [data-sidebar-body] {
+  background: transparent;
+}
+
+#nd-page {
+  background: transparent;
+}
+
+#nd-page > * {
+  max-width: 100% !important;
+}
+
+#nd-notebook-layout {
+  --fd-layout-width: 100vw !important;
+}
+
+#nd-toc {
+  width: var(--site-doc-toc-width);
+  border-inline-start: 1px solid var(--color-line);
+  padding-inline-start: var(--site-doc-toc-gutter);
+}
+
+#nd-toc [aria-current="true"],
+#nd-toc [data-active="true"],
+#nd-toc a:hover {
+  color: var(--color-brand);
+}
+
+a p.text-fd-muted-foreground.truncate {
+  overflow: visible;
+  text-overflow: clip;
+  white-space: normal;
+}
+
+button span.truncate[class*="transition-"] {
+  overflow: visible;
+  line-height: 1.15;
+  text-overflow: clip;
+  white-space: normal;
+}
+
+@media (max-width: 1024px) {
+  #nd-toc {
+    width: 100%;
+    border-inline-start: 0;
+    padding-inline-start: 0;
+  }
+}
+
+@media (min-width: 768px) {
+  #nd-notebook-layout {
+    --fd-sidebar-width: var(--site-doc-sidebar-width);
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    scroll-behavior: auto !important;
+    transition-duration: 0ms !important;
+    animation-duration: 0ms !important;
+  }
+}

@@ -1,0 +1,491 @@
+package daemon
+
+import (
+	"context"
+	"encoding/json"
+	"errors"
+	"testing"
+
+	"github.com/compozy/compozy/internal/api/contract"
+	apicore "github.com/compozy/compozy/internal/api/core"
+
+	compozyconfig "github.com/compozy/compozy/internal/config"
+	looppkg "github.com/compozy/compozy/internal/loop"
+	looppkgdsl "github.com/compozy/compozy/internal/loop/dsl"
+	toolspkg "github.com/compozy/compozy/internal/tools"
+	"github.com/compozy/compozy/internal/workspaceaccess"
+)
+
+type loopToolSchemaContextKey struct{}
+
+func TestLoopToolSchemaSource(t *testing.T) {
+	t.Parallel()
+
+	t.Run("Should expose registry descriptor schemas as loop snapshots", func(t *testing.T) {
+		t.Parallel()
+
+		descriptor := loopToolSchemaDescriptor(t)
+		source := newLoopToolSchemaSource(t.Context(), loopToolSchemaRegistry{
+			views: map[toolspkg.ToolID]toolspkg.ToolView{
+				descriptor.ID: {Descriptor: descriptor},
+			},
+		})
+
+		snapshot, ok := source.Snapshot(descriptor.ID.String())
+		if !ok {
+			t.Fatalf("Snapshot(%q) ok = false, want true", descriptor.ID)
+		}
+		if got, want := snapshot.ToolID, descriptor.ID.String(); got != want {
+			t.Fatalf("snapshot.ToolID = %q, want %q", got, want)
+		}
+		if !json.Valid(snapshot.InputSchema) {
+			t.Fatalf("snapshot.InputSchema = %s, want valid JSON", snapshot.InputSchema)
+		}
+		if !json.Valid(snapshot.OutputSchema) {
+			t.Fatalf("snapshot.OutputSchema = %s, want valid JSON", snapshot.OutputSchema)
+		}
+		if got, want := snapshot.InputSchemaDigest, descriptor.InputSchemaDigest; got != want {
+			t.Fatalf("snapshot.InputSchemaDigest = %q, want %q", got, want)
+		}
+		if got, want := snapshot.OutputSchemaDigest, descriptor.OutputSchemaDigest; got != want {
+			t.Fatalf("snapshot.OutputSchemaDigest = %q, want %q", got, want)
+		}
+
+		snapshot.InputSchema[0] = '['
+		next, ok := source.Snapshot(descriptor.ID.String())
+		if !ok {
+			t.Fatalf("Snapshot(%q) after mutation ok = false, want true", descriptor.ID)
+		}
+		if got, want := next.InputSchema[0], byte('{'); got != want {
+			t.Fatalf("next.InputSchema[0] = %q, want %q", got, want)
+		}
+	})
+
+	t.Run("Should reject invalid or unknown tool identifiers", func(t *testing.T) {
+		t.Parallel()
+
+		source := newLoopToolSchemaSource(
+			t.Context(),
+			loopToolSchemaRegistry{views: map[toolspkg.ToolID]toolspkg.ToolView{}},
+		)
+		if _, ok := source.Snapshot("not a valid tool id"); ok {
+			t.Fatal("Snapshot(invalid id) ok = true, want false")
+		}
+		if _, ok := source.Snapshot("ext__fixture__missing"); ok {
+			t.Fatal("Snapshot(unknown id) ok = true, want false")
+		}
+	})
+
+	t.Run("Should project the registry once for all requested schemas", func(t *testing.T) {
+		t.Parallel()
+
+		first := loopToolSchemaDescriptor(t)
+		second := first
+		second.ID = toolspkg.ToolID("ext__fixture__second")
+		listCalls := 0
+		getCalls := 0
+		source := newLoopToolSchemaSource(t.Context(), loopToolSchemaRegistry{
+			views: map[toolspkg.ToolID]toolspkg.ToolView{
+				first.ID:  {Descriptor: first},
+				second.ID: {Descriptor: second},
+			},
+			listCalls: &listCalls,
+			getCalls:  &getCalls,
+		})
+
+		for _, id := range []toolspkg.ToolID{first.ID, second.ID, first.ID} {
+			if _, ok := source.Snapshot(id.String()); !ok {
+				t.Fatalf("Snapshot(%q) ok = false, want true", id)
+			}
+		}
+		if got, want := listCalls, 1; got != want {
+			t.Fatalf("registry List calls = %d, want %d", got, want)
+		}
+		if got, want := getCalls, 0; got != want {
+			t.Fatalf("registry Get calls = %d, want %d", got, want)
+		}
+	})
+
+	t.Run("Should pass caller context to registry lookups", func(t *testing.T) {
+		t.Parallel()
+
+		const marker = "schema-projection"
+		var captured any
+		ctx := context.WithValue(t.Context(), loopToolSchemaContextKey{}, marker)
+		descriptor := loopToolSchemaDescriptor(t)
+		source := newLoopToolSchemaSource(ctx, loopToolSchemaRegistry{
+			views: map[toolspkg.ToolID]toolspkg.ToolView{
+				descriptor.ID: {Descriptor: descriptor},
+			},
+			listContextValue: &captured,
+		})
+
+		if _, ok := source.Snapshot(descriptor.ID.String()); !ok {
+			t.Fatalf("Snapshot(%q) ok = false, want true", descriptor.ID)
+		}
+		if captured != marker {
+			t.Fatalf("registry List context marker = %#v, want %q", captured, marker)
+		}
+	})
+
+	t.Run("Should project lifecycle tools in the acting profile and workspace", func(t *testing.T) {
+		t.Parallel()
+
+		descriptor := loopToolSchemaDescriptor(t)
+		descriptor.ID = "ext__qa_lab__capture_candidate"
+		var captured toolspkg.Scope
+		source := newScopedLoopToolSchemaSource(
+			t.Context(),
+			loopToolSchemaRegistry{
+				views: map[toolspkg.ToolID]toolspkg.ToolView{
+					descriptor.ID: {Descriptor: descriptor},
+				},
+				listScope: &captured,
+			},
+			toolspkg.Scope{
+				Operator: true, ProfileID: "profile-engineering", WorkspaceID: "workspace-qa",
+			},
+		)
+
+		if _, ok := source.Snapshot(descriptor.ID.String()); !ok {
+			t.Fatalf("Snapshot(%q) ok = false, want lifecycle action schema", descriptor.ID)
+		}
+		if !captured.Operator || captured.ProfileID != "profile-engineering" ||
+			captured.WorkspaceID != "workspace-qa" {
+			t.Fatalf("registry List scope = %#v, want acting profile and workspace", captured)
+		}
+	})
+
+	t.Run("Should compile a lifecycle action only through its valid scope", func(t *testing.T) {
+		t.Parallel()
+
+		descriptor := loopToolSchemaDescriptor(t)
+		descriptor.ID = "ext__qa_lab__capture_candidate"
+		validScope := toolspkg.Scope{
+			Operator: true, ProfileID: "profile-engineering", WorkspaceID: "workspace-qa",
+		}
+		registry := loopToolSchemaRegistry{
+			views: map[toolspkg.ToolID]toolspkg.ToolView{
+				descriptor.ID: {Descriptor: descriptor},
+			},
+			requiredScope: &validScope,
+		}
+		definition := looppkgdsl.Definition{Graph: looppkgdsl.Graph{Nodes: []looppkgdsl.Node{{
+			ID: "capture", Class: looppkgdsl.NodeClassAction, Kind: descriptor.ID.String(),
+		}}}}
+
+		resolved, err := newLoopCompilerFactory(registry)(
+			t.Context(), "workspace-qa", "profile-engineering",
+		).Compile(definition)
+		if err != nil {
+			t.Fatalf("Compile(valid lifecycle scope) error = %v", err)
+		}
+		if _, ok := resolved.ToolSchemas[descriptor.ID.String()]; !ok {
+			t.Fatalf("resolved tool schemas = %#v, want %q", resolved.ToolSchemas, descriptor.ID)
+		}
+
+		_, err = newLoopCompilerFactory(registry)(
+			t.Context(), "workspace-peer", "profile-engineering",
+		).Compile(definition)
+		lintErr, ok := errors.AsType[*looppkg.LintFailedError](err)
+		if !ok || len(lintErr.Errors) != 1 || lintErr.Errors[0].Code != looppkg.CodeUnknownActionKind {
+			t.Fatalf("Compile(peer lifecycle scope) error = %v, want %s", err, looppkg.CodeUnknownActionKind)
+		}
+	})
+
+	t.Run("Should validate lifecycle actions through the public API only in the acting scope", func(t *testing.T) {
+		t.Parallel()
+
+		descriptor := loopToolSchemaDescriptor(t)
+		descriptor.ID = "ext__qa_lab__capture_candidate"
+		validScope := toolspkg.Scope{
+			Operator: true, ProfileID: "profile-engineering", WorkspaceID: "workspace-qa",
+		}
+		registry := loopToolSchemaRegistry{
+			views: map[toolspkg.ToolID]toolspkg.ToolView{
+				descriptor.ID: {Descriptor: descriptor},
+			},
+			requiredScope: &validScope,
+		}
+		service := &daemonLoopAPIService{toolRegistry: registry}
+		definition := looppkgdsl.Definition{Graph: looppkgdsl.Graph{Nodes: []looppkgdsl.Node{{
+			ID: "capture", Class: looppkgdsl.NodeClassAction, Kind: descriptor.ID.String(),
+		}}}}
+		request := contract.ValidateLoopRequest{Definition: contract.LoopDefinitionDocument(definition)}
+
+		response, err := service.ValidateLoop(
+			t.Context(), "workspace-qa", "profile-engineering", "", request,
+		)
+		if err != nil {
+			t.Fatalf("ValidateLoop(valid lifecycle scope) error = %v", err)
+		}
+		if !response.Valid {
+			t.Fatalf("ValidateLoop(valid lifecycle scope) response = %#v, want valid", response)
+		}
+
+		_, err = service.ValidateLoop(t.Context(), "workspace-peer", "profile-engineering", "", request)
+		lintErr, ok := errors.AsType[*apicore.LoopLintFailedError](err)
+		if !ok || len(lintErr.Errors) != 1 || lintErr.Errors[0].Code != looppkg.CodeUnknownActionKind {
+			t.Fatalf("ValidateLoop(peer lifecycle scope) error = %v, want %s", err, looppkg.CodeUnknownActionKind)
+		}
+	})
+
+	t.Run("Should stop before registry lookup when caller context is canceled", func(t *testing.T) {
+		t.Parallel()
+
+		ctx, cancel := context.WithCancel(t.Context())
+		cancel()
+		descriptor := loopToolSchemaDescriptor(t)
+		listCalls := 0
+		source := newLoopToolSchemaSource(ctx, loopToolSchemaRegistry{
+			views: map[toolspkg.ToolID]toolspkg.ToolView{
+				descriptor.ID: {Descriptor: descriptor},
+			},
+			listCalls: &listCalls,
+		})
+
+		if _, ok := source.Snapshot(descriptor.ID.String()); ok {
+			t.Fatalf("Snapshot(%q) ok = true, want false after canceled context", descriptor.ID)
+		}
+		if listCalls != 0 {
+			t.Fatalf("registry List calls = %d, want 0", listCalls)
+		}
+	})
+
+	t.Run("Should disable schema source when registry is unavailable", func(t *testing.T) {
+		t.Parallel()
+
+		var missingContext context.Context
+		if source := newLoopToolSchemaSource(missingContext, loopToolSchemaRegistry{}); source != nil {
+			t.Fatalf("newLoopToolSchemaSource(nil context) = %T, want nil", source)
+		}
+		if source := newLoopToolSchemaSource(t.Context(), nil); source != nil {
+			t.Fatalf("newLoopToolSchemaSource(nil) = %T, want nil", source)
+		}
+	})
+
+	t.Run("Should call only tools owned by the extension that installed the Loop", func(t *testing.T) {
+		t.Parallel()
+
+		const (
+			owner       = "release-automation"
+			ownToolID   = toolspkg.ToolID("ext__release_automation__prepare")
+			otherToolID = toolspkg.ToolID("ext__artifact_store__write")
+		)
+		ownCalled := false
+		ownProvider, err := toolspkg.NewNativeProvider(
+			toolspkg.SourceRef{Kind: toolspkg.SourceExtension, Owner: owner},
+			toolspkg.NativeTool{
+				Descriptor: loopExtensionActionDescriptor(ownToolID, owner),
+				Call: func(context.Context, toolspkg.Scope, toolspkg.CallRequest) (toolspkg.ToolResult, error) {
+					ownCalled = true
+					return toolspkg.ToolResult{Structured: json.RawMessage(`{"status":"prepared"}`)}, nil
+				},
+			},
+		)
+		if err != nil {
+			t.Fatalf("NewNativeProvider(own extension) error = %v", err)
+		}
+		otherCalled := false
+		otherProvider, err := toolspkg.NewNativeProvider(
+			toolspkg.SourceRef{Kind: toolspkg.SourceExtension, Owner: "artifact-store"},
+			toolspkg.NativeTool{
+				Descriptor: loopExtensionActionDescriptor(otherToolID, "artifact-store"),
+				Call: func(context.Context, toolspkg.Scope, toolspkg.CallRequest) (toolspkg.ToolResult, error) {
+					otherCalled = true
+					return toolspkg.ToolResult{Structured: json.RawMessage(`{"status":"written"}`)}, nil
+				},
+			},
+		)
+		if err != nil {
+			t.Fatalf("NewNativeProvider(foreign extension) error = %v", err)
+		}
+		cfg := testConfig(t, testHomePaths(t))
+		cfg.Permissions.Mode = compozyconfig.PermissionModeApproveAll
+		cfg.Tools.Policy.ExternalDefault = compozyconfig.ToolsExternalDefaultDisabled
+		policy, err := newNativeToolPolicyResolver(nativeToolPolicyResolverDeps{
+			Config:            &cfg,
+			ApprovalAvailable: true,
+		})
+		if err != nil {
+			t.Fatalf("newNativeToolPolicyResolver() error = %v", err)
+		}
+		registry, err := toolspkg.NewRegistry(
+			toolspkg.WithProviders(ownProvider, otherProvider),
+			toolspkg.WithPolicyInputResolver(policy, toolspkg.ToolsetCatalog{}),
+		)
+		if err != nil {
+			t.Fatalf("NewRegistry() error = %v", err)
+		}
+		actions, err := looppkg.NewActionRegistry(registry)
+		if err != nil {
+			t.Fatalf("NewActionRegistry() error = %v", err)
+		}
+		scope := toolspkg.Scope{ActorKind: string(workspaceaccess.ActorDaemon)}
+		ctx := toolspkg.WithTrustedExtensionOwner(t.Context(), owner)
+		ownerGrant := toolspkg.SourceGrant{Kind: toolspkg.SourceExtension, Owner: owner}
+		inputs, err := policy.Resolve(ctx, scope)
+		if err != nil {
+			t.Fatalf("Resolve(loop-owned policy) error = %v", err)
+		}
+		if !sourceGrantExists(inputs.AllowSources, ownerGrant) {
+			t.Fatalf("loop-owned allow sources = %#v, want %#v", inputs.AllowSources, ownerGrant)
+		}
+		if sourceGrantExists(inputs.TrustedSources, ownerGrant) {
+			t.Fatalf("loop-owned trusted sources = %#v, want no permission bypass", inputs.TrustedSources)
+		}
+
+		executor, err := actions.Resolve(ctx, scope, ownToolID.String())
+		if err != nil {
+			t.Fatalf("Resolve(own extension tool) error = %v", err)
+		}
+		_, err = executor.Execute(ctx, loopActionNode(ownToolID), looppkg.ActionExecutionInput{
+			ToolScope: scope,
+		})
+		if err != nil {
+			t.Fatalf("Execute(own extension tool) error = %v", err)
+		}
+		if !ownCalled {
+			t.Fatal("own extension tool called = false, want true")
+		}
+
+		_, err = actions.Resolve(ctx, scope, otherToolID.String())
+		if !errors.Is(err, looppkg.ErrActionUnknownKind) {
+			t.Fatalf("Resolve(foreign extension tool) error = %v, want ErrActionUnknownKind", err)
+		}
+		if otherCalled {
+			t.Fatal("foreign extension tool called = true, want false")
+		}
+
+		untrustedScope := toolspkg.Scope{ActorKind: string(workspaceaccess.ActorAgentSession)}
+		_, err = actions.Resolve(ctx, untrustedScope, ownToolID.String())
+		if !errors.Is(err, looppkg.ErrActionUnknownKind) {
+			t.Fatalf("Resolve(agent-forged owner) error = %v, want ErrActionUnknownKind", err)
+		}
+	})
+}
+
+func loopExtensionActionDescriptor(id toolspkg.ToolID, owner string) toolspkg.Descriptor {
+	return toolspkg.Descriptor{
+		ID:               id,
+		ToolPresentation: toolspkg.NewToolPresentation("Prepare release", "", ""),
+		Description:      "Prepare a release artifact.",
+		InputSchema:      json.RawMessage(`{"type":"object","additionalProperties":false}`),
+		OutputSchema: json.RawMessage(
+			`{"type":"object","required":["status"],"properties":{"status":{"type":"string"}}}`,
+		),
+		Backend: toolspkg.BackendRef{
+			Kind:       toolspkg.BackendNativeGo,
+			NativeName: "prepare",
+		},
+		Source:     toolspkg.SourceRef{Kind: toolspkg.SourceExtension, Owner: owner},
+		Visibility: toolspkg.VisibilitySession,
+		Risk:       toolspkg.RiskRead,
+		ReadOnly:   true,
+	}
+}
+
+func loopActionNode(id toolspkg.ToolID) looppkgdsl.Node {
+	return looppkgdsl.Node{
+		ID:    "prepare",
+		Class: looppkgdsl.NodeClassAction,
+		Kind:  id.String(),
+	}
+}
+
+type loopToolSchemaRegistry struct {
+	views            map[toolspkg.ToolID]toolspkg.ToolView
+	listCalls        *int
+	getCalls         *int
+	listContextValue *any
+	listScope        *toolspkg.Scope
+	requiredScope    *toolspkg.Scope
+}
+
+func (r loopToolSchemaRegistry) List(ctx context.Context, scope toolspkg.Scope) ([]toolspkg.ToolView, error) {
+	if r.listCalls != nil {
+		*r.listCalls++
+	}
+	if r.listContextValue != nil {
+		*r.listContextValue = ctx.Value(loopToolSchemaContextKey{})
+	}
+	if r.listScope != nil {
+		*r.listScope = scope
+	}
+	if r.requiredScope != nil && scope != *r.requiredScope {
+		return nil, nil
+	}
+	views := make([]toolspkg.ToolView, 0, len(r.views))
+	for id := range r.views {
+		views = append(views, r.views[id])
+	}
+	return views, nil
+}
+
+func (r loopToolSchemaRegistry) Search(
+	context.Context,
+	toolspkg.Scope,
+	toolspkg.SearchQuery,
+) ([]toolspkg.ToolView, error) {
+	return r.List(context.Background(), toolspkg.Scope{})
+}
+
+func (r loopToolSchemaRegistry) Get(
+	ctx context.Context,
+	_ toolspkg.Scope,
+	id toolspkg.ToolID,
+) (toolspkg.ToolView, error) {
+	if r.getCalls != nil {
+		*r.getCalls++
+	}
+	if err := ctx.Err(); err != nil {
+		return toolspkg.ToolView{}, err
+	}
+	view, ok := r.views[id]
+	if !ok {
+		return toolspkg.ToolView{}, errors.New("tool not found")
+	}
+	return view, nil
+}
+
+func (r loopToolSchemaRegistry) Call(
+	context.Context,
+	toolspkg.Scope,
+	toolspkg.CallRequest,
+) (toolspkg.ToolResult, error) {
+	return toolspkg.ToolResult{}, errors.New("unexpected tool call")
+}
+
+func loopToolSchemaDescriptor(t *testing.T) toolspkg.Descriptor {
+	t.Helper()
+
+	descriptor := toolspkg.Descriptor{
+		ID:               "ext__fixture__finalize",
+		ToolPresentation: toolspkg.NewToolPresentation("Finalize review round", "", ""),
+		Description:      "Resolve triaged review issue artifacts.",
+		InputSchema: json.RawMessage(
+			`{"type":"object","required":["task_name","round"],"properties":{"task_name":{"type":"string"},"round":{"type":"integer"}}}`,
+		),
+		OutputSchema: json.RawMessage(
+			`{"type":"object","properties":{"resolved":{"type":"integer"},"invalid":{"type":"integer"},"pending":{"type":"integer"}}}`,
+		),
+		Backend: toolspkg.BackendRef{
+			Kind:       toolspkg.BackendNativeGo,
+			NativeName: "finalize",
+		},
+		Source: toolspkg.SourceRef{
+			Kind:  toolspkg.SourceExtension,
+			Owner: "fixture",
+		},
+		Visibility:            toolspkg.VisibilityModel,
+		Risk:                  toolspkg.RiskMutating,
+		ReadOnly:              false,
+		ConcurrencySafe:       false,
+		ToolExecutionMetadata: toolspkg.NewToolExecutionMetadata(false, "", 4096),
+	}
+	withDigests, err := toolspkg.DescriptorWithSchemaDigests(descriptor)
+	if err != nil {
+		t.Fatalf("DescriptorWithSchemaDigests() error = %v", err)
+	}
+	return withDigests
+}

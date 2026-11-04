@@ -1,0 +1,471 @@
+package session
+
+import (
+	"context"
+	"fmt"
+	"strings"
+
+	"github.com/compozy/compozy/internal/profiling"
+
+	"github.com/compozy/compozy/internal/acp"
+	commandpkg "github.com/compozy/compozy/internal/command"
+	"github.com/compozy/compozy/internal/mention"
+)
+
+func (m *Manager) reservePromptSlot(
+	ctx context.Context,
+	session *Session,
+	runtime *RuntimeSelection,
+) (*AgentProcess, error) {
+	proc, err := session.beginExclusivePromptSetup()
+	if err != nil {
+		return nil, err
+	}
+	proc, err = m.prepareReservedPromptSlot(ctx, session, runtime, proc)
+	if err != nil {
+		session.finishPromptSetup()
+		return nil, err
+	}
+	return proc, nil
+}
+
+func (m *Manager) prepareReservedPromptSlot(
+	ctx context.Context,
+	session *Session,
+	runtime *RuntimeSelection,
+	proc *AgentProcess,
+) (*AgentProcess, error) {
+	return m.ensurePromptRuntime(ctx, session, runtime, proc)
+}
+
+func commitPromptDispatch(ctx context.Context, commit func(context.Context) error) error {
+	if commit == nil {
+		return nil
+	}
+	return commit(ctx)
+}
+
+func (m *Manager) submitPromptRequest(ctx context.Context, req promptRequest) (<-chan acp.AgentEvent, error) {
+	session, err := m.lookupPromptRequestSession(ctx, req)
+	if err != nil {
+		return nil, err
+	}
+
+	var events <-chan acp.AgentEvent
+	profiling.Do(
+		ctx,
+		func(ctx context.Context) { events, err = m.submitProfiledPromptRequest(ctx, req, session) },
+		"session_id",
+		session.ID,
+		"operation",
+		"session_turn",
+	)
+	return events, err
+}
+
+func (m *Manager) submitProfiledPromptRequest(
+	ctx context.Context,
+	req promptRequest,
+	session *Session,
+) (<-chan acp.AgentEvent, error) {
+	if req.deliveryCtx == nil {
+		req.deliveryCtx = ctx
+	}
+	promptExecutionCtx, cancelPromptExecution := m.promptExecutionContext(ctx, false)
+	proc, err := session.beginExclusivePromptSetupForRequest(req, cancelPromptExecution)
+	if err != nil {
+		cancelPromptExecution()
+		return nil, err
+	}
+	slotReserved := true
+	stateOwned := true
+	defer func() {
+		if slotReserved {
+			session.finishPromptSetup()
+		}
+		if stateOwned {
+			cancelPromptExecution()
+			clearPromptState(session, req.turnID)
+		}
+	}()
+	proc, err = m.prepareReservedPromptSlot(promptExecutionCtx, session, req.runtime, proc)
+	if err != nil {
+		return nil, err
+	}
+	resolvedAttachments, err := m.preparePromptRequestAttachments(promptExecutionCtx, session, proc, req)
+	if err != nil {
+		return nil, err
+	}
+	if req.releaseSlotBeforeHooks {
+		session.finishPromptSetup()
+		slotReserved = false
+		clearPromptState(session, req.turnID)
+		stateOwned = false
+	}
+	message, err := m.preparePromptRequestMessage(promptExecutionCtx, session, &req)
+	if err != nil {
+		return nil, err
+	}
+	if !slotReserved {
+		proc, err = session.beginExclusivePromptSetupForRequest(req, cancelPromptExecution)
+		if err != nil {
+			return nil, err
+		}
+		slotReserved = true
+		stateOwned = true
+		proc, err = m.prepareReservedPromptSlot(promptExecutionCtx, session, req.runtime, proc)
+		if err != nil {
+			return nil, err
+		}
+	} else {
+		session.setCurrentSkillInvocations(req.skillInvocations)
+	}
+	dispatchMessage, err := m.requestDispatchMessage(promptExecutionCtx, session, &req, message)
+	if err != nil {
+		return nil, err
+	}
+	turnState := newPromptRequestDispatchState(session, req, message)
+	if err := m.dispatchTurnStart(promptExecutionCtx, turnState); err != nil {
+		return nil, err
+	}
+	events, err := m.submitPromptInReservedSlot(
+		promptExecutionCtx,
+		session,
+		proc,
+		req,
+		message,
+		dispatchMessage,
+		resolvedAttachments,
+		turnState,
+		cancelPromptExecution,
+	)
+	if err != nil {
+		return nil, err
+	}
+	stateOwned = false
+	return events, nil
+}
+
+func (m *Manager) preparePromptRequestAttachments(
+	ctx context.Context,
+	session *Session,
+	proc *AgentProcess,
+	req promptRequest,
+) ([]acp.PromptAttachment, error) {
+	if err := validatePromptAttachmentCaps(req.attachments, proc.CapsSnapshot()); err != nil {
+		return nil, err
+	}
+	attachments, err := m.resolvePromptAttachments(
+		ctx,
+		session.WorkspaceID,
+		session.ID,
+		req.attachments,
+		proc.CapsSnapshot(),
+	)
+	if err != nil {
+		return nil, err
+	}
+	if err := commitPromptDispatch(ctx, req.commitDispatch); err != nil {
+		return nil, err
+	}
+	return attachments, nil
+}
+
+func (m *Manager) preparePromptRequestMessage(
+	ctx context.Context,
+	session *Session,
+	req *promptRequest,
+) (string, error) {
+	if req.delivery == PromptDeliveryMaintenance {
+		return req.message, nil
+	}
+	message, err := m.dispatchInputPreSubmit(
+		ctx,
+		session,
+		req.turnID,
+		req.turnSource,
+		req.message,
+		req.attachments,
+		req.mentions,
+	)
+	if err != nil {
+		return "", err
+	}
+	if err := m.prepareAgentCommandDelivery(ctx, req, message); err != nil {
+		return "", err
+	}
+	if req.delivery == PromptDeliveryAgentCommand {
+		message = strings.TrimSpace(message)
+	}
+	req.skillInvocations = commandpkg.ReconcileInvocations(message, req.skillInvocations)
+	// A hook rewrite keeps only admitted mentions whose exact token is still present; it never adds one.
+	// Survivors keep their authored-text offsets, which the transcript displays.
+	req.mentions = mention.Reconcile(message, req.mentions)
+	return message, nil
+}
+
+// submitPromptInReservedSlot starts durable delivery and balances lifecycle edges when setup fails.
+func (m *Manager) submitPromptInReservedSlot(
+	ctx context.Context,
+	session *Session,
+	proc *AgentProcess,
+	req promptRequest,
+	message string,
+	dispatchInput preparedPromptInput,
+	attachments []acp.PromptAttachment,
+	turnState *promptTurnDispatchState,
+	cancelPromptExecution context.CancelFunc,
+) (<-chan acp.AgentEvent, error) {
+	req.message = message
+	if err := m.recordRestartBoundary(session, req); err != nil {
+		return nil, err
+	}
+	dispatchMessage, replayBlock, err := m.prepareReservedPromptInput(ctx, session, &req, dispatchInput)
+	if err != nil {
+		return nil, err
+	}
+	if _, err := m.persistSessionPromptActivity(ctx, session, m.now()); err != nil {
+		return nil, err
+	}
+	delivery, err := m.openDurablePromptDelivery(req.deliveryCtx, session, req.turnID)
+	if err != nil {
+		return nil, fmt.Errorf("session: open durable prompt delivery for %q: %w", req.target, err)
+	}
+	activity, running := m.startPromptActivity(ctx, session, turnState)
+	pumpStarted := false
+	defer func() {
+		if !pumpStarted {
+			m.publishLifecycleAttentionTransition(ctx, running, session.Info())
+		}
+	}()
+	turnState.recovery = &promptRecoveryState{originalMessage: dispatchInput.message}
+	turnState.reportMessageIDs = []string{req.messageID}
+	for _, input := range dispatchInput.batched {
+		turnState.reportMessageIDs = append(turnState.reportMessageIDs, input.request.messageID)
+	}
+	recoveryRequest := m.newDispatchPromptRequest(ctx, session, &req, dispatchMessage, dispatchInput, attachments,
+		activity)
+	source, err := m.startHostedPromptRun(ctx, session, proc, turnState, recoveryRequest)
+	if err != nil {
+		delivery.cancel()
+		cancelPromptExecution()
+		activity.stop()
+		activity.finish(m.now())
+		return nil, fmt.Errorf("session: prompt session %q: %w", req.target, err)
+	}
+	if turnState.managed != nil {
+		if err := m.recordManagedDriverAttached(ctx, turnState.managed, req.turnID); err != nil {
+			m.clearActivePromptRunForState(session, turnState)
+			m.releaseHostedPromptRun(session, turnState)
+			delivery.cancel()
+			m.abortPromptBeforePump(cancelPromptExecution, activity, source)
+			return nil, err
+		}
+	}
+	if err := m.preparePromptDelivery(ctx, session, req, cancelPromptExecution, activity, source); err != nil {
+		m.clearActivePromptRunForState(session, turnState)
+		m.releaseHostedPromptRun(session, turnState)
+		delivery.cancel()
+		return nil, err
+	}
+	m.recordBatchedPromptInputs(ctx, session, dispatchInput.batched)
+	m.consumeReservedPromptContext(session, req, replayBlock)
+
+	lifecycleCtx := m.fallbackLifecycleContext()
+	m.startPromptPersistencePump(
+		lifecycleCtx,
+		session,
+		turnState,
+		source,
+		activity,
+		cancelPromptExecution,
+		delivery.persistenceDone,
+	)
+	pumpStarted = true
+	return delivery.events, nil
+}
+
+// newDispatchPromptRequest builds the ACP request for one dispatch, including the request's mention
+// links and session references after the dispatch containment re-check.
+func (m *Manager) newDispatchPromptRequest(
+	ctx context.Context,
+	session *Session,
+	req *promptRequest,
+	dispatchMessage string,
+	dispatchInput preparedPromptInput,
+	attachments []acp.PromptAttachment,
+	activity *promptActivitySupervisor,
+) acp.PromptRequest {
+	request := acp.PromptRequest{
+		Maintenance:               req.delivery == PromptDeliveryMaintenance,
+		AgentCommand:              req.delivery == PromptDeliveryAgentCommand,
+		TurnID:                    req.turnID,
+		RunID:                     req.runID,
+		Generation:                session.Info().RuntimeGeneration,
+		Message:                   dispatchMessage,
+		Sections:                  dispatchInput.sections,
+		Attachments:               attachments,
+		Meta:                      req.meta,
+		ActivityReporter:          activity.report,
+		ActivityHeartbeatInterval: m.supervision.ActivityHeartbeatInterval,
+	}
+	m.promptMentionInputs(ctx, session, req).apply(&request)
+	return request
+}
+
+// startPromptActivity publishes the running badge and returns its snapshot for failed setup cleanup.
+func (m *Manager) startPromptActivity(
+	ctx context.Context,
+	session *Session,
+	turnState *promptTurnDispatchState,
+) (*promptActivitySupervisor, *Info) {
+	activity := newPromptActivitySupervisor(ctx, m, session, turnState, m.supervision)
+	before := session.Info()
+	m.clearEndedEarly(ctx, session)
+	activity.start()
+	running := session.Info()
+	m.publishLifecycleAttentionTransition(ctx, before, running)
+	return activity, running
+}
+
+func (m *Manager) preparePromptDelivery(
+	ctx context.Context,
+	session *Session,
+	req promptRequest,
+	cancelPromptExecution context.CancelFunc,
+	activity *promptActivitySupervisor,
+	source <-chan acp.AgentEvent,
+) error {
+	if req.prepareDelivery == nil {
+		return nil
+	}
+	if err := req.prepareDelivery(ctx, PromptDeliveryInfo{SessionID: session.ID, TurnID: req.turnID}); err != nil {
+		m.abortPromptBeforePump(cancelPromptExecution, activity, source)
+		return fmt.Errorf("session: prepare prompt delivery for %q: %w", req.target, err)
+	}
+	return nil
+}
+
+func (m *Manager) abortPromptBeforePump(
+	cancelPromptExecution context.CancelFunc,
+	activity *promptActivitySupervisor,
+	source <-chan acp.AgentEvent,
+) {
+	cancelPromptExecution()
+	activity.stop()
+	activity.finish(m.now())
+	m.startTrackedPromptTask(func() {
+		drainPromptSource(source)
+	})
+}
+
+func (m *Manager) startPromptPersistencePump(
+	lifecycleCtx context.Context,
+	session *Session,
+	turnState *promptTurnDispatchState,
+	source <-chan acp.AgentEvent,
+	activity *promptActivitySupervisor,
+	cancelPromptExecution context.CancelFunc,
+	persistenceDone chan<- struct{},
+) {
+	m.startTrackedPromptTask(func() {
+		defer closePromptPersistenceDone(persistenceDone)
+		m.pumpPrompt(
+			lifecycleCtx,
+			nil,
+			session,
+			turnState,
+			source,
+			activity.eventsChannel(),
+			nil,
+			activity,
+			cancelPromptExecution,
+		)
+	})
+}
+
+func closePromptPersistenceDone(done chan<- struct{}) {
+	if done != nil {
+		close(done)
+	}
+}
+
+type preparedPromptInput struct {
+	message  string
+	sections []acp.PromptSection
+	// batched are the queued messages this turn carries after the request's own input.
+	batched []batchedPromptInput
+}
+
+func (m *Manager) promptDispatchMessage(
+	ctx context.Context,
+	session *Session,
+	message string,
+	delivery PromptDelivery,
+) (preparedPromptInput, error) {
+	if delivery == PromptDeliveryMaintenance || delivery == PromptDeliveryAgentCommand {
+		return preparedPromptInput{message: message}, nil
+	}
+	ctx, sections := acp.CollectPromptSections(ctx)
+	augmented, err := m.augmentPromptMessage(ctx, session, message)
+	return preparedPromptInput{
+		message:  promptOriginMessage(session.CurrentPromptMeta().Origin, augmented),
+		sections: sections(),
+	}, err
+}
+
+func (m *Manager) augmentPromptMessage(ctx context.Context, session *Session, message string) (string, error) {
+	expanded, err := m.expandPromptSkillInvocations(ctx, session, message)
+	if err != nil {
+		return "", err
+	}
+	if m.inputAugmenter == nil {
+		return expanded, nil
+	}
+	augmented, err := m.inputAugmenter(ctx, session, expanded)
+	if err != nil {
+		return "", fmt.Errorf("session: augment prompt input: %w", err)
+	}
+	if strings.TrimSpace(augmented) == "" {
+		return expanded, nil
+	}
+	return augmented, nil
+}
+
+func drainPromptSource(source <-chan acp.AgentEvent) {
+	for range source {
+		continue
+	}
+}
+
+func (m *Manager) prepareReservedPromptInput(
+	ctx context.Context,
+	session *Session,
+	req *promptRequest,
+	input preparedPromptInput,
+) (string, string, error) {
+	if req.delivery == PromptDeliveryMaintenance {
+		if err := m.recordCompactionRequest(ctx, session, *req); err != nil {
+			return "", "", err
+		}
+	}
+	if err := m.recordPromptInputEvent(ctx, session, req); err != nil {
+		return "", "", err
+	}
+	raiseBatchedPromptHops(session, input.batched)
+	replayBlock := ""
+	if req.delivery == PromptDeliveryNormal {
+		replayBlock = m.pendingResumeReplay(session.ID)
+		input.message = session.worktreeBindingNotice(input.message)
+	}
+	return promptWithResumeReplay(replayBlock, input.message), replayBlock, nil
+}
+
+func (m *Manager) consumeReservedPromptContext(session *Session, req promptRequest, replayBlock string) {
+	if req.delivery != PromptDeliveryNormal {
+		return
+	}
+	m.consumeResumeReplay(session.ID, replayBlock)
+	m.consumeWorktreeBindingNotice(session)
+	m.recordImportedContextConsumption(session, req, replayBlock)
+}

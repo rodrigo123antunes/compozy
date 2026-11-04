@@ -1,0 +1,147 @@
+import type { Meta, StoryObj } from "@storybook/react-vite";
+
+import { CenteredSurface } from "@/storybook/story-layout";
+import type { PermissionRequest } from "@/systems/session";
+
+import { PermissionDock } from "../permission-dock";
+
+const permission: PermissionRequest = {
+  requestId: "req-123",
+  toolName: "Run a command",
+  action: "execute",
+  resource: "workspace compozy",
+  toolInput: { command: "bunx turbo run lint typecheck test --filter=./web" },
+  turnId: "turn-001",
+};
+
+const meta: Meta<typeof PermissionDock> = {
+  title: "systems/session/components/PermissionDock",
+  component: PermissionDock,
+  parameters: {
+    layout: "centered",
+    docs: {
+      description: {
+        component:
+          "Pending permission as a composer-docked decision panel. Buttons render only for the decisions the runtime offers; reject-always lives behind the reject split; digit keys 1–4 decide directly (key 4 fires with the menu closed).",
+      },
+    },
+  },
+  decorators: [
+    Story => (
+      <CenteredSurface>
+        <div className="w-full max-w-xl">
+          <Story />
+        </div>
+      </CenteredSurface>
+    ),
+  ],
+  args: {
+    sessionId: "sess-001",
+    workspaceId: "ws_alpha",
+    countLabel: null,
+    onResolved: () => {},
+  },
+};
+
+export default meta;
+type Story = StoryObj<typeof meta>;
+
+export const AllFourDecisions: Story = {
+  args: { permission },
+};
+
+export const QueuedCount: Story = {
+  args: { permission, countLabel: "1/2" },
+};
+
+export const GatedDecisions: Story = {
+  parameters: {
+    docs: {
+      description: {
+        story: "Runtimes that offer only a subset of decisions gate the buttons and keys.",
+      },
+    },
+  },
+  args: {
+    permission: {
+      ...permission,
+      supportedDecisions: ["allow-once", "reject-once"],
+    },
+  },
+};
+
+/**
+ * VC-10 — a terminal ask, decided on the session's one decision surface.
+ *
+ * The generic subject line cannot show what matters here, so the terminal
+ * detail replaces it: the exact command as the agent wrote it and the folder
+ * it would run in. Exec approval does not carry a terminal id.
+ *
+ * The board titles this row "Claude Code wants to run · dev server". The title
+ * takes the agent's name from the session when the cache has it. Host chrome
+ * stays Dock. Authorized host-chrome delta.
+ */
+export const TerminalExec: Story = {
+  args: {
+    permission: {
+      requestId: permission.requestId,
+      toolName: "compozy__terminal_exec",
+      toolInput: {
+        command: "bun",
+        args: ["add", "@xterm/xterm", "@xterm/addon-fit"],
+        cwd: "~/dev/atlas-api",
+        // The runtime's own classification; without it the client fails closed
+        // to `unclassifiable` and withholds the remembered decision.
+        risk: "ordinary",
+      },
+      action: "",
+      resource: "",
+      turnId: permission.turnId,
+    },
+  },
+};
+
+/**
+ * VC-11 — an irreversible command.
+ *
+ * Danger is stated in words before the command is even read, and no remembered
+ * decision is offered: the fixed irreversible set always asks, at every autonomy
+ * level, so Allow always or Never allow would be a promise the runtime would
+ * refuse to keep. Two one-shot choices only.
+ */
+export const TerminalIrreversible: Story = {
+  args: {
+    permission: {
+      requestId: permission.requestId,
+      toolName: "compozy__terminal_exec",
+      toolInput: {
+        command: "rm",
+        args: ["-rf", "/var/lib/atlas/journal-backups"],
+        cwd: "~/dev/atlas-api",
+        risk: "irreversible",
+      },
+      action: "",
+      resource: "",
+      turnId: permission.turnId,
+    },
+  },
+};
+
+/**
+ * VC-12a — permission to type into a terminal someone else is watching.
+ *
+ * Typing is scoped to one terminal. Activity and the catalog title appear only
+ * when the daemon or catalog published them — never invented.
+ */
+export const TerminalTypingGrant: Story = {
+  args: {
+    permission: {
+      requestId: permission.requestId,
+      toolName: "compozy__terminal_write",
+      toolInput: { terminal_id: "term-9cd7e14b2a66" },
+      action: "",
+      resource: "",
+      turnId: permission.turnId,
+    },
+  },
+};

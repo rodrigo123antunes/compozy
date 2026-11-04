@@ -1,0 +1,2288 @@
+//go:build integration
+
+package daemon
+
+import (
+	"context"
+	"database/sql"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"os"
+	"path/filepath"
+	"slices"
+	"strings"
+	"sync"
+	"sync/atomic"
+	"testing"
+	"time"
+
+	"github.com/compozy/compozy/internal/acp"
+	compozyconfig "github.com/compozy/compozy/internal/config"
+	looppkg "github.com/compozy/compozy/internal/loop"
+	loopdsl "github.com/compozy/compozy/internal/loop/dsl"
+	"github.com/compozy/compozy/internal/loop/gate"
+	goalpkg "github.com/compozy/compozy/internal/loop/goal"
+
+	"github.com/compozy/compozy/internal/session"
+	speedpkg "github.com/compozy/compozy/internal/speed"
+	"github.com/compozy/compozy/internal/store"
+	taskpkg "github.com/compozy/compozy/internal/task"
+	"github.com/compozy/compozy/internal/testutil"
+	"github.com/compozy/compozy/internal/testutil/acpmock"
+	toolspkg "github.com/compozy/compozy/internal/tools"
+	"github.com/compozy/compozy/internal/workspace"
+)
+
+func TestLoopGoalManagedRuntimeIntegration(t *testing.T) {
+	t.Run("Should queue requested Fast after the provider revokes it", func(t *testing.T) {
+		fixture := newLoopGoalManagedRuntimeFixture(t, "revoked-speed", nil,
+			withoutInitialGoalBinding(),
+			withGoalRuntimeSessionManager(func(manager *session.Manager) SessionManager {
+				return &revokedSpeedSessionManager{Manager: manager}
+			}),
+		)
+		request := fixture.bindingRequest("revoked-speed")
+		request.Runtime = &looppkg.RuntimeSpec{Speed: speedpkg.SpeedFast}
+		binding, err := fixture.runtime.BindActionSession(t.Context(), request)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if binding.AppliedRuntime.Speed != speedpkg.SpeedNormal {
+			t.Fatalf("applied speed = %q, want provider-observed normal", binding.AppliedRuntime.Speed)
+		}
+		fixture.binding = binding
+		ticket, err := fixture.preparePrompt(t, "goal-prompt-revoked-speed", nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		entry, err := fixture.goalStore.GetSessionInputQueueEntryByID(t.Context(), ticket.QueueEntryID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if entry.Runtime.Speed != string(speedpkg.SpeedFast) {
+			t.Fatalf("queued speed = %q, want retained Fast intent", entry.Runtime.Speed)
+		}
+	})
+
+	t.Run("Should drain messages and reply wakes before a prepared Goal at the turn boundary", func(t *testing.T) {
+		driver := newHarnessIntegrationDriver()
+		received := make(chan acp.PromptRequest, 4)
+		release := make(chan struct{})
+		var prompts atomic.Int64
+		releaseOnce := sync.OnceFunc(func() { close(release) })
+		ctx, cancel := context.WithTimeout(t.Context(), 30*time.Second)
+		defer cancel()
+		driver.promptHook = func(ctx context.Context, proc *session.AgentProcess, req acp.PromptRequest) (<-chan acp.AgentEvent, error) {
+			first := prompts.Add(1) == 1
+			received <- req
+			out := make(chan acp.AgentEvent, 1)
+			go func() {
+				defer close(out)
+				if first {
+					select {
+					case <-release:
+					case <-ctx.Done():
+						return
+					}
+				}
+				out <- acp.AgentEvent{Type: acp.EventTypeDone, SessionID: proc.SessionID, TurnID: req.TurnID, PromptStopReason: acp.PromptStopReasonEndTurn}
+			}()
+			return out, nil
+		}
+		fixture := newLoopGoalManagedRuntimeFixture(t, "queue-fairness", driver)
+		t.Cleanup(releaseOnce)
+		watchStore := fixture.daemonInstance.registry.(store.ReplyWatchStore)
+		replies, err := session.NewReplyWatchService(watchStore, fixture.manager)
+		if err != nil {
+			t.Fatal(err)
+		}
+		fixture.manager.SetReplyWatchService(replies)
+		active, err := fixture.manager.Prompt(ctx, fixture.binding.SessionID, "active operator turn")
+		if err != nil {
+			t.Fatal(err)
+		}
+		<-received
+		ticket, err := fixture.preparePrompt(t, "goal-prompt-queue-fairness", nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		queued, err := fixture.manager.SendPrompt(ctx, fixture.binding.SessionID, session.SendPromptOpts{
+			Message: "queued operator input", Mode: session.BusyInputModeQueue,
+			MessageID: "queued-operator", IdempotencyKey: "queued-operator",
+			Caller: session.PromptCaller{Kind: "human", ID: "operator", Source: "http"},
+		})
+		if err != nil || queued.Status != store.SessionPromptResultStatusQueued || queued.QueuePosition != 1 {
+			t.Fatalf("queue admission = %#v, %v", queued, err)
+		}
+		target, err := fixture.manager.Create(ctx, new(session.CreateOpts{
+			Workspace: string(fixture.run.WorkspaceID), AgentName: fixture.agentName,
+		}))
+		if err != nil {
+			t.Fatal(err)
+		}
+		agentInput, err := fixture.manager.SendPrompt(ctx, fixture.binding.SessionID, session.SendPromptOpts{
+			Message: "queued session message", Mode: session.BusyInputModeQueue,
+			MessageID: "queued-agent", IdempotencyKey: "queued-agent",
+			Origin: &acp.PromptOriginMeta{Kind: "session", SessionID: target.ID,
+				WorkspaceID: string(fixture.run.WorkspaceID), Hop: 1},
+		})
+		if err != nil || agentInput.Status != store.SessionPromptResultStatusQueued || agentInput.QueuePosition != 2 {
+			t.Fatalf("agent admission = %#v, %v", agentInput, err)
+		}
+		question := session.SendPromptOpts{
+			Message: "reply to the Goal session", MessageID: "goal-question", IdempotencyKey: "goal-question",
+			NotifyOnComplete: true,
+			Origin: &acp.PromptOriginMeta{Kind: "session", SessionID: fixture.binding.SessionID,
+				WorkspaceID: string(fixture.run.WorkspaceID), Hop: 1},
+		}
+		answer, err := fixture.manager.SendPrompt(ctx, target.ID, question)
+		if err != nil || answer.ReplyWatch == nil {
+			t.Fatalf("watched send = %#v, %v", answer, err)
+		}
+		drainHarnessIntegrationEvents(answer.Events)
+		<-received
+		if err := replies.Reconcile(ctx, answer.ReplyWatch.ID); err != nil {
+			t.Fatal(err)
+		}
+		watch, err := watchStore.GetReplyWatch(ctx, answer.ReplyWatch.ID)
+		if err != nil || watch.State != store.ReplyWatchDelivered {
+			t.Fatalf("reply handoff = %#v, %v", watch, err)
+		}
+		wake, err := fixture.goalStore.GetSessionInputQueueEntryByID(ctx, watch.DeliveredInputID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		agentEntry, err := fixture.goalStore.GetSessionInputQueueEntryByID(ctx, agentInput.QueueEntryID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		checkpoint, err := fixture.goalStore.LoadCheckpoint(ctx, fixture.key)
+		if err != nil || checkpoint.TurnsUsed != 0 || checkpoint.Phase != "queued" {
+			t.Fatalf("parked Goal = %#v, %v", checkpoint, err)
+		}
+		entry, err := fixture.goalStore.GetSessionInputQueueEntryByID(ctx, queued.QueueEntryID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		releaseOnce()
+		drainHarnessIntegrationEvents(active)
+		// Operator input runs first (#760); the queued agent message and the reply wake then share one
+		// batched turn, and the prepared Goal runs after that batch.
+		for _, want := range []string{entry.TurnID, agentEntry.TurnID, ticket.PromptID} {
+			select {
+			case got := <-received:
+				if got.TurnID != want {
+					t.Fatalf("next turn = %q, want %q", got.TurnID, want)
+				}
+				if got.TurnID == agentEntry.TurnID &&
+					(got.Meta.Origin == nil || got.Meta.Origin.SessionID != target.ID || got.Meta.Origin.Hop != 1) {
+					t.Fatalf("queued agent origin = %#v", got.Meta.Origin)
+				}
+				if got.TurnID == agentEntry.TurnID &&
+					!strings.Contains(got.Message, "replied to your message goal-question") {
+					t.Fatalf("batched turn lacks the reply wake:\n%s", got.Message)
+				}
+				if got.TurnID == entry.TurnID && got.Meta.Origin != nil {
+					t.Fatalf("operator origin = %#v", got.Meta.Origin)
+				}
+			case <-ctx.Done():
+				t.Fatalf("waiting for %q: %v", want, ctx.Err())
+			}
+		}
+		if _, err := fixture.runtime.AwaitActionPrompt(ctx, ticket); err != nil {
+			t.Fatal(err)
+		}
+		batchedWake, err := fixture.goalStore.GetSessionInputQueueEntryByID(ctx, wake.ID)
+		if err != nil || batchedWake.Status != store.SessionInputQueueStatusSent ||
+			batchedWake.TurnID != agentEntry.TurnID {
+			t.Fatalf("reply wake = %q/%q, %v; want sent in the batched turn %s",
+				batchedWake.Status, batchedWake.TurnID, err, agentEntry.TurnID)
+		}
+		checkpoint, err = fixture.goalStore.LoadCheckpoint(ctx, fixture.key)
+		if err != nil || checkpoint.TurnsUsed != 1 || checkpoint.BindingEpoch != fixture.binding.BindingEpoch ||
+			checkpoint.ControlEpoch != 1 || checkpoint.TaskRunID != fixture.taskRunID {
+			t.Fatalf("resumed Goal = %#v, %v", checkpoint, err)
+		}
+		if err := replies.Deliver(ctx, watch.ID); err != nil {
+			t.Fatal(err)
+		}
+		replayed, err := fixture.manager.SendPrompt(ctx, target.ID, question)
+		if err != nil || !replayed.Replayed {
+			t.Fatalf("watched replay = %#v, %v", replayed, err)
+		}
+		if err := fixture.manager.WaitForPromptDrains(ctx); err != nil {
+			t.Fatal(err)
+		}
+		if prompts.Load() != 5 {
+			t.Fatalf("prompt count = %d, want original, answer, operator input, one batched turn and Goal",
+				prompts.Load())
+		}
+	})
+	for _, test := range []struct {
+		command, first, correction string
+	}{
+		{"compact", "completed", ""},
+		{"compress", "completed", ""},
+		{"compact", "completed", "failed"},
+		{"compact", "failed", "completed"},
+	} {
+		command := test.command
+		wantStatus := test.first
+		if test.correction != "" {
+			wantStatus = test.correction
+		}
+		t.Run(
+			"Should execute managed maintenance "+command+" and settle "+test.first+" corrected to "+wantStatus,
+			func(t *testing.T) {
+				driver := newHarnessIntegrationDriver()
+				received := make(chan acp.PromptRequest, 2)
+				driver.promptHook = func(_ context.Context, _ *session.AgentProcess, req acp.PromptRequest) (<-chan acp.AgentEvent, error) {
+					received <- req
+					out := make(chan acp.AgentEvent, 5)
+					if !req.Maintenance {
+						out <- (acp.AgentEvent{Type: acp.EventTypeAvailableCommands, Title: acp.SystemEventTitleAvailableCommandsUpdate, TurnID: req.TurnID}).WithAvailableCommands([]store.SessionAdvertisedCommand{{Name: command}})
+						out <- acp.AgentEvent{Type: acp.EventTypeUsage, TurnID: req.TurnID, Usage: &acp.TokenUsage{ContextUsed: new(int64(90)), ContextSize: new(int64(100))}}
+					} else {
+						out <- acp.AgentEvent{Type: acp.EventTypeCompaction, TurnID: req.TurnID, Compaction: &acp.CompactionObservation{CompactionID: "c1", Status: "in_progress"}}
+						out <- acp.AgentEvent{Type: acp.EventTypeCompaction, TurnID: req.TurnID, Compaction: &acp.CompactionObservation{CompactionID: "c1", Status: test.first, Terminal: true}}
+						if test.correction != "" {
+							out <- acp.AgentEvent{Type: acp.EventTypeCompaction, TurnID: req.TurnID, Compaction: &acp.CompactionObservation{CompactionID: "c1", Status: test.correction}}
+						}
+					}
+					out <- acp.AgentEvent{Type: acp.EventTypeDone, TurnID: req.TurnID, PromptStopReason: acp.PromptStopReasonEndTurn}
+					close(out)
+					return out, nil
+				}
+				fixture := newLoopGoalManagedRuntimeFixture(t, "native-"+command, driver)
+				initial, err := fixture.manager.Prompt(t.Context(), fixture.binding.SessionID, "Observe context")
+				if err != nil {
+					t.Fatal(err)
+				}
+				drainHarnessIntegrationEvents(initial)
+				<-received
+				usage, err := fixture.runtime.Usage(t.Context(), fixture.binding)
+				if err != nil || !usage.Known {
+					t.Fatalf("usage=%#v %v", usage, err)
+				}
+				resolved, ok, err := fixture.runtime.CompactionCommand(t.Context(), fixture.binding)
+				if err != nil || !ok || resolved != command {
+					t.Fatalf("command=%q/%v %v", resolved, ok, err)
+				}
+				if _, err := fixture.goalStore.BindCheckpoint(
+					t.Context(),
+					goalpkg.BindCheckpointRequest{
+						Key:                  fixture.key,
+						ExpectedControlEpoch: 1,
+						ExpectedBindingEpoch: 0,
+						ExpectedPhase:        "idle",
+						TaskRunID:            fixture.taskRunID,
+						SessionID:            fixture.binding.SessionID,
+						BindingHandle:        fixture.binding.Handle,
+						BindingEpoch:         fixture.binding.BindingEpoch,
+					},
+				); err != nil {
+					t.Fatal(err)
+				}
+				current, err := fixture.goalStore.LoadCheckpoint(t.Context(), fixture.key)
+				if err != nil {
+					t.Fatal(err)
+				}
+				if _, err := fixture.goalStore.RecordContextUsage(
+					t.Context(),
+					goalpkg.RecordContextUsageRequest{
+						Key:                  fixture.key,
+						ExpectedControlEpoch: current.ControlEpoch,
+						ExpectedBindingEpoch: fixture.binding.BindingEpoch,
+						ExpectedPhase:        current.Phase,
+						SessionID:            fixture.binding.SessionID,
+						BindingHandle:        fixture.binding.Handle,
+						Usage:                usage,
+					},
+				); err != nil {
+					t.Fatal(err)
+				}
+				request := looppkg.ActionPromptRequest{
+					PromptID:             "native-compact",
+					Message:              "/" + resolved,
+					Kind:                 "compact",
+					Delivery:             looppkg.ActionPromptDeliveryMaintenance,
+					ContextUsageSequence: new(usage.Sequence),
+					ContextUsageUsed:     new(usage.Used),
+					Owner: looppkg.ActionPromptOwner{
+						LoopRunID:    fixture.run.ID,
+						TaskRunID:    fixture.taskRunID,
+						Generation:   1,
+						NodeID:       "converge",
+						ControlEpoch: 1,
+						BindingEpoch: fixture.binding.BindingEpoch,
+					},
+				}
+				staleBinding := fixture.binding
+				staleBinding.BindingEpoch++
+				staleRequest := request
+				staleRequest.Owner.BindingEpoch++
+				if _, err := fixture.runtime.PrepareActionPrompt(t.Context(), staleBinding, staleRequest); err == nil {
+					t.Fatal("superseded compaction binding accepted")
+				}
+				ticket, err := fixture.runtime.PrepareActionPrompt(t.Context(), fixture.binding, request)
+				if err != nil {
+					t.Fatal(err)
+				}
+				result, err := fixture.runtime.AwaitActionPrompt(t.Context(), ticket)
+				if err != nil {
+					t.Fatal(err)
+				}
+				req := <-received
+				if req.Message != "/"+command || !req.Maintenance {
+					t.Fatalf("maintenance request=%#v", req)
+				}
+				if result.Compaction == nil || result.Compaction.CompactionID != "c1" ||
+					result.Compaction.Status != wantStatus {
+					t.Fatalf("result=%#v", result)
+				}
+				recovered, _, found, err := reconstructManagedGoalPromptResult(
+					t.Context(),
+					fixture.manager,
+					fixture.binding.SessionID,
+					ticket.PromptID,
+				)
+				if err != nil || !found || recovered.PromptID != ticket.PromptID || recovered.Compaction == nil ||
+					recovered.Compaction.Status != wantStatus {
+					t.Fatalf("reconstructed result=%#v found=%v err=%v", recovered, found, err)
+				}
+				after, err := fixture.runtime.Usage(t.Context(), fixture.binding)
+				if err != nil || after.Known {
+					t.Fatalf("post compact usage=%#v %v", after, err)
+				}
+				settlement := goalpkg.CompactionSucceeded
+				if result.Compaction.Status == "failed" {
+					settlement = goalpkg.CompactionFailed
+				}
+				checkpoint, err := fixture.goalStore.CompleteCompaction(
+					t.Context(),
+					goalpkg.CompleteCompactionRequest{
+						Key:                  fixture.key,
+						ExpectedControlEpoch: 1,
+						ExpectedBindingEpoch: fixture.binding.BindingEpoch,
+						TaskRunID:            fixture.taskRunID,
+						QueueEntryID:         ticket.QueueEntryID,
+						PromptID:             ticket.PromptID,
+						Result: goalpkg.CompactionResult{
+							PromptResult:      result,
+							Outcome:           settlement,
+							UsageSequence:     new(usage.Sequence),
+							UsageBaselineUsed: new(usage.Used),
+						},
+					},
+				)
+				if err != nil {
+					t.Fatal(err)
+				}
+				if wantStatus == "completed" &&
+					(checkpoint.ContextState != "unknown" || checkpoint.CompactionBaselineUsed != nil) {
+					t.Fatalf("checkpoint=%#v", checkpoint)
+				}
+				if wantStatus == "failed" && (checkpoint.ContextState != "known" || checkpoint.UsageSequence == nil ||
+					*checkpoint.UsageSequence != usage.Sequence) {
+					t.Fatalf("corrected failure cleared the retained usage checkpoint: %#v", checkpoint)
+				}
+			},
+		)
+	}
+
+	// Invariant: native completion permits managed Goal work on the same binding without a fresh usage update.
+	// Owner: daemon managed Goal lifecycle; canonical managed runtime integration suite (IT-028).
+	t.Run("Should compact native ACP context and continue Goal work without reseeding", func(t *testing.T) {
+		fixtureScript, err := acpmock.LoadFixture(mockFixturePath(t, "native_compaction_fixture.json"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		for i := range fixtureScript.Agents {
+			fixtureScript.Agents[i].Turns = append(
+				fixtureScript.Agents[i].Turns,
+				acpmock.TurnFixture{
+					Name:  "goal-work",
+					Match: acpmock.TurnMatch{Goal: &acpmock.TurnMatchGoal{Kind: acp.GoalPromptKindWork}},
+					Steps: []acpmock.Step{{Kind: acpmock.StepKindAssistant, Text: `{"status":"complete"}`}},
+				},
+			)
+		}
+		bytes, err := json.Marshal(fixtureScript)
+		if err != nil {
+			t.Fatal(err)
+		}
+		scriptPath := filepath.Join(t.TempDir(), "goal-native.json")
+		if err := os.WriteFile(scriptPath, bytes, 0o600); err != nil {
+			t.Fatal(err)
+		}
+		command := acpmock.BuildCommand(
+			acpmock.RequireDriver(t),
+			scriptPath,
+			"compaction-claude",
+			filepath.Join(t.TempDir(), "native-driver.jsonl"),
+		)
+		fixture := newLoopGoalManagedRuntimeFixture(t, "native-executor", nil, withGoalRuntimeProviderCommand(command))
+		baseline, err := fixture.manager.Prompt(t.Context(), fixture.binding.SessionID, "baseline")
+		if err != nil {
+			t.Fatal(err)
+		}
+		drainHarnessIntegrationEvents(baseline)
+		node := compileManagedGoalDefinition(t, "native-executor", fixture.agentName, "native-executor").Definition.Graph.Nodes[0]
+		executor, err := goalpkg.NewExecutor(
+			goalpkg.Dependencies{
+				Store:    fixture.goalStore,
+				Binder:   fixture.runtime,
+				Budget:   fixture.goalStore,
+				Context:  fixture.runtime,
+				Recovery: fixture.runtime,
+				Judge: loopGoalJudgeEvaluatorFunc(
+					func(context.Context, goalpkg.JudgeRequest) (goalpkg.JudgeResult, error) {
+						return goalpkg.JudgeResult{Verdict: gate.Verdict{Outcome: gate.VerdictOutcomeApproved}}, nil
+					},
+				),
+			},
+		)
+		if err != nil {
+			t.Fatal(err)
+		}
+		raw, err := executor.Execute(
+			t.Context(),
+			node,
+			looppkg.ActionExecutionInput{
+				WorkspaceID:      fixture.run.WorkspaceID,
+				LoopRunID:        fixture.run.ID,
+				Generation:       1,
+				NodeID:           node.ID,
+				CorrelationID:    fixture.taskRunID,
+				ToolScope:        toolspkg.Scope{ProfileID: store.DefaultProfileID},
+				RuntimeSelection: &looppkg.ActionRuntimeSelection{Catalog: integrationRuntimeCatalog{}},
+				Environment:      &loopdsl.EnvironmentSpec{Mode: loopdsl.EnvironmentRoot},
+				GoalSegmentEpoch: 1,
+				Actor: &taskpkg.ActorContext{
+					Actor: taskpkg.ActorIdentity{Kind: taskpkg.ActorKindDaemon, Ref: "goal-managed-test"},
+				},
+				GoalContextNudgeRatio: new(0.8),
+			},
+		)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if raw.Control == nil || raw.Control.Disposition != looppkg.ActionDispositionSucceeded {
+			t.Fatalf("Goal control=%#v", raw.Control)
+		}
+		checkpoint, err := fixture.goalStore.LoadCheckpoint(t.Context(), fixture.key)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if checkpoint.BindingEpoch != fixture.binding.BindingEpoch ||
+			checkpoint.SessionID != fixture.binding.SessionID ||
+			checkpoint.TurnsUsed != 1 {
+			t.Fatalf("reseeded or skipped work checkpoint=%#v", checkpoint)
+		}
+		markers, err := fixture.manager.Compactions(t.Context(), fixture.binding.SessionID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(markers) != 1 || markers[0].Status != "completed" || markers[0].Payload.Trigger != "requested" {
+			t.Fatalf("markers=%#v", markers)
+		}
+	})
+
+	// Invariant: deleting a stopped Goal owner settles unbound work and preserves unrelated sessions and Run history.
+	// Owner: Manager/daemon lifecycle seam; canonical managed runtime integration suite.
+	t.Run("Should delete a stopped session with an unbound Goal checkpoint", func(t *testing.T) {
+		fixture := newLoopGoalManagedRuntimeFixture(t, "delete-unbound", nil, withoutInitialGoalBinding())
+		ctx := t.Context()
+		originID, originIdentity := fixture.createOriginSession(t, "delete-unbound")
+		neighborID, _ := fixture.createOriginSession(t, "delete-neighbor")
+		if err := fixture.manager.Stop(ctx, originID); err != nil {
+			t.Fatal(err)
+		}
+		stopped, err := fixture.manager.Status(ctx, originID)
+		if err != nil || stopped.State != session.StateStopped {
+			t.Fatalf("session before deletion = %#v, %v", stopped, err)
+		}
+		connection, ok := fixture.goalStore.(interface {
+			loopAPIPersistence
+			loopGoalAPIPersistence
+			DB() *sql.DB
+		})
+		if !ok {
+			t.Fatal("Goal store lacks the lifecycle persistence fixture")
+		}
+		if _, err := connection.DB().ExecContext(ctx,
+			`UPDATE loop_runs SET origin_kind = 'session', origin_session_id = ?,
+			 origin_creation_profile_ref = ?, origin_policy_spec_digest = ?, origin_creation_digest = ? WHERE id = ?`,
+			originID, originIdentity.CreationProfileRef, originIdentity.PolicySpecDigest,
+			originIdentity.CreationDigest, string(fixture.run.ID)); err != nil {
+			t.Fatal(err)
+		}
+		aggregate, err := looppkg.NewService(
+			fixture.goalStore,
+			looppkg.DefinitionResolverFunc(
+				func(context.Context, looppkg.WorkspaceID, string, string) (*looppkg.ResolvedDefinition, error) {
+					return nil, looppkg.ErrDefinitionNotFound
+				},
+			),
+			managedTestGoalRunPolicyResolver(),
+			looppkg.WithCancellationSessionController(loopCancellationSessionController{sessions: fixture.manager}),
+		)
+		if err != nil {
+			t.Fatal(err)
+		}
+		fixture.manager.SetGoalCommandHandler(&daemonLoopAPIService{
+			aggregate: aggregate, persistence: connection, goalPersistence: connection,
+		})
+		if err := fixture.manager.Delete(ctx, originID); err != nil {
+			t.Fatalf("Delete(stopped Goal owner) error = %v", err)
+		}
+		if _, err := fixture.manager.Status(ctx, originID); !errors.Is(err, session.ErrSessionNotFound) {
+			t.Fatalf("deleted session status error = %v, want ErrSessionNotFound", err)
+		}
+		if _, err := fixture.manager.Status(ctx, neighborID); err != nil {
+			t.Fatalf("neighbor changed during deletion: %v", err)
+		}
+		run, err := fixture.goalStore.GetLoopRun(ctx, fixture.run.WorkspaceID, fixture.run.ID)
+		if err != nil || run.Status != looppkg.StatusCanceled {
+			t.Fatalf("retained Goal Run = %#v, %v", run, err)
+		}
+		checkpoint, err := fixture.goalStore.LoadCheckpoint(ctx, fixture.key)
+		if err != nil || checkpoint.Phase != "terminal" {
+			t.Fatalf("retained Goal checkpoint = %#v, %v", checkpoint, err)
+		}
+	})
+
+	// Invariant: a known context snapshot reads exactly its persisted usage event, even after newer activity.
+	// Owner: daemon context-event adapter; canonical managed runtime integration suite.
+	t.Run("Should read a pinned context observation from the real session event store", func(t *testing.T) {
+		driver := newHarnessIntegrationDriver()
+		driver.promptHook = func(_ context.Context, _ *session.AgentProcess, req acp.PromptRequest) (<-chan acp.AgentEvent, error) {
+			events := make(chan acp.AgentEvent, 3)
+			events <- acp.AgentEvent{Type: acp.EventTypeUsage, TurnID: req.TurnID, Usage: &acp.TokenUsage{ContextUsed: new(int64(10)), ContextSize: new(int64(100))}}
+			events <- acp.AgentEvent{Type: acp.EventTypeAgentMessage, TurnID: req.TurnID, Text: "Work continued after the context observation."}
+			events <- acp.AgentEvent{Type: acp.EventTypeDone, TurnID: req.TurnID}
+			close(events)
+			return events, nil
+		}
+		fixture := newLoopGoalManagedRuntimeFixture(t, "context-reread", driver)
+		events, err := fixture.manager.Prompt(t.Context(), fixture.binding.SessionID, "Calculate the billing summary")
+		if err != nil {
+			t.Fatal(err)
+		}
+		for range events {
+		}
+		runtime := loopGoalContextRuntime{sessions: fixture.manager}
+		usage, err := runtime.Usage(t.Context(), fixture.binding)
+		if err != nil || !usage.Known {
+			t.Fatalf("latest context = %#v, %v", usage, err)
+		}
+		pinned, err := runtime.UsageAtSequence(t.Context(), fixture.binding, usage.Sequence)
+		if err != nil || !pinned.Known || pinned.Sequence != usage.Sequence || pinned.Used != 10 || pinned.Size != 100 {
+			t.Fatalf("pinned context = %#v, %v", pinned, err)
+		}
+		missing, err := runtime.UsageAtSequence(t.Context(), fixture.binding, usage.Sequence+1)
+		if err != nil || missing.Known {
+			t.Fatalf("non-usage event became known context: %#v, %v", missing, err)
+		}
+	})
+
+	// Invariant: the real managed binder adopts its checkpoint before initial context observation.
+	// Owner: Goal executor/runtime seam; canonical managed runtime integration suite.
+	t.Run("Should observe known context before the first managed Goal prompt", func(t *testing.T) {
+		fixture := newLoopGoalManagedRuntimeFixture(t, "initial-context", nil, withoutInitialGoalBinding())
+		node := compileManagedGoalDefinition(t, "initial-context", fixture.agentName, "initial-context").Definition.Graph.Nodes[0]
+		judgeReached := false
+		judge := loopGoalJudgeEvaluatorFunc(func(context.Context, goalpkg.JudgeRequest) (goalpkg.JudgeResult, error) {
+			judgeReached = true
+			return goalpkg.JudgeResult{}, errors.New("known context reached the judge")
+		})
+		executor, err := goalpkg.NewExecutor(goalpkg.Dependencies{
+			Store: fixture.goalStore, Binder: fixture.runtime, Judge: judge,
+			Budget: fixture.goalStore, Context: initialGoalContextHealth{fixture.runtime}, Recovery: fixture.runtime,
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		_, err = executor.Execute(t.Context(), node, looppkg.ActionExecutionInput{
+			WorkspaceID: fixture.run.WorkspaceID, LoopRunID: fixture.run.ID,
+			ToolScope:  toolspkg.Scope{ProfileID: store.DefaultProfileID},
+			Generation: 1, NodeID: node.ID, CorrelationID: fixture.taskRunID,
+			RuntimeSelection: &looppkg.ActionRuntimeSelection{Catalog: integrationRuntimeCatalog{}},
+			Environment:      &loopdsl.EnvironmentSpec{Mode: loopdsl.EnvironmentRoot}, GoalSegmentEpoch: 1,
+			GoalContextNudgeRatio: new(0.8),
+		})
+		checkpoint, readErr := fixture.goalStore.LoadCheckpoint(t.Context(), fixture.key)
+		if readErr != nil {
+			t.Fatal(readErr)
+		}
+		if !judgeReached || checkpoint.ContextState != "known" || checkpoint.BindingEpoch != 1 ||
+			checkpoint.UsageSequence == nil || *checkpoint.UsageSequence != 1 {
+			t.Fatalf("initial context checkpoint = %#v; execution error = %v", checkpoint, err)
+		}
+	})
+	// Invariant: failed checkpoint adoption retains durable binding ownership for retry or cancellation.
+	// Owner: managed Goal/store seam; canonical managed runtime integration suite.
+	for _, cancelRun := range []bool{false, true} {
+		t.Run(
+			fmt.Sprintf("Should recover failed binding adoption with cancellation %t", cancelRun),
+			func(t *testing.T) {
+				fixture := newLoopGoalManagedRuntimeFixture(t, "adoption-failure", nil, withoutInitialGoalBinding())
+				node := compileManagedGoalDefinition(t, "adoption-failure", fixture.agentName, "adoption-failure").Definition.Graph.Nodes[0]
+				adoptionErr := errors.New("checkpoint adoption unavailable")
+				boundary := &failingGoalBindingAdoption{ExecutorStore: fixture.goalStore, err: adoptionErr}
+				actor, err := taskpkg.DeriveHumanActorContext("adoption-recovery", taskpkg.OriginKindCLI, "cli")
+				if err != nil {
+					t.Fatal(err)
+				}
+				executor, err := goalpkg.NewExecutor(goalpkg.Dependencies{
+					Store:  boundary,
+					Binder: fixture.runtime,
+					Judge: loopGoalJudgeEvaluatorFunc(
+						func(context.Context, goalpkg.JudgeRequest) (goalpkg.JudgeResult, error) {
+							return goalpkg.JudgeResult{Verdict: gate.Verdict{Outcome: gate.VerdictOutcomeApproved}}, nil
+						},
+					),
+					Budget:   fixture.goalStore,
+					Context:  initialGoalContextHealth{fixture.runtime},
+					Recovery: fixture.runtime,
+				})
+				if err != nil {
+					t.Fatal(err)
+				}
+				input := looppkg.ActionExecutionInput{
+					WorkspaceID: fixture.run.WorkspaceID, LoopRunID: fixture.run.ID,
+					ToolScope: toolspkg.Scope{ProfileID: store.DefaultProfileID}, Actor: &actor,
+					Generation: 1, NodeID: node.ID, CorrelationID: fixture.taskRunID,
+					RuntimeSelection: &looppkg.ActionRuntimeSelection{Catalog: integrationRuntimeCatalog{}},
+					Environment:      &loopdsl.EnvironmentSpec{Mode: loopdsl.EnvironmentRoot}, GoalSegmentEpoch: 1,
+					GoalContextNudgeRatio: new(0.8),
+				}
+				if _, err := executor.Execute(t.Context(), node, input); !errors.Is(err, adoptionErr) {
+					t.Fatalf("adoption error = %v, want %v", err, adoptionErr)
+				}
+				key := goalpkg.BindingKey{
+					WorkspaceID: fixture.run.WorkspaceID,
+					LoopRunID:   fixture.run.ID,
+					Handle:      boundary.request.BindingHandle,
+				}
+				binding, err := fixture.goalStore.GetActiveSessionBinding(t.Context(), key)
+				if err != nil || binding.SessionID != boundary.request.SessionID ||
+					binding.Ownership != goalpkg.BindingOwnershipRunOwned {
+					t.Fatalf("durable unadopted binding = %#v, %v", binding, err)
+				}
+				checkpoint, err := fixture.goalStore.LoadCheckpoint(t.Context(), fixture.key)
+				if err != nil || checkpoint.BindingEpoch != 0 {
+					t.Fatalf("unadopted checkpoint = %#v, %v", checkpoint, err)
+				}
+				if !cancelRun {
+					if _, err := executor.Execute(t.Context(), node, input); err != nil {
+						t.Fatalf("adoption retry did not complete: %v", err)
+					}
+					checkpoint, err := fixture.goalStore.LoadCheckpoint(t.Context(), fixture.key)
+					if err != nil || checkpoint.SessionID != binding.SessionID ||
+						checkpoint.BindingEpoch != binding.BindingEpoch ||
+						checkpoint.Status != "complete" {
+						t.Fatalf("retry replaced or lost durable binding: %#v, %v", checkpoint, err)
+					}
+					return
+				}
+				aggregate, err := looppkg.NewService(
+					fixture.goalStore,
+					looppkg.DefinitionResolverFunc(
+						func(context.Context, looppkg.WorkspaceID, string, string) (*looppkg.ResolvedDefinition, error) {
+							return nil, looppkg.ErrDefinitionNotFound
+						},
+					),
+					managedTestGoalRunPolicyResolver(),
+					looppkg.WithCancellationSessionController(
+						loopCancellationSessionController{sessions: fixture.manager},
+					),
+				)
+				if err != nil {
+					t.Fatal(err)
+				}
+				if err := aggregate.CancelRun(
+					t.Context(),
+					fixture.run.WorkspaceID,
+					fixture.run.ID,
+					"cancel unadopted work",
+					actor,
+				); err != nil {
+					t.Fatal(err)
+				}
+				closed, err := fixture.goalStore.GetSessionBindingAttempt(t.Context(), key, binding.BindingEpoch)
+				if err != nil || closed.State != goalpkg.BindingStateClosed {
+					t.Fatalf("canceled binding = %#v, %v", closed, err)
+				}
+				info, err := fixture.manager.Status(t.Context(), binding.SessionID)
+				if err != nil || info.State != session.StateStopped {
+					t.Fatalf("unadopted session survived cancellation: %#v, %v", info, err)
+				}
+			},
+		)
+	}
+
+	// Invariant: operator queue clear preserves a queued managed Goal prompt for dispatch.
+	// Owner: daemon Goal runtime; canonical managed runtime integration suite.
+	t.Run(
+		"Should preserve a queued Goal prompt when the operator clears the shared queue",
+		func(t *testing.T) {
+			driver := newHarnessIntegrationDriver()
+			release := make(chan struct{})
+			started := make(chan struct{}, 1)
+			defer func() {
+				select {
+				case <-release:
+				default:
+					close(release)
+				}
+			}()
+			driver.promptHook = func(ctx context.Context, _ *session.AgentProcess, req acp.PromptRequest) (<-chan acp.AgentEvent, error) {
+				select {
+				case started <- struct{}{}:
+				default:
+				}
+				events := make(chan acp.AgentEvent, 1)
+				go func() {
+					defer close(events)
+					select {
+					case <-ctx.Done():
+					case <-release:
+					}
+					events <- acp.AgentEvent{
+						Type: acp.EventTypeDone, TurnID: req.TurnID,
+						StopReason:       string(acp.PromptStopReasonEndTurn),
+						PromptStopReason: acp.PromptStopReasonEndTurn,
+					}
+				}()
+				return events, nil
+			}
+			fixture := newLoopGoalManagedRuntimeFixture(t, "clear-queued", driver)
+			ctx := testutil.Context(t)
+			active, err := fixture.manager.Prompt(ctx, fixture.binding.SessionID, "hold active turn")
+			if err != nil {
+				t.Fatal(err)
+			}
+			select {
+			case <-started:
+			case <-ctx.Done():
+				t.Fatal(ctx.Err())
+			}
+			ticket, err := fixture.preparePrompt(t, "goal-clear-queued", nil)
+			if err != nil {
+				t.Fatal(err)
+			}
+			result, err := fixture.manager.ClearPendingInputs(ctx, fixture.binding.SessionID,
+				session.PromptCaller{Kind: "human", ID: "queue-operator", Source: "test"})
+			if err != nil || result.ClearedCount != 0 {
+				entry, lookupErr := fixture.goalStore.GetSessionInputQueueEntryByID(ctx, ticket.QueueEntryID)
+				t.Fatalf("clear operator queue = %#v, %v; Goal entry = %#v, %v", result, err, entry, lookupErr)
+			}
+			entry, err := fixture.goalStore.GetSessionInputQueueEntryByID(ctx, ticket.QueueEntryID)
+			if err != nil || entry.Status != store.SessionInputQueueStatusQueued {
+				t.Fatalf("Goal entry after operator clear = %#v, %v", entry, err)
+			}
+			close(release)
+			awaitCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+			defer cancel()
+			terminal, err := fixture.runtime.AwaitActionPrompt(awaitCtx, ticket)
+			if err != nil || terminal.Outcome != looppkg.ActionPromptOutcomeCompleted ||
+				terminal.PromptID != ticket.PromptID {
+				t.Fatalf("preserved Goal terminal = %#v, %v", terminal, err)
+			}
+			if err := fixture.manager.Stop(ctx, fixture.binding.SessionID); err != nil {
+				t.Fatal(err)
+			}
+			for range active {
+			}
+		},
+	)
+	t.Run("Should wait for a durable claim through SQLite contention before executing once", func(t *testing.T) {
+		t.Parallel()
+		testLoopActionClaimContention(t)
+	})
+
+	// Invariant: SQLite contention retries terminal persistence without repeating the action; the real runtime suite owns it.
+	for _, oversized := range []bool{false, true} {
+		t.Run(
+			fmt.Sprintf("Should retain an executed action through SQLite contention oversized=%t", oversized),
+			func(t *testing.T) {
+				t.Parallel()
+				testLoopActionPersistenceContention(t, oversized, false)
+			},
+		)
+	}
+
+	t.Run("Should retain action ownership while a heartbeat write is contended", func(t *testing.T) {
+		t.Parallel()
+		testLoopActionPersistenceContention(t, false, true)
+	})
+	for _, lifecycle := range []string{"shutdown", "expiry"} {
+		t.Run("Should retain a completed result through "+lifecycle, func(t *testing.T) {
+			t.Parallel()
+			testLoopActionPersistenceContention(t, false, false, lifecycle)
+		})
+	}
+
+	t.Run("Should keep a quiet action alive without an inherited deadline", func(t *testing.T) {
+		testLoopActionLivenessIntegration(t)
+	})
+
+	t.Run(
+		"Should complete and externalize a Loop action result above the envelope cap within budget",
+		func(t *testing.T) {
+			testLoopActionWithinBudgetResultIntegration(t)
+		},
+	)
+
+	t.Run(
+		"Should fail and release a Loop action lease with node guidance above the result budget",
+		func(t *testing.T) {
+			testLoopActionAboveBudgetResultIntegration(t)
+		},
+	)
+
+	t.Run("Should quarantine a repeated node failure while preserving a successful sibling", func(t *testing.T) {
+		testLoopFailureBreakerIntegration(t)
+	})
+
+	t.Run("Should revalidate a borrowed origin without rewriting its immutable profile", func(t *testing.T) {
+		fixture := newLoopGoalManagedRuntimeFixture(t, "origin-borrowed", nil, withoutInitialGoalBinding())
+
+		originID, originIdentity := fixture.createOriginSession(t, "origin-borrowed")
+		request := fixture.bindingRequest("origin-borrowed")
+		request.OriginSessionID = originID
+		request.PinnedCreationProfileRef = originIdentity.CreationProfileRef
+		request.PinnedCreationDigest = originIdentity.CreationDigest
+		request.StaticPolicySpecDigest = originIdentity.PolicySpecDigest
+
+		applied, err := fixture.runtime.revalidatePersistedProfile(
+			testutil.Context(t),
+			request,
+			originIdentity,
+			true,
+		)
+		if err != nil {
+			t.Fatalf("revalidatePersistedProfile() error = %v", err)
+		}
+		if applied.Provider == "" {
+			t.Fatalf("applied runtime = %#v, want persisted provider", applied)
+		}
+	})
+
+	t.Run("Should preserve a materialized binding lineage after provenance parent deletion", func(t *testing.T) {
+		fixture := newLoopGoalManagedRuntimeFixture(t, "provenance-existing", nil, withoutInitialGoalBinding())
+		parentID, _ := fixture.createOriginSession(t, "provenance-existing")
+		request := fixture.bindingRequest("provenance-existing")
+		request.ProvenanceParentSessionID = parentID
+
+		created, err := fixture.runtime.BindActionSession(testutil.Context(t), request)
+		if err != nil {
+			t.Fatalf("BindActionSession(first) error = %v", err)
+		}
+		assertSessionProvenanceParent(t, fixture.manager, created.SessionID, parentID)
+		if err := fixture.manager.Delete(testutil.Context(t), parentID); err != nil {
+			t.Fatalf("Delete(parent) error = %v", err)
+		}
+
+		matched, err := fixture.runtime.BindActionSession(testutil.Context(t), request)
+		if err != nil {
+			t.Fatalf("BindActionSession(existing) error = %v", err)
+		}
+		if matched.SessionID != created.SessionID || matched.BindingEpoch != created.BindingEpoch {
+			t.Fatalf("existing binding = %#v, want identity %#v", matched, created)
+		}
+		assertSessionProvenanceParent(t, fixture.manager, matched.SessionID, parentID)
+		t.Cleanup(func() {
+			if err := fixture.manager.Delete(testutil.Context(t), matched.SessionID); err != nil {
+				t.Errorf("Delete(bound session) error = %v", err)
+			}
+		})
+	})
+
+	t.Run("Should preserve a deleted provenance parent as an orphan when a managed retry advances", func(t *testing.T) {
+		var failingManager *failFirstEnsureCreatedManager
+		fixture := newLoopGoalManagedRuntimeFixture(
+			t,
+			"provenance-retry",
+			nil,
+			withoutInitialGoalBinding(),
+			withGoalRuntimeSessionManager(func(manager *session.Manager) SessionManager {
+				failingManager = &failFirstEnsureCreatedManager{Manager: manager}
+				return failingManager
+			}),
+		)
+		parentID, _ := fixture.createOriginSession(t, "provenance-retry")
+		failingManager.beforeFailure = func(ctx context.Context) error {
+			return fixture.manager.Delete(ctx, parentID)
+		}
+		request := fixture.bindingRequest("provenance-retry")
+		request.ProvenanceParentSessionID = parentID
+
+		failedBinding, err := fixture.runtime.BindActionSession(testutil.Context(t), request)
+		creationErr, creationErrMatched := errors.AsType[*looppkg.ActionSessionCreationError](err)
+		if !creationErrMatched || !creationErr.EffectKnownFalse {
+			t.Fatalf("BindActionSession(first) error = %v, want known-false creation failure", err)
+		}
+		if _, active := fixture.manager.Get(request.DesiredSessionID); active {
+			t.Fatalf("failed session %q was materialized", request.DesiredSessionID)
+		}
+
+		retryRequest := request
+		retryRequest.TargetBindingEpoch = 2
+		retryRequest.BindingAttemptID, retryRequest.DesiredSessionID = goalpkg.DeriveBindingIdentity(
+			fixture.key,
+			retryRequest.Handle,
+			2,
+		)
+		if err := fixture.runtime.AdvanceActionSessionRetry(testutil.Context(t), &looppkg.ActionSessionRetryRequest{
+			BindRequest:           retryRequest,
+			FailedBinding:         failedBinding,
+			FailureCode:           creationErr.Code,
+			ExpectedPromptAttempt: 0,
+			RetryWithFreshSession: true,
+		}); err != nil {
+			t.Fatalf("AdvanceActionSessionRetry() error = %v", err)
+		}
+
+		checkpoint, err := fixture.goalStore.LoadCheckpoint(testutil.Context(t), fixture.key)
+		if err != nil {
+			t.Fatal(err)
+		}
+		retryRequest.ExpectedCheckpointPhase = string(checkpoint.Phase)
+		retryRequest.ExpectedCheckpointBindingEpoch = checkpoint.BindingEpoch
+		retryRequest.ExpectedCheckpointSessionID = checkpoint.SessionID
+		retryRequest.ExpectedCheckpointHandle = checkpoint.BindingHandle
+		retryBinding, err := fixture.runtime.BindActionSession(testutil.Context(t), retryRequest)
+		if err != nil {
+			t.Fatalf("BindActionSession(retry) error = %v", err)
+		}
+		if retryBinding.BindingEpoch != 2 || retryBinding.SessionID != retryRequest.DesiredSessionID {
+			t.Fatalf("retry binding = %#v, want epoch 2 session %q", retryBinding, retryRequest.DesiredSessionID)
+		}
+		t.Cleanup(func() {
+			if err := fixture.manager.Delete(testutil.Context(t), retryBinding.SessionID); err != nil {
+				t.Errorf("Delete(retry session) error = %v", err)
+			}
+		})
+		assertSessionProvenanceParent(t, fixture.manager, retryBinding.SessionID, parentID)
+	})
+
+	t.Run("Should persist and enforce managed tool narrowing across binding reuse", func(t *testing.T) {
+		fixture := newLoopGoalManagedRuntimeFixture(t, "tool-subset", nil,
+			withoutInitialGoalBinding(),
+			withGoalRuntimeAgentTools("compozy__session_list", "compozy__workspace_list"),
+		)
+		ctx := t.Context()
+		request := fixture.bindingRequest("tool-subset")
+		request.AllowedTools = []string{" compozy__workspace_list ", "compozy__workspace_list"}
+		binding, err := fixture.runtime.BindActionSession(ctx, request)
+		if err != nil {
+			t.Fatalf("BindActionSession(subset) error = %v", err)
+		}
+		wantTools := []string{"compozy__workspace_list"}
+		profile, err := fixture.goalStore.GetSessionCreationProfile(ctx, binding.CreationProfileRef)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !slices.Equal(profile.AllowedTools, wantTools) || !slices.Equal(profile.AgentTools, wantTools) {
+			t.Fatalf("creation profile tools = %v / %v, want %v", profile.AllowedTools, profile.AgentTools, wantTools)
+		}
+		info, err := fixture.manager.Status(ctx, binding.SessionID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if info.Lineage == nil || !slices.Equal(info.Lineage.PermissionPolicy.Tools, wantTools) {
+			t.Fatalf("session lineage = %#v, want narrowed tools %v", info.Lineage, wantTools)
+		}
+		request.AllowedTools = wantTools
+		reused, err := fixture.runtime.BindActionSession(ctx, request)
+		if err != nil || reused.SessionID != binding.SessionID {
+			t.Fatalf("BindActionSession(normalized retry) = %#v, %v, want original session", reused, err)
+		}
+	})
+
+	t.Run("Should reject managed tool widening before creating a session", func(t *testing.T) {
+		fixture := newLoopGoalManagedRuntimeFixture(t, "tool-widening", nil,
+			withoutInitialGoalBinding(),
+			withGoalRuntimeAgentTools("compozy__session_list", "compozy__workspace_list"),
+		)
+		ctx := t.Context()
+		request := fixture.bindingRequest("tool-widening")
+		request.AllowedTools = []string{"compozy__config_get"}
+		_, err := fixture.runtime.BindActionSession(ctx, request)
+		if !errors.Is(err, session.ErrValidation) || !strings.Contains(err.Error(), "widens agent profile") {
+			t.Fatalf("BindActionSession(widening) error = %v, want deterministic validation failure", err)
+		}
+		metadata, marshalErr := marshalLoopActionFailureMetadata("loop_action", err)
+		if marshalErr != nil {
+			t.Fatal(marshalErr)
+		}
+		var envelope loopActionFailureMetadata
+		if err := json.Unmarshal(metadata, &envelope); err != nil {
+			t.Fatal(err)
+		}
+		if envelope.Failure.Code != "allowed_tools_policy_violation" ||
+			!strings.Contains(envelope.Failure.Cause, "compozy__config_get") ||
+			strings.Contains(envelope.Failure.Cause, "session:") || envelope.Failure.Recovery == "" {
+			t.Fatalf("Loop failure = %#v, want safe tool-policy cause and recovery", envelope.Failure)
+		}
+		if _, active := fixture.manager.Get(request.DesiredSessionID); active {
+			t.Fatalf("rejected session %q was materialized", request.DesiredSessionID)
+		}
+		_, statusErr := fixture.manager.Status(ctx, request.DesiredSessionID)
+		if !errors.Is(statusErr, session.ErrSessionNotFound) {
+			t.Fatalf("Status(rejected session) error = %v, want ErrSessionNotFound", statusErr)
+		}
+	})
+
+	t.Run("Should reject a tool restriction that diverges from the active pinned profile", func(t *testing.T) {
+		fixture := newLoopGoalManagedRuntimeFixture(t, "tool-profile", nil,
+			withGoalRuntimeAgentTools("compozy__session_list", "compozy__workspace_list"),
+		)
+		request := fixture.bindingRequest("tool-profile")
+		request.BindingAttemptID = "binding-attempt-goal-managed-tool-profile-divergent"
+		request.DesiredSessionID = "sess-goal-managed-tool-profile-divergent"
+		request.AllowedTools = []string{"compozy__workspace_list"}
+		_, err := fixture.runtime.BindActionSession(t.Context(), request)
+		reason, matched := errors.AsType[*looppkg.ReasonError](err)
+		if !matched || reason.Code != looppkg.ReasonCodeContinuousBindingMismatch ||
+			!errors.Is(err, looppkg.ErrTransitionConflict) {
+			t.Fatalf("BindActionSession(divergent tools) error = %v, want bindingMismatch", err)
+		}
+		if _, active := fixture.manager.Get(fixture.binding.SessionID); !active {
+			t.Fatalf("original session %q is no longer active", fixture.binding.SessionID)
+		}
+		if _, active := fixture.manager.Get(request.DesiredSessionID); active {
+			t.Fatalf("divergent session %q was materialized", request.DesiredSessionID)
+		}
+	})
+
+	t.Run("Should reject a runtime triple that diverges from the active pinned profile", func(t *testing.T) {
+		fixture := newLoopGoalManagedRuntimeFixture(t, "runtime-profile", nil, withoutInitialGoalBinding())
+		firstRequest := fixture.bindingRequest("runtime-profile")
+		firstRequest.Runtime = &looppkg.RuntimeSpec{Model: "first-model"}
+
+		first, err := fixture.runtime.BindActionSession(testutil.Context(t), firstRequest)
+		if err != nil {
+			t.Fatalf("BindActionSession(first runtime) error = %v", err)
+		}
+		if first.AppliedRuntime.Model != "first-model" {
+			t.Fatalf("first AppliedRuntime = %#v, want first-model", first.AppliedRuntime)
+		}
+
+		secondRequest := fixture.bindingRequest("runtime-profile")
+		secondRequest.BindingAttemptID = "binding-attempt-goal-managed-runtime-profile-divergent"
+		secondRequest.DesiredSessionID = "sess-goal-managed-runtime-profile-divergent"
+		secondRequest.Runtime = &looppkg.RuntimeSpec{Model: "second-model"}
+		_, err = fixture.runtime.BindActionSession(testutil.Context(t), secondRequest)
+		reason, reasonMatched := errors.AsType[*looppkg.ReasonError](err)
+		if !reasonMatched || reason.Code != looppkg.ReasonCodeContinuousBindingMismatch ||
+			!errors.Is(err, looppkg.ErrTransitionConflict) {
+			t.Fatalf("BindActionSession(divergent runtime) error = %v, want bindingMismatch", err)
+		}
+		if _, active := fixture.manager.Get(first.SessionID); !active {
+			t.Fatalf("first session %q is not active after rejected divergence", first.SessionID)
+		}
+		if _, active := fixture.manager.Get(secondRequest.DesiredSessionID); active {
+			t.Fatalf("divergent session %q was materialized", secondRequest.DesiredSessionID)
+		}
+	})
+
+	t.Run("Should converge Cancel after session materialization and before binding activation", func(t *testing.T) {
+		materialized := make(chan struct{})
+		releaseActivation := make(chan struct{})
+		fixture := newLoopGoalManagedRuntimeFixture(
+			t,
+			"stop-create-race",
+			newHarnessIntegrationDriver(),
+			withoutInitialGoalBinding(),
+			withGoalRuntimeSessionManager(func(manager *session.Manager) SessionManager {
+				return &delayedEnsureCreatedManager{
+					Manager: manager, materialized: materialized, release: releaseActivation,
+				}
+			}),
+		)
+		request := fixture.bindingRequest("stop-create-race")
+		result := make(chan error, 1)
+		go func() {
+			_, err := fixture.runtime.BindActionSession(testutil.Context(t), request)
+			result <- err
+		}()
+		select {
+		case <-materialized:
+		case <-time.After(time.Second):
+			t.Fatal("managed session creation did not materialize")
+		}
+
+		aggregate, err := looppkg.NewService(
+			fixture.goalStore,
+			looppkg.DefinitionResolverFunc(
+				func(context.Context, looppkg.WorkspaceID, string, string) (*looppkg.ResolvedDefinition, error) {
+					return nil, looppkg.ErrDefinitionNotFound
+				},
+			),
+			managedTestGoalRunPolicyResolver(),
+			looppkg.WithClock(time.Now),
+			looppkg.WithCancellationSessionController(loopCancellationSessionController{sessions: fixture.manager}),
+		)
+		if err != nil {
+			t.Fatalf("loop.NewService() error = %v", err)
+		}
+		actor, err := taskpkg.DeriveHumanActorContext("operator-cancel-create", taskpkg.OriginKindCLI, "cli")
+		if err != nil {
+			t.Fatalf("DeriveHumanActorContext() error = %v", err)
+		}
+		if err := aggregate.CancelRun(
+			testutil.Context(t), fixture.run.WorkspaceID, fixture.run.ID, "operator cancel", actor,
+		); err != nil {
+			t.Fatalf("CancelRun() error = %v", err)
+		}
+		cleanupStore, ok := fixture.goalStore.(loopSessionCleanupStore)
+		if !ok {
+			t.Fatalf("goal store = %T, want loopSessionCleanupStore", fixture.goalStore)
+		}
+		outboxStore, ok := fixture.goalStore.(goalSessionOutboxStore)
+		if !ok {
+			t.Fatalf("goal store = %T, want goalSessionOutboxStore", fixture.goalStore)
+		}
+		if pending, err := cleanupStore.ClaimLoopSessionCleanup(testutil.Context(t), 10); err != nil {
+			t.Fatalf("ClaimLoopSessionCleanup(unsettled) error = %v", err)
+		} else if len(pending) != 0 {
+			t.Fatalf("unsettled cleanup = %#v, want hidden", pending)
+		}
+		close(releaseActivation)
+		select {
+		case bindErr := <-result:
+			if bindErr == nil {
+				t.Fatal("BindActionSession(after Cancel) error = nil")
+			}
+		case <-time.After(time.Second):
+			t.Fatal("BindActionSession did not converge after Cancel")
+		}
+
+		if _, active := fixture.manager.Get(request.DesiredSessionID); active {
+			t.Fatalf("late-created root session %q survived binding cancellation", request.DesiredSessionID)
+		}
+
+		relay := &goalSessionOutboxRelay{
+			store: outboxStore, appender: fixture.manager,
+			cleanupStore: cleanupStore, stopper: fixture.manager, now: time.Now,
+		}
+		if err := relay.DeliverPending(testutil.Context(t)); err != nil {
+			t.Fatalf("DeliverPending() error = %v", err)
+		}
+		if _, active := fixture.manager.Get(request.DesiredSessionID); active {
+			t.Fatalf("late-created session %q remained active", request.DesiredSessionID)
+		}
+		if pending, err := cleanupStore.ClaimLoopSessionCleanup(testutil.Context(t), 10); err != nil {
+			t.Fatalf("ClaimLoopSessionCleanup(completed) error = %v", err)
+		} else if len(pending) != 0 {
+			t.Fatalf("completed cleanup = %#v, want none", pending)
+		}
+	})
+
+	t.Run("Should carry one prompt through the real Manager slot and durable terminal await", func(t *testing.T) {
+		fixture := newLoopGoalManagedRuntimeFixture(t, "terminal", nil)
+		var reported atomic.Int64
+		promptID := "goal-prompt-managed-runtime"
+		ticket, err := fixture.preparePrompt(t, promptID, looppkg.ActionUsageReporterFunc(func(tokens int64) {
+			reported.Store(tokens)
+		}))
+		if err != nil {
+			t.Fatalf("PrepareActionPrompt() error = %v", err)
+		}
+		result, err := fixture.runtime.AwaitActionPrompt(testutil.Context(t), ticket)
+		if err != nil {
+			t.Fatalf("AwaitActionPrompt() error = %v", err)
+		}
+		if result.PromptID != promptID || result.Outcome != looppkg.ActionPromptOutcomeCompleted ||
+			result.StopReason != looppkg.ActionStopEndTurn || result.Text != "reply" ||
+			!result.TokensReported || result.TokensUsed != 3 || result.EventStartSeq < 1 ||
+			result.EventEndSeq < result.EventStartSeq {
+			t.Fatalf("managed prompt result = %#v", result)
+		}
+		if got := reported.Load(); got != 3 {
+			t.Fatalf("reported action usage = %d, want 3", got)
+		}
+		checkpoint, err := fixture.goalStore.LoadCheckpoint(testutil.Context(t), fixture.key)
+		if err != nil {
+			t.Fatalf("LoadCheckpoint() error = %v", err)
+		}
+		if checkpoint.Phase != "judging" || checkpoint.TurnsUsed != 1 || checkpoint.PromptID != promptID {
+			t.Fatalf("managed checkpoint = %#v", checkpoint)
+		}
+	})
+
+	t.Run("Should atomically Cancel an attached prompt and cancel its exact real Manager lease", func(t *testing.T) {
+		driver := newHarnessIntegrationDriver()
+		promptStarted := make(chan struct{})
+		promptCanceled := make(chan struct{})
+		providerCancel := make(chan struct{})
+		var cancelOnce sync.Once
+		driver.cancelHook = func(context.Context, *session.AgentProcess) error {
+			cancelOnce.Do(func() { close(providerCancel) })
+			return nil
+		}
+		driver.promptHook = func(
+			ctx context.Context,
+			proc *session.AgentProcess,
+			req acp.PromptRequest,
+		) (<-chan acp.AgentEvent, error) {
+			events := make(chan acp.AgentEvent, 1)
+			close(promptStarted)
+			go func() {
+				defer close(events)
+				select {
+				case <-ctx.Done():
+				case <-providerCancel:
+				}
+				close(promptCanceled)
+				events <- acp.AgentEvent{
+					Type: acp.EventTypeDone, SessionID: proc.SessionID, TurnID: req.TurnID,
+					Timestamp: time.Now().UTC(), StopReason: string(looppkg.ActionStopCancelled),
+					PromptStopReason: acp.PromptStopReasonCancelled,
+				}
+			}()
+			return events, nil
+		}
+		fixture := newLoopGoalManagedRuntimeFixture(t, "stop", driver)
+		promptID := "goal-prompt-managed-stop"
+		ticket, err := fixture.preparePrompt(t, promptID, nil)
+		if err != nil {
+			t.Fatalf("PrepareActionPrompt() error = %v", err)
+		}
+		select {
+		case <-promptStarted:
+		case <-time.After(time.Second):
+			t.Fatal("managed driver prompt did not start")
+		}
+
+		aggregate, err := looppkg.NewService(
+			fixture.goalStore,
+			looppkg.DefinitionResolverFunc(func(
+				context.Context,
+				looppkg.WorkspaceID,
+				string,
+				string,
+			) (*looppkg.ResolvedDefinition, error) {
+				return nil, looppkg.ErrDefinitionNotFound
+			}),
+			managedTestGoalRunPolicyResolver(),
+			looppkg.WithClock(time.Now),
+			looppkg.WithGoalPromptLeaseRevoker(loopGoalPromptLeaseRevoker{sessions: fixture.manager}),
+			looppkg.WithCancellationSessionController(loopCancellationSessionController{sessions: fixture.manager}),
+		)
+		if err != nil {
+			t.Fatalf("loop.NewService() error = %v", err)
+		}
+		actor, err := taskpkg.DeriveHumanActorContext("operator-cancel", taskpkg.OriginKindCLI, "cli")
+		if err != nil {
+			t.Fatalf("DeriveHumanActorContext() error = %v", err)
+		}
+		if err := aggregate.CancelRun(
+			testutil.Context(t),
+			fixture.run.WorkspaceID,
+			fixture.run.ID,
+			"operator cancel",
+			actor,
+		); err != nil {
+			t.Fatalf("CancelRun() error = %v", err)
+		}
+		select {
+		case <-promptCanceled:
+		case <-time.After(time.Second):
+			t.Fatal("managed driver prompt lease was not canceled")
+		}
+		result, err := fixture.runtime.AwaitActionPrompt(testutil.Context(t), ticket)
+		if err != nil {
+			t.Fatalf("AwaitActionPrompt(after Cancel) error = %v", err)
+		}
+		if result.PromptID != promptID || result.Outcome != looppkg.ActionPromptOutcomeAmbiguous ||
+			result.ReasonCode != looppkg.ReasonCodeGoalControlRevokedInFlight || result.StopReason != looppkg.ActionStopCancelled ||
+			result.EventStartSeq < 1 || result.EventEndSeq < result.EventStartSeq {
+			t.Fatalf("stopped managed prompt result = %#v", result)
+		}
+		checkpoint, err := fixture.goalStore.LoadCheckpoint(testutil.Context(t), fixture.key)
+		if err != nil {
+			t.Fatalf("LoadCheckpoint() error = %v", err)
+		}
+		if checkpoint.ControlEpoch != 2 || checkpoint.Phase != "terminal" || checkpoint.Status != "paused" ||
+			checkpoint.ControlActorKind != string(actor.Actor.Kind.Normalize()) ||
+			checkpoint.ControlActorID != actor.Actor.Ref {
+			t.Fatalf("stopped managed checkpoint = %#v", checkpoint)
+		}
+		run, err := fixture.goalStore.GetLoopRun(
+			testutil.Context(t), fixture.run.WorkspaceID, fixture.run.ID,
+		)
+		if err != nil {
+			t.Fatalf("GetLoopRun() error = %v", err)
+		}
+		if run.Status != looppkg.StatusCanceled {
+			t.Fatalf("canceled managed Run status = %q, want canceled", run.Status)
+		}
+	})
+
+	t.Run("Should settle Pause through the real Manager and coordinator before one live Resume", func(t *testing.T) {
+		driver := newHarnessIntegrationDriver()
+		promptStarted := make(chan struct{})
+		releasePrompt := make(chan struct{})
+		driver.promptHook = func(
+			_ context.Context,
+			proc *session.AgentProcess,
+			req acp.PromptRequest,
+		) (<-chan acp.AgentEvent, error) {
+			events := make(chan acp.AgentEvent, 2)
+			close(promptStarted)
+			go func() {
+				defer close(events)
+				<-releasePrompt
+				ts := time.Now().UTC()
+				tokens := int64(4)
+				events <- acp.AgentEvent{
+					Type: acp.EventTypeAgentMessage, SessionID: proc.SessionID,
+					TurnID: req.TurnID, Timestamp: ts, Text: "pause boundary reply",
+				}
+				events <- acp.AgentEvent{
+					Type: acp.EventTypeDone, SessionID: proc.SessionID, TurnID: req.TurnID,
+					Timestamp: ts, StopReason: string(looppkg.ActionStopEndTurn),
+					PromptStopReason: acp.PromptStopReasonEndTurn,
+					Usage:            &acp.TokenUsage{TurnID: req.TurnID, TotalTokens: &tokens, Timestamp: ts},
+				}
+			}()
+			return events, nil
+		}
+
+		fixture := newLoopGoalCoordinatorRuntimeFixture(t, "pause-resume", driver)
+		judge := loopGoalJudgeEvaluatorFunc(func(
+			context.Context,
+			goalpkg.JudgeRequest,
+		) (goalpkg.JudgeResult, error) {
+			t.Fatal("Goal judge ran after a pending Pause boundary")
+			return goalpkg.JudgeResult{}, nil
+		})
+		executor, err := goalpkg.NewExecutor(goalpkg.Dependencies{
+			Store: fixture.goalStore, Binder: fixture.runtime, Judge: judge,
+			Budget: fixture.goalStore, Context: fixture.runtime, Recovery: fixture.runtime,
+			Now: time.Now,
+		})
+		if err != nil {
+			t.Fatalf("goal.NewExecutor() error = %v", err)
+		}
+		resultC := make(chan looppkg.ActionRawResult, 1)
+		errC := make(chan error, 1)
+		go func() {
+			result, executeErr := executor.Execute(testutil.Context(t), fixture.node, looppkg.ActionExecutionInput{
+				WorkspaceID: fixture.run.WorkspaceID, LoopRunID: fixture.run.ID,
+				ToolScope:  toolspkg.Scope{ProfileID: fixture.run.ProfileID},
+				Generation: 1, NodeID: fixture.node.ID, ItemIndex: 0,
+				Actor: &fixture.actor, CorrelationID: fixture.workerClaim.Run.ID,
+				RuntimeSelection: &looppkg.ActionRuntimeSelection{
+					Defaults: looppkg.RuntimeDefaults{
+						Worker: looppkg.RuntimeSpec{Model: "worker-model"},
+						Judge:  looppkg.RuntimeSpec{Model: "judge-model"},
+					},
+					Catalog: integrationRuntimeCatalog{},
+				},
+				Environment: &loopdsl.EnvironmentSpec{Mode: loopdsl.EnvironmentRoot}, GoalSegmentEpoch: 1,
+				GoalContextNudgeRatio: new(fixture.run.GoalContextNudgeRatio),
+			})
+			if executeErr != nil {
+				errC <- executeErr
+				return
+			}
+			resultC <- result
+		}()
+		select {
+		case <-promptStarted:
+		case err := <-errC:
+			t.Fatalf("Goal Execute() before prompt error = %v", err)
+		case <-time.After(2 * time.Second):
+			t.Fatal("managed Goal prompt did not start")
+		}
+
+		activationObserver := &activationDispatchObserver{}
+		dispatcher, err := newTaskRunActivationDispatcher(fixture.taskStore, nil, activationObserver, nil)
+		if err != nil {
+			t.Fatalf("newTaskRunActivationDispatcher() error = %v", err)
+		}
+		state := &bootState{tasks: &taskRuntime{}, logger: discardLogger()}
+		state.tasks.activation.Store(dispatcher)
+		aggregate, err := looppkg.NewService(
+			fixture.goalStore,
+			looppkg.DefinitionResolverFunc(func(
+				context.Context,
+				looppkg.WorkspaceID,
+				string,
+				string,
+			) (*looppkg.ResolvedDefinition, error) {
+				return nil, looppkg.ErrDefinitionNotFound
+			}),
+			managedTestGoalRunPolicyResolver(),
+			looppkg.WithClock(time.Now),
+			looppkg.WithGoalRunActivator(loopGoalRunActivator{state: state}),
+		)
+		if err != nil {
+			t.Fatalf("loop.NewService() error = %v", err)
+		}
+		pauseActor, err := taskpkg.DeriveHumanActorContext(
+			"operator-pause", taskpkg.OriginKindCLI, "cli",
+		)
+		if err != nil {
+			t.Fatalf("DeriveHumanActorContext(pause) error = %v", err)
+		}
+		if err := aggregate.Pause(
+			testutil.Context(t), fixture.run.WorkspaceID, fixture.run.ID, pauseActor,
+		); err != nil {
+			t.Fatalf("Pause() error = %v", err)
+		}
+		close(releasePrompt)
+
+		var raw looppkg.ActionRawResult
+		select {
+		case raw = <-resultC:
+		case err := <-errC:
+			t.Fatalf("Goal Execute() error = %v", err)
+		case <-time.After(2 * time.Second):
+			t.Fatal("Goal Execute() did not settle the paused prompt")
+		}
+		if raw.Control == nil || raw.Control.Disposition != looppkg.ActionDispositionPaused ||
+			raw.Control.Cause != looppkg.ReasonCode(looppkg.TransitionCausePauseBoundary) ||
+			raw.TokensUsed != 4 {
+			t.Fatalf("paused Goal result = %#v", raw)
+		}
+		fixture.completeWorkerControl(t, raw)
+		fixture.runNextCoordinator(t)
+
+		pausedRun, err := fixture.goalStore.GetLoopRun(
+			testutil.Context(t), fixture.run.WorkspaceID, fixture.run.ID,
+		)
+		if err != nil {
+			t.Fatalf("GetLoopRun(paused) error = %v", err)
+		}
+		if pausedRun.Status != looppkg.StatusPaused || pausedRun.PauseRequested {
+			t.Fatalf("paused Run = %#v", pausedRun)
+		}
+		fixture.assertAwaitingGoalWithoutWorker(t)
+
+		resumeActor, err := taskpkg.DeriveHumanActorContext(
+			"operator-resume", taskpkg.OriginKindCLI, "cli",
+		)
+		if err != nil {
+			t.Fatalf("DeriveHumanActorContext(resume) error = %v", err)
+		}
+		if err := aggregate.Resume(
+			testutil.Context(t), fixture.run.WorkspaceID, fixture.run.ID, resumeActor,
+		); err != nil {
+			t.Fatalf("Resume() error = %v", err)
+		}
+		if err := aggregate.Resume(
+			testutil.Context(t), fixture.run.WorkspaceID, fixture.run.ID, resumeActor,
+		); err != nil {
+			t.Fatalf("Resume(idempotent) error = %v", err)
+		}
+		if got := activationObserver.runIDs(); len(got) != 1 {
+			t.Fatalf("live Goal activations = %#v, want exactly one successor", got)
+		}
+		successor, err := fixture.taskStore.GetTaskRun(
+			testutil.Context(t), activationObserver.runIDs()[0],
+		)
+		if err != nil {
+			t.Fatalf("GetTaskRun(successor) error = %v", err)
+		}
+		var metadata loopGoalIntegrationRunMetadata
+		if err := json.Unmarshal(successor.Metadata, &metadata); err != nil {
+			t.Fatalf("decode successor metadata error = %v", err)
+		}
+		if successor.RunKind.Normalize() != taskpkg.RunKindWorker || !successor.IsLoopWorker() ||
+			successor.LoopRunID != string(fixture.run.ID) || metadata.Generation != 1 ||
+			metadata.NodeID != string(fixture.node.ID) || metadata.ItemIndex != 0 ||
+			metadata.GoalSegmentEpoch != 2 {
+			t.Fatalf("Goal successor = %#v metadata = %#v", successor, metadata)
+		}
+	})
+}
+
+type initialGoalContextHealth struct{ goalpkg.ContextHealth }
+
+func (initialGoalContextHealth) Usage(context.Context, looppkg.ActionSessionBinding) (goalpkg.ContextUsage, error) {
+	return goalpkg.ContextUsage{
+		Known: true, Used: 1, Size: 100, Sequence: 1,
+		ReportedAt: time.Date(2026, 9, 10, 12, 0, 0, 0, time.UTC),
+	}, nil
+}
+
+type integrationRuntimeCatalog struct{}
+
+func (integrationRuntimeCatalog) CanonicalProvider(provider string) string {
+	return provider
+}
+
+func (integrationRuntimeCatalog) ValidateRuntime(context.Context, looppkg.RuntimeSpec) error {
+	return nil
+}
+
+func managedTestGoalRunPolicyResolver() looppkg.GoalRunPolicyResolver {
+	return looppkg.GoalRunPolicyResolverFunc(func(
+		context.Context,
+		looppkg.WorkspaceID,
+	) (*looppkg.GoalRunPolicy, error) {
+		return &looppkg.GoalRunPolicy{ContextNudgeRatio: 0.8}, nil
+	})
+}
+
+type loopGoalJudgeEvaluatorFunc func(context.Context, goalpkg.JudgeRequest) (goalpkg.JudgeResult, error)
+
+type loopGoalIntegrationRunMetadata struct {
+	Generation       int    `json:"generation"`
+	NodeID           string `json:"node_id"`
+	ItemIndex        int    `json:"item_index"`
+	GoalSegmentEpoch int64  `json:"goal_segment_epoch"`
+}
+
+func (f loopGoalJudgeEvaluatorFunc) EvaluateGoal(
+	ctx context.Context,
+	req goalpkg.JudgeRequest,
+) (goalpkg.JudgeResult, error) {
+	return f(ctx, req)
+}
+
+type loopGoalCoordinatorRuntimeFixture struct {
+	runtime       *loopGoalRuntime
+	goalStore     loopGoalProductionStore
+	taskStore     taskStore
+	taskManager   *taskpkg.Service
+	run           looppkg.Run
+	node          loopdsl.Node
+	actor         taskpkg.ActorContext
+	workerClaim   *taskpkg.ClaimResult
+	workspaceRoot string
+}
+
+func newLoopGoalCoordinatorRuntimeFixture(
+	t *testing.T,
+	suffix string,
+	driver *harnessIntegrationDriver,
+) loopGoalCoordinatorRuntimeFixture {
+	t.Helper()
+	homePaths := integrationHomePaths(t)
+	cfg := testConfig(t, homePaths)
+	workspaceRoot := homePaths.HomeDir + "/workspace"
+	resolvedWorkspace := newHarnessIntegrationWorkspace(t, homePaths, cfg, workspaceRoot)
+	daemonInstance, deps := bootHarnessPolicyDaemon(t, homePaths, &cfg)
+	t.Cleanup(func() {
+		if err := daemonInstance.Shutdown(testutil.Context(t)); err != nil {
+			t.Errorf("Daemon.Shutdown() error = %v", err)
+		}
+	})
+
+	goalStore, ok := daemonInstance.registry.(loopGoalProductionStore)
+	if !ok {
+		t.Fatalf("registry = %T, want loopGoalProductionStore", daemonInstance.registry)
+	}
+	tasks, ok := daemonInstance.registry.(taskStore)
+	if !ok {
+		t.Fatalf("registry = %T, want taskStore", daemonInstance.registry)
+	}
+	outputs, ok := daemonInstance.registry.(looppkg.GenerationOutputReader)
+	if !ok {
+		t.Fatalf("registry = %T, want GenerationOutputReader", daemonInstance.registry)
+	}
+	queueStore, ok := daemonInstance.registry.(store.SessionInputQueueStore)
+	if !ok {
+		t.Fatalf("registry = %T, want SessionInputQueueStore", daemonInstance.registry)
+	}
+	now := time.Now().UTC()
+	if err := daemonInstance.registry.InsertWorkspace(testutil.Context(t), workspace.Workspace{
+		ID: resolvedWorkspace.ID, Name: resolvedWorkspace.Name, RootDir: resolvedWorkspace.RootDir,
+		CreatedAt: now, UpdatedAt: now,
+	}); err != nil {
+		t.Fatalf("InsertWorkspace() error = %v", err)
+	}
+
+	manager := newHarnessIntegrationManager(
+		t,
+		homePaths,
+		deps,
+		resolvedWorkspace,
+		driver,
+		session.WithSessionCatalog(daemonInstance.registry),
+		session.WithSessionCreationStore(goalStore),
+		session.WithSessionInputQueueStore(queueStore),
+	)
+	t.Cleanup(func() {
+		if err := manager.Shutdown(testutil.Context(t)); err != nil {
+			t.Errorf("Manager.Shutdown() error = %v", err)
+		}
+	})
+
+	loopName := "goal-managed-coordinator-" + suffix
+	handleLabel := "managed-" + suffix
+	resolved := compileManagedGoalDefinition(t, loopName, resolvedWorkspace.Agents[0].Name, handleLabel)
+	run := looppkg.Run{
+		ID:          looppkg.RunID("looprun-goal-coordinator-" + suffix),
+		WorkspaceID: looppkg.WorkspaceID(resolvedWorkspace.ID),
+		LoopName:    loopName, Status: looppkg.StatusRunning,
+		ReattemptStrategy: looppkg.ReattemptFailedOnly, CreatedAt: now,
+		StartedAt: now, LastProgressAt: now, Inputs: map[string]any{},
+		IterationCap: 3, BudgetTokens: 100, BudgetWallSec: 60,
+		BudgetOnExceeded: loopdsl.BudgetExceededHalt,
+	}
+	applyResolvedLoopRunPinningForTest(t, &run, now, resolved)
+	if _, err := goalStore.CreateLoopRunForStart(
+		testutil.Context(t), run, loopdsl.ConcurrencyAllow,
+	); err != nil {
+		t.Fatalf("CreateLoopRunForStart() error = %v", err)
+	}
+
+	coordinatorRunner, err := looppkg.NewCoordinatorRunner(
+		tasks, goalStore, outputs, discardLogger(),
+	)
+	if err != nil {
+		t.Fatalf("loop.NewCoordinatorRunner() error = %v", err)
+	}
+	taskManager, err := taskpkg.NewManager(
+		taskpkg.WithStore(tasks),
+		taskpkg.WithCoordinatorRunner(coordinatorRunner),
+		taskpkg.WithGenerationStateFinalizer(looppkg.NewStoreFinalizer()),
+		taskpkg.WithCoordinatorTerminalStatusValidator(func(status string) bool {
+			return looppkg.Status(status).Valid()
+		}),
+		taskpkg.WithCoordinatorTerminalHookStatusValidator(func(status string) bool {
+			return looppkg.Status(status).Terminal()
+		}),
+	)
+	if err != nil {
+		t.Fatalf("task.NewManager() error = %v", err)
+	}
+	actor, err := taskpkg.DeriveDaemonActorContext("loop-action", "daemon.loop-action")
+	if err != nil {
+		t.Fatalf("DeriveDaemonActorContext() error = %v", err)
+	}
+	initialClaim := claimLoopRunForIntegration(
+		t, taskManager, tasks, run, taskpkg.RunKindCoordinator, "", actor,
+	)
+	if _, err := taskManager.StartRun(
+		testutil.Context(t),
+		initialClaim.Run.ID,
+		taskpkg.StartRun{
+			IdempotencyKey: "start-" + initialClaim.Run.ID,
+			ClaimToken:     initialClaim.ClaimToken,
+		},
+		actor,
+	); err != nil {
+		t.Fatalf("StartRun(initial coordinator) error = %v", err)
+	}
+	workerClaim := claimLoopRunForIntegration(
+		t, taskManager, tasks, run, taskpkg.RunKindWorker, "", actor,
+	)
+
+	policyGate := &loopSessionPolicyGate{
+		workspaceResolver: &harnessIntegrationWorkspaceResolver{resolved: resolvedWorkspace},
+	}
+	runtime := newLoopGoalProductionRuntime(
+		goalStore,
+		manager,
+		policyGate,
+		time.Now,
+		discardLogger(),
+		nil,
+	)
+	return loopGoalCoordinatorRuntimeFixture{
+		runtime: runtime, goalStore: goalStore, taskStore: tasks, taskManager: taskManager,
+		run: run, node: resolved.Definition.Graph.Nodes[0], actor: actor,
+		workerClaim: workerClaim, workspaceRoot: workspaceRoot,
+	}
+}
+
+func compileManagedGoalDefinition(
+	t *testing.T,
+	loopName string,
+	agent string,
+	handleLabel string,
+) *looppkg.ResolvedDefinition {
+	t.Helper()
+	definition := loopdsl.Definition{
+		APIVersion:  loopdsl.APIVersion,
+		Kind:        loopdsl.KindLoop,
+		Meta:        loopdsl.Meta{Name: loopName, Version: 1},
+		Concurrency: loopdsl.ConcurrencyAllow,
+		Contract: loopdsl.Contract{
+			Goal: "Settle a managed Goal pause", DefinitionOfDone: "The Goal converges",
+			IterationCap: 3, NoProgress: loopdsl.NoProgress{Window: 1},
+			Budget: loopdsl.Budget{
+				Tokens: 100, WallClockSec: 60, OnExceeded: loopdsl.BudgetExceededHalt,
+			},
+		},
+		Graph: loopdsl.Graph{
+			Nodes: []loopdsl.Node{{
+				ID: "converge", Class: loopdsl.NodeClassAction, Kind: string(loopdsl.ActionGoal),
+				Session: &loopdsl.SessionSpec{Handle: handleLabel, Mode: loopdsl.SessionModeContinuous},
+				Params: loopdsl.NodeParams{
+					"agent": agent, "objective": "Finish the durable objective",
+					"judge": []any{map[string]any{
+						"id": "done", "type": "agent-judge", "agent": "reviewer",
+						"rubric": "Approve when the objective is complete",
+					}},
+					"max_turns": 3, "on_exhausted": loopdsl.GoalOnExhaustedHalt,
+					"output_schema": map[string]any{
+						"status": map[string]any{
+							"type": "string", "enum": []any{"complete", "blocked"},
+						},
+					},
+				},
+			}},
+			Edges: []loopdsl.Edge{},
+		},
+	}
+	resolved, err := looppkg.NewCompiler().Compile(definition)
+	if err != nil {
+		t.Fatalf("Compile(managed Goal definition) error = %v", err)
+	}
+	return resolved
+}
+
+func claimLoopRunForIntegration(
+	t *testing.T,
+	manager *taskpkg.Service,
+	store taskStore,
+	run looppkg.Run,
+	kind taskpkg.RunKind,
+	runID string,
+	actor taskpkg.ActorContext,
+) *taskpkg.ClaimResult {
+	t.Helper()
+	queued, err := store.ListTaskRunsByStatus(
+		testutil.Context(t), []taskpkg.RunStatus{taskpkg.TaskRunStatusQueued},
+	)
+	if err != nil {
+		t.Fatalf("ListTaskRunsByStatus() error = %v", err)
+	}
+	selectedID := runID
+	for _, candidate := range queued {
+		if selectedID == "" && candidate.LoopRunID == string(run.ID) &&
+			candidate.RunKind.Normalize() == kind.Normalize() {
+			selectedID = candidate.ID
+			break
+		}
+	}
+	if selectedID == "" {
+		t.Fatalf("no queued %q Run for Loop %q", kind.Normalize(), run.ID)
+	}
+	claimedBy := actor.Actor
+	claim, err := manager.ClaimNextRun(testutil.Context(t), taskpkg.ClaimCriteria{
+		RunID: selectedID, Scope: taskpkg.ScopeWorkspace, WorkspaceID: string(run.WorkspaceID),
+		RunKind: kind, ClaimerSessionID: "integration-" + selectedID, ClaimedBy: &claimedBy,
+		LeaseDuration: taskpkg.DefaultRunLeaseDuration, Now: time.Now().UTC(),
+	}, actor)
+	if err != nil {
+		t.Fatalf("ClaimNextRun(%q) error = %v", kind.Normalize(), err)
+	}
+	return claim
+}
+
+func (f loopGoalCoordinatorRuntimeFixture) completeWorkerControl(
+	t *testing.T,
+	raw looppkg.ActionRawResult,
+) {
+	t.Helper()
+	payload, err := json.Marshal(raw.Control)
+	if err != nil {
+		t.Fatalf("json.Marshal(ActionControl) error = %v", err)
+	}
+	completed, err := f.taskManager.CompleteRunLease(testutil.Context(t), taskpkg.LeaseCompletion{
+		RunID: f.workerClaim.Run.ID, ClaimToken: f.workerClaim.ClaimToken,
+		Result: taskpkg.RunResult{
+			TokensUsed: raw.TokensUsed,
+			CoordinatorControl: &taskpkg.CoordinatorControlResult{
+				Kind: looppkg.CoordinatorControlKindLoopAction, Payload: payload,
+			},
+		},
+		TokensUsed: raw.TokensUsed, Now: time.Now().UTC(),
+	}, f.actor)
+	if err != nil {
+		t.Fatalf("CompleteRunLease(Goal control) error = %v", err)
+	}
+	if completed.Status.Normalize() != taskpkg.TaskRunStatusCompleted {
+		t.Fatalf("completed Goal worker status = %q", completed.Status)
+	}
+}
+
+func (f loopGoalCoordinatorRuntimeFixture) runNextCoordinator(t *testing.T) {
+	t.Helper()
+	reconciler, ok := f.taskStore.(loopCoordinatorBootReconciler)
+	if !ok {
+		t.Fatalf("task store = %T, want loopCoordinatorBootReconciler", f.taskStore)
+	}
+	runs, err := reconciler.ReconcileLoopCoordinatorsOnBoot(
+		testutil.Context(t), f.actor.Origin, time.Now().UTC(),
+	)
+	if err != nil {
+		t.Fatalf("ReconcileLoopCoordinatorsOnBoot() error = %v", err)
+	}
+	if len(runs) != 1 {
+		t.Fatalf("reconciled coordinators = %#v, want exactly one", runs)
+	}
+	claim := claimLoopRunForIntegration(
+		t, f.taskManager, f.taskStore, f.run, taskpkg.RunKindCoordinator, runs[0].ID, f.actor,
+	)
+	if _, err := f.taskManager.StartRun(
+		testutil.Context(t),
+		claim.Run.ID,
+		taskpkg.StartRun{
+			IdempotencyKey: "start-" + claim.Run.ID,
+			ClaimToken:     claim.ClaimToken,
+		},
+		f.actor,
+	); err != nil {
+		t.Fatalf("StartRun(settlement coordinator) error = %v", err)
+	}
+}
+
+func (f loopGoalCoordinatorRuntimeFixture) assertAwaitingGoalWithoutWorker(t *testing.T) {
+	t.Helper()
+	outputs, ok := f.taskStore.(looppkg.GenerationOutputReader)
+	if !ok {
+		t.Fatalf("task store = %T, want GenerationOutputReader", f.taskStore)
+	}
+	generationOutputs, err := outputs.ListGenerationOutputs(
+		testutil.Context(t),
+		f.run.WorkspaceID,
+		f.run.ID,
+		1,
+	)
+	if err != nil {
+		t.Fatalf("ListGenerationOutputs() error = %v", err)
+	}
+	if len(generationOutputs) != 1 ||
+		generationOutputs[0].Status != looppkg.GenerationOutputStatusAwaitingGoal {
+		t.Fatalf("paused generation outputs = %#v", generationOutputs)
+	}
+	active, err := f.taskStore.ListTaskRunsByStatus(testutil.Context(t), []taskpkg.RunStatus{
+		taskpkg.TaskRunStatusQueued,
+		taskpkg.TaskRunStatusClaimed,
+		taskpkg.TaskRunStatusStarting,
+		taskpkg.TaskRunStatusRunning,
+	})
+	if err != nil {
+		t.Fatalf("ListTaskRunsByStatus(active) error = %v", err)
+	}
+	for _, candidate := range active {
+		if candidate.LoopRunID == string(f.run.ID) && candidate.RunKind.Normalize() == taskpkg.RunKindWorker {
+			t.Fatalf("paused Goal still has in-flight worker = %#v", candidate)
+		}
+	}
+	checkpoint, err := f.goalStore.LoadCheckpoint(testutil.Context(t), goalpkg.TurnKey{
+		WorkspaceID: f.run.WorkspaceID, LoopRunID: f.run.ID,
+		Generation: 1, NodeID: f.node.ID, ItemIndex: 0,
+	})
+	if err != nil {
+		t.Fatalf("LoadCheckpoint(paused) error = %v", err)
+	}
+	if checkpoint.Phase != "awaiting_control" || checkpoint.Status != "paused" ||
+		checkpoint.TurnsUsed != 1 || checkpoint.ControlEpoch != 1 {
+		t.Fatalf("paused Goal checkpoint = %#v", checkpoint)
+	}
+}
+
+type loopGoalManagedRuntimeFixture struct {
+	homePaths         compozyconfig.HomePaths
+	config            compozyconfig.Config
+	resolvedWorkspace workspace.ResolvedWorkspace
+	daemonInstance    *Daemon
+	runtime           *loopGoalRuntime
+	goalStore         loopGoalProductionStore
+	manager           *session.Manager
+	run               looppkg.Run
+	key               goalpkg.TurnKey
+	binding           looppkg.ActionSessionBinding
+	taskRunID         string
+	workspaceRoot     string
+	agentName         string
+}
+
+type loopGoalManagedRuntimeFixtureConfig struct {
+	providerCommand string
+	bindInitial     bool
+	decorate        func(*session.Manager) SessionManager
+	agentTools      []string
+}
+
+type loopGoalManagedRuntimeFixtureOption func(*loopGoalManagedRuntimeFixtureConfig)
+
+func withGoalRuntimeProviderCommand(command string) loopGoalManagedRuntimeFixtureOption {
+	return func(config *loopGoalManagedRuntimeFixtureConfig) { config.providerCommand = command }
+}
+
+func withoutInitialGoalBinding() loopGoalManagedRuntimeFixtureOption {
+	return func(config *loopGoalManagedRuntimeFixtureConfig) { config.bindInitial = false }
+}
+
+func withGoalRuntimeAgentTools(tools ...string) loopGoalManagedRuntimeFixtureOption {
+	return func(config *loopGoalManagedRuntimeFixtureConfig) { config.agentTools = slices.Clone(tools) }
+}
+
+func withGoalRuntimeSessionManager(
+	decorate func(*session.Manager) SessionManager,
+) loopGoalManagedRuntimeFixtureOption {
+	return func(config *loopGoalManagedRuntimeFixtureConfig) { config.decorate = decorate }
+}
+
+type delayedEnsureCreatedManager struct {
+	*session.Manager
+	materialized chan struct{}
+	release      <-chan struct{}
+}
+
+// revokedSpeedSessionManager injects provider observations at the session I/O boundary.
+type revokedSpeedSessionManager struct {
+	*session.Manager
+}
+
+func (m *revokedSpeedSessionManager) Status(ctx context.Context, id string) (*session.Info, error) {
+	info, err := m.Manager.Status(ctx, id)
+	if err != nil {
+		return nil, err
+	}
+	info.Speed = speedpkg.SpeedFast
+	info.SpeedResolution = &speedpkg.Resolution{
+		Requested: speedpkg.SpeedFast, Status: speedpkg.ResolutionRejected, Reason: speedpkg.ReasonProviderRejected,
+	}
+	info.ACPCapsKnown = true
+	info.ACPCaps.ConfigOptions = []acp.SessionConfigOption{{
+		ID: "fast", Category: "model_config", Kind: acp.SessionConfigOptionKindBoolean, CurrentBool: new(false),
+	}}
+	return info, nil
+}
+
+type failFirstEnsureCreatedManager struct {
+	*session.Manager
+	beforeFailure func(context.Context) error
+	failed        atomic.Bool
+}
+
+func (m *failFirstEnsureCreatedManager) EnsureCreated(
+	ctx context.Context,
+	optsInput *session.CreateOpts,
+) (session.EnsureCreatedResult, error) {
+	opts := *optsInput
+
+	if m.failed.CompareAndSwap(false, true) {
+		if m.beforeFailure != nil {
+			if err := m.beforeFailure(ctx); err != nil {
+				return session.EnsureCreatedResult{}, err
+			}
+		}
+		return session.EnsureCreatedResult{}, &session.CreationError{
+			Effect: session.EffectKnownFalse,
+			Code:   session.SessionCreationCodeStoreUnavailable,
+			Err:    errors.New("injected known-false creation failure"),
+		}
+	}
+	return m.Manager.EnsureCreated(ctx, &(opts))
+}
+
+func (m *delayedEnsureCreatedManager) EnsureCreated(
+	ctx context.Context,
+	optsInput *session.CreateOpts,
+) (session.EnsureCreatedResult, error) {
+	opts := *optsInput
+
+	result, err := m.Manager.EnsureCreated(ctx, &(opts))
+	close(m.materialized)
+	select {
+	case <-m.release:
+		return result, err
+	case <-ctx.Done():
+		return session.EnsureCreatedResult{}, ctx.Err()
+	}
+}
+
+func newLoopGoalManagedRuntimeFixture(
+	t *testing.T,
+	suffix string,
+	driver session.AgentDriver,
+	options ...loopGoalManagedRuntimeFixtureOption,
+) loopGoalManagedRuntimeFixture {
+	t.Helper()
+	config := loopGoalManagedRuntimeFixtureConfig{bindInitial: true}
+	for _, option := range options {
+		option(&config)
+	}
+	homePaths := integrationHomePaths(t)
+	cfg := testConfig(t, homePaths)
+	workspaceRoot := homePaths.HomeDir + "/workspace"
+	resolvedWorkspace := newHarnessIntegrationWorkspace(t, homePaths, cfg, workspaceRoot)
+	resolvedWorkspace.Agents[0].Tools = slices.Clone(config.agentTools)
+	if config.providerCommand != "" {
+		cfg.Roles.AutoTitle.Enabled = false
+		cfg.Providers[acpmock.ProviderName] = acpmock.ProviderConfig(config.providerCommand)
+		cfg.Providers["acpmock-replacement"] = acpmock.ProviderConfig(config.providerCommand)
+		resolvedWorkspace.Config = cfg
+		resolvedWorkspace.Agents[0].Provider = acpmock.ProviderName
+		resolvedWorkspace.Agents[0].Model = ""
+	}
+	daemonInstance, deps := bootHarnessPolicyDaemon(t, homePaths, &cfg)
+	t.Cleanup(func() {
+		if err := daemonInstance.Shutdown(testutil.Context(t)); err != nil {
+			t.Errorf("Daemon.Shutdown() error = %v", err)
+		}
+	})
+
+	goalStore, ok := daemonInstance.registry.(loopGoalProductionStore)
+	if !ok {
+		t.Fatalf("registry = %T, want loopGoalProductionStore", daemonInstance.registry)
+	}
+	tasks, ok := daemonInstance.registry.(taskStore)
+	if !ok {
+		t.Fatalf("registry = %T, want taskStore", daemonInstance.registry)
+	}
+	queueStore, ok := daemonInstance.registry.(store.SessionInputQueueStore)
+	if !ok {
+		t.Fatalf("registry = %T, want SessionInputQueueStore", daemonInstance.registry)
+	}
+	now := time.Now().UTC()
+	if err := daemonInstance.registry.InsertWorkspace(testutil.Context(t), workspace.Workspace{
+		ID: resolvedWorkspace.ID, Name: resolvedWorkspace.Name, RootDir: resolvedWorkspace.RootDir,
+		CreatedAt: now, UpdatedAt: now,
+	}); err != nil {
+		t.Fatalf("InsertWorkspace() error = %v", err)
+	}
+
+	if driver == nil {
+		if config.providerCommand != "" {
+			driver = session.NewACPDriverAdapter(acp.New(acp.WithProviderPreStarter(daemonInstance.providerPreStarter)))
+		} else {
+			driver = newHarnessIntegrationDriver()
+		}
+	}
+	manager := newHarnessIntegrationManager(
+		t,
+		homePaths,
+		deps,
+		resolvedWorkspace,
+		driver,
+		session.WithHostedMCPLauncher(deps.HostedMCP),
+		session.WithSessionCatalog(daemonInstance.registry),
+		session.WithSessionCreationStore(goalStore),
+		session.WithSessionInputQueueStore(queueStore),
+	)
+	t.Cleanup(func() {
+		if err := manager.Shutdown(testutil.Context(t)); err != nil {
+			t.Errorf("Manager.Shutdown() error = %v", err)
+		}
+	})
+
+	run := looppkg.Run{
+		ID:          looppkg.RunID("looprun-goal-managed-" + suffix),
+		WorkspaceID: looppkg.WorkspaceID(resolvedWorkspace.ID),
+		LoopName:    "goal-managed", Status: looppkg.StatusRunning,
+		ReattemptStrategy: looppkg.ReattemptFailedOnly, CreatedAt: now, StartedAt: now,
+		LastProgressAt: now, Inputs: map[string]any{},
+	}
+	if config.providerCommand != "" {
+		applyResolvedLoopRunPinningForTest(
+			t,
+			&run,
+			now,
+			compileManagedGoalDefinition(t, run.LoopName, resolvedWorkspace.Agents[0].Name, suffix),
+		)
+		run.IterationCap = 3
+		run.BudgetOnExceeded = loopdsl.BudgetExceededHalt
+	} else {
+		applyLoopRunPinningForTest(t, &run, now)
+	}
+	run.BudgetTokens = 100
+	run.BudgetWallSec = 60
+	if _, err := goalStore.CreateLoopRunForStart(
+		testutil.Context(t), run, loopdsl.ConcurrencyAllow,
+	); err != nil {
+		t.Fatalf("CreateLoopRunForStart() error = %v", err)
+	}
+
+	// The fixture starts at a live Goal cell after the coordinator advanced generation 1.
+	// Run creation reserves that generation with a zero cursor; seed its active cursor here.
+	connection, ok := daemonInstance.registry.(interface{ DB() *sql.DB })
+	if !ok {
+		t.Fatalf("registry = %T, want SQL fixture connection", daemonInstance.registry)
+	}
+	if _, err := connection.DB().ExecContext(testutil.Context(t),
+		"UPDATE loop_runs SET generation = 1 WHERE id = ?", string(run.ID)); err != nil {
+		t.Fatalf("seed active Goal generation: %v", err)
+	}
+
+	actor := taskpkg.ActorIdentity{Kind: taskpkg.ActorKindDaemon, Ref: "goal-managed-test"}
+	origin := taskpkg.Origin{Kind: taskpkg.OriginKindDaemon, Ref: "goal-managed-test"}
+	taskRecord := taskpkg.Task{
+		ID: "task-goal-managed-" + suffix, ProfileID: store.DefaultProfileID, Scope: taskpkg.ScopeWorkspace,
+		WorkspaceID: resolvedWorkspace.ID, Title: "Run managed Goal prompt",
+		Status: taskpkg.TaskStatusInProgress, Priority: taskpkg.PriorityHigh,
+		CreatedBy: actor, Origin: origin, CreatedAt: now, UpdatedAt: now,
+	}
+	if err := tasks.CreateTask(testutil.Context(t), taskRecord); err != nil {
+		t.Fatalf("CreateTask() error = %v", err)
+	}
+	taskRunID := "taskrun-goal-managed-" + suffix
+	seedDaemonTaskRunLifecycle(t, tasks, taskpkg.Run{
+		ID: taskRunID, TaskID: taskRecord.ID, Attempt: 1, RunKind: taskpkg.RunKindWorker,
+		LoopRunID: string(run.ID), Status: taskpkg.TaskRunStatusRunning,
+		ClaimedBy: &actor, Origin: origin,
+		Metadata: json.RawMessage(
+			`{"generation":1,"node_id":"converge","item_index":0,"attempt":1,"epoch":0,"goal_segment_epoch":1}`,
+		),
+		QueuedAt: now, ClaimedAt: now, StartedAt: now,
+	})
+
+	key := goalpkg.TurnKey{
+		WorkspaceID: run.WorkspaceID, LoopRunID: run.ID, Generation: 1,
+		NodeID: "converge", ItemIndex: 0,
+	}
+	if _, err := goalStore.CreateCheckpoint(testutil.Context(t), goalpkg.CreateCheckpointRequest{
+		Checkpoint: goalpkg.Checkpoint{
+			Key: key, ControlEpoch: 1, Phase: "idle", Status: "active", TurnLimit: 3,
+			TaskRunID: taskRunID, ContextState: loopManagedContextStateUnknown,
+			ContextNudgeRatio: 0.8, UpdatedAt: now,
+		},
+	}); err != nil {
+		t.Fatalf("CreateCheckpoint() error = %v", err)
+	}
+
+	policyGate := &loopSessionPolicyGate{
+		workspaceResolver: &harnessIntegrationWorkspaceResolver{resolved: resolvedWorkspace},
+	}
+	runtimeSessions := SessionManager(manager)
+	if config.decorate != nil {
+		runtimeSessions = config.decorate(manager)
+	}
+	runtime := newLoopGoalProductionRuntime(
+		goalStore,
+		runtimeSessions,
+		policyGate,
+		time.Now,
+		discardLogger(),
+		nil,
+	)
+	fixture := loopGoalManagedRuntimeFixture{
+		homePaths: homePaths, config: cfg, resolvedWorkspace: resolvedWorkspace, daemonInstance: daemonInstance,
+		runtime: runtime, goalStore: goalStore, manager: manager,
+		run: run, key: key, taskRunID: taskRunID,
+		workspaceRoot: resolvedWorkspace.RootDir, agentName: resolvedWorkspace.Agents[0].Name,
+	}
+	if config.bindInitial {
+		request := fixture.bindingRequest(suffix)
+		if config.providerCommand != "" {
+			var err error
+			request.Handle, err = loopdsl.DeriveGoalHandle("converge", suffix, 0)
+			if err != nil {
+				t.Fatal(err)
+			}
+		}
+		binding, err := runtime.BindActionSession(testutil.Context(t), request)
+		if err != nil {
+			t.Fatalf("BindActionSession() error = %v", err)
+		}
+		fixture.binding = binding
+	}
+	return fixture
+}
+
+func (f *loopGoalManagedRuntimeFixture) bindingRequest(suffix string) looppkg.ActionSessionBindRequest {
+	return looppkg.ActionSessionBindRequest{
+		WorkspaceID: f.run.WorkspaceID, ProfileID: store.DefaultProfileID, LoopRunID: f.run.ID, Generation: 1,
+		NodeID: "converge", ItemIndex: 0, Agent: f.agentName,
+		Environment: &loopdsl.EnvironmentSpec{Mode: loopdsl.EnvironmentRoot},
+		Handle:      "goal:managed:" + suffix, Mode: "continuous",
+		TargetBindingEpoch: 1, ExpectedControlEpoch: 1,
+		ExpectedCheckpointPhase: "idle", ExpectedTaskRunID: f.taskRunID,
+		BindingAttemptID: "binding-attempt-goal-managed-" + suffix,
+		DesiredSessionID: "sess-goal-managed-" + suffix,
+		MaxTurns:         3,
+	}
+}
+
+func (f *loopGoalManagedRuntimeFixture) createOriginSession(
+	t *testing.T,
+	suffix string,
+) (string, store.SessionCreationIdentity) {
+	t.Helper()
+	ctx := testutil.Context(t)
+	request := f.bindingRequest("origin-" + suffix)
+
+	profile, opts, materialized, err := f.runtime.resolveEffectiveCreationProfile(ctx, request, "")
+	if err != nil {
+		t.Fatalf("resolveEffectiveCreationProfile(origin) error = %v", err)
+	}
+	if materialized != nil {
+		t.Fatalf("resolveEffectiveCreationProfile(origin) materialized worktree = %#v, want nil", materialized)
+	}
+	sessionID := "sess-goal-origin-" + suffix
+	opts.DesiredSessionID = sessionID
+
+	identity, err := bindingCreationIdentity(profile, &(opts), sessionID)
+	if err != nil {
+		t.Fatalf("bindingCreationIdentity(origin) error = %v", err)
+	}
+	opts.CreationProfile = cloneStoreCreationProfile(profile)
+	opts.CreationIdentity = cloneStoreCreationIdentity(identity)
+	if _, err := f.manager.EnsureCreated(ctx, &(opts)); err != nil {
+		t.Fatalf("EnsureCreated(origin) error = %v", err)
+	}
+	return sessionID, identity
+}
+
+func assertSessionProvenanceParent(
+	t *testing.T,
+	manager *session.Manager,
+	sessionID string,
+	wantParentID string,
+) {
+	t.Helper()
+	info, err := manager.Status(testutil.Context(t), sessionID)
+	if err != nil {
+		t.Fatalf("Status(%q) error = %v", sessionID, err)
+	}
+	if info.Lineage == nil || info.Lineage.ParentSessionID != wantParentID {
+		t.Fatalf("Status(%q).Lineage = %#v, want parent %q", sessionID, info.Lineage, wantParentID)
+	}
+	if wantParentID == "" && (info.Lineage.RootSessionID != sessionID || info.Lineage.SpawnDepth != 0) {
+		t.Fatalf("Status(%q).Lineage = %#v, want self-rooted lineage", sessionID, info.Lineage)
+	}
+}
+
+func (f *loopGoalManagedRuntimeFixture) preparePrompt(
+	t *testing.T,
+	promptID string,
+	reporter looppkg.ActionUsageReporter,
+) (looppkg.ActionPromptTicket, error) {
+	t.Helper()
+	return f.runtime.PrepareActionPrompt(testutil.Context(t), f.binding, looppkg.ActionPromptRequest{
+		PromptID: promptID, Message: "Advance the managed Goal", Kind: "work",
+		Owner: looppkg.ActionPromptOwner{
+			LoopRunID: f.run.ID, TaskRunID: f.taskRunID, Generation: 1,
+			NodeID: "converge", ItemIndex: 0, Turn: 1,
+			ControlEpoch: 1, BindingEpoch: f.binding.BindingEpoch,
+		},
+		UsageReporter: reporter,
+	})
+}
+
+// failingGoalBindingAdoption injects one pre-commit store failure without changing binding ownership.
+type failingGoalBindingAdoption struct {
+	goalpkg.ExecutorStore
+	err     error
+	request goalpkg.BindCheckpointRequest
+}
+
+func (s *failingGoalBindingAdoption) BindCheckpoint(
+	ctx context.Context,
+	req goalpkg.BindCheckpointRequest,
+) (goalpkg.Checkpoint, error) {
+	if s.err != nil {
+		err := s.err
+		s.err = nil
+		s.request = req
+		return goalpkg.Checkpoint{}, err
+	}
+	return s.ExecutorStore.BindCheckpoint(ctx, req)
+}

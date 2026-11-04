@@ -1,0 +1,333 @@
+import { queryOptions } from "@tanstack/react-query";
+
+import {
+  getSettingsAttention,
+  getSettingsCmdPalette,
+  getSettingsAutomation,
+  getSettingsGeneral,
+  getSettingsHooksExtensions,
+  getSettingsMarketplace,
+  getSettingsObservability,
+  getSettingsPersona,
+  getSettingsProvider,
+  getSettingsProviderUsage,
+  getSettingsRestartStatus,
+  getSettingsRoles,
+  getSettingsShell,
+  getSettingsSkills,
+  getSettingsUpdate,
+  getRolesStatus,
+  listSettingsApplyRecords,
+  listSettingsHooks,
+  listSettingsMCPServers,
+  getSettingsMCPServer,
+  listSettingsProviders,
+} from "../adapters/settings-api";
+import { settingsKeys } from "./query-keys";
+import { isTerminalRestartStatus } from "./restart-status";
+import type {
+  SettingsApplyRecordsFilter,
+  SettingsAttentionFilter,
+  SettingsMCPServerListFilter,
+  SettingsMCPServerGetFilter,
+  SettingsCmdPaletteFilter,
+  SettingsHookListFilter,
+  SettingsPersonaFilter,
+  SettingsSkillsFilter,
+} from "../types";
+
+const SECTION_STALE_TIME = 15_000;
+const SECTION_REFETCH_INTERVAL = 60_000;
+const COLLECTION_STALE_TIME = 15_000;
+const COLLECTION_REFETCH_INTERVAL = 45_000;
+const MCP_AUTH_STATUS_POLL_INTERVAL = 1_000;
+const APPLY_RECORDS_STALE_TIME = 5_000;
+const APPLY_RECORDS_REFETCH_INTERVAL = 30_000;
+const RESTART_POLL_INTERVAL = 2_000;
+/**
+ * Cadence while an Update Operation is live. Apply is asynchronous and truthful:
+ * the endpoint only acknowledges acquisition, so terminal truth (staged phases,
+ * rollback, failure) arrives exclusively through this read.
+ */
+const UPDATE_OPERATION_POLL_INTERVAL = 2_000;
+const SETTINGS_QUERY_RETRY_LIMIT = 2;
+
+export function shouldRetrySettingsQuery(failureCount: number, error: Error): boolean {
+  if (getErrorStatus(error) === 403) {
+    return false;
+  }
+
+  return failureCount < SETTINGS_QUERY_RETRY_LIMIT;
+}
+
+export function settingsGeneralOptions() {
+  return queryOptions({
+    queryKey: settingsKeys.section("general"),
+    queryFn: ({ signal }) => getSettingsGeneral(signal),
+    staleTime: SECTION_STALE_TIME,
+    refetchInterval: SECTION_REFETCH_INTERVAL,
+    retry: shouldRetrySettingsQuery,
+  });
+}
+
+export function settingsPersonaOptions(filter: SettingsPersonaFilter) {
+  return queryOptions({
+    queryKey: settingsKeys.personaSection(filter),
+    queryFn: ({ signal }) => getSettingsPersona(filter, signal),
+    staleTime: SECTION_STALE_TIME,
+    refetchInterval: SECTION_REFETCH_INTERVAL,
+    retry: shouldRetrySettingsQuery,
+  });
+}
+
+export function settingsPersonaFilterForProfile(profile: string): SettingsPersonaFilter {
+  return profile === "default" ? { scope: "user" } : { scope: "profile", profile };
+}
+
+export function settingsAttentionFilterForProfile(profile: string): SettingsAttentionFilter {
+  return profile === "default" ? { scope: "user" } : { scope: "profile", profile };
+}
+
+export function settingsUpdateOptions() {
+  return queryOptions({
+    queryKey: settingsKeys.updateStatus(),
+    queryFn: ({ signal }) => getSettingsUpdate(signal),
+    staleTime: SECTION_STALE_TIME,
+    // At rest this is a section read; a live operation makes it the progress
+    // feed, so it tightens to 2s until the operation clears.
+    refetchInterval: query =>
+      query.state.data?.operation ? UPDATE_OPERATION_POLL_INTERVAL : SECTION_REFETCH_INTERVAL,
+    retry: shouldRetrySettingsQuery,
+  });
+}
+
+export function settingsRolesStatusOptions() {
+  return queryOptions({
+    queryKey: settingsKeys.rolesStatus(),
+    queryFn: ({ signal }) => getRolesStatus(signal),
+    staleTime: SECTION_STALE_TIME,
+    refetchInterval: SECTION_REFETCH_INTERVAL,
+    retry: shouldRetrySettingsQuery,
+  });
+}
+
+export function settingsRolesOptions() {
+  return queryOptions({
+    queryKey: settingsKeys.section("roles"),
+    queryFn: ({ signal }) => getSettingsRoles(signal),
+    staleTime: SECTION_STALE_TIME,
+    refetchInterval: SECTION_REFETCH_INTERVAL,
+    retry: shouldRetrySettingsQuery,
+  });
+}
+
+export function settingsSkillsOptions(filter: SettingsSkillsFilter = {}) {
+  return queryOptions({
+    queryKey: settingsKeys.skillsSection(filter),
+    queryFn: ({ signal }) => getSettingsSkills(filter, signal),
+    staleTime: SECTION_STALE_TIME,
+    refetchInterval: SECTION_REFETCH_INTERVAL,
+    retry: shouldRetrySettingsQuery,
+  });
+}
+
+export function settingsAutomationOptions() {
+  return queryOptions({
+    queryKey: settingsKeys.section("automation"),
+    queryFn: ({ signal }) => getSettingsAutomation(signal),
+    staleTime: SECTION_STALE_TIME,
+    refetchInterval: SECTION_REFETCH_INTERVAL,
+    retry: shouldRetrySettingsQuery,
+  });
+}
+
+export function settingsProviderUsageOptions() {
+  return queryOptions({
+    queryKey: settingsKeys.section("provider-usage"),
+    queryFn: ({ signal }) => getSettingsProviderUsage(signal),
+    staleTime: SECTION_STALE_TIME,
+    refetchInterval: SECTION_REFETCH_INTERVAL,
+    retry: shouldRetrySettingsQuery,
+  });
+}
+
+export function settingsMarketplaceOptions() {
+  return queryOptions({
+    queryKey: settingsKeys.section("marketplace"),
+    queryFn: ({ signal }) => getSettingsMarketplace(signal),
+    staleTime: SECTION_STALE_TIME,
+    refetchInterval: SECTION_REFETCH_INTERVAL,
+    retry: shouldRetrySettingsQuery,
+  });
+}
+
+export function settingsCmdPaletteOptions(filter: SettingsCmdPaletteFilter = {}) {
+  return queryOptions({
+    queryKey: settingsKeys.cmdPaletteSection(filter),
+    queryFn: ({ signal }) => getSettingsCmdPalette(filter, signal),
+    staleTime: SECTION_STALE_TIME,
+    refetchInterval: SECTION_REFETCH_INTERVAL,
+    retry: shouldRetrySettingsQuery,
+  });
+}
+
+export function settingsAttentionOptions(filter: SettingsAttentionFilter) {
+  return queryOptions({
+    queryKey: settingsKeys.attentionSection(filter),
+    queryFn: ({ signal }) => getSettingsAttention(filter, signal),
+    staleTime: SECTION_STALE_TIME,
+    refetchInterval: SECTION_REFETCH_INTERVAL,
+    retry: shouldRetrySettingsQuery,
+  });
+}
+
+export function settingsShellOptions() {
+  return queryOptions({
+    queryKey: settingsKeys.section("shell"),
+    queryFn: ({ signal }) => getSettingsShell(signal),
+    // The shell section paints every client's Appearance fonts and is served by
+    // the local daemon, so a browser "offline" flag must not pause its reads.
+    // "always" turns reconnect refetches off by default; keep them so a read
+    // that failed while disconnected is retried when the connection returns.
+    networkMode: "always",
+    refetchOnReconnect: true,
+    staleTime: SECTION_STALE_TIME,
+    refetchInterval: SECTION_REFETCH_INTERVAL,
+    retry: shouldRetrySettingsQuery,
+  });
+}
+
+export function settingsObservabilityOptions() {
+  return queryOptions({
+    queryKey: settingsKeys.section("observability"),
+    queryFn: ({ signal }) => getSettingsObservability(signal),
+    staleTime: SECTION_STALE_TIME,
+    refetchInterval: SECTION_REFETCH_INTERVAL,
+    retry: shouldRetrySettingsQuery,
+  });
+}
+
+export function settingsHooksExtensionsOptions() {
+  return queryOptions({
+    queryKey: settingsKeys.section("hooks-extensions"),
+    queryFn: ({ signal }) => getSettingsHooksExtensions(signal),
+    staleTime: SECTION_STALE_TIME,
+    refetchInterval: SECTION_REFETCH_INTERVAL,
+    retry: shouldRetrySettingsQuery,
+  });
+}
+
+export function settingsProvidersListOptions(enabled = true) {
+  return queryOptions({
+    queryKey: settingsKeys.providersList(),
+    queryFn: ({ signal }) => listSettingsProviders(signal),
+    enabled,
+    staleTime: COLLECTION_STALE_TIME,
+    refetchInterval: COLLECTION_REFETCH_INTERVAL,
+    retry: shouldRetrySettingsQuery,
+  });
+}
+
+export function settingsProviderDetailOptions(name: string, enabled = true) {
+  return queryOptions({
+    queryKey: settingsKeys.providerDetail(name),
+    queryFn: ({ signal }) => getSettingsProvider(name, signal),
+    staleTime: COLLECTION_STALE_TIME,
+    refetchInterval: COLLECTION_REFETCH_INTERVAL,
+    enabled: Boolean(name) && enabled,
+    retry: shouldRetrySettingsQuery,
+  });
+}
+
+export function settingsHooksListOptions(filter: SettingsHookListFilter = {}) {
+  return queryOptions({
+    queryKey: settingsKeys.hooksList(filter),
+    queryFn: ({ signal }) => listSettingsHooks(filter, signal),
+    staleTime: COLLECTION_STALE_TIME,
+    refetchInterval: COLLECTION_REFETCH_INTERVAL,
+    retry: shouldRetrySettingsQuery,
+  });
+}
+
+export function settingsMCPServerDetailOptions(
+  name: string,
+  filter: SettingsMCPServerGetFilter = {},
+  enabled = true,
+  refetchInterval = COLLECTION_REFETCH_INTERVAL
+) {
+  const normalizedName = name.trim();
+  return queryOptions({
+    queryKey: settingsKeys.mcpDetail(normalizedName, filter),
+    queryFn: ({ signal }) => getSettingsMCPServer(normalizedName, filter, signal),
+    staleTime: COLLECTION_STALE_TIME,
+    refetchInterval,
+    enabled: enabled && normalizedName !== "",
+    retry: shouldRetrySettingsQuery,
+  });
+}
+
+export function settingsMCPServersListOptions(
+  filter: SettingsMCPServerListFilter = {},
+  enabled = true,
+  refetchInterval = COLLECTION_REFETCH_INTERVAL
+) {
+  return queryOptions({
+    queryKey: settingsKeys.mcpList(filter),
+    queryFn: ({ signal }) => listSettingsMCPServers(filter, signal),
+    staleTime: COLLECTION_STALE_TIME,
+    refetchInterval,
+    enabled,
+    retry: shouldRetrySettingsQuery,
+  });
+}
+
+export function settingsRestartStatusOptions(operationId: string | null, enabled = true) {
+  const active = Boolean(operationId) && enabled;
+
+  return queryOptions({
+    queryKey: settingsKeys.restartStatus(operationId ?? ""),
+    queryFn: ({ signal }) => getSettingsRestartStatus(operationId ?? "", signal),
+    enabled: active,
+    staleTime: 0,
+    refetchInterval: query =>
+      isTerminalRestartStatus(query.state.data?.status) || isTerminalRestartError(query.state.error)
+        ? false
+        : RESTART_POLL_INTERVAL,
+    refetchIntervalInBackground: true,
+    retry: (failureCount, error) =>
+      getErrorStatus(error) === 404 ? false : shouldRetrySettingsQuery(failureCount, error),
+  });
+}
+
+function isTerminalRestartError(error: Error | null): boolean {
+  const status = getErrorStatus(error);
+  return status === 403 || status === 404;
+}
+
+function getErrorStatus(error: unknown): number | null {
+  if (typeof error !== "object" || error === null) return null;
+  const status = Reflect.get(error, "status");
+  return typeof status === "number" ? status : null;
+}
+
+export function settingsApplyRecordsOptions(filter: SettingsApplyRecordsFilter = {}) {
+  return queryOptions({
+    queryKey: settingsKeys.applyRecords(filter),
+    queryFn: ({ signal }) => listSettingsApplyRecords(filter, signal),
+    staleTime: APPLY_RECORDS_STALE_TIME,
+    refetchInterval: APPLY_RECORDS_REFETCH_INTERVAL,
+    retry: shouldRetrySettingsQuery,
+  });
+}
+
+export const SETTINGS_QUERY_INTERVALS = {
+  sectionStaleTime: SECTION_STALE_TIME,
+  sectionRefetchInterval: SECTION_REFETCH_INTERVAL,
+  collectionStaleTime: COLLECTION_STALE_TIME,
+  collectionRefetchInterval: COLLECTION_REFETCH_INTERVAL,
+  mcpAuthStatusPollInterval: MCP_AUTH_STATUS_POLL_INTERVAL,
+  applyRecordsStaleTime: APPLY_RECORDS_STALE_TIME,
+  applyRecordsRefetchInterval: APPLY_RECORDS_REFETCH_INTERVAL,
+  restartPollInterval: RESTART_POLL_INTERVAL,
+  updateOperationPollInterval: UPDATE_OPERATION_POLL_INTERVAL,
+} as const;

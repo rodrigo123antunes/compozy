@@ -1,0 +1,383 @@
+import type { Meta, StoryObj } from "@storybook/react-vite";
+import { delay, HttpResponse } from "msw";
+import { compozyApiMock } from "@/storybook/openapi-msw";
+
+import { storybookMswParameters } from "@/storybook/msw";
+import {
+  StorybookGeneralDraftDirtySetup,
+  StorybookGeneralSavingSetup,
+  StorybookRestartPhaseSetup,
+  StorybookSettingsUpdateRefreshErrorSetup,
+} from "@/storybook/settings-state-helpers";
+import {
+  StorybookRestartNoticeSetup,
+  StorybookRouteCanvas,
+  StorybookWorkspaceSetup,
+  appRouteParameters,
+} from "@/storybook/route-story-meta";
+import {
+  settingsAppliedMutationFixture,
+  settingsGeneralSectionFixture,
+  settingsRestartStatusFixture,
+  settingsUpdateAppAvailableFixture,
+  settingsUpdateApplyingFixture,
+  settingsUpdateBlockedFixture,
+  settingsUpdateBothAvailableFixture,
+  settingsUpdateManagedFixture,
+  settingsUpdateNoAppFixture,
+  settingsUpdateRolledBackFixture,
+  settingsUpdateRuntimeAvailableFixture,
+  settingsUpdateStatusFixture,
+  settingsUpdateStagedFixture,
+} from "@/systems/settings/mocks";
+import type { SettingsUpdateStatus } from "@/systems/settings";
+import { toolApprovalGrantsResponseFixture } from "@/systems/tool-approvals/mocks";
+
+const meta: Meta<typeof StorybookRouteCanvas> = {
+  title: "systems/settings/routes/SettingsGeneral",
+  component: StorybookRouteCanvas,
+  parameters: {
+    layout: "fullscreen",
+    docs: {
+      description: {
+        component:
+          "General settings route stories rendered through the real app shell, including loading, error, dirty, saving, and all restart notice tones.",
+      },
+    },
+  },
+};
+
+export default meta;
+type Story = StoryObj<typeof meta>;
+
+/**
+ * Default general settings page with runtime status and machine settings.
+ * Represents the idle shell state for the route story.
+ */
+export const Default: Story = {
+  args: {},
+  parameters: appRouteParameters("/settings/general"),
+  render: () => <StorybookWorkspaceSetup />,
+};
+
+/**
+ * The retired Defaults route: old links and persisted windows land on General,
+ * whose first group now holds the session defaults.
+ */
+export const RetiredDefaultsRedirect: Story = {
+  args: {},
+  parameters: appRouteParameters("/settings/defaults"),
+  render: () => <StorybookWorkspaceSetup />,
+};
+
+/**
+ * Runtime memory reporting disabled -- the daemon interval is 0s, so the general
+ * page renders the disabled sampling value for the field.
+ */
+export const MemoryReportingDisabled: Story = {
+  args: {},
+  parameters: {
+    ...appRouteParameters("/settings/general"),
+    ...storybookMswParameters({
+      settings: [
+        compozyApiMock.get("/api/settings/general", () =>
+          HttpResponse.json({
+            ...settingsGeneralSectionFixture,
+            config: {
+              ...settingsGeneralSectionFixture.config,
+              daemon: {
+                ...settingsGeneralSectionFixture.config.daemon,
+                memory_report_interval: "0s",
+              },
+            },
+          })
+        ),
+      ],
+    }),
+  },
+  render: () => <StorybookWorkspaceSetup />,
+};
+
+/**
+ * Initial loading state while the section envelope is still resolving.
+ */
+export const Loading: Story = {
+  args: {},
+  parameters: {
+    ...appRouteParameters("/settings/general"),
+    ...storybookMswParameters({
+      settings: [
+        compozyApiMock.get("/api/settings/general", async () => {
+          await delay("infinite");
+          return HttpResponse.json(settingsGeneralSectionFixture);
+        }),
+      ],
+    }),
+  },
+  render: () => <StorybookWorkspaceSetup />,
+};
+
+/**
+ * Error branch shown when the general settings request fails.
+ */
+export const Error: Story = {
+  args: {},
+  parameters: {
+    ...appRouteParameters("/settings/general"),
+    ...storybookMswParameters({
+      settings: [
+        compozyApiMock.get("/api/settings/general", () =>
+          HttpResponse.json({ error: "Failed to load general settings" }, { status: 500 })
+        ),
+      ],
+    }),
+  },
+  render: () => <StorybookWorkspaceSetup />,
+};
+
+/**
+ * Dirty shell state -- the memory-report interval has been edited so the save-bar
+ * reads Unsaved changes + the Save button enables.
+ */
+export const Dirty: Story = {
+  args: {},
+  parameters: appRouteParameters("/settings/general"),
+  render: () => (
+    <>
+      <StorybookWorkspaceSetup />
+      <StorybookGeneralDraftDirtySetup />
+    </>
+  ),
+};
+
+/**
+ * Saving shell state -- the PATCH endpoint hangs so the Save button shows the
+ * spinner + Saving... label for the story.
+ */
+export const Saving: Story = {
+  args: {},
+  parameters: {
+    ...appRouteParameters("/settings/general"),
+    ...storybookMswParameters({
+      settings: [
+        compozyApiMock.patch("/api/settings/general", async () => {
+          await delay("infinite");
+          return HttpResponse.json(settingsAppliedMutationFixture);
+        }),
+      ],
+    }),
+  },
+  render: () => (
+    <>
+      <StorybookWorkspaceSetup />
+      <StorybookGeneralSavingSetup />
+    </>
+  ),
+};
+
+/**
+ * Restart-warning notice -- mutation recorded as restart-required.
+ */
+export const RestartWarning: Story = {
+  args: {},
+  parameters: appRouteParameters("/settings/general"),
+  render: () => (
+    <>
+      <StorybookWorkspaceSetup />
+      <StorybookRestartNoticeSetup section="general" />
+    </>
+  ),
+};
+
+/**
+ * Restart-polling notice -- operation started, status still pending, spinner
+ * visible in the notice.
+ */
+export const RestartPolling: Story = {
+  args: {},
+  parameters: {
+    ...appRouteParameters("/settings/general"),
+    ...storybookMswParameters({
+      settings: [
+        compozyApiMock.get("/api/settings/actions/restart/{operation_id}", async () => {
+          await delay("infinite");
+          return HttpResponse.json({
+            ...settingsRestartStatusFixture,
+            operation_id: "op_polling",
+            status: "pending",
+            active_session_count: 2,
+          });
+        }),
+      ],
+    }),
+  },
+  render: () => (
+    <>
+      <StorybookWorkspaceSetup />
+      <StorybookRestartPhaseSetup
+        section="general"
+        overrides={{
+          mutationRestartRequired: true,
+          operationId: "op_polling",
+          status: "pending",
+          activeSessionCount: 2,
+        }}
+      />
+    </>
+  ),
+};
+
+/**
+ * Apply-history state -- config apply records include applied, blocked, and
+ * failed rows with next-action and diagnostics surfaced in the general route.
+ */
+export const ApplyHistory: Story = {
+  args: {},
+  parameters: appRouteParameters("/settings/general"),
+  render: () => <StorybookWorkspaceSetup />,
+};
+
+/**
+ * Restart-success notice -- operation completed, Dismiss button visible.
+ */
+export const RestartSuccess: Story = {
+  args: {},
+  parameters: appRouteParameters("/settings/general"),
+  render: () => (
+    <>
+      <StorybookWorkspaceSetup />
+      <StorybookRestartPhaseSetup
+        section="general"
+        overrides={{
+          mutationRestartRequired: true,
+          operationId: "op_success",
+          status: "ready",
+        }}
+      />
+    </>
+  ),
+};
+
+/**
+ * Restart-failure notice -- operation failed with a reason suffix + Dismiss.
+ */
+export const RestartFailure: Story = {
+  args: {},
+  parameters: appRouteParameters("/settings/general"),
+  render: () => (
+    <>
+      <StorybookWorkspaceSetup />
+      <StorybookRestartPhaseSetup
+        section="general"
+        overrides={{
+          mutationRestartRequired: true,
+          operationId: "op_failure",
+          status: "failed",
+          failureReason: "helper exited non-zero",
+        }}
+      />
+    </>
+  ),
+};
+
+/**
+ * Remembered decisions in context: the Permissions area shows the active workspace's
+ * remembered native-tool approval decisions (allow + reject exact rows) inside the real
+ * general settings page, proving the section's placement.
+ */
+export const RememberedDecisions: Story = {
+  args: {},
+  parameters: {
+    ...appRouteParameters("/settings/general"),
+    ...storybookMswParameters({
+      "tool-approvals": [
+        compozyApiMock.get("/api/tool-approval-grants", () =>
+          HttpResponse.json(toolApprovalGrantsResponseFixture)
+        ),
+      ],
+    }),
+  },
+  render: () => <StorybookWorkspaceSetup />,
+};
+
+/** One story per update state the daemon can report — the S1 visual contract. */
+function updateStory(snapshot: SettingsUpdateStatus): Story {
+  return {
+    args: {},
+    parameters: {
+      ...appRouteParameters("/settings/general"),
+      ...storybookMswParameters({
+        settings: [compozyApiMock.get("/api/settings/update", () => HttpResponse.json(snapshot))],
+      }),
+    },
+    render: () => <StorybookWorkspaceSetup />,
+  };
+}
+
+/** Update status is unresolved, so the one product row checks. */
+export const UpdatesChecking: Story = {
+  args: {},
+  parameters: {
+    ...appRouteParameters("/settings/general"),
+    ...storybookMswParameters({
+      settings: [
+        compozyApiMock.get("/api/settings/update", async () => {
+          await delay("infinite");
+          return HttpResponse.json(settingsUpdateStatusFixture);
+        }),
+      ],
+    }),
+  },
+  render: () => <StorybookWorkspaceSetup />,
+};
+
+/** Everything is current: the calm, explicit settled state. */
+export const UpdatesUpToDate: Story = updateStory(settingsUpdateStatusFixture);
+
+/** A release is offered: one CompozyOS row, one version lane, one Update button. */
+export const UpdatesBothAvailable: Story = updateStory(settingsUpdateBothAvailableFixture);
+
+/** Only the runtime is behind: still one row and one Update — the split never shows. */
+export const UpdatesRuntimeAvailable: Story = updateStory(settingsUpdateRuntimeAvailableFixture);
+
+/** Only the app is behind: still one row and one Update — the split never shows. */
+export const UpdatesAppAvailable: Story = updateStory(settingsUpdateAppAvailableFixture);
+
+/** Package-managed install: the command is the action, so no Update button exists. */
+export const UpdatesManagedRuntime: Story = updateStory(settingsUpdateManagedFixture);
+
+/** Headless host with no desktop app: the same single row. */
+export const UpdatesNoAppInstalled: Story = updateStory(settingsUpdateNoAppFixture);
+
+/** Mid-update: the status lane becomes "Updating" with the measured percent. */
+export const UpdatesApplying: Story = updateStory(settingsUpdateApplyingFixture);
+
+/** App closed: the update finishes on next launch, the one state where cancel is real. */
+export const UpdatesAppStaged: Story = updateStory(settingsUpdateStagedFixture);
+
+/** Another surface holds the channel: the holder is named and no action is offered. */
+export const UpdatesBlocked: Story = updateStory(settingsUpdateBlockedFixture);
+
+/** The update failed: the row names the restored version and the error gets its own row. */
+export const UpdatesRolledBack: Story = updateStory(settingsUpdateRolledBackFixture);
+
+/** A background refresh failed while the last-known snapshot remains visible. */
+export const UpdatesRefreshFailed: Story = {
+  args: {},
+  parameters: {
+    ...appRouteParameters("/settings/general"),
+    ...storybookMswParameters({
+      settings: [
+        compozyApiMock.get("/api/settings/update", () =>
+          HttpResponse.json({ error: "The update status could not be refreshed." }, { status: 503 })
+        ),
+      ],
+    }),
+  },
+  render: () => (
+    <>
+      <StorybookWorkspaceSetup />
+      <StorybookSettingsUpdateRefreshErrorSetup snapshot={settingsUpdateRuntimeAvailableFixture} />
+    </>
+  ),
+};

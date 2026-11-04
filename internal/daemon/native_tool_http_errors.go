@@ -1,0 +1,63 @@
+package daemon
+
+import (
+	"errors"
+	"fmt"
+	"net/http"
+
+	"github.com/compozy/compozy/internal/store"
+	"github.com/compozy/compozy/internal/workspace"
+
+	toolspkg "github.com/compozy/compozy/internal/tools"
+)
+
+func nativeHTTPStatusToolError(id toolspkg.ToolID, err error, status int) error {
+	if errors.Is(err, workspace.ErrWorkspaceRootMissing) {
+		return toolspkg.NewToolError(
+			toolspkg.ErrorCodeWorkspaceRootMissing,
+			id,
+			err.Error(),
+			errors.Join(toolspkg.ErrToolNotFound, err),
+		)
+	}
+	if errors.Is(err, store.ErrWorkspaceArchived) {
+		return toolspkg.NewToolError(
+			toolspkg.ErrorCodeWorkspaceArchived,
+			id,
+			err.Error(),
+			errors.Join(toolspkg.ErrToolConflict, err),
+		)
+	}
+	code := toolspkg.ErrorCodeBackendFailed
+	cause := toolspkg.ErrToolBackendFailed
+	reason := toolspkg.ReasonBackendUnhealthy
+	switch status {
+	case http.StatusBadRequest, http.StatusUnprocessableEntity, http.StatusRequestEntityTooLarge:
+		code = toolspkg.ErrorCodeInvalidInput
+		cause = toolspkg.ErrToolInvalidInput
+		reason = toolspkg.ReasonConfigValidationFailed
+	case http.StatusForbidden:
+		code = toolspkg.ErrorCodeDenied
+		cause = toolspkg.ErrToolDenied
+		reason = toolspkg.ReasonPolicyDenied
+	case http.StatusNotFound:
+		code = toolspkg.ErrorCodeNotFound
+		cause = toolspkg.ErrToolNotFound
+		reason = toolspkg.ReasonToolUnknown
+	case http.StatusConflict:
+		code = toolspkg.ErrorCodeConflict
+		cause = toolspkg.ErrToolConflict
+		reason = toolspkg.ReasonConflictedID
+	case http.StatusServiceUnavailable:
+		code = toolspkg.ErrorCodeUnavailable
+		cause = toolspkg.ErrToolUnavailable
+		reason = toolspkg.ReasonDependencyMissing
+	}
+	return toolspkg.NewToolError(
+		code,
+		id,
+		err.Error(),
+		fmt.Errorf("%w: %w", cause, err),
+		reason,
+	)
+}

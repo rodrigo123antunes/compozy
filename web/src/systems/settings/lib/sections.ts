@@ -1,0 +1,214 @@
+import {
+  Activity,
+  Bell,
+  Cable,
+  Command,
+  Cpu,
+  Gauge,
+  Palette,
+  PanelTop,
+  Puzzle,
+  Radio,
+  Route,
+  SlidersHorizontal,
+  Store,
+  Terminal,
+  UsersRound,
+  Webhook,
+  Wrench,
+  Zap,
+} from "@compozy/ui/icons";
+
+import type {
+  SettingsSectionDescriptor,
+  SettingsSectionGroup,
+  SettingsSectionSlug,
+} from "../types";
+import { DEFAULT_SETTINGS_SECTION_SLUG, retiredSettingsSectionReplacement } from "./section-paths";
+
+/**
+ * Daemon sections + browser Appearance, grouped so the nav reads as a mental
+ * model (design system §03): Workspace = "how my work is set up", Personal =
+ * "how I like to work", Runtime = "what my agents can do", System = "how
+ * CompozyOS itself behaves".
+ * Keywords feed the sidebar search.
+ */
+export const SETTINGS_SECTIONS: readonly SettingsSectionDescriptor[] = [
+  {
+    slug: "general",
+    label: "General",
+    icon: SlidersHorizontal,
+    group: "workspace",
+    keywords:
+      "defaults session defaults new sessions profile agent provider model reasoning effort smooth streaming permissions session timeout update version runtime socket editor open vscode",
+  },
+  {
+    slug: "terminal",
+    label: "Terminal",
+    icon: Terminal,
+    group: "workspace",
+    keywords:
+      "terminal shell scrollback recording retention detached ttl subscribers daemon workspace default_shell",
+  },
+  {
+    slug: "appearance",
+    label: "Appearance",
+    icon: Palette,
+    group: "workspace",
+    keywords: "theme dark mode light mode wallpaper motion desktop",
+  },
+  {
+    slug: "layouts",
+    label: "Layouts",
+    icon: PanelTop,
+    group: "workspace",
+    keywords: "window manager desktops profiles split stack geometry snap focus shortcuts alias",
+  },
+  {
+    slug: "profiles",
+    label: "Profiles",
+    icon: UsersRound,
+    group: "workspace",
+    keywords: "profile context switch identity archive selection separation",
+  },
+  {
+    slug: "providers",
+    label: "Providers",
+    icon: Cpu,
+    group: "workspace",
+    keywords: "models catalog auth claude codex cursor gemini sign-in",
+  },
+  {
+    slug: "provider-usage",
+    label: "Provider usage",
+    icon: Gauge,
+    group: "workspace",
+    keywords:
+      "usage limits quota subscription weekly session reset refresh interval keychain claude codex tray",
+  },
+  {
+    slug: "roles",
+    label: "Roles",
+    icon: Route,
+    group: "runtime",
+    keywords: "background agents coordinator auto-title routing model provider fallback",
+  },
+  {
+    slug: "skills",
+    label: "Skills",
+    icon: Wrench,
+    group: "runtime",
+    keywords:
+      "registry marketplace policy disabled install sources folders agents claude custom directories origin expose",
+  },
+  {
+    slug: "mcp",
+    label: "MCP servers",
+    icon: Cable,
+    group: "runtime",
+    keywords:
+      "mcp servers tools transport stdio http oauth authorize extension override runtime name workspace",
+  },
+  {
+    slug: "automation",
+    label: "Automation",
+    icon: Zap,
+    group: "runtime",
+    keywords: "jobs triggers scheduler engine timezone cron",
+  },
+  {
+    slug: "gateway",
+    label: "Remote access",
+    icon: Radio,
+    group: "system",
+    keywords:
+      "gateway remote reachability exposure overlay public pairing devices revoke audit ingress",
+  },
+  {
+    slug: "palette",
+    label: "Palette",
+    icon: Command,
+    group: "operator",
+    keywords: "command palette personalization recents pinned ranking",
+  },
+  {
+    slug: "attention",
+    label: "Notifications",
+    icon: Bell,
+    group: "operator",
+    keywords: "attention toasts sound system alerts mute workspace bell",
+  },
+  {
+    slug: "observability",
+    label: "Diagnostics",
+    icon: Activity,
+    group: "operator",
+    keywords: "observability capture transcripts storage support bundle logs retention",
+  },
+  {
+    slug: "hooks",
+    label: "Hooks",
+    icon: Webhook,
+    group: "system",
+    keywords: "lifecycle events",
+  },
+  {
+    slug: "extensions",
+    label: "Extensions",
+    icon: Puzzle,
+    group: "system",
+    keywords: "policy registry unverified trust",
+  },
+  {
+    slug: "marketplace",
+    label: "Marketplace",
+    icon: Store,
+    group: "system",
+    keywords:
+      "catalog feed plugin marketplaces sources presets custom refresh ttl timeout base_url experimental",
+  },
+] as const;
+
+export const SETTINGS_SECTION_GROUPS: ReadonlyArray<{
+  id: SettingsSectionGroup;
+  label: string;
+}> = [
+  { id: "workspace", label: "Basics" },
+  { id: "operator", label: "Personal" },
+  { id: "runtime", label: "Agents" },
+  { id: "system", label: "Advanced" },
+];
+
+export const SETTINGS_SECTION_SLUGS: readonly SettingsSectionSlug[] = SETTINGS_SECTIONS.map(
+  section => section.slug
+);
+
+export function findSettingsSection(
+  slug: string | undefined | null
+): SettingsSectionDescriptor | undefined {
+  if (!slug) {
+    return undefined;
+  }
+
+  return SETTINGS_SECTIONS.find(section => section.slug === slug);
+}
+
+/**
+ * The section a settings window route names (`/settings/<slug>`): a retired slug resolves to the
+ * section that absorbed it, and a bare or unknown segment opens the first section.
+ */
+export function settingsSectionSlugFromPathname(pathname: string): SettingsSectionSlug {
+  const raw = pathname.split("/")[2] ?? "";
+  const segment = retiredSettingsSectionReplacement(raw) ?? raw;
+  return findSettingsSection(segment)?.slug ?? DEFAULT_SETTINGS_SECTION_SLUG;
+}
+
+export { SETTINGS_ROOT_PATH, settingsSectionPath } from "./section-paths";
+
+export function filterSettingsSections(query: string): readonly SettingsSectionDescriptor[] {
+  const normalized = query.trim().toLowerCase();
+  if (!normalized) return SETTINGS_SECTIONS;
+  return SETTINGS_SECTIONS.filter(section =>
+    `${section.label} ${section.keywords}`.toLowerCase().includes(normalized)
+  );
+}

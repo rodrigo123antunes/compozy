@@ -1,0 +1,212 @@
+import { useSettingsSkillsPage } from "@/systems/settings/hooks/use-settings-skills-page";
+import {
+  SettingsAdvancedFold,
+  SettingsDisabledSkillsSection,
+  SettingsPageFrame,
+  SettingsPageState,
+  SettingsRuntimeUnavailable,
+  SettingsInlineSaveControls,
+  SettingsSaveBar,
+  SettingsSkillsScopeNotice,
+  SettingsSkillsEngineSection,
+  SettingsSkillsInstallPolicySection,
+  SettingsSkillsDiscoverySection,
+  SettingsSkillSourcesSection,
+  SettingsSkillsScopeSelector,
+  useSettingsSaveBarState,
+  useSettingsTopbar,
+} from "@/systems/settings";
+
+export function SkillsSettingsPage() {
+  const page = useSettingsSkillsPage();
+  useSettingsTopbar();
+  const policySaveState = useSettingsSaveBarState({
+    isDirty: page.isPolicyDirty,
+    isSaving: page.isSavingPolicy,
+    error: page.savePolicyError,
+    warnings: page.policyWarnings,
+    lastAppliedLabel: page.lastPolicyLabel,
+  });
+
+  if (page.isLoading) {
+    return <SettingsPageState slug="skills" state="loading" />;
+  }
+
+  if (page.error || !page.envelope || !page.draft) {
+    return (
+      <SettingsPageState
+        error={page.error}
+        onRetry={page.handleRetry}
+        slug="skills"
+        state="error"
+      />
+    );
+  }
+
+  return (
+    <SkillsSettingsContent
+      page={page}
+      envelope={page.envelope}
+      draft={page.draft}
+      policySaveState={policySaveState}
+    />
+  );
+}
+
+type SkillsPageModel = ReturnType<typeof useSettingsSkillsPage>;
+type LoadedSkillsProps = {
+  page: SkillsPageModel;
+  envelope: NonNullable<SkillsPageModel["envelope"]>;
+  draft: NonNullable<SkillsPageModel["draft"]>;
+};
+function SkillsSettingsContent({
+  page,
+  envelope,
+  draft,
+  policySaveState,
+}: LoadedSkillsProps & { policySaveState: ReturnType<typeof useSettingsSaveBarState> }) {
+  const { setDraft, restart } = page;
+  const isPersonalPolicyScope = page.selection.scope === "user";
+  const scopeLabel = skillsScopeLabel(page);
+
+  return (
+    <SettingsPageFrame
+      meta={[
+        ...(envelope.runtime_available
+          ? [
+              {
+                key: "discovered",
+                content: (
+                  <span>
+                    <span className="font-medium text-muted-foreground">
+                      {envelope.discovered_count}
+                    </span>{" "}
+                    discovered
+                  </span>
+                ),
+              },
+              {
+                key: "disabled",
+                content: (
+                  <span>
+                    <span className="font-medium text-muted-foreground">
+                      {envelope.disabled_count}
+                    </span>{" "}
+                    disabled
+                  </span>
+                ),
+              },
+            ]
+          : [{ key: "runtime", content: <span>CompozyOS isn&apos;t reachable</span> }]),
+        {
+          key: "scope",
+          content: <span data-testid="settings-page-skills-scope-label">showing {scopeLabel}</span>,
+        },
+      ]}
+      restart={restart}
+      saveBar={
+        isPersonalPolicyScope ? (
+          <SettingsSaveBar
+            onReset={page.handleResetPolicy}
+            onSave={page.handleSavePolicy}
+            slug="skills"
+            state={policySaveState}
+          />
+        ) : undefined
+      }
+      slug="skills"
+    >
+      {!envelope.runtime_available ? (
+        <SettingsRuntimeUnavailable
+          slug="skills"
+          description="CompozyOS isn't reachable right now. Skill counts are hidden until it's back. You can still change these settings."
+        />
+      ) : null}
+      <SettingsSkillsScopeSelector
+        selection={page.selection}
+        availableScopes={page.availableScopes}
+        personalLabel={page.personalLabel}
+        agents={page.agents}
+        workspaces={page.workspaces}
+        onSelectUser={page.selectUser}
+        onSelectWorkspaceScope={page.selectWorkspaceScope}
+        onSelectAgentScope={page.selectAgentScope}
+        onSelectAgent={page.selectAgent}
+        onSelectWorkspace={page.selectWorkspace}
+      />
+      {isPersonalPolicyScope ? (
+        <SettingsSkillsEngineSection draft={draft} onChange={setDraft} />
+      ) : null}
+      <SettingsSkillSourcesSection model={page.sources} />
+      {isPersonalPolicyScope ? (
+        <SettingsSkillsDiscoverySection draft={draft} onChange={setDraft} />
+      ) : null}
+      <SkillsDisabledPolicy page={page} envelope={envelope} draft={draft} />
+      {isPersonalPolicyScope ? (
+        <SettingsAdvancedFold
+          data-testid="settings-page-skills-advanced"
+          label="Advanced — install policy"
+          padded
+        >
+          <SettingsSkillsInstallPolicySection draft={draft} onChange={setDraft} />
+        </SettingsAdvancedFold>
+      ) : page.selection.scope === "agent" ? (
+        <SettingsSkillsScopeNotice kind="agent" />
+      ) : page.isRepositoryProfile ? (
+        <SettingsSkillsScopeNotice kind="repository-profile" />
+      ) : null}
+    </SettingsPageFrame>
+  );
+}
+
+function SkillsDisabledPolicy({ page, envelope, draft }: LoadedSkillsProps) {
+  return (
+    <SettingsDisabledSkillsSection
+      baselineDisabled={envelope.config.disabled_skills ?? []}
+      disabled={draft.disabled_skills ?? []}
+      note={
+        page.isRepositoryProfile
+          ? "Read-only — set by the active profile"
+          : page.selection.scope === "agent"
+            ? `applies immediately · scoped to ${page.selectedAgent?.name ?? page.selection.agentName}${page.selectedWorkspace ? ` via ${page.selectedWorkspace.name}` : ""}`
+            : "applies right away · no restart needed"
+      }
+      emptyTitle={
+        page.selection.scope === "agent"
+          ? "No skills turned off for this agent"
+          : "No skills turned off"
+      }
+      emptyDescription={
+        page.selection.scope === "agent"
+          ? "This agent uses the same skills as everywhere else."
+          : "Every skill here is turned on."
+      }
+      onToggle={page.toggleDisabled}
+      readOnly={page.isRepositoryProfile}
+      controls={
+        page.isRepositoryProfile ? undefined : (
+          <SettingsInlineSaveControls
+            controlTestIdPrefix="settings-page-skills-disabled"
+            testId="settings-page-skills-disabled-controls"
+            saveLabel="Apply now"
+            isDirty={page.isDisabledDirty}
+            isSaving={page.isSavingDisabled}
+            error={page.saveDisabledError}
+            warnings={page.disabledWarnings}
+            lastAppliedLabel={page.lastDisabledLabel}
+            onSave={page.handleSaveDisabled}
+            onReset={page.handleResetDisabled}
+          />
+        )
+      }
+    />
+  );
+}
+
+function skillsScopeLabel(page: SkillsPageModel): string {
+  return page.selection.scope === "user"
+    ? page.personalLabel.toLowerCase()
+    : page.selection.scope === "workspace"
+      ? `project ${page.selectedWorkspace?.name ?? page.selection.workspaceId}`
+      : `agent ${page.selectedAgent?.name ?? page.selection.agentName}`;
+}

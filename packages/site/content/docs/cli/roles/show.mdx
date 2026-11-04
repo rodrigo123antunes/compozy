@@ -1,0 +1,55 @@
+---
+title: "compozy roles show"
+description: "Show one effective background role"
+---
+
+## compozy roles show
+
+Show one effective background role
+
+### Synopsis
+
+Show one effective background role. The fallback_chain table lists each route's provider, model, reasoning_effort, and command (the route's account; empty inherits the agent or provider command). JSON output also carries command_fingerprint.
+
+```
+compozy roles show <role> [flags]
+```
+
+### Examples
+
+```
+  compozy roles show auto_title
+  compozy roles show auto_title -o json
+```
+
+### Options
+
+```
+  -h, --help               help for show
+      --workspace string   Override workspace context (ID, name, or path)
+```
+
+### Options inherited from parent commands
+
+```
+      --json             Emit JSON output
+  -o, --output string    Output format: human, json, jsonl, or toon (default "human")
+      --profile string   Act as a profile for this command
+```
+
+## Output Formats
+
+The root `-o, --output` flag accepts these values. A renderer is supported only when this command writes that result; `jsonl` is for commands that emit one JSON record per line.
+
+| Format  | Command result                          |
+| ------- | --------------------------------------- |
+| `human` | Interactive terminal rendering          |
+| `json`  | Machine-readable JSON rendering         |
+| `jsonl` | One JSON record per line when supported |
+| `toon`  | Compact agent-readable rendering        |
+
+Example:
+
+```bash
+compozy roles show <role> -o json
+```

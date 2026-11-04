@@ -1,0 +1,75 @@
+---
+id: RT-home-zero-inventory-first-run
+area: RT
+title: Home offers one honest start when nothing has run
+persona: Lea
+journey: J-operate-home-dashboard
+expected: When `GET /api/observe/overview` reports no work at all — every counter zero, `has_live_work` false, no pulse bucket, busiest and longest_session absent — Home replaces the seven zones with one heading ("No agent work yet", or "No agent work yet in <project>" in a project scope), one support line ("Start a session with an agent, or set up a task that runs on its own."), and exactly three actions that really exist: Start a session (primary; opens the session-create dialog in place), Create a task (`/tasks/new`), Browse the marketplace (`/marketplace/skills`); no zero-filled panels — neither the KPI strip nor an empty Needs you zone renders above it, and the seven zones return as soon as any counter, live work, or pulse bucket is non-zero.
+entry_points: web `/` (dashboard OS window) on a fresh install or an empty project workspace; `GET /api/observe/overview` (HTTP+UDS)
+qa_status: skipped
+bug_ids: BUG-20260820-global-home-deleted-onboarding; BUG-20260826-onboarding-pulse-hides-empty-home
+fix_status: pending
+retest_status:
+fix_commits: e520f3fe
+evidence: docs/qa/evidence/2026-08-26-pr-484-global-desktop/CH-home-zero-inventory-first-start-no-empty-state.png; /Users/pedronauck/dev/qa-labs/compozy-pr-484-global-home-canary-20260826-120414-672594-lab/qa-artifacts/qa/api-overview-first-home.json
+last_report: docs/qa/reports/2026-10-02-untested.md
+overlaps: RT-home-dashboard-zones
+---
+
+story: As someone opening Compozy for the first time I see one thing I can do, in my own words, instead of ten panels reporting zero.
+
+New behavior introduced by the normie-friendly UI foundation pass (2026-08-20,
+`docs/prompts/normie-friendly-ui-pass.md` D3): `home-first-run.tsx` renders through
+`CatalogEmptyState` and `home-overview-empty.ts` owns the predicate.
+
+The predicate is deliberately stricter than "today's counters are zero" — `has_live_work` and the
+pulse window are part of it, so a fresh install with an agent already working, or with activity
+outside the today/outcomes windows, keeps the seven zones. Telling that person nothing has happened
+would be untrue. Walk both sides: the honest zero state, and each of the four ways it must NOT
+appear (live work, a pending approval, a run closed today, a pulse bucket outside today).
+
+The three actions are the walk's real subject — each must land somewhere that exists and accepts
+work, not a dead route. `RT-home-dashboard-zones` owns the populated read (as Cora); this file owns
+the zero read and the transition between them, under Lea, because a workspace with nothing in it is
+by definition a first-run surface and New User is the persona that owns first-run.
+
+**Cycle notes — taxonomy sweep (branch cycle 2026-08-20, normie-friendly UI foundation pass).**
+
+2026-08-20 retry: skipped by explicit user instruction after the onboarding defect was fixed and
+scoped checks passed. No behavioral pass is claimed; same-persona retest remains pending.
+
+2026-08-26 walk: failed. A fresh isolated Global first run with no workspace or agent work rendered
+all seven dashboard zones before and after refresh. The public overview read showed no attention,
+runs, tasks, or live work, but two onboarding-created pulse events prevented the zero state.
+Tracked as `BUG-20260826-onboarding-pulse-hides-empty-home`.
+Seven journeys in scope: J-operate-home-dashboard, J-operate-desktop-shell, J-19,
+J-administer-runtime-settings, J-14, J-answer-agent-requests, plus J-start-from-empty-catalogs as
+the adjacent canary. Dimensions 1–4 ride the charters listed below. Deliberate skips, recorded so
+they do not read as covered:
+
+- **Continuity (cross-device / cross-session)** — skipped on all seven. Compozy promises no
+  cross-device continuity; `personas.md` already records mobile as a device lens on Marina and the
+  desktop shell as desktop-only.
+- **Responsiveness** — covered on J-operate-desktop-shell and J-operate-home-dashboard, the two
+  layout-dense surfaces the 13.5px→15px baseline reflows. Skipped on J-14 and
+  J-answer-agent-requests: full-bleed single-column transcript, no breakpoint logic touched.
+- **The `daemon` → `CompozyOS` word sweep** across gateway, vault, and marketplace
+  surfaces did not reset those scenarios. It is a COPY.md §6 surface-alias swap; the canonical noun
+  is unchanged in code, wire, CLI, and API, and no scenario's `expected:` asserts the word.
+- **The docs site** (`packages/site` eyebrow 11→12px, micro, icon-well radius, and the Fumadocs dark
+  ramp now derived from runtime tokens) is out of this cycle's persona walks.
+  `ET-site-docs-typography-opendesign` asserts site type, which is unchanged; no scenario asserts the
+  ramp. `--audit-site` wired into `codegen-check` is the mechanical gate. Recorded as a follow-up.
+- No `automation-backlog/` entry — this cycle changes presentation, not a journey's stability
+  profile.
+
+
+2026-09-27 scope update: current coverage follows the surviving product surfaces; a fresh walk is required.
+
+QA impact 2026-09-28 (ui-normie-pass): the KPI strip now renders only once work exists, the Needs you
+zone hides when nothing is waiting (the menubar bell stays the entry point), the first-run state gains
+the Empty-state support line, and Start a session is the primary action. Not walked.
+
+2026-10-05: Deferred from this QA cycle by the user's explicit scope reduction.
+Coverage remains outstanding; this skip is not a passing result. Resume from the dated
+report's session matrix in a future QA cycle.

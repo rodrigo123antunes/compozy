@@ -1,0 +1,660 @@
+---
+title: compozy.loop/v1 DSL
+description: The Loop definition schema — declared inputs, the contract, node classes and kinds, the gate contract, and start bindings.
+---
+
+A Loop definition is a **data-first, serializable** document — `compozy.loop/v1` YAML on disk, never a
+program of inline functions. The daemon compiles it to a resolved form that the coordinator and
+executors consume; authors and agents read and write the YAML. This page is the schema reference.
+For the `{{ }}` and CEL grammar used inside fields, see the
+[reference grammar](/docs/loops/reference-grammar).
+
+## Top-level shape
+
+```yaml
+apiVersion: compozy.loop/v1 # required — the only accepted value
+kind: Loop # required
+meta: { name, description, version, catalog }
+concurrency: forbid # forbid (default) | allow | queue
+inputs: {} # declared typed inputs
+contract: {} # goal, verification, stop model, terminal outcomes
+graph: { nodes: [], edges: [] } # the body DAG
+start: [] # how a run may be started
+```
+
+| Field         | Required | Notes                                                                                                                 |
+| ------------- | -------- | --------------------------------------------------------------------------------------------------------------------- |
+| `apiVersion`  | yes      | Must be `compozy.loop/v1`.                                                                                            |
+| `kind`        | yes      | Must be `Loop`.                                                                                                       |
+| `meta`        | yes      | `name`, `description`, `catalog`; `version` is daemon-owned and monotonic.                                            |
+| `concurrency` | no       | `forbid` (default) rejects a second same-Loop start; `allow` runs in parallel; `queue` defers to a FIFO `queued` run. |
+| `inputs`      | no       | Map of declared inputs.                                                                                               |
+| `contract`    | yes      | The goal → verify → stop contract.                                                                                    |
+| `graph`       | yes      | `nodes` + `edges`.                                                                                                    |
+| `start`       | no       | Start bindings; defaults to manual only.                                                                              |
+
+`meta.catalog` carries the browsable metadata: `use_when`, `keywords`, and `category`.
+
+## Declared inputs
+
+Each input names a type; a caller supplies values at run time.
+
+```yaml
+inputs:
+  slug: { type: string, required: true }
+  implementer: { type: agent, default: code_implementer }
+  reviewer: { type: agent, default: code_reviewer }
+  worker_runtime:
+    {
+      type: runtime,
+      default:
+        {
+          provider: codex,
+          model: gpt-5.5-codex,
+          reasoning: high,
+          speed: fast,
+          acp_options: [{ id: thinking, bool_value: true }],
+        },
+    }
+  verify_command: { type: string, default: "" }
+  auto_commit: { type: boolean, default: false }
+  spec: { type: ref, ref: { kind: skill } }
+  release_token: { type: ref, ref: { kind: secret } }
+```
+
+| Type      | Accepts                                                   | Notes                                                                                                                                          |
+| --------- | --------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------- |
+| `string`  | text                                                      |                                                                                                                                                |
+| `number`  | int or float                                              |                                                                                                                                                |
+| `boolean` | bool                                                      |                                                                                                                                                |
+| `file`    | text                                                      | The value is not browsed or checked for existence.                                                                                             |
+| `agent`   | an exact agent name                                       | The daemon checks the workspace agent catalog.                                                                                                 |
+| `ref`     | an exact resource name                                    | `ref.kind` selects the catalog used for validation.                                                                                            |
+| `runtime` | `{ provider?, model?, reasoning?, speed?, acp_options? }` | A partial object that can be bound directly to an action runtime. Each ACP option requires `id` and exactly one of `value_id` or `bool_value`. |
+
+Per-input fields: `type` (required), `required` (default `false`), `description`, `default`, and
+`ref` (for `type: ref`). String-like inputs may also declare `enum`; those choices take precedence
+over a catalog picker. `ref.kind` is closed to `skill`, `loop`, `worktree`, `session`, `workspace`,
+or `secret`.
+
+Effective values resolve one field at a time in this order: run input, workspace config, global
+config, then the definition default. The daemon validates the winning value immediately before a
+dry run or run starts, including entity existence and runtime support. A failure starts no run and
+returns `input_validation` with `{ loop, field, kind?, value?, origin, reason }`. Secret inputs expose
+Vault reference names and metadata only; secret values never enter the catalog or error payload.
+
+## The contract
+
+```yaml
+contract:
+  goal: "Ship the tasks under {{ .inputs.slug }} and verify them."
+  definition_of_done: "All tasks pass their gates and the project's checks are green."
+  constraints: [] # optional guardrail statements
+  boundaries: [] # optional scope statements
+  stop_when: # optional CEL terminal condition; a scalar expression is also valid
+    expr: "generation >= 4"
+    on_eval_error: exit # fail | exit
+  verification: # gate criteria that decide "done"
+    - {
+        id: checks,
+        type: command,
+        check: "test -d artifacts/{{ .inputs.slug | shellQuote }}",
+        expect: exit_zero,
+      }
+  terminal_states: [done, no-op, blocked, failed, exhausted, stalled, canceled]
+  iteration_cap: 50 # 0 = unbounded (watch Loops)
+  no_progress: { window: 3 }
+  budget: { tokens: 0, wall_clock_sec: 0, on_exceeded: halt } # 0 = off
+  runtime_defaults:
+    worker:
+      {
+        provider: codex,
+        model: gpt-5.4,
+        reasoning: high,
+        speed: fast,
+        acp_options: [{ id: thinking, bool_value: true }],
+      }
+    judge: { provider: claude, model: opus, speed: normal }
+  runtime_rules:
+    - match: { type: frontend, complexity: high }
+      runtime:
+        { model: gpt-5.5-codex, speed: normal, acp_options: [{ id: context, value_id: large }] }
+```
+
+`verification` uses the same [gate criteria](#the-gate-contract) shape as a `gate` node. `stop_when`
+accepts either a CEL string or the strict `{ expr, on_eval_error }` object. A broken continuation
+predicate exits by default so it cannot keep a run alive; set `on_eval_error: fail` to end the run
+`failed` instead. The stop model — `iteration_cap`, `no_progress`, and `budget` — is documented in
+full on the [guardrails](/docs/loops/guardrails) page. `terminal_states` lists the fixed seven outcomes.
+`runtime_defaults.worker` seeds worker runtime fields; `runtime_defaults.judge` seeds judge fields.
+Each `runtime_rules` entry matches one exact task `id`, one `type`, one `complexity`, or the
+conjunction `type + complexity`. The conjunction is AND, and `id` cannot be combined with another
+selector. Specificity is `id > type + complexity > type > complexity`. Matching rules merge runtime
+fields and ACP option IDs independently; a later equal-specificity rule wins only the non-empty fields
+and option IDs it sets.
+
+A `command` check is authored shell code. Any runtime value inserted into `check` must end with
+`| shellQuote`, as in the example above. Publish and dry-run reject unquoted command substitutions so
+an input, trigger payload, or node output cannot introduce shell syntax. Leave the template action
+outside authored single quotes, double quotes, and backslash escapes because `shellQuote` supplies
+the complete quoting context. Dynamic command templates also reject actions inside shell comments
+and `<<` constructs such as heredocs and here-strings.
+
+The contract may react to terminal truth with `on_done`, `on_noop`, `on_blocked`, `on_failed`,
+`on_exhausted`, `on_stalled`, and `on_canceled`. Each list contains
+[effects](/docs/loops/failure-handling#effects-observe-committed-truth); terminal effects observe the
+outcome and never rewrite it.
+
+## The body graph
+
+`graph.nodes` is a list of typed nodes; `graph.edges` are `{ from, to }` dependency edges. Edges
+are acyclic — the linter rejects a cycle. Node IDs match `^[a-z][a-z0-9_]*$` — lowercase and
+snake_case — which makes the same ID valid in both `{{ }}` and CEL without escaping.
+
+Every node shares an envelope — `id`, `class`, `kind` — plus optional `session`, `timeout`,
+`deadline`, `retry`, `result_contract`, `on_error`, lifecycle effects, `on_parent_close`, `harvest`,
+and `produces` (a JSON schema declaring the node's output so downstream `nodes.<id>.output.*`
+references validate).
+
+### Node classes
+
+| Class     | Openness | Kinds                                                                      |
+| --------- | -------- | -------------------------------------------------------------------------- |
+| `action`  | **open** | `run-agent`, `run-loop`, `transform`, `goal`, or any tool ID               |
+| `control` | closed   | `fan-out`, `collect`, `branch`, `route`, `gate`, `wait`, `ask`, `sub-loop` |
+| `source`  | closed   | `input`, `file-import`, `watch-source`, `watch-events`                     |
+
+### Action nodes
+
+Four action kinds are reserved; every other action `kind` is a literal **tool ID**
+(`compozy__*`, `ext__*`, or `mcp__*`) resolved through the runtime tool registry — so every native,
+extension, and MCP tool is a Loop action for free.
+
+| Kind        | Params                                                                                                                                         |
+| ----------- | ---------------------------------------------------------------------------------------------------------------------------------------------- |
+| `run-agent` | `agent` (required), `prompt` (required), `output_schema?`, `cwd?`, `runtime?`, `allowed_tools?`, `max_turns?`                                  |
+| `run-loop`  | `loop` (name), `inputs?`, `config_overrides?`, `mode: await` (default, parks in `awaiting_child`) or `detach` (returns `{loop_run_id}`)        |
+| `transform` | `map` — each entry is `{from: <ns path>}`, `{value: <literal>}`, or `{template: "{{ }}"}`                                                      |
+| `goal`      | `agent`, `objective`, `judge`, `max_turns`, `on_exhausted?`, `output_schema`, `runtime?`; see the [Goal node reference](/docs/loops/goal-node) |
+| any tool ID | `params` = the tool's own input schema, template-interpolated; optional `harvest`                                                              |
+
+A detached `run-loop` returns `{loop_run_id}`. An awaited `run-loop` without `produces` keeps
+the existing scalar terminal output (`child_loop_status:done` or `child_loop_status:no-op`). To
+use the child identity in a downstream node, declare its complete terminal result:
+
+```yaml
+produces:
+  loop_run_id: string
+  status: string
+```
+
+After the child ends successfully, `nodes.<id>.output.loop_run_id` is its exact Run ID and
+`nodes.<id>.output.status` is `done` or `no-op`. A detached node may declare only
+`loop_run_id: string`. Validation rejects other `run-loop` output declarations before execution.
+Existing runs keep their pinned definitions and stored results.
+
+A `run-agent` node with an `output_schema` publishes typed output, so the next node can reference
+`nodes.<id>.output.<field>` — the type-safe chaining pattern.
+The daemon validates the agent's exact structured result against that schema before it settles the
+task and revalidates it before publishing node success. A mismatch fails with `invalid_output`.
+Large results keep the same structured value when stored by content reference. The bound agent
+session may heartbeat its task, but only the owning daemon can complete or fail it.
+Loop action results up to 16 KiB stay inline. Larger accepted values are stored by content reference,
+so run payloads expose `result_ref` and `result_bytes` instead of embedding the value. Read the exact
+bytes through `compozy task run result`, `GET /api/task-runs/{id}/result`, or
+`compozy__task_run_result`.
+
+`tools.default_max_result_bytes` is the outer action-result bound. For a literal tool action, a
+smaller descriptor limit wins. A zero configured default uses the 16 MiB platform ceiling rather
+than making result size unbounded. A result above the effective bound, or a tool result already
+marked truncated, fails the node with `action_result_too_large`; the diagnostic names the node,
+tool, actual bytes, effective limit, and safe next action.
+Each managed `run-agent` cell owns a system session. A session-started Loop records the nearest
+origin session as informational parent lineage without borrowing it. Terminal cell settlement
+closes the binding and queues a durable stop. A failure scheduled for retry keeps the binding active
+until the cell reaches a terminal boundary.
+Cross-generation references keep the same authored shape on every pass. On generation 1,
+`previous.generation` is `0`; before a best candidate exists, `best.generation` is `0`. Authored
+node outputs use zero values from their declared schemas and verdict lists are empty, so a valid
+history path can be rendered during initial and sparse repair generations. Use the generation
+number when history-dependent prose should be omitted.
+`params.runtime` accepts either a literal `{ provider, model, reasoning, speed, acp_options }` object
+or one exact reference to a declared runtime input. Each `acp_options` entry requires `id` and exactly
+one of `value_id` or `bool_value`:
+
+```yaml
+params:
+  runtime: "{{ .inputs.worker_runtime }}"
+```
+
+Field interpolation inside a runtime object is invalid. Worker fields resolve independently in this
+order, from highest to lowest precedence: per-run rule, imported task frontmatter, referenced
+runtime input, configured rule, literal `params.runtime`, `runtime_defaults.worker`, then empty
+fields from the agent definition. `resolved_runtime.source` reports a referenced value as `input`.
+Rule specificity is `id > type + complexity > type > complexity`; matching rules merge scalar fields
+and ACP option IDs independently, and a later equal-specificity rule wins only the values it sets. A
+child `run-loop` resolves its own rules and never inherits the parent's per-run rules.
+
+Use `run-loop.params.config_overrides` to apply one direct-run configuration layer to one child.
+It supports `await` and `detach`, has per-run precedence, and never changes the child's stored
+configuration. Omitting it preserves the existing child defaults and parent-environment forwarding.
+
+The field is closed to the same keys as `RunLoopRequest.config_overrides`:
+`human_gate_enabled`, `reattempt_strategy`, `enabled_checks_json`, `iteration_cap`,
+`budget_tokens`, `budget_wall_sec`, `budget_on_exceeded`, `no_progress_window`, `fan_out_width`,
+`gate_max_revisions`, `runtime_defaults`, `runtime_rules`, and `environment`. Operator-owned
+`lifecycle` and `request_expire_after` policy is not authorable here. Unknown keys and wrong literal
+types fail validation before the child starts.
+
+```yaml
+- id: implement
+  class: action
+  kind: run-loop
+  params:
+    loop: build-feature
+    mode: await
+    config_overrides:
+      iteration_cap: 4
+      budget_tokens: "{{ .nodes.routing.output.remaining_tokens }}"
+      budget_wall_sec: 7200
+      budget_on_exceeded: halt
+      reattempt_strategy: halt
+      environment: { mode: worktree, worktree_ref: "{{ .inputs.worktree_ref }}" }
+      runtime_rules: "{{ .nodes.routing.output.runtime_rules }}"
+      enabled_checks_json:
+        quality: { enabled: true }
+```
+
+An exact reference keeps the source JSON type: the token budget remains a number and runtime rules
+remain an array. See [Reference grammar](/docs/loops/reference-grammar#typed-direct-references).
+`run-agent` sessions use the target agent definition plus workspace defaults for
+permission policy. `allowed_tools` is a narrowing override only: every listed value must be a
+canonical tool ID already allowed by the resolved agent profile. A widening or unknown tool
+rejects the node run deterministically before an ungated session can start.
+The restriction is pinned with the managed session's creation profile. Reusing a binding with
+a different explicit tool list fails with a binding mismatch; an equivalent list reuses the session.
+Policy refusals publish `allowed_tools_policy_violation` with the rejected tool and recovery
+guidance in the Loop's action failure.
+
+### Control nodes
+
+| Kind       | Purpose                                   | Key fields                                                                                      |
+| ---------- | ----------------------------------------- | ----------------------------------------------------------------------------------------------- |
+| `fan-out`  | Run a batch of branches over a collection | `collection`, `filter?`, `batch_size` (default 1), `max_parallel`, positive `max_fan_out`       |
+| `collect`  | Join barrier — waits for fanned branches  | —                                                                                               |
+| `branch`   | Route on a CEL condition                  | `condition` (true/false edges), optional `on_eval_error: fail \| exit`                          |
+| `route`    | Select exactly one forward path           | ordered `routes: [{when, to}]`, mandatory `default`                                             |
+| `gate`     | Verify against criteria and route         | `criteria`, `verdict_policy`, `on_result`, `max_revisions`                                      |
+| `sub-loop` | An inline nested Loop                     | `body` (graph) + `contract`                                                                     |
+| `wait`     | Park on time or one durable event         | `params`: exactly one of `for`, `until`, `event`; optional `expect`, `ahead_arrival`, `expires` |
+
+`fan-out` exposes `item` and `index` to its branch scope — a single element at `batch_size: 1`, an
+array slice above it. Use `bind_as` and `index_as` to give nested fan-outs distinct names.
+When `filter` is set, the Loop evaluates it once per source element with `item`, the source `index`,
+and the fan-out's own aliases. Only matching elements are batched and counted by `max_fan_out`.
+Evaluation errors fail the fan-out by default; set `on_eval_error: exit` to end the Loop instead.
+
+The default strategy is `wait_all`. `fail_fast` ends on the first definitive failure, and `race`
+accepts the lowest-index successful lane. `best_effort` requires both a threshold and an explicit
+declaration that missing results are acceptable:
+
+```yaml
+- id: inspect_files
+  class: control
+  kind: fan-out
+  collection: "{{ .nodes.changed.output.files }}"
+  bind_as: file
+  index_as: file_index
+  strategy:
+    kind: best_effort
+    threshold: 66%
+    missing: acceptable
+```
+
+Thresholds use a percentage such as `66%` or a count such as `{ count: 2 }`. A collect result is
+`succeeded`, `partial`, or `failed`. Its output contains `total`, `succeeded`, `failed`, `canceled`,
+`coverage_rate`, and `partial`. Read live counts through `nodes.<fan-out-id>.progress.*`; inside that
+fan-out body, `progress.*` is the short form. Available fields are `total`, `succeeded`, `failed`,
+`canceled`, `running`, `pending`, `settled`, `success_rate`, and `failure_rate`. Rates are `0` for an
+empty collection.
+
+Routing predicates fail the node by default when CEL evaluation fails. A `branch` or filtered
+`watch-events` node may set `on_eval_error: exit` to end the Loop successfully instead. Predicate
+costs at or above 80% of the configured CEL limit emit a durable warning; exceeding the limit is an
+authoring failure handled by the same policy.
+
+### Branch fan-in and required conditions
+
+A node with multiple incoming edges waits for **every predecessor to settle successfully**.
+Skipped paths satisfy that dependency barrier: a false `branch` marks its exclusive descendants
+`branch_skipped`, and a `route` marks its non-selected paths `route_not_taken`. The skip propagates
+only while every incoming path is skipped; a shared join remains runnable when another path is
+active. Fan-in merges alternative paths. It does **not** require every branch condition to be true,
+and it does not start as soon as the first predecessor finishes.
+
+For example, if `true_path` succeeds and `false_path` is `branch_skipped`, their shared `join` runs
+after both settle. A skipped node may have `status: succeeded` with a skip marker in `output_ref`;
+that status alone does not prove its action executed. Unhandled failures still block ordinary
+success dependencies; only explicit error routing or `allow_fail` absorbs them.
+
+To require multiple conditions before a write or approval, combine them in one `branch` and make
+it the protected node's **sole predecessor**. This complete example skips `publish` unless both
+inputs are true:
+
+```yaml
+apiVersion: compozy.loop/v1
+kind: Loop
+meta: { name: guarded-delivery }
+start: [{ kind: cli }, { kind: uds }]
+inputs:
+  security_ok: { type: boolean, required: true }
+  approval_ok: { type: boolean, required: true }
+contract:
+  goal: Publish only after both checks pass
+  definition_of_done: Delivery decision settled
+  iteration_cap: 1
+  stop_when: "generation >= 1"
+graph:
+  nodes:
+    - id: all_required
+      class: control
+      kind: branch
+      condition: "inputs.security_ok && inputs.approval_ok"
+    - id: publish
+      class: action
+      kind: transform
+      params: { map: { published: { value: true } } }
+      produces: { published: boolean }
+  edges:
+    - { from: all_required, to: publish }
+```
+
+Run with `--input security_ok=true --input approval_ok=false` to see `publish` skipped; set both
+inputs to `true` to execute it. Replace the illustrative transform with your write action or gate.
+Keep required checks on the guarded path; an additional incoming edge can make the protected node
+live again. For conditions derived from earlier work, use explicit typed result fields in the AND
+predicate instead of checking only `nodes.<id>.status`.
+
+A `route` checks its CEL conditions in declaration order and takes the first match. If none match,
+it takes the mandatory `default`. Every destination must be a unique direct forward edge. A broken
+condition fails closed with `predicate_evaluation_failed`; it never falls through to the default.
+Nodes that belong only to a non-selected path settle as durable `route_not_taken` evidence and are
+not evaluated or scheduled, including gates. Shared downstream joins remain live. Inspect the
+decision through Loop status, the node roster, and `route_causes`.
+
+```yaml
+- id: classify
+  class: control
+  kind: route
+  routes:
+    - when: nodes.score.output.value >= 0.8
+      to: publish
+    - when: nodes.score.output.value >= 0.5
+      to: revise
+  default: reject
+```
+
+### Node reliability fields
+
+| Field                                            | Contract                                                                         |
+| ------------------------------------------------ | -------------------------------------------------------------------------------- |
+| `timeout`                                        | Optional limit for one attempt.                                                  |
+| `deadline`                                       | Optional total limit across attempts and backoff; must be at least `timeout`.    |
+| `retry.max_attempts`                             | Total attempts including the first; `0` disables automatic retry.                |
+| `retry.on_failure`                               | Node-family retry behavior where supported.                                      |
+| `retry.backoff.{base,max}`                       | Bounded retry delay.                                                             |
+| `retry.non_retryable`                            | Failure classes this node must not retry.                                        |
+| `result_contract.{failure_field,message_field?}` | Reads application-level failure from an otherwise successful payload.            |
+| `on_error`                                       | Exactly one of `route` or `allow_fail`; optional `effects` observe the decision. |
+| `on_retry`, `on_success`, `on_pause`             | Effects for those committed node transitions.                                    |
+| `on_timeout`, `on_cancel`, `on_quarantine`       | Effects for those committed node transitions.                                    |
+| `on_parent_close`                                | Awaited `run-loop` policy: `terminate` or `abandon`.                             |
+
+Automatic retry is class-gated: only `transport` and `attempt_timeout` qualify. Mechanical actions
+inherit family defaults; `run-agent` and `run-loop` require explicit node-level `retry`, and `goal`
+does not use generic node retry. See [Failure handling](/docs/loops/failure-handling) for precedence,
+classification, and delivery guarantees.
+
+### Durable wait control
+
+```yaml
+- id: wait_for_completion
+  class: control
+  kind: wait
+  params:
+    event: { kind: task.run.completed }
+    ahead_arrival: consume_on_entry
+```
+
+Event kinds must belong to the [hook event catalog](/docs/hooks/event-catalog). Run
+`compozy hooks events` to inspect the daemon's active catalog before authoring a subscription.
+
+Choose exactly one wait source: `for` (duration), `until` (timestamp), or `event` (subscription).
+`expect` is the JSON schema for a manual or event resume payload. `ahead_arrival` is
+`consume_on_entry` or `reject`. `expires.after` is optional; expiry may enqueue `escalate` effects
+and/or route to one authored node. Without `expires`, the wait remains parked indefinitely.
+
+### Source nodes
+
+| Kind           | Purpose                                        | Key fields                                   |
+| -------------- | ---------------------------------------------- | -------------------------------------------- |
+| `input`        | Expose a declared input to the graph           | `input_ref`                                  |
+| `file-import`  | Materialize a finite collection from files     | `pattern`, `parse: json \| text`, `produces` |
+| `watch-source` | Wait for an external signal, then tick         | `watch` (spec)                               |
+| `watch-events` | Wake on an internal CompozyOS event, then tick | `events` (subscription list)                 |
+
+A definition that contains a `watch-source` node is a **watch Loop** — it defaults to
+`iteration_cap: 0` and holds the `watching` state between ticks.
+See [extending Loops](/docs/loops/extensions#watch-sources).
+
+### Watch-events source
+
+A `watch-events` node parks the Loop at zero cost and wakes it when an **internal CompozyOS event**
+commits — a task status transition, a task-run outcome, a loop terminal. It is the event-driven
+sibling of `watch-source`: `watch-source` polls an _external_ signal through an extension, while
+`watch-events` observes CompozyOS's own durable ledgers. Hook dispatch is only the doorbell; the matched
+batch is always re-derived from the append-only ledger at wake, so a subscription survives daemon
+downtime and dropped hooks.
+
+The node carries a typed `events` list. Each subscription names a supported hook `kind` and an
+optional `filter` — a [CEL](/docs/loops/reference-grammar) expression over `event`, `inputs`,
+and `nodes`. Multiple subscriptions OR together; an empty `filter` matches every event of that kind
+in the Loop's workspace.
+
+```yaml
+graph:
+  nodes:
+    - id: on_task_done
+      class: source
+      kind: watch-events
+      events:
+        - kind: task.status_changed
+          filter: "event.payload.to_status == 'completed'"
+        - kind: loop.terminal
+    - id: react
+      class: action
+      kind: run-agent
+      params:
+        { agent: "{{ .inputs.responder }}", prompt: "Handle {{ .nodes.on_task_done.output }}" }
+  edges:
+    - { from: on_task_done, to: react }
+```
+
+The matched batch lands at `nodes.<id>.output` for downstream nodes (fan out over it to process each
+event). A Loop with a `watch-events` node holds `watching` between wakes and — unlike
+`watch-source` — **never stalls on silence**. Its default configuration is still the delivery
+profile, including `iteration_cap: 50`; set `contract.iteration_cap: 0` explicitly when it must run
+without an iteration limit. A quiet subscription is healthy dormancy, not a failure; the Loop parks
+until an event matches.
+
+**Supported kinds.** `events[].kind` validates against the full hook catalog at publish; a
+kind outside the supported set fails lint (`watch_events_kind_unsupported`). Only **post-state
+observation** hooks are subscribable — sync-eligible `pre_*` hooks are rejected (you watch committed
+state, you do not intercept it).
+
+| Family        | Kinds                                                                                             | Replay ledger                 |
+| ------------- | ------------------------------------------------------------------------------------------------- | ----------------------------- |
+| `task`        | `task.status_changed`, `task.blocked`, `task.unblocked`, `task.needs_attention`, `task.recovered` | `task_events`                 |
+| `task.run`    | `task.run.completed`, `task.run.failed`                                                           | `task_events`                 |
+| `loop`        | `loop.terminal`, `loop.node.terminal`                                                             | `loop_run_events`             |
+| `automation`  | `automation.run.completed`, `automation.run.failed`                                               | `automation_runs`             |
+| `coordinator` | `coordinator.spawned`, `coordinator.decision`, `coordinator.stopped`, `coordinator.failed`        | `event_summaries`             |
+| `event`       | `event.post_record`                                                                               | `session_events:<session_id>` |
+
+`event.post_record` subscriptions must constrain `event.session_id` with equality; otherwise lint
+returns `watch_events_filter_too_broad`. Its output includes metadata such as `record_type`,
+`sequence`, `turn_id`, `agent_name`, and `session_id`; record content is never copied into the
+watch-events batch. The kind select and lint error text always name the registry-derived supported
+set, so the grammar never changes as families are added.
+
+The parked read-model — the active subscriptions, per-stream cursors, and last wake — is visible on the
+run detail (`compozy loop status --run-id <run-id> -o json`, HTTP/UDS, and the web run page) only
+while the Loop is dormant on events.
+
+## The gate contract
+
+A `gate` node (and the contract's `verification`) is a list of typed **criteria**. Each criterion
+is a typed object, never a bare string — push vague checks toward a `command` where you can.
+
+| Criterion `type` | Fields                                                                | Verdict source? |
+| ---------------- | --------------------------------------------------------------------- | --------------- |
+| `command`        | `check` (command), `expect` (e.g. `exit_zero`), optional `metric`     | no              |
+| `agent-judge`    | `agent`, `rubric` (`{{ }}` template), optional `runtime` and `metric` | yes             |
+| `human`          | `prompt`; `metric` is not allowed                                     | yes             |
+| `extension`      | `tool` (tool ID), `inputs`, optional `metric`                         | no              |
+
+`verdict_policy` selects how the gate decides:
+
+- `revise_until_clean` — iterate until the criteria pass. **Requires at least one `agent-judge` or
+  `human` criterion** (a verdict source); the linter rejects it otherwise
+  (`verdict_policy_requires_judge`).
+- `fixed_passes` — a fixed number of passing runs, for command-only gates.
+
+An `agent-judge` verdict emits **blocking issues** — `{ id, note }` objects. The `id` set is
+load-bearing: the [stall signature](/docs/loops/guardrails#the-two-no-progress-axes)
+compares the repeated set across the no-progress window. A malformed judge response degrades to a
+revision, never a silent pass. `on_result` maps a verdict (`pass`, `fail`, `blocked`, `approval`,
+`error`, `timeout`, `invalid_output`) to `continue`, `revise`, `next_generation`, `escalate`,
+`halt`, or an in-body direct forward target written as `{ route: node_id }`. The removed `branch`
+action is rejected. `approval` accepts only `escalate` or `halt` and cannot use an object route to
+bypass a pending approval. `max_revisions` caps the loop before the gate fails.
+An `agent-judge.runtime` value overrides `runtime_defaults.judge` field by field for that criterion
+only. Task runtime rules never apply to judges.
+
+### Metric criteria
+
+Add `metric` to one machine criterion when a Loop must improve one scalar score without accepting a
+regression. The block requires `direction`; `min_delta` is optional and defaults to `0`, which still
+requires a strict improvement.
+
+```yaml
+- id: quality
+  class: control
+  kind: gate
+  criteria:
+    - id: acceptance_score
+      type: agent-judge
+      agent: reviewer
+      rubric: >
+        Score the candidate from 0 to 1 against the definition of done. Approve only when the
+        cited evidence supports every required outcome.
+      metric:
+        direction: maximize
+        min_delta: 0.05
+  verdict_policy: revise_until_clean
+  on_result:
+    fail: revise
+  max_revisions: 8
+```
+
+The grammar is deliberately narrow:
+
+- `direction` is `maximize` or `minimize`.
+- `min_delta` must be finite and non-negative.
+- A definition may contain at most one metric criterion. Multi-objective ratchets are not part of
+  `compozy.loop/v1`.
+- `command`, `agent-judge`, and `extension` criteria may declare a metric; `human` may not.
+- A missing or non-finite required score produces `invalid_output`. It never passes and never
+  advances the best generation.
+
+Each scorer has a typed response contract:
+
+| Criterion     | Score contract                                                                                                                                                  |
+| ------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `command`     | Standard output must be exactly one JSON object with no extra fields, for example `{"score":0.72}`. The configured command expectation still decides pass/fail. |
+| `agent-judge` | The required verdict object gains numeric `score`; it still includes `verdict`, `blocking_issues`, and non-empty `evidence` for a pass.                         |
+| `extension`   | Structured tool output gains numeric `score` alongside `verdict`; `blocking_issues` and `evidence` remain available.                                            |
+
+The score participates in the [ratchet](/docs/loops/ratchet). A candidate becomes best only when
+the aggregate gate verdict is approved and the finite score improves the current baseline in the
+declared direction by at least `min_delta`.
+
+## Runtime validation and provenance
+
+`compozy loop validate --workspace <ref> --file <path>` validates definition-contained runtime
+values. `compozy loop run --dry-run` and normal submission validate the effective runtime after
+workspace, stored, and per-run layers resolve; the daemon repeats the check immediately before
+binding. A failure returns structured `runtime_validation` items and starts no ACP process.
+
+Use repeatable `--runtime` flags for per-run defaults and rules. The expression is
+`provider/model@reasoning:speed=normal|fast`; `-` leaves provider or model unset, speed-only intent
+uses `-/-:speed=fast`, and model IDs may contain additional slashes. `speed` is a provider-neutral
+field; do not encode fast mode inside a model ID. Run detail exposes the final binder-applied
+`resolved_runtime`, each field's source, and the speed outcome (`applied`, `unsupported`, or
+`rejected`) through CLI, HTTP/UDS, native tools, SSE, and the read-only web run inspector.
+
+## Start bindings
+
+`start` lists the kinds that may launch a run. Declared kinds are a read-only allowlist; the
+[catalog](/docs/loops/catalog) and detail screens render them as chips.
+
+```yaml
+start:
+  - { kind: manual }
+  - { kind: cli }
+  - { kind: http }
+  - { kind: uds }
+  - { kind: native_tool }
+  - { kind: schedule } # hands-free starts via automation
+```
+
+Available kinds: `manual`, `cli`, `http`, `uds`, `native_tool`, `schedule`, `trigger`, `webhook`,
+`extension`. Hands-free starts (`schedule`, `trigger`, `webhook`) ride CompozyOS's existing
+[automation](/docs/automation) primitives — a `Trigger` or `Job` targets the Loop with
+typed inputs. A watch-source is a body-node concept, **never** a start binding.
+
+## Config defaults
+
+`[loops.defaults.<kind>]` in `config.toml` seeds new Loops of that kind (`delivery` or `watch`).
+These defaults are a `RestartRequired` config plane, separate from the per-Loop
+[configure](/docs/loops/configure) store.
+
+| Key                     | `delivery` | `watch` |
+| ----------------------- | ---------- | ------- |
+| `iteration_cap`         | 50         | 0       |
+| `no_progress.window`    | 3          | 2       |
+| `gates.max_revisions`   | 10         | —       |
+| `budget.tokens`         | 0          | 0       |
+| `budget.wall_clock_sec` | 0          | 0       |
+| `budget.on_exceeded`    | `halt`     | `halt`  |
+| `fan_out_width`         | 4          | 2       |
+
+Write-time validation rejects negative `fan_out_width` values; positive values have no daemon-wide
+ceiling. Effective config resolves field by field from built-ins, the definition, the matching
+`[loops.defaults.*]` family, an inherited parent environment, the per-Loop config store, and per-run
+overrides. `effective_config.sources` identifies the winning logical source for each JSON Pointer.
+Other bounded fields remain clamped to their documented ceilings. See
+[configure](/docs/loops/configure).
+
+For a review child that may be adopted after recovery, reserve an optional JSON string input
+`reviewed_worktree` containing a JSON object with exactly `worktree_id`, `include_paths`, and `fingerprint`.
+Capture its canonical ID, complete selected file list and SHA-256 fingerprint from a scoped
+`compozy worktree exit --include` plan before the original review. Pass the JSON string through
+`run-loop.params.inputs.reviewed_worktree`; an exact template reference preserves its value.
+The child definition must declare this optional JSON string input.
+
+Adoption requires the original persisted child inputs to equal the rematerialized parent inputs,
+then an independent check of the registered worktree's repository, branch, HEAD, selected bytes
+and index. A mutable task slug or path is insufficient. Absent or stale proof preserves normal
+review execution; recovery never replaces the reviewed fingerprint with a newly calculated one.
+The proof permits 1–4096 exact selected file paths and rejects unknown object fields.

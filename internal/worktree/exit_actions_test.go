@@ -1,0 +1,973 @@
+package worktree
+
+import (
+	"context"
+	"encoding/json"
+	"errors"
+	"os"
+	"path/filepath"
+	"slices"
+	"strings"
+	"sync"
+	"sync/atomic"
+	"testing"
+	"time"
+)
+
+// Canonical suite: durable exit sequencing, cancellation, idempotency, and event reports.
+func TestExitActions(t *testing.T) {
+	t.Parallel()
+
+	// Invariant: failed inventory preserves running receipts until readable journals can recover them.
+	// Owner: worktree recovery; canonical exit sequencing suite with real filesystem failure.
+	t.Run(
+		"Should preserve delivery receipt when journal inventory fails and recover after restoration",
+		func(t *testing.T) {
+			t.Parallel()
+			f := newExitActionFixture(t, false)
+			f.service.root = t.TempDir()
+			caller := &managedFailureSessionBoundary{cause: ErrExitActionInvalid}
+			WithManagedDeliverySessions(caller)(f.service)
+			operation := ExitOperation{ID: "inventory-unavailable", WorkspaceID: f.item.WorkspaceID,
+				WorktreeID: f.item.ID, Action: string(ExitActionDeliver), State: exitOperationRunning,
+				StartedAt: statusTestClock()}
+			if err := f.store.InsertExitOperation(t.Context(), operation); err != nil {
+				t.Fatal(err)
+			}
+			directory := filepath.Join(f.service.root, ".delivery")
+			const original = "journal inventory is not a directory"
+			if err := os.WriteFile(directory, []byte(original), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := os.ReadDir(directory); err == nil || errors.Is(err, os.ErrNotExist) {
+				t.Fatalf("fixture must fail inventory without implying absence: %v", err)
+			}
+			if err := f.service.RecoverManagedDeliveries(
+				t.Context(),
+			); !errors.Is(
+				err,
+				ErrDeliveryInventoryUnavailable,
+			) {
+				t.Fatalf("failed inventory must request lifecycle-owned retry: %v", err)
+			}
+			running, err := f.store.ListRunningExitOperations(t.Context())
+			if err != nil || len(running) != 1 || running[0].ID != operation.ID || running[0].FinishedAt != nil {
+				t.Fatalf("failed inventory changed receipt: %#v error=%v", running, err)
+			}
+			f.events.mu.Lock()
+			eventCount := len(f.events.events)
+			f.events.mu.Unlock()
+			if eventCount != 0 || caller.stops.Load() != 0 || len(f.runner.commands()) != 0 {
+				t.Fatal("failed inventory caused recovery effects")
+			}
+			data, err := os.ReadFile(directory)
+			if err != nil || string(data) != original {
+				t.Fatalf("failed inventory changed filesystem: %q error=%v", data, err)
+			}
+			if err := os.Remove(directory); err != nil {
+				t.Fatal(err)
+			}
+			journal := &managedDeliveryJournal{
+				Version: 1, OperationID: operation.ID, Item: f.item, Phase: exitStepCompleted,
+			}
+			if err := saveDeliveryJournal(filepath.Join(directory, "restored.json"), journal); err != nil {
+				t.Fatal(err)
+			}
+			if err := f.service.RecoverManagedDeliveries(t.Context()); err != nil {
+				t.Fatal(err)
+			}
+			waitForExitOperation(t, f.store, operation.ID, exitStepCompleted)
+			if caller.stops.Load() != 0 || len(f.runner.commands()) != 0 {
+				t.Fatal("restored terminal receipt replayed execution effects")
+			}
+		},
+	)
+
+	// Invariant: unknown journals preserve bytes and never prevent independent receipt recovery.
+	// Owner: worktree recovery; canonical exit sequencing suite at journal/store I/O boundaries.
+	for _, contents := range []string{"{broken", `{"version":2,"phase":"prepared"}`, `{"version":1,"phase":"future"}`} {
+		t.Run("Should preserve unreadable journal and recover sibling receipt "+contents, func(t *testing.T) {
+			t.Parallel()
+			f := newExitActionFixture(t, false)
+			f.service.root = t.TempDir()
+			caller := &managedFailureSessionBoundary{cause: ErrExitActionInvalid}
+			WithManagedDeliverySessions(caller)(f.service)
+			operation := ExitOperation{ID: "readable", WorkspaceID: f.item.WorkspaceID,
+				WorktreeID: f.item.ID, Action: string(ExitActionDeliver), State: exitOperationRunning,
+				StartedAt: statusTestClock()}
+			if err := f.store.InsertExitOperation(t.Context(), operation); err != nil {
+				t.Fatal(err)
+			}
+			directory := filepath.Join(f.service.root, ".delivery")
+			if err := saveDeliveryJournal(filepath.Join(directory, "valid.json"), &managedDeliveryJournal{
+				Version: 1, OperationID: operation.ID, Item: f.item, Phase: exitStepCompleted,
+			}); err != nil {
+				t.Fatal(err)
+			}
+			badPath := filepath.Join(directory, "bad.json")
+			if err := os.WriteFile(badPath, []byte(contents), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			if err := f.service.RecoverManagedDeliveries(t.Context()); err != nil {
+				t.Fatal(err)
+			}
+			waitForExitOperation(t, f.store, operation.ID, exitStepCompleted)
+			data, err := os.ReadFile(badPath)
+			if err != nil || string(data) != contents {
+				t.Fatalf("unknown journal changed: data=%q error=%v", data, err)
+			}
+			if caller.stops.Load() != 0 || len(f.runner.commands()) != 0 {
+				t.Fatal("unknown journal caused execution effects")
+			}
+		})
+	}
+
+	// Invariant: orphan delivery receipts release the SQL active fence as explicit failures without effects.
+	// Owner: worktree recovery; canonical exit sequencing store/journal boundary suite.
+	for _, reason := range []string{"missing-root", "missing-file", "unreadable-file", "no-runtime", "no-runtime-journal"} {
+		t.Run("Should fail orphan delivery receipt with "+reason, func(t *testing.T) {
+			t.Parallel()
+			f := newExitActionFixture(t, false)
+			caller := &managedFailureSessionBoundary{cause: ErrExitActionInvalid}
+			WithManagedDeliverySessions(caller)(f.service)
+			if reason != "missing-root" {
+				f.service.root = t.TempDir()
+			}
+			if reason == "no-runtime" || reason == "no-runtime-journal" {
+				f.service.deliverySessions = nil
+			}
+			if reason == "unreadable-file" {
+				directory := filepath.Join(f.service.root, ".delivery")
+				if err := os.MkdirAll(directory, 0o700); err != nil {
+					t.Fatal(err)
+				}
+				if err := os.WriteFile(
+					filepath.Join(directory, "unreadable.json"),
+					[]byte("{broken"),
+					0o600,
+				); err != nil {
+					t.Fatal(err)
+				}
+			}
+			operation := ExitOperation{ID: "orphan", WorkspaceID: f.item.WorkspaceID,
+				WorktreeID: f.item.ID, Action: string(ExitActionDeliver), State: exitOperationRunning,
+				StartedAt: statusTestClock()}
+			if err := f.store.InsertExitOperation(t.Context(), operation); err != nil {
+				t.Fatal(err)
+			}
+			if reason == "no-runtime-journal" {
+				journal := &managedDeliveryJournal{
+					Version: 1, OperationID: operation.ID, Item: f.item, Phase: deliveryPhasePrepared,
+				}
+				if err := saveDeliveryJournal(
+					filepath.Join(f.service.root, ".delivery", "valid.json"),
+					journal,
+				); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if err := f.service.RecoverManagedDeliveries(t.Context()); err != nil {
+				t.Fatal(err)
+			}
+			waitForExitOperation(t, f.store, operation.ID, exitStepFailed)
+			payload := exitEventPayload(t, f.events, EventExitActionFailed)
+			expectedMessage := "journal unavailable"
+			if reason == "no-runtime-journal" {
+				expectedMessage = "interrupted by daemon restart"
+			}
+			if !strings.Contains(payload.Message, expectedMessage) || caller.stops.Load() != 0 ||
+				len(f.runner.commands()) != 0 {
+				t.Fatalf("orphan recovery=%#v stops=%d commands=%v", payload, caller.stops.Load(), f.runner.commands())
+			}
+			operation.ID = "next-reviewed-operation"
+			if err := f.store.InsertExitOperation(t.Context(), operation); err != nil {
+				t.Fatalf("orphan still holds SQL active-operation fence: %v", err)
+			}
+		})
+	}
+
+	// Invariant: done/map completion cannot become visible while the session fence remains held.
+	// Owner: managed execution lifetime; canonical exit sequencing session boundary suite.
+	t.Run("Should release managed session fence before signaling cleanup completion", func(t *testing.T) {
+		t.Parallel()
+		f := newExitActionFixture(t, false)
+		f.service.root = t.TempDir()
+		WithManagedDeliverySessions(&managedFailureSessionBoundary{cause: ErrExitActionInvalid})(f.service)
+		operation := ExitOperation{ID: "cleanup", WorkspaceID: f.item.WorkspaceID,
+			WorktreeID: f.item.ID, Action: string(ExitActionDeliver), State: exitOperationRunning,
+			StartedAt: statusTestClock()}
+		if err := f.store.InsertExitOperation(t.Context(), operation); err != nil {
+			t.Fatal(err)
+		}
+		ctx, cancel := context.WithCancel(t.Context())
+		control := &exitOperationControl{done: make(chan struct{}), cancel: cancel}
+		f.service.exits[operation.ID] = control
+		releasing, unblock := make(chan struct{}), make(chan struct{})
+		release := sync.OnceFunc(func() { close(unblock) })
+		t.Cleanup(release)
+		journal := &managedDeliveryJournal{
+			Version:     1,
+			OperationID: operation.ID,
+			Item:        f.item,
+			Phase:       deliveryPhasePrepared,
+		}
+		go f.service.runManagedDelivery(
+			ctx,
+			cancel,
+			control,
+			func() { close(releasing); <-unblock },
+			"caller",
+			filepath.Join(f.service.root, "cleanup.json"),
+			journal,
+			operation,
+		)
+		select {
+		case <-releasing:
+		case <-time.After(5 * time.Second):
+			t.Fatal("session fence release did not start")
+		}
+		select {
+		case <-control.done:
+			t.Fatal("completion signaled before fence released")
+		default:
+		}
+		f.service.exitMu.Lock()
+		registered := f.service.exits[operation.ID] == control
+		f.service.exitMu.Unlock()
+		if !registered {
+			t.Fatal("control disappeared while session fence held")
+		}
+		release()
+		select {
+		case <-control.done:
+		case <-time.After(5 * time.Second):
+			t.Fatal("cleanup completion not signaled after release")
+		}
+	})
+
+	t.Run("Should run commit and push once with announced phases and one CTA", func(t *testing.T) {
+		t.Parallel()
+		fixture := newExitActionFixture(t, false)
+		opID, err := fixture.service.RunExitAction(
+			t.Context(), fixture.item.WorkspaceID, fixture.item.Name,
+			ExitActionRequest{Action: ExitActionCommitPush},
+		)
+		if err != nil || opID != "op-exit" {
+			t.Fatalf("RunExitAction() = %q, %v", opID, err)
+		}
+		operation := waitForExitOperation(t, fixture.store, opID, "completed")
+		if operation.WorktreeID != fixture.item.ID || operation.FinishedAt == nil ||
+			!fixture.runner.isCommitted() || !fixture.runner.isPushed() {
+			t.Fatalf(
+				"operation/runner = %#v committed=%t pushed=%t",
+				operation,
+				fixture.runner.isCommitted(),
+				fixture.runner.isPushed(),
+			)
+		}
+		commands := fixture.runner.commands()
+		if countCommand(commands, "add -A") != 1 || countCommand(commands, "commit -m Update 1 files") != 1 ||
+			countCommand(commands, "push -u origin feature/exit") != 1 {
+			t.Fatalf("exit commands = %#v, want one stage, commit, and publish", commands)
+		}
+		started := exitEventPayload(t, fixture.events, EventExitActionStarted)
+		if len(started.Phases) != 2 || started.Phases[0] != ExitPhaseCommit || started.Phases[1] != ExitPhasePush {
+			t.Fatalf("started phases = %#v, want commit then push", started.Phases)
+		}
+		completed := exitEventPayload(t, fixture.events, EventExitActionCompleted)
+		if completed.Result == nil || len(completed.Result.Steps) != 2 || completed.Result.CTA == nil ||
+			completed.Result.CTA.Label != "Open in browser" {
+			t.Fatalf("completed payload = %#v, want two steps and exactly one browser CTA", completed)
+		}
+	})
+
+	t.Run("Should keep the completed commit when explicit cancel stops push", func(t *testing.T) {
+		t.Parallel()
+		fixture := newExitActionFixture(t, true)
+		opID, err := fixture.service.RunExitAction(
+			t.Context(), fixture.item.WorkspaceID, fixture.item.ID,
+			ExitActionRequest{Action: ExitActionCommitPush, Message: "Keep this commit"},
+		)
+		if err != nil {
+			t.Fatalf("RunExitAction() error = %v", err)
+		}
+		select {
+		case <-fixture.runner.pushStarted:
+		case <-time.After(time.Second):
+			t.Fatal("push phase did not start")
+		}
+		if err := fixture.service.CancelExitAction(
+			t.Context(), fixture.item.WorkspaceID, fixture.item.Name, opID,
+		); err != nil {
+			t.Fatalf("CancelExitAction() error = %v", err)
+		}
+		waitForExitEvent(t, fixture.events, EventExitActionCanceled)
+		operation := exitOperation(fixture.store, opID)
+		if operation.State != "canceled" || !fixture.runner.isCommitted() || fixture.runner.isPushed() {
+			t.Fatalf(
+				"canceled operation = %#v committed=%t pushed=%t",
+				operation,
+				fixture.runner.isCommitted(),
+				fixture.runner.isPushed(),
+			)
+		}
+		payload := exitEventPayload(t, fixture.events, EventExitActionCanceled)
+		if payload.Phase != ExitPhasePush || payload.Result == nil || len(payload.Result.Steps) != 2 {
+			t.Fatalf("cancel payload = %#v, want stopped push with committed step retained", payload)
+		}
+	})
+
+	t.Run("Should preserve lookup errors during exit cancellation", func(t *testing.T) {
+		t.Parallel()
+		fixture := newExitActionFixture(t, false)
+		storeErr := errors.New("read unavailable")
+		fixture.service.store = &getErrorWorktreeStore{
+			memoryWorktreeStore: fixture.store,
+			err:                 storeErr,
+		}
+
+		err := fixture.service.CancelExitAction(
+			t.Context(), fixture.item.WorkspaceID, fixture.item.ID, "op-exit",
+		)
+		if !errors.Is(err, storeErr) || errors.Is(err, ErrNotFound) ||
+			!strings.Contains(err.Error(), "read exit cancellation target") {
+			t.Fatalf("CancelExitAction() error = %v, want contextualized store error", err)
+		}
+	})
+
+	t.Run("Should refuse a second durable operation before starting another worker", func(t *testing.T) {
+		t.Parallel()
+		fixture := newExitActionFixture(t, false)
+		if err := fixture.store.InsertExitOperation(t.Context(), ExitOperation{
+			ID: "op-active", WorkspaceID: fixture.item.WorkspaceID, WorktreeID: fixture.item.ID,
+			Action: string(ExitActionPush), State: "running", StartedAt: statusTestClock(),
+		}); err != nil {
+			t.Fatalf("seed active operation: %v", err)
+		}
+		_, err := fixture.service.RunExitAction(
+			t.Context(), fixture.item.WorkspaceID, fixture.item.ID,
+			ExitActionRequest{Action: ExitActionCommit},
+		)
+		if !errors.Is(err, ErrOperationInProgress) {
+			t.Fatalf("RunExitAction(second) error = %v, want ErrOperationInProgress", err)
+		}
+		if fixture.events.count(EventExitActionStarted) != 0 {
+			t.Fatal("second operation emitted a start event")
+		}
+	})
+
+	t.Run("Should make a stale cancel a no-op that cannot hit a later operation", func(t *testing.T) {
+		t.Parallel()
+		store := newMemoryWorktreeStore()
+		item := Worktree{ID: "wt-exit", WorkspaceID: "ws-exit", State: StateReady}
+		if err := store.Insert(t.Context(), item); err != nil {
+			t.Fatalf("seed worktree: %v", err)
+		}
+		finished := statusTestClock()
+		store.exitOps["op-stale"] = ExitOperation{
+			ID: "op-stale", WorkspaceID: item.WorkspaceID, WorktreeID: item.ID,
+			Action: string(ExitActionCommit), State: "completed", StartedAt: finished, FinishedAt: &finished,
+		}
+		store.exitOps["op-later"] = ExitOperation{
+			ID: "op-later", WorkspaceID: item.WorkspaceID, WorktreeID: item.ID,
+			Action: string(ExitActionPush), State: "running", StartedAt: finished.Add(time.Second),
+		}
+		service := NewService(store, &recordingGitRunner{})
+		if err := service.CancelExitAction(t.Context(), item.WorkspaceID, item.ID, "op-stale"); err != nil {
+			t.Fatalf("CancelExitAction(stale) error = %v", err)
+		}
+		if got := exitOperation(store, "op-later"); got.State != "running" {
+			t.Fatalf("later operation = %#v, want untouched", got)
+		}
+	})
+
+	// Invariant: exit completion persists local truth and refreshes the exact forge identity once.
+	// Owner: worktree exit completion; canonical exit sequencing suite.
+	t.Run("Should refresh local and forge status once after a completed action", func(t *testing.T) {
+		t.Parallel()
+		store := newMemoryWorktreeStore()
+		item := Worktree{
+			ID: "wt-refresh", WorkspaceID: "ws-refresh", Branch: "feature/refresh",
+			Path: "/repo/refresh", State: StateReady, CreatedAt: statusTestClock(), UpdatedAt: statusTestClock(),
+		}
+		if err := store.Insert(t.Context(), item); err != nil {
+			t.Fatalf("seed refresh worktree: %v", err)
+		}
+		runner := &recordingGitRunner{run: func(call gitInvocation) gitResponse {
+			switch strings.Join(call.args, " ") {
+			case "status --porcelain=v2 --branch -z":
+				return gitResponse{stdout: []byte("# branch.oid deadbeef\x00# branch.head feature/refresh\x00" +
+					"# branch.upstream origin/feature/refresh\x00# branch.ab +0 -0\x00")}
+			case "remote get-url origin":
+				return gitResponse{stdout: []byte("git@github.com:acme/repo.git\n")}
+			default:
+				return gitResponse{err: errors.New("unexpected Git call")}
+			}
+		}}
+		provider := &recordingExitForge{status: &ForgeStatus{Provider: "github"}}
+		service := NewService(store, runner, WithForge(provider), WithClock(statusTestClock))
+		cache := attachTestPullRequests(t, service, item, provider)
+		service.refreshAfterExit(t.Context(), item)
+		status, err := store.GetStatus(t.Context(), item.WorkspaceID, item.ID)
+		if err != nil || status == nil || status.ReadError != "" || status.Branch == nil ||
+			*status.Branch != item.Branch || status.DirtyFiles == nil || *status.DirtyFiles != 0 ||
+			status.RefreshedAt == nil {
+			t.Fatalf("cached local refresh = %#v, %v", status, err)
+		}
+
+		service.pullRequests.mu.Lock()
+		flight := service.pullRequests.flights[PullRequestKey{item.WorkspaceID, "github.com/acme/repo", item.Branch}]
+		service.pullRequests.mu.Unlock()
+		if flight != nil {
+			<-flight.done
+		}
+		if provider.statusCalls != 1 || len(provider.lastStatus.RemoteURLs) != 1 ||
+			provider.lastStatus.RemoteURLs[0] != "https://github.com/acme/repo.git" ||
+			provider.lastStatus.Branch != item.Branch {
+			t.Fatalf("forge refresh calls/request = %d/%#v", provider.statusCalls, provider.lastStatus)
+		}
+		key := PullRequestKey{item.WorkspaceID, "github.com/acme/repo", item.Branch}
+		entries, err := cache.ReadPullRequests(t.Context(), []PullRequestKey{key})
+		cached := entries[key].Facts
+		if err != nil || cached == nil || cached.Provider != "github" {
+			t.Fatalf("cached refresh=%#v %v", cached, err)
+		}
+	})
+
+	t.Run("Should skip a push that is already up to date", func(t *testing.T) {
+		t.Parallel()
+		runner := &recordingGitRunner{responses: []gitResponse{{stdout: []byte(
+			"# branch.oid deadbeef\x00# branch.head feature/exit\x00" +
+				"# branch.upstream origin/feature/exit\x00# branch.ab +0 -0\x00",
+		)}}}
+		service := NewService(newMemoryWorktreeStore(), runner)
+		step, err := service.runExitPush(t.Context(), Worktree{Path: "/repo", Branch: "feature/exit"}, false)
+		if err != nil || step.State != "skipped" || step.Reason != "already up to date" ||
+			containsCommandPrefix(invocationCommands(runner.invocations()), "push") {
+			t.Fatalf("runExitPush() = %#v, %v; calls=%#v", step, err, runner.invocations())
+		}
+	})
+
+	t.Run("Should report the configured upstream after pushing", func(t *testing.T) {
+		t.Parallel()
+		runner := &recordingGitRunner{responses: []gitResponse{
+			{stdout: []byte("# branch.oid abc123\x00# branch.head feature/exit\x00" +
+				"# branch.upstream fork/review\x00# branch.ab +1 -0\x00")},
+			{},
+			{stdout: []byte("abc123\n")},
+		}}
+		service := NewService(newMemoryWorktreeStore(), runner)
+		step, err := service.runExitPush(
+			t.Context(), Worktree{Path: "/repo", Branch: "feature/exit"}, false,
+		)
+		if err != nil || step.Upstream != "fork/review" {
+			t.Fatalf("runExitPush() = %#v, %v, want configured upstream", step, err)
+		}
+		if got := invocationCommands(runner.invocations()); countCommand(got, "push") != 1 ||
+			containsCommandPrefix(got, "push -u") {
+			t.Fatalf("push commands = %#v, want existing upstream without publish flags", got)
+		}
+	})
+
+	t.Run("Should surface a commit hook failure once and keep later phases stopped", func(t *testing.T) {
+		t.Parallel()
+		runner := &recordingGitRunner{responses: []gitResponse{
+			{}, {stdout: []byte("new.txt\x00")},
+			{stdout: []byte("hook stdout\n"), stderr: []byte("hook stderr\n"), err: errors.New("hook rejected")},
+		}}
+		service := NewService(newMemoryWorktreeStore(), runner)
+		steps, err := service.runExitSequence(
+			t.Context(), ExitOperation{ID: "op-hook"}, Worktree{Path: "/repo", Branch: "feature/exit"},
+			&ExitPlan{CommitScope: ExitCommitScope{ChangedFiles: 1}},
+			ExitActionRequest{Action: ExitActionCommitPush, Message: "Run hooks"},
+		)
+		commands := invocationCommands(runner.invocations())
+		if err == nil || len(steps) != 1 || steps[0].State != "failed" ||
+			!strings.Contains(steps[0].Output, "hook stdout") || !strings.Contains(steps[0].Output, "hook stderr") ||
+			countCommand(commands, "commit -m Run hooks") != 1 || containsCommandPrefix(commands, "push") {
+			t.Fatalf("runExitSequence() = %#v, %v; calls=%#v", steps, err, commands)
+		}
+	})
+
+	t.Run("Should stream redacted commit hook output before the terminal step", func(t *testing.T) {
+		t.Parallel()
+		runner := &streamingRecordingGitRunner{
+			recordingGitRunner: &recordingGitRunner{responses: []gitResponse{
+				{}, {stdout: []byte("new.txt\x00")}, {stdout: []byte("committed\n")}, {stdout: []byte("deadbeef\n")},
+			}},
+			chunks: []GitOutput{
+				{Stream: GitOutputStdout, Chunk: []byte("hook started\n")},
+				{Stream: GitOutputStderr, Chunk: []byte("claim_token=compozy_claim_hook_secret\n")},
+			},
+		}
+		events := &recordingEventSink{}
+		service := NewService(newMemoryWorktreeStore(), runner, WithEvents(events))
+		steps, err := service.runExitSequence(
+			t.Context(),
+			ExitOperation{ID: "op-hook-output", WorkspaceID: "ws-hook", WorktreeID: "wt-hook"},
+			Worktree{Path: "/repo", Branch: "feature/exit"},
+			&ExitPlan{CommitScope: ExitCommitScope{ChangedFiles: 1}},
+			ExitActionRequest{Action: ExitActionCommit, Message: "Run hooks"},
+		)
+		if err != nil || len(steps) != 1 || steps[0].State != "completed" {
+			t.Fatalf("runExitSequence() = %#v, %v", steps, err)
+		}
+		stdout := exitEventPayloadForStream(t, events, GitOutputStdout)
+		if stdout.OperationID != "op-hook-output" || stdout.Action != ExitActionCommit ||
+			stdout.Phase != ExitPhaseCommit || stdout.Stream != string(GitOutputStdout) ||
+			stdout.Chunk != "hook started\n" {
+			t.Fatalf("first hook output payload = %#v", stdout)
+		}
+		encoded, marshalErr := json.Marshal(events.events)
+		if marshalErr != nil {
+			t.Fatalf("marshal events: %v", marshalErr)
+		}
+		if strings.Contains(string(encoded), "compozy_claim_hook_secret") ||
+			!strings.Contains(string(encoded), "compozy_claim_[REDACTED]") {
+			t.Fatalf("hook output events leaked raw token: %s", encoded)
+		}
+		if outputIndex, terminalIndex := exitEventIndex(
+			events,
+			EventExitHookOutput,
+		), exitLastEventIndex(
+			events,
+			EventExitActionStep,
+		); outputIndex < 0 || terminalIndex < 0 ||
+			outputIndex >= terminalIndex {
+			t.Fatalf("event order output=%d terminal-step=%d, want output first", outputIndex, terminalIndex)
+		}
+	})
+
+	t.Run("Should keep a completed commit when the following push fails", func(t *testing.T) {
+		t.Parallel()
+		runner := &recordingGitRunner{responses: []gitResponse{
+			{}, {stdout: []byte("new.txt\x00")}, {stdout: []byte("committed\n")}, {stdout: []byte("deadbeef\n")},
+			{stdout: []byte("# branch.oid deadbeef\x00# branch.head feature/exit\x00")},
+			{stderr: []byte("remote rejected\n"), err: errors.New("push rejected")},
+		}}
+		service := NewService(newMemoryWorktreeStore(), runner)
+		steps, err := service.runExitSequence(
+			t.Context(), ExitOperation{ID: "op-push-failure"},
+			Worktree{Path: "/repo", Branch: "feature/exit"},
+			&ExitPlan{CommitScope: ExitCommitScope{ChangedFiles: 1}},
+			ExitActionRequest{Action: ExitActionCommitPush},
+		)
+		if err == nil || len(steps) != 2 || steps[0].State != "completed" || steps[0].SHA != "deadbeef" ||
+			steps[1].State != "failed" || !strings.Contains(steps[1].Output, "remote rejected") {
+			t.Fatalf("runExitSequence() = %#v, %v", steps, err)
+		}
+	})
+
+	t.Run("Should skip an empty staged commit without creating one", func(t *testing.T) {
+		t.Parallel()
+		runner := &recordingGitRunner{responses: []gitResponse{{}, {}}}
+		service := NewService(newMemoryWorktreeStore(), runner)
+		step, err := service.runExitCommit(
+			t.Context(), ExitOperation{}, ExitActionCommit,
+			Worktree{Path: "/repo"}, ExitCommitScope{}, "",
+		)
+		if err != nil || step.State != "skipped" || step.Reason != "nothing to commit" ||
+			containsCommandPrefix(invocationCommands(runner.invocations()), "commit") {
+			t.Fatalf("runExitCommit() = %#v, %v; calls=%#v", step, err, runner.invocations())
+		}
+	})
+
+	t.Run("Should commit a staged whitespace-only filename", func(t *testing.T) {
+		t.Parallel()
+		runner := &recordingGitRunner{responses: []gitResponse{
+			{}, {stdout: []byte(" \x00")}, {stdout: []byte("committed\n")}, {stdout: []byte("deadbeef\n")},
+		}}
+		service := NewService(newMemoryWorktreeStore(), runner)
+		step, err := service.runExitCommit(
+			t.Context(), ExitOperation{}, ExitActionCommit,
+			Worktree{Path: "/repo"}, ExitCommitScope{}, "",
+		)
+		if err != nil || step.State != "completed" || step.SHA != "deadbeef" ||
+			countCommand(invocationCommands(runner.invocations()), "commit -m Update 1 files") != 1 {
+			t.Fatalf("runExitCommit(whitespace filename) = %#v, %v; calls=%#v", step, err, runner.invocations())
+		}
+	})
+
+	t.Run("Should preserve an idempotent existing PR result and draft request", func(t *testing.T) {
+		t.Parallel()
+		store := newMemoryWorktreeStore()
+		item := Worktree{
+			ID: "wt-pr", WorkspaceID: "ws-pr", Path: "/repo", Branch: "feature/pr", State: StateReady,
+			CreatedAt: statusTestClock(), UpdatedAt: statusTestClock(),
+		}
+		if err := store.Insert(t.Context(), item); err != nil {
+			t.Fatalf("seed PR worktree: %v", err)
+		}
+		provider := &recordingExitForge{create: &ForgePRResult{
+			Status: "opened_existing", Number: 51,
+			URL: "https://secret@github.com/acme/repo/pull/51?token=bad#fragment",
+		}}
+		service := NewService(store, &recordingGitRunner{}, WithForge(provider), WithClock(statusTestClock))
+		step, err := service.runExitPR(t.Context(), item, &ExitPlan{
+			Base: "main", RemoteURLs: []string{"https://github.com/acme/repo.git"},
+			Forge: &ForgeCapabilities{Provider: "github"},
+		}, ExitActionRequest{Action: ExitActionOpenPR, Title: "Exit", Body: "Ready", Draft: true})
+		cached, cacheErr := store.GetForgeStatus(t.Context(), item.WorkspaceID, item.ID)
+		if err != nil || cacheErr != nil || step.PRStatus != "opened_existing" || step.PRNumber != 51 ||
+			step.URL != "https://github.com/acme/repo/pull/51" || cached != nil || provider.createCalls != 1 ||
+			!provider.lastCreate.Draft || provider.lastCreate.Title != "Exit" || provider.lastCreate.Body != "Ready" ||
+			provider.lastCreate.Base != "main" {
+			t.Fatalf(
+				"runExitPR() = %#v, %v; request=%#v calls=%d",
+				step,
+				err,
+				provider.lastCreate,
+				provider.createCalls,
+			)
+		}
+	})
+
+	t.Run("Should reuse the planned PR defaults when the request keeps the resolved base", func(t *testing.T) {
+		t.Parallel()
+		item := Worktree{
+			ID: "wt-pr", WorkspaceID: "ws-pr", Path: "/repo", Branch: "feature/pr", State: StateReady,
+			CreatedAt: statusTestClock(), UpdatedAt: statusTestClock(),
+		}
+		store := newMemoryWorktreeStore()
+		if err := store.Insert(t.Context(), item); err != nil {
+			t.Fatalf("seed worktree: %v", err)
+		}
+		provider := &recordingExitForge{create: &ForgePRResult{
+			Status: "opened", Number: 52, URL: "https://github.com/acme/repo/pull/52",
+		}}
+		runner := &recordingGitRunner{}
+		service := NewService(store, runner, WithForge(provider), WithClock(statusTestClock))
+		step, err := service.runExitPR(
+			t.Context(),
+			item,
+			&ExitPlan{
+				Base: "main", RemoteURLs: []string{"https://github.com/acme/repo.git"},
+				Forge:     &ForgeCapabilities{Provider: "github"},
+				PRPrefill: &ExitPRPrefill{Title: "feature/pr", Body: "## Summary\nPlanned body."},
+			},
+			ExitActionRequest{Action: ExitActionOpenPR},
+		)
+		if err != nil || step.PRStatus != "opened" || provider.lastCreate.Title != "feature/pr" ||
+			provider.lastCreate.Body != "## Summary\nPlanned body." || len(runner.invocations()) != 0 {
+			t.Fatalf("runExitPR() = %#v, %v; request=%#v", step, err, provider.lastCreate)
+		}
+	})
+}
+
+type recordingExitForge struct {
+	capabilities    *ForgeCapabilities
+	capabilityCalls int
+	status          *ForgeStatus
+	statusErr       error
+	statusCalls     int
+	lastStatus      ForgeStatusRequest
+	create          *ForgePRResult
+	createErr       error
+	createCalls     int
+	lastCreate      ForgePRRequest
+}
+
+func (f *recordingExitForge) Capabilities(context.Context, []string) (*ForgeCapabilities, error) {
+	f.capabilityCalls++
+	return f.capabilities, nil
+}
+
+type streamingRecordingGitRunner struct {
+	*recordingGitRunner
+	chunks []GitOutput
+}
+
+func (r *streamingRecordingGitRunner) RunStreaming(
+	ctx context.Context,
+	dir string,
+	onOutput GitOutputHandler,
+	args ...string,
+) ([]byte, []byte, error) {
+	stdout, stderr, err := r.Run(ctx, dir, args...)
+	for _, chunk := range r.chunks {
+		onOutput(chunk)
+	}
+	return stdout, stderr, err
+}
+
+func (f *recordingExitForge) Status(_ context.Context, request ForgeStatusRequest) (*ForgeStatus, error) {
+	f.statusCalls++
+	f.lastStatus = request
+	return f.status, f.statusErr
+}
+
+func (f *recordingExitForge) CreatePR(_ context.Context, request ForgePRRequest) (*ForgePRResult, error) {
+	f.createCalls++
+	f.lastCreate = request
+	return f.create, f.createErr
+}
+
+type exitActionFixture struct {
+	service *Service
+	store   *memoryWorktreeStore
+	runner  *scriptedExitRunner
+	events  *recordingEventSink
+	item    Worktree
+}
+
+func newExitActionFixture(t *testing.T, blockPush bool) exitActionFixture {
+	t.Helper()
+	root := t.TempDir()
+	commonDir := filepath.Join(root, ".git")
+	if err := os.MkdirAll(commonDir, 0o755); err != nil {
+		t.Fatalf("create Git directory: %v", err)
+	}
+	item := Worktree{
+		ID: "wt-exit", WorkspaceID: "ws-exit", Name: "exit", Branch: "feature/exit",
+		Path: root, State: StateReady, Origin: OriginManual, BaseRef: "main",
+		CreatedAt: statusTestClock(), UpdatedAt: statusTestClock(),
+	}
+	store := newMemoryWorktreeStore()
+	if err := store.Insert(t.Context(), item); err != nil {
+		t.Fatalf("seed worktree: %v", err)
+	}
+	runner := &scriptedExitRunner{
+		root: root, commonDir: commonDir, blockPush: blockPush, pushStarted: make(chan struct{}),
+	}
+	events := &recordingEventSink{}
+	service := NewService(
+		store, runner, WithCapabilityGate(readyCapabilityGate()),
+		WithWorkspaceResolver(staticWorkspaceResolver{workspaces: map[string]Workspace{
+			item.WorkspaceID: {ID: item.WorkspaceID, Root: root},
+		}}),
+		WithSessionGuard(fixedSessionGuard{}), WithEvents(events), WithClock(statusTestClock),
+		WithIDGenerator(func(string) (string, error) { return "op-exit", nil }),
+	)
+	return exitActionFixture{service: service, store: store, runner: runner, events: events, item: item}
+}
+
+type scriptedExitRunner struct {
+	mu          sync.Mutex
+	root        string
+	commonDir   string
+	committed   bool
+	pushed      bool
+	blockPush   bool
+	pushStarted chan struct{}
+	pushOnce    sync.Once
+	calls       []string
+}
+
+func (r *scriptedExitRunner) Run(ctx context.Context, _ string, args ...string) ([]byte, []byte, error) {
+	command := strings.Join(args, " ")
+	r.mu.Lock()
+	r.calls = append(r.calls, command)
+	committed, pushed := r.committed, r.pushed
+	r.mu.Unlock()
+	switch {
+	case command == "status --porcelain=v2 --branch -z":
+		if !committed {
+			return []byte("# branch.oid old\x00# branch.head feature/exit\x00? new.txt\x00"), nil, nil
+		}
+		if pushed {
+			return []byte("# branch.oid new\x00# branch.head feature/exit\x00" +
+				"# branch.upstream origin/feature/exit\x00# branch.ab +0 -0\x00"), nil, nil
+		}
+		return []byte("# branch.oid new\x00# branch.head feature/exit\x00"), nil, nil
+	case command == "diff --numstat -z", command == "diff --cached --numstat -z":
+		return nil, nil, nil
+	case command == "rev-list --count main..HEAD":
+		return []byte("1\n"), nil, nil
+	case command == "remote get-url --all origin":
+		return []byte("git@github.com:acme/repo.git\n"), nil, nil
+	case strings.HasPrefix(command, "config --get branch."):
+		return nil, nil, errors.New("not configured")
+	case command == "status --porcelain=v2 -z --untracked-files=all":
+		if committed {
+			return nil, nil, nil
+		}
+		return []byte("? new.txt\x00! ignored.env\x00"), nil, nil
+	case strings.HasPrefix(command, "rev-list --count HEAD --not"):
+		return []byte("1\n"), nil, nil
+	case command == "branch -r --list */feature/exit":
+		if pushed {
+			return []byte("origin/feature/exit\n"), nil, nil
+		}
+		return nil, nil, nil
+	case command == "rev-parse --path-format=absolute --git-common-dir":
+		return []byte(r.commonDir + "\n"), nil, nil
+	case command == "add -A":
+		return nil, nil, nil
+	case command == "diff --cached --name-only -z":
+		return []byte("new.txt\x00"), nil, nil
+	case strings.HasPrefix(command, "commit -m "):
+		r.mu.Lock()
+		r.committed = true
+		r.mu.Unlock()
+		return []byte("committed\n"), nil, nil
+	case command == "push -u origin feature/exit":
+		if r.blockPush {
+			r.pushOnce.Do(func() { close(r.pushStarted) })
+			<-ctx.Done()
+			return nil, nil, ctx.Err()
+		}
+		r.mu.Lock()
+		r.pushed = true
+		r.mu.Unlock()
+		return []byte("pushed\n"), nil, nil
+	case command == "rev-parse HEAD":
+		return []byte("deadbeef\n"), nil, nil
+	default:
+		return nil, nil, errors.New("unexpected exit Git command: " + command)
+	}
+}
+
+func (r *scriptedExitRunner) isCommitted() bool {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.committed
+}
+
+func (r *scriptedExitRunner) isPushed() bool {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.pushed
+}
+
+func (r *scriptedExitRunner) commands() []string {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return append([]string(nil), r.calls...)
+}
+
+func waitForExitOperation(
+	t *testing.T,
+	store *memoryWorktreeStore,
+	opID, state string,
+	timeout ...time.Duration,
+) ExitOperation {
+	t.Helper()
+	limit := time.Second
+	if len(timeout) > 0 {
+		limit = timeout[0]
+	}
+	deadline := time.NewTimer(limit)
+	defer deadline.Stop()
+	ticker := time.NewTicker(time.Millisecond)
+	defer ticker.Stop()
+	for {
+		if operation := exitOperation(store, opID); operation.State == state {
+			return operation
+		}
+		select {
+		case <-deadline.C:
+			t.Fatalf("operation %q did not reach %q; got %#v", opID, state, exitOperation(store, opID))
+		case <-ticker.C:
+		}
+	}
+}
+
+func exitOperation(store *memoryWorktreeStore, opID string) ExitOperation {
+	store.mu.Lock()
+	defer store.mu.Unlock()
+	return store.exitOps[opID]
+}
+
+func waitForExitEvent(t *testing.T, events *recordingEventSink, name string) {
+	t.Helper()
+	deadline := time.NewTimer(time.Second)
+	defer deadline.Stop()
+	ticker := time.NewTicker(time.Millisecond)
+	defer ticker.Stop()
+	for events.count(name) == 0 {
+		select {
+		case <-deadline.C:
+			t.Fatalf("event %q was not emitted", name)
+		case <-ticker.C:
+		}
+	}
+}
+
+func exitEventPayload(t *testing.T, events *recordingEventSink, name string) ExitEventPayload {
+	t.Helper()
+	events.mu.Lock()
+	defer events.mu.Unlock()
+	for _, v := range slices.Backward(events.events) {
+		if v.Name != name {
+			continue
+		}
+		var payload ExitEventPayload
+		if err := json.Unmarshal(v.Payload, &payload); err != nil {
+			t.Fatalf("decode %s payload: %v", name, err)
+		}
+		return payload
+	}
+	t.Fatalf("event %q not found", name)
+	return ExitEventPayload{}
+}
+
+func exitEventIndex(events *recordingEventSink, name string) int {
+	events.mu.Lock()
+	defer events.mu.Unlock()
+	for index, event := range events.events {
+		if event.Name == name {
+			return index
+		}
+	}
+	return -1
+}
+
+func exitLastEventIndex(events *recordingEventSink, name string) int {
+	events.mu.Lock()
+	defer events.mu.Unlock()
+	for index, v := range slices.Backward(events.events) {
+		if v.Name == name {
+			return index
+		}
+	}
+	return -1
+}
+
+func exitEventPayloadForStream(
+	t *testing.T,
+	events *recordingEventSink,
+	stream GitOutputStream,
+) ExitEventPayload {
+	t.Helper()
+	events.mu.Lock()
+	defer events.mu.Unlock()
+	for _, event := range events.events {
+		if event.Name != EventExitHookOutput {
+			continue
+		}
+		var payload ExitEventPayload
+		if err := json.Unmarshal(event.Payload, &payload); err != nil {
+			t.Fatalf("decode %s payload: %v", EventExitHookOutput, err)
+		}
+		if payload.Stream == string(stream) {
+			return payload
+		}
+	}
+	t.Fatalf("hook output stream %q not found", stream)
+	return ExitEventPayload{}
+}
+
+func countCommand(commands []string, expected string) int {
+	count := 0
+	for _, command := range commands {
+		if command == expected {
+			count++
+		}
+	}
+	return count
+}
+
+// managedFailureSessionBoundary isolates the runtime stop/fence I/O in exit tests.
+type managedFailureSessionBoundary struct {
+	cause error
+	stops atomic.Int64
+}
+
+func (c *managedFailureSessionBoundary) AcquireDeliveryFence(context.Context, string, string, string) (func(), error) {
+	return func() {}, nil
+}
+
+func (c *managedFailureSessionBoundary) StopDeliverySession(context.Context, string) error {
+	c.stops.Add(1)
+	return c.cause
+}

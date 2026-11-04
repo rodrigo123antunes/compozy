@@ -1,0 +1,406 @@
+import { fireEvent, render, screen, waitFor } from "@testing-library/react";
+import userEvent from "@testing-library/user-event";
+import { describe, expect, it, vi } from "vitest";
+
+import { UIProvider } from "@compozy/ui";
+import type { AgentPayload } from "@/systems/agent";
+import { FIXTURE_AGENT_DEFINITION_DIGEST } from "@/systems/agent/mocks";
+import type { WorkspacePayload } from "@/systems/workspace";
+
+import { SessionCreateDialog, type SessionCreateDialogProps } from "../session-create-dialog";
+
+// Invariant: session creation selects only durable identity and launch context; the destination
+// composer owns every prompt and runtime selection after the session exists.
+// Cancel means "stop creating the environment" while one is being built, and "dismiss" otherwise.
+// Owning layer: session create dialog presentation. Canonical suite: this component test.
+vi.mock("@/systems/status", () => ({
+  useDaemonStatus: () => ({ data: undefined }),
+}));
+
+const agents: AgentPayload[] = [
+  {
+    label: "Claude Agent",
+    kind: "on_demand",
+    resolved_appearance: {
+      version: 1,
+      avatar: "generated",
+      seed: "claude-agent",
+      generation: 1,
+      color: "#7c5cff",
+    },
+    name: "claude-agent",
+    provider: "claude",
+    prompt: "help",
+    origin: "workspace",
+    workspace_id: "ws_alpha",
+    definition_digest: FIXTURE_AGENT_DEFINITION_DIGEST,
+  },
+  {
+    label: "Codex Agent",
+    kind: "on_demand",
+    resolved_appearance: {
+      version: 1,
+      avatar: "generated",
+      seed: "codex-agent",
+      generation: 1,
+      color: "#7c5cff",
+    },
+    name: "codex-agent",
+    provider: "codex",
+    prompt: "code",
+    origin: "workspace",
+    workspace_id: "ws_alpha",
+    definition_digest: FIXTURE_AGENT_DEFINITION_DIGEST,
+  },
+];
+
+const workspace: WorkspacePayload = {
+  id: "ws_alpha",
+  root_dir: "/workspace/alpha",
+  add_dirs: [],
+  name: "alpha",
+  created_at: "2026-04-20T10:00:00Z",
+  updated_at: "2026-04-20T10:00:00Z",
+};
+
+function getDialogBackdrop(): HTMLElement {
+  const backdrop = document.querySelector('[data-slot="dialog-overlay"]');
+  if (!(backdrop instanceof HTMLElement)) {
+    throw new Error("Expected dialog backdrop to be rendered.");
+  }
+  return backdrop;
+}
+
+function makeProps(overrides: Partial<SessionCreateDialogProps> = {}): SessionCreateDialogProps {
+  return {
+    open: true,
+    restoreFocusOnClose: true,
+    onOpenChange: vi.fn(),
+    mode: "simple",
+    onModeChange: vi.fn(),
+    agents,
+    scope: "project",
+    destinationLabel: workspace.name,
+    sessionRoot: workspace.root_dir,
+    destinationReady: true,
+    sessionName: "",
+    onSessionNameChange: vi.fn(),
+    selectedAgentName: "claude-agent",
+    onAgentChange: vi.fn(),
+    onSubmit: vi.fn(),
+    isSubmitting: false,
+    isAwaitingEnvironment: false,
+    onCancelEnvironment: vi.fn(),
+    submitError: null,
+    ...overrides,
+  };
+}
+
+function renderDialog(overrides: Partial<SessionCreateDialogProps> = {}) {
+  return render(
+    <UIProvider reducedMotion="never" skipAnimations>
+      <SessionCreateDialog {...makeProps(overrides)} />
+    </UIProvider>
+  );
+}
+
+async function closeDialogFromFocusedLauncher(restoreFocusOnClose: boolean) {
+  const renderSurface = (open: boolean) => (
+    <UIProvider reducedMotion="never" skipAnimations>
+      <button data-testid="session-create-launcher" type="button">
+        New session
+      </button>
+      <SessionCreateDialog {...makeProps({ open, restoreFocusOnClose })} />
+    </UIProvider>
+  );
+  const view = render(renderSurface(false));
+  const launcher = screen.getByTestId("session-create-launcher");
+  launcher.focus();
+  view.rerender(renderSurface(true));
+  await waitFor(() => {
+    expect(screen.getByTestId("session-create-dialog")).toContainElement(
+      document.activeElement as HTMLElement
+    );
+  });
+  view.rerender(renderSurface(false));
+  await waitFor(() =>
+    expect(screen.queryByTestId("session-create-dialog")).not.toBeInTheDocument()
+  );
+  return { launcher, unmount: view.unmount };
+}
+
+function renderDialogWithFocusSource(overrides: Partial<SessionCreateDialogProps> = {}) {
+  const renderTree = (nextOverrides: Partial<SessionCreateDialogProps>) => (
+    <UIProvider reducedMotion="never" skipAnimations>
+      <button data-testid="session-create-focus-source" type="button">
+        New session
+      </button>
+      <SessionCreateDialog {...makeProps(nextOverrides)} />
+    </UIProvider>
+  );
+  const view = render(renderTree(overrides));
+  return {
+    ...view,
+    rerenderDialog: (nextOverrides: Partial<SessionCreateDialogProps>) =>
+      view.rerender(renderTree(nextOverrides)),
+  };
+}
+describe("SessionCreateDialog", () => {
+  it("Should show only the Agent field in Simple mode", () => {
+    renderDialog();
+
+    expect(screen.getByTestId("session-create-agent-select")).toBeInTheDocument();
+    expect(screen.queryByTestId("session-create-composer")).not.toBeInTheDocument();
+    expect(screen.queryByRole("textbox", { name: "First message" })).not.toBeInTheDocument();
+    expect(screen.queryByTestId("session-create-workspace-select")).not.toBeInTheDocument();
+    expect(screen.queryByTestId("session-create-name-input")).not.toBeInTheDocument();
+    expect(screen.queryByTestId("session-create-runtime-select")).not.toBeInTheDocument();
+  });
+
+  it("Should reveal name and launch details in Advanced mode", () => {
+    renderDialog({ mode: "advanced" });
+
+    expect(screen.getByTestId("session-create-agent-select")).toBeInTheDocument();
+    expect(screen.queryByTestId("session-create-composer")).not.toBeInTheDocument();
+    expect(screen.getByTestId("session-create-name-input")).toBeInTheDocument();
+    expect(screen.getByTestId("workspace-scope-statement")).toHaveTextContent(
+      "Runs in alpha — /workspace/alpha"
+    );
+    // A bounded destination is a statement, never a picker.
+    expect(screen.queryByTestId("session-destination-row")).not.toBeInTheDocument();
+    expect(screen.queryByTestId("profile-destination-chip")).not.toBeInTheDocument();
+    expect(screen.queryByTestId("session-create-workspace-select")).not.toBeInTheDocument();
+  });
+
+  it("Should ask for the project and profile inline only for the aggregated axes", () => {
+    const onProject = vi.fn();
+    renderDialog({
+      destinationAxes: {
+        project: {
+          options: [
+            { value: "ws_alpha", label: "alpha" },
+            { value: "@user", label: "User" },
+          ],
+          value: "ws_alpha",
+          onChange: onProject,
+        },
+        profile: {
+          options: [{ value: "marketing", label: "marketing" }],
+          value: "marketing",
+          onChange: vi.fn(),
+        },
+      },
+    });
+
+    const row = screen.getByTestId("session-destination-row");
+    expect(row).toHaveTextContent("In");
+    expect(screen.getByTestId("session-destination-project")).toHaveAccessibleName(
+      "Project: alpha"
+    );
+    expect(screen.getByTestId("session-destination-profile")).toHaveAccessibleName(
+      "Profile: marketing"
+    );
+    // The session surface replaces the read-only profile chip with the picker (ADR-003).
+    expect(screen.queryByTestId("profile-destination-chip")).not.toBeInTheDocument();
+  });
+
+  it("Should show only the profile picker when only profiles are aggregated", () => {
+    renderDialog({
+      destinationAxes: {
+        profile: {
+          options: [{ value: "marketing", label: "marketing" }],
+          value: "marketing",
+          onChange: vi.fn(),
+        },
+      },
+    });
+
+    expect(screen.queryByTestId("session-destination-project")).not.toBeInTheDocument();
+    expect(screen.getByTestId("session-destination-row")).toHaveTextContent("In alpha");
+  });
+
+  it("Should route Cancel to the environment while one is being created", async () => {
+    const user = userEvent.setup();
+    const onCancelEnvironment = vi.fn();
+    const onOpenChange = vi.fn();
+    renderDialog({ isAwaitingEnvironment: true, onCancelEnvironment, onOpenChange });
+
+    await user.click(screen.getByRole("button", { name: "Cancel" }));
+
+    expect(onCancelEnvironment).toHaveBeenCalledTimes(1);
+    // Stopping the worktree is not dismissing the dialog; the draft stays put.
+    expect(onOpenChange).not.toHaveBeenCalled();
+    expect(screen.getByTestId("session-create-environment-status")).toBeInTheDocument();
+    expect(screen.getByTestId("session-create-submit")).toBeDisabled();
+  });
+
+  it("Should freeze advanced launch inputs while an environment is being created", () => {
+    renderDialog({
+      environment: {
+        value: { kind: "new", name: "hotfix-cors", previous: { kind: "root" } },
+        worktrees: [],
+        onChange: vi.fn(),
+        materialization: {
+          status: "creating",
+          phase: "creating checkout",
+          start: vi.fn(),
+          cancel: vi.fn(),
+          recover: vi.fn(),
+          retry: vi.fn(),
+          reset: vi.fn(),
+        },
+      },
+      isAwaitingEnvironment: true,
+      mode: "advanced",
+    });
+
+    expect(screen.getByTestId("session-create-environment")).toBeDisabled();
+    expect(screen.getByTestId("session-create-name-input")).toBeDisabled();
+    expect(screen.queryByTestId("session-create-workspace-select")).not.toBeInTheDocument();
+  });
+
+  it("Should route Cancel to dismissal when no environment is being created", async () => {
+    const user = userEvent.setup();
+    const onCancelEnvironment = vi.fn();
+    const onOpenChange = vi.fn();
+    renderDialog({ onCancelEnvironment, onOpenChange });
+
+    await user.click(screen.getByRole("button", { name: "Cancel" }));
+
+    expect(onOpenChange).toHaveBeenCalledWith(false);
+    expect(onCancelEnvironment).not.toHaveBeenCalled();
+  });
+
+  // A failed environment must never be a dead end or discard launch details.
+  it("Should offer retry, another environment, and the workspace root when creation fails", () => {
+    renderDialog({
+      mode: "advanced",
+      environment: {
+        value: { kind: "new", name: "hotfix-cors" },
+        worktrees: [],
+        onChange: vi.fn(),
+        materialization: {
+          status: "failed",
+          error: "fatal: could not create work tree dir",
+          start: vi.fn(),
+          cancel: vi.fn(),
+          recover: vi.fn(),
+          retry: vi.fn(),
+          reset: vi.fn(),
+        },
+      },
+    });
+
+    expect(screen.getByText("fatal: could not create work tree dir")).toBeInTheDocument();
+    expect(screen.getByTestId("session-environment-retry")).toBeInTheDocument();
+    expect(screen.getByTestId("session-environment-root")).toBeInTheDocument();
+    expect(screen.getByTestId("session-create-environment")).toBeInTheDocument();
+    expect(screen.queryByTestId("session-create-composer")).not.toBeInTheDocument();
+  });
+
+  it("Should report mode changes through the shared toolbar", async () => {
+    const user = userEvent.setup();
+    const onModeChange = vi.fn();
+    renderDialog({ onModeChange });
+
+    expect(screen.getByTestId("session-create-mode-simple")).toHaveAttribute(
+      "aria-pressed",
+      "true"
+    );
+    await user.click(screen.getByTestId("session-create-mode-advanced"));
+    expect(onModeChange).toHaveBeenCalledWith("advanced");
+  });
+
+  it("Should report agent and name changes to the owner", async () => {
+    const user = userEvent.setup();
+    const onAgentChange = vi.fn();
+    const onSessionNameChange = vi.fn();
+    renderDialog({
+      mode: "advanced",
+      onAgentChange,
+      onSessionNameChange,
+    });
+
+    await user.click(screen.getByTestId("session-create-agent-select"));
+    await user.click(screen.getByTestId("agent-command-item-codex-agent"));
+    await user.type(screen.getByTestId("session-create-name-input"), "A");
+
+    expect(onAgentChange).toHaveBeenCalledWith("codex-agent");
+    expect(onSessionNameChange).toHaveBeenCalledWith("A");
+  });
+
+  it("Should submit only through the Start session action", () => {
+    const onSubmit = vi.fn();
+    renderDialog({ onSubmit });
+
+    expect(screen.getByTestId("session-create-submit")).toHaveTextContent("Start session");
+    expect(screen.queryByRole("button", { name: /send/i })).not.toBeInTheDocument();
+    fireEvent.click(screen.getByTestId("session-create-submit"));
+    expect(onSubmit).toHaveBeenCalledTimes(1);
+  });
+
+  it("Should block submission until an available agent is selected", () => {
+    const onSubmit = vi.fn();
+    renderDialog({ onSubmit, selectedAgentName: "missing-agent" });
+
+    expect(screen.getByTestId("session-create-submit")).toBeDisabled();
+    fireEvent.click(screen.getByTestId("session-create-submit"));
+    expect(onSubmit).not.toHaveBeenCalled();
+  });
+
+  it("Should disable the agent picker until a destination is ready", () => {
+    renderDialog({ destinationReady: false });
+
+    expect(screen.getByTestId("session-create-agent-select")).toBeDisabled();
+    expect(screen.getByTestId("session-create-agent-select")).toHaveTextContent(
+      "Select a workspace first"
+    );
+    expect(screen.getByTestId("session-create-submit")).toBeDisabled();
+  });
+
+  it("Should keep creation feedback inline and prevent dismissal while submitting", () => {
+    const onOpenChange = vi.fn();
+    renderDialog({ isSubmitting: true, onOpenChange });
+
+    expect(screen.getByTestId("session-create-pending-status")).toHaveTextContent(
+      "Starting your session…"
+    );
+    expect(screen.getByTestId("session-create-submit")).toBeDisabled();
+    fireEvent.click(getDialogBackdrop());
+    expect(onOpenChange).not.toHaveBeenCalled();
+  });
+
+  it("Should not restore focus into the source window after successful creation", async () => {
+    const view = renderDialogWithFocusSource({ open: false });
+    const sourceWindowFocusTarget = screen.getByTestId("session-create-focus-source");
+    sourceWindowFocusTarget.focus();
+    expect(sourceWindowFocusTarget).toHaveFocus();
+
+    view.rerenderDialog({ isSubmitting: true, open: true });
+    await waitFor(() => expect(sourceWindowFocusTarget).not.toHaveFocus());
+
+    view.rerenderDialog({ open: false });
+    await waitFor(() =>
+      expect(screen.queryByTestId("session-create-dialog")).not.toBeInTheDocument()
+    );
+    expect(sourceWindowFocusTarget).not.toHaveFocus();
+  });
+
+  it("Should associate a create failure with the form without closing the dialog", () => {
+    renderDialog({ submitError: "Server rejected the session" });
+
+    expect(screen.getByTestId("session-create-submit-error")).toHaveTextContent(
+      "Server rejected the session"
+    );
+    expect(screen.getByTestId("session-create-dialog")).toBeInTheDocument();
+  });
+
+  it("Should restore launcher focus only for a normal dismissal", async () => {
+    const dismissed = await closeDialogFromFocusedLauncher(true);
+    expect(dismissed.launcher).toHaveFocus();
+    dismissed.unmount();
+
+    const handedOff = await closeDialogFromFocusedLauncher(false);
+    expect(handedOff.launcher).not.toHaveFocus();
+  });
+});

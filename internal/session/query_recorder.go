@@ -1,0 +1,238 @@
+package session
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"os"
+	"path/filepath"
+
+	"strings"
+
+	"github.com/compozy/compozy/internal/store"
+	"github.com/compozy/compozy/internal/store/sessiondb"
+)
+
+type recorderOpenTarget struct {
+	active EventRecorder
+	stored *storedRecorderTarget
+}
+
+type storedRecorderTarget struct {
+	owner  store.SessionDBOwner
+	dbPath string
+}
+
+func (m *Manager) openQueryRecorder(ctx context.Context, id string) (EventReadCloser, func() error, error) {
+	if m.openQueryStore == nil {
+		return nil, nil, errors.New("session: query recorder opener is required")
+	}
+	for attempt := range 2 {
+		target, err := m.resolveRecorderOpenTarget(ctx, id, true)
+		if err != nil {
+			return nil, nil, err
+		}
+		if target.active != nil {
+			return target.active, func() error { return nil }, nil
+		}
+		if target.stored == nil {
+			return nil, nil, errors.New("session: resolved query recorder target is empty")
+		}
+		reader, err := m.openQueryStore(ctx, target.stored.owner, target.stored.dbPath)
+		if err == nil {
+			return reader, m.eventStoreCleanup(reader), nil
+		}
+		if attempt == 0 && errors.Is(err, sessiondb.ErrReadOnlyPoolQuiescing) {
+			if waitErr := m.waitForConversationFinalization(ctx, target.stored.owner.SessionID); waitErr != nil {
+				return nil, nil, waitErr
+			}
+			continue
+		}
+		return nil, nil, normalizeRecorderOpenError(target.stored.owner.SessionID, err)
+	}
+	return nil, nil, errors.New("session: query recorder retry exhausted")
+}
+
+// UpgradeSessionDatabase lets the daemon migrate retained histories before
+// publishing read-only surfaces. Older schemas and stale rewind baselines open a writer;
+// unknown, ahead, corrupt, or foreign databases retain their refusal unchanged.
+func (m *Manager) UpgradeSessionDatabase(ctx context.Context, id string) error {
+	reader, cleanup, err := m.openQueryRecorder(ctx, id)
+	if err == nil {
+		stateReader, ok := reader.(store.ConversationRewindReader)
+		stale := false
+		var readErr error
+		if ok {
+			state, found, stateErr := stateReader.ConversationRewindState(ctx)
+			readErr = stateErr
+			stale = found && state.BaselineStale
+		}
+		if closeErr := cleanup(); readErr != nil || closeErr != nil {
+			return errors.Join(readErr, closeErr)
+		}
+		if !stale {
+			return nil
+		}
+	}
+	if errors.Is(err, ErrSessionNotFound) {
+		meta, metaErr := m.readMetaWithContext(ctx, id)
+		if metaErr == nil &&
+			meta.RuntimeStatus == store.SessionRuntimeUnbound &&
+			meta.RuntimeTransition == store.SessionRuntimeTransitionNone &&
+			meta.ACPSessionID == nil {
+			dbPath := store.SessionDBFile(filepath.Join(m.homePaths.SessionsDir, meta.ID))
+			if _, statErr := os.Stat(dbPath); errors.Is(statErr, os.ErrNotExist) {
+				// Accepted sessions have metadata before their first runtime binds an event database.
+				return nil
+			}
+		}
+	}
+	if err != nil && !errors.Is(err, store.ErrSchemaBehind) {
+		return err
+	}
+	recorder, cleanup, err := m.openMutationRecorder(ctx, id)
+	if err != nil {
+		return err
+	}
+	_, _, refreshErr := refreshStaleConversationRewindBaseline(ctx, recorder)
+	return errors.Join(refreshErr, cleanup())
+}
+
+func (m *Manager) openMutationRecorder(ctx context.Context, id string) (EventRecorder, func() error, error) {
+	if m.openStore == nil {
+		return nil, nil, errors.New("session: mutable recorder opener is required")
+	}
+	target, err := m.resolveRecorderOpenTarget(ctx, id, false)
+	if err != nil {
+		return nil, nil, err
+	}
+	if target.active != nil {
+		return target.active, func() error { return nil }, nil
+	}
+	if target.stored == nil {
+		return nil, nil, errors.New("session: resolved mutable recorder target is empty")
+	}
+	recorder, err := m.openStore(ctx, target.stored.owner, target.stored.dbPath)
+	if err != nil {
+		return nil, nil, normalizeRecorderOpenError(target.stored.owner.SessionID, err)
+	}
+	return recorder, m.eventStoreCleanup(recorder), nil
+}
+
+func (m *Manager) resolveRecorderOpenTarget(
+	ctx context.Context,
+	id string,
+	allowReadOnlyFallback bool,
+) (recorderOpenTarget, error) {
+	if ctx == nil {
+		return recorderOpenTarget{}, errors.New("session: query context is required")
+	}
+
+	target := strings.TrimSpace(id)
+	if target == "" {
+		return recorderOpenTarget{}, errors.New("session: session id is required")
+	}
+	if err := m.waitForConversationFinalization(ctx, target); err != nil {
+		return recorderOpenTarget{}, err
+	}
+
+	waited, err := m.waitForSessionFinalization(ctx, target)
+	if err != nil {
+		return recorderOpenTarget{}, fmt.Errorf("session: wait for finalization for %q: %w", target, err)
+	}
+
+	if session, ok := m.Get(target); ok {
+		recorder := session.recorderHandle()
+		if recorder == nil && session.Info().State == StateStarting {
+			if err := waitForSessionStartRecorder(ctx, m.sessionStartRun(target)); err != nil {
+				return recorderOpenTarget{}, fmt.Errorf(
+					"session: wait for recorder for %q: %w",
+					target,
+					err,
+				)
+			}
+			recorder = session.recorderHandle()
+		}
+		if recorder != nil {
+			return recorderOpenTarget{active: recorder}, nil
+		}
+		if !waited {
+			recorder := session.recorderHandle()
+			if recorder != nil {
+				return recorderOpenTarget{active: recorder}, nil
+			}
+			if allowReadOnlyFallback {
+				m.logger.DebugContext(
+					ctx,
+					"session: active recorder unavailable; falling back to stored events",
+					"session_id",
+					target,
+				)
+			} else {
+				return recorderOpenTarget{}, fmt.Errorf("session: recorder is not available for %q", target)
+			}
+		}
+	}
+
+	meta, err := m.readMetaWithContext(ctx, target)
+	if err != nil {
+		return recorderOpenTarget{}, err
+	}
+
+	dbPath := store.SessionDBFile(filepath.Join(m.homePaths.SessionsDir, target))
+	owner, err := m.resolveStoredSessionOwner(ctx, &meta)
+	if err != nil {
+		return recorderOpenTarget{}, fmt.Errorf("session: resolve catalog owner for %q: %w", target, err)
+	}
+	if err := m.recoverOwnedSessionDBClear(ctx, owner, dbPath); err != nil {
+		return recorderOpenTarget{}, fmt.Errorf("session: recover clear state for %q: %w", target, err)
+	}
+	if _, err := os.Stat(dbPath); err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return recorderOpenTarget{}, fmt.Errorf("%w: %s", ErrSessionNotFound, target)
+		}
+		return recorderOpenTarget{}, fmt.Errorf("session: stat events database for %q: %w", target, err)
+	}
+	return recorderOpenTarget{
+		stored: &storedRecorderTarget{
+			owner:  owner,
+			dbPath: dbPath,
+		},
+	}, nil
+}
+
+func normalizeRecorderOpenError(sessionID string, err error) error {
+	if errors.Is(err, sessiondb.ErrReadOnlyPoolQuiescing) {
+		return fmt.Errorf("%w: %s", ErrSessionNotFound, sessionID)
+	}
+	return fmt.Errorf("session: open events database for %q: %w", sessionID, err)
+}
+
+func (m *Manager) eventStoreCleanup(store store.EventCloser) func() error {
+	return func() error {
+		closeCtx, cancel := m.lifecycleCleanupContext()
+		defer cancel()
+		return store.Close(closeCtx)
+	}
+}
+
+func (m *Manager) waitForSessionFinalization(ctx context.Context, id string) (bool, error) {
+	target := strings.TrimSpace(id)
+	if target == "" {
+		return false, nil
+	}
+
+	m.mu.RLock()
+	finalization, ok := m.finalizing[target]
+	m.mu.RUnlock()
+	if !ok || finalization == nil {
+		return false, nil
+	}
+
+	select {
+	case <-finalization.done:
+		return true, nil
+	case <-ctx.Done():
+		return true, ctx.Err()
+	}
+}

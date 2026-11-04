@@ -1,0 +1,42 @@
+CREATE TABLE notification_cursors (
+			scope_kind        TEXT NOT NULL CHECK (scope_kind IN ('global', 'workspace')),
+			profile_id        TEXT NOT NULL REFERENCES profiles(id),
+			workspace_id      TEXT NOT NULL DEFAULT '' CHECK (
+				(scope_kind = 'global' AND workspace_id = '') OR
+(scope_kind = 'workspace' AND workspace_id <> '')
+			),
+			consumer_id       TEXT NOT NULL CHECK (consumer_id <> ''),
+			stream_name       TEXT NOT NULL CHECK (stream_name <> ''),
+			subject_id        TEXT NOT NULL DEFAULT '',
+			last_sequence     INTEGER NOT NULL DEFAULT 0 CHECK (last_sequence >= 0),
+			last_delivery_id  TEXT NOT NULL DEFAULT '',
+			last_delivered_at TEXT,
+			last_error        TEXT NOT NULL DEFAULT '',
+			updated_at        TEXT NOT NULL,
+			PRIMARY KEY (scope_kind, profile_id, workspace_id, consumer_id, stream_name, subject_id)
+		);
+
+CREATE INDEX notification_cursors_stream_sequence_idx
+			ON notification_cursors(scope_kind, profile_id, workspace_id, stream_name, last_sequence DESC)
+			WHERE last_sequence > 0;
+
+CREATE TABLE attention_acknowledgements (
+    profile_id TEXT NOT NULL REFERENCES profiles(id),
+    actor_kind TEXT NOT NULL,
+    actor_id TEXT NOT NULL,
+    occurrence_id TEXT NOT NULL,
+    acknowledged_at TEXT NOT NULL,
+    PRIMARY KEY (profile_id, actor_kind, actor_id, occurrence_id)
+);
+
+CREATE TABLE attention_snapshots (
+    id TEXT PRIMARY KEY,
+    profile_id TEXT NOT NULL REFERENCES profiles(id),
+    actor_kind TEXT NOT NULL,
+    actor_id TEXT NOT NULL,
+    population TEXT NOT NULL,
+    occurrence_ids TEXT NOT NULL CHECK (json_valid(occurrence_ids)),
+    expires_at TEXT NOT NULL
+);
+
+CREATE INDEX attention_snapshots_expiry_idx ON attention_snapshots(expires_at);

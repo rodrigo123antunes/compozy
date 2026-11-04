@@ -1,0 +1,253 @@
+package daemon
+
+import (
+	"context"
+	"errors"
+
+	"log/slog"
+	"os"
+
+	"sync"
+	"syscall"
+	"time"
+
+	"github.com/compozy/compozy/internal/admission"
+	core "github.com/compozy/compozy/internal/api/core"
+
+	"github.com/compozy/compozy/internal/cmdpalette"
+	compozyconfig "github.com/compozy/compozy/internal/config"
+	extensionpkg "github.com/compozy/compozy/internal/extension"
+	"github.com/compozy/compozy/internal/gateway"
+	"github.com/compozy/compozy/internal/heartbeat"
+	hookspkg "github.com/compozy/compozy/internal/hooks"
+	looppkg "github.com/compozy/compozy/internal/loop"
+
+	"github.com/compozy/compozy/internal/observe"
+	profilepkg "github.com/compozy/compozy/internal/profile"
+	"github.com/compozy/compozy/internal/providers"
+
+	"github.com/compozy/compozy/internal/resources"
+	"github.com/compozy/compozy/internal/session"
+	"github.com/compozy/compozy/internal/skills"
+	"github.com/compozy/compozy/internal/soul"
+	"github.com/compozy/compozy/internal/store"
+
+	taskpkg "github.com/compozy/compozy/internal/task"
+	"github.com/compozy/compozy/internal/toolruntime"
+	toolspkg "github.com/compozy/compozy/internal/tools"
+	"github.com/compozy/compozy/internal/windowmanager"
+	workspacepkg "github.com/compozy/compozy/internal/workspace"
+)
+
+const defaultShutdownTimeout = 10 * time.Second
+
+var (
+	errDaemonBootInProgress     = errors.New("daemon: boot in progress")
+	errDaemonShutdownInProgress = errors.New("daemon: shutdown in progress")
+
+	errMissingWorkspaceRemovalPreparation = errors.New(
+		"daemon: session manager does not implement workspace removal preparation",
+	)
+)
+
+// Option customizes daemon construction.
+type Option func(*Daemon)
+
+// ConfigLoader resolves the daemon-level runtime configuration.
+type ConfigLoader func() (compozyconfig.Config, error)
+
+// SessionManager is the shared transport-facing session surface consumed by daemon/.
+type SessionManager = core.SessionManager
+
+// Observer is the daemon observer surface used for transport wiring and reconciliation.
+type Observer interface {
+	core.Observer
+	session.Notifier
+	Reconcile(ctx context.Context) (store.ReconcileResult, error)
+}
+
+type daemonObserveRegistry interface {
+	observe.Registry
+	store.EventSummaryBatchWriter
+	store.SessionCatalog
+}
+
+type daemonWorkspaceRegistry interface {
+	workspacepkg.Store
+}
+
+type daemonAttentionWorkspaceMuteRegistry interface {
+	session.AttentionWorkspaceMuteReader
+	ListAttentionWorkspaceMutes(ctx context.Context, profileID string) ([]string, error)
+	ReplaceAttentionWorkspaceMutes(ctx context.Context, profileID string, workspaceIDs []string) error
+}
+
+// Registry is the composition-root database surface grouped by owning domain.
+// Consumers depend on their local narrow interfaces instead of this aggregate.
+type Registry interface {
+	daemonObserveRegistry
+	daemonWorkspaceRegistry
+	daemonAttentionWorkspaceMuteRegistry
+	store.SkillExposureRepository
+	core.TaskDesignationStore
+	gateway.Store
+	store.OnboardingStore
+	looppkg.ReconciliationStore
+	VerifyDefaultProfile(context.Context) error
+}
+
+// Server is a daemon-owned runtime component with explicit start and shutdown phases.
+type Server interface {
+	Start(ctx context.Context) error
+	Shutdown(ctx context.Context) error
+}
+
+// ServerFactory constructs runtime components such as HTTP and UDS servers.
+type ServerFactory func(ctx context.Context, deps RuntimeDeps) (Server, error)
+
+// GatewayTierServerFactory constructs one daemon-owned loopback listener for a tier and its active surfaces.
+type GatewayTierServerFactory func(
+	ctx context.Context,
+	deps *RuntimeDeps,
+	tier gateway.Tier,
+	surfaces []gateway.Surface,
+) (Server, error)
+
+type registryOpener func(ctx context.Context, path string) (Registry, error)
+type sessionManagerFactory func(ctx context.Context, deps SessionManagerDeps) (SessionManager, error)
+type observerFactory func(ctx context.Context, deps RuntimeDeps) (Observer, error)
+type extensionManagerFactory func(deps extensionManagerDeps) extensionRuntime
+type automationManagerFactory func(deps automationManagerDeps) (automationRuntime, error)
+type resourceReconcileDriverFactory func(
+	ctx context.Context,
+	deps resourceReconcileDriverDeps,
+) (resources.ReconcileDriver, error)
+
+type supportBundleShutdowner interface {
+	Shutdown(context.Context) error
+}
+
+type observerRetentionStarter interface {
+	StartRetention(context.Context) error
+}
+
+type observerRetentionStopper interface {
+	ShutdownRetention(context.Context) error
+}
+
+type resourceReconcileDriverDeps struct {
+	Config              compozyconfig.Config
+	Logger              *slog.Logger
+	Registry            Registry
+	ResourceStore       resources.RawStore
+	CodecRegistry       *resources.CodecRegistry
+	Hooks               *hookspkg.Hooks
+	AgentCatalog        *resourceCatalog[compozyconfig.AgentDef]
+	SoulCatalog         *resourceCatalog[soul.ResourceSpec]
+	HeartbeatCatalog    *resourceCatalog[heartbeat.ResourceSpec]
+	ToolCatalog         *resourceCatalog[toolspkg.Tool]
+	MCPServerCatalog    *resourceCatalog[compozyconfig.MCPServer]
+	LoopCatalog         *resourceCatalog[looppkg.ResourceSpec]
+	WindowLayoutCatalog *resourceCatalog[windowmanager.LayoutResource]
+	SkillsRegistry      *skills.Registry
+	Automation          automationResourceProjectorTarget
+}
+
+type extensionRuntime interface {
+	Start(context.Context) error
+	Stop(context.Context) error
+	Reload(context.Context) error
+	Get(string) (*extensionpkg.Extension, error)
+	InspectPackageResources(context.Context, string) (*extensionpkg.Extension, error)
+}
+
+type extensionDevRuntime interface {
+	GetForInstance(extensionpkg.InstanceKey) (*extensionpkg.Extension, error)
+	ListForWorkspace(string) []extensionpkg.ExtensionInfo
+	InspectDevelopmentGeneration(context.Context, string, string, string) (extensionpkg.DevelopmentGeneration, error)
+	LinkDevelopmentFromOrigin(context.Context, string, string, string) (*extensionpkg.Extension, error)
+	StageDevelopmentLink(context.Context, extensionpkg.InstanceKey, string, string) (*extensionpkg.DevLink, error)
+	ActivateDevelopmentLink(context.Context, extensionpkg.InstanceKey) (*extensionpkg.Extension, error)
+	ReloadExtension(context.Context, extensionpkg.InstanceKey, string) (*extensionpkg.Extension, error)
+	UnlinkDevelopment(context.Context, extensionpkg.InstanceKey) error
+	Logs(extensionpkg.InstanceKey, extensionpkg.ExtensionLogCursor) (extensionpkg.ExtensionLogSnapshot, error)
+}
+
+type extensionManagerDeps struct {
+	Registry          *extensionpkg.Registry
+	HomePaths         compozyconfig.HomePaths
+	Extensions        compozyconfig.ExtensionsConfig
+	Sessions          SessionManager
+	Clarify           toolspkg.ClarifyBroker
+	Automation        func() extensionpkg.HostAPIAutomationManager
+	Tasks             taskpkg.Manager
+	ModelCatalog      core.ModelCatalogService
+	Observer          Observer
+	SkillsRegistry    *skills.Registry
+	WorkspaceResolver workspacepkg.RuntimeResolver
+	Profiles          *profilepkg.Manager
+	Logger            *slog.Logger
+	ResourceStore     resources.RawStore
+	SourceSessions    resources.SourceSessionManager
+	ResourceCodecs    *resources.CodecRegistry
+	ResourceTrigger   func(context.Context, resources.ResourceKind, resources.ReconcileReason) error
+	SoulAuthoring     core.SoulAuthoringService
+	SoulRefresher     core.SoulRefresher
+	HeartbeatAuthor   core.HeartbeatAuthoringService
+	HeartbeatStatus   core.HeartbeatStatusService
+	HeartbeatWake     core.HeartbeatWakeService
+	SessionHealth     core.SessionHealthReader
+	WakeEvents        core.HeartbeatWakeEventReader
+	CmdPalette        cmdpalette.ViewService
+	ViewPatches       extensionpkg.ViewPatchPublisher
+	ProcessRegistry   *toolruntime.Registry
+	SecretResolver    extensionpkg.SecretRefResolver
+	EnvBindings       extensionpkg.EnvBindingStore
+	LifecycleEvents   extensionpkg.LifecycleEventSink
+	CompozyExecutable func() (string, error)
+}
+
+// Daemon is the sole Compozy composition root.
+type Daemon struct {
+	mu sync.Mutex
+
+	homePaths              compozyconfig.HomePaths
+	loadConfig             ConfigLoader
+	logger                 *slog.Logger
+	closeLogger            func() error
+	now                    func() time.Time
+	pid                    func() int
+	processStartedAt       func(int) (time.Time, error)
+	processToken           func(int) (string, error)
+	acquireLock            func(path string, pid int) (*Lock, error)
+	openRegistry           registryOpener
+	newSessionManager      sessionManagerFactory
+	newObserver            observerFactory
+	newExtensionManager    extensionManagerFactory
+	newAutomationManager   automationManagerFactory
+	newResourceReconcile   resourceReconcileDriverFactory
+	httpFactory            ServerFactory
+	udsFactory             ServerFactory
+	gatewayTierFactory     GatewayTierServerFactory
+	gatewayProviderEffects gateway.EffectDriver
+	signalProcess          func(int, syscall.Signal) error
+	processAlive           func(int) bool
+	executable             func() (string, error)
+	startDetached          detachedStartFunc
+	signalCh               <-chan os.Signal
+	verifyBoundaries       bool
+	boundaryRoot           string
+	getenv                 func(string) string
+
+	readyCh            chan struct{}
+	readyClosed        bool
+	booting            bool
+	shutdown           *daemonShutdownOperation
+	restartRequested   bool
+	config             compozyconfig.Config
+	admission          admission.Gate
+	providerPreStarter *providers.PreStarter
+	// providerAuthVerdicts keeps the last live provider sign-in verdict for settings and provider list.
+	providerAuthVerdicts *providers.AuthVerdicts
+	daemonRuntimeState
+}

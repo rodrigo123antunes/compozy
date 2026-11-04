@@ -1,0 +1,396 @@
+package spec
+
+import (
+	"github.com/compozy/compozy/internal/api/contract"
+	"github.com/compozy/compozy/internal/workspaceaccess"
+)
+
+const taskExecutionProfileConflictDescription = "Task execution profile conflict"
+
+func registryTaskManagementOperations() []OperationSpec {
+	operations := []OperationSpec{
+		listTasksOperationSpec(),
+		createTaskOperationSpec(),
+		getTaskOperationSpec(),
+		inspectTaskOperationSpec(),
+		deleteTaskOperationSpec(),
+		updateTaskOperationSpec(),
+		blockTaskOperationSpec(),
+		listTaskBlocksOperationSpec(),
+		clearTaskBlockOperationSpec(),
+		recoverTaskOperationSpec(),
+		getTaskExecutionProfileOperationSpec(),
+		setTaskExecutionProfileOperationSpec(),
+		setTaskWorktreePolicyOperationSpec(),
+		deleteTaskExecutionProfileOperationSpec(),
+		listTaskReviewsOperationSpec(),
+	}
+	for index := range operations {
+		operations[index].Parameters = ensureProfileParameters(
+			operations[index].Parameters,
+			operations[index].Method == httpMethodGet,
+		)
+	}
+	return operations
+}
+func listTasksOperationSpec() OperationSpec {
+	return OperationSpec{
+		Method:      httpMethodGet,
+		Path:        specAPITasksPath,
+		AppAccess:   AppAccessAllowed,
+		OperationID: "listTasks",
+		Summary:     "List a bounded task catalog page",
+		Tags:        []string{specTasksKey},
+		Transports:  []Transport{TransportHTTP, TransportUDS},
+		Parameters: withProfileScope(
+			boolQueryParam(
+				"all_workspaces",
+				"Read every project and User within the profile lens; conflicts with workspace",
+			),
+			workspaceIDsQueryParam("Repeatable project IDs; @user selects User; requires all_workspaces=true"),
+			enumQueryParam(
+				specScopeKey,
+				"Filter by catalog visibility",
+				append(taskCatalogScopeValues(), "user", workspaceaccess.UserSelector),
+			),
+			queryParam(specWorkspaceKey, "Filter by workspace path, name, or ID", false),
+			enumQueryParam("status", "Filter by task status", taskStatusValues()),
+			enumQueryParam("priority", "Filter by task priority", taskPriorityValues()),
+			boolQueryParam("include_drafts", "Include draft tasks in list results"),
+			boolQueryParam("include_loop", "Include Loop execution records; omitted means false"),
+			queryParam("loop_run_id", "Filter by Loop run ID; also includes Loop execution records", false),
+			enumQueryParam("approval_state", "Filter by task approval state", taskApprovalStateValues()),
+			enumQueryParam("owner_kind", "Filter by owner kind", taskOwnerKindValues()),
+			queryParam("owner_ref", "Filter by owner reference", false),
+			queryParam("parent_task_id", "Filter by parent task ID", false),
+			queryParam("worktree", "Filter by active run worktree ID", false),
+			queryParam("query", "Filter by task title or identifier", false),
+			enumQueryParam("sort", "Order by recent activity or priority", taskCatalogSortValues()),
+			queryParam("cursor", "Opaque query-bound continuation cursor", false),
+			intQueryParam("limit", "Page size from 1 to 200 (default 50)"),
+		),
+		Responses: []ResponseSpec{
+			{Status: 403, Description: specAggregateDeniedText, Body: contract.ErrorPayload{}},
+			{Status: 200, Description: "OK", Body: contract.TasksResponse{}},
+			{Status: 404, Description: specWorkspaceNotFoundDescription, Body: contract.ErrorPayload{}},
+			{Status: 400, Description: "Invalid task filter or cursor", Body: contract.TaskQueryErrorPayload{}},
+			{Status: 410, Description: workspaceRootMissingDescription, Body: contract.ErrorPayload{}},
+			{Status: 503, Description: specTaskServiceIsNotConfiguredDescription, Body: contract.ErrorPayload{}},
+			{Status: 500, Description: specInternalServerErrorDescription, Body: contract.ErrorPayload{}},
+		},
+	}
+}
+func createTaskOperationSpec() OperationSpec {
+	return OperationSpec{
+		Method:      httpMethodPost,
+		Path:        specAPITasksPath,
+		AppAccess:   AppAccessAllowed,
+		OperationID: "createTask",
+		Summary:     "Create a task",
+		Tags:        []string{specTasksKey},
+		Transports:  []Transport{TransportHTTP, TransportUDS},
+		Parameters:  withProfileSelector(),
+		RequestBody: contract.CreateTaskRequest{},
+		Responses: []ResponseSpec{
+			{Status: 201, Description: specCreatedDescription, Body: contract.TaskResponse{}},
+			{Status: 404, Description: specWorkspaceNotFoundDescription, Body: contract.ErrorPayload{}},
+			{Status: 409, Description: "Task conflict", Body: contract.ErrorPayload{}},
+			{Status: 413, Description: specPayloadTooLargeDescription, Body: contract.ErrorPayload{}},
+			{Status: 422, Description: "Invalid task request", Body: contract.ErrorPayload{}},
+			{Status: 503, Description: specTaskServiceIsNotConfiguredDescription, Body: contract.ErrorPayload{}},
+			{Status: 500, Description: specInternalServerErrorDescription, Body: contract.ErrorPayload{}},
+		},
+	}
+}
+func getTaskOperationSpec() OperationSpec {
+	return OperationSpec{
+		Method:      httpMethodGet,
+		Path:        specAPITasksIDPath,
+		AppAccess:   AppAccessAllowed,
+		OperationID: "getTask",
+		Summary:     "Get one task with detail",
+		Tags:        []string{specTasksKey},
+		Transports:  []Transport{TransportHTTP, TransportUDS},
+		Parameters: withProfileScope(
+			pathParam("id", "Task id"),
+		),
+		Responses: []ResponseSpec{
+			{Status: 200, Description: "OK", Body: contract.TaskDetailResponse{}},
+			{Status: 404, Description: specTaskNotFoundDescription, Body: contract.ErrorPayload{}},
+			{Status: 422, Description: specInvalidTaskIDDescription, Body: contract.ErrorPayload{}},
+			{Status: 503, Description: specTaskServiceIsNotConfiguredDescription, Body: contract.ErrorPayload{}},
+			{Status: 500, Description: specInternalServerErrorDescription, Body: contract.ErrorPayload{}},
+		},
+	}
+}
+func inspectTaskOperationSpec() OperationSpec {
+	return OperationSpec{
+		Method:      httpMethodGet,
+		Path:        specAPITasksIDInspectPath,
+		AppAccess:   AppAccessAllowed,
+		OperationID: "inspectTask",
+		Summary:     "Inspect one task with diagnostics",
+		Tags:        []string{specTasksKey},
+		Transports:  []Transport{TransportHTTP, TransportUDS},
+		Parameters: []ParameterSpec{
+			pathParam("id", "Task id"),
+		},
+		Responses: []ResponseSpec{
+			{Status: 200, Description: "OK", Body: contract.TaskInspectResponse{}},
+			{Status: 404, Description: specTaskNotFoundDescription, Body: contract.ErrorPayload{}},
+			{Status: 422, Description: specInvalidTaskIDDescription, Body: contract.ErrorPayload{}},
+			{Status: 503, Description: specTaskServiceIsNotConfiguredDescription, Body: contract.ErrorPayload{}},
+			{Status: 500, Description: specInternalServerErrorDescription, Body: contract.ErrorPayload{}},
+		},
+	}
+}
+func deleteTaskOperationSpec() OperationSpec {
+	return OperationSpec{
+		Method:      httpMethodDelete,
+		Path:        specAPITasksIDPath,
+		AppAccess:   AppAccessAllowed,
+		OperationID: "deleteTask",
+		Summary:     "Delete one task",
+		Tags:        []string{specTasksKey},
+		Transports:  []Transport{TransportHTTP, TransportUDS},
+		Parameters: []ParameterSpec{
+			pathParam("id", "Task id"),
+		},
+		Responses: []ResponseSpec{
+			{Status: 204, Description: specNoContentDescription},
+			{Status: 404, Description: specTaskNotFoundDescription, Body: contract.ErrorPayload{}},
+			{Status: 400, Description: "Invalid task delete", Body: contract.ErrorPayload{}},
+			{Status: 503, Description: specTaskServiceIsNotConfiguredDescription, Body: contract.ErrorPayload{}},
+			{Status: 500, Description: specInternalServerErrorDescription, Body: contract.ErrorPayload{}},
+		},
+	}
+}
+func updateTaskOperationSpec() OperationSpec {
+	return OperationSpec{
+		Method:      httpMethodPatch,
+		Path:        specAPITasksIDPath,
+		AppAccess:   AppAccessAllowed,
+		OperationID: "updateTask",
+		Summary:     "Update one task",
+		Tags:        []string{specTasksKey},
+		Transports:  []Transport{TransportHTTP, TransportUDS},
+		Parameters: []ParameterSpec{
+			pathParam("id", "Task id"),
+		},
+		RequestBody: contract.UpdateTaskRequest{},
+		Responses: []ResponseSpec{
+			{Status: 200, Description: "OK", Body: contract.TaskResponse{}},
+			{Status: 404, Description: specTaskNotFoundDescription, Body: contract.ErrorPayload{}},
+			{Status: 409, Description: "Task update conflict", Body: contract.ErrorPayload{}},
+			{Status: 422, Description: "Invalid task update", Body: contract.ErrorPayload{}},
+			{Status: 503, Description: specTaskServiceIsNotConfiguredDescription, Body: contract.ErrorPayload{}},
+			{Status: 500, Description: specInternalServerErrorDescription, Body: contract.ErrorPayload{}},
+		},
+	}
+}
+func blockTaskOperationSpec() OperationSpec {
+	return OperationSpec{
+		Method:      httpMethodPost,
+		Path:        specAPITasksIDBlocksPath,
+		AppAccess:   AppAccessAllowed,
+		OperationID: "blockTask",
+		Summary:     "Create one typed task block",
+		Tags:        []string{specTasksKey},
+		Transports:  []Transport{TransportHTTP, TransportUDS},
+		Parameters: []ParameterSpec{
+			pathParam("id", "Task id"),
+		},
+		RequestBody: contract.CreateTaskBlockRequest{},
+		Responses: []ResponseSpec{
+			{Status: 201, Description: specCreatedDescription, Body: contract.TaskBlockResponse{}},
+			{Status: 404, Description: specTaskNotFoundDescription, Body: contract.ErrorPayload{}},
+			{Status: 409, Description: "Task block conflict", Body: contract.ErrorPayload{}},
+			{Status: 422, Description: "Invalid task block request", Body: contract.ErrorPayload{}},
+			{Status: 503, Description: specTaskServiceIsNotConfiguredDescription, Body: contract.ErrorPayload{}},
+			{Status: 500, Description: specInternalServerErrorDescription, Body: contract.ErrorPayload{}},
+		},
+	}
+}
+func listTaskBlocksOperationSpec() OperationSpec {
+	return OperationSpec{
+		Method:      httpMethodGet,
+		Path:        specAPITasksIDBlocksPath,
+		AppAccess:   AppAccessAllowed,
+		OperationID: "listTaskBlocks",
+		Summary:     "List typed task blocks",
+		Tags:        []string{specTasksKey},
+		Transports:  []Transport{TransportHTTP, TransportUDS},
+		Parameters: []ParameterSpec{
+			pathParam("id", "Task id"),
+			boolQueryParam("include_cleared", "Include cleared task blocks"),
+		},
+		Responses: []ResponseSpec{
+			{Status: 200, Description: "OK", Body: contract.TaskBlocksResponse{}},
+			{Status: 400, Description: "Invalid task block query", Body: contract.ErrorPayload{}},
+			{Status: 404, Description: specTaskNotFoundDescription, Body: contract.ErrorPayload{}},
+			{Status: 422, Description: specInvalidTaskIDDescription, Body: contract.ErrorPayload{}},
+			{Status: 503, Description: specTaskServiceIsNotConfiguredDescription, Body: contract.ErrorPayload{}},
+			{Status: 500, Description: specInternalServerErrorDescription, Body: contract.ErrorPayload{}},
+		},
+	}
+}
+func clearTaskBlockOperationSpec() OperationSpec {
+	return OperationSpec{
+		Method:      httpMethodPost,
+		Path:        specAPITasksIDBlocksBlockIDClearPath,
+		AppAccess:   AppAccessAllowed,
+		OperationID: "clearTaskBlock",
+		Summary:     "Clear one typed task block",
+		Tags:        []string{specTasksKey},
+		Transports:  []Transport{TransportHTTP, TransportUDS},
+		Parameters: []ParameterSpec{
+			pathParam("id", "Task id"),
+			pathParam("block_id", "Task block id"),
+		},
+		RequestBody: contract.ClearTaskBlockRequest{},
+		Responses: []ResponseSpec{
+			{Status: 200, Description: "OK", Body: contract.TaskBlockResponse{}},
+			{Status: 404, Description: "Task or block not found", Body: contract.ErrorPayload{}},
+			{Status: 409, Description: "Task block conflict", Body: contract.ErrorPayload{}},
+			{Status: 422, Description: "Invalid task block clear request", Body: contract.ErrorPayload{}},
+			{Status: 503, Description: specTaskServiceIsNotConfiguredDescription, Body: contract.ErrorPayload{}},
+			{Status: 500, Description: specInternalServerErrorDescription, Body: contract.ErrorPayload{}},
+		},
+	}
+}
+func recoverTaskOperationSpec() OperationSpec {
+	return OperationSpec{
+		Method:      httpMethodPost,
+		Path:        specAPITasksIDRecoverPath,
+		AppAccess:   AppAccessDenied,
+		OperationID: "recoverTask",
+		Summary:     "Recover one task from needs_attention",
+		Tags:        []string{specTasksKey},
+		Transports:  []Transport{TransportHTTP, TransportUDS},
+		Parameters: []ParameterSpec{
+			pathParam("id", "Task id"),
+		},
+		RequestBody: contract.RecoverTaskRequest{},
+		Responses: []ResponseSpec{
+			{Status: 200, Description: "OK", Body: contract.TaskResponse{}},
+			{Status: 404, Description: specTaskNotFoundDescription, Body: contract.ErrorPayload{}},
+			{Status: 409, Description: "Task recover conflict", Body: contract.ErrorPayload{}},
+			{Status: 422, Description: "Invalid task recover request", Body: contract.ErrorPayload{}},
+			{Status: 503, Description: specTaskServiceIsNotConfiguredDescription, Body: contract.ErrorPayload{}},
+			{Status: 500, Description: specInternalServerErrorDescription, Body: contract.ErrorPayload{}},
+		},
+	}
+}
+func getTaskExecutionProfileOperationSpec() OperationSpec {
+	return OperationSpec{
+		Method:      httpMethodGet,
+		Path:        specAPITasksIDExecutionProfilePath,
+		AppAccess:   AppAccessAllowed,
+		OperationID: "getTaskExecutionProfile",
+		Summary:     "Get one task execution profile",
+		Tags:        []string{specTasksKey},
+		Transports:  []Transport{TransportHTTP, TransportUDS},
+		Parameters: []ParameterSpec{
+			pathParam("id", "Task id"),
+		},
+		Responses: []ResponseSpec{
+			{Status: 200, Description: "OK", Body: contract.TaskExecutionProfileResponse{}},
+			{Status: 404, Description: specTaskNotFoundDescription, Body: contract.ErrorPayload{}},
+			{Status: 422, Description: specInvalidTaskIDDescription, Body: contract.ErrorPayload{}},
+			{Status: 503, Description: specTaskServiceIsNotConfiguredDescription, Body: contract.ErrorPayload{}},
+			{Status: 500, Description: specInternalServerErrorDescription, Body: contract.ErrorPayload{}},
+		},
+	}
+}
+func setTaskExecutionProfileOperationSpec() OperationSpec {
+	return OperationSpec{
+		Method:      httpMethodPut,
+		Path:        specAPITasksIDExecutionProfilePath,
+		AppAccess:   AppAccessAllowed,
+		OperationID: "setTaskExecutionProfile",
+		Summary:     "Replace one task execution profile",
+		Tags:        []string{specTasksKey},
+		Transports:  []Transport{TransportHTTP, TransportUDS},
+		Parameters: []ParameterSpec{
+			pathParam("id", "Task id"),
+		},
+		RequestBody: contract.SetTaskExecutionProfileRequest{},
+		Responses: []ResponseSpec{
+			{Status: 200, Description: "OK", Body: contract.TaskExecutionProfileResponse{}},
+			{Status: 400, Description: "Invalid task execution profile", Body: contract.ErrorPayload{}},
+			{Status: 404, Description: specTaskNotFoundDescription, Body: contract.ErrorPayload{}},
+			{Status: 409, Description: taskExecutionProfileConflictDescription, Body: contract.ErrorPayload{}},
+			{Status: 503, Description: specTaskServiceIsNotConfiguredDescription, Body: contract.ErrorPayload{}},
+			{Status: 500, Description: specInternalServerErrorDescription, Body: contract.ErrorPayload{}},
+		},
+	}
+}
+func setTaskWorktreePolicyOperationSpec() OperationSpec {
+	return OperationSpec{
+		Method:      httpMethodPatch,
+		Path:        specAPITasksIDExecutionProfileWorktreePath,
+		AppAccess:   AppAccessDenied,
+		OperationID: "setTaskWorktreePolicy",
+		Summary:     "Set one task worktree policy",
+		Tags:        []string{specTasksKey},
+		Transports:  []Transport{TransportHTTP, TransportUDS},
+		Parameters: []ParameterSpec{
+			pathParam("id", "Task id"),
+		},
+		RequestBody: contract.SetTaskWorktreePolicyRequest{},
+		Responses: []ResponseSpec{
+			{Status: 200, Description: "OK", Body: contract.TaskExecutionProfileResponse{}},
+			{Status: 400, Description: "Invalid task worktree policy", Body: contract.ErrorPayload{}},
+			{Status: 404, Description: specTaskNotFoundDescription, Body: contract.ErrorPayload{}},
+			{Status: 409, Description: taskExecutionProfileConflictDescription, Body: contract.ErrorPayload{}},
+			{Status: 503, Description: specTaskServiceIsNotConfiguredDescription, Body: contract.ErrorPayload{}},
+			{Status: 500, Description: specInternalServerErrorDescription, Body: contract.ErrorPayload{}},
+		},
+	}
+}
+func deleteTaskExecutionProfileOperationSpec() OperationSpec {
+	return OperationSpec{
+		Method:      httpMethodDelete,
+		Path:        specAPITasksIDExecutionProfilePath,
+		AppAccess:   AppAccessAllowed,
+		OperationID: "deleteTaskExecutionProfile",
+		Summary:     "Delete one task execution profile",
+		Tags:        []string{specTasksKey},
+		Transports:  []Transport{TransportHTTP, TransportUDS},
+		Parameters: []ParameterSpec{
+			pathParam("id", "Task id"),
+		},
+		Responses: []ResponseSpec{
+			{Status: 204, Description: specNoContentDescription},
+			{Status: 404, Description: "Task or execution profile not found", Body: contract.ErrorPayload{}},
+			{Status: 409, Description: taskExecutionProfileConflictDescription, Body: contract.ErrorPayload{}},
+			{Status: 503, Description: specTaskServiceIsNotConfiguredDescription, Body: contract.ErrorPayload{}},
+			{Status: 500, Description: specInternalServerErrorDescription, Body: contract.ErrorPayload{}},
+		},
+	}
+}
+
+func listTaskReviewsOperationSpec() OperationSpec {
+	return OperationSpec{
+		Method:      httpMethodGet,
+		Path:        "/api/tasks/{id}/reviews",
+		AppAccess:   AppAccessAllowed,
+		OperationID: "listTaskReviews",
+		Summary:     "List task-run reviews for one task",
+		Tags:        []string{specTasksKey},
+		Transports:  []Transport{TransportHTTP, TransportUDS},
+		Parameters: []ParameterSpec{
+			pathParam("id", "Task id"),
+			enumQueryParam("status", "Filter by review status", taskRunReviewStatusValues()),
+			queryParam("reviewer_session_id", "Filter by reviewer session id", false),
+			intQueryParam("limit", "Maximum number of records to return"),
+		},
+		Responses: []ResponseSpec{
+			{Status: 200, Description: "OK", Body: contract.TaskRunReviewsResponse{}},
+			{Status: 400, Description: "Invalid review filter", Body: contract.ErrorPayload{}},
+			{Status: 404, Description: specTaskNotFoundDescription, Body: contract.ErrorPayload{}},
+			{Status: 503, Description: specTaskServiceIsNotConfiguredDescription, Body: contract.ErrorPayload{}},
+			{Status: 500, Description: specInternalServerErrorDescription, Body: contract.ErrorPayload{}},
+		},
+	}
+}

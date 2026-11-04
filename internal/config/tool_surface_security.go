@@ -1,0 +1,139 @@
+package config
+
+import (
+	"fmt"
+	"maps"
+
+	"slices"
+
+	"strings"
+)
+
+func flattenConfigValue(entries *[]Entry, path string, value any, redacted bool) {
+	switch typed := value.(type) {
+	case map[string]any:
+		if len(typed) == 0 {
+			if path != "" {
+				*entries = append(*entries, Entry{Path: path, Value: map[string]any{}, Redacted: redacted})
+			}
+			return
+		}
+		keys := slices.Sorted(maps.Keys(typed))
+		for _, key := range keys {
+			nextPath := key
+			if path != "" {
+				nextPath = path + "." + key
+			}
+			nestedLoopInput := strings.HasPrefix(path, LoopsConfigKey+"."+LoopInputsConfigKey+".") &&
+				len(strings.Split(path, ".")) >= 4
+			flattenConfigValue(
+				entries,
+				nextPath,
+				typed[key],
+				redacted || key == "env" || key == "secret_env" || key == toolSurfaceAuthLoginCommandKey ||
+					(nestedLoopInput && configPathIsSecret([]string{key})),
+			)
+		}
+	case []any:
+		if len(typed) == 0 {
+			if path != "" {
+				*entries = append(*entries, Entry{Path: path, Value: []any{}, Redacted: redacted})
+			}
+			return
+		}
+		for i, item := range typed {
+			flattenConfigValue(entries, fmt.Sprintf("%s[%d]", path, i), item, redacted)
+		}
+	default:
+		if path != "" {
+			if redacted {
+				typed = RedactedValue()
+			}
+			*entries = append(*entries, Entry{Path: path, Value: typed, Redacted: redacted})
+		}
+	}
+}
+
+func configPathHasArraySyntax(path []string) bool {
+	for _, segment := range path {
+		if strings.ContainsAny(segment, "[]") {
+			return true
+		}
+	}
+	return false
+}
+
+func configPathIsSecret(path []string) bool {
+	for _, segment := range path {
+		lower := strings.ToLower(strings.TrimSpace(segment))
+		switch lower {
+		case "env", "secret_env", "secret_ref", "client_secret_ref", toolSurfaceWebhookSecretRefKey:
+			return true
+		}
+		if strings.Contains(lower, "secret") ||
+			strings.Contains(lower, "token") ||
+			strings.Contains(lower, "password") ||
+			strings.Contains(lower, "authorization") {
+			return true
+		}
+	}
+	return false
+}
+
+func configPathIsTrustRoot(path []string) bool {
+	if len(path) == 0 {
+		return true
+	}
+	switch path[0] {
+	case "daemon", string(MCPServerTransportHTTP), toolSurfacePermissionsKey, "observability", "log",
+		toolSurfaceMCPServersKey, "autonomy":
+		return true
+	case toolSurfaceHooksKey:
+		return true
+	case providersConfigKey:
+		return providerConfigPathIsTrustRoot(path)
+	case "tools":
+		return toolsConfigPathIsTrustRoot(path)
+	case SkillsDirName:
+		return skillsConfigPathIsTrustRoot(path)
+	case "extensions", vaultConfigKey:
+		return true
+	case "agents":
+		// Per-agent overrides can raise a permission level, so only the operator writes them.
+		return len(path) >= 2 && path[1] == AgentOverridesConfigKey
+	case toolSurfaceMarketplaceKey:
+		return len(path) >= 3 && path[1] == "catalog" && path[2] == configBaseURLKey
+	}
+	return false
+}
+
+func providerConfigPathIsTrustRoot(path []string) bool {
+	if len(path) < 3 {
+		return false
+	}
+	return path[2] == toolSurfaceCommandKey || path[2] == toolSurfaceMCPServersKey
+}
+
+func toolsConfigPathIsTrustRoot(path []string) bool {
+	if len(path) < 2 {
+		return false
+	}
+	switch path[1] {
+	case string(ToolsExternalDefaultEnabled), "hosted_mcp_enabled", "hosted_mcp", "policy":
+		return true
+	default:
+		return false
+	}
+}
+
+func skillsConfigPathIsTrustRoot(path []string) bool {
+	if len(path) < 2 {
+		return false
+	}
+	switch path[1] {
+	case "sources", "custom_sources", "allowed_marketplace_hooks":
+		return true
+	default:
+		return false
+	}
+}

@@ -1,0 +1,173 @@
+package toolruntime
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"strings"
+	"time"
+)
+
+func (r *Registry) checkpoint(ctx context.Context, id string, checkpoint ProcessCheckpoint) error {
+	r.mutationMu.Lock()
+	defer r.mutationMu.Unlock()
+	if ctx == nil {
+		return errors.New("toolruntime: checkpoint context is required")
+	}
+	r.mu.RLock()
+	active, ok := r.active[id]
+	if !ok {
+		r.mu.RUnlock()
+		return nil
+	}
+	record := active.record
+	r.mu.RUnlock()
+
+	if checkpoint.Owner != nil {
+		record.Owner = normalizeOwner(*checkpoint.Owner)
+	}
+	if checkpoint.PID != nil {
+		record.PID = *checkpoint.PID
+	}
+	if checkpoint.ProcessGroupID != nil {
+		record.ProcessGroupID = *checkpoint.ProcessGroupID
+	}
+	if checkpoint.StartedAt != nil {
+		record.StartedAt = checkpoint.StartedAt.UTC()
+	}
+	if checkpoint.State != "" {
+		record.State = checkpoint.State
+	}
+	if checkpoint.Error != "" {
+		record.Error = trimBounded(checkpoint.Error)
+	}
+	if checkpoint.UpdatedAt.IsZero() {
+		record.UpdatedAt = r.now().UTC()
+	} else {
+		record.UpdatedAt = checkpoint.UpdatedAt.UTC()
+	}
+
+	if err := validateRecord(record); err != nil {
+		return err
+	}
+	if err := r.upsert(ctx, record); err != nil {
+		return err
+	}
+
+	r.mu.Lock()
+	if current, ok := r.active[id]; ok {
+		if current.record.PID != record.PID || !current.record.StartedAt.Equal(record.StartedAt) {
+			current.verifiedAt = time.Time{}
+		}
+		current.record = record
+		r.active[id] = current
+	}
+	r.mu.Unlock()
+	return nil
+}
+
+func (r *Registry) complete(ctx context.Context, id string, completion ProcessCompletion) error {
+	r.mutationMu.Lock()
+	defer r.mutationMu.Unlock()
+	if ctx == nil {
+		return errors.New("toolruntime: complete context is required")
+	}
+	r.mu.RLock()
+	_, ok := r.active[id]
+	r.mu.RUnlock()
+	if !ok {
+		return nil
+	}
+
+	state := ProcessStateCompleted
+	errText := strings.TrimSpace(completion.Error)
+	if completion.Err != nil {
+		errText = completion.Err.Error()
+		state = ProcessStateFailed
+	}
+	if err := r.updateStateLocked(ctx, id, state, completion.ExitCode, errText, new(r.now().UTC())); err != nil {
+		return err
+	}
+	r.mu.Lock()
+	delete(r.active, id)
+	r.mu.Unlock()
+	return nil
+}
+
+func (r *Registry) interruptCandidates(
+	ctx context.Context,
+	scope InterruptScope,
+) ([]activeProcess, error) {
+	byID := make(map[string]activeProcess)
+
+	r.mu.RLock()
+	for id, active := range r.active {
+		if matchesScope(active.record, scope) && !isTerminalState(active.record.State) {
+			byID[id] = active
+		}
+	}
+	r.mu.RUnlock()
+
+	if r.store != nil {
+		records, err := r.store.ListProcessRecords(ctx, ProcessQuery{
+			States: activeStates(),
+			Scope:  scope,
+		})
+		if err != nil {
+			return nil, fmt.Errorf("toolruntime: list process records for interrupt: %w", err)
+		}
+		for _, record := range records {
+			if _, exists := byID[record.ID]; exists {
+				continue
+			}
+			byID[record.ID] = activeProcess{record: record}
+		}
+	}
+
+	candidates := make([]activeProcess, 0, len(byID))
+	for _, candidate := range byID {
+		candidates = append(candidates, candidate)
+	}
+	return candidates, nil
+}
+
+func matchesScope(record ProcessRecord, scope InterruptScope) bool {
+	if scope.ProcessID != "" && record.ID != scope.ProcessID {
+		return false
+	}
+	if !matchesOwnerScope(record.Owner, scope) {
+		return false
+	}
+	if scope.Source != "" && record.Source != scope.Source {
+		return false
+	}
+	return true
+}
+
+func matchesOwnerScope(owner ProcessOwner, scope InterruptScope) bool {
+	if scope.SessionID != "" && owner.SessionID != scope.SessionID {
+		return false
+	}
+	if scope.TurnID != "" && owner.TurnID != scope.TurnID {
+		return false
+	}
+	if scope.RunID != "" && owner.RunID != scope.RunID {
+		return false
+	}
+	if scope.Generation != 0 && owner.Generation != scope.Generation {
+		return false
+	}
+	if scope.ToolCallID != "" && owner.ToolCallID != scope.ToolCallID {
+		return false
+	}
+	if scope.TerminalID != "" && owner.TerminalID != scope.TerminalID {
+		return false
+	}
+	if scope.ExtensionName != "" && owner.ExtensionName != scope.ExtensionName {
+		return false
+	}
+	if scope.HookName != "" && owner.HookName != scope.HookName {
+		return false
+	}
+	return true
+}

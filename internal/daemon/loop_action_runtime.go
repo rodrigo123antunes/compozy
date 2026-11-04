@@ -1,0 +1,414 @@
+package daemon
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"log/slog"
+	"strings"
+	"sync"
+	"sync/atomic"
+	"time"
+
+	hookspkg "github.com/compozy/compozy/internal/hooks"
+	looppkg "github.com/compozy/compozy/internal/loop"
+	taskpkg "github.com/compozy/compozy/internal/task"
+)
+
+const (
+	loopActionRuntimeActorRef       = "loop-action"
+	loopActionRuntimeOriginRef      = "daemon.loop-action"
+	loopActionHeartbeatMaxInterval  = 5 * time.Minute
+	loopActionRuntimeReasonEnqueued = "task_run_enqueued"
+	loopActionRuntimeReasonRecover  = "recovery"
+	loopActionRuntimeReasonKey      = "reason"
+)
+
+type loopActionTaskManager interface {
+	ReserveRunLeaseSettlement(context.Context, string, string, time.Time, taskpkg.ActorContext) (func(), error)
+	ClaimNextRun(context.Context, taskpkg.ClaimCriteria, taskpkg.ActorContext) (*taskpkg.ClaimResult, error)
+	HeartbeatRunLease(context.Context, taskpkg.LeaseHeartbeat, taskpkg.ActorContext) (*taskpkg.Run, error)
+	BindLeasedRunSession(context.Context, taskpkg.LeaseSessionBinding, taskpkg.ActorContext) (*taskpkg.Run, error)
+	CompleteRunLease(context.Context, taskpkg.LeaseCompletion, taskpkg.ActorContext) (*taskpkg.Run, error)
+	FailRunLease(context.Context, taskpkg.LeaseFailure, taskpkg.ActorContext) (*taskpkg.Run, error)
+}
+
+type loopActionRunner interface {
+	ExecuteActionRun(context.Context, taskpkg.Run, taskpkg.ActorContext) (taskpkg.RunResult, error)
+	ActionRunTimeout(context.Context, taskpkg.Run) (time.Duration, bool, error)
+}
+
+type loopActionRuntime struct {
+	manager  loopActionTaskManager
+	store    taskStore
+	runner   loopActionRunner
+	sessions loopActionSessionStatus
+	logger   *slog.Logger
+	now      func() time.Time
+
+	root                      context.Context
+	cancel                    context.CancelFunc
+	sem                       chan struct{}
+	spawnMu                   sync.Mutex
+	wg                        sync.WaitGroup
+	stopping                  atomic.Bool
+	heartbeatInterval         func(time.Duration) time.Duration
+	livenessPollInterval      func(time.Duration) time.Duration
+	claimRetryInterval        time.Duration
+	persistenceAttemptTimeout time.Duration
+}
+
+var _ taskRunEnqueuedObserver = (*loopActionRuntime)(nil)
+
+const loopActionConcurrencyLimit = 64
+
+func newLoopActionRuntime(
+	manager loopActionTaskManager,
+	store taskStore,
+	runner loopActionRunner,
+	sessions loopActionSessionStatus,
+	logger *slog.Logger,
+	now func() time.Time,
+) (*loopActionRuntime, error) {
+	if manager == nil {
+		return nil, errors.New("daemon: loop action runtime requires task manager")
+	}
+	if store == nil {
+		return nil, errors.New("daemon: loop action runtime requires task store")
+	}
+	if runner == nil {
+		return nil, errors.New("daemon: loop action runtime requires coordinator runner")
+	}
+	if logger == nil {
+		logger = slog.Default()
+	}
+	if now == nil {
+		now = func() time.Time { return time.Now().UTC() }
+	}
+	root, cancel := context.WithCancel(context.Background())
+	return &loopActionRuntime{
+		manager:              manager,
+		store:                store,
+		runner:               runner,
+		sessions:             sessions,
+		logger:               logger,
+		now:                  now,
+		root:                 root,
+		cancel:               cancel,
+		sem:                  make(chan struct{}, loopActionConcurrencyLimit),
+		heartbeatInterval:    loopActionHeartbeatInterval,
+		livenessPollInterval: loopActionLivenessPollInterval,
+		claimRetryInterval:   loopActionClaimRetryInterval,
+	}, nil
+}
+
+func (r *loopActionRuntime) OnTaskRunEnqueued(
+	ctx context.Context,
+	payload hookspkg.TaskRunEnqueuedPayload,
+) {
+	if r == nil {
+		return
+	}
+	ctx, cancel := taskRunActivationContext(ctx)
+	defer cancel()
+	runID := strings.TrimSpace(payload.RunID)
+	if runID == "" {
+		r.logError("daemon: loop action enqueue payload missing run id", nil, payload)
+		return
+	}
+	run, err := r.store.GetTaskRun(ctx, runID)
+	if err != nil {
+		r.logError("daemon: load loop action run", err, payload)
+		return
+	}
+	taskRecord, err := r.store.GetTask(ctx, run.TaskID)
+	if err != nil {
+		r.logError("daemon: load loop action task", err, payload)
+		return
+	}
+	r.startQueuedRun(ctx, taskRecord, run, loopActionRuntimeReasonEnqueued, payload)
+}
+
+func (r *loopActionRuntime) Recover(ctx context.Context) {
+	if r == nil {
+		return
+	}
+	if ctx == nil {
+		return
+	}
+	runs, err := r.store.ListTaskRunsByStatus(ctx, []taskpkg.RunStatus{taskpkg.TaskRunStatusQueued})
+	if err != nil {
+		r.logError("daemon: list queued loop action runs", err, hookspkg.TaskRunEnqueuedPayload{})
+		return
+	}
+	for _, run := range runs {
+		if !isQueuedLoopActionRun(run) {
+			continue
+		}
+		taskRecord, err := r.store.GetTask(ctx, run.TaskID)
+		if err != nil {
+			r.logError("daemon: load loop action recovery task", err, loopActionPayload(run))
+			continue
+		}
+		r.startQueuedRun(ctx, taskRecord, run, loopActionRuntimeReasonRecover, loopActionPayload(run))
+	}
+}
+
+func (r *loopActionRuntime) startQueuedRun(
+	ctx context.Context,
+	taskRecord taskpkg.Task,
+	run taskpkg.Run,
+	reason string,
+	payload hookspkg.TaskRunEnqueuedPayload,
+) {
+	if r == nil {
+		return
+	}
+	r.spawnMu.Lock()
+	defer r.spawnMu.Unlock()
+	if r.stopping.Load() {
+		return
+	}
+	r.wg.Go(func() {
+		// Preserve composition-root recovery admission while the runtime owns cancellation.
+		runCtx, cancel := context.WithCancel(context.WithoutCancel(ctx))
+		stop := context.AfterFunc(r.root, cancel)
+		defer func() { stop(); cancel() }()
+		if err := r.executeStartedRun(runCtx, taskRecord, run, reason); err != nil &&
+			!errors.Is(err, context.Canceled) {
+			r.logError("daemon: execute loop action run", err, payload)
+		}
+	})
+}
+
+func (r *loopActionRuntime) executeQueuedRun(
+	ctx context.Context,
+	taskRecord taskpkg.Task,
+	run taskpkg.Run,
+	reason string,
+) error {
+	if !isQueuedLoopActionRun(run) {
+		return nil
+	}
+	actor, err := taskpkg.DeriveDaemonActorContext(
+		loopActionRuntimeActorRef,
+		loopActionRuntimeOriginRef,
+	)
+	if err != nil {
+		return err
+	}
+	policy, err := r.actionLivenessPolicyForRun(ctx, run)
+	if err != nil {
+		return err
+	}
+	claim, err := r.claimQueuedRun(ctx, taskRecord, run, policy.leaseDuration, actor)
+	if err != nil {
+		if errors.Is(err, taskpkg.ErrNoClaimableRun) {
+			return nil
+		}
+		return err
+	}
+	result, controlled, err := r.executeClaimedRun(
+		ctx,
+		claim,
+		actor,
+		policy.leaseDuration,
+		policy.actionTimeout,
+		policy.timeoutReason,
+		looppkg.WorkspaceID(taskRecord.WorkspaceID),
+		policy.silenceWindow,
+		policy.deathStreakLimit,
+	)
+	if controlled {
+		return err
+	}
+	return r.settleExecutedRun(ctx, claim, actor, reason, result, err)
+}
+
+func (r *loopActionRuntime) claimQueuedRun(
+	ctx context.Context,
+	taskRecord taskpkg.Task,
+	run taskpkg.Run,
+	leaseDuration time.Duration,
+	actor taskpkg.ActorContext,
+) (*taskpkg.ClaimResult, error) {
+	var claim *taskpkg.ClaimResult
+	err := retrySQLitePersistence(ctx, r.persistenceAttemptTimeout, func(attemptCtx context.Context) error {
+		var err error
+		claim, err = r.manager.ClaimNextRun(attemptCtx, taskpkg.ClaimCriteria{
+			RunID:       strings.TrimSpace(run.ID),
+			Scope:       taskRecord.Scope.Normalize(),
+			WorkspaceID: strings.TrimSpace(taskRecord.WorkspaceID),
+			RunKind:     taskpkg.RunKindWorker,
+			ClaimedBy: &taskpkg.ActorIdentity{
+				Kind: taskpkg.ActorKindDaemon,
+				Ref:  loopActionRuntimeActorRef,
+			},
+			LeaseDuration: leaseDuration,
+			Now:           r.now().UTC(),
+		}, actor)
+		return err
+	})
+	return claim, err
+}
+
+func (r *loopActionRuntime) settleExecutedRun(
+	ctx context.Context,
+	claim *taskpkg.ClaimResult,
+	actor taskpkg.ActorContext,
+	reason string,
+	result taskpkg.RunResult,
+	err error,
+) error {
+	if err != nil && ctx.Err() != nil {
+		return err
+	}
+	settleCtx, cancel := loopActionSettlementContext(ctx)
+	defer cancel()
+	settledAt := r.now().UTC()
+	var release func()
+	reserveErr := retrySQLitePersistence(
+		settleCtx,
+		r.persistenceAttemptTimeout,
+		func(attemptCtx context.Context) error {
+			var reserveErr error
+			release, reserveErr = r.manager.ReserveRunLeaseSettlement(
+				attemptCtx,
+				claim.Run.ID,
+				claim.ClaimToken,
+				settledAt,
+				actor,
+			)
+			return reserveErr
+		},
+	)
+	if reserveErr != nil {
+		return errors.Join(err, reserveErr)
+	}
+	defer release()
+	if err == nil {
+		err = looppkg.ValidateActionRunResult(claim.Run, result)
+	}
+	if err != nil {
+		return r.failClaimedRun(settleCtx, claim, actor, reason, result.TokensUsed, settledAt, err)
+	}
+	var completed *taskpkg.Run
+	var completionErr error
+	err = retrySQLitePersistence(settleCtx, r.persistenceAttemptTimeout, func(settleCtx context.Context) error {
+		completed, completionErr = r.manager.CompleteRunLease(settleCtx, taskpkg.LeaseCompletion{
+			RunID: claim.Run.ID, ClaimToken: claim.ClaimToken, Result: result,
+			TokensUsed: result.TokensUsed, Now: settledAt,
+		}, actor)
+		if completed != nil {
+			return nil
+		}
+		return completionErr
+	})
+	if completed != nil {
+		return completionErr
+	}
+	if err != nil && settleCtx.Err() == nil {
+		return r.failClaimedRun(settleCtx, claim, actor, reason, result.TokensUsed, settledAt, err)
+	}
+	return err
+}
+
+func (r *loopActionRuntime) failClaimedRun(
+	ctx context.Context,
+	claim *taskpkg.ClaimResult,
+	actor taskpkg.ActorContext,
+	reason string,
+	tokensUsed int64,
+	settledAt time.Time,
+	cause error,
+) error {
+	if claim == nil {
+		return cause
+	}
+	metadata, err := marshalLoopActionFailureMetadata(reason, cause)
+	if err != nil {
+		return errors.Join(cause, err)
+	}
+	var failureErr error
+	retryErr := retrySQLitePersistence(ctx, r.persistenceAttemptTimeout, func(settleCtx context.Context) error {
+		failed, err := r.manager.FailRunLease(settleCtx, taskpkg.LeaseFailure{
+			RunID: claim.Run.ID, ClaimToken: claim.ClaimToken,
+			Failure:    taskpkg.RunFailure{Error: cause.Error(), Metadata: metadata},
+			TokensUsed: tokensUsed, Now: settledAt,
+		}, actor)
+		failureErr = err
+		if failed != nil {
+			return nil
+		}
+		return err
+	})
+	return errors.Join(cause, failureErr, retryErr)
+}
+
+func (r *loopActionRuntime) shutdown(ctx context.Context) error {
+	if r == nil {
+		return nil
+	}
+	r.spawnMu.Lock()
+	if r.stopping.CompareAndSwap(false, true) && r.cancel != nil {
+		r.cancel()
+	}
+	r.spawnMu.Unlock()
+	return r.wait(ctx)
+}
+
+func (r *loopActionRuntime) wait(ctx context.Context) error {
+	if r == nil {
+		return nil
+	}
+	done := make(chan struct{})
+	go func() {
+		r.wg.Wait()
+		close(done)
+	}()
+	select {
+	case <-done:
+		return nil
+	case <-ctx.Done():
+		return fmt.Errorf("daemon: wait for loop action runtime: %w", ctx.Err())
+	}
+}
+
+func isQueuedLoopActionRun(run taskpkg.Run) bool {
+	return run.Status.Normalize() == taskpkg.TaskRunStatusQueued &&
+		run.RunKind.Normalize() == taskpkg.RunKindWorker &&
+		strings.TrimSpace(run.LoopRunID) != ""
+}
+
+func loopActionPayload(run taskpkg.Run) hookspkg.TaskRunEnqueuedPayload {
+	return hookspkg.TaskRunEnqueuedPayload{
+		ProfileID: strings.TrimSpace(run.ProfileID),
+		TaskID:    run.TaskID,
+		RunID:     run.ID,
+	}
+}
+
+func (r *loopActionRuntime) logError(
+	msg string,
+	err error,
+	payload hookspkg.TaskRunEnqueuedPayload,
+) {
+	if r == nil || r.logger == nil {
+		return
+	}
+	args := []any{
+		coordinatorRuntimeTaskIDKey, strings.TrimSpace(payload.TaskID),
+		daemonLogRunIDKey, strings.TrimSpace(payload.RunID),
+	}
+	if err != nil {
+		args = append(args, "error", err)
+	}
+	r.logger.Error(msg, args...)
+}
+
+func (r *loopActionRuntime) String() string {
+	if r == nil {
+		return ""
+	}
+	return fmt.Sprintf("%s:%p", loopActionRuntimeActorRef, r)
+}

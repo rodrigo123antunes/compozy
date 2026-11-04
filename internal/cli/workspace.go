@@ -1,0 +1,336 @@
+package cli
+
+import (
+	"errors"
+	"path/filepath"
+
+	"strings"
+
+	"github.com/spf13/cobra"
+)
+
+const (
+	workspaceModelKey        = "model"
+	workspaceArchiveAction   = "archive"
+	workspaceUnarchiveAction = "unarchive"
+)
+
+const (
+	workspaceAgentValue    = "Agent"
+	workspaceCategoryValue = "Category"
+	workspaceCreatedValue  = "Created"
+	workspaceNameValue     = "Name"
+	workspaceRootValue     = "Root"
+
+	workspaceSourceValue  = "Source"
+	workspaceUpdatedValue = "Updated"
+	workspaceAgentNameKey = "agent_name"
+	workspaceCategoryKey  = "category"
+	workspaceCreatedAtKey = "created_at"
+	workspaceFlagKey      = "flag"
+	workspaceListKey      = "list"
+	workspaceSourceKey    = "source"
+)
+
+func newWorkspaceCommand(deps commandDeps) *cobra.Command {
+	cmd := &cobra.Command{
+		Use:   workspaceSkillSource,
+		Short: "Manage registered workspaces",
+	}
+
+	cmd.AddCommand(newWorkspaceAddCommand(deps))
+	cmd.AddCommand(newWorkspaceListCommand(deps))
+	cmd.AddCommand(newWorkspaceInfoCommand(deps))
+	cmd.AddCommand(newWorkspaceEditCommand(deps))
+	cmd.AddCommand(newWorkspaceRemoveCommand(deps))
+	cmd.AddCommand(newWorkspaceArchiveCommand(deps, true))
+	cmd.AddCommand(newWorkspaceArchiveCommand(deps, false))
+	cmd.AddCommand(newWorkspaceFolderCommand(deps))
+	cmd.AddCommand(newWorkspaceMoveCommand(deps))
+	cmd.AddCommand(newWorkspaceReorderCommand(deps))
+	return cmd
+}
+
+func newWorkspaceAddCommand(deps commandDeps) *cobra.Command {
+	var (
+		name         string
+		addDirs      []string
+		defaultAgent string
+	)
+
+	cmd := &cobra.Command{
+		Use:   "add <path>",
+		Short: "Register a workspace",
+		Example: `  # Register a workspace with a stable name
+  compozy workspace add "$PWD" --name checkout-api
+
+  # Include an additional directory and set a workspace default agent
+  compozy workspace add "$PWD" --name platform --add-dir "$PWD/docs" --default-agent architect`,
+		Args: exactOneNonBlankArg(),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			rootDir := strings.TrimSpace(args[0])
+			if !filepath.IsAbs(rootDir) {
+				cwd, err := currentWorkingDirectory(deps)
+				if err != nil {
+					return err
+				}
+				rootDir = filepath.Join(cwd, rootDir)
+			}
+
+			client, err := clientFromDeps(deps)
+			if err != nil {
+				return err
+			}
+
+			workspace, err := client.CreateWorkspace(cmd.Context(), WorkspaceCreateRequest{
+				RootDir:      rootDir,
+				Name:         strings.TrimSpace(name),
+				AddDirs:      trimmedUniqueStrings(addDirs),
+				DefaultAgent: strings.TrimSpace(defaultAgent),
+			})
+			if err != nil {
+				return err
+			}
+
+			return writeCommandOutput(cmd, workspaceRecordBundle(workspace))
+		},
+	}
+	cmd.Flags().StringVar(&name, automationNameKey, "", "Optional workspace name")
+	cmd.Flags().
+		StringArrayVar(&addDirs, "add-dir", nil, "Additional directory to include (repeatable)")
+	cmd.Flags().
+		StringVar(&defaultAgent, "default-agent", "", "Default agent override for this workspace")
+	return cmd
+}
+
+func newWorkspaceListCommand(deps commandDeps) *cobra.Command {
+	var archived bool
+	cmd := &cobra.Command{
+		Use:   workspaceListKey,
+		Short: "List registered workspaces",
+		Example: `  # Show every registered workspace
+  compozy workspace list
+
+  # Return workspace records as JSON
+  compozy workspace list --output json`,
+		RunE: func(cmd *cobra.Command, _ []string) error {
+			client, err := clientFromDeps(deps)
+			if err != nil {
+				return err
+			}
+
+			list := client.ListWorkspaces
+			if archived {
+				list = client.ListArchivedWorkspaces
+			}
+			workspaces, err := list(cmd.Context())
+			if err != nil {
+				return err
+			}
+			return writeCommandOutput(cmd, workspaceListBundle(workspaces))
+		},
+	}
+	cmd.Flags().BoolVar(&archived, "archived", false, "List archived projects instead of active projects")
+	return cmd
+}
+
+func newWorkspaceInfoCommand(deps commandDeps) *cobra.Command {
+	var workspaceRef string
+	cmd := &cobra.Command{
+		Use:   "info [name-or-id]",
+		Short: "Show one workspace with resolved details",
+		Example: `  # Show workspace paths, agents, and skills by name
+  compozy workspace info checkout-api
+
+  # Resolve the current directory as a workspace
+  compozy workspace info
+
+  # Emit resolved workspace details as JSON
+  compozy workspace info ws_1234 -o json`,
+		Args: cobra.RangeArgs(0, 1),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			client, err := clientFromDeps(deps)
+			if err != nil {
+				return err
+			}
+
+			resolved, err := resolveCommandWorkspace(
+				cmd.Context(),
+				cmd,
+				deps,
+				client,
+				workspaceResolutionRequest{
+					PositionalRef: firstArg(args),
+					FlagRef:       workspaceRef,
+				},
+			)
+			if err != nil {
+				return err
+			}
+			return writeCommandOutput(cmd, workspaceDetailBundle(resolved.Detail))
+		},
+	}
+	cmd.Flags().
+		StringVar(
+			&workspaceRef,
+			workspaceFlagName,
+			"",
+			"Override workspace context (ID, name, or path) when no positional ref is supplied",
+		)
+	return cmd
+}
+
+func resolveCLIWorkspaceRouteRef(
+	cmd *cobra.Command,
+	deps commandDeps,
+	client workspaceLookupClient,
+	workspaceRef string,
+) (string, error) {
+	resolution, err := resolveCommandWorkspace(
+		cmd.Context(),
+		cmd,
+		deps,
+		client,
+		workspaceResolutionRequest{FlagRef: workspaceRef},
+	)
+	if err != nil {
+		return "", err
+	}
+	return resolution.ID, nil
+}
+
+func firstArg(args []string) string {
+	if len(args) == 0 {
+		return ""
+	}
+	return args[0]
+}
+
+func workspaceEditFlagsChanged(cmd *cobra.Command) bool {
+	return cmd.Flags().Changed(automationNameKey) ||
+		cmd.Flags().Changed("add-dir") ||
+		cmd.Flags().Changed("remove-dir") ||
+		cmd.Flags().Changed("default-agent")
+}
+
+func newWorkspaceEditCommand(deps commandDeps) *cobra.Command {
+	var (
+		name         string
+		addDirs      []string
+		removeDirs   []string
+		defaultAgent string
+	)
+
+	cmd := &cobra.Command{
+		Use:   "edit <name-or-id>",
+		Short: "Edit a registered workspace",
+		Example: `  # Rename a workspace
+  compozy workspace edit checkout-api --name checkout
+
+  # Clear the workspace default agent
+  compozy workspace edit checkout-api --default-agent ""`,
+		Args: exactOneNonBlankArg(),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			client, err := clientFromDeps(deps)
+			if err != nil {
+				return err
+			}
+
+			if !workspaceEditFlagsChanged(cmd) {
+				return errors.New("cli: at least one edit flag is required")
+			}
+
+			detail, err := client.GetWorkspace(cmd.Context(), args[0])
+			if err != nil {
+				return err
+			}
+
+			request := WorkspaceUpdateRequest{}
+			if cmd.Flags().Changed(automationNameKey) {
+				trimmedName := strings.TrimSpace(name)
+				if trimmedName == "" {
+					return errors.New("cli: --name cannot be empty")
+				}
+				request.Name = &trimmedName
+			}
+			if cmd.Flags().Changed("add-dir") || cmd.Flags().Changed("remove-dir") {
+				mergedDirs, err := mergeWorkspaceAddDirs(
+					detail.Workspace.AddDirs,
+					addDirs,
+					removeDirs,
+				)
+				if err != nil {
+					return err
+				}
+				request.AddDirs = &mergedDirs
+			}
+			if cmd.Flags().Changed("default-agent") {
+				request.DefaultAgent = new(strings.TrimSpace(defaultAgent))
+			}
+
+			updated, err := client.UpdateWorkspace(cmd.Context(), detail.Workspace.ID, request)
+			if err != nil {
+				return err
+			}
+
+			return writeCommandOutput(cmd, workspaceRecordBundle(updated))
+		},
+	}
+	cmd.Flags().StringVar(&name, automationNameKey, "", "Rename the workspace")
+	cmd.Flags().
+		StringArrayVar(&addDirs, "add-dir", nil, "Additional directory to include (repeatable)")
+	cmd.Flags().
+		StringArrayVar(&removeDirs, "remove-dir", nil, "Additional directory to remove (repeatable)")
+	cmd.Flags().
+		StringVar(&defaultAgent, "default-agent", "", "Override the workspace default agent (set empty to clear)")
+	return cmd
+}
+
+func newWorkspaceRemoveCommand(deps commandDeps) *cobra.Command {
+	return &cobra.Command{
+		Use:   "remove <name-or-id>",
+		Short: "Remove a workspace registration and stopped session history",
+		Example: `  # Remove a workspace registration by name
+  compozy workspace remove checkout-api`,
+		Args: exactOneNonBlankArg(),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			client, err := clientFromDeps(deps)
+			if err != nil {
+				return err
+			}
+
+			detail, err := client.GetWorkspace(cmd.Context(), args[0])
+			if err != nil {
+				return err
+			}
+			if err := client.DeleteWorkspace(cmd.Context(), detail.Workspace.ID); err != nil {
+				return err
+			}
+
+			return writeCommandOutput(cmd, workspaceRecordBundle(detail.Workspace))
+		},
+	}
+}
+
+func newWorkspaceArchiveCommand(deps commandDeps, archived bool) *cobra.Command {
+	action, title := workspaceUnarchiveAction, "Unarchive"
+	if archived {
+		action, title = workspaceArchiveAction, "Archive"
+	}
+	return &cobra.Command{
+		Use:   action + " <name-or-id>",
+		Short: title + " a workspace without removing its data",
+		Args:  exactOneNonBlankArg(),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			client, err := clientFromDeps(deps)
+			if err != nil {
+				return err
+			}
+			ws, err := client.SetWorkspaceArchived(cmd.Context(), strings.TrimSpace(args[0]), archived)
+			if err != nil {
+				return err
+			}
+			return writeCommandOutput(cmd, workspaceRecordBundle(ws))
+		},
+	}
+}

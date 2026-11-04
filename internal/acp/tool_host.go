@@ -1,0 +1,282 @@
+package acp
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"log/slog"
+	"os"
+	"path/filepath"
+	"strings"
+
+	acpsdk "github.com/coder/acp-go-sdk"
+	compozyconfig "github.com/compozy/compozy/internal/config"
+)
+
+type permissionOperation = PermissionOperation
+
+const (
+	permissionReadTextFile     = PermissionOperationReadTextFile
+	permissionWriteTextFile    = PermissionOperationWriteTextFile
+	permissionCreateTerminal   = PermissionOperationCreateTerminal
+	permissionCloseTerminal    = PermissionOperationCloseTerminal
+	permissionRequestToolGrant = PermissionOperationRequestToolGrant
+)
+
+type permissionDecision = PermissionDecision
+
+const (
+	decisionPending      = PermissionDecisionPending
+	decisionCanceled     = PermissionDecisionCanceled
+	decisionAllowOnce    = PermissionDecisionAllowOnce
+	decisionAllowAlways  = PermissionDecisionAllowAlways
+	decisionRejectOnce   = PermissionDecisionRejectOnce
+	decisionRejectAlways = PermissionDecisionRejectAlways
+)
+
+var _ ToolHost = (*localToolHost)(nil)
+
+type localToolHost struct {
+	cwd         string
+	permissions permissionPolicy
+	terminals   *terminalManager
+}
+
+type localRuntimeConfig struct {
+	terminalManager TerminalHost
+	terminalScope   LocalTerminalScope
+	additionalRoots []string
+}
+
+type LocalTerminalScope struct {
+	WorkspaceID  string
+	ProfileID    string
+	SessionID    string
+	Generation   int64
+	ActorID      string
+	AllowedRoots []string
+}
+
+// LocalRuntimeOption customizes local ACP runtime helpers.
+type LocalRuntimeOption func(*localRuntimeConfig)
+
+func WithLocalTerminalManager(manager TerminalHost, scope LocalTerminalScope) LocalRuntimeOption {
+	return func(cfg *localRuntimeConfig) {
+		cfg.terminalManager = manager
+		cfg.terminalScope = scope
+	}
+}
+
+// WithLocalAdditionalRoots authorizes local tool-host paths outside the primary root.
+func WithLocalAdditionalRoots(roots ...string) LocalRuntimeOption {
+	snapshot := append([]string(nil), roots...)
+	return func(cfg *localRuntimeConfig) {
+		cfg.additionalRoots = append(cfg.additionalRoots, snapshot...)
+	}
+}
+
+// NewLocalToolHost returns the local daemon-host file, permission, and terminal host.
+func NewLocalToolHost(
+	ctx context.Context,
+	root string,
+	mode compozyconfig.PermissionMode,
+	logger *slog.Logger,
+	opts ...LocalRuntimeOption,
+) (ToolHost, error) {
+	return newLocalToolHost(ctx, root, mode, logger, opts...)
+}
+
+func newLocalToolHost(
+	ctx context.Context,
+	root string,
+	mode compozyconfig.PermissionMode,
+	logger *slog.Logger,
+	opts ...LocalRuntimeOption,
+) (*localToolHost, error) {
+	if ctx == nil {
+		return nil, errors.New("acp: local tool host context is required")
+	}
+	cfg := localRuntimeConfig{}
+	for _, opt := range opts {
+		if opt != nil {
+			opt(&cfg)
+		}
+	}
+	policy, err := newPermissionPolicy(mode, root, cfg.additionalRoots...)
+	if err != nil {
+		return nil, err
+	}
+	return newLocalToolHostFromPolicy(ctx, root, policy, logger, opts...), nil
+}
+
+func newLocalToolHostFromPolicy(
+	ctx context.Context,
+	root string,
+	policy permissionPolicy,
+	logger *slog.Logger,
+	opts ...LocalRuntimeOption,
+) *localToolHost {
+	if logger == nil {
+		logger = slog.Default()
+	}
+	cfg := localRuntimeConfig{}
+	for _, opt := range opts {
+		if opt != nil {
+			opt(&cfg)
+		}
+	}
+	return &localToolHost{
+		cwd:         root,
+		permissions: policy,
+		terminals:   newTerminalManager(ctx, logger, cfg.terminalManager, cfg.terminalScope),
+	}
+}
+
+func (h *localToolHost) ReadTextFile(_ context.Context, path string) (string, error) {
+	if err := h.Authorize(permissionReadTextFile); err != nil {
+		return "", err
+	}
+	resolvedPath, err := h.ResolvePath(path)
+	if err != nil {
+		return "", err
+	}
+	content, err := os.ReadFile(resolvedPath)
+	if err != nil {
+		return "", fmt.Errorf("acp: read %q: %w", resolvedPath, err)
+	}
+	return string(content), nil
+}
+
+func (h *localToolHost) WriteTextFile(_ context.Context, path string, content string) error {
+	if err := h.Authorize(permissionWriteTextFile); err != nil {
+		return err
+	}
+	resolvedPath, err := h.ResolvePath(path)
+	if err != nil {
+		return err
+	}
+	if err := os.MkdirAll(filepath.Dir(resolvedPath), 0o755); err != nil {
+		return fmt.Errorf("acp: create parent directories for %q: %w", resolvedPath, err)
+	}
+	if err := os.WriteFile(resolvedPath, []byte(content), 0o600); err != nil {
+		return fmt.Errorf("acp: write %q: %w", resolvedPath, err)
+	}
+	return nil
+}
+
+func (h *localToolHost) ResolvePath(path string) (string, error) {
+	return h.permissions.resolvePath(path)
+}
+
+func (h *localToolHost) Authorize(op PermissionOperation) error {
+	return h.permissions.authorize(op)
+}
+
+func (h *localToolHost) PermissionDecisionSource(
+	req acpsdk.RequestPermissionRequest,
+) (PermissionDecision, bool, string) {
+	return h.permissions.permissionDecisionSource(req)
+}
+
+func (h *localToolHost) DaemonPermissionDecisionSource(
+	req acpsdk.RequestPermissionRequest,
+) (PermissionDecision, bool, string) {
+	return h.permissions.daemonPermissionDecisionSource(req)
+}
+
+func (h *localToolHost) PermissionDecision(
+	req acpsdk.RequestPermissionRequest,
+) (PermissionDecision, bool) {
+	return h.permissions.permissionDecision(req)
+}
+
+func (h *localToolHost) CreateTerminal(
+	ctx context.Context,
+	req acpsdk.CreateTerminalRequest,
+) (acpsdk.CreateTerminalResponse, error) {
+	return h.createTerminal(ctx, req, terminalOwnership{systemOwned: true})
+}
+
+func (h *localToolHost) createTerminal(
+	ctx context.Context,
+	req acpsdk.CreateTerminalRequest,
+	ownership terminalOwnership,
+) (acpsdk.CreateTerminalResponse, error) {
+	if ctx == nil {
+		return acpsdk.CreateTerminalResponse{}, errors.New("acp: create terminal context is required")
+	}
+	if err := h.Authorize(permissionCreateTerminal); err != nil {
+		return acpsdk.CreateTerminalResponse{}, err
+	}
+	cwd := h.cwd
+	if req.Cwd != nil {
+		cwd = *req.Cwd
+	}
+	resolvedCwd, err := h.ResolvePath(cwd)
+	if err != nil {
+		return acpsdk.CreateTerminalResponse{}, err
+	}
+	return h.terminals.create(ctx, resolvedCwd, req, ownership)
+}
+
+func (h *localToolHost) KillTerminal(id string) error {
+	return h.killTerminalWithContext(h.terminals.lifecycle, id)
+}
+
+func (h *localToolHost) killTerminalWithContext(ctx context.Context, id string) error {
+	if err := h.Authorize(permissionCloseTerminal); err != nil {
+		return err
+	}
+	return h.terminals.kill(ctx, id)
+}
+
+func (h *localToolHost) TerminalOutput(id string) (string, error) {
+	output, _, _, err := h.terminalOutputStatusWithContext(h.terminals.lifecycle, id)
+	return output, err
+}
+
+func (h *localToolHost) terminalOutputStatusWithContext(
+	ctx context.Context,
+	id string,
+) (string, bool, *acpsdk.TerminalExitStatus, error) {
+	return h.terminals.output(ctx, id)
+}
+
+func (h *localToolHost) WaitForTerminalExit(ctx context.Context, id string) (int, error) {
+	exitStatus, err := h.waitForTerminalExitStatus(ctx, id)
+	if err != nil {
+		return 0, err
+	}
+	if exitStatus == nil {
+		return 1, fmt.Errorf("acp: terminal %q exited without an exit code", id)
+	}
+	if exitStatus.ExitCode == nil {
+		if exitStatus.Signal != nil && strings.TrimSpace(*exitStatus.Signal) != "" {
+			return 1, fmt.Errorf("acp: terminal %q exited due to signal: %s", id, strings.TrimSpace(*exitStatus.Signal))
+		}
+		return 1, fmt.Errorf("acp: terminal %q exited without an exit code", id)
+	}
+	return *exitStatus.ExitCode, nil
+}
+
+func (h *localToolHost) waitForTerminalExitStatus(
+	ctx context.Context,
+	id string,
+) (*acpsdk.TerminalExitStatus, error) {
+	return h.terminals.wait(ctx, id)
+}
+
+func (h *localToolHost) ReleaseTerminal(id string) error {
+	return h.releaseTerminalWithContext(h.terminals.lifecycle, id)
+}
+
+func (h *localToolHost) releaseTerminalWithContext(ctx context.Context, id string) error {
+	return h.terminals.releaseWithContext(ctx, id)
+}
+
+func (h *localToolHost) Close() {
+	if h == nil || h.terminals == nil {
+		return
+	}
+	h.terminals.closeAll()
+}

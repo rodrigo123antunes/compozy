@@ -1,0 +1,1033 @@
+import { readFileSync } from "node:fs";
+import { join } from "node:path";
+
+import { describe, expect, it, vi } from "vitest";
+
+import { Extension } from "../extension.js";
+import {
+  CONNECTIVITY_ESTABLISH_METHOD,
+  CONNECTIVITY_STATUS_METHOD,
+  CONNECTIVITY_TEARDOWN_METHOD,
+  registerConnectivityProvider,
+  type ConnectivityProviderHandlers,
+} from "../connectivity-provider.js";
+import {
+  FORGE_CAPABILITIES_METHOD,
+  FORGE_PR_CREATE_METHOD,
+  FORGE_STATUS_METHOD,
+  registerForgeProvider,
+  type ForgeProviderHandlers,
+} from "../forge-provider.js";
+import {
+  CapabilityDeniedError,
+  InternalError,
+  InvalidParamsError,
+  MethodNotFoundError,
+  NotInitializedError,
+  ShutdownInProgressError,
+  ToolExecutionError,
+} from "../errors.js";
+import { canonicalJSON, schemaDigest } from "../schema-digest.js";
+import { TestHarness } from "../testing/harness.js";
+import { createMockTransportPair, MockTransport } from "../testing/mock-transport.js";
+import type { TransportHandler } from "../transport.js";
+import type { DescribePayload, InitializeRequest, JSONValue, ViewFrame } from "../types.js";
+import {
+  VIEW_CLOSE_METHOD,
+  VIEW_EVENT_METHOD,
+  VIEW_OPEN_METHOD,
+  registerViewProvider,
+  type ViewProviderHandlers,
+} from "../view-provider.js";
+import { ViewSessionRegistry } from "../view-session-registry.js";
+
+const DEFAULT_PROFILE_LENS = {
+  profile_lens_id: "00000000000000000000000000",
+  profile_name: "default",
+};
+
+interface SchemaDigestFixture {
+  name: string;
+  schema: JSONValue;
+  canonical: string;
+  sha256: string;
+}
+
+class FailingProvideTransport extends MockTransport {
+  public readonly connectivityHandlers = new Set<string>();
+
+  public override handle(method: string, handler: TransportHandler): void {
+    super.handle(method, handler);
+    if (!method.startsWith("connectivity/")) {
+      return;
+    }
+    this.connectivityHandlers.add(method);
+    if (method === CONNECTIVITY_STATUS_METHOD) {
+      throw new Error("connectivity transport bind failed");
+    }
+  }
+
+  public override unhandle(method: string): void {
+    super.unhandle(method);
+    this.connectivityHandlers.delete(method);
+  }
+}
+
+function initializeFor(extension: Extension): InitializeRequest {
+  const methods = extension.getImplementedMethods();
+  return {
+    protocol_version: "1",
+    supported_protocol_versions: ["1"],
+    compozy_version: "0.5.0",
+    session_nonce: "session-nonce-test",
+    extension: {
+      name: extension.definition.name,
+      version: extension.definition.version,
+      source_tier: "user",
+    },
+    capabilities: {
+      provides: extension.definition.capabilities?.provides ?? [],
+      granted_permissions: extension.definition.permissions?.requires ?? [],
+      granted_resource_kinds: [],
+      granted_resource_scopes: [],
+    },
+    methods: {
+      daemon_requests: methods.filter(method => ["health_check", "shutdown"].includes(method)),
+      extension_services: methods.filter(method => !["health_check", "shutdown"].includes(method)),
+    },
+    runtime: {
+      health_check_interval_ms: 30_000,
+      health_check_timeout_ms: 5_000,
+      shutdown_timeout_ms: 10_000,
+      default_hook_timeout_ms: 5_000,
+      default_view_timeout_ms: 3_000,
+    },
+  };
+}
+
+describe("Extension", () => {
+  it("start performs initialize handshake first", async () => {
+    const pair = createMockTransportPair();
+    const extension = new Extension(
+      {
+        name: "test-ext",
+        version: "0.1.0",
+        resources: {
+          cmd_palette: {
+            views: [{ id: "browser", title: "Notes", kind: "list", program: true }],
+          },
+        },
+      },
+      { transport: pair.extension }
+    );
+
+    const startPromise = extension.start();
+
+    await expect(pair.host.call("health_check", {})).rejects.toBeInstanceOf(NotInitializedError);
+    await expect(pair.host.call("initialize", initializeFor(extension))).resolves.toMatchObject({
+      protocol_version: "1",
+      cmd_palette_views: ["browser"],
+    });
+    await expect(startPromise).resolves.toBeDefined();
+  });
+
+  it("handle routes inbound requests to the correct handler", async () => {
+    const harness = new TestHarness();
+    const extension = new Extension({
+      name: "router",
+      version: "0.1.0",
+    });
+
+    extension.handle("custom/store", async (_ctx, params: { key: string }) => ({
+      stored: params.key,
+    }));
+    await harness.loadExtension(extension);
+
+    await expect(harness.call("custom/store", { key: "alpha" })).resolves.toEqual({
+      stored: "alpha",
+    });
+  });
+
+  it("returns method not found when no handler is registered", async () => {
+    const harness = new TestHarness();
+    const extension = new Extension({
+      name: "missing",
+      version: "0.1.0",
+    });
+
+    await harness.loadExtension(extension);
+    await expect(harness.call("custom/store", { key: "x" })).rejects.toBeInstanceOf(
+      MethodNotFoundError
+    );
+  });
+
+  it("onReady fires after successful handshake", async () => {
+    const ready = vi.fn(async () => {});
+    const harness = new TestHarness();
+    const extension = new Extension({
+      name: "ready",
+      version: "0.1.0",
+    });
+
+    extension.onReady(ready);
+    await harness.loadExtension(extension);
+
+    expect(ready).toHaveBeenCalledTimes(1);
+  });
+
+  it("rejects initialize when required grants are missing", async () => {
+    const pair = createMockTransportPair();
+    const extension = new Extension(
+      {
+        name: "denied",
+        version: "0.1.0",
+        permissions: { requires: ["sessions/list"] },
+      },
+      { transport: pair.extension }
+    );
+
+    void extension.start();
+    await expect(
+      pair.host.call("initialize", {
+        ...initializeFor(extension),
+        capabilities: {
+          provides: [],
+          granted_permissions: [],
+          granted_resource_kinds: [],
+          granted_resource_scopes: [],
+        },
+      })
+    ).rejects.toBeInstanceOf(CapabilityDeniedError);
+  });
+
+  it("serves default health checks", async () => {
+    const harness = new TestHarness();
+    const extension = new Extension({
+      name: "tools",
+      version: "0.1.0",
+    });
+
+    await harness.loadExtension(extension, {
+      daemonRequests: ["health_check", "shutdown"],
+    });
+    await expect(harness.call("health_check", {})).resolves.toMatchObject({ healthy: true });
+  });
+
+  it("captures session nonce and resource grants during initialize", async () => {
+    const ready = vi.fn();
+    const harness = new TestHarness();
+    const extension = new Extension({
+      name: "resource-ext",
+      version: "0.1.0",
+    });
+
+    extension.onReady((_host, session) => {
+      ready({
+        session_nonce: session.initializeRequest.session_nonce,
+        granted_resource_kinds: session.initializeRequest.capabilities.granted_resource_kinds,
+        granted_resource_scopes: session.initializeRequest.capabilities.granted_resource_scopes,
+      });
+    });
+
+    await harness.loadExtension(extension, {
+      sessionNonce: "nonce-resource",
+      grantedResourceKinds: ["tool", "skill"],
+      grantedResourceScopes: ["workspace"],
+    });
+
+    expect(ready).toHaveBeenCalledWith({
+      session_nonce: "nonce-resource",
+      granted_resource_kinds: ["tool", "skill"],
+      granted_resource_scopes: ["workspace"],
+    });
+  });
+
+  it("rejects new work after shutdown begins", async () => {
+    const harness = new TestHarness();
+    const extension = new Extension({
+      name: "shutdown",
+      version: "0.1.0",
+    });
+
+    await harness.loadExtension(extension);
+    await expect(harness.call("shutdown", { reason: "test", deadline_ms: 1000 })).resolves.toEqual({
+      acknowledged: true,
+    });
+    await expect(harness.call("health_check", {})).rejects.toBeInstanceOf(ShutdownInProgressError);
+  });
+
+  it("registers executable tools and preserves trusted invocation context", async () => {
+    const harness = new TestHarness();
+    const clarify = vi.fn(async () => ({ text: "ship it", fallback: false }));
+    harness.mockHostAPI("clarify/ask", clarify);
+    const extension = new Extension({
+      name: "linear",
+      version: "0.1.0",
+      permissions: { requires: ["clarify/ask"] },
+    });
+
+    extension.tool<{ query: string }>(
+      "search",
+      {
+        readOnly: true,
+        inputSchema: {
+          required: ["query"],
+          type: "object",
+          properties: {
+            query: { type: "string" },
+          },
+        },
+      },
+      async ({ input, trustedWorkspace, invocationId, askClarification }) => {
+        expect(trustedWorkspace).toEqual({ id: "workspace-1", root: "/workspace/one" });
+        expect(invocationId).toBe("invocation-1");
+        const answer = await askClarification({ question: "Deploy?", choices: ["yes", "no"] });
+        return {
+          content: [{ type: "text", text: `found ${input.query}: ${answer.text}` }],
+          truncated: false,
+          bytes: 0,
+          duration_ms: 0,
+        };
+      }
+    );
+
+    await harness.loadExtension(extension);
+
+    expect(extension.definition.capabilities?.provides).toContain("tool.provider");
+    expect(harness.getLastInitializeResponse()?.implemented_methods).toEqual(
+      expect.arrayContaining(["provide_tools", "tools/call"])
+    );
+
+    await expect(harness.call("provide_tools", {})).resolves.toEqual({
+      tools: [
+        {
+          id: "ext__linear__search",
+          handler: "search",
+          input_schema: {
+            required: ["query"],
+            type: "object",
+            properties: {
+              query: { type: "string" },
+            },
+          },
+          input_schema_digest: "1dc63095e8672403bbe40fa26719d175e695c0167f6daad6b9655f6506491f01",
+          read_only: true,
+          requires_interaction: false,
+          risk: "read",
+          capabilities: [],
+        },
+      ],
+    });
+
+    await expect(
+      harness.call("tools/call", {
+        tool_id: "ext__linear__search",
+        handler: "search",
+        session_id: "session-1",
+        invocation_id: "invocation-1",
+        trusted_workspace: { id: "workspace-1", root: "/workspace/one" },
+        input: { query: "alpha" },
+      })
+    ).resolves.toEqual({
+      result: {
+        content: [{ type: "text", text: "found alpha: ship it" }],
+        truncated: false,
+        bytes: 0,
+        duration_ms: 0,
+      },
+    });
+    expect(clarify).toHaveBeenCalledWith({
+      invocation_id: "invocation-1",
+      question: "Deploy?",
+      choices: ["yes", "no"],
+    });
+  });
+
+  it("prints a deterministic describe payload and exits without transport startup", async () => {
+    const harness = new TestHarness();
+    const extension = new Extension(
+      {
+        name: "describe-fixture",
+        version: "0.1.0",
+        description: "Describe fixture",
+        subprocess: { command: "node", args: ["index.js"] },
+        permissions: { requires: ["sessions/list"] },
+        profiles: [
+          {
+            name: " finance ",
+            color: " #d6a647 ",
+            defaults: { agent: " analyst " },
+            credentials: [{ provider: " openai ", slot: " api_key " }],
+          },
+        ],
+        resources: {
+          skills: [
+            { path: " skills/zeta ", profile: " finance " },
+            { path: "skills/alpha" },
+            { path: "skills/zeta", profile: "finance" },
+          ],
+          loops: [{ path: " loops/zeta " }, { path: "loops/alpha" }, { path: "loops/zeta" }],
+          agents: [{ path: " agents/zeta " }, { path: "agents/alpha" }, { path: "agents/zeta" }],
+          automation: [
+            { path: " automation/zeta " },
+            { path: "automation/alpha" },
+            { path: "automation/zeta" },
+          ],
+          layouts: [
+            { path: " layouts/zeta " },
+            { path: "layouts/alpha" },
+            { path: "layouts/zeta" },
+          ],
+          cmd_palette: {
+            commands: [
+              {
+                id: "search",
+                title: "Search reviews",
+                icon: "search",
+                action: { kind: "tool", tool: "search" },
+                default_shortcut: "alt+shift+KeyS",
+              },
+            ],
+            views: [{ id: "browser", title: "Notes", kind: "list", program: true }],
+          },
+        },
+        supported_hook_events: [{ event: "prompt.post_assemble", profile: "finance" }],
+      },
+      { describeProcess: harness.captureDescribeProcess() }
+    );
+    extension.tool<{ query: string }>(
+      "search",
+      {
+        profile: "finance",
+        description: "Search extension data",
+        readOnly: true,
+        requiresInteraction: true,
+        inputSchema: {
+          type: "object",
+          required: ["query"],
+          properties: { query: { type: "string" } },
+        },
+        command: {
+          verb: "review/search",
+          summary: "Search reviews",
+          flags: { query: "query" },
+        },
+      },
+      async () => ({ content: [], truncated: false, bytes: 0, duration_ms: 0 })
+    );
+    extension.commandGroup("review", "Review commands");
+    extension.watchSource("reviews", {}, async () => ({
+      ready: false,
+      event_key: "reviews:describe",
+    }));
+
+    await expect(extension.start()).resolves.toBeDefined();
+    const result = harness.getDescribeResult();
+    expect(result.exitCode).toBe(0);
+    expect(result.stdout.trim().split("\n")).toHaveLength(1);
+    const payload = JSON.parse(result.stdout) as DescribePayload;
+    expect(payload.resources).toEqual({
+      skills: [{ path: "skills/alpha" }, { path: "skills/zeta", profile: "finance" }],
+      loops: [{ path: "loops/alpha" }, { path: "loops/zeta" }],
+      agents: [{ path: "agents/alpha" }, { path: "agents/zeta" }],
+      automation: [{ path: "automation/alpha" }, { path: "automation/zeta" }],
+      layouts: [{ path: "layouts/alpha" }, { path: "layouts/zeta" }],
+      cmd_palette: {
+        commands: [
+          {
+            id: "search",
+            title: "Search reviews",
+            icon: "search",
+            action: { kind: "tool", tool: "search" },
+            default_shortcut: "alt+shift+KeyS",
+          },
+        ],
+        views: [{ id: "browser", title: "Notes", kind: "list", program: true }],
+      },
+    });
+    expect(payload.cmd_palette_views).toEqual(["browser"]);
+    expect(payload).toMatchObject({
+      name: "describe-fixture",
+      version: "0.1.0",
+      description: "Describe fixture",
+      provides: ["loop.watch_source", "tool.provider"],
+      permissions: ["sessions/list"],
+      profiles: [
+        {
+          name: "finance",
+          color: "#d6a647",
+          defaults: { agent: "analyst" },
+          credentials: [{ provider: "openai", slot: "api_key" }],
+        },
+      ],
+      subprocess: { command: "node", args: ["index.js"] },
+      tools: [
+        {
+          profile: "finance",
+          id: "ext__describe_fixture__search",
+          handler: "search",
+          description: "Search extension data",
+          input_schema: {
+            type: "object",
+            required: ["query"],
+            properties: { query: { type: "string" } },
+          },
+          input_schema_digest: schemaDigest({
+            type: "object",
+            required: ["query"],
+            properties: { query: { type: "string" } },
+          }),
+          requires_interaction: true,
+          command: {
+            verb: "review/search",
+            summary: "Search reviews",
+            flags: { query: "query" },
+          },
+        },
+      ],
+      command_groups: [{ path: "review", summary: "Review commands" }],
+      hook_events: [{ event: "prompt.post_assemble", profile: "finance" }],
+      watch_source_kinds: ["reviews"],
+      sdk: {
+        name: "@compozy/extension-sdk",
+        protocol_version: "1",
+        min_compozy_version: "0.3.0-beta.1",
+      },
+    });
+  });
+
+  it("rejects model source initialize when generated required methods are missing", async () => {
+    const pair = createMockTransportPair();
+    const extension = new Extension(
+      {
+        name: "incomplete-model-source",
+        version: "0.1.0",
+        capabilities: { provides: ["model.source"] },
+      },
+      { transport: pair.extension }
+    );
+
+    void extension.start();
+    await expect(pair.host.call("initialize", initializeFor(extension))).rejects.toMatchObject({
+      constructor: InternalError,
+      data: { error: expect.stringContaining("models/list") },
+    });
+  });
+
+  it("describes and polls heartbeat sources", async () => {
+    const harness = new TestHarness();
+    const extension = new Extension({
+      name: "heartbeat-fixture",
+      version: "0.1.0",
+      subprocess: { command: "node", args: ["index.js"] },
+    });
+    extension.heartbeatSource(
+      "issues",
+      { title: "Issues", params_schema: { type: "object" } },
+      req => ({ items: [{ key: "1", title: req.source_id }], state: req.state })
+    );
+    expect(extension.describe().heartbeat_source_kinds).toEqual([
+      { kind: "issues", title: "Issues", params_schema: { type: "object" } },
+    ]);
+    expect(() => extension.handle("heartbeat/source_poll", () => ({ items: [] }))).toThrow(
+      "reserved"
+    );
+    await harness.loadExtension(extension);
+    expect(harness.getLastInitializeResponse()?.heartbeat_source_kinds).toEqual([
+      { kind: "issues", title: "Issues", params_schema: { type: "object" } },
+    ]);
+    await expect(
+      harness.call("heartbeat/source_poll", {
+        kind: "issues",
+        source_id: "incoming",
+        state: { cursor: 1 },
+      })
+    ).resolves.toEqual({ items: [{ key: "1", title: "incoming" }], state: { cursor: 1 } });
+  });
+
+  it("leaves method registration open after an invalid heartbeat source", () => {
+    const extension = new Extension({
+      name: "heartbeat-fixture",
+      version: "1.0.0",
+      subprocess: { command: "fixture" },
+    });
+    expect(() =>
+      extension.heartbeatSource("bad/kind", { title: "Invalid" }, () => ({ items: [] }))
+    ).toThrow();
+    expect(extension.describe().heartbeat_source_kinds).toEqual([]);
+    expect(() => extension.handle("heartbeat/source_poll", () => ({ items: [] }))).not.toThrow();
+  });
+
+  it("registers watch sources and serves watch/poll", async () => {
+    const harness = new TestHarness();
+    const extension = new Extension({
+      name: "review-watcher",
+      version: "0.1.0",
+    });
+
+    extension.watchSource<{ kind: string; query: string }>(
+      "reviews",
+      {},
+      async ({ spec, expectedStateDigest }) => ({
+        ready: spec.query === "open",
+        event_key: "reviews:r1",
+        state_digest: expectedStateDigest === "sha256:previous" ? "sha256:next" : "sha256:first",
+        payload: { review: "r1" },
+        settled_at: "2026-07-05T12:00:00.000Z",
+      })
+    );
+
+    await harness.loadExtension(extension);
+
+    expect(extension.definition.capabilities?.provides).toContain("loop.watch_source");
+    expect(harness.getLastInitializeResponse()?.implemented_methods).toEqual(
+      expect.arrayContaining(["watch/poll"])
+    );
+    expect(harness.getLastInitializeResponse()?.watch_source_kinds).toEqual(["reviews"]);
+
+    await expect(
+      harness.call("watch/poll", {
+        spec: { kind: "reviews", query: "open" },
+        expected_state_digest: "sha256:previous",
+      })
+    ).resolves.toEqual({
+      ready: true,
+      event_key: "reviews:r1",
+      state_digest: "sha256:next",
+      payload: { review: "r1" },
+      settled_at: "2026-07-05T12:00:00.000Z",
+    });
+  });
+
+  it("registers and serves a connectivity provider", async () => {
+    const harness = new TestHarness();
+    const extension = new Extension({ name: "connectivity", version: "0.1.0" });
+    registerConnectivityProvider(extension, {
+      establish: (_context, request) => ({
+        tier: request.tier,
+        endpoints: [{ url: "https://gateway.example.test", scheme: "https", stability: "stable" }],
+        health: "healthy",
+      }),
+      status: (_context, request) => ({
+        tier: request.tier,
+        endpoints: [{ url: "https://gateway.example.test", scheme: "https", stability: "stable" }],
+        health: "healthy",
+      }),
+      teardown: () => ({ stopped: true }),
+    });
+    await harness.loadExtension(extension);
+    expect(extension.definition.capabilities?.provides).toContain("connectivity.provider");
+    expect(harness.getLastInitializeResponse()?.implemented_methods).toEqual(
+      expect.arrayContaining([
+        "connectivity/establish",
+        "connectivity/status",
+        "connectivity/teardown",
+      ])
+    );
+    await expect(
+      harness.call("connectivity/establish", {
+        tier: "private",
+        forward_target: "127.0.0.1:43210",
+        challenge_path: "/.well-known/compozy/gateway-challenge/typescript",
+        deadline: "2026-08-07T12:00:00Z",
+      })
+    ).resolves.toMatchObject({ tier: "private", health: "healthy" });
+    await expect(harness.call("connectivity/status", { tier: "private" })).resolves.toMatchObject({
+      tier: "private",
+      health: "healthy",
+    });
+    await expect(
+      harness.call("connectivity/teardown", {
+        tier: "private",
+        deadline: "2026-08-07T12:00:00Z",
+      })
+    ).resolves.toEqual({ stopped: true });
+  });
+
+  it("registers and serves a forge provider", async () => {
+    const harness = new TestHarness();
+    const extension = new Extension({ name: "forge", version: "0.1.0" });
+    registerForgeProvider(extension, forgeHandlers());
+    await harness.loadExtension(extension);
+
+    expect(extension.definition.capabilities?.provides).toContain("forge.provider");
+    expect(harness.getLastInitializeResponse()?.implemented_methods).toEqual(
+      expect.arrayContaining([
+        FORGE_CAPABILITIES_METHOD,
+        FORGE_STATUS_METHOD,
+        FORGE_PR_CREATE_METHOD,
+      ])
+    );
+    await expect(
+      harness.call(FORGE_CAPABILITIES_METHOD, {
+        remote_urls: ["https://github.com/acme/repo.git"],
+      })
+    ).resolves.toMatchObject({ served: true, provider: "test" });
+    await expect(
+      harness.call(FORGE_STATUS_METHOD, {
+        remote_urls: ["https://github.com/acme/repo.git"],
+        branch: "feature/exit",
+      })
+    ).resolves.toMatchObject({ provider: "test", pr_number: 7 });
+    await expect(
+      harness.call(FORGE_PR_CREATE_METHOD, {
+        remote_urls: ["https://github.com/acme/repo.git"],
+        head: "feature/exit",
+        base: "main",
+        title: "Exit",
+      })
+    ).resolves.toMatchObject({ status: "created", number: 8 });
+  });
+
+  it("owns view sessions, admits increasing generations, and closes idempotently", async () => {
+    const harness = new TestHarness();
+    const extension = new Extension({ name: "view-provider", version: "0.1.0" });
+    const registry = new ViewSessionRegistry();
+    const close = vi.fn<ViewProviderHandlers["close"]>();
+    const signals: AbortSignal[] = [];
+    registerViewProvider(
+      extension,
+      {
+        open: (context, request) => {
+          signals.push(context.signal);
+          return viewFrame(request.view_session, "r1", 0);
+        },
+        event: (context, request) => {
+          signals.push(context.signal);
+          return viewFrame(request.view_session, `r${request.generation + 1}`, request.generation);
+        },
+        close,
+      },
+      { registry }
+    );
+    await harness.loadExtension(extension);
+
+    await expect(
+      harness.call(VIEW_OPEN_METHOD, {
+        view_session: "vs_invalid",
+        view: "notes.browser",
+        workspace: "ws_1",
+        client: "client_1",
+      })
+    ).rejects.toBeInstanceOf(InvalidParamsError);
+    await expect(
+      harness.call(VIEW_OPEN_METHOD, {
+        view_session: "vs_1",
+        view: "notes.browser",
+        profile_lens: DEFAULT_PROFILE_LENS,
+        workspace: "ws_1",
+        client: "client_1",
+      })
+    ).resolves.toMatchObject({ view_session: "vs_1", generation: 0 });
+    expect(registry.size).toBe(1);
+    await expect(
+      harness.call(VIEW_EVENT_METHOD, {
+        view_session: "vs_1",
+        handler: "search",
+        revision: "r1",
+        seq: 1,
+        generation: 1,
+      })
+    ).resolves.toMatchObject({ revision: "r2", generation: 1 });
+    await expect(
+      harness.call(VIEW_EVENT_METHOD, {
+        view_session: "vs_1",
+        handler: "search",
+        revision: "r2",
+        seq: 2,
+        generation: 1,
+      })
+    ).rejects.toBeInstanceOf(InvalidParamsError);
+    await expect(
+      harness.call(VIEW_EVENT_METHOD, {
+        view_session: "vs_foreign",
+        handler: "search",
+        revision: "r1",
+        seq: 1,
+        generation: 1,
+      })
+    ).rejects.toBeInstanceOf(InvalidParamsError);
+
+    await expect(harness.call(VIEW_CLOSE_METHOD, { view_session: "vs_1" })).rejects.toBeInstanceOf(
+      InvalidParamsError
+    );
+    await expect(
+      harness.call(VIEW_CLOSE_METHOD, {
+        view_session: "vs_1",
+        profile_lens: DEFAULT_PROFILE_LENS,
+      })
+    ).resolves.toEqual({});
+    await expect(
+      harness.call(VIEW_CLOSE_METHOD, {
+        view_session: "vs_1",
+        profile_lens: DEFAULT_PROFILE_LENS,
+      })
+    ).resolves.toEqual({});
+    expect(close).toHaveBeenCalledTimes(1);
+    expect(close).toHaveBeenCalledWith(
+      expect.anything(),
+      expect.objectContaining({ profile_lens: DEFAULT_PROFILE_LENS })
+    );
+    expect(registry.size).toBe(0);
+    expect(signals).toHaveLength(2);
+    expect(signals.every(signal => signal instanceof AbortSignal)).toBe(true);
+  });
+
+  it("rolls back view sessions when open fails", async () => {
+    const harness = new TestHarness();
+    const extension = new Extension({ name: "view-open-failure", version: "0.1.0" });
+    const registry = new ViewSessionRegistry();
+    registerViewProvider(
+      extension,
+      {
+        open: () => {
+          throw new Error("open failed");
+        },
+        event: () => undefined,
+        close: () => undefined,
+      },
+      { registry }
+    );
+    await harness.loadExtension(extension);
+
+    await expect(
+      harness.call(VIEW_OPEN_METHOD, {
+        view_session: "vs_failed",
+        view: "notes.browser",
+        profile_lens: DEFAULT_PROFILE_LENS,
+        workspace: "ws_1",
+        client: "client_1",
+      })
+    ).rejects.toThrow("open failed");
+    expect(registry.size).toBe(0);
+  });
+
+  it("keeps forge provider registration atomic across collisions", () => {
+    const extension = new Extension({ name: "forge-collision", version: "0.1.0" });
+    extension.handle(FORGE_STATUS_METHOD, () => ({ provider: "existing" }));
+
+    expect(() => registerForgeProvider(extension, forgeHandlers())).toThrow(
+      "forge/status is already registered"
+    );
+    expect(extension.definition.capabilities?.provides ?? []).not.toContain("forge.provider");
+    expect(() => extension.handle(FORGE_CAPABILITIES_METHOD, () => ({}))).not.toThrow();
+    expect(() => extension.handle(FORGE_PR_CREATE_METHOD, () => ({}))).not.toThrow();
+  });
+
+  it("rejects malformed connectivity requests before calling provider handlers", async () => {
+    const harness = new TestHarness();
+    const establish = vi.fn<ConnectivityProviderHandlers["establish"]>(() => ({
+      tier: "private",
+      endpoints: [],
+      health: "healthy",
+    }));
+    const status = vi.fn<ConnectivityProviderHandlers["status"]>(() => ({
+      tier: "private",
+      endpoints: [],
+      health: "healthy",
+    }));
+    const teardown = vi.fn<ConnectivityProviderHandlers["teardown"]>(() => ({ stopped: true }));
+    const extension = new Extension({ name: "connectivity-validation", version: "0.1.0" });
+    registerConnectivityProvider(extension, { establish, status, teardown });
+    await harness.loadExtension(extension);
+
+    await expect(
+      harness.call(CONNECTIVITY_ESTABLISH_METHOD, {
+        tier: "private",
+        forward_target: "127.0.0.1:43210",
+        challenge_path: "/challenge",
+      })
+    ).rejects.toBeInstanceOf(InvalidParamsError);
+    await expect(harness.call(CONNECTIVITY_STATUS_METHOD, { tier: 42 })).rejects.toBeInstanceOf(
+      InvalidParamsError
+    );
+    await expect(harness.call(CONNECTIVITY_TEARDOWN_METHOD, null)).rejects.toBeInstanceOf(
+      InvalidParamsError
+    );
+
+    expect(establish).not.toHaveBeenCalled();
+    expect(status).not.toHaveBeenCalled();
+    expect(teardown).not.toHaveBeenCalled();
+  });
+
+  it("keeps connectivity provider registration atomic across collisions", () => {
+    const extension = new Extension({ name: "connectivity-collision", version: "0.1.0" });
+    extension.handle(CONNECTIVITY_STATUS_METHOD, () => ({ tier: "private", health: "down" }));
+
+    expect(() => registerConnectivityProvider(extension, connectivityHandlers())).toThrow(
+      "connectivity/status is already registered"
+    );
+    expect(extension.definition.capabilities?.provides ?? []).not.toContain(
+      "connectivity.provider"
+    );
+    expect(() => extension.handle(CONNECTIVITY_ESTABLISH_METHOD, () => ({}))).not.toThrow();
+    expect(() => extension.handle(CONNECTIVITY_TEARDOWN_METHOD, () => ({}))).not.toThrow();
+  });
+
+  it("rolls back transport handlers when connectivity registration fails", () => {
+    const transport = new FailingProvideTransport();
+    const extension = new Extension(
+      { name: "connectivity-bind-failure", version: "0.1.0" },
+      { transport }
+    );
+
+    expect(() => registerConnectivityProvider(extension, connectivityHandlers())).toThrow(
+      "connectivity transport bind failed"
+    );
+    expect(transport.connectivityHandlers.size).toBe(0);
+    expect(extension.definition.capabilities?.provides ?? []).not.toContain(
+      "connectivity.provider"
+    );
+    expect(extension.getImplementedMethods()).not.toEqual(
+      expect.arrayContaining([
+        CONNECTIVITY_ESTABLISH_METHOD,
+        CONNECTIVITY_STATUS_METHOD,
+        CONNECTIVITY_TEARDOWN_METHOD,
+      ])
+    );
+  });
+
+  it("rejects duplicate and every post-start registration surface", async () => {
+    const duplicate = new Extension({ name: "connectivity-duplicate", version: "0.1.0" });
+    registerConnectivityProvider(duplicate, connectivityHandlers());
+    expect(() => registerConnectivityProvider(duplicate, connectivityHandlers())).toThrow(
+      "connectivity/establish is already registered"
+    );
+
+    const pair = createMockTransportPair();
+    const late = new Extension(
+      { name: "connectivity-late", version: "0.1.0" },
+      { transport: pair.extension }
+    );
+    const started = late.start();
+    expect(() => registerConnectivityProvider(late, connectivityHandlers())).toThrow(
+      "extension registration is closed after start"
+    );
+    expect(() =>
+      late.tool("late-tool", { inputSchema: { type: "object" } }, async () => ({
+        content: [],
+        truncated: false,
+        bytes: 0,
+        duration_ms: 0,
+      }))
+    ).toThrow("extension registration is closed after start");
+    expect(() =>
+      late.watchSource("late-watch", {}, async () => ({
+        ready: false,
+        event_key: "late-watch",
+      }))
+    ).toThrow("extension registration is closed after start");
+    expect(() => late.commandGroup("late", "Late commands")).toThrow(
+      "extension registration is closed after start"
+    );
+    await pair.host.call("initialize", initializeFor(late));
+    await expect(started).resolves.toBeDefined();
+  });
+
+  it("redacts sensitive tool input from handler errors", async () => {
+    const harness = new TestHarness();
+    const extension = new Extension({
+      name: "secrets",
+      version: "0.1.0",
+    });
+
+    extension.tool<{ token: string }>(
+      "lookup",
+      {
+        readOnly: true,
+        inputSchema: {
+          type: "object",
+          required: ["token"],
+          properties: {
+            token: { type: "string" },
+          },
+        },
+        sensitiveInputFields: ["token"],
+      },
+      async ({ input }) => {
+        throw new Error(`backend rejected ${input.token}`);
+      }
+    );
+
+    await harness.loadExtension(extension);
+
+    await expect(
+      harness.call("tools/call", {
+        tool_id: "ext__secrets__lookup",
+        handler: "lookup",
+        input: { token: "secret-token" },
+      })
+    ).rejects.toMatchObject({
+      constructor: ToolExecutionError,
+      data: {
+        tool_id: "ext__secrets__lookup",
+        handler: "lookup",
+        error: "backend rejected [REDACTED]",
+        input: { token: "[REDACTED]" },
+        sensitive_input_fields: ["token"],
+      },
+    });
+  });
+
+  it("matches daemon schema digest fixtures", () => {
+    const fixturePath = join(__dirname, "../../test-fixtures/digest/cases.json");
+    const fixtures = JSON.parse(readFileSync(fixturePath, "utf8")) as SchemaDigestFixture[];
+
+    expect(fixtures.length).toBeGreaterThan(0);
+    for (const fixture of fixtures) {
+      expect(canonicalJSON(fixture.schema)).toBe(fixture.canonical);
+      expect(schemaDigest(fixture.schema)).toBe(fixture.sha256);
+    }
+  });
+});
+
+function connectivityHandlers(): ConnectivityProviderHandlers {
+  return {
+    establish: (_context, request) => ({
+      tier: request.tier,
+      endpoints: [{ url: "https://gateway.example.test", scheme: "https", stability: "stable" }],
+      health: "healthy",
+    }),
+    status: (_context, request) => ({
+      tier: request.tier,
+      endpoints: [{ url: "https://gateway.example.test", scheme: "https", stability: "stable" }],
+      health: "healthy",
+    }),
+    teardown: () => ({ stopped: true }),
+  };
+}
+
+function forgeHandlers(): ForgeProviderHandlers {
+  return {
+    capabilities: () => ({
+      served: true,
+      available: true,
+      provider: "test",
+      served_remote: "https://github.com/acme/repo",
+    }),
+    status: () => ({
+      provider: "test",
+      pr_number: 7,
+      pr_state: "open",
+      fetched_at: "2026-08-12T12:00:00Z",
+    }),
+    createPR: () => ({
+      status: "created",
+      number: 8,
+      url: "https://github.com/acme/repo/pull/8",
+    }),
+  };
+}
+
+function viewFrame(viewSession: string, revision: string, generation: number): ViewFrame {
+  return {
+    view_session: viewSession,
+    revision,
+    generation,
+    payload: {
+      view: "notes.browser",
+      sections: [{ rows: [{ id: "note-1", title: "First note" }] }],
+    },
+    handlers: ["search"],
+  };
+}

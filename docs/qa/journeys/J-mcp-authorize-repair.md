@@ -1,0 +1,92 @@
+# J-mcp-authorize-repair: Authorize and repair a remote MCP server
+
+The PRD repair journey under the ADR-011 authorization floor and ADR-016 daemon-mediated OAuth: a freshly installed (or long-broken) remote MCP server shows `needs_login`; the operator — local or away from the daemon host — authorizes it and watches truthful status confirm. Success exists only as `authenticated && token_present` (safety invariant 6); a failed or canceled attempt never leaves the server worse than before (invariant 7). This journey also owns the second PRD metric anchor for MCP: **truthful readiness — zero installed-but-broken, zero false greens**.
+
+```mermaid
+flowchart TD
+  A[Entry: Settings /settings/mcp with the selected profile and workspace] --> B[Status matrix: configured x auth x runtime x probe, four independent signals]
+  A2[Entry: compozy mcp auth login with logical name, scope and optional extension owner] --> C
+  A3[Entry: Marketplace Installed or extension detail Server section] --> B
+  B -->|needs_login OAuth remote| C[Begin: daemon PKCE session; live authorization_url always visible and copyable]
+  B -->|stdio or non-OAuth server| B2[No authorize affordance offered — truthful absence]
+  C --> R[Resolve registration: pre-registration, then CIMD, then one DCR fallback]
+  R --> D{Completion path}
+  D -->|browser on daemon host| E[Open browser; daemon-hosted callback completes]
+  D -->|remote operator| F[Copy URL to any browser; paste the full redirect URL into manual exchange]
+  D -->|non-loopback HTTP bind| F2[Auto-callback refused by daemon; manual exchange is the only path]
+  F2 --> F
+  E --> G{Refetched status for the captured owner and scope}
+  F --> G
+  G -->|authenticated AND token_present| H[Confirmed: matrix flips truthfully; CLI exits zero]
+  G -->|anything less| I[Not success: dialog stays failed; prior status and any prior token intact]
+  I --> C2[Retry: new begin supersedes the session]
+  C2 --> C
+  C -.->|close dialog / walk away| X1[Abandon: server keeps truthful needs_login state; no phantom ready]
+  E -.->|cancel at provider| X2[Abandon: exchange never fires; existing token untouched]
+  H --> J[Repair lane: manual definition editor or extension env, headers and endpoint override]
+  J --> K[Side effect: same-name definitions keep independent owner and scope credentials; extension package unchanged]
+  H --> L[True end: fresh scoped list shows authenticated + token_present + runtime status from a real probe; no surface claims ready without the credential]
+```
+
+```yaml
+journey:
+  id: J-mcp-authorize-repair
+  name: Authorize and repair a remote MCP server
+  value_statement: "I can make a remote MCP server actually usable — and see the truth when it is not — from any machine, without ever losing a working credential to a failed attempt."
+  personas: [Bruno, Iris, Ada]
+  entry_points:
+    - url: /settings/mcp
+      origin: in-app-nav
+    - url: /marketplace/installed
+      origin: in-app-nav
+    - url: /marketplace/<entry-id>
+      origin: in-app-nav
+    - url: compozy mcp auth login <name> [--manual] [--scope --workspace --owner]
+      origin: direct
+    - url: POST /api/settings/mcp-servers/{name}/auth/begin|exchange|logout
+      origin: direct
+    - url: compozy.com/docs/marketplace
+      origin: external-share
+  actions:
+    - step: 1
+      verb: Read the status matrix for the target server
+      expected_observable: configured, auth_status, runtime_status, and probe render as four independent truthful signals; tool count only on a succeeded probe; unknown values neutral, never green
+    - step: 2
+      verb: Begin authorization
+      expected_observable: A live PKCE authorization URL is rendered copyable immediately; browser open is optional; stdio/non-OAuth servers never offer the action
+    - step: 3
+      verb: Complete via browser callback or manual full-redirect-URL paste
+      expected_observable: Manual exchange accepts only a full redirect URL; the daemon validates state and issuer, burns the single-use session on every attempt, and never echoes OAuth material
+    - step: 4
+      verb: Confirm
+      expected_observable: Success is declared only on refetched authenticated && token_present; failure or cancel visibly preserves the prior status and token
+    - step: 5
+      verb: Repair configuration in the editor when needed
+      expected_observable: Manual definitions use the transport-aware editor; extension definitions allow only env, headers and endpoint overrides, retain package declarations, and reset only their exact override
+  goal:
+    observable: The target server reads authenticated with a present token and truthful runtime status on every plane that renders it
+    side_effects: [scoped-token-persisted, pkce-session-consumed, auth-events-emitted-redacted]
+  true_end_state: A fresh scoped settings read (web, CLI, API agree) reports authenticated && token_present with the negotiated protocol version and runtime status from a real probe; a deliberately failed or abandoned attempt leaves the previous credential and status intact
+  exit:
+    natural: Settings or Marketplace detail with the selected definition confirmed
+  abandonment:
+    - at_step: 2
+      how: Close the authorize dialog without completing
+      resume: Server keeps its truthful needs_login state; a later begin supersedes cleanly
+    - at_step: 3
+      how: Cancel at the provider, paste an expired/mismatched code, or let the PKCE session expire (5 min)
+      resume: Deterministic failure; prior token untouched; retry with a fresh begin
+    - at_step: 4
+      how: Operator never returns (structurally-valid-but-never-authorized accumulation)
+      resume: The status matrix keeps showing the honest needs_login next-step — the ADR-011 mitigation
+  crosses: [web, cli, settings-api, mcp-auth, vault, external-oauth-provider, workspaces]
+```
+
+## Coverage notes (Task 10 planning)
+
+- Taxonomy sweep: journeys (authorize + repair lanes), functional (pre-registration → CIMD → one DCR fallback, redirect-only manual exchange, scoped identity), experiential (status legibility without color-only signaling; copyable-URL affordance), edge/error/empty (expiry, supersession, cancel, mix-up, non-loopback refusal, unknown status values), cross-cutting (workspace isolation of OAuth tokens, registrations, and canonical secret refs; redaction across logs/events/payloads).
+- Deliberate skip: locale variation (en-US only this cycle — no localized surfaces shipped in the program).
+
+2026-09-13 task04 impact: current entry points and repair branches now cover extension owners and
+manual definitions. Final marketplace-catalog tasks09/10 own the new live walk; older MCP release
+evidence does not verify these changed surfaces.

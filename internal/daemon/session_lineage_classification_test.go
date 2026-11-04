@@ -1,0 +1,74 @@
+package daemon
+
+import (
+	"testing"
+
+	"github.com/compozy/compozy/internal/session"
+	"github.com/compozy/compozy/internal/store"
+	toolspkg "github.com/compozy/compozy/internal/tools"
+)
+
+func TestSessionLineageClassificationUsesSessionType(t *testing.T) {
+	t.Parallel()
+
+	t.Run("Should not enforce spawned policy metadata on a system provenance session", func(t *testing.T) {
+		t.Parallel()
+
+		inputs := toolspkg.PolicyInputs{}
+		err := applySessionToolPolicy(&inputs, &session.Info{
+			ID: "sess-goal", Type: session.SessionTypeSystem,
+			Lineage: &store.SessionLineage{
+				ParentSessionID: "sess-orchestrator", RootSessionID: "sess-orchestrator", SpawnDepth: 1,
+				PermissionPolicy: store.SessionPermissionPolicy{Tools: []string{"compozy__session_status"}},
+			},
+		})
+		if err != nil {
+			t.Fatalf("applySessionToolPolicy(system provenance) error = %v", err)
+		}
+		if inputs.Session.Enforced {
+			t.Fatalf("system provenance policy = %#v, want unenforced policy", inputs.Session)
+		}
+	})
+
+	t.Run("Should continue enforcing an empty policy on a spawned session", func(t *testing.T) {
+		t.Parallel()
+
+		inputs := toolspkg.PolicyInputs{}
+		err := applySessionToolPolicy(&inputs, &session.Info{
+			ID: "sess-worker", Type: session.SessionTypeSpawned,
+			Lineage: &store.SessionLineage{
+				ParentSessionID: "sess-root", RootSessionID: "sess-root", SpawnDepth: 1,
+			},
+		})
+		if err != nil {
+			t.Fatalf("applySessionToolPolicy(spawned) error = %v", err)
+		}
+		if !inputs.Session.Enforced || len(inputs.Session.Tools) != 0 {
+			t.Fatalf("spawned policy = %#v, want enforced empty policy", inputs.Session)
+		}
+	})
+
+	t.Run("Should ignore retired lineage tools while retaining enforcement", func(t *testing.T) {
+		t.Parallel()
+		inputs := toolspkg.PolicyInputs{}
+		info := &session.Info{
+			ID:   "retired-lineage-session",
+			Type: session.SessionTypeSpawned,
+			Lineage: &store.SessionLineage{
+				ParentSessionID:  "root-session",
+				RootSessionID:    "root-session",
+				SpawnDepth:       1,
+				PermissionPolicy: store.SessionPermissionPolicy{Tools: []string{"compozy__memory_list"}},
+			},
+		}
+		if err := applySessionToolPolicy(&inputs, info); err != nil {
+			t.Fatal(err)
+		}
+		if !inputs.Session.Enforced || len(inputs.Session.Tools) != 0 {
+			t.Fatalf("retired lineage policy = %#v", inputs.Session)
+		}
+		if len(info.Lineage.PermissionPolicy.Tools) != 1 {
+			t.Fatal("persisted lineage mutated")
+		}
+	})
+}

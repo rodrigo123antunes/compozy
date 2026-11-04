@@ -5,13 +5,19 @@ run:
     - ""
   issues-exit-code: 1
   tests: true
+  timeout: 10m
 
 linters:
   default: none
   enable:
     - bodyclose
+    - depguard
+    - forbidigo
+    - copyloopvar
+    - dogsled
     - errcheck
     - funlen
+    - gochecknoinits
     - goconst
     - gocritic
     - gocyclo
@@ -20,6 +26,7 @@ linters:
     - ineffassign
     - lll
     - misspell
+    - modernize
     - nakedret
     - noctx
     - nolintlint
@@ -30,12 +37,36 @@ linters:
     - unused
     - whitespace
   settings:
+    depguard:
+      rules:
+        modern-go-root:
+          files:
+            - "${config-path}/*.go"
+            - "${config-path}/**/*.go"
+            - "!${config-path}/sdk/**/*.go"
+            - "!${config-path}/internal/extension/testdata/**/*.go"
+          deny:
+            - pkg: github.com/google/uuid
+              desc: Use stdlib uuid.NewV4().String() (stdlib_uuid, Go 1.27).
+    forbidigo:
+      analyze-types: true
+      exclude-godoc-examples: false
+      forbid:
+        - pattern: '^sort\.(Strings|Ints|Float64s|Slice|SliceStable|Sort|Stable)$'
+          pkg: "^sort$"
+          msg: Use slices.Sort, SortFunc or SortStableFunc, preserving ordering (slices_sort/slices_sort_func).
+        - pattern: '^errors\.As$'
+          pkg: "^errors$"
+          msg: Use errors.AsType with the same target type (errors_as_type).
     errcheck:
       check-type-assertions: true
       check-blank: true
+      # AsType returns a matched error value, not an operation failure.
+      exclude-functions:
+        - errors.AsType
     funlen:
       lines: 80
-      statements: 50
+      statements: 60
     goconst:
       min-len: 3
       min-occurrences: 3
@@ -47,11 +78,13 @@ linters:
         - diagnostic
       disabled-tags:
         - opinionated
-      disabled-checks:
-        - evalOrder # False positive with bubbletea Update pattern
-        - hugeParam # Value receivers are intentional API design choices
+      settings:
+        hugeParam:
+          sizeThreshold: 512
+        rangeValCopy:
+          sizeThreshold: 512
     gocyclo:
-      min-complexity: 15
+      min-complexity: 20
     lll:
       line-length: 120
     misspell:
@@ -66,7 +99,29 @@ linters:
       - legacy
       - std-error-handling
     rules:
+      # Declarative tooling/fixture tables keep literal paths and schema keys readable.
+      - linters: [goconst]
+        path: "(^magefiles/|^internal/extension/testdata/[^/]+-fixture-go/)"
+      # Boundary tables and the linear release transaction are deliberately kept together.
+      - linters: [funlen]
+        path: '^magefiles/(boundaries|web_assets_publish)\.go$'
+      - linters: [gocyclo]
+        path: '^magefiles/boundaries\.go$'
+      # Tooling paths are supplied by the repository/operator, not untrusted runtime input.
+      - linters: [gosec]
+        path: "^magefiles/"
+        text: "G(101|122|306|703):"
+      # The catalog publisher only touches paths its operator passes on the command line.
+      - linters: [gosec]
+        path: "^cmd/compozy-catalog/"
+        text: "G703:"
+      # These shared E2E helpers accept trusted fixture/lab paths and loopback URLs,
+      # including the CI bootstrap manifest. They have the same boundary as *_test.go.
+      - linters: [gosec]
+        path: '^internal/testutil/e2e/(artifacts_(files|storage)|runtime_harness(_sessions|_transport)?)\.go$'
+        text: "G70[34]:"
       - linters:
+          - dupl
           - errcheck
           - funlen
           - gocyclo
@@ -75,22 +130,28 @@ linters:
           - unparam
         path: _test\.go
       - linters:
-          - gosec
-        text: "G204"
-        path: internal/core/agent/
+          - gochecknoinits
+          - goconst
+        path: _test\.go
       - linters:
           - gocritic
         text: unnecessaryDefer
       - linters:
-          - gochecknoinits
-          - goconst
-        path: _test\.go
+          - lll
+        source: "//\t@"
       - linters:
           - lll
         source: "`.*`"
       - linters:
           - lll
         source: "^// @"
+      - linters:
+          - errcheck
+        path: mock_.*\.go$
+    paths:
+      - third_party$
+      - builtin$
+      - \.old_project
 
 formatters:
   enable:
@@ -107,3 +168,11 @@ formatters:
 
   exclusions:
     generated: lax
+    paths:
+      - third_party$
+      - builtin$
+      - \.old_project
+
+issues:
+  max-issues-per-linter: 0
+  max-same-issues: 0

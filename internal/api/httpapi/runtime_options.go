@@ -1,0 +1,101 @@
+package httpapi
+
+import (
+	"log/slog"
+	"strings"
+	"time"
+
+	"github.com/compozy/compozy/internal/api/core"
+	compozyconfig "github.com/compozy/compozy/internal/config"
+	"github.com/compozy/compozy/internal/session"
+)
+
+// WithHomePaths overrides the resolved Compozy home layout.
+func WithHomePaths(homePaths compozyconfig.HomePaths) Option {
+	return func(server *Server) {
+		server.homePaths = homePaths
+		if !server.configSet {
+			server.config = compozyconfig.DefaultWithHome(homePaths)
+		}
+	}
+}
+
+// WithConfig overrides the runtime configuration used by the server.
+func WithConfig(cfg *compozyconfig.Config) Option {
+	return func(server *Server) {
+		if cfg != nil {
+			server.config = *cfg
+			server.configSet = true
+		}
+	}
+}
+
+// WithHost overrides the HTTP bind host.
+func WithHost(host string) Option {
+	return func(server *Server) {
+		server.host = strings.TrimSpace(host)
+	}
+}
+
+// WithPort overrides the HTTP bind port.
+func WithPort(port int) Option {
+	return func(server *Server) {
+		server.port = port
+		server.portSet = true
+	}
+}
+
+// WithLogger injects the server logger.
+func WithLogger(logger *slog.Logger) Option {
+	return func(server *Server) {
+		server.logger = logger
+	}
+}
+
+// WithStartedAt overrides the daemon start time reported by the API.
+func WithStartedAt(startedAt time.Time) Option {
+	return func(server *Server) { server.startedAt = startedAt }
+}
+
+// WithNow overrides the server clock, mainly for tests.
+func WithNow(now func() time.Time) Option {
+	return func(server *Server) { server.now = now }
+}
+
+// WithPollInterval overrides the SSE poll cadence.
+func WithPollInterval(interval time.Duration) Option {
+	return func(server *Server) { server.pollInterval = interval }
+}
+
+// WithSessionManager injects the runtime session manager.
+func WithSessionManager(manager core.SessionManager) Option {
+	return func(server *Server) { server.sessions = manager }
+}
+
+// WithSessionCatalog injects the daemon-owned session catalog.
+func WithSessionCatalog(catalog core.SessionCatalog) Option {
+	return func(server *Server) { server.sessionCatalog = catalog }
+}
+
+// WithTaskService injects the daemon-owned task service.
+func WithTaskService(service core.TaskService) Option {
+	return func(server *Server) { server.tasks = service }
+}
+
+// WithDaemonDrainController injects daemon-global admission control.
+func WithDaemonDrainController(controller core.DaemonDrainController) Option {
+	return func(server *Server) { server.drainController = controller }
+}
+
+func WithSubagentService(service session.SubagentService) Option {
+	return func(server *Server) { server.subagents = service }
+}
+
+// WithSessionMonitorService exposes the daemon-owned session monitors.
+func WithSessionMonitorService(service core.SessionMonitorService) Option {
+	return func(server *Server) { server.sessionMonitors = service }
+}
+
+func WithSessionProcessService(service core.SessionProcessService) Option {
+	return func(server *Server) { server.sessionProcesses = service }
+}

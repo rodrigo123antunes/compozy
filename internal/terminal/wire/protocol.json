@@ -1,0 +1,29 @@
+{
+    "subprotocol": "compozy.terminal.v3",
+    "compatibility_digest": "a2a0bc2049718faa7dc87ffb757852434937c9ea1cc6750f10423bf3b2b5b889",
+    "limits": {
+        "max_input_bytes": 65536,
+        "min_cols": 20,
+        "max_cols": 2000,
+        "min_rows": 5,
+        "max_rows": 1000
+    },
+    "server": [
+        { "go_name": "ServerOpOutput", "ts_name": "output", "value": 1 },
+        { "go_name": "ServerOpAttached", "ts_name": "attached", "value": 2 },
+        { "go_name": "ServerOpExit", "ts_name": "exit", "value": 3 },
+        { "go_name": "ServerOpError", "ts_name": "error", "value": 4 },
+        { "go_name": "ServerOpTitle", "ts_name": "title", "value": 5 },
+        { "go_name": "ServerOpResized", "ts_name": "resized", "value": 6 },
+        { "go_name": "ServerOpGap", "ts_name": "gap", "value": 7 },
+        { "go_name": "ServerOpPresence", "ts_name": "presence", "value": 8 },
+        { "go_name": "ServerOpRedactedInput", "ts_name": "redactedInput", "value": 9 }
+    ],
+    "client": [
+        { "go_name": "ClientOpInput", "ts_name": "input", "value": 1 },
+        { "go_name": "ClientOpAck", "ts_name": "ack", "value": 2 },
+        { "go_name": "ClientOpResize", "ts_name": "resize", "value": 3 },
+        { "go_name": "ClientOpSignal", "ts_name": "signal", "value": 4 },
+        { "go_name": "ClientOpDetach", "ts_name": "detach", "value": 5 }
+    ]
+}

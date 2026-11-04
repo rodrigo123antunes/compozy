@@ -1,0 +1,141 @@
+import type { Meta, StoryObj } from "@storybook/react-vite";
+import { expect, waitFor, within } from "storybook/test";
+import { Dialog, DialogContent, DialogTitle } from "../dialog";
+
+import {
+  ContextMenu,
+  ContextMenuContent,
+  ContextMenuGroup,
+  ContextMenuItem,
+  ContextMenuLabel,
+  ContextMenuSeparator,
+  ContextMenuShortcut,
+  ContextMenuSub,
+  ContextMenuSubContent,
+  ContextMenuSubTrigger,
+  ContextMenuTrigger,
+} from "../context-menu";
+
+const meta: Meta<typeof ContextMenu> = {
+  title: "components/ContextMenu",
+  component: ContextMenu,
+  parameters: {
+    docs: {
+      description: {
+        component:
+          "Right-click destination chooser. Launch surfaces and deck tabs attach it to offer explicit open/close/pin choices; items follow the shared menu grammar (32px rows at radius 8 on a `shadow-pop` card, `surface-2` focus, danger tint for destructive).",
+      },
+    },
+  },
+};
+
+export default meta;
+type Story = StoryObj<typeof meta>;
+
+export const InsideDialog: Story = {
+  tags: ["play-fn"],
+  render: () => (
+    <Dialog defaultOpen>
+      <DialogContent>
+        <DialogTitle>Projects</DialogTitle>
+        <ContextMenu>
+          <ContextMenuTrigger tabIndex={0}>Project tile</ContextMenuTrigger>
+          <ContextMenuContent>
+            <ContextMenuItem>Archive project</ContextMenuItem>
+          </ContextMenuContent>
+        </ContextMenu>
+      </DialogContent>
+    </Dialog>
+  ),
+  play: async ({ userEvent }) => {
+    const body = within(document.body);
+    const trigger = await body.findByText("Project tile");
+    await userEvent.click(trigger);
+    await expect(trigger).toHaveFocus();
+    trigger.dispatchEvent(new MouseEvent("contextmenu", { bubbles: true, cancelable: true }));
+    await waitFor(() => expect(body.getByRole("menu").contains(document.activeElement)).toBe(true));
+    await userEvent.keyboard("{Escape}");
+    await waitFor(() => expect(trigger).toHaveFocus());
+  },
+};
+
+async function openContextMenu(
+  canvasElement: HTMLElement,
+  triggerText: string,
+  expectedItem: string | RegExp
+): Promise<void> {
+  const trigger = within(canvasElement).getByText(triggerText);
+  trigger.dispatchEvent(new MouseEvent("contextmenu", { bubbles: true, cancelable: true }));
+  await waitFor(() => {
+    const menu = within(document.body).getByRole("menu");
+    expect(within(menu).getByRole("menuitem", { name: expectedItem })).toBeInTheDocument();
+  });
+}
+
+/** The window-tab menu contract: lifecycle verbs, pin, destructive bulk close. */
+export const TabMenu: Story = {
+  render: () => (
+    <ContextMenu>
+      <ContextMenuTrigger>
+        <div className="grid h-24 w-64 place-items-center rounded-md border border-dashed border-line-strong text-small-body text-subtle select-none">
+          Right-click a tab
+        </div>
+      </ContextMenuTrigger>
+      <ContextMenuContent>
+        <ContextMenuItem>
+          Close tab
+          <ContextMenuShortcut>⌘W</ContextMenuShortcut>
+        </ContextMenuItem>
+        <ContextMenuItem>Close other tabs</ContextMenuItem>
+        <ContextMenuItem>Close tabs to the right</ContextMenuItem>
+        <ContextMenuSeparator />
+        <ContextMenuItem>Pin tab</ContextMenuItem>
+        <ContextMenuItem>Move tab to new window</ContextMenuItem>
+        <ContextMenuItem>Merge all windows</ContextMenuItem>
+      </ContextMenuContent>
+    </ContextMenu>
+  ),
+  play: async ({ canvasElement }) => {
+    // The shortcut hint is part of the item's accessible name.
+    await openContextMenu(canvasElement, "Right-click a tab", /^Close tab\s*⌘W$/);
+  },
+};
+
+/** Launch-surface destinations, mirroring the dock app menu. */
+export const DestinationMenu: Story = {
+  render: () => (
+    <ContextMenu>
+      <ContextMenuTrigger>
+        <div className="grid h-24 w-64 place-items-center rounded-md border border-dashed border-line-strong text-small-body text-subtle select-none">
+          Right-click a dock app
+        </div>
+      </ContextMenuTrigger>
+      <ContextMenuContent>
+        <ContextMenuGroup>
+          <ContextMenuLabel>Open Tasks</ContextMenuLabel>
+          <ContextMenuItem>Open in new tab</ContextMenuItem>
+          <ContextMenuItem>
+            Open in split
+            <ContextMenuShortcut>⌥ click</ContextMenuShortcut>
+          </ContextMenuItem>
+          <ContextMenuItem>Open in new window</ContextMenuItem>
+          <ContextMenuItem>
+            Open in new desktop
+            <ContextMenuShortcut>⇧ click</ContextMenuShortcut>
+          </ContextMenuItem>
+        </ContextMenuGroup>
+        <ContextMenuSeparator />
+        <ContextMenuSub>
+          <ContextMenuSubTrigger>Go to tab</ContextMenuSubTrigger>
+          <ContextMenuSubContent>
+            <ContextMenuItem>Tasks — Desktop 1</ContextMenuItem>
+            <ContextMenuItem>Run #418 — Desktop 2</ContextMenuItem>
+          </ContextMenuSubContent>
+        </ContextMenuSub>
+      </ContextMenuContent>
+    </ContextMenu>
+  ),
+  play: async ({ canvasElement }) => {
+    await openContextMenu(canvasElement, "Right-click a dock app", "Open in new window");
+  },
+};

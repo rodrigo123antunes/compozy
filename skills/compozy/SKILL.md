@@ -1,247 +1,97 @@
 ---
 name: compozy
-description: Explains Compozy capabilities, CLI commands, core workflow skills, optional extension skills, configuration, artifact structure, reusable agents, and extensions. Use when the user asks how to use Compozy, what commands are available, how the workflow pipeline works, or how to configure a workspace. Do not use for executing workflow steps — use the specific cy- skills instead.
+description: Operate CompozyOS. Use when working with CompozyOS sessions, agents, native tools, skills, tasks, Loops, Goals, Terminal, desktops and windows, automation, extensions, or configuration. Don't use for unrelated projects.
+metadata:
+  compozy:
+    version: 1
+    kind: runtime
+    bundled: true
+    instructional_only: true
 ---
 
-# Compozy Reference Guide
+# CompozyOS
 
-Comprehensive reference for the Compozy CLI and its AI-assisted development workflow.
+This body routes to the matching reference. When tools and skills are enabled, startup includes this router, not the full reference manuals. With tools enabled and skills disabled, capable sessions retain the two complete tool manuals inline because native skill reads are unavailable. Daemon-owned title generation omits the tool router because its role consumes supplied input and returns output; other tools-enabled sessions retain the appropriate guidance.
 
-## What Is Compozy
+To read a reference in a managed session, resolve `compozy__skill_view` through the active harness and call the returned tool reference with `{"name":"compozy","file":"references/<file>.md"}` using the exact path below. Tool discovery, descriptor reads, skill reads, and retained-result reads needed to load these references are the bootstrap exception to the reading prerequisite. Inspect the live descriptor before calling other tools; discover capabilities with `compozy__tool_search`. Keep existing tool authorization: missing guidance does not grant or revoke access, and a denied skill read is not permission to bypass policy through CLI or filesystem access.
 
-Compozy is a Go CLI that orchestrates the full lifecycle of AI-assisted development. It covers product ideation, technical specification, task decomposition, automated execution via AI coding agents, and PR review remediation.
+If a reference result is truncated and includes an artifact, resolve `compozy__tool_artifact_read` through the active harness. Pass the returned artifact URI unchanged as `artifact_uri`, start at `offset: 0`, and continue with each `next_offset` until `eof`. Decode and concatenate `data_base64` pages to read the retained result envelope, including its full structured `content`; preserve any redactions in display text. Use the current workspace scope. A preview alone is not a complete reference. If the result has no usable artifact or a continuation is denied, report the reference as unavailable; do not use CLI or filesystem access to bypass it.
 
-Key characteristics:
+## Required Reading Router
 
-- **Agent-agnostic.** Supports claude, codex, copilot, cursor-agent, droid, gemini, opencode, and pi as ACP runtimes.
-- **Skills-based.** Bundled skills (installed via `compozy setup`) teach agents how to execute each workflow phase.
-- **Artifact-driven.** Planning and review artifacts live as markdown under `.compozy/tasks/<slug>/`, versioned alongside the codebase.
-- **Daemon-backed runtime.** A home-scoped daemon owns run state, workspace registration, snapshots, streams, and the synced `global.db` catalog under `~/.compozy/`.
-- **Single binary, local-first.** The daemon is launched from the same binary; there are no external control planes.
+Match the CompozyOS operation to the row and read its listed references before that operation, unless the bounded descriptor fallback in Error Handling applies.
 
-## Workflow Pipeline Overview
+A delegated coding, research, or review assignment can use its authorized provider tools without first loading CompozyOS manuals. Being called a worker, coordinator, or reviewer does not itself create a daemon Task claim, lease, or review authority. If native tools or their references are unavailable, continue independent provider work and report only the dependent CompozyOS operation as blocked. Never bypass a withheld native capability through CLI, filesystem access, or direct state edits.
 
-The standard development pipeline follows these phases in order. Each phase produces artifacts consumed by the next.
+| Task                                                                                                                           | MUST read                                                          |
+| ------------------------------------------------------------------------------------------------------------------------------ | ------------------------------------------------------------------ |
+| Use CompozyOS to delegate code changes on an isolated branch, inspect subagent Git/PR facts, or deliver its work               | references/native-tools.md; references/worktrees.md                |
+| Start, inspect, prompt, stop, resume, compact, or debug CompozyOS sessions and daemon state                                    | references/runtime-operations.md                                   |
+| Work in the User scope (`@user`, no project) or read All projects aggregates (`--all-workspaces`, `all_workspaces=true`)       | references/runtime-operations.md + references/native-tools.md      |
+| Open, inspect, retry, diagnose, or recover the desktop app; update the host runtime and app                                    | references/desktop.md                                              |
+| Inspect or configure daemon-owned background roles, role diagnostics, builtin identities, or role fallback routing             | references/runtime-operations.md + references/agent-definitions.md |
+| Inspect, refresh, curate, or configure provider models, runtime strategies, ACP options, reasoning, Fast, or pricing           | references/runtime-operations.md + references/native-tools.md      |
+| Read or refresh provider usage (subscription limits, resets, credits, balances) or configure its collection and consent        | references/runtime-operations.md + references/native-tools.md      |
+| Configure provider authentication or run provider authentication login                                                         | references/agent-definitions.md + references/native-tools.md       |
+| Expose one CompozyOS workspace to an external MCP client with `compozy mcp serve`                                              | references/runtime-operations.md                                   |
+| Inspect, mutate, or watch virtual desktops, managed windows, or workspace layouts through native tools, CLI, HTTP, or UDS      | references/window-management.md + references/native-tools.md       |
+| Open, inspect, attach to, execute in, or interact with CompozyOS terminals; answer terminal input or audit terminal commands   | references/terminal.md + references/native-tools.md                |
+| Create or review CompozyOS agent definitions, provider defaults, permissions, workspace access, or MCP sidecars                | references/agent-definitions.md + references/tools-and-skills.md   |
+| Propose a reusable skill or inspect its operator review                                                                        | references/skill-authoring.md + references/native-tools.md         |
+| Discover or call CompozyOS-native tools, inspect native tool IDs, view skills, or choose tools vs CLI                          | references/tools-and-skills.md + references/native-tools.md        |
+| List, inspect, or invoke command palette commands; inspect or cancel a pending palette approval                                | references/native-tools.md                                         |
+| Claim, run, review, block, recover, or coordinate daemon Tasks; or wake a Task creator                                         | references/tasks-and-orchestration.md                              |
+| Delegate a task to a subagent on another agent, provider, or model; read, list, or cancel subagents                            | references/native-tools.md + references/tasks-and-orchestration.md |
+| Author, configure, run, observe, approve, or stop a CompozyOS Loop or Goal; use `/goal`; read Loop terminal outcomes or events | references/loops.md + references/native-tools.md                   |
+| Install, enable, update, dev-link, build, publish, or remove an extension; manage extension kits, secrets, or hooks            | references/extensions.md + references/native-tools.md              |
+| Write or scaffold extension code: manifests, permissions, provide surfaces, contributed commands, or command palette entries   | references/extension-authoring.md + references/extensions.md       |
+| Create or manage Automations (jobs and triggers), read their last run, or review suggestions                                   | references/native-tools.md + references/configuration.md           |
+| Create, inspect, bind sessions to, exit, publish, remove, or recover workspace worktrees                                       | references/worktrees.md + references/native-tools.md               |
+| Inspect or manage Gateway posture, tier surfaces, device pairing, connection profiles, SSH forwards, or stream tickets         | references/runtime-operations.md + references/configuration.md     |
+| List, select, create, update, rename, archive, unarchive, delete, or retry profile lifecycle operations                        | references/profiles.md + references/native-tools.md                |
+| Build an external app with the TypeScript or Go client, or create, audit, update, and revoke app tokens                        | references/app-sdk.md                                              |
+| Read or change CompozyOS configuration: config.toml keys, defaults, scopes, and the settings apply lifecycle                   | references/configuration.md                                        |
 
-1. **Setup** -- `compozy setup` installs core skills into target agents plus any setup assets shipped by enabled extensions.
-2. **Ideation** (optional) -- install and enable the first-party `cy-idea-factory` extension, run `compozy setup`, then use `/cy-idea-factory` to expand a raw idea into a structured, research-backed spec at `.compozy/tasks/<slug>/_idea.md`.
-3. **Requirements** -- `/cy-create-prd` creates a business-focused Product Requirements Document at `.compozy/tasks/<slug>/_prd.md` with ADRs.
-4. **Technical Design** -- `/cy-create-techspec` translates the PRD into a technical specification at `.compozy/tasks/<slug>/_techspec.md` with ADRs.
-5. **Task Decomposition** -- `/cy-create-tasks` breaks down the PRD and TechSpec into independently implementable task files (`task_01.md`, `task_02.md`, etc.) and a master list at `_tasks.md`.
-6. **Execution** -- `compozy tasks run <slug> --ide <runtime>` dispatches task files sequentially to the configured AI agent for implementation.
-7. **Review** -- `/cy-review-round` (manual AI review) or `compozy reviews fetch <slug> --provider coderabbit --pr <N>` (external provider) produces review issue files under `reviews-NNN/`.
-8. **Remediation** -- `compozy reviews fix <slug>` processes review issues, triages, fixes, and verifies each one.
-9. **Archive** -- `compozy archive --name <slug>` moves fully completed workflows to `.compozy/tasks/_archived/`.
+## Reference Index
 
-Repeat phases 7-8 until the review is clean, then merge.
+For explicit always-on memory reads or writes, also read `references/agent-memory.md`.
 
-```dot
-digraph compozy_pipeline {
-    "compozy setup" [shape=box];
-    "/cy-idea-factory (optional)" [shape=box];
-    "/cy-create-prd" [shape=box];
-    "/cy-create-techspec" [shape=box];
-    "/cy-create-tasks" [shape=box];
-    "compozy tasks run" [shape=box];
-    "Review (manual or provider)" [shape=box];
-    "compozy reviews fix" [shape=box];
-    "Reviews clean?" [shape=diamond];
-    "compozy archive" [shape=doublecircle];
+- references/skill-authoring.md - proposed skills, inert drafts, operator review, and installation scope.
+- references/agent-memory.md - explicit always-on agent notes, identity boundaries, budgets, revisions, and memory tools.
+- references/runtime-operations.md - daemon, session, Gateway profile/SSH, background-role, operations, lifecycle diagnostics, and runtime troubleshooting.
+- references/desktop.md - desktop app commands, attachment and ownership, runtime and app updates, diagnostics, and recovery.
+- references/window-management.md - daemon-authoritative desktops, windows, layouts, revisions, clients, resources, hooks, recovery, and public surfaces.
+- references/terminal.md - deliberate terminal activation, native tool IDs, approval and shared input, input requests, untrusted output, journal, profile, and platform rules.
+- references/agent-definitions.md - AGENT.md structure, reserved builtin role identities, provider defaults, permissions, category paths, MCP sidecars, and safe setup workflow.
+- references/tools-and-skills.md - CompozyOS-native tool discovery, skill view/search, bundled resources, marketplace and MCP install flows, and management-surface exceptions.
+- references/native-tools.md - daemon-native toolsets, stable CompozyOS tool IDs, when to inspect descriptors, and CLI fallbacks for agents running inside CompozyOS.
+- references/tasks-and-orchestration.md - coordinator, worker, and reviewer loops, subagents versus spawned workers, task authority boundaries, typed blocks and the unblock-loop breaker, wake-creator, completion claims, review verdict rules, and sensitive-data limits.
+- references/loops.md - Loop and Goal authoring/operation, `/goal` commands, native tools, terminal and context states, approval/recovery semantics, reference grammar, hooks, and watch behavior.
+- references/extensions.md - extension kits, install trust, the authoring and dev loop, instance scoping, dev overlays, logs, and hook management.
+- references/extension-authoring.md - code-backed and resource-only extension authoring: templates, SDK declarations, static manifests, permissions, provide surfaces, contributed commands, command palette entries, and structured workflows.
+- references/app-sdk.md - external TypeScript and Go apps, daemon discovery, prompt/event streams, local app-token management, browser origin boundaries, and runtime OpenAPI.
+- references/configuration.md - layered config.toml desired state, profile credentials, the settings apply lifecycle, and the key reference for gateway, scheduler, Loop, Goal, automation, session rebuild, role, and window-manager settings.
+- references/worktrees.md - workspace worktree lifecycle, session binding, exit plans and actions, forge integration, cleanup evidence, and public management surfaces.
+- references/profiles.md - operator-profile selection, immutable session binding, lifecycle plans, local-only mutations, errors, events, and public management surfaces.
 
-    "compozy setup" -> "/cy-idea-factory (optional)";
-    "/cy-idea-factory (optional)" -> "/cy-create-prd";
-    "/cy-create-prd" -> "/cy-create-techspec";
-    "/cy-create-techspec" -> "/cy-create-tasks";
-    "/cy-create-tasks" -> "compozy tasks run";
-    "compozy tasks run" -> "Review (manual or provider)";
-    "Review (manual or provider)" -> "compozy reviews fix";
-    "compozy reviews fix" -> "Reviews clean?";
-    "Reviews clean?" -> "Review (manual or provider)" [label="no"];
-    "Reviews clean?" -> "compozy archive" [label="yes"];
-}
-```
+## Operating Loop
 
-For a detailed step-by-step walkthrough of each phase, read `references/workflow-guide.md`.
+1. Read the references for the intended CompozyOS operation, or qualify for the bounded descriptor fallback below.
+2. Prefer CompozyOS-native tools and structured outputs over prose, logs, or direct internal access when managing CompozyOS.
+3. Keep authority with the daemon: task state, review verdicts, session lifecycle, extension lifecycle, hooks, and tool calls must use CompozyOS public surfaces. Never edit SQLite databases, process internals, or generated projections directly.
+4. After a mutation, confirm the result through a structured read instead of assuming success.
 
-## CLI Commands Quick Reference
+## Error Handling
 
-| Command | Purpose | Key Flags |
-| --- | --- | --- |
-| **Setup & Config** | | |
-| `compozy setup` | Install core skills and enabled extension assets | `--agent`, `--skill`, `--global`, `--copy`, `--list`, `--all`, `--yes` |
-| `compozy upgrade` | Update CLI to latest release | |
-| **Workflow Execution** | | |
-| `compozy daemon` | Manage the home-scoped daemon lifecycle | `start`, `status`, `stop` |
-| `compozy workspaces` | Inspect and manage daemon workspace registrations | `list`, `show`, `register`, `unregister`, `resolve` |
-| `compozy tasks run` | Execute PRD task files through the daemon | `--name`, `--multiple`, `--recursive` / `-r`, `--attach`, `--ui`, `--stream`, `--detach`, `--task-runtime` |
-| `compozy exec` | Execute an ad hoc prompt | `--agent`, `--format`, `--prompt-file`, `--tui`, `--persist`, `--run-id` |
-| `compozy runs` | Attach, watch, and purge daemon-managed runs | `attach`, `watch`, `purge` |
-| **Review** | | |
-| `compozy reviews fetch` | Fetch provider review comments | `--provider`, `--pr`, `--name`, `--round` |
-| `compozy reviews fix` | Process review issue files | `--name`, `--round`, `--concurrent`, `--batch-size`, `--ide` |
-| **Utilities** | | |
-| `compozy tasks validate` | Validate task file metadata | `--name`, `--tasks-dir`, `--format` |
-| `compozy sync` | Reconcile workflow artifacts into daemon `global.db` | `--name`, `--root-dir`, `--tasks-dir` |
-| `compozy archive` | Move daemon-eligible completed workflows to archive | `--name`, `--root-dir`, `--tasks-dir` |
-| `compozy migrate` | Convert legacy artifacts to frontmatter | `--name`, `--dry-run`, `--reviews-dir` |
-| **Agent Management** | | |
-| `compozy agents list` | List resolved reusable agents | |
-| `compozy agents inspect` | View agent definition and defaults | `<name>` |
-| **Extensions** | | |
-| `compozy ext list` | List extensions | |
-| `compozy ext inspect` | View extension details | `<name>` |
-| `compozy ext install` | Install an extension from a local path or GitHub repo archive | `<source>`, `--remote`, `--ref`, `--subdir` |
-| `compozy ext uninstall` | Remove an extension | `<name>` |
-| `compozy ext enable/disable` | Toggle extension | `<name>` |
-| `compozy ext doctor` | Diagnose extension issues | |
+If a required resource read fails, retry `compozy__skill_view` once with the exact router path. Correct
+`tool_not_found` or `tool_invalid_input` before retrying; retry `tool_backend_failed` once without
+changing the request. After a second failure, proceed only when one native call's live descriptor
+fully defines the requested operation, risk, and result handling. A visible `terminal_exec` qualifies
+for a one-command terminal demonstration; multi-step terminal interaction still requires
+`references/terminal.md`. Otherwise stop
+the affected operation and report the exact path. Preserve structured runtime errors, follow the
+diagnostic order in `references/runtime-operations.md`, and keep daemon-owned state authoritative.
 
-Common flags shared by `tasks run`, `exec`, and `reviews fix`: `--ide`, `--model`, `--reasoning-effort`, `--add-dir`, `--auto-commit`, `--dry-run`.
+**Read references/tools-and-skills.md and references/native-tools.md in full before CompozyOS-native operational tool calls or tool/skill mutations.** Discovery, descriptor inspection, reference reads, and their retained-result continuations may run first to load that guidance. Provider-owned repository tools do not trigger this prerequisite.
 
-For complete flag documentation, read `references/cli-reference.md`.
-
-## Core Skills Summary
-
-| Skill | Trigger | When To Use | Do Not Use For |
-| --- | --- | --- | --- |
-| `cy-create-prd` | `/cy-create-prd` | Building a Product Requirements Document | TechSpec, task breakdown, coding |
-| `cy-create-techspec` | `/cy-create-techspec` | Translating PRD into technical design | PRD creation, task execution |
-| `cy-create-tasks` | `/cy-create-tasks` | Decomposing PRD+TechSpec into task files | Execution, review |
-| `cy-execute-task` | (internal) | Executing a single PRD task (called by `compozy tasks run`) | Direct invocation, review work |
-| `cy-review-round` | `/cy-review-round` | Performing comprehensive code review | Fetching external reviews, fixing |
-| `cy-fix-reviews` | (internal) | Remediating review issues (called by `compozy reviews fix`) | Fetching reviews, task execution |
-| `cy-final-verify` | `/cy-final-verify` | Enforcing verification before completion claims | Early planning, brainstorming |
-| `cy-workflow-memory` | (internal) | Maintaining cross-task workflow memory | PR reviews, user preferences |
-| `compozy` | `/compozy` | Learning how to use Compozy | Executing workflow steps |
-
-## Optional Extension Skills
-
-| Skill | Trigger | When To Use | Install Flow |
-| --- | --- | --- | --- |
-| `cy-idea-factory` | `/cy-idea-factory` | Raw feature idea needs structured exploration before a PRD | `compozy ext install --yes compozy/compozy --remote github --ref <tag> --subdir extensions/cy-idea-factory` -> `compozy ext enable cy-idea-factory` -> `compozy setup` |
-
-For detailed skill descriptions and inputs/outputs, read `references/skills-reference.md`.
-
-## Artifact Directory Structure
-
-```
-.compozy/
-  config.toml                          # Workspace configuration
-  tasks/
-    <slug>/                            # One directory per workflow
-      _idea.md                         # Idea spec (from cy-idea-factory)
-      _prd.md                          # Product Requirements Document
-      _techspec.md                     # Technical Specification
-      _tasks.md                        # Master task list
-      task_01.md ... task_N.md         # Individual task files
-      adrs/
-        adr-001.md ... adr-NNN.md      # Architecture Decision Records
-      reviews-NNN/
-        issue_001.md ... issue_N.md    # Review issues with round metadata in frontmatter
-      memory/
-        MEMORY.md                      # Shared workflow memory
-        task_01.md ... task_N.md       # Per-task memory
-    _archived/
-      <timestamp>-<slug>/             # Archived completed workflows
-  agents/
-    <name>/                            # Workspace-scoped reusable agents
-      AGENT.md                         # Agent definition
-      mcp.json                         # Optional MCP server config
-  extensions/                          # Workspace-scoped extensions
-```
-
-Global paths:
-- `~/.compozy/agents/<name>/` -- global reusable agents (workspace overrides global)
-- `~/.compozy/extensions/` -- user-scoped extensions
-- `~/.compozy/runs/<run-id>/` -- daemon-managed run artifacts and persisted exec sessions
-- `~/.compozy/global.db` -- daemon workspace, workflow, task, and review catalog
-
-## Configuration
-
-Workspace defaults live in `.compozy/config.toml`. CLI flags always override config values.
-
-```toml
-[defaults]
-ide = "claude"
-model = "opus"
-auto_commit = true
-reasoning_effort = "high"
-add_dirs = ["../shared-lib"]
-
-[tasks]
-types = ["frontend", "backend", "docs", "test", "infra", "refactor", "chore", "bugfix"]
-
-[tasks.run]
-include_completed = false
-recursive = false
-
-[fix_reviews]
-concurrent = 2
-batch_size = 3
-
-[fetch_reviews]
-provider = "coderabbit"
-nitpicks = false
-
-[exec]
-verbose = false
-tui = false
-persist = false
-```
-
-For all fields, types, and defaults, read `references/config-reference.md`.
-
-## Reusable Agents and the Council Pattern
-
-Reusable agents are standalone personas that can be invoked via `compozy exec --agent <name>` or referenced by skills through `run_agent`.
-
-**Discovery order:** workspace (`.compozy/agents/<name>/`) overrides global (`~/.compozy/agents/<name>/`).
-
-**Agent definition:** Each agent has an `AGENT.md` with YAML frontmatter (`title`, `description`) and optional `mcp.json` for MCP server configuration.
-
-**Council agents shipped by the optional `cy-idea-factory` extension**:
-
-| Agent | Perspective |
-| --- | --- |
-| `pragmatic-engineer` | Execution-focused, delivery speed, maintenance burden |
-| `architect-advisor` | Long-term system coherence, boundaries, coupling |
-| `security-advocate` | Attack vectors, compliance, data protection |
-| `product-mind` | User impact, business value, opportunity cost |
-| `devils-advocate` | Challenges assumptions, surfaces risks, stress-tests |
-| `the-thinker` | Cross-domain patterns, structural reframing |
-
-Install flow: `compozy ext install --yes compozy/compozy --remote github --ref <tag> --subdir extensions/cy-idea-factory` -> `compozy ext enable cy-idea-factory` -> `compozy setup`.
-
-The `cy-idea-factory` skill uses these agents in a council debate to challenge feature scope and surface risks. The `council` skill can also orchestrate multi-advisor debates on demand.
-
-Management commands: `compozy agents list`, `compozy agents inspect <name>`.
-
-## Extensions
-
-Executable plugins that extend Compozy at runtime via JSON-RPC 2.0 on stdin/stdout.
-
-- **Three scopes:** bundled (shipped with Compozy), user (`~/.compozy/extensions/`), workspace (`.compozy/extensions/`). Workspace overrides user overrides bundled.
-- **Disabled by default.** Enable explicitly with `compozy ext enable <name>` or `--extensions` flag on `exec`.
-- **Capabilities:** lifecycle observation, prompt decoration, plan injection, agent session modification, review provider registration.
-- **SDKs:** TypeScript (`@compozy/extension-sdk`), Go (`sdk/extension`).
-- **Scaffolding:** `npx @compozy/create-extension` generates extension boilerplate.
-
-Management: `compozy ext list`, `compozy ext inspect <name>`, `compozy ext install <source>`, `compozy ext uninstall <name>`, `compozy ext enable/disable <name>`, `compozy ext doctor`.
-
-## Common Patterns
-
-- Run `compozy setup` before starting any workflow to ensure core skills and enabled extension assets are installed.
-- Follow the pipeline in order: idea (optional) -> PRD -> TechSpec -> Tasks -> Execution -> Review -> Fix.
-- Configure workspace defaults in `.compozy/config.toml` to reduce repetitive CLI flags.
-- Run `compozy tasks validate --name <slug>` before `compozy tasks run` to catch metadata issues early.
-- Use `compozy archive` to clean up fully completed workflows and keep the tasks directory focused.
-- Use `compozy exec --agent <name>` for ad hoc prompts with a specific advisor perspective.
-- Use `compozy exec --persist` to save session artifacts for later resumption with `--run-id`.
-
-## Anti-Patterns
-
-- **Skipping pipeline stages.** Running `compozy tasks run` without a PRD and task files produces poor results.
-- **Invoking `cy-execute-task` directly.** Use `compozy tasks run`, which handles dispatch, sequencing, memory, and tracking.
-- **Mixing workflow skills out of order.** Running `/cy-create-tasks` without a PRD and TechSpec leads to shallow task decomposition.
-- **Editing task file frontmatter manually.** Use `compozy migrate` or `compozy tasks validate` to fix metadata issues programmatically.
-- **Confusing skills with CLI commands.** Skills (slash commands like `/cy-create-prd`) run inside an agent session. CLI commands (`compozy tasks run`) run in the terminal.
-- **Skipping verification.** Always use `cy-final-verify` before claiming task completion or creating commits.
+**Read references/tasks-and-orchestration.md in full before exercising daemon Task authority or submitting a Task review verdict.** A general delegated assignment does not confer that authority.

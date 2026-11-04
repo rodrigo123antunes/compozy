@@ -1,63 +1,56 @@
-import type { Meta } from "@storybook/react-vite";
 import { useEffect } from "react";
+import { useQueryClient } from "@tanstack/react-query";
 
-import { resetActiveWorkspaceStoreForTests, useActiveWorkspaceStore } from "@/systems/app-shell";
-import { setRunStreamFactoryOverrideForTests, type RunStreamFactory } from "@/systems/runs";
+import { settingsRestartStore, type SettingsSectionName } from "@/systems/settings";
+import { statusKeys } from "@/systems/status";
+import { statusFixture } from "@/systems/status/mocks";
+import { setActiveWorkspaceId } from "@/systems/workspace";
+import { storyDefaultWorkspaceId } from "@/storybook/fintech-scenario";
 
 export function StorybookRouteCanvas() {
   return null;
 }
 
-export function createRouteStoryMeta(
-  title: string,
-  description: string
-): Meta<typeof StorybookRouteCanvas> {
-  return {
-    title,
-    component: StorybookRouteCanvas,
-    parameters: {
-      layout: "fullscreen",
-      docs: {
-        description: {
-          component: description,
-        },
-      },
-    },
-  };
-}
-
-export function appRouteParameters(path: string) {
-  return {
-    layout: "fullscreen" as const,
-    router: {
-      kind: "app" as const,
-      initialEntries: [path],
-    },
-  };
-}
-
 export function StorybookWorkspaceSetup({
-  workspaceId = "ws-storybook",
+  workspaceId = storyDefaultWorkspaceId,
 }: {
   workspaceId?: string;
 }) {
   useEffect(() => {
-    useActiveWorkspaceStore.setState({ selectedWorkspaceId: workspaceId });
-    return () => {
-      resetActiveWorkspaceStoreForTests();
-    };
+    setActiveWorkspaceId(workspaceId);
   }, [workspaceId]);
 
   return null;
 }
 
-export function StorybookRunStreamSetup({ factory }: { factory: RunStreamFactory | null }) {
+export function StorybookUserHomeDirSetup({ userHomeDir }: { userHomeDir: string | null }) {
+  const queryClient = useQueryClient();
+
   useEffect(() => {
-    setRunStreamFactoryOverrideForTests(factory);
-    return () => {
-      setRunStreamFactoryOverrideForTests(null);
-    };
-  }, [factory]);
+    queryClient.setQueryData(statusKeys.current(), {
+      ...statusFixture,
+      daemon: {
+        ...statusFixture.daemon,
+        user_home_dir: userHomeDir ?? "",
+      },
+    });
+  }, [queryClient, userHomeDir]);
+
+  return null;
+}
+
+export function StorybookRestartNoticeSetup({ section }: { section: SettingsSectionName }) {
+  useEffect(() => {
+    settingsRestartStore.trigger.settingsMutationRecorded({
+      mutation: {
+        section,
+        restartRequired: true,
+        restartScope: "global",
+        warnings: [],
+        completedAt: "2026-04-18T01:00:00Z",
+      },
+    });
+  }, [section]);
 
   return null;
 }

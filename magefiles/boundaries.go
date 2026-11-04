@@ -1,0 +1,455 @@
+//go:build mage
+
+package main
+
+import (
+	"cmp"
+	"context"
+	"errors"
+	"fmt"
+	"go/parser"
+	"go/token"
+	"io/fs"
+	"os"
+	"os/exec"
+	"path/filepath"
+	"slices"
+	"strconv"
+	"strings"
+)
+
+const compozyModulePath = "github.com/compozy/compozy/"
+
+type directImportBoundary struct {
+	importer string
+	imported string
+}
+
+func directImportBoundaries() []directImportBoundary {
+	forbidden := []directImportBoundary{
+		{"internal/config", "internal/daemon"},
+		{"internal/acp", "internal/daemon"},
+		{"internal/session", "internal/daemon"},
+		{"internal/store", "internal/daemon"},
+		{"internal/observe", "internal/daemon"},
+		{"internal/events", "internal/daemon"},
+		{"internal/doctor", "internal/daemon"},
+		{"internal/providers", "internal/daemon"},
+		{"internal/loop", "internal/daemon"},
+		{"internal/diagnosticcontract", "internal/daemon"},
+		{"internal/config", "internal/api/httpapi"},
+		{"internal/acp", "internal/api/httpapi"},
+		{"internal/session", "internal/api/httpapi"},
+		{"internal/store", "internal/api/httpapi"},
+		{"internal/observe", "internal/api/httpapi"},
+		{"internal/events", "internal/api/httpapi"},
+		{"internal/doctor", "internal/api/httpapi"},
+		{"internal/providers", "internal/api/httpapi"},
+		{"internal/loop", "internal/api/httpapi"},
+		{"internal/diagnosticcontract", "internal/api/httpapi"},
+		{"internal/config", "internal/api/udsapi"},
+		{"internal/acp", "internal/api/udsapi"},
+		{"internal/session", "internal/api/udsapi"},
+		{"internal/store", "internal/api/udsapi"},
+		{"internal/observe", "internal/api/udsapi"},
+		{"internal/events", "internal/api/udsapi"},
+		{"internal/doctor", "internal/api/udsapi"},
+		{"internal/providers", "internal/api/udsapi"},
+		{"internal/loop", "internal/api/udsapi"},
+		{"internal/diagnosticcontract", "internal/api/udsapi"},
+		{"internal/config", "internal/cli"},
+		{"internal/acp", "internal/cli"},
+		{"internal/session", "internal/cli"},
+		{"internal/store", "internal/cli"},
+		{"internal/observe", "internal/cli"},
+		{"internal/events", "internal/cli"},
+		{"internal/doctor", "internal/cli"},
+		{"internal/providers", "internal/cli"},
+		{"internal/loop", "internal/cli"},
+		{"internal/diagnosticcontract", "internal/cli"},
+		{"internal/providers", "internal/session"},
+		{"internal/providers", "internal/acp"},
+		{"internal/providers", "internal/api/core"},
+		{"internal/api/contract", "internal/daemon"},
+		{"internal/api/contract", "internal/api/httpapi"},
+		{"internal/api/contract", "internal/api/udsapi"},
+		{"internal/api/contract", "internal/cli"},
+		{"internal/diagnosticcontract", "internal/api/contract"},
+		{"internal/diagnosticcontract", "internal/api/core"},
+		{"internal/events", "internal/api/contract"},
+		{"internal/events", "internal/api/core"},
+		{"internal/loop", "internal/api/contract"},
+		{"internal/loop", "internal/api/core"},
+		{"internal/loop", "internal/loop/goal"},
+		{"internal/automation", "internal/loop"},
+		{"internal/automation", "internal/loop/dsl"},
+		{"internal/api/core", "internal/daemon"},
+		{"internal/api/core", "internal/api/httpapi"},
+		{"internal/api/core", "internal/api/udsapi"},
+		{"internal/api/core", "internal/cli"},
+		{"internal/api/httpapi", "internal/daemon"},
+		{"internal/api/httpapi", "internal/api/udsapi"},
+		{"internal/api/httpapi", "internal/cli"},
+		{"internal/api/udsapi", "internal/daemon"},
+		{"internal/api/udsapi", "internal/api/httpapi"},
+		{"internal/api/udsapi", "internal/cli"},
+		{"internal/modelcatalog", "internal/daemon"},
+		{"internal/modelcatalog", "internal/api/contract"},
+		{"internal/modelcatalog", "internal/api/core"},
+		{"internal/modelcatalog", "internal/api/httpapi"},
+		{"internal/modelcatalog", "internal/api/udsapi"},
+		{"internal/modelcatalog", "internal/cli"},
+		{"internal/marketplace", "internal/daemon"},
+		{"internal/marketplace", "internal/api/contract"},
+		{"internal/marketplace", "internal/api/core"},
+		{"internal/marketplace", "internal/api/httpapi"},
+		{"internal/marketplace", "internal/api/udsapi"},
+		{"internal/marketplace", "internal/cli"},
+		{"internal/marketplace", "internal/skills"},
+		{"internal/marketplace", "internal/extension"},
+		{"internal/marketplace", "internal/settings"},
+		{"internal/marketplace", "internal/mcp"},
+		{"internal/terminal", "internal/daemon"},
+		{"internal/terminal", "internal/api/httpapi"},
+		{"internal/terminal", "internal/api/udsapi"},
+		{"internal/terminal", "internal/api/core"},
+		{"internal/terminal", "internal/api/contract"},
+		{"internal/terminal", "internal/cli"},
+		{"internal/terminal", "internal/tools"},
+		{"internal/terminal", "internal/acp"},
+		{"internal/terminal", "internal/session"},
+		{"internal/terminal", "internal/profile"},
+		{"internal/store/workspacedb", "internal/daemon"},
+		{"internal/store/workspacedb", "internal/api/httpapi"},
+		{"internal/store/workspacedb", "internal/api/udsapi"},
+		{"internal/store/workspacedb", "internal/cli"},
+		{"internal/workspaceaccess", "internal/daemon"},
+		{"internal/workspaceaccess", "internal/api/httpapi"},
+		{"internal/workspaceaccess", "internal/api/udsapi"},
+		{"internal/workspaceaccess", "internal/cli"},
+		{"internal/profile", "internal/daemon"},
+		{"internal/profile", "internal/cli"},
+		{"internal/profile", "internal/session"},
+		{"internal/profile", "internal/task"},
+		{"internal/profile", "internal/workspace"},
+		{"internal/profile", "internal/extension"},
+	}
+	return append(forbidden, gatewayForbiddenDirectImports...)
+}
+
+// Boundaries verifies direct package rules, strict leaf imports, and dependency closures.
+func Boundaries() error {
+	forbidden := directImportBoundaries()
+
+	violations := 0
+	for _, rule := range forbidden {
+		importerDir := rule.importer
+		if _, err := os.Stat(importerDir); err != nil {
+			if errors.Is(err, os.ErrNotExist) {
+				continue
+			}
+			return fmt.Errorf("inspect boundary importer %q: %w", importerDir, err)
+		}
+		importPath := "github.com/compozy/compozy/" + rule.imported
+		files, err := filesImporting(importerDir, importPath)
+		if err != nil {
+			return fmt.Errorf("check whether %q imports %q: %w", importerDir, importPath, err)
+		}
+		if len(files) > 0 {
+			fmt.Printf("VIOLATION: %s imports %s\n", rule.importer, rule.imported)
+			for _, file := range files {
+				fmt.Printf("  %s\n", file)
+			}
+			violations++
+		}
+	}
+
+	prefixForbidden := []struct {
+		importer string
+		imported string
+	}{
+		{"internal/worktree", "internal/session"},
+		{"internal/worktree", "internal/task"},
+		{"internal/worktree", "internal/loop"},
+		{"internal/worktree", "internal/workspace"},
+		{"internal/worktree", "internal/daemon"},
+		{"internal/worktree", "internal/api"},
+		{"internal/worktree", "internal/cli"},
+		{"internal/profile", "internal/api"},
+	}
+	for _, rule := range prefixForbidden {
+		importerDir := rule.importer
+		if _, err := os.Stat(importerDir); err != nil {
+			if errors.Is(err, os.ErrNotExist) {
+				continue
+			}
+			return fmt.Errorf("inspect boundary importer %q: %w", importerDir, err)
+		}
+		importPath := "github.com/compozy/compozy/" + rule.imported
+		files, err := filesImportingPrefix(importerDir, importPath)
+		if err != nil {
+			return fmt.Errorf("check whether %q imports %q or a subpackage: %w", importerDir, importPath, err)
+		}
+		if len(files) == 0 {
+			continue
+		}
+		fmt.Printf("VIOLATION: %s imports %s or a subpackage\n", rule.importer, rule.imported)
+		for _, file := range files {
+			fmt.Printf("  %s\n", file)
+		}
+		violations++
+	}
+
+	leafRules := []struct {
+		importer string
+		allowed  map[string]struct{}
+	}{
+		{importer: "internal/heartbeat/source", allowed: map[string]struct{}{
+			"github.com/compozy/compozy/internal/diagnostics": {},
+			"github.com/compozy/compozy/internal/fileutil":    {},
+			"github.com/compozy/compozy/internal/procutil":    {},
+		}},
+		{importer: "internal/redact", allowed: map[string]struct{}{}},
+		{importer: "internal/extensionprotocol", allowed: map[string]struct{}{}},
+		{importer: "internal/mcppolicy", allowed: map[string]struct{}{}},
+		{
+			importer: "internal/extension/agentplugin",
+			allowed: map[string]struct{}{
+				"github.com/compozy/compozy/internal/fileutil":    {},
+				"github.com/compozy/compozy/internal/frontmatter": {},
+				"github.com/compozy/compozy/internal/mcppolicy":   {},
+			},
+		},
+		{importer: "internal/workspaceaccess", allowed: map[string]struct{}{}},
+		{importer: "internal/mention", allowed: map[string]struct{}{}},
+		{
+			importer: "internal/workspacefiles",
+			allowed: map[string]struct{}{
+				"github.com/compozy/compozy/internal/fileutil": {},
+			},
+		},
+		{
+			importer: "internal/codegen/sdkgo",
+			allowed: map[string]struct{}{
+				"github.com/compozy/compozy/internal/extension/contract": {},
+				"github.com/dave/jennifer/jen":                           {},
+			},
+		},
+		{
+			importer: "internal/registry/gitsrc",
+			allowed: map[string]struct{}{
+				"github.com/compozy/compozy/internal/fileutil":       {},
+				"github.com/compozy/compozy/internal/outboundpolicy": {},
+				"github.com/compozy/compozy/internal/registry":       {},
+			},
+		},
+		{
+			importer: "internal/toolmeta",
+			allowed: map[string]struct{}{
+				"github.com/compozy/compozy/internal/redact": {},
+			},
+		},
+	}
+	for _, rule := range leafRules {
+		files, err := productionFilesImportingOutsideLeaf(rule.importer, rule.allowed)
+		if err != nil {
+			return fmt.Errorf("inspect leaf boundary importer %q: %w", rule.importer, err)
+		}
+		if len(files) == 0 {
+			continue
+		}
+		fmt.Printf("VIOLATION: %s imports a non-leaf dependency\n", rule.importer)
+		for _, file := range files {
+			fmt.Printf("  %s\n", file)
+		}
+		violations++
+	}
+
+	sdkInternalImports, err := filesImportingPrefix("sdk/go", compozyModulePath+"internal")
+	if err != nil {
+		return fmt.Errorf("inspect public Go SDK imports: %w", err)
+	}
+	if len(sdkInternalImports) > 0 {
+		fmt.Println("VIOLATION: sdk/go imports daemon internal packages")
+		for _, file := range sdkInternalImports {
+			fmt.Printf("  %s\n", file)
+		}
+		violations++
+	}
+
+	closureViolations, err := inspectDependencyClosures(
+		subprocessDependencyClosureRules,
+		listPackageDependencies,
+	)
+	if err != nil {
+		return fmt.Errorf("inspect dependency closures: %w", err)
+	}
+	for _, violation := range closureViolations {
+		fmt.Printf(
+			"VIOLATION: %s transitively depends on %s\n",
+			violation.root,
+			violation.dependency,
+		)
+		violations++
+	}
+
+	if violations > 0 {
+		return fmt.Errorf("found %d boundary violations", violations)
+	}
+	fmt.Println("OK: all package boundaries respected")
+	return nil
+}
+
+func productionFilesImportingOutsideLeaf(
+	root string,
+	allowed map[string]struct{},
+) ([]string, error) {
+	if _, err := os.Stat(root); err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return nil, nil
+		}
+		return nil, err
+	}
+
+	fset := token.NewFileSet()
+	files := make([]string, 0)
+	err := filepath.WalkDir(root, func(path string, entry fs.DirEntry, walkErr error) error {
+		if walkErr != nil {
+			return walkErr
+		}
+		if entry.IsDir() || filepath.Ext(path) != ".go" || strings.HasSuffix(path, "_test.go") {
+			return nil
+		}
+		parsed, err := parser.ParseFile(fset, path, nil, parser.ImportsOnly)
+		if err != nil {
+			return fmt.Errorf("parse Go imports in %q: %w", path, err)
+		}
+		for _, spec := range parsed.Imports {
+			importPath, err := strconv.Unquote(spec.Path.Value)
+			if err != nil {
+				return fmt.Errorf("decode Go import in %q: %w", path, err)
+			}
+			if isStandardLibraryImport(importPath) {
+				continue
+			}
+			if _, ok := allowed[importPath]; ok {
+				continue
+			}
+			files = append(files, path)
+			break
+		}
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	slices.Sort(files)
+	return files, nil
+}
+
+func isStandardLibraryImport(importPath string) bool {
+	first, _, _ := strings.Cut(importPath, "/")
+	return !strings.Contains(first, ".")
+}
+
+func inspectDependencyClosures(
+	rules []dependencyClosureRule,
+	listDependencies func(string) ([]string, error),
+) ([]dependencyClosureViolation, error) {
+	violations := make([]dependencyClosureViolation, 0)
+	for _, rule := range rules {
+		dependencies, err := listDependencies(rule.root)
+		if err != nil {
+			return nil, fmt.Errorf("list dependencies for %q: %w", rule.root, err)
+		}
+		selfPath := compozyModulePath + strings.TrimPrefix(rule.root, "./")
+		for _, dependency := range dependencies {
+			if dependency == selfPath {
+				continue
+			}
+			if !dependencyForbiddenByClosureRule(dependency, rule) {
+				continue
+			}
+			violations = append(violations, dependencyClosureViolation{
+				root: rule.root, dependency: dependency,
+			})
+		}
+	}
+	slices.SortFunc(violations, func(a, b dependencyClosureViolation) int {
+		return cmp.Or(cmp.Compare(a.root, b.root), cmp.Compare(a.dependency, b.dependency))
+	})
+	return violations, nil
+}
+
+func dependencyForbiddenByClosureRule(dependency string, rule dependencyClosureRule) bool {
+	for _, prefix := range rule.allowedPrefixes {
+		if dependency == prefix || strings.HasPrefix(dependency, prefix+"/") {
+			return false
+		}
+	}
+	if slices.Contains(rule.forbiddenExact, dependency) {
+		return true
+	}
+	for _, prefix := range rule.forbiddenPrefixes {
+		if dependency == prefix || strings.HasPrefix(dependency, prefix+"/") {
+			return true
+		}
+	}
+	return false
+}
+
+func listPackageDependencies(root string) ([]string, error) {
+	command := exec.CommandContext(context.Background(), "go", "list", "-deps", root)
+	output, err := command.CombinedOutput()
+	if err != nil {
+		return nil, fmt.Errorf("go list -deps %s: %w: %s", root, err, strings.TrimSpace(string(output)))
+	}
+	dependencies := strings.Fields(string(output))
+	slices.Sort(dependencies)
+	return dependencies, nil
+}
+
+func filesImporting(root string, target string) ([]string, error) {
+	return filesImportingMatching(root, func(importPath string) bool {
+		return importPath == target
+	})
+}
+
+func filesImportingPrefix(root string, target string) ([]string, error) {
+	return filesImportingMatching(root, func(importPath string) bool {
+		return importPath == target || strings.HasPrefix(importPath, target+"/")
+	})
+}
+
+func filesImportingMatching(root string, matches func(string) bool) ([]string, error) {
+	fset := token.NewFileSet()
+	files := make([]string, 0)
+	err := filepath.WalkDir(root, func(path string, entry fs.DirEntry, walkErr error) error {
+		if walkErr != nil {
+			return walkErr
+		}
+		if entry.IsDir() || filepath.Ext(path) != ".go" || strings.HasSuffix(path, "_test.go") {
+			return nil
+		}
+		parsed, err := parser.ParseFile(fset, path, nil, parser.ImportsOnly)
+		if err != nil {
+			return fmt.Errorf("parse Go imports in %q: %w", path, err)
+		}
+		for _, spec := range parsed.Imports {
+			importPath, err := strconv.Unquote(spec.Path.Value)
+			if err != nil {
+				return fmt.Errorf("decode Go import in %q: %w", path, err)
+			}
+			if matches(importPath) {
+				files = append(files, path)
+				break
+			}
+		}
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	slices.Sort(files)
+	return files, nil
+}

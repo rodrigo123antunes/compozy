@@ -1,0 +1,168 @@
+---
+title: Environment Variables
+description: Environment variables CompozyOS reads, injects, propagates, and explicitly does not support.
+---
+
+CompozyOS reads a small core set of environment variables, injects session identity into managed agent
+subprocesses, and lets some extension providers use process-level overrides.
+
+## Precedence
+
+| Source                        | Applies to                                  | Precedence                                                                                                                                |
+| ----------------------------- | ------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------- |
+| Process environment           | All CompozyOS commands and daemon startup.  | Base environment.                                                                                                                         |
+| `<workspace>/.env`            | Config loads that include a workspace root. | Loaded before `$COMPOZY_HOME` is resolved. Does not override variables already set by the process loader.                                 |
+| `config.toml`                 | Runtime config values.                      | Used for CompozyOS config. There is no `COMPOZY_CONFIG` or `COMPOZY_LOG_LEVEL` override today.                                            |
+| Managed session env injection | Agent subprocesses.                         | Starts from daemon environment, sets CompozyOS session variables, sets `COMPOZY_BIN`, and prepends the daemon binary directory to `PATH`. |
+| Hook subprocess env           | Hook subprocesses.                          | Starts from an allowlist of parent env vars, then applies hook `env` overrides.                                                           |
+
+## Desktop-owned daemon PATH
+
+On macOS and Linux, a daemon started from the desktop app resolves `PATH` from the operator's login
+shell before it starts runtime services. Only `PATH` is imported; other shell variables do not
+replace the desktop process environment. If shell resolution fails or exceeds its bound, startup
+continues with the inherited `PATH` and records a warning.
+
+This behavior applies only while durable install provenance identifies the runtime as desktop-owned.
+A daemon started or installed by the operator keeps the environment from its own launcher. Windows
+keeps the inherited desktop environment.
+
+## Core Variables CompozyOS Reads
+
+| Variable                               | Type           | Default      | Valid values                                        | Description                                                                                                                                                               |
+| -------------------------------------- | -------------- | ------------ | --------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `COMPOZY_HOME`                         | path           | `~/.compozy` | Non-empty path.                                     | Overrides the global CompozyOS home directory. If a workspace `.env` sets it, that value can affect config loading for that workspace before home paths are resolved.     |
+| `COMPOZY_DEV_VERIFY_BOUNDARIES`        | boolean string | unset        | `1`, `true`, or `yes` enable boundary verification. | Development-only daemon boundary import verification toggle.                                                                                                              |
+| `COMPOZY_MARKETPLACE_CATALOG_BASE_URL` | URL            | unset        | Absolute `http`, `https`, or local `file` URL.      | Runtime-only catalog source override. Development commands set it to the checkout catalog; it takes precedence over `config.toml` and is never written back to that file. |
+| `GITHUB_TOKEN`                         | token string   | unset        | Non-empty token.                                    | Used by the GitHub registry client for private repositories and higher rate limits.                                                                                       |
+
+## Provider credential variables
+
+Provider config binds launch-time credentials only when a provider uses
+`auth_mode = "bound_secret"`. Each `credential_slots` entry names a target environment variable and
+resolves its value from either `env:NAME` or an encrypted CompozyOS secret ref such as
+`vault:providers/openrouter/api-key`. CompozyOS injects only the bound value into the provider
+subprocess.
+
+Direct ACP providers such as Claude Code, Codex, Gemini CLI, OpenCode, Kimi CLI, and similar CLIs
+use `auth_mode = "native_cli"` by default. The direct `pi` provider also
+uses Pi's `/login` and auth file by default. Wrapped API-key providers such as OpenRouter, z.ai,
+Moonshot/Kimi, Vercel AI Gateway, and xAI default to
+`auth_mode = "bound_secret"`: CompozyOS exposes them directly, launches Pi under the hood, and injects
+the configured provider key.
+
+| Variable             | Default provider    | Default | Valid values             | Description                                                                           |
+| -------------------- | ------------------- | ------- | ------------------------ | ------------------------------------------------------------------------------------- |
+| `ANTHROPIC_API_KEY`  | `pi`                | unset   | Provider-specific token. | Optional Pi-owned env credential for direct `pi`, or an explicit bound-secret target. |
+| `OPENROUTER_API_KEY` | `openrouter`        | unset   | Provider-specific token. | Default CompozyOS-managed credential target for the OpenRouter wrapper.               |
+| `ZAI_API_KEY`        | `zai`               | unset   | Provider-specific token. | Default CompozyOS-managed credential target for the z.ai wrapper.                     |
+| `KIMI_API_KEY`       | `moonshot`          | unset   | Provider-specific token. | Default CompozyOS-managed credential target for the Moonshot/Kimi wrapper.            |
+| `AI_GATEWAY_API_KEY` | `vercel-ai-gateway` | unset   | Provider-specific token. | Default CompozyOS-managed credential target for the Vercel AI Gateway wrapper.        |
+| `XAI_API_KEY`        | `xai`               | unset   | Provider-specific token. | Default CompozyOS-managed credential target for the xAI wrapper.                      |
+
+`COMPOZY_VAULT_KEY` can override the daemon-local Vault encryption key. When it is unset, CompozyOS creates
+`$COMPOZY_HOME/vault.key` with `0600` permissions the first time it needs to encrypt or decrypt a
+vault-backed secret.
+
+Use [Vault](/docs/configuration/vault) for CompozyOS-managed encrypted values that should be
+written through CLI, HTTP, UDS, or web surfaces. Use `env:NAME` when the service manager or shell
+that starts the daemon should remain the source of truth for the secret value.
+
+## Automation Webhook Secrets
+
+Config-defined webhook triggers require `[[automation.triggers]].webhook_secret_ref`. Use `env:NAME`
+for operator-managed environment variables or `vault:automation/...` for CompozyOS-managed encrypted
+secrets.
+
+| Variable named by `env:` ref            | Type   | Default | Valid values                                          | Description                                                 |
+| --------------------------------------- | ------ | ------- | ----------------------------------------------------- | ----------------------------------------------------------- |
+| `COMPOZY_DEPLOY_WEBHOOK_SECRET` example | string | none    | Must exist and be non-empty when the ref is resolved. | Secret used to validate config-defined automation webhooks. |
+
+Example:
+
+```toml
+[[automation.triggers]]
+scope = "global"
+name = "deploy-webhook"
+agent = "release"
+prompt = "Handle deploy webhook {{ .Kind }}."
+event = "webhook"
+endpoint_slug = "deploy"
+webhook_secret_ref = "env:COMPOZY_DEPLOY_WEBHOOK_SECRET"
+```
+
+```bash
+export COMPOZY_DEPLOY_WEBHOOK_SECRET="replace-with-secret"
+```
+
+## Variables CompozyOS Injects Into Agent Sessions
+
+Managed ACP agent subprocesses start from the provider's `env_policy`. `filtered` inherits the
+daemon environment after removing secret-shaped variables; `isolated` keeps only a fixed
+operational allowlist. CompozyOS then applies these changes:
+
+| Variable                       | Type          | Default                                                              | Valid values                          | Description                                                                            |
+| ------------------------------ | ------------- | -------------------------------------------------------------------- | ------------------------------------- | -------------------------------------------------------------------------------------- |
+| `COMPOZY_SESSION_ID`           | string        | set for every managed session                                        | Session ID.                           | Injected into the agent process and read by `compozy whoami`.                          |
+| `COMPOZY_AGENT`                | string        | resolved agent name                                                  | Agent name.                           | Injected for agent identity metadata.                                                  |
+| `COMPOZY_AGENT_NAME`           | string        | resolved agent name                                                  | Agent name.                           | Injected for agent identity metadata.                                                  |
+| `COMPOZY_PROVIDER`             | string        | resolved provider id                                                 | Provider id.                          | Injected for provider-aware tools and diagnostics.                                     |
+| `COMPOZY_PROVIDER_HARNESS`     | string        | resolved provider harness                                            | `acp`, `pi_acp`.                      | Injected for provider-aware tools and diagnostics.                                     |
+| `COMPOZY_PROVIDER_AUTH_MODE`   | string        | resolved provider auth mode                                          | `native_cli`, `bound_secret`, `none`. | Identifies whether auth is native CLI, CompozyOS-bound secret, or none.                |
+| `COMPOZY_PROVIDER_ENV_POLICY`  | string        | resolved provider env policy                                         | `filtered`, `isolated`.               | Identifies which daemon environment policy was used.                                   |
+| `COMPOZY_PROVIDER_HOME_POLICY` | string        | resolved provider home policy                                        | `operator`, `isolated`.               | Identifies whether the provider uses operator or isolated home state.                  |
+| `COMPOZY_MODEL`                | string        | resolved model                                                       | Provider model string.                | Injected for provider-aware tools and diagnostics.                                     |
+| `PROVIDER_HOME`                | path          | set only when `home_policy = "isolated"`                             | CompozyOS-owned provider home.        | Points generic provider CLIs at `$COMPOZY_HOME/providers/<provider>`.                  |
+| `HOME`                         | path          | provider home when isolated, otherwise parent.                       | Existing path.                        | Redirected to provider home only for isolated provider-home launches.                  |
+| `XDG_CONFIG_HOME`              | path          | set only when provider home is isolated                              | Provider config directory.            | Generic config location under the isolated provider home.                              |
+| `XDG_DATA_HOME`                | path          | set only when provider home is isolated                              | Provider data directory.              | Generic data location under the isolated provider home.                                |
+| `XDG_CACHE_HOME`               | path          | set only when provider home is isolated                              | Provider cache directory.             | Generic cache location under the isolated provider home.                               |
+| `CLAUDE_CONFIG_DIR`            | path          | set only for isolated `claude` providers                             | Provider Claude config directory.     | Points Claude Code at isolated CompozyOS-owned auth/config state.                      |
+| `CODEX_HOME`                   | path          | set only for isolated `codex` providers                              | Provider Codex home directory.        | Points Codex at isolated CompozyOS-owned auth/config state.                            |
+| `PROVIDER_CODEX_HOME`          | path          | set only for isolated `codex` providers                              | Provider Codex home directory.        | Mirrors `CODEX_HOME` for QA and provider-launch diagnostics.                           |
+| `OPENCODE_CONFIG_DIR`          | path          | set only for isolated `opencode` providers                           | Provider OpenCode config directory.   | Points OpenCode at isolated CompozyOS-owned auth/config state.                         |
+| `PI_CODING_AGENT_DIR`          | path          | set for native Pi isolated home or Pi-backed `bound_secret` sessions | Pi auth/config directory.             | Points Pi at the isolated native auth store or bound-secret runtime config.            |
+| `COMPOZY_BIN`                  | absolute path | current CompozyOS executable                                         | Existing executable path.             | Injected into ACP provider subprocesses so agents can call the same CompozyOS binary.  |
+| `PATH`                         | path list     | inherited or allowlisted                                             | Path list for the operating system.   | The directory containing `COMPOZY_BIN` is prepended and duplicate entries are removed. |
+
+## Hook Subprocess Environment
+
+Hook subprocesses do not inherit the full daemon environment. They inherit an allowlist and then
+apply explicit hook `env` values from config, `AGENT.md`, or `SKILL.md`.
+
+| Variable      | Type      | Default          | Valid values            | Description                               |
+| ------------- | --------- | ---------------- | ----------------------- | ----------------------------------------- |
+| `COMSPEC`     | string    | inherited if set | Any string.             | Windows command processor environment.    |
+| `HOME`        | path      | inherited if set | Path.                   | User home.                                |
+| `LANG`        | string    | inherited if set | Locale string.          | Locale.                                   |
+| `LC_ALL`      | string    | inherited if set | Locale string.          | Locale override.                          |
+| `LC_CTYPE`    | string    | inherited if set | Locale string.          | Character classification locale.          |
+| `LOGNAME`     | string    | inherited if set | User name.              | Login name.                               |
+| `PATH`        | path list | inherited if set | Path list.              | Executable lookup path for hook commands. |
+| `PATHEXT`     | string    | inherited if set | Windows extension list. | Windows executable extension lookup.      |
+| `SHELL`       | path      | inherited if set | Shell path.             | User shell.                               |
+| `SYSTEMROOT`  | path      | inherited if set | Windows system root.    | Windows system root.                      |
+| `TEMP`        | path      | inherited if set | Path.                   | Temporary directory.                      |
+| `TERM`        | string    | inherited if set | Terminal type.          | Terminal metadata.                        |
+| `TMP`         | path      | inherited if set | Path.                   | Temporary directory.                      |
+| `TMPDIR`      | path      | inherited if set | Path.                   | Temporary directory.                      |
+| `USER`        | string    | inherited if set | User name.              | User account.                             |
+| `USERPROFILE` | path      | inherited if set | Windows profile path.   | Windows user profile.                     |
+
+Explicit hook `env` values override inherited values with the same key.
+
+## Not Supported As Environment Overrides
+
+These names are common guesses or appear in older task notes, but current CompozyOS code does not read
+them as runtime configuration variables.
+
+| Variable               | Status                              | Use instead                                                                                                  |
+| ---------------------- | ----------------------------------- | ------------------------------------------------------------------------------------------------------------ |
+| `COMPOZY_CONFIG`       | Not read.                           | Put global config at `$COMPOZY_HOME/config.toml` and workspace config at `<workspace>/.compozy/config.toml`. |
+| `COMPOZY_LOG_LEVEL`    | Not read.                           | Set `[log].level` in `config.toml`.                                                                          |
+| `VITE_COMPOZY_API_URL` | Not read by CompozyOS runtime code. | It is listed as a Turbo build cache input, not a daemon config variable.                                     |
+
+## Related Pages
+
+- [config.toml](/docs/configuration/config-toml) documents config fields that replace env overrides.
+- [File Locations](/docs/configuration/file-locations) documents `$COMPOZY_HOME` and workspace paths.

@@ -1,0 +1,11296 @@
+package daemon
+
+import (
+	"bufio"
+	"bytes"
+	"cmp"
+	"context"
+	"crypto/sha256"
+	"database/sql"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"io"
+	"log/slog"
+	"maps"
+	"net/http"
+	"net/http/httptest"
+	"os"
+	"os/signal"
+	"path/filepath"
+	"reflect"
+	"runtime"
+	"slices"
+	"strings"
+	"sync"
+	"syscall"
+	"testing"
+	"time"
+
+	opendesign "github.com/compozy/compozy/extensions/open-design"
+	speccycle "github.com/compozy/compozy/extensions/spec-cycle"
+
+	"github.com/compozy/compozy/internal/acp"
+	"github.com/compozy/compozy/internal/api/contract"
+	"github.com/compozy/compozy/internal/api/core"
+	attachmentspkg "github.com/compozy/compozy/internal/attachments"
+	automationpkg "github.com/compozy/compozy/internal/automation"
+	"github.com/compozy/compozy/internal/cmdpalette"
+	compozyconfig "github.com/compozy/compozy/internal/config"
+	"github.com/compozy/compozy/internal/diagnosticcontract"
+	"github.com/compozy/compozy/internal/doctor"
+	eventspkg "github.com/compozy/compozy/internal/events"
+	extensionpkg "github.com/compozy/compozy/internal/extension"
+	extensionprotocol "github.com/compozy/compozy/internal/extensionprotocol"
+	"github.com/compozy/compozy/internal/gateway"
+	"github.com/compozy/compozy/internal/heartbeat"
+	hookspkg "github.com/compozy/compozy/internal/hooks"
+	looppkg "github.com/compozy/compozy/internal/loop"
+	loopdsl "github.com/compozy/compozy/internal/loop/dsl"
+	"github.com/compozy/compozy/internal/observe"
+	"github.com/compozy/compozy/internal/procutil"
+	profilepkg "github.com/compozy/compozy/internal/profile"
+	registrypkg "github.com/compozy/compozy/internal/registry"
+	registrygithub "github.com/compozy/compozy/internal/registry/github"
+	"github.com/compozy/compozy/internal/resources"
+	"github.com/compozy/compozy/internal/session"
+	"github.com/compozy/compozy/internal/sessionprocess"
+	"github.com/compozy/compozy/internal/skills"
+	"github.com/compozy/compozy/internal/store"
+	"github.com/compozy/compozy/internal/store/globaldb"
+	"github.com/compozy/compozy/internal/store/sessiondb"
+	"github.com/compozy/compozy/internal/subprocess"
+	taskpkg "github.com/compozy/compozy/internal/task"
+	"github.com/compozy/compozy/internal/testutil"
+	toolspkg "github.com/compozy/compozy/internal/tools"
+	"github.com/compozy/compozy/internal/transcript"
+	workspacepkg "github.com/compozy/compozy/internal/workspace"
+	"github.com/compozy/compozy/internal/workspaceaccess"
+	"github.com/gofrs/flock"
+	"go.uber.org/goleak"
+	"golang.org/x/sys/execabs"
+)
+
+func TestAcquireLockSucceedsWithoutExistingLock(t *testing.T) {
+	lockPath := filepath.Join(t.TempDir(), "daemon.lock")
+
+	lock, err := AcquireLock(lockPath, os.Getpid())
+	if err != nil {
+		t.Fatalf("AcquireLock() error = %v", err)
+	}
+	t.Cleanup(func() {
+		if err := lock.Release(); err != nil {
+			t.Fatalf("lock.Release() error = %v", err)
+		}
+	})
+
+	if got := lock.StalePID(); got != 0 {
+		t.Fatalf("lock.StalePID() = %d, want 0", got)
+	}
+
+	data, err := os.ReadFile(lockPath)
+	if err != nil {
+		t.Fatalf("os.ReadFile(lock) error = %v", err)
+	}
+	if got, want := strings.TrimSpace(string(data)), strconvString(os.Getpid()); got != want {
+		t.Fatalf("lock file contents = %q, want %q", got, want)
+	}
+}
+
+func TestRuntimeMemoryMonitor(t *testing.T) {
+	t.Run("Should report baseline periodic and joined shutdown snapshots", func(t *testing.T) {
+		// not parallel: UT-061 compares the process-wide goroutine count around shutdown.
+		baselineGoroutines := runtime.NumGoroutine()
+
+		startedAt := time.Date(2026, 7, 15, 12, 0, 0, 0, time.UTC)
+		now := startedAt
+		ticker := &runtimeMemoryManualTicker{ticks: make(chan time.Time, 1)}
+		reports := make(chan doctor.RuntimeMemorySnapshot, 3)
+		monitor := newRuntimeMemoryMonitor(
+			time.Minute,
+			startedAt,
+			slog.Default(),
+			func(options *runtimeMemoryMonitorOptions) {
+				options.now = func() time.Time { return now }
+				options.residentMemory = func() (uint64, string, error) { return 8192, "current", nil }
+				options.newTicker = func(time.Duration) runtimeMemoryTicker { return ticker }
+				options.report = func(snapshot doctor.RuntimeMemorySnapshot) { reports <- snapshot }
+			},
+		)
+		if err := monitor.Start(testutil.Context(t)); err != nil {
+			t.Fatalf("Start() error = %v", err)
+		}
+		baseline := receiveRuntimeMemorySnapshot(t, reports)
+		if baseline.Phase != runtimeMemoryPhaseBaseline || !baseline.Active || baseline.ResidentMemoryBytes != 8192 {
+			t.Fatalf("baseline snapshot = %#v, want active populated baseline", baseline)
+		}
+
+		now = startedAt.Add(time.Minute)
+		ticker.ticks <- now
+		periodic := receiveRuntimeMemorySnapshot(t, reports)
+		if periodic.Phase != runtimeMemoryPhasePeriodic || periodic.UptimeSeconds != 60 || periodic.Goroutines <= 0 {
+			t.Fatalf("periodic snapshot = %#v, want one-minute populated sample", periodic)
+		}
+
+		now = startedAt.Add(2 * time.Minute)
+		shutdownCtx, cancel := context.WithTimeout(t.Context(), time.Second)
+		defer cancel()
+		if err := monitor.Shutdown(shutdownCtx); err != nil {
+			t.Fatalf("Shutdown() error = %v", err)
+		}
+		shutdown := receiveRuntimeMemorySnapshot(t, reports)
+		if shutdown.Phase != runtimeMemoryPhaseShutdown || shutdown.Active || shutdown.UptimeSeconds != 120 {
+			t.Fatalf("shutdown snapshot = %#v, want inactive joined snapshot", shutdown)
+		}
+		if !ticker.stopped {
+			t.Fatal("Shutdown() ticker stopped = false, want true")
+		}
+
+		deadline := time.Now().Add(time.Second)
+		for runtime.NumGoroutine() > baselineGoroutines && time.Now().Before(deadline) {
+			runtime.Gosched()
+		}
+		if got := runtime.NumGoroutine(); got > baselineGoroutines {
+			t.Fatalf("goroutines after shutdown = %d, want at most baseline %d", got, baselineGoroutines)
+		}
+	})
+
+	t.Run("Should disable sampling without starting a ticker", func(t *testing.T) {
+		t.Parallel()
+
+		tickerStarted := false
+		monitor := newRuntimeMemoryMonitor(
+			0,
+			time.Now(),
+			slog.Default(),
+			func(options *runtimeMemoryMonitorOptions) {
+				options.newTicker = func(time.Duration) runtimeMemoryTicker {
+					tickerStarted = true
+					return &runtimeMemoryManualTicker{ticks: make(chan time.Time)}
+				}
+			},
+		)
+		if err := monitor.Start(testutil.Context(t)); err != nil {
+			t.Fatalf("Start() error = %v", err)
+		}
+		if tickerStarted {
+			t.Fatal("Start() created a ticker for interval zero")
+		}
+		snapshot := monitor.RuntimeMemorySnapshot()
+		if snapshot.Enabled || snapshot.Active || snapshot.Phase != runtimeMemoryPhaseDisabled {
+			t.Fatalf("RuntimeMemorySnapshot() = %#v, want deterministic disabled state", snapshot)
+		}
+		if err := monitor.Shutdown(testutil.Context(t)); err != nil {
+			t.Fatalf("Shutdown() error = %v", err)
+		}
+	})
+}
+
+type runtimeMemoryManualTicker struct {
+	ticks   chan time.Time
+	stopped bool
+}
+
+func (t *runtimeMemoryManualTicker) C() <-chan time.Time { return t.ticks }
+
+func (t *runtimeMemoryManualTicker) Stop() { t.stopped = true }
+
+func receiveRuntimeMemorySnapshot(
+	t *testing.T,
+	reports <-chan doctor.RuntimeMemorySnapshot,
+) doctor.RuntimeMemorySnapshot {
+	t.Helper()
+	select {
+	case snapshot := <-reports:
+		return snapshot
+	case <-time.After(time.Second):
+		t.Fatal("runtime memory snapshot was not reported")
+		return doctor.RuntimeMemorySnapshot{}
+	}
+}
+
+func TestAcquireLockFailsWhenAnotherDaemonHoldsTheLock(t *testing.T) {
+	lockPath := filepath.Join(t.TempDir(), "daemon.lock")
+
+	first, err := AcquireLock(lockPath, os.Getpid())
+	if err != nil {
+		t.Fatalf("AcquireLock(first) error = %v", err)
+	}
+	t.Cleanup(func() {
+		if err := first.Release(); err != nil {
+			t.Fatalf("first.Release() error = %v", err)
+		}
+	})
+
+	second, err := AcquireLock(lockPath, os.Getpid())
+	if second != nil {
+		t.Fatalf("AcquireLock(second) lock = %#v, want nil", second)
+	}
+	if !errors.Is(err, ErrAlreadyRunning) {
+		t.Fatalf("AcquireLock(second) error = %v, want ErrAlreadyRunning", err)
+	}
+	if owner, err := InspectLockOwner(lockPath); err != nil || owner != (LockOwner{PID: os.Getpid(), Held: true}) {
+		t.Fatalf("InspectLockOwner(held) = %#v, %v; want held by pid %d", owner, err, os.Getpid())
+	}
+}
+
+func TestInspectLockOwnerReportsFreeLockWithLivePID(t *testing.T) {
+	lockPath := filepath.Join(t.TempDir(), "daemon.lock")
+	if err := os.WriteFile(lockPath, nil, 0o644); err != nil {
+		t.Fatalf("os.WriteFile(lock) error = %v", err)
+	}
+	if err := writeLockPID(lockPIDPath(lockPath), os.Getpid()); err != nil {
+		t.Fatalf("writeLockPID() error = %v", err)
+	}
+
+	owner, err := InspectLockOwner(lockPath)
+	if err != nil || owner != (LockOwner{PID: os.Getpid()}) {
+		t.Fatalf("InspectLockOwner(free) = %#v, %v; want live recorded pid %d with Held=false", owner, err, os.Getpid())
+	}
+}
+
+func TestAcquireLockReclaimsStalePID(t *testing.T) {
+	lockPath := filepath.Join(t.TempDir(), "daemon.lock")
+	if err := os.WriteFile(lockPath, []byte("999999\n"), 0o644); err != nil {
+		t.Fatalf("os.WriteFile(lock) error = %v", err)
+	}
+	if owner, err := InspectLockOwner(lockPath); err != nil || owner.Held {
+		t.Fatalf("InspectLockOwner(stale) = %#v, %v; want a free lock", owner, err)
+	}
+
+	lock, err := acquireLock(lockPath, 1234, lockDeps{
+		newFlock:     func(path string) *flock.Flock { return flock.New(path) },
+		processAlive: func(_ int) bool { return false },
+	})
+	if err != nil {
+		t.Fatalf("acquireLock() error = %v", err)
+	}
+	t.Cleanup(func() {
+		if err := lock.Release(); err != nil {
+			t.Fatalf("lock.Release() error = %v", err)
+		}
+	})
+
+	if got, want := lock.StalePID(), 999999; got != want {
+		t.Fatalf("lock.StalePID() = %d, want %d", got, want)
+	}
+}
+
+func TestUpdateLock(t *testing.T) {
+	t.Parallel()
+	t.Run("Should recognize a Linux prior owner despite wall clock drift", func(t *testing.T) {
+		t.Parallel()
+		token, err := procutil.ProcessToken(os.Getpid())
+		if err != nil {
+			t.Fatal(err)
+		}
+		if token == "" {
+			t.Skip("Linux kernel identity")
+		}
+		path := filepath.Join(t.TempDir(), "update.lock")
+		owner := UpdateLockOwner{
+			PID:          os.Getpid(),
+			StartedAt:    time.Date(2000, 1, 1, 0, 0, 0, 0, time.UTC),
+			ProcessToken: token,
+		}
+		if err := writeUpdateLockOwner(updateLockOwnerPath(path), owner); err != nil {
+			t.Fatal(err)
+		}
+		lock, err := AcquireUpdateLock(path, owner)
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() {
+			if err := lock.Release(); err != nil {
+				t.Error(err)
+			}
+		})
+		if lock.StaleOwner() != nil {
+			t.Fatal("live kernel identity reported as stale")
+		}
+	})
+
+	t.Run("Should reject a concurrent runtime mutation", func(t *testing.T) {
+		t.Parallel()
+
+		lockPath := filepath.Join(t.TempDir(), "update.lock")
+		startedAt, err := procutil.StartedAt(os.Getpid())
+		if err != nil {
+			t.Fatalf("procutil.StartedAt() error = %v", err)
+		}
+		owner := UpdateLockOwner{PID: os.Getpid(), StartedAt: startedAt}
+		first, err := AcquireUpdateLock(lockPath, owner)
+		if err != nil {
+			t.Fatalf("AcquireUpdateLock(first) error = %v", err)
+		}
+		t.Cleanup(func() {
+			if err := first.Release(); err != nil {
+				t.Errorf("first.Release() error = %v", err)
+			}
+		})
+
+		second, err := AcquireUpdateLock(lockPath, owner)
+		if second != nil {
+			t.Fatalf("AcquireUpdateLock(second) lock = %#v, want nil", second)
+		}
+		if !errors.Is(err, ErrRuntimeMutationInProgress) {
+			t.Fatalf("AcquireUpdateLock(second) error = %v, want ErrRuntimeMutationInProgress", err)
+		}
+	})
+
+	t.Run("Should replace a stale owner with the caller identity", func(t *testing.T) {
+		t.Parallel()
+
+		lockPath := filepath.Join(t.TempDir(), "update.lock")
+		stale := UpdateLockOwner{
+			PID:       999_999_999,
+			StartedAt: time.Date(2020, 1, 2, 3, 4, 5, 0, time.UTC),
+		}
+		data, err := json.Marshal(stale)
+		if err != nil {
+			t.Fatalf("json.Marshal(stale owner) error = %v", err)
+		}
+		if err := os.WriteFile(updateLockOwnerPath(lockPath), append(data, '\n'), 0o600); err != nil {
+			t.Fatalf("os.WriteFile(update lock) error = %v", err)
+		}
+		startedAt, err := procutil.StartedAt(os.Getpid())
+		if err != nil {
+			t.Fatalf("procutil.StartedAt() error = %v", err)
+		}
+		owner := UpdateLockOwner{PID: os.Getpid(), StartedAt: startedAt}
+		lock, err := AcquireUpdateLock(lockPath, owner)
+		if err != nil {
+			t.Fatalf("AcquireUpdateLock() error = %v", err)
+		}
+
+		if got := lock.StaleOwner(); got == nil || got.PID != stale.PID || !got.StartedAt.Equal(stale.StartedAt) {
+			t.Fatalf("StaleOwner() = %#v, want %#v", got, stale)
+		}
+		contents, err := os.ReadFile(updateLockOwnerPath(lockPath))
+		if err != nil {
+			t.Fatalf("os.ReadFile(update lock) error = %v", err)
+		}
+		var persisted UpdateLockOwner
+		if err := json.Unmarshal(contents, &persisted); err != nil {
+			t.Fatalf("json.Unmarshal(update lock) error = %v", err)
+		}
+		if persisted.PID != owner.PID || !persisted.StartedAt.Equal(owner.StartedAt) {
+			t.Fatalf("persisted owner = %#v, want %#v", persisted, owner)
+		}
+		if err := lock.Release(); err != nil {
+			t.Fatalf("lock.Release() error = %v", err)
+		}
+		contents, err = os.ReadFile(updateLockOwnerPath(lockPath))
+		if err != nil {
+			t.Fatalf("os.ReadFile(released lock) error = %v", err)
+		}
+		if len(contents) != 0 {
+			t.Fatalf("released lock contents = %q, want empty", contents)
+		}
+		reacquired, err := AcquireUpdateLock(lockPath, owner)
+		if err != nil {
+			t.Fatalf("AcquireUpdateLock(after release) error = %v", err)
+		}
+		if reacquired.StaleOwner() != nil {
+			t.Fatal("released lock retained a stale owner")
+		}
+		if err := reacquired.Release(); err != nil {
+			t.Fatalf("Release(reacquired) error = %v", err)
+		}
+	})
+}
+
+func TestInfoWriteReadAndRemoveRoundTrip(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "daemon.json")
+	now := time.Date(2026, 4, 3, 12, 30, 0, 0, time.UTC)
+	info := Info{
+		PID:       4242,
+		HTTPHost:  "::1",
+		Port:      2123,
+		StartedAt: now,
+	}
+
+	if err := WriteInfo(path, info); err != nil {
+		t.Fatalf("WriteInfo() error = %v", err)
+	}
+
+	got, err := ReadInfo(path)
+	if err != nil {
+		t.Fatalf("ReadInfo() error = %v", err)
+	}
+	if got.PID != info.PID || got.Port != info.Port || got.HTTPHost != info.HTTPHost ||
+		!got.StartedAt.Equal(info.StartedAt) {
+		t.Fatalf("ReadInfo() = %#v, want %#v", got, info)
+	}
+
+	if err := RemoveInfo(path); err != nil {
+		t.Fatalf("RemoveInfo() error = %v", err)
+	}
+	if _, err := os.Stat(path); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("daemon.json exists after RemoveInfo(): stat error = %v, want os.ErrNotExist", err)
+	}
+
+	t.Run("Should reject an oversized daemon discovery record", func(t *testing.T) {
+		t.Parallel()
+
+		oversizedPath := filepath.Join(t.TempDir(), "daemon.json")
+		if err := os.WriteFile(oversizedPath, bytes.Repeat([]byte("x"), daemonInfoMaxBytes+1), 0o600); err != nil {
+			t.Fatalf("os.WriteFile(oversized daemon info) error = %v", err)
+		}
+
+		_, err := ReadInfo(oversizedPath)
+		if err == nil || !strings.Contains(err.Error(), "exceeds 65536 bytes") {
+			t.Fatalf("ReadInfo(oversized daemon info) error = %v, want bounded-record error", err)
+		}
+	})
+}
+
+// Invariant: the terminal-Loop neutralization barrier finishes before task recovery and readiness;
+// a barrier error fails boot closed. The canonical daemon boot suite owns startup ordering.
+func TestBootLoopReconciliationBarrier(t *testing.T) {
+	t.Run("Should fail closed before recovery readiness backstop ticker or claims IT-031", func(t *testing.T) {
+		homePaths := testHomePaths(t)
+		cfg := testConfig(t, homePaths)
+		barrierErr := errors.New("injected Loop neutralization failure")
+		recoveryCalled := false
+		registry := &recordingRegistry{
+			path: homePaths.DatabaseFile, neutralizeLoopOrphansErr: barrierErr,
+			onListTaskRunsByStatus: func([]taskpkg.RunStatus) { recoveryCalled = true },
+		}
+		d := newTestDaemon(t, homePaths, &cfg)
+		d.openRegistry = func(context.Context, string) (Registry, error) { return registry, nil }
+		d.newSessionManager = func(context.Context, SessionManagerDeps) (SessionManager, error) {
+			return &fakeSessionManager{}, nil
+		}
+		d.newObserver = func(context.Context, RuntimeDeps) (Observer, error) { return &fakeObserver{}, nil }
+		d.httpFactory = func(context.Context, RuntimeDeps) (Server, error) {
+			return &fakeServer{name: "http"}, nil
+		}
+		d.udsFactory = func(context.Context, RuntimeDeps) (Server, error) {
+			return &fakeServer{name: "uds"}, nil
+		}
+
+		err := d.boot(testutil.Context(t))
+		if !errors.Is(err, barrierErr) || !strings.Contains(err.Error(), "neutralize Loop orphans before recovery") {
+			t.Fatalf("boot() error = %v, want structured neutralization failure", err)
+		}
+		select {
+		case <-d.readyCh:
+			t.Fatal("boot() reported readiness after neutralization failed")
+		default:
+		}
+		if recoveryCalled {
+			t.Fatal("boot() ran task recovery after neutralization failed")
+		}
+		registry.mu.Lock()
+		calls := slices.Clone(registry.reconciliationCalls)
+		registry.mu.Unlock()
+		if !slices.Equal(calls, []string{"neutralize"}) {
+			t.Fatalf("reconciliation calls = %#v, want only neutralize", calls)
+		}
+		if d.tasks != nil || d.scheduler != nil || d.coordinator != nil {
+			t.Fatalf("published runtimes after failed barrier: tasks=%v scheduler=%v coordinator=%v",
+				d.tasks != nil, d.scheduler != nil, d.coordinator != nil)
+		}
+	})
+
+	t.Run("Should block real SQLite claim traffic until orphan ownership is neutralized IT-028", func(t *testing.T) {
+		homePaths := testHomePaths(t)
+		cfg := testConfig(t, homePaths)
+		cloneDaemonTestStoreSeed(t, homePaths.DatabaseFile)
+		db, err := openDaemonTestGlobalDBAtPath(testutil.Context(t), homePaths.DatabaseFile)
+		if err != nil {
+			t.Fatalf("OpenGlobalDB() error = %v", err)
+		}
+		t.Cleanup(func() {
+			if err := db.Close(testutil.Context(t)); err != nil {
+				t.Fatalf("GlobalDB.Close() error = %v", err)
+			}
+		})
+		now := time.Date(2026, time.August, 20, 14, 0, 0, 0, time.UTC)
+		if err := db.InsertWorkspace(testutil.Context(t), workspacepkg.Workspace{
+			ID: "ws-daemon-barrier", Name: "Daemon barrier", RootDir: t.TempDir(),
+			CreatedAt: now, UpdatedAt: now,
+		}); err != nil {
+			t.Fatalf("InsertWorkspace() error = %v", err)
+		}
+		terminalRun := looppkg.Run{
+			ID: "looprun-daemon-barrier-terminal", WorkspaceID: "ws-daemon-barrier",
+			LoopName: "daemon-barrier-terminal", Status: looppkg.StatusRunning,
+			ReattemptStrategy: looppkg.ReattemptFailedOnly, IterationCap: 1,
+			BudgetOnExceeded: loopdsl.BudgetExceededHalt, CreatedAt: now, LastProgressAt: now,
+		}
+		applyLoopRunPinningForTest(t, &terminalRun, now)
+		if _, err := db.CreateLoopRunForStart(testutil.Context(t), terminalRun, loopdsl.ConcurrencyAllow); err != nil {
+			t.Fatalf("CreateLoopRunForStart(terminal) error = %v", err)
+		}
+		missingRun := terminalRun
+		missingRun.ID = "looprun-daemon-barrier-source"
+		missingRun.LoopName = "daemon-barrier-missing"
+		applyLoopRunPinningForTest(t, &missingRun, now)
+		if _, err := db.CreateLoopRunForStart(testutil.Context(t), missingRun, loopdsl.ConcurrencyAllow); err != nil {
+			t.Fatalf("CreateLoopRunForStart(missing) error = %v", err)
+		}
+		const missingLoopRunID = "looprun-daemon-barrier-missing"
+		if _, err := db.DB().ExecContext(testutil.Context(t),
+			`UPDATE loop_runs SET status = 'failed' WHERE id = ?`, terminalRun.ID); err != nil {
+			t.Fatalf("seed terminal Loop orphan error = %v", err)
+		}
+		if _, err := db.DB().ExecContext(testutil.Context(t),
+			`UPDATE task_runs SET loop_run_id = ? WHERE loop_run_id = ?`, missingLoopRunID, missingRun.ID); err != nil {
+			t.Fatalf("seed missing Loop orphan error = %v", err)
+		}
+		orphanRunIDs := make([]string, 0, 2)
+		rows, err := db.DB().QueryContext(testutil.Context(t), `SELECT id FROM task_runs
+			WHERE loop_run_id IN (?, ?) ORDER BY id`, terminalRun.ID, missingLoopRunID)
+		if err != nil {
+			t.Fatalf("list orphan task runs error = %v", err)
+		}
+		for rows.Next() {
+			var runID string
+			if err := rows.Scan(&runID); err != nil {
+				if closeErr := rows.Close(); closeErr != nil {
+					t.Fatalf("scan orphan task run error = %v; close error = %v", err, closeErr)
+				}
+				t.Fatalf("scan orphan task run error = %v", err)
+			}
+			orphanRunIDs = append(orphanRunIDs, runID)
+		}
+		if err := rows.Err(); err != nil {
+			if closeErr := rows.Close(); closeErr != nil {
+				t.Fatalf("iterate orphan task runs error = %v; close error = %v", err, closeErr)
+			}
+			t.Fatalf("iterate orphan task runs error = %v", err)
+		}
+		if err := rows.Close(); err != nil {
+			t.Fatalf("close orphan task runs error = %v", err)
+		}
+		if len(orphanRunIDs) != 2 {
+			t.Fatalf("orphan task runs = %#v, want terminal and missing", orphanRunIDs)
+		}
+
+		registry := &blockingLoopReconciliationRegistry{
+			GlobalDB: db, neutralizeStarted: make(chan struct{}),
+			releaseNeutralize: make(chan struct{}), claimAttempts: make(chan string, 64),
+		}
+		d := newTestDaemon(t, homePaths, &cfg)
+		d.openRegistry = func(context.Context, string) (Registry, error) { return registry, nil }
+		d.newSessionManager = func(context.Context, SessionManagerDeps) (SessionManager, error) {
+			return &fakeSessionManager{}, nil
+		}
+		d.newObserver = func(context.Context, RuntimeDeps) (Observer, error) { return &fakeObserver{}, nil }
+		d.httpFactory = func(context.Context, RuntimeDeps) (Server, error) {
+			return &fakeServer{name: "http"}, nil
+		}
+		d.udsFactory = func(context.Context, RuntimeDeps) (Server, error) {
+			return &fakeServer{name: "uds"}, nil
+		}
+		bootResult := make(chan error, 1)
+		go func() { bootResult <- d.boot(testutil.Context(t)) }()
+		select {
+		case <-registry.neutralizeStarted:
+		case <-time.After(time.Second):
+			t.Fatal("daemon did not enter the Loop neutralization barrier")
+		}
+		select {
+		case runID := <-registry.claimAttempts:
+			t.Fatalf("claim %q started before Loop neutralization completed", runID)
+		default:
+		}
+		select {
+		case <-d.readyCh:
+			t.Fatal("daemon became ready while Loop neutralization was blocked")
+		default:
+		}
+		close(registry.releaseNeutralize)
+		select {
+		case err := <-bootResult:
+			if err != nil {
+				t.Fatalf("boot() error = %v", err)
+			}
+		case <-time.After(5 * time.Second):
+			t.Fatal("daemon boot did not finish after Loop neutralization was released")
+		}
+		t.Cleanup(func() {
+			if err := d.Shutdown(testutil.Context(t)); err != nil {
+				t.Fatalf("Shutdown() error = %v", err)
+			}
+		})
+		actor, err := taskpkg.DeriveDaemonActorContext("barrier-claimer", "loop.boot")
+		if err != nil {
+			t.Fatalf("DeriveDaemonActorContext() error = %v", err)
+		}
+		const claimers = 16
+		claimResults := make(chan error, claimers)
+		for index := range claimers {
+			go func() {
+				_, claimErr := d.tasks.manager.ClaimNextRun(testutil.Context(t), taskpkg.ClaimCriteria{
+					RunID: orphanRunIDs[index%len(orphanRunIDs)], Scope: taskpkg.ScopeWorkspace,
+					WorkspaceID: string(terminalRun.WorkspaceID), RunKind: taskpkg.RunKindCoordinator,
+					ClaimerSessionID: fmt.Sprintf("barrier-claimer-%d", index),
+					LeaseDuration:    time.Minute, Now: now.Add(time.Minute),
+				}, actor)
+				claimResults <- claimErr
+			}()
+		}
+		for range claimers {
+			if claimErr := <-claimResults; !errors.Is(claimErr, taskpkg.ErrNoClaimableRun) {
+				t.Fatalf("ClaimNextRun(after barrier) error = %v, want ErrNoClaimableRun", claimErr)
+			}
+		}
+	})
+
+	t.Run("Should neutralize before recovery and backfill only after readiness IT-028", func(t *testing.T) {
+		homePaths := testHomePaths(t)
+		cfg := testConfig(t, homePaths)
+		var mu sync.Mutex
+		order := make([]string, 0, 3)
+		backfillAfterReady := false
+		backfillDone := make(chan struct{}, 1)
+		appendOrder := func(value string) {
+			mu.Lock()
+			order = append(order, value)
+			mu.Unlock()
+		}
+		registry := &recordingRegistry{path: homePaths.DatabaseFile}
+		registry.onNeutralizeLoopOrphans = func() { appendOrder("neutralize") }
+		registry.onListTaskRunsByStatus = func([]taskpkg.RunStatus) { appendOrder("recovery") }
+		d := newTestDaemon(t, homePaths, &cfg)
+		registry.onBackfillLoopProvenance = func() {
+			select {
+			case <-d.readyCh:
+				backfillAfterReady = true
+			default:
+			}
+			appendOrder("backfill")
+			select {
+			case backfillDone <- struct{}{}:
+			default:
+			}
+		}
+		d.openRegistry = func(context.Context, string) (Registry, error) { return registry, nil }
+		d.newSessionManager = func(context.Context, SessionManagerDeps) (SessionManager, error) {
+			return &fakeSessionManager{}, nil
+		}
+		d.newObserver = func(context.Context, RuntimeDeps) (Observer, error) { return &fakeObserver{}, nil }
+		d.httpFactory = func(context.Context, RuntimeDeps) (Server, error) {
+			return &fakeServer{name: "http"}, nil
+		}
+		d.udsFactory = func(context.Context, RuntimeDeps) (Server, error) {
+			return &fakeServer{name: "uds"}, nil
+		}
+		if err := d.boot(testutil.Context(t)); err != nil {
+			t.Fatalf("boot() error = %v", err)
+		}
+		t.Cleanup(func() {
+			if err := d.Shutdown(testutil.Context(t)); err != nil {
+				t.Fatalf("Shutdown() error = %v", err)
+			}
+		})
+		select {
+		case <-backfillDone:
+		case <-time.After(time.Second):
+			t.Fatal("post-readiness provenance backfill did not run")
+		}
+		mu.Lock()
+		gotOrder := slices.Clone(order)
+		mu.Unlock()
+		neutralizeIndex := slices.Index(gotOrder, "neutralize")
+		recoveryIndex := slices.Index(gotOrder, "recovery")
+		backfillIndex := slices.Index(gotOrder, "backfill")
+		if neutralizeIndex < 0 || recoveryIndex < 0 || backfillIndex < 0 ||
+			neutralizeIndex >= recoveryIndex || recoveryIndex >= backfillIndex {
+			t.Fatalf("boot order = %#v, want neutralize before recovery before backfill", gotOrder)
+		}
+		if !backfillAfterReady {
+			t.Fatal("provenance backfill ran before daemon readiness")
+		}
+	})
+
+	t.Run("Should backfill a pre-change coordinator through first boot IT-010", func(t *testing.T) {
+		homePaths := testHomePaths(t)
+		cfg := testConfig(t, homePaths)
+		cloneDaemonTestStoreSeed(t, homePaths.DatabaseFile)
+		database, err := openDaemonTestGlobalDBAtPath(testutil.Context(t), homePaths.DatabaseFile)
+		if err != nil {
+			t.Fatalf("OpenGlobalDB() error = %v", err)
+		}
+		now := time.Date(2026, time.August, 20, 17, 0, 0, 0, time.UTC)
+		workspaceID := "ws-daemon-provenance-boot"
+		if err := database.InsertWorkspace(testutil.Context(t), workspacepkg.Workspace{
+			ID: workspaceID, Name: "Daemon provenance boot", RootDir: t.TempDir(),
+			CreatedAt: now, UpdatedAt: now,
+		}); err != nil {
+			t.Fatalf("InsertWorkspace() error = %v", err)
+		}
+		seed := looppkg.Run{
+			ID: "looprun-daemon-provenance-boot", WorkspaceID: looppkg.WorkspaceID(workspaceID),
+			LoopName: "daemon-provenance-boot", Status: looppkg.StatusRunning,
+			ReattemptStrategy: looppkg.ReattemptFailedOnly, IterationCap: 1,
+			BudgetOnExceeded: loopdsl.BudgetExceededHalt, CreatedAt: now, LastProgressAt: now,
+		}
+		applyLoopRunPinningForTest(t, &seed, now)
+		run, err := database.CreateLoopRunForStart(testutil.Context(t), seed, loopdsl.ConcurrencyAllow)
+		if err != nil {
+			t.Fatalf("CreateLoopRunForStart() error = %v", err)
+		}
+		coordinatorTaskID := fmt.Sprintf("loop.%s.coordinator", run.ID)
+		if _, err := database.DB().ExecContext(
+			testutil.Context(t), `UPDATE tasks SET metadata_json = '{}' WHERE id = ?`, coordinatorTaskID,
+		); err != nil {
+			t.Fatalf("seed pre-change coordinator metadata error = %v", err)
+		}
+
+		d := newTestDaemon(t, homePaths, &cfg)
+		d.openRegistry = func(context.Context, string) (Registry, error) { return database, nil }
+		d.newSessionManager = func(context.Context, SessionManagerDeps) (SessionManager, error) {
+			return &fakeSessionManager{}, nil
+		}
+		d.newObserver = func(context.Context, RuntimeDeps) (Observer, error) { return &fakeObserver{}, nil }
+		d.httpFactory = func(context.Context, RuntimeDeps) (Server, error) {
+			return &fakeServer{name: "http"}, nil
+		}
+		d.udsFactory = func(context.Context, RuntimeDeps) (Server, error) {
+			return &fakeServer{name: "uds"}, nil
+		}
+		booted := false
+		t.Cleanup(func() {
+			if booted {
+				if err := d.Shutdown(testutil.Context(t)); err != nil {
+					t.Fatalf("Shutdown() error = %v", err)
+				}
+				return
+			}
+			if err := database.Close(testutil.Context(t)); err != nil {
+				t.Fatalf("GlobalDB.Close() error = %v", err)
+			}
+		})
+		if err := d.boot(testutil.Context(t)); err != nil {
+			t.Fatalf("boot() error = %v", err)
+		}
+		booted = true
+
+		deadline := time.Now().Add(2 * time.Second)
+		for {
+			record, getErr := database.GetTask(testutil.Context(t), coordinatorTaskID)
+			if getErr != nil {
+				t.Fatalf("GetTask(coordinator) error = %v", getErr)
+			}
+			if strings.Contains(string(record.Metadata), `"loop_name":"daemon-provenance-boot"`) {
+				break
+			}
+			if time.Now().After(deadline) {
+				t.Fatalf("first boot did not backfill coordinator metadata: %s", record.Metadata)
+			}
+			time.Sleep(10 * time.Millisecond)
+		}
+		actor, err := taskpkg.DeriveDaemonActorContext("provenance-boot-test", "daemon.boot.test")
+		if err != nil {
+			t.Fatalf("DeriveDaemonActorContext() error = %v", err)
+		}
+		actor.ReadScope = store.ReadScope{ProfileID: store.DefaultProfileID}
+		query := taskpkg.CatalogQuery{
+			Scope: taskpkg.CatalogScopeWorkspace, WorkspaceID: workspaceID,
+			IncludeDrafts: true, Limit: 10,
+		}
+		core.ApplyTaskLoopCatalogFilters(&query, false, string(run.ID))
+		catalog, err := d.tasks.manager.ListTaskCatalog(testutil.Context(t), query, actor)
+		if err != nil {
+			t.Fatalf("ListTaskCatalog(first boot provenance) error = %v", err)
+		}
+		coordinatorIndex := slices.IndexFunc(catalog.Tasks, func(summary taskpkg.Summary) bool {
+			return summary.ID == coordinatorTaskID
+		})
+		if coordinatorIndex < 0 {
+			t.Fatalf("first boot catalog = %#v, want coordinator %q", catalog.Tasks, coordinatorTaskID)
+		}
+		payload := contract.TaskCatalogItemPayloadFromSummary(&catalog.Tasks[coordinatorIndex])
+		if payload.Loop == nil || payload.Loop.RunID != string(run.ID) ||
+			payload.Loop.LoopName != seed.LoopName ||
+			payload.Loop.Role != contract.LoopProvenanceRoleCoordinator {
+			t.Fatalf("first boot coordinator Loop = %#v, want complete coordinator provenance", payload.Loop)
+		}
+	})
+}
+
+func TestBootSessionAttachmentRetentionPinsQueuedInputs(t *testing.T) {
+	t.Parallel()
+
+	t.Run("Should retain queued attachments through the startup retention sweep", func(t *testing.T) {
+		t.Parallel()
+
+		homePaths := testHomePaths(t)
+		cfg := testConfig(t, homePaths)
+		cfg.Session.Attachments.Retention.MaxCount = 1
+		cfg.Session.Attachments.Retention.MaxBytes = 1 << 20
+		cfg.Session.Attachments.Retention.MaxAge = 24 * time.Hour
+
+		preBootStore, err := attachmentspkg.OpenFilesystemAttachmentStore(
+			t.Context(),
+			attachmentspkg.FilesystemStoreConfig{
+				Root:      homePaths.SessionAttachmentsDir,
+				Retention: attachmentspkg.AttachmentRetention{MaxCount: 20, MaxBytes: 1 << 20, MaxAge: 24 * time.Hour},
+				Limits: attachmentspkg.StoreLimits{
+					MaxFileBytes: cfg.Session.Attachments.MaxFileBytes,
+					AllowedMIME:  cfg.Session.Attachments.AllowedMIME,
+				},
+			},
+		)
+		if err != nil {
+			t.Fatalf("OpenFilesystemAttachmentStore(pre-boot) error = %v", err)
+		}
+		queued, err := preBootStore.Put(t.Context(), attachmentspkg.PutRequest{
+			WorkspaceID: "ws-queued",
+			SessionID:   "sess-queued",
+			Name:        "queued.txt",
+			Data:        []byte("queued"),
+		})
+		if err != nil {
+			t.Fatalf("Put(queued attachment) error = %v", err)
+		}
+		unrelated, err := preBootStore.Put(t.Context(), attachmentspkg.PutRequest{
+			WorkspaceID: "ws-queued",
+			SessionID:   "sess-queued",
+			Name:        "unrelated.txt",
+			Data:        []byte("unrelated"),
+		})
+		if err != nil {
+			t.Fatalf("Put(unrelated attachment) error = %v", err)
+		}
+		if err := setAttachmentCreatedAt(
+			homePaths.SessionAttachmentsDir,
+			"ws-queued",
+			"sess-queued",
+			queued.ID,
+			time.Date(2000, time.January, 1, 0, 0, 0, 0, time.UTC),
+		); err != nil {
+			t.Fatalf("setAttachmentCreatedAt(queued attachment) error = %v", err)
+		}
+
+		registry := &queuedAttachmentRecordingRegistry{
+			recordingRegistry: &recordingRegistry{path: homePaths.DatabaseFile},
+			entries: []store.SessionInputQueueEntry{{
+				SessionID: "sess-queued",
+				Attachments: []store.SessionInputAttachment{{
+					ID: queued.ID,
+				}},
+			}},
+		}
+		d := newTestDaemon(t, homePaths, &cfg)
+		d.openRegistry = func(context.Context, string) (Registry, error) {
+			return registry, nil
+		}
+		var bootAttachments attachmentspkg.Store
+		d.newSessionManager = func(_ context.Context, deps SessionManagerDeps) (SessionManager, error) {
+			attachmentStore, ok := deps.SessionAttachments.(attachmentspkg.Store)
+			if !ok {
+				return nil, fmt.Errorf("session attachment opener = %T, want attachment store", deps.SessionAttachments)
+			}
+			bootAttachments = attachmentStore
+			return &fakeSessionManager{}, nil
+		}
+		d.newObserver = func(context.Context, RuntimeDeps) (Observer, error) {
+			return &fakeObserver{}, nil
+		}
+		d.httpFactory = func(context.Context, RuntimeDeps) (Server, error) {
+			return &fakeServer{name: "http"}, nil
+		}
+		d.udsFactory = func(context.Context, RuntimeDeps) (Server, error) {
+			return &fakeServer{name: "uds"}, nil
+		}
+
+		if err := d.boot(testutil.Context(t)); err != nil {
+			t.Fatalf("boot() error = %v", err)
+		}
+		t.Cleanup(func() {
+			if err := d.Shutdown(testutil.Context(t)); err != nil {
+				t.Errorf("Shutdown() error = %v", err)
+			}
+		})
+
+		if bootAttachments == nil {
+			t.Fatal("session manager dependencies omit session attachments")
+		}
+		if _, err := bootAttachments.Stat(t.Context(), "ws-queued", "sess-queued", queued.ID); err != nil {
+			t.Fatalf("Stat(queued attachment) error = %v", err)
+		}
+		if _, err := bootAttachments.Stat(
+			t.Context(),
+			"ws-queued",
+			"sess-queued",
+			unrelated.ID,
+		); !errors.Is(
+			err,
+			attachmentspkg.ErrNotFound,
+		) {
+			t.Fatalf("Stat(unrelated attachment) error = %v, want %v", err, attachmentspkg.ErrNotFound)
+		}
+	})
+}
+
+func setAttachmentCreatedAt(
+	root string,
+	workspaceID string,
+	sessionID string,
+	attachmentID string,
+	createdAt time.Time,
+) error {
+	path := filepath.Join(root, workspaceID, sessionID, attachmentID+".json")
+	payload, err := os.ReadFile(path)
+	if err != nil {
+		return fmt.Errorf("read attachment metadata: %w", err)
+	}
+	var metadata map[string]any
+	if err := json.Unmarshal(payload, &metadata); err != nil {
+		return fmt.Errorf("decode attachment metadata: %w", err)
+	}
+	metadata["created_at"] = createdAt.UTC().Format(time.RFC3339Nano)
+	payload, err = json.Marshal(metadata)
+	if err != nil {
+		return fmt.Errorf("encode attachment metadata: %w", err)
+	}
+	if err := os.WriteFile(path, payload, 0o600); err != nil {
+		return fmt.Errorf("write attachment metadata: %w", err)
+	}
+	return nil
+}
+
+func TestBootPublishesOperatingSystemProcessStartTime(t *testing.T) {
+	t.Parallel()
+
+	t.Run("Should publish the operating system process start time instead of the boot clock", func(t *testing.T) {
+		t.Parallel()
+
+		expectedStartedAt, err := procutil.StartedAt(os.Getpid())
+		if err != nil {
+			t.Fatalf("procutil.StartedAt(daemon process) error = %v", err)
+		}
+
+		homePaths := testHomePaths(t)
+		cfg := testConfig(t, homePaths)
+		d := newTestDaemon(t, homePaths, &cfg)
+		d.now = func() time.Time { return expectedStartedAt.Add(-time.Hour) }
+		d.openRegistry = func(context.Context, string) (Registry, error) {
+			return &recordingRegistry{path: homePaths.DatabaseFile}, nil
+		}
+		d.newSessionManager = func(context.Context, SessionManagerDeps) (SessionManager, error) {
+			return &fakeSessionManager{}, nil
+		}
+		d.newObserver = func(context.Context, RuntimeDeps) (Observer, error) {
+			return &fakeObserver{}, nil
+		}
+		d.httpFactory = func(context.Context, RuntimeDeps) (Server, error) {
+			return &fakeServer{name: "http"}, nil
+		}
+		d.udsFactory = func(context.Context, RuntimeDeps) (Server, error) {
+			return &fakeServer{name: "uds"}, nil
+		}
+
+		if err := d.boot(testutil.Context(t)); err != nil {
+			t.Fatalf("boot() error = %v", err)
+		}
+		t.Cleanup(func() {
+			if err := d.Shutdown(testutil.Context(t)); err != nil {
+				t.Errorf("Shutdown() error = %v", err)
+			}
+		})
+
+		info, err := ReadInfo(homePaths.DaemonInfo)
+		if err != nil {
+			t.Fatalf("ReadInfo(daemon.json) error = %v", err)
+		}
+		if !info.StartedAt.Equal(expectedStartedAt) {
+			t.Fatalf(
+				"daemon info start time = %v, want operating system start time %v",
+				info.StartedAt,
+				expectedStartedAt,
+			)
+		}
+	})
+}
+
+func TestBootPublishesInfoOnlyAfterAllFallibleStartupCompletes(t *testing.T) {
+	t.Parallel()
+
+	t.Run("Should keep daemon discovery unavailable and clean up servers when late reconciliation fails", func(
+		t *testing.T,
+	) {
+		t.Parallel()
+
+		homePaths := testHomePaths(t)
+		cfg := testConfig(t, homePaths)
+		d := newTestDaemon(t, homePaths, &cfg)
+		d.openRegistry = func(context.Context, string) (Registry, error) {
+			return &recordingRegistry{path: homePaths.DatabaseFile}, nil
+		}
+		d.newSessionManager = func(context.Context, SessionManagerDeps) (SessionManager, error) {
+			return &fakeSessionManager{}, nil
+		}
+
+		lateFailure := errors.New("late reconciliation failure")
+		reconcileStarted := make(chan struct{})
+		releaseReconcile := make(chan struct{})
+		release := sync.OnceFunc(func() { close(releaseReconcile) })
+		t.Cleanup(release)
+		d.newObserver = func(context.Context, RuntimeDeps) (Observer, error) {
+			return &fakeObserver{
+				err: lateFailure,
+				onReconcile: func() {
+					close(reconcileStarted)
+					<-releaseReconcile
+				},
+			}, nil
+		}
+
+		httpServer := &fakeServer{name: "http"}
+		udsServer := &fakeServer{name: "uds"}
+		d.httpFactory = func(context.Context, RuntimeDeps) (Server, error) { return httpServer, nil }
+		d.udsFactory = func(context.Context, RuntimeDeps) (Server, error) { return udsServer, nil }
+
+		bootResult := make(chan error, 1)
+		go func() {
+			bootResult <- d.boot(testutil.Context(t))
+		}()
+
+		select {
+		case <-reconcileStarted:
+		case <-time.After(5 * time.Second):
+			t.Fatal("boot() did not reach late reconciliation")
+		}
+
+		_, infoErr := os.Stat(homePaths.DaemonInfo)
+		release()
+		select {
+		case bootErr := <-bootResult:
+			if !errors.Is(bootErr, lateFailure) {
+				t.Fatalf("boot() error = %v, want late reconciliation failure", bootErr)
+			}
+		case <-time.After(5 * time.Second):
+			t.Fatal("boot() did not return after late reconciliation failed")
+		}
+
+		if !errors.Is(infoErr, os.ErrNotExist) {
+			t.Fatalf("daemon.json during incomplete boot stat error = %v, want os.ErrNotExist", infoErr)
+		}
+		if got := httpServer.shutdownCallCount(); got != 1 {
+			t.Fatalf("http server shutdown calls = %d, want 1 after late boot failure", got)
+		}
+		if got := udsServer.shutdownCallCount(); got != 1 {
+			t.Fatalf("uds server shutdown calls = %d, want 1 after late boot failure", got)
+		}
+		if _, err := os.Stat(homePaths.DaemonInfo); !errors.Is(err, os.ErrNotExist) {
+			t.Fatalf("daemon.json after failed boot stat error = %v, want os.ErrNotExist", err)
+		}
+	})
+}
+
+func TestBootWithRegistryMissingResourceDBLeavesResourceServiceUnavailable(t *testing.T) {
+	homePaths := testHomePaths(t)
+	cfg := testConfig(t, homePaths)
+
+	var httpSawNilResources bool
+	var udsSawNilResources bool
+
+	d := newTestDaemon(t, homePaths, &cfg)
+	d.openRegistry = func(context.Context, string) (Registry, error) {
+		return &recordingRegistry{path: homePaths.DatabaseFile}, nil
+	}
+	d.newSessionManager = func(context.Context, SessionManagerDeps) (SessionManager, error) {
+		return &fakeSessionManager{}, nil
+	}
+	d.newObserver = func(context.Context, RuntimeDeps) (Observer, error) {
+		return &fakeObserver{}, nil
+	}
+	d.httpFactory = func(_ context.Context, deps RuntimeDeps) (Server, error) {
+		httpSawNilResources = deps.Resources == nil
+		return &fakeServer{name: "http"}, nil
+	}
+	d.udsFactory = func(_ context.Context, deps RuntimeDeps) (Server, error) {
+		udsSawNilResources = deps.Resources == nil
+		return &fakeServer{name: "uds"}, nil
+	}
+
+	if err := d.boot(testutil.Context(t)); err != nil {
+		t.Fatalf("boot() error = %v", err)
+	}
+	t.Cleanup(func() {
+		if err := d.Shutdown(testutil.Context(t)); err != nil {
+			t.Fatalf("Shutdown() error = %v", err)
+		}
+	})
+
+	if !httpSawNilResources {
+		t.Fatal("httpFactory() received non-nil resource service, want nil when registry has no SQL handle")
+	}
+	if !udsSawNilResources {
+		t.Fatal("udsFactory() received non-nil resource service, want nil when registry has no SQL handle")
+	}
+}
+
+func TestBootRunsResourceReconcileBeforeObserverReconcile(t *testing.T) {
+	homePaths := testHomePaths(t)
+	cfg := testConfig(t, homePaths)
+
+	var mu sync.Mutex
+	var order []string
+	appendOrder := func(step string) {
+		mu.Lock()
+		defer mu.Unlock()
+		order = append(order, step)
+	}
+
+	driver := &fakeResourceReconcileDriver{
+		onRunBoot: func() {
+			appendOrder("driver")
+		},
+	}
+
+	d := newTestDaemon(t, homePaths, &cfg)
+	d.openRegistry = func(context.Context, string) (Registry, error) {
+		return &recordingRegistry{path: homePaths.DatabaseFile}, nil
+	}
+	d.newSessionManager = func(context.Context, SessionManagerDeps) (SessionManager, error) {
+		return &fakeSessionManager{}, nil
+	}
+	d.newObserver = func(context.Context, RuntimeDeps) (Observer, error) {
+		return &fakeObserver{
+			onReconcile: func() {
+				appendOrder("observer")
+			},
+		}, nil
+	}
+	d.newResourceReconcile = func(context.Context, resourceReconcileDriverDeps) (resources.ReconcileDriver, error) {
+		return driver, nil
+	}
+	d.httpFactory = func(context.Context, RuntimeDeps) (Server, error) {
+		return &fakeServer{name: "http"}, nil
+	}
+	d.udsFactory = func(context.Context, RuntimeDeps) (Server, error) {
+		return &fakeServer{name: "uds"}, nil
+	}
+
+	if err := d.boot(testutil.Context(t)); err != nil {
+		t.Fatalf("boot() error = %v", err)
+	}
+	t.Cleanup(func() {
+		if err := d.Shutdown(testutil.Context(t)); err != nil {
+			t.Fatalf("Shutdown() error = %v", err)
+		}
+	})
+
+	mu.Lock()
+	gotOrder := append([]string(nil), order...)
+	mu.Unlock()
+	wantOrder := []string{"driver", "observer"}
+	if !slices.Equal(gotOrder, wantOrder) {
+		t.Fatalf("boot order = %#v, want %#v", gotOrder, wantOrder)
+	}
+}
+
+func TestBootRunsObserverReconcileBeforeTaskRoleRecovery(t *testing.T) {
+	t.Run("Should fence recovered task activation until session reconciliation finishes", func(t *testing.T) {
+		homePaths := testHomePaths(t)
+		cfg := testConfig(t, homePaths)
+
+		var mu sync.Mutex
+		observerReconciled := false
+		queuedRecoveryObserved := false
+		queuedRecoveryBeforeObserver := false
+		registry := &recordingRegistry{
+			path: homePaths.DatabaseFile,
+			onListTaskRunsByStatus: func(statuses []taskpkg.RunStatus) {
+				if !slices.Equal(statuses, []taskpkg.RunStatus{taskpkg.TaskRunStatusQueued}) {
+					return
+				}
+				mu.Lock()
+				defer mu.Unlock()
+				queuedRecoveryObserved = true
+				queuedRecoveryBeforeObserver = queuedRecoveryBeforeObserver || !observerReconciled
+			},
+		}
+
+		d := newTestDaemon(t, homePaths, &cfg)
+		d.openRegistry = func(context.Context, string) (Registry, error) {
+			return registry, nil
+		}
+		d.newSessionManager = func(context.Context, SessionManagerDeps) (SessionManager, error) {
+			return &fakeSessionManager{}, nil
+		}
+		d.newObserver = func(context.Context, RuntimeDeps) (Observer, error) {
+			return &fakeObserver{onReconcile: func() {
+				mu.Lock()
+				observerReconciled = true
+				mu.Unlock()
+			}}, nil
+		}
+		d.httpFactory = func(context.Context, RuntimeDeps) (Server, error) {
+			return &fakeServer{name: "http"}, nil
+		}
+		d.udsFactory = func(context.Context, RuntimeDeps) (Server, error) {
+			return &fakeServer{name: "uds"}, nil
+		}
+
+		if err := d.boot(testutil.Context(t)); err != nil {
+			t.Fatalf("boot() error = %v", err)
+		}
+		t.Cleanup(func() {
+			if err := d.Shutdown(testutil.Context(t)); err != nil {
+				t.Fatalf("Shutdown() error = %v", err)
+			}
+		})
+
+		mu.Lock()
+		observed := queuedRecoveryObserved
+		beforeObserver := queuedRecoveryBeforeObserver
+		mu.Unlock()
+		if !observed {
+			t.Fatal("boot() did not run task-role recovery")
+		}
+		if beforeObserver {
+			t.Fatal("boot() ran task-role recovery before observer reconciliation")
+		}
+	})
+}
+
+func TestLoopCoordinatorBootGate(t *testing.T) {
+	t.Run("Should suppress observer and scheduler activation until reconciliation finishes", func(t *testing.T) {
+		t.Parallel()
+
+		backstop := &recordingLoopBackstopRunner{}
+		gate := newLoopCoordinatorBootGate(backstop)
+		actor, err := taskpkg.DeriveDaemonActorContext("boot-gate-test", "daemon.test")
+		if err != nil {
+			t.Fatalf("DeriveDaemonActorContext() error = %v", err)
+		}
+		now := time.Date(2026, 7, 11, 15, 0, 0, 0, time.UTC)
+
+		started, err := gate.RunLoopCoordinatorBackstop(testutil.Context(t), now, actor)
+		if err != nil {
+			t.Fatalf("observer backstop before activation error = %v", err)
+		}
+		if started != 0 || len(backstop.calls) != 0 {
+			t.Fatalf("observer backstop before activation = (%d, %d calls), want (0, 0)", started, len(backstop.calls))
+		}
+
+		schedulerSource := schedulerTaskSource{
+			coordinatorBackstop: gate,
+			store:               &recordingRegistry{},
+		}
+		started, err = schedulerSource.RunLoopCoordinatorBackstop(testutil.Context(t), now, actor)
+		if err != nil {
+			t.Fatalf("scheduler backstop before activation error = %v", err)
+		}
+		if started != 0 || len(backstop.calls) != 0 {
+			t.Fatalf("scheduler backstop before activation = (%d, %d calls), want (0, 0)", started, len(backstop.calls))
+		}
+
+		gate.Activate()
+		started, err = schedulerSource.RunLoopCoordinatorBackstop(testutil.Context(t), now, actor)
+		if err != nil {
+			t.Fatalf("scheduler backstop after activation error = %v", err)
+		}
+		if started != 1 || len(backstop.calls) != 1 {
+			t.Fatalf("scheduler backstop after activation = (%d, %d calls), want (1, 1)", started, len(backstop.calls))
+		}
+	})
+}
+
+func TestShutdownClosesResourceReconcileDriver(t *testing.T) {
+	homePaths := testHomePaths(t)
+	cfg := testConfig(t, homePaths)
+
+	driver := &fakeResourceReconcileDriver{}
+	d := newTestDaemon(t, homePaths, &cfg)
+	d.openRegistry = func(context.Context, string) (Registry, error) {
+		return &recordingRegistry{path: homePaths.DatabaseFile}, nil
+	}
+	d.newSessionManager = func(context.Context, SessionManagerDeps) (SessionManager, error) {
+		return &fakeSessionManager{}, nil
+	}
+	d.newObserver = func(context.Context, RuntimeDeps) (Observer, error) {
+		return &fakeObserver{}, nil
+	}
+	d.newResourceReconcile = func(context.Context, resourceReconcileDriverDeps) (resources.ReconcileDriver, error) {
+		return driver, nil
+	}
+	d.httpFactory = func(context.Context, RuntimeDeps) (Server, error) {
+		return &fakeServer{name: "http"}, nil
+	}
+	d.udsFactory = func(context.Context, RuntimeDeps) (Server, error) {
+		return &fakeServer{name: "uds"}, nil
+	}
+
+	if err := d.boot(testutil.Context(t)); err != nil {
+		t.Fatalf("boot() error = %v", err)
+	}
+
+	if err := d.Shutdown(testutil.Context(t)); err != nil {
+		t.Fatalf("Shutdown() error = %v", err)
+	}
+	if got, want := driver.closeCalls, 1; got != want {
+		t.Fatalf("resource reconcile Close() calls = %d, want %d", got, want)
+	}
+}
+
+func TestBootDoesNotRegisterOperatorHomeAsWorkspace(t *testing.T) {
+	t.Parallel()
+
+	t.Run("Should serve with no workspaces and refuse operator home registration", func(t *testing.T) {
+		t.Parallel()
+
+		operatorHome := filepath.Join(t.TempDir(), "operator-home")
+		if err := os.MkdirAll(filepath.Join(operatorHome, compozyconfig.DirName), 0o755); err != nil {
+			t.Fatalf("os.MkdirAll(%q) error = %v", operatorHome, err)
+		}
+		writeDaemonFile(
+			t,
+			filepath.Join(operatorHome, compozyconfig.DirName, compozyconfig.ConfigName),
+			"[gateway]\nenabled = true\nprivate_port = 5252\n",
+		)
+		homePaths := testHomePaths(t)
+		writeDaemonFile(t, homePaths.ConfigFile, "[gateway]\nprivate_port = 4242\n")
+		cfg := testConfig(t, homePaths)
+
+		d := newTestDaemon(t, homePaths, &cfg)
+		d.getenv = func(key string) string {
+			if key == "HOME" {
+				return operatorHome
+			}
+			return os.Getenv(key)
+		}
+		d.newSessionManager = func(context.Context, SessionManagerDeps) (SessionManager, error) {
+			return &fakeSessionManager{}, nil
+		}
+		d.newObserver = func(context.Context, RuntimeDeps) (Observer, error) {
+			return &fakeObserver{}, nil
+		}
+		d.httpFactory = func(context.Context, RuntimeDeps) (Server, error) {
+			return &fakeServer{name: "http"}, nil
+		}
+		d.udsFactory = func(context.Context, RuntimeDeps) (Server, error) {
+			return &fakeServer{name: "uds"}, nil
+		}
+
+		if err := d.boot(testutil.Context(t)); err != nil {
+			t.Fatalf("boot() error = %v", err)
+		}
+		t.Cleanup(func() {
+			if err := d.Shutdown(testutil.Context(t)); err != nil {
+				t.Fatalf("Shutdown() error = %v", err)
+			}
+		})
+
+		workspaces, err := d.registry.ListWorkspaces(testutil.Context(t))
+		if err != nil {
+			t.Fatalf("ListWorkspaces() error = %v", err)
+		}
+		if len(workspaces) != 0 {
+			t.Fatalf("ListWorkspaces() = %#v, want no synthetic workspace", workspaces)
+		}
+
+		if _, err := d.workspaceResolver.ResolveOrRegister(testutil.Context(t), operatorHome); !errors.Is(
+			err,
+			workspacepkg.ErrOperatorHomeWorkspace,
+		) {
+			t.Fatalf("ResolveOrRegister(operator home) error = %v, want ErrOperatorHomeWorkspace", err)
+		}
+		after, err := d.registry.ListWorkspaces(testutil.Context(t))
+		if err != nil {
+			t.Fatalf("ListWorkspaces(after refused registration) error = %v", err)
+		}
+		if len(after) != 0 {
+			t.Fatalf("ListWorkspaces(after refused registration) = %#v, want none", after)
+		}
+	})
+}
+
+func TestBootRejectsSessionManagersMissingWorkspaceRemovalPreparation(t *testing.T) {
+	homePaths := testHomePaths(t)
+	cfg := testConfig(t, homePaths)
+	d := newTestDaemon(t, homePaths, &cfg)
+	d.openRegistry = func(context.Context, string) (Registry, error) {
+		return &recordingRegistry{path: homePaths.DatabaseFile}, nil
+	}
+	d.newSessionManager = func(context.Context, SessionManagerDeps) (SessionManager, error) {
+		base := &fakeSessionManager{}
+		return sessionManagerWithoutWorkspaceRemoval{
+			SessionManager:        base,
+			workspaceAccessBinder: base,
+		}, nil
+	}
+
+	err := d.boot(testutil.Context(t))
+	if !errors.Is(err, errMissingWorkspaceRemovalPreparation) {
+		t.Fatalf("boot() error = %v, want %v", err, errMissingWorkspaceRemovalPreparation)
+	}
+}
+
+func TestBootRemovesStaleSocketAndCleansOrphans(t *testing.T) {
+	t.Parallel()
+
+	t.Run("Should replace the stale socket and clean orphaned descendants", func(t *testing.T) {
+		t.Parallel()
+
+		homePaths := testHomePaths(t)
+		cfg := testConfig(t, homePaths)
+		staleSocket := cfg.Daemon.Socket
+		if err := os.WriteFile(staleSocket, []byte("stale"), 0o600); err != nil {
+			t.Fatalf("os.WriteFile(socket) error = %v", err)
+		}
+
+		d := newTestDaemon(t, homePaths, &cfg)
+		d.pid = func() int { return 777 }
+		d.processStartedAt = func(int) (time.Time, error) {
+			return time.Date(2026, 8, 11, 12, 0, 0, 0, time.UTC), nil
+		}
+		d.acquireLock = func(path string, _ int) (*Lock, error) {
+			return &Lock{path: path, stalePID: 444}, nil
+		}
+
+		registry := &recordingRegistry{path: homePaths.DatabaseFile}
+		observer := &fakeObserver{result: store.ReconcileResult{Indexed: []string{"sess-a"}}}
+		recoveryCalls := 0
+		sessionManager := &pendingStopRecoveryManager{
+			fakeSessionManager: &fakeSessionManager{
+				infos: orphanTestSessions(t, time.Date(2026, 8, 11, 12, 0, 0, 0, time.UTC)),
+			},
+			recoveryHook: func(context.Context) error {
+				recoveryCalls++
+				return nil
+			},
+		}
+		d.openRegistry = func(context.Context, string) (Registry, error) {
+			return registry, nil
+		}
+		d.newSessionManager = func(context.Context, SessionManagerDeps) (SessionManager, error) {
+			return sessionManager, nil
+		}
+		d.newObserver = func(context.Context, RuntimeDeps) (Observer, error) {
+			return observer, nil
+		}
+
+		if err := d.boot(testutil.Context(t)); err != nil {
+			t.Fatalf("boot() error = %v", err)
+		}
+		t.Cleanup(func() {
+			if err := d.Shutdown(testutil.Context(t)); err != nil {
+				t.Fatalf("Shutdown() error = %v", err)
+			}
+		})
+
+		socketInfo, err := os.Lstat(staleSocket)
+		if err != nil {
+			t.Fatalf("os.Lstat(socket) error = %v", err)
+		}
+		if socketInfo.Mode()&os.ModeSocket == 0 {
+			t.Fatalf("socket mode = %v, want unix socket", socketInfo.Mode())
+		}
+		if !observer.reconciled {
+			t.Fatal("boot() did not call observer.Reconcile")
+		}
+		if recoveryCalls != 1 {
+			t.Fatalf("boot stop recovery calls = %d, want 1", recoveryCalls)
+		}
+
+		info, err := ReadInfo(homePaths.DaemonInfo)
+		if err != nil {
+			t.Fatalf("ReadInfo(daemon.json) error = %v", err)
+		}
+		if got, want := info.PID, 777; got != want {
+			t.Fatalf("daemon info pid = %d, want %d", got, want)
+		}
+	})
+}
+
+func TestBootRejectsConcurrentCallWhileFirstBootIsInProgress(t *testing.T) {
+	homePaths := testHomePaths(t)
+	cfg := testConfig(t, homePaths)
+	d := newTestDaemon(t, homePaths, &cfg)
+
+	loadStarted := make(chan struct{})
+	releaseLoad := make(chan struct{})
+	d.loadConfig = func() (compozyconfig.Config, error) {
+		close(loadStarted)
+		<-releaseLoad
+		return cfg, nil
+	}
+	d.openRegistry = func(context.Context, string) (Registry, error) {
+		return &recordingRegistry{path: homePaths.DatabaseFile}, nil
+	}
+	d.newSessionManager = func(context.Context, SessionManagerDeps) (SessionManager, error) {
+		return &fakeSessionManager{}, nil
+	}
+	d.newObserver = func(context.Context, RuntimeDeps) (Observer, error) {
+		return &fakeObserver{}, nil
+	}
+	d.httpFactory = func(context.Context, RuntimeDeps) (Server, error) {
+		return &fakeServer{name: "http"}, nil
+	}
+	d.udsFactory = func(context.Context, RuntimeDeps) (Server, error) {
+		return &fakeServer{name: "uds"}, nil
+	}
+
+	firstBoot := make(chan error, 1)
+	go func() {
+		firstBoot <- d.boot(testutil.Context(t))
+	}()
+
+	<-loadStarted
+	if err := d.boot(testutil.Context(t)); err == nil || !strings.Contains(err.Error(), "already booted") {
+		t.Fatalf("concurrent boot error = %v, want already booted", err)
+	}
+
+	close(releaseLoad)
+	if err := <-firstBoot; err != nil {
+		t.Fatalf("first boot error = %v", err)
+	}
+	if err := d.Shutdown(testutil.Context(t)); err != nil {
+		t.Fatalf("Shutdown() error = %v", err)
+	}
+}
+
+func TestShutdownTearsDownInRequiredOrder(t *testing.T) {
+	homePaths := testHomePaths(t)
+	cfg := testConfig(t, homePaths)
+	d := newTestDaemon(t, homePaths, &cfg)
+
+	var events []string
+	d.extensions = &fakeExtensionRuntime{
+		onStop: func() {
+			events = append(events, "extensions")
+		},
+	}
+	d.automation = &fakeAutomationManager{
+		onShutdown: func() {
+			events = append(events, "automation")
+		},
+	}
+	d.sessions = &fakeSessionManager{
+		infos: []*session.Info{{ID: "sess-a"}, {ID: "sess-b"}},
+		onStop: func(id string) {
+			events = append(events, "session:"+id)
+		},
+	}
+	d.tasks = &taskRuntime{}
+	d.httpServer = &fakeServer{name: "http", onShutdown: func() { events = append(events, "http") }}
+	d.udsServer = &fakeServer{name: "uds", onShutdown: func() { events = append(events, "uds") }}
+	d.registry = &recordingRegistry{
+		path: homePaths.DatabaseFile,
+		onClose: func() {
+			events = append(events, "db")
+		},
+	}
+	d.hooks = &fakeHookRuntime{
+		onClose: func() {
+			events = append(events, "hooks")
+		},
+	}
+	d.lock = &Lock{
+		path: homePaths.DaemonLock,
+		releaseFn: func() error {
+			events = append(events, "lock")
+			return nil
+		},
+	}
+	d.closeLogger = func() error {
+		events = append(events, "logger")
+		return nil
+	}
+
+	if err := d.Shutdown(testutil.Context(t)); err != nil {
+		t.Fatalf("Shutdown() error = %v", err)
+	}
+	if d.tasks != nil {
+		t.Fatalf("Shutdown() left task runtime = %#v, want nil", d.tasks)
+	}
+
+	want := []string{
+		"extensions",
+		"automation",
+		"session:sess-a",
+		"session:sess-b",
+		"http",
+		"uds",
+		"hooks",
+		"db",
+		"lock",
+		"logger",
+	}
+	if !testutil.EqualStringSlices(events, want) {
+		t.Fatalf("Shutdown() order = %#v, want %#v", events, want)
+	}
+}
+
+func TestDaemonShutdownOperation(t *testing.T) {
+	t.Run("Should retain one operation while callers wait with independent contexts", func(t *testing.T) {
+		t.Parallel()
+
+		d, err := New(WithHomePaths(testHomePaths(t)), WithLogger(discardLogger()))
+		if err != nil {
+			t.Fatalf("New() error = %v", err)
+		}
+		shutdownStarted := make(chan struct{})
+		releaseShutdown := make(chan struct{})
+		server := &fakeServer{
+			name: "http",
+			shutdownFn: func(ctx context.Context) error {
+				close(shutdownStarted)
+				select {
+				case <-releaseShutdown:
+					return nil
+				case <-ctx.Done():
+					return ctx.Err()
+				}
+			},
+		}
+		d.httpServer = server
+
+		testCtx := testutil.Context(t)
+		firstDone := make(chan error, 1)
+		go func() {
+			firstDone <- d.Shutdown(testCtx)
+		}()
+		select {
+		case <-shutdownStarted:
+		case <-testCtx.Done():
+			t.Fatalf("shutdown did not start: %v", testCtx.Err())
+		}
+
+		d.mu.Lock()
+		retainedServer := d.httpServer
+		d.mu.Unlock()
+		if retainedServer != server {
+			t.Fatalf("http server during shutdown = %p, want retained %p", retainedServer, server)
+		}
+		if err := d.beginBoot(); !errors.Is(err, errDaemonShutdownInProgress) {
+			t.Fatalf("beginBoot(during shutdown) error = %v, want shutdown in progress", err)
+		}
+
+		canceledWaiter, cancelWaiter := context.WithCancel(testCtx)
+		cancelWaiter()
+		if err := d.Shutdown(canceledWaiter); !errors.Is(err, context.Canceled) {
+			t.Fatalf("Shutdown(canceled waiter) error = %v, want context.Canceled", err)
+		}
+		if got := server.shutdownCallCount(); got != 1 {
+			t.Fatalf("server Shutdown() calls while joining = %d, want 1", got)
+		}
+
+		joinedDone := make(chan error, 1)
+		go func() {
+			joinedDone <- d.Shutdown(testCtx)
+		}()
+		close(releaseShutdown)
+		for name, result := range map[string]<-chan error{
+			"owner":  firstDone,
+			"joiner": joinedDone,
+		} {
+			select {
+			case err := <-result:
+				if err != nil {
+					t.Fatalf("%s Shutdown() error = %v", name, err)
+				}
+			case <-testCtx.Done():
+				t.Fatalf("%s Shutdown() did not finish: %v", name, testCtx.Err())
+			}
+		}
+
+		d.mu.Lock()
+		clearedServer := d.httpServer
+		d.mu.Unlock()
+		if clearedServer != nil {
+			t.Fatalf("http server after shutdown = %p, want nil", clearedServer)
+		}
+		if err := d.Shutdown(testCtx); err != nil {
+			t.Fatalf("Shutdown(repeated) error = %v", err)
+		}
+		if got := server.shutdownCallCount(); got != 1 {
+			t.Fatalf("server Shutdown() calls after repeated shutdown = %d, want 1", got)
+		}
+		if err := d.beginBoot(); err != nil {
+			t.Fatalf("beginBoot(after shutdown) error = %v", err)
+		}
+		d.mu.Lock()
+		d.booting = false
+		d.mu.Unlock()
+	})
+
+	t.Run("Should retain failed targets for a later retry", func(t *testing.T) {
+		t.Parallel()
+
+		d, err := New(WithHomePaths(testHomePaths(t)), WithLogger(discardLogger()))
+		if err != nil {
+			t.Fatalf("New() error = %v", err)
+		}
+		shutdownFailure := errors.New("server shutdown failed")
+		var server *fakeServer
+		server = &fakeServer{
+			name: "http",
+			shutdownFn: func(context.Context) error {
+				if server.shutdownCallCount() == 1 {
+					return shutdownFailure
+				}
+				return nil
+			},
+		}
+		d.httpServer = server
+
+		testCtx := testutil.Context(t)
+		if err := d.Shutdown(testCtx); !errors.Is(err, shutdownFailure) {
+			t.Fatalf("Shutdown(first) error = %v, want shutdown failure", err)
+		}
+		d.mu.Lock()
+		retainedServer := d.httpServer
+		d.mu.Unlock()
+		if retainedServer != server {
+			t.Fatalf("http server after failed shutdown = %p, want retained %p", retainedServer, server)
+		}
+		if err := d.beginBoot(); !errors.Is(err, shutdownFailure) {
+			t.Fatalf("beginBoot(after failed shutdown) error = %v, want shutdown failure", err)
+		}
+
+		if err := d.Shutdown(testCtx); err != nil {
+			t.Fatalf("Shutdown(retry) error = %v", err)
+		}
+		if got := server.shutdownCallCount(); got != 2 {
+			t.Fatalf("server Shutdown() calls after retry = %d, want 2", got)
+		}
+	})
+
+	t.Run("Should reject invalid ownership contexts", func(t *testing.T) {
+		t.Parallel()
+
+		var nilDaemon *Daemon
+		if err := nilDaemon.Shutdown(testutil.Context(t)); err == nil {
+			t.Fatal("Shutdown() on nil daemon error = nil, want error")
+		}
+		d, err := New(WithLogger(discardLogger()))
+		if err != nil {
+			t.Fatalf("New() error = %v", err)
+		}
+		if err := d.Shutdown(nil); err == nil { //nolint:staticcheck // Verifies the public nil-context contract.
+			t.Fatal("Shutdown(nil) error = nil, want error")
+		}
+		if err := d.beginBoot(); err != nil {
+			t.Fatalf("beginBoot() error = %v", err)
+		}
+		if err := d.Shutdown(testutil.Context(t)); !errors.Is(err, errDaemonBootInProgress) {
+			t.Fatalf("Shutdown(during boot) error = %v, want boot in progress", err)
+		}
+		bootErr := errors.New("abort test boot")
+		d.finishBoot(&bootErr)
+	})
+}
+
+func TestBootExtensionsBuildsManagerWhenNoExtensionsInstalled(t *testing.T) {
+	t.Parallel()
+
+	t.Run("Should build an extension manager when no extensions are installed", func(t *testing.T) {
+		t.Parallel()
+
+		db := openDaemonTestGlobalDB(t)
+		homePaths := testHomePaths(t)
+		d := newTestDaemon(t, homePaths, testConfigPtr(t, homePaths))
+
+		runtime := &fakeExtensionRuntime{}
+		var managerBuilt bool
+		d.newExtensionManager = func(extensionManagerDeps) extensionRuntime {
+			managerBuilt = true
+			return runtime
+		}
+
+		rebuilds := 0
+		state := &bootState{
+			logger:   discardLogger(),
+			registry: db,
+			sessions: &fakeSessionManager{},
+			observer: &fakeObserver{},
+			hooks: &fakeHookRuntime{
+				onRebuild: func(context.Context) error {
+					rebuilds++
+					return nil
+				},
+			},
+		}
+		cleanup := &bootCleanup{}
+
+		if err := d.bootExtensions(testutil.Context(t), state, cleanup); err != nil {
+			t.Fatalf("bootExtensions() error = %v", err)
+		}
+
+		if !managerBuilt {
+			t.Fatal("bootExtensions() did not build an extension manager")
+		}
+		if runtime.startCount != 1 {
+			t.Fatalf("extension runtime start count = %d, want 1", runtime.startCount)
+		}
+		if rebuilds != 1 {
+			t.Fatalf("hook rebuild count = %d, want 1", rebuilds)
+		}
+		if state.extensions != runtime {
+			t.Fatalf("state.extensions = %#v, want runtime", state.extensions)
+		}
+		if state.deps.Extensions == nil {
+			t.Fatal("state.deps.Extensions = nil, want extension service")
+		}
+		if len(cleanup.fns) != 1 {
+			t.Fatalf("cleanup fns = %d, want 1", len(cleanup.fns))
+		}
+		extRegistry := extensionpkg.NewRegistry(db.DB())
+		for _, extensionName := range []string{speccycle.Name, opendesign.Name} {
+			info, err := extRegistry.Get(extensionName)
+			if err != nil {
+				t.Fatalf("registry.Get(%s) error = %v", extensionName, err)
+			}
+			if !info.Enabled || info.Source != extensionpkg.SourceBundled {
+				t.Fatalf("%s info = %#v, want installed and enabled bundled extension", extensionName, info)
+			}
+			if got, want := filepath.Base(info.ManifestPath), "extension.json"; got != want {
+				t.Fatalf("%s manifest file = %q, want %q", extensionName, got, want)
+			}
+		}
+	})
+}
+
+func TestBootExtensionsReconcilesManagedArtifactsBeforeRuntimeStart(t *testing.T) {
+	t.Parallel()
+
+	t.Run("Should restore the committed backup and remove orphaned installs", func(t *testing.T) {
+		t.Parallel()
+
+		db := openDaemonTestGlobalDB(t)
+		homePaths := testHomePaths(t)
+		managedRoot := extensionpkg.ManagedInstallRoot(homePaths)
+		registered := filepath.Join(managedRoot, "reconciled")
+		if err := os.MkdirAll(registered, 0o755); err != nil {
+			t.Fatalf("os.MkdirAll(%q) error = %v", registered, err)
+		}
+		committed := daemonTestExtensionManifest("reconciled", daemonTestExtensionOptions{version: "1.0.0"})
+		manifestPath := filepath.Join(registered, "extension.toml")
+		if err := os.WriteFile(manifestPath, []byte(committed), 0o644); err != nil {
+			t.Fatalf("os.WriteFile(%q) error = %v", manifestPath, err)
+		}
+		manifest, err := extensionpkg.LoadManifest(registered)
+		if err != nil {
+			t.Fatalf("LoadManifest(committed) error = %v", err)
+		}
+		checksum, err := extensionpkg.ComputeDirectoryChecksum(registered)
+		if err != nil {
+			t.Fatalf("ComputeDirectoryChecksum(committed) error = %v", err)
+		}
+		registry := extensionpkg.NewRegistry(db.DB())
+		if err := registry.Install(manifest, registered, checksum); err != nil {
+			t.Fatalf("Registry.Install() error = %v", err)
+		}
+		backup := registered + ".compozy-backup-1755280000000000000"
+		if err := os.Rename(registered, backup); err != nil {
+			t.Fatalf("os.Rename(backup) error = %v", err)
+		}
+		if err := os.MkdirAll(registered, 0o755); err != nil {
+			t.Fatalf("os.MkdirAll(candidate) error = %v", err)
+		}
+		candidate := daemonTestExtensionManifest("reconciled", daemonTestExtensionOptions{version: "9.9.9"})
+		if err := os.WriteFile(manifestPath, []byte(candidate), 0o644); err != nil {
+			t.Fatalf("os.WriteFile(candidate) error = %v", err)
+		}
+		orphan := filepath.Join(managedRoot, "orphan")
+		if err := os.MkdirAll(orphan, 0o755); err != nil {
+			t.Fatalf("os.MkdirAll(orphan) error = %v", err)
+		}
+
+		d := newTestDaemon(t, homePaths, testConfigPtr(t, homePaths))
+		d.newExtensionManager = func(extensionManagerDeps) extensionRuntime {
+			contents, readErr := os.ReadFile(manifestPath)
+			if readErr != nil || string(contents) != committed {
+				t.Fatalf("manifest at runtime construction = %q, %v; want committed bytes", contents, readErr)
+			}
+			for _, removed := range []string{backup, orphan} {
+				if _, statErr := os.Lstat(removed); !errors.Is(statErr, os.ErrNotExist) {
+					t.Fatalf("path %q at runtime construction stat error = %v, want removed", removed, statErr)
+				}
+			}
+			return &fakeExtensionRuntime{}
+		}
+		state := &bootState{
+			logger: discardLogger(), registry: db, sessions: &fakeSessionManager{},
+			observer: &fakeObserver{}, hooks: &fakeHookRuntime{},
+		}
+		if err := d.bootExtensions(testutil.Context(t), state, &bootCleanup{}); err != nil {
+			t.Fatalf("bootExtensions() error = %v", err)
+		}
+		contents, err := os.ReadFile(manifestPath)
+		if err != nil || string(contents) != committed {
+			t.Fatalf("reconciled manifest = %q, %v; want committed bytes", contents, err)
+		}
+		for _, removed := range []string{backup, orphan} {
+			if _, err := os.Lstat(removed); !errors.Is(err, os.ErrNotExist) {
+				t.Fatalf("reconciled path %q stat error = %v, want removed", removed, err)
+			}
+		}
+	})
+}
+
+func TestBootExtensionsPreservesBundledDisableEnableState(t *testing.T) {
+	t.Parallel()
+
+	for _, extensionName := range []string{speccycle.Name, opendesign.Name} {
+		t.Run("Should preserve "+extensionName+" disable and enable state across boots", func(t *testing.T) {
+			t.Parallel()
+
+			db := openDaemonTestGlobalDB(t)
+			homePaths := testHomePaths(t)
+			d := newTestDaemon(t, homePaths, testConfigPtr(t, homePaths))
+			runtime := &fakeExtensionRuntime{}
+			d.newExtensionManager = func(extensionManagerDeps) extensionRuntime {
+				return runtime
+			}
+			state := &bootState{
+				logger:   discardLogger(),
+				registry: db,
+				sessions: &fakeSessionManager{},
+				observer: &fakeObserver{},
+				hooks:    &fakeHookRuntime{},
+			}
+
+			if err := d.bootExtensions(testutil.Context(t), state, &bootCleanup{}); err != nil {
+				t.Fatalf("bootExtensions(first) error = %v", err)
+			}
+			extRegistry := extensionpkg.NewRegistry(db.DB())
+			if err := extRegistry.Disable(extensionName); err != nil {
+				t.Fatalf("registry.Disable(%s) error = %v", extensionName, err)
+			}
+			if err := d.bootExtensions(testutil.Context(t), state, &bootCleanup{}); err != nil {
+				t.Fatalf("bootExtensions(after disable) error = %v", err)
+			}
+			disabled, err := extRegistry.Get(extensionName)
+			if err != nil {
+				t.Fatalf("registry.Get(%s disabled) error = %v", extensionName, err)
+			}
+			if disabled.Enabled {
+				t.Fatalf("%s enabled after disabled boot = true, want false", extensionName)
+			}
+
+			if err := extRegistry.Enable(extensionName); err != nil {
+				t.Fatalf("registry.Enable(%s) error = %v", extensionName, err)
+			}
+			if err := d.bootExtensions(testutil.Context(t), state, &bootCleanup{}); err != nil {
+				t.Fatalf("bootExtensions(after enable) error = %v", err)
+			}
+			enabled, err := extRegistry.Get(extensionName)
+			if err != nil {
+				t.Fatalf("registry.Get(%s enabled) error = %v", extensionName, err)
+			}
+			if !enabled.Enabled {
+				t.Fatalf("%s enabled after enable boot = false, want true", extensionName)
+			}
+		})
+	}
+}
+
+func TestNewHostAPISessionManagerAdapter(t *testing.T) {
+	t.Parallel()
+
+	t.Run("Should expose and forward session archive operations when source supports them", func(t *testing.T) {
+		t.Parallel()
+
+		source := &fakeArchivingSessionManager{fakeSessionManager: &fakeSessionManager{}}
+		adapter := newHostAPISessionManagerAdapter(source)
+		archiveManager, ok := adapter.(core.SessionArchiveManager)
+		if !ok {
+			t.Fatalf("newHostAPISessionManagerAdapter() = %T, want session archive operations", adapter)
+		}
+
+		archived, err := archiveManager.Archive(testutil.Context(t), "ws-archive", "sess-archive")
+		if err != nil {
+			t.Fatalf("Archive() error = %v", err)
+		}
+		if got, want := archived.ID, "sess-archive"; got != want {
+			t.Fatalf("Archive() session ID = %q, want %q", got, want)
+		}
+		if got, want := source.archiveCall, (fakeSessionArchiveCall{
+			workspaceID: "ws-archive",
+			sessionID:   "sess-archive",
+		}); got != want {
+			t.Fatalf("Archive() call = %#v, want %#v", got, want)
+		}
+		if _, err := archiveManager.ArchiveWithStop(testutil.Context(t), "ws-archive", "sess-live"); err != nil {
+			t.Fatalf("ArchiveWithStop() error = %v", err)
+		}
+		if got, want := source.archiveCall, (fakeSessionArchiveCall{
+			workspaceID: "ws-archive",
+			sessionID:   "sess-live",
+			stop:        true,
+		}); got != want {
+			t.Fatalf("ArchiveWithStop() call = %#v, want %#v", got, want)
+		}
+
+		unarchived, err := archiveManager.Unarchive(testutil.Context(t), "ws-unarchive", "sess-unarchive")
+		if err != nil {
+			t.Fatalf("Unarchive() error = %v", err)
+		}
+		if got, want := unarchived.ID, "sess-unarchive"; got != want {
+			t.Fatalf("Unarchive() session ID = %q, want %q", got, want)
+		}
+		if got, want := source.unarchiveCall, (fakeSessionArchiveCall{
+			workspaceID: "ws-unarchive",
+			sessionID:   "sess-unarchive",
+		}); got != want {
+			t.Fatalf("Unarchive() call = %#v, want %#v", got, want)
+		}
+	})
+
+	t.Run("Should reject session archive operations when source does not support them", func(t *testing.T) {
+		t.Parallel()
+
+		adapter := newHostAPISessionManagerAdapter(&fakeSessionManager{})
+		archiveManager, ok := adapter.(core.SessionArchiveManager)
+		if !ok {
+			t.Fatalf("newHostAPISessionManagerAdapter() = %T, want session archive operations", adapter)
+		}
+		_, archiveErr := archiveManager.Archive(testutil.Context(t), "ws-archive", "sess-archive")
+		if archiveErr == nil || !strings.Contains(archiveErr.Error(), "does not support session archiving") {
+			t.Fatalf("Archive() error = %v, want unsupported session archiving", archiveErr)
+		}
+		_, unarchiveErr := archiveManager.Unarchive(testutil.Context(t), "ws-archive", "sess-archive")
+		if unarchiveErr == nil || !strings.Contains(unarchiveErr.Error(), "does not support session archiving") {
+			t.Fatalf("Unarchive() error = %v, want unsupported session archiving", unarchiveErr)
+		}
+	})
+
+	t.Run("Should expose and forward durable acceptance when source supports it", func(t *testing.T) {
+		t.Parallel()
+
+		source := &fakeAcceptingSessionManager{fakeSessionManager: &fakeSessionManager{}}
+		adapter := newHostAPISessionManagerAdapter(source)
+		acceptance, ok := adapter.(core.SessionAcceptanceManager)
+		if !ok {
+			t.Fatalf("newHostAPISessionManagerAdapter() = %T, want durable acceptance", adapter)
+		}
+		opts := session.CreateAcceptedOpts{Session: session.CreateOpts{Name: "accepted-session"}}
+		info, err := acceptance.CreateAccepted(testutil.Context(t), &(opts))
+		if err != nil {
+			t.Fatalf("CreateAccepted() error = %v", err)
+		}
+		if info.ID != "accepted-session" || source.acceptedCall.Session.Name != opts.Session.Name {
+			t.Fatalf("CreateAccepted() = (%#v, %#v), want forwarded accepted session", info, source.acceptedCall)
+		}
+	})
+
+	t.Run("Should omit durable acceptance when source does not support it", func(t *testing.T) {
+		t.Parallel()
+
+		adapter := newHostAPISessionManagerAdapter(&fakeSessionManager{})
+		if _, ok := adapter.(core.SessionAcceptanceManager); ok {
+			t.Fatalf("newHostAPISessionManagerAdapter() = %T, want no durable acceptance", adapter)
+		}
+	})
+
+	t.Run("Should forward prompt options when the session source supports them", func(t *testing.T) {
+		t.Parallel()
+
+		source := &fakePromptOptionsSessionManager{fakeSessionManager: &fakeSessionManager{}}
+		adapter := newHostAPISessionManagerAdapter(source)
+		prompter, ok := adapter.(hostAPIPromptOptsSessionManager)
+		if !ok {
+			t.Fatalf("newHostAPISessionManagerAdapter() = %T, want prompt options", adapter)
+		}
+		opts := session.PromptOpts{Message: "user message", TurnSource: session.TurnSourceUser}
+		events, err := prompter.PromptWithOpts(testutil.Context(t), "sess-user", opts)
+		if err != nil {
+			t.Fatalf("PromptWithOpts() error = %v", err)
+		}
+		for event := range events {
+			t.Fatalf("PromptWithOpts() emitted unexpected event %#v", event)
+		}
+		if source.sessionID != "sess-user" || !reflect.DeepEqual(source.options, opts) {
+			t.Fatalf(
+				"PromptWithOpts() = (%q, %#v), want forwarded session and options",
+				source.sessionID,
+				source.options,
+			)
+		}
+	})
+}
+
+func TestBootExtensionsBuildsManagerDepsAndRebuildsHooks(t *testing.T) {
+	t.Parallel()
+
+	db := openDaemonTestGlobalDB(t)
+	installDaemonTestExtension(t, db, "ext-present", daemonTestExtensionOptions{}, true)
+
+	homePaths := testHomePaths(t)
+	cfg := testConfig(t, homePaths)
+	skillsRegistry := skills.NewRegistry(skills.RegistryConfig{})
+	sessions := &fakeSessionManager{}
+	observer := &fakeObserver{}
+	logger := discardLogger()
+	runtime := &fakeExtensionRuntime{}
+
+	var captured extensionManagerDeps
+	d := newTestDaemon(t, homePaths, &cfg)
+	d.newExtensionManager = func(deps extensionManagerDeps) extensionRuntime {
+		captured = deps
+		return runtime
+	}
+
+	rebuilds := 0
+	state := &bootState{
+		logger:         logger,
+		registry:       db,
+		skillsRegistry: skillsRegistry,
+		sessions:       sessions,
+		observer:       observer,
+		hooks: &fakeHookRuntime{
+			onRebuild: func(context.Context) error {
+				rebuilds++
+				return nil
+			},
+		},
+	}
+	cleanup := &bootCleanup{}
+
+	if err := d.bootExtensions(testutil.Context(t), state, cleanup); err != nil {
+		t.Fatalf("bootExtensions() error = %v", err)
+	}
+
+	if runtime.startCount != 1 {
+		t.Fatalf("extension runtime start count = %d, want 1", runtime.startCount)
+	}
+	if rebuilds != 1 {
+		t.Fatalf("hook rebuild count = %d, want 1", rebuilds)
+	}
+	if captured.Registry == nil {
+		t.Fatal("captured extension registry = nil")
+	}
+	if captured.Sessions != sessions {
+		t.Fatal("captured sessions dependency mismatch")
+	}
+	if captured.Observer != observer {
+		t.Fatal("captured observer dependency mismatch")
+	}
+	if captured.SkillsRegistry != skillsRegistry {
+		t.Fatal("captured skills registry dependency mismatch")
+	}
+	if captured.Logger != logger {
+		t.Fatal("captured logger dependency mismatch")
+	}
+	if state.extensions != runtime {
+		t.Fatalf("state.extensions = %#v, want runtime", state.extensions)
+	}
+	if len(cleanup.fns) != 1 {
+		t.Fatalf("cleanup fns = %d, want 1", len(cleanup.fns))
+	}
+}
+
+func TestExtensionManagerDepsIncludeResourceHandlesAndTrigger(t *testing.T) {
+	t.Parallel()
+
+	db := openDaemonTestGlobalDB(t)
+	kernel, err := resources.NewKernel(db.DB())
+	if err != nil {
+		t.Fatalf("resources.NewKernel() error = %v", err)
+	}
+	homePaths := testHomePaths(t)
+	cfg := testConfig(t, homePaths)
+	logger := discardLogger()
+	skillsRegistry := skills.NewRegistry(skills.RegistryConfig{})
+	sessions := &fakeSessionManager{}
+	observer := &fakeObserver{}
+	automation := &fakeAutomationManager{}
+	reconcile := &fakeResourceReconcileDriver{}
+	codecs := resources.NewCodecRegistry()
+	extRegistry := extensionpkg.NewRegistry(db.DB())
+
+	d := newTestDaemon(t, homePaths, &cfg)
+	deps := d.extensionManagerDeps(&bootState{
+		cfg:               cfg,
+		logger:            logger,
+		sessions:          sessions,
+		deps:              RuntimeDeps{},
+		observer:          observer,
+		skillsRegistry:    skillsRegistry,
+		resourceKernel:    kernel,
+		resourceCodecs:    codecs,
+		resourceReconcile: reconcile,
+		automation:        automation,
+	}, extRegistry)
+
+	if deps.Registry != extRegistry {
+		t.Fatal("deps.Registry mismatch")
+	}
+	if deps.Sessions != sessions {
+		t.Fatal("deps.Sessions mismatch")
+	}
+	if deps.Observer != observer {
+		t.Fatal("deps.Observer mismatch")
+	}
+	if deps.SkillsRegistry != skillsRegistry {
+		t.Fatal("deps.SkillsRegistry mismatch")
+	}
+	if deps.Logger != logger {
+		t.Fatal("deps.Logger mismatch")
+	}
+	if deps.ResourceCodecs != codecs {
+		t.Fatal("deps.ResourceCodecs mismatch")
+	}
+	if got, ok := deps.ResourceStore.(*resources.Kernel); !ok || got != kernel {
+		t.Fatalf("deps.ResourceStore = %#v, want kernel-backed raw store", deps.ResourceStore)
+	}
+	if got, ok := deps.SourceSessions.(*resources.Kernel); !ok || got != kernel {
+		t.Fatalf("deps.SourceSessions = %#v, want kernel-backed source sessions", deps.SourceSessions)
+	}
+	if got := deps.Automation(); got != automation {
+		t.Fatalf("deps.Automation() = %#v, want automation runtime", got)
+	}
+	if err := deps.ResourceTrigger(
+		testutil.Context(t),
+		hookBindingResourceKind,
+		resources.ReconcileReasonWrite,
+	); err != nil {
+		t.Fatalf("deps.ResourceTrigger() error = %v", err)
+	}
+	if reconcile.triggerCalls != 1 {
+		t.Fatalf("resource trigger calls = %d, want 1", reconcile.triggerCalls)
+	}
+	if reconcile.lastKind != hookBindingResourceKind || reconcile.lastReason != resources.ReconcileReasonWrite {
+		t.Fatalf(
+			"resource trigger = (%q, %q), want (%q, %q)",
+			reconcile.lastKind,
+			reconcile.lastReason,
+			hookBindingResourceKind,
+			resources.ReconcileReasonWrite,
+		)
+	}
+}
+
+func TestDefaultExtensionManagerFactory(t *testing.T) {
+	t.Parallel()
+
+	t.Run("Should pass the env binding store to extension launches", func(t *testing.T) {
+		t.Parallel()
+
+		db := openDaemonTestGlobalDB(t)
+		const extensionName = "factory-env-binding"
+		installDaemonTestExtension(t, db, extensionName, daemonTestExtensionOptions{
+			requiredEnv: []string{"BOUND_SECRET"},
+		}, true)
+		kernel, err := resources.NewKernel(db.DB())
+		if err != nil {
+			t.Fatalf("resources.NewKernel() error = %v", err)
+		}
+		lookupErr := errors.New("recording env binding lookup")
+		bindingStore := &recordingExtensionEnvBindingStore{listErr: lookupErr}
+		d := &Daemon{}
+		d.applyExtensionManagerFactoryDefault()
+		runtime := d.newExtensionManager(extensionManagerDeps{
+			Registry:       extensionpkg.NewRegistry(db.DB()),
+			Sessions:       &fakeSessionManager{},
+			ResourceStore:  kernel,
+			SourceSessions: kernel,
+			EnvBindings:    bindingStore,
+			Logger:         discardLogger(),
+		})
+		if runtime == nil {
+			t.Fatal("default extension manager factory returned nil runtime")
+		}
+		t.Cleanup(func() {
+			ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+			defer cancel()
+			if stopErr := runtime.Stop(ctx); stopErr != nil {
+				t.Errorf("extension runtime Stop() error = %v", stopErr)
+			}
+		})
+
+		err = runtime.Start(t.Context())
+		if !errors.Is(err, lookupErr) {
+			t.Fatalf("extension runtime Start() error = %v, want env binding lookup failure", err)
+		}
+		wantCalls := []extensionEnvBindingLookup{{
+			extension: extensionName,
+			profileID: store.DefaultProfileID,
+		}}
+		if got := bindingStore.snapshot(); !reflect.DeepEqual(got, wantCalls) {
+			t.Fatalf("ListEnvBindings() calls = %#v, want %#v", got, wantCalls)
+		}
+	})
+}
+
+type extensionEnvBindingLookup struct {
+	extension   string
+	profileID   string
+	workspaceID string
+}
+
+type recordingExtensionEnvBindingStore struct {
+	mu      sync.Mutex
+	listErr error
+	calls   []extensionEnvBindingLookup
+}
+
+func (s *recordingExtensionEnvBindingStore) ListEnvBindings(
+	_ context.Context,
+	extension string,
+	profileID string,
+	workspaceID string,
+) ([]extensionpkg.EnvBinding, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.calls = append(s.calls, extensionEnvBindingLookup{
+		extension: extension, profileID: profileID, workspaceID: workspaceID,
+	})
+	return nil, s.listErr
+}
+
+func (s *recordingExtensionEnvBindingStore) ResolveEnvBindings(
+	ctx context.Context,
+	extension string,
+	profileID string,
+	workspaceID string,
+) ([]extensionpkg.EnvBinding, error) {
+	return s.ListEnvBindings(ctx, extension, profileID, workspaceID)
+}
+
+func (*recordingExtensionEnvBindingStore) PutEnvBinding(context.Context, extensionpkg.EnvBinding) error {
+	return errors.New("unexpected env binding write")
+}
+
+func (*recordingExtensionEnvBindingStore) DeleteEnvBinding(
+	context.Context,
+	string,
+	string,
+	string,
+	string,
+) error {
+	return errors.New("unexpected env binding delete")
+}
+
+func (s *recordingExtensionEnvBindingStore) snapshot() []extensionEnvBindingLookup {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return append([]extensionEnvBindingLookup(nil), s.calls...)
+}
+
+func TestBootHooksBuildsResourceBackedRuntimeAndAttachesObserver(t *testing.T) {
+	t.Parallel()
+
+	db := openDaemonTestGlobalDB(t)
+	kernel, err := resources.NewKernel(db.DB())
+	if err != nil {
+		t.Fatalf("resources.NewKernel() error = %v", err)
+	}
+	codec, err := newHookBindingCodec()
+	if err != nil {
+		t.Fatalf("newHookBindingCodec() error = %v", err)
+	}
+	codecs := resources.NewCodecRegistry()
+	if err := resources.RegisterCodec(codecs, codec); err != nil {
+		t.Fatalf("RegisterCodec() error = %v", err)
+	}
+	store, err := newHookBindingStore(kernel, codec)
+	if err != nil {
+		t.Fatalf("newHookBindingStore() error = %v", err)
+	}
+
+	homePaths := testHomePaths(t)
+	cfg := testConfig(t, homePaths)
+	observer := &hookAwareTestObserver{}
+	reconcile := &fakeResourceReconcileDriver{}
+	d := newTestDaemon(t, homePaths, &cfg)
+	state := &bootState{
+		cfg:    cfg,
+		logger: discardLogger(),
+		notifier: newHooksNotifier(
+			discardLogger(),
+			func() time.Time { return time.Date(2026, 4, 15, 12, 0, 0, 0, time.UTC) },
+		),
+		observer:          observer,
+		skillsRegistry:    skills.NewRegistry(skills.RegistryConfig{}),
+		resourceKernel:    kernel,
+		resourceCodecs:    codecs,
+		resourceReconcile: reconcile,
+	}
+	cleanup := &bootCleanup{}
+
+	if err := d.bootHooks(testutil.Context(t), state, cleanup); err != nil {
+		t.Fatalf("bootHooks() error = %v", err)
+	}
+	if err := d.bootResourceWatchers(testutil.Context(t), state, cleanup); err != nil {
+		t.Fatalf("bootResourceWatchers() error = %v", err)
+	}
+	t.Cleanup(func() {
+		for i, v := range slices.Backward(cleanup.fns) {
+			if err := v(testutil.Context(t)); err != nil {
+				t.Fatalf("cleanup[%d]() error = %v", i, err)
+			}
+		}
+	})
+
+	if observer.attached == nil {
+		t.Fatal("observer attached hooks = nil, want runtime source")
+	}
+	if state.hooks == nil || state.hookDispatcher == nil || state.hookBindings == nil {
+		t.Fatalf("hook state = %#v, want populated runtime, dispatcher, and bindings", state)
+	}
+	if len(cleanup.fns) < 2 {
+		t.Fatalf("cleanup fns = %d, want hook close plus skills watcher stop", len(cleanup.fns))
+	}
+	if reconcile.triggerCalls == 0 {
+		t.Fatal("resource reconcile trigger calls = 0, want resource-backed hook sync")
+	}
+
+	records, err := store.List(testutil.Context(t), resources.MutationActor{
+		Kind:     resources.MutationActorKindDaemon,
+		ID:       "reader",
+		Source:   resources.ResourceSource{Kind: resources.ResourceSourceKind("daemon"), ID: "reader"},
+		MaxScope: resources.ResourceScope{Kind: resources.ResourceScopeKindUser},
+	}, resources.ResourceFilter{})
+	if err != nil {
+		t.Fatalf("store.List() error = %v", err)
+	}
+	if len(records) == 0 {
+		t.Fatal("store.List() count = 0, want native hook bindings")
+	}
+}
+
+func TestBootResourceWatchersRequiresHookBindingsForSkillsWatcher(t *testing.T) {
+	t.Parallel()
+
+	t.Run("Should reject skills watcher startup without hook bindings", func(t *testing.T) {
+		t.Parallel()
+
+		state := &bootState{skillsRegistry: skills.NewRegistry(skills.RegistryConfig{})}
+		err := (&Daemon{}).bootResourceWatchers(testutil.Context(t), state, &bootCleanup{})
+		if err == nil {
+			t.Fatal("bootResourceWatchers() error = nil, want missing hook bindings error")
+		}
+		if got, want := err.Error(), "daemon: hook bindings are required before starting the skills watcher"; got != want {
+			t.Fatalf("bootResourceWatchers() error = %q, want %q", got, want)
+		}
+	})
+}
+
+func TestAttachExtensionRuntimeUsesHookBindingSyncBeforeRebuild(t *testing.T) {
+	t.Parallel()
+
+	db := openDaemonTestGlobalDB(t)
+	extRegistry := extensionpkg.NewRegistry(db.DB())
+	homePaths := testHomePaths(t)
+	d := newTestDaemon(t, homePaths, testConfigPtr(t, homePaths))
+	manager := &fakeExtensionRuntime{}
+
+	t.Run("Should sync hook bindings when available", func(t *testing.T) {
+		t.Parallel()
+
+		syncCalls := 0
+		rebuilds := 0
+		state := &bootState{
+			logger:       discardLogger(),
+			hookBindings: hookBindingPublisherFunc(func(context.Context) error { syncCalls++; return nil }),
+			hooks: &fakeHookRuntime{onRebuild: func(context.Context) error {
+				rebuilds++
+				return nil
+			}},
+		}
+
+		if err := d.attachExtensionRuntime(testutil.Context(t), state, extRegistry, manager); err != nil {
+			t.Fatal(err)
+		}
+
+		if syncCalls != 1 {
+			t.Fatalf("hook binding sync calls = %d, want 1", syncCalls)
+		}
+		if rebuilds != 0 {
+			t.Fatalf("hook rebuild count = %d, want 0", rebuilds)
+		}
+		if state.deps.Extensions == nil {
+			t.Fatal("state.deps.Extensions = nil, want extension service")
+		}
+	})
+
+	t.Run("Should fall back to rebuild without hook bindings", func(t *testing.T) {
+		t.Parallel()
+
+		rebuilds := 0
+		state := &bootState{
+			logger: discardLogger(),
+			hooks: &fakeHookRuntime{onRebuild: func(context.Context) error {
+				rebuilds++
+				return nil
+			}},
+		}
+
+		if err := d.attachExtensionRuntime(testutil.Context(t), state, extRegistry, manager); err != nil {
+			t.Fatal(err)
+		}
+
+		if rebuilds != 1 {
+			t.Fatalf("hook rebuild count = %d, want 1", rebuilds)
+		}
+		if state.deps.Extensions == nil {
+			t.Fatal("state.deps.Extensions = nil, want extension service")
+		}
+	})
+
+	t.Run("Should propagate agent skill reconciliation failures before attaching consumers", func(t *testing.T) {
+		t.Parallel()
+
+		syncFailure := errors.New("resource deletion failed")
+		state := &bootState{
+			logger:              discardLogger(),
+			agentSkillResources: agentSkillPublisherFunc(func(context.Context) error { return syncFailure }),
+			hookBindings: hookBindingPublisherFunc(func(context.Context) error {
+				t.Fatal("hook consumers ran after failed skill reconciliation")
+				return nil
+			}),
+		}
+		if err := d.attachExtensionRuntime(t.Context(), state, extRegistry, manager); !errors.Is(err, syncFailure) {
+			t.Fatalf("attachExtensionRuntime() = %v, want reconciliation failure", err)
+		}
+	})
+
+	t.Run("Should propagate sync failures without rebuilding", func(t *testing.T) {
+		t.Parallel()
+
+		syncCalls := 0
+		rebuilds := 0
+		syncFailure := errors.New("boom")
+		state := &bootState{
+			logger: discardLogger(),
+			hookBindings: hookBindingPublisherFunc(func(context.Context) error {
+				syncCalls++
+				return syncFailure
+			}),
+			hooks: &fakeHookRuntime{onRebuild: func(context.Context) error {
+				rebuilds++
+				return nil
+			}},
+		}
+
+		if err := d.attachExtensionRuntime(
+			testutil.Context(t),
+			state,
+			extRegistry,
+			manager,
+		); !errors.Is(
+			err,
+			syncFailure,
+		) {
+			t.Fatalf("attachExtensionRuntime() = %v, want sync failure", err)
+		}
+
+		if syncCalls != 1 {
+			t.Fatalf("hook binding sync calls = %d, want 1", syncCalls)
+		}
+		if rebuilds != 0 {
+			t.Fatalf("hook rebuild count = %d, want 0", rebuilds)
+		}
+	})
+}
+
+func TestNewDaemonExtensionServiceHandlesNilRegistryAndDefaults(t *testing.T) {
+	t.Parallel()
+
+	t.Run("Should reject nil dependencies", func(t *testing.T) {
+		t.Parallel()
+
+		if svc := newDaemonExtensionService(nil); svc != nil {
+			t.Fatalf("newDaemonExtensionService(nil) = %#v, want nil", svc)
+		}
+	})
+
+	t.Run("Should reject a nil registry", func(t *testing.T) {
+		t.Parallel()
+
+		if svc := newDaemonExtensionService(&daemonExtensionServiceDeps{}); svc != nil {
+			t.Fatalf("newDaemonExtensionService(empty) = %#v, want nil", svc)
+		}
+	})
+
+	t.Run("Should apply defaults without mutating caller dependencies", func(t *testing.T) {
+		t.Parallel()
+
+		db := openDaemonTestGlobalDB(t)
+		registry := extensionpkg.NewRegistry(db.DB())
+		deps := &daemonExtensionServiceDeps{Registry: registry}
+		svc, ok := newDaemonExtensionService(deps).(*daemonExtensionService)
+		if !ok || svc == nil {
+			t.Fatal("newDaemonExtensionService(defaults) did not return daemon service")
+		}
+		if deps.Logger != nil || deps.Now != nil || deps.Getenv != nil {
+			t.Fatalf("caller dependencies mutated = %#v", deps)
+		}
+		if svc.logger == nil || svc.now == nil || svc.getenv == nil {
+			t.Fatalf(
+				"service defaults present = logger:%t now:%t getenv:%t, want all true",
+				svc.logger != nil,
+				svc.now != nil,
+				svc.getenv != nil,
+			)
+		}
+	})
+}
+
+func TestBootExtensionsLogsStartFailureAndKeepsPartialRuntime(t *testing.T) {
+	t.Parallel()
+
+	db := openDaemonTestGlobalDB(t)
+	installDaemonTestExtension(t, db, "ext-broken", daemonTestExtensionOptions{}, true)
+
+	var logBuffer bytes.Buffer
+	logger := slog.New(slog.NewTextHandler(&logBuffer, nil))
+	runtime := &fakeExtensionRuntime{startErr: errors.New("boom")}
+	homePaths := testHomePaths(t)
+	d := newTestDaemon(t, homePaths, testConfigPtr(t, homePaths))
+	d.newExtensionManager = func(extensionManagerDeps) extensionRuntime {
+		return runtime
+	}
+
+	rebuilds := 0
+	state := &bootState{
+		logger:   logger,
+		registry: db,
+		sessions: &fakeSessionManager{},
+		observer: &fakeObserver{},
+		hooks: &fakeHookRuntime{
+			onRebuild: func(context.Context) error {
+				rebuilds++
+				return nil
+			},
+		},
+	}
+	cleanup := &bootCleanup{}
+
+	if err := d.bootExtensions(testutil.Context(t), state, cleanup); err != nil {
+		t.Fatalf("bootExtensions() error = %v, want nil", err)
+	}
+
+	if runtime.startCount != 1 {
+		t.Fatalf("extension runtime start count = %d, want 1", runtime.startCount)
+	}
+	if rebuilds != 1 {
+		t.Fatalf("hook rebuild count = %d, want 1 after failed start", rebuilds)
+	}
+	if len(cleanup.fns) != 1 {
+		t.Fatalf("cleanup fns = %d, want 1", len(cleanup.fns))
+	}
+	if state.currentExtensionRuntime() != runtime {
+		t.Fatalf("state.extensions = %#v, want runtime after failed start", state.currentExtensionRuntime())
+	}
+	if state.deps.Extensions == nil {
+		t.Fatal("state.deps.Extensions = nil, want extension service after failed start")
+	}
+	if !strings.Contains(logBuffer.String(), "extension manager start failed") {
+		t.Fatalf("log output = %q, want extension start failure message", logBuffer.String())
+	}
+}
+
+func TestBootExtensionsKeepsHealthyRegisteredExtensionsAfterPartialStartFailure(t *testing.T) {
+	t.Parallel()
+
+	t.Run("ShouldKeepHealthyRegisteredExtensionsAfterPartialStartFailure", func(t *testing.T) {
+		t.Parallel()
+
+		db := openDaemonTestGlobalDB(t)
+		installDaemonTestExtension(t, db, "ext-healthy", daemonTestExtensionOptions{}, true)
+		installDaemonTestExtension(t, db, "ext-bad", daemonTestExtensionOptions{}, true)
+
+		var logBuffer bytes.Buffer
+		logger := slog.New(slog.NewTextHandler(&logBuffer, nil))
+		runtime := &fakeExtensionRuntime{
+			startErr: errors.New("boom"),
+			getFn: func(name string) (*extensionpkg.Extension, error) {
+				switch name {
+				case "ext-healthy":
+					return &extensionpkg.Extension{
+						Info: extensionpkg.ExtensionInfo{
+							Name:    "ext-healthy",
+							Enabled: true,
+						},
+						Status: extensionpkg.ExtensionStatus{
+							Name:       "ext-healthy",
+							Enabled:    true,
+							Registered: true,
+						},
+					}, nil
+				case "ext-bad":
+					return nil, extensionpkg.ErrExtensionNotFound
+				default:
+					return nil, extensionpkg.ErrExtensionNotFound
+				}
+			},
+		}
+		homePaths := testHomePaths(t)
+		d := newTestDaemon(t, homePaths, testConfigPtr(t, homePaths))
+		d.newExtensionManager = func(extensionManagerDeps) extensionRuntime {
+			return runtime
+		}
+
+		rebuilds := 0
+		state := &bootState{
+			logger:   logger,
+			registry: db,
+			sessions: &fakeSessionManager{},
+			observer: &fakeObserver{},
+			hooks: &fakeHookRuntime{
+				onRebuild: func(context.Context) error {
+					rebuilds++
+					return nil
+				},
+			},
+		}
+		cleanup := &bootCleanup{}
+
+		if err := d.bootExtensions(testutil.Context(t), state, cleanup); err != nil {
+			t.Fatalf("bootExtensions() error = %v, want nil", err)
+		}
+
+		if runtime.startCount != 1 {
+			t.Fatalf("extension runtime start count = %d, want 1", runtime.startCount)
+		}
+		if rebuilds != 1 {
+			t.Fatalf("hook rebuild count = %d, want 1 after partial start", rebuilds)
+		}
+		if len(cleanup.fns) != 1 {
+			t.Fatalf("cleanup fns = %d, want 1", len(cleanup.fns))
+		}
+		if state.currentExtensionRuntime() != runtime {
+			t.Fatalf("state.extensions = %#v, want runtime", state.currentExtensionRuntime())
+		}
+		if state.deps.Extensions == nil {
+			t.Fatal("state.deps.Extensions = nil, want extension service")
+		}
+		healthy, err := state.deps.Extensions.Status(testutil.Context(t), "ext-healthy")
+		if err != nil {
+			t.Fatalf("Extensions.Status(ext-healthy) error = %v", err)
+		}
+		if got, want := healthy.State, "registered"; got != want {
+			t.Fatalf("ext-healthy state = %q, want %q", got, want)
+		}
+		bad, err := state.deps.Extensions.Status(testutil.Context(t), "ext-bad")
+		if err != nil {
+			t.Fatalf("Extensions.Status(ext-bad) error = %v", err)
+		}
+		if got, want := bad.State, "enabled"; got != want {
+			t.Fatalf("ext-bad state = %q, want %q", got, want)
+		}
+		if !strings.Contains(logBuffer.String(), "healthy extensions only") {
+			t.Fatalf("log output = %q, want partial start continuation message", logBuffer.String())
+		}
+	})
+}
+
+func TestBootExtensionsContinuesAfterExtensionLocalContextFailure(t *testing.T) {
+	t.Parallel()
+
+	t.Run("ShouldContinueAfterExtensionInitializeDeadline", func(t *testing.T) {
+		t.Parallel()
+
+		db := openDaemonTestGlobalDB(t)
+		installDaemonTestExtension(t, db, "ext-timeout", daemonTestExtensionOptions{}, true)
+
+		var logBuffer bytes.Buffer
+		logger := slog.New(slog.NewTextHandler(&logBuffer, nil))
+		runtime := &fakeExtensionRuntime{startErr: context.DeadlineExceeded}
+		homePaths := testHomePaths(t)
+		d := newTestDaemon(t, homePaths, testConfigPtr(t, homePaths))
+		d.newExtensionManager = func(extensionManagerDeps) extensionRuntime {
+			return runtime
+		}
+
+		rebuilds := 0
+		state := &bootState{
+			logger:   logger,
+			registry: db,
+			sessions: &fakeSessionManager{},
+			observer: &fakeObserver{},
+			hooks: &fakeHookRuntime{
+				onRebuild: func(context.Context) error {
+					rebuilds++
+					return nil
+				},
+			},
+		}
+		cleanup := &bootCleanup{}
+
+		if err := d.bootExtensions(testutil.Context(t), state, cleanup); err != nil {
+			t.Fatalf("bootExtensions() error = %v, want nil", err)
+		}
+		if runtime.startCount != 1 {
+			t.Fatalf("extension runtime start count = %d, want 1", runtime.startCount)
+		}
+		if rebuilds != 1 {
+			t.Fatalf("hook rebuild count = %d, want 1 after local extension deadline", rebuilds)
+		}
+		if state.currentExtensionRuntime() != runtime {
+			t.Fatalf(
+				"state.extensions = %#v, want runtime after local extension deadline",
+				state.currentExtensionRuntime(),
+			)
+		}
+		if state.deps.Extensions == nil {
+			t.Fatal("state.deps.Extensions = nil, want extension service after local extension deadline")
+		}
+		if !strings.Contains(logBuffer.String(), "extension manager start failed") {
+			t.Fatalf("log output = %q, want extension start failure message", logBuffer.String())
+		}
+	})
+}
+
+func TestBootExtensionsPropagatesContextCancellation(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name    string
+		build   func(*testing.T) context.Context
+		wantErr error
+	}{
+		{
+			name: "ShouldPropagateCanceledBootContext",
+			build: func(t *testing.T) context.Context {
+				t.Helper()
+				ctx, cancel := context.WithCancel(testutil.Context(t))
+				cancel()
+				return ctx
+			},
+			wantErr: context.Canceled,
+		},
+		{
+			name: "ShouldPropagateExpiredBootContext",
+			build: func(t *testing.T) context.Context {
+				t.Helper()
+				ctx, cancel := context.WithDeadline(testutil.Context(t), time.Now().Add(-time.Second))
+				t.Cleanup(cancel)
+				return ctx
+			},
+			wantErr: context.DeadlineExceeded,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			db := openDaemonTestGlobalDB(t)
+			installDaemonTestExtension(t, db, "ext-canceled", daemonTestExtensionOptions{}, true)
+
+			runtime := &fakeExtensionRuntime{startErr: tc.wantErr}
+			homePaths := testHomePaths(t)
+			d := newTestDaemon(t, homePaths, testConfigPtr(t, homePaths))
+			d.newExtensionManager = func(extensionManagerDeps) extensionRuntime {
+				return runtime
+			}
+
+			state := &bootState{
+				logger:   discardLogger(),
+				registry: db,
+				sessions: &fakeSessionManager{},
+				observer: &fakeObserver{},
+				hooks: &fakeHookRuntime{
+					onRebuild: func(context.Context) error {
+						t.Fatal("hooks should not rebuild when extension start is canceled")
+						return nil
+					},
+				},
+			}
+			cleanup := &bootCleanup{}
+
+			err := d.bootExtensions(tc.build(t), state, cleanup)
+			if !errors.Is(err, tc.wantErr) {
+				t.Fatalf("bootExtensions() error = %v, want %v", err, tc.wantErr)
+			}
+			if runtime.startCount != 0 {
+				t.Fatalf("extension runtime start count = %d, want 0 after canceled boot context", runtime.startCount)
+			}
+			if len(cleanup.fns) != 1 {
+				t.Fatalf("cleanup fns = %d, want 1", len(cleanup.fns))
+			}
+			if state.currentExtensionRuntime() != nil {
+				t.Fatalf("state.extensions = %#v, want nil after canceled start", state.currentExtensionRuntime())
+			}
+			if state.deps.Extensions != nil {
+				t.Fatalf("state.deps.Extensions = %#v, want nil after canceled start", state.deps.Extensions)
+			}
+		})
+	}
+}
+
+func TestBootAutomationBuildsManagerDepsAndAttachesHookBoundary(t *testing.T) {
+	t.Parallel()
+
+	db := openDaemonTestGlobalDB(t)
+	homePaths := testHomePaths(t)
+	cfg := testConfig(t, homePaths)
+	cfg.Automation.Enabled = true
+
+	resolver, err := workspacepkg.NewResolver(
+		db,
+		workspacepkg.WithHomePaths(homePaths),
+		workspacepkg.WithLogger(discardLogger()),
+		workspacepkg.WithConfigLoader(func(rootDir string) (compozyconfig.Config, error) {
+			return compozyconfig.LoadForHome(homePaths, compozyconfig.WithWorkspaceRoot(rootDir))
+		}),
+	)
+	if err != nil {
+		t.Fatalf("NewResolver() error = %v", err)
+	}
+
+	baseLifecycle := &recordingNotifier{}
+	managerLifecycle := &recordingNotifier{}
+	baseTelemetry := &recordingHookTelemetrySink{}
+	managerTelemetry := &recordingHookTelemetrySink{}
+	manager := &fakeAutomationManager{
+		sessionObserver:   managerLifecycle,
+		hookTelemetrySink: managerTelemetry,
+		status:            automationpkg.ManagerStatus{Running: true, SchedulerRunning: true},
+	}
+	var captured automationManagerDeps
+	d := newTestDaemon(t, homePaths, &cfg)
+	d.newAutomationManager = func(deps automationManagerDeps) (automationRuntime, error) {
+		captured = deps
+		return manager, nil
+	}
+
+	state := &bootState{
+		cfg:                cfg,
+		logger:             discardLogger(),
+		registry:           db,
+		sessions:           &fakeSessionManager{},
+		workspaceResolver:  resolver,
+		lifecycleObservers: newSessionLifecycleFanout(baseLifecycle),
+		hookTelemetrySinks: newHookTelemetryFanout(baseTelemetry),
+	}
+	cleanup := &bootCleanup{}
+
+	if err := d.bootAutomation(testutil.Context(t), state, cleanup); err != nil {
+		t.Fatalf("bootAutomation() error = %v", err)
+	}
+
+	if captured.Store == nil {
+		t.Fatal("captured.Store = nil")
+	}
+	if captured.Sessions != state.sessions {
+		t.Fatal("captured.Sessions dependency mismatch")
+	}
+	if captured.WorkspaceResolver != resolver {
+		t.Fatal("captured.WorkspaceResolver dependency mismatch")
+	}
+	if got, want := captured.Config.Enabled, cfg.Automation.Enabled; got != want {
+		t.Fatalf("captured.Config.Enabled = %v, want %v", got, want)
+	}
+	if got, want := captured.Config.Timezone, cfg.Automation.Timezone; got != want {
+		t.Fatalf("captured.Config.Timezone = %q, want %q", got, want)
+	}
+	if got, want := captured.Config.MaxConcurrentJobs, cfg.Automation.MaxConcurrentJobs; got != want {
+		t.Fatalf("captured.Config.MaxConcurrentJobs = %d, want %d", got, want)
+	}
+	if got, want := captured.Config.DefaultFireLimit, cfg.Automation.DefaultFireLimit; got != want {
+		t.Fatalf("captured.Config.DefaultFireLimit = %#v, want %#v", got, want)
+	}
+	if manager.startCount != 1 {
+		t.Fatalf("manager start count = %d, want 1", manager.startCount)
+	}
+	if state.automation != manager {
+		t.Fatalf("state.automation = %#v, want manager", state.automation)
+	}
+	if state.deps.Automation != manager {
+		t.Fatalf("state.deps.Automation = %#v, want manager", state.deps.Automation)
+	}
+	if len(cleanup.fns) != 1 {
+		t.Fatalf("cleanup fns = %d, want 1", len(cleanup.fns))
+	}
+
+	state.lifecycleObservers.OnSessionCreated(testutil.Context(t), &session.Session{ID: "sess-automation"})
+	if got, want := managerLifecycle.events, []string{"created"}; !testutil.EqualStringSlices(got, want) {
+		t.Fatalf("manager lifecycle events = %#v, want %#v", got, want)
+	}
+	if got, want := baseLifecycle.events, []string{"created"}; !testutil.EqualStringSlices(got, want) {
+		t.Fatalf("base lifecycle events = %#v, want %#v", got, want)
+	}
+
+	if err := state.hookTelemetrySinks.WriteHookRecord(
+		testutil.Context(t),
+		"sess-automation",
+		hookspkg.HookRunRecord{HookName: "post-stop"},
+	); err != nil {
+		t.Fatalf("WriteHookRecord() error = %v", err)
+	}
+	if got, want := baseTelemetry.count(), 1; got != want {
+		t.Fatalf("base telemetry count = %d, want %d", got, want)
+	}
+	if got, want := managerTelemetry.count(), 1; got != want {
+		t.Fatalf("manager telemetry count = %d, want %d", got, want)
+	}
+}
+
+func TestHooksNotifierNoopDispatchesWithoutRuntime(t *testing.T) {
+	t.Parallel()
+
+	notifier := newHooksNotifier(discardLogger(), func() time.Time {
+		return time.Date(2026, 4, 11, 12, 0, 0, 0, time.UTC)
+	})
+
+	notifier.OnSessionCreated(testutil.Context(t), &session.Session{ID: "sess-created"})
+	notifier.OnSessionStopped(testutil.Context(t), &session.Session{ID: "sess-stopped"})
+
+	if _, err := notifier.DispatchSessionPreCreate(
+		testutil.Context(t),
+		hookspkg.SessionPreCreatePayload{},
+	); err != nil {
+		t.Fatalf("DispatchSessionPreCreate() error = %v", err)
+	}
+	if _, err := notifier.DispatchSessionPreResume(
+		testutil.Context(t),
+		hookspkg.SessionPreResumePayload{},
+	); err != nil {
+		t.Fatalf("DispatchSessionPreResume() error = %v", err)
+	}
+	if _, err := notifier.DispatchSessionPostResume(
+		testutil.Context(t),
+		hookspkg.SessionPostResumePayload{},
+	); err != nil {
+		t.Fatalf("DispatchSessionPostResume() error = %v", err)
+	}
+	if _, err := notifier.DispatchSessionPreStop(testutil.Context(t), hookspkg.SessionPreStopPayload{}); err != nil {
+		t.Fatalf("DispatchSessionPreStop() error = %v", err)
+	}
+	if _, err := notifier.DispatchInputPreSubmit(testutil.Context(t), hookspkg.InputPreSubmitPayload{}); err != nil {
+		t.Fatalf("DispatchInputPreSubmit() error = %v", err)
+	}
+	if _, err := notifier.DispatchPromptPostAssemble(testutil.Context(t), hookspkg.PromptPayload{}); err != nil {
+		t.Fatalf("DispatchPromptPostAssemble() error = %v", err)
+	}
+	if _, err := notifier.DispatchEventPreRecord(testutil.Context(t), hookspkg.EventPreRecordPayload{}); err != nil {
+		t.Fatalf("DispatchEventPreRecord() error = %v", err)
+	}
+	if _, err := notifier.DispatchEventPostRecord(testutil.Context(t), hookspkg.EventPostRecordPayload{}); err != nil {
+		t.Fatalf("DispatchEventPostRecord() error = %v", err)
+	}
+	if _, err := notifier.DispatchAgentPreStart(testutil.Context(t), hookspkg.AgentPreStartPayload{}); err != nil {
+		t.Fatalf("DispatchAgentPreStart() error = %v", err)
+	}
+	if _, err := notifier.DispatchAgentSpawned(testutil.Context(t), hookspkg.AgentSpawnedPayload{}); err != nil {
+		t.Fatalf("DispatchAgentSpawned() error = %v", err)
+	}
+	if _, err := notifier.DispatchAgentCrashed(testutil.Context(t), hookspkg.AgentCrashedPayload{}); err != nil {
+		t.Fatalf("DispatchAgentCrashed() error = %v", err)
+	}
+	if _, err := notifier.DispatchAgentStopped(testutil.Context(t), hookspkg.AgentStoppedPayload{}); err != nil {
+		t.Fatalf("DispatchAgentStopped() error = %v", err)
+	}
+}
+
+func TestDaemonExtensionServiceInstallStatusEnableAndDisable(t *testing.T) {
+	t.Parallel()
+
+	t.Run("Should install enabled and support repeated enable then disable", func(t *testing.T) {
+		t.Parallel()
+
+		homePaths := testHomePaths(t)
+		db := openDaemonTestGlobalDB(t)
+		registry := extensionpkg.NewRegistry(db.DB())
+		manager := extensionpkg.NewManager(registry, extensionpkg.WithLogger(discardLogger()))
+		if err := manager.Start(testutil.Context(t)); err != nil {
+			t.Fatalf("manager.Start() error = %v", err)
+		}
+		t.Cleanup(func() {
+			if err := manager.Stop(testutil.Context(t)); err != nil {
+				t.Fatalf("manager.Stop() error = %v", err)
+			}
+		})
+
+		syncs := 0
+		fixedNow := time.Date(2026, 4, 10, 12, 0, 0, 0, time.UTC)
+		service := newDaemonExtensionService(
+			&daemonExtensionServiceDeps{
+				Registry: registry,
+				Runtime:  manager,
+				HookBindings: fakeHookBindingPublisher(func(context.Context) error {
+					syncs++
+					return nil
+				}),
+				HomePaths: homePaths,
+				Logger:    discardLogger(),
+				Now:       func() time.Time { return fixedNow },
+			},
+			withDaemonExtensionMarketplace(
+				compozyconfig.ExtensionsConfig{Trust: compozyconfig.ExtensionsTrustConfig{AllowUnverified: true}},
+				nil,
+			),
+			withDaemonExtensionAutomation(&fakeAutomationManager{}),
+			withDaemonExtensionEventWriter(db),
+		)
+		actor, err := taskpkg.DeriveHumanActorContext("user-1", taskpkg.OriginKindCLI, "compozy extension install")
+		if err != nil {
+			t.Fatalf("DeriveHumanActorContext() error = %v", err)
+		}
+
+		fixtureDir := filepath.Join(t.TempDir(), "service-ext")
+		if err := os.MkdirAll(fixtureDir, 0o755); err != nil {
+			t.Fatalf("os.MkdirAll(%q) error = %v", fixtureDir, err)
+		}
+		if err := os.WriteFile(
+			filepath.Join(fixtureDir, "extension.toml"),
+			[]byte(daemonTestExtensionManifest("service-ext", daemonTestExtensionOptions{
+				runtimeCommand: daemonExtensionHelperCommand(t),
+				runtimeArgs:    daemonExtensionHelperArgs(),
+				runtimeEnv:     daemonExtensionHelperEnv(""),
+			})),
+			0o644,
+		); err != nil {
+			t.Fatalf("os.WriteFile(extension.toml) error = %v", err)
+		}
+		installed, err := service.Install(testutil.Context(t), contract.InstallExtensionRequest{
+			Source:          contract.InstallExtensionSourceLocalPath,
+			Ref:             fixtureDir,
+			AllowUnverified: true,
+		}, actor)
+		if err != nil {
+			t.Fatalf("service.Install() error = %v", err)
+		}
+		if got, want := installed.Name, "service-ext"; got != want {
+			t.Fatalf("installed.Name = %q, want %q", got, want)
+		}
+		if got, want := installed.State, "active"; got != want {
+			t.Fatalf("installed.State = %q, want %q", got, want)
+		}
+		if !installed.Enabled {
+			t.Fatal("installed.Enabled = false, want default-on install")
+		}
+		if installed.PID <= 0 {
+			t.Fatalf("installed.PID = %d, want active subprocess", installed.PID)
+		}
+		if installed.Provenance == nil ||
+			installed.Provenance.InstalledFrom != extensionpkg.ExtensionInstalledFromLocalPath ||
+			installed.Provenance.ChecksumVerified || !installed.Provenance.AllowUnverified {
+			t.Fatalf("installed provenance = %#v, want consented local-path provenance", installed.Provenance)
+		}
+		_, err = service.Install(testutil.Context(t), contract.InstallExtensionRequest{
+			Source:          contract.InstallExtensionSourceLocalPath,
+			Ref:             fixtureDir,
+			AllowUnverified: true,
+		}, actor)
+		if !errors.Is(err, extensionpkg.ErrExtensionExists) {
+			t.Fatalf("service.Install(duplicate) error = %v, want ErrExtensionExists", err)
+		}
+		listed, err := service.List(testutil.Context(t))
+		if err != nil {
+			t.Fatalf("service.List() error = %v", err)
+		}
+		if got, want := len(listed), 1; got != want {
+			t.Fatalf("len(service.List()) = %d, want %d", got, want)
+		}
+		if got, want := listed[0].Name, "service-ext"; got != want {
+			t.Fatalf("service.List()[0].Name = %q, want %q", got, want)
+		}
+		if !listed[0].Enabled {
+			t.Fatal("service.List()[0].Enabled = false, want default-on install")
+		}
+
+		info, err := registry.Get("service-ext")
+		if err != nil {
+			t.Fatalf("registry.Get(service-ext) error = %v", err)
+		}
+		wantManifestPath := filepath.Join(extensionpkg.ManagedInstallPath(homePaths, "service-ext"), "extension.toml")
+		if info.ManifestPath != wantManifestPath {
+			t.Fatalf("installed manifest path = %q, want %q", info.ManifestPath, wantManifestPath)
+		}
+		if _, err := os.Stat(filepath.Join(fixtureDir, "extension.toml")); err != nil {
+			t.Fatalf("source fixture manifest stat error = %v", err)
+		}
+
+		status, err := service.Status(testutil.Context(t), "service-ext")
+		if err != nil {
+			t.Fatalf("service.Status() error = %v", err)
+		}
+		if got, want := status.Name, "service-ext"; got != want {
+			t.Fatalf("status.Name = %q, want %q", got, want)
+		}
+		if got, want := status.State, "active"; got != want {
+			t.Fatalf("status.State = %q, want %q", got, want)
+		}
+		if !status.Enabled {
+			t.Fatal("status.Enabled = false, want default-on install")
+		}
+		if status.PID <= 0 {
+			t.Fatalf("status.PID = %d, want active subprocess", status.PID)
+		}
+
+		enabled, err := service.Enable(
+			testutil.Context(t),
+			"service-ext",
+			contract.EnableExtensionRequest{},
+			actor,
+		)
+		if err != nil {
+			t.Fatalf("service.Enable() error = %v", err)
+		}
+		if got, want := enabled.Extension.State, "active"; got != want {
+			t.Fatalf("enabled.Extension.State = %q, want %q", got, want)
+		}
+		if !enabled.Extension.Enabled {
+			t.Fatal("enabled.Extension.Enabled = false, want true")
+		}
+
+		disabled, err := service.Disable(testutil.Context(t), "service-ext", actor)
+		if err != nil {
+			t.Fatalf("service.Disable() error = %v", err)
+		}
+		if got, want := disabled.State, "disabled"; got != want {
+			t.Fatalf("disabled.State = %q, want %q", got, want)
+		}
+		if disabled.Enabled {
+			t.Fatal("disabled.Enabled = true, want false")
+		}
+
+		listed, err = service.List(testutil.Context(t))
+		if err != nil {
+			t.Fatalf("service.List() error = %v", err)
+		}
+		if got, want := len(listed), 1; got != want {
+			t.Fatalf("len(service.List()) = %d, want %d", got, want)
+		}
+		if got, want := listed[0].State, "disabled"; got != want {
+			t.Fatalf("service.List()[0].State = %q, want %q", got, want)
+		}
+		if syncs != 3 {
+			t.Fatalf("hook binding sync count = %d, want 3", syncs)
+		}
+		summaries, err := db.ListEventSummaries(
+			testutil.Context(t),
+			store.EventSummaryQuery{ReadScope: store.ReadScope{AllProfiles: true},
+				Component: eventspkg.ComponentExtension,
+			},
+		)
+		if err != nil {
+			t.Fatalf("ListEventSummaries(extension) error = %v", err)
+		}
+		wantCounts := map[string]int{
+			eventspkg.ExtensionInstallCompleted: 1,
+			eventspkg.ExtensionInstallFailed:    1,
+			eventspkg.ExtensionEnabled:          1,
+			eventspkg.ExtensionDisabled:         1,
+		}
+		gotCounts := make(map[string]int, len(wantCounts))
+		var installContent []byte
+		var failedInstallContent []byte
+		for i, summary := range summaries {
+			gotCounts[summary.Type]++
+			if summary.ActorKind != string(taskpkg.ActorKindHuman) || summary.ActorID != "user-1" {
+				t.Fatalf("summary[%d] actor = %s/%s, want human/user-1", i, summary.ActorKind, summary.ActorID)
+			}
+			if summary.Type == eventspkg.ExtensionInstallCompleted {
+				installContent = summary.Content
+			}
+			if summary.Type == eventspkg.ExtensionInstallFailed {
+				failedInstallContent = summary.Content
+			}
+		}
+		if len(summaries) != 4 || !maps.Equal(gotCounts, wantCounts) {
+			t.Fatalf("extension event type counts = %#v from summaries=%#v, want %#v", gotCounts, summaries, wantCounts)
+		}
+		var installFields map[string]any
+		if err := json.Unmarshal(installContent, &installFields); err != nil {
+			t.Fatalf("json.Unmarshal(install event) error = %v", err)
+		}
+		wantInstallFields := map[string]any{
+			"extension_name": "service-ext",
+			"source_kind":    "local_path",
+			"digest_matched": false,
+		}
+		if !reflect.DeepEqual(installFields, wantInstallFields) {
+			t.Fatalf("install event content = %#v, want %#v", installFields, wantInstallFields)
+		}
+		var failedInstallFields map[string]any
+		if err := json.Unmarshal(failedInstallContent, &failedInstallFields); err != nil {
+			t.Fatalf("json.Unmarshal(failed install event) error = %v", err)
+		}
+		if !reflect.DeepEqual(failedInstallFields, wantInstallFields) {
+			t.Fatalf("failed install event content = %#v, want %#v", failedInstallFields, wantInstallFields)
+		}
+	})
+
+	t.Run("Should serialize concurrent same-name portable installs by instance key", func(t *testing.T) {
+		t.Parallel()
+
+		homePaths := testHomePaths(t)
+		db := openDaemonTestGlobalDB(t)
+		registry := extensionpkg.NewRegistry(db.DB())
+		service := newDaemonExtensionService(
+			&daemonExtensionServiceDeps{
+				Registry: registry, HomePaths: homePaths, Logger: discardLogger(), Now: time.Now,
+			},
+			withDaemonExtensionMarketplace(
+				compozyconfig.ExtensionsConfig{
+					Trust: compozyconfig.ExtensionsTrustConfig{AllowUnverified: true},
+				},
+				nil,
+			),
+		).(*daemonExtensionService)
+		actor, err := taskpkg.DeriveHumanActorContext(
+			"operator",
+			taskpkg.OriginKindCLI,
+			"concurrent portable install",
+		)
+		if err != nil {
+			t.Fatalf("DeriveHumanActorContext() error = %v", err)
+		}
+		fixtureDir := t.TempDir()
+		if err := os.WriteFile(filepath.Join(fixtureDir, "plugin.json"), []byte(`{
+  "$schema": "https://agent-plugins.org/schemas/1.0.0/plugin.schema.json",
+  "name": "same-name-portable",
+  "version": "1.0.0"
+}`), 0o600); err != nil {
+			t.Fatalf("os.WriteFile(plugin.json) error = %v", err)
+		}
+		req := contract.InstallExtensionRequest{
+			Source: contract.InstallExtensionSourceLocalPath, Ref: fixtureDir, AllowUnverified: true,
+		}
+		start := make(chan struct{})
+		results := make(chan error, 2)
+		for range 2 {
+			go func() {
+				<-start
+				_, installErr := service.Install(t.Context(), req, actor)
+				results <- installErr
+			}()
+		}
+		close(start)
+		var succeeded, conflicted int
+		for range 2 {
+			installErr := <-results
+			switch {
+			case installErr == nil:
+				succeeded++
+			case errors.Is(installErr, extensionpkg.ErrExtensionExists):
+				conflicted++
+			default:
+				t.Fatalf("concurrent Install() error = %v, want success or ErrExtensionExists", installErr)
+			}
+		}
+		if succeeded != 1 || conflicted != 1 {
+			t.Fatalf("concurrent results = success:%d conflict:%d, want 1/1", succeeded, conflicted)
+		}
+		infos, err := registry.List()
+		if err != nil {
+			t.Fatalf("registry.List() error = %v", err)
+		}
+		if len(infos) != 1 || infos[0].Name != "same-name-portable" {
+			t.Fatalf("registry.List() = %#v, want one same-name-portable row", infos)
+		}
+		if _, err := os.Stat(extensionpkg.ManagedInstallPath(homePaths, "same-name-portable")); err != nil {
+			t.Fatalf("os.Stat(managed install) error = %v", err)
+		}
+	})
+}
+
+func TestDaemonExtensionServiceInstallsPublishedSources(t *testing.T) {
+	t.Parallel()
+
+	t.Run("Should install GitHub releases with optional integrity-only sidecars", func(t *testing.T) {
+		t.Parallel()
+
+		archive := nativeExtensionTarGz(t, "1.0.0")
+		digestBytes := sha256.Sum256(archive)
+		digest := fmt.Sprintf("%x", digestBytes)
+		mismatch := strings.Repeat("0", sha256.Size*2)
+		for _, testCase := range []struct {
+			name        string
+			sidecar     *string
+			wantMatched bool
+			wantErr     error
+		}{
+			{name: "Should install without a sidecar"},
+			{name: "Should verify a matching sidecar", sidecar: &digest, wantMatched: true},
+			{
+				name: "Should roll back a mismatching sidecar", sidecar: &mismatch,
+				wantErr: extensionpkg.ErrExtensionArchiveDigestMismatch,
+			},
+		} {
+			t.Run(testCase.name, func(t *testing.T) {
+				t.Parallel()
+
+				server := newDaemonGitHubReleaseServer(t, archive, testCase.sidecar)
+				homePaths, registry, service, actor := newDaemonDistributionInstallService(
+					t,
+					func(context.Context, compozyconfig.ExtensionsConfig) ([]registrypkg.Source, error) {
+						return []registrypkg.Source{registrygithub.NewClient(server.URL)}, nil
+					},
+				)
+				installed, err := service.Install(t.Context(), contract.InstallExtensionRequest{
+					Source: contract.InstallExtensionSourceGitHub, Ref: "acme/tool-ext", AllowUnverified: true,
+				}, actor)
+				if testCase.wantErr != nil {
+					if !errors.Is(err, testCase.wantErr) {
+						t.Fatalf("service.Install(github) error = %v, want %v", err, testCase.wantErr)
+					}
+					if _, getErr := registry.Get("tool-ext"); !errors.Is(getErr, extensionpkg.ErrExtensionNotFound) {
+						t.Fatalf("registry.Get(tool-ext) error = %v, want no partial row", getErr)
+					}
+					if _, statErr := os.Stat(
+						extensionpkg.ManagedInstallPath(homePaths, "tool-ext"),
+					); !errors.Is(statErr, os.ErrNotExist) {
+						t.Fatalf("os.Stat(managed tool-ext) error = %v, want no partial files", statErr)
+					}
+					return
+				}
+				if err != nil {
+					t.Fatalf("service.Install(github) error = %v", err)
+				}
+				if installed.Provenance == nil ||
+					installed.Provenance.InstalledFrom != extensionpkg.ExtensionInstalledFromGitHub ||
+					installed.Provenance.DigestMatched != testCase.wantMatched ||
+					installed.Provenance.ChecksumVerified ||
+					installed.Provenance.RegistryTier != extensionpkg.ExtensionRegistryTierUnverified {
+					t.Fatalf("github provenance = %#v, want truthful integrity-only provenance", installed.Provenance)
+				}
+			})
+		}
+	})
+
+	t.Run("Should reject a local path before loading the published git source", func(t *testing.T) {
+		t.Parallel()
+
+		repository := t.TempDir()
+		loaderCalled := false
+		_, _, service, actor := newDaemonDistributionInstallService(
+			t,
+			func(context.Context, compozyconfig.ExtensionsConfig) ([]registrypkg.Source, error) {
+				loaderCalled = true
+				return nil, errors.New("unexpected marketplace source load")
+			},
+		)
+		_, err := service.Install(t.Context(), contract.InstallExtensionRequest{
+			Source: contract.InstallExtensionSourceGit, Ref: repository, Version: "v1.0.0", AllowUnverified: true,
+		}, actor)
+		if err == nil || !strings.Contains(err.Error(), "must use HTTPS") {
+			t.Fatalf("service.Install(local git) error = %v, want HTTPS requirement", err)
+		}
+		if loaderCalled {
+			t.Fatal("marketplace source loader ran for a rejected local git path")
+		}
+	})
+}
+
+func newDaemonDistributionInstallService(
+	t *testing.T,
+	loader extensionMarketplaceSourceLoader,
+) (
+	compozyconfig.HomePaths,
+	*extensionpkg.Registry,
+	*daemonExtensionService,
+	taskpkg.ActorContext,
+) {
+	t.Helper()
+	homePaths := testHomePaths(t)
+	db := openDaemonTestGlobalDB(t)
+	registry := extensionpkg.NewRegistry(db.DB())
+	service, ok := newDaemonExtensionService(
+		&daemonExtensionServiceDeps{
+			Registry:  registry,
+			HomePaths: homePaths,
+			Logger:    discardLogger(),
+			Now:       time.Now,
+		},
+		withDaemonExtensionMarketplace(
+			compozyconfig.ExtensionsConfig{Trust: compozyconfig.ExtensionsTrustConfig{AllowUnverified: true}},
+			loader,
+		),
+	).(*daemonExtensionService)
+	if !ok {
+		t.Fatal("newDaemonExtensionService() did not return daemonExtensionService")
+	}
+	actor, err := taskpkg.DeriveHumanActorContext("user-1", taskpkg.OriginKindCLI, "compozy extension install")
+	if err != nil {
+		t.Fatalf("DeriveHumanActorContext() error = %v", err)
+	}
+	return homePaths, registry, service, actor
+}
+
+func newDaemonGitHubReleaseServer(t *testing.T, archive []byte, sidecar *string) *httptest.Server {
+	t.Helper()
+	var server *httptest.Server
+	server = httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		assetName := "tool-ext-v1.0.0.tar.gz"
+		assets := []map[string]any{{
+			"name": assetName, "url": server.URL + "/downloads/" + assetName,
+			"content_type": "application/gzip", "size": len(archive),
+		}}
+		if sidecar != nil {
+			assets = append(assets, map[string]any{
+				"name": assetName + ".sha256", "url": server.URL + "/downloads/" + assetName + ".sha256",
+				"content_type": "text/plain", "size": len(*sidecar),
+			})
+		}
+		release := map[string]any{
+			"tag_name": "1.0.0", "name": "tool-ext", "html_url": server.URL + "/releases/1.0.0",
+			"assets": assets, "author": map[string]any{"login": "acme"},
+		}
+		switch request.URL.Path {
+		case "/repos/acme/tool-ext/releases/latest":
+			writeDaemonTestJSON(writer, release)
+		case "/repos/acme/tool-ext/releases":
+			writeDaemonTestJSON(writer, []any{release})
+		case "/downloads/" + assetName:
+			writer.Header().Set("Content-Type", "application/gzip")
+			if _, err := writer.Write(archive); err != nil {
+				panic(err)
+			}
+		case "/downloads/" + assetName + ".sha256":
+			writer.Header().Set("Content-Type", "text/plain")
+			if sidecar == nil {
+				http.NotFound(writer, request)
+				return
+			}
+			if _, err := writer.Write([]byte(*sidecar + "  " + assetName + "\n")); err != nil {
+				panic(err)
+			}
+		default:
+			http.NotFound(writer, request)
+		}
+	}))
+	t.Cleanup(server.Close)
+	return server
+}
+
+func writeDaemonTestJSON(writer http.ResponseWriter, value any) {
+	writer.Header().Set("Content-Type", "application/json")
+	if err := json.NewEncoder(writer).Encode(value); err != nil {
+		panic(err)
+	}
+}
+
+func TestDaemonExtensionServiceRecordsCommittedBatchUpdatesBeforeReturningFailure(t *testing.T) {
+	t.Parallel()
+
+	db := openDaemonTestGlobalDB(t)
+	fixedNow := time.Date(2026, 7, 16, 18, 0, 0, 0, time.UTC)
+	service := &daemonExtensionService{eventWriter: db, now: func() time.Time { return fixedNow }}
+	actor, err := taskpkg.DeriveHumanActorContext("user-1", taskpkg.OriginKindCLI, "compozy extension update --all")
+	if err != nil {
+		t.Fatalf("DeriveHumanActorContext() error = %v", err)
+	}
+	cause := errors.New("later update failed")
+	items := []extensionpkg.MarketplaceUpdateResult{
+		{
+			Name: "a-good", Slug: "acme/a-good", Registry: "github",
+			CurrentVersion: "1.0.0", LatestVersion: "2.0.0", Path: "/extensions/a-good",
+			Status: extensionpkg.MarketplaceUpdateStatusUpdated,
+			Warnings: []diagnosticcontract.DiagnosticItem{{
+				Code: diagnosticcontract.CodeExtensionUpdateCleanupFailed,
+			}},
+		},
+		{
+			Name: "b-good", Slug: "acme/b-good", Registry: "github",
+			CurrentVersion: "1.0.0", LatestVersion: "2.0.0", Path: "/extensions/b-good",
+			Status: extensionpkg.MarketplaceUpdateStatusUpdated,
+		},
+		{
+			Name: "c-failed", Slug: "acme/c-failed", Registry: "github",
+			CurrentVersion: "1.0.0", LatestVersion: "2.0.0", Path: "/extensions/c-failed",
+			Status: extensionpkg.MarketplaceUpdateStatusFailed,
+		},
+	}
+
+	payloads, err := service.finalizeMarketplaceUpdateBatch(t.Context(), actor, items, cause)
+	if !errors.Is(err, cause) {
+		t.Fatalf("finalizeMarketplaceUpdateBatch() error = %v, want original batch failure", err)
+	}
+	if len(payloads) != 3 {
+		t.Fatalf("finalizeMarketplaceUpdateBatch() payloads = %#v, want two updates and one failure", payloads)
+	}
+	if len(payloads[0].Warnings) != 1 ||
+		payloads[0].Warnings[0].Code != diagnosticcontract.CodeExtensionUpdateCleanupFailed {
+		t.Fatalf("finalizeMarketplaceUpdateBatch() warnings = %#v, want cleanup warning", payloads[0].Warnings)
+	}
+	summaries, err := db.ListEventSummaries(
+		t.Context(),
+		store.EventSummaryQuery{ReadScope: store.ReadScope{AllProfiles: true},
+			Type: eventspkg.ExtensionUpdateCompleted,
+		},
+	)
+	if err != nil {
+		t.Fatalf("ListEventSummaries(extension.update.completed) error = %v", err)
+	}
+	if len(summaries) != 2 {
+		t.Fatalf("extension.update.completed summaries = %#v, want two", summaries)
+	}
+	for _, summary := range summaries {
+		var fields map[string]any
+		if err := json.Unmarshal(summary.Content, &fields); err != nil {
+			t.Fatalf("json.Unmarshal(update event) error = %v", err)
+		}
+		if len(fields) != 2 || fields["source_kind"] != "github" {
+			t.Fatalf("update event fields = %#v, want exact name/source keys", fields)
+		}
+	}
+	for _, name := range []string{"a-good", "b-good"} {
+		found := false
+		for _, summary := range summaries {
+			if bytes.Contains(summary.Content, []byte(`"extension_name":"`+name+`"`)) {
+				found = true
+				break
+			}
+		}
+		if !found {
+			t.Fatalf("extension.update.completed summaries = %#v, want event for %s", summaries, name)
+		}
+	}
+	failed, err := db.ListEventSummaries(
+		t.Context(),
+		store.EventSummaryQuery{ReadScope: store.ReadScope{AllProfiles: true},
+			Type: eventspkg.ExtensionUpdateFailed,
+		},
+	)
+	if err != nil {
+		t.Fatalf("ListEventSummaries(extension.update.failed) error = %v", err)
+	}
+	if len(failed) != 1 || !bytes.Contains(failed[0].Content, []byte(`"extension_name":"c-failed"`)) {
+		t.Fatalf("extension.update.failed summaries = %#v, want c-failed", failed)
+	}
+
+	writeErr := errors.New("event store failed")
+	failingWriter := &daemonExtensionEventStoreStub{writeErr: writeErr}
+	service.eventWriter = failingWriter
+	_, err = service.finalizeMarketplaceUpdateBatch(t.Context(), actor, items, cause)
+	if !errors.Is(err, cause) || !errors.Is(err, writeErr) {
+		t.Fatalf("finalizeMarketplaceUpdateBatch(event failure) error = %v, want batch and event failures", err)
+	}
+	if failingWriter.writeCalls != len(items) {
+		t.Fatalf("event writer calls = %d, want %d committed update attempts", failingWriter.writeCalls, len(items))
+	}
+}
+
+type daemonExtensionEventStoreStub struct {
+	writeErr   error
+	writeCalls int
+}
+
+func (s *daemonExtensionEventStoreStub) WriteEventSummary(context.Context, store.EventSummary) error {
+	s.writeCalls++
+	return s.writeErr
+}
+
+func (s *daemonExtensionEventStoreStub) WriteEventSummaries(
+	_ context.Context,
+	summaries []store.EventSummary,
+) error {
+	s.writeCalls += len(summaries)
+	return s.writeErr
+}
+
+func (*daemonExtensionEventStoreStub) ListEventSummaries(
+	context.Context,
+	store.EventSummaryQuery,
+) ([]store.EventSummary, error) {
+	return nil, nil
+}
+
+func TestDaemonExtensionServiceRollsBackFailedInstallReload(t *testing.T) {
+	t.Parallel()
+
+	t.Run("Should remove the managed install when default-on reload fails", func(t *testing.T) {
+		t.Parallel()
+
+		homePaths := testHomePaths(t)
+		db := openDaemonTestGlobalDB(t)
+		registry := extensionpkg.NewRegistry(db.DB())
+		installDaemonTestExtension(
+			t,
+			db,
+			"unrelated-broken",
+			daemonTestExtensionOptions{runtimeCommand: filepath.Join(t.TempDir(), "missing-provider")},
+			true,
+		)
+		manager := extensionpkg.NewManager(registry, extensionpkg.WithLogger(discardLogger()))
+		if err := manager.Start(testutil.Context(t)); err == nil || !strings.Contains(err.Error(), "missing-provider") {
+			t.Fatalf("expected missing-provider startup failure: %v", err)
+		}
+		t.Cleanup(func() {
+			if err := manager.Stop(testutil.Context(t)); err != nil {
+				t.Fatalf("manager.Stop() error = %v", err)
+			}
+		})
+
+		service := newDaemonExtensionService(
+			&daemonExtensionServiceDeps{
+				Registry: registry,
+				Runtime:  manager,
+				HookBindings: fakeHookBindingPublisher(func(context.Context) error {
+					return nil
+				}),
+				HomePaths: homePaths,
+				Logger:    discardLogger(),
+				Now:       time.Now,
+			},
+			withDaemonExtensionMarketplace(
+				compozyconfig.ExtensionsConfig{Trust: compozyconfig.ExtensionsTrustConfig{AllowUnverified: true}},
+				nil,
+			),
+			withDaemonExtensionAutomation(&fakeAutomationManager{}),
+		)
+		actor, err := taskpkg.DeriveHumanActorContext("user-1", taskpkg.OriginKindCLI, "compozy extension install")
+		if err != nil {
+			t.Fatalf("DeriveHumanActorContext() error = %v", err)
+		}
+
+		healthyDir := t.TempDir()
+		if err := os.WriteFile(filepath.Join(healthyDir, "extension.toml"), []byte(`[extension]
+name = "recoverable"
+version = "0.1.0"
+min_compozy_version = "0.0.1"
+`), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := service.Install(t.Context(), contract.InstallExtensionRequest{
+			Source: contract.InstallExtensionSourceLocalPath, Ref: healthyDir, AllowUnverified: true,
+		}, actor); err != nil {
+			t.Fatalf("unrelated failure blocked healthy install: %v", err)
+		}
+		if _, err := db.DB().
+			ExecContext(t.Context(), `DELETE FROM extension_installations WHERE extension_name = 'recoverable'`); err != nil {
+			t.Fatal(err)
+		}
+		agent, err := taskpkg.DeriveAgentSessionActorContext("agent-orphan", "ws-orphan")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := service.Remove(
+			t.Context(),
+			"recoverable",
+			agent,
+		); !errors.Is(
+			err,
+			extensionpkg.ErrExtensionNotFound,
+		) {
+			t.Fatalf("workspace agent orphan removal = %v", err)
+		}
+
+		if _, err := service.Remove(t.Context(), "recoverable", actor); err != nil {
+			t.Fatalf("remove orphan: %v", err)
+		}
+		if _, err := registry.Get("recoverable"); !errors.Is(err, extensionpkg.ErrExtensionNotFound) {
+			t.Fatalf("orphan retained: %v", err)
+		}
+		if _, err := os.Stat(
+			extensionpkg.ManagedInstallPath(homePaths, "recoverable"),
+		); !errors.Is(
+			err,
+			os.ErrNotExist,
+		) {
+			t.Fatalf("orphan directory retained: %v", err)
+		}
+
+		if _, err := service.Install(t.Context(), contract.InstallExtensionRequest{
+			Source: contract.InstallExtensionSourceLocalPath, Ref: healthyDir, AllowUnverified: true,
+		}, actor); err != nil {
+			t.Fatalf("reinstall recovered name: %v", err)
+		}
+		if _, err := service.Remove(t.Context(), "recoverable", actor); err != nil {
+			t.Fatalf("remove reinstalled package: %v", err)
+		}
+
+		fixtureDir := filepath.Join(t.TempDir(), "rollback-ext")
+		agentDir := filepath.Join(fixtureDir, "agents", "broken")
+		if err := os.MkdirAll(agentDir, 0o755); err != nil {
+			t.Fatalf("os.MkdirAll(%q) error = %v", agentDir, err)
+		}
+		if err := os.WriteFile(
+			filepath.Join(fixtureDir, "extension.toml"),
+			[]byte(`[extension]
+name = "rollback-ext"
+version = "0.1.0"
+description = "Invalid extension used to verify daemon install rollback."
+min_compozy_version = "0.0.1"
+
+[[resources.agents]]
+path = "agents"
+`),
+			0o644,
+		); err != nil {
+			t.Fatalf("os.WriteFile(extension.toml) error = %v", err)
+		}
+		if err := os.WriteFile(
+			filepath.Join(agentDir, "AGENT.md"),
+			[]byte(`---
+provider: codex
+---
+
+Broken agent missing required name.
+`),
+			0o644,
+		); err != nil {
+			t.Fatalf("os.WriteFile(AGENT.md) error = %v", err)
+		}
+
+		_, err = service.Install(testutil.Context(t), contract.InstallExtensionRequest{
+			Source:          contract.InstallExtensionSourceLocalPath,
+			Ref:             fixtureDir,
+			AllowUnverified: true,
+		}, actor)
+		if err == nil {
+			t.Fatal("service.Install(invalid extension) error = nil, want reload failure")
+		}
+		if !strings.Contains(err.Error(), "agent name is required") {
+			t.Fatalf("service.Install(invalid extension) error = %v, want agent parse failure", err)
+		}
+
+		if _, err := registry.Get("rollback-ext"); !errors.Is(err, extensionpkg.ErrExtensionNotFound) {
+			t.Fatalf("registry.Get(rollback-ext) error = %v, want ErrExtensionNotFound", err)
+		}
+		managedPath := extensionpkg.ManagedInstallPath(homePaths, "rollback-ext")
+		if _, err := os.Stat(managedPath); !errors.Is(err, os.ErrNotExist) {
+			t.Fatalf("os.Stat(%q) error = %v, want rolled-back install absent", managedPath, err)
+		}
+		if _, err := manager.Get("rollback-ext"); !errors.Is(err, extensionpkg.ErrExtensionNotFound) {
+			t.Fatalf("manager.Get(rollback-ext) error = %v, want ErrExtensionNotFound", err)
+		}
+		if _, err := os.Stat(filepath.Join(fixtureDir, "extension.toml")); err != nil {
+			t.Fatalf("source fixture manifest stat error = %v", err)
+		}
+	})
+}
+
+func TestDaemonExtensionServiceCheckReadyErrors(t *testing.T) {
+	t.Parallel()
+
+	var nilService *daemonExtensionService
+	if err := nilService.checkReady(); err == nil {
+		t.Fatal("nil service checkReady() error = nil, want error")
+	}
+
+	service := &daemonExtensionService{homePaths: testHomePaths(t), logger: discardLogger(), now: time.Now}
+	if _, err := service.List(testutil.Context(t)); err == nil {
+		t.Fatal("List() without registry error = nil, want error")
+	}
+}
+
+func TestExtensionDeclarationProviderReturnsRuntimeDeclarations(t *testing.T) {
+	t.Parallel()
+	t.Run("Should project one isolated declaration for every active profile", func(t *testing.T) {
+		t.Parallel()
+
+		want := []hookspkg.HookDecl{{
+			Name:         "ext-turn-start",
+			Event:        hookspkg.HookTurnStart,
+			Mode:         hookspkg.HookModeSync,
+			ExecutorKind: hookspkg.HookExecutorSubprocess,
+			Command:      "/bin/sh",
+			Args:         []string{"-c", "printf '{}'"},
+		}}
+		runtime := &fakeExtensionRuntime{hookDecls: want}
+		profiles := extensionHookProfileCatalogStub{profiles: []profilepkg.WithCounts{
+			{ID: store.DefaultProfileID, Name: "default", State: profilepkg.StateActive},
+			{ID: "profile-marketing", Name: "marketing", State: profilepkg.StateActive},
+		}}
+
+		got, err := extensionDeclarationProvider(
+			func() extensionRuntime { return runtime },
+			profiles,
+		)(
+			testutil.Context(t),
+		)
+		if err != nil {
+			t.Fatalf("extensionDeclarationProvider() error = %v", err)
+		}
+		if len(got) != 2 || got[0].ProfileID != store.DefaultProfileID || got[1].ProfileID != "profile-marketing" {
+			t.Fatalf("extensionDeclarationProvider() = %#v, want default and marketing owners", got)
+		}
+	})
+}
+
+func TestChainDeclarationProvidersWrapsProviderErrors(t *testing.T) {
+	t.Parallel()
+
+	wantErr := errors.New("provider boom")
+	provider := chainDeclarationProviders(
+		func(context.Context) ([]hookspkg.HookDecl, error) {
+			return nil, wantErr
+		},
+	)
+
+	_, err := provider(testutil.Context(t))
+	if !errors.Is(err, wantErr) {
+		t.Fatalf("provider error = %v, want wrapped %v", err, wantErr)
+	}
+	if err == nil || !strings.Contains(err.Error(), "provider 1") {
+		t.Fatalf("provider error = %v, want provider context", err)
+	}
+}
+
+func TestExtensionDeclarationProviderWrapsRuntimeErrors(t *testing.T) {
+	t.Parallel()
+
+	wantErr := errors.New("runtime boom")
+	runtime := &fakeExtensionRuntime{hookErr: wantErr}
+
+	_, err := extensionDeclarationProvider(
+		func() extensionRuntime { return runtime },
+		extensionHookProfileCatalogStub{profiles: defaultExtensionHookProfiles()},
+	)(testutil.Context(t))
+	if !errors.Is(err, wantErr) {
+		t.Fatalf("extensionDeclarationProvider() error = %v, want wrapped %v", err, wantErr)
+	}
+	if err == nil || !strings.Contains(err.Error(), "extension runtime") {
+		t.Fatalf("extensionDeclarationProvider() error = %v, want runtime context", err)
+	}
+}
+
+func TestBootStateExtensionRuntimeAccessIsSynchronized(t *testing.T) {
+	t.Parallel()
+
+	state := &bootState{}
+	runtime := &fakeExtensionRuntime{
+		hookDecls: []hookspkg.HookDecl{{
+			Name:         "ext-turn-start",
+			Event:        hookspkg.HookTurnStart,
+			Mode:         hookspkg.HookModeSync,
+			ExecutorKind: hookspkg.HookExecutorSubprocess,
+			Command:      "/bin/sh",
+			Args:         []string{"-c", "printf '{}'"},
+		}},
+	}
+	provider := extensionDeclarationProvider(
+		state.currentExtensionRuntime,
+		extensionHookProfileCatalogStub{profiles: defaultExtensionHookProfiles()},
+	)
+
+	start := make(chan struct{})
+	providerErrors := make(chan error, 16*128)
+	var wg sync.WaitGroup
+	for i := range 16 {
+		wg.Add(2)
+
+		go func(iteration int) {
+			defer wg.Done()
+			<-start
+			for j := range 128 {
+				if (iteration+j)%2 == 0 {
+					state.setExtensionRuntime(runtime)
+				} else {
+					state.setExtensionRuntime(nil)
+				}
+			}
+		}(i)
+
+		go func() {
+			defer wg.Done()
+			<-start
+			for range 128 {
+				if _, err := provider(t.Context()); err != nil {
+					providerErrors <- err
+				}
+			}
+		}()
+	}
+
+	close(start)
+	wg.Wait()
+	close(providerErrors)
+	for err := range providerErrors {
+		t.Errorf("extension declaration provider error = %v", err)
+	}
+}
+
+func TestShutdownDrainsHooksBeforeClosingDatabase(t *testing.T) {
+	t.Parallel()
+
+	homePaths := testHomePaths(t)
+	cfg := testConfig(t, homePaths)
+	d := newTestDaemon(t, homePaths, &cfg)
+
+	asyncStarted := make(chan struct{}, 1)
+	asyncRelease := make(chan struct{})
+	dbClosed := make(chan struct{}, 1)
+
+	hooks := hookspkg.NewHooks(
+		hookspkg.WithLogger(discardLogger()),
+		hookspkg.WithNativeDeclarations([]hookspkg.HookDecl{
+			{
+				Name:         "async-stop",
+				Event:        hookspkg.HookSessionPostStop,
+				Mode:         hookspkg.HookModeAsync,
+				ExecutorKind: hookspkg.HookExecutorNative,
+			},
+		}),
+		hookspkg.WithExecutorResolver(testHookExecutorResolver(map[string]hookspkg.Executor{
+			"async-stop": hookspkg.NewTypedNativeExecutor(
+				func(_ context.Context, _ hookspkg.RegisteredHook, _ hookspkg.SessionLifecyclePayload) (hookspkg.SessionPostStopPatch, error) {
+					asyncStarted <- struct{}{}
+					<-asyncRelease
+					return hookspkg.SessionPostStopPatch{}, nil
+				},
+			),
+		})),
+	)
+	t.Cleanup(hooks.Close)
+	if err := hooks.Rebuild(testutil.Context(t)); err != nil {
+		t.Fatalf("Rebuild() error = %v", err)
+	}
+
+	notifier := newHooksNotifier(
+		discardLogger(),
+		func() time.Time { return time.Date(2026, 4, 9, 12, 0, 0, 0, time.UTC) },
+	)
+	notifier.setRuntime(hooks, nil)
+
+	d.sessions = &fakeSessionManager{
+		infos: []*session.Info{{ID: "sess-a"}},
+		onStop: func(string) {
+			if _, err := notifier.DispatchSessionPostStop(
+				t.Context(),
+				hookSessionLifecyclePayload(&session.Session{
+					ID:          "sess-a",
+					AgentName:   "codex",
+					WorkspaceID: "ws-1",
+					Workspace:   "/tmp/ws-1",
+					Type:        session.SessionTypeUser,
+					State:       session.StateStopped,
+					CreatedAt:   time.Date(2026, 4, 9, 11, 0, 0, 0, time.UTC),
+					UpdatedAt:   time.Date(2026, 4, 9, 12, 0, 0, 0, time.UTC),
+				}, hookspkg.HookSessionPostStop, time.Date(2026, 4, 9, 12, 0, 0, 0, time.UTC)),
+			); err != nil {
+				t.Fatalf("DispatchSessionPostStop() error = %v", err)
+			}
+		},
+	}
+	d.hooks = hooks
+	d.registry = &recordingRegistry{
+		path: homePaths.DatabaseFile,
+		onClose: func() {
+			dbClosed <- struct{}{}
+		},
+	}
+	d.closeLogger = func() error { return nil }
+
+	errCh := make(chan error, 1)
+	go func() {
+		errCh <- d.Shutdown(testutil.Context(t))
+	}()
+
+	select {
+	case <-asyncStarted:
+	case <-time.After(time.Second):
+		t.Fatal("async hook did not start before shutdown blocked")
+	}
+
+	select {
+	case <-dbClosed:
+		t.Fatal("database closed before hooks drained")
+	default:
+	}
+
+	close(asyncRelease)
+	if err := <-errCh; err != nil {
+		t.Fatalf("Shutdown() error = %v", err)
+	}
+
+	select {
+	case <-dbClosed:
+	case <-time.After(time.Second):
+		t.Fatal("database was not closed after hooks drained")
+	}
+}
+
+func TestBootFailureCleansUpStartedResourcesInReverseOrder(t *testing.T) {
+	homePaths := testHomePaths(t)
+	cfg := testConfig(t, homePaths)
+	d := newTestDaemon(t, homePaths, &cfg)
+
+	var events []string
+	d.closeLogger = func() error {
+		events = append(events, "logger")
+		return nil
+	}
+	d.acquireLock = func(path string, _ int) (*Lock, error) {
+		return &Lock{
+			path: path,
+			releaseFn: func() error {
+				events = append(events, "lock")
+				return nil
+			},
+		}, nil
+	}
+	d.openRegistry = func(context.Context, string) (Registry, error) {
+		return &recordingRegistry{
+			path: homePaths.DatabaseFile,
+			onClose: func() {
+				events = append(events, "db")
+			},
+		}, nil
+	}
+	d.newSessionManager = func(context.Context, SessionManagerDeps) (SessionManager, error) {
+		return &fakeSessionManager{}, nil
+	}
+	d.newObserver = func(context.Context, RuntimeDeps) (Observer, error) {
+		return &fakeObserver{}, nil
+	}
+	d.httpFactory = func(context.Context, RuntimeDeps) (Server, error) {
+		return &fakeServer{
+			name: "http",
+			onShutdown: func() {
+				events = append(events, "http")
+			},
+		}, nil
+	}
+	d.udsFactory = func(context.Context, RuntimeDeps) (Server, error) {
+		return nil, errors.New("uds boom")
+	}
+
+	if err := d.boot(testutil.Context(t)); err == nil || !strings.Contains(err.Error(), "uds boom") {
+		t.Fatalf("boot() error = %v, want uds boom", err)
+	}
+
+	want := []string{"http", "db", "lock", "logger"}
+	if !testutil.EqualStringSlices(events, want) {
+		t.Fatalf("boot() cleanup order = %#v, want %#v", events, want)
+	}
+}
+
+func TestBootCleanupRequiresOwnedContext(t *testing.T) {
+	t.Parallel()
+
+	t.Run("Should detach cancellation while preserving boot values and a cleanup deadline", func(t *testing.T) {
+		t.Parallel()
+
+		type bootValueKey struct{}
+		const bootValue = "boot-owned"
+		bootCtx, cancelBoot := context.WithCancel(
+			context.WithValue(testutil.Context(t), bootValueKey{}, bootValue),
+		)
+		cancelBoot()
+
+		primaryErr := errors.New("boot failed")
+		cleanupErr := primaryErr
+		cleanup := &bootCleanup{}
+		cleanup.add(func(ctx context.Context) error {
+			if err := ctx.Err(); err != nil {
+				t.Fatalf("boot cleanup context error = %v, want detached cleanup", err)
+			}
+			if got := ctx.Value(bootValueKey{}); got != bootValue {
+				t.Fatalf("boot cleanup context value = %#v, want %q", got, bootValue)
+			}
+			if _, ok := ctx.Deadline(); !ok {
+				t.Fatal("boot cleanup context deadline = none, want bounded cleanup")
+			}
+			return nil
+		})
+
+		cleanup.run(bootCtx, &cleanupErr)
+
+		if !errors.Is(cleanupErr, primaryErr) {
+			t.Fatalf("boot cleanup error = %v, want primary error identity", cleanupErr)
+		}
+	})
+
+	t.Run("Should preserve the primary error without running cleanup when context is missing", func(t *testing.T) {
+		t.Parallel()
+
+		primaryErr := errors.New("boot failed")
+		cleanupErr := primaryErr
+		cleanupCalled := false
+		cleanup := &bootCleanup{}
+		cleanup.add(func(context.Context) error {
+			cleanupCalled = true
+			return nil
+		})
+
+		cleanup.run(nil, &cleanupErr) //nolint:staticcheck // Verifies the internal nil-context guard.
+
+		if cleanupCalled {
+			t.Fatal("boot cleanup ran without an owning context")
+		}
+		if !errors.Is(cleanupErr, primaryErr) {
+			t.Fatalf("boot cleanup error = %v, want primary error identity", cleanupErr)
+		}
+		if !strings.Contains(cleanupErr.Error(), "boot cleanup context is required") {
+			t.Fatalf("boot cleanup error = %v, want missing-context detail", cleanupErr)
+		}
+	})
+}
+
+func TestBootFailureWhenWritingDaemonInfoCleansUpAllServers(t *testing.T) {
+	homePaths := testHomePaths(t)
+	cfg := testConfig(t, homePaths)
+	infoDir := filepath.Join(homePaths.HomeDir, "daemon-info-dir")
+	if err := os.MkdirAll(infoDir, 0o755); err != nil {
+		t.Fatalf("os.MkdirAll(infoDir) error = %v", err)
+	}
+
+	d := newTestDaemon(t, homePaths, &cfg)
+	d.homePaths.DaemonInfo = infoDir
+
+	var events []string
+	d.closeLogger = func() error {
+		events = append(events, "logger")
+		return nil
+	}
+	d.acquireLock = func(path string, _ int) (*Lock, error) {
+		return &Lock{
+			path: path,
+			releaseFn: func() error {
+				events = append(events, "lock")
+				return nil
+			},
+		}, nil
+	}
+	d.openRegistry = func(context.Context, string) (Registry, error) {
+		return &recordingRegistry{
+			path: homePaths.DatabaseFile,
+			onClose: func() {
+				events = append(events, "db")
+			},
+		}, nil
+	}
+	d.newSessionManager = func(context.Context, SessionManagerDeps) (SessionManager, error) {
+		return &fakeSessionManager{}, nil
+	}
+	d.newObserver = func(context.Context, RuntimeDeps) (Observer, error) {
+		return &fakeObserver{}, nil
+	}
+	d.httpFactory = func(context.Context, RuntimeDeps) (Server, error) {
+		return &fakeServer{name: "http", onShutdown: func() { events = append(events, "http") }}, nil
+	}
+	d.udsFactory = func(context.Context, RuntimeDeps) (Server, error) {
+		return &fakeServer{name: "uds", onShutdown: func() { events = append(events, "uds") }}, nil
+	}
+
+	if err := d.boot(testutil.Context(t)); err == nil || !strings.Contains(err.Error(), "daemon info") {
+		t.Fatalf("boot() error = %v, want daemon info failure", err)
+	}
+
+	want := []string{"uds", "http", "db", "lock", "logger"}
+	if !testutil.EqualStringSlices(events, want) {
+		t.Fatalf("boot() cleanup order = %#v, want %#v", events, want)
+	}
+}
+
+func TestVerifyImportBoundariesReportsViolations(t *testing.T) {
+	root := t.TempDir()
+	if err := os.WriteFile(
+		filepath.Join(root, "go.mod"),
+		[]byte("module github.com/compozy/compozy\n"),
+		0o644,
+	); err != nil {
+		t.Fatalf("os.WriteFile(go.mod) error = %v", err)
+	}
+
+	sourceDir := filepath.Join(root, "internal", "worker")
+	if err := os.MkdirAll(sourceDir, 0o755); err != nil {
+		t.Fatalf("os.MkdirAll(sourceDir) error = %v", err)
+	}
+	if err := os.WriteFile(
+		filepath.Join(sourceDir, "worker.go"),
+		[]byte("package worker\n\nimport _ \"github.com/compozy/compozy/internal/daemon\"\n"),
+		0o644,
+	); err != nil {
+		t.Fatalf("os.WriteFile(worker.go) error = %v", err)
+	}
+
+	violations, err := verifyImportBoundaries(root)
+	if err != nil {
+		t.Fatalf("verifyImportBoundaries() error = %v", err)
+	}
+	if len(violations) != 1 {
+		t.Fatalf("verifyImportBoundaries() violations = %d, want 1", len(violations))
+	}
+}
+
+func TestVerifyImportBoundariesAllowsDaemonSubpackages(t *testing.T) {
+	root := t.TempDir()
+	if err := os.WriteFile(
+		filepath.Join(root, "go.mod"),
+		[]byte("module github.com/compozy/compozy\n"),
+		0o644,
+	); err != nil {
+		t.Fatalf("os.WriteFile(go.mod) error = %v", err)
+	}
+
+	sourceDir := filepath.Join(root, "internal", "daemon", "subsystem")
+	if err := os.MkdirAll(sourceDir, 0o755); err != nil {
+		t.Fatalf("os.MkdirAll(sourceDir) error = %v", err)
+	}
+	if err := os.WriteFile(
+		filepath.Join(sourceDir, "subsystem.go"),
+		[]byte("package subsystem\n\nimport _ \"github.com/compozy/compozy/internal/cli\"\n"),
+		0o644,
+	); err != nil {
+		t.Fatalf("os.WriteFile(subsystem.go) error = %v", err)
+	}
+
+	violations, err := verifyImportBoundaries(root)
+	if err != nil {
+		t.Fatalf("verifyImportBoundaries() error = %v", err)
+	}
+	if len(violations) != 0 {
+		t.Fatalf("verifyImportBoundaries() violations = %d, want 0", len(violations))
+	}
+}
+
+func TestVerifyImportBoundariesDoesNotExemptHTTPPackages(t *testing.T) {
+	root := t.TempDir()
+	if err := os.WriteFile(
+		filepath.Join(root, "go.mod"),
+		[]byte("module github.com/compozy/compozy\n"),
+		0o644,
+	); err != nil {
+		t.Fatalf("os.WriteFile(go.mod) error = %v", err)
+	}
+
+	sourceDir := filepath.Join(root, "internal", "api", "httpapi")
+	if err := os.MkdirAll(sourceDir, 0o755); err != nil {
+		t.Fatalf("os.MkdirAll(sourceDir) error = %v", err)
+	}
+	if err := os.WriteFile(
+		filepath.Join(sourceDir, "handler.go"),
+		[]byte("package httpapi\n\nimport _ \"github.com/compozy/compozy/internal/cli\"\n"),
+		0o644,
+	); err != nil {
+		t.Fatalf("os.WriteFile(handler.go) error = %v", err)
+	}
+
+	violations, err := verifyImportBoundaries(root)
+	if err != nil {
+		t.Fatalf("verifyImportBoundaries() error = %v", err)
+	}
+	if len(violations) != 1 {
+		t.Fatalf("verifyImportBoundaries() violations = %d, want 1", len(violations))
+	}
+}
+
+func TestStopSessionsIgnoresNotFoundAndHandlesNilManager(t *testing.T) {
+	d, err := New(WithLogger(discardLogger()))
+	if err != nil {
+		t.Fatalf("New() error = %v", err)
+	}
+	if err := d.stopSessions(testutil.Context(t), nil); err != nil {
+		t.Fatalf("stopSessions(nil) error = %v", err)
+	}
+
+	manager := &fakeSessionManager{
+		infos: []*session.Info{{ID: "sess-a"}},
+		stopErr: func(id string) error {
+			return fmt.Errorf("%w: %s", session.ErrSessionNotFound, id)
+		},
+	}
+	if err := d.stopSessions(testutil.Context(t), manager); err != nil {
+		t.Fatalf("stopSessions(not found) error = %v", err)
+	}
+}
+
+type quiescingSessionManager struct {
+	*fakeSessionManager
+	quiescedBeforeStop *bool
+}
+
+func (m quiescingSessionManager) QuiesceReplyWatches(context.Context) error {
+	*m.quiescedBeforeStop = len(m.stopWithCauseCalls) == 0
+	return nil
+}
+
+// Invariant: reply watches close before sessions stop, so a target settling during shutdown cannot resume
+// a sender being stopped. Owner: daemon shutdown suite.
+func TestShutdownRuntimeSessionsQuiescesReplyWatchesFirst(t *testing.T) {
+	d, err := New(WithLogger(discardLogger()))
+	if err != nil {
+		t.Fatalf("New() error = %v", err)
+	}
+	quiesced := false
+	manager := quiescingSessionManager{
+		fakeSessionManager: &fakeSessionManager{infos: []*session.Info{{ID: "sess-a"}}},
+		quiescedBeforeStop: &quiesced,
+	}
+	var errs []error
+	d.shutdownRuntimeSessions(
+		testutil.Context(t),
+		&shutdownTargets{sessions: manager},
+		&errs,
+	)
+	if len(errs) != 0 || !quiesced || len(manager.stopWithCauseCalls) != 1 {
+		t.Fatalf("errs=%v quiescedBeforeStop=%t stops=%d", errs, quiesced, len(manager.stopWithCauseCalls))
+	}
+}
+
+type preparedShutdownSessionManager struct {
+	*fakeSessionManager
+}
+
+func (preparedShutdownSessionManager) DaemonShutdownStop() (session.StopCause, string, bool) {
+	cause, detail := session.DaemonShutdownStopCause(true)
+	return cause, detail, true
+}
+
+func TestStopSessionsUsesPreparedShutdownCause(t *testing.T) {
+	t.Run("Should stop sessions with the restart decision captured when shutdown was prepared", func(t *testing.T) {
+		d, err := New(WithLogger(discardLogger()))
+		if err != nil {
+			t.Fatalf("New() error = %v", err)
+		}
+		d.restartRequested = false
+
+		manager := preparedShutdownSessionManager{&fakeSessionManager{infos: []*session.Info{{ID: "sess-a"}}}}
+		if err := d.stopSessions(testutil.Context(t), manager); err != nil {
+			t.Fatalf("stopSessions() error = %v", err)
+		}
+		if got := len(manager.stopWithCauseCalls); got != 1 {
+			t.Fatalf("StopWithCause() calls = %d, want 1", got)
+		}
+		if call := manager.stopWithCauseCalls[0]; call.cause != session.CauseShutdown ||
+			call.detail != "Interrupted by daemon restart." {
+			t.Fatalf("StopWithCause() = %v %q, want the prepared restart classification", call.cause, call.detail)
+		}
+	})
+}
+
+func TestStopSessionsUsesShutdownCauseWhenSupported(t *testing.T) {
+	d, err := New(WithLogger(discardLogger()))
+	if err != nil {
+		t.Fatalf("New() error = %v", err)
+	}
+	d.restartRequested = true
+
+	manager := &fakeSessionManager{
+		infos: []*session.Info{{ID: "sess-a"}},
+	}
+	if err := d.stopSessions(testutil.Context(t), manager); err != nil {
+		t.Fatalf("stopSessions() error = %v", err)
+	}
+
+	if got := len(manager.stopWithCauseCalls); got != 1 {
+		t.Fatalf("StopWithCause() calls = %d, want 1", got)
+	}
+	call := manager.stopWithCauseCalls[0]
+	if call.id != "sess-a" {
+		t.Fatalf("StopWithCause() id = %q, want %q", call.id, "sess-a")
+	}
+	if call.cause != session.CauseShutdown {
+		t.Fatalf("StopWithCause() cause = %v, want %v", call.cause, session.CauseShutdown)
+	}
+	if call.detail != "Interrupted by daemon restart." {
+		t.Fatalf("StopWithCause() detail = %q, want restart attribution", call.detail)
+	}
+	if got := len(manager.stopCalls); got != 0 {
+		t.Fatalf("Stop() calls = %d, want 0 when StopWithCause is available", got)
+	}
+}
+
+func TestStopSessionsWaitsForInFlightFinalizations(t *testing.T) {
+	d, err := New(WithLogger(discardLogger()))
+	if err != nil {
+		t.Fatalf("New() error = %v", err)
+	}
+
+	release := make(chan struct{})
+	manager := &fakeSessionManager{
+		infos:                    []*session.Info{{ID: "sess-a"}},
+		waitFinalizationsRelease: release,
+	}
+
+	stopDone := make(chan error, 1)
+	go func() {
+		stopDone <- d.stopSessions(testutil.Context(t), manager)
+	}()
+
+	select {
+	case err := <-stopDone:
+		t.Fatalf("stopSessions() returned before finalizations completed: %v", err)
+	case <-time.After(50 * time.Millisecond):
+	}
+
+	close(release)
+
+	if err := <-stopDone; err != nil {
+		t.Fatalf("stopSessions() error = %v", err)
+	}
+	if got := manager.waitFinalizationsCalls; got != 1 {
+		t.Fatalf("WaitForFinalizations() calls = %d, want 1", got)
+	}
+}
+
+func TestShutdownRuntimeWorkersDrainsFinalizationsBeforeSessionManager(t *testing.T) {
+	t.Parallel()
+
+	t.Run("Should drain session finalizations before session manager shutdown", func(t *testing.T) {
+		t.Parallel()
+
+		order := make([]string, 0, 3)
+		manager := &fakeSessionManager{
+			waitFinalizationsHook: func() { order = append(order, "session-finalizations") },
+			shutdownHook:          func() { order = append(order, "session-manager") },
+		}
+		d := &Daemon{}
+		var shutdownErrs []error
+
+		d.shutdownRuntimeWorkers(testutil.Context(t), &shutdownTargets{
+			sessions: manager,
+		}, &shutdownErrs)
+
+		if err := errors.Join(shutdownErrs...); err != nil {
+			t.Fatalf("shutdownRuntimeWorkers() error = %v", err)
+		}
+		want := []string{"session-finalizations", "session-manager"}
+		if !slices.Equal(order, want) {
+			t.Fatalf("shutdown order = %v, want %v", order, want)
+		}
+	})
+
+	t.Run("Should drain workspace deletion ownership before session shutdown", func(t *testing.T) {
+		t.Parallel()
+
+		order := make([]string, 0, 3)
+		manager := &fakeSessionManager{
+			waitFinalizationsHook: func() { order = append(order, "session-finalizations") },
+			shutdownHook:          func() { order = append(order, "session-manager") },
+		}
+		finalizer := workspaceUnregisterFinalizerFunc(func(context.Context) error {
+			order = append(order, "workspace-finalizations")
+			return nil
+		})
+		d := &Daemon{}
+		var shutdownErrs []error
+
+		d.shutdownRuntimeWorkers(testutil.Context(t), &shutdownTargets{
+			workspaceFinalizer: finalizer,
+			sessions:           manager,
+		}, &shutdownErrs)
+
+		if err := errors.Join(shutdownErrs...); err != nil {
+			t.Fatalf("shutdownRuntimeWorkers() error = %v", err)
+		}
+		want := []string{"workspace-finalizations", "session-finalizations", "session-manager"}
+		if !slices.Equal(order, want) {
+			t.Fatalf("shutdown order = %v, want %v", order, want)
+		}
+	})
+}
+
+func TestShutdownServersAndHooksDrainsSupportAfterServers(t *testing.T) {
+	t.Parallel()
+
+	order := make([]string, 0, 3)
+	d := &Daemon{}
+	var shutdownErrs []error
+	d.shutdownServersAndHooks(testutil.Context(t), &shutdownTargets{
+		httpServer: &fakeServer{name: "http", onShutdown: func() { order = append(order, "http") }},
+		udsServer:  &fakeServer{name: "uds", onShutdown: func() { order = append(order, "uds") }},
+		supportBundles: supportBundleShutdownerFunc(func(context.Context) error {
+			order = append(order, "support")
+			return nil
+		}),
+	}, &shutdownErrs)
+
+	if err := errors.Join(shutdownErrs...); err != nil {
+		t.Fatalf("shutdownServersAndHooks() error = %v", err)
+	}
+	want := []string{"http", "uds", "support"}
+	if !slices.Equal(order, want) {
+		t.Fatalf("shutdown order = %v, want %v", order, want)
+	}
+}
+
+func orphanTestSessions(t *testing.T, started time.Time) []*session.Info {
+	t.Helper()
+	return []*session.Info{{ID: "sess-orphan", State: session.StateStopping, Liveness: &store.SessionLivenessMeta{
+		SubprocessPID: 1001, SubprocessStartedAt: &started,
+	}}}
+}
+
+func TestOptionsConfigureDaemon(t *testing.T) {
+	homePaths := testHomePaths(t)
+	cfg := testConfig(t, homePaths)
+	signalCh := make(chan os.Signal, 1)
+	httpFactory := func(context.Context, RuntimeDeps) (Server, error) { return &fakeServer{name: "http"}, nil }
+	udsFactory := func(context.Context, RuntimeDeps) (Server, error) { return &fakeServer{name: "uds"}, nil }
+	gatewayFactory := func(
+		context.Context,
+		*RuntimeDeps,
+		gateway.Tier,
+		[]gateway.Surface,
+	) (Server, error) {
+		return &fakeServer{name: "gateway"}, nil
+	}
+	now := time.Date(2026, 4, 3, 15, 0, 0, 0, time.UTC)
+
+	d, err := New(
+		WithHomePaths(homePaths),
+		WithConfigLoader(func() (compozyconfig.Config, error) { return cfg, nil }),
+		WithLogger(discardLogger()),
+		WithNow(func() time.Time { return now }),
+		WithHTTPServerFactory(httpFactory),
+		WithUDSServerFactory(udsFactory),
+		WithGatewayTierServerFactory(gatewayFactory),
+		WithSignalBridge(signalCh),
+		WithBoundaryVerification(true),
+	)
+	if err != nil {
+		t.Fatalf("New() error = %v", err)
+	}
+
+	if got, err := d.loadConfig(); err != nil {
+		t.Fatalf("loadConfig() error = %v", err)
+	} else if got.HTTP.Port != cfg.HTTP.Port {
+		t.Fatalf("loadConfig() port = %d, want %d", got.HTTP.Port, cfg.HTTP.Port)
+	}
+	if got := d.now(); !got.Equal(now) {
+		t.Fatalf("now() = %v, want %v", got, now)
+	}
+	if d.signalCh != signalCh {
+		t.Fatal("WithSignalBridge() did not apply")
+	}
+	if !d.verifyBoundaries {
+		t.Fatal("WithBoundaryVerification(true) did not apply")
+	}
+	gatewayServer, err := d.gatewayTierFactory(
+		testutil.Context(t),
+		&RuntimeDeps{},
+		gateway.TierPrivate,
+		[]gateway.Surface{gateway.SurfaceOperatorUI},
+	)
+	if err != nil {
+		t.Fatalf("gatewayTierFactory() error = %v", err)
+	}
+	if got, ok := gatewayServer.(*fakeServer); !ok || got.name != "gateway" {
+		t.Fatalf("gatewayTierFactory() = %#v, want gateway sentinel", gatewayServer)
+	}
+}
+
+func TestBootConfigEnsuresManagedAgents(t *testing.T) {
+	t.Parallel()
+
+	t.Run("Should ensure the default managed agent definitions", func(t *testing.T) {
+		t.Parallel()
+
+		homePaths := testHomePaths(t)
+		cfg := testConfig(t, homePaths)
+		d := newTestDaemon(t, homePaths, &cfg)
+		state := &bootState{}
+		cleanup := &bootCleanup{}
+
+		if err := d.bootConfig(state, cleanup); err != nil {
+			t.Fatalf("bootConfig() error = %v", err)
+		}
+
+		for _, name := range []string{compozyconfig.DefaultAgentName} {
+			agent, err := compozyconfig.LoadAgentDef(name, homePaths)
+			if err != nil {
+				t.Fatalf("LoadAgentDef(%s) error = %v", name, err)
+			}
+			if agent.Name != name {
+				t.Fatalf("LoadAgentDef(%s).Name = %q, want %q", name, agent.Name, name)
+			}
+		}
+	})
+}
+
+// TestBootConfigRoutesConfigAliasWarningToDaemonLog owns FR-006: the boot-time [agents.stays_on]
+// warning from the daemon's first config load lands once in the daemon log and never on
+// slog.Default. It swaps process-wide loggers, so it does not run in parallel.
+func TestBootConfigRoutesConfigAliasWarningToDaemonLog(t *testing.T) {
+	var stray, daemonLog bytes.Buffer
+	previous := slog.Default()
+	slog.SetDefault(slog.New(slog.NewTextHandler(&stray, nil)))
+	compozyconfig.RouteDeprecationWarnings(nil)
+	t.Cleanup(func() {
+		compozyconfig.RouteDeprecationWarnings(nil)
+		slog.SetDefault(previous)
+	})
+
+	homePaths := testHomePaths(t)
+	if err := os.WriteFile(
+		homePaths.ConfigFile,
+		[]byte("[agents.stays_on]\napproval_timeout = \"2h\"\n"),
+		0o600,
+	); err != nil {
+		t.Fatal(err)
+	}
+	d := newTestDaemon(t, homePaths, nil)
+	d.logger = slog.New(slog.NewTextHandler(&daemonLog, nil))
+	d.loadConfig = func() (compozyconfig.Config, error) { return loadConfigFromHome(homePaths, d.getenv) }
+
+	state := &bootState{}
+	if err := d.bootConfig(state, &bootCleanup{}); err != nil {
+		t.Fatalf("bootConfig() error = %v", err)
+	}
+	if _, err := d.loadConfig(); err != nil {
+		t.Fatalf("second loadConfig() error = %v", err)
+	}
+	if state.cfg.Agents.AlwaysOn.ApprovalTimeout != 2*time.Hour {
+		t.Fatalf("ApprovalTimeout = %v, want 2h", state.cfg.Agents.AlwaysOn.ApprovalTimeout)
+	}
+	if got := strings.Count(daemonLog.String(), "agents.stays_on is deprecated"); got != 1 ||
+		!strings.Contains(daemonLog.String(), "level=WARN") ||
+		!strings.Contains(daemonLog.String(), "keys=approval_timeout") {
+		t.Fatalf("daemon log = %q, want one WARN naming keys=approval_timeout", daemonLog.String())
+	}
+	if strings.Contains(stray.String(), "agents.stays_on") {
+		t.Fatalf("slog.Default received %q, want the warning only in the daemon log", stray.String())
+	}
+}
+
+func TestRunShutsDownOnInjectedSignal(t *testing.T) {
+	homePaths := testHomePaths(t)
+	cfg := testConfig(t, homePaths)
+	signalCh := make(chan os.Signal, 1)
+	const waitTimeout = 5 * time.Second
+
+	d := newTestDaemon(t, homePaths, &cfg)
+	d.signalCh = signalCh
+	d.acquireLock = func(path string, _ int) (*Lock, error) {
+		return &Lock{path: path}, nil
+	}
+	d.openRegistry = func(context.Context, string) (Registry, error) {
+		return &recordingRegistry{path: homePaths.DatabaseFile}, nil
+	}
+	lifecycleErrors := make(chan error, 2)
+	d.newSessionManager = func(ctx context.Context, _ SessionManagerDeps) (SessionManager, error) {
+		return &fakeSessionManager{
+			waitFinalizationsHook: func() { lifecycleErrors <- ctx.Err() },
+			shutdownHook:          func() { lifecycleErrors <- ctx.Err() },
+		}, nil
+	}
+	d.newObserver = func(context.Context, RuntimeDeps) (Observer, error) {
+		return &fakeObserver{}, nil
+	}
+	d.httpFactory = func(context.Context, RuntimeDeps) (Server, error) {
+		return &fakeServer{name: "http"}, nil
+	}
+	d.udsFactory = func(context.Context, RuntimeDeps) (Server, error) {
+		return &fakeServer{name: "uds"}, nil
+	}
+
+	errCh := make(chan error, 1)
+	go func() {
+		errCh <- d.Run(t.Context())
+	}()
+
+	select {
+	case <-d.readyCh:
+	case err := <-errCh:
+		t.Fatalf("Run() exited before signaling ready: %v", err)
+	case <-time.After(waitTimeout):
+		t.Fatal("Run() did not signal ready after boot")
+	}
+	signalCh <- syscall.SIGTERM
+
+	select {
+	case err := <-errCh:
+		if err != nil {
+			t.Fatalf("Run() error = %v", err)
+		}
+	case <-time.After(waitTimeout):
+		t.Fatal("Run() did not shut down after injected signal")
+	}
+	for phase, want := range []string{"session finalization", "session manager shutdown"} {
+		select {
+		case err := <-lifecycleErrors:
+			if err != nil {
+				t.Fatalf("runtime context during %s = %v, want active", want, err)
+			}
+		case <-time.After(waitTimeout):
+			t.Fatalf("missing runtime context observation for phase %d (%s)", phase, want)
+		}
+	}
+}
+
+func TestGracefulShutdownTimeout(t *testing.T) {
+	t.Parallel()
+	t.Run("Should reserve drain grace and the complete parallel termination ladder", func(t *testing.T) {
+		t.Parallel()
+		cfg := compozyconfig.DefaultWithHome(testHomePaths(t))
+		d := &Daemon{config: cfg}
+		want := defaultShutdownTimeout + cfg.Daemon.ShutdownGrace + cfg.Session.Stop.CooperativeGrace + 10*time.Second
+		if got := d.gracefulShutdownTimeout(); got != want {
+			t.Fatalf("gracefulShutdownTimeout() = %s, want %s", got, want)
+		}
+	})
+}
+
+func TestRunAbortsCleanlyOnInjectedSignalDuringBoot(t *testing.T) {
+	t.Parallel()
+
+	homePaths := testHomePaths(t)
+	cfg := testConfig(t, homePaths)
+	signalCh := make(chan os.Signal, 1)
+	sessionFactoryStarted := make(chan struct{})
+	const waitTimeout = 5 * time.Second
+
+	d := newTestDaemon(t, homePaths, &cfg)
+	d.signalCh = signalCh
+
+	var (
+		eventsMu sync.Mutex
+		events   []string
+	)
+	recordEvent := func(event string) {
+		eventsMu.Lock()
+		defer eventsMu.Unlock()
+		events = append(events, event)
+	}
+	d.closeLogger = func() error {
+		recordEvent("logger")
+		return nil
+	}
+	d.openRegistry = func(context.Context, string) (Registry, error) {
+		return &recordingRegistry{
+			path: homePaths.DatabaseFile,
+			onClose: func() {
+				recordEvent("db")
+			},
+		}, nil
+	}
+	d.newSessionManager = func(ctx context.Context, _ SessionManagerDeps) (SessionManager, error) {
+		close(sessionFactoryStarted)
+		<-ctx.Done()
+		return nil, ctx.Err()
+	}
+
+	errCh := make(chan error, 1)
+	go func() {
+		errCh <- d.Run(t.Context())
+	}()
+
+	select {
+	case <-sessionFactoryStarted:
+	case err := <-errCh:
+		t.Fatalf("Run() exited before boot reached session manager: %v", err)
+	case <-time.After(waitTimeout):
+		t.Fatal("Run() did not reach cancellable boot step")
+	}
+
+	signalCh <- syscall.SIGTERM
+
+	select {
+	case err := <-errCh:
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("Run() error = %v, want context.Canceled", err)
+		}
+	case <-time.After(waitTimeout):
+		t.Fatal("Run() did not abort boot after injected signal")
+	}
+
+	lockBytes, err := os.ReadFile(homePaths.DaemonLock)
+	if err != nil {
+		t.Fatalf("os.ReadFile(daemon lock) error = %v", err)
+	}
+	t.Logf("daemon_lock=%s contents=%q", homePaths.DaemonLock, string(lockBytes))
+	if got := strings.TrimSpace(string(lockBytes)); got != "0" {
+		t.Fatalf("daemon lock = %q, want 0 after boot cleanup", got)
+	}
+	if _, err := ReadInfo(homePaths.DaemonInfo); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("ReadInfo(after boot abort) error = %v, want os.ErrNotExist", err)
+	}
+	t.Logf("daemon_info=%s removed=true", homePaths.DaemonInfo)
+	select {
+	case <-d.readyCh:
+		t.Fatal("readyCh closed even though boot was aborted")
+	default:
+	}
+
+	eventsMu.Lock()
+	gotEvents := append([]string(nil), events...)
+	eventsMu.Unlock()
+	wantEvents := []string{"db", "logger"}
+	if !testutil.EqualStringSlices(gotEvents, wantEvents) {
+		t.Fatalf("boot abort cleanup events = %#v, want %#v", gotEvents, wantEvents)
+	}
+	t.Logf("cleanup_events=%v", gotEvents)
+}
+
+const daemonGoleakHelperEnv = "COMPOZY_DAEMON_GOLEAK_HELPER"
+
+func TestDaemonGoleakHelperProcess(_ *testing.T) {
+	if os.Getenv(daemonGoleakHelperEnv) != "1" {
+		return
+	}
+
+	signalCh := make(chan os.Signal, 1)
+	signal.Notify(signalCh, syscall.SIGINT, syscall.SIGTERM)
+
+	select {
+	case <-signalCh:
+		signal.Stop(signalCh)
+		os.Exit(0)
+	case <-time.After(30 * time.Second):
+		signal.Stop(signalCh)
+		os.Exit(2)
+	}
+}
+
+func TestDaemonGoleakFullCycle(t *testing.T) {
+	defer goleak.VerifyNone(t, goleak.IgnoreCurrent())
+
+	homePaths := testHomePaths(t)
+	cfg := testConfig(t, homePaths)
+	signalCh := make(chan os.Signal, 1)
+	const waitTimeout = 5 * time.Second
+
+	manager := &goleakSessionManager{
+		fakeSessionManager: &fakeSessionManager{
+			infos: []*session.Info{{
+				ID:    "sess-goleak",
+				State: session.StateActive,
+			}},
+		},
+	}
+	d := newTestDaemon(t, homePaths, &cfg)
+	d.signalCh = signalCh
+	d.openRegistry = func(context.Context, string) (Registry, error) {
+		return &recordingRegistry{path: homePaths.DatabaseFile}, nil
+	}
+	d.newSessionManager = func(context.Context, SessionManagerDeps) (SessionManager, error) {
+		return manager, nil
+	}
+	d.newObserver = func(context.Context, RuntimeDeps) (Observer, error) {
+		return &fakeObserver{}, nil
+	}
+	d.httpFactory = func(context.Context, RuntimeDeps) (Server, error) {
+		return &fakeServer{name: "http"}, nil
+	}
+	d.udsFactory = func(context.Context, RuntimeDeps) (Server, error) {
+		return &fakeServer{name: "uds"}, nil
+	}
+
+	errCh := make(chan error, 1)
+	go func() {
+		errCh <- d.Run(t.Context())
+	}()
+
+	select {
+	case <-d.readyCh:
+	case err := <-errCh:
+		t.Fatalf("Run() exited before signaling ready: %v", err)
+	case <-time.After(waitTimeout):
+		t.Fatal("Run() did not signal ready")
+	}
+
+	bin, err := os.Executable()
+	if err != nil {
+		t.Fatalf("os.Executable() error = %v", err)
+	}
+	process, err := subprocess.Launch(testutil.Context(t), subprocess.LaunchConfig{
+		Command:          bin,
+		Args:             []string{"-test.run=TestDaemonGoleakHelperProcess"},
+		Env:              append(os.Environ(), daemonGoleakHelperEnv+"=1"),
+		DisableTransport: true,
+		ShutdownTimeout:  250 * time.Millisecond,
+		PostSignalGrace:  50 * time.Millisecond,
+		Logger:           discardLogger(),
+	})
+	if err != nil {
+		t.Fatalf("subprocess.Launch(helper) error = %v", err)
+	}
+	manager.setProcess(process)
+	t.Logf("managed_subprocess_pid=%d", process.PID())
+
+	signalCh <- syscall.SIGTERM
+	select {
+	case err := <-errCh:
+		if err != nil {
+			t.Fatalf("Run() shutdown error = %v", err)
+		}
+	case <-time.After(waitTimeout):
+		t.Fatal("Run() did not stop after signal")
+	}
+	if !manager.stopped() {
+		t.Fatal("session manager did not stop the managed subprocess during daemon shutdown")
+	}
+	select {
+	case <-process.Done():
+	case <-time.After(waitTimeout):
+		t.Fatal("managed subprocess did not exit after daemon shutdown")
+	}
+	if err := process.Wait(); err != nil {
+		t.Fatalf("managed subprocess wait error = %v; stderr=%s", err, process.Stderr())
+	}
+}
+
+func TestRunShutsDownWhenObserverRetentionStartFails(t *testing.T) {
+	t.Parallel()
+
+	t.Run("ShouldShutDownWhenObserverRetentionStartFails", func(t *testing.T) {
+		t.Parallel()
+
+		homePaths := testHomePaths(t)
+		cfg := testConfig(t, homePaths)
+		retentionErr := errors.New("retention start failed")
+		observer := &failingRetentionObserver{startErr: retentionErr}
+		httpShutdown := false
+		udsShutdown := false
+
+		d := newTestDaemon(t, homePaths, &cfg)
+		d.acquireLock = func(path string, _ int) (*Lock, error) {
+			return &Lock{path: path}, nil
+		}
+		d.openRegistry = func(context.Context, string) (Registry, error) {
+			return &recordingRegistry{path: homePaths.DatabaseFile}, nil
+		}
+		d.newSessionManager = func(context.Context, SessionManagerDeps) (SessionManager, error) {
+			return &fakeSessionManager{}, nil
+		}
+		d.newObserver = func(context.Context, RuntimeDeps) (Observer, error) {
+			return observer, nil
+		}
+		d.httpFactory = func(context.Context, RuntimeDeps) (Server, error) {
+			return &fakeServer{name: "http", onShutdown: func() { httpShutdown = true }}, nil
+		}
+		d.udsFactory = func(context.Context, RuntimeDeps) (Server, error) {
+			return &fakeServer{name: "uds", onShutdown: func() { udsShutdown = true }}, nil
+		}
+
+		err := d.Run(t.Context())
+		if !errors.Is(err, retentionErr) {
+			t.Fatalf("Run() error = %v, want retention start failure", err)
+		}
+		if !observer.shutdownCalled {
+			t.Fatal("observer.ShutdownRetention() was not called")
+		}
+		if !httpShutdown || !udsShutdown {
+			t.Fatalf("server shutdown flags = http:%v uds:%v, want both true", httpShutdown, udsShutdown)
+		}
+	})
+}
+
+func TestBoundariesUsesConfiguredRoot(t *testing.T) {
+	root := t.TempDir()
+	if err := os.WriteFile(
+		filepath.Join(root, "go.mod"),
+		[]byte("module github.com/compozy/compozy\n"),
+		0o644,
+	); err != nil {
+		t.Fatalf("os.WriteFile(go.mod) error = %v", err)
+	}
+	if err := os.MkdirAll(filepath.Join(root, "internal"), 0o755); err != nil {
+		t.Fatalf("os.MkdirAll(internal) error = %v", err)
+	}
+
+	d, err := New(WithLogger(discardLogger()))
+	if err != nil {
+		t.Fatalf("New() error = %v", err)
+	}
+	d.boundaryRoot = root
+
+	if err := d.Boundaries(testutil.Context(t)); err != nil {
+		t.Fatalf("Boundaries() error = %v", err)
+	}
+}
+
+func TestBoundariesReturnsViolations(t *testing.T) {
+	root := t.TempDir()
+	if err := os.WriteFile(
+		filepath.Join(root, "go.mod"),
+		[]byte("module github.com/compozy/compozy\n"),
+		0o644,
+	); err != nil {
+		t.Fatalf("os.WriteFile(go.mod) error = %v", err)
+	}
+	violatingDir := filepath.Join(root, "internal", "worker")
+	if err := os.MkdirAll(violatingDir, 0o755); err != nil {
+		t.Fatalf("os.MkdirAll(violatingDir) error = %v", err)
+	}
+	if err := os.WriteFile(
+		filepath.Join(violatingDir, "worker.go"),
+		[]byte("package worker\n\nimport _ \"github.com/compozy/compozy/internal/cli\"\n"),
+		0o644,
+	); err != nil {
+		t.Fatalf("os.WriteFile(worker.go) error = %v", err)
+	}
+
+	d, err := New(WithLogger(discardLogger()))
+	if err != nil {
+		t.Fatalf("New() error = %v", err)
+	}
+	d.boundaryRoot = root
+
+	if err := d.Boundaries(testutil.Context(t)); err == nil {
+		t.Fatal("Boundaries() error = nil, want violation")
+	}
+}
+
+func TestBoundariesUsesWorkingDirectoryWhenRootUnset(t *testing.T) {
+	root := t.TempDir()
+	if err := os.WriteFile(
+		filepath.Join(root, "go.mod"),
+		[]byte("module github.com/compozy/compozy\n"),
+		0o644,
+	); err != nil {
+		t.Fatalf("os.WriteFile(go.mod) error = %v", err)
+	}
+	if err := os.MkdirAll(filepath.Join(root, "internal"), 0o755); err != nil {
+		t.Fatalf("os.MkdirAll(internal) error = %v", err)
+	}
+
+	cwd, err := os.Getwd()
+	if err != nil {
+		t.Fatalf("os.Getwd() error = %v", err)
+	}
+	if err := os.Chdir(root); err != nil {
+		t.Fatalf("os.Chdir(root) error = %v", err)
+	}
+	t.Cleanup(func() {
+		if err := os.Chdir(cwd); err != nil {
+			t.Errorf("os.Chdir(%q) cleanup error = %v", cwd, err)
+		}
+	})
+
+	d, err := New(WithLogger(discardLogger()))
+	if err != nil {
+		t.Fatalf("New() error = %v", err)
+	}
+	if err := d.Boundaries(testutil.Context(t)); err != nil {
+		t.Fatalf("Boundaries() error = %v", err)
+	}
+}
+
+func TestLoadConfigFromHomeAppliesOverlayAndNormalizesSocket(t *testing.T) {
+	homePaths := testHomePaths(t)
+	if err := os.WriteFile(
+		homePaths.ConfigFile,
+		[]byte("[daemon]\nsocket = \"~/compozy-test.sock\"\n[http]\nport = 4242\n"),
+		0o644,
+	); err != nil {
+		t.Fatalf("os.WriteFile(config) error = %v", err)
+	}
+
+	cfg, err := loadConfigFromHome(homePaths, func(string) string { return "" })
+	if err != nil {
+		t.Fatalf("loadConfigFromHome() error = %v", err)
+	}
+	if got, want := cfg.HTTP.Port, 4242; got != want {
+		t.Fatalf("cfg.HTTP.Port = %d, want %d", got, want)
+	}
+	if !strings.Contains(cfg.Daemon.Socket, "compozy-test.sock") || !filepath.IsAbs(cfg.Daemon.Socket) {
+		t.Fatalf("cfg.Daemon.Socket = %q, want expanded absolute path", cfg.Daemon.Socket)
+	}
+}
+
+func TestLoadConfigFromHomeValidationError(t *testing.T) {
+	homePaths := testHomePaths(t)
+	if err := os.WriteFile(
+		homePaths.ConfigFile,
+		[]byte("[http]\nport = 70000\n"),
+		0o644,
+	); err != nil {
+		t.Fatalf("os.WriteFile(config) error = %v", err)
+	}
+
+	if _, err := loadConfigFromHome(homePaths, func(string) string { return "" }); err == nil {
+		t.Fatal("loadConfigFromHome(invalid config) error = nil, want non-nil")
+	}
+}
+
+func TestShouldVerifyBoundariesFromEnv(t *testing.T) {
+	d, err := New(WithLogger(discardLogger()))
+	if err != nil {
+		t.Fatalf("New() error = %v", err)
+	}
+	d.getenv = func(string) string { return "yes" }
+	if !d.shouldVerifyBoundaries() {
+		t.Fatal("shouldVerifyBoundaries() = false, want true")
+	}
+	d.verifyBoundaries = false
+	d.getenv = func(string) string { return "" }
+	if d.shouldVerifyBoundaries() {
+		t.Fatal("shouldVerifyBoundaries() = true, want false")
+	}
+	d.getenv = nil
+	if d.shouldVerifyBoundaries() {
+		t.Fatal("shouldVerifyBoundaries() with nil getenv = true, want false")
+	}
+	d.verifyBoundaries = true
+	if !d.shouldVerifyBoundaries() {
+		t.Fatal("shouldVerifyBoundaries() with explicit option = false, want true")
+	}
+}
+
+func TestSignalSourceDefaultsToOSSignalRegistration(t *testing.T) {
+	d, err := New(WithLogger(discardLogger()))
+	if err != nil {
+		t.Fatalf("New() error = %v", err)
+	}
+
+	ch, stop := d.signalSource()
+	if ch == nil {
+		t.Fatal("signalSource() bridge = nil")
+	}
+	stop()
+}
+
+func TestBootInjectsComposedAssemblerForFeatureFlagCombinations(t *testing.T) {
+	t.Parallel()
+
+	testCases := []struct {
+		name          string
+		skillsEnabled bool
+		wantSkills    bool
+	}{
+		{name: "Should compose startup with skills on", skillsEnabled: true, wantSkills: true},
+		{name: "Should compose startup with skills off", skillsEnabled: false, wantSkills: false},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			homePaths := testHomePaths(t)
+			cloneDaemonTestStoreSeed(t, homePaths.DatabaseFile)
+			cfg := testConfig(t, homePaths)
+			cfg.Skills.Enabled = tc.skillsEnabled
+
+			d := newTestDaemon(t, homePaths, &cfg)
+
+			var capturedDeps SessionManagerDeps
+			d.newSessionManager = func(_ context.Context, deps SessionManagerDeps) (SessionManager, error) {
+				capturedDeps = deps
+				return &fakeSessionManager{}, nil
+			}
+			d.newObserver = func(context.Context, RuntimeDeps) (Observer, error) {
+				return &fakeObserver{}, nil
+			}
+			d.httpFactory = func(_ context.Context, _ RuntimeDeps) (Server, error) {
+				return &fakeServer{name: "http"}, nil
+			}
+			d.udsFactory = func(context.Context, RuntimeDeps) (Server, error) {
+				return &fakeServer{name: "uds"}, nil
+			}
+
+			if err := d.boot(testutil.Context(t)); err != nil {
+				t.Fatalf("boot() error = %v", err)
+			}
+			t.Cleanup(func() {
+				if err := d.Shutdown(testutil.Context(t)); err != nil {
+					t.Fatalf("Shutdown() error = %v", err)
+				}
+			})
+
+			if capturedDeps.PromptAssembler == nil {
+				t.Fatal("boot() did not inject the composed prompt assembler")
+			}
+			if _, ok := capturedDeps.PromptAssembler.(session.StartupPromptAssembler); !ok {
+				t.Fatal("boot() did not inject a startup-aware prompt assembler")
+			}
+			if capturedDeps.StartupPromptOverlay == nil {
+				t.Fatal("boot() did not inject the Compozy runtime startup prompt overlay")
+			}
+			if capturedDeps.PromptInputAugmenter == nil {
+				t.Fatal("boot() did not inject the prompt input augmenter")
+			}
+			if capturedDeps.WorkspaceResolver == nil {
+				t.Fatal("boot() did not inject the workspace resolver")
+			}
+			if d.workspaceResolver == nil {
+				t.Fatal("boot() did not retain the workspace resolver")
+			}
+			if got := d.skillsRegistry != nil; got != tc.wantSkills {
+				t.Fatalf("skills registry initialized = %t, want %t", got, tc.wantSkills)
+			}
+
+			workspace := filepath.Join(t.TempDir(), "workspace")
+			workspaceRef := workspacepkg.ResolvedWorkspace{
+				RootDir: workspace,
+				Agents:  []compozyconfig.AgentDef{testPromptAgent("Base prompt.")},
+			}
+			prompt, err := capturedDeps.PromptAssembler.Assemble(
+				t.Context(),
+				testPromptAgent("Base prompt."),
+				&workspaceRef,
+			)
+			if err != nil {
+				t.Fatalf("PromptAssembler.Assemble() error = %v", err)
+			}
+
+			assertPromptContainsInOrder(t, prompt, orderedFragments(tc.wantSkills)...)
+			assertPromptExcludes(t, prompt, excludedFragments(tc.wantSkills)...)
+
+			if tc.wantSkills {
+				if skills := d.skillsRegistry.List(); len(skills) == 0 {
+					t.Fatal("skills registry list = empty, want bundled skills")
+				}
+			}
+		})
+	}
+}
+
+func TestBootCreatesWorkspaceResolverAndInjectsSessionManager(t *testing.T) {
+	t.Parallel()
+
+	t.Run("Should wire session dependencies and both transport services before serving", func(t *testing.T) {
+		t.Parallel()
+
+		homePaths := testHomePaths(t)
+		cfg := testConfig(t, homePaths)
+
+		var capturedDeps SessionManagerDeps
+		var capturedHTTPDeps RuntimeDeps
+		var capturedUDSDeps RuntimeDeps
+		sessions := &fakeSessionManager{}
+		d := newTestDaemon(t, homePaths, &cfg)
+		d.newSessionManager = func(_ context.Context, deps SessionManagerDeps) (SessionManager, error) {
+			capturedDeps = deps
+			return sessions, nil
+		}
+		d.newObserver = func(context.Context, RuntimeDeps) (Observer, error) {
+			return &fakeObserver{}, nil
+		}
+		d.httpFactory = func(_ context.Context, deps RuntimeDeps) (Server, error) {
+			capturedHTTPDeps = deps
+			return &fakeServer{name: "http"}, nil
+		}
+		d.udsFactory = func(_ context.Context, deps RuntimeDeps) (Server, error) {
+			capturedUDSDeps = deps
+			return &fakeServer{name: "uds"}, nil
+		}
+
+		if err := d.boot(testutil.Context(t)); err != nil {
+			t.Fatalf("boot() error = %v", err)
+		}
+		t.Cleanup(func() {
+			if err := d.Shutdown(testutil.Context(t)); err != nil {
+				t.Fatalf("Shutdown() error = %v", err)
+			}
+		})
+
+		if capturedDeps.SessionAttachments == nil {
+			t.Fatal("session owner constructed before session attachment storage")
+		}
+		if capturedHTTPDeps.SessionAttachments == nil {
+			t.Fatal("http server constructed without session attachment storage")
+		}
+		if capturedUDSDeps.SessionAttachments == nil {
+			t.Fatal("uds server constructed without session attachment storage")
+		}
+		sessions.mu.Lock()
+		notifier := sessions.turnEndNotifier
+		sessions.mu.Unlock()
+		if notifier == nil {
+			t.Fatal("boot() did not bind the session turn-end notifier")
+		}
+
+		if d.workspaceResolver == nil {
+			t.Fatal("boot() did not create the daemon workspace resolver")
+		}
+		if capturedDeps.WorkspaceResolver == nil {
+			t.Fatal("boot() did not inject the session manager workspace resolver")
+		}
+		if capturedDeps.SpawnWakeNotifier == nil || capturedDeps.SpawnWakeNotifier != d.sessionWakeBridge {
+			t.Fatal("boot() did not inject the daemon-owned session wake bridge")
+		}
+		if capturedUDSDeps.WorkspaceService == nil {
+			t.Fatal("boot() did not inject the uds workspace service")
+		}
+		if capturedUDSDeps.WorkspaceService != d.workspaceResolver {
+			t.Fatal("boot() injected a different workspace service into uds")
+		}
+
+		workspaceRoot := filepath.Join(t.TempDir(), "workspace")
+		resolved := resolveDaemonWorkspace(t, capturedDeps.WorkspaceResolver, workspaceRoot)
+		if got, want := resolved.RootDir, canonicalDaemonRoot(t, workspaceRoot); got != want {
+			t.Fatalf("resolved workspace root = %q, want %q", got, want)
+		}
+	})
+}
+
+// TestWorkspaceRegistrationRefreshesHookBindings verifies workspace registration refreshes the hook bindings used by later events.
+func TestWorkspaceRegistrationRefreshesHookBindings(t *testing.T) {
+	t.Parallel()
+
+	t.Run("Should refresh config hooks after a workspace is registered", func(t *testing.T) {
+		t.Parallel()
+
+		homePaths := testHomePaths(t)
+		cloneDaemonTestStoreSeed(t, homePaths.DatabaseFile)
+		cfg := testConfig(t, homePaths)
+		cfg.Skills.Enabled = false
+		cfg.Automation.Enabled = false
+
+		d := newTestDaemon(t, homePaths, &cfg)
+		d.newSessionManager = func(context.Context, SessionManagerDeps) (SessionManager, error) {
+			return &fakeSessionManager{}, nil
+		}
+		d.newObserver = func(context.Context, RuntimeDeps) (Observer, error) {
+			return &fakeObserver{}, nil
+		}
+		d.httpFactory = func(context.Context, RuntimeDeps) (Server, error) {
+			return &fakeServer{name: "http"}, nil
+		}
+		d.udsFactory = func(context.Context, RuntimeDeps) (Server, error) {
+			return &fakeServer{name: "uds"}, nil
+		}
+
+		if err := d.boot(testutil.Context(t)); err != nil {
+			t.Fatalf("boot() error = %v", err)
+		}
+		t.Cleanup(func() {
+			if err := d.Shutdown(testutil.Context(t)); err != nil {
+				t.Fatalf("Shutdown() error = %v", err)
+			}
+		})
+
+		hooksRuntime, ok := d.hooks.(*hookspkg.Hooks)
+		if !ok {
+			t.Fatalf("daemon hooks runtime = %T, want *hooks.Hooks", d.hooks)
+		}
+
+		workspaceRoot := filepath.Join(t.TempDir(), "workspace")
+		writeDaemonFile(t, filepath.Join(workspaceRoot, ".compozy", "config.toml"), `
+[[hooks.declarations]]
+name = "workspace-register-hook"
+event = "session.post_create"
+mode = "sync"
+command = "/bin/sh"
+args = ["-c", "printf '{}'"]
+`)
+
+		resolved, err := d.workspaceResolver.ResolveOrRegister(testutil.Context(t), workspaceRoot)
+		if err != nil {
+			t.Fatalf("ResolveOrRegister() error = %v", err)
+		}
+
+		waitForCondition(t, "workspace hook binding refresh", func() bool {
+			entries, catalogErr := hooksRuntime.Catalog(hookspkg.CatalogFilter{
+				WorkspaceID: resolved.ID,
+				Event:       hookspkg.HookSessionPostCreate,
+			})
+			if catalogErr != nil {
+				t.Fatalf("Catalog() error = %v", catalogErr)
+			}
+			for _, entry := range entries {
+				if entry.Name == "workspace-register-hook" && entry.Source == hookspkg.HookSourceConfig {
+					return true
+				}
+			}
+			return false
+		})
+	})
+}
+
+func TestBootResourceWatchersStartAndSkillsWatcherRefreshes(t *testing.T) {
+	t.Parallel()
+
+	t.Run("Should reject personal profile roots inside a workspace before watching skills", func(t *testing.T) {
+		t.Parallel()
+		home := testHomePaths(t)
+		root := t.TempDir()
+		if err := os.MkdirAll(home.ProfilesDir, 0o755); err != nil {
+			t.Fatal(err)
+		}
+		profileRoot := filepath.Join(home.ProfilesDir, compozyconfig.DefaultProfileDirName)
+		if err := os.Rename(profileRoot, profileRoot+".original"); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Symlink(root, profileRoot); err != nil {
+			t.Fatal(err)
+		}
+		registry := &recordingRegistry{workspaces: map[string]workspacepkg.Workspace{
+			"ws_containment": {ID: "ws_containment", Name: "repo", RootDir: root},
+		}}
+		for _, provider := range []func(context.Context) ([]string, error){
+			workspaceSkillWatcherRoots(home, registry, nil),
+			workspaceAgentWatcherRoots(home, registry, nil),
+		} {
+			roots, err := provider(t.Context())
+			if err == nil || !strings.Contains(err.Error(), "cannot be inside registered workspace") {
+				t.Fatalf("roots = %v, error = %v; want personal profile containment refusal", roots, err)
+			}
+		}
+	})
+
+	t.Run("Should refresh skills and stop resource watchers before sessions", func(t *testing.T) {
+		t.Parallel()
+
+		homePaths := testHomePaths(t)
+		cfg := testConfig(t, homePaths)
+		cfg.Skills.Enabled = true
+		cfg.Skills.PollInterval = 10 * time.Millisecond
+
+		var skillsDone <-chan struct{}
+		sessions := &fakeSessionManager{
+			infos: []*session.Info{{ID: "sess-a"}},
+			onStop: func(string) {
+				select {
+				case <-skillsDone:
+				default:
+					t.Error("skills watcher was still running when session shutdown started")
+				}
+			},
+		}
+		d := newTestDaemon(t, homePaths, &cfg)
+		d.newSessionManager = func(context.Context, SessionManagerDeps) (SessionManager, error) {
+			return sessions, nil
+		}
+		d.newObserver = func(context.Context, RuntimeDeps) (Observer, error) {
+			return &fakeObserver{}, nil
+		}
+		d.httpFactory = func(context.Context, RuntimeDeps) (Server, error) {
+			return &fakeServer{name: "http"}, nil
+		}
+		d.udsFactory = func(context.Context, RuntimeDeps) (Server, error) {
+			return &fakeServer{name: "uds"}, nil
+		}
+
+		if err := d.boot(testutil.Context(t)); err != nil {
+			t.Fatalf("boot() error = %v", err)
+		}
+
+		registry := d.skillsRegistry
+		if registry == nil {
+			t.Fatal("boot() did not initialize the skills registry")
+		}
+		skillsDone = d.skillsDone
+		if skillsDone == nil {
+			t.Fatal("boot() did not start the skills watcher")
+		}
+		loopsDone := d.loopsDone
+		if loopsDone == nil {
+			t.Fatal("boot() did not start the loops watcher after configuring extension publishers")
+		}
+
+		writeDaemonSkill(t, homePaths.SkillsDir, "watched-skill", "Global watched skill")
+		waitForCondition(t, "watcher refresh after boot", func() bool {
+			_, ok := registry.Get("watched-skill")
+			return ok
+		})
+
+		if err := d.Shutdown(testutil.Context(t)); err != nil {
+			t.Fatalf("Shutdown() error = %v", err)
+		}
+		select {
+		case <-skillsDone:
+		default:
+			t.Fatal("skills watcher was still running after shutdown")
+		}
+		select {
+		case <-loopsDone:
+		default:
+			t.Fatal("loops watcher was still running after shutdown")
+		}
+		versionAfterShutdown := registry.GlobalVersion()
+
+		writeDaemonSkill(
+			t,
+			homePaths.SkillsDir,
+			"after-shutdown",
+			"Should not be observed",
+		)
+
+		if got := registry.GlobalVersion(); got != versionAfterShutdown {
+			t.Fatalf("registry version after shutdown file write = %d, want %d", got, versionAfterShutdown)
+		}
+		if _, ok := registry.Get("after-shutdown"); ok {
+			t.Fatal("skills watcher continued refreshing after shutdown")
+		}
+	})
+}
+
+func TestSkillsRegistryConfigUsesDaemonHomeAndDisabledSkills(t *testing.T) {
+	t.Parallel()
+
+	homePaths := testHomePaths(t)
+	cfg := testConfig(t, homePaths)
+	cfg.Skills.DisabledSkills = []string{"alpha", "beta"}
+
+	d := newTestDaemon(t, homePaths, &cfg)
+
+	registryCfg := d.skillsRegistryConfig(&cfg)
+	if registryCfg.BundledFS == nil {
+		t.Fatal("skillsRegistryConfig() BundledFS = nil")
+	}
+	canonicalSkillsDir, err := filepath.EvalSymlinks(homePaths.SkillsDir)
+	if err != nil {
+		t.Fatalf("EvalSymlinks(skills dir) error = %v", err)
+	}
+	if got := registryCfg.GlobalSkillRoots; len(got) != 2 || got[1].Dir != canonicalSkillsDir {
+		t.Fatalf("skillsRegistryConfig() GlobalSkillRoots = %#v, want agents plus compozy home", got)
+	}
+	if got, want := registryCfg.GlobalAgentsDir, homePaths.AgentsDir; got != want {
+		t.Fatalf("skillsRegistryConfig() GlobalAgentsDir = %q, want %q", got, want)
+	}
+	if got := registryCfg.DisabledSkills; len(got) != 2 || got[0] != "alpha" || got[1] != "beta" {
+		t.Fatalf("skillsRegistryConfig() DisabledSkills = %#v, want [alpha beta]", got)
+	}
+}
+
+func TestRemoveStaleSocketBehaviors(t *testing.T) {
+	socketPath := filepath.Join(t.TempDir(), "daemon.sock")
+	if err := removeStaleSocket(socketPath); err != nil {
+		t.Fatalf("removeStaleSocket(missing) error = %v", err)
+	}
+
+	if err := os.WriteFile(socketPath, []byte("stale"), 0o600); err != nil {
+		t.Fatalf("os.WriteFile(socket) error = %v", err)
+	}
+	if err := removeStaleSocket(socketPath); err != nil {
+		t.Fatalf("removeStaleSocket(file) error = %v", err)
+	}
+
+	dirPath := filepath.Join(t.TempDir(), "dir")
+	if err := os.MkdirAll(filepath.Join(dirPath, "child"), 0o755); err != nil {
+		t.Fatalf("os.MkdirAll(dirPath) error = %v", err)
+	}
+	if err := removeStaleSocket(dirPath); err == nil {
+		t.Fatal("removeStaleSocket(dir) error = nil, want non-nil")
+	}
+}
+
+func TestResolveDaemonPortUsesReporterWhenAvailable(t *testing.T) {
+	if got, want := resolveDaemonPort(2123, portReportingServer{port: 9090}), 9090; got != want {
+		t.Fatalf("resolveDaemonPort() = %d, want %d", got, want)
+	}
+	if got, want := resolveDaemonPort(2123, &fakeServer{name: "default"}), 2123; got != want {
+		t.Fatalf("resolveDaemonPort(default) = %d, want %d", got, want)
+	}
+}
+
+func TestProcessAliveAndRuntimeLoggerHelpers(t *testing.T) {
+	if procutil.Alive(0) {
+		t.Fatal("procutil.Alive(0) = true, want false")
+	}
+	if !procutil.Alive(os.Getpid()) {
+		t.Fatal("procutil.Alive(self) = false, want true")
+	}
+	if procutil.Alive(999999) && runtime.GOOS != "windows" {
+		t.Fatal("procutil.Alive(999999) = true, want false")
+	}
+
+	d, err := New()
+	if err != nil {
+		t.Fatalf("New() error = %v", err)
+	}
+	if got := d.runtimeLogger(); got == nil {
+		t.Fatal("runtimeLogger() = nil")
+	}
+}
+
+func TestInfoValidationAndReadFailures(t *testing.T) {
+	if err := (Info{}).Validate(); err == nil {
+		t.Fatal("Info.Validate() error = nil, want non-nil")
+	}
+	if err := (Info{PID: 1, Port: -1, StartedAt: time.Now().UTC()}).Validate(); err == nil {
+		t.Fatal("Info.Validate(invalid port) error = nil, want non-nil")
+	}
+	if err := (Info{PID: 1, Port: 1, StartedAt: time.Now().UTC()}).Validate(); err != nil {
+		t.Fatalf("Info.Validate(valid) error = %v", err)
+	}
+	if err := WriteInfo("", Info{}); err == nil {
+		t.Fatal("WriteInfo(blank path) error = nil, want non-nil")
+	}
+	if err := RemoveInfo(""); err != nil {
+		t.Fatalf("RemoveInfo(blank path) error = %v", err)
+	}
+
+	path := filepath.Join(t.TempDir(), "bad.json")
+	if err := os.WriteFile(path, []byte("{bad"), 0o644); err != nil {
+		t.Fatalf("os.WriteFile(bad.json) error = %v", err)
+	}
+	if _, err := ReadInfo(path); err == nil {
+		t.Fatal("ReadInfo(invalid JSON) error = nil, want non-nil")
+	}
+	if _, err := ReadInfo(""); err == nil {
+		t.Fatal("ReadInfo(blank path) error = nil, want non-nil")
+	}
+
+	validPath := filepath.Join(t.TempDir(), "nested", "daemon.json")
+	validInfo := Info{PID: 10, Port: 20, StartedAt: time.Now().UTC()}
+	if err := WriteInfo(validPath, validInfo); err != nil {
+		t.Fatalf("WriteInfo(valid path) error = %v", err)
+	}
+	if err := syncDir(filepath.Dir(validPath)); err != nil {
+		t.Fatalf("syncDir(valid dir) error = %v", err)
+	}
+	if err := RemoveInfo(filepath.Join(t.TempDir(), "missing.json")); err != nil {
+		t.Fatalf("RemoveInfo(missing file) error = %v", err)
+	}
+}
+
+func TestLockHelpersAndErrors(t *testing.T) {
+	lock := &Lock{path: "/tmp/daemon.lock"}
+	if got := lock.Path(); got != "/tmp/daemon.lock" {
+		t.Fatalf("lock.Path() = %q, want %q", got, "/tmp/daemon.lock")
+	}
+
+	err := errAlreadyRunning{pid: 42}
+	if !strings.Contains(err.Error(), "42") {
+		t.Fatalf("errAlreadyRunning.Error() = %q, want pid in message", err.Error())
+	}
+	if got := (errAlreadyRunning{}).Error(); got != ErrAlreadyRunning.Error() {
+		t.Fatalf("errAlreadyRunning{}.Error() = %q, want %q", got, ErrAlreadyRunning.Error())
+	}
+	if !errors.Is(err, ErrAlreadyRunning) {
+		t.Fatalf("errors.Is(errAlreadyRunning, ErrAlreadyRunning) = false, want true")
+	}
+
+	if _, err := AcquireLock("", 1); err == nil {
+		t.Fatal("AcquireLock(blank path) error = nil, want non-nil")
+	}
+	if _, err := AcquireLock(filepath.Join(t.TempDir(), "daemon.lock"), 0); err == nil {
+		t.Fatal("AcquireLock(invalid pid) error = nil, want non-nil")
+	}
+
+	released := false
+	if err := (&Lock{releaseFn: func() error { released = true; return nil }}).Release(); err != nil {
+		t.Fatalf("Lock.Release(releaseFn) error = %v", err)
+	}
+	if !released {
+		t.Fatal("Lock.Release() did not use injected release function")
+	}
+	if got := ((*Lock)(nil)).Path(); got != "" {
+		t.Fatalf("nil lock Path() = %q, want empty", got)
+	}
+	if got := ((*Lock)(nil)).StalePID(); got != 0 {
+		t.Fatalf("nil lock StalePID() = %d, want 0", got)
+	}
+	if err := ((*Lock)(nil)).Release(); err != nil {
+		t.Fatalf("nil lock Release() error = %v, want nil", err)
+	}
+
+	path := filepath.Join(t.TempDir(), "pid.lock")
+	if err := os.WriteFile(path, []byte("not-a-pid\n"), 0o644); err != nil {
+		t.Fatalf("os.WriteFile(pid.lock) error = %v", err)
+	}
+	if got, err := readLockPID(path); err != nil {
+		t.Fatalf("readLockPID(invalid contents) error = %v", err)
+	} else if got != 0 {
+		t.Fatalf("readLockPID(invalid contents) = %d, want 0", got)
+	}
+	if err := writeLockPID(path, 0); err != nil {
+		t.Fatalf("writeLockPID(0) error = %v", err)
+	}
+	if data, err := os.ReadFile(path); err != nil {
+		t.Fatalf("os.ReadFile(pid.lock) error = %v", err)
+	} else if string(data) != "0\n" {
+		t.Fatalf("writeLockPID(0) contents = %q, want 0 newline", string(data))
+	}
+}
+
+func waitForCondition(t *testing.T, label string, fn func() bool) {
+	t.Helper()
+	waitForConditionWithin(t, label, 2*time.Second, fn)
+}
+
+func waitForConditionWithin(t *testing.T, label string, timeout time.Duration, fn func() bool) {
+	t.Helper()
+
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		if fn() {
+			return
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	t.Fatalf("timed out waiting for %s", label)
+}
+
+func testHomePaths(t *testing.T) compozyconfig.HomePaths {
+	t.Helper()
+
+	homePaths, err := compozyconfig.ResolveHomePathsFrom(t.TempDir())
+	if err != nil {
+		t.Fatalf("ResolveHomePathsFrom() error = %v", err)
+	}
+	homePaths.DaemonSocket = shortSocketPath(t)
+	if err := compozyconfig.EnsureHomeLayout(homePaths); err != nil {
+		t.Fatalf("EnsureHomeLayout() error = %v", err)
+	}
+	return homePaths
+}
+
+func testConfig(t *testing.T, homePaths compozyconfig.HomePaths) compozyconfig.Config {
+	t.Helper()
+
+	cfg := compozyconfig.DefaultWithHome(homePaths)
+	cfg.HTTP.Host = "127.0.0.1"
+	cfg.HTTP.Port = freeTCPPort(t)
+	cfg.Daemon.Socket = homePaths.DaemonSocket
+	cfg.Automation.Enabled = false
+	return cfg
+}
+
+func testConfigPtr(t *testing.T, homePaths compozyconfig.HomePaths) *compozyconfig.Config {
+	t.Helper()
+
+	cfg := testConfig(t, homePaths)
+	return &cfg
+}
+
+func writeDaemonSkill(t *testing.T, root string, name string, description string) {
+	t.Helper()
+
+	content := fmt.Sprintf(`---
+name: %s
+description: %s
+---
+
+# %s
+`, name, description, name)
+	writeDaemonFile(t, filepath.Join(root, name, "SKILL.md"), content)
+}
+
+func writeDaemonFile(t *testing.T, path string, content string) {
+	t.Helper()
+
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		t.Fatalf("os.MkdirAll(%q) error = %v", filepath.Dir(path), err)
+	}
+	if err := os.WriteFile(path, []byte(content), 0o644); err != nil {
+		t.Fatalf("os.WriteFile(%q) error = %v", path, err)
+	}
+}
+
+func resolveDaemonWorkspace(
+	t *testing.T,
+	resolver workspacepkg.RuntimeResolver,
+	root string,
+) workspacepkg.ResolvedWorkspace {
+	t.Helper()
+
+	if resolver == nil {
+		t.Fatal("workspace resolver = nil")
+	}
+	if err := os.MkdirAll(root, 0o755); err != nil {
+		t.Fatalf("os.MkdirAll(%q) error = %v", root, err)
+	}
+
+	resolved, err := resolver.ResolveOrRegister(testutil.Context(t), root)
+	if err != nil {
+		t.Fatalf("ResolveOrRegister(%q) error = %v", root, err)
+	}
+	return resolved
+}
+
+func canonicalDaemonRoot(t *testing.T, root string) string {
+	t.Helper()
+
+	evaluated, err := filepath.EvalSymlinks(root)
+	if err != nil {
+		t.Fatalf("filepath.EvalSymlinks(%q) error = %v", root, err)
+	}
+	canonical, err := filepath.Abs(evaluated)
+	if err != nil {
+		t.Fatalf("filepath.Abs(%q) error = %v", evaluated, err)
+	}
+	return canonical
+}
+
+func orderedFragments(wantSkills bool) []string {
+	fragments := make([]string, 0, 6)
+	fragments = append(fragments, compozyRuntimeEnvelopeStart, "# Compozy Runtime", "Base prompt.")
+	if wantSkills {
+		fragments = append(fragments, "<available-skills>", "compozy")
+	}
+	if wantSkills {
+		fragments = append(fragments, "# CompozyOS")
+	} else {
+		fragments = append(fragments, "# Tools And Skills", "# Native Tools")
+	}
+	return fragments
+}
+
+func excludedFragments(wantSkills bool) []string {
+	fragments := []string{"# CompozyOS"}
+	if wantSkills {
+		fragments = []string{"# Tools And Skills", "# Native Tools"}
+	}
+	if !wantSkills {
+		fragments = append(fragments, "<available-skills>")
+	}
+	return fragments
+}
+
+func assertPromptContainsInOrder(t *testing.T, prompt string, fragments ...string) {
+	t.Helper()
+
+	searchFrom := 0
+	for _, fragment := range fragments {
+		if fragment == "" {
+			continue
+		}
+
+		offset := strings.Index(prompt[searchFrom:], fragment)
+		if offset < 0 {
+			t.Fatalf("prompt %q does not contain %q", prompt, fragment)
+		}
+		searchFrom += offset + len(fragment)
+	}
+}
+
+func assertPromptExcludes(t *testing.T, prompt string, fragments ...string) {
+	t.Helper()
+
+	for _, fragment := range fragments {
+		if fragment == "" {
+			continue
+		}
+		if strings.Contains(prompt, fragment) {
+			t.Fatalf("prompt %q contains unexpected fragment %q", prompt, fragment)
+		}
+	}
+}
+
+func newTestDaemon(t *testing.T, homePaths compozyconfig.HomePaths, cfg *compozyconfig.Config) *Daemon {
+	t.Helper()
+
+	if _, err := os.Stat(homePaths.DatabaseFile); errors.Is(err, os.ErrNotExist) {
+		if err := daemonTestStoreSeed.Clone(homePaths.DatabaseFile); err != nil {
+			t.Fatalf("daemon store seed Clone() error = %v", err)
+		}
+	} else if err != nil {
+		t.Fatalf("os.Stat(%q) error = %v", homePaths.DatabaseFile, err)
+	}
+	if cfg != nil {
+		// Host CPU load must not delay background work inside daemon tests.
+		cfg.Daemon.Load.AdmissionThreshold = 0
+	}
+	d, err := New(
+		WithHomePaths(homePaths),
+		WithConfig(cfg),
+		WithLogger(discardLogger()),
+	)
+	if err != nil {
+		t.Fatalf("New() error = %v", err)
+	}
+	d.getenv = func(key string) string {
+		if key == "HOME" {
+			return homePaths.HomeDir
+		}
+		return os.Getenv(key)
+	}
+	return d
+}
+
+func discardLogger() *slog.Logger {
+	return slog.New(slog.NewTextHandler(io.Discard, nil))
+}
+
+func strconvString(v int) string {
+	return fmt.Sprintf("%d", v)
+}
+
+func shortSocketPath(t *testing.T) string {
+	t.Helper()
+
+	path := filepath.Join(os.TempDir(), fmt.Sprintf("compozy-%d.sock", time.Now().UTC().UnixNano()))
+	t.Cleanup(func() {
+		if err := os.Remove(path); err != nil && !errors.Is(err, os.ErrNotExist) {
+			t.Errorf("remove short socket path %q: %v", path, err)
+		}
+	})
+	return path
+}
+
+func freeTCPPort(t *testing.T) int {
+	t.Helper()
+	return testutil.FreeTCPPort(t)
+}
+
+func TestDetachedHarnessDaemonScenarios(t *testing.T) {
+	testCases := []struct {
+		name string
+		run  func(*testing.T)
+	}{
+		{
+			name: "ShouldAllowProcessedReentryMetadataForDuplicateDetachedHarnessSubmission",
+			run:  testTaskRuntimeDetachedHarnessSubmissionAllowsProcessedReentryMetadata,
+		},
+		{
+			name: "ShouldScheduleRescanWhenHarnessReentryQueueIsFull",
+			run:  testHarnessReentryBridgeOnTaskEventSchedulesRescanWhenQueueIsFull,
+		},
+		{
+			name: "ShouldRecoverEqualTimestampRunsByTerminalSequence",
+			run:  testHarnessReentryBridgeRecoverOrdersEqualTimestampsByTerminalSequence,
+		},
+		{
+			name: "ShouldCancelBlockedStatusLookupOnBridgeShutdown",
+			run:  testHarnessReentryBridgeShutdownCancelsBlockedStatusLookup,
+		},
+		{
+			name: "ShouldFinalizeHungSyntheticWakeOnBridgeShutdown",
+			run:  testHarnessReentryBridgeShutdownFinalizesHungSyntheticWake,
+		},
+		{
+			name: "ShouldFilterFallbackSectionsWithoutDuplicatesOrDisabledProviders",
+			run:  testSectionSelectorFallbackStillFiltersProvidersAndDuplicates,
+		},
+	}
+
+	for _, tt := range testCases {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			tt.run(t)
+		})
+	}
+}
+
+func testTaskRuntimeDetachedHarnessSubmissionAllowsProcessedReentryMetadata(t *testing.T) {
+	sessions := &fakeSessionManager{}
+	runtime, resolver, _ := newDetachedHarnessTaskRuntimeForTest(t, sessions)
+	workspace := resolveDaemonWorkspace(t, resolver, filepath.Join(t.TempDir(), "workspace"))
+	sessions.infos = []*session.Info{
+		{
+			ProfileID:   store.DefaultProfileID,
+			ID:          "sess-owner",
+			Type:        session.SessionTypeSystem,
+			State:       session.StateActive,
+			WorkspaceID: workspace.ID,
+			Workspace:   workspace.RootDir,
+		},
+		{
+			ProfileID:   store.DefaultProfileID,
+			ID:          "sess-wake",
+			Type:        session.SessionTypeSystem,
+			State:       session.StateActive,
+			WorkspaceID: workspace.ID,
+			Workspace:   workspace.RootDir,
+		},
+	}
+
+	req := detachedHarnessSubmitRequest{
+		SubmissionKey:  "detached-reentry-match",
+		OwnerSessionID: "sess-owner",
+		Scope:          taskpkg.ScopeWorkspace,
+		WorkspaceID:    workspace.ID,
+		Summary:        "Processed detached work",
+		WakeTarget: detachedHarnessWakeTargetInput{
+			SessionID: "sess-wake",
+		},
+	}
+
+	first, err := runtime.submitDetachedHarnessWork(testutil.Context(t), req)
+	if err != nil {
+		t.Fatalf("submitDetachedHarnessWork(first) error = %v", err)
+	}
+
+	completeDetachedHarnessRunForTest(t, runtime, first.Run.ID, "sess-owner")
+	waitForDetachedHarnessReentryState(t, runtime, first.Run.ID, harnessReentryOutcomeEmitted)
+
+	second, err := runtime.submitDetachedHarnessWork(testutil.Context(t), req)
+	if err != nil {
+		t.Fatalf("submitDetachedHarnessWork(duplicate after reentry) error = %v", err)
+	}
+	if got := second.ExistingTask; !got {
+		t.Fatal("duplicate submission ExistingTask = false, want true")
+	}
+	if got := second.ExistingRun; !got {
+		t.Fatal("duplicate submission ExistingRun = false, want true")
+	}
+	if got, want := second.Run.ID, first.Run.ID; got != want {
+		t.Fatalf("duplicate submission run id = %q, want %q", got, want)
+	}
+}
+
+func testHarnessReentryBridgeOnTaskEventSchedulesRescanWhenQueueIsFull(t *testing.T) {
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+
+	record := taskpkg.EventRecord{
+		Sequence: 1,
+		Event: taskpkg.Event{
+			TaskID:    "task-1",
+			RunID:     "run-1",
+			EventType: harnessTaskEventRunCompleted,
+		},
+	}
+	bridge := &harnessReentryBridge{
+		ctx:        ctx,
+		cancel:     cancel,
+		logger:     discardLogger(),
+		events:     make(chan taskpkg.EventRecord, 1),
+		rescan:     make(chan struct{}, 1),
+		processing: make(map[string]struct{}),
+		queues:     make(map[string]*harnessWakeQueue),
+	}
+	bridge.events <- record
+
+	done := make(chan struct{})
+	go func() {
+		bridge.OnTaskEvent(t.Context(), record)
+		close(done)
+	}()
+
+	select {
+	case <-done:
+	case <-time.After(200 * time.Millisecond):
+		t.Fatal("OnTaskEvent() blocked on a full queue, want immediate return")
+	}
+
+	select {
+	case <-bridge.rescan:
+	default:
+		t.Fatal("overflow did not schedule a recovery rescan")
+	}
+}
+
+func testHarnessReentryBridgeRecoverOrdersEqualTimestampsByTerminalSequence(t *testing.T) {
+	resolver := NewHarnessContextResolver(HarnessRuntimeSignals{
+		SyntheticTurnsEnabled:      true,
+		DetachedTaskRuntimeEnabled: true,
+	})
+	db := openDaemonTestGlobalDB(t)
+	if err := db.InsertWorkspace(testutil.Context(t), workspacepkg.Workspace{
+		ID: "ws-1", RootDir: t.TempDir(), Name: "detached-recovery",
+		CreatedAt: time.Now().UTC(), UpdatedAt: time.Now().UTC(),
+	}); err != nil {
+		t.Fatalf("InsertWorkspace(detached recovery) error = %v", err)
+	}
+	sessions := &fakeSessionManager{
+		infos: []*session.Info{
+			{
+				ID:          "sess-owner",
+				AgentName:   "coder",
+				Type:        session.SessionTypeSystem,
+				State:       session.StateActive,
+				WorkspaceID: "ws-1",
+			},
+			{
+				ID:          "sess-wake",
+				AgentName:   "coder",
+				Type:        session.SessionTypeSystem,
+				State:       session.StateActive,
+				WorkspaceID: "ws-1",
+			},
+		},
+	}
+	actor, err := detachedHarnessActorContext("sess-owner")
+	if err != nil {
+		t.Fatalf("detachedHarnessActorContext() error = %v", err)
+	}
+
+	base := time.Date(2026, 4, 18, 14, 0, 0, 0, time.UTC)
+	seedDetachedHarnessRecoveryRunForTest(
+		t,
+		db,
+		actor,
+		"task-b",
+		"run-b",
+		"first completed run",
+		base,
+	)
+	seedDetachedHarnessRecoveryRunForTest(
+		t,
+		db,
+		actor,
+		"task-a",
+		"run-a",
+		"second completed run",
+		base,
+	)
+
+	bridge, err := newHarnessReentryBridge(t.Context(), resolver, nil, db, sessions, discardLogger())
+	if err != nil {
+		t.Fatalf("newHarnessReentryBridge() error = %v", err)
+	}
+	t.Cleanup(bridge.shutdown)
+
+	if err := bridge.recover(testutil.Context(t)); err != nil {
+		t.Fatalf("recover() error = %v", err)
+	}
+	waitForTaskRuntimeCondition(t, 2*time.Second, func() bool {
+		return sessions.syntheticPromptCount() == 2
+	})
+
+	sessions.mu.Lock()
+	calls := append([]fakeSyntheticPromptCall(nil), sessions.syntheticPromptCalls...)
+	sessions.mu.Unlock()
+
+	if got, want := len(calls), 2; got != want {
+		t.Fatalf("len(syntheticPromptCalls) = %d, want %d", got, want)
+	}
+	if got, want := calls[0].opts.Metadata.TaskRunID, "run-b"; got != want {
+		t.Fatalf("first recovered synthetic wake run id = %q, want %q", got, want)
+	}
+	if got, want := calls[1].opts.Metadata.TaskRunID, "run-a"; got != want {
+		t.Fatalf("second recovered synthetic wake run id = %q, want %q", got, want)
+	}
+}
+
+func testHarnessReentryBridgeShutdownFinalizesHungSyntheticWake(t *testing.T) {
+	started := make(chan struct{})
+	blocked := make(chan acp.AgentEvent)
+	sessions := &fakeSessionManager{
+		infos: []*session.Info{
+			{ID: "sess-owner", AgentName: "coder", Type: session.SessionTypeSystem, State: session.StateActive},
+			{ID: "sess-wake", AgentName: "coder", Type: session.SessionTypeSystem, State: session.StateActive},
+		},
+	}
+	runtime, _, _ := newDetachedHarnessTaskRuntimeForTest(t, sessions)
+	sessions.syntheticPromptHook = func(context.Context, string, session.SyntheticPromptOpts) (<-chan acp.AgentEvent, error) {
+		select {
+		case <-started:
+		default:
+			close(started)
+		}
+		return blocked, nil
+	}
+
+	submission := submitDetachedHarnessWorkForTest(t, runtime, detachedHarnessSubmitRequest{
+		SubmissionKey:  "reentry-shutdown-hung-stream",
+		OwnerSessionID: "sess-owner",
+		Scope:          taskpkg.ScopeGlobal,
+		Summary:        "Bridge shutdown during synthetic wake",
+		WakeTarget: detachedHarnessWakeTargetInput{
+			SessionID: "sess-wake",
+		},
+	})
+
+	completeDetachedHarnessRunForTest(t, runtime, submission.Run.ID, "sess-owner")
+	select {
+	case <-started:
+	case <-time.After(2 * time.Second):
+		t.Fatal("synthetic wake did not start before shutdown")
+	}
+
+	runtime.reentry.shutdown()
+	metadata := waitForDetachedHarnessReentryState(t, runtime, submission.Run.ID, harnessReentryOutcomeDropped)
+	if got, want := metadata.Reentry.Reason, harnessReentryReasonDispatchFailed; got != want {
+		t.Fatalf("metadata.Reentry.Reason = %q, want %q", got, want)
+	}
+}
+
+func testHarnessReentryBridgeShutdownCancelsBlockedStatusLookup(t *testing.T) {
+	resolver := NewHarnessContextResolver(HarnessRuntimeSignals{
+		SyntheticTurnsEnabled:      true,
+		DetachedTaskRuntimeEnabled: true,
+	})
+	db := openDaemonTestGlobalDB(t)
+	if err := db.InsertWorkspace(testutil.Context(t), workspacepkg.Workspace{
+		ID: "ws-1", RootDir: t.TempDir(), Name: "detached-blocked-status",
+		CreatedAt: time.Now().UTC(), UpdatedAt: time.Now().UTC(),
+	}); err != nil {
+		t.Fatalf("InsertWorkspace(detached blocked status) error = %v", err)
+	}
+	actor, err := detachedHarnessActorContext("sess-owner")
+	if err != nil {
+		t.Fatalf("detachedHarnessActorContext() error = %v", err)
+	}
+
+	completedAt := time.Date(2026, 4, 19, 4, 0, 0, 0, time.UTC)
+	seedDetachedHarnessRecoveryRunForTest(
+		t,
+		db,
+		actor,
+		"task-blocked",
+		"run-blocked",
+		"blocked status lookup",
+		completedAt,
+	)
+
+	statusStarted := make(chan struct{})
+	statusCanceled := make(chan struct{})
+	sessions := &blockingStatusSessionManager{
+		fakeSessionManager: &fakeSessionManager{
+			infos: []*session.Info{
+				{ID: "sess-owner", AgentName: "coder", Type: session.SessionTypeSystem, State: session.StateActive},
+				{ID: "sess-wake", AgentName: "coder", Type: session.SessionTypeSystem, State: session.StateActive},
+			},
+		},
+		blockSessionID: "sess-wake",
+		statusStarted:  statusStarted,
+		statusCanceled: statusCanceled,
+	}
+
+	bridge, err := newHarnessReentryBridge(t.Context(), resolver, nil, db, sessions, discardLogger())
+	if err != nil {
+		t.Fatalf("newHarnessReentryBridge() error = %v", err)
+	}
+	t.Cleanup(bridge.shutdown)
+
+	bridge.OnTaskEvent(t.Context(), taskpkg.EventRecord{
+		Sequence: 1,
+		Event: taskpkg.Event{
+			TaskID:    "task-blocked",
+			RunID:     "run-blocked",
+			EventType: harnessTaskEventRunCompleted,
+			Timestamp: completedAt,
+		},
+	})
+
+	select {
+	case <-statusStarted:
+	case <-time.After(2 * time.Second):
+		t.Fatal("bridge worker did not reach the blocked status lookup")
+	}
+
+	shutdownDone := make(chan struct{})
+	go func() {
+		bridge.shutdown()
+		close(shutdownDone)
+	}()
+
+	select {
+	case <-shutdownDone:
+	case <-time.After(2 * time.Second):
+		t.Fatal("shutdown() blocked while a session status lookup ignored cancellation")
+	}
+	select {
+	case <-statusCanceled:
+	default:
+		t.Fatal("shutdown() did not cancel the active session status lookup")
+	}
+}
+
+func testSectionSelectorFallbackStillFiltersProvidersAndDuplicates(t *testing.T) {
+	var selector *SectionSelector
+	selected, resolved, err := selector.Select(
+		session.StartupPromptContext{SessionType: session.SessionTypeUser},
+		[]PromptSectionDescriptor{
+			{
+				Name:     string(HarnessPromptSectionRuntimeIdentity),
+				Position: PromptSectionPositionPrepend,
+				Order:    10,
+				Provider: nil,
+			},
+			{
+				Name:     string(HarnessPromptSectionRuntimeIdentity),
+				Position: PromptSectionPositionPrepend,
+				Order:    20,
+				Provider: staticPromptProvider("runtime block"),
+			},
+			{
+				Name:     string(HarnessPromptSectionTools),
+				Position: PromptSectionPositionAppend,
+				Order:    10,
+				Provider: staticPromptProvider("tools block"),
+				Predicate: func(ResolvedHarnessPolicy) bool {
+					return false
+				},
+			},
+			{
+				Name:     string(HarnessPromptSectionTools),
+				Position: PromptSectionPositionAppend,
+				Order:    20,
+				Provider: staticPromptProvider("duplicate tools block"),
+			},
+		},
+	)
+	if err != nil {
+		t.Fatalf("Select() error = %v", err)
+	}
+
+	gotNames := make([]string, 0, len(selected))
+	for _, descriptor := range selected {
+		gotNames = append(gotNames, descriptor.Name)
+	}
+	if got, want := gotNames, []string{
+		string(HarnessPromptSectionRuntimeIdentity),
+		string(HarnessPromptSectionTools),
+	}; !slices.Equal(
+		got,
+		want,
+	) {
+		t.Fatalf("selected descriptor names = %#v, want %#v", got, want)
+	}
+	if resolved.Surface != "" ||
+		resolved.Session.SessionClass != "" ||
+		resolved.Turn.Origin != "" ||
+		len(resolved.Policy.IncludeSections) != 0 ||
+		len(resolved.Policy.EnableAugmenters) != 0 ||
+		resolved.Policy.DiagnosticLabel != "" ||
+		len(resolved.Policy.ObservabilityTags) != 0 {
+		t.Fatalf("resolved fallback context = %#v, want zero-value policy context", resolved)
+	}
+}
+
+func TestHarnessContextResolverDetachedRunModeRequiresDetachedMetadata(t *testing.T) {
+	testCases := []struct {
+		name  string
+		input HarnessResolutionInput
+		want  DetachedRunMode
+	}{
+		{
+			name: "ShouldNotEnableDetachedRunModeForSystemStartupWithoutDetachedMetadata",
+			input: HarnessResolutionInput{
+				Surface: ResolutionSurfaceStartup,
+				Session: HarnessSessionInput{
+					Type: session.SessionTypeSystem,
+				},
+			},
+			want: DetachedRunModeNone,
+		},
+		{
+			name: "ShouldNotEnableDetachedRunModeForSyntheticTurnsWithoutDetachedMetadata",
+			input: HarnessResolutionInput{
+				Surface: ResolutionSurfaceTurn,
+				Session: HarnessSessionInput{
+					Type: session.SessionTypeSystem,
+				},
+				Turn: HarnessTurnRequest{
+					Source: session.TurnSourceSynthetic,
+					Synthetic: &SyntheticTurnMetadata{
+						Reason:  "task_complete",
+						Trigger: "task.run_completed",
+					},
+				},
+			},
+			want: DetachedRunModeNone,
+		},
+		{
+			name: "ShouldEnableDetachedRunModeOnlyWhenDetachedMetadataIsPresent",
+			input: HarnessResolutionInput{
+				Surface: ResolutionSurfaceTurn,
+				Session: HarnessSessionInput{
+					Type: session.SessionTypeSystem,
+				},
+				Turn: HarnessTurnRequest{
+					Source: session.TurnSourceSynthetic,
+					Synthetic: &SyntheticTurnMetadata{
+						Reason:  "task_complete",
+						Trigger: "task.run_completed",
+					},
+					Detached: &DetachedRunMetadata{
+						TaskRunID: "run-123",
+					},
+				},
+			},
+			want: DetachedRunModeTaskRuntime,
+		},
+	}
+
+	for _, tt := range testCases {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			resolver := NewHarnessContextResolver(HarnessRuntimeSignals{
+				SyntheticTurnsEnabled:      true,
+				DetachedTaskRuntimeEnabled: true,
+			})
+			resolved, err := resolver.Resolve(tt.input)
+			if err != nil {
+				t.Fatalf("Resolve() error = %v", err)
+			}
+			if got, want := resolved.Policy.DetachedRunMode, tt.want; got != want {
+				t.Fatalf("DetachedRunMode = %q, want %q", got, want)
+			}
+		})
+	}
+}
+
+func TestPromptInputCompositeEnforcesPerDescriptorBudgets(t *testing.T) {
+	t.Run("ShouldCapEachDescriptorBeforeConsumingAggregateBudget", func(t *testing.T) {
+		t.Parallel()
+
+		resolver := &staticPromptInputAugmenterResolver{
+			resolved: ResolvedHarnessContext{
+				Policy: ResolvedHarnessPolicy{
+					EnableAugmenters: []HarnessAugmenter{"prefix", "suffix"},
+				},
+			},
+		}
+
+		augmenter, err := newPromptInputCompositeAugmenter(
+			discardLogger(),
+			resolver,
+			nil,
+			promptInputAugmenterDescriptor{
+				Name:   "prefix",
+				Order:  100,
+				Budget: 1,
+				Augmenter: func(_ context.Context, _ *session.Session, message string) (string, error) {
+					return "AAAA" + message, nil
+				},
+			},
+			promptInputAugmenterDescriptor{
+				Name:   "suffix",
+				Order:  200,
+				Budget: 3,
+				Augmenter: func(_ context.Context, _ *session.Session, message string) (string, error) {
+					return message + "BBBB", nil
+				},
+			},
+		)
+		if err != nil {
+			t.Fatalf("newPromptInputCompositeAugmenter() error = %v", err)
+		}
+
+		got, err := augmenter(t.Context(), newPromptInputTestSession(""), "base")
+		if err != nil {
+			t.Fatalf("Augment() error = %v", err)
+		}
+		if got != "AbaseBBB" {
+			t.Fatalf("Augment() = %q, want %q", got, "AbaseBBB")
+		}
+	})
+}
+
+func seedDetachedHarnessRecoveryRunForTest(
+	t *testing.T,
+	db *globaldb.GlobalDB,
+	actor taskpkg.ActorContext,
+	taskID string,
+	runID string,
+	summary string,
+	completedAt time.Time,
+) {
+	t.Helper()
+
+	taskMetadata, err := marshalDetachedHarnessMetadata(detachedHarnessTaskMetadata{
+		Schema:         harnessDetachedMetadataSchema,
+		Kind:           harnessDetachedTaskMetadataKey,
+		SubmissionKey:  "submission-" + runID,
+		Summary:        summary,
+		OwnerSessionID: "sess-owner",
+		WakeTarget: detachedHarnessWakeTarget{
+			SessionID:   "sess-wake",
+			SessionType: string(session.SessionTypeSystem),
+		},
+	})
+	if err != nil {
+		t.Fatalf("marshalDetachedHarnessMetadata(task) error = %v", err)
+	}
+	runMetadata, err := marshalDetachedHarnessMetadata(detachedHarnessRunMetadata{
+		Schema:         harnessDetachedMetadataSchema,
+		Kind:           harnessDetachedRunMetadataKey,
+		SubmissionKey:  "submission-" + runID,
+		Summary:        summary,
+		OwnerSessionID: "sess-owner",
+		WakeTarget: detachedHarnessWakeTarget{
+			SessionID:   "sess-wake",
+			SessionType: string(session.SessionTypeSystem),
+		},
+	})
+	if err != nil {
+		t.Fatalf("marshalDetachedHarnessMetadata(run) error = %v", err)
+	}
+
+	if err := db.CreateTask(testutil.Context(t), taskpkg.Task{
+		ProfileID: store.DefaultProfileID,
+		ID:        taskID,
+		Scope:     taskpkg.ScopeGlobal,
+		Title:     summary,
+		Status:    taskpkg.TaskStatusCompleted,
+		CreatedBy: actor.Actor,
+		Origin:    actor.Origin,
+		CreatedAt: completedAt.Add(-time.Minute),
+		UpdatedAt: completedAt,
+		ClosedAt:  completedAt,
+		Metadata:  taskMetadata,
+	}); err != nil {
+		t.Fatalf("CreateTask(%q) error = %v", taskID, err)
+	}
+	run := taskpkg.Run{
+		ProfileID:      store.DefaultProfileID,
+		ID:             runID,
+		TaskID:         taskID,
+		Status:         taskpkg.TaskRunStatusCompleted,
+		Attempt:        1,
+		Origin:         actor.Origin,
+		IdempotencyKey: "idem-" + runID,
+		Metadata:       runMetadata,
+		QueuedAt:       completedAt.Add(-2 * time.Minute),
+		ClaimedAt:      completedAt.Add(-90 * time.Second),
+		StartedAt:      completedAt.Add(-time.Minute),
+		EndedAt:        completedAt,
+	}
+	run.SetResult(json.RawMessage(`{"ok":true}`))
+	command, err := taskpkg.NewTerminalRunHistoryImport(run, actor)
+	if err != nil {
+		t.Fatalf("NewTerminalRunHistoryImport(%q) error = %v", runID, err)
+	}
+	if err := db.ImportTerminalRunHistory(testutil.Context(t), &command); err != nil {
+		t.Fatalf("ImportTerminalRunHistory(%q) error = %v", runID, err)
+	}
+}
+
+type workspaceUnregisterFinalizerFunc func(context.Context) error
+
+func (f workspaceUnregisterFinalizerFunc) DrainUnregisters(ctx context.Context) error {
+	return f(ctx)
+}
+
+type supportBundleShutdownerFunc func(context.Context) error
+
+func (f supportBundleShutdownerFunc) Shutdown(ctx context.Context) error {
+	return f(ctx)
+}
+
+type fakeSessionManager struct {
+	pendingRecoveryErr error
+	listAllErr         error
+	mu                 sync.Mutex
+	infos              []*session.Info
+	sessionEvents      map[string][]store.SessionEvent
+	nextEventSequence  int64
+	onStop             func(string)
+	stopErr            func(string) error
+	stopWithCauseErr   func(string, session.StopCause, string) error
+	requestStopErr     func(string, session.StopCause, string) error
+	createCalls        []session.CreateOpts
+	promptCalls        []struct {
+		id  string
+		msg string
+	}
+	syntheticPromptCalls     []fakeSyntheticPromptCall
+	syntheticPromptHook      func(context.Context, string, session.SyntheticPromptOpts) (<-chan acp.AgentEvent, error)
+	promptHook               func(context.Context, string, string) (<-chan acp.AgentEvent, error)
+	activePromptRunHook      func(context.Context, string) (session.PromptRunIdentity, error)
+	healthRows               map[string]heartbeat.SessionHealth
+	promptStarted            chan struct{}
+	promptRelease            <-chan struct{}
+	promptCtxCancelled       chan struct{}
+	stopCalls                []string
+	deleteCalls              []string
+	repairCalls              []session.RepairOpts
+	pendingRecoveryCalls     []string
+	stopWithCauseCalls       []fakeStopWithCauseCall
+	requestStopCalls         []fakeStopWithCauseCall
+	waitFinalizationsRelease <-chan struct{}
+	waitFinalizationsCalls   int
+	waitFinalizationsHook    func()
+	shutdownCalls            int
+	shutdownErr              error
+	shutdownHook             func()
+	workspaceAccessPolicy    workspaceaccess.Policy
+	turnEndNotifier          session.TurnEndNotifier
+	agentExtensionCalls      []fakeAgentExtensionCall
+}
+
+var _ SessionManager = (*fakeSessionManager)(nil)
+var _ autoTitleSessionManager = (*fakeSessionManager)(nil)
+var _ clarifyEventPublisher = (*fakeSessionManager)(nil)
+var _ workspaceAccessPolicyBinder = (*fakeSessionManager)(nil)
+
+func (f *fakeSessionManager) SetWorkspaceAccessPolicy(policy workspaceaccess.Policy) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.workspaceAccessPolicy = policy
+}
+
+func (f *fakeSessionManager) PrepareWorkspaceRemoval(
+	context.Context,
+	string,
+) (workspacepkg.UnregisterPreparation, error) {
+	return fakeWorkspaceRemovalPreparation{}, nil
+}
+
+type fakeWorkspaceRemovalPreparation struct{}
+
+func (fakeWorkspaceRemovalPreparation) BeforeDelete(context.Context) error { return nil }
+
+func (fakeWorkspaceRemovalPreparation) Commit(context.Context) error { return nil }
+
+func (fakeWorkspaceRemovalPreparation) Rollback(context.Context) error { return nil }
+
+type blockingStatusSessionManager struct {
+	*fakeSessionManager
+	blockSessionID string
+	statusStarted  chan struct{}
+	statusCanceled chan struct{}
+	statusOnce     sync.Once
+}
+
+type fakeSyntheticPromptCall struct {
+	id   string
+	opts session.SyntheticPromptOpts
+}
+
+type fakeStopWithCauseCall struct {
+	id     string
+	cause  session.StopCause
+	detail string
+}
+
+type goleakSessionManager struct {
+	*fakeSessionManager
+	mu      sync.Mutex
+	process *subprocess.Process
+	wasStop bool
+}
+
+func (m *goleakSessionManager) setProcess(process *subprocess.Process) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.process = process
+}
+
+func (m *goleakSessionManager) stopped() bool {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.wasStop
+}
+
+func (m *goleakSessionManager) StopWithCause(
+	ctx context.Context,
+	id string,
+	cause session.StopCause,
+	detail string,
+) error {
+	m.mu.Lock()
+	m.wasStop = true
+	process := m.process
+	m.mu.Unlock()
+	if m.fakeSessionManager != nil {
+		m.fakeSessionManager.mu.Lock()
+		m.stopWithCauseCalls = append(
+			m.stopWithCauseCalls,
+			fakeStopWithCauseCall{id: id, cause: cause, detail: detail},
+		)
+		m.fakeSessionManager.mu.Unlock()
+	}
+	if process == nil {
+		return nil
+	}
+	return process.Shutdown(ctx)
+}
+
+func (f *fakeSessionManager) Create(_ context.Context, optsInput *session.CreateOpts) (*session.Session, error) {
+	opts := *optsInput
+
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.createCalls = append(f.createCalls, opts)
+	sessionID := fmt.Sprintf("child-%d", len(f.createCalls))
+	workspaceID := strings.TrimSpace(opts.Workspace)
+	workspace := strings.TrimSpace(opts.WorkspacePath)
+	if workspace == "" {
+		workspace = workspaceID
+	}
+	if workspaceID == "" {
+		workspaceID = workspace
+	}
+	return &session.Session{
+		ID:          sessionID,
+		AgentName:   opts.AgentName,
+		WorkspaceID: workspaceID,
+		Workspace:   workspace,
+		Type:        opts.Type,
+		State:       session.StateActive,
+	}, nil
+}
+
+func (f *fakeSessionManager) Spawn(ctx context.Context, opts session.SpawnOpts) (*session.Session, error) {
+	child, err := f.Create(ctx, new(session.CreateOpts{
+		AgentName:     opts.AgentName,
+		Provider:      opts.Provider,
+		Name:          opts.Name,
+		Workspace:     opts.Workspace,
+		WorkspacePath: opts.WorkspacePath,
+		PromptOverlay: opts.PromptOverlay,
+		Type:          session.SessionTypeSpawned,
+		Lineage: &store.SessionLineage{
+			ParentSessionID:  opts.ParentSessionID,
+			SpawnRole:        opts.SpawnRole,
+			AutoStopOnParent: opts.AutoStopOnParent,
+			PermissionPolicy: opts.PermissionPolicy,
+		},
+	}))
+	if err != nil {
+		return nil, err
+	}
+	f.mu.Lock()
+	f.infos = append(f.infos, child.Info())
+	f.mu.Unlock()
+	return child, nil
+}
+
+func (f *fakeSessionManager) ApplyAutomaticSessionTitle(
+	_ context.Context,
+	id string,
+	title string,
+) (bool, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	for _, info := range f.infos {
+		if info == nil || info.ID != id || strings.TrimSpace(info.Name) != "" {
+			continue
+		}
+		info.Name = strings.TrimSpace(title)
+		return true, nil
+	}
+	return false, nil
+}
+
+func (f *fakeSessionManager) List() []*session.Info {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return append([]*session.Info(nil), f.infos...)
+}
+
+func (f *fakeSessionManager) ListAll(context.Context) ([]*session.Info, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return append([]*session.Info(nil), f.infos...), f.listAllErr
+}
+
+func (f *fakeSessionManager) ListForWorkspace(ctx context.Context, workspaceID string) ([]*session.Info, error) {
+	infos, err := f.ListAll(ctx)
+	return slices.DeleteFunc(infos, func(info *session.Info) bool {
+		return info == nil || info.WorkspaceID != workspaceID
+	}), err
+}
+
+func (f *fakeSessionManager) ExpireRestartInteractions(_ context.Context, sessionID string) (int, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.pendingRecoveryCalls = append(f.pendingRecoveryCalls, sessionID)
+	return 1, f.pendingRecoveryErr
+}
+
+func (f *fakeSessionManager) Status(_ context.Context, id string) (*session.Info, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	for _, info := range f.infos {
+		if info != nil && info.ID == id {
+			return info, nil
+		}
+	}
+	return nil, session.ErrSessionNotFound
+}
+
+func (f *fakeSessionManager) ActivePromptRun(
+	ctx context.Context,
+	id string,
+) (session.PromptRunIdentity, error) {
+	if f.activePromptRunHook != nil {
+		return f.activePromptRunHook(ctx, id)
+	}
+	return session.PromptRunIdentity{}, session.ErrPromptNotActive
+}
+
+func (f *blockingStatusSessionManager) Status(ctx context.Context, id string) (*session.Info, error) {
+	if strings.TrimSpace(id) == strings.TrimSpace(f.blockSessionID) {
+		block := false
+		f.statusOnce.Do(func() { block = true })
+		if block {
+			close(f.statusStarted)
+			<-ctx.Done()
+			close(f.statusCanceled)
+			return nil, ctx.Err()
+		}
+	}
+	// Only the active routing lookup blocks; shutdown's summary lookup can finish.
+	return f.fakeSessionManager.Status(ctx, id)
+}
+
+func (f *fakeSessionManager) EventMetadata(context.Context, string, store.EventQuery) ([]store.EventMetadata, error) {
+	return nil, nil
+}
+
+func (f *fakeSessionManager) Events(
+	_ context.Context,
+	id string,
+	query store.EventQuery,
+) ([]store.SessionEvent, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+
+	events := append([]store.SessionEvent(nil), f.sessionEvents[id]...)
+	filtered := make([]store.SessionEvent, 0, len(events))
+	for _, event := range events {
+		if query.AfterSequence > 0 && event.Sequence <= query.AfterSequence {
+			continue
+		}
+		if query.Type != "" && event.Type != query.Type {
+			continue
+		}
+		filtered = append(filtered, event)
+	}
+	slices.SortStableFunc(filtered, func(a, b store.SessionEvent) int {
+		return cmp.Compare(a.Sequence, b.Sequence)
+	})
+	if query.Limit > 0 && len(filtered) > query.Limit {
+		filtered = filtered[len(filtered)-query.Limit:]
+	}
+	return filtered, nil
+}
+
+func (f *fakeSessionManager) LatestSessionEventByType(
+	ctx context.Context,
+	id string,
+	eventType string,
+) (*store.SessionEvent, error) {
+	events, err := f.Events(ctx, id, store.EventQuery{Type: eventType, Limit: 1})
+	if err != nil || len(events) == 0 {
+		return nil, err
+	}
+	event := events[0]
+	return &event, nil
+}
+
+func (f *fakeSessionManager) AppendSessionEventIfAbsent(
+	_ context.Context,
+	event session.GoalEvent,
+) error {
+	if err := event.Validate(); err != nil {
+		return err
+	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.sessionEvents == nil {
+		f.sessionEvents = make(map[string][]store.SessionEvent)
+	}
+	for _, existing := range f.sessionEvents[event.SessionID] {
+		if existing.ID != event.EventID {
+			continue
+		}
+		if existing.TurnID == event.SyntheticTurnID &&
+			existing.Type == event.Type &&
+			existing.AgentName == event.AgentName &&
+			existing.Content == string(event.Content) &&
+			existing.Timestamp.Equal(event.CreatedAt) {
+			return nil
+		}
+		return errors.New("fake session manager: event identity collision")
+	}
+	f.nextEventSequence++
+	f.sessionEvents[event.SessionID] = append(f.sessionEvents[event.SessionID], store.SessionEvent{
+		ID: event.EventID, SessionID: event.SessionID, Sequence: f.nextEventSequence,
+		TurnID: event.SyntheticTurnID, Type: event.Type, AgentName: event.AgentName,
+		Content: string(event.Content), Timestamp: event.CreatedAt,
+	})
+	return nil
+}
+
+func (f *fakeSessionManager) PublishClarifyEvent(
+	_ context.Context,
+	event toolspkg.ClarifyEvent,
+) error {
+	if err := event.Validate(); err != nil {
+		return err
+	}
+	payload, err := json.Marshal(event)
+	if err != nil {
+		return fmt.Errorf("fake session manager: marshal clarification event: %w", err)
+	}
+	turnID := "clarify:" + event.Request.RequestID
+	content, err := transcript.MarshalAgentEvent(acp.AgentEvent{
+		Type:      acp.EventTypeClarify,
+		SessionID: event.Request.SessionID,
+		TurnID:    turnID,
+		Timestamp: event.At.UTC(),
+		Raw:       payload,
+	}.WithRequestID(event.Request.RequestID))
+	if err != nil {
+		return fmt.Errorf("fake session manager: encode clarification event: %w", err)
+	}
+
+	persisted := store.SessionEvent{
+		ID:        event.Request.RequestID + "-" + string(event.Status),
+		SessionID: event.Request.SessionID,
+		TurnID:    turnID,
+		Type:      acp.EventTypeClarify,
+		AgentName: event.Request.AgentName,
+		Content:   content,
+		Timestamp: event.At.UTC(),
+	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.sessionEvents == nil {
+		f.sessionEvents = make(map[string][]store.SessionEvent)
+	}
+	for _, existing := range f.sessionEvents[persisted.SessionID] {
+		if existing.ID != persisted.ID {
+			continue
+		}
+		if existing.TurnID == persisted.TurnID && existing.Type == persisted.Type &&
+			existing.AgentName == persisted.AgentName && existing.Content == persisted.Content &&
+			existing.Timestamp.Equal(persisted.Timestamp) {
+			return nil
+		}
+		return errors.New("fake session manager: clarification event identity collision")
+	}
+	f.nextEventSequence++
+	persisted.Sequence = f.nextEventSequence
+	f.sessionEvents[persisted.SessionID] = append(f.sessionEvents[persisted.SessionID], persisted)
+	return nil
+}
+
+func (f *fakeSessionManager) History(context.Context, string, store.EventQuery) ([]store.TurnHistory, error) {
+	return nil, nil
+}
+
+func (f *fakeSessionManager) TranscriptPage(
+	context.Context,
+	string,
+	transcript.PageQuery,
+) (transcript.Page, error) {
+	return transcript.Page{}, nil
+}
+
+func (f *fakeSessionManager) TranscriptChanges(
+	context.Context,
+	string,
+	transcript.ChangeQuery,
+) (transcript.ChangePage, error) {
+	return transcript.ChangePage{}, nil
+}
+
+func (f *fakeSessionManager) InputQueueSummary(
+	context.Context,
+	string,
+) (session.InputQueueSummary, error) {
+	return session.InputQueueSummary{}, nil
+}
+
+func (f *fakeSessionManager) WorkingDir(context.Context, string) (string, error) {
+	return "", session.ErrSessionNotFound
+}
+
+func (f *fakeSessionManager) RepairSession(
+	_ context.Context,
+	opts session.RepairOpts,
+) (*session.RepairResult, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.repairCalls = append(f.repairCalls, opts)
+	return &session.RepairResult{SessionID: opts.SessionID}, nil
+}
+
+func (f *fakeSessionManager) Stop(_ context.Context, id string) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.stopCalls = append(f.stopCalls, id)
+	if f.onStop != nil && len(f.infos) > 0 {
+		f.onStop(f.infos[0].ID)
+		f.infos = f.infos[1:]
+	}
+	if f.stopErr != nil {
+		return f.stopErr(id)
+	}
+	return nil
+}
+
+func (f *fakeSessionManager) Delete(_ context.Context, id string) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+
+	f.deleteCalls = append(f.deleteCalls, id)
+
+	removed := false
+	filtered := f.infos[:0]
+	for _, info := range f.infos {
+		if info != nil && info.ID == id {
+			removed = true
+			continue
+		}
+		filtered = append(filtered, info)
+	}
+	f.infos = filtered
+	if !removed {
+		return session.ErrSessionNotFound
+	}
+	return nil
+}
+
+func (f *fakeSessionManager) StopWithCause(_ context.Context, id string, cause session.StopCause, detail string) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.stopWithCauseCalls = append(f.stopWithCauseCalls, fakeStopWithCauseCall{
+		id:     id,
+		cause:  cause,
+		detail: detail,
+	})
+	if f.onStop != nil && len(f.infos) > 0 {
+		f.onStop(f.infos[0].ID)
+		f.infos = f.infos[1:]
+	}
+	if f.stopWithCauseErr != nil {
+		return f.stopWithCauseErr(id, cause, detail)
+	}
+	if f.stopErr != nil {
+		return f.stopErr(id)
+	}
+	return nil
+}
+
+func (f *fakeSessionManager) RequestStopWithCause(
+	_ context.Context,
+	id string,
+	cause session.StopCause,
+	detail string,
+) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.requestStopCalls = append(f.requestStopCalls, fakeStopWithCauseCall{
+		id:     id,
+		cause:  cause,
+		detail: detail,
+	})
+	if f.requestStopErr != nil {
+		return f.requestStopErr(id, cause, detail)
+	}
+	return nil
+}
+
+func (f *fakeSessionManager) WaitForFinalizations(ctx context.Context) error {
+	f.mu.Lock()
+	f.waitFinalizationsCalls++
+	release := f.waitFinalizationsRelease
+	hook := f.waitFinalizationsHook
+	f.mu.Unlock()
+	if hook != nil {
+		hook()
+	}
+
+	if release == nil {
+		return nil
+	}
+
+	select {
+	case <-release:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
+func (f *fakeSessionManager) Shutdown(context.Context) error {
+	f.mu.Lock()
+	f.shutdownCalls++
+	hook := f.shutdownHook
+	err := f.shutdownErr
+	f.mu.Unlock()
+	if hook != nil {
+		hook()
+	}
+	return err
+}
+
+func (f *fakeSessionManager) Resume(context.Context, string) (*session.Session, error) {
+	return nil, nil
+}
+
+func (f *fakeSessionManager) ClearConversation(
+	ctx context.Context,
+	id string,
+) (*session.Session, error) {
+	info, err := f.Status(ctx, id)
+	if err != nil && !errors.Is(err, session.ErrSessionNotFound) {
+		return nil, err
+	}
+	if info == nil {
+		return &session.Session{ID: id, State: session.StateActive}, nil
+	}
+
+	return &session.Session{
+		ID:          info.ID,
+		Name:        info.Name,
+		AgentName:   info.AgentName,
+		WorkspaceID: info.WorkspaceID,
+		Workspace:   info.Workspace,
+		Type:        info.Type,
+		State:       session.StateActive,
+		CreatedAt:   info.CreatedAt,
+		UpdatedAt:   info.UpdatedAt,
+	}, nil
+}
+
+func (f *fakeSessionManager) RewindConversation(
+	context.Context,
+	string,
+	session.ConversationRewindOptions,
+) (session.ConversationRewindResult, error) {
+	return session.ConversationRewindResult{}, nil
+}
+
+type databaseUpgradeManager struct {
+	*fakeSessionManager
+	upgraded      []string
+	upgradeErrors map[string]error
+}
+
+func (m *databaseUpgradeManager) UpgradeSessionDatabase(_ context.Context, id string) error {
+	if len(m.pendingRecoveryCalls) != 0 {
+		return errors.New("database upgrade ran after read-only interaction recovery")
+	}
+	m.upgraded = append(m.upgraded, id)
+	return m.upgradeErrors[id]
+}
+
+type derivedEventReconcileManager struct {
+	*fakeSessionManager
+	reconciled []string
+	err        error
+}
+
+func (m *derivedEventReconcileManager) ReconcileDerivedSessionEvents(
+	_ context.Context,
+	infos []*session.Info,
+) (int, error) {
+	for _, info := range infos {
+		m.reconciled = append(m.reconciled, info.ID)
+	}
+	return 0, m.err
+}
+
+type restartStateReadManager struct {
+	*fakeSessionManager
+	read func(context.Context, string) (bool, error)
+}
+
+func (m *restartStateReadManager) HasPendingRestart(ctx context.Context, id string) (bool, error) {
+	return m.read(ctx, id)
+}
+
+func TestBootSessionRepair(t *testing.T) {
+	t.Parallel()
+
+	// Invariant: a per-session repair eligibility failure does not hide healthy sessions;
+	// cancellation still aborts the composition-root boot repair suite.
+	for _, canceled := range []bool{false, true} {
+		name := "Should isolate unreadable restart repair state and repair the next session"
+		if canceled {
+			name = "Should stop repair when a restart state read cancels boot"
+		}
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+			ctx, cancel := context.WithCancel(t.Context())
+			defer cancel()
+			readErr := errors.New("restart checkpoint unreadable")
+			manager := &restartStateReadManager{
+				fakeSessionManager: &fakeSessionManager{infos: []*session.Info{
+					{ID: "sess-unreadable", State: session.StateStopped, StopReason: store.StopShutdown},
+					{ID: "sess-ready", State: session.StateStopped, StopReason: store.StopShutdown},
+				}},
+				read: func(_ context.Context, id string) (bool, error) {
+					if id == "sess-unreadable" {
+						if canceled {
+							cancel()
+						}
+						return false, readErr
+					}
+					return true, nil
+				},
+			}
+			var logs bytes.Buffer
+			state := &bootState{sessions: manager, logger: slog.New(slog.NewJSONHandler(&logs, nil))}
+			err := (&Daemon{}).bootSessionRepair(ctx, state)
+			if canceled {
+				if !errors.Is(err, context.Canceled) || len(manager.repairCalls) != 0 {
+					t.Fatalf("canceled repair = %v; calls = %v", err, manager.repairCalls)
+				}
+				return
+			}
+			if err != nil || len(manager.repairCalls) != 1 || manager.repairCalls[0].SessionID != "sess-ready" {
+				t.Fatalf("isolated repair = %v; calls = %v", err, manager.repairCalls)
+			}
+			if !strings.Contains(logs.String(), "sess-unreadable") ||
+				!strings.Contains(logs.String(), readErr.Error()) {
+				t.Fatalf("missing per-session diagnostic: %s", logs.String())
+			}
+		})
+	}
+
+	// Invariant: retained databases upgrade before boot reads their histories;
+	// migration failures stop boot and identity refusals stay isolated to their session.
+	t.Run("Should upgrade completed histories before interaction recovery and preserve refusal", func(t *testing.T) {
+		t.Parallel()
+		manager := &databaseUpgradeManager{fakeSessionManager: &fakeSessionManager{
+			infos: []*session.Info{{ID: "sess-complete", State: session.StateStopped, StopReason: store.StopCompleted}},
+		}}
+		d := &Daemon{}
+		state := &bootState{logger: discardLogger(), sessions: manager}
+		if err := d.bootSessionRepair(testutil.Context(t), state); err != nil {
+			t.Fatal(err)
+		}
+		if !slices.Equal(manager.upgraded, []string{"sess-complete"}) || len(manager.pendingRecoveryCalls) != 1 {
+			t.Fatalf("upgrade/recovery=%v/%v", manager.upgraded, manager.pendingRecoveryCalls)
+		}
+		manager.pendingRecoveryCalls = nil
+		manager.upgradeErrors = map[string]error{"sess-complete": store.ErrSchemaAhead}
+		if err := d.bootSessionRepair(
+			testutil.Context(t),
+			state,
+		); !errors.Is(err, store.ErrSchemaAhead) ||
+			len(manager.pendingRecoveryCalls) != 0 {
+			t.Fatalf("migration refusal=%v, recovery=%v", err, manager.pendingRecoveryCalls)
+		}
+	})
+
+	for _, tc := range []struct {
+		name string
+		err  error
+	}{
+		{"Should isolate a foreign session database during boot", sessiondb.ErrSessionDBOwnerMismatch},
+		{"Should isolate a session database without owner evidence during boot", sessiondb.ErrSessionDBOwnerMissing},
+		{"Should isolate a replaced database family during boot", sessiondb.ErrSessionDBFamilyChanged},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			manager := &databaseUpgradeManager{
+				fakeSessionManager: &fakeSessionManager{infos: []*session.Info{
+					{
+						ID:          "sess-refused",
+						WorkspaceID: "ws-refused",
+						State:       session.StateStopped,
+						StopReason:  store.StopError,
+					},
+					{ID: "sess-ready", State: session.StateStopped, StopReason: store.StopError},
+				}},
+				upgradeErrors: map[string]error{"sess-refused": fmt.Errorf("open retained history: %w", tc.err)},
+			}
+			var logs bytes.Buffer
+			state := &bootState{logger: slog.New(slog.NewJSONHandler(&logs, nil)), sessions: manager}
+			if err := (&Daemon{}).bootSessionRepair(t.Context(), state); err != nil {
+				t.Fatalf("bootSessionRepair() error = %v, want healthy sessions available", err)
+			}
+			if !slices.Equal(manager.upgraded, []string{"sess-refused", "sess-ready"}) {
+				t.Fatalf("upgraded = %v, want both retained stores inspected", manager.upgraded)
+			}
+			if !slices.Equal(manager.pendingRecoveryCalls, []string{"sess-ready"}) {
+				t.Fatalf("interaction recovery = %v, want only the owned session", manager.pendingRecoveryCalls)
+			}
+			if len(manager.repairCalls) != 1 || manager.repairCalls[0].SessionID != "sess-ready" {
+				t.Fatalf("history repair = %v, want only the owned session", manager.repairCalls)
+			}
+			var entry map[string]any
+			decoder := json.NewDecoder(&logs)
+			for {
+				var candidate map[string]any
+				if err := decoder.Decode(&candidate); errors.Is(err, io.EOF) {
+					break
+				} else if err != nil {
+					t.Fatal(err)
+				}
+				if candidate["session_id"] == "sess-refused" {
+					entry = candidate
+					break
+				}
+			}
+			if entry["level"] != "WARN" || entry["session_id"] != "sess-refused" ||
+				entry["workspace_id"] != "ws-refused" {
+				t.Fatalf("refusal diagnostic = %v", entry)
+			}
+			if detail, ok := entry["error"].(string); !ok || !strings.Contains(detail, tc.err.Error()) {
+				t.Fatalf("refusal diagnostic lost its cause: %v", entry)
+			}
+		})
+	}
+
+	t.Run("Should preserve cancellation even when database identity is also refused", func(t *testing.T) {
+		t.Parallel()
+		manager := &databaseUpgradeManager{
+			fakeSessionManager: &fakeSessionManager{infos: []*session.Info{{ID: "sess-refused"}}},
+			upgradeErrors: map[string]error{
+				"sess-refused": errors.Join(sessiondb.ErrSessionDBOwnerMismatch, context.Canceled),
+			},
+		}
+		state := &bootState{logger: discardLogger(), sessions: manager}
+		if err := (&Daemon{}).bootSessionRepair(t.Context(), state); !errors.Is(err, context.Canceled) {
+			t.Fatalf("bootSessionRepair() error = %v, want cancellation", err)
+		}
+		if len(manager.pendingRecoveryCalls) != 0 || len(manager.repairCalls) != 0 {
+			t.Fatal("boot continued after cancellation")
+		}
+	})
+
+	t.Run("Should reconcile derived session events over the boot inventory without failing boot", func(t *testing.T) {
+		t.Parallel()
+		manager := &derivedEventReconcileManager{
+			fakeSessionManager: &fakeSessionManager{infos: []*session.Info{
+				{ID: "sess-source", State: session.StateStopped, StopReason: store.StopCompleted},
+				{ID: "sess-child", State: session.StateStopped, StopReason: store.StopCompleted},
+			}},
+			err: errors.New("ledger unavailable"),
+		}
+		state := &bootState{logger: discardLogger(), sessions: manager}
+		if err := (&Daemon{}).bootSessionRepair(testutil.Context(t), state); err != nil {
+			t.Fatalf("bootSessionRepair() error = %v, want a reconciliation failure logged only", err)
+		}
+		if !slices.Equal(manager.reconciled, []string{"sess-source", "sess-child"}) {
+			t.Fatalf("reconciled inventory = %v, want the boot inventory", manager.reconciled)
+		}
+	})
+
+	t.Run("Should settle pending stops before crash inventory and stop boot on settlement failure", func(t *testing.T) {
+		t.Parallel()
+		settlementErr := errors.New("verified terminal settlement unavailable")
+		manager := &pendingStopRecoveryManager{
+			fakeSessionManager: &fakeSessionManager{listAllErr: errors.New("inventory must follow settlement")},
+			recoveryErr:        settlementErr,
+		}
+		state := &bootState{logger: discardLogger(), sessions: manager}
+		daemon := &Daemon{}
+		if err := daemon.bootSessionRepair(testutil.Context(t), state); !errors.Is(err, settlementErr) {
+			t.Fatalf("boot bypassed pending terminal settlement: %v", err)
+		}
+	})
+
+	t.Run("Should stop boot when restart decisions cannot be expired", func(t *testing.T) {
+		t.Parallel()
+		expiryErr := errors.New("decision store unavailable")
+		manager := &fakeSessionManager{
+			pendingRecoveryErr: expiryErr,
+			infos:              []*session.Info{{ID: "sess-old", State: session.StateStopped}},
+		}
+		state := &bootState{logger: discardLogger(), sessions: manager}
+		daemon := &Daemon{}
+		if err := daemon.bootSessionRepair(t.Context(), state); !errors.Is(err, expiryErr) {
+			t.Fatalf("boot hid decision expiry failure: %v", err)
+		}
+	})
+	t.Run("Should stop boot when recovered session inventory is unavailable", func(t *testing.T) {
+		t.Parallel()
+		inventoryErr := errors.New("session catalog recovery failed")
+		manager := &fakeSessionManager{listAllErr: inventoryErr}
+		state := &bootState{logger: discardLogger(), sessions: manager}
+		daemon := &Daemon{}
+		if err := daemon.bootSessionRepair(t.Context(), state); !errors.Is(err, inventoryErr) {
+			t.Fatalf("boot accepted incomplete recovery: %v", err)
+		}
+		manager.mu.Lock()
+		defer manager.mu.Unlock()
+		if len(manager.repairCalls) != 0 || len(manager.pendingRecoveryCalls) != 0 {
+			t.Fatal("boot continued with an incomplete inventory")
+		}
+	})
+	t.Run("ShouldRepairOnlyStoppedCrashOrErrorSessions", func(t *testing.T) {
+		t.Parallel()
+
+		manager := &fakeSessionManager{
+			infos: []*session.Info{
+				{ID: "sess-crash", State: session.StateStopped, StopReason: store.StopAgentCrashed},
+				{ID: "sess-error", State: session.StateStopped, StopReason: store.StopError},
+				{ID: "sess-complete", State: session.StateStopped, StopReason: store.StopCompleted},
+				{ID: "sess-active", State: session.StateActive, StopReason: store.StopAgentCrashed},
+			},
+		}
+		state := &bootState{
+			logger:   discardLogger(),
+			sessions: manager,
+		}
+		daemon := &Daemon{}
+
+		if err := daemon.bootSessionRepair(testutil.Context(t), state); err != nil {
+			t.Fatalf("bootSessionRepair() error = %v", err)
+		}
+
+		manager.mu.Lock()
+		defer manager.mu.Unlock()
+		if got, want := len(manager.repairCalls), 2; got != want {
+			t.Fatalf("repair calls = %d, want %d", got, want)
+		}
+		if manager.repairCalls[0].SessionID != "sess-crash" || manager.repairCalls[1].SessionID != "sess-error" {
+			t.Fatalf("repair calls = %#v, want crash then error sessions", manager.repairCalls)
+		}
+		if got, want := manager.pendingRecoveryCalls, []string{
+			"sess-crash",
+			"sess-error",
+			"sess-complete",
+			"sess-active",
+		}; !slices.Equal(
+			got,
+			want,
+		) {
+			t.Fatalf("pending recovery calls = %#v, want %#v", got, want)
+		}
+	})
+}
+
+type pendingStopRecoveryManager struct {
+	*fakeSessionManager
+	recoveryErr  error
+	recoveryHook func(context.Context) error
+}
+
+func (m *pendingStopRecoveryManager) RecoverPendingStops(ctx context.Context) error {
+	if m.recoveryHook != nil {
+		return m.recoveryHook(ctx)
+	}
+	return m.recoveryErr
+}
+
+func (f *fakeSessionManager) Prompt(ctx context.Context, id string, msg string) (<-chan acp.AgentEvent, error) {
+	f.mu.Lock()
+	f.promptCalls = append(f.promptCalls, struct {
+		id  string
+		msg string
+	}{id: id, msg: msg})
+	promptHook := f.promptHook
+	promptStarted := f.promptStarted
+	promptRelease := f.promptRelease
+	promptCtxCancelled := f.promptCtxCancelled
+	f.mu.Unlock()
+
+	if promptHook != nil {
+		return promptHook(ctx, id, msg)
+	}
+
+	if promptStarted != nil {
+		select {
+		case promptStarted <- struct{}{}:
+		default:
+		}
+	}
+
+	if promptRelease != nil || promptCtxCancelled != nil {
+		ch := make(chan acp.AgentEvent)
+		go func() {
+			defer close(ch)
+			if promptRelease == nil {
+				if ctx != nil {
+					<-ctx.Done()
+				}
+			} else {
+				select {
+				case <-promptRelease:
+					return
+				case <-ctx.Done():
+				}
+			}
+			if promptCtxCancelled != nil {
+				select {
+				case promptCtxCancelled <- struct{}{}:
+				default:
+				}
+			}
+		}()
+		return ch, nil
+	}
+
+	ch := make(chan acp.AgentEvent)
+	close(ch)
+	return ch, nil
+}
+
+func (f *fakeSessionManager) PromptWithOpts(
+	ctx context.Context,
+	id string,
+	opts session.PromptOpts,
+) (<-chan acp.AgentEvent, error) {
+	return f.Prompt(ctx, id, opts.Message)
+}
+
+func (f *fakeSessionManager) SendPrompt(
+	ctx context.Context,
+	id string,
+	opts session.SendPromptOpts,
+) (session.SendPromptResult, error) {
+	events, err := f.Prompt(ctx, id, opts.Message)
+	if err != nil {
+		return session.SendPromptResult{}, err
+	}
+	return session.SendPromptResult{
+		Status: "accepted",
+		Mode:   opts.Mode,
+		Events: events,
+	}, nil
+}
+
+func (f *fakeSessionManager) SteerPrompt(
+	_ context.Context,
+	_ string,
+	_ session.SteerPromptOpts,
+) (session.SendPromptResult, error) {
+	return session.SendPromptResult{
+		Status:   "steering",
+		Mode:     session.BusyInputModeSteer,
+		Delivery: store.SessionInputDeliveryInterruptThenPrompt,
+	}, nil
+}
+
+func (f *fakeSessionManager) CancelQueuedPrompt(
+	_ context.Context,
+	_ string,
+	queueEntryID string,
+) (session.SendPromptResult, error) {
+	return session.SendPromptResult{
+		Status:       "canceled",
+		Mode:         session.BusyInputModeQueue,
+		QueueEntryID: queueEntryID,
+	}, nil
+}
+
+func (f *fakeSessionManager) ListPendingInputs(context.Context, string) ([]session.PendingInput, error) {
+	return []session.PendingInput{}, nil
+}
+
+func (f *fakeSessionManager) ClearPendingInputs(
+	context.Context,
+	string,
+	session.PromptCaller,
+) (session.ClearPendingInputsResult, error) {
+	return session.ClearPendingInputsResult{}, nil
+}
+
+func (f *fakeSessionManager) ReplacePendingInput(
+	context.Context,
+	string,
+	string,
+	session.ReplacePendingInputOpts,
+) (session.PendingInput, error) {
+	return session.PendingInput{}, session.ErrSessionNotFound
+}
+
+func (f *fakeSessionManager) PromotePendingInputToSteer(
+	context.Context,
+	string,
+	string,
+	session.PromotePendingInputOpts,
+) (session.SendPromptResult, error) {
+	return session.SendPromptResult{}, session.ErrSessionNotFound
+}
+
+func (f *fakeSessionManager) CancelPrompt(
+	context.Context,
+	string,
+) (session.PromptCancelResult, error) {
+	return session.PromptCancelResult{Outcome: session.PromptCancelOutcomeCanceled}, nil
+}
+
+func (f *fakeSessionManager) PromptSynthetic(
+	ctx context.Context,
+	id string,
+	opts session.SyntheticPromptOpts,
+) (<-chan acp.AgentEvent, error) {
+	info, err := f.Status(ctx, id)
+	if err != nil {
+		return nil, err
+	}
+	if info == nil || info.State != session.StateActive {
+		return nil, session.ErrSessionNotActive
+	}
+
+	f.mu.Lock()
+	f.syntheticPromptCalls = append(f.syntheticPromptCalls, fakeSyntheticPromptCall{id: id, opts: opts})
+	hook := f.syntheticPromptHook
+	f.mu.Unlock()
+
+	if hook != nil {
+		return hook(ctx, id, opts)
+	}
+
+	f.recordSyntheticEvent(id, info, opts)
+	ch := make(chan acp.AgentEvent)
+	close(ch)
+	return ch, nil
+}
+
+func (f *fakeSessionManager) ApprovePermission(
+	context.Context,
+	string,
+	acp.ApproveRequest,
+) (session.ApprovalResult, error) {
+	return session.ApprovalResult{}, nil
+}
+
+func (f *fakeSessionManager) SetTurnEndNotifier(fn session.TurnEndNotifier) {
+	f.mu.Lock()
+	f.turnEndNotifier = fn
+	f.mu.Unlock()
+}
+
+func (f *fakeSessionManager) AddTurnEndNotifier(fn session.TurnEndNotifier) {
+	if fn == nil {
+		return
+	}
+	f.mu.Lock()
+	previous := f.turnEndNotifier
+	if previous == nil {
+		f.turnEndNotifier = fn
+	} else {
+		f.turnEndNotifier = func(ctx context.Context, identity session.PromptRunIdentity) {
+			previous(ctx, identity)
+			fn(ctx, identity)
+		}
+	}
+	f.mu.Unlock()
+}
+
+func (f *fakeSessionManager) IsPrompting(string) bool {
+	return false
+}
+
+func (f *fakeSessionManager) recordSyntheticEvent(
+	sessionID string,
+	info *session.Info,
+	opts session.SyntheticPromptOpts,
+) {
+	if info == nil {
+		return
+	}
+
+	timestamp := time.Now().UTC()
+
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.sessionEvents == nil {
+		f.sessionEvents = make(map[string][]store.SessionEvent)
+	}
+	f.nextEventSequence++
+	sequence := f.nextEventSequence
+	turnID := fmt.Sprintf("turn-synthetic-%d", sequence)
+
+	payload, err := json.Marshal(acp.AgentEvent{
+		Type:      acp.EventTypeSyntheticReentry,
+		TurnID:    turnID,
+		Timestamp: timestamp,
+		Text:      strings.TrimSpace(opts.Message),
+		Synthetic: &opts.Metadata,
+	})
+	if err != nil {
+		return
+	}
+
+	f.sessionEvents[sessionID] = append(f.sessionEvents[sessionID], store.SessionEvent{
+		ID:        fmt.Sprintf("evt-%d", sequence),
+		SessionID: sessionID,
+		Sequence:  sequence,
+		TurnID:    turnID,
+		Type:      acp.EventTypeSyntheticReentry,
+		AgentName: info.AgentName,
+		Content:   string(payload),
+		Timestamp: timestamp,
+	})
+}
+
+func (f *fakeSessionManager) syntheticPromptCount() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return len(f.syntheticPromptCalls)
+}
+
+func (f *fakeSessionManager) createCount() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return len(f.createCalls)
+}
+
+func (f *fakeSessionManager) createCall(index int) session.CreateOpts {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.createCalls[index]
+}
+
+type fakePromptOptionsSessionManager struct {
+	*fakeSessionManager
+	sessionID string
+	options   session.PromptOpts
+}
+
+func (f *fakePromptOptionsSessionManager) PromptWithOpts(
+	_ context.Context,
+	id string,
+	opts session.PromptOpts,
+) (<-chan acp.AgentEvent, error) {
+	f.sessionID = id
+	f.options = opts
+	events := make(chan acp.AgentEvent)
+	close(events)
+	return events, nil
+}
+
+type fakeAcceptingSessionManager struct {
+	*fakeSessionManager
+	acceptedCall session.CreateAcceptedOpts
+}
+
+type fakeSessionArchiveCall struct {
+	workspaceID string
+	sessionID   string
+	stop        bool
+}
+
+type fakeArchivingSessionManager struct {
+	*fakeSessionManager
+	archiveCall   fakeSessionArchiveCall
+	unarchiveCall fakeSessionArchiveCall
+}
+
+func (f *fakeArchivingSessionManager) Archive(
+	_ context.Context,
+	workspaceID string,
+	sessionID string,
+) (*session.Info, error) {
+	f.archiveCall = fakeSessionArchiveCall{workspaceID: workspaceID, sessionID: sessionID}
+	return &session.Info{ID: sessionID, WorkspaceID: workspaceID}, nil
+}
+
+func (f *fakeArchivingSessionManager) ArchiveWithStop(
+	_ context.Context,
+	workspaceID string,
+	sessionID string,
+) (*session.Info, error) {
+	f.archiveCall = fakeSessionArchiveCall{workspaceID: workspaceID, sessionID: sessionID, stop: true}
+	return &session.Info{ID: sessionID, WorkspaceID: workspaceID}, nil
+}
+
+func (f *fakeArchivingSessionManager) Unarchive(
+	_ context.Context,
+	workspaceID string,
+	sessionID string,
+) (*session.Info, error) {
+	f.unarchiveCall = fakeSessionArchiveCall{workspaceID: workspaceID, sessionID: sessionID}
+	return &session.Info{ID: sessionID, WorkspaceID: workspaceID}, nil
+}
+
+func (f *fakeAcceptingSessionManager) CreateAccepted(
+	_ context.Context,
+	optsInput *session.CreateAcceptedOpts,
+) (*session.Info, error) {
+	opts := *optsInput
+
+	f.acceptedCall = opts
+	return &session.Info{ID: "accepted-session"}, nil
+}
+
+type syntheticPrompter interface {
+	PromptSynthetic(context.Context, string, session.SyntheticPromptOpts) (<-chan acp.AgentEvent, error)
+}
+
+type spawnSurface interface {
+	Spawn(context.Context, session.SpawnOpts) (*session.Session, error)
+}
+
+type autoTitleApplySurface interface {
+	ApplyAutomaticSessionTitle(context.Context, string, string) (bool, error)
+}
+
+type nonBindableHarnessSessionManager struct {
+	SessionManager
+	syntheticPrompter     syntheticPrompter
+	workspaceAccessBinder workspaceAccessPolicyBinder
+}
+
+func (m nonBindableHarnessSessionManager) AddTurnEndNotifier(fn session.TurnEndNotifier) {
+	if registrar, ok := m.SessionManager.(turnEndNotifierRegistrar); ok {
+		registrar.AddTurnEndNotifier(fn)
+	}
+}
+
+func (m nonBindableHarnessSessionManager) SetWorkspaceAccessPolicy(policy workspaceaccess.Policy) {
+	m.workspaceAccessBinder.SetWorkspaceAccessPolicy(policy)
+}
+
+func (m nonBindableHarnessSessionManager) PublishClarifyEvent(
+	ctx context.Context,
+	event toolspkg.ClarifyEvent,
+) error {
+	publisher, ok := m.SessionManager.(clarifyEventPublisher)
+	if !ok {
+		return errors.New("non-bindable session manager: clarification publisher is required")
+	}
+	return publisher.PublishClarifyEvent(ctx, event)
+}
+
+type sessionManagerWithoutWorkspaceRemoval struct {
+	SessionManager
+	workspaceAccessBinder workspaceAccessPolicyBinder
+}
+
+func (m sessionManagerWithoutWorkspaceRemoval) AddTurnEndNotifier(fn session.TurnEndNotifier) {
+	if registrar, ok := m.SessionManager.(turnEndNotifierRegistrar); ok {
+		registrar.AddTurnEndNotifier(fn)
+	}
+}
+
+func (m sessionManagerWithoutWorkspaceRemoval) SetWorkspaceAccessPolicy(policy workspaceaccess.Policy) {
+	m.workspaceAccessBinder.SetWorkspaceAccessPolicy(policy)
+}
+
+func (m sessionManagerWithoutWorkspaceRemoval) PublishClarifyEvent(
+	ctx context.Context,
+	event toolspkg.ClarifyEvent,
+) error {
+	publisher, ok := m.SessionManager.(clarifyEventPublisher)
+	if !ok {
+		return errors.New("session manager without workspace removal: clarification publisher is required")
+	}
+	return publisher.PublishClarifyEvent(ctx, event)
+}
+
+var (
+	_ SessionManager        = (*fakeSessionManager)(nil)
+	_ SessionManager        = nonBindableHarnessSessionManager{}
+	_ syntheticPrompter     = (*fakeSessionManager)(nil)
+	_ syntheticPrompter     = nonBindableHarnessSessionManager{}
+	_ spawnSurface          = nonBindableHarnessSessionManager{}
+	_ autoTitleApplySurface = nonBindableHarnessSessionManager{}
+)
+
+func (m nonBindableHarnessSessionManager) Spawn(
+	ctx context.Context,
+	opts session.SpawnOpts,
+) (*session.Session, error) {
+	spawner, ok := m.SessionManager.(spawnSurface)
+	if !ok {
+		return nil, errors.New("daemon test: session manager spawn surface is required")
+	}
+	return spawner.Spawn(ctx, opts)
+}
+
+func (m nonBindableHarnessSessionManager) PromptSynthetic(
+	ctx context.Context,
+	id string,
+	opts session.SyntheticPromptOpts,
+) (<-chan acp.AgentEvent, error) {
+	return m.syntheticPrompter.PromptSynthetic(ctx, id, opts)
+}
+
+func (m nonBindableHarnessSessionManager) ApplyAutomaticSessionTitle(
+	ctx context.Context,
+	id string,
+	title string,
+) (bool, error) {
+	applier, ok := m.SessionManager.(autoTitleApplySurface)
+	if !ok {
+		return false, errors.New("daemon test: session manager automatic title surface is required")
+	}
+	return applier.ApplyAutomaticSessionTitle(ctx, id, title)
+}
+
+func (m nonBindableHarnessSessionManager) PrepareWorkspaceRemoval(
+	ctx context.Context,
+	workspaceID string,
+) (workspacepkg.UnregisterPreparation, error) {
+	preparer, ok := m.SessionManager.(workspaceRemovalPreparer)
+	if !ok {
+		return nil, errMissingWorkspaceRemovalPreparation
+	}
+	return preparer.PrepareWorkspaceRemoval(ctx, workspaceID)
+}
+
+type fakeObserver struct {
+	reconciled  bool
+	result      store.ReconcileResult
+	err         error
+	onReconcile func()
+}
+
+func (f *fakeObserver) QueryEvents(context.Context, store.EventSummaryQuery) ([]store.EventSummary, error) {
+	return nil, nil
+}
+
+func (f *fakeObserver) QueryHookCatalog(context.Context, hookspkg.CatalogFilter) ([]hookspkg.CatalogEntry, error) {
+	return nil, nil
+}
+
+func (f *fakeObserver) QueryHookRuns(context.Context, store.HookRunQuery) ([]hookspkg.HookRunRecord, error) {
+	return nil, nil
+}
+
+func (f *fakeObserver) QueryHookEvents(context.Context, hookspkg.EventFilter) ([]hookspkg.EventDescriptor, error) {
+	return nil, nil
+}
+
+func (f *fakeObserver) QueryTokenStats(context.Context, store.TokenStatsQuery) ([]store.TokenStats, error) {
+	return nil, nil
+}
+
+func (f *fakeObserver) QueryTaskDashboard(
+	context.Context,
+	observe.TaskDashboardQuery,
+) (observe.TaskDashboardView, error) {
+	return observe.TaskDashboardView{}, nil
+}
+
+func (f *fakeObserver) QueryTaskInbox(
+	context.Context,
+	observe.TaskInboxQuery,
+	taskpkg.ActorIdentity,
+) (observe.TaskInboxView, error) {
+	return observe.TaskInboxView{}, nil
+}
+
+func (f *fakeObserver) QueryObserveOverview(
+	context.Context,
+	observe.OverviewQuery,
+) (observe.OverviewView, error) {
+	return observe.OverviewView{}, nil
+}
+
+func (f *fakeObserver) Health(context.Context) (observe.Health, error) {
+	return observe.Health{Status: "ok"}, nil
+}
+
+func (f *fakeObserver) Reconcile(context.Context) (store.ReconcileResult, error) {
+	if f.onReconcile != nil {
+		f.onReconcile()
+	}
+	f.reconciled = true
+	return f.result, f.err
+}
+
+func (f *fakeObserver) OnSessionCreated(context.Context, *session.Session) {}
+
+func (f *fakeObserver) OnSessionStopped(context.Context, *session.Session) {}
+
+func (f *fakeObserver) OnAgentEvent(context.Context, string, any) {}
+
+type failingRetentionObserver struct {
+	fakeObserver
+	startErr       error
+	shutdownCalled bool
+}
+
+func (f *failingRetentionObserver) StartRetention(context.Context) error {
+	return f.startErr
+}
+
+func (f *failingRetentionObserver) ShutdownRetention(context.Context) error {
+	f.shutdownCalled = true
+	return nil
+}
+
+type hookAwareTestObserver struct {
+	fakeObserver
+	attached observe.HookCatalogSource
+}
+
+func (o *hookAwareTestObserver) AttachHooks(source observe.HookCatalogSource) {
+	o.attached = source
+}
+
+type fakeServer struct {
+	mu            sync.Mutex
+	name          string
+	onShutdown    func()
+	shutdownFn    func(context.Context) error
+	shutdownCalls int
+}
+
+func (f *fakeServer) Start(context.Context) error {
+	return nil
+}
+
+func (f *fakeServer) Shutdown(ctx context.Context) error {
+	f.mu.Lock()
+	f.shutdownCalls++
+	onShutdown := f.onShutdown
+	shutdownFn := f.shutdownFn
+	f.mu.Unlock()
+	if onShutdown != nil {
+		onShutdown()
+	}
+	if shutdownFn != nil {
+		return shutdownFn(ctx)
+	}
+	return nil
+}
+
+func (f *fakeServer) shutdownCallCount() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.shutdownCalls
+}
+
+type fakeResourceReconcileDriver struct {
+	runBootCalls int
+	closeCalls   int
+	triggerCalls int
+	waitCalls    int
+	lastKind     resources.ResourceKind
+	lastReason   resources.ReconcileReason
+	triggerErr   error
+	onRunBoot    func()
+	onClose      func()
+}
+
+func (f *fakeResourceReconcileDriver) WaitForIdle(
+	context.Context,
+	resources.ReconcileTicket,
+) error {
+	f.waitCalls++
+	return nil
+}
+
+func (f *fakeResourceReconcileDriver) Trigger(
+	_ context.Context,
+	kind resources.ResourceKind,
+	reason resources.ReconcileReason,
+) (resources.ReconcileTicket, error) {
+	f.triggerCalls++
+	f.lastKind = kind
+	f.lastReason = reason
+	return resources.ReconcileTicket{}, f.triggerErr
+}
+
+func (f *fakeResourceReconcileDriver) RunBoot(context.Context) error {
+	f.runBootCalls++
+	if f.onRunBoot != nil {
+		f.onRunBoot()
+	}
+	return nil
+}
+
+func (f *fakeResourceReconcileDriver) Close(context.Context) error {
+	f.closeCalls++
+	if f.onClose != nil {
+		f.onClose()
+	}
+	return nil
+}
+
+type recordingRegistry struct {
+	path                      string
+	onClose                   func()
+	onListTaskRunsByStatus    func([]taskpkg.RunStatus)
+	mu                        sync.Mutex
+	workspaces                map[string]workspacepkg.Workspace
+	workspaceDeletionIntents  map[string]workspacepkg.DeletionIntent
+	deadEntities              map[store.DeadEntityKey]store.DeadEntity
+	approvalGrants            map[toolspkg.ApprovalGrantKey]toolspkg.ApprovalGrant
+	gatewaySnapshot           gateway.Snapshot
+	neutralizeLoopOrphansErr  error
+	backfillLoopProvenanceErr error
+	reconciliationCalls       []string
+	onNeutralizeLoopOrphans   func()
+	onBackfillLoopProvenance  func()
+}
+
+type blockingLoopReconciliationRegistry struct {
+	*globaldb.GlobalDB
+	neutralizeStarted chan struct{}
+	releaseNeutralize chan struct{}
+	claimAttempts     chan string
+	neutralizeOnce    sync.Once
+}
+
+func (r *blockingLoopReconciliationRegistry) NeutralizeLoopRunOrphans(
+	ctx context.Context,
+) (looppkg.SweepReport, error) {
+	r.neutralizeOnce.Do(func() { close(r.neutralizeStarted) })
+	select {
+	case <-r.releaseNeutralize:
+	case <-ctx.Done():
+		return looppkg.SweepReport{}, ctx.Err()
+	}
+	return r.GlobalDB.NeutralizeLoopRunOrphans(ctx)
+}
+
+func (r *blockingLoopReconciliationRegistry) WithLeaseSettlementTransaction(
+	ctx context.Context,
+	action string,
+	fn func(taskpkg.LeaseSettlementMutationStore) error,
+) error {
+	if action == "claim task run lease" {
+		select {
+		case r.claimAttempts <- action:
+		default:
+		}
+	}
+	return r.GlobalDB.WithLeaseSettlementTransaction(ctx, action, fn)
+}
+
+func (r *recordingRegistry) NeutralizeLoopRunOrphans(context.Context) (looppkg.SweepReport, error) {
+	r.mu.Lock()
+	r.reconciliationCalls = append(r.reconciliationCalls, "neutralize")
+	err := r.neutralizeLoopOrphansErr
+	callback := r.onNeutralizeLoopOrphans
+	r.mu.Unlock()
+	if callback != nil {
+		callback()
+	}
+	return looppkg.SweepReport{}, err
+}
+
+func (r *recordingRegistry) SweepLoopRunOrphans(context.Context) (looppkg.SweepReport, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.reconciliationCalls = append(r.reconciliationCalls, "sweep")
+	return looppkg.SweepReport{}, nil
+}
+
+func (r *recordingRegistry) BackfillLoopProvenance(context.Context) (int, error) {
+	r.mu.Lock()
+	r.reconciliationCalls = append(r.reconciliationCalls, "backfill")
+	err := r.backfillLoopProvenanceErr
+	callback := r.onBackfillLoopProvenance
+	r.mu.Unlock()
+	if callback != nil {
+		callback()
+	}
+	return 0, err
+}
+
+type queuedAttachmentRecordingRegistry struct {
+	*recordingRegistry
+	queuedAttachmentStore
+}
+
+type queuedAttachmentStore struct {
+	entries []store.SessionInputQueueEntry
+}
+
+func (r *recordingRegistry) CreateSkillExposure(
+	context.Context,
+	store.SkillExposureRecord,
+) (store.SkillExposureRecord, error) {
+	return store.SkillExposureRecord{}, errors.New("recording registry: skill exposure writes are not configured")
+}
+
+func (r *recordingRegistry) GetSkillExposureByOwnerTarget(
+	context.Context,
+	string,
+	store.SkillExposureOwnerScope,
+	string,
+	string,
+) (store.SkillExposureRecord, error) {
+	return store.SkillExposureRecord{}, sql.ErrNoRows
+}
+
+func (r *recordingRegistry) ListSkillExposuresByOwner(
+	context.Context,
+	string,
+	store.SkillExposureOwnerScope,
+	string,
+) ([]store.SkillExposureRecord, error) {
+	return []store.SkillExposureRecord{}, nil
+}
+
+func (r *recordingRegistry) ListSkillExposuresByCanonicalDir(
+	context.Context,
+	string,
+) ([]store.SkillExposureRecord, error) {
+	return []store.SkillExposureRecord{}, nil
+}
+
+func (r *recordingRegistry) DeleteSkillExposure(context.Context, int64) error {
+	return nil
+}
+
+func (r *recordingRegistry) VerifyDefaultProfile(context.Context) error {
+	return nil
+}
+
+func (r *recordingRegistry) ListAttentionWorkspaceMutes(context.Context, string) ([]string, error) {
+	return []string{}, nil
+}
+
+func (r *recordingRegistry) ReplaceAttentionWorkspaceMutes(context.Context, string, []string) error {
+	return nil
+}
+
+func (r *recordingRegistry) IsAttentionWorkspaceMuted(context.Context, string, string) (bool, error) {
+	return false, nil
+}
+
+func (s queuedAttachmentStore) ListPendingSessionInputs(
+	context.Context,
+	string,
+) ([]store.SessionInputQueueEntry, error) {
+	return slices.Clone(s.entries), nil
+}
+
+func (r *recordingRegistry) Snapshot(context.Context) (gateway.Snapshot, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return gateway.Snapshot{
+		Providers: append([]gateway.ProviderActivation(nil), r.gatewaySnapshot.Providers...),
+		Surfaces:  append([]gateway.SurfaceExposure(nil), r.gatewaySnapshot.Surfaces...),
+		Devices:   append([]gateway.DeviceSession(nil), r.gatewaySnapshot.Devices...),
+	}, nil
+}
+
+func (r *recordingRegistry) Transition(
+	_ context.Context,
+	req gateway.TransitionRequest,
+	now time.Time,
+) (bool, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	switch req.Target {
+	case gateway.TargetProvider:
+		for i := range r.gatewaySnapshot.Providers {
+			row := &r.gatewaySnapshot.Providers[i]
+			if row.ProviderName != req.Provider.Name || row.Tier != req.Tier {
+				continue
+			}
+			if row.Generation != req.ExpectedGeneration {
+				return false, gateway.ErrGenerationConflict
+			}
+			if row.Desired == req.Desired {
+				return false, nil
+			}
+			row.Desired = req.Desired
+			row.Generation++
+			if req.Desired == gateway.DesiredDisabled {
+				row.Observed = gateway.ProviderDown
+			}
+			return true, nil
+		}
+		if req.Desired == gateway.DesiredDisabled {
+			return false, nil
+		}
+		r.gatewaySnapshot.Providers = append(r.gatewaySnapshot.Providers, gateway.ProviderActivation{
+			ProviderName: req.Provider.Name, Tier: req.Tier, Desired: req.Desired,
+			Observed: gateway.ProviderDown, Generation: 1,
+		})
+		return true, nil
+	case gateway.TargetSurface:
+		for i := range r.gatewaySnapshot.Surfaces {
+			row := &r.gatewaySnapshot.Surfaces[i]
+			if row.Surface != req.Surface || row.Tier != req.Tier {
+				continue
+			}
+			if row.Generation != req.ExpectedGeneration {
+				return false, gateway.ErrGenerationConflict
+			}
+			if row.Desired == req.Desired {
+				return false, nil
+			}
+			row.Desired = req.Desired
+			row.Generation++
+			if req.Desired == gateway.DesiredDisabled {
+				row.Observed = gateway.SurfaceOff
+				row.ConsentedAt = time.Time{}
+			} else if req.Consent {
+				row.ConsentedAt = now
+			}
+			return true, nil
+		}
+		if req.Desired == gateway.DesiredDisabled {
+			return false, nil
+		}
+		r.gatewaySnapshot.Surfaces = append(r.gatewaySnapshot.Surfaces, gateway.SurfaceExposure{
+			Surface: req.Surface, Tier: req.Tier, Desired: req.Desired,
+			Observed: gateway.SurfaceOff, Generation: 1,
+		})
+		return true, nil
+	default:
+		return false, errors.New("unsupported gateway transition target")
+	}
+}
+
+func (r *recordingRegistry) DisableAll(context.Context) (bool, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	changed := false
+	for i := range r.gatewaySnapshot.Providers {
+		row := &r.gatewaySnapshot.Providers[i]
+		if row.Desired != gateway.DesiredDisabled || row.Observed != gateway.ProviderDown {
+			row.Desired = gateway.DesiredDisabled
+			row.Observed = gateway.ProviderDown
+			row.Generation++
+			changed = true
+		}
+	}
+	for i := range r.gatewaySnapshot.Surfaces {
+		row := &r.gatewaySnapshot.Surfaces[i]
+		if row.Desired != gateway.DesiredDisabled || row.Observed != gateway.SurfaceOff || !row.ConsentedAt.IsZero() {
+			row.Desired = gateway.DesiredDisabled
+			row.Observed = gateway.SurfaceOff
+			row.Generation++
+			row.ConsentedAt = time.Time{}
+			changed = true
+		}
+	}
+	return changed, nil
+}
+
+func (r *recordingRegistry) SetObserved(
+	_ context.Context,
+	plan gateway.TierPlan,
+	providerObserved gateway.ProviderObservedState,
+	surfaceObserved gateway.SurfaceObservedState,
+	at time.Time,
+	cause string,
+) (bool, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if plan.Provider == nil {
+		return false, nil
+	}
+	providerMatched := false
+	for i := range r.gatewaySnapshot.Providers {
+		row := &r.gatewaySnapshot.Providers[i]
+		if row.ProviderName == plan.Provider.ProviderName && row.Tier == plan.Provider.Tier &&
+			row.Generation == plan.Provider.Generation {
+			row.Observed = providerObserved
+			row.LastHealthAt = at
+			row.LastError = cause
+			providerMatched = true
+		}
+	}
+	if !providerMatched {
+		return false, nil
+	}
+	for _, expected := range plan.Surfaces {
+		matched := false
+		for i := range r.gatewaySnapshot.Surfaces {
+			row := &r.gatewaySnapshot.Surfaces[i]
+			if row.Surface == expected.Surface && row.Tier == expected.Tier &&
+				row.Generation == expected.Generation {
+				row.Observed = surfaceObserved
+				matched = true
+			}
+		}
+		if !matched {
+			return false, nil
+		}
+	}
+	return true, nil
+}
+
+func (r *recordingRegistry) LookupApprovalGrant(
+	_ context.Context,
+	key toolspkg.ApprovalGrantKey,
+) (toolspkg.ApprovalGrant, bool, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	grant, ok := r.approvalGrants[key.Normalize()]
+	return grant, ok, nil
+}
+
+func (r *recordingRegistry) PutApprovalGrant(
+	_ context.Context,
+	grant toolspkg.ApprovalGrant,
+) (toolspkg.ApprovalGrant, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.approvalGrants == nil {
+		r.approvalGrants = make(map[toolspkg.ApprovalGrantKey]toolspkg.ApprovalGrant)
+	}
+	grant = grant.Normalize()
+	if grant.ID == "" {
+		grant.ID = fmt.Sprintf("grant-%d", len(r.approvalGrants)+1)
+	}
+	now := time.Now().UTC()
+	if grant.CreatedAt.IsZero() {
+		grant.CreatedAt = now
+	}
+	if grant.LastUsedAt.IsZero() {
+		grant.LastUsedAt = now
+	}
+	r.approvalGrants[grant.ApprovalGrantKey] = grant
+	return grant, nil
+}
+
+func (r *recordingRegistry) ListApprovalGrants(
+	_ context.Context,
+	readScope store.ReadScope,
+	workspaceID string,
+) ([]toolspkg.ApprovalGrant, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	grants := make([]toolspkg.ApprovalGrant, 0)
+	for key, grant := range r.approvalGrants {
+		if key.WorkspaceID == workspaceID &&
+			(readScope.AllProfiles || key.ProfileID == readScope.ProfileID) {
+			grants = append(grants, grant)
+		}
+	}
+	return grants, nil
+}
+
+func (r *recordingRegistry) RevokeApprovalGrant(_ context.Context, profileID, workspaceID, id string) error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	for key, grant := range r.approvalGrants {
+		if key.ProfileID == profileID && key.WorkspaceID == workspaceID && grant.ID == id {
+			delete(r.approvalGrants, key)
+			return nil
+		}
+	}
+	return toolspkg.ErrApprovalGrantNotFound
+}
+
+func (r *recordingRegistry) CreateApproval(
+	_ context.Context,
+	approvalID string,
+	request toolspkg.ApprovalRequest,
+	now time.Time,
+) (toolspkg.ApprovalStatus, error) {
+	return toolspkg.ApprovalStatus{
+		ApprovalID: approvalID, WorkspaceID: request.WorkspaceID, InvocationID: request.InvocationID,
+		CommandID: request.CommandID, Target: request.Target, Args: request.Args,
+		ApprovalStatus: toolspkg.ApprovalPending, RequestedAt: now, ExpiresAt: request.ExpiresAt,
+	}, nil
+}
+
+func (r *recordingRegistry) GetApproval(context.Context, string) (toolspkg.ApprovalStatus, error) {
+	return toolspkg.ApprovalStatus{}, toolspkg.ErrApprovalNotFound
+}
+
+func (r *recordingRegistry) ResolveApproval(
+	context.Context,
+	string,
+	toolspkg.ApprovalOutcome,
+	time.Time,
+) (toolspkg.ApprovalStatus, error) {
+	return toolspkg.ApprovalStatus{}, toolspkg.ErrApprovalNotFound
+}
+
+func (r *recordingRegistry) CompleteApprovalExecution(
+	context.Context,
+	string,
+	toolspkg.ApprovalExecutionStatus,
+	json.RawMessage,
+	json.RawMessage,
+	time.Time,
+) (toolspkg.ApprovalStatus, error) {
+	return toolspkg.ApprovalStatus{}, toolspkg.ErrApprovalNotFound
+}
+
+func (r *recordingRegistry) ExpireApprovals(context.Context, time.Time) ([]toolspkg.ApprovalStatus, error) {
+	return nil, nil
+}
+
+func (r *recordingRegistry) RecoverDispatchingApprovals(
+	context.Context,
+	time.Time,
+) ([]toolspkg.ApprovalStatus, error) {
+	return nil, nil
+}
+
+func (r *recordingRegistry) ListPendingApprovals(context.Context) ([]toolspkg.ApprovalStatus, error) {
+	return nil, nil
+}
+
+func (r *recordingRegistry) RecordCmdPaletteUsage(
+	context.Context,
+	cmdpalette.Usage,
+	cmdpalette.Weights,
+) error {
+	return nil
+}
+
+func (r *recordingRegistry) CmdPalettePersonalization(
+	context.Context,
+	cmdpalette.ProfileLensID,
+	cmdpalette.WorkspaceID,
+) (cmdpalette.PersonalizationRows, error) {
+	return cmdpalette.PersonalizationRows{}, nil
+}
+
+func (r *recordingRegistry) PutCmdPalettePin(
+	context.Context,
+	cmdpalette.ProfileLensID,
+	cmdpalette.WorkspaceID,
+	cmdpalette.CommandID,
+	time.Time,
+) error {
+	return nil
+}
+
+func (r *recordingRegistry) DeleteCmdPalettePin(
+	context.Context,
+	cmdpalette.ProfileLensID,
+	cmdpalette.WorkspaceID,
+	cmdpalette.CommandID,
+) error {
+	return nil
+}
+
+func (r *recordingRegistry) PruneCmdPaletteCommand(
+	context.Context,
+	cmdpalette.ProfileLensID,
+	cmdpalette.WorkspaceID,
+	cmdpalette.CommandID,
+) error {
+	return nil
+}
+
+func (r *recordingRegistry) PruneCmdPaletteUsage(
+	context.Context,
+	cmdpalette.ProfileLensID,
+	cmdpalette.WorkspaceID,
+	cmdpalette.CommandID,
+) error {
+	return nil
+}
+
+func (r *recordingRegistry) PruneCmdPaletteQueryHit(
+	context.Context,
+	cmdpalette.ProfileLensID,
+	cmdpalette.WorkspaceID,
+	string,
+	cmdpalette.CommandID,
+) error {
+	return nil
+}
+
+func (r *recordingRegistry) ResetCmdPalettePersonalization(
+	context.Context,
+	cmdpalette.ProfileLensID,
+	cmdpalette.WorkspaceID,
+) error {
+	return nil
+}
+
+func (r *recordingRegistry) MarkDeadEntity(_ context.Context, entity store.DeadEntity) error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.deadEntities == nil {
+		r.deadEntities = make(map[store.DeadEntityKey]store.DeadEntity)
+	}
+	r.deadEntities[entity.DeadEntityKey] = entity
+	return nil
+}
+
+func (r *recordingRegistry) ClearDeadEntity(
+	_ context.Context,
+	key store.DeadEntityKey,
+) error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	delete(r.deadEntities, key)
+	return nil
+}
+
+func (r *recordingRegistry) FindDeadEntity(
+	_ context.Context,
+	key store.DeadEntityKey,
+) (store.DeadEntity, bool, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	entity, ok := r.deadEntities[key]
+	return entity, ok, nil
+}
+
+func (r *recordingRegistry) ListDeadEntities(
+	_ context.Context,
+	readScope store.ReadScope,
+	workspaceID string,
+) ([]store.DeadEntity, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	entities := make([]store.DeadEntity, 0)
+	for key, entity := range r.deadEntities {
+		if key.WorkspaceID == workspaceID &&
+			(readScope.AllProfiles || key.ProfileID == readScope.ProfileID) {
+			entities = append(entities, entity)
+		}
+	}
+	return entities, nil
+}
+
+var (
+	_ Registry              = (*recordingRegistry)(nil)
+	_ taskStore             = (*recordingRegistry)(nil)
+	_ store.DeadEntityStore = (*recordingRegistry)(nil)
+)
+
+func (r *recordingRegistry) Path() string {
+	return r.path
+}
+
+func (r *recordingRegistry) SweepAdmissionClaims(context.Context, time.Time, int) (int, error) {
+	return 0, nil
+}
+
+func (r *recordingRegistry) InsertWorkspace(_ context.Context, ws workspacepkg.Workspace) error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	r.ensureWorkspaceMapLocked()
+	for _, existing := range r.workspaces {
+		if existing.RootDir == ws.RootDir {
+			return workspacepkg.ErrWorkspacePathTaken
+		}
+		if existing.Name == ws.Name {
+			return workspacepkg.ErrWorkspaceNameTaken
+		}
+	}
+	r.workspaces[ws.ID] = cloneRecordingWorkspace(ws)
+	return nil
+}
+
+func (r *recordingRegistry) UpdateWorkspace(_ context.Context, ws workspacepkg.Workspace) error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	r.ensureWorkspaceMapLocked()
+	if _, ok := r.workspaces[ws.ID]; !ok {
+		return workspacepkg.ErrWorkspaceNotFound
+	}
+	for id, existing := range r.workspaces {
+		if id == ws.ID {
+			continue
+		}
+		if existing.RootDir == ws.RootDir {
+			return workspacepkg.ErrWorkspacePathTaken
+		}
+		if existing.Name == ws.Name {
+			return workspacepkg.ErrWorkspaceNameTaken
+		}
+	}
+	r.workspaces[ws.ID] = cloneRecordingWorkspace(ws)
+	return nil
+}
+
+func (r *recordingRegistry) DeleteWorkspace(_ context.Context, id string) error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	r.ensureWorkspaceMapLocked()
+	if _, ok := r.workspaces[id]; !ok {
+		return workspacepkg.ErrWorkspaceNotFound
+	}
+	delete(r.workspaces, id)
+	return nil
+}
+
+func (r *recordingRegistry) StageWorkspaceDeletion(_ context.Context, id string) error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	r.ensureWorkspaceMapLocked()
+	ws, ok := r.workspaces[id]
+	if !ok {
+		return workspacepkg.ErrWorkspaceNotFound
+	}
+	if r.workspaceDeletionIntents == nil {
+		r.workspaceDeletionIntents = make(map[string]workspacepkg.DeletionIntent)
+	}
+	r.workspaceDeletionIntents[id] = workspacepkg.DeletionIntent{Workspace: cloneRecordingWorkspace(ws)}
+	delete(r.workspaces, id)
+	return nil
+}
+
+func (r *recordingRegistry) GetWorkspaceDeletionIntent(
+	_ context.Context,
+	id string,
+) (workspacepkg.DeletionIntent, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	intent, ok := r.workspaceDeletionIntents[id]
+	if !ok {
+		return workspacepkg.DeletionIntent{}, workspacepkg.ErrWorkspaceDeletionIntentNotFound
+	}
+	intent.Workspace = cloneRecordingWorkspace(intent.Workspace)
+	return intent, nil
+}
+
+func (r *recordingRegistry) ListWorkspaceDeletionIntents(
+	context.Context,
+) ([]workspacepkg.DeletionIntent, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	intents := make([]workspacepkg.DeletionIntent, 0, len(r.workspaceDeletionIntents))
+	for _, intent := range r.workspaceDeletionIntents {
+		intent.Workspace = cloneRecordingWorkspace(intent.Workspace)
+		intents = append(intents, intent)
+	}
+	slices.SortFunc(intents, func(a, b workspacepkg.DeletionIntent) int {
+		return strings.Compare(a.Workspace.ID, b.Workspace.ID)
+	})
+	return intents, nil
+}
+
+func (r *recordingRegistry) CompleteWorkspaceDeletion(_ context.Context, id string) error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if _, ok := r.workspaceDeletionIntents[id]; !ok {
+		return workspacepkg.ErrWorkspaceDeletionIntentNotFound
+	}
+	delete(r.workspaceDeletionIntents, id)
+	return nil
+}
+
+func (r *recordingRegistry) GetWorkspace(_ context.Context, id string) (workspacepkg.Workspace, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	r.ensureWorkspaceMapLocked()
+	ws, ok := r.workspaces[id]
+	if ok {
+		return cloneRecordingWorkspace(ws), nil
+	}
+	return workspacepkg.Workspace{}, workspacepkg.ErrWorkspaceNotFound
+}
+
+func (r *recordingRegistry) GetWorkspaceByPath(
+	_ context.Context,
+	rootDir string,
+) (workspacepkg.Workspace, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	r.ensureWorkspaceMapLocked()
+	for _, ws := range r.workspaces {
+		if ws.RootDir == rootDir {
+			return cloneRecordingWorkspace(ws), nil
+		}
+	}
+	return workspacepkg.Workspace{}, workspacepkg.ErrWorkspaceNotFound
+}
+
+func (r *recordingRegistry) GetWorkspaceByName(
+	_ context.Context,
+	name string,
+) (workspacepkg.Workspace, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	r.ensureWorkspaceMapLocked()
+	for _, ws := range r.workspaces {
+		if ws.Name == name {
+			return cloneRecordingWorkspace(ws), nil
+		}
+	}
+	return workspacepkg.Workspace{}, workspacepkg.ErrWorkspaceNotFound
+}
+
+func (r *recordingRegistry) ListWorkspaces(context.Context) ([]workspacepkg.Workspace, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	r.ensureWorkspaceMapLocked()
+	workspaces := make([]workspacepkg.Workspace, 0, len(r.workspaces))
+	for _, ws := range r.workspaces {
+		workspaces = append(workspaces, cloneRecordingWorkspace(ws))
+	}
+	slices.SortFunc(workspaces, func(a, b workspacepkg.Workspace) int {
+		return cmp.Or(strings.Compare(a.Name, b.Name), strings.Compare(a.ID, b.ID))
+	})
+	return workspaces, nil
+}
+
+func (r *recordingRegistry) ensureWorkspaceMapLocked() {
+	if r.workspaces == nil {
+		r.workspaces = make(map[string]workspacepkg.Workspace)
+	}
+}
+
+func cloneRecordingWorkspace(ws workspacepkg.Workspace) workspacepkg.Workspace {
+	ws.AdditionalDirs = append([]string(nil), ws.AdditionalDirs...)
+	return ws
+}
+
+func (r *recordingRegistry) RegisterSession(context.Context, *store.SessionInfo) error {
+	return nil
+}
+
+func (r *recordingRegistry) UpdateSessionState(context.Context, store.SessionStateUpdate) error {
+	return nil
+}
+
+func (r *recordingRegistry) DeleteSession(context.Context, string) error {
+	return nil
+}
+
+func (r *recordingRegistry) ListSessions(context.Context, store.SessionListQuery) ([]store.SessionInfo, error) {
+	return nil, nil
+}
+
+func (r *recordingRegistry) AttachSession(context.Context, store.SessionAttachRequest) (store.SessionAttach, error) {
+	return store.SessionAttach{}, store.ErrSessionNotFound
+}
+
+func (r *recordingRegistry) ReconcileSessions(context.Context, []store.SessionInfo) (store.ReconcileResult, error) {
+	return store.ReconcileResult{}, nil
+}
+
+func (r *recordingRegistry) WriteEventSummary(context.Context, store.EventSummary) error {
+	return nil
+}
+
+func (r *recordingRegistry) WriteEventSummaries(context.Context, []store.EventSummary) error {
+	return nil
+}
+
+func (r *recordingRegistry) ListEventSummaries(context.Context, store.EventSummaryQuery) ([]store.EventSummary, error) {
+	return nil, nil
+}
+
+func (r *recordingRegistry) RecordTokenUsage(
+	context.Context,
+	store.TokenStatsUpdate,
+	store.TokenUsageDailyUpdate,
+) error {
+	return nil
+}
+
+func (r *recordingRegistry) ListTokenStats(context.Context, store.TokenStatsQuery) ([]store.TokenStats, error) {
+	return nil, nil
+}
+
+func (r *recordingRegistry) WritePermissionLog(context.Context, store.PermissionLogEntry) error {
+	return nil
+}
+
+func (r *recordingRegistry) ListPermissionLog(
+	context.Context,
+	store.PermissionLogQuery,
+) ([]store.PermissionLogEntry, error) {
+	return nil, nil
+}
+
+func (r *recordingRegistry) GetOnboardingStatus(context.Context) (store.OnboardingStatus, error) {
+	return store.OnboardingStatus{}, nil
+}
+
+func (r *recordingRegistry) CompleteOnboarding(context.Context, string) (store.OnboardingStatus, error) {
+	return store.OnboardingStatus{Completed: true}, nil
+}
+
+func (r *recordingRegistry) ResetOnboarding(context.Context) (store.OnboardingStatus, error) {
+	return store.OnboardingStatus{}, nil
+}
+
+func (r *recordingRegistry) GetAppMetadata(context.Context, string) (string, bool, error) {
+	return "", false, nil
+}
+
+func (r *recordingRegistry) SetAppMetadata(context.Context, string, string) error {
+	return nil
+}
+
+func (r *recordingRegistry) DeleteAppMetadata(context.Context, string) error {
+	return nil
+}
+
+func (r *recordingRegistry) PutTaskDesignationRollup(context.Context, store.TaskDesignationRollup) error {
+	return nil
+}
+
+func (r *recordingRegistry) ListTaskDesignationRollups(
+	context.Context,
+	store.TaskDesignationRollupQuery,
+) ([]store.TaskDesignationRollup, error) {
+	return nil, nil
+}
+
+func (r *recordingRegistry) CreateTask(context.Context, taskpkg.Task) error {
+	return nil
+}
+
+func (r *recordingRegistry) CreateTaskDefinition(
+	context.Context,
+	*taskpkg.CreateTaskDefinitionMutation,
+) error {
+	return nil
+}
+
+func (r *recordingRegistry) UpdateTaskDefinition(
+	context.Context,
+	*taskpkg.UpdateTaskDefinitionMutation,
+) (taskpkg.ExecutionProfile, error) {
+	return taskpkg.ExecutionProfile{}, nil
+}
+
+func (r *recordingRegistry) SetTaskExecutionProfile(
+	context.Context,
+	*taskpkg.ExecutionProfileMutation,
+) (taskpkg.ExecutionProfile, error) {
+	return taskpkg.ExecutionProfile{}, nil
+}
+
+func (r *recordingRegistry) SetTaskWorktreePolicy(
+	context.Context,
+	*taskpkg.WorktreePolicyMutation,
+) (taskpkg.ExecutionProfile, error) {
+	return taskpkg.ExecutionProfile{}, nil
+}
+
+func (r *recordingRegistry) DeleteTaskExecutionProfile(
+	context.Context,
+	taskpkg.ExecutionProfileDeleteMutation,
+) error {
+	return nil
+}
+
+func (r *recordingRegistry) UpdateTask(context.Context, taskpkg.Task, taskpkg.ActorContext) error {
+	return nil
+}
+
+func (r *recordingRegistry) DeleteTask(context.Context, string) error {
+	return nil
+}
+
+func (r *recordingRegistry) GetTask(context.Context, string) (taskpkg.Task, error) {
+	return taskpkg.Task{}, taskpkg.ErrTaskNotFound
+}
+func (r *recordingRegistry) ListTasks(context.Context, taskpkg.Query) ([]taskpkg.Summary, error) {
+	return nil, nil
+}
+
+func (r *recordingRegistry) CountDirectChildren(context.Context, string) (int, error) {
+	return 0, nil
+}
+
+func (r *recordingRegistry) CreateDependency(context.Context, taskpkg.Dependency) error {
+	return nil
+}
+
+func (r *recordingRegistry) DeleteDependency(context.Context, string, string) error {
+	return nil
+}
+
+func (r *recordingRegistry) ListDependencies(context.Context, string) ([]taskpkg.Dependency, error) {
+	return nil, nil
+}
+
+func (r *recordingRegistry) ListTaskBlocks(context.Context, string, bool) ([]taskpkg.TaskBlock, error) {
+	return nil, nil
+}
+
+func (r *recordingRegistry) ListExpiredTaskBlockTargets(
+	context.Context,
+	time.Time,
+) ([]taskpkg.BlockExpiryTarget, error) {
+	return nil, nil
+}
+
+func (r *recordingRegistry) HasOpenTaskBlocks(context.Context, string) (bool, error) {
+	return false, nil
+}
+
+func (r *recordingRegistry) CreateTaskBlock(
+	context.Context,
+	taskpkg.CreateTaskBlockMutation,
+) (taskpkg.BlockMutationResult, error) {
+	return taskpkg.BlockMutationResult{}, nil
+}
+
+func (r *recordingRegistry) ClearTaskBlock(
+	context.Context,
+	taskpkg.ClearTaskBlockMutation,
+) (taskpkg.TaskBlock, error) {
+	return taskpkg.TaskBlock{}, nil
+}
+
+func (r *recordingRegistry) ClearTaskNeedsAttention(
+	context.Context,
+	taskpkg.NeedsAttentionClearMutation,
+) (taskpkg.NeedsAttentionClearResult, error) {
+	return taskpkg.NeedsAttentionClearResult{}, nil
+}
+
+func (r *recordingRegistry) ExpireTaskBlocks(
+	context.Context,
+	taskpkg.ExpireTaskBlocksMutation,
+) (taskpkg.ExpireTaskBlocksResult, error) {
+	return taskpkg.ExpireTaskBlocksResult{}, nil
+}
+
+func (r *recordingRegistry) BlockTaskAndReleaseRun(
+	context.Context,
+	taskpkg.BlockTaskAndReleaseRunMutation,
+) (taskpkg.BlockTaskAndReleaseRunResult, error) {
+	return taskpkg.BlockTaskAndReleaseRunResult{}, nil
+}
+
+func (r *recordingRegistry) ListDependents(context.Context, string) ([]taskpkg.Dependency, error) {
+	return nil, nil
+}
+
+func (r *recordingRegistry) CountDependencies(context.Context, string) (int, error) {
+	return 0, nil
+}
+
+func (r *recordingRegistry) HasDependencyPath(context.Context, string, string) (bool, error) {
+	return false, nil
+}
+
+func (r *recordingRegistry) UpdateTaskRunMetadata(
+	context.Context,
+	taskpkg.RunMetadataMutation,
+) (taskpkg.Run, error) {
+	return taskpkg.Run{}, nil
+}
+
+func (r *recordingRegistry) FailTasklessRunOnBoot(
+	context.Context,
+	taskpkg.TerminalRunMutation,
+) (taskpkg.Run, error) {
+	return taskpkg.Run{}, taskpkg.ErrTaskRunNotFound
+}
+
+func (r *recordingRegistry) TransitionTerminalRun(
+	context.Context,
+	taskpkg.TerminalRunMutation,
+) (taskpkg.Run, error) {
+	return taskpkg.Run{}, taskpkg.ErrTaskRunNotFound
+}
+
+func (r *recordingRegistry) GetTaskRun(context.Context, string) (taskpkg.Run, error) {
+	return taskpkg.Run{}, taskpkg.ErrTaskRunNotFound
+}
+
+func (r *recordingRegistry) ReadTaskRunResultPage(
+	context.Context,
+	string,
+	int64,
+	int64,
+) (taskpkg.RunResultPage, error) {
+	return taskpkg.RunResultPage{}, taskpkg.ErrTaskRunResultNotFound
+}
+
+func (r *recordingRegistry) ListTaskRuns(context.Context, taskpkg.RunQuery) ([]taskpkg.Run, error) {
+	return nil, nil
+}
+
+func (r *recordingRegistry) ListTaskRunsByStatus(
+	_ context.Context,
+	statuses []taskpkg.RunStatus,
+) ([]taskpkg.Run, error) {
+	if r.onListTaskRunsByStatus != nil {
+		r.onListTaskRunsByStatus(append([]taskpkg.RunStatus(nil), statuses...))
+	}
+	return nil, nil
+}
+
+func (r *recordingRegistry) GetTaskTriageState(
+	context.Context,
+	string,
+	taskpkg.ActorIdentity,
+) (taskpkg.TriageState, error) {
+	return taskpkg.TriageState{}, taskpkg.ErrTaskTriageStateNotFound
+}
+
+func (r *recordingRegistry) UpsertTaskTriageState(context.Context, taskpkg.TriageState) error {
+	return nil
+}
+
+func (r *recordingRegistry) GetExecutionProfile(
+	context.Context,
+	string,
+) (taskpkg.ExecutionProfile, error) {
+	return taskpkg.ExecutionProfile{}, taskpkg.ErrExecutionProfileNotFound
+}
+
+func (r *recordingRegistry) UpsertExecutionProfile(
+	context.Context,
+	*taskpkg.ExecutionProfile,
+) (taskpkg.ExecutionProfile, error) {
+	return taskpkg.ExecutionProfile{}, nil
+}
+
+func (r *recordingRegistry) DeleteExecutionProfile(context.Context, string) error {
+	return taskpkg.ErrExecutionProfileNotFound
+}
+
+func (r *recordingRegistry) RequestRunReview(
+	context.Context,
+	*taskpkg.RunReview,
+) (taskpkg.RunReview, bool, error) {
+	return taskpkg.RunReview{}, false, taskpkg.ErrRunReviewNotFound
+}
+
+func (r *recordingRegistry) GetRunReview(context.Context, string) (taskpkg.RunReview, error) {
+	return taskpkg.RunReview{}, taskpkg.ErrRunReviewNotFound
+}
+
+func (r *recordingRegistry) RecordRunReview(
+	context.Context,
+	taskpkg.RecordRunReviewRequest,
+	taskpkg.ActorContext,
+	time.Time,
+	string,
+) (taskpkg.RunReviewResult, error) {
+	return taskpkg.RunReviewResult{}, taskpkg.ErrRunReviewNotFound
+}
+
+func (r *recordingRegistry) BindRunReviewSession(
+	context.Context,
+	taskpkg.BindRunReviewSessionRequest,
+	time.Time,
+) (taskpkg.RunReview, error) {
+	return taskpkg.RunReview{}, taskpkg.ErrRunReviewNotFound
+}
+
+func (r *recordingRegistry) LookupRunReviewBySession(context.Context, string) (taskpkg.RunReview, error) {
+	return taskpkg.RunReview{}, taskpkg.ErrRunReviewNotFound
+}
+
+func (r *recordingRegistry) ListRunReviews(context.Context, taskpkg.RunReviewQuery) ([]taskpkg.RunReview, error) {
+	return nil, nil
+}
+
+func (r *recordingRegistry) ListTaskTriageStates(
+	context.Context,
+	taskpkg.ActorIdentity,
+) ([]taskpkg.TriageState, error) {
+	return nil, nil
+}
+
+func (r *recordingRegistry) CountActiveSessionBindings(context.Context, string) (int, error) {
+	return 0, nil
+}
+
+func (r *recordingRegistry) WithLeaseSettlementTransaction(
+	_ context.Context,
+	_ string,
+	fn func(taskpkg.LeaseSettlementMutationStore) error,
+) error {
+	return fn(r)
+}
+
+func (r *recordingRegistry) WithTaskExecutionTransaction(
+	_ context.Context,
+	fn func(taskpkg.ExecutionMutationStore) error,
+) error {
+	return fn(r)
+}
+
+func (r *recordingRegistry) WithTaskMutationTransaction(
+	_ context.Context,
+	_ string,
+	mutation taskpkg.RunMutation,
+) error {
+	return mutation(r)
+}
+
+func (r *recordingRegistry) ReserveTerminalRunCommand(
+	_ context.Context,
+	command taskpkg.TerminalRunCommand,
+) (taskpkg.TerminalRunCommand, bool, error) {
+	return command, true, nil
+}
+
+func (r *recordingRegistry) AdvanceTerminalRunCommandPhase(
+	_ context.Context,
+	command taskpkg.TerminalRunCommand,
+	_ taskpkg.TerminalRunCommandPhase,
+	_ time.Time,
+) (taskpkg.TerminalRunCommand, error) {
+	return command, nil
+}
+
+func (r *recordingRegistry) ReleaseTerminalRunCommand(
+	context.Context,
+	taskpkg.TerminalRunCommand,
+) error {
+	return nil
+}
+
+func (r *recordingRegistry) ListTerminalRunCommands(
+	context.Context,
+) ([]taskpkg.TerminalRunCommand, error) {
+	return nil, nil
+}
+
+func (r *recordingRegistry) ConsumeTerminalRunCommand(
+	_ context.Context,
+	command taskpkg.TerminalRunCommand,
+	_ taskpkg.TerminalRunCommandPhase,
+) (taskpkg.TerminalRunCommand, error) {
+	return command, nil
+}
+
+func (r *recordingRegistry) SettleCompletedTaskHierarchy(
+	context.Context,
+	string,
+	taskpkg.ActorContext,
+	time.Time,
+) (taskpkg.CompletedRunSettlement, error) {
+	return taskpkg.CompletedRunSettlement{}, nil
+}
+
+func (r *recordingRegistry) AdmitRunDirectExecution(
+	context.Context,
+	taskpkg.RunDirectExecutionAdmissionMutation,
+) (taskpkg.NominalRunMutationResult, error) {
+	return taskpkg.NominalRunMutationResult{}, taskpkg.ErrTaskRunNotFound
+}
+
+func (r *recordingRegistry) TransitionRunStarting(
+	context.Context,
+	taskpkg.RunStartingMutation,
+) (taskpkg.NominalRunMutationResult, error) {
+	return taskpkg.NominalRunMutationResult{}, taskpkg.ErrTaskRunNotFound
+}
+
+func (r *recordingRegistry) BindRunSession(
+	context.Context,
+	taskpkg.RunSessionBindingMutation,
+) (taskpkg.NominalRunMutationResult, error) {
+	return taskpkg.NominalRunMutationResult{}, taskpkg.ErrTaskRunNotFound
+}
+
+func (r *recordingRegistry) TransitionRunRunning(
+	context.Context,
+	taskpkg.RunRunningMutation,
+) (taskpkg.NominalRunMutationResult, error) {
+	return taskpkg.NominalRunMutationResult{}, taskpkg.ErrTaskRunNotFound
+}
+
+func (r *recordingRegistry) RecoverTaskRunOnBoot(
+	context.Context,
+	taskpkg.RunBootRecoveryMutation,
+) (taskpkg.NominalRunMutationResult, error) {
+	return taskpkg.NominalRunMutationResult{}, taskpkg.ErrTaskRunNotFound
+}
+
+func (r *recordingRegistry) MarkRunNeedsAttentionMutation(
+	context.Context,
+	taskpkg.RunNeedsAttentionCommand,
+) (taskpkg.RunNeedsAttentionMutation, error) {
+	return taskpkg.RunNeedsAttentionMutation{}, taskpkg.ErrTaskRunNotFound
+}
+
+func (r *recordingRegistry) ClaimNextRun(
+	context.Context,
+	taskpkg.ClaimCriteria,
+) (taskpkg.ClaimResult, error) {
+	return taskpkg.ClaimResult{}, taskpkg.ErrNoClaimableRun
+}
+
+func (r *recordingRegistry) HeartbeatRunLease(
+	context.Context,
+	taskpkg.LeaseHeartbeat,
+) (taskpkg.Run, error) {
+	return taskpkg.Run{}, taskpkg.ErrTaskRunNotFound
+}
+
+func (r *recordingRegistry) BindLeasedRunSession(
+	context.Context,
+	taskpkg.LeaseSessionBinding,
+) (taskpkg.Run, error) {
+	return taskpkg.Run{}, taskpkg.ErrTaskRunNotFound
+}
+
+func (r *recordingRegistry) FailRunLeaseMutation(
+	context.Context,
+	taskpkg.LeaseFailure,
+) (taskpkg.FailedRunLeaseMutation, error) {
+	return taskpkg.FailedRunLeaseMutation{}, taskpkg.ErrTaskRunNotFound
+}
+
+func (r *recordingRegistry) ReleaseRunLease(
+	context.Context,
+	taskpkg.LeaseRelease,
+) (taskpkg.Run, error) {
+	return taskpkg.Run{}, taskpkg.ErrTaskRunNotFound
+}
+
+func (r *recordingRegistry) ListActiveSessionRunLeases(context.Context, string) ([]taskpkg.Run, error) {
+	return nil, nil
+}
+
+func (r *recordingRegistry) ReleaseSessionRunLease(
+	context.Context,
+	taskpkg.Run,
+	taskpkg.SessionLeaseRelease,
+	taskpkg.ActorContext,
+) (taskpkg.Run, error) {
+	return taskpkg.Run{}, taskpkg.ErrTaskRunNotFound
+}
+
+func (r *recordingRegistry) ForceReleaseTaskRun(
+	context.Context,
+	taskpkg.ForceReleaseRunMutation,
+) (taskpkg.ForceRunMutationResult, error) {
+	return taskpkg.ForceRunMutationResult{}, taskpkg.ErrTaskRunNotFound
+}
+
+func (r *recordingRegistry) ForceFailTaskRun(
+	context.Context,
+	taskpkg.ForceFailRunMutation,
+) (taskpkg.ForceRunMutationResult, error) {
+	return taskpkg.ForceRunMutationResult{}, taskpkg.ErrTaskRunNotFound
+}
+
+func (r *recordingRegistry) RetryTaskRun(
+	context.Context,
+	taskpkg.RetryRunMutation,
+) (taskpkg.RetryRunResult, error) {
+	return taskpkg.RetryRunResult{}, taskpkg.ErrTaskRunNotFound
+}
+
+func (r *recordingRegistry) RecoverTaskRun(
+	context.Context,
+	taskpkg.RecoverRunMutation,
+) (taskpkg.RetryRunResult, error) {
+	return taskpkg.RetryRunResult{}, taskpkg.ErrTaskRunNotFound
+}
+
+func (r *recordingRegistry) InvalidateForceRunInputs(
+	context.Context,
+	string,
+	time.Time,
+) (taskpkg.ForceRunInputInvalidation, error) {
+	return taskpkg.ForceRunInputInvalidation{}, nil
+}
+
+func (r *recordingRegistry) CompleteRunLease(
+	context.Context,
+	taskpkg.LeaseCompletion,
+) (taskpkg.Run, error) {
+	return taskpkg.Run{}, taskpkg.ErrTaskRunNotFound
+}
+
+func (r *recordingRegistry) CompleteRunLeaseSettlement(
+	context.Context,
+	taskpkg.LeaseCompletion,
+) (taskpkg.CompletedRunSettlement, error) {
+	return taskpkg.CompletedRunSettlement{}, taskpkg.ErrTaskRunNotFound
+}
+
+func (r *recordingRegistry) FailRunLease(
+	context.Context,
+	taskpkg.LeaseFailure,
+) (taskpkg.Run, error) {
+	return taskpkg.Run{}, taskpkg.ErrTaskRunNotFound
+}
+
+func (r *recordingRegistry) RecoverExpiredRunLeases(
+	context.Context,
+	taskpkg.ExpiredLeaseRecovery,
+) ([]taskpkg.ExpiredLeaseRecoveryResult, error) {
+	return nil, nil
+}
+
+func (r *recordingRegistry) ReserveQueuedRun(
+	context.Context,
+	taskpkg.QueueRunReservation,
+) (taskpkg.Task, taskpkg.Run, bool, error) {
+	return taskpkg.Task{}, taskpkg.Run{}, false, taskpkg.ErrTaskNotFound
+}
+
+func (r *recordingRegistry) CompleteCoordinatorAndEnqueueNext(
+	context.Context,
+	taskpkg.CoordinatorCompletion,
+	taskpkg.GenerationStateFinalizer,
+) (taskpkg.CoordinatorCompletionResult, error) {
+	return taskpkg.CoordinatorCompletionResult{}, taskpkg.ErrTaskRunNotFound
+}
+
+func (r *recordingRegistry) CreateTaskEvent(context.Context, taskpkg.Event) error {
+	return nil
+}
+
+func (r *recordingRegistry) ListTaskEvents(context.Context, taskpkg.EventQuery) ([]taskpkg.Event, error) {
+	return nil, nil
+}
+
+func (r *recordingRegistry) TaskWakeEventExists(context.Context, string, string) (bool, error) {
+	return false, nil
+}
+
+func (r *recordingRegistry) GetTaskEventRecord(context.Context, string) (taskpkg.EventRecord, error) {
+	return taskpkg.EventRecord{}, taskpkg.ErrTaskEventNotFound
+}
+
+func (r *recordingRegistry) ListTaskEventRecords(
+	context.Context,
+	taskpkg.EventRecordQuery,
+) ([]taskpkg.EventRecord, error) {
+	return nil, nil
+}
+
+func (r *recordingRegistry) GetTaskRunByIdempotencyKey(
+	context.Context,
+	string,
+	taskpkg.Origin,
+) (taskpkg.Run, error) {
+	return taskpkg.Run{}, taskpkg.ErrTaskRunIdempotencyNotFound
+}
+
+func (r *recordingRegistry) SaveTaskRunIdempotency(context.Context, taskpkg.RunIdempotency) error {
+	return nil
+}
+func (r *recordingRegistry) Close(context.Context) error {
+	if r.onClose != nil {
+		r.onClose()
+	}
+	return nil
+}
+
+type recordingNotifier struct {
+	events        []string
+	eventSessions []*session.Session
+}
+
+func (n *recordingNotifier) OnSessionCreated(context.Context, *session.Session) {
+	n.events = append(n.events, "created")
+}
+
+func (n *recordingNotifier) OnSessionStopped(context.Context, *session.Session) {
+	n.events = append(n.events, "stopped")
+}
+
+func (n *recordingNotifier) OnAgentEvent(context.Context, string, any) {
+	n.events = append(n.events, "agent")
+}
+
+func (n *recordingNotifier) OnAgentEventForSession(
+	_ context.Context,
+	sess *session.Session,
+	_ any,
+) {
+	n.events = append(n.events, "agent")
+	n.eventSessions = append(n.eventSessions, sess)
+}
+
+type recordingHookTelemetrySink struct {
+	calls []struct {
+		sessionID string
+		record    hookspkg.HookRunRecord
+	}
+}
+
+func (s *recordingHookTelemetrySink) WriteHookRecord(
+	_ context.Context,
+	sessionID string,
+	record hookspkg.HookRunRecord,
+) error {
+	s.calls = append(s.calls, struct {
+		sessionID string
+		record    hookspkg.HookRunRecord
+	}{
+		sessionID: sessionID,
+		record:    record,
+	})
+	return nil
+}
+
+func (s *recordingHookTelemetrySink) count() int {
+	if s == nil {
+		return 0
+	}
+	return len(s.calls)
+}
+
+type fakeAutomationManager struct {
+	jobs              []automationpkg.Job
+	triggers          []automationpkg.Trigger
+	runs              []automationpkg.Run
+	status            automationpkg.ManagerStatus
+	startCount        int
+	shutdownCount     int
+	startErr          error
+	shutdownErr       error
+	onStart           func()
+	onShutdown        func()
+	sessionObserver   session.Notifier
+	hookTelemetrySink hookspkg.TelemetrySink
+}
+
+func (f *fakeAutomationManager) Start(context.Context) error {
+	f.startCount++
+	if f.onStart != nil {
+		f.onStart()
+	}
+	f.status.Running = true
+	return f.startErr
+}
+
+func (f *fakeAutomationManager) Shutdown(context.Context) error {
+	f.shutdownCount++
+	if f.onShutdown != nil {
+		f.onShutdown()
+	}
+	f.status.Running = false
+	f.status.SchedulerRunning = false
+	return f.shutdownErr
+}
+
+func (f *fakeAutomationManager) ListSuggestions(
+	context.Context,
+	store.ReadScope,
+	string,
+	automationpkg.SuggestionStatus,
+) ([]automationpkg.Suggestion, error) {
+	return nil, nil
+}
+
+func (f *fakeAutomationManager) AcceptSuggestion(
+	context.Context,
+	string,
+	string,
+	string,
+) (automationpkg.SuggestionAcceptance, error) {
+	return automationpkg.SuggestionAcceptance{}, automationpkg.ErrSuggestionNotFound
+}
+
+func (f *fakeAutomationManager) DismissSuggestion(
+	context.Context,
+	string,
+	string,
+	string,
+) (automationpkg.Suggestion, error) {
+	return automationpkg.Suggestion{}, automationpkg.ErrSuggestionNotFound
+}
+
+func (f *fakeAutomationManager) Jobs(context.Context) ([]automationpkg.Job, error) {
+	return append([]automationpkg.Job(nil), f.jobs...), nil
+}
+
+func (*fakeAutomationManager) EffectivePackageAutomation(
+	_ context.Context,
+	jobs []automationpkg.Job,
+	triggers []automationpkg.Trigger,
+) ([]automationpkg.Job, []automationpkg.Trigger, error) {
+	return append([]automationpkg.Job(nil), jobs...), append([]automationpkg.Trigger(nil), triggers...), nil
+}
+
+func (f *fakeAutomationManager) ListJobs(
+	_ context.Context,
+	query automationpkg.JobListQuery,
+) (automationpkg.JobListPage, error) {
+	return automationpkg.BuildJobListPage(f.jobs, query)
+}
+
+func (f *fakeAutomationManager) GetJob(_ context.Context, id string) (automationpkg.Job, error) {
+	for _, job := range f.jobs {
+		if job.ID == strings.TrimSpace(id) {
+			return job, nil
+		}
+	}
+	return automationpkg.Job{}, automationpkg.ErrJobNotFound
+}
+
+func (f *fakeAutomationManager) CreateJob(_ context.Context, job automationpkg.Job) (automationpkg.Job, error) {
+	f.jobs = append(f.jobs, job)
+	return job, nil
+}
+
+func (f *fakeAutomationManager) UpdateJob(_ context.Context, job automationpkg.Job) (automationpkg.Job, error) {
+	for i := range f.jobs {
+		if f.jobs[i].ID == strings.TrimSpace(job.ID) {
+			f.jobs[i] = job
+			return job, nil
+		}
+	}
+	return automationpkg.Job{}, automationpkg.ErrJobNotFound
+}
+
+func (f *fakeAutomationManager) DeleteJob(_ context.Context, id string) error {
+	for i := range f.jobs {
+		if f.jobs[i].ID == strings.TrimSpace(id) {
+			f.jobs = append(f.jobs[:i], f.jobs[i+1:]...)
+			return nil
+		}
+	}
+	return automationpkg.ErrJobNotFound
+}
+
+func (f *fakeAutomationManager) TriggerJob(ctx context.Context, id string) (automationpkg.Run, error) {
+	return f.TriggerJobWithPayload(ctx, id, nil)
+}
+
+func (f *fakeAutomationManager) TriggerJobWithPayload(
+	_ context.Context,
+	id string,
+	_ map[string]any,
+) (automationpkg.Run, error) {
+	run := automationpkg.Run{
+		ID:      "run-" + strings.TrimSpace(id),
+		JobID:   strings.TrimSpace(id),
+		Status:  automationpkg.RunCompleted,
+		Attempt: 1,
+	}
+	f.runs = append(f.runs, run)
+	return run, nil
+}
+
+func (f *fakeAutomationManager) Triggers(context.Context) ([]automationpkg.Trigger, error) {
+	return append([]automationpkg.Trigger(nil), f.triggers...), nil
+}
+
+func (f *fakeAutomationManager) ListTriggers(
+	_ context.Context,
+	query automationpkg.TriggerListQuery,
+) (automationpkg.TriggerListPage, error) {
+	return automationpkg.BuildTriggerListPage(f.triggers, query)
+}
+
+func (f *fakeAutomationManager) GetTrigger(_ context.Context, id string) (automationpkg.Trigger, error) {
+	for _, trigger := range f.triggers {
+		if trigger.ID == strings.TrimSpace(id) {
+			return trigger, nil
+		}
+	}
+	return automationpkg.Trigger{}, automationpkg.ErrTriggerNotFound
+}
+
+func (f *fakeAutomationManager) CreateTrigger(
+	_ context.Context,
+	trigger automationpkg.Trigger,
+	_ automationpkg.WebhookSecretWrite,
+) (automationpkg.Trigger, error) {
+	f.triggers = append(f.triggers, trigger)
+	return trigger, nil
+}
+
+func (f *fakeAutomationManager) UpdateTrigger(
+	_ context.Context,
+	trigger automationpkg.Trigger,
+	_ *automationpkg.WebhookSecretWrite,
+) (automationpkg.Trigger, error) {
+	for i := range f.triggers {
+		if f.triggers[i].ID == strings.TrimSpace(trigger.ID) {
+			f.triggers[i] = trigger
+			return trigger, nil
+		}
+	}
+	return automationpkg.Trigger{}, automationpkg.ErrTriggerNotFound
+}
+
+func (f *fakeAutomationManager) DeleteTrigger(_ context.Context, id string) error {
+	for i := range f.triggers {
+		if f.triggers[i].ID == strings.TrimSpace(id) {
+			f.triggers = append(f.triggers[:i], f.triggers[i+1:]...)
+			return nil
+		}
+	}
+	return automationpkg.ErrTriggerNotFound
+}
+
+func (f *fakeAutomationManager) Runs(context.Context, automationpkg.RunQuery) ([]automationpkg.Run, error) {
+	return append([]automationpkg.Run(nil), f.runs...), nil
+}
+
+func (f *fakeAutomationManager) ListRuns(_ context.Context, query automationpkg.RunQuery) ([]automationpkg.Run, error) {
+	runs := make([]automationpkg.Run, 0, len(f.runs))
+	for _, run := range f.runs {
+		if query.JobID != "" && run.JobID != query.JobID {
+			continue
+		}
+		if query.TriggerID != "" && run.TriggerID != query.TriggerID {
+			continue
+		}
+		if query.Status != "" && run.Status != query.Status {
+			continue
+		}
+		runs = append(runs, run)
+	}
+	return runs, nil
+}
+
+func (f *fakeAutomationManager) LatestRunsByOwner(
+	_ context.Context,
+	owner automationpkg.RunOwnerKind,
+	ids []string,
+) (map[string]automationpkg.Run, error) {
+	result := make(map[string]automationpkg.Run)
+	for _, id := range ids {
+		for _, run := range f.runs {
+			ownerID := run.JobID
+			if owner == automationpkg.RunOwnerTrigger {
+				ownerID = run.TriggerID
+			}
+			if ownerID != id {
+				continue
+			}
+			previous, exists := result[id]
+			if !exists ||
+				(run.StartedAt != nil && (previous.StartedAt == nil || run.StartedAt.After(*previous.StartedAt))) ||
+				(run.StartedAt != nil && previous.StartedAt != nil && run.StartedAt.Equal(*previous.StartedAt) && run.ID > previous.ID) {
+				result[id] = run
+			}
+		}
+	}
+	return result, nil
+}
+
+func (f *fakeAutomationManager) GetRun(_ context.Context, id string) (automationpkg.Run, error) {
+	for _, run := range f.runs {
+		if run.ID == strings.TrimSpace(id) {
+			return run, nil
+		}
+	}
+	return automationpkg.Run{}, automationpkg.ErrRunNotFound
+}
+
+func (f *fakeAutomationManager) Status(context.Context) (automationpkg.ManagerStatus, error) {
+	return f.status, nil
+}
+
+func (f *fakeAutomationManager) SetJobEnabled(context.Context, string, bool) (automationpkg.Job, error) {
+	return automationpkg.Job{}, nil
+}
+
+func (f *fakeAutomationManager) SetTriggerEnabled(context.Context, string, bool) (automationpkg.Trigger, error) {
+	return automationpkg.Trigger{}, nil
+}
+
+func (f *fakeAutomationManager) HandleWebhook(
+	context.Context,
+	automationpkg.WebhookRequest,
+) (automationpkg.TriggerResult, error) {
+	return automationpkg.TriggerResult{}, nil
+}
+
+func (f *fakeAutomationManager) SyncManagedDefinitions(
+	_ context.Context,
+	source automationpkg.JobSource,
+	desiredJobs []automationpkg.Job,
+	desiredTriggers []automationpkg.Trigger,
+) (automationpkg.SyncStats, error) {
+	f.jobs = slices.DeleteFunc(append([]automationpkg.Job(nil), f.jobs...), func(job automationpkg.Job) bool {
+		return job.Source == source
+	})
+	f.jobs = append(f.jobs, desiredJobs...)
+
+	f.triggers = slices.DeleteFunc(
+		append([]automationpkg.Trigger(nil), f.triggers...),
+		func(trigger automationpkg.Trigger) bool {
+			return trigger.Source == source
+		},
+	)
+	f.triggers = append(f.triggers, desiredTriggers...)
+
+	return automationpkg.SyncStats{
+		JobsSynced:     len(desiredJobs),
+		TriggersSynced: len(desiredTriggers),
+		SyncedAt:       time.Now().UTC(),
+	}, nil
+}
+
+func (f *fakeAutomationManager) FireExtensionTrigger(
+	_ context.Context,
+	request automationpkg.ExtensionTriggerRequest,
+) (automationpkg.TriggerResult, error) {
+	return automationpkg.TriggerResult{
+		Matched: 0,
+		Runs:    append([]automationpkg.Run(nil), f.runs...),
+	}, request.Validate("extension_trigger")
+}
+
+func (f *fakeAutomationManager) SessionObserver() session.Notifier {
+	if f.sessionObserver != nil {
+		return f.sessionObserver
+	}
+	return &recordingNotifier{}
+}
+
+func (f *fakeAutomationManager) HookTelemetrySink() hookspkg.TelemetrySink {
+	if f.hookTelemetrySink != nil {
+		return f.hookTelemetrySink
+	}
+	return &recordingHookTelemetrySink{}
+}
+
+type fakeHookRuntime struct {
+	version            int64
+	onRebuild          func(context.Context) error
+	onClose            func()
+	onDispatchCreate   func(context.Context, hookspkg.SessionPostCreatePayload) error
+	onDispatchStop     func(context.Context, hookspkg.SessionPostStopPayload) error
+	onTurnStart        func(context.Context, hookspkg.TurnStartPayload) error
+	onTurnEnd          func(context.Context, hookspkg.TurnEndPayload) error
+	onMessageStart     func(context.Context, hookspkg.MessageStartPayload) error
+	onMessageDelta     func(context.Context, hookspkg.MessageDeltaPayload) error
+	onMessageEnd       func(context.Context, hookspkg.MessageEndPayload) error
+	onMessagePersisted func(context.Context, hookspkg.SessionMessagePersistedPayload) error
+	onToolPreCall      func(context.Context, hookspkg.ToolPreCallPayload) error
+	onToolPostCall     func(context.Context, hookspkg.ToolPostCallPayload) error
+	onToolPostError    func(context.Context, hookspkg.ToolPostErrorPayload) error
+	onPermRequest      func(context.Context, hookspkg.PermissionRequestPayload) error
+	onPermResolved     func(context.Context, hookspkg.PermissionResolvedPayload) error
+	onPermDenied       func(context.Context, hookspkg.PermissionDeniedPayload) error
+	onPreCompact       func(context.Context, hookspkg.ContextPreCompactPayload) error
+	onPostCompact      func(context.Context, hookspkg.ContextPostCompactPayload) error
+	onTaskRunEnqueued  func(context.Context, hookspkg.TaskRunEnqueuedPayload) error
+	onTaskRunPreClaim  func(context.Context, hookspkg.TaskRunPreClaimPayload) error
+	onTaskRunPostClaim func(context.Context, hookspkg.TaskRunPostClaimPayload) error
+	onTaskRunRecovered func(context.Context, hookspkg.TaskRunLeaseRecoveredPayload) error
+	onLoopNodeTerminal func(context.Context, hookspkg.LoopNodeTerminalPayload) error
+	onLoopTerminal     func(context.Context, hookspkg.LoopTerminalPayload) error
+	onSpawnPreCreate   func(context.Context, hookspkg.SpawnPreCreatePayload) error
+}
+
+func (f *fakeHookRuntime) Rebuild(ctx context.Context) error {
+	if f.onRebuild != nil {
+		return f.onRebuild(ctx)
+	}
+	return nil
+}
+
+func (f *fakeHookRuntime) Close() {
+	if f.onClose != nil {
+		f.onClose()
+	}
+}
+
+func (f *fakeHookRuntime) Version() int64 {
+	return f.version
+}
+
+func (f *fakeHookRuntime) DispatchSessionPreCreate(
+	_ context.Context,
+	payload hookspkg.SessionPreCreatePayload,
+) (hookspkg.SessionPreCreatePayload, error) {
+	return payload, nil
+}
+
+func (f *fakeHookRuntime) DispatchSessionPostCreate(
+	ctx context.Context,
+	payload hookspkg.SessionPostCreatePayload,
+) (hookspkg.SessionPostCreatePayload, error) {
+	if f.onDispatchCreate != nil {
+		return payload, f.onDispatchCreate(ctx, payload)
+	}
+	return payload, nil
+}
+
+func (f *fakeHookRuntime) DispatchSessionPreResume(
+	_ context.Context,
+	payload hookspkg.SessionPreResumePayload,
+) (hookspkg.SessionPreResumePayload, error) {
+	return payload, nil
+}
+
+func (f *fakeHookRuntime) DispatchSessionPostResume(
+	_ context.Context,
+	payload hookspkg.SessionPostResumePayload,
+) (hookspkg.SessionPostResumePayload, error) {
+	return payload, nil
+}
+
+func (f *fakeHookRuntime) DispatchSessionPreStop(
+	_ context.Context,
+	payload hookspkg.SessionPreStopPayload,
+) (hookspkg.SessionPreStopPayload, error) {
+	return payload, nil
+}
+
+func (f *fakeHookRuntime) DispatchSessionPostStop(
+	ctx context.Context,
+	payload hookspkg.SessionPostStopPayload,
+) (hookspkg.SessionPostStopPayload, error) {
+	if f.onDispatchStop != nil {
+		return payload, f.onDispatchStop(ctx, payload)
+	}
+	return payload, nil
+}
+
+func (f *fakeHookRuntime) DispatchSessionRuntimeRecoveryStarted(
+	_ context.Context,
+	payload hookspkg.SessionRuntimeRecoveryStartedPayload,
+) (hookspkg.SessionRuntimeRecoveryStartedPayload, error) {
+	return payload, nil
+}
+
+func (f *fakeHookRuntime) DispatchSessionRuntimeRecoverySucceeded(
+	_ context.Context,
+	payload hookspkg.SessionRuntimeRecoverySucceededPayload,
+) (hookspkg.SessionRuntimeRecoverySucceededPayload, error) {
+	return payload, nil
+}
+
+func (f *fakeHookRuntime) DispatchSessionRuntimeRecoveryExhausted(
+	_ context.Context,
+	payload hookspkg.SessionRuntimeRecoveryExhaustedPayload,
+) (hookspkg.SessionRuntimeRecoveryExhaustedPayload, error) {
+	return payload, nil
+}
+
+func (f *fakeHookRuntime) DispatchInputPreSubmit(
+	_ context.Context,
+	payload hookspkg.InputPreSubmitPayload,
+) (hookspkg.InputPreSubmitPayload, error) {
+	return payload, nil
+}
+
+func (f *fakeHookRuntime) DispatchPromptPostAssemble(
+	_ context.Context,
+	payload hookspkg.PromptPayload,
+) (hookspkg.PromptPayload, error) {
+	return payload, nil
+}
+
+func (f *fakeHookRuntime) DispatchEventPreRecord(
+	_ context.Context,
+	payload hookspkg.EventPreRecordPayload,
+) (hookspkg.EventPreRecordPayload, error) {
+	return payload, nil
+}
+
+func (f *fakeHookRuntime) DispatchEventPostRecord(
+	_ context.Context,
+	payload hookspkg.EventPostRecordPayload,
+) (hookspkg.EventPostRecordPayload, error) {
+	return payload, nil
+}
+
+func (f *fakeHookRuntime) DispatchAutomationJobPreFire(
+	_ context.Context,
+	payload hookspkg.AutomationJobPreFirePayload,
+) (hookspkg.AutomationJobPreFirePayload, error) {
+	return payload, nil
+}
+
+func (f *fakeHookRuntime) DispatchAutomationJobPostFire(
+	_ context.Context,
+	payload hookspkg.AutomationJobPostFirePayload,
+) (hookspkg.AutomationJobPostFirePayload, error) {
+	return payload, nil
+}
+
+func (f *fakeHookRuntime) DispatchAutomationTriggerPreFire(
+	_ context.Context,
+	payload hookspkg.AutomationTriggerPreFirePayload,
+) (hookspkg.AutomationTriggerPreFirePayload, error) {
+	return payload, nil
+}
+
+func (f *fakeHookRuntime) DispatchAutomationTriggerPostFire(
+	_ context.Context,
+	payload hookspkg.AutomationTriggerPostFirePayload,
+) (hookspkg.AutomationTriggerPostFirePayload, error) {
+	return payload, nil
+}
+
+func (f *fakeHookRuntime) DispatchAutomationRunCompleted(
+	_ context.Context,
+	payload hookspkg.AutomationRunCompletedPayload,
+) (hookspkg.AutomationRunCompletedPayload, error) {
+	return payload, nil
+}
+
+func (f *fakeHookRuntime) DispatchAutomationRunFailed(
+	_ context.Context,
+	payload hookspkg.AutomationRunFailedPayload,
+) (hookspkg.AutomationRunFailedPayload, error) {
+	return payload, nil
+}
+
+func (f *fakeHookRuntime) DispatchAgentPreStart(
+	_ context.Context,
+	payload hookspkg.AgentPreStartPayload,
+) (hookspkg.AgentPreStartPayload, error) {
+	return payload, nil
+}
+
+func (f *fakeHookRuntime) DispatchAgentSpawned(
+	_ context.Context,
+	payload hookspkg.AgentSpawnedPayload,
+) (hookspkg.AgentSpawnedPayload, error) {
+	return payload, nil
+}
+
+func (f *fakeHookRuntime) DispatchAgentCrashed(
+	_ context.Context,
+	payload hookspkg.AgentCrashedPayload,
+) (hookspkg.AgentCrashedPayload, error) {
+	return payload, nil
+}
+
+func (f *fakeHookRuntime) DispatchAgentStopped(
+	_ context.Context,
+	payload hookspkg.AgentStoppedPayload,
+) (hookspkg.AgentStoppedPayload, error) {
+	return payload, nil
+}
+
+func (f *fakeHookRuntime) DispatchTurnStart(
+	ctx context.Context,
+	payload hookspkg.TurnStartPayload,
+) (hookspkg.TurnStartPayload, error) {
+	if f.onTurnStart != nil {
+		return payload, f.onTurnStart(ctx, payload)
+	}
+	return payload, nil
+}
+
+func (f *fakeHookRuntime) DispatchTurnEnd(
+	ctx context.Context,
+	payload hookspkg.TurnEndPayload,
+) (hookspkg.TurnEndPayload, error) {
+	if f.onTurnEnd != nil {
+		return payload, f.onTurnEnd(ctx, payload)
+	}
+	return payload, nil
+}
+
+func (f *fakeHookRuntime) DispatchMessageStart(
+	ctx context.Context,
+	payload hookspkg.MessageStartPayload,
+) (hookspkg.MessageStartPayload, error) {
+	if f.onMessageStart != nil {
+		return payload, f.onMessageStart(ctx, payload)
+	}
+	return payload, nil
+}
+
+func (f *fakeHookRuntime) DispatchMessageDelta(
+	ctx context.Context,
+	payload hookspkg.MessageDeltaPayload,
+) (hookspkg.MessageDeltaPayload, error) {
+	if f.onMessageDelta != nil {
+		return payload, f.onMessageDelta(ctx, payload)
+	}
+	return payload, nil
+}
+
+func (f *fakeHookRuntime) DispatchMessageEnd(
+	ctx context.Context,
+	payload hookspkg.MessageEndPayload,
+) (hookspkg.MessageEndPayload, error) {
+	if f.onMessageEnd != nil {
+		return payload, f.onMessageEnd(ctx, payload)
+	}
+	return payload, nil
+}
+
+func (f *fakeHookRuntime) DispatchSessionMessagePersisted(
+	ctx context.Context,
+	payload hookspkg.SessionMessagePersistedPayload,
+) (hookspkg.SessionMessagePersistedPayload, error) {
+	if f.onMessagePersisted != nil {
+		return payload, f.onMessagePersisted(ctx, payload)
+	}
+	return payload, nil
+}
+
+func (f *fakeHookRuntime) DispatchToolPreCall(
+	ctx context.Context,
+	payload hookspkg.ToolPreCallPayload,
+) (hookspkg.ToolPreCallPayload, error) {
+	if f.onToolPreCall != nil {
+		return payload, f.onToolPreCall(ctx, payload)
+	}
+	return payload, nil
+}
+
+func (f *fakeHookRuntime) DispatchToolPostCall(
+	ctx context.Context,
+	payload hookspkg.ToolPostCallPayload,
+) (hookspkg.ToolPostCallPayload, error) {
+	if f.onToolPostCall != nil {
+		return payload, f.onToolPostCall(ctx, payload)
+	}
+	return payload, nil
+}
+
+func (f *fakeHookRuntime) DispatchToolPostError(
+	ctx context.Context,
+	payload hookspkg.ToolPostErrorPayload,
+) (hookspkg.ToolPostErrorPayload, error) {
+	if f.onToolPostError != nil {
+		return payload, f.onToolPostError(ctx, payload)
+	}
+	return payload, nil
+}
+
+func (f *fakeHookRuntime) DispatchPermissionRequest(
+	ctx context.Context,
+	payload hookspkg.PermissionRequestPayload,
+) (hookspkg.PermissionRequestPayload, error) {
+	if f.onPermRequest != nil {
+		return payload, f.onPermRequest(ctx, payload)
+	}
+	return payload, nil
+}
+
+func (f *fakeHookRuntime) DispatchPermissionResolved(
+	ctx context.Context,
+	payload hookspkg.PermissionResolvedPayload,
+) (hookspkg.PermissionResolvedPayload, error) {
+	if f.onPermResolved != nil {
+		return payload, f.onPermResolved(ctx, payload)
+	}
+	return payload, nil
+}
+
+func (f *fakeHookRuntime) DispatchPermissionDenied(
+	ctx context.Context,
+	payload hookspkg.PermissionDeniedPayload,
+) (hookspkg.PermissionDeniedPayload, error) {
+	if f.onPermDenied != nil {
+		return payload, f.onPermDenied(ctx, payload)
+	}
+	return payload, nil
+}
+
+func (f *fakeHookRuntime) DispatchContextPreCompact(
+	ctx context.Context,
+	payload hookspkg.ContextPreCompactPayload,
+) (hookspkg.ContextPreCompactPayload, error) {
+	if f.onPreCompact != nil {
+		return payload, f.onPreCompact(ctx, payload)
+	}
+	return payload, nil
+}
+
+func (f *fakeHookRuntime) DispatchContextPostCompact(
+	ctx context.Context,
+	payload hookspkg.ContextPostCompactPayload,
+) (hookspkg.ContextPostCompactPayload, error) {
+	if f.onPostCompact != nil {
+		return payload, f.onPostCompact(ctx, payload)
+	}
+	return payload, nil
+}
+
+func (f *fakeHookRuntime) DispatchCoordinatorPreSpawn(
+	_ context.Context,
+	payload hookspkg.CoordinatorPreSpawnPayload,
+) (hookspkg.CoordinatorPreSpawnPayload, error) {
+	return payload, nil
+}
+
+func (f *fakeHookRuntime) DispatchCoordinatorSpawned(
+	_ context.Context,
+	payload hookspkg.CoordinatorSpawnedPayload,
+) (hookspkg.CoordinatorSpawnedPayload, error) {
+	return payload, nil
+}
+
+func (f *fakeHookRuntime) DispatchCoordinatorDecision(
+	_ context.Context,
+	payload hookspkg.CoordinatorDecisionPayload,
+) (hookspkg.CoordinatorDecisionPayload, error) {
+	return payload, nil
+}
+
+func (f *fakeHookRuntime) DispatchCoordinatorStopped(
+	_ context.Context,
+	payload hookspkg.CoordinatorStoppedPayload,
+) (hookspkg.CoordinatorStoppedPayload, error) {
+	return payload, nil
+}
+
+func (f *fakeHookRuntime) DispatchCoordinatorFailed(
+	_ context.Context,
+	payload hookspkg.CoordinatorFailedPayload,
+) (hookspkg.CoordinatorFailedPayload, error) {
+	return payload, nil
+}
+
+func (f *fakeHookRuntime) DispatchTaskBlocked(
+	_ context.Context,
+	payload hookspkg.TaskBlockedPayload,
+) (hookspkg.TaskBlockedPayload, error) {
+	return payload, nil
+}
+
+func (f *fakeHookRuntime) DispatchTaskUnblocked(
+	_ context.Context,
+	payload hookspkg.TaskUnblockedPayload,
+) (hookspkg.TaskUnblockedPayload, error) {
+	return payload, nil
+}
+
+func (f *fakeHookRuntime) DispatchTaskNeedsAttention(
+	_ context.Context,
+	payload hookspkg.TaskNeedsAttentionPayload,
+) (hookspkg.TaskNeedsAttentionPayload, error) {
+	return payload, nil
+}
+
+func (f *fakeHookRuntime) DispatchTaskRecovered(
+	_ context.Context,
+	payload hookspkg.TaskRecoveredPayload,
+) (hookspkg.TaskRecoveredPayload, error) {
+	return payload, nil
+}
+
+func (f *fakeHookRuntime) DispatchTaskStatusChanged(
+	_ context.Context,
+	payload hookspkg.TaskStatusChangedPayload,
+) (hookspkg.TaskStatusChangedPayload, error) {
+	return payload, nil
+}
+
+func (f *fakeHookRuntime) DispatchTaskRunEnqueued(
+	ctx context.Context,
+	payload hookspkg.TaskRunEnqueuedPayload,
+) (hookspkg.TaskRunEnqueuedPayload, error) {
+	if f.onTaskRunEnqueued != nil {
+		return payload, f.onTaskRunEnqueued(ctx, payload)
+	}
+	return payload, nil
+}
+
+func (f *fakeHookRuntime) DispatchTaskRunPreClaim(
+	ctx context.Context,
+	payload hookspkg.TaskRunPreClaimPayload,
+) (hookspkg.TaskRunPreClaimPayload, error) {
+	if f.onTaskRunPreClaim != nil {
+		return payload, f.onTaskRunPreClaim(ctx, payload)
+	}
+	return payload, nil
+}
+
+func (f *fakeHookRuntime) DispatchTaskRunPostClaim(
+	ctx context.Context,
+	payload hookspkg.TaskRunPostClaimPayload,
+) (hookspkg.TaskRunPostClaimPayload, error) {
+	if f.onTaskRunPostClaim != nil {
+		return payload, f.onTaskRunPostClaim(ctx, payload)
+	}
+	return payload, nil
+}
+
+func (f *fakeHookRuntime) DispatchTaskRunLeaseExtended(
+	_ context.Context,
+	payload hookspkg.TaskRunLeaseExtendedPayload,
+) (hookspkg.TaskRunLeaseExtendedPayload, error) {
+	return payload, nil
+}
+
+func (f *fakeHookRuntime) DispatchTaskRunLeaseExpired(
+	_ context.Context,
+	payload hookspkg.TaskRunLeaseExpiredPayload,
+) (hookspkg.TaskRunLeaseExpiredPayload, error) {
+	return payload, nil
+}
+
+func (f *fakeHookRuntime) DispatchTaskRunLeaseRecovered(
+	ctx context.Context,
+	payload hookspkg.TaskRunLeaseRecoveredPayload,
+) (hookspkg.TaskRunLeaseRecoveredPayload, error) {
+	if f.onTaskRunRecovered != nil {
+		return payload, f.onTaskRunRecovered(ctx, payload)
+	}
+	return payload, nil
+}
+
+func (f *fakeHookRuntime) DispatchTaskRunReleased(
+	_ context.Context,
+	payload hookspkg.TaskRunReleasedPayload,
+) (hookspkg.TaskRunReleasedPayload, error) {
+	return payload, nil
+}
+
+func (f *fakeHookRuntime) DispatchTaskRunCompleted(
+	_ context.Context,
+	payload hookspkg.TaskRunCompletedPayload,
+) (hookspkg.TaskRunCompletedPayload, error) {
+	return payload, nil
+}
+
+func (f *fakeHookRuntime) DispatchTaskRunFailed(
+	_ context.Context,
+	payload hookspkg.TaskRunFailedPayload,
+) (hookspkg.TaskRunFailedPayload, error) {
+	return payload, nil
+}
+
+func (f *fakeHookRuntime) DispatchLoopStarted(
+	_ context.Context,
+	payload hookspkg.LoopStartedPayload,
+) (hookspkg.LoopStartedPayload, error) {
+	return payload, nil
+}
+
+func (f *fakeHookRuntime) DispatchLoopGenerationPre(
+	_ context.Context,
+	payload hookspkg.LoopGenerationPrePayload,
+) (hookspkg.LoopGenerationPrePayload, error) {
+	return payload, nil
+}
+
+func (f *fakeHookRuntime) DispatchLoopGenerationPost(
+	_ context.Context,
+	payload hookspkg.LoopGenerationPostPayload,
+) (hookspkg.LoopGenerationPostPayload, error) {
+	return payload, nil
+}
+
+func (f *fakeHookRuntime) DispatchLoopGatePre(
+	_ context.Context,
+	payload hookspkg.LoopGatePrePayload,
+) (hookspkg.LoopGatePrePayload, error) {
+	return payload, nil
+}
+
+func (f *fakeHookRuntime) DispatchLoopGatePost(
+	_ context.Context,
+	payload hookspkg.LoopGatePostPayload,
+) (hookspkg.LoopGatePostPayload, error) {
+	return payload, nil
+}
+
+func (f *fakeHookRuntime) DispatchLoopNodeTerminal(
+	ctx context.Context,
+	payload hookspkg.LoopNodeTerminalPayload,
+) (hookspkg.LoopNodeTerminalPayload, error) {
+	if f.onLoopNodeTerminal != nil {
+		return payload, f.onLoopNodeTerminal(ctx, payload)
+	}
+	return payload, nil
+}
+
+func (f *fakeHookRuntime) DispatchLoopTerminal(
+	ctx context.Context,
+	payload hookspkg.LoopTerminalPayload,
+) (hookspkg.LoopTerminalPayload, error) {
+	if f.onLoopTerminal != nil {
+		return payload, f.onLoopTerminal(ctx, payload)
+	}
+	return payload, nil
+}
+
+func (f *fakeHookRuntime) DispatchSpawnPreCreate(
+	ctx context.Context,
+	payload hookspkg.SpawnPreCreatePayload,
+) (hookspkg.SpawnPreCreatePayload, error) {
+	if f.onSpawnPreCreate != nil {
+		return payload, f.onSpawnPreCreate(ctx, payload)
+	}
+	return payload, nil
+}
+
+func (f *fakeHookRuntime) DispatchSpawnCreated(
+	_ context.Context,
+	payload hookspkg.SpawnCreatedPayload,
+) (hookspkg.SpawnCreatedPayload, error) {
+	return payload, nil
+}
+
+func (f *fakeHookRuntime) DispatchSpawnParentStopped(
+	_ context.Context,
+	payload hookspkg.SpawnParentStoppedPayload,
+) (hookspkg.SpawnParentStoppedPayload, error) {
+	return payload, nil
+}
+
+func (f *fakeHookRuntime) DispatchSpawnTTLExpired(
+	_ context.Context,
+	payload hookspkg.SpawnTTLExpiredPayload,
+) (hookspkg.SpawnTTLExpiredPayload, error) {
+	return payload, nil
+}
+
+func (f *fakeHookRuntime) DispatchSpawnReaped(
+	_ context.Context,
+	payload hookspkg.SpawnReapedPayload,
+) (hookspkg.SpawnReapedPayload, error) {
+	return payload, nil
+}
+
+func (f *fakeHookRuntime) DispatchAgentSoulSnapshotResolved(
+	_ context.Context,
+	payload hookspkg.AgentSoulSnapshotResolvedPayload,
+) (hookspkg.AgentSoulSnapshotResolvedPayload, error) {
+	return payload, nil
+}
+
+func (f *fakeHookRuntime) DispatchAgentSoulMutationAfter(
+	_ context.Context,
+	payload hookspkg.AgentSoulMutationAfterPayload,
+) (hookspkg.AgentSoulMutationAfterPayload, error) {
+	return payload, nil
+}
+
+func (f *fakeHookRuntime) DispatchAgentHeartbeatPolicyResolved(
+	_ context.Context,
+	payload hookspkg.AgentHeartbeatPolicyResolvedPayload,
+) (hookspkg.AgentHeartbeatPolicyResolvedPayload, error) {
+	return payload, nil
+}
+
+func (f *fakeHookRuntime) DispatchAgentHeartbeatWakeBefore(
+	_ context.Context,
+	payload hookspkg.AgentHeartbeatWakeBeforePayload,
+) (hookspkg.AgentHeartbeatWakeBeforePayload, error) {
+	return payload, nil
+}
+
+func (f *fakeHookRuntime) DispatchAgentHeartbeatWakeAfter(
+	_ context.Context,
+	payload hookspkg.AgentHeartbeatWakeAfterPayload,
+) (hookspkg.AgentHeartbeatWakeAfterPayload, error) {
+	return payload, nil
+}
+
+func (f *fakeHookRuntime) DispatchSessionHealthUpdateAfter(
+	_ context.Context,
+	payload hookspkg.SessionHealthUpdateAfterPayload,
+) (hookspkg.SessionHealthUpdateAfterPayload, error) {
+	return payload, nil
+}
+
+func (f *fakeHookRuntime) DispatchSessionAttentionChanged(
+	_ context.Context,
+	payload hookspkg.SessionAttentionChangedPayload,
+) (hookspkg.SessionAttentionChangedPayload, error) {
+	return payload, nil
+}
+
+func testHookExecutorResolver(native map[string]hookspkg.Executor) hookspkg.ExecutorResolver {
+	return func(decl hookspkg.HookDecl) (hookspkg.Executor, error) {
+		if decl.ExecutorKind == hookspkg.HookExecutorNative {
+			executor := native[strings.TrimSpace(decl.Name)]
+			if executor == nil {
+				return nil, errors.New("missing native executor")
+			}
+			return executor, nil
+		}
+		return defaultDaemonExecutorResolver(decl)
+	}
+}
+
+type fakeHookBindingPublisher func(context.Context) error
+
+func (f fakeHookBindingPublisher) Sync(ctx context.Context) error {
+	if f == nil {
+		return nil
+	}
+	return f(ctx)
+}
+
+type portReportingServer struct {
+	port int
+}
+
+func (s portReportingServer) Start(context.Context) error {
+	return nil
+}
+
+func (s portReportingServer) Shutdown(context.Context) error {
+	return nil
+}
+
+func (s portReportingServer) Port() int {
+	return s.port
+}
+
+const (
+	daemonExtensionHelperEnvKey      = "COMPOZY_TEST_DAEMON_EXTENSION_HELPER"
+	daemonExtensionHelperScenarioKey = "COMPOZY_TEST_DAEMON_EXTENSION_SCENARIO"
+	daemonExtensionHelperMarkerKey   = "COMPOZY_TEST_DAEMON_EXTENSION_MARKER"
+)
+
+func TestDaemonExtensionHelperProcess(t *testing.T) {
+	if os.Getenv(daemonExtensionHelperEnvKey) != "1" {
+		return
+	}
+	if strings.TrimSpace(os.Getenv(daemonExtensionHelperScenarioKey)) == "secret_hygiene" {
+		if _, err := fmt.Fprintf(
+			os.Stderr,
+			"runtime_secret=%s provider_token=%s safe=visible\n",
+			os.Getenv("BOUND_SECRET"),
+			os.Getenv("BOUND_PROVIDER_TOKEN"),
+		); err != nil {
+			t.Fatalf("fmt.Fprintf(os.Stderr) error = %v", err)
+		}
+	}
+
+	server := newDaemonExtensionHelperServer(
+		strings.TrimSpace(os.Getenv(daemonExtensionHelperScenarioKey)),
+		strings.TrimSpace(os.Getenv(daemonExtensionHelperMarkerKey)),
+	)
+	os.Exit(server.run())
+}
+
+type fakeExtensionRuntime struct {
+	startCount  int
+	stopCount   int
+	reloadCount int
+	startErr    error
+	stopErr     error
+	reloadErr   error
+	hookDecls   []hookspkg.HookDecl
+	hookErr     error
+	getExt      *extensionpkg.Extension
+	getErr      error
+	getFn       func(string) (*extensionpkg.Extension, error)
+	onStart     func()
+	onStop      func()
+	onReload    func(context.Context) error
+}
+
+type extensionHookProfileCatalogStub struct {
+	profiles []profilepkg.WithCounts
+}
+
+func (s extensionHookProfileCatalogStub) List(context.Context) ([]profilepkg.WithCounts, error) {
+	return append([]profilepkg.WithCounts(nil), s.profiles...), nil
+}
+
+func defaultExtensionHookProfiles() []profilepkg.WithCounts {
+	return []profilepkg.WithCounts{{
+		ID: store.DefaultProfileID, Name: "default", State: profilepkg.StateActive,
+	}}
+}
+
+func (f *fakeExtensionRuntime) Start(context.Context) error {
+	f.startCount++
+	if f.onStart != nil {
+		f.onStart()
+	}
+	return f.startErr
+}
+
+func (f *fakeExtensionRuntime) Stop(context.Context) error {
+	f.stopCount++
+	if f.onStop != nil {
+		f.onStop()
+	}
+	return f.stopErr
+}
+
+func (f *fakeExtensionRuntime) Reload(ctx context.Context) error {
+	f.reloadCount++
+	if f.onReload != nil {
+		if err := f.onReload(ctx); err != nil {
+			return err
+		}
+	}
+	return f.reloadErr
+}
+
+func (f *fakeExtensionRuntime) Get(name string) (*extensionpkg.Extension, error) {
+	if f.getFn != nil {
+		return f.getFn(name)
+	}
+	if f.getErr != nil {
+		return nil, f.getErr
+	}
+	if f.getExt != nil {
+		return f.getExt, nil
+	}
+	return nil, extensionpkg.ErrExtensionNotFound
+}
+
+func (f *fakeExtensionRuntime) HookDeclarations(context.Context) ([]hookspkg.HookDecl, error) {
+	decls := make([]hookspkg.HookDecl, 0, len(f.hookDecls))
+	for _, decl := range f.hookDecls {
+		cloned := decl
+		cloned.Args = append([]string(nil), decl.Args...)
+		if len(decl.Env) > 0 {
+			cloned.Env = make(map[string]string, len(decl.Env))
+			maps.Copy(cloned.Env, decl.Env)
+		}
+		if len(decl.Metadata) > 0 {
+			cloned.Metadata = make(map[string]string, len(decl.Metadata))
+			maps.Copy(cloned.Metadata, decl.Metadata)
+		}
+		decls = append(decls, cloned)
+	}
+	return decls, f.hookErr
+}
+
+func (f *fakeExtensionRuntime) HookDeclarationsForProfiles(
+	_ context.Context,
+	profiles []extensionpkg.ProfileLens,
+) ([]hookspkg.HookDecl, error) {
+	if f.hookErr != nil {
+		return nil, f.hookErr
+	}
+	decls := make([]hookspkg.HookDecl, 0, len(f.hookDecls)*len(profiles))
+	for _, profile := range profiles {
+		for _, declaration := range f.hookDecls {
+			cloned := declaration
+			cloned = cloned.WithPlacement(profile.ID, nil)
+			cloned.Args = append([]string(nil), declaration.Args...)
+			decls = append(decls, cloned)
+		}
+	}
+	return decls, nil
+}
+
+func (f *fakeExtensionRuntime) InspectPackageResources(
+	_ context.Context,
+	name string,
+) (*extensionpkg.Extension, error) {
+	return f.Get(name)
+}
+
+type daemonTestExtensionOptions struct {
+	bundled          bool
+	version          string
+	requiredEnv      []string
+	runtimeCommand   string
+	runtimeArgs      []string
+	runtimeEnv       map[string]string
+	runtimeSecretEnv map[string]string
+	hookCommand      string
+	hookArgs         []string
+	hookEvent        hookspkg.HookEvent
+	capabilities     []string
+	permissions      []string
+}
+
+func openDaemonTestGlobalDB(t *testing.T) *globaldb.GlobalDB {
+	t.Helper()
+
+	databasePath := filepath.Join(t.TempDir(), store.GlobalDatabaseName)
+	cloneDaemonTestStoreSeed(t, databasePath)
+	db, err := openDaemonTestGlobalDBAtPath(testutil.Context(t), databasePath)
+	if err != nil {
+		t.Fatalf("OpenGlobalDB() error = %v", err)
+	}
+	t.Cleanup(func() {
+		if err := db.Close(testutil.Context(t)); err != nil {
+			t.Fatalf("GlobalDB.Close() error = %v", err)
+		}
+	})
+	return db
+}
+
+func cloneDaemonTestStoreSeed(t *testing.T, databasePath string) {
+	t.Helper()
+
+	if err := daemonTestStoreSeed.Clone(databasePath); err != nil {
+		t.Fatalf("daemon store seed Clone() error = %v", err)
+	}
+}
+
+func installDaemonTestExtension(
+	t *testing.T,
+	db *globaldb.GlobalDB,
+	name string,
+	opts daemonTestExtensionOptions,
+	enabled bool,
+) string {
+	t.Helper()
+
+	if db == nil {
+		t.Fatal("installDaemonTestExtension() db = nil")
+	}
+
+	dir := filepath.Join(t.TempDir(), name)
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatalf("os.MkdirAll(%q) error = %v", dir, err)
+	}
+	manifestPath := filepath.Join(dir, "extension.toml")
+	if err := os.WriteFile(manifestPath, []byte(daemonTestExtensionManifest(name, opts)), 0o644); err != nil {
+		t.Fatalf("os.WriteFile(%q) error = %v", manifestPath, err)
+	}
+
+	manifest, err := extensionpkg.LoadManifest(dir)
+	if err != nil {
+		t.Fatalf("LoadManifest(%q) error = %v", dir, err)
+	}
+	checksum, err := extensionpkg.ComputeDirectoryChecksum(dir)
+	if err != nil {
+		t.Fatalf("ComputeDirectoryChecksum(%q) error = %v", dir, err)
+	}
+
+	registry := extensionpkg.NewRegistry(db.DB())
+	installOptions := make([]extensionpkg.InstallOption, 0, 1)
+	if opts.bundled {
+		installOptions = append(installOptions, extensionpkg.WithInstallSource(extensionpkg.SourceBundled))
+	}
+	if err := registry.Install(manifest, dir, checksum, installOptions...); err != nil {
+		t.Fatalf("Registry.Install(%q) error = %v", name, err)
+	}
+	if !enabled {
+		if err := registry.Disable(name); err != nil {
+			t.Fatalf("Registry.Disable(%q) error = %v", name, err)
+		}
+	}
+
+	return dir
+}
+
+func daemonTestExtensionManifest(name string, opts daemonTestExtensionOptions) string {
+	version := strings.TrimSpace(opts.version)
+	if version == "" {
+		version = "0.2.1"
+	}
+	command := strings.TrimSpace(opts.runtimeCommand)
+	if command == "" {
+		command = "fake-extension"
+	}
+	capabilities := append([]string(nil), opts.capabilities...)
+	if opts.capabilities == nil {
+		capabilities = []string{"tool.provider"}
+	}
+	permissions := append([]string(nil), opts.permissions...)
+	if opts.permissions == nil {
+		permissions = []string{"sessions/list"}
+	}
+
+	event := opts.hookEvent
+	if event == "" {
+		event = hookspkg.HookSessionPostCreate
+	}
+
+	var builder strings.Builder
+	fmt.Fprintf(&builder, `[extension]
+name = %q
+version = %q
+description = "Daemon extension test fixture"
+min_compozy_version = "0.5.0"
+`, name, version)
+	if opts.requiredEnv != nil {
+		builder.WriteString("requires_env = " + daemonTOMLStringArray(opts.requiredEnv) + "\n")
+	}
+	builder.WriteString("\n[resources]\n")
+
+	if strings.TrimSpace(opts.hookCommand) != "" {
+		fmt.Fprintf(&builder, `
+[[resources.hooks]]
+name = %q
+event = %q
+mode = "sync"
+executor.kind = "subprocess"
+executor.command = %q
+`, name+"-hook", string(event), opts.hookCommand)
+		if len(opts.hookArgs) > 0 {
+			builder.WriteString("executor.args = " + daemonTOMLStringArray(opts.hookArgs) + "\n")
+		}
+	}
+
+	builder.WriteString(`
+[capabilities]
+provides = ` + daemonTOMLStringArray(capabilities) + `
+
+`)
+	builder.WriteString(`
+[permissions]
+requires = ` + daemonTOMLStringArray(permissions) + `
+
+[subprocess]
+command = ` + fmt.Sprintf("%q", command) + `
+`)
+	if len(opts.runtimeArgs) > 0 {
+		builder.WriteString("args = " + daemonTOMLStringArray(opts.runtimeArgs) + "\n")
+	}
+	if len(opts.runtimeEnv) > 0 {
+		builder.WriteString("\n[subprocess.env]\n")
+		keys := make([]string, 0, len(opts.runtimeEnv))
+		for key := range opts.runtimeEnv {
+			keys = append(keys, key)
+		}
+		slices.Sort(keys)
+		for _, key := range keys {
+			fmt.Fprintf(&builder, "%s = %q\n", key, opts.runtimeEnv[key])
+		}
+	}
+	if len(opts.runtimeSecretEnv) > 0 {
+		builder.WriteString("\n[subprocess.secret_env]\n")
+		keys := make([]string, 0, len(opts.runtimeSecretEnv))
+		for key := range opts.runtimeSecretEnv {
+			keys = append(keys, key)
+		}
+		slices.Sort(keys)
+		for _, key := range keys {
+			fmt.Fprintf(&builder, "%s = %q\n", key, opts.runtimeSecretEnv[key])
+		}
+	}
+
+	return builder.String()
+}
+
+func daemonTOMLStringArray(values []string) string {
+	quoted := make([]string, 0, len(values))
+	for _, value := range values {
+		quoted = append(quoted, fmt.Sprintf("%q", value))
+	}
+	return "[" + strings.Join(quoted, ", ") + "]"
+}
+
+func daemonExtensionHelperCommand(t *testing.T) string {
+	t.Helper()
+
+	command, err := os.Executable()
+	if err != nil {
+		t.Fatalf("os.Executable() error = %v", err)
+	}
+	return command
+}
+
+func daemonExtensionHelperArgs() []string {
+	return []string{"-test.run=TestDaemonExtensionHelperProcess"}
+}
+
+func daemonExtensionHelperEnv(markerPath string) map[string]string {
+	env := map[string]string{
+		daemonExtensionHelperEnvKey: "1",
+	}
+	if strings.TrimSpace(markerPath) != "" {
+		env[daemonExtensionHelperMarkerKey] = markerPath
+	}
+	return env
+}
+
+type daemonExtensionHelperServer struct {
+	scenario string
+	marker   string
+	scanner  *bufio.Scanner
+	encoder  *json.Encoder
+	mu       sync.Mutex
+}
+
+type daemonExtensionHelperRequest struct {
+	ID     any             `json:"id"`
+	Method string          `json:"method"`
+	Params json.RawMessage `json:"params,omitempty"`
+}
+
+func newDaemonExtensionHelperServer(scenario string, marker string) *daemonExtensionHelperServer {
+	scanner := bufio.NewScanner(os.Stdin)
+	scanner.Buffer(make([]byte, 0, 64*1024), 10*1024*1024)
+
+	encoder := json.NewEncoder(os.Stdout)
+	encoder.SetEscapeHTML(false)
+
+	return &daemonExtensionHelperServer{
+		scenario: scenario,
+		marker:   marker,
+		scanner:  scanner,
+		encoder:  encoder,
+	}
+}
+
+func (h *daemonExtensionHelperServer) run() int {
+	for h.scanner.Scan() {
+		var req daemonExtensionHelperRequest
+		if err := json.Unmarshal(h.scanner.Bytes(), &req); err != nil {
+			fmt.Fprintln(os.Stderr, err)
+			return 1
+		}
+		exitProcess, err := h.handleRequest(req)
+		if err != nil {
+			fmt.Fprintln(os.Stderr, err)
+			return 1
+		}
+		if exitProcess {
+			return 1
+		}
+	}
+	if err := h.scanner.Err(); err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		return 1
+	}
+	return 0
+}
+
+func (h *daemonExtensionHelperServer) handleRequest(req daemonExtensionHelperRequest) (bool, error) {
+	switch req.Method {
+	case "initialize":
+		var params subprocess.InitializeRequest
+		if err := json.Unmarshal(req.Params, &params); err != nil {
+			return false, err
+		}
+		response := daemonExtensionInitializeResponse(params)
+		if err := h.sendResult(req.ID, response); err != nil {
+			return false, err
+		}
+		if h.scenario == "record_initialize" || h.scenario == "auto_exit_record_initialize" {
+			if err := h.recordInitialize(params, response); err != nil {
+				return false, err
+			}
+		}
+		return h.scenario == "auto_exit_record_initialize", nil
+	case "health_check":
+		return false, h.sendResult(req.ID, subprocess.HealthCheckResponse{Healthy: true})
+	case "shutdown":
+		if strings.TrimSpace(h.marker) != "" {
+			if err := appendMarkerLine(h.marker, "shutdown"); err != nil {
+				return false, err
+			}
+		}
+		return false, h.sendResult(req.ID, subprocess.ShutdownResponse{Acknowledged: true})
+	default:
+		return false, h.sendResult(req.ID, map[string]any{})
+	}
+}
+
+func (h *daemonExtensionHelperServer) sendResult(id any, result any) error {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	return h.encoder.Encode(map[string]any{
+		"jsonrpc": "2.0",
+		"id":      id,
+		"result":  result,
+	})
+}
+
+func (h *daemonExtensionHelperServer) recordInitialize(
+	request subprocess.InitializeRequest,
+	response subprocess.InitializeResponse,
+) error {
+	if strings.TrimSpace(h.marker) == "" {
+		return nil
+	}
+
+	payload, err := json.Marshal(daemonInitializeMarker{
+		Request:  request,
+		Response: response,
+	})
+	if err != nil {
+		return fmt.Errorf("record initialize marker: marshal payload: %w", err)
+	}
+	if err := appendMarkerLine(h.marker, string(payload)); err != nil {
+		return fmt.Errorf("record initialize marker: %w", err)
+	}
+	return nil
+}
+
+func daemonExtensionInitializeResponse(req subprocess.InitializeRequest) subprocess.InitializeResponse {
+	implementedMethods := []string{"health_check", "shutdown"}
+	implementedMethods = append(
+		implementedMethods,
+		extensionprotocol.CapabilityServiceMethods(req.Capabilities.Provides)...)
+
+	return subprocess.InitializeResponse{
+		ProtocolVersion: req.ProtocolVersion,
+		ExtensionInfo: subprocess.InitializeExtensionInfo{
+			Name:    req.Extension.Name,
+			Version: req.Extension.Version,
+		},
+		AcceptedCapabilities: subprocess.AcceptedCapabilities{
+			Provides:    append([]string(nil), req.Capabilities.Provides...),
+			Permissions: append([]extensionprotocol.HostAPIMethod(nil), req.Capabilities.GrantedPermissions...),
+		},
+		ImplementedMethods:  implementedMethods,
+		SupportedHookEvents: []string{string(hookspkg.HookSessionPostCreate)},
+		Supports: subprocess.InitializeSupports{
+			HealthCheck: true,
+		},
+	}
+}
+
+type daemonInitializeMarker struct {
+	Request  subprocess.InitializeRequest  `json:"request"`
+	Response subprocess.InitializeResponse `json:"response"`
+}
+
+func appendMarkerLine(path string, line string) (err error) {
+	target := strings.TrimSpace(path)
+	if target == "" {
+		return nil
+	}
+	if err := os.MkdirAll(filepath.Dir(target), 0o755); err != nil {
+		return fmt.Errorf("append marker line: create marker directory: %w", err)
+	}
+	file, err := os.OpenFile(target, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o600)
+	if err != nil {
+		return fmt.Errorf("append marker line: open marker file: %w", err)
+	}
+	defer func() {
+		if closeErr := file.Close(); err == nil && closeErr != nil {
+			err = fmt.Errorf("append marker line: close marker file: %w", closeErr)
+		}
+	}()
+	_, err = fmt.Fprintf(file, "%s\n", strings.TrimSpace(line))
+	if err != nil {
+		return fmt.Errorf("append marker line: write marker file: %w", err)
+	}
+	return nil
+}
+
+func (f *fakeSessionManager) UsageEvents(context.Context, string) ([]session.UsageEventEnvelope, error) {
+	return nil, nil
+}
+
+func (f *fakeSessionManager) Deliveries(context.Context, string) ([]session.DeliveryEventEnvelope, error) {
+	return nil, nil
+}
+
+func (f *fakeSessionManager) Compactions(context.Context, string) ([]session.CompactionEnvelope, error) {
+	return nil, nil
+}
+
+func (f *fakeSessionManager) LatestSettledTurn(context.Context, string) (session.SettledTurn, error) {
+	return session.SettledTurn{}, nil
+}
+
+func (f *fakeSessionManager) ContextEvents(context.Context, string) (session.ContextEvents, error) {
+	return session.ContextEvents{}, nil
+}
+
+func (r *recordingRegistry) SetWorkspaceArchived(context.Context, string, bool) (workspacepkg.Workspace, error) {
+	return workspacepkg.Workspace{}, workspacepkg.ErrWorkspaceNotFound
+}
+
+// Recording registry is the existing boot-suite persistence I/O boundary.
+func (r *recordingRegistry) LoadProcessObservations(context.Context) ([]sessionprocess.Observation, error) {
+	return nil, nil
+}
+
+func (r *recordingRegistry) SaveProcessObservations(
+	context.Context,
+	[]sessionprocess.Observation,
+	[]sessionprocess.Identity,
+) error {
+	return nil
+}
+
+func (r *recordingRegistry) PermissionDailyRollups(
+	context.Context,
+	store.PermissionRollupQuery,
+) ([]store.PermissionDailyRollup, error) {
+	return nil, nil
+}
+
+func (r *recordingRegistry) PermissionEntries(
+	context.Context,
+	store.PermissionEntriesQuery,
+) ([]store.PermissionLogEntry, error) {
+	return nil, nil
+}
+
+func TestReadWorkspaceWorkLog(t *testing.T) {
+	t.Parallel()
+	for _, mode := range []string{"missing", "valid", "truncated", "symlink file", "symlink parent", "malformed"} {
+		t.Run("Should safely read work log with "+mode, func(t *testing.T) {
+			t.Parallel()
+			root := t.TempDir()
+			dir := filepath.Join(root, ".compozy")
+			outside := t.TempDir()
+			if mode == "symlink parent" {
+				if err := os.Symlink(outside, dir); err != nil {
+					t.Fatal(err)
+				}
+			} else if err := os.Mkdir(dir, 0700); err != nil {
+				t.Fatal(err)
+			}
+			path := filepath.Join(dir, "work-log.md")
+			content := "# Work log\n\n- [ ] wl-20261102-01 | 2026-11-02T14:00:00Z | Export\n"
+			if mode == "truncated" {
+				content += strings.Repeat(" ", 64*1024) + "\n- [ ] wl-20261102-02 | 2026-11-02T14:00:00Z | Hidden\n"
+			}
+			if mode == "malformed" {
+				content = "# Work log\n\nbad\n" + content
+			}
+			if mode == "symlink file" {
+				target := filepath.Join(outside, "work-log.md")
+				if err := os.WriteFile(target, []byte(content), 0600); err != nil {
+					t.Fatal(err)
+				}
+				if err := os.Symlink(target, path); err != nil {
+					t.Fatal(err)
+				}
+			} else if mode != "missing" {
+				if err := os.WriteFile(path, []byte(content), 0600); err != nil {
+					t.Fatal(err)
+				}
+			}
+			var logs bytes.Buffer
+			facts, truncated := readWorkspaceWorkLog(root, slog.New(slog.NewTextHandler(&logs, nil)))
+			want := 1
+			if mode == "missing" || strings.HasPrefix(mode, "symlink") {
+				want = 0
+			}
+			if len(facts) != want || truncated != (mode == "truncated") {
+				t.Fatal(facts, truncated)
+			}
+			if strings.HasPrefix(mode, "symlink") &&
+				!strings.Contains(logs.String(), "work_log: path outside workspace") {
+				t.Fatal(logs.String())
+			}
+			if mode == "truncated" && strings.Contains(logs.String(), "ignored line") {
+				t.Fatal(logs.String())
+			}
+			if mode == "malformed" && !strings.Contains(logs.String(), "ignored line 3") {
+				t.Fatal(logs.String())
+			}
+		})
+	}
+}
+
+func TestWorkLogOpenAfterReplacement(t *testing.T) {
+	t.Parallel()
+	for _, mode := range []string{"outside symlink", "fifo"} {
+		t.Run("Should safely open a validated file replaced by "+mode, func(t *testing.T) {
+			t.Parallel()
+			if mode == "fifo" && runtime.GOOS == "windows" {
+				t.Skip("Windows has no filesystem FIFOs")
+			}
+			root := t.TempDir()
+			dir := filepath.Join(root, ".compozy")
+			if err := os.Mkdir(dir, 0700); err != nil {
+				t.Fatal(err)
+			}
+			path := filepath.Join(dir, "work-log.md")
+			if err := os.WriteFile(path, []byte("# Work log"), 0600); err != nil {
+				t.Fatal(err)
+			}
+			if info, err := os.Stat(path); err != nil || !info.Mode().IsRegular() {
+				t.Fatalf("validated file=%v err=%v", info, err)
+			}
+			workspace, err := os.OpenRoot(root)
+			if err != nil {
+				t.Fatal(err)
+			}
+			t.Cleanup(func() {
+				if err := workspace.Close(); err != nil {
+					t.Error(err)
+				}
+			})
+			if err := os.Remove(path); err != nil {
+				t.Fatal(err)
+			}
+			if mode == "outside symlink" {
+				if runtime.GOOS == "windows" {
+					t.Skip("symlink creation requires elevated privileges on Windows")
+				}
+				outside := filepath.Join(t.TempDir(), "private.md")
+				if err := os.WriteFile(outside, []byte("private"), 0600); err != nil {
+					t.Fatal(err)
+				}
+				if err := os.Symlink(outside, path); err != nil {
+					t.Fatal(err)
+				}
+				file, err := openWorkspaceWorkLogFile(workspace)
+				if err == nil {
+					if closeErr := file.Close(); closeErr != nil {
+						t.Error(closeErr)
+					}
+					t.Fatal("opened outside workspace")
+				}
+				return
+			}
+			if out, err := execabs.CommandContext(t.Context(), "mkfifo", path).CombinedOutput(); err != nil {
+				t.Fatalf("mkfifo: %v %s", err, out)
+			}
+			type opened struct {
+				file *os.File
+				err  error
+			}
+			done := make(chan opened, 1)
+			go func() { file, err := openWorkspaceWorkLogFile(workspace); done <- opened{file, err} }()
+			select {
+			case got := <-done:
+				if got.err != nil {
+					t.Fatal(got.err)
+				}
+				defer func() {
+					if err := got.file.Close(); err != nil {
+						t.Error(err)
+					}
+				}()
+				if info, err := got.file.Stat(); err != nil || info.Mode().IsRegular() {
+					t.Fatalf("special file=%v err=%v", info, err)
+				}
+			case <-time.After(2 * time.Second):
+				writer, err := os.OpenFile(path, os.O_WRONLY|syscall.O_NONBLOCK, 0)
+				if err != nil {
+					t.Fatal(err)
+				}
+				if err := writer.Close(); err != nil {
+					t.Error(err)
+				}
+				got := <-done
+				if got.file != nil {
+					if err := got.file.Close(); err != nil {
+						t.Error(err)
+					}
+				}
+				t.Fatal("FIFO open waited for a writer")
+			}
+		})
+	}
+}
+
+func TestReadWorkspaceWorkLogReplacement(t *testing.T) {
+	t.Parallel()
+	for _, parent := range []bool{false, true} {
+		t.Run(fmt.Sprintf("Should contain reads during parent replacement %t", parent), func(t *testing.T) {
+			t.Parallel()
+			root, outside := t.TempDir(), t.TempDir()
+			dir := filepath.Join(root, ".compozy")
+			if err := os.Mkdir(dir, 0700); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(
+				filepath.Join(outside, "work-log.md"),
+				[]byte("- [ ] wl-20261102-99 | 2026-11-02T14:00:00Z | Outside\n"),
+				0600,
+			); err != nil {
+				t.Fatal(err)
+			}
+			path, target := filepath.Join(dir, "work-log.md"), filepath.Join(outside, "work-log.md")
+			if err := os.WriteFile(path, []byte("# Work log\n"), 0600); err != nil {
+				t.Fatal(err)
+			}
+			if parent {
+				path, target = dir, outside
+			}
+			done := make(chan error, 1)
+			go func() {
+				for range 200 {
+					if err := os.Rename(path, path+".saved"); err != nil {
+						done <- err
+						return
+					}
+					if err := os.Symlink(target, path); err != nil {
+						done <- err
+						return
+					}
+					if err := os.Remove(path); err != nil {
+						done <- err
+						return
+					}
+					if err := os.Rename(path+".saved", path); err != nil {
+						done <- err
+						return
+					}
+				}
+				done <- nil
+			}()
+			logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+			leaked := false
+			for range 200 {
+				facts, _ := readWorkspaceWorkLog(root, logger)
+				if len(facts) != 0 {
+					leaked = true
+				}
+			}
+			if err := <-done; err != nil {
+				t.Fatal(err)
+			}
+			if leaked {
+				t.Fatal("read work log outside workspace during replacement")
+			}
+		})
+	}
+}

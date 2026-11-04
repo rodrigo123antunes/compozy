@@ -1,0 +1,656 @@
+package store
+
+import (
+	"database/sql"
+	"errors"
+	"os"
+	"path/filepath"
+	"strings"
+	"testing"
+	"testing/iotest"
+	"time"
+
+	"github.com/compozy/compozy/internal/testutil"
+)
+
+func TestValidationHelpersAndPathUtilities(t *testing.T) {
+	t.Parallel()
+
+	now := time.Date(2026, 4, 3, 20, 0, 0, 0, time.UTC)
+
+	for _, tt := range []struct {
+		name  string
+		scope ReadScope
+		valid bool
+	}{
+		{name: "Should accept one explicit profile", scope: ReadScope{ProfileID: DefaultProfileID}, valid: true},
+		{name: "Should accept the explicit aggregate", scope: ReadScope{AllProfiles: true}, valid: true},
+		{name: "Should reject an implicit read lens", scope: ReadScope{}},
+		{name: "Should reject a mixed read lens", scope: ReadScope{ProfileID: DefaultProfileID, AllProfiles: true}},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			err := tt.scope.Validate()
+			if tt.valid && err != nil {
+				t.Fatalf("ReadScope.Validate() error = %v", err)
+			}
+			if !tt.valid && !errors.Is(err, ErrReadScopeInvalid) {
+				t.Fatalf("ReadScope.Validate() error = %v, want ErrReadScopeInvalid", err)
+			}
+		})
+	}
+
+	for _, tt := range []struct {
+		name     string
+		validate func() error
+	}{
+		{name: "Should require an event summary profile owner", validate: func() error { return (EventSummary{}).Validate() }},
+		{name: "Should require a dead entity profile owner", validate: func() error { return (DeadEntity{}).Validate() }},
+		{name: "Should require a token usage profile owner", validate: func() error { return (TokenUsageDailyUpdate{}).Validate() }},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			err := tt.validate()
+			if err == nil || !strings.Contains(err.Error(), "profile_id") {
+				t.Fatalf("Validate() error = %v, want profile_id requirement", err)
+			}
+		})
+	}
+
+	for _, tt := range []struct {
+		name     string
+		validate func(ReadScope) error
+	}{
+		{name: "event summary query", validate: func(scope ReadScope) error { return (EventSummaryQuery{ReadScope: scope}).Validate() }},
+		{name: "overview since query", validate: func(scope ReadScope) error { return (OverviewSinceQuery{ReadScope: scope}).Validate() }},
+		{name: "overview day query", validate: func(scope ReadScope) error { return (OverviewDayQuery{ReadScope: scope}).Validate() }},
+		{name: "overview workspace query", validate: func(scope ReadScope) error { return (OverviewWorkspaceQuery{ReadScope: scope}).Validate() }},
+		{name: "session list query", validate: func(scope ReadScope) error { return (SessionListQuery{ReadScope: scope}).Validate() }},
+	} {
+		t.Run("Should reject an implicit read lens for "+tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			if err := tt.validate(ReadScope{}); !errors.Is(err, ErrReadScopeInvalid) {
+				t.Fatalf("Validate() error = %v, want ErrReadScopeInvalid", err)
+			}
+		})
+		t.Run("Should reject a mixed read lens for "+tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			scope := ReadScope{ProfileID: DefaultProfileID, AllProfiles: true}
+			if err := tt.validate(scope); !errors.Is(err, ErrReadScopeInvalid) {
+				t.Fatalf("Validate() error = %v, want ErrReadScopeInvalid", err)
+			}
+		})
+	}
+
+	tests := []struct {
+		name              string
+		validate          func() error
+		wantError         bool
+		wantErrorContains string
+	}{
+		{
+			name: "session event valid",
+			validate: func() error {
+				return (SessionEvent{TurnID: "turn-1", Type: "agent_message", AgentName: "coder"}).Validate()
+			},
+		},
+		{
+			name: "session event invalid",
+			validate: func() error {
+				return (SessionEvent{}).Validate()
+			},
+			wantError: true,
+		},
+		{
+			name: "session event missing type",
+			validate: func() error {
+				return (SessionEvent{TurnID: "turn-1"}).Validate()
+			},
+			wantError: true,
+		},
+		{
+			name: "session event missing agent",
+			validate: func() error {
+				return (SessionEvent{TurnID: "turn-1", Type: "agent_message"}).Validate()
+			},
+			wantError: true,
+		},
+		{
+			name: "event query valid",
+			validate: func() error {
+				return (EventQuery{Limit: 1, AfterSequence: 1}).Validate()
+			},
+		},
+		{
+			name: "event query invalid",
+			validate: func() error {
+				return (EventQuery{Limit: -1}).Validate()
+			},
+			wantError: true,
+		},
+		{
+			name: "token usage valid",
+			validate: func() error {
+				return (TokenUsage{TurnID: "turn-1"}).Validate()
+			},
+		},
+		{
+			name: "token usage invalid",
+			validate: func() error {
+				return (TokenUsage{}).Validate()
+			},
+			wantError: true,
+		},
+		{
+			name: "session info valid",
+			validate: func() error {
+				return (&SessionInfo{
+					ID:            "sess-1",
+					AgentName:     "coder",
+					WorkspaceID:   "ws-1",
+					ProfileID:     DefaultProfileID,
+					State:         "active",
+					RuntimeStatus: SessionRuntimeReady,
+				}).Validate()
+			},
+		},
+		{
+			name: "session info invalid",
+			validate: func() error {
+				return (&SessionInfo{}).Validate()
+			},
+			wantError: true,
+		},
+		{
+			name: "Should reject SessionInfo without a runtime status",
+			validate: func() error {
+				return (&SessionInfo{
+					ID:          "sess-1",
+					AgentName:   "coder",
+					WorkspaceID: "ws-1",
+					ProfileID:   DefaultProfileID,
+					State:       "active",
+				}).Validate()
+			},
+			wantError:         true,
+			wantErrorContains: "invalid session runtime status",
+		},
+		{
+			name: "session info missing agent",
+			validate: func() error {
+				return (&SessionInfo{ID: "sess-1", RuntimeStatus: SessionRuntimeReady}).Validate()
+			},
+			wantError: true,
+		},
+		{
+			name: "session info missing workspace",
+			validate: func() error {
+				return (&SessionInfo{ID: "sess-1", AgentName: "coder", RuntimeStatus: SessionRuntimeReady}).Validate()
+			},
+			wantError: true,
+		},
+		{
+			name: "session info missing state",
+			validate: func() error {
+				return (&SessionInfo{ID: "sess-1", AgentName: "coder", WorkspaceID: "ws-1", RuntimeStatus: SessionRuntimeReady}).Validate()
+			},
+			wantError: true,
+		},
+		{
+			name: "session list query invalid",
+			validate: func() error {
+				return (SessionListQuery{Limit: -1}).Validate()
+			},
+			wantError: true,
+		},
+		{
+			name: "session state update valid",
+			validate: func() error {
+				return (SessionStateUpdate{ID: "sess-1", State: "stopped"}).Validate()
+			},
+		},
+		{
+			name: "session state update invalid",
+			validate: func() error {
+				return (SessionStateUpdate{}).Validate()
+			},
+			wantError: true,
+		},
+		{
+			name: "session state update missing state",
+			validate: func() error {
+				return (SessionStateUpdate{ID: "sess-1"}).Validate()
+			},
+			wantError: true,
+		},
+		{
+			name: "Should reject a failed runtime update without failure evidence",
+			validate: func() error {
+				return (SessionStateUpdate{
+					ID:                "sess-1",
+					State:             "active",
+					RuntimeSet:        true,
+					RuntimeStatus:     SessionRuntimeFailed,
+					RuntimeTransition: SessionRuntimeTransitionInitialBind,
+				}).Validate()
+			},
+			wantError:         true,
+			wantErrorContains: "requires a failure",
+		},
+		{
+			name: "Should reject failed session metadata without failure evidence",
+			validate: func() error {
+				return (&SessionInfo{
+					ID:                "sess-1",
+					AgentName:         "coder",
+					WorkspaceID:       "ws-1",
+					ProfileID:         DefaultProfileID,
+					State:             "active",
+					RuntimeStatus:     SessionRuntimeFailed,
+					RuntimeTransition: SessionRuntimeTransitionInitialBind,
+				}).Validate()
+			},
+			wantError:         true,
+			wantErrorContains: "requires a failure",
+		},
+		{
+			name: "Should accept a failed runtime update with failure evidence",
+			validate: func() error {
+				return (SessionStateUpdate{
+					ID:                "sess-1",
+					State:             "active",
+					RuntimeSet:        true,
+					RuntimeStatus:     SessionRuntimeFailed,
+					RuntimeTransition: SessionRuntimeTransitionInitialBind,
+					RuntimeFailure:    "provider startup failed",
+				}).Validate()
+			},
+		},
+		{
+			name: "event summary valid",
+			validate: func() error {
+				return (EventSummary{
+					ProfileID:   DefaultProfileID,
+					SessionID:   "sess-1",
+					WorkspaceID: "ws-store-helpers",
+					Type:        "agent_message",
+					AgentName:   "coder",
+				}).Validate()
+			},
+		},
+		{
+			name: "event summary invalid",
+			validate: func() error {
+				return (EventSummary{}).Validate()
+			},
+			wantError: true,
+		},
+		{
+			name: "event summary missing type",
+			validate: func() error {
+				return (EventSummary{SessionID: "sess-1", WorkspaceID: "ws-store-helpers"}).Validate()
+			},
+			wantError: true,
+		},
+		{
+			name: "event summary missing session",
+			validate: func() error {
+				return (EventSummary{Type: "agent_message", AgentName: "coder"}).Validate()
+			},
+			wantError: true,
+		},
+		{
+			name: "event summary missing agent",
+			validate: func() error {
+				return (EventSummary{
+					SessionID:   "sess-1",
+					WorkspaceID: "ws-store-helpers",
+					Type:        "agent_message",
+				}).Validate()
+			},
+			wantError: true,
+		},
+		{
+			name: "global event summary settings changed",
+			validate: func() error {
+				return (EventSummary{ProfileID: DefaultProfileID, Type: "settings.changed"}).Validate()
+			},
+		},
+		{
+			name: "global event summary skill shadowed",
+			validate: func() error {
+				return (EventSummary{ProfileID: DefaultProfileID, Type: "skill.shadowed"}).Validate()
+			},
+		},
+		{
+			name: "event summary rejects task run dot family",
+			validate: func() error {
+				return (EventSummary{
+					SessionID:   "sess-1",
+					WorkspaceID: "ws-store-helpers",
+					Type:        "task_run.completed",
+					AgentName:   "coder",
+				}).Validate()
+			},
+			wantError: true,
+		},
+		{
+			name: "global event summary skills load failed",
+			validate: func() error {
+				return (EventSummary{ProfileID: DefaultProfileID, Type: "skills.load_failed"}).Validate()
+			},
+		},
+		{
+			name: "global event summary hook dispatch start",
+			validate: func() error {
+				return (EventSummary{ProfileID: DefaultProfileID, Type: "hook.dispatch.start"}).Validate()
+			},
+		},
+		{
+			name: "global event summary hook dispatch complete",
+			validate: func() error {
+				return (EventSummary{ProfileID: DefaultProfileID, Type: "hook.dispatch.complete"}).Validate()
+			},
+		},
+		{
+			name: "event summary query invalid",
+			validate: func() error {
+				return (EventSummaryQuery{ReadScope: ReadScope{AllProfiles: true}, Limit: -1}).Validate()
+			},
+			wantError: true,
+		},
+		{
+			name: "token stats update valid",
+			validate: func() error {
+				return (TokenStatsUpdate{
+					SessionID:  "sess-1",
+					AgentName:  "coder",
+					CostStatus: "unknown",
+					CostSource: "none",
+				}).Validate()
+			},
+		},
+		{
+			name: "token stats update invalid",
+			validate: func() error {
+				return (TokenStatsUpdate{}).Validate()
+			},
+			wantError: true,
+		},
+		{
+			name: "token stats update missing agent",
+			validate: func() error {
+				return (TokenStatsUpdate{SessionID: "sess-1"}).Validate()
+			},
+			wantError: true,
+		},
+		{
+			name: "token stats query invalid",
+			validate: func() error {
+				return (TokenStatsQuery{Limit: -1}).Validate()
+			},
+			wantError: true,
+		},
+		{
+			name: "permission log entry valid",
+			validate: func() error {
+				return (PermissionLogEntry{
+					SessionID:  "sess-1",
+					AgentName:  "coder",
+					Action:     "bash",
+					Resource:   "/tmp",
+					Decision:   "allow",
+					PolicyUsed: "approve-reads",
+				}).Validate()
+			},
+		},
+		{
+			name: "permission log entry invalid",
+			validate: func() error {
+				return (PermissionLogEntry{}).Validate()
+			},
+			wantError: true,
+		},
+		{
+			name: "permission log entry missing agent",
+			validate: func() error {
+				return (PermissionLogEntry{SessionID: "sess-1"}).Validate()
+			},
+			wantError: true,
+		},
+		{
+			name: "permission log entry missing action",
+			validate: func() error {
+				return (PermissionLogEntry{SessionID: "sess-1", AgentName: "coder"}).Validate()
+			},
+			wantError: true,
+		},
+		{
+			name: "permission log entry missing resource",
+			validate: func() error {
+				return (PermissionLogEntry{SessionID: "sess-1", AgentName: "coder", Action: "bash"}).Validate()
+			},
+			wantError: true,
+		},
+		{
+			name: "permission log entry missing decision",
+			validate: func() error {
+				return (PermissionLogEntry{SessionID: "sess-1", AgentName: "coder", Action: "bash", Resource: "/tmp"}).Validate()
+			},
+			wantError: true,
+		},
+		{
+			name: "permission log entry missing policy",
+			validate: func() error {
+				return (PermissionLogEntry{SessionID: "sess-1", AgentName: "coder", Action: "bash", Resource: "/tmp", Decision: "allow"}).Validate()
+			},
+			wantError: true,
+		},
+		{
+			name: "permission log query invalid",
+			validate: func() error {
+				return (PermissionLogQuery{Limit: -1}).Validate()
+			},
+			wantError: true,
+		},
+		{
+			name: "session meta valid",
+			validate: func() error {
+				return (&SessionMeta{
+					ID:            "sess-meta",
+					AgentName:     "coder",
+					WorkspaceID:   "ws-meta",
+					ProfileID:     DefaultProfileID,
+					State:         "active",
+					RuntimeStatus: SessionRuntimeReady,
+					CreatedAt:     now,
+					UpdatedAt:     now,
+				}).Validate()
+			},
+		},
+		{
+			name: "session meta invalid",
+			validate: func() error {
+				return (&SessionMeta{}).Validate()
+			},
+			wantError: true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			err := tt.validate()
+			if tt.wantError && err == nil {
+				t.Fatal("validate() error = nil, want non-nil")
+			}
+			if tt.wantErrorContains != "" && !strings.Contains(err.Error(), tt.wantErrorContains) {
+				t.Fatalf("validate() error = %v, want substring %q", err, tt.wantErrorContains)
+			}
+			if !tt.wantError && err != nil {
+				t.Fatalf("validate() error = %v", err)
+			}
+		})
+	}
+
+	sessionRoot := filepath.Join(string(filepath.Separator), "tmp", "session-a")
+	if got, want := GlobalDatabaseName, "compozy.db"; got != want {
+		t.Fatalf("GlobalDatabaseName = %q, want %q", got, want)
+	}
+	if got, want := SessionDatabaseName, "events.db"; got != want {
+		t.Fatalf("SessionDatabaseName = %q, want %q", got, want)
+	}
+	if got, want := SessionDBFile(sessionRoot), filepath.Join(sessionRoot, SessionDatabaseName); got != want {
+		t.Fatalf("SessionDBFile() = %q, want %q", got, want)
+	}
+	if got, want := SessionMetaFile(sessionRoot), filepath.Join(sessionRoot, SessionMetaName); got != want {
+		t.Fatalf("SessionMetaFile() = %q, want %q", got, want)
+	}
+}
+
+func TestValidationPrimitives(t *testing.T) {
+	t.Parallel()
+
+	if err := requireField("value", "session id"); err != nil {
+		t.Fatalf("requireField(valid) error = %v", err)
+	}
+	if err := requireField("   ", "session id"); err == nil {
+		t.Fatal("requireField(whitespace) error = nil, want non-nil")
+	}
+
+	if err := requirePositiveLimit(0, "event limit"); err != nil {
+		t.Fatalf("requirePositiveLimit(0) error = %v", err)
+	}
+	if err := requirePositiveLimit(3, "event limit"); err != nil {
+		t.Fatalf("requirePositiveLimit(3) error = %v", err)
+	}
+	if err := requirePositiveLimit(-1, "event limit"); err == nil {
+		t.Fatal("requirePositiveLimit(-1) error = nil, want non-nil")
+	}
+}
+
+func TestStoreHelpersAndErrorPaths(t *testing.T) {
+	t.Parallel()
+
+	now := time.Date(2026, 4, 3, 20, 15, 0, 0, time.UTC)
+	if got := normalizeTime(now.In(time.FixedZone("test", -3*60*60))); got.Location() != time.UTC {
+		t.Fatalf("normalizeTime() location = %v, want UTC", got.Location())
+	}
+	if got := normalizeTime(time.Time{}); !got.IsZero() {
+		t.Fatalf("normalizeTime(zero) = %v, want zero", got)
+	}
+
+	formatted := FormatTimestamp(now)
+	parsed, err := ParseTimestamp(formatted)
+	if err != nil {
+		t.Fatalf("ParseTimestamp() error = %v", err)
+	}
+	if !parsed.Equal(now.UTC()) {
+		t.Fatalf("ParseTimestamp() = %v, want %v", parsed, now.UTC())
+	}
+	if _, err := ParseTimestamp("bad-timestamp"); err == nil {
+		t.Fatal("ParseTimestamp() error = nil, want non-nil")
+	}
+
+	if got := NullableString(""); got != nil {
+		t.Fatalf("NullableString(\"\") = %#v, want nil", got)
+	}
+	if got := NullableString("value"); got != "value" {
+		t.Fatalf("NullableString(value) = %#v, want value", got)
+	}
+
+	var nilString *string
+	if got := NullableStringPointer(nilString); got != nil {
+		t.Fatalf("NullableStringPointer(nil) = %#v, want nil", got)
+	}
+	value := "abc"
+	if got := NullableStringPointer(&value); got != "abc" {
+		t.Fatalf("NullableStringPointer(&value) = %#v, want abc", got)
+	}
+	if got := NullString(sql.NullString{}); got != nil {
+		t.Fatalf("NullString(invalid) = %#v, want nil", got)
+	}
+	if got := NullString(sql.NullString{String: "value", Valid: true}); got == nil || *got != "value" {
+		t.Fatalf("NullString(valid) = %#v, want value", got)
+	}
+	if got := NullInt64(sql.NullInt64{}); got != nil {
+		t.Fatalf("NullInt64(invalid) = %#v, want nil", got)
+	}
+	if got := NullInt64(sql.NullInt64{Int64: 7, Valid: true}); got == nil || *got != 7 {
+		t.Fatalf("NullInt64(valid) = %#v, want 7", got)
+	}
+	if got := NullFloat64(sql.NullFloat64{}); got != nil {
+		t.Fatalf("NullFloat64(invalid) = %#v, want nil", got)
+	}
+	if got := NullFloat64(sql.NullFloat64{Float64: 1.25, Valid: true}); got == nil || *got != 1.25 {
+		t.Fatalf("NullFloat64(valid) = %#v, want 1.25", got)
+	}
+
+	got, err := NewID("prefix")
+	if err != nil {
+		t.Fatalf("NewID(prefix) error = %v", err)
+	}
+	if got == "" || filepath.Base(got) != got {
+		t.Fatalf("NewID(prefix) = %q, want non-empty plain value", got)
+	}
+	got, err = NewID("")
+	if err != nil {
+		t.Fatalf("NewID(empty prefix) error = %v", err)
+	}
+	if got == "" {
+		t.Fatal("NewID(\"\") = empty, want non-empty")
+	}
+
+	t.Run("Should reject missing or unreadable identifier entropy", func(t *testing.T) {
+		t.Parallel()
+
+		entropyErr := errors.New("entropy unavailable")
+		generatedID, generateErr := newID("prefix", iotest.ErrReader(entropyErr))
+		if generatedID != "" {
+			t.Fatalf("newID(failing entropy) = %q, want empty", generatedID)
+		}
+		if !errors.Is(generateErr, entropyErr) {
+			t.Fatalf("newID(failing entropy) error = %v, want entropy failure", generateErr)
+		}
+		generatedID, generateErr = newID("prefix", nil)
+		if generatedID != "" || generateErr == nil {
+			t.Fatalf(
+				"newID(nil entropy) = %q, %v; want empty ID and error",
+				generatedID,
+				generateErr,
+			)
+		}
+	})
+
+	if err := Checkpoint(testutil.Context(t), nil); err != nil {
+		t.Fatalf("Checkpoint(nil) error = %v", err)
+	}
+	if _, err := OpenSQLiteDatabase(testutil.Context(t), "", nil); err == nil {
+		t.Fatal("OpenSQLiteDatabase(\"\") error = nil, want non-nil")
+	}
+}
+
+func TestMetaReadWriteErrors(t *testing.T) {
+	t.Parallel()
+
+	if _, err := ReadSessionMeta(""); err == nil {
+		t.Fatal("ReadSessionMeta(\"\") error = nil, want non-nil")
+	}
+	invalidPath := filepath.Join(t.TempDir(), SessionMetaName)
+	if err := os.WriteFile(invalidPath, []byte("{"), 0o644); err != nil {
+		t.Fatalf("WriteFile() error = %v", err)
+	}
+	if _, err := ReadSessionMeta(invalidPath); err == nil {
+		t.Fatal("ReadSessionMeta(invalid JSON) error = nil, want non-nil")
+	}
+
+	if err := WriteSessionMeta("", &SessionMeta{}); err == nil {
+		t.Fatal("WriteSessionMeta(\"\") error = nil, want non-nil")
+	}
+	if err := WriteSessionMeta(filepath.Join(t.TempDir(), SessionMetaName), &SessionMeta{}); err == nil {
+		t.Fatal("WriteSessionMeta(invalid meta) error = nil, want non-nil")
+	}
+}

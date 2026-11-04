@@ -1,0 +1,222 @@
+package task
+
+import (
+	"context"
+	"encoding/json"
+
+	"fmt"
+	"strings"
+
+	diagnosticcontract "github.com/compozy/compozy/internal/diagnosticcontract"
+)
+
+func requireForceFailStatus(run Run) error {
+	switch run.Status.Normalize() {
+	case TaskRunStatusQueued, TaskRunStatusClaimed:
+		return nil
+	case TaskRunStatusCompleted, TaskRunStatusFailed, TaskRunStatusCanceled:
+		return forceRunDiagnosticError(
+			diagnosticcontract.CodeTaskRunAlreadyTerminal,
+			"Task run is already terminal",
+			fmt.Sprintf("Run %s is already %s and cannot be force failed.", run.ID, run.Status.Normalize()),
+			diagnosticcontract.SeverityInfo,
+			fmt.Sprintf("compozy task inspect %s", run.ID),
+			map[string]any{runEvidenceIDKey: run.ID, leaseStatusKey: run.Status.Normalize().String()},
+			ErrInvalidStatusTransition,
+		)
+	case TaskRunStatusNeedsAttention:
+		return forceRunDiagnosticError(
+			diagnosticcontract.CodeTaskRunStillActive,
+			"Task run needs recovery",
+			fmt.Sprintf("Run %s is needs_attention; recover it before forcing another terminal action.", run.ID),
+			diagnosticcontract.SeverityError,
+			fmt.Sprintf("compozy task run recover %s --reason %q", run.ID, "operator recovery"),
+			map[string]any{runEvidenceIDKey: run.ID, leaseStatusKey: run.Status.Normalize().String()},
+			ErrInvalidStatusTransition,
+		)
+	default:
+		return forceRunDiagnosticError(
+			diagnosticcontract.CodeTaskRunStillActive,
+			"Task run is still active",
+			fmt.Sprintf(
+				"Run %s is %s; active runs must be stopped before forced failure.",
+				run.ID,
+				run.Status.Normalize(),
+			),
+			diagnosticcontract.SeverityError,
+			fmt.Sprintf("compozy task run cancel %s --reason %q", run.ID, "stop before force fail"),
+			map[string]any{runEvidenceIDKey: run.ID, leaseStatusKey: run.Status.Normalize().String()},
+			ErrInvalidStatusTransition,
+		)
+	}
+}
+
+func (m *Service) requireRetryChainDepth(ctx context.Context, source Run) error {
+	runs, err := m.store.ListTaskRuns(ctx, RunQuery{TaskID: source.TaskID})
+	if err != nil {
+		return err
+	}
+	byID := make(map[string]Run, len(runs))
+	for _, run := range runs {
+		byID[run.ID] = run
+	}
+	depth := 0
+	for current := source; strings.TrimSpace(current.PreviousRunID) != ""; {
+		depth++
+		if depth >= MaxRetryRunChainDepth {
+			return forceRunDiagnosticError(
+				diagnosticcontract.CodeRetryChainTooDeep,
+				"Retry chain is too deep",
+				fmt.Sprintf("Run %s already has retry depth %d.", source.ID, depth),
+				diagnosticcontract.SeverityError,
+				fmt.Sprintf("compozy task inspect %s", source.TaskID),
+				map[string]any{runEvidenceIDKey: source.ID, taskEvidenceIDKey: source.TaskID, "depth": depth},
+				ErrRetryChainTooDeep,
+			)
+		}
+		previous, ok := byID[strings.TrimSpace(current.PreviousRunID)]
+		if !ok {
+			break
+		}
+		current = previous
+	}
+	return nil
+}
+
+func normalizeForceReleaseRun(req ForceReleaseRun) (ForceReleaseRun, error) {
+	reason, err := normalizeForceOperationReason(req.Reason, "force_release.reason")
+	if err != nil {
+		return ForceReleaseRun{}, err
+	}
+	req.Reason = reason
+	metadata, err := normalizeForceOperationMetadata(req.Metadata, "force_release.metadata")
+	if err != nil {
+		return ForceReleaseRun{}, err
+	}
+	req.Metadata = metadata
+	return req, nil
+}
+
+func normalizeForceFailRun(req ForceFailRun) (ForceFailRun, error) {
+	reason, err := normalizeForceOperationReason(req.Reason, "force_fail.reason")
+	if err != nil {
+		return ForceFailRun{}, err
+	}
+	req.Reason = reason
+	if req.Reason == "" {
+		return ForceFailRun{}, forceRunDiagnosticError(
+			diagnosticcontract.CodeForceOpRequiresReason,
+			"Force fail requires a reason",
+			"Provide --reason so the recovery audit event explains why the run was failed.",
+			diagnosticcontract.SeverityError,
+			"compozy task fail <run-id> --reason \"operator recovery\"",
+			nil,
+			ErrForceOpRequiresReason,
+		)
+	}
+	metadata, err := normalizeForceOperationMetadata(req.Metadata, "force_fail.metadata")
+	if err != nil {
+		return ForceFailRun{}, err
+	}
+	req.Metadata = metadata
+	return req, nil
+}
+
+func normalizeRetryRunRequest(req RetryRunRequest) (RetryRunRequest, error) {
+	metadata, err := normalizeForceOperationMetadata(req.Metadata, "retry_run.metadata")
+	if err != nil {
+		return RetryRunRequest{}, err
+	}
+	req.Metadata = metadata
+	return req, nil
+}
+
+func normalizeRecoverRunRequest(req RecoverRunRequest) (RecoverRunRequest, error) {
+	reason, err := normalizeForceOperationReason(req.Reason, "recover_run.reason")
+	if err != nil {
+		return RecoverRunRequest{}, err
+	}
+	req.Reason = reason
+	metadata, err := normalizeForceOperationMetadata(req.Metadata, "recover_run.metadata")
+	if err != nil {
+		return RecoverRunRequest{}, err
+	}
+	req.Metadata = metadata
+	return req, nil
+}
+
+func normalizeBulkForceRunRequest(req BulkForceRunRequest, requireReason bool) (BulkForceRunRequest, error) {
+	if len(req.RunIDs) == 0 {
+		return BulkForceRunRequest{}, fmt.Errorf("%w: bulk force run_ids is required", ErrValidation)
+	}
+	if len(req.RunIDs) > MaxForceRunBulkIDs {
+		return BulkForceRunRequest{}, forceRunDiagnosticError(
+			diagnosticcontract.CodeBulkTooLarge,
+			"Bulk force operation is too large",
+			fmt.Sprintf("Bulk force operations accept at most %d run ids.", MaxForceRunBulkIDs),
+			diagnosticcontract.SeverityError,
+			"",
+			map[string]any{"limit": MaxForceRunBulkIDs, "count": len(req.RunIDs)},
+			ErrBulkTooLarge,
+		)
+	}
+	seen := make(map[string]struct{}, len(req.RunIDs))
+	ids := make([]string, 0, len(req.RunIDs))
+	for _, id := range req.RunIDs {
+		trimmed := strings.TrimSpace(id)
+		if trimmed == "" {
+			return BulkForceRunRequest{}, fmt.Errorf(
+				"%w: bulk force run_ids must not contain empty values",
+				ErrValidation,
+			)
+		}
+		if _, ok := seen[trimmed]; ok {
+			continue
+		}
+		seen[trimmed] = struct{}{}
+		ids = append(ids, trimmed)
+	}
+	req.RunIDs = ids
+	reason, err := normalizeForceOperationReason(req.Reason, "bulk_force.reason")
+	if err != nil {
+		return BulkForceRunRequest{}, err
+	}
+	req.Reason = reason
+	if requireReason && req.Reason == "" {
+		return BulkForceRunRequest{}, forceRunDiagnosticError(
+			diagnosticcontract.CodeForceOpRequiresReason,
+			"Force fail requires a reason",
+			"Provide a reason so every failed row has clear audit evidence.",
+			diagnosticcontract.SeverityError,
+			"compozy task fail <run-id...> --reason \"operator recovery\"",
+			nil,
+			ErrForceOpRequiresReason,
+		)
+	}
+	metadata, err := normalizeForceOperationMetadata(req.Metadata, "bulk_force.metadata")
+	if err != nil {
+		return BulkForceRunRequest{}, err
+	}
+	req.Metadata = metadata
+	return req, nil
+}
+
+func normalizeForceOperationReason(reason string, path string) (string, error) {
+	normalized := RedactClaimTokens(strings.TrimSpace(reason))
+	if err := ValidateReasonSize(normalized, path); err != nil {
+		return "", err
+	}
+	return normalized, nil
+}
+
+func normalizeForceOperationMetadata(raw json.RawMessage, path string) (json.RawMessage, error) {
+	normalized := normalizeRawJSON(raw)
+	if err := ValidateMetadataSize(normalized, path); err != nil {
+		return nil, err
+	}
+	redacted := RedactClaimTokenJSON(normalized)
+	if err := ValidateMetadataSize(redacted, path); err != nil {
+		return nil, err
+	}
+	return redacted, nil
+}

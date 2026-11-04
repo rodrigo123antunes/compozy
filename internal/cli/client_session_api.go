@@ -1,0 +1,76 @@
+package cli
+
+import (
+	"context"
+
+	"github.com/compozy/compozy/internal/api/contract"
+	"github.com/compozy/compozy/internal/transcript"
+)
+
+// sessionClientAPI groups the daemon's session-scoped CLI transport surface.
+type sessionClientAPI interface {
+	SearchSessionTranscript(
+		context.Context,
+		string,
+		transcript.SearchQuery,
+	) (contract.SessionTranscriptSearchResponse, error)
+	GetSessionOutline(context.Context, string) (contract.SessionTranscriptOutlineResponse, error)
+	ListSessions(context.Context, SessionListQuery) (SessionListPage, error)
+	CreateSession(context.Context, CreateSessionRequest) (SessionRecord, error)
+	GetSession(context.Context, string) (SessionRecord, error)
+	GetSessionHealth(context.Context, string) (SessionHealthRecord, error)
+	GetSessionStatus(context.Context, string) (SessionStatusRecord, error)
+	GetSessionUsage(context.Context, string) (SessionUsageRecord, error)
+	GetSessionUsageTurns(context.Context, string) (contract.SessionUsageTurnsResponse, error)
+	InspectSession(context.Context, string, SessionInspectQuery) (SessionInspectRecord, error)
+	RefreshSessionSoul(context.Context, string, SessionSoulRefreshRequest) (AgentSoulRecord, error)
+	StopSession(context.Context, string, bool, contract.SessionProcessPolicy) (SessionStopRecord, error)
+	ArchiveSession(context.Context, string, bool, bool, contract.SessionProcessPolicy) (SessionRecord, error)
+	MoveSessionToLater(context.Context, string, contract.MoveSessionToLaterRequest) (SessionRecord, error)
+	ResumeSessionFromLater(context.Context, string, bool) (SessionRecord, error)
+	MarkSessionSeen(context.Context, string) (SessionRecord, error)
+	UnarchiveSession(context.Context, string) (SessionRecord, error)
+	RenameSession(context.Context, string, RenameSessionRequest) (SessionRecord, error)
+	SetSessionParent(context.Context, string, SetSessionParentRequest) (SessionRecord, error)
+	ClearSessionParent(context.Context, string) (SessionRecord, error)
+	MoveSessionToProfile(context.Context, string, MoveSessionToProfileRequest) (MoveSessionToProfileResponse, error)
+	DeleteSession(context.Context, string, bool, contract.SessionProcessPolicy) error
+	ResumeSession(context.Context, string) (SessionRecord, error)
+	UploadSessionAttachment(context.Context, string, string) (SessionAttachmentRecord, error)
+	SetSessionRuntime(context.Context, string, SetSessionRuntimeRequest) (SessionRecord, error)
+	ClearSessionRuntime(context.Context, string, int64) (SessionRecord, error)
+	SessionRecap(context.Context, string, int) (SessionRecapRecord, error)
+	RepairSession(context.Context, string, SessionRepairQuery) (SessionRepairRecord, error)
+	GetSessionTranscript(context.Context, string) (SessionTranscriptRecord, error)
+	MutateSessionGoal(context.Context, string, contract.SessionGoalCommandRequest) (contract.GoalCommandResult, error)
+	RewindSession(context.Context, string, SessionRewindRequest) (SessionRewindRecord, error)
+	GetSessionOwner(context.Context, string) (contract.SessionOwner, error)
+	PreviewSessionDerive(context.Context, SessionDeriveTarget) (SessionDerivePreviewRecord, error)
+	ContinueSession(context.Context, SessionDeriveTarget, SessionContinueRequest) (SessionDeriveRecord, error)
+	ForkSession(context.Context, SessionDeriveTarget, SessionForkRequest) (SessionDeriveRecord, error)
+	ApproveSession(context.Context, string, SessionApprovalRequest) (SessionApprovalRecord, error)
+	ListSessionClarifications(context.Context, string) (ClarificationsRecord, error)
+	ListSessionInteractions(context.Context, string, []string) (SessionInteractionsRecord, error)
+	ListSessionPendingInteractions(context.Context, string, bool) (SessionInteractionsRecord, error)
+	GetSessionAttentionSummary(context.Context) (SessionAttentionSummaryRecord, error)
+	WaitSession(context.Context, string, string, SessionWaitRequest) (SessionWaitRecord, error)
+	CancelSessionPrompt(context.Context, string) (SessionPromptCancelRecord, error)
+	AnswerSessionClarification(
+		context.Context,
+		string,
+		string,
+		ClarificationAnswerRequest,
+	) (ClarificationAnswerRecord, error)
+	PromptSession(context.Context, string, string) ([]AgentEventRecord, error)
+	SendSessionPrompt(context.Context, string, SessionPromptRequest) (SessionPromptRecord, error)
+	SteerSessionPrompt(context.Context, string, contract.SteerPromptRequest) (SessionPromptRecord, error)
+	ListSessionInputs(context.Context, string) (SessionInputListRecord, error)
+	ClearSessionInputs(context.Context, string) (contract.SessionInputClearResponse, error)
+	ReplaceSessionInput(context.Context, string, string, ReplaceSessionInputRequest) (SessionInputRecord, error)
+	PromoteSessionInput(context.Context, string, string, PromoteSessionInputRequest) (SessionPromptRecord, error)
+	CancelSessionInput(context.Context, string, string) (SessionPromptRecord, error)
+	StreamPromptSession(context.Context, string, SessionPromptRequest, SSEHandler) error
+	SessionEvents(context.Context, string, SessionEventQuery) ([]SessionEventRecord, error)
+	StreamSessionEvents(context.Context, string, SessionEventQuery, string, SSEHandler) error
+	SessionHistory(context.Context, string, SessionEventQuery) ([]TurnHistoryRecord, error)
+}

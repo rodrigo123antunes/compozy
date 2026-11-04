@@ -1,0 +1,344 @@
+package spec
+
+import "github.com/compozy/compozy/internal/api/contract"
+
+const (
+	agentIdentityDeniedDescription         = "Agent identity is denied"
+	sessionAttentionUnavailableDescription = "Session attention is unavailable"
+	finishedAutomationParamDescription     = "Exclude settled automation-run sessions; " +
+		"search, type, parent, root, archive=only and later=only reads ignore it"
+)
+
+func sessionCatalogOperations() []OperationSpec {
+	return []OperationSpec{
+		sessionCatalogListOperation(),
+		sessionCatalogFacetsOperation(),
+		sessionCatalogStreamOperation(),
+		sessionWaitOperation(),
+		sessionPromptCancelOperation(),
+		sessionPresenceOperation(),
+		sessionInteractionsOperation(),
+		sessionPendingInteractionsOperation(),
+		sessionAttentionSummaryOperation(),
+	}
+}
+
+func sessionPromptCancelOperation() OperationSpec {
+	return OperationSpec{
+		Method:      httpMethodPost,
+		Path:        "/api/workspaces/{workspace_id}/sessions/{session_id}/prompt/cancel",
+		AppAccess:   AppAccessAllowed,
+		OperationID: "cancelSessionPrompt",
+		Summary:     "Cancel the active session prompt",
+		Tags:        []string{specSessionsKey},
+		Transports:  []Transport{TransportHTTP, TransportUDS},
+		Parameters: []ParameterSpec{
+			pathParam("workspace_id", "Workspace id"),
+			pathParam("session_id", "Session id"),
+		},
+		Responses: []ResponseSpec{
+			{Status: 200, Description: "Cancellation result", Body: contract.SessionPromptCancelResponse{}},
+			{Status: 404, Description: specSessionNotFoundDescription, Body: contract.ErrorPayload{}},
+			{Status: 500, Description: specInternalServerErrorDescription, Body: contract.ErrorPayload{}},
+		},
+	}
+}
+
+func sessionWaitOperation() OperationSpec {
+	return OperationSpec{
+		Method:      httpMethodPost,
+		Path:        "/api/workspaces/{workspace_id}/sessions/{session_id}/wait",
+		AppAccess:   AppAccessAllowed,
+		OperationID: "waitForSession",
+		Summary:     "Wait for a session state",
+		Tags:        []string{specSessionsKey},
+		Transports:  []Transport{TransportHTTP, TransportUDS},
+		Parameters: []ParameterSpec{
+			pathParam("workspace_id", "Workspace id"),
+			pathParam("session_id", "Session id"),
+		},
+		RequestBody: contract.SessionWaitRequest{},
+		Responses: []ResponseSpec{
+			{Status: 200, Description: "Wait completed or timed out", Body: contract.SessionWaitResponse{}},
+			{Status: 400, Description: "Malformed wait request", Body: contract.ErrorPayload{}},
+			{Status: 404, Description: authoredContextSessionNotFoundDescription, Body: contract.ErrorPayload{}},
+			{Status: 409, Description: "Wait limit reached or registration in use", Body: contract.ErrorPayload{}},
+			{Status: 410, Description: "Session gone or wait registration expired", Body: contract.ErrorPayload{}},
+			{Status: 422, Description: "Invalid wait request", Body: contract.ErrorPayload{}},
+			{Status: 503, Description: "Session wait is unavailable", Body: contract.ErrorPayload{}},
+			{Status: 500, Description: specInternalServerErrorDescription, Body: contract.ErrorPayload{}},
+		},
+	}
+}
+
+func sessionCatalogListOperation() OperationSpec {
+	return OperationSpec{
+		Method:      httpMethodGet,
+		Path:        specSessionsPath,
+		AppAccess:   AppAccessAllowed,
+		OperationID: "listSessions",
+		Summary:     "List sessions",
+		Tags:        []string{specSessionsKey},
+		Transports:  []Transport{TransportHTTP, TransportUDS},
+		Parameters: withProfileScope(
+			queryParam("workspace_id", "Workspace id or path", false),
+			boolQueryParam("all_workspaces", "Use the explicit all-workspaces aggregate"),
+			workspaceIDsQueryParam("Project IDs or @user; repeatable, requires all_workspaces"),
+			boolQueryParam("include_health", "Include metadata-only health for returned sessions"),
+			boolQueryParam("skip_total", "Omit the exact catalog count for a bounded cursor read"),
+			boolQueryParam("exclude_instance_main", "Exclude always-on main sessions from the page and its total"),
+			boolQueryParam("exclude_finished_automation", finishedAutomationParamDescription),
+			enumQueryParam(
+				"state",
+				"Filter by exact session state",
+				[]string{"starting", specActiveKey, "stopping", specStoppedKey},
+			),
+			enumQueryParam("type", "Filter by exact session type", sessionCatalogTypeValues()),
+			queryParam("agent", "Filter by exact agent definition name", false),
+			enumQueryParam(
+				"subagents",
+				"Subagent session visibility (default include)",
+				[]string{specIncludeKey, specExcludeKey, specOnlyKey},
+			),
+			enumQueryParam("children", "Managed child visibility", []string{"include", "exclude"}),
+			queryParam("parent", "Filter by exact parent session id", false),
+			queryParam("root", "Filter by exact root session id (includes the root itself)", false),
+			queryParam("worktree", "Filter by exact bound worktree id", false),
+			queryParam(
+				"q",
+				"Search session id, name, agent, or provider; title_agent searches visible title and agent",
+				false,
+			),
+			enumQueryParam(
+				"search_fields",
+				"Select visible title/agent search instead of the default catalog fields",
+				[]string{"title_agent"},
+			),
+			boolQueryParam("resumable", "Only list sessions eligible for explicit attach"),
+			boolQueryParam("attention", "Only list sessions in the needs-you attention class"),
+			ParameterSpec{
+				Name:        "board_column",
+				In:          specParameterInQuery,
+				Kind:        specArrayKind,
+				Description: "Repeatable board column filter: needs_you, working, waiting, in_review, done",
+			},
+			queryParam("badge", "Filter by comma-separated exact session badges", false),
+			enumQueryParam(
+				"archive",
+				"Archived session visibility",
+				[]string{specExcludeKey, specOnlyKey, specIncludeKey},
+			),
+			enumQueryParam(
+				"later",
+				"Visibility of sessions parked in Later; excluded by default",
+				[]string{specExcludeKey, specOnlyKey, specIncludeKey},
+			),
+			enumQueryParam(
+				"sort",
+				"Stable session ordering",
+				[]string{"recent", "created", "name", "last_activity", "attention", "navigator", "manual"},
+			),
+			queryParam("cursor", "Opaque next_cursor from the previous page", false),
+			intQueryParam("limit", "Sessions per page (1-100)"),
+		),
+		Responses: sessionCatalogListResponses(),
+	}
+}
+
+func sessionPresenceOperation() OperationSpec {
+	return OperationSpec{
+		Method:      httpMethodPost,
+		Path:        "/api/workspaces/{workspace_id}/sessions/{session_id}/presence",
+		AppAccess:   AppAccessAllowed,
+		OperationID: "updateSessionPresence",
+		Summary:     "Update operator session presence",
+		Tags:        []string{specSessionsKey},
+		Transports:  []Transport{TransportHTTP, TransportUDS},
+		Parameters: []ParameterSpec{
+			pathParam("workspace_id", "Workspace id"),
+			pathParam("session_id", "Session id"),
+		},
+		RequestBody: contract.SessionPresenceRequest{},
+		Responses: []ResponseSpec{
+			{Status: 200, Description: "Presence lease acquired", Body: contract.SessionPresenceResponse{}},
+			{Status: 204, Description: "Presence lease renewed or released"},
+			{Status: 400, Description: "Invalid presence request", Body: contract.ErrorPayload{}},
+			{Status: 403, Description: agentIdentityDeniedDescription, Body: contract.ErrorPayload{}},
+			{Status: 404, Description: "Session or lease not found", Body: contract.ErrorPayload{}},
+			{Status: 409, Description: "Presence lease ownership mismatch", Body: contract.ErrorPayload{}},
+			{Status: 503, Description: sessionAttentionUnavailableDescription, Body: contract.ErrorPayload{}},
+			{Status: 500, Description: specInternalServerErrorDescription, Body: contract.ErrorPayload{}},
+		},
+	}
+}
+
+func sessionPendingInteractionsOperation() OperationSpec {
+	operation := sessionInteractionsOperation()
+	operation.Path = "/api/workspaces/{workspace_id}/sessions/{session_id}/pending-interactions"
+	operation.OperationID = "listSessionPendingInteractions"
+	return operation
+}
+
+func sessionInteractionsOperation() OperationSpec {
+	return OperationSpec{
+		Method:      httpMethodGet,
+		Path:        "/api/workspaces/{workspace_id}/sessions/{session_id}/interactions",
+		AppAccess:   AppAccessAllowed,
+		OperationID: "listSessionInteractions",
+		Summary:     "List pending session interactions",
+		Tags:        []string{specSessionsKey},
+		Transports:  []Transport{TransportHTTP, TransportUDS},
+		Parameters: []ParameterSpec{
+			pathParam("workspace_id", "Workspace id"),
+			pathParam("session_id", "Session id"),
+			boolQueryParam("descendants", "Include descendant sessions in the same workspace and profile"),
+			enumQueryParam(
+				"status",
+				"Filter by interaction status",
+				[]string{specPendingKey, "orphaned", "resolved", "timed_out", "canceled"},
+			),
+		},
+		Responses: []ResponseSpec{
+			{Status: 200, Description: "OK", Body: contract.SessionInteractionsResponse{}},
+			{Status: 400, Description: "Invalid interaction status", Body: contract.ErrorPayload{}},
+			{Status: 403, Description: agentIdentityDeniedDescription, Body: contract.ErrorPayload{}},
+			{Status: 404, Description: authoredContextSessionNotFoundDescription, Body: contract.ErrorPayload{}},
+			{Status: 503, Description: sessionAttentionUnavailableDescription, Body: contract.ErrorPayload{}},
+			{Status: 500, Description: specInternalServerErrorDescription, Body: contract.ErrorPayload{}},
+		},
+	}
+}
+
+func sessionAttentionSummaryOperation() OperationSpec {
+	return OperationSpec{
+		Method:      httpMethodGet,
+		Path:        "/api/sessions/attention-summary",
+		AppAccess:   AppAccessAllowed,
+		OperationID: "getSessionAttentionSummary",
+		Summary:     "Get exact session attention counts",
+		Tags:        []string{specSessionsKey},
+		Transports:  []Transport{TransportHTTP, TransportUDS},
+		Responses: []ResponseSpec{
+			{Status: 200, Description: "OK", Body: contract.SessionAttentionSummaryPayload{}},
+			{Status: 403, Description: agentIdentityDeniedDescription, Body: contract.ErrorPayload{}},
+			{Status: 503, Description: sessionAttentionUnavailableDescription, Body: contract.ErrorPayload{}},
+			{Status: 500, Description: specInternalServerErrorDescription, Body: contract.ErrorPayload{}},
+		},
+	}
+}
+
+func sessionCatalogTypeValues() []string {
+	return []string{specUserKey, "system", "coordinator", "spawned"}
+}
+
+func sessionCatalogStreamOperation() OperationSpec {
+	return OperationSpec{
+		Method:      httpMethodGet,
+		Path:        "/api/sessions/catalog-stream",
+		AppAccess:   AppAccessDenied,
+		OperationID: "streamSessionCatalog",
+		Summary:     "Stream session catalog changes across workspaces",
+		Tags:        []string{specSessionsKey},
+		Transports:  []Transport{TransportHTTP, TransportUDS},
+		Parameters: withProfileScope(
+			queryParam("workspace_id", "Workspace id or path", false),
+			boolQueryParam("all_workspaces", "Subscribe to the explicit all-workspaces aggregate"),
+			optionalLastEventIDHeaderParam("Resume after this catalog sequence"),
+			queryParam(
+				"last_event_id",
+				"Resume cursor when Last-Event-ID cannot be set; the header takes precedence",
+				false,
+			),
+		),
+		Responses: []ResponseSpec{
+			{Status: 101, Description: specEventStreamUpgrade},
+			{
+				Status: 200,
+				Description: "Profile-scoped session catalog event stream for the selected workspace " +
+					"or explicit owner-labeled all-workspaces aggregate",
+				Bodies: responseBodiesOf(
+					responseBodyOf[contract.SessionCatalogEventPayload](),
+					responseBodyOf[contract.SessionAttentionEventPayload](),
+					responseBodyOf[contract.OperatorNotificationEventPayload](),
+					responseBodyOf[contract.AgentInstancePayload](),
+				),
+				ContentType: specContentTypeEventStream,
+			},
+			{Status: 500, Description: specInternalServerErrorDescription, Body: contract.ErrorPayload{}},
+			{Status: 503, Description: "Session catalog stream is unavailable", Body: contract.ErrorPayload{}},
+		},
+	}
+}
+
+func sessionCatalogFacetsOperation() OperationSpec {
+	return OperationSpec{
+		Method:      httpMethodGet,
+		Path:        "/api/sessions/facets",
+		AppAccess:   AppAccessAllowed,
+		OperationID: "listSessionFacets",
+		Summary:     "Count session catalog facets",
+		Tags:        []string{specSessionsKey},
+		Transports:  []Transport{TransportHTTP, TransportUDS},
+		Parameters: withProfileScope(
+			boolQueryParam("exclude_instance_main", "Exclude instance main sessions from board counts"),
+			boolQueryParam("exclude_finished_automation", finishedAutomationParamDescription),
+			queryParam("workspace_id", "Workspace id or path", false),
+			boolQueryParam("all_workspaces", "Use the explicit all-workspaces aggregate"),
+			workspaceIDsQueryParam("Project IDs or @user; repeatable, requires all_workspaces"),
+			queryParam("worktree", "Filter by bound worktree id", false),
+			queryParam("agent", "Filter by exact agent name", false),
+			enumQueryParam(
+				"subagents",
+				"Subagent session visibility (default include)",
+				[]string{specIncludeKey, specExcludeKey, specOnlyKey},
+			),
+			enumQueryParam("children", "Managed child visibility", []string{"include", "exclude"}),
+			queryParam("parent", "Filter by exact parent session id", false),
+			queryParam("root", "Filter by exact root session id (includes the root itself)", false),
+			boolQueryParam("resumable", "Only count sessions eligible for explicit attach"),
+			enumQueryParam(
+				"state",
+				"Filter by exact session state",
+				[]string{"starting", "active", "stopping", specStoppedKey},
+			),
+			enumQueryParam("type", "Filter by exact session type", sessionCatalogTypeValues()),
+			enumQueryParam(
+				"archive",
+				"Archived session visibility",
+				[]string{specExcludeKey, specOnlyKey, specIncludeKey},
+			),
+			enumQueryParam(
+				"later",
+				"Visibility of sessions parked in Later; excluded by default",
+				[]string{specExcludeKey, specOnlyKey, specIncludeKey},
+			),
+		),
+		Responses: []ResponseSpec{
+			{
+				Status:      200,
+				Description: "Exact scope counts, independent of text query and selected badge",
+				Body:        contract.SessionCatalogFacetsResponse{},
+			},
+			{Status: 400, Description: "Invalid catalog scope or filters", Body: contract.ErrorPayload{}},
+			{Status: 404, Description: specWorkspaceNotFoundDescription, Body: contract.ErrorPayload{}},
+			{Status: 410, Description: workspaceRootMissingDescription, Body: contract.ErrorPayload{}},
+			{Status: 503, Description: "Session catalog facets are unavailable", Body: contract.ErrorPayload{}},
+			{Status: 500, Description: specInternalServerErrorDescription, Body: contract.ErrorPayload{}},
+		},
+	}
+}
+
+func sessionCatalogListResponses() []ResponseSpec {
+	return []ResponseSpec{
+		{Status: 200, Description: "OK", Body: contract.SessionCatalogResponse{}},
+		{Status: 400, Description: "Invalid session list query or cursor", Body: contract.ErrorPayload{}},
+		{Status: 404, Description: specWorkspaceNotFoundDescription, Body: contract.ErrorPayload{}},
+		{Status: 410, Description: workspaceRootMissingDescription, Body: contract.ErrorPayload{}},
+		{
+			Status:      503,
+			Description: "Paged session catalog or workspace resolver is unavailable",
+			Body:        contract.ErrorPayload{},
+		},
+		{Status: 500, Description: specInternalServerErrorDescription, Body: contract.ErrorPayload{}},
+	}
+}

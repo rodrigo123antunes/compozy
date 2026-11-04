@@ -1,0 +1,44 @@
+{
+    "name": "@compozy/desktop",
+    "version": "0.3.0",
+    "private": true,
+    "description": "CompozyOS Electron desktop shell",
+    "homepage": "https://compozy.com",
+    "author": "Compozy",
+    "type": "module",
+    "main": "dist/main.cjs",
+    "scripts": {
+        "build": "bun run build:runtime && bun run build:main && bun run scripts/package-local.ts",
+        "build:main": "bun run scripts/build-main.ts",
+        "build:runtime": "bun run scripts/build-runtime.ts",
+        "build:e2e-update": "bun run scripts/build-e2e-update.ts",
+        "release:config": "bun run scripts/generate-release-config.ts",
+        "release:collect": "bun run scripts/collect-release-artifacts.ts",
+        "release:prepare-channel": "bun run scripts/prepare-channel-manifests.ts",
+        "release:verify-mac-zip": "bun run scripts/verify-mac-update-zip.ts",
+        "release:finalize-mac": "bun run scripts/finalize-macos-release.ts",
+        "dev": "bun run build:runtime && bun run build:main && COMPOZY_DESKTOP_BUNDLE_ROOT=.artifacts/runtime electron .",
+        "lint": "bunx oxfmt --check . && bunx oxlint --deny-warnings .",
+        "test": "vitest run",
+        "test:e2e": "bun run build:e2e-update && playwright test --config playwright.config.ts --grep-invert @nightly",
+        "test:e2e:nightly": "bun run build:e2e-update && playwright test --config playwright.config.ts --grep @nightly",
+        "typecheck": "tsc --noEmit"
+    },
+    "dependencies": {
+        "electron-updater": "6.8.11",
+        "tar": "7.5.22"
+    },
+    "devDependencies": {
+        "@playwright/test": "1.64.1",
+        "@types/bun": "1.4.4",
+        "@types/node": "26.6.5",
+        "@vitest/coverage-v8": "5.0.5",
+        "electron": "45.0.0",
+        "electron-builder": "26.18.0",
+        "esbuild": "0.28.2",
+        "typescript": "7.0.2",
+        "vitest": "5.0.5",
+        "yaml": "2.9.1"
+    },
+    "desktopName": "compozyos.desktop"
+}

@@ -1,0 +1,152 @@
+package daemon
+
+import (
+	"context"
+	"fmt"
+	"strings"
+
+	compozyconfig "github.com/compozy/compozy/internal/config"
+	"github.com/compozy/compozy/internal/coordinator"
+	hookspkg "github.com/compozy/compozy/internal/hooks"
+	"github.com/compozy/compozy/internal/session"
+)
+
+func (r *coordinatorRuntime) dispatchPreSpawn(
+	ctx context.Context,
+	payload hookspkg.CoordinatorPreSpawnPayload,
+) (hookspkg.CoordinatorPreSpawnPayload, error) {
+	if r.hooks == nil {
+		return payload, nil
+	}
+	result, err := r.hooks.DispatchCoordinatorPreSpawn(ctx, payload)
+	if err != nil {
+		return result, fmt.Errorf("daemon: dispatch coordinator pre-spawn hook: %w", err)
+	}
+	return result, nil
+}
+
+func (r *coordinatorRuntime) dispatchSpawned(
+	ctx context.Context,
+	decision coordinator.Decision,
+	info *session.Info,
+	cfg compozyconfig.ResolvedCoordinatorRole,
+	reason string,
+) {
+	if r.hooks == nil || info == nil {
+		return
+	}
+	_, err := r.hooks.DispatchCoordinatorSpawned(ctx, hookspkg.CoordinatorSpawnedPayload{
+		Event: hookspkg.HookCoordinatorSpawned, Timestamp: r.now().UTC(),
+		ProfileID:            decision.ProfileID,
+		WorkspaceID:          decision.WorkspaceID,
+		Workspace:            info.Workspace,
+		AgentName:            info.AgentName,
+		CoordinatorSessionID: info.ID,
+		TaskID:               decision.TaskID,
+		RunID:                decision.RunID,
+		WorkflowID:           decision.WorkflowID,
+
+		Provider:     cfg.Provider,
+		Model:        cfg.Model,
+		DecisionKind: "lifecycle",
+		Decision:     reason,
+	})
+	if err != nil {
+		r.logger.Warn("daemon: dispatch coordinator spawned hook failed", "error", err)
+	}
+}
+
+func (r *coordinatorRuntime) dispatchStopped(ctx context.Context, info *session.Info) {
+	if r.hooks == nil || info == nil {
+		return
+	}
+	_, err := r.hooks.DispatchCoordinatorStopped(ctx, hookspkg.CoordinatorStoppedPayload{
+		Event: hookspkg.HookCoordinatorStopped, Timestamp: r.now().UTC(),
+		ProfileID:            info.ProfileID,
+		WorkspaceID:          info.WorkspaceID,
+		Workspace:            info.Workspace,
+		AgentName:            info.AgentName,
+		CoordinatorSessionID: info.ID,
+
+		Provider:     info.Provider,
+		DecisionKind: "lifecycle",
+		Decision:     coordinator.ReasonCoordinatorStopped,
+		StopReason:   string(info.StopReason),
+	})
+	if err != nil {
+		r.logger.Warn("daemon: dispatch coordinator stopped hook failed", "error", err)
+	}
+}
+
+func (r *coordinatorRuntime) dispatchFailed(
+	ctx context.Context,
+	decision coordinator.Decision,
+	reason string,
+	failed error,
+) {
+	if r.hooks == nil || failed == nil {
+		return
+	}
+	_, err := r.hooks.DispatchCoordinatorFailed(ctx, hookspkg.CoordinatorFailedPayload{
+		Event: hookspkg.HookCoordinatorFailed, Timestamp: r.now().UTC(),
+		ProfileID:    decision.ProfileID,
+		WorkspaceID:  decision.WorkspaceID,
+		TaskID:       decision.TaskID,
+		RunID:        decision.RunID,
+		WorkflowID:   decision.WorkflowID,
+		DecisionKind: "bootstrap",
+		Decision:     reason,
+		Error:        failed.Error(),
+	})
+	if err != nil {
+		r.logger.Warn("daemon: dispatch coordinator failed hook failed", "error", err)
+	}
+}
+
+func (r *coordinatorRuntime) dispatchDecision(
+	ctx context.Context,
+	decision coordinator.Decision,
+	reason string,
+	override string,
+) {
+	if r.hooks == nil {
+		return
+	}
+	value := decision.Reason
+	if strings.TrimSpace(override) != "" {
+		value = strings.TrimSpace(override)
+	}
+	_, err := r.hooks.DispatchCoordinatorDecision(ctx, hookspkg.CoordinatorDecisionPayload{
+		Event: hookspkg.HookCoordinatorDecision, Timestamp: r.now().UTC(),
+		ProfileID:    decision.ProfileID,
+		WorkspaceID:  decision.WorkspaceID,
+		TaskID:       decision.TaskID,
+		RunID:        decision.RunID,
+		WorkflowID:   decision.WorkflowID,
+		DecisionKind: "bootstrap",
+		Decision:     firstNonEmpty(value, reason),
+	})
+	if err != nil {
+		r.logger.Warn("daemon: dispatch coordinator decision hook failed", "error", err)
+	}
+}
+
+func (r *coordinatorRuntime) preSpawnPayload(
+	decision coordinator.Decision,
+	cfg compozyconfig.ResolvedCoordinatorRole,
+	reason string,
+) hookspkg.CoordinatorPreSpawnPayload {
+	return hookspkg.CoordinatorPreSpawnPayload{
+		Event: hookspkg.HookCoordinatorPreSpawn, Timestamp: r.now().UTC(),
+		ProfileID:   decision.ProfileID,
+		WorkspaceID: decision.WorkspaceID,
+		AgentName:   cfg.AgentName,
+		TaskID:      decision.TaskID,
+		RunID:       decision.RunID,
+		WorkflowID:  decision.WorkflowID,
+
+		Provider: cfg.Provider,
+		Model:    cfg.Model,
+		Reason:   reason,
+	}
+}

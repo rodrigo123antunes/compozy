@@ -1,0 +1,254 @@
+// Suite: OS session-window controller
+// Invariant: context reads run whenever the window is live or the context sidebar is open.
+// Invariant: runtime snapshot projection remains render-stable while the runtime store is unchanged.
+// Boundary IN: retained-window liveness and inspector query admission.
+// Boundary OUT: query transport behavior, owned by each domain hook suite.
+import { renderHook } from "@testing-library/react";
+import { beforeEach, describe, expect, it, vi } from "vitest";
+
+import type { SessionPayload } from "@/systems/session";
+import { primarySessionFixture } from "@/systems/session/mocks";
+import {
+  sessionPromptRuntimeInput,
+  sessionPromptRuntimeStoreLogic,
+  type SessionPromptRuntimeStore,
+} from "@/systems/session/stores/session-prompt-runtime-store";
+
+const mocks = vi.hoisted(() => ({
+  inspectorOpen: false,
+  hasLiveGoal: undefined as boolean | undefined,
+  sessionCommands: vi.fn(),
+  sessionTopbar: vi.fn(),
+  sessionUsage: vi.fn(),
+  usageTurns: vi.fn(),
+  sessionVault: vi.fn(),
+  promptRuntimeStore: null as SessionPromptRuntimeStore | null,
+  worktreeBinding: {
+    worktreeId: "",
+    worktree: undefined as { id: string; state: string } | undefined,
+    bound: false,
+    worktrees: [],
+    forkAvailable: false,
+    forkUnavailableReason: undefined,
+  },
+}));
+
+vi.mock("@/systems/agent", async importOriginal => ({
+  ...(await importOriginal<typeof import("@/systems/agent")>()),
+  useAgentInstances: () => [],
+}));
+
+vi.mock("@/hooks/routes/use-session-clear-dialog", () => ({
+  useSessionClearDialog: () => ({ openDialog: vi.fn() }),
+}));
+
+vi.mock("@/hooks/routes/use-session-page-controls", () => ({
+  useSessionPageControls: () => ({
+    canClear: true,
+    handleClear: vi.fn(),
+    handleInterruptPrompt: vi.fn(),
+    handleQueuePrompt: vi.fn(),
+    handleRemoveQueuedPrompt: vi.fn(),
+    handleReplaceQueuedPrompt: vi.fn(),
+    handleSteerPrompt: vi.fn(),
+    handleSteerQueuedPrompt: vi.fn(),
+    handleStop: vi.fn(),
+    isClearing: false,
+    isSessionRunning: false,
+    isStopping: false,
+    isUnarchiving: false,
+  }),
+}));
+
+vi.mock("../use-session-window-sidebar", () => ({
+  useSessionWindowSidebar: () => ({ open: false, toggle: vi.fn() }),
+}));
+
+vi.mock("@/systems/session", () => ({
+  sessionSuccessorId: () => null,
+  useSessionLinkedWork: () => ({
+    items: [],
+    lead: null,
+    count: { total: 0, allPullRequests: true, needsYou: 0 },
+  }),
+  getSessionPromptRuntimeSnapshot: () => ({ model: "gpt-5.6-terra", provider: "codex" }),
+  isSessionTransportDisconnected: () => false,
+  SessionTransportChip: () => null,
+  useSessionTransportState: () => ({ phase: "live", retry: vi.fn() }),
+  useSessionCommands: (...args: unknown[]) => {
+    mocks.sessionCommands(...args);
+    return { catalog: [], isPending: false, refetch: vi.fn() };
+  },
+  useSessionGoalHeader: () => ({
+    hasLiveGoal: mocks.hasLiveGoal,
+    onApprove: vi.fn(),
+    onClear: vi.fn(),
+    onPause: vi.fn(),
+    onResume: vi.fn(),
+    pendingAction: null,
+    snapshot: null,
+  }),
+  useSessionInspectorState: () => ({ open: mocks.inspectorOpen, toggle: vi.fn() }),
+  useSessionPromptRuntimeContext: () => mocks.promptRuntimeStore,
+  useSessionTopbarSlot: (...args: unknown[]) => mocks.sessionTopbar(...args),
+  useSessionWorktreeBinding: () => mocks.worktreeBinding,
+  useSessionUsageTurns: (...args: unknown[]) => {
+    mocks.usageTurns(...args);
+    return {};
+  },
+  useSessionContext: (...args: unknown[]) => {
+    mocks.sessionUsage(...args);
+    return { usage: undefined, context: { state: "unknown" } };
+  },
+}));
+
+// The PR chip feed owns its own suite; the controller only forwards it.
+vi.mock("../use-session-window-pull-request", () => ({
+  useSessionWindowPullRequest: () => ({
+    pullRequestExit: undefined,
+    pullRequestRefresh: { mutate: vi.fn(), isPending: false },
+    exitSurface: null,
+    onSendPrompt: vi.fn(),
+  }),
+}));
+
+vi.mock("@/systems/vault", () => ({
+  useSessionVaultSecrets: (...args: unknown[]) => {
+    mocks.sessionVault(...args);
+    return { data: undefined, error: null, isLoading: false };
+  },
+}));
+
+import { useSessionWindowController } from "../use-session-window-controller";
+
+const session: SessionPayload = {
+  ...primarySessionFixture,
+  id: "sess-1",
+  state: "stopped",
+  workspace_id: "ws-1",
+};
+
+describe("useSessionWindowController", () => {
+  beforeEach(() => {
+    mocks.inspectorOpen = false;
+    mocks.hasLiveGoal = undefined;
+    mocks.sessionCommands.mockReset();
+    mocks.sessionTopbar.mockReset();
+    mocks.sessionUsage.mockReset();
+    mocks.usageTurns.mockReset();
+    mocks.sessionVault.mockReset();
+    mocks.promptRuntimeStore = sessionPromptRuntimeStoreLogic.createStore(
+      sessionPromptRuntimeInput({
+        agentName: "attachments_qa",
+        canPrompt: true,
+        effectiveRuntime: { model: "gpt-5.6-terra", provider: "codex" },
+        selectedRuntime: undefined,
+        selectionRevision: 0,
+        sessionId: "sess-1",
+        workspaceId: "ws-1",
+      })
+    );
+    mocks.worktreeBinding.worktreeId = "";
+    mocks.worktreeBinding.worktree = undefined;
+    mocks.worktreeBinding.bound = false;
+  });
+
+  it("Should admit context reads while live or open and never read vault", () => {
+    const input = {
+      windowId: "window:sess-1",
+      sessionId: "sess-1",
+      workspaceId: "ws-1",
+      session,
+      liveDataEnabled: true,
+    };
+    const { rerender } = renderHook(() => useSessionWindowController(input));
+    expect(mocks.sessionUsage).toHaveBeenLastCalledWith("sess-1", "ws-1", "stopped", {
+      enabled: true,
+    });
+    expect(mocks.usageTurns).toHaveBeenLastCalledWith("sess-1", "ws-1", "stopped", {
+      enabled: true,
+    });
+    input.liveDataEnabled = false;
+    rerender();
+    expect(mocks.sessionUsage).toHaveBeenLastCalledWith("sess-1", "ws-1", "stopped", {
+      enabled: false,
+    });
+    mocks.inspectorOpen = true;
+    rerender();
+    expect(mocks.sessionUsage).toHaveBeenLastCalledWith("sess-1", "ws-1", "stopped", {
+      enabled: true,
+    });
+    expect(mocks.usageTurns).toHaveBeenLastCalledWith("sess-1", "ws-1", "stopped", {
+      enabled: true,
+    });
+    expect(mocks.sessionVault).not.toHaveBeenCalled();
+  });
+
+  // Invariant: unknown Goal presence reaches the stop-confirmation owner unchanged.
+  // Owner: session window controller; canonical suite: use-session-window-controller.
+  it.each([undefined, false, true])(
+    "Should preserve Goal presence %s in lifecycle controls",
+    hasLiveGoal => {
+      mocks.hasLiveGoal = hasLiveGoal;
+      renderHook(() =>
+        useSessionWindowController({
+          windowId: "window:sess-1",
+          sessionId: "sess-1",
+          workspaceId: "ws-1",
+          session,
+          liveDataEnabled: true,
+        })
+      );
+      expect(mocks.sessionTopbar).toHaveBeenLastCalledWith(
+        expect.objectContaining({ hasLiveGoal })
+      );
+    }
+  );
+
+  it("Should route a bound worktree chip through the shell-owned lifecycle dialogs", () => {
+    const worktree = { id: "wt-1", state: "ready" };
+    mocks.worktreeBinding.worktreeId = worktree.id;
+    mocks.worktreeBinding.worktree = worktree;
+    mocks.worktreeBinding.bound = true;
+    const onOpenWorktreeContext = vi.fn();
+    const onResolveMissingWorktree = vi.fn();
+
+    renderHook(() =>
+      useSessionWindowController({
+        windowId: "window:sess-1",
+        sessionId: "sess-1",
+        workspaceId: "ws-1",
+        session,
+        liveDataEnabled: true,
+        onOpenWorktreeContext,
+        onResolveMissingWorktree,
+      })
+    );
+
+    const topbar = mocks.sessionTopbar.mock.lastCall?.[0] as {
+      worktreeBinding?: { onOpenContext?: () => void; onResolve?: () => void };
+    };
+    topbar.worktreeBinding?.onOpenContext?.();
+    topbar.worktreeBinding?.onResolve?.();
+
+    expect(onOpenWorktreeContext).toHaveBeenCalledWith("ws-1", worktree);
+    expect(onResolveMissingWorktree).toHaveBeenCalledWith("ws-1", worktree);
+  });
+
+  it("Should derive a stable runtime snapshot without re-rendering indefinitely", () => {
+    const { result } = renderHook(() =>
+      useSessionWindowController({
+        windowId: "window:sess-1",
+        sessionId: "sess-1",
+        workspaceId: "ws-1",
+        session,
+        liveDataEnabled: true,
+      })
+    );
+
+    expect(result.current.promptRuntimeSnapshot).toEqual({
+      model: "gpt-5.6-terra",
+      provider: "codex",
+    });
+  });
+});

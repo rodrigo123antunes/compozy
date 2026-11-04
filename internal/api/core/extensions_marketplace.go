@@ -1,0 +1,99 @@
+package core
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"strings"
+
+	"github.com/compozy/compozy/internal/api/contract"
+	marketplacepkg "github.com/compozy/compozy/internal/marketplace"
+)
+
+func (h *BaseHandlers) joinInstalledExtensionMarketplace(
+	ctx context.Context,
+	items []contract.ExtensionPayload,
+) error {
+	if h == nil || h.MarketplaceCatalog == nil {
+		return nil
+	}
+
+	joinErrors := make([]error, 0)
+	for index := range items {
+		item := &items[index]
+		if item.Origin == nil || item.Origin.SourceRef == "" {
+			continue
+		}
+		entryID := strings.TrimSpace(item.Origin.EntryID)
+		if entryID == "" {
+			continue
+		}
+		entry, err := h.MarketplaceCatalog.Entry(
+			ctx,
+			marketplacepkg.Origin{SourceRef: item.Origin.SourceRef, EntryID: entryID},
+		)
+		if onlyMarketplaceEntryNotFound(err) {
+			continue
+		}
+		if err != nil {
+			joinErrors = append(
+				joinErrors,
+				fmt.Errorf("resolve installed extension marketplace entry %q: %w", entryID, err),
+			)
+			continue
+		}
+		if entry == nil {
+			joinErrors = append(
+				joinErrors,
+				fmt.Errorf("resolve installed extension marketplace entry %q: empty result", entryID),
+			)
+			continue
+		}
+
+		installed := newMarketplaceInstallIndex()
+		installation := marketplaceInstall{
+			extension:  item,
+			format:     strings.TrimSpace(item.Format),
+			name:       strings.TrimSpace(item.Name),
+			version:    strings.TrimSpace(item.Version),
+			managePath: marketplaceExtensionsInstalledPath,
+		}
+		installed.byOrigin[marketplacepkg.Origin{SourceRef: item.Origin.SourceRef, EntryID: entryID}] = installation
+		listing, err := h.catalogMarketplaceListing(ctx, *entry, installed)
+		if err != nil {
+			joinErrors = append(
+				joinErrors,
+				fmt.Errorf("project installed extension marketplace entry %q: %w", entryID, err),
+			)
+			continue
+		}
+		item.Marketplace = &listing
+		item.UpdateAvailable = listing.UpdateAvailable
+		if listing.UpdateAvailable {
+			item.RemoteVersion = listing.Version
+		}
+	}
+	return errors.Join(joinErrors...)
+}
+
+func onlyMarketplaceEntryNotFound(err error) bool {
+	if err == nil {
+		return false
+	}
+	if joined, ok := err.(interface{ Unwrap() []error }); ok {
+		children := joined.Unwrap()
+		if len(children) == 0 {
+			return false
+		}
+		for _, child := range children {
+			if !onlyMarketplaceEntryNotFound(child) {
+				return false
+			}
+		}
+		return true
+	}
+	if wrapped, ok := err.(interface{ Unwrap() error }); ok {
+		return onlyMarketplaceEntryNotFound(wrapped.Unwrap())
+	}
+	return errors.Is(err, marketplacepkg.ErrEntryNotFound)
+}

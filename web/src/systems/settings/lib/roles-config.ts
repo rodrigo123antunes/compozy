@@ -1,0 +1,209 @@
+import type { ReasoningEffort, RuntimeSpeed } from "@/lib/api-contract";
+import type { RuntimeACPOptionSelection } from "@/systems/runtime";
+
+import type { RoleFallbackEntry, RoleName, SettingsRolesConfig } from "../types";
+
+/**
+ * Fixed product display order, independent of the API's lexical sort
+ * (`GET /api/roles` returns roles sorted by name).
+ */
+export const ROLE_ORDER: readonly RoleName[] = ["coordinator", "auto_title"];
+
+/** Sentence-case role names for panel headers. */
+export const ROLE_LABELS: Record<RoleName, string> = {
+  coordinator: "Coordinator",
+  auto_title: "Auto title",
+};
+
+/** One-line description of what each background role does. */
+export const ROLE_DESCRIPTIONS: Record<RoleName, string> = {
+  coordinator: "Orchestrates managed sessions.",
+  auto_title: "Names new sessions from their first exchange.",
+};
+
+export type RoleFieldKind = "switch" | "text" | "select" | "number";
+
+export interface RoleFieldDescriptor {
+  /** Config field key under `roles.<role>`. */
+  key: string;
+  label: string;
+  description?: string;
+  kind: RoleFieldKind;
+  placeholder?: string;
+  /** Minimum for `number` controls. */
+  min?: number;
+  /** Render the text control in the mono family (ids, durations, model refs). */
+  mono?: boolean;
+}
+
+const NO_FIELDS: readonly RoleFieldDescriptor[] = [];
+
+const COORDINATOR_FIELDS: readonly RoleFieldDescriptor[] = [
+  {
+    key: "ttl",
+    label: "Session TTL",
+    description: "Coordinator session lifetime.",
+    kind: "text",
+    placeholder: "2h",
+    mono: true,
+  },
+  {
+    key: "max_children",
+    label: "Max children",
+    description: "Safe-spawn child cap.",
+    kind: "number",
+    min: 1,
+  },
+  {
+    key: "max_active_sessions_per_workspace",
+    label: "Max active sessions",
+    description: "Managed-session cap per workspace.",
+    kind: "number",
+    min: 1,
+  },
+];
+
+/**
+ * Editable policy fields per role. Routing (`enabled`, `agent`, `provider`,
+ * `model`, `reasoning_effort`) is not listed here — it is owned by the role
+ * header switch, the agent picker, and the runtime selector.
+ */
+export const ROLE_FIELDS: Record<RoleName, readonly RoleFieldDescriptor[]> = {
+  coordinator: COORDINATOR_FIELDS,
+  auto_title: NO_FIELDS,
+};
+
+const REASONING_VALUES = [
+  "none",
+  "minimal",
+  "low",
+  "medium",
+  "high",
+  "xhigh",
+  "max",
+] as const satisfies readonly ReasoningEffort[];
+
+export function isReasoningEffortOptionValue(value: string): boolean {
+  return value === "" || (REASONING_VALUES as readonly string[]).includes(value);
+}
+
+/**
+ * Immutably set one scalar role field, returning a new full section config.
+ * The cast is contained here: `ROLE_FIELDS` guarantees `field` is a valid key
+ * for `role` and `value`'s runtime kind matches the descriptor.
+ */
+export function applyRoleFieldEdit(
+  config: SettingsRolesConfig,
+  role: RoleName,
+  field: string,
+  value: string | number | boolean
+): SettingsRolesConfig {
+  return {
+    ...config,
+    [role]: { ...config[role], [field]: value },
+  } as SettingsRolesConfig;
+}
+
+/** The three routing keys the runtime selector owns as one decision. */
+export interface RoleRuntimeValue {
+  provider: string;
+  model: string;
+  reasoning_effort: string;
+  speed: RuntimeSpeed | "";
+  acp_options?: RuntimeACPOptionSelection[];
+}
+
+export const EMPTY_ROLE_RUNTIME: RoleRuntimeValue = {
+  provider: "",
+  model: "",
+  reasoning_effort: "",
+  speed: "",
+  acp_options: undefined,
+};
+
+/**
+ * Write provider, model and reasoning effort together. The runtime selector
+ * resolves them as one route, so they are never left half-applied.
+ */
+export function applyRoleRuntimeEdit(
+  config: SettingsRolesConfig,
+  role: RoleName,
+  value: RoleRuntimeValue
+): SettingsRolesConfig {
+  const nextRole = {
+    ...config[role],
+    provider: value.provider,
+    model: value.model,
+    reasoning_effort: value.reasoning_effort,
+    acp_options: value.acp_options ?? [],
+  } as SettingsRolesConfig[RoleName] & { speed?: RuntimeSpeed };
+  if (value.speed) nextRole.speed = value.speed;
+  else delete nextRole.speed;
+  return {
+    ...config,
+    [role]: nextRole,
+  } as SettingsRolesConfig;
+}
+
+/** Clear the route so the role inherits again. */
+export function clearRoleRuntime(config: SettingsRolesConfig, role: RoleName): SettingsRolesConfig {
+  return applyRoleRuntimeEdit(config, role, EMPTY_ROLE_RUNTIME);
+}
+
+export function emptyFallbackEntry(): RoleFallbackEntry {
+  return { provider: "", model: "", reasoning_effort: "", acp_options: [], command: "" };
+}
+
+function applyRoleFallbackChain(
+  config: SettingsRolesConfig,
+  role: RoleName,
+  chain: RoleFallbackEntry[]
+): SettingsRolesConfig {
+  return {
+    ...config,
+    [role]: { ...config[role], fallback_chain: chain },
+  } as SettingsRolesConfig;
+}
+
+export function addFallbackEntry(config: SettingsRolesConfig, role: RoleName): SettingsRolesConfig {
+  return applyRoleFallbackChain(config, role, [
+    ...config[role].fallback_chain,
+    emptyFallbackEntry(),
+  ]);
+}
+
+export function removeFallbackEntry(
+  config: SettingsRolesConfig,
+  role: RoleName,
+  index: number
+): SettingsRolesConfig {
+  return applyRoleFallbackChain(
+    config,
+    role,
+    config[role].fallback_chain.filter((_entry, entryIndex) => entryIndex !== index)
+  );
+}
+
+/**
+ * Replace one fallback route's runtime — the selector emits all three keys. The route's
+ * account `command` is not part of the runtime selection, so it is preserved.
+ */
+export function setFallbackRuntime(
+  config: SettingsRolesConfig,
+  role: RoleName,
+  index: number,
+  value: RoleRuntimeValue
+): SettingsRolesConfig {
+  const chain = config[role].fallback_chain.map((entry, entryIndex) => {
+    if (entryIndex !== index) return entry;
+    return {
+      provider: value.provider,
+      model: value.model,
+      reasoning_effort: value.reasoning_effort,
+      acp_options: value.acp_options ?? [],
+      command: entry.command ?? "",
+      ...(value.speed ? { speed: value.speed } : {}),
+    };
+  });
+  return applyRoleFallbackChain(config, role, chain);
+}

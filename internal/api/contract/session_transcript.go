@@ -1,0 +1,79 @@
+package contract
+
+import "github.com/compozy/compozy/internal/transcript"
+
+const (
+	SessionStreamFrameRaw        = "raw"
+	SessionStreamFrameTranscript = "transcript"
+
+	SessionStreamEventTranscriptSnapshot  = "transcript_snapshot"
+	SessionStreamEventTranscriptDelta     = "transcript_delta"
+	SessionStreamEventGoalSnapshotChanged = "goal_snapshot_changed"
+	SessionStreamEventCommandsChanged     = "session_commands_changed"
+	SessionStreamEventConsumerDegraded    = "stream.consumer_degraded"
+
+	TranscriptSnapshotReasonFenceMissing       = "fence_missing"
+	TranscriptSnapshotReasonEpochMismatch      = "epoch_mismatch"
+	TranscriptSnapshotReasonGenerationMismatch = "generation_mismatch"
+	TranscriptSnapshotReasonSequenceReset      = "sequence_reset"
+	TranscriptSnapshotReasonCursorExpired      = "cursor_expired"
+)
+
+// SessionTranscriptResponse wraps one bounded chronological transcript page.
+type SessionTranscriptResponse struct {
+	Entries            []transcript.Entry `json:"entries"`
+	Epoch              int64              `json:"epoch"`
+	Generation         int64              `json:"generation"`
+	MaxSequence        int64              `json:"max_sequence"`
+	HasOlder           bool               `json:"has_older"`
+	NextBeforeSequence int64              `json:"next_before_sequence,omitzero"`
+	Limit              int                `json:"limit"`
+}
+
+// TranscriptSnapshotPayload seeds or explicitly resets one bounded transcript tail.
+type TranscriptSnapshotPayload struct {
+	SessionID          string             `json:"session_id"`
+	WorkspaceID        string             `json:"workspace_id,omitempty"`
+	WorkspacePath      string             `json:"workspace_path,omitempty"`
+	Epoch              int64              `json:"epoch"`
+	Generation         int64              `json:"generation"`
+	Entries            []transcript.Entry `json:"entries"`
+	MaxSequence        int64              `json:"max_sequence"`
+	HasOlder           bool               `json:"has_older"`
+	NextBeforeSequence int64              `json:"next_before_sequence,omitzero"`
+	Reset              bool               `json:"reset"`
+	Reason             string             `json:"reason,omitempty"`
+}
+
+// TranscriptDeltaPayload carries one bounded batch of materialized entry upserts.
+type TranscriptDeltaPayload struct {
+	SessionID     string             `json:"session_id"`
+	WorkspaceID   string             `json:"workspace_id,omitempty"`
+	WorkspacePath string             `json:"workspace_path,omitempty"`
+	Epoch         int64              `json:"epoch"`
+	Generation    int64              `json:"generation"`
+	Entries       []transcript.Entry `json:"entries"`
+	Cursor        int64              `json:"cursor"`
+	MaxSequence   int64              `json:"max_sequence"`
+	HasMore       bool               `json:"has_more"`
+}
+
+// SessionCommandsChangedPayload invalidates one session command catalog revision.
+type SessionCommandsChangedPayload struct {
+	SessionID string `json:"session_id"`
+	Revision  string `json:"revision"`
+}
+
+// SessionConsumerDegradedPayload tells the client to catch up from its last delivered cursor.
+type SessionConsumerDegradedPayload struct {
+	SessionID       string `json:"session_id"`
+	AfterSequence   int64  `json:"after_sequence"`
+	ThroughSequence int64  `json:"through_sequence"`
+	Refresh         bool   `json:"refresh"`
+}
+
+// SessionTranscriptSearchResponse is the bounded full-history search result.
+type SessionTranscriptSearchResponse = transcript.SearchResult
+
+// SessionTranscriptOutlineResponse is the full retained operator-message trail.
+type SessionTranscriptOutlineResponse = transcript.OutlineResult

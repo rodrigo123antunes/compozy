@@ -1,0 +1,451 @@
+# Window Management
+
+## Contents
+
+- Operating model
+- Tabs and stacks
+- CLI
+- Native tools
+- HTTP, UDS, and stream
+- Raw layout recovery
+- Configuration and hooks
+- Reserved partitions
+
+CompozyOS manages persistent virtual desktops, tiled groups, tab stacks, floating windows, and layout
+history as one daemon-authoritative workspace topology. Never edit internal client-state keys or
+invent window fractions. Use semantic desktop, window, and layout operations; the daemon validates,
+normalizes, and commits the complete topology atomically.
+
+## Operating Model
+
+- A window belongs to exactly one persistent desktop and to exactly one container: the tiled group
+  tree, the floating list, or a floating tab stack.
+- Tiled groups contain `leaf`, weighted `split`, or `stack` nodes. Floating windows retain
+  normalized geometry so clients can project the same topology into different viewports.
+- Every durable mutation is compare-and-swap guarded by the workspace `revision`. A successful
+  mutation advances it once and records one event. Layout/topology changes add one history entry;
+  route navigation and stack activation do not enter or clear layout history.
+- `desktop.switch` and `window.focus` require an explicit connected `client_id`. They never select an
+  implicit foreground browser.
+- Zoom makes the unit holding the window (a solo window or its whole tab frame) the only full-frame
+  island of a desktop and flags it `zoomed`. When the window's desktop shows nothing else, the unit
+  zooms in place; when another window is visible there, the unit moves to a fresh desktop inserted
+  right after it so nothing gets covered. That desktop is a regular desktop: tabs and tiles work on it.
+  Unzooming returns the unit to the slot it left (`return_anchor`) and removes the desktop zoom
+  created once it is empty; closing the zoomed unit removes it the same way. Grouping a window into
+  the zoomed frame keeps the zoom; tiling another window to a screen edge shrinks the zoomed island to
+  the free zone and ends the zoom, and a structural insert, `layout.arrange`, `window.move`,
+  `window.swap`, `window.resize`, or `window.toggle_floating` ends it in place. A minimized window that
+  was zoomed comes back zoomed on the desktop it minimized from, and a zoomed frame stays zoomed when
+  its zoomed tab closes.
+- Preview, validation, rejected commands, and no-ops do not persist or emit topology events.
+- Snapshots and layout documents are version 5. The wire snapshot carries no `history` body; undo and
+  redo stay daemon-internal, and the snapshot reports `closed_entry_count` instead of reopen bodies.
+  The daemon migrates a stored version 3 or 4 arrangement on load and persists it once under the next
+  revision, so caches keyed by revision refetch: a former focus desktop becomes a regular desktop whose
+  owner stays zoomed on it with its return anchor, retired `jobs`/`triggers` windows become
+  `automations` windows on the matching route, and layout history resets.
+- On load the daemon also drops windows whose app is no longer registered, renormalizes the topology,
+  rewrites a retired Settings sub-route to `/settings`, and persists the result once under the next
+  revision. After a successful persist it logs `windowmanager.snapshot_reconciled` with `workspace_id`,
+  `profile_id`, the sorted dropped app IDs (`dropped_apps`), the rewritten-route count
+  (`rewritten_routes`), and the new `revision`, counting the current arrangement, its history, and its
+  closed windows. Persisted `window_layout` resources follow the same registered-app rule.
+
+Read the current revision before mutating:
+
+```bash
+compozy layout get --workspace <workspace-id> -o json
+```
+
+Pass that value as `--revision` to each CLI mutation. On
+`window_manager_revision_conflict`, read again and recompute the intended semantic command. Do not
+blindly replay stale geometry.
+
+## Tabs And Stacks
+
+A tab is a full window that shares a frame with its siblings. One concept, two containers:
+
+- A tiled tab frame is a `stack` node inside a desktop group tree.
+- A floating tab frame is an entry in that desktop's `floating_stacks` (`id`, ordered `window_ids`,
+  durable `active_id`, frame `rect`, `minimized`).
+
+Stack rules the daemon enforces:
+
+- A stack holds at least two members and one member `active_id`. Normalization dissolves a
+  one-member stack back to a tiled leaf or a floating window at the frame rect.
+- Pinned members form a contiguous prefix of `window_ids`. Reorder and group clamp an index into the
+  member's own region, so pinned tabs never fall behind unpinned ones.
+- `active_id` is the durable last-active member. Each connected client also keeps `stack_active`
+  (stack id → window id) in its client view; that projection is presentation state, repaired on
+  reconnect, and never replaces the durable value.
+
+Per-window tab state:
+
+- `nav_stack` holds the window's route ancestors, oldest first; `route` stays the current leaf.
+- `pinned` survives grouping, ungrouping, and reopen.
+
+Closing and reopening:
+
+- Every non-minimize close pushes exactly one closed entry, whatever the scope: one command, one
+  revision, one entry. Minimizing pushes none.
+- `window reopen` pops the newest entry and recreates its windows with their original IDs, routes,
+  nav stacks, and pins. Members still live are skipped. The entry rejoins its original stack when
+  that stack still exists; otherwise a multi-window entry rebuilds a floating tab frame at the stored
+  rect, and a single survivor returns as a floating window. A deleted desktop resolves to the bound
+  client's active desktop, else the first standard desktop. An empty reopen history succeeds without
+  applying.
+- Window IDs are reserved across live windows **and** windows retained in closed entries. Reusing a
+  reserved ID fails with `window_manager_invalid_command`; omit the ID and the daemon generates a
+  free opaque one, readable from the command result's changed window IDs. Never parse a window ID.
+
+## CLI
+
+Desktop lifecycle:
+
+```bash
+compozy desktop list --workspace <workspace-id> -o json
+compozy desktop create --workspace <workspace-id> --revision <revision> --name Build -o json
+compozy desktop update --workspace <workspace-id> --revision <revision> --id <desktop-id> --name Review
+compozy desktop reorder --workspace <workspace-id> --revision <revision> --id <desktop-id> --order 0
+compozy desktop delete --workspace <workspace-id> --revision <revision> --id <desktop-id> \
+  --destination <desktop-id>
+```
+
+Deleting the final desktop is rejected. Deleting a non-empty desktop requires a distinct explicit
+destination so the transfer and deletion remain one transaction.
+
+Client-local presentation:
+
+```bash
+compozy desktop clients register --workspace <workspace-id> --client <stable-client-id> -o json
+compozy desktop switch --workspace <workspace-id> --revision <revision> \
+  --client <stable-client-id> --id <desktop-id>
+compozy window focus --workspace <workspace-id> --revision <revision> \
+  --client <stable-client-id> --direction right
+compozy window zoom --workspace <workspace-id> --revision <revision> --id <window-id>
+```
+
+`window zoom` needs no client: it toggles the durable zoom, and every client sees the unit fill its
+desktop. Pass `--client` to move that client's focus onto the window and follow it to the desktop the
+zoom lands on.
+
+Use `compozy desktop clients list|register|unregister` to manage live presentation identities. Browser
+clients persist only their random stable client ID locally; topology and revisions stay in the daemon.
+Each client view advances its own monotonic `presentation_revision`, independently of the workspace
+topology revision. Re-registering an existing stable ID without an active desktop preserves its
+repaired view and is a no-op when nothing changed.
+
+Window lifecycle and placement:
+
+```bash
+compozy window list --workspace <workspace-id> -o json
+compozy window open --workspace <workspace-id> --revision <revision> --app tasks \
+  --pathname /tasks --search-json '{}'
+compozy window navigate --workspace <workspace-id> --revision <revision> --id <window-id> \
+  --pathname /tasks/<task-id> --search-json '{"tab":"runs"}'
+compozy window move --workspace <workspace-id> --revision <revision> --id <window-id> \
+  --desktop <desktop-id> --target <window-id> --placement right
+compozy window move --workspace <workspace-id> --revision <revision> --id <window-id> \
+  --desktop <desktop-id> --group
+compozy window float --workspace <workspace-id> --revision <revision> --id <window-id>
+compozy window resize --workspace <workspace-id> --revision <revision> --id <window-id> \
+  --rect 0,0,0.5,0.6
+compozy window swap --workspace <workspace-id> --revision <revision> \
+  --first <window-id> --second <window-id>
+compozy window close --workspace <workspace-id> --revision <revision> --id <window-id> --minimize
+compozy window open --workspace <workspace-id> --revision <revision> --restore <window-id>
+```
+
+Open jobs and triggers with `--app automations` (`--pathname /automations/jobs/<job-id>` or
+`/automations/triggers/<trigger-id>`). The retired app ids `jobs` and `triggers` still open
+Automations in v0.4.0 with a deprecation warning and fail like unknown ids from v0.5.0; never emit
+them in commands or `window_layout` resources.
+
+Where a new window lands follows `new_window_policy`: `tab` (default) joins the client's focused
+window as a tab when that window is visible on the open's desktop, else it falls back to
+`beside_focus` placement (an empty desktop gets one full pane); `beside_focus` tiles beside the
+client's focus; `floating` floats. Focus is per client, so an open without `--client`/`client_id`
+never joins the frame a person is looking at. Explicit placement wins over the policy:
+`--stack-target` joins that window's tabs, `--tiled` splits beside the client's focus, and
+`--floating` (`floating` on `compozy__window_open`) opens a free floating window; `--floating`
+cannot be combined with `--tiled` or `--stack-target`.
+
+Tabs:
+
+```bash
+compozy window group --workspace <workspace-id> --revision <revision> \
+  --target <window-id> --windows <window-b>,<window-c> --insert-index 1
+compozy window activate <window-id> --workspace <workspace-id> --revision <revision> \
+  --client <stable-client-id>
+compozy window pin <window-id> --workspace <workspace-id> --revision <revision>
+compozy window unpin <window-id> --workspace <workspace-id> --revision <revision>
+compozy window reopen --workspace <workspace-id> --revision <revision>
+compozy window open --workspace <workspace-id> --revision <revision> --app tasks \
+  --pathname /tasks --stack-target <window-id>
+compozy window navigate --workspace <workspace-id> --revision <revision> --id <window-id> \
+  --mode push --pathname /tasks/<task-id>
+compozy window navigate --workspace <workspace-id> --revision <revision> --id <window-id> --mode pop
+compozy window close --workspace <workspace-id> --revision <revision> --id <window-id> --scope others
+```
+
+- `group` takes one `--target` (the destination frame) and a comma-separated `--windows` list of
+  distinct joiners, each different from the target. Members join in list order, the last one becomes
+  active, and a solo target is converted into a stack first. `--insert-index` is the anchor in the
+  target's member list, clamped into each joiner's pin region; omit it to append.
+- `activate` sets the stack's durable `active_id`. With `--client` it also sets that client's active
+  tab. It is the public name of the internal command `window.stack.set_active`.
+- `pin` and `unpin` set the flag and re-collate the stack's pinned prefix. Pinning a non-stacked
+  window is legal; the flag applies when it later joins a stack.
+- `reopen` takes no target — it always pops the newest closed entry.
+- `open --stack-target <window-id>` opens the new window as a tab of that window's frame and makes it
+  active. It is exclusive with `--restore`.
+- `navigate --mode replace|push|pop` (default `replace`). `push` records the current route in
+  `nav_stack` before moving; `pop` returns to the newest `nav_stack` entry and rejects `--pathname`
+  and `--search-json`. Popping an empty stack succeeds without applying.
+- `close --scope tab|group|others|right` (default `tab`). `tab` refuses a pinned window; `group`
+  closes every member of the frame, pinned included; `others` and `right` close only unpinned members
+  of that stack. `--minimize` is legal only with `--scope tab`. On a non-stacked window, `others` and
+  `right` succeed without applying.
+
+`window list` reports `stack_id`, `member_order`, `active`, `pinned`, and `nav_depth` alongside id,
+app, desktop, placement, and pathname, in every output mode.
+
+Structural placements are `before`, `after`, `left`, `right`, `top`, `bottom`, and `center`;
+`floating` accepts a normalized `x,y,width,height` rect. Dropping onto an occupied target reflows the
+tree. When viewport minima cannot fit, clients project the affected split as a stack without
+corrupting the durable topology. `--group` operates on the whole unit: with `--target` and a
+structural placement the tab frame splices in beside it as one node (`center` folds the members into
+the target's stack), with `--rect` the frame floats out as one unit at that rect, and with only
+`--desktop` it relocates the frame or the source tiled group.
+
+`placement` is structural (`tiled`, `stacked`, or `floating`); `route` is the durable internal
+pathname plus canonical JSON-object search state. `window navigate` may include `--client` to switch
+and focus that explicit connected client atomically. Without it, navigation changes no presentation.
+With a bound client, explicit `window focus --id` and `window open --restore` also activate the
+window's owning desktop for that client; `window swap` exchanges two units' structural places — a
+stacked window swaps as its whole tab frame, and two members of one frame never swap. The browser
+exposes the same command by dropping a drag on an occupied window's center, or anywhere over it
+while `window_manager.swap_modifier` is held.
+
+Layout operations:
+
+```bash
+compozy layout arrange --workspace <workspace-id> --revision <revision> --desktop <desktop-id> \
+  --window <window-a> --window <window-b> --arrangement horizontal
+compozy layout arrange --workspace <workspace-id> --revision <revision> --resource <resource-id>
+compozy layout resize --workspace <workspace-id> --revision <revision> \
+  --split <node-id> --boundary 0 --delta 0.05
+compozy layout frame-resize --workspace <workspace-id> --revision <revision> \
+  --desktop <desktop-id> --edit <group-a>=0,0,0.6,1 --edit <group-b>=0.6,0,0.4,1
+compozy layout balance --workspace <workspace-id> --revision <revision> --group <group-id>
+compozy layout undo --workspace <workspace-id> --revision <revision>
+compozy layout redo --workspace <workspace-id> --revision <revision>
+compozy layout watch --workspace <workspace-id> -o jsonl
+compozy layout watch --workspace <workspace-id> --client <stable-client-id> -o jsonl
+```
+
+`--arrangement` accepts `horizontal`, `vertical`, `grid`, `stack`, or `main_stack`; `main_stack`
+gives the first `--window` a 60% main column and splits the rest vertically beside it. Every
+`--window` is its own participant, so two named tabs of one deck are split into separate panes.
+`--keep-frames` (`keep_frames` on HTTP/UDS and `compozy__layout_arrange`) instead arranges each
+named window's whole tab frame as one participant, keeping the deck's tabs, active tab, and identity;
+name a deck once, by any of its tabs.
+`layout resize` moves one split boundary in weight space. `layout frame-resize` atomically rewrites
+abutting island frames: every group edge on the shared line moves together, and overlapping frames
+are rejected. `window resize` assigns a normalized frame to the unit containing the window —
+floating windows and floating tab frames take the rect directly, a solo tiled island resizes in
+place, and a split member detaches into its own island at that frame while siblings keep their
+exact zones. In the browser every shared boundary — split or island — is one draggable seam, and a
+tiled unit's free edges and corners resize that unit alone, stopping at the nearest island.
+
+`--resource` is exclusive with inline arrangement fields. Declarative `window_layout` resources are
+data-only topology templates: strict, versioned, workspace-bound when scoped locally, with `any`,
+`landscape`, or `portrait` aspect variants plus explicit participant slots and overflow policy. A
+resource cannot execute code or receive pointer events. Discover them through
+`compozy__resources_list`; they may be global or workspace-scoped, and a workspace resource wins when
+IDs collide. Applying one runs the same preview, revision/CAS, validation, commit, event, and
+history pipeline as an inline arrange command.
+
+## Native Tools
+
+The lazy `compozy__window_manager` toolset provides desktop, window, and layout operations with the same
+workspace, revision, client, diagnostic, and risk contracts as the CLI/API. Resolve
+`compozy__tool_info` for an exact tool before calling it. Use `window_manager.read` for reads/previews and
+`window_manager.write` for mutations.
+
+Tab tools mirror the CLI verbs one to one: `compozy__window_group`, `compozy__window_reorder`,
+`compozy__window_activate`, `compozy__window_pin`, `compozy__window_reopen`. `window_reorder` is the
+tool form of moving a member inside its own stack (`window_id` + clamped `index`); the CLI reaches the
+same reordering through `window group --insert-index`. Three existing tools carry the tab inputs:
+`compozy__window_open` accepts `stack_target_window_id` (and `floating`), `compozy__window_navigate` accepts
+`mode` (`replace`/`push`/`pop`, and rejects `route` when `mode` is `pop`), and
+`compozy__window_close` accepts `scope` (`tab`/`group`/`others`/`right`, rejected together with
+`minimize`). All five tab tools are mutating and require `window_manager.write`.
+
+## HTTP, UDS, And Stream
+
+HTTP and UDS expose identical workspace routes under:
+
+```text
+/api/workspaces/{workspace_id}/window-manager
+```
+
+The surface includes snapshot, preview, commands, client list/register/unregister, layout
+export/validate/apply, layout profiles, and the WebSocket stream. Tabs add no routes. The commands
+and preview endpoints accept five more command IDs — `window.stack.group`, `window.stack.reorder`,
+`window.stack.set_active`, `window.pin`, `window.reopen` — plus the extended `window.open`
+(`stack_target_window_id` inside `window`), `window.navigate` (`mode`), and `window.close` (`scope`) payloads.
+Payload decoding is strict: unknown fields are rejected, `mode: "pop"` rejects a non-empty `route`,
+and `minimize` rejects a non-empty `scope`. The snapshot carries `floating_stacks` per desktop,
+`nav_stack` and `pinned` per window, and `closed_entry_count`; client frames carry `stack_active`.
+
+Layout profile records use
+`GET /layout-profiles` and `PUT|DELETE /layout-profiles/{profile_id}` below the workspace route. A
+list contains global records plus records scoped to that workspace; writes cannot address another
+workspace. HTTP profile mutations require a loopback listener, while UDS exposes the same request
+and response contract.
+
+The CLI covers the same records:
+
+```bash
+compozy layout-profile list --workspace <workspace-id> -o json
+compozy layout-profile get <profile-id> --workspace <workspace-id> -o json
+compozy layout-profile put <profile-id> --workspace <workspace-id> \
+  --scope workspace|global --file profile.json --expected-version <n> -o json
+compozy layout-profile delete <profile-id> --workspace <workspace-id> --expected-version <n> -o json
+```
+
+`--expected-version 0` creates; a non-zero value replaces or deletes that exact version and fails on
+a concurrent write. `--scope` defaults to `workspace`. `get` filters the visible list, because there
+is no per-profile read route; the list is complete and unpaginated, and it never contains another
+workspace's records.
+
+Pass `--client <stable-client-id>` in the CLI, or an optional registered `client_id` over HTTP/UDS,
+to bind the stream to one presentation view. Its initial
+snapshot contains that client fence; later client frames carry only that ID and a strictly newer
+`presentation_revision`, while topology event frames follow the workspace revision. An unbound
+stream receives topology only. Never apply an equal or older client frame. If a subscriber is
+evicted as slow, reconnect and replace local state from the next fence. If the daemon lost the
+transient client registration, register the same stable ID before reconnecting. Never merge a
+reconnect snapshot with an unfenced local mirror.
+
+## Raw Layout Recovery
+
+Semantic commands are the normal path. Raw layout replacement is the validated recovery escape
+hatch:
+
+```bash
+compozy layout export --workspace <workspace-id> -o json > layout.json
+compozy layout validate --workspace <workspace-id> --file layout.json -o json
+compozy layout apply --workspace <workspace-id> --revision <revision> --file layout.json -o json
+```
+
+Documents are version 5 and round-trip `floating_stacks`, `nav_stack`, and `pinned`. Export omits
+history and closed entries, so a raw round trip never restores reopen history. A version 4 document is
+still accepted and upgraded (its retired `jobs`/`triggers` windows become `automations`); any other
+version fails validation with `window_manager_invalid_topology` and the `topology.unsupported_version`
+diagnostic. This interface currently has no legacy-document converter. Preserve the original
+document and current state, and report the missing lossless upgrade path; manually rebuilding
+a layout is not a migration of the original data.
+
+Validate never writes. Apply binds the document to the requested workspace,
+validates the complete topology, preserves current routes for surviving window IDs, and performs one
+atomic replacement. There is no raw key-value fallback.
+
+A tiled return anchor in an exported document carries `return_anchor.source_group`, the daemon's
+validated deep capture of its source group. Restoring a minimized window reinstalls that exact group
+identity, node order, weights, and placement while the live residue is unchanged; if the source changed
+while the window was minimized, CompozyOS keeps those edits and inserts at the structural anchor, then
+beside the client's focused window on the same desktop, then floating. A zoomed window's
+`return_anchor` is the slot unzoom takes it back to, and `return_anchor.zoomed` records a zoom the
+window held when it minimized. Treat both as daemon-owned recovery state: preserve them during raw
+document round trips and never fabricate or edit them.
+
+## Configuration And Hooks
+
+Global defaults live under `[window_manager]` with nested `gaps`, `snap`, `bindings`, `shortcuts`, and
+`global_shortcuts`.
+Validated config updates hot-apply atomically; an invalid update leaves the active defaults unchanged.
+Use `GET/PATCH /api/settings/window-manager` for the typed Settings surface. Edge-center bindings are
+`zoom`, `reserved`, or `none`; any/landscape/portrait profiles are `window_layout` resources.
+Workspace layout documents may carry typed overrides without changing other workspaces.
+
+The Settings PATCH preserves its section echo and adds `apply`, the daemon's application receipt.
+Inspect `apply.applied`, `next_action`, `warnings`, and `partial_failures`; HTTP success alone does
+not prove live application. An unchanged file still retries a pending scoped live application;
+a global settings reload is not needed to retry a Layouts PATCH. For a behavior-only `config` save, pass `preserve_shortcuts: true` to
+retain the current local and global shortcut maps atomically. Explicit top-level shortcut maps still
+replace their respective maps. Omitting the flag retains full-config replacement semantics.
+Zero is valid for every gap: `inner` controls spacing between tiles; the other four values are insets.
+
+Shortcut values are one chord string or an array; `""` and `[]` disable an action. Indexed family
+keys accept ranges: `desktop.switch = "control+Digit1..9"` and
+`window.tab.jump = "control+alt+Digit1..8"`. The daemon expands ranges and validates defaults plus
+overrides as one map. `GET /api/settings/window-manager` returns `defaults` and `effective`; use
+`compozy config get window_manager -o json` for the same discovery through the CLI. Writes through
+`config set` accept a scalar or JSON string array and reject the complete mutation on any collision.
+
+`global_shortcuts` maps one registry command ID to one chord; `palette.summon.global` defaults to
+`meta+shift+Space`. Electron shells report per-client registration truth through their window-manager
+client context. Pass `client_id` to the Settings read to distinguish intended, active, in-use,
+permission-blocked, and unsupported states. Browser clients cannot report registrations.
+
+`nav_stack_limit` (default 50, range 1..200) caps each window's `nav_stack`; `closed_entry_limit`
+(default 20, range 1..100) caps retained closed entries. Both are write-time caps resolved from the
+effective workspace config when the mutation runs, evicting the oldest value. Lowering a live limit
+is not retroactive: it applies to the next relevant mutation, not to stored state.
+
+Committed operations emit nine async hooks. `window_manager.layout.applied`,
+`window_manager.desktop.created`, `window_manager.desktop.deleted`, and
+`window_manager.window.moved` follow their commands. Tab operations add
+`window_manager.window.opened` (`window.open`, `window.reopen`),
+`window_manager.window.closed` (every close scope, carrying all removed window IDs),
+`window_manager.stack.activated` (durable activation via `window.stack.set_active` and the daemon's
+coalesced last-active commits), `window_manager.stack.grouped` (a stack formed or extended by
+`window.stack.group`, `window.open --stack-target`, or a reopen that rebuilds a frame), and
+`window_manager.stack.ungrouped` (a stack dissolved by close, by a group that empties its source
+stack, or by floating a member out). Preview, pointer motion, navigation, client focus, per-client
+tab flips, and desktop switching emit no extension hooks.
+
+Stable public errors include `window_manager_revision_conflict`,
+`window_manager_invalid_topology`, `window_manager_destination_required`,
+`window_manager_history_boundary`, `window_manager_slow_consumer`, `window_manager_not_stacked`
+(a stack operation on a window that is in no stack), and `window_manager_window_pinned`
+(`close --scope tab` on a pinned window — unpin it or use `--scope group`). Preserve structured
+diagnostics and entity conflicts when reporting failures.
+
+## Reserved Partitions
+
+Each profile has two reserved desktop partitions besides its per-project partitions:
+
+- `global` is the **All projects** desktop. The Web binds it while the topbar globe is on. It is
+  operator UX state: every agent identity, including agents with the unrestricted grant, is denied.
+  Window, desktop, and layout tools accept `workspace: "global"` for operator calls only, before
+  registry normalization; other native tools reject `global`. HTTP/UDS reach it at
+  `/api/workspaces/global/window-manager`; CLI `--workspace global` is a data selector and fails with
+  `workspace_reserved`.
+- `user` is the **User** desktop, bound when the User destination is focused. Public WM paths and
+  native tools accept `workspace: "@user"` and map it to the acting profile's `user` partition.
+  Granted agents may use their own profile's `user` partition and project partitions; another
+  profile's partitions stay operator-only.
+
+Window data binding lives in `route.search.workspace`. A serialized binding always wins in every
+partition: a registered workspace ID reads that project, `"@user"` reads User. An unbound window
+reads its partition: `global` reads the aggregate (catalog windows), a project partition reads that
+project, `user` reads User. In `global`, open, navigate, reopen, and layout replacement reject a
+non-empty binding that is neither `@user` nor a registered workspace with HTTP 400
+`window_binding_invalid`. Project partitions are not validated, so existing layouts stay valid.
+Snapshot validation is registry-free: a saved layout always loads, and stale bindings are handled by
+reconciliation.
+
+Session deletion reconciles every live and persisted partition of every profile (project, `global`,
+`user`): windows on the deleted session move to the empty sessions view, and closed entries,
+navigation history, and undo/redo for it are dropped. Workspace unregistration retires windows
+bound to that workspace onto their app's catalog route in every partition and removes the binding
+from closed entries, navigation, and undo/redo; nothing brings it back, and a re-registered folder is
+a new workspace ID. Each reconciliation publishes the partition's normal window-manager event.
+
+Layouts of the former `COMPOZY_HOME` pseudo-project are copied to the profile's `user` partition
+during the v0.4.0 upgrade when the target is absent; an existing User layout wins and the source
+snapshot is kept under its original key.

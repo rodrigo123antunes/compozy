@@ -1,0 +1,1471 @@
+package worktree
+
+import (
+	"bytes"
+	"context"
+	"encoding/json"
+	"errors"
+	"log/slog"
+	"os"
+	"path/filepath"
+	"reflect"
+	"slices"
+	"strings"
+	"sync"
+	"sync/atomic"
+	"testing"
+	"time"
+
+	"github.com/compozy/compozy/internal/config"
+	"github.com/compozy/compozy/internal/diagnostics"
+	"github.com/compozy/compozy/internal/store"
+)
+
+const testWorktreeProfileID = store.DefaultProfileID
+
+const testNonDefaultWorktreeProfileID = "01ARZ3NDEKTSV4RRFFQ69G5FAV"
+
+type createTestFixture struct {
+	service         *Service
+	store           *memoryWorktreeStore
+	runner          *recordingGitRunner
+	workspace       Workspace
+	commonDir       string
+	adminGitDir     string
+	worktreesRoot   string
+	listOutput      []byte
+	events          *recordingEventSink
+	logs            *lockedLogBuffer
+	failWorktreeAdd atomic.Bool
+	// interruptWorktreeAdd leaves the locked, half-written checkout a killed
+	// `git worktree add` leaves behind and reports its deadline.
+	interruptWorktreeAdd atomic.Bool
+	failCheckoutRemoval  atomic.Bool
+}
+
+// lockedLogBuffer collects structured logs written by detached creations.
+type lockedLogBuffer struct {
+	mu     sync.Mutex
+	buffer bytes.Buffer
+}
+
+func (b *lockedLogBuffer) Write(value []byte) (int, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buffer.Write(value)
+}
+
+func (b *lockedLogBuffer) String() string {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buffer.String()
+}
+
+func newCreateTestFixture(t *testing.T, worktreesConfig config.WorktreesConfig) *createTestFixture {
+	t.Helper()
+	root := t.TempDir()
+	commonDir := filepath.Join(root, ".git")
+	if err := os.MkdirAll(commonDir, 0o700); err != nil {
+		t.Fatalf("create Git common directory: %v", err)
+	}
+	worktreesRoot := t.TempDir()
+	adminGitDir := filepath.Join(commonDir, "worktrees", "created")
+	store := newMemoryWorktreeStore()
+	workspace := Workspace{ID: "ws-create", Name: "Create Workspace", Root: root}
+	fixture := &createTestFixture{
+		store: store, workspace: workspace, commonDir: commonDir,
+		adminGitDir: adminGitDir, worktreesRoot: worktreesRoot,
+		listOutput: worktreeListFixture(root, "main"),
+		events:     &recordingEventSink{}, logs: &lockedLogBuffer{},
+	}
+	runner := &recordingGitRunner{}
+	runner.run = func(call gitInvocation) gitResponse {
+		command := strings.Join(call.args, " ")
+		switch {
+		case command == "rev-parse --path-format=absolute --git-common-dir":
+			return gitResponse{stdout: []byte(commonDir + "\n")}
+		case strings.Contains(command, "worktree list --porcelain -z"):
+			return gitResponse{stdout: append([]byte(nil), fixture.listOutput...)}
+		case command == "rev-parse --verify HEAD":
+			return gitResponse{stdout: []byte("root-head\n")}
+		case command == "show-ref --verify --quiet refs/heads/feature/existing":
+			return gitResponse{}
+		case strings.HasPrefix(command, "show-ref --verify --quiet refs/heads/"):
+			return gitResponse{err: errors.New("reference does not exist")}
+		case command == "symbolic-ref --quiet --short refs/remotes/origin/HEAD":
+			return gitResponse{err: errors.New("origin HEAD is absent")}
+		case command == "symbolic-ref --quiet --short HEAD":
+			return gitResponse{stdout: []byte("main\n")}
+		case strings.HasPrefix(command, "branch "):
+			return gitResponse{}
+		case strings.HasPrefix(command, "rev-parse --verify "):
+			return gitResponse{stdout: []byte("created-head\n")}
+		case strings.HasPrefix(command, "worktree add "):
+			if fixture.failWorktreeAdd.Load() {
+				return gitResponse{stderr: []byte("checkout failed"), err: errors.New("exit 1")}
+			}
+			target := call.args[len(call.args)-2]
+			if fixture.interruptWorktreeAdd.Load() {
+				if err := writeInterruptedCheckout(target, adminGitDir); err != nil {
+					return gitResponse{err: err}
+				}
+				return gitResponse{err: context.DeadlineExceeded}
+			}
+			if err := os.MkdirAll(target, 0o700); err != nil {
+				return gitResponse{err: err}
+			}
+			if err := os.MkdirAll(adminGitDir, 0o700); err != nil {
+				return gitResponse{err: err}
+			}
+			return gitResponse{}
+		case command == "rev-parse --path-format=absolute --git-dir":
+			return gitResponse{stdout: []byte(adminGitDir + "\n")}
+		case strings.HasPrefix(command, "config branch."):
+			return gitResponse{}
+		case strings.HasPrefix(command, "ls-files --others --ignored --exclude-standard -z --"):
+			return gitResponse{stdout: []byte(".env\x00")}
+		case strings.HasPrefix(command, "for-each-ref --format=%(objectname) refs/heads/"):
+			return gitResponse{stdout: []byte("created-head\n")}
+		case strings.Contains(command, "worktree remove --force"):
+			if fixture.failCheckoutRemoval.Load() {
+				return gitResponse{stderr: []byte("permission denied"), err: errors.New("exit 128")}
+			}
+			if _, err := os.Lstat(filepath.Join(adminGitDir, "locked")); err == nil &&
+				!strings.Contains(command, "--force --force") {
+				return gitResponse{
+					stderr: []byte("fatal: cannot remove a locked working tree, lock reason: initializing"),
+					err:    errors.New("exit 128"),
+				}
+			}
+			if err := os.RemoveAll(call.args[len(call.args)-1]); err != nil {
+				return gitResponse{err: err}
+			}
+			if err := os.RemoveAll(adminGitDir); err != nil {
+				return gitResponse{err: err}
+			}
+			return gitResponse{}
+		case strings.HasPrefix(command, "update-ref -d "):
+			return gitResponse{}
+		default:
+			return gitResponse{err: errors.New("unexpected Git command: " + command)}
+		}
+	}
+	fixture.runner = runner
+	var sequence atomic.Int64
+	fixture.service = NewService(
+		store,
+		runner,
+		WithCapabilityGate(readyCapabilityGate()),
+		WithWorkspaceResolver(staticWorkspaceResolver{workspaces: map[string]Workspace{workspace.ID: workspace}}),
+		WithConfig(worktreesConfig, worktreesRoot),
+		WithEvents(fixture.events),
+		WithLogger(slog.New(slog.NewJSONHandler(fixture.logs, nil))),
+		WithIDGenerator(func(string) (string, error) {
+			return "wt-create-" + string(rune('a'+sequence.Add(1)-1)), nil
+		}),
+		WithClock(func() time.Time { return time.Date(2026, 8, 12, 12, 0, 0, 0, time.UTC) }),
+	)
+	return fixture
+}
+
+// writeInterruptedCheckout mirrors what Git leaves after `worktree add` is
+// killed mid-checkout: a partial tree and an admin entry locked "initializing".
+func writeInterruptedCheckout(target, adminGitDir string) error {
+	if err := os.MkdirAll(target, 0o700); err != nil {
+		return err
+	}
+	if err := os.WriteFile(filepath.Join(target, "partial.txt"), []byte("partial"), 0o600); err != nil {
+		return err
+	}
+	if err := os.MkdirAll(adminGitDir, 0o700); err != nil {
+		return err
+	}
+	backlink := filepath.Join(target, ".git") + "\n"
+	if err := os.WriteFile(filepath.Join(adminGitDir, "gitdir"), []byte(backlink), 0o600); err != nil {
+		return err
+	}
+	return os.WriteFile(filepath.Join(adminGitDir, "locked"), []byte("initializing"), 0o600)
+}
+
+func createAcceptedAndWait(t *testing.T, fixture *createTestFixture, name string) *Worktree {
+	t.Helper()
+	item, err := fixture.service.CreateAccepted(
+		t.Context(), fixture.workspace.ID, CreateOptions{ProfileID: testWorktreeProfileID, Name: name},
+	)
+	if err != nil {
+		t.Fatalf("CreateAccepted() error = %v", err)
+	}
+	operation := fixture.service.getCreateOperation(fixture.workspace.ID, item.ID)
+	if operation == nil {
+		t.Fatal("accepted creation operation = nil")
+	}
+	select {
+	case <-operation.done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("accepted creation did not finish")
+	}
+	return item
+}
+
+// requireFailedCreation asserts the row survived as a failed tombstone with
+// its cause and that the failure reached the lifecycle event stream.
+func requireFailedCreation(t *testing.T, fixture *createTestFixture, id, wantCause string) *Worktree {
+	t.Helper()
+	stored, err := fixture.store.Get(t.Context(), fixture.workspace.ID, id)
+	if err != nil || stored == nil || stored.State != StateFailed ||
+		!strings.Contains(stored.CreateFailure(), wantCause) {
+		t.Fatalf("failed creation = %#v, %v, want failed record with cause %q", stored, err, wantCause)
+	}
+	if got := fixture.events.count(EventCreationFailed); got != 1 {
+		t.Fatalf("creation failed events = %d, want one", got)
+	}
+	var payload creationFailedPayload
+	fixture.events.mu.Lock()
+	for _, event := range fixture.events.events {
+		if event.Name == EventCreationFailed {
+			if err := json.Unmarshal(event.Payload, &payload); err != nil {
+				t.Errorf("decode creation failed payload: %v", err)
+			}
+		}
+	}
+	fixture.events.mu.Unlock()
+	if payload.WorktreeID != id || payload.PendingPhase != stored.PendingPhase ||
+		payload.PendingPhase == PhaseNone || payload.Error != stored.CreateFailure() {
+		t.Fatalf("creation failed payload = %#v, want phase and cause of %#v", payload, stored)
+	}
+	return stored
+}
+
+func worktreeListFixture(root, branch string) []byte {
+	return []byte("worktree " + root + "\x00HEAD root-head\x00branch refs/heads/" + branch + "\x00\x00")
+}
+
+// Canonical suite: durable phased creation, rollback, cancellation, bootstrap, and path safety.
+func TestServiceCreate(t *testing.T) {
+	t.Parallel()
+
+	t.Run("Should keep a failed record with its cause after an accepted creation rolls back", func(t *testing.T) {
+		t.Parallel()
+		fixture := newCreateTestFixture(t, config.DefaultWorktreesConfig())
+		fixture.failWorktreeAdd.Store(true)
+		events, cancel, err := fixture.service.SubscribeWorktreeCatalogEvents(t.Context())
+		if err != nil {
+			t.Fatalf("SubscribeWorktreeCatalogEvents() error = %v", err)
+		}
+		defer cancel()
+
+		item := createAcceptedAndWait(t, fixture, "Async Failure")
+
+		var received []CatalogEvent
+		var failed CatalogEvent
+		for failed.Kind != CatalogEventFailed {
+			select {
+			case event := <-events:
+				received = append(received, event)
+				failed = event
+			case <-time.After(time.Second):
+				t.Fatalf("catalog events = %#v, want scoped accepted failure", received)
+			}
+		}
+		if failed.WorkspaceID != fixture.workspace.ID || failed.WorktreeID != item.ID ||
+			!strings.Contains(failed.Error, "checkout failed") {
+			t.Fatalf("catalog failure = %#v, want scoped accepted failure", failed)
+		}
+		stored := requireFailedCreation(t, fixture, item.ID, "checkout phase failed")
+		if !strings.Contains(stored.CreateError, "checkout failed") {
+			t.Fatalf("failed record cause = %q, want Git stderr", stored.CreateError)
+		}
+		commands := invocationCommands(fixture.runner.invocations())
+		if !containsCommandPrefix(commands, "update-ref -d refs/heads/async-failure created-head") {
+			t.Fatalf("rollback Git calls = %#v, want compare-and-delete", commands)
+		}
+		if logs := fixture.logs.String(); !strings.Contains(logs, `"level":"WARN"`) ||
+			!strings.Contains(logs, "worktree creation failed and was rolled back") ||
+			!strings.Contains(logs, `"worktree_id":"`+item.ID+`"`) {
+			t.Fatalf("logs = %s, want structured rollback warning", logs)
+		}
+		if err := fixture.service.Dismiss(t.Context(), fixture.workspace.ID, item.ID); err != nil {
+			t.Fatalf("Dismiss(failed creation) error = %v", err)
+		}
+	})
+
+	t.Run("Should unwind an interrupted locked checkout before deleting its branch", func(t *testing.T) {
+		t.Parallel()
+		settings := config.DefaultWorktreesConfig()
+		settings.CheckoutTimeout = 42 * time.Minute
+		fixture := newCreateTestFixture(t, settings)
+		fixture.interruptWorktreeAdd.Store(true)
+
+		item := createAcceptedAndWait(t, fixture, "Large Checkout")
+
+		stored := requireFailedCreation(t, fixture, item.ID, "worktrees.checkout_timeout (42m0s)")
+		if stored.PendingPhase != PhaseCheckout {
+			t.Fatalf("failed phase = %q, want checkout", stored.PendingPhase)
+		}
+		if _, err := os.Lstat(item.Path); !errors.Is(err, os.ErrNotExist) {
+			t.Fatalf("Lstat(checkout) error = %v, want removed checkout", err)
+		}
+		if _, err := os.Lstat(fixture.adminGitDir); !errors.Is(err, os.ErrNotExist) {
+			t.Fatalf("Lstat(admin entry) error = %v, want removed admin entry", err)
+		}
+		invocations := fixture.runner.invocations()
+		addIndex := slices.IndexFunc(invocations, func(call gitInvocation) bool {
+			return strings.HasPrefix(strings.Join(call.args, " "), "worktree add ")
+		})
+		if addIndex < 0 || invocations[addIndex].timeout != settings.CheckoutTimeout {
+			t.Fatalf("checkout invocation = %#v, want worktrees.checkout_timeout budget", invocations)
+		}
+		commands := invocationCommands(invocations)
+		removeIndex := slices.IndexFunc(commands, func(command string) bool {
+			return strings.HasSuffix(command, " worktree remove --force --force "+item.Path)
+		})
+		branchIndex := slices.Index(commands, "update-ref -d refs/heads/large-checkout created-head")
+		if removeIndex < 0 || branchIndex < removeIndex {
+			t.Fatalf("rollback Git calls = %#v, want locked checkout removed before branch", commands)
+		}
+	})
+
+	t.Run("Should keep the branch and report an incomplete rollback", func(t *testing.T) {
+		t.Parallel()
+		fixture := newCreateTestFixture(t, config.DefaultWorktreesConfig())
+		fixture.interruptWorktreeAdd.Store(true)
+		fixture.failCheckoutRemoval.Store(true)
+
+		item := createAcceptedAndWait(t, fixture, "Stuck Checkout")
+
+		stored := requireFailedCreation(t, fixture, item.ID, "rollback incomplete")
+		if !strings.Contains(stored.CreateRollbackError, "permission denied") {
+			t.Fatalf("failed record cause = %q, want rollback stderr", stored.CreateError)
+		}
+		if containsCommandPrefix(invocationCommands(fixture.runner.invocations()), "update-ref -d ") {
+			t.Fatal("branch was deleted while its checkout is still registered")
+		}
+		if _, err := os.Lstat(item.Path); err != nil {
+			t.Fatalf("Lstat(leftover checkout) error = %v, want leftover kept for inspection", err)
+		}
+		if logs := fixture.logs.String(); !strings.Contains(logs, `"level":"ERROR"`) ||
+			!strings.Contains(logs, "rollback is incomplete") {
+			t.Fatalf("logs = %s, want structured incomplete-rollback error", logs)
+		}
+	})
+
+	t.Run("Should return and store the requested worktree ID", func(t *testing.T) {
+		t.Parallel()
+		fixture := newCreateTestFixture(t, config.DefaultWorktreesConfig())
+
+		item, err := fixture.service.Create(t.Context(), fixture.workspace.ID, CreateOptions{
+			ID: "wt-requested", ProfileID: testWorktreeProfileID, Name: "Requested ID",
+		})
+		if err != nil {
+			t.Fatalf("Create(requested ID) error = %v", err)
+		}
+		if item.ID != "wt-requested" {
+			t.Fatalf("Create(requested ID) ID = %q, want wt-requested", item.ID)
+		}
+		stored, err := fixture.store.Get(t.Context(), fixture.workspace.ID, "wt-requested")
+		if err != nil || stored == nil {
+			t.Fatalf("store.Get(wt-requested) = %#v, %v, want the created record", stored, err)
+		}
+	})
+
+	t.Run("Should record an incomplete synchronous rollback and finish it on recovery", func(t *testing.T) {
+		t.Parallel()
+		fixture := newCreateTestFixture(t, config.DefaultWorktreesConfig())
+		fixture.interruptWorktreeAdd.Store(true)
+		fixture.failCheckoutRemoval.Store(true)
+
+		_, err := fixture.service.Create(t.Context(), fixture.workspace.ID, CreateOptions{
+			ProfileID: testWorktreeProfileID, Name: "Sync Stuck",
+		})
+		if err == nil || !strings.Contains(err.Error(), "roll back checkout") {
+			t.Fatalf("Create(stuck rollback) error = %v, want rollback failure", err)
+		}
+		stored := requireFailedCreation(t, fixture, "wt-create-a", "rollback incomplete")
+		if containsCommandPrefix(invocationCommands(fixture.runner.invocations()), "update-ref -d ") {
+			t.Fatal("branch was deleted while its checkout is still registered")
+		}
+
+		// The next boot finds the leftover still registered on its branch.
+		fixture.failCheckoutRemoval.Store(false)
+		fixture.listOutput = append(
+			worktreeListFixture(fixture.workspace.Root, "main"),
+			[]byte(
+				"worktree "+stored.Path+"\x00HEAD created-head\x00branch refs/heads/sync-stuck\x00locked initializing\x00\x00",
+			)...)
+		if err := fixture.service.RecoverCreations(t.Context()); err != nil {
+			t.Fatalf("RecoverCreations() error = %v", err)
+		}
+		recovered, err := fixture.store.Get(t.Context(), fixture.workspace.ID, stored.ID)
+		if err != nil || recovered.State != StateFailed || recovered.CreateRollbackError != "" ||
+			!strings.Contains(recovered.CreateFailure(), "worktrees.checkout_timeout") {
+			t.Fatalf("recovered = %#v, %v, want failed record with the original cause only", recovered, err)
+		}
+		if _, statErr := os.Lstat(stored.Path); !errors.Is(statErr, os.ErrNotExist) {
+			t.Fatalf("Lstat(leftover) error = %v, want removed on recovery", statErr)
+		}
+		if !containsCommandPrefix(
+			invocationCommands(fixture.runner.invocations()), "update-ref -d refs/heads/sync-stuck created-head",
+		) {
+			t.Fatal("recovery did not compare-delete the minted branch")
+		}
+	})
+
+	for _, testCase := range []struct {
+		name          string
+		entry         string
+		leftoverGone  bool
+		wantLeftPath  bool
+		wantRecovered string
+	}{
+		{
+			name: "a replacement checkout on another branch", entry: "\x00HEAD other-head\x00branch refs/heads/someone-else\x00\x00",
+			wantLeftPath: true, wantRecovered: "checked out on another branch",
+		},
+		{
+			name: "a replacement checkout without the add lock", entry: "\x00HEAD created-head\x00branch refs/heads/replaced\x00\x00",
+			wantLeftPath: true, wantRecovered: "not attributable",
+		},
+		{
+			name: "a minted branch another checkout holds", leftoverGone: true,
+			entry:         "-elsewhere\x00HEAD created-head\x00branch refs/heads/replaced\x00\x00",
+			wantRecovered: "checked out elsewhere",
+		},
+	} {
+		t.Run("Should leave "+testCase.name+" alone on recovery", func(t *testing.T) {
+			t.Parallel()
+			fixture := newCreateTestFixture(t, config.DefaultWorktreesConfig())
+			fixture.interruptWorktreeAdd.Store(true)
+			fixture.failCheckoutRemoval.Store(true)
+			item := createAcceptedAndWait(t, fixture, "Replaced")
+			fixture.failCheckoutRemoval.Store(false)
+			if testCase.leftoverGone {
+				if err := os.RemoveAll(item.Path); err != nil {
+					t.Fatalf("remove leftover: %v", err)
+				}
+			}
+			fixture.listOutput = append(worktreeListFixture(fixture.workspace.Root, "main"),
+				[]byte("worktree "+item.Path+testCase.entry)...)
+			before := len(fixture.runner.invocations())
+
+			if err := fixture.service.RecoverCreations(t.Context()); err != nil {
+				t.Fatalf("RecoverCreations() error = %v", err)
+			}
+			for _, command := range invocationCommands(fixture.runner.invocations()[before:]) {
+				if strings.Contains(command, "worktree remove") || strings.HasPrefix(command, "update-ref -d ") {
+					t.Fatalf("recovery ran %q against state it cannot attribute", command)
+				}
+			}
+			if _, err := os.Lstat(item.Path); testCase.wantLeftPath && err != nil {
+				t.Fatalf("Lstat(replacement) error = %v, want untouched", err)
+			}
+			stored, err := fixture.store.Get(t.Context(), fixture.workspace.ID, item.ID)
+			if err != nil || stored.CreateRollbackError == "" {
+				t.Fatalf("stored = %#v, %v, want rollback still marked incomplete", stored, err)
+			}
+			if logs := fixture.logs.String(); !strings.Contains(logs, "rollback is still incomplete") ||
+				!strings.Contains(logs, testCase.wantRecovered) {
+				t.Fatalf("logs = %s, want recovery warning %q", logs, testCase.wantRecovered)
+			}
+		})
+	}
+
+	t.Run("Should not count an unverifiable admin entry for the checkout as removed", func(t *testing.T) {
+		t.Parallel()
+		commonDir := t.TempDir()
+		checkout := filepath.Join(t.TempDir(), "big-one")
+		for _, name := range []string{"big-one2", "unrelated"} {
+			if err := os.MkdirAll(filepath.Join(commonDir, "worktrees", name), 0o700); err != nil {
+				t.Fatalf("seed admin entry %s: %v", name, err)
+			}
+		}
+		err := dropCheckoutAdminEntries(commonDir, checkout)
+		if err == nil || !strings.Contains(err.Error(), "big-one2") {
+			t.Fatalf("dropCheckoutAdminEntries() error = %v, want unverifiable big-one2 entry", err)
+		}
+		if _, statErr := os.Stat(filepath.Join(commonDir, "worktrees", "unrelated")); statErr != nil {
+			t.Fatalf("unrelated admin entry was touched: %v", statErr)
+		}
+	})
+
+	t.Run("Should materialize a per-run worktree with readable names and recorded namespace", func(t *testing.T) {
+		t.Parallel()
+		fixture := newCreateTestFixture(t, config.DefaultWorktreesConfig())
+		request := RunWorktreeRequest{ProfileID: testWorktreeProfileID, TaskSlug: "Review Docs", RunID: "run-123"}
+		item, err := fixture.service.MaterializeForRun(t.Context(), fixture.workspace.ID, request)
+		if err != nil {
+			t.Fatalf("MaterializeForRun() error = %v", err)
+		}
+		wantName := RunWorktreeName(request.TaskSlug, request.RunID)
+		if item.Name != wantName || item.Branch != "run/"+wantName || item.Origin != OriginPerRun ||
+			item.RunID != request.RunID || item.RunNamespace != "run/" {
+			t.Fatalf("MaterializeForRun() = %#v, want readable run identity", item)
+		}
+	})
+
+	t.Run("Should roll back only the exact per-run materialization", func(t *testing.T) {
+		t.Parallel()
+		fixture := newCreateTestFixture(t, config.DefaultWorktreesConfig())
+		request := RunWorktreeRequest{ProfileID: testWorktreeProfileID, TaskSlug: "Review Docs", RunID: "run-rollback"}
+		item, err := fixture.service.MaterializeForRun(t.Context(), fixture.workspace.ID, request)
+		if err != nil {
+			t.Fatalf("MaterializeForRun() error = %v", err)
+		}
+		if err := fixture.service.RollbackRunMaterialization(
+			t.Context(),
+			fixture.workspace.ID,
+			item.ID,
+			"different-run",
+		); !errors.Is(err, ErrNotFound) {
+			t.Fatalf("RollbackRunMaterialization(different run) error = %v, want ErrNotFound", err)
+		}
+		if _, err := fixture.store.Get(t.Context(), fixture.workspace.ID, item.ID); err != nil {
+			t.Fatalf("Get() after rejected rollback error = %v", err)
+		}
+		if err := fixture.service.RollbackRunMaterialization(
+			t.Context(),
+			fixture.workspace.ID,
+			item.ID,
+			request.RunID,
+		); err != nil {
+			t.Fatalf("RollbackRunMaterialization() error = %v", err)
+		}
+		if got, err := fixture.store.Get(
+			t.Context(),
+			fixture.workspace.ID,
+			item.ID,
+		); !errors.Is(err, ErrNotFound) ||
+			got != nil {
+			t.Fatalf("Get() after rollback = %#v, %v, want ErrNotFound", got, err)
+		}
+		commands := invocationCommands(fixture.runner.invocations())
+		if !slices.ContainsFunc(commands, func(command string) bool {
+			return strings.HasSuffix(command, " worktree remove --force "+item.Path)
+		}) {
+			t.Fatalf("rollback Git calls = %#v, want forced checkout removal", commands)
+		}
+		if !containsCommandPrefix(commands, "update-ref -d refs/heads/"+item.Branch+" "+item.CreatedHead) {
+			t.Fatalf("rollback Git calls = %#v, want compare-and-delete", commands)
+		}
+	})
+
+	t.Run("Should create the worktree under the id its caller chose", func(t *testing.T) {
+		t.Parallel()
+		fixture := newCreateTestFixture(t, config.DefaultWorktreesConfig())
+		item, err := fixture.service.Create(t.Context(), fixture.workspace.ID, CreateOptions{
+			ID: "wt_chosen_by_move", ProfileID: testNonDefaultWorktreeProfileID, Name: "Moved Branch",
+		})
+		if err != nil {
+			t.Fatalf("Create() error = %v", err)
+		}
+		persisted, err := fixture.store.Get(t.Context(), fixture.workspace.ID, "wt_chosen_by_move")
+		if item.ID != "wt_chosen_by_move" || err != nil || persisted.State != StateReady {
+			t.Fatalf("Create() id = %q, persisted = %#v, %v; want the requested id ready", item.ID, persisted, err)
+		}
+	})
+
+	t.Run("Should create a branch and persist every phase before completing", func(t *testing.T) {
+		t.Parallel()
+		fixture := newCreateTestFixture(t, config.DefaultWorktreesConfig())
+		events := &recordingEventSink{}
+		fixture.service.events = events
+		item, err := fixture.service.Create(
+			t.Context(),
+			fixture.workspace.ID,
+			CreateOptions{ProfileID: testNonDefaultWorktreeProfileID, Name: "Docs Refresh"},
+		)
+		if err != nil {
+			t.Fatalf("Create() error = %v", err)
+		}
+		if item.ProfileID != testNonDefaultWorktreeProfileID {
+			t.Fatalf("created ProfileID = %q, want %q", item.ProfileID, testNonDefaultWorktreeProfileID)
+		}
+		persisted, err := fixture.store.Get(t.Context(), fixture.workspace.ID, item.ID)
+		if err != nil {
+			t.Fatalf("Get(non-default owner) error = %v", err)
+		}
+		if persisted.ProfileID != testNonDefaultWorktreeProfileID {
+			t.Fatalf("persisted ProfileID = %q, want %q", persisted.ProfileID, testNonDefaultWorktreeProfileID)
+		}
+		if item.State != StateReady || !item.CreatedBranch || item.BaseRef != "main" ||
+			item.CreatedHead != "created-head" || filepath.Base(item.GitDir) != "created" {
+			t.Fatalf("Create() = %#v, want ready runtime-owned worktree", item)
+		}
+		wantPhases := []PendingPhase{PhaseBranch, PhaseCheckout, PhaseCopy, PhaseSetup}
+		if got := fixture.store.phases(); !reflect.DeepEqual(got, wantPhases) {
+			t.Fatalf("pending phases = %#v, want %#v", got, wantPhases)
+		}
+		commands := invocationCommands(fixture.runner.invocations())
+		for _, want := range []string{
+			"branch docs-refresh main",
+			"worktree add " + item.Path + " docs-refresh",
+			"config branch.docs-refresh.gh-merge-base main",
+		} {
+			if !slices.Contains(commands, want) {
+				t.Fatalf("Git calls = %#v, missing %q", commands, want)
+			}
+		}
+		if got := events.count(EventCreated); got != 1 {
+			t.Fatalf("created events = %d, want one", got)
+		}
+	})
+
+	t.Run("Should return a durable pending row before detached materialization completes", func(t *testing.T) {
+		t.Parallel()
+		fixture := newCreateTestFixture(t, config.DefaultWorktreesConfig())
+		materializationStarted := make(chan struct{})
+		continueMaterialization := make(chan struct{})
+		baseRun := fixture.runner.run
+		fixture.runner.run = func(call gitInvocation) gitResponse {
+			if strings.HasPrefix(strings.Join(call.args, " "), "branch accepted-create ") {
+				close(materializationStarted)
+				<-continueMaterialization
+			}
+			return baseRun(call)
+		}
+		requestContext, cancelRequest := context.WithCancel(t.Context())
+		item, err := fixture.service.CreateAccepted(
+			requestContext,
+			fixture.workspace.ID,
+			CreateOptions{ProfileID: testWorktreeProfileID, Name: "Accepted Create"},
+		)
+		if err != nil {
+			t.Fatalf("CreateAccepted() error = %v", err)
+		}
+		cancelRequest()
+		select {
+		case <-materializationStarted:
+		case <-time.After(time.Second):
+			t.Fatal("detached materialization did not start")
+		}
+		if item.State != StatePending {
+			t.Fatalf("CreateAccepted() state = %q, want pending", item.State)
+		}
+		persisted, err := fixture.store.Get(t.Context(), fixture.workspace.ID, item.ID)
+		if err != nil || persisted.State != StatePending {
+			t.Fatalf("pending row = %#v, %v, want durable pending", persisted, err)
+		}
+		operation := fixture.service.getCreateOperation(fixture.workspace.ID, item.ID)
+		if operation == nil {
+			t.Fatal("accepted creation operation = nil")
+		}
+		close(continueMaterialization)
+		select {
+		case <-operation.done:
+		case <-time.After(time.Second):
+			t.Fatal("detached materialization did not complete")
+		}
+		persisted, err = fixture.store.Get(t.Context(), fixture.workspace.ID, item.ID)
+		if err != nil || persisted.State != StateReady {
+			t.Fatalf("completed row = %#v, %v, want ready after request cancellation", persisted, err)
+		}
+	})
+
+	t.Run("Should expose pending state while CreateReady waits and return the ready row", func(t *testing.T) {
+		t.Parallel()
+		fixture := newCreateTestFixture(t, config.DefaultWorktreesConfig())
+		materializationStarted := make(chan struct{})
+		continueMaterialization := make(chan struct{})
+		baseRun := fixture.runner.run
+		fixture.runner.run = func(call gitInvocation) gitResponse {
+			if strings.HasPrefix(strings.Join(call.args, " "), "branch ready-create ") {
+				close(materializationStarted)
+				<-continueMaterialization
+			}
+			return baseRun(call)
+		}
+		result := make(chan *Worktree, 1)
+		errResult := make(chan error, 1)
+		go func() {
+			item, err := fixture.service.CreateReady(
+				t.Context(),
+				fixture.workspace.ID,
+				CreateOptions{ProfileID: testWorktreeProfileID, Name: "Ready Create"},
+			)
+			result <- item
+			errResult <- err
+		}()
+		select {
+		case <-materializationStarted:
+		case <-time.After(time.Second):
+			t.Fatal("ready materialization did not start")
+		}
+		rows, err := fixture.store.List(t.Context(), fixture.workspace.ID)
+		if err != nil || len(rows) != 1 || rows[0].State != StatePending {
+			t.Fatalf("rows while CreateReady waits = %#v, %v, want one pending row", rows, err)
+		}
+		close(continueMaterialization)
+		if err := <-errResult; err != nil {
+			t.Fatalf("CreateReady() error = %v", err)
+		}
+		if item := <-result; item == nil || item.State != StateReady {
+			t.Fatalf("CreateReady() = %#v, want ready row", item)
+		}
+	})
+
+	t.Run("Should cancel and roll back CreateReady when its caller stops waiting", func(t *testing.T) {
+		t.Parallel()
+		fixture := newCreateTestFixture(t, config.DefaultWorktreesConfig())
+		materializationStarted := make(chan struct{})
+		baseRun := fixture.runner.run
+		fixture.runner.run = func(call gitInvocation) gitResponse {
+			if strings.HasPrefix(strings.Join(call.args, " "), "branch canceled-ready ") {
+				close(materializationStarted)
+				// Like the real runner, the in-flight Git command dies with the
+				// operation context the caller's cancellation reaches.
+				<-call.ctx.Done()
+				return gitResponse{err: call.ctx.Err()}
+			}
+			return baseRun(call)
+		}
+		ctx, cancel := context.WithCancel(t.Context())
+		errResult := make(chan error, 1)
+		go func() {
+			_, err := fixture.service.CreateReady(
+				ctx,
+				fixture.workspace.ID,
+				CreateOptions{ProfileID: testWorktreeProfileID, Name: "Canceled Ready"},
+			)
+			errResult <- err
+		}()
+		select {
+		case <-materializationStarted:
+		case <-time.After(time.Second):
+			t.Fatal("cancelable materialization did not start")
+		}
+		rows, err := fixture.store.List(t.Context(), fixture.workspace.ID)
+		if err != nil || len(rows) != 1 {
+			t.Fatalf("rows before CreateReady cancellation = %#v, %v", rows, err)
+		}
+		cancel()
+		if err := <-errResult; !errors.Is(err, context.Canceled) {
+			t.Fatalf("CreateReady() error = %v, want context.Canceled", err)
+		}
+		if _, err := fixture.store.Get(
+			t.Context(),
+			fixture.workspace.ID,
+			rows[0].ID,
+		); !errors.Is(
+			err,
+			ErrNotFound,
+		) {
+			t.Fatalf("Get(canceled CreateReady) error = %v, want ErrNotFound", err)
+		}
+	})
+
+	t.Run("Should remove a completed CreateReady when cancellation wins delivery", func(t *testing.T) {
+		t.Parallel()
+		fixture := newCreateTestFixture(t, config.DefaultWorktreesConfig())
+		events := newBlockingCreatedEventSink()
+		fixture.service.events = events
+		baseRun := fixture.runner.run
+		fixture.runner.run = func(call gitInvocation) gitResponse {
+			switch strings.Join(call.args, " ") {
+			case "status --porcelain=v2 --branch -z":
+				return gitResponse{
+					stdout: []byte("# branch.oid created-head\x00# branch.head canceled-after-ready\x00"),
+				}
+			case "diff --numstat -z", "diff --cached --numstat -z", "branch -r --contains HEAD":
+				return gitResponse{}
+			case "rev-list --count main..HEAD":
+				return gitResponse{stdout: []byte("0\n")}
+			default:
+				return baseRun(call)
+			}
+		}
+		ctx, cancel := context.WithCancel(t.Context())
+		result := make(chan *Worktree, 1)
+		errResult := make(chan error, 1)
+		go func() {
+			item, err := fixture.service.CreateReady(
+				ctx,
+				fixture.workspace.ID,
+				CreateOptions{ProfileID: testWorktreeProfileID, Name: "Canceled After Ready"},
+			)
+			result <- item
+			errResult <- err
+		}()
+
+		select {
+		case <-events.entered:
+		case <-time.After(time.Second):
+			t.Fatal("timed out waiting for completed creation event")
+		}
+		rows, err := fixture.store.List(t.Context(), fixture.workspace.ID)
+		if err != nil || len(rows) != 1 || rows[0].State != StateReady {
+			t.Fatalf("rows before delivery cancellation = %#v, %v, want one ready row", rows, err)
+		}
+		if err := os.WriteFile(
+			filepath.Join(rows[0].Path, ".git"),
+			[]byte("gitdir: "+fixture.adminGitDir+"\n"),
+			0o600,
+		); err != nil {
+			t.Fatalf("write worktree pointer: %v", err)
+		}
+		if err := os.WriteFile(filepath.Join(fixture.adminGitDir, "commondir"), []byte("../..\n"), 0o600); err != nil {
+			t.Fatalf("write common pointer: %v", err)
+		}
+		if err := os.WriteFile(
+			filepath.Join(fixture.adminGitDir, "gitdir"),
+			[]byte(filepath.Join(rows[0].Path, ".git")+"\n"),
+			0o600,
+		); err != nil {
+			t.Fatalf("write worktree backlink: %v", err)
+		}
+		cancel()
+		close(events.release)
+		if item := <-result; item != nil {
+			t.Fatalf("CreateReady() item = %#v, want nil after caller cancellation", item)
+		}
+		createErr := <-errResult
+		if !errors.Is(createErr, context.Canceled) {
+			t.Fatalf("CreateReady() error = %v, want context.Canceled", createErr)
+		}
+		stored, err := fixture.store.Get(t.Context(), fixture.workspace.ID, rows[0].ID)
+		if err != nil || stored.State != StateRemoved {
+			t.Fatalf(
+				"worktree after delivery cancellation = %#v, %v (create error %v), want removed tombstone",
+				stored,
+				err,
+				createErr,
+			)
+		}
+	})
+
+	t.Run("Should reuse an existing branch without minting or configuring it", func(t *testing.T) {
+		t.Parallel()
+		fixture := newCreateTestFixture(t, config.DefaultWorktreesConfig())
+		item, err := fixture.service.Create(t.Context(), fixture.workspace.ID, CreateOptions{
+			ProfileID: testWorktreeProfileID, Name: "Existing", ExistingBranch: "feature/existing",
+		})
+		if err != nil {
+			t.Fatalf("Create(existing branch) error = %v", err)
+		}
+		if item.CreatedBranch {
+			t.Fatal("CreatedBranch = true, want false")
+		}
+		for _, command := range invocationCommands(fixture.runner.invocations()) {
+			if strings.HasPrefix(command, "branch feature/existing ") ||
+				strings.HasPrefix(command, "config branch.feature/existing") {
+				t.Fatalf("existing branch received a mint/config mutation: %q", command)
+			}
+		}
+	})
+
+	t.Run("Should reject a registered name before invoking Git", func(t *testing.T) {
+		t.Parallel()
+		fixture := newCreateTestFixture(t, config.DefaultWorktreesConfig())
+		now := time.Date(2026, 8, 12, 11, 0, 0, 0, time.UTC)
+		if err := fixture.store.Insert(t.Context(), Worktree{
+			ID: "wt-existing", WorkspaceID: fixture.workspace.ID, Name: "docs-refresh",
+			Path: filepath.Join(fixture.worktreesRoot, "existing"), State: StateReady,
+			Origin: OriginManual, SetupState: SetupNone, CreatedAt: now, UpdatedAt: now,
+		}); err != nil {
+			t.Fatalf("seed worktree: %v", err)
+		}
+		_, err := fixture.service.Create(
+			t.Context(),
+			fixture.workspace.ID,
+			CreateOptions{ProfileID: testWorktreeProfileID, Name: "Docs Refresh"},
+		)
+		if !errors.Is(err, ErrNameTaken) {
+			t.Fatalf("Create(duplicate) error = %v, want ErrNameTaken", err)
+		}
+		if calls := fixture.runner.invocations(); len(calls) != 0 {
+			t.Fatalf("Git calls = %#v, want none for a registered collision", calls)
+		}
+	})
+
+	t.Run("Should classify pending-row constraint failures without leaking storage errors", func(t *testing.T) {
+		t.Parallel()
+		cases := []struct {
+			name string
+			err  error
+			want error
+		}{
+			{name: "path", err: errors.New("UNIQUE constraint failed: worktrees.path"), want: ErrPathExists},
+			{
+				name: "name",
+				err:  errors.New("UNIQUE constraint failed: worktrees.workspace_id, worktrees.name"),
+				want: ErrNameTaken,
+			},
+			{name: "other", err: errors.New("database unavailable")},
+		}
+		for _, testCase := range cases {
+			t.Run("Should map "+testCase.name+" insertion failure", func(t *testing.T) {
+				t.Parallel()
+				fixture := newCreateTestFixture(t, config.DefaultWorktreesConfig())
+				fixture.service.store = &insertErrorWorktreeStore{
+					memoryWorktreeStore: fixture.store,
+					err:                 testCase.err,
+				}
+				_, err := fixture.service.Create(
+					t.Context(), fixture.workspace.ID,
+					CreateOptions{ProfileID: testWorktreeProfileID, Name: "Insert Conflict"},
+				)
+				if testCase.want != nil {
+					if !errors.Is(err, testCase.want) {
+						t.Fatalf("Create() error = %v, want %v", err, testCase.want)
+					}
+					return
+				}
+				if !errors.Is(err, testCase.err) || !strings.Contains(err.Error(), "insert pending row") {
+					t.Fatalf("Create() error = %v, want wrapped storage error", err)
+				}
+			})
+		}
+	})
+
+	t.Run("Should let exactly one concurrent creation own a name", func(t *testing.T) {
+		t.Parallel()
+		fixture := newCreateTestFixture(t, config.DefaultWorktreesConfig())
+		start := make(chan struct{})
+		results := make(chan error, 2)
+		var group sync.WaitGroup
+		for range 2 {
+			group.Go(func() {
+				<-start
+				_, err := fixture.service.Create(
+					t.Context(), fixture.workspace.ID,
+					CreateOptions{ProfileID: testWorktreeProfileID, Name: "Concurrent"},
+				)
+				results <- err
+			})
+		}
+		close(start)
+		group.Wait()
+		close(results)
+		successes, conflicts := 0, 0
+		for err := range results {
+			switch {
+			case err == nil:
+				successes++
+			case errors.Is(err, ErrNameTaken):
+				conflicts++
+			default:
+				t.Fatalf("Create(concurrent) error = %v", err)
+			}
+		}
+		if successes != 1 || conflicts != 1 {
+			t.Fatalf("concurrent results = %d success, %d conflicts, want one each", successes, conflicts)
+		}
+	})
+
+	t.Run("Should classify branches held by the root or another worktree", func(t *testing.T) {
+		t.Parallel()
+		rootFixture := newCreateTestFixture(t, config.DefaultWorktreesConfig())
+		if _, err := rootFixture.service.Create(t.Context(), rootFixture.workspace.ID, CreateOptions{
+			ProfileID: testWorktreeProfileID, Name: "Root Branch", Branch: "main",
+		}); !errors.Is(err, ErrBranchCheckedOutAtRoot) {
+			t.Fatalf("Create(root branch) error = %v, want ErrBranchCheckedOutAtRoot", err)
+		}
+
+		linkedFixture := newCreateTestFixture(t, config.DefaultWorktreesConfig())
+		linkedFixture.listOutput = append(
+			linkedFixture.listOutput,
+			[]byte("worktree /linked\x00HEAD held\x00branch refs/heads/feature/held\x00\x00")...,
+		)
+		if _, err := linkedFixture.service.Create(t.Context(), linkedFixture.workspace.ID, CreateOptions{
+			ProfileID: testWorktreeProfileID, Name: "Held Branch", Branch: "feature/held",
+		}); !errors.Is(err, ErrBranchHeld) {
+			t.Fatalf("Create(held branch) error = %v, want ErrBranchHeld", err)
+		}
+	})
+
+	t.Run("Should reject missing refs and repositories without commits before mutation", func(t *testing.T) {
+		t.Parallel()
+		existingFixture := newCreateTestFixture(t, config.DefaultWorktreesConfig())
+		if _, err := existingFixture.service.Create(t.Context(), existingFixture.workspace.ID, CreateOptions{
+			ProfileID: testWorktreeProfileID, Name: "Missing Existing", ExistingBranch: "feature/missing",
+		}); !errors.Is(err, ErrBaseRefNotFound) {
+			t.Fatalf("Create(missing existing branch) error = %v, want ErrBaseRefNotFound", err)
+		}
+
+		baseFixture := newCreateTestFixture(t, config.DefaultWorktreesConfig())
+		baseRun := baseFixture.runner.run
+		baseFixture.runner.run = func(call gitInvocation) gitResponse {
+			if strings.Join(call.args, " ") == "rev-parse --verify missing^{commit}" {
+				return gitResponse{stderr: []byte("unknown revision"), err: errors.New("exit 128")}
+			}
+			return baseRun(call)
+		}
+		if _, err := baseFixture.service.Create(t.Context(), baseFixture.workspace.ID, CreateOptions{
+			ProfileID: testWorktreeProfileID, Name: "Missing Base", BaseRef: "missing",
+		}); !errors.Is(err, ErrBaseRefNotFound) {
+			t.Fatalf("Create(missing base) error = %v, want ErrBaseRefNotFound", err)
+		}
+		if item, err := baseFixture.service.CreateAccepted(
+			t.Context(),
+			baseFixture.workspace.ID,
+			CreateOptions{ProfileID: testWorktreeProfileID, Name: "Missing Accepted Base", BaseRef: "missing"},
+		); !errors.Is(err, ErrBaseRefNotFound) || item != nil {
+			t.Fatalf("CreateAccepted(missing base) = %#v, %v, want nil ErrBaseRefNotFound", item, err)
+		}
+		rows, err := baseFixture.store.List(t.Context(), baseFixture.workspace.ID)
+		if err != nil || len(rows) != 0 {
+			t.Fatalf("List() after rejected acceptance = %#v, %v, want no durable row", rows, err)
+		}
+
+		unbornFixture := newCreateTestFixture(t, config.DefaultWorktreesConfig())
+		unbornRun := unbornFixture.runner.run
+		unbornFixture.runner.run = func(call gitInvocation) gitResponse {
+			if strings.Join(call.args, " ") == "rev-parse --verify HEAD" {
+				return gitResponse{stderr: []byte("unknown revision"), err: errors.New("exit 128")}
+			}
+			return unbornRun(call)
+		}
+		if _, err := unbornFixture.service.Create(t.Context(), unbornFixture.workspace.ID, CreateOptions{
+			ProfileID: testWorktreeProfileID, Name: "Unborn",
+		}); !errors.Is(err, ErrRepoHasNoCommits) {
+			t.Fatalf("Create(unborn) error = %v, want ErrRepoHasNoCommits", err)
+		}
+	})
+
+	t.Run("Should unwind a failed checkout and allow an exact retry", func(t *testing.T) {
+		t.Parallel()
+		fixture := newCreateTestFixture(t, config.DefaultWorktreesConfig())
+		fixture.failWorktreeAdd.Store(true)
+		_, err := fixture.service.Create(t.Context(), fixture.workspace.ID, CreateOptions{
+			ProfileID: testWorktreeProfileID, Name: "Retry Me",
+		})
+		if err == nil || !strings.Contains(err.Error(), "checkout failed") {
+			t.Fatalf("Create(failing checkout) error = %v, want checkout failure", err)
+		}
+		if item, getErr := fixture.store.Get(
+			t.Context(),
+			fixture.workspace.ID,
+			"retry-me",
+		); !errors.Is(getErr, ErrNotFound) ||
+			item != nil {
+			t.Fatalf("failed row = %#v, %v, want deleted", item, getErr)
+		}
+		commands := invocationCommands(fixture.runner.invocations())
+		if !containsCommandPrefix(commands, "update-ref -d refs/heads/retry-me created-head") {
+			t.Fatalf("rollback Git calls = %#v, want compare-and-delete", commands)
+		}
+		fixture.failWorktreeAdd.Store(false)
+		if _, retryErr := fixture.service.Create(
+			t.Context(),
+			fixture.workspace.ID,
+			CreateOptions{ProfileID: testWorktreeProfileID, Name: "Retry Me"},
+		); retryErr != nil {
+			t.Fatalf("Create(retry) error = %v", retryErr)
+		}
+	})
+
+	t.Run("Should copy ignored files without overwriting the checkout", func(t *testing.T) {
+		t.Parallel()
+		worktreesConfig := config.DefaultWorktreesConfig()
+		worktreesConfig.CopyList = []string{".env"}
+		fixture := newCreateTestFixture(t, worktreesConfig)
+		if err := os.WriteFile(filepath.Join(fixture.workspace.Root, ".env"), []byte("source"), 0o600); err != nil {
+			t.Fatalf("write bootstrap source: %v", err)
+		}
+		item, err := fixture.service.Create(
+			t.Context(),
+			fixture.workspace.ID,
+			CreateOptions{ProfileID: testWorktreeProfileID, Name: "Bootstrap"},
+		)
+		if err != nil {
+			t.Fatalf("Create(bootstrap) error = %v", err)
+		}
+		contents, err := os.ReadFile(filepath.Join(item.Path, ".env"))
+		if err != nil {
+			t.Fatalf("read copied bootstrap file: %v", err)
+		}
+		if string(contents) != "source" {
+			t.Fatalf("copied bootstrap contents = %q, want source", contents)
+		}
+		if err := os.WriteFile(filepath.Join(item.Path, ".env"), []byte("existing"), 0o600); err != nil {
+			t.Fatalf("replace target fixture: %v", err)
+		}
+		if err := fixture.service.copyBootstrapFile(fixture.workspace.Root, item.Path, ".env"); err != nil {
+			t.Fatalf("copyBootstrapFile(existing) error = %v", err)
+		}
+		contents, err = os.ReadFile(filepath.Join(item.Path, ".env"))
+		if err != nil || string(contents) != "existing" {
+			t.Fatalf("existing bootstrap target = %q, %v, want untouched", contents, err)
+		}
+	})
+
+	t.Run("Should cancel only a pending creation and unwind recorded artifacts", func(t *testing.T) {
+		t.Parallel()
+		fixture := newCreateTestFixture(t, config.DefaultWorktreesConfig())
+		events := &recordingEventSink{}
+		fixture.service.events = events
+		target := filepath.Join(fixture.worktreesRoot, "cancel")
+		if err := os.MkdirAll(target, 0o700); err != nil {
+			t.Fatalf("create pending target: %v", err)
+		}
+		now := time.Date(2026, 8, 12, 11, 0, 0, 0, time.UTC)
+		pending := Worktree{
+			ID: "wt-cancel", WorkspaceID: fixture.workspace.ID, Name: "cancel", Branch: "cancel",
+			Path: target, GitDir: fixture.adminGitDir, State: StatePending, PendingPhase: PhaseCheckout,
+			Origin: OriginManual, SetupState: SetupNone, CreatedBranch: true, CreatedHead: "created-head",
+			CreatedAt: now, UpdatedAt: now,
+		}
+		if err := fixture.store.Insert(t.Context(), pending); err != nil {
+			t.Fatalf("seed pending worktree: %v", err)
+		}
+		if err := fixture.service.CancelCreate(t.Context(), fixture.workspace.ID, pending.Name); err != nil {
+			t.Fatalf("CancelCreate() error = %v", err)
+		}
+		if _, err := fixture.store.Get(
+			t.Context(),
+			fixture.workspace.ID,
+			pending.ID,
+		); !errors.Is(
+			err,
+			ErrNotFound,
+		) {
+			t.Fatalf("Get(canceled) error = %v, want ErrNotFound", err)
+		}
+		if got := events.count(EventCreationCanceled); got != 1 {
+			t.Fatalf("creation canceled events = %d, want one", got)
+		}
+		ready := pending
+		ready.ID, ready.Name, ready.Path, ready.State = "wt-ready", "ready", filepath.Join(
+			fixture.worktreesRoot,
+			"ready",
+		), StateReady
+		if err := fixture.store.Insert(t.Context(), ready); err != nil {
+			t.Fatalf("seed ready worktree: %v", err)
+		}
+		if err := fixture.service.CancelCreate(
+			t.Context(),
+			fixture.workspace.ID,
+			ready.ID,
+		); !errors.Is(
+			err,
+			ErrNotPending,
+		) {
+			t.Fatalf("CancelCreate(ready) error = %v, want ErrNotPending", err)
+		}
+		if err := fixture.service.CancelCreate(
+			t.Context(),
+			"ws-other",
+			ready.ID,
+		); !errors.Is(
+			err,
+			ErrNotFound,
+		) {
+			t.Fatalf("CancelCreate(cross-workspace) error = %v, want ErrNotFound", err)
+		}
+	})
+
+	for _, tc := range []struct {
+		name         string
+		successReads int
+	}{
+		{name: "on the initial read", successReads: 0},
+		{name: "on the locked reread", successReads: 1},
+	} {
+		t.Run("Should preserve store errors "+tc.name+" during creation cancellation", func(t *testing.T) {
+			t.Parallel()
+			fixture := newCreateTestFixture(t, config.DefaultWorktreesConfig())
+			now := time.Date(2026, 8, 15, 12, 0, 0, 0, time.UTC)
+			pending := Worktree{
+				ID: "wt-pending", WorkspaceID: fixture.workspace.ID, Name: "pending", Branch: "pending",
+				Path: filepath.Join(fixture.worktreesRoot, "pending"), GitDir: fixture.adminGitDir,
+				State: StatePending, PendingPhase: PhaseCheckout, Origin: OriginManual,
+				SetupState: SetupNone, CreatedAt: now, UpdatedAt: now,
+			}
+			if err := fixture.store.Insert(t.Context(), pending); err != nil {
+				t.Fatalf("seed pending worktree: %v", err)
+			}
+			storeErr := errors.New("read unavailable")
+			fixture.service.store = &getErrorWorktreeStore{
+				memoryWorktreeStore: fixture.store,
+				err:                 storeErr,
+				successReads:        tc.successReads,
+			}
+
+			err := fixture.service.CancelCreate(t.Context(), fixture.workspace.ID, pending.Name)
+			if !errors.Is(err, storeErr) || errors.Is(err, ErrNotFound) {
+				t.Fatalf("CancelCreate() error = %v, want wrapped store error", err)
+			}
+		})
+	}
+
+	t.Run(
+		"Should allowlist setup environment and report timeout without exposing unrelated values",
+		func(t *testing.T) {
+			t.Parallel()
+			workspace := Workspace{ID: "ws-setup", Root: t.TempDir()}
+			item := Worktree{ID: "wt-setup", Path: t.TempDir(), Branch: "feature/setup"}
+			got := setupEnvironment([]string{
+				"PATH=/bin", "HOME=/operator", "LANG=en_US.UTF-8", "LC_ALL=C", "TMPDIR=/tmp",
+				"SHELL=/bad", "GIT_TOKEN=secret", "CLAIM_TOKEN=secret", "UNRELATED=value",
+			}, workspace, item, "/bin/sh")
+			joined := strings.Join(got, "\n")
+			for _, required := range []string{
+				"PATH=/bin", "HOME=/operator", "LANG=en_US.UTF-8", "LC_ALL=C", "TMPDIR=/tmp",
+				"SHELL=/bin/sh", "COMPOZY_WORKSPACE_ROOT=" + workspace.Root,
+				"COMPOZY_WORKTREE_PATH=" + item.Path, "COMPOZY_WORKTREE_ID=wt-setup",
+				"COMPOZY_WORKTREE_BRANCH=feature/setup",
+			} {
+				if !strings.Contains(joined, required) {
+					t.Fatalf("setup environment = %#v, missing %q", got, required)
+				}
+			}
+			if strings.Contains(joined, "GIT_TOKEN") || strings.Contains(joined, "CLAIM_TOKEN") ||
+				strings.Contains(joined, "UNRELATED") {
+				t.Fatalf("setup environment leaked unrelated values: %#v", got)
+			}
+
+			worktreesConfig := config.DefaultWorktreesConfig()
+			worktreesConfig.SetupCommand = "printf timed-out >&2; sleep 5"
+			worktreesConfig.SetupTimeout = 30 * time.Millisecond
+			service := NewService(
+				newMemoryWorktreeStore(),
+				&recordingGitRunner{},
+				WithConfig(worktreesConfig, t.TempDir()),
+			)
+			state, detail := service.runSetup(t.Context(), workspace, item, true)
+			if state != SetupFailed || detail == "" || !strings.Contains(detail, context.DeadlineExceeded.Error()) {
+				t.Fatalf("runSetup(timeout) = (%q, %q), want readable failed timeout", state, detail)
+			}
+		},
+	)
+
+	t.Run("Should reject explicit paths that overlap workspace or live worktree roots", func(t *testing.T) {
+		t.Parallel()
+		fixture := newCreateTestFixture(t, config.DefaultWorktreesConfig())
+		if _, err := fixture.service.Create(t.Context(), fixture.workspace.ID, CreateOptions{
+			ProfileID: testWorktreeProfileID, Name: "Inside", Path: filepath.Join(fixture.workspace.Root, "nested"),
+		}); !errors.Is(err, ErrPathExists) {
+			t.Fatalf("Create(overlapping workspace) error = %v, want ErrPathExists", err)
+		}
+		now := time.Date(2026, 8, 12, 11, 0, 0, 0, time.UTC)
+		existingPath := filepath.Join(fixture.worktreesRoot, "existing")
+		if err := fixture.store.Insert(t.Context(), Worktree{
+			ID: "wt-existing-path", WorkspaceID: fixture.workspace.ID, Name: "existing-path",
+			Path: existingPath, State: StateReady, Origin: OriginManual, SetupState: SetupNone,
+			CreatedAt: now, UpdatedAt: now,
+		}); err != nil {
+			t.Fatalf("seed live path: %v", err)
+		}
+		if _, err := fixture.service.Create(t.Context(), fixture.workspace.ID, CreateOptions{
+			ProfileID: testWorktreeProfileID, Name: "Overlap", Path: filepath.Join(existingPath, "nested"),
+		}); !errors.Is(err, ErrPathExists) {
+			t.Fatalf("Create(overlapping worktree) error = %v, want ErrPathExists", err)
+		}
+		if _, err := fixture.service.Create(t.Context(), fixture.workspace.ID, CreateOptions{
+			ProfileID: testWorktreeProfileID, Name: "Ancestor", Path: filepath.Dir(existingPath),
+		}); !errors.Is(err, ErrPathExists) {
+			t.Fatalf("Create(ancestor of worktree) error = %v, want ErrPathExists", err)
+		}
+
+		otherWorkspace := Workspace{ID: "ws-other", Name: "Other", Root: t.TempDir()}
+		otherPath := filepath.Join(fixture.worktreesRoot, "other-existing")
+		if err := fixture.store.Insert(t.Context(), Worktree{
+			ID: "wt-other-path", WorkspaceID: otherWorkspace.ID, Name: "other-path",
+			Path: otherPath, State: StateReady, Origin: OriginManual, SetupState: SetupNone,
+			CreatedAt: now, UpdatedAt: now,
+		}); err != nil {
+			t.Fatalf("seed other-workspace path: %v", err)
+		}
+		fixture.service.resolver = staticWorkspaceResolver{workspaces: map[string]Workspace{
+			fixture.workspace.ID: fixture.workspace,
+			otherWorkspace.ID:    otherWorkspace,
+		}}
+		if _, err := fixture.service.Create(t.Context(), fixture.workspace.ID, CreateOptions{
+			ProfileID: testWorktreeProfileID, Name: "Cross Workspace", Path: filepath.Join(otherPath, "nested"),
+		}); !errors.Is(err, ErrPathExists) {
+			t.Fatalf("Create(cross-workspace overlap) error = %v, want ErrPathExists", err)
+		}
+	})
+
+	t.Run("Should revalidate canonical containment between Git mutations", func(t *testing.T) {
+		t.Parallel()
+		fixture := newCreateTestFixture(t, config.DefaultWorktreesConfig())
+		baseRun := fixture.runner.run
+		inserted := false
+		fixture.runner.run = func(call gitInvocation) gitResponse {
+			if !inserted && strings.HasPrefix(strings.Join(call.args, " "), "branch race-revalidation ") {
+				inserted = true
+				now := time.Date(2026, 8, 12, 11, 0, 0, 0, time.UTC)
+				candidate := filepath.Join(fixture.worktreesRoot, "create-workspace", "race-revalidation")
+				if err := fixture.store.Insert(t.Context(), Worktree{
+					ID: "wt-racing-path", WorkspaceID: fixture.workspace.ID, Name: "racing-path",
+					Path: filepath.Dir(candidate), State: StateReady, Origin: OriginManual,
+					SetupState: SetupNone, CreatedAt: now, UpdatedAt: now,
+				}); err != nil {
+					t.Fatalf("seed racing path: %v", err)
+				}
+			}
+			return baseRun(call)
+		}
+		_, err := fixture.service.Create(
+			t.Context(), fixture.workspace.ID,
+			CreateOptions{ProfileID: testWorktreeProfileID, Name: "Race Revalidation"},
+		)
+		if !errors.Is(err, ErrPathExists) {
+			t.Fatalf("Create(racing containment) error = %v, want ErrPathExists", err)
+		}
+		if containsCommandPrefix(invocationCommands(fixture.runner.invocations()), "worktree add ") {
+			t.Fatal("checkout mutation ran after containment changed")
+		}
+	})
+
+	t.Run("Should preserve derived-path provenance when the configured root symlink changes", func(t *testing.T) {
+		t.Parallel()
+		fixture := newCreateTestFixture(t, config.DefaultWorktreesConfig())
+		safeRoot := t.TempDir()
+		otherRoot := t.TempDir()
+		rootLink := filepath.Join(t.TempDir(), "worktrees-root")
+		if err := os.Symlink(safeRoot, rootLink); err != nil {
+			t.Fatalf("Symlink(safe root) error = %v", err)
+		}
+		item := Worktree{
+			ID: "wt-derived-provenance", WorkspaceID: fixture.workspace.ID,
+			Path: filepath.Join(safeRoot, "workspace", "derived"),
+		}
+		if err := os.Remove(rootLink); err != nil {
+			t.Fatalf("Remove(root symlink) error = %v", err)
+		}
+		if err := os.Symlink(otherRoot, rootLink); err != nil {
+			t.Fatalf("Symlink(replaced root) error = %v", err)
+		}
+		if err := fixture.service.revalidateMutationPath(
+			t.Context(), fixture.workspace, item, rootLink, false,
+		); !errors.Is(err, ErrConfigInvalid) {
+			t.Fatalf("revalidateMutationPath(derived escape) error = %v, want ErrConfigInvalid", err)
+		}
+	})
+
+	t.Run("Should reject a bootstrap destination parent symlink that escapes the worktree", func(t *testing.T) {
+		t.Parallel()
+		fixture := newCreateTestFixture(t, config.DefaultWorktreesConfig())
+		sourceRoot := t.TempDir()
+		targetRoot := t.TempDir()
+		outside := t.TempDir()
+		if err := os.MkdirAll(filepath.Join(sourceRoot, "nested"), 0o700); err != nil {
+			t.Fatalf("MkdirAll(source nested) error = %v", err)
+		}
+		if err := os.WriteFile(filepath.Join(sourceRoot, "nested", "secret.env"), []byte("safe\n"), 0o600); err != nil {
+			t.Fatalf("WriteFile(source) error = %v", err)
+		}
+		if err := os.Symlink(outside, filepath.Join(targetRoot, "nested")); err != nil {
+			t.Fatalf("Symlink(destination escape) error = %v", err)
+		}
+		if err := fixture.service.copyBootstrapFile(
+			sourceRoot, targetRoot, filepath.Join("nested", "secret.env"),
+		); !errors.Is(err, ErrConfigInvalid) {
+			t.Fatalf("copyBootstrapFile(symlink escape) error = %v, want ErrConfigInvalid", err)
+		}
+		if _, err := os.Stat(filepath.Join(outside, "secret.env")); !errors.Is(err, os.ErrNotExist) {
+			t.Fatalf("outside destination stat error = %v, want no copied file", err)
+		}
+	})
+
+	t.Run("Should redact setup and Git diagnostics at the worktree boundary", func(t *testing.T) {
+		t.Parallel()
+		const secret = "bound-worktree-secret-123456"
+		cleanup := diagnostics.RegisterRequiredSecret(secret)
+		t.Cleanup(cleanup)
+		workspace := Workspace{ID: "ws-redaction", Root: t.TempDir()}
+		item := Worktree{ID: "wt-redaction", Path: t.TempDir(), Branch: "feature/redaction"}
+		settings := config.DefaultWorktreesConfig()
+		settings.SetupCommand = "printf 'token=" + secret + "' >&2; exit 1"
+		service := NewService(newMemoryWorktreeStore(), &recordingGitRunner{}, WithConfig(settings, t.TempDir()))
+		service.getenv = func(string) string { return "/bin/sh" }
+		service.environ = func() []string {
+			return []string{"PATH=/bin", "BOUND_SECRET=" + secret, "CLAIM_TOKEN=compozy_claim_" + secret}
+		}
+		state, detail := service.runSetup(t.Context(), workspace, item, true)
+		if state != SetupFailed || strings.Contains(detail, secret) || !strings.Contains(detail, "[REDACTED]") {
+			t.Fatalf("runSetup(secret) = (%q, %q), want redacted failure", state, detail)
+		}
+		for _, entry := range setupEnvironment(service.environ(), workspace, item, "/bin/sh") {
+			if strings.Contains(entry, secret) {
+				t.Fatalf("setup environment leaked registered secret: %q", entry)
+			}
+		}
+		gitErr := gitCommandError([]string{"status"}, "token="+secret, errors.New("exit 1"))
+		if strings.Contains(gitErr.Error(), secret) || !strings.Contains(gitErr.Error(), "[REDACTED]") {
+			t.Fatalf("git diagnostic = %q, want redacted", gitErr)
+		}
+		refusalErr := refusal(ErrDeniedByHook, "token="+secret)
+		if strings.Contains(refusalErr.Error(), secret) || !strings.Contains(refusalErr.Error(), "[REDACTED]") {
+			t.Fatalf("refusal diagnostic = %q, want redacted", refusalErr)
+		}
+		requestType := reflect.TypeFor[RunWorktreeRequest]()
+		for field := range requestType.Fields() {
+			fieldName := strings.ToLower(field.Name)
+			if strings.Contains(fieldName, "claim") || strings.Contains(fieldName, "token") ||
+				strings.Contains(fieldName, "secret") {
+				t.Fatalf("RunWorktreeRequest exposes secret-bearing field %q", field.Name)
+			}
+		}
+	})
+
+	t.Run("Should reject an unwritable placement parent before mutating Git", func(t *testing.T) {
+		t.Parallel()
+		fixture := newCreateTestFixture(t, config.DefaultWorktreesConfig())
+		blockedRoot := filepath.Join(t.TempDir(), "blocked")
+		if err := os.WriteFile(blockedRoot, []byte("not a directory"), 0o600); err != nil {
+			t.Fatalf("WriteFile(%q) error = %v", blockedRoot, err)
+		}
+		fixture.service.Reconfigure(config.DefaultWorktreesConfig(), blockedRoot)
+
+		_, err := fixture.service.Create(t.Context(), fixture.workspace.ID, CreateOptions{
+			ProfileID: testWorktreeProfileID, Name: "blocked",
+		})
+		if !errors.Is(err, ErrConfigInvalid) {
+			t.Fatalf("Create() error = %v, want ErrConfigInvalid", err)
+		}
+		got, getErr := fixture.store.Get(t.Context(), fixture.workspace.ID, "blocked")
+		if !errors.Is(getErr, ErrNotFound) || got != nil {
+			t.Fatalf("registry row = %#v, want rollback deletion", got)
+		}
+		for _, call := range fixture.runner.invocations() {
+			if len(call.args) > 0 && (call.args[0] == "branch" || call.args[0] == "worktree") {
+				t.Fatalf("mutating Git call = %#v, want none", call.args)
+			}
+		}
+	})
+}
+
+type blockingCreatedEventSink struct {
+	entered chan struct{}
+	release chan struct{}
+	once    sync.Once
+}
+
+func newBlockingCreatedEventSink() *blockingCreatedEventSink {
+	return &blockingCreatedEventSink{entered: make(chan struct{}), release: make(chan struct{})}
+}
+
+func (s *blockingCreatedEventSink) PublishWorktreeEvent(_ context.Context, event LifecycleEvent) error {
+	if event.Name == EventCreated {
+		s.once.Do(func() { close(s.entered) })
+		<-s.release
+	}
+	return nil
+}
+
+type insertErrorWorktreeStore struct {
+	*memoryWorktreeStore
+	err error
+}
+
+func (s *insertErrorWorktreeStore) Insert(context.Context, Worktree) error {
+	return s.err
+}
+
+func invocationCommands(calls []gitInvocation) []string {
+	commands := make([]string, 0, len(calls))
+	for _, call := range calls {
+		commands = append(commands, strings.Join(call.args, " "))
+	}
+	return commands
+}
+
+func containsCommandPrefix(commands []string, prefix string) bool {
+	for _, command := range commands {
+		if strings.HasPrefix(command, prefix) {
+			return true
+		}
+	}
+	return false
+}

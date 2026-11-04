@@ -1,0 +1,14 @@
+{
+    "title": "Operations",
+    "icon": "Wrench",
+    "pages": [
+        "daemon",
+        "desktop-app",
+        "desktop-release",
+        "mcp-serve",
+        "database",
+        "support-bundles",
+        "troubleshooting",
+        "production"
+    ]
+}

@@ -1,0 +1,450 @@
+import type { components } from "@compozy/client";
+import type { UIMessage as AIUIMessage } from "ai";
+
+import type { OperationQuery, OperationRequestBody, OperationResponse } from "@/lib/api-contract";
+import type { SessionBusyInputAction } from "./lib/session-busy-input";
+import type { SessionSendOutcome } from "./lib/session-send-outcome";
+
+export type SessionCatalogPageResponse = OperationResponse<"listSessions", 200>;
+/** Counted consumers require a total; count-free cursor reads use the wire envelope. */
+export type SessionsResponse = Omit<SessionCatalogPageResponse, "page"> & {
+  page: SessionCatalogPageResponse["page"] & { total: number };
+};
+type SessionCatalogStreamPayload = OperationResponse<"streamSessionCatalog", 200>;
+export type SessionCatalogEventPayload = Extract<SessionCatalogStreamPayload, { kind: string }>;
+export type SessionAttentionEventPayload = Extract<SessionCatalogStreamPayload, { from: string }>;
+export type OperatorNotificationEventPayload = Extract<
+  SessionCatalogStreamPayload,
+  { notification_id: string }
+>;
+export type SessionsQuery = OperationQuery<"listSessions"> & {
+  /** `_dx.md`: hides always-on main sessions from rows, cards and counts. */
+  exclude_instance_main?: boolean;
+};
+export type SessionListFilters = Omit<SessionsQuery, "cursor">;
+export type SessionPayload = SessionsResponse["sessions"][number];
+/** What opening a session from the list needs: a catalog row, or a subagent's child session. */
+export type SessionListTarget = Pick<SessionPayload, "id" | "agent_name" | "workspace_id"> & {
+  subagentId?: string;
+};
+export type SessionResponse = OperationResponse<"getSession", 200>;
+export type SessionByIDResponse = OperationResponse<"getSessionByID", 200>;
+/** Minimal workspace-ownership projection: the only session read allowed before a switch confirm. */
+export type SessionOwnerResponse = OperationResponse<"getSessionOwner", 200>;
+export type SessionRuntimePayload = SessionPayload["runtime"];
+export type SessionRuntimeEffective = NonNullable<SessionRuntimePayload["effective"]>;
+export type SessionRuntimeSelection = NonNullable<SessionRuntimePayload["selected"]>;
+export type SetSessionRuntimeRequest = OperationRequestBody<"setSessionRuntime">;
+export type RenameSessionRequest = OperationRequestBody<"renameSession">;
+export type ACPCaps = NonNullable<SessionRuntimePayload["acp_caps"]>;
+export type SessionState = SessionPayload["state"];
+export type SessionFailurePayload = NonNullable<SessionPayload["failure"]>;
+export type SessionLineagePayload = NonNullable<SessionPayload["lineage"]>;
+/** The daemon's last authoritative work inspection; `null` until supervision has looked. */
+export type SessionSupervisionPayload = NonNullable<SessionPayload["supervision"]>;
+export type SessionWorkSignalPayload = SessionSupervisionPayload["work_signals"][number];
+export type SessionWorkSignalKind = SessionWorkSignalPayload["kind"];
+/** One quiet episode: warned once, with an optional inactivity-stop deadline. */
+export type SessionQuietWarningPayload = NonNullable<SessionSupervisionPayload["quiet_warning"]>;
+export type AgentMePayload = OperationResponse<"getAgentMe", 200>["me"];
+export type AgentContextPayload = OperationResponse<"getAgentContext", 200>["context"];
+export type AgentSpawnPayload = OperationResponse<"spawnAgentSession", 201>["spawn"];
+export type CoordinatorConfigPayload = OperationResponse<
+  "getAgentCoordinatorConfig",
+  200
+>["coordinator"];
+
+export type SessionEventsResponse = OperationResponse<"listSessionEvents", 200>;
+export type SessionEventPayload = SessionEventsResponse["events"][number];
+/**
+ * Actionable provider diagnostic attached to prompt-failure error events
+ * (auth lapse, rate limit). Derived from the API contract; the session
+ * survives these, so it is never a terminal failure.
+ */
+export type ProviderErrorDiagnosticPayload = NonNullable<SessionEventPayload["provider_error"]>;
+export type FetchSessionEventsParams = OperationQuery<"listSessionEvents">;
+
+export type SessionHistoryResponse = OperationResponse<"getSessionHistory", 200>;
+export type TurnHistoryPayload = SessionHistoryResponse["history"][number];
+
+export type SessionTranscriptResponse = OperationResponse<"getSessionTranscript", 200>;
+export type SessionCommandsResponse = OperationResponse<"getSessionCommands", 200>;
+export type SessionCommandPayload = SessionCommandsResponse["commands"][number];
+export type SessionTranscriptEntry = SessionTranscriptResponse["entries"][number];
+export type SessionTranscriptQuery = OperationQuery<"getSessionTranscript">;
+export type SessionStreamResponse = OperationResponse<"streamSession", 200>;
+export type TranscriptSnapshotPayload = components["schemas"]["TranscriptSnapshotPayload"];
+export type TranscriptDeltaPayload = components["schemas"]["TranscriptDeltaPayload"];
+/** A slow watcher was shed; the server replays `after_sequence..through_sequence` on the same stream. */
+export type SessionConsumerDegradedPayload =
+  components["schemas"]["SessionConsumerDegradedPayload"];
+/** Parent-stream roster frames (`_dx.md` Live updates): the snapshot after subscribe, then row changes. */
+export type SubagentsSnapshotPayload = components["schemas"]["SubagentsSnapshotEvent"];
+export type SubagentUpdatedPayload = components["schemas"]["SubagentUpdatedEvent"];
+export type SessionBadge = SessionPayload["badge"];
+/** Sanitized pending question / permission projection embedded on session payloads. */
+export type SessionPendingInteraction = SessionPayload["pending_interactions"][number];
+/** Exact cross-workspace attention counts — the only count source for badge and title. */
+export type SessionAttentionSummary = OperationResponse<"getSessionAttentionSummary", 200>;
+export type SessionPresenceRequest = OperationRequestBody<"updateSessionPresence">;
+export type SessionPresenceLease = OperationResponse<"updateSessionPresence", 200>;
+export type SessionAttachResponse = OperationResponse<"attachSession", 200>;
+export type SessionRecapResponse = OperationResponse<"getSessionRecap", 200>;
+export type SessionRecapPayload = SessionRecapResponse["recap"];
+export type SessionUsageResponse = OperationResponse<"getSessionUsage", 200>;
+export type SessionUsagePayload = SessionUsageResponse["usage"];
+export type SessionContextPayload = SessionUsagePayload["context"];
+export type SessionUsageTurnsResponse = OperationResponse<"getSessionUsageTurns", 200>;
+export type TranscriptMarkerPayload = SessionRecapPayload["recent_markers"][number];
+export type SessionRepairResponse = OperationResponse<"repairSession", 200>;
+export type SessionRepairPayload = SessionRepairResponse["repair"];
+export type SessionRepairQuery = OperationQuery<"repairSession">;
+export type SessionAttachment = OperationResponse<"uploadSessionAttachment", 201>["attachment"];
+export type SessionPromptAttachment = NonNullable<
+  OperationRequestBody<"sendSessionPrompt">["attachments"]
+>[number];
+
+export interface SessionBusyInputDraft {
+  attachments: SessionPromptAttachment[];
+  message: string;
+}
+
+/**
+ * A busy-send verb. Resolves with the daemon's disposition envelope so the
+ * composer can answer inline; a refusal rejects with the reason and never
+ * consumes the draft.
+ */
+export type SessionBusyInputHandler = (
+  draft: SessionBusyInputDraft
+) => void | Promise<SessionSendOutcome | void>;
+
+export interface SessionPromptRequest {
+  attachments?: SessionPromptAttachment[];
+  expected_turn_id?: string;
+  idempotency_key: string;
+  message_id: string;
+  messages: Array<{
+    id: string;
+    parts: Array<{ text?: string; type: string }>;
+    role: "user";
+  }>;
+  mode?: SessionBusyInputAction;
+  runtime?: OperationRequestBody<"sendSessionPrompt">["runtime"];
+}
+export type SessionPromptResponse =
+  | OperationResponse<"sendSessionPrompt", 200>
+  | OperationResponse<"sendSessionPrompt", 202>;
+/**
+ * The daemon's stop answer: 202 acceptance (`wait: false`), or the settled
+ * verified/unverified outcome and the already-stopped case (200).
+ */
+export type SessionStopResult =
+  | OperationResponse<"stopSession", 200>
+  | OperationResponse<"stopSession", 202>;
+/**
+ * The daemon's answer to a turn stop: `canceled` (a turn was in flight and the
+ * stop ladder owns it now) or `nothing-in-flight` (the turn had already
+ * finished when the stop arrived — US-009.EC-2).
+ */
+export type SessionPromptCancelResult = OperationResponse<"cancelSessionPrompt", 200>;
+/**
+ * The 202 receipt for a compaction request (experimental). It only says the
+ * agent's compaction command was accepted; the outcome arrives as the session's
+ * Compaction item and usage markers.
+ */
+export type SessionCompactionReceipt = OperationResponse<"compactSession", 202>;
+type SessionPromptEnvelope = Extract<SessionPromptResponse, { prompt: unknown }>;
+export type SessionPromptPayload = SessionPromptEnvelope["prompt"];
+export type SessionGoalCommandResult = NonNullable<SessionPromptPayload["goal"]>;
+export type SessionPromptResult = SessionPromptPayload | SessionGoalCommandResult;
+/**
+ * The daemon found the session idle at admission and started a direct turn,
+ * answering with the prompt event stream instead of the JSON envelope. The
+ * stream is released so the live tail owns the turn (SD-010).
+ */
+export interface SessionPromptDirectTurn {
+  direct_turn: true;
+  idempotency_key: string;
+  message_id: string;
+}
+export type SessionPromptSendResult = SessionPromptResult | SessionPromptDirectTurn;
+export type SessionInputsResponse = OperationResponse<"listSessionInputs", 200>;
+export type SessionInputPayload = SessionInputsResponse["inputs"][number];
+/** The daemon-stamped sender of a session message (`PromptOriginMeta`); absent for operator input. */
+export type PromptOriginPayload = NonNullable<SessionInputPayload["origin"]>;
+/** Daemon-owned queue summary riding the queue list: how many are parked and the cap. */
+export type SessionQueueSummary = NonNullable<SessionInputsResponse["queue"]>;
+export type SessionInputClearResponse = OperationResponse<"clearSessionInputs", 200>;
+export type ReplaceSessionInputRequest = OperationRequestBody<"replaceSessionInput">;
+export type PromoteSessionInputRequest = OperationRequestBody<"promoteSessionInput">;
+export type SessionGoalResponse = OperationResponse<"getSessionGoal", 200>;
+export type SessionGoalCommandRequest = OperationRequestBody<"mutateSessionGoal">;
+export type SessionGoalSnapshot = NonNullable<SessionGoalResponse["goal"]>;
+export type SessionGoalContext = SessionGoalSnapshot["context"];
+export type SessionGoalStatus = SessionGoalSnapshot["status"];
+export type GoalPromptMeta = NonNullable<SessionEventPayload["goal"]>;
+
+export type CreateSessionParams = OperationRequestBody<"createSession">;
+export type ForkSessionToWorktreeParams = OperationRequestBody<"forkSessionToWorktree">;
+export type SessionApprovalResponse = OperationResponse<"approveSession", 200>;
+export type ApproveSessionParams = OperationRequestBody<"approveSession">;
+export type PermissionDecision = ApproveSessionParams["decision"];
+
+export type SessionInteractionsResponse = OperationResponse<"listSessionInteractions", 200>;
+/**
+ * One restart-durable interaction record as the daemon lists it. Same shape as
+ * the `pending_interactions` rows embedded on the session payload, read here
+ * with an explicit status filter so settled decisions (expired at a daemon
+ * restart, timed out, resolved) stay reachable after the live projection drops them.
+ */
+export type SessionInteractionRecord = SessionInteractionsResponse["interactions"][number];
+export type SessionInteractionStatus = NonNullable<
+  NonNullable<OperationQuery<"listSessionInteractions">>["status"]
+>;
+export type ClarificationsResponse = OperationResponse<"listSessionClarifications", 200>;
+/** Live pending clarification projection — the exact authority for pending truth. */
+export type ClarificationPending = ClarificationsResponse["clarifications"][number];
+export type AnswerClarificationBody = OperationRequestBody<"answerSessionClarification">;
+export type AnswerClarificationResult = OperationResponse<"answerSessionClarification", 200>;
+export type ToolArtifactPage = OperationResponse<"readToolArtifact", 200>;
+export type ToolArtifactRef = ToolArtifactPage["artifact"];
+
+export type ClarifyStatus = "pending" | "resolved" | "timed_out" | "canceled";
+
+export interface ClarifyEventAnswer {
+  choice: number | null;
+  text: string;
+  fallback: boolean;
+}
+
+export interface ClarifyEventRequest {
+  request_id: string;
+  workspace_id?: string;
+  session_id?: string;
+  agent_name?: string;
+  question: string;
+  choices?: string[];
+  asked_at?: string;
+  deadline?: string | null;
+}
+
+/**
+ * Parsed view of a durable `clarify` transcript event. The pending card renders from the live GET,
+ * never from this payload; terminal receipts are truthful historical evidence read from it.
+ */
+export interface ClarifyEventView {
+  status: ClarifyStatus;
+  requestId: string;
+  request: ClarifyEventRequest;
+  answer: ClarifyEventAnswer | null;
+  at?: string;
+}
+
+export interface ToolUseResult {
+  stdout?: string;
+  stderr?: string;
+  filePath?: string;
+  content?: string;
+  structuredPatch?: unknown[];
+  error?: string;
+  preview?: string;
+  truncated?: boolean;
+  artifacts?: ToolArtifactRef[];
+  rawOutput?: unknown;
+}
+
+export interface TokenUsagePayload {
+  meta?: Record<string, unknown>;
+  sequence?: number;
+  turn_id?: string;
+  input_tokens?: number;
+  output_tokens?: number;
+  total_tokens?: number;
+  thought_tokens?: number;
+  cache_read_tokens?: number;
+  cache_write_tokens?: number;
+  context_used?: number;
+  context_size?: number;
+  cost_amount?: number;
+  cost_currency?: string;
+  timestamp?: string;
+}
+
+export interface RuntimeActivityPayload {
+  turn_id?: string;
+  turn_source?: string;
+  turn_started_at?: string | null;
+  deadline_at?: string | null;
+  last_activity_at?: string | null;
+  last_activity_kind?: string;
+  last_activity_detail?: string;
+  current_tool?: string;
+  tool_call_id?: string;
+  last_progress_at?: string | null;
+  iteration_current?: number;
+  iteration_max?: number;
+  idle_seconds?: number;
+  elapsed_ms: number;
+  elapsed_seconds?: number;
+}
+
+export interface PromptDeliveryPayload {
+  turn_id: string;
+  sent_at: string;
+  estimate: string;
+  /** `null` when the delivery sent no sections (a literal maintenance prompt). */
+  spans: Array<{
+    key: string;
+    kind: string;
+    bytes: number;
+    tokens?: number | null;
+    delivery?: string;
+    name?: string;
+    unchanged?: boolean;
+    startup_dedup?: boolean;
+    hook_modified?: boolean;
+  }> | null;
+}
+
+export interface AgentEventPayload {
+  type: string;
+  session_id?: string;
+  turn_id?: string;
+  message_id?: string;
+  request_id?: string;
+  timestamp?: string;
+  text?: string;
+  title?: string;
+  tool_call_id?: string;
+  stop_reason?: string;
+  action?: string;
+  resource?: string;
+  decision?: string;
+  /** Who settled a permission ask: `operator`, `timeout`, `policy`, `rule`, `repeat_denied`, … */
+  resolved_by?: string;
+  error?: string;
+  failure?: SessionFailurePayload;
+  provider_error?: ProviderErrorDiagnosticPayload | null;
+  usage?: TokenUsagePayload;
+  delivery?: PromptDeliveryPayload;
+  runtime?: RuntimeActivityPayload;
+  marker?: TranscriptMarkerPayload;
+  goal?: GoalPromptMeta;
+  raw?: unknown;
+}
+
+export interface CompozyPermissionData extends AgentEventPayload {
+  request_id: string;
+  raw?: Record<string, unknown>;
+}
+
+/**
+ * One observed agent compaction, carried by a `data-compozy-compaction` transcript
+ * part (`internal/transcript/projection_compaction.go`). `status` is
+ * `in_progress | completed | failed | cancelled` or a vendor value passed through
+ * verbatim; the item updates in place under the same `compaction_id`.
+ */
+export interface SessionReportData {
+  report_id: string;
+  instance_id: string;
+  kind: string;
+  payload: unknown;
+  created_at: string;
+}
+
+export interface SessionCompactionItemData {
+  kind: "compaction";
+  compaction_id: string;
+  status: string;
+  summary?: string;
+  error?: string;
+  started_at: string;
+  ended_at?: string;
+}
+
+export interface SessionDataParts extends Record<string, unknown> {
+  "compozy-event": AgentEventPayload;
+  "compozy-permission": CompozyPermissionData;
+  "compozy-compaction": SessionCompactionItemData;
+  "compozy-report": SessionReportData;
+}
+
+export type SessionMessage = AIUIMessage<unknown, SessionDataParts>;
+export type TranscriptMessage = SessionMessage;
+export type TranscriptMessageRole = TranscriptMessage["role"];
+
+export type NormalizedSessionTranscriptEntry = Omit<SessionTranscriptEntry, "message"> & {
+  message: SessionMessage;
+};
+
+export type NormalizedSessionTranscriptResponse = Omit<SessionTranscriptResponse, "entries"> & {
+  entries: NormalizedSessionTranscriptEntry[];
+};
+
+/** Frontend-owned stream cursor added to the bounded REST transcript page. */
+export type SessionTranscriptPage = NormalizedSessionTranscriptResponse & {
+  cursor: number;
+};
+
+export type UIMessageRole = "user" | "assistant" | "tool_call" | "tool_result" | "system" | "diff";
+
+export interface UIMessageDiff {
+  language?: string;
+  content: string;
+  path?: string;
+  additions?: number;
+  removals?: number;
+}
+
+export interface UIMessage {
+  id: string;
+  role: UIMessageRole;
+  content: string;
+  toolName?: string;
+  toolTitle?: string;
+  toolInput?: Record<string, unknown>;
+  toolResult?: ToolUseResult;
+  toolError?: boolean;
+  thinking?: string;
+  thinkingComplete?: boolean;
+  isStreaming?: boolean;
+  diff?: UIMessageDiff;
+  timestamp: number;
+}
+
+export interface PermissionRequest {
+  requestId: string;
+  /** Stable runtime identity when the permission originated from a CompozyOS native tool. */
+  toolId?: string;
+  toolName: string;
+  toolInput: Record<string, unknown>;
+  action: string;
+  resource: string;
+  supportedDecisions?: string[];
+  turnId?: string;
+  toolCallId?: string;
+}
+
+/*
+ * Navigation reads over the materialized transcript (S8/S9): the bounded
+ * full-history literal search and the operator-message outline. `sequence` is
+ * the entry's stable start cursor — the identity for matches, ticks and jumps.
+ */
+export type SessionTranscriptSearchResponse = OperationResponse<"searchSessionTranscript", 200>;
+export type SessionTranscriptSearchMatch = SessionTranscriptSearchResponse["matches"][number];
+export type SessionTranscriptSearchQuery = OperationQuery<"searchSessionTranscript">;
+export type SessionTranscriptOutlineResponse = OperationResponse<
+  "getSessionTranscriptOutline",
+  200
+>;
+export type SessionTranscriptOutlineEntry = SessionTranscriptOutlineResponse["entries"][number];
+
+/* Session folders and manual order (issue #781): daemon-owned sidebar layout. */
+export type SessionFoldersResponse = OperationResponse<"listSessionFolders", 200>;
+export type SessionFolderPayload = SessionFoldersResponse["folders"][number];
+export type ReorderSessionsRequest = OperationRequestBody<"reorderSessions">;
+
+/* Workspace folders (issue #1044): one profile's grouping and order of projects in All projects. */
+export type WorkspaceLayoutResponse = OperationResponse<"getWorkspaceLayout", 200>;
+export type WorkspaceFolderPayload = WorkspaceLayoutResponse["folders"][number];
+export type WorkspacePlacementPayload = WorkspaceLayoutResponse["placements"][number];

@@ -1,0 +1,26 @@
+package events
+
+const (
+	ComponentAutomation   = "automation"
+	ComponentCmdPalette   = "cmd_palette"
+	ComponentConfig       = "config"
+	ComponentExtension    = "extension"
+	ComponentGateway      = "gateway"
+	ComponentHarness      = "harness"
+	ComponentHook         = "hook"
+	ComponentMarketplace  = "marketplace"
+	ComponentMCP          = "mcp"
+	ComponentNotification = "notification"
+	ComponentProvider     = "provider"
+	ComponentProfile      = "profile"
+	ComponentReliability  = "reliability"
+	ComponentRole         = "role"
+	ComponentScheduler    = "scheduler"
+	ComponentSession      = "session"
+	ComponentSkill        = "skill"
+	ComponentTask         = "task"
+	ComponentTools        = "tools"
+	ComponentTranscript   = "transcript"
+	ComponentWorkspace    = "workspace"
+	ComponentWorktree     = "worktree"
+)

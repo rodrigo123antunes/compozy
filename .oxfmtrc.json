@@ -13,18 +13,27 @@
     "ignorePatterns": [
         "**/node_modules/**",
         "**/dist/**",
+        "web/dist-proto/**",
         "**/bin/**",
         "**/.turbo/**",
         "**/.tmp/**",
         "**/coverage/**",
         "**/*.min.js",
         ".resources/**",
-        ".peer-reviews/**",
+        ".old_project/**",
         ".claude/skills/**",
         ".agents/skills/**",
+        "internal/bridges/testdata/slack-manifest-schema-v0.5.0/manifest.schema.1.0.0.json",
+        "internal/extension/testdata/client-plugins/open-design/**",
+        "internal/extension/testdata/client-plugins/loop-engineering/**",
+        "internal/tools/builtin/testdata/native-tool-catalog.json",
+        "catalog/v3/*.json",
+        "openapi/compozy.json",
+        "**/routeTree.gen.ts",
+        "extensions/open-design/lint.gen.mjs",
         ".compozy/tasks/**",
-        ".compozy/runs/**",
-        "docs/design/**",
-        "skills/**"
+        "docs/**",
+        "packages/launch-video/.agents/**",
+        "packages/launch-video/research/**"
     ]
 }

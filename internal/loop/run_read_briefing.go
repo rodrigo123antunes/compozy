@@ -1,0 +1,180 @@
+package loop
+
+import (
+	"cmp"
+	"context"
+	"encoding/json"
+	"fmt"
+	"slices"
+	"strings"
+	"time"
+
+	"github.com/compozy/compozy/internal/loop/dsl"
+)
+
+func (s *computedRunReadService) Briefing(
+	ctx context.Context,
+	workspaceID string,
+	runID RunID,
+) (Briefing, error) {
+	ws := WorkspaceID(workspaceID)
+	source, err := s.loadRosterSource(ctx, ws, runID)
+	if err != nil {
+		return Briefing{}, err
+	}
+	roster, err := projectCompleteRoster(&source, NodeStateFilterAll, 0)
+	if err != nil {
+		return Briefing{}, err
+	}
+	requests, err := s.loadAllPendingRequests(ctx, ws, runID)
+	if err != nil {
+		return Briefing{}, fmt.Errorf("read loop briefing requests: %w", err)
+	}
+	artifacts, err := s.loadArtifacts(ctx, ws, runID, source.Graph, source.Outputs)
+	if err != nil {
+		return Briefing{}, err
+	}
+	approvalWaitingSince, err := s.loadApprovalWaitingSince(ctx, ws, source.Run)
+	if err != nil {
+		return Briefing{}, err
+	}
+	return ProjectBriefing(&BriefingSource{
+		Graph:                source.Graph,
+		Outputs:              source.Outputs,
+		Run:                  source.Run,
+		Roster:               roster,
+		Requests:             requests,
+		Artifacts:            artifacts,
+		Outcome:              source.Outcome,
+		ApprovalWaitingSince: approvalWaitingSince,
+		Now:                  s.now(),
+	}), nil
+}
+
+func (s *computedRunReadService) loadApprovalWaitingSince(
+	ctx context.Context,
+	workspaceID WorkspaceID,
+	run Run,
+) (time.Time, error) {
+	if run.Status != StatusNeedsApproval && run.ActiveGateID == "" {
+		return time.Time{}, nil
+	}
+	summaries, err := s.store.ListLoopRunSummaries(ctx, workspaceID, []RunID{run.ID})
+	if err != nil {
+		return time.Time{}, fmt.Errorf("read loop approval opening: %w", err)
+	}
+	summary, ok := summaries[run.ID]
+	if !ok || summary.Attention == nil || summary.Attention.Kind != gateResultApprovalKey ||
+		summary.Attention.Since.IsZero() {
+		return time.Time{}, fmt.Errorf("read loop approval opening: durable approval attention is unavailable")
+	}
+	return summary.Attention.Since.UTC(), nil
+}
+
+func projectCompleteRoster(
+	source *RosterSource,
+	state NodeStateFilter,
+	generation int,
+) (RosterPage, error) {
+	query, err := normalizeRosterQuery(RosterQuery{State: state, Generation: generation})
+	if err != nil {
+		return RosterPage{}, err
+	}
+	return projectRoster(source, query)
+}
+
+func (s *computedRunReadService) loadAllPendingRequests(
+	ctx context.Context,
+	workspaceID WorkspaceID,
+	runID RunID,
+) ([]Request, error) {
+	query := RequestQuery{RunID: runID, Limit: 200}
+	requests := make([]Request, 0)
+	for {
+		page, err := s.store.ListRequests(ctx, workspaceID, query)
+		if err != nil {
+			return nil, err
+		}
+		requests = append(requests, page.Items...)
+		if page.NextCursor == "" {
+			return requests, nil
+		}
+		query.Cursor = page.NextCursor
+	}
+}
+
+func (s *computedRunReadService) loadArtifacts(
+	ctx context.Context,
+	workspaceID WorkspaceID,
+	runID RunID,
+	graph dsl.Graph,
+	outputs []GenerationOutput,
+) ([]RunArtifact, error) {
+	refs := outputRefs(outputs)
+	available := make(map[string]bool, len(refs))
+	if reader, ok := s.store.(OutputBlobAvailabilityReader); ok && len(refs) > 0 {
+		var err error
+		available, err = reader.ListAvailableLoopOutputRefs(ctx, workspaceID, runID)
+		if err != nil {
+			return nil, fmt.Errorf("read loop output availability: %w", err)
+		}
+	} else {
+		for _, ref := range refs {
+			available[ref] = true
+		}
+	}
+	return artifactsFromOutputs(graph, outputs, available), nil
+}
+
+func outputRefs(outputs []GenerationOutput) []string {
+	seen := make(map[string]bool)
+	refs := make([]string, 0, len(outputs))
+	for _, output := range outputs {
+		if output.OutputRef == "" || seen[output.OutputRef] {
+			continue
+		}
+		seen[output.OutputRef] = true
+		refs = append(refs, output.OutputRef)
+	}
+	return refs
+}
+
+func artifactsFromOutputs(graph dsl.Graph, outputs []GenerationOutput, available map[string]bool) []RunArtifact {
+	actions := make(map[string]bool, len(graph.Nodes))
+	for _, node := range graph.Nodes {
+		actions[string(node.ID)] = node.Class == dsl.NodeClassAction
+	}
+	outputs = slices.Clone(outputs)
+	slices.SortStableFunc(outputs, func(a, b GenerationOutput) int {
+		return cmp.Compare(b.Generation, a.Generation)
+	})
+	items := make([]RunArtifact, 0)
+	for _, output := range outputs {
+		if output.OutputRef == "" || outputRefRepresentsAbsentValue(output.OutputRef) ||
+			(!actions[output.NodeID] && output.ArtifactName == "" && output.OutputID == "") {
+			continue
+		}
+		availability := ArtifactPruned
+		// Small results live in the generation row itself; blob retention does not own them.
+		if json.Valid([]byte(output.OutputRef)) || available[output.OutputRef] {
+			availability = ArtifactAvailable
+			if output.Status == string(NodeStatePartial) {
+				availability = ArtifactPartial
+			}
+		}
+		name := strings.TrimSpace(output.ArtifactName)
+		if name == "" {
+			name = strings.TrimSpace(output.OutputID)
+		}
+		if name == "" {
+			name = fmt.Sprintf("%s (round %d, item %d)", output.NodeID, output.Generation, output.ItemIndex+1)
+		}
+		items = append(items, RunArtifact{
+			Name:         name,
+			Output:       output.OutputID,
+			Ref:          output.OutputRef,
+			Availability: availability,
+		})
+	}
+	return items
+}

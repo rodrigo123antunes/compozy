@@ -1,0 +1,61 @@
+---
+title: Getting Started
+description: Install CompozyOS, choose the desktop app or command path, run a real session end to end, and inspect the same runtime state from the browser.
+---
+
+Start by choosing the desktop app or the `compozy` command. Both operate the same daemon and durable
+runtime state, so you can move between them without creating a second installation.
+
+<OperatorNote>
+  Every step operates on the same local daemon and the same SQLite-backed history. Nothing here is a
+  demo or a simulation — the session you create in Quick Start is the one you inspect in the Web UI
+  page.
+</OperatorNote>
+
+## In this section
+
+<RouteList>
+  <RouteRow
+    href="/docs/getting-started/installation"
+    label="Install"
+    title="Install CompozyOS"
+    description="Install the desktop app for an interactive setup, or install the compozy command for a terminal-managed runtime."
+    meta="Step 1"
+  />
+  <RouteRow
+    href="/docs/getting-started/desktop-app"
+    label="Desktop"
+    title="Start with the desktop app"
+    description="Attach to an existing runtime or provision the verified bundled runtime offline, then learn the update and recovery paths."
+    meta="Interactive"
+  />
+  <RouteRow
+    href="/docs/getting-started/quick-start"
+    label="Run"
+    title="Start the daemon and drive a session"
+    description="Use this page to start the daemon, create a real session, attach while it is active, inspect its durable history, and stop it during cleanup."
+    meta="Step 2"
+  />
+  <RouteRow
+    href="/docs/getting-started/first-agent"
+    label="Author"
+    title="Your first custom agent"
+    description="Use this page to create one minimal AGENT.md definition, store it in the correct runtime path, and verify that CompozyOS resolves it for the current workspace."
+    meta="Step 3"
+  />
+  <RouteRow
+    href="/docs/getting-started/web-ui"
+    label="Observe"
+    title="The same runtime from the browser"
+    description="Use this page to open the web UI, inspect the session you already created, and compare the browser view with the same daemon state you saw in the CLI."
+    meta="Step 4"
+  />
+</RouteList>
+
+## Where to go next
+
+Once the daemon is running and you have created a session, the rest of the documentation is
+organized by runtime concept rather than by sequence. [Sessions](/docs/sessions) covers the
+durable unit you just created, [Agents](/docs/agents) covers definition resolution and
+provider supervision, and [Configuration](/docs/configuration) covers which file or
+environment variable to change when you need to alter the behavior you saw here.

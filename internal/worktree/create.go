@@ -1,0 +1,437 @@
+package worktree
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"os"
+	"path/filepath"
+	"strings"
+
+	"github.com/compozy/compozy/internal/diagnostics"
+	"github.com/compozy/compozy/internal/redact"
+)
+
+type CreateOptions struct {
+	// ID assigns the new row's id; empty generates one. A caller that must find the
+	// worktree after a daemon restart, such as a session move, records it first.
+	ID             string
+	ProfileID      string
+	Name           string
+	Branch         string
+	BaseRef        string
+	ExistingBranch string
+	Path           string
+	Origin         Origin
+	RunID          string
+	RunNamespace   string
+}
+
+type RunWorktreeRequest struct {
+	BaseRef   string
+	ProfileID string
+	TaskSlug  string
+	RunID     string
+}
+
+func (s *Service) Create(ctx context.Context, workspaceID string, options CreateOptions) (*Worktree, error) {
+	return s.create(ctx, workspaceID, options)
+}
+
+func (s *Service) CancelCreate(ctx context.Context, workspaceID, ref string) error {
+	item, err := s.store.Get(ctx, workspaceID, ref)
+	if errors.Is(err, ErrNotFound) {
+		return ErrNotFound
+	}
+	if err != nil {
+		return fmt.Errorf("worktree: read create cancellation target: %w", err)
+	}
+	if item == nil {
+		return ErrNotFound
+	}
+	worktreeID := item.ID
+	canceled, err := s.cancelAcceptedCreation(ctx, workspaceID, worktreeID)
+	if canceled {
+		return err
+	}
+	if item.State != StatePending {
+		return ErrNotPending
+	}
+	workspace, err := s.resolveWorkspace(ctx, workspaceID)
+	if err != nil {
+		return err
+	}
+	commonDir, err := s.commonDir(ctx, workspace.Root)
+	if err != nil {
+		return err
+	}
+	release, err := s.locks.Acquire(ctx, commonDir)
+	if err != nil {
+		return err
+	}
+	defer release()
+	item, err = s.store.Get(ctx, workspaceID, worktreeID)
+	if errors.Is(err, ErrNotFound) {
+		return ErrNotFound
+	}
+	if err != nil {
+		return fmt.Errorf("worktree: reread create cancellation target: %w", err)
+	}
+	if item == nil {
+		return ErrNotFound
+	}
+	if item.State != StatePending {
+		return ErrNotPending
+	}
+	rollbackErr := s.rollbackCreate(context.WithoutCancel(ctx), workspace, commonDir, *item)
+	if rollbackErr != nil {
+		// Boot reconciliation retries the rollback the failed row records as incomplete.
+		return errors.Join(rollbackErr, s.recordCreateFailure(
+			context.WithoutCancel(ctx), *item, context.Canceled, rollbackErr,
+		))
+	}
+	if deleteErr := s.store.DeletePending(context.WithoutCancel(ctx), workspaceID, worktreeID); deleteErr != nil {
+		return deleteErr
+	}
+	s.invalidateDiscovery(workspaceID)
+	s.emit(ctx, EventCreationCanceled, *item)
+	return nil
+}
+
+func (s *Service) MaterializeForRun(
+	ctx context.Context,
+	workspaceID string,
+	request RunWorktreeRequest,
+) (*Worktree, error) {
+	workspace, err := s.resolveWorkspace(ctx, workspaceID)
+	if err != nil {
+		return nil, err
+	}
+	settings, _ := s.worktreeSettings(workspace)
+	name := RunWorktreeName(request.TaskSlug, request.RunID)
+	branch := RunBranchName(settings.RunBranchNamespace, request.TaskSlug, request.RunID)
+	item, err := s.create(ctx, workspaceID, CreateOptions{
+		ProfileID: request.ProfileID,
+		Name:      name, Branch: branch, Origin: OriginPerRun, RunID: request.RunID,
+		RunNamespace: settings.RunBranchNamespace, BaseRef: request.BaseRef,
+	})
+	if err != nil {
+		if errors.Is(err, ErrDeniedByHook) {
+			return nil, err
+		}
+		return nil, fmt.Errorf(
+			"%w: %s",
+			ErrPerRunMaterialization,
+			diagnostics.RedactAndBound(err.Error(), setupDiagnosticLimit),
+		)
+	}
+	return item, nil
+}
+
+func (s *Service) create(ctx context.Context, workspaceID string, options CreateOptions) (*Worktree, error) {
+	workspace, item, commonDir, err := s.prepareCreation(ctx, workspaceID, options)
+	if err != nil {
+		return nil, err
+	}
+	release, err := s.locks.Acquire(ctx, commonDir)
+	if err != nil {
+		return nil, err
+	}
+	defer release()
+
+	if err := s.insertPendingUnderLock(ctx, workspace, commonDir, &item, options); err != nil {
+		return nil, err
+	}
+	if err := s.materializePending(ctx, workspace, &item, options); err != nil {
+		// The caller receives this error, so a complete rollback frees the name
+		// for an exact retry.
+		cleanupCtx := context.WithoutCancel(ctx)
+		rollbackErr := s.rollbackCreate(cleanupCtx, workspace, commonDir, item)
+		if rollbackErr != nil {
+			// Boot reconciliation retries the rollback the failed row records as incomplete.
+			return nil, errors.Join(err, rollbackErr, s.recordCreateFailure(cleanupCtx, item, err, rollbackErr))
+		}
+		deleteErr := s.store.DeletePending(cleanupCtx, item.WorkspaceID, item.ID)
+		s.logCreateFailure(cleanupCtx, item, err, nil, deleteErr)
+		if deleteErr == nil {
+			s.publishCatalogEvent(CatalogEventDeleted, item)
+		}
+		return nil, errors.Join(err, deleteErr)
+	}
+	s.invalidateDiscovery(workspaceID)
+	s.emit(ctx, EventCreated, item)
+	return &item, nil
+}
+
+func (s *Service) prepareCreation(
+	ctx context.Context,
+	workspaceID string,
+	options CreateOptions,
+) (Workspace, Worktree, string, error) {
+	if strings.TrimSpace(options.ProfileID) == "" {
+		return Workspace{}, Worktree{}, "", refusal(ErrRefInvalid, "profile_id is required")
+	}
+	if _, err := s.capability.Check(ctx); err != nil {
+		return Workspace{}, Worktree{}, "", err
+	}
+	workspace, err := s.resolveWorkspace(ctx, workspaceID)
+	if err != nil {
+		return Workspace{}, Worktree{}, "", err
+	}
+	item, err := s.prepareCreate(ctx, workspace, options)
+	if err != nil {
+		return Workspace{}, Worktree{}, "", err
+	}
+	if err := s.refuseRemovingBranch(ctx, workspace.ID, item.Branch); err != nil {
+		return Workspace{}, Worktree{}, "", err
+	}
+	commonDir, err := s.commonDir(ctx, workspace.Root)
+	if err != nil {
+		return Workspace{}, Worktree{}, "", err
+	}
+	return workspace, item, commonDir, nil
+}
+
+func (s *Service) insertPendingUnderLock(
+	ctx context.Context,
+	workspace Workspace,
+	commonDir string,
+	item *Worktree,
+	options CreateOptions,
+) error {
+	if err := s.validateCreateUnderLock(ctx, workspace, commonDir, *item, options); err != nil {
+		return err
+	}
+	if err := s.resolvePendingBranch(ctx, workspace.Root, item, options); err != nil {
+		return err
+	}
+	if err := s.dispatchGate(ctx, EventPreCreate, eventPayloadFromWorktree(*item, workspace.Root)); err != nil {
+		return err
+	}
+	if err := s.store.Insert(ctx, *item); err != nil {
+		return mapInsertError(err, *item)
+	}
+	s.publishCatalogEvent(CatalogEventUpserted, *item)
+	return nil
+}
+
+func (s *Service) refuseRemovingBranch(ctx context.Context, workspaceID, branch string) error {
+	rows, err := s.store.List(ctx, workspaceID)
+	if err != nil {
+		return fmt.Errorf("worktree: inspect branch removal fence: %w", err)
+	}
+	for _, row := range rows {
+		if row.State == StateRemoving && row.Branch == branch {
+			return refusal(ErrBranchHeld, row.Path)
+		}
+	}
+	return nil
+}
+
+func (s *Service) prepareCreate(
+	ctx context.Context,
+	workspace Workspace,
+	options CreateOptions,
+) (Worktree, error) {
+	name := strings.TrimSpace(options.Name)
+	if name == "" {
+		rows, err := s.store.List(ctx, workspace.ID)
+		if err != nil {
+			return Worktree{}, fmt.Errorf("worktree: list names: %w", err)
+		}
+		taken := make(map[string]struct{}, len(rows))
+		for _, row := range rows {
+			taken[row.Name] = struct{}{}
+		}
+		name = GenerateName(func(candidate string) bool { _, exists := taken[candidate]; return exists })
+	}
+	names := DeriveNames(name)
+	if existing, getErr := s.store.Get(ctx, workspace.ID, names.Directory); getErr == nil && existing != nil {
+		return Worktree{}, refusal(ErrNameTaken, names.Directory)
+	} else if getErr != nil && !errors.Is(getErr, ErrNotFound) {
+		return Worktree{}, fmt.Errorf("worktree: check name availability: %w", getErr)
+	}
+	branch := strings.TrimSpace(options.Branch)
+	if options.ExistingBranch != "" {
+		branch = strings.TrimSpace(options.ExistingBranch)
+	}
+	if branch == "" {
+		branch = names.Branch
+	}
+	path := strings.TrimSpace(options.Path)
+	_, placementRoot := s.worktreeSettings(workspace)
+	if path == "" {
+		path = filepath.Join(placementRoot, SanitizeName(workspace.Name), names.Directory)
+	}
+	path, err := filepath.Abs(filepath.Clean(path))
+	if err != nil {
+		return Worktree{}, fmt.Errorf("worktree: resolve create path: %w", err)
+	}
+	path, err = canonicalFuturePath(path)
+	if err != nil {
+		if options.Path == "" {
+			return Worktree{}, refusal(ErrConfigInvalid, "worktrees.root cannot resolve the derived path: "+err.Error())
+		}
+		return Worktree{}, refusal(ErrPathExists, "explicit path cannot be resolved: "+err.Error())
+	}
+	id := strings.TrimSpace(options.ID)
+	if id == "" {
+		if id, err = s.newID("wt"); err != nil {
+			return Worktree{}, err
+		}
+	}
+	origin := options.Origin
+	if origin == "" {
+		origin = OriginManual
+	}
+	now := s.now().UTC()
+	return Worktree{
+		ProfileID: strings.TrimSpace(options.ProfileID),
+		ID:        id, WorkspaceID: workspace.ID, Name: names.Directory, Branch: branch, Path: path,
+		State: StatePending, Origin: origin, SetupState: SetupNone, BaseRef: strings.TrimSpace(options.BaseRef),
+		RunID: strings.TrimSpace(options.RunID), RunNamespace: strings.TrimSpace(options.RunNamespace),
+		CreatedAt: now, UpdatedAt: now,
+	}, nil
+}
+
+func (s *Service) validateCreateUnderLock(
+	ctx context.Context,
+	workspace Workspace,
+	commonDir string,
+	item Worktree,
+	options CreateOptions,
+) error {
+	if existing, getErr := s.store.Get(ctx, workspace.ID, item.Name); getErr == nil && existing != nil {
+		return refusal(ErrNameTaken, item.Name)
+	} else if getErr != nil && !errors.Is(getErr, ErrNotFound) {
+		return fmt.Errorf("worktree: recheck name availability: %w", getErr)
+	}
+	if _, err := os.Lstat(item.Path); err == nil {
+		return refusal(ErrPathExists, item.Path)
+	} else if !errors.Is(err, os.ErrNotExist) {
+		return fmt.Errorf("worktree: inspect create path: %w", err)
+	}
+	if err := s.validateCreatePath(ctx, workspace, item.Path, options.Path != "", item.ID); err != nil {
+		return err
+	}
+	entries, err := s.readWorktreeList(ctx, workspace.Root, commonDir)
+	if err != nil {
+		return err
+	}
+	for _, entry := range entries {
+		if entry.Branch != item.Branch {
+			continue
+		}
+		if entry.Main {
+			return refusal(ErrBranchCheckedOutAtRoot, item.Branch)
+		}
+		return refusal(ErrBranchHeld, entry.Path)
+	}
+	ref := "refs/heads/" + item.Branch
+	_, _, branchProbeErr := s.runner.Run(ctx, workspace.Root, "show-ref", "--verify", "--quiet", ref)
+	if options.ExistingBranch != "" {
+		if branchProbeErr != nil {
+			return refusal(ErrBaseRefNotFound, item.Branch)
+		}
+	} else if branchProbeErr == nil {
+		return refusal(ErrBranchHeld, item.Branch)
+	}
+	if _, stderr, err := s.runner.Run(ctx, workspace.Root, "rev-parse", "--verify", "HEAD"); err != nil {
+		return refusal(ErrRepoHasNoCommits, diagnostics.RedactAndBound(string(stderr), 2048))
+	}
+	return nil
+}
+
+func (s *Service) materializePending(
+	ctx context.Context,
+	workspace Workspace,
+	item *Worktree,
+	options CreateOptions,
+) error {
+	_, placementRoot := s.worktreeSettings(workspace)
+	explicitPath := options.Path != ""
+	if err := s.setPending(ctx, item, PhaseBranch); err != nil {
+		return err
+	}
+	if err := s.ensurePlacementParent(ctx, workspace, *item, placementRoot, explicitPath); err != nil {
+		return err
+	}
+	if item.CreatedBranch {
+		if err := s.revalidateMutationPath(ctx, workspace, *item, placementRoot, explicitPath); err != nil {
+			return err
+		}
+		if _, stderr, err := s.runner.Run(ctx, workspace.Root, "branch", item.Branch, item.BaseRef); err != nil {
+			return refusal(ErrBaseRefNotFound, diagnostics.RedactAndBound(string(stderr), 2048))
+		}
+	}
+	if err := s.setPending(ctx, item, PhaseCheckout); err != nil {
+		return err
+	}
+	if err := s.validateCreatePath(ctx, workspace, item.Path, options.Path != "", item.ID); err != nil {
+		return err
+	}
+	if err := s.addCheckout(ctx, workspace, *item); err != nil {
+		return err
+	}
+	gitDir, err := s.resolveGitDir(ctx, item.Path)
+	if err != nil {
+		return err
+	}
+	item.GitDir = gitDir
+	if err := s.recordPendingBranchBase(ctx, workspace, item, placementRoot, explicitPath); err != nil {
+		return err
+	}
+	if err := s.setPending(ctx, item, PhaseCopy); err != nil {
+		return err
+	}
+	if err := s.copyBootstrapFiles(ctx, workspace, *item, explicitPath); err != nil {
+		return err
+	}
+	if err := s.setPending(ctx, item, PhaseSetup); err != nil {
+		return err
+	}
+	setupState, setupError := s.runSetup(ctx, workspace, *item, explicitPath)
+	completedAt := s.now().UTC()
+	if err := s.store.CompleteCreate(ctx, item.WorkspaceID, item.ID, setupState, setupError, completedAt); err != nil {
+		return fmt.Errorf("worktree: complete creation: %w", err)
+	}
+	item.State, item.PendingPhase = StateReady, PhaseNone
+	item.SetupState, item.SetupError = setupState, setupError
+	item.UpdatedAt = completedAt
+	if setupState == SetupFailed {
+		s.emit(ctx, EventSetupFailed, *item)
+	}
+	return nil
+}
+
+func (s *Service) setPending(ctx context.Context, item *Worktree, phase PendingPhase) error {
+	item.PendingPhase = phase
+	item.UpdatedAt = s.now().UTC()
+	err := s.store.UpdatePending(ctx, item.WorkspaceID, item.ID, PendingUpdate{
+		Phase: phase, Branch: item.Branch, GitDir: item.GitDir, BaseRef: item.BaseRef,
+		CreatedBranch: item.CreatedBranch, RunNamespace: item.RunNamespace, CreatedHead: item.CreatedHead,
+	})
+	if err == nil {
+		s.publishCatalogEvent(CatalogEventUpserted, *item)
+	}
+	return err
+}
+
+func mapInsertError(err error, item Worktree) error {
+	message := strings.ToLower(err.Error())
+	if strings.Contains(message, "path") {
+		return refusal(ErrPathExists, item.Path)
+	}
+	if strings.Contains(message, "name") || strings.Contains(message, "unique") {
+		return refusal(ErrNameTaken, item.Name)
+	}
+	return fmt.Errorf("worktree: insert pending row: %w", err)
+}
+
+func eventPayloadFromWorktree(item Worktree, workspaceRoot string) HookWorktree {
+	return HookWorktree{
+		ProfileID: item.ProfileID, WorktreeID: item.ID, WorkspaceID: item.WorkspaceID, Name: redact.String(item.Name),
+		WorkspaceRoot: redact.String(workspaceRoot), Branch: redact.String(item.Branch),
+		Path: redact.String(item.Path), Origin: item.Origin, RunID: item.RunID,
+	}
+}

@@ -1,0 +1,31 @@
+name: Catalog validation
+
+on:
+  pull_request:
+    paths:
+      - "catalog/**"
+      - "cmd/compozy-catalog/**"
+      - "internal/marketplace/**"
+      - ".github/workflows/catalog.yml"
+
+permissions:
+  contents: read
+
+jobs:
+  validate:
+    name: Validate curated feeds
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Set up Go
+        uses: ./.github/actions/setup-go
+        with:
+          go-version: "1.27.3"
+
+      - name: Test herdr bridge runtime
+        run: python3 -B -m unittest discover -s catalog/packages/herdr-bridge/tests -v
+
+      - name: Validate catalog documents
+        run: go run ./cmd/compozy-catalog validate ./catalog

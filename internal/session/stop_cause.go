@@ -1,0 +1,59 @@
+package session
+
+// StopCause records why a session stop was initiated.
+type StopCause int
+
+const (
+	CauseNone StopCause = iota
+	CauseCompleted
+	CauseFailed
+	CauseUserRequested
+	CauseShutdown
+	CauseHookDenied
+	CauseProcessExited
+	CauseTimeout
+	CauseClearConversation
+	CauseConversationRewind
+	// CauseSpawnTTLExpired asks the session manager to classify the stop while
+	// holding the session lifecycle lock, so prompt admission cannot race the
+	// TTL decision.
+	CauseSpawnTTLExpired
+	CauseInactivity
+	// CauseOwnerReleased ends a managed session's ownership without asserting
+	// that its task succeeded or that an operator canceled it.
+	CauseOwnerReleased
+)
+
+const stopDetailInactivity = "inactivity"
+
+// String returns the stable cause token used by public stop diagnostics.
+func (cause StopCause) String() string {
+	switch cause {
+	case CauseCompleted:
+		return "completed"
+	case CauseOwnerReleased:
+		return "owner_released"
+	case CauseFailed:
+		return string(BadgeFailed)
+	case CauseUserRequested:
+		return "user_requested"
+	case CauseShutdown:
+		return "shutdown"
+	case CauseHookDenied:
+		return "hook_denied"
+	case CauseProcessExited:
+		return "process_exited"
+	case CauseInactivity:
+		return stopDetailInactivity
+	case CauseTimeout:
+		return runtimeActivityKindTimeout
+	case CauseClearConversation:
+		return "clear_conversation"
+	case CauseConversationRewind:
+		return "conversation_rewind"
+	case CauseSpawnTTLExpired:
+		return "spawn_ttl_expired"
+	default:
+		return ""
+	}
+}

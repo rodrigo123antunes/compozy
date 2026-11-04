@@ -1,0 +1,38 @@
+{
+    "version": 2,
+    "agents": [
+        {
+            "name": "wake-creator",
+            "provider": "claude",
+            "permissions": "approve-all",
+            "prompt": "You observe delegated task wakes.",
+            "turns": [
+                {
+                    "name": "bootstrap",
+                    "match": {
+                        "turn_source": "user",
+                        "user_text": "noop"
+                    },
+                    "steps": [
+                        {
+                            "kind": "assistant",
+                            "chunks": ["noop"]
+                        }
+                    ]
+                },
+                {
+                    "name": "synthetic-wake",
+                    "match": {
+                        "turn_source": "synthetic"
+                    },
+                    "steps": [
+                        {
+                            "kind": "assistant",
+                            "chunks": ["wake observed"]
+                        }
+                    ]
+                }
+            ]
+        }
+    ]
+}

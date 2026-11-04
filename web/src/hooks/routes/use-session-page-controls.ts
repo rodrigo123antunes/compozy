@@ -1,0 +1,266 @@
+import { useEffect } from "react";
+import { useSelector } from "@xstate/store-react";
+import { useAui, useAuiState } from "@assistant-ui/react";
+import { useQueryClient } from "@tanstack/react-query";
+import { toast } from "@compozy/ui";
+
+import { useStoreBinding } from "@/hooks/use-store-binding";
+import {
+  cancelSessionPrompt,
+  invalidateSessionMutationQueries,
+  useClearSessionConversation,
+  useStopSession,
+  useSessionTranscriptThreadMessages,
+  canPromptSession,
+  isSessionRunning,
+  isUserControllableSession,
+  sessionBusyInputDefaultMode,
+  sessionSteerDelivery,
+  sessionStopAttention,
+  useUnarchiveSession,
+  type SessionPayload,
+  type SessionProcessPolicy,
+  type SessionPromptRuntimeSnapshot,
+} from "@/systems/session";
+import {
+  createSessionPageControlsLogic,
+  isStopRequestActive,
+  isStopRetryPending,
+  type SessionPageControlsState,
+} from "./session-page-controls-store";
+import { useSessionBusyInputControls } from "./use-session-busy-input-controls";
+
+interface UseSessionPageControlsOptions {
+  getRuntimeSnapshot?: () => SessionPromptRuntimeSnapshot | null;
+  /** Whether the hosting window owns live data; a background window reads its queue on return. */
+  liveDataEnabled?: boolean;
+  workspaceId?: string;
+}
+
+/** Coordinates session-page actions, preserving the displayed session ownership for lifecycle mutations. */
+export function useSessionPageControls(
+  sessionId: string,
+  session: SessionPayload,
+  options: UseSessionPageControlsOptions = {}
+) {
+  const aui = useAui();
+  const queryClient = useQueryClient();
+  const workspaceId = options.workspaceId ?? "";
+  const getRuntimeSnapshot = options.getRuntimeSnapshot;
+  const messages = useAuiState(state => state.thread.messages);
+  const transcriptMessages = useSessionTranscriptThreadMessages();
+  const isRunning = useAuiState(state => state.thread.isRunning);
+  const stopMutation = useStopSession();
+  const unarchiveMutation = useUnarchiveSession();
+  const clearMutation = useClearSessionConversation({ workspaceId });
+  const {
+    activeTurnId,
+    canPrompt,
+    daemonRunning,
+    effectiveRunning,
+    promptControlsAvailable,
+    userControllable,
+  } = sessionPromptFlags(session, isRunning);
+  const bindingKey = `${workspaceId}\u0000${sessionId}`;
+  const { store } = useStoreBinding(bindingKey, () =>
+    createSessionPageControlsLogic().createStore()
+  );
+  const controlsState = useSelector(store, snapshot => snapshot.context);
+  const sessionState = session.state;
+  // The daemon's lifecycle is the only thing that settles an accepted stop:
+  // every poll or invalidation result enters the store as evidence.
+  useEffect(() => {
+    store.trigger.lifecycleObserved({
+      running: daemonRunning,
+      state: sessionState,
+      turnId: activeTurnId,
+    });
+  }, [activeTurnId, daemonRunning, sessionState, store]);
+  const busyInput = useSessionBusyInputControls({
+    activeTurnId,
+    getRuntimeSnapshot,
+    liveDataEnabled: options.liveDataEnabled ?? true,
+    promptControlsAvailable,
+    sessionState,
+    sessionId,
+    store,
+    workspaceId,
+  });
+  const handleCancelPrompt = () => {
+    if (!promptControlsAvailable) {
+      return;
+    }
+
+    store.trigger.stopRequested({
+      execute: async () => {
+        // The daemon's verdict (`canceled` / `nothing-in-flight`) is the request's
+        // outcome and enters the store as evidence. The reread that carries the
+        // lifecycle evidence belongs to TanStack Query: a refetch failure lands
+        // in query state and is logged, never on the accepted stop.
+        const verdict = await cancelSessionPrompt(workspaceId, sessionId);
+        invalidateSessionMutationQueries(queryClient, workspaceId, sessionId).catch(error => {
+          console.error("Failed to reread the session after cancelling its prompt", error);
+        });
+        return verdict;
+      },
+      failureMessage: "Failed to stop the current prompt.",
+      scope: "turn",
+      turnId: activeTurnId,
+    });
+  };
+
+  const isUnarchiving = unarchiveMutation.isPending;
+  const isClearing = clearMutation.isPending;
+  const busyInputPending = busyInput.pending;
+  const { canClear, controlsBusy, isStopping, isStopRetrying, stopAttention } =
+    sessionControlsAvailability({
+      controlsState,
+      effectiveRunning,
+      hasConversationContent: messages.length > 0 || transcriptMessages.length > 0,
+      pending: { busyInputPending, isClearing, isUnarchiving },
+      session,
+      userControllable,
+    });
+
+  // Stop and its retry are one action with one owner. A retry of an
+  // unverified stop is the same session stop, waited on (`wait: true`) so the
+  // request resolves with the daemon's settled answer; that answer only says
+  // this request settled — the session read model still owns the truth.
+  const handleStop = (processes?: SessionProcessPolicy) => {
+    if (controlsBusy || !userControllable) {
+      return;
+    }
+
+    const retry = stopAttention !== null;
+    // A retry repeats the answer the stop it retries gave about running processes.
+    const policy = processes ?? (retry ? (controlsState.stopProcesses ?? undefined) : undefined);
+    store.trigger.stopRequested({
+      execute: () =>
+        stopMutation.mutateAsync({
+          id: sessionId,
+          workspace_id: session.workspace_id,
+          profile_name: session.profile_name,
+          wait: retry,
+          ...(policy ? { processes: policy } : {}),
+        }),
+      failureMessage: null,
+      ...(policy ? { processes: policy } : {}),
+      retry,
+      scope: "session",
+      turnId: activeTurnId,
+    });
+  };
+
+  const handleUnarchive = () => {
+    if (controlsBusy || !userControllable || session.archived_at === null) {
+      return;
+    }
+
+    unarchiveMutation.mutate(session, {
+      onError: error => {
+        console.error("Failed to unarchive session", error);
+        toast.error("Couldn't unarchive this session.");
+      },
+    });
+  };
+
+  const handleClear = () => {
+    if (controlsBusy || !userControllable || effectiveRunning) {
+      return;
+    }
+
+    clearMutation.mutate(sessionId, {
+      onSuccess: () => {
+        aui.thread.reset();
+      },
+    });
+  };
+
+  return {
+    canClear,
+    canPrompt,
+    canRetryStop: userControllable,
+    allowBusyInput: canPrompt,
+    busyInputDefaultMode: sessionBusyInputDefaultMode(session),
+    busyInputSteerDelivery: sessionSteerDelivery(session),
+    handleCancelPrompt,
+    handleClear,
+    handleClearQueue: busyInput.handleClearQueue,
+    handleDiscardUnconfirmedSend: busyInput.handleDiscardUnconfirmedSend,
+    handleInterruptPrompt: busyInput.handleInterruptPrompt,
+    handleQueuePrompt: busyInput.handleQueuePrompt,
+    handleRemoveQueuedPrompt: busyInput.handleRemoveQueuedPrompt,
+    handleReplaceQueuedPrompt: busyInput.handleReplaceQueuedPrompt,
+    handleRetryUnconfirmedSend: busyInput.handleRetryUnconfirmedSend,
+    handleSteerPrompt: busyInput.handleSteerPrompt,
+    handleSteerQueuedPrompt: busyInput.handleSteerQueuedPrompt,
+    handleStop,
+    handleUnarchive,
+    isBusyInputPending: busyInputPending,
+    isClearing,
+    isSessionRunning: daemonRunning,
+    isStopRetrying,
+    isStopping,
+    isUnarchiving,
+    messages,
+    queueCap: busyInput.queueCap,
+    queuedPrompts: busyInput.queuedPrompts,
+    stopAttention,
+    /** The daemon answered the last turn stop with `nothing-in-flight` (US-009.EC-2); cleared by the store after a few seconds. */
+    stopCompletionNote: controlsState.stopCompletion !== null,
+    stopPhase: isStopping ? ("stopping" as const) : ("idle" as const),
+    unconfirmedSends: busyInput.unconfirmedSends,
+  };
+}
+
+/** What the session read model allows before any request of ours is in flight. */
+function sessionPromptFlags(session: SessionPayload, threadRunning: boolean) {
+  const daemonRunning = isSessionRunning(session);
+  const effectiveRunning = threadRunning || daemonRunning;
+  const canPrompt = canPromptSession(session);
+  return {
+    activeTurnId: session.activity?.turn_id?.trim() ?? "",
+    canPrompt,
+    daemonRunning,
+    effectiveRunning,
+    promptControlsAvailable: effectiveRunning && canPrompt,
+    userControllable: isUserControllableSession(session),
+  };
+}
+
+/**
+ * Which controls are available once the page's own requests are known.
+ * Stopping reads true from the first activation until the daemon confirms the
+ * stop landed; a session the daemon itself reports as `stopping` reads the same
+ * way even when no request of ours is in flight (US-009.AC-1/AC-3). A stop the
+ * daemon could not verify keeps its attention until the read model says
+ * `stopped` — neither acceptance, escalation, nor time clears it here.
+ */
+function sessionControlsAvailability(input: {
+  controlsState: SessionPageControlsState;
+  effectiveRunning: boolean;
+  hasConversationContent: boolean;
+  pending: {
+    busyInputPending: boolean;
+    isClearing: boolean;
+    isUnarchiving: boolean;
+  };
+  session: SessionPayload;
+  userControllable: boolean;
+}) {
+  const stopRequestActive = isStopRequestActive(input.controlsState);
+  const { pending } = input;
+  const controlsBusy =
+    stopRequestActive || pending.isUnarchiving || pending.isClearing || pending.busyInputPending;
+  return {
+    canClear:
+      input.userControllable &&
+      input.hasConversationContent &&
+      !controlsBusy &&
+      !input.effectiveRunning,
+    controlsBusy,
+    isStopping: stopRequestActive || input.session.state === "stopping",
+    isStopRetrying: isStopRetryPending(input.controlsState),
+    stopAttention: sessionStopAttention(input.session),
+  };
+}

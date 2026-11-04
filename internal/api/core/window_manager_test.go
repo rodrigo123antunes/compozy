@@ -1,0 +1,1178 @@
+// Suite: Window-manager shared transport handlers.
+// Invariants: WM-TRANSPORT-002 strict command schemas and status/body envelopes;
+// WM-GO-014 workspace/client isolation.
+// Owning layer: shared HTTP/UDS core handlers. Canonical suite: this file.
+// Boundary IN: strict wire decoding, path/body identity, and public error mapping.
+// Boundary OUT: reducer, persistence, and topology semantics belong to internal/windowmanager.
+package core
+
+import (
+	"context"
+	"encoding/json"
+	"fmt"
+	"net"
+	"net/http"
+	"net/http/httptest"
+	"slices"
+	"strings"
+	"sync"
+	"sync/atomic"
+	"testing"
+	"time"
+
+	"github.com/compozy/compozy/internal/api/contract"
+	profilepkg "github.com/compozy/compozy/internal/profile"
+	"github.com/compozy/compozy/internal/resources"
+	"github.com/compozy/compozy/internal/store"
+	"github.com/compozy/compozy/internal/windowmanager"
+	"github.com/gin-gonic/gin"
+)
+
+func TestWindowManagerHandlers(t *testing.T) {
+	t.Run("Should preview without writing, commit once, and expose revision conflicts", func(t *testing.T) {
+		t.Parallel()
+		fixture := newWindowManagerHandlerFixture(t)
+
+		initial := performWindowManagerTestRequest(
+			t,
+			fixture.router,
+			http.MethodGet,
+			windowManagerTestPath("workspace-a"),
+			"",
+		)
+		requireWindowManagerStatus(t, initial, http.StatusOK)
+		var snapshot contract.WindowManagerSnapshot
+		decodeWindowManagerTestBody(t, initial, &snapshot)
+		if snapshot.WorkspaceID != "workspace-a" || snapshot.Revision != 0 || len(snapshot.Desktops) != 1 {
+			t.Fatalf("initial snapshot = %+v", snapshot)
+		}
+
+		body := createDesktopCommandBody("workspace-a", 0, "desktop-second")
+		preview := performWindowManagerTestRequest(
+			t, fixture.router, http.MethodPost, windowManagerTestPath("workspace-a")+"/preview", body,
+		)
+		requireWindowManagerStatus(t, preview, http.StatusOK)
+		var proposal contract.WindowManagerPreview
+		decodeWindowManagerTestBody(t, preview, &proposal)
+		if !proposal.Changed || proposal.Snapshot.Revision != 1 || len(proposal.Snapshot.Desktops) != 2 {
+			t.Fatalf("preview = %+v", proposal)
+		}
+
+		unchanged := performWindowManagerTestRequest(
+			t,
+			fixture.router,
+			http.MethodGet,
+			windowManagerTestPath("workspace-a"),
+			"",
+		)
+		requireWindowManagerStatus(t, unchanged, http.StatusOK)
+		decodeWindowManagerTestBody(t, unchanged, &snapshot)
+		if snapshot.Revision != 0 || len(snapshot.Desktops) != 1 {
+			t.Fatalf("snapshot after preview = %+v", snapshot)
+		}
+
+		committed := performWindowManagerTestRequest(
+			t, fixture.router, http.MethodPost, windowManagerTestPath("workspace-a")+"/commands", body,
+		)
+		requireWindowManagerStatus(t, committed, http.StatusOK)
+		var result contract.WindowManagerResult
+		decodeWindowManagerTestBody(t, committed, &result)
+		if !result.Applied || result.Snapshot.Revision != 1 || len(result.Snapshot.Desktops) != 2 {
+			t.Fatalf("command result = %+v", result)
+		}
+
+		stale := performWindowManagerTestRequest(
+			t, fixture.router, http.MethodPost, windowManagerTestPath("workspace-a")+"/commands", body,
+		)
+		errorPayload := requireWindowManagerError(
+			t, stale, http.StatusConflict, contract.WindowManagerErrorRevisionConflict,
+		)
+		if errorPayload.CurrentRevision == nil || *errorPayload.CurrentRevision != 1 {
+			t.Fatalf("current_revision = %v", errorPayload.CurrentRevision)
+		}
+	})
+
+	t.Run("Should reject unknown, mismatched, trailing, and unsafe command input", func(t *testing.T) {
+		t.Parallel()
+		fixture := newWindowManagerHandlerFixture(t)
+		valid := createDesktopCommandBody("workspace-a", 0, "desktop-second")
+		cases := map[string]string{
+			"unknown top-level field": strings.TrimSuffix(valid, "}") + `,"surprise":true}`,
+			"mismatched payload": `{"workspace_id":"workspace-a","command_id":"layout.undo","expected_revision":0,` +
+				`"actor":{"kind":"test","id":"actor"},"origin":"core-test","payload":{"desktop_id":"desktop-default"}}`,
+			"unknown command":     strings.Replace(valid, `"desktop.create"`, `"desktop.unknown"`, 1),
+			"trailing JSON value": valid + `{}`,
+			"unsafe revision": strings.Replace(
+				valid,
+				`"expected_revision":0`,
+				`"expected_revision":9007199254740992`,
+				1,
+			),
+		}
+		for name, body := range cases {
+			t.Run("Should reject "+name, func(t *testing.T) {
+				t.Parallel()
+				response := performWindowManagerTestRequest(
+					t, fixture.router, http.MethodPost, windowManagerTestPath("workspace-a")+"/commands", body,
+				)
+				requireWindowManagerError(
+					t, response, http.StatusUnprocessableEntity, contract.WindowManagerErrorInvalidCommand,
+				)
+			})
+		}
+	})
+
+	t.Run("Should open and navigate a durable route through the discriminated wire contract", func(t *testing.T) {
+		t.Parallel()
+		fixture := newWindowManagerHandlerFixture(t)
+
+		opened := performWindowManagerTestRequest(
+			t,
+			fixture.router,
+			http.MethodPost,
+			windowManagerTestPath("workspace-a")+"/commands",
+			`{"workspace_id":"workspace-a","command_id":"window.open","expected_revision":0,`+
+				`"actor":{"kind":"test","id":"actor"},"origin":"core-test","payload":{"window":{`+
+				`"id":"window-a","app":"tasks","route":{"pathname":"/tasks","search":{"status":"open"}},`+
+				`"desktop_id":"desktop-default","floating_rect":{"x":0.1,"y":0.1,"width":0.5,"height":0.5},`+
+				`"insert_tiled":false}}}`,
+		)
+		requireWindowManagerStatus(t, opened, http.StatusOK)
+		var result contract.WindowManagerResult
+		decodeWindowManagerTestBody(t, opened, &result)
+		window := result.Snapshot.Windows["window-a"]
+		if window.Route.Pathname != "/tasks" ||
+			string(window.Route.Search["status"]) != `"open"` ||
+			window.Placement != windowmanager.WindowPlacementFloating {
+			t.Fatalf("opened window = %+v", window)
+		}
+
+		navigated := performWindowManagerTestRequest(
+			t,
+			fixture.router,
+			http.MethodPost,
+			windowManagerTestPath("workspace-a")+"/commands",
+			`{"workspace_id":"workspace-a","command_id":"window.navigate","expected_revision":1,`+
+				`"actor":{"kind":"test","id":"actor"},"origin":"core-test",`+
+				`"payload":{"window_id":"window-a","route":{"pathname":"/tasks/detail",`+
+				`"search":{"task_id":"task-123"}}}}`,
+		)
+		requireWindowManagerStatus(t, navigated, http.StatusOK)
+		decodeWindowManagerTestBody(t, navigated, &result)
+		window = result.Snapshot.Windows["window-a"]
+		if !result.Applied ||
+			result.Snapshot.Revision != 2 ||
+			window.Route.Pathname != "/tasks/detail" ||
+			string(window.Route.Search["task_id"]) != `"task-123"` {
+			t.Fatalf("navigate result = %+v", result)
+		}
+
+		for name, payload := range map[string]string{
+			"legacy location":   `{"window_id":"window-a","location":"/legacy"}`,
+			"non-object search": `{"window_id":"window-a","route":{"pathname":"/tasks","search":[]}}`,
+		} {
+			t.Run("Should reject "+name, func(t *testing.T) {
+				t.Parallel()
+				response := performWindowManagerTestRequest(
+					t,
+					fixture.router,
+					http.MethodPost,
+					windowManagerTestPath("workspace-a")+"/commands",
+					`{"workspace_id":"workspace-a","command_id":"window.navigate","expected_revision":2,`+
+						`"actor":{"kind":"test","id":"actor"},"origin":"core-test","payload":`+payload+`}`,
+				)
+				requireWindowManagerError(
+					t,
+					response,
+					http.StatusUnprocessableEntity,
+					contract.WindowManagerErrorInvalidCommand,
+				)
+			})
+		}
+	})
+
+	t.Run("Should execute the strict v3 tab command contract", func(t *testing.T) {
+		t.Parallel()
+		fixture := newWindowManagerHandlerFixture(t)
+
+		for index, windowID := range []string{"window-a", "window-b"} {
+			response := performWindowManagerTestRequest(
+				t,
+				fixture.router,
+				http.MethodPost,
+				windowManagerTestPath("workspace-a")+"/commands",
+				windowManagerTestCommandBody(
+					"workspace-a",
+					uint64(index),
+					"window.open",
+					fmt.Sprintf(
+						`{"window":{"id":%q,"app":"tasks","route":{"pathname":%q,"search":{}},`+
+							`"desktop_id":"desktop-default","floating_rect":{"x":0.1,"y":0.1,"width":0.5,"height":0.5},`+
+							`"insert_tiled":false}}`,
+						windowID,
+						"/tasks/"+windowID,
+					),
+				),
+			)
+			requireWindowManagerStatus(t, response, http.StatusOK)
+		}
+
+		commands := []struct {
+			id      string
+			payload string
+		}{
+			{id: "window.stack.group", payload: `{"target_window_id":"window-a","window_ids":["window-b"]}`},
+			{id: "window.stack.set_active", payload: `{"window_id":"window-a"}`},
+			{id: "window.stack.reorder", payload: `{"window_id":"window-b","index":0}`},
+			{id: "window.pin", payload: `{"window_id":"window-a","pinned":true}`},
+			{
+				id: "window.navigate",
+				payload: `{"window_id":"window-b","mode":"push",` +
+					`"route":{"pathname":"/tasks/detail","search":{"id":"123"}}}`,
+			},
+			{
+				id: "window.navigate",
+				payload: `{"window_id":"window-b","mode":"replace",` +
+					`"route":{"pathname":"/tasks/replaced","search":{}}}`,
+			},
+			{id: "window.close", payload: `{"window_id":"window-b","minimize":false,"scope":"tab"}`},
+			{id: "window.reopen", payload: `{}`},
+		}
+		revision := uint64(2)
+		for _, command := range commands {
+			response := performWindowManagerTestRequest(
+				t,
+				fixture.router,
+				http.MethodPost,
+				windowManagerTestPath("workspace-a")+"/commands",
+				windowManagerTestCommandBody("workspace-a", revision, command.id, command.payload),
+			)
+			requireWindowManagerStatus(t, response, http.StatusOK)
+			var result contract.WindowManagerResult
+			decodeWindowManagerTestBody(t, response, &result)
+			if !result.Applied || result.Snapshot.Version != windowmanager.SnapshotVersion {
+				t.Fatalf("%s result = %+v", command.id, result)
+			}
+			if command.id == "window.stack.group" && len(result.Snapshot.Desktops[0].FloatingStacks) != 1 {
+				t.Fatalf("group result = %+v, want one floating stack", result.Snapshot.Desktops[0])
+			}
+			revision = uint64(result.Snapshot.Revision)
+		}
+
+		var snapshot contract.WindowManagerSnapshot
+		response := performWindowManagerTestRequest(
+			t,
+			fixture.router,
+			http.MethodGet,
+			windowManagerTestPath("workspace-a"),
+			"",
+		)
+		requireWindowManagerStatus(t, response, http.StatusOK)
+		decodeWindowManagerTestBody(t, response, &snapshot)
+		if snapshot.ClosedEntryCount != 0 || len(snapshot.Windows) != 2 {
+			t.Fatalf("final v3 snapshot = %+v", snapshot)
+		}
+	})
+
+	t.Run("Should reject unknown fields and incompatible v3 tab command modes", func(t *testing.T) {
+		t.Parallel()
+		fixture := newWindowManagerHandlerFixture(t)
+
+		strictCases := []struct {
+			id      string
+			payload string
+		}{
+			{
+				id: "window.stack.group",
+				payload: `{"target_window_id":"window-a","window_ids":["window-b"],` +
+					`"surprise":true}`,
+			},
+			{id: "window.stack.reorder", payload: `{"window_id":"window-a","index":0,"surprise":true}`},
+			{id: "window.stack.set_active", payload: `{"window_id":"window-a","surprise":true}`},
+			{id: "window.pin", payload: `{"window_id":"window-a","pinned":true,"surprise":true}`},
+			{id: "window.reopen", payload: `{"surprise":true}`},
+		}
+		for _, testCase := range strictCases {
+			t.Run("Should reject unknown fields for "+testCase.id, func(t *testing.T) {
+				t.Parallel()
+				response := performWindowManagerTestRequest(
+					t,
+					fixture.router,
+					http.MethodPost,
+					windowManagerTestPath("workspace-a")+"/commands",
+					windowManagerTestCommandBody("workspace-a", 0, testCase.id, testCase.payload),
+				)
+				requireWindowManagerError(
+					t,
+					response,
+					http.StatusUnprocessableEntity,
+					contract.WindowManagerErrorInvalidCommand,
+				)
+			})
+		}
+		opened := performWindowManagerTestRequest(
+			t,
+			fixture.router,
+			http.MethodPost,
+			windowManagerTestPath("workspace-a")+"/commands",
+			windowManagerTestCommandBody(
+				"workspace-a",
+				0,
+				"window.open",
+				`{"window":{"id":"window-a","app":"tasks","route":{"pathname":"/tasks","search":{}},`+
+					`"desktop_id":"desktop-default","floating_rect":{"x":0.1,"y":0.1,"width":0.5,"height":0.5},`+
+					`"insert_tiled":false}}`,
+			),
+		)
+		requireWindowManagerStatus(t, opened, http.StatusOK)
+
+		for name, command := range map[string]struct {
+			id      string
+			payload string
+		}{
+			"pop with route": {
+				id: "window.navigate",
+				payload: `{"window_id":"window-a","mode":"pop",` +
+					`"route":{"pathname":"/not-allowed","search":{}}}`,
+			},
+			"minimize with group scope": {
+				id: "window.close", payload: `{"window_id":"window-a","minimize":true,"scope":"group"}`,
+			},
+		} {
+			t.Run("Should reject "+name, func(t *testing.T) {
+				t.Parallel()
+				response := performWindowManagerTestRequest(
+					t,
+					fixture.router,
+					http.MethodPost,
+					windowManagerTestPath("workspace-a")+"/commands",
+					windowManagerTestCommandBody("workspace-a", 1, command.id, command.payload),
+				)
+				requireWindowManagerError(
+					t,
+					response,
+					http.StatusUnprocessableEntity,
+					contract.WindowManagerErrorInvalidCommand,
+				)
+			})
+		}
+
+		unsafeRevision := uint64(contract.WindowManagerMaxSafeRevision) + 1
+		unsafe := performWindowManagerTestRequest(
+			t,
+			fixture.router,
+			http.MethodPost,
+			windowManagerTestPath("workspace-a")+"/commands",
+			windowManagerTestCommandBody(
+				"workspace-a",
+				unsafeRevision,
+				"window.stack.group",
+				`{"target_window_id":"window-a","window_ids":["window-b"]}`,
+			),
+		)
+		requireWindowManagerError(
+			t,
+			unsafe,
+			http.StatusUnprocessableEntity,
+			contract.WindowManagerErrorInvalidCommand,
+		)
+	})
+
+	t.Run("Should map tab topology failures to exact public codes", func(t *testing.T) {
+		t.Parallel()
+
+		for _, commandID := range []string{"window.stack.set_active", "window.stack.reorder"} {
+			fixture := newWindowManagerHandlerFixture(t)
+			opened := performWindowManagerTestRequest(
+				t,
+				fixture.router,
+				http.MethodPost,
+				windowManagerTestPath("workspace-a")+"/commands",
+				windowManagerTestCommandBody(
+					"workspace-a",
+					0,
+					"window.open",
+					`{"window":{"id":"window-a","app":"tasks","route":{"pathname":"/tasks","search":{}},`+
+						`"desktop_id":"desktop-default","floating_rect":{"x":0.1,"y":0.1,"width":0.5,"height":0.5},`+
+						`"insert_tiled":false}}`,
+				),
+			)
+			requireWindowManagerStatus(t, opened, http.StatusOK)
+
+			payload := `{"window_id":"window-a"}`
+			if commandID == "window.stack.reorder" {
+				payload = `{"window_id":"window-a","index":0}`
+			}
+			notStacked := performWindowManagerTestRequest(
+				t,
+				fixture.router,
+				http.MethodPost,
+				windowManagerTestPath("workspace-a")+"/commands",
+				windowManagerTestCommandBody("workspace-a", 1, commandID, payload),
+			)
+			requireWindowManagerError(
+				t,
+				notStacked,
+				http.StatusUnprocessableEntity,
+				contract.WindowManagerErrorNotStacked,
+			)
+
+			missingPayload := strings.Replace(payload, "window-a", "window-missing", 1)
+			missing := performWindowManagerTestRequest(
+				t,
+				fixture.router,
+				http.MethodPost,
+				windowManagerTestPath("workspace-a")+"/commands",
+				windowManagerTestCommandBody("workspace-a", 1, commandID, missingPayload),
+			)
+			requireWindowManagerError(
+				t,
+				missing,
+				http.StatusNotFound,
+				contract.WindowManagerErrorWindowNotFound,
+			)
+		}
+
+		fixture := newWindowManagerHandlerFixture(t)
+		opened := performWindowManagerTestRequest(
+			t,
+			fixture.router,
+			http.MethodPost,
+			windowManagerTestPath("workspace-a")+"/commands",
+			windowManagerTestCommandBody(
+				"workspace-a",
+				0,
+				"window.open",
+				`{"window":{"id":"window-a","app":"tasks","route":{"pathname":"/tasks","search":{}},`+
+					`"desktop_id":"desktop-default","floating_rect":{"x":0.1,"y":0.1,"width":0.5,"height":0.5},`+
+					`"insert_tiled":false}}`,
+			),
+		)
+		requireWindowManagerStatus(t, opened, http.StatusOK)
+		pinned := performWindowManagerTestRequest(
+			t,
+			fixture.router,
+			http.MethodPost,
+			windowManagerTestPath("workspace-a")+"/commands",
+			windowManagerTestCommandBody(
+				"workspace-a", 1, "window.pin", `{"window_id":"window-a","pinned":true}`,
+			),
+		)
+		requireWindowManagerStatus(t, pinned, http.StatusOK)
+		closed := performWindowManagerTestRequest(
+			t,
+			fixture.router,
+			http.MethodPost,
+			windowManagerTestPath("workspace-a")+"/commands",
+			windowManagerTestCommandBody(
+				"workspace-a", 2, "window.close", `{"window_id":"window-a","minimize":false}`,
+			),
+		)
+		requireWindowManagerError(
+			t,
+			closed,
+			http.StatusUnprocessableEntity,
+			contract.WindowManagerErrorWindowPinned,
+		)
+	})
+
+	t.Run("Should serialize concurrent tab mutations through revision CAS and allow retry", func(t *testing.T) {
+		t.Parallel()
+		fixture := newWindowManagerHandlerFixture(t)
+		for index, windowID := range []string{"window-a", "window-b", "window-c"} {
+			opened := performWindowManagerTestRequest(
+				t,
+				fixture.router,
+				http.MethodPost,
+				windowManagerTestPath("workspace-a")+"/commands",
+				windowManagerTestCommandBody(
+					"workspace-a",
+					uint64(index),
+					"window.open",
+					fmt.Sprintf(
+						`{"window":{"id":%q,"app":"tasks","route":{"pathname":%q,"search":{}},`+
+							`"desktop_id":"desktop-default","floating_rect":{"x":0.1,"y":0.1,"width":0.5,"height":0.5},`+
+							`"insert_tiled":false}}`,
+						windowID,
+						"/tasks/"+windowID,
+					),
+				),
+			)
+			requireWindowManagerStatus(t, opened, http.StatusOK)
+		}
+
+		groupBody := windowManagerTestCommandBody(
+			"workspace-a",
+			3,
+			"window.stack.group",
+			`{"target_window_id":"window-a","window_ids":["window-b"]}`,
+		)
+		closeBody := windowManagerTestCommandBody(
+			"workspace-a",
+			3,
+			"window.close",
+			`{"window_id":"window-c","minimize":false}`,
+		)
+		type raceResult struct {
+			body     string
+			response *httptest.ResponseRecorder
+		}
+		results := make(chan raceResult, 2)
+		for _, body := range []string{groupBody, closeBody} {
+			go func() {
+				results <- raceResult{
+					body: body,
+					response: performWindowManagerTestRequest(
+						t,
+						fixture.router,
+						http.MethodPost,
+						windowManagerTestPath("workspace-a")+"/commands",
+						body,
+					),
+				}
+			}()
+		}
+		statuses := map[int]int{}
+		var stale raceResult
+		for range 2 {
+			result := <-results
+			statuses[result.response.Code]++
+			if result.response.Code == http.StatusConflict {
+				stale = result
+				payload := requireWindowManagerError(
+					t,
+					result.response,
+					http.StatusConflict,
+					contract.WindowManagerErrorRevisionConflict,
+				)
+				if payload.CurrentRevision == nil || *payload.CurrentRevision != 4 {
+					t.Fatalf("race current_revision = %v, want 4", payload.CurrentRevision)
+				}
+			}
+		}
+		if statuses[http.StatusOK] != 1 || statuses[http.StatusConflict] != 1 {
+			t.Fatalf("race statuses = %+v, want one 200 and one 409", statuses)
+		}
+		retryBody := strings.Replace(stale.body, `"expected_revision":3`, `"expected_revision":4`, 1)
+		retried := performWindowManagerTestRequest(
+			t,
+			fixture.router,
+			http.MethodPost,
+			windowManagerTestPath("workspace-a")+"/commands",
+			retryBody,
+		)
+		requireWindowManagerStatus(t, retried, http.StatusOK)
+		var retriedResult contract.WindowManagerResult
+		decodeWindowManagerTestBody(t, retried, &retriedResult)
+		if !retriedResult.Applied || retriedResult.Snapshot.Revision != 5 {
+			t.Fatalf("retried result = %+v", retriedResult)
+		}
+	})
+
+	t.Run("Should require registered presentation clients and preserve workspace isolation", func(t *testing.T) {
+		t.Parallel()
+		fixture := newWindowManagerHandlerFixture(t)
+
+		missingClient := performWindowManagerTestRequest(
+			t,
+			fixture.router,
+			http.MethodPost,
+			windowManagerTestPath("workspace-a")+"/commands",
+			`{"workspace_id":"workspace-a","command_id":"desktop.switch","expected_revision":0,`+
+				`"actor":{"kind":"test","id":"actor"},"origin":"core-test",`+
+				`"payload":{"desktop_id":"desktop-default"}}`,
+		)
+		requireWindowManagerError(t, missingClient, http.StatusNotFound, contract.WindowManagerErrorClientNotFound)
+
+		registered := performWindowManagerTestRequest(
+			t,
+			fixture.router,
+			http.MethodPost,
+			windowManagerTestPath("workspace-a")+"/clients",
+			`{"workspace_id":"workspace-a","client_id":" client-a "}`,
+		)
+		requireWindowManagerStatus(t, registered, http.StatusCreated)
+		var client contract.WindowManagerClientView
+		decodeWindowManagerTestBody(t, registered, &client)
+		if client.WorkspaceID != "workspace-a" || client.ClientID != "client-a" ||
+			client.PresentationRevision != 1 {
+			t.Fatalf("registered client = %+v", client)
+		}
+
+		mismatch := performWindowManagerTestRequest(
+			t,
+			fixture.router,
+			http.MethodPost,
+			windowManagerTestPath("workspace-a")+"/clients",
+			`{"workspace_id":"workspace-b","client_id":"client-b"}`,
+		)
+		requireWindowManagerError(
+			t,
+			mismatch,
+			http.StatusUnprocessableEntity,
+			contract.WindowManagerErrorInvalidCommand,
+		)
+
+		crossWorkspace := performWindowManagerTestRequest(
+			t,
+			fixture.router,
+			http.MethodDelete,
+			windowManagerTestPath("workspace-b")+"/clients/client-a",
+			"",
+		)
+		requireWindowManagerError(t, crossWorkspace, http.StatusNotFound, contract.WindowManagerErrorClientNotFound)
+
+		workspaceA := listWindowManagerTestClients(t, fixture.router, "workspace-a")
+		workspaceB := listWindowManagerTestClients(t, fixture.router, "workspace-b")
+		if len(workspaceA.Clients) != 1 || len(workspaceB.Clients) != 0 {
+			t.Fatalf("client partitions: workspace-a=%+v workspace-b=%+v", workspaceA, workspaceB)
+		}
+
+		removed := performWindowManagerTestRequest(
+			t, fixture.router, http.MethodDelete, windowManagerTestPath("workspace-a")+"/clients/client-a", "",
+		)
+		requireWindowManagerStatus(t, removed, http.StatusNoContent)
+		if clients := listWindowManagerTestClients(t, fixture.router, "workspace-a"); len(clients.Clients) != 0 {
+			t.Fatalf("clients after delete = %+v", clients)
+		}
+	})
+
+	t.Run("Should serialize required empty arrays instead of null", func(t *testing.T) {
+		t.Parallel()
+		fixture := newWindowManagerHandlerFixture(t)
+
+		snapshotResponse := performWindowManagerTestRequest(
+			t,
+			fixture.router,
+			http.MethodGet,
+			windowManagerTestPath("workspace-a"),
+			"",
+		)
+		requireWindowManagerStatus(t, snapshotResponse, http.StatusOK)
+		var snapshot struct {
+			Desktops []struct {
+				Floating json.RawMessage `json:"floating"`
+			} `json:"desktops"`
+		}
+		decodeWindowManagerTestBody(t, snapshotResponse, &snapshot)
+		if len(snapshot.Desktops) != 1 {
+			t.Fatalf("snapshot desktops = %+v, want one", snapshot.Desktops)
+		}
+		if string(snapshot.Desktops[0].Floating) != "[]" {
+			t.Fatalf("desktop floating JSON = %s, want []", snapshot.Desktops[0].Floating)
+		}
+		convertedSnapshot, err := contract.WindowManagerSnapshotFromDomain(windowmanager.Snapshot{
+			WorkspaceID: "workspace-a",
+			Desktops: []windowmanager.Desktop{{
+				ID: "desktop-empty", Floating: nil,
+			}},
+		})
+		if err != nil {
+			t.Fatalf("WindowManagerSnapshotFromDomain() error = %v", err)
+		}
+		convertedJSON, err := json.Marshal(convertedSnapshot)
+		if err != nil {
+			t.Fatalf("json.Marshal(converted snapshot) error = %v", err)
+		}
+		var converted struct {
+			Desktops []struct {
+				Floating json.RawMessage `json:"floating"`
+			} `json:"desktops"`
+		}
+		if err := json.Unmarshal(convertedJSON, &converted); err != nil {
+			t.Fatalf("json.Unmarshal(converted snapshot) error = %v", err)
+		}
+		if len(converted.Desktops) != 1 {
+			t.Fatalf("converted snapshot desktops = %+v, want one", converted.Desktops)
+		}
+		if string(converted.Desktops[0].Floating) != "[]" {
+			t.Fatalf("converted desktop floating JSON = %s, want []", converted.Desktops[0].Floating)
+		}
+
+		clientResponse := performWindowManagerTestRequest(
+			t,
+			fixture.router,
+			http.MethodPost,
+			windowManagerTestPath("workspace-a")+"/clients",
+			`{"workspace_id":"workspace-a","client_id":"client-a"}`,
+		)
+		requireWindowManagerStatus(t, clientResponse, http.StatusCreated)
+		var client struct {
+			FocusOrder json.RawMessage `json:"focus_order"`
+		}
+		decodeWindowManagerTestBody(t, clientResponse, &client)
+		if string(client.FocusOrder) != "[]" {
+			t.Fatalf("client focus_order JSON = %s, want []", client.FocusOrder)
+		}
+	})
+
+	t.Run("Should export and validate a workspace-bound layout", func(t *testing.T) {
+		t.Parallel()
+		fixture := newWindowManagerHandlerFixture(t)
+		exported := performWindowManagerTestRequest(
+			t, fixture.router, http.MethodGet, windowManagerTestPath("workspace-a")+"/layout", "",
+		)
+		requireWindowManagerStatus(t, exported, http.StatusOK)
+		var document contract.WindowManagerLayoutDocument
+		decodeWindowManagerTestBody(t, exported, &document)
+		if document.WorkspaceID != "workspace-a" || len(document.Desktops) != 1 {
+			t.Fatalf("layout document = %+v", document)
+		}
+
+		validationBody := marshalWindowManagerTestJSON(t, contract.WindowManagerLayoutValidationRequest{
+			WorkspaceID: "workspace-a", Document: document,
+		})
+		validated := performWindowManagerTestRequest(
+			t,
+			fixture.router,
+			http.MethodPost,
+			windowManagerTestPath("workspace-a")+"/layout/validate",
+			validationBody,
+		)
+		requireWindowManagerStatus(t, validated, http.StatusOK)
+		var validation contract.WindowManagerLayoutValidationResponse
+		decodeWindowManagerTestBody(t, validated, &validation)
+		if !validation.Valid || validation.WorkspaceID != "workspace-a" {
+			t.Fatalf("layout validation = %+v", validation)
+		}
+	})
+
+	t.Run("Should hand the resolved profile to the window-manager provider", func(t *testing.T) {
+		t.Parallel()
+		fixture := newWindowManagerHandlerFixture(t)
+		path := windowManagerTestPath("workspace-a")
+
+		// Named profile: the provider is asked for the resolved id, not the name.
+		response := performWindowManagerTestRequest(t, fixture.router, http.MethodGet, path+"?profile=marketing", "")
+		if response.Code != http.StatusOK {
+			t.Fatalf("GET ?profile=marketing status = %d; body=%s", response.Code, response.Body.String())
+		}
+		// Omitted profile: the boundary resolves `default` rather than reading unscoped.
+		response = performWindowManagerTestRequest(t, fixture.router, http.MethodGet, path, "")
+		if response.Code != http.StatusOK {
+			t.Fatalf("GET (no profile) status = %d; body=%s", response.Code, response.Body.String())
+		}
+		if got := fixture.providers.requestedProfiles(); !slices.Equal(
+			got, []string{"profile-marketing", store.DefaultProfileID},
+		) {
+			t.Fatalf("requested profiles = %v, want [profile-marketing %s]", got, store.DefaultProfileID)
+		}
+	})
+
+	t.Run("Should refuse an all-profiles view of one profile's desktops", func(t *testing.T) {
+		t.Parallel()
+		fixture := newWindowManagerHandlerFixture(t)
+		response := performWindowManagerTestRequest(
+			t, fixture.router, http.MethodGet,
+			windowManagerTestPath("workspace-a")+"?all_profiles=true", "",
+		)
+		if response.Code != http.StatusBadRequest {
+			t.Fatalf("GET ?all_profiles=true status = %d; body=%s", response.Code, response.Body.String())
+		}
+		if !strings.Contains(response.Body.String(), "profile_selection_conflict") {
+			t.Fatalf("GET ?all_profiles=true body = %s, want profile_selection_conflict", response.Body.String())
+		}
+		if got := fixture.providers.requestedProfiles(); len(got) != 0 {
+			t.Fatalf("requested profiles = %v, want none for a refused read", got)
+		}
+	})
+
+	t.Run("Should claim a client id through one atomic registration", func(t *testing.T) {
+		t.Parallel()
+		fixture := newWindowManagerHandlerFixture(t)
+		body := `{"workspace_id":"workspace-a","client_id":"client:web","kind":"browser",` +
+			`"context":{"workspace_trusted":true}}`
+		response := performWindowManagerTestRequest(
+			t, fixture.router, http.MethodPost,
+			windowManagerTestPath("workspace-a")+"/clients?profile=marketing", body,
+		)
+		if response.Code != http.StatusCreated {
+			t.Fatalf("POST /clients status = %d; body=%s", response.Code, response.Body.String())
+		}
+		// One call carries the whole claim: the transport never retires and registers
+		// as two operations that another registration could interleave with.
+		want := []claimedWindowManagerClient{
+			{workspaceID: "workspace-a", clientID: "client:web", profileID: "profile-marketing"},
+		}
+		if got := fixture.providers.claimedClients(); !slices.Equal(got, want) {
+			t.Fatalf("claimed clients = %+v, want %+v", got, want)
+		}
+		if got := fixture.providers.requestedProfiles(); len(got) != 0 {
+			t.Fatalf("requested profiles = %v, want the claim to resolve its own runtime", got)
+		}
+	})
+
+	t.Run("Should expose only global and route-workspace layout profiles", func(t *testing.T) {
+		t.Parallel()
+		fixture := newWindowManagerHandlerFixture(t)
+		now := time.Date(2026, time.July, 22, 12, 0, 0, 0, time.UTC)
+		records := map[string]resources.RawRecord{
+			"global-profile": {
+				Kind: windowmanager.WindowLayoutResourceKind, ID: "global-profile", Version: 1,
+				Scope:    resources.ResourceScope{Kind: resources.ResourceScopeKindUser},
+				SpecJSON: []byte(`{"version":1}`), CreatedAt: now, UpdatedAt: now,
+			},
+			"workspace-a-profile": {
+				Kind: windowmanager.WindowLayoutResourceKind, ID: "workspace-a-profile", Version: 2,
+				Scope:    resources.ResourceScope{Kind: resources.ResourceScopeKindWorkspace, ID: "workspace-a"},
+				SpecJSON: []byte(`{"version":1}`), CreatedAt: now, UpdatedAt: now,
+			},
+			"workspace-b-profile": {
+				Kind: windowmanager.WindowLayoutResourceKind, ID: "workspace-b-profile", Version: 3,
+				Scope:    resources.ResourceScope{Kind: resources.ResourceScopeKindWorkspace, ID: "workspace-b"},
+				SpecJSON: []byte(`{"version":1}`), CreatedAt: now, UpdatedAt: now,
+			},
+		}
+		putCalled := false
+		fixture.handlers.Resources = stubResourceService{
+			ListFn: func(_ context.Context, filter resources.ResourceFilter) ([]resources.RawRecord, error) {
+				if filter.Kind != windowmanager.WindowLayoutResourceKind || filter.Scope == nil {
+					t.Fatalf("layout-profile filter = %+v", filter)
+				}
+				if filter.Scope.Kind == resources.ResourceScopeKindUser {
+					return []resources.RawRecord{records["global-profile"]}, nil
+				}
+				if filter.Scope.ID == "workspace-a" {
+					return []resources.RawRecord{records["workspace-a-profile"]}, nil
+				}
+				return []resources.RawRecord{records["workspace-b-profile"]}, nil
+			},
+			GetFn: func(_ context.Context, _ resources.ResourceKind, id string) (resources.RawRecord, error) {
+				record, ok := records[id]
+				if !ok {
+					return resources.RawRecord{}, resources.ErrNotFound
+				}
+				return record, nil
+			},
+			PutFn: func(_ context.Context, _ resources.RawDraft) (resources.RawRecord, error) {
+				putCalled = true
+				return resources.RawRecord{}, nil
+			},
+		}
+
+		listed := performWindowManagerTestRequest(
+			t,
+			fixture.router,
+			http.MethodGet,
+			windowManagerTestPath("workspace-a")+"/layout-profiles",
+			"",
+		)
+		requireWindowManagerStatus(t, listed, http.StatusOK)
+		var payload contract.ResourcesResponse
+		decodeWindowManagerTestBody(t, listed, &payload)
+		if len(payload.Records) != 2 ||
+			payload.Records[0].ID != "global-profile" ||
+			payload.Records[1].ID != "workspace-a-profile" {
+			t.Fatalf("visible layout profiles = %+v", payload.Records)
+		}
+
+		foreignPut := performWindowManagerTestRequest(
+			t,
+			fixture.router,
+			http.MethodPut,
+			windowManagerTestPath("workspace-a")+"/layout-profiles/foreign-profile",
+			`{"scope":{"kind":"workspace","id":"workspace-b"},"expected_version":0,"spec":{"version":1}}`,
+		)
+		requireWindowManagerStatus(t, foreignPut, http.StatusForbidden)
+		if putCalled {
+			t.Fatal("foreign workspace profile reached ResourceService.Put")
+		}
+
+		foreignDelete := performWindowManagerTestRequest(
+			t,
+			fixture.router,
+			http.MethodDelete,
+			windowManagerTestPath("workspace-a")+"/layout-profiles/workspace-b-profile",
+			`{"expected_version":3}`,
+		)
+		requireWindowManagerStatus(t, foreignDelete, http.StatusNotFound)
+	})
+
+	t.Run("Should map stream lifecycle failures to stable structured errors", func(t *testing.T) {
+		t.Parallel()
+		status, payload := windowManagerErrorPayload("workspace-a", windowmanager.ErrSlowConsumer)
+		if status != http.StatusConflict || payload.Code != contract.WindowManagerErrorSlowConsumer {
+			t.Fatalf("slow-consumer error = status %d payload %+v", status, payload)
+		}
+		status, payload = windowManagerErrorPayload(
+			"workspace-a",
+			windowmanager.ErrPresentationRevisionExhausted,
+		)
+		if status != http.StatusServiceUnavailable ||
+			payload.Code != contract.WindowManagerErrorUnavailable {
+			t.Fatalf("presentation-revision error = status %d payload %+v", status, payload)
+		}
+		if !isExpectedWindowManagerSocketError(net.ErrClosed) {
+			t.Fatal("net.ErrClosed was classified as an unexpected socket failure")
+		}
+	})
+}
+
+type windowManagerHandlerFixture struct {
+	router    *gin.Engine
+	handlers  *BaseHandlers
+	manager   *windowmanager.Manager
+	providers *singleProfileWindowManagers
+}
+
+func newWindowManagerHandlerFixture(t *testing.T) windowManagerHandlerFixture {
+	t.Helper()
+	var sequence atomic.Int64
+	// Wire-contract cases assert floating opens; placement-policy defaults belong to the windowmanager suite.
+	config := windowmanager.DefaultConfig()
+	config.NewWindowPolicy = windowmanager.NewWindowFloating
+	manager, err := windowmanager.NewService(
+		windowmanager.NewMemoryRepository(),
+		windowmanager.NewMemoryWorkspaceResolver("workspace-a", "workspace-b"),
+		nil,
+		config,
+		windowmanager.WithClock(func() time.Time { return time.Date(2026, time.July, 22, 12, 0, 0, 0, time.UTC) }),
+		windowmanager.WithIDGenerator(func(kind string) (string, error) {
+			return fmt.Sprintf("%s-%03d", kind, sequence.Add(1)), nil
+		}),
+	)
+	if err != nil {
+		t.Fatalf("NewService() error = %v", err)
+	}
+	providers := &singleProfileWindowManagers{manager: manager}
+	handlers := NewBaseHandlers(&BaseHandlerConfig{
+		WindowManager: providers,
+		Profiles:      windowManagerProfileServiceStub{},
+	})
+	router := gin.New()
+	registerWindowManagerTestRoutes(router, handlers)
+	t.Cleanup(func() {
+		ctx, cancel := context.WithTimeout(context.WithoutCancel(t.Context()), time.Second)
+		defer cancel()
+		if shutdownErr := handlers.ShutdownWindowManagerStreams(ctx); shutdownErr != nil {
+			t.Errorf("ShutdownWindowManagerStreams() error = %v", shutdownErr)
+		}
+		if closeErr := manager.Close(); closeErr != nil {
+			t.Errorf("Manager.Close() error = %v", closeErr)
+		}
+	})
+	return windowManagerHandlerFixture{
+		router: router, handlers: handlers, manager: manager, providers: providers,
+	}
+}
+
+func registerWindowManagerTestRoutes(router gin.IRouter, handlers *BaseHandlers) {
+	manager := router.Group("/api/workspaces/:workspace_id/window-manager")
+	manager.GET("", handlers.GetWindowManagerSnapshot)
+	manager.POST("/preview", handlers.PreviewWindowManagerCommand)
+	manager.POST("/commands", handlers.ExecuteWindowManagerCommand)
+	manager.GET("/clients", handlers.ListWindowManagerClients)
+	manager.POST("/clients", handlers.RegisterWindowManagerClient)
+	manager.DELETE("/clients/:client_id", handlers.UnregisterWindowManagerClient)
+	manager.GET("/layout", handlers.ExportWindowManagerLayout)
+	manager.POST("/layout/validate", handlers.ValidateWindowManagerLayout)
+	manager.PUT("/layout", handlers.ReplaceWindowManagerLayout)
+	manager.GET("/layout-profiles", handlers.ListWindowManagerLayoutProfiles)
+	manager.PUT("/layout-profiles/:profile_id", handlers.PutWindowManagerLayoutProfile)
+	manager.DELETE("/layout-profiles/:profile_id", handlers.DeleteWindowManagerLayoutProfile)
+	manager.GET("/stream", handlers.StreamWindowManager)
+}
+
+func windowManagerTestPath(workspaceID string) string {
+	return "/api/workspaces/" + workspaceID + "/window-manager"
+}
+
+func createDesktopCommandBody(workspaceID string, revision uint64, desktopID string) string {
+	return fmt.Sprintf(
+		`{"workspace_id":%q,"command_id":"desktop.create","expected_revision":%d,`+
+			`"actor":{"kind":"test","id":"actor"},"origin":"core-test",`+
+			`"payload":{"desktop_id":%q,"name":"Second"}}`,
+		workspaceID,
+		revision,
+		desktopID,
+	)
+}
+
+func windowManagerTestCommandBody(workspaceID string, revision uint64, commandID string, payload string) string {
+	return fmt.Sprintf(
+		`{"workspace_id":%q,"command_id":%q,"expected_revision":%d,`+
+			`"actor":{"kind":"test","id":"actor"},"origin":"core-test","payload":%s}`,
+		workspaceID,
+		commandID,
+		revision,
+		payload,
+	)
+}
+
+func performWindowManagerTestRequest(
+	t *testing.T,
+	router http.Handler,
+	method string,
+	path string,
+	body string,
+) *httptest.ResponseRecorder {
+	t.Helper()
+	request, err := http.NewRequestWithContext(t.Context(), method, path, strings.NewReader(body))
+	if err != nil {
+		t.Fatalf("NewRequestWithContext() error = %v", err)
+	}
+	request.Header.Set("Content-Type", "application/json")
+	response := httptest.NewRecorder()
+	router.ServeHTTP(response, request)
+	return response
+}
+
+func requireWindowManagerStatus(t *testing.T, response *httptest.ResponseRecorder, want int) {
+	t.Helper()
+	if response.Code != want {
+		t.Fatalf("status = %d, want %d; body = %s", response.Code, want, response.Body.String())
+	}
+}
+
+func requireWindowManagerError(
+	t *testing.T,
+	response *httptest.ResponseRecorder,
+	status int,
+	code contract.WindowManagerErrorCode,
+) contract.WindowManagerErrorPayload {
+	t.Helper()
+	requireWindowManagerStatus(t, response, status)
+	var payload contract.WindowManagerErrorPayload
+	decodeWindowManagerTestBody(t, response, &payload)
+	if payload.Code != code || payload.Error != string(code) {
+		t.Fatalf("error payload = %+v, want code %q", payload, code)
+	}
+	return payload
+}
+
+func decodeWindowManagerTestBody(t *testing.T, response *httptest.ResponseRecorder, target any) {
+	t.Helper()
+	if err := json.Unmarshal(response.Body.Bytes(), target); err != nil {
+		t.Fatalf("decode response body %q: %v", response.Body.String(), err)
+	}
+}
+
+func TestWindowManagerRegistrationContext(t *testing.T) {
+	t.Parallel()
+	t.Run("Should clone global shortcuts into the registration context", func(t *testing.T) {
+		t.Parallel()
+		input := contract.WindowManagerClientContextInput{
+			ScopeGlobal: true,
+			GlobalShortcuts: []windowmanager.GlobalShortcutRegistration{{
+				CommandID:     windowmanager.DefaultGlobalSummonCommandID,
+				IntendedChord: windowmanager.DefaultGlobalSummonChord,
+				Status:        windowmanager.GlobalShortcutRegistered,
+			}},
+		}
+		got := windowManagerRegistrationContext(input)
+		if !got.ScopeGlobal || len(got.GlobalShortcuts) != 1 ||
+			got.GlobalShortcuts[0].CommandID != windowmanager.DefaultGlobalSummonCommandID ||
+			got.GlobalShortcuts[0].IntendedChord != windowmanager.DefaultGlobalSummonChord {
+			t.Fatalf("registration context = %#v, want cloned global shortcuts", got)
+		}
+		input.GlobalShortcuts[0].IntendedChord = "mutated"
+		if got.GlobalShortcuts[0].IntendedChord != windowmanager.DefaultGlobalSummonChord {
+			t.Fatal("registration context aliased the caller shortcut slice")
+		}
+	})
+}
+
+func marshalWindowManagerTestJSON(t *testing.T, value any) string {
+	t.Helper()
+	payload, err := json.Marshal(value)
+	if err != nil {
+		t.Fatalf("json.Marshal() error = %v", err)
+	}
+	return string(payload)
+}
+
+func listWindowManagerTestClients(
+	t *testing.T,
+	router http.Handler,
+	workspaceID string,
+) contract.WindowManagerClientsResponse {
+	t.Helper()
+	response := performWindowManagerTestRequest(
+		t, router, http.MethodGet, windowManagerTestPath(workspaceID)+"/clients", "",
+	)
+	requireWindowManagerStatus(t, response, http.StatusOK)
+	var clients contract.WindowManagerClientsResponse
+	decodeWindowManagerTestBody(t, response, &clients)
+	return clients
+}
+
+// singleProfileWindowManagers serves one manager for every profile and records the
+// profile each request asked for.
+//
+// The partition itself is the daemon repository suite's subject; what the transport
+// owes is that the profile it resolved is the one it hands the provider — recording
+// it is the only way that can be asserted rather than assumed.
+type singleProfileWindowManagers struct {
+	manager WindowManagerService
+
+	mu       sync.Mutex
+	profiles []string
+	claims   []claimedWindowManagerClient
+}
+
+type claimedWindowManagerClient struct {
+	workspaceID string
+	clientID    string
+	profileID   string
+}
+
+func (s *singleProfileWindowManagers) WindowManagerFor(profileID string) (WindowManagerService, error) {
+	s.mu.Lock()
+	s.profiles = append(s.profiles, profileID)
+	s.mu.Unlock()
+	return s.manager, nil
+}
+
+func (s *singleProfileWindowManagers) ClaimClient(
+	ctx context.Context,
+	profileID string,
+	registration windowmanager.ClientRegistration,
+) (windowmanager.ClientView, error) {
+	s.mu.Lock()
+	s.claims = append(s.claims, claimedWindowManagerClient{
+		workspaceID: string(registration.WorkspaceID),
+		clientID:    string(registration.ClientID),
+		profileID:   profileID,
+	})
+	s.mu.Unlock()
+	return s.manager.RegisterClient(ctx, registration)
+}
+
+func (s *singleProfileWindowManagers) requestedProfiles() []string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return append([]string(nil), s.profiles...)
+}
+
+func (s *singleProfileWindowManagers) claimedClients() []claimedWindowManagerClient {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return append([]claimedWindowManagerClient(nil), s.claims...)
+}
+
+// windowManagerProfileServiceStub resolves the one named profile these transport
+// tests use, so the handler performs a real name → id resolution instead of the
+// unavailable-service shortcut.
+type windowManagerProfileServiceStub struct {
+	ProfileService
+}
+
+func (windowManagerProfileServiceStub) Resolve(
+	_ context.Context,
+	in profilepkg.ResolveInput,
+) (profilepkg.Resolution, error) {
+	if in.Flag == "marketing" {
+		return profilepkg.Resolution{
+			Profile: profilepkg.Profile{
+				ID: "profile-marketing", Name: "marketing", State: profilepkg.StateActive,
+			},
+			Source: profilepkg.ResolutionSourceFlag,
+		}, nil
+	}
+	return profilepkg.Resolution{
+		Profile: profilepkg.Profile{
+			ID: store.DefaultProfileID, Name: "default", State: profilepkg.StateActive,
+		},
+		Source: profilepkg.ResolutionSourceDefault,
+	}, nil
+}

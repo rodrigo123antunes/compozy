@@ -1,0 +1,2051 @@
+package daemon
+
+import (
+	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"reflect"
+	"slices"
+	"strings"
+	"testing"
+	"time"
+
+	"github.com/compozy/compozy/internal/api/contract"
+	core "github.com/compozy/compozy/internal/api/core"
+	apitest "github.com/compozy/compozy/internal/api/testutil"
+	looppkg "github.com/compozy/compozy/internal/loop"
+	"github.com/compozy/compozy/internal/loop/dsl"
+	goalpkg "github.com/compozy/compozy/internal/loop/goal"
+	"github.com/compozy/compozy/internal/session"
+	"github.com/compozy/compozy/internal/store"
+	taskpkg "github.com/compozy/compozy/internal/task"
+	toolspkg "github.com/compozy/compozy/internal/tools"
+	workspacepkg "github.com/compozy/compozy/internal/workspace"
+)
+
+func TestDaemonNativeLoopTools(t *testing.T) {
+	t.Parallel()
+
+	t.Run("Should route structured Goal control through the authenticated caller session", func(t *testing.T) {
+		t.Parallel()
+
+		var capturedWorkspaceID string
+		var capturedTargetID string
+		var capturedCaller session.PromptCaller
+		var capturedCommand session.GoalCommand
+		service := &nativeLoopServiceStub{
+			goalCommandFn: func(
+				_ context.Context,
+				workspaceID string,
+				targetID string,
+				caller session.PromptCaller,
+				command session.GoalCommand,
+			) (session.GoalDispatchDecision, error) {
+				capturedWorkspaceID, capturedTargetID, capturedCaller, capturedCommand =
+					workspaceID, targetID, caller, command
+				previous := "run-old"
+				return session.GoalDispatchDecision{
+					Kind: session.GoalDispatchRespond,
+					Result: &session.GoalCommandResult{
+						Outcome: session.GoalOutcomeReplaced, ReplacedRunID: &previous,
+						Snapshot: &session.GoalSnapshot{
+							RunID: "run-new", NodeID: "goal", Objective: "Ship the child",
+							OriginSessionID: targetID, BoundSessionID: targetID,
+							Status: "active", RunStatus: "running", TurnLimit: 5, Live: true,
+							ContractSummary: "Ship it",
+							Context:         session.GoalContextSnapshot{State: "unknown", NudgeRatio: 0},
+						},
+					},
+				}, nil
+			},
+		}
+		registry := newDaemonNativeRegistry(t, &daemonNativeToolsDeps{
+			Sessions: nativeTestSessionManager("ws-alpha"),
+			Loops:    func() core.LoopService { return service },
+		}, nativeApproveAllPolicyInputs())
+
+		result, err := registry.Call(
+			t.Context(),
+			toolspkg.Scope{SessionID: "sess-alpha", WorkspaceID: "ws-alpha"},
+			toolspkg.CallRequest{
+				ToolID: toolspkg.ToolIDGoalControl,
+				Input: json.RawMessage(
+					`{"session_id":"sess-child","operation":"replace","objective":"Ship the child","expected_run_id":"run-current","runtime":{"provider":"cursor","model":"grok-4.5","reasoning_effort":"high","speed":"fast"}}`,
+				),
+			},
+		)
+		if err != nil {
+			t.Fatalf("Registry.Call(goal_control) error = %v", err)
+		}
+		if capturedWorkspaceID != "ws-alpha" || capturedTargetID != "sess-child" {
+			t.Fatalf("Goal target = %s/%s, want ws-alpha/sess-child", capturedWorkspaceID, capturedTargetID)
+		}
+		if capturedCaller.Kind != string(taskpkg.ActorKindAgentSession) || capturedCaller.ID != "sess-alpha" ||
+			capturedCaller.Source != string(taskpkg.OriginKindAgentSession) {
+			t.Fatalf("Goal caller = %#v", capturedCaller)
+		}
+		if capturedCommand.Verb != session.GoalCommandVerbReplace || capturedCommand.ExpectedRunID != "run-current" ||
+			capturedCommand.Runtime == nil || capturedCommand.Runtime.Provider != "cursor" ||
+			capturedCommand.Runtime.Model != "grok-4.5" || capturedCommand.Runtime.ReasoningEffort != "high" ||
+			capturedCommand.Runtime.Speed != "fast" {
+			t.Fatalf("Goal command = %#v", capturedCommand)
+		}
+		requireNativeStructuredContains(t, result, []byte(`"outcome":"replaced"`))
+		requireNativeStructuredContains(t, result, []byte(`"replaced_run_id":"run-old"`))
+	})
+
+	t.Run("Should forward the bounded catalog query within caller workspace scope", func(t *testing.T) {
+		t.Parallel()
+
+		var capturedWorkspaceID string
+		var capturedQuery looppkg.CatalogQuery
+		lastRunCreatedAt := time.Date(2026, 7, 10, 11, 0, 0, 0, time.UTC)
+		registry := newDaemonNativeRegistry(t, &daemonNativeToolsDeps{
+			Sessions: nativeTestSessionManager("ws-alpha"),
+			Loops: func() core.LoopService {
+				return &nativeLoopServiceStub{
+					listLoopsFn: func(
+						_ context.Context,
+						workspaceID string,
+						query looppkg.CatalogQuery,
+					) (contract.LoopsResponse, error) {
+						capturedWorkspaceID = workspaceID
+						capturedQuery = query
+						return contract.LoopsResponse{
+							Loops: []contract.LoopCatalogEntryPayload{{
+								Name: "release",
+								LastRun: &contract.LoopCatalogLastRunPayload{
+									ID:        "run-release-latest",
+									Status:    contract.LoopRunStatusRunning,
+									CreatedAt: lastRunCreatedAt,
+								},
+							}},
+							Facets: contract.LoopCatalogFacetsPayload{
+								Kinds:      map[string]int{"workspace": 2},
+								Categories: map[string]int{"delivery": 2},
+								Statuses:   map[string]int{"running": 1},
+							},
+							Page: contract.CountedCursorPagePayload{
+								NextCursor: "cursor-2",
+								HasMore:    true,
+								Total:      3,
+								Limit:      1,
+							},
+						}, nil
+					},
+				}
+			},
+		}, nativeApproveAllPolicyInputs())
+
+		result, err := registry.Call(
+			t.Context(),
+			toolspkg.Scope{SessionID: "sess-alpha", WorkspaceID: "ws-alpha"},
+			toolspkg.CallRequest{
+				ToolID: toolspkg.ToolIDLoopList,
+				Input: json.RawMessage(
+					`{"q":"release","kind":"workspace","category":"delivery","status":"running","sort":"name","cursor":"cursor-1","limit":1}`,
+				),
+			},
+		)
+		if err != nil {
+			t.Fatalf("Registry.Call(loop_list) error = %v", err)
+		}
+
+		if capturedWorkspaceID != "ws-alpha" {
+			t.Fatalf("workspaceID = %q, want ws-alpha", capturedWorkspaceID)
+		}
+		wantQuery := looppkg.CatalogQuery{
+			ProfileID: store.DefaultProfileID,
+			Search:    "release",
+			Kind:      looppkg.CatalogKindWorkspace,
+			Category:  "delivery",
+			Status:    looppkg.StatusRunning,
+			Sort:      looppkg.CatalogSortName,
+			Cursor:    "cursor-1",
+			Limit:     1,
+		}
+		if !reflect.DeepEqual(capturedQuery, wantQuery) {
+			t.Fatalf("query = %#v, want %#v", capturedQuery, wantQuery)
+		}
+		requireNativeStructuredContains(t, result, []byte(`"facets"`))
+		requireNativeStructuredContains(t, result, []byte(`"id":"run-release-latest"`))
+		requireNativeStructuredContains(t, result, []byte(`"status":"running"`))
+		requireNativeStructuredContains(t, result, []byte(`"created_at":"2026-07-10T11:00:00Z"`))
+		requireNativeStructuredContains(t, result, []byte(`"next_cursor":"cursor-2"`))
+		requireNativeStructuredContains(t, result, []byte(`"total":3`))
+		if result.Preview != "1 of 3 loops; more available" {
+			t.Fatalf("preview = %q, want bounded continuation summary", result.Preview)
+		}
+	})
+
+	t.Run("Should reject a loop catalog workspace outside caller scope", func(t *testing.T) {
+		t.Parallel()
+
+		listCalled := false
+		registry := newDaemonNativeRegistry(t, &daemonNativeToolsDeps{
+			Sessions: nativeTestSessionManager("ws-alpha"),
+			Loops: func() core.LoopService {
+				return &nativeLoopServiceStub{
+					listLoopsFn: func(
+						context.Context,
+						string,
+						looppkg.CatalogQuery,
+					) (contract.LoopsResponse, error) {
+						listCalled = true
+						return contract.LoopsResponse{}, nil
+					},
+				}
+			},
+			Workspaces: nativeTestWorkspaceService(t),
+		}, nativeApproveAllPolicyInputs())
+
+		_, err := registry.Call(
+			t.Context(),
+			toolspkg.Scope{SessionID: "sess-alpha", WorkspaceID: "ws-alpha"},
+			toolspkg.CallRequest{
+				ToolID: toolspkg.ToolIDLoopList,
+				Input:  json.RawMessage(`{"workspace":"ws-beta"}`),
+			},
+		)
+
+		toolErr, toolErrMatched := errors.AsType[*toolspkg.ToolError](err)
+		if !toolErrMatched {
+			t.Fatalf("Registry.Call(loop_list foreign workspace) error = %v, want ToolError", err)
+		}
+		if toolErr.Code != toolspkg.ErrorCodeDenied ||
+			!slices.Contains(toolErr.ReasonCodes, toolspkg.ReasonWorkspaceAccessDenied) {
+			t.Fatalf("tool error = %#v, want workspace access denial", toolErr)
+		}
+		if listCalled {
+			t.Fatal("ListLoops was called for a workspace outside caller scope")
+		}
+	})
+
+	t.Run("Should expose effective config sources through native inspect", func(t *testing.T) {
+		t.Parallel()
+
+		effective := contract.LoopEffectiveConfig{
+			IterationCap: 12,
+			Sources: map[string]string{
+				"/iteration_cap": looppkg.EffectiveConfigSourceDeliveryDefaults,
+			},
+		}
+		document := loopAPITestDocument(t, "release", 3, "Release safely")
+		registry := newDaemonNativeRegistry(t, &daemonNativeToolsDeps{
+			Sessions: nativeTestSessionManager("ws-alpha"),
+			Loops: func() core.LoopService {
+				return &nativeLoopServiceStub{getLoopFn: func(
+					context.Context,
+					string,
+					string,
+				) (contract.LoopResponse, error) {
+					return contract.LoopResponse{Loop: contract.LoopDefinitionPayload{
+						Name: "release", Version: 3, Definition: document, EffectiveConfig: &effective,
+					}}, nil
+				}}
+			},
+		}, nativeApproveAllPolicyInputs())
+
+		result, err := registry.Call(
+			t.Context(),
+			toolspkg.Scope{SessionID: "sess-alpha", WorkspaceID: "ws-alpha"},
+			toolspkg.CallRequest{
+				ToolID: toolspkg.ToolIDLoopInspect,
+				Input:  json.RawMessage(`{"name":"release"}`),
+			},
+		)
+		if err != nil {
+			t.Fatalf("Registry.Call(loop_inspect) error = %v", err)
+		}
+		requireNativeStructuredContains(t, result, []byte(`"effective_config"`))
+		requireNativeStructuredContains(t, result, []byte(`"/iteration_cap":"loops.defaults.delivery"`))
+	})
+
+	t.Run("Should forward the selected profile read scope when listing runs", func(t *testing.T) {
+		t.Parallel()
+		const profileID = "profile-loop-owner"
+		var captured core.LoopRunListQuery
+		registry := newDaemonNativeRegistry(t, &daemonNativeToolsDeps{
+			Workspaces: nativeTestWorkspaceService(t),
+			Loops: func() core.LoopService {
+				return &nativeLoopServiceStub{
+					listLoopRunsFn: func(
+						_ context.Context,
+						workspaceID string,
+						query core.LoopRunListQuery,
+					) (contract.LoopRunsResponse, error) {
+						if workspaceID != "ws-alpha" {
+							t.Fatalf("ListLoopRuns workspace = %q, want ws-alpha", workspaceID)
+						}
+						captured = query
+						return contract.LoopRunsResponse{Runs: []contract.LoopRunPayload{{
+							ID: "run-profile", ProfileID: profileID,
+						}}}, nil
+					},
+				}
+			},
+		}, nativeApproveAllPolicyInputs())
+		result, err := registry.Call(t.Context(), toolspkg.Scope{
+			ProfileID: profileID, WorkspaceID: "ws-alpha", Operator: true,
+		}, toolspkg.CallRequest{
+			ToolID: toolspkg.ToolIDLoopRuns,
+			Input:  json.RawMessage(`{"workspace":"ws-alpha","loop_name":"release","status":"running","limit":2}`),
+		})
+		if err != nil {
+			t.Fatalf("Registry.Call(loop_runs) error = %v", err)
+		}
+		if captured.ReadScope.ProfileID != profileID || captured.LoopName != "release" ||
+			captured.Status != "running" || captured.Limit != 2 {
+			t.Fatalf("ListLoopRuns query = %#v, want profile-aware release/running/2", captured)
+		}
+		requireNativeStructuredContains(t, result, []byte(`"profile_id":"profile-loop-owner"`))
+	})
+
+	t.Run("Should preserve current version on stale native Loop publishes", func(t *testing.T) {
+		t.Parallel()
+
+		definition := loopAPITestDefinition(t, "release", 1, "Release safely")
+		input, err := json.Marshal(map[string]any{
+			"definition":       definition,
+			"expected_version": 1,
+		})
+		if err != nil {
+			t.Fatalf("json.Marshal(loop_create input) error = %v", err)
+		}
+		registry := newDaemonNativeRegistry(t, &daemonNativeToolsDeps{
+			Sessions:   nativeTestSessionManager("ws-alpha"),
+			Workspaces: nativeTestWorkspaceService(t),
+			Loops: func() core.LoopService {
+				return &nativeLoopServiceStub{
+					patchLoopFn: func(
+						context.Context,
+						string,
+						string,
+						contract.PatchLoopRequest,
+					) (contract.LoopResponse, error) {
+						return contract.LoopResponse{}, &core.LoopVersionConflictError{CurrentVersion: 2}
+					},
+				}
+			},
+		}, nativeApproveAllPolicyInputs())
+
+		_, err = registry.Call(
+			t.Context(),
+			toolspkg.Scope{SessionID: "sess-alpha", WorkspaceID: "ws-alpha"},
+			toolspkg.CallRequest{ToolID: toolspkg.ToolIDLoopCreate, Input: input},
+		)
+		toolErr, toolErrMatched := errors.AsType[*toolspkg.ToolError](err)
+		if !toolErrMatched || toolErr.Code != toolspkg.ErrorCodeConflict {
+			t.Fatalf("Registry.Call(loop_create stale) error = %#v, want conflict ToolError", err)
+		}
+		if !slices.Contains(toolErr.ReasonCodes, toolspkg.ReasonLoopVersionConflict) {
+			t.Fatalf("ReasonCodes = %#v, want loop_version_conflict", toolErr.ReasonCodes)
+		}
+		if toolErr.PartialResult == nil {
+			t.Fatal("partial result = nil, want version conflict details")
+		}
+		var partial struct {
+			VersionConflict struct {
+				CurrentVersion int `json:"current_version"`
+			} `json:"version_conflict"`
+		}
+		if err := json.Unmarshal(toolErr.PartialResult.Structured, &partial); err != nil {
+			t.Fatalf("json.Unmarshal(partial result) error = %v", err)
+		}
+		if partial.VersionConflict.CurrentVersion != 2 {
+			t.Fatalf("partial result = %#v, want version_conflict.current_version 2", partial)
+		}
+	})
+
+	t.Run("Should deny deletion of immutable native Loop sources", func(t *testing.T) {
+		t.Parallel()
+
+		registry := newDaemonNativeRegistry(t, &daemonNativeToolsDeps{
+			Sessions:   nativeTestSessionManager("ws-alpha"),
+			Workspaces: nativeTestWorkspaceService(t),
+			Loops: func() core.LoopService {
+				return &nativeLoopServiceStub{
+					deleteLoopFn: func(context.Context, string, string) error {
+						return fmt.Errorf("%w: marketplace source", looppkg.ErrDefinitionReadOnly)
+					},
+				}
+			},
+		}, nativeApproveAllPolicyInputs())
+
+		_, err := registry.Call(
+			t.Context(),
+			toolspkg.Scope{SessionID: "sess-alpha", WorkspaceID: "ws-alpha"},
+			toolspkg.CallRequest{
+				ToolID: toolspkg.ToolIDLoopDelete,
+				Input:  json.RawMessage(`{"name":"review-and-fix"}`),
+			},
+		)
+		toolErr, toolErrMatched := errors.AsType[*toolspkg.ToolError](err)
+		if !toolErrMatched || toolErr.Code != toolspkg.ErrorCodeDenied {
+			t.Fatalf("Registry.Call(loop_delete read-only) error = %#v, want denied ToolError", err)
+		}
+		if !slices.Contains(toolErr.ReasonCodes, toolspkg.ReasonLoopSourceImmutable) ||
+			slices.Contains(toolErr.ReasonCodes, toolspkg.ReasonSchemaInvalid) {
+			t.Fatalf("ReasonCodes = %#v, want only Loop source immutability semantics", toolErr.ReasonCodes)
+		}
+	})
+
+	t.Run("Should preserve Loop control reason codes in native errors", func(t *testing.T) {
+		t.Parallel()
+
+		cases := []struct {
+			name         string
+			toolID       toolspkg.ToolID
+			input        json.RawMessage
+			domainReason looppkg.ReasonCode
+			wantReason   toolspkg.ReasonCode
+		}{
+			{
+				name:         "Should preserve invalid status transitions for Pause",
+				toolID:       toolspkg.ToolIDLoopPause,
+				input:        json.RawMessage(`{"run_id":"looprun-paused"}`),
+				domainReason: looppkg.ReasonCodeInvalidStatusTransition,
+				wantReason:   toolspkg.ReasonLoopInvalidStatusTransition,
+			},
+			{
+				name:         "Should preserve terminal run rejection for Cancel",
+				toolID:       toolspkg.ToolIDLoopCancel,
+				input:        json.RawMessage(`{"run_id":"looprun-terminal"}`),
+				domainReason: looppkg.ReasonCodeTerminalRun,
+				wantReason:   toolspkg.ReasonLoopTerminalRun,
+			},
+			{
+				name:         "Should preserve invalid status transitions for Resume",
+				toolID:       toolspkg.ToolIDLoopResume,
+				input:        json.RawMessage(`{"run_id":"looprun-running"}`),
+				domainReason: looppkg.ReasonCodeInvalidStatusTransition,
+				wantReason:   toolspkg.ReasonLoopInvalidStatusTransition,
+			},
+			{
+				name:   "Should preserve invalid status transitions for Approve",
+				toolID: toolspkg.ToolIDLoopApprove,
+				input: json.RawMessage(
+					`{"run_id":"looprun-running","gate_id":"human","decision":"approve"}`,
+				),
+				domainReason: looppkg.ReasonCodeInvalidStatusTransition,
+				wantReason:   toolspkg.ReasonLoopInvalidStatusTransition,
+			},
+		}
+		for _, tc := range cases {
+			t.Run(tc.name, func(t *testing.T) {
+				t.Parallel()
+
+				domainErr := &looppkg.ReasonError{Code: tc.domainReason, Err: looppkg.ErrInvalidTransition}
+				registry := newDaemonNativeRegistry(t, &daemonNativeToolsDeps{
+					Sessions:   nativeTestSessionManager("ws-alpha"),
+					Workspaces: nativeTestWorkspaceService(t),
+					Loops: func() core.LoopService {
+						return &nativeLoopServiceStub{
+							cancelLoopRunFn: func(context.Context, string, string) (contract.LoopMutationResponse, error) {
+								return contract.LoopMutationResponse{}, domainErr
+							},
+							pauseLoopRunFn: func(context.Context, string, string) error {
+								return domainErr
+							},
+							resumeLoopRunFn: func(context.Context, string, string) error {
+								return domainErr
+							},
+							approveLoopRunFn: func(
+								context.Context,
+								string,
+								string,
+								contract.ApproveLoopRunRequest,
+								taskpkg.ActorContext,
+							) error {
+								return domainErr
+							},
+						}
+					},
+				}, nativeApproveAllPolicyInputs())
+
+				_, err := registry.Call(
+					t.Context(),
+					toolspkg.Scope{SessionID: "sess-alpha", WorkspaceID: "ws-alpha"},
+					toolspkg.CallRequest{ToolID: tc.toolID, Input: tc.input},
+				)
+				toolErr, toolErrMatched := errors.AsType[*toolspkg.ToolError](err)
+				if !toolErrMatched || toolErr.Code != toolspkg.ErrorCodeInvalidInput {
+					t.Fatalf("Registry.Call(%s) error = %#v, want invalid-input ToolError", tc.toolID, err)
+				}
+				if !slices.Contains(toolErr.ReasonCodes, tc.wantReason) ||
+					slices.Contains(toolErr.ReasonCodes, toolspkg.ReasonSchemaInvalid) {
+					t.Fatalf(
+						"ReasonCodes = %#v, want only %q Loop control semantics",
+						toolErr.ReasonCodes,
+						tc.wantReason,
+					)
+				}
+				if !errors.Is(err, looppkg.ErrInvalidTransition) {
+					t.Fatalf("Registry.Call(%s) error = %v, want wrapped ErrInvalidTransition", tc.toolID, err)
+				}
+			})
+		}
+
+		lifecycleErr := &looppkg.ReasonError{
+			Code: looppkg.ReasonCodeAlreadyDecided,
+			Err:  looppkg.ErrTransitionConflict,
+			Meta: map[string]string{
+				looppkg.ReasonMetaActualState:        "quarantined",
+				looppkg.ReasonMetaAllowedTransitions: "requeue,cancel",
+				looppkg.ReasonMetaWinnerActorID:      "operator:alice",
+			},
+		}
+		mapped := nativeLoopReasonToolError(toolspkg.ToolIDLoopNodeRequeue, lifecycleErr)
+		toolErr, ok := errors.AsType[*toolspkg.ToolError](mapped)
+		if !ok || toolErr.Code != toolspkg.ErrorCodeConflict ||
+			!errors.Is(mapped, toolspkg.ErrToolConflict) ||
+			!slices.Contains(toolErr.ReasonCodes, toolspkg.ReasonLoopAlreadyDecided) ||
+			toolErr.PartialResult == nil {
+			t.Fatalf("native lifecycle error = %#v", mapped)
+		}
+		var partial contract.ErrorPayload
+		if err := json.Unmarshal(toolErr.PartialResult.Structured, &partial); err != nil {
+			t.Fatalf("json.Unmarshal(native lifecycle partial result) error = %v", err)
+		}
+		if partial.Code != string(looppkg.ReasonCodeAlreadyDecided) ||
+			partial.Details[looppkg.ReasonMetaActualState] != "quarantined" ||
+			partial.Details[looppkg.ReasonMetaWinnerActorID] != "operator:alice" {
+			t.Fatalf("native lifecycle partial result = %#v", partial)
+		}
+	})
+
+	t.Run("Should expose all Loop lifecycle operations through native tools with shared response shapes", func(
+		t *testing.T,
+	) {
+		t.Parallel()
+
+		requestedAt := time.Date(2026, 8, 2, 18, 0, 0, 0, time.UTC)
+		provenance := &contract.LoopControlProvenancePayload{
+			ActorKind: "session", ActorID: "sess-alpha", Reason: "operator request", RequestedAt: requestedAt,
+		}
+		var calls []string
+		loopSvc := &nativeLoopServiceStub{
+			cancelLoopRunFn: func(_ context.Context, workspaceID string, runID string) (contract.LoopMutationResponse, error) {
+				calls = append(calls, "run.cancel")
+				if workspaceID != "ws-alpha" || runID != "run-1" {
+					t.Fatalf("CancelLoopRun target = %s/%s", workspaceID, runID)
+				}
+				return contract.LoopMutationResponse{
+					OK: true, RunID: runID, Status: string(contract.LoopRunStatusCanceled), Provenance: provenance,
+				}, nil
+			},
+			listLoopNodesFn: func(
+				_ context.Context,
+				workspaceID string,
+				query core.LoopNodeListQuery,
+			) (contract.LoopNodeInventoryResponse, error) {
+				calls = append(calls, "nodes.list")
+				if workspaceID != "ws-alpha" || query.State != "waiting" || query.Limit != 5 {
+					t.Fatalf("ListLoopNodes scope/query = %s/%#v", workspaceID, query)
+				}
+				return contract.LoopNodeInventoryResponse{Items: []contract.LoopNodeInventoryItem{{
+					State:      contract.LoopNodeInventoryWaiting,
+					LoopRunID:  "run-1",
+					LoopName:   "release",
+					Generation: 2,
+					NodeID:     "approval",
+					StateAt:    requestedAt,
+				}}}, nil
+			},
+			pauseLoopNodeFn: func(
+				_ context.Context,
+				workspaceID string,
+				runID string,
+				nodeID string,
+				req contract.LoopNodePauseRequest,
+				_ taskpkg.ActorContext,
+			) (contract.LoopMutationResponse, error) {
+				calls = append(calls, "node.pause")
+				if workspaceID != "ws-alpha" || runID != "run-1" || nodeID != "approval" ||
+					req.Mode != "drain" || req.Reason != "inspect" {
+					t.Fatalf("PauseLoopNode request = %s/%s/%s %#v", workspaceID, runID, nodeID, req)
+				}
+				return nativeLoopNodeMutationResponse(runID, nodeID, provenance), nil
+			},
+			resumeLoopNodeFn: func(
+				_ context.Context,
+				_ string,
+				runID string,
+				nodeID string,
+				req contract.LoopNodeResumeRequest,
+				_ taskpkg.ActorContext,
+			) (contract.LoopMutationResponse, error) {
+				calls = append(calls, "node.resume")
+				validPayload := string(req.Payload) == `{"approved":true}`
+				if req.Mode != "plain" || req.ItemIndex == nil || *req.ItemIndex != 0 || !validPayload {
+					t.Fatalf("ResumeLoopNode request = %#v", req)
+				}
+				return nativeLoopNodeMutationResponse(runID, nodeID, provenance), nil
+			},
+			cancelLoopNodeFn: nativeLoopNodeMutationRecorder(t, &calls, "node.cancel", provenance),
+			requeueLoopNodeFn: nativeLoopNodeMutationRecorder(
+				t, &calls, "node.requeue", provenance,
+			),
+		}
+		registry := newDaemonNativeRegistry(t, &daemonNativeToolsDeps{
+			Sessions:   nativeTestSessionManager("ws-alpha"),
+			Workspaces: nativeTestWorkspaceService(t),
+			Loops:      func() core.LoopService { return loopSvc },
+		}, nativeApproveAllPolicyInputs())
+
+		cases := []struct {
+			id        toolspkg.ToolID
+			input     string
+			inventory bool
+		}{
+			{id: toolspkg.ToolIDLoopCancel, input: `{"run_id":"run-1"}`},
+			{id: toolspkg.ToolIDLoopNodes, input: `{"state":"waiting","limit":5}`, inventory: true},
+			{
+				id:    toolspkg.ToolIDLoopNodePause,
+				input: `{"run_id":"run-1","node_id":"approval","mode":"drain","reason":"inspect"}`,
+			},
+			{
+				id:    toolspkg.ToolIDLoopNodeResume,
+				input: `{"run_id":"run-1","node_id":"approval","mode":"plain","item_index":0,"payload":{"approved":true}}`,
+			},
+			{
+				id:    toolspkg.ToolIDLoopNodeCancel,
+				input: `{"run_id":"run-1","node_id":"approval","reason":"inspect"}`,
+			},
+			{
+				id:    toolspkg.ToolIDLoopNodeRequeue,
+				input: `{"run_id":"run-1","node_id":"approval","reason":"inspect"}`,
+			},
+		}
+		for _, tc := range cases {
+			result, err := registry.Call(
+				t.Context(),
+				toolspkg.Scope{SessionID: "sess-alpha", WorkspaceID: "ws-alpha"},
+				toolspkg.CallRequest{ToolID: tc.id, Input: json.RawMessage(tc.input)},
+			)
+			if err != nil {
+				t.Fatalf("Registry.Call(%s) error = %v", tc.id, err)
+			}
+			if tc.inventory {
+				var response contract.LoopNodeInventoryResponse
+				if err := json.Unmarshal(result.Structured, &response); err != nil || len(response.Items) != 1 {
+					t.Fatalf("%s structured result = %s, error = %v", tc.id, result.Structured, err)
+				}
+				continue
+			}
+			var response contract.LoopMutationResponse
+			if err := json.Unmarshal(result.Structured, &response); err != nil {
+				t.Fatalf("json.Unmarshal(%s result) error = %v", tc.id, err)
+			}
+			if !response.OK || response.RunID != "run-1" || response.Provenance == nil {
+				t.Fatalf("%s structured result = %#v", tc.id, response)
+			}
+		}
+
+		wantCalls := []string{
+			"run.cancel", "nodes.list", "node.pause", "node.resume", "node.cancel", "node.requeue",
+		}
+		if !slices.Equal(calls, wantCalls) {
+			t.Fatalf("lifecycle calls = %#v, want %#v", calls, wantCalls)
+		}
+	})
+
+	t.Run("Should amend one addressed node cell through the native tool", func(t *testing.T) {
+		t.Parallel()
+
+		loopSvc := &nativeLoopServiceStub{amendLoopNodeFn: func(
+			_ context.Context, workspaceID, runID, nodeID string,
+			req contract.LoopNodeAmendRequest, actor taskpkg.ActorContext,
+		) (contract.LoopNodeAmendResponse, error) {
+			if workspaceID != "ws-alpha" || runID != "run-1" || nodeID != "repair" ||
+				req.ItemIndex != 3 || string(req.Payload) != `{"value":"fixed"}` ||
+				actor.Actor.Kind.Normalize() != taskpkg.ActorKindAgentSession {
+				t.Fatalf("AmendLoopNode request = %s/%s/%s %#v actor=%#v", workspaceID, runID, nodeID, req, actor)
+			}
+			return contract.LoopNodeAmendResponse{OK: true, Amendment: contract.LoopNodeAmendmentPayload{
+				LoopRunID: runID, Generation: 2, NodeID: nodeID, ItemIndex: req.ItemIndex,
+				Sequence: 1, Amended: req.Payload,
+			}}, nil
+		}}
+		registry := newDaemonNativeRegistry(t, &daemonNativeToolsDeps{
+			Sessions: nativeTestSessionManager("ws-alpha"),
+			Loops:    func() core.LoopService { return loopSvc },
+		}, nativeApproveAllPolicyInputs())
+		result, err := registry.Call(t.Context(),
+			toolspkg.Scope{SessionID: "sess-alpha", WorkspaceID: "ws-alpha"},
+			toolspkg.CallRequest{
+				ToolID: toolspkg.ToolIDLoopNodeAmend,
+				Input: json.RawMessage(
+					`{"run_id":"run-1","node_id":"repair","item_index":3,"payload":{"value":"fixed"}}`,
+				),
+			},
+		)
+		if err != nil {
+			t.Fatalf("Registry.Call(loop_node_amend) error = %v", err)
+		}
+		var response contract.LoopNodeAmendResponse
+		if err := json.Unmarshal(result.Structured, &response); err != nil || !response.OK ||
+			response.Amendment.ItemIndex != 3 || response.Amendment.Sequence != 1 {
+			t.Fatalf("loop_node_amend structured result = %s, error = %v", result.Structured, err)
+		}
+	})
+
+	t.Run("Should route dry run through loop service with native tool actor", func(t *testing.T) {
+		t.Parallel()
+
+		var capturedStartKind dsl.StartKind
+		var capturedActor taskpkg.ActorContext
+		var capturedDry bool
+		registry := newDaemonNativeRegistry(t, &daemonNativeToolsDeps{
+			Sessions: nativeTestSessionManager("ws-alpha", "profile-marketing"),
+			Loops: func() core.LoopService {
+				return &nativeLoopServiceStub{
+					runLoopFn: func(
+						_ context.Context,
+						workspaceID string,
+						name string,
+						input core.LoopRunInput,
+					) (contract.RunLoopResponse, error) {
+						request := input.Request
+						if workspaceID != "ws-alpha" || name != "release" {
+							t.Fatalf("RunLoop target = %s/%s, want ws-alpha/release", workspaceID, name)
+						}
+						if input.ProfileID != "profile-marketing" {
+							t.Fatalf("RunLoop profile = %q, want profile-marketing", input.ProfileID)
+						}
+						if request.Inputs["target"] != "prod" {
+							t.Fatalf("RunLoop inputs = %#v, want target prod", request.Inputs)
+						}
+						if request.ConfigOverrides == nil ||
+							request.ConfigOverrides.Environment == nil ||
+							request.ConfigOverrides.Environment.Mode != contract.LoopEnvironmentModePerRun {
+							t.Fatalf(
+								"RunLoop config overrides = %#v, want per_run environment",
+								request.ConfigOverrides,
+							)
+						}
+						if len(request.ConfigOverrides.RuntimeRules) != 2 ||
+							request.ConfigOverrides.RuntimeRules[0].Match.Type != "frontend" ||
+							request.ConfigOverrides.RuntimeRules[0].Match.Complexity != "high" ||
+							request.ConfigOverrides.RuntimeRules[0].Runtime.Reasoning != "high" ||
+							request.ConfigOverrides.RuntimeRules[1].Match.Complexity != "low" ||
+							request.ConfigOverrides.RuntimeRules[1].Runtime.Model != "gpt-5.6-luna" {
+							t.Fatalf(
+								"RunLoop runtime rules = %#v, want conjunction and legacy rule",
+								request.ConfigOverrides.RuntimeRules,
+							)
+						}
+						capturedStartKind = input.StartKind
+						capturedActor = input.Actor
+						capturedDry = input.Dry
+						return contract.RunLoopResponse{
+							DryRun: &contract.LoopPlanPayload{
+								LoopName:       "release",
+								ResolvedInputs: request.Inputs,
+								InputOrigins: map[string]contract.LoopInputOrigin{
+									"target": contract.LoopInputOriginRun,
+								},
+								EffectiveConfig: contract.LoopEffectiveConfig{
+									RunRuntimeRules: request.ConfigOverrides.RuntimeRules,
+									Sources: map[string]string{
+										"/run_runtime_rules/0": looppkg.EffectiveConfigSourcePerRun,
+									},
+								},
+							},
+						}, nil
+					},
+				}
+			},
+		}, nativeApproveAllPolicyInputs())
+
+		result, err := registry.Call(
+			t.Context(),
+			toolspkg.Scope{SessionID: "sess-caller", ProfileID: "profile-marketing", WorkspaceID: "ws-alpha"},
+			toolspkg.CallRequest{
+				ToolID: toolspkg.ToolIDLoopRun,
+				Input: json.RawMessage(
+					`{"workspace":"ws-alpha","name":"release","inputs":{"target":"prod"},"config_overrides":{"environment":{"mode":"per_run"},"runtime_rules":[{"match":{"type":"frontend","complexity":"high"},"runtime":{"reasoning":"high"}},{"match":{"complexity":"low"},"runtime":{"model":"gpt-5.6-luna"}}]},"dry":true}`,
+				),
+			},
+		)
+		if err != nil {
+			t.Fatalf("Registry.Call(loop_run) error = %v", err)
+		}
+
+		if capturedStartKind != dsl.StartNativeTool {
+			t.Fatalf("startKind = %q, want native_tool", capturedStartKind)
+		}
+		if capturedActor.Actor.Kind != taskpkg.ActorKindAgentSession || capturedActor.Actor.Ref != "sess-caller" {
+			t.Fatalf("actor = %#v, want agent session sess-caller", capturedActor.Actor)
+		}
+		if !capturedDry {
+			t.Fatal("dry = false, want true")
+		}
+		requireNativeStructuredContains(t, result, []byte(`"dry_run"`))
+		requireNativeStructuredContains(t, result, []byte(`"release"`))
+		requireNativeStructuredContains(t, result, []byte(`"input_origins":{"target":"run"}`))
+		requireNativeStructuredContains(
+			t,
+			result,
+			[]byte(`"match":{"type":"frontend","complexity":"high"}`),
+		)
+		requireNativeStructuredContains(
+			t,
+			result,
+			[]byte(`"match":{"complexity":"low"},"runtime":{"model":"gpt-5.6-luna"}`),
+		)
+		requireNativeStructuredContains(t, result, []byte(`"/run_runtime_rules/0":"per_run"`))
+	})
+
+	t.Run("Should reject structurally invalid runtime rules before Loop service", func(t *testing.T) {
+		t.Parallel()
+
+		for _, testCase := range []struct {
+			name string
+			rule string
+		}{
+			{name: "Should reject an empty matcher", rule: `{"match":{},"runtime":{"provider":"codex"}}`},
+			{
+				name: "Should reject an ID collision",
+				rule: `{"match":{"id":"task_01","type":"frontend"},"runtime":{"provider":"codex"}}`,
+			},
+			{name: "Should reject an empty runtime", rule: `{"match":{"type":"frontend"},"runtime":{}}`},
+			{
+				name: "Should reject an unknown runtime field",
+				rule: `{"match":{"type":"frontend"},"runtime":{"effort":"high"}}`,
+			},
+		} {
+			t.Run(testCase.name, func(t *testing.T) {
+				t.Parallel()
+
+				called := false
+				registry := newDaemonNativeRegistry(t, &daemonNativeToolsDeps{
+					Sessions: nativeTestSessionManager("ws-alpha"),
+					Loops: func() core.LoopService {
+						return &nativeLoopServiceStub{runLoopFn: func(
+							context.Context,
+							string,
+							string,
+							core.LoopRunInput,
+						) (contract.RunLoopResponse, error) {
+							called = true
+							return contract.RunLoopResponse{}, nil
+						}}
+					},
+				}, nativeApproveAllPolicyInputs())
+				_, err := registry.Call(
+					t.Context(),
+					toolspkg.Scope{SessionID: "sess-caller", WorkspaceID: "ws-alpha"},
+					toolspkg.CallRequest{
+						ToolID: toolspkg.ToolIDLoopRun,
+						Input: json.RawMessage(
+							`{"name":"release","config_overrides":{"runtime_rules":[` +
+								testCase.rule + `]},"dry":true}`,
+						),
+					},
+				)
+				if called {
+					t.Fatal("Loop service was called for a structurally invalid runtime rule")
+				}
+				toolErr, matched := errors.AsType[*toolspkg.ToolError](err)
+				if !matched || toolErr.Code != toolspkg.ErrorCodeInvalidInput {
+					t.Fatalf("Registry.Call(loop_run) error = %#v, want invalid-input ToolError", err)
+				}
+			})
+		}
+	})
+
+	t.Run("Should preserve the persisted run web URL in structured output", func(t *testing.T) {
+		t.Parallel()
+
+		registry := newDaemonNativeRegistry(t, &daemonNativeToolsDeps{
+			Sessions: nativeTestSessionManager("ws-alpha", "profile-marketing"),
+			Loops: func() core.LoopService {
+				return &nativeLoopServiceStub{
+					runLoopFn: func(
+						context.Context,
+						string,
+						string,
+						core.LoopRunInput,
+					) (contract.RunLoopResponse, error) {
+						return contract.RunLoopResponse{
+							Run:    &contract.LoopRunPayload{ID: "run-release"},
+							WebURL: "http://127.0.0.1:43127/loop-runs/run-release",
+						}, nil
+					},
+				}
+			},
+		}, nativeApproveAllPolicyInputs())
+
+		result, err := registry.Call(
+			t.Context(),
+			toolspkg.Scope{SessionID: "sess-caller", ProfileID: "profile-marketing", WorkspaceID: "ws-alpha"},
+			toolspkg.CallRequest{
+				ToolID: toolspkg.ToolIDLoopRun,
+				Input:  json.RawMessage(`{"name":"release"}`),
+			},
+		)
+		if err != nil {
+			t.Fatalf("Registry.Call(loop_run persisted) error = %v", err)
+		}
+		requireNativeStructuredContains(
+			t,
+			result,
+			[]byte(`"web_url":"http://127.0.0.1:43127/loop-runs/run-release"`),
+		)
+	})
+
+	t.Run("Should return typed input validation diagnostics for native submissions", func(t *testing.T) {
+		t.Parallel()
+
+		registry := newDaemonNativeRegistry(t, &daemonNativeToolsDeps{
+			Sessions: nativeTestSessionManager("ws-alpha", "profile-marketing"),
+			Loops: func() core.LoopService {
+				return &nativeLoopServiceStub{
+					runLoopFn: func(
+						context.Context,
+						string,
+						string,
+						core.LoopRunInput,
+					) (contract.RunLoopResponse, error) {
+						return contract.RunLoopResponse{}, &looppkg.InputValidationError{
+							Loop: "review-and-fix", Field: "unknown", Origin: looppkg.InputOriginRun,
+							Reason: looppkg.InputValidationReasonUnknownInput,
+							Err:    errors.New("input is not declared"),
+						}
+					},
+				}
+			},
+		}, nativeApproveAllPolicyInputs())
+
+		_, err := registry.Call(
+			t.Context(),
+			toolspkg.Scope{SessionID: "sess-caller", ProfileID: "profile-marketing", WorkspaceID: "ws-alpha"},
+			toolspkg.CallRequest{
+				ToolID: toolspkg.ToolIDLoopRun,
+				Input:  json.RawMessage(`{"name":"review-and-fix","inputs":{"unknown":true},"dry":true}`),
+			},
+		)
+		toolErr, toolErrMatched := errors.AsType[*toolspkg.ToolError](err)
+		if !toolErrMatched || toolErr.Code != toolspkg.ErrorCodeInvalidInput {
+			t.Fatalf("Registry.Call(loop_run input validation) error = %#v, want invalid-input ToolError", err)
+		}
+		if toolErr.PartialResult == nil {
+			t.Fatalf("loop_run input validation ToolError = %#v, want structured partial result", toolErr)
+		}
+		structured := string(toolErr.PartialResult.Structured)
+		for _, want := range []string{
+			`"input_validation"`,
+			`"loop":"review-and-fix"`,
+			`"field":"unknown"`,
+			`"origin":"run"`,
+			`"reason":"unknown_input"`,
+		} {
+			if !strings.Contains(structured, want) {
+				t.Fatalf("loop_run input validation structured payload = %s, want %s", structured, want)
+			}
+		}
+	})
+
+	t.Run("Should return structured runtime validation diagnostics", func(t *testing.T) {
+		t.Parallel()
+
+		definition := loopAPITestDefinition(t, "release", 1, "Release safely")
+		input, err := json.Marshal(map[string]any{
+			"workspace":  "ws-alpha",
+			"name":       "release",
+			"definition": definition,
+		})
+		if err != nil {
+			t.Fatalf("json.Marshal(loop_validate input) error = %v", err)
+		}
+		registry := newDaemonNativeRegistry(t, &daemonNativeToolsDeps{
+			Sessions: nativeTestSessionManager("ws-alpha"),
+			Loops: func() core.LoopService {
+				return &nativeLoopServiceStub{
+					validateLoopFn: func(
+						context.Context,
+						string,
+						string,
+						contract.ValidateLoopRequest,
+					) (contract.LoopValidationResponse, error) {
+						return contract.LoopValidationResponse{}, looppkg.NewRuntimeValidationError(
+							looppkg.RuntimeValidationItem{
+								TaskID: "task_06",
+								Field:  "model",
+								Value:  "unknown-model",
+								Reason: "unknown_model",
+							},
+						)
+					},
+				}
+			},
+		}, nativeApproveAllPolicyInputs())
+
+		result, err := registry.Call(
+			t.Context(),
+			toolspkg.Scope{SessionID: "sess-alpha", WorkspaceID: "ws-alpha"},
+			toolspkg.CallRequest{ToolID: toolspkg.ToolIDLoopValidate, Input: input},
+		)
+		if err != nil {
+			t.Fatalf("Registry.Call(loop_validate) error = %v", err)
+		}
+		requireNativeStructuredContains(t, result, []byte(`"valid":false`))
+		requireNativeStructuredContains(t, result, []byte(`"runtime_validation"`))
+		requireNativeStructuredContains(t, result, []byte(`"task_id":"task_06"`))
+		requireNativeStructuredContains(t, result, []byte(`"reason":"unknown_model"`))
+	})
+
+	t.Run("Should reject retired runtime keys before calling the loop service", func(t *testing.T) {
+		t.Parallel()
+
+		validateCalled := false
+		registry := newDaemonNativeRegistry(t, &daemonNativeToolsDeps{
+			Sessions: nativeTestSessionManager("ws-alpha"),
+			Loops: func() core.LoopService {
+				return &nativeLoopServiceStub{
+					validateLoopFn: func(
+						context.Context,
+						string,
+						string,
+						contract.ValidateLoopRequest,
+					) (contract.LoopValidationResponse, error) {
+						validateCalled = true
+						return contract.LoopValidationResponse{}, nil
+					},
+				}
+			},
+		}, nativeApproveAllPolicyInputs())
+
+		_, err := registry.Call(
+			t.Context(),
+			toolspkg.Scope{SessionID: "sess-alpha", WorkspaceID: "ws-alpha"},
+			toolspkg.CallRequest{
+				ToolID: toolspkg.ToolIDLoopValidate,
+				Input:  json.RawMessage(`{"definition":{"contract":{"model_defaults":{}}}}`),
+			},
+		)
+
+		toolErr, toolErrMatched := errors.AsType[*toolspkg.ToolError](err)
+		if !toolErrMatched {
+			t.Fatalf("Registry.Call(loop_validate retired key) error = %v, want ToolError", err)
+		}
+		if toolErr.Code != toolspkg.ErrorCodeInvalidInput ||
+			!strings.Contains(toolErr.Error(), "definition.contract.model_defaults") ||
+			!strings.Contains(toolErr.Error(), "MIGRATION_GUIDE.md#per-task-runtime-selection") {
+			t.Fatalf("tool error = %#v, want retired-key migration guidance", toolErr)
+		}
+		if validateCalled {
+			t.Fatal("ValidateLoop was called after native retired-key preflight failed")
+		}
+	})
+
+	t.Run("Should distinguish retired criterion model from nested runtime model", func(t *testing.T) {
+		t.Parallel()
+
+		valid := json.RawMessage(`{
+			"definition": {
+				"contract": {
+					"runtime_defaults": {"judge": {"model": "judge-model"}},
+					"verification": [{"runtime": {"model": "criterion-model"}}]
+				}
+			}
+		}`)
+		if path, found := retiredNativeLoopRuntimePath(valid); found {
+			t.Fatalf("retiredNativeLoopRuntimePath(valid runtime) = %q, true; want false", path)
+		}
+		retired := json.RawMessage(
+			`{"definition":{"contract":{"verification":[{"model":"gpt-5.4"}]}}}`,
+		)
+		path, found := retiredNativeLoopRuntimePath(retired)
+		if !found || path != "definition.contract.verification[0].model" {
+			t.Fatalf("retiredNativeLoopRuntimePath(retired model) = %q, %t", path, found)
+		}
+	})
+
+	t.Run("Should preserve resolved runtime provenance in native status", func(t *testing.T) {
+		t.Parallel()
+
+		var capturedWorkspaceID string
+		registry := newDaemonNativeRegistry(t, &daemonNativeToolsDeps{
+			Sessions: nativeTestSessionManager("ws-alpha"),
+			Workspaces: apitest.StubWorkspaceService{ResolveFn: func(
+				_ context.Context,
+				ref string,
+			) (workspacepkg.ResolvedWorkspace, error) {
+				switch ref {
+				case "registry-alpha", "stable-alpha":
+					return workspacepkg.ResolvedWorkspace{
+						ID:          "registry-alpha",
+						WorkspaceID: "stable-alpha",
+					}, nil
+				default:
+					return workspacepkg.ResolvedWorkspace{}, workspacepkg.ErrWorkspaceNotFound
+				}
+			}},
+			Loops: func() core.LoopService {
+				return &nativeLoopServiceStub{
+					getLoopRunFn: func(
+						_ context.Context,
+						workspaceID string,
+						_ string,
+					) (contract.LoopRunResponse, error) {
+						capturedWorkspaceID = workspaceID
+						return contract.LoopRunResponse{
+							Run: contract.LoopRunPayload{ID: "run-1", Status: contract.LoopRunStatusRunning},
+							EffectiveConfig: contract.LoopEffectiveConfig{Sources: map[string]string{
+								"/runtime_defaults/worker/model": looppkg.EffectiveConfigSourceDefinition,
+							}},
+							Generations: []contract.LoopGenerationPayload{{
+								Generation: 1,
+								Outputs: []contract.LoopGenerationOutput{{
+									NodeID: "worker",
+									Status: "completed",
+									ResolvedRuntime: &contract.LoopResolvedRuntime{
+										Provider: "openai",
+										Model:    "gpt-5.4",
+										Source: contract.LoopRuntimeProvenance{
+											Provider: "default",
+											Model:    "frontmatter",
+										},
+									},
+								}},
+							}},
+						}, nil
+					},
+				}
+			},
+		}, nativeApproveAllPolicyInputs())
+
+		result, err := registry.Call(
+			t.Context(),
+			toolspkg.Scope{Operator: true, WorkspaceID: "registry-alpha"},
+			toolspkg.CallRequest{
+				ToolID: toolspkg.ToolIDLoopStatus,
+				Input:  json.RawMessage(`{"run_id":"run-1"}`),
+			},
+		)
+		if err != nil {
+			t.Fatalf("Registry.Call(loop_status) error = %v", err)
+		}
+		if capturedWorkspaceID != "registry-alpha" {
+			t.Fatalf("Loop service workspace ID = %q, want registry-alpha", capturedWorkspaceID)
+		}
+		requireNativeStructuredContains(t, result, []byte(`"resolved_runtime"`))
+		requireNativeStructuredContains(t, result, []byte(`"model":"gpt-5.4"`))
+		requireNativeStructuredContains(t, result, []byte(`"model":"frontmatter"`))
+		requireNativeStructuredContains(
+			t,
+			result,
+			[]byte(`"/runtime_defaults/worker/model":"definition"`),
+		)
+	})
+
+	t.Run("Should keep loop tools unavailable until service is ready", func(t *testing.T) {
+		t.Parallel()
+
+		var loopSvc core.LoopService
+		registry := newDaemonNativeRegistry(t, &daemonNativeToolsDeps{
+			Sessions:   nativeTestSessionManager("ws-alpha"),
+			Workspaces: nativeTestWorkspaceService(t),
+			Loops:      func() core.LoopService { return loopSvc },
+		}, nativeApproveAllPolicyInputs())
+		scope := toolspkg.Scope{SessionID: "sess-alpha", WorkspaceID: "ws-alpha"}
+		views, err := registry.OperatorProjection(t.Context(), scope)
+		if err != nil {
+			t.Fatalf("OperatorProjection(before service) error = %v", err)
+		}
+		readinessToolIDs := nativeToolIDsWithPrefixes(views, "loop_", "goal_")
+		loopToolIDs := nativeToolIDsWithPrefixes(views, "loop_")
+		if len(readinessToolIDs) == 0 || len(loopToolIDs) == 0 {
+			t.Fatal("OperatorProjection(before service) contains no Loop or Goal tools")
+		}
+		for _, id := range readinessToolIDs {
+			requireNativeToolUnavailableReason(t, views, id)
+		}
+
+		loopSvc = &nativeLoopServiceStub{
+			listLoopsFn: func(context.Context, string, looppkg.CatalogQuery) (contract.LoopsResponse, error) {
+				return contract.LoopsResponse{}, nil
+			},
+		}
+		views, err = registry.OperatorProjection(t.Context(), scope)
+		if err != nil {
+			t.Fatalf("OperatorProjection(after service) error = %v", err)
+		}
+		for _, id := range loopToolIDs {
+			requireNativeToolAvailable(t, views, id)
+		}
+	})
+
+	t.Run("Should surface shared service self approval denial", func(t *testing.T) {
+		t.Parallel()
+
+		approveCalled := false
+		registry := newDaemonNativeRegistry(t, &daemonNativeToolsDeps{
+			Sessions: nativeTestSessionManager("ws-alpha"),
+			Loops: func() core.LoopService {
+				return &nativeLoopServiceStub{
+					approveLoopRunFn: func(context.Context, string, string, contract.ApproveLoopRunRequest, taskpkg.ActorContext) error {
+						approveCalled = true
+						return taskpkg.ErrPermissionDenied
+					},
+				}
+			},
+		}, nativeApproveAllPolicyInputs())
+
+		_, err := registry.Call(
+			t.Context(),
+			toolspkg.Scope{SessionID: "sess-author", WorkspaceID: "ws-alpha"},
+			toolspkg.CallRequest{
+				ToolID: toolspkg.ToolIDLoopApprove,
+				Input: json.RawMessage(
+					`{"workspace":"ws-alpha","run_id":"looprun-1","gate_id":"human",` +
+						`"decision":"approve","approval_token_hash":"sha256:` +
+						strings.Repeat("a", 64) +
+						`"}`,
+				),
+			},
+		)
+
+		toolErr, toolErrMatched := errors.AsType[*toolspkg.ToolError](err)
+		if !toolErrMatched {
+			t.Fatalf("Registry.Call(loop_approve) error = %v, want ToolError", err)
+		}
+		if !slices.Contains(toolErr.ReasonCodes, toolspkg.ReasonApprovalSelfDenied) ||
+			!slices.Contains(toolErr.ReasonCodes, toolspkg.ReasonPolicyDenied) {
+			t.Fatalf("ReasonCodes = %#v, want self approval and policy denial", toolErr.ReasonCodes)
+		}
+		if !approveCalled {
+			t.Fatal("ApproveLoopRun was not called")
+		}
+	})
+
+	t.Run("Should reject raw approval tokens without echoing them", func(t *testing.T) {
+		t.Parallel()
+
+		registry := newDaemonNativeRegistry(t, &daemonNativeToolsDeps{
+			Sessions: nativeTestSessionManager("ws-alpha"),
+			Loops:    func() core.LoopService { return &nativeLoopServiceStub{} },
+		}, nativeApproveAllPolicyInputs())
+
+		_, err := registry.Call(
+			t.Context(),
+			toolspkg.Scope{SessionID: "sess-reviewer"},
+			toolspkg.CallRequest{
+				ToolID: toolspkg.ToolIDLoopApprove,
+				Input: json.RawMessage(
+					`{"workspace":"ws-alpha","run_id":"looprun-1","gate_id":"human","decision":"approve","approval_token_hash":"raw-secret-token"}`,
+				),
+			},
+		)
+
+		toolErr, toolErrMatched := errors.AsType[*toolspkg.ToolError](err)
+		if !toolErrMatched {
+			t.Fatalf("Registry.Call(loop_approve raw token) error = %v, want ToolError", err)
+		}
+		if toolErr.Code != toolspkg.ErrorCodeInvalidInput ||
+			!slices.Contains(toolErr.ReasonCodes, toolspkg.ReasonSchemaInvalid) {
+			t.Fatalf("tool error = %#v, want invalid input schema error", toolErr)
+		}
+		if strings.Contains(toolErr.Error(), "raw-secret-token") {
+			t.Fatalf("tool error leaked raw token: %v", toolErr)
+		}
+	})
+
+	t.Run("Should expose a visible Goal through origin and active binding alias until clear", func(t *testing.T) {
+		t.Parallel()
+
+		visible := true
+		aliasActive := true
+		snapshot := &session.GoalSnapshot{
+			RunID: "run-goal", NodeID: "goal", Objective: "ship safely",
+			BoundSessionID: "session-bound",
+			Status:         "complete", RunStatus: "done", TurnsUsed: 2, TurnLimit: 4,
+			ContractSummary: "objective satisfied", Context: session.GoalContextSnapshot{
+				State: "unknown", NudgeRatio: 0.8,
+			},
+		}
+		loopSvc := &nativeLoopServiceStub{
+			getSessionGoalFn: func(_ context.Context, workspaceID string, sessionID string) (*session.GoalSnapshot, error) {
+				if workspaceID != "ws-goal" || !visible || sessionID != "session-origin" {
+					return nil, nil
+				}
+				return snapshot, nil
+			},
+			resolveActiveGoalOriginAliasFn: func(
+				_ context.Context,
+				workspaceID looppkg.WorkspaceID,
+				sessionID string,
+			) (string, bool, error) {
+				if workspaceID == "ws-goal" && sessionID == "session-bound" && aliasActive {
+					return "session-origin", true, nil
+				}
+				return "", false, nil
+			},
+		}
+		registry := newDaemonNativeRegistry(t, &daemonNativeToolsDeps{
+			Sessions:   nativeTestSessionManager("ws-alpha"),
+			Loops:      func() core.LoopService { return loopSvc },
+			Workspaces: nativeTestWorkspaceService(t),
+		}, nativeApproveAllPolicyInputs())
+
+		for _, sessionID := range []string{"session-origin", "session-bound"} {
+			scope := toolspkg.Scope{WorkspaceID: "ws-goal", SessionID: sessionID, Operator: true}
+			views, err := registry.OperatorProjection(t.Context(), scope)
+			if err != nil {
+				t.Fatalf("OperatorProjection(%s) error = %v", sessionID, err)
+			}
+			requireNativeToolAvailable(t, views, toolspkg.ToolIDGoalGet)
+			result, err := registry.Call(t.Context(), scope, toolspkg.CallRequest{
+				ToolID: toolspkg.ToolIDGoalGet,
+				Input:  json.RawMessage(`{}`),
+			})
+			if err != nil {
+				t.Fatalf("Registry.Call(goal_get %s) error = %v", sessionID, err)
+			}
+			requireNativeStructuredContains(t, result, []byte(`"run_id":"run-goal"`))
+			requireNativeStructuredContains(t, result, []byte(`"live":false`))
+		}
+
+		aliasActive = false
+		aliasViews, err := registry.OperatorProjection(
+			t.Context(),
+			toolspkg.Scope{WorkspaceID: "ws-goal", SessionID: "session-bound", Operator: true},
+		)
+		if err != nil {
+			t.Fatalf("OperatorProjection(alias revoked) error = %v", err)
+		}
+		requireNativeToolUnavailableWithReason(
+			t,
+			aliasViews,
+			toolspkg.ToolIDGoalGet,
+			toolspkg.ReasonGoalNotActive,
+		)
+
+		visible = false
+		originViews, err := registry.OperatorProjection(
+			t.Context(),
+			toolspkg.Scope{WorkspaceID: "ws-goal", SessionID: "session-origin", Operator: true},
+		)
+		if err != nil {
+			t.Fatalf("OperatorProjection(cleared) error = %v", err)
+		}
+		requireNativeToolUnavailableWithReason(
+			t,
+			originViews,
+			toolspkg.ToolIDGoalGet,
+			toolspkg.ReasonGoalNotActive,
+		)
+	})
+
+	t.Run("Should report only against the invocation-time prompt identity", func(t *testing.T) {
+		t.Parallel()
+
+		target := goalpkg.ToolReportTarget{
+			Key: goalpkg.TurnKey{
+				WorkspaceID: "ws-goal", LoopRunID: "run-goal", Generation: 2,
+				NodeID: "goal", ItemIndex: 0,
+			},
+			ExpectedControlEpoch: 3, ExpectedBindingEpoch: 4,
+			PromptID:       "prompt-current",
+			BoundSessionID: "session-bound",
+		}
+		var captured goalpkg.RecordToolReportRequest
+		loopSvc := &nativeLoopServiceStub{
+			findGoalReportTargetFn: func(
+				_ context.Context,
+				workspaceID looppkg.WorkspaceID,
+				sessionID string,
+			) (goalpkg.ToolReportTarget, bool, error) {
+				if workspaceID != "ws-goal" || sessionID != "session-bound" {
+					t.Fatalf("FindGoalReportTarget target = %s/%s", workspaceID, sessionID)
+				}
+				return target, true, nil
+			},
+			recordGoalReportFn: func(
+				_ context.Context,
+				request goalpkg.RecordToolReportRequest,
+			) (goalpkg.ReportIntent, error) {
+				captured = request
+				return goalpkg.ReportIntent{
+					PromptID: request.Target.PromptID, Status: request.Status,
+					EvidenceRef: "sha256:evidence", BindingEpoch: request.Target.ExpectedBindingEpoch,
+					ActorKind: request.ActorKind, ActorID: request.ActorID,
+					RecordedAt: time.Date(2026, 7, 10, 20, 0, 0, 0, time.UTC),
+				}, nil
+			},
+		}
+		registry := newDaemonNativeRegistry(t, &daemonNativeToolsDeps{
+			Sessions: nativeTestSessionManager("ws-goal"),
+			Loops:    func() core.LoopService { return loopSvc },
+		}, nativeApproveAllPolicyInputs())
+		scope := toolspkg.Scope{WorkspaceID: "ws-goal", SessionID: "session-bound"}
+		result, err := registry.Call(t.Context(), scope, toolspkg.CallRequest{
+			ToolID: toolspkg.ToolIDGoalReport,
+			Input:  json.RawMessage(`{"status":"blocked","evidence":"waiting on release approval"}`),
+		})
+		if err != nil {
+			t.Fatalf("Registry.Call(goal_report) error = %v", err)
+		}
+		if captured.Target != target || captured.Status != "blocked" ||
+			captured.Evidence != "waiting on release approval" {
+			t.Fatalf("RecordGoalReport request = %#v", captured)
+		}
+		if captured.ActorKind != string(taskpkg.ActorKindAgentSession) || captured.ActorID != "session-bound" {
+			t.Fatalf("RecordGoalReport actor = %s/%s", captured.ActorKind, captured.ActorID)
+		}
+		requireNativeStructuredContains(t, result, []byte(`"prompt_id":"prompt-current"`))
+		requireNativeStructuredContains(t, result, []byte(`"evidence_ref":"sha256:evidence"`))
+
+		findCalls := 0
+		loopSvc.findGoalReportTargetFn = func(
+			context.Context,
+			looppkg.WorkspaceID,
+			string,
+		) (goalpkg.ToolReportTarget, bool, error) {
+			findCalls++
+			if findCalls == 1 {
+				return target, true, nil
+			}
+			return goalpkg.ToolReportTarget{}, false, nil
+		}
+		captured = goalpkg.RecordToolReportRequest{}
+		_, err = registry.Call(t.Context(), scope, toolspkg.CallRequest{
+			ToolID: toolspkg.ToolIDGoalReport,
+			Input:  json.RawMessage(`{"status":"complete"}`),
+		})
+		toolErr, toolErrMatched := errors.AsType[*toolspkg.ToolError](err)
+		if !toolErrMatched ||
+			!slices.Contains(toolErr.ReasonCodes, toolspkg.ReasonGoalNotActive) {
+			t.Fatalf("Registry.Call(goal_report revoked) error = %#v", err)
+		}
+		if captured.Target.Key.LoopRunID != "" {
+			t.Fatalf("RecordGoalReport called after revoke: %#v", captured)
+		}
+	})
+
+	t.Run("Should return the canonical paginated Goal turn contract", func(t *testing.T) {
+		t.Parallel()
+
+		item := 1
+		next := int64(9)
+		var captured core.GoalTurnListQuery
+		loopSvc := &nativeLoopServiceStub{
+			listGoalTurnsFn: func(
+				_ context.Context,
+				workspaceID string,
+				runID string,
+				query core.GoalTurnListQuery,
+			) (session.GoalTurnPage, error) {
+				if workspaceID != "ws-goal" || runID != "run-goal" {
+					t.Fatalf("ListGoalTurns target = %s/%s", workspaceID, runID)
+				}
+				captured = query
+				return session.GoalTurnPage{
+					Turns: []session.GoalTurn{{
+						Seq: 9, Generation: 2, NodeID: "goal", ItemIndex: 1,
+						Turn: 3, PromptAttempt: 0, SessionID: "session-bound",
+						BindingHandle: "goal:handle", BindingEpoch: 4, PromptID: "prompt-9",
+						BlockingIssues: []session.GoalBlockingIssue{}, Criteria: []session.GoalCriterionResult{},
+						Warnings: []session.GoalDiagnosticWarning{}, ActorKind: "agent_session",
+						ActorID: "session-bound", StartedAt: time.Date(2026, 7, 10, 20, 0, 0, 0, time.UTC),
+					}},
+					NextAfterSeq: &next,
+				}, nil
+			},
+		}
+		registry := newDaemonNativeRegistry(t, &daemonNativeToolsDeps{
+			Sessions: nativeTestSessionManager("ws-goal"),
+			Loops:    func() core.LoopService { return loopSvc },
+		}, nativeApproveAllPolicyInputs())
+		result, err := registry.Call(
+			t.Context(),
+			toolspkg.Scope{SessionID: "sess-goal", WorkspaceID: "ws-goal"},
+			toolspkg.CallRequest{
+				ToolID: toolspkg.ToolIDLoopTurns,
+				Input: json.RawMessage(
+					`{"run_id":"run-goal","node":"goal","item":1,"after_seq":4,"limit":5}`,
+				),
+			},
+		)
+		if err != nil {
+			t.Fatalf("Registry.Call(loop_turns) error = %v", err)
+		}
+		if captured.NodeID != "goal" || captured.ItemIndex == nil || *captured.ItemIndex != item ||
+			captured.AfterSeq != 4 || captured.Limit != 5 {
+			t.Fatalf("ListGoalTurns query = %#v", captured)
+		}
+		requireNativeStructuredContains(t, result, []byte(`"prompt_id":"prompt-9"`))
+		requireNativeStructuredContains(t, result, []byte(`"result_status":null`))
+		requireNativeStructuredContains(t, result, []byte(`"criteria":[]`))
+		requireNativeStructuredContains(t, result, []byte(`"warnings":[]`))
+		requireNativeStructuredContains(t, result, []byte(`"next_after_seq":9`))
+	})
+}
+
+func nativeToolIDsWithPrefixes(views []toolspkg.ToolView, prefixes ...string) []toolspkg.ToolID {
+	ids := make([]toolspkg.ToolID, 0)
+	for index := range views {
+		view := &views[index]
+		name := strings.TrimPrefix(string(view.Descriptor.ID), "compozy__")
+		for _, prefix := range prefixes {
+			if strings.HasPrefix(name, prefix) {
+				ids = append(ids, view.Descriptor.ID)
+				break
+			}
+		}
+	}
+	return ids
+}
+
+func nativeLoopNodeMutationResponse(
+	runID string,
+	nodeID string,
+	provenance *contract.LoopControlProvenancePayload,
+) contract.LoopMutationResponse {
+	return contract.LoopMutationResponse{
+		OK: true, RunID: runID, NodeID: nodeID, Provenance: provenance,
+		Control: &contract.LoopNodeControlPayload{LoopRunID: runID, NodeID: nodeID},
+	}
+}
+
+func nativeLoopNodeMutationRecorder(
+	t *testing.T,
+	calls *[]string,
+	name string,
+	provenance *contract.LoopControlProvenancePayload,
+) func(
+	context.Context,
+	string,
+	string,
+	string,
+	contract.LoopNodeMutationRequest,
+	taskpkg.ActorContext,
+) (contract.LoopMutationResponse, error) {
+	t.Helper()
+	return func(
+		_ context.Context,
+		workspaceID string,
+		runID string,
+		nodeID string,
+		req contract.LoopNodeMutationRequest,
+		_ taskpkg.ActorContext,
+	) (contract.LoopMutationResponse, error) {
+		*calls = append(*calls, name)
+		if workspaceID != "ws-alpha" || runID != "run-1" || nodeID != "approval" || req.Reason != "inspect" {
+			t.Fatalf("%s request = %s/%s/%s %#v", name, workspaceID, runID, nodeID, req)
+		}
+		return nativeLoopNodeMutationResponse(runID, nodeID, provenance), nil
+	}
+}
+
+type nativeLoopServiceStub struct {
+	listLoopsFn            func(context.Context, string, looppkg.CatalogQuery) (contract.LoopsResponse, error)
+	createLoopFn           func(context.Context, string, contract.CreateLoopRequest) (contract.LoopResponse, error)
+	getLoopFn              func(context.Context, string, string) (contract.LoopResponse, error)
+	patchLoopFn            func(context.Context, string, string, contract.PatchLoopRequest) (contract.LoopResponse, error)
+	validateLoopFn         func(context.Context, string, string, contract.ValidateLoopRequest) (contract.LoopValidationResponse, error)
+	deleteLoopFn           func(context.Context, string, string) error
+	runLoopFn              func(context.Context, string, string, core.LoopRunInput) (contract.RunLoopResponse, error)
+	getLoopConfigFn        func(context.Context, string, string) (contract.LoopConfigResponse, error)
+	putLoopConfigFn        func(context.Context, string, string, contract.PutLoopConfigRequest) (contract.LoopConfigResponse, error)
+	listLoopRunsFn         func(context.Context, string, core.LoopRunListQuery) (contract.LoopRunsResponse, error)
+	getLoopRunFn           func(context.Context, string, string) (contract.LoopRunResponse, error)
+	getSessionGoalFn       func(context.Context, string, string) (*session.GoalSnapshot, error)
+	goalCommandFn          func(context.Context, string, string, session.PromptCaller, session.GoalCommand) (session.GoalDispatchDecision, error)
+	listGoalTurnsFn        func(context.Context, string, string, core.GoalTurnListQuery) (session.GoalTurnPage, error)
+	findGoalReportTargetFn func(
+		context.Context,
+		looppkg.WorkspaceID,
+		string,
+	) (goalpkg.ToolReportTarget, bool, error)
+	resolveActiveGoalOriginAliasFn func(context.Context, looppkg.WorkspaceID, string) (string, bool, error)
+	recordGoalReportFn             func(context.Context, goalpkg.RecordToolReportRequest) (goalpkg.ReportIntent, error)
+	cancelLoopRunFn                func(context.Context, string, string) (contract.LoopMutationResponse, error)
+	pauseLoopRunFn                 func(context.Context, string, string) error
+	resumeLoopRunFn                func(context.Context, string, string) error
+	approveLoopRunFn               func(context.Context, string, string, contract.ApproveLoopRunRequest, taskpkg.ActorContext) error
+	listLoopRunEventsFn            func(context.Context, string, string, int64, store.ReadScope) ([]contract.LoopRunEventPayload, error)
+	listLoopNodesFn                func(context.Context, string, core.LoopNodeListQuery) (contract.LoopNodeInventoryResponse, error)
+	pauseLoopNodeFn                func(context.Context, string, string, string, contract.LoopNodePauseRequest, taskpkg.ActorContext) (contract.LoopMutationResponse, error)
+	resumeLoopNodeFn               func(context.Context, string, string, string, contract.LoopNodeResumeRequest, taskpkg.ActorContext) (contract.LoopMutationResponse, error)
+	cancelLoopNodeFn               func(context.Context, string, string, string, contract.LoopNodeMutationRequest, taskpkg.ActorContext) (contract.LoopMutationResponse, error)
+	requeueLoopNodeFn              func(context.Context, string, string, string, contract.LoopNodeMutationRequest, taskpkg.ActorContext) (contract.LoopMutationResponse, error)
+	amendLoopNodeFn                func(context.Context, string, string, string, contract.LoopNodeAmendRequest, taskpkg.ActorContext) (contract.LoopNodeAmendResponse, error)
+}
+
+var _ core.LoopService = (*nativeLoopServiceStub)(nil)
+
+func (s *nativeLoopServiceStub) GetSessionGoal(
+	ctx context.Context,
+	workspaceID string,
+	sessionID string,
+) (*session.GoalSnapshot, error) {
+	if s.getSessionGoalFn != nil {
+		return s.getSessionGoalFn(ctx, workspaceID, sessionID)
+	}
+	return nil, errors.New("unexpected GetSessionGoal call")
+}
+
+func (s *nativeLoopServiceStub) Handle(
+	ctx context.Context,
+	workspaceID string,
+	sessionID string,
+	caller session.PromptCaller,
+	command session.GoalCommand,
+) (session.GoalDispatchDecision, error) {
+	if s.goalCommandFn == nil {
+		return session.GoalDispatchDecision{}, errors.New("unexpected Goal command")
+	}
+	return s.goalCommandFn(ctx, workspaceID, sessionID, caller, command)
+}
+
+func (s *nativeLoopServiceStub) ListGoalTurns(
+	ctx context.Context,
+	workspaceID string,
+	runID string,
+	query core.GoalTurnListQuery,
+) (session.GoalTurnPage, error) {
+	if s.listGoalTurnsFn != nil {
+		return s.listGoalTurnsFn(ctx, workspaceID, runID, query)
+	}
+	return session.GoalTurnPage{}, errors.New("unexpected ListGoalTurns call")
+}
+
+func (s *nativeLoopServiceStub) findGoalReportTarget(
+	ctx context.Context,
+	workspaceID looppkg.WorkspaceID,
+	sessionID string,
+) (goalpkg.ToolReportTarget, bool, error) {
+	if s.findGoalReportTargetFn != nil {
+		return s.findGoalReportTargetFn(ctx, workspaceID, sessionID)
+	}
+	return goalpkg.ToolReportTarget{}, false, errors.New("unexpected FindGoalReportTarget call")
+}
+
+func (s *nativeLoopServiceStub) resolveActiveGoalOriginAlias(
+	ctx context.Context,
+	workspaceID looppkg.WorkspaceID,
+	sessionID string,
+) (string, bool, error) {
+	if s.resolveActiveGoalOriginAliasFn != nil {
+		return s.resolveActiveGoalOriginAliasFn(ctx, workspaceID, sessionID)
+	}
+	return "", false, errors.New("unexpected ResolveActiveGoalOriginAlias call")
+}
+
+func (s *nativeLoopServiceStub) recordGoalReport(
+	ctx context.Context,
+	request goalpkg.RecordToolReportRequest,
+) (goalpkg.ReportIntent, error) {
+	if s.recordGoalReportFn != nil {
+		return s.recordGoalReportFn(ctx, request)
+	}
+	return goalpkg.ReportIntent{}, errors.New("unexpected RecordGoalReport call")
+}
+
+func requireNativeToolUnavailableWithReason(
+	t *testing.T,
+	views []toolspkg.ToolView,
+	id toolspkg.ToolID,
+	reason toolspkg.ReasonCode,
+) {
+	t.Helper()
+	view := nativeToolViewByID(views, id)
+	if view == nil || view.Availability.Available ||
+		!slices.Contains(view.Availability.ReasonCodes, reason) {
+		t.Fatalf("%s availability = %#v, want unavailable with %s", id, view, reason)
+	}
+}
+
+func (s *nativeLoopServiceStub) ListLoops(
+	ctx context.Context,
+	workspaceID string,
+	query looppkg.CatalogQuery,
+) (contract.LoopsResponse, error) {
+	if s.listLoopsFn != nil {
+		return s.listLoopsFn(ctx, workspaceID, query)
+	}
+	return contract.LoopsResponse{}, errors.New("unexpected ListLoops call")
+}
+
+func (s *nativeLoopServiceStub) CreateLoop(
+	ctx context.Context,
+	workspaceID string,
+	_ string,
+	req contract.CreateLoopRequest,
+) (contract.LoopResponse, error) {
+	if s.createLoopFn != nil {
+		return s.createLoopFn(ctx, workspaceID, req)
+	}
+	return contract.LoopResponse{}, errors.New("unexpected CreateLoop call")
+}
+
+func (s *nativeLoopServiceStub) GetLoop(
+	ctx context.Context,
+	workspaceID string,
+	_ string,
+	name string,
+) (contract.LoopResponse, error) {
+	if s.getLoopFn != nil {
+		return s.getLoopFn(ctx, workspaceID, name)
+	}
+	return contract.LoopResponse{}, errors.New("unexpected GetLoop call")
+}
+
+func (s *nativeLoopServiceStub) PatchLoop(
+	ctx context.Context,
+	workspaceID string,
+	_ string,
+	name string,
+	req contract.PatchLoopRequest,
+) (contract.LoopResponse, error) {
+	if s.patchLoopFn != nil {
+		return s.patchLoopFn(ctx, workspaceID, name, req)
+	}
+	return contract.LoopResponse{}, errors.New("unexpected PatchLoop call")
+}
+
+func (s *nativeLoopServiceStub) ValidateLoop(
+	ctx context.Context,
+	workspaceID string,
+	_ string,
+	name string,
+	req contract.ValidateLoopRequest,
+) (contract.LoopValidationResponse, error) {
+	if s.validateLoopFn != nil {
+		return s.validateLoopFn(ctx, workspaceID, name, req)
+	}
+	return contract.LoopValidationResponse{}, errors.New("unexpected ValidateLoop call")
+}
+
+func (s *nativeLoopServiceStub) DeleteLoop(ctx context.Context, workspaceID string, _ string, name string) error {
+	if s.deleteLoopFn != nil {
+		return s.deleteLoopFn(ctx, workspaceID, name)
+	}
+	return errors.New("unexpected DeleteLoop call")
+}
+
+func (s *nativeLoopServiceStub) RunLoop(
+	ctx context.Context,
+	workspaceID string,
+	name string,
+	input core.LoopRunInput,
+) (contract.RunLoopResponse, error) {
+	if s.runLoopFn != nil {
+		return s.runLoopFn(ctx, workspaceID, name, input)
+	}
+	return contract.RunLoopResponse{}, errors.New("unexpected RunLoop call")
+}
+
+func (s *nativeLoopServiceStub) GetLoopConfig(
+	ctx context.Context,
+	workspaceID string,
+	_ string,
+	name string,
+) (contract.LoopConfigResponse, error) {
+	if s.getLoopConfigFn != nil {
+		return s.getLoopConfigFn(ctx, workspaceID, name)
+	}
+	return contract.LoopConfigResponse{}, errors.New("unexpected GetLoopConfig call")
+}
+
+func (s *nativeLoopServiceStub) PutLoopConfig(
+	ctx context.Context,
+	workspaceID string,
+	_ string,
+	name string,
+	req contract.PutLoopConfigRequest,
+) (contract.LoopConfigResponse, error) {
+	if s.putLoopConfigFn != nil {
+		return s.putLoopConfigFn(ctx, workspaceID, name, req)
+	}
+	return contract.LoopConfigResponse{}, errors.New("unexpected PutLoopConfig call")
+}
+
+func (s *nativeLoopServiceStub) GetLoopInputDefaults(
+	context.Context,
+	string,
+	string,
+	string,
+	contract.LoopInputDefaultsScope,
+) (contract.LoopInputDefaultsResponse, error) {
+	return contract.LoopInputDefaultsResponse{}, errors.New("unexpected GetLoopInputDefaults call")
+}
+
+func (s *nativeLoopServiceStub) GetLoopInputDefault(
+	context.Context,
+	string,
+	string,
+	string,
+	string,
+	contract.LoopInputDefaultsScope,
+) (contract.LoopInputDefaultResponse, error) {
+	return contract.LoopInputDefaultResponse{}, errors.New("unexpected GetLoopInputDefault call")
+}
+
+func (s *nativeLoopServiceStub) PutLoopInputDefaults(
+	context.Context,
+	string,
+	string,
+	string,
+	contract.PutLoopInputDefaultsRequest,
+) (contract.LoopInputDefaultsResponse, error) {
+	return contract.LoopInputDefaultsResponse{}, errors.New("unexpected PutLoopInputDefaults call")
+}
+
+func (s *nativeLoopServiceStub) PutLoopInputDefault(
+	context.Context,
+	string,
+	string,
+	string,
+	string,
+	contract.PutLoopInputDefaultRequest,
+) (contract.LoopInputDefaultResponse, error) {
+	return contract.LoopInputDefaultResponse{}, errors.New("unexpected PutLoopInputDefault call")
+}
+
+func (s *nativeLoopServiceStub) DeleteLoopInputDefault(
+	context.Context,
+	string,
+	string,
+	string,
+	string,
+	contract.LoopInputDefaultsScope,
+) (contract.DeleteLoopInputDefaultResponse, error) {
+	return contract.DeleteLoopInputDefaultResponse{}, errors.New("unexpected DeleteLoopInputDefault call")
+}
+
+func (s *nativeLoopServiceStub) GetLoopAnnotations(
+	context.Context,
+	string,
+	string,
+	string,
+) (contract.LoopAnnotationsResponse, error) {
+	return contract.LoopAnnotationsResponse{}, errors.New("unexpected GetLoopAnnotations call")
+}
+
+func (s *nativeLoopServiceStub) PutLoopAnnotations(
+	context.Context,
+	string,
+	string,
+	string,
+	contract.PutLoopAnnotationsRequest,
+) (contract.LoopAnnotationsResponse, error) {
+	return contract.LoopAnnotationsResponse{}, errors.New("unexpected PutLoopAnnotations call")
+}
+
+func (s *nativeLoopServiceStub) ListLoopRuns(
+	ctx context.Context,
+	workspaceID string,
+	query core.LoopRunListQuery,
+) (contract.LoopRunsResponse, error) {
+	if s.listLoopRunsFn != nil {
+		return s.listLoopRunsFn(ctx, workspaceID, query)
+	}
+	return contract.LoopRunsResponse{}, errors.New("unexpected ListLoopRuns call")
+}
+
+func (s *nativeLoopServiceStub) GetLoopRun(
+	ctx context.Context,
+	workspaceID string,
+	runID string,
+) (contract.LoopRunResponse, error) {
+	if s.getLoopRunFn != nil {
+		return s.getLoopRunFn(ctx, workspaceID, runID)
+	}
+	return contract.LoopRunResponse{}, errors.New("unexpected GetLoopRun call")
+}
+
+func (s *nativeLoopServiceStub) DiffLoopRun(
+	context.Context, string, string, looppkg.DiffQuery,
+) (contract.LoopDiffResponse, error) {
+	return contract.LoopDiffResponse{}, errors.New("unexpected DiffLoopRun call")
+}
+
+func (s *nativeLoopServiceStub) RerunLoopRun(
+	context.Context, string, string, contract.RerunLoopRequest, taskpkg.ActorContext,
+) (contract.RerunLoopResponse, error) {
+	return contract.RerunLoopResponse{}, errors.New("unexpected RerunLoopRun call")
+}
+
+func (s *nativeLoopServiceStub) ForkLoopRun(
+	context.Context, string, string, contract.ForkLoopRequest, taskpkg.ActorContext,
+) (contract.ForkLoopResponse, error) {
+	return contract.ForkLoopResponse{}, errors.New("unexpected ForkLoopRun call")
+}
+
+func (s *nativeLoopServiceStub) CancelLoopRun(
+	ctx context.Context,
+	workspaceID string,
+	runID string,
+	_ taskpkg.ActorContext,
+) (contract.LoopMutationResponse, error) {
+	if s.cancelLoopRunFn != nil {
+		return s.cancelLoopRunFn(ctx, workspaceID, runID)
+	}
+	return contract.LoopMutationResponse{}, errors.New("unexpected CancelLoopRun call")
+}
+
+func (s *nativeLoopServiceStub) ListLoopNodes(
+	ctx context.Context,
+	workspaceID string,
+	query core.LoopNodeListQuery,
+) (contract.LoopNodeInventoryResponse, error) {
+	if s.listLoopNodesFn != nil {
+		return s.listLoopNodesFn(ctx, workspaceID, query)
+	}
+	return contract.LoopNodeInventoryResponse{}, errors.New("unexpected ListLoopNodes call")
+}
+
+func (s *nativeLoopServiceStub) PauseLoopNode(
+	ctx context.Context,
+	workspaceID string,
+	runID string,
+	nodeID string,
+	req contract.LoopNodePauseRequest,
+	actor taskpkg.ActorContext,
+) (contract.LoopMutationResponse, error) {
+	if s.pauseLoopNodeFn != nil {
+		return s.pauseLoopNodeFn(ctx, workspaceID, runID, nodeID, req, actor)
+	}
+	return contract.LoopMutationResponse{}, errors.New("unexpected PauseLoopNode call")
+}
+
+func (s *nativeLoopServiceStub) ResumeLoopNode(
+	ctx context.Context,
+	workspaceID string,
+	runID string,
+	nodeID string,
+	req contract.LoopNodeResumeRequest,
+	actor taskpkg.ActorContext,
+) (contract.LoopMutationResponse, error) {
+	if s.resumeLoopNodeFn != nil {
+		return s.resumeLoopNodeFn(ctx, workspaceID, runID, nodeID, req, actor)
+	}
+	return contract.LoopMutationResponse{}, errors.New("unexpected ResumeLoopNode call")
+}
+
+func (s *nativeLoopServiceStub) CancelLoopNode(
+	ctx context.Context,
+	workspaceID string,
+	runID string,
+	nodeID string,
+	req contract.LoopNodeMutationRequest,
+	actor taskpkg.ActorContext,
+) (contract.LoopMutationResponse, error) {
+	if s.cancelLoopNodeFn != nil {
+		return s.cancelLoopNodeFn(ctx, workspaceID, runID, nodeID, req, actor)
+	}
+	return contract.LoopMutationResponse{}, errors.New("unexpected CancelLoopNode call")
+}
+
+func (s *nativeLoopServiceStub) RequeueLoopNode(
+	ctx context.Context,
+	workspaceID string,
+	runID string,
+	nodeID string,
+	req contract.LoopNodeMutationRequest,
+	actor taskpkg.ActorContext,
+) (contract.LoopMutationResponse, error) {
+	if s.requeueLoopNodeFn != nil {
+		return s.requeueLoopNodeFn(ctx, workspaceID, runID, nodeID, req, actor)
+	}
+	return contract.LoopMutationResponse{}, errors.New("unexpected RequeueLoopNode call")
+}
+
+func (s *nativeLoopServiceStub) PauseLoopRun(
+	ctx context.Context,
+	workspaceID string,
+	runID string,
+	_ taskpkg.ActorContext,
+) error {
+	if s.pauseLoopRunFn != nil {
+		return s.pauseLoopRunFn(ctx, workspaceID, runID)
+	}
+	return errors.New("unexpected PauseLoopRun call")
+}
+
+func (s *nativeLoopServiceStub) ResumeLoopRun(
+	ctx context.Context,
+	workspaceID string,
+	runID string,
+	_ taskpkg.ActorContext,
+) error {
+	if s.resumeLoopRunFn != nil {
+		return s.resumeLoopRunFn(ctx, workspaceID, runID)
+	}
+	return errors.New("unexpected ResumeLoopRun call")
+}
+
+func (s *nativeLoopServiceStub) ApproveLoopRun(
+	ctx context.Context,
+	workspaceID string,
+	runID string,
+	req contract.ApproveLoopRunRequest,
+	actor taskpkg.ActorContext,
+) error {
+	if s.approveLoopRunFn != nil {
+		return s.approveLoopRunFn(ctx, workspaceID, runID, req, actor)
+	}
+	return errors.New("unexpected ApproveLoopRun call")
+}
+
+func (s *nativeLoopServiceStub) ListLoopRequests(
+	context.Context,
+	string,
+	core.LoopRequestListQuery,
+) (contract.LoopRequestsResponse, error) {
+	return contract.LoopRequestsResponse{}, errors.New("unexpected ListLoopRequests call")
+}
+
+func (s *nativeLoopServiceStub) GetLoopRequest(
+	context.Context,
+	string,
+	string,
+	int,
+	string,
+	int,
+) (contract.LoopRequestPayload, error) {
+	return contract.LoopRequestPayload{}, errors.New("unexpected GetLoopRequest call")
+}
+
+func (s *nativeLoopServiceStub) RespondLoopRequest(
+	context.Context,
+	string,
+	string,
+	string,
+	contract.RespondLoopRequest,
+	taskpkg.ActorContext,
+) (contract.RespondLoopRequestResponse, error) {
+	return contract.RespondLoopRequestResponse{}, errors.New("unexpected RespondLoopRequest call")
+}
+
+func (s *nativeLoopServiceStub) AmendLoopNode(
+	ctx context.Context,
+	workspaceID string,
+	runID string,
+	nodeID string,
+	req contract.LoopNodeAmendRequest,
+	actor taskpkg.ActorContext,
+) (contract.LoopNodeAmendResponse, error) {
+	if s.amendLoopNodeFn != nil {
+		return s.amendLoopNodeFn(ctx, workspaceID, runID, nodeID, req, actor)
+	}
+	return contract.LoopNodeAmendResponse{}, errors.New("unexpected AmendLoopNode call")
+}
+
+func (s *nativeLoopServiceStub) ListLoopRunEvents(
+	ctx context.Context,
+	workspaceID string,
+	runID string,
+	afterSeq int64,
+	readScope store.ReadScope,
+) ([]contract.LoopRunEventPayload, error) {
+	if s.listLoopRunEventsFn != nil {
+		return s.listLoopRunEventsFn(ctx, workspaceID, runID, afterSeq, readScope)
+	}
+	return nil, errors.New("unexpected ListLoopRunEvents call")
+}

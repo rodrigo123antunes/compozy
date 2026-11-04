@@ -1,0 +1,94 @@
+import { Check } from "@compozy/ui/icons";
+
+import { RadioCard, RadioCardGroup, SkeletonText, type RadioCardGroupOption } from "@compozy/ui";
+
+const CHOICE_GRID_CLASS = "grid gap-2 p-3 @min-settings-takeover:grid-cols-3";
+/** Longer ladders (five permission levels) read top to bottom in one column. */
+const CHOICE_STACK_CLASS = "grid gap-2 p-3";
+
+/** One placeholder card per rung of the three-way choices this group serves. */
+const CHOICE_SKELETON_CARDS = ["first", "second", "third"] as const;
+
+export interface SettingsChoiceOption<V extends string> {
+  value: V;
+  /** Humanized name ("Ask first"). */
+  name: string;
+  /** One-line consequence. */
+  description: string;
+  /** The option's own glyph; a group whose options carry icons drops the check mark. */
+  icon?: RadioCardGroupOption<V>["icon"];
+}
+
+export interface SettingsChoiceGroupProps<V extends string> {
+  options: ReadonlyArray<SettingsChoiceOption<V>>;
+  value: V;
+  onChange: (next: V) => void;
+  ariaLabel: string;
+  /** `stack` keeps every option in one column; the default grid fits three across. */
+  layout?: "grid" | "stack";
+  "data-testid"?: string;
+}
+
+/** Choice cards with one tab stop and native radio-group keyboard behavior. */
+export function SettingsChoiceGroup<V extends string>({
+  options,
+  value,
+  onChange,
+  ariaLabel,
+  layout = "grid",
+  "data-testid": testId,
+}: SettingsChoiceGroupProps<V>) {
+  return (
+    <RadioCardGroup
+      aria-label={ariaLabel}
+      className={layout === "stack" ? CHOICE_STACK_CLASS : CHOICE_GRID_CLASS}
+      data-testid={testId}
+      onValueChange={onChange}
+      options={options.map(option => ({
+        value: option.value,
+        title: option.name,
+        description: <span className="block leading-snug">{option.description}</span>,
+        icon: option.icon,
+        // The card's own selected treatment (selected fill + inset ring) carries the choice;
+        // icon-less cards keep a check so the choice still reads without a glyph.
+        badge: option.icon ? undefined : (
+          <Check
+            aria-hidden="true"
+            className={option.value === value ? "size-3.5 text-fg" : "size-3.5 opacity-0"}
+          />
+        ),
+        className: "relative",
+        "data-testid": testId ? `${testId}-${option.value}` : undefined,
+      }))}
+      value={value}
+    />
+  );
+}
+
+/**
+ * The choice cards in skeleton form: the real group grid and `RadioCard` shell with placeholder
+ * title and description. The cards are disabled and out of the tab order, and the group is hidden
+ * from assistive technology; the page's `SkeletonRegion` announces the loading.
+ */
+export function SettingsChoiceGroupSkeleton() {
+  return (
+    <div aria-hidden="true" className={CHOICE_GRID_CLASS}>
+      {CHOICE_SKELETON_CARDS.map(card => (
+        <RadioCard
+          className="pointer-events-none"
+          description={
+            <span className="block leading-snug">
+              <SkeletonText lines={2} />
+            </span>
+          }
+          disabled
+          key={card}
+          onSelect={() => undefined}
+          selected={false}
+          tabIndex={-1}
+          title={<SkeletonText className="w-24" />}
+        />
+      ))}
+    </div>
+  );
+}

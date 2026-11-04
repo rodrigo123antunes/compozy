@@ -1,0 +1,205 @@
+import type { ComponentProps, ReactNode } from "react";
+import { Bell, Check, CircleAlert } from "@compozy/ui/icons";
+
+import { Button, cn, Empty, Eyebrow, Icon, SkeletonRegion } from "@compozy/ui";
+
+import type { OsAttentionRow, OsAttentionSections } from "../lib/attention-model";
+import { AttentionBellRow, AttentionBellRowSkeleton } from "./attention-bell-row";
+
+function BellSection({
+  label,
+  rows,
+  onSelect,
+  testId,
+  onAcknowledge,
+  disabled,
+}: {
+  label: string;
+  rows: readonly OsAttentionRow[];
+  onSelect: (row: OsAttentionRow) => void;
+  testId: string;
+  onAcknowledge?: (row?: OsAttentionRow) => void;
+  disabled: boolean;
+}) {
+  if (rows.length === 0) return null;
+  return (
+    <section
+      className="flex flex-col border-line pt-1.5 first:pt-0 [&+&]:mt-1 [&+&]:border-t"
+      data-testid={testId}
+    >
+      <Eyebrow className="flex items-center gap-1.5 px-2.5 pt-1.5 pb-1 text-subtle">
+        {label}
+        <span className="font-mono text-micro text-faint">{rows.length}</span>
+      </Eyebrow>
+      {rows.map(row => (
+        <div
+          className="flex min-w-0 items-center"
+          key={row.notificationId ?? `${row.kind}:${row.id}`}
+        >
+          <AttentionBellRow row={row} onSelect={onSelect} />
+          <Button
+            size="icon-sm"
+            variant="quiet"
+            aria-label={`Mark ${row.title} as read`}
+            disabled={disabled || !row.notificationId || !onAcknowledge}
+            onClick={() => onAcknowledge?.(row)}
+          >
+            <Check aria-hidden="true" />
+          </Button>
+        </div>
+      ))}
+    </section>
+  );
+}
+
+export interface AttentionBellProps extends Omit<ComponentProps<"div">, "onSelect"> {
+  sections: OsAttentionSections;
+  total?: number;
+  pending?: boolean;
+  error?: string | null;
+  onAcknowledge?: (row?: OsAttentionRow) => void;
+  sessionsDisconnected: boolean;
+  tasksDisconnected: boolean;
+  loopRequestsDisconnected?: boolean;
+  loading: boolean;
+  onSelect: (row: OsAttentionRow) => void;
+  /** Scripts waiting for approval, grouped above Needs you; they never mark notifications read. */
+  scripts?: ReactNode;
+  scriptCount?: number;
+  /** The scripts' list never loaded, so the bell can't call itself quiet. */
+  scriptsUnavailable?: boolean;
+}
+
+/** Acknowledgement removes notifications while source actions remain available in their owning app. */
+export function AttentionBell({
+  sections,
+  total,
+  pending = false,
+  error,
+  onAcknowledge,
+  sessionsDisconnected,
+  tasksDisconnected,
+  loopRequestsDisconnected = false,
+  loading,
+  onSelect,
+  scripts,
+  scriptCount = 0,
+  scriptsUnavailable = false,
+  className,
+  ...props
+}: AttentionBellProps) {
+  const disconnected = sessionsDisconnected || tasksDisconnected || loopRequestsDisconnected;
+  const shown = sections.needsYou.length + sections.finished.length;
+  const empty = shown === 0;
+  const quiet = empty && scriptCount === 0 && !scriptsUnavailable;
+
+  return (
+    <div
+      className={cn("flex min-h-0 flex-col", className)}
+      data-testid="os-attention-bell"
+      {...props}
+    >
+      <div className="flex items-center justify-end gap-2 border-b border-line px-1 pb-2">
+        <Button
+          size="sm"
+          variant="ghost"
+          disabled={pending || disconnected || empty || !onAcknowledge}
+          onClick={() => onAcknowledge?.()}
+        >
+          {pending ? "Clearing…" : "Clear all"}
+        </Button>
+      </div>
+      <BellNotices
+        error={error}
+        total={total}
+        shown={shown}
+        sessionsDisconnected={sessionsDisconnected}
+        tasksDisconnected={tasksDisconnected}
+        loopRequestsDisconnected={loopRequestsDisconnected}
+        scriptsUnavailable={scriptsUnavailable}
+      />
+      <div className="-mx-1 flex max-h-96 min-h-0 flex-col overflow-y-auto">
+        {scripts}
+        <BellSection
+          label="Needs you"
+          rows={sections.needsYou}
+          onSelect={onSelect}
+          onAcknowledge={onAcknowledge}
+          disabled={pending || disconnected}
+          testId="os-bell-needs-you"
+        />
+        <BellSection
+          label="Finished"
+          rows={sections.finished}
+          onSelect={onSelect}
+          onAcknowledge={onAcknowledge}
+          disabled={pending || disconnected}
+          testId="os-bell-finished"
+        />
+        {!loading && quiet && !disconnected ? (
+          <Empty
+            data-testid="os-bell-empty"
+            icon={Bell}
+            size="compact"
+            fill={false}
+            className="py-7"
+            title="All quiet"
+            description="No unread notifications."
+          />
+        ) : null}
+        {loading && quiet ? (
+          <SkeletonRegion label="Loading notifications">
+            <AttentionBellRowSkeleton />
+            <AttentionBellRowSkeleton />
+          </SkeletonRegion>
+        ) : null}
+      </div>
+    </div>
+  );
+}
+
+function BellNotices({
+  error,
+  total,
+  shown,
+  sessionsDisconnected,
+  tasksDisconnected,
+  loopRequestsDisconnected,
+  scriptsUnavailable,
+}: Pick<
+  AttentionBellProps,
+  | "error"
+  | "total"
+  | "sessionsDisconnected"
+  | "tasksDisconnected"
+  | "loopRequestsDisconnected"
+  | "scriptsUnavailable"
+> & { shown: number }) {
+  const disconnected = Boolean(
+    sessionsDisconnected || tasksDisconnected || loopRequestsDisconnected || scriptsUnavailable
+  );
+  return (
+    <>
+      {error ? (
+        <p role="alert" className="px-2 py-2 text-small-body text-destructive">
+          {error}
+        </p>
+      ) : null}
+      {total !== undefined && total > shown ? (
+        <p className="px-2 py-2 text-eyebrow text-subtle">
+          {shown} of {total} shown
+        </p>
+      ) : null}
+      {disconnected ? (
+        <div
+          role="status"
+          className="flex items-start gap-2 rounded-md border border-warning/30 bg-warning-tint px-2.5 py-2 text-small-body text-warning"
+          data-testid="os-bell-disconnected"
+        >
+          <Icon as={CircleAlert} size="sm" className="mt-0.5 shrink-0" />
+          <span>Some notifications can't update right now.</span>
+        </div>
+      ) : null}
+    </>
+  );
+}

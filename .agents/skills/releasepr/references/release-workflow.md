@@ -8,6 +8,7 @@
 - What triggers the dry-run job
 - pr-release does not tag or publish
 - What triggers the production release
+- Explicit beta, stable, and legacy releases
 - Branch and PR naming
 - RELEASE_BODY.md vs RELEASE_NOTES.md
 - Mental model for debugging "why no release?"
@@ -72,6 +73,42 @@ job (not pr-release) then:
 
 Do not hand-author `release:` commits on the default branch — that is the
 trigger that publishes a production release.
+
+## Explicit beta, stable, and legacy releases
+
+Use `pr-release plan` when a manual workflow supplies an authoritative ref,
+version, and channel. This path is separate from the conventional-commit
+release-PR version calculation:
+
+1. Checkout the supplied ref with full history and tags.
+2. Run `plan --ref ... --version ... --channel ... --format github` and append
+   its stdout to `$GITHUB_OUTPUT`.
+3. Run `release-body` with the emitted `release_tag` and `release_git_range`,
+   writing stdout to a temporary Markdown file. Pass `--initial` only when the
+   emitted `release_initial` is true; otherwise pass `--range`.
+4. Run the project's dry-run checks using the emitted unprefixed version and
+   publication policy.
+5. Only the consuming workflow creates the emitted tag and invokes GoReleaser,
+   npm, and Homebrew. The release publisher and any changelog receipt generator
+   consume the same planned predecessor and range; only the release publisher
+   consumes the temporary Markdown file.
+
+The plan proves that the supplied ref is the checked-out `HEAD` and that the
+derived tag is absent locally and on `origin`. Read the `plan` channel-policy
+table in `commands.md` before wiring the publishing steps; it is the single
+source for GitHub, npm, and Homebrew behavior. A legacy branch or packaging
+profile is owned by the consumer; pr-release never infers it from the channel
+name.
+
+Treat every plan output as authoritative. Shell code must not strip `v`, parse
+commit subjects, rerun `git cliff --bumped-version`, or infer a channel from a
+branch. The planner emits both the unprefixed version and its single `v`-tag so
+the publishing steps can consume the correct form directly. It also emits the
+nearest predecessor on the first-parent release line, the exact predecessor-
+to-commit range, and explicit first-release intent. Every channel includes
+prerelease predecessors (releasepr v0.0.30+), so each release body covers only
+its own range. Do not recompute
+these values with `git describe` in the consuming workflow.
 
 ## Branch and PR naming
 

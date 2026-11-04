@@ -9,138 +9,294 @@ import (
 )
 
 const (
-	DirName           = ".compozy"
-	ConfigFileName    = "config.toml"
-	AgentsDirName     = "agents"
-	ExtensionsDirName = "extensions"
-	StateDirName      = "state"
-	WorktreesDirName  = "worktrees"
-	DaemonDirName     = "daemon"
-	DBDirName         = "db"
-	RunsDirName       = "runs"
-	LogsDirName       = "logs"
-	CacheDirName      = "cache"
-
-	GlobalDBFileName = "global.db"
-	DaemonSocketName = "daemon.sock"
-	DaemonLockName   = "daemon.lock"
-	DaemonInfoName   = "daemon.json"
-	DaemonLogName    = "daemon.log"
+	privateDirMode  = 0o700
+	privateFileMode = 0o600
 )
 
-var osUserHomeDir = os.UserHomeDir
+const (
+	// AgentsDirName is the directory used for persisted agent definitions.
+	AgentsDirName = "agents"
+	// SkillsDirName is the directory used for persisted user skills.
+	SkillsDirName = "skills"
+	// LoopsDirName is the directory used for persisted user loop definitions.
+	LoopsDirName = LoopsConfigKey
+	// ProfilesDirName is the directory used for profile-owned state.
+	ProfilesDirName = "profiles"
+	// DefaultProfileDirName is the permanent default profile directory.
+	DefaultProfileDirName = "default"
+	// SessionsDirName is the directory used for persisted session state.
+	SessionsDirName = "sessions"
+	// ToolArtifactsDirName is the directory used for retained oversized tool results.
+	ToolArtifactsDirName = "tool-artifacts"
+	// SessionAttachmentsDirName is the directory used for persisted session attachments.
+	SessionAttachmentsDirName = "session-attachments"
+	// RestartsDirName is the directory used for persisted daemon restart operations.
+	RestartsDirName = "restarts"
+	// LogsDirName is the directory used for structured logs.
+	LogsDirName = "logs"
+	// GatewayDirName is the directory used for client-local gateway state.
+	GatewayDirName = "gateway"
+	// GatewayCredentialsDirName is the private gateway credential directory.
+	GatewayCredentialsDirName = "credentials"
+	// BinDirName is the directory for runtime binaries managed by CompozyOS.
+	BinDirName = "bin"
+	// DatabaseName is the global database filename.
+	DatabaseName = "compozy.db"
+	// DaemonSocketName is the daemon UDS filename.
+	DaemonSocketName = "daemon.sock"
+	// DaemonLockName is the daemon file-lock name.
+	DaemonLockName = "daemon.lock"
+	// UpdateLockName is the cross-process runtime mutation lock name.
+	UpdateLockName = "update.lock"
+	// DaemonInfoName is the daemon metadata filename.
+	DaemonInfoName = "daemon.json"
+	// LogFileName is the structured daemon log filename.
+	LogFileName = "compozy.log"
+	// AppStateFileName is the desktop shell state filename.
+	AppStateFileName = "app.json"
+	// UpdateOperationFileName is the live host update journal filename.
+	UpdateOperationFileName = "update-operation.json"
+	// UpdateOperationLockName is the stable lock guarding the update journal.
+	UpdateOperationLockName = "update-operation.lock"
+	// UpdateHistoryFileName is the terminal update audit filename.
+	UpdateHistoryFileName = "update-history.jsonl"
+	// DesktopProvenanceFileName records ownership of the bundled runtime.
+	DesktopProvenanceFileName = ".desktop-provenance.json"
+	// AgentDefinitionFileName is the canonical file name for persisted agent definitions.
+	AgentDefinitionFileName = "AGENT.md"
+	agentDefName            = AgentDefinitionFileName
+)
 
-// HomePaths captures the stable home-scoped Compozy layout.
+// HomePaths captures the filesystem layout for the Compozy home directory.
 type HomePaths struct {
-	HomeDir       string
-	ConfigFile    string
-	AgentsDir     string
-	ExtensionsDir string
-	StateDir      string
-	WorktreesDir  string
-	DaemonDir     string
-	SocketPath    string
-	LockPath      string
-	InfoPath      string
-	DBDir         string
-	GlobalDBPath  string
-	RunsDir       string
-	LogsDir       string
-	LogFile       string
-	CacheDir      string
+	OperatorHomeDir       string
+	HomeDir               string
+	ConfigFile            string
+	AgentsDir             string
+	SkillsDir             string
+	LoopsDir              string
+	ProfilesDir           string
+	DefaultProfileDir     string
+	SessionsDir           string
+	ToolArtifactsDir      string
+	SessionAttachmentsDir string
+	RestartsDir           string
+	LogsDir               string
+	GatewayDir            string
+	GatewayCredentialsDir string
+	ExtensionDataRoot     string
+	BinDir                string
+	LogFile               string
+	AppStateFile          string
+	UpdateOperationFile   string
+	UpdateOperationLock   string
+	UpdateHistoryFile     string
+	DesktopProvenanceFile string
+	DatabaseFile          string
+	DaemonSocket          string
+	DaemonLock            string
+	DaemonInfo            string
 }
 
-// ResolveHomeDir returns the canonical Compozy home root under the current user's home directory.
+// ResolveHomeDir resolves the global Compozy home directory, honoring COMPOZY_HOME when present.
 func ResolveHomeDir() (string, error) {
-	homeDir, err := osUserHomeDir()
+	return resolveHomeDir(processEnvLookup)
+}
+
+// ResolveOperatorHomeDir resolves the canonical operator user home directory for workspace defaults.
+func ResolveOperatorHomeDir(homePaths HomePaths) (string, error) {
+	return ResolveOperatorHomeDirWithLookup(homePaths, processEnvLookup)
+}
+
+// ResolveOperatorHomeDirWithLookup resolves the canonical operator user home directory with injectable env lookup.
+func ResolveOperatorHomeDirWithLookup(
+	homePaths HomePaths,
+	lookup func(string) (string, bool),
+) (string, error) {
+	return resolveOperatorHomeDir(homePaths, lookup, os.UserHomeDir)
+}
+
+func resolveOperatorHomeDir(
+	homePaths HomePaths,
+	lookup func(string) (string, bool),
+	lookupUserHome func() (string, error),
+) (string, error) {
+	if lookup != nil {
+		if homeDir, ok := lookup("HOME"); ok && strings.TrimSpace(homeDir) != "" {
+			return resolveCanonicalDirIfExists(homeDir)
+		}
+	}
+
+	if lookupUserHome != nil {
+		userHome, err := lookupUserHome()
+		if err != nil {
+			if fallback, ok := fallbackOperatorHomeDir(homePaths); ok {
+				return fallback, nil
+			}
+			return "", fmt.Errorf("resolve user home directory: %w", err)
+		}
+		resolvedUserHome, resolveErr := resolveCanonicalDirIfExists(userHome)
+		if resolveErr == nil && strings.TrimSpace(resolvedUserHome) != "" {
+			return resolvedUserHome, nil
+		}
+		if fallback, ok := fallbackOperatorHomeDir(homePaths); ok {
+			return fallback, nil
+		}
+		if resolveErr != nil {
+			return "", fmt.Errorf("resolve user home directory: %w", resolveErr)
+		}
+		return "", errors.New("config: operator home directory is required")
+	}
+
+	if fallback, ok := fallbackOperatorHomeDir(homePaths); ok {
+		return fallback, nil
+	}
+	return "", errors.New("config: operator home directory is required")
+}
+
+func fallbackOperatorHomeDir(homePaths HomePaths) (string, bool) {
+	homeDir := strings.TrimSpace(homePaths.HomeDir)
+	if homeDir == "" || filepath.Base(homeDir) != DirName {
+		return "", false
+	}
+
+	parent := filepath.Dir(homeDir)
+	if parent == "." || parent == homeDir || strings.TrimSpace(parent) == "" {
+		return "", false
+	}
+	return parent, true
+}
+
+func resolveHomeDir(lookup envLookup) (string, error) {
+	if lookup != nil {
+		if override, ok := lookup("COMPOZY_HOME"); ok && strings.TrimSpace(override) != "" {
+			return resolveAbsoluteDir(override)
+		}
+	}
+
+	userHome, err := os.UserHomeDir()
 	if err != nil {
 		return "", fmt.Errorf("resolve user home directory: %w", err)
 	}
-	return ResolvePath(filepath.Join(homeDir, DirName))
+
+	return filepath.Join(userHome, DirName), nil
 }
 
-// ResolveHomePaths resolves the canonical Compozy home layout from the current user's home directory.
+// ResolveHomePaths resolves the canonical Compozy home layout.
 func ResolveHomePaths() (HomePaths, error) {
-	homeDir, err := ResolveHomeDir()
+	return resolveHomePaths(processEnvLookup)
+}
+
+// ResolveHomePathsForWorkspace resolves the canonical Compozy home layout while
+// honoring COMPOZY_HOME from the supplied workspace .env when the process env omits it.
+func ResolveHomePathsForWorkspace(workspaceRoot string) (HomePaths, error) {
+	workspaceRoot, err := resolveWorkspaceRoot(workspaceRoot)
 	if err != nil {
 		return HomePaths{}, err
 	}
-	return ResolveHomePathsFrom(homeDir)
+	lookup := processEnvLookup
+	dotenvLookup, err := loadDotEnvLookup(workspaceRoot)
+	if err != nil {
+		return HomePaths{}, err
+	}
+	if dotenvLookup != nil {
+		lookup = layeredEnvLookup(processEnvLookup, dotenvLookup)
+	}
+	return resolveHomePaths(lookup)
 }
 
-// ResolveHomePathsFrom resolves the canonical Compozy home layout from an explicit base directory.
+func resolveHomePaths(lookup envLookup) (HomePaths, error) {
+	homeDir, err := resolveHomeDir(lookup)
+	if err != nil {
+		return HomePaths{}, err
+	}
+
+	paths, err := ResolveHomePathsFrom(homeDir)
+	if err != nil {
+		return HomePaths{}, err
+	}
+	if lookup != nil {
+		if operatorHome, ok := lookup("HOME"); ok && strings.TrimSpace(operatorHome) != "" {
+			resolvedOperatorHome, resolveErr := resolveAbsoluteDir(operatorHome)
+			if resolveErr != nil {
+				return HomePaths{}, fmt.Errorf("resolve operator home directory: %w", resolveErr)
+			}
+			paths.OperatorHomeDir = resolvedOperatorHome
+		}
+	}
+	return paths, nil
+}
+
+// ResolveHomePathsFrom resolves the canonical Compozy home layout from an explicit directory.
 func ResolveHomePathsFrom(homeDir string) (HomePaths, error) {
 	root, err := resolveAbsoluteDir(homeDir)
 	if err != nil {
 		return HomePaths{}, err
 	}
 
+	operatorHome := root
+	if filepath.Base(root) == DirName {
+		operatorHome = filepath.Dir(root)
+	}
 	return HomePaths{
-		HomeDir:       root,
-		ConfigFile:    filepath.Join(root, ConfigFileName),
-		AgentsDir:     filepath.Join(root, AgentsDirName),
-		ExtensionsDir: filepath.Join(root, ExtensionsDirName),
-		StateDir:      filepath.Join(root, StateDirName),
-		WorktreesDir:  filepath.Join(root, StateDirName, WorktreesDirName),
-		DaemonDir:     filepath.Join(root, DaemonDirName),
-		SocketPath:    filepath.Join(root, DaemonDirName, DaemonSocketName),
-		LockPath:      filepath.Join(root, DaemonDirName, DaemonLockName),
-		InfoPath:      filepath.Join(root, DaemonDirName, DaemonInfoName),
-		DBDir:         filepath.Join(root, DBDirName),
-		GlobalDBPath:  filepath.Join(root, DBDirName, GlobalDBFileName),
-		RunsDir:       filepath.Join(root, RunsDirName),
-		LogsDir:       filepath.Join(root, LogsDirName),
-		LogFile:       filepath.Join(root, LogsDirName, DaemonLogName),
-		CacheDir:      filepath.Join(root, CacheDirName),
+		OperatorHomeDir:       operatorHome,
+		HomeDir:               root,
+		ConfigFile:            filepath.Join(root, ConfigName),
+		AgentsDir:             filepath.Join(root, AgentsDirName),
+		SkillsDir:             filepath.Join(root, SkillsDirName),
+		LoopsDir:              filepath.Join(root, LoopsDirName),
+		ProfilesDir:           filepath.Join(root, ProfilesDirName),
+		DefaultProfileDir:     filepath.Join(root, ProfilesDirName, DefaultProfileDirName),
+		SessionsDir:           filepath.Join(root, SessionsDirName),
+		ToolArtifactsDir:      filepath.Join(root, ToolArtifactsDirName),
+		SessionAttachmentsDir: filepath.Join(root, SessionAttachmentsDirName),
+		RestartsDir:           filepath.Join(root, RestartsDirName),
+		LogsDir:               filepath.Join(root, LogsDirName),
+		GatewayDir:            filepath.Join(root, GatewayDirName),
+		GatewayCredentialsDir: filepath.Join(root, GatewayDirName, GatewayCredentialsDirName),
+		ExtensionDataRoot:     filepath.Join(root, ExtensionDataDirName),
+		BinDir:                filepath.Join(root, BinDirName),
+		LogFile:               filepath.Join(root, LogsDirName, LogFileName),
+		AppStateFile:          filepath.Join(root, AppStateFileName),
+		UpdateOperationFile:   filepath.Join(root, UpdateOperationFileName),
+		UpdateOperationLock:   filepath.Join(root, UpdateOperationLockName),
+		UpdateHistoryFile:     filepath.Join(root, LogsDirName, UpdateHistoryFileName),
+		DesktopProvenanceFile: filepath.Join(root, BinDirName, DesktopProvenanceFileName),
+		DatabaseFile:          filepath.Join(root, DatabaseName),
+		DaemonSocket:          filepath.Join(root, DaemonSocketName),
+		DaemonLock:            filepath.Join(root, DaemonLockName),
+		DaemonInfo:            filepath.Join(root, DaemonInfoName),
 	}, nil
 }
 
-// EnsureHomeLayout creates and validates the stable Compozy home layout.
+// EnsureHomeLayout creates the directories required by the Compozy home layout.
 func EnsureHomeLayout(paths HomePaths) error {
-	dirs := []struct {
-		path string
-		perm os.FileMode
-	}{
-		{paths.HomeDir, 0o755},
-		{paths.AgentsDir, 0o755},
-		{paths.ExtensionsDir, 0o755},
-		{paths.StateDir, 0o755},
-		{paths.WorktreesDir, 0o755},
-		{paths.DaemonDir, 0o700},
-		{paths.DBDir, 0o755},
-		{paths.RunsDir, 0o755},
-		{paths.LogsDir, 0o755},
-		{paths.CacheDir, 0o755},
-	}
-
-	for _, dir := range dirs {
-		if err := ensureDir(dir.path, dir.perm); err != nil {
-			return err
+	for _, dir := range []string{
+		paths.HomeDir,
+		paths.AgentsDir,
+		paths.SkillsDir,
+		paths.LoopsDir,
+		paths.ProfilesDir,
+		paths.DefaultProfileDir,
+		paths.SessionsDir,
+		paths.ToolArtifactsDir,
+		paths.SessionAttachmentsDir,
+		paths.RestartsDir,
+		paths.LogsDir,
+		paths.GatewayDir,
+		paths.GatewayCredentialsDir,
+		paths.ExtensionDataRoot,
+		paths.BinDir,
+	} {
+		if strings.TrimSpace(dir) == "" {
+			return errors.New("config: home path is required")
 		}
-	}
-
-	return nil
-}
-
-func ensureDir(path string, perm os.FileMode) error {
-	cleanPath := strings.TrimSpace(path)
-	if cleanPath == "" {
-		return errors.New("config: home path is required")
-	}
-
-	if err := os.MkdirAll(cleanPath, perm); err != nil {
-		return fmt.Errorf("create compozy directory %q: %w", cleanPath, err)
-	}
-
-	info, err := os.Stat(cleanPath)
-	if err != nil {
-		return fmt.Errorf("stat compozy directory %q: %w", cleanPath, err)
-	}
-	if !info.IsDir() {
-		return fmt.Errorf("config: path %q is not a directory", cleanPath)
-	}
-	if err := os.Chmod(cleanPath, perm); err != nil {
-		return fmt.Errorf("chmod compozy directory %q: %w", cleanPath, err)
+		if err := os.MkdirAll(dir, privateDirMode); err != nil {
+			return fmt.Errorf("create compozy directory %q: %w", dir, err)
+		}
+		if err := os.Chmod(dir, privateDirMode); err != nil {
+			return fmt.Errorf("secure compozy directory %q: %w", dir, err)
+		}
 	}
 
 	return nil
@@ -152,12 +308,33 @@ func resolveAbsoluteDir(path string) (string, error) {
 		return "", err
 	}
 	if strings.TrimSpace(absPath) == "" {
-		return "", errors.New("config: base directory is empty")
+		return "", errors.New("config: path is required")
 	}
 	return absPath, nil
 }
 
-// ResolvePath expands a possible `~`-prefixed path and returns an absolute path.
+func resolveCanonicalDirIfExists(path string) (string, error) {
+	absPath, err := resolveAbsoluteDir(path)
+	if err != nil {
+		return "", err
+	}
+
+	canonicalPath, err := filepath.EvalSymlinks(absPath)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return absPath, nil
+		}
+		return "", fmt.Errorf("resolve canonical path %q: %w", path, err)
+	}
+
+	canonicalPath, err = filepath.Abs(canonicalPath)
+	if err != nil {
+		return "", fmt.Errorf("resolve canonical path %q: %w", canonicalPath, err)
+	}
+	return canonicalPath, nil
+}
+
+// ResolvePath expands `~`-prefixed paths and returns an absolute path.
 func ResolvePath(path string) (string, error) {
 	expanded, err := expandUserPath(path)
 	if err != nil {
@@ -173,6 +350,7 @@ func ResolvePath(path string) (string, error) {
 	if err != nil {
 		return "", fmt.Errorf("resolve absolute path %q: %w", path, err)
 	}
+
 	return absPath, nil
 }
 
@@ -182,15 +360,16 @@ func expandUserPath(path string) (string, error) {
 		return "", nil
 	}
 	if clean == "~" {
-		return osUserHomeDir()
+		return os.UserHomeDir()
 	}
 	if !strings.HasPrefix(clean, "~/") {
 		return clean, nil
 	}
 
-	homeDir, err := osUserHomeDir()
+	userHome, err := os.UserHomeDir()
 	if err != nil {
 		return "", fmt.Errorf("resolve user home directory: %w", err)
 	}
-	return filepath.Join(homeDir, clean[2:]), nil
+
+	return filepath.Join(userHome, clean[2:]), nil
 }

@@ -1,0 +1,493 @@
+import {
+  baseArgs,
+  GoalCommandErrorFixture,
+  renderWithTranscriptState,
+  quietTimelineStory,
+} from "./session-thread-story-runtime";
+import { primarySessionFixture, sessionCommandCatalogFixture } from "@/systems/session/mocks";
+import type { Meta, StoryObj } from "@storybook/react-vite";
+import { ScrollToBottomPill } from "@/components/assistant-ui/scroll-to-bottom-pill";
+import { SessionThread } from "@/components/assistant-ui/session-thread";
+import { storybookMswParameters } from "@/storybook/msw";
+import { compozyApiMock } from "@/storybook/openapi-msw";
+import { HttpResponse } from "msw";
+import { SessionChatRuntimeProvider } from "@/systems/session/components/session-chat-runtime-provider";
+import { expect, userEvent, waitFor, within } from "storybook/test";
+
+import {
+  changedFilesTranscript,
+  foldedTurnsTranscript,
+  hoverToolbarTranscript,
+  mixedStreamingTranscript,
+  transcriptPayload,
+  wideProseTranscript,
+} from "./session-thread-story-transcripts";
+import {
+  largeTranscriptEntries,
+  largeTranscriptPage,
+} from "./session-thread-story-large-transcript";
+import {
+  completedGroupTranscript,
+  giantPayloadTranscript,
+  interruptedOpenTranscript,
+  liveToolTranscript,
+  parallelToolsTranscript,
+  partialFailureTranscript,
+  steerFallbackTranscript,
+  steerMarkersTranscript,
+  streamingProseTranscript,
+} from "./session-thread-story-quiet-transcripts";
+
+const storyWorkspaceId = primarySessionFixture.workspace_id ?? "ws_alpha";
+
+/**
+ * Storybook stories for the assistant-ui session thread shell.
+ *
+ * The component depends on `@assistant-ui/react`'s `ThreadPrimitive` /
+ * `MessagePrimitive` / `ComposerPrimitive`, which in turn require an active
+ * runtime context (`AssistantRuntimeProvider`). These stories use the same
+ * session runtime provider as the route shell, while overriding transcript
+ * hydration to keep the empty-thread chrome visible.
+ */
+const meta: Meta<typeof SessionThread> = {
+  title: "systems/session/components/assistant-ui/SessionThread",
+  component: SessionThread,
+  parameters: {
+    layout: "fullscreen",
+    ...storybookMswParameters({
+      session: [
+        compozyApiMock.get("/api/workspaces/{workspace_id}/sessions/{session_id}/transcript", () =>
+          HttpResponse.json(transcriptPayload([]))
+        ),
+      ],
+    }),
+    docs: {
+      description: {
+        component:
+          "Shell wrapping `@assistant-ui/react` ThreadPrimitive + ComposerPrimitive. The transcript and composer span the full pane width, sharing only the inset padding; the composer is the raised InputGroup `composer` plate (`--canvas-soft` + `--line` hairline, plus `shadow-card` in light; focus deepens the hairline to `--line-strong`). The native slash trigger inserts canonical tokens without sending: leading prompts offer the catalog sections and inline prompts offer skills. Idle shows the round inverted send (`--primary`); while a turn runs the primary disc becomes a Stop, Enter queues the draft (the Enter hint stays for screen readers, with no visible shortcut badges), and queued prompts sit in a sunken panel above the composer as steer/edit/remove rows. Clear-conversation lives in the topbar, not the composer.",
+      },
+    },
+  },
+  decorators: [
+    Story => (
+      <SessionChatRuntimeProvider
+        sessionId={primarySessionFixture.id}
+        workspaceId={storyWorkspaceId}
+      >
+        <div className="flex h-[640px] w-full flex-col bg-background border border-line">
+          <Story />
+        </div>
+      </SessionChatRuntimeProvider>
+    ),
+  ],
+};
+
+export default meta;
+
+type Story = StoryObj<typeof meta>;
+
+/**
+ * Transcript loading state — a user turn, an agent turn with its work line, a follow-up and a
+ * short answer, in the live rows' own frames and type, never the empty-state copy.
+ */
+export const LoadingSkeleton: Story = {
+  args: baseArgs,
+  render: args => renderWithTranscriptState(args, { status: "pending" }),
+};
+
+/**
+ * Transcript fetch failure — retryable pane with provider detail surfaced.
+ */
+export const TranscriptError: Story = {
+  args: baseArgs,
+  render: args =>
+    renderWithTranscriptState(args, {
+      status: "error",
+      error: new Error("Storybook transcript fetch failed."),
+    }),
+};
+
+/**
+ * Empty thread state — assistant-ui empty slot renders the agent eyebrow + intro copy.
+ */
+export const Empty: Story = {
+  args: baseArgs,
+};
+
+/**
+ * Slash catalog — type `/` to browse built-in, agent, and skill sections; add
+ * prompt text before `/` to see the inline skills-only projection.
+ */
+export const SlashCommandCatalog: Story = {
+  args: {
+    ...baseArgs,
+    commandCatalog: sessionCommandCatalogFixture,
+  },
+  parameters: {
+    ...storybookMswParameters({
+      session: [
+        compozyApiMock.get("/api/workspaces/{workspace_id}/sessions/{session_id}", () =>
+          HttpResponse.json({
+            session: { ...primarySessionFixture, state: "stopped" },
+          })
+        ),
+        compozyApiMock.get("/api/workspaces/{workspace_id}/sessions/{session_id}/transcript", () =>
+          HttpResponse.json(transcriptPayload([]))
+        ),
+      ],
+    }),
+  },
+  play: async ({ canvasElement }) => {
+    const canvas = within(canvasElement);
+    const input = await canvas.findByLabelText("Session prompt");
+    // Retype per attempt: the trigger only opens once the composer's cursor
+    // plugin has registered, which can land after the first keystroke.
+    await waitFor(async () => {
+      await userEvent.clear(input);
+      await userEvent.type(input, "/");
+      await expect(canvas.getByLabelText("Session commands")).toBeVisible();
+    });
+  },
+};
+
+/**
+ * Disabled composer (session not active) — verifies placeholder + disabled state.
+ */
+export const Disabled: Story = {
+  args: {
+    sessionId: primarySessionFixture.id,
+    agentName: primarySessionFixture.agent_name,
+    canPrompt: false,
+    onCancelPrompt: () => undefined,
+  },
+};
+
+/**
+ * Durable startup state — the persisted session is already addressable while CompozyOS
+ * prepares its runtime, and the composer remains disabled until activation.
+ */
+export const Starting: Story = {
+  args: {
+    ...baseArgs,
+    sessionState: "starting",
+  },
+};
+
+/**
+ * Durable generic startup failure — the diagnostic replaces transcript chrome
+ * without claiming that agent runtime settings are always the recovery path.
+ */
+export const StartupFailure: Story = {
+  args: {
+    ...baseArgs,
+    sessionState: "stopped",
+    failure: {
+      kind: "startup_failure",
+      summary: "The configured model is unavailable for this provider.",
+    },
+  },
+};
+
+/**
+ * Mixed streaming turn — reasoning, unregistered and registered tool calls, then later markdown text.
+ */
+export const MixedStreaming: Story = {
+  args: {
+    sessionId: primarySessionFixture.id,
+    agentName: primarySessionFixture.agent_name,
+    canPrompt: true,
+    onCancelPrompt: () => undefined,
+  },
+  parameters: {
+    ...storybookMswParameters({
+      session: [
+        compozyApiMock.get("/api/workspaces/{workspace_id}/sessions/{session_id}/transcript", () =>
+          HttpResponse.json(transcriptPayload(mixedStreamingTranscript))
+        ),
+      ],
+    }),
+  },
+};
+
+/**
+ * Folded work turns — three settled assistant turns collapse to duration buttons while final text remains visible.
+ */
+export const FoldedTurns: Story = {
+  args: {
+    sessionId: primarySessionFixture.id,
+    agentName: primarySessionFixture.agent_name,
+    canPrompt: true,
+    onCancelPrompt: () => undefined,
+  },
+  parameters: {
+    ...storybookMswParameters({
+      session: [
+        compozyApiMock.get("/api/workspaces/{workspace_id}/sessions/{session_id}/transcript", () =>
+          HttpResponse.json(transcriptPayload(foldedTurnsTranscript))
+        ),
+      ],
+    }),
+  },
+};
+
+/**
+ * Changed-files roll-up — a settled editing turn closes with a collapsed
+ * "Edited N files +a/-d" audit summary at its tail (below the folded work and the
+ * terminal answer). Display-only: no Undo/Review, since CompozyOS exposes no checkpoint
+ * semantics. Expanding it lists each modified file with its diff stats.
+ */
+export const ChangedFilesRollup: Story = {
+  args: {
+    sessionId: primarySessionFixture.id,
+    agentName: primarySessionFixture.agent_name,
+    canPrompt: true,
+    onCancelPrompt: () => undefined,
+  },
+  parameters: {
+    ...storybookMswParameters({
+      session: [
+        compozyApiMock.get("/api/workspaces/{workspace_id}/sessions/{session_id}/transcript", () =>
+          HttpResponse.json(transcriptPayload(changedFilesTranscript))
+        ),
+      ],
+    }),
+  },
+};
+
+/**
+ * Persistent toolbar — durable user output exposes copy and message editing.
+ */
+export const MessageToolbar: Story = {
+  args: {
+    sessionId: primarySessionFixture.id,
+    agentName: primarySessionFixture.agent_name,
+    canPrompt: true,
+    onCancelPrompt: () => undefined,
+  },
+  parameters: {
+    ...storybookMswParameters({
+      session: [
+        compozyApiMock.get("/api/workspaces/{workspace_id}/sessions/{session_id}/transcript", () =>
+          HttpResponse.json(transcriptPayload(hoverToolbarTranscript))
+        ),
+      ],
+    }),
+  },
+  play: async ({ canvasElement }) => {
+    const canvas = within(canvasElement);
+    await expect(await canvas.findByRole("button", { name: "Edit message" })).toBeVisible();
+  },
+};
+
+/**
+ * Goal command validation — typed failures stay internal while the session-scoped
+ * runtime alert gives the operator a concrete recovery action.
+ */
+export const GoalCommandError: Story = {
+  args: {
+    sessionId: primarySessionFixture.id,
+    agentName: primarySessionFixture.agent_name,
+    canPrompt: true,
+    onCancelPrompt: () => undefined,
+  },
+  parameters: {
+    ...storybookMswParameters({
+      session: [
+        compozyApiMock.get("/api/workspaces/{workspace_id}/sessions/{session_id}/transcript", () =>
+          HttpResponse.json(transcriptPayload(hoverToolbarTranscript))
+        ),
+      ],
+    }),
+  },
+  decorators: [
+    Story => (
+      <GoalCommandErrorFixture>
+        <Story />
+      </GoalCommandErrorFixture>
+    ),
+  ],
+  play: async ({ canvasElement }) => {
+    const canvas = within(canvasElement);
+    await expect(await canvas.findByRole("alert")).toHaveTextContent(
+      "Add an objective after /goal, then try again."
+    );
+    await expect(canvas.queryByText("goal_objective_required")).not.toBeInTheDocument();
+  },
+};
+
+/**
+ * Busy turn controls — queue, steer, and interrupt share the running composer surface.
+ */
+export const BusyInputControls: Story = {
+  args: {
+    sessionId: primarySessionFixture.id,
+    agentName: primarySessionFixture.agent_name,
+    canPrompt: true,
+    isSessionRunning: true,
+    allowBusyInput: true,
+    onCancelPrompt: () => undefined,
+    onQueuePrompt: () => undefined,
+    onInterruptPrompt: () => undefined,
+    onSteerPrompt: () => undefined,
+    isBusyInputPending: true,
+  },
+  parameters: {
+    ...storybookMswParameters({
+      session: [
+        compozyApiMock.get("/api/workspaces/{workspace_id}/sessions/{session_id}/transcript", () =>
+          HttpResponse.json(transcriptPayload(mixedStreamingTranscript))
+        ),
+      ],
+    }),
+  },
+};
+
+/**
+ * Wide panel — viewport and composer share the same full-width content rail.
+ */
+export const WidePanel: Story = {
+  ...MixedStreaming,
+  decorators: [
+    Story => (
+      <SessionChatRuntimeProvider
+        sessionId={primarySessionFixture.id}
+        workspaceId={storyWorkspaceId}
+      >
+        <div className="flex h-[640px] w-[1200px] max-w-full flex-col border border-line bg-background">
+          <Story />
+        </div>
+      </SessionChatRuntimeProvider>
+    ),
+  ],
+};
+
+/**
+ * Wide prose — long user and agent messages, a wide table, and a long code line
+ * grow with the pane: no fixed reading measure caps the transcript (#897).
+ */
+export const WideProse: Story = quietTimelineStory(wideProseTranscript);
+
+/**
+ * Onboarding inset — matches wizard header/footer horizontal padding (px-8).
+ */
+export const OnboardingInset: Story = {
+  ...MixedStreaming,
+  args: {
+    sessionId: primarySessionFixture.id,
+    agentName: primarySessionFixture.agent_name,
+    canPrompt: true,
+    contentInset: "px-8",
+    onCancelPrompt: () => undefined,
+  },
+  decorators: [
+    Story => (
+      <SessionChatRuntimeProvider
+        sessionId={primarySessionFixture.id}
+        workspaceId={storyWorkspaceId}
+      >
+        <div className="flex h-[640px] w-[1200px] max-w-full flex-col border border-line bg-background">
+          <Story />
+        </div>
+      </SessionChatRuntimeProvider>
+    ),
+  ],
+};
+
+/**
+ * Scroll-to-bottom pill — the live-follow affordance revealed when the reader
+ * scrolls away from the live edge. Neutral `size-8 rounded-full` disc
+ * (`bg-popover` + `shadow-pop`, whose ring is the hairline; no glass/backdrop-blur), floating over the
+ * transcript above the composer. Interaction-gated in production; rendered here
+ * in its visible state over a transcript-like backdrop.
+ */
+export const ScrollToBottomAffordance: Story = {
+  args: baseArgs,
+  render: () => (
+    <div className="relative flex min-h-0 flex-1 flex-col bg-background">
+      <div className="flex-1 space-y-4 overflow-hidden px-4 py-6 text-sm leading-7 text-muted-foreground">
+        {Array.from({ length: 8 }, (_, index) => (
+          <p key={index}>
+            Streamed transcript line {index + 1} — the reader has scrolled up while the assistant
+            keeps answering below the fold, so the live-follow pill offers a one-click return to the
+            newest output.
+          </p>
+        ))}
+      </div>
+      <ScrollToBottomPill visible onClick={() => undefined} />
+    </div>
+  ),
+};
+
+// --- Quiet timeline (ADR-006..009, task_07 VC-01..VC-09) ---------------------
+
+/** VC-01 — a settled turn folded behind "Worked for · counts", then the live turn: prose, the completed-tools group, and the one live row ("Running shell — …"). */
+export const QuietTimelineLiveRow: Story = quietTimelineStory(liveToolTranscript, {
+  running: true,
+  currentTool: "Bash",
+});
+
+/** VC-02 — three tools in flight stay one honest row: "Running 3 tools…" with the layers glyph, expandable to the in-flight list. */
+export const QuietTimelineParallelTools: Story = quietTimelineStory(parallelToolsTranscript, {
+  running: true,
+});
+
+/** VC-03 — six settled tools of the live turn rest as "Ran 4 commands · Edited 1 file · Read 3 files"; open reveals the production ToolCallRows. */
+export const QuietTimelineCompletedGroup: Story = quietTimelineStory(completedGroupTranscript, {
+  running: true,
+  currentTool: "Bash",
+});
+
+/** VC-04 — one absorbed failure: "· 1 failed" in the same ink, subtle × and the word "failed" inside; no danger, the live row keeps going. */
+export const QuietTimelinePartialFailure: Story = quietTimelineStory(partialFailureTranscript, {
+  running: true,
+  currentTool: "Bash",
+});
+
+/** VC-06 — the turn you stopped stays open: the running call reads "stopped", the label is "You stopped after 1m 40s" in warning ink. */
+export const QuietTimelineInterruptedOpen: Story = quietTimelineStory(interruptedOpenTranscript);
+
+/** VC-06 (right) — a steer that fell back to interrupt folds normally: "Interrupted after 48s · replaced by your steer · Ran 2 commands". */
+export const QuietTimelineSteerFallbackFold: Story = quietTimelineStory(steerFallbackTranscript);
+
+/** VC-07 — steer markers under the operator's bubbles: injected, pending injection, superseded (quieter), fallback, and from the queue. */
+export const QuietTimelineSteerMarkers: Story = quietTimelineStory(steerMarkersTranscript);
+
+/** VC-08 — a 12,480-line tool result: the expanded body shows the head; the strip says how much of how much and offers Show all / Download. */
+export const QuietTimelineGiantPayload: Story = quietTimelineStory(giantPayloadTranscript);
+
+/** VC-09 — assistant prose still streaming: the smooth reveal on (default), off under reduced motion or the Smooth streaming setting. */
+export const QuietTimelineStreamingProse: Story = quietTimelineStory(streamingProseTranscript, {
+  running: true,
+});
+
+/** VC-11 — the lead reply landed, two spawned agents still run: the status row keeps working with "2 agents running". */
+export const QuietTimelineChildrenRunning: Story = quietTimelineStory(liveToolTranscript, {
+  running: true,
+  agents: 2,
+});
+
+const LARGE_TRANSCRIPT = largeTranscriptEntries();
+
+/**
+ * E2E-018 seed — 3,000 entries served 200 at a time through `before_sequence`,
+ * the way the daemon pages history. Scroll up to load older pages; pages far
+ * above the reader are released from memory and reload on the way back.
+ */
+export const ThreeThousandEntries: Story = {
+  args: baseArgs,
+  parameters: {
+    ...storybookMswParameters({
+      session: [
+        compozyApiMock.get(
+          "/api/workspaces/{workspace_id}/sessions/{session_id}/transcript",
+          ({ request }) => {
+            const before = new URL(request.url).searchParams.get("before_sequence");
+            return HttpResponse.json(
+              largeTranscriptPage(LARGE_TRANSCRIPT, before === null ? null : Number(before))
+            );
+          }
+        ),
+      ],
+    }),
+  },
+};

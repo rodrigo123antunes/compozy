@@ -1,0 +1,117 @@
+package config
+
+import (
+	"errors"
+	"fmt"
+	"log/slog"
+	"net"
+	"net/url"
+	"strings"
+
+	"github.com/compozy/compozy/internal/extension/surfaces"
+)
+
+// Validate ensures the skills configuration is internally consistent.
+func (c SkillsConfig) Validate() error {
+	if err := ValidateSkillSources(c.Sources); err != nil {
+		return err
+	}
+	if err := validateDuplicateSkillSourceRoots(c.Sources, c.CustomSources); err != nil {
+		return err
+	}
+	if !c.Enabled {
+		return nil
+	}
+	if c.PollInterval <= 0 {
+		return fmt.Errorf("skills.poll_interval must be positive: %s", c.PollInterval)
+	}
+
+	return nil
+}
+
+// Validate ensures the extension configuration is internally consistent.
+func (c ExtensionsConfig) Validate() error {
+	if err := c.Sources.GitHub.Validate(); err != nil {
+		return err
+	}
+	if err := c.Dev.Validate(); err != nil {
+		return err
+	}
+	return c.Resources.Validate()
+}
+
+// Validate ensures the extension resource policy is internally consistent.
+func (c ExtensionsResourcesConfig) Validate() error {
+	if _, err := surfaces.NormalizeAllowedKinds(c.AllowedKinds); err != nil {
+		return fmt.Errorf("extensions.resources.allowed_kinds: %w", err)
+	}
+	if c.MaxScope != "" {
+		if err := c.MaxScope.Validate("extensions.resources.max_scope"); err != nil {
+			return err
+		}
+	}
+	if err := c.SnapshotRateLimit.Validate("extensions.resources.snapshot_rate_limit"); err != nil {
+		return err
+	}
+	if err := c.OperatorWriteRateLimit.Validate("extensions.resources.operator_write_rate_limit"); err != nil {
+		return err
+	}
+	return nil
+}
+
+// Validate ensures one configured resource rate-limit bucket is internally consistent.
+func (c ExtensionsResourceRateLimitConfig) Validate(path string) error {
+	if c.Requests == 0 && c.Window == 0 && c.Queue == 0 {
+		return nil
+	}
+	if c.Requests <= 0 {
+		return fmt.Errorf("%s.requests must be positive: %d", path, c.Requests)
+	}
+	if c.Window <= 0 {
+		return fmt.Errorf("%s.window must be positive: %s", path, c.Window)
+	}
+	if c.Queue < 0 {
+		return fmt.Errorf("%s.queue must be zero or positive: %d", path, c.Queue)
+	}
+	return nil
+}
+
+// Validate ensures the GitHub extension source is internally consistent.
+func (c ExtensionsGitHubSourceConfig) Validate() error {
+	baseURL := strings.TrimSpace(c.BaseURL)
+	if baseURL == "" {
+		if !c.Enabled {
+			return nil
+		}
+		return errors.New("extensions.sources.github.base_url is required")
+	}
+	parsed, err := url.Parse(baseURL)
+	if err != nil {
+		return fmt.Errorf("extensions.sources.github.base_url is invalid: %w", err)
+	}
+	if parsed.Scheme != marketplaceSchemeHTTP && parsed.Scheme != urlSchemeHTTPS {
+		return fmt.Errorf("extensions.sources.github.base_url must use http or https: %q", c.BaseURL)
+	}
+	if strings.TrimSpace(parsed.Host) == "" {
+		return fmt.Errorf("extensions.sources.github.base_url must include a host: %q", c.BaseURL)
+	}
+	if parsed.Scheme == marketplaceSchemeHTTP && !isLoopbackHost(parsed.Hostname()) {
+		slog.Warn("config: extensions GitHub source uses insecure http scheme", "url", c.BaseURL)
+	}
+	return nil
+}
+
+func isLoopbackHost(host string) bool {
+	return strings.EqualFold(strings.TrimSpace(host), "localhost") || net.ParseIP(host).IsLoopback()
+}
+
+// Validate ensures the extension dev-loop interval is usable.
+func (c ExtensionsDevConfig) Validate() error {
+	if c.WatchInterval == 0 {
+		return nil
+	}
+	if c.WatchInterval <= 0 {
+		return fmt.Errorf("extensions.dev.watch_interval must be positive: %s", c.WatchInterval)
+	}
+	return nil
+}

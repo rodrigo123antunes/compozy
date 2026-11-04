@@ -1,0 +1,72 @@
+package daemon
+
+import (
+	"context"
+	"errors"
+	"slices"
+
+	"github.com/compozy/compozy/internal/agentinstance"
+	compozyconfig "github.com/compozy/compozy/internal/config"
+	"github.com/compozy/compozy/internal/session"
+	"github.com/compozy/compozy/internal/store"
+	workspacepkg "github.com/compozy/compozy/internal/workspace"
+)
+
+type instanceDefinitions struct {
+	sourceDeclarations *instanceSourceDeclarations
+	monitors           instanceRotationMonitors
+	workspaces         *workspacepkg.Resolver
+	profiles           session.ProfileNameResolver
+	agents             session.AgentResolver
+	sessions           *session.Manager
+	// scriptsEnabled is the poller's own `agents.heartbeat.sources.scripts_enabled`, so instance
+	// reads ask for approval exactly where a poll would run the script.
+	scriptsEnabled bool
+}
+
+var _ instanceDefinitionReader = instanceDefinitions{}
+
+func (r instanceDefinitions) InstanceDefinition(
+	ctx context.Context,
+	profileID, workspaceID, agentName string,
+) (instanceDefinition, error) {
+	resolved, err := r.resolveWorkspace(ctx, profileID, workspaceID)
+	if err != nil {
+		return instanceDefinition{}, err
+	}
+	agent, err := r.agents.ResolveAgent(agentName, &resolved)
+	if errors.Is(err, workspacepkg.ErrAgentNotAvailable) {
+		return instanceDefinition{}, agentinstance.ErrDefinitionMissing
+	}
+	if err != nil {
+		return instanceDefinition{}, err
+	}
+	if agent.Kind != compozyconfig.AgentKindAlwaysOn {
+		return instanceDefinition{}, agentinstance.ErrNotAlwaysOn
+	}
+	runtime, err := resolved.Config.ResolveAgent(agent)
+	if err != nil {
+		return instanceDefinition{}, err
+	}
+	tools, err := r.sessions.DelegationTools(runtime)
+	if err != nil {
+		return instanceDefinition{}, err
+	}
+	policy := store.SessionPermissionPolicy{
+		Tools:          tools,
+		WorkspacePaths: append([]string{resolved.RootDir}, resolved.AdditionalDirs...),
+	}
+	for _, skill := range resolved.Skills {
+		if !slices.Contains(agent.Skills.Disabled, skill.Name) {
+			policy.Skills = append(policy.Skills, skill.Name)
+		}
+	}
+	for _, server := range runtime.MCPServers {
+		policy.MCPServers = append(policy.MCPServers, server.Name)
+	}
+	return instanceDefinition{
+		Kind:   agent.Kind,
+		Grant:  agent.WorkspaceAccess,
+		Policy: store.NormalizeSessionPermissionPolicy(policy),
+	}, nil
+}

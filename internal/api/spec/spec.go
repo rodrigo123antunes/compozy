@@ -1,0 +1,346 @@
+package spec
+
+import (
+	"context"
+	"encoding/json"
+	"fmt"
+	"reflect"
+
+	"github.com/getkin/kin-openapi/openapi3"
+)
+
+const (
+	httpMethodDelete = "DELETE"
+	httpMethodGet    = "GET"
+	httpMethodHead   = "HEAD"
+	httpMethodPatch  = "PATCH"
+	httpMethodPost   = "POST"
+	httpMethodPut    = "PUT"
+)
+
+const (
+	specContentTypeEventStream = "text/event-stream"
+	specEventStreamUpgrade     = "WebSocket upgrade; each text message contains one complete SSE frame"
+	specExpectedRevisionKey    = "expected_revision"
+	specFormatInt64            = "int64"
+	specParameterInPath        = openapi3.ParameterInPath
+	specParameterInQuery       = openapi3.ParameterInQuery
+	specArrayKind              = "array"
+	specWorkspaceIDKey         = "workspace_id"
+	specAggregateDeniedText    = "Agent aggregate access denied"
+)
+
+const (
+	specAPIAutomationJobsIDPath         = "/api/automation/jobs/{id}"
+	specAPIAutomationTriggersIDPath     = "/api/automation/triggers/{id}"
+	specAPIExtensionsPath               = "/api/extensions"
+	specAPIExtensionsPreviewInstallPath = specAPIExtensionsPath + "/preview-install"
+	specAPIExtensionsCommandsPath       = specAPIExtensionsPath + "/commands"
+	specAPIExtensionsNamePath           = "/api/extensions/{name}"
+	specAPIExtensionsNameProvenancePath = specAPIExtensionsNamePath + "/provenance"
+	specAPIExtensionsDevPath            = specAPIExtensionsPath + "/dev"
+	specAPIExtensionsNameReloadPath     = specAPIExtensionsNamePath + "/reload"
+	specAPIExtensionsNameLogsPath       = specAPIExtensionsNamePath + "/logs"
+	specAPIExtensionsNameInventoryPath  = specAPIExtensionsNamePath + "/inventory"
+	specAPIExtensionsNameSecretsPath    = specAPIExtensionsNamePath + "/secrets"
+	specAPIExtensionsNameSecretPath     = specAPIExtensionsNameSecretsPath + "/{env_name}"
+	specAPIExtensionsNameEnablementPath = specAPIExtensionsNamePath + "/enablement"
+	specAPIResourcesKindIDPath          = "/api/resources/{kind}/{id}"
+	specAPISettingsAutomationPath       = "/api/settings/automation"
+	specAPISettingsGeneralPath          = "/api/settings/general"
+	specAPISettingsPersonaPath          = "/api/settings/persona"
+	specAPISettingsHooksExtensionsPath  = "/api/settings/hooks-extensions"
+	specAPISettingsHooksNamePath        = "/api/settings/hooks/{name}"
+	specAPISettingsMCPServersNamePath   = "/api/settings/mcp-servers/{name}"
+	specAPISettingsRolesPath            = "/api/settings/roles"
+
+	specAPISettingsWindowManagerPath = "/api/settings/window-manager"
+	specAPISettingsCmdPalettePath    = "/api/settings/cmd-palette"
+	specAPISettingsAttentionPath     = "/api/settings/attention"
+	specAPISettingsShellPath         = "/api/settings/shell"
+	specAPISettingsObservabilityPath = "/api/settings/observability"
+	specAPISettingsProvidersNamePath = "/api/settings/providers/{name}"
+
+	specAPISettingsSkillsPath                  = "/api/settings/skills"
+	specAPIRunsBulkFailPath                    = "/api/runs/bulk/fail"
+	specAPIRunsBulkReleasePath                 = "/api/runs/bulk/release"
+	specAPIRunsIDFailPath                      = "/api/runs/{id}/fail"
+	specAPIRunsIDInspectPath                   = "/api/runs/{id}/inspect"
+	specAPIRunsIDReleasePath                   = "/api/runs/{id}/release"
+	specAPIRunsIDRetryPath                     = "/api/runs/{id}/retry"
+	specAPIRunsIDRecoverPath                   = "/api/runs/{id}/recover"
+	specAPISchedulerPath                       = "/api/scheduler"
+	specAPISchedulerBacklogPath                = "/api/scheduler/backlog"
+	specAPISchedulerDrainPath                  = "/api/scheduler/drain"
+	specAPISchedulerPausePath                  = "/api/scheduler/pause"
+	specAPISchedulerResumePath                 = "/api/scheduler/resume"
+	specAPITaskRunsIDReviewsPath               = "/api/task-runs/{id}/reviews"
+	specAPITaskRunsIDResultPath                = "/api/task-runs/{id}/result"
+	specAPITasksPath                           = "/api/tasks"
+	specAPITasksIDPath                         = "/api/tasks/{id}"
+	specAPITasksIDBlocksPath                   = specAPITasksIDPath + "/blocks"
+	specAPITasksIDBlocksBlockIDClearPath       = specAPITasksIDBlocksPath + "/{block_id}/clear"
+	specAPITasksIDExecutionProfilePath         = "/api/tasks/{id}/execution-profile"
+	specAPITasksIDExecutionProfileWorktreePath = specAPITasksIDExecutionProfilePath + "/worktree"
+	specAPITasksIDInspectPath                  = "/api/tasks/{id}/inspect"
+
+	specAPITasksIDPausePath                         = "/api/tasks/{id}/pause"
+	specAPITasksIDRecoverPath                       = specAPITasksIDPath + "/recover"
+	specAPITasksIDResumePath                        = "/api/tasks/{id}/resume"
+	specAPITasksIDRunsPath                          = "/api/tasks/{id}/runs"
+	specAPITasksIDRunsFanOutPath                    = specAPITasksIDRunsPath + "/fan-out"
+	specAPIVaultEntriesPath                         = "/api/vault/secrets"
+	specAPIWorkspacesIDPath                         = "/api/workspaces/{id}"
+	specAcceptedDescription                         = "Accepted"
+	specActivationConflictDescription               = "Activation conflict"
+	specActivationNotFoundDescription               = "Activation not found"
+	specAgentCallerIdentityIsMissingDescription     = "Agent caller identity is missing"
+	specAgentNotFoundDescription                    = "Agent not found"
+	specAutomationJobNotFoundDescription            = "Automation job not found"
+	specAutomationManagerIsNotConfiguredDescription = "Automation manager is not configured"
+	specAutomationTriggerNotFoundDescription        = "Automation trigger not found"
+
+	specConflictingSettingsChangeDescription              = "Conflicting settings change"
+	specSuccessDescription                                = "Success"
+	specCreatedDescription                                = "Created"
+	specUpdatedDescription                                = "Updated"
+	specExtensionNotFoundDescription                      = "Extension not found"
+	specExtensionServiceIsNotConfiguredDescription        = "Extension service is not configured"
+	specForbiddenDescription                              = "Forbidden"
+	specForceOperationForbiddenDescription                = "Force operation forbidden"
+	specForceOperationRateLimitExceededDescription        = "Force-operation rate limit exceeded"
+	specSupportBundleServiceIsNotConfiguredDescription    = "Support bundle service is not configured"
+	specForbiddenWorkspaceOrPermissionMismatchDescription = "Forbidden - workspace or permission mismatch"
+	specInternalDaemonErrorDescription                    = "Internal daemon error"
+	specInternalServerErrorDescription                    = "Internal server error"
+	specObserveNotConfiguredDescription                   = "Observe service is not configured"
+	specOnboardingStoreUnavailableDescription             = "Onboarding store is not configured"
+	specSessionPromptConflictDescription                  = "Session prompt conflict"
+	specInvalidAgentLocalLayerDescription                 = "Invalid agent-local layer"
+	specInvalidAutomationRunFilterDescription             = "Invalid automation run filter"
+
+	specInvalidFilterDescription            = "Invalid filter"
+	specInvalidSettingsPayloadDescription   = "Invalid settings payload"
+	specInvalidSkillLookupDescription       = "Invalid skill lookup"
+	specInvalidTaskIDDescription            = "Invalid task id"
+	specInvalidTaskTriageRequestDescription = "Invalid task triage request"
+
+	specNoContentDescription                                 = "No Content"
+	specPayloadTooLargeDescription                           = "Payload too large"
+	specRateLimitedDescription                               = "Rate limited"
+	specProviderNotFoundDescription                          = "Provider not found"
+	specServiceUnavailableDependentServiceMissingDescription = "Service unavailable - dependent service missing"
+	specSessionNotFoundDescription                           = "Session not found"
+	specSkillOrScopeNotFoundDescription                      = "Skill or scope not found"
+	specSkillsRegistryIsNotConfiguredDescription             = "Skills registry is not configured"
+	specTaskNotFoundDescription                              = "Task not found"
+	specTaskAdmissionUnavailableDescription                  = "Task service is unavailable or daemon is draining"
+
+	specTaskRunNotFoundDescription                    = "Task run not found"
+	specTaskServiceIsNotConfiguredDescription         = "Task service is not configured"
+	specToolNotFoundDescription                       = "Tool not found"
+	specToolRegistryUnavailableDescription            = "Tool registry unavailable"
+	specVaultServiceUnavailableDescription            = "Vault service unavailable"
+	specWorkspaceNotFoundDescription                  = "Workspace not found"
+	specWorkspaceRootMissingDescription               = "Workspace root missing"
+	specAgentDefinitionServicesUnavailableDescription = "Workspace resolver or definition sync unavailable"
+	specAPIAgentsNamePath                             = "/api/agents/{name}"
+	specAgentKey                                      = "agent"
+	specAgentsKey                                     = "agents"
+	specAutomationKey                                 = "automation"
+
+	specDiagnosticsKey = "diagnostics"
+	specOnboardingKey  = "onboarding"
+	specFilesystemKey  = "filesystem"
+	specGatewayKey     = "gateway"
+	specExtensionKey   = "extension"
+	specExtensionsKey  = "extensions"
+	specHooksKey       = "hooks"
+	specIntegerKey     = "integer"
+	specStringKey      = "string"
+	specLogsKey        = "logs"
+	specMarketplaceKey = "marketplace"
+
+	specNotificationsKey           = "notifications"
+	specObserveKey                 = "observe"
+	specProvidersKey               = "providers"
+	specProfileNotFoundDescription = "Profile not found"
+	specProfilesKey                = "profiles"
+	specResourcesKey               = "resources"
+	specRolesKey                   = "roles"
+	specSessionsKey                = "sessions"
+	specSettingsKey                = "settings"
+	specSkillsKey                  = "skills"
+	specSupportKey                 = "support"
+	specTasksKey                   = "tasks"
+	specToolsKey                   = "tools"
+	specCmdPaletteKey              = "cmd-palette"
+	specToolsetsKey                = "toolsets"
+	specVaultKey                   = "vault"
+	specWorkspacesKey              = "workspaces"
+	specWorktreesKey               = "worktrees"
+)
+
+const (
+	// DefaultPath is the canonical generated OpenAPI output location.
+	DefaultPath = "openapi/compozy.json"
+)
+
+var rawMessageType = reflect.TypeFor[json.RawMessage]()
+
+// Transport identifies which daemon transport exposes a route.
+type Transport string
+
+const (
+	TransportHTTP                   Transport = "http"
+	TransportUDS                    Transport = "uds"
+	workspaceRootMissingDescription           = "Workspace root is missing"
+)
+
+type binaryResponse struct{}
+
+// ParameterSpec describes one OpenAPI parameter.
+type ParameterSpec struct {
+	Name        string
+	In          string
+	Description string
+	Required    bool
+	Kind        string
+	Format      string
+	Enum        []string
+	Pattern     string
+	MaxLength   *uint64
+	Minimum     *float64
+	Maximum     *float64
+	Default     any
+}
+
+// ResponseSpec describes one OpenAPI response.
+type ResponseSpec struct {
+	Status            int
+	Default           bool
+	Description       string
+	Body              any
+	Bodies            responseBodies
+	ContentType       string
+	AdditionalContent map[string]any
+	Headers           map[string]ParameterSpec
+}
+
+// OperationAuth identifies the transport-owned trust boundary for an operation.
+type OperationAuth string
+
+const (
+	OperationAuthDevice         OperationAuth = "device"
+	OperationAuthLocalSocket    OperationAuth = "local_socket"
+	OperationAuthPrivatePreAuth OperationAuth = "private_pre_auth"
+)
+
+// AppAccess is an explicit local-browser authorization decision.
+type AppAccess string
+
+const (
+	AppAccessAllowed AppAccess = "allowed"
+	AppAccessDenied  AppAccess = "denied"
+)
+
+// OperationSpec describes one canonical REST operation.
+type OperationSpec struct {
+	AppAccess   AppAccess
+	Stream      string
+	Stability   string
+	Method      string
+	Path        string
+	OperationID string
+	Summary     string
+	Tags        []string
+	Transports  []Transport
+	Auth        map[Transport]OperationAuth
+	Parameters  []ParameterSpec
+	RequestBody any
+	// RequestBodyOptional keeps a request body schema documented while allowing empty requests.
+	RequestBodyOptional bool
+	// RequestContentType overrides the request media type; an empty value uses application/json when RequestBody is set.
+	// RequestUploadForm is the only non-JSON value accepted today.
+	RequestContentType string
+	Responses          []ResponseSpec
+}
+
+// RequestUploadForm documents a multipart upload carrying one required binary "file" field.
+const RequestUploadForm = "multipart/form-data"
+
+// Document builds the canonical OpenAPI specification document.
+func Document() (*openapi3.T, error) {
+	doc := &openapi3.T{
+		OpenAPI: "3.0.3",
+		Info: &openapi3.Info{
+			Title:   "Compozy API",
+			Version: "1.0.0",
+		},
+		Components: &openapi3.Components{
+			Schemas: openapi3.Schemas{},
+		},
+		Paths: openapi3.NewPaths(),
+		Tags: openapi3.Tags{
+			{Name: specAgentKey},
+			{Name: specAppTokensKey},
+			{Name: specAgentsKey},
+			{Name: specAutomationKey},
+			{Name: specDiagnosticsKey},
+			{Name: specOnboardingKey},
+			{Name: specFilesystemKey},
+			{Name: specGatewayKey},
+			{Name: specNotificationsKey},
+			{Name: specExtensionsKey},
+			{Name: specHooksKey},
+			{Name: specLogsKey},
+			{Name: specLoopsKey},
+			{Name: specMarketplaceKey},
+			{Name: specObserveKey},
+			{Name: specOpenAIKey},
+			{Name: specProvidersKey},
+			{Name: specProfilesKey},
+			{Name: specResourcesKey},
+			{Name: specRolesKey},
+			{Name: specSessionsKey},
+			{Name: specSettingsKey},
+			{Name: specSupportKey},
+			{Name: specSkillsKey},
+			{Name: specTasksKey},
+			{Name: specToolsKey},
+			{Name: specCmdPaletteKey},
+			{Name: specToolsetsKey},
+			{Name: specVaultKey},
+			{Name: specWorkspacesKey},
+			{Name: specWorktreesKey},
+		},
+	}
+	if err := registerExtensionAuthoringComponentSchemas(doc.Components.Schemas); err != nil {
+		return nil, fmt.Errorf("register extension authoring component schemas: %w", err)
+	}
+	if err := registerWindowManagerComponentSchemas(doc.Components.Schemas); err != nil {
+		return nil, fmt.Errorf("register window-manager component schemas: %w", err)
+	}
+
+	operations := Operations()
+	if err := validateOperationRegistry(operations); err != nil {
+		return nil, fmt.Errorf("validate operation registry: %w", err)
+	}
+	for _, opSpec := range operations {
+		operation, err := buildOperation(doc.Components.Schemas, opSpec)
+		if err != nil {
+			return nil, fmt.Errorf("build %s %s: %w", opSpec.Method, opSpec.Path, err)
+		}
+		doc.AddOperation(opSpec.Path, opSpec.Method, operation)
+	}
+	resolveComponentSchemaReferences(doc.Components.Schemas)
+	if err := lintDocumentSchemas(doc); err != nil {
+		return nil, fmt.Errorf("lint openapi: %w", err)
+	}
+
+	if err := doc.Validate(context.Background()); err != nil {
+		return nil, fmt.Errorf("validate openapi: %w", err)
+	}
+
+	return doc, nil
+}

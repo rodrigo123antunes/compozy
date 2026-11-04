@@ -1,0 +1,1264 @@
+package acpmock
+
+import (
+	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"math"
+	"os"
+	"path/filepath"
+	"reflect"
+	"strings"
+	"sync"
+	"testing"
+	"time"
+
+	"github.com/compozy/compozy/internal/acp"
+	compozyconfig "github.com/compozy/compozy/internal/config"
+)
+
+func TestLoadFixtureParsesMultipleAgentsAndScenarioPrimitives(t *testing.T) {
+	t.Parallel()
+
+	t.Run("Should map named agents and assistant responses", func(t *testing.T) {
+		t.Parallel()
+
+		fixture, err := LoadFixture(filepath.Join("testdata", "multi_agent_fixture.json"))
+		if err != nil {
+			t.Fatalf("LoadFixture() error = %v", err)
+		}
+
+		if got, want := len(fixture.Agents), 2; got != want {
+			t.Fatalf("len(fixture.Agents) = %d, want %d", got, want)
+		}
+
+		alpha, err := fixture.Agent("alpha")
+		if err != nil {
+			t.Fatalf("fixture.Agent(alpha) error = %v", err)
+		}
+		turn, err := alpha.SelectTurn("hello alpha", acp.PromptMeta{TurnSource: acp.PromptTurnSourceUser})
+		if err != nil {
+			t.Fatalf("alpha.SelectTurn() error = %v", err)
+		}
+		if got, want := turn.Name, "alpha-hello"; got != want {
+			t.Fatalf("turn.Name = %q, want %q", got, want)
+		}
+		if got, want := turn.Steps[0].Kind, StepKindAssistant; got != want {
+			t.Fatalf("turn.Steps[0].Kind = %q, want %q", got, want)
+		}
+		if got, want := turn.Steps[1].Kind, StepKindAssistant; got != want {
+			t.Fatalf("turn.Steps[1].Kind = %q, want %q", got, want)
+		}
+	})
+
+	t.Run("Should maps permission and command primitives", func(t *testing.T) {
+		t.Parallel()
+
+		fixture, err := LoadFixture(filepath.Join("testdata", "permission_env_fixture.json"))
+		if err != nil {
+			t.Fatalf("LoadFixture() error = %v", err)
+		}
+
+		approver, err := fixture.Agent("approver")
+		if err != nil {
+			t.Fatalf("fixture.Agent(approver) error = %v", err)
+		}
+		permissionTurn, err := approver.SelectTurn(
+			"request permission",
+			acp.PromptMeta{TurnSource: acp.PromptTurnSourceUser},
+		)
+		if err != nil {
+			t.Fatalf("approver.SelectTurn() error = %v", err)
+		}
+		if got, want := permissionTurn.Steps[0].Kind, StepKindPermission; got != want {
+			t.Fatalf("permission step kind = %q, want %q", got, want)
+		}
+		if got, want := permissionTurn.Steps[0].ExpectDecision, "allow-always"; got != want {
+			t.Fatalf("permission ExpectDecision = %q, want %q", got, want)
+		}
+
+		runner, err := fixture.Agent("runner")
+		if err != nil {
+			t.Fatalf("fixture.Agent(runner) error = %v", err)
+		}
+		commandTurn, err := runner.SelectTurn(
+			"run command",
+			acp.PromptMeta{TurnSource: acp.PromptTurnSourceUser},
+		)
+		if err != nil {
+			t.Fatalf("runner.SelectTurn() error = %v", err)
+		}
+		if got, want := commandTurn.Steps[0].Kind, StepKindCommand; got != want {
+			t.Fatalf("command step kind = %q, want %q", got, want)
+		}
+		if got, want := commandTurn.Steps[0].Command, "compozy"; got != want {
+			t.Fatalf("command step command = %q, want %q", got, want)
+		}
+	})
+
+	t.Run("Should select a judge turn by exact structured metadata", func(t *testing.T) {
+		t.Parallel()
+
+		fixture, err := ParseFixture(
+			[]byte(
+				`{"version":2,"agents":[{"name":"judge","provider":"claude","turns":[` +
+					`{"name":"turn-two","match":{"turn_source":"user","judge":{"role":"agent-judge","attempt":2}},` +
+					`"steps":[{"kind":"assistant","text":"revise"}]}]}]}`,
+			),
+		)
+		if err != nil {
+			t.Fatalf("ParseFixture(judge metadata) error = %v", err)
+		}
+		judge, err := fixture.Agent("judge")
+		if err != nil {
+			t.Fatalf("fixture.Agent(judge) error = %v", err)
+		}
+		turn, err := judge.SelectTurn(
+			"rendered rubric is not routing authority",
+			acp.PromptMeta{TurnSource: acp.PromptTurnSourceUser, Judge: &acp.PromptJudgeMeta{
+				Role: acp.PromptJudgeRoleAgent, Attempt: 2, CorrelationID: "goal-judge:stable",
+				GateID: "goal:goal-judge", CriterionID: "review",
+			}},
+		)
+		if err != nil {
+			t.Fatalf("judge.SelectTurn(judge metadata) error = %v", err)
+		}
+		if got, want := turn.Name, "turn-two"; got != want {
+			t.Fatalf("turn.Name = %q, want %q", got, want)
+		}
+		if _, err := judge.SelectTurn(
+			"same rendered rubric",
+			acp.PromptMeta{TurnSource: acp.PromptTurnSourceUser, Judge: &acp.PromptJudgeMeta{
+				Role: acp.PromptJudgeRoleAgent, Attempt: 3, CorrelationID: "goal-judge:stable",
+				GateID: "goal:goal-judge", CriterionID: "review",
+			}},
+		); err == nil || !strings.Contains(err.Error(), "no turn matched") {
+			t.Fatalf("judge.SelectTurn(non-matching attempt) error = %v, want no-match error", err)
+		}
+	})
+
+	t.Run("Should select a Goal turn by exact structured metadata", func(t *testing.T) {
+		t.Parallel()
+
+		fixture, err := ParseFixture([]byte(
+			`{"version":2,"agents":[{"name":"judge","provider":"claude","turns":[` +
+				`{"name":"second-work","match":{"turn_source":"synthetic","goal":{"kind":"goal-work","turn":2}},` +
+				`"steps":[{"kind":"assistant","text":"pass"}]}]}]}`,
+		))
+		if err != nil {
+			t.Fatalf("ParseFixture(Goal metadata) error = %v", err)
+		}
+		judge, err := fixture.Agent("judge")
+		if err != nil {
+			t.Fatalf("fixture.Agent(judge) error = %v", err)
+		}
+		turnValue := 2
+		turn, err := judge.SelectTurn(
+			"work prompt",
+			acp.PromptMeta{TurnSource: acp.PromptTurnSourceSynthetic, Synthetic: &acp.PromptSyntheticMeta{
+				Reason: "goal_work",
+				Goal: &acp.GoalPromptMeta{
+					Kind: acp.GoalPromptKindWork, RunID: "run-1", NodeID: "goal", Generation: 1,
+					ItemIndex: 0, Turn: &turnValue, PromptAttempt: 0, PromptID: "prompt-2",
+				},
+			}},
+		)
+		if err != nil {
+			t.Fatalf("judge.SelectTurn(Goal metadata) error = %v", err)
+		}
+		if turn.Name != "second-work" {
+			t.Fatalf("turn.Name = %q, want second-work", turn.Name)
+		}
+	})
+
+	t.Run("Should select by a canonical user-text fragment", func(t *testing.T) {
+		t.Parallel()
+
+		fixture, err := ParseFixture([]byte(
+			`{"version":2,"agents":[{"name":"repair","provider":"claude","turns":[` +
+				`{"name":"with-verdict","match":{"user_text_contains":"previous verdict: quality rejected"},` +
+				`"steps":[{"kind":"assistant","text":"repair"}]}]}]}`,
+		))
+		if err != nil {
+			t.Fatalf("ParseFixture(fragment matcher) error = %v", err)
+		}
+		agent, err := fixture.Agent("repair")
+		if err != nil {
+			t.Fatalf("fixture.Agent(repair) error = %v", err)
+		}
+		turn, err := agent.SelectTurn(
+			"<compozy-situation-context>runtime</compozy-situation-context>\n" +
+				"Use this repair context: previous verdict: quality rejected; score=0.4",
+		)
+		if err != nil {
+			t.Fatalf("agent.SelectTurn(fragment) error = %v", err)
+		}
+		if turn.Name != "with-verdict" {
+			t.Fatalf("turn.Name = %q, want with-verdict", turn.Name)
+		}
+		if _, err := agent.SelectTurn("previous verdict: quality approved"); err == nil {
+			t.Fatal("agent.SelectTurn(nonmatching fragment) error = nil, want no-match")
+		} else if !strings.Contains(err.Error(), "no turn matched") {
+			t.Fatalf("agent.SelectTurn(nonmatching fragment) error = %v, want no turn matched", err)
+		}
+	})
+
+	t.Run("Should select a replay turn by a raw prompt marker", func(t *testing.T) {
+		t.Parallel()
+
+		fixture, err := ParseFixture([]byte(
+			`{"version":2,"agents":[{"name":"replay","provider":"claude","turns":[` +
+				`{"name":"recovered","match":{"user_text":"continue work",` +
+				`"raw_user_text_contains":"<compozy_context_replay>"},` +
+				`"steps":[{"kind":"assistant","text":"recovered"}]},` +
+				`{"name":"initial","match":{"user_text":"continue work"},` +
+				`"steps":[{"kind":"assistant","text":"initial"}]}]}]}`,
+		))
+		if err != nil {
+			t.Fatalf("ParseFixture(raw replay matcher) error = %v", err)
+		}
+		agent, err := fixture.Agent("replay")
+		if err != nil {
+			t.Fatalf("fixture.Agent(replay) error = %v", err)
+		}
+		initial, err := agent.SelectTurn("continue work")
+		if err != nil {
+			t.Fatalf("agent.SelectTurn(initial) error = %v", err)
+		}
+		if got, want := initial.Name, "initial"; got != want {
+			t.Fatalf("initial turn name = %q, want %q", got, want)
+		}
+		recovered, err := agent.SelectTurn(strings.Join([]string{
+			"<compozy_context_replay>",
+			"[]",
+			"</compozy_context_replay>",
+			"",
+			userRequestPromptMarker,
+			"",
+			"continue work",
+		}, "\n"))
+		if err != nil {
+			t.Fatalf("agent.SelectTurn(recovered) error = %v", err)
+		}
+		if got, want := recovered.Name, "recovered"; got != want {
+			t.Fatalf("recovered turn name = %q, want %q", got, want)
+		}
+	})
+}
+
+func TestRegisterRendersValidatedAgentDefinition(t *testing.T) {
+	t.Parallel()
+
+	homePaths := mockHomePaths(t)
+	diagnosticsPath := filepath.Join(t.TempDir(), "diag", "alpha.jsonl")
+
+	registration, err := Register(homePaths, RegisterOptions{
+		FixturePath:     filepath.Join("testdata", "multi_agent_fixture.json"),
+		FixtureAgent:    "alpha",
+		AgentName:       " mock-alpha ",
+		DriverPath:      "/tmp/mock driver/acpmock-driver",
+		DiagnosticsPath: diagnosticsPath,
+	})
+	if err != nil {
+		t.Fatalf("Register() error = %v", err)
+	}
+	if got, want := registration.AgentName, "mock-alpha"; got != want {
+		t.Fatalf("registration.AgentName = %q, want %q", got, want)
+	}
+	if got, want := registration.AgentDefPath, filepath.Join(
+		homePaths.AgentsDir,
+		"mock-alpha",
+		"AGENT.md",
+	); got != want {
+		t.Fatalf("registration.AgentDefPath = %q, want %q", got, want)
+	}
+
+	loaded, err := compozyconfig.LoadAgentDefFile(registration.AgentDefPath)
+	if err != nil {
+		t.Fatalf("LoadAgentDefFile(%q) error = %v", registration.AgentDefPath, err)
+	}
+	if got, want := loaded.Name, "mock-alpha"; got != want {
+		t.Fatalf("loaded.Name = %q, want %q", got, want)
+	}
+	if got, want := loaded.Provider, "claude"; got != want {
+		t.Fatalf("loaded.Provider = %q, want %q", got, want)
+	}
+	if got, want := loaded.Command, registration.Command; got != want {
+		t.Fatalf("loaded.Command = %q, want %q", got, want)
+	}
+
+	cfg := compozyconfig.DefaultWithHome(homePaths)
+	resolved, err := cfg.ResolveAgent(loaded)
+	if err != nil {
+		t.Fatalf("ResolveAgent() error = %v", err)
+	}
+	if got, want := resolved.Provider, "claude"; got != want {
+		t.Fatalf("resolved.Provider = %q, want %q", got, want)
+	}
+	if got, want := resolved.Command, registration.Command; got != want {
+		t.Fatalf("resolved.Command = %q, want %q", got, want)
+	}
+}
+
+func TestReadDiagnosticsParsesJSONLines(t *testing.T) {
+	t.Parallel()
+
+	t.Run("Should decode Compozy session ownership alongside ACP diagnostics", func(t *testing.T) {
+		t.Parallel()
+
+		path := filepath.Join(t.TempDir(), "diag.jsonl")
+		want := []DiagnosticsRecord{
+			{
+				CompozySessionID: "compozy-session-a",
+				AgentName:        "alpha",
+				SessionID:        "acp-session-1",
+				PromptIndex:      1,
+				Prompt:           "hello",
+				PromptMeta:       acp.PromptMeta{TurnSource: acp.PromptTurnSourceUser},
+				TurnName:         "alpha-hello",
+				Match: TurnMatch{
+					TurnSource: acp.PromptTurnSourceUser,
+					UserText:   "hello",
+				},
+			},
+			{
+				CompozySessionID: "compozy-session-b",
+				AgentName:        "beta",
+				SessionID:        "acp-session-1",
+				PromptIndex:      2,
+				Prompt:           "hello beta",
+				PromptMeta: acp.PromptMeta{
+					TurnSource: acp.PromptTurnSourceUser,
+				},
+				TurnName: "beta-hello",
+				Match: TurnMatch{
+					TurnSource: acp.PromptTurnSourceUser,
+				},
+			},
+			{
+				CompozySessionID:  "compozy-session-a",
+				AgentName:         "gamma",
+				SessionID:         "acp-session-1",
+				ProtocolMethod:    "session/set_config_option",
+				ConfigOptionID:    "reasoning_effort",
+				ConfigOptionValue: "max",
+			},
+		}
+
+		encoded := []byte("\n")
+		for index, record := range want {
+			data, err := json.Marshal(record)
+			if err != nil {
+				t.Fatalf("json.Marshal(record %d) error = %v", index, err)
+			}
+			encoded = append(encoded, data...)
+			encoded = append(encoded, '\n')
+		}
+		if err := os.WriteFile(path, encoded, 0o600); err != nil {
+			t.Fatalf("os.WriteFile(%q) error = %v", path, err)
+		}
+
+		got, err := ReadDiagnostics(path)
+		if err != nil {
+			t.Fatalf("ReadDiagnostics() error = %v", err)
+		}
+		if !reflect.DeepEqual(got, want) {
+			t.Fatalf("ReadDiagnostics() = %#v, want %#v", got, want)
+		}
+	})
+
+	t.Run("Should select one Compozy session in append order before protocol projection", func(t *testing.T) {
+		t.Parallel()
+
+		records := []DiagnosticsRecord{
+			{CompozySessionID: "compozy-session-a", SessionID: "acp-session-1", ProtocolMethod: "model"},
+			{CompozySessionID: "compozy-session-b", SessionID: "acp-session-1", ProtocolMethod: "foreign"},
+			{CompozySessionID: " compozy-session-a ", SessionID: "acp-session-1", ProtocolMethod: "prompt"},
+			{CompozySessionID: "compozy-session-a", SessionID: "acp-session-1", PromptIndex: 1},
+			{
+				CompozySessionID: "compozy-session-a",
+				SessionID:        "acp-session-1",
+				LifecycleEvent:   "session_new",
+				PromptIndex:      1,
+			},
+		}
+		owned := DiagnosticsForCompozySession(records, " compozy-session-a ")
+		if got, want := len(owned), 4; got != want {
+			t.Fatalf("DiagnosticsForCompozySession() = %#v, want four records", owned)
+		}
+		if owned[0].ProtocolMethod != "model" || owned[1].ProtocolMethod != "prompt" {
+			t.Fatalf("DiagnosticsForCompozySession() = %#v, want model then prompt", owned)
+		}
+		protocol := ProtocolDiagnostics(owned)
+		if !reflect.DeepEqual(protocol, owned[:2]) {
+			t.Fatalf("ProtocolDiagnostics(owned) = %#v, want %#v", protocol, owned[:2])
+		}
+		prompt := PromptDiagnostics(owned)
+		if len(prompt) != 1 || prompt[0].PromptIndex != 1 || prompt[0].LifecycleEvent != "" {
+			t.Fatalf("PromptDiagnostics(owned) = %#v, want one prompt record", prompt)
+		}
+	})
+
+	t.Run("Should fail closed for empty or unknown Compozy session owners", func(t *testing.T) {
+		t.Parallel()
+
+		records := []DiagnosticsRecord{
+			{CompozySessionID: "", SessionID: "compozy-session-a"},
+			{CompozySessionID: "compozy-session-a", SessionID: "acp-session-1"},
+		}
+		tests := []struct {
+			name  string
+			owner string
+		}{
+			{name: "Should return an allocated empty result for an empty owner"},
+			{name: "Should return an allocated empty result for a whitespace owner", owner: "   "},
+			{name: "Should return an allocated empty result for an unknown owner", owner: "compozy-session-missing"},
+		}
+		for _, tt := range tests {
+			t.Run(tt.name, func(t *testing.T) {
+				t.Parallel()
+
+				got := DiagnosticsForCompozySession(records, tt.owner)
+				if got == nil {
+					t.Fatal("DiagnosticsForCompozySession() = nil, want allocated empty result")
+				}
+				if len(got) != 0 {
+					t.Fatalf("DiagnosticsForCompozySession() = %#v, want no records", got)
+				}
+			})
+		}
+	})
+
+	t.Run("Should reject a diagnostics record above the scanner limit", func(t *testing.T) {
+		t.Parallel()
+
+		path := filepath.Join(t.TempDir(), "oversized.jsonl")
+		if err := os.WriteFile(path, []byte(strings.Repeat("x", 10*1024*1024+1)), 0o600); err != nil {
+			t.Fatalf("os.WriteFile(%q) error = %v", path, err)
+		}
+		if _, err := ReadDiagnostics(path); err == nil || !strings.Contains(err.Error(), "scan diagnostics") {
+			t.Fatalf("ReadDiagnostics(oversized) error = %v, want scanner limit error", err)
+		}
+	})
+}
+
+func TestLoadFixtureAndParseFixtureValidationErrors(t *testing.T) {
+	t.Parallel()
+
+	t.Run("Should load fixture requires path", func(t *testing.T) {
+		t.Parallel()
+
+		if _, err := LoadFixture(" "); err == nil || !strings.Contains(err.Error(), "fixture path is required") {
+			t.Fatalf("LoadFixture(empty) error = %v, want required-path error", err)
+		}
+	})
+
+	t.Run("Should load fixture reports read error", func(t *testing.T) {
+		t.Parallel()
+
+		if _, err := LoadFixture(filepath.Join(t.TempDir(), "missing.json")); err == nil ||
+			!strings.Contains(err.Error(), "read fixture") {
+			t.Fatalf("LoadFixture(missing) error = %v, want read error", err)
+		}
+	})
+
+	cases := []struct {
+		name string
+		raw  string
+		want string
+	}{
+		{
+			name: "Should reject invalid version",
+			raw:  `{"version":1,"agents":[{"name":"alpha","provider":"claude","turns":[{"match":{"turn_source":"user","user_text":"hi"},"steps":[{"kind":"assistant","text":"hi"}]}]}]}`,
+			want: "fixture version 1",
+		},
+		{
+			name: "Should reject duplicate agent",
+			raw:  `{"version":2,"agents":[{"name":"alpha","provider":"claude","turns":[{"match":{"turn_source":"user","user_text":"hi"},"steps":[{"kind":"assistant","text":"hi"}]}]},{"name":"alpha","provider":"claude","turns":[{"match":{"turn_source":"user","user_text":"hello"},"steps":[{"kind":"assistant","text":"hi"}]}]}]}`,
+			want: "duplicate agent",
+		},
+		{
+			name: "Should reject legacy matcher fields",
+			raw:  `{"version":2,"agents":[{"name":"alpha","provider":"claude","turns":[{"match":{"equals":"a"},"steps":[{"kind":"assistant","text":"hi"}]}]}]}`,
+			want: "unknown field",
+		},
+		{
+			name: "Should reject invalid stop reason",
+			raw:  `{"version":2,"agents":[{"name":"alpha","provider":"claude","turns":[{"match":{"turn_source":"user","user_text":"hi"},"stop_reason":"bad","steps":[{"kind":"assistant","text":"hi"}]}]}]}`,
+			want: "stop_reason",
+		},
+		{
+			name: "Should reject negative scripted usage",
+			raw:  `{"version":2,"agents":[{"name":"alpha","provider":"claude","turns":[{"match":{"turn_source":"user","user_text":"hi"},"usage":{"input_tokens":-1,"output_tokens":2},"steps":[{"kind":"assistant","text":"hi"}]}]}]}`,
+			want: "input_tokens must be >= 0",
+		},
+		{
+			name: "Should reject scripted usage whose total exceeds int capacity",
+			raw: fmt.Sprintf(
+				`{"version":2,"agents":[{"name":"alpha","provider":"claude","turns":[{"match":{"turn_source":"user","user_text":"hi"},"usage":{"input_tokens":%d,"output_tokens":1},"steps":[{"kind":"assistant","text":"hi"}]}]}]}`,
+				math.MaxInt,
+			),
+			want: "total tokens exceed int capacity",
+		},
+		{
+			name: "Should reject invalid permission decision",
+			raw:  `{"version":2,"agents":[{"name":"alpha","provider":"claude","turns":[{"match":{"turn_source":"user","user_text":"hi"},"steps":[{"kind":"permission","tool_call_id":"perm-1","tool_kind":"edit","expect_decision":"maybe"}]}]}]}`,
+			want: "expect_decision",
+		},
+		{
+			name: "Should reject command cwd that is not absolute",
+			raw:  `{"version":2,"agents":[{"name":"alpha","provider":"claude","turns":[{"match":{"turn_source":"user","user_text":"hi"},"steps":[{"kind":"command_exec","command":"compozy","cwd":"relative"}]}]}]}`,
+			want: "cwd must be absolute",
+		},
+		{
+			name: "Should reject driver control without payload",
+			raw:  `{"version":2,"agents":[{"name":"alpha","provider":"claude","turns":[{"match":{"turn_source":"user","user_text":"hi"},"steps":[{"kind":"driver_control"}]}]}]}`,
+			want: "driver_control is required",
+		},
+		{
+			name: "Should reject driver delay that exceeds duration capacity",
+			raw: fmt.Sprintf(
+				`{"version":2,"agents":[{"name":"alpha","provider":"claude","turns":[{"match":{"turn_source":"user","user_text":"hi"},"steps":[{"kind":"driver_control","driver_control":{"action":"delay","delay_ms":%d}}]}]}]}`,
+				math.MaxInt64/int64(time.Millisecond)+1,
+			),
+			want: "delay_ms exceeds duration capacity",
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			if _, err := ParseFixture([]byte(tc.raw)); err == nil || !strings.Contains(err.Error(), tc.want) {
+				t.Fatalf("ParseFixture(%s) error = %v, want substring %q", tc.name, err, tc.want)
+			}
+		})
+	}
+}
+
+func TestParseFixtureAcceptsScriptedUsage(t *testing.T) {
+	t.Parallel()
+
+	t.Run("Should accept scripted input and output token usage", func(t *testing.T) {
+		t.Parallel()
+
+		fixture, err := ParseFixture([]byte(
+			`{"version":2,"agents":[{"name":"alpha","provider":"claude","turns":[{` +
+				`"match":{"turn_source":"user","user_text":"hi"},` +
+				`"usage":{"input_tokens":13,"output_tokens":5},` +
+				`"steps":[{"kind":"assistant","text":"hi"}]}]}]}`,
+		))
+		if err != nil {
+			t.Fatalf("ParseFixture(scripted usage) error = %v", err)
+		}
+		agent, err := fixture.Agent("alpha")
+		if err != nil {
+			t.Fatalf("Fixture.Agent(alpha) error = %v", err)
+		}
+		if agent.Turns[0].Usage == nil || agent.Turns[0].Usage.InputTokens != 13 ||
+			agent.Turns[0].Usage.OutputTokens != 5 {
+			t.Fatalf("scripted usage = %#v, want input=13 output=5", agent.Turns[0].Usage)
+		}
+	})
+}
+
+func TestParseFixtureAcceptsACPStopReasonVocabulary(t *testing.T) {
+	t.Parallel()
+
+	reasons := []acp.PromptStopReason{
+		acp.PromptStopReasonEndTurn,
+		acp.PromptStopReasonMaxTokens,
+		acp.PromptStopReasonMaxTurnRequests,
+		acp.PromptStopReasonRefusal,
+		acp.PromptStopReasonCancelled,
+	}
+	for _, reason := range reasons {
+		t.Run("Should accept "+string(reason), func(t *testing.T) {
+			t.Parallel()
+
+			raw := `{"version":2,"agents":[{"name":"alpha","provider":"claude","turns":[{` +
+				`"match":{"turn_source":"user","user_text":"hi"},"stop_reason":"` + string(reason) +
+				`","steps":[{"kind":"assistant","text":"hi"}]}]}]}`
+			if _, err := ParseFixture([]byte(raw)); err != nil {
+				t.Fatalf("ParseFixture(stop_reason=%q) error = %v", reason, err)
+			}
+		})
+	}
+}
+
+func TestParseFixtureAcceptsTurnUsage(t *testing.T) {
+	t.Parallel()
+
+	t.Run("Should parse deterministic prompt-response token usage on a turn", func(t *testing.T) {
+		t.Parallel()
+
+		raw := `{"version":2,"agents":[{"name":"alpha","provider":"claude","turns":[{` +
+			`"match":{"turn_source":"user","user_text":"hi"},"stop_reason":"end_turn",` +
+			`"steps":[{"kind":"assistant","text":"hi"}],` +
+			`"usage":{"input_tokens":1200,"output_tokens":340,"total_tokens":1540}}]}]}`
+		fixture, err := ParseFixture([]byte(raw))
+		if err != nil {
+			t.Fatalf("ParseFixture(usage) error = %v", err)
+		}
+		alpha, err := fixture.Agent("alpha")
+		if err != nil {
+			t.Fatalf("fixture.Agent(alpha) error = %v", err)
+		}
+		usage := alpha.Turns[0].Usage
+		if usage == nil {
+			t.Fatalf("Turns[0].Usage = nil, want parsed prompt-response usage")
+		}
+		if usage.InputTokens != 1200 || usage.OutputTokens != 340 ||
+			usage.TotalTokens == nil || *usage.TotalTokens != 1540 {
+			t.Fatalf("Turns[0].Usage = %+v, want {InputTokens:1200 OutputTokens:340 TotalTokens:1540}", *usage)
+		}
+	})
+}
+
+func TestFixtureLookupAndHelperErrors(t *testing.T) {
+	t.Parallel()
+
+	fixture, err := LoadFixture(filepath.Join("testdata", "multi_agent_fixture.json"))
+	if err != nil {
+		t.Fatalf("LoadFixture() error = %v", err)
+	}
+
+	if _, err := fixture.Agent(""); err == nil || !strings.Contains(err.Error(), "fixture agent name is required") {
+		t.Fatalf("fixture.Agent(empty) error = %v, want required-name error", err)
+	}
+	if _, err := fixture.Agent("missing"); err == nil || !strings.Contains(err.Error(), "not found") {
+		t.Fatalf("fixture.Agent(missing) error = %v, want not-found error", err)
+	}
+	trimmedFixture, err := ParseFixture(
+		[]byte(
+			`{"version":2,"agents":[{"name":" alpha ","provider":"claude","turns":[{"match":{"turn_source":"user","user_text":"hi"},"steps":[{"kind":"assistant","text":"hi"}]}]}]}`,
+		),
+	)
+	if err != nil {
+		t.Fatalf("ParseFixture(trimmed name) error = %v", err)
+	}
+	trimmedAgent, err := trimmedFixture.Agent("alpha")
+	if err != nil {
+		t.Fatalf("trimmedFixture.Agent(alpha) error = %v", err)
+	}
+	if got, want := trimmedAgent.Name, "alpha"; got != want {
+		t.Fatalf("trimmedAgent.Name = %q, want %q", got, want)
+	}
+	alpha, err := fixture.Agent("alpha")
+	if err != nil {
+		t.Fatalf("fixture.Agent(alpha) error = %v", err)
+	}
+	if _, err := alpha.SelectTurn(
+		"different prompt",
+		acp.PromptMeta{TurnSource: acp.PromptTurnSourceUser},
+	); err == nil ||
+		!strings.Contains(err.Error(), "no turn matched") {
+		t.Fatalf("alpha.SelectTurn(missing) error = %v, want no-match error", err)
+	}
+
+	augmentedPrompt := strings.Join([]string{
+		"<compozy-situation-context>",
+		`{"self":{"session_id":"sess_123","agent_name":"alpha"}}`,
+		"</compozy-situation-context>",
+		"",
+		"<current-available-skills>",
+		`  <skill name="compozy">Operate Compozy runtime surfaces.</skill>`,
+		"</current-available-skills>",
+		"",
+		"The <current-available-skills> block above is the authoritative current skill state for this turn.",
+		"If it differs from any earlier <available-skills> startup snapshot, trust the current block.",
+		"Use `compozy__skill_view` to load full instructions for any skill.",
+		"Use `compozy__skill_view` to read a specific skill resource file when the skill references one.",
+		currentSkillsCatalogFinalLine,
+		"",
+		"<user-message>",
+		"hello alpha",
+		"</user-message>",
+	}, "\n")
+	turn, err := alpha.SelectTurn(
+		augmentedPrompt,
+		acp.PromptMeta{TurnSource: acp.PromptTurnSourceUser},
+	)
+	if err != nil {
+		t.Fatalf("alpha.SelectTurn(augmented prompt) error = %v", err)
+	}
+	if got, want := turn.Name, "alpha-hello"; got != want {
+		t.Fatalf("augmented turn.Name = %q, want %q", got, want)
+	}
+
+	startupAugmentedPrompt := strings.Join([]string{
+		"Session instructions (treat as system guidance for this conversation):",
+		"",
+		"You are alpha.",
+		"",
+		userRequestPromptMarker,
+		"",
+		"<compozy-situation-context>",
+		`{"self":{"session_id":"sess_123","agent_name":"alpha"}}`,
+		"</compozy-situation-context>",
+		"",
+		"<current-available-skills>",
+		`  <skill name="compozy">Operate Compozy runtime surfaces.</skill>`,
+		"</current-available-skills>",
+		"",
+		"The <current-available-skills> block above is the authoritative current skill state for this turn.",
+		"If it differs from any earlier <available-skills> startup snapshot, trust the current block.",
+		"Use `compozy__skill_view` to load full instructions for any skill.",
+		"Use `compozy__skill_view` to read a specific skill resource file when the skill references one.",
+		currentSkillsCatalogFinalLine,
+		"",
+		"hello alpha",
+	}, "\n")
+	turn, err = alpha.SelectTurn(
+		startupAugmentedPrompt,
+		acp.PromptMeta{TurnSource: acp.PromptTurnSourceUser},
+	)
+	if err != nil {
+		t.Fatalf("alpha.SelectTurn(startup augmented prompt) error = %v", err)
+	}
+	if got, want := turn.Name, "alpha-hello"; got != want {
+		t.Fatalf("startup augmented turn.Name = %q, want %q", got, want)
+	}
+}
+
+func TestCanonicalUserTextStripsPromptAugmentationLayers(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name   string
+		prompt string
+		want   string
+	}{
+		{
+			name: "Should strip context notice and reminder before situation",
+			prompt: "<compozy-context-notice>Completed.</compozy-context-notice>\n" +
+				"<compozy-context-reminder>Preserve facts.</compozy-context-reminder>\n" +
+				"<compozy-situation-context>{}</compozy-situation-context>\nhello alpha",
+			want: "hello alpha",
+		},
+
+		{
+			name: "Should strip the environment change notice before situation context",
+			prompt: "<compozy-environment-change>Directory changed.</compozy-environment-change>\n" +
+				"<compozy-situation-context>{}</compozy-situation-context>\nhello alpha",
+			want: "hello alpha",
+		},
+		{
+			name: "Should preserve plain user prompt",
+			prompt: `
+hello alpha
+`,
+			want: "hello alpha",
+		},
+		{
+			name: "Should strip layered situation skills and user-message wrappers",
+			prompt: strings.Join([]string{
+				"<compozy-situation-context>",
+				`{"self":{"session_id":"sess_123","agent_name":"alpha"}}`,
+				"</compozy-situation-context>",
+				"",
+				"<current-available-skills>",
+				`<skill name="qa-marker">Marker.</skill>`,
+				"</current-available-skills>",
+				"",
+				"The <current-available-skills> block above is the authoritative current skill state for this turn.",
+				"If it differs from any earlier <available-skills> startup snapshot, trust the current block.",
+				"Use `compozy__skill_view` to load full instructions for any skill.",
+				"Use `compozy__skill_view` to read a specific skill resource file when the skill references one.",
+				currentSkillsCatalogFinalLine,
+				"",
+				"<user-message>",
+				"hello alpha",
+				"</user-message>",
+			}, "\n"),
+			want: "hello alpha",
+		},
+		{
+			name: "Should strip current skill instructions from session-prefixed prompt",
+			prompt: strings.Join([]string{
+				"<current-available-skills>",
+				`<skill name="qa-marker">Marker.</skill>`,
+				"</current-available-skills>",
+				"",
+				"The <current-available-skills> block above is the authoritative current skill state for this turn.",
+				"If it differs from any earlier <available-skills> startup snapshot, trust the current block.",
+				"Resolve canonical `compozy__skill_view` through the active harness, then call the returned tool reference to load full instructions for any skill.",
+				"Use the returned tool reference for canonical `compozy__skill_view` to read a specific skill resource file when the skill references one.",
+				currentSkillsCatalogFinalLine,
+				"",
+				"hello alpha",
+			}, "\n"),
+			want: "hello alpha",
+		},
+		{
+			name: "Should stop at malformed Compozy wrapper",
+			prompt: strings.Join([]string{
+				"<current-available-skills>",
+				`<skill name="qa-marker">Marker.</skill>`,
+				"",
+				"hello alpha",
+			}, "\n"),
+			want: strings.Join([]string{
+				"<current-available-skills>",
+				`<skill name="qa-marker">Marker.</skill>`,
+				"",
+				"hello alpha",
+			}, "\n"),
+		},
+		{
+			name: "Should strip self closing legacy available skills block",
+			prompt: strings.Join([]string{
+				"<available-skills />",
+				"",
+				"hello alpha",
+			}, "\n"),
+			want: "hello alpha",
+		},
+
+		{
+			name: "Should strip Loop output contract suffix",
+			prompt: strings.Join([]string{
+				"local loop probe",
+				"",
+				loopOutputContractPrefix +
+					`{"properties":{"summary":{"type":"string"}},"required":["summary"],"type":"object"}`,
+			}, "\n"),
+			want: "local loop probe",
+		},
+		{
+			name: "Should strip run-agent output contract",
+			prompt: strings.Join([]string{
+				"hello alpha",
+				"",
+				"Output contract:",
+				"End your final message with exactly one JSON object that satisfies this output_schema (no other JSON object may follow it): {\"required\":[\"summary\"],\"type\":\"object\"}",
+			}, "\n"),
+			want: "hello alpha",
+		},
+		{
+			name: "Should strip run-agent schema retry and output contract",
+			prompt: strings.Join([]string{
+				"hello alpha",
+				"",
+				"Output contract:",
+				"End your final message with exactly one JSON object that satisfies this output_schema (no other JSON object may follow it): {\"required\":[\"summary\"],\"type\":\"object\"}",
+				"",
+				"Your previous response did not satisfy output_schema: loop: action schema validation failed",
+				"Return exactly one JSON object that satisfies this output_schema: {\"required\":[\"summary\"],\"type\":\"object\"}",
+			}, "\n"),
+			want: "hello alpha",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			if got := canonicalUserText(tt.prompt); got != tt.want {
+				t.Fatalf("canonicalUserText() = %q, want %q", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestResolveDriverPathHonorsExplicitAndEnvOverrides(t *testing.T) {
+	if got, err := resolveDriverPath("/tmp/custom-driver"); err != nil || got != "/tmp/custom-driver" {
+		t.Fatalf("resolveDriverPath(override) = %q, %v, want override path", got, err)
+	}
+
+	t.Setenv(driverBinaryEnvVar, "/env/acpmock-driver")
+	if got, err := resolveDriverPath(""); err != nil || got != "/env/acpmock-driver" {
+		t.Fatalf("resolveDriverPath(env) = %q, %v, want /env/acpmock-driver", got, err)
+	}
+}
+
+func TestRegistrationHelperOverridesAndDiagnosticsErrors(t *testing.T) {
+	t.Run("Should expose typed native provider identities and diagnostics matching", func(t *testing.T) {
+		t.Parallel()
+
+		for _, provider := range []string{ProviderClaude, "claude-code"} {
+			t.Run("Should resolve provider alias "+provider, func(t *testing.T) {
+				t.Parallel()
+
+				cfg, err := ProviderConfigForIdentity(provider, "/tmp/acpmock-driver")
+				if err != nil {
+					t.Fatalf("ProviderConfigForIdentity(%q) error = %v", provider, err)
+				}
+				if cfg.Command != "/tmp/acpmock-driver" {
+					t.Fatalf("ProviderConfigForIdentity(%q).Command = %q", provider, cfg.Command)
+				}
+			})
+		}
+		if _, err := ProviderConfigForIdentity("custom"); err == nil {
+			t.Fatal("ProviderConfigForIdentity(custom) error = nil, want unsupported identity")
+		}
+
+		records := []DiagnosticsRecord{{Provider: "claude"}, {Provider: "codex"}, {Provider: "claude-code"}}
+		claude := DiagnosticsForProvider(records, "claude")
+		if len(claude) != 2 {
+			t.Fatalf("DiagnosticsForProvider(claude) = %#v, want canonical alias pair", claude)
+		}
+		if got, want := []string{
+			claude[0].Provider,
+			claude[1].Provider,
+		}, []string{
+			"claude",
+			"claude-code",
+		}; !reflect.DeepEqual(
+			got,
+			want,
+		) {
+			t.Fatalf("DiagnosticsForProvider(claude) providers = %#v, want %#v", got, want)
+		}
+	})
+
+	t.Run("Should default diagnostics path uses logs directory", func(t *testing.T) {
+		t.Parallel()
+
+		homePaths := mockHomePaths(t)
+		got, err := resolveDiagnosticsPath(homePaths, "alpha", "")
+		if err != nil {
+			t.Fatalf("resolveDiagnosticsPath() error = %v", err)
+		}
+		want := filepath.Join(homePaths.LogsDir, "acpmock", "alpha.jsonl")
+		if got != want {
+			t.Fatalf("resolveDiagnosticsPath() = %q, want %q", got, want)
+		}
+	})
+
+	t.Run("Should resolve diagnostics path rejects unsafe agent names", func(t *testing.T) {
+		t.Parallel()
+
+		homePaths := mockHomePaths(t)
+		if _, err := resolveDiagnosticsPath(homePaths, "../alpha", ""); err == nil ||
+			!strings.Contains(err.Error(), "invalid agent name") {
+			t.Fatalf("resolveDiagnosticsPath(unsafe) error = %v, want invalid-agent-name error", err)
+		}
+	})
+
+	t.Run("Should resolve diagnostics path requires logs directory without override", func(t *testing.T) {
+		t.Parallel()
+
+		homePaths := mockHomePaths(t)
+		homePaths.LogsDir = " "
+		if _, err := resolveDiagnosticsPath(homePaths, "alpha", ""); err == nil ||
+			!strings.Contains(err.Error(), "logs directory is required") {
+			t.Fatalf("resolveDiagnosticsPath(blank logs dir) error = %v, want logs-dir validation", err)
+		}
+	})
+
+	t.Run("Should render agent def uses default prompt", func(t *testing.T) {
+		t.Parallel()
+
+		content := renderAgentDef(
+			"mock-alpha",
+			AgentFixture{
+				Provider:        "claude",
+				ReasoningEffort: "max",
+				Tools:           []string{"mcp__local__echo_environment"},
+			},
+			"node driver.js",
+			"claude",
+			nil,
+		)
+		if !strings.Contains(content, "You are mock-alpha.") {
+			t.Fatalf("renderAgentDef() = %q, want default prompt", content)
+		}
+		if !strings.Contains(content, "reasoning_effort: max") {
+			t.Fatalf("renderAgentDef() = %q, want reasoning effort", content)
+		}
+		if !strings.Contains(content, "tools:\n  - 'mcp__local__echo_environment'") {
+			t.Fatalf("renderAgentDef() = %q, want requested tool", content)
+		}
+	})
+
+	t.Run("Should read diagnostics reports invalid json", func(t *testing.T) {
+		t.Parallel()
+
+		path := filepath.Join(t.TempDir(), "bad.jsonl")
+		if err := os.WriteFile(path, []byte("not-json\n"), 0o600); err != nil {
+			t.Fatalf("os.WriteFile(%q) error = %v", path, err)
+		}
+		if _, err := ReadDiagnostics(path); err == nil || !strings.Contains(err.Error(), "decode diagnostics line 1") {
+			t.Fatalf("ReadDiagnostics(invalid) error = %v, want decode error", err)
+		}
+	})
+
+	t.Run("Should register requires agents dir", func(t *testing.T) {
+		t.Parallel()
+
+		if _, err := Register(compozyconfig.HomePaths{}, RegisterOptions{}); err == nil ||
+			!strings.Contains(err.Error(), "agents directory is required") {
+			t.Fatalf("Register(empty home) error = %v, want agents-dir validation", err)
+		}
+	})
+
+	t.Run("Should register reports missing fixture agent", func(t *testing.T) {
+		t.Parallel()
+
+		homePaths := mockHomePaths(t)
+		_, err := Register(homePaths, RegisterOptions{
+			FixturePath:  filepath.Join("testdata", "multi_agent_fixture.json"),
+			FixtureAgent: "missing",
+			DriverPath:   "/tmp/mock-driver",
+		})
+		if err == nil || !strings.Contains(err.Error(), "lookup fixture agent") {
+			t.Fatalf("Register(missing fixture agent) error = %v, want lookup context", err)
+		}
+	})
+
+	t.Run("Should register rejects unsafe runtime agent names", func(t *testing.T) {
+		t.Parallel()
+
+		homePaths := mockHomePaths(t)
+		_, err := Register(homePaths, RegisterOptions{
+			FixturePath:  filepath.Join("testdata", "multi_agent_fixture.json"),
+			FixtureAgent: "alpha",
+			AgentName:    "../escape",
+			DriverPath:   "/tmp/mock-driver",
+		})
+		if err == nil || !strings.Contains(err.Error(), "validate runtime agent name") {
+			t.Fatalf("Register(unsafe runtime agent name) error = %v, want runtime-agent validation", err)
+		}
+	})
+
+	t.Run("Should register wraps diagnostics path failures", func(t *testing.T) {
+		t.Parallel()
+
+		homePaths := mockHomePaths(t)
+		homePaths.LogsDir = ""
+		_, err := Register(homePaths, RegisterOptions{
+			FixturePath:  filepath.Join("testdata", "multi_agent_fixture.json"),
+			FixtureAgent: "alpha",
+			AgentName:    "alpha",
+			DriverPath:   "/tmp/mock-driver",
+		})
+		if err == nil || !strings.Contains(err.Error(), "resolve diagnostics path") {
+			t.Fatalf("Register(blank logs dir) error = %v, want diagnostics-path context", err)
+		}
+	})
+}
+
+func TestBuildDriverBinaryHonorsContextCancellation(t *testing.T) {
+	t.Parallel()
+
+	repoRoot, err := repoRootFromCaller()
+	if err != nil {
+		t.Fatalf("repoRootFromCaller() error = %v", err)
+	}
+
+	ctx, cancel := context.WithCancel(t.Context())
+	cancel()
+
+	err = buildDriverBinary(ctx, repoRoot, filepath.Join(t.TempDir(), driverBinaryName()))
+	if err == nil {
+		t.Fatal("buildDriverBinary(canceled) error = nil, want context cancellation")
+	}
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("buildDriverBinary(canceled) error = %v, want context.Canceled", err)
+	}
+}
+
+func TestDefaultDriverPathSharesConcurrentBuildResult(t *testing.T) {
+	// not parallel: clears the CI override and mutates the shared driver cache.
+	t.Setenv(driverBinaryEnvVar, "")
+	restoreDriverBinaryCache(t, "")
+
+	const callers = 4
+	type result struct {
+		path string
+		err  error
+	}
+
+	results := make(chan result, callers)
+	var wg sync.WaitGroup
+	for range callers {
+		wg.Go(func() {
+			path, err := DefaultDriverPath()
+			results <- result{path: path, err: err}
+		})
+	}
+	wg.Wait()
+	close(results)
+
+	var builtPath string
+	for item := range results {
+		if item.err != nil {
+			t.Fatalf("DefaultDriverPath() error = %v", item.err)
+		}
+		if builtPath == "" {
+			builtPath = item.path
+			continue
+		}
+		if item.path != builtPath {
+			t.Fatalf("DefaultDriverPath() path = %q, want shared cached path %q", item.path, builtPath)
+		}
+	}
+
+	if builtPath == "" {
+		t.Fatal("DefaultDriverPath() returned empty path for all callers")
+	}
+	if _, err := os.Stat(builtPath); err != nil {
+		t.Fatalf("os.Stat(%q) error = %v", builtPath, err)
+	}
+
+	// Reuse the cold-build result for the real command contract; the serial
+	// parent keeps its PATH override isolated from the parallel driver tests.
+	t.Run("Should support user command expectations with the shared driver", func(t *testing.T) {
+		testDriverSupportsUserCommandExpectations(t, builtPath)
+	})
+}
+
+func TestValidationAndDriverHelpers(t *testing.T) {
+	t.Parallel()
+
+	t.Run("Should validation helpers reject invalid values", func(t *testing.T) {
+		t.Parallel()
+
+		if err := validateToolKind("tool_kind", "bogus"); err == nil {
+			t.Fatal("validateToolKind(invalid) error = nil, want non-nil")
+		}
+		if err := validateToolStatus("status", "bogus"); err == nil {
+			t.Fatal("validateToolStatus(invalid) error = nil, want non-nil")
+		}
+		if err := validatePermissionDecision("decision", "bogus"); err == nil {
+			t.Fatal("validatePermissionDecision(invalid) error = nil, want non-nil")
+		}
+		if (TurnMatch{Judge: &TurnMatchJudge{Attempt: -1}}).Validate("match") == nil {
+			t.Fatal("TurnMatch.Validate(negative judge attempt) error = nil, want non-nil")
+		}
+		if (TurnMatch{TurnSource: acp.PromptTurnSourceUser}).Validate("match") != nil {
+			t.Fatal("TurnMatch.Validate(user selector) error != nil, want nil")
+		}
+		if (TurnMatch{TurnSource: acp.PromptTurnSourceSynthetic}).Validate("match") != nil {
+			t.Fatal("TurnMatch.Validate(synthetic selector) error != nil, want nil")
+		}
+
+		if (DriverControlStep{Action: DriverControlWriteRawJSONRPC}).Validate("driver_control") == nil {
+			t.Fatal("DriverControlStep.Validate(missing raw_jsonrpc) error = nil, want non-nil")
+		}
+		if (DriverControlStep{Action: DriverControlDisconnect, DelayMS: -1}).Validate("driver_control") == nil {
+			t.Fatal("DriverControlStep.Validate(negative delay) error = nil, want non-nil")
+		}
+		if (DriverControlStep{Action: DriverControlBlockUntilCancel, Async: true}).Validate("driver_control") == nil {
+			t.Fatal("DriverControlStep.Validate(async block_until_cancel) error = nil, want non-nil")
+		}
+		err := (DriverControlStep{Action: DriverControlDelay}).Validate("driver_control")
+		if err == nil || !strings.Contains(err.Error(), "delay_ms must be > 0 for delay") {
+			t.Fatalf("DriverControlStep.Validate(delay without delay_ms) error = %v, want delay_ms diagnostic", err)
+		}
+		err = (DriverControlStep{Action: DriverControlDelay, DelayMS: 1, Async: true}).Validate("driver_control")
+		if err == nil || !strings.Contains(err.Error(), "async is invalid for delay") {
+			t.Fatalf("DriverControlStep.Validate(async delay) error = %v, want async diagnostic", err)
+		}
+		if err := (DriverControlStep{Action: DriverControlDelay, DelayMS: 1}).Validate("driver_control"); err != nil {
+			t.Fatalf("DriverControlStep.Validate(delay) error = %v", err)
+		}
+		err = (DriverControlStep{Action: DriverControlFailPrompt}).Validate("driver_control")
+		if err == nil || !strings.Contains(err.Error(), "error_message is required for fail_prompt") {
+			t.Fatalf("DriverControlStep.Validate(fail_prompt without message) error = %v, want message diagnostic", err)
+		}
+		err = (DriverControlStep{Action: DriverControlDelay, DelayMS: 1, ErrorMessage: "429"}).
+			Validate("driver_control")
+		if err == nil || !strings.Contains(err.Error(), "only valid for fail_prompt") {
+			t.Fatalf(
+				"DriverControlStep.Validate(delay with error_message) error = %v, want fail_prompt-only diagnostic",
+				err,
+			)
+		}
+		if err := (DriverControlStep{Action: DriverControlFailPrompt, ErrorMessage: "429 rate limit exceeded"}).
+			Validate("driver_control"); err != nil {
+			t.Fatalf("DriverControlStep.Validate(fail_prompt) error = %v", err)
+		}
+		err = (DriverControlStep{Action: DriverControlDelay, DelayMS: 1, WhenPathMissing: ".credential"}).
+			Validate("driver_control")
+		if err == nil || !strings.Contains(err.Error(), "only valid for fail_prompt") {
+			t.Fatalf(
+				"DriverControlStep.Validate(delay with when_path_missing) error = %v, want fail_prompt-only diagnostic",
+				err,
+			)
+		}
+		if err := (DriverControlStep{
+			Action: DriverControlFailPrompt, ErrorMessage: "Authentication required", ErrorCode: -32000,
+			WhenPathMissing: ".credential",
+		}).Validate("driver_control"); err != nil {
+			t.Fatalf("DriverControlStep.Validate(gated fail_prompt) error = %v", err)
+		}
+		if (TurnFixture{}).Validate("turn") == nil {
+			t.Fatal("TurnFixture.Validate(no steps) error = nil, want non-nil")
+		}
+		if hasTextPayload("", nil) {
+			t.Fatal("hasTextPayload(empty) = true, want false")
+		}
+	})
+
+	t.Run("Should driver helpers resolve defaults and omit empty diagnostics", func(t *testing.T) {
+		t.Parallel()
+
+		driverPath, err := DefaultDriverPath()
+		if err != nil {
+			t.Fatalf("DefaultDriverPath() error = %v", err)
+		}
+		if got, err := resolveDriverPath(""); err != nil || got != driverPath {
+			t.Fatalf("resolveDriverPath(default) = %q, %v, want %q", got, err, driverPath)
+		}
+
+		command := BuildCommand("/tmp/driver", "/tmp/fixture.json", "alpha", "")
+		if strings.Contains(command, "--diagnostics") {
+			t.Fatalf("BuildCommand() = %q, want no diagnostics flag", command)
+		}
+	})
+
+	t.Run("Should read diagnostics reports missing file", func(t *testing.T) {
+		t.Parallel()
+
+		if _, err := ReadDiagnostics(filepath.Join(t.TempDir(), "missing.jsonl")); err == nil ||
+			!strings.Contains(err.Error(), "open diagnostics") {
+			t.Fatalf("ReadDiagnostics(missing) error = %v, want open error", err)
+		}
+	})
+}
+
+func mockHomePaths(t testing.TB) compozyconfig.HomePaths {
+	t.Helper()
+
+	homePaths, err := compozyconfig.ResolveHomePathsFrom(t.TempDir())
+	if err != nil {
+		t.Fatalf("ResolveHomePathsFrom() error = %v", err)
+	}
+	if err := compozyconfig.EnsureHomeLayout(homePaths); err != nil {
+		t.Fatalf("EnsureHomeLayout() error = %v", err)
+	}
+	return homePaths
+}
+
+func TestNativeToolStepValidation(t *testing.T) {
+	t.Run("Should require a native tool identity and object arguments without scripted results", func(t *testing.T) {
+		t.Parallel()
+		valid := Step{
+			Kind:       StepKindNativeToolCall,
+			ToolID:     "compozy__subagent_delegate",
+			ToolCallID: "delegate",
+			RawInput:   json.RawMessage(`{"task":"work"}`),
+		}
+		if err := valid.Validate("step"); err != nil {
+			t.Fatal(err)
+		}
+		for _, mutate := range []func(*Step){
+			func(s *Step) { s.ToolID = "shell" },
+			func(s *Step) { s.ToolCallID = "" },
+			func(s *Step) { s.RawInput = json.RawMessage(`[]`) },
+			func(s *Step) { s.RawInput = json.RawMessage(`null`) },
+			func(s *Step) { s.RawInput = nil },
+			func(s *Step) { s.RawOutput = json.RawMessage(`{"subagent_id":"synthetic"}`) },
+			func(s *Step) { s.Status = "completed" },
+		} {
+			invalid := valid
+			mutate(&invalid)
+			if err := invalid.Validate("step"); err == nil {
+				t.Fatalf("accepted invalid native call: %#v", invalid)
+			}
+		}
+	})
+}

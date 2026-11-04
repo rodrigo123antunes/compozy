@@ -1,0 +1,222 @@
+package core
+
+import (
+	"fmt"
+
+	"net/http"
+
+	"github.com/compozy/compozy/internal/api/contract"
+	"github.com/compozy/compozy/internal/cmdpalette"
+
+	settingspkg "github.com/compozy/compozy/internal/settings"
+	"github.com/gin-gonic/gin"
+)
+
+func (h *BaseHandlers) getSettingsSection(c *gin.Context, section settingspkg.SectionName) {
+	if h.Settings == nil {
+		h.respondError(c, http.StatusServiceUnavailable, errSettingsServiceUnavailable)
+		return
+	}
+
+	req, err := parseSettingsSectionRequest(c, section)
+	if err != nil {
+		h.respondError(c, StatusForSettingsError(err), err)
+		return
+	}
+
+	if !h.resolveSettingsClientProfile(c, &req) {
+		return
+	}
+	envelope, err := h.Settings.GetSection(c.Request.Context(), req)
+	if err != nil {
+		status := StatusForSettingsError(err)
+		if status >= http.StatusInternalServerError && h.Logger != nil {
+			h.Logger.Error("settings section read failed", "section", section, "error", err)
+		}
+		h.respondError(c, status, err)
+		return
+	}
+
+	payload, err := SettingsSectionResponseFromEnvelope(envelope)
+	if err != nil {
+		h.respondError(c, http.StatusInternalServerError, err)
+		return
+	}
+
+	c.JSON(http.StatusOK, payload)
+}
+
+func (h *BaseHandlers) updateSettingsSection(c *gin.Context, req settingspkg.SectionUpdateRequest) {
+	result, ok := h.applySettingsSection(c, req, nil)
+	if !ok {
+		return
+	}
+	c.JSON(http.StatusOK, SettingsApplyResponseFromResult(result))
+}
+
+func (h *BaseHandlers) applySettingsSection(
+	c *gin.Context,
+	req settingspkg.SectionUpdateRequest,
+	respondTypedError func(*gin.Context, error) bool,
+) (settingspkg.ApplyResult, bool) {
+	if h.Settings == nil {
+		h.respondError(c, http.StatusServiceUnavailable, errSettingsServiceUnavailable)
+		return settingspkg.ApplyResult{}, false
+	}
+	result, err := h.Settings.ApplySection(
+		h.settingsMutationContext(c),
+		req,
+	)
+	if err != nil {
+		if respondTypedError != nil && respondTypedError(c, err) {
+			return settingspkg.ApplyResult{}, false
+		}
+		h.respondError(c, StatusForSettingsError(err), err)
+		return settingspkg.ApplyResult{}, false
+	}
+	return result, true
+}
+
+func (h *BaseHandlers) updateSettingsSectionEcho(
+	c *gin.Context,
+	req settingspkg.SectionUpdateRequest,
+	respondTypedError func(*gin.Context, error) bool,
+) {
+	if _, ok := h.applySettingsSection(c, req, respondTypedError); !ok {
+		return
+	}
+	envelope, err := h.Settings.GetSection(c.Request.Context(), req.SectionRequest)
+	if err != nil {
+		h.respondError(c, StatusForSettingsError(err), err)
+		return
+	}
+	payload, err := SettingsSectionResponseFromEnvelope(envelope)
+	if err != nil {
+		h.respondError(c, http.StatusInternalServerError, err)
+		return
+	}
+	c.JSON(http.StatusOK, payload)
+}
+
+func (h *BaseHandlers) listSettingsCollection(c *gin.Context, collection settingspkg.CollectionName) {
+	if h.Settings == nil {
+		h.respondError(c, http.StatusServiceUnavailable, errSettingsServiceUnavailable)
+		return
+	}
+
+	req, err := parseSettingsCollectionRequest(c, collection)
+	if err != nil {
+		h.respondError(c, StatusForSettingsError(err), err)
+		return
+	}
+
+	envelope, err := h.Settings.ListCollection(c.Request.Context(), req)
+	if err != nil {
+		h.respondError(c, StatusForSettingsError(err), err)
+		return
+	}
+
+	payload, err := SettingsCollectionResponseFromEnvelope(envelope)
+	if err != nil {
+		h.respondError(c, http.StatusInternalServerError, err)
+		return
+	}
+
+	c.JSON(http.StatusOK, payload)
+}
+
+func (h *BaseHandlers) getSettingsCollectionItem(c *gin.Context, collection settingspkg.CollectionName) {
+	if h.Settings == nil {
+		h.respondError(c, http.StatusServiceUnavailable, errSettingsServiceUnavailable)
+		return
+	}
+
+	req, err := parseSettingsCollectionRequest(c, collection)
+	if err != nil {
+		h.respondError(c, StatusForSettingsError(err), err)
+		return
+	}
+	name, err := requiredSettingsPathValue(c.Param("name"), "name")
+	if err != nil {
+		h.respondError(c, StatusForSettingsError(err), err)
+		return
+	}
+
+	envelope, err := h.Settings.ListCollection(c.Request.Context(), req)
+	if err != nil {
+		h.respondError(c, StatusForSettingsError(err), err)
+		return
+	}
+
+	switch collection {
+	case settingspkg.CollectionProviders:
+		item, found := findSettingsProvider(envelope.Providers, name)
+		if !found {
+			notFound := NewSettingsNotFoundError(fmt.Errorf("provider %q not found", name))
+			h.respondError(c, StatusForSettingsError(notFound), notFound)
+			return
+		}
+		c.JSON(http.StatusOK, contract.SettingsProviderResponse{Provider: settingsProviderItemPayload(&item)})
+	default:
+		h.respondError(
+			c,
+			http.StatusInternalServerError,
+			fmt.Errorf("settings item lookup unsupported for %q", collection),
+		)
+	}
+}
+
+func (h *BaseHandlers) putSettingsCollectionItem(c *gin.Context, req settingspkg.CollectionItemPutRequest) {
+	if h.Settings == nil {
+		h.respondError(c, http.StatusServiceUnavailable, errSettingsServiceUnavailable)
+		return
+	}
+
+	result, err := h.Settings.ApplyCollectionItem(
+		h.settingsMutationContext(c),
+		req,
+	)
+	if err != nil {
+		h.respondError(c, StatusForSettingsError(err), err)
+		return
+	}
+
+	c.JSON(http.StatusOK, SettingsApplyResponseFromResult(result))
+}
+
+func (h *BaseHandlers) deleteSettingsCollectionItem(c *gin.Context, req settingspkg.CollectionItemDeleteRequest) {
+	if h.Settings == nil {
+		h.respondError(c, http.StatusServiceUnavailable, errSettingsServiceUnavailable)
+		return
+	}
+
+	result, err := h.Settings.ApplyCollectionDelete(
+		h.settingsMutationContext(c),
+		req,
+	)
+	if err != nil {
+		h.respondError(c, StatusForSettingsError(err), err)
+		return
+	}
+
+	c.JSON(http.StatusOK, SettingsApplyResponseFromResult(result))
+}
+
+func (h *BaseHandlers) resolveSettingsClientProfile(c *gin.Context, req *settingspkg.SectionRequest) bool {
+	if req.Section != settingspkg.SectionWindowManager {
+		return true
+	}
+	resolved, err := h.resolveProfileReadSelectionWithSelector(c, req.WorkspaceID, c.Query("client_profile"))
+	if err != nil {
+		h.respondProfileReadScopeError(c, err)
+		return false
+	}
+	if resolved.Scope.AllProfiles {
+		h.respondError(c, http.StatusBadRequest, fmt.Errorf("client_profile must select one profile"))
+		return false
+	}
+	req.ClientProfile = cmdpalette.ScopedProfileLens(
+		cmdpalette.ProfileLensID(resolved.Scope.ProfileID), resolved.ProfileName,
+	)
+	return true
+}

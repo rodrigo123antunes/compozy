@@ -1,0 +1,242 @@
+import type { AgentHeartbeatSourceCatalog, AgentPayload } from "../types";
+import { storyAgentNames } from "@/storybook/fintech-scenario";
+
+/** Stable 64-char hex stand-in for AgentDefinitionDigest (not a real hash). */
+export const FIXTURE_AGENT_DEFINITION_DIGEST =
+  "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+
+export const agentFixtures: AgentPayload[] = [
+  {
+    label: storyAgentNames.cto,
+    kind: "on_demand",
+    resolved_appearance: {
+      version: 1,
+      avatar: "generated",
+      seed: storyAgentNames.cto,
+      generation: 1,
+      color: "#7c5cff",
+    },
+    name: storyAgentNames.cto,
+    provider: "claude",
+    prompt:
+      "Own launch command, arbitrate technical risk, and produce concise operator-ready briefings for the 18:30 UTC cutover.",
+    origin: "global",
+    definition_digest: FIXTURE_AGENT_DEFINITION_DIGEST,
+  },
+  {
+    label: storyAgentNames.cfo,
+    kind: "on_demand",
+    resolved_appearance: {
+      version: 1,
+      avatar: "generated",
+      seed: storyAgentNames.cfo,
+      generation: 1,
+      color: "#7c5cff",
+    },
+    name: storyAgentNames.cfo,
+    provider: "claude",
+    prompt:
+      "Track burn, launch revenue pacing, reserve exposure, and operator-visible finance decisions across launch week.",
+    origin: "global",
+    definition_digest: FIXTURE_AGENT_DEFINITION_DIGEST,
+  },
+  {
+    label: storyAgentNames.product,
+    kind: "on_demand",
+    resolved_appearance: {
+      version: 1,
+      avatar: "generated",
+      seed: storyAgentNames.product,
+      generation: 1,
+      color: "#7c5cff",
+    },
+    name: storyAgentNames.product,
+    provider: "gemini",
+    prompt:
+      "Maintain the launch checklist, align product decisions across teams, and keep the operator on the highest-leverage next step.",
+    origin: "global",
+    definition_digest: FIXTURE_AGENT_DEFINITION_DIGEST,
+  },
+  {
+    label: storyAgentNames.frontend,
+    kind: "on_demand",
+    resolved_appearance: {
+      version: 1,
+      avatar: "generated",
+      seed: storyAgentNames.frontend,
+      generation: 1,
+      color: "#7c5cff",
+    },
+    name: storyAgentNames.frontend,
+    provider: "codex",
+    model: "gpt-5.4",
+    prompt:
+      "Validate launch UI states, patch landing-page regressions, and summarize any customer-facing risk before ship.",
+    origin: "global",
+    definition_digest: FIXTURE_AGENT_DEFINITION_DIGEST,
+  },
+  {
+    label: storyAgentNames.marketing,
+    kind: "on_demand",
+    resolved_appearance: {
+      version: 1,
+      avatar: "generated",
+      seed: storyAgentNames.marketing,
+      generation: 1,
+      color: "#7c5cff",
+    },
+    name: storyAgentNames.marketing,
+    provider: "gemini",
+    prompt:
+      "Coordinate launch timing, CRM sends, ad spend windows, and campaign sequencing across the go-to-market team.",
+    origin: "global",
+    definition_digest: FIXTURE_AGENT_DEFINITION_DIGEST,
+  },
+  {
+    label: storyAgentNames.copywriter,
+    kind: "on_demand",
+    resolved_appearance: {
+      version: 1,
+      avatar: "generated",
+      seed: storyAgentNames.copywriter,
+      generation: 1,
+      color: "#7c5cff",
+    },
+    name: storyAgentNames.copywriter,
+    provider: "claude",
+    prompt:
+      "Polish launch headlines, claims, emails, and support macros so every operator-facing draft is publishable.",
+    origin: "global",
+    definition_digest: FIXTURE_AGENT_DEFINITION_DIGEST,
+  },
+  {
+    label: storyAgentNames.fraud,
+    kind: "on_demand",
+    resolved_appearance: {
+      version: 1,
+      avatar: "generated",
+      seed: storyAgentNames.fraud,
+      generation: 1,
+      color: "#7c5cff",
+    },
+    name: storyAgentNames.fraud,
+    provider: "claude",
+    prompt:
+      "Investigate suspicious payout holds, reserve anomalies, and launch-day risk spikes before operators approve merchant actions.",
+    origin: "global",
+    definition_digest: FIXTURE_AGENT_DEFINITION_DIGEST,
+  },
+  {
+    label: storyAgentNames.support,
+    kind: "on_demand",
+    resolved_appearance: {
+      version: 1,
+      avatar: "generated",
+      seed: storyAgentNames.support,
+      generation: 1,
+      color: "#7c5cff",
+    },
+    name: storyAgentNames.support,
+    provider: "claude",
+    prompt:
+      "Handle merchant escalations, cluster repeat issues, and prepare the next support reply with customer-safe language.",
+    origin: "global",
+    definition_digest: FIXTURE_AGENT_DEFINITION_DIGEST,
+  },
+  {
+    label: storyAgentNames.compliance,
+    kind: "on_demand",
+    resolved_appearance: {
+      version: 1,
+      avatar: "generated",
+      seed: storyAgentNames.compliance,
+      generation: 1,
+      color: "#7c5cff",
+    },
+    name: storyAgentNames.compliance,
+    provider: "qwen-code",
+    model: "qwen3.6-plus",
+    prompt:
+      "Check KYB evidence, sanctions flags, and claims compliance before a launch-room decision is finalized.",
+    origin: "global",
+    definition_digest: FIXTURE_AGENT_DEFINITION_DIGEST,
+  },
+  {
+    label: storyAgentNames.release,
+    kind: "on_demand",
+    resolved_appearance: {
+      version: 1,
+      avatar: "generated",
+      seed: storyAgentNames.release,
+      generation: 1,
+      color: "#7c5cff",
+    },
+    name: storyAgentNames.release,
+    provider: "codex",
+    model: "gpt-5.4",
+    prompt:
+      "Own release verification, canary promotion, rollback guardrails, and cross-system launch readiness updates.",
+    origin: "global",
+    definition_digest: FIXTURE_AGENT_DEFINITION_DIGEST,
+  },
+  {
+    label: storyAgentNames.platform,
+    kind: "on_demand",
+    resolved_appearance: {
+      version: 1,
+      avatar: "generated",
+      seed: storyAgentNames.platform,
+      generation: 1,
+      color: "#7c5cff",
+    },
+    name: storyAgentNames.platform,
+    provider: "codex",
+    model: "gpt-5.4",
+    prompt:
+      "Investigate webhook failures, partner API drift, and rollout bottlenecks across the checkout platform.",
+    origin: "global",
+    definition_digest: FIXTURE_AGENT_DEFINITION_DIGEST,
+  },
+];
+
+export const primaryAgentFixture: AgentPayload = agentFixtures[0];
+
+/** The kinds and scripts a fixture agent's check-ins can read: GitHub issues and one script. */
+export function heartbeatSourceCatalogFixture(
+  agent: string,
+  approved: ReadonlySet<string> = new Set()
+): AgentHeartbeatSourceCatalog {
+  const sha256 = "sha256:7f3a91c0d2b4e6f8a1c3e5b7d9f1a3c5e7b9d1f3a5c7e9b1d3f5a7c9e1b3d5e2";
+  return {
+    agent,
+    scripts_enabled: true,
+    limits: { max_per_agent: 8, max_items: 20 },
+    kinds: [
+      {
+        kind: "forge-github/issues",
+        extension: "forge-github",
+        title: "New GitHub issues",
+        description: "Open issues created since the last check, with linked open pull requests.",
+        params_schema: {
+          type: "object",
+          properties: {
+            repo: { type: "string", pattern: "^[\\w.-]+/[\\w.-]+$" },
+            labels: { type: "array", items: { type: "string" } },
+            exclude_labels: { type: "array", items: { type: "string" } },
+            backfill: { type: "string", format: "duration" },
+          },
+          additionalProperties: false,
+        },
+      },
+    ],
+    scripts: [
+      {
+        name: "failed-deploys",
+        executable: true,
+        sha256,
+        approved: approved.has("failed-deploys"),
+        approved_sha256: approved.has("failed-deploys") ? sha256 : null,
+      },
+    ],
+  };
+}

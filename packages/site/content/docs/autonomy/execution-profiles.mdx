@@ -1,0 +1,96 @@
+---
+title: Task Execution Profiles
+description: Task-owned selection for coordinators, workers, reviewers, worktrees, and runtime evidence.
+---
+
+A task execution profile selects how one task runs. It can narrow worker and reviewer eligibility,
+configure coordinator guidance, select a worktree, and add guidance for runtime evidence. Task
+ownership, lease authority, terminal state, and review verdicts stay with the task service.
+
+## Profile blocks
+
+| Block          | Purpose                                                                                                                    |
+| -------------- | -------------------------------------------------------------------------------------------------------------------------- |
+| `coordinator`  | `inherit` uses workspace defaults. `guided` adds task-specific agent, provider, model, and guidance.                       |
+| `worker`       | `inherit` uses workspace defaults. `select` narrows eligible agents and capabilities.                                      |
+| `review`       | Agent, provider, model, runtime options, and agent/capability selectors for review.                                        |
+| `participants` | Allowed and preferred agent names and capabilities. Selectors narrow routing; they grant no permissions.                   |
+| `worktree`     | Selects the task's working tree under the workspace policy. See [Task worktree isolation](/docs/worktrees/task-isolation). |
+| `runtime`      | `default` keeps normal guidance. `evidence` adds guidance for browser, simulator, local-app, and artifact validation.      |
+
+Worker and review blocks support exact runtime selection, including reasoning effort, speed, and
+ACP options where the selected provider supports them. Provider authorization, credentials, and
+session validation still apply. Evidence mode preserves the configured session permission policy.
+
+The [generated task API](/docs/api/tasks) owns the complete request and response shapes.
+
+## Selection and execution
+
+1. Config defaults under `[task.orchestration.profile]` and `[task.orchestration.review]` supply
+   coordinator, worker, worktree, provider-override, and review-policy defaults.
+2. A profile write trims, deduplicates, normalizes, and validates selectors against those gates.
+3. Claim eligibility checks the worker agent and required capabilities before granting a run.
+4. Session start loads the persisted profile and passes its worker, worktree, and runtime policy
+   into normal session creation. It does not bypass provider authorization or session validation.
+5. Review routing uses the review and participant selectors. The original worker is excluded when
+   the review policy requires an independent reviewer.
+6. A continuation run uses the task's current profile when it is enqueued. Reviewed-run worker
+   and capability fields are copied only where the new profile leaves the selector empty.
+
+A task with an active run rejects profile changes. Finish or release that run before changing its
+execution policy.
+
+## Read and change a profile
+
+Use [compozy task profile](/docs/cli/task/profile), the Web **Task setup** sheet, or the API:
+
+| Method   | Route                               | Result                                                      |
+| -------- | ----------------------------------- | ----------------------------------------------------------- |
+| `GET`    | `/api/tasks/{id}/execution-profile` | The stored profile, or inherited defaults.                  |
+| `PUT`    | `/api/tasks/{id}/execution-profile` | Replaces the complete profile; omitted blocks use defaults. |
+| `DELETE` | `/api/tasks/{id}/execution-profile` | Removes the overlay and restores inherited defaults.        |
+
+`PUT` requires a matching `task_id` when supplied. `PUT` and `DELETE` return `409 Conflict` while
+`tasks.current_run_id` is set. Validation errors leave the stored profile unchanged.
+
+Managed agents use the same service through `compozy__task_execution_profile_get`,
+`compozy__task_execution_profile_set`, and `compozy__task_execution_profile_delete`.
+Those tools do not grant reviewer authority; verdicts use the [review gate](/docs/autonomy/review-gate).
+
+## Task setup in the Web
+
+Open a task and choose **Edit setup** in the properties rail. The sheet shows worker policy and
+runtime, coordinator guidance, review routing, worktree selection, participants, and capabilities.
+**View JSON** is a read-only view of the same profile. Editing and clearing are unavailable while
+a run is active. Clearing a stored profile requires confirmation.
+
+Reviews and their attempts remain under **Runs**. **Inspect → Stream** shows event-stream state.
+Server validation errors appear in the UI; the browser does not grant authority independently.
+
+## Configuration
+
+```toml
+[task.orchestration.profile]
+default_coordinator_mode = "inherit"
+default_worker_mode = "inherit"
+default_worktree_mode = "inherit"
+allow_task_provider_override = true
+```
+
+Workspace config overlays global config. Unknown keys are errors. Disabling provider overrides
+rejects coordinator, worker, and reviewer provider/model overrides at profile validation time.
+The [configuration reference](/docs/configuration/config-toml) owns the full set of defaults and gates.
+
+## Authority
+
+`task_runs` is the durable execution queue. Claim and lease checks decide ownership. The task
+service owns transitions, profile validation, review verdicts, and continuation-run creation.
+Selection policies can narrow eligible agents; they cannot bypass workspace, tool, permission,
+or provider checks. A guided coordinator remains the daemon-managed workspace coordinator and
+respects the configured active-session limit.
+
+## Related pages
+
+- [Task Runs and Leases](/docs/autonomy/task-runs-and-leases)
+- [Coordinator Handoff](/docs/autonomy/coordinator)
+- [Review Gate](/docs/autonomy/review-gate)

@@ -1,0 +1,201 @@
+import type { EnqueueObject } from "@xstate/store";
+
+import type {
+  SessionTransportFailure,
+  SessionTransportHistoryReset,
+  SessionTransportPhase,
+} from "../lib/session-transport";
+import type {
+  SessionEventPayload,
+  TranscriptDeltaPayload,
+  TranscriptSnapshotPayload,
+} from "../types";
+
+export const MAX_PENDING_FRAMES = 64;
+export const RECONNECT_BASE_DELAY_MS = 250;
+export const RECONNECT_MAX_DELAY_MS = 4_000;
+/** Reconnects tried before the live view gives up and says so (US-018.AC-2). */
+export const MAX_RECONNECT_ATTEMPTS = 6;
+export const SURFACE_REFRESH_DELAY_MS = 120;
+export const TRANSCRIPT_RECOVERY_DELAY_MS = 5_000;
+export const TRANSCRIPT_RECOVERY_MAX_DELAY_MS = 60_000;
+
+/**
+ * Each consecutive failed transcript recovery doubles the wait up to the cap: a
+ * deterministic failure must not refetch the whole transcript every few seconds forever.
+ */
+export function transcriptRecoveryDelayMs(failedAttempts: number): number {
+  return Math.min(
+    TRANSCRIPT_RECOVERY_DELAY_MS * 2 ** Math.max(0, failedAttempts),
+    TRANSCRIPT_RECOVERY_MAX_DELAY_MS
+  );
+}
+
+export type SessionLiveTailFrame =
+  | {
+      containsClarification: boolean;
+      cursor: number;
+      kind: "delta";
+      payload: TranscriptDeltaPayload;
+    }
+  | {
+      containsClarification: boolean;
+      cursor: number;
+      kind: "snapshot";
+      payload: TranscriptSnapshotPayload;
+    };
+
+/** One frame written by a batch; `reset` replaced loaded history with another generation. */
+export interface SessionLiveTailAppliedFrame {
+  frame: SessionLiveTailFrame;
+  result: "applied" | "reset";
+}
+
+/**
+ * Why a batch stopped before its last frame: aborted before any write, the next
+ * frame no longer fits the cache fences, or its entries failed to normalize.
+ */
+export type SessionLiveTailBatchStop =
+  | "cancelled"
+  | "mismatch"
+  | { error: unknown; frame: SessionLiveTailFrame };
+
+/**
+ * Queued frames apply as one ordered batch with one cache write: `applied` is
+ * the in-order prefix that landed, exactly what sequential application would
+ * have written before `stop`.
+ */
+export interface SessionLiveTailBatchResult {
+  applied: readonly SessionLiveTailAppliedFrame[];
+  stop: SessionLiveTailBatchStop | null;
+}
+
+export interface SessionLiveTailStreamHandlers {
+  commandsChanged: () => void;
+  /** The server shed this watcher and is replaying up to `throughSequence` on this stream. */
+  degraded: (throughSequence: number) => void;
+  error: (error?: unknown) => void;
+  frame: (frame: SessionLiveTailFrame) => void;
+  goalChanged: () => void;
+  terminal: (payload: SessionEventPayload | null, sequence: number) => void;
+}
+
+export interface SessionLiveTailRuntime {
+  applyFrames: (
+    frames: readonly SessionLiveTailFrame[],
+    signal: AbortSignal
+  ) => Promise<SessionLiveTailBatchResult>;
+  applyTerminal: (payload: SessionEventPayload | null, sequence: number) => void;
+  invalidateClarifications: () => void;
+  invalidateCommands: () => void;
+  invalidateGoal: () => void;
+  /** `delta`: the trailing refresh after a burst of transcript deltas. */
+  invalidateSessionSurfaces: (reason?: "delta") => void;
+  openStream: (handlers: SessionLiveTailStreamHandlers) => (reason: string) => void;
+  recordApplyFailure: (frame: SessionLiveTailFrame, error: unknown) => void;
+  recordReconnect: (attempt: number, delayMs: number, error?: unknown) => void;
+  recordTranscriptFailure: (
+    error: unknown,
+    options: { recovery: boolean; sessionState?: string }
+  ) => void;
+  refreshTranscript: (signal: AbortSignal) => Promise<void>;
+}
+
+export type ApplyPhase =
+  | "idle"
+  | "scheduled"
+  | "applying"
+  | "repair-scheduled"
+  | "repairing"
+  | "repair-waiting"
+  | "terminal-refreshing";
+export type QueryRecoveryPhase = "idle" | "waiting" | "refreshing";
+export type TransportPhase = SessionTransportPhase;
+
+export interface SessionLiveTailContext {
+  applyPhase: ApplyPhase;
+  /** The stream is replaying a gap: after a reopen (until the queue drains) or after a shed (until the watermark). */
+  catchingUp: boolean;
+  /** The shed replay's watermark; catching up ends only once an applied frame reaches it. */
+  catchUpThrough: number | null;
+  /** When the transport stopped being live; `null` while live. */
+  degradedAt: number | null;
+  /** Retries exhausted: how many and when. */
+  failure: SessionTransportFailure | null;
+  generation: number;
+  /** A reset snapshot replaced loaded history with another generation. */
+  historyReset: SessionTransportHistoryReset | null;
+  /** When the last frame applied. */
+  lastLiveAt: number | null;
+  lastTranscriptError: unknown | null;
+  overflowed: boolean;
+  pendingFrames: readonly SessionLiveTailFrame[];
+  pendingTerminal: {
+    payload: SessionEventPayload | null;
+    sequence: number;
+  } | null;
+  queryRecoveryPhase: QueryRecoveryPhase;
+  reconnectAttempt: number;
+  /** Consecutive failed transcript recoveries (repair or query); sets the next recovery delay. */
+  recoveryAttempt: number;
+  surfaceRefreshScheduled: boolean;
+  transportPhase: TransportPhase;
+}
+
+export type SessionLiveTailEvents = {
+  applyCompleted: SessionLiveTailBatchResult & { at: number; generation: number };
+  applyFailed: { error: unknown; frame: SessionLiveTailFrame; generation: number };
+  applyStarted: { generation: number };
+  commandsChanged: { generation: number };
+  configured: { at: number; enabled: boolean; runtime: SessionLiveTailRuntime };
+  degradedReceived: { generation: number; throughSequence: number };
+  disposed: Record<never, never>;
+  frameReceived: { at: number; frame: SessionLiveTailFrame; generation: number };
+  goalChanged: { generation: number };
+  manualRecoveryRequested: Record<never, never>;
+  queryRecoveryElapsed: { generation: number };
+  queryRecoveryFailed: { error: unknown; generation: number };
+  queryRecoverySucceeded: { generation: number };
+  reconnectElapsed: { generation: number };
+  repairElapsed: { generation: number };
+  repairFailed: { error: unknown; generation: number };
+  repairStarted: { generation: number };
+  repairSucceeded: { generation: number };
+  streamError: { at: number; error?: unknown; generation: number };
+  surfaceRefreshElapsed: { generation: number };
+  terminalReceived: {
+    generation: number;
+    payload: SessionEventPayload | null;
+    sequence: number;
+  };
+  terminalRefreshFinished: { generation: number };
+  transcriptObserved: { error: unknown | null; sessionState?: string };
+};
+
+export type SessionLiveTailEnqueue = EnqueueObject<
+  SessionLiveTailContext,
+  never,
+  SessionLiveTailEvents
+>;
+
+export interface SessionLiveTailTrigger {
+  applyCompleted: (event: SessionLiveTailEvents["applyCompleted"]) => void;
+  applyFailed: (event: SessionLiveTailEvents["applyFailed"]) => void;
+  applyStarted: (event: SessionLiveTailEvents["applyStarted"]) => void;
+  commandsChanged: (event: SessionLiveTailEvents["commandsChanged"]) => void;
+  degradedReceived: (event: SessionLiveTailEvents["degradedReceived"]) => void;
+  frameReceived: (event: SessionLiveTailEvents["frameReceived"]) => void;
+  goalChanged: (event: SessionLiveTailEvents["goalChanged"]) => void;
+  queryRecoveryElapsed: (event: SessionLiveTailEvents["queryRecoveryElapsed"]) => void;
+  queryRecoveryFailed: (event: SessionLiveTailEvents["queryRecoveryFailed"]) => void;
+  queryRecoverySucceeded: (event: SessionLiveTailEvents["queryRecoverySucceeded"]) => void;
+  reconnectElapsed: (event: SessionLiveTailEvents["reconnectElapsed"]) => void;
+  repairElapsed: (event: SessionLiveTailEvents["repairElapsed"]) => void;
+  repairFailed: (event: SessionLiveTailEvents["repairFailed"]) => void;
+  repairStarted: (event: SessionLiveTailEvents["repairStarted"]) => void;
+  repairSucceeded: (event: SessionLiveTailEvents["repairSucceeded"]) => void;
+  streamError: (event: SessionLiveTailEvents["streamError"]) => void;
+  surfaceRefreshElapsed: (event: SessionLiveTailEvents["surfaceRefreshElapsed"]) => void;
+  terminalReceived: (event: SessionLiveTailEvents["terminalReceived"]) => void;
+  terminalRefreshFinished: (event: SessionLiveTailEvents["terminalRefreshFinished"]) => void;
+}

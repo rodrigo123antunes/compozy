@@ -1,0 +1,293 @@
+package core
+
+import (
+	"maps"
+
+	"strings"
+	"time"
+
+	"github.com/compozy/compozy/internal/api/contract"
+
+	compozyconfig "github.com/compozy/compozy/internal/config"
+
+	hookspkg "github.com/compozy/compozy/internal/hooks"
+
+	settingspkg "github.com/compozy/compozy/internal/settings"
+)
+
+func settingsInstalledExtensionPayloads(
+	values []settingspkg.InstalledExtension,
+) []contract.SettingsInstalledExtensionPayload {
+	if len(values) == 0 {
+		return nil
+	}
+	payloads := make([]contract.SettingsInstalledExtensionPayload, 0, len(values))
+	for _, value := range values {
+		payloads = append(payloads, contract.SettingsInstalledExtensionPayload{
+			Name:          strings.TrimSpace(value.Name),
+			Version:       strings.TrimSpace(value.Version),
+			Enabled:       value.Enabled,
+			State:         strings.TrimSpace(value.State),
+			Health:        strings.TrimSpace(value.Health),
+			HealthMessage: strings.TrimSpace(value.HealthMessage),
+			LastError:     strings.TrimSpace(value.LastError),
+			RequiresEnv:   append([]string(nil), value.RequiresEnv...),
+			MissingEnv:    append([]string(nil), value.MissingEnv...),
+			Palette:       settingsInstalledExtensionPalettePayload(value.Palette),
+		})
+	}
+	return payloads
+}
+
+func settingsInstalledExtensionPalettePayload(
+	value *settingspkg.InstalledExtensionPalette,
+) *contract.SettingsInstalledExtensionPalettePayload {
+	if value == nil {
+		return nil
+	}
+	payload := &contract.SettingsInstalledExtensionPalettePayload{
+		Commands: make([]contract.SettingsInstalledExtensionPaletteCommandPayload, 0, len(value.Commands)),
+		Views:    make([]contract.SettingsInstalledExtensionPaletteViewPayload, 0, len(value.Views)),
+	}
+	for _, command := range value.Commands {
+		payload.Commands = append(payload.Commands, contract.SettingsInstalledExtensionPaletteCommandPayload{
+			ID: strings.TrimSpace(command.ID), Title: strings.TrimSpace(command.Title),
+			Bindings:       append([]string{}, command.Bindings...),
+			DefaultBinding: strings.TrimSpace(command.DefaultBinding),
+			DefaultDormant: command.DefaultDormant, ConflictWith: strings.TrimSpace(command.ConflictWith),
+			Available: command.Available, Reason: strings.TrimSpace(command.Reason),
+		})
+	}
+	for _, view := range value.Views {
+		payload.Views = append(payload.Views, contract.SettingsInstalledExtensionPaletteViewPayload{
+			ID: strings.TrimSpace(view.ID), Title: strings.TrimSpace(view.Title),
+			Available: view.Available, Reason: strings.TrimSpace(view.Reason),
+		})
+	}
+	return payload
+}
+
+func settingsProviderItemPayloads(values []settingspkg.ProviderItem) []contract.SettingsProviderItemPayload {
+	if len(values) == 0 {
+		return []contract.SettingsProviderItemPayload{}
+	}
+	payloads := make([]contract.SettingsProviderItemPayload, 0, len(values))
+	for idx := range values {
+		payloads = append(payloads, settingsProviderItemPayload(&values[idx]))
+	}
+	return payloads
+}
+
+func settingsProviderItemPayload(value *settingspkg.ProviderItem) contract.SettingsProviderItemPayload {
+	if value == nil {
+		return contract.SettingsProviderItemPayload{}
+	}
+	payload := contract.SettingsProviderItemPayload{
+		SessionEnvStatus: settingsProviderCredentialStatusPayloads(value.SessionEnvStatus),
+		Name:             strings.TrimSpace(value.Name),
+		Settings:         settingsProviderSettingsPayload(value.Settings),
+		RuntimeStrategy:  providerRuntimeStrategy(value.Name, value.Settings.RuntimeProvider),
+		Default:          value.Default,
+		CommandAvailable: value.CommandAvailable,
+		Credentials:      settingsProviderCredentialStatusPayloads(value.Credentials),
+		AuthStatus:       settingsProviderAuthStatusPayload(value.AuthStatus),
+		SourceMetadata:   settingsSourceMetadataPayload(value.SourceMetadata),
+	}
+	if value.Fallback != nil {
+		payload.Fallback = &contract.SettingsProviderFallbackPayload{
+			Source:   settingsSourceRefPayload(value.Fallback.Source),
+			Settings: settingsProviderSettingsPayload(value.Fallback.Settings),
+		}
+	}
+	return payload
+}
+
+func settingsProviderSettingsPayload(value settingspkg.ProviderSettings) contract.SettingsProviderSettingsPayload {
+	return contract.SettingsProviderSettingsPayload{
+		SessionEnv:       SessionEnvToPayload(value.SessionEnv),
+		Command:          strings.TrimSpace(value.Command),
+		CommandInherited: value.CommandInherited,
+		DisplayName:      strings.TrimSpace(value.DisplayName),
+		Models:           settingsProviderModelsPayload(value.Models),
+		Harness:          string(value.Harness),
+		RuntimeProvider:  strings.TrimSpace(value.RuntimeProvider),
+		Transport:        strings.TrimSpace(value.Transport),
+		BaseURL:          strings.TrimSpace(value.BaseURL),
+		AuthMode:         string(value.AuthMode),
+		EnvPolicy:        string(value.EnvPolicy),
+		HomePolicy:       string(value.HomePolicy),
+		SteerCapability:  value.SteerCapability,
+		AuthStatusCmd:    strings.TrimSpace(value.AuthStatusCmd),
+		AuthACPMethod:    strings.TrimSpace(value.AuthACPMethod),
+		CredentialSlots:  settingsProviderCredentialSlotPayloads(value.CredentialSlots),
+	}
+}
+
+func settingsProviderCredentialSlotPayloads(
+	values []compozyconfig.ProviderCredentialSlot,
+) []contract.SettingsProviderCredentialSlotPayload {
+	if len(values) == 0 {
+		return nil
+	}
+	payloads := make([]contract.SettingsProviderCredentialSlotPayload, 0, len(values))
+	for _, value := range values {
+		payloads = append(payloads, contract.SettingsProviderCredentialSlotPayload{
+			Name:      strings.TrimSpace(value.Name),
+			TargetEnv: strings.TrimSpace(value.TargetEnv),
+			SecretRef: strings.TrimSpace(value.SecretRef),
+			Kind:      strings.TrimSpace(value.Kind),
+			Required:  value.Required,
+		})
+	}
+	return payloads
+}
+
+func settingsProviderAuthStatusPayload(
+	value settingspkg.ProviderAuthStatus,
+) *contract.SettingsProviderAuthStatusPayload {
+	payload := contract.SettingsProviderAuthStatusPayload{
+		Mode:        string(value.Mode),
+		EnvPolicy:   string(value.EnvPolicy),
+		HomePolicy:  string(value.HomePolicy),
+		State:       strings.TrimSpace(value.State),
+		Code:        strings.TrimSpace(value.Code),
+		Message:     strings.TrimSpace(value.Message),
+		StatusCmd:   strings.TrimSpace(value.StatusCmd),
+		Login:       providerLoginDescriptorPayload(value.Login),
+		LastProbeAt: optionalTime(value.CheckedAt),
+	}
+	return &payload
+}
+
+func settingsProviderCredentialStatusPayloads(
+	values []settingspkg.ProviderCredentialStatus,
+) []contract.SettingsProviderCredentialStatusPayload {
+	if len(values) == 0 {
+		return nil
+	}
+	payloads := make([]contract.SettingsProviderCredentialStatusPayload, 0, len(values))
+	for _, value := range values {
+		payloads = append(payloads, contract.SettingsProviderCredentialStatusPayload{
+			Name:      strings.TrimSpace(value.Name),
+			TargetEnv: strings.TrimSpace(value.TargetEnv),
+			SecretRef: strings.TrimSpace(value.SecretRef),
+			Kind:      strings.TrimSpace(value.Kind),
+			Required:  value.Required,
+			Present:   value.Present,
+			Source:    strings.TrimSpace(value.Source),
+		})
+	}
+	return payloads
+}
+
+func settingsHookItemPayloads(values []settingspkg.HookItem) []contract.SettingsHookItemPayload {
+	if len(values) == 0 {
+		return []contract.SettingsHookItemPayload{}
+	}
+	payloads := make([]contract.SettingsHookItemPayload, 0, len(values))
+	for i := range values {
+		value := &values[i]
+		payloads = append(payloads, contract.SettingsHookItemPayload{
+			Name:           strings.TrimSpace(value.Name),
+			Declaration:    settingsHookDeclarationPayload(value.Declaration),
+			SourceMetadata: settingsSourceMetadataPayload(value.SourceMetadata),
+		})
+	}
+	return payloads
+}
+
+func settingsHookDeclarationPayload(value hookspkg.HookDecl) contract.SettingsHookDeclarationPayload {
+	return contract.SettingsHookDeclarationPayload{
+		Name:         strings.TrimSpace(value.Name),
+		Event:        value.Event,
+		Mode:         value.Mode,
+		Required:     value.Required,
+		Enabled:      value.Enabled,
+		Priority:     int(value.Priority),
+		Timeout:      durationString(value.Timeout),
+		Matcher:      value.Matcher,
+		ExecutorKind: value.ExecutorKind,
+		Command:      strings.TrimSpace(value.Command),
+		Args:         cloneStrings(value.Args),
+		Env:          cloneStringMap(value.Env),
+		SecretEnv:    cloneStringMap(value.SecretEnv),
+		Metadata:     cloneStringMap(value.Metadata),
+	}
+}
+
+func settingsSourceMetadataPayload(value settingspkg.SourceMetadata) contract.SettingsSourceMetadataPayload {
+	return contract.SettingsSourceMetadataPayload{
+		EffectiveSource:  settingsSourceRefPayload(value.EffectiveSource),
+		ShadowedSources:  settingsSourceRefPayloads(value.ShadowedSources),
+		AvailableTargets: settingsWriteTargetKindsPayload(value.AvailableTargets),
+	}
+}
+
+func settingsSourceRefPayload(value settingspkg.SourceRef) contract.SettingsSourceRefPayload {
+	return contract.SettingsSourceRefPayload{
+		Kind:        contract.SettingsSourceKind(value.Kind),
+		Scope:       contract.SettingsScopeKind(value.Scope),
+		WorkspaceID: strings.TrimSpace(value.WorkspaceID),
+		Profile:     strings.TrimSpace(value.ProfileName),
+		AgentName:   strings.TrimSpace(value.AgentName),
+	}
+}
+
+func settingsSourceRefPayloads(values []settingspkg.SourceRef) []contract.SettingsSourceRefPayload {
+	if len(values) == 0 {
+		return nil
+	}
+	payloads := make([]contract.SettingsSourceRefPayload, 0, len(values))
+	for _, value := range values {
+		payloads = append(payloads, settingsSourceRefPayload(value))
+	}
+	return payloads
+}
+
+func settingsWriteTargetKindsPayload(values []settingspkg.WriteTargetKind) []contract.SettingsWriteTargetKind {
+	if len(values) == 0 {
+		return nil
+	}
+	payloads := make([]contract.SettingsWriteTargetKind, 0, len(values))
+	for _, value := range values {
+		payloads = append(payloads, contract.SettingsWriteTargetKind(value))
+	}
+	return payloads
+}
+
+func cloneStringMap(src map[string]string) map[string]string {
+	if len(src) == 0 {
+		return nil
+	}
+	dst := make(map[string]string, len(src))
+	maps.Copy(dst, src)
+	return dst
+}
+
+func cloneStrings(src []string) []string {
+	if len(src) == 0 {
+		return nil
+	}
+	return append([]string(nil), src...)
+}
+
+func cloneBoolPtr(src *bool) *bool {
+	if src == nil {
+		return nil
+	}
+	return new(*src)
+}
+
+func cloneTimePointer(src *time.Time) *time.Time {
+	if src == nil {
+		return nil
+	}
+	return new(src.UTC())
+}
+
+func durationString(value time.Duration) string {
+	if value <= 0 {
+		return ""
+	}
+	return value.String()
+}

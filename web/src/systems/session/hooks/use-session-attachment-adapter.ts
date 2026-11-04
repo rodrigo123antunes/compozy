@@ -1,0 +1,228 @@
+import type {
+  Attachment,
+  AttachmentAdapter,
+  CompleteAttachment,
+  PendingAttachment,
+} from "@assistant-ui/react";
+import { useState } from "react";
+
+import {
+  SessionAttachmentApiError,
+  uploadSessionAttachment,
+} from "../adapters/session-attachment-api";
+import { ATTACHMENT_ALLOWED_REASON, SESSION_ATTACHMENT_PART_NAME } from "../lib/attachment-kinds";
+import {
+  releaseComposerDraftFile,
+  retainComposerDraftUpload,
+  retainedComposerDraftUpload,
+} from "../lib/session-composer-attachment-drafts";
+import { consumeSubmittedComposerAttachment } from "../lib/session-composer-attachment-ownership";
+import type { SessionAttachment } from "../types";
+import { sessionStore } from "../stores/session-store";
+
+export const SESSION_ATTACHMENT_ADAPTER_ACCEPT = "*";
+
+interface SessionAttachmentAdapterOptions {
+  sessionId?: string;
+  workspaceId: string;
+}
+
+function pendingId(): string {
+  const crypto = globalThis.crypto;
+  if (typeof crypto?.randomUUID === "function") {
+    return crypto.randomUUID();
+  }
+  if (typeof crypto?.getRandomValues !== "function") {
+    return `pending-${Date.now().toString(36)}-${Math.random().toString(36).slice(2)}`;
+  }
+  const bytes = new Uint8Array(16);
+  crypto.getRandomValues(bytes);
+  bytes[6] = (bytes[6]! & 0x0f) | 0x40;
+  bytes[8] = (bytes[8]! & 0x3f) | 0x80;
+  const hex = Array.from(bytes, byte => byte.toString(16).padStart(2, "0")).join("");
+  return `${hex.slice(0, 8)}-${hex.slice(8, 12)}-${hex.slice(12, 16)}-${hex.slice(16, 20)}-${hex.slice(20)}`;
+}
+
+function persistFailureMessage(error: unknown): string {
+  if (error instanceof SessionAttachmentApiError) {
+    if (error.statusCode === 413) return "File exceeds the server upload limit";
+    if (error.statusCode === 415) return ATTACHMENT_ALLOWED_REASON;
+  }
+  return "Couldn't save";
+}
+
+function registerFileAliases(
+  files: Map<string, File>,
+  pendingID: string,
+  uploadedID: string,
+  file: File
+): void {
+  files.set(pendingID, file);
+  files.set(uploadedID, file);
+}
+
+export class SessionAttachmentAdapter implements AttachmentAdapter {
+  /**
+   * Wildcard lets the daemon apply its configured admission policy consistently
+   * to picker, drop, and paste input.
+   */
+  public accept = SESSION_ATTACHMENT_ADAPTER_ACCEPT;
+
+  private readonly uploads = new Map<string, SessionAttachment>();
+  private readonly sentFiles = new Map<string, File>();
+  private readonly uploadedFiles = new Map<string, File>();
+  private readonly inFlightUploads = new Map<string, Promise<SessionAttachment>>();
+  private readonly removedWhileUploading = new Set<string>();
+  private readonly workspaceId: string;
+  private readonly sessionId: string | undefined;
+
+  constructor({ workspaceId, sessionId }: SessionAttachmentAdapterOptions) {
+    this.workspaceId = workspaceId;
+    this.sessionId = sessionId;
+  }
+
+  public async *add({ file }: { file: File }): AsyncGenerator<PendingAttachment, void> {
+    const id = pendingId();
+    const base: Omit<PendingAttachment, "status"> = {
+      id,
+      type: file.type.startsWith("image/") ? "image" : "file",
+      name: file.name,
+      contentType: file.type,
+      file,
+    };
+
+    if (!this.sessionId) {
+      yield { ...base, status: { type: "requires-action", reason: "composer-send" }, content: [] };
+      return;
+    }
+
+    try {
+      // A draft restored after a runtime rebuild reuses its upload instead of sending the bytes again.
+      let upload = retainedComposerDraftUpload(this.workspaceId, this.sessionId, file);
+      if (!upload) {
+        upload = uploadSessionAttachment(this.workspaceId, this.sessionId, file);
+        retainComposerDraftUpload(this.workspaceId, this.sessionId, file, upload);
+      }
+      this.inFlightUploads.set(id, upload);
+      // Register ownership before exposing the running tile to a consumer.
+      yield {
+        ...base,
+        status: { type: "running", reason: "uploading", progress: 0 },
+      };
+      const uploaded = await upload;
+      if (this.removedWhileUploading.has(id)) return;
+      this.uploads.set(id, uploaded);
+      this.uploadedFiles.set(id, file);
+      yield {
+        ...base,
+        contentType: uploaded.mime_type,
+        status: { type: "requires-action", reason: "composer-send" },
+        content: [
+          {
+            type: "data",
+            name: SESSION_ATTACHMENT_PART_NAME,
+            data: uploaded,
+          },
+        ],
+      };
+    } catch (error) {
+      if (this.removedWhileUploading.has(id)) return;
+      yield {
+        ...base,
+        status: {
+          type: "incomplete",
+          reason: "error",
+          message: persistFailureMessage(error),
+        },
+      };
+    } finally {
+      this.inFlightUploads.delete(id);
+      this.removedWhileUploading.delete(id);
+    }
+  }
+
+  public async remove(attachment: Attachment): Promise<void> {
+    if (!this.sessionId) return;
+    if (attachment.file) releaseComposerDraftFile(attachment.file);
+    // Removal transfers the first-message handoff to the edited draft before upload cleanup awaits.
+    sessionStore.trigger.firstPromptSent({ sessionId: this.sessionId });
+    consumeSubmittedComposerAttachment(attachment);
+    sessionStore.trigger.composerPromptRefusalDismissed({ sessionId: this.sessionId });
+    this.uploads.delete(attachment.id);
+    this.uploadedFiles.delete(attachment.id);
+    if (this.inFlightUploads.has(attachment.id)) {
+      this.removedWhileUploading.add(attachment.id);
+    }
+    // IDs are content-addressed within the session, shared by duplicate tiles,
+    // rebuilt runtimes and persisted messages. A tile cannot own DELETE;
+    // daemon retention and session deletion own durable byte cleanup.
+  }
+
+  public async send(attachment: PendingAttachment): Promise<CompleteAttachment> {
+    if (!this.sessionId) {
+      return { ...attachment, status: { type: "complete" }, content: [] };
+    }
+    const uploaded = this.uploads.get(attachment.id);
+    if (!uploaded) {
+      throw new Error(`Attachment "${attachment.name}" is not ready to send`);
+    }
+    this.uploads.delete(attachment.id);
+    this.uploadedFiles.delete(attachment.id);
+    if (attachment.file) {
+      releaseComposerDraftFile(attachment.file);
+      registerFileAliases(this.sentFiles, attachment.id, uploaded.id, attachment.file);
+    }
+    return {
+      ...attachment,
+      id: uploaded.id,
+      contentType: uploaded.mime_type,
+      status: { type: "complete" },
+      content: [
+        {
+          type: "data",
+          name: SESSION_ATTACHMENT_PART_NAME,
+          data: {
+            bytes: uploaded.bytes,
+            height: uploaded.height,
+            id: uploaded.id,
+            kind: uploaded.kind,
+            mime_type: uploaded.mime_type,
+            name: uploaded.name,
+            sha256: uploaded.sha256,
+            width: uploaded.width,
+          },
+        },
+      ],
+    };
+  }
+
+  public acknowledgeSentFiles(): void {
+    this.sentFiles.clear();
+    this.uploadedFiles.clear();
+  }
+
+  public recoverSentFiles(): File[] {
+    const files = new Set([...this.sentFiles.values(), ...this.uploadedFiles.values()]);
+    for (const file of files) {
+      this.forgetFile(file);
+    }
+    return [...files];
+  }
+
+  private forgetFile(file: File): void {
+    for (const [id, candidate] of this.sentFiles) {
+      if (candidate === file) this.sentFiles.delete(id);
+    }
+    for (const [id, candidate] of this.uploadedFiles) {
+      if (candidate === file) this.uploadedFiles.delete(id);
+    }
+  }
+}
+
+export function useSessionAttachmentAdapter(
+  workspaceId: string,
+  sessionId: string
+): SessionAttachmentAdapter {
+  const [adapter] = useState(() => new SessionAttachmentAdapter({ workspaceId, sessionId }));
+  return adapter;
+}

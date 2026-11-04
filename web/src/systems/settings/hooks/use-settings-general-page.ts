@@ -1,0 +1,178 @@
+import { useState, type SetStateAction } from "react";
+
+import { useSettingsPage } from "./use-settings-page";
+import { useCheckSettingsUpdate } from "./use-settings-update-mutations";
+
+import {
+  type SettingsGeneralSection,
+  type SettingsUpdateGeneralRequest,
+  useCancelSettingsUpdate,
+  useProductUpdate,
+  useReloadSettings,
+  useSettingsApplyRecords,
+  useSettingsGeneral,
+  useUpdateSettingsGeneral,
+} from "@/systems/settings";
+import { useActiveWorkspace } from "@/systems/workspace";
+
+type GeneralConfig = SettingsGeneralSection["config"];
+type GeneralDraftState = { draft: GeneralConfig | null; workspaceKey: string };
+
+function releaseSavedDraft(
+  current: GeneralDraftState,
+  submitted: GeneralConfig,
+  workspaceKey: string
+): GeneralDraftState {
+  // Newer edits and drafts from another workspace still belong to the user.
+  return current.workspaceKey === workspaceKey && current.draft === submitted
+    ? { ...current, draft: null }
+    : current;
+}
+
+function applyResultLabel(result: {
+  active_generation: number;
+  next_action: string;
+  restart_required?: boolean;
+  skipped?: boolean;
+  skipped_reason?: string;
+}) {
+  if (result.skipped) {
+    return result.skipped_reason ?? "No config changes detected";
+  }
+  if (result.restart_required || result.next_action === "restart-daemon") {
+    return "Saved · restart required to apply";
+  }
+  if (result.next_action === "new-session") {
+    return "Saved · new sessions use this config";
+  }
+  if (result.next_action === "retry") {
+    return "Saved · reload required";
+  }
+  return `Saved · active generation ${result.active_generation}`;
+}
+
+function updateActionError(error: unknown): string | null {
+  return error instanceof Error ? error.message : null;
+}
+
+export function useSettingsGeneralPage() {
+  const query = useSettingsGeneral();
+  const productUpdate = useProductUpdate();
+  const update = productUpdate.query;
+  const updateCancel = useCancelSettingsUpdate();
+  const updateCheck = useCheckSettingsUpdate();
+  const applyRecords = useSettingsApplyRecords({ limit: 8 });
+  const mutation = useUpdateSettingsGeneral();
+  const reload = useReloadSettings();
+  const page = useSettingsPage({ currentSlug: "general" });
+  const { activeWorkspaceId } = useActiveWorkspace();
+
+  const envelope = query.data ?? null;
+  const workspaceContextKey = activeWorkspaceId ?? "__none__";
+
+  const [draftState, setDraftState] = useState<GeneralDraftState>({
+    draft: null,
+    workspaceKey: workspaceContextKey,
+  });
+  const draft =
+    draftState.workspaceKey === workspaceContextKey
+      ? (draftState.draft ?? envelope?.config ?? null)
+      : (envelope?.config ?? null);
+  const setDraft = (update: SetStateAction<GeneralConfig | null>) => {
+    setDraftState(current => {
+      const currentDraft =
+        current.workspaceKey === workspaceContextKey
+          ? (current.draft ?? envelope?.config ?? null)
+          : (envelope?.config ?? null);
+      return {
+        draft: typeof update === "function" ? update(currentDraft) : update,
+        workspaceKey: workspaceContextKey,
+      };
+    });
+  };
+  const [lastAppliedState, setLastAppliedState] = useState<{
+    label: string | null;
+    workspaceKey: string;
+  }>({ label: null, workspaceKey: workspaceContextKey });
+  const lastAppliedLabel =
+    lastAppliedState.workspaceKey === workspaceContextKey ? lastAppliedState.label : null;
+  const setLastAppliedLabel = (label: string | null) => {
+    setLastAppliedState({ label, workspaceKey: workspaceContextKey });
+  };
+
+  const isDirty =
+    envelope && draft ? JSON.stringify(envelope.config) !== JSON.stringify(draft) : false;
+
+  const handleReset = () => {
+    if (envelope) {
+      setDraft(envelope.config);
+    }
+  };
+
+  const handleSave = () => {
+    if (!draft) return;
+    const body: SettingsUpdateGeneralRequest = { config: draft };
+    mutation.mutate(body, {
+      onSuccess: result => {
+        // The mutation awaits the canonical refetch before releasing its submitted draft.
+        setDraftState(current => releaseSavedDraft(current, draft, workspaceContextKey));
+        setLastAppliedLabel(applyResultLabel(result));
+      },
+    });
+  };
+
+  const handleReload = () => {
+    reload.mutate(undefined, {
+      onSuccess: result => {
+        setLastAppliedLabel(applyResultLabel(result));
+      },
+    });
+  };
+
+  const saveError = updateActionError(mutation.error);
+
+  const handleRetry = () => {
+    void query.refetch();
+  };
+
+  return {
+    isLoading: query.isLoading,
+    error: query.error,
+    envelope,
+    draft,
+    setDraft,
+    isDirty,
+    handleReset,
+    handleSave,
+    isSaving: mutation.isPending,
+    saveError,
+    warnings: mutation.data?.warnings,
+    lastAppliedLabel,
+    handleRetry,
+    restart: page.restart,
+    update,
+    // Apply/cancel only acknowledge acquisition. `result` carries the daemon's
+    // own answer (`accepted` or `blocked` with its holder) so the surface can
+    // report it verbatim; terminal truth still comes from the `update` read.
+    updateActions: {
+      check: () => updateCheck.mutate(),
+      isChecking: updateCheck.isPending,
+      checkError:
+        updateCheck.context?.checkedAt === update.data?.runtime.checked_at
+          ? updateActionError(updateCheck.error)
+          : null,
+      apply: productUpdate.apply,
+      cancel: () => updateCancel.mutate(),
+      isApplying: productUpdate.applying,
+      isCanceling: updateCancel.isPending,
+      result: productUpdate.applyResult,
+      cancelResult: updateCancel.data ?? null,
+      error: productUpdate.applyError ?? updateActionError(updateCancel.error),
+    },
+    applyRecords,
+    handleReload,
+    isReloading: reload.isPending,
+    reloadError: updateActionError(reload.error),
+    reloadResult: reload.data ?? null,
+  };
+}

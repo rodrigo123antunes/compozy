@@ -1,0 +1,56 @@
+---
+title: "compozy task create"
+description: "Create a task"
+---
+
+## compozy task create
+
+Create a task
+
+```
+compozy task create [flags]
+```
+
+### Options
+
+```
+      --as-agent                Create using the current CompozyOS-managed agent session identity
+      --auto-enqueue-on-ready   Auto-enqueue the run once blocking dependencies complete
+      --description string      Task description
+  -h, --help                    help for create
+      --id string               Explicit task ID
+      --identifier string       Human-friendly task identifier
+      --metadata string         Optional metadata JSON
+      --no-wake-creator         Disable creator wake notifications for this task
+      --owner-kind string       Optional owner kind
+      --owner-ref string        Optional owner reference
+      --priority string         Task priority: low, medium, high, or urgent
+      --scope string            Task scope: user (aliases: @user, global) or workspace
+      --title string            Task title
+      --workspace string        Override workspace (ID, name, or path)
+```
+
+### Options inherited from parent commands
+
+```
+      --json             Emit JSON output
+  -o, --output string    Output format: human, json, jsonl, or toon (default "human")
+      --profile string   Act as a profile for this command
+```
+
+## Output Formats
+
+The root `-o, --output` flag accepts these values. A renderer is supported only when this command writes that result; `jsonl` is for commands that emit one JSON record per line.
+
+| Format  | Command result                          |
+| ------- | --------------------------------------- |
+| `human` | Interactive terminal rendering          |
+| `json`  | Machine-readable JSON rendering         |
+| `jsonl` | One JSON record per line when supported |
+| `toon`  | Compact agent-readable rendering        |
+
+Example:
+
+```bash
+compozy task create -o json
+```

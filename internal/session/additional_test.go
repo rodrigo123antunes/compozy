@@ -1,0 +1,1373 @@
+package session
+
+import (
+	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"io"
+	"log/slog"
+	"os"
+	"path/filepath"
+	"slices"
+	"strings"
+	"sync"
+	"testing"
+	"time"
+
+	"github.com/compozy/compozy/internal/acp"
+	"github.com/compozy/compozy/internal/agentinstance"
+	compozyconfig "github.com/compozy/compozy/internal/config"
+	"github.com/compozy/compozy/internal/store"
+	"github.com/compozy/compozy/internal/testutil"
+	"github.com/compozy/compozy/internal/transcript"
+	workspacepkg "github.com/compozy/compozy/internal/workspace"
+)
+
+type failingEntropyReader struct {
+	err error
+}
+
+func (r failingEntropyReader) Read([]byte) (int, error) {
+	return 0, r.err
+}
+
+func TestCreateCleansUpOnStartFailure(t *testing.T) {
+	t.Parallel()
+
+	h := newHarness(t)
+	recorder := &stubRecorder{}
+	h.driver.startHook = func(_ acp.StartOpts, _ int) (*fakeProcess, error) {
+		return nil, errors.New("start failed token=super-secret")
+	}
+	h.manager = newManagerWithHarness(t, h,
+		WithStore(func(context.Context, store.SessionDBOwner, string) (EventRecorder, error) {
+			return recorder, nil
+		}),
+	)
+
+	_, err := h.manager.Create(testutil.Context(t), new(CreateOpts{
+		AgentName: "coder",
+		Workspace: h.workspaceID,
+	}))
+	if err == nil {
+		t.Fatal("Create() error = nil, want non-nil")
+	}
+	if !strings.Contains(err.Error(), "start failed") {
+		t.Fatalf("Create() error = %v, want start failure", err)
+	}
+	if recorder.closeCalls != 1 {
+		t.Fatalf("recorder close calls = %d, want 1", recorder.closeCalls)
+	}
+	meta := readMeta(t, store.SessionMetaFile(filepath.Join(h.homePaths.SessionsDir, "sess-1")))
+	if meta.State != string(StateStopped) {
+		t.Fatalf("failed start meta state = %q, want stopped", meta.State)
+	}
+	if meta.Failure == nil {
+		t.Fatal("failed start meta Failure = nil, want startup failure")
+	}
+	if got, want := meta.Failure.Kind, store.FailureStartup; got != want {
+		t.Fatalf("failed start failure kind = %q, want %q", got, want)
+	}
+	if !strings.Contains(meta.Failure.Summary, "start failed") ||
+		strings.Contains(meta.Failure.Summary, "super-secret") ||
+		!strings.Contains(meta.Failure.Summary, "[REDACTED]") {
+		t.Fatalf("failed start summary = %q, want redacted start failure", meta.Failure.Summary)
+	}
+	if meta.Failure.CrashBundlePath == "" {
+		t.Fatal("failed start crash bundle path = empty, want persisted bundle")
+	}
+	if _, statErr := os.Stat(meta.Failure.CrashBundlePath); statErr != nil {
+		t.Fatalf("stat crash bundle %q error = %v", meta.Failure.CrashBundlePath, statErr)
+	}
+	bundle, err := os.ReadFile(meta.Failure.CrashBundlePath)
+	if err != nil {
+		t.Fatalf("ReadFile(crash bundle) error = %v", err)
+	}
+	if strings.Contains(string(bundle), "super-secret") || !strings.Contains(string(bundle), "[REDACTED]") {
+		t.Fatalf("crash bundle = %q, want redacted secret", string(bundle))
+	}
+	if len(h.manager.List()) != 0 {
+		t.Fatalf("List() after failed create = %d sessions, want 0", len(h.manager.List()))
+	}
+	all, err := h.manager.ListAll(testutil.Context(t))
+	if err != nil {
+		t.Fatalf("ListAll() after failed create error = %v", err)
+	}
+	if len(all) != 1 || all[0].Failure == nil || all[0].Failure.Kind != store.FailureStartup {
+		t.Fatalf("ListAll() after failed create = %#v, want one startup failure", all)
+	}
+	if got := h.notifier.createdCount(); got != 1 {
+		t.Fatalf("created notifications after failed create = %d, want 1", got)
+	}
+	if got := h.notifier.stoppedCount(); got != 1 {
+		t.Fatalf("stopped notifications after failed create = %d, want 1", got)
+	}
+	wantOrder := []string{"created:sess-1", "stopped:sess-1"}
+	if got := h.notifier.notificationOrder(); !slices.Equal(got, wantOrder) {
+		t.Fatalf("notification order after failed create = %#v, want %#v", got, wantOrder)
+	}
+}
+
+func TestCreateErrorBranches(t *testing.T) {
+	t.Parallel()
+
+	t.Run("Should blank agent name uses config default", func(t *testing.T) {
+		t.Parallel()
+
+		h := newHarness(t)
+		session, err := h.manager.Create(testutil.Context(t), new(CreateOpts{Workspace: h.workspaceID}))
+		if err != nil {
+			t.Fatalf("Create(blank agent) error = %v", err)
+		}
+		t.Cleanup(func() {
+			reportSessionStop(t, h, session.ID)
+		})
+		if got, want := session.Info().AgentName, compozyconfig.DefaultAgentName; got != want {
+			t.Fatalf("Create(blank agent) AgentName = %q, want %q", got, want)
+		}
+	})
+
+	t.Run("Should blank agent name without config default", func(t *testing.T) {
+		t.Parallel()
+
+		h := newHarness(t)
+		h.cfg.Defaults.Agent = ""
+		h.resolver.upsert(&workspacepkg.ResolvedWorkspace{
+			ID:      h.workspaceID,
+			RootDir: h.workspace,
+			Name:    h.workspaceName,
+			Config:  h.cfg,
+			Agents: []compozyconfig.AgentDef{{
+				Name:     "coder",
+				Provider: "claude",
+				Prompt:   "You are a coding assistant.",
+			}},
+		})
+		h.manager = newManagerWithHarness(t, h)
+		if _, err := h.manager.Create(testutil.Context(t), new(CreateOpts{Workspace: h.workspaceID})); err == nil {
+			t.Fatal("Create(blank agent with empty defaults) error = nil, want non-nil")
+		}
+	})
+
+	t.Run("Should reject an empty generated session id", func(t *testing.T) {
+		t.Parallel()
+
+		h := newHarness(t, WithSessionIDGenerator(func() (string, error) { return "", nil }))
+		if _, err := h.manager.Create(testutil.Context(t), new(CreateOpts{
+			AgentName: "coder",
+			Workspace: h.workspaceID,
+		})); err == nil {
+			t.Fatal("Create(empty session id) error = nil, want non-nil")
+		}
+	})
+
+	t.Run("Should propagate session ID entropy failure before session creation", func(t *testing.T) {
+		t.Parallel()
+
+		entropyErr := errors.New("entropy unavailable")
+		h := newHarness(t, WithSessionIDGenerator(func() (string, error) {
+			return "", entropyErr
+		}))
+		if _, err := h.manager.Create(testutil.Context(t), new(CreateOpts{
+			AgentName: "coder",
+			Workspace: h.workspaceID,
+		})); !errors.Is(err, entropyErr) {
+			t.Fatalf("Create() error = %v, want entropy failure", err)
+		}
+		if sessions := h.manager.List(); len(sessions) != 0 {
+			t.Fatalf("List() after entropy failure = %#v, want no session", sessions)
+		}
+	})
+
+	t.Run("Should store open failure", func(t *testing.T) {
+		t.Parallel()
+
+		h := newHarness(t)
+		h.manager = newManagerWithHarness(
+			t,
+			h,
+			WithStore(func(context.Context, store.SessionDBOwner, string) (EventRecorder, error) {
+				return nil, errors.New("open failed")
+			}),
+		)
+		if _, err := h.manager.Create(testutil.Context(t), new(CreateOpts{
+			AgentName: "coder",
+			Workspace: h.workspaceID,
+		})); err == nil {
+			t.Fatal("Create(store open failure) error = nil, want non-nil")
+		}
+	})
+}
+
+func TestCreateWithNilPromptAssemblerIsSafe(t *testing.T) {
+	t.Parallel()
+
+	h := newHarness(t, WithPromptAssembler(nil))
+
+	session, err := h.manager.Create(testutil.Context(t), new(CreateOpts{
+		AgentName: "coder",
+		Workspace: h.workspaceID,
+	}))
+	if err != nil {
+		t.Fatalf("Create() error = %v", err)
+	}
+	t.Cleanup(func() {
+		reportSessionStop(t, h, session.ID)
+	})
+
+	if got := session.Info().Type; got != SessionTypeUser {
+		t.Fatalf("session type = %q, want %q", got, SessionTypeUser)
+	}
+	if got := h.driver.startCalls[0].SystemPrompt; got != "You are a coding assistant." {
+		t.Fatalf("start system prompt = %q, want raw agent prompt", got)
+	}
+}
+
+func TestResumeCleansUpOnStartFailure(t *testing.T) {
+	t.Parallel()
+
+	h := newHarness(t)
+	session := createSession(t, h)
+	if err := h.manager.Stop(testutil.Context(t), session.ID); err != nil {
+		t.Fatalf("Stop() error = %v", err)
+	}
+
+	recorder := &stubRecorder{}
+	h.driver.startHook = func(_ acp.StartOpts, _ int) (*fakeProcess, error) {
+		return nil, errors.New("resume failed")
+	}
+	h.manager = newManagerWithHarness(t, h,
+		WithStore(func(context.Context, store.SessionDBOwner, string) (EventRecorder, error) {
+			return recorder, nil
+		}),
+	)
+
+	_, err := h.manager.Resume(testutil.Context(t), session.ID)
+	if err == nil {
+		t.Fatal("Resume() error = nil, want non-nil")
+	}
+	if !strings.Contains(err.Error(), "resume failed") {
+		t.Fatalf("Resume() error = %v, want resume failure", err)
+	}
+	if recorder.closeCalls != 1 {
+		t.Fatalf("recorder close calls = %d, want 1", recorder.closeCalls)
+	}
+}
+
+func TestCreatePassesResolvedAdditionalDirsToDriver(t *testing.T) {
+	t.Parallel()
+
+	h := newHarness(t)
+	additionalOne := filepath.Join(h.homePaths.HomeDir, "shared-one")
+	additionalTwo := filepath.Join(h.homePaths.HomeDir, "shared-two")
+	for _, dir := range []string{additionalOne, additionalTwo} {
+		if err := os.MkdirAll(dir, 0o755); err != nil {
+			t.Fatalf("os.MkdirAll(%q) error = %v", dir, err)
+		}
+	}
+
+	h.resolver.upsert(&workspacepkg.ResolvedWorkspace{
+		ID:             h.workspaceID,
+		RootDir:        h.workspace,
+		AdditionalDirs: []string{additionalOne, additionalTwo},
+		Name:           h.workspaceName,
+		Config:         h.cfg,
+		Agents: []compozyconfig.AgentDef{{
+			Name:     "coder",
+			Provider: "claude",
+			Prompt:   "You are a coding assistant.",
+		}},
+	})
+
+	session, err := h.manager.Create(testutil.Context(t), new(CreateOpts{
+		AgentName: "coder",
+		Workspace: h.workspaceID,
+	}))
+	if err != nil {
+		t.Fatalf("Create() error = %v", err)
+	}
+	t.Cleanup(func() {
+		reportSessionStop(t, h, session.ID)
+	})
+
+	if got, want := h.driver.startCalls[0].AdditionalDirs, []string{
+		additionalOne,
+		additionalTwo,
+	}; !slices.Equal(
+		got,
+		want,
+	) {
+		t.Fatalf("start AdditionalDirs = %#v, want %#v", got, want)
+	}
+}
+
+func TestResumePassesResolvedAdditionalDirsToDriver(t *testing.T) {
+	t.Parallel()
+
+	h := newHarness(t)
+	additionalOne := filepath.Join(h.homePaths.HomeDir, "shared-one")
+	additionalTwo := filepath.Join(h.homePaths.HomeDir, "shared-two")
+	for _, dir := range []string{additionalOne, additionalTwo} {
+		if err := os.MkdirAll(dir, 0o755); err != nil {
+			t.Fatalf("os.MkdirAll(%q) error = %v", dir, err)
+		}
+	}
+
+	h.resolver.upsert(&workspacepkg.ResolvedWorkspace{
+		ID:             h.workspaceID,
+		RootDir:        h.workspace,
+		AdditionalDirs: []string{additionalOne, additionalTwo},
+		Name:           h.workspaceName,
+		Config:         h.cfg,
+		Agents: []compozyconfig.AgentDef{{
+			Name:     "coder",
+			Provider: "claude",
+			Prompt:   "You are a coding assistant.",
+		}},
+	})
+
+	session := createSession(t, h)
+	if err := h.manager.Stop(testutil.Context(t), session.ID); err != nil {
+		t.Fatalf("Stop() error = %v", err)
+	}
+
+	resumed, err := h.manager.Resume(testutil.Context(t), session.ID)
+	if err != nil {
+		t.Fatalf("Resume() error = %v", err)
+	}
+	t.Cleanup(func() {
+		reportSessionStop(t, h, resumed.ID)
+	})
+
+	if got, want := h.driver.startCalls[1].AdditionalDirs, []string{
+		additionalOne,
+		additionalTwo,
+	}; !slices.Equal(
+		got,
+		want,
+	) {
+		t.Fatalf("resume start AdditionalDirs = %#v, want %#v", got, want)
+	}
+}
+
+func TestResumeErrorBranches(t *testing.T) {
+	t.Parallel()
+
+	h := newHarness(t)
+	if _, err := h.manager.Resume(testutil.Context(t), ""); err == nil {
+		t.Fatal("Resume(blank id) error = nil, want non-nil")
+	}
+	if _, err := h.manager.Resume(testutil.Context(t), "missing"); err == nil {
+		t.Fatal("Resume(missing meta) error = nil, want non-nil")
+	}
+}
+
+func TestPromptErrorPaths(t *testing.T) {
+	t.Parallel()
+
+	t.Run("Should resume a stopped persisted session after manager restart", func(t *testing.T) {
+		t.Parallel()
+
+		h := newHarness(t)
+		session := createSession(t, h)
+		first, err := h.manager.Prompt(testutil.Context(t), session.ID, "first")
+		if err != nil {
+			t.Fatalf("Prompt(first) error = %v", err)
+		}
+		collectEvents(t, first)
+		if err := h.manager.Stop(testutil.Context(t), session.ID); err != nil {
+			t.Fatalf("Stop() error = %v", err)
+		}
+
+		restarted := newManagerWithHarness(t, h)
+		second, err := restarted.Prompt(testutil.Context(t), session.ID, "after-restart")
+		if err != nil {
+			t.Fatalf("Prompt(stopped after restart) error = %v", err)
+		}
+		collectEvents(t, second)
+		resumed, ok := restarted.Get(session.ID)
+		if !ok {
+			t.Fatalf("Get(%q) found = false, want resumed session", session.ID)
+		}
+		if got := resumed.Info().State; got != StateActive {
+			t.Fatalf("resumed state = %q, want %q", got, StateActive)
+		}
+		t.Cleanup(func() {
+			if err := restarted.Stop(testutil.Context(t), resumed.ID); err != nil {
+				t.Fatalf("Stop(resumed) error = %v", err)
+			}
+		})
+		h.driver.mu.Lock()
+		startCalls := len(h.driver.startCalls)
+		h.driver.mu.Unlock()
+		if startCalls != 2 {
+			t.Fatalf("driver start calls = %d, want 2 after restart resume", startCalls)
+		}
+	})
+
+	t.Run("Should resume a stopped session through a normal prompt", func(t *testing.T) {
+		t.Parallel()
+
+		h := newHarness(t)
+		session := createSession(t, h)
+		_, err := h.manager.Prompt(testutil.Context(t), session.ID, "   ")
+		if err == nil || err.Error() != "session: prompt message is required" {
+			t.Fatalf("Prompt(empty) error = %v, want prompt message required", err)
+		}
+		if _, err := h.manager.Prompt(testutil.Context(t), "missing", "hello"); !errors.Is(err, ErrSessionNotFound) {
+			t.Fatalf("Prompt(missing) error = %v, want ErrSessionNotFound", err)
+		}
+		if err := h.manager.Stop(testutil.Context(t), session.ID); err != nil {
+			t.Fatalf("Stop() error = %v", err)
+		}
+		events, err := h.manager.Prompt(testutil.Context(t), session.ID, "after-stop")
+		if err != nil {
+			t.Fatalf("Prompt(stopped) error = %v", err)
+		}
+		collectEvents(t, events)
+		resumed, ok := h.manager.Get(session.ID)
+		if !ok {
+			t.Fatalf("Get(%q) found = false, want true after prompt resume", session.ID)
+		}
+		if got := resumed.Info().State; got != StateActive {
+			t.Fatalf("resumed state = %q, want %q", got, StateActive)
+		}
+		h.driver.mu.Lock()
+		startCalls := len(h.driver.startCalls)
+		h.driver.mu.Unlock()
+		if startCalls != 2 {
+			t.Fatalf("driver start calls = %d, want 2 after prompt resume", startCalls)
+		}
+	})
+
+	t.Run("Should return the runtime bind failure for an unbound session", func(t *testing.T) {
+		t.Parallel()
+
+		h := newHarness(t)
+		session := createSession(t, h)
+		session.markRuntimeUnbound(time.Now().UTC())
+		if got := session.Info().RuntimeStatus; got != RuntimeStatusUnbound {
+			t.Fatalf("unbound session runtime status = %q, want %q", got, RuntimeStatusUnbound)
+		}
+		bindErr := errors.New("runtime bind unavailable")
+		h.driver.mu.Lock()
+		h.driver.startHook = func(_ acp.StartOpts, _ int) (*fakeProcess, error) {
+			return nil, bindErr
+		}
+		h.driver.mu.Unlock()
+		if _, err := h.manager.Prompt(testutil.Context(t), session.ID, "bind-runtime"); !errors.Is(err, bindErr) {
+			t.Fatalf("Prompt(unbound) error = %v, want runtime bind failure", err)
+		}
+	})
+
+	t.Run("Should propagate turn ID entropy failure before prompt dispatch", func(t *testing.T) {
+		t.Parallel()
+
+		entropyErr := errors.New("entropy unavailable")
+		h := newHarness(t)
+		session := createSession(t, h)
+		safeTurnIDGenerator := h.manager.newTurnID
+		t.Cleanup(func() {
+			h.manager.newTurnID = safeTurnIDGenerator
+			if err := h.manager.Stop(testutil.Context(t), session.ID); err != nil {
+				t.Errorf("Stop() error = %v", err)
+			}
+		})
+		h.manager.newTurnID = func() (string, error) {
+			return "", entropyErr
+		}
+		if _, err := h.manager.Prompt(testutil.Context(t), session.ID, "requires id"); !errors.Is(err, entropyErr) {
+			t.Fatalf("Prompt() error = %v, want entropy failure", err)
+		}
+		if calls := len(managerPromptCalls(h)); calls != 0 {
+			t.Fatalf("driver prompt calls after entropy failure = %d, want 0", calls)
+		}
+	})
+
+	t.Run("Should reject an empty turn ID without a fallback", func(t *testing.T) {
+		t.Parallel()
+
+		h := newHarness(t)
+		session := createSession(t, h)
+		safeTurnIDGenerator := h.manager.newTurnID
+		t.Cleanup(func() {
+			h.manager.newTurnID = safeTurnIDGenerator
+			if err := h.manager.Stop(testutil.Context(t), session.ID); err != nil {
+				t.Errorf("Stop() error = %v", err)
+			}
+		})
+		h.manager.newTurnID = func() (string, error) {
+			return "", nil
+		}
+		if _, err := h.manager.Prompt(testutil.Context(t), session.ID, "requires id"); err == nil {
+			t.Fatal("Prompt() error = nil, want empty turn ID rejection")
+		}
+		if calls := len(managerPromptCalls(h)); calls != 0 {
+			t.Fatalf("driver prompt calls after empty turn ID = %d, want 0", calls)
+		}
+	})
+}
+
+func TestResumeReturnsExistingActiveSession(t *testing.T) {
+	t.Parallel()
+
+	h := newHarness(t)
+	session := createSession(t, h)
+	t.Cleanup(func() {
+		reportSessionStop(t, h, session.ID)
+	})
+
+	resumed, err := h.manager.Resume(testutil.Context(t), session.ID)
+	if err != nil {
+		t.Fatalf("Resume(active) error = %v", err)
+	}
+	if resumed != session {
+		t.Fatalf("Resume(active) returned %p, want %p", resumed, session)
+	}
+}
+
+// Invariant: concurrent callers share one stopped-session resume and receive the same active
+// session. Owning layer: session Manager lifecycle. Canonical suite: resume coverage in this file.
+func TestConcurrentResumeSharesOneStart(t *testing.T) {
+	t.Parallel()
+	t.Run("Should share one runtime start across concurrent callers", func(t *testing.T) {
+		t.Parallel()
+		testConcurrentResumeSharesOneStart(t)
+	})
+}
+
+func testConcurrentResumeSharesOneStart(t *testing.T) {
+	t.Helper()
+
+	h := newHarness(t)
+	session := createSession(t, h)
+	if err := h.manager.Stop(testutil.Context(t), session.ID); err != nil {
+		t.Fatalf("Stop() error = %v", err)
+	}
+
+	startEntered := make(chan struct{}, 2)
+	releaseStart := make(chan struct{})
+	var releaseStartOnce sync.Once
+	t.Cleanup(func() {
+		releaseStartOnce.Do(func() { close(releaseStart) })
+	})
+	h.driver.mu.Lock()
+	h.driver.startHook = func(opts acp.StartOpts, _ int) (*fakeProcess, error) {
+		startEntered <- struct{}{}
+		<-releaseStart
+		return newFakeProcess(opts.AgentName, opts.Command, opts.Cwd, "acp-resumed"), nil
+	}
+	h.driver.mu.Unlock()
+
+	type result struct {
+		session *Session
+		err     error
+	}
+	results := make(chan result, 2)
+	resume := func() {
+		resumed, err := h.manager.Resume(t.Context(), session.ID)
+		results <- result{session: resumed, err: err}
+	}
+	go resume()
+	<-startEntered
+	secondWaitEntered := make(chan struct{})
+	secondContext, cancelSecond := context.WithCancel(testutil.Context(t))
+	t.Cleanup(cancelSecond)
+	waitContext := &resumeWaitObservedContext{
+		Context: secondContext,
+		entered: secondWaitEntered,
+	}
+	go func() {
+		resumed, err := h.manager.Resume(waitContext, session.ID)
+		results <- result{session: resumed, err: err}
+	}()
+	select {
+	case <-secondWaitEntered:
+	case <-time.After(2 * time.Second):
+		t.Fatal("second Resume() did not enter the shared waiter")
+	}
+	releaseStartOnce.Do(func() { close(releaseStart) })
+
+	first := <-results
+	second := <-results
+	if first.err != nil || second.err != nil {
+		t.Fatalf("concurrent Resume() errors = (%v, %v), want nil", first.err, second.err)
+	}
+	if first.session == nil || second.session != first.session {
+		t.Fatalf("concurrent Resume() sessions = (%p, %p), want one shared session", first.session, second.session)
+	}
+	h.driver.mu.Lock()
+	startCalls := len(h.driver.startCalls)
+	h.driver.mu.Unlock()
+	if startCalls != 2 {
+		t.Fatalf("driver Start() calls = %d, want one create and one shared resume", startCalls)
+	}
+	t.Cleanup(func() {
+		if err := h.manager.Stop(testutil.Context(t), session.ID); err != nil &&
+			!errors.Is(err, ErrSessionNotFound) {
+			t.Errorf("Stop() cleanup error = %v", err)
+		}
+	})
+}
+
+type resumeWaitObservedContext struct {
+	context.Context
+	once    sync.Once
+	entered chan struct{}
+}
+
+func (c *resumeWaitObservedContext) Done() <-chan struct{} {
+	c.once.Do(func() { close(c.entered) })
+	return c.Context.Done()
+}
+
+// Invariant: shutdown ignores completed resume failures and waits for every pending resume.
+// Owning layer: session Manager lifecycle. Canonical suite: resume coverage in this file.
+func TestWaitForSessionResumesDrainsAllCapturedRuns(t *testing.T) {
+	t.Parallel()
+	t.Run("Should ignore an ordinary resume failure", func(t *testing.T) {
+		t.Parallel()
+
+		failed := &sessionResumeRun{done: make(chan struct{}), err: errors.New("resume failed")}
+		close(failed.done)
+		manager := &Manager{resumeLifecycle: sessionResumeLifecycle{
+			runs: map[string]*sessionResumeRun{"failed": failed},
+		}}
+
+		if err := manager.waitForSessionResumes(testutil.Context(t)); err != nil {
+			t.Fatalf("waitForSessionResumes() error = %v, want ordinary resume failure ignored", err)
+		}
+	})
+
+	t.Run("Should remain blocked until a pending resume completes", func(t *testing.T) {
+		t.Parallel()
+
+		pending := &sessionResumeRun{done: make(chan struct{})}
+		var closePending sync.Once
+		t.Cleanup(func() { closePending.Do(func() { close(pending.done) }) })
+		manager := &Manager{resumeLifecycle: sessionResumeLifecycle{
+			runs: map[string]*sessionResumeRun{"pending": pending},
+		}}
+		waitEntered := make(chan struct{})
+		waitContext := &resumeWaitObservedContext{
+			Context: testutil.Context(t),
+			entered: waitEntered,
+		}
+		waitDone := make(chan error, 1)
+		go func() {
+			waitDone <- manager.waitForSessionResumes(waitContext)
+		}()
+
+		select {
+		case <-waitEntered:
+		case <-time.After(2 * time.Second):
+			t.Fatal("waitForSessionResumes() did not enter the pending resume wait")
+		}
+		select {
+		case err := <-waitDone:
+			t.Fatalf("waitForSessionResumes() returned while resume was pending: %v", err)
+		default:
+		}
+		closePending.Do(func() { close(pending.done) })
+		if err := <-waitDone; err != nil {
+			t.Fatalf("waitForSessionResumes() error = %v, want nil after pending resume completed", err)
+		}
+	})
+}
+
+func TestNewManagerOptionsAndValidation(t *testing.T) {
+	t.Parallel()
+
+	homePaths, err := compozyconfig.ResolveHomePathsFrom(t.TempDir())
+	if err != nil {
+		t.Fatalf("ResolveHomePathsFrom() error = %v", err)
+	}
+
+	now := time.Date(2026, 4, 3, 15, 0, 0, 0, time.UTC)
+	cfg := compozyconfig.DefaultWithHome(homePaths)
+	resolver := newFakeWorkspaceResolver(&workspacepkg.ResolvedWorkspace{
+		ID:      "ws-options",
+		RootDir: "/tmp/workspace",
+		Name:    "workspace",
+		Config:  cfg,
+		Agents: []compozyconfig.AgentDef{{
+			Name:     compozyconfig.DefaultAgentName,
+			Provider: "claude",
+			Prompt:   "hi",
+		}},
+	})
+	manager, err := NewManager(
+		WithHomePaths(homePaths),
+		WithDriver(newFakeDriver()),
+		WithNotifier(newFakeNotifier()),
+		WithWorkspaceResolver(resolver),
+		WithNow(func() time.Time { return now }),
+		WithPromptBufferSize(7),
+	)
+	if err != nil {
+		t.Fatalf("NewManager() error = %v", err)
+	}
+	cleanupTestManager(t, manager)
+	if got := manager.now(); !got.Equal(now) {
+		t.Fatalf("now() = %s, want %s", got, now)
+	}
+	if got := manager.promptBufSize; got != 7 {
+		t.Fatalf("promptBufSize = %d, want 7", got)
+	}
+	if manager.workspace != resolver {
+		t.Fatal("workspace resolver override was not applied")
+	}
+
+	defaultManager, err := NewManager(WithHomePaths(homePaths))
+	if err != nil {
+		t.Fatalf("NewManager(defaults) error = %v", err)
+	}
+	cleanupTestManager(t, defaultManager)
+	if defaultManager.driver == nil {
+		t.Fatal("defaultManager.driver = nil, want default ACP adapter")
+	}
+
+	_, err = NewManager(
+		WithHomePaths(homePaths),
+		WithDriver(nil),
+	)
+	if err == nil {
+		t.Fatal("NewManager(nil driver) error = nil, want non-nil")
+	}
+
+	manager, err = NewManager(
+		WithHomePaths(homePaths),
+		WithDriver(newFakeDriver()),
+		WithLogger(nil),
+		WithNotifier(nil),
+		WithWorkspaceResolver(resolver),
+		WithStore(func(context.Context, store.SessionDBOwner, string) (EventRecorder, error) {
+			return &stubRecorder{}, nil
+		}),
+		WithNow(nil),
+		WithSessionIDGenerator(nil),
+		WithTurnIDGenerator(nil),
+		WithPromptBufferSize(0),
+	)
+	if err != nil {
+		t.Fatalf("NewManager(normalized defaults) error = %v", err)
+	}
+	cleanupTestManager(t, manager)
+	if manager.logger == nil || manager.now == nil || manager.newSessionID == nil || manager.newTurnID == nil {
+		t.Fatal("NewManager() failed to restore default dependencies after nil overrides")
+	}
+	if manager.notifier != nil {
+		t.Fatal("NewManager() restored a notifier default, want nil")
+	}
+	if manager.promptBufSize != defaultPromptBufferSize {
+		t.Fatalf("promptBufSize = %d, want default %d", manager.promptBufSize, defaultPromptBufferSize)
+	}
+
+	testCases := []struct {
+		name string
+		opts []Option
+	}{
+		{
+			name: "missing store opener",
+			opts: []Option{
+				WithHomePaths(homePaths),
+				WithDriver(newFakeDriver()),
+				WithWorkspaceResolver(resolver),
+				WithStore(nil),
+			},
+		},
+	}
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			if _, err := NewManager(tc.opts...); err == nil {
+				t.Fatalf("NewManager(%s) error = nil, want non-nil", tc.name)
+			}
+		})
+	}
+
+	t.Run("ShouldWrapInvalidSupervisionConfigWithSessionContext", func(t *testing.T) {
+		t.Parallel()
+
+		_, err := NewManager(
+			WithHomePaths(homePaths),
+			WithDriver(newFakeDriver()),
+			WithWorkspaceResolver(resolver),
+			WithSessionSupervision(compozyconfig.SessionSupervisionConfig{
+				ActivityHeartbeatInterval: -time.Second,
+				ProgressNotifyInterval:    time.Minute,
+				QuietAfter:                time.Minute,
+				StopGrace:                 2 * time.Minute,
+				TimeoutCancelGrace:        time.Second,
+			}),
+		)
+		if err == nil {
+			t.Fatal("NewManager(invalid supervision) error = nil, want non-nil")
+		}
+		if !strings.Contains(err.Error(), "session: session.supervision.activity_heartbeat_interval") {
+			t.Fatalf("NewManager(invalid supervision) error = %v, want session supervision context", err)
+		}
+	})
+}
+
+func TestHelperFunctionsAndUtilities(t *testing.T) {
+	t.Parallel()
+
+	resolved := workspacepkg.ResolvedWorkspace{
+		Agents: []compozyconfig.AgentDef{{
+			Name:     "coder",
+			Provider: "claude",
+			Prompt:   "hi",
+		}},
+	}
+	got, err := resolveWorkspaceAgent("coder", &resolved)
+	if err != nil {
+		t.Fatalf("resolveWorkspaceAgent(coder) error = %v", err)
+	}
+	if got.Name != "coder" {
+		t.Fatalf("resolveWorkspaceAgent(coder) name = %q, want coder", got.Name)
+	}
+	if _, err := resolveWorkspaceAgent("missing", &resolved); !errors.Is(err, workspacepkg.ErrAgentNotAvailable) {
+		t.Fatalf("resolveWorkspaceAgent(missing) error = %v, want ErrAgentNotAvailable", err)
+	}
+
+	done := make(chan struct{})
+	close(done)
+	if !isProcessDone(&AgentProcess{done: done}) {
+		t.Fatal("isProcessDone(closed) = false, want true")
+	}
+	if !isProcessDone(nil) {
+		t.Fatal("isProcessDone(nil) = false, want true")
+	}
+
+	if got := derefString(nil); got != "" {
+		t.Fatalf("derefString(nil) = %q, want empty", got)
+	}
+	if got := *stringPointer("value"); got != "value" {
+		t.Fatalf("stringPointer(value) = %q, want value", got)
+	}
+	if stringPointer("   ") != nil {
+		t.Fatal("stringPointer(blank) = non-nil, want nil")
+	}
+	if got, err := newID("sess"); err != nil {
+		t.Fatalf("newID(sess) error = %v", err)
+	} else if !strings.HasPrefix(got, "sess-") {
+		t.Fatalf("newID(sess) = %q, want prefixed id", got)
+	}
+	if got, err := newID(""); err != nil {
+		t.Fatalf("newID(\"\") error = %v", err)
+	} else if got == "" {
+		t.Fatal("newID(\"\") = empty, want non-empty")
+	}
+
+	t.Run("Should surface unreadable entropy without a timestamp substitute", func(t *testing.T) {
+		t.Parallel()
+
+		entropyErr := errors.New("entropy unavailable")
+		if _, err := newIDFromReader("sess", failingEntropyReader{err: entropyErr}); !errors.Is(err, entropyErr) {
+			t.Fatalf("newIDFromReader() error = %v, want entropy failure", err)
+		}
+	})
+}
+
+func TestCreateWithBlankWorkspaceReturnsValidationError(t *testing.T) {
+	t.Parallel()
+
+	h := newHarness(t)
+	if _, err := h.manager.Create(testutil.Context(t), new(CreateOpts{AgentName: "coder"})); err == nil {
+		t.Fatal("Create(blank workspace) error = nil, want non-nil")
+	}
+	if _, err := h.manager.Create(testutil.Context(t), new(CreateOpts{
+		AgentName:     "coder",
+		Workspace:     h.workspaceID,
+		WorkspacePath: h.workspace,
+	})); err == nil {
+		t.Fatal("Create(workspace + workspacePath) error = nil, want non-nil")
+	}
+}
+
+func TestCreateAndResumeRequireWorkspaceResolver(t *testing.T) {
+	t.Parallel()
+
+	homePaths, err := compozyconfig.ResolveHomePathsFrom(t.TempDir())
+	if err != nil {
+		t.Fatalf("ResolveHomePathsFrom() error = %v", err)
+	}
+
+	manager, err := NewManager(
+		WithHomePaths(homePaths),
+		WithDriver(newFakeDriver()),
+		WithLogger(slog.New(slog.NewTextHandler(io.Discard, nil))),
+	)
+	if err != nil {
+		t.Fatalf("NewManager() error = %v", err)
+	}
+	cleanupTestManager(t, manager)
+
+	if _, err := manager.Create(testutil.Context(t), new(CreateOpts{
+		AgentName: "coder",
+		Workspace: "ws-missing",
+	})); err == nil {
+		t.Fatal("Create(without resolver) error = nil, want non-nil")
+	}
+
+	sessionDir := filepath.Join(homePaths.SessionsDir, "sess-stored")
+	if err := store.WriteSessionMeta(store.SessionMetaFile(sessionDir), &store.SessionMeta{
+		ID:            "sess-stored",
+		AgentName:     "coder",
+		WorkspaceID:   "ws-stored",
+		State:         string(StateStopped),
+		RuntimeStatus: store.SessionRuntimeReady,
+		CreatedAt:     time.Date(2026, 4, 3, 12, 0, 0, 0, time.UTC),
+		UpdatedAt:     time.Date(2026, 4, 3, 12, 0, 0, 0, time.UTC),
+	}); err != nil {
+		t.Fatalf("WriteSessionMeta() error = %v", err)
+	}
+
+	if _, err := manager.Resume(testutil.Context(t), "sess-stored"); err == nil {
+		t.Fatal("Resume(without resolver) error = nil, want non-nil")
+	}
+}
+
+func TestMarshalAgentEvent(t *testing.T) {
+	t.Parallel()
+
+	rawPayload := json.RawMessage(
+		`{"sessionUpdate":"tool_call_update","status":"completed","rawOutput":"hello","_meta":{"claudeCode":{"toolName":"Bash"}}}`,
+	)
+	raw, err := marshalAgentEvent(acp.AgentEvent{Raw: rawPayload})
+	if err != nil {
+		t.Fatalf("marshalAgentEvent(raw) error = %v", err)
+	}
+
+	totalTokens := int64(4)
+	structuredEvent := acp.AgentEvent{
+		Type:      acp.EventTypeDone,
+		SessionID: "acp-1",
+		TurnID:    "turn-1",
+		Timestamp: time.Now().UTC(),
+		Text:      "done",
+		Error:     "none",
+		Usage: &acp.TokenUsage{
+			TurnID:      "turn-1",
+			TotalTokens: &totalTokens,
+			Timestamp:   time.Now().UTC(),
+		},
+	}.WithResolvedBy("agent_session:sess-creator")
+	payload, err := marshalAgentEvent(structuredEvent)
+	if err != nil {
+		t.Fatalf("marshalAgentEvent(structured) error = %v", err)
+	}
+
+	var decoded map[string]any
+	if err := json.Unmarshal([]byte(payload), &decoded); err != nil {
+		t.Fatalf("json.Unmarshal(payload) error = %v", err)
+	}
+	if decoded["schema"] != transcript.CanonicalSchema {
+		t.Fatalf("decoded[schema] = %v, want %q", decoded["schema"], transcript.CanonicalSchema)
+	}
+	if decoded["type"] != acp.EventTypeDone {
+		t.Fatalf("decoded[type] = %v, want %q", decoded["type"], acp.EventTypeDone)
+	}
+	if decoded["text"] != "done" {
+		t.Fatalf("decoded[text] = %v, want %q", decoded["text"], "done")
+	}
+	if decoded["resolved_by"] != "agent_session:sess-creator" {
+		t.Fatalf("decoded[resolved_by] = %v, want acting session", decoded["resolved_by"])
+	}
+	replayed, err := transcript.UnmarshalAgentEvent(payload)
+	if err != nil {
+		t.Fatalf("UnmarshalAgentEvent() error = %v", err)
+	}
+	if replayed.ResolvedByValue() != "agent_session:sess-creator" {
+		t.Fatalf("replayed.ResolvedByValue() = %q, want acting session", replayed.ResolvedByValue())
+	}
+
+	var rawDecoded map[string]any
+	if err := json.Unmarshal([]byte(raw), &rawDecoded); err != nil {
+		t.Fatalf("json.Unmarshal(raw payload) error = %v", err)
+	}
+	if rawDecoded["schema"] != transcript.CanonicalSchema {
+		t.Fatalf("rawDecoded[schema] = %v, want %q", rawDecoded["schema"], transcript.CanonicalSchema)
+	}
+	if rawDecoded["tool_name"] != "Bash" {
+		t.Fatalf("rawDecoded[tool_name] = %v, want %q", rawDecoded["tool_name"], "Bash")
+	}
+	if _, ok := rawDecoded["raw"]; ok {
+		t.Fatalf("rawDecoded unexpectedly retained nested raw payload: %#v", rawDecoded)
+	}
+}
+
+func TestAgentProcessHelpersAndAdapterUtilities(t *testing.T) {
+	t.Parallel()
+
+	wrapped := wrapACPProcess(&acp.AgentProcess{
+		PID:       99,
+		AgentName: "coder",
+		Command:   "fake",
+		Cwd:       "/tmp",
+		SessionID: "acp-1",
+		StartedAt: time.Now().UTC(),
+	})
+	if wrapped == nil || wrapped.PID != 99 || wrapped.SessionID != "acp-1" {
+		t.Fatalf("wrapACPProcess() = %#v", wrapped)
+	}
+	if wrapACPProcess(nil) != nil {
+		t.Fatal("wrapACPProcess(nil) = non-nil, want nil")
+	}
+
+	manager := &Manager{logger: slog.New(slog.NewTextHandler(io.Discard, nil))}
+	if got := manager.sessionLogger(nil); got == nil {
+		t.Fatal("sessionLogger(nil) = nil, want logger")
+	}
+	if got := manager.sessionLogger(&Session{ID: "sess-1", AgentName: "coder"}); got == nil {
+		t.Fatal("sessionLogger(session) = nil, want logger")
+	}
+
+	adapter := NewACPDriverAdapter(acp.New())
+	if _, err := adapter.nativeProcess(&AgentProcess{}); err == nil {
+		t.Fatal("nativeProcess(unsupported process) error = nil, want non-nil")
+	}
+
+	if _, err := adapter.Start(t.Context(), acp.StartOpts{}); err == nil {
+		t.Fatal("Start(invalid opts) error = nil, want non-nil")
+	}
+	if err := adapter.Cancel(t.Context(), wrapACPProcess(&acp.AgentProcess{})); err == nil {
+		t.Fatal("Cancel(empty session id) error = nil, want non-nil")
+	}
+}
+
+func TestSessionDirAccessorAndStopWithoutProcess(t *testing.T) {
+	t.Parallel()
+
+	h := newHarness(t)
+	session := createSession(t, h)
+	if session.SessionDir() == "" {
+		t.Fatal("SessionDir() = empty, want path")
+	}
+
+	session.clearProcess(time.Now().UTC())
+	if err := h.manager.Stop(testutil.Context(t), session.ID); err != nil {
+		t.Fatalf("Stop(no process) error = %v", err)
+	}
+	if readMeta(t, session.MetaPath()).State != string(StateStopped) {
+		t.Fatalf("meta state after no-process stop = %q, want %q", readMeta(t, session.MetaPath()).State, StateStopped)
+	}
+}
+
+func TestTransitionToSameStateOnlyUpdatesTimestamp(t *testing.T) {
+	t.Parallel()
+
+	now := time.Now().UTC()
+	session := &Session{
+		ID:        "sess-1",
+		AgentName: "coder",
+		Workspace: t.TempDir(),
+		State:     StateActive,
+		CreatedAt: now,
+		UpdatedAt: now,
+	}
+
+	later := now.Add(time.Second)
+	if err := session.transition(StateActive, later); err != nil {
+		t.Fatalf("transition(same state) error = %v", err)
+	}
+	if got := session.Info().UpdatedAt; !got.Equal(later) {
+		t.Fatalf("UpdatedAt = %s, want %s", got, later)
+	}
+}
+
+type stubRecorder struct {
+	closeCalls int
+}
+
+func (s *stubRecorder) ListTokenUsage(context.Context) ([]store.TokenUsage, error) {
+	return nil, nil
+}
+
+func (s *stubRecorder) Record(context.Context, store.SessionEvent) error {
+	return nil
+}
+
+func (s *stubRecorder) RecordTokenUsage(context.Context, store.TokenUsage) error {
+	return nil
+}
+
+func (s *stubRecorder) Query(context.Context, store.EventQuery) ([]store.SessionEvent, error) {
+	return nil, nil
+}
+
+func (s *stubRecorder) History(context.Context, store.EventQuery) ([]store.TurnHistory, error) {
+	return nil, nil
+}
+
+func (s *stubRecorder) Close(context.Context) error {
+	s.closeCalls++
+	return nil
+}
+
+func TestResolveWorkspaceSessionAgentGuardsNilInputs(t *testing.T) {
+	t.Run("Should reject a nil resolved workspace", func(t *testing.T) {
+		t.Parallel()
+
+		_, err := resolveWorkspaceSessionAgentForType("coder", "", "", nil, nil)
+		if err == nil {
+			t.Fatal("resolveWorkspaceSessionAgent(nil workspace) error = nil, want non-nil")
+		}
+		if !strings.Contains(err.Error(), "resolved workspace is required") {
+			t.Fatalf("resolveWorkspaceSessionAgent(nil workspace) error = %v", err)
+		}
+	})
+
+	t.Run("Should allow a nil agent resolver when a workspace is provided", func(t *testing.T) {
+		t.Parallel()
+
+		homePaths, err := compozyconfig.ResolveHomePathsFrom(t.TempDir())
+		if err != nil {
+			t.Fatalf("ResolveHomePathsFrom() error = %v", err)
+		}
+
+		resolvedWorkspace := &workspacepkg.ResolvedWorkspace{
+			Config: compozyconfig.DefaultWithHome(homePaths),
+			Agents: []compozyconfig.AgentDef{{
+				Name:     "coder",
+				Provider: "claude",
+				Prompt:   "You are a coding assistant.",
+			}},
+		}
+
+		resolved, err := resolveWorkspaceSessionAgentForType("coder", "", "", resolvedWorkspace, nil)
+		if err != nil {
+			t.Fatalf("resolveWorkspaceSessionAgentForType(nil agent resolver) error = %v", err)
+		}
+		if got, want := resolved.Provider, "claude"; got != want {
+			t.Fatalf("resolveWorkspaceSessionAgentForType(nil agent resolver) provider = %q, want %q", got, want)
+		}
+	})
+}
+
+func TestNativeSubagentEventFromStored(t *testing.T) {
+	// UT-036: the persisted event supplies native identity, model, settlement, and result.
+	t.Run("Should convert native calls and results without creating lifecycle side effects", func(t *testing.T) {
+		t.Parallel()
+		for _, tool := range []string{"Agent", "Task"} {
+			event := acp.AgentEvent{
+				Type:       acp.EventTypeToolCall,
+				ToolCallID: "toolu_agent",
+				Title:      "Review the diff (high effort)",
+			}.WithProviderToolMetadata("", tool, "pending").
+				WithTool(tool, json.RawMessage(`{"model":"sonnet-5.5","description":"Survey risks"}`), false)
+			payload, err := transcript.MarshalAgentEvent(event)
+			if err != nil {
+				t.Fatal(err)
+			}
+			at := time.Date(2026, 10, 8, 0, 0, 0, 0, time.UTC)
+			row := store.SessionEvent{SessionID: "parent", TurnID: "turn", Timestamp: at, Content: payload}
+			got, ok, err := NativeSubagentEventFromStored("workspace", row)
+			if err != nil || !ok {
+				t.Fatalf("convert = %#v, %v, %v", got, ok, err)
+			}
+			if got.WorkspaceID != "workspace" || got.ParentTurnID != "turn" || got.ToolName != tool ||
+				got.ProviderToolCallID != "toolu_agent" ||
+				got.Title != "Survey risks" ||
+				got.Model != "sonnet-5.5" ||
+				got.Status != "pending" ||
+				!got.At.Equal(at) {
+				t.Fatalf("call = %#v", got)
+			}
+			event.Type = acp.EventTypeToolResult
+			event = event.WithProviderToolMetadata("", tool, "completed")
+			event.Raw = json.RawMessage(`{"status":"completed","rawOutput":"Review complete"}`)
+			row.Content, err = transcript.MarshalAgentEvent(event)
+			if err != nil {
+				t.Fatal(err)
+			}
+			got, ok, err = NativeSubagentEventFromStored("workspace", row)
+			if err != nil || !ok || got.Status != "completed" || got.Result != "Review complete" {
+				t.Fatalf("result = %#v, %v, %v", got, ok, err)
+			}
+		}
+	})
+	// Invariant: a committed task observation converts to a task event for its launching call, with a
+	// one-line progress preferring summary, then description, then the last tool.
+	t.Run("Should convert committed native task observations for their launching call", func(t *testing.T) {
+		t.Parallel()
+		at := time.Date(2026, 10, 27, 0, 0, 0, 0, time.UTC)
+		for _, tc := range []struct {
+			summary                     *string
+			description, lastTool, want string
+		}{
+			{summary: new("Reading files"), description: "Survey", lastTool: "Grep", want: "Reading files"},
+			{description: "Survey", lastTool: "Grep", want: "Survey"},
+			{lastTool: "Grep", want: "Grep"},
+		} {
+			event := acp.AgentEvent{
+				Type: acp.EventTypeNativeTask, TurnID: "turn", ToolCallID: "toolu_agent",
+			}.WithNativeTask(&acp.NativeTaskObservation{
+				Kind: acp.NativeTaskKindProgress, TaskID: "agent-a", ToolCallID: "toolu_agent", Summary: tc.summary,
+				Description: tc.description, LastToolName: tc.lastTool,
+			})
+			payload, err := transcript.MarshalAgentEvent(event)
+			if err != nil {
+				t.Fatal(err)
+			}
+			got, ok, err := NativeSubagentEventFromStored(
+				"workspace", store.SessionEvent{TurnID: "turn", Timestamp: at, Content: payload},
+			)
+			if err != nil || !ok || got.Task == nil || got.ProviderToolCallID != "toolu_agent" ||
+				got.ToolName != "" || got.ParentTurnID != "turn" || got.WorkspaceID != "workspace" ||
+				got.Task.Kind != acp.NativeTaskKindProgress || got.Task.Progress != tc.want || !got.At.Equal(at) {
+				t.Fatalf("task event = %#v %#v, %v, %v", got, got.Task, ok, err)
+			}
+		}
+	})
+	// Issue #766: either the background input flag or the persisted async receipt marks a launch.
+	t.Run("Should mark background launches from the input flag or the persisted receipt", func(t *testing.T) {
+		t.Parallel()
+		call := acp.AgentEvent{Type: acp.EventTypeToolCall, ToolCallID: "toolu_agent"}.
+			WithProviderToolMetadata("", "Agent", "pending").
+			WithTool("Agent", json.RawMessage(`{"description":"S1","run_in_background":true}`), false)
+		receipt := acp.AgentEvent{Type: acp.EventTypeToolResult, ToolCallID: "toolu_agent"}.
+			WithProviderToolMetadata("", "Agent", "completed").
+			WithProviderToolAsync()
+		receipt.Raw = json.RawMessage(`{"status":"completed","rawOutput":"Async agent launched successfully."}`)
+		foreground := acp.AgentEvent{Type: acp.EventTypeToolResult, ToolCallID: "toolu_agent"}.
+			WithProviderToolMetadata("", "Agent", "completed")
+		for _, tc := range []struct {
+			event      acp.AgentEvent
+			background bool
+		}{{call, true}, {receipt, true}, {foreground, false}} {
+			content, err := transcript.MarshalAgentEvent(tc.event)
+			if err != nil {
+				t.Fatal(err)
+			}
+			got, ok, err := NativeSubagentEventFromStored("workspace", store.SessionEvent{Content: content})
+			if err != nil || !ok || got.Background != tc.background {
+				t.Fatalf("convert %s = %#v, %v, %v", tc.event.Type, got, ok, err)
+			}
+		}
+	})
+	// UT-037: inner events with an unknown parent cannot be mistaken for Agent calls.
+	t.Run("Should ignore inner and legacy tool calls without native tool metadata", func(t *testing.T) {
+		t.Parallel()
+		for _, event := range []acp.AgentEvent{
+			acp.AgentEvent{Type: acp.EventTypeToolCall, ToolCallID: "inner"}.WithProviderToolMetadata("missing", "Read", "pending"),
+			{Type: acp.EventTypeToolCall, ToolCallID: "legacy", Title: "Agent"},
+		} {
+			content, err := transcript.MarshalAgentEvent(event)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if got, ok, err := NativeSubagentEventFromStored(
+				"workspace",
+				store.SessionEvent{Content: content},
+			); err != nil ||
+				ok {
+				t.Fatalf("unexpected native event = %#v, %v, %v", got, ok, err)
+			}
+		}
+	})
+}
+
+func (*stubRecorder) MaxEventSequence(context.Context) (int64, error) {
+	return 0, nil
+}
+
+func (*stubRecorder) QueryEventMetadata(context.Context, store.EventQuery) ([]store.EventMetadata, error) {
+	return nil, nil
+}
+
+func TestInstanceMainPromptResume(t *testing.T) {
+	// Invariant: ordinary and idempotent prompts resume the same durable main exactly once.
+	// Owner: session admission; canonical suite: TestInstanceMainPromptResume.
+	for _, idempotent := range []bool{false, true} {
+		t.Run(
+			fmt.Sprintf("Should resume the same stopped instance main with idempotency %t", idempotent),
+			func(t *testing.T) {
+				t.Parallel()
+				h := newHarness(t)
+				db, err := openSessionTestGlobalDB(t.Context(), filepath.Join(t.TempDir(), "global.db"))
+				if err != nil {
+					t.Fatal(err)
+				}
+				t.Cleanup(func() {
+					if err := db.Close(context.Background()); err != nil {
+						t.Error(err)
+					}
+				})
+				now := time.Date(2026, 1, 1, 12, 0, 0, 0, time.UTC)
+				if err := db.InsertWorkspace(t.Context(), workspacepkg.Workspace{
+					ID: h.workspaceID, Name: h.workspaceName, RootDir: h.workspace,
+					CreatedAt: now, UpdatedAt: now,
+				}); err != nil {
+					t.Fatal(err)
+				}
+				h.manager = newManagerWithHarness(t, h, WithSessionCatalog(db), WithSessionInputQueueStore(db))
+				cleanupTestManager(t, h.manager)
+				main := createSession(t, h)
+				instance, err := db.Instances().Adopt(t.Context(), agentinstance.Instance{
+					ProfileID: store.DefaultProfileID, AgentName: "coder", WorkspaceID: h.workspaceID,
+					PermissionCeiling: "{}", CreatedByKind: "human",
+				}, main.ID, 10)
+				if err != nil {
+					t.Fatal(err)
+				}
+				// Archive-with-children must refuse the main before stopping any live member.
+				if _, err := h.manager.ArchiveWithChildren(
+					t.Context(),
+					h.workspaceID,
+					main.ID,
+					ArchiveTreeOptions{Stop: true},
+				); !errors.Is(
+					err,
+					store.ErrSessionIsInstanceMain,
+				) {
+					t.Fatalf("archive main=%v", err)
+				}
+				if active, ok := h.manager.Get(main.ID); !ok || active.Info().State != StateActive {
+					t.Fatal("archive stopped protected main")
+				}
+				if err := h.manager.Stop(t.Context(), main.ID); err != nil {
+					t.Fatal(err)
+				}
+				if idempotent {
+					opts := SendPromptOpts{
+						Message:        "Continue the existing conversation",
+						MessageID:      "resume-message",
+						IdempotencyKey: "resume-once",
+					}
+					result, err := h.manager.SendPrompt(t.Context(), main.ID, opts)
+					if err != nil {
+						t.Fatal(err)
+					}
+					collectEvents(t, result.Events)
+					replay, err := h.manager.SendPrompt(t.Context(), main.ID, opts)
+					if err != nil || !replay.Replayed {
+						t.Fatalf("replay=%+v error=%v", replay, err)
+					}
+				} else {
+					stream, err := h.manager.Prompt(t.Context(), main.ID, "Continue the existing conversation")
+					if err != nil {
+						t.Fatal(err)
+					}
+					collectEvents(t, stream)
+				}
+				resumed, ok := h.manager.Get(main.ID)
+				if !ok || resumed.Info().State != StateActive {
+					t.Fatalf("main did not resume: %v", ok)
+				}
+				retained, err := db.Instances().Get(t.Context(), instance.ID)
+				if err != nil || retained.MainSessionID != main.ID {
+					t.Fatalf("main pointer changed: %#v, %v", retained, err)
+				}
+				h.driver.mu.Lock()
+				starts := len(h.driver.startCalls)
+				h.driver.mu.Unlock()
+				if starts != 2 {
+					t.Fatalf("provider starts=%d, want initial and resume", starts)
+				}
+			},
+		)
+	}
+}

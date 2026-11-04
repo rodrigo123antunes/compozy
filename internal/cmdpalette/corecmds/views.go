@@ -1,0 +1,27 @@
+package corecmds
+
+import "github.com/compozy/compozy/internal/cmdpalette"
+
+const coreProfilesKey = "profiles"
+
+var viewOnlyDefinitions = []domainDefinition{
+	{id: "sessions", title: "Sessions", icon: coreIconTerminal},
+	{id: "worktrees", title: "Worktrees", icon: "git-branch"},
+	{id: coreAppExtensions, title: "Extensions", icon: "blocks"},
+	{id: coreProfilesKey, title: "Profiles", icon: "users-round"},
+}
+
+func viewCommands() []cmdpalette.Descriptor {
+	definitions := append([]domainDefinition(nil), viewOnlyDefinitions...)
+	definitions = append(definitions, sharedAppViewDomains...)
+	commands := make([]cmdpalette.Descriptor, 0, len(definitions))
+	for _, view := range definitions {
+		command := coreDescriptor(
+			cmdpalette.CommandID("palette.view."+view.id), view.title, coreSectionViews, view.icon,
+			cmdpalette.Action{Kind: cmdpalette.ActionKindView, View: view.id},
+		)
+		command.Keywords = append([]string(nil), view.keywords...)
+		commands = append(commands, command)
+	}
+	return commands
+}

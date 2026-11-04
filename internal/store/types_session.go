@@ -1,0 +1,423 @@
+package store
+
+import (
+	"errors"
+	"fmt"
+	"strings"
+	"time"
+
+	speedpkg "github.com/compozy/compozy/internal/speed"
+)
+
+var (
+	// ErrSessionNotFound reports that a persisted session row does not exist.
+	ErrSessionNotFound = errors.New("store: session not found")
+	// ErrSessionAttachLocked reports that another holder owns a live attach lease.
+	ErrSessionAttachLocked = errors.New("store: session attach locked")
+	// ErrSessionNotAttachable reports that a session is not eligible for attach/resume.
+	ErrSessionNotAttachable = errors.New("store: session not attachable")
+)
+
+type StopReason string
+
+const (
+	StopCompleted      StopReason = "completed"
+	StopOwnerReleased  StopReason = "owner_released"
+	StopUserCanceled   StopReason = "user_canceled"
+	StopMaxIterations  StopReason = "max_iterations"
+	StopLoopDetected   StopReason = "loop_detected"
+	StopTimeout        StopReason = "timeout"
+	StopBudgetExceeded StopReason = "budget_exceeded"
+	StopError          StopReason = "error"
+	StopAgentCrashed   StopReason = "agent_crashed"
+	StopHookStopped    StopReason = "hook_stopped"
+	StopShutdown       StopReason = "shutdown"
+)
+
+// ValidStopReason reports whether r is a supported stop reason enum member.
+func ValidStopReason(r StopReason) bool {
+	switch r {
+	case StopCompleted,
+		StopOwnerReleased,
+		StopUserCanceled,
+		StopMaxIterations,
+		StopLoopDetected,
+		StopTimeout,
+		StopBudgetExceeded,
+		StopError,
+		StopAgentCrashed,
+		StopHookStopped,
+		StopShutdown:
+		return true
+	default:
+		return false
+	}
+}
+
+// SessionInfo is the canonical session index row stored in the global database.
+// SessionAttachState keeps the optional attach binding compact inside SessionInfo.
+// Embedding preserves the flat field access the catalog projections rely on.
+type SessionAttachState struct {
+	AttachedTo      string
+	AttachExpiresAt *time.Time
+}
+
+type SessionInfo struct {
+	InstanceID               string
+	InitiatorKind            string
+	InitiatorID              string
+	EffectiveWorkspaceAccess string
+	VerdictOnly              bool `json:"-"`
+	ID                       string
+	ProfileID                string
+	Name                     string
+	AgentName                string
+	Provider                 string
+	Model                    string
+	ReasoningEffort          string
+	Speed                    speedpkg.Speed
+	*SessionRuntimeDetails
+	SpeedResolution          *speedpkg.Resolution
+	RuntimeStatus            SessionRuntimeStatus
+	RuntimeTransition        SessionRuntimeTransition
+	RuntimeFailure           string
+	RuntimeGeneration        int64
+	SelectedRuntime          *SessionRuntimeSelection
+	RuntimeSelectionRevision int64
+	WorkspaceID              string
+	WorktreeID               string
+
+	SessionType            string
+	Lineage                *SessionLineage
+	State                  string
+	ACPSessionID           *string
+	StopReason             StopReason
+	StopEscalated          bool
+	StopVerificationFailed bool
+	StopDetail             string
+	Failure                *SessionFailure
+	Liveness               *SessionLivenessMeta
+	SoulSnapshotID         string
+	SoulDigest             string
+	ParentSoulDigest       string
+
+	*SessionAttachState
+	TranscriptEpoch int64
+	Attention       *SessionAttention
+	ArchivedAt      *time.Time
+	CreatedAt       time.Time
+	UpdatedAt       time.Time
+}
+
+// SessionArchiveFilter controls whether archived rows participate in a catalog read.
+type SessionArchiveFilter string
+
+const (
+	SessionArchiveExclude SessionArchiveFilter = "exclude"
+	SessionArchiveOnly    SessionArchiveFilter = "only"
+	SessionArchiveInclude SessionArchiveFilter = "include"
+)
+
+// Validate reports whether the archive filter is supported. An empty filter
+// leaves internal catalog reads unfiltered.
+func (f SessionArchiveFilter) Validate() error {
+	switch f {
+	case "", SessionArchiveExclude, SessionArchiveOnly, SessionArchiveInclude:
+		return nil
+	default:
+		return fmt.Errorf("store: unsupported session archive filter %q", f)
+	}
+}
+
+// Validate accepts persisted Global sessions without a workspace and validates their remaining identity.
+func (s *SessionInfo) Validate() error {
+	if err := requireField(s.ID, "session id"); err != nil {
+		return err
+	}
+	if err := requireField(s.ProfileID, "session profile id"); err != nil {
+		return err
+	}
+	if err := requireField(s.AgentName, "session agent name"); err != nil {
+		return err
+	}
+	if err := requireField(s.State, "session state"); err != nil {
+		return err
+	}
+	if err := ValidateSessionLineage(s.ID, s.Lineage); err != nil {
+		return err
+	}
+	if err := ValidateSessionLineageForType(s.SessionType, s.Lineage); err != nil {
+		return err
+	}
+	if err := validateSessionStopReason(s.StopReason); err != nil {
+		return err
+	}
+	if err := validateSessionRuntime(s.RuntimeStatus, s.RuntimeTransition, s.RuntimeFailure); err != nil {
+		return err
+	}
+	if err := validateSessionRuntimeRecovery(
+		s.RuntimeStatus,
+		s.RuntimeGeneration,
+		s.RuntimeRecoveryValue(),
+	); err != nil {
+		return err
+	}
+	if err := validateSessionSpeedMetadata(s.Speed, s.SpeedResolution); err != nil {
+		return err
+	}
+	if err := ValidateSessionACPOptionSelections(s.ACPOptionsValue()); err != nil {
+		return fmt.Errorf("store: validate session ACP options: %w", err)
+	}
+	if err := ValidateSessionRuntimeSelection(s.SelectedRuntime, s.RuntimeSelectionRevision); err != nil {
+		return err
+	}
+	if err := s.Liveness.Validate(); err != nil {
+		return err
+	}
+	if err := validateSessionSoulProvenance(s.SoulSnapshotID, s.SoulDigest); err != nil {
+		return err
+	}
+	if s.Failure != nil {
+		if err := s.Failure.Validate(); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// SessionListQuery filters session index queries through one explicit profile or
+// the AllProfiles aggregate.
+type SessionListQuery struct {
+	Subagents       string
+	ReadScope       ReadScope
+	ID              string
+	State           string
+	AgentName       string
+	WorkspaceID     string
+	WorktreeID      string
+	SessionType     string
+	ParentSessionID string
+	RootSessionID   string
+	SpawnRole       string
+	LineageKind     LineageKind
+	Resumable       bool
+	Archive         SessionArchiveFilter
+	Sort            string
+	Limit           int
+}
+
+// SessionTranscriptEpochUpdate advances a session transcript epoch after destructive transcript resets.
+type SessionTranscriptEpochUpdate struct {
+	SessionID string
+	Minimum   int64
+}
+
+// Validate ensures the epoch update targets a known session and positive epoch.
+func (u SessionTranscriptEpochUpdate) Validate() error {
+	if err := requireField(u.SessionID, "session id"); err != nil {
+		return err
+	}
+	if u.Minimum <= 0 {
+		return fmt.Errorf("store: transcript epoch minimum must be positive")
+	}
+	return nil
+}
+
+// Validate rejects an implicit profile lens before checking query bounds.
+func (q SessionListQuery) Validate() error {
+	switch q.Subagents {
+	case "", "include", "exclude", "only":
+	default:
+		return fmt.Errorf("store: unsupported subagents filter %q", q.Subagents)
+	}
+	if err := q.ReadScope.Validate(); err != nil {
+		return err
+	}
+	if err := requirePositiveLimit(q.Limit, "session limit"); err != nil {
+		return err
+	}
+	if !q.LineageKind.Valid() {
+		return fmt.Errorf("store: unsupported session lineage kind filter %q", q.LineageKind)
+	}
+	return q.Archive.Validate()
+}
+
+// SessionAttachRequest identifies one explicit attach lock acquisition.
+type SessionAttachRequest struct {
+	SessionID  string
+	AttachedTo string
+	Now        time.Time
+	TTL        time.Duration
+}
+
+// Normalize trims the attach request and applies UTC timestamps.
+func (r SessionAttachRequest) Normalize() SessionAttachRequest {
+	r.SessionID = strings.TrimSpace(r.SessionID)
+	r.AttachedTo = strings.TrimSpace(r.AttachedTo)
+	if !r.Now.IsZero() {
+		r.Now = r.Now.UTC()
+	}
+	return r
+}
+
+// Validate ensures the attach request carries the fields needed for a CAS lock.
+func (r SessionAttachRequest) Validate() error {
+	normalized := r.Normalize()
+	if err := requireField(normalized.SessionID, "session attach session id"); err != nil {
+		return err
+	}
+	if err := requireField(normalized.AttachedTo, "session attach holder"); err != nil {
+		return err
+	}
+	if normalized.TTL <= 0 {
+		return fmt.Errorf("store: session attach ttl must be positive")
+	}
+	return nil
+}
+
+// SessionAttach records one acquired attach lock.
+type SessionAttach struct {
+	SessionID       string
+	AttachedTo      string
+	AttachExpiresAt time.Time
+	AttachedAt      time.Time
+}
+
+// SessionStateUpdate updates only the stateful fields of an indexed session.
+type SessionStateUpdate struct {
+	ID                       string
+	State                    string
+	ACPSessionID             *string
+	RuntimeSet               bool
+	Provider                 string
+	Model                    string
+	ReasoningEffort          string
+	Speed                    speedpkg.Speed
+	ACPOptions               []SessionACPOptionSelection
+	SpeedResolution          *speedpkg.Resolution
+	RuntimeStatus            SessionRuntimeStatus
+	RuntimeTransition        SessionRuntimeTransition
+	RuntimeFailure           string
+	RuntimeGeneration        int64
+	RuntimeRecovery          *SessionRuntimeRecovery
+	SelectedRuntimeSet       bool
+	SelectedRuntime          *SessionRuntimeSelection
+	RuntimeSelectionRevision int64
+	StopReasonSet            bool
+	StopReason               *string
+	StopEscalated            bool
+	StopVerificationFailed   bool
+	StopDetail               string
+	FailureSet               bool
+	Failure                  *SessionFailure
+	AttentionTransition      bool
+	Liveness                 *SessionLivenessMeta
+
+	UpdatedAt time.Time
+}
+
+// SessionSoulSnapshotUpdate updates the Soul provenance attached to a session.
+type SessionSoulSnapshotUpdate struct {
+	ID               string
+	SoulSnapshotID   string
+	SoulDigest       string
+	ParentSoulDigest string
+	UpdatedAt        time.Time
+}
+
+// Validate ensures session Soul provenance is internally consistent.
+func (u SessionSoulSnapshotUpdate) Validate() error {
+	if err := requireField(u.ID, "session soul update id"); err != nil {
+		return err
+	}
+	return validateSessionSoulProvenance(u.SoulSnapshotID, u.SoulDigest)
+}
+
+// Validate ensures the update contains the required fields.
+func (u SessionStateUpdate) Validate() error {
+	if err := requireField(u.ID, "session update id"); err != nil {
+		return err
+	}
+	if err := requireField(u.State, "session update state"); err != nil {
+		return err
+	}
+	if err := u.Liveness.Validate(); err != nil {
+		return err
+	}
+	if u.RuntimeSet {
+		if err := validateSessionRuntime(u.RuntimeStatus, u.RuntimeTransition, u.RuntimeFailure); err != nil {
+			return err
+		}
+		if err := validateSessionRuntimeRecovery(u.RuntimeStatus, u.RuntimeGeneration, u.RuntimeRecovery); err != nil {
+			return err
+		}
+		if err := validateSessionSpeedMetadata(u.Speed, u.SpeedResolution); err != nil {
+			return err
+		}
+		if err := ValidateSessionACPOptionSelections(u.ACPOptions); err != nil {
+			return fmt.Errorf("store: validate session ACP options: %w", err)
+		}
+	}
+	if u.SelectedRuntimeSet {
+		if err := ValidateSessionRuntimeSelection(u.SelectedRuntime, u.RuntimeSelectionRevision); err != nil {
+			return err
+		}
+	}
+	if u.StopReasonSet && u.StopReason != nil {
+		if err := validateSessionStopReason(StopReason(strings.TrimSpace(*u.StopReason))); err != nil {
+			return err
+		}
+	}
+	if u.Failure != nil {
+		if err := u.Failure.Validate(); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func validateSessionSoulProvenance(snapshotID string, digest string) error {
+	hasSnapshotID := strings.TrimSpace(snapshotID) != ""
+	hasDigest := strings.TrimSpace(digest) != ""
+	if hasSnapshotID && !hasDigest {
+		return errors.New("store: session soul digest is required when soul snapshot id is set")
+	}
+	return nil
+}
+
+func validateSessionStopReason(reason StopReason) error {
+	if reason == "" {
+		return nil
+	}
+	if !ValidStopReason(reason) {
+		return fmt.Errorf("store: invalid session stop reason %q", reason)
+	}
+	return nil
+}
+
+// EventSummary is the global, cross-session observability record for one event.
+
+// AttachedToValue returns the optional attach owner without exposing nil embedding details.
+func (s *SessionInfo) AttachedToValue() string {
+	if s.SessionAttachState == nil {
+		return ""
+	}
+	return s.AttachedTo
+}
+
+// AttachExpiresAtValue returns the optional attach expiry without exposing nil embedding details.
+func (s *SessionInfo) AttachExpiresAtValue() *time.Time {
+	if s.SessionAttachState == nil {
+		return nil
+	}
+	return s.AttachExpiresAt
+}
+
+// SetAttach updates the optional attach binding with value semantics.
+func (s *SessionInfo) SetAttach(attachedTo string, expiresAt *time.Time) {
+	if attachedTo == "" && expiresAt == nil {
+		s.SessionAttachState = nil
+		return
+	}
+	s.SessionAttachState = &SessionAttachState{AttachedTo: attachedTo, AttachExpiresAt: expiresAt}
+}

@@ -1,0 +1,327 @@
+package core
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"net/http"
+	"strings"
+	"time"
+
+	"github.com/compozy/compozy/internal/api/contract"
+	compozyconfig "github.com/compozy/compozy/internal/config"
+	"github.com/compozy/compozy/internal/diagnostics"
+	"github.com/compozy/compozy/internal/doctor"
+	"github.com/compozy/compozy/internal/session"
+	settingspkg "github.com/compozy/compozy/internal/settings"
+	"github.com/gin-gonic/gin"
+)
+
+const (
+	statusApplyStateCurrent        = "current"
+	statusApplyStatePendingRestart = "pending_restart"
+	statusApplyStateUnavailable    = "unavailable"
+	statusStateAvailable           = "available"
+	statusStateConfigured          = "configured"
+	statusStateDegraded            = "degraded"
+	statusStateOK                  = "ok"
+	statusStateRunning             = "running"
+	statusStateUnavailable         = "unavailable"
+	statusStateWarn                = "warn"
+	statusStateError               = "error"
+)
+
+type pendingConfigRestartReader interface {
+	HasPendingConfigRestart(ctx context.Context) (bool, error)
+}
+
+// GetDoctor returns the hard-cut diagnostic probe payload shared by HTTP and UDS.
+func (h *BaseHandlers) GetDoctor(c *gin.Context) {
+	opts := doctor.RunOptions{
+		Only:    splitStatusFilter(c.QueryArray("only"), c.Query("only")),
+		Exclude: splitStatusFilter(c.QueryArray("exclude"), c.Query("exclude")),
+		Quiet:   strings.EqualFold(strings.TrimSpace(c.Query("quiet")), "true"),
+		Env: doctor.ProbeEnv{
+			Now: h.nowUTC,
+		},
+	}
+	payload, err := h.doctorPayload(c.Request.Context(), opts)
+	if err != nil {
+		h.respondError(c, http.StatusInternalServerError, err)
+		return
+	}
+	c.JSON(http.StatusOK, payload)
+}
+
+func (h *BaseHandlers) statusPayload(
+	ctx context.Context,
+	workspaceID string,
+) (contract.StatusPayload, error) {
+	return h.statusPayloadWithAggregate(ctx, workspaceID, h.sessionAggregate)
+}
+
+// Doctor can share its session snapshot without sharing probe error handling.
+func (h *BaseHandlers) statusPayloadWithAggregate(
+	ctx context.Context,
+	workspaceID string,
+	aggregate func(context.Context) (contract.SessionAggregatePayload, error),
+) (contract.StatusPayload, error) {
+	if err := h.validateStatusDependencies(ctx); err != nil {
+		return contract.StatusPayload{}, err
+	}
+
+	health, err := h.Observer.Health(ctx)
+	if err != nil {
+		return contract.StatusPayload{}, fmt.Errorf("api: collect observer health: %w", err)
+	}
+	sessionSummary, err := aggregate(ctx)
+	if err != nil {
+		return contract.StatusPayload{}, err
+	}
+	automationHealth, err := h.automationHealth(ctx)
+	if err != nil {
+		return contract.StatusPayload{}, fmt.Errorf("api: collect automation health: %w", err)
+	}
+	gatewayStatus, err := h.runtimeGatewayStatusPayload(ctx)
+	if err != nil {
+		return contract.StatusPayload{}, fmt.Errorf("api: collect gateway status: %w", err)
+	}
+	schemaStreams, err := h.schemaStreamStatusPayloads(ctx)
+	if err != nil {
+		return contract.StatusPayload{}, fmt.Errorf("api: collect schema stream status: %w", err)
+	}
+	providers, err := h.providerStatusPayloads(ctx)
+	if err != nil {
+		return contract.StatusPayload{}, fmt.Errorf("api: collect provider status: %w", err)
+	}
+	mcpServers, err := h.mcpServerStatusPayloads(ctx, workspaceID)
+	if err != nil {
+		return contract.StatusPayload{}, fmt.Errorf("api: collect MCP server status: %w", err)
+	}
+	skillStatus, err := h.skillRuntimeStatusPayload(ctx, workspaceID)
+	if err != nil {
+		return contract.StatusPayload{}, fmt.Errorf("api: collect skill runtime status: %w", err)
+	}
+	configStatus, err := h.configRuntimeStatusPayload(ctx, workspaceID)
+	if err != nil {
+		return contract.StatusPayload{}, fmt.Errorf("api: collect config status: %w", err)
+	}
+
+	return contract.StatusPayload{
+		SchemaVersion: contract.StatusSchemaVersion,
+		GeneratedAt:   h.nowUTC(),
+		Daemon: h.daemonStatusPayload(
+			&health,
+			sessionSummary.Total,
+			gatewayStatus,
+			schemaStreams,
+		),
+		Sessions:         sessionSummary,
+		SubprocessHealth: h.subprocessHealthAggregate(workspaceID),
+		Health:           ObserveHealthPayloadFromHealth(&health),
+		Automation:       automationHealth,
+		Tasks:            TaskHealthPayloadFromObserve(health.Tasks),
+		Providers:        providers,
+		MCPServers:       mcpServers,
+		Skills:           skillStatus,
+		Config:           configStatus,
+		LogTail:          h.logTailStatusPayload(ctx),
+	}, nil
+}
+
+func (h *BaseHandlers) validateStatusDependencies(ctx context.Context) error {
+	if ctx == nil {
+		return errors.New("api: status context is required")
+	}
+	if h.Observer == nil {
+		return errors.New("api: observer is required for status")
+	}
+	if h.Sessions == nil {
+		return errors.New("api: session manager is required for status")
+	}
+	return nil
+}
+
+func (h *BaseHandlers) runtimeGatewayStatusPayload(ctx context.Context) (*contract.GatewayStatusPayload, error) {
+	if h.Gateway == nil {
+		return nil, nil
+	}
+	payload, err := h.GatewayStatus(ctx)
+	if err != nil {
+		return nil, err
+	}
+	return &payload, nil
+}
+
+func (h *BaseHandlers) sessionAggregate(ctx context.Context) (contract.SessionAggregatePayload, error) {
+	infos, err := h.Sessions.ListAll(ctx)
+	if err != nil {
+		return contract.SessionAggregatePayload{}, fmt.Errorf("api: list sessions for status: %w", err)
+	}
+	return aggregateSessionInfos(infos), nil
+}
+
+// Both status and doctor aggregate the same immutable session snapshot.
+func aggregateSessionInfos(infos []*session.Info) contract.SessionAggregatePayload {
+	byStatus := make(map[string]int)
+	byBadge := make(map[string]int)
+	active := 0
+	for _, info := range infos {
+		if info == nil {
+			continue
+		}
+		state := strings.TrimSpace(string(info.State))
+		if state == "" {
+			state = unknownValue
+		}
+		byStatus[state]++
+		badge := string(session.BadgeForInfo(info))
+		if badge == "" {
+			badge = string(session.BadgeUnknown)
+		}
+		byBadge[badge]++
+		if info.State == session.StateActive {
+			active++
+		}
+	}
+	return contract.SessionAggregatePayload{
+		Active:   active,
+		Total:    len(infos),
+		ByStatus: byStatus,
+		ByBadge:  byBadge,
+	}
+}
+
+func (h *BaseHandlers) providerStatusPayloads(ctx context.Context) ([]contract.ProviderStatusPayload, error) {
+	response, err := h.providerListResponse(ctx)
+	if err != nil {
+		return nil, err
+	}
+	payloads := make([]contract.ProviderStatusPayload, 0, len(response.Providers))
+	for _, provider := range response.Providers {
+		status := provider.AuthStatus
+		var lastProbeAt *time.Time
+		if status.LastProbeAt != nil && !status.LastProbeAt.IsZero() {
+			timestamp := status.LastProbeAt.UTC()
+			lastProbeAt = &timestamp
+		}
+		payloads = append(payloads, contract.ProviderStatusPayload{
+			Name:          strings.TrimSpace(provider.Name),
+			DisplayName:   strings.TrimSpace(provider.DisplayName),
+			Default:       provider.Default,
+			Mode:          strings.TrimSpace(status.Mode),
+			EnvPolicy:     strings.TrimSpace(status.EnvPolicy),
+			HomePolicy:    strings.TrimSpace(status.HomePolicy),
+			State:         strings.TrimSpace(status.State),
+			Code:          strings.TrimSpace(status.Code),
+			Message:       diagnostics.RedactAndBound(status.Message, maxDiagnosticPayloadBytes),
+			StatusCommand: diagnostics.RedactAndBound(status.StatusCmd, maxDiagnosticPayloadBytes),
+			Login:         status.Login,
+			LastProbeAt:   lastProbeAt,
+		})
+	}
+	return payloads, nil
+}
+
+func (h *BaseHandlers) configRuntimeStatusPayload(
+	ctx context.Context,
+	workspaceID string,
+) (contract.ConfigRuntimeStatusPayload, error) {
+	cfg := h.Config
+	payload := contract.ConfigRuntimeStatusPayload{
+		Status:          statusStateOK,
+		Validated:       true,
+		HomeDir:         strings.TrimSpace(h.HomePaths.HomeDir),
+		ConfigFile:      strings.TrimSpace(h.HomePaths.ConfigFile),
+		RestartRequired: false,
+		ApplyState:      statusApplyStateCurrent,
+	}
+	profileDiagnostics, err := h.profileLayerDiagnostics(ctx, workspaceID)
+	if err != nil {
+		return contract.ConfigRuntimeStatusPayload{}, err
+	}
+	payload.Diagnostics = profileDiagnostics
+	if err := cfg.Validate(); err != nil {
+		payload.Status = statusStateError
+		payload.Validated = false
+		payload.ValidationError = diagnostics.RedactAndBound(err.Error(), maxDiagnosticPayloadBytes)
+		return payload, nil
+	}
+	reader, ok := h.Settings.(pendingConfigRestartReader)
+	if !ok {
+		return payload, nil
+	}
+	pendingRestart, err := reader.HasPendingConfigRestart(ctx)
+	if err != nil {
+		payload.Status = statusStateError
+		payload.ApplyState = statusApplyStateUnavailable
+		return payload, nil
+	}
+	if pendingRestart {
+		payload.Status = statusStateWarn
+		payload.RestartRequired = true
+		payload.ApplyState = statusApplyStatePendingRestart
+	}
+	return payload, nil
+}
+
+func (h *BaseHandlers) profileLayerDiagnostics(
+	ctx context.Context,
+	workspaceID string,
+) ([]contract.ConfigLayerDiagnosticPayload, error) {
+	if h.Profiles == nil {
+		return nil, nil
+	}
+	profileNames, err := h.Profiles.ListNames(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("list profile names for config diagnostics: %w", err)
+	}
+	workspaceRoot := ""
+	if trimmedID := strings.TrimSpace(workspaceID); trimmedID != "" && h.Workspaces != nil {
+		workspace, getErr := h.Workspaces.Get(ctx, trimmedID)
+		if getErr != nil {
+			return nil, fmt.Errorf("resolve workspace for config diagnostics: %w", getErr)
+		}
+		workspaceRoot = workspace.RootDir
+	}
+	items, err := compozyconfig.InspectProfileLayerFiles(h.HomePaths, workspaceRoot, profileNames)
+	if err != nil {
+		return nil, err
+	}
+	payloads := make([]contract.ConfigLayerDiagnosticPayload, 0, len(items))
+	for _, item := range items {
+		payloads = append(payloads, contract.ConfigLayerDiagnosticPayload{
+			Code: item.Code, Layer: item.Layer, Profile: item.Profile, Path: item.Path, Message: item.Message,
+		})
+	}
+	return payloads, nil
+}
+
+func (h *BaseHandlers) logTailStatusPayload(ctx context.Context) contract.LogTailStatusPayload {
+	if h.Settings == nil {
+		return contract.LogTailStatusPayload{
+			Available: false,
+			Status:    statusStateUnavailable,
+		}
+	}
+	envelope, err := h.Settings.GetSection(ctx, settingspkg.SectionRequest{
+		Section: settingspkg.SectionObservability,
+		Scope:   settingspkg.ScopeUser,
+	})
+	if err != nil || envelope.Observability == nil {
+		return contract.LogTailStatusPayload{
+			Available: false,
+			Status:    "unavailable",
+		}
+	}
+	if envelope.Observability.LogTailSupport.Available {
+		return contract.LogTailStatusPayload{
+			Available: true,
+			Status:    statusStateAvailable,
+		}
+	}
+	return contract.LogTailStatusPayload{
+		Available: false,
+		Status:    "disabled",
+	}
+}

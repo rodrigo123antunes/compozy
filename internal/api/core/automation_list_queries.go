@@ -1,0 +1,130 @@
+package core
+
+import (
+	"strings"
+
+	"github.com/compozy/compozy/internal/workspaceaccess"
+
+	automationpkg "github.com/compozy/compozy/internal/automation"
+	"github.com/compozy/compozy/internal/store"
+	"github.com/gin-gonic/gin"
+)
+
+// ParseAutomationJobListQuery parses the shared automation job list filters.
+func ParseAutomationJobListQuery(
+	c *gin.Context,
+	readScope store.ReadScope,
+	workspaces ...WorkspaceGetter,
+) (automationpkg.JobListQuery, error) {
+	limit, err := ParseOptionalInt(c.Query("limit"))
+	if err != nil {
+		return automationpkg.JobListQuery{}, err
+	}
+	enabled, err := parseOptionalBoolPointer(c.Query("enabled"))
+	if err != nil {
+		return automationpkg.JobListQuery{}, err
+	}
+
+	breadth, err := parseWorkspaceBreadth(
+		c, "", breadthEncoding{Selector: workspaceIDKey, OmissionIsAll: true}, workspaces...,
+	)
+	if err != nil {
+		return automationpkg.JobListQuery{}, err
+	}
+	query := automationpkg.JobListQuery{
+		WorkspaceIDs: breadth.WorkspaceIDs,
+		ReadScope:    readScope,
+		// The breadth carries the selector with a migrated legacy alias already resolved.
+		WorkspaceID: breadth.WorkspaceID,
+		LoopName:    strings.TrimSpace(c.Query("loop")),
+		Target:      strings.TrimSpace(c.Query("target")),
+		Enabled:     enabled,
+		Search:      strings.TrimSpace(c.Query("q")),
+		Cursor:      strings.TrimSpace(c.Query("cursor")),
+		Limit:       limit,
+	}
+	if query.WorkspaceID == workspaceaccess.UserSelector {
+		query.WorkspaceID = ""
+		query.WorkspaceIDs = []string{workspaceaccess.UserSelector}
+		query.Scope = automationpkg.AutomationScopeGlobal
+	}
+	if query.Limit == 0 {
+		query.Limit = automationpkg.DefaultListLimit
+	}
+	if rawScope := strings.TrimSpace(c.Query("scope")); rawScope != "" {
+		query.Scope = automationpkg.Scope(rawScope).Normalize()
+		if err := query.Scope.Validate("scope"); err != nil {
+			return automationpkg.JobListQuery{}, err
+		}
+	}
+	if rawSource := strings.TrimSpace(c.Query("source")); rawSource != "" {
+		query.Source = automationpkg.JobSource(rawSource)
+		if err := query.Source.Validate("source"); err != nil {
+			return automationpkg.JobListQuery{}, err
+		}
+	}
+	if err := automationpkg.ValidateJobListQuery(query); err != nil {
+		return automationpkg.JobListQuery{}, err
+	}
+	return query, nil
+}
+
+// ParseAutomationTriggerListQuery parses the shared automation trigger list filters.
+func ParseAutomationTriggerListQuery(
+	c *gin.Context,
+	readScope store.ReadScope,
+	workspaces ...WorkspaceGetter,
+) (automationpkg.TriggerListQuery, error) {
+	limit, err := ParseOptionalInt(c.Query("limit"))
+	if err != nil {
+		return automationpkg.TriggerListQuery{}, err
+	}
+	enabled, err := parseOptionalBoolPointer(c.Query("enabled"))
+	if err != nil {
+		return automationpkg.TriggerListQuery{}, err
+	}
+
+	breadth, err := parseWorkspaceBreadth(
+		c, "", breadthEncoding{Selector: workspaceIDKey, OmissionIsAll: true}, workspaces...,
+	)
+	if err != nil {
+		return automationpkg.TriggerListQuery{}, err
+	}
+	query := automationpkg.TriggerListQuery{
+		WorkspaceIDs: breadth.WorkspaceIDs,
+		ReadScope:    readScope,
+		// The breadth carries the selector with a migrated legacy alias already resolved.
+		WorkspaceID: breadth.WorkspaceID,
+		Event:       strings.TrimSpace(c.Query("event")),
+		LoopName:    strings.TrimSpace(c.Query("loop")),
+		Target:      strings.TrimSpace(c.Query("target")),
+		Enabled:     enabled,
+		Search:      strings.TrimSpace(c.Query("q")),
+		Cursor:      strings.TrimSpace(c.Query("cursor")),
+		Limit:       limit,
+	}
+	if query.WorkspaceID == workspaceaccess.UserSelector {
+		query.WorkspaceID = ""
+		query.WorkspaceIDs = []string{workspaceaccess.UserSelector}
+		query.Scope = automationpkg.AutomationScopeGlobal
+	}
+	if query.Limit == 0 {
+		query.Limit = automationpkg.DefaultListLimit
+	}
+	if rawScope := strings.TrimSpace(c.Query("scope")); rawScope != "" {
+		query.Scope = automationpkg.Scope(rawScope).Normalize()
+		if err := query.Scope.Validate("scope"); err != nil {
+			return automationpkg.TriggerListQuery{}, err
+		}
+	}
+	if rawSource := strings.TrimSpace(c.Query("source")); rawSource != "" {
+		query.Source = automationpkg.JobSource(rawSource)
+		if err := query.Source.Validate("source"); err != nil {
+			return automationpkg.TriggerListQuery{}, err
+		}
+	}
+	if err := automationpkg.ValidateTriggerListQuery(query); err != nil {
+		return automationpkg.TriggerListQuery{}, err
+	}
+	return query, nil
+}

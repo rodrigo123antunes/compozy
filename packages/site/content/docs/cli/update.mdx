@@ -1,0 +1,53 @@
+---
+title: "compozy update"
+description: "Check for and apply CompozyOS runtime and app updates"
+---
+
+## compozy update
+
+Check for and apply CompozyOS runtime and app updates
+
+```
+compozy update [flags]
+```
+
+### Examples
+
+```
+compozy update
+  compozy update --check
+  compozy update --cancel
+  compozy update -o json
+```
+
+### Options
+
+```
+      --cancel   Cancel a dormant update operation
+      --check    Check without applying updates
+  -h, --help     help for update
+```
+
+### Options inherited from parent commands
+
+```
+      --json            Emit JSON output
+  -o, --output string   Output format: human, json, jsonl, or toon (default "human")
+```
+
+## Output Formats
+
+The root `-o, --output` flag accepts these values. A renderer is supported only when this command writes that result; `jsonl` is for commands that emit one JSON record per line.
+
+| Format  | Command result                          |
+| ------- | --------------------------------------- |
+| `human` | Interactive terminal rendering          |
+| `json`  | Machine-readable JSON rendering         |
+| `jsonl` | One JSON record per line when supported |
+| `toon`  | Compact agent-readable rendering        |
+
+Example:
+
+```bash
+compozy update -o json
+```

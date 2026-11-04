@@ -1,0 +1,190 @@
+package settings
+
+import (
+	"cmp"
+	"context"
+
+	"fmt"
+
+	"slices"
+
+	compozyconfig "github.com/compozy/compozy/internal/config"
+
+	skillspkg "github.com/compozy/compozy/internal/skills"
+	workspacepkg "github.com/compozy/compozy/internal/workspace"
+)
+
+func (s *service) buildSkillsSection(
+	ctx context.Context,
+	cfg *compozyconfig.Config,
+	resolved *workspacepkg.ResolvedWorkspace,
+	scope ScopeKind,
+	profileName string,
+	agentName string,
+) (SkillsSection, error) {
+	section := SkillsSection{
+		Config: cfg.Skills,
+		Links:  buildSkillsOperationalLinks(),
+	}
+
+	if scope == ScopeAgent {
+		agent, _, err := s.resolveEffectiveAgent(resolved, agentName)
+		if err != nil {
+			return SkillsSection{}, err
+		}
+		section.Config.DisabledSkills = append([]string(nil), agent.Skills.Disabled...)
+	}
+
+	if s.skillsRuntime == nil {
+		section.DisabledCount = len(section.Config.DisabledSkills)
+		var sourceErr error
+		section.Sources, section.Inherits, sourceErr = s.buildSkillSourceReadModel(
+			section.Config, resolved, scope, nil, false,
+		)
+		if sourceErr != nil {
+			return SkillsSection{}, sourceErr
+		}
+		return section, nil
+	}
+	projection, err := s.skillProjectionWorkspace(ctx, cfg, resolved, scope, profileName)
+	if err != nil {
+		return SkillsSection{}, err
+	}
+
+	skills, err := s.loadSkillsForSection(ctx, projection, scope, agentName)
+	if err != nil {
+		return SkillsSection{}, mapSkillsSettingsError(err)
+	}
+	section.RuntimeAvailable = true
+	section.DiscoveredCount = len(skills)
+	for _, skill := range skills {
+		if skill != nil && !skill.Enabled {
+			section.DisabledCount++
+		}
+	}
+	if diagnosticsRuntime, ok := s.skillsRuntime.(SkillsDiagnosticsRuntime); ok {
+		diagnostics, diagnosticsErr := diagnosticsRuntime.SkillDiagnostics(ctx, projection, agentName)
+		if diagnosticsErr != nil {
+			return SkillsSection{}, mapSkillsSettingsError(diagnosticsErr)
+		}
+		section.Diagnostics = diagnostics
+	}
+	var statuses []skillspkg.SkillSourceRootStatus
+	if sourcesRuntime, ok := s.skillsRuntime.(SkillsSourcesRuntime); ok {
+		statuses, err = sourcesRuntime.SkillSourceRoots(ctx, projection)
+		if err != nil {
+			return SkillsSection{}, mapSkillsSettingsError(err)
+		}
+	}
+	section.Sources, section.Inherits, err = s.buildSkillSourceReadModel(
+		section.Config, projection, scope, statuses, true,
+	)
+	if err != nil {
+		return SkillsSection{}, err
+	}
+
+	return section, nil
+}
+
+func (s *service) loadSkillsForSection(
+	ctx context.Context,
+	projection *workspacepkg.ResolvedWorkspace,
+	scope ScopeKind,
+	agentName string,
+) ([]*skillspkg.Skill, error) {
+	if scope == ScopeAgent {
+		return s.skillsRuntime.ForAgent(ctx, projection, agentName)
+	}
+	if projection != nil {
+		if runtime, ok := s.skillsRuntime.(SkillsWorkspaceRuntime); ok {
+			return runtime.ForWorkspace(ctx, projection)
+		}
+	}
+	return s.skillsRuntime.List(), nil
+}
+
+func (s *service) buildAutomationSection(
+	ctx context.Context,
+	cfg *compozyconfig.Config,
+) (AutomationSection, error) {
+	runtime := AutomationRuntimeStatus{}
+	if s.automationRuntime != nil {
+		status, err := s.automationRuntime.AutomationRuntimeStatus(ctx)
+		if err != nil {
+			return AutomationSection{}, fmt.Errorf("settings: automation runtime: %w", err)
+		}
+		runtime = status
+	}
+
+	runtime.HostTimezone = compozyconfig.HostTimezone()
+	return AutomationSection{
+		Config: AutomationSettings{
+			Enabled:           cfg.Automation.Enabled,
+			Timezone:          cfg.Automation.Timezone,
+			MaxConcurrentJobs: cfg.Automation.MaxConcurrentJobs,
+			DefaultFireLimit:  cfg.Automation.DefaultFireLimit,
+		},
+		Runtime: runtime,
+		Links: []OperationalLink{
+			{Label: string(SectionAutomation), Path: "/automation"},
+		},
+	}, nil
+}
+
+func (s *service) buildObservabilitySection(
+	ctx context.Context,
+	cfg *compozyconfig.Config,
+) (ObservabilitySection, error) {
+	runtime := ObservabilityRuntimeStatus{}
+	if s.observabilityRuntime != nil {
+		status, err := s.observabilityRuntime.ObservabilityRuntimeStatus(ctx)
+		if err != nil {
+			return ObservabilitySection{}, fmt.Errorf("settings: observability runtime: %w", err)
+		}
+		runtime = status
+	}
+
+	return ObservabilitySection{
+		Config:         cfg.Observability,
+		Runtime:        runtime,
+		LogTailSupport: CapabilityStatus{Available: s.logTailAvailable},
+	}, nil
+}
+
+func (s *service) buildHooksExtensionsSection(
+	ctx context.Context,
+	cfg *compozyconfig.Config,
+) (HooksExtensionsSection, error) {
+	hooks, err := s.buildHookItems(ScopeUser, "", "", "")
+	if err != nil {
+		return HooksExtensionsSection{}, err
+	}
+
+	installed := []InstalledExtension{}
+	if s.extensions != nil {
+		values, err := s.extensions.InstalledExtensions(ctx)
+		if err != nil {
+			return HooksExtensionsSection{}, fmt.Errorf("settings: installed extensions: %w", err)
+		}
+		installed = append(installed, values...)
+		slices.SortFunc(installed, func(left, right InstalledExtension) int {
+			return cmp.Compare(left.Name, right.Name)
+		})
+	}
+
+	parity := TransportParityStatus{}
+	if s.transportParity != nil {
+		status, err := s.transportParity.TransportParityStatus(ctx)
+		if err != nil {
+			return HooksExtensionsSection{}, fmt.Errorf("settings: transport parity status: %w", err)
+		}
+		parity = status
+	}
+
+	return HooksExtensionsSection{
+		Hooks:           hooks,
+		Extensions:      cloneExtensionsConfig(cfg.Extensions),
+		Installed:       installed,
+		TransportParity: parity,
+	}, nil
+}

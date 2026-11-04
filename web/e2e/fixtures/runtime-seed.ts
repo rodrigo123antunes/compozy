@@ -1,0 +1,1526 @@
+import { execFile } from "node:child_process";
+import { createHash } from "node:crypto";
+import {
+  chmod,
+  copyFile,
+  mkdir,
+  mkdtemp,
+  readdir,
+  readFile,
+  rm,
+  stat,
+  symlink,
+  writeFile,
+} from "node:fs/promises";
+import os from "node:os";
+import path from "node:path";
+import process from "node:process";
+import {} from "node:url";
+import { promisify } from "node:util";
+
+import type {
+  AutomationJob,
+  AutomationRun,
+  AutomationTrigger,
+  CreateAutomationJobRequest,
+  CreateAutomationTriggerRequest,
+} from "@/systems/automation";
+import type {
+  SettingsHookRequest,
+  SettingsMCPServerRequest,
+  SettingsMCPServerTarget,
+  SettingsMutationResult,
+  SettingsProviderRequest,
+  SettingsSkillsSection,
+} from "@/systems/settings";
+import type {
+  TaskDashboardView,
+  TaskInboxView,
+  TaskRecord,
+  TaskRun,
+  TaskRunDetailView,
+} from "@/systems/tasks";
+import type { BrowserExtensionRegistrySeed } from "./extension-registry-server";
+import type { TaskCatalogSemanticItem } from "./scenario-contracts";
+
+const execFileAsync = promisify(execFile);
+const MOCK_AGENT_PROVIDER_NAME = "acpmock";
+
+export interface WorkspacePayload {
+  id: string;
+  root_dir: string;
+  name: string;
+}
+
+interface SeededSessionPayload {
+  id: string;
+  agent_name: string;
+  workspace_id: string;
+  state: string;
+  name?: string | null;
+  failure?: {
+    kind: string;
+    summary?: string | null;
+  } | null;
+}
+
+interface BrowserMockAgentSeed {
+  runtimeProvider?: string;
+  runtimeCommandName?: "claude-agent-acp";
+  fixturePath: string;
+  fixtureAgent?: string;
+  agentName?: string;
+  category_path?: string[];
+}
+
+interface BrowserWorkspaceSeed {
+  rootDir: string;
+}
+
+interface BrowserSessionSeed {
+  agentName: string;
+  workspaceRootDir?: string;
+}
+
+export interface BrowserSkillSeed {
+  body: string;
+  description: string;
+  marketplace?: {
+    hashOverride?: string;
+    installedAt?: string;
+    registry?: string;
+    slug: string;
+    version?: string;
+  };
+  metadata?: Record<string, unknown>;
+  name: string;
+  resources?: Record<string, string>;
+  version?: string;
+}
+
+interface BrowserMarketplaceEntrySeed {
+  description: string;
+  entry_id: string;
+  name: string;
+  published_at?: string;
+  updated_at?: string;
+  version?: string;
+}
+
+export interface BrowserMarketplaceExtensionEntrySeed extends BrowserMarketplaceEntrySeed {
+  artifact_url: string;
+  author?: string;
+  digest_release_tag?: string;
+  digest_sha256?: string;
+  /** Curated display marker; install-time detection stays authoritative. */
+  format?: "compozy" | "agent-plugin";
+  install_slug: string;
+  repository?: string;
+  tier: "official" | "community" | "unverified";
+}
+
+export interface BrowserMarketplacePresetSeed {
+  name: string;
+  source: string;
+  description: string;
+  default: "on" | "off";
+}
+
+export interface BrowserMarketplaceCatalogSeed {
+  extensions?: BrowserMarketplaceExtensionEntrySeed[];
+  generatedAt?: string;
+  presets?: BrowserMarketplacePresetSeed[];
+}
+
+export interface BrowserRuntimeSeed {
+  extensionRegistry?: BrowserExtensionRegistrySeed;
+  marketplaceCatalog?: BrowserMarketplaceCatalogSeed;
+  skills?: BrowserSkillSeed[];
+  mockAgents?: BrowserMockAgentSeed[];
+  workspace?: BrowserWorkspaceSeed;
+  session?: BrowserSessionSeed;
+}
+
+export interface BrowserAutomationOperatorFlowSeed {
+  agentName: string;
+  timeoutMs?: number;
+  workspaceId?: string;
+}
+
+export interface BrowserSettingsProviderSeed {
+  name: string;
+  settings: SettingsProviderRequest["settings"];
+}
+
+export interface BrowserSettingsMCPServerSeed {
+  name: string;
+  scope?: "global" | "workspace";
+  server: SettingsMCPServerRequest["server"];
+  target?: SettingsMCPServerTarget;
+  workspaceId?: string;
+  workspaceRootDir?: string;
+}
+
+export interface BrowserSettingsHookSeed {
+  name: string;
+  declaration: SettingsHookRequest["declaration"];
+}
+
+export interface BrowserSettingsFixturesSeed {
+  disabledSkills?: string[];
+  hooks?: BrowserSettingsHookSeed[];
+  mcpServers?: BrowserSettingsMCPServerSeed[];
+  providers?: BrowserSettingsProviderSeed[];
+  timeoutMs?: number;
+}
+
+export interface BrowserSettingsFixturesResult {
+  createdHookNames: string[];
+  createdMCPServers: Array<{
+    name: string;
+    scope: "global" | "workspace";
+    target: SettingsMCPServerTarget;
+    workspaceId?: string;
+  }>;
+  createdProviderNames: string[];
+  initialDisabledSkills?: string[];
+  workspace?: WorkspacePayload;
+}
+
+type BrowserSettingsSeedRuntime = Pick<
+  BrowserRuntimeSeedClient,
+  "requestJSON" | "requestOperatorJSON"
+> &
+  Partial<Pick<BrowserRuntimeSeedClient, "resolveWorkspace">> & {
+    paths?: {
+      homeDir: string;
+      workspaceDir?: string;
+    };
+    seeded?: BrowserRuntimeSeedResult;
+  };
+
+type BrowserAutomationOperatorSeedRuntime = Pick<BrowserRuntimeSeedClient, "requestJSON"> &
+  Partial<Pick<BrowserRuntimeSeedClient, "resolveWorkspace">> & {
+    paths?: {
+      workspaceDir: string;
+    };
+    seeded?: BrowserRuntimeSeedResult;
+  };
+
+export interface BrowserAutomationOperatorFlowResult {
+  job: AutomationJob;
+  trigger: AutomationTrigger;
+  baselineRun: AutomationRun;
+}
+
+export interface BrowserTasksOperatorFlowSeed {
+  referenceTaskScope?: "global" | "workspace";
+  sessionAgentName: string;
+  timeoutMs?: number;
+  workspaceRootDir?: string;
+}
+
+export interface BrowserTasksOperatorFlowResult {
+  approvalInbox: TaskInboxView;
+  approvalTask: TaskRecord;
+  dashboard: TaskDashboardView;
+  referenceTask: TaskRecord;
+  runningRun: TaskRun;
+  runningRunDetail: TaskRunDetailView;
+  runningTask: TaskRecord;
+  session: SeededSessionPayload;
+  workspace: WorkspacePayload;
+}
+
+export interface BrowserTaskCatalogQuery {
+  includeLoop?: boolean;
+  loopRunId?: string;
+  workspace?: string;
+}
+
+export interface BrowserTaskCatalogResponse {
+  tasks: TaskCatalogSemanticItem[];
+  page: {
+    has_more: boolean;
+    limit: number;
+    next_cursor?: string;
+    total: number;
+  };
+}
+
+export async function readBrowserTaskCatalog(
+  runtime: Pick<BrowserRuntimeSeedClient, "requestJSON">,
+  query: BrowserTaskCatalogQuery = {}
+): Promise<BrowserTaskCatalogResponse> {
+  const params = new URLSearchParams();
+  if (query.includeLoop) {
+    params.set("include_loop", "true");
+  }
+  const loopRunId = query.loopRunId?.trim();
+  if (loopRunId) {
+    params.set("loop_run_id", loopRunId);
+  }
+  const workspace = query.workspace?.trim();
+  if (workspace) {
+    params.set("workspace", workspace);
+  }
+  const suffix = params.size > 0 ? `?${params.toString()}` : "";
+  return await runtime.requestJSON<BrowserTaskCatalogResponse>(`/api/tasks${suffix}`);
+}
+
+export interface BrowserRuntimeSeedResult {
+  workspace?: WorkspacePayload;
+  session?: SeededSessionPayload;
+}
+
+export interface BrowserRuntimeSeedClient {
+  requestJSON<T>(pathname: string, init?: RequestInit): Promise<T>;
+  requestOperatorJSON?<T>(pathname: string, init?: RequestInit): Promise<T>;
+  resolveWorkspace(rootDir: string): Promise<WorkspacePayload>;
+}
+
+interface BrowserRuntimeSeedPaths {
+  homeDir: string;
+  repoRoot: string;
+}
+
+interface MockFixtureAgent {
+  name: string;
+  provider: string;
+  model?: string;
+  permissions?: string;
+  prompt?: string;
+  category_path?: string[];
+}
+
+interface MockFixture {
+  agents?: MockFixtureAgent[];
+}
+
+type BrowserTasksOperatorSeedRuntime = Pick<BrowserRuntimeSeedClient, "requestJSON"> &
+  Partial<Pick<BrowserRuntimeSeedClient, "resolveWorkspace">> & {
+    paths?: {
+      workspaceDir: string;
+    };
+    seeded?: BrowserRuntimeSeedResult;
+  };
+const AUTOMATION_OPERATOR_FLOW_TIMEOUT_MS = 15_000;
+const TASKS_OPERATOR_FLOW_TIMEOUT_MS = 15_000;
+const SETTINGS_OPERATOR_FLOW_TIMEOUT_MS = 15_000;
+const BROWSER_SEED_POLL_MS = 150;
+const BROWSER_SEED_SESSION_ACTIVE_TIMEOUT_MS = 30_000;
+
+let acpMockDriverBinaryPromise: Promise<string> | undefined;
+
+export const browserAutomationOperatorFlowScenario = {
+  job: {
+    initialName: "deploy-review",
+    editedName: "deploy-review-updated",
+    prompt: "Review payload deploy for main",
+    scheduleExpr: "0 9 * * *",
+    updatedScheduleExpr: "15 10 * * *",
+  },
+  trigger: {
+    endpointSlug: "browser-deploy-review",
+    event: "webhook",
+    name: "deploy-review-webhook",
+    prompt: `Review payload {{ index .Data "payload" }} for {{ index .Data "branch" }}`,
+    webhookID: "wbh_browser_deploy_review",
+    webhookSecret: "shared-secret",
+  },
+  transcript: {
+    assistant: "Automation review completed for deploy on main.",
+  },
+} as const;
+
+export const browserSettingsOperatorFlowScenario = {
+  general: {
+    // Idle-agent presets offered by Settings > General (15 minutes / 1 hour).
+    primaryIdleReleaseSeconds: 900,
+    fallbackIdleReleaseSeconds: 3600,
+  },
+  hooks: {
+    hookName: "browser-turn-end",
+  },
+  mcpServers: {
+    global: {
+      command: "npx",
+      name: "browser-global-mcp",
+      target: "sidecar",
+    },
+    workspace: {
+      command: "uvx",
+      name: "browser-workspace-mcp",
+      target: "config",
+    },
+  },
+  providers: {
+    overlayCommand: "codex-browser",
+    overlayModel: "gpt-5.4",
+  },
+  skills: {
+    disabledSkill: "browser-disabled-skill",
+    policyRegistry: "browser-marketplace-registry",
+  },
+} as const;
+
+export const browserTasksOperatorFlowScenario = {
+  approvalTask: {
+    identifier: "TASK-BROWSER-APPROVAL",
+    title: "Approve browser regression rollout",
+  },
+  referenceTask: {
+    identifier: "TASK-BROWSER-QUEUE",
+    title: "Prepare operator queue summary",
+  },
+  runningTask: {
+    identifier: "TASK-BROWSER-RUN",
+    title: "Capture tasks operator evidence",
+  },
+  runningRun: {
+    claimIdempotencyKey: "tasks-browser-claim-01",
+    enqueueIdempotencyKey: "tasks-browser-enqueue-01",
+  },
+} as const;
+export async function seedBrowserRuntimeHome(
+  paths: BrowserRuntimeSeedPaths,
+  seed: BrowserRuntimeSeed | undefined
+): Promise<void> {
+  const skills = seed?.skills ?? [];
+  if (skills.length > 0) {
+    await seedBrowserSkills(paths.homeDir, skills);
+  }
+
+  const mockAgents = seed?.mockAgents ?? [];
+  if (mockAgents.length === 0) {
+    return;
+  }
+
+  const driverPath = await ensureACPmockDriverBinary(paths.repoRoot);
+  await installACPmockDriverShim(paths.homeDir, driverPath);
+  const agentsDir = path.join(paths.homeDir, "agents");
+  const diagnosticsDir = path.join(paths.homeDir, "logs", "acpmock");
+
+  await mkdir(agentsDir, { recursive: true });
+  await mkdir(diagnosticsDir, { recursive: true });
+
+  for (const spec of mockAgents) {
+    let agentDriverPath = driverPath;
+    if (spec.runtimeCommandName) {
+      await installACPmockDriverShim(paths.homeDir, driverPath, spec.runtimeCommandName);
+      agentDriverPath = path.join(paths.homeDir, "bin", spec.runtimeCommandName);
+    }
+    const registration = await loadMockAgentRegistration(agentDriverPath, diagnosticsDir, spec);
+    const agentDir = path.join(agentsDir, registration.agentName);
+    const agentDefPath = path.join(agentDir, "AGENT.md");
+    await mkdir(agentDir, { recursive: true });
+    await writeFile(
+      agentDefPath,
+      renderMockAgentDef(
+        registration.agentName,
+        registration.agent,
+        registration.command,
+        spec.runtimeProvider
+      ),
+      "utf8"
+    );
+  }
+}
+
+async function seedBrowserSkills(homeDir: string, skills: BrowserSkillSeed[]): Promise<void> {
+  const skillsDir = path.join(homeDir, "skills");
+  await mkdir(skillsDir, { recursive: true });
+
+  for (const skill of skills) {
+    const skillName = normalizeSeedSkillName(skill.name);
+    const skillDir = path.join(skillsDir, skillName);
+    await mkdir(skillDir, { recursive: true });
+
+    const skillFile = path.join(skillDir, "SKILL.md");
+    await writeFile(skillFile, renderSeedSkillDocument(skill), { encoding: "utf8", mode: 0o600 });
+    await chmod(skillFile, 0o600);
+
+    for (const [relativePath, content] of Object.entries(skill.resources ?? {})) {
+      const target = resolveSeedSkillPath(skillDir, relativePath);
+      await mkdir(path.dirname(target), { recursive: true });
+      await writeFile(target, content, { encoding: "utf8", mode: 0o600 });
+      await chmod(target, 0o600);
+    }
+
+    if (skill.marketplace) {
+      const hash = await computeSeedSkillDirectoryHash(skillDir);
+      const sidecar = {
+        hash: skill.marketplace.hashOverride ?? hash,
+        registry: skill.marketplace.registry ?? "clawhub",
+        slug: skill.marketplace.slug,
+        version: skill.marketplace.version ?? skill.version ?? "",
+        installed_at: skill.marketplace.installedAt ?? "2026-05-09T00:00:00Z",
+      };
+      await writeFile(
+        path.join(skillDir, ".compozy-meta.json"),
+        `${JSON.stringify(sidecar, null, 2)}\n`,
+        {
+          encoding: "utf8",
+          mode: 0o600,
+        }
+      );
+      await chmod(path.join(skillDir, ".compozy-meta.json"), 0o600);
+    }
+  }
+}
+
+function normalizeSeedSkillName(name: string): string {
+  const trimmed = name.trim();
+  if (!/^[A-Za-z0-9._-]+$/.test(trimmed)) {
+    throw new Error(`browser skill seed name ${JSON.stringify(name)} is invalid`);
+  }
+  return trimmed;
+}
+
+function resolveSeedSkillPath(skillDir: string, relativePath: string): string {
+  const target = path.resolve(skillDir, relativePath);
+  const relative = path.relative(skillDir, target);
+  if (relative.startsWith("..") || path.isAbsolute(relative)) {
+    throw new Error(`browser skill seed resource ${relativePath} escapes ${skillDir}`);
+  }
+  return target;
+}
+
+function renderSeedSkillDocument(skill: BrowserSkillSeed): string {
+  const lines = [
+    "---",
+    `name: ${JSON.stringify(normalizeSeedSkillName(skill.name))}`,
+    `description: ${JSON.stringify(skill.description)}`,
+  ];
+  if (skill.version?.trim()) {
+    lines.push(`version: ${JSON.stringify(skill.version.trim())}`);
+  }
+  if (skill.metadata && Object.keys(skill.metadata).length > 0) {
+    lines.push("metadata:");
+    lines.push(...renderSeedYAMLMap(skill.metadata, 2));
+  }
+  lines.push("---", "", skill.body.trim(), "");
+  return lines.join("\n");
+}
+
+function renderSeedYAMLMap(value: Record<string, unknown>, indent: number): string[] {
+  return Object.entries(value).flatMap(([key, entry]) => renderSeedYAMLEntry(key, entry, indent));
+}
+
+function renderSeedYAMLEntry(key: string, value: unknown, indent: number): string[] {
+  const prefix = " ".repeat(indent);
+  if (Array.isArray(value)) {
+    return [
+      `${prefix}${key}:`,
+      ...value.map(item => `${" ".repeat(indent + 2)}- ${renderSeedYAMLScalar(item)}`),
+    ];
+  }
+  if (value && typeof value === "object") {
+    return [`${prefix}${key}:`, ...renderSeedYAMLMap(value as Record<string, unknown>, indent + 2)];
+  }
+  return [`${prefix}${key}: ${renderSeedYAMLScalar(value)}`];
+}
+
+function renderSeedYAMLScalar(value: unknown): string {
+  if (typeof value === "string") {
+    return JSON.stringify(value);
+  }
+  if (typeof value === "number" || typeof value === "boolean") {
+    return String(value);
+  }
+  if (value === null || value === undefined) {
+    return "null";
+  }
+  return JSON.stringify(value);
+}
+
+async function computeSeedSkillDirectoryHash(skillDir: string): Promise<string> {
+  const entries = await collectSeedSkillFiles(skillDir, skillDir);
+  const hash = createHash("sha256");
+
+  for (const relativePath of entries.sort()) {
+    const absolutePath = path.join(skillDir, relativePath);
+    const info = await stat(absolutePath);
+    if (!info.isFile()) {
+      throw new Error(`browser skill seed hash only supports regular files: ${absolutePath}`);
+    }
+
+    hash.update(
+      `file:${relativePath.split(path.sep).join("/")}\nmode:${formatSeedFileMode(info.mode)}\n`
+    );
+    hash.update(await readFile(absolutePath));
+    hash.update(Buffer.from([0]));
+  }
+
+  return hash.digest("hex");
+}
+
+async function collectSeedSkillFiles(rootDir: string, currentDir: string): Promise<string[]> {
+  const entries = await readdir(currentDir, { withFileTypes: true });
+  const files: string[] = [];
+  for (const entry of entries) {
+    if (entry.name === ".compozy-meta.json") {
+      continue;
+    }
+    const absolutePath = path.join(currentDir, entry.name);
+    if (entry.isDirectory()) {
+      files.push(...(await collectSeedSkillFiles(rootDir, absolutePath)));
+      continue;
+    }
+    if (!entry.isFile()) {
+      throw new Error(`browser skill seed hash only supports files: ${absolutePath}`);
+    }
+    files.push(path.relative(rootDir, absolutePath));
+  }
+  return files;
+}
+
+function formatSeedFileMode(mode: number): string {
+  return `0${(mode & 0o777).toString(8).padStart(3, "0")}`;
+}
+
+export async function applyBrowserRuntimeSeed(
+  runtime: BrowserRuntimeSeedClient,
+  seed: BrowserRuntimeSeed | undefined,
+  fallbackWorkspaceRootDir?: string
+): Promise<BrowserRuntimeSeedResult> {
+  if (seed === undefined && !fallbackWorkspaceRootDir?.trim()) {
+    return {};
+  }
+
+  let workspace = await resolveSeedWorkspace(runtime, seed, fallbackWorkspaceRootDir);
+  if (seed?.session === undefined) {
+    return { workspace };
+  }
+
+  const sessionWorkspaceRoot = seed.session.workspaceRootDir ?? seed.workspace?.rootDir;
+  if (sessionWorkspaceRoot === undefined || sessionWorkspaceRoot.trim() === "") {
+    throw new Error(
+      "session runtime seed requires a workspace root via seed.workspace or session.workspaceRootDir"
+    );
+  }
+
+  if (!workspace || workspace.root_dir !== sessionWorkspaceRoot) {
+    workspace = await runtime.resolveWorkspace(sessionWorkspaceRoot);
+  }
+
+  const payload = await runtime.requestJSON<{ session: SeededSessionPayload }>("/api/sessions", {
+    method: "POST",
+    body: JSON.stringify({
+      agent_name: seed.session.agentName,
+      workspace: workspace.id,
+    }),
+  });
+
+  // Gate before handing the session to specs: none of them may hit an
+  // agent-authenticated endpoint while the session is still `starting`.
+  const session = await waitForSeedSessionActive(runtime, payload.session.id);
+
+  return {
+    workspace,
+    session,
+  };
+}
+
+export async function seedBrowserAutomationOperatorFlow(
+  runtime: BrowserAutomationOperatorSeedRuntime,
+  seed: BrowserAutomationOperatorFlowSeed
+): Promise<BrowserAutomationOperatorFlowResult> {
+  const agentName = seed.agentName.trim();
+  if (agentName === "") {
+    throw new Error("automation operator flow seed requires a non-empty agent name");
+  }
+
+  const timeoutMs = seed.timeoutMs ?? AUTOMATION_OPERATOR_FLOW_TIMEOUT_MS;
+  const job = await createAutomationOperatorJob(runtime, agentName);
+  const trigger = await createAutomationOperatorTrigger(runtime, agentName);
+
+  const initialRun = (
+    await runtime.requestJSON<{ run: AutomationRun }>(
+      `/api/automation/jobs/${encodeURIComponent(job.id)}/trigger`,
+      {
+        method: "POST",
+      }
+    )
+  ).run;
+
+  const baselineRun = await waitForSeedCondition(
+    async () => {
+      const payload = await runtime.requestJSON<{ run: AutomationRun }>(
+        `/api/automation/runs/${encodeURIComponent(initialRun.id)}`
+      );
+      const run = payload.run;
+      return run.status === "completed" && Boolean(run.session_id) ? run : null;
+    },
+    `completed automation run ${initialRun.id}`,
+    timeoutMs
+  );
+
+  await waitForSeedCondition(
+    async () => {
+      const payload = await runtime.requestJSON<{ runs: AutomationRun[] }>(
+        `/api/automation/jobs/${encodeURIComponent(job.id)}/runs?limit=10`
+      );
+      return payload.runs.some(
+        run => run.id === baselineRun.id && run.session_id === baselineRun.session_id
+      )
+        ? payload.runs
+        : null;
+    },
+    `visible run history for automation job ${job.id}`,
+    timeoutMs
+  );
+
+  await waitForSeedCondition(
+    async () => {
+      const owner = await runtime.requestJSON<{ workspace_id: string }>(
+        `/api/sessions/${encodeURIComponent(baselineRun.session_id ?? "")}/owner`
+      );
+      const payload = await runtime.requestJSON<{ entries: Array<{ message: unknown }> }>(
+        // A global automation runs a User session, which owns no workspace.
+        workspaceSessionPath(
+          owner.workspace_id || "@user",
+          baselineRun.session_id ?? "",
+          "/transcript"
+        )
+      );
+      const transcript = JSON.stringify(payload.entries.map(entry => entry.message));
+
+      return transcript.includes(browserAutomationOperatorFlowScenario.job.prompt) &&
+        transcript.includes(browserAutomationOperatorFlowScenario.transcript.assistant)
+        ? transcript
+        : null;
+    },
+    `automation transcript for session ${baselineRun.session_id}`,
+    timeoutMs
+  );
+
+  return {
+    job,
+    trigger,
+    baselineRun,
+  };
+}
+
+export async function seedBrowserTasksOperatorFlow(
+  runtime: BrowserTasksOperatorSeedRuntime,
+  seed: BrowserTasksOperatorFlowSeed
+): Promise<BrowserTasksOperatorFlowResult> {
+  const sessionAgentName = seed.sessionAgentName.trim();
+  if (sessionAgentName === "") {
+    throw new Error("tasks operator flow seed requires a non-empty session agent name");
+  }
+
+  const timeoutMs = seed.timeoutMs ?? TASKS_OPERATOR_FLOW_TIMEOUT_MS;
+  const sessionWorkspace = await resolveBrowserTasksWorkspace(runtime, seed, timeoutMs);
+  const createdSession = (
+    await runtime.requestJSON<{ session: SeededSessionPayload }>("/api/sessions", {
+      method: "POST",
+      body: JSON.stringify({
+        agent_name: sessionAgentName,
+        workspace: sessionWorkspace.id,
+      }),
+    })
+  ).session;
+
+  // The claim-next call below authenticates as this session; it 401s with
+  // `identity_stale` until background-role activation commits. Gate on active.
+  const activeSession = await waitForSeedSessionActive(runtime, createdSession.id, timeoutMs);
+  const referenceTaskScope = seed.referenceTaskScope ?? "global";
+
+  const referenceTask = await createBrowserTask(runtime, {
+    description: "Seeded ready task for list and dashboard coverage.",
+    identifier: browserTasksOperatorFlowScenario.referenceTask.identifier,
+    owner: {
+      kind: "human",
+      ref: "qa-operator",
+    },
+    priority: "medium",
+    scope: referenceTaskScope,
+    title: browserTasksOperatorFlowScenario.referenceTask.title,
+    ...(referenceTaskScope === "workspace" ? { workspace: sessionWorkspace.id } : {}),
+  });
+
+  const approvalTask = await createBrowserTask(runtime, {
+    approval_policy: "manual",
+    description: "Approval-gated task for inbox regression coverage.",
+    identifier: browserTasksOperatorFlowScenario.approvalTask.identifier,
+    owner: {
+      kind: "human",
+      ref: "release-manager",
+    },
+    priority: "high",
+    scope: "global",
+    title: browserTasksOperatorFlowScenario.approvalTask.title,
+  });
+
+  const runningTask = await createBrowserTask(runtime, {
+    description: "Running task for dashboard, detail, and run-detail regression coverage.",
+    identifier: browserTasksOperatorFlowScenario.runningTask.identifier,
+    owner: {
+      kind: "automation",
+      ref: "browser-task-runner",
+    },
+    priority: "urgent",
+    scope: "global",
+    title: browserTasksOperatorFlowScenario.runningTask.title,
+  });
+
+  const runningRun = (
+    await runtime.requestJSON<{ run: TaskRun }>(
+      `/api/tasks/${encodeURIComponent(runningTask.id)}/runs`,
+      {
+        method: "POST",
+        body: JSON.stringify({
+          idempotency_key: browserTasksOperatorFlowScenario.runningRun.enqueueIdempotencyKey,
+        }),
+      }
+    )
+  ).run;
+
+  // Operator HTTP claim was removed (Task #03); seed claims via the agent claim-next path.
+  // Claim-next binds the caller session and leaves the run claimed — enough for dashboard
+  // active_runs. Operator /start would try to spawn a second task session and 500.
+  await runtime.requestJSON<{ claim: { run: TaskRun } }>("/api/agent/tasks/claim-next", {
+    method: "POST",
+    headers: {
+      "X-Compozy-Session-ID": activeSession.id,
+      "X-Compozy-Agent": sessionAgentName,
+    },
+    body: JSON.stringify({
+      run_id: runningRun.id,
+      idempotency_key: browserTasksOperatorFlowScenario.runningRun.claimIdempotencyKey,
+    }),
+  });
+
+  const runningRunDetail = await waitForSeedCondition(
+    async () => {
+      const payload = await runtime.requestJSON<{ run: TaskRunDetailView }>(
+        `/api/task-runs/${encodeURIComponent(runningRun.id)}`
+      );
+      const detail = payload.run;
+      return detail.session?.session_id === activeSession.id &&
+        ["claimed", "queued", "running", "starting"].includes(detail.run.status)
+        ? detail
+        : null;
+    },
+    `task run detail ${runningRun.id} to expose linked session`,
+    timeoutMs
+  );
+
+  const dashboard = await waitForSeedCondition(
+    async () => {
+      const payload = await runtime.requestJSON<{ dashboard: TaskDashboardView }>(
+        "/api/observe/tasks/dashboard"
+      );
+      const candidate = payload.dashboard;
+      const minimumTaskCount = referenceTaskScope === "workspace" ? 2 : 3;
+      return candidate.totals.tasks_total >= minimumTaskCount &&
+        candidate.active_runs.items?.some(item => item.run_id === runningRun.id)
+        ? candidate
+        : null;
+    },
+    "task dashboard seeded operator state",
+    timeoutMs
+  );
+
+  const approvalInbox = await waitForSeedCondition(
+    async () => {
+      const payload = await runtime.requestJSON<{ inbox: TaskInboxView }>(
+        "/api/observe/tasks/inbox?lane=approvals&limit=10"
+      );
+      const candidate = payload.inbox;
+      return candidate.groups?.some(group =>
+        (group.items ?? []).some(item => item.task.id === approvalTask.id)
+      )
+        ? candidate
+        : null;
+    },
+    "task approvals inbox seeded operator state",
+    timeoutMs
+  );
+
+  return {
+    approvalInbox,
+    approvalTask,
+    dashboard,
+    referenceTask,
+    runningRun,
+    runningRunDetail,
+    runningTask,
+    session: activeSession,
+    workspace: sessionWorkspace,
+  };
+}
+
+export async function seedBrowserSettingsFixtures(
+  runtime: BrowserSettingsSeedRuntime,
+  seed: BrowserSettingsFixturesSeed = {}
+): Promise<BrowserSettingsFixturesResult> {
+  const timeoutMs = seed.timeoutMs ?? SETTINGS_OPERATOR_FLOW_TIMEOUT_MS;
+  const result: BrowserSettingsFixturesResult = {
+    createdHookNames: [],
+    createdMCPServers: [],
+    createdProviderNames: [],
+  };
+
+  if (seed.disabledSkills !== undefined) {
+    const payload = await runtime.requestJSON<SettingsSkillsSection>("/api/settings/skills");
+    const currentDisabled = normalizeStringList(payload.config.disabled_skills ?? []);
+    const desiredDisabled = normalizeStringList(seed.disabledSkills);
+    result.initialDisabledSkills = currentDisabled;
+
+    if (!sameStringList(currentDisabled, desiredDisabled)) {
+      await runtime.requestJSON<SettingsMutationResult>("/api/settings/skills", {
+        method: "PATCH",
+        body: JSON.stringify({
+          config: {
+            ...payload.config,
+            disabled_skills: desiredDisabled,
+          },
+        }),
+      });
+
+      await waitForSeedCondition(
+        async () => {
+          const current = await runtime.requestJSON<SettingsSkillsSection>("/api/settings/skills");
+          return sameStringList(
+            normalizeStringList(current.config.disabled_skills ?? []),
+            desiredDisabled
+          )
+            ? current.config
+            : null;
+        },
+        "settings disabled skills seed",
+        timeoutMs
+      );
+    }
+  }
+
+  for (const provider of seed.providers ?? []) {
+    const name = provider.name.trim();
+    if (name === "") {
+      throw new Error("settings provider seed requires a non-empty name");
+    }
+
+    await runtime.requestJSON<SettingsMutationResult>(
+      `/api/settings/providers/${encodeURIComponent(name)}`,
+      {
+        method: "PUT",
+        body: JSON.stringify({
+          settings: provider.settings,
+        }),
+      }
+    );
+
+    result.createdProviderNames.push(name);
+    await waitForSeedCondition(
+      async () => {
+        const payload = await runtime.requestJSON<{
+          providers: Array<{ name: string }>;
+        }>("/api/settings/providers");
+        return payload.providers.some(entry => entry.name === name) ? payload.providers : null;
+      },
+      `settings provider ${name}`,
+      timeoutMs
+    );
+  }
+
+  let resolvedWorkspace = runtime.seeded?.workspace;
+
+  for (const serverSeed of seed.mcpServers ?? []) {
+    const name = serverSeed.name.trim();
+    if (name === "") {
+      throw new Error("settings MCP server seed requires a non-empty name");
+    }
+
+    const scope = serverSeed.scope ?? "global";
+    const target = serverSeed.target ?? "auto";
+    let workspaceId = serverSeed.workspaceId?.trim();
+
+    if (scope === "workspace") {
+      if (!workspaceId) {
+        const rootDir =
+          serverSeed.workspaceRootDir?.trim() || resolvedWorkspace?.root_dir?.trim() || "";
+        if (rootDir === "") {
+          throw new Error(
+            `workspace MCP server seed for ${name} requires workspaceId, workspaceRootDir, or a seeded workspace`
+          );
+        }
+        if (!runtime.resolveWorkspace) {
+          throw new Error(
+            `workspace MCP server seed for ${name} requires resolveWorkspace support on the runtime`
+          );
+        }
+        resolvedWorkspace = await runtime.resolveWorkspace(rootDir);
+        workspaceId = resolvedWorkspace.id;
+      }
+      if (!resolvedWorkspace || resolvedWorkspace.id !== workspaceId) {
+        resolvedWorkspace = {
+          id: workspaceId,
+          root_dir: serverSeed.workspaceRootDir?.trim() || resolvedWorkspace?.root_dir || "",
+          name: resolvedWorkspace?.name || workspaceId,
+        };
+      }
+      result.workspace = resolvedWorkspace;
+    }
+
+    await runtime.requestJSON<SettingsMutationResult>(
+      buildSettingsMCPServerPath(name, scope, workspaceId, target),
+      {
+        method: "PUT",
+        body: JSON.stringify({
+          server: {
+            ...serverSeed.server,
+            name,
+          },
+        }),
+      }
+    );
+
+    result.createdMCPServers.push({
+      name,
+      scope,
+      target,
+      workspaceId,
+    });
+
+    await waitForSeedCondition(
+      async () => {
+        const payload = await runtime.requestJSON<{
+          mcp_servers: Array<{ name: string; workspace_id?: string }>;
+        }>(buildSettingsMCPServersListPath(scope, workspaceId));
+        return payload.mcp_servers.some(
+          entry =>
+            entry.name === name &&
+            (scope === "global" || (entry.workspace_id ?? "") === workspaceId)
+        )
+          ? payload.mcp_servers
+          : null;
+      },
+      `settings MCP server ${name}`,
+      timeoutMs
+    );
+  }
+
+  for (const hook of seed.hooks ?? []) {
+    const name = hook.name.trim();
+    if (name === "") {
+      throw new Error("settings hook seed requires a non-empty name");
+    }
+
+    await runtime.requestJSON<SettingsMutationResult>(
+      `/api/settings/hooks/${encodeURIComponent(name)}`,
+      {
+        method: "PUT",
+        body: JSON.stringify({
+          declaration: {
+            ...hook.declaration,
+            name,
+          },
+        }),
+      }
+    );
+
+    result.createdHookNames.push(name);
+    await waitForSeedCondition(
+      async () => {
+        const payload = await runtime.requestJSON<{
+          hooks: Array<{ name: string }>;
+        }>("/api/settings/hooks");
+        return payload.hooks.some(entry => entry.name === name) ? payload.hooks : null;
+      },
+      `settings hook ${name}`,
+      timeoutMs
+    );
+  }
+
+  return result;
+}
+
+export async function cleanupBrowserSettingsFixtures(
+  runtime: BrowserSettingsSeedRuntime,
+  seeded: BrowserSettingsFixturesResult
+): Promise<void> {
+  if (seeded.initialDisabledSkills !== undefined) {
+    const payload = await runtime.requestJSON<SettingsSkillsSection>("/api/settings/skills");
+    const desiredDisabled = normalizeStringList(seeded.initialDisabledSkills);
+    if (
+      !sameStringList(normalizeStringList(payload.config.disabled_skills ?? []), desiredDisabled)
+    ) {
+      await runtime.requestJSON<SettingsMutationResult>("/api/settings/skills", {
+        method: "PATCH",
+        body: JSON.stringify({
+          config: {
+            ...payload.config,
+            disabled_skills: desiredDisabled,
+          },
+        }),
+      });
+    }
+  }
+
+  for (const hookName of [...seeded.createdHookNames].reverse()) {
+    await ignoreNotFound(
+      runtime.requestJSON<SettingsMutationResult>(
+        `/api/settings/hooks/${encodeURIComponent(hookName)}`,
+        {
+          method: "DELETE",
+        }
+      )
+    );
+  }
+
+  for (const server of [...seeded.createdMCPServers].reverse()) {
+    await ignoreNotFound(
+      runtime.requestJSON<SettingsMutationResult>(
+        buildSettingsMCPServerPath(server.name, server.scope, server.workspaceId, server.target),
+        {
+          method: "DELETE",
+        }
+      )
+    );
+  }
+
+  for (const providerName of [...seeded.createdProviderNames].reverse()) {
+    await ignoreNotFound(
+      runtime.requestJSON<SettingsMutationResult>(
+        `/api/settings/providers/${encodeURIComponent(providerName)}`,
+        {
+          method: "DELETE",
+        }
+      )
+    );
+  }
+
+  const restartsDir = runtime.paths?.homeDir
+    ? path.join(runtime.paths.homeDir, "restarts")
+    : undefined;
+  if (restartsDir) {
+    await rm(restartsDir, { recursive: true, force: true });
+  }
+}
+
+function buildSettingsMCPServersListPath(
+  scope: "global" | "workspace",
+  workspaceId?: string
+): string {
+  const params = new URLSearchParams({ scope });
+  if (scope === "workspace" && workspaceId) {
+    params.set("workspace_id", workspaceId);
+  }
+  return `/api/settings/mcp-servers?${params.toString()}`;
+}
+
+function buildSettingsMCPServerPath(
+  name: string,
+  scope: "global" | "workspace",
+  workspaceId: string | undefined,
+  target: SettingsMCPServerTarget
+): string {
+  const params = new URLSearchParams({
+    scope,
+    target,
+  });
+  if (scope === "workspace" && workspaceId) {
+    params.set("workspace_id", workspaceId);
+  }
+  return `/api/settings/mcp-servers/${encodeURIComponent(name)}?${params.toString()}`;
+}
+
+function normalizeStringList(values: string[]): string[] {
+  return [...new Set(values.map(value => value.trim()).filter(value => value !== ""))].sort();
+}
+
+function sameStringList(left: string[], right: string[]): boolean {
+  if (left.length !== right.length) {
+    return false;
+  }
+  for (let index = 0; index < left.length; index += 1) {
+    if (left[index] !== right[index]) {
+      return false;
+    }
+  }
+  return true;
+}
+
+async function ignoreNotFound<T>(operation: Promise<T>): Promise<T | undefined> {
+  try {
+    return await operation;
+  } catch (error) {
+    if (error instanceof Error && error.message.includes(" 404:")) {
+      return undefined;
+    }
+    throw error;
+  }
+}
+
+async function resolveBrowserTasksWorkspace(
+  runtime: BrowserTasksOperatorSeedRuntime,
+  seed: BrowserTasksOperatorFlowSeed,
+  timeoutMs: number
+): Promise<WorkspacePayload> {
+  const workspaceRootDir = seed.workspaceRootDir?.trim();
+  if (workspaceRootDir) {
+    if (!runtime.resolveWorkspace) {
+      throw new Error(
+        "tasks operator flow seed requires resolveWorkspace when workspaceRootDir is provided"
+      );
+    }
+    return await runtime.resolveWorkspace(workspaceRootDir);
+  }
+
+  const seededWorkspace = runtime.seeded?.workspace;
+  if (seededWorkspace) {
+    return seededWorkspace;
+  }
+
+  const resolveWorkspace = runtime.resolveWorkspace?.bind(runtime);
+  const workspaceDir = runtime.paths?.workspaceDir;
+  if (resolveWorkspace && workspaceDir) {
+    return await waitForSeedCondition(
+      async () => await resolveWorkspace(workspaceDir),
+      "browser tasks workspace",
+      timeoutMs
+    );
+  }
+
+  return await waitForSeedCondition(
+    async () => {
+      const payload = await runtime.requestJSON<{ workspaces: WorkspacePayload[] }>(
+        "/api/workspaces"
+      );
+      return payload.workspaces[0] ?? null;
+    },
+    "browser tasks workspace",
+    timeoutMs
+  );
+}
+
+async function createBrowserTask(
+  runtime: Pick<BrowserRuntimeSeedClient, "requestJSON">,
+  body: Record<string, unknown>
+): Promise<TaskRecord> {
+  return (
+    await runtime.requestJSON<{ task: TaskRecord }>("/api/tasks", {
+      method: "POST",
+      body: JSON.stringify(body),
+    })
+  ).task;
+}
+
+async function resolveSeedWorkspace(
+  runtime: BrowserRuntimeSeedClient,
+  seed: BrowserRuntimeSeed | undefined,
+  fallbackWorkspaceRootDir: string | undefined
+): Promise<WorkspacePayload | undefined> {
+  const rootDir =
+    seed?.workspace?.rootDir?.trim() ||
+    seed?.session?.workspaceRootDir?.trim() ||
+    fallbackWorkspaceRootDir?.trim();
+  if (!rootDir) {
+    return undefined;
+  }
+
+  return runtime.resolveWorkspace(rootDir);
+}
+
+async function loadMockAgentRegistration(
+  driverPath: string,
+  diagnosticsDir: string,
+  spec: BrowserMockAgentSeed
+): Promise<{
+  agentName: string;
+  command: string;
+  agent: MockFixtureAgent;
+}> {
+  const fixturePath = path.resolve(spec.fixturePath);
+  const rawFixture = await readFile(fixturePath, "utf8");
+  const fixture = JSON.parse(rawFixture) as MockFixture;
+  const fixtureAgentName = spec.fixtureAgent?.trim() || spec.agentName?.trim() || "";
+  if (fixtureAgentName === "") {
+    throw new Error(`mock agent seed for ${fixturePath} requires fixtureAgent or agentName`);
+  }
+
+  const agent = fixture.agents?.find(candidate => candidate.name === fixtureAgentName);
+  if (!agent) {
+    throw new Error(`mock agent fixture ${fixturePath} does not contain agent ${fixtureAgentName}`);
+  }
+
+  const agentName = spec.agentName?.trim() || fixtureAgentName;
+  const diagnosticsPath = path.join(diagnosticsDir, `${agentName}.jsonl`);
+  const command = shellQuote([
+    driverPath,
+    "--fixture",
+    fixturePath,
+    "--agent",
+    fixtureAgentName,
+    "--diagnostics",
+    diagnosticsPath,
+  ]);
+
+  const resolvedAgent: MockFixtureAgent = spec.category_path
+    ? { ...agent, category_path: spec.category_path }
+    : agent;
+
+  return { agentName, command, agent: resolvedAgent };
+}
+
+async function ensureACPmockDriverBinary(repoRoot: string): Promise<string> {
+  const override = process.env.COMPOZY_TEST_ACPMOCK_DRIVER_BIN?.trim();
+  if (override) {
+    return path.isAbsolute(override) ? override : path.resolve(repoRoot, override);
+  }
+
+  if (acpMockDriverBinaryPromise === undefined) {
+    acpMockDriverBinaryPromise = buildACPmockDriverBinary(repoRoot).catch(error => {
+      acpMockDriverBinaryPromise = undefined;
+      throw error;
+    });
+  }
+  return await acpMockDriverBinaryPromise;
+}
+
+async function buildACPmockDriverBinary(repoRoot: string): Promise<string> {
+  const buildDir = await mkdtemp(path.join(os.tmpdir(), "compozy-acpmock-driver-"));
+  const outputPath = path.join(
+    buildDir,
+    process.platform === "win32" ? "acpmock-driver.exe" : "acpmock-driver"
+  );
+
+  await execFileAsync(
+    "go",
+    ["build", "-o", outputPath, "./internal/testutil/acpmock/cmd/acpmock-driver"],
+    {
+      cwd: repoRoot,
+      env: process.env,
+      maxBuffer: 20 * 1024 * 1024,
+    }
+  );
+
+  return outputPath;
+}
+
+async function installACPmockDriverShim(
+  homeDir: string,
+  driverPath: string,
+  name = acpMockDriverBinaryName()
+): Promise<void> {
+  const binDir = path.join(homeDir, "bin");
+  const targetPath = path.join(binDir, name);
+  await mkdir(binDir, { recursive: true });
+  await rm(targetPath, { force: true });
+
+  if (process.platform !== "win32") {
+    try {
+      await symlink(driverPath, targetPath);
+      return;
+    } catch {
+      // Fall back to copying below when symlinks are unavailable.
+    }
+  }
+
+  await copyFile(driverPath, targetPath);
+  await chmod(targetPath, 0o755);
+}
+
+function acpMockDriverBinaryName(): string {
+  return process.platform === "win32" ? "acpmock-driver.exe" : "acpmock-driver";
+}
+
+function renderMockAgentDef(
+  name: string,
+  agent: MockFixtureAgent,
+  command: string,
+  provider = MOCK_AGENT_PROVIDER_NAME
+): string {
+  const prompt = agent.prompt?.trim() || `You are ${name}.`;
+  const lines = ["---", `name: ${name}`, `provider: ${provider}`, `command: ${command}`];
+
+  if (agent.model?.trim()) {
+    lines.push(`model: ${agent.model.trim()}`);
+  }
+  if (agent.permissions?.trim()) {
+    lines.push(`permissions: ${agent.permissions.trim()}`);
+  }
+  const segments = agent.category_path?.map(seg => seg.trim()).filter(seg => seg.length > 0) ?? [];
+  if (segments.length > 0) {
+    lines.push(`category_path: [${segments.map(seg => JSON.stringify(seg)).join(", ")}]`);
+  }
+
+  lines.push("---", "", prompt, "");
+  return lines.join("\n");
+}
+
+function requireSeedWorkspaceID(workspaceId: string | undefined, context: string): string {
+  const normalized = workspaceId?.trim() ?? "";
+  if (normalized === "") {
+    throw new Error(`${context} requires a workspace_id`);
+  }
+  return normalized;
+}
+
+function workspaceSessionPath(workspaceId: string, sessionId: string, suffix: string): string {
+  const normalizedSessionID = sessionId.trim();
+  if (normalizedSessionID === "") {
+    throw new Error("workspace session path requires a session_id");
+  }
+  return workspacePath(
+    workspaceId,
+    `/sessions/${encodeURIComponent(normalizedSessionID)}${suffix.startsWith("/") ? suffix : `/${suffix}`}`
+  );
+}
+
+function workspacePath(workspaceId: string, suffix: string): string {
+  const normalizedWorkspaceID = requireSeedWorkspaceID(workspaceId, "workspace-scoped path");
+  return `/api/workspaces/${encodeURIComponent(normalizedWorkspaceID)}${suffix}`;
+}
+
+async function createAutomationOperatorJob(
+  runtime: Pick<BrowserRuntimeSeedClient, "requestJSON">,
+  agentName: string
+): Promise<AutomationJob> {
+  const request: CreateAutomationJobRequest = {
+    agent_name: agentName,
+    enabled: true,
+    fire_limit: { max: 12, window: "1h" },
+    name: browserAutomationOperatorFlowScenario.job.initialName,
+    prompt: browserAutomationOperatorFlowScenario.job.prompt,
+    retry: { strategy: "none", max_retries: 0, base_delay: "" },
+    schedule: {
+      mode: "cron",
+      expr: browserAutomationOperatorFlowScenario.job.scheduleExpr,
+    },
+    scope: "global",
+  };
+
+  return (
+    await runtime.requestJSON<{ job: AutomationJob }>("/api/automation/jobs", {
+      method: "POST",
+      body: JSON.stringify(request),
+    })
+  ).job;
+}
+
+async function createAutomationOperatorTrigger(
+  runtime: Pick<BrowserRuntimeSeedClient, "requestJSON">,
+  agentName: string
+): Promise<AutomationTrigger> {
+  const request: CreateAutomationTriggerRequest = {
+    agent_name: agentName,
+    enabled: true,
+    endpoint_slug: browserAutomationOperatorFlowScenario.trigger.endpointSlug,
+    event: browserAutomationOperatorFlowScenario.trigger.event,
+    filter: {
+      "data.branch": "main",
+    },
+    fire_limit: { max: 12, window: "1h" },
+    name: browserAutomationOperatorFlowScenario.trigger.name,
+    prompt: browserAutomationOperatorFlowScenario.trigger.prompt,
+    retry: { strategy: "none", max_retries: 0, base_delay: "" },
+    scope: "global",
+    webhook_id: browserAutomationOperatorFlowScenario.trigger.webhookID,
+    webhook_secret_value: browserAutomationOperatorFlowScenario.trigger.webhookSecret,
+  };
+
+  return (
+    await runtime.requestJSON<{ trigger: AutomationTrigger }>("/api/automation/triggers", {
+      method: "POST",
+      body: JSON.stringify(request),
+    })
+  ).trigger;
+}
+
+async function waitForSeedCondition<T>(
+  read: () => Promise<T | null>,
+  label: string,
+  timeoutMs: number
+): Promise<T> {
+  const deadline = Date.now() + timeoutMs;
+  let lastError: unknown;
+
+  while (Date.now() < deadline) {
+    try {
+      const value = await read();
+      if (value !== null) {
+        return value;
+      }
+    } catch (error) {
+      lastError = error;
+    }
+
+    await delay(BROWSER_SEED_POLL_MS);
+  }
+
+  const detail = lastError instanceof Error ? `; last error: ${lastError.message}` : "";
+  throw new Error(`timed out waiting for ${label}${detail}`);
+}
+
+/**
+ * Block until an accepted seeded session is durably `active`. Accepted sessions
+ * report `starting` until activation commits, and agent-authenticated
+ * endpoints reject with `identity_stale` until the session is `active`. Poll the
+ * real session record — never a sleep — and fail fast (throw) if the session ends
+ * up `stopped`, surfacing a broken session as a setup failure rather than a later
+ * 401. Exported so specs that create their own session can gate it before calling
+ * agent-authenticated endpoints.
+ */
+export async function waitForSeedSessionActive(
+  runtime: Pick<BrowserRuntimeSeedClient, "requestJSON">,
+  sessionId: string,
+  timeoutMs = BROWSER_SEED_SESSION_ACTIVE_TIMEOUT_MS
+): Promise<SeededSessionPayload> {
+  const deadline = Date.now() + timeoutMs;
+  let lastState = "unknown";
+  let lastError: unknown;
+
+  while (Date.now() < deadline) {
+    let session: SeededSessionPayload | undefined;
+    try {
+      ({ session } = await runtime.requestJSON<{ session: SeededSessionPayload }>(
+        `/api/sessions/${encodeURIComponent(sessionId)}`
+      ));
+      lastState = session.state;
+      lastError = undefined;
+    } catch (error) {
+      lastError = error;
+    }
+
+    if (session?.state === "active") {
+      return session;
+    }
+    if (session?.state === "stopped") {
+      const failureKind = session.failure?.kind?.trim() || "unknown";
+      const failureSummary = session.failure?.summary?.trim() || "no failure summary";
+      throw new Error(
+        `seed session ${sessionId} entered "stopped" before activating; ` +
+          `failure ${failureKind}: ${failureSummary}`
+      );
+    }
+
+    await delay(BROWSER_SEED_POLL_MS);
+  }
+
+  const detail = lastError instanceof Error ? `; last error: ${lastError.message}` : "";
+  throw new Error(
+    `timed out waiting for seed session ${sessionId} to become active ` +
+      `(last state: ${lastState})${detail}`
+  );
+}
+
+async function delay(ms: number): Promise<void> {
+  await new Promise(resolve => {
+    setTimeout(resolve, ms);
+  });
+}
+
+function shellQuote(argv: string[]): string {
+  return argv
+    .map(argument => {
+      if (/^[A-Za-z0-9_./:@%+=,-]+$/.test(argument)) {
+        return argument;
+      }
+      return `'${argument.replace(/'/g, `'"'"'`)}'`;
+    })
+    .join(" ");
+}

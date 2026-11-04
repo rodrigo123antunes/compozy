@@ -1,15 +1,15 @@
 {
   "version": 1,
   "sidecar": "git@github.com:compozy/specs.git",
-  "source_branch": "agentic",
+  "source_branch": "v0.3",
   "namespaces": [
     {
       "name": "compozy",
-      "sidecar_branch": "compozy/__branches__/agentic",
-      "commit": "043f6321150358c1fd4b023a3c7a80cc6e51ffae",
-      "digest": "sha256:49d72a82f3bbbb41b390758635a95cef90025cde0d78cc4d4c267ddd3832ac3c",
-      "files": 1444,
-      "bytes": 11886143
+      "sidecar_branch": "compozy/__branches__/v0.3",
+      "commit": "a1772aa60b9ef00937d0fd550aa2791f631c1421",
+      "digest": "sha256:29030cae7932e6051aa3c199f1e69b5c6441ccd699a3249c3566315cc2a66450",
+      "files": 7396,
+      "bytes": 235656008
     }
   ]
 }

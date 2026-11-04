@@ -1,0 +1,1687 @@
+//go:build integration && !windows
+
+package daemon
+
+import (
+	"bytes"
+	"context"
+	"encoding/json"
+	"errors"
+	"net/http"
+	"net/http/httptest"
+	"net/url"
+	"os"
+	"path/filepath"
+	"strings"
+	"sync"
+	"testing"
+	"time"
+
+	"github.com/compozy/compozy/internal/api/contract"
+	"github.com/compozy/compozy/internal/api/httpapi"
+	apitest "github.com/compozy/compozy/internal/api/testutil"
+	"github.com/compozy/compozy/internal/api/udsapi"
+	compozyconfig "github.com/compozy/compozy/internal/config"
+	extensionpkg "github.com/compozy/compozy/internal/extension"
+	"github.com/compozy/compozy/internal/extensioninput"
+	"github.com/compozy/compozy/internal/extensionmcp"
+	"github.com/compozy/compozy/internal/store"
+	"github.com/compozy/compozy/internal/store/globaldb"
+	taskpkg "github.com/compozy/compozy/internal/task"
+	"github.com/compozy/compozy/internal/vault"
+	workspacepkg "github.com/compozy/compozy/internal/workspace"
+	"github.com/gin-gonic/gin"
+)
+
+func TestExtensionSecrets(t *testing.T) {
+	t.Run("Should serialize generic Vault mutations with package retirement", testExtensionVaultMutationIsolation)
+	t.Run("Should remove all installation state after the second input secret write fails [IT-020]",
+		testExtensionInputInstallRollback)
+	t.Run("Should inject a global binding only after enable", testExtensionSecretBindingEnableInjection)
+	t.Run(
+		"Should prefer a development binding and fall back to the profile binding",
+		testExtensionSecretDevBindingIsolation,
+	)
+	t.Run("Should roll back a failed transport batch", testExtensionSecretTransportRollback)
+	t.Run("Should retire global and development bindings by instance", testExtensionSecretBindingRetirement)
+	t.Run(
+		"Should retire orphan bindings across workspaces and restore them on removal failure",
+		testOrphanExtensionSecretRetirement,
+	)
+	t.Run("Should preserve remote header binding parity across HTTP and UDS", testExtensionRemoteHeaderBindingParity)
+}
+
+func testExtensionRemoteHeaderBindingParity(t *testing.T) {
+	t.Parallel()
+
+	const (
+		extensionName = "remote-header-binding"
+		secretValue   = "remote-header-secret-59f2"
+	)
+	harness := newExtensionSecretIntegrationHarness(t, extensionSecretIntegrationHarnessOptions{
+		actorReason: "remote header transport parity", allowUnverified: true,
+	})
+	fixtureDir := writeRemoteHeaderExtensionFixture(t, t.TempDir(), extensionName)
+	if _, err := harness.service.Install(t.Context(), contract.InstallExtensionRequest{
+		Source: contract.InstallExtensionSourceLocalPath, Ref: fixtureDir, AllowUnverified: true,
+	}, harness.actor); err != nil {
+		t.Fatalf("Install() error = %v", err)
+	}
+	secretRef := vault.ExtensionProfileSecretRef(extensionName, store.DefaultProfileID, "", "DEPLOYMENT_KEY")
+	if _, err := harness.vault.PutSecret(t.Context(), secretRef, "operator_remote_header", secretValue); err != nil {
+		t.Fatalf("PutSecret(remote header) error = %v", err)
+	}
+	engines := []struct {
+		name   string
+		engine *gin.Engine
+	}{
+		{name: "HTTP", engine: harness.transport},
+		{name: "UDS", engine: newExtensionTransportEngine(harness.service, harness.actor, "uds")},
+	}
+	for _, transport := range engines {
+		setResponse := performExtensionTransportRequest(
+			t,
+			transport.engine,
+			http.MethodPut,
+			"/extensions/"+extensionName+"/secrets",
+			mustExtensionTransportJSON(t, contract.SetExtensionSecretsRequest{
+				Bindings: []contract.ExtensionSecretBindingInput{{
+					EnvName: "DEPLOYMENT_KEY", VaultRef: &secretRef,
+					MCPServer: "deployment-api", HeaderName: "X-Deployment-Key",
+				}},
+			}),
+		)
+		if setResponse.Code != http.StatusOK {
+			t.Fatalf("%s set status = %d, want 200; body=%s", transport.name, setResponse.Code, setResponse.Body)
+		}
+		assertSecretsAbsent(
+			t,
+			transport.name+" set response",
+			setResponse.Body.String(),
+			[]string{secretValue, secretRef},
+		)
+		rows, err := harness.db.ExtensionEnvRepo.ListEnvBindings(
+			t.Context(),
+			extensionName,
+			store.DefaultProfileID,
+			"",
+		)
+		if err != nil {
+			t.Fatalf("%s ListEnvBindings() error = %v", transport.name, err)
+		}
+		if len(rows) != 1 || rows[0].SecretRef != secretRef || rows[0].MCPServer != "deployment-api" ||
+			rows[0].HeaderName != "X-Deployment-Key" {
+			t.Fatalf("%s binding rows = %#v, want identical remote mapping", transport.name, rows)
+		}
+		listResponse := performExtensionTransportRequest(
+			t, transport.engine, http.MethodGet, "/extensions/"+extensionName+"/secrets", nil,
+		)
+		if listResponse.Code != http.StatusOK {
+			t.Fatalf("%s list status = %d, want 200; body=%s", transport.name, listResponse.Code, listResponse.Body)
+		}
+		var payload contract.ExtensionSecretsPayload
+		if err := json.Unmarshal(listResponse.Body.Bytes(), &payload); err != nil {
+			t.Fatalf("%s json.Unmarshal(list) error = %v", transport.name, err)
+		}
+		if len(payload.Bindings) != 1 || payload.Bindings[0].EnvName != "DEPLOYMENT_KEY" ||
+			payload.Bindings[0].MCPServer != "deployment-api" ||
+			payload.Bindings[0].HeaderName != "X-Deployment-Key" || payload.Bindings[0].Stale {
+			t.Fatalf("%s presence-only payload = %#v", transport.name, payload)
+		}
+		assertSecretsAbsent(
+			t,
+			transport.name+" list response",
+			listResponse.Body.String(),
+			[]string{secretValue, secretRef},
+		)
+	}
+
+	missingRef := vault.ExtensionProfileSecretRef(extensionName, store.DefaultProfileID, "", "MISSING_KEY")
+	danglingResponse := performExtensionTransportRequest(
+		t,
+		harness.transport,
+		http.MethodPut,
+		"/extensions/"+extensionName+"/secrets",
+		mustExtensionTransportJSON(t, contract.SetExtensionSecretsRequest{
+			Bindings: []contract.ExtensionSecretBindingInput{{
+				EnvName: "MISSING_KEY", VaultRef: &missingRef,
+				MCPServer: "deployment-api", HeaderName: "X-Missing-Key",
+			}},
+		}),
+	)
+	if danglingResponse.Code != http.StatusBadRequest ||
+		!strings.Contains(danglingResponse.Body.String(), "extension_env_binding_dangling") {
+		t.Fatalf(
+			"dangling remote binding status = %d body=%s, want binding error",
+			danglingResponse.Code,
+			danglingResponse.Body,
+		)
+	}
+}
+
+type extensionSecretIntegrationHarnessOptions struct {
+	actorReason      string
+	actorWorkspaceID string
+	allowUnverified  bool
+	failingVault     bool
+	workspaceID      string
+}
+
+type extensionSecretIntegrationHarness struct {
+	actor         taskpkg.ActorContext
+	db            *globaldb.GlobalDB
+	failingVault  *extensionSecretFailingVault
+	service       *daemonExtensionService
+	transport     *gin.Engine
+	vault         *vault.Service
+	workspaceRoot string
+}
+
+func newExtensionSecretIntegrationHarness(
+	t *testing.T,
+	opts extensionSecretIntegrationHarnessOptions,
+) *extensionSecretIntegrationHarness {
+	t.Helper()
+
+	homePaths := testHomePaths(t)
+	db := openDaemonTestGlobalDB(t)
+	registry := extensionpkg.NewRegistry(db.DB())
+	vaultService, err := vault.NewService(
+		db.VaultRepo,
+		vault.NewFileKeyProvider(t.TempDir(), nil),
+	)
+	if err != nil {
+		t.Fatalf("vault.NewService() error = %v", err)
+	}
+
+	serviceVault := extensionSecretVault(vaultService)
+	var failingVault *extensionSecretFailingVault
+	if opts.failingVault {
+		failingVault = &extensionSecretFailingVault{extensionSecretVault: vaultService}
+		serviceVault = failingVault
+	}
+
+	managerOptions := []extensionpkg.Option{
+		extensionpkg.WithLogger(discardLogger()),
+		extensionpkg.WithSecretResolver(vaultService),
+		extensionpkg.WithEnvBindingStore(db.ExtensionEnvRepo),
+	}
+	var workspaceResolver *daemonExtensionWorkspaceResolverStub
+	var workspaceRoot string
+	if opts.workspaceID != "" {
+		workspaceRoot = t.TempDir()
+		workspaceResolver = &daemonExtensionWorkspaceResolverStub{resolved: workspacepkg.ResolvedWorkspace{
+			ID: opts.workspaceID, Name: "extension-secret-integration", RootDir: workspaceRoot,
+			WorkspaceID: opts.workspaceID,
+		}}
+		managerOptions = append(managerOptions, extensionpkg.WithWorkspaceResolver(workspaceResolver))
+	}
+
+	manager := extensionpkg.NewManager(registry, managerOptions...)
+	if err := manager.Start(t.Context()); err != nil {
+		t.Fatalf("Manager.Start() error = %v", err)
+	}
+	t.Cleanup(func() {
+		if err := manager.Stop(context.Background()); err != nil {
+			t.Errorf("Manager.Stop() error = %v", err)
+		}
+	})
+
+	serviceOptions := []daemonExtensionServiceOption{
+		withDaemonExtensionAutomation(&fakeAutomationManager{}),
+		withDaemonExtensionEventWriter(db),
+		withDaemonExtensionSecrets(db.ExtensionEnvRepo, serviceVault),
+		withDaemonExtensionInputs(db.ExtensionInputs),
+		withDaemonExtensionMCPAllocations(db.ExtensionMCP),
+	}
+	if workspaceResolver != nil {
+		serviceOptions = append(serviceOptions, withDaemonExtensionWorkspaceResolver(workspaceResolver))
+	}
+	if opts.allowUnverified {
+		serviceOptions = append(serviceOptions, withDaemonExtensionMarketplace(
+			compozyconfig.ExtensionsConfig{
+				Trust: compozyconfig.ExtensionsTrustConfig{AllowUnverified: true},
+			},
+			nil,
+		))
+	}
+	service, ok := newDaemonExtensionService(&daemonExtensionServiceDeps{
+		Registry:  registry,
+		Runtime:   manager,
+		HomePaths: homePaths,
+		Logger:    discardLogger(),
+		Now:       time.Now,
+	},
+		serviceOptions...,
+	).(*daemonExtensionService)
+	if !ok {
+		t.Fatal("newDaemonExtensionService() did not return daemonExtensionService")
+	}
+	actor := newExtensionSecretIntegrationActor(t, opts.actorWorkspaceID, opts.actorReason)
+
+	return &extensionSecretIntegrationHarness{
+		actor:         actor,
+		db:            db,
+		failingVault:  failingVault,
+		service:       service,
+		transport:     newExtensionTransportEngine(service, actor, "http"),
+		vault:         vaultService,
+		workspaceRoot: workspaceRoot,
+	}
+}
+
+func newExtensionSecretIntegrationActor(
+	t *testing.T,
+	workspaceID string,
+	reason string,
+) taskpkg.ActorContext {
+	t.Helper()
+	if workspaceID == "" {
+		actor, err := taskpkg.DeriveHumanActorContext("operator", taskpkg.OriginKindHTTP, reason)
+		if err != nil {
+			t.Fatalf("DeriveHumanActorContext() error = %v", err)
+		}
+		actor.ReadScope = store.ReadScope{ProfileID: store.DefaultProfileID}
+		return actor
+	}
+	actor, err := taskpkg.DeriveHumanActorContextForWorkspace(
+		"operator",
+		workspaceID,
+		taskpkg.OriginKindHTTP,
+		reason,
+	)
+	if err != nil {
+		t.Fatalf("DeriveHumanActorContextForWorkspace() error = %v", err)
+	}
+	actor.ReadScope = store.ReadScope{ProfileID: store.DefaultProfileID}
+	return actor
+}
+
+func testExtensionSecretBindingRetirement(t *testing.T) {
+	t.Parallel()
+
+	const (
+		extensionName = "binding-retirement"
+		workspaceID   = "workspace-binding-retirement"
+		ownedGlobal   = "owned-global-secret-705a"
+		ownedDev      = "owned-dev-secret-a42f"
+		foreignValue  = "foreign-owned-secret-4bd1"
+	)
+	harness := newExtensionSecretIntegrationHarness(t, extensionSecretIntegrationHarnessOptions{
+		actorReason:     "global binding retirement",
+		allowUnverified: true,
+		workspaceID:     workspaceID,
+	})
+	devActor := newExtensionSecretIntegrationActor(t, workspaceID, "development binding retirement")
+	fixtureDir := writeBoundSecretExtensionFixtureWithEnv(
+		t,
+		t.TempDir(),
+		extensionName,
+		[]string{"BOUND_SECRET", "OTHER_SECRET"},
+	)
+	if _, err := harness.service.Install(t.Context(), contract.InstallExtensionRequest{
+		Source: contract.InstallExtensionSourceLocalPath, Ref: fixtureDir, AllowUnverified: true,
+	}, harness.actor); err != nil {
+		t.Fatalf("Install(global) error = %v", err)
+	}
+	foreignRef := vault.ExtensionProfileSecretRef(extensionName, store.DefaultProfileID, "", "FOREIGN_SHARED")
+	if _, err := harness.vault.PutSecret(t.Context(), foreignRef, "foreign_token", foreignValue); err != nil {
+		t.Fatalf("PutSecret(foreign) error = %v", err)
+	}
+	if _, err := harness.service.SetExtensionSecrets(
+		t.Context(),
+		extensionName,
+		contract.SetExtensionSecretsRequest{Bindings: []contract.ExtensionSecretBindingInput{
+			{EnvName: "BOUND_SECRET", Value: new(ownedGlobal)},
+			{EnvName: "OTHER_SECRET", VaultRef: &foreignRef},
+		}},
+		harness.actor,
+	); err != nil {
+		t.Fatalf("SetExtensionSecrets(global) error = %v", err)
+	}
+	globalOwnedRef := vault.ExtensionProfileSecretRef(extensionName, store.DefaultProfileID, "", "BOUND_SECRET")
+	if _, err := harness.service.Enable(
+		t.Context(),
+		extensionName,
+		contract.EnableExtensionRequest{},
+		harness.actor,
+	); err != nil {
+		t.Fatal(err)
+	}
+	beforeRemoval, err := harness.service.runtime.Get(extensionName)
+	if err != nil || !beforeRemoval.Status.Active {
+		t.Fatalf("fixture was not active before removal: %#v %v", beforeRemoval, err)
+	}
+	beforeLogs := waitForSecretExtensionLogsAfter(
+		t,
+		harness.service,
+		extensionName,
+		harness.actor,
+		0,
+		"",
+		"runtime_secret=",
+	)
+	// Invariant: a committed daemon removal releases its MCP names; failed retirement preserves them and secrets.
+	// Owner: real daemon lifecycle integration; canonical suite: TestExtensionSecrets.
+	allocationTarget := extensionmcp.Target{
+		Extension:  extensionName,
+		ProfileID:  store.DefaultProfileID,
+		ServerName: "server",
+	}
+	allocation, err := harness.db.ExtensionMCP.Reserve(t.Context(), allocationTarget, "sticky-name", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := harness.db.ExtensionMCP.Update(
+		t.Context(),
+		allocationTarget,
+		extensionmcp.Override{URL: "https://example.com/retained"},
+	); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := harness.db.DB().
+		ExecContext(t.Context(), `CREATE TRIGGER fail_removal_allocations BEFORE DELETE ON extension_mcp_overrides BEGIN SELECT RAISE(ABORT, 'retirement failure'); END`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := harness.service.Remove(t.Context(), extensionName, harness.actor); err == nil {
+		t.Fatal("retirement failure ignored")
+	}
+	retained, err := harness.db.ExtensionMCP.List(t.Context(), store.DefaultProfileID, "")
+	if err != nil || len(retained) != 1 || retained[0].RuntimeName != allocation.RuntimeName ||
+		retained[0].URL != "https://example.com/retained" {
+		t.Fatalf("failed removal changed override: %#v %v", retained, err)
+	}
+	if _, err := harness.service.registry.Get(extensionName); err != nil {
+		t.Fatal(err)
+	}
+	restoredRuntime, err := harness.service.runtime.Get(extensionName)
+	if err != nil || !restoredRuntime.Status.Active {
+		t.Fatalf("failed removal did not restore runtime readiness: %#v %v", restoredRuntime, err)
+	}
+	restoredStatus, err := harness.service.Status(t.Context(), extensionName)
+	if err != nil || len(restoredStatus.MissingEnv) != 0 {
+		t.Fatalf("restored API readiness=%#v %v", restoredStatus, err)
+	}
+	restartedLogs := waitForSecretExtensionLogsAfter(t, harness.service, extensionName, harness.actor,
+		beforeLogs.matched.Sequence, beforeLogs.matched.StreamEpoch, "runtime_secret=")
+	if !strings.Contains(restartedLogs.matched.Message, "runtime_secret=[REDACTED]") {
+		t.Fatalf("restored process did not receive its bound secret: %s", restartedLogs.matched.Message)
+	}
+	secret, err := harness.vault.ResolveRef(t.Context(), globalOwnedRef)
+	if err != nil || secret != ownedGlobal {
+		t.Fatalf("failed removal lost secret: %#v %v", secret, err)
+	}
+	if _, err := harness.db.DB().ExecContext(t.Context(), `DROP TRIGGER fail_removal_allocations`); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := harness.service.Remove(t.Context(), extensionName, harness.actor); err != nil {
+		t.Fatalf("Remove(global) error = %v", err)
+	}
+	if rows, err := harness.db.ExtensionMCP.List(
+		t.Context(),
+		store.DefaultProfileID,
+		"",
+	); err != nil ||
+		len(rows) != 0 {
+		t.Fatalf("committed removal retained allocations: %#v %v", rows, err)
+	}
+
+	assertExtensionBindingsRetired(
+		t,
+		harness.db,
+		harness.vault,
+		extensionName,
+		"",
+		globalOwnedRef,
+		foreignRef,
+		foreignValue,
+	)
+	if _, err := harness.service.Install(t.Context(), contract.InstallExtensionRequest{
+		Source: contract.InstallExtensionSourceLocalPath, Ref: fixtureDir, AllowUnverified: true,
+	}, harness.actor); err != nil {
+		t.Fatalf("Install(global after removal) error = %v", err)
+	}
+	reinstalledSecrets, err := harness.service.ListExtensionSecrets(
+		t.Context(),
+		extensionName,
+		harness.actor,
+	)
+	if err != nil {
+		t.Fatalf("ListExtensionSecrets(reinstalled global) error = %v", err)
+	}
+	if len(reinstalledSecrets.BoundEnvKeys) != 0 || len(reinstalledSecrets.Bindings) != 0 {
+		t.Fatalf("reinstalled global bindings = %#v, want empty", reinstalledSecrets)
+	}
+
+	origin := filepath.Join(harness.workspaceRoot, "binding-retirement-extension")
+	firstGeneration := writeBoundSecretExtensionGenerationWithEnv(
+		t,
+		origin,
+		extensionName,
+		"2.0.0",
+		[]string{"BOUND_SECRET", "OTHER_SECRET"},
+	)
+	if _, err := harness.service.Dev(t.Context(), contract.DevLinkExtensionRequest{
+		OriginPath: origin, GenerationHash: firstGeneration,
+	}, devActor); err != nil {
+		t.Fatalf("Dev() error = %v", err)
+	}
+	devForeignRef := vault.ExtensionProfileSecretRef(
+		extensionName,
+		store.DefaultProfileID,
+		workspaceID,
+		"FOREIGN_SHARED",
+	)
+	if _, err := harness.vault.PutSecret(t.Context(), devForeignRef, "foreign_token", foreignValue); err != nil {
+		t.Fatalf("PutSecret(dev foreign) error = %v", err)
+	}
+	if _, err := harness.service.SetExtensionSecrets(
+		t.Context(),
+		extensionName,
+		contract.SetExtensionSecretsRequest{Bindings: []contract.ExtensionSecretBindingInput{
+			{EnvName: "BOUND_SECRET", Value: new(ownedDev)},
+			{EnvName: "OTHER_SECRET", VaultRef: &devForeignRef},
+		}},
+		devActor,
+	); err != nil {
+		t.Fatalf("SetExtensionSecrets(dev) error = %v", err)
+	}
+	logsBeforeReload, err := harness.service.ExtensionLogs(t.Context(), extensionName, 0, "", devActor)
+	if err != nil {
+		t.Fatalf("ExtensionLogs(before manifest drop) error = %v", err)
+	}
+	var sequenceBeforeReload int64
+	if len(logsBeforeReload.Logs) > 0 {
+		sequenceBeforeReload = logsBeforeReload.Logs[len(logsBeforeReload.Logs)-1].Sequence
+	}
+	secondGeneration := writeBoundSecretExtensionGenerationWithEnv(
+		t,
+		origin,
+		extensionName,
+		"2.1.0",
+		[]string{"OTHER_SECRET"},
+	)
+	if _, err := harness.service.ReloadDev(t.Context(), extensionName, contract.ReloadExtensionRequest{
+		GenerationHash: secondGeneration,
+	}, devActor); err != nil {
+		t.Fatalf("ReloadDev(drop declared env) error = %v", err)
+	}
+	devSecrets, err := harness.service.ListExtensionSecrets(t.Context(), extensionName, devActor)
+	if err != nil {
+		t.Fatalf("ListExtensionSecrets(dev after reload) error = %v", err)
+	}
+	if len(devSecrets.Bindings) != 2 || !devSecrets.Bindings[0].Stale ||
+		devSecrets.Bindings[0].EnvName != "BOUND_SECRET" || devSecrets.Bindings[1].Stale {
+		t.Fatalf("dev bindings after manifest drop = %#v, want stale BOUND_SECRET only", devSecrets.Bindings)
+	}
+	logMatch := waitForSecretExtensionLogsAfter(
+		t,
+		harness.service,
+		extensionName,
+		devActor,
+		sequenceBeforeReload,
+		logsBeforeReload.StreamEpoch,
+		"runtime_secret=",
+	)
+	if strings.Contains(logMatch.matched.Message, "runtime_secret=[REDACTED]") {
+		t.Fatalf("matched dev log = %q, stale binding was injected", logMatch.matched.Message)
+	}
+	devOwnedRef := vault.ExtensionProfileSecretRef(extensionName, store.DefaultProfileID, workspaceID, "BOUND_SECRET")
+	// Invariant: failed dev unlink retains names, overrides, and bindings; committed unlink releases only its instance.
+	// Owner: daemon development lifecycle with real runtime/SQLite/Vault; canonical suite: TestExtensionSecrets.
+	if _, err := harness.db.ExtensionMCP.Reserve(t.Context(), allocationTarget, "global-kept", nil); err != nil {
+		t.Fatal(err)
+	}
+	devTarget := allocationTarget
+	devTarget.WorkspaceID = workspaceID
+	if _, err := harness.db.ExtensionMCP.Reserve(t.Context(), devTarget, "dev-kept", nil); err != nil {
+		t.Fatal(err)
+	}
+	if err := harness.db.ExtensionMCP.Update(
+		t.Context(),
+		devTarget,
+		extensionmcp.Override{URL: "https://example.com/dev"},
+	); err != nil {
+		t.Fatal(err)
+	}
+	namedDevTarget := devTarget
+	namedDevTarget.ProfileID = "named-profile"
+	if _, err := harness.db.ExtensionMCP.Reserve(t.Context(), namedDevTarget, "dev-named", nil); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := harness.db.DB().
+		ExecContext(t.Context(), `CREATE TRIGGER fail_dev_unlink_event BEFORE INSERT ON event_summary_outbox WHEN NEW.type = 'extension.dev.unlinked' BEGIN SELECT RAISE(ABORT, 'injected dev unlink event failure'); END`); err != nil {
+		t.Fatal(err)
+	}
+	_, unlinkErr := harness.service.RemoveScoped(t.Context(), extensionName, devActor)
+	if unlinkErr == nil || !strings.Contains(unlinkErr.Error(), "injected dev unlink event failure") {
+		t.Fatalf("unlink event failure = %v", unlinkErr)
+	}
+	if _, err := harness.db.DB().ExecContext(t.Context(), `DROP TRIGGER fail_dev_unlink_event`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := harness.db.DB().
+		ExecContext(t.Context(), `CREATE TRIGGER fail_dev_allocations BEFORE DELETE ON extension_mcp_overrides WHEN OLD.workspace_id <> '' BEGIN SELECT RAISE(ABORT, 'dev retirement failure'); END`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := harness.service.RemoveScoped(t.Context(), extensionName, devActor); err == nil {
+		t.Fatal("dev allocation retirement failure ignored")
+	}
+	if _, err := harness.db.DB().ExecContext(t.Context(), `DROP TRIGGER fail_dev_allocations`); err != nil {
+		t.Fatal(err)
+	}
+	var unlinkEvents int
+	if err := harness.db.ReadDB().
+		QueryRowContext(t.Context(), `SELECT COUNT(*) FROM event_summaries WHERE type = 'extension.dev.unlinked'`).
+		Scan(&unlinkEvents); err != nil ||
+		unlinkEvents != 0 {
+		t.Fatalf("failed retirement published a completed unlink event: %d %v", unlinkEvents, err)
+	}
+	if link, err := harness.service.registry.GetDevLink(
+		extensionName,
+		workspaceID,
+	); err != nil ||
+		link.BundleGeneration != secondGeneration {
+		t.Fatalf("failed unlink lost development generation: %#v %v", link, err)
+	}
+	devAllocations, err := harness.db.ExtensionMCP.List(t.Context(), store.DefaultProfileID, workspaceID)
+	if err != nil || len(devAllocations) != 1 || devAllocations[0].RuntimeName != "dev-kept" ||
+		devAllocations[0].URL != "https://example.com/dev" {
+		t.Fatalf("failed unlink changed dev allocation: %#v %v", devAllocations, err)
+	}
+	if value, err := harness.vault.ResolveRef(t.Context(), devOwnedRef); err != nil || value != ownedDev {
+		t.Fatalf("failed unlink lost dev vault value: %v", err)
+	}
+
+	if _, err := harness.service.RemoveScoped(t.Context(), extensionName, devActor); err != nil {
+		t.Fatalf("RemoveScoped(dev) error = %v", err)
+	}
+	if err := harness.db.ReadDB().
+		QueryRowContext(t.Context(), `SELECT COUNT(*) FROM event_summaries WHERE type = 'extension.dev.unlinked'`).
+		Scan(&unlinkEvents); err != nil ||
+		unlinkEvents != 1 {
+		t.Fatalf("committed retirement event count: %d %v", unlinkEvents, err)
+	}
+	remainingAllocations, err := harness.db.ExtensionMCP.ListAll(t.Context())
+	if err != nil || len(remainingAllocations) != 1 || remainingAllocations[0].RuntimeName != "global-kept" ||
+		remainingAllocations[0].WorkspaceID != "" {
+		t.Fatalf(
+			"committed unlink changed another instance or retained its allocation: %#v %v",
+			remainingAllocations,
+			err,
+		)
+	}
+
+	assertExtensionBindingsRetired(
+		t,
+		harness.db,
+		harness.vault,
+		extensionName,
+		workspaceID,
+		devOwnedRef,
+		devForeignRef,
+		foreignValue,
+	)
+}
+
+func assertExtensionBindingsRetired(
+	t *testing.T,
+	db *globaldb.GlobalDB,
+	secretVault *vault.Service,
+	extensionName string,
+	workspaceID string,
+	ownedRef string,
+	foreignRef string,
+	foreignValue string,
+) {
+	t.Helper()
+	rows, err := db.ExtensionEnvRepo.ListEnvBindings(
+		t.Context(),
+		extensionName,
+		store.DefaultProfileID,
+		workspaceID,
+	)
+	if err != nil {
+		t.Fatalf("ListEnvBindings(%q) error = %v", workspaceID, err)
+	}
+	if len(rows) != 0 {
+		t.Fatalf("bindings after retirement for workspace %q = %#v, want none", workspaceID, rows)
+	}
+	if _, err := secretVault.ResolveRef(t.Context(), ownedRef); !errors.Is(err, vault.ErrSecretNotFound) {
+		t.Fatalf("ResolveRef(owned %q) error = %v, want secret removed", ownedRef, err)
+	}
+	gotForeign, err := secretVault.ResolveRef(t.Context(), foreignRef)
+	if err != nil {
+		t.Fatalf("ResolveRef(foreign %q) error = %v", foreignRef, err)
+	}
+	if gotForeign != foreignValue {
+		t.Fatalf("foreign ref %q = %q, want preserved", foreignRef, gotForeign)
+	}
+}
+
+func testExtensionSecretDevBindingIsolation(t *testing.T) {
+	t.Parallel()
+
+	const (
+		extensionName = "dev-binding-isolation"
+		workspaceID   = "workspace-dev-binding"
+		devSecret     = "workspace-only-secret-f18a"
+		globalSecret  = "global-only-secret-c53b"
+	)
+	harness := newExtensionSecretIntegrationHarness(t, extensionSecretIntegrationHarnessOptions{
+		actorReason:      "development binding isolation",
+		actorWorkspaceID: workspaceID,
+		workspaceID:      workspaceID,
+	})
+	origin := filepath.Join(harness.workspaceRoot, "dev-binding-extension")
+	firstGeneration := writeBoundSecretExtensionGeneration(t, origin, extensionName, "1.0.0")
+	devResponse := performExtensionTransportRequest(
+		t,
+		harness.transport,
+		http.MethodPost,
+		"/extensions/dev",
+		mustExtensionTransportJSON(t, contract.DevLinkExtensionRequest{
+			OriginPath: origin, GenerationHash: firstGeneration,
+		}),
+	)
+	if devResponse.Code != http.StatusCreated {
+		t.Fatalf("dev link status = %d, want %d; body=%s", devResponse.Code, http.StatusCreated, devResponse.Body)
+	}
+	boundValue := devSecret
+	setResponse := performExtensionTransportRequest(
+		t,
+		harness.transport,
+		http.MethodPut,
+		"/extensions/"+extensionName+"/secrets",
+		mustExtensionTransportJSON(
+			t,
+			contract.SetExtensionSecretsRequest{Bindings: []contract.ExtensionSecretBindingInput{
+				{EnvName: "BOUND_SECRET", Value: &boundValue},
+			}},
+		),
+	)
+	if setResponse.Code != http.StatusOK {
+		t.Fatalf("dev set status = %d, want %d; body=%s", setResponse.Code, http.StatusOK, setResponse.Body)
+	}
+	workspaceRows, err := harness.db.ExtensionEnvRepo.ListEnvBindings(
+		t.Context(),
+		extensionName,
+		store.DefaultProfileID,
+		workspaceID,
+	)
+	if err != nil {
+		t.Fatalf("ListEnvBindings(workspace) error = %v", err)
+	}
+	if len(workspaceRows) != 1 ||
+		workspaceRows[0].SecretRef != vault.ExtensionProfileSecretRef(
+			extensionName,
+			store.DefaultProfileID,
+			workspaceID,
+			"BOUND_SECRET",
+		) {
+		t.Fatalf("workspace bindings = %#v, want exact workspace-owned ref", workspaceRows)
+	}
+	globalRows, err := harness.db.ExtensionEnvRepo.ListEnvBindings(
+		t.Context(),
+		extensionName,
+		store.DefaultProfileID,
+		"",
+	)
+	if err != nil {
+		t.Fatalf("ListEnvBindings(global) error = %v", err)
+	}
+	if len(globalRows) != 0 {
+		t.Fatalf("global bindings after dev set = %#v, want none", globalRows)
+	}
+
+	secondGeneration := writeBoundSecretExtensionGeneration(t, origin, extensionName, "1.1.0")
+	reloadResponse := performExtensionTransportRequest(
+		t,
+		harness.transport,
+		http.MethodPost,
+		"/extensions/"+extensionName+"/reload",
+		mustExtensionTransportJSON(t, contract.ReloadExtensionRequest{GenerationHash: secondGeneration}),
+	)
+	if reloadResponse.Code != http.StatusOK {
+		t.Fatalf(
+			"reload with workspace binding status = %d, want %d; body=%s",
+			reloadResponse.Code,
+			http.StatusOK,
+			reloadResponse.Body,
+		)
+	}
+	logs := waitForSecretExtensionLogs(t, harness.service, extensionName, harness.actor, "runtime_secret=")
+	boundLogsJSON := string(mustExtensionTransportJSON(t, logs))
+	assertSecretsAbsent(t, "workspace-bound logs", boundLogsJSON, []string{devSecret})
+	if !strings.Contains(boundLogsJSON, "runtime_secret=[REDACTED]") {
+		t.Fatalf("workspace-bound logs = %s, want proof of injected and redacted binding", boundLogsJSON)
+	}
+	latestSequence := logs[len(logs)-1].Sequence
+
+	globalRef := vault.ExtensionProfileSecretRef(extensionName, store.DefaultProfileID, "", "BOUND_SECRET")
+	if _, err := harness.vault.PutSecret(
+		t.Context(),
+		globalRef,
+		extensionpkg.ExtensionEnvBindingKind,
+		globalSecret,
+	); err != nil {
+		t.Fatalf("PutSecret(global sentinel) error = %v", err)
+	}
+	if err := harness.db.ExtensionEnvRepo.PutEnvBinding(t.Context(), extensionpkg.EnvBinding{
+		ExtensionName: extensionName,
+		ProfileID:     store.DefaultProfileID,
+		EnvName:       "BOUND_SECRET",
+		SecretRef:     globalRef,
+		Kind:          extensionpkg.ExtensionEnvBindingKind,
+	}); err != nil {
+		t.Fatalf("PutEnvBinding(global sentinel) error = %v", err)
+	}
+	deleteResponse := performExtensionTransportRequest(
+		t,
+		harness.transport,
+		http.MethodDelete,
+		"/extensions/"+extensionName+"/secrets/BOUND_SECRET",
+		nil,
+	)
+	if deleteResponse.Code != http.StatusNoContent {
+		t.Fatalf(
+			"delete dev binding status = %d, want %d; body=%s",
+			deleteResponse.Code,
+			http.StatusNoContent,
+			deleteResponse.Body,
+		)
+	}
+	thirdGeneration := writeBoundSecretExtensionGeneration(t, origin, extensionName, "1.2.0")
+	emptyReloadResponse := performExtensionTransportRequest(
+		t,
+		harness.transport,
+		http.MethodPost,
+		"/extensions/"+extensionName+"/reload",
+		mustExtensionTransportJSON(t, contract.ReloadExtensionRequest{GenerationHash: thirdGeneration}),
+	)
+	if emptyReloadResponse.Code != http.StatusOK {
+		t.Fatalf(
+			"reload without workspace binding status = %d, want %d; body=%s",
+			emptyReloadResponse.Code,
+			http.StatusOK,
+			emptyReloadResponse.Body,
+		)
+	}
+	logMatch := waitForSecretExtensionLogsAfter(
+		t,
+		harness.service,
+		extensionName,
+		harness.actor,
+		latestSequence,
+		logs[len(logs)-1].StreamEpoch,
+		"runtime_secret=",
+	)
+	encoded := string(mustExtensionTransportJSON(t, logMatch.logs))
+	assertSecretsAbsent(t, "dev logs without workspace binding", encoded, []string{devSecret, globalSecret})
+	effective, err := harness.db.ExtensionEnvRepo.ResolveEnvBindings(
+		t.Context(),
+		extensionName,
+		store.DefaultProfileID,
+		workspaceID,
+	)
+	if err != nil || len(effective) != 1 || effective[0].SecretRef != globalRef {
+		t.Fatalf("effective binding after deleting workspace override = %#v/%v, want profile fallback", effective, err)
+	}
+	if !strings.Contains(logMatch.matched.Message, "runtime_secret=[REDACTED]") {
+		t.Fatalf("matched dev log = %q, want injected and redacted profile fallback", logMatch.matched.Message)
+	}
+}
+
+func testExtensionSecretTransportRollback(t *testing.T) {
+	t.Parallel()
+
+	const extensionName = "binding-rollback"
+	harness := newExtensionSecretIntegrationHarness(t, extensionSecretIntegrationHarnessOptions{
+		actorReason:     "binding rollback",
+		allowUnverified: true,
+		failingVault:    true,
+	})
+	fixtureDir := writeBoundSecretExtensionFixtureWithEnv(
+		t,
+		t.TempDir(),
+		extensionName,
+		[]string{"A_KEY", "B_KEY"},
+	)
+	installResponse := performExtensionTransportRequest(
+		t,
+		harness.transport,
+		http.MethodPost,
+		"/extensions",
+		mustExtensionTransportJSON(t, contract.InstallExtensionRequest{
+			Source: contract.InstallExtensionSourceLocalPath, Ref: fixtureDir, AllowUnverified: true,
+		}),
+	)
+	if installResponse.Code != http.StatusCreated {
+		t.Fatalf(
+			"install status = %d, want %d; body=%s",
+			installResponse.Code,
+			http.StatusCreated,
+			installResponse.Body,
+		)
+	}
+
+	oldA, oldB := "old-a-secret", "old-b-secret"
+	oldBRef := vault.ExtensionProfileSecretRef(extensionName, store.DefaultProfileID, "", "B_SHARED")
+	if _, err := harness.vault.PutSecret(
+		t.Context(),
+		oldBRef,
+		extensionpkg.ExtensionEnvBindingKind,
+		oldB,
+	); err != nil {
+		t.Fatalf("PutSecret(ref-form seed) error = %v", err)
+	}
+	initialResponse := performExtensionTransportRequest(
+		t,
+		harness.transport,
+		http.MethodPut,
+		"/extensions/"+extensionName+"/secrets",
+		mustExtensionTransportJSON(
+			t,
+			contract.SetExtensionSecretsRequest{Bindings: []contract.ExtensionSecretBindingInput{
+				{EnvName: "A_KEY", Value: &oldA},
+				{EnvName: "B_KEY", VaultRef: &oldBRef},
+			}},
+		),
+	)
+	if initialResponse.Code != http.StatusOK {
+		t.Fatalf("initial set status = %d, want %d; body=%s", initialResponse.Code, http.StatusOK, initialResponse.Body)
+	}
+	initialRows, err := harness.db.ExtensionEnvRepo.ListEnvBindings(
+		t.Context(),
+		extensionName,
+		store.DefaultProfileID,
+		"",
+	)
+	if err != nil {
+		t.Fatalf("ListEnvBindings(initial) error = %v", err)
+	}
+	if len(initialRows) != 2 || initialRows[1].EnvName != "B_KEY" || initialRows[1].SecretRef != oldBRef {
+		t.Fatalf("initial binding rows = %#v, want value-form A and reused ref-form B", initialRows)
+	}
+	harness.failingVault.failSecondNextPut()
+	newA, newB := "new-a-secret", "new-b-secret"
+	failureResponse := performExtensionTransportRequest(
+		t,
+		harness.transport,
+		http.MethodPut,
+		"/extensions/"+extensionName+"/secrets",
+		mustExtensionTransportJSON(
+			t,
+			contract.SetExtensionSecretsRequest{Bindings: []contract.ExtensionSecretBindingInput{
+				{EnvName: "B_KEY", Value: &newB},
+				{EnvName: "A_KEY", Value: &newA},
+			}},
+		),
+	)
+	if failureResponse.Code != http.StatusInternalServerError {
+		t.Fatalf(
+			"failed set status = %d, want %d; body=%s",
+			failureResponse.Code,
+			http.StatusInternalServerError,
+			failureResponse.Body,
+		)
+	}
+	var errorPayload contract.ErrorPayload
+	if err := json.Unmarshal(failureResponse.Body.Bytes(), &errorPayload); err != nil {
+		t.Fatalf("json.Unmarshal(failed set response) error = %v", err)
+	}
+	if !strings.Contains(errorPayload.Error, "injected transport vault failure") {
+		t.Fatalf("failed set error = %q, want injected transport vault failure", errorPayload.Error)
+	}
+	assertSecretsAbsent(
+		t,
+		"failed set response",
+		failureResponse.Body.String(),
+		[]string{oldA, oldB, newA, newB},
+	)
+
+	listResponse := performExtensionTransportRequest(
+		t,
+		harness.transport,
+		http.MethodGet,
+		"/extensions/"+extensionName+"/secrets",
+		nil,
+	)
+	if listResponse.Code != http.StatusOK {
+		t.Fatalf("list status = %d, want %d; body=%s", listResponse.Code, http.StatusOK, listResponse.Body)
+	}
+	var payload contract.ExtensionSecretsPayload
+	if err := json.Unmarshal(listResponse.Body.Bytes(), &payload); err != nil {
+		t.Fatalf("json.Unmarshal(list response) error = %v", err)
+	}
+	if strings.Join(payload.BoundEnvKeys, ",") != "A_KEY,B_KEY" {
+		t.Fatalf("bound env keys = %#v, want pre-call A_KEY and B_KEY", payload.BoundEnvKeys)
+	}
+	for envName, state := range map[string]struct {
+		ref  string
+		want string
+	}{
+		"A_KEY": {ref: vault.ExtensionProfileSecretRef(extensionName, store.DefaultProfileID, "", "A_KEY"), want: oldA},
+		"B_KEY": {ref: oldBRef, want: oldB},
+	} {
+		got, resolveErr := harness.vault.ResolveRef(t.Context(), state.ref)
+		if resolveErr != nil {
+			t.Fatalf("ResolveRef(%s, %q) error = %v", envName, state.ref, resolveErr)
+		}
+		if got != state.want {
+			t.Fatalf("ResolveRef(%s, %q) = %q, want restored pre-call value", envName, state.ref, got)
+		}
+	}
+}
+
+func testExtensionSecretBindingEnableInjection(t *testing.T) {
+	t.Parallel()
+
+	const (
+		extensionName = "binding-hygiene"
+		secretValue   = "extension-binding-secret-f26a9c41"
+	)
+	harness := newExtensionSecretIntegrationHarness(t, extensionSecretIntegrationHarnessOptions{
+		actorReason:     "binding hygiene",
+		allowUnverified: true,
+	})
+	fixtureDir := writeBoundSecretExtensionFixture(t, t.TempDir(), extensionName)
+	installResponse := performExtensionTransportRequest(
+		t,
+		harness.transport,
+		http.MethodPost,
+		"/extensions",
+		mustExtensionTransportJSON(t, contract.InstallExtensionRequest{
+			Source: contract.InstallExtensionSourceLocalPath, Ref: fixtureDir, AllowUnverified: true,
+		}),
+	)
+	if installResponse.Code != http.StatusCreated {
+		t.Fatalf(
+			"install status = %d, want %d; body=%s",
+			installResponse.Code,
+			http.StatusCreated,
+			installResponse.Body,
+		)
+	}
+	assertSecretsAbsent(t, "install response", installResponse.Body.String(), []string{secretValue})
+	var installPayload contract.ExtensionResponse
+	if err := json.Unmarshal(installResponse.Body.Bytes(), &installPayload); err != nil {
+		t.Fatalf("json.Unmarshal(install response) error = %v", err)
+	}
+	installed := installPayload.Extension
+	if !installed.Enabled || len(installed.MissingEnv) != 1 || installed.MissingEnv[0] != "BOUND_SECRET" {
+		t.Fatalf("installed extension = %#v, want missing binding diagnostic", installed)
+	}
+	disabledResponse := performExtensionTransportRequest(t, harness.transport, http.MethodPost,
+		"/extensions/"+extensionName+"/disable", nil)
+	if disabledResponse.Code != http.StatusOK {
+		t.Fatalf("disable: %d/%s", disabledResponse.Code, disabledResponse.Body)
+	}
+	var disabled contract.ExtensionResponse
+	if err := json.Unmarshal(disabledResponse.Body.Bytes(), &disabled); err != nil {
+		t.Fatal(err)
+	}
+	if disabled.Extension.Enabled || disabled.Extension.PID != 0 {
+		t.Fatalf("disabled extension = %#v", disabled.Extension)
+	}
+
+	boundValue := secretValue
+	setResponse := performExtensionTransportRequest(
+		t,
+		harness.transport,
+		http.MethodPut,
+		"/extensions/"+extensionName+"/secrets",
+		mustExtensionTransportJSON(t, contract.SetExtensionSecretsRequest{
+			Bindings: []contract.ExtensionSecretBindingInput{
+				{EnvName: "BOUND_SECRET", Value: &boundValue},
+			},
+		}),
+	)
+	if setResponse.Code != http.StatusOK {
+		t.Fatalf("set secrets status = %d, want %d; body=%s", setResponse.Code, http.StatusOK, setResponse.Body)
+	}
+	assertSecretsAbsent(t, "set secrets response", setResponse.Body.String(), []string{secretValue})
+	rows, err := harness.db.ExtensionEnvRepo.ListEnvBindings(
+		t.Context(),
+		extensionName,
+		store.DefaultProfileID,
+		"",
+	)
+	if err != nil {
+		t.Fatalf("ListEnvBindings() error = %v", err)
+	}
+	if len(rows) != 1 || rows[0].EnvName != "BOUND_SECRET" ||
+		!strings.HasPrefix(rows[0].SecretRef, "vault:extensions/global/") {
+		t.Fatalf("global binding rows = %#v", rows)
+	}
+
+	enableResponse := performExtensionTransportRequest(
+		t,
+		harness.transport,
+		http.MethodPost,
+		"/extensions/"+extensionName+"/enable",
+		mustExtensionTransportJSON(t, contract.EnableExtensionRequest{}),
+	)
+	if enableResponse.Code != http.StatusOK {
+		t.Fatalf("enable status = %d, want %d; body=%s", enableResponse.Code, http.StatusOK, enableResponse.Body)
+	}
+	assertSecretsAbsent(t, "enable response", enableResponse.Body.String(), []string{secretValue})
+	logs := waitForSecretExtensionLogs(t, harness.service, extensionName, harness.actor, "runtime_secret=")
+	logsJSON := mustExtensionTransportJSON(t, logs)
+	assertSecretsAbsent(t, "bound extension logs", string(logsJSON), []string{secretValue})
+	if !bytes.Contains(logsJSON, []byte("[REDACTED]")) {
+		t.Fatalf("bound extension logs = %s, want redaction marker proving injected value", logsJSON)
+	}
+	events, err := harness.db.ListEventSummaries(
+		t.Context(),
+		store.EventSummaryQuery{ReadScope: store.ReadScope{AllProfiles: true}, Component: "extension"},
+	)
+	if err != nil {
+		t.Fatalf("ListEventSummaries() error = %v", err)
+	}
+	assertSecretsAbsent(
+		t,
+		"binding lifecycle events",
+		string(mustExtensionTransportJSON(t, events)),
+		[]string{secretValue},
+	)
+}
+
+func writeBoundSecretExtensionFixture(t *testing.T, root, name string) string {
+	t.Helper()
+	return writeBoundSecretExtensionFixtureWithEnv(t, root, name, []string{"BOUND_SECRET"})
+}
+
+func writeRemoteHeaderExtensionFixture(t *testing.T, root, name string) string {
+	t.Helper()
+	dir := writeBoundSecretExtensionFixtureWithEnv(t, root, name, nil)
+	manifestPath := filepath.Join(dir, "extension.toml")
+	manifest, err := os.ReadFile(manifestPath)
+	if err != nil {
+		t.Fatalf("os.ReadFile(%q) error = %v", manifestPath, err)
+	}
+	manifest = append(manifest, []byte(`
+
+[resources.mcp_servers.deployment-api]
+transport = "http"
+url = "https://deployment.example.test/mcp"
+headers = { "X-Tenant" = "acme" }
+`)...)
+	if err := os.WriteFile(manifestPath, manifest, 0o644); err != nil {
+		t.Fatalf("os.WriteFile(%q) error = %v", manifestPath, err)
+	}
+	return dir
+}
+
+func writeBoundSecretExtensionFixtureWithEnv(
+	t *testing.T,
+	root string,
+	name string,
+	requiredEnv []string,
+) string {
+	t.Helper()
+	return writeBoundSecretExtensionFixtureVersion(t, root, name, "1.0.0", requiredEnv)
+}
+
+func writeBoundSecretExtensionFixtureVersion(
+	t *testing.T,
+	root string,
+	name string,
+	version string,
+	requiredEnv []string,
+) string {
+	t.Helper()
+	dir := filepath.Join(root, name+"-"+version)
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatalf("os.MkdirAll(%q) error = %v", dir, err)
+	}
+	manifest := daemonTestExtensionManifest(name, daemonTestExtensionOptions{
+		version:        version,
+		requiredEnv:    requiredEnv,
+		runtimeCommand: daemonExtensionHelperCommand(t),
+		runtimeArgs:    daemonExtensionHelperArgs(),
+		runtimeEnv:     daemonExtensionHelperScenarioEnv("secret_hygiene", ""),
+	})
+	manifestPath := filepath.Join(dir, "extension.toml")
+	if err := os.WriteFile(manifestPath, []byte(manifest), 0o644); err != nil {
+		t.Fatalf("os.WriteFile(%q) error = %v", manifestPath, err)
+	}
+	return dir
+}
+
+type extensionSecretFailingVault struct {
+	extensionSecretVault
+
+	mu        sync.Mutex
+	putCalls  int
+	failPutAt int
+}
+
+func (v *extensionSecretFailingVault) PutSecret(
+	ctx context.Context,
+	ref string,
+	kind string,
+	value string,
+) (vault.Metadata, error) {
+	v.mu.Lock()
+	v.putCalls++
+	shouldFail := v.failPutAt > 0 && v.putCalls == v.failPutAt
+	v.mu.Unlock()
+	if shouldFail {
+		return vault.Metadata{}, errors.New("injected transport vault failure")
+	}
+	return v.extensionSecretVault.PutSecret(ctx, ref, kind, value)
+}
+
+func (v *extensionSecretFailingVault) failSecondNextPut() {
+	v.mu.Lock()
+	defer v.mu.Unlock()
+	v.failPutAt = v.putCalls + 2
+}
+
+func writeBoundSecretExtensionGeneration(t *testing.T, origin, name, version string) string {
+	t.Helper()
+	return writeBoundSecretExtensionGenerationWithEnv(
+		t,
+		origin,
+		name,
+		version,
+		[]string{"BOUND_SECRET"},
+	)
+}
+
+func writeBoundSecretExtensionGenerationWithEnv(
+	t *testing.T,
+	origin string,
+	name string,
+	version string,
+	requiredEnv []string,
+) string {
+	t.Helper()
+	fixture := writeBoundSecretExtensionFixtureVersion(t, t.TempDir(), name, version, requiredEnv)
+	return publishSecretExtensionGeneration(t, origin, fixture)
+}
+
+// Invariant: a second secret-write failure leaves no installed package, input rows, bindings or vault material.
+// Owner: daemon install transaction; canonical suite: TestExtensionSecrets.
+func testExtensionInputInstallRollback(t *testing.T) {
+	t.Parallel()
+	harness := newExtensionSecretIntegrationHarness(t, extensionSecretIntegrationHarnessOptions{
+		allowUnverified: true, failingVault: true, actorReason: "input install rollback",
+	})
+	const name = "input-rollback"
+	root := t.TempDir()
+	manifest := `name = "input-rollback"
+version = "1.0.0"
+description = "Input install rollback fixture"
+min_compozy_version = "0.0.0"
+
+[[inputs]]
+id = "first"
+prompt = "First"
+type = "secret"
+required = true
+binding = { type = "env", name = "FIRST_KEY" }
+
+[[inputs]]
+id = "second"
+prompt = "Second"
+type = "secret"
+required = true
+binding = { type = "env", name = "SECOND_KEY" }
+
+[[inputs]]
+id = "workspace"
+prompt = "Workspace"
+type = "identifier"
+required = true
+binding = { type = "env", name = "WORKSPACE_ID" }
+
+[resources.mcp_servers.server]
+command = "server"
+env = { WORKSPACE_ID = "workspace" }
+secret_env = { FIRST_KEY = "first", SECOND_KEY = "second" }
+`
+	if err := os.WriteFile(filepath.Join(root, "extension.toml"), []byte(manifest), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	harness.failingVault.failSecondNextPut()
+	response := performExtensionTransportRequest(t, harness.transport, http.MethodPost, "/extensions",
+		mustExtensionTransportJSON(t, contract.InstallExtensionRequest{
+			Source: contract.InstallExtensionSourceLocalPath, Ref: root, AllowUnverified: true, Scope: "global",
+			Inputs: map[string]extensioninput.Value{
+				"first":     {Value: json.RawMessage(`"first-secret"`)},
+				"second":    {Value: json.RawMessage(`"second-secret"`)},
+				"workspace": {Value: json.RawMessage(`"team"`)},
+			},
+		}))
+	if response.Code != http.StatusInternalServerError {
+		t.Fatalf("storage failure status=%d body=%s", response.Code, response.Body)
+	}
+	var failure contract.ErrorPayload
+	if err := json.Unmarshal(response.Body.Bytes(), &failure); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(failure.Error, "injected transport vault failure") {
+		t.Fatalf("primary storage failure was lost: %#v", failure)
+	}
+	assertSecretsAbsent(t, "failed input install", response.Body.String(), []string{"first-secret", "second-secret"})
+	instance := extensioninput.Instance{Extension: name, ProfileID: store.DefaultProfileID}
+	rows, err := harness.db.ExtensionInputs.List(t.Context(), instance)
+	if err != nil || len(rows) != 0 {
+		t.Fatalf("failed install retained input rows: %#v %v", rows, err)
+	}
+	bindings, err := harness.db.ExtensionEnvRepo.ListEnvBindings(t.Context(), name, store.DefaultProfileID, "")
+	if err != nil || len(bindings) != 0 {
+		t.Fatalf("failed install retained bindings: %#v %v", bindings, err)
+	}
+	secrets, err := harness.vault.ListMetadata(t.Context(), vault.ExtensionSecretOwnerPrefix(name, ""))
+	if err != nil || len(secrets) != 0 {
+		t.Fatalf("failed install retained vault entries: %#v %v", secrets, err)
+	}
+	if _, err := harness.service.registry.Get(name); !errors.Is(err, extensionpkg.ErrExtensionNotFound) {
+		t.Fatalf("failed install retained registry entry: %v", err)
+	}
+	if _, err := os.Stat(
+		extensionpkg.ManagedInstallPath(harness.service.homePaths, name),
+	); !errors.Is(
+		err,
+		os.ErrNotExist,
+	) {
+		t.Fatalf("failed install retained package files: %v", err)
+	}
+	items, err := harness.service.List(t.Context())
+	if err != nil || len(items) != 0 {
+		t.Fatalf("failed install remained in public inventory: %#v %v", items, err)
+	}
+}
+
+func testOrphanExtensionSecretRetirement(t *testing.T) {
+	t.Helper()
+	t.Parallel()
+	const name = "orphan-binding-retirement"
+	harness := newExtensionSecretIntegrationHarness(
+		t,
+		extensionSecretIntegrationHarnessOptions{actorReason: "orphan recovery", allowUnverified: true},
+	)
+	fixture := writeBoundSecretExtensionFixtureWithEnv(t, t.TempDir(), name, []string{"BOUND_SECRET"})
+	request := contract.InstallExtensionRequest{
+		Source:          contract.InstallExtensionSourceLocalPath,
+		Ref:             fixture,
+		AllowUnverified: true,
+	}
+	if _, err := harness.service.Install(t.Context(), request, harness.actor); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := harness.db.DB().
+		ExecContext(t.Context(), `DELETE FROM extension_installations WHERE extension_name = ?`, name); err != nil {
+		t.Fatal(err)
+	}
+	scopes := []string{"", "ws-orphan-a", "ws-orphan-b"}
+	when := time.Date(2026, 11, 1, 0, 0, 0, 0, time.UTC)
+	for _, workspace := range scopes {
+		ref := vault.ExtensionProfileSecretRef(name, store.DefaultProfileID, workspace, "BOUND_SECRET")
+		if _, err := harness.vault.PutSecret(
+			t.Context(),
+			ref,
+			extensionpkg.ExtensionEnvBindingKind,
+			"orphan-owned-secret",
+		); err != nil {
+			t.Fatal(err)
+		}
+		if err := harness.db.ExtensionEnvRepo.PutEnvBinding(t.Context(), extensionpkg.EnvBinding{
+			ExtensionName: name,
+			ProfileID:     store.DefaultProfileID,
+			WorkspaceID:   workspace,
+			EnvName:       "BOUND_SECRET",
+			SecretRef:     ref,
+			Kind:          extensionpkg.ExtensionEnvBindingKind,
+			CreatedAt:     when,
+			UpdatedAt:     when,
+		}); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := harness.db.ExtensionMCP.Reserve(
+			t.Context(),
+			extensionmcp.Target{
+				Extension:   name,
+				ProfileID:   store.DefaultProfileID,
+				WorkspaceID: workspace,
+				ServerName:  "orphan-server",
+			},
+			"orphan-server",
+			nil,
+		); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// Invariant: orphan recovery also retires Vault writes interrupted before binding persistence.
+	// Owner: real daemon removal transaction; canonical suite: TestExtensionSecrets.
+	var unboundRefs []string
+	for _, workspace := range scopes {
+		ref := vault.ExtensionProfileSecretRef(name, store.DefaultProfileID, workspace, "UNBOUND_SECRET")
+		if _, err := harness.vault.PutSecret(
+			t.Context(),
+			ref,
+			extensionpkg.ExtensionEnvBindingKind,
+			"unbound-owned-secret",
+		); err != nil {
+			t.Fatal(err)
+		}
+		unboundRefs = append(unboundRefs, ref)
+	}
+	preserved := []string{
+		vault.ExtensionProfileSecretRef(name+"-neighbor", store.DefaultProfileID, "", "TOKEN"),
+		vault.ExtensionProfileSecretRef(name, store.DefaultProfileID, "", "OPERATOR_SECRET"),
+	}
+	for i, ref := range preserved {
+		kind := extensionpkg.ExtensionEnvBindingKind
+		if i == 1 {
+			kind = "operator-managed"
+		}
+		if _, err := harness.vault.PutSecret(t.Context(), ref, kind, "preserved-secret"); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	if _, err := harness.db.DB().
+		ExecContext(t.Context(), `CREATE TRIGGER fail_orphan_removal BEFORE DELETE ON extension_mcp_overrides BEGIN SELECT RAISE(ABORT, 'orphan retirement failure'); END`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := harness.service.Remove(
+		t.Context(),
+		name,
+		harness.actor,
+	); err == nil ||
+		!strings.Contains(err.Error(), "orphan retirement failure") {
+		t.Fatalf("remove failure = %v", err)
+	}
+	for _, ref := range unboundRefs {
+		if value, err := harness.vault.ResolveRef(t.Context(), ref); err != nil || value != "unbound-owned-secret" {
+			t.Fatalf("unbound secret not restored: %v", err)
+		}
+	}
+
+	for _, workspace := range scopes {
+		bindings, err := harness.db.ExtensionEnvRepo.ListEnvBindings(
+			t.Context(),
+			name,
+			store.DefaultProfileID,
+			workspace,
+		)
+		if err != nil || len(bindings) != 1 {
+			t.Fatalf("restored bindings in %s: %v, %v", workspace, bindings, err)
+		}
+		value, err := harness.vault.ResolveRef(
+			t.Context(),
+			vault.ExtensionProfileSecretRef(name, store.DefaultProfileID, workspace, "BOUND_SECRET"),
+		)
+		if err != nil || value != "orphan-owned-secret" {
+			t.Fatalf("secret not restored in %s: %v", workspace, err)
+		}
+	}
+	if _, err := harness.db.DB().ExecContext(t.Context(), `DROP TRIGGER fail_orphan_removal`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := harness.service.Remove(t.Context(), name, harness.actor); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := harness.service.Install(t.Context(), request, harness.actor); err != nil {
+		t.Fatal(err)
+	}
+	for _, workspace := range scopes {
+		bindings, err := harness.db.ExtensionEnvRepo.ListEnvBindings(
+			t.Context(),
+			name,
+			store.DefaultProfileID,
+			workspace,
+		)
+		if err != nil || len(bindings) != 0 {
+			t.Fatalf("reinstall inherited bindings in %s: %v, %v", workspace, bindings, err)
+		}
+		if _, err := harness.vault.ResolveRef(
+			t.Context(),
+			vault.ExtensionProfileSecretRef(name, store.DefaultProfileID, workspace, "BOUND_SECRET"),
+		); !errors.Is(
+			err,
+			vault.ErrSecretNotFound,
+		) {
+			t.Fatalf("removed orphan credential in %s: %v", workspace, err)
+		}
+	}
+	for _, ref := range unboundRefs {
+		if _, err := harness.vault.ResolveRef(t.Context(), ref); !errors.Is(err, vault.ErrSecretNotFound) {
+			t.Fatalf("unbound orphan secret survived: %v", err)
+		}
+	}
+	for _, ref := range preserved {
+		if value, err := harness.vault.ResolveRef(t.Context(), ref); err != nil || value != "preserved-secret" {
+			t.Fatalf("unowned secret changed: %v", err)
+		}
+	}
+
+	records, err := harness.db.ExtensionMCP.ListAll(t.Context())
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, record := range records {
+		if record.Extension == name {
+			t.Fatalf("orphan MCP allocation survived: %s", record.WorkspaceID)
+		}
+	}
+}
+
+// Invariant: production HTTP and UDS Vault mutations wait for retirement before changing owned refs.
+// Owner: daemon API composition and lifecycle coordinator; canonical suite: TestExtensionSecrets.
+func testExtensionVaultMutationIsolation(t *testing.T) {
+	t.Helper()
+	for _, scenario := range []struct{ transport, method string }{
+		{"HTTP", http.MethodPut}, {"HTTP", http.MethodDelete}, {"UDS", http.MethodPut}, {"UDS", http.MethodDelete},
+	} {
+		method := scenario.method
+		t.Run("Should block "+method+" through "+scenario.transport+" until retirement completes", func(t *testing.T) {
+			t.Parallel()
+			const name = "encoded-owner"
+			harness := newExtensionSecretIntegrationHarness(
+				t,
+				extensionSecretIntegrationHarnessOptions{
+					actorReason:     "generic vault retirement isolation",
+					allowUnverified: true,
+				},
+			)
+			fixture := writeBoundSecretExtensionFixtureWithEnv(t, t.TempDir(), name, []string{"TOKEN"})
+			if _, err := harness.service.Install(t.Context(), contract.InstallExtensionRequest{
+				Source: contract.InstallExtensionSourceLocalPath, Ref: fixture, AllowUnverified: true,
+			}, harness.actor); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := harness.db.DB().ExecContext(t.Context(),
+				`DELETE FROM extension_installations WHERE extension_name = ?`, name); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := harness.db.ExtensionMCP.Reserve(t.Context(), extensionmcp.Target{
+				Extension: name, ProfileID: store.DefaultProfileID, ServerName: "retirement-fixture",
+			}, "retirement-fixture", nil); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := harness.db.DB().ExecContext(t.Context(),
+				`CREATE TRIGGER fail_vault_isolation BEFORE DELETE ON extension_mcp_overrides
+                 BEGIN SELECT RAISE(ABORT, 'vault-isolation-removal-failure'); END`); err != nil {
+				t.Fatal(err)
+			}
+
+			ref := vault.ExtensionProfileSecretRef(name, store.DefaultProfileID, "ws-guard", "TOKEN")
+			if _, err := harness.vault.PutSecret(
+				t.Context(),
+				ref,
+				extensionpkg.ExtensionEnvBindingKind,
+				"old-value",
+			); err != nil {
+				t.Fatal(err)
+			}
+			engine := newExtensionVaultProductionEngine(t, harness, scenario.transport)
+			ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
+			defer cancel()
+			entered, release := make(chan struct{}), make(chan struct{})
+			var releaseOnce sync.Once
+			defer releaseOnce.Do(func() { close(release) })
+			harness.service.secretVault = &extensionRetirementBarrierVault{
+				extensionSecretVault: harness.vault, entered: entered, release: release,
+			}
+			retired := make(chan error, 1)
+			go func() {
+				_, err := harness.service.Remove(ctx, name, harness.actor)
+				retired <- err
+			}()
+
+			select {
+			case <-entered:
+			case err := <-retired:
+				t.Fatalf("production removal returned before the retirement barrier: %v", err)
+			case <-ctx.Done():
+				t.Fatal(ctx.Err())
+			}
+			body, err := json.Marshal(
+				contract.PutVaultSecretRequest{
+					Ref:         ref,
+					Kind:        extensionpkg.ExtensionEnvBindingKind,
+					SecretValue: "new-value",
+				},
+			)
+			if err != nil {
+				t.Fatal(err)
+			}
+			request := httptest.NewRequest(method, "/api/vault/secrets?ref="+url.QueryEscape(ref), bytes.NewReader(body)).
+				WithContext(ctx)
+			request.Header.Set("Content-Type", "application/json")
+			request.RemoteAddr = "127.0.0.1:12345"
+			request.Host = "127.0.0.1:2123"
+			response := httptest.NewRecorder()
+			completed := make(chan struct{})
+			go func() { defer close(completed); engine.ServeHTTP(response, request) }()
+			waitForExtensionPackageRefs(t, harness.service.lifecycle, name, 2)
+			if value, err := harness.vault.ResolveRef(ctx, ref); err != nil || value != "old-value" {
+				t.Fatalf("generic mutation escaped retirement lock: %v", err)
+			}
+			releaseOnce.Do(func() { close(release) })
+			select {
+			case err := <-retired:
+				if err == nil || !strings.Contains(err.Error(), "vault-isolation-removal-failure") {
+					t.Fatalf("production removal compensation = %v", err)
+				}
+			case <-ctx.Done():
+				t.Fatal(ctx.Err())
+			}
+
+			if _, err := harness.service.registry.Get(name); err != nil {
+				t.Fatalf("package not restored after failed removal: %v", err)
+			}
+
+			select {
+			case <-completed:
+			case <-ctx.Done():
+				t.Fatal(ctx.Err())
+			}
+			wantStatus := http.StatusOK
+			if method == http.MethodDelete {
+				wantStatus = http.StatusNoContent
+			}
+			if response.Code != wantStatus {
+				t.Fatalf("Vault mutation status = %d", response.Code)
+			}
+			value, err := harness.vault.ResolveRef(ctx, ref)
+			if method == http.MethodPut && (err != nil || value != "new-value") {
+				t.Fatalf("later write lost: %v", err)
+			}
+			if method == http.MethodDelete && !errors.Is(err, vault.ErrSecretNotFound) {
+				t.Fatalf("later deletion lost: %v", err)
+			}
+		})
+	}
+}
+
+// waitForExtensionPackageRefs observes the coordinator signal rather than timing a blocked writer.
+func waitForExtensionPackageRefs(t *testing.T, c *extensionLifecycleCoordinator, name string, want int) {
+	t.Helper()
+	timer := time.NewTimer(3 * time.Second)
+	defer timer.Stop()
+	for {
+		c.mu.Lock()
+		got := 0
+		if entry := c.packages[name]; entry != nil {
+			got = entry.refs
+		}
+		changed := c.changed
+		c.mu.Unlock()
+		if got == want {
+			return
+		}
+		select {
+		case <-changed:
+		case <-timer.C:
+			t.Fatalf("package refs for %q did not reach %d", name, want)
+		}
+	}
+}
+
+// newExtensionVaultProductionEngine exercises the production HTTP/UDS options without opening listeners.
+func newExtensionVaultProductionEngine(
+	t *testing.T, harness *extensionSecretIntegrationHarness, transport string,
+) *gin.Engine {
+	t.Helper()
+	engine := gin.New()
+	paths := harness.service.homePaths
+	deps := RuntimeDeps{HomePaths: paths, Config: compozyconfig.DefaultWithHome(paths),
+		Logger: discardLogger(), Vault: harness.vault, Extensions: harness.service}
+	if transport == "HTTP" {
+		options := httpServerOptions(&deps)
+		options = append(options, httpapi.WithEngine(engine), httpapi.WithTerminalProvider(nil),
+			httpapi.WithSessionManager(authoredContextSessionManager()),
+			httpapi.WithTaskService(&apitest.StubTaskManager{}), httpapi.WithObserver(apitest.StubObserver{}),
+			httpapi.WithWorkspaceResolver(apitest.StubWorkspaceService{}))
+		if _, err := httpapi.New(options...); err != nil {
+			t.Fatal(err)
+		}
+	} else {
+		options := udsServerOptions(&deps)
+		options = append(
+			options,
+			udsapi.WithEngine(engine),
+			udsapi.WithTerminalProvider(nil),
+			udsapi.WithSocketPath(shortSocketPath(t)),
+			udsapi.WithSessionManager(authoredContextSessionManager()),
+			udsapi.WithTaskService(&apitest.StubTaskManager{}),
+			udsapi.WithObserver(apitest.StubObserver{}),
+			udsapi.WithWorkspaceResolver(apitest.StubWorkspaceService{}),
+		)
+		if _, err := udsapi.New(options...); err != nil {
+			t.Fatal(err)
+		}
+	}
+	return engine
+}
+
+// extensionRetirementBarrierVault pauses only the Vault I/O boundary while production removal owns its lock.
+type extensionRetirementBarrierVault struct {
+	extensionSecretVault
+	entered chan struct{}
+	release <-chan struct{}
+}
+
+func (v *extensionRetirementBarrierVault) ListExtensionMetadata(
+	ctx context.Context,
+	name string,
+) ([]vault.Metadata, error) {
+	rows, err := v.extensionSecretVault.ListExtensionMetadata(ctx, name)
+	if err != nil {
+		return nil, err
+	}
+	close(v.entered)
+	select {
+	case <-v.release:
+		return rows, nil
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	}
+}

@@ -1,0 +1,88 @@
+import type { Meta, StoryObj } from "@storybook/react-vite";
+import { fn, userEvent, within } from "storybook/test";
+
+import { StorySurface } from "@/storybook/story-layout";
+
+import { toProfileRows } from "../../lib/profile-rows";
+import {
+  consultingProfileFixture,
+  defaultProfileFixture,
+  growthProfileFixture,
+  marketingProfileFixture,
+} from "../../mocks/fixtures";
+import { ProfileSwitcher } from "../profile-switcher";
+
+const PLURAL = toProfileRows(
+  [defaultProfileFixture, marketingProfileFixture, consultingProfileFixture, growthProfileFixture],
+  "marketing"
+);
+
+const meta: Meta<typeof ProfileSwitcher> = {
+  title: "systems/profiles/components/ProfileSwitcher",
+  component: ProfileSwitcher,
+  parameters: {
+    layout: "centered",
+    docs: {
+      description: {
+        component:
+          "The rail-foot profile switcher: a 40px rail item. Quiet until a second profile exists; once plural it carries the identity glyph (name in the tooltip) and answers the boundary question in one sentence.",
+      },
+    },
+  },
+  args: {
+    onSelectProfile: fn(),
+    onSelectAggregate: fn(),
+    onCreate: fn(),
+    onEditProfile: fn(),
+    onOpenSettings: fn(),
+  },
+  decorators: [
+    Story => (
+      <StorySurface>
+        <div className="flex w-rail justify-center bg-rail py-2.5">
+          <Story />
+        </div>
+      </StorySurface>
+    ),
+  ],
+};
+
+export default meta;
+type Story = StoryObj<typeof meta>;
+
+/** Only `default` exists: a neutral icon button, no ceremony anywhere. */
+export const Quiet: Story = {
+  args: {
+    rows: toProfileRows([defaultProfileFixture], "default"),
+    activeName: "default",
+    aggregate: false,
+    quiet: true,
+    archivedCount: 0,
+  },
+};
+
+/** Plural: glyph plus name, with the archived count demoted to a Settings link. */
+export const Plural: Story = {
+  args: {
+    rows: PLURAL,
+    activeName: "marketing",
+    aggregate: false,
+    quiet: false,
+    archivedCount: 2,
+  },
+  play: async ({ canvasElement }) => {
+    const canvas = within(canvasElement);
+    await userEvent.click(canvas.getByRole("button", { name: "Profile: marketing" }));
+  },
+};
+
+/** The aggregate is a way of looking, so it renders the neutral layered mark. */
+export const AllProfiles: Story = {
+  args: {
+    rows: PLURAL,
+    activeName: "marketing",
+    aggregate: true,
+    quiet: false,
+    archivedCount: 2,
+  },
+};

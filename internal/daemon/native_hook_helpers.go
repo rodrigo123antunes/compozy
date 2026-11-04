@@ -1,0 +1,363 @@
+package daemon
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"strings"
+
+	compozyconfig "github.com/compozy/compozy/internal/config"
+	"github.com/compozy/compozy/internal/config/lifecycle"
+	hookspkg "github.com/compozy/compozy/internal/hooks"
+
+	toolspkg "github.com/compozy/compozy/internal/tools"
+)
+
+const nativeSecretAPIKey = "api_key"
+
+func (n *daemonNativeTools) hookCatalogFilter(
+	ctx context.Context,
+	input hooksListInput,
+	scope toolspkg.Scope,
+) (hookspkg.CatalogFilter, error) {
+	readScope, err := n.nativeProfileReadScope(ctx, scope)
+	if err != nil {
+		return hookspkg.CatalogFilter{}, err
+	}
+	workspaceRef := nativeCallerWorkspaceInput(input.Workspace, scope)
+	filter := hookspkg.CatalogFilter{
+		ProfileID: readScope.ProfileID,
+		AgentName: strings.TrimSpace(input.Agent),
+	}
+	if strings.TrimSpace(workspaceRef) != "" {
+		if n == nil || n.deps == nil || n.deps.Workspaces == nil {
+			return hookspkg.CatalogFilter{}, errors.New("daemon: workspace service is required")
+		}
+		resolved, resolveErr := n.deps.Workspaces.Resolve(ctx, workspaceRef)
+		if resolveErr != nil {
+			return hookspkg.CatalogFilter{}, fmt.Errorf("resolve hook catalog workspace: %w", resolveErr)
+		}
+		filter.WorkspaceID = strings.TrimSpace(resolved.ID)
+		filter.WorkspaceRoot = strings.TrimSpace(resolved.RootDir)
+	}
+	if event := strings.TrimSpace(input.Event); event != "" {
+		parsed := hookspkg.HookEvent(event)
+		if err := parsed.Validate(); err != nil {
+			return hookspkg.CatalogFilter{}, err
+		}
+		filter.Event = parsed
+	}
+	if source := strings.TrimSpace(input.Source); source != "" {
+		var parsed hookspkg.HookSource
+		if err := parsed.UnmarshalText([]byte(source)); err != nil {
+			return hookspkg.CatalogFilter{}, err
+		}
+		filter.Source = &parsed
+	}
+	if mode := strings.TrimSpace(input.Mode); mode != "" {
+		parsed := hookspkg.HookMode(mode)
+		if err := parsed.Validate(); err != nil {
+			return hookspkg.CatalogFilter{}, err
+		}
+		filter.Mode = parsed
+	}
+	return filter, nil
+}
+
+func (n *daemonNativeTools) rejectImmutableHookIfPresent(
+	ctx context.Context,
+	id toolspkg.ToolID,
+	name string,
+) error {
+	if n.deps.Observer == nil {
+		return nil
+	}
+	entries, err := n.deps.Observer.QueryHookCatalog(ctx, hookspkg.CatalogFilter{})
+	if err != nil {
+		return err
+	}
+	trimmed := strings.TrimSpace(name)
+	for _, entry := range entries {
+		if entry.Name != trimmed {
+			continue
+		}
+		if entry.Source != hookspkg.HookSourceConfig {
+			return toolspkg.NewToolError(
+				toolspkg.ErrorCodeDenied,
+				id,
+				fmt.Sprintf("hook %q source %q is immutable by tools", trimmed, entry.Source.String()),
+				toolspkg.ErrToolDenied,
+				toolspkg.ReasonHookSourceImmutable,
+			)
+		}
+		return nativeHookValidationError(id, fmt.Errorf("hook %q already exists", trimmed))
+	}
+	return nil
+}
+
+func (n *daemonNativeTools) deleteHookDeclaration(
+	ctx context.Context,
+	id toolspkg.ToolID,
+	target compozyconfig.WriteTarget,
+	workspaceRoot string,
+	name string,
+) (bool, error) {
+	deleted := false
+	if _, err := compozyconfig.EditConfigOverlay(
+		n.deps.HomePaths,
+		workspaceRoot,
+		target,
+		func(editor *compozyconfig.OverlayEditor) error {
+			var err error
+			deleted, err = editor.DeleteArrayTableItem(
+				[]string{nativeConfigHookToolsHooksKey, nativeConfigHookToolsDeclarationsKey},
+				nativeConfigHookToolsNameKey,
+				name,
+			)
+			return err
+		},
+	); err != nil {
+		return false, nativeHookValidationError(id, err)
+	}
+	if !deleted {
+		if err := n.rejectImmutableHookIfPresent(ctx, id, name); err != nil {
+			return false, err
+		}
+		return false, nil
+	}
+	return true, nil
+}
+
+func (n *daemonNativeTools) setHookEnabled(
+	ctx context.Context,
+	scope toolspkg.Scope,
+	req toolspkg.CallRequest,
+	enabled bool,
+) (toolspkg.ToolResult, error) {
+	var input hookNameMutationInput
+	if err := decodeNativeInput(req, &input); err != nil {
+		return toolspkg.ToolResult{}, err
+	}
+	workspaceRoot, err := n.nativeWorkspaceRoot(ctx, req.ToolID, input.Workspace)
+	if err != nil {
+		return toolspkg.ToolResult{}, err
+	}
+	target, workspaceRoot, err := n.nativeConfigWriteTarget(req.ToolID, scope, input.Scope, workspaceRoot)
+	if err != nil {
+		return toolspkg.ToolResult{}, err
+	}
+	decls, err := compozyconfig.OverlayHookDeclarations(target)
+	if err != nil {
+		return toolspkg.ToolResult{}, nativeHookValidationError(req.ToolID, err)
+	}
+	decl, ok := findHookDecl(decls, input.Name)
+	if !ok {
+		if err := n.rejectImmutableHookIfPresent(ctx, req.ToolID, input.Name); err != nil {
+			return toolspkg.ToolResult{}, err
+		}
+		return toolspkg.ToolResult{}, nativeHookNotFoundError(req.ToolID, input.Name)
+	}
+	decl.Enabled = new(enabled)
+	if hookEnvMapContainsSecret(decl.Env) {
+		return toolspkg.ToolResult{}, nativeHookSecretError(req.ToolID)
+	}
+	if _, err := hookspkg.CanonicalizeHookDecl(decl); err != nil {
+		return toolspkg.ToolResult{}, nativeHookValidationError(req.ToolID, err)
+	}
+	if _, err := compozyconfig.EditConfigOverlay(
+		n.deps.HomePaths,
+		workspaceRoot,
+		target,
+		func(editor *compozyconfig.OverlayEditor) error {
+			return editor.UpsertArrayTableItem(
+				[]string{nativeConfigHookToolsHooksKey, nativeConfigHookToolsDeclarationsKey},
+				nativeConfigHookToolsNameKey,
+				decl.Name,
+				compozyconfig.HookDeclarationOverlayValues(decl),
+			)
+		},
+	); err != nil {
+		return toolspkg.ToolResult{}, nativeHookValidationError(req.ToolID, err)
+	}
+	action := hookActionDisabled
+	if enabled {
+		action = hookActionEnabled
+	}
+	return nativeHookMutationResult(decl, action, target)
+}
+
+func nativeHookMutableSource(id toolspkg.ToolID, source *string) error {
+	if source == nil {
+		return nil
+	}
+	trimmed := strings.TrimSpace(*source)
+	if trimmed == "" || trimmed == hookspkg.HookSourceConfig.String() {
+		return nil
+	}
+	return toolspkg.NewToolError(
+		toolspkg.ErrorCodeDenied,
+		id,
+		fmt.Sprintf("hook source %q is immutable by tools", trimmed),
+		toolspkg.ErrToolDenied,
+		toolspkg.ReasonHookSourceImmutable,
+	)
+}
+
+func nativeHookSecretError(id toolspkg.ToolID) error {
+	return toolspkg.NewToolError(
+		toolspkg.ErrorCodeDenied,
+		id,
+		"hook executor env contains a forbidden secret-bearing input",
+		toolspkg.ErrToolDenied,
+		toolspkg.ReasonHookSecretInputForbidden,
+	)
+}
+
+func nativeHookValidationError(id toolspkg.ToolID, err error) error {
+	return toolspkg.NewToolError(
+		toolspkg.ErrorCodeInvalidInput,
+		id,
+		"hook declaration validation failed",
+		fmt.Errorf("%w: %w", toolspkg.ErrToolInvalidInput, err),
+		toolspkg.ReasonHookValidationFailed,
+	)
+}
+
+func nativeHookCatalogFilterError(id toolspkg.ToolID, err error) error {
+	if toolErr, ok := errors.AsType[*toolspkg.ToolError](err); ok && toolErr != nil {
+		return err
+	}
+	return nativeHookValidationError(id, err)
+}
+
+func nativeHookNotFoundError(id toolspkg.ToolID, name string) error {
+	trimmed := strings.TrimSpace(name)
+	return toolspkg.NewToolError(
+		toolspkg.ErrorCodeNotFound,
+		id,
+		fmt.Sprintf("hook %q not found in target config overlay", trimmed),
+		toolspkg.ErrToolNotFound,
+		toolspkg.ReasonToolUnknown,
+	)
+}
+
+func nativeHookMutationResult(
+	decl hookspkg.HookDecl,
+	action string,
+	target compozyconfig.WriteTarget,
+) (toolspkg.ToolResult, error) {
+	payload := map[string]any{
+		nativeConfigHookToolsNameKey:   decl.Name,
+		nativeActionKey:                action,
+		nativeConfigHookToolsScopeKey:  string(target.Scope()),
+		nativeConfigHookToolsTargetKey: target.Path(),
+		nativeConfigHookToolsHookKey:   nativeHookDeclPayload(decl),
+	}
+	if err := addNativeConfigLifecycleFields(payload, "hooks.declarations"); err != nil {
+		return toolspkg.ToolResult{}, err
+	}
+	return structuredResult(payload, decl.Name)
+}
+
+func addNativeConfigLifecycleFields(payload map[string]any, path string) error {
+	rule, err := lifecycle.ClassifyPath(path)
+	if err != nil {
+		return err
+	}
+	applied := rule.Lifecycle != lifecycle.RestartRequired
+	status := lifecycle.StatusApplied
+	if !applied {
+		status = lifecycle.StatusBlocked
+	}
+	payload[nativeAppliedValue] = applied
+	payload[nativeConfigHookToolsLifecycleKey] = string(rule.Lifecycle)
+	payload[nativeConfigHookToolsNextActionKey] = string(lifecycle.NextActionForLifecycle(rule.Lifecycle, status))
+	return nil
+}
+
+func nativeHookDeclPayload(decl hookspkg.HookDecl) map[string]any {
+	payload := map[string]any{
+		nativeConfigHookToolsNameKey: decl.Name,
+		loopEventIdentity:            decl.Event.String(),
+		bootSourceKey:                decl.Source.String(),
+		"mode":                       string(decl.Mode),
+		daemonRequiredValue:          decl.Required,
+		"priority":                   decl.Priority,
+		"executor_kind":              string(decl.ExecutorKind),
+		"command":                    decl.Command,
+		nativeToolsArgsKey:           append([]string(nil), decl.Args...),
+		"env":                        cloneStringMap(decl.Env),
+		"secret_env":                 cloneStringMap(decl.SecretEnv),
+		"matcher":                    decl.Matcher,
+	}
+	if decl.Enabled != nil {
+		payload[hookEnabledKey] = *decl.Enabled
+	} else {
+		payload[hookEnabledKey] = true
+	}
+	if decl.Timeout > 0 {
+		payload["timeout_ms"] = decl.Timeout.Milliseconds()
+	}
+	return payload
+}
+
+func findHookDecl(decls []hookspkg.HookDecl, name string) (hookspkg.HookDecl, bool) {
+	trimmed := strings.TrimSpace(name)
+	for _, decl := range decls {
+		if strings.EqualFold(strings.TrimSpace(decl.Name), trimmed) {
+			return decl, true
+		}
+	}
+	return hookspkg.HookDecl{}, false
+}
+
+func hookEnvContainsSecret(env *map[string]string) bool {
+	if env == nil {
+		return false
+	}
+	return hookEnvMapContainsSecret(*env)
+}
+
+func hookEnvMapContainsSecret(env map[string]string) bool {
+	for key, value := range env {
+		if secretLikeText(key) || secretLikeText(value) {
+			return true
+		}
+	}
+	return false
+}
+
+func secretLikeText(value string) bool {
+	lower := strings.ToLower(strings.TrimSpace(value))
+	if lower == "" {
+		return false
+	}
+	needles := []string{
+		"secret",
+		nativeConfigHookToolsTokenKey,
+		"password",
+		nativeSecretAPIKey,
+		"apikey",
+		"authorization",
+		"bearer",
+	}
+	for _, needle := range needles {
+		if strings.Contains(lower, needle) {
+			return true
+		}
+	}
+	return strings.HasPrefix(lower, "sk-")
+}
+
+func cloneHookMatcher(src hookspkg.HookMatcher) hookspkg.HookMatcher {
+	cloned := src
+	if src.ToolReadOnly != nil {
+		value := *src.ToolReadOnly
+		cloned.ToolReadOnly = &value
+	}
+	if src.Autonomy != nil {
+		value := *src.Autonomy
+		cloned.Autonomy = &value
+	}
+	return cloned
+}

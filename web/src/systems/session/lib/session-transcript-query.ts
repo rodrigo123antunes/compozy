@@ -1,0 +1,400 @@
+import type { InfiniteData } from "@tanstack/react-query";
+
+import { isAgentEventPayload } from "./message-parts";
+import { isProviderErrorEvent, isProviderFailureMarker } from "./provider-error";
+
+import type {
+  NormalizedSessionTranscriptEntry,
+  NormalizedSessionTranscriptResponse,
+  SessionMessage,
+  SessionTranscriptPage,
+  SessionTranscriptQuery,
+  TranscriptDeltaPayload,
+  TranscriptSnapshotPayload,
+} from "../types";
+
+const DEFAULT_TRANSCRIPT_LIMIT = 200;
+
+export interface OlderTranscriptPageParam {
+  beforeSequence: number;
+  epoch: number;
+  generation: number;
+}
+
+export type SessionTranscriptPageParam = OlderTranscriptPageParam | undefined;
+export type SessionTranscriptData = InfiniteData<SessionTranscriptPage, unknown>;
+
+interface TranscriptFence {
+  epoch: number;
+  generation: number;
+}
+
+export function transcriptPageFromResponse(
+  response: NormalizedSessionTranscriptResponse
+): SessionTranscriptPage {
+  return { ...response, cursor: response.max_sequence };
+}
+
+export function transcriptPageRequest(
+  pageParam: SessionTranscriptPageParam
+): SessionTranscriptQuery {
+  return pageParam ? { before_sequence: pageParam.beforeSequence } : {};
+}
+
+export function nextTranscriptPageParam(page: SessionTranscriptPage): SessionTranscriptPageParam {
+  if (!page.has_older || page.next_before_sequence === undefined) {
+    return undefined;
+  }
+  return {
+    beforeSequence: page.next_before_sequence,
+    epoch: page.epoch,
+    generation: page.generation,
+  };
+}
+
+export function transcriptPageMatchesFence(
+  response: TranscriptFence,
+  pageParam: SessionTranscriptPageParam
+): boolean {
+  return (
+    pageParam === undefined ||
+    (response.epoch === pageParam.epoch && response.generation === pageParam.generation)
+  );
+}
+
+export function flattenTranscriptEntries(
+  data: SessionTranscriptData | undefined
+): NormalizedSessionTranscriptEntry[] {
+  if (!data) return [];
+  return mergeTranscriptEntries(...data.pages.map(page => page.entries));
+}
+
+export function flattenTranscriptMessages(
+  data: SessionTranscriptData | undefined
+): SessionMessage[] {
+  return projectTranscriptMessages(flattenTranscriptEntries(data).map(entry => entry.message));
+}
+
+/** Reconcile an admitted input without advancing past assistant events still owned by the POST. */
+export function reconcileAdmittedPrompt(
+  data: SessionTranscriptData | undefined,
+  response: NormalizedSessionTranscriptResponse,
+  messageId: string
+): SessionTranscriptData | undefined {
+  const head = data?.pages[0];
+  if (!data || !head || !transcriptFrameMatches(data, response)) return data;
+  const input = response.entries.find(
+    entry => entry.message.id === messageId && entry.message.role === "user"
+  );
+  if (!input) return data;
+  return withBoundedTranscriptHead(data, {
+    ...head,
+    entries: mergeTranscriptEntries(head.entries, [input]),
+  });
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function compozyEventFromPart(part: unknown) {
+  if (!isRecord(part) || part.type !== "data-compozy-event") {
+    return null;
+  }
+  return isAgentEventPayload(part.data) ? part.data : null;
+}
+
+function eventTurnID(part: unknown, event: ReturnType<typeof compozyEventFromPart>): string | null {
+  if (!event) return null;
+  if (isRecord(part) && typeof part.turnId === "string" && part.turnId.trim() !== "") {
+    return part.turnId;
+  }
+  return event.turn_id?.trim() || null;
+}
+
+interface ProviderFailurePart {
+  index: number;
+  turnID: string;
+  kind: "marker" | "diagnostic" | "error";
+}
+
+const failurePartsByContent = new WeakMap<
+  NonNullable<SessionMessage["parts"]>,
+  readonly ProviderFailurePart[]
+>();
+
+function providerFailureParts(message: SessionMessage): readonly ProviderFailurePart[] {
+  const parts = message.parts;
+  if (!parts) return [];
+  const cached = failurePartsByContent.get(parts);
+  if (cached) return cached;
+  const failures: ProviderFailurePart[] = [];
+  for (let index = 0; index < parts.length; index += 1) {
+    const part = parts[index];
+    const event = compozyEventFromPart(part);
+    if (!event) continue;
+    const marker = isProviderFailureMarker(event);
+    if (!marker && event.type !== "error") continue;
+    const turnID = eventTurnID(part, event);
+    if (!turnID) continue;
+    failures.push({
+      index,
+      turnID,
+      kind: marker ? "marker" : isProviderErrorEvent(event) ? "diagnostic" : "error",
+    });
+  }
+  failurePartsByContent.set(parts, failures);
+  return failures;
+}
+
+/**
+ * Turn ids that recorded a provider failure, split by which record should
+ * survive projection: the daemon emits both a raw `error` event and a
+ * `provider_failure` marker for the same turn, and the transcript shows one.
+ * The marker wins by default; an `error` carrying an actionable provider
+ * diagnostic (auth lapse, rate limit) wins instead because it names the
+ * provider, the next step, and the occurrence context the marker lacks.
+ */
+function providerFailureTurnIDs(messages: readonly SessionMessage[]): {
+  markerTurnIDs: ReadonlySet<string>;
+  diagnosticTurnIDs: ReadonlySet<string>;
+} {
+  const markerTurnIDs = new Set<string>();
+  const diagnosticTurnIDs = new Set<string>();
+  for (const message of messages) {
+    for (const failure of providerFailureParts(message)) {
+      if (failure.kind === "marker") markerTurnIDs.add(failure.turnID);
+      else if (failure.kind === "diagnostic") diagnosticTurnIDs.add(failure.turnID);
+    }
+  }
+  return { markerTurnIDs, diagnosticTurnIDs };
+}
+
+function projectTranscriptMessages(messages: readonly SessionMessage[]): SessionMessage[] {
+  const { markerTurnIDs, diagnosticTurnIDs } = providerFailureTurnIDs(messages);
+  if (markerTurnIDs.size === 0) return [...messages];
+
+  const projected: SessionMessage[] = [];
+  for (const message of messages) {
+    const parts = message.parts ?? [];
+    if (parts.length === 0) continue;
+    const hidden = new Set<number>();
+    for (const failure of providerFailureParts(message)) {
+      if (
+        markerTurnIDs.has(failure.turnID) &&
+        (failure.kind === "error" ||
+          (failure.kind === "marker" && diagnosticTurnIDs.has(failure.turnID)))
+      ) {
+        hidden.add(failure.index);
+      }
+    }
+    if (hidden.size === 0) {
+      projected.push(message);
+      continue;
+    }
+    const visibleParts = parts.filter((_part, index) => !hidden.has(index));
+    if (visibleParts.length === 0) continue;
+    projected.push({ ...message, parts: visibleParts } as SessionMessage);
+  }
+  return projected;
+}
+
+export function transcriptFrameMatches(
+  data: SessionTranscriptData | undefined,
+  frame: TranscriptFence
+): boolean {
+  const head = data?.pages[0];
+  return !head || (head.epoch === frame.epoch && head.generation === frame.generation);
+}
+
+export function transcriptStreamCursor(data: SessionTranscriptData | undefined) {
+  const head = data?.pages[0];
+  if (!head) return {};
+  return {
+    afterSequence: head.cursor,
+    epoch: head.epoch,
+    generation: head.generation,
+  };
+}
+
+export function applyTranscriptSnapshot(
+  data: SessionTranscriptData | undefined,
+  snapshot: Omit<TranscriptSnapshotPayload, "entries"> & {
+    entries: NormalizedSessionTranscriptEntry[];
+  },
+  eventCursor: number
+): SessionTranscriptData {
+  const existingHead = data?.pages[0];
+  const reset = snapshot.reset || !data || !existingHead;
+  const entries = reset
+    ? mergeTranscriptEntries(snapshot.entries)
+    : mergeTranscriptEntries(existingHead.entries, snapshot.entries);
+  const head: SessionTranscriptPage = {
+    cursor: reset
+      ? Math.max(snapshot.max_sequence, eventCursor)
+      : Math.max(existingHead?.cursor ?? 0, snapshot.max_sequence, eventCursor),
+    entries,
+    epoch: snapshot.epoch,
+    generation: snapshot.generation,
+    has_older: snapshot.has_older,
+    limit: existingHead?.limit ?? Math.max(snapshot.entries.length, DEFAULT_TRANSCRIPT_LIMIT),
+    max_sequence: reset
+      ? snapshot.max_sequence
+      : Math.max(existingHead?.max_sequence ?? 0, snapshot.max_sequence),
+    ...(snapshot.next_before_sequence === undefined
+      ? {}
+      : { next_before_sequence: snapshot.next_before_sequence }),
+  };
+
+  if (reset) {
+    return withBoundedTranscriptHead(undefined, head);
+  }
+  return withBoundedTranscriptHead(data, head);
+}
+
+export function applyTranscriptDelta(
+  data: SessionTranscriptData | undefined,
+  delta: Omit<TranscriptDeltaPayload, "entries"> & {
+    entries: NormalizedSessionTranscriptEntry[];
+  },
+  eventCursor: number
+): SessionTranscriptData {
+  const existingHead = data?.pages[0];
+  const head: SessionTranscriptPage = {
+    cursor: Math.max(existingHead?.cursor ?? 0, delta.cursor, eventCursor),
+    entries: mergeTranscriptEntries(existingHead?.entries ?? [], delta.entries),
+    epoch: delta.epoch,
+    generation: delta.generation,
+    has_older: existingHead?.has_older ?? false,
+    limit: existingHead?.limit ?? DEFAULT_TRANSCRIPT_LIMIT,
+    max_sequence: Math.max(existingHead?.max_sequence ?? 0, delta.max_sequence),
+    ...(existingHead?.next_before_sequence === undefined
+      ? {}
+      : { next_before_sequence: existingHead.next_before_sequence }),
+  };
+
+  if (!data) {
+    return withBoundedTranscriptHead(undefined, head);
+  }
+  return withBoundedTranscriptHead(data, head);
+}
+
+/**
+ * A refetched head page (a mutation's reread, a focus refetch) over a head the
+ * live stream already advanced: same fences → the two merge by start sequence
+ * and the cursor keeps the stream's position, so an entry the stream applied
+ * between the daemon's read and the answer landing is never dropped (the
+ * stream will not carry it again); other fences → the reread is a history
+ * rewrite and replaces the load, as the live tail states it.
+ */
+export function reconcileRefetchedTranscriptHead(
+  data: SessionTranscriptData | undefined,
+  page: SessionTranscriptPage
+): SessionTranscriptPage {
+  const existingHead = data?.pages[0];
+  if (
+    !existingHead ||
+    existingHead.epoch !== page.epoch ||
+    existingHead.generation !== page.generation
+  ) {
+    return page;
+  }
+  return {
+    ...page,
+    cursor: Math.max(existingHead.cursor, page.cursor),
+    entries: mergeTranscriptEntries(existingHead.entries, page.entries),
+    max_sequence: Math.max(existingHead.max_sequence, page.max_sequence),
+  };
+}
+
+export function reconcileTranscriptTail(
+  data: SessionTranscriptData | undefined,
+  tail: SessionTranscriptPage
+): SessionTranscriptData {
+  const existingHead = data?.pages[0];
+  if (
+    !data ||
+    !existingHead ||
+    existingHead.epoch !== tail.epoch ||
+    existingHead.generation !== tail.generation
+  ) {
+    return withBoundedTranscriptHead(undefined, tail);
+  }
+  return withBoundedTranscriptHead(data, {
+    ...tail,
+    cursor: Math.max(existingHead.cursor, tail.cursor),
+    entries: mergeTranscriptEntries(existingHead.entries, tail.entries),
+  });
+}
+
+export function appendSyntheticTranscriptMessage(
+  data: SessionTranscriptData | undefined,
+  message: SessionMessage,
+  sequence: number
+): SessionTranscriptData | undefined {
+  const head = data?.pages[0];
+  if (!data || !head) return data;
+  const syntheticEntry: NormalizedSessionTranscriptEntry = {
+    message,
+    sequence,
+    start_sequence: Number.MAX_SAFE_INTEGER,
+  };
+  return withBoundedTranscriptHead(data, {
+    ...head,
+    entries: mergeTranscriptEntries(head.entries, [syntheticEntry]),
+  });
+}
+
+function mergeTranscriptEntries(
+  ...collections: readonly NormalizedSessionTranscriptEntry[][]
+): NormalizedSessionTranscriptEntry[] {
+  const entriesByStart = new Map<number, NormalizedSessionTranscriptEntry>();
+  for (const entries of collections) {
+    for (const entry of entries) {
+      const current = entriesByStart.get(entry.start_sequence);
+      if (!current || entry.sequence >= current.sequence) {
+        entriesByStart.set(entry.start_sequence, entry);
+      }
+    }
+  }
+  return [...entriesByStart.values()].sort(
+    (left, right) => left.start_sequence - right.start_sequence
+  );
+}
+
+function withBoundedTranscriptHead(
+  data: SessionTranscriptData | undefined,
+  head: SessionTranscriptPage
+): SessionTranscriptData {
+  const headLimit = Math.max(1, head.limit);
+  const headSplit = Math.max(0, head.entries.length - headLimit);
+  let overflow = head.entries.slice(0, headSplit);
+  const boundedHead = { ...head, entries: head.entries.slice(headSplit) };
+  const existingHistory = data?.pages.slice(1) ?? [];
+  const history: SessionTranscriptPage[] = [];
+
+  for (const page of existingHistory) {
+    if (overflow.length === 0) {
+      history.push(page);
+      continue;
+    }
+    const entries = mergeTranscriptEntries(overflow, page.entries);
+    const pageLimit = Math.max(1, page.limit);
+    const split = Math.max(0, entries.length - pageLimit);
+    overflow = entries.slice(0, split);
+    history.push({ ...page, entries: entries.slice(split) });
+  }
+
+  while (overflow.length > 0) {
+    const template = history.at(-1) ?? boundedHead;
+    const pageLimit = Math.max(1, template.limit);
+    const split = Math.max(0, overflow.length - pageLimit);
+    const entries = overflow.slice(split);
+    overflow = overflow.slice(0, split);
+    history.push({ ...template, entries });
+  }
+
+  const pageParams = data?.pageParams.slice(0, history.length + 1) ?? [undefined];
+  while (pageParams.length < history.length + 1) pageParams.push(undefined);
+  return { pages: [boundedHead, ...history], pageParams };
+}

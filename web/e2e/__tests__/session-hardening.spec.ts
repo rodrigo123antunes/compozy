@@ -1,0 +1,1655 @@
+import { execFile } from "node:child_process";
+import { createHash, randomUUID } from "node:crypto";
+import { mkdtempSync, readFileSync, writeFileSync } from "node:fs";
+import { mkdir, mkdtemp, readFile, writeFile } from "node:fs/promises";
+import os from "node:os";
+import path from "node:path";
+import process from "node:process";
+import { fileURLToPath } from "node:url";
+import { promisify } from "node:util";
+
+import { appWindow, sessionWindow, switchWorkspace } from "../fixtures/os-navigation";
+import {
+  sessionLifecycleSelectors,
+  sessionWindowSelectors,
+  settingsOperatorSelectors,
+} from "../fixtures/selectors";
+import {
+  cleanupBrowserSettingsFixtures,
+  seedBrowserSettingsFixtures,
+  type BrowserRuntime,
+  type WorkspacePayload,
+} from "../fixtures/runtime";
+import { expect, test } from "../fixtures/test";
+import { completeOnboardingIfPrompted } from "../fixtures/workspace";
+
+const execFileAsync = promisify(execFile);
+const fixtureRoot = path.resolve(
+  path.dirname(fileURLToPath(import.meta.url)),
+  "..",
+  "..",
+  "..",
+  "internal",
+  "testutil",
+  "acpmock",
+  "testdata"
+);
+const browserHardeningFixture = path.join(fixtureRoot, "browser_session_hardening_fixture.json");
+const driverFaultFixture = path.join(fixtureRoot, "driver_fault_fixture.json");
+const autoTitleFixture = path.join(fixtureRoot, "auto_title_fixture.json");
+const costProvenanceFixture = path.join(fixtureRoot, "cost_provenance_fixture.json");
+const toolArtifactFixture = path.join(fixtureRoot, "browser_tool_artifact_fixture.json");
+const nativeCompactionFixture = path.join(fixtureRoot, "native_compaction_fixture.json");
+const sessionContextFixture = path.join(fixtureRoot, "session_context_fixture.json");
+const permissionAgent = "permission-hardening-agent";
+const faultAgent = "faulty";
+const autoTitleAgent = "auto-title-agent";
+const costProvenanceAgent = "cost-provenance-agent";
+const toolArtifactAgent = "tool-artifact-agent";
+const compactionAgent = "compaction-claude";
+const silentContextAgent = "session-context-agent";
+const compactionHoldPrompt = "hold the turn open";
+const costProvenancePrompt = "Summarize the cost provenance run";
+const toolArtifactDigest = "c82d7447711d610d6c0d8fd52b8c8ee99f051a81e62f51bf052eaad467fca444";
+const toolArtifactTail = "E2E-009 tool artifact tail";
+// Public native ToolIDs such as compozy__mcp_auth_status are not credential markers.
+const sensitivePattern =
+  /compozy_claim_|claim_token["':\s]|(?<!compozy__)mcp[_-]?auth|telegram-bot-token|pkce|oauth|webhook_secret|provider[_-]?credentials?["'\s]*[:=]/i;
+
+interface SessionPayload {
+  id: string;
+  agent_name: string;
+  runtime: {
+    effective?: {
+      model?: string;
+      provider: string;
+    } | null;
+    status: string;
+  };
+  state: string;
+  workspace_id: string;
+  name?: string | null;
+  available_commands?: Array<{ name: string }>;
+}
+
+interface SessionEnvelope {
+  session: SessionPayload;
+}
+
+interface SessionListEnvelope {
+  sessions: SessionPayload[];
+}
+
+interface UsageEnvelope {
+  usage?: {
+    cost_status?: string;
+    cost_source?: string;
+    total_cost?: number;
+    cost_currency?: string;
+  };
+}
+
+interface SessionEventEnvelope {
+  events: unknown[];
+}
+
+interface SessionHistoryEnvelope {
+  history: unknown[];
+}
+
+interface SessionRepairEnvelope {
+  repair: {
+    session_id: string;
+    issues?: unknown[];
+    actions?: unknown[];
+  };
+}
+
+test.use({
+  runtimeOptions: {
+    seed: {
+      mockAgents: [
+        {
+          fixturePath: browserHardeningFixture,
+          fixtureAgent: permissionAgent,
+        },
+        {
+          fixturePath: driverFaultFixture,
+          fixtureAgent: faultAgent,
+        },
+        {
+          fixturePath: autoTitleFixture,
+          fixtureAgent: autoTitleAgent,
+        },
+        {
+          fixturePath: toolArtifactFixture,
+          fixtureAgent: toolArtifactAgent,
+        },
+      ],
+    },
+  },
+});
+
+test("E2E-009: cold canonical session navigation loads the transcript and oversized tool results retain their tail", async ({
+  page,
+  runtime,
+}) => {
+  await test.step("first document navigation to a canonical session route loads the app shell and transcript", async () => {
+    if (!runtime.paths?.homeDir) {
+      throw new Error("cold session-route E2E requires launch-mode runtime paths.");
+    }
+
+    const workspace = await runtime.resolveWorkspace(runtime.paths.workspaceDir);
+    await runtime.requestJSON("/api/onboarding/complete", { method: "POST" });
+    const session = await createSession(runtime, permissionAgent, workspace.id);
+    const sessionRequestPath = sessionAPIPath(workspace.id, session.id);
+    const observedSessionRequests = new Set<string>();
+
+    page.on("request", request => {
+      const pathname = new URL(request.url()).pathname;
+      if (request.method() === "GET" && pathname === sessionRequestPath) {
+        observedSessionRequests.add(pathname);
+      }
+    });
+    await page.addInitScript(
+      ({ workspaceId }) => {
+        localStorage.setItem(
+          "compozy:active-workspace:v4",
+          JSON.stringify({
+            context: {
+              scope: "workspace",
+              selectedWorkspaceId: workspaceId,
+              worktreeByScope: {},
+            },
+            version: 0,
+          })
+        );
+      },
+      { workspaceId: workspace.id }
+    );
+
+    await page.goto(runtime.url(sessionPath(permissionAgent, session.id)), {
+      waitUntil: "domcontentloaded",
+    });
+
+    const sessionWin = sessionWindow(page, session.id);
+    const ui = sessionWindowSelectors(sessionWin, page);
+    await expect
+      .poll(async () => ({
+        osDesktopVisible: await page.getByTestId("os-desktop").isVisible(),
+        chatViewVisible: await ui.chatView.isVisible(),
+        sessionRequestObserved: observedSessionRequests.has(sessionRequestPath),
+      }))
+      .toEqual({
+        osDesktopVisible: true,
+        chatViewVisible: true,
+        sessionRequestObserved: true,
+      });
+  });
+
+  await test.step("E2E-009: operator pages an oversized tool result to its retained tail", async () => {
+    const appPage = page;
+    const workspace = await prepareSessionRuntime(runtime, appPage);
+    await seedToolArtifact(runtime, workspace.root_dir);
+    const session = await createSession(runtime, toolArtifactAgent, workspace.id);
+    const artifactOffsets: string[] = [];
+    appPage.on("response", response => {
+      const url = new URL(response.url());
+      if (url.pathname.includes("/tool-artifacts/")) {
+        artifactOffsets.push(url.searchParams.get("offset") ?? "0");
+      }
+    });
+
+    await appPage.goto(runtime.url(sessionPath(toolArtifactAgent, session.id)), {
+      waitUntil: "domcontentloaded",
+    });
+    const sessionWin = sessionWindow(appPage, session.id);
+    const ui = sessionWindowSelectors(sessionWin, appPage);
+    await expect(sessionWin).toBeVisible();
+    await ui.composerTextarea.fill("exercise tool artifact recovery");
+    await ui.composerTextarea.press("Enter");
+
+    await expect(ui.chatView).toContainText("Retained result is ready for page-back.");
+    await sessionWin.getByTestId("turn-fold-row").click();
+    await sessionWin.getByRole("button", { name: "Toggle tool call (success)" }).click();
+    await expect(ui.chatView).toContainText("E2E-009 bounded retained-result preview");
+    await sessionWin.getByRole("button", { name: "Open full result" }).click();
+    const loadMore = sessionWin.getByRole("button", { name: "Load more" });
+    await expect(loadMore).toBeVisible();
+    await loadMore.click();
+    await expect(loadMore).toBeEnabled();
+    await loadMore.click();
+
+    await expect(loadMore).toBeHidden();
+    await expect(sessionWin.getByTestId("full-tool-result")).toContainText(toolArtifactTail);
+    await expect(sessionWin.getByText("140,084 of 140,084 bytes")).toBeVisible();
+    expect(artifactOffsets).toEqual(["0", "65536", "131072"]);
+  });
+});
+
+test("operator rejects a permission request, records tool output, and keeps session artifacts private", async ({
+  appPage,
+  browserArtifacts,
+  runtime,
+}) => {
+  const workspace = await prepareSessionRuntime(runtime, appPage);
+  const session = await createSession(runtime, permissionAgent, workspace.id);
+  const deepLinkLoadingPhases = new Set<string>();
+  let sampleDeepLinkLoading = true;
+  const deepLinkLoadingSampler = (async () => {
+    while (sampleDeepLinkLoading) {
+      if (
+        await appPage
+          .getByTestId("session-route-loading")
+          .isVisible()
+          .catch(() => false)
+      ) {
+        deepLinkLoadingPhases.add("route");
+      }
+      if (
+        await appPage
+          .getByTestId("thread-transcript-skeleton")
+          .isVisible()
+          .catch(() => false)
+      ) {
+        deepLinkLoadingPhases.add("transcript");
+      }
+      await appPage.waitForTimeout(25).catch(() => {
+        sampleDeepLinkLoading = false;
+      });
+    }
+  })();
+
+  await appPage.goto(runtime.url(`/session/${session.id}`), {
+    waitUntil: "domcontentloaded",
+  });
+
+  const sessionWin = sessionWindow(appPage, session.id);
+  const ui = sessionWindowSelectors(sessionWin, appPage);
+  await expect(sessionWin).toBeVisible();
+  sampleDeepLinkLoading = false;
+  await deepLinkLoadingSampler;
+  await expect
+    .poll(() => new URL(appPage.url()).pathname)
+    .toBe(sessionPath(permissionAgent, session.id));
+  expect(deepLinkLoadingPhases.size).toBeLessThanOrEqual(1);
+  await expect(ui.composerTextarea).toBeEnabled();
+
+  await ui.composerTextarea.fill("exercise permission hardening");
+  await ui.composerTextarea.press("Enter");
+
+  await expect(ui.chatView).toContainText("Permission hardening started.");
+  await expect(ui.permissionPrompt).toBeVisible();
+  await expect(sessionWin.getByTestId("permission-dock-subject")).toHaveText("hardening.txt");
+
+  const approvalResponsePromise = appPage.waitForResponse(
+    response =>
+      response.request().method() === "POST" &&
+      response.url().endsWith(sessionAPIPath(workspace.id, session.id, "/approve"))
+  );
+  await sessionWin.getByTestId("permission-reject-menu-trigger").click();
+  await appPage.getByTestId("permission-reject-always").click();
+  expect((await approvalResponsePromise).ok()).toBe(true);
+
+  await expect(ui.permissionPrompt).toBeHidden();
+  await expect(ui.viewToggle).toBeVisible();
+
+  const snapshot = await captureSessionSnapshot(runtime, workspace.id, session.id);
+  expect(JSON.stringify(snapshot.events)).toContain("tool-hardening-read-1");
+  expect(JSON.stringify(snapshot.events)).toContain("hardening read complete");
+  expect(JSON.stringify(snapshot.events)).toContain("reject-always");
+  expect(JSON.stringify(snapshot.history)).toContain("exercise permission hardening");
+  await runtime.artifactCollector.captureJSON("browser_api_snapshots", snapshot);
+  await browserArtifacts.captureScreenshot("session-permission-rejected", appPage);
+  const manifest = await browserArtifacts.persist(appPage);
+  expect(manifest.artifacts).toEqual(
+    expect.arrayContaining([
+      expect.objectContaining({ kind: "browser_api_snapshots" }),
+      expect.objectContaining({ kind: "browser_route_state" }),
+      expect.objectContaining({ kind: "browser_screenshots" }),
+      expect.objectContaining({ kind: "browser_trace" }),
+    ])
+  );
+
+  const routeState = JSON.parse(
+    await readFile(runtime.artifactCollector.artifactPath("browser_route_state"), "utf8")
+  ) as Record<string, unknown>;
+  expect(routeState).toMatchObject({
+    chat_view_visible: true,
+    session_view_toggle_visible: true,
+    message_count: expect.any(Number),
+    permission_prompt_visible: false,
+  });
+  await assertNoSensitiveLeak(appPage, runtime, snapshot);
+});
+
+test("operator cancels a running prompt, clears the transcript, and deletes the session across surfaces", async ({
+  appPage,
+  browserArtifacts,
+  runtime,
+}) => {
+  const workspace = await prepareSessionRuntime(runtime, appPage);
+  const session = await createSession(runtime, faultAgent, workspace.id);
+  const otherSession = await createSession(runtime, faultAgent, workspace.id);
+
+  await appPage.goto(runtime.url(sessionPath(faultAgent, session.id)), {
+    waitUntil: "domcontentloaded",
+  });
+
+  const sessionWin = sessionWindow(appPage, session.id);
+  const ui = sessionWindowSelectors(sessionWin, appPage);
+  await expect(sessionWin).toBeVisible();
+  await ui.composerTextarea.fill("block until canceled");
+  await ui.composerTextarea.press("Enter");
+  await expect(ui.chatView).toContainText("block until canceled");
+  await expect
+    .poll(async () => {
+      const transcript = await runtime.requestJSON<unknown>(
+        sessionAPIPath(workspace.id, session.id, "/transcript")
+      );
+      return JSON.stringify(transcript);
+    })
+    .toContain("block until canceled");
+
+  const stopActionPaths = [
+    sessionAPIPath(workspace.id, session.id, "/prompt/cancel"),
+    sessionAPIPath(workspace.id, session.id, "/stop"),
+  ];
+  const stopActionResponsePromise = appPage.waitForResponse(
+    response =>
+      response.request().method() === "POST" &&
+      stopActionPaths.some(pathname => new URL(response.url()).pathname === pathname)
+  );
+  await expect(ui.stopButton).toBeVisible();
+  await ui.stopButton.click();
+  expect((await stopActionResponsePromise).ok()).toBe(true);
+
+  await expect(ui.sessionRowActions(session.id)).toBeEnabled({ timeout: 60_000 });
+  const beforeClear = await captureSessionSnapshot(runtime, workspace.id, session.id);
+  expect(JSON.stringify(beforeClear.transcript)).toContain("block until canceled");
+
+  // Invariant: a settled canceled turn can be edited and sent again in the same session.
+  // Owner: session lifecycle browser integration; canonical suite: this file.
+  const edit = sessionWin.getByRole("button", { name: "Edit message", exact: true });
+  await expect(edit).toBeEnabled();
+  await runtime.requestJSON(sessionAPIPath(workspace.id, session.id, "/stop"), {
+    method: "POST",
+    body: JSON.stringify({ wait: true }),
+  });
+  const beforeEdit = await captureSessionSnapshot(runtime, workspace.id, session.id);
+  await ui.composerTextarea.fill("Replace this unsent draft");
+  await edit.click();
+  await browserArtifacts.captureScreenshot("session-edit-selected", appPage);
+  await expect(appPage.getByRole("dialog", { name: "Edit this message?" })).toHaveCount(0);
+  await expect(ui.composerTextarea).toHaveText("block until canceled");
+  await expect(ui.composerTextarea).toBeFocused();
+  const selected = await captureSessionSnapshot(runtime, workspace.id, session.id);
+  expect(selected.transcript).toEqual(beforeEdit.transcript);
+  await ui.composerTextarea.press("Escape");
+  await expect(ui.composerTextarea).toBeEmpty();
+  const canceledEdit = await captureSessionSnapshot(runtime, workspace.id, session.id);
+  expect(canceledEdit.transcript).toEqual(beforeEdit.transcript);
+  await edit.click();
+  await expect(ui.composerTextarea).toHaveText("block until canceled");
+  await expect(ui.composerTextarea).toBeFocused();
+  await ui.composerTextarea.fill("continue after disconnect");
+  let releaseRewind!: () => void;
+  const heldRewind = new Promise<void>(resolve => {
+    releaseRewind = resolve;
+  });
+  let rewindAccepted!: () => void;
+  const acceptedRewind = new Promise<void>(resolve => {
+    rewindAccepted = resolve;
+  });
+  const rewindRoute = `**${sessionAPIPath(workspace.id, session.id, "/rewind")}*`;
+  await appPage.route(rewindRoute, async route => {
+    const response = await route.fetch();
+    expect(response.ok()).toBe(true);
+    rewindAccepted();
+    await heldRewind;
+    await route.fulfill({ response });
+  });
+  // Invariant (#1017): a detached edit with a lost acknowledgment belongs only to
+  // Retry; replaying its identity must not create another turn. Owner: this browser suite.
+  const promptRoute = `**${sessionAPIPath(workspace.id, session.id, "/prompt")}*`;
+  let detachedBody: Record<string, unknown> = {};
+  await appPage.route(promptRoute, async route => {
+    const request = route.request();
+    detachedBody = request.postDataJSON();
+    // Read acceptance headers, not the indefinitely open SSE body that route.fetch buffers.
+    const response = await fetch(request.url(), {
+      method: "POST",
+      headers: request.headers(),
+      body: request.postData(),
+    });
+    expect(response.ok).toBe(true);
+    await response.body?.cancel();
+    await route.abort("failed");
+  });
+  await ui.composerTextarea.press("Enter");
+  await acceptedRewind;
+  await sessionWin
+    .locator(`[data-slot="session-row-target"][data-testid$="-session-${otherSession.id}"]`)
+    .click();
+  const otherWin = sessionWindow(appPage, otherSession.id);
+  await expect(otherWin).toBeVisible();
+  releaseRewind();
+  await expect
+    .poll(async () =>
+      JSON.stringify((await captureSessionSnapshot(runtime, workspace.id, session.id)).transcript)
+    )
+    .toContain("recovered after disconnect");
+  await appPage.unroute(rewindRoute);
+  await otherWin
+    .locator(`[data-slot="session-row-target"][data-testid$="-session-${session.id}"]`)
+    .click();
+  await expect(ui.chatView).toContainText("recovered after disconnect");
+  await expect(sessionWin.getByTestId("composer-queued-retry")).toBeVisible();
+  await expect(ui.composerTextarea).toBeEmpty();
+  await browserArtifacts.captureScreenshot("session-edit-safe-retry", appPage);
+  await appPage.unroute(promptRoute);
+  const retryResponse = appPage.waitForResponse(
+    response =>
+      response.request().method() === "POST" &&
+      new URL(response.url()).pathname === sessionAPIPath(workspace.id, session.id, "/prompt")
+  );
+  await sessionWin.getByTestId("composer-queued-retry").click();
+  const replay = await retryResponse;
+  expect(replay.ok()).toBe(true);
+  // ExtractPromptInput accepts the optional top-level text alias; Retry uses
+  // the same canonical messages without the goal transport's redundant alias.
+  const { message: detachedText, ...detachedRequest } = detachedBody;
+  expect(detachedText).toBe("continue after disconnect");
+  expect(replay.request().postDataJSON()).toEqual(detachedRequest);
+  expect(await replay.json()).toMatchObject({ prompt: { replayed: true } });
+  await expect(sessionWin.getByTestId("composer-queued-retry")).toHaveCount(0);
+  await expect(ui.composerTextarea).toBeEmpty();
+  const afterEdit = await captureSessionSnapshot(runtime, workspace.id, session.id);
+  expect(JSON.stringify(afterEdit.transcript)).not.toContain("block until canceled");
+  expect(JSON.stringify(afterEdit.transcript)).toContain("continue after disconnect");
+  await browserArtifacts.captureScreenshot("session-stop-edit-resend", appPage);
+
+  await ui.sessionRowActions(session.id).click();
+  await ui.sessionRowMenuItem("clear", session.id).click();
+  await expect(appPage.getByTestId("composer-clear-dialog")).toBeVisible();
+  const clearResponsePromise = appPage.waitForResponse(
+    response =>
+      response.request().method() === "POST" &&
+      response.url().endsWith(sessionAPIPath(workspace.id, session.id, "/clear"))
+  );
+  await appPage.getByTestId("composer-clear-confirm").click();
+  const clearResponse = await clearResponsePromise;
+  if (!clearResponse.ok()) {
+    const daemonLog = runtime.paths?.daemonLog
+      ? await readFile(runtime.paths.daemonLog, "utf8")
+      : "daemon log unavailable";
+    throw new Error(`clear session returned ${clearResponse.status()}\n${daemonLog}`);
+  }
+  await expect(ui.chatView).not.toContainText("block until canceled");
+  await expect(ui.chatView).not.toContainText("continue after disconnect");
+  await appPage.reload({ waitUntil: "domcontentloaded" });
+  await expect(sessionWin).toBeVisible();
+  await expect(ui.chatView).not.toContainText("block until canceled");
+  await expect(ui.chatView).not.toContainText("continue after disconnect");
+
+  const afterClear = await captureSessionSnapshot(runtime, workspace.id, session.id);
+  expect(JSON.stringify(afterClear.transcript)).not.toContain("block until canceled");
+  expect(JSON.stringify(afterClear.transcript)).not.toContain("continue after disconnect");
+
+  const deletableSession = session;
+  const stopResponse = await appPage.request.post(
+    runtime.url(sessionAPIPath(workspace.id, session.id, "/stop"))
+  );
+  expect(stopResponse.status(), await stopResponse.text()).toBe(204);
+  const queue = await runtime.requestJSON<{ inputs: unknown[] }>(
+    sessionAPIPath(workspace.id, session.id, "/prompt/queue")
+  );
+  expect(queue.inputs).toEqual([]);
+  await appPage.goto(runtime.url(sessionPath(faultAgent, deletableSession.id)), {
+    waitUntil: "domcontentloaded",
+  });
+  const deletableWin = sessionWindow(appPage, deletableSession.id);
+  const deletableUi = sessionWindowSelectors(deletableWin, appPage);
+  await expect(deletableWin).toBeVisible();
+  await expect(deletableUi.sessionRowActions(deletableSession.id)).toBeEnabled();
+  await browserArtifacts.captureScreenshot("session-stopped-before-delete", appPage);
+  await deletableUi.sessionRowActions(deletableSession.id).click();
+  await deletableUi.sessionRowMenuItem("delete", deletableSession.id).click();
+  await expect(appPage.getByTestId("delete-dialog")).toBeVisible();
+  const deleteResponsePromise = appPage.waitForResponse(
+    response =>
+      response.request().method() === "DELETE" &&
+      new URL(response.url()).pathname === sessionAPIPath(workspace.id, deletableSession.id) &&
+      new URL(response.url()).searchParams.get("profile") === "default"
+  );
+  await appPage.getByTestId("delete-dialog-confirm").click();
+  const deleteResponse = await deleteResponsePromise;
+  if (!deleteResponse.ok()) {
+    throw new Error(
+      `delete session returned ${deleteResponse.status()}: ${await deleteResponse.text()}`
+    );
+  }
+  expect(deleteResponse.status()).toBe(204);
+  await expect.poll(() => new URL(appPage.url()).pathname).toBe("/sessions");
+  await expect(appPage.getByTestId("session-window-empty")).toBeVisible();
+
+  await expect(
+    runtime.requestJSON<SessionEnvelope>(sessionAPIPath(workspace.id, deletableSession.id))
+  ).rejects.toThrow("404");
+  if (!runtime.requestOperatorJSON) {
+    throw new Error("session delete parity check requires launch-mode UDS access.");
+  }
+  await expect(
+    runtime.requestOperatorJSON<SessionEnvelope>(sessionAPIPath(workspace.id, deletableSession.id))
+  ).rejects.toThrow("404");
+  const cliSessions = await listSessionsViaCLI(runtime);
+  expect(cliSessions.some(record => record.id === deletableSession.id)).toBe(false);
+
+  await runtime.artifactCollector.captureJSON("browser_api_snapshots", {
+    after_clear: afterClear,
+    before_clear: beforeClear,
+    cli_sessions_after_delete: cliSessions,
+    deleted_session_id: deletableSession.id,
+  });
+  await browserArtifacts.captureScreenshot("session-cancel-clear-delete", appPage);
+  await browserArtifacts.persist(appPage);
+  await assertNoSensitiveLeak(appPage, runtime, {
+    afterClear,
+    beforeClear,
+    cli_sessions_after_delete: cliSessions,
+    deleted_session_id: deletableSession.id,
+  });
+});
+
+test("operator repairs an interrupted session through HTTP, UDS, and CLI without losing transcript evidence", async ({
+  appPage,
+  browserArtifacts,
+  runtime,
+}) => {
+  const workspace = await prepareSessionRuntime(runtime, appPage);
+  const session = await createSession(runtime, faultAgent, workspace.id);
+
+  await appPage.goto(runtime.url(sessionPath(faultAgent, session.id)), {
+    waitUntil: "domcontentloaded",
+  });
+
+  const sessionWin = sessionWindow(appPage, session.id);
+  const ui = sessionWindowSelectors(sessionWin, appPage);
+  await expect(sessionWin).toBeVisible();
+  await ui.composerTextarea.fill("trigger crash mid-stream");
+  await ui.composerTextarea.press("Enter");
+  await expect(ui.chatView).toContainText("partial before crash", { timeout: 15_000 });
+  await expect(ui.stopButton).not.toBeVisible({ timeout: 20_000 });
+  await expect
+    .poll(async () => {
+      const payload = await runtime.requestJSON<SessionEnvelope>(
+        sessionAPIPath(workspace.id, session.id)
+      );
+      return payload.session.state;
+    })
+    .toBe("stopped");
+
+  const beforeRepair = await captureSessionSnapshot(runtime, workspace.id, session.id);
+  expect(JSON.stringify(beforeRepair.history)).toContain("trigger crash mid-stream");
+  expect(JSON.stringify(beforeRepair.history)).toContain("partial before crash");
+
+  const httpRepair = await runtime.requestJSON<SessionRepairEnvelope>(
+    sessionAPIPath(workspace.id, session.id, "/repair?dry_run=true&force=true"),
+    { method: "POST" }
+  );
+  expect(httpRepair.repair.session_id).toBe(session.id);
+
+  if (!runtime.requestOperatorJSON) {
+    throw new Error("session repair E2E requires launch-mode UDS access.");
+  }
+  const udsRepair = await runtime.requestOperatorJSON<SessionRepairEnvelope>(
+    sessionAPIPath(workspace.id, session.id, "/repair?dry_run=true&force=true"),
+    { method: "POST" }
+  );
+  expect(udsRepair.repair.session_id).toBe(session.id);
+
+  const cliRepair = await repairSessionViaCLI(runtime, session.id);
+  expect(JSON.stringify(cliRepair)).toContain(session.id);
+
+  const afterRepair = await captureSessionSnapshot(runtime, workspace.id, session.id);
+  expect(JSON.stringify(afterRepair.history)).toContain("trigger crash mid-stream");
+  expect(JSON.stringify(afterRepair.history)).toContain("partial before crash");
+  expect(afterRepair.session.session.state).toBe("stopped");
+
+  await appPage.reload({ waitUntil: "domcontentloaded" });
+  await expect(ui.chatView).toContainText("partial before crash");
+  await expect(ui.stopButton).not.toBeVisible();
+
+  await runtime.artifactCollector.captureJSON("browser_api_snapshots", {
+    after_repair: afterRepair,
+    before_repair: beforeRepair,
+    cli_repair: cliRepair,
+    http_repair: httpRepair,
+    uds_repair: udsRepair,
+  });
+  await browserArtifacts.captureScreenshot("session-repair-parity", appPage);
+  await browserArtifacts.persist(appPage);
+  await assertNoSensitiveLeak(appPage, runtime, { afterRepair, beforeRepair, cliRepair });
+});
+
+test("operator sees the daemon-generated session title and the file-mutation verifier marker", async ({
+  appPage,
+  browserArtifacts,
+  runtime,
+}) => {
+  const workspace = await prepareSessionRuntime(runtime, appPage);
+  const session = await createSession(runtime, autoTitleAgent, workspace.id);
+  expect(session.name ?? "").toBe("");
+
+  await appPage.goto(runtime.url(sessionPath(autoTitleAgent, session.id)), {
+    waitUntil: "domcontentloaded",
+  });
+
+  const sessionWin = sessionWindow(appPage, session.id);
+  const ui = sessionWindowSelectors(sessionWin, appPage);
+  await expect(sessionWin).toBeVisible();
+  await ui.composerTextarea.fill("Implement checkout retry fencing");
+  await ui.composerTextarea.press("Enter");
+
+  await expect(ui.chatView).toContainText("Implemented checkout retry fencing.");
+
+  const markerNotice = sessionWin.getByTestId("transcript-marker-notice");
+  await expect(markerNotice).toBeVisible();
+  await expect(markerNotice).toHaveAttribute("data-tone", "warning");
+  await expect(markerNotice).toHaveAttribute(
+    "data-marker-kind",
+    "transcript_marker.file_mutation_unverified"
+  );
+  await expect(sessionWin.getByTestId("transcript-marker-summary")).toContainText(
+    "file mutation failed and was not recovered"
+  );
+  await browserArtifacts.captureScreenshot("session-auto-title-verifier-marker", appPage);
+
+  await expect
+    .poll(
+      async () => {
+        const detail = await runtime.requestJSON<SessionEnvelope>(
+          sessionAPIPath(workspace.id, session.id)
+        );
+        return detail.session.name ?? "";
+      },
+      { timeout: 30_000 }
+    )
+    .toBe("Checkout Retry Fencing");
+
+  await appPage.goto(runtime.url(`/agents/${autoTitleAgent}`), {
+    waitUntil: "domcontentloaded",
+  });
+  const sessionLink = appPage.getByTestId(`agent-session-link-${session.id}`);
+  await expect(sessionLink).toContainText("Checkout Retry Fencing");
+  await expect(sessionLink).not.toContainText("New session");
+  await browserArtifacts.captureScreenshot("session-auto-title-list", appPage);
+
+  const snapshot = await captureSessionSnapshot(runtime, workspace.id, session.id);
+  await runtime.artifactCollector.captureJSON("browser_api_snapshots", snapshot);
+  await browserArtifacts.persist(appPage);
+  await assertNoSensitiveLeak(appPage, runtime, snapshot);
+});
+
+test.describe("E2E-010 truthful session cost provenance by auth mode", () => {
+  test.use({
+    runtimeOptions: {
+      env: { PATH: ["/usr/bin", "/bin"].join(path.delimiter) },
+      modelsDevEnabled: false,
+      seed: {
+        mockAgents: [{ fixturePath: costProvenanceFixture, fixtureAgent: costProvenanceAgent }],
+      },
+    },
+  });
+
+  test("operator sees an estimated cue for a metered provider and included for a subscription provider", async ({
+    appPage,
+    runtime,
+  }) => {
+    if (!runtime.paths?.homeDir) {
+      throw new Error("cost provenance E2E requires launch-mode runtime paths.");
+    }
+    const ui = sessionLifecycleSelectors(appPage);
+    const workspaceRoot = await mkdtemp(
+      path.join(os.tmpdir(), "compozy-cost-provenance-workspace-")
+    );
+    const driverCommand = await readSeededAgentCommand(runtime.paths.homeDir, costProvenanceAgent);
+
+    // The model catalog is daemon-global: workspace config never reconciles it, so cost
+    // provenance is seeded through the public Settings PUT, which applies active config and
+    // reconciles the catalog. auth_mode="none" defaults to none_security="local_transport", and
+    // the metered curated rates land in the global catalog before any turn runs.
+    const seeded = await seedBrowserSettingsFixtures(runtime, {
+      providers: [
+        {
+          name: "cost-metered",
+          settings: {
+            command: driverCommand,
+            display_name: "Cost Metered",
+            harness: "acp",
+            auth_mode: "none",
+            models: {
+              default: "cost-metered-model",
+              curated: [
+                {
+                  id: "cost-metered-model",
+                  display_name: "Cost Metered Model",
+                  cost_input_per_million: 3,
+                  cost_output_per_million: 15,
+                },
+              ],
+            },
+          },
+        },
+        {
+          name: "cost-included",
+          settings: {
+            command: driverCommand,
+            display_name: "Cost Included",
+            harness: "acp",
+            auth_mode: "native_cli",
+            models: {
+              default: "cost-included-model",
+              curated: [{ id: "cost-included-model", display_name: "Cost Included Model" }],
+            },
+          },
+        },
+      ],
+    });
+
+    try {
+      const workspace = await runtime.resolveWorkspace(workspaceRoot);
+
+      await appPage.goto(runtime.url("/"), { waitUntil: "domcontentloaded" });
+      await completeOnboardingIfPrompted(ui);
+      await expect(ui.osDesktop).toBeVisible();
+      await switchWorkspace(appPage, workspace.id, workspace.name);
+      await appPage.setViewportSize({ width: 1440, height: 900 });
+
+      const estimated = await openUsageCostForProvider(appPage, runtime, workspace.id, {
+        provider: "cost-metered",
+        model: "cost-metered-model",
+        status: "estimated",
+      });
+      await expect(estimated).toContainText("≈");
+      await expect(estimated).toContainText("Estimated");
+      await expect(estimated).toContainText("Catalog rate");
+      await expect(estimated).toContainText("$");
+
+      const included = await openUsageCostForProvider(appPage, runtime, workspace.id, {
+        provider: "cost-included",
+        model: "cost-included-model",
+        status: "included",
+      });
+      await expect(included).toContainText("Included");
+      await expect(included).not.toContainText("$");
+      await expect(included).not.toContainText("≈");
+    } finally {
+      await cleanupBrowserSettingsFixtures(runtime, seeded);
+    }
+  });
+});
+
+async function openUsageCostForProvider(
+  page: import("@playwright/test").Page,
+  runtime: BrowserRuntime,
+  workspaceID: string,
+  opts: { provider: string; model: string; status: string }
+): Promise<import("@playwright/test").Locator> {
+  const session = await createProviderSession(
+    runtime,
+    workspaceID,
+    opts.provider,
+    opts.model,
+    costProvenancePrompt
+  );
+
+  await page.goto(runtime.url(sessionPath(costProvenanceAgent, session.id)), {
+    waitUntil: "domcontentloaded",
+  });
+  const sessionWin = sessionWindow(page, session.id);
+  const sessionUi = sessionWindowSelectors(sessionWin, page);
+  await expect(sessionWin).toBeVisible();
+  await expect(sessionUi.chatView).toContainText("Cost provenance run recorded.");
+
+  await expect
+    .poll(
+      async () => {
+        const usage = await runtime.requestJSON<UsageEnvelope>(
+          sessionAPIPath(workspaceID, session.id, "/usage")
+        );
+        return usage.usage?.cost_status ?? "";
+      },
+      { timeout: 30_000 }
+    )
+    .toBe(opts.status);
+
+  await expect(sessionWin).toBeVisible();
+  await sessionWin.getByTestId("session-inspector-toggle").click();
+  return sessionWin.getByTestId("session-inspector-usage-cost");
+}
+
+async function createProviderSession(
+  runtime: BrowserRuntime,
+  workspaceID: string,
+  provider: string,
+  model: string,
+  prompt: string
+): Promise<SessionPayload> {
+  const payload = await runtime.requestJSON<SessionEnvelope>("/api/sessions", {
+    method: "POST",
+    body: JSON.stringify({
+      agent_name: costProvenanceAgent,
+      workspace: workspaceID,
+    }),
+  });
+  expect(payload.session.id).not.toBe("");
+  expect(payload.session.runtime.status).toBe("unbound");
+
+  const promptResponse = await fetch(
+    runtime.url(sessionAPIPath(workspaceID, payload.session.id, "/prompt")),
+    {
+      headers: { "content-type": "application/json" },
+      method: "POST",
+      body: JSON.stringify({
+        idempotency_key: randomUUID(),
+        message: prompt,
+        message_id: randomUUID(),
+        runtime: { model, provider },
+      }),
+    }
+  );
+  expect(promptResponse.ok).toBe(true);
+  expect(promptResponse.headers.get("content-type")).toContain("text/event-stream");
+  await promptResponse.text();
+
+  await expect
+    .poll(async () => {
+      const detail = await runtime.requestJSON<SessionEnvelope>(
+        sessionAPIPath(workspaceID, payload.session.id)
+      );
+      return detail.session.runtime.effective?.provider ?? "";
+    })
+    .toBe(provider);
+
+  const detail = await runtime.requestJSON<SessionEnvelope>(
+    sessionAPIPath(workspaceID, payload.session.id)
+  );
+  return detail.session;
+}
+
+async function readSeededAgentCommand(homeDir: string, agentName: string): Promise<string> {
+  const agentDefPath = path.join(homeDir, "agents", agentName, "AGENT.md");
+  const agentDef = await readFile(agentDefPath, "utf8");
+  const match = agentDef.match(/^command:\s+(.+)$/m);
+  if (!match) {
+    throw new Error(`agent definition ${agentDefPath} is missing a command line`);
+  }
+  return match[1].trim();
+}
+
+interface PromptEnvelope {
+  prompt: {
+    disposition?: string;
+    entry_id?: string;
+    queue_position?: number;
+    steer_delivery?: string;
+    turn_id?: string;
+  };
+}
+
+interface SettingsGeneralEnvelope {
+  config: { busy_input?: { default_mode: string } | null };
+}
+
+interface PromptQueueEnvelope {
+  inputs: Array<{ id: string; mode: string; status: string; text: string }>;
+}
+
+/** Starts the fixture turn that stays live until canceled and waits for the busy composer. */
+async function startBlockingTurn(
+  ui: ReturnType<typeof sessionWindowSelectors>,
+  runtime: BrowserRuntime,
+  workspaceID: string,
+  sessionID: string,
+  prompt = "block until canceled"
+): Promise<void> {
+  const acceptedResponse = promptResponse(ui.composerTextarea.page(), workspaceID, sessionID);
+  await ui.composerTextarea.fill(prompt);
+  await ui.composerTextarea.press("Enter");
+  expect((await acceptedResponse).status()).toBe(200);
+  await expect(ui.chatView).toContainText(prompt);
+  await expect(ui.composerStopButton).toBeVisible();
+  await expect
+    .poll(async () => {
+      const envelope = await runtime.requestJSON<SessionEnvelope>(
+        sessionAPIPath(workspaceID, sessionID)
+      );
+      return (envelope.session as { activity?: { turn_id?: string } }).activity?.turn_id ?? "";
+    })
+    .not.toBe("");
+}
+
+function promptResponse(
+  page: import("@playwright/test").Page,
+  workspaceID: string,
+  sessionID: string
+) {
+  return page.waitForResponse(
+    response =>
+      response.request().method() === "POST" &&
+      response.url().endsWith(sessionAPIPath(workspaceID, sessionID, "/prompt"))
+  );
+}
+
+test("E2E-012 / E2E-025: composer honors default steering, explicit queue actions, and persisted follow-up settings", async ({
+  appPage,
+  browserArtifacts,
+  runtime,
+}) => {
+  await test.step("E2E-012: Enter during a turn steers by default, the modifier queues once, explicit verbs win, and an empty Enter is a no-op", async () => {
+    const workspace = await prepareSessionRuntime(runtime, appPage);
+    const session = await createSession(runtime, faultAgent, workspace.id);
+    await appPage.goto(runtime.url(sessionPath(faultAgent, session.id)), {
+      waitUntil: "domcontentloaded",
+    });
+    const sessionWin = sessionWindow(appPage, session.id);
+    const ui = sessionWindowSelectors(sessionWin, appPage);
+    await expect(sessionWin).toBeVisible();
+    await expect(ui.composerEnterHint).toHaveAttribute("data-enter", "send");
+
+    await startBlockingTurn(ui, runtime, workspace.id, session.id);
+    // The hint mirrors the daemon default (steer) with the one-shot opposite,
+    // for assistive tech only: the busy row shows no shortcut badges (#826).
+    await expect(ui.composerEnterHint).toHaveAttribute("data-enter", "steer");
+    await expect(ui.composerEnterHint).toHaveAttribute("data-modifier", "queue");
+    await expect(ui.composerEnterHint).toHaveClass(/(^|\s)sr-only(\s|$)/);
+
+    // Empty draft + Enter: nothing sent, no feedback noise (US-003.EC-3).
+    const promptRequests: string[] = [];
+    appPage.on("request", request => {
+      if (
+        request.method() === "POST" &&
+        request.url().endsWith(sessionAPIPath(workspace.id, session.id, "/prompt"))
+      ) {
+        promptRequests.push(request.postData() ?? "");
+      }
+    });
+    await ui.composerTextarea.press("Enter");
+    await ui.composerTextarea.press("ControlOrMeta+Enter");
+    await expect(ui.composerFeedbackNote).toHaveCount(0);
+    expect(promptRequests).toHaveLength(0);
+
+    // Modifier+Enter performs the opposite of the default for exactly one send.
+    await ui.composerTextarea.fill("park this follow-up");
+    const queuedResponse = promptResponse(appPage, workspace.id, session.id);
+    await ui.composerTextarea.press("ControlOrMeta+Enter");
+    const queued = (await (await queuedResponse).json()) as PromptEnvelope;
+    expect(queued.prompt.disposition).toBe("queued");
+    expect(queued.prompt.queue_position).toBe(1);
+    await expect(ui.composerFeedbackNote).toHaveAttribute("data-code", "queued");
+    await expect(ui.composerFeedbackNote).toContainText("Queued #1 — runs after the current turn");
+    // The entry id rides on data-detail, off screen (internal ids stay off session screens).
+    await expect(ui.composerFeedbackNote).toHaveAttribute(
+      "data-detail",
+      queued.prompt.entry_id ?? ""
+    );
+    await expect(ui.composerTextarea).toHaveText("");
+    await expect(ui.composerEnterHint).toHaveAttribute("data-enter", "steer");
+
+    // Explicit verb always wins for that send (US-003.EC-2).
+    await ui.composerTextarea.fill("second follow-up");
+    const explicitResponse = promptResponse(appPage, workspace.id, session.id);
+    await ui.composerQueueButton.click();
+    const explicit = (await (await explicitResponse).json()) as PromptEnvelope;
+    expect(explicit.prompt.disposition).toBe("queued");
+    expect(explicit.prompt.queue_position).toBe(2);
+    await expect(ui.composerFeedbackNote).toContainText("Queued #2");
+    const queue = await runtime.requestJSON<PromptQueueEnvelope>(
+      sessionAPIPath(workspace.id, session.id, "/prompt/queue")
+    );
+    expect(queue.inputs.map(input => input.text)).toEqual([
+      "park this follow-up",
+      "second follow-up",
+    ]);
+
+    // Plain Enter steers: the daemon answers with the delivery it actually used.
+    await ui.composerTextarea.fill("only touch the lifecycle tests");
+    const steerResponse = promptResponse(appPage, workspace.id, session.id);
+    await ui.composerTextarea.press("Enter");
+    const steerRequestBody = JSON.parse((await steerResponse).request().postData() ?? "{}") as {
+      mode?: string;
+    };
+    expect(steerRequestBody.mode).toBe("steer");
+    const steered = (await (await steerResponse).json()) as PromptEnvelope;
+    expect(steered.prompt.disposition).toBe("steering");
+    expect(["injected", "pending_injection", "interrupt_fallback"]).toContain(
+      steered.prompt.steer_delivery
+    );
+    await expect(ui.composerFeedbackNote).toHaveAttribute("data-kind", "disposition");
+    await expect(ui.composerFeedbackNote).toHaveAttribute("data-code", "steering");
+    await expect(ui.composerFeedbackNote).toHaveAttribute(
+      "data-detail",
+      steered.prompt.steer_delivery ?? ""
+    );
+    await expect(ui.composerTextarea).toHaveText("");
+    await browserArtifacts.captureScreenshot("e2e-012-composer-enter-default-steer", appPage);
+
+    // End this session before changing the daemon-wide follow-up setting.
+    const stopResponse = await appPage.request.post(
+      runtime.url(sessionAPIPath(workspace.id, session.id, "/stop"))
+    );
+    expect(stopResponse.status(), await stopResponse.text()).toBe(204);
+  });
+
+  await test.step("E2E-025: flipping Follow-up behavior in Settings changes what Enter does, and the daemon holds the value", async () => {
+    const workspace = await prepareSessionRuntime(runtime, appPage);
+    const before = await runtime.requestJSON<SettingsGeneralEnvelope>("/api/settings/general");
+    expect(before.config.busy_input?.default_mode).toBe("steer");
+
+    await appPage.goto(runtime.url("/settings/general"), { waitUntil: "domcontentloaded" });
+    const settingsWin = appWindow(appPage, "settings");
+    await expect(settingsWin).toBeVisible({ timeout: 20_000 });
+    const settingsUI = settingsOperatorSelectors(settingsWin);
+    await expect(settingsUI.general.page).toBeVisible();
+    await expect(settingsUI.general.followUpOption("steer")).toHaveAttribute(
+      "aria-pressed",
+      "true"
+    );
+    await settingsUI.general.followUpOption("queue").click();
+    await expect(settingsUI.general.saveButton).toBeEnabled();
+    const saveResponse = appPage.waitForResponse(
+      response =>
+        response.request().method() === "PATCH" &&
+        new URL(response.url()).pathname === "/api/settings/general"
+    );
+    await settingsUI.general.saveButton.click();
+    expect((await saveResponse).ok()).toBe(true);
+    await expect
+      .poll(async () => {
+        const envelope =
+          await runtime.requestJSON<SettingsGeneralEnvelope>("/api/settings/general");
+        return envelope.config.busy_input?.default_mode ?? "";
+      })
+      .toBe("queue");
+    await browserArtifacts.captureScreenshot("e2e-025-settings-follow-up-queue", appPage);
+
+    const session = await createSession(runtime, faultAgent, workspace.id);
+    await appPage.goto(runtime.url(sessionPath(faultAgent, session.id)), {
+      waitUntil: "domcontentloaded",
+    });
+    const sessionWin = sessionWindow(appPage, session.id);
+    const ui = sessionWindowSelectors(sessionWin, appPage);
+    await expect(sessionWin).toBeVisible();
+    await startBlockingTurn(ui, runtime, workspace.id, session.id);
+    // The session resource reports the daemon value; the hint mirrors it.
+    const detail = await runtime.requestJSON<SessionEnvelope>(
+      sessionAPIPath(workspace.id, session.id)
+    );
+    expect(
+      (detail.session as { busy_input?: { default_mode?: string } }).busy_input?.default_mode
+    ).toBe("queue");
+    await expect(ui.composerEnterHint).toHaveAttribute("data-enter", "queue");
+    await expect(ui.composerEnterHint).toHaveAttribute("data-modifier", "steer");
+
+    await ui.composerTextarea.fill("park this one");
+    const queuedResponse = promptResponse(appPage, workspace.id, session.id);
+    await ui.composerTextarea.press("Enter");
+    const queued = (await (await queuedResponse).json()) as PromptEnvelope;
+    expect(queued.prompt.disposition).toBe("queued");
+    await expect(ui.composerFeedbackNote).toContainText("Queued #1");
+
+    await ui.composerTextarea.fill("redirect this one");
+    const steerResponse = promptResponse(appPage, workspace.id, session.id);
+    await ui.composerTextarea.press("ControlOrMeta+Enter");
+    const steered = (await (await steerResponse).json()) as PromptEnvelope;
+    expect(steered.prompt.disposition).toBe("steering");
+    await expect(ui.composerFeedbackNote).toHaveAttribute("data-code", "steering");
+    await browserArtifacts.captureScreenshot("e2e-025-composer-enter-queue-default", appPage);
+  });
+});
+
+test("E2E-013: a stale-fence refusal states the reason inline and gives the draft back", async ({
+  appPage,
+  browserArtifacts,
+  runtime,
+}) => {
+  const workspace = await prepareSessionRuntime(runtime, appPage);
+  const session = await createSession(runtime, faultAgent, workspace.id);
+  await appPage.goto(runtime.url(sessionPath(faultAgent, session.id)), {
+    waitUntil: "domcontentloaded",
+  });
+  const sessionWin = sessionWindow(appPage, session.id);
+  const ui = sessionWindowSelectors(sessionWin, appPage);
+  await expect(sessionWin).toBeVisible();
+  await startBlockingTurn(ui, runtime, workspace.id, session.id);
+
+  // Stale-fence simulation: the browser's strict fence names a turn that is no
+  // longer the live one, so the daemon refuses with active_turn_mismatch.
+  await appPage.route(`**${sessionAPIPath(workspace.id, session.id, "/prompt")}`, async route => {
+    const body = JSON.parse(route.request().postData() ?? "{}") as Record<string, unknown>;
+    await route.continue({
+      postData: JSON.stringify({ ...body, expected_turn_id: "turn-stale-e2e-013" }),
+    });
+  });
+  const draft = "Only touch the lifecycle tests, skip the store package";
+  await ui.composerTextarea.fill(draft);
+  const refusedResponse = promptResponse(appPage, workspace.id, session.id);
+  await ui.composerTextarea.press("Enter");
+  const refused = await refusedResponse;
+  expect(refused.status()).toBe(409);
+  const refusal = (await refused.json()) as { code?: string; current_turn_id?: string };
+  expect(refusal.code).toBe("active_turn_mismatch");
+  expect(refusal.current_turn_id ?? "").not.toBe("");
+
+  await expect(ui.composerFeedbackNote).toHaveAttribute("data-kind", "refusal");
+  await expect(ui.composerFeedbackNote).toHaveAttribute("data-code", "active_turn_mismatch");
+  await expect(ui.composerFeedbackNote).toContainText(
+    "Not sent — the turn changed before this went out. Your draft is back."
+  );
+  await expect(ui.composerFeedbackNote).toHaveAttribute("data-detail", "active_turn_mismatch");
+  await expect(ui.composerTextarea).toHaveText(draft);
+  // The turn is still live: nothing was interrupted by the refused send.
+  await expect(ui.composerStopButton).toBeVisible();
+  await expect(ui.composerEnterHint).toHaveAttribute("data-enter", "steer");
+  await browserArtifacts.captureScreenshot("e2e-013-composer-refusal-draft-restored", appPage);
+  await appPage.unroute(`**${sessionAPIPath(workspace.id, session.id, "/prompt")}`);
+});
+
+test("E2E-015: Stop reads Stopping… until the daemon confirms, guards a double-click, and keeps the draft and the interrupted turn", async ({
+  appPage,
+  browserArtifacts,
+  runtime,
+}) => {
+  const workspace = await prepareSessionRuntime(runtime, appPage);
+  const session = await createSession(runtime, faultAgent, workspace.id);
+  await appPage.goto(runtime.url(sessionPath(faultAgent, session.id)), {
+    waitUntil: "domcontentloaded",
+  });
+  const sessionWin = sessionWindow(appPage, session.id);
+  const ui = sessionWindowSelectors(sessionWin, appPage);
+  await expect(sessionWin).toBeVisible();
+
+  // The turn ignores the cooperative cancel, so "Stopping…" is observable for the
+  // whole cooperative grace before the ladder escalates and the turn settles.
+  const stubbornPrompt = "hold ignoring cancel";
+  await startBlockingTurn(ui, runtime, workspace.id, session.id, stubbornPrompt);
+  await expect(ui.composerStopButton).toHaveAttribute("data-state", "stop");
+  // A draft typed during the turn belongs to the operator (US-009.EC-4).
+  const draft = "after this, only touch the lifecycle tests";
+  await ui.composerTextarea.fill(draft);
+  const cancelPath = sessionAPIPath(workspace.id, session.id, "/prompt/cancel");
+  const cancelRequests: string[] = [];
+  appPage.on("request", request => {
+    if (request.method() === "POST" && request.url().endsWith(cancelPath)) {
+      cancelRequests.push(request.url());
+    }
+  });
+  const cancelResponse = appPage.waitForResponse(
+    response => response.request().method() === "POST" && response.url().endsWith(cancelPath)
+  );
+
+  // One double-click, one stop: the second activation lands on the guarded pill (US-009.EC-1).
+  await ui.composerStopButton.dblclick();
+  await expect(ui.composerStopButton).toHaveAttribute("data-state", "stopping");
+  await expect(ui.composerStopButton).toHaveAttribute("aria-disabled", "true");
+  await expect(ui.composerStopButton).toHaveText("Stopping…");
+  // The turn is ending: guidance can't be honored, queued work survives (ADR-003).
+  await expect(ui.composerSteerButton).toHaveCount(0);
+  await expect(ui.composerInterruptButton).toHaveCount(0);
+  await expect(ui.composerQueueButton).toBeVisible();
+  await expect(ui.composerEnterHint).toHaveAttribute("data-enter", "queue");
+  await browserArtifacts.captureScreenshot("e2e-015-composer-stopping", appPage);
+  expect((await cancelResponse).ok()).toBe(true);
+  await ui.composerStopButton.click({ force: true });
+  expect(cancelRequests).toHaveLength(1);
+
+  // Stopped reads from the daemon, never from the acknowledgement: the control
+  // returns to Send only once the session stops reporting the turn.
+  await expect(ui.composerSendButton).toBeVisible({ timeout: 60_000 });
+  await expect
+    .poll(async () => {
+      const envelope = await runtime.requestJSON<SessionEnvelope>(
+        sessionAPIPath(workspace.id, session.id)
+      );
+      return (envelope.session as { activity?: { turn_id?: string } }).activity?.turn_id ?? "";
+    })
+    .toBe("");
+  expect(cancelRequests).toHaveLength(1);
+  await expect(ui.composerTextarea).toHaveText(draft);
+  await expect(ui.composerEnterHint).toHaveAttribute("data-enter", "send");
+  // The interrupted turn stays on screen where it was stopped (US-009.AC-4).
+  await expect(ui.chatView).toContainText(stubbornPrompt);
+  await browserArtifacts.captureScreenshot("e2e-015-composer-stopped-draft-kept", appPage);
+});
+
+async function prepareSessionRuntime(
+  runtime: BrowserRuntime,
+  page: import("@playwright/test").Page
+): Promise<WorkspacePayload> {
+  if (!runtime.paths?.homeDir) {
+    throw new Error("session hardening E2E requires launch-mode runtime paths.");
+  }
+  const workspace = await runtime.resolveWorkspace(runtime.paths.workspaceDir);
+  const ui = sessionLifecycleSelectors(page);
+  await page.goto(runtime.url("/"), { waitUntil: "domcontentloaded" });
+  await completeOnboardingIfPrompted(ui);
+  await switchWorkspace(page, workspace.id, workspace.name);
+  return workspace;
+}
+
+async function seedToolArtifact(runtime: BrowserRuntime, workspaceRoot: string): Promise<void> {
+  if (!runtime.paths?.homeDir) {
+    throw new Error("tool artifact E2E requires launch-mode runtime paths.");
+  }
+  const content = Buffer.from(
+    JSON.stringify({
+      content: [{ type: "text", text: `${"x".repeat(140_000)} ${toolArtifactTail}` }],
+      truncated: false,
+    }),
+    "utf8"
+  );
+  const digest = createHash("sha256").update(content).digest("hex");
+  expect(digest).toBe(toolArtifactDigest);
+  const identity = await readFile(path.join(workspaceRoot, ".compozy", "workspace.toml"), "utf8");
+  const workspaceID = /^workspace_id\s*=\s*"([^"]+)"$/m.exec(identity)?.[1];
+  if (!workspaceID) {
+    throw new Error(`workspace identity is missing from ${workspaceRoot}`);
+  }
+  const workspaceDigest = createHash("sha256").update(workspaceID).digest("hex");
+  const workspaceDir = path.join(runtime.paths.homeDir, "tool-artifacts", workspaceDigest);
+  await mkdir(workspaceDir, { recursive: true, mode: 0o700 });
+  await writeFile(path.join(workspaceDir, `art_${digest}.json`), content, { mode: 0o600 });
+}
+
+async function createSession(
+  runtime: BrowserRuntime,
+  agentName: string,
+  workspaceID: string
+): Promise<SessionPayload> {
+  const payload = await runtime.requestJSON<SessionEnvelope>("/api/sessions", {
+    method: "POST",
+    body: JSON.stringify({
+      agent_name: agentName,
+      workspace: workspaceID,
+    }),
+  });
+  expect(payload.session.id).not.toBe("");
+  expect(payload.session.agent_name).toBe(agentName);
+  expect(payload.session.workspace_id).toBe(workspaceID);
+  return payload.session;
+}
+
+async function captureSessionSnapshot(
+  runtime: BrowserRuntime,
+  workspaceID: string,
+  sessionID: string
+): Promise<{
+  events: SessionEventEnvelope;
+  history: SessionHistoryEnvelope;
+  session: SessionEnvelope;
+  transcript: unknown;
+  udsSession?: SessionEnvelope;
+}> {
+  const sessionPathname = sessionAPIPath(workspaceID, sessionID);
+  const snapshot = {
+    events: await runtime.requestJSON<SessionEventEnvelope>(`${sessionPathname}/events`),
+    history: await runtime.requestJSON<SessionHistoryEnvelope>(`${sessionPathname}/history`),
+    session: await runtime.requestJSON<SessionEnvelope>(sessionPathname),
+    transcript: await runtime.requestJSON<unknown>(`${sessionPathname}/transcript`),
+    udsSession: runtime.requestOperatorJSON
+      ? await runtime.requestOperatorJSON<SessionEnvelope>(sessionPathname)
+      : undefined,
+  };
+  if (snapshot.udsSession) {
+    expect(snapshot.udsSession.session.id).toBe(snapshot.session.session.id);
+    expect(snapshot.udsSession.session.state).toBe(snapshot.session.session.state);
+  }
+  return snapshot;
+}
+
+async function listSessionsViaCLI(runtime: BrowserRuntime): Promise<SessionPayload[]> {
+  if (!runtime.paths) {
+    throw new Error("session hardening CLI checks require launch-mode runtime paths.");
+  }
+  const { stdout } = await execFileAsync(
+    runtime.paths.cliShim,
+    ["session", "list", "--all", "-o", "json"],
+    { env: cliEnv(runtime.paths) }
+  );
+  return (JSON.parse(stdout) as SessionListEnvelope).sessions;
+}
+
+async function repairSessionViaCLI(runtime: BrowserRuntime, sessionID: string): Promise<unknown> {
+  if (!runtime.paths) {
+    throw new Error("session hardening CLI checks require launch-mode runtime paths.");
+  }
+  const { stdout } = await execFileAsync(
+    runtime.paths.cliShim,
+    ["session", "repair", sessionID, "--dry-run", "--force", "-o", "json"],
+    { env: cliEnv(runtime.paths) }
+  );
+  return JSON.parse(stdout) as unknown;
+}
+
+function cliEnv(paths: {
+  cliShim: string;
+  homeDir: string;
+  operatorHomeDir: string;
+}): NodeJS.ProcessEnv {
+  return {
+    ...process.env,
+    COMPOZY_HOME: paths.homeDir,
+    HOME: paths.operatorHomeDir,
+    PATH: [path.dirname(paths.cliShim), process.env.PATH ?? ""]
+      .filter(Boolean)
+      .join(path.delimiter),
+  };
+}
+
+function sessionPath(agentName: string, sessionID: string): string {
+  return `/agents/${agentName}/sessions/${sessionID}`;
+}
+
+function sessionAPIPath(workspaceID: string, sessionID: string, suffix = ""): string {
+  return `/api/workspaces/${encodeURIComponent(workspaceID)}/sessions/${encodeURIComponent(
+    sessionID
+  )}${suffix}`;
+}
+
+async function assertNoSensitiveLeak(
+  page: import("@playwright/test").Page,
+  runtime: BrowserRuntime,
+  snapshot: unknown
+): Promise<void> {
+  await expect(page.locator("body")).not.toContainText(sensitivePattern);
+  const artifactPayloads = [
+    JSON.stringify(snapshot),
+    await readFile(runtime.artifactCollector.artifactPath("browser_console"), "utf8"),
+    await readFile(runtime.artifactCollector.artifactPath("browser_network"), "utf8"),
+    await readFile(runtime.artifactCollector.artifactPath("browser_route_state"), "utf8"),
+    await readFile(runtime.artifactCollector.artifactPath("browser_api_snapshots"), "utf8"),
+  ];
+  for (const payload of artifactPayloads) {
+    expect(payload).not.toMatch(sensitivePattern);
+  }
+  if (runtime.paths?.daemonLog) {
+    expect(await readFile(runtime.paths.daemonLog, "utf8")).not.toMatch(sensitivePattern);
+  }
+}
+
+test.describe("session context E2E-001", () => {
+  test.use({
+    runtimeOptions: {
+      modelsDevEnabled: false,
+      seed: {
+        mockAgents: [
+          {
+            fixturePath: sessionContextFixture,
+            fixtureAgent: silentContextAgent,
+          },
+        ],
+      },
+    },
+  });
+
+  test("composer reports context and opens the same tab-less sidebar as the topbar", async ({
+    appPage,
+    runtime,
+  }) => {
+    if (!runtime.paths) throw new Error("session context E2E requires launch-mode runtime paths");
+    await appPage.setViewportSize({ width: 1440, height: 900 });
+    const workspace = await runtime.resolveWorkspace(runtime.paths.workspaceDir);
+    const session = await createSession(runtime, silentContextAgent, workspace.id);
+    const ref = `vault:sessions/${session.id}/context-fixture`;
+    await runtime.requestJSON("/api/vault/secrets", {
+      method: "PUT",
+      body: JSON.stringify({ ref, kind: "api_key", secret_value: "session-context-fixture-value" }),
+    });
+    await appPage.goto(runtime.url(sessionPath(session.agent_name, session.id)), {
+      waitUntil: "domcontentloaded",
+    });
+    await completeOnboardingIfPrompted(sessionLifecycleSelectors(appPage));
+    const sessionWin = sessionWindow(appPage, session.id);
+    const ui = sessionWindowSelectors(sessionWin, appPage);
+    await expect(sessionWin).toBeVisible();
+    await ui.composerTextarea.fill("reported");
+    await ui.composerTextarea.press("Enter");
+    const contextButton = sessionWin.getByTestId("composer-context-button");
+    await expect(contextButton).toHaveAccessibleName("Context 35% used");
+    await contextButton.hover();
+    await expect(appPage.getByRole("tooltip")).toContainText("35% · 89.7K / 256K");
+    await contextButton.click();
+    const sidebar = appPage.getByRole("complementary", { name: "Context" });
+    await expect(sidebar).toBeVisible();
+    await expect(sessionWin.getByTestId("session-inspector-toggle")).toHaveAttribute(
+      "aria-pressed",
+      "true"
+    );
+    await expect(sidebar.locator('[data-testid^="session-inspector-tab-"]')).toHaveCount(0);
+    await expect(sidebar.getByTestId("session-inspector").locator(":scope > section")).toHaveCount(
+      5
+    );
+    await sessionWin.getByTestId("session-inspector-toggle").click();
+    await ui.composerTextarea.fill("warning");
+    await ui.composerTextarea.press("Enter");
+    await expect(contextButton).toHaveAccessibleName("Context 88% used");
+    // CompozyOS acts at no threshold: a high reading is the same quiet reported ring.
+    await expect(contextButton).toHaveAttribute("data-state", "reported");
+    await contextButton.hover();
+    await expect(appPage.getByRole("tooltip")).toContainText("88% · 225.3K / 256K");
+    await appPage.goto(runtime.url("/vault"), { waitUntil: "domcontentloaded" });
+    await expect(appPage.getByTestId(`vault-secrets-delete-${ref}`)).toBeVisible();
+  });
+});
+
+interface CompactionFixtureStep {
+  kind: string;
+  driver_control?: { action: string; delay_ms?: number };
+}
+
+interface CompactionFixtureTurn {
+  name: string;
+  match: Record<string, string>;
+  steps: CompactionFixtureStep[];
+}
+
+interface CompactionFixtureAgent {
+  name: string;
+  turns: CompactionFixtureTurn[];
+}
+
+/**
+ * Derives the fixture this suite drives from the Go-owned native compaction fixture: the same
+ * `compaction-claude` agent and frames, plus a held turn (Compact now must be observed disabled
+ * while a turn streams) and a pause after the in-progress frame (the "Compacting context…" row
+ * must be observable before the terminal frame replaces it).
+ */
+function writeCompactionFixture(): string {
+  const source = JSON.parse(readFileSync(nativeCompactionFixture, "utf8")) as {
+    version: number;
+    agents: CompactionFixtureAgent[];
+  };
+  const agent = source.agents.find(candidate => candidate.name === compactionAgent);
+  const compactNow = agent?.turns.find(turn => turn.name === "compact-now");
+  if (!agent || !compactNow) {
+    throw new Error(`${nativeCompactionFixture} must define ${compactionAgent} with compact-now`);
+  }
+  compactNow.steps.splice(1, 0, {
+    kind: "driver_control",
+    driver_control: { action: "delay", delay_ms: 3_000 },
+  });
+  agent.turns.push({
+    name: "hold-open",
+    match: { user_text: compactionHoldPrompt },
+    steps: [{ kind: "driver_control", driver_control: { action: "block_until_cancel" } }],
+  });
+  const target = path.join(
+    mkdtempSync(path.join(os.tmpdir(), "compozy-compaction-fixture-")),
+    "native_compaction_derived_fixture.json"
+  );
+  writeFileSync(target, JSON.stringify({ version: source.version, agents: [agent] }), "utf8");
+  return target;
+}
+
+/** One turn on a `compaction-claude` session: its first prompt makes the agent advertise `compact`. */
+async function promptUntilCompactAdvertised(
+  ui: ReturnType<typeof sessionWindowSelectors>,
+  runtime: BrowserRuntime,
+  workspaceID: string,
+  sessionID: string
+): Promise<void> {
+  await ui.composerTextarea.fill("baseline");
+  await ui.composerTextarea.press("Enter");
+  await expect(ui.chatView).toContainText("baseline ready");
+  await expect
+    .poll(async () => {
+      const detail = await runtime.requestJSON<SessionEnvelope>(
+        sessionAPIPath(workspaceID, sessionID)
+      );
+      return detail.session.available_commands?.map(command => command.name) ?? [];
+    })
+    .toContain("compact");
+}
+
+async function openSessionWindow(
+  runtime: BrowserRuntime,
+  page: import("@playwright/test").Page,
+  agentName: string,
+  workspaceID: string
+) {
+  const session = await createSession(runtime, agentName, workspaceID);
+  await page.goto(runtime.url(sessionPath(agentName, session.id)), {
+    waitUntil: "domcontentloaded",
+  });
+  const sessionWin = sessionWindow(page, session.id);
+  await expect(sessionWin).toBeVisible();
+  return { session, sessionWin, ui: sessionWindowSelectors(sessionWin, page) };
+}
+
+test.describe("native compaction E2E-005 / E2E-006", () => {
+  test.use({
+    runtimeOptions: {
+      modelsDevEnabled: false,
+      seed: {
+        mockAgents: [
+          { fixturePath: writeCompactionFixture(), fixtureAgent: compactionAgent },
+          { fixturePath: sessionContextFixture, fixtureAgent: silentContextAgent },
+        ],
+      },
+    },
+  });
+
+  test("E2E-005: Compact now shows the agent's compaction in the timeline and the context rail", async ({
+    appPage,
+    browserArtifacts,
+    runtime,
+  }) => {
+    await appPage.setViewportSize({ width: 1440, height: 900 });
+    const workspace = await prepareSessionRuntime(runtime, appPage);
+    const { session, sessionWin, ui } = await openSessionWindow(
+      runtime,
+      appPage,
+      compactionAgent,
+      workspace.id
+    );
+    await promptUntilCompactAdvertised(ui, runtime, workspace.id, session.id);
+
+    // The context control opens the Context rail; Compact now is offered once the agent advertised it.
+    await sessionWin.getByTestId("composer-context-button").click();
+    const compactNow = appPage.getByTestId("session-context-compact-now");
+    await expect(compactNow).toBeEnabled();
+    const compactResponse = appPage.waitForResponse(
+      response =>
+        response.request().method() === "POST" &&
+        new URL(response.url()).pathname === sessionAPIPath(workspace.id, session.id, "/compact")
+    );
+    await compactNow.click();
+    expect((await compactResponse).status()).toBe(202);
+
+    // The fixture pauses after the in-progress frame, so the live row is observable before it settles.
+    const compaction = sessionWin.getByTestId("session-compaction-item");
+    await expect(compaction).toHaveAttribute("data-status", "in_progress");
+    await expect(compaction).toContainText("Compacting context…");
+    await expect(compaction).toHaveAttribute("data-status", "completed");
+    await expect(compaction).toContainText("Context compacted");
+
+    const summary = sessionWin.getByTestId("session-compaction-summary");
+    const summaryToggle = summary.getByRole("button", { name: "Summary" });
+    await expect(summaryToggle).toHaveAttribute("aria-expanded", "false");
+    await summaryToggle.click();
+    await expect(summaryToggle).toHaveAttribute("aria-expanded", "true");
+    await expect(summary).toContainText("Retain the agreed project constraints.");
+    await expect(ui.chatView).toContainText("Native compaction observed.");
+
+    // A compaction started through Compact now is a requested one; the rail's Turns fold lists it.
+    const inspectorToggle = sessionWin.getByTestId("session-inspector-toggle");
+    if ((await inspectorToggle.getAttribute("aria-pressed")) !== "true") {
+      await inspectorToggle.click();
+    }
+    const turnsToggle = appPage
+      .getByTestId("session-context-turns")
+      .getByRole("button", { name: /^Turns/ });
+    if ((await turnsToggle.getAttribute("aria-expanded")) !== "true") {
+      await turnsToggle.click();
+    }
+    const marker = appPage.getByTestId("session-context-compaction-marker");
+    await expect(marker).toContainText("Requested compaction");
+    await expect(marker).toContainText("completed");
+    await browserArtifacts.captureScreenshot("e2e-005-native-compaction", appPage);
+  });
+
+  test("E2E-006: Compact now is absent without an advertised command and disabled while a turn streams", async ({
+    appPage,
+    runtime,
+  }) => {
+    await appPage.setViewportSize({ width: 1440, height: 900 });
+    const workspace = await prepareSessionRuntime(runtime, appPage);
+    const compactNow = appPage.getByTestId("session-context-compact-now");
+
+    await test.step("an agent that advertises no command shows the meter without Compact now", async () => {
+      const { session, sessionWin, ui } = await openSessionWindow(
+        runtime,
+        appPage,
+        silentContextAgent,
+        workspace.id
+      );
+      await ui.composerTextarea.fill("reported");
+      await ui.composerTextarea.press("Enter");
+      const contextButton = sessionWin.getByTestId("composer-context-button");
+      await expect(contextButton).toHaveAccessibleName("Context 35% used");
+      const detail = await runtime.requestJSON<SessionEnvelope>(
+        sessionAPIPath(workspace.id, session.id)
+      );
+      expect(detail.session.available_commands ?? []).toEqual([]);
+
+      await contextButton.click();
+      await expect(appPage.getByTestId("session-context-meter")).toBeVisible();
+      await expect(compactNow).toHaveCount(0);
+    });
+
+    await test.step("an agent that advertises compact offers it, disabled while a turn streams", async () => {
+      const { session, sessionWin, ui } = await openSessionWindow(
+        runtime,
+        appPage,
+        compactionAgent,
+        workspace.id
+      );
+      await promptUntilCompactAdvertised(ui, runtime, workspace.id, session.id);
+      const contextButton = sessionWin.getByTestId("composer-context-button");
+      await contextButton.click();
+      await expect(compactNow).toBeEnabled();
+
+      await startBlockingTurn(ui, runtime, workspace.id, session.id, compactionHoldPrompt);
+      await contextButton.click();
+      await expect(compactNow).toBeVisible();
+      await expect(compactNow).toBeDisabled();
+
+      // End the held turn's session so the daemon teardown has nothing left to cancel.
+      const stopResponse = await appPage.request.post(
+        runtime.url(sessionAPIPath(workspace.id, session.id, "/stop"))
+      );
+      expect(stopResponse.status(), await stopResponse.text()).toBe(204);
+    });
+  });
+});

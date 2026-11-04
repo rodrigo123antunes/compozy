@@ -1,0 +1,1293 @@
+import type {
+  ConfigApplyRecordsResponse,
+  SettingsAutomationSection,
+  SettingsAttentionSection,
+  SettingsCmdPaletteSection,
+  SettingsApplyResponse,
+  SettingsGeneralSection,
+  SettingsHookEntry,
+  SettingsHooksExtensionsSection,
+  SettingsMarketplaceSection,
+  SettingsProviderUsageSection,
+  SettingsMCPServerCollection,
+  SettingsMCPServerEntry,
+  SettingsMutationResult,
+  SettingsObservabilitySection,
+  SettingsProviderCollection,
+  SettingsProviderEntry,
+  SettingsRestartResponse,
+  SettingsRestartStatus,
+  SettingsSkillSource,
+  SettingsSkillSourceRoot,
+  SettingsSkillsSection,
+  TerminalSettingsConfig,
+} from "@/systems/settings";
+import type { OperationResponse } from "@/lib/api-contract";
+import { storyAgentNames, storyWorkspacePaths } from "@/storybook/fintech-scenario";
+
+export const terminalSettingsFixture: TerminalSettingsConfig = {
+  default_shell: "",
+  shell_integration: true,
+  scrollback_bytes: 1_048_576,
+  detached_ttl: "24h",
+  exit_retention: "15m",
+  recording: false,
+  recording_retention_days: 30,
+  max_per_workspace: 8,
+  max_per_daemon: 32,
+  max_subscribers: 16,
+};
+
+export const settingsGeneralSectionFixture: SettingsGeneralSection = {
+  section: "general",
+  scope: "user",
+  available_scopes: ["user"],
+  actions: {
+    restart: { available: true, behavior: "action_trigger", name: "restart" },
+  },
+  config: {
+    busy_input: { default_mode: "steer" },
+    daemon: {
+      memory_report_interval: "5m",
+      reload_timeouts: { mcp: "10s", providers: "5s" },
+      socket: "/tmp/compozy.sock",
+    },
+    http: { host: "127.0.0.1", port: 2123 },
+    limits: { max_concurrent_agents: 20 },
+    permissions: { mode: "approve-all" },
+    redact: { enabled: true },
+    session_timeout: "0s",
+    idle_release_after: "30m0s",
+    terminal: terminalSettingsFixture,
+  },
+  config_paths: {
+    daemon_info: "/tmp/daemon.json",
+    global_config: "~/.compozy/config.toml",
+    global_mcp_sidecar: "~/.compozy/mcp.json",
+    home_dir: "~/.compozy",
+    log_file: "~/.compozy/compozy.log",
+  },
+  runtime: {
+    active_agents: 7,
+    active_sessions: 4,
+    available: true,
+    http_host: "127.0.0.1",
+    http_port: 2123,
+    socket: "~/.compozy/daemon.sock",
+    total_sessions: 12,
+    uptime_seconds: 3600,
+  },
+};
+
+export const settingsMarketplaceSectionFixture: SettingsMarketplaceSection = {
+  section: "marketplace",
+  scope: "user",
+  available_scopes: ["user"],
+  config: {
+    base_url: "https://raw.githubusercontent.com/compozy/compozy/main/catalog",
+    ttl: "1h",
+    timeout: "30s",
+  },
+};
+
+export const settingsProviderUsageSectionFixture: SettingsProviderUsageSection = {
+  section: "provider-usage",
+  scope: "user",
+  available_scopes: ["user"],
+  keychain_supported: false,
+  config: {
+    enabled: true,
+    refresh_interval: "5m0s",
+    providers: {
+      openrouter: { enabled: false },
+      claude: { enabled: true, keychain_access: false },
+    },
+  },
+};
+
+export const settingsAttentionSectionFixture: SettingsAttentionSection = {
+  section: "attention",
+  scope: "user",
+  available_scopes: ["user"],
+  config: {
+    toasts: true,
+    sound: true,
+    system: false,
+    muted_workspaces: [],
+  },
+};
+
+export const settingsCmdPaletteSectionFixture: SettingsCmdPaletteSection = {
+  section: "cmd-palette",
+  scope: "user",
+  available_scopes: ["user", "profile", "workspace"],
+  aliases: {},
+  fallback_agent_enabled: true,
+  personalization: true,
+};
+
+export const settingsAutomationSectionFixture: SettingsAutomationSection = {
+  section: "automation",
+  scope: "user",
+  available_scopes: ["user"],
+  config: {
+    enabled: true,
+    timezone: "UTC",
+    max_concurrent_jobs: 8,
+    default_fire_limit: { max: 5, window: "1m" },
+  },
+  runtime: {
+    host_timezone: "America/Sao_Paulo",
+    available: true,
+    running: true,
+    scheduler_running: true,
+    job_enabled: 3,
+    job_total: 5,
+    trigger_enabled: 2,
+    trigger_total: 4,
+    last_synced_at: "2026-04-17T10:00:00Z",
+    next_fire: "2026-04-17T12:00:00Z",
+  },
+  links: [{ label: "automation", path: "/automation" }],
+};
+
+export const settingsObservabilitySectionFixture: SettingsObservabilitySection = {
+  section: "observability",
+  scope: "user",
+  available_scopes: ["user"],
+  config: {
+    enabled: true,
+    max_global_bytes: 1024 * 1024 * 1024,
+    retention_days: 7,
+    transcripts: {
+      enabled: true,
+      max_bytes_per_session: 256 * 1024 * 1024,
+      segment_bytes: 1024 * 1024,
+    },
+  },
+  log_tail: {
+    available: true,
+    stream_url: "/api/settings/observability/log-tail",
+    transport: "sse",
+  },
+  runtime: {
+    active_agents: 2,
+    active_sessions: 4,
+    available: true,
+    global_db_size_bytes: 180 * 1024 * 1024,
+    session_db_size_bytes: 132 * 1024 * 1024,
+    uptime_seconds: 3600,
+  },
+};
+
+const emptyRootDiagnostics: Pick<
+  SettingsSkillSourceRoot,
+  "collisions" | "skipped_links" | "verification"
+> = {
+  collisions: [],
+  skipped_links: [],
+  verification: { blocked: 0, warned: 0 },
+};
+
+/**
+ * Default daemon-measured sources. Tests derive unreadable, truncated, and
+ * runtime-unavailable variants from these measured rows.
+ */
+export const settingsSkillSourcesFixture: SettingsSkillSource[] = [
+  {
+    slug: "compozy",
+    label: "CompozyOS",
+    kind: "builtin",
+    enabled: true,
+    always_on: true,
+    workspace_path: ".compozy/skills",
+    global_path: "~/.compozy/skills",
+    roots: [
+      {
+        ...emptyRootDiagnostics,
+        root_id: "r_w_builtin_04c9",
+        path: `${storyWorkspacePaths.hq}/.compozy/skills`,
+        exists: true,
+        readable: true,
+        scanned_count: 8,
+        skill_count: 8,
+        truncated: false,
+        native_readers: [],
+      },
+      {
+        ...emptyRootDiagnostics,
+        root_id: "r_u_builtin_11ab",
+        path: "/Users/ana/.compozy/skills",
+        exists: true,
+        readable: true,
+        scanned_count: 4,
+        skill_count: 4,
+        truncated: false,
+        native_readers: [],
+      },
+    ],
+  },
+  {
+    slug: "agents",
+    label: "Universal (.agents)",
+    kind: "preset",
+    enabled: true,
+    always_on: false,
+    default: true,
+    workspace_path: ".agents/skills",
+    global_path: "~/.agents/skills",
+    roots: [
+      {
+        root_id: "r_w_agents_9f31",
+        path: `${storyWorkspacePaths.hq}/.agents/skills`,
+        exists: true,
+        readable: true,
+        scanned_count: 5,
+        skill_count: 3,
+        truncated: false,
+        native_readers: [],
+        skipped_links: [
+          { path: `${storyWorkspacePaths.hq}/.agents/skills/review-old`, reason: "dangling" },
+          { path: `${storyWorkspacePaths.hq}/.agents/skills/vendor-link`, reason: "escape" },
+        ],
+        collisions: [
+          {
+            name: "frontend-qa",
+            winner_root_id: "r_w_builtin_04c9",
+            qualified_form: "agents:frontend-qa",
+          },
+        ],
+        verification: { blocked: 0, warned: 1 },
+      },
+      {
+        ...emptyRootDiagnostics,
+        root_id: "r_u_agents_7c02",
+        path: "/Users/ana/.agents/skills",
+        exists: true,
+        readable: true,
+        scanned_count: 2,
+        skill_count: 2,
+        truncated: false,
+        native_readers: [],
+      },
+    ],
+  },
+  {
+    slug: "claude",
+    label: "Claude (.claude)",
+    kind: "preset",
+    enabled: false,
+    always_on: false,
+    default: false,
+    workspace_path: ".claude/skills",
+    global_path: "~/.claude/skills",
+    roots: [
+      {
+        ...emptyRootDiagnostics,
+        root_id: "r_w_claude_3ad1",
+        path: `${storyWorkspacePaths.hq}/.claude/skills`,
+        exists: false,
+        readable: true,
+        truncated: false,
+        native_readers: ["claude"],
+      },
+      {
+        ...emptyRootDiagnostics,
+        root_id: "r_u_claude_8be4",
+        path: "/Users/ana/.claude/skills",
+        exists: true,
+        readable: true,
+        scanned_count: 1,
+        skill_count: 1,
+        truncated: false,
+        native_readers: ["claude"],
+      },
+    ],
+  },
+  {
+    slug: "team-skills",
+    label: "team-skills",
+    kind: "custom",
+    enabled: true,
+    always_on: false,
+    path: "~/team-skills",
+    roots: [
+      {
+        ...emptyRootDiagnostics,
+        root_id: "r_u_custom_a41c",
+        path: "/Users/ana/team-skills",
+        exists: true,
+        readable: true,
+        scanned_count: 3,
+        skill_count: 3,
+        truncated: false,
+        native_readers: [],
+      },
+    ],
+  },
+];
+
+export const settingsSkillsSectionFixture: SettingsSkillsSection = {
+  section: "skills",
+  scope: "user",
+  available_scopes: ["user", "profile", "workspace", "agent"],
+  runtime_available: true,
+  discovered_count: 12,
+  disabled_count: 2,
+  config: {
+    enabled: true,
+    disabled_skills: ["alpha", "beta"],
+    poll_interval: "5m",
+    allowed_marketplace_hooks: [],
+    sources: ["agents"],
+    custom_sources: ["~/team-skills"],
+  },
+  sources: settingsSkillSourcesFixture,
+  links: [{ label: "skills", path: "/marketplace" }],
+};
+
+export const settingsHooksExtensionsSectionFixture: SettingsHooksExtensionsSection = {
+  section: "hooks-extensions",
+  scope: "user",
+  available_scopes: ["user"],
+  config: {
+    trust: {
+      allow_unverified: false,
+    },
+    sources: {
+      github: { enabled: true, base_url: "https://api.github.com" },
+      git: { enabled: false },
+    },
+    dev: {
+      watch_interval: "2s",
+    },
+    resources: {
+      allowed_kinds: ["snapshot", "artifact"],
+      max_scope: "workspace",
+      snapshot_rate_limit: { queue: 100, requests: 30, window: "5m" },
+      operator_write_rate_limit: { queue: 20, requests: 10, window: "1m" },
+    },
+  },
+  hooks: [
+    {
+      name: "pre-commit-lint",
+      declaration: {
+        name: "pre-commit-lint",
+        event: "tool.pre_call",
+        mode: "sync",
+        command: "make",
+        args: ["lint"],
+        matcher: { tool_name: "Bash" },
+        required: true,
+      },
+      source_metadata: {
+        available_targets: ["global-config"],
+        effective_source: { kind: "global-config", scope: "user" },
+      },
+    },
+    {
+      name: "slack-notify",
+      declaration: {
+        name: "slack-notify",
+        event: "permission.denied",
+        mode: "async",
+        command: "node",
+        args: ["./hooks/slack.js"],
+        matcher: { agent_name: storyAgentNames.support },
+        required: false,
+      },
+      source_metadata: {
+        available_targets: ["global-config"],
+        effective_source: { kind: "global-config", scope: "user" },
+      },
+    },
+  ],
+  installed: [
+    {
+      name: "notes",
+      enabled: true,
+      version: "0.1.0",
+      state: "running",
+      health: "healthy",
+      palette: {
+        commands: [
+          {
+            id: "ext.notes.capture",
+            title: "Capture note",
+            bindings: ["alt+shift+KeyN"],
+            default_binding: "alt+shift+KeyN",
+            default_dormant: false,
+            available: true,
+          },
+          {
+            id: "ext.notes.recent",
+            title: "Recent notes",
+            bindings: [],
+            default_binding: "meta+KeyN",
+            default_dormant: true,
+            conflict_with: "session.new",
+            available: true,
+          },
+          {
+            id: "ext.notes.purge",
+            title: "Purge archived notes",
+            bindings: [],
+            default_dormant: false,
+            available: true,
+          },
+        ],
+        views: [
+          { id: "ext.notes.recent", title: "Recent notes", available: true },
+          { id: "ext.notes.browse", title: "Browse notes", available: true },
+        ],
+      },
+    },
+    {
+      name: "forge-github",
+      enabled: true,
+      version: "1.2.3",
+      state: "running",
+      health: "healthy",
+      requires_env: ["GITHUB_TOKEN"],
+      missing_env: ["GITHUB_TOKEN"],
+    },
+  ],
+  transport_parity: {
+    known: true,
+    settings_http: true,
+    settings_uds: true,
+    extensions_http: true,
+    extensions_uds: true,
+  },
+};
+
+export const settingsProviderFixtures: SettingsProviderEntry[] = [
+  {
+    name: "claude",
+    default: true,
+    command_available: true,
+    settings: {
+      command: "npx -y @agentclientprotocol/claude-agent-acp@latest",
+      display_name: "Claude Code",
+      models: {
+        default: "claude-sonnet-5",
+        curated: [
+          {
+            id: "claude-fable-5",
+            supports_reasoning: true,
+            reasoning_efforts: ["low", "medium", "high", "xhigh", "max"],
+            default_reasoning_effort: "high",
+          },
+          {
+            id: "claude-opus-4-8",
+            supports_reasoning: true,
+            reasoning_efforts: ["low", "medium", "high", "xhigh", "max"],
+            default_reasoning_effort: "high",
+          },
+          {
+            id: "claude-sonnet-5",
+            supports_reasoning: true,
+            reasoning_efforts: ["low", "medium", "high", "xhigh", "max"],
+            default_reasoning_effort: "high",
+          },
+          { id: "claude-haiku-4-5-20251001", supports_reasoning: true },
+        ],
+        reasoning: { apply: "acp_option" },
+      },
+      harness: "acp",
+      auth_mode: "native_cli",
+      env_policy: "filtered",
+      home_policy: "operator",
+      auth_status_command: "claude auth status",
+    },
+    auth_status: {
+      mode: "native_cli",
+      env_policy: "filtered",
+      home_policy: "operator",
+      state: "unknown",
+      code: "provider_classification_unknown",
+      message:
+        "Provider owns authentication through its native CLI; run a provider auth probe for live status.",
+      status_command: "claude auth status",
+      login: {
+        configured: true,
+        executable: "claude",
+        presence: "unknown",
+        recommended_action: "inspect",
+        source: "auth_login_command",
+      },
+    },
+    source_metadata: {
+      available_targets: ["global-config"],
+      effective_source: { kind: "global-config", scope: "user" },
+      shadowed_sources: [{ kind: "builtin-provider", scope: "user" }],
+    },
+    fallback: {
+      settings: {
+        command: "npx -y @agentclientprotocol/claude-agent-acp@latest",
+        models: {
+          default: "claude-sonnet-5",
+          curated: [
+            { id: "claude-fable-5" },
+            { id: "claude-opus-4-8" },
+            { id: "claude-sonnet-5" },
+            { id: "claude-haiku-4-5-20251001" },
+          ],
+          reasoning: { apply: "acp_option" },
+        },
+        auth_mode: "native_cli",
+        env_policy: "filtered",
+        home_policy: "operator",
+      },
+      source: { kind: "builtin-provider", scope: "user" },
+    },
+  },
+  {
+    name: "codex",
+    default: false,
+    command_available: true,
+    settings: {
+      command: "npx -y @agentclientprotocol/codex-acp@latest",
+      models: {
+        default: "gpt-5.6-sol",
+        curated: [
+          {
+            id: "gpt-5.6-sol",
+            supports_reasoning: true,
+            reasoning_efforts: ["none", "low", "medium", "high", "xhigh", "max"],
+            default_reasoning_effort: "medium",
+          },
+          {
+            id: "gpt-5.6-terra",
+            supports_reasoning: true,
+            reasoning_efforts: ["none", "low", "medium", "high", "xhigh", "max"],
+            default_reasoning_effort: "medium",
+          },
+          {
+            id: "gpt-5.6-luna",
+            supports_reasoning: true,
+            reasoning_efforts: ["none", "low", "medium", "high", "xhigh", "max"],
+            default_reasoning_effort: "medium",
+          },
+        ],
+        reasoning: { apply: "acp_option" },
+      },
+      harness: "acp",
+      auth_mode: "native_cli",
+      env_policy: "filtered",
+      home_policy: "operator",
+      auth_status_command: "codex auth status",
+    },
+    auth_status: {
+      mode: "native_cli",
+      env_policy: "filtered",
+      home_policy: "operator",
+      state: "unknown",
+      code: "provider_classification_unknown",
+      message:
+        "Provider owns authentication through its native CLI; run a provider auth probe for live status.",
+      status_command: "codex auth status",
+      login: {
+        configured: true,
+        executable: "codex",
+        presence: "unknown",
+        recommended_action: "inspect",
+        source: "auth_login_command",
+      },
+    },
+    source_metadata: {
+      available_targets: ["global-config"],
+      effective_source: { kind: "builtin-provider", scope: "user" },
+    },
+  },
+  {
+    name: "openrouter",
+    default: false,
+    command_available: true,
+    settings: {
+      command: "npx -y pi-acp@latest",
+      display_name: "OpenRouter",
+      models: {
+        default: "openai/gpt-5.4",
+        curated: [
+          { id: "openai/gpt-5.4", supports_reasoning: true },
+          { id: "anthropic/claude-sonnet-4-6" },
+        ],
+      },
+      harness: "pi_acp",
+      runtime_provider: "openrouter",
+      auth_mode: "bound_secret",
+      env_policy: "filtered",
+      home_policy: "operator",
+      credential_slots: [
+        {
+          name: "api_key",
+          target_env: "OPENROUTER_API_KEY",
+          secret_ref: "env:OPENROUTER_API_KEY",
+          kind: "api_key",
+          required: true,
+        },
+      ],
+    },
+    auth_status: {
+      mode: "bound_secret",
+      env_policy: "filtered",
+      home_policy: "operator",
+      state: "missing_credential",
+      code: "provider_credential_unresolved",
+      message: 'Required CompozyOS-managed provider credential "OPENROUTER_API_KEY" is unresolved.',
+      login: {
+        configured: false,
+        presence: "unknown",
+        recommended_action: "bind_secret",
+      },
+    },
+    credentials: [
+      {
+        name: "api_key",
+        target_env: "OPENROUTER_API_KEY",
+        secret_ref: "env:OPENROUTER_API_KEY",
+        kind: "api_key",
+        required: true,
+        present: false,
+        source: "env",
+      },
+    ],
+    source_metadata: {
+      available_targets: ["global-config"],
+      effective_source: { kind: "builtin-provider", scope: "user" },
+    },
+  },
+  {
+    name: "kimi-cli",
+    default: false,
+    command_available: true,
+    settings: {
+      command: "kimi acp",
+      display_name: "Kimi CLI",
+      harness: "acp",
+      auth_mode: "native_cli",
+      env_policy: "filtered",
+      home_policy: "operator",
+    },
+    auth_status: {
+      mode: "native_cli",
+      env_policy: "filtered",
+      home_policy: "operator",
+      state: "unknown",
+      code: "provider_classification_unknown",
+      message:
+        "Provider owns authentication through its native CLI; run a provider auth probe for live status.",
+      login: {
+        configured: false,
+        presence: "unknown",
+        recommended_action: "inspect",
+      },
+    },
+    source_metadata: {
+      available_targets: ["global-config"],
+      effective_source: { kind: "builtin-provider", scope: "user" },
+    },
+  },
+  {
+    name: "qwen-code",
+    default: false,
+    command_available: true,
+    settings: {
+      command: "npx -y @qwen-code/qwen-code@latest --acp --experimental-skills",
+      display_name: "Qwen Code",
+      models: { default: "qwen3.6-plus", curated: [{ id: "qwen3.6-plus" }] },
+      harness: "acp",
+    },
+    source_metadata: {
+      available_targets: ["global-config"],
+      effective_source: { kind: "builtin-provider", scope: "user" },
+    },
+  },
+  {
+    name: "agy",
+    default: false,
+    command_available: true,
+    settings: {
+      command: "agy_acp_server.par --uid=",
+      display_name: "Google Antigravity",
+      harness: "acp",
+      auth_mode: "native_cli",
+      env_policy: "filtered",
+      home_policy: "operator",
+      auth_acp_method: "oauth-personal",
+    },
+    auth_status: {
+      mode: "native_cli",
+      env_policy: "filtered",
+      home_policy: "operator",
+      state: "unknown",
+      code: "provider_classification_unknown",
+      message:
+        "Provider owns authentication through its native CLI; run a provider auth probe for live status.",
+      login: {
+        configured: true,
+        executable: "agy_acp_server.par",
+        presence: "present",
+        recommended_action: "inspect",
+        source: "auth_acp_method",
+      },
+    },
+    source_metadata: {
+      available_targets: ["global-config"],
+      effective_source: { kind: "builtin-provider", scope: "user" },
+    },
+  },
+];
+
+export const settingsMCPServerFixtures: SettingsMCPServerEntry[] = [
+  {
+    name: "filesystem",
+    transport: "stdio",
+    command: "npx -y @modelcontextprotocol/server-filesystem",
+    args: [storyWorkspacePaths.risk],
+    scope: "user",
+    source_metadata: {
+      available_targets: ["global-mcp-sidecar", "global-config"],
+      effective_source: { kind: "global-mcp-sidecar", scope: "user" },
+      shadowed_sources: [{ kind: "global-config", scope: "user" }],
+    },
+  },
+  {
+    name: "github",
+    transport: "stdio",
+    command: "npx -y @modelcontextprotocol/server-github",
+    env_keys: ["GITHUB_TOKEN"],
+    scope: "user",
+    source_metadata: {
+      available_targets: ["global-mcp-sidecar"],
+      effective_source: { kind: "global-mcp-sidecar", scope: "user" },
+    },
+  },
+];
+
+export const settingsHookFixtures: SettingsHookEntry[] =
+  settingsHooksExtensionsSectionFixture.hooks ?? [];
+
+export const settingsProvidersCollectionFixture = {
+  available_scopes: ["user"],
+  collection: "providers",
+  providers: settingsProviderFixtures,
+  scope: "user",
+} satisfies SettingsProviderCollection;
+
+export const settingsMCPServersCollectionFixture = {
+  available_scopes: ["user", "profile", "workspace"],
+  collection: "mcp-servers",
+  mcp_servers: settingsMCPServerFixtures,
+  scope: "user",
+} satisfies SettingsMCPServerCollection;
+
+// The reference visual-contract matrix: nine servers exercising every auth x
+// runtime x probe cell (docs/design/opendesign/mcp-management.html SERVERS).
+function mcpConfigSource(kind: string, scope: "user" | "profile" | "workspace") {
+  return {
+    available_targets: [kind] as SettingsMCPServerEntry["source_metadata"]["available_targets"],
+    effective_source:
+      scope === "workspace" ? { kind, scope, workspace_id: "ws-platform" } : { kind, scope },
+  } as SettingsMCPServerEntry["source_metadata"];
+}
+
+export const mcpManagementServerFixtures: SettingsMCPServerEntry[] = [
+  {
+    name: "github-local",
+    transport: "stdio",
+    command: "npx",
+    args: ["-y", "@modelcontextprotocol/server-github"],
+    env_keys: ["LOG_LEVEL"],
+    secret_env_keys: ["GITHUB_PERSONAL_ACCESS_TOKEN"],
+    scope: "workspace",
+    workspace_id: "ws-platform",
+    runtime_status: {
+      configured: true,
+      initialized: true,
+      state: "ready",
+      probe: "succeeded",
+      tool_count: 12,
+    },
+    source_metadata: mcpConfigSource("workspace-mcp-sidecar", "workspace"),
+  },
+  {
+    name: "linear",
+    transport: "http",
+    url: "https://mcp.linear.app/mcp",
+    auth: {
+      client_secret_configured: false,
+      registration: "auto",
+    },
+    auth_status: {
+      server_name: "linear",
+      owner: "manual",
+      scope: "workspace",
+      status: "needs_login",
+      token_present: false,
+      refreshable: true,
+      diagnostic: "token absent",
+    },
+    runtime_status: {
+      configured: true,
+      initialized: false,
+      state: "auth_required",
+      probe: "skipped",
+      tool_count: 0,
+    },
+    catalog_entry: "linear",
+    catalog_version: "1.4.0",
+    scope: "workspace",
+    workspace_id: "ws-platform",
+    source_metadata: mcpConfigSource("workspace-config", "workspace"),
+  },
+  {
+    name: "sentry",
+    transport: "http",
+    url: "https://mcp.sentry.dev/mcp",
+    auth: {
+      client_secret_configured: false,
+      registration: "auto",
+    },
+    auth_status: {
+      server_name: "sentry",
+      owner: "manual",
+      scope: "workspace",
+      status: "authenticated",
+      token_present: true,
+      refreshable: true,
+      diagnostic: "token present",
+    },
+    runtime_status: {
+      configured: true,
+      initialized: true,
+      state: "ready",
+      probe: "succeeded",
+      protocol_version: "2026-07-28",
+      tool_count: 18,
+    },
+    catalog_entry: "sentry",
+    catalog_version: "2.1.0",
+    scope: "workspace",
+    workspace_id: "ws-platform",
+    source_metadata: mcpConfigSource("workspace-config", "workspace"),
+  },
+  {
+    name: "notion",
+    transport: "http",
+    url: "https://mcp.notion.com/mcp",
+    auth: {
+      client_secret_configured: false,
+      registration: "auto",
+    },
+    auth_status: {
+      server_name: "notion",
+      owner: "manual",
+      scope: "workspace",
+      status: "expired",
+      token_present: true,
+      refreshable: true,
+      diagnostic: "token expired",
+    },
+    runtime_status: {
+      configured: true,
+      initialized: false,
+      state: "auth_expired",
+      probe: "skipped",
+      tool_count: 0,
+    },
+    scope: "workspace",
+    workspace_id: "ws-platform",
+    source_metadata: mcpConfigSource("workspace-config", "workspace"),
+  },
+  {
+    name: "grafana",
+    transport: "http",
+    url: "https://mcp.grafana.com/mcp",
+    auth: {
+      client_secret_configured: false,
+      registration: "auto",
+    },
+    auth_status: {
+      server_name: "grafana",
+      owner: "manual",
+      scope: "user",
+      status: "invalid",
+      token_present: true,
+      refreshable: false,
+      diagnostic: "token rejected",
+    },
+    runtime_status: {
+      configured: true,
+      initialized: false,
+      state: "auth_invalid",
+      probe: "skipped",
+      tool_count: 0,
+    },
+    scope: "user",
+    source_metadata: mcpConfigSource("global-config", "user"),
+  },
+  {
+    name: "github-remote",
+    transport: "http",
+    url: "https://api.githubcopilot.com/mcp",
+    auth: {
+      client_secret_configured: false,
+      registration: "auto",
+    },
+    auth_status: {
+      server_name: "github-remote",
+      owner: "manual",
+      scope: "user",
+      status: "authenticated",
+      token_present: true,
+      refreshable: true,
+      diagnostic: "prior token retained",
+    },
+    runtime_status: {
+      configured: true,
+      initialized: false,
+      state: "auth_refresh_failed",
+      probe: "skipped",
+      tool_count: 0,
+    },
+    scope: "user",
+    source_metadata: mcpConfigSource("global-config", "user"),
+  },
+  {
+    name: "filesystem",
+    transport: "stdio",
+    command: "node",
+    args: ["./bin/filesystem-mcp.js"],
+    scope: "workspace",
+    workspace_id: "ws-platform",
+    runtime_status: {
+      configured: true,
+      initialized: false,
+      state: "config_error",
+      probe: "skipped",
+      tool_count: 0,
+    },
+    source_metadata: mcpConfigSource("workspace-config", "workspace"),
+  },
+  {
+    name: "pagerduty",
+    transport: "http",
+    url: "https://mcp.pagerduty.com/mcp",
+    auth: {
+      client_secret_configured: false,
+      registration: "auto",
+    },
+    auth_status: {
+      server_name: "pagerduty",
+      owner: "manual",
+      scope: "workspace",
+      status: "authenticated",
+      token_present: true,
+      refreshable: true,
+      diagnostic: "token present",
+    },
+    runtime_status: {
+      configured: true,
+      initialized: true,
+      state: "permission_denied",
+      probe: "failed",
+      tool_count: 0,
+    },
+    scope: "workspace",
+    workspace_id: "ws-platform",
+    source_metadata: mcpConfigSource("workspace-config", "workspace"),
+  },
+  {
+    name: "buildkite",
+    transport: "http",
+    url: "https://mcp.buildkite.com/mcp",
+    auth: {
+      client_secret_configured: false,
+      registration: "auto",
+    },
+    auth_status: {
+      server_name: "buildkite",
+      owner: "manual",
+      scope: "user",
+      status: "authenticated",
+      token_present: true,
+      refreshable: true,
+      diagnostic: "token present",
+    },
+    runtime_status: {
+      configured: true,
+      initialized: true,
+      state: "runtime_unavailable",
+      probe: "failed",
+      tool_count: 0,
+    },
+    scope: "user",
+    source_metadata: mcpConfigSource("global-config", "user"),
+  },
+];
+
+/**
+ * Owner-aware rows for Settings › MCP servers (task_04): a manual `github` beside the
+ * `compozy/github` extension's own `github` (owner `extension:github`, runtime name
+ * `github.github`, OAuth needing login, with a stored override), plus a running
+ * extension server whose runtime name kept the plain manifest name.
+ */
+export const mcpExtensionServerFixtures: SettingsMCPServerEntry[] = [
+  {
+    name: "github",
+    transport: "stdio",
+    command: "npx",
+    args: ["-y", "@modelcontextprotocol/server-github"],
+    env_keys: ["GITHUB_API_URL"],
+    secret_env_keys: ["GITHUB_PERSONAL_ACCESS_TOKEN"],
+    owner: "manual",
+    scope: "user",
+    runtime_status: {
+      configured: true,
+      initialized: true,
+      state: "ready",
+      probe: "succeeded",
+      tool_count: 12,
+    },
+    source_metadata: mcpConfigSource("global-mcp-sidecar", "user"),
+  },
+  {
+    name: "github",
+    transport: "http",
+    url: "https://api.githubcopilot.com/mcp",
+    owner: "extension:github",
+    runtime_name: "github.github",
+    auth: {
+      client_secret_configured: false,
+      registration: "dynamic",
+      issuer_url: "https://github.com/login/oauth",
+      scopes: ["repo", "read:org"],
+    },
+    auth_status: {
+      server_name: "github",
+      owner: "extension:github",
+      scope: "user",
+      status: "needs_login",
+      token_present: false,
+      refreshable: true,
+      diagnostic: "token absent",
+    },
+    runtime_status: {
+      configured: true,
+      initialized: false,
+      state: "auth_required",
+      probe: "skipped",
+      tool_count: 0,
+    },
+    override: { headers: { "X-GitHub-Api-Version": "2022-11-28" } },
+    scope: "user",
+    source_metadata: {
+      available_targets: [],
+      effective_source: { kind: "extension", scope: "user" },
+    },
+  },
+  {
+    name: "context7",
+    transport: "http",
+    url: "https://mcp.context7.com/mcp",
+    owner: "extension:context7",
+    runtime_name: "context7",
+    auth_status: null,
+    runtime_status: {
+      configured: true,
+      initialized: true,
+      state: "ready",
+      probe: "succeeded",
+      protocol_version: "2026-07-28",
+      tool_count: 2,
+    },
+    scope: "user",
+    source_metadata: {
+      available_targets: [],
+      effective_source: { kind: "extension", scope: "user" },
+    },
+  },
+];
+
+export const mcpOwnerCollectionFixture = {
+  available_scopes: ["user", "workspace"],
+  collection: "mcp-servers",
+  mcp_servers: [...mcpExtensionServerFixtures, ...mcpManagementServerFixtures],
+  scope: "user",
+} satisfies SettingsMCPServerCollection;
+
+export const mcpManagementCollectionFixture = {
+  available_scopes: ["user", "workspace"],
+  collection: "mcp-servers",
+  mcp_servers: mcpManagementServerFixtures,
+  scope: "workspace",
+  workspace_id: "ws-platform",
+} satisfies SettingsMCPServerCollection;
+
+export const mcpAuthBeginFixture = {
+  authorization_url:
+    "https://auth.linear.app/oauth/authorize?client_id=compozy-linear-public&code_challenge=J6lRkq8l9lZ3tZpQf7uYx2AqY7M3xv2b9R6n0ZsVn4A&code_challenge_method=S256&redirect_uri=http%3A%2F%2F127.0.0.1%3A2123%2Fapi%2Fmcp%2Foauth%2Fcallback&state=compozy_mcp_7m3p9q",
+  callback_url: "http://127.0.0.1:2123/api/mcp/oauth/callback",
+  expires_at: new Date(Date.now() + 5 * 60_000).toISOString(),
+  manual_supported: true,
+  state: "compozy_mcp_7m3p9q",
+};
+
+export const mcpAuthStatusAuthenticatedFixture = {
+  server_name: "linear",
+  owner: "manual",
+  scope: "workspace",
+  workspace_id: "ws-platform",
+  status: "authenticated",
+  token_present: true,
+  refreshable: true,
+  diagnostic: "token present",
+};
+
+export const settingsRestartResponseFixture: SettingsRestartResponse = {
+  operation_id: "restart_northstar_pay",
+  status: "pending",
+  active_session_count: 2,
+  status_url: "/api/settings/actions/restart/restart_northstar_pay",
+};
+
+export const settingsRestartStatusFixture: SettingsRestartStatus = {
+  operation_id: "restart_northstar_pay",
+  status: "ready",
+  active_session_count: 0,
+  old_pid: 1000,
+  old_socket_path: "/tmp/compozy.sock",
+  old_started_at: "2026-04-17T10:00:00Z",
+  started_at: "2026-04-17T10:05:00Z",
+  updated_at: "2026-04-17T10:05:05Z",
+};
+
+/** A section apply receipt; the shell section adds its own config to it. */
+type SettingsApplyReceipt = Exclude<
+  SettingsMutationResult,
+  OperationResponse<"updateSettingsShell", 200>
+>;
+
+export const settingsAppliedMutationFixture: SettingsApplyReceipt = {
+  active_config_hash: "sha256:active-live",
+  active_generation: 42,
+  applied: true,
+  apply_record_id: "cfg_apply_live",
+  section: "general",
+  scope: "user",
+  lifecycle: "live",
+  next_action: "none",
+  restart_required: false,
+  restart_scope: "none",
+  warnings: [],
+  write_target: "global-config",
+};
+
+export const settingsRestartRequiredMutationFixture: SettingsApplyReceipt = {
+  active_config_hash: "sha256:active-blocked",
+  active_generation: 41,
+  applied: true,
+  apply_record_id: "cfg_apply_blocked",
+  section: "general",
+  scope: "user",
+  lifecycle: "restart-required",
+  next_action: "restart-daemon",
+  restart_required: true,
+  restart_scope: "daemon",
+  warnings: [],
+  write_target: "global-config",
+};
+
+export const settingsReloadAppliedFixture: SettingsApplyResponse = {
+  active_config_hash: "sha256:active-live",
+  active_generation: 42,
+  applied: true,
+  apply_record_id: "cfg_apply_live",
+  lifecycle: "live",
+  next_action: "none",
+  restart_required: false,
+  warnings: [],
+};
+
+export const settingsReloadBlockedFixture: SettingsApplyResponse = {
+  active_config_hash: "sha256:active-blocked",
+  active_generation: 41,
+  applied: false,
+  apply_record_id: "cfg_apply_blocked",
+  lifecycle: "restart-required",
+  next_action: "restart-daemon",
+  restart_required: true,
+  restart_scope: "daemon",
+  warnings: ["restart the daemon to activate config.toml"],
+};
+
+export const settingsApplyRecordsFixture: ConfigApplyRecordsResponse = {
+  entries: [
+    {
+      id: "cfg_apply_blocked",
+      desired_config_hash: "sha256:desired-restart-required",
+      active_config_hash: "sha256:active-blocked",
+      generation: 41,
+      actor: "http",
+      diff_class: "restart-required",
+      status: "blocked",
+      lifecycle: "restart-required",
+      next_action: "restart-daemon",
+      diagnostics: [
+        {
+          id: "diag_restart_required",
+          code: "config.apply.restart_required",
+          title: "Restart required",
+          message: "daemon.socket changes require a daemon restart.",
+          severity: "warning",
+          category: "configuration",
+          data_freshness: "current",
+          suggested_command: "compozy config reload",
+        },
+      ],
+      created_at: "2026-05-20T13:10:00Z",
+      updated_at: "2026-05-20T13:10:03Z",
+    },
+    {
+      id: "cfg_apply_live",
+      desired_config_hash: "sha256:desired-live",
+      active_config_hash: "sha256:active-live",
+      generation: 42,
+      actor: "web",
+      diff_class: "live",
+      status: "applied",
+      lifecycle: "live",
+      next_action: "none",
+      created_at: "2026-05-20T13:18:00Z",
+      applied_at: "2026-05-20T13:18:01Z",
+      updated_at: "2026-05-20T13:18:01Z",
+    },
+    {
+      id: "cfg_apply_failed",
+      desired_config_hash: "sha256:desired-failed",
+      active_config_hash: "sha256:active-live",
+      generation: 42,
+      actor: "autonomy",
+      diff_class: "session-rebind",
+      status: "failed",
+      lifecycle: "session-rebind",
+      next_action: "retry",
+      diagnostics: [
+        {
+          id: "diag_invalid_config",
+          code: "config.invalid",
+          title: "Invalid config",
+          message: "provider timeout must be a positive duration.",
+          severity: "error",
+          category: "configuration",
+          data_freshness: "current",
+          suggested_command: "compozy config validate",
+        },
+      ],
+      created_at: "2026-05-20T13:24:00Z",
+      updated_at: "2026-05-20T13:24:02Z",
+    },
+  ],
+};

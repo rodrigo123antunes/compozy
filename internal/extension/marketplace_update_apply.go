@@ -1,0 +1,29 @@
+package extensionpkg
+
+import (
+	"context"
+
+	compozyconfig "github.com/compozy/compozy/internal/config"
+)
+
+func applyResolvedMarketplaceUpdate(
+	ctx context.Context,
+	homePaths compozyconfig.HomePaths,
+	registry LifecycleRegistry,
+	info *ExtensionInfo,
+	req MarketplaceUpdateRequest,
+	reload MutationReload,
+	resolution marketplaceUpdateResolution,
+) (marketplaceUpdateApplyResult, error) {
+	if err := validateMarketplaceTrustGate(
+		dereferenceOptionalString(info.RegistrySlug),
+		resolution.registryName,
+		req.PolicyAllowsUnverified,
+		req.AllowUnverified,
+		resolution.trust,
+	); err != nil {
+		return marketplaceUpdateApplyResult{}, err
+	}
+
+	return applyMarketplaceExtensionUpdate(ctx, homePaths, registry, info, req, resolution, reload)
+}

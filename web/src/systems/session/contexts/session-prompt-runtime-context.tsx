@@ -1,0 +1,162 @@
+import { useEffect, type ReactNode } from "react";
+
+import { useStoreBinding } from "@/hooks/use-store-binding";
+import type { SessionPayload, SessionRuntimeEffective, SessionRuntimeSelection } from "../types";
+import {
+  sessionPromptRuntimeInput,
+  sessionPromptRuntimeStoreLogic,
+} from "../stores/session-prompt-runtime-store";
+import {
+  SessionPromptRuntimeContext,
+  SessionPromptRuntimeActivityContext,
+  SessionPromptRuntimeCapabilitiesContext,
+} from "./session-prompt-runtime-context-value";
+
+export interface SessionPromptRuntimeProviderProps {
+  session: SessionPayload;
+  canPrompt: boolean;
+  children: ReactNode;
+}
+
+function runtimeInputFromValues(
+  agentName: string,
+  canPrompt: boolean,
+  workspaceId: string | undefined,
+  sessionId: string,
+  provider: SessionRuntimeEffective["provider"] | undefined,
+  model: SessionRuntimeEffective["model"] | undefined,
+  reasoningEffort: SessionRuntimeEffective["reasoning_effort"] | undefined,
+  speed: SessionRuntimeEffective["speed"] | undefined,
+  selectedProvider: SessionRuntimeSelection["provider"] | undefined,
+  selectedModel: SessionRuntimeSelection["model"] | undefined,
+  selectedReasoningEffort: SessionRuntimeSelection["reasoning_effort"] | undefined,
+  selectedSpeed: SessionRuntimeSelection["speed"] | undefined,
+  selectionRevision: number,
+  effectiveACPOptions: SessionRuntimeEffective["acp_options"],
+  selectedACPOptions: SessionRuntimeSelection["acp_options"],
+  requestedRuntime: SessionRuntimeSelection | undefined
+) {
+  return sessionPromptRuntimeInput({
+    agentName,
+    canPrompt,
+    requestedRuntime,
+    effectiveRuntime:
+      provider === undefined
+        ? undefined
+        : {
+            provider,
+            ...(model === undefined ? {} : { model }),
+            ...(reasoningEffort === undefined ? {} : { reasoning_effort: reasoningEffort }),
+            ...(speed === undefined ? {} : { speed }),
+            ...(effectiveACPOptions ? { acp_options: effectiveACPOptions } : {}),
+          },
+    selectedRuntime:
+      selectedProvider === undefined
+        ? undefined
+        : {
+            provider: selectedProvider,
+            ...(selectedModel === undefined ? {} : { model: selectedModel }),
+            ...(selectedReasoningEffort === undefined
+              ? {}
+              : { reasoning_effort: selectedReasoningEffort }),
+            ...(selectedSpeed === undefined ? {} : { speed: selectedSpeed }),
+            ...(selectedACPOptions ? { acp_options: selectedACPOptions } : {}),
+          },
+    selectionRevision,
+    sessionId,
+    workspaceId,
+  });
+}
+
+/** Bind server inputs to one session intent store while exposing capability snapshots separately. */
+export function SessionPromptRuntimeProvider({
+  session,
+  canPrompt,
+  children,
+}: SessionPromptRuntimeProviderProps) {
+  const effectiveProvider = session.runtime?.effective?.provider;
+  const effectiveModel = session.runtime?.effective?.model;
+  const effectiveReasoningEffort = session.runtime?.effective?.reasoning_effort;
+  const effectiveSpeed = session.runtime?.effective?.speed;
+  const selectedProvider = session.runtime?.selected?.provider;
+  const selectedModel = session.runtime?.selected?.model;
+  const selectedReasoningEffort = session.runtime?.selected?.reasoning_effort;
+  const selectedSpeed = session.runtime?.selected?.speed;
+  const selectionRevision = session.runtime.selection_revision;
+  const effectiveACPOptions = session.runtime?.effective?.acp_options;
+  const selectedACPOptions = session.runtime?.selected?.acp_options;
+  const requestedRuntime = session.runtime.requested ?? undefined;
+  const { store } = useStoreBinding(session.id, () =>
+    sessionPromptRuntimeStoreLogic.createStore(
+      runtimeInputFromValues(
+        session.agent_name,
+        canPrompt,
+        session.workspace_id,
+        session.id,
+        effectiveProvider,
+        effectiveModel,
+        effectiveReasoningEffort,
+        effectiveSpeed,
+        selectedProvider,
+        selectedModel,
+        selectedReasoningEffort,
+        selectedSpeed,
+        selectionRevision,
+        effectiveACPOptions,
+        selectedACPOptions,
+        requestedRuntime
+      )
+    )
+  );
+
+  useEffect(() => {
+    store.trigger.inputUpdated(
+      runtimeInputFromValues(
+        session.agent_name,
+        canPrompt,
+        session.workspace_id,
+        session.id,
+        effectiveProvider,
+        effectiveModel,
+        effectiveReasoningEffort,
+        effectiveSpeed,
+        selectedProvider,
+        selectedModel,
+        selectedReasoningEffort,
+        selectedSpeed,
+        selectionRevision,
+        effectiveACPOptions,
+        selectedACPOptions,
+        requestedRuntime
+      )
+    );
+  }, [
+    canPrompt,
+    effectiveModel,
+    effectiveProvider,
+    effectiveReasoningEffort,
+    effectiveSpeed,
+    selectedModel,
+    selectedProvider,
+    selectedReasoningEffort,
+    selectedSpeed,
+    selectionRevision,
+    effectiveACPOptions,
+    selectedACPOptions,
+    requestedRuntime,
+    session.agent_name,
+    session.id,
+    session.workspace_id,
+    store,
+  ]);
+
+  return (
+    <SessionPromptRuntimeContext value={store}>
+      <SessionPromptRuntimeCapabilitiesContext value={session.runtime}>
+        <SessionPromptRuntimeActivityContext value={session.badge}>
+          {children}
+        </SessionPromptRuntimeActivityContext>
+      </SessionPromptRuntimeCapabilitiesContext>
+    </SessionPromptRuntimeContext>
+  );
+}

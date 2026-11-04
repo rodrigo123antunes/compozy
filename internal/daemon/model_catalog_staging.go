@@ -1,0 +1,252 @@
+package daemon
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"maps"
+	"slices"
+	"time"
+
+	compozyconfig "github.com/compozy/compozy/internal/config"
+	"github.com/compozy/compozy/internal/modelcatalog"
+)
+
+type stagedLiveProviderConfigs struct {
+	effective map[string]compozyconfig.ProviderConfig
+	sources   map[string]*modelcatalog.LiveProviderSource
+	previous  map[string]*modelcatalog.LiveProviderSource
+	changed   []string
+}
+
+type stagedModelCatalogGeneration struct {
+	service        modelCatalogGenerationService
+	plan           *modelcatalog.RefreshPlan
+	providers      map[string]compozyconfig.ProviderConfig
+	reasoningApply map[string]bool
+	live           stagedLiveProviderConfigs
+}
+
+func (r *modelCatalogRuntime) stageModelCatalogGeneration(
+	ctx context.Context,
+	cfg *compozyconfig.Config,
+) (stagedModelCatalogGeneration, error) {
+	reasoningApply, err := effectiveCatalogReasoningApply(cfg)
+	if err != nil {
+		return stagedModelCatalogGeneration{}, err
+	}
+	providers := map[string]compozyconfig.ProviderConfig(nil)
+	if cfg != nil {
+		providers = compozyconfig.CloneProviderConfigs(cfg.Providers)
+	}
+	live, err := r.stageLiveProviderConfigs(providers)
+	if err != nil {
+		return stagedModelCatalogGeneration{}, err
+	}
+	service, ok := r.service.(modelCatalogGenerationService)
+	if !ok {
+		return stagedModelCatalogGeneration{}, errors.New(
+			"daemon: model catalog service cannot publish atomic generations",
+		)
+	}
+	plan, err := service.NewRefreshPlan()
+	if err != nil {
+		return stagedModelCatalogGeneration{}, fmt.Errorf(
+			"daemon: create model catalog refresh plan: %w",
+			err,
+		)
+	}
+	if err := plan.SetLiveSources(slices.Collect(maps.Values(live.sources))); err != nil {
+		return stagedModelCatalogGeneration{}, fmt.Errorf("daemon: stage live model catalog sources: %w", err)
+	}
+	now := time.Now().UTC()
+	if r.now != nil {
+		now = r.now().UTC()
+	}
+	configSource := modelcatalog.NewConfigSource(providers)
+	if err := r.refreshStagedConfig(ctx, plan, configSource, providers, now); err != nil {
+		return stagedModelCatalogGeneration{}, err
+	}
+	if err := refreshStagedLive(ctx, plan, live, r.catalogExecutionContexts(), now); err != nil {
+		return stagedModelCatalogGeneration{}, err
+	}
+	return stagedModelCatalogGeneration{
+		service:        service,
+		plan:           plan,
+		providers:      providers,
+		reasoningApply: reasoningApply,
+		live:           live,
+	}, nil
+}
+
+func (r *modelCatalogRuntime) refreshStagedConfig(
+	ctx context.Context,
+	plan *modelcatalog.RefreshPlan,
+	source *modelcatalog.ProviderConfigSource,
+	providers map[string]compozyconfig.ProviderConfig,
+	now time.Time,
+) error {
+	providerIDs := reconcileProviderIDs(r.configSource.ProviderIDs(), providers)
+	for _, providerID := range providerIDs {
+		if _, err := plan.Refresh(ctx, source, modelcatalog.RefreshOptions{
+			ProviderID:       providerID,
+			ExecutionContext: modelcatalog.GlobalCatalogExecutionContext(),
+			Force:            true,
+			Now:              now,
+		}); err != nil {
+			return fmt.Errorf("daemon: reconcile model catalog config provider %q: %w", providerID, err)
+		}
+	}
+	return nil
+}
+
+func refreshStagedLive(
+	ctx context.Context,
+	plan *modelcatalog.RefreshPlan,
+	live stagedLiveProviderConfigs,
+	executionContexts []modelcatalog.CatalogExecutionContext,
+	now time.Time,
+) error {
+	for _, executionContext := range executionContexts {
+		for _, providerID := range live.changed {
+			previousExecutionContext, err := previousLiveExecutionContext(
+				live.previous[providerID],
+				executionContext,
+			)
+			if err != nil {
+				return fmt.Errorf(
+					"daemon: resolve prior live model catalog context for %q: %w",
+					providerID,
+					err,
+				)
+			}
+			statuses, refreshErr := plan.Refresh(ctx, live.sources[providerID], modelcatalog.RefreshOptions{
+				ProviderID:               providerID,
+				ExecutionContext:         executionContext,
+				PreviousExecutionContext: previousExecutionContext,
+				Force:                    true,
+				Now:                      now,
+			})
+			if refreshErr == nil {
+				continue
+			}
+			if ctx.Err() != nil {
+				return fmt.Errorf("daemon: reconcile live model catalog provider %q: %w", providerID, ctx.Err())
+			}
+			if !recordedLiveRefreshFailure(statuses, providerID) {
+				return fmt.Errorf("daemon: reconcile live model catalog provider %q: %w", providerID, refreshErr)
+			}
+		}
+	}
+	return nil
+}
+
+func (r *modelCatalogRuntime) publishModelCatalogGeneration(generation stagedModelCatalogGeneration) {
+	r.configSource.ReplaceProviders(generation.providers)
+	if updater, ok := r.service.(modelCatalogMergeOptionsUpdater); ok {
+		updater.UpdateMergeOptions(modelcatalog.MergeOptions{ReasoningApply: generation.reasoningApply})
+	}
+	r.liveSourcesMu.Lock()
+	for id, source := range r.dynamicSources {
+		if source.Kind() == modelcatalog.SourceKindProviderLive {
+			delete(r.dynamicSources, id)
+		}
+	}
+	r.liveSources = generation.live.sources
+	r.liveSourcesMu.Unlock()
+}
+
+func reconcileProviderIDs(
+	previous []string,
+	next map[string]compozyconfig.ProviderConfig,
+) []string {
+	providerSet := make(map[string]struct{}, len(previous)+len(next))
+	for _, providerID := range previous {
+		providerSet[providerID] = struct{}{}
+	}
+	for providerID := range next {
+		providerSet[providerID] = struct{}{}
+	}
+	providerIDs := make([]string, 0, len(providerSet))
+	for providerID := range providerSet {
+		providerIDs = append(providerIDs, providerID)
+	}
+	slices.Sort(providerIDs)
+	return providerIDs
+}
+
+func (r *modelCatalogRuntime) stageLiveProviderConfigs(
+	providers map[string]compozyconfig.ProviderConfig,
+) (stagedLiveProviderConfigs, error) {
+	resolver := &compozyconfig.Config{Providers: providers}
+	effective := make(map[string]compozyconfig.ProviderConfig, len(r.liveSources))
+	candidates := maps.Clone(r.liveSources)
+	if r.liveSourceFactory != nil {
+		sources, err := r.liveSourceFactory(providers)
+		if err != nil {
+			return stagedLiveProviderConfigs{}, err
+		}
+		candidates = make(map[string]*modelcatalog.LiveProviderSource, len(sources))
+		for _, source := range sources {
+			live, ok := source.(*modelcatalog.LiveProviderSource)
+			if !ok {
+				return stagedLiveProviderConfigs{}, fmt.Errorf("daemon: unexpected live source type %T", source)
+			}
+			candidates[live.ProviderIDs()[0]] = live
+		}
+	}
+	for providerID := range candidates {
+		provider, err := resolver.ResolveProvider(providerID)
+		if err != nil {
+			return stagedLiveProviderConfigs{}, fmt.Errorf(
+				"daemon: resolve live model catalog provider %q: %w",
+				providerID,
+				err,
+			)
+		}
+		effective[providerID] = provider
+	}
+	staged := stagedLiveProviderConfigs{
+		effective: effective,
+		sources:   make(map[string]*modelcatalog.LiveProviderSource, len(r.liveSources)),
+		previous:  make(map[string]*modelcatalog.LiveProviderSource, len(r.liveSources)),
+		changed:   make([]string, 0, len(r.liveSources)),
+	}
+	for providerID, candidate := range candidates {
+		source := r.liveSources[providerID]
+		if source == nil {
+			staged.sources[providerID] = candidate
+			staged.changed = append(staged.changed, providerID)
+			continue
+		}
+		clone, changed, err := source.CloneWithProvider(effective[providerID])
+		if err != nil {
+			return stagedLiveProviderConfigs{}, fmt.Errorf(
+				"daemon: stage live model catalog provider %q: %w",
+				providerID,
+				err,
+			)
+		}
+		staged.sources[providerID] = clone
+		staged.previous[providerID] = source
+		if changed {
+			staged.changed = append(staged.changed, providerID)
+		}
+	}
+	slices.Sort(staged.changed)
+	return staged, nil
+}
+
+func previousLiveExecutionContext(
+	source *modelcatalog.LiveProviderSource,
+	executionContext modelcatalog.CatalogExecutionContext,
+) (modelcatalog.CatalogExecutionContext, error) {
+	if source == nil {
+		return modelcatalog.CatalogExecutionContext{}, nil
+	}
+	fingerprint, err := source.CatalogExecutionFingerprint()
+	if err != nil {
+		return modelcatalog.CatalogExecutionContext{}, err
+	}
+	return executionContext.WithCommandFingerprint(fingerprint)
+}

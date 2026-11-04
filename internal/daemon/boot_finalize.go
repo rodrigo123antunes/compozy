@@ -1,0 +1,244 @@
+package daemon
+
+import (
+	"context"
+	"errors"
+	"fmt"
+
+	"time"
+
+	compozyconfig "github.com/compozy/compozy/internal/config"
+
+	profilepkg "github.com/compozy/compozy/internal/profile"
+
+	"github.com/compozy/compozy/internal/skills"
+	workspacepkg "github.com/compozy/compozy/internal/workspace"
+
+	skillbundled "github.com/compozy/compozy/skills"
+)
+
+func (d *Daemon) bootFinalize(ctx context.Context, state *bootState) error {
+	if state.resourceReconcile != nil {
+		if err := state.resourceReconcile.RunBoot(ctx); err != nil {
+			return fmt.Errorf("daemon: boot resource reconcile: %w", err)
+		}
+	}
+
+	reconcileResult, err := state.observer.Reconcile(ctx)
+	if err != nil {
+		return fmt.Errorf("daemon: reconcile sessions: %w", err)
+	}
+	state.logger.Info(
+		"daemon: boot reconciliation complete",
+		"indexed_sessions", len(reconcileResult.Indexed),
+		"orphaned_sessions", len(reconcileResult.Orphaned),
+	)
+
+	if d.shouldVerifyBoundaries() {
+		if boundaryErr := d.Boundaries(ctx); boundaryErr != nil {
+			state.logger.Warn("daemon: boundary verification warning", "error", boundaryErr)
+		}
+	}
+	return nil
+}
+
+func (d *Daemon) skillsRegistryConfig(cfg *compozyconfig.Config) skills.RegistryConfig {
+	skillsConfig := compozyconfig.DefaultWithHome(d.homePaths).Skills
+	if cfg == nil {
+		return skills.RegistryConfig{
+			BundledFS:        skillbundled.FS(),
+			GlobalSkillRoots: compozyconfig.ResolveGlobalSkillRoots(&skillsConfig, d.homePaths),
+			GlobalAgentsDir:  d.homePaths.AgentsDir,
+		}
+	}
+	skillsConfig = cfg.Skills
+
+	return skills.RegistryConfig{
+		BundledFS:        skillbundled.FS(),
+		GlobalSkillRoots: compozyconfig.ResolveGlobalSkillRoots(&skillsConfig, d.homePaths),
+		GlobalAgentsDir:  d.homePaths.AgentsDir,
+		DisabledSkills:   append([]string(nil), cfg.Skills.DisabledSkills...),
+	}
+}
+
+func startSkillsWatcher(
+	ctx context.Context,
+	registry *skills.Registry,
+	interval time.Duration,
+	rootsProvider func(context.Context) ([]string, error),
+	agentRootsProvider func(context.Context) ([]string, error),
+	afterRefresh func(context.Context) error,
+) (context.CancelFunc, chan struct{}) {
+	if registry == nil {
+		return nil, nil
+	}
+
+	watcherCtx, cancel := context.WithCancel(ctx)
+	done := make(chan struct{})
+	watcher := skills.NewWatcher(registry, interval)
+	watcher.SetRootsProvider(rootsProvider)
+	watcher.SetAgentRootsProvider(agentRootsProvider)
+	watcher.SetAfterRefresh(afterRefresh)
+	go func() {
+		defer close(done)
+		watcher.Start(watcherCtx)
+	}()
+	return cancel, done
+}
+
+func workspaceSkillWatcherRoots(
+	homePaths compozyconfig.HomePaths,
+	registry workspaceRegistryReader,
+	profiles extensionProfileCatalog,
+) func(context.Context) ([]string, error) {
+	if registry == nil {
+		return nil
+	}
+
+	return func(ctx context.Context) ([]string, error) {
+		workspaces, err := registry.ListWorkspaces(ctx)
+		if err != nil {
+			return nil, fmt.Errorf("daemon: list workspaces for skill watcher: %w", err)
+		}
+
+		profileNames, err := activeResourceProfileNames(ctx, profiles)
+		if err != nil {
+			return nil, err
+		}
+		roots := make([]string, 0, len(workspaces)*len(profileNames)*4)
+		seen := make(map[string]struct{}, cap(roots))
+		for _, workspace := range workspaces {
+			for _, profileName := range profileNames {
+				if err := workspacepkg.ValidatePersonalProfileRoot(
+					workspace.RootDir, homePaths.HomeDir, homePaths.ProfilesDir, profileName,
+				); err != nil {
+					return nil, err
+				}
+				cfg, err := compozyconfig.LoadForHome(homePaths,
+					compozyconfig.WithWorkspaceRoot(workspace.RootDir), compozyconfig.WithProfile(profileName))
+				if err != nil {
+					return nil, fmt.Errorf(
+						"daemon: load skill watcher roots for workspace %q profile %q: %w",
+						workspace.ID, profileName, err,
+					)
+				}
+				for _, root := range compozyconfig.WorkspaceDiscoveryRoots(
+					workspace.RootDir, workspace.AdditionalDirs, homePaths, profileName,
+				) {
+					if root.Source == compozyconfig.WorkspaceDiscoverySourceGlobal {
+						continue
+					}
+					for _, skillRoot := range root.SkillsDirs(&cfg.Skills) {
+						if _, exists := seen[skillRoot.Dir]; exists {
+							continue
+						}
+						seen[skillRoot.Dir] = struct{}{}
+						roots = append(roots, skillRoot.Dir)
+					}
+				}
+			}
+		}
+
+		return roots, nil
+	}
+}
+
+func workspaceAgentWatcherRoots(
+	homePaths compozyconfig.HomePaths,
+	registry workspaceRegistryReader,
+	profiles extensionProfileCatalog,
+) func(context.Context) ([]string, error) {
+	if registry == nil {
+		return nil
+	}
+	return func(ctx context.Context) ([]string, error) {
+		workspaces, err := registry.ListWorkspaces(ctx)
+		if err != nil {
+			return nil, fmt.Errorf("daemon: list workspaces for agent watcher: %w", err)
+		}
+		profileNames, err := activeResourceProfileNames(ctx, profiles)
+		if err != nil {
+			return nil, err
+		}
+		roots := make([]string, 0, len(workspaces)*len(profileNames)*3)
+		seen := make(map[string]struct{}, cap(roots))
+		for _, workspace := range workspaces {
+			for _, profileName := range profileNames {
+				if err := workspacepkg.ValidatePersonalProfileRoot(
+					workspace.RootDir, homePaths.HomeDir, homePaths.ProfilesDir, profileName,
+				); err != nil {
+					return nil, err
+				}
+				for _, root := range compozyconfig.WorkspaceDiscoveryRoots(
+					workspace.RootDir,
+					workspace.AdditionalDirs,
+					homePaths,
+					profileName,
+				) {
+					if root.Source == compozyconfig.WorkspaceDiscoverySourceGlobal {
+						continue
+					}
+					agentsDir := root.AgentsDir()
+					if _, exists := seen[agentsDir]; exists {
+						continue
+					}
+					seen[agentsDir] = struct{}{}
+					roots = append(roots, agentsDir)
+				}
+			}
+		}
+		return roots, nil
+	}
+}
+
+func activeResourceProfileNames(
+	ctx context.Context,
+	profiles extensionProfileCatalog,
+) ([]string, error) {
+	if profiles == nil {
+		return []string{compozyconfig.DefaultProfileDirName}, nil
+	}
+	listed, err := profiles.List(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("daemon: list profiles for resource watcher: %w", err)
+	}
+	profileNames := make([]string, 0, len(listed))
+	for _, profile := range listed {
+		if profile.State == profilepkg.StateActive {
+			profileNames = append(profileNames, profile.Name)
+		}
+	}
+	if len(profileNames) == 0 {
+		profileNames = append(profileNames, compozyconfig.DefaultProfileDirName)
+	}
+	return profileNames, nil
+}
+
+func stopSkillsWatcher(ctx context.Context, cancel context.CancelFunc, done <-chan struct{}) error {
+	if cancel != nil {
+		cancel()
+	}
+	if done == nil {
+		return nil
+	}
+	if ctx == nil {
+		return errors.New("daemon: stop skills watcher context is required")
+	}
+	select {
+	case <-done:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
+func resolveDaemonPort(defaultPort int, server Server) int {
+	type portReporter interface {
+		Port() int
+	}
+
+	if reporter, ok := server.(portReporter); ok && reporter.Port() >= 0 {
+		return reporter.Port()
+	}
+	return defaultPort
+}

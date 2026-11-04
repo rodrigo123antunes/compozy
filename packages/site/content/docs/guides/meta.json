@@ -1,0 +1,11 @@
+{
+    "title": "Guides",
+    "icon": "Book",
+    "pages": [
+        "index",
+        "build-your-first-extension",
+        "watch-new-github-issues",
+        "choose-an-operator-surface",
+        "debug-a-failed-session"
+    ]
+}

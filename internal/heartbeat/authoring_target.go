@@ -1,0 +1,231 @@
+package heartbeat
+
+import (
+	"context"
+
+	"errors"
+	"fmt"
+	"os"
+	"path/filepath"
+	"strings"
+
+	compozyconfig "github.com/compozy/compozy/internal/config"
+	"github.com/compozy/compozy/internal/managedsidecar"
+)
+
+type resolvedAuthoringTarget struct {
+	profileID     string
+	workspaceID   string
+	workspaceRoot string
+	agentName     string
+	agentPath     string
+	heartbeatPath string
+	sourcePath    string
+	managedPath   managedsidecar.Path
+	config        compozyconfig.HeartbeatConfig
+}
+
+type normalizedAuthoringTarget struct {
+	profileID     string
+	workspaceID   string
+	workspaceRoot string
+	agentName     string
+	agentPath     string
+	config        compozyconfig.HeartbeatConfig
+}
+
+func (s *ManagedHeartbeatAuthoringService) resolveTarget(
+	ctx context.Context,
+	target AuthoringTarget,
+) (resolvedAuthoringTarget, error) {
+	if err := checkContext(ctx); err != nil {
+		return resolvedAuthoringTarget{}, err
+	}
+	normalized, err := normalizeAuthoringTarget(target)
+	if err != nil {
+		return resolvedAuthoringTarget{}, err
+	}
+	if diagnostic := validateManagedHeartbeatPath(
+		normalized.workspaceRoot,
+		normalized.agentPath,
+		"AGENT.md",
+	); diagnostic != nil {
+		return resolvedAuthoringTarget{}, authoringDiagnosticFromDiagnostic(diagnostic, ErrAuthoringPathRejected)
+	}
+	if err := ensureAuthoringAgent(normalized.agentPath, normalized.agentName); err != nil {
+		return resolvedAuthoringTarget{}, err
+	}
+	heartbeatPath, sourcePath, managedPath, err := resolveAuthoringHeartbeatPath(
+		normalized.workspaceRoot,
+		normalized.agentPath,
+	)
+	if err != nil {
+		return resolvedAuthoringTarget{}, err
+	}
+	return resolvedAuthoringTarget{
+		profileID:     normalized.profileID,
+		workspaceID:   normalized.workspaceID,
+		workspaceRoot: normalized.workspaceRoot,
+		agentName:     normalized.agentName,
+		agentPath:     normalized.agentPath,
+		heartbeatPath: heartbeatPath,
+		sourcePath:    sourcePath,
+		managedPath:   managedPath,
+		config:        normalized.config,
+	}, nil
+}
+
+func normalizeAuthoringTarget(target AuthoringTarget) (normalizedAuthoringTarget, error) {
+	config := target.Config
+	if err := config.Validate(); err != nil {
+		return normalizedAuthoringTarget{}, err
+	}
+	profileID := strings.TrimSpace(target.ProfileID)
+	workspaceID := strings.TrimSpace(target.WorkspaceID)
+	if profileID == "" && workspaceID != "" {
+		profileID = "00000000000000000000000000"
+	}
+	workspaceRoot := strings.TrimSpace(target.WorkspaceRoot)
+	agentName := strings.TrimSpace(target.AgentName)
+	if workspaceID == "" && profileID == "" {
+		return normalizedAuthoringTarget{}, errors.New("heartbeat: authoring workspace id is required")
+	}
+	if workspaceRoot == "" {
+		return normalizedAuthoringTarget{}, errors.New("heartbeat: authoring workspace root is required")
+	}
+	if !validAgentNameInput(agentName) {
+		return normalizedAuthoringTarget{}, authoringDiagnosticError(
+			diagnosticHeartbeatAgentNotFound,
+			FileName,
+			"agent name is required",
+			nil,
+			ErrAuthoringAgentNotFound,
+		)
+	}
+
+	agentPath := strings.TrimSpace(target.AgentPath)
+	if agentPath == "" {
+		agentPath = filepath.Join(
+			workspaceRoot,
+			compozyconfig.DirName,
+			compozyconfig.AgentsDirName,
+			agentName,
+			"AGENT.md",
+		)
+	}
+	return normalizedAuthoringTarget{
+		profileID:     profileID,
+		workspaceID:   workspaceID,
+		workspaceRoot: workspaceRoot,
+		agentName:     agentName,
+		agentPath:     agentPath,
+		config:        config,
+	}, nil
+}
+
+func ensureAuthoringAgent(agentPath string, agentName string) error {
+	agent, err := compozyconfig.LoadAgentDefFile(agentPath)
+	if err == nil && agent.Name == agentName {
+		return nil
+	}
+
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return authoringDiagnosticError(
+				diagnosticHeartbeatAgentNotFound,
+				safePathWithoutRoot(agentPath),
+				"agent definition was not found",
+				err,
+				ErrAuthoringAgentNotFound,
+			)
+		}
+		return authoringDiagnosticError(
+			diagnosticHeartbeatAgentNotFound,
+			safePathWithoutRoot(agentPath),
+			"agent definition could not be loaded",
+			err,
+			ErrAuthoringAgentNotFound,
+		)
+	}
+	return authoringDiagnosticError(
+		diagnosticHeartbeatAgentNotFound,
+		safePathWithoutRoot(agentPath),
+		"agent definition does not match requested agent",
+		nil,
+		ErrAuthoringAgentNotFound,
+	)
+}
+
+func resolveAuthoringHeartbeatPath(
+	workspaceRoot string,
+	agentPath string,
+) (string, string, managedsidecar.Path, error) {
+	heartbeatPath, err := heartbeatPathForAgent(agentPath)
+	if err != nil {
+		return "", "", managedsidecar.Path{}, authoringDiagnosticError(
+			"heartbeat_invalid_source_path",
+			safePathWithoutRoot(agentPath),
+			"HEARTBEAT.md source path is required",
+			err,
+			ErrAuthoringPathRejected,
+		)
+	}
+	sourcePath, diagnostic := safeSourcePath(heartbeatPath, workspaceRoot)
+	if diagnostic != nil {
+		return "", "", managedsidecar.Path{}, authoringDiagnosticFromDiagnostic(
+			diagnostic,
+			ErrAuthoringPathRejected,
+		)
+	}
+	managedPath, diagnostic := resolveManagedHeartbeatPath(workspaceRoot, heartbeatPath, FileName)
+	if diagnostic != nil {
+		diagnostic.SourcePath = firstNonEmpty(diagnostic.SourcePath, sourcePath)
+		return "", "", managedsidecar.Path{}, authoringDiagnosticFromDiagnostic(
+			diagnostic,
+			ErrAuthoringPathRejected,
+		)
+	}
+	return managedPath.Absolute(), sourcePath, managedPath, nil
+}
+
+func (s *ManagedHeartbeatAuthoringService) currentHeartbeatForMutation(
+	ctx context.Context,
+	target resolvedAuthoringTarget,
+) (ResolvedPolicy, error) {
+	current, err := Resolve(ctx, ResolveRequest{
+		AgentPath:     target.agentPath,
+		WorkspaceRoot: target.workspaceRoot,
+		Config:        target.config,
+	})
+	if err == nil {
+		return current, nil
+	}
+	if !errors.Is(err, ErrInvalid) {
+		return ResolvedPolicy{}, fmt.Errorf("heartbeat: resolve current HEARTBEAT.md: %w", err)
+	}
+	if current.Present {
+		return current, nil
+	}
+	return current, authoringInvalidError(current.Diagnostics)
+}
+
+func (s *ManagedHeartbeatAuthoringService) verifyUnchangedHeartbeat(
+	ctx context.Context,
+	target resolvedAuthoringTarget,
+	previous *ResolvedPolicy,
+) error {
+	latest, err := s.currentHeartbeatForMutation(ctx, target)
+	if err != nil {
+		return err
+	}
+	if previous == nil {
+		return conflictError(target.sourcePath, "current HEARTBEAT.md state is required")
+	}
+	if latest.Present != previous.Present || latest.Digest != previous.Digest {
+		return conflictError(target.sourcePath, "HEARTBEAT.md changed before managed mutation completed")
+	}
+	if latest.Digest == "" && previous.Present && latest.contentDigest != previous.contentDigest {
+		return conflictError(target.sourcePath, "HEARTBEAT.md changed before managed mutation completed")
+	}
+	return nil
+}

@@ -1,0 +1,72 @@
+---
+title: "compozy session new"
+description: "Create a new session"
+---
+
+## compozy session new
+
+Create a new session
+
+```
+compozy session new [flags]
+```
+
+### Examples
+
+```
+  # Start a session in the current workspace using the configured default agent
+  compozy session new
+
+  # Start a named session for a specific registered workspace and agent
+  compozy session new --workspace checkout-api --agent reviewer --name review-api
+
+  # Auto-register an absolute workspace path before creating the session
+  compozy session new --cwd "$PWD" --agent reviewer
+
+  # Start a session inside a session folder
+  compozy session new --agent reviewer --folder sfold-1234
+
+  # Start a recovery session for a failed parent session
+  compozy session new --agent codex --parent sess_01J9R2K7M4T1 --lineage-kind recovery
+```
+
+### Options
+
+```
+      --agent string                               Agent definition name (defaults to config default)
+      --cwd string                                 Absolute workspace directory to auto-register
+      --folder string                              Create the session at the end of this session folder
+  -h, --help                                       help for new
+      --lineage-kind string                        Relation to --parent: provenance (default) or recovery
+      --name string                                Optional session label
+      --new-worktree string[="__compozy_auto__"]   Create a worktree before starting; optionally provide its name
+      --parent string                              Record a same-workspace parent session as creation provenance
+      --user                                       Create a session in User scope
+      --workspace string                           Override workspace (ID, name, or path)
+      --worktree string                            Start in an existing ready worktree
+```
+
+### Options inherited from parent commands
+
+```
+      --json             Emit JSON output
+  -o, --output string    Output format: human, json, jsonl, or toon (default "human")
+      --profile string   Act as a profile for this command
+```
+
+## Output Formats
+
+The root `-o, --output` flag accepts these values. A renderer is supported only when this command writes that result; `jsonl` is for commands that emit one JSON record per line.
+
+| Format  | Command result                          |
+| ------- | --------------------------------------- |
+| `human` | Interactive terminal rendering          |
+| `json`  | Machine-readable JSON rendering         |
+| `jsonl` | One JSON record per line when supported |
+| `toon`  | Compact agent-readable rendering        |
+
+Example:
+
+```bash
+compozy session new -o json
+```

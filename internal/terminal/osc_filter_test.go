@@ -1,0 +1,424 @@
+package terminal
+
+import (
+	"bytes"
+	"context"
+	"errors"
+	"fmt"
+	"strings"
+	"sync"
+	"testing"
+	"time"
+
+	terminalwire "github.com/compozy/compozy/internal/terminal/wire"
+)
+
+func TestOSCSecurityFilterUnicode(t *testing.T) {
+	t.Parallel()
+	for _, sample := range []struct {
+		name  string
+		input string
+		want  string
+	}{
+		{"Should preserve colored Unicode prompts and ANSI redraws", "\x1b[34m~/project\x1b[39m\r\n\x1b[35m❯\x1b[39m abc\b \b", "\x1b[34m~/project\x1b[39m\r\n\x1b[35m❯\x1b[39m abc\b \b"},
+		{"Should preserve multibyte characters containing C1 bytes", "❯❮⇡⇣≡✦ АÝ✜🔐", "❯❮⇡⇣≡✦ АÝ✜🔐"},
+		{"Should keep Unicode ST bytes inside blocked controls", "before\x1b]52;c;✜secret\x07after\x1bP✜private\x1b\\done", "beforeafterdone"},
+		{"Should retain raw C1 filtering beside Unicode", "❯\x9d52;c;✜secret\x9cА\x90✜private\x9cÝ", "❯АÝ"},
+		{"Should filter UTF-8 encoded C1 controls beside printable Unicode", "❯\u009d52;c;✜secret\u009cА\u0090✜private\u009cÝ", "❯АÝ"},
+		{"Should preserve unknown OSC with Unicode content", "\x1b]133;✜❯\x07abc", "\x1b]133;✜❯\x07abc"},
+		{"Should retain invalid bytes without hiding adjacent controls", "\xff\xe2x\x9d52;c;secret\x07ready", "\xff\xe2xready"},
+	} {
+		t.Run(sample.name, func(t *testing.T) {
+			t.Parallel()
+			for chunkSize := 1; chunkSize <= len(sample.input); chunkSize++ {
+				for _, inputSide := range []bool{false, true} {
+					filter := newOSCSecurityFilter("nonce-1", nil)
+					var got []byte
+					for offset := 0; offset < len(sample.input); offset += chunkSize {
+						chunk := []byte(sample.input[offset:min(offset+chunkSize, len(sample.input))])
+						if inputSide {
+							got = append(got, filter.FilterInput(chunk)...)
+						} else {
+							got = append(got, filter.Filter(chunk).DisplayBytes...)
+						}
+					}
+					if string(got) != sample.want {
+						t.Fatalf("chunk=%d inputSide=%v: got %q, want %q", chunkSize, inputSide, got, sample.want)
+					}
+				}
+			}
+		})
+	}
+	t.Run("Should flush an incomplete final rune without releasing blocked control content", func(t *testing.T) {
+		t.Parallel()
+		for _, sample := range []struct{ name, input, want string }{
+			{"Should retain final malformed bytes before a raw OSC", "visible\xe2\x9d", "visible\xe2"},
+			{"Should retain an incomplete final character", "visible\xf0\x9f", "visible\xf0\x9f"},
+			{"Should keep an unterminated clipboard control blocked", "visible\x1b]52;c;secret\xf0\x9f", "visible"},
+		} {
+			t.Run(sample.name, func(t *testing.T) {
+				t.Parallel()
+				filter := newOSCSecurityFilter("nonce-1", nil)
+				got := filter.Filter([]byte(sample.input)).DisplayBytes
+				got = append(got, filter.Flush().DisplayBytes...)
+				if string(got) != sample.want {
+					t.Fatalf("input=%q flushed=%q, want %q", sample.input, got, sample.want)
+				}
+			})
+		}
+	})
+	t.Run("Should preserve Unicode in model facing output", func(t *testing.T) {
+		t.Parallel()
+		input := []byte("❯АÝ✜🔐\x1b]8;;https://example.com/✜\x1b\\link\x1bP✜private\x1b\\done" +
+			"\u009d8;;https://example.com\u009c\u0090private\u009c")
+		if got := string(modelFacingOutput(input)); got != "❯АÝ✜🔐linkdone" {
+			t.Fatalf("modelFacingOutput() = %q", got)
+		}
+	})
+	t.Run("Should discard oversized controls through their real terminator", func(t *testing.T) {
+		t.Parallel()
+		for _, prefix := range []string{"\x1b]52;c;", "\x1bP"} {
+			t.Run(fmt.Sprintf("Should discard control %x", prefix), func(t *testing.T) {
+				t.Parallel()
+				for _, terminator := range []string{"\x1b\\", "\x9c", "\u009c"} {
+					t.Run(fmt.Sprintf("Should resume after terminator %x", terminator), func(t *testing.T) {
+						t.Parallel()
+						filter := newOSCSecurityFilter("nonce-1", nil)
+						first := filter.Filter([]byte(prefix + strings.Repeat("x", maxPendingOSCBytes)))
+						got := first.DisplayBytes
+						for _, value := range []byte("✜secret" + terminator + "❯ ready") {
+							got = append(got, filter.Filter([]byte{value}).DisplayBytes...)
+						}
+						if string(got) != "❯ ready" {
+							t.Fatalf("prefix=%q terminator=%q display=%q", prefix, terminator, got)
+						}
+					})
+				}
+			})
+		}
+	})
+	t.Run("Should deliver each key after an ASCII or Unicode prompt", func(t *testing.T) {
+		t.Parallel()
+		for _, glyph := range []string{">", "❯"} {
+			t.Run(fmt.Sprintf("Should deliver keys after prompt %s", glyph), func(t *testing.T) {
+				t.Parallel()
+				filter := newOSCSecurityFilter("nonce-1", nil)
+				prompt := fmt.Sprintf("\x1b[34m~/project\x1b[39m\r\n\x1b[35m%s\x1b[39m ", glyph)
+				if got := string(filter.Filter([]byte(prompt)).DisplayBytes); got != prompt {
+					t.Errorf("prompt %q: got %q", glyph, got)
+				}
+				for _, key := range []string{"a", "b", "c"} {
+					if got := string(filter.Filter([]byte(key)).DisplayBytes); got != key {
+						t.Errorf("prompt %q key %q: got %q", glyph, key, got)
+					}
+				}
+			})
+		}
+	})
+}
+
+func TestOSCSecurityFilterShouldAuthenticateMarkersAndSplitDisplay(t *testing.T) {
+	t.Parallel()
+	filter := newOSCSecurityFilter("nonce-1", nil)
+	first := filter.Filter([]byte("before\x1b]7113;v1;nonce-1;S;cmd=bun%20test;"))
+	if string(first.DisplayBytes) != "before" || len(first.MarkerFacts) != 0 {
+		t.Fatalf("first Filter() = %#v", first)
+	}
+	second := filter.Filter([]byte("cwd=%2Ftmp\x1b\\after"))
+	if string(second.DisplayBytes) != "after" {
+		t.Fatalf("DisplayBytes = %q, want after", second.DisplayBytes)
+	}
+	if len(second.MarkerFacts) != 1 || second.MarkerFacts[0].Kind != "S" ||
+		second.MarkerFacts[0].Command != "bun test" || second.MarkerFacts[0].Cwd != "/tmp" {
+		t.Fatalf("MarkerFacts = %#v", second.MarkerFacts)
+	}
+
+	for _, forged := range []string{
+		"\x1b]133;A\x07", "\x1b]7113;v1;wrong;F;exit=0\x1b\\", "\x1b]7113;v1;;F;exit=0\x1b\\",
+	} {
+		result := filter.Filter([]byte(forged))
+		if len(result.MarkerFacts) != 0 {
+			t.Fatalf("forged marker %q emitted facts %#v", forged, result.MarkerFacts)
+		}
+	}
+
+	t.Run("Should bound and fail closed on an unterminated OSC sequence", func(t *testing.T) {
+		filter := newOSCSecurityFilter("nonce-1", nil)
+		result := filter.Filter(append([]byte("visible\x1b]52;c;"), bytes.Repeat([]byte("x"), maxPendingOSCBytes)...))
+		if string(result.DisplayBytes) != "visible" || len(filter.output.pending) != 0 || !filter.output.discarding {
+			t.Fatalf(
+				"overflow filter result/state = %#v pending=%d discarding=%v",
+				result,
+				len(filter.output.pending),
+				filter.output.discarding,
+			)
+		}
+		result = filter.Filter([]byte("ignored\x1b\\safe"))
+		if string(result.DisplayBytes) != "safe" || filter.output.discarding {
+			t.Fatalf("post-terminator filter result/state = %#v discarding=%v", result, filter.output.discarding)
+		}
+	})
+
+	t.Run("Should neutralize OSC location hyperlinks and DCS for every output consumer", func(t *testing.T) {
+		t.Parallel()
+		input := []byte(
+			"before\x1b]7;file:///tmp\x07middle\x1b]8;;https://example.com\x1b\\link\x1b]8;;\x1b\\after\x1bPprivate\x1b\\done",
+		)
+		filtered := modelFacingOutput(input)
+		if got, want := string(filtered), "beforemiddlelinkafterdone"; got != want {
+			t.Fatalf("modelFacingOutput() = %q, want %q", got, want)
+		}
+		if got, want := string(newOSCSecurityFilter("nonce-1", nil).Filter(input).DisplayBytes),
+			"beforemiddlelinkafterdone"; got != want {
+			t.Fatalf("human display output = %q, want %q", got, want)
+		}
+	})
+
+	t.Run("Should neutralize C1 OSC and DCS across split reads", func(t *testing.T) {
+		t.Parallel()
+		filter := newOSCSecurityFilter("nonce-1", nil)
+		first := filter.Filter([]byte("before\x9d52;c;secret"))
+		if got := string(first.DisplayBytes); got != "before" {
+			t.Fatalf("first C1 OSC display = %q, want before", got)
+		}
+		second := filter.Filter([]byte("\x9cafter\x90private\x9cdone"))
+		if got := string(second.DisplayBytes); got != "afterdone" {
+			t.Fatalf("second C1 control display = %q, want afterdone", got)
+		}
+		input := []byte("before\x9d8;;https://example.com\x9clink\x9d8;;\x9cafter")
+		if got := string(newOSCSecurityFilter("nonce-1", nil).Filter(input).DisplayBytes); got != "beforelinkafter" {
+			t.Fatalf("C1 hyperlink display = %q, want beforelinkafter", got)
+		}
+	})
+}
+
+func TestOSCSecurityFilterShouldDeliverTypedFactsBeforeDisplayFanout(t *testing.T) {
+	t.Run("Should deliver typed facts before filtered display bytes", func(t *testing.T) {
+		t.Parallel()
+		consumer := &recordingMarkerConsumer{facts: make(chan MarkerFacts, 1)}
+		journal := &markerTestJournal{fakeRecordingJournal: &fakeRecordingJournal{}, consumer: consumer}
+		manager, starter, _ := newTestManager(t, DefaultSettings(), WithJournal(journal))
+		handle := openTestTerminal(t, manager, "workspace-a", "profile-a")
+		marker := "visible\x1b]7113;v1;" + handle.MarkerNonce() + ";S;cmd=bun%20test;cwd=%2Ftmp\x1b\\after"
+		if err := starter.latest().emit([]byte(marker)); err != nil {
+			t.Fatalf("emit marker output: %v", err)
+		}
+		select {
+		case fact := <-consumer.facts:
+			if fact.Kind != "S" || fact.Command != "bun test" || fact.Cwd != "/tmp" {
+				t.Fatalf("consumed marker fact = %#v", fact)
+			}
+		case <-time.After(time.Second):
+			t.Fatal("authenticated marker fact did not reach the consumer")
+		}
+		waitForTerminalTail(
+			t,
+			handle,
+			"display fanout did not receive only filtered bytes",
+			func(read *ReadResult) bool {
+				return read.Content == "visibleafter"
+			},
+		)
+	})
+}
+
+func TestOSCSecurityFilterShouldBlockInputWhenAuthenticatedFactsCannotBeJournaled(t *testing.T) {
+	t.Run("Should reject input when marker delivery fails before journal admission", func(t *testing.T) {
+		t.Parallel()
+		consumer := &failingMarkerConsumer{called: make(chan struct{}, 1)}
+		journal := &markerTestJournal{fakeRecordingJournal: &fakeRecordingJournal{}, consumer: consumer}
+		manager, starter, _ := newTestManager(t, DefaultSettings(), WithJournal(journal))
+		handle := openTestTerminal(t, manager, "workspace-a", "profile-a")
+		proc := starter.latest()
+		seen, release := make(chan struct{}), make(chan struct{})
+		releaseVisibility := sync.OnceFunc(func() { close(release) })
+		proc.mu.Lock()
+		proc.visibilitySeen, proc.visibilityWait = seen, release
+		proc.mu.Unlock()
+		var workers sync.WaitGroup
+		t.Cleanup(func() { releaseVisibility(); workers.Wait() })
+		result := make(chan error, 1)
+		actor := Actor{Kind: ActorKindHuman, ID: "operator", ProfileID: "profile-a"}
+		workers.Go(func() { result <- handle.Write(t.Context(), actor, []byte("blocked")) })
+		select {
+		case <-seen:
+		case <-time.After(time.Second):
+			t.Fatal("input preparation did not start")
+		}
+		marker := "\x1b]7113;v1;" + handle.MarkerNonce() + ";S;cmd=pwd;cwd=%2Ftmp\x1b\\"
+		if err := proc.emit([]byte(marker)); err != nil {
+			t.Fatal(err)
+		}
+		select {
+		case <-consumer.called:
+		case <-time.After(time.Second):
+			t.Fatal("marker consumer did not run before admission")
+		}
+		releaseVisibility()
+		select {
+		case err := <-result:
+			if !errors.Is(err, ErrJournalUnavailable) {
+				t.Fatalf("Write() = %v, want ErrJournalUnavailable", err)
+			}
+		case <-time.After(time.Second):
+			t.Fatal("input admission did not finish")
+		}
+		if got := proc.inputString(); got != "" {
+			t.Fatalf("unadmitted input reached PTY: %q", got)
+		}
+	})
+	t.Run("Should block input after authenticated facts miss the journal lane", func(t *testing.T) {
+		t.Parallel()
+		consumer := &failingMarkerConsumer{called: make(chan struct{}, 1)}
+		journal := &markerTestJournal{fakeRecordingJournal: &fakeRecordingJournal{}, consumer: consumer}
+		manager, starter, _ := newTestManager(t, DefaultSettings(), WithJournal(journal))
+		handle := openTestTerminal(t, manager, "workspace-a", "profile-a")
+		marker := "\x1b]7113;v1;" + handle.MarkerNonce() + ";S;cmd=pwd;cwd=%2Ftmp\x1b\\"
+		if err := starter.latest().emit([]byte(marker)); err != nil {
+			t.Fatalf("emit marker output: %v", err)
+		}
+		deadline := time.NewTimer(time.Second)
+		defer deadline.Stop()
+		select {
+		case <-consumer.called:
+		case <-deadline.C:
+			t.Fatal("marker consumer was not called")
+		}
+		actor := Actor{Kind: ActorKindHuman, ID: "operator", ProfileID: "profile-a"}
+		if err := handle.Write(t.Context(), actor, []byte("blocked")); !errors.Is(err, ErrJournalUnavailable) {
+			t.Fatalf("Write(after marker journal failure) error = %v, want ErrJournalUnavailable", err)
+		}
+	})
+}
+
+type recordingMarkerConsumer struct {
+	facts chan MarkerFacts
+}
+
+type failingMarkerConsumer struct {
+	called chan struct{}
+}
+
+type markerTestJournal struct {
+	*fakeRecordingJournal
+	consumer MarkerConsumer
+}
+
+func (j *markerTestJournal) ConsumeMarkerFacts(ctx context.Context, info Info, facts []MarkerFacts) error {
+	return j.consumer.ConsumeMarkerFacts(ctx, info, facts)
+}
+
+func (c *failingMarkerConsumer) ConsumeMarkerFacts(context.Context, Info, []MarkerFacts) error {
+	c.called <- struct{}{}
+	return ErrJournalUnavailable
+}
+
+func (c *recordingMarkerConsumer) ConsumeMarkerFacts(_ context.Context, _ Info, facts []MarkerFacts) error {
+	for _, fact := range facts {
+		c.facts <- fact
+	}
+	return nil
+}
+
+func TestOSCSecurityFilterShouldStripClipboardBeforeSequenceAccounting(t *testing.T) {
+	t.Run("Should strip clipboard controls before sequence accounting", func(t *testing.T) {
+		t.Parallel()
+		manager, starter, _ := newTestManager(t, DefaultSettings())
+		handle := openTestTerminal(t, manager, "workspace-a", "profile-a")
+		sub, err := handle.Attach(t.Context(), AttachOptions{
+			Mode: "read", Flow: "drop", Actor: Actor{Kind: ActorKindHuman, ID: "operator", ProfileID: "profile-a"},
+		})
+		if err != nil {
+			t.Fatalf("Attach() error = %v", err)
+		}
+		t.Cleanup(func() {
+			if err := sub.Close(); err != nil {
+				t.Errorf("subscription.Close() error = %v", err)
+			}
+		})
+		<-sub.Frames()
+		assertPresenceFrame(t, receiveSubscriptionFrame(t, sub), 1)
+		input := []byte("before\x1b]52;c;c2VjcmV0\x07after")
+		if err := starter.latest().emit(input); err != nil {
+			t.Fatalf("emit() error = %v", err)
+		}
+		select {
+		case frame := <-sub.Frames():
+			if frame.Op != terminalwire.ServerOpOutput || frame.Seq != 0 || string(frame.Payload) != "beforeafter" {
+				t.Fatalf("OUTPUT = %#v", frame)
+			}
+		case <-time.After(time.Second):
+			t.Fatal("filtered OUTPUT was not delivered")
+		}
+		read, err := handle.Screen(t.Context(), ReadOptions{View: "tail"})
+		if err != nil {
+			t.Fatalf("Screen() error = %v", err)
+		}
+		if read.Seq != uint64(len("beforeafter")) || read.Content != "beforeafter" ||
+			bytes.Contains([]byte(read.Content), []byte("52;")) {
+			t.Fatalf("Screen() = %#v", read)
+		}
+		actor := Actor{Kind: ActorKindHuman, ID: "operator", ProfileID: "profile-a"}
+		if err := handle.Write(t.Context(), actor, []byte("x\x1b]52;c;leak\x07y")); err != nil {
+			t.Fatalf("Write() error = %v", err)
+		}
+		if got := starter.latest().inputString(); got != "xy" {
+			t.Fatalf("process input = %q, want xy", got)
+		}
+	})
+}
+
+func TestTerminalTitlePipelineShouldPinAndSanitize(t *testing.T) {
+	t.Parallel()
+
+	t.Run("Should keep a user title pinned over program OSC", func(t *testing.T) {
+		t.Parallel()
+		manager, starter, _ := newTestManager(t, DefaultSettings())
+		handle, err := manager.Open(t.Context(), OpenRequest{
+			WS:           "workspace-a",
+			Title:        "Pinned",
+			Actor:        Actor{Kind: ActorKindHuman, ID: "operator", ProfileID: "profile-a"},
+			Capabilities: Capabilities{Interactive: true},
+		})
+		if err != nil {
+			t.Fatalf("Open() error = %v", err)
+		}
+		if err := starter.latest().emit([]byte("\x1b]2;program\x07sync")); err != nil {
+			t.Fatalf("emit() error = %v", err)
+		}
+		waitForTerminalTail(t, handle, "title output was not consumed", func(read *ReadResult) bool {
+			return strings.Contains(read.Content, "sync")
+		})
+		if got := handle.Info().Title; got != "Pinned" {
+			t.Fatalf("Info().Title = %q, want Pinned", got)
+		}
+	})
+
+	t.Run("Should strip controls and bound an unpinned title", func(t *testing.T) {
+		t.Parallel()
+		bus := NewNotifier(nil)
+		titleChanged := make(chan Event, 1)
+		bus.Observe(func(_ context.Context, event Event) {
+			if event.Kind == EventKindTitleChanged {
+				titleChanged <- event
+			}
+		})
+		manager, starter, _ := newTestManager(t, DefaultSettings(), WithNotifier(bus))
+		handle := openTestTerminal(t, manager, "workspace-a", "profile-a")
+		programTitle := "hello\n" + strings.Repeat("界", 200)
+		if err := starter.latest().emit([]byte("\x1b]2;" + programTitle + "\x07")); err != nil {
+			t.Fatalf("emit() error = %v", err)
+		}
+		deadline := time.NewTimer(time.Second)
+		defer deadline.Stop()
+		select {
+		case <-titleChanged:
+		case <-deadline.C:
+			t.Fatal("title change event was not emitted")
+		}
+		title := handle.Info().Title
+		if strings.ContainsAny(title, "\r\n") || len([]byte(title)) > 256 {
+			t.Fatalf("sanitized title = %q (%d bytes)", title, len([]byte(title)))
+		}
+	})
+}

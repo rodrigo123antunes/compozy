@@ -1,0 +1,685 @@
+package daemon
+
+import (
+	"bytes"
+	"context"
+	"errors"
+	"log/slog"
+	"os"
+	"path/filepath"
+	"slices"
+
+	"strings"
+	"testing"
+
+	compozyconfig "github.com/compozy/compozy/internal/config"
+
+	"github.com/compozy/compozy/internal/acp"
+	"github.com/compozy/compozy/internal/session"
+)
+
+func TestPromptInputCompositeOrdersEnabledAugmentersByDescriptorOrder(t *testing.T) {
+	t.Parallel()
+
+	t.Run("Should order enabled augmenters by descriptor order", func(t *testing.T) {
+		t.Parallel()
+
+		resolver := &staticPromptInputAugmenterResolver{
+			resolved: ResolvedHarnessContext{
+				Policy: ResolvedHarnessPolicy{
+					EnableAugmenters: []HarnessAugmenter{"later", "earlier"},
+				},
+			},
+		}
+
+		callOrder := make([]string, 0, 2)
+		augmenter, err := newPromptInputCompositeAugmenter(
+			discardLogger(),
+			resolver,
+			nil,
+			promptInputAugmenterDescriptor{
+				Name:   "later",
+				Order:  200,
+				Budget: 32,
+				Augmenter: func(_ context.Context, _ *session.Session, message string) (string, error) {
+					callOrder = append(callOrder, "later")
+					return message + "\nSECOND", nil
+				},
+			},
+			promptInputAugmenterDescriptor{
+				Name:   "earlier",
+				Order:  100,
+				Budget: 32,
+				Augmenter: func(_ context.Context, _ *session.Session, message string) (string, error) {
+					callOrder = append(callOrder, "earlier")
+					return message + "\nFIRST", nil
+				},
+			},
+		)
+		if err != nil {
+			t.Fatalf("newPromptInputCompositeAugmenter() error = %v", err)
+		}
+
+		got, err := augmenter(t.Context(), newPromptInputTestSession(""), "base")
+		if err != nil {
+			t.Fatalf("Augment() error = %v", err)
+		}
+		if got != "base\nFIRST\nSECOND" {
+			t.Fatalf("Augment() = %q, want ordered output", got)
+		}
+		if got, want := strings.Join(callOrder, ","), "earlier,later"; got != want {
+			t.Fatalf("call order = %q, want %q", got, want)
+		}
+	})
+}
+
+func TestNormalizePromptInputAugmenterDescriptorsValidation(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name        string
+		descriptors []promptInputAugmenterDescriptor
+		wantErr     string
+	}{
+		{
+			name: "missing name",
+			descriptors: []promptInputAugmenterDescriptor{{
+				Budget:    1,
+				Augmenter: func(context.Context, *session.Session, string) (string, error) { return "", nil },
+			}},
+			wantErr: "name is required",
+		},
+		{
+			name: "duplicate names",
+			descriptors: []promptInputAugmenterDescriptor{
+				{
+					Name:      "dup",
+					Budget:    1,
+					Augmenter: func(context.Context, *session.Session, string) (string, error) { return "", nil },
+				},
+				{
+					Name:      "dup",
+					Budget:    1,
+					Augmenter: func(context.Context, *session.Session, string) (string, error) { return "", nil },
+				},
+			},
+			wantErr: `duplicate prompt input augmenter descriptor "dup"`,
+		},
+		{
+			name: "missing augmenter",
+			descriptors: []promptInputAugmenterDescriptor{{
+				Name:   "missing",
+				Budget: 1,
+			}},
+			wantErr: `prompt input augmenter "missing" is missing an augmenter`,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			_, err := normalizePromptInputAugmenterDescriptors(tt.descriptors)
+			if err == nil {
+				t.Fatal("normalizePromptInputAugmenterDescriptors() error = nil, want validation failure")
+			}
+			if !strings.Contains(err.Error(), tt.wantErr) {
+				t.Fatalf("normalizePromptInputAugmenterDescriptors() error = %v, want substring %q", err, tt.wantErr)
+			}
+		})
+	}
+}
+
+func TestNormalizePromptInputAugmenterBudgetBehaviorDefaultsToTrim(t *testing.T) {
+	t.Parallel()
+
+	t.Run("Should default unknown budget behavior to trim", func(t *testing.T) {
+		t.Parallel()
+
+		if got := normalizePromptInputAugmenterBudgetBehavior(""); got != promptInputAugmenterBudgetBehaviorTrim {
+			t.Fatalf("normalizePromptInputAugmenterBudgetBehavior(empty) = %q, want trim", got)
+		}
+		if got := normalizePromptInputAugmenterBudgetBehavior(
+			"unknown",
+		); got != promptInputAugmenterBudgetBehaviorTrim {
+			t.Fatalf("normalizePromptInputAugmenterBudgetBehavior(unknown) = %q, want trim", got)
+		}
+		if got := normalizePromptInputAugmenterBudgetBehavior(
+			promptInputAugmenterBudgetBehaviorOmit,
+		); got != promptInputAugmenterBudgetBehaviorOmit {
+			t.Fatalf("normalizePromptInputAugmenterBudgetBehavior(omit) = %q, want omit", got)
+		}
+	})
+}
+
+func TestPromptInputCompositeAppliesAggregateBudgetPolicies(t *testing.T) {
+	t.Run("Should register only the accepted budgeted owned prefix", func(t *testing.T) {
+		t.Parallel()
+		ctx, collect := acp.CollectPromptSections(t.Context())
+		accepted, _ := applyPromptInputAugmenterBudget(
+			"request",
+			"status text\n\nrequest",
+			true,
+			6,
+			promptInputAugmenterBudgetBehaviorTrim,
+		)
+		registerDeliveredAugmentation(ctx, HarnessAugmenterSituation, "request", accepted)
+		registerDeliveredAugmentation(ctx, HarnessAugmenterSituation, accepted, accepted)
+		registerDeliveredAugmentation(ctx, HarnessAugmenterSkills, accepted, "catalog\n"+accepted)
+		got := collect()
+		if len(got) != 1 || got[0].Key != "situation" || got[0].Content != "status" ||
+			!strings.Contains(accepted, got[0].Content) {
+			t.Fatalf("accepted %q, sections %#v", accepted, got)
+		}
+	})
+	t.Parallel()
+
+	tests := []struct {
+		name           string
+		suffixBehavior promptInputAugmenterBudgetBehavior
+		want           string
+	}{
+		{
+			name:           "trim later output to remaining aggregate budget",
+			suffixBehavior: promptInputAugmenterBudgetBehaviorTrim,
+			want:           "AAbaseB",
+		},
+		{
+			name:           "omit later output when aggregate budget is exhausted",
+			suffixBehavior: promptInputAugmenterBudgetBehaviorOmit,
+			want:           "AAbase",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			resolver := &staticPromptInputAugmenterResolver{
+				resolved: ResolvedHarnessContext{
+					Policy: ResolvedHarnessPolicy{
+						EnableAugmenters: []HarnessAugmenter{"prefix", "suffix"},
+					},
+				},
+			}
+
+			augmenter, err := newPromptInputCompositeAugmenter(
+				discardLogger(),
+				resolver,
+				nil,
+				promptInputAugmenterDescriptor{
+					Name:   "prefix",
+					Order:  100,
+					Budget: 2,
+					Augmenter: func(_ context.Context, _ *session.Session, message string) (string, error) {
+						return "AA" + message, nil
+					},
+				},
+				promptInputAugmenterDescriptor{
+					Name:           "suffix",
+					Order:          200,
+					Budget:         1,
+					BudgetBehavior: tt.suffixBehavior,
+					Augmenter: func(_ context.Context, _ *session.Session, message string) (string, error) {
+						return message + "BBBB", nil
+					},
+				},
+			)
+			if err != nil {
+				t.Fatalf("newPromptInputCompositeAugmenter() error = %v", err)
+			}
+
+			got, err := augmenter(t.Context(), newPromptInputTestSession(""), "base")
+			if err != nil {
+				t.Fatalf("Augment() error = %v", err)
+			}
+			if got != tt.want {
+				t.Fatalf("Augment() = %q, want %q", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestPromptInputCompositePreservesCurrentMessageForOverBudgetRewrite(t *testing.T) {
+	t.Parallel()
+
+	t.Run("Should preserve current message for over-budget rewrite", func(t *testing.T) {
+		t.Parallel()
+
+		resolver := &staticPromptInputAugmenterResolver{
+			resolved: ResolvedHarnessContext{
+				Policy: ResolvedHarnessPolicy{
+					EnableAugmenters: []HarnessAugmenter{"rewrite"},
+				},
+			},
+		}
+
+		augmenter, err := newPromptInputCompositeAugmenter(
+			discardLogger(),
+			resolver,
+			nil,
+			promptInputAugmenterDescriptor{
+				Name:           "rewrite",
+				Order:          100,
+				Budget:         1,
+				BudgetBehavior: promptInputAugmenterBudgetBehaviorTrim,
+				Augmenter: func(_ context.Context, _ *session.Session, _ string) (string, error) {
+					return "rewritten message", nil
+				},
+			},
+		)
+		if err != nil {
+			t.Fatalf("newPromptInputCompositeAugmenter() error = %v", err)
+		}
+
+		got, err := augmenter(t.Context(), newPromptInputTestSession(""), "base")
+		if err != nil {
+			t.Fatalf("Augment() error = %v", err)
+		}
+		if got != "base" {
+			t.Fatalf("Augment() = %q, want original message preserved for over-budget rewrite", got)
+		}
+	})
+}
+
+func TestPromptInputCompositeLoggerForSessionFallsBackSafely(t *testing.T) {
+	t.Parallel()
+
+	t.Run("Should fall back safely when session logger is unavailable", func(t *testing.T) {
+		t.Parallel()
+
+		composite := &promptInputComposite{}
+		if got := composite.loggerForSession(nil); got == nil {
+			t.Fatal("loggerForSession(nil) = nil, want default logger")
+		}
+		if got := composite.loggerForSession(&session.Session{}); got == nil {
+			t.Fatal("loggerForSession(session without info) = nil, want default logger")
+		}
+	})
+}
+
+func TestPromptInputCompositeCriticalFailureStopsPipeline(t *testing.T) {
+	t.Parallel()
+
+	t.Run("Should stop pipeline on critical failure", func(t *testing.T) {
+		t.Parallel()
+
+		resolver := &staticPromptInputAugmenterResolver{
+			resolved: ResolvedHarnessContext{
+				Policy: ResolvedHarnessPolicy{
+					EnableAugmenters: []HarnessAugmenter{"prefix", "boom", "after"},
+				},
+			},
+		}
+
+		afterCalls := 0
+		augmenter, err := newPromptInputCompositeAugmenter(
+			discardLogger(),
+			resolver,
+			nil,
+			promptInputAugmenterDescriptor{
+				Name:   "prefix",
+				Order:  100,
+				Budget: 32,
+				Augmenter: func(_ context.Context, _ *session.Session, message string) (string, error) {
+					return "AA" + message, nil
+				},
+			},
+			promptInputAugmenterDescriptor{
+				Name:     "boom",
+				Order:    200,
+				Critical: true,
+				Budget:   32,
+				Augmenter: func(_ context.Context, _ *session.Session, _ string) (string, error) {
+					return "", errors.New("boom")
+				},
+			},
+			promptInputAugmenterDescriptor{
+				Name:   "after",
+				Order:  300,
+				Budget: 32,
+				Augmenter: func(_ context.Context, _ *session.Session, message string) (string, error) {
+					afterCalls++
+					return message + " after", nil
+				},
+			},
+		)
+		if err != nil {
+			t.Fatalf("newPromptInputCompositeAugmenter() error = %v", err)
+		}
+
+		if _, err := augmenter(t.Context(), newPromptInputTestSession(""), "base"); err == nil {
+			t.Fatal("Augment() error = nil, want critical failure")
+		} else if !strings.Contains(err.Error(), `prompt augmenter "boom"`) {
+			t.Fatalf("Augment() error = %v, want wrapped augmenter name", err)
+		}
+		if afterCalls != 0 {
+			t.Fatalf("afterCalls = %d, want 0 after critical failure", afterCalls)
+		}
+	})
+}
+
+func TestPromptInputCompositeContextCancellationStopsPipeline(t *testing.T) {
+	t.Parallel()
+
+	t.Run("Should stop pipeline on context cancellation", func(t *testing.T) {
+		t.Parallel()
+
+		resolver := &staticPromptInputAugmenterResolver{
+			resolved: ResolvedHarnessContext{
+				Policy: ResolvedHarnessPolicy{
+					EnableAugmenters: []HarnessAugmenter{"warn"},
+				},
+			},
+		}
+
+		augmenter, err := newPromptInputCompositeAugmenter(
+			discardLogger(),
+			resolver,
+			nil,
+			promptInputAugmenterDescriptor{
+				Name:   "warn",
+				Order:  100,
+				Budget: 32,
+				Augmenter: func(_ context.Context, _ *session.Session, _ string) (string, error) {
+					return "", context.Canceled
+				},
+			},
+		)
+		if err != nil {
+			t.Fatalf("newPromptInputCompositeAugmenter() error = %v", err)
+		}
+
+		if _, err := augmenter(
+			t.Context(),
+			newPromptInputTestSession(""),
+			"base",
+		); !errors.Is(
+			err,
+			context.Canceled,
+		) {
+			t.Fatalf("Augment() error = %v, want context.Canceled", err)
+		}
+	})
+}
+
+func TestPromptInputCompositeNoncriticalFailureWarnsAndContinues(t *testing.T) {
+	t.Parallel()
+
+	t.Run("Should warn and continue after noncritical failure", func(t *testing.T) {
+		t.Parallel()
+
+		var logs bytes.Buffer
+		logger := slog.New(slog.NewTextHandler(&logs, &slog.HandlerOptions{Level: slog.LevelWarn}))
+		resolver := &staticPromptInputAugmenterResolver{
+			resolved: ResolvedHarnessContext{
+				Policy: ResolvedHarnessPolicy{
+					EnableAugmenters: []HarnessAugmenter{"warn", "suffix"},
+				},
+			},
+		}
+
+		augmenter, err := newPromptInputCompositeAugmenter(
+			logger,
+			resolver,
+			nil,
+			promptInputAugmenterDescriptor{
+				Name:   "warn",
+				Order:  100,
+				Budget: 32,
+				Augmenter: func(_ context.Context, _ *session.Session, _ string) (string, error) {
+					return "", errors.New("temporary failure")
+				},
+			},
+			promptInputAugmenterDescriptor{
+				Name:   "suffix",
+				Order:  200,
+				Budget: 32,
+				Augmenter: func(_ context.Context, _ *session.Session, message string) (string, error) {
+					return message + " ok", nil
+				},
+			},
+		)
+		if err != nil {
+			t.Fatalf("newPromptInputCompositeAugmenter() error = %v", err)
+		}
+
+		got, err := augmenter(t.Context(), newPromptInputTestSession(""), "base")
+		if err != nil {
+			t.Fatalf("Augment() error = %v, want warning-only continuation", err)
+		}
+		if got != "base ok" {
+			t.Fatalf("Augment() = %q, want suffix to run after warning", got)
+		}
+		if !strings.Contains(logs.String(), "noncritical prompt augmenter failed") {
+			t.Fatalf("logs = %q, want noncritical warning message", logs.String())
+		}
+		if !strings.Contains(logs.String(), "augmenter=warn") {
+			t.Fatalf("logs = %q, want augmenter name", logs.String())
+		}
+	})
+}
+
+func TestPromptInputCompositeBlankOutputPreservesLastValidMessage(t *testing.T) {
+	t.Parallel()
+
+	t.Run("Should preserve last valid message for blank output", func(t *testing.T) {
+		t.Parallel()
+
+		resolver := &staticPromptInputAugmenterResolver{
+			resolved: ResolvedHarnessContext{
+				Policy: ResolvedHarnessPolicy{
+					EnableAugmenters: []HarnessAugmenter{"blank", "suffix"},
+				},
+			},
+		}
+
+		augmenter, err := newPromptInputCompositeAugmenter(
+			discardLogger(),
+			resolver,
+			nil,
+			promptInputAugmenterDescriptor{
+				Name:   "blank",
+				Order:  100,
+				Budget: 32,
+				Augmenter: func(_ context.Context, _ *session.Session, _ string) (string, error) {
+					return "   \n\t", nil
+				},
+			},
+			promptInputAugmenterDescriptor{
+				Name:   "suffix",
+				Order:  200,
+				Budget: 32,
+				Augmenter: func(_ context.Context, _ *session.Session, message string) (string, error) {
+					return message + "\nkept", nil
+				},
+			},
+		)
+		if err != nil {
+			t.Fatalf("newPromptInputCompositeAugmenter() error = %v", err)
+		}
+
+		got, err := augmenter(t.Context(), newPromptInputTestSession(""), "base")
+		if err != nil {
+			t.Fatalf("Augment() error = %v", err)
+		}
+		if got != "base\nkept" {
+			t.Fatalf("Augment() = %q, want blank augmenter to leave prior message intact", got)
+		}
+	})
+}
+
+// Invariant: upgraded prompts preserve active context without retired memory frames.
+// Owner: daemon composition; canonical suite: prompt_input_composite.
+func TestPromptInputCompositeUpgradedPromptContent(t *testing.T) {
+	t.Run("Should preserve soul skills and situation after loading retired settings [UT-018]", func(t *testing.T) {
+		t.Parallel()
+		home, err := compozyconfig.ResolveHomePathsFrom(t.TempDir())
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := compozyconfig.EnsureHomeLayout(home); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(home.ConfigFile, []byte("[memory]\nenabled = true\n"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := compozyconfig.LoadForHome(home); err != nil {
+			t.Fatal(err)
+		}
+		workspaceRoot := filepath.Join(home.HomeDir, "workspace")
+		resolver := NewHarnessContextResolver(
+			HarnessRuntimeSignals{
+				SkillsPromptSectionEnabled:    true,
+				SituationPromptSectionEnabled: true,
+				SkillsAugmenter:               true,
+				SituationAugmenter:            true,
+			},
+		)
+		descriptors := defaultStartupPromptSectionDescriptors(staticPromptProvider("STARTUP_SKILLS"), nil)
+		descriptors = append(
+			descriptors,
+			PromptSectionDescriptor{
+				Name:      string(HarnessPromptSectionSituation),
+				Position:  PromptSectionPositionPrepend,
+				Provider:  staticPromptProvider("STARTUP_SITUATION"),
+				Predicate: policyIncludesSection(HarnessPromptSectionSituation),
+			},
+		)
+		assembler := NewComposedAssembler(
+			WithSectionSelector(NewSectionSelector(resolver, nil)),
+			WithPromptSectionDescriptors(descriptors...),
+		)
+		workspace := testResolvedWorkspace(workspaceRoot)
+		startup, err := assembler.AssembleStartup(
+			t.Context(),
+			session.StartupPromptContext{
+				SessionType:  session.SessionTypeUser,
+				SoulSnapshot: testPromptSoulSnapshot(t, "PERSONA_BODY"),
+			},
+			testPromptAgent("Base prompt."),
+			&workspace,
+		)
+		if err != nil {
+			t.Fatal(err)
+		}
+		augmenter, err := newPromptInputCompositeAugmenter(
+			discardLogger(),
+			resolver,
+			nil,
+			defaultPromptInputAugmenterDescriptors(
+				func(_ context.Context, _ *session.Session, message string) (string, error) {
+					return "CURRENT_SKILLS\n\n" + message, nil
+				},
+				func(_ context.Context, _ *session.Session, message string) (string, error) {
+					return "TURN_SITUATION\n\n" + message, nil
+				},
+			)...)
+		if err != nil {
+			t.Fatal(err)
+		}
+		turn, err := augmenter(t.Context(), newPromptInputTestSession(workspaceRoot), "request")
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, want := range []string{"PERSONA_BODY", "STARTUP_SKILLS", "STARTUP_SITUATION"} {
+			if !strings.Contains(startup, want) {
+				t.Fatalf("startup = %q, want %q", startup, want)
+			}
+		}
+		for _, want := range []string{"CURRENT_SKILLS", "TURN_SITUATION", "request"} {
+			if !strings.Contains(turn, want) {
+				t.Fatalf("turn = %q, want %q", turn, want)
+			}
+		}
+		for _, retired := range []string{"# Persistent Memory", "<compozy_checkpoint_summary>", "<turn-recall>", "<workspace-knowledge-snapshot>"} {
+			if strings.Contains(startup, retired) || strings.Contains(turn, retired) {
+				t.Fatalf("delivered retired frame %q", retired)
+			}
+		}
+	})
+}
+
+func TestPromptInputContributionRunes(t *testing.T) {
+	t.Parallel()
+
+	t.Run("Should count prompt input contribution runes", func(t *testing.T) {
+		t.Parallel()
+
+		if got := promptInputContributionRunes("base", "AAbaseZZ"); got != 4 {
+			t.Fatalf("promptInputContributionRunes(wrapped) = %d, want 4", got)
+		}
+		if got := promptInputContributionRunes("base", "rewritten"); got != len("rewritten")-len("base") {
+			t.Fatalf("promptInputContributionRunes(rewrite) = %d, want positive rewrite delta", got)
+		}
+		if got := promptInputContributionRunes("base", "x"); got != 0 {
+			t.Fatalf("promptInputContributionRunes(shorter rewrite) = %d, want 0", got)
+		}
+	})
+}
+
+type staticPromptInputAugmenterResolver struct {
+	resolved ResolvedHarnessContext
+	err      error
+}
+
+func (r *staticPromptInputAugmenterResolver) ResolvePrompt(
+	_ *session.Info,
+	_ session.TurnSource,
+	_ acp.PromptMeta,
+) (ResolvedHarnessContext, error) {
+	if r == nil {
+		return ResolvedHarnessContext{}, nil
+	}
+	return r.resolved, r.err
+}
+
+func newPromptInputTestSession(workspaceRoot string) *session.Session {
+	return &session.Session{
+		ID:        "sess-1",
+		AgentName: "coder",
+		Type:      session.SessionTypeUser,
+		Workspace: workspaceRoot,
+	}
+}
+
+// TestAlwaysOnDoctrineStartup owns UT-018: always-on sessions get the always_on_doctrine section
+// wrapped in its tag; ordinary sessions do not.
+func TestAlwaysOnDoctrineStartup(t *testing.T) {
+	names := []string{}
+	for _, descriptor := range defaultStartupPromptSectionDescriptors(nil, nil) {
+		names = append(names, descriptor.Name)
+	}
+	if !slices.Contains(names, "always_on_doctrine") {
+		t.Fatalf("startup sections = %v, want always_on_doctrine", names)
+	}
+	for _, tc := range []struct {
+		name       string
+		startup    session.StartupPromptContext
+		want, main bool
+	}{
+		{"Should include doctrine for an instance main", session.StartupPromptContext{InstanceID: "instance", SessionType: session.SessionTypeUser}, true, true},
+		{"Should include doctrine for an instance descendant", session.StartupPromptContext{AncestorInstanceID: "instance", SessionType: session.SessionTypeUser}, true, false},
+		{"Should omit doctrine for an ordinary session", session.StartupPromptContext{SessionType: session.SessionTypeUser}, false, false},
+		{"Should omit doctrine for a conductor without instance identity", session.StartupPromptContext{AgentName: "orchestrator", SessionType: session.SessionTypeUser}, false, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			assembler := NewComposedAssembler(
+				WithPromptSectionDescriptors(defaultStartupPromptSectionDescriptors(nil, nil)...),
+			)
+			workspace := testResolvedWorkspace(t.TempDir())
+			got, err := assembler.AssembleStartup(t.Context(), tc.startup, testPromptAgent("Base prompt."), &workspace)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if strings.Contains(got, "<compozy-always-on-doctrine>") != tc.want ||
+				strings.Contains(got, "</compozy-always-on-doctrine>") != tc.want {
+				t.Fatalf("doctrine presence mismatch: %s", got)
+			}
+			if strings.Contains(got, "Do not start a Goal on this main session") != tc.main {
+				t.Fatalf("main instruction mismatch: %s", got)
+			}
+		})
+	}
+}

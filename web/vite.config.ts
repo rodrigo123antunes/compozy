@@ -1,33 +1,40 @@
-import tailwindcss from "@tailwindcss/vite";
+import { proto } from "@compozy/proto/vite";
+import { devtools } from "@tanstack/devtools-vite";
 import { tanstackRouter } from "@tanstack/router-plugin/vite";
-import viteReact from "@vitejs/plugin-react";
-import { fileURLToPath, URL } from "node:url";
 import { defineConfig } from "vite";
 
-export default defineConfig({
+import { resolveApiProxyOrigin, resolveApiProxyTarget } from "./src/lib/vite-api-proxy-target.ts";
+import presentationConfig from "./vite.presentation.ts";
+
+const apiProxyTarget = resolveApiProxyTarget(process.env);
+const apiProxyOrigin = resolveApiProxyOrigin(process.env);
+
+export default defineConfig(({ command }) => ({
   plugins: [
+    command === "serve" && devtools(),
     tanstackRouter({
       target: "react",
       autoCodeSplitting: true,
     }),
-    tailwindcss(),
-    viteReact(),
+    ...(presentationConfig.plugins ?? []),
+    // Prototypes, drafts, flows and the gallery never reach the SPA bundle. `proto dev` and
+    // `proto build` reuse this config for the render origin, where the boundary steps aside.
+    proto(),
   ],
-  resolve: {
-    alias: {
-      "@": fileURLToPath(new URL("./src", import.meta.url)),
-    },
-  },
+  resolve: presentationConfig.resolve,
+  build: presentationConfig.build,
   server: {
     host: "127.0.0.1",
-    port: 3000,
-    strictPort: true,
     proxy: {
       "/api": {
-        target: "http://localhost:2123",
+        target: apiProxyTarget,
         changeOrigin: true,
+        // Forward window-manager and document-wide event streams to the daemon.
         ws: true,
+        headers: {
+          Origin: apiProxyOrigin,
+        },
       },
     },
   },
-});
+}));

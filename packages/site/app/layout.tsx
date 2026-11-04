@@ -1,0 +1,126 @@
+import "./global.css";
+import { Geist, JetBrains_Mono, Playfair_Display } from "next/font/google";
+import type { CSSProperties, ReactNode } from "react";
+import type { Metadata, Viewport } from "next";
+import { Analytics } from "@vercel/analytics/next";
+import { SpeedInsights } from "@vercel/speed-insights/next";
+import { RootProvider } from "fumadocs-ui/provider/next";
+import { Toaster, UIProvider } from "@compozy/ui";
+import { SiteFooter } from "@/components/site/site-footer";
+import { SiteSearchDialog, SiteSearchProvider } from "@/components/site/site-search";
+import { siteConfig } from "@/lib/site-config";
+
+const SITE_TOASTER_STYLE = {
+  "--normal-bg": "var(--color-canvas-soft)",
+  "--normal-border": "var(--color-line-soft)",
+} as CSSProperties;
+
+const geist = Geist({
+  subsets: ["latin"],
+  variable: "--font-geist",
+  display: "swap",
+});
+
+const playfairDisplay = Playfair_Display({
+  subsets: ["latin"],
+  variable: "--font-playfair",
+  display: "swap",
+  weight: ["400"],
+});
+
+const jetbrainsMono = JetBrains_Mono({
+  subsets: ["latin"],
+  variable: "--font-jetbrains-mono",
+  display: "swap",
+});
+
+export const metadata: Metadata = {
+  metadataBase: new URL(siteConfig.url),
+  applicationName: siteConfig.name,
+  title: {
+    default: siteConfig.name,
+    template: "%s | CompozyOS",
+  },
+  description: siteConfig.description,
+  alternates: {
+    canonical: "/",
+  },
+  openGraph: {
+    type: "website",
+    locale: "en_US",
+    url: siteConfig.url,
+    siteName: siteConfig.name,
+    title: siteConfig.name,
+    description: siteConfig.description,
+    images: [
+      {
+        url: "/opengraph-image",
+        width: 1200,
+        height: 630,
+        alt: "CompozyOS: one complete environment to create, automate, and supervise agent work",
+      },
+    ],
+  },
+  twitter: {
+    card: "summary_large_image",
+    title: siteConfig.name,
+    description: siteConfig.description,
+    images: ["/opengraph-image"],
+  },
+  robots: {
+    index: true,
+    follow: true,
+  },
+  icons: {
+    icon: [
+      { url: "/favicon.svg", type: "image/svg+xml" },
+      { url: "/favicon.ico", sizes: "any" },
+    ],
+    apple: [{ url: "/apple-touch-icon.png", sizes: "180x180", type: "image/png" }],
+  },
+  manifest: "/site.webmanifest",
+};
+
+export const viewport: Viewport = {
+  themeColor: "#E8572A",
+};
+
+export default function RootLayout({ children }: { children: ReactNode }) {
+  return (
+    <html
+      lang="en"
+      className={`dark ${geist.variable} ${playfairDisplay.variable} ${jetbrainsMono.variable}`}
+    >
+      <body className="flex min-h-dvh flex-col bg-fd-background font-sans text-fd-foreground antialiased">
+        <a
+          href="#main-content"
+          className="sr-only focus:not-sr-only focus:fixed focus:top-4 focus:left-4 focus:z-50 focus:rounded-lg focus:border focus:border-line focus:bg-elevated focus:px-4 focus:py-2 focus:text-sm focus:font-medium focus:text-fg"
+        >
+          Skip to content
+        </a>
+        <UIProvider>
+          <Toaster
+            // D9: the site's toasts keep the lifted canvas-soft surface and soft hairline.
+            style={SITE_TOASTER_STYLE}
+          />
+          <SiteSearchProvider>
+            <RootProvider
+              search={{
+                SearchDialog: SiteSearchDialog,
+                options: {
+                  api: "/api/search",
+                },
+              }}
+              theme={{ enabled: false }}
+            >
+              {children}
+              <SiteFooter />
+            </RootProvider>
+          </SiteSearchProvider>
+        </UIProvider>
+        <Analytics />
+        <SpeedInsights />
+      </body>
+    </html>
+  );
+}

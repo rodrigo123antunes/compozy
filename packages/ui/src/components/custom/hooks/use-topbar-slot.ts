@@ -1,0 +1,140 @@
+"use client";
+
+import * as React from "react";
+
+/** Parent crumb in a window-local drill-in trail (leaf is `crumb` / Topbar title). */
+export interface TopbarCrumb {
+  /** Stable list key — required so path collapse/reorder never remounts the wrong crumb. */
+  id: string;
+  label: React.ReactNode;
+  onSelect: () => void;
+}
+
+export interface TopbarSlotValue {
+  /**
+   * Override for the current route / leaf title. Lets routes that resolve
+   * identity from loader data push it as a live node.
+   */
+  crumb?: React.ReactNode;
+  /** Host context before the title, in place of the window's own. */
+  leading?: React.ReactNode;
+  /** Quiet identity glyph at window root (hidden when drill-in crumbs/back are set). */
+  glyph?: React.ReactNode;
+  /** Icon well by default; `state` renders a bare live-state mark for document windows. */
+  glyphPresentation?: "icon" | "state";
+  /** Optional mono count beside the title at root or in a drill-in identity. */
+  count?: React.ReactNode;
+  /** Live status chip in the head trail (state-colored). */
+  status?: React.ReactNode;
+  /**
+   * Window-local parent crumbs for in-place navigation. When set (or `onBack`
+   * is set), the head uses the drill-in variant — back chevron replaces the glyph.
+   */
+  crumbs?: readonly TopbarCrumb[];
+  /** Pop one location level (drill-in back affordance). */
+  onBack?: () => void;
+  /** Action buttons in the trailing zone (≤1 primary + companions). */
+  actions?: React.ReactNode;
+  /** Overflow menu rendered last in the trailing zone. */
+  overflow?: React.ReactNode;
+  /**
+   * Optional 38px context-strip content. Route views lead it (ADR-007/D3:
+   * views · filters · spacer · display-mode); the head never hosts views.
+   */
+  toolbar?: React.ReactNode;
+}
+
+interface TopbarSlotPublisher {
+  publishSlot: (owner: object, slot: TopbarSlotValue | null) => void;
+  clearSlot: (owner: object) => void;
+}
+
+export interface TopbarSlotStore extends TopbarSlotPublisher {
+  getSnapshot: () => TopbarSlotValue | null;
+  subscribe: (listener: () => void) => () => void;
+}
+
+export const TopbarSlotSettersContext = React.createContext<TopbarSlotPublisher | null>(null);
+
+export const TopbarSlotContext = React.createContext<TopbarSlotStore | null>(null);
+
+/**
+ * Reference equality per zone. ReactNode contents are compared by identity —
+ * a publisher rendering fresh JSX republishes, which is required so replaced
+ * action handlers reach the topbar.
+ */
+function isSameTopbarSlot(a: TopbarSlotValue | null, b: TopbarSlotValue | null): boolean {
+  if (a === b) return true;
+  if (a == null || b == null) return false;
+  return (
+    a.leading === b.leading &&
+    a.crumb === b.crumb &&
+    a.glyph === b.glyph &&
+    a.glyphPresentation === b.glyphPresentation &&
+    a.count === b.count &&
+    a.status === b.status &&
+    a.crumbs === b.crumbs &&
+    a.onBack === b.onBack &&
+    a.actions === b.actions &&
+    a.overflow === b.overflow &&
+    a.toolbar === b.toolbar
+  );
+}
+
+export function createTopbarSlotStore(): TopbarSlotStore {
+  let active: { owner: object; slot: TopbarSlotValue | null } | null = null;
+  const listeners = new Set<() => void>();
+  const emit = () => {
+    for (const listener of listeners) listener();
+  };
+
+  return {
+    getSnapshot: () => active?.slot ?? null,
+    subscribe: listener => {
+      listeners.add(listener);
+      return () => listeners.delete(listener);
+    },
+    publishSlot: (owner, slot) => {
+      if (active?.owner === owner && isSameTopbarSlot(active.slot, slot)) return;
+      active = { owner, slot };
+      emit();
+    },
+    clearSlot: owner => {
+      if (active?.owner !== owner) return;
+      active = null;
+      emit();
+    },
+  };
+}
+
+const subscribeToNothing = () => () => undefined;
+const getNullSnapshot = () => null;
+
+/**
+ * Pushes a topbar slot for the lifetime of the calling component.
+ */
+export function useTopbarSlot(slot: TopbarSlotValue | null): void {
+  const setters = React.use(TopbarSlotSettersContext);
+  const [owner] = React.useState<object>(() => ({}));
+  React.useLayoutEffect(() => {
+    if (!setters) return;
+    if (slot === null) {
+      setters.clearSlot(owner);
+      return;
+    }
+    setters.publishSlot(owner, slot);
+  });
+  React.useEffect(() => {
+    if (!setters) return;
+    return () => setters.clearSlot(owner);
+  }, [owner, setters]);
+}
+
+export function useTopbarSlotValue(): TopbarSlotValue | null {
+  const store = React.use(TopbarSlotContext);
+  return React.useSyncExternalStore(
+    store?.subscribe ?? subscribeToNothing,
+    store?.getSnapshot ?? getNullSnapshot,
+    store?.getSnapshot ?? getNullSnapshot
+  );
+}

@@ -1,0 +1,206 @@
+// Suite: cmd-palette structural catalog cache
+// Invariant: the persisted record carries STRUCTURE only — descriptors,
+// sources, bindings and aliases, never client-resolved availability — is scoped
+// to one canonical workspace id and contract version, and drops itself rather
+// than serving a corrupt or stale-shaped entry.
+// Boundary IN: the record projection and the IndexedDB read/write/drop wrapper.
+// Boundary OUT: hydration policy, availability evaluation, and network reads.
+import "fake-indexeddb/auto";
+
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+
+import {
+  dropCatalogRecord,
+  readCatalogRecord,
+  writeCatalogRecord,
+} from "../cmd-palette-catalog-cache";
+import {
+  CMD_PALETTE_CATALOG_CONTRACT_VERSION,
+  parseCatalogRecord,
+  toCatalogRecord,
+} from "../cmd-palette-catalog-record";
+import type { CmdPaletteCatalogResponse } from "../cmd-palette-types";
+
+const WORKSPACE = "ws-hq";
+
+function servedCatalog(): CmdPaletteCatalogResponse {
+  return {
+    profile_lens: { profile_lens_id: "00000000000000000000000000", profile_name: "default" },
+    catalog_revision: "sha256:catalog-1",
+    context_revision: "7",
+    commands: [
+      {
+        id: "window.close",
+        title: "Close window",
+        section: "Window",
+        icon: "x-square",
+        source: "core",
+        keywords: ["dismiss"],
+        available: false,
+        reason: "requires a focused window",
+        bindings: ["meta+KeyW"],
+        alias: null,
+        destructive: false,
+        availability_exempt: false,
+        arguments: [],
+        action: { kind: "client_op", op: "window.close" },
+        execution: { retry_safe: false, single_flight: true },
+        when: [{ key: "window.focused", value: true, reason: "requires a focused window" }],
+      },
+      {
+        id: "shortcuts.cheatsheet",
+        title: "Keyboard shortcuts",
+        section: "Shell",
+        icon: "keyboard",
+        source: "core",
+        available: true,
+        bindings: ["meta+Slash"],
+        alias: "keys",
+        destructive: false,
+        availability_exempt: true,
+        arguments: [],
+        action: { kind: "client_op", op: "shortcuts.cheatsheet" },
+        execution: { retry_safe: true, single_flight: false },
+      },
+    ],
+    sources: [{ source: "core", status: "healthy" }],
+  };
+}
+
+async function clearStore(): Promise<void> {
+  await dropCatalogRecord(WORKSPACE, "default");
+  await dropCatalogRecord(WORKSPACE, "marketing");
+  await dropCatalogRecord("ws-other", "default");
+}
+
+describe("cmd-palette catalog record", () => {
+  it("Should keep structure and strip every client-resolved field", () => {
+    const record = toCatalogRecord(WORKSPACE, "default", servedCatalog());
+    expect(record.catalogRevision).toBe("sha256:catalog-1");
+    expect(record.commands).toHaveLength(2);
+    for (const command of record.commands) {
+      expect(command).not.toHaveProperty("available");
+      expect(command).not.toHaveProperty("reason");
+    }
+    const [closeWindow] = record.commands;
+    expect(closeWindow).toEqual({
+      id: "window.close",
+      title: "Close window",
+      section: "Window",
+      icon: "x-square",
+      source: "core",
+      keywords: ["dismiss"],
+      bindings: ["meta+KeyW"],
+      alias: null,
+      destructive: false,
+      availability_exempt: false,
+      arguments: [],
+      action: { kind: "client_op", op: "window.close" },
+      execution: { retry_safe: false, single_flight: true },
+      when: [{ key: "window.focused", value: true, reason: "requires a focused window" }],
+    });
+    expect(record.sources).toEqual([{ source: "core", status: "healthy" }]);
+  });
+
+  it("Should reject a record that carries resolved availability", () => {
+    const record = toCatalogRecord(WORKSPACE, "default", servedCatalog());
+    const poisoned = {
+      ...record,
+      commands: [{ ...record.commands[0], available: true, reason: "" }],
+    };
+    expect(parseCatalogRecord(poisoned)).toBeNull();
+  });
+
+  it("Should reject a record written under another contract version", () => {
+    const record = toCatalogRecord(WORKSPACE, "default", servedCatalog());
+    expect(
+      parseCatalogRecord({
+        ...record,
+        contractVersion: CMD_PALETTE_CATALOG_CONTRACT_VERSION + 1,
+      })
+    ).toBeNull();
+  });
+});
+
+describe("cmd-palette catalog cache", () => {
+  afterEach(() => vi.restoreAllMocks());
+  beforeEach(async () => {
+    await clearStore();
+  });
+
+  it("Should round-trip the last-known catalog for a workspace", async () => {
+    await writeCatalogRecord(toCatalogRecord(WORKSPACE, "default", servedCatalog()));
+    const stored = await readCatalogRecord(WORKSPACE, "default");
+    expect(stored?.catalogRevision).toBe("sha256:catalog-1");
+    expect(stored?.commands.map(command => command.id)).toEqual([
+      "window.close",
+      "shortcuts.cheatsheet",
+    ]);
+  });
+
+  it("Should persist an identical catalog only once across connections and concurrent writers", async () => {
+    const put = vi.spyOn(IDBObjectStore.prototype, "put");
+    const record = toCatalogRecord(WORKSPACE, "default", servedCatalog());
+    await Promise.all([writeCatalogRecord(record), writeCatalogRecord(structuredClone(record))]);
+    await writeCatalogRecord(structuredClone(record));
+    expect(put).toHaveBeenCalledTimes(1);
+    expect(await readCatalogRecord(WORKSPACE, "default")).toEqual(record);
+    const changed = { ...record, catalogRevision: "sha256:catalog-2" };
+    await writeCatalogRecord(changed);
+    expect(put).toHaveBeenCalledTimes(2);
+    expect(await readCatalogRecord(WORKSPACE, "default")).toEqual(changed);
+  });
+
+  it("Should keep one bounded record per workspace", async () => {
+    await writeCatalogRecord(toCatalogRecord(WORKSPACE, "default", servedCatalog()));
+    await writeCatalogRecord(
+      toCatalogRecord(WORKSPACE, "default", {
+        ...servedCatalog(),
+        catalog_revision: "sha256:catalog-2",
+      })
+    );
+    const stored = await readCatalogRecord(WORKSPACE, "default");
+    expect(stored?.catalogRevision).toBe("sha256:catalog-2");
+  });
+
+  it("Should never serve one workspace's catalog to another", async () => {
+    await writeCatalogRecord(toCatalogRecord(WORKSPACE, "default", servedCatalog()));
+    expect(await readCatalogRecord("ws-other", "default")).toBeNull();
+  });
+
+  it("Should never serve one profile lens's catalog to another", async () => {
+    // The catalog answers differently per lens, so the two records coexist in
+    // the same workspace and neither may stand in for the other.
+    await writeCatalogRecord(toCatalogRecord(WORKSPACE, "default", servedCatalog()));
+    expect(await readCatalogRecord(WORKSPACE, "marketing")).toBeNull();
+
+    await writeCatalogRecord(
+      toCatalogRecord(WORKSPACE, "marketing", {
+        ...servedCatalog(),
+        catalog_revision: "sha256:marketing-1",
+      })
+    );
+    expect((await readCatalogRecord(WORKSPACE, "default"))?.catalogRevision).toBe(
+      "sha256:catalog-1"
+    );
+    expect((await readCatalogRecord(WORKSPACE, "marketing"))?.catalogRevision).toBe(
+      "sha256:marketing-1"
+    );
+  });
+
+  it("Should drop a corrupt record and report a cold open", async () => {
+    await writeCatalogRecord({
+      ...toCatalogRecord(WORKSPACE, "default", servedCatalog()),
+      // A record that lost its revision is unusable: the projection could not
+      // tell whether the daemon had moved past it.
+      catalogRevision: "",
+    });
+    expect(await readCatalogRecord(WORKSPACE, "default")).toBeNull();
+    // The drop is durable — a second read does not resurrect it.
+    expect(await readCatalogRecord(WORKSPACE, "default")).toBeNull();
+  });
+
+  it("Should report a cold open when no record exists", async () => {
+    expect(await readCatalogRecord(WORKSPACE, "default")).toBeNull();
+  });
+});

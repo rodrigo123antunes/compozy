@@ -1,0 +1,160 @@
+import { useEffect } from "react";
+import { shallowEqual } from "@xstate/store";
+import { useSelector, useStore } from "@xstate/store-react";
+import { useInfiniteQuery, useQuery, useQueryClient } from "@tanstack/react-query";
+
+import { flattenTranscriptMessages } from "../lib/session-transcript-query";
+import type { SessionTranscriptThreadStatus } from "../lib/session-transcript-thread-context-value";
+import {
+  isLiveSessionState,
+  sessionDetailOptions,
+  sessionTranscriptOptions,
+} from "../lib/query-options";
+import { toReadonlyThreadMessages } from "../lib/session-thread-repository";
+import {
+  rescheduleSessionStreamBackedReads,
+  retainSessionStreamLiveness,
+} from "../lib/session-stream-liveness";
+import type { SessionTransportSnapshot } from "../lib/session-transport";
+import {
+  createSessionLiveTailRuntime,
+  SESSION_BOARD_DRAWER_CATALOG_REFRESH_MS,
+} from "./session-live-tail-runtime";
+import { sessionLiveTailLogic } from "./session-live-tail-store";
+import {
+  defaultEventSourceFactory,
+  type SessionStreamEventSourceFactory,
+} from "./session-stream-source";
+
+interface UseSessionLiveTailOptions {
+  workspaceId: string;
+  sessionId: string;
+  enabled?: boolean;
+  eventSourceFactory?: SessionStreamEventSourceFactory;
+  resetGeneration?: number;
+}
+
+export function useSessionLiveTail({
+  workspaceId,
+  sessionId,
+  enabled = true,
+  eventSourceFactory,
+  resetGeneration = 0,
+}: UseSessionLiveTailOptions) {
+  const queryClient = useQueryClient();
+  const store = useStore(sessionLiveTailLogic);
+  const catalogDeltaRefreshMs = SESSION_BOARD_DRAWER_CATALOG_REFRESH_MS;
+  const queryEnabled = sessionId.trim() !== "";
+  const projectLiveEnabled = enabled && workspaceId.trim() !== "";
+  const sessionState = useQuery({
+    ...sessionDetailOptions(workspaceId, sessionId),
+    enabled: queryEnabled && projectLiveEnabled,
+  }).data?.state;
+  const transcriptQuery = useInfiniteQuery({
+    ...sessionTranscriptOptions(workspaceId, sessionId),
+    enabled: queryEnabled,
+  });
+  const streamShouldOpen =
+    projectLiveEnabled &&
+    queryEnabled &&
+    (sessionState == null || isLiveSessionState(sessionState));
+  const canOpenStream =
+    streamShouldOpen &&
+    typeof window !== "undefined" &&
+    (eventSourceFactory !== undefined || typeof EventSource !== "undefined");
+
+  useEffect(() => {
+    const runtime = createSessionLiveTailRuntime({
+      eventSourceFactory: eventSourceFactory ?? defaultEventSourceFactory,
+      queryClient,
+      sessionId,
+      workspaceId,
+      catalogDeltaRefreshMs,
+    });
+    store.trigger.configured({ at: Date.now(), enabled: canOpenStream, runtime });
+    return () => store.trigger.disposed();
+  }, [
+    canOpenStream,
+    catalogDeltaRefreshMs,
+    eventSourceFactory,
+    queryClient,
+    resetGeneration,
+    sessionId,
+    store,
+    workspaceId,
+  ]);
+
+  useEffect(() => {
+    store.trigger.transcriptObserved({
+      error: transcriptQuery.isError ? transcriptQuery.error : null,
+      sessionState: sessionState ?? "unknown",
+    });
+  }, [sessionState, store, transcriptQuery.error, transcriptQuery.isError]);
+
+  const transport = useSelector(
+    store,
+    snapshot => transportSnapshot(snapshot.context),
+    shallowEqual
+  );
+  const streamLive = transport.phase === "live" && !transport.catchingUp;
+  // A live stream invalidates this session's control reads as they change, so they
+  // drop to the safety cadence while this tail holds the live edge.
+  useEffect(() => {
+    if (!streamLive) return;
+    const release = retainSessionStreamLiveness(sessionId);
+    rescheduleSessionStreamBackedReads(queryClient, workspaceId, sessionId);
+    return () => {
+      release();
+      rescheduleSessionStreamBackedReads(queryClient, workspaceId, sessionId);
+    };
+  }, [queryClient, sessionId, streamLive, workspaceId]);
+  const transcriptMessages = flattenTranscriptMessages(transcriptQuery.data);
+  const transcriptStatus: SessionTranscriptThreadStatus = transcriptQuery.isPending
+    ? "pending"
+    : transcriptQuery.isError
+      ? "error"
+      : "success";
+
+  return {
+    messages: toReadonlyThreadMessages(transcriptMessages),
+    status: transcriptStatus,
+    isPending: transcriptQuery.isPending,
+    isError: transcriptQuery.isError,
+    error: transcriptQuery.error,
+    hasOlder: transcriptQuery.hasNextPage,
+    isFetchingOlder: transcriptQuery.isFetchingNextPage,
+    loadOlder: () => {
+      void transcriptQuery.fetchNextPage();
+    },
+    retry: () => {
+      if (workspaceId.trim() === "") void transcriptQuery.refetch();
+      else store.trigger.manualRecoveryRequested();
+    },
+    transport,
+  };
+}
+
+function transportSnapshot(context: {
+  catchingUp: boolean;
+  degradedAt: number | null;
+  failure: SessionTransportSnapshot["failure"];
+  historyReset: SessionTransportSnapshot["historyReset"];
+  lastLiveAt: number | null;
+  reconnectAttempt: number;
+  transportPhase: SessionTransportSnapshot["phase"];
+}): SessionTransportSnapshot {
+  return {
+    catchingUp: context.catchingUp,
+    degradedAt: context.degradedAt,
+    failure: context.failure,
+    historyReset: context.historyReset,
+    lastLiveAt: context.lastLiveAt,
+    phase: context.transportPhase,
+    reconnectAttempt: context.reconnectAttempt,
+  };
+}
+
+export type {
+  SessionStreamEventSource,
+  SessionStreamEventSourceFactory,
+} from "./session-stream-source";

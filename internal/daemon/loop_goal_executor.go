@@ -1,0 +1,231 @@
+package daemon
+
+import (
+	"context"
+	"fmt"
+	"strings"
+	"sync"
+
+	looppkg "github.com/compozy/compozy/internal/loop"
+	"github.com/compozy/compozy/internal/loop/dsl"
+	"github.com/compozy/compozy/internal/loop/gate"
+	goalpkg "github.com/compozy/compozy/internal/loop/goal"
+	"github.com/compozy/compozy/internal/session"
+	"github.com/compozy/compozy/internal/store"
+	"github.com/compozy/compozy/internal/tools"
+	"github.com/compozy/compozy/internal/worktree"
+)
+
+type loopGoalRuntimePorts interface {
+	looppkg.ManagedActionSessionBinder
+	goalpkg.ContextHealth
+	goalpkg.PromptRecovery
+	goalpkg.WaitReader
+	goalpkg.WaitSessionRecovery
+}
+
+type loopGoalExecutorStore interface {
+	goalpkg.ExecutorStore
+	goalpkg.BudgetGuard
+	looppkg.Store
+}
+
+type loopGoalProductionStore interface {
+	loopGoalExecutorStore
+	loopGoalPromptRecoveryStore
+	goalpkg.BindingStore
+	goalpkg.BindingAttemptAllocator
+	store.SessionCreationStore
+}
+
+type loopGoalRuntime struct {
+	waitSources *sessionWorkSources
+	*loopActionSessionBinder
+	*loopGoalContextRuntime
+	*loopGoalPromptRecovery
+}
+
+var _ loopGoalRuntimePorts = (*loopGoalRuntime)(nil)
+
+type loopManagedInputLifecycleInstaller interface {
+	SetManagedInputLifecycle(session.ManagedInputLifecycle)
+}
+
+// composeLoopGoalExecutor adapts daemon runtime ports into the Loop Goal executor.
+func composeLoopGoalExecutor(
+	store loopGoalExecutorStore,
+	runtime loopGoalRuntimePorts,
+	evaluator gate.GateEvaluator,
+	executions *loopJudgeExecutionRegistry,
+	workspaceRoots looppkg.ActionToolWorkspaceRootResolver,
+) (looppkg.ActionRegistryOption, error) {
+	if store == nil || runtime == nil || evaluator == nil || executions == nil {
+		return nil, fmt.Errorf("%w: Goal runtime ports are incomplete", looppkg.ErrActionDependencyMissing)
+	}
+	executor, err := goalpkg.NewExecutor(goalpkg.Dependencies{
+		Store:  store,
+		Binder: runtime,
+		Judge: &loopGoalJudgeEvaluator{
+			store: store, evaluator: evaluator, executions: executions, workspaceRoots: workspaceRoots,
+		},
+		Budget:   store,
+		Context:  runtime,
+		Recovery: runtime,
+		Waits:    runtime,
+	})
+	if err != nil {
+		return nil, err
+	}
+	return looppkg.WithActionGoalExecutor(executor), nil
+}
+
+type loopGoalJudgeEvaluator struct {
+	workspaceRoots looppkg.ActionToolWorkspaceRootResolver
+	store          looppkg.Store
+	evaluator      gate.GateEvaluator
+	executions     *loopJudgeExecutionRegistry
+}
+
+// EvaluateGoal evaluates pinned criteria with the Goal environment, usage accounting, and scoped tool identity.
+func (e *loopGoalJudgeEvaluator) EvaluateGoal(
+	ctx context.Context,
+	req goalpkg.JudgeRequest,
+) (goalpkg.JudgeResult, error) {
+	if e == nil || e.store == nil || e.evaluator == nil || e.executions == nil {
+		return goalpkg.JudgeResult{}, fmt.Errorf(
+			"%w: Goal judge evaluator is unavailable",
+			looppkg.ErrActionDependencyMissing,
+		)
+	}
+	release, err := e.executions.reserve(req.AttemptID)
+	if err != nil {
+		return goalpkg.JudgeResult{}, err
+	}
+	defer release()
+	run, err := e.store.GetLoopRun(ctx, req.Key.WorkspaceID, req.Key.LoopRunID)
+	if err != nil {
+		return goalpkg.JudgeResult{}, err
+	}
+	snapshot, err := e.store.GetLoopDefinitionSnapshot(ctx, run.WorkspaceID, run.ProfileID, run.DefinitionDigest)
+	if err != nil {
+		return goalpkg.JudgeResult{}, err
+	}
+	resolved, err := looppkg.LoadExecutedDefinitionSnapshot(snapshot.Definition, run.DefinitionDigest)
+	if err != nil {
+		return goalpkg.JudgeResult{}, fmt.Errorf("daemon: load Goal judge snapshot: %w", err)
+	}
+	contract, err := looppkg.MaterializeContract(resolved.Definition.Contract, run.Inputs)
+	if err != nil {
+		return goalpkg.JudgeResult{}, fmt.Errorf("daemon: materialize Goal judge contract: %w", err)
+	}
+	trustedRoot, releaseRoot, err := e.acquireJudgeWorkspaceRoot(
+		ctx,
+		req.Key,
+		req.Environment,
+	)
+	if err != nil {
+		return goalpkg.JudgeResult{}, err
+	}
+	if releaseRoot != nil {
+		defer releaseRoot()
+	}
+	usage := &loopGoalJudgeUsage{}
+	judgeGate := gate.GateFromGoalJudge(string(req.Key.NodeID), req.Criteria)
+	verdict, err := e.evaluator.Evaluate(ctx, judgeGate, gate.GateInput{
+		JudgeParentSessionID:   req.SessionID,
+		TrustedWorkspaceRoot:   trustedRoot,
+		LoopRunID:              string(run.ID),
+		Placement:              gate.PlacementInBody,
+		Contract:               &contract,
+		Revision:               req.Turn - 1,
+		BrokenJudgeStreakLimit: gate.DefaultBrokenJudgeStreakLimit,
+		ToolScope: tools.Scope{
+			ProfileID:   strings.TrimSpace(run.ProfileID),
+			WorkspaceID: string(req.Key.WorkspaceID),
+			ActorKind:   harnessSummaryDefaultAgentName,
+		},
+		ToolCallCorrelationID: strings.TrimSpace(req.AttemptID),
+		JudgeRuntime:          resolved.EffectiveConfig.RuntimeDefaults.Judge,
+		JudgeUsageReporter:    usage,
+		JudgeEvidence: gate.JudgeEvidence{
+			Text:       req.Result.Text,
+			Structured: append([]byte(nil), req.Result.Structured...),
+		},
+	})
+	if err != nil {
+		return goalpkg.JudgeResult{}, err
+	}
+	tokensUsed, tokensReported := usage.snapshot()
+	return goalpkg.JudgeResult{
+		Verdict: verdict, TokensUsed: tokensUsed, TokensReported: tokensReported,
+	}, nil
+}
+
+// acquireJudgeWorkspaceRoot leases the explicit or per-run worktree for the caller to hold during judging.
+func (e *loopGoalJudgeEvaluator) acquireJudgeWorkspaceRoot(
+	ctx context.Context,
+	key goalpkg.TurnKey,
+	environment dsl.EnvironmentSpec,
+) (string, func(), error) {
+	if environment.Mode == dsl.EnvironmentPerRun {
+		// Reuse the binder's run identity to lease the existing tree; judging never materializes one.
+		binding := looppkg.ActionSessionBindRequest{
+			LoopRunID: key.LoopRunID, Generation: key.Generation, NodeID: key.NodeID, ItemIndex: key.ItemIndex,
+		}
+		environment = dsl.EnvironmentSpec{
+			Mode: dsl.EnvironmentWorktree,
+			WorktreeRef: worktree.RunWorktreeName(
+				loopActionWorktreeSlug(binding), loopActionWorktreeRunID(binding),
+			),
+		}
+	}
+	if environment.Mode != dsl.EnvironmentWorktree {
+		return "", nil, nil
+	}
+	if e.workspaceRoots == nil {
+		return "", nil, fmt.Errorf(
+			"%w: Goal judge worktree resolver is unavailable",
+			looppkg.ErrActionDependencyMissing,
+		)
+	}
+	root, release, err := e.workspaceRoots.AcquireActionToolWorkspaceRoot(ctx, looppkg.ActionToolWorkspaceRootRequest{
+		WorkspaceID: key.WorkspaceID, Environment: environment,
+	})
+	if err != nil {
+		return "", nil, fmt.Errorf("daemon: acquire Goal judge worktree: %w", err)
+	}
+	if release == nil {
+		return "", nil, fmt.Errorf("%w: Goal judge worktree lease is unavailable", looppkg.ErrActionDependencyMissing)
+	}
+	root = strings.TrimSpace(root)
+	if root == "" {
+		release()
+		return "", nil, fmt.Errorf("%w: Goal judge worktree root is empty", looppkg.ErrActionDependencyMissing)
+	}
+	return root, release, nil
+}
+
+type loopGoalJudgeUsage struct {
+	mu       sync.Mutex
+	tokens   int64
+	reported bool
+}
+
+func (u *loopGoalJudgeUsage) ReportJudgeTokensUsed(tokens int64) {
+	if u == nil || tokens < 0 {
+		return
+	}
+	u.mu.Lock()
+	u.tokens = max(u.tokens, tokens)
+	u.reported = true
+	u.mu.Unlock()
+}
+
+func (u *loopGoalJudgeUsage) snapshot() (int64, bool) {
+	if u == nil {
+		return 0, false
+	}
+	u.mu.Lock()
+	defer u.mu.Unlock()
+	return u.tokens, u.reported
+}

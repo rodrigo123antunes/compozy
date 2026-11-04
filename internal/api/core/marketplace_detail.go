@@ -1,0 +1,88 @@
+package core
+
+import (
+	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
+
+	"github.com/compozy/compozy/internal/api/contract"
+	extensionpkg "github.com/compozy/compozy/internal/extension"
+	marketplacepkg "github.com/compozy/compozy/internal/marketplace"
+)
+
+// catalogMarketplaceEntry keeps incompatible entries readable while preserving install blockers and inspection errors.
+func (h *BaseHandlers) catalogMarketplaceEntry(
+	ctx context.Context,
+	source, entryID string,
+	scope marketplaceReadScope,
+) (contract.MarketplaceEntryResponse, error) {
+	if h == nil || h.MarketplaceCatalog == nil {
+		return contract.MarketplaceEntryResponse{}, errors.Join(
+			ErrMarketplaceUnavailable, errors.New("catalog is not configured"),
+		)
+	}
+	entry, err := h.MarketplaceCatalog.Detail(ctx, source, entryID)
+	if err != nil {
+		return contract.MarketplaceEntryResponse{}, normalizeCuratedMarketplaceError(err)
+	}
+	if entry == nil {
+		return contract.MarketplaceEntryResponse{}, errors.Join(
+			ErrMarketplaceNotFound, fmt.Errorf("marketplace entry %q not found", entryID),
+		)
+	}
+	installed, err := h.extensionInstallIndex(ctx, scope)
+	if err != nil {
+		return contract.MarketplaceEntryResponse{}, err
+	}
+	listing, err := h.catalogMarketplaceListing(ctx, *entry, installed)
+	if err != nil {
+		return contract.MarketplaceEntryResponse{}, err
+	}
+	details, err := marketplacepkg.ProjectEntry(*entry)
+	if err != nil {
+		return contract.MarketplaceEntryResponse{}, err
+	}
+	response := contract.MarketplaceEntryResponse{Entry: listing}
+	response.Extension = marketplaceExtensionDetail(details)
+	projected := *entry
+	projected.InstallBlocker = listing.InstallBlocker
+	if err := h.populateMarketplaceExtensionDetail(ctx, projected, installed, scope, response.Extension); err != nil {
+		if incompatible, ok := errors.AsType[*extensionpkg.ManifestCompatibilityError](err); ok {
+			response.Entry.Installable = false
+			response.Entry.InstallBlocker = incompatible.Error()
+			return response, nil
+		}
+		return contract.MarketplaceEntryResponse{}, err
+	}
+	return response, nil
+}
+
+func marketplaceExtensionDetail(
+	details marketplacepkg.EntryDetails,
+) *contract.MarketplaceExtensionDetailPayload {
+	if details.Extension == nil {
+		return nil
+	}
+	result := &contract.MarketplaceExtensionDetailPayload{
+		Inputs:       []contract.MarketplaceInputPayload{},
+		MCPServers:   []contract.MarketplaceServerPayload{},
+		InstallSlug:  details.Extension.InstallSlug,
+		ArtifactURL:  details.Extension.ArtifactURL,
+		DigestSHA256: details.Extension.DigestSHA256,
+		Repository:   details.Extension.Repository,
+		Contents: contract.ExtensionContentsPayload{
+			Skills: details.Extension.Contents.Skills, MCPServers: details.Extension.Contents.MCPServers,
+			Hooks: details.Extension.Contents.Hooks, Loops: details.Extension.Contents.Loops,
+			Agents: details.Extension.Contents.Agents,
+		},
+	}
+	for _, input := range details.Extension.Inputs {
+		result.Inputs = append(result.Inputs, contract.MarketplaceInputPayload{
+			ID: input.ID, Prompt: input.Prompt, Type: input.Type, Required: input.Required,
+			Binding: contract.MarketplaceInputBindingPayload{Type: input.Binding.Type, Name: input.Binding.Name},
+			Default: append(json.RawMessage(nil), input.Default...),
+		})
+	}
+	return result
+}

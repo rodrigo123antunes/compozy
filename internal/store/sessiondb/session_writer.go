@@ -1,0 +1,271 @@
+package sessiondb
+
+import (
+	"context"
+	"database/sql"
+	"errors"
+	"fmt"
+	"log/slog"
+	"os"
+	"time"
+
+	"github.com/compozy/compozy/internal/store"
+)
+
+const (
+	sessionPassiveCheckpointEvery = 128
+	// sessionWALTruncateBytes bounds a live session WAL. PASSIVE checkpoints never shrink the
+	// file, and frequent readers keep SQLite from restarting it, so it otherwise grows for the
+	// whole session.
+	sessionWALTruncateBytes = 16 << 20
+	// sessionWALCheckpointWait bounds background waits for readers and database family guards.
+	sessionWALCheckpointWait = 200 * time.Millisecond
+	// sessionWALMaintenanceDelay is the idle time after writes before the writer checkpoints and
+	// truncates an oversized WAL, and the first retry delay for a deferred truncation.
+	sessionWALMaintenanceDelay = time.Second
+	// sessionWALMaintenanceMaxDelay caps the backoff while readers keep deferring truncation.
+	sessionWALMaintenanceMaxDelay = 30 * time.Second
+)
+
+var errSessionCheckpointDeferred = errors.New("store: session checkpoint admission deferred")
+
+func (s *SessionDB) writerLoop() {
+	writesSinceCheckpoint := 0
+	var pending *sessionWriteRequest
+	// Truncation can wait on readers while it holds the SQLite writer lock, so it runs only
+	// after the writer has been idle; every write pushes the maintenance timer back.
+	maintenance := time.NewTimer(time.Hour)
+	maintenance.Stop()
+	defer maintenance.Stop()
+	var retryDelay time.Duration
+	idleDelay := func() time.Duration { return max(retryDelay, s.walMaintenanceDelay()) }
+	for {
+		if writesSinceCheckpoint >= sessionPassiveCheckpointEvery {
+			writesSinceCheckpoint = 0
+			select {
+			case s.checkpointWake <- struct{}{}:
+			default:
+			}
+		}
+		if pending != nil {
+			request := *pending
+			var weight int
+			pending, weight = s.writePendingChunks(request)
+			writesSinceCheckpoint += weight
+			if weight > 0 {
+				maintenance.Reset(idleDelay())
+			}
+			continue
+		}
+		select {
+		case req := <-s.writeCh:
+			var weight int
+			pending, weight = s.writePendingChunks(req)
+			writesSinceCheckpoint += weight
+			if weight > 0 {
+				maintenance.Reset(idleDelay())
+			}
+		case <-maintenance.C:
+			writesSinceCheckpoint = 0
+			if !s.checkpointWAL() {
+				retryDelay = 0
+				continue
+			}
+			retryDelay = min(max(2*retryDelay, s.walMaintenanceDelay()), sessionWALMaintenanceMaxDelay)
+			maintenance.Reset(retryDelay)
+		case shutdown := <-s.shutdownCh:
+			shutdown.result <- s.drainWrites(shutdown.ctx)
+			return
+		case <-s.writerCtx.Done():
+			return
+		}
+	}
+}
+
+func (s *SessionDB) passiveCheckpointLoop() {
+	defer close(s.checkpointDone)
+	for {
+		select {
+		case <-s.writerCtx.Done():
+			return
+		case <-s.checkpointWake:
+			if err := s.passiveCheckpoint(s.writerCtx); err != nil && s.writerCtx.Err() == nil {
+				if errors.Is(err, errSessionCheckpointDeferred) {
+					slog.Default().
+						DebugContext(s.writerCtx, "store: passive session wal checkpoint deferred")
+					continue
+				}
+				slog.Default().WarnContext(s.writerCtx, "store: passive session wal checkpoint failed",
+					"session_id", s.owner.SessionID, "error", err)
+			}
+		}
+	}
+}
+
+func (s *SessionDB) drainWrites(ctx context.Context) error {
+	var drainErr error
+
+	for {
+		select {
+		case <-ctx.Done():
+			return errors.Join(drainErr, fmt.Errorf("%w: %w", store.ErrDrainTimeout, ctx.Err()))
+		case req := <-s.writeCh:
+			result := s.executeWrite(req)
+			req.result <- result
+			if result.err != nil {
+				drainErr = errors.Join(drainErr, result.err)
+			}
+		default:
+			return drainErr
+		}
+	}
+}
+
+func (s *SessionDB) executeWrite(req sessionWriteRequest) sessionWriteResult {
+	if err := req.ctx.Err(); err != nil {
+		return sessionWriteResult{err: fmt.Errorf("store: session write canceled before execution: %w", err)}
+	}
+
+	switch req.kind {
+	case sessionWriteEvent:
+		event, err := s.writeEvent(req.ctx, req.event)
+		return sessionWriteResult{event: event, err: err}
+	case sessionWriteEventIfAbsent:
+		event, inserted, err := s.writeEventIfAbsent(req.ctx, req.event)
+		return sessionWriteResult{event: event, inserted: inserted, err: err}
+	case sessionWriteEventBatch:
+		events, err := s.writeEventBatch(req.ctx, req.events)
+		return sessionWriteResult{events: events, err: err}
+	case sessionWriteUsage:
+		return sessionWriteResult{err: s.writeTokenUsage(req.ctx, req.usage)}
+	case sessionWriteHookRun:
+		return sessionWriteResult{err: s.writeHookRun(req.ctx, req.hook)}
+	case sessionWriteArchive:
+		s.transcriptFolds.reset()
+		result, err := s.writeArchiveEvents(req.ctx, req.archive)
+		return sessionWriteResult{archive: result, err: err}
+	case sessionWriteConversationRewindBaselineRefresh:
+		return sessionWriteResult{err: s.writeConversationRewindBaselineRefresh(req.ctx, req.baseline)}
+	case sessionWriteConversationRewind:
+		s.transcriptFolds.reset()
+		result, err := s.writeConversationRewind(req.ctx, req.rewind)
+		return sessionWriteResult{rewind: result, err: err}
+	case sessionWriteClear:
+		s.transcriptFolds.reset()
+		err := clearSessionSQLite(req.ctx, s.db)
+		if err != nil {
+			err = fmt.Errorf("store: clear session database: %w", err)
+		}
+		return sessionWriteResult{err: err}
+	default:
+		return sessionWriteResult{err: fmt.Errorf("store: unsupported session write kind %d", req.kind)}
+	}
+}
+
+func sessionWriteCheckpointWeight(req sessionWriteRequest, result sessionWriteResult) int {
+	switch req.kind {
+	case sessionWriteEvent, sessionWriteEventIfAbsent:
+		return 1
+	case sessionWriteEventBatch:
+		return len(result.events)
+	case sessionWriteUsage,
+		sessionWriteHookRun,
+		sessionWriteArchive,
+		sessionWriteConversationRewind,
+		sessionWriteConversationRewindBaselineRefresh:
+		return 1
+	default:
+		return 0
+	}
+}
+
+func (s *SessionDB) passiveCheckpoint(ctx context.Context) error {
+	admissionCtx, cancel := context.WithTimeout(ctx, sessionWALCheckpointWait)
+	defer cancel()
+	return s.checkpointWithLease(admissionCtx, func(_ context.Context, connection *sql.Conn) error {
+		// Dedicated maintenance must finish I/O to advance the WAL backfill pointer.
+		return store.CheckpointPassiveConnection(ctx, connection)
+	})
+}
+
+// checkpointWAL schedules backfill and truncates once the WAL outgrows the live-session bound. The
+// writer calls it only when idle. It reports whether the WAL is still oversized because readers
+// outlasted the bounded wait.
+func (s *SessionDB) checkpointWAL() bool {
+	info, err := os.Stat(s.path + "-wal")
+	if err != nil || info.Size() < s.walTruncateLimit() {
+		select {
+		case s.checkpointWake <- struct{}{}:
+		default:
+		}
+		return false
+	}
+	ctx, cancel := context.WithTimeout(s.writerCtx, sessionWALCheckpointWait)
+	defer cancel()
+	err = s.checkpointWithLease(ctx, store.CheckpointTruncateConnection)
+	switch {
+	case err == nil:
+		return false
+	case errors.Is(err, context.DeadlineExceeded):
+		select {
+		case s.checkpointWake <- struct{}{}:
+		default:
+		}
+		slog.Default().DebugContext(s.writerCtx, "store: session wal truncation deferred by readers",
+			"wal_bytes", info.Size())
+		return true
+	default:
+		slog.Default().WarnContext(s.writerCtx, "store: truncate session wal failed", "error", err)
+		return false
+	}
+}
+
+func (s *SessionDB) walMaintenanceDelay() time.Duration {
+	if delay := s.walMaintenanceDelayOverride.Load(); delay > 0 {
+		return time.Duration(delay)
+	}
+	return sessionWALMaintenanceDelay
+}
+
+func (s *SessionDB) walTruncateLimit() int64 {
+	if limit := s.walTruncateBytes.Load(); limit > 0 {
+		return limit
+	}
+	return sessionWALTruncateBytes
+}
+
+func (s *SessionDB) checkpointWithLease(
+	ctx context.Context,
+	checkpoint func(context.Context, *sql.Conn) error,
+) (err error) {
+	// Acquire the connection before the family lease: opening a pool connection
+	// itself takes that lease to verify the immutable database identity.
+	// Maintenance has its own already-verified connection. Borrowing the writer's
+	// last idle connection would force a foreground write to reopen under the
+	// family lease held by this checkpoint's potentially slow filesystem sync.
+	connection, err := s.checkpointDB.Conn(ctx)
+	if err != nil {
+		if errors.Is(err, context.DeadlineExceeded) {
+			err = errors.Join(errSessionCheckpointDeferred, err)
+		}
+		return fmt.Errorf("store: acquire session checkpoint connection: %w", err)
+	}
+	defer func() {
+		if closeErr := connection.Close(); closeErr != nil {
+			err = errors.Join(err, fmt.Errorf("store: release session checkpoint connection: %w", closeErr))
+		}
+	}()
+	lease, err := AcquireFamilyLease(ctx, s.path)
+	if err != nil {
+		if errors.Is(err, context.DeadlineExceeded) {
+			err = errors.Join(errSessionCheckpointDeferred, err)
+		}
+		return err
+	}
+	defer lease.Release()
+	err = checkpoint(ctx, connection)
+	if errors.Is(err, context.DeadlineExceeded) {
+		return errors.Join(errSessionCheckpointDeferred, err)
+	}
+	return err
+}

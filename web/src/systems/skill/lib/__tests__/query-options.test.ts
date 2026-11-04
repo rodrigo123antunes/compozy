@@ -1,0 +1,55 @@
+import { describe, expect, it } from "vitest";
+
+import { skillDetailOptions, skillShadowsOptions, skillsListOptions } from "../query-options";
+
+describe("skillsListOptions", () => {
+  it("includes workspace and profile in query key", () => {
+    const options = skillsListOptions("ws_123", true, "research");
+    expect(options.queryKey).toEqual(["skills", "list", "ws_123", "research"]);
+  });
+
+  it("uses an empty workspace as the global scope", () => {
+    const options = skillsListOptions("");
+    expect(options.enabled).toBe(true);
+  });
+
+  it("is enabled when workspace is provided", () => {
+    const options = skillsListOptions("ws_123");
+    expect(options.enabled).toBe(true);
+  });
+});
+
+describe("skillDetailOptions", () => {
+  it("includes name, workspace, and profile in query key", () => {
+    const options = skillDetailOptions("my-skill", "ws_123", "research");
+    expect(options.queryKey).toEqual(["skills", "detail", "my-skill", "ws_123", "research"]);
+  });
+
+  it("is disabled when name is empty", () => {
+    const options = skillDetailOptions("", "ws_123");
+    expect(options.enabled).toBe(false);
+  });
+
+  it("is enabled for a named global skill when workspace is empty", () => {
+    const options = skillDetailOptions("my-skill", "");
+    expect(options.enabled).toBe(true);
+  });
+
+  it("is enabled when both name and workspace are provided", () => {
+    const options = skillDetailOptions("my-skill", "ws_123");
+    expect(options.enabled).toBe(true);
+  });
+});
+
+describe("skillShadowsOptions", () => {
+  it("includes name, workspace, and profile in query key", () => {
+    const options = skillShadowsOptions("my-skill", "ws_123", "research");
+    expect(options.queryKey).toEqual(["skills", "shadows", "my-skill", "ws_123", "research"]);
+  });
+
+  it("is disabled until a name is provided and accepts global scope", () => {
+    expect(skillShadowsOptions("", "ws_123").enabled).toBe(false);
+    expect(skillShadowsOptions("my-skill", "").enabled).toBe(true);
+    expect(skillShadowsOptions("my-skill", "ws_123").enabled).toBe(true);
+  });
+});

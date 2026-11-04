@@ -1,0 +1,54 @@
+---
+id: RT-worktree-reconcile-branch-safety
+area: RT
+title: Reconcile missing worktrees and reclaim only unchanged run branches
+persona: Théo
+journey: J-worktree-management
+expected: Removing a checkout outside Compozy creates a missing tombstone without deleting sessions, runs, events, or branches; restore accepts only the recorded Git identity, normal removal preserves branches, and automatic reclamation deletes only a Compozy-created run-namespace branch whose ref still equals its recorded head.
+entry_points: compozy worktree list --refresh|adopt|inspect|remove|dismiss -o json; HTTP/UDS list|adopt|inspect|remove|dismiss routes; worktree.missing|removed|branch_reclaimed events; Workspace menu nest Resolve
+qa_status: pass
+bug_ids:
+fix_status:
+retest_status:
+fix_commits:
+evidence: /Users/pedronauck/dev/qa-labs/compozy-worktree-support-20260813-083057-155448-lab/qa-artifacts/qa/browser-worktree-stream-proof.json; internal/daemon/daemon_worktree_e2e_integration_test.go; /Users/pedronauck/dev/qa-labs/compozy-pr-410-review-evidence-20260815-055849-475301-lab/qa-artifacts/qa/screenshots/remove-worktree-confirmation.png; /Users/pedronauck/dev/qa-labs/compozy-pr-410-review-evidence-20260815-055849-475301-lab/qa-artifacts/qa/api-workspaces.json
+last_report: docs/qa/reports/2026-08-15-pr-410-review-evidence.md
+overlaps: RT-worktree-web-missing-resolution; RT-worktree-web-removal-two-step; RT-worktree-exit-merged-cleanup
+---
+
+QA impact: Tasks 01, 02, and 06 expose reconcile, removal, and recovery. The walk must replace the
+old path with another repository, move both eligible and changed run branches, and prove no
+workspace prune, cascade, unsafe leftover deletion, or compare-and-delete race can lose history.
+
+2026-08-15 entry move (reset to untested): the Workspaces overview became the Command-Tab
+switcher and no longer carries Resolve; the web entry is the menubar Workspace menu nest. CLI,
+HTTP/UDS, and event legs are untouched by the redesign — the reset covers the web entry leg only.
+
+
+2026-09-16 bulk-removal impact: both menubar and overview expose bounded selection and individual
+missing-record resolution. Verify mixed and missing-only selections, Escape/Shift/select-all,
+active/foreign/archived/discovered exclusions, immutable targets during live updates, per-item
+partial results and failed-only retry. Metadata dismissal preserves replacements and history;
+repeated dismissal and refresh/restart stay clean. No force or session stop is implicit.
+Current run: `docs/qa/reports/2026-09-16-worktree-bulk-delete.md` (targeted rendered and API evidence recorded; final CI pending).
+
+2026-10-24 removal recovery regression: a locked, empty orphan must refuse unforced removal by
+registered ID and discovered path, preserving its folder and Git lock; explicit force removes
+both. Interrupt an orphan removal after deleting its folder but before clearing its Git entry.
+Retry and boot recovery must clear only that entry before emitting `worktree.removed`, preserve an
+unrelated stale entry, and remain retryable while cleanup fails. If the saved Git backlink changes,
+even force must preserve the registration and the other checkout. These cases are owned by
+`TestWorktreeLifecycleIntegration` in `internal/worktree/worktree_integration_test.go`; validation
+uses real isolated Git repositories and the race detector.
+
+## Missing registration removal regression: GitHub #1011
+
+In an isolated lab, create a managed worktree, remove its checkout externally, and refresh until its state is `missing`.
+
+- `worktree remove <id> --force` removes it from visible catalogs without Git commands, hooks, or filesystem deletion. Repeat removal is idempotent and historical attribution remains retained.
+- Recreate the saved path with a sentinel before removal. Removal must fail closed and preserve the sentinel.
+- Bind a session before removing its checkout. Even a stopped session blocks removal until archived; `--force` does not bypass this guard.
+- A running exit operation blocks metadata dismissal until the exit operation terminates, even after reconciliation marks its checkout missing.
+- Ordinary removal preserves the branch. `--delete-branch` remains a separate opt-in governed by the existing branch ownership, occupancy, and merge-safety checks.
+
+Repeat metadata-only removal through CLI/HTTP and the native tool after deleting the parent project folder as well. The retained project registration must allow the lifecycle guard to run; a ready or recreated checkout must still refuse filesystem removal.

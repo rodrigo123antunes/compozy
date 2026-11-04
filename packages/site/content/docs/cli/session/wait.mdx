@@ -1,0 +1,56 @@
+---
+title: "compozy session wait"
+description: "Wait for a session state"
+---
+
+## compozy session wait
+
+Wait for a session state
+
+```
+compozy session wait <id> [flags]
+```
+
+### Examples
+
+```
+  # Wait until a session needs input or becomes idle
+  compozy session wait sess_1234 --until waiting-for-input,idle --timeout 120s
+
+  # Keep waiting through bounded, gapless server requests
+  compozy session wait sess_1234 --unbounded
+```
+
+### Options
+
+```
+  -h, --help               help for wait
+      --timeout duration   Maximum wait duration (default 5m0s)
+      --unbounded          Keep waiting through bounded server requests
+      --until strings      Session states to wait for
+```
+
+### Options inherited from parent commands
+
+```
+      --json             Emit JSON output
+  -o, --output string    Output format: human, json, jsonl, or toon (default "human")
+      --profile string   Act as a profile for this command
+```
+
+## Output Formats
+
+The root `-o, --output` flag accepts these values. A renderer is supported only when this command writes that result; `jsonl` is for commands that emit one JSON record per line.
+
+| Format  | Command result                          |
+| ------- | --------------------------------------- |
+| `human` | Interactive terminal rendering          |
+| `json`  | Machine-readable JSON rendering         |
+| `jsonl` | One JSON record per line when supported |
+| `toon`  | Compact agent-readable rendering        |
+
+Example:
+
+```bash
+compozy session wait <id> -o json
+```

@@ -1,0 +1,258 @@
+package cli
+
+import (
+	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"strings"
+	"testing"
+
+	"github.com/compozy/compozy/internal/agentidentity"
+	"github.com/compozy/compozy/internal/session"
+	"github.com/compozy/compozy/internal/store"
+	taskpkg "github.com/compozy/compozy/internal/task"
+)
+
+func TestResolveAgentCallerFromEnv(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name string
+		run  func(t *testing.T)
+	}{
+		{
+			name: "Should use daemon session lookup",
+			run: func(t *testing.T) {
+				t.Helper()
+
+				deps := newTestDeps(t, &stubClient{})
+				deps.getenv = func(key string) string {
+					switch key {
+					case agentidentity.EnvSessionID:
+						return "sess-1"
+					case agentidentity.EnvAgent:
+						return "coder"
+					default:
+						return ""
+					}
+				}
+
+				client := &stubClient{
+					getSessionFn: func(ctx context.Context, id string) (SessionRecord, error) {
+						if id != "sess-1" {
+							t.Fatalf("GetSession() id = %q, want sess-1", id)
+						}
+						if values := profileQueryValues(ctx, nil); values.Get("all_profiles") != "true" {
+							t.Fatalf("GetSession() profile query = %v, want all_profiles=true", values)
+						}
+						return SessionRecord{
+							ID:          "sess-1",
+							ProfileID:   store.DefaultProfileID,
+							AgentName:   "coder",
+							WorkspaceID: "ws-1",
+							State:       session.StateActive,
+						}, nil
+					},
+				}
+
+				caller, err := resolveAgentCallerFromEnv(t.Context(), deps, client, "agent.cli.test")
+				if err != nil {
+					t.Fatalf("resolveAgentCallerFromEnv() error = %v", err)
+				}
+				if caller.Actor.Actor.Kind != taskpkg.ActorKindAgentSession ||
+					caller.Actor.Origin.Kind != taskpkg.OriginKindCLI {
+					t.Fatalf("caller.Actor = %#v, want agent-session actor with CLI origin", caller.Actor)
+				}
+			},
+		},
+		{
+			name: "Should reject missing identity before lookup",
+			run: func(t *testing.T) {
+				t.Helper()
+
+				deps := newTestDeps(t, &stubClient{})
+				client := &stubClient{
+					getSessionFn: func(context.Context, string) (SessionRecord, error) {
+						t.Fatal("GetSession() should not be called when env identity is missing")
+						return SessionRecord{}, errors.New("unexpected")
+					},
+				}
+
+				_, err := resolveAgentCallerFromEnv(t.Context(), deps, client, "agent.cli.test")
+				if !errors.Is(err, agentidentity.ErrIdentityRequired) {
+					t.Fatalf("resolveAgentCallerFromEnv() error = %v, want ErrIdentityRequired", err)
+				}
+				if got := cliExitCodeForError(err); got != agentidentity.ExitIdentityRequired {
+					t.Fatalf("cliExitCodeForError() = %d, want %d", got, agentidentity.ExitIdentityRequired)
+				}
+			},
+		},
+		{
+			name: "Should wrap daemon session lookup errors with session id",
+			run: func(t *testing.T) {
+				t.Helper()
+
+				deps := newTestDeps(t, &stubClient{})
+				deps.getenv = func(key string) string {
+					switch key {
+					case agentidentity.EnvSessionID:
+						return "sess-missing"
+					case agentidentity.EnvAgent:
+						return "coder"
+					default:
+						return ""
+					}
+				}
+				client := &stubClient{
+					getSessionFn: func(context.Context, string) (SessionRecord, error) {
+						return SessionRecord{}, session.ErrSessionNotFound
+					},
+				}
+
+				lookup := agentSessionLookup(client)
+				_, err := lookup(t.Context(), "sess-missing")
+				if !errors.Is(err, session.ErrSessionNotFound) {
+					t.Fatalf("agentSessionLookup() error = %v, want ErrSessionNotFound", err)
+				}
+				if !strings.Contains(err.Error(), "sess-missing") {
+					t.Fatalf("agentSessionLookup() error = %v, want session id context", err)
+				}
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			tt.run(t)
+		})
+	}
+}
+
+func TestAgentCommandErrorRendering(t *testing.T) {
+	t.Parallel()
+
+	t.Run("Should render identity required as JSON when output json is requested", func(t *testing.T) {
+		t.Parallel()
+
+		deps := newTestDeps(t, &stubClient{})
+
+		exitCode, stdout, stderr := executeRootCommandWithExit(t, deps, "me", "context", "-o", "json")
+		if exitCode != agentidentity.ExitIdentityRequired {
+			t.Fatalf(
+				"executeRootCommandWithExit() exit code = %d, want %d",
+				exitCode,
+				agentidentity.ExitIdentityRequired,
+			)
+		}
+		if strings.TrimSpace(stdout) != "" {
+			t.Fatalf("executeRootCommandWithExit() stdout = %q, want empty", stdout)
+		}
+
+		var payload struct {
+			Error agentidentity.ErrorPayload `json:"error"`
+		}
+		if err := json.Unmarshal([]byte(stderr), &payload); err != nil {
+			t.Fatalf("json.Unmarshal(stderr) error = %v", err)
+		}
+		if payload.Error.Code != "identity_required" {
+			t.Fatalf("payload.Error.Code = %q, want %q", payload.Error.Code, "identity_required")
+		}
+		if payload.Error.ExitCode != agentidentity.ExitIdentityRequired {
+			t.Fatalf("payload.Error.ExitCode = %d, want %d", payload.Error.ExitCode, agentidentity.ExitIdentityRequired)
+		}
+		if !strings.Contains(payload.Error.Message, agentidentity.EnvSessionID+" is required") {
+			t.Fatalf("payload.Error.Message = %q, want COMPOZY_SESSION_ID guidance", payload.Error.Message)
+		}
+	})
+
+	t.Run("Should render identity required as JSONL when output jsonl is requested", func(t *testing.T) {
+		t.Parallel()
+
+		deps := newTestDeps(t, &stubClient{})
+
+		exitCode, stdout, stderr := executeRootCommandWithExit(
+			t,
+			deps,
+			"task",
+			"next",
+			"-o",
+			"jsonl",
+		)
+		if exitCode != agentidentity.ExitIdentityRequired {
+			t.Fatalf(
+				"executeRootCommandWithExit() exit code = %d, want %d",
+				exitCode,
+				agentidentity.ExitIdentityRequired,
+			)
+		}
+		if strings.TrimSpace(stdout) != "" {
+			t.Fatalf("executeRootCommandWithExit() stdout = %q, want empty", stdout)
+		}
+
+		var payload struct {
+			Type  string                     `json:"type"`
+			Error agentidentity.ErrorPayload `json:"error"`
+		}
+		if err := json.Unmarshal([]byte(stderr), &payload); err != nil {
+			t.Fatalf("json.Unmarshal(stderr) error = %v", err)
+		}
+		if payload.Type != "error" {
+			t.Fatalf("payload.Type = %q, want %q", payload.Type, "error")
+		}
+		if payload.Error.Code != "identity_required" {
+			t.Fatalf("payload.Error.Code = %q, want %q", payload.Error.Code, "identity_required")
+		}
+	})
+
+	t.Run("Should keep human error rendering when structured output is not requested", func(t *testing.T) {
+		t.Parallel()
+
+		deps := newTestDeps(t, &stubClient{})
+
+		exitCode, stdout, stderr := executeRootCommandWithExit(t, deps, "me", "context")
+		if exitCode != agentidentity.ExitIdentityRequired {
+			t.Fatalf(
+				"executeRootCommandWithExit() exit code = %d, want %d",
+				exitCode,
+				agentidentity.ExitIdentityRequired,
+			)
+		}
+		if strings.TrimSpace(stdout) != "" {
+			t.Fatalf("executeRootCommandWithExit() stdout = %q, want empty", stdout)
+		}
+		for _, want := range []string{
+			"error: Agent identity error",
+			"COMPOZY_SESSION_ID is required for agent commands",
+			"try: run this command from a CompozyOS-managed agent session",
+		} {
+			if !strings.Contains(stderr, want) {
+				t.Fatalf("executeRootCommandWithExit() stderr = %q, want %q", stderr, want)
+			}
+		}
+	})
+}
+
+func TestHeartbeatScriptAgentRejection(t *testing.T) {
+	for _, revoke := range []bool{false, true} {
+		t.Run(
+			fmt.Sprintf("Should refuse script approval from an agent revoke=%t [UT-063]", revoke),
+			func(t *testing.T) {
+				t.Parallel()
+				deps := newTestDeps(t, &stubClient{})
+				deps.getenv = func(key string) string {
+					if key == agentidentity.EnvSessionID {
+						return "sess-agent"
+					}
+					return ""
+				}
+				cmd := newHeartbeatScriptApprovalCommand(deps, revoke)
+				cmd.SetArgs([]string{"coder", "poll", "--yes"})
+				if err := cmd.Execute(); err == nil || !strings.Contains(err.Error(), "source_approval_operator_only") {
+					t.Fatalf("error=%v", err)
+				}
+			},
+		)
+	}
+}

@@ -1,0 +1,396 @@
+package daemon
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"strings"
+
+	"github.com/compozy/compozy/internal/api/contract"
+	core "github.com/compozy/compozy/internal/api/core"
+	automationpkg "github.com/compozy/compozy/internal/automation"
+	toolspkg "github.com/compozy/compozy/internal/tools"
+)
+
+func (n *daemonNativeTools) automationTriggersGet(
+	ctx context.Context,
+	scope toolspkg.Scope,
+	req toolspkg.CallRequest,
+) (toolspkg.ToolResult, error) {
+	var input automationTriggerIDInput
+	if err := decodeNativeInput(req, &input); err != nil {
+		return toolspkg.ToolResult{}, err
+	}
+	triggerID, err := requiredNativeString(req.ToolID, daemonPayloadTriggerIDKey, input.TriggerID)
+	if err != nil {
+		return toolspkg.ToolResult{}, err
+	}
+	readScope, err := n.nativeProfileReadScope(ctx, scope)
+	if err != nil {
+		return toolspkg.ToolResult{}, err
+	}
+	trigger, err := n.nativeAutomationTriggerForWorkspace(ctx, input.WorkspaceID, triggerID, readScope)
+	if err != nil {
+		return toolspkg.ToolResult{}, nativeAutomationToolError(req.ToolID, err)
+	}
+	payloads, err := n.automationTriggerPayloads(ctx, []automationpkg.Trigger{trigger})
+	if err != nil {
+		return toolspkg.ToolResult{}, nativeAutomationToolError(req.ToolID, err)
+	}
+	payload := payloads[0]
+	return structuredResult(map[string]any{nativeAutomationToolsTriggerKey: payload}, payload.ID)
+}
+
+func (n *daemonNativeTools) automationTriggersCreate(
+	ctx context.Context,
+	scope toolspkg.Scope,
+	req toolspkg.CallRequest,
+) (toolspkg.ToolResult, error) {
+	var input automationTriggerCreateInput
+	if err := decodeNativeInput(req, &input); err != nil {
+		return toolspkg.ToolResult{}, err
+	}
+	trigger := core.AutomationTriggerFromCreateRequest(input.request())
+	readScope, err := n.nativeProfileReadScope(ctx, scope)
+	if err != nil {
+		return toolspkg.ToolResult{}, err
+	}
+	trigger.ProfileID = readScope.ProfileID
+	if err := automationpkg.ValidateTriggerEvent(trigger.Event, "trigger"); err != nil {
+		return toolspkg.ToolResult{}, nativeAutomationValidationError(req.ToolID, err)
+	}
+	created, err := n.automationManager().CreateTrigger(ctx, trigger, input.webhookSecretWrite())
+	if err != nil {
+		return toolspkg.ToolResult{}, nativeAutomationToolError(req.ToolID, err)
+	}
+	payload := core.TriggerPayloadFromTrigger(created)
+	return structuredResult(map[string]any{nativeAutomationToolsTriggerKey: payload}, payload.ID)
+}
+
+func (n *daemonNativeTools) automationTriggersUpdate(
+	ctx context.Context,
+	scope toolspkg.Scope,
+	req toolspkg.CallRequest,
+) (toolspkg.ToolResult, error) {
+	var input automationTriggerUpdateInput
+	if err := decodeNativeInput(req, &input); err != nil {
+		return toolspkg.ToolResult{}, err
+	}
+	triggerID, err := requiredNativeString(req.ToolID, daemonPayloadTriggerIDKey, input.TriggerID)
+	if err != nil {
+		return toolspkg.ToolResult{}, err
+	}
+	patch := input.request()
+	if !patch.HasChanges() {
+		return toolspkg.ToolResult{}, nativeAutomationValidationError(
+			req.ToolID,
+			errors.New("automation trigger update must include at least one field"),
+		)
+	}
+	readScope, err := n.nativeProfileReadScope(ctx, scope)
+	if err != nil {
+		return toolspkg.ToolResult{}, err
+	}
+	current, err := n.nativeAutomationTriggerForWorkspace(ctx, input.WorkspaceID, triggerID, readScope)
+	if err != nil {
+		return toolspkg.ToolResult{}, nativeAutomationToolError(req.ToolID, err)
+	}
+	var updated automationpkg.Trigger
+	switch current.Source {
+	case automationpkg.JobSourceConfig, automationpkg.JobSourcePackage:
+		if err := core.ValidateAutomationManagedTriggerUpdate(patch); err != nil {
+			return toolspkg.ToolResult{}, nativeAutomationValidationError(req.ToolID, err)
+		}
+		updated, err = n.automationManager().SetTriggerEnabled(ctx, current.ID, *patch.Enabled)
+	default:
+		next, patchErr := core.ApplyAutomationTriggerPatch(current, patch)
+		if patchErr != nil {
+			return toolspkg.ToolResult{}, nativeAutomationValidationError(req.ToolID, patchErr)
+		}
+		updated, err = n.automationManager().UpdateTrigger(ctx, next, input.webhookSecretWrite())
+	}
+	if err != nil {
+		return toolspkg.ToolResult{}, nativeAutomationToolError(req.ToolID, err)
+	}
+	payload := core.TriggerPayloadFromTrigger(updated)
+	return structuredResult(map[string]any{nativeAutomationToolsTriggerKey: payload}, payload.ID)
+}
+
+func (n *daemonNativeTools) automationTriggersDelete(
+	ctx context.Context,
+	scope toolspkg.Scope,
+	req toolspkg.CallRequest,
+) (toolspkg.ToolResult, error) {
+	var input automationTriggerIDInput
+	if err := decodeNativeInput(req, &input); err != nil {
+		return toolspkg.ToolResult{}, err
+	}
+	triggerID, err := requiredNativeString(req.ToolID, daemonPayloadTriggerIDKey, input.TriggerID)
+	if err != nil {
+		return toolspkg.ToolResult{}, err
+	}
+	readScope, err := n.nativeProfileReadScope(ctx, scope)
+	if err != nil {
+		return toolspkg.ToolResult{}, err
+	}
+	current, err := n.nativeAutomationTriggerForWorkspace(ctx, input.WorkspaceID, triggerID, readScope)
+	if err != nil {
+		return toolspkg.ToolResult{}, nativeAutomationToolError(req.ToolID, err)
+	}
+	if current.Source != automationpkg.JobSourceDynamic {
+		return toolspkg.ToolResult{}, nativeAutomationScopeError(
+			req.ToolID,
+			nativeAutomationToolsTriggerKey,
+			current.ID,
+			current.Source,
+		)
+	}
+	if err := n.automationManager().DeleteTrigger(ctx, current.ID); err != nil {
+		return toolspkg.ToolResult{}, nativeAutomationToolError(req.ToolID, err)
+	}
+	return structuredResult(
+		map[string]any{daemonPayloadTriggerIDKey: current.ID, nativeAutomationToolsDeletedKey: true},
+		current.ID,
+	)
+}
+
+func (n *daemonNativeTools) automationTriggersEnable(
+	ctx context.Context,
+	scope toolspkg.Scope,
+	req toolspkg.CallRequest,
+) (toolspkg.ToolResult, error) {
+	return n.automationSetTriggerEnabled(ctx, scope, req, true)
+}
+
+func (n *daemonNativeTools) automationTriggersDisable(
+	ctx context.Context,
+	scope toolspkg.Scope,
+	req toolspkg.CallRequest,
+) (toolspkg.ToolResult, error) {
+	return n.automationSetTriggerEnabled(ctx, scope, req, false)
+}
+
+func (n *daemonNativeTools) automationTriggersHistory(
+	ctx context.Context,
+	scope toolspkg.Scope,
+	req toolspkg.CallRequest,
+) (toolspkg.ToolResult, error) {
+	var input automationTriggerHistoryInput
+	if err := decodeNativeInput(req, &input); err != nil {
+		return toolspkg.ToolResult{}, err
+	}
+	triggerID, err := requiredNativeString(req.ToolID, daemonPayloadTriggerIDKey, input.TriggerID)
+	if err != nil {
+		return toolspkg.ToolResult{}, err
+	}
+	readScope, err := n.nativeProfileReadScope(ctx, scope)
+	if err != nil {
+		return toolspkg.ToolResult{}, err
+	}
+	trigger, err := n.nativeAutomationTriggerForWorkspace(ctx, input.WorkspaceID, triggerID, readScope)
+	if err != nil {
+		return toolspkg.ToolResult{}, nativeAutomationToolError(req.ToolID, err)
+	}
+	query, err := input.query(req.ToolID)
+	if err != nil {
+		return toolspkg.ToolResult{}, err
+	}
+	query.JobID = ""
+	query.TriggerID = trigger.ID
+	query.ReadScope = readScope
+	return n.automationRunsForQuery(ctx, req.ToolID, input.WorkspaceID, query)
+}
+
+func (n *daemonNativeTools) automationRunsList(
+	ctx context.Context,
+	scope toolspkg.Scope,
+	req toolspkg.CallRequest,
+) (toolspkg.ToolResult, error) {
+	var input automationRunQueryInput
+	if err := decodeNativeInput(req, &input); err != nil {
+		return toolspkg.ToolResult{}, err
+	}
+	query, err := input.query(req.ToolID)
+	if err != nil {
+		return toolspkg.ToolResult{}, err
+	}
+	query.ReadScope, err = n.nativeProfileReadScope(ctx, scope)
+	if err != nil {
+		return toolspkg.ToolResult{}, err
+	}
+	return n.automationRunsForQuery(ctx, req.ToolID, input.WorkspaceID, query)
+}
+
+func (n *daemonNativeTools) automationRunsGet(
+	ctx context.Context,
+	scope toolspkg.Scope,
+	req toolspkg.CallRequest,
+) (toolspkg.ToolResult, error) {
+	var input automationRunIDInput
+	if err := decodeNativeInput(req, &input); err != nil {
+		return toolspkg.ToolResult{}, err
+	}
+	runID, err := requiredNativeString(req.ToolID, "run_id", input.RunID)
+	if err != nil {
+		return toolspkg.ToolResult{}, err
+	}
+	readScope, err := n.nativeProfileReadScope(ctx, scope)
+	if err != nil {
+		return toolspkg.ToolResult{}, err
+	}
+	run, err := n.nativeAutomationRunForWorkspace(ctx, input.WorkspaceID, runID, readScope)
+	if err != nil {
+		return toolspkg.ToolResult{}, nativeAutomationToolError(req.ToolID, err)
+	}
+	payload := core.RunPayloadFromRun(run)
+	return structuredResult(map[string]any{nativeAutomationToolsRunKey: payload}, payload.ID)
+}
+
+func (n *daemonNativeTools) automationSetJobEnabled(
+	ctx context.Context,
+	scope toolspkg.Scope,
+	req toolspkg.CallRequest,
+	enabled bool,
+) (toolspkg.ToolResult, error) {
+	var input automationJobIDInput
+	if err := decodeNativeInput(req, &input); err != nil {
+		return toolspkg.ToolResult{}, err
+	}
+	jobID, err := requiredNativeString(req.ToolID, daemonPayloadJobIDKey, input.JobID)
+	if err != nil {
+		return toolspkg.ToolResult{}, err
+	}
+	readScope, err := n.nativeProfileReadScope(ctx, scope)
+	if err != nil {
+		return toolspkg.ToolResult{}, err
+	}
+	current, err := n.nativeAutomationJobForWorkspace(ctx, input.WorkspaceID, jobID, readScope)
+	if err != nil {
+		return toolspkg.ToolResult{}, nativeAutomationToolError(req.ToolID, err)
+	}
+	updated, err := n.automationManager().SetJobEnabled(ctx, current.ID, enabled)
+	if err != nil {
+		return toolspkg.ToolResult{}, nativeAutomationToolError(req.ToolID, err)
+	}
+	payload := n.automationJobPayloadBestEffort(ctx, updated)
+	return structuredResult(map[string]any{nativeAutomationToolsJobKey: payload}, payload.ID)
+}
+
+func (n *daemonNativeTools) automationSetTriggerEnabled(
+	ctx context.Context,
+	scope toolspkg.Scope,
+	req toolspkg.CallRequest,
+	enabled bool,
+) (toolspkg.ToolResult, error) {
+	var input automationTriggerIDInput
+	if err := decodeNativeInput(req, &input); err != nil {
+		return toolspkg.ToolResult{}, err
+	}
+	triggerID, err := requiredNativeString(req.ToolID, daemonPayloadTriggerIDKey, input.TriggerID)
+	if err != nil {
+		return toolspkg.ToolResult{}, err
+	}
+	readScope, err := n.nativeProfileReadScope(ctx, scope)
+	if err != nil {
+		return toolspkg.ToolResult{}, err
+	}
+	current, err := n.nativeAutomationTriggerForWorkspace(ctx, input.WorkspaceID, triggerID, readScope)
+	if err != nil {
+		return toolspkg.ToolResult{}, nativeAutomationToolError(req.ToolID, err)
+	}
+	updated, err := n.automationManager().SetTriggerEnabled(ctx, current.ID, enabled)
+	if err != nil {
+		return toolspkg.ToolResult{}, nativeAutomationToolError(req.ToolID, err)
+	}
+	payload := core.TriggerPayloadFromTrigger(updated)
+	return structuredResult(map[string]any{nativeAutomationToolsTriggerKey: payload}, payload.ID)
+}
+
+func (n *daemonNativeTools) automationRunsForQuery(
+	ctx context.Context,
+	toolID toolspkg.ToolID,
+	workspaceID string,
+	query automationpkg.RunQuery,
+) (toolspkg.ToolResult, error) {
+	var (
+		runs []automationpkg.Run
+		err  error
+	)
+	if strings.TrimSpace(workspaceID) == "" {
+		runs, err = n.automationManager().ListRuns(ctx, query)
+	} else {
+		runs, err = n.nativeAutomationRunsForWorkspace(ctx, workspaceID, query)
+	}
+	if err != nil {
+		return toolspkg.ToolResult{}, nativeAutomationToolError(toolID, err)
+	}
+	payload := core.RunPayloadsFromRuns(runs)
+	return structuredResult(
+		map[string]any{nativeAutomationToolsRunsKey: payload},
+		fmt.Sprintf("%d automation runs", len(payload)),
+	)
+}
+
+func (n *daemonNativeTools) automationJobPayloads(
+	ctx context.Context,
+	jobs []automationpkg.Job,
+) ([]contract.JobPayload, error) {
+	stateByID, err := n.automationSchedulerStateByJobID(ctx)
+	if err != nil {
+		return nil, err
+	}
+	ids := make([]string, len(jobs))
+	for i, job := range jobs {
+		ids[i] = job.ID
+	}
+	runs, err := n.automationManager().LatestRunsByOwner(ctx, automationpkg.RunOwnerJob, ids)
+	if err != nil {
+		return nil, err
+	}
+	payloads := core.JobPayloadsFromJobs(jobs, stateByID)
+	for i := range payloads {
+		if run, ok := runs[payloads[i].ID]; ok {
+			payloads[i].LastRun = core.AutomationLastRunPayloadFromRun(run)
+		}
+	}
+	return payloads, nil
+}
+
+func (n *daemonNativeTools) automationJobPayload(
+	ctx context.Context,
+	job automationpkg.Job,
+) (contract.JobPayload, error) {
+	payloads, err := n.automationJobPayloads(ctx, []automationpkg.Job{job})
+	if err != nil {
+		return contract.JobPayload{}, err
+	}
+	if len(payloads) == 0 {
+		return contract.JobPayload{}, errors.New("daemon: automation job payload missing")
+	}
+	return payloads[0], nil
+}
+
+func (n *daemonNativeTools) automationJobPayloadBestEffort(
+	ctx context.Context,
+	job automationpkg.Job,
+) contract.JobPayload {
+	payload, err := n.automationJobPayload(ctx, job)
+	if err == nil {
+		return payload
+	}
+	return core.JobPayloadFromJob(job, nil, nil)
+}
+
+func (n *daemonNativeTools) automationSchedulerStateByJobID(
+	ctx context.Context,
+) (map[string]contract.AutomationSchedulerStatePayload, error) {
+	status, err := n.automationManager().Status(ctx)
+	if err != nil {
+		return nil, err
+	}
+	stateByID := make(map[string]contract.AutomationSchedulerStatePayload, len(status.ScheduledJobs))
+	for _, scheduled := range status.ScheduledJobs {
+		stateByID[scheduled.JobID] = core.AutomationSchedulerStatePayloadFromState(scheduled)
+	}
+	return stateByID, nil
+}

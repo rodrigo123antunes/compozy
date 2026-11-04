@@ -1,0 +1,58 @@
+---
+id: TA-action-run-liveness
+area: TA
+title: Keep long-running Loop nodes alive without a hidden clock
+persona: Ada
+journey: J-bound-runaway-work
+expected: A Loop node without an authored timeout stays live while fresh work evidence remains. The Loop silence window raises attention. Separately, configured session supervision can stop expired work after stop_grace; only verified process-tree exit permits bounded recovery of an authoritative task binding, preserving committed files and consuming max_attempts.
+entry_points: `compozy loop status --run-id <run-id> -o json`; Loop node inventory and event history over CLI/HTTP/UDS; `loops.defaults.delivery.liveness.silence_window`
+qa_status: blocked-verify
+bug_ids:
+fix_status:
+retest_status:
+fix_commits:
+evidence: /Users/pedronauck/dev/qa-labs/compozy-qa-ta-replay-20260730-062156-531636-lab/qa-artifacts/qa; /Users/pedronauck/dev/qa-labs/compozy-northstar-pay-20260801-135009-390014-lab/qa-artifacts/qa/loop/adjacent-safety-tests.json
+last_report:
+overlaps: LP-days-long-node-no-clock; LP-crash-death-resume; TA-lease-recovery-attempt-budget
+---
+
+QA impact 2026-08-02: the Loop node lifecycle hard cut removes the inherited 7m30s action kill,
+`node_timeout`/`no_progress` lease-failure path, and
+`task.orchestration.action_run_timeout`. The former pass evidence no longer proves the product
+contract. Task 13 owns the isolated public-surface walk after Tasks 07–11 expose the node inventory,
+attention events, and current configuration reference.
+
+Forensic evidence contract (SD-006) — each item cites timestamp, exact command, observed output:
+
+- A clock advanced by days while a node with no authored timeout remains live and no duration
+  failure event is emitted.
+- Fresh activity, an in-flight tool, and transport presence each count as evidence without a
+  synthetic heartbeat becoming progress.
+- Silence raises one attention flag, new evidence clears it, and neither transition interrupts
+  the prompt or frees its lease.
+- An authored node timeout bounds that node; session supervision is independently controlled by
+  fresh work evidence, `quiet_after` and `stop_grace`.
+
+Issue 616 verification slice (CI only): `TestManagerIntegrationSupervisedWorkRecovery` freezes a
+disposable ACP process group with bounded supervision timings and requires process-tree exit before
+a linked task attempt appears. `TestGlobalDBSupervisedRecovery` owns attempt exhaustion, prior lease
+recovery accounting and the Loop cell/binding transition. `TestSharedSessionStopOperation` owns
+receipt replay and explicit-stop exclusion. Store coverage also checks independent recovery after
+one candidate fails, shared designation budgets and cross-profile/workspace exclusion. Integration
+requires cleared source lease timestamps and rejects a heartbeat using the old claim token.
+Run the integration through the required
+`Supervised work recovery (integration)` CI lane; no host sessions or local QA labs are used.
+The original reporter's 41-minute measurements remain unverified. A successful bounded fixture does
+not establish exactly-once external effects or remeasure the production default timers.
+
+QA impact 2026-10-16 (issue #763): a Goal segment drives an already-bound session, so it never
+reported that session to the action heartbeat and every tick recorded "no evidence". Any Goal running
+past `silence_window` (default 30m) raised `attention_flag = silence`, and the bound session showed
+`needs-attention` while it was working. The Goal executor now names its bound session as liveness
+evidence only (`ReportActionLivenessSession`). It transfers no run-session link and no confirmed-death
+resume, which remain owned by the Goal binding and recovery. Walk: start a session-origin Goal under
+`loops.defaults.delivery.liveness.silence_window = "1m"`. While the bound session keeps producing tool
+calls for longer than the window, `loop_node_controls.attention_flag` stays empty and the session
+badge stays `running`. A Goal whose session stops producing activity still raises `silence`.
+Automated owners: `TestLoopActionRuntimeEnforcesActionLiveness` (daemon) and
+`TestExecutorShouldConvergeOnThirdTurnWithDurableAudit` (Goal executor).

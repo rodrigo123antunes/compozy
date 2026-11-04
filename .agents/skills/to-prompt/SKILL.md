@@ -1,90 +1,26 @@
 ---
 name: to-prompt
-description: Transform code, issues, or context into a detailed prompt/context for another LLM to fix or implement. Use when preparing comprehensive context for external LLM assistance, bug fixes, improvements, or feature implementations. Provides detailed context without implementation suggestions, letting the receiving LLM decide how to implement solutions. Focuses on "what" (problem, requirements, current state) not "how" (implementation approach).
+description: "Create a handoff brief for another LLM to implement. Preserve accepted decisions and write to docs/prompts/; excludes one-shot questions and end-user copy."
+disable-model-invocation: true
+metadata:
+  author: Pedro Nauck
+  github: https://github.com/pedronauck
+  repository: https://github.com/pedronauck/skills
 ---
-
 # To Prompt
 
-Transform code, issues, or context into detailed prompts for another LLM to fix or implement.
+Write a **brief**, not a solution. The brief carries everything the receiving LLM needs to choose the implementation itself — the problem, the current state, the requirements, the constraints — and preserves any implementation constraints or approved plan already supplied by the user. Leave undecided design choices to the receiver; do not erase accepted decisions to manufacture an open-ended problem.
 
-## Overview
+Every brief is a file: `docs/prompts/<YYYYMMDD-HHmm>_<slug>.md` (e.g. `docs/prompts/20260709-1745_fix-auth-redirect.md`).
 
-This skill helps create comprehensive, context-rich prompts for external LLM assistance. The goal is to provide all necessary context about the problem, current state, and requirements without prescribing implementation approaches. The receiving LLM decides how to implement the solution based on the context provided.
+## Steps
 
-## Core Principles
+1. **Classify the task** — bug fix, improvement, or feature — and draft a one-paragraph statement of the problem and the outcome wanted.
+2. **Gather the evidence.** Read the code paths involved; quote current code as it exists; capture the relevant error/log excerpts, excluding credentials and unrelated private data; note environment and recent changes. *Done when:* every claim in the brief is backed by something you actually read or ran.
+3. **Write the brief from the template.** Copy `assets/brief-template.md` to `docs/prompts/<YYYYMMDD-HHmm>_<slug>.md` (create the directory if absent; slug = lowercase-hyphenated summary; timestamp = now). Fill the applicable sections and remove guidance comments. Record consequential unknowns; omit irrelevant sections.
+4. **Check decision fidelity.** Separate user-approved constraints from suggestions and unresolved choices. Preserve the requested outcome and authorization; avoid introducing new implementation mandates.
+5. **Hand off.** Reply with the file path and a one-line summary of what the brief asks for.
 
-<critical>
-- **MUST** explain all context comprehensively and in detail
-- **MUST** show code snippets only to illustrate current implementation, structure, or problem areas
-- **MUST NOT** include implementation suggestions, solutions, or "how to fix" instructions
-- **MUST NOT** show example solutions, code patterns, or step-by-step guides
-- **MUST** let the receiving LLM decide how to implement the solution based on the context provided
-- **MUST** focus on "what" (problem, requirements, current state) not "how" (implementation approach)
-</critical>
+## Bundled files
 
-## Task Type Guidance
-
-### Bug Fix
-
-When transforming a bug fix task, ensure the prompt includes:
-
-- **Reproduction steps**: Exact steps to reproduce the bug consistently
-- **Error messages and logs**: Complete error messages, stack traces, console logs, and any diagnostic output
-- **Current behavior**: What actually happens when the bug occurs
-- **Expected behavior**: What should happen instead
-- **Environment context**: OS, browser, Node version, dependencies versions, configuration
-- **Recent changes**: What changed recently that might have introduced the bug (git history, recent commits)
-- **Affected code**: Show the current implementation of code paths involved in the bug
-- **Related components**: Files, modules, or systems that interact with the buggy code
-- **Regression tests**: Current tests (if any) and what regression tests should be written to prevent the bug from recurring
-- **Impact**: Who/what is affected by this bug and severity
-
-### Improvement
-
-When transforming an improvement task, ensure the prompt includes:
-
-- **Current state**: Detailed description of how things work now
-- **Current implementation**: Code showing the existing approach
-- **What needs improvement**: Specific aspects that need enhancement (performance, maintainability, usability, etc.)
-- **Constraints**: Technical constraints, backward compatibility requirements, or limitations
-- **Success criteria**: How to measure if the improvement is successful
-- **Related code**: Files and modules that will be affected
-- **Dependencies**: External libraries, APIs, or systems involved
-- **User impact**: How users will benefit from the improvement
-- **Non-goals**: What should NOT be changed or improved
-
-### Feature
-
-When transforming a feature task, ensure the prompt includes:
-
-- **Requirements**: Complete functional requirements and user stories
-- **Current system context**: How the system works now and where the feature fits
-- **Integration points**: Where the feature connects with existing code
-- **Data models**: Current data structures and what needs to be added/modified
-- **API contracts**: Existing APIs and what new endpoints or methods are needed
-- **User flows**: How users will interact with the feature
-- **Edge cases**: Boundary conditions and special scenarios to consider
-- **Constraints**: Technical, business, or design constraints
-- **Dependencies**: External services, libraries, or systems required
-- **Testing requirements**: What needs to be tested (unit, integration, E2E)
-
-## What NOT to Include
-
-- Implementation suggestions or "how to fix" instructions
-- Example solutions or code patterns to follow
-- Step-by-step implementation guides
-- Prescribed approaches or methodologies
-- "Before/after" code examples showing solutions
-
-## Usage
-
-When asked to transform code, issues, or context into a prompt:
-
-1. **Gather comprehensive context**: Collect all relevant information about the problem, current state, and requirements
-2. **Show current code**: Include code snippets to illustrate the current implementation, structure, or problem areas
-3. **Describe the problem**: Clearly explain what needs to be fixed, improved, or implemented
-4. **Provide context**: Include environment details, related components, dependencies, and constraints
-5. **Avoid solutions**: Do not include implementation suggestions, examples, or step-by-step guides
-6. **Focus on "what"**: Describe the problem, requirements, and current state, not how to solve it
-
-The resulting prompt should be comprehensive enough for another LLM to understand the full context and decide on the best implementation approach independently.
+- `assets/brief-template.md` — the brief's skeleton and per-type coverage guidance; the single source of truth for what a complete brief contains.

@@ -1,0 +1,144 @@
+package spec
+
+import (
+	"fmt"
+	"maps"
+	"reflect"
+	"slices"
+
+	"github.com/compozy/compozy/internal/api/contract"
+	"github.com/compozy/compozy/internal/windowmanager"
+	"github.com/getkin/kin-openapi/openapi3"
+)
+
+const (
+	windowManagerModeProperty  = "mode"
+	windowManagerRouteProperty = "route"
+)
+
+type windowManagerComponentSchema struct {
+	name  string
+	value any
+}
+
+var windowManagerBaseComponentSchemas = []windowManagerComponentSchema{
+	{name: "WindowManagerLayoutNode", value: contract.WindowManagerLayoutNode{}},
+	{name: "WindowManagerLayoutGroup", value: contract.WindowManagerLayoutGroup{}},
+	{name: "WindowManagerDesktop", value: contract.WindowManagerDesktop{}},
+	{name: "WindowManagerSnapshot", value: contract.WindowManagerSnapshot{}},
+	{name: "WindowManagerLayoutDocument", value: contract.WindowManagerLayoutDocument{}},
+	{name: "WindowManagerCommandRequest", value: contract.WindowManagerCommandRequest{}},
+	{name: "WindowManagerResult", value: contract.WindowManagerResult{}},
+	{name: "WindowManagerPreview", value: contract.WindowManagerPreview{}},
+	{name: "WindowManagerClientView", value: contract.WindowManagerClientView{}},
+	{name: "WindowManagerClientsResponse", value: contract.WindowManagerClientsResponse{}},
+	{name: "WindowManagerClientRegistration", value: contract.WindowManagerClientRegistration{}},
+	{name: "WindowManagerLayoutValidationRequest", value: contract.WindowManagerLayoutValidationRequest{}},
+	{name: "WindowManagerLayoutValidationResponse", value: contract.WindowManagerLayoutValidationResponse{}},
+	{name: "WindowManagerLayoutReplaceRequest", value: contract.WindowManagerLayoutReplaceRequest{}},
+	{name: "WindowManagerErrorPayload", value: contract.WindowManagerErrorPayload{}},
+	{name: "WindowManagerSnapshotFrame", value: contract.WindowManagerSnapshotFrame{}},
+	{name: "WindowManagerEventFrame", value: contract.WindowManagerEventFrame{}},
+	{name: "WindowManagerClientFrame", value: contract.WindowManagerClientFrame{}},
+	{name: "WindowManagerErrorFrame", value: contract.WindowManagerErrorFrame{}},
+	{name: "WindowManagerHeartbeatFrame", value: contract.WindowManagerHeartbeatFrame{}},
+}
+
+var windowManagerComponentSchemas = buildWindowManagerComponentSchemas()
+
+func buildWindowManagerComponentSchemas() []windowManagerComponentSchema {
+	components := append([]windowManagerComponentSchema(nil), windowManagerBaseComponentSchemas...)
+	for _, command := range windowManagerCommandSchemaSpecs {
+		components = append(components, command.payload)
+	}
+	return components
+}
+
+func registerWindowManagerComponentSchemas(schemas openapi3.Schemas) error {
+	names, err := operationComponentNames()
+	if err != nil {
+		return err
+	}
+	legacy := openapi3.Schemas{}
+	sources := make(map[*openapi3.Schema]reflect.Type)
+	for _, component := range windowManagerComponentSchemas {
+		schemaRef, reflected, err := reflectSchemaValue(component.value, legacy, names)
+		if err != nil {
+			return fmt.Errorf("build %s: %w", component.name, err)
+		}
+		maps.Copy(sources, reflected)
+		if generated := legacy[component.name]; generated != nil && generated.Value != nil {
+			continue
+		}
+		legacy[component.name] = schemaRef
+	}
+	for _, component := range windowManagerComponentSchemas {
+		schemaRef := legacy[component.name]
+		if schemaRef == nil || schemaRef.Value == nil {
+			return fmt.Errorf("component %s did not resolve to a concrete schema", component.name)
+		}
+	}
+	// Apply contextual constraints before sharing schemas so nested wire shapes stay unchanged.
+	customizeWindowManagerSchemas(legacy)
+	maps.Copy(schemas, legacy)
+	for _, component := range windowManagerComponentSchemas {
+		schemaRef := legacy[component.name]
+		if err := componentizeSchema(
+			schemaRef,
+			sources,
+			names,
+			schemas,
+			make(map[*openapi3.Schema]struct{}),
+		); err != nil {
+			return err
+		}
+		schemas[component.name] = &openapi3.SchemaRef{Value: schemaRef.Value}
+	}
+	return nil
+}
+
+func customizeWindowManagerSchemas(schemas openapi3.Schemas) {
+	for _, component := range windowManagerComponentSchemas {
+		if schemaRef := schemas[component.name]; schemaRef != nil && schemaRef.Value != nil {
+			schemaRef.Value.WithoutAdditionalProperties()
+		}
+	}
+	customizeWindowManagerCommandRequest(schemas)
+	customizeWindowManagerRouteIntent(schemas)
+}
+
+func customizeWindowManagerRouteIntent(schemas openapi3.Schemas) {
+	payload := schemas["WindowManagerNavigateWindowPayload"]
+	if payload == nil || payload.Value == nil {
+		return
+	}
+	route := payload.Value.Properties[windowManagerRouteProperty]
+	if route == nil || route.Value == nil {
+		return
+	}
+	payload.Value.Required = slices.DeleteFunc(payload.Value.Required, func(field string) bool {
+		return field == windowManagerRouteProperty
+	})
+	route.Value.WithoutAdditionalProperties()
+	pop := openapi3.NewObjectSchema().
+		WithProperty(windowManagerModeProperty, openapi3.NewStringSchema().WithEnum(string(windowmanager.NavigatePop))).
+		WithRequired([]string{windowManagerModeProperty})
+	pop.Not = openapi3.NewObjectSchema().WithRequired([]string{windowManagerRouteProperty}).NewRef()
+	routed := openapi3.NewObjectSchema().
+		WithProperty(
+			windowManagerModeProperty,
+			openapi3.NewStringSchema().WithEnum("replace", string(windowmanager.NavigatePush)),
+		).
+		WithRequired([]string{windowManagerRouteProperty})
+	payload.Value.OneOf = openapi3.SchemaRefs{pop.NewRef(), routed.NewRef()}
+}
+
+func customizeWindowManagerFrameSchema(schema *openapi3.Schema, value string) {
+	if schema == nil {
+		return
+	}
+	typeRef := schema.Properties["type"]
+	if typeRef != nil && typeRef.Value != nil {
+		setStringEnum(typeRef.Value, []string{value})
+	}
+}

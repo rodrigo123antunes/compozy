@@ -1,0 +1,533 @@
+package daemon
+
+import (
+	"context"
+	"errors"
+	"strings"
+	"testing"
+
+	compozyconfig "github.com/compozy/compozy/internal/config"
+	workspacepkg "github.com/compozy/compozy/internal/workspace"
+)
+
+type roleResolverFunc func(context.Context, string, compozyconfig.RoleName) (ResolvedRole, error)
+
+func (f roleResolverFunc) Resolve(
+	ctx context.Context,
+	workspaceID string,
+	role compozyconfig.RoleName,
+) (ResolvedRole, error) {
+	return f(ctx, workspaceID, role)
+}
+
+func resolvedRoleResolver(resolved *ResolvedRole) RoleResolver {
+	role := *resolved
+	return roleResolverFunc(func(context.Context, string, compozyconfig.RoleName) (ResolvedRole, error) {
+		return role, nil
+	})
+}
+
+func TestRoleResolver(t *testing.T) {
+	t.Parallel()
+
+	t.Run("Should resolve default builtin and inherited identities", func(t *testing.T) {
+		t.Parallel()
+
+		cfg := roleResolverConfig()
+		cfg.Roles.Coordinator.Enabled = false
+		resolver := newRoleResolver(&cfg, nil, nil)
+
+		coordinator, err := resolver.Resolve(t.Context(), "", compozyconfig.RoleCoordinator)
+		if err != nil {
+			t.Fatalf("Resolve(coordinator) error = %v", err)
+		}
+		if coordinator.Enabled || !coordinator.Builtin ||
+			coordinator.AgentName != compozyconfig.BuiltinCoordinatorAgentName ||
+			strings.TrimSpace(coordinator.AgentDef.Prompt) == "" {
+			t.Fatalf("Resolve(coordinator) = %#v, want disabled builtin coordinator", coordinator)
+		}
+
+		if coordinator.Provenance["agent"] != compozyconfig.RoleFieldSourceDefault ||
+			coordinator.Provenance["model"] != compozyconfig.RoleFieldSourceDefault {
+			t.Fatalf("Resolve(coordinator) provenance = %#v, want default fields", coordinator.Provenance)
+		}
+
+		for _, role := range []compozyconfig.RoleName{compozyconfig.RoleAutoTitle} {
+			resolved, resolveErr := resolver.Resolve(t.Context(), "", role)
+			if resolveErr != nil {
+				t.Fatalf("Resolve(%s) error = %v", role, resolveErr)
+			}
+			if !resolved.Inherit || resolved.AgentName != "" || resolved.AgentDef.Name != "" ||
+				resolved.AgentDef.Prompt != "" {
+				t.Fatalf("Resolve(%s) = %#v, want invocation-time inheritance", role, resolved)
+			}
+		}
+	})
+
+	t.Run("Should resolve custom catalog agents", func(t *testing.T) {
+		t.Parallel()
+
+		cfg := roleResolverConfig()
+		cfg.Roles.Coordinator.Enabled = true
+		cfg.Roles.Coordinator.Agent = "my-curator"
+		agent := compozyconfig.AgentDef{Name: "my-curator", Prompt: "curate exactly", Tools: []string{"read"}}
+		resolver := newRoleResolver(&cfg, nil, roleAgentResolverStub{
+			agents: map[string]compozyconfig.AgentDef{"my-curator": agent},
+		})
+
+		resolved, err := resolver.Resolve(t.Context(), "", compozyconfig.RoleCoordinator)
+		if err != nil {
+			t.Fatalf("Resolve(coordinator) error = %v", err)
+		}
+		if resolved.Builtin || resolved.Inherit || resolved.AgentName != "my-curator" {
+			t.Fatalf("Resolve(coordinator) = %#v, want custom catalog identity", resolved)
+		}
+		if resolved.AgentDef.Prompt != agent.Prompt || len(resolved.AgentDef.Tools) != 1 ||
+			resolved.AgentDef.Tools[0] != "read" {
+			t.Fatalf("Resolve(coordinator) AgentDef = %#v, want untouched catalog definition", resolved.AgentDef)
+		}
+
+		cfg.Roles.AutoTitle.Agent = "my-curator"
+		resolved, err = newRoleResolver(&cfg, nil, roleAgentResolverStub{
+			agents: map[string]compozyconfig.AgentDef{"my-curator": agent},
+		}).Resolve(t.Context(), "", compozyconfig.RoleAutoTitle)
+		if err != nil {
+			t.Fatalf("Resolve(auto_title) error = %v", err)
+		}
+		if resolved.Inherit || resolved.AgentName != "my-curator" {
+			t.Fatalf("Resolve(auto_title) = %#v, want explicit catalog identity", resolved)
+		}
+	})
+
+	t.Run("Should resolve inherited role overrides through the invoking agent provider chain", func(t *testing.T) {
+		t.Parallel()
+
+		for _, testCase := range []struct {
+			name          string
+			role          compozyconfig.RoleName
+			agentProvider string
+			wantProvider  string
+		}{
+			{
+				name:          "Should prefer the invoking agent provider",
+				role:          compozyconfig.RoleAutoTitle,
+				agentProvider: "agent-provider",
+				wantProvider:  "agent-provider",
+			},
+			{
+				name:         "Should use the default provider when the invoking agent inherits it",
+				role:         compozyconfig.RoleAutoTitle,
+				wantProvider: "default-provider",
+			},
+		} {
+			t.Run(testCase.name, func(t *testing.T) {
+				t.Parallel()
+
+				cfg := roleResolverConfig()
+				cfg.Roles.Coordinator.Enabled = true
+				cfg.Defaults.Provider = "default-provider"
+				cfg.Providers["agent-provider"] = compozyconfig.ProviderConfig{Command: "agent-acp"}
+				cfg.Providers["default-provider"] = compozyconfig.ProviderConfig{Command: "default-acp"}
+				cfg.Roles.AutoTitle.Model = "role-model"
+				resolver := newRoleResolver(&cfg, nil, roleAgentResolverStub{agents: map[string]compozyconfig.AgentDef{
+					"invoking-agent": {
+						Name:     "invoking-agent",
+						Provider: testCase.agentProvider,
+						Prompt:   "Handle the parent session.",
+					},
+				}})
+				ctx := withRoleInvocationCorrelation(t.Context(), roleInvocationCorrelation{
+					AgentName: "invoking-agent",
+				})
+
+				resolved, err := resolver.Resolve(ctx, "", testCase.role)
+				if err != nil {
+					t.Fatalf("Resolve(%s) error = %v", testCase.role, err)
+				}
+				if !resolved.Inherit || resolved.AgentName != "invoking-agent" ||
+					resolved.Provider != testCase.wantProvider || resolved.Model != "role-model" {
+					t.Fatalf(
+						"Resolve(%s) = %#v, want inherited invoking-agent routed through %q/role-model",
+						testCase.role,
+						resolved,
+						testCase.wantProvider,
+					)
+				}
+			})
+		}
+	})
+
+	t.Run("Should reject missing catalog agents and unknown roles deterministically", func(t *testing.T) {
+		t.Parallel()
+
+		cfg := roleResolverConfig()
+		cfg.Roles.Coordinator.Enabled = true
+		cfg.Roles.Coordinator.Agent = "ghost"
+		resolver := newRoleResolver(&cfg, nil, roleAgentResolverStub{})
+
+		_, err := resolver.Resolve(t.Context(), "", compozyconfig.RoleCoordinator)
+		resolutionErr, resolutionErrMatched := errors.AsType[*RoleResolutionError](err)
+		if !resolutionErrMatched || resolutionErr.Code != roleErrorAgentNotFound ||
+			resolutionErr.Agent != "ghost" {
+			t.Fatalf("Resolve(ghost) error = %v, want role_agent_not_found naming ghost", err)
+		}
+
+		_, err = resolver.Resolve(t.Context(), "", compozyconfig.RoleName("unknown"))
+		resolutionErr, resolutionErrMatched = errors.AsType[*RoleResolutionError](err)
+		if !resolutionErrMatched || resolutionErr.Code != roleErrorUnknown {
+			t.Fatalf("Resolve(unknown) error = %v, want role_unknown", err)
+		}
+	})
+
+	t.Run("Should apply role agent and provider model precedence", func(t *testing.T) {
+		t.Parallel()
+
+		for _, testCase := range []struct {
+			name          string
+			roleModel     string
+			overrideModel string
+			agentModel    string
+			providerModel string
+			want          string
+		}{
+			{name: "role model", roleModel: "role-model", agentModel: "agent-model", providerModel: "provider-model", want: "role-model"},
+			{name: "role model over the operator override", roleModel: "role-model", overrideModel: "override-model", agentModel: "agent-model", want: "role-model"},
+			{name: "operator override model", overrideModel: "override-model", agentModel: "agent-model", providerModel: "provider-model", want: "override-model"},
+			{name: "agent model", agentModel: "agent-model", providerModel: "provider-model", want: "agent-model"},
+			{name: "provider default", providerModel: "provider-model", want: "provider-model"},
+		} {
+			t.Run("Should prefer "+testCase.name, func(t *testing.T) {
+				t.Parallel()
+
+				cfg := roleResolverConfig()
+				cfg.Roles.Coordinator.Enabled = true
+				cfg.Providers["mock"] = compozyconfig.ProviderConfig{
+					Command: "mock-acp",
+					Models:  compozyconfig.ProviderModelsConfig{Default: testCase.providerModel},
+				}
+				cfg.Roles.Coordinator.Agent = "my-curator"
+				cfg.Roles.Coordinator.Model = testCase.roleModel
+				if testCase.overrideModel != "" {
+					cfg.Agents.Overrides = map[string]compozyconfig.AgentOverride{
+						"my-curator": {Model: testCase.overrideModel},
+					}
+				}
+				resolver := newRoleResolver(&cfg, nil, roleAgentResolverStub{
+					agents: map[string]compozyconfig.AgentDef{
+						"my-curator": {
+							Name:     "my-curator",
+							Provider: "mock",
+							Model:    testCase.agentModel,
+							Prompt:   "Coordinate work.",
+						},
+					},
+				})
+
+				resolved, err := resolver.Resolve(t.Context(), "", compozyconfig.RoleCoordinator)
+				if err != nil {
+					t.Fatalf("Resolve(coordinator) error = %v", err)
+				}
+				if resolved.Model != testCase.want {
+					t.Fatalf("Resolve(coordinator) model = %q, want %q", resolved.Model, testCase.want)
+				}
+			})
+		}
+	})
+
+	t.Run("Should drop the override model when the role selects another provider", func(t *testing.T) {
+		t.Parallel()
+
+		cfg := roleResolverConfig()
+		cfg.Roles.Coordinator.Enabled = true
+		cfg.Providers["mock"] = compozyconfig.ProviderConfig{Command: "mock-acp"}
+		cfg.Providers["other"] = compozyconfig.ProviderConfig{
+			Command: "other-acp",
+			Models:  compozyconfig.ProviderModelsConfig{Default: "other-default"},
+		}
+		cfg.Roles.Coordinator.Agent = "my-curator"
+		cfg.Roles.Coordinator.Provider = "other"
+		cfg.Agents.Overrides = map[string]compozyconfig.AgentOverride{
+			"my-curator": {Provider: "mock", Model: "override-model"},
+		}
+		resolver := newRoleResolver(&cfg, nil, roleAgentResolverStub{
+			agents: map[string]compozyconfig.AgentDef{
+				"my-curator": {Name: "my-curator", Prompt: "Coordinate work."},
+			},
+		})
+
+		resolved, err := resolver.Resolve(t.Context(), "", compozyconfig.RoleCoordinator)
+		if err != nil {
+			t.Fatalf("Resolve(coordinator) error = %v", err)
+		}
+		if resolved.Provider != "other" || resolved.Model != "other-default" {
+			t.Fatalf("Resolve(coordinator) = %q/%q, want other/other-default", resolved.Provider, resolved.Model)
+		}
+	})
+
+	t.Run("Should drop the override effort when the role selects another model", func(t *testing.T) {
+		t.Parallel()
+
+		cfg := roleResolverConfig()
+		cfg.Roles.Coordinator.Enabled = true
+		cfg.Providers["mock"] = compozyconfig.ProviderConfig{Command: "mock-acp"}
+		cfg.Roles.Coordinator.Agent = "my-curator"
+		cfg.Roles.Coordinator.Model = "role-model"
+		cfg.Agents.Overrides = map[string]compozyconfig.AgentOverride{
+			"my-curator": {Model: "override-model", ReasoningEffort: "high"},
+		}
+		resolver := newRoleResolver(&cfg, nil, roleAgentResolverStub{
+			agents: map[string]compozyconfig.AgentDef{
+				"my-curator": {Name: "my-curator", Provider: "mock", Prompt: "Coordinate work."},
+			},
+		})
+
+		resolved, err := resolver.Resolve(t.Context(), "", compozyconfig.RoleCoordinator)
+		if err != nil {
+			t.Fatalf("Resolve(coordinator) error = %v", err)
+		}
+		if resolved.Model != "role-model" || resolved.ReasoningEffort != "" {
+			t.Fatalf("Resolve(coordinator) = %q/%q, want role-model with no reasoning effort",
+				resolved.Model, resolved.ReasoningEffort)
+		}
+	})
+
+	t.Run("Should keep the override effort when the role selects the effective model", func(t *testing.T) {
+		t.Parallel()
+
+		cfg := roleResolverConfig()
+		cfg.Roles.Coordinator.Enabled = true
+		cfg.Providers["mock"] = compozyconfig.ProviderConfig{
+			Command: "mock-acp",
+			Models: compozyconfig.ProviderModelsConfig{
+				Default:   "provider-model",
+				Reasoning: compozyconfig.ProviderReasoningConfig{Apply: compozyconfig.ReasoningApplyACPOption},
+			},
+		}
+		cfg.Roles.Coordinator.Agent = "my-curator"
+		cfg.Roles.Coordinator.Model = "provider-model"
+		cfg.Agents.Overrides = map[string]compozyconfig.AgentOverride{
+			"my-curator": {ReasoningEffort: "high"},
+		}
+		resolver := newRoleResolver(&cfg, nil, roleAgentResolverStub{
+			agents: map[string]compozyconfig.AgentDef{
+				"my-curator": {Name: "my-curator", Provider: "mock", Prompt: "Coordinate work."},
+			},
+		})
+
+		resolved, err := resolver.Resolve(t.Context(), "", compozyconfig.RoleCoordinator)
+		if err != nil {
+			t.Fatalf("Resolve(coordinator) error = %v", err)
+		}
+		if resolved.Model != "provider-model" || resolved.ReasoningEffort != "high" {
+			t.Fatalf("Resolve(coordinator) = %q/%q, want provider-model/high", resolved.Model, resolved.ReasoningEffort)
+		}
+	})
+
+	t.Run("Should reject providers that require an unresolved runtime model", func(t *testing.T) {
+		t.Parallel()
+
+		cfg := roleResolverConfig()
+		cfg.Roles.Coordinator.Enabled = true
+		const providerName = "model-required"
+		cfg.Providers[providerName] = compozyconfig.ProviderConfig{
+			Command: "pi-acp", Harness: compozyconfig.ProviderHarnessPiACP,
+		}
+		cfg.Roles.Coordinator.Provider = providerName
+		resolver := newRoleResolver(&cfg, nil, nil)
+
+		_, err := resolver.Resolve(t.Context(), "", compozyconfig.RoleCoordinator)
+		if err == nil || !errors.Is(err, compozyconfig.ErrRuntimeModelRequired) {
+			t.Fatalf("Resolve(coordinator) error = %v, want missing runtime model", err)
+		}
+	})
+
+	t.Run("Should report per-field workspace and global provenance", func(t *testing.T) {
+		t.Parallel()
+
+		global := roleResolverConfig()
+		global.Roles.Coordinator.Enabled = true
+		global.Providers["mock"] = compozyconfig.ProviderConfig{Command: "mock-acp"}
+		global.Roles.Coordinator.Provider = "mock"
+		global.Roles.Coordinator.Model = "global-model"
+		global.RoleSources[compozyconfig.RoleCoordinator][compozyconfig.RoleFieldProvider] = compozyconfig.RoleFieldSourceGlobal
+		global.RoleSources[compozyconfig.RoleCoordinator][compozyconfig.RoleFieldModel] = compozyconfig.RoleFieldSourceGlobal
+		workspaceA := global
+		workspaceA.Roles.Coordinator.Model = "workspace-model"
+		workspaceA.RoleSources = compozyconfig.CloneRoleFieldSources(global.RoleSources)
+		workspaceA.RoleSources[compozyconfig.RoleCoordinator][compozyconfig.RoleFieldModel] = compozyconfig.RoleFieldSourceWorkspace
+		workspaceB := global
+		resolver := newRoleResolver(&global, roleWorkspaceResolverStub{configs: map[string]compozyconfig.Config{
+			"ws-a": workspaceA,
+			"ws-b": workspaceB,
+		}}, nil)
+
+		resolvedA, err := resolver.Resolve(t.Context(), "ws-a", compozyconfig.RoleCoordinator)
+		if err != nil {
+			t.Fatalf("Resolve(ws-a) error = %v", err)
+		}
+		resolvedB, err := resolver.Resolve(t.Context(), "ws-b", compozyconfig.RoleCoordinator)
+		if err != nil {
+			t.Fatalf("Resolve(ws-b) error = %v", err)
+		}
+		if resolvedA.Model != "workspace-model" ||
+			resolvedA.Provenance["model"] != compozyconfig.RoleFieldSourceWorkspace ||
+			resolvedB.Model != "global-model" || resolvedB.Provenance["model"] != compozyconfig.RoleFieldSourceGlobal {
+			t.Fatalf("workspace provenance = a:%#v b:%#v", resolvedA, resolvedB)
+		}
+		if resolvedA.Provenance["agent"] != compozyconfig.RoleFieldSourceDefault ||
+			resolvedB.Provenance["agent"] != compozyconfig.RoleFieldSourceDefault {
+			t.Fatalf(
+				"agent provenance = a:%q b:%q, want default",
+				resolvedA.Provenance["agent"],
+				resolvedB.Provenance["agent"],
+			)
+		}
+	})
+
+	t.Run("Should return a disabled role", func(t *testing.T) {
+		t.Parallel()
+
+		cfg := roleResolverConfig()
+		cfg.Roles.Coordinator.Enabled = false
+		cfg.Roles.Coordinator.Agent = "missing-curator"
+		cfg.Roles.Coordinator.Provider = "model-required"
+		cfg.Providers["model-required"] = compozyconfig.ProviderConfig{
+			Command: "pi-acp", Harness: compozyconfig.ProviderHarnessPiACP,
+		}
+		resolved, err := newRoleResolver(&cfg, nil, nil).Resolve(t.Context(), "", compozyconfig.RoleCoordinator)
+		if err != nil {
+			t.Fatalf("Resolve(coordinator) error = %v", err)
+		}
+		if resolved.Enabled {
+			t.Fatalf("Resolve(coordinator) Enabled = true, want false")
+		}
+		if resolved.AgentName != "" || resolved.Model != "" {
+			t.Fatalf("Resolve(coordinator) = %#v, want no resolved route for disabled role", resolved)
+		}
+	})
+
+	t.Run("Should allow direct ACP roles without a runtime model", func(t *testing.T) {
+		t.Parallel()
+
+		cfg := roleResolverConfig()
+		cfg.Roles.Coordinator.Enabled = true
+		cfg.Providers["direct-acp"] = compozyconfig.ProviderConfig{
+			Command: "direct-agent acp", Harness: compozyconfig.ProviderHarnessACP,
+		}
+		cfg.Roles.Coordinator.Provider = "direct-acp"
+		resolved, err := newRoleResolver(&cfg, nil, nil).Resolve(t.Context(), "", compozyconfig.RoleCoordinator)
+		if err != nil {
+			t.Fatalf("Resolve(coordinator) error = %v", err)
+		}
+		if resolved.Provider != "direct-acp" || resolved.Model != "" {
+			t.Fatalf("Resolve(coordinator) = %#v, want direct ACP provider without a model", resolved)
+		}
+	})
+}
+
+type roleAgentResolverStub struct {
+	agents map[string]compozyconfig.AgentDef
+}
+
+func (s roleAgentResolverStub) ResolveAgent(
+	name string,
+	_ *workspacepkg.ResolvedWorkspace,
+) (compozyconfig.AgentDef, error) {
+	agent, ok := s.agents[name]
+	if !ok {
+		return compozyconfig.AgentDef{}, workspacepkg.ErrAgentNotAvailable
+	}
+	return compozyconfig.CloneAgentDef(agent), nil
+}
+
+type roleWorkspaceResolverStub struct {
+	configs map[string]compozyconfig.Config
+}
+
+func (s roleWorkspaceResolverStub) Resolve(
+	_ context.Context,
+	idOrPath string,
+) (workspacepkg.ResolvedWorkspace, error) {
+	cfg, ok := s.configs[idOrPath]
+	if !ok {
+		return workspacepkg.ResolvedWorkspace{}, workspacepkg.ErrWorkspaceNotFound
+	}
+	return workspacepkg.ResolvedWorkspace{
+		ID:     idOrPath,
+		Config: cfg,
+	}, nil
+}
+
+func (s roleWorkspaceResolverStub) ResolveOrRegister(
+	ctx context.Context,
+	path string,
+) (workspacepkg.ResolvedWorkspace, error) {
+	return s.Resolve(ctx, path)
+}
+
+func roleResolverConfig() compozyconfig.Config {
+	return compozyconfig.DefaultWithHome(compozyconfig.HomePaths{})
+}
+
+func TestRoleResolverProfile(t *testing.T) {
+	t.Parallel()
+	t.Run("Should inherit the Agent from the source Profile", func(t *testing.T) {
+		t.Parallel()
+		cfg := roleResolverConfig()
+		cfg.Roles.Coordinator.Enabled = true
+		scoped := loopActionBinderWorkspace(
+			t,
+			[]compozyconfig.AgentDef{{Name: "profile-worker", Provider: "mock", Model: "scoped-model", Prompt: "Work"}},
+		)
+		scoped.ProfileID = "profile-engineering"
+		resolver := newRoleResolver(
+			&cfg,
+			&loopPolicyProfileWorkspaceResolver{scoped: scoped},
+			profileRoleAgentResolver{},
+		)
+		resolver.profileNames = loopProfileNameResolverStub{"profile-engineering": "engineering"}
+		ctx := withRoleInvocationCorrelation(
+			t.Context(),
+			roleInvocationCorrelation{
+				ProfileID: "profile-engineering",
+				AgentName: "profile-worker",
+				SessionID: "session-worker",
+			},
+		)
+		role, err := resolver.Resolve(ctx, "ws-loop", compozyconfig.RoleAutoTitle)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if role.AgentName != "profile-worker" || role.Model != "scoped-model" {
+			t.Fatalf("wrong role: %#v", role)
+		}
+		ctx = withRoleInvocationCorrelation(
+			t.Context(),
+			roleInvocationCorrelation{ProfileID: "profile-missing", AgentName: "profile-worker"},
+		)
+		if _, err := resolver.Resolve(
+			ctx,
+			"ws-loop",
+			compozyconfig.RoleAutoTitle,
+		); err == nil ||
+			!strings.Contains(err.Error(), "profile not found") {
+			t.Fatalf("error = %v, want profile not found", err)
+		}
+	})
+}
+
+type profileRoleAgentResolver struct{}
+
+func (profileRoleAgentResolver) ResolveAgent(
+	name string,
+	resolved *workspacepkg.ResolvedWorkspace,
+) (compozyconfig.AgentDef, error) {
+	if resolved != nil && resolved.ProfileID == "profile-engineering" {
+		for _, agent := range resolved.Agents {
+			if agent.Name == name {
+				return agent, nil
+			}
+		}
+	}
+	return compozyconfig.AgentDef{}, workspacepkg.ErrAgentNotAvailable
+}

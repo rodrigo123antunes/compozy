@@ -1,0 +1,229 @@
+package contract
+
+import (
+	"time"
+
+	"github.com/compozy/compozy/internal/config"
+
+	hookspkg "github.com/compozy/compozy/internal/hooks"
+)
+
+type SettingsProviderSettingsPayload struct {
+	SessionEnv       map[string]SessionEnvBindingPayload     `json:"session_env,omitempty"`
+	SteerCapability  config.SteerCapability                  `json:"steer_capability,omitempty"`
+	Command          string                                  `json:"command,omitempty"`
+	CommandInherited bool                                    `json:"command_inherited,omitempty"`
+	DisplayName      string                                  `json:"display_name,omitempty"`
+	Models           *SettingsProviderModelsPayload          `json:"models,omitzero"`
+	Harness          string                                  `json:"harness,omitempty"`
+	RuntimeProvider  string                                  `json:"runtime_provider,omitempty"`
+	Transport        string                                  `json:"transport,omitempty"`
+	BaseURL          string                                  `json:"base_url,omitempty"`
+	AuthMode         string                                  `json:"auth_mode,omitempty"`
+	EnvPolicy        string                                  `json:"env_policy,omitempty"`
+	HomePolicy       string                                  `json:"home_policy,omitempty"`
+	AuthStatusCmd    string                                  `json:"auth_status_command,omitempty"`
+	AuthACPMethod    string                                  `json:"auth_acp_method,omitempty"`
+	CredentialSlots  []SettingsProviderCredentialSlotPayload `json:"credential_slots,omitempty"`
+}
+
+// SettingsProviderWritePayload accepts auth_login_command without exposing it on reads.
+type SettingsProviderWritePayload struct {
+	SessionEnv      map[string]SessionEnvBindingPayload     `json:"session_env,omitzero"`
+	SteerCapability config.SteerCapability                  `json:"steer_capability,omitempty"`
+	Command         string                                  `json:"command,omitempty"`
+	DisplayName     string                                  `json:"display_name,omitempty"`
+	Models          *SettingsProviderModelsPayload          `json:"models,omitzero"`
+	Harness         string                                  `json:"harness,omitempty"`
+	RuntimeProvider string                                  `json:"runtime_provider,omitempty"`
+	Transport       string                                  `json:"transport,omitempty"`
+	BaseURL         string                                  `json:"base_url,omitempty"`
+	AuthMode        string                                  `json:"auth_mode,omitempty"`
+	EnvPolicy       string                                  `json:"env_policy,omitempty"`
+	HomePolicy      string                                  `json:"home_policy,omitempty"`
+	AuthStatusCmd   string                                  `json:"auth_status_command,omitempty"`
+	AuthLoginCmd    *string                                 `json:"auth_login_command,omitzero"`
+	AuthACPMethod   *string                                 `json:"auth_acp_method,omitzero"`
+	CredentialSlots []SettingsProviderCredentialSlotPayload `json:"credential_slots,omitempty"`
+}
+
+type SettingsProviderCredentialSlotPayload struct {
+	Name      string `json:"name"`
+	TargetEnv string `json:"target_env"`
+	SecretRef string `json:"secret_ref"`
+	Kind      string `json:"kind,omitempty"`
+	Required  bool   `json:"required"`
+}
+
+type SettingsProviderCredentialStatusPayload struct {
+	Name      string `json:"name"`
+	TargetEnv string `json:"target_env"`
+	SecretRef string `json:"secret_ref"`
+	Kind      string `json:"kind,omitempty"`
+	Required  bool   `json:"required"`
+	Present   bool   `json:"present"`
+	Source    string `json:"source,omitempty"`
+}
+
+type SettingsProviderAuthStatusPayload struct {
+	Mode       string                         `json:"mode"`
+	EnvPolicy  string                         `json:"env_policy"`
+	HomePolicy string                         `json:"home_policy"`
+	State      string                         `json:"state"`
+	Code       string                         `json:"code,omitempty"`
+	Message    string                         `json:"message,omitempty"`
+	StatusCmd  string                         `json:"status_command,omitempty"`
+	Login      ProviderLoginDescriptorPayload `json:"login"`
+	// LastProbeAt is when the reported sign-in state was last verified live; absent when never.
+	LastProbeAt *time.Time `json:"last_probe_at,omitempty"`
+}
+
+type SettingsProviderSecretWritePayload struct {
+	Name      string `json:"name,omitempty"`
+	SecretRef string `json:"secret_ref"`
+	Kind      string `json:"kind,omitempty"`
+	Value     string `json:"value"`
+}
+
+type SettingsProviderFallbackPayload struct {
+	Source   SettingsSourceRefPayload        `json:"source"`
+	Settings SettingsProviderSettingsPayload `json:"settings"`
+}
+
+type SettingsProviderItemPayload struct {
+	SessionEnvStatus []SettingsProviderCredentialStatusPayload `json:"session_env_status,omitempty"`
+	Name             string                                    `json:"name"`
+	Settings         SettingsProviderSettingsPayload           `json:"settings"`
+	RuntimeStrategy  ProviderRuntimeStrategy                   `json:"runtime_strategy,omitempty"`
+	Default          bool                                      `json:"default"`
+	CommandAvailable bool                                      `json:"command_available"`
+	Credentials      []SettingsProviderCredentialStatusPayload `json:"credentials,omitempty"`
+	AuthStatus       *SettingsProviderAuthStatusPayload        `json:"auth_status,omitzero"`
+	SourceMetadata   SettingsSourceMetadataPayload             `json:"source_metadata"`
+	Fallback         *SettingsProviderFallbackPayload          `json:"fallback,omitzero"`
+}
+
+type SettingsMCPServerPayload struct {
+	Headers   map[string]string             `json:"headers,omitempty"`
+	Name      string                        `json:"name"`
+	Transport string                        `json:"transport,omitempty"`
+	Command   string                        `json:"command,omitempty"`
+	Args      []string                      `json:"args,omitempty"`
+	Env       map[string]string             `json:"env,omitempty"`
+	SecretEnv map[string]string             `json:"secret_env,omitempty"`
+	URL       string                        `json:"url,omitempty"`
+	Auth      *SettingsMCPAuthConfigPayload `json:"auth,omitzero"`
+}
+
+type SettingsMCPAuthConfigPayload struct {
+	Registration    string   `json:"registration,omitempty"`
+	IssuerURL       string   `json:"issuer_url,omitempty"`
+	ClientID        string   `json:"client_id,omitempty"`
+	ClientSecretRef string   `json:"client_secret_ref,omitempty"`
+	Scopes          []string `json:"scopes,omitempty"`
+}
+
+type SettingsMCPSecretValuesPayload struct {
+	SecretEnv         map[string]string `json:"secret_env,omitempty"`
+	OAuthClientSecret *string           `json:"oauth_client_secret,omitzero"`
+}
+
+// SettingsMCPSecretPreservationPayload identifies existing bindings to retain without exposing their refs.
+type SettingsMCPSecretPreservationPayload struct {
+	SecretEnv         []string `json:"secret_env,omitempty"`
+	OAuthClientSecret bool     `json:"oauth_client_secret,omitzero"`
+}
+
+// SettingsMCPAuthConfigViewPayload is the public, binding-free OAuth configuration projection.
+type SettingsMCPAuthConfigViewPayload struct {
+	Registration           string   `json:"registration,omitempty"`
+	IssuerURL              string   `json:"issuer_url,omitempty"`
+	ClientID               string   `json:"client_id,omitempty"`
+	ClientSecretConfigured bool     `json:"client_secret_configured"`
+	Scopes                 []string `json:"scopes,omitempty"`
+}
+
+type SettingsMCPAuthStatusPayload struct {
+	ServerName   string     `json:"server_name"`
+	Owner        string     `json:"owner"`
+	Scope        string     `json:"scope"`
+	WorkspaceID  string     `json:"workspace_id,omitempty"`
+	Profile      string     `json:"profile,omitempty"`
+	Status       string     `json:"status"`
+	RemoteURL    string     `json:"remote_url,omitempty"`
+	AuthType     string     `json:"auth_type,omitempty"`
+	ClientID     string     `json:"client_id,omitempty"`
+	Issuer       string     `json:"issuer,omitempty"`
+	Scopes       []string   `json:"scopes,omitempty"`
+	ExpiresAt    *time.Time `json:"expires_at,omitempty"`
+	UpdatedAt    *time.Time `json:"updated_at,omitempty"`
+	Refreshable  bool       `json:"refreshable"`
+	TokenPresent bool       `json:"token_present"`
+	Diagnostic   string     `json:"diagnostic,omitempty"`
+	// Inherited is true when the requested scope has no own definition and this record belongs
+	// to the broader scope that declares the effective definition and owns its credential.
+	Inherited bool `json:"inherited,omitempty"`
+}
+
+type SettingsMCPServerRuntimeStatusPayload struct {
+	Configured      bool   `json:"configured"`
+	Initialized     bool   `json:"initialized"`
+	State           string `json:"state"`
+	Probe           string `json:"probe"`
+	ToolCount       int    `json:"tool_count"`
+	ProtocolVersion string `json:"protocol_version,omitempty"`
+	Reason          string `json:"reason,omitempty"`
+	Diagnostic      string `json:"diagnostic,omitempty"`
+}
+
+// SettingsMCPExtensionOverridePayload exposes only validated non-secret override fields.
+type SettingsMCPExtensionOverridePayload struct {
+	Env     map[string]string `json:"env,omitempty"`
+	Headers map[string]string `json:"headers,omitempty"`
+	URL     string            `json:"url,omitempty"`
+}
+
+type SettingsMCPServerItemPayload struct {
+	Owner          string                                 `json:"owner,omitempty"`
+	RuntimeName    string                                 `json:"runtime_name,omitempty"`
+	Override       *SettingsMCPExtensionOverridePayload   `json:"override,omitzero"`
+	Name           string                                 `json:"name"`
+	Transport      string                                 `json:"transport"`
+	Command        string                                 `json:"command,omitempty"`
+	Args           []string                               `json:"args,omitempty"`
+	EnvKeys        []string                               `json:"env_keys,omitempty"`
+	SecretEnvKeys  []string                               `json:"secret_env_keys,omitempty"`
+	URL            string                                 `json:"url,omitempty"`
+	Auth           *SettingsMCPAuthConfigViewPayload      `json:"auth,omitzero"`
+	AuthStatus     *SettingsMCPAuthStatusPayload          `json:"auth_status,omitzero"`
+	RuntimeStatus  *SettingsMCPServerRuntimeStatusPayload `json:"runtime_status,omitzero"`
+	Scope          SettingsScopeKind                      `json:"scope"`
+	WorkspaceID    string                                 `json:"workspace_id,omitempty"`
+	Profile        string                                 `json:"profile,omitempty"`
+	CatalogEntry   string                                 `json:"catalog_entry,omitempty"`
+	CatalogVersion string                                 `json:"catalog_version,omitempty"`
+	SourceMetadata SettingsSourceMetadataPayload          `json:"source_metadata"`
+}
+
+type SettingsHookDeclarationPayload struct {
+	Name         string                    `json:"name"`
+	Event        hookspkg.HookEvent        `json:"event"`
+	Mode         hookspkg.HookMode         `json:"mode,omitempty"`
+	Required     bool                      `json:"required,omitzero"`
+	Enabled      *bool                     `json:"enabled,omitzero"`
+	Priority     int                       `json:"priority,omitzero"`
+	Timeout      string                    `json:"timeout,omitempty"`
+	Matcher      hookspkg.HookMatcher      `json:"matcher"`
+	ExecutorKind hookspkg.HookExecutorKind `json:"executor_kind,omitempty"`
+	Command      string                    `json:"command,omitempty"`
+	Args         []string                  `json:"args,omitempty"`
+	Env          map[string]string         `json:"env,omitempty"`
+	SecretEnv    map[string]string         `json:"secret_env,omitempty"`
+	Metadata     map[string]string         `json:"metadata,omitempty"`
+}
+
+type SettingsHookItemPayload struct {
+	Name           string                         `json:"name"`
+	Declaration    SettingsHookDeclarationPayload `json:"declaration"`
+	SourceMetadata SettingsSourceMetadataPayload  `json:"source_metadata"`
+}

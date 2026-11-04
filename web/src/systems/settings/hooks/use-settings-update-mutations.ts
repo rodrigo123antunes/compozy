@@ -1,0 +1,53 @@
+import { useMutation, useQueryClient } from "@tanstack/react-query";
+
+import {
+  applySettingsUpdate,
+  cancelSettingsUpdate,
+  checkSettingsUpdate,
+} from "../adapters/settings-api";
+import { settingsKeys } from "../lib/query-keys";
+import type { SettingsUpdateApplyRequest, SettingsUpdateStatus } from "../types";
+
+/**
+ * Update-operation mutations (ADR-009). These are host-global lifecycle actions
+ * over the durable Update Operation, not config-section writes, so they record no
+ * pending restart and live apart from `use-settings-mutations`.
+ *
+ * Both endpoints answer with acknowledgement, never a terminal verdict: `accepted`
+ * means the operation record was durably acquired, `blocked` names the holder that
+ * owns it. Terminal truth — staged phases, rollback, failure — arrives only through
+ * `GET /api/settings/update`, which is why every mutation invalidates that read
+ * instead of writing an optimistic snapshot. The apply key is shared so every
+ * surface (menubar and Settings) sees one in-flight request, whoever started it.
+ */
+export function useApplySettingsUpdate() {
+  const queryClient = useQueryClient();
+
+  return useMutation({
+    mutationKey: settingsKeys.updateApply(),
+    mutationFn: (body: SettingsUpdateApplyRequest) => applySettingsUpdate(body),
+    onSettled: () => queryClient.invalidateQueries({ queryKey: settingsKeys.updateStatus() }),
+  });
+}
+
+export function useCancelSettingsUpdate() {
+  const queryClient = useQueryClient();
+
+  return useMutation({
+    mutationFn: () => cancelSettingsUpdate(),
+    onSettled: () => queryClient.invalidateQueries({ queryKey: settingsKeys.updateStatus() }),
+  });
+}
+
+/** Publishes a successful manual check to the shared update-status query cache. */
+export function useCheckSettingsUpdate() {
+  const queryClient = useQueryClient();
+  return useMutation({
+    mutationFn: () => checkSettingsUpdate(),
+    onMutate: () => ({
+      checkedAt: queryClient.getQueryData<SettingsUpdateStatus>(settingsKeys.updateStatus())
+        ?.runtime.checked_at,
+    }),
+    onSuccess: snapshot => queryClient.setQueryData(settingsKeys.updateStatus(), snapshot),
+  });
+}

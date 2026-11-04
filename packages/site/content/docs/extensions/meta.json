@@ -1,0 +1,16 @@
+{
+    "title": "Extensions",
+    "icon": "Puzzle",
+    "pages": [
+        "develop",
+        "manifest",
+        "cmd-palette",
+        "permissions",
+        "commands",
+        "publish",
+        "install",
+        "open-design",
+        "agent-plugins",
+        "secrets"
+    ]
+}

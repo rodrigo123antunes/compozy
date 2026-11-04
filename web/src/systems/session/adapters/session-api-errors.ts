@@ -1,0 +1,92 @@
+import {
+  apiErrorCode,
+  apiErrorCurrentTurnId,
+  apiErrorQueueCap,
+  defaultApiErrorMessage,
+} from "@/lib/api-client";
+import { describeGoalCommandFailure } from "../lib/session-goal-chat-transport";
+import type { SessionGoalCommandResult } from "../types";
+
+export interface SessionApiErrorDetail {
+  /** Deterministic daemon error code, e.g. `active_turn_mismatch`. */
+  code?: string;
+  /** The turn the daemon reports as active when a strict fence is refused. */
+  currentTurnId?: string;
+  /** The queue cap named by a `queue_full` refusal. */
+  queueCap?: number;
+}
+
+export class SessionApiError extends Error {
+  readonly code: string | null;
+  readonly currentTurnId: string | null;
+  readonly queueCap: number | null;
+
+  constructor(
+    message: string,
+    public readonly status: number,
+    public readonly sessionId?: string,
+    detail: SessionApiErrorDetail = {}
+  ) {
+    super(message);
+    this.name = "SessionApiError";
+    this.code = detail.code ?? null;
+    this.currentTurnId = detail.currentTurnId ?? null;
+    this.queueCap = detail.queueCap ?? null;
+  }
+}
+
+export class SessionNotFoundError extends SessionApiError {
+  constructor(id: string) {
+    super(`Session not found: ${id}`, 404, id);
+    this.name = "SessionNotFoundError";
+  }
+}
+
+export class SessionGoalCommandError extends SessionApiError {
+  /** Retains the structured Goal refusal alongside its transport error. */
+  constructor(
+    public readonly result: SessionGoalCommandResult,
+    status: number,
+    sessionId: string
+  ) {
+    super(
+      describeGoalCommandFailure(result.reason_code) ?? "Goal command failed.",
+      status,
+      sessionId,
+      result.reason_code ? { code: result.reason_code } : {}
+    );
+    this.name = "SessionGoalCommandError";
+  }
+}
+
+export function throwSessionRequestError(
+  response: Response,
+  error: unknown,
+  fallback: string,
+  sessionId?: string
+): never {
+  if (response.status === 404 && sessionId) {
+    throw new SessionNotFoundError(sessionId);
+  }
+  throw new SessionApiError(
+    defaultApiErrorMessage(fallback, response, error),
+    response.status,
+    sessionId,
+    {
+      code: apiErrorCode(error),
+      currentTurnId: apiErrorCurrentTurnId(error),
+      queueCap: apiErrorQueueCap(error),
+    }
+  );
+}
+
+export function isTerminalInputReadError(error: unknown): boolean {
+  return (
+    error instanceof SessionApiError &&
+    (error.status === 404 || error.status === 410 || error.code === "session_not_promptable")
+  );
+}
+
+export function isSessionUnavailable(error: unknown): boolean {
+  return error instanceof SessionApiError && (error.status === 404 || error.status === 410);
+}

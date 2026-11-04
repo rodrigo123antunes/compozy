@@ -1,0 +1,299 @@
+---
+title: Sessions board
+description: See every session by who owns the next step — Needs you, Working, Waiting, In review, Done — and open any of them in a drawer without leaving the board.
+---
+
+The sessions board is a Kanban view of the session window. It places every session in one of five
+columns by **who owns the next step**, so with ten agents running you can tell at a glance what is
+waiting on you, what is still working, what is parked until something wakes it, and which pull
+requests are ready to merge.
+
+You never move cards. The daemon derives each session's column from its badge and its pull request,
+and the board, the CLI, and the native tools all read that same value.
+
+## The five columns
+
+The daemon checks these rules in order; the first one that matches wins.
+
+| Column        | A session lands here when…                                                                             |
+| ------------- | ------------------------------------------------------------------------------------------------------ |
+| **Needs you** | it needs a decision from you: `waiting-for-input`, `waiting-for-auth`, `failed`, or `needs-attention`. |
+| **Working**   | it is `running`, `hung`, or `unhealthy`: something is executing, or should be.                         |
+| **Waiting**   | it is `waiting`: idle, with a registered wake source such as a monitor, a timer, or child sessions.    |
+| **In review** | its branch, or a pull request [linked to it](/docs/sessions/linked-work), is open, drafts included.    |
+| **Done**      | anything else that is not archived.                                                                    |
+
+A session with an open PR that asks for approval sits in **Needs you**, not **In review**: your
+decision comes first. A running session with an open PR stays in **Working** until its turn settles,
+and a waiting session with an open PR stays in **Waiting** until its wake arrives: active work comes
+before review. A **Waiting** card names what it waits on, such as **Monitoring** or **Waiting**.
+Archived sessions never appear in the columns; they live in the **Archive** bar at the bottom.
+
+## Walkthrough: open the board and act on a card
+
+1. Open a session window. In its header, right after the title, you see a **List | Kanban** switch
+   with **List** selected.
+2. Select **Kanban** (or press <kbd>Tab</kbd> until the switch has focus, move to **Kanban** with
+
+   <kbd>→</kbd>, and press <kbd>Enter</kbd>).
+
+   **Expected:** the window body becomes five columns. Each header shows its name and a count, for
+   example `Needs you 2 · Working 5 · Waiting 1 · In review 3 · Done 128`. The header now reads **Sessions** and
+   offers **View options** and **New session**.
+
+3. Read a card. Each card has three rows:
+   - the branch and PR number (`feat/forge-gql · #932`) with at most one status on the right;
+   - the session title, with a dot before it when the session finished and you have not looked yet;
+   - the agent, then either `↳ parent title` (a child session) or a children count (a parent), and
+     how long ago the session last changed.
+4. Right-click a card, or hover it and select its **…** button (also reachable with <kbd>Tab</kbd>
+   right after the card).
+
+   **Expected:** the same actions as the session's row in the list open: rename, copy its ID or
+   title, continue or fork it, stop, archive, or delete it. Choosing one does not open the session.
+
+5. Click a card.
+
+   **Expected:** the session opens in a drawer on the right side of the board. The board stays where
+   it was, keeps updating, and highlights the card you opened. See
+   [Work in a session from the board](#work-in-a-session-from-the-board).
+
+6. Reload the app.
+
+   **Expected:** the window keeps the view you chose last, and the drawer is still open on the same
+   session. Each session window remembers its own view, and a new window always opens in **List**.
+
+## Work in a session from the board
+
+The drawer is the complete session: transcript, composer, model and runtime picker, goal controls,
+subagents, terminal output, approvals and questions, and the session's header actions. Everything
+you can do in **List** you can do here, while the board stays visible beside it.
+
+1. Click a card in **Working**.
+
+   **Expected:** the drawer opens with that session. Its header shows the session state, the title,
+   the pull request and status chips, **Stop** while it runs, and the context sidebar toggle. On the
+   right are **Previous session**, **Next session**, **Open full session**, the session's **…** menu,
+   and **Close**.
+
+2. Click another card.
+
+   **Expected:** the drawer switches to that session. Anything you typed in the composer of the first
+   session stays there as a draft, and its card shows **Draft** until you send or clear it.
+
+3. Press <kbd>Ctrl</kbd>+<kbd>Shift</kbd>+<kbd>↓</kbd> (or select **Next session**).
+
+   **Expected:** the drawer moves to the next card on the board: down the column, then on to the next
+   column. <kbd>Ctrl</kbd>+<kbd>Shift</kbd>+<kbd>↑</kbd> goes back. These are the same
+   **Next session** and **Previous session** shortcuts as the session list, so a remapped shortcut
+   works here too. They do nothing while you are typing in the composer.
+
+4. Drag the drawer's left edge to resize it, or focus the edge with <kbd>Tab</kbd> and use
+
+   <kbd>←</kbd> and <kbd>→</kbd> (<kbd>Home</kbd> and <kbd>End</kbd> jump to the narrowest and
+   widest).
+
+   **Expected:** the board narrows or widens beside the drawer and scrolls sideways when its columns
+   no longer fit. The width is remembered for this window, and new windows start from the last width
+   you chose.
+
+5. Press <kbd>Esc</kbd>.
+
+   **Expected:** the drawer closes and focus returns to the session's card, even if the card moved to
+   another column while the drawer was open. Clicking an empty part of the board also closes the
+   drawer, unless the composer holds a message you have not sent.
+
+6. Use the browser's back button.
+
+   **Expected:** the drawer opens again on the session you closed. Back and forward step through the
+   sessions you opened, and the address bar always points at the session in the drawer, so you can
+   copy it as a link.
+
+7. Select **Open full session**.
+
+   **Expected:** the window switches to **List** with that session open, the same as before the
+   board existed.
+
+A few things to know:
+
+- **Child sessions.** A child session's header starts with its parent's title. Select it to open the
+  parent in the drawer. Subagents open in their own panel inside the drawer, as they do in **List**.
+- **Archive and delete.** Archiving or deleting the session from the drawer's **…** menu (or from its
+  card) closes the drawer and moves focus to the next card in the same column.
+- **Cards that move.** A card can move from **Working** to **Waiting**, **Needs you**, or **Done** while its session
+  is open. The drawer stays open and the highlight follows the card.
+- **A session open in another window.** A session is shown by one window at a time. If another
+  window already shows it, clicking its card brings that window forward instead of opening the
+  drawer.
+- **Narrow windows.** When the window is too narrow for the drawer and a column side by side, the
+  drawer covers the board edge to edge. Press <kbd>Esc</kbd> to get back to the board.
+- **All projects and All profiles.** The drawer opens sessions from any project shown on the board.
+  A session that belongs to another profile opens read-only, with the option to switch to its
+  profile, exactly as it does in **List**.
+
+## Select several cards and act on them at once
+
+The board selects cards the way the session list selects rows, and runs the same bulk actions.
+
+1. Hold <kbd>⌘</kbd> (<kbd>Ctrl</kbd> on Windows and Linux) and click a card, or hover a card and
+   tick the checkbox that takes the place of its provider mark.
+
+   **Expected:** the card turns selected, every card shows a checkbox, and the board header swaps
+   **View options** and **New session** for the selection bar:
+   a select-all checkbox, `1 selected`, a delete button, **More actions**, and **Done**
+   (<kbd>Esc</kbd>). The board itself does not move.
+
+2. Click more cards. While a selection is open, a plain click toggles a card instead of opening it.
+   <kbd>Shift</kbd>-click selects the range from the last card you picked to the clicked one, inside
+   the clicked card's column.
+3. To take a whole column, hover its header and tick the checkbox that replaces its mark; tick it
+   again to deselect only that column's cards. Grouped by project or profile, each swimlane header
+   has the same checkbox for the whole lane. <kbd>⌘</kbd> <kbd>A</kbd> selects every card the board
+   shows.
+4. Open **More actions** in the selection bar, or right-click any selected card.
+
+   **Expected:** a menu titled with the selection's size (`5 sessions`) offers **Move to folder**
+   where it applies, **Stop** with how many are active, **Archive** (or **Stop and archive** when
+   some are live) with how many apply, **Unarchive** with how many are archived, **Copy session
+   IDs**, and **Delete 5 sessions**. Delete asks for confirmation first.
+
+5. Run an action.
+
+   **Expected:** one toast reports the outcome. When some selected sessions do not take the action,
+   it says how many were skipped and why, for example `2 skipped: 1 already archived, 1 child
+session follows its parent.`
+
+Rules worth knowing:
+
+- Selecting never opens the drawer: <kbd>⌘</kbd>/<kbd>Ctrl</kbd>-click, <kbd>Shift</kbd>-click,
+  and clicks while a selection is open only select. A plain click with nothing selected opens the
+  card in the drawer as usual. When a bulk archive or delete includes the session open in the
+  drawer, the drawer closes and focus moves to the nearest card that is not part of the batch.
+- Right-clicking a card outside the selection makes that card the selection and opens its own menu,
+  as Finder does.
+- A selected card that moves to another column (a session that finishes, for example) stays
+  selected. A card that disappears, because it was archived or deleted elsewhere, leaves the
+  selection.
+- Folding **Done** keeps its selected cards; the bar counts them as hidden (`6 selected · 4
+hidden`). Archived cards can be selected while the **Archive** bar is open; closing it drops
+  them from the selection.
+- Selections can span columns, projects (under **All projects**), and profiles (under **All
+  profiles**); each action runs against each session's own project and profile. **Move to
+  folder** needs every selected session in one project and profile, and says so otherwise.
+- **List** and **Kanban** keep separate selections. Switching views, the scope, the profile, or the
+  grouping starts with nothing selected.
+- From the keyboard, press <kbd>Tab</kbd> from a card to reach its checkbox, <kbd>Space</kbd> to
+  toggle it, and <kbd>Shift</kbd> <kbd>Space</kbd> for a range. Screen readers announce the
+  selection count as it changes.
+
+## Group and sort the board
+
+Open **View options** (the sliders icon) in the board header. Use **Group by** to split the board into one swimlane per project (under
+**All projects**) or per profile (under **All profiles**). Each swimlane keeps the four columns, with
+counts for that project or profile only. **Group by** shows only where a grouping applies, and starts
+at **None**. The **Archive** bar stays a single bar.
+
+Use **Sort by** to order the cards inside every column: **Created**, **Name**, **Last activity**, or
+**Attention first**. The list's **Manual** order belongs to its folders, so the board reads it as
+**Last activity**.
+
+Click a swimlane's header to fold it to its name and count; the columns come back when you click it again.
+**Collapse all** folds every swimlane at once, and the same item then reads **Expand all**. Grouped by
+project, **Show empty projects** adds a swimlane for each project with no sessions.
+
+Sort, grouping, project folds, and **Show empty projects** belong to the window and are shared by its **List** and **Kanban** views: group the
+board by project, switch to **List**, and the list is grouped by project too. Another window keeps
+its own choice. A window you have not changed yet starts from `shell.sessions.sort` and
+`shell.sessions.group_by` (`compozy config get shell.sessions.sort`).
+
+## What the status on a card means
+
+A card shows one status. In **Needs you** it is the reason you are needed; everywhere else it is the
+pull request signal that most needs attention.
+
+| Status            | Meaning                                                                                     |
+| ----------------- | ------------------------------------------------------------------------------------------- |
+| Approval          | The agent is waiting for you to approve a tool call.                                        |
+| Input             | The agent asked you a question.                                                             |
+| Auth              | The provider needs you to sign in.                                                          |
+| Failed            | The session failed.                                                                         |
+| Checks failing    | At least one CI check failed on the PR head.                                                |
+| Changes requested | A reviewer requested changes.                                                               |
+| Conflicts         | The PR conflicts with its base branch.                                                      |
+| Ready to merge    | Open, not a draft, checks passing (or none), approved (or no review needed), and mergeable. |
+| Draft             | The PR is a draft.                                                                          |
+| Merged · Closed   | The PR is finished.                                                                         |
+
+"Ready to merge" appears only when every one of those facts is known and fresh. If GitHub has not
+answered yet, or the last lookup failed, the card shows no status rather than guessing.
+
+## Child sessions
+
+Sessions an orchestrator spawns are cards of their own, placed by their own state. A child shows
+`↳` and its parent's title; a parent shows how many direct children it has, with a dot when one of
+them needs you. Hover the count to see the children per column.
+
+A forked or continued session is not a child: it is a new top-level session that names its source
+as provenance. Its card shows the fork or continue glyph and the source's title instead of `↳`, and
+the source's child count does not include it.
+
+**Hide child sessions** is on by default in a new window: child sessions (spawned workers, sessions
+created with a parent, subagents and recovery sessions) stay out of the columns and the counts, and
+their parent's count shows them. Forked and continued sessions stay on the board.
+
+1. Open **View options** in the board header and clear **Hide child sessions**.
+
+   **Expected:** every child session joins the columns, and the column counts rise to match. The
+   choice is remembered for this window.
+
+2. Check it again to hide them.
+
+## Load more and the Archive bar
+
+Each column shows 50 cards at a time. When a column holds more, it ends with
+**Load more 50 of 128**; the count in the header always covers the whole column, loaded or not.
+
+The **Archive** bar at the bottom shows how many archived sessions the scope holds and stays hidden
+when there are none. Expand it to see them as cards; clicking one opens it like any other card.
+
+### Fold a column
+
+1. Select the arrow at the right of a column's header, for example **Collapse Done**.
+
+   **Expected:** the column folds into a narrow rail that shows its mark, its name written
+   vertically, and its count. The other columns move over to use the space.
+
+2. Select the rail (or focus it with <kbd>Tab</kbd> and press <kbd>Enter</kbd>).
+
+   **Expected:** the column opens again and focus moves to its **Collapse** arrow.
+
+A fold applies to that column in every swimlane when the board is grouped, so the lanes stay
+aligned. Each session window remembers its folds across reloads; a new window opens with every column
+expanded. Selected cards in a folded column stay selected and count as hidden.
+
+## Finished automation runs
+
+An automation job or trigger session shows on the list and the board while it runs or needs you. When it finishes cleanly, it leaves both, and the counts follow. Nothing is archived or deleted: open it from the Automations run view, or find it with search.
+
+A run stays visible when it failed, when it or one of its child sessions is waiting on you or still working, or when you prompted it yourself. Opening a run does not keep it on the list. A failed run stays until you archive it. A child session always moves with its parent. Loop and Task sessions keep their place on the list.
+
+## Scope and freshness
+
+The board follows the same scope as the session list: the current project, or every project when
+**All projects** is selected (cards then show the project name when they have no PR). It updates as
+sessions change and re-reads every 60 seconds while the window is visible, which also keeps PR
+facts current.
+
+## From the CLI and agents
+
+The same columns are available outside the window:
+
+```bash
+compozy session list --column in_review
+compozy session list --column needs_you,working --hide-children
+compozy session list --column waiting
+```
+
+Agents read the same `board_column` field through `compozy__session_list` and
+`compozy__session_status`. See [`compozy session list`](/docs/cli/session/list) and the
+[Sessions API](/docs/api/sessions) for the exact flags and fields.

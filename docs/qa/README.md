@@ -1,0 +1,94 @@
+# QA — Living Docs
+
+Canonical QA tree for Compozy. Owned by the `qa-report` (planning) + `qa-execution` (sessions) skill pair; `eng-real-scenario-qa` (playbook lab + runtime observation) also lands its findings here. One tree, forever: rounds append, ids never reset, history lives in dated reports.
+
+## Layout
+
+- `scenarios/<AREA>-<slug>.md` — source-of-truth scenario tracker, one flat-frontmatter file per behavior. Existing counter-based scenario ids are grandfathered; new ids are content-addressed.
+- `state.csv` — generated, gitignored tracker view. Regenerate with `python3 .agents/skills/qa-report/scripts/materialize_state.py docs/qa`; never edit or commit it.
+- `bugs/BUG-<YYYYMMDD>-<slug>.md` — global bug registry. Existing `BUG-0001..0038` ids are grandfathered; new ids are content-addressed and deduplicated by symptom.
+- `journeys/J-<slug>.md` — journey maps + Mermaid flows. Existing `J-01..J-32` ids are grandfathered.
+- `charters/CH-<slug>.md` — immutable session missions. Existing `CH-001..CH-052` ids are grandfathered; debriefs belong only in run reports.
+- `reports/<YYYY-MM-DD>-<scope>.md` — one per run, never overwritten
+- `evidence/<date>-<scope>/` — checkpoint/failure screenshots + cited run artifacts only (lean). **Skeeper-managed** (`git@github.com:compozy/specs.git`, namespace `compozy`, pattern `docs/qa/evidence/**`): gitignored from the main repo, mirrored to the sidecar, restored via `skeeper restore --all`. Reports reference evidence by repo-relative path, which resolves after restore. Uncited bulk dumps are pruned before sync.
+- `automation-backlog/<slug>.md` — one conflict-resistant automation intent per file.
+- `templates/` — project copies of scenario, bug, charter, and report templates.
+
+## Area codes (scenario id prefixes)
+
+| Code | Area |
+|---|---|
+| RT | Runtime & sessions (daemon, session lifecycle, providers) |
+| TA | Tasks & automation (task runs, leases, scheduling, loops) |
+| ET | Extensibility & tools (extensions, hooks, skills, registries, bundles) |
+| MS | Settings (config lifecycle, roles, providers, vault, environment) |
+| LP | Loops (workflow runs, catalog, configure/fork, editor) |
+| GL | Goal (conversational convergence, controls, context, recovery) |
+| REL | Release and distribution (installers, registries, channels, provenance) |
+| SITE | Public documentation site (published receipts and user-visible release truth) |
+| APP | Desktop app shell (CompozyOS app: install/provisioning, runtime resolution, app/runtime updates, links, window lifecycle, `compozy app` CLI) |
+
+NB is retired. Its dated reports remain historical evidence and its ids must not be reused.
+
+New areas: define the code here first, then mint ids.
+
+## Entry points
+
+- CLI: `compozy` (structured output; UDS + HTTP parity)
+- Web: `make web-dev` (export `COMPOZY_WEB_API_PROXY_TARGET` from the bootstrap manifest for isolated labs)
+- Release/scenario labs: `eng-qa-bootstrap` skill (isolated `COMPOZY_HOME`/ports/provider homes; see CLAUDE.md Workflow Rules)
+
+## Adopted from
+
+### Conflict-resistant living docs (2026-07-12)
+
+- Exploded the 439-row tracked `state.csv` into `scenarios/`, preserving every id, verdict, link, evidence path, report path, overlap, and note. The converter exposed and repaired one malformed legacy row (`RT-083`, one surplus empty CSV field) before the 439-file round trip passed.
+- `state.csv` is now a disposable materialized view and is ignored by Git. Scenario files are the only tracker source of truth.
+- Split the 12 `AB-001..AB-012` entries from the shared `automation-backlog.md` into content-addressed files under `automation-backlog/`; legacy ids remain recorded inside the files for historical report lookup.
+- Grandfathered the healthy single-tree counter ids already cited by reports: scenarios, `BUG-0001..0038`, `J-01..J-32`, and `CH-001..052`. New artifacts use the content-addressed formats documented above; no counter is read again.
+- Existing charter debriefs are frozen pre-migration history. Executors must not append to them; every new debrief is written incrementally into its dated report.
+- The pre-migration README changelog was closed and moved to `reports/2026-07-12-living-docs-migration.md`; cycle history continues exclusively in dated reports.
+
+### Initial consolidation (2026-07-05)
+
+- The legacy `state.csv` was seeded from the feature-stories tracker (253 stories, cycle 2026-06). Its frozen origin and five subsystem analyses live in `_seeds/feature-stories/`; its rows now live in `scenarios/`. Original prose statuses remain in scenario bodies (`migrated-status:`). Empty journey fields remain intentional until a journey flow legitimately owns the behavior.
+- `bugs/BUG-0001..0017` re-minted from the feature-stories registry (old per-round `BUG-001..017`); impact tiers unclassified — classify on next touch.
+- **Evidence caveat:** the origin lab (`~/dev/qa-labs/compozy-feature-stories-20260621-...-lab/`) was accidentally deleted during the 2026-07-05 cleanup, so its lab-relative `qa/evidence/...` and `qa/issues/...` paths in scenario files are dangling. Treat those migrated `pass` verdicts as historical claims backed by the surviving `file:line` code citations; the next Full cycle re-validates with fresh evidence.
+- `_seeds/final-qa/` — archived pre-release master plan (283 scenarios across 15 modules) + openclaw/hermes QA pattern libraries, from the retired `.compozy/tasks/final-qa/`. Mine into journeys/charters as cycles touch each module, then prune.
+- `_seeds/qa-e2e-playbook.md` — the archived 2026-04 E2E playbook (evidence standard, execution profiles, suite matrix, automation backlog seed), formerly `docs/ideas/qa-e2e/`.
+- Historical per-round QA trees (29 under `.compozy/tasks/_archived/*/qa/`), `final-qa/_runs/` evidence, and 28 stale external labs were deleted on 2026-07-05 (no live references; ids collided across rounds and were never migrated).
+
+### Product retirement (2026-09-27)
+
+The active scenario, journey, charter, and backlog trees no longer schedule Network, Bridges, or
+Sandbox work. Dedicated retired plans were removed. Dated reports, retained bug reproduction
+receipts, and mixed `_seeds/` research record historical observations only; they are not a current
+capability catalog or an executable release plan. Use `scenarios/` for current coverage. The two
+retirement canaries are `ET-retired-product-surfaces-absent` and `RT-authored-context-lifecycle`.
+
+### Product retirement — memory (2026-10-07)
+
+Agent memory, Dream consolidation, the Knowledge app and workspace knowledge injection, and CompozyOS-side
+session compaction (pressure compaction, checkpoint summaries, archived spans) are retired. Their dedicated
+scenarios (`MS-001..MS-024`, `MS-026`, `MS-059`, and the memory-named `MS-`, `RT-`, and `TA-` scenarios), journeys
+(`J-25` and three memory journeys), and charters (including `CH-039`) were deleted; mixed scenarios, journeys, and
+charters were rewritten in place, and the compaction scenarios now cover the replacement behavior (bounded
+rebuilds, observed agent compaction, Compact now). `MS-025` and `MS-027..MS-058` stay: they are settings, vault,
+model, and support scenarios. The `MS` code and the retired ids are never reused. The retirement canary is
+`ET-retired-product-surfaces-absent` (extended with the memory legs); the upgrade walk is
+`RT-upgrade-memory-removal-home`. Dated reports, bug receipts, `_seeds/`, and `evidence/` that mention memory,
+Dream, Knowledge, or compaction record historical observations only; they are not a current capability catalog
+or an executable plan.
+
+### Product retirement — long-tail providers (2026-10-17)
+
+Issue #761 removed 12 built-in providers: `hermes`, `openclaw`, `blackbox`, `cline`, `goose`, `junie`,
+`kiro`, `openhands`, `qoder`, `mistral`, `groq`, and `minimax`. References keep resolving through a
+deprecation shim until v0.5.0. The dedicated scenarios `RT-hermes-live-model-readiness` and
+`RT-openclaw-provider-managed-runtime` were deleted with the Hermes live discovery and OpenClaw
+provider-managed strategy they covered; their ids are never reused. Mixed scenarios and journeys that
+used a removed provider were rewritten in place to use `claude` or `codex`, with dated QA impact notes
+that keep the earlier results as history. `RT-retired-builtin-provider-shim` covers the deprecation
+window. Charters, dated reports, bug receipts, `_seeds/`, and `evidence/` that mention the removed
+providers record historical observations only, and `src:` lines that cite the `hermes-comparison`
+program name a task folder, not the provider.

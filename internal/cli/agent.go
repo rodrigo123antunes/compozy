@@ -1,0 +1,460 @@
+package cli
+
+import (
+	"strconv"
+	"strings"
+
+	"github.com/compozy/compozy/internal/api/contract"
+	"github.com/spf13/cobra"
+)
+
+const (
+	toolOperatorToolsValue = "Tools"
+)
+
+const (
+	agentKernelProviderValue = "Provider"
+)
+
+const (
+	installPermissionsValue = "Permissions"
+	cliProviderKey          = "provider"
+)
+
+const (
+	automationNameValue  = "Name"
+	configPermissionsKey = "permissions"
+)
+
+const (
+	agentKernelModelValue = "Model"
+	automationNameKey     = "name"
+)
+
+const (
+	agentModelKey             = "model"
+	agentReasoningEffortKey   = "reasoning-effort"
+	agentReasoningEffortValue = "Reasoning Effort"
+	agentReasoningEffortField = "reasoning_effort"
+	agentSpeedValue           = "Speed"
+	agentSpeedField           = "speed"
+	agentACPOptionsValue      = "ACP Options"
+	agentACPOptionsField      = "acp_options"
+)
+
+const (
+	agentBodyValue         = "Body"
+	agentCategoryValue     = "Category"
+	agentAgentKey          = "agent"
+	agentCategoryKey       = "category"
+	agentCommandKey        = "command"
+	agentDisableSkillFlag  = "disable-skill"
+	agentDisabledSkillsKey = "disabled_skills"
+	agentInfoNameValue     = "info <name>"
+	agentListKey           = "list"
+)
+
+func newAgentCommand(deps commandDeps) *cobra.Command {
+	cmd := &cobra.Command{
+		Use:   agentAgentKey,
+		Short: "Inspect CompozyOS agent definitions",
+	}
+
+	commands := []*cobra.Command{
+		newAgentInstanceCommand(deps),
+		newAgentSkillCommand(deps),
+		newAgentActivityCommand(deps),
+		newAgentCreateCommand(deps),
+		newAgentDraftCommand(deps),
+		newAgentUpdateCommand(deps),
+		newAgentDeleteCommand(deps),
+		newAgentDuplicateCommand(deps),
+		newAgentListCommand(deps),
+		newAgentInfoCommand(deps),
+		newAgentSoulCommand(deps),
+		newAgentMemoryCommand(deps),
+		newAgentHeartbeatCommand(deps),
+	}
+	for _, command := range commands {
+		configureAgentProfileCommands(command, deps)
+		cmd.AddCommand(command)
+	}
+	return cmd
+}
+
+func configureAgentProfileCommands(cmd *cobra.Command, deps commandDeps) {
+	if cmd == nil {
+		return
+	}
+	if cmd.Annotations[agentAggregateProfileReadAnnotation] == "" {
+		configureSingleProfileReadCommand(cmd, deps)
+	}
+	for _, child := range cmd.Commands() {
+		configureAgentProfileCommands(child, deps)
+	}
+}
+
+func newAgentListCommand(deps commandDeps) *cobra.Command {
+	cmd := &cobra.Command{
+		Use:   agentListKey,
+		Short: "List installed agent definitions",
+		Example: `  # Show every agent definition available to the daemon
+  compozy agent list
+
+  # Show agents resolved for a workspace
+  compozy agent list --workspace ~/dev/ai/acme-startup
+
+  # Emit the same list as JSON
+  compozy agent list -o json`,
+		RunE: func(cmd *cobra.Command, _ []string) error {
+			if wantsAllWorkspaces(cmd) {
+				return writeAggregateCatalog(cmd, deps, "agents")
+			}
+			client, err := clientFromDeps(deps)
+			if err != nil {
+				return err
+			}
+
+			query, err := agentQueryFromCommand(cmd, deps, client)
+			if err != nil {
+				return err
+			}
+			agents, err := client.ListAgents(cmd.Context(), query)
+			if err != nil {
+				return err
+			}
+			return writeCommandOutput(cmd, agentListBundle(agents))
+		},
+	}
+	cmd.Flags().String("workspace", "", "Override workspace context (ID, name, or path)")
+	addAllWorkspacesFlag(cmd)
+	return cmd
+}
+
+func newAgentInfoCommand(deps commandDeps) *cobra.Command {
+	cmd := &cobra.Command{
+		Use:   agentInfoNameValue,
+		Short: "Show one agent definition",
+		Example: `  # Inspect the default bootstrap agent
+  compozy agent info general
+
+  # Inspect a workspace-local agent
+  compozy agent info reviewer --workspace ~/dev/ai/acme-startup
+
+  # Inspect an agent definition as JSON
+  compozy agent info reviewer -o json`,
+		Args: exactOneNonBlankArg(),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			client, err := clientFromDeps(deps)
+			if err != nil {
+				return err
+			}
+
+			query, err := agentQueryFromCommand(cmd, deps, client)
+			if err != nil {
+				return err
+			}
+			agent, err := client.GetAgent(cmd.Context(), args[0], query)
+			if err != nil {
+				return err
+			}
+			return writeCommandOutput(cmd, agentBundle(&agent))
+		},
+	}
+	cmd.Flags().String("workspace", "", "Override workspace context (ID, name, or path)")
+	return cmd
+}
+
+func agentQueryFromCommand(
+	cmd *cobra.Command,
+	deps commandDeps,
+	client workspaceLookupClient,
+) (AgentQuery, error) {
+	workspace, err := commandWorkspaceFlag(cmd)
+	if err != nil {
+		return AgentQuery{}, err
+	}
+	resolution, resolved, err := resolveContextualCommandWorkspace(
+		cmd.Context(),
+		cmd,
+		deps,
+		client,
+		workspace,
+	)
+	if err != nil {
+		return AgentQuery{}, err
+	}
+	if !resolved {
+		return AgentQuery{}, nil
+	}
+	return AgentQuery{Workspace: resolution.ID}, nil
+}
+
+func agentListBundle(items []AgentRecord) outputBundle {
+	return listBundle(
+		items,
+		items,
+		"Agents",
+		[]string{
+			automationNameValue,
+			agentKernelProviderValue,
+			agentKernelModelValue,
+			agentCategoryValue,
+			taskOriginValue,
+			automationWorkspaceValue,
+			"Disabled Skills",
+			"Layer",
+			"Shadows",
+			"Definition Digest",
+			toolOperatorToolsValue,
+			installPermissionsValue,
+		},
+		"agents",
+		[]string{
+			automationNameKey,
+			cliProviderKey,
+			agentModelKey,
+			agentCategoryKey,
+			taskOriginKey,
+			automationWorkspaceIDKey,
+			agentDisabledSkillsKey,
+			"layer",
+			"shadows",
+			"definition_digest",
+			"tool_count",
+			configPermissionsKey,
+		},
+		func(item AgentRecord) []string {
+			return []string{
+				stringOrDash(item.Name),
+				stringOrDash(item.Provider),
+				stringOrDash(item.Model),
+				stringOrDash(agentCategoryLabel(item.CategoryPath)),
+				stringOrDash(string(item.Origin)),
+				stringOrDash(item.WorkspaceID),
+				stringOrDash(agentSkillsLabel(item.Skills)),
+				stringOrDash(item.Layer),
+				stringOrDash(agentShadowLayers(item.Shadows)),
+				stringOrDash(item.DefinitionDigest),
+				strconv.Itoa(len(item.Tools)),
+				stringOrDash(item.Permissions),
+			}
+		},
+		func(item AgentRecord) []string {
+			return []string{
+				item.Name,
+				item.Provider,
+				item.Model,
+				agentCategoryLabel(item.CategoryPath),
+				string(item.Origin),
+				item.WorkspaceID,
+				agentSkillsLabel(item.Skills),
+				item.Layer,
+				agentShadowLayers(item.Shadows),
+				item.DefinitionDigest,
+				strconv.Itoa(len(item.Tools)),
+				item.Permissions,
+			}
+		},
+	)
+}
+
+func agentBundle(record *AgentRecord) outputBundle {
+	// Render callbacks retain an owned snapshot of the response record.
+	snapshot := *record
+	item := &snapshot
+	return outputBundle{
+		jsonValue: item,
+		human: func() (string, error) {
+			return renderAgentHuman(item), nil
+		},
+		toon: func() (string, error) {
+			// Detail output emits tool names; list output keeps the table dense with tool_count.
+			header := renderToonObject(agentAgentKey, []string{
+				automationNameKey,
+				cliProviderKey,
+				agentCommandKey,
+				agentModelKey,
+				agentReasoningEffortField,
+				agentSpeedField,
+				agentACPOptionsField,
+				agentCategoryKey,
+				taskOriginKey,
+				automationWorkspaceIDKey,
+				agentDisabledSkillsKey,
+				"layer",
+				"shadows",
+				"definition_digest",
+				"tools",
+				configPermissionsKey,
+				"effective_permissions",
+				"effective_permissions_source",
+				clientToolsPromptKey,
+			}, []string{
+				item.Name,
+				item.Provider,
+				item.Command,
+				item.Model,
+				string(item.ReasoningEffort),
+				string(item.Speed),
+				agentACPOptionsLabel(item.ACPOptions),
+				agentCategoryLabel(item.CategoryPath),
+				string(item.Origin),
+				item.WorkspaceID,
+				agentSkillsLabel(item.Skills),
+				item.Layer,
+				agentShadowLayers(item.Shadows),
+				item.DefinitionDigest,
+				strings.Join(item.Tools, "|"),
+				item.Permissions,
+				agentEffectivePermissions(item),
+				agentEffectivePermissionsSource(item),
+				item.Prompt,
+			})
+			return renderHumanBlocks(header, renderToonArray(
+				"fallback_chain",
+				[]string{
+					cliProviderKey,
+					agentModelKey,
+					agentReasoningEffortField,
+					agentSpeedField,
+					agentACPOptionsField,
+					agentCommandKey,
+					"command_fingerprint",
+				},
+				agentFallbackChainToonRows(item.FallbackChain),
+			), renderAgentEnvironment(item, true)), nil
+		},
+	}
+}
+
+// renderAgentHuman renders the human detail view of one agent.
+func renderAgentHuman(item *AgentRecord) string {
+	base := renderHumanSection("Agent", []keyValue{
+		{Label: automationNameValue, Value: stringOrDash(item.Name)},
+		{Label: "Display name", Value: stringOrDash(item.Label)},
+		{Label: extensionMarketplaceDescriptionValue, Value: stringOrDash(item.Description)},
+		{Label: cliOutputKindValue, Value: stringOrDash(item.Kind)},
+		{Label: agentKernelProviderValue, Value: stringOrDash(item.Provider)},
+		{Label: cliCommandValue, Value: stringOrDash(item.Command)},
+		{Label: agentKernelModelValue, Value: stringOrDash(item.Model)},
+		{Label: agentReasoningEffortValue, Value: stringOrDash(string(item.ReasoningEffort))},
+		{Label: agentSpeedValue, Value: stringOrDash(string(item.Speed))},
+		{Label: agentACPOptionsValue, Value: stringOrDash(agentACPOptionsLabel(item.ACPOptions))},
+		{Label: agentCategoryValue, Value: stringOrDash(agentCategoryLabel(item.CategoryPath))},
+		{Label: taskOriginValue, Value: stringOrDash(string(item.Origin))},
+		{Label: automationWorkspaceValue, Value: stringOrDash(item.WorkspaceID)},
+		{Label: "Disabled Skills", Value: stringOrDash(agentSkillsLabel(item.Skills))},
+		{Label: "Layer", Value: stringOrDash(item.Layer)},
+		{Label: "Shadows", Value: stringOrDash(agentShadowLayers(item.Shadows))},
+		{Label: "Definition Digest", Value: stringOrDash(item.DefinitionDigest)},
+		{Label: toolOperatorToolsValue, Value: stringOrDash(strings.Join(item.Tools, ", "))},
+		{Label: installPermissionsValue, Value: stringOrDash(item.Permissions)},
+		{Label: "Effective permissions", Value: agentEffectivePermissionsLabel(item)},
+		{Label: "workspace_access", Value: stringOrDash(item.WorkspaceAccess)},
+	})
+
+	servers := make([][]string, 0, len(item.MCPServers))
+	for _, server := range item.MCPServers {
+		servers = append(servers, []string{
+			stringOrDash(server.Name),
+			stringOrDash(server.Command),
+			stringOrDash(strings.Join(server.Args, " ")),
+		})
+	}
+	mcp := renderHumanTable("MCP Servers", []string{automationNameValue, cliCommandValue, "Args"}, servers)
+	fallbackChain := ""
+	if len(item.FallbackChain) > 0 {
+		fallbackChain = renderHumanTable(
+			"Fallback Chain",
+			[]string{
+				agentKernelProviderValue,
+				agentKernelModelValue,
+				agentReasoningEffortValue,
+				cliCommandValue,
+			},
+			agentFallbackChainRows(item.FallbackChain),
+		)
+	}
+	prompt := renderHumanSection(
+		"Prompt",
+		[]keyValue{{Label: agentBodyValue, Value: stringOrDash(item.Prompt)}},
+	)
+	return renderHumanBlocks(base, mcp, fallbackChain, renderAgentEnvironment(item, false), prompt)
+}
+
+func renderAgentEnvironment(item *AgentRecord, toon bool) string {
+	if item.EffectiveRuntime == nil || len(item.EffectiveRuntime.SessionEnvStatus) == 0 {
+		return ""
+	}
+	rows := make([][]string, 0, len(item.EffectiveRuntime.SessionEnvStatus))
+	for _, status := range item.EffectiveRuntime.SessionEnvStatus {
+		rows = append(rows, []string{
+			status.Name, status.SecretRef, status.Source,
+			strconv.FormatBool(status.Present), strconv.FormatBool(status.Required),
+		})
+	}
+	if toon {
+		return renderToonArray(
+			"session_env",
+			[]string{"name", "ref", cmdPaletteSourceFlag, "present", "required"},
+			rows,
+		)
+	}
+	return renderHumanTable(
+		"Session Environment",
+		[]string{automationNameValue, "Reference", authoredContextSourceValue, "Present", outputRequiredValue},
+		rows,
+	)
+}
+
+func agentShadowLayers(shadows []contract.AgentDefinitionShadowPayload) string {
+	layers := make([]string, 0, len(shadows))
+	for _, shadow := range shadows {
+		if layer := strings.TrimSpace(shadow.Layer); layer != "" {
+			layers = append(layers, layer)
+		}
+	}
+	return strings.Join(layers, ", ")
+}
+
+func agentCategoryLabel(path []string) string {
+	if len(path) == 0 {
+		return ""
+	}
+	// AGENT.md category paths render as a single space-delimited CLI path.
+	return strings.Join(path, " / ")
+}
+
+func agentSkillsLabel(skills *contract.CreateAgentSkillsConfig) string {
+	if skills == nil {
+		return ""
+	}
+	return strings.Join(skills.Disabled, ", ")
+}
+
+// agentEffectivePermissionsLabel shows the level a new session starts at and which layer set it.
+func agentEffectivePermissionsLabel(item *AgentRecord) string {
+	level := agentEffectivePermissions(item)
+	if level == "" {
+		return "-"
+	}
+	if source := agentEffectivePermissionsSource(item); source != "" {
+		return level + " (" + source + ")"
+	}
+	return level
+}
+
+func agentEffectivePermissions(item *AgentRecord) string {
+	if item.EffectiveRuntime == nil {
+		return ""
+	}
+	return item.EffectiveRuntime.Permissions
+}
+
+func agentEffectivePermissionsSource(item *AgentRecord) string {
+	if item.EffectiveRuntime == nil {
+		return ""
+	}
+	return string(item.EffectiveRuntime.Sources.Permissions)
+}

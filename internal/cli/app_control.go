@@ -1,0 +1,209 @@
+package cli
+
+import (
+	"bufio"
+	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"net"
+	"os"
+	"path/filepath"
+	"strings"
+	"time"
+
+	compozyconfig "github.com/compozy/compozy/internal/config"
+)
+
+const (
+	appControlSchemaVersion = 1
+	appControlTimeout       = 2 * time.Second
+	appControlLongTimeout   = 2 * time.Minute
+)
+
+type appControlCaller func(context.Context, string, string, any) (any, error)
+
+type appControlRequest struct {
+	SchemaVersion int    `json:"schema_version"`
+	ID            int    `json:"id"`
+	Token         string `json:"token"`
+	Method        string `json:"method"`
+	Params        any    `json:"params,omitempty"`
+}
+
+type appControlResponse struct {
+	SchemaVersion int                     `json:"schema_version"`
+	ID            int                     `json:"id"`
+	Result        json.RawMessage         `json:"result,omitempty"`
+	Error         *appCommandErrorPayload `json:"error,omitzero"`
+}
+
+func appControlRunning(
+	ctx context.Context,
+	homePaths compozyconfig.HomePaths,
+	deps commandDeps,
+) (bool, error) {
+	running, _, err := appControlPresence(ctx, homePaths, deps)
+	return running, err
+}
+
+func appControlPresence(
+	ctx context.Context,
+	homePaths compozyconfig.HomePaths,
+	deps commandDeps,
+) (bool, string, error) {
+	result, err := deps.callAppControl(
+		ctx,
+		filepath.Join(homePaths.HomeDir, "app.sock"),
+		appDiagnoseMethod,
+		map[string]any{},
+	)
+	if err == nil {
+		version := ""
+		if fields, ok := result.(map[string]any); ok {
+			if observedVersion, ok := fields[appVersionKey].(string); ok {
+				version = observedVersion
+			}
+		}
+		return true, version, nil
+	}
+	appErr, ok := errors.AsType[*appCommandError](err)
+	if ok && (appErr.code == appNotRunningCode || appErr.code == appControlUnavailableCode) {
+		return false, "", nil
+	}
+	return false, "", fmt.Errorf("app: probe control channel: %w", err)
+}
+
+func callAppControl(ctx context.Context, socketPath string, method string, params any) (any, error) {
+	if ctx == nil {
+		return nil, errors.New("app control: context is required")
+	}
+	if _, err := os.Stat(socketPath); err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return nil, newAppCommandError(
+				appNotRunningCode,
+				"the CompozyOS desktop app is not running",
+				err,
+			)
+		}
+		return nil, fmt.Errorf("app control: inspect socket: %w", err)
+	}
+	token, err := readAppControlToken(socketPath)
+	if err != nil {
+		return nil, newAppCommandError(
+			appControlUnavailableCode,
+			"the CompozyOS desktop app control channel is unavailable",
+			err,
+		)
+	}
+
+	timeout := appControlTimeoutForMethod(method)
+	callCtx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
+	connection, err := (&net.Dialer{}).DialContext(callCtx, "unix", socketPath)
+	if err != nil {
+		return nil, newAppCommandError(
+			appControlUnavailableCode,
+			"the CompozyOS desktop app control channel is unavailable",
+			err,
+		)
+	}
+	if deadline, ok := callCtx.Deadline(); ok {
+		if err := connection.SetDeadline(deadline); err != nil {
+			return nil, closeAppControlAfterError(
+				connection,
+				fmt.Errorf("app control: set deadline: %w", err),
+			)
+		}
+	}
+
+	request := appControlRequest{
+		SchemaVersion: appControlSchemaVersion,
+		ID:            1,
+		Token:         token,
+		Method:        method,
+		Params:        params,
+	}
+	return exchangeAppControl(connection, request)
+}
+
+func appControlTimeoutForMethod(method string) time.Duration {
+	if method == appExportDiagnosticsMethod || method == appRetryMethod {
+		return appControlLongTimeout
+	}
+	return appControlTimeout
+}
+
+func readAppControlToken(socketPath string) (string, error) {
+	tokenPath := filepath.Join(filepath.Dir(socketPath), "app.token")
+	info, err := os.Stat(tokenPath)
+	if err != nil {
+		return "", fmt.Errorf("app control: inspect token: %w", err)
+	}
+	if info.Size() <= 0 || info.Size() > 4096 {
+		return "", errors.New("app control: token size is invalid")
+	}
+	data, err := os.ReadFile(tokenPath)
+	if err != nil {
+		return "", fmt.Errorf("app control: read token: %w", err)
+	}
+	token := strings.TrimSpace(string(data))
+	if token == "" {
+		return "", errors.New("app control: token is empty")
+	}
+	return token, nil
+}
+
+func exchangeAppControl(connection net.Conn, request appControlRequest) (any, error) {
+	if err := json.NewEncoder(connection).Encode(request); err != nil {
+		return nil, newAppCommandError(
+			appControlUnavailableCode,
+			"the CompozyOS desktop app control channel did not accept the request",
+			closeAppControlAfterError(connection, err),
+		)
+	}
+	var response appControlResponse
+	if err := json.NewDecoder(bufio.NewReader(connection)).Decode(&response); err != nil {
+		return nil, newAppCommandError(
+			appControlUnavailableCode,
+			"the CompozyOS desktop app control channel did not respond",
+			closeAppControlAfterError(connection, err),
+		)
+	}
+	if err := connection.Close(); err != nil {
+		return nil, newAppCommandError(
+			appControlUnavailableCode,
+			"the CompozyOS desktop app control channel did not close cleanly",
+			err,
+		)
+	}
+	if response.SchemaVersion != appControlSchemaVersion || response.ID != request.ID {
+		return nil, newAppCommandError(
+			appControlUnavailableCode,
+			"the CompozyOS desktop app control response is incompatible",
+			nil,
+		)
+	}
+	if response.Error != nil {
+		return nil, newAppCommandError(response.Error.Code, response.Error.Message, nil)
+	}
+	if len(response.Result) == 0 {
+		return map[string]any{"ok": true}, nil
+	}
+	var result any
+	if err := json.Unmarshal(response.Result, &result); err != nil {
+		return nil, newAppCommandError(
+			appControlUnavailableCode,
+			"the CompozyOS desktop app returned an invalid control response",
+			err,
+		)
+	}
+	return result, nil
+}
+
+func closeAppControlAfterError(connection net.Conn, cause error) error {
+	if closeErr := connection.Close(); closeErr != nil {
+		return errors.Join(cause, closeErr)
+	}
+	return cause
+}

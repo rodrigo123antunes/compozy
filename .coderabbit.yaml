@@ -9,23 +9,38 @@ reviews:
   collapse_walkthrough: false
   sequence_diagrams: true
   profile: "chill"
+  auto_review:
+    base_branches:
+      - "stack/.*"
   path_filters:
+    - "!docs/design/**/*"
     - "!**/*.md"
+    - "!**/*.mdx"
     - "!**/*.yaml"
     - "!**/*.yml"
     - "!**/*.json"
     - "!**/*.toml"
     - "!**/*.xml"
     - "!**/*.mdc"
-    - "!**/*.mdx"
+    - "!**/*.lock"
+    - "!**/*.sum"
     - "!.cursor/**"
     - "!.git/**"
     - "!.claude/**"
+    - "!.codex/**"
+    - "!.compozy/**"
     - "!.vscode/**"
     - "!.agents/**"
     - "!.taskmaster/**"
     - "!**/fixtures/**"
     - "!test/testdata/**"
+    # Generated / binary artifacts — gated by `make codegen-check`, not line-reviewable
+    - "!**/generated/**"
+    - "!**/*.d.ts"
+    - "!**/*.gz"
+    # Storybook fixtures + Playwright harness — verified by capture/e2e, not code review
+    - "!**/*.stories.tsx"
+    - "!web/e2e/**"
   path_instructions:
     - path: "**/*_test.go"
       instructions: |-

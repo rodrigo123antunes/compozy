@@ -1,0 +1,133 @@
+// Package testutil provides shared test helpers for internal packages.
+package testutil
+
+import (
+	"context"
+	"fmt"
+	"net"
+	"os"
+	"slices"
+	"sync"
+	"sync/atomic"
+	"testing"
+	"time"
+)
+
+const defaultTimeout = 45 * time.Second
+
+var (
+	tcpPortCounter       atomic.Uint32
+	tcpPortReservationMu sync.Mutex
+	tcpPortReservations  = make(map[int]struct{})
+)
+
+// Context inherits test cancellation and provides a fresh timeout during cleanup.
+func Context(t testing.TB) context.Context {
+	t.Helper()
+
+	parent := t.Context()
+	if parent.Err() != nil {
+		// Cleanup callbacks need a fresh timeout after the test context is canceled.
+		parent = context.WithoutCancel(parent)
+	}
+	ctx, cancel := context.WithTimeout(parent, defaultTimeout)
+	t.Cleanup(cancel)
+	return ctx
+}
+
+// EqualStringSlices reports whether two string slices have equal contents.
+func EqualStringSlices(left, right []string) bool {
+	return slices.Equal(left, right)
+}
+
+// FreeTCPPort returns an available localhost TCP port chosen from a
+// per-process pseudo-random walk through a high, non-default port range. The
+// listener is closed before returning, so callers still need to bind quickly,
+// but this avoids repeated reuse of the same ephemeral port under parallel
+// package execution.
+func FreeTCPPort(t testing.TB) int {
+	t.Helper()
+
+	const (
+		minPort = 20000
+		// Keep test allocations below the default Linux and macOS ephemeral ranges.
+		portSpan    = 10000
+		maxAttempts = portSpan
+	)
+
+	pid := os.Getpid()
+	if pid < 0 {
+		t.Fatalf("os.Getpid() = %d, want non-negative pid", pid)
+	}
+
+	listenerContext, cancel := context.WithTimeout(t.Context(), time.Second)
+	defer cancel()
+
+	listenConfig := net.ListenConfig{}
+	seed := int64(pid)*131 + int64(tcpPortCounter.Add(1))
+	start := int(seed % int64(portSpan))
+	for attempt := range maxAttempts {
+		port := minPort + ((start + attempt) % portSpan)
+		reachable, err := tcpPortReachable(listenerContext, port)
+		if err != nil {
+			t.Fatalf("probe localhost TCP port %d: %v", port, err)
+		}
+		if reachable {
+			continue
+		}
+		ln, err := listenConfig.Listen(listenerContext, "tcp", fmt.Sprintf("127.0.0.1:%d", port))
+		if err != nil {
+			continue
+		}
+		if !reserveTCPPort(port) {
+			if err := ln.Close(); err != nil {
+				t.Fatalf("net.Listener.Close(%d) error = %v", port, err)
+			}
+			continue
+		}
+		if err := ln.Close(); err != nil {
+			releaseTCPPort(port)
+			t.Fatalf("net.Listener.Close(%d) error = %v", port, err)
+		}
+		t.Cleanup(func() {
+			releaseTCPPort(port)
+		})
+		return port
+	}
+
+	t.Fatal("FreeTCPPort() exhausted candidate range")
+	return 0
+}
+
+func tcpPortReachable(ctx context.Context, port int) (bool, error) {
+	dialer := net.Dialer{Timeout: 20 * time.Millisecond}
+	connection, err := dialer.DialContext(ctx, "tcp", fmt.Sprintf("127.0.0.1:%d", port))
+	if err != nil {
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return false, fmt.Errorf("dial localhost TCP port: %w", ctxErr)
+		}
+		return false, nil
+	}
+	if err := connection.Close(); err != nil {
+		return true, fmt.Errorf("close TCP port probe: %w", err)
+	}
+	return true, nil
+}
+
+func reserveTCPPort(port int) bool {
+	tcpPortReservationMu.Lock()
+	defer tcpPortReservationMu.Unlock()
+
+	if _, ok := tcpPortReservations[port]; ok {
+		return false
+	}
+	tcpPortReservations[port] = struct{}{}
+	return true
+}
+
+func releaseTCPPort(port int) {
+	tcpPortReservationMu.Lock()
+	defer tcpPortReservationMu.Unlock()
+
+	delete(tcpPortReservations, port)
+}

@@ -1,0 +1,325 @@
+package cli
+
+import (
+	"cmp"
+	"errors"
+	"fmt"
+	"strings"
+
+	"github.com/compozy/compozy/internal/api/contract"
+	taskpkg "github.com/compozy/compozy/internal/task"
+	"github.com/spf13/cobra"
+)
+
+const taskLoopColumn = "LOOP"
+
+type taskListOptions struct {
+	allWorkspaces bool
+	scopeRaw      string
+	workspaceRef  string
+	statusRaw     string
+	priorityRaw   string
+	ownerKindRaw  string
+	ownerRef      string
+	parentTaskID  string
+	worktreeID    string
+	includeLoop   bool
+	loopRunID     string
+	queryRaw      string
+	sortRaw       string
+	cursor        string
+	limit         int
+}
+
+func newTaskListCommand(deps commandDeps) *cobra.Command {
+	opts := &taskListOptions{}
+	cmd := &cobra.Command{
+		Use:   taskListKey,
+		Short: "List tasks",
+		Args:  cobra.NoArgs,
+		RunE: func(cmd *cobra.Command, _ []string) error {
+			return opts.run(cmd, deps)
+		},
+	}
+	addTaskListFlags(cmd, opts)
+	configureProfileReadCommand(cmd, deps)
+	return cmd
+}
+
+func (o *taskListOptions) run(cmd *cobra.Command, deps commandDeps) error {
+	if o.allWorkspaces {
+		if cmd.Flags().Changed("workspace") {
+			return errors.New("cli: --all-workspaces and --workspace are mutually exclusive")
+		}
+		if cmd.Flags().Changed("scope") && strings.TrimSpace(o.scopeRaw) != cliAllValue {
+			return errors.New("cli: --all-workspaces conflicts with --scope")
+		}
+		o.scopeRaw = cliAllValue
+	}
+	client, err := clientFromDeps(deps)
+	if err != nil {
+		return err
+	}
+	query, err := parseTaskListFilters(
+		cmd,
+		deps,
+		client,
+		o.scopeRaw,
+		o.workspaceRef,
+		o.statusRaw,
+		o.priorityRaw,
+		o.ownerKindRaw,
+		o.ownerRef,
+		o.parentTaskID,
+		o.worktreeID,
+		o.includeLoop,
+		o.loopRunID,
+		o.queryRaw,
+		o.sortRaw,
+		o.cursor,
+		o.limit,
+	)
+	if err != nil {
+		return err
+	}
+	query.AllWorkspaces = o.allWorkspaces
+	page, err := client.ListTasks(cmd.Context(), query)
+	if err != nil {
+		return err
+	}
+	format, err := resolveOutputFormat(cmd)
+	if err != nil {
+		return err
+	}
+	if o.allWorkspaces && format == OutputHuman {
+		workspaces, err := client.ListWorkspaces(cmd.Context())
+		if err != nil {
+			return err
+		}
+		names := make(map[string]string, len(workspaces))
+		for _, workspace := range workspaces {
+			names[workspace.ID] = workspace.Name
+		}
+		return writeCommandOutput(cmd, taskSummaryListBundleWithProjects(page, names))
+	}
+	return writeCommandOutput(cmd, taskSummaryListBundle(page))
+}
+
+func addTaskListFlags(cmd *cobra.Command, opts *taskListOptions) {
+	cmd.Flags().BoolVar(&opts.allWorkspaces, "all-workspaces", false, "List tasks across every project and User")
+	cmd.Flags().
+		StringVar(&opts.scopeRaw, taskScopeKey, "", "Filter by scope: user (aliases: @user, global) or workspace")
+	cmd.Flags().
+		StringVar(&opts.workspaceRef, "workspace", "", "Override workspace filter (ID, name, or path)")
+	cmd.Flags().StringVar(&opts.statusRaw, taskStatusKey, "", "Filter by task status")
+	cmd.Flags().StringVar(&opts.priorityRaw, "priority", "", "Filter by task priority")
+	cmd.Flags().StringVar(&opts.ownerKindRaw, "owner-kind", "", "Filter by owner kind")
+	cmd.Flags().StringVar(&opts.ownerRef, "owner-ref", "", "Filter by owner reference")
+	cmd.Flags().StringVar(&opts.parentTaskID, "parent", "", "Filter by parent task ID")
+	cmd.Flags().StringVar(&opts.worktreeID, "worktree", "", "Filter by active run worktree ID")
+	cmd.Flags().BoolVar(&opts.includeLoop, "include-loop", false, "Include Loop execution records")
+	cmd.Flags().StringVar(&opts.loopRunID, "loop-run", "", "Filter by Loop run ID")
+	cmd.Flags().StringVar(&opts.queryRaw, "query", "", "Search task title or identifier")
+	cmd.Flags().StringVar(&opts.sortRaw, "sort", "recent", "Sort by recent or priority")
+	cmd.Flags().StringVar(&opts.cursor, "cursor", "", "Continue from an opaque catalog cursor")
+	cmd.Flags().IntVar(&opts.limit, "limit", 0, "Maximum tasks to return (1-200)")
+}
+
+func parseTaskListFilters(
+	cmd *cobra.Command,
+	deps commandDeps,
+	client workspaceLookupClient,
+	scopeRaw string,
+	workspaceRef string,
+	statusRaw string,
+	priorityRaw string,
+	ownerKindRaw string,
+	ownerRef string,
+	parentTaskID string,
+	worktreeID string,
+	includeLoop bool,
+	loopRunID string,
+	queryRaw string,
+	sortRaw string,
+	cursor string,
+	limit int,
+) (TaskListQuery, error) {
+	catalogScope, workspace, err := resolveTaskListScopeWorkspace(cmd, deps, client, scopeRaw, workspaceRef)
+	if err != nil {
+		return TaskListQuery{}, err
+	}
+	status, err := parseOptionalTaskStatus(statusRaw)
+	if err != nil {
+		return TaskListQuery{}, err
+	}
+	var priority taskpkg.Priority
+	if strings.TrimSpace(priorityRaw) != "" {
+		priority, err = parseOptionalTaskPriority(priorityRaw)
+		if err != nil {
+			return TaskListQuery{}, err
+		}
+	}
+	ownerKind, err := parseOptionalTaskOwnerKind(ownerKindRaw)
+	if err != nil {
+		return TaskListQuery{}, err
+	}
+	trimmedOwnerRef := strings.TrimSpace(ownerRef)
+	if (ownerKind != "" && trimmedOwnerRef == "") || (ownerKind == "" && trimmedOwnerRef != "") {
+		return TaskListQuery{}, errors.New(
+			"cli: --owner-kind and --owner-ref must be provided together",
+		)
+	}
+	trimmedWorktreeID := strings.TrimSpace(worktreeID)
+	if trimmedWorktreeID != "" && strings.TrimSpace(workspace) == "" {
+		return TaskListQuery{}, errors.New("cli: --worktree requires a workspace scope or --workspace")
+	}
+	if err := validateTaskLast(limit); err != nil {
+		return TaskListQuery{}, err
+	}
+	sortKey := cmp.Or(
+		taskpkg.CatalogSort(strings.ToLower(strings.TrimSpace(sortRaw))).Normalize(),
+		taskpkg.CatalogSortRecent,
+	)
+	if sortKey != taskpkg.CatalogSortRecent && sortKey != taskpkg.CatalogSortPriority {
+		return TaskListQuery{}, errors.New("cli: --sort must be recent or priority")
+	}
+	return TaskListQuery{
+		Scope:        catalogScope,
+		Workspace:    workspace,
+		Status:       status,
+		Priority:     priority,
+		OwnerKind:    ownerKind,
+		OwnerRef:     trimmedOwnerRef,
+		ParentTaskID: strings.TrimSpace(parentTaskID),
+		Worktree:     trimmedWorktreeID,
+		IncludeLoop:  includeLoop || strings.TrimSpace(loopRunID) != "",
+		LoopRunID:    strings.TrimSpace(loopRunID),
+		Query:        strings.TrimSpace(queryRaw),
+		Sort:         sortKey,
+		Cursor:       strings.TrimSpace(cursor),
+		Limit:        limit,
+	}, nil
+}
+
+func resolveTaskListScopeWorkspace(
+	cmd *cobra.Command,
+	deps commandDeps,
+	client workspaceLookupClient,
+	scopeRaw string,
+	workspaceRef string,
+) (taskpkg.CatalogScope, string, error) {
+	if strings.TrimSpace(strings.ToLower(scopeRaw)) != string(taskpkg.CatalogScopeAll) {
+		scope, workspace, err := resolveTaskScopeWorkspace(cmd, deps, client, scopeRaw, workspaceRef, false)
+		return taskpkg.CatalogScope(scope), workspace, err
+	}
+	workspace := strings.TrimSpace(workspaceRef)
+	if workspace == "" {
+		return taskpkg.CatalogScopeAll, "", nil
+	}
+	resolution, err := resolveCommandWorkspace(
+		cmd.Context(),
+		cmd,
+		deps,
+		client,
+		workspaceResolutionRequest{FlagRef: workspace},
+	)
+	if err != nil {
+		return "", "", err
+	}
+	return taskpkg.CatalogScopeAll, resolution.ID, nil
+}
+
+func taskSummaryListBundle(page TaskListRecord) outputBundle {
+	return taskSummaryListBundleWithProjects(page, nil)
+}
+
+func taskSummaryListBundleWithProjects(page TaskListRecord, names map[string]string) outputBundle {
+	workspaceHeader := strings.ToUpper(taskWorkspaceValue)
+	if names != nil {
+		workspaceHeader = cliProjectHeader
+	}
+	projectLabel := func(id string) string {
+		if names == nil {
+			return stringOrDash(id)
+		}
+		if id == "" {
+			return cliUserScopeLabel
+		}
+		return cmp.Or(names[id], id)
+	}
+	return listBundle(
+		page,
+		page.Tasks,
+		"Tasks",
+		[]string{
+			"ID",
+			cliProfileHeader,
+			strings.ToUpper(taskIdentifierValue),
+			strings.ToUpper(taskScopeValue),
+			workspaceHeader,
+			strings.ToUpper(taskParentValue),
+			strings.ToUpper(taskStatusValue),
+			strings.ToUpper(taskOwnerValue),
+			taskLoopColumn,
+			strings.ToUpper(taskTitleValue),
+		},
+		"tasks",
+		[]string{
+			"id",
+			profileNameOutputKey,
+			taskIdentifierKey,
+			taskScopeKey,
+			taskWorkspaceIDKey,
+			"parent_task_id",
+			taskStatusKey,
+			taskOwnerKey,
+			loopLoopKey,
+			taskTitleKey,
+		},
+		func(item TaskCatalogItemRecord) []string {
+			return []string{
+				stringOrDash(item.ID),
+				stringOrDash(item.ProfileName),
+				stringOrDash(item.Identifier),
+				stringOrDash(string(item.Scope)),
+				projectLabel(item.WorkspaceID),
+				stringOrDash(item.ParentTaskID),
+				stringOrDash(string(item.Status)),
+				stringOrDash(formatTaskOwnership(item.Owner)),
+				stringOrDash(formatTaskLoopProvenance(item.Loop)),
+				stringOrDash(item.Title),
+			}
+		},
+		func(item TaskCatalogItemRecord) []string {
+			return []string{
+				item.ID,
+				item.ProfileName,
+				item.Identifier,
+				string(item.Scope),
+				item.WorkspaceID,
+				item.ParentTaskID,
+				string(item.Status),
+				formatTaskOwnership(item.Owner),
+				formatTaskLoopProvenance(item.Loop),
+				item.Title,
+			}
+		},
+	)
+}
+
+func formatTaskLoopProvenance(provenance *contract.LoopProvenance) string {
+	if provenance == nil {
+		return ""
+	}
+	identity := cmp.Or(strings.TrimSpace(provenance.LoopName), strings.TrimSpace(provenance.RunID))
+	suffix := taskLoopCoordinatorLabel
+	if provenance.Role == contract.LoopProvenanceRoleCell {
+		suffix = "cell"
+		if provenance.Generation != nil {
+			suffix = fmt.Sprintf("g%d", *provenance.Generation)
+		}
+	}
+	return identity + " · " + suffix
+}
+
+const taskLoopCoordinatorLabel = "run"

@@ -1,0 +1,4085 @@
+//go:build integration
+
+package udsapi
+
+import (
+	"archive/tar"
+	"bytes"
+	"compress/gzip"
+	"context"
+	"crypto/sha256"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"io"
+	"net/http"
+	"net/http/httptest"
+	"net/url"
+	"os"
+	"path/filepath"
+	"reflect"
+	"runtime"
+	"slices"
+	"strings"
+	"testing"
+	"time"
+
+	"github.com/compozy/compozy/internal/agentidentity"
+	compozycontract "github.com/compozy/compozy/internal/api/contract"
+	apispec "github.com/compozy/compozy/internal/api/spec"
+	apitestutil "github.com/compozy/compozy/internal/api/testutil"
+	automationpkg "github.com/compozy/compozy/internal/automation"
+	compozyconfig "github.com/compozy/compozy/internal/config"
+	"github.com/compozy/compozy/internal/resources"
+	"github.com/compozy/compozy/internal/session"
+	"github.com/compozy/compozy/internal/store"
+	"github.com/compozy/compozy/internal/testutil/acpmock"
+	e2etest "github.com/compozy/compozy/internal/testutil/e2e"
+	transcriptpkg "github.com/compozy/compozy/internal/transcript"
+	"github.com/compozy/compozy/internal/windowmanager"
+)
+
+const (
+	transportUDSApprovalAgent    = "transport-uds-approver"
+	transportUDSAutoTitleAgent   = "transport-uds-auto-title"
+	transportUDSAutomationAgent  = "transport-uds-automation-runner"
+	transportUDSFaultyAgent      = "transport-uds-faulty-runner"
+	transportUDSObserveAgent     = "transport-uds-observe"
+	transportUDSOverrideProvider = "qa-transport-override"
+)
+
+func TestUDSTransportSessionOwnerProjectionMatchesHTTP(t *testing.T) {
+	acpmock.RequireDriver(t)
+	t.Parallel()
+
+	t.Run("Should return the same minimal session owner over HTTP and UDS", func(t *testing.T) {
+		t.Parallel()
+
+		runtimeHarness := e2etest.StartRuntimeHarness(t, &e2etest.RuntimeHarnessOptions{
+			MockAgents: []e2etest.MockAgentSpec{{
+				FixturePath:  transportMockFixturePath(t, "automation_task_fixture.json"),
+				FixtureAgent: "automation-runner",
+				AgentName:    transportUDSAutomationAgent,
+			}},
+		})
+
+		ctx, cancel := context.WithTimeout(t.Context(), 20*time.Second)
+		defer cancel()
+
+		sessionPayload, err := runtimeHarness.CreateSession(ctx, compozycontract.CreateSessionRequest{
+			AgentName:     transportUDSAutomationAgent,
+			WorkspacePath: runtimeHarness.WorkspaceRoot,
+		})
+		if err != nil {
+			t.Fatalf("CreateSession() error = %v", err)
+		}
+		sessionPayload = waitForTransportSessionActive(t, ctx, runtimeHarness, sessionPayload)
+
+		clients, err := runtimeHarness.TransportClients()
+		if err != nil {
+			t.Fatalf("TransportClients() error = %v", err)
+		}
+		path := "/api/sessions/" + url.PathEscape(sessionPayload.ID) + "/owner"
+		httpResponse := mustUnixRequest(t, clients.HTTPClient, http.MethodGet, runtimeHarness.HTTPURL(path), nil, nil)
+		udsResponse := mustUnixRequest(t, clients.UDSClient, http.MethodGet, runtimeHarness.UDSURL(path), nil, nil)
+		httpBody := readAndCloseHTTPBody(t, httpResponse)
+		udsBody := readAndCloseHTTPBody(t, udsResponse)
+
+		if httpResponse.StatusCode != http.StatusOK || udsResponse.StatusCode != http.StatusOK {
+			t.Fatalf(
+				"owner status parity = HTTP %d / UDS %d, want %d; bodies=%s / %s",
+				httpResponse.StatusCode,
+				udsResponse.StatusCode,
+				http.StatusOK,
+				httpBody,
+				udsBody,
+			)
+		}
+		if !bytes.Equal(httpBody, udsBody) {
+			t.Fatalf("owner payloads differ: HTTP=%s UDS=%s", httpBody, udsBody)
+		}
+
+		var fields map[string]json.RawMessage
+		if err := json.Unmarshal(httpBody, &fields); err != nil {
+			t.Fatalf("json.Unmarshal(owner fields) error = %v; body=%s", err, httpBody)
+		}
+		if len(fields) != 3 || fields["session_id"] == nil || fields["workspace_id"] == nil ||
+			fields["workspace_name"] == nil {
+			t.Fatalf("owner fields = %v, want exactly session_id workspace_id workspace_name", fields)
+		}
+
+		var owner compozycontract.SessionOwner
+		if err := json.Unmarshal(httpBody, &owner); err != nil {
+			t.Fatalf("json.Unmarshal(owner) error = %v", err)
+		}
+		if owner.SessionID != sessionPayload.ID || owner.WorkspaceID != sessionPayload.WorkspaceID ||
+			strings.TrimSpace(owner.WorkspaceName) == "" {
+			t.Fatalf(
+				"owner = %#v, want session %q workspace %q and non-empty name",
+				owner,
+				sessionPayload.ID,
+				sessionPayload.WorkspaceID,
+			)
+		}
+	})
+}
+
+func TestUDSTransportSessionCommandsProjectionMatchesHTTP(t *testing.T) {
+	acpmock.RequireDriver(t)
+	t.Parallel()
+
+	t.Run("Should return the same session command catalog and workspace fence over HTTP and UDS", func(t *testing.T) {
+		t.Parallel()
+
+		runtimeHarness := e2etest.StartRuntimeHarness(t, &e2etest.RuntimeHarnessOptions{
+			MockAgents: []e2etest.MockAgentSpec{{
+				FixturePath:  transportMockFixturePath(t, "automation_task_fixture.json"),
+				FixtureAgent: "automation-runner",
+				AgentName:    transportUDSAutomationAgent,
+			}},
+		})
+
+		ctx, cancel := context.WithTimeout(t.Context(), 20*time.Second)
+		defer cancel()
+
+		created, err := runtimeHarness.CreateSession(ctx, compozycontract.CreateSessionRequest{
+			AgentName:     transportUDSAutomationAgent,
+			WorkspacePath: runtimeHarness.WorkspaceRoot,
+		})
+		if err != nil {
+			t.Fatalf("CreateSession() error = %v", err)
+		}
+		created = waitForTransportSessionActive(t, ctx, runtimeHarness, created)
+
+		clients, err := runtimeHarness.TransportClients()
+		if err != nil {
+			t.Fatalf("TransportClients() error = %v", err)
+		}
+		path := transportHarnessSessionPath(t, runtimeHarness, created.ID, "/commands")
+		httpResponse := mustUnixRequest(t, clients.HTTPClient, http.MethodGet, runtimeHarness.HTTPURL(path), nil, nil)
+		udsResponse := mustUnixRequest(t, clients.UDSClient, http.MethodGet, runtimeHarness.UDSURL(path), nil, nil)
+		httpBody := readAndCloseHTTPBody(t, httpResponse)
+		udsBody := readAndCloseHTTPBody(t, udsResponse)
+		if httpResponse.StatusCode != http.StatusOK || udsResponse.StatusCode != http.StatusOK {
+			t.Fatalf(
+				"session commands status parity = HTTP %d / UDS %d, want %d; bodies=%s / %s",
+				httpResponse.StatusCode,
+				udsResponse.StatusCode,
+				http.StatusOK,
+				httpBody,
+				udsBody,
+			)
+		}
+		if !jsonEqual(httpBody, udsBody) {
+			t.Fatalf("session commands payloads differ: HTTP=%s UDS=%s", httpBody, udsBody)
+		}
+
+		var catalog compozycontract.SessionCommandsResponse
+		if err := json.Unmarshal(httpBody, &catalog); err != nil {
+			t.Fatalf("json.Unmarshal(session commands) error = %v; body=%s", err, httpBody)
+		}
+		if strings.TrimSpace(catalog.Revision) == "" || len(catalog.Commands) == 0 {
+			t.Fatalf("session commands catalog = %#v, want non-empty revision and commands", catalog)
+		}
+		for _, command := range catalog.Commands {
+			if strings.Contains(command.Source.Key, string(filepath.Separator)) ||
+				strings.Contains(command.Source.Key, "/") {
+				t.Fatalf("session command source key = %q, want path-free identity", command.Source.Key)
+			}
+		}
+
+		foreignPath := "/api/workspaces/foreign-workspace/sessions/" + url.PathEscape(created.ID) + "/commands"
+		httpForeign := mustUnixRequest(
+			t,
+			clients.HTTPClient,
+			http.MethodGet,
+			runtimeHarness.HTTPURL(foreignPath),
+			nil,
+			nil,
+		)
+		udsForeign := mustUnixRequest(
+			t,
+			clients.UDSClient,
+			http.MethodGet,
+			runtimeHarness.UDSURL(foreignPath),
+			nil,
+			nil,
+		)
+		httpForeignBody := readAndCloseHTTPBody(t, httpForeign)
+		udsForeignBody := readAndCloseHTTPBody(t, udsForeign)
+		if httpForeign.StatusCode != http.StatusNotFound || udsForeign.StatusCode != http.StatusNotFound {
+			t.Fatalf(
+				"foreign session commands status parity = HTTP %d / UDS %d, want %d; bodies=%s / %s",
+				httpForeign.StatusCode,
+				udsForeign.StatusCode,
+				http.StatusNotFound,
+				httpForeignBody,
+				udsForeignBody,
+			)
+		}
+		if !jsonEqual(httpForeignBody, udsForeignBody) {
+			t.Fatalf("foreign session commands errors differ: HTTP=%s UDS=%s", httpForeignBody, udsForeignBody)
+		}
+	})
+}
+
+func TestUDSTransportSkillProjectionAndExposureErrorsMatchHTTP(t *testing.T) {
+	acpmock.RequireDriver(t)
+	t.Parallel()
+
+	runtimeHarness := e2etest.StartRuntimeHarness(t, &e2etest.RuntimeHarnessOptions{})
+	clients, err := runtimeHarness.TransportClients()
+	if err != nil {
+		t.Fatalf("TransportClients() error = %v", err)
+	}
+	tests := []struct {
+		name       string
+		method     string
+		path       string
+		body       []byte
+		wantStatus int
+	}{
+		{name: "list fields", method: http.MethodGet, path: "/api/skills", wantStatus: http.StatusOK},
+		{name: "detail fields", method: http.MethodGet, path: "/api/skills/compozy", wantStatus: http.StatusOK},
+		{name: "expose refusal", method: http.MethodPost, path: "/api/skills/compozy/expose",
+			body: []byte(`{"targets":["agents"]}`), wantStatus: http.StatusConflict},
+		{name: "unexpose refusal", method: http.MethodPost, path: "/api/skills/compozy/unexpose",
+			body: []byte(`{"targets":["agents"]}`), wantStatus: http.StatusConflict},
+	}
+	for _, test := range tests {
+		t.Run("Should preserve "+test.name, func(t *testing.T) {
+			t.Parallel()
+			httpResponse := mustUnixRequest(
+				t, clients.HTTPClient, test.method, runtimeHarness.HTTPURL(test.path), test.body, nil,
+			)
+			udsResponse := mustUnixRequest(
+				t, clients.UDSClient, test.method, runtimeHarness.UDSURL(test.path), test.body, nil,
+			)
+			httpBody := readAndCloseHTTPBody(t, httpResponse)
+			udsBody := readAndCloseHTTPBody(t, udsResponse)
+			if httpResponse.StatusCode != test.wantStatus || udsResponse.StatusCode != test.wantStatus {
+				t.Fatalf(
+					"skill status parity = HTTP %d / UDS %d, want %d; bodies=%s / %s",
+					httpResponse.StatusCode, udsResponse.StatusCode, test.wantStatus, httpBody, udsBody,
+				)
+			}
+			if !jsonEqual(httpBody, udsBody) {
+				t.Fatalf("skill payload parity differs: HTTP=%s UDS=%s", httpBody, udsBody)
+			}
+			var fields map[string]json.RawMessage
+			if err := json.Unmarshal(httpBody, &fields); err != nil {
+				t.Fatalf("json.Unmarshal(skill parity fields) error = %v", err)
+			}
+			if test.wantStatus == http.StatusConflict {
+				var failure compozycontract.SkillExposureFailureResponse
+				if err := json.Unmarshal(httpBody, &failure); err != nil {
+					t.Fatalf("json.Unmarshal(skill exposure failure) error = %v", err)
+				}
+				if failure.Error.Code != "expose_failed" || len(failure.Results) != 1 {
+					t.Fatalf("skill exposure failure = %#v", failure)
+				}
+				return
+			}
+			if test.path == "/api/skills/compozy" {
+				var detail compozycontract.SkillResponse
+				if err := json.Unmarshal(httpBody, &detail); err != nil {
+					t.Fatalf("json.Unmarshal(skill detail) error = %v", err)
+				}
+				if detail.Skill.Origin != "" || detail.Skill.Exposures == nil || len(*detail.Skill.Exposures) != 0 {
+					t.Fatalf("skill detail = %#v, want explicit empty origin/exposures", detail)
+				}
+			}
+		})
+	}
+}
+
+func TestUDSTransportCmdPaletteViewRoutesMatchHTTP(t *testing.T) {
+	acpmock.RequireDriver(t)
+	t.Parallel()
+
+	runtimeHarness := e2etest.StartRuntimeHarness(t, &e2etest.RuntimeHarnessOptions{})
+	clients, err := runtimeHarness.TransportClients()
+	if err != nil {
+		t.Fatalf("TransportClients() error = %v", err)
+	}
+	workspace := url.QueryEscape(runtimeHarness.WorkspaceID)
+	testCases := []struct {
+		name       string
+		method     string
+		path       string
+		body       []byte
+		wantStatus int
+		wantError  string
+	}{
+		{
+			name:       "reject a missing declarative view",
+			method:     http.MethodGet,
+			path:       "/api/cmd-palette/views/ext.missing.recent?workspace=" + workspace,
+			wantStatus: http.StatusNotFound,
+			wantError:  "view_error",
+		},
+		{
+			name:       "reject a stream cursor without an epoch",
+			method:     http.MethodGet,
+			path:       "/api/cmd-palette/views/ext.missing.recent/stream?workspace=" + workspace + "&after=1",
+			wantStatus: http.StatusBadRequest,
+			wantError:  "view_error",
+		},
+		{
+			name:       "reject a program open without client identity",
+			method:     http.MethodPost,
+			path:       "/api/cmd-palette/views/ext.missing.browser/open",
+			body:       []byte(`{"workspace":"` + runtimeHarness.WorkspaceID + `"}`),
+			wantStatus: http.StatusUnauthorized,
+			wantError:  "client_unauthorized",
+		},
+		{
+			name:       "reject a missing program stream",
+			method:     http.MethodGet,
+			path:       "/api/cmd-palette/view-sessions/vs_missing/stream?token=vst_missing",
+			wantStatus: http.StatusGone,
+			wantError:  "session_gone",
+		},
+		{
+			name:       "reject a missing program event",
+			method:     http.MethodPost,
+			path:       "/api/cmd-palette/view-sessions/vs_missing/events",
+			body:       []byte(`{"handler":"h","revision":"vr_1","seq":1}`),
+			wantStatus: http.StatusGone,
+			wantError:  "session_gone",
+		},
+		{
+			name:       "close a missing program session idempotently",
+			method:     http.MethodDelete,
+			path:       "/api/cmd-palette/view-sessions/vs_missing",
+			wantStatus: http.StatusOK,
+		},
+	}
+	for _, testCase := range testCases {
+		t.Run("Should "+testCase.name, func(t *testing.T) {
+			t.Parallel()
+			httpResponse := mustUnixRequest(
+				t, clients.HTTPClient, testCase.method, runtimeHarness.HTTPURL(testCase.path), testCase.body, nil,
+			)
+			udsResponse := mustUnixRequest(
+				t, clients.UDSClient, testCase.method, runtimeHarness.UDSURL(testCase.path), testCase.body, nil,
+			)
+			httpBody := readAndCloseHTTPBody(t, httpResponse)
+			udsBody := readAndCloseHTTPBody(t, udsResponse)
+			if httpResponse.StatusCode != testCase.wantStatus || udsResponse.StatusCode != testCase.wantStatus {
+				t.Fatalf(
+					"status parity = HTTP %d / UDS %d, want %d; bodies=%s / %s",
+					httpResponse.StatusCode, udsResponse.StatusCode, testCase.wantStatus, httpBody, udsBody,
+				)
+			}
+			if testCase.wantError != "" {
+				var httpErr, udsErr compozycontract.CmdPaletteError
+				if err := json.Unmarshal(httpBody, &httpErr); err != nil {
+					t.Fatalf("json.Unmarshal(HTTP error) error = %v body=%s", err, httpBody)
+				}
+				if err := json.Unmarshal(udsBody, &udsErr); err != nil {
+					t.Fatalf("json.Unmarshal(UDS error) error = %v body=%s", err, udsBody)
+				}
+				if httpErr.Error != testCase.wantError || udsErr.Error != testCase.wantError {
+					t.Fatalf(
+						"error code = HTTP %q / UDS %q, want %q",
+						httpErr.Error, udsErr.Error, testCase.wantError,
+					)
+				}
+			}
+			if !jsonEqual(httpBody, udsBody) {
+				t.Fatalf("payload parity differs: HTTP=%s UDS=%s", httpBody, udsBody)
+			}
+		})
+	}
+}
+
+func TestUDSTransportDaemonDrainMatchesHTTPAndCLI(t *testing.T) {
+	t.Run("Should expose identical safe-to-stop readouts", func(t *testing.T) {
+		t.Parallel()
+		acpmock.RequireDriver(t)
+
+		runtimeHarness := e2etest.StartRuntimeHarness(t, &e2etest.RuntimeHarnessOptions{})
+		ctx, cancel := context.WithTimeout(t.Context(), 20*time.Second)
+		defer cancel()
+
+		var httpDraining compozycontract.DrainStatusResponse
+		if err := runtimeHarness.HTTPJSON(ctx, http.MethodPost, "/api/drain", nil, &httpDraining); err != nil {
+			t.Fatalf("HTTP drain error = %v", err)
+		}
+		var udsDraining compozycontract.DrainStatusResponse
+		if err := runtimeHarness.UDSJSON(ctx, http.MethodPost, "/api/drain", nil, &udsDraining); err != nil {
+			t.Fatalf("UDS drain error = %v", err)
+		}
+		var cliDraining compozycontract.DrainStatusResponse
+		if err := runtimeHarness.CLI.RunJSON(ctx, &cliDraining, "drain", "-o", "json"); err != nil {
+			t.Fatalf("CLI drain error = %v", err)
+		}
+		if httpDraining.State != compozycontract.DrainStateDraining ||
+			httpDraining != udsDraining || udsDraining != cliDraining {
+			t.Fatalf("drain parity mismatch: HTTP=%#v UDS=%#v CLI=%#v", httpDraining, udsDraining, cliDraining)
+		}
+		if !httpDraining.AdmissionClosed ||
+			!httpDraining.AuthoritativeClaimsSettled ||
+			!httpDraining.SessionExecutionSettled ||
+			!httpDraining.SafeToStop {
+			t.Fatalf("drain safety status = %#v, want closed and safe to stop", httpDraining)
+		}
+
+		var cliActive compozycontract.DrainStatusResponse
+		if err := runtimeHarness.CLI.RunJSON(ctx, &cliActive, "undrain", "-o", "json"); err != nil {
+			t.Fatalf("CLI undrain error = %v", err)
+		}
+		var udsActive compozycontract.DrainStatusResponse
+		if err := runtimeHarness.UDSJSON(ctx, http.MethodPost, "/api/undrain", nil, &udsActive); err != nil {
+			t.Fatalf("UDS undrain error = %v", err)
+		}
+		var httpActive compozycontract.DrainStatusResponse
+		if err := runtimeHarness.HTTPJSON(ctx, http.MethodPost, "/api/undrain", nil, &httpActive); err != nil {
+			t.Fatalf("HTTP undrain error = %v", err)
+		}
+		if cliActive.State != compozycontract.DrainStateActive ||
+			cliActive != udsActive || udsActive != httpActive {
+			t.Fatalf("undrain parity mismatch: CLI=%#v UDS=%#v HTTP=%#v", cliActive, udsActive, httpActive)
+		}
+		if cliActive.AdmissionClosed || cliActive.SafeToStop {
+			t.Fatalf("undrain safety status = %#v, want open and unsafe to stop", cliActive)
+		}
+	})
+}
+
+func TestUDSTransportRuntimeMemoryDoctorMatchesHTTPAndCLI(t *testing.T) {
+	t.Run("Should return identical runtime memory data over HTTP UDS and CLI", func(t *testing.T) {
+		t.Parallel()
+		acpmock.RequireDriver(t)
+
+		runtimeHarness := e2etest.StartRuntimeHarness(t, &e2etest.RuntimeHarnessOptions{})
+		ctx, cancel := context.WithTimeout(t.Context(), 20*time.Second)
+		defer cancel()
+
+		var httpPayload compozycontract.DoctorPayload
+		if err := runtimeHarness.HTTPJSON(ctx, http.MethodGet, "/api/doctor", nil, &httpPayload); err != nil {
+			t.Fatalf("HTTP doctor error = %v", err)
+		}
+		var udsPayload compozycontract.DoctorPayload
+		if err := runtimeHarness.UDSJSON(ctx, http.MethodGet, "/api/doctor", nil, &udsPayload); err != nil {
+			t.Fatalf("UDS doctor error = %v", err)
+		}
+		var cliPayload compozycontract.DoctorPayload
+		if err := runtimeHarness.CLI.RunJSON(ctx, &cliPayload, "doctor", "-o", "json"); err != nil {
+			t.Fatalf("CLI doctor error = %v", err)
+		}
+
+		httpItem := transportDoctorItem(t, httpPayload, "runtime.memory")
+		udsItem := transportDoctorItem(t, udsPayload, "runtime.memory")
+		cliItem := transportDoctorItem(t, cliPayload, "runtime.memory")
+		if !reflect.DeepEqual(httpItem, udsItem) || !reflect.DeepEqual(udsItem, cliItem) {
+			t.Fatalf("runtime.memory parity mismatch: HTTP=%#v UDS=%#v CLI=%#v", httpItem, udsItem, cliItem)
+		}
+		if httpItem.Evidence["enabled"] != true || httpItem.Evidence["active"] != true ||
+			httpItem.Evidence["resident_memory_available"] != true ||
+			!transportPositiveNumber(httpItem.Evidence["resident_memory_bytes"]) ||
+			!transportPositiveNumber(httpItem.Evidence["heap_alloc_bytes"]) ||
+			!transportPositiveNumber(httpItem.Evidence["goroutines"]) {
+			t.Fatalf("runtime.memory evidence = %#v, want populated daemon snapshot", httpItem.Evidence)
+		}
+	})
+}
+
+func TestUDSTransportWindowManagerMatchesHTTP(t *testing.T) {
+	t.Run(
+		"Should preserve window manager reads mutations clients layouts and errors across real transports",
+		func(t *testing.T) {
+			t.Parallel()
+			acpmock.RequireDriver(t)
+
+			runtimeHarness := e2etest.StartRuntimeHarness(t, &e2etest.RuntimeHarnessOptions{
+				MockAgents: []e2etest.MockAgentSpec{{
+					FixturePath:  transportMockFixturePath(t, "automation_task_fixture.json"),
+					FixtureAgent: "automation-runner",
+					AgentName:    transportUDSAutomationAgent,
+				}},
+			})
+			clients, err := runtimeHarness.TransportClients()
+			if err != nil {
+				t.Fatalf("TransportClients() error = %v", err)
+			}
+			ctx, cancel := context.WithTimeout(t.Context(), 45*time.Second)
+			defer cancel()
+
+			basePath := "/api/workspaces/" + url.PathEscape(runtimeHarness.WorkspaceID) + "/window-manager"
+			var httpSnapshot compozycontract.WindowManagerSnapshot
+			if err := runtimeHarness.HTTPJSON(ctx, http.MethodGet, basePath, nil, &httpSnapshot); err != nil {
+				t.Fatalf("HTTP window manager snapshot error = %v", err)
+			}
+			var udsSnapshot compozycontract.WindowManagerSnapshot
+			if err := runtimeHarness.UDSJSON(ctx, http.MethodGet, basePath, nil, &udsSnapshot); err != nil {
+				t.Fatalf("UDS window manager snapshot error = %v", err)
+			}
+			if !reflect.DeepEqual(httpSnapshot, udsSnapshot) {
+				t.Fatalf("window manager snapshot parity mismatch: HTTP=%#v UDS=%#v", httpSnapshot, udsSnapshot)
+			}
+
+			createRequest := windowManagerTransportCreateDesktopRequest(
+				runtimeHarness.WorkspaceID,
+				httpSnapshot.Revision,
+				"desktop-http",
+			)
+			var httpPreview compozycontract.WindowManagerPreview
+			if err := runtimeHarness.HTTPJSON(
+				ctx,
+				http.MethodPost,
+				basePath+"/preview",
+				createRequest,
+				&httpPreview,
+			); err != nil {
+				t.Fatalf("HTTP window manager preview error = %v", err)
+			}
+			var udsPreview compozycontract.WindowManagerPreview
+			if err := runtimeHarness.UDSJSON(
+				ctx,
+				http.MethodPost,
+				basePath+"/preview",
+				createRequest,
+				&udsPreview,
+			); err != nil {
+				t.Fatalf("UDS window manager preview error = %v", err)
+			}
+			if !reflect.DeepEqual(httpPreview, udsPreview) {
+				t.Fatalf("window manager preview parity mismatch: HTTP=%#v UDS=%#v", httpPreview, udsPreview)
+			}
+
+			var httpMutation compozycontract.WindowManagerResult
+			if err := runtimeHarness.HTTPJSON(
+				ctx,
+				http.MethodPost,
+				basePath+"/commands",
+				createRequest,
+				&httpMutation,
+			); err != nil {
+				t.Fatalf("HTTP window manager command error = %v", err)
+			}
+			if !httpMutation.Applied || httpMutation.Snapshot.Revision != httpSnapshot.Revision+1 {
+				t.Fatalf(
+					"HTTP window manager mutation = %#v, want applied revision %d",
+					httpMutation,
+					httpSnapshot.Revision+1,
+				)
+			}
+
+			udsCreateRequest := windowManagerTransportCreateDesktopRequest(
+				runtimeHarness.WorkspaceID,
+				httpMutation.Snapshot.Revision,
+				"desktop-uds",
+			)
+			var udsMutation compozycontract.WindowManagerResult
+			if err := runtimeHarness.UDSJSON(
+				ctx,
+				http.MethodPost,
+				basePath+"/commands",
+				udsCreateRequest,
+				&udsMutation,
+			); err != nil {
+				t.Fatalf("UDS window manager command error = %v", err)
+			}
+			if !udsMutation.Applied || udsMutation.Snapshot.Revision != httpMutation.Snapshot.Revision+1 {
+				t.Fatalf(
+					"UDS window manager mutation = %#v, want applied revision %d",
+					udsMutation,
+					httpMutation.Snapshot.Revision+1,
+				)
+			}
+
+			// The window.stack.group journey below groups two floating windows. The
+			// shipped new_window_policy is tab (tiled tabs), so the floating
+			// premise is set explicitly through the public settings route.
+			var windowManagerSettings map[string]json.RawMessage
+			if err := runtimeHarness.HTTPJSON(
+				ctx,
+				http.MethodGet,
+				"/api/settings/window-manager",
+				nil,
+				&windowManagerSettings,
+			); err != nil {
+				t.Fatalf("HTTP window manager settings error = %v", err)
+			}
+			var windowManagerConfig map[string]json.RawMessage
+			if err := json.Unmarshal(windowManagerSettings["config"], &windowManagerConfig); err != nil {
+				t.Fatalf("decode window manager settings config error = %v", err)
+			}
+			windowManagerConfig["new_window_policy"] = json.RawMessage(`"floating"`)
+			if err := runtimeHarness.HTTPJSON(
+				ctx,
+				http.MethodPatch,
+				"/api/settings/window-manager",
+				map[string]any{"config": windowManagerConfig},
+				nil,
+			); err != nil {
+				t.Fatalf("HTTP window manager floating policy error = %v", err)
+			}
+
+			openRequest := func(
+				revision compozycontract.WindowManagerRevision,
+				windowID string,
+			) compozycontract.WindowManagerCommandRequest {
+				return windowManagerTransportCommandRequest(
+					runtimeHarness.WorkspaceID,
+					revision,
+					compozycontract.WindowManagerCommandWindowOpen,
+					json.RawMessage(fmt.Sprintf(
+						`{"window":{"id":%q,"app":"tasks","route":{"pathname":%q,"search":{}},`+
+							`"desktop_id":"desktop-default","floating_rect":{"x":0.1,"y":0.1,`+
+							`"width":0.5,"height":0.5},"insert_tiled":false}}`,
+						windowID,
+						"/tasks/"+windowID,
+					)),
+				)
+			}
+			var firstOpen compozycontract.WindowManagerResult
+			if err := runtimeHarness.HTTPJSON(
+				ctx,
+				http.MethodPost,
+				basePath+"/commands",
+				openRequest(udsMutation.Snapshot.Revision, "window-a"),
+				&firstOpen,
+			); err != nil {
+				t.Fatalf("HTTP window.open error = %v", err)
+			}
+			var secondOpen compozycontract.WindowManagerResult
+			if err := runtimeHarness.UDSJSON(
+				ctx,
+				http.MethodPost,
+				basePath+"/commands",
+				openRequest(firstOpen.Snapshot.Revision, "window-b"),
+				&secondOpen,
+			); err != nil {
+				t.Fatalf("UDS window.open error = %v", err)
+			}
+			groupRequest := windowManagerTransportCommandRequest(
+				runtimeHarness.WorkspaceID,
+				secondOpen.Snapshot.Revision,
+				compozycontract.WindowManagerCommandWindowStackGroup,
+				json.RawMessage(`{"target_window_id":"window-a","window_ids":["window-b"]}`),
+			)
+			var httpGroupPreview compozycontract.WindowManagerPreview
+			if err := runtimeHarness.HTTPJSON(
+				ctx,
+				http.MethodPost,
+				basePath+"/preview",
+				groupRequest,
+				&httpGroupPreview,
+			); err != nil {
+				t.Fatalf("HTTP window.stack.group preview error = %v", err)
+			}
+			var udsGroupPreview compozycontract.WindowManagerPreview
+			if err := runtimeHarness.UDSJSON(
+				ctx,
+				http.MethodPost,
+				basePath+"/preview",
+				groupRequest,
+				&udsGroupPreview,
+			); err != nil {
+				t.Fatalf("UDS window.stack.group preview error = %v", err)
+			}
+			if !reflect.DeepEqual(httpGroupPreview, udsGroupPreview) {
+				t.Fatalf(
+					"window.stack.group preview parity mismatch: HTTP=%#v UDS=%#v",
+					httpGroupPreview,
+					udsGroupPreview,
+				)
+			}
+			var grouped compozycontract.WindowManagerResult
+			if err := runtimeHarness.HTTPJSON(
+				ctx,
+				http.MethodPost,
+				basePath+"/commands",
+				groupRequest,
+				&grouped,
+			); err != nil {
+				t.Fatalf("HTTP window.stack.group error = %v", err)
+			}
+			groupedDesktop := requireWindowManagerDesktop(t, grouped.Snapshot, "desktop-default")
+			if !grouped.Applied || grouped.Snapshot.Version != windowmanager.SnapshotVersion ||
+				len(groupedDesktop.FloatingStacks) != 1 {
+				t.Fatalf("window.stack.group result = %#v", grouped)
+			}
+
+			var thirdOpen compozycontract.WindowManagerResult
+			if err := runtimeHarness.HTTPJSON(
+				ctx,
+				http.MethodPost,
+				basePath+"/commands",
+				openRequest(grouped.Snapshot.Revision, "window-c"),
+				&thirdOpen,
+			); err != nil {
+				t.Fatalf("HTTP third window.open error = %v", err)
+			}
+
+			var cliWindows []struct {
+				ID          windowmanager.WindowID `json:"id"`
+				StackID     *windowmanager.NodeID  `json:"stack_id,omitempty"`
+				MemberOrder *int                   `json:"member_order,omitempty"`
+				Active      bool                   `json:"active"`
+				Pinned      bool                   `json:"pinned"`
+				NavDepth    int                    `json:"nav_depth"`
+			}
+			if err := runtimeHarness.CLI.RunJSON(
+				ctx,
+				&cliWindows,
+				"window", "list", "--workspace", runtimeHarness.WorkspaceID, "-o", "json",
+			); err != nil {
+				t.Fatalf("CLI window list error = %v", err)
+			}
+			if len(cliWindows) != 3 {
+				t.Fatalf("CLI window list length = %d, want 3: %#v", len(cliWindows), cliWindows)
+			}
+			listedByID := make(map[windowmanager.WindowID]struct {
+				stackID     *windowmanager.NodeID
+				memberOrder *int
+			}, len(cliWindows))
+			for _, item := range cliWindows {
+				listedByID[item.ID] = struct {
+					stackID     *windowmanager.NodeID
+					memberOrder *int
+				}{stackID: item.StackID, memberOrder: item.MemberOrder}
+			}
+			if listedByID["window-a"].stackID == nil || listedByID["window-a"].memberOrder == nil ||
+				listedByID["window-b"].stackID == nil || listedByID["window-b"].memberOrder == nil ||
+				listedByID["window-c"].stackID != nil {
+				t.Fatalf("CLI window list topology = %#v, want grouped a/b and standalone c", cliWindows)
+			}
+
+			assertCLIHTTPParity := func(label string, cliSnapshot compozycontract.WindowManagerSnapshot) {
+				t.Helper()
+				var current compozycontract.WindowManagerSnapshot
+				if err := runtimeHarness.HTTPJSON(ctx, http.MethodGet, basePath, nil, &current); err != nil {
+					t.Fatalf("HTTP snapshot after %s error = %v", label, err)
+				}
+				cliJSON, err := json.Marshal(cliSnapshot)
+				if err != nil {
+					t.Fatalf("json.Marshal(CLI snapshot after %s) error = %v", label, err)
+				}
+				httpJSON, err := json.Marshal(current)
+				if err != nil {
+					t.Fatalf("json.Marshal(HTTP snapshot after %s) error = %v", label, err)
+				}
+				if !bytes.Equal(cliJSON, httpJSON) {
+					t.Fatalf("CLI/HTTP snapshot parity after %s mismatch: CLI=%s HTTP=%s", label, cliJSON, httpJSON)
+				}
+			}
+
+			var cliGrouped compozycontract.WindowManagerResult
+			if err := runtimeHarness.CLI.RunJSON(
+				ctx,
+				&cliGrouped,
+				"window", "group", "--target", "window-a", "--windows", "window-c",
+				"--workspace", runtimeHarness.WorkspaceID,
+				"--revision", fmt.Sprint(thirdOpen.Snapshot.Revision),
+				"-o", "json",
+			); err != nil {
+				t.Fatalf("CLI window group error = %v", err)
+			}
+			assertCLIHTTPParity("group", cliGrouped.Snapshot)
+
+			cliDesktop := requireWindowManagerDesktop(t, cliGrouped.Snapshot, "desktop-default")
+			cliStackIndex := -1
+			for idx := range cliDesktop.FloatingStacks {
+				candidate := &cliDesktop.FloatingStacks[idx]
+				if slices.Contains(candidate.WindowIDs, windowmanager.WindowID("window-a")) &&
+					slices.Contains(candidate.WindowIDs, windowmanager.WindowID("window-c")) {
+					cliStackIndex = idx
+					break
+				}
+			}
+			if cliStackIndex < 0 {
+				t.Fatalf(
+					"CLI grouped stacks = %#v, want stack containing window-a and window-c",
+					cliDesktop.FloatingStacks,
+				)
+			}
+			cliStack := cliDesktop.FloatingStacks[cliStackIndex]
+			activateID := cliStack.WindowIDs[0]
+			if cliStack.ActiveID != nil && activateID == *cliStack.ActiveID {
+				activateID = cliStack.WindowIDs[1]
+			}
+			var cliActivated compozycontract.WindowManagerResult
+			if err := runtimeHarness.CLI.RunJSON(
+				ctx,
+				&cliActivated,
+				"window", "activate", string(activateID),
+				"--workspace", runtimeHarness.WorkspaceID,
+				"--revision", fmt.Sprint(cliGrouped.Snapshot.Revision),
+				"-o", "json",
+			); err != nil {
+				t.Fatalf("CLI window activate error = %v", err)
+			}
+			assertCLIHTTPParity("activate", cliActivated.Snapshot)
+
+			var cliPinned compozycontract.WindowManagerResult
+			if err := runtimeHarness.CLI.RunJSON(
+				ctx,
+				&cliPinned,
+				"window", "pin", string(activateID),
+				"--workspace", runtimeHarness.WorkspaceID,
+				"--revision", fmt.Sprint(cliActivated.Snapshot.Revision),
+				"-o", "json",
+			); err != nil {
+				t.Fatalf("CLI window pin error = %v", err)
+			}
+			assertCLIHTTPParity("pin", cliPinned.Snapshot)
+
+			closeID := windowmanager.WindowID("window-c")
+			if closeID == activateID {
+				closeID = "window-b"
+			}
+			var cliClosed compozycontract.WindowManagerResult
+			if err := runtimeHarness.CLI.RunJSON(
+				ctx,
+				&cliClosed,
+				"window", "close", "--id", string(closeID),
+				"--workspace", runtimeHarness.WorkspaceID,
+				"--revision", fmt.Sprint(cliPinned.Snapshot.Revision),
+				"-o", "json",
+			); err != nil {
+				t.Fatalf("CLI window close error = %v", err)
+			}
+			var cliReopened compozycontract.WindowManagerResult
+			if err := runtimeHarness.CLI.RunJSON(
+				ctx,
+				&cliReopened,
+				"window", "reopen",
+				"--workspace", runtimeHarness.WorkspaceID,
+				"--revision", fmt.Sprint(cliClosed.Snapshot.Revision),
+				"-o", "json",
+			); err != nil {
+				t.Fatalf("CLI window reopen error = %v", err)
+			}
+			assertCLIHTTPParity("reopen", cliReopened.Snapshot)
+
+			_, staleStderr, staleErr := runtimeHarness.CLI.Run(
+				ctx,
+				"window", "activate", string(activateID),
+				"--workspace", runtimeHarness.WorkspaceID,
+				"--revision", fmt.Sprint(cliGrouped.Snapshot.Revision),
+				"-o", "json",
+			)
+			if staleErr == nil ||
+				!strings.Contains(staleStderr, string(compozycontract.WindowManagerErrorRevisionConflict)) {
+				t.Fatalf("stale CLI activation error = %v, stderr=%q", staleErr, staleStderr)
+			}
+
+			_, malformedStderr, malformedErr := runtimeHarness.CLI.Run(
+				ctx,
+				"window", "group", "--target", "window-a", "--windows", "window-b,,window-c",
+				"--workspace", runtimeHarness.WorkspaceID,
+				"--revision", fmt.Sprint(cliReopened.Snapshot.Revision),
+				"-o", "json",
+			)
+			if malformedErr == nil || !strings.Contains(malformedStderr, "--windows must contain non-empty") {
+				t.Fatalf("malformed CLI group error = %v, stderr=%q", malformedErr, malformedStderr)
+			}
+
+			var exported compozycontract.WindowManagerLayoutDocument
+			if err := runtimeHarness.CLI.RunJSON(
+				ctx,
+				&exported,
+				"layout", "export", "--workspace", runtimeHarness.WorkspaceID, "-o", "json",
+			); err != nil {
+				t.Fatalf("CLI layout export error = %v", err)
+			}
+			exportedJSON, err := json.Marshal(exported)
+			if err != nil {
+				t.Fatalf("json.Marshal(exported layout) error = %v", err)
+			}
+			layoutPath := filepath.Join(t.TempDir(), "window-layout.json")
+			if err := os.WriteFile(layoutPath, exportedJSON, 0o600); err != nil {
+				t.Fatalf("os.WriteFile(%q) error = %v", layoutPath, err)
+			}
+
+			var cliClosedAgain compozycontract.WindowManagerResult
+			if err := runtimeHarness.CLI.RunJSON(
+				ctx,
+				&cliClosedAgain,
+				"window", "close", "--id", string(closeID),
+				"--workspace", runtimeHarness.WorkspaceID,
+				"--revision", fmt.Sprint(cliReopened.Snapshot.Revision),
+				"-o", "json",
+			); err != nil {
+				t.Fatalf("CLI second window close error = %v", err)
+			}
+			var cliApplied compozycontract.WindowManagerResult
+			if err := runtimeHarness.CLI.RunJSON(
+				ctx,
+				&cliApplied,
+				"layout", "apply", "--file", layoutPath,
+				"--workspace", runtimeHarness.WorkspaceID,
+				"--revision", fmt.Sprint(cliClosedAgain.Snapshot.Revision),
+				"-o", "json",
+			); err != nil {
+				t.Fatalf("CLI layout apply error = %v", err)
+			}
+			assertCLIHTTPParity("layout apply", cliApplied.Snapshot)
+			var appliedLayout compozycontract.WindowManagerLayoutDocument
+			if err := runtimeHarness.HTTPJSON(
+				ctx,
+				http.MethodGet,
+				basePath+"/layout",
+				nil,
+				&appliedLayout,
+			); err != nil {
+				t.Fatalf("HTTP layout export after CLI apply error = %v", err)
+			}
+			if !reflect.DeepEqual(exported, appliedLayout) {
+				t.Fatalf("layout round-trip mismatch: exported=%#v applied=%#v", exported, appliedLayout)
+			}
+			assertWindowManagerLayoutProfileRoundTrip(
+				t,
+				ctx,
+				runtimeHarness,
+				basePath,
+				exported,
+			)
+			assertWindowManagerSessionReopenAcrossClients(
+				t,
+				ctx,
+				runtimeHarness,
+				basePath,
+				cliApplied.Snapshot.Revision,
+			)
+
+			registration := compozycontract.WindowManagerClientRegistration{
+				WorkspaceID: windowmanager.WorkspaceID(runtimeHarness.WorkspaceID),
+				ClientID:    "transport-parity-client",
+			}
+			var httpClient compozycontract.WindowManagerClientView
+			if err := runtimeHarness.HTTPJSON(
+				ctx,
+				http.MethodPost,
+				basePath+"/clients",
+				registration,
+				&httpClient,
+			); err != nil {
+				t.Fatalf("HTTP window manager client registration error = %v", err)
+			}
+			var udsClient compozycontract.WindowManagerClientView
+			if err := runtimeHarness.UDSJSON(
+				ctx,
+				http.MethodPost,
+				basePath+"/clients",
+				registration,
+				&udsClient,
+			); err != nil {
+				t.Fatalf("UDS window manager client registration error = %v", err)
+			}
+			if httpClient.AttachmentToken == "" || udsClient.AttachmentToken == "" {
+				t.Fatalf(
+					"window manager registration tokens must be present: HTTP=%q UDS=%q",
+					httpClient.AttachmentToken,
+					udsClient.AttachmentToken,
+				)
+			}
+			if httpClient.AttachmentToken == udsClient.AttachmentToken {
+				t.Fatal("window manager client re-registration did not rotate the attachment token")
+			}
+			httpStableClient := httpClient
+			udsStableClient := udsClient
+			httpStableClient.AttachmentToken = ""
+			udsStableClient.AttachmentToken = ""
+			if !reflect.DeepEqual(httpStableClient, udsStableClient) {
+				t.Fatalf("window manager client parity mismatch: HTTP=%#v UDS=%#v", httpStableClient, udsStableClient)
+			}
+
+			var httpLayout compozycontract.WindowManagerLayoutDocument
+			if err := runtimeHarness.HTTPJSON(ctx, http.MethodGet, basePath+"/layout", nil, &httpLayout); err != nil {
+				t.Fatalf("HTTP window manager layout export error = %v", err)
+			}
+			var udsLayout compozycontract.WindowManagerLayoutDocument
+			if err := runtimeHarness.UDSJSON(ctx, http.MethodGet, basePath+"/layout", nil, &udsLayout); err != nil {
+				t.Fatalf("UDS window manager layout export error = %v", err)
+			}
+			if !reflect.DeepEqual(httpLayout, udsLayout) {
+				t.Fatalf("window manager layout parity mismatch: HTTP=%#v UDS=%#v", httpLayout, udsLayout)
+			}
+
+			validationRequest := compozycontract.WindowManagerLayoutValidationRequest{
+				WorkspaceID: windowmanager.WorkspaceID(runtimeHarness.WorkspaceID),
+				Document:    httpLayout,
+			}
+			var httpValidation compozycontract.WindowManagerLayoutValidationResponse
+			if err := runtimeHarness.HTTPJSON(
+				ctx,
+				http.MethodPost,
+				basePath+"/layout/validate",
+				validationRequest,
+				&httpValidation,
+			); err != nil {
+				t.Fatalf("HTTP window manager layout validation error = %v", err)
+			}
+			var udsValidation compozycontract.WindowManagerLayoutValidationResponse
+			if err := runtimeHarness.UDSJSON(
+				ctx,
+				http.MethodPost,
+				basePath+"/layout/validate",
+				validationRequest,
+				&udsValidation,
+			); err != nil {
+				t.Fatalf("UDS window manager layout validation error = %v", err)
+			}
+			if !reflect.DeepEqual(httpValidation, udsValidation) || !httpValidation.Valid {
+				t.Fatalf("window manager validation parity mismatch: HTTP=%#v UDS=%#v", httpValidation, udsValidation)
+			}
+
+			invalidRequest := windowManagerTransportCreateDesktopRequest(
+				runtimeHarness.WorkspaceID,
+				udsMutation.Snapshot.Revision,
+				"desktop-invalid",
+			)
+			invalidRequest.CommandID = "desktop.unknown"
+			invalidBody, err := json.Marshal(invalidRequest)
+			if err != nil {
+				t.Fatalf("json.Marshal(invalid window manager request) error = %v", err)
+			}
+			httpErrorResponse := mustUnixRequest(
+				t,
+				clients.HTTPClient,
+				http.MethodPost,
+				runtimeHarness.HTTPURL(basePath+"/commands"),
+				invalidBody,
+				nil,
+			)
+			udsErrorResponse := mustUnixRequest(
+				t,
+				clients.UDSClient,
+				http.MethodPost,
+				runtimeHarness.UDSURL(basePath+"/commands"),
+				invalidBody,
+				nil,
+			)
+			httpErrorBody := readAndCloseHTTPBody(t, httpErrorResponse)
+			udsErrorBody := readAndCloseHTTPBody(t, udsErrorResponse)
+			if httpErrorResponse.StatusCode != http.StatusUnprocessableEntity ||
+				udsErrorResponse.StatusCode != http.StatusUnprocessableEntity ||
+				!jsonEqual(httpErrorBody, udsErrorBody) {
+				t.Fatalf(
+					"window manager error parity mismatch: HTTP=(%d %s) UDS=(%d %s)",
+					httpErrorResponse.StatusCode,
+					httpErrorBody,
+					udsErrorResponse.StatusCode,
+					udsErrorBody,
+				)
+			}
+		},
+	)
+}
+
+func assertWindowManagerLayoutProfileRoundTrip(
+	t *testing.T,
+	ctx context.Context,
+	runtimeHarness *e2etest.RuntimeHarness,
+	basePath string,
+	exported compozycontract.WindowManagerLayoutDocument,
+) {
+	t.Helper()
+
+	const profileID = "transport-tabs-profile"
+	profileDocument := exported
+	profileDocument.WorkspaceID = ""
+	profileSpec := windowManagerTransportPayload(t, windowmanager.LayoutResource{
+		Version:        windowmanager.LayoutResourceVersion,
+		ID:             profileID,
+		DisplayName:    "Transport tabs profile",
+		AspectVariant:  windowmanager.LayoutAspectAny,
+		OverflowPolicy: windowmanager.LayoutOverflowStack,
+		Document:       profileDocument.Domain(),
+	})
+	var stored compozycontract.ResourceResponse
+	if err := runtimeHarness.HTTPJSON(
+		ctx,
+		http.MethodPut,
+		basePath+"/layout-profiles/"+profileID,
+		compozycontract.PutResourceRequest{
+			Scope: resources.ResourceScope{Kind: resources.ResourceScopeKindUser},
+			Spec:  profileSpec,
+		},
+		&stored,
+	); err != nil {
+		t.Fatalf("HTTP layout profile put error = %v", err)
+	}
+	if stored.Record.ID != profileID || stored.Record.Scope.Kind != resources.ResourceScopeKindUser {
+		t.Fatalf("stored layout profile = %#v, want user-scoped profile %q", stored.Record, profileID)
+	}
+
+	originalWorkspaceID := runtimeHarness.WorkspaceID
+	defer func() { runtimeHarness.WorkspaceID = originalWorkspaceID }()
+	freshWorkspace, err := runtimeHarness.ResolveWorkspace(ctx, t.TempDir())
+	if err != nil {
+		t.Fatalf("ResolveWorkspace(fresh layout target) error = %v", err)
+	}
+	freshBasePath := "/api/workspaces/" + url.PathEscape(freshWorkspace.ID) + "/window-manager"
+	var freshSnapshot compozycontract.WindowManagerSnapshot
+	if err := runtimeHarness.HTTPJSON(ctx, http.MethodGet, freshBasePath, nil, &freshSnapshot); err != nil {
+		t.Fatalf("HTTP fresh workspace snapshot error = %v", err)
+	}
+	applyRequest := windowManagerTransportCommandRequest(
+		freshWorkspace.ID,
+		freshSnapshot.Revision,
+		compozycontract.WindowManagerCommandLayoutArrange,
+		windowManagerTransportPayload(t, compozycontract.WindowManagerArrangeLayoutPayload{
+			ResourceID: profileID,
+		}),
+	)
+	var applied compozycontract.WindowManagerResult
+	if err := runtimeHarness.HTTPJSON(
+		ctx,
+		http.MethodPost,
+		freshBasePath+"/commands",
+		applyRequest,
+		&applied,
+	); err != nil {
+		t.Fatalf("HTTP layout profile apply error = %v", err)
+	}
+	var reconstructed compozycontract.WindowManagerLayoutDocument
+	if err := runtimeHarness.HTTPJSON(
+		ctx,
+		http.MethodGet,
+		freshBasePath+"/layout",
+		nil,
+		&reconstructed,
+	); err != nil {
+		t.Fatalf("HTTP reconstructed profile export error = %v", err)
+	}
+	wantReconstructed := exported
+	wantReconstructed.WorkspaceID = windowmanager.WorkspaceID(freshWorkspace.ID)
+	if !applied.Applied || !reflect.DeepEqual(reconstructed, wantReconstructed) {
+		t.Fatalf(
+			"profile reconstruction mismatch: applied=%t got=%#v want=%#v",
+			applied.Applied,
+			reconstructed,
+			wantReconstructed,
+		)
+	}
+
+	v2Document := reconstructed
+	v2Document.Version = 2
+	v2Revision := applied.Snapshot.Revision
+	v2Body := windowManagerTransportPayload(t, compozycontract.WindowManagerLayoutReplaceRequest{
+		WorkspaceID:      windowmanager.WorkspaceID(freshWorkspace.ID),
+		ExpectedRevision: &v2Revision,
+		Actor:            compozycontract.WindowManagerActor{Kind: "test", ID: "transport-parity"},
+		Origin:           "transport-parity",
+		Document:         v2Document,
+	})
+	response := mustUnixRequest(
+		t,
+		runtimeHarness.HTTPClient,
+		http.MethodPut,
+		runtimeHarness.HTTPURL(freshBasePath+"/layout"),
+		v2Body,
+		nil,
+	)
+	body := readAndCloseHTTPBody(t, response)
+	var payload compozycontract.WindowManagerErrorPayload
+	if err := json.Unmarshal(body, &payload); err != nil {
+		t.Fatalf("json.Unmarshal(v2 layout error) error = %v; body=%s", err, body)
+	}
+	if response.StatusCode != http.StatusUnprocessableEntity ||
+		payload.Code != compozycontract.WindowManagerErrorInvalidTopology ||
+		len(payload.Diagnostics) == 0 ||
+		payload.Diagnostics[0].Code != "topology.unsupported_version" {
+		t.Fatalf("v2 layout apply = status %d payload %#v", response.StatusCode, payload)
+	}
+}
+
+func assertWindowManagerSessionReopenAcrossClients(
+	t *testing.T,
+	ctx context.Context,
+	runtimeHarness *e2etest.RuntimeHarness,
+	basePath string,
+	revision compozycontract.WindowManagerRevision,
+) {
+	t.Helper()
+
+	sessionPayload, err := runtimeHarness.CreateSession(ctx, compozycontract.CreateSessionRequest{
+		AgentName:     transportUDSAutomationAgent,
+		WorkspacePath: runtimeHarness.WorkspaceRoot,
+	})
+	if err != nil {
+		t.Fatalf("CreateSession(window tab identity) error = %v", err)
+	}
+	sessionPayload = waitForTransportSessionActive(t, ctx, runtimeHarness, sessionPayload)
+
+	clientA := windowmanager.ClientID("session-tab-client-a")
+	clientB := windowmanager.ClientID("session-tab-client-b")
+	for _, clientID := range []windowmanager.ClientID{clientA, clientB} {
+		var registered compozycontract.WindowManagerClientView
+		if err := runtimeHarness.HTTPJSON(
+			ctx,
+			http.MethodPost,
+			basePath+"/clients",
+			compozycontract.WindowManagerClientRegistration{
+				WorkspaceID: windowmanager.WorkspaceID(runtimeHarness.WorkspaceID),
+				ClientID:    clientID,
+			},
+			&registered,
+		); err != nil {
+			t.Fatalf("HTTP register window client %q error = %v", clientID, err)
+		}
+	}
+
+	instanceKey := sessionPayload.ID
+	openRequest := windowManagerTransportCommandRequest(
+		runtimeHarness.WorkspaceID,
+		revision,
+		compozycontract.WindowManagerCommandWindowOpen,
+		windowManagerTransportPayload(t, compozycontract.WindowManagerOpenWindowPayload{
+			Window: compozycontract.WindowManagerWindowSpecPayload{
+				ID:          "window-session",
+				App:         "session",
+				InstanceKey: &instanceKey,
+				Route: windowmanager.RouteIntent{
+					Pathname: "/sessions/" + sessionPayload.ID,
+					Search:   windowmanager.RouteSearch{},
+				},
+				DesktopID:    "desktop-default",
+				FloatingRect: windowmanager.NormalizedRect{X: 0.2, Y: 0.2, Width: 0.6, Height: 0.6},
+			},
+		}),
+	)
+	openRequest.ClientID = &clientA
+	var opened compozycontract.WindowManagerResult
+	if err := runtimeHarness.HTTPJSON(
+		ctx,
+		http.MethodPost,
+		basePath+"/commands",
+		openRequest,
+		&opened,
+	); err != nil {
+		t.Fatalf("HTTP session window open error = %v", err)
+	}
+	navigateRequest := windowManagerTransportCommandRequest(
+		runtimeHarness.WorkspaceID,
+		opened.Snapshot.Revision,
+		compozycontract.WindowManagerCommandWindowNavigate,
+		windowManagerTransportPayload(t, compozycontract.WindowManagerNavigateWindowPayload{
+			WindowID: "window-session",
+			Route: windowmanager.RouteIntent{
+				Pathname: "/sessions/" + sessionPayload.ID + "/transcript",
+				Search:   windowmanager.RouteSearch{"view": json.RawMessage(`"full"`)},
+			},
+			Mode: windowmanager.NavigatePush,
+		}),
+	)
+	navigateRequest.ClientID = &clientA
+	var navigated compozycontract.WindowManagerResult
+	if err := runtimeHarness.HTTPJSON(
+		ctx,
+		http.MethodPost,
+		basePath+"/commands",
+		navigateRequest,
+		&navigated,
+	); err != nil {
+		t.Fatalf("HTTP session window navigate error = %v", err)
+	}
+	wantWindow := navigated.Snapshot.Windows["window-session"]
+
+	sessionPath := "/api/sessions/" + url.PathEscape(sessionPayload.ID)
+	var beforeClose compozycontract.SessionResponse
+	if err := runtimeHarness.HTTPJSON(ctx, http.MethodGet, sessionPath, nil, &beforeClose); err != nil {
+		t.Fatalf("HTTP session state before close error = %v", err)
+	}
+	closeRequest := windowManagerTransportCommandRequest(
+		runtimeHarness.WorkspaceID,
+		navigated.Snapshot.Revision,
+		compozycontract.WindowManagerCommandWindowClose,
+		windowManagerTransportPayload(t, compozycontract.WindowManagerCloseWindowPayload{
+			WindowID: "window-session",
+			Scope:    windowmanager.CloseScopeTab,
+		}),
+	)
+	closeRequest.ClientID = &clientA
+	var closed compozycontract.WindowManagerResult
+	if err := runtimeHarness.HTTPJSON(
+		ctx,
+		http.MethodPost,
+		basePath+"/commands",
+		closeRequest,
+		&closed,
+	); err != nil {
+		t.Fatalf("HTTP session window close error = %v", err)
+	}
+	var afterClose compozycontract.SessionResponse
+	if err := runtimeHarness.HTTPJSON(ctx, http.MethodGet, sessionPath, nil, &afterClose); err != nil {
+		t.Fatalf("HTTP session state after close error = %v", err)
+	}
+	if beforeClose.Session.ID != afterClose.Session.ID ||
+		beforeClose.Session.State != afterClose.Session.State ||
+		beforeClose.Session.WorkspaceID != afterClose.Session.WorkspaceID ||
+		beforeClose.Session.AgentName != afterClose.Session.AgentName {
+		t.Fatalf("stable session identity changed when its tab closed: before=%#v after=%#v", beforeClose, afterClose)
+	}
+
+	reopenRequest := windowManagerTransportCommandRequest(
+		runtimeHarness.WorkspaceID,
+		closed.Snapshot.Revision,
+		compozycontract.WindowManagerCommandWindowReopen,
+		windowManagerTransportPayload(t, compozycontract.WindowManagerReopenWindowPayload{}),
+	)
+	reopenRequest.ClientID = &clientB
+	var reopened compozycontract.WindowManagerResult
+	if err := runtimeHarness.HTTPJSON(
+		ctx,
+		http.MethodPost,
+		basePath+"/commands",
+		reopenRequest,
+		&reopened,
+	); err != nil {
+		t.Fatalf("HTTP session window reopen from second client error = %v", err)
+	}
+	if !reopened.Applied || !reflect.DeepEqual(reopened.Snapshot.Windows["window-session"], wantWindow) {
+		t.Fatalf(
+			"reopened session window = %#v, want preserved route and nav stack %#v",
+			reopened.Snapshot.Windows["window-session"],
+			wantWindow,
+		)
+	}
+}
+
+func windowManagerTransportPayload(t *testing.T, payload any) json.RawMessage {
+	t.Helper()
+
+	raw, err := json.Marshal(payload)
+	if err != nil {
+		t.Fatalf("json.Marshal(window manager transport payload) error = %v", err)
+	}
+	return raw
+}
+
+func requireWindowManagerDesktop(
+	t testing.TB,
+	snapshot compozycontract.WindowManagerSnapshot,
+	desktopID windowmanager.DesktopID,
+) compozycontract.WindowManagerDesktop {
+	t.Helper()
+	for _, desktop := range snapshot.Desktops {
+		if desktop.ID == desktopID {
+			return desktop
+		}
+	}
+	t.Fatalf("desktop %q missing from snapshot %#v", desktopID, snapshot.Desktops)
+	return compozycontract.WindowManagerDesktop{}
+}
+
+func windowManagerTransportCreateDesktopRequest(
+	workspaceID string,
+	revision compozycontract.WindowManagerRevision,
+	desktopID string,
+) compozycontract.WindowManagerCommandRequest {
+	return windowManagerTransportCommandRequest(
+		workspaceID,
+		revision,
+		compozycontract.WindowManagerCommandDesktopCreate,
+		json.RawMessage(fmt.Sprintf(
+			`{"desktop_id":%q,"name":%q}`,
+			desktopID,
+			desktopID,
+		)),
+	)
+}
+
+func windowManagerTransportCommandRequest(
+	workspaceID string,
+	revision compozycontract.WindowManagerRevision,
+	commandID compozycontract.WindowManagerCommandID,
+	payload json.RawMessage,
+) compozycontract.WindowManagerCommandRequest {
+	return compozycontract.WindowManagerCommandRequest{
+		WorkspaceID:      windowmanager.WorkspaceID(workspaceID),
+		CommandID:        commandID,
+		ExpectedRevision: &revision,
+		Actor:            compozycontract.WindowManagerActor{Kind: "test", ID: "transport-parity"},
+		Origin:           "transport-parity",
+		Payload:          payload,
+	}
+}
+
+func jsonEqual(left []byte, right []byte) bool {
+	var leftValue any
+	if err := json.Unmarshal(left, &leftValue); err != nil {
+		return false
+	}
+	var rightValue any
+	if err := json.Unmarshal(right, &rightValue); err != nil {
+		return false
+	}
+	return reflect.DeepEqual(leftValue, rightValue)
+}
+
+func TestUDSTransportAutomaticSessionTitlePersistsAndMatchesHTTP(t *testing.T) {
+	acpmock.RequireDriver(t)
+	t.Parallel()
+
+	runtimeHarness := e2etest.StartRuntimeHarness(t, &e2etest.RuntimeHarnessOptions{
+		MockAgents: []e2etest.MockAgentSpec{{
+			FixturePath:  transportMockFixturePath(t, "auto_title_fixture.json"),
+			FixtureAgent: "auto-title-agent",
+			AgentName:    transportUDSAutoTitleAgent,
+		}},
+	})
+
+	ctx, cancel := context.WithTimeout(t.Context(), 20*time.Second)
+	defer cancel()
+
+	sessionPayload, err := runtimeHarness.CreateSession(ctx, compozycontract.CreateSessionRequest{
+		AgentName:     transportUDSAutoTitleAgent,
+		WorkspacePath: runtimeHarness.WorkspaceRoot,
+	})
+	if err != nil {
+		t.Fatalf("CreateSession() error = %v", err)
+	}
+	if sessionPayload.Name != "" {
+		t.Fatalf("created session name = %q, want unnamed", sessionPayload.Name)
+	}
+	sessionPayload = waitForTransportSessionActive(t, ctx, runtimeHarness, sessionPayload)
+
+	if _, err := runtimeHarness.PromptSessionHTTP(
+		ctx,
+		sessionPayload.ID,
+		"Implement checkout retry fencing",
+	); err != nil {
+		t.Fatalf("PromptSessionHTTP() error = %v", err)
+	}
+
+	const generatedTitle = "Checkout Retry Fencing"
+	httpCatalog, udsCatalog := waitForTransportSessionTitle(
+		t,
+		ctx,
+		runtimeHarness,
+		sessionPayload.ID,
+		generatedTitle,
+	)
+	assertTransportCatalogTitle(t, "HTTP", httpCatalog, sessionPayload.ID, generatedTitle)
+	assertTransportCatalogTitle(t, "UDS", udsCatalog, sessionPayload.ID, generatedTitle)
+
+	metaPath := store.SessionMetaFile(filepath.Join(runtimeHarness.HomePaths.SessionsDir, sessionPayload.ID))
+	meta, err := store.ReadSessionMeta(metaPath)
+	if err != nil {
+		t.Fatalf("ReadSessionMeta(%q) error = %v", metaPath, err)
+	}
+	if meta.Name != generatedTitle {
+		t.Fatalf("session meta name = %q, want %q", meta.Name, generatedTitle)
+	}
+}
+
+func TestUDSTransportApprovalFlowMatchesHTTP(t *testing.T) {
+	acpmock.RequireDriver(t)
+	t.Parallel()
+
+	runtimeHarness := e2etest.StartRuntimeHarness(t, &e2etest.RuntimeHarnessOptions{
+		MockAgents: []e2etest.MockAgentSpec{{
+			FixturePath:  transportMockFixturePath(t, "permission_env_fixture.json"),
+			FixtureAgent: "approver",
+			AgentName:    transportUDSApprovalAgent,
+		}},
+	})
+
+	clients, err := runtimeHarness.TransportClients()
+	if err != nil {
+		t.Fatalf("TransportClients() error = %v", err)
+	}
+
+	ctx, cancel := context.WithTimeout(t.Context(), 20*time.Second)
+	defer cancel()
+
+	session, err := runtimeHarness.CreateSession(ctx, compozycontract.CreateSessionRequest{
+		AgentName:     transportUDSApprovalAgent,
+		WorkspacePath: runtimeHarness.WorkspaceRoot,
+	})
+	if err != nil {
+		t.Fatalf("CreateSession() error = %v", err)
+	}
+	session = waitForTransportSessionActive(t, ctx, runtimeHarness, session)
+
+	var approvedRequestID string
+	events, err := runtimeHarness.PromptSessionHTTPWithEvents(
+		ctx,
+		session.ID,
+		"request permission",
+		func(record e2etest.SSEEvent) error {
+			payload, ok := e2etest.PermissionPayloadFromSSE(record)
+			if !ok || payload.Decision != "" || approvedRequestID != "" {
+				return nil
+			}
+			approvedRequestID = payload.RequestID
+
+			resp := mustUnixRequest(
+				t,
+				clients.UDSClient,
+				http.MethodPost,
+				clients.UDSBaseURL+transportHarnessSessionPath(t, runtimeHarness, session.ID, "/approve"),
+				[]byte(fmt.Sprintf(`{"request_id":"%s","decision":"allow-always"}`, payload.RequestID)),
+				nil,
+			)
+			body, readErr := io.ReadAll(resp.Body)
+			closeErr := resp.Body.Close()
+			if readErr != nil && closeErr != nil {
+				return errors.Join(
+					fmt.Errorf("read UDS approval response: %w", readErr),
+					fmt.Errorf("close UDS approval response body: %w", closeErr),
+				)
+			}
+			if readErr != nil {
+				return fmt.Errorf("read UDS approval response: %w", readErr)
+			}
+			if closeErr != nil {
+				return fmt.Errorf("close UDS approval response body: %w", closeErr)
+			}
+			if err := e2etest.ValidateUDSApprovalResponse(resp.StatusCode, body); err != nil {
+				return err
+			}
+			return nil
+		},
+	)
+	if err != nil {
+		t.Fatalf("PromptSessionHTTPWithEvents() error = %v", err)
+	}
+	if approvedRequestID == "" {
+		t.Fatal("approvedRequestID = empty, want pending permission request")
+	}
+
+	payloads := e2etest.PermissionPayloads(events)
+	if got, want := len(payloads), 2; got != want {
+		t.Fatalf("len(permission payloads) = %d, want %d; payloads=%#v", got, want, payloads)
+	}
+	if got, want := payloads[0].RequestID, approvedRequestID; got != want {
+		t.Fatalf("payloads[0].RequestID = %q, want %q", got, want)
+	}
+	if got := payloads[len(payloads)-1].Decision; got != "allow-always" {
+		t.Fatalf("final permission decision = %q, want %q", got, "allow-always")
+	}
+	if !e2etest.RecordsContainTextDelta(events, "allow-always") {
+		t.Fatalf("prompt events = %#v, want allow-always text delta", events)
+	}
+}
+
+func TestUDSTransportSessionRuntimeCreateReadMatchesHTTP(t *testing.T) {
+	acpmock.RequireDriver(t)
+	t.Parallel()
+
+	runtimeHarness := e2etest.StartRuntimeHarness(t, &e2etest.RuntimeHarnessOptions{
+		ConfigSeed: e2etest.ConfigSeedOptions{Mutate: func(cfg *compozyconfig.Config) {
+			cfg.Session.Supervision.ActivityHeartbeatInterval = 100 * time.Millisecond
+		}},
+		MockAgents: []e2etest.MockAgentSpec{{
+			FixturePath:  transportMockFixturePath(t, "automation_task_fixture.json"),
+			FixtureAgent: "automation-runner",
+			AgentName:    transportUDSAutomationAgent,
+		}},
+	})
+
+	ctx, cancel := context.WithTimeout(t.Context(), 20*time.Second)
+	defer cancel()
+
+	var created compozycontract.SessionResponse
+	if err := runtimeHarness.UDSJSON(ctx, http.MethodPost, "/api/sessions", compozycontract.CreateSessionRequest{
+		AgentName:     transportUDSAutomationAgent,
+		WorkspacePath: runtimeHarness.WorkspaceRoot,
+	}, &created); err != nil {
+		t.Fatalf("UDS create session error = %v", err)
+	}
+	if created.Session.ID == "" {
+		t.Fatal("UDS create session id = empty, want non-empty")
+	}
+	if created.Session.Runtime.Status != "unbound" || created.Session.Runtime.Effective != nil {
+		t.Fatalf("UDS create runtime = %#v, want unbound without effective selection", created.Session.Runtime)
+	}
+	if created.Session.State != session.StateActive {
+		t.Fatalf("UDS accepted create state = %q, want %q", created.Session.State, session.StateActive)
+	}
+	created.Session = waitForTransportSessionActive(t, ctx, runtimeHarness, created.Session)
+
+	var udsDetail compozycontract.SessionResponse
+	if err := runtimeHarness.UDSJSON(
+		ctx,
+		http.MethodGet,
+		transportHarnessSessionPath(t, runtimeHarness, created.Session.ID, ""),
+		nil,
+		&udsDetail,
+	); err != nil {
+		t.Fatalf("UDS get session error = %v", err)
+	}
+	if udsDetail.Session.Runtime.Status != created.Session.Runtime.Status ||
+		udsDetail.Session.Runtime.Effective != nil {
+		t.Fatalf(
+			"UDS detail runtime = %#v, want unbound without effective selection",
+			udsDetail.Session.Runtime,
+		)
+	}
+
+	var httpDetail compozycontract.SessionResponse
+	if err := runtimeHarness.HTTPJSON(
+		ctx,
+		http.MethodGet,
+		transportHarnessSessionPath(t, runtimeHarness, created.Session.ID, ""),
+		nil,
+		&httpDetail,
+	); err != nil {
+		t.Fatalf("HTTP get session error = %v", err)
+	}
+	if httpDetail.Session.Runtime.Status != created.Session.Runtime.Status ||
+		httpDetail.Session.Runtime.Effective != nil {
+		t.Fatalf(
+			"HTTP detail runtime = %#v, want unbound without effective selection",
+			httpDetail.Session.Runtime,
+		)
+	}
+
+	// Invariant IT-039: both transports expose the wired supervision registry (one inspected source per
+	// work-signal kind), future steer delivery and durable queue capacity on the session resource.
+	// Owner: public transport parity; canonical real-daemon suite.
+	wantSources := len(session.WorkSignalKindValues())
+	for httpDetail.Session.Supervision == nil || len(httpDetail.Session.Supervision.Sources) != wantSources {
+		select {
+		case <-ctx.Done():
+			t.Fatal("supervision was not rebuilt", ctx.Err())
+		case <-time.After(20 * time.Millisecond):
+		}
+		if err := runtimeHarness.HTTPJSON(ctx, http.MethodGet,
+			transportHarnessSessionPath(t, runtimeHarness, created.Session.ID, ""), nil, &httpDetail); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := runtimeHarness.UDSJSON(ctx, http.MethodGet,
+		transportHarnessSessionPath(t, runtimeHarness, created.Session.ID, ""), nil, &udsDetail); err != nil {
+		t.Fatal(err)
+	}
+	for _, detail := range []compozycontract.SessionPayload{httpDetail.Session, udsDetail.Session} {
+		if detail.BusyInput == nil || detail.BusyInput.SteerDelivery == "" ||
+			detail.Queue == nil || detail.Queue.Entries != 0 || detail.Queue.Cap != 10 {
+			t.Fatalf("incomplete admission projection: busy=%+v queue=%+v", detail.BusyInput, detail.Queue)
+		}
+		if detail.Supervision == nil || detail.Supervision.WorkSignals == nil ||
+			len(detail.Supervision.Sources) != wantSources {
+			t.Fatalf("incomplete supervision projection: %+v", detail.Supervision)
+		}
+		for _, source := range detail.Supervision.Sources {
+			if source.State == "unknown" {
+				t.Fatalf("unwired source: %+v", source)
+			}
+		}
+	}
+
+	assertTransportSessionProvenanceParity(t, ctx, runtimeHarness, created.Session)
+}
+
+func assertTransportSessionProvenanceParity(
+	t *testing.T,
+	ctx context.Context,
+	runtimeHarness *e2etest.RuntimeHarness,
+	parent compozycontract.SessionPayload,
+) {
+	t.Helper()
+
+	var explicitChild compozycontract.SessionResponse
+	if err := runtimeHarness.UDSJSON(ctx, http.MethodPost, "/api/sessions", compozycontract.CreateSessionRequest{
+		AgentName:       parent.AgentName,
+		Name:            "ΟΣ İ",
+		WorkspacePath:   runtimeHarness.WorkspaceRoot,
+		ParentSessionID: parent.ID,
+	}, &explicitChild); err != nil {
+		t.Fatalf("UDS create explicit provenance child error = %v", err)
+	}
+	if explicitChild.Session.Type != session.SessionTypeUser {
+		t.Fatalf("explicit child type = %q, want %q", explicitChild.Session.Type, session.SessionTypeUser)
+	}
+	if explicitChild.Session.Lineage == nil ||
+		explicitChild.Session.Lineage.ParentSessionID != parent.ID ||
+		explicitChild.Session.Lineage.RootSessionID != parent.ID ||
+		explicitChild.Session.Lineage.SpawnDepth != 1 {
+		t.Fatalf(
+			"explicit child lineage = %#v, want parent/root %q depth 1",
+			explicitChild.Session.Lineage,
+			parent.ID,
+		)
+	}
+	if explicitChild.Session.Lineage.TTLExpiresAt != nil || explicitChild.Session.Lineage.AutoStopOnParent {
+		t.Fatalf("explicit child lineage = %#v, want no governance coupling", explicitChild.Session.Lineage)
+	}
+
+	inferredBody, err := json.Marshal(compozycontract.CreateSessionRequest{
+		AgentName:     parent.AgentName,
+		WorkspacePath: runtimeHarness.WorkspaceRoot,
+	})
+	if err != nil {
+		t.Fatalf("marshal inferred create request error = %v", err)
+	}
+	inferredResp := mustUnixRequest(
+		t,
+		runtimeHarness.UDSClient,
+		http.MethodPost,
+		runtimeHarness.UDSURL("/api/sessions"),
+		inferredBody,
+		map[string]string{
+			agentidentity.HeaderSessionID: parent.ID,
+			agentidentity.HeaderAgent:     parent.AgentName,
+		},
+	)
+	inferredPayload, readErr := io.ReadAll(inferredResp.Body)
+	closeErr := inferredResp.Body.Close()
+	if readErr != nil {
+		t.Fatalf("read inferred create response error = %v", readErr)
+	}
+	if closeErr != nil {
+		t.Errorf("close inferred create response error = %v", closeErr)
+	}
+	if inferredResp.StatusCode != http.StatusCreated {
+		t.Fatalf(
+			"inferred create status = %d, want %d; body=%s",
+			inferredResp.StatusCode,
+			http.StatusCreated,
+			strings.TrimSpace(string(inferredPayload)),
+		)
+	}
+	var inferredChild compozycontract.SessionResponse
+	if err := json.Unmarshal(inferredPayload, &inferredChild); err != nil {
+		t.Fatalf("decode inferred create response error = %v", err)
+	}
+	if inferredChild.Session.Lineage == nil ||
+		inferredChild.Session.Lineage.ParentSessionID != parent.ID {
+		t.Fatalf(
+			"identity-inferred child lineage = %#v, want caller parent %q",
+			inferredChild.Session.Lineage,
+			parent.ID,
+		)
+	}
+
+	childIDs := []string{explicitChild.Session.ID, inferredChild.Session.ID}
+	slices.Sort(childIDs)
+	parentQuery := "/api/sessions?all_workspaces=true&parent=" + url.QueryEscape(parent.ID)
+	rootQuery := "/api/sessions?all_workspaces=true&root=" + url.QueryEscape(parent.ID)
+
+	var udsChildren compozycontract.SessionCatalogResponse
+	if err := runtimeHarness.UDSJSON(ctx, http.MethodGet, parentQuery, nil, &udsChildren); err != nil {
+		t.Fatalf("UDS list parent filter error = %v", err)
+	}
+	var httpChildren compozycontract.SessionCatalogResponse
+	if err := runtimeHarness.HTTPJSON(ctx, http.MethodGet, parentQuery, nil, &httpChildren); err != nil {
+		t.Fatalf("HTTP list parent filter error = %v", err)
+	}
+	udsChildIDs := transportSessionCatalogIDs(udsChildren)
+	httpChildIDs := transportSessionCatalogIDs(httpChildren)
+	if !slices.Equal(udsChildIDs, childIDs) || !slices.Equal(httpChildIDs, childIDs) {
+		t.Fatalf(
+			"parent filter ids uds=%#v http=%#v, want %#v on both transports",
+			udsChildIDs,
+			httpChildIDs,
+			childIDs,
+		)
+	}
+	if udsChildren.Page.Total == nil || *udsChildren.Page.Total != 2 || httpChildren.Page.Total == nil ||
+		*httpChildren.Page.Total != 2 {
+		t.Fatalf(
+			"parent filter totals uds=%v http=%v, want 2 on both transports",
+			udsChildren.Page.Total,
+			httpChildren.Page.Total,
+		)
+	}
+
+	var udsTree compozycontract.SessionCatalogResponse
+	if err := runtimeHarness.UDSJSON(ctx, http.MethodGet, rootQuery, nil, &udsTree); err != nil {
+		t.Fatalf("UDS list root filter error = %v", err)
+	}
+	var httpTree compozycontract.SessionCatalogResponse
+	if err := runtimeHarness.HTTPJSON(ctx, http.MethodGet, rootQuery, nil, &httpTree); err != nil {
+		t.Fatalf("HTTP list root filter error = %v", err)
+	}
+	wantTree := append([]string{parent.ID}, childIDs...)
+	slices.Sort(wantTree)
+	udsTreeIDs := transportSessionCatalogIDs(udsTree)
+	httpTreeIDs := transportSessionCatalogIDs(httpTree)
+	if !slices.Equal(udsTreeIDs, wantTree) || !slices.Equal(httpTreeIDs, wantTree) {
+		t.Fatalf(
+			"root filter ids uds=%#v http=%#v, want whole tree %#v on both transports",
+			udsTreeIDs,
+			httpTreeIDs,
+			wantTree,
+		)
+	}
+	if udsTree.Page.Total == nil || *udsTree.Page.Total != 3 || httpTree.Page.Total == nil ||
+		*httpTree.Page.Total != 3 {
+		t.Fatalf(
+			"root filter totals uds=%v http=%v, want 3 on both transports",
+			udsTree.Page.Total,
+			httpTree.Page.Total,
+		)
+	}
+	latest := httpTree.Sessions[0]
+	for _, item := range httpTree.Sessions[1:] {
+		if item.CreatedAt.After(latest.CreatedAt) || item.CreatedAt.Equal(latest.CreatedAt) && item.ID > latest.ID {
+			latest = item
+		}
+	}
+	// Invariant: metadata counts include each live tree member exactly once on both transports.
+	facetQuery := "/api/sessions/facets?all_workspaces=true&root=" + url.QueryEscape(parent.ID)
+	for _, read := range []struct {
+		name    string
+		request func(context.Context, string, string, any, any) error
+	}{
+		{name: "UDS", request: runtimeHarness.UDSJSON},
+		{name: "HTTP", request: runtimeHarness.HTTPJSON},
+	} {
+		for _, text := range []string{"ος", "i̇"} {
+			var visibleMatches compozycontract.SessionCatalogResponse
+			path := rootQuery + "&skip_total=true&search_fields=title_agent&q=" + url.QueryEscape(text)
+			if err := read.request(ctx, http.MethodGet, path, nil, &visibleMatches); err != nil {
+				t.Fatalf("%s Unicode search error=%v", read.name, err)
+			}
+			if len(visibleMatches.Sessions) != 1 || visibleMatches.Sessions[0].ID != explicitChild.Session.ID {
+				t.Fatalf("%s Unicode query%q matches=%#v", read.name, text, visibleMatches)
+			}
+		}
+		var createdPage compozycontract.SessionCatalogResponse
+		if err := read.request(
+			ctx,
+			http.MethodGet,
+			rootQuery+"&sort=created&skip_total=true&limit=1",
+			nil,
+			&createdPage,
+		); err != nil {
+			t.Fatalf("%s created read error=%v", read.name, err)
+		}
+		if len(createdPage.Sessions) != 1 || createdPage.Sessions[0].ID != latest.ID || createdPage.Page.Total != nil ||
+			!createdPage.Page.HasMore {
+			t.Fatalf("%s latest-created page=%#v", read.name, createdPage)
+		}
+		var navigatorPage compozycontract.SessionCatalogResponse
+		if err := read.request(
+			ctx,
+			http.MethodGet,
+			rootQuery+"&sort=navigator&skip_total=true&limit=1",
+			nil,
+			&navigatorPage,
+		); err != nil {
+			t.Fatalf("%s navigator read error=%v", read.name, err)
+		}
+		if len(navigatorPage.Sessions) != 1 || navigatorPage.Page.Total != nil || !navigatorPage.Page.HasMore ||
+			navigatorPage.Page.NextCursor == "" {
+			t.Fatalf("%s bounded navigator page=%#v", read.name, navigatorPage)
+		}
+		var facets compozycontract.SessionCatalogFacetsResponse
+		if err := read.request(ctx, http.MethodGet, facetQuery, nil, &facets); err != nil {
+			t.Fatalf("%s facets error=%v", read.name, err)
+		}
+		if facets.Facets.All != 3 || len(facets.ByWorkspace) != 1 || facets.ByWorkspace[0].Facets.All != 3 {
+			t.Fatalf("%s tree facets=%#v, want three scoped live sessions", read.name, facets)
+		}
+	}
+}
+
+func transportSessionCatalogIDs(page compozycontract.SessionCatalogResponse) []string {
+	ids := make([]string, 0, len(page.Sessions))
+	for _, item := range page.Sessions {
+		ids = append(ids, item.ID)
+	}
+	slices.Sort(ids)
+	return ids
+}
+
+func TestUDSTransportStoppedSessionRemainsUnattachable(t *testing.T) {
+	acpmock.RequireDriver(t)
+	t.Parallel()
+
+	runtimeHarness := e2etest.StartRuntimeHarness(t, &e2etest.RuntimeHarnessOptions{
+		MockAgents: []e2etest.MockAgentSpec{{
+			FixturePath:  transportMockFixturePath(t, "automation_task_fixture.json"),
+			FixtureAgent: "automation-runner",
+			AgentName:    transportUDSAutomationAgent,
+		}},
+	})
+
+	ctx, cancel := context.WithTimeout(t.Context(), 20*time.Second)
+	defer cancel()
+
+	var created compozycontract.SessionResponse
+	if err := runtimeHarness.UDSJSON(ctx, http.MethodPost, "/api/sessions", compozycontract.CreateSessionRequest{
+		AgentName:     transportUDSAutomationAgent,
+		WorkspacePath: runtimeHarness.WorkspaceRoot,
+	}, &created); err != nil {
+		t.Fatalf("UDS create session error = %v", err)
+	}
+	created.Session = waitForTransportSessionActive(t, ctx, runtimeHarness, created.Session)
+
+	stopResp := mustUnixRequest(
+		t,
+		runtimeHarness.UDSClient,
+		http.MethodPost,
+		runtimeHarness.UDSURL(transportHarnessSessionPath(t, runtimeHarness, created.Session.ID, "/stop")),
+		nil,
+		nil,
+	)
+	body, readErr := io.ReadAll(stopResp.Body)
+	closeErr := stopResp.Body.Close()
+	if readErr != nil {
+		t.Fatalf("read UDS stop body error = %v", readErr)
+	}
+	if closeErr != nil {
+		t.Fatalf("close UDS stop body error = %v", closeErr)
+	}
+	if stopResp.StatusCode != http.StatusNoContent {
+		t.Fatalf(
+			"UDS stop session status = %d, want %d; body=%s",
+			stopResp.StatusCode,
+			http.StatusNoContent,
+			string(body),
+		)
+	}
+
+	// The same durable stop cause is available to the Web resource and native readers.
+	for _, read := range []func(context.Context, string, string, any, any) error{
+		runtimeHarness.HTTPJSON, runtimeHarness.UDSJSON,
+	} {
+		var detail compozycontract.SessionResponse
+		if err := read(ctx, http.MethodGet,
+			transportHarnessSessionPath(t, runtimeHarness, created.Session.ID, ""), nil, &detail); err != nil {
+			t.Fatal(err)
+		}
+		if detail.Session.State != session.StateStopped || detail.Session.StopCause != "user_requested" ||
+			detail.Session.Verified == nil || !*detail.Session.Verified {
+			t.Fatalf("stopped resource lost cause or verification: %#v", detail.Session)
+		}
+	}
+	nativeInput, err := json.Marshal(map[string]any{
+		"workspace": created.Session.WorkspaceID, "session_id": created.Session.ID, "limit": 1,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var native compozycontract.ToolInvokeResponse
+	if err := runtimeHarness.CLI.RunJSON(ctx, &native,
+		"tool", "invoke", "compozy__session_describe", "--input", string(nativeInput), "-o", "json"); err != nil {
+		t.Fatal(err)
+	}
+	var nativeDetail compozycontract.SessionResponse
+	if err := json.Unmarshal(native.Result.Structured, &nativeDetail); err != nil {
+		t.Fatal(err)
+	}
+	if nativeDetail.Session.StopCause != "user_requested" || nativeDetail.Session.State != session.StateStopped {
+		t.Fatalf("native stopped resource = %#v", nativeDetail.Session)
+	}
+
+	resumeResp := mustUnixRequest(
+		t,
+		runtimeHarness.UDSClient,
+		http.MethodPost,
+		runtimeHarness.UDSURL(transportHarnessSessionPath(t, runtimeHarness, created.Session.ID, "/attach")),
+		nil,
+		nil,
+	)
+	resumeBody, resumeReadErr := io.ReadAll(resumeResp.Body)
+	resumeCloseErr := resumeResp.Body.Close()
+	if resumeReadErr != nil {
+		t.Fatalf("read UDS resume body error = %v", resumeReadErr)
+	}
+	if resumeCloseErr != nil {
+		t.Fatalf("close UDS resume body error = %v", resumeCloseErr)
+	}
+	if resumeResp.StatusCode != http.StatusConflict {
+		t.Fatalf(
+			"UDS attach status = %d, want %d; body=%s",
+			resumeResp.StatusCode,
+			http.StatusConflict,
+			string(resumeBody),
+		)
+	}
+	if !strings.Contains(string(resumeBody), created.Session.ID) {
+		t.Fatalf("UDS attach body = %s, want session id %q", string(resumeBody), created.Session.ID)
+	}
+	if !strings.Contains(string(resumeBody), "not attachable") {
+		t.Fatalf("UDS attach body = %s, want attachability context", string(resumeBody))
+	}
+}
+
+func TestUDSTransportProjectionParityMatchesHTTPAndCLI(t *testing.T) {
+	acpmock.RequireDriver(t)
+	t.Parallel()
+
+	runtimeHarness := e2etest.StartRuntimeHarness(t, &e2etest.RuntimeHarnessOptions{
+		ConfigSeed: e2etest.ConfigSeedOptions{
+			DefaultAgent: transportUDSAutomationAgent,
+		},
+		MockAgents: []e2etest.MockAgentSpec{{
+			FixturePath:  transportMockFixturePath(t, "automation_task_fixture.json"),
+			FixtureAgent: "automation-runner",
+			AgentName:    transportUDSAutomationAgent,
+		}},
+	})
+
+	clients, err := runtimeHarness.TransportClients()
+	if err != nil {
+		t.Fatalf("TransportClients() error = %v", err)
+	}
+
+	ctx, cancel := context.WithTimeout(t.Context(), 20*time.Second)
+	defer cancel()
+
+	trigger, endpoint := seedTransportWebhookTrigger(t, ctx, runtimeHarness)
+	delivery, err := runtimeHarness.DeliverGlobalWebhook(
+		ctx,
+		endpoint,
+		"shared-secret",
+		[]byte(`{"payload":"deploy","branch":"main"}`),
+		"delivery-uds-transport",
+		time.Now().UTC(),
+	)
+	if err != nil {
+		t.Fatalf("DeliverGlobalWebhook() error = %v", err)
+	}
+	if got, want := len(delivery.Runs), 1; got != want {
+		t.Fatalf("len(delivery.Runs) = %d, want %d; delivery=%#v", got, want, delivery)
+	}
+
+	runID := delivery.Runs[0].ID
+	httpRun := waitForHTTPAutomationRun(t, ctx, runtimeHarness, runID)
+	udsRun := waitForUDSAutomationRun(t, ctx, runtimeHarness, runID)
+	cliRun := waitForCLIAutomationRun(t, ctx, clients.CLI, runID)
+
+	if err := e2etest.ValidateWebhookRunProjection(delivery, httpRun, udsRun, cliRun); err != nil {
+		t.Fatalf("ValidateWebhookRunProjection() error = %v", err)
+	}
+	if got, want := cliRun.TriggerID, trigger.ID; got != want {
+		t.Fatalf("cliRun.TriggerID = %q, want %q", got, want)
+	}
+}
+
+func TestUDSTransportMarketplaceParityMatchesHTTPAndCLI(t *testing.T) {
+	t.Parallel()
+
+	catalogServer := newTransportMarketplaceCatalogServer(t)
+	startMarketplaceHarness := func(t testing.TB) *e2etest.RuntimeHarness {
+		t.Helper()
+		return e2etest.StartRuntimeHarness(t, &e2etest.RuntimeHarnessOptions{
+			ConfigSeed: e2etest.ConfigSeedOptions{
+				Mutate: func(cfg *compozyconfig.Config) {
+					cfg.Marketplace.Catalog.BaseURL = catalogServer.URL
+					cfg.Marketplace.Catalog.TTL = time.Hour.String()
+					cfg.Marketplace.Catalog.Timeout = time.Second.String()
+				},
+			},
+		})
+	}
+	runtimeHarness := startMarketplaceHarness(t)
+	// Establish one committed snapshot before comparing nonblocking reads across transports.
+	var refreshed compozycontract.MarketplaceRefreshResponse
+	if err := runtimeHarness.HTTPJSON(
+		t.Context(),
+		http.MethodPost,
+		"/api/marketplace/refresh",
+		nil,
+		&refreshed,
+	); err != nil {
+		t.Fatalf("refresh parity fixture: %v", err)
+	}
+
+	clients, err := runtimeHarness.TransportClients()
+	if err != nil {
+		t.Fatalf("TransportClients() error = %v", err)
+	}
+
+	ctx, cancel := context.WithTimeout(t.Context(), 20*time.Second)
+	defer cancel()
+
+	t.Run("Should return the same catalog payload over HTTP, UDS, and CLI", func(t *testing.T) {
+		path := "/api/marketplace?limit=20"
+		var httpValue compozycontract.MarketplaceListResponse
+		if err := runtimeHarness.HTTPJSON(ctx, http.MethodGet, path, nil, &httpValue); err != nil {
+			t.Fatalf("HTTPJSON(%s) error = %v", path, err)
+		}
+		var udsValue compozycontract.MarketplaceListResponse
+		if err := runtimeHarness.UDSJSON(ctx, http.MethodGet, path, nil, &udsValue); err != nil {
+			t.Fatalf("UDSJSON(%s) error = %v", path, err)
+		}
+		var cliValue compozycontract.MarketplaceListResponse
+		if err := clients.CLI.RunJSON(
+			ctx,
+			&cliValue,
+			"marketplace",
+			"search",
+			"--limit",
+			"20",
+			"-o",
+			"json",
+		); err != nil {
+			t.Fatalf("CLI marketplace search error = %v", err)
+		}
+		assertTransportMarketplaceParity(t, path, httpValue, udsValue, cliValue)
+	})
+
+	t.Run("Should return the same entry detail payload over HTTP, UDS, and CLI", func(t *testing.T) {
+		path := "/api/marketplace/entries/bridge-github"
+		var httpValue compozycontract.MarketplaceEntryResponse
+		if err := runtimeHarness.HTTPJSON(ctx, http.MethodGet, path, nil, &httpValue); err != nil {
+			t.Fatalf("HTTPJSON(%s) error = %v", path, err)
+		}
+		var udsValue compozycontract.MarketplaceEntryResponse
+		if err := runtimeHarness.UDSJSON(ctx, http.MethodGet, path, nil, &udsValue); err != nil {
+			t.Fatalf("UDSJSON(%s) error = %v", path, err)
+		}
+		var cliValue compozycontract.MarketplaceEntryResponse
+		if err := clients.CLI.RunJSON(
+			ctx,
+			&cliValue,
+			"marketplace",
+			"info",
+			"bridge-github",
+			"-o",
+			"json",
+		); err != nil {
+			t.Fatalf("CLI marketplace info error = %v", err)
+		}
+		assertTransportMarketplaceParity(t, path, httpValue, udsValue, cliValue)
+	})
+
+	t.Run("Should preserve the current extension search envelope across HTTP, UDS, and CLI", func(t *testing.T) {
+		path := "/api/extensions/search?q=bridge&limit=20"
+		var httpValue compozycontract.ExtensionSearchResponse
+		if err := runtimeHarness.HTTPJSON(ctx, http.MethodGet, path, nil, &httpValue); err != nil {
+			t.Fatalf("HTTPJSON(%s) error = %v", path, err)
+		}
+		var udsValue compozycontract.ExtensionSearchResponse
+		if err := runtimeHarness.UDSJSON(ctx, http.MethodGet, path, nil, &udsValue); err != nil {
+			t.Fatalf("UDSJSON(%s) error = %v", path, err)
+		}
+		var cliValue compozycontract.ExtensionSearchResponse
+		if err := clients.CLI.RunJSON(
+			ctx,
+			&cliValue,
+			"extension",
+			"search",
+			"bridge",
+			"--limit",
+			"20",
+			"-o",
+			"json",
+		); err != nil {
+			t.Fatalf("CLI extension search error = %v", err)
+		}
+		assertTransportMarketplaceParity(t, path, httpValue, udsValue, cliValue)
+		// The search unions live community results with the curated catalog, so
+		// only the curated entry has a stable shape worth pinning.
+		curated := slices.IndexFunc(cliValue.Items, func(item compozycontract.ExtensionSearchItem) bool {
+			return item.Slug == "compozy/bridge-github"
+		})
+		if curated < 0 {
+			t.Fatalf("CLI extension search items = %#v, want the curated entry", cliValue)
+		}
+		item := cliValue.Items[curated]
+		if item.Name != "GitHub bridge" ||
+			item.Description != "Connect GitHub events to Compozy" ||
+			item.Version != "1.0.0" ||
+			item.Source != "curated" ||
+			item.Tier != "official" ||
+			item.Integrity != "catalog_digest" {
+			t.Fatalf("CLI extension search item = %#v, want current source-union fields", item)
+		}
+	})
+
+	t.Run("Should refresh the same catalog source over guarded HTTP and unguarded UDS", func(t *testing.T) {
+		path := "/api/marketplace/refresh"
+		var httpValue compozycontract.MarketplaceRefreshResponse
+		if err := runtimeHarness.HTTPJSON(ctx, http.MethodPost, path, nil, &httpValue); err != nil {
+			t.Fatalf("HTTPJSON(%s) error = %v", path, err)
+		}
+		var udsValue compozycontract.MarketplaceRefreshResponse
+		if err := runtimeHarness.UDSJSON(ctx, http.MethodPost, path, nil, &udsValue); err != nil {
+			t.Fatalf("UDSJSON(%s) error = %v", path, err)
+		}
+		assertTransportMarketplaceParity(t, path, httpValue, udsValue)
+	})
+}
+
+func newTransportMarketplaceCatalogServer(t testing.TB) *httptest.Server {
+	t.Helper()
+	manifest := `[extension]
+name = "bridge-github"
+version = "1.0.0"
+description = "Connect GitHub events to Compozy"
+min_compozy_version = "0.3.0-beta.25"
+
+[capabilities]
+provides = []
+
+[permissions]
+requires = []
+`
+	var archive bytes.Buffer
+	compressed := gzip.NewWriter(&archive)
+	writer := tar.NewWriter(compressed)
+	if err := writer.WriteHeader(
+		&tar.Header{Name: "bridge-github/extension.toml", Mode: 0o600, Size: int64(len(manifest))},
+	); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := io.WriteString(writer, manifest); err != nil {
+		t.Fatal(err)
+	}
+	if err := writer.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := compressed.Close(); err != nil {
+		t.Fatal(err)
+	}
+	digest := fmt.Sprintf("%x", sha256.Sum256(archive.Bytes()))
+	server := httptest.NewServer(http.HandlerFunc(func(response http.ResponseWriter, request *http.Request) {
+		switch request.URL.Path {
+		case "/package.tgz":
+			if _, err := response.Write(archive.Bytes()); err != nil {
+				t.Errorf("write package: %v", err)
+			}
+		case "/v3/marketplaces.json":
+			if _, err := io.WriteString(
+				response,
+				`{"manifest_version":3,"generated_at":"2026-09-13T00:00:00Z","entries":[]}`,
+			); err != nil {
+				t.Errorf("write presets: %v", err)
+			}
+		case "/v3/extensions.json":
+			response.Header().Set("Content-Type", "application/json")
+			document := `{"manifest_version":3,"generated_at":"2026-09-13T00:00:00Z","entries":[{` +
+				`"entry_id":"bridge-github","name":"GitHub bridge","description":"Connect GitHub events to Compozy",` +
+				`"version":"1.0.0","install_slug":"compozy/bridge-github",` +
+				`"artifact_url":"http://` + request.Host + `/package.tgz",` +
+				`"digest_sha256":"` + digest + `","tier":"official"}]}`
+			if _, err := io.WriteString(response, document); err != nil {
+				t.Errorf("write catalog: %v", err)
+			}
+		default:
+			http.NotFound(response, request)
+		}
+	}))
+	t.Cleanup(server.Close)
+	return server
+}
+
+func assertTransportMarketplaceParity(t testing.TB, path string, values ...any) {
+	t.Helper()
+	if len(values) < 2 {
+		t.Fatalf("%s transport values = %d, want at least 2", path, len(values))
+	}
+	expected := values[0]
+	for index, value := range values[1:] {
+		if reflect.DeepEqual(expected, value) {
+			continue
+		}
+		expectedJSON, expectedErr := json.Marshal(expected)
+		valueJSON, valueErr := json.Marshal(value)
+		if expectedErr != nil || valueErr != nil {
+			t.Fatalf(
+				"%s parity mismatch at transport %d; expected marshal error = %v, value marshal error = %v",
+				path,
+				index+1,
+				expectedErr,
+				valueErr,
+			)
+		}
+		t.Fatalf(
+			"%s transport 0 payload = %s, want parity with transport %d payload %s",
+			path,
+			expectedJSON,
+			index+1,
+			valueJSON,
+		)
+	}
+}
+
+func TestUDSTransportPromptFailureProjectionUsesSharedRuntimeHarness(t *testing.T) {
+	acpmock.RequireDriver(t)
+	t.Parallel()
+
+	runtimeHarness := e2etest.StartRuntimeHarness(t, &e2etest.RuntimeHarnessOptions{
+		MockAgents: []e2etest.MockAgentSpec{{
+			FixturePath:  transportMockFixturePath(t, "driver_fault_fixture.json"),
+			FixtureAgent: "faulty",
+			AgentName:    transportUDSFaultyAgent,
+		}},
+	})
+
+	ctx, cancel := context.WithTimeout(t.Context(), 20*time.Second)
+	defer cancel()
+
+	session, err := runtimeHarness.CreateSession(ctx, compozycontract.CreateSessionRequest{
+		AgentName:     transportUDSFaultyAgent,
+		WorkspacePath: runtimeHarness.WorkspaceRoot,
+	})
+	if err != nil {
+		t.Fatalf("CreateSession() error = %v", err)
+	}
+	session = waitForTransportSessionActive(t, ctx, runtimeHarness, session)
+
+	stream, err := runtimeHarness.PromptSession(ctx, session.ID, "trigger crash mid-stream")
+	if err != nil {
+		t.Fatalf("PromptSession() error = %v", err)
+	}
+	if !udsSSEContainsEvent(stream, "error") {
+		t.Fatalf("UDS prompt stream = %#v, want error event", stream)
+	}
+
+	transcript, err := runtimeHarness.SessionTranscript(ctx, session.ID)
+	if err != nil {
+		t.Fatalf("SessionTranscript() error = %v", err)
+	}
+	messages := transcriptpkg.MessagesFromEntries(transcript.Entries)
+	if !strings.Contains(joinTransportTranscript(messages), "partial before crash") {
+		t.Fatalf("transcript = %#v, want partial assistant output", messages)
+	}
+
+	eventsResp, err := runtimeHarness.SessionEvents(ctx, session.ID)
+	if err != nil {
+		t.Fatalf("SessionEvents() error = %v", err)
+	}
+	if !udsSessionEventsContainType(eventsResp.Events, "error") {
+		t.Fatalf("UDS session events = %#v, want error projection", eventsResp.Events)
+	}
+}
+
+// Invariant: terminal process-exited sessions reject every attachment path before ACP session/load.
+// Owning layer: HTTP/UDS session transport parity.
+func TestUDSTransportTerminalProcessFailureRejectsAttachAndPromptBeforeACPResume(t *testing.T) {
+	acpmock.RequireDriver(t)
+	t.Parallel()
+
+	t.Run("Should reject attach and prompt before ACP resume after a terminal process failure", func(t *testing.T) {
+		t.Parallel()
+
+		runtimeHarness := e2etest.StartRuntimeHarness(t, &e2etest.RuntimeHarnessOptions{
+			MockAgents: []e2etest.MockAgentSpec{{
+				FixturePath:  transportMockFixturePath(t, "driver_fault_fixture.json"),
+				FixtureAgent: "faulty",
+				AgentName:    transportUDSFaultyAgent,
+			}},
+		})
+
+		ctx, cancel := context.WithTimeout(t.Context(), 20*time.Second)
+		defer cancel()
+
+		created, err := runtimeHarness.CreateSession(ctx, compozycontract.CreateSessionRequest{
+			AgentName:     transportUDSFaultyAgent,
+			WorkspacePath: runtimeHarness.WorkspaceRoot,
+		})
+		if err != nil {
+			t.Fatalf("CreateSession() error = %v", err)
+		}
+		created = waitForTransportSessionActive(t, ctx, runtimeHarness, created)
+
+		stream, err := runtimeHarness.PromptSession(ctx, created.ID, "trigger crash mid-stream")
+		if err != nil {
+			t.Fatalf("PromptSession() error = %v", err)
+		}
+		if !udsSSEContainsEvent(stream, "error") {
+			t.Fatalf("UDS prompt stream = %#v, want error event", stream)
+		}
+		waitForTransportDeadSession(t, ctx, runtimeHarness, created.ID)
+
+		clients, err := runtimeHarness.TransportClients()
+		if err != nil {
+			t.Fatalf("TransportClients() error = %v", err)
+		}
+		path := transportHarnessSessionPath(t, runtimeHarness, created.ID, "/attach")
+		assertTransportDeadSessionRejection(t, clients.HTTPClient, runtimeHarness.HTTPURL(path), nil)
+		assertTransportDeadSessionRejection(t, clients.UDSClient, runtimeHarness.UDSURL(path), nil)
+
+		promptBody, err := json.Marshal(compozycontract.SendPromptRequest{
+			Message:        "retry a dead session",
+			MessageID:      "message-dead-session-retry",
+			IdempotencyKey: "idempotency-dead-session-retry",
+		})
+		if err != nil {
+			t.Fatalf("json.Marshal(dead session prompt) error = %v", err)
+		}
+		promptPath := transportHarnessSessionPath(t, runtimeHarness, created.ID, "/prompt")
+		assertTransportDeadSessionRejection(t, clients.HTTPClient, runtimeHarness.HTTPURL(promptPath), promptBody)
+		assertTransportDeadSessionRejection(t, clients.UDSClient, runtimeHarness.UDSURL(promptPath), promptBody)
+
+		registration, ok := runtimeHarness.MockAgentRegistration(transportUDSFaultyAgent)
+		if !ok {
+			t.Fatalf("MockAgentRegistration(%q) not found", transportUDSFaultyAgent)
+		}
+		diagnostics, err := acpmock.ReadDiagnostics(registration.DiagnosticsPath)
+		if err != nil {
+			t.Fatalf("ReadDiagnostics(%q) error = %v", registration.DiagnosticsPath, err)
+		}
+		for _, diagnostic := range acpmock.ProtocolDiagnostics(
+			acpmock.DiagnosticsForCompozySession(diagnostics, created.ID),
+		) {
+			if diagnostic.ProtocolMethod == "session/load" {
+				t.Fatalf("terminal session diagnostics = %#v, want no session/load", diagnostics)
+			}
+		}
+	})
+}
+
+func TestUDSTransportObserveHarnessLifecycleParityMatchesHTTP(t *testing.T) {
+	acpmock.RequireDriver(t)
+	t.Parallel()
+
+	runtimeHarness := e2etest.StartRuntimeHarness(t, &e2etest.RuntimeHarnessOptions{
+		MockAgents: []e2etest.MockAgentSpec{{
+			FixturePath:  transportMockFixturePath(t, "multi_agent_fixture.json"),
+			FixtureAgent: "alpha",
+			AgentName:    transportUDSObserveAgent,
+		}},
+	})
+
+	ctx, cancel := context.WithTimeout(t.Context(), 20*time.Second)
+	defer cancel()
+
+	session, err := runtimeHarness.CreateSession(ctx, compozycontract.CreateSessionRequest{
+		AgentName:     transportUDSObserveAgent,
+		WorkspacePath: runtimeHarness.WorkspaceRoot,
+	})
+	if err != nil {
+		t.Fatalf("CreateSession() error = %v", err)
+	}
+	session = waitForTransportSessionActive(t, ctx, runtimeHarness, session)
+
+	stream, err := runtimeHarness.PromptSessionHTTP(ctx, session.ID, "hello alpha")
+	if err != nil {
+		t.Fatalf("PromptSessionHTTP() error = %v", err)
+	}
+	if len(stream) == 0 {
+		t.Fatal("prompt stream = empty, want streamed events")
+	}
+
+	transcriptResp, err := runtimeHarness.SessionTranscript(ctx, session.ID)
+	if err != nil {
+		t.Fatalf("SessionTranscript() error = %v", err)
+	}
+	messages := transcriptpkg.MessagesFromEntries(transcriptResp.Entries)
+	if !strings.Contains(joinTransportTranscript(messages), "alpha says hi") {
+		t.Fatalf("transcript = %#v, want assistant reply", messages)
+	}
+
+	httpHarnessEvents := waitForTransportListLogs(
+		t,
+		ctx,
+		"waitForHTTPListLogs",
+		wantTransportObserveHarnessTypes(),
+		func(fetchCtx context.Context) ([]compozycontract.LogEventPayload, error) {
+			var response compozycontract.LogsListResponse
+			err := runtimeHarness.HTTPJSON(
+				fetchCtx,
+				http.MethodGet,
+				transportHarnessLogsPath(t, runtimeHarness, session.ID),
+				nil,
+				&response,
+			)
+			return response.Events, err
+		},
+	)
+	udsHarnessEvents := waitForTransportListLogs(
+		t,
+		ctx,
+		"waitForUDSListLogs",
+		wantTransportObserveHarnessTypes(),
+		func(fetchCtx context.Context) ([]compozycontract.LogEventPayload, error) {
+			var response compozycontract.LogsListResponse
+			err := runtimeHarness.UDSJSON(
+				fetchCtx,
+				http.MethodGet,
+				transportHarnessLogsPath(t, runtimeHarness, session.ID),
+				nil,
+				&response,
+			)
+			return response.Events, err
+		},
+	)
+
+	if !reflect.DeepEqual(httpHarnessEvents, udsHarnessEvents) {
+		t.Fatalf("HTTP harness events = %#v, want UDS parity %#v", httpHarnessEvents, udsHarnessEvents)
+	}
+	if got, want := logEventTypes(httpHarnessEvents), wantTransportObserveHarnessTypes(); !slices.Equal(got, want) {
+		t.Fatalf("harness event types = %#v, want %#v", got, want)
+	}
+	if !strings.Contains(httpHarnessEvents[0].Summary, "surface=startup") {
+		t.Fatalf("startup summary = %q, want startup surface", httpHarnessEvents[0].Summary)
+	}
+	if !strings.Contains(httpHarnessEvents[1].Summary, "selected=") {
+		t.Fatalf("section summary = %q, want selected sections", httpHarnessEvents[1].Summary)
+	}
+	if !strings.Contains(httpHarnessEvents[2].Summary, "surface=turn") {
+		t.Fatalf("turn summary = %q, want turn surface", httpHarnessEvents[2].Summary)
+	}
+	for _, augmenter := range []string{"skills", "situation"} {
+		if !slices.ContainsFunc(httpHarnessEvents[3:], func(event compozycontract.LogEventPayload) bool {
+			return strings.Contains(event.Summary, "augmenter="+augmenter+" ")
+		}) {
+			t.Fatalf("harness events = %#v, want %q augmenter metadata", httpHarnessEvents, augmenter)
+		}
+	}
+}
+
+func transportHarnessSessionPath(
+	t testing.TB,
+	harness *e2etest.RuntimeHarness,
+	sessionID string,
+	suffix string,
+) string {
+	t.Helper()
+
+	workspaceID := strings.TrimSpace(harness.WorkspaceID)
+	if workspaceID == "" {
+		t.Fatal("runtime harness WorkspaceID = empty")
+	}
+	return "/api/workspaces/" + url.PathEscape(workspaceID) +
+		"/sessions/" + url.PathEscape(sessionID) + suffix
+}
+
+func transportHarnessLogsPath(
+	t testing.TB,
+	harness *e2etest.RuntimeHarness,
+	sessionID string,
+) string {
+	t.Helper()
+
+	workspaceID := strings.TrimSpace(harness.WorkspaceID)
+	if workspaceID == "" {
+		t.Fatal("runtime harness WorkspaceID = empty")
+	}
+	query := url.Values{}
+	query.Set("workspace_id", workspaceID)
+	query.Set("session_id", strings.TrimSpace(sessionID))
+	query.Set("limit", "20")
+	return "/api/logs?" + query.Encode()
+}
+
+func TestUDSTransportSettingsReadParityMatchesHTTP(t *testing.T) {
+	acpmock.RequireDriver(t)
+	t.Parallel()
+
+	runtimeHarness := e2etest.StartRuntimeHarness(t, &e2etest.RuntimeHarnessOptions{})
+
+	ctx, cancel := context.WithTimeout(t.Context(), 20*time.Second)
+	defer cancel()
+
+	workspaceID := runtimeHarness.WorkspaceID
+
+	testCases := []struct {
+		name   string
+		path   string
+		decode func() any
+	}{
+		{
+			name:   "general section",
+			path:   "/api/settings/general",
+			decode: func() any { return &compozycontract.SettingsGeneralResponse{} },
+		},
+		{
+			name:   "providers collection",
+			path:   "/api/settings/providers",
+			decode: func() any { return &compozycontract.SettingsProvidersResponse{} },
+		},
+		{
+			name: "workspace mcp servers collection",
+			path: "/api/settings/mcp-servers?scope=workspace&workspace_id=" + url.QueryEscape(workspaceID),
+			decode: func() any {
+				return &compozycontract.SettingsMCPServersResponse{}
+			},
+		},
+		{
+			name:   "hooks and extensions section",
+			path:   "/api/settings/hooks-extensions",
+			decode: func() any { return &compozycontract.SettingsHooksExtensionsResponse{} },
+		},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			assertSettingsReadParityEventually(t, ctx, runtimeHarness, tc.path, tc.decode)
+		})
+	}
+}
+
+// Invariant: HTTP and UDS converge on the same settings projection after a concurrent live catalog
+// revision settles; a revision committed between sequential reads is not a transport mismatch.
+func assertSettingsReadParityEventually(
+	t *testing.T,
+	ctx context.Context,
+	runtimeHarness *e2etest.RuntimeHarness,
+	path string,
+	decode func() any,
+) {
+	t.Helper()
+
+	for {
+		sampleStarted := time.Now()
+		httpValue := decode()
+		if err := runtimeHarness.HTTPJSON(ctx, http.MethodGet, path, nil, httpValue); err != nil {
+			t.Fatalf("HTTPJSON(%s) error = %v", path, err)
+		}
+
+		udsValue := decode()
+		if err := runtimeHarness.UDSJSON(ctx, http.MethodGet, path, nil, udsValue); err != nil {
+			t.Fatalf("UDSJSON(%s) error = %v", path, err)
+		}
+		assertAndNormalizeSettingsReadParityVolatileFields(
+			t,
+			httpValue,
+			udsValue,
+			time.Since(sampleStarted),
+		)
+		if reflect.DeepEqual(httpValue, udsValue) {
+			return
+		}
+
+		select {
+		case <-ctx.Done():
+			httpPayload, err := json.Marshal(httpValue)
+			if err != nil {
+				t.Fatalf("json.Marshal(%s HTTP payload) error = %v", path, err)
+			}
+			udsPayload, err := json.Marshal(udsValue)
+			if err != nil {
+				t.Fatalf("json.Marshal(%s UDS payload) error = %v", path, err)
+			}
+			t.Fatalf("%s HTTP payload = %s, want UDS parity %s", path, httpPayload, udsPayload)
+		case <-time.After(25 * time.Millisecond):
+		}
+	}
+}
+
+func assertAndNormalizeSettingsReadParityVolatileFields(
+	t *testing.T,
+	httpValue,
+	udsValue any,
+	sampleDuration time.Duration,
+) {
+	t.Helper()
+
+	httpGeneral, httpOK := httpValue.(*compozycontract.SettingsGeneralResponse)
+	udsGeneral, udsOK := udsValue.(*compozycontract.SettingsGeneralResponse)
+	if !httpOK || !udsOK {
+		return
+	}
+
+	assertAndNormalizeSampledUptime(
+		t,
+		&httpGeneral.Runtime.UptimeSeconds,
+		&udsGeneral.Runtime.UptimeSeconds,
+		sampleDuration,
+	)
+}
+
+func assertAndNormalizeSampledUptime(t *testing.T, httpUptime, udsUptime *int64, sampleDuration time.Duration) {
+	t.Helper()
+	maxDriftSeconds := int64(sampleDuration/time.Second) + 1
+	uptimeDrift := *udsUptime - *httpUptime
+	if *httpUptime < 0 || *udsUptime < 0 || uptimeDrift < 0 || uptimeDrift > maxDriftSeconds {
+		t.Fatalf(
+			"uptime HTTP=%ds UDS=%ds, want nonnegative values and UDS after HTTP within %ds sampling window",
+			*httpUptime,
+			*udsUptime,
+			maxDriftSeconds,
+		)
+	}
+	*httpUptime, *udsUptime = 0, 0
+}
+
+func TestUDSTransportSettingsDependencyExtensionParityMatchesHTTP(t *testing.T) {
+	acpmock.RequireDriver(t)
+	t.Parallel()
+
+	t.Run("Should preserve extension state and bound uptime drift across transports", func(t *testing.T) {
+		t.Parallel()
+		runtimeHarness := e2etest.StartRuntimeHarness(t, &e2etest.RuntimeHarnessOptions{})
+
+		clients, err := runtimeHarness.TransportClients()
+		if err != nil {
+			t.Fatalf("TransportClients() error = %v", err)
+		}
+
+		ctx, cancel := context.WithTimeout(t.Context(), 20*time.Second)
+		defer cancel()
+
+		sampleStarted := time.Now()
+		httpListResp := mustUnixRequest(
+			t,
+			clients.HTTPClient,
+			http.MethodGet,
+			transportSettingsHTTPURL(runtimeHarness, "/api/extensions"),
+			nil,
+			nil,
+		)
+		if httpListResp.StatusCode != http.StatusOK {
+			body := readAndCloseHTTPBody(t, httpListResp)
+			t.Fatalf(
+				"HTTP extension list status = %d, want %d; body=%s",
+				httpListResp.StatusCode,
+				http.StatusOK,
+				string(body),
+			)
+		}
+		var httpList compozycontract.ExtensionsResponse
+		decodeHTTPJSON(t, httpListResp, &httpList)
+
+		var udsList compozycontract.ExtensionsResponse
+		if err := runtimeHarness.UDSJSON(ctx, http.MethodGet, "/api/extensions", nil, &udsList); err != nil {
+			t.Fatalf("UDSJSON(/api/extensions) error = %v", err)
+		}
+		sampleDuration := time.Since(sampleStarted)
+		if len(httpList.Extensions) != len(udsList.Extensions) {
+			t.Fatalf("HTTP extension count = %d, want UDS parity %d", len(httpList.Extensions), len(udsList.Extensions))
+		}
+		for i := range httpList.Extensions {
+			assertAndNormalizeSampledUptime(
+				t,
+				&httpList.Extensions[i].UptimeSeconds,
+				&udsList.Extensions[i].UptimeSeconds,
+				sampleDuration,
+			)
+		}
+		if !reflect.DeepEqual(httpList.Extensions, udsList.Extensions) {
+			t.Fatalf("HTTP extensions = %#v, want UDS parity %#v", httpList.Extensions, udsList.Extensions)
+		}
+		if len(httpList.Extensions) == 0 {
+			return
+		}
+
+		name := httpList.Extensions[0].Name
+		sampleStarted = time.Now()
+		httpStatusResp := mustUnixRequest(
+			t,
+			clients.HTTPClient,
+			http.MethodGet,
+			transportSettingsHTTPURL(runtimeHarness, "/api/extensions/"+url.PathEscape(name)),
+			nil,
+			nil,
+		)
+		if httpStatusResp.StatusCode != http.StatusOK {
+			body := readAndCloseHTTPBody(t, httpStatusResp)
+			t.Fatalf(
+				"HTTP extension status = %d, want %d; body=%s",
+				httpStatusResp.StatusCode,
+				http.StatusOK,
+				string(body),
+			)
+		}
+		var httpStatus compozycontract.ExtensionResponse
+		decodeHTTPJSON(t, httpStatusResp, &httpStatus)
+
+		var udsStatus compozycontract.ExtensionResponse
+		if err := runtimeHarness.UDSJSON(
+			ctx,
+			http.MethodGet,
+			"/api/extensions/"+url.PathEscape(name),
+			nil,
+			&udsStatus,
+		); err != nil {
+			t.Fatalf("UDSJSON(/api/extensions/%s) error = %v", name, err)
+		}
+		assertAndNormalizeSampledUptime(
+			t,
+			&httpStatus.Extension.UptimeSeconds,
+			&udsStatus.Extension.UptimeSeconds,
+			time.Since(sampleStarted),
+		)
+		if !reflect.DeepEqual(httpStatus.Extension, udsStatus.Extension) {
+			t.Fatalf("HTTP extension = %#v, want UDS parity %#v", httpStatus.Extension, udsStatus.Extension)
+		}
+	})
+}
+
+func TestUDSTransportSettingsMutationsRemainPrivilegedWhenHTTPIsNonLoopback(t *testing.T) {
+	acpmock.RequireDriver(t)
+	t.Parallel()
+
+	runtimeHarness := e2etest.StartRuntimeHarness(t, &e2etest.RuntimeHarnessOptions{
+		ConfigSeed: e2etest.ConfigSeedOptions{
+			Host: "0.0.0.0",
+		},
+	})
+
+	clients, err := runtimeHarness.TransportClients()
+	if err != nil {
+		t.Fatalf("TransportClients() error = %v", err)
+	}
+
+	ctx, cancel := context.WithTimeout(t.Context(), 20*time.Second)
+	defer cancel()
+
+	workspaceID := runtimeHarness.WorkspaceID
+	putPath := "/api/settings/mcp-servers/server-a?scope=workspace&workspace_id=" +
+		url.QueryEscape(workspaceID) + "&target=sidecar"
+	putBody, err := json.Marshal(compozycontract.PutSettingsMCPServerRequest{
+		Server: compozycontract.SettingsMCPServerPayload{
+			Name:    "server-a",
+			Command: "mcpd",
+			Args:    []string{"serve"},
+		},
+	})
+	if err != nil {
+		t.Fatalf("json.Marshal(put settings body) error = %v", err)
+	}
+
+	httpPutResp := mustUnixRequest(
+		t,
+		clients.HTTPClient,
+		http.MethodPut,
+		transportSettingsHTTPURL(runtimeHarness, putPath),
+		putBody,
+		nil,
+	)
+	if httpPutResp.StatusCode != http.StatusForbidden {
+		body := readAndCloseHTTPBody(t, httpPutResp)
+		t.Fatalf(
+			"HTTP PUT settings status = %d, want %d; body=%s",
+			httpPutResp.StatusCode,
+			http.StatusForbidden,
+			string(body),
+		)
+	}
+	var forbidden compozycontract.ErrorPayload
+	decodeHTTPJSON(t, httpPutResp, &forbidden)
+
+	var udsMutation compozycontract.SettingsLayeredCollectionMutationResult
+	if err := runtimeHarness.UDSJSON(
+		ctx,
+		http.MethodPut,
+		putPath,
+		compozycontract.PutSettingsMCPServerRequest{
+			Server: compozycontract.SettingsMCPServerPayload{
+				Name:    "server-a",
+				Command: "mcpd",
+				Args:    []string{"serve"},
+			},
+		},
+		&udsMutation,
+	); err != nil {
+		t.Fatalf("UDSJSON(PUT %s) error = %v", putPath, err)
+	}
+	if udsMutation.Scope != compozycontract.SettingsLayeredScopeWorkspace || udsMutation.WorkspaceID != workspaceID {
+		t.Fatalf("UDS mutation = %#v, want workspace-scoped result", udsMutation)
+	}
+
+	listPath := "/api/settings/mcp-servers?scope=workspace&workspace_id=" + url.QueryEscape(workspaceID)
+	httpListResp := mustUnixRequest(
+		t,
+		clients.HTTPClient,
+		http.MethodGet,
+		transportSettingsHTTPURL(runtimeHarness, listPath),
+		nil,
+		nil,
+	)
+	if httpListResp.StatusCode != http.StatusForbidden {
+		body := readAndCloseHTTPBody(t, httpListResp)
+		t.Fatalf(
+			"HTTP GET settings list status = %d, want %d; body=%s",
+			httpListResp.StatusCode,
+			http.StatusForbidden,
+			string(body),
+		)
+	}
+	var listForbidden compozycontract.ErrorPayload
+	decodeHTTPJSON(t, httpListResp, &listForbidden)
+
+	var udsList compozycontract.SettingsMCPServersResponse
+	if err := runtimeHarness.UDSJSON(ctx, http.MethodGet, listPath, nil, &udsList); err != nil {
+		t.Fatalf("UDSJSON(GET %s) error = %v", listPath, err)
+	}
+	if !settingsMCPServerPresent(udsList.MCPServers, "server-a") {
+		t.Fatalf("UDS mcp list = %#v, want server-a after UDS mutation", udsList)
+	}
+
+	deletePath := "/api/settings/mcp-servers/server-a?scope=workspace&workspace_id=" +
+		url.QueryEscape(workspaceID) + "&target=sidecar"
+	var deleteResult compozycontract.SettingsLayeredCollectionMutationResult
+	if err := runtimeHarness.UDSJSON(ctx, http.MethodDelete, deletePath, nil, &deleteResult); err != nil {
+		t.Fatalf("UDSJSON(DELETE %s) error = %v", deletePath, err)
+	}
+	if deleteResult.Scope != compozycontract.SettingsLayeredScopeWorkspace ||
+		deleteResult.WorkspaceID != workspaceID {
+		t.Fatalf("deleteResult = %#v, want workspace-scoped delete result", deleteResult)
+	}
+
+	httpListResp = mustUnixRequest(
+		t,
+		clients.HTTPClient,
+		http.MethodGet,
+		transportSettingsHTTPURL(runtimeHarness, listPath),
+		nil,
+		nil,
+	)
+	if httpListResp.StatusCode != http.StatusForbidden {
+		body := readAndCloseHTTPBody(t, httpListResp)
+		t.Fatalf(
+			"HTTP GET settings list after delete status = %d, want %d; body=%s",
+			httpListResp.StatusCode,
+			http.StatusForbidden,
+			string(body),
+		)
+	}
+	var listAfterDeleteForbidden compozycontract.ErrorPayload
+	decodeHTTPJSON(t, httpListResp, &listAfterDeleteForbidden)
+
+	var udsListAfterDelete compozycontract.SettingsMCPServersResponse
+	if err := runtimeHarness.UDSJSON(ctx, http.MethodGet, listPath, nil, &udsListAfterDelete); err != nil {
+		t.Fatalf("UDSJSON(GET %s after delete) error = %v", listPath, err)
+	}
+	if settingsMCPServerPresent(udsListAfterDelete.MCPServers, "server-a") {
+		t.Fatalf("UDS mcp list after delete = %#v, want server-a removed", udsListAfterDelete)
+	}
+}
+
+func TestUDSTransportTaskSurfaceMatchesHTTPAndDocumentedSpecOperations(t *testing.T) {
+	t.Parallel()
+
+	homePaths := newTestHomePaths(t)
+	udsEngine := newTestRouter(t, newTestHandlers(t, &stubSessionManager{}, stubObserver{}, homePaths))
+
+	udsRoutes := apitestutil.RoutesFromEngine(udsEngine.Routes(), isDocumentedTaskRoute)
+	httpRoutes := apitestutil.DocumentedRoutesForTransport(apispec.TransportHTTP, isDocumentedTaskRoute)
+	if !slices.Equal(udsRoutes, httpRoutes) {
+		t.Fatalf("UDS task routes = %v, want documented HTTP task routes %v", udsRoutes, httpRoutes)
+	}
+
+	specRoutes := apitestutil.DocumentedRoutesForTransport(apispec.TransportUDS, isDocumentedTaskRoute)
+	if !slices.Equal(udsRoutes, specRoutes) {
+		t.Fatalf("UDS task routes = %v, want documented task routes %v", udsRoutes, specRoutes)
+	}
+}
+
+func TestUDSTransportProfileSurfaceMatchesHTTPAndDocumentedSpecOperations(t *testing.T) {
+	t.Parallel()
+	t.Run("Should match the HTTP and documented profile surfaces", func(t *testing.T) {
+		t.Parallel()
+		udsEngine := newTestRouter(t, newTestHandlers(t, &stubSessionManager{}, stubObserver{}, newTestHomePaths(t)))
+		udsRoutes := apitestutil.ProfileRoutesFromEngine(udsEngine.Routes())
+		httpRoutes := apitestutil.DocumentedProfileRoutesForTransport(apispec.TransportHTTP)
+		if !slices.Equal(udsRoutes, httpRoutes) {
+			t.Fatalf("UDS profile routes = %v, want documented HTTP profile routes %v", udsRoutes, httpRoutes)
+		}
+		specRoutes := apitestutil.DocumentedProfileRoutesForTransport(apispec.TransportUDS)
+		if !slices.Equal(udsRoutes, specRoutes) {
+			t.Fatalf("UDS profile routes = %v, want documented profile routes %v", udsRoutes, specRoutes)
+		}
+	})
+}
+
+func waitForUDSAutomationRun(
+	t testing.TB,
+	ctx context.Context,
+	harness *e2etest.RuntimeHarness,
+	runID string,
+) compozycontract.RunPayload {
+	t.Helper()
+
+	return waitForTransportAutomationRun(
+		t,
+		ctx,
+		runID,
+		"waitForUDSAutomationRun",
+		func(fetchCtx context.Context) (compozycontract.RunPayload, error) {
+			return harness.GetAutomationRun(fetchCtx, runID)
+		},
+	)
+}
+
+func transportSettingsHTTPURL(harness *e2etest.RuntimeHarness, path string) string {
+	return fmt.Sprintf("http://127.0.0.1:%d%s", harness.Config.HTTP.Port, path)
+}
+
+func settingsMCPServerPresent(items []compozycontract.SettingsMCPServerItemPayload, name string) bool {
+	for _, item := range items {
+		if item.Name == name {
+			return true
+		}
+	}
+	return false
+}
+
+func waitForCLIAutomationRun(
+	t testing.TB,
+	ctx context.Context,
+	client *e2etest.CLIClient,
+	runID string,
+) compozycontract.RunPayload {
+	t.Helper()
+
+	return waitForTransportAutomationRun(
+		t,
+		ctx,
+		runID,
+		"waitForCLIAutomationRun",
+		func(fetchCtx context.Context) (compozycontract.RunPayload, error) {
+			var run compozycontract.RunPayload
+			err := client.RunJSON(fetchCtx, &run, "automation", "runs", "get", runID, "-o", "json")
+			return run, err
+		},
+	)
+}
+
+func seedTransportWebhookTrigger(
+	t testing.TB,
+	ctx context.Context,
+	harness *e2etest.RuntimeHarness,
+) (compozycontract.TriggerPayload, string) {
+	t.Helper()
+
+	state, err := harness.SeedAutomationFixtures(ctx, e2etest.AutomationFixtureSeed{
+		Triggers: []compozycontract.CreateTriggerRequest{{
+			Scope:              automationpkg.AutomationScopeGlobal,
+			Name:               "deploy-review",
+			AgentName:          transportUDSAutomationAgent,
+			Prompt:             `Review payload {{ index .Data "payload" }} for {{ index .Data "branch" }}`,
+			Event:              "webhook",
+			EndpointSlug:       "deploy-review",
+			WebhookSecretValue: "shared-secret",
+		}},
+	})
+	if err != nil {
+		t.Fatalf("SeedAutomationFixtures() error = %v", err)
+	}
+	if got, want := len(state.Triggers), 1; got != want {
+		t.Fatalf("len(state.Triggers) = %d, want %d", got, want)
+	}
+
+	endpoint, err := automationpkg.FormatWebhookEndpoint(
+		state.Triggers[0].EndpointSlug,
+		state.Triggers[0].WebhookID,
+	)
+	if err != nil {
+		t.Fatalf("FormatWebhookEndpoint() error = %v", err)
+	}
+	return state.Triggers[0], endpoint
+}
+
+func isDocumentedTaskRoute(path string) bool {
+	return strings.HasPrefix(path, "/api/tasks") ||
+		strings.HasPrefix(path, "/api/task-runs") ||
+		strings.HasPrefix(path, "/api/observe/tasks")
+}
+
+func waitForHTTPAutomationRun(
+	t testing.TB,
+	ctx context.Context,
+	harness *e2etest.RuntimeHarness,
+	runID string,
+) compozycontract.RunPayload {
+	t.Helper()
+
+	return waitForTransportAutomationRun(
+		t,
+		ctx,
+		runID,
+		"waitForHTTPAutomationRun",
+		func(fetchCtx context.Context) (compozycontract.RunPayload, error) {
+			var response compozycontract.RunResponse
+			err := harness.HTTPJSON(
+				fetchCtx,
+				http.MethodGet,
+				"/api/automation/runs/"+url.PathEscape(runID),
+				nil,
+				&response,
+			)
+			return response.Run, err
+		},
+	)
+}
+
+func waitForTransportAutomationRun(
+	t testing.TB,
+	ctx context.Context,
+	runID string,
+	label string,
+	fetch func(context.Context) (compozycontract.RunPayload, error),
+) compozycontract.RunPayload {
+	t.Helper()
+
+	waitCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
+	ticker := time.NewTicker(25 * time.Millisecond)
+	defer ticker.Stop()
+
+	var (
+		lastErr error
+		lastRun compozycontract.RunPayload
+	)
+	for {
+		run, err := fetch(waitCtx)
+		if err == nil && run.ID == runID {
+			return run
+		}
+		lastErr = err
+		lastRun = run
+		select {
+		case <-waitCtx.Done():
+			t.Fatalf(
+				"%s(%q) timed out: %v; last error=%v last run=%#v",
+				label,
+				runID,
+				waitCtx.Err(),
+				lastErr,
+				lastRun,
+			)
+		case <-ticker.C:
+		}
+	}
+}
+
+func waitForTransportSessionTitle(
+	t testing.TB,
+	ctx context.Context,
+	harness *e2etest.RuntimeHarness,
+	sessionID string,
+	wantTitle string,
+) (compozycontract.SessionsResponse, compozycontract.SessionsResponse) {
+	t.Helper()
+
+	waitCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
+	ticker := time.NewTicker(25 * time.Millisecond)
+	defer ticker.Stop()
+	path := "/api/sessions?workspace_id=" + url.QueryEscape(harness.WorkspaceID)
+
+	var (
+		httpCatalog compozycontract.SessionsResponse
+		udsCatalog  compozycontract.SessionsResponse
+		httpErr     error
+		udsErr      error
+	)
+	for {
+		httpCatalog = compozycontract.SessionsResponse{}
+		httpErr = harness.HTTPJSON(waitCtx, http.MethodGet, path, nil, &httpCatalog)
+		udsCatalog = compozycontract.SessionsResponse{}
+		udsErr = harness.UDSJSON(waitCtx, http.MethodGet, path, nil, &udsCatalog)
+		if httpErr == nil && udsErr == nil &&
+			transportCatalogHasSingleTitle(httpCatalog, sessionID, wantTitle) &&
+			transportCatalogHasSingleTitle(udsCatalog, sessionID, wantTitle) {
+			return httpCatalog, udsCatalog
+		}
+
+		select {
+		case <-waitCtx.Done():
+			t.Fatalf(
+				"automatic title %q for session %q timed out: %v; HTTP error=%v catalog=%#v; UDS error=%v catalog=%#v",
+				wantTitle,
+				sessionID,
+				waitCtx.Err(),
+				httpErr,
+				httpCatalog,
+				udsErr,
+				udsCatalog,
+			)
+		case <-ticker.C:
+		}
+	}
+}
+
+func waitForTransportSessionActive(
+	t testing.TB,
+	ctx context.Context,
+	harness *e2etest.RuntimeHarness,
+	accepted compozycontract.SessionPayload,
+) compozycontract.SessionPayload {
+	t.Helper()
+	active, err := harness.WaitForSessionActive(ctx, accepted.ID)
+	if err != nil {
+		t.Fatalf("WaitForSessionActive(%q) error = %v; accepted=%#v", accepted.ID, err, accepted)
+	}
+	return active
+}
+
+func waitForTransportDeadSession(
+	t testing.TB,
+	ctx context.Context,
+	harness *e2etest.RuntimeHarness,
+	sessionID string,
+) {
+	t.Helper()
+
+	waitCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
+	ticker := time.NewTicker(25 * time.Millisecond)
+	defer ticker.Stop()
+	path := transportHarnessSessionPath(t, harness, sessionID, "?include_health=true")
+	var last compozycontract.SessionPayload
+	var lastErr error
+	for {
+		var response compozycontract.SessionResponse
+		if err := harness.UDSJSON(waitCtx, http.MethodGet, path, nil, &response); err == nil {
+			last = response.Session
+			if last.State == session.StateStopped &&
+				last.Failure != nil && last.Failure.Kind == store.FailureProcess &&
+				last.Health != nil && last.Health.Health == compozycontract.SessionHealthDead &&
+				!last.Health.Attachable && !last.Health.EligibleForWake {
+				return
+			}
+		} else {
+			lastErr = err
+		}
+
+		select {
+		case <-waitCtx.Done():
+			t.Fatalf(
+				"terminal session %q did not become dead and non-attachable: %v; last=%#v",
+				sessionID,
+				lastErr,
+				last,
+			)
+		case <-ticker.C:
+		}
+	}
+}
+
+func assertTransportDeadSessionRejection(
+	t *testing.T,
+	client *http.Client,
+	targetURL string,
+	body []byte,
+) {
+	t.Helper()
+
+	response := mustUnixRequest(t, client, http.MethodPost, targetURL, body, nil)
+	payload := readAndCloseHTTPBody(t, response)
+	if response.StatusCode != http.StatusConflict {
+		t.Fatalf("POST %s status = %d, want %d; body=%s", targetURL, response.StatusCode, http.StatusConflict, payload)
+	}
+	var failure compozycontract.ErrorPayload
+	if err := json.Unmarshal(payload, &failure); err != nil {
+		t.Fatalf("json.Unmarshal(%s) error = %v; body=%s", targetURL, err, payload)
+	}
+	if !strings.Contains(failure.Error, "not attachable") {
+		t.Fatalf("POST %s error = %q, want attachability context", targetURL, failure.Error)
+	}
+}
+
+func transportCatalogHasSingleTitle(
+	catalog compozycontract.SessionsResponse,
+	sessionID string,
+	wantTitle string,
+) bool {
+	return len(catalog.Sessions) == 1 &&
+		catalog.Sessions[0].ID == sessionID &&
+		catalog.Sessions[0].Name == wantTitle
+}
+
+func assertTransportCatalogTitle(
+	t testing.TB,
+	transport string,
+	catalog compozycontract.SessionsResponse,
+	sessionID string,
+	wantTitle string,
+) {
+	t.Helper()
+
+	if !transportCatalogHasSingleTitle(catalog, sessionID, wantTitle) {
+		t.Fatalf(
+			"%s session catalog = %#v, want exactly one session id=%q name=%q",
+			transport,
+			catalog.Sessions,
+			sessionID,
+			wantTitle,
+		)
+	}
+}
+
+func waitForTransportListLogs(
+	t testing.TB,
+	ctx context.Context,
+	label string,
+	wantTypes []string,
+	fetch func(context.Context) ([]compozycontract.LogEventPayload, error),
+) []compozycontract.LogEventPayload {
+	t.Helper()
+
+	waitCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
+	ticker := time.NewTicker(25 * time.Millisecond)
+	defer ticker.Stop()
+
+	var (
+		lastErr    error
+		lastEvents []compozycontract.LogEventPayload
+	)
+	for {
+		events, err := fetch(waitCtx)
+		if err == nil {
+			harnessEvents := filterHarnessListLogs(events)
+			if slices.Equal(logEventTypes(harnessEvents), wantTypes) {
+				return harnessEvents
+			}
+			lastEvents = harnessEvents
+		} else {
+			lastErr = err
+		}
+
+		select {
+		case <-waitCtx.Done():
+			t.Fatalf(
+				"%s timed out: %v; last error=%v last harness events=%#v",
+				label,
+				waitCtx.Err(),
+				lastErr,
+				lastEvents,
+			)
+		case <-ticker.C:
+		}
+	}
+}
+
+func wantTransportObserveHarnessTypes() []string {
+	return []string{
+		"harness.context_resolved",
+		"harness.section_selected",
+		"harness.context_resolved",
+		"harness.augmenter_applied",
+		"harness.augmenter_applied",
+	}
+}
+
+func udsSSEContainsEvent(records []e2etest.SSEEvent, want string) bool {
+	for _, record := range records {
+		if record.Event == want {
+			return true
+		}
+	}
+	return false
+}
+
+func udsSessionEventsContainType(events []compozycontract.SessionEventPayload, want string) bool {
+	for _, event := range events {
+		var payload struct {
+			Type string `json:"type"`
+		}
+		if err := json.Unmarshal(event.Content, &payload); err == nil && payload.Type == want {
+			return true
+		}
+	}
+	return false
+}
+
+func filterHarnessListLogs(events []compozycontract.LogEventPayload) []compozycontract.LogEventPayload {
+	filtered := make([]compozycontract.LogEventPayload, 0, len(events))
+	for _, event := range events {
+		if strings.HasPrefix(event.Type, "harness.") {
+			filtered = append(filtered, event)
+		}
+	}
+	return filtered
+}
+
+func logEventTypes(events []compozycontract.LogEventPayload) []string {
+	types := make([]string, 0, len(events))
+	for _, event := range events {
+		types = append(types, event.Type)
+	}
+	return types
+}
+
+func joinTransportTranscript(messages []transcriptpkg.UIMessage) string {
+	return transcriptpkg.JoinUIMessageText(messages)
+}
+
+func waitForTransportTranscriptText(
+	t testing.TB,
+	ctx context.Context,
+	runtimeHarness *e2etest.RuntimeHarness,
+	sessionID string,
+	want ...string,
+) {
+	t.Helper()
+
+	waitCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
+	ticker := time.NewTicker(25 * time.Millisecond)
+	defer ticker.Stop()
+	var (
+		lastText string
+		lastErr  error
+	)
+	for {
+		page, err := runtimeHarness.SessionTranscript(waitCtx, sessionID)
+		if err == nil {
+			lastText = joinTransportTranscript(transcriptpkg.MessagesFromEntries(page.Entries))
+			matched := true
+			for _, expected := range want {
+				if !strings.Contains(lastText, expected) {
+					matched = false
+					break
+				}
+			}
+			if matched {
+				return
+			}
+		} else {
+			lastErr = err
+		}
+
+		select {
+		case <-waitCtx.Done():
+			t.Fatalf(
+				"timed out waiting for session %q transcript text %q: %v; last error=%v transcript=%q",
+				sessionID,
+				want,
+				waitCtx.Err(),
+				lastErr,
+				lastText,
+			)
+		case <-ticker.C:
+		}
+	}
+}
+
+func transportMockFixturePath(t testing.TB, name string) string {
+	t.Helper()
+
+	_, file, _, ok := runtime.Caller(0)
+	if !ok {
+		t.Fatal("runtime.Caller(0) failed")
+	}
+	return filepath.Join(filepath.Dir(file), "..", "..", "testutil", "acpmock", "testdata", name)
+}
+
+func writeTransportProviderOverrideConfig(
+	t testing.TB,
+	workspaceRoot string,
+	providerName string,
+	command string,
+	includeProvider bool,
+) {
+	t.Helper()
+
+	configDir := filepath.Join(workspaceRoot, compozyconfig.DirName)
+	if err := os.MkdirAll(configDir, 0o755); err != nil {
+		t.Fatalf("os.MkdirAll(%q) error = %v", configDir, err)
+	}
+
+	var builder strings.Builder
+	if includeProvider {
+		builder.WriteString("[providers." + providerName + "]\n")
+		builder.WriteString(`command = "`)
+		builder.WriteString(escapeTransportConfigString(command))
+		builder.WriteString("\"\n")
+		builder.WriteString("[providers." + providerName + ".models]\n")
+		builder.WriteString(`default = "transport-override-model"` + "\n")
+		builder.WriteString("[[providers." + providerName + ".credential_slots]]\n")
+		builder.WriteString(`name = "api_key"` + "\n")
+		builder.WriteString(`target_env = "TRANSPORT_OVERRIDE_API_KEY"` + "\n")
+		builder.WriteString(`secret_ref = "env:TRANSPORT_OVERRIDE_API_KEY"` + "\n")
+		builder.WriteString(`kind = "api_key"` + "\n")
+		builder.WriteString(`required = false` + "\n")
+	}
+
+	configPath := filepath.Join(configDir, compozyconfig.ConfigName)
+	if err := os.WriteFile(configPath, []byte(builder.String()), 0o600); err != nil {
+		t.Fatalf("os.WriteFile(%q) error = %v", configPath, err)
+	}
+}
+
+func escapeTransportConfigString(value string) string {
+	replacer := strings.NewReplacer(`\`, `\\`, `"`, `\"`)
+	return replacer.Replace(strings.TrimSpace(value))
+}
+
+func transportDoctorItem(
+	t testing.TB,
+	payload compozycontract.DoctorPayload,
+	id string,
+) compozycontract.DiagnosticItem {
+	t.Helper()
+	for _, item := range payload.Items {
+		if item.ID == id {
+			return item
+		}
+	}
+	t.Fatalf("doctor items = %#v, want %q", payload.Items, id)
+	return compozycontract.DiagnosticItem{}
+}
+
+func transportPositiveNumber(value any) bool {
+	number, ok := value.(float64)
+	return ok && number > 0
+}
+
+// Invariant IT-040: navigation has identical structured results on HTTP, UDS,
+// CLI and native tools, with bounded search and a canonical workspace binder.
+func TestUDSTransportSessionNavigationMatchesAllPublicSurfaces(t *testing.T) {
+	acpmock.RequireDriver(t)
+	t.Parallel()
+	t.Run("Should navigate older history with four-surface parity and workspace denial", func(t *testing.T) {
+		t.Parallel()
+		fixture := writeTransportNavigationFixture(t)
+		h := e2etest.StartRuntimeHarness(t, &e2etest.RuntimeHarnessOptions{MockAgents: []e2etest.MockAgentSpec{{
+			FixturePath: fixture, FixtureAgent: "navigation-runner", AgentName: "navigation-runner",
+		}}})
+		ctx, cancel := context.WithTimeout(t.Context(), 90*time.Second)
+		defer cancel()
+		created, err := h.CreateSession(
+			ctx,
+			compozycontract.CreateSessionRequest{AgentName: "navigation-runner", WorkspacePath: h.WorkspaceRoot},
+		)
+		if err != nil {
+			t.Fatal(err)
+		}
+		for i := range 105 {
+			if _, err := h.PromptSession(ctx, created.ID, fmt.Sprintf("question %03d", i)); err != nil {
+				t.Fatalf("prompt %d: %v", i, err)
+			}
+		}
+		for _, suffix := range []string{"search?q=question&limit=2", "outline"} {
+			path := transportHarnessSessionPath(t, h, created.ID, "/transcript/"+suffix)
+			var httpValue, udsValue any
+			if err := h.HTTPJSON(ctx, http.MethodGet, path, nil, &httpValue); err != nil {
+				t.Fatal(err)
+			}
+			if err := h.UDSJSON(ctx, http.MethodGet, path, nil, &udsValue); err != nil {
+				t.Fatal(err)
+			}
+			if !reflect.DeepEqual(httpValue, udsValue) {
+				t.Fatalf("HTTP/UDS navigation mismatch: %#v / %#v", httpValue, udsValue)
+			}
+			var cliValue any
+			args := []string{"session", "outline", created.ID, "-o", "json"}
+			nativeID := "compozy__session_outline"
+			input := map[string]any{"workspace": created.WorkspaceID, "session_id": created.ID}
+			if strings.HasPrefix(suffix, "search") {
+				args = []string{"session", "search", created.ID, "question", "--limit", "2", "-o", "json"}
+				nativeID = "compozy__session_search"
+				input["q"], input["limit"] = "question", 2
+			}
+			if err := h.CLI.RunJSON(ctx, &cliValue, args...); err != nil {
+				t.Fatal(err)
+			}
+			if !reflect.DeepEqual(httpValue, cliValue) {
+				t.Fatalf("CLI navigation mismatch: %#v / %#v", httpValue, cliValue)
+			}
+			raw, err := json.Marshal(input)
+			if err != nil {
+				t.Fatal(err)
+			}
+			var native compozycontract.ToolInvokeResponse
+			if err := h.CLI.RunJSON(
+				ctx,
+				&native,
+				"tool",
+				"invoke",
+				nativeID,
+				"--input",
+				string(raw),
+				"-o",
+				"json",
+			); err != nil {
+				t.Fatal(err)
+			}
+			var nativeValue any
+			if err := json.Unmarshal(native.Result.Structured, &nativeValue); err != nil {
+				t.Fatalf("native decode: %v result=%+v", err, native)
+			}
+			if !reflect.DeepEqual(httpValue, nativeValue) {
+				t.Fatalf("native navigation mismatch: %#v / %#v", httpValue, nativeValue)
+			}
+		}
+		var search compozycontract.SessionTranscriptSearchResponse
+		if err := h.CLI.RunJSON(
+			ctx,
+			&search,
+			"session",
+			"search",
+			created.ID,
+			"question 000",
+			"-o",
+			"json",
+		); err != nil {
+			t.Fatal(err)
+		}
+		if len(search.Matches) != 1 || search.Truncated || search.Matches[0].Snippet != "question 000" {
+			t.Fatalf("older history search = %#v", search)
+		}
+		if search.Matches[0].PartIndex == nil || *search.Matches[0].PartIndex != 0 ||
+			search.Matches[0].Field != "text" {
+			t.Fatalf("older history match source = %#v", search.Matches[0])
+		}
+		var outline compozycontract.SessionTranscriptOutlineResponse
+		if err := h.CLI.RunJSON(ctx, &outline, "session", "outline", created.ID, "-o", "json"); err != nil {
+			t.Fatal(err)
+		}
+		if len(outline.Entries) != 105 || outline.Entries[0].Preview != "question 000" ||
+			outline.Entries[104].ReplyPreview != "reply 104" {
+			t.Fatalf("full outline = %#v", outline)
+		}
+		assertTransportNavigationBoundaries(t, ctx, h, created)
+	})
+}
+
+func writeTransportNavigationFixture(t *testing.T) string {
+	t.Helper()
+	turns := make([]map[string]any, 0, 105)
+	for i := range 105 {
+		turns = append(turns, map[string]any{
+			"name":  fmt.Sprintf("navigation-%03d", i),
+			"match": map[string]any{"turn_source": "user", "user_text": fmt.Sprintf("question %03d", i)},
+			"steps": []map[string]any{{"kind": "assistant", "text": fmt.Sprintf("reply %03d", i)}},
+		})
+	}
+	fixture := map[string]any{"version": 2, "agents": []map[string]any{
+		{
+			"name":        "navigation-runner",
+			"provider":    "claude",
+			"permissions": "approve-all",
+			"prompt":      "Answer navigation fixtures.",
+			"turns":       turns,
+		},
+	}}
+	raw, err := json.Marshal(fixture)
+	if err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(t.TempDir(), "navigation.json")
+	if err := os.WriteFile(path, raw, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	return path
+}
+
+func assertTransportNavigationBoundaries(
+	t *testing.T,
+	ctx context.Context,
+	h *e2etest.RuntimeHarness,
+	created compozycontract.SessionPayload,
+) {
+	t.Helper()
+	var other compozycontract.WorkspaceResponse
+	if err := h.UDSJSON(
+		ctx,
+		http.MethodPost,
+		"/api/workspaces",
+		compozycontract.CreateWorkspaceRequest{RootDir: t.TempDir(), Name: "navigation-other"},
+		&other,
+	); err != nil {
+		t.Fatal(err)
+	}
+	for _, transport := range []struct {
+		client *http.Client
+		url    func(string) string
+	}{{h.HTTPClient, h.HTTPURL}, {h.UDSClient, h.UDSURL}} {
+		for _, tc := range []struct {
+			path   string
+			status int
+		}{
+			{transportHarnessSessionPath(t, h, created.ID, "/transcript/search?q=x&limit=1001"), http.StatusBadRequest},
+			{transportHarnessSessionPath(t, h, created.ID, "/transcript/search?q="), http.StatusBadRequest},
+			{"/api/workspaces/" + other.Workspace.ID + "/sessions/" + created.ID + "/transcript/search?q=question", http.StatusNotFound},
+			{"/api/workspaces/" + other.Workspace.ID + "/sessions/" + created.ID + "/transcript/outline", http.StatusNotFound},
+		} {
+			resp := mustUnixRequest(t, transport.client, http.MethodGet, transport.url(tc.path), nil, nil)
+			body := readAndCloseHTTPBody(t, resp)
+			if resp.StatusCode != tc.status || !strings.Contains(string(body), "error") {
+				t.Fatalf("boundary %s = %d %s", tc.path, resp.StatusCode, body)
+			}
+		}
+	}
+	for _, nativeID := range []string{"compozy__session_search", "compozy__session_outline"} {
+		input := map[string]any{"workspace": other.Workspace.ID, "session_id": created.ID}
+		if strings.HasSuffix(nativeID, "search") {
+			input["q"] = "question"
+		}
+		raw, err := json.Marshal(input)
+		if err != nil {
+			t.Fatal(err)
+		}
+		stdout, stderr, err := h.CLI.Run(ctx, "tool", "invoke", nativeID, "--input", string(raw), "-o", "json")
+		if err == nil {
+			t.Fatalf("foreign workspace tool succeeded: %s %s", stdout, stderr)
+		}
+		if strings.Contains(stdout, "question 000") || strings.Contains(stdout, "reply 000") {
+			t.Fatalf("foreign workspace leaked history: %s", stdout)
+		}
+	}
+}
+
+func TestUDSTransportAppTokenLifecycleMatchesHTTP(t *testing.T) {
+	acpmock.RequireDriver(t)
+	t.Parallel()
+	t.Run(
+		"Should manage one durable credential through both transports and enforce browser boundaries [IT-001 IT-002 IT-009]",
+		func(t *testing.T) {
+			t.Parallel()
+			harness := e2etest.StartRuntimeHarness(t, &e2etest.RuntimeHarnessOptions{})
+			clients, err := harness.TransportClients()
+			if err != nil {
+				t.Fatalf("TransportClients() error = %v", err)
+			}
+			request := func(uds bool, method, path, body string, headers map[string]string, status int) []byte {
+				t.Helper()
+				client, target := clients.HTTPClient, harness.HTTPURL(path)
+				if uds {
+					client, target = clients.UDSClient, harness.UDSURL(path)
+				}
+				response := mustUnixRequest(t, client, method, target, []byte(body), headers)
+				payload := readAndCloseHTTPBody(t, response)
+				if response.StatusCode != status {
+					t.Fatalf("UDS=%t %s %s = %d/%s, want %d", uds, method, path, response.StatusCode, payload, status)
+				}
+				return payload
+			}
+			decodeError := func(body []byte, code string) {
+				t.Helper()
+				var payload compozycontract.ErrorPayload
+				if err := json.Unmarshal(body, &payload); err != nil {
+					t.Fatalf("decode error response: %v; body=%s", err, body)
+				}
+				if payload.Code != code || payload.Error == "" {
+					t.Fatalf("error payload = %#v, want %s with message", payload, code)
+				}
+			}
+			committed, err := os.ReadFile("../../../openapi/compozy.json")
+			if err != nil {
+				t.Fatal(err)
+			}
+			for _, uds := range []bool{false, true} {
+				if body := request(
+					uds,
+					http.MethodGet,
+					"/api/openapi.json",
+					"",
+					nil,
+					http.StatusOK,
+				); !bytes.Equal(
+					body,
+					committed,
+				) {
+					t.Fatalf("UDS=%t runtime OpenAPI differs from committed contract", uds)
+				}
+			}
+			created := request(true, http.MethodPost, "/api/app-tokens",
+				`{"name":"Transport browser","origins":["http://localhost:3000"]}`, nil, http.StatusCreated)
+			var issued compozycontract.AppTokenIssuedResponse
+			if err := json.Unmarshal(created, &issued); err != nil {
+				t.Fatalf("decode issued token: %v", err)
+			}
+			if !strings.HasPrefix(issued.Token, "cpz_app_") || !strings.HasPrefix(issued.AppToken.ID, "apt_") ||
+				issued.AppToken.Name != "Transport browser" || issued.AppToken.LastUsedAt != nil {
+				t.Fatalf("issued token = %#v", issued.AppToken)
+			}
+			path := "/api/app-tokens/" + issued.AppToken.ID
+			listed := request(false, http.MethodGet, "/api/app-tokens", "", nil, http.StatusOK)
+			udsListed := request(true, http.MethodGet, "/api/app-tokens", "", nil, http.StatusOK)
+			if !jsonEqual(listed, udsListed) {
+				t.Fatalf("app token lists differ: HTTP=%s UDS=%s", listed, udsListed)
+			}
+			var tokens compozycontract.AppTokensResponse
+			if err := json.Unmarshal(listed, &tokens); err != nil {
+				t.Fatalf("decode listed tokens: %v", err)
+			}
+			if len(tokens.AppTokens) != 1 || tokens.AppTokens[0].ID != issued.AppToken.ID ||
+				bytes.Contains(listed, []byte("cpz_app_")) {
+				t.Fatalf("listed tokens = %s, want one secret-free credential", listed)
+			}
+			browserHeaders := map[string]string{
+				"Origin":        "http://localhost:3000",
+				"Authorization": "Bearer " + issued.Token,
+			}
+			preflight := mustUnixRequest(
+				t,
+				clients.HTTPClient,
+				http.MethodOptions,
+				harness.HTTPURL("/api/sessions"),
+				nil,
+				map[string]string{"Origin": browserHeaders["Origin"], "Access-Control-Request-Method": http.MethodGet},
+			)
+			preflightBody := readAndCloseHTTPBody(t, preflight)
+			if preflight.StatusCode != http.StatusNoContent || len(preflightBody) != 0 ||
+				preflight.Header.Get("Access-Control-Allow-Origin") != browserHeaders["Origin"] ||
+				preflight.Header.Get("Access-Control-Allow-Credentials") != "" {
+				t.Fatalf("preflight = %d/%s headers=%v", preflight.StatusCode, preflightBody, preflight.Header)
+			}
+			listPath := "/api/sessions?workspace_id=" + url.QueryEscape(harness.WorkspaceID)
+			localBody := request(false, http.MethodGet, listPath, "", nil, http.StatusOK)
+			ownOriginBody := request(
+				false,
+				http.MethodGet,
+				listPath,
+				"",
+				map[string]string{"Origin": harness.HTTPBaseURL},
+				http.StatusOK,
+			)
+			browserBody := request(false, http.MethodGet, listPath, "", browserHeaders, http.StatusOK)
+			request(false, http.MethodGet, "/api/status/identity", "", browserHeaders, http.StatusOK)
+			if !bytes.Equal(localBody, ownOriginBody) || !bytes.Equal(localBody, browserBody) {
+				t.Fatalf("session reads differ across local, own-origin and app-token requests")
+			}
+			// Existing local privileges remain unchanged, including mutations and vault reads.
+			resolveBody, err := json.Marshal(compozycontract.ResolveWorkspaceRequest{Path: harness.WorkspaceRoot})
+			if err != nil {
+				t.Fatal(err)
+			}
+			request(false, http.MethodPost, "/api/workspaces/resolve", string(resolveBody), nil, http.StatusOK)
+			request(false, http.MethodGet, "/api/vault/secrets", "", nil, http.StatusOK)
+			ownHeaders := map[string]string{"Origin": harness.HTTPBaseURL}
+			for _, test := range []struct{ method, path, body string }{
+				{http.MethodPost, "/api/sessions", `{}`},
+				{http.MethodPatch, "/api/settings/general", `{}`},
+			} {
+				local := request(false, test.method, test.path, test.body, nil, http.StatusBadRequest)
+				own := request(false, test.method, test.path, test.body, ownHeaders, http.StatusBadRequest)
+				if !jsonEqual(local, own) {
+					t.Fatalf(
+						"own-origin %s %s differs from tokenless local: %s / %s",
+						test.method,
+						test.path,
+						local,
+						own,
+					)
+				}
+			}
+			settingsPath := "/api/settings/general"
+			terminalsPath := "/api/workspaces/" + url.PathEscape(harness.WorkspaceID) + "/terminals"
+			settingsSampleStart := time.Now()
+			settingsBefore := request(false, http.MethodGet, settingsPath, "", nil, http.StatusOK)
+			terminalsBefore := request(false, http.MethodGet, terminalsPath, "", nil, http.StatusOK)
+			for _, test := range []struct{ method, path, body string }{
+				{http.MethodPost, terminalsPath + "/exec", `{"command":"echo forbidden"}`},
+				{http.MethodPatch, settingsPath, `{"config":{"limits":{"max_concurrent_agents":99}}}`},
+				{http.MethodPost, "/api/tools/compozy__session_list/invoke", `{}`},
+				{http.MethodPost, "/api/extensions", `{"source":"forbidden"}`},
+				{http.MethodPost, "/api/agent/tasks/claim-next", `{}`},
+			} {
+				decodeError(
+					request(false, test.method, test.path, test.body, browserHeaders, http.StatusForbidden),
+					"app_token_route_forbidden",
+				)
+			}
+			settingsAfter := request(false, http.MethodGet, settingsPath, "", nil, http.StatusOK)
+			var beforeSettings, afterSettings compozycontract.SettingsGeneralResponse
+			if err := json.Unmarshal(settingsBefore, &beforeSettings); err != nil {
+				t.Fatalf("decode settings before denied mutation: %v", err)
+			}
+			if err := json.Unmarshal(settingsAfter, &afterSettings); err != nil {
+				t.Fatalf("decode settings after denied mutation: %v", err)
+			}
+			// A denied mutation preserves settings while the daemon's uptime keeps advancing.
+			assertAndNormalizeSettingsReadParityVolatileFields(
+				t, &beforeSettings, &afterSettings, time.Since(settingsSampleStart),
+			)
+			if !reflect.DeepEqual(beforeSettings, afterSettings) {
+				t.Fatal("denied app mutation changed settings")
+			}
+			if after := request(
+				false,
+				http.MethodGet,
+				terminalsPath,
+				"",
+				nil,
+				http.StatusOK,
+			); !jsonEqual(
+				terminalsBefore,
+				after,
+			) {
+				t.Fatal("denied app mutation created a terminal")
+			}
+			decodeError(request(
+				false,
+				http.MethodOptions,
+				"/api/sessions",
+				"",
+				map[string]string{
+					"Origin":                        "http://localhost:4000",
+					"Access-Control-Request-Method": http.MethodGet,
+				},
+				http.StatusForbidden,
+			), "app_origin_not_allowed")
+			for _, endpoint := range []string{"/api/status", "/api/app-tokens", "/api/vault/secrets", "/api/gateway/devices", "/api/agent/me", "/api/fs/browse"} {
+				decodeError(
+					request(false, http.MethodGet, endpoint, "", browserHeaders, http.StatusForbidden),
+					"app_token_route_forbidden",
+				)
+			}
+			decodeError(request(false, http.MethodPost, "/api/app-tokens",
+				`{"name":"Forbidden"}`, browserHeaders, http.StatusForbidden), "app_token_route_forbidden")
+			var udsUpdate compozycontract.AppTokenResponse
+			if err := json.Unmarshal(request(true, http.MethodPatch, path,
+				`{"name":"UDS browser"}`, nil, http.StatusOK), &udsUpdate); err != nil {
+				t.Fatal(err)
+			}
+			if udsUpdate.AppToken.Name != "UDS browser" ||
+				!slices.Equal(udsUpdate.AppToken.Origins, []string{"http://localhost:3000"}) {
+				t.Fatalf("UDS app-token patch = %#v, want renamed token and preserved origins", udsUpdate.AppToken)
+			}
+			updated := request(false, http.MethodPatch, path,
+				`{"name":"Updated browser","origins":["https://dash.example.com"]}`, nil, http.StatusOK)
+			var update compozycontract.AppTokenResponse
+			if err := json.Unmarshal(updated, &update); err != nil {
+				t.Fatalf("decode updated token: %v", err)
+			}
+			if update.AppToken.Name != "Updated browser" ||
+				!slices.Equal(update.AppToken.Origins, []string{"https://dash.example.com"}) ||
+				update.AppToken.LastUsedAt == nil {
+				t.Fatalf(
+					"updated token = %#v, want origin replacement and successful-read attribution",
+					update.AppToken,
+				)
+			}
+			decodeError(
+				request(false, http.MethodGet, "/api/sessions", "", browserHeaders, http.StatusForbidden),
+				"app_origin_not_allowed",
+			)
+			decodeError(
+				request(false, http.MethodOptions, "/api/sessions", "", browserHeaders, http.StatusForbidden),
+				"app_origin_not_allowed",
+			)
+			newPreflight := request(
+				false,
+				http.MethodOptions,
+				"/api/sessions",
+				"",
+				map[string]string{
+					"Origin":                        "https://dash.example.com",
+					"Access-Control-Request-Method": http.MethodGet,
+				},
+				http.StatusNoContent,
+			)
+			if len(newPreflight) != 0 {
+				t.Fatalf("new-origin preflight body = %s, want empty", newPreflight)
+			}
+			for _, uds := range []bool{false, true} {
+				decodeError(
+					request(uds, http.MethodGet, "/api/app-tokens?state=expired", "", nil, http.StatusBadRequest),
+					"app_token_state_invalid",
+				)
+			}
+			revoked := request(true, http.MethodDelete, path, "", nil, http.StatusOK)
+			var result compozycontract.AppTokenRevokeResponse
+			if err := json.Unmarshal(revoked, &result); err != nil {
+				t.Fatalf("decode revoked token: %v", err)
+			}
+			if !result.Changed || result.AppToken.RevokedAt == nil || result.AppToken.ID != issued.AppToken.ID {
+				t.Fatalf("revoked response = %#v", result)
+			}
+			for _, uds := range []bool{false, true} {
+				decodeError(
+					request(uds, http.MethodPatch, path, `{"name":"Revoked update"}`, nil, http.StatusConflict),
+					"app_token_revoked",
+				)
+				decodeError(
+					request(uds, http.MethodDelete, "/api/app-tokens/apt_missing", "", nil, http.StatusNotFound),
+					"app_token_not_found",
+				)
+				for _, state := range []string{"active", "revoked", "all"} {
+					body := request(uds, http.MethodGet, "/api/app-tokens?state="+state, "", nil, http.StatusOK)
+					if err := json.Unmarshal(body, &tokens); err != nil {
+						t.Fatalf("decode state %s: %v", state, err)
+					}
+					want := 1
+					if state == "active" {
+						want = 0
+					}
+					if len(tokens.AppTokens) != want || bytes.Contains(body, []byte("cpz_app_")) {
+						t.Fatalf("state %s = %s, want %d secret-free rows", state, body, want)
+					}
+				}
+			}
+			decodeError(request(
+				false,
+				http.MethodGet,
+				"/api/sessions",
+				"",
+				map[string]string{
+					"Origin":        "https://dash.example.com",
+					"Authorization": "Bearer " + issued.Token,
+				},
+				http.StatusUnauthorized,
+			),
+				"app_token_revoked")
+			var localOnly compozycontract.AppTokenIssuedResponse
+			if err := json.Unmarshal(
+				request(
+					false,
+					http.MethodPost,
+					"/api/app-tokens",
+					`{"name":"Local attribution"}`,
+					nil,
+					http.StatusCreated,
+				),
+				&localOnly,
+			); err != nil {
+				t.Fatal(err)
+			}
+			request(
+				false,
+				http.MethodGet,
+				"/api/status",
+				"",
+				map[string]string{"Authorization": "Bearer " + localOnly.Token},
+				http.StatusOK,
+			)
+			for _, origin := range []string{"https://dash.example.com", "http://localhost:3000", "null"} {
+				decodeError(request(
+					false,
+					http.MethodOptions,
+					"/api/sessions",
+					"",
+					map[string]string{
+						"Origin":                        origin,
+						"Access-Control-Request-Method": http.MethodGet,
+					},
+					http.StatusForbidden,
+				), "app_origin_not_allowed")
+				decodeError(request(
+					false,
+					http.MethodGet,
+					"/api/sessions",
+					"",
+					map[string]string{
+						"Origin":        origin,
+						"Authorization": "Bearer " + localOnly.Token,
+					},
+					http.StatusForbidden,
+				), "app_origin_not_allowed")
+			}
+			var limiterToken compozycontract.AppTokenIssuedResponse
+			if err := json.Unmarshal(request(
+				true,
+				http.MethodPost,
+				"/api/app-tokens",
+				`{"name":"Rate isolation","origins":["http://a.test","http://b.test"]}`,
+				nil,
+				http.StatusCreated,
+			), &limiterToken); err != nil {
+				t.Fatal(err)
+			}
+			for range 10 {
+				decodeError(request(
+					false,
+					http.MethodGet,
+					"/api/status/identity",
+					"",
+					map[string]string{
+						"Origin":        "http://a.test",
+						"Authorization": "Bearer cpz_app_invalid",
+					},
+					http.StatusUnauthorized,
+				), "app_token_unauthenticated")
+			}
+			decodeError(request(
+				false,
+				http.MethodGet,
+				"/api/status/identity",
+				"",
+				map[string]string{
+					"Origin":        "http://a.test",
+					"Authorization": "Bearer " + limiterToken.Token,
+				},
+				http.StatusTooManyRequests,
+			), "app_token_rate_limited")
+			request(
+				false,
+				http.MethodGet,
+				"/api/status/identity",
+				"",
+				map[string]string{
+					"Origin":        "http://b.test",
+					"Authorization": "Bearer " + limiterToken.Token,
+				},
+				http.StatusOK,
+			)
+
+		},
+	)
+}

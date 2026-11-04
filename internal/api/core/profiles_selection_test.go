@@ -1,0 +1,130 @@
+package core_test
+
+import (
+	"context"
+	"net/http"
+	"strings"
+	"testing"
+
+	"github.com/compozy/compozy/internal/api/contract"
+	core "github.com/compozy/compozy/internal/api/core"
+	profilepkg "github.com/compozy/compozy/internal/profile"
+	"github.com/gin-gonic/gin"
+)
+
+func (sessionProfileServiceStub) ListSelections(context.Context) ([]profilepkg.Selection, error) {
+	return []profilepkg.Selection{{
+		Lens: profilepkg.SelectionLensWorkspace, WorkspaceID: "ws-marketing", ProfileID: "profile-marketing",
+	}}, nil
+}
+
+func TestGetProfileSelectionsReturnsOneStableShape(t *testing.T) {
+	t.Parallel()
+
+	t.Run("Should return arrays for the full map and filtered lenses", func(t *testing.T) {
+		t.Parallel()
+
+		handlers := core.NewBaseHandlers(&core.BaseHandlerConfig{Profiles: sessionProfileServiceStub{}})
+		engine := gin.New()
+		engine.GET("/profiles/selection", handlers.GetProfileSelections)
+
+		tests := []struct {
+			name        string
+			path        string
+			wantScope   contract.ProfileSelectionScope
+			wantProfile string
+			wantNote    string
+		}{
+			{
+				name: "full selection map", path: "/profiles/selection",
+				wantScope: contract.ProfileSelectionScopeWorkspace, wantProfile: "default",
+				wantNote: "archived_remembered_fallback",
+			},
+			{
+				name:      "archived remembered workspace lens",
+				path:      "/profiles/selection?scope=workspace&workspace_id=ws-marketing",
+				wantScope: contract.ProfileSelectionScopeWorkspace, wantProfile: "default",
+				wantNote: "archived_remembered_fallback",
+			},
+			{
+				name: "unstored global lens", path: "/profiles/selection?scope=global",
+				wantScope: contract.ProfileSelectionScopeGlobal, wantProfile: "default",
+			},
+		}
+		for _, test := range tests {
+			t.Run("Should return an array for "+test.name, func(t *testing.T) {
+				response := performRequest(t, engine, http.MethodGet, test.path, nil)
+				if response.Code != http.StatusOK {
+					t.Fatalf(
+						"GET %s status = %d, want %d; body=%s",
+						test.path,
+						response.Code,
+						http.StatusOK,
+						response.Body.String(),
+					)
+				}
+				var payload []contract.ProfileSelection
+				decodeJSON(t, response.Body.Bytes(), &payload)
+				if len(payload) != 1 || payload[0].Scope != test.wantScope || payload[0].Profile != test.wantProfile {
+					t.Fatalf(
+						"GET %s payload = %#v, want one %s/%s selection",
+						test.path,
+						payload,
+						test.wantScope,
+						test.wantProfile,
+					)
+				}
+				if payload[0].Note != test.wantNote {
+					t.Fatalf("GET %s note = %q, want %q", test.path, payload[0].Note, test.wantNote)
+				}
+			})
+		}
+	})
+}
+
+type selectionWriteProfileServiceStub struct {
+	core.ProfileService
+}
+
+func (selectionWriteProfileServiceStub) GetByName(_ context.Context, name string) (profilepkg.Profile, error) {
+	return profilepkg.Profile{ID: "profile-" + name, Name: name, State: profilepkg.StateActive}, nil
+}
+
+func (selectionWriteProfileServiceStub) PutSelection(context.Context, profilepkg.Selection) error {
+	return nil
+}
+
+func TestPutProfileSelectionDeprecatesTheWorkspaceLens(t *testing.T) {
+	t.Parallel()
+
+	handlers := core.NewBaseHandlers(&core.BaseHandlerConfig{Profiles: selectionWriteProfileServiceStub{}})
+	engine := gin.New()
+	engine.PUT("/profiles/selection", handlers.PutProfileSelection)
+
+	tests := []struct {
+		name        string
+		body        string
+		wantWarning bool
+	}{
+		{
+			name:        "workspace",
+			body:        `{"scope":"workspace","workspace_id":"ws-1","profile":"marketing"}`,
+			wantWarning: true,
+		},
+		{name: "global", body: `{"scope":"global","profile":"marketing"}`},
+	}
+	for _, test := range tests {
+		t.Run("Should answer the "+test.name+" lens", func(t *testing.T) {
+			t.Parallel()
+
+			response := performRequest(t, engine, http.MethodPut, "/profiles/selection", []byte(test.body))
+			if response.Code != http.StatusOK {
+				t.Fatalf("PUT status = %d, want %d; body=%s", response.Code, http.StatusOK, response.Body.String())
+			}
+			warning := response.Header().Get("Warning")
+			if got := strings.Contains(warning, "v0.5.0"); got != test.wantWarning {
+				t.Fatalf("PUT %s Warning = %q, want deprecation warning %t", test.name, warning, test.wantWarning)
+			}
+		})
+	}
+}

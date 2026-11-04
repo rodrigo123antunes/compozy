@@ -1,0 +1,546 @@
+package globaldb
+
+import (
+	"context"
+	"database/sql"
+	"encoding/json"
+	"errors"
+	"path/filepath"
+	"reflect"
+	"strings"
+	"testing"
+	"time"
+
+	"github.com/compozy/compozy/internal/extensionenv"
+	"github.com/compozy/compozy/internal/extensioninput"
+	"github.com/compozy/compozy/internal/store"
+	"github.com/compozy/compozy/internal/testutil"
+	"github.com/compozy/compozy/internal/vault"
+)
+
+func TestExtensionEnvironmentMigration(t *testing.T) {
+	t.Parallel()
+	t.Run("Should append portable instance metadata and remote header mapping atomically", func(t *testing.T) {
+		path := filepath.Join(t.TempDir(), GlobalDatabaseName)
+		prefix := globalMigrationPrefixBefore(t, "00065_schema.sql")
+		if err := copyGlobalMigrationTemplate(path, prefix); err != nil {
+			t.Fatalf("copy v64 migration fixture: %v", err)
+		}
+		legacy, err := sql.Open(sqliteDriverName, path)
+		if err != nil {
+			t.Fatalf("sql.Open(v64 fixture) error = %v", err)
+		}
+		legacyClosed := false
+		t.Cleanup(func() {
+			if legacyClosed {
+				return
+			}
+			if closeErr := legacy.Close(); closeErr != nil {
+				t.Errorf("Close(v64 fixture cleanup) error = %v", closeErr)
+			}
+		})
+		if err := applyGlobalMigrationPrefix(
+			t,
+			legacy,
+			prefix,
+		); err != nil {
+			t.Fatalf("Apply(v64 prefix) error = %v", err)
+		}
+		statements := []string{
+			`INSERT INTO workspaces (id, root_dir, name, created_at, updated_at)
+			 VALUES ('ws-portable', '/tmp/ws-portable', 'portable',
+			 '2026-08-15T12:00:00Z', '2026-08-15T12:00:00Z')`,
+			`INSERT INTO extensions (
+			 name, version, source, enabled, manifest_path, installed_at,
+			 provides_json, permissions_json, checksum, provenance_json
+			 ) VALUES (
+			 'portable', '1.0.0', 'local', 0, '/tmp/portable/plugin.json',
+			 '2026-08-15T12:01:00Z', '[]', '[]', 'checksum-portable', '{}'
+			 )`,
+			`INSERT INTO extension_dev_links (
+			 extension_name, workspace_id, origin_path, bundle_generation, linked_at
+			 ) VALUES (
+			 'portable', 'ws-portable', '/tmp/portable-dev',
+			 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',
+			 '2026-08-15T12:02:00Z'
+			 )`,
+			`INSERT INTO extension_env_bindings (
+			 extension_name, workspace_id, env_name, secret_ref, kind, created_at, updated_at
+			 ) VALUES (
+			 'portable', '', 'API_KEY', 'vault:extensions/global/portable/env/API_KEY',
+			 'extension_env', '2026-08-15T12:03:00Z', '2026-08-15T12:03:00Z'
+			 )`,
+			`INSERT INTO extension_env_bindings (
+			 extension_name, workspace_id, env_name, secret_ref, kind, created_at, updated_at
+			 ) VALUES (
+			 'portable', 'ws-portable', 'WS_KEY',
+			 'vault:extensions/ws/ws-portable/portable/env/WS_KEY',
+			 'extension_env', '2026-08-15T12:04:00Z', '2026-08-15T12:04:00Z'
+			 )`,
+		}
+		for idx, statement := range statements {
+			if _, err := legacy.ExecContext(testutil.Context(t), statement); err != nil {
+				t.Fatalf("seed v64 statement %d error = %v", idx+1, err)
+			}
+		}
+		if err := legacy.Close(); err != nil {
+			t.Fatalf("Close(v64 fixture) error = %v", err)
+		}
+		legacyClosed = true
+
+		upgraded, err := openGlobalMigrationUpgrade(t, path)
+		if err != nil {
+			t.Fatalf("OpenGlobalDB(v64 fixture) error = %v", err)
+		}
+		closed := false
+		t.Cleanup(func() {
+			if closed {
+				return
+			}
+			if closeErr := upgraded.Close(testutil.Context(t)); closeErr != nil {
+				t.Errorf("Close(upgraded v64 fixture cleanup) error = %v", closeErr)
+			}
+		})
+		assertTableHasColumns(t, upgraded.db, "extensions", []string{"format", "ingest_diagnostics_json"})
+		assertTableHasColumns(
+			t,
+			upgraded.db,
+			"extension_dev_links",
+			[]string{"format", "ingest_diagnostics_json"},
+		)
+		assertTableHasColumns(t, upgraded.db, "extension_env_bindings", []string{"mcp_server", "header_name"})
+		for _, table := range []string{"extensions", "extension_dev_links"} {
+			assertTableExcludesColumns(t, upgraded.db, table, []string{
+				"network_requirement_digest", "network_confirmed_by", "network_confirmed_at",
+			})
+		}
+		insertBinding := `INSERT INTO extension_env_bindings (
+		extension_name, workspace_id, env_name, secret_ref, kind, created_at, updated_at
+	) VALUES ('kit', 'ws-1', 'API_KEY', 'vault:extensions/ws/ws-1/kit/env/API_KEY',
+	'extension_env', '2026-08-02T12:02:00Z', '2026-08-02T12:02:00Z')`
+		if _, err := upgraded.db.ExecContext(testutil.Context(t), insertBinding); err != nil {
+			t.Fatalf("insert migrated binding error = %v", err)
+		}
+		if _, err := upgraded.db.ExecContext(testutil.Context(t), insertBinding); !isSQLitePrimaryKeyConstraint(err) {
+			t.Fatalf("duplicate migrated binding error = %v, want composite primary-key constraint", err)
+		}
+		invalidKindBinding := `INSERT INTO extension_env_bindings (
+		extension_name, workspace_id, env_name, secret_ref, kind, created_at, updated_at
+	) VALUES ('kit', 'ws-1', 'OTHER_KEY', 'vault:extensions/ws/ws-1/kit/env/OTHER_KEY',
+	'other', '2026-08-02T12:03:00Z', '2026-08-02T12:03:00Z')`
+		if _, err := upgraded.db.ExecContext(testutil.Context(t), invalidKindBinding); err == nil {
+			t.Fatal("invalid migrated binding kind error = nil, want CHECK rejection")
+		}
+		status, err := store.Status(testutil.Context(t), upgraded.db, MigrationStream())
+		if err != nil {
+			t.Fatalf("Status(upgraded fixture) error = %v", err)
+		}
+		assertCompleteMigrationStream(t, status, MigrationStream())
+
+		if err := upgraded.Close(testutil.Context(t)); err != nil {
+			t.Fatalf("Close(upgraded fixture) error = %v", err)
+		}
+		closed = true
+		reopened, err := OpenGlobalDB(testutil.Context(t), path)
+		if err != nil {
+			t.Fatalf("OpenGlobalDB(reopen upgraded fixture) error = %v", err)
+		}
+		t.Cleanup(func() {
+			if closeErr := reopened.Close(testutil.Context(t)); closeErr != nil {
+				t.Errorf("Close(reopened fixture) error = %v", closeErr)
+			}
+		})
+		bindings, err := reopened.ListEnvBindings(testutil.Context(t), "kit", "", "ws-1")
+		if err != nil {
+			t.Fatalf("ListEnvBindings(reopened) error = %v", err)
+		}
+		if len(bindings) != 1 || bindings[0].EnvName != "API_KEY" {
+			t.Fatalf("reopened bindings = %#v, want preserved API_KEY", bindings)
+		}
+	})
+}
+
+func TestExtensionEnvRepoRoundTripAndInstanceIsolation(t *testing.T) {
+	t.Parallel()
+
+	// Invariant: profile overrides outrank workspace overrides for the same
+	// environment name, with all four fallback tiers deterministic.
+	// Owner: global extension environment binding store.
+	// Canonical suite: extension environment repository tests.
+	t.Run("Should resolve the complete profile-first precedence order", func(t *testing.T) {
+		t.Parallel()
+		ctx := testutil.Context(t)
+		db := openTestGlobalDB(t)
+		const financeID = "01JPROFILEFINANCE000000000"
+		if _, err := db.db.ExecContext(ctx, `INSERT INTO profiles (
+			id, name, color, icon, state, created_at
+		) VALUES (?, 'finance', '#112233', 'briefcase', 'active', ?)`, financeID, phase0FixtureTime); err != nil {
+			t.Fatalf("insert finance profile: %v", err)
+		}
+		rows := []extensionenv.Binding{
+			{
+				ExtensionName: "kit",
+				EnvName:       "TOKEN",
+				SecretRef:     vault.ExtensionSecretRef("kit", "", "user-user"),
+				Kind:          extensionenv.BindingKind,
+			},
+			{
+				ExtensionName: "kit",
+				WorkspaceID:   "ws-1",
+				EnvName:       "TOKEN",
+				SecretRef:     vault.ExtensionSecretRef("kit", "ws-1", "user-workspace"),
+				Kind:          extensionenv.BindingKind,
+			},
+			{
+				ExtensionName: "kit",
+				ProfileID:     financeID,
+				EnvName:       "TOKEN",
+				SecretRef:     vault.ExtensionProfileSecretRef("kit", financeID, "", "profile-user"),
+				Kind:          extensionenv.BindingKind,
+			},
+			{
+				ExtensionName: "kit",
+				ProfileID:     financeID,
+				WorkspaceID:   "ws-1",
+				EnvName:       "TOKEN",
+				SecretRef:     vault.ExtensionProfileSecretRef("kit", financeID, "ws-1", "profile-workspace"),
+				Kind:          extensionenv.BindingKind,
+			},
+		}
+		for _, binding := range rows {
+			if err := db.PutEnvBinding(ctx, binding); err != nil {
+				t.Fatalf("PutEnvBinding(%#v) error = %v", binding, err)
+			}
+		}
+		want := []string{rows[3].SecretRef, rows[2].SecretRef, rows[1].SecretRef, rows[0].SecretRef}
+		deleteScopes := [][2]string{{financeID, "ws-1"}, {financeID, ""}, {"", "ws-1"}}
+		for index, wantRef := range want {
+			resolved, err := db.ResolveEnvBindings(ctx, "kit", financeID, "ws-1")
+			if err != nil || len(resolved) != 1 || resolved[0].SecretRef != wantRef {
+				t.Fatalf("ResolveEnvBindings(step %d) = %#v, %v, want %q", index, resolved, err, wantRef)
+			}
+			if index < len(deleteScopes) {
+				scope := deleteScopes[index]
+				if err := db.DeleteEnvBinding(ctx, "kit", scope[0], scope[1], "TOKEN"); err != nil {
+					t.Fatalf("DeleteEnvBinding(step %d) error = %v", index, err)
+				}
+			}
+		}
+	})
+
+	t.Run("Should upsert one instance while preserving timestamps and other scopes", func(t *testing.T) {
+		t.Parallel()
+
+		db := openTestGlobalDB(t)
+		createdAt := time.Date(2026, 8, 2, 10, 0, 0, 123, time.UTC)
+		updatedAt := createdAt.Add(time.Minute)
+		global := extensionenv.Binding{
+			ExtensionName: "kit", EnvName: "API_KEY",
+			SecretRef: vault.ExtensionSecretRef("kit", "", "API_KEY"),
+			MCPServer: "deployment-api", HeaderName: "X-Deployment-Key",
+			Kind: extensionenv.BindingKind, CreatedAt: createdAt, UpdatedAt: createdAt,
+		}
+		workspace := extensionenv.Binding{
+			ExtensionName: "kit", WorkspaceID: "ws-1", EnvName: "API_KEY",
+			SecretRef: vault.ExtensionSecretRef("kit", "ws-1", "API_KEY"),
+			Kind:      extensionenv.BindingKind, CreatedAt: createdAt, UpdatedAt: createdAt,
+		}
+		for _, binding := range []extensionenv.Binding{global, workspace} {
+			if err := db.PutEnvBinding(testutil.Context(t), binding); err != nil {
+				t.Fatalf("PutEnvBinding(%#v) error = %v", binding, err)
+			}
+		}
+
+		global.SecretRef = "vault:extensions/global/kit/env/API_KEY_V2"
+		global.UpdatedAt = updatedAt
+		if err := db.PutEnvBinding(testutil.Context(t), global); err != nil {
+			t.Fatalf("PutEnvBinding(upsert) error = %v", err)
+		}
+		gotGlobal, err := db.ListEnvBindings(testutil.Context(t), "kit", "", "")
+		if err != nil {
+			t.Fatalf("ListEnvBindings(global) error = %v", err)
+		}
+		if len(gotGlobal) != 1 || gotGlobal[0].SecretRef != global.SecretRef ||
+			gotGlobal[0].MCPServer != global.MCPServer || gotGlobal[0].HeaderName != global.HeaderName ||
+			!gotGlobal[0].CreatedAt.Equal(createdAt) || !gotGlobal[0].UpdatedAt.Equal(updatedAt) ||
+			gotGlobal[0].Kind != extensionenv.BindingKind {
+			t.Fatalf("global bindings = %#v, want upsert preserving created_at", gotGlobal)
+		}
+		gotWorkspace, err := db.ListEnvBindings(testutil.Context(t), "kit", "", "ws-1")
+		if err != nil {
+			t.Fatalf("ListEnvBindings(workspace) error = %v", err)
+		}
+		if !reflect.DeepEqual(gotWorkspace, []extensionenv.Binding{workspace}) {
+			t.Fatalf("workspace bindings = %#v, want %#v", gotWorkspace, []extensionenv.Binding{workspace})
+		}
+
+		if err := db.DeleteEnvBinding(testutil.Context(t), "kit", "", "", "API_KEY"); err != nil {
+			t.Fatalf("DeleteEnvBinding(global) error = %v", err)
+		}
+		gotGlobal, err = db.ListEnvBindings(testutil.Context(t), "kit", "", "")
+		if err != nil {
+			t.Fatalf("ListEnvBindings(global after delete) error = %v", err)
+		}
+		if len(gotGlobal) != 0 {
+			t.Fatalf("global bindings after delete = %#v, want empty", gotGlobal)
+		}
+		gotWorkspace, err = db.ListEnvBindings(testutil.Context(t), "kit", "", "ws-1")
+		if err != nil || len(gotWorkspace) != 1 {
+			t.Fatalf("workspace bindings after global delete = %#v, %v", gotWorkspace, err)
+		}
+	})
+
+	t.Run("Should list environment names in sorted order", func(t *testing.T) {
+		t.Parallel()
+
+		db := openTestGlobalDB(t)
+		for _, envName := range []string{"Z_TOKEN", "A_TOKEN", "M_TOKEN"} {
+			if err := db.PutEnvBinding(testutil.Context(t), extensionenv.Binding{
+				ExtensionName: "kit", EnvName: envName,
+				SecretRef: vault.ExtensionSecretRef("kit", "", envName), Kind: extensionenv.BindingKind,
+			}); err != nil {
+				t.Fatalf("PutEnvBinding(%s) error = %v", envName, err)
+			}
+		}
+		bindings, err := db.ListEnvBindings(testutil.Context(t), "kit", "", "")
+		if err != nil {
+			t.Fatalf("ListEnvBindings() error = %v", err)
+		}
+		got := make([]string, 0, len(bindings))
+		for _, binding := range bindings {
+			got = append(got, binding.EnvName)
+		}
+		if !reflect.DeepEqual(got, []string{"A_TOKEN", "M_TOKEN", "Z_TOKEN"}) {
+			t.Fatalf("env names = %#v, want sorted", got)
+		}
+	})
+
+	t.Run("Should reject refs owned by another extension or workspace", func(t *testing.T) {
+		t.Parallel()
+
+		db := openTestGlobalDB(t)
+		for _, testCase := range []struct {
+			name string
+			ref  string
+		}{
+			{name: "another extension", ref: vault.ExtensionSecretRef("other", "ws-1", "API_KEY")},
+			{name: "another workspace", ref: vault.ExtensionSecretRef("kit", "ws-2", "API_KEY")},
+			{name: "global scope", ref: vault.ExtensionSecretRef("kit", "", "API_KEY")},
+		} {
+			t.Run("Should reject "+testCase.name, func(t *testing.T) {
+				t.Parallel()
+				err := db.PutEnvBinding(testutil.Context(t), extensionenv.Binding{
+					ExtensionName: "kit", WorkspaceID: "ws-1", EnvName: "API_KEY",
+					SecretRef: testCase.ref, Kind: extensionenv.BindingKind,
+				})
+				if err == nil || !strings.Contains(err.Error(), "outside its instance namespace") {
+					t.Fatalf("PutEnvBinding(%s) error = %v, want owner isolation failure", testCase.name, err)
+				}
+			})
+		}
+	})
+
+	t.Run("Should reject binding ownership kinds outside the extension environment contract", func(t *testing.T) {
+		t.Parallel()
+
+		db := openTestGlobalDB(t)
+		err := db.PutEnvBinding(testutil.Context(t), extensionenv.Binding{
+			ExtensionName: "kit",
+			EnvName:       "API_KEY",
+			SecretRef:     vault.ExtensionSecretRef("kit", "", "API_KEY"),
+			Kind:          "other",
+		})
+		if err == nil || !strings.Contains(err.Error(), `kind must be "extension_env"`) {
+			t.Fatalf("PutEnvBinding(invalid kind) error = %v, want ownership-kind rejection", err)
+		}
+	})
+}
+
+// Invariant: input batches persist exact instance values across reopen and restore before-images without losing inactive rows.
+// Owner: global extension input persistence. Canonical suite: extension environment repository tests.
+func TestExtensionInputRepoLifecycle(t *testing.T) {
+	t.Parallel()
+	// Invariant: a batch waits for another writer and cancellation persists no before-image changes.
+	// Owner: extension input persistence; canonical suite: TestExtensionInputRepoLifecycle.
+	t.Run("Should honor cancellation while waiting to apply an input batch", func(t *testing.T) {
+		t.Parallel()
+		ctx := t.Context()
+		db := openTestGlobalDB(t)
+		db.DB().SetMaxOpenConns(2)
+		writer, err := db.DB().Conn(ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		locked := false
+		t.Cleanup(func() {
+			if locked {
+				if _, err := writer.ExecContext(context.Background(), "ROLLBACK"); err != nil {
+					t.Error(err)
+				}
+			}
+			if err := writer.Close(); err != nil {
+				t.Error(err)
+			}
+		})
+		if _, err := db.DB().ExecContext(ctx, "PRAGMA busy_timeout = 1"); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := writer.ExecContext(ctx, "BEGIN IMMEDIATE"); err != nil {
+			t.Fatal(err)
+		}
+		locked = true
+		instance := extensioninput.Instance{Extension: "example"}
+		record := extensioninput.Record{
+			Type: "string", Value: json.RawMessage(`"value"`), Active: true,
+			UpdatedAt: time.Date(2026, time.October, 9, 12, 0, 0, 0, time.UTC),
+		}
+		mutations := []extensioninput.Mutation{{InputID: "setting", After: &record}}
+		waitCtx, cancel := context.WithTimeout(ctx, 100*time.Millisecond)
+		defer cancel()
+		if err := db.ExtensionInputs.Apply(waitCtx, instance, mutations); !errors.Is(err, context.DeadlineExceeded) {
+			t.Fatalf("contended input batch = %v; want deadline exceeded", err)
+		}
+		if _, err := writer.ExecContext(ctx, "ROLLBACK"); err != nil {
+			t.Fatal(err)
+		}
+		locked = false
+		values, err := db.ExtensionInputs.List(ctx, instance)
+		if err != nil || len(values) != 0 {
+			t.Fatalf("canceled batch persisted = %#v, %v", values, err)
+		}
+		if err := db.ExtensionInputs.Apply(ctx, instance, mutations); err != nil {
+			t.Fatalf("input batch after writer release: %v", err)
+		}
+		values, err = db.ExtensionInputs.List(ctx, instance)
+		if err != nil || len(values) != 1 || !equalExtensionInputRecord(values["setting"], record) {
+			t.Fatalf("committed input batch = %#v, %v", values, err)
+		}
+	})
+	t.Run("Should preserve values across reopen and roll back an entire conflicted batch [UT-056]", func(t *testing.T) {
+		t.Parallel()
+		ctx := testutil.Context(t)
+		db := openTestGlobalDB(t)
+		instance := extensioninput.Instance{
+			Extension:   "linear",
+			ProfileID:   store.DefaultProfileID,
+			WorkspaceID: "workspace-a",
+		}
+		original := extensioninput.Record{
+			Type:      "identifier",
+			Value:     json.RawMessage(`"team-a"`),
+			Active:    true,
+			UpdatedAt: time.Now().UTC(),
+		}
+		if err := db.ExtensionInputs.Apply(
+			ctx,
+			instance,
+			[]extensioninput.Mutation{{InputID: "workspace", After: &original}},
+		); err != nil {
+			t.Fatal(err)
+		}
+		for _, other := range []extensioninput.Instance{
+			{Extension: "other", ProfileID: instance.ProfileID, WorkspaceID: instance.WorkspaceID},
+			{Extension: instance.Extension, WorkspaceID: instance.WorkspaceID},
+			{Extension: instance.Extension, ProfileID: instance.ProfileID},
+		} {
+			values, err := db.ExtensionInputs.List(ctx, other)
+			if err != nil || len(values) != 0 {
+				t.Fatalf("instance isolation: values %v error %v", values, err)
+			}
+		}
+		path := db.Path()
+		if err := db.Close(ctx); err != nil {
+			t.Fatal(err)
+		}
+		reopened, err := OpenGlobalDB(ctx, path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() {
+			if err := reopened.Close(testutil.Context(t)); err != nil {
+				t.Error(err)
+			}
+		})
+		values, err := reopened.ExtensionInputs.List(ctx, instance)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !equalExtensionInputRecord(values["workspace"], original) {
+			t.Fatalf("reopened values = %#v", values)
+		}
+		inactive := original
+		inactive.Active = false
+		inactive.UpdatedAt = original.UpdatedAt.Add(time.Second)
+		created := extensioninput.Record{
+			Type:      "boolean",
+			Value:     json.RawMessage(`false`),
+			Active:    true,
+			UpdatedAt: inactive.UpdatedAt,
+		}
+		changes := []extensioninput.Mutation{
+			{InputID: "new", After: &created},
+			{InputID: "workspace", Before: &original, After: &inactive},
+		}
+		if err := reopened.ExtensionInputs.Apply(ctx, instance, changes); err != nil {
+			t.Fatal(err)
+		}
+		values, err = reopened.ExtensionInputs.List(ctx, instance)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(values) != 2 || !equalExtensionInputRecord(values["workspace"], inactive) {
+			t.Fatalf("inactive values were lost: %#v", values)
+		}
+		stale := []extensioninput.Mutation{
+			{InputID: "must-rollback", After: &created},
+			{InputID: "workspace", Before: &original, After: &created},
+		}
+		if err := reopened.ExtensionInputs.Apply(ctx, instance, stale); !errors.Is(err, extensioninput.ErrConflict) {
+			t.Fatalf("stale batch error = %v", err)
+		}
+		values, err = reopened.ExtensionInputs.List(ctx, instance)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(values) != 2 || !equalExtensionInputRecord(values["workspace"], inactive) {
+			t.Fatalf("conflicted batch changed values: %#v", values)
+		}
+		rollback := []extensioninput.Mutation{
+			{InputID: "new", Before: &created},
+			{InputID: "workspace", Before: &inactive, After: &original},
+		}
+		if err := reopened.ExtensionInputs.Apply(ctx, instance, rollback); err != nil {
+			t.Fatal(err)
+		}
+		values, err = reopened.ExtensionInputs.List(ctx, instance)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(values) != 1 || !equalExtensionInputRecord(values["workspace"], original) {
+			t.Fatalf("rollback failed to restore before-images: %#v", values)
+		}
+	})
+	t.Run("Should reject secrets and mismatched JSON types before any write", func(t *testing.T) {
+		t.Parallel()
+		ctx := testutil.Context(t)
+		db := openTestGlobalDB(t)
+		instance := extensioninput.Instance{Extension: "example"}
+		for _, record := range []extensioninput.Record{
+			{Type: "secret", Value: json.RawMessage(`"secret-value"`), Active: true, UpdatedAt: time.Now()},
+			{Type: "boolean", Value: json.RawMessage(`"false"`), Active: true, UpdatedAt: time.Now()},
+			{Type: "string", Value: json.RawMessage(`true`), Active: true, UpdatedAt: time.Now()},
+		} {
+			if err := db.ExtensionInputs.Apply(
+				ctx,
+				instance,
+				[]extensioninput.Mutation{{InputID: "value", After: &record}},
+			); err == nil {
+				t.Fatal("invalid record was accepted")
+			}
+		}
+		values, err := db.ExtensionInputs.List(ctx, instance)
+		if err != nil || len(values) != 0 {
+			t.Fatalf("invalid batch wrote values: %v error %v", values, err)
+		}
+	})
+}

@@ -1,0 +1,2048 @@
+package acp
+
+import (
+	"bytes"
+	"context"
+	"encoding/base64"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"log/slog"
+	"path/filepath"
+	"reflect"
+	"slices"
+	"strings"
+	"testing"
+	"time"
+
+	acpsdk "github.com/coder/acp-go-sdk"
+	compozyconfig "github.com/compozy/compozy/internal/config"
+	"github.com/compozy/compozy/internal/store"
+	"github.com/compozy/compozy/internal/testutil"
+)
+
+func TestTokenUsageParsing(t *testing.T) {
+	t.Parallel()
+	t.Run("Should invalidate occupancy without clearing accumulated token counters or costs", func(t *testing.T) {
+		t.Parallel()
+		proc := newDirectProcess(t, compozyconfig.PermissionModeApproveAll)
+		active, err := proc.beginPrompt("turn-usage", 16)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer proc.endPrompt(active)
+		before := TokenUsage{
+			InputTokens: new(int64(10)), OutputTokens: new(int64(20)), TotalTokens: new(int64(30)),
+			ThoughtTokens: new(int64(4)), CacheReadTokens: new(int64(5)), CacheWriteTokens: new(int64(6)),
+			ContextUsed: new(int64(190000)), ContextSize: new(int64(200000)),
+			CostAmount: new(1.5), CostCurrency: new("USD"),
+		}
+		proc.mergePromptUsage(before)
+		sendCompactionTestUpdate(t, proc, "c1", `{"status":"completed"}`)
+		before.ContextUsed = nil
+		before.ContextSize = nil
+		if got := proc.mergePromptUsage(TokenUsage{}); !reflect.DeepEqual(got, before) {
+			t.Fatalf("post-compaction usage = %#v, want %#v", got, before)
+		}
+	})
+
+	t.Run("Should decode canonical adapter cache counters and prefer them over legacy aliases", func(t *testing.T) {
+		t.Parallel()
+		for _, tc := range []struct {
+			name, raw   string
+			read, write int64
+		}{
+			{"Should decode OpenCode buildUsage", `{"inputTokens":10,"outputTokens":2,"totalTokens":12,"cachedReadTokens":4,"cachedWriteTokens":5}`, 4, 5},
+			{"Should preserve decoder aliases", `{"cacheReadTokens":9,"cacheWriteTokens":8}`, 9, 8},
+			{"Should prefer canonical fields", `{"cachedReadTokens":4,"cachedWriteTokens":5,"cacheReadTokens":9,"cacheWriteTokens":8}`, 4, 5},
+			{"Should preserve canonical zero", `{"cachedReadTokens":0,"cachedWriteTokens":0,"cacheReadTokens":9,"cacheWriteTokens":8}`, 0, 0},
+		} {
+			t.Run(tc.name, func(t *testing.T) {
+				t.Parallel()
+				var wire wireUsage
+				if err := json.Unmarshal([]byte(tc.raw), &wire); err != nil {
+					t.Fatal(err)
+				}
+				got := tokenUsageFromPromptResponse("turn", &wire)
+				if got.CacheReadTokens == nil || *got.CacheReadTokens != tc.read || got.CacheWriteTokens == nil ||
+					*got.CacheWriteTokens != tc.write {
+					t.Fatalf("usage = %#v", got)
+				}
+			})
+		}
+	})
+	t.Run("Should retain only sanitized object metadata and overlay reported metadata", func(t *testing.T) {
+		t.Parallel()
+		raw := json.RawMessage(
+			`{"_claude/origin":"result","nested":{"claim_token":"secret","note":"compozy_claim_secret"}}`,
+		)
+		meta := decodeUsageMeta(raw)
+		nested, ok := meta["nested"].(map[string]any)
+		if !ok || meta["_claude/origin"] != "result" || nested["note"] != "compozy_claim_[REDACTED]" {
+			t.Fatalf("meta = %#v", meta)
+		}
+		if _, exists := nested["claim_token"]; exists {
+			t.Fatal("claim_token survived sanitization")
+		}
+		if !(TokenUsage{Meta: meta}).IsZero() {
+			t.Fatal("metadata alone is not reported usage")
+		}
+		merged := (TokenUsage{Meta: map[string]any{"old": true}}).Merge(TokenUsage{Meta: meta})
+		if !reflect.DeepEqual(merged.Meta, meta) || !reflect.DeepEqual(merged.Merge(TokenUsage{}).Meta, meta) {
+			t.Fatal("metadata merge lost its overlay")
+		}
+		for _, raw := range []string{`"x"`, `[1]`, `3`, `null`} {
+			got := tokenUsageFromUsageUpdate(
+				"turn",
+				wireUsageUpdate{Used: new(int64(80)), Size: new(int64(100)), Meta: json.RawMessage(raw)},
+			)
+			if got.Meta != nil || got.ContextUsed == nil || *got.ContextUsed != 80 {
+				t.Fatalf("non-object %s usage = %#v", raw, got)
+			}
+		}
+	})
+	t.Run("Should drop invalid context and counter values and preserve valid zero", func(t *testing.T) {
+		t.Parallel()
+		got, dropped := validateContextNumbers(
+			TokenUsage{
+				ContextUsed:      new(int64(-1)),
+				ContextSize:      new(int64(0)),
+				InputTokens:      new(int64(-5)),
+				OutputTokens:     new(int64(0)),
+				CacheReadTokens:  new(int64(-1)),
+				CacheWriteTokens: new(int64(-2)),
+				ThoughtTokens:    new(int64(-1)),
+				TotalTokens:      new(int64(-1)),
+			},
+		)
+		want := []string{
+			"used",
+			"size",
+			"input_tokens",
+			"total_tokens",
+			"thought_tokens",
+			"cache_read_tokens",
+			"cache_write_tokens",
+		}
+		if !slices.Equal(dropped, want) || got.ContextUsed != nil || got.ContextSize != nil || got.InputTokens != nil ||
+			got.CacheReadTokens != nil ||
+			got.CacheWriteTokens != nil ||
+			got.TotalTokens != nil ||
+			got.ThoughtTokens != nil ||
+			got.OutputTokens == nil ||
+			*got.OutputTokens != 0 {
+			t.Fatalf("validated = %#v, dropped = %v", got, dropped)
+		}
+		valid := TokenUsage{ContextUsed: new(int64(0)), ContextSize: new(int64(100)), InputTokens: new(int64(0))}
+		got, dropped = validateContextNumbers(valid)
+		if len(dropped) != 0 || !reflect.DeepEqual(got, valid) {
+			t.Fatalf("valid usage changed: %#v / %v", got, dropped)
+		}
+	})
+	t.Run("Should warn once per session for aliases and invalid numbers", func(t *testing.T) {
+		t.Parallel()
+		var logs bytes.Buffer
+		proc := &AgentProcess{SessionID: "session-a", logger: slog.New(slog.NewTextHandler(&logs, nil))}
+		proc.warnUsageAlias(&wireUsage{CachedReadTokens: new(int64(4))})
+		if logs.Len() != 0 {
+			t.Fatal("canonical shape emitted deprecation")
+		}
+		for range 2 {
+			proc.warnUsageAlias(&wireUsage{LegacyCacheReadTokens: new(int64(9))})
+			proc.validatedUsage(TokenUsage{ContextUsed: new(int64(-1))})
+		}
+		text := logs.String()
+		if strings.Count(text, "are deprecated") != 1 || strings.Count(text, "dropped out-of-range") != 1 ||
+			!strings.Contains(text, "cachedReadTokens/cachedWriteTokens") ||
+			!strings.Contains(text, "v0.6.0") ||
+			!strings.Contains(text, "used") {
+			t.Fatalf("warnings: %s", text)
+		}
+		next := &AgentProcess{SessionID: "session-b", logger: proc.logger}
+		next.validatedUsage(TokenUsage{ContextSize: new(int64(0))})
+		if strings.Count(logs.String(), "dropped out-of-range") != 2 {
+			t.Fatal("a separate session lost its warning")
+		}
+	})
+
+	inputTokens := int64(10)
+	outputTokens := int64(12)
+	totalTokens := int64(22)
+	thoughtTokens := int64(3)
+	cacheReadTokens := int64(4)
+	cacheWriteTokens := int64(5)
+	used := int64(80)
+	size := int64(100)
+	amount := 1.25
+	currency := "USD"
+
+	promptUsage := tokenUsageFromPromptResponse("turn-1", &wireUsage{
+		InputTokens:       &inputTokens,
+		OutputTokens:      &outputTokens,
+		TotalTokens:       &totalTokens,
+		ThoughtTokens:     &thoughtTokens,
+		CachedReadTokens:  &cacheReadTokens,
+		CachedWriteTokens: &cacheWriteTokens,
+	})
+	if promptUsage.InputTokens == nil || *promptUsage.InputTokens != inputTokens {
+		t.Fatalf("tokenUsageFromPromptResponse() input_tokens = %#v, want %d", promptUsage.InputTokens, inputTokens)
+	}
+	if promptUsage.CacheWriteTokens == nil || *promptUsage.CacheWriteTokens != cacheWriteTokens {
+		t.Fatalf(
+			"tokenUsageFromPromptResponse() cache_write_tokens = %#v, want %d",
+			promptUsage.CacheWriteTokens,
+			cacheWriteTokens,
+		)
+	}
+
+	merged := promptUsage.Merge(tokenUsageFromUsageUpdate("turn-1", wireUsageUpdate{
+		Used: &used,
+		Size: &size,
+		Cost: &wireCost{
+			Amount:   &amount,
+			Currency: &currency,
+		},
+	}))
+	if merged.ContextUsed == nil || *merged.ContextUsed != used {
+		t.Fatalf("merged.ContextUsed = %#v, want %d", merged.ContextUsed, used)
+	}
+	if merged.CostCurrency == nil || *merged.CostCurrency != currency {
+		t.Fatalf("merged.CostCurrency = %#v, want %q", merged.CostCurrency, currency)
+	}
+
+	empty := tokenUsageFromPromptResponse("turn-2", nil)
+	if !empty.IsZero() {
+		t.Fatalf("tokenUsageFromPromptResponse(nil) should be zero, got %#v", empty)
+	}
+}
+
+func TestPromptCoalescesRedundantToolUpdates(t *testing.T) {
+	t.Parallel()
+
+	t.Run("Should complete a tool update burst without overflowing the ACP notification queue", func(t *testing.T) {
+		t.Parallel()
+
+		driver := New(WithPromptBufferSize(2))
+		proc := startHelperProcess(t, driver, "tool_update_burst", "", StartOpts{})
+		defer stopProcess(t, driver, proc)
+
+		eventsCh, err := driver.Prompt(testutil.Context(t), proc, PromptRequest{
+			TurnID:  "turn-tool-update-burst",
+			Message: "run tool update burst",
+		})
+		if err != nil {
+			t.Fatalf("Prompt() error = %v", err)
+		}
+
+		events := collectEvents(t, eventsCh)
+		wantTypes := []string{EventTypeToolCall, EventTypeToolResult, EventTypePromptDelivery, EventTypeDone}
+		if len(events) != len(wantTypes) {
+			t.Fatalf("Prompt() event count = %d, want %d", len(events), len(wantTypes))
+		}
+		for index, want := range wantTypes {
+			if got := events[index].Type; got != want {
+				t.Fatalf("event %d type = %q, want %q", index, got, want)
+			}
+		}
+		if got, want := events[0].ToolCallID, "tool-burst"; got != want {
+			t.Fatalf("tool call id = %q, want %q", got, want)
+		}
+		if got, want := events[1].ToolCallID, "tool-burst"; got != want {
+			t.Fatalf("tool result id = %q, want %q", got, want)
+		}
+	})
+
+	t.Run("Should preserve a diverse notification burst without disconnecting", func(t *testing.T) {
+		t.Parallel()
+
+		driver := New(WithPromptBufferSize(2))
+		proc := startHelperProcess(t, driver, "diverse_update_burst", "", StartOpts{})
+		defer stopProcess(t, driver, proc)
+
+		eventsCh, err := driver.Prompt(testutil.Context(t), proc, PromptRequest{
+			TurnID:  "turn-diverse-update-burst",
+			Message: "run diverse update burst",
+		})
+		if err != nil {
+			t.Fatalf("Prompt() error = %v", err)
+		}
+
+		select {
+		case <-proc.conn.Done():
+			t.Fatalf("ACP connection closed under notification pressure: %v", proc.conn.Cause())
+		default:
+		}
+
+		events := collectEvents(t, eventsCh)
+		if got, want := len(events), 1_102; got != want {
+			t.Fatalf("Prompt() event count = %d, want %d", got, want)
+		}
+		for index := range 1_100 {
+			if got, want := events[index].Type, EventTypeToolCall; got != want {
+				t.Fatalf("event %d type = %q, want %q", index, got, want)
+			}
+			if got, want := events[index].ToolCallID, fmt.Sprintf("tool-diverse-%04d", index); got != want {
+				t.Fatalf("event %d tool call id = %q, want %q", index, got, want)
+			}
+		}
+		if receipt := events[len(events)-2]; receipt.Type != EventTypePromptDelivery ||
+			receipt.DeliveryManifest() == nil ||
+			receipt.DeliveryManifest().TurnID != "turn-diverse-update-burst" {
+			t.Fatalf("missing confirmed receipt: %#v", receipt)
+		}
+		if got := events[len(events)-1].Type; got != EventTypeDone {
+			t.Fatalf("last event type = %q, want %q", got, EventTypeDone)
+		}
+	})
+}
+
+func TestPromptPrependsSystemPromptOnce(t *testing.T) {
+	t.Parallel()
+
+	driver := New()
+	proc := startHelperProcess(t, driver, "echo_prompt", "", StartOpts{
+		SystemPrompt: "Memory context first.\nThen agent prompt.",
+	})
+	defer stopProcess(t, driver, proc)
+
+	firstEventsCh, err := driver.Prompt(testutil.Context(t), proc, PromptRequest{
+		TurnID:  "turn-1",
+		Message: "first request",
+	})
+	if err != nil {
+		t.Fatalf("Prompt(first) error = %v", err)
+	}
+	firstEvents := collectEvents(t, firstEventsCh)
+	if len(firstEvents) == 0 {
+		t.Fatal("Prompt(first) returned no events")
+	}
+	if !strings.Contains(firstEvents[0].Text, "Session instructions") {
+		t.Fatalf("first prompt text = %q, want injected system prompt prefix", firstEvents[0].Text)
+	}
+	if !strings.Contains(firstEvents[0].Text, "Memory context first.\nThen agent prompt.") {
+		t.Fatalf("first prompt text = %q, want system prompt content", firstEvents[0].Text)
+	}
+	if !strings.Contains(firstEvents[0].Text, "User request:\n\nfirst request") {
+		t.Fatalf("first prompt text = %q, want user request content", firstEvents[0].Text)
+	}
+
+	secondEventsCh, err := driver.Prompt(testutil.Context(t), proc, PromptRequest{
+		TurnID:  "turn-2",
+		Message: "second request",
+	})
+	if err != nil {
+		t.Fatalf("Prompt(second) error = %v", err)
+	}
+	secondEvents := collectEvents(t, secondEventsCh)
+	if len(secondEvents) == 0 {
+		t.Fatal("Prompt(second) returned no events")
+	}
+	if secondEvents[0].Text != "second request" {
+		t.Fatalf("second prompt text = %q, want plain user request", secondEvents[0].Text)
+	}
+}
+
+// Invariant: startup guidance rebuilt for a live runtime switch replaces the first-turn
+// prefix only while it is unsent; native delivery and a sent prefix stay unchanged.
+func TestReplacePendingStartupPrompt(t *testing.T) {
+	t.Parallel()
+
+	t.Run("Should send the replaced guidance on the first turn and refuse after it", func(t *testing.T) {
+		t.Parallel()
+		driver := New()
+		proc := startHelperProcess(t, driver, "echo_prompt", "", StartOpts{SystemPrompt: "self: claude/old-model"})
+		defer stopProcess(t, driver, proc)
+
+		if !proc.ReplacePendingStartupPrompt("self: claude/new-model", StartupManifest{}) {
+			t.Fatal("ReplacePendingStartupPrompt(unsent) = false, want true")
+		}
+		events, err := driver.Prompt(testutil.Context(t), proc, PromptRequest{TurnID: "turn-1", Message: "go"})
+		if err != nil {
+			t.Fatalf("Prompt(first) error = %v", err)
+		}
+		first := collectEvents(t, events)
+		if len(first) == 0 || !strings.Contains(first[0].Text, "self: claude/new-model") ||
+			strings.Contains(first[0].Text, "old-model") {
+			t.Fatalf("first prompt events = %#v, want the replaced startup guidance", first)
+		}
+		if proc.ReplacePendingStartupPrompt("self: claude/later", StartupManifest{}) {
+			t.Fatal("ReplacePendingStartupPrompt(sent) = true, want false once the prefix was delivered")
+		}
+	})
+
+	t.Run("Should leave natively delivered guidance unchanged", func(t *testing.T) {
+		t.Parallel()
+		driver := New()
+		proc := startHelperProcess(t, driver, "echo_prompt", "", StartOpts{
+			SystemPrompt: "self: claude/old-model", SystemPromptDelivery: SystemPromptDeliveryNative,
+		})
+		defer stopProcess(t, driver, proc)
+
+		if proc.ReplacePendingStartupPrompt("self: claude/new-model", StartupManifest{}) {
+			t.Fatal("ReplacePendingStartupPrompt(native) = true, want false")
+		}
+	})
+}
+
+func TestPromptMaintenancePreservesStartupDelivery(t *testing.T) {
+	t.Parallel()
+	for _, delivery := range []SystemPromptDeliveryMode{
+		SystemPromptDeliveryFirstTurnPrefix, SystemPromptDeliveryNative,
+	} {
+		t.Run("Should preserve startup delivery after maintenance with "+string(delivery), func(t *testing.T) {
+			t.Parallel()
+			const systemPrompt = "Compozy runtime envelope."
+			driver := New()
+			proc := startHelperProcess(t, driver, "echo_prompt", "", StartOpts{
+				SystemPrompt: systemPrompt, SystemPromptDelivery: delivery,
+			})
+			defer stopProcess(t, driver, proc)
+			const maintenanceMessage = " \n/compact\t "
+			pending := PromptSection{Key: "pending", Content: "/compact", UnchangedContent: "pending unchanged"}
+			retained := PromptSection{
+				Key:              "retained",
+				Content:          "delivered catalog",
+				UnchangedContent: "catalog unchanged",
+			}
+			proc.markPromptSectionsDelivered(
+				PromptRequest{Message: retained.Content, Sections: []PromptSection{retained}},
+			)
+			requests := []PromptRequest{
+				{
+					TurnID:      "maintenance",
+					Message:     maintenanceMessage,
+					Maintenance: true,
+					Sections:    []PromptSection{pending, retained},
+				},
+				{TurnID: "ordinary-first", Message: "first request"},
+				{TurnID: "ordinary-second", Message: "second request"},
+			}
+			for index, req := range requests {
+				stream, err := driver.Prompt(t.Context(), proc, req)
+				if err != nil {
+					t.Fatalf("Prompt(%s) error = %v", req.TurnID, err)
+				}
+				events := collectEvents(t, stream)
+				if len(events) == 0 {
+					t.Fatalf("Prompt(%s) returned no events", req.TurnID)
+				}
+				want := req.Message
+				if index == 1 && delivery == SystemPromptDeliveryFirstTurnPrefix {
+					want = "Session instructions (treat as system guidance for this conversation):\n\n" +
+						systemPrompt + "\n\nUser request:\n\n" + req.Message
+				}
+				if got := events[0].Text; got != want {
+					t.Fatalf("Prompt(%s) text = %q, want %q", req.TurnID, got, want)
+				}
+				proc.systemPromptMu.Lock()
+				sent := proc.systemPromptSent
+				proc.systemPromptMu.Unlock()
+				if sent != (index > 0) {
+					t.Fatalf("Prompt(%s) startup delivered = %t, want %t", req.TurnID, sent, index > 0)
+				}
+				if index == 0 {
+					if got, _ := proc.compactPromptSections(
+						pending.Content,
+						[]PromptSection{pending},
+					); got != pending.Content {
+						t.Fatalf("maintenance consumed pending section: %q", got)
+					}
+					if got, _ := proc.compactPromptSections(
+						retained.Content,
+						[]PromptSection{retained},
+					); got != retained.UnchangedContent {
+						t.Fatalf("maintenance cleared delivered section: %q", got)
+					}
+				}
+			}
+		})
+	}
+	t.Run("Should retain delivered sections after failed maintenance", func(t *testing.T) {
+		t.Parallel()
+		driver := New()
+		proc := startHelperProcess(t, driver, "prompt_request_error_with_reason", "", StartOpts{})
+		defer stopProcess(t, driver, proc)
+		section := PromptSection{Key: "skills", Content: "/compact", UnchangedContent: "unchanged"}
+		req := PromptRequest{
+			TurnID:      "maintenance-failed",
+			Message:     section.Content,
+			Maintenance: true,
+			Sections:    []PromptSection{section},
+		}
+		proc.markPromptSectionsDelivered(req)
+		stream, err := driver.Prompt(t.Context(), proc, req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		failed := false
+		for _, event := range collectEvents(t, stream) {
+			failed = failed || event.Type == EventTypeError
+		}
+		if !failed {
+			t.Fatal("maintenance request did not fail")
+		}
+		if got, _ := proc.compactPromptSections(section.Content, req.Sections); got != section.UnchangedContent {
+			t.Fatalf("failed maintenance cleared delivered section: %q", got)
+		}
+	})
+}
+
+func TestPromptCompactsDeliveredSections(t *testing.T) {
+	t.Run("Should estimate only text bytes with overflow-safe rounding", func(t *testing.T) {
+		t.Parallel()
+		for _, tc := range []struct{ bytes, tokens int64 }{{0, 0}, {1, 1}, {4, 1}, {5, 2}, {24400, 6100}, {9223372036854775807, 2305843009213693952}} {
+			if got := EstimateTokens(tc.bytes); got != tc.tokens {
+				t.Fatalf("estimate(%d) = %d, want %d", tc.bytes, got, tc.tokens)
+			}
+		}
+	})
+	t.Run("Should capture exact wire spans with startup dedup and text and binary attachments", func(t *testing.T) {
+		t.Parallel()
+		section := PromptSection{
+			Key:              "skills",
+			Content:          "catalog full",
+			StartupContent:   "startup catalog",
+			UnchangedContent: "unchanged",
+		}
+		for _, mode := range []SystemPromptDeliveryMode{SystemPromptDeliveryFirstTurnPrefix, SystemPromptDeliveryNative} {
+			proc := &AgentProcess{
+				SessionID:            "session",
+				systemPrompt:         section.StartupContent,
+				systemPromptDelivery: mode,
+				startupManifest: StartupManifest{
+					Spans: []DeliveredSpan{TextSpan("skills", section.StartupContent)},
+				},
+				caps: Caps{PromptImage: true, PromptEmbeddedContext: true},
+			}
+			before := timeNowUTC()
+			wire, manifest, err := buildWirePromptRequest(
+				proc,
+				PromptRequest{
+					TurnID:   "turn",
+					Message:  section.Content + "\nknowledge text\nuser request",
+					Sections: []PromptSection{section, {Key: "knowledge", Content: "knowledge text"}},
+					Attachments: []PromptAttachment{
+						{Name: "notes.txt", MIMEType: "text/plain", Data: []byte("hello")},
+						{Name: "photo.png", MIMEType: "image/png", Data: []byte{1, 2, 3}},
+					},
+				},
+			)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if manifest.TurnID != "turn" || manifest.Estimate != "bytes_div_4" || manifest.SentAt.Before(before) ||
+				len(manifest.Spans) != 5 {
+				t.Fatalf("manifest = %#v", manifest)
+			}
+			spans := manifest.Spans
+			if spans[0].Key != "skills" || spans[0].Bytes != 15 || spans[0].Delivery != string(mode) ||
+				spans[0].Unchanged {
+				t.Fatalf("startup = %#v", spans[0])
+			}
+			if spans[1].Key != "skills" || spans[1].Bytes != 9 || !spans[1].Unchanged || !spans[1].StartupDedup {
+				t.Fatalf("stub = %#v", spans[1])
+			}
+			if spans[2].Key != "knowledge" || spans[2].Bytes != 14 || spans[2].Unchanged || *spans[2].Tokens != 4 {
+				t.Fatalf("full = %#v", spans[2])
+			}
+			if spans[3].Name != "notes.txt" || spans[3].Kind != "text" || spans[3].Bytes != 5 || *spans[3].Tokens != 2 {
+				t.Fatalf("text = %#v", spans[3])
+			}
+			if spans[4].Name != "photo.png" || spans[4].Kind != "binary" || spans[4].Bytes != 3 ||
+				spans[4].Tokens != nil {
+				t.Fatalf("binary = %#v", spans[4])
+			}
+			if strings.Contains(
+				wire.Prompt[0].Text.Text,
+				section.StartupContent,
+			) != (mode == SystemPromptDeliveryFirstTurnPrefix) {
+				t.Fatalf("wire text = %q", wire.Prompt[0].Text.Text)
+			}
+		}
+	})
+	t.Run("Should attribute fallback attachment framing and avoid overlapping section ownership", func(t *testing.T) {
+		t.Parallel()
+		_, manifest, err := buildWirePromptRequest(
+			&AgentProcess{},
+			PromptRequest{
+				Message: "outer inner end",
+				Sections: []PromptSection{
+					{Key: "outer", Content: "outer inner end"},
+					{Key: "inner", Content: "inner"},
+				},
+				Attachments: []PromptAttachment{{Name: "note.txt", MIMEType: "text/plain", Data: []byte("hello")}},
+			},
+		)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(manifest.Spans) != 2 || manifest.Spans[0].Bytes != 15 ||
+			manifest.Spans[1].Bytes != int64(len("--- note.txt ---\nhello")) {
+			t.Fatalf("spans = %#v", manifest.Spans)
+		}
+	})
+	t.Parallel()
+	for _, native := range []bool{false, true} {
+		t.Run(
+			fmt.Sprintf("Should compact startup and confirmed catalogs with native delivery %t", native),
+			func(t *testing.T) {
+				t.Parallel()
+				section := PromptSection{Key: "skills", Content: "<current>alpha</current>",
+					StartupContent: "<startup>alpha</startup>", UnchangedContent: "<unchanged/>"}
+				opts := StartOpts{
+					SystemPrompt: section.StartupContent,
+					StartupManifest: StartupManifest{
+						Spans: []DeliveredSpan{TextSpan("skills", section.StartupContent)},
+					},
+				}
+				if native {
+					opts.SystemPromptDelivery = SystemPromptDeliveryNative
+				}
+				driver := New()
+				proc := startHelperProcess(t, driver, "echo_prompt", "", opts)
+				defer stopProcess(t, driver, proc)
+				for index, change := range []bool{false, false, true, false} {
+					if change {
+						section.Content = "<current>alpha beta</current>"
+						section.StartupContent = "<startup>alpha beta</startup>"
+					}
+					request := PromptRequest{
+						TurnID:   fmt.Sprintf("turn-%d", index),
+						Message:  section.Content + "\nrequest",
+						Sections: []PromptSection{section},
+					}
+					events, err := driver.Prompt(t.Context(), proc, request)
+					if err != nil {
+						t.Fatal(err)
+					}
+					got := collectEvents(t, events)
+					if len(got) == 0 {
+						t.Fatal("missing echoed wire payload")
+					}
+					if strings.Contains(got[0].Text, section.Content) != change ||
+						strings.Contains(got[0].Text, section.UnchangedContent) == change {
+						t.Fatalf("turn %d wire payload = %q", index, got[0].Text)
+					}
+					var receipt *DeliveryManifest
+					for _, event := range got {
+						if event.Type == EventTypePromptDelivery {
+							if receipt != nil {
+								t.Fatal("duplicate receipt")
+							}
+							receipt = event.DeliveryManifest()
+						}
+					}
+					if receipt == nil || receipt.TurnID != request.TurnID {
+						t.Fatalf("missing confirmed receipt on turn %d", index)
+					}
+					expectedCount := 1
+					if index == 0 {
+						expectedCount = 2
+					}
+					if len(receipt.Spans) != expectedCount {
+						t.Fatalf("receipt spans = %#v", receipt.Spans)
+					}
+					last := receipt.Spans[len(receipt.Spans)-1]
+					if last.Unchanged == change || last.StartupDedup != (index == 0) {
+						t.Fatalf("receipt state = %#v", last)
+					}
+					if request.Message != section.Content+"\nrequest" {
+						t.Fatal("compaction mutated retry input")
+					}
+				}
+			},
+		)
+	}
+	t.Run("Should resend unseen sections after build failure and on a fresh process", func(t *testing.T) {
+		t.Parallel()
+		section := PromptSection{
+			Key:              "skills",
+			Content:          "<current>new</current>",
+			StartupContent:   "<startup>new</startup>",
+			UnchangedContent: "<unchanged/>",
+		}
+		req := PromptRequest{TurnID: "turn", Message: section.Content, Sections: []PromptSection{section}}
+		proc := &AgentProcess{systemPrompt: "<startup>old</startup>"}
+		invalid := req
+		invalid.Attachments = []PromptAttachment{{Name: "image.png", MIMEType: "image/png", Data: []byte("image")}}
+		if _, _, err := buildWirePromptRequest(proc, invalid); !errors.Is(err, ErrPromptImagesUnsupported) {
+			t.Fatalf("attachment error = %v", err)
+		}
+		for range 2 {
+			wire, _, err := buildWirePromptRequest(proc, req)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !strings.Contains(wire.Prompt[0].Text.Text, section.Content) {
+				t.Fatal("preparing an unsent request advanced context")
+			}
+		}
+		proc.markPromptSectionsDelivered(req)
+		if got, _ := proc.compactPromptSections(req.Message, req.Sections); got != section.UnchangedContent {
+			t.Fatalf("confirmed context = %q", got)
+		}
+		fresh := &AgentProcess{}
+		if got, _ := fresh.compactPromptSections(req.Message, req.Sections); got != section.Content {
+			t.Fatalf("fresh process reused unseen context: %q", got)
+		}
+		proc.markPromptSectionsDelivered(PromptRequest{Message: "empty", Sections: []PromptSection{{Key: "skills"}}})
+		if got, _ := proc.compactPromptSections(req.Message, req.Sections); got != section.Content {
+			t.Fatalf("removed context remained current: %q", got)
+		}
+	})
+	for _, scenario := range []string{"prompt_request_error_with_reason", "block_prompt_until_cancel"} {
+		t.Run("Should invalidate uncertain context after "+scenario, func(t *testing.T) {
+			t.Parallel()
+			driver := New()
+			proc := startHelperProcess(t, driver, scenario, "", StartOpts{})
+			defer stopProcess(t, driver, proc)
+			section := PromptSection{Key: "skills", Content: "full catalog", UnchangedContent: "unchanged"}
+			req := PromptRequest{TurnID: "failed-turn", Message: section.Content, Sections: []PromptSection{section}}
+			proc.markPromptSectionsDelivered(req)
+			ctx, cancel := context.WithCancel(t.Context())
+			defer cancel()
+			events, err := driver.Prompt(ctx, proc, req)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if scenario == "block_prompt_until_cancel" {
+				select {
+				case event := <-events:
+					if event.Text != "blocking" {
+						t.Fatalf("unexpected event: %#v", event)
+					}
+				case <-t.Context().Done():
+					t.Fatal("prompt never started")
+				}
+				cancel()
+			}
+			for _, event := range collectEvents(t, events) {
+				if event.Type == EventTypePromptDelivery {
+					t.Fatalf("failed transport emitted delivery: %#v", event)
+				}
+			}
+			if got, _ := proc.compactPromptSections(req.Message, req.Sections); got != section.Content {
+				t.Fatalf("failed delivery retained uncertain context: %q", got)
+			}
+		})
+	}
+}
+
+func TestPromptAttachesSystemPromptDeliveryMetadata(t *testing.T) {
+	t.Parallel()
+
+	t.Run("Should annotate first-turn system prompt fallback", func(t *testing.T) {
+		t.Parallel()
+
+		driver := New()
+		proc := startHelperProcess(t, driver, "echo_prompt_meta", "", StartOpts{
+			SystemPrompt: "Compozy runtime envelope.",
+		})
+		defer stopProcess(t, driver, proc)
+
+		eventsCh, err := driver.Prompt(testutil.Context(t), proc, PromptRequest{
+			TurnID:  "turn-system-meta",
+			Message: "first request",
+		})
+		if err != nil {
+			t.Fatalf("Prompt() error = %v", err)
+		}
+
+		events := collectEvents(t, eventsCh)
+		if len(events) == 0 {
+			t.Fatal("Prompt() returned no events")
+		}
+
+		var payload PromptMeta
+		if err := json.Unmarshal([]byte(events[0].Text), &payload); err != nil {
+			t.Fatalf("json.Unmarshal(prompt meta echo) error = %v", err)
+		}
+		if payload.System == nil {
+			t.Fatal("payload.System = nil, want system prompt delivery metadata")
+		}
+		if got, want := payload.System.PromptDelivery, string(SystemPromptDeliveryFirstTurnPrefix); got != want {
+			t.Fatalf("payload.System.PromptDelivery = %q, want %q", got, want)
+		}
+	})
+
+	t.Run("Should annotate native system prompt delivery without fallback prefix", func(t *testing.T) {
+		t.Parallel()
+
+		driver := New()
+		proc := startHelperProcess(t, driver, "echo_prompt_meta", "", StartOpts{
+			SystemPrompt:         "Compozy runtime envelope.",
+			SystemPromptDelivery: SystemPromptDeliveryNative,
+		})
+		defer stopProcess(t, driver, proc)
+
+		eventsCh, err := driver.Prompt(testutil.Context(t), proc, PromptRequest{
+			TurnID:  "turn-system-native",
+			Message: "first request",
+		})
+		if err != nil {
+			t.Fatalf("Prompt() error = %v", err)
+		}
+
+		events := collectEvents(t, eventsCh)
+		if len(events) == 0 {
+			t.Fatal("Prompt() returned no events")
+		}
+
+		var payload PromptMeta
+		if err := json.Unmarshal([]byte(events[0].Text), &payload); err != nil {
+			t.Fatalf("json.Unmarshal(prompt meta echo) error = %v", err)
+		}
+		if payload.System == nil {
+			t.Fatal("payload.System = nil, want system prompt delivery metadata")
+		}
+		if got, want := payload.System.PromptDelivery, string(SystemPromptDeliveryNative); got != want {
+			t.Fatalf("payload.System.PromptDelivery = %q, want %q", got, want)
+		}
+	})
+}
+
+func TestPromptCacheControlForStartOpts(t *testing.T) {
+	t.Parallel()
+
+	cases := []struct {
+		name    string
+		opts    StartOpts
+		want    bool
+		wantTTL string
+	}{
+		{
+			name: "Should skip unsupported provider",
+			opts: StartOpts{ProviderName: "codex"},
+		},
+		{
+			name: "Should enable short-lived cache control for Claude provider",
+			opts: StartOpts{ProviderName: "claude"},
+			want: true,
+		},
+		{
+			name: "Should enable long-lived cache control for Anthropic endpoint",
+			opts: StartOpts{
+				ProviderName: "pi",
+				ProviderConfig: &compozyconfig.ProviderConfig{
+					RuntimeProvider: "anthropic",
+					BaseURL:         "https://api.anthropic.com/v1",
+				},
+			},
+			want:    true,
+			wantTTL: "1h",
+		},
+		{
+			name: "Should enable long-lived cache control for Vertex Anthropic endpoint",
+			opts: StartOpts{
+				ProviderName: "pi",
+				ProviderConfig: &compozyconfig.ProviderConfig{
+					RuntimeProvider: "anthropic",
+					BaseURL:         "https://us-east5-aiplatform.googleapis.com/v1",
+				},
+			},
+			want:    true,
+			wantTTL: "1h",
+		},
+		{
+			name: "Should skip OpenRouter even when a base URL is present",
+			opts: StartOpts{
+				ProviderName: "openrouter",
+				ProviderConfig: &compozyconfig.ProviderConfig{
+					RuntimeProvider: "openrouter",
+					BaseURL:         "https://openrouter.ai/api/v1",
+				},
+			},
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			got := promptCacheControlForStartOpts(tc.opts)
+			if !tc.want {
+				if got != nil {
+					t.Fatalf("promptCacheControlForStartOpts() = %#v, want nil", got)
+				}
+				return
+			}
+			if got == nil {
+				t.Fatal("promptCacheControlForStartOpts() = nil, want cache control")
+			}
+			if got.Type != "ephemeral" {
+				t.Fatalf("cache control type = %q, want ephemeral", got.Type)
+			}
+			if got.TTL != tc.wantTTL {
+				t.Fatalf("cache control TTL = %q, want %q", got.TTL, tc.wantTTL)
+			}
+		})
+	}
+}
+
+func TestBuildWirePromptRequestAttachesPromptCacheControlMetadata(t *testing.T) {
+	t.Parallel()
+
+	t.Run("Should annotate text content without changing prompt text", func(t *testing.T) {
+		t.Parallel()
+
+		proc := &AgentProcess{
+			SessionID: "sess-cache",
+			promptCacheControl: &promptCacheControl{
+				Type: "ephemeral",
+				TTL:  "1h",
+			},
+		}
+		request, _, err := buildWirePromptRequest(proc, PromptRequest{
+			TurnID:  "turn-cache",
+			Message: "hello cache",
+		})
+		if err != nil {
+			t.Fatalf("buildWirePromptRequest() error = %v", err)
+		}
+		if got, want := len(request.Prompt), 1; got != want {
+			t.Fatalf("len(Prompt) = %d, want %d", got, want)
+		}
+		text := request.Prompt[0].Text
+		if text == nil {
+			t.Fatal("Prompt[0].Text = nil, want text block")
+		}
+		if got, want := text.Text, "hello cache"; got != want {
+			t.Fatalf("Prompt[0].Text.Text = %q, want %q", got, want)
+		}
+		cacheControl, ok := text.Meta["cache_control"].(map[string]any)
+		if !ok {
+			t.Fatalf("Prompt[0].Text.Meta = %#v, want cache_control map", text.Meta)
+		}
+		if got, want := cacheControl["type"], "ephemeral"; got != want {
+			t.Fatalf("cache_control.type = %#v, want %q", got, want)
+		}
+		if got, want := cacheControl["ttl"], "1h"; got != want {
+			t.Fatalf("cache_control.ttl = %#v, want %q", got, want)
+		}
+	})
+
+	t.Run("Should leave text content metadata empty when provider is unsupported", func(t *testing.T) {
+		t.Parallel()
+
+		request, _, err := buildWirePromptRequest(&AgentProcess{SessionID: "sess-cache"}, PromptRequest{
+			TurnID:  "turn-cache",
+			Message: "hello cache",
+		})
+		if err != nil {
+			t.Fatalf("buildWirePromptRequest() error = %v", err)
+		}
+		if request.Prompt[0].Text == nil {
+			t.Fatal("Prompt[0].Text = nil, want text block")
+		}
+		if len(request.Prompt[0].Text.Meta) != 0 {
+			t.Fatalf("Prompt[0].Text.Meta = %#v, want empty metadata", request.Prompt[0].Text.Meta)
+		}
+	})
+}
+
+func TestBuildWirePromptRequestAppendsAttachments(t *testing.T) {
+	t.Parallel()
+
+	t.Run("Should append attachment blocks after text", func(t *testing.T) {
+		t.Parallel()
+
+		proc := &AgentProcess{SessionID: "sess-attachments"}
+		proc.setCaps(Caps{PromptImage: true})
+		request, _, err := buildWirePromptRequest(proc, PromptRequest{
+			TurnID:  "turn-attachments",
+			Message: "inspect this",
+			Attachments: []PromptAttachment{{
+				Name: "diagram.png", MIMEType: "image/png", Data: []byte("image"),
+			}},
+		})
+		if err != nil {
+			t.Fatalf("buildWirePromptRequest() error = %v", err)
+		}
+		if len(request.Prompt) != 2 || request.Prompt[0].Text == nil || request.Prompt[1].Image == nil {
+			t.Fatalf("Prompt = %#v, want text followed by image", request.Prompt)
+		}
+	})
+
+	t.Run("Should omit the text block for an attachment-only prompt", func(t *testing.T) {
+		t.Parallel()
+
+		proc := &AgentProcess{SessionID: "sess-attachment-only"}
+		proc.setCaps(Caps{PromptImage: true})
+		request, _, err := buildWirePromptRequest(proc, PromptRequest{
+			TurnID: "turn-attachment-only",
+			Attachments: []PromptAttachment{{
+				Name: "diagram.png", MIMEType: "image/png", Data: []byte("image"),
+			}},
+		})
+		if err != nil {
+			t.Fatalf("buildWirePromptRequest() error = %v", err)
+		}
+		if len(request.Prompt) != 1 || request.Prompt[0].Image == nil {
+			t.Fatalf("Prompt = %#v, want one image block", request.Prompt)
+		}
+	})
+}
+
+func TestBuildWirePromptRequestDeliversMentions(t *testing.T) {
+	t.Parallel()
+
+	t.Run("Should order text, session references, resource links, then attachments", func(t *testing.T) {
+		t.Parallel()
+
+		proc := &AgentProcess{SessionID: "sess-mentions"}
+		proc.setCaps(Caps{PromptImage: true})
+		references := "<compozy_session_references>\n- @session:sess-9f8e7d\n</compozy_session_references>"
+		request, manifest, err := buildWirePromptRequest(proc, PromptRequest{
+			TurnID:            "turn-mentions",
+			Message:           "Review @internal/acp/client_prompt.go and @web/src",
+			SessionReferences: references,
+			MentionLinks: []PromptResourceLink{
+				NewPromptResourceLink(
+					"internal/acp/client_prompt.go",
+					"/Users/ana/code/shop/internal/acp/client_prompt.go",
+					false,
+				),
+				NewPromptResourceLink("web/src", "/Users/ana/code/shop/web/src", true),
+			},
+			MentionDelivery: PromptMentionDelivery{
+				Sessions: 1, SessionIDs: []string{"sess-9f8e7d"}, ReferencesForm: "reference",
+				DroppedOverCap: 2, DroppedAtDispatch: 1,
+			},
+			Attachments: []PromptAttachment{{Name: "diagram.png", MIMEType: "image/png", Data: []byte("image")}},
+		})
+		if err != nil {
+			t.Fatalf("buildWirePromptRequest() error = %v", err)
+		}
+		wire, err := json.Marshal(request.Prompt)
+		if err != nil {
+			t.Fatalf("marshal prompt: %v", err)
+		}
+		var blocks []map[string]any
+		if err := json.Unmarshal(wire, &blocks); err != nil {
+			t.Fatalf("unmarshal prompt: %v", err)
+		}
+		want := []map[string]any{
+			{"type": "text", "text": "Review @internal/acp/client_prompt.go and @web/src"},
+			{"type": "text", "text": references},
+			{
+				"type": "resource_link", "name": "internal/acp/client_prompt.go",
+				"uri": "file:///Users/ana/code/shop/internal/acp/client_prompt.go",
+			},
+			{"type": "resource_link", "name": "web/src/", "uri": "file:///Users/ana/code/shop/web/src/"},
+			{"type": "image", "data": base64.StdEncoding.EncodeToString([]byte("image")), "mimeType": "image/png"},
+		}
+		if !reflect.DeepEqual(blocks, want) {
+			t.Fatalf("prompt blocks = %#v, want %#v", blocks, want)
+		}
+		wantMentions := &DeliveredMentions{
+			Links: 2, Sessions: 1, ReferencesForm: "reference", DroppedOverCap: 2, DroppedAtDispatch: 1,
+			Blocks: []DeliveredMentionBlock{
+				{
+					Kind: DeliveredMentionBlockSessionReferences, Form: "reference",
+					SessionIDs: []string{"sess-9f8e7d"}, Bytes: int64(len(references)),
+				},
+				{Kind: DeliveredMentionBlockResourceLink, Name: "internal/acp/client_prompt.go"},
+				{Kind: DeliveredMentionBlockResourceLink, Name: "web/src/"},
+			},
+		}
+		if !reflect.DeepEqual(manifest.Mentions, wantMentions) {
+			t.Fatalf("manifest.Mentions = %#v, want %#v", manifest.Mentions, wantMentions)
+		}
+		encoded, err := json.Marshal(manifest.Mentions)
+		if err != nil {
+			t.Fatalf("marshal mentions: %v", err)
+		}
+		wantJSON := `{"links":2,"sessions":1,"references_form":"reference",` +
+			`"dropped_over_cap":2,"dropped_at_dispatch":1,"blocks":[` +
+			`{"kind":"session_references","form":"reference","session_ids":["sess-9f8e7d"],"bytes":` +
+			fmt.Sprint(len(references)) + `},` +
+			`{"kind":"resource_link","name":"internal/acp/client_prompt.go"},` +
+			`{"kind":"resource_link","name":"web/src/"}]}`
+		if string(encoded) != wantJSON {
+			t.Fatalf("manifest mentions JSON = %s, want %s", encoded, wantJSON)
+		}
+		whole, err := json.Marshal(manifest)
+		if err != nil {
+			t.Fatalf("marshal manifest: %v", err)
+		}
+		if strings.Contains(string(whole), "/Users/ana") || strings.Contains(string(whole), "file://") {
+			t.Fatalf("manifest JSON = %s, want no absolute paths or URIs", whole)
+		}
+	})
+
+	t.Run("Should clone mention blocks independently of the source manifest", func(t *testing.T) {
+		t.Parallel()
+
+		source := &DeliveryManifest{Mentions: &DeliveredMentions{Blocks: []DeliveredMentionBlock{
+			{Kind: DeliveredMentionBlockSessionReferences, SessionIDs: []string{"sess-a"}},
+		}}}
+		cloned := cloneDeliveryManifest(source)
+		source.Mentions.Blocks[0].SessionIDs[0] = "sess-mutated"
+		source.Mentions.Blocks[0].Kind = "mutated"
+		if got := cloned.Mentions.Blocks[0]; got.Kind != DeliveredMentionBlockSessionReferences ||
+			got.SessionIDs[0] != "sess-a" {
+			t.Fatalf("cloned block = %#v, want unaffected by source mutation", got)
+		}
+	})
+
+	t.Run("Should omit mention blocks and manifest counts when the prompt has none", func(t *testing.T) {
+		t.Parallel()
+
+		request, manifest, err := buildWirePromptRequest(&AgentProcess{SessionID: "sess-plain"}, PromptRequest{
+			TurnID:  "turn-plain",
+			Message: "plain prompt",
+		})
+		if err != nil {
+			t.Fatalf("buildWirePromptRequest() error = %v", err)
+		}
+		if len(request.Prompt) != 1 || request.Prompt[0].Text == nil {
+			t.Fatalf("Prompt = %#v, want one text block", request.Prompt)
+		}
+		if manifest.Mentions != nil {
+			t.Fatalf("manifest.Mentions = %#v, want nil", manifest.Mentions)
+		}
+		encoded, err := json.Marshal(manifest)
+		if err != nil {
+			t.Fatalf("marshal manifest: %v", err)
+		}
+		if strings.Contains(string(encoded), `"mentions"`) {
+			t.Fatalf("manifest JSON = %s, want no mentions key", encoded)
+		}
+	})
+}
+
+func TestNewPromptResourceLink(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name   string
+		rel    string
+		abs    string
+		folder bool
+		want   PromptResourceLink
+	}{
+		{
+			name: "Should percent-encode spaces and reserved characters in the URI only",
+			rel:  "docs/My Notes #1.md", abs: "/Users/ana/code/shop/docs/My Notes #1.md",
+			want: PromptResourceLink{
+				Name: "docs/My Notes #1.md",
+				URI:  "file:///Users/ana/code/shop/docs/My%20Notes%20%231.md",
+			},
+		},
+		{
+			name: "Should end folder name and URI in a slash",
+			rel:  "web/src", abs: "/Users/ana/code/shop/web/src", folder: true,
+			want: PromptResourceLink{Name: "web/src/", URI: "file:///Users/ana/code/shop/web/src/"},
+		},
+		{
+			name: "Should not double a folder trailing slash",
+			rel:  "web/src/", abs: "/Users/ana/code/shop/web/src/", folder: true,
+			want: PromptResourceLink{Name: "web/src/", URI: "file:///Users/ana/code/shop/web/src/"},
+		},
+		{
+			name: "Should percent-encode non-ASCII path segments",
+			rel:  "notas/café.md", abs: "/srv/notas/café.md",
+			want: PromptResourceLink{Name: "notas/café.md", URI: "file:///srv/notas/caf%C3%A9.md"},
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			if got := NewPromptResourceLink(tc.rel, tc.abs, tc.folder); got != tc.want {
+				t.Fatalf("NewPromptResourceLink() = %#v, want %#v", got, tc.want)
+			}
+		})
+	}
+}
+
+func TestPromptAttachmentBuildFailurePreservesFirstTurnSystemPrompt(t *testing.T) {
+	t.Parallel()
+
+	t.Run("Should preserve the first-turn system prompt after attachment failure", func(t *testing.T) {
+		t.Parallel()
+
+		proc := &AgentProcess{
+			SessionID:    "sess-system-after-attachment-error",
+			systemPrompt: "Keep this first-turn guidance.",
+		}
+		_, _, err := buildWirePromptRequest(proc, PromptRequest{
+			TurnID: "turn-invalid-attachment",
+			Attachments: []PromptAttachment{{
+				Name: "diagram.png", MIMEType: "image/png", Data: []byte("image"),
+			}},
+		})
+		if !errors.Is(err, ErrPromptImagesUnsupported) {
+			t.Fatalf("buildWirePromptRequest(invalid attachment) error = %v, want ErrPromptImagesUnsupported", err)
+		}
+
+		request, _, err := buildWirePromptRequest(proc, PromptRequest{
+			TurnID:  "turn-first-delivered",
+			Message: "first accepted request",
+		})
+		if err != nil {
+			t.Fatalf("buildWirePromptRequest(first accepted) error = %v", err)
+		}
+		if len(request.Prompt) != 1 || request.Prompt[0].Text == nil {
+			t.Fatalf("Prompt = %#v, want first-turn text block", request.Prompt)
+		}
+		if !strings.Contains(request.Prompt[0].Text.Text, "Keep this first-turn guidance.") {
+			t.Fatalf("first accepted prompt = %q, want preserved system guidance", request.Prompt[0].Text.Text)
+		}
+	})
+}
+
+func TestPromptSendsAttachmentBlocksThroughACPSubprocess(t *testing.T) {
+	t.Parallel()
+
+	t.Run("Should send typed image blocks through the ACP subprocess", func(t *testing.T) {
+		t.Parallel()
+
+		driver := New()
+		proc := startHelperProcess(t, driver, "echo_prompt_blocks", "", StartOpts{})
+		t.Cleanup(func() {
+			stopProcess(t, driver, proc)
+		})
+
+		attachmentData := []byte("image-through-acp")
+		eventsCh, err := driver.Prompt(testutil.Context(t), proc, PromptRequest{
+			TurnID: "turn-subprocess-attachment",
+			Attachments: []PromptAttachment{{
+				Name: "diagram.png", MIMEType: "image/png", Data: attachmentData,
+			}},
+		})
+		if err != nil {
+			t.Fatalf("Prompt() error = %v", err)
+		}
+		events := collectEvents(t, eventsCh)
+		if len(events) == 0 {
+			t.Fatal("Prompt() returned no events")
+		}
+
+		var blocks []acpsdk.ContentBlock
+		if err := json.Unmarshal([]byte(events[0].Text), &blocks); err != nil {
+			t.Fatalf("json.Unmarshal(echoed prompt blocks) error = %v", err)
+		}
+		if len(blocks) != 1 || blocks[0].Image == nil {
+			t.Fatalf("echoed prompt blocks = %#v, want one image block", blocks)
+		}
+		if got, want := blocks[0].Image.MimeType, "image/png"; got != want {
+			t.Fatalf("image MIME type = %q, want %q", got, want)
+		}
+		if got, want := blocks[0].Image.Data, base64.StdEncoding.EncodeToString(attachmentData); got != want {
+			t.Fatalf("image data = %q, want %q", got, want)
+		}
+	})
+}
+
+func TestPromptSendsZeroByteTextAttachmentThroughACPSubprocess(t *testing.T) {
+	t.Parallel()
+
+	t.Run("Should send an attachment-only zero-byte text resource through the ACP subprocess", func(t *testing.T) {
+		t.Parallel()
+
+		driver := New()
+		proc := startHelperProcess(t, driver, "echo_prompt_blocks", "", StartOpts{})
+		t.Cleanup(func() {
+			stopProcess(t, driver, proc)
+		})
+
+		eventsCh, err := driver.Prompt(testutil.Context(t), proc, PromptRequest{
+			TurnID: "turn-subprocess-empty-text-attachment",
+			Attachments: []PromptAttachment{{
+				Name: "empty.txt", MIMEType: "text/plain",
+			}},
+		})
+		if err != nil {
+			t.Fatalf("Prompt() error = %v", err)
+		}
+		events := collectEvents(t, eventsCh)
+		if len(events) == 0 {
+			t.Fatal("Prompt() returned no events")
+		}
+
+		var blocks []acpsdk.ContentBlock
+		if err := json.Unmarshal([]byte(events[0].Text), &blocks); err != nil {
+			t.Fatalf("json.Unmarshal(echoed prompt blocks) error = %v", err)
+		}
+		if len(blocks) != 1 || blocks[0].Resource == nil ||
+			blocks[0].Resource.Resource.TextResourceContents == nil {
+			t.Fatalf("echoed prompt blocks = %#v, want one empty text resource block", blocks)
+		}
+		resource := blocks[0].Resource.Resource.TextResourceContents
+		if resource.MimeType == nil || *resource.MimeType != "text/plain" {
+			t.Fatalf("text resource MIME type = %#v, want text/plain", resource.MimeType)
+		}
+		if resource.Text != "" {
+			t.Fatalf("text resource text = %q, want empty", resource.Text)
+		}
+	})
+}
+
+func TestPromptSkipsFirstTurnPrefixForNativeSystemPromptDelivery(t *testing.T) {
+	t.Parallel()
+
+	t.Run("Should send plain user request when system prompt is native", func(t *testing.T) {
+		t.Parallel()
+
+		driver := New()
+		proc := startHelperProcess(t, driver, "echo_prompt", "", StartOpts{
+			SystemPrompt:         "Compozy runtime envelope.",
+			SystemPromptDelivery: SystemPromptDeliveryNative,
+		})
+		defer stopProcess(t, driver, proc)
+
+		eventsCh, err := driver.Prompt(testutil.Context(t), proc, PromptRequest{
+			TurnID:  "turn-native-text",
+			Message: "first request",
+		})
+		if err != nil {
+			t.Fatalf("Prompt() error = %v", err)
+		}
+
+		events := collectEvents(t, eventsCh)
+		if len(events) == 0 {
+			t.Fatal("Prompt() returned no events")
+		}
+		if got, want := events[0].Text, "first request"; got != want {
+			t.Fatalf("first prompt text = %q, want %q", got, want)
+		}
+		if strings.Contains(events[0].Text, "Compozy runtime envelope.") ||
+			strings.Contains(events[0].Text, "Session instructions") {
+			t.Fatalf("first prompt text = %q, want no fallback prefix", events[0].Text)
+		}
+	})
+}
+
+func TestPromptActivityReporterReportsWhilePromptIsInFlight(t *testing.T) {
+	t.Run("ShouldReportWhilePromptIsInFlight", func(t *testing.T) {
+		t.Parallel()
+
+		ctx, cancel := context.WithCancel(testutil.Context(t))
+		defer cancel()
+
+		reports := make(chan PromptActivityReport, 4)
+		stop := startPromptActivityReporter(ctx, PromptRequest{
+			TurnID:                    "turn-reporter",
+			Message:                   "hello",
+			ActivityHeartbeatInterval: 5 * time.Millisecond,
+			ActivityReporter: func(report PromptActivityReport) {
+				select {
+				case reports <- report:
+				default:
+				}
+			},
+		})
+		defer stop()
+
+		first := readPromptActivityReport(t, reports)
+		if got, want := first.Kind, "agent_waiting"; got != want {
+			t.Fatalf("first report kind = %q, want %q", got, want)
+		}
+		if first.Timestamp.IsZero() {
+			t.Fatal("first report timestamp is zero")
+		}
+
+		second := readPromptActivityReport(t, reports)
+		if got, want := second.Kind, "agent_waiting"; got != want {
+			t.Fatalf("second report kind = %q, want %q", got, want)
+		}
+		if second.Timestamp.Before(first.Timestamp) {
+			t.Fatalf("second report timestamp %s before first %s", second.Timestamp, first.Timestamp)
+		}
+	})
+}
+
+func TestPromptTransmitsStructuredMetadata(t *testing.T) {
+	t.Parallel()
+	t.Run("Should transmit synthetic task metadata through ACP", func(t *testing.T) {
+		t.Parallel()
+
+		driver := New()
+		proc := startHelperProcess(t, driver, "echo_prompt_meta", "", StartOpts{})
+		defer stopProcess(t, driver, proc)
+
+		eventsCh, err := driver.Prompt(testutil.Context(t), proc, PromptRequest{
+			TurnID:  "turn-meta",
+			Message: "task wake-up",
+			Meta: PromptMeta{
+				TurnSource: PromptTurnSourceSynthetic,
+				Synthetic: &PromptSyntheticMeta{
+					Reason:    "task_run_completed",
+					TaskID:    "task-1",
+					TaskRunID: "run-1",
+					Summary:   "Completed task",
+				},
+			},
+		})
+		if err != nil {
+			t.Fatalf("Prompt() error = %v", err)
+		}
+
+		events := collectEvents(t, eventsCh)
+		if len(events) == 0 {
+			t.Fatal("Prompt() returned no events")
+		}
+
+		var payload PromptMeta
+		if err := json.Unmarshal([]byte(events[0].Text), &payload); err != nil {
+			t.Fatalf("json.Unmarshal(prompt meta echo) error = %v", err)
+		}
+		if got, want := payload.TurnSource, PromptTurnSourceSynthetic; got != want {
+			t.Fatalf("payload.TurnSource = %q, want %q", got, want)
+		}
+		if payload.Synthetic == nil {
+			t.Fatal("payload.Synthetic = nil, want task provenance")
+		}
+		if got := payload.Synthetic; got.Reason != "task_run_completed" || got.TaskID != "task-1" ||
+			got.TaskRunID != "run-1" ||
+			got.Summary != "Completed task" {
+			t.Fatalf("payload.Synthetic = %#v, want complete task provenance", got)
+		}
+	})
+}
+
+func TestPromptStreamsSessionUpdates(t *testing.T) {
+	t.Parallel()
+	for _, tc := range []struct {
+		name     string
+		variant  string
+		wantUsed *int64
+		wantSize *int64
+		wantCost float64
+	}{
+		{"Should discard same-turn occupancy on completion without new usage", "", nil, nil, 1.5},
+		{"Should keep occupancy unknown after cost-only telemetry", "cost", nil, nil, 2.5},
+		{"Should not combine fresh used-only telemetry with pre-compaction size", "used", new(int64(8000)), nil, 1.5},
+		{"Should preserve fresh occupancy across a terminal correction", "fresh", new(int64(8000)), new(int64(200000)), 1.5},
+		{"Should retain token totals without restoring occupancy", "totals", nil, nil, 1.5},
+		{"Should discard occupancy when the terminal compaction arrives after the response", "late", nil, nil, 1.5},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			driver := New(WithPromptDrainWait(500 * time.Millisecond))
+			proc := startHelperProcess(t, driver, "compaction_usage", tc.variant, StartOpts{})
+			defer stopProcess(t, driver, proc)
+			stream, err := driver.Prompt(t.Context(), proc, PromptRequest{TurnID: "turn-compact", Message: "/compact"})
+			if err != nil {
+				t.Fatal(err)
+			}
+			events := collectEvents(t, stream)
+			terminalSeen := false
+			doneSeen := false
+			for _, event := range events {
+				if event.Compaction != nil && event.Compaction.Terminal {
+					terminalSeen = true
+				}
+				if !terminalSeen || event.Usage == nil {
+					continue
+				}
+				got := event.Usage
+				if !reflect.DeepEqual(got.ContextUsed, tc.wantUsed) ||
+					!reflect.DeepEqual(got.ContextSize, tc.wantSize) {
+					t.Fatalf(
+						"post-compaction %s occupancy = %#v, want used=%v size=%v",
+						event.Type,
+						got,
+						tc.wantUsed,
+						tc.wantSize,
+					)
+				}
+				if got.CostAmount == nil || *got.CostAmount != tc.wantCost || got.CostCurrency == nil ||
+					*got.CostCurrency != "USD" {
+					t.Fatalf("post-compaction cost = %#v", got)
+				}
+				if event.Type == EventTypeDone {
+					doneSeen = true
+					if tc.variant == "totals" && (got.InputTokens == nil || *got.InputTokens != 190000 ||
+						got.OutputTokens == nil || *got.OutputTokens != 1000 || got.TotalTokens == nil || *got.TotalTokens != 191000) {
+						t.Fatalf("prompt totals = %#v", got)
+					}
+				}
+			}
+			if !terminalSeen || !doneSeen {
+				t.Fatalf("missing compaction or done event: %#v", events)
+			}
+		})
+	}
+
+	t.Run("Should stream session updates and refresh session metadata from prompt events", func(t *testing.T) {
+		t.Parallel()
+
+		driver := New()
+		proc := startHelperProcess(t, driver, "stream_updates", "", StartOpts{})
+		defer stopProcess(t, driver, proc)
+
+		eventsCh, err := driver.Prompt(testutil.Context(t), proc, PromptRequest{
+			TurnID:  "turn-stream",
+			Message: "hello",
+		})
+		if err != nil {
+			t.Fatalf("Prompt() error = %v", err)
+		}
+
+		events := collectEvents(t, eventsCh)
+		if len(events) == 0 {
+			t.Fatal("Prompt() returned no events")
+		}
+
+		if events[len(events)-1].Type != EventTypeDone {
+			t.Fatalf("Prompt() last event = %#v, want done", events[len(events)-1])
+		}
+
+		var eventTypes []string
+		for _, event := range events {
+			eventTypes = append(eventTypes, event.Type)
+		}
+		if !slices.Contains(eventTypes, EventTypeAgentMessage) {
+			t.Fatalf("Prompt() event types = %#v, want agent message", eventTypes)
+		}
+		if !slices.Contains(eventTypes, EventTypeThought) {
+			t.Fatalf("Prompt() event types = %#v, want thought", eventTypes)
+		}
+		if !slices.Contains(eventTypes, EventTypeToolCall) {
+			t.Fatalf("Prompt() event types = %#v, want tool call", eventTypes)
+		}
+		if !slices.Contains(eventTypes, EventTypeDone) {
+			t.Fatalf("Prompt() event types = %#v, want done", eventTypes)
+		}
+		for _, event := range events {
+			if event.Type == EventTypeDone && event.PromptStopReason != PromptStopReasonEndTurn {
+				t.Fatalf("Prompt() stop reason = %q, want %q", event.PromptStopReason, PromptStopReasonEndTurn)
+			}
+		}
+		if proc.SessionID != "sess-new" {
+			t.Fatalf("Start() session id = %q, want %q", proc.SessionID, "sess-new")
+		}
+		if caps := proc.CapsSnapshot(); !slices.Equal(caps.SupportedModes, []string{"new-mode"}) {
+			t.Fatalf("Start() supported modes = %#v, want %#v", caps.SupportedModes, []string{"new-mode"})
+		}
+	})
+}
+
+func TestPromptErrorPreservesRequestErrorData(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		scenario string
+		code     string
+	}{
+		{name: "Should accept another prompt on the same process after authentication recovers", scenario: "provider_auth_recovers", code: ProviderErrorAuthRequired},
+		{name: "Should accept another prompt on the same process after rate limiting recovers", scenario: "provider_rate_limit_recovers", code: ProviderErrorRateLimited},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			driver := New()
+			proc := startHelperProcess(t, driver, tc.scenario, "", StartOpts{})
+			t.Cleanup(func() { stopProcess(t, driver, proc) })
+			for index := range 3 {
+				stream, err := driver.Prompt(t.Context(), proc, PromptRequest{
+					TurnID: fmt.Sprintf("turn-%d", index), Message: "continue",
+				})
+				if err != nil {
+					t.Fatalf("prompt %d: %v", index, err)
+				}
+				events := collectEvents(t, stream)
+				if len(events) == 0 {
+					t.Fatalf("prompt %d returned no events", index)
+				}
+				last := events[len(events)-1]
+				if index < 2 {
+					if last.Type != EventTypeError || last.Failure == nil || last.Failure.Kind != store.FailurePrompt ||
+						last.ProviderError == nil {
+						t.Fatalf("prompt %d terminal event = %#v", index, last)
+					}
+					if last.ProviderError.Code != tc.code || last.ProviderError.OccurrenceCount != uint64(index+1) {
+						t.Fatalf("prompt %d provider diagnostic = %#v", index, last.ProviderError)
+					}
+				} else if last.Type != EventTypeDone || last.PromptStopReason != PromptStopReasonEndTurn || last.ProviderError != nil {
+					t.Fatalf("recovered prompt terminal event = %#v", last)
+				}
+				select {
+				case <-proc.Done():
+					t.Fatalf("provider process exited after prompt %d", index)
+				default:
+				}
+			}
+		})
+	}
+
+	t.Parallel()
+
+	t.Run("Should emit structured request error data for downstream marker classification", func(t *testing.T) {
+		t.Parallel()
+
+		driver := New()
+		proc := startHelperProcess(t, driver, "prompt_request_error_with_reason", "", StartOpts{})
+		t.Cleanup(func() {
+			stopProcess(t, driver, proc)
+		})
+
+		eventsCh, err := driver.Prompt(testutil.Context(t), proc, PromptRequest{
+			TurnID:  "turn-mcp-auth",
+			Message: "trigger structured auth error",
+		})
+		if err != nil {
+			t.Fatalf("Prompt() error = %v", err)
+		}
+
+		events := collectEvents(t, eventsCh)
+		if len(events) == 0 {
+			t.Fatal("Prompt() events = empty, want error event")
+		}
+		event := events[len(events)-1]
+		if event.Type != EventTypeError {
+			t.Fatalf("Prompt() last event type = %q, want %q", event.Type, EventTypeError)
+		}
+		var payload struct {
+			Data struct {
+				ReasonCodes []string `json:"reason_codes"`
+			} `json:"data"`
+		}
+		if err := json.Unmarshal(event.Raw, &payload); err != nil {
+			t.Fatalf("json.Unmarshal(event.Raw) error = %v raw=%s", err, string(event.Raw))
+		}
+		if !slices.Contains(payload.Data.ReasonCodes, "mcp_auth_required") {
+			t.Fatalf("request error reason codes = %#v, want mcp_auth_required", payload.Data.ReasonCodes)
+		}
+	})
+}
+
+func TestPromptStopDoesNotEmitRuntimeError(t *testing.T) {
+	t.Parallel()
+
+	t.Run("Should not emit runtime error after explicit stop", func(t *testing.T) {
+		t.Parallel()
+
+		driver := New()
+		proc := startHelperProcess(t, driver, "block_prompt_until_cancel", "", StartOpts{})
+		stopped := false
+		t.Cleanup(func() {
+			if stopped {
+				return
+			}
+			stopProcess(t, driver, proc)
+		})
+
+		eventsCh, err := driver.Prompt(testutil.Context(t), proc, PromptRequest{
+			TurnID:  "turn-stop",
+			Message: "block until stopped",
+		})
+		if err != nil {
+			t.Fatalf("Prompt() error = %v", err)
+		}
+
+		select {
+		case event := <-eventsCh:
+			if got, want := event.Type, EventTypeAgentMessage; got != want {
+				t.Fatalf("first prompt event = %q, want %q", got, want)
+			}
+		case <-time.After(5 * time.Second):
+			t.Fatal("timeout waiting for blocking prompt to start")
+		}
+
+		if err := driver.Stop(testutil.Context(t), proc); err != nil {
+			t.Fatalf("Stop() error = %v", err)
+		}
+		stopped = true
+		for _, event := range collectEvents(t, eventsCh) {
+			if event.Type == EventTypeError {
+				t.Fatalf("prompt events contain %q after explicit stop: %#v", EventTypeError, event)
+			}
+		}
+	})
+}
+
+func TestCooperativePromptCancellation(t *testing.T) {
+	t.Parallel()
+	t.Run("Should deliver cancellation without detaching a noncooperative peer prompt", func(t *testing.T) {
+		t.Parallel()
+		driver := New()
+		proc := startHelperProcess(t, driver, "cooperative_cancel_ignored", "", StartOpts{})
+		t.Cleanup(func() { stopProcess(t, driver, proc) })
+		ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
+		defer cancel()
+		events, err := driver.Prompt(ctx, proc, PromptRequest{TurnID: "cooperative-turn", Message: "wait"})
+		if err != nil {
+			t.Fatal(err)
+		}
+		select {
+		case event := <-events:
+			if event.Type != EventTypeAgentMessage {
+				t.Fatalf("initial prompt event = %#v", event)
+			}
+		case <-ctx.Done():
+			t.Fatal(ctx.Err())
+		}
+		active := proc.currentPrompt()
+		if err := driver.CancelCooperatively(ctx, proc); err != nil {
+			t.Fatal(err)
+		}
+		select {
+		case event := <-events:
+			if event.Type != EventTypeAgentMessage || event.Text != "cancel received" {
+				t.Fatalf("peer cancellation acknowledgement = %#v", event)
+			}
+		case <-ctx.Done():
+			t.Fatal(ctx.Err())
+		}
+		if proc.currentPrompt() != active || active.steerContext.Err() != nil {
+			t.Fatal("cooperative cancellation detached the active prompt")
+		}
+		if err := driver.Cancel(ctx, proc); err != nil {
+			t.Fatal(err)
+		}
+		collectEvents(t, events)
+	})
+}
+
+func TestShouldSuppressPromptErrorOnStop(t *testing.T) {
+	t.Parallel()
+
+	testCases := []struct {
+		name string
+		err  error
+		want bool
+	}{
+		{
+			name: "Should suppress context canceled errors",
+			err:  context.Canceled,
+			want: true,
+		},
+		{
+			name: "Should suppress deadline exceeded errors",
+			err:  context.DeadlineExceeded,
+			want: true,
+		},
+		{
+			name: "Should suppress wrapped canceled failures",
+			err:  WrapFailure(store.FailureCanceled, "stopped", context.Canceled),
+			want: true,
+		},
+		{
+			name: "Should suppress request errors carrying canceled details",
+			err: &acpsdk.RequestError{
+				Code:    -32603,
+				Message: "Internal error",
+				Data:    map[string]any{"error": "context canceled"},
+			},
+			want: true,
+		},
+		{
+			name: "Should suppress peer disconnect request errors after stop",
+			err: &acpsdk.RequestError{
+				Code:    -32603,
+				Message: "Internal error",
+				Data:    map[string]any{"error": "peer disconnected before response"},
+			},
+			want: true,
+		},
+		{
+			name: "Should not suppress generic request failures",
+			err: &acpsdk.RequestError{
+				Code:    -32603,
+				Message: "Internal error",
+				Data:    map[string]any{"details": "Tool invocation failed"},
+			},
+			want: false,
+		},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			if got := shouldSuppressPromptErrorOnStop(tc.err); got != tc.want {
+				t.Fatalf("shouldSuppressPromptErrorOnStop() = %v, want %v", got, tc.want)
+			}
+		})
+	}
+}
+
+func TestSteerPreservesActivePrompt(t *testing.T) {
+	t.Parallel()
+	cases := []struct {
+		name      string
+		scenario  string
+		want      SteerAttempt
+		wantError error
+	}{
+		{
+			"Should inject guidance without replacing or canceling the active turn",
+			"steering_injected",
+			SteerAttemptInjected,
+			nil,
+		},
+		{
+			"Should report accepted guidance waiting behind a tool",
+			"steering_pending",
+			SteerAttemptPendingInjection,
+			nil,
+		},
+		{
+			"Should return pending concurrent guidance before its prompt completes",
+			"concurrent_steering",
+			SteerAttemptPendingInjection,
+			nil,
+		},
+		{
+			"Should leave fallback to the session owner after a refused injection",
+			"steering_failed",
+			SteerAttemptUnsupported,
+			nil,
+		},
+		{
+			"Should return the text to host-owned follow-up delivery when the remote turn ended",
+			"steering_idle",
+			SteerAttemptUnsupported,
+			ErrSteerTurnMismatch,
+		},
+		{
+			"Should report unsupported without sending or canceling on an ordinary ACP agent",
+			"block_prompt_until_cancel",
+			SteerAttemptUnsupported,
+			nil,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			driver := New()
+			capturePath := filepath.Join(t.TempDir(), "steer.jsonl")
+			proc := startHelperProcess(t, driver, tc.scenario, "", StartOpts{
+				Env: helperEnvWithCapture(tc.scenario, "", capturePath),
+			})
+			proc.capsMu.Lock()
+			proc.caps.PromptImage = true
+			proc.caps.PromptEmbeddedContext = true
+			proc.capsMu.Unlock()
+			defer stopProcess(t, driver, proc)
+			if tc.scenario == "concurrent_steering" {
+				proc.capsMu.Lock()
+				proc.caps.SteerCapability = compozyconfig.SteerCapabilityConcurrentPrompt
+				proc.capsMu.Unlock()
+			}
+
+			ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
+			defer cancel()
+			events, err := driver.Prompt(ctx, proc, PromptRequest{TurnID: "original-turn", Message: "keep working"})
+			if err != nil {
+				t.Fatal(err)
+			}
+			select {
+			case event := <-events:
+				if event.Type != EventTypeAgentMessage {
+					t.Fatalf("initial event = %#v", event)
+				}
+			case <-ctx.Done():
+				t.Fatal(ctx.Err())
+			}
+			original := proc.currentPrompt()
+			attempt, err := driver.Steer(ctx, proc, "original-turn", "change direction", []PromptAttachment{
+				{Name: "screen.png", MIMEType: "image/png", Data: []byte("image")},
+				{Name: "notes.txt", MIMEType: "text/plain", Data: []byte("notes")},
+				{Name: "report.pdf", MIMEType: "application/pdf", Data: []byte("pdf")},
+			})
+			if attempt.Attempt != tc.want || !errors.Is(err, tc.wantError) {
+				t.Fatalf("Steer() = %#v, %v; want %q, %v", attempt, err, tc.want, tc.wantError)
+			}
+			if tc.scenario == "concurrent_steering" {
+				if attempt.Completion == nil {
+					t.Fatal("concurrent steer did not expose completion")
+				}
+				select {
+				case event := <-events:
+					if event.Type != EventTypeAgentMessage || event.TurnID != "original-turn" {
+						t.Fatalf("concurrent event=%#v", event)
+					}
+				case <-ctx.Done():
+					t.Fatal(ctx.Err())
+				}
+				select {
+				case err := <-attempt.Completion:
+					t.Fatalf("concurrent completion returned early: %v", err)
+				default:
+				}
+			}
+			if tc.want == SteerAttemptInjected || tc.scenario == "concurrent_steering" {
+				method := steerExtensionMethod
+				if tc.scenario == "concurrent_steering" {
+					method = acpsdk.AgentMethodSessionPrompt
+				}
+				requests := captureRequestParamsForMethod(t, capturePath, method)
+				var blocks []acpsdk.ContentBlock
+				if len(requests) == 0 {
+					t.Fatal("steer request was not sent")
+				}
+				if err := json.Unmarshal(requests[len(requests)-1]["prompt"], &blocks); err != nil {
+					t.Fatal(err)
+				}
+				if len(blocks) != 4 || blocks[1].Image == nil || blocks[1].Image.Data != "aW1hZ2U=" ||
+					blocks[2].Resource == nil || blocks[3].Resource == nil {
+					t.Fatalf("steer content blocks = %#v", blocks)
+				}
+			}
+			if proc.currentPrompt() != original {
+				t.Fatal("Steer replaced the active prompt")
+			}
+			if tc.want == SteerAttemptInjected {
+				select {
+				case event := <-events:
+					if event.Type != EventTypeAgentMessage || event.TurnID != "original-turn" ||
+						event.Text != "change direction" {
+						t.Fatalf("steered event = %#v", event)
+					}
+				case <-ctx.Done():
+					t.Fatal(ctx.Err())
+				}
+			}
+			select {
+			case event := <-events:
+				t.Fatalf("Steer unexpectedly ended or canceled the prompt: %#v", event)
+			default:
+			}
+			if err := driver.Cancel(ctx, proc); err != nil {
+				t.Fatal(err)
+			}
+			collectEvents(t, events)
+			if attempt.Completion != nil {
+				select {
+				case <-attempt.Completion:
+				case <-ctx.Done():
+					t.Fatal("concurrent completion leaked after cancel")
+				}
+			}
+		})
+	}
+	t.Run("Should reject a stale local turn fence before sending guidance", func(t *testing.T) {
+		t.Parallel()
+		driver := New()
+		proc := startHelperProcess(t, driver, "steering_injected", "", StartOpts{})
+		defer stopProcess(t, driver, proc)
+		ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
+		defer cancel()
+		events, err := driver.Prompt(ctx, proc, PromptRequest{TurnID: "current-turn", Message: "keep working"})
+		if err != nil {
+			t.Fatal(err)
+		}
+		attempt, err := driver.Steer(ctx, proc, "old-turn", "stale guidance", nil)
+		if attempt.Attempt != SteerAttemptUnsupported || !errors.Is(err, ErrSteerTurnMismatch) {
+			t.Fatalf("Steer() = %#v, %v", attempt, err)
+		}
+		if err := driver.Cancel(ctx, proc); err != nil {
+			t.Fatal(err)
+		}
+		collectEvents(t, events)
+	})
+}
+
+// UT-001 UT-002: normalize, clone, and validate sender origin at the ACP boundary.
+func TestPromptOriginContract(t *testing.T) {
+	t.Parallel()
+	t.Run("Should normalize bound and clone immutable sender metadata", func(t *testing.T) {
+		t.Parallel()
+		raw := PromptOriginMeta{
+			Kind:        " session ",
+			SessionID:   " sess-a ",
+			WorkspaceID: " ws-1 ",
+			TitleAtSend: strings.Repeat("界", 250),
+			Hop:         1,
+		}
+		got := raw.Normalize()
+		if got.Kind != "session" || got.SessionID != "sess-a" || got.WorkspaceID != "ws-1" ||
+			len([]rune(got.TitleAtSend)) != 200 {
+			t.Fatal(got)
+		}
+		event := (AgentEvent{Type: EventTypeUserMessage}).WithPromptOrigin(&got)
+		got.TitleAtSend = "changed"
+		cloned := event.PromptOrigin()
+		cloned.Hop = 8
+		if event.PromptOrigin().Hop != 1 || event.PromptOrigin().TitleAtSend == "changed" {
+			t.Fatal("origin aliases its caller")
+		}
+		if ClonePromptOriginMeta(nil) != nil || !(PromptOriginMeta{}).IsZero() {
+			t.Fatal("absent origin is not zero")
+		}
+	})
+	for _, tc := range []struct {
+		name  string
+		meta  PromptOriginMeta
+		valid bool
+	}{
+		{"Should accept a session origin", PromptOriginMeta{Kind: "session", SessionID: "a", WorkspaceID: "w", Hop: 1}, true},
+		{"Should reject another kind", PromptOriginMeta{Kind: "agent", SessionID: "a", WorkspaceID: "w", Hop: 1}, false},
+		{"Should reject an empty sender", PromptOriginMeta{Kind: "session", WorkspaceID: "w", Hop: 1}, false},
+		{"Should accept a User-scope sender without a workspace", PromptOriginMeta{Kind: "session", SessionID: "a", Hop: 1}, true},
+		{"Should reject hop zero", PromptOriginMeta{Kind: "session", SessionID: "a", WorkspaceID: "w"}, false},
+		{"Should reject hop nine", PromptOriginMeta{Kind: "session", SessionID: "a", WorkspaceID: "w", Hop: 9}, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			if (tc.meta.Validate() == nil) != tc.valid {
+				t.Fatal(tc.meta)
+			}
+		})
+	}
+	t.Run("Should restrict origin to user prompt metadata", func(t *testing.T) {
+		t.Parallel()
+		origin := &PromptOriginMeta{Kind: "session", SessionID: "a", WorkspaceID: "w", Hop: 1}
+		meta := PromptMeta{TurnSource: PromptTurnSourceUser, Origin: origin}
+		if err := meta.Validate(); err != nil {
+			t.Fatal(err)
+		}
+		mapped, err := meta.ToMap()
+		if err != nil || mapped["origin"] == nil {
+			t.Fatal(mapped, err)
+		}
+		meta.TurnSource = PromptTurnSourceSynthetic
+		meta.Synthetic = &PromptSyntheticMeta{Kind: "subagent", Reason: "done"}
+		if meta.Validate() == nil {
+			t.Fatal("synthetic origin accepted")
+		}
+	})
+}
+
+func TestPromptAgentCommandPreservesContextDelivery(t *testing.T) {
+	t.Parallel()
+	t.Run("Should send command as the first wire block and defer context", func(t *testing.T) {
+		t.Parallel()
+		driver := New()
+		proc := startHelperProcess(t, driver, "echo_prompt", "", StartOpts{
+			SystemPrompt: "startup instructions", SystemPromptDelivery: SystemPromptDeliveryFirstTurnPrefix,
+		})
+		defer stopProcess(t, driver, proc)
+		section := PromptSection{Key: "skills", Content: "pending skills", UnchangedContent: "skills unchanged"}
+		requests := []PromptRequest{
+			{
+				TurnID:       "command",
+				Message:      "/compact keep decisions",
+				AgentCommand: true,
+				Sections:     []PromptSection{section},
+			},
+			{TurnID: "ordinary", Message: "pending skills\n\ncontinue", Sections: []PromptSection{section}},
+			{TurnID: "later", Message: "pending skills\n\ncontinue", Sections: []PromptSection{section}},
+		}
+		for index, request := range requests {
+			stream, err := driver.Prompt(t.Context(), proc, request)
+			if err != nil {
+				t.Fatal(err)
+			}
+			events := collectEvents(t, stream)
+			if len(events) == 0 {
+				t.Fatal("missing wire echo")
+			}
+			got := events[0].Text
+			switch index {
+			case 0:
+				if got != request.Message {
+					t.Fatalf("first wire block = %q", got)
+				}
+			case 1:
+				if !strings.Contains(got, "startup instructions") || !strings.Contains(got, section.Content) {
+					t.Fatalf("deferred context missing: %q", got)
+				}
+			case 2:
+				if strings.Contains(got, "startup instructions") || !strings.Contains(got, section.UnchangedContent) {
+					t.Fatalf("context delivery not advanced: %q", got)
+				}
+			}
+		}
+	})
+}

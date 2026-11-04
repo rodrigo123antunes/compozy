@@ -1,0 +1,236 @@
+import { Link } from "@tanstack/react-router";
+import { Check, ChevronRight } from "@compozy/ui/icons";
+
+import { Button, Panel, Section, StateGlyph, Time } from "@compozy/ui";
+
+import type { AttentionNotificationScope } from "@/systems/notifications";
+
+import type { HomeAttentionActions } from "../hooks/use-home-attention-actions";
+import type { HomeAttentionResolvedKind } from "../hooks/use-home-attention-actions";
+import { itemBindingSearch } from "@/systems/workspace";
+import type { HomeAttention, HomeAttentionItem } from "../types";
+
+export interface HomeAttentionZoneProps {
+  attention: HomeAttention;
+  actions: HomeAttentionActions;
+  notificationScope?: AttentionNotificationScope;
+  scopeLabel?: string;
+  /** All projects: items open in place, bound to the project (or User) that owns them. */
+  bindItemsToOwner?: boolean;
+}
+
+interface HomeAttentionRowProps {
+  item: HomeAttentionItem;
+  openSearch?: { workspace: string };
+  onAcknowledge: (id?: string) => void;
+  acknowledgementDisabled: boolean;
+  resolved: HomeAttentionResolvedKind | undefined;
+  onApprove: (taskId: string) => void;
+  onReject: (taskId: string) => void;
+  onRetry: (runId: string) => void;
+  isMutating: boolean;
+}
+
+function attentionGlyph(kind: string): "attention" | "failed" {
+  return kind === "failure" ? "failed" : "attention";
+}
+
+function attentionKindLabel(kind: string): string {
+  switch (kind) {
+    case "approval":
+      return "Waiting for approval";
+    case "failure":
+      return "Failed";
+    default:
+      return "Needs your answer";
+  }
+}
+
+function attentionSentence(item: HomeAttentionItem): string {
+  switch (item.kind) {
+    case "approval":
+      return "is waiting for your approval";
+    case "failure":
+      return item.detail ? `failed — ${item.detail}` : "failed";
+    default:
+      return item.detail ? `needs attention — ${item.detail}` : "needs your attention";
+  }
+}
+
+function HomeAttentionRow({
+  item,
+  openSearch,
+  onAcknowledge,
+  acknowledgementDisabled,
+  resolved,
+  onApprove,
+  onReject,
+  onRetry,
+  isMutating,
+}: HomeAttentionRowProps) {
+  if (resolved) {
+    return (
+      <div
+        className="grid grid-cols-[14px_minmax(0,1fr)_auto] items-center gap-3 bg-success-tint px-4 py-3"
+        data-resolved={resolved}
+        data-slot="home-attention-row"
+      >
+        <StateGlyph label="Resolved" state="done" />
+        <span className="truncate text-small-body text-muted-foreground">
+          {resolved === "approved" ? "Approved — " : "Rejected — "}
+          <span className="font-medium text-fg-strong">{item.title}</span>
+          {resolved === "approved" ? " is starting" : " will not run"}
+        </span>
+        <span className="font-mono text-mono-id tabular-nums text-subtle">now</span>
+      </div>
+    );
+  }
+
+  const taskId = item.task_id;
+  const runId = item.run_id;
+  return (
+    <div
+      className="grid grid-cols-[14px_minmax(0,1fr)_auto_auto] items-center gap-3 px-4 py-3 transition-colors duration-base hover:bg-surface-2 max-[760px]:grid-cols-[14px_minmax(0,1fr)_auto]"
+      data-slot="home-attention-row"
+    >
+      <StateGlyph label={attentionKindLabel(item.kind)} state={attentionGlyph(item.kind)} />
+      <span className="truncate text-small-body text-muted-foreground max-[760px]:whitespace-normal">
+        <span className="font-medium text-fg-strong">{item.title}</span> {attentionSentence(item)}
+      </span>
+      <span className="text-eyebrow tabular-nums text-subtle max-[760px]:hidden">
+        <Time iso={item.occurred_at} />
+      </span>
+      <span className="flex items-center gap-1.5">
+        <Button
+          size="icon-sm"
+          variant="quiet"
+          aria-label={`Mark ${item.title} as read`}
+          disabled={isMutating || acknowledgementDisabled || !item.notification_id}
+          onClick={() => onAcknowledge(item.notification_id)}
+        >
+          <Check aria-hidden="true" />
+        </Button>
+        {item.actions.includes("approve") && taskId ? (
+          <Button
+            disabled={isMutating}
+            onClick={() => onApprove(taskId)}
+            size="sm"
+            variant="secondary"
+          >
+            Approve
+          </Button>
+        ) : null}
+        {item.actions.includes("reject") && taskId ? (
+          <Button disabled={isMutating} onClick={() => onReject(taskId)} size="sm" variant="ghost">
+            Reject
+          </Button>
+        ) : null}
+        {item.actions.includes("retry") && runId ? (
+          <Button
+            disabled={isMutating}
+            onClick={() => onRetry(runId)}
+            size="sm"
+            variant="secondary"
+          >
+            Retry
+          </Button>
+        ) : null}
+        {item.actions.includes("open") && taskId ? (
+          <Button
+            nativeButton={false}
+            render={<Link params={{ id: taskId }} search={openSearch} to="/tasks/$id" />}
+            size="sm"
+            variant="ghost"
+          >
+            Open
+          </Button>
+        ) : null}
+      </span>
+    </div>
+  );
+}
+
+/**
+ * Zone 1 — everything currently waiting on the user, with the daemon-accepted
+ * verbs (approve/reject/retry/open) inline. Approve/reject resolve the row
+ * optimistically; every settled decision reconciles the overview counters.
+ */
+export function HomeAttentionZone({
+  attention,
+  actions,
+  notificationScope,
+  scopeLabel = "Selected scope",
+  bindItemsToOwner = false,
+}: HomeAttentionZoneProps) {
+  const {
+    resolvedById,
+    pendingIds,
+    onApprove,
+    onReject,
+    onRetry,
+    onAcknowledge,
+    acknowledgementPending,
+    acknowledgementError,
+  } = actions;
+  const acknowledgementDisabled =
+    acknowledgementPending || !attention.snapshot || !notificationScope;
+
+  const inbox = (
+    <span className="flex items-center gap-2">
+      <Button
+        size="sm"
+        variant="quiet"
+        disabled={acknowledgementDisabled || attention.total === 0}
+        aria-label={`Clear all notifications in ${scopeLabel}`}
+        onClick={() => onAcknowledge()}
+      >
+        {acknowledgementPending ? "Clearing…" : "Clear all"}
+      </Button>
+      <Button
+        nativeButton={false}
+        render={<Link search={{ mode: "inbox" }} to="/tasks" />}
+        size="sm"
+        variant="link"
+      >
+        Open inbox
+        <ChevronRight aria-hidden="true" />
+      </Button>
+    </span>
+  );
+
+  // Nothing waiting: the menubar bell stays the entry point, so Home shows no empty zone.
+  if (attention.total === 0 && attention.items.length === 0) {
+    return null;
+  }
+
+  return (
+    <Section count={attention.total} data-slot="home-attention" label="Needs you" right={inbox}>
+      <Panel bodyClassName="p-0" className="overflow-hidden">
+        {acknowledgementError ? (
+          <p role="alert" className="px-4 py-2 text-small-body text-destructive">
+            {acknowledgementError}
+          </p>
+        ) : null}
+        <div className="divide-y divide-line-soft">
+          {attention.items.map(item => (
+            <HomeAttentionRow
+              isMutating={
+                (item.task_id != null && pendingIds.has(item.task_id)) ||
+                (item.run_id != null && pendingIds.has(item.run_id))
+              }
+              item={item}
+              openSearch={bindItemsToOwner ? itemBindingSearch(item.workspace_id) : undefined}
+              key={item.notification_id ?? `${item.kind}:${item.task_id ?? item.title}`}
+              onAcknowledge={onAcknowledge}
+              acknowledgementDisabled={acknowledgementDisabled}
+              onApprove={onApprove}
+              onReject={onReject}
+              onRetry={onRetry}
+              resolved={item.task_id ? resolvedById[item.task_id] : undefined}
+            />
+          ))}
+        </div>
+      </Panel>
+    </Section>
+  );
+}

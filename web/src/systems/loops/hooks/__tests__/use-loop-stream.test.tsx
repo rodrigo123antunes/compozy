@@ -1,0 +1,1153 @@
+import { QueryClient, QueryClientProvider, QueryObserver } from "@tanstack/react-query";
+import { act, renderHook, waitFor } from "@testing-library/react";
+import { createElement, type ReactNode } from "react";
+import { describe, expect, it, vi } from "vitest";
+
+import { loopsKeys, useLoopStream } from "@/systems/loops";
+import type { LoopRunEventFrame, LoopStreamEventSource } from "@/systems/loops";
+import { LIVE_REFETCH_INTERVAL } from "../../lib/query-options";
+
+const LOOP_EVENT_KINDS = [
+  "node_running",
+  "node_succeeded",
+  "node_failed",
+  "gate_verdict",
+  "generation_started",
+  "token_tick",
+  "needs_approval",
+  "status_changed",
+  "goal_turn_started",
+  "goal_turn_completed",
+  "goal_status_changed",
+] as const;
+
+class FakeLoopStreamEventSource {
+  private closed = false;
+  public close = vi.fn(() => {
+    this.closed = true;
+  });
+  public onmessage: ((event: MessageEvent) => void) | null = null;
+  public onerror: ((event: Event) => void) | null = null;
+  public readonly addEventListener = vi.fn(this.recordAddListener.bind(this));
+  public readonly removeEventListener = vi.fn(this.recordRemoveListener.bind(this));
+  private readonly listeners = new Map<string, EventListenerOrEventListenerObject[]>();
+
+  private recordAddListener(type: string, listener: EventListenerOrEventListenerObject) {
+    const current = this.listeners.get(type) ?? [];
+    current.push(listener);
+    this.listeners.set(type, current);
+  }
+
+  private recordRemoveListener(type: string, listener: EventListenerOrEventListenerObject) {
+    const current = this.listeners.get(type) ?? [];
+    this.listeners.set(
+      type,
+      current.filter(candidate => candidate !== listener)
+    );
+  }
+
+  hasListener(type: string): boolean {
+    return (this.listeners.get(type) ?? []).length > 0;
+  }
+
+  emitMessage(data: unknown) {
+    if (this.closed || !this.onmessage) {
+      return;
+    }
+    this.onmessage(
+      new MessageEvent("message", {
+        data: typeof data === "string" ? data : JSON.stringify(data),
+      })
+    );
+  }
+
+  emitNamed(type: string, data: unknown) {
+    if (this.closed) {
+      return;
+    }
+    const current = this.listeners.get(type) ?? [];
+    if (current.length === 0) {
+      return;
+    }
+    const event = new MessageEvent(type, {
+      data: typeof data === "string" ? data : JSON.stringify(data),
+    });
+    for (const listener of current) {
+      if (typeof listener === "function") {
+        listener(event);
+      } else if (listener && typeof listener.handleEvent === "function") {
+        listener.handleEvent(event);
+      }
+    }
+  }
+
+  emitError(event?: Event) {
+    if (this.closed || !this.onerror) {
+      return;
+    }
+    this.onerror(event ?? new Event("error"));
+  }
+}
+
+function createNamedOnlySource(): {
+  source: LoopStreamEventSource;
+  hasListener: (type: string) => boolean;
+} {
+  const listeners = new Map<string, EventListenerOrEventListenerObject[]>();
+  const source: LoopStreamEventSource = {
+    onmessage: null,
+    onerror: null,
+    close: vi.fn(),
+    addEventListener: (type, listener) => {
+      const current = listeners.get(type) ?? [];
+      current.push(listener);
+      listeners.set(type, current);
+    },
+    // Intentionally omit removeEventListener to exercise the cleanup branch that
+    // must still close the source and clear onmessage/onerror without it.
+  };
+  return {
+    source,
+    hasListener: type => (listeners.get(type) ?? []).length > 0,
+  };
+}
+
+function createWrapper(queryClient: QueryClient) {
+  return ({ children }: { children: ReactNode }) =>
+    createElement(QueryClientProvider, { client: queryClient }, children);
+}
+
+function buildFrame(overrides: Partial<LoopRunEventFrame> = {}): LoopRunEventFrame {
+  const frame = {
+    id: "loopevt_1",
+    seq: 42,
+    kind: "status_changed",
+    loop_run_id: "looprun_1",
+    workspace_id: "ws_1",
+    at: "2026-07-05T12:00:00Z",
+    payload: { from: "running", to: "paused", cause: "operator_pause" },
+    ...overrides,
+  };
+  return frame as LoopRunEventFrame;
+}
+
+describe("useLoopStream", () => {
+  it.each(["active", "disposed", "settled", "replaced", "disabled", "initial", "static"])(
+    "Should bound a pending cached refresh while preserving the %s boundary",
+    async boundary => {
+      vi.useFakeTimers();
+      const queryClient = new QueryClient({
+        defaultOptions: { queries: { retry: false, gcTime: Infinity } },
+      });
+      const eventSource = new FakeLoopStreamEventSource();
+      const eventSourceFactory = () => eventSource;
+      let revision = 0;
+      let reads = 0;
+      let canceled = 0;
+      const releases: (() => void)[] = [];
+      const options = {
+        queryKey: loopsKeys.runBriefing("ws_1", "looprun_1"),
+        initialData: boundary === "initial" ? undefined : { revision: 0 },
+        staleTime: boundary === "static" ? ("static" as const) : Infinity,
+        queryFn: ({ signal }: { signal: AbortSignal }) => {
+          const readRevision = revision;
+          if (++reads > 1 && boundary !== "replaced") {
+            return Promise.resolve({ revision: readRevision });
+          }
+          return new Promise<{ revision: number }>((resolve, reject) => {
+            releases.push(() => resolve({ revision: readRevision }));
+            signal.addEventListener(
+              "abort",
+              () => {
+                canceled++;
+                reject(new DOMException("Aborted", "AbortError"));
+              },
+              { once: true }
+            );
+          });
+        },
+      };
+      const observer = new QueryObserver(queryClient, options);
+      const unsubscribe = observer.subscribe(() => undefined);
+      if (boundary === "static") void observer.refetch();
+      const { unmount } = renderHook(
+        () => useLoopStream("ws_1", "looprun_1", { eventSourceFactory }),
+        { wrapper: createWrapper(queryClient) }
+      );
+      const wake = (nextRevision: number) => {
+        revision = nextRevision;
+        eventSource.emitNamed("node_running", buildFrame({ kind: "node_running" }));
+      };
+      try {
+        await act(async () => {
+          wake(1);
+          await vi.advanceTimersByTimeAsync(0);
+          wake(2);
+          await vi.advanceTimersByTimeAsync(0);
+        });
+        expect(reads).toBe(1);
+        expect(canceled).toBe(0);
+        await act(async () => {
+          await vi.advanceTimersByTimeAsync(LIVE_REFETCH_INTERVAL / 2);
+          wake(3);
+          await vi.advanceTimersByTimeAsync(0);
+          if (boundary === "disposed") unmount();
+          if (boundary === "disabled") observer.setOptions({ ...options, enabled: false });
+          if (boundary === "settled") releases[0]?.();
+          if (boundary === "replaced") {
+            releases[0]?.();
+            await vi.advanceTimersByTimeAsync(0);
+            wake(3);
+            await vi.advanceTimersByTimeAsync(0);
+            void observer.refetch();
+          }
+          await vi.advanceTimersByTimeAsync(0);
+        });
+        await act(async () => {
+          await vi.advanceTimersByTimeAsync(LIVE_REFETCH_INTERVAL / 2 - 1);
+        });
+        const beforeDeadline = { reads, canceled };
+        if (!["settled", "replaced"].includes(boundary)) {
+          expect(beforeDeadline).toEqual({ reads: 1, canceled: 0 });
+        }
+        await act(async () => {
+          await vi.advanceTimersByTimeAsync(1);
+        });
+        if (boundary === "active" || boundary === "disposed") {
+          expect(reads).toBe(2);
+          expect(canceled).toBe(1);
+          expect(observer.getCurrentResult().data).toEqual({ revision: 3 });
+        } else {
+          expect({ reads, canceled }).toEqual(beforeDeadline);
+          if (boundary === "replaced") {
+            // The trailing invalidate now awaits an external replacement. Its
+            // earlier deadline must not cancel that different promise.
+            await act(async () => {
+              await vi.advanceTimersByTimeAsync(LIVE_REFETCH_INTERVAL / 2);
+            });
+            expect({ reads, canceled }).toEqual(beforeDeadline);
+          }
+          await act(async () => {
+            for (const release of releases) {
+              release();
+              await vi.advanceTimersByTimeAsync(0);
+            }
+          });
+          if (boundary === "disabled" || boundary === "static") {
+            expect(reads).toBe(1);
+            expect(observer.getCurrentQuery().state.isInvalidated).toBe(true);
+            if (boundary === "disabled") {
+              await act(async () => {
+                observer.setOptions({ ...options, enabled: true });
+                await vi.advanceTimersByTimeAsync(0);
+              });
+            }
+          }
+          if (boundary !== "static") {
+            expect(observer.getCurrentResult().data).toEqual({ revision: 3 });
+          }
+          if (boundary === "initial" || boundary === "disabled" || boundary === "settled") {
+            expect(reads).toBe(2);
+            expect(canceled).toBe(0);
+          }
+        }
+        const reconciled = { reads, canceled };
+        await act(async () => {
+          await vi.advanceTimersByTimeAsync(LIVE_REFETCH_INTERVAL);
+        });
+        expect({ reads, canceled }).toEqual(reconciled);
+        expect(vi.getTimerCount()).toBe(0);
+      } finally {
+        unmount();
+        unsubscribe();
+        queryClient.clear();
+        await vi.advanceTimersByTimeAsync(0);
+        vi.useRealTimers();
+      }
+    }
+  );
+
+  it.each(["cached read only", "cached sibling", "initial sibling", "disabled prefetch sibling"])(
+    "Should keep cached reads progressing while reconciling %s",
+    async boundary => {
+      vi.useFakeTimers();
+      const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+      const eventSource = new FakeLoopStreamEventSource();
+      const eventSourceFactory = () => eventSource;
+      let revision = 0;
+      let reads = 0;
+      let canceled = 0;
+      let releaseOlderRead = () => {};
+      const observer = new QueryObserver(queryClient, {
+        queryKey: loopsKeys.runBriefing("ws_1", "looprun_1"),
+        initialData: { revision: 0 },
+        staleTime: Infinity,
+        queryFn: ({ signal }) => {
+          const readRevision = revision;
+          if (++reads > 1) return Promise.resolve({ revision: readRevision });
+          return new Promise<{ revision: number }>((resolve, reject) => {
+            releaseOlderRead = () => resolve({ revision: readRevision });
+            signal.addEventListener(
+              "abort",
+              () => {
+                canceled++;
+                reject(new DOMException("Aborted", "AbortError"));
+              },
+              { once: true }
+            );
+          });
+        },
+      });
+      const unsubscribe = observer.subscribe(() => undefined);
+      const olderRead = observer.refetch();
+      let siblingReads = 0;
+      let siblingCanceled = 0;
+      let releaseSiblingRead = () => {};
+      const siblingOptions = {
+        queryKey: loopsKeys.runRoster("ws_1", "looprun_1"),
+        queryKeyHashFn: (key: readonly unknown[]) => JSON.stringify(["custom", key]),
+        enabled: boundary === "initial sibling" || boundary === "cached sibling",
+        initialData: boundary === "cached sibling" ? { revision: 0 } : undefined,
+        staleTime: Infinity,
+        queryFn: ({ signal }: { signal: AbortSignal }) => {
+          const readRevision = revision;
+          if (++siblingReads > 1) return Promise.resolve({ revision: readRevision });
+          return new Promise<{ revision: number }>((resolve, reject) => {
+            releaseSiblingRead = () => resolve({ revision: readRevision });
+            signal.addEventListener(
+              "abort",
+              () => {
+                siblingCanceled++;
+                reject(new DOMException("Aborted", "AbortError"));
+              },
+              { once: true }
+            );
+          });
+        },
+      };
+      const siblingObserver = new QueryObserver(queryClient, siblingOptions);
+      const unsubscribeSibling = siblingObserver.subscribe(() => undefined);
+      const prefetch =
+        boundary === "disabled prefetch sibling"
+          ? queryClient.prefetchQuery(siblingOptions)
+          : undefined;
+      const unrelatedKey = loopsKeys.runBriefing("ws_2", "looprun_2");
+      queryClient.setQueryData(unrelatedKey, { revision: 0 });
+      let catalogReads = 0;
+      const catalogObserver = new QueryObserver(queryClient, {
+        queryKey: loopsKeys.catalogByWorkspace("ws_1"),
+        initialData: { revision: 0 },
+        staleTime: Infinity,
+        queryFn: async () => {
+          catalogReads++;
+          return { revision };
+        },
+      });
+      const unsubscribeCatalog = catalogObserver.subscribe(() => undefined);
+      const { unmount } = renderHook(
+        () => useLoopStream("ws_1", "looprun_1", { eventSourceFactory }),
+        { wrapper: createWrapper(queryClient) }
+      );
+      try {
+        expect(reads).toBe(1);
+        await act(async () => {
+          revision = 1;
+          eventSource.emitNamed("node_running", buildFrame({ kind: "node_running" }));
+          await vi.advanceTimersByTimeAsync(1);
+        });
+        // Neither pre-event response has been released. The cached query can
+        // already converge, including when a sibling uses a custom key hash.
+        expect(observer.getCurrentResult().data).toEqual({ revision: 1 });
+        expect(reads).toBe(2);
+        expect(canceled).toBe(1);
+        expect(siblingReads).toBe(boundary === "cached read only" ? 0 : 1);
+        expect(siblingCanceled).toBe(0);
+        expect(catalogReads).toBe(0);
+        await act(async () => {
+          revision = 2;
+          eventSource.emitNamed("status_changed", buildFrame({ kind: "status_changed" }));
+          await vi.advanceTimersByTimeAsync(1);
+        });
+        // A later event must reach both ready queries while the sibling's
+        // initial, cached, or disabled read is still blocked.
+        expect(observer.getCurrentResult().data).toEqual({ revision: 2 });
+        expect(reads).toBe(3);
+        expect(canceled).toBe(1);
+        expect(catalogObserver.getCurrentResult().data).toEqual({ revision: 2 });
+        expect(catalogReads).toBe(1);
+        expect(siblingReads).toBe(boundary === "cached read only" ? 0 : 1);
+        expect(siblingCanceled).toBe(0);
+        await act(async () => {
+          releaseSiblingRead();
+          await vi.advanceTimersByTimeAsync(1);
+        });
+        await prefetch;
+        if (boundary === "disabled prefetch sibling") {
+          expect(siblingReads).toBe(1);
+          expect(siblingObserver.getCurrentQuery().state.isInvalidated).toBe(true);
+          await act(async () => {
+            siblingObserver.setOptions({ ...siblingOptions, enabled: true });
+            await vi.advanceTimersByTimeAsync(1);
+          });
+        }
+        if (boundary !== "cached read only") {
+          expect(siblingReads).toBe(2);
+          expect(siblingObserver.getCurrentResult().data).toEqual({ revision: 2 });
+        }
+        expect(reads).toBe(3);
+        expect(canceled).toBe(1);
+        expect(catalogReads).toBe(1);
+        expect(queryClient.getQueryState(unrelatedKey)?.isInvalidated).toBe(false);
+      } finally {
+        unmount();
+        releaseOlderRead();
+        releaseSiblingRead();
+        unsubscribe();
+        unsubscribeSibling();
+        unsubscribeCatalog();
+        queryClient.clear();
+        await olderRead;
+        vi.useRealTimers();
+      }
+    }
+  );
+
+  it.each(["active", "disposed", "disabled", "disabled without prefetch", "failed initial read"])(
+    "Should reconcile a wake across an initial read with an %s observer",
+    async boundary => {
+      vi.useFakeTimers();
+      const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+      const eventSource = new FakeLoopStreamEventSource();
+      const eventSourceFactory = () => eventSource;
+      const onEvent = vi.fn();
+      const disabled = boundary.startsWith("disabled");
+      let revision = 0;
+      let reads = 0;
+      let canceled = 0;
+      const options = {
+        queryKey: ["loops", "run-detail", "ws_1", "looprun_1"],
+        enabled: !disabled,
+        staleTime: Infinity,
+        queryFn: ({ signal }: { signal: AbortSignal }) => {
+          const attempt = ++reads;
+          const readRevision = revision;
+          return new Promise<{ revision: number }>((resolve, reject) => {
+            const timer = setTimeout(() => {
+              if (boundary === "failed initial read" && attempt === 1) {
+                reject(new Error("Initial read failed"));
+              } else {
+                resolve({ revision: readRevision });
+              }
+            }, 100);
+            signal.addEventListener(
+              "abort",
+              () => {
+                canceled++;
+                clearTimeout(timer);
+                reject(new DOMException("Aborted", "AbortError"));
+              },
+              { once: true }
+            );
+          });
+        },
+      };
+      const observer = new QueryObserver(queryClient, options);
+      const unsubscribe = observer.subscribe(() => undefined);
+      const prefetch = boundary === "disabled" ? queryClient.prefetchQuery(options) : undefined;
+      const { unmount } = renderHook(
+        () => useLoopStream("ws_1", "looprun_1", { eventSourceFactory, onEvent }),
+        { wrapper: createWrapper(queryClient) }
+      );
+      try {
+        const initialReads = boundary === "disabled without prefetch" ? 0 : 1;
+        expect(reads).toBe(initialReads);
+        await act(async () => {
+          revision = 1;
+          eventSource.emitNamed("node_running", buildFrame({ kind: "node_running" }));
+          await vi.advanceTimersByTimeAsync(1);
+        });
+        expect(onEvent).toHaveBeenCalledTimes(1);
+        expect(reads).toBe(initialReads);
+        if (boundary === "disposed") unmount();
+        await act(async () => {
+          await vi.advanceTimersByTimeAsync(300);
+        });
+        await prefetch;
+        if (disabled) {
+          expect(reads).toBe(initialReads);
+          expect(queryClient.getQueryState(options.queryKey)?.isInvalidated).toBe(true);
+          await act(async () => {
+            observer.setOptions({ ...options, enabled: true });
+            await vi.advanceTimersByTimeAsync(100);
+          });
+        }
+        expect(reads).toBe(initialReads + 1);
+        expect(canceled).toBe(0);
+        expect(observer.getCurrentResult().data).toEqual({ revision: 1 });
+        expect(queryClient.getQueryState(options.queryKey)?.isInvalidated).toBe(false);
+      } finally {
+        unmount();
+        unsubscribe();
+        queryClient.clear();
+        vi.useRealTimers();
+      }
+    }
+  );
+
+  it("Should converge scoped reads after a lifecycle burst while delivering every frame", async () => {
+    vi.useFakeTimers();
+    const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    const eventSource = new FakeLoopStreamEventSource();
+    const onEvent = vi.fn();
+    let revision = 0;
+    let reads = 0;
+    let canceled = 0;
+    const queryKey = ["loops", "run-detail", "ws_1", "looprun_1"];
+    queryClient.setQueryData(queryKey, { revision: 0 });
+    queryClient.setQueryData(["loops", "run-detail", "ws_2", "looprun_2"], { revision: 0 });
+    const observer = new QueryObserver(queryClient, {
+      queryKey,
+      staleTime: Infinity,
+      queryFn: ({ signal }) => {
+        reads++;
+        const readRevision = revision;
+        return new Promise<{ revision: number }>((resolve, reject) => {
+          const timer = setTimeout(() => resolve({ revision: readRevision }), 100);
+          signal.addEventListener(
+            "abort",
+            () => {
+              canceled++;
+              clearTimeout(timer);
+              reject(new DOMException("Aborted", "AbortError"));
+            },
+            { once: true }
+          );
+        });
+      },
+    });
+    const unsubscribe = observer.subscribe(() => undefined);
+    const eventSourceFactory = () => eventSource;
+    const { unmount } = renderHook(
+      () => useLoopStream("ws_1", "looprun_1", { eventSourceFactory, onEvent }),
+      { wrapper: createWrapper(queryClient) }
+    );
+    try {
+      for (let sequence = 1; sequence <= 100; sequence++) {
+        await act(async () => {
+          revision = sequence;
+          eventSource.emitNamed(
+            "node_running",
+            buildFrame({ kind: "node_running", seq: sequence })
+          );
+          await vi.advanceTimersByTimeAsync(2);
+        });
+      }
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(1_000);
+      });
+      expect(onEvent).toHaveBeenCalledTimes(100);
+      expect(observer.getCurrentResult().data).toEqual({ revision: 100 });
+      expect(
+        queryClient.getQueryState(["loops", "run-detail", "ws_2", "looprun_2"])?.isInvalidated
+      ).toBe(false);
+      console.log(`[loop-stream-burst] ${JSON.stringify({ frames: 100, reads, canceled })}`);
+      expect(reads).toBe(3);
+      expect(canceled).toBe(0);
+    } finally {
+      unmount();
+      unsubscribe();
+      queryClient.clear();
+      vi.useRealTimers();
+    }
+  });
+
+  it.each(["scheduled disposal", "in-flight disposal", "stream error", "read failure"])(
+    "Should preserve pending authoritative reads through %s",
+    async boundary => {
+      vi.useFakeTimers();
+      const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+      const eventSource = new FakeLoopStreamEventSource();
+      const eventSourceFactory = () => eventSource;
+      const onEvent = vi.fn();
+      const onError = vi.fn();
+      const queryKey = ["loops", "run-detail", "ws_1", "looprun_1"];
+      const affectedKeys = [
+        ["loops", "requests", "ws_1"],
+        ["loops", "node-inventory", "ws_1"],
+        ["loops", "catalog", "ws_1"],
+        ["loops", "run-reads", "ws_1", "looprun_1", "goal-turns", 50],
+      ];
+      queryClient.setQueryData(queryKey, { revision: 0 });
+      for (const key of affectedKeys) queryClient.setQueryData(key, { revision: 0 });
+      let revision = 1;
+      let reads = 0;
+      let canceled = 0;
+      const observer = new QueryObserver(queryClient, {
+        queryKey,
+        staleTime: Infinity,
+        queryFn: ({ signal }) => {
+          const attempt = ++reads;
+          const readRevision = revision;
+          signal.addEventListener(
+            "abort",
+            () => {
+              canceled++;
+            },
+            { once: true }
+          );
+          return new Promise<{ revision: number }>((resolve, reject) => {
+            setTimeout(() => {
+              if (boundary === "read failure" && attempt === 1) reject(new Error("Read failed"));
+              else resolve({ revision: readRevision });
+            }, 100);
+          });
+        },
+      });
+      const unsubscribe = observer.subscribe(() => undefined);
+      const { unmount } = renderHook(
+        () => useLoopStream("ws_1", "looprun_1", { eventSourceFactory, onEvent, onError }),
+        { wrapper: createWrapper(queryClient) }
+      );
+      try {
+        act(() => eventSource.emitNamed("node_running", buildFrame({ kind: "node_running" })));
+        expect(onEvent).toHaveBeenCalledTimes(1);
+        if (boundary !== "scheduled disposal") {
+          await act(async () => {
+            await vi.advanceTimersByTimeAsync(1);
+          });
+          expect(reads).toBe(1);
+        }
+        act(() => {
+          revision = 2;
+          for (const kind of ["request_opened", "status_changed", "goal_turn_completed"] as const) {
+            eventSource.emitNamed(kind, buildFrame({ kind }));
+          }
+          if (boundary.includes("disposal")) unmount();
+          if (boundary === "stream error") eventSource.emitError();
+        });
+        expect(onEvent).toHaveBeenCalledTimes(4);
+        await act(async () => {
+          await vi.advanceTimersByTimeAsync(500);
+        });
+        expect(observer.getCurrentResult().data).toEqual({ revision: 2 });
+        expect(reads).toBe(boundary === "scheduled disposal" ? 1 : 2);
+        expect(canceled).toBe(0);
+        for (const key of affectedKeys) {
+          expect(queryClient.getQueryState(key)?.isInvalidated).toBe(true);
+        }
+        expect(onError).toHaveBeenCalledTimes(boundary === "stream error" ? 1 : 0);
+      } finally {
+        unmount();
+        unsubscribe();
+        queryClient.clear();
+        vi.useRealTimers();
+      }
+    }
+  );
+
+  it("Should open a workspace-scoped stream seeded with after_sequence and subscribe to every enumerated kind", () => {
+    const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    const eventSource = new FakeLoopStreamEventSource();
+    const factory = vi.fn(() => eventSource);
+
+    renderHook(
+      () => useLoopStream("ws_1", "looprun_1", { afterSequence: 14, eventSourceFactory: factory }),
+      { wrapper: createWrapper(queryClient) }
+    );
+
+    expect(factory).toHaveBeenCalledTimes(1);
+    expect(factory).toHaveBeenCalledWith(
+      "/api/workspaces/ws_1/loop-runs/looprun_1/events?profile=default&after_sequence=14"
+    );
+    for (const kind of LOOP_EVENT_KINDS) {
+      expect(eventSource.hasListener(kind)).toBe(true);
+    }
+  });
+
+  // Invariant: once a run stream is replaced, its detached source cannot deliver
+  // late frames. Owning layer: SSE transport hook. Canonical suite: this file.
+  it("Should discard a late frame from a replaced subscription", () => {
+    const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    const sources: FakeLoopStreamEventSource[] = [];
+    const factory = vi.fn(() => {
+      const source = new FakeLoopStreamEventSource();
+      sources.push(source);
+      return source;
+    });
+    const onEvent = vi.fn();
+    const { rerender } = renderHook(
+      ({ runId, workspaceId }) =>
+        useLoopStream(workspaceId, runId, {
+          eventSourceFactory: factory,
+          onEvent,
+        }),
+      {
+        initialProps: { runId: "looprun-a", workspaceId: "workspace-a" },
+        wrapper: createWrapper(queryClient),
+      }
+    );
+    const lateHandler = sources[0]?.onmessage;
+    const firstFrame = buildFrame({
+      kind: "node_running",
+      loop_run_id: "looprun-a",
+      workspace_id: "workspace-a",
+    });
+    act(() => {
+      sources[0]?.emitMessage(firstFrame);
+    });
+    const firstSubscription = onEvent.mock.calls[0]?.[1];
+
+    rerender({ runId: "looprun-b", workspaceId: "workspace-b" });
+    const secondFrame = buildFrame({
+      kind: "node_running",
+      loop_run_id: "looprun-b",
+      workspace_id: "workspace-b",
+    });
+    act(() => {
+      sources[1]?.emitMessage(secondFrame);
+    });
+    const secondSubscription = onEvent.mock.calls[1]?.[1];
+    expect(secondSubscription.generation).toBeGreaterThan(firstSubscription.generation);
+    onEvent.mockClear();
+
+    const lateFrame = buildFrame({
+      kind: "node_running",
+      loop_run_id: "looprun-a",
+      workspace_id: "workspace-a",
+    });
+    act(() => {
+      lateHandler?.(new MessageEvent("message", { data: JSON.stringify(lateFrame) }));
+    });
+
+    expect(onEvent).not.toHaveBeenCalled();
+  });
+
+  it("Should apply each SSE event kind to onEvent (no kind silently dropped)", async () => {
+    const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    const eventSource = new FakeLoopStreamEventSource();
+    const factory = vi.fn(() => eventSource);
+    const onEvent = vi.fn();
+
+    renderHook(
+      () =>
+        useLoopStream("ws_1", "looprun_1", {
+          afterSequence: 0,
+          eventSourceFactory: factory,
+          onEvent,
+        }),
+      { wrapper: createWrapper(queryClient) }
+    );
+
+    for (const [index, kind] of LOOP_EVENT_KINDS.entries()) {
+      const frame = buildFrame({ kind, seq: index + 1 });
+      act(() => {
+        eventSource.emitNamed(kind, frame);
+      });
+      // Every enumerated kind reaches onEvent with the parsed frame — the L-017
+      // named-listener invariant.
+      await waitFor(() => {
+        expect(onEvent).toHaveBeenCalledWith(
+          frame,
+          expect.objectContaining({
+            runId: "looprun_1",
+            workspaceId: "ws_1",
+          })
+        );
+      });
+    }
+
+    expect(onEvent).toHaveBeenCalledTimes(LOOP_EVENT_KINDS.length);
+  });
+
+  it("Should invalidate the run queries on lifecycle kinds but not on display kinds", async () => {
+    const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    const invalidateQueries = vi.spyOn(queryClient, "invalidateQueries");
+    const eventSource = new FakeLoopStreamEventSource();
+    const factory = vi.fn(() => eventSource);
+    const onEvent = vi.fn();
+
+    renderHook(() => useLoopStream("ws_1", "looprun_1", { eventSourceFactory: factory, onEvent }), {
+      wrapper: createWrapper(queryClient),
+    });
+
+    act(() => {
+      eventSource.emitNamed("status_changed", buildFrame({ kind: "status_changed" }));
+    });
+    await waitFor(() => expect(onEvent).toHaveBeenCalledTimes(1));
+    expect(invalidateQueries).toHaveBeenCalledWith({
+      queryKey: ["loops", "run-detail", "ws_1", "looprun_1"],
+    });
+    // Only this workspace's runs lists — not the unscoped root across all workspaces.
+    expect(invalidateQueries).toHaveBeenCalledWith({ queryKey: ["loops", "runs", "ws_1"] });
+    // Status changes own the catalog's latest-run and aggregate projections.
+    expect(invalidateQueries).toHaveBeenCalledWith({
+      queryKey: ["loops", "catalog", "ws_1"],
+    });
+
+    invalidateQueries.mockClear();
+    onEvent.mockClear();
+
+    // High-frequency display frames are applied locally via onEvent, never invalidating.
+    act(() => {
+      eventSource.emitNamed("token_tick", buildFrame({ kind: "token_tick" }));
+    });
+    await waitFor(() => expect(onEvent).toHaveBeenCalledTimes(1));
+    expect(invalidateQueries).not.toHaveBeenCalled();
+
+    // Goal turn frames wake only the durable turn read for this workspace and run.
+    act(() => {
+      eventSource.emitNamed("goal_turn_started", buildFrame({ kind: "goal_turn_started" }));
+      eventSource.emitNamed("goal_turn_completed", buildFrame({ kind: "goal_turn_completed" }));
+    });
+    await waitFor(() => expect(onEvent).toHaveBeenCalledTimes(3));
+    expect(invalidateQueries).toHaveBeenCalledTimes(1);
+    expect(invalidateQueries).toHaveBeenNthCalledWith(1, {
+      queryKey: ["loops", "run-reads", "ws_1", "looprun_1", "goal-turns", 50],
+    });
+
+    act(() => {
+      eventSource.emitNamed("goal_status_changed", buildFrame({ kind: "goal_status_changed" }));
+    });
+    await waitFor(() => expect(onEvent).toHaveBeenCalledTimes(4));
+    expect(invalidateQueries).toHaveBeenCalledWith({
+      queryKey: ["loops", "run-detail", "ws_1", "looprun_1"],
+    });
+    expect(invalidateQueries).toHaveBeenCalledWith({ queryKey: ["loops", "runs", "ws_1"] });
+  });
+
+  it("Should refresh the request inventory on the request lifecycle kinds the daemon set omits", async () => {
+    const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    const invalidateQueries = vi.spyOn(queryClient, "invalidateQueries");
+    const eventSource = new FakeLoopStreamEventSource();
+    const factory = vi.fn(() => eventSource);
+    const onEvent = vi.fn();
+
+    renderHook(() => useLoopStream("ws_1", "looprun_1", { eventSourceFactory: factory, onEvent }), {
+      wrapper: createWrapper(queryClient),
+    });
+
+    const requestKinds = [
+      "request_opened",
+      "request_answered",
+      "request_expired",
+      "request_canceled",
+      "node_amended",
+    ] as const;
+    for (const kind of requestKinds) {
+      invalidateQueries.mockClear();
+      onEvent.mockClear();
+      act(() => {
+        eventSource.emitNamed(kind, buildFrame({ kind }));
+      });
+      await waitFor(() => expect(onEvent).toHaveBeenCalledTimes(1));
+      expect(invalidateQueries).toHaveBeenCalledWith({
+        queryKey: ["loops", "run-detail", "ws_1", "looprun_1"],
+      });
+      expect(invalidateQueries).toHaveBeenCalledWith({ queryKey: ["loops", "requests", "ws_1"] });
+      expect(invalidateQueries).toHaveBeenCalledWith({
+        queryKey: ["loops", "node-inventory", "ws_1"],
+      });
+
+      expect(invalidateQueries).not.toHaveBeenCalledWith({
+        queryKey: ["loops", "catalog", "ws_1"],
+      });
+    }
+
+    invalidateQueries.mockClear();
+    onEvent.mockClear();
+    act(() => {
+      eventSource.emitNamed("branch_pruned", buildFrame({ kind: "branch_pruned" }));
+    });
+    await waitFor(() => expect(onEvent).toHaveBeenCalledTimes(1));
+    expect(invalidateQueries).toHaveBeenCalledWith({ queryKey: ["loops", "runs", "ws_1"] });
+    expect(invalidateQueries).not.toHaveBeenCalledWith({ queryKey: ["loops", "requests", "ws_1"] });
+  });
+
+  it("Should keep the source open for effect results after terminal status until cleanup", async () => {
+    const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    const eventSource = new FakeLoopStreamEventSource();
+    const factory = vi.fn(() => eventSource);
+    const onEvent = vi.fn();
+
+    const { unmount } = renderHook(
+      () =>
+        useLoopStream("ws_1", "looprun_1", {
+          eventSourceFactory: factory,
+          onEvent,
+        }),
+      { wrapper: createWrapper(queryClient) }
+    );
+
+    const terminal = buildFrame({
+      id: "loopevt_terminal",
+      seq: 42,
+      kind: "status_changed",
+      payload: { status: "done" },
+    });
+    const effectResult = buildFrame({
+      id: "loopevt_effect",
+      seq: 43,
+      kind: "effect_results",
+      payload: {
+        delivery_id: "delivery_1",
+        trigger: "on_done",
+        outcome: "ok",
+        code: "",
+        cause: "",
+      },
+    });
+    act(() => {
+      eventSource.emitNamed("status_changed", terminal);
+      eventSource.emitNamed("effect_results", effectResult);
+    });
+
+    await waitFor(() => expect(onEvent).toHaveBeenCalledTimes(2));
+    expect(onEvent.mock.calls.map(([frame]) => frame)).toEqual([terminal, effectResult]);
+    expect(eventSource.close).not.toHaveBeenCalled();
+
+    unmount();
+    expect(eventSource.close).toHaveBeenCalledTimes(1);
+  });
+
+  it("Should not reopen the EventSource when only onEvent identity changes", async () => {
+    const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    const eventSource = new FakeLoopStreamEventSource();
+    const factory = vi.fn(() => eventSource);
+
+    const { rerender } = renderHook(
+      ({ onEvent }: { onEvent: () => void }) =>
+        useLoopStream("ws_1", "looprun_1", { eventSourceFactory: factory, onEvent }),
+      { wrapper: createWrapper(queryClient), initialProps: { onEvent: vi.fn() } }
+    );
+
+    expect(factory).toHaveBeenCalledTimes(1);
+
+    // A fresh (inline-style) callback each render must not tear down the stream.
+    const nextOnEvent = vi.fn();
+    rerender({ onEvent: nextOnEvent });
+    expect(factory).toHaveBeenCalledTimes(1);
+    expect(eventSource.close).not.toHaveBeenCalled();
+
+    // The latest callback is the one invoked (ref stays current).
+    act(() => {
+      eventSource.emitNamed("status_changed", buildFrame());
+    });
+    await waitFor(() => expect(nextOnEvent).toHaveBeenCalledTimes(1));
+  });
+
+  it("Should seed after_sequence=0 into the stream URL to opt into Last-Event-ID:0 precedence", () => {
+    const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    const factory = vi.fn(() => new FakeLoopStreamEventSource());
+
+    renderHook(
+      () => useLoopStream("ws_1", "looprun_1", { afterSequence: 0, eventSourceFactory: factory }),
+      { wrapper: createWrapper(queryClient) }
+    );
+
+    expect(factory).toHaveBeenCalledWith(
+      "/api/workspaces/ws_1/loop-runs/looprun_1/events?profile=default&after_sequence=0"
+    );
+  });
+
+  it("Should retain the Profile when no after_sequence is provided", () => {
+    const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    const factory = vi.fn(() => new FakeLoopStreamEventSource());
+
+    renderHook(() => useLoopStream("ws_1", "looprun_1", { eventSourceFactory: factory }), {
+      wrapper: createWrapper(queryClient),
+    });
+
+    expect(factory).toHaveBeenCalledWith(
+      "/api/workspaces/ws_1/loop-runs/looprun_1/events?profile=default"
+    );
+  });
+
+  it("Should still parse defensive unnamed message frames via onmessage", async () => {
+    const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    const eventSource = new FakeLoopStreamEventSource();
+    const factory = vi.fn(() => eventSource);
+    const onEvent = vi.fn();
+
+    renderHook(
+      () =>
+        useLoopStream("ws_1", "looprun_1", {
+          eventSourceFactory: factory,
+          onEvent,
+        }),
+      { wrapper: createWrapper(queryClient) }
+    );
+
+    const frame = buildFrame();
+    act(() => {
+      eventSource.emitMessage(frame);
+    });
+
+    await waitFor(() => {
+      expect(onEvent).toHaveBeenCalledWith(
+        frame,
+        expect.objectContaining({ runId: "looprun_1", workspaceId: "ws_1" })
+      );
+    });
+  });
+
+  it("Should remove every listener and close the source on cleanup", () => {
+    const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    const eventSource = new FakeLoopStreamEventSource();
+    const factory = vi.fn(() => eventSource);
+
+    const { unmount } = renderHook(
+      () => useLoopStream("ws_1", "looprun_1", { afterSequence: 4, eventSourceFactory: factory }),
+      { wrapper: createWrapper(queryClient) }
+    );
+
+    unmount();
+    expect(eventSource.close).toHaveBeenCalledTimes(1);
+    expect(eventSource.onmessage).toBeNull();
+    expect(eventSource.onerror).toBeNull();
+    for (const kind of LOOP_EVENT_KINDS) {
+      expect(eventSource.removeEventListener).toHaveBeenCalledWith(kind, expect.any(Function));
+      expect(eventSource.hasListener(kind)).toBe(false);
+    }
+  });
+
+  it("Should close the source on cleanup even when removeEventListener is missing", () => {
+    const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    const namedOnly = createNamedOnlySource();
+    const factory = vi.fn(() => namedOnly.source);
+
+    const { unmount } = renderHook(
+      () => useLoopStream("ws_1", "looprun_1", { afterSequence: 1, eventSourceFactory: factory }),
+      { wrapper: createWrapper(queryClient) }
+    );
+
+    expect(namedOnly.hasListener("status_changed")).toBe(true);
+    expect(() => unmount()).not.toThrow();
+    expect(namedOnly.source.close).toHaveBeenCalledTimes(1);
+    expect(namedOnly.source.onmessage).toBeNull();
+    expect(namedOnly.source.onerror).toBeNull();
+  });
+
+  it("Should not open a source when disabled", () => {
+    const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    const factory = vi.fn(() => new FakeLoopStreamEventSource());
+
+    renderHook(
+      () =>
+        useLoopStream("ws_1", "looprun_1", {
+          enabled: false,
+          afterSequence: 1,
+          eventSourceFactory: factory,
+        }),
+      { wrapper: createWrapper(queryClient) }
+    );
+
+    expect(factory).not.toHaveBeenCalled();
+  });
+
+  it("Should not open a source for an empty workspace or run id", () => {
+    const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    const factory = vi.fn(() => new FakeLoopStreamEventSource());
+
+    const { rerender } = renderHook(
+      ({ ws, run }: { ws: string; run: string }) =>
+        useLoopStream(ws, run, { afterSequence: 1, eventSourceFactory: factory }),
+      { wrapper: createWrapper(queryClient), initialProps: { ws: "   ", run: "looprun_1" } }
+    );
+    expect(factory).not.toHaveBeenCalled();
+
+    rerender({ ws: "ws_1", run: "  " });
+    expect(factory).not.toHaveBeenCalled();
+  });
+
+  it("Should call onError when a named SSE payload cannot be parsed", () => {
+    const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    const eventSource = new FakeLoopStreamEventSource();
+    const factory = vi.fn(() => eventSource);
+    const onError = vi.fn();
+    const onEvent = vi.fn();
+
+    renderHook(
+      () =>
+        useLoopStream("ws_1", "looprun_1", {
+          afterSequence: 7,
+          eventSourceFactory: factory,
+          onEvent,
+          onError,
+        }),
+      { wrapper: createWrapper(queryClient) }
+    );
+
+    expect(() => {
+      act(() => {
+        eventSource.emitNamed("status_changed", "{not valid json");
+      });
+    }).not.toThrow();
+
+    expect(onError).toHaveBeenCalledTimes(1);
+    expect(onEvent).not.toHaveBeenCalled();
+  });
+
+  it("Should let a throw from the onEvent consumer propagate instead of misreporting it as a parse error", () => {
+    const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    const eventSource = new FakeLoopStreamEventSource();
+    const factory = vi.fn(() => eventSource);
+    const onError = vi.fn();
+    const onEvent = vi.fn(() => {
+      throw new Error("consumer boom");
+    });
+
+    renderHook(
+      () => useLoopStream("ws_1", "looprun_1", { eventSourceFactory: factory, onEvent, onError }),
+      { wrapper: createWrapper(queryClient) }
+    );
+
+    expect(() => {
+      act(() => {
+        eventSource.emitNamed("status_changed", buildFrame());
+      });
+    }).toThrow("consumer boom");
+    // A consumer bug must not be swallowed and relabeled a stream-parse failure.
+    expect(onError).not.toHaveBeenCalled();
+  });
+
+  it("Should forward connection errors to onError", () => {
+    const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    const eventSource = new FakeLoopStreamEventSource();
+    const factory = vi.fn(() => eventSource);
+    const onError = vi.fn();
+
+    renderHook(
+      () =>
+        useLoopStream("ws_1", "looprun_1", {
+          afterSequence: 1,
+          eventSourceFactory: factory,
+          onError,
+        }),
+      { wrapper: createWrapper(queryClient) }
+    );
+
+    const errorEvent = new Event("error");
+    act(() => {
+      eventSource.emitError(errorEvent);
+    });
+
+    expect(onError).toHaveBeenCalledWith(errorEvent);
+  });
+
+  it("Should reuse the same source across re-renders with the same inputs and reopen on resume change", () => {
+    const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    const factory = vi.fn(() => new FakeLoopStreamEventSource());
+
+    const { rerender } = renderHook(
+      ({ seq }: { seq: number }) =>
+        useLoopStream("ws_1", "looprun_1", { afterSequence: seq, eventSourceFactory: factory }),
+      { wrapper: createWrapper(queryClient), initialProps: { seq: 14 } }
+    );
+
+    expect(factory).toHaveBeenCalledTimes(1);
+    rerender({ seq: 14 });
+    expect(factory).toHaveBeenCalledTimes(1);
+    rerender({ seq: 22 });
+    expect(factory).toHaveBeenCalledTimes(2);
+  });
+});

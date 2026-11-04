@@ -1,0 +1,150 @@
+package spec
+
+import (
+	"fmt"
+
+	"github.com/getkin/kin-openapi/openapi3"
+)
+
+func buildOperation(schemas openapi3.Schemas, spec OperationSpec) (*openapi3.Operation, error) {
+	operation := openapi3.NewOperation()
+	operation.OperationID = spec.OperationID
+	operation.Summary = spec.Summary
+	operation.Tags = append([]string(nil), spec.Tags...)
+	operation.Extensions = map[string]any{
+		"x-compozy-transports": spec.Transports,
+		"x-compozy-app-access": spec.AppAccess,
+	}
+	if spec.Stream != "" {
+		operation.Extensions["x-compozy-stream"] = spec.Stream
+	}
+	if spec.Stability != "" {
+		operation.Extensions["x-stability"] = spec.Stability
+	}
+	if len(spec.Auth) > 0 {
+		auth := make(map[string]string, len(spec.Auth))
+		for transport, mode := range spec.Auth {
+			auth[string(transport)] = string(mode)
+		}
+		operation.Extensions["x-compozy-auth"] = auth
+	}
+
+	for _, param := range spec.Parameters {
+		operation.AddParameter(buildParameter(param))
+	}
+	requestBody, err := buildRequestBody(schemas, spec)
+	if err != nil {
+		return nil, err
+	}
+	operation.RequestBody = requestBody
+	for _, response := range spec.Responses {
+		built, err := buildResponse(schemas, response)
+		if err != nil {
+			return nil, err
+		}
+		if response.Default {
+			operation.Responses.Set("default", &openapi3.ResponseRef{Value: built})
+			continue
+		}
+		operation.AddResponse(response.Status, built)
+	}
+	return operation, nil
+}
+
+const schemaFormatBinary = "binary"
+
+func buildRequestBody(schemas openapi3.Schemas, spec OperationSpec) (*openapi3.RequestBodyRef, error) {
+	if spec.RequestContentType == RequestUploadForm {
+		if spec.RequestBody != nil {
+			return nil, fmt.Errorf("operation %s: upload form requests do not take a body schema", spec.OperationID)
+		}
+		fileSchema := openapi3.NewStringSchema().WithFormat(schemaFormatBinary)
+		formSchema := openapi3.NewObjectSchema().
+			WithProperty("file", fileSchema).
+			WithoutAdditionalProperties()
+		formSchema.Required = []string{"file"}
+		body := openapi3.NewRequestBody().
+			WithContent(openapi3.Content{
+				RequestUploadForm: &openapi3.MediaType{Schema: &openapi3.SchemaRef{Value: formSchema}},
+			}).
+			WithDescription("Multipart upload with one required binary file field")
+		body.Required = !spec.RequestBodyOptional
+		return &openapi3.RequestBodyRef{Value: body}, nil
+	}
+	if spec.RequestContentType != "" && spec.RequestContentType != "application/json" {
+		return nil, fmt.Errorf(
+			"operation %s: unsupported request content type %q",
+			spec.OperationID,
+			spec.RequestContentType,
+		)
+	}
+	if spec.RequestBody == nil {
+		return nil, nil
+	}
+	schemaRef, err := schemaRefForValue(spec.RequestBody, schemas)
+	if err != nil {
+		return nil, fmt.Errorf("request body schema: %w", err)
+	}
+	body := openapi3.NewRequestBody().
+		WithContent(openapi3.NewContentWithJSONSchemaRef(schemaRef)).
+		WithDescription("JSON request body")
+	body.Required = !spec.RequestBodyOptional
+	return &openapi3.RequestBodyRef{Value: body}, nil
+}
+
+func buildResponse(schemas openapi3.Schemas, response ResponseSpec) (*openapi3.Response, error) {
+	if response.Body != nil {
+		if !response.Bodies.empty() {
+			return nil, fmt.Errorf("response %d cannot define Body and Bodies", response.Status)
+		}
+	}
+	result := openapi3.NewResponse().WithDescription(response.Description)
+	if len(response.Headers) > 0 {
+		result.Headers = make(openapi3.Headers, len(response.Headers))
+		for name, header := range response.Headers {
+			result.Headers[name] = &openapi3.HeaderRef{Value: &openapi3.Header{
+				Description: header.Description,
+				Schema:      schemaRefForParameter(header),
+			}}
+		}
+	}
+	if response.Body == nil && response.Bodies.empty() {
+		return result, nil
+	}
+	schemaRefs := make([]*openapi3.SchemaRef, 0, len(response.Bodies.schemaTypes)+1)
+	if response.Body != nil {
+		schemaRef, err := schemaRefForValue(response.Body, schemas)
+		if err != nil {
+			return nil, fmt.Errorf("response %d schema: %w", response.Status, err)
+		}
+		schemaRefs = append(schemaRefs, schemaRef)
+	}
+	for _, schemaType := range response.Bodies.schemaTypes {
+		schemaRef, err := schemaRefForType(schemaType, schemas)
+		if err != nil {
+			return nil, fmt.Errorf("response %d schema: %w", response.Status, err)
+		}
+		schemaRefs = append(schemaRefs, schemaRef)
+	}
+	schemaRef := schemaRefs[0]
+	if len(schemaRefs) > 1 {
+		schemaRef = &openapi3.SchemaRef{Value: &openapi3.Schema{OneOf: schemaRefs}}
+		if response.Bodies.overlapping {
+			schemaRef.Value.OneOf = nil
+			schemaRef.Value.AnyOf = schemaRefs
+		}
+	}
+	contentType := response.ContentType
+	if contentType == "" {
+		contentType = "application/json"
+	}
+	result.WithContent(openapi3.Content{contentType: &openapi3.MediaType{Schema: schemaRef}})
+	for mediaType, value := range response.AdditionalContent {
+		additional, err := schemaRefForValue(value, schemas)
+		if err != nil {
+			return nil, fmt.Errorf("response %d %s schema: %w", response.Status, mediaType, err)
+		}
+		result.Content[mediaType] = &openapi3.MediaType{Schema: additional}
+	}
+	return result, nil
+}

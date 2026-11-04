@@ -1,0 +1,2159 @@
+import { describe, expect, it } from "vitest";
+
+import { toThreadMessageLikes } from "@/systems/session/lib/session-thread-repository";
+import { toTimelineParts } from "@/systems/session/lib/timeline-message-parts";
+import { deriveToolRowStatus } from "@/systems/session/lib/message-parts";
+import { toolMessageFromPart } from "@/components/assistant-ui/session-timeline-tool-message";
+import type { SessionMessage } from "@/systems/session/types";
+import claudeGoalLive from "./fixtures/claude-goal-live.json";
+
+import {
+  deriveSessionRows,
+  sessionRowEqual,
+  type SessionRow,
+  type SessionTimelineDataPart,
+  type SessionTimelinePart,
+  type SessionTimelineToolPart,
+} from "../session-timeline.logic";
+import { estimateMessageSize } from "../timeline-row-estimates";
+
+function tool(
+  index: number,
+  overrides: Partial<SessionTimelineToolPart> = {}
+): SessionTimelineToolPart {
+  return {
+    kind: "tool",
+    id: `tool-${index}`,
+    toolCallId: `tool-call-${index}`,
+    toolName: "Read",
+    args: { file_path: `/tmp/file-${index}.ts` },
+    result: { content: `file-${index}` },
+    status: "settled",
+    turnId: "turn-1",
+    timestamp: `2026-07-07T12:00:0${Math.min(index, 9)}Z`,
+    ...overrides,
+  };
+}
+
+function text(
+  id: string,
+  value: string,
+  turnId?: string,
+  timestamp = "2026-07-07T12:00:09Z"
+): SessionTimelinePart {
+  return { kind: "text", id, text: value, turnId, timestamp, state: "done" };
+}
+
+describe("session timeline derivation", () => {
+  it("Should preserve a live terminal error without an output body", () => {
+    // Invariant: terminal error evidence survives the live projection and row status.
+    // Owner: transcript-to-timeline boundary; canonical suite: this file.
+    const [part] = toTimelineParts({
+      id: "turn-1",
+      content: [
+        {
+          type: "tool-call",
+          toolCallId: "delegate-error",
+          toolName: "delegate",
+          state: "output-error",
+        },
+      ],
+    });
+    if (part?.kind !== "tool") throw new Error("expected a tool part");
+    const message = toolMessageFromPart(part);
+    expect(
+      deriveToolRowStatus({
+        toolError: message.toolError,
+        toolResult: message.toolResult,
+        resultReceived: message.role === "tool_result",
+        hasInput: true,
+        turnSettled: true,
+      })
+    ).toMatchObject({ status: "failed", runtimeError: true });
+  });
+
+  it("Should settle an acknowledged delegation with no output body", () => {
+    // Invariant: an explicit terminal receipt owns liveness, independent of its payload.
+    // Owner: transcript-to-timeline boundary; canonical suite: this file.
+    const [message] = toThreadMessageLikes([
+      {
+        id: "turn-1",
+        role: "assistant",
+        parts: [
+          {
+            type: "tool-compozy__subagent_delegate",
+            toolCallId: "delegate-1",
+            state: "output-available",
+            output: undefined,
+            input: { task: "Write documentation" },
+          },
+        ],
+      } as SessionMessage,
+    ]);
+    const parts = toTimelineParts({ id: "turn-1", content: message?.content });
+    expect(parts[0]).toMatchObject({ kind: "tool", status: "settled" });
+    expect(
+      deriveSessionRows(parts, { activeTurnId: "turn-1" }).some(row => row.kind === "live-tool")
+    ).toBe(false);
+  });
+
+  // Captured Claude transcript_delta, before the Goal turn settled: Goal metadata
+  // on invisible tool receipts/usage must not divide the completed work rail.
+  it.each([true, false])("Should group captured Claude Goal work with active=%s", active => {
+    const [message] = toThreadMessageLikes([claudeGoalLive as SessionMessage]);
+    const parts = toTimelineParts(message!);
+    const options = active ? { activeTurnId: claudeGoalLive.id } : {};
+    const rows = deriveSessionRows(parts, options);
+    expect(rows).toHaveLength(1);
+    expect(rows[0]).toMatchObject({
+      kind: "work",
+      summary: { label: "Ran 4 commands", entryCount: 4 },
+      active,
+      expanded: false,
+    });
+    const group = rows[0]!;
+    if (group.kind !== "work") throw new Error("expected grouped Claude commands");
+    expect(group.entries).toEqual(parts.filter(part => part.kind === "tool"));
+    expect(
+      deriveSessionRows(parts, { ...options, expandedWorkGroupIds: new Set([group.groupId]) })[0]
+    ).toMatchObject({ expanded: true, entries: group.entries });
+  });
+
+  it("Should retain a running call after the captured Goal's completed group", () => {
+    const [message] = toThreadMessageLikes([claudeGoalLive as SessionMessage]);
+    const parts = toTimelineParts(message!).map(part =>
+      part.kind === "tool" && part.toolCallId === "claude-call-4"
+        ? { ...part, status: "running" as const, result: undefined }
+        : part
+    );
+    const rows = deriveSessionRows(parts, { activeTurnId: claudeGoalLive.id });
+    expect(rows.map(row => row.kind)).toEqual(["work", "live-tool"]);
+    expect(rows[0]).toMatchObject({
+      kind: "work",
+      summary: { label: "Ran 3 commands" },
+      active: true,
+    });
+    expect(rows[1]).toMatchObject({
+      kind: "live-tool",
+      entries: [{ toolCallId: "claude-call-4" }],
+    });
+  });
+
+  it("Should preserve mixed order, complete parts, expansion and identity through streaming", () => {
+    const parts: SessionTimelinePart[] = [
+      {
+        kind: "reasoning",
+        id: "r1",
+        text: "Inspect **input**",
+        turnId: "turn-1",
+        state: "done",
+        partIndex: 0,
+      },
+      tool(1, { status: "running", partIndex: 1 }),
+      {
+        kind: "reasoning",
+        id: "r2",
+        text: "Then `verify`",
+        turnId: "turn-1",
+        state: "streaming",
+        partIndex: 2,
+      },
+      tool(2, { isError: true, partIndex: 3 }),
+    ];
+    const [initial] = deriveSessionRows(parts, { activeTurnId: "turn-1" });
+    if (initial?.kind !== "work") throw new Error("expected mixed work");
+    expect(initial.entries).toEqual(parts);
+    expect(initial.summary).toMatchObject({ entryCount: 2, failedCount: 1 });
+    expect(initial.summary?.label).toBe("2 tools · 2 thoughts · 1 running · thinking");
+    expect(initial.active).toBe(true);
+    const settledParts = parts.map(part =>
+      part.kind === "tool" ? { ...part, status: "settled" as const } : { ...part, state: "done" }
+    );
+    const [settled] = deriveSessionRows(settledParts, {
+      expandedWorkGroupIds: new Set([initial.groupId]),
+    });
+    if (settled?.kind !== "work") throw new Error("expected settled mixed work");
+    expect(settled.groupId).toBe(initial.groupId);
+    expect(settled.expanded).toBe(true);
+    expect(settled.active).toBe(false);
+    expect(settled.entries).toEqual(settledParts);
+    expect(sessionRowEqual(initial, settled)).toBe(false);
+    const [updated] = deriveSessionRows(
+      parts.map(part =>
+        part.kind === "reasoning" ? { ...part, text: part.text + " more" } : part
+      ),
+      { activeTurnId: "turn-1" }
+    );
+    expect(sessionRowEqual(initial, updated!)).toBe(false);
+  });
+
+  it("Should bound mixed work by turns, permissions and deliberate terminal interactions", () => {
+    const thought = (id: string, turnId = "turn-1"): SessionTimelinePart => ({
+      kind: "reasoning",
+      id,
+      text: id,
+      turnId,
+      state: "done",
+    });
+    const parts: SessionTimelinePart[] = [
+      thought("r1"),
+      tool(1),
+      tool(2, { toolName: "compozy__terminal_exec" }),
+      thought("r2"),
+      tool(3),
+      {
+        kind: "data",
+        id: "permission",
+        name: "data-compozy-permission",
+        data: {},
+        turnId: "turn-1",
+      },
+      thought("r3"),
+      tool(4, { status: "interrupted" }),
+      thought("r4", "turn-2"),
+      tool(5, { turnId: "turn-2" }),
+    ];
+    const rows = deriveSessionRows(parts);
+    expect(rows.map(row => row.kind)).toEqual(["work", "work", "work", "data", "work", "work"]);
+    expect(rows[1]).toMatchObject({ summary: null, entries: [parts[2]] });
+    expect(rows[4]).toMatchObject({ summary: { label: "1 tool · 1 thought · 1 stopped" } });
+    expect(
+      rows.flatMap<SessionTimelinePart>(row =>
+        row.kind === "work" ? row.entries : row.kind === "data" ? row.parts : []
+      )
+    ).toEqual(parts);
+  });
+
+  it("Should collapse a settled run of 8 into one semantic summary row", () => {
+    const rows = deriveSessionRows(Array.from({ length: 8 }, (_, index) => tool(index + 1)));
+
+    expect(rows).toHaveLength(1);
+    const workRow = rows[0];
+    if (workRow?.kind !== "work") throw new Error("expected work row");
+    expect(workRow.entries).toHaveLength(8);
+    expect(workRow.summary?.label).toBe("Read 8 files");
+    expect(workRow.expanded).toBe(false);
+    expect(workRow.active).toBe(false);
+  });
+
+  it("Should mark the summary row expanded once the work group is toggled open", () => {
+    const groupId = "work:turn-1:tool-call-1";
+    const rows = deriveSessionRows(
+      Array.from({ length: 8 }, (_, index) => tool(index + 1)),
+      { expandedWorkGroupIds: new Set([groupId]) }
+    );
+
+    const workRow = rows[0];
+    if (workRow?.kind !== "work") throw new Error("expected work row");
+    expect(workRow.groupId).toBe(groupId);
+    expect(workRow.expanded).toBe(true);
+    expect(workRow.summary).not.toBeNull();
+    expect(workRow.entries).toHaveLength(8);
+  });
+
+  it("Should keep a work disclosure expanded when the rendered part id is replaced", () => {
+    const initialParts = [...Array.from({ length: 4 }, (_, index) => tool(index + 1)), tool(5)];
+    const groupId = "work:turn-1:tool-call-1";
+    const initialRows = deriveSessionRows(initialParts, {
+      expandedWorkGroupIds: new Set([groupId]),
+    });
+
+    const rederivedParts = initialParts.map((part, index) => ({
+      ...part,
+      id: `replacement-${index + 1}`,
+    }));
+    const rederivedRows = deriveSessionRows(rederivedParts, {
+      expandedWorkGroupIds: new Set([groupId]),
+    });
+
+    const initialWork = initialRows.find(row => row.kind === "work");
+    const rederivedWork = rederivedRows.find(row => row.kind === "work");
+    if (initialWork?.kind !== "work" || rederivedWork?.kind !== "work") {
+      throw new Error("expected work rows");
+    }
+    expect(initialWork.groupId).toBe(groupId);
+    expect(rederivedWork.groupId).toBe(groupId);
+    expect(rederivedWork.expanded).toBe(true);
+    expect(rederivedWork.entries).toHaveLength(5);
+  });
+
+  it("Should keep a work disclosure stable when calls reorder or duplicate events settle", () => {
+    const initialParts = Array.from({ length: 5 }, (_, index) => tool(index + 1));
+    const groupId = "work:turn-1:tool-call-1";
+    const initialRows = deriveSessionRows(initialParts, {
+      expandedWorkGroupIds: new Set([groupId]),
+    });
+
+    const reorderedRows = deriveSessionRows(
+      [initialParts[1]!, initialParts[0]!, ...initialParts.slice(2)],
+      { expandedWorkGroupIds: new Set([groupId]) }
+    );
+    const duplicateRemovedRows = deriveSessionRows(
+      [
+        initialParts[0]!,
+        { ...initialParts[0]!, id: "duplicate-rendered-tool-1" },
+        ...initialParts.slice(1),
+      ],
+      { expandedWorkGroupIds: new Set([groupId]) }
+    );
+
+    for (const rows of [initialRows, reorderedRows, duplicateRemovedRows]) {
+      const workRow = rows.find(row => row.kind === "work");
+      if (workRow?.kind !== "work") throw new Error("expected work row");
+      expect(workRow.groupId).toBe(groupId);
+      expect(workRow.expanded).toBe(true);
+    }
+  });
+
+  it("Should retain a group's key when a lower-sorting call arrives and the group closes", () => {
+    const initialParts = Array.from({ length: 5 }, (_, index) => tool(index + 1));
+    const groupId = "work:turn-1:tool-call-1";
+    const anchors = new Map([
+      [
+        groupId,
+        {
+          groupId,
+          turnId: "turn-1",
+          anchorEntryId: "tool-call-1",
+        },
+      ],
+    ]);
+
+    const initialRows = deriveSessionRows(initialParts, {
+      expandedWorkGroupIds: new Set([groupId]),
+      workGroupAnchors: anchors,
+    });
+    const grownParts = [tool(0), ...initialParts];
+    const grownRows = deriveSessionRows(grownParts, {
+      expandedWorkGroupIds: new Set([groupId]),
+      workGroupAnchors: anchors,
+    });
+    const closedRows = deriveSessionRows(grownParts, { workGroupAnchors: anchors });
+
+    for (const rows of [initialRows, grownRows, closedRows]) {
+      const workRow = rows.find(row => row.kind === "work");
+      if (workRow?.kind !== "work") throw new Error("expected work row");
+      expect(workRow.groupId).toBe(groupId);
+    }
+    const grownWork = grownRows.find(row => row.kind === "work");
+    const closedWork = closedRows.find(row => row.kind === "work");
+    if (grownWork?.kind !== "work" || closedWork?.kind !== "work") {
+      throw new Error("expected grown and closed work rows");
+    }
+    expect(grownWork.expanded).toBe(true);
+    expect(closedWork.expanded).toBe(false);
+  });
+
+  it("Should retain the completed group's identity while calls settle, failures included", () => {
+    const liveParts = Array.from({ length: 3 }, (_, index) =>
+      tool(index + 1, { status: "running", result: undefined })
+    );
+    const liveRows = deriveSessionRows(liveParts, { activeTurnId: "turn-1" });
+    expect(liveRows.map(row => row.kind)).toEqual(["live-tool"]);
+
+    // Two calls settle (one failed) while the third still runs: one completed
+    // group ahead of the live row, the failure counted inside it.
+    const partial = liveParts.map((part, index) =>
+      index === 2
+        ? part
+        : index === 1
+          ? { ...part, status: "settled" as const, isError: true, result: { error: "boom" } }
+          : { ...part, status: "settled" as const, result: { content: "file-1" } }
+    );
+    const partialRows = deriveSessionRows(partial, { activeTurnId: "turn-1" });
+    expect(partialRows.map(row => row.kind)).toEqual(["work", "live-tool"]);
+    const group = partialRows[0];
+    if (group?.kind !== "work") throw new Error("expected completed group");
+    expect(group.summary?.failedCount).toBe(1);
+    const anchors = new Map([
+      [group.groupId, { groupId: group.groupId, turnId: "turn-1", anchorEntryId: "tool-call-1" }],
+    ]);
+
+    const settledParts = liveParts.map((part, index) =>
+      index === 1
+        ? { ...part, status: "settled" as const, isError: true, result: { error: "boom" } }
+        : { ...part, status: "settled" as const, result: { content: `file-${index + 1}` } }
+    );
+    const settledRows = deriveSessionRows(settledParts, { workGroupAnchors: anchors });
+    expect(settledRows.map(row => row.kind)).toEqual(["work"]);
+    const settled = settledRows[0];
+    if (settled?.kind !== "work") throw new Error("expected settled group");
+    expect(settled.groupId).toBe(group.groupId);
+    expect(settled.entries).toHaveLength(3);
+    expect(settled.summary?.failedCount).toBe(1);
+  });
+
+  it("Should keep an expanded group's identity when a lower-sorting call settles into it", () => {
+    const historicalGroupId = "work:turn-1:tool-call-4";
+    const expandedRows = deriveSessionRows(
+      [tool(4), tool(5), tool(6, { status: "running", result: undefined })],
+      {
+        activeTurnId: "turn-1",
+        expandedWorkGroupIds: new Set([historicalGroupId]),
+      }
+    );
+    const expandedWork = expandedRows.find(row => row.kind === "work");
+    if (expandedWork?.kind !== "work") throw new Error("expected expanded work row");
+    expect(expandedWork.groupId).toBe(historicalGroupId);
+    expect(expandedWork.expanded).toBe(true);
+
+    const observedAnchors = new Map([
+      [
+        historicalGroupId,
+        {
+          groupId: historicalGroupId,
+          turnId: "turn-1",
+          anchorEntryId: "tool-call-1",
+        },
+      ],
+    ]);
+    const settledRows = deriveSessionRows(
+      [tool(1), tool(4, { isError: true, result: { error: "boom" } }), tool(5)],
+      { workGroupAnchors: observedAnchors, expandedWorkGroupIds: new Set([historicalGroupId]) }
+    );
+    const workRows = settledRows.filter(row => row.kind === "work");
+
+    expect(workRows).toHaveLength(1);
+    expect(workRows[0]?.groupId).toBe(historicalGroupId);
+    expect(workRows[0]?.expanded).toBe(true);
+    expect(workRows[0]?.summary?.failedCount).toBe(1);
+  });
+
+  it("Should give separated parallel tool segments distinct live row identities", () => {
+    // Invariant: React can retain every live row across same-turn narrative boundaries.
+    // Owner: timeline projection; canonical suite: this file.
+    const rows = deriveSessionRows(
+      [
+        tool(1, { status: "running", result: undefined }),
+        text("boundary", "Continuing"),
+        tool(2, { status: "running", result: undefined }),
+      ],
+      { activeTurnId: "turn-1" }
+    );
+    const live = rows.filter(row => row.kind === "live-tool");
+    expect(live).toHaveLength(2);
+    expect(new Set(rows.map(row => row.id)).size).toBe(rows.length);
+    expect(live.flatMap(row => row.entries.map(entry => entry.id))).toEqual(["tool-1", "tool-2"]);
+    const next = deriveSessionRows(
+      [tool(1), text("boundary", "Continuing"), tool(2, { status: "running", result: undefined })],
+      { activeTurnId: "turn-1" }
+    );
+    expect(next.find(row => row.kind === "live-tool")?.id).toBe(live[1]?.id);
+  });
+
+  it("Should keep text between work segments while grouping adjacent reasoning and tools", () => {
+    const parts: SessionTimelinePart[] = [
+      tool(1),
+      tool(2),
+      text("text-break", "Narration"),
+      { kind: "reasoning", id: "reason-break", text: "Thinking", turnId: "turn-1", state: "done" },
+      tool(3),
+    ];
+
+    const rows = deriveSessionRows(parts);
+
+    expect(rows.map(row => row.kind)).toEqual(["work", "text", "work"]);
+    const [first, , last] = rows;
+    if (first?.kind !== "work" || last?.kind !== "work") throw new Error("expected work rows");
+    // Reasoning is an entry, never an extra tool in the summary.
+    expect(first.summary?.label).toBe("Read 2 files");
+    expect(last.summary?.label).toBe("1 tool · 1 thought");
+    expect(last.summary?.entryCount).toBe(1);
+    expect(last.entries.map(entry => entry.id)).toEqual(["reason-break", "tool-3"]);
+  });
+
+  // UT-085 / UT-089 (ADR-006 rule 1): the live turn derives exactly one live row
+  // for the calls still running — one call reads as itself, several stay one
+  // honest row with a count — and progress ticks never become rows.
+  it("Should derive exactly one live row that replaces itself and counts parallel calls", () => {
+    const single = deriveSessionRows(
+      [
+        tool(1),
+        tool(2),
+        tool(3, {
+          toolName: "Bash",
+          args: { command: "go test" },
+          status: "running",
+          result: undefined,
+        }),
+      ],
+      { activeTurnId: "turn-1" }
+    );
+    expect(single.map(row => row.kind)).toEqual(["work", "live-tool"]);
+    const live = single[1];
+    if (live?.kind !== "live-tool") throw new Error("expected live row");
+    expect(live.id).toBe("live:turn-1:tool-call-1");
+    expect(live.entries.map(entry => entry.id)).toEqual(["tool-3"]);
+
+    const parallel = deriveSessionRows(
+      [
+        tool(1, { status: "running", result: undefined }),
+        tool(2, { status: "running", result: undefined }),
+        tool(3, { status: "running", result: undefined }),
+      ],
+      { activeTurnId: "turn-1" }
+    );
+    expect(parallel).toHaveLength(1);
+    const row = parallel[0];
+    if (row?.kind !== "live-tool") throw new Error("expected live row");
+    expect(row.entries).toHaveLength(3);
+    expect(row.id).toBe("live:turn-1:tool-call-1");
+    expect(row.expanded).toBe(false);
+    expect(
+      deriveSessionRows(
+        [
+          tool(1, { status: "running", result: undefined }),
+          tool(2, { status: "running", result: undefined }),
+        ],
+        { activeTurnId: "turn-1", expandedWorkGroupIds: new Set(["live:turn-1:tool-call-1"]) }
+      )[0]
+    ).toMatchObject({ kind: "live-tool", expanded: true });
+  });
+
+  it.each(["running", "settled"] as const)(
+    "Should ignore trailing progress ticks without settling an active %s work tail",
+    status => {
+      const rows = deriveSessionRows(
+        [
+          tool(1, { status, result: status === "running" ? undefined : { content: "done" } }),
+          {
+            kind: "data",
+            id: "tick-1",
+            name: "data-compozy-event",
+            data: { type: "runtime_progress", runtime: { elapsed_seconds: 4, idle_seconds: 0 } },
+            turnId: "turn-1",
+          },
+          {
+            kind: "data",
+            id: "tick-2",
+            name: "data-compozy-event",
+            data: { type: "runtime_progress", runtime: { elapsed_seconds: 9, idle_seconds: 0 } },
+            turnId: "turn-1",
+          },
+        ],
+        { activeTurnId: "turn-1" }
+      );
+      expect(rows).toHaveLength(1);
+      expect(rows[0]).toMatchObject(
+        status === "running" ? { kind: "live-tool" } : { kind: "work", active: true }
+      );
+    }
+  );
+
+  // The name-only Task/Agent classifier is gone (`_spec.md` delete target): a
+  // running Task call without a subagent card is an ordinary running tool.
+  it("Should count a running Task call without a card into the one parallel live row", () => {
+    const rows = deriveSessionRows(
+      [
+        tool(1, {
+          toolName: "Task",
+          args: { description: "review the diff" },
+          status: "running",
+          result: undefined,
+        }),
+        tool(2, {
+          toolName: "Bash",
+          args: { command: "go vet" },
+          status: "running",
+          result: undefined,
+        }),
+      ],
+      { activeTurnId: "turn-1" }
+    );
+    expect(rows.map(row => row.kind)).toEqual(["live-tool"]);
+    const live = rows[0];
+    if (live?.kind !== "live-tool") throw new Error("expected live row");
+    expect(live.entries.map(entry => entry.id)).toEqual(["tool-1", "tool-2"]);
+  });
+
+  // UT-087: completed tools of the live turn collapse into one expandable group
+  // sentence; a single completed call stays a row of its own.
+  it("Should collapse the live turn's completed tools into one group sentence", () => {
+    const parts: SessionTimelinePart[] = [
+      tool(1, { toolName: "Bash", args: { command: "go test" } }),
+      tool(2, { toolName: "Bash", args: { command: "go vet" } }),
+      tool(3, { toolName: "Edit", args: { file_path: "/src/a.ts" } }),
+      tool(4, { toolName: "Edit", args: { file_path: "/src/b.ts" } }),
+      tool(5, {
+        toolName: "Bash",
+        args: { command: "go build" },
+        status: "running",
+        result: undefined,
+      }),
+    ];
+    const rows = deriveSessionRows(parts, { activeTurnId: "turn-1" });
+    expect(rows.map(row => row.kind)).toEqual(["work", "live-tool"]);
+    const group = rows[0];
+    if (group?.kind !== "work") throw new Error("expected group row");
+    expect(group.active).toBe(true);
+    expect(group.summary?.label).toBe("Ran 2 commands · Edited 2 files");
+    expect(group.summary?.failedCount).toBe(0);
+    expect(group.expanded).toBe(false);
+
+    const lone = deriveSessionRows([tool(1), tool(2, { status: "running", result: undefined })], {
+      activeTurnId: "turn-1",
+    });
+    expect(lone.map(row => row.kind)).toEqual(["work", "live-tool"]);
+    expect(lone[0]).toMatchObject({ kind: "work", summary: null, active: true });
+  });
+
+  it("Should keep the trailing run of the active turn open even when fully settled", () => {
+    const rows = deriveSessionRows(
+      Array.from({ length: 3 }, (_, index) => tool(index + 1)),
+      { activeTurnId: "turn-1" }
+    );
+
+    expect(rows).toHaveLength(1);
+    const workRow = rows[0];
+    if (workRow?.kind !== "work") throw new Error("expected work row");
+    // Completed tools of the live turn rest as the group sentence, still active.
+    expect(workRow.summary?.label).toBe("Read 3 files");
+    expect(workRow.active).toBe(true);
+  });
+
+  it("Should collapse an earlier run the moment it settles, even mid-turn", () => {
+    const parts: SessionTimelinePart[] = [
+      tool(1),
+      tool(2),
+      tool(3),
+      text("narration", "Progress so far", "turn-1", "2026-07-07T12:00:04Z"),
+      tool(4, { status: "running", result: undefined }),
+      tool(5, { status: "running", result: undefined }),
+    ];
+
+    const rows = deriveSessionRows(parts, { activeTurnId: "turn-1" });
+
+    expect(rows.map(row => row.kind)).toEqual(["work", "text", "live-tool"]);
+    const [settled, , live] = rows;
+    if (settled?.kind !== "work" || live?.kind !== "live-tool") throw new Error("expected rows");
+    expect(settled.summary?.label).toBe("Read 3 files");
+    expect(settled.active).toBe(false);
+    expect(live.entries.map(entry => entry.id)).toEqual(["tool-4", "tool-5"]);
+  });
+
+  // UT-088 (ADR-009): a failure the agent absorbed stays inside the group as
+  // information — counted in "· N failed" — never as turn-level danger.
+  it("Should keep an absorbed failure inside the group with a failed count, not as an alarm", () => {
+    const parts: SessionTimelinePart[] = [
+      tool(1, { toolName: "Bash", args: { command: "go test" } }),
+      tool(2, {
+        toolName: "Bash",
+        args: { command: "go test -count=3" },
+        isError: true,
+        result: { error: "FAIL" },
+      }),
+      tool(3, { toolName: "Edit", args: { file_path: "/src/a.ts" } }),
+      tool(4, {
+        toolName: "Bash",
+        args: { command: "go test -race" },
+        status: "running",
+        result: undefined,
+      }),
+    ];
+
+    const rows = deriveSessionRows(parts, { activeTurnId: "turn-1" });
+
+    expect(rows.map(row => row.kind)).toEqual(["work", "live-tool"]);
+    const group = rows[0];
+    if (group?.kind !== "work") throw new Error("expected group row");
+    expect(group.entries.map(entry => entry.id)).toEqual(["tool-1", "tool-2", "tool-3"]);
+    expect(group.summary?.label).toBe("Ran 2 commands · Edited a.ts");
+    expect(group.summary?.failedCount).toBe(1);
+
+    // A settled run with a failure folds the same way once the turn moves on.
+    const settled = deriveSessionRows(parts.slice(0, 3));
+    expect(settled).toHaveLength(1);
+    expect(settled[0]).toMatchObject({ kind: "work", active: false });
+  });
+
+  it("Should order summary categories Ran, Edited, Read, Searched, Used with distinct-file counts", () => {
+    const parts: SessionTimelinePart[] = [
+      tool(1, { toolName: "mcp__linear__list_issues", args: {} }),
+      tool(2, { toolName: "Task", args: { prompt: "explore" } }),
+      tool(3, { toolName: "Grep", args: { pattern: "Alert" } }),
+      tool(4, { toolName: "Read", args: { file_path: "/src/a.ts" } }),
+      tool(5, { toolName: "Read", args: { file_path: "/src/a.ts" } }),
+      tool(6, {
+        toolName: "Edit",
+        args: { file_path: "/src/b.ts", old_string: "a", new_string: "b" },
+      }),
+      tool(7, { toolName: "Bash", args: { command: "ls" } }),
+    ];
+
+    const rows = deriveSessionRows(parts);
+
+    const workRow = rows[0];
+    if (workRow?.kind !== "work") throw new Error("expected work row");
+    // Fixed presentation order regardless of call order; the two same-path
+    // Reads count as one distinct file.
+    expect(workRow.summary?.label).toBe(
+      "Ran 1 command · Edited b.ts · Read a.ts · Searched once · Used 2 tools"
+    );
+  });
+
+  // Invariant: the group sentence counts each call as the kind its row shows.
+  it("Should count title-named shell tools and read-only shell commands by the kind their rows show", () => {
+    const parts: SessionTimelinePart[] = [
+      tool(1, { toolName: "Terminal", args: { command: "go test ./..." } }),
+      tool(2, { toolName: "Bash", args: { command: "cat web/package.json" } }),
+      tool(3, { toolName: "Bash", args: { command: "rg -n TODO web/src" } }),
+    ];
+
+    const workRow = deriveSessionRows(parts)[0];
+    if (workRow?.kind !== "work") throw new Error("expected work row");
+    expect(workRow.summary?.label).toBe("Ran 1 command · Read package.json · Searched once");
+  });
+
+  // Invariant: a file counts once however its reads were spelled, and a directory listing is not a file.
+  it("Should count shell and tool reads of one path as one file and listings as directories", () => {
+    const parts: SessionTimelinePart[] = [
+      tool(1, { toolName: "Bash", args: { command: "cat web/a.ts" } }),
+      tool(2, { toolName: "Bash", args: { command: "cat web/a.ts" } }),
+      tool(3, { toolName: "Read", args: { file_path: "web/a.ts" } }),
+      tool(4, { toolName: "Bash", args: { command: "ls web/src" } }),
+    ];
+
+    const workRow = deriveSessionRows(parts)[0];
+    if (workRow?.kind !== "work") throw new Error("expected work row");
+    expect(workRow.summary?.label).toBe("Read a.ts · Listed src");
+  });
+
+  it("Should count one relative path read under two leading cd directories as two files", () => {
+    const parts: SessionTimelinePart[] = [
+      tool(1, { toolName: "Bash", args: { command: "cd /repo/a && cat package.json" } }),
+      tool(2, { toolName: "Bash", args: { command: "cd /repo/b && cat package.json" } }),
+      tool(3, { toolName: "Read", args: { file_path: "/repo/a/package.json" } }),
+    ];
+
+    const workRow = deriveSessionRows(parts)[0];
+    if (workRow?.kind !== "work") throw new Error("expected work row");
+    expect(workRow.summary?.label).toBe("Read 2 files");
+  });
+
+  it("Should treat the derivation as a pure view that never mutates the message parts", () => {
+    const parts = Object.freeze([tool(1), tool(2), tool(3)]) as readonly SessionTimelinePart[];
+    const snapshot = parts.map(part => ({ ...part }));
+
+    expect(() =>
+      deriveSessionRows(parts, { foldSettledTurns: true, expandedWorkGroupIds: new Set() })
+    ).not.toThrow();
+
+    expect(parts).toHaveLength(3);
+    parts.forEach((part, index) => {
+      expect(part).toEqual(snapshot[index]);
+    });
+  });
+
+  it("Should fold settled turns while leaving the terminal assistant text visible", () => {
+    const rows = deriveSessionRows(
+      [
+        {
+          kind: "reasoning",
+          id: "reason-1",
+          text: "Need context",
+          turnId: "turn-fold",
+          timestamp: "2026-07-07T12:00:00Z",
+          state: "done",
+        },
+        tool(1, { turnId: "turn-fold", timestamp: "2026-07-07T12:00:03Z" }),
+        text("terminal", "Done", "turn-fold", "2026-07-07T12:00:05Z"),
+      ],
+      { foldSettledTurns: true }
+    );
+
+    expect(rows.map(row => row.kind)).toEqual(["turn-fold", "text"]);
+    const foldRow = rows[0];
+    if (foldRow?.kind !== "turn-fold") throw new Error("expected fold row");
+    // Duration is the span between the turn's first and last fixture timestamps.
+    expect(foldRow.label).toBe("Worked for 5s");
+    expect(foldRow.durationMs).toBe(5000);
+    expect(foldRow.cause).toBe("settled");
+    expect(foldRow.open).toBe(false);
+    // A lone Read has no group sentence, so the fold carries the duration alone.
+    expect(foldRow.counts).toBeNull();
+    expect(foldRow.rows.map(row => row.kind)).toEqual(["work"]);
+    expect(foldRow.rows[0]).toMatchObject({ entries: [{ kind: "reasoning" }, { kind: "tool" }] });
+    // The terminal assistant message is never folded inside the disclosure.
+    expect(foldRow.rows.some(row => row.kind === "text")).toBe(false);
+    expect(rows[1]).toMatchObject({ kind: "text", id: "text:terminal" });
+  });
+
+  it("Should keep permission decisions outside a settled turn fold", () => {
+    const rows = deriveSessionRows(
+      [
+        tool(1, { turnId: "turn-permission", timestamp: "2026-07-07T12:00:00Z" }),
+        {
+          kind: "data",
+          id: "permission-rejected",
+          name: "data-compozy-permission",
+          data: {
+            type: "permission",
+            request_id: "turn-permission:permission-rejected",
+            decision: "reject-always",
+          },
+          turnId: "turn-permission",
+          timestamp: "2026-07-07T12:00:04Z",
+          state: "done",
+        },
+        text("terminal-permission", "Rejected", "turn-permission", "2026-07-07T12:00:05Z"),
+      ],
+      { foldSettledTurns: true }
+    );
+
+    expect(rows.map(row => row.kind)).toEqual(["turn-fold", "data", "text"]);
+    const [foldRow, permissionRow] = rows;
+    if (foldRow?.kind !== "turn-fold" || permissionRow?.kind !== "data") {
+      throw new Error("expected a fold followed by a persistent permission row");
+    }
+    expect(foldRow.rows.map(row => row.kind)).toEqual(["work"]);
+    expect(permissionRow.part.name).toBe("data-compozy-permission");
+  });
+
+  // Invariant (S18): an observed compaction is its own visible row — never a hidden
+  // progress tick, never one of the turn's intra-turn work behind "Worked for".
+  it("Should keep a compaction item as its own row outside a settled turn fold", () => {
+    const compaction: SessionTimelinePart = {
+      kind: "data",
+      id: "c1f0b8f4",
+      name: "data-compozy-compaction",
+      data: {
+        kind: "compaction",
+        compaction_id: "c1f0b8f4",
+        status: "in_progress",
+        started_at: "2026-07-07T12:00:02Z",
+      },
+      turnId: "turn-compaction",
+      timestamp: "2026-07-07T12:00:02Z",
+    };
+    const alone = deriveSessionRows([compaction], { foldSettledTurns: true });
+    expect(alone).toHaveLength(1);
+    expect(alone[0]).toMatchObject({ kind: "data", id: "data:c1f0b8f4" });
+
+    const rows = deriveSessionRows(
+      [
+        tool(1, { turnId: "turn-compaction", timestamp: "2026-07-07T12:00:00Z" }),
+        compaction,
+        text("terminal-compaction", "Done.", "turn-compaction", "2026-07-07T12:00:05Z"),
+      ],
+      { foldSettledTurns: true }
+    );
+    expect(rows.map(row => row.kind)).toEqual(["turn-fold", "data", "text"]);
+    const [foldRow, compactionRow] = rows;
+    if (foldRow?.kind !== "turn-fold" || compactionRow?.kind !== "data") {
+      throw new Error("expected a fold followed by the compaction row");
+    }
+    expect(foldRow.rows.map(row => row.kind)).toEqual(["work"]);
+    expect(compactionRow.part.name).toBe("data-compozy-compaction");
+  });
+
+  it("Should keep a settled deliberate terminal block outside a turn fold and summary", () => {
+    const rows = deriveSessionRows(
+      [
+        tool(1, { turnId: "turn-terminal", timestamp: "2026-08-26T12:00:00Z" }),
+        tool(2, { turnId: "turn-terminal", timestamp: "2026-08-26T12:00:01Z" }),
+        tool(3, {
+          toolName: "compozy__terminal_exec",
+          args: { command: "bun run dev" },
+          result: {
+            rawOutput: { terminal_id: "term-4f21c9a03b7e", output: "ready", still_running: true },
+          },
+          turnId: "turn-terminal",
+          timestamp: "2026-08-26T12:00:02Z",
+        }),
+        text("terminal-answer", "The server is up.", "turn-terminal", "2026-08-26T12:00:05Z"),
+      ],
+      { foldSettledTurns: true }
+    );
+
+    expect(rows.map(row => row.kind)).toEqual(["turn-fold", "work", "text"]);
+    const [foldRow, terminalRow] = rows;
+    if (foldRow?.kind !== "turn-fold" || terminalRow?.kind !== "work") {
+      throw new Error("expected a fold followed by a persistent terminal work row");
+    }
+    expect(foldRow.rows.map(row => row.kind)).toEqual(["work"]);
+    expect(terminalRow.summary).toBeNull();
+    expect(terminalRow.entries.map(entry => entry.kind === "tool" && entry.toolName)).toEqual([
+      "compozy__terminal_exec",
+    ]);
+    const foldedWork = foldRow.rows[0];
+    if (foldedWork?.kind !== "work") throw new Error("expected folded work");
+    expect(foldedWork.entries.map(entry => entry.kind === "tool" && entry.toolName)).toEqual([
+      "Read",
+      "Read",
+    ]);
+    // Inside the fold the calls read as rows — no second disclosure; the sentence lives on the fold.
+    expect(foldedWork.summary).toBeNull();
+    expect(foldRow.counts).toBe("Read 2 files");
+  });
+
+  it("Should keep a settled terminal open outside a turn fold and summary", () => {
+    const rows = deriveSessionRows(
+      [
+        tool(1, { turnId: "turn-open", timestamp: "2026-08-26T12:00:00Z" }),
+        tool(2, { turnId: "turn-open", timestamp: "2026-08-26T12:00:01Z" }),
+        tool(3, {
+          toolName: "compozy__terminal_open",
+          args: { title: "Build logs" },
+          result: { rawOutput: { terminal_id: "term-a03b558d21f0" } },
+          turnId: "turn-open",
+          timestamp: "2026-08-26T12:00:02Z",
+        }),
+        text("open-answer", "The terminal is open.", "turn-open", "2026-08-26T12:00:05Z"),
+      ],
+      { foldSettledTurns: true }
+    );
+
+    expect(rows.map(row => row.kind)).toEqual(["turn-fold", "work", "text"]);
+    const [foldRow, terminalRow] = rows;
+    if (foldRow?.kind !== "turn-fold" || terminalRow?.kind !== "work") {
+      throw new Error("expected a fold followed by a persistent terminal work row");
+    }
+    expect(terminalRow.summary).toBeNull();
+    expect(terminalRow.entries.map(entry => entry.kind === "tool" && entry.toolName)).toEqual([
+      "compozy__terminal_open",
+    ]);
+    const foldedWork = foldRow.rows[0];
+    if (foldedWork?.kind !== "work") throw new Error("expected folded work");
+    expect(foldedWork.entries.map(entry => entry.kind === "tool" && entry.toolName)).toEqual([
+      "Read",
+      "Read",
+    ]);
+  });
+
+  it("Should keep a running terminal as its own live row beside the live tail", () => {
+    const rows = deriveSessionRows(
+      [
+        tool(1, { turnId: "turn-live-terminal", timestamp: "2026-08-26T12:00:00Z" }),
+        tool(2, { turnId: "turn-live-terminal", timestamp: "2026-08-26T12:00:01Z" }),
+        tool(3, {
+          toolName: "compozy__terminal_exec",
+          status: "running",
+          args: { command: "bun run dev" },
+          turnId: "turn-live-terminal",
+          timestamp: "2026-08-26T12:00:02Z",
+        }),
+      ],
+      { activeTurnId: "turn-live-terminal" }
+    );
+
+    const work = rows.filter(row => row.kind === "work");
+    expect(work).toHaveLength(2);
+    expect(work[0]?.entries.map(entry => entry.kind === "tool" && entry.toolName)).toEqual([
+      "Read",
+      "Read",
+    ]);
+    expect(work[0]?.summary?.label).toBe("Read 2 files");
+    expect(work[0]?.active).toBe(true);
+    expect(work[1]?.entries.map(entry => entry.kind === "tool" && entry.toolName)).toEqual([
+      "compozy__terminal_exec",
+    ]);
+    expect(work[1]?.summary).toBeNull();
+    expect(work[1]?.active).toBe(true);
+  });
+
+  it("Should fold generic data events into a settled turn", () => {
+    const rows = deriveSessionRows(
+      [
+        tool(1, { turnId: "turn-generic-data", timestamp: "2026-08-26T12:00:00Z" }),
+        {
+          kind: "data",
+          id: "runtime-progress-1",
+          name: "data-compozy-event",
+          // A runtime warning is a visible row (a status event would render nothing and never become one).
+          data: {
+            type: "runtime_warning",
+            goal: { kind: "goal-work" },
+            text: "Provider slow to answer",
+            runtime: { elapsed_seconds: 40, idle_seconds: 30 },
+          },
+          turnId: "turn-generic-data",
+          timestamp: "2026-08-26T12:00:04Z",
+          state: "done",
+        },
+        text(
+          "terminal-reported",
+          "The terminal report is complete.",
+          "turn-generic-data",
+          "2026-08-26T12:00:05Z"
+        ),
+      ],
+      { foldSettledTurns: true }
+    );
+
+    expect(rows.map(row => row.kind)).toEqual(["turn-fold", "text"]);
+    const [foldRow] = rows;
+    if (foldRow?.kind !== "turn-fold") {
+      throw new Error("expected the settled turn to fold its data event");
+    }
+    expect(foldRow.rows.map(row => row.kind)).toEqual(["work", "data"]);
+  });
+
+  it("Should preserve prose across hidden progress ticks and retain every search part", () => {
+    const rows = deriveSessionRows([
+      { ...text("first", "Streaming response ", "turn-stream"), partIndex: 0 },
+      {
+        kind: "data",
+        id: "usage",
+        name: "data-compozy-event",
+        data: { type: "usage" },
+        turnId: "turn-stream",
+      },
+      { ...text("second", "started.", "turn-stream"), partIndex: 2 },
+    ]);
+    expect(rows).toHaveLength(1);
+    const row = rows[0];
+    if (row?.kind !== "text") throw new Error("expected continuous prose");
+    expect(row.part.text).toBe("Streaming response started.");
+    expect(row.parts.map(part => part.partIndex)).toEqual([0, 2]);
+  });
+
+  it("Should keep every text segment visible when a permission splits the response", () => {
+    const rows = deriveSessionRows(
+      [
+        text(
+          "before-permission",
+          "Streaming response started.",
+          "turn-split",
+          "2026-07-07T12:00:00Z"
+        ),
+        {
+          kind: "data",
+          id: "permission-allowed",
+          name: "data-compozy-permission",
+          data: {
+            type: "permission",
+            request_id: "turn-split:permission-allowed",
+            decision: "allow-once",
+          },
+          turnId: "turn-split",
+          timestamp: "2026-07-07T12:00:02Z",
+          state: "done",
+        },
+        text(
+          "after-permission",
+          "Session continued after approval.",
+          "turn-split",
+          "2026-07-07T12:00:03Z"
+        ),
+      ],
+      { foldSettledTurns: true }
+    );
+
+    expect(rows.map(row => row.kind)).toEqual(["text", "data", "text"]);
+    expect(rows.filter(row => row.kind === "text").map(row => row.part.text)).toEqual([
+      "Streaming response started.",
+      "Session continued after approval.",
+    ]);
+  });
+
+  it("Should keep the live turn inline instead of folding it", () => {
+    const rows = deriveSessionRows(
+      [
+        tool(1, {
+          status: "running",
+          result: undefined,
+          turnId: "turn-live",
+          timestamp: "2026-07-07T12:00:00Z",
+        }),
+        text("terminal-live", "Still working", "turn-live", "2026-07-07T12:00:03Z"),
+      ],
+      { foldSettledTurns: true }
+    );
+
+    expect(rows.some(row => row.kind === "turn-fold")).toBe(false);
+    expect(rows.map(row => row.kind)).toEqual(["live-tool", "text"]);
+  });
+
+  it.each(["interrupted", "cancelled", "canceled"])(
+    "Should fold a state-%s tool with its reasoning as stopped work",
+    state => {
+      const rows = deriveSessionRows(
+        [
+          {
+            kind: "reasoning",
+            id: "reason-int",
+            text: "Working",
+            turnId: "turn-int",
+            timestamp: "2026-07-07T12:00:00Z",
+            state: "done",
+          },
+          tool(1, {
+            turnId: "turn-int",
+            timestamp: "2026-07-07T12:00:04Z",
+            status: "running",
+            result: undefined,
+            state,
+          }),
+          text("terminal-int", "Stopped early", "turn-int", "2026-07-07T12:00:07Z"),
+        ],
+        { foldSettledTurns: true }
+      );
+
+      // An interrupted turn still derives a turn-fold row, but the render keeps it
+      // expanded; the label swaps to the "You stopped" language and the terminal
+      // assistant message stays visible below.
+      expect(rows.map(row => row.kind)).toEqual(["turn-fold", "text"]);
+      const foldRow = rows[0];
+      if (foldRow?.kind !== "turn-fold") throw new Error("expected fold row");
+      expect(foldRow.cause).toBe("stopped");
+      expect(foldRow.open).toBe(true);
+      expect(foldRow.label).toBe("You stopped after 7s");
+      expect(foldRow.rows.map(row => row.kind)).toEqual(["work"]);
+      expect(foldRow.rows[0]).toMatchObject({
+        active: false,
+        summary: { label: "1 tool · 1 thought · 1 stopped" },
+        expanded: false,
+        entries: [{ kind: "reasoning" }, { kind: "tool", status: "interrupted", state }],
+      });
+      expect(rows[1]).toMatchObject({ kind: "text", id: "text:terminal-int" });
+    }
+  );
+
+  it("Should label a turn interrupted via the interruptedTurnIds option", () => {
+    const rows = deriveSessionRows(
+      [
+        {
+          kind: "reasoning",
+          id: "reason-opt",
+          text: "Working",
+          turnId: "turn-opt",
+          timestamp: "2026-07-07T12:00:00Z",
+          state: "done",
+        },
+        tool(1, { turnId: "turn-opt", timestamp: "2026-07-07T12:00:05Z" }),
+        text("terminal-opt", "Stopped", "turn-opt", "2026-07-07T12:00:05Z"),
+      ],
+      { foldSettledTurns: true, interruptedTurnIds: new Set(["turn-opt"]) }
+    );
+
+    const foldRow = rows[0];
+    if (foldRow?.kind !== "turn-fold") throw new Error("expected fold row");
+    expect(foldRow.cause).toBe("stopped");
+    expect(foldRow.open).toBe(true);
+    expect(foldRow.label).toBe("You stopped after 5s");
+  });
+
+  it("Should fold a settled turn behind a plain Worked label when the duration is unknown", () => {
+    const rows = deriveSessionRows(
+      [
+        { kind: "reasoning", id: "reason-nd", text: "Thinking", turnId: "turn-nd", state: "done" },
+        { kind: "text", id: "text-nd", text: "Done", turnId: "turn-nd", state: "done" },
+      ],
+      { foldSettledTurns: true }
+    );
+
+    expect(rows.map(row => row.kind)).toEqual(["turn-fold", "text"]);
+    const foldRow = rows[0];
+    if (foldRow?.kind !== "turn-fold") throw new Error("expected fold row");
+    expect(foldRow.cause).toBe("settled");
+    expect(foldRow.durationMs).toBe(0);
+    expect(foldRow.label).toBe("Worked");
+  });
+
+  it("Should group consecutive reasoning parts into one row carrying the update count", () => {
+    const parts: SessionTimelinePart[] = [
+      {
+        kind: "reasoning",
+        id: "reason-1",
+        text: "First thought",
+        turnId: "turn-1",
+        timestamp: "2026-07-07T12:00:00Z",
+        state: "done",
+      },
+      {
+        kind: "reasoning",
+        id: "reason-2",
+        text: "Second thought",
+        turnId: "turn-1",
+        timestamp: "2026-07-07T12:00:01Z",
+        state: "done",
+      },
+      {
+        kind: "reasoning",
+        id: "reason-3",
+        text: "Third thought",
+        turnId: "turn-1",
+        timestamp: "2026-07-07T12:00:02Z",
+        state: "done",
+      },
+    ];
+
+    const rows = deriveSessionRows(parts);
+
+    expect(rows).toHaveLength(1);
+    const row = rows[0];
+    if (row?.kind !== "reasoning") throw new Error("expected reasoning row");
+    // The three consecutive parts collapse into one "3 updates" row anchored to
+    // the first part's id, with every part's text preserved in order.
+    expect(row.updateCount).toBe(3);
+    expect(row.parts).toHaveLength(3);
+    expect(row.id).toBe("reasoning:reason-1");
+    expect(row.text).toBe("First thought\n\nSecond thought\n\nThird thought");
+    expect(row.streaming).toBe(false);
+  });
+
+  it("Should split reasoning groups across turn boundaries and track streaming state", () => {
+    const rows = deriveSessionRows([
+      { kind: "reasoning", id: "reason-a", text: "Turn one", turnId: "turn-1", state: "done" },
+      { kind: "reasoning", id: "reason-b", text: "Turn two", turnId: "turn-2", state: "running" },
+    ]);
+
+    expect(rows.map(row => row.kind)).toEqual(["reasoning", "reasoning"]);
+    const [first, second] = rows;
+    if (first?.kind !== "reasoning" || second?.kind !== "reasoning") {
+      throw new Error("expected two reasoning rows");
+    }
+    expect(first.updateCount).toBe(1);
+    expect(first.streaming).toBe(false);
+    expect(second.updateCount).toBe(1);
+    // A still-streaming reasoning part keeps the row live so the turn stays open.
+    expect(second.streaming).toBe(true);
+  });
+});
+
+// UT-091: a settled turn folds behind its duration and its work counts; the
+// final answer stays outside the fold.
+it("Should fold a settled turn behind duration and counts with the answer outside", () => {
+  const rows = deriveSessionRows(
+    [
+      tool(1, {
+        toolName: "Bash",
+        args: { command: "go test" },
+        turnId: "turn-c",
+        timestamp: "2026-07-07T12:00:00Z",
+      }),
+      tool(2, {
+        toolName: "Bash",
+        args: { command: "go vet" },
+        turnId: "turn-c",
+        timestamp: "2026-07-07T12:01:00Z",
+      }),
+      tool(3, {
+        toolName: "Read",
+        args: { file_path: "/src/a.ts" },
+        turnId: "turn-c",
+        timestamp: "2026-07-07T12:03:00Z",
+      }),
+      text("answer", "Done — 14 tests updated.", "turn-c", "2026-07-07T12:04:12Z"),
+    ],
+    { foldSettledTurns: true }
+  );
+  expect(rows.map(row => row.kind)).toEqual(["turn-fold", "text"]);
+  const foldRow = rows[0];
+  if (foldRow?.kind !== "turn-fold") throw new Error("expected fold row");
+  expect(foldRow.label).toBe("Worked for 4m 12s · Ran 2 commands · Read a.ts");
+  expect(foldRow.counts).toBe("Ran 2 commands · Read a.ts");
+  expect(foldRow.cause).toBe("settled");
+  expect(foldRow.open).toBe(false);
+});
+
+// UT-093: a zero-tool turn has no fold row — message and answer only.
+it("Should derive no fold row for a zero-tool turn", () => {
+  const rows = deriveSessionRows(
+    [
+      text(
+        "only-answer",
+        "Three of the manager tests are flaky.",
+        "turn-z",
+        "2026-07-07T12:00:00Z"
+      ),
+    ],
+    { foldSettledTurns: true, activeTurnId: undefined }
+  );
+  expect(rows.map(row => row.kind)).toEqual(["text"]);
+});
+
+// UT-094: a turn a fallback steer interrupted folds like a settled one but
+// names its true cause; a turn that failed stays open under a danger label.
+it("Should fold a superseded turn with its true cause and keep a failed turn open", () => {
+  const superseded = deriveSessionRows(
+    [
+      tool(1, {
+        toolName: "Bash",
+        args: { command: "go test" },
+        turnId: "turn-s",
+        timestamp: "2026-07-07T12:00:00Z",
+      }),
+      tool(3, {
+        toolName: "Bash",
+        args: { command: "go build" },
+        turnId: "turn-s",
+        timestamp: "2026-07-07T12:00:10Z",
+      }),
+      tool(2, {
+        toolName: "Bash",
+        args: { command: "go vet" },
+        turnId: "turn-s",
+        timestamp: "2026-07-07T12:00:20Z",
+        status: "running",
+        result: undefined,
+      }),
+      {
+        kind: "reasoning",
+        id: "reason-s",
+        text: "Halfway",
+        turnId: "turn-s",
+        timestamp: "2026-07-07T12:00:48Z",
+        state: "done",
+      },
+    ],
+    { foldSettledTurns: true, supersededTurnIds: new Set(["turn-s"]) }
+  );
+  expect(superseded.map(row => row.kind)).toEqual(["turn-fold"]);
+  const fold = superseded[0];
+  if (fold?.kind !== "turn-fold") throw new Error("expected fold row");
+  expect(fold.cause).toBe("steer_fallback");
+  expect(fold.open).toBe(false);
+  expect(fold.label).toBe("Interrupted after 48s · replaced by your steer · Ran 2 commands");
+  // The call still running at the interrupt reads stopped, not running.
+  const work = fold.rows.find(
+    row => row.kind === "work" && row.entries.some(entry => entry.id === "tool-2")
+  );
+  if (work?.kind !== "work") throw new Error("expected the stopped call inside the fold");
+  expect(work.entries.find(entry => entry.id === "tool-2")).toMatchObject({
+    kind: "tool",
+    status: "interrupted",
+  });
+
+  const failed = deriveSessionRows(
+    [
+      tool(1, { turnId: "turn-f", timestamp: "2026-07-07T12:00:00Z" }),
+      tool(2, { turnId: "turn-f", timestamp: "2026-07-07T12:02:03Z" }),
+    ],
+    { foldSettledTurns: true, failedTurnIds: new Set(["turn-f"]) }
+  );
+  const failedFold = failed[0];
+  if (failedFold?.kind !== "turn-fold") throw new Error("expected fold row");
+  expect(failedFold).toMatchObject({ cause: "failed", open: true, label: "Failed after 2m 3s" });
+});
+
+// UT-090: decision asks and errors are rich rows — they split tool groups and
+// never disappear into a settled turn's fold.
+it.each([
+  { label: "session errors", event: { type: "error", error: "provider exploded" } },
+  {
+    label: "file mutation verification warnings",
+    event: {
+      type: "transcript_marker.created",
+      marker: {
+        kind: "transcript_marker.file_mutation_unverified",
+        summary: "File mutation failed and was not recovered.",
+        occurred_at: "2026-07-07T12:00:02Z",
+      },
+    },
+  },
+  {
+    label: "raw file mutation verification warnings",
+    event: {
+      type: "transcript_marker.created",
+      raw: {
+        kind: "transcript_marker.file_mutation_unverified",
+        summary: "File mutation failed and was not recovered.",
+        occurred_at: "2026-07-07T12:00:02Z",
+      },
+    },
+  },
+])("Should keep $label out of tool groups and outside the fold", ({ event }) => {
+  const rows = deriveSessionRows(
+    [
+      tool(1, { turnId: "turn-r", timestamp: "2026-07-07T12:00:00Z" }),
+      tool(2, { turnId: "turn-r", timestamp: "2026-07-07T12:00:01Z" }),
+      {
+        kind: "data",
+        id: "error-r",
+        name: "data-compozy-event",
+        data: event,
+        turnId: "turn-r",
+        timestamp: "2026-07-07T12:00:02Z",
+      },
+      tool(3, { turnId: "turn-r", timestamp: "2026-07-07T12:00:03Z" }),
+      tool(4, { turnId: "turn-r", timestamp: "2026-07-07T12:00:04Z" }),
+      text("answer-r", "Recovered.", "turn-r", "2026-07-07T12:00:05Z"),
+    ],
+    { foldSettledTurns: true }
+  );
+  // The error row splits the run into two groups and stays visible beside the fold.
+  expect(rows.map(row => row.kind)).toEqual(["turn-fold", "data", "text"]);
+  const fold = rows[0];
+  if (fold?.kind !== "turn-fold") throw new Error("expected fold row");
+  expect(fold.rows.map(row => row.kind)).toEqual(["work", "work"]);
+});
+
+describe("changed-files roll-up derivation", () => {
+  // Invariant: live children suppress only their spawning turn's file summary,
+  // even across row boundaries. Owner: pure timeline projection, canonical suite here.
+  it("Should track live subagents across intervening turn groups without hiding other turns' files", () => {
+    const rows = deriveSessionRows(
+      [
+        editTool(1, "/src/a.ts", "a", "a\nb"),
+        { ...editTool(2, "/src/b.ts", "a", "a\nc"), turnId: "turn-2" },
+        subagentPart("sub-live", "delegate-1"),
+      ],
+      { foldSettledTurns: true }
+    );
+    expect(rows.filter(row => row.kind === "changed-files").map(row => row.turnId)).toEqual([
+      "turn-2",
+    ]);
+  });
+
+  it.each([undefined, "turn-1"])(
+    "Should withhold edited files until subagents settle (active turn %s)",
+    activeTurnId => {
+      const parts = [
+        editTool(1, "/src/a.ts", "a", "a\nb"),
+        subagentPart("sub-live", "delegate-1"),
+        text("answer", "Waiting for the review.", "turn-1"),
+      ];
+      const live = deriveSessionRows(parts, { foldSettledTurns: true, activeTurnId });
+      expect(live.some(row => row.kind === "changed-files")).toBe(false);
+      const settled = deriveSessionRows(parts, {
+        foldSettledTurns: true,
+        settledSubagentIds: new Set(["sub-live"]),
+      });
+      expect(settled.filter(row => row.kind === "changed-files")).toHaveLength(1);
+    }
+  );
+
+  function editTool(
+    index: number,
+    filePath: string,
+    oldString: string,
+    newString: string
+  ): SessionTimelineToolPart {
+    return tool(index, {
+      toolName: "Edit",
+      turnId: "turn-1",
+      args: { file_path: filePath, old_string: oldString, new_string: newString },
+    });
+  }
+
+  it("Should aggregate a settled turn's Edit/Write files, summing repeat edits to one entry", () => {
+    // File a is edited twice (+1 then +1); file b replaces three lines with one
+    // (-2). Same path collapses to one first-touch-ordered entry with summed stats.
+    const rows = deriveSessionRows(
+      [
+        editTool(1, "/src/a.ts", "a\nb", "a\nb\nc"),
+        editTool(2, "/src/b.ts", "x\ny\nz", "x"),
+        editTool(3, "/src/a.ts", "c", "c\nd"),
+      ],
+      { foldSettledTurns: true }
+    );
+
+    const rollup = rows.find(row => row.kind === "changed-files");
+    if (rollup?.kind !== "changed-files") throw new Error("expected a changed-files row");
+    expect(rollup.files.map(file => file.path)).toEqual(["/src/a.ts", "/src/b.ts"]);
+    expect(rollup.files[0]).toMatchObject({ additions: 2, deletions: 0 });
+    expect(rollup.files[1]).toMatchObject({ additions: 0, deletions: 2 });
+    expect(rollup.additions).toBe(2);
+    expect(rollup.deletions).toBe(2);
+    expect(rollup.expanded).toBe(false);
+  });
+
+  it("Should count a Write as its full content line count with no deletions", () => {
+    const rows = deriveSessionRows(
+      [
+        tool(1, {
+          toolName: "Write",
+          turnId: "turn-1",
+          args: { file_path: "/src/new.ts", content: "one\ntwo\nthree" },
+        }),
+        text("t1", "Wrote the file.", "turn-1"),
+      ],
+      { foldSettledTurns: true }
+    );
+
+    const rollup = rows.find(row => row.kind === "changed-files");
+    if (rollup?.kind !== "changed-files") throw new Error("expected a changed-files row");
+    expect(rollup.files).toEqual([{ path: "/src/new.ts", additions: 3, deletions: 0 }]);
+  });
+
+  it("Should derive no roll-up row for a settled turn that modified no files", () => {
+    const rows = deriveSessionRows(
+      [
+        tool(1, { toolName: "Read", turnId: "turn-1", args: { file_path: "/src/a.ts" } }),
+        tool(2, { toolName: "Bash", turnId: "turn-1", args: { command: "ls" } }),
+        text("t1", "Done reviewing.", "turn-1"),
+      ],
+      { foldSettledTurns: true }
+    );
+
+    expect(rows.some(row => row.kind === "changed-files")).toBe(false);
+  });
+
+  it("Should not derive a roll-up while the editing turn is still active (display-only settled)", () => {
+    const rows = deriveSessionRows([editTool(1, "/src/a.ts", "a", "a\nb")], {
+      foldSettledTurns: true,
+      activeTurnId: "turn-1",
+    });
+
+    expect(rows.some(row => row.kind === "changed-files")).toBe(false);
+  });
+
+  it("Should exclude failed edits from the roll-up", () => {
+    const rows = deriveSessionRows(
+      [
+        tool(1, {
+          toolName: "Edit",
+          turnId: "turn-1",
+          args: { file_path: "/src/broken.ts", old_string: "a", new_string: "b" },
+          isError: true,
+          result: undefined,
+        }),
+        text("t1", "The edit failed.", "turn-1"),
+      ],
+      { foldSettledTurns: true }
+    );
+
+    expect(rows.some(row => row.kind === "changed-files")).toBe(false);
+  });
+});
+
+describe("marker clustering", () => {
+  function markerEvent(
+    id: string,
+    kind: string,
+    timestamp = "2026-07-07T12:00:00Z",
+    turnId = "turn-1"
+  ) {
+    return {
+      kind: "data",
+      id,
+      name: "data-compozy-event",
+      // The daemon's wire shape: a `transcript_marker.created` event carrying the marker.
+      data: {
+        type: "transcript_marker.created",
+        marker: { kind, occurred_at: timestamp, summary: kind },
+      },
+      turnId,
+      timestamp,
+      state: "done",
+    } satisfies SessionTimelinePart;
+  }
+
+  it("Should merge consecutive same-kind markers into one row carrying the count", () => {
+    const rows = deriveSessionRows([
+      markerEvent("m1", "provider-retry"),
+      markerEvent("m2", "provider-retry", "2026-07-07T12:00:01Z"),
+      markerEvent("m3", "provider-retry", "2026-07-07T12:00:02Z"),
+    ]);
+
+    expect(rows).toHaveLength(1);
+    const row = rows[0];
+    if (row?.kind !== "data") throw new Error("expected data row");
+    expect(row.count).toBe(3);
+    expect(row.parts).toHaveLength(3);
+    // The row anchors to the first event: stable id + render anchor part.
+    expect(row.id).toBe("data:m1");
+    expect(row.part.id).toBe("m1");
+  });
+
+  it("Should split marker clusters when the kind changes", () => {
+    const rows = deriveSessionRows([
+      markerEvent("m1", "provider-retry"),
+      markerEvent("m2", "compaction"),
+    ]);
+
+    expect(rows).toHaveLength(2);
+    expect(rows.map(row => (row.kind === "data" ? row.count : row.kind))).toEqual([1, 1]);
+  });
+
+  it("Should split same-kind marker clusters when the turn changes", () => {
+    const rows = deriveSessionRows([
+      markerEvent("m1", "provider-retry", "2026-07-07T12:00:00Z", "turn-1"),
+      markerEvent("m2", "provider-retry", "2026-07-07T12:00:01Z", "turn-2"),
+    ]);
+
+    expect(rows).toHaveLength(2);
+    expect(rows.map(row => (row.kind === "data" ? row.parts.map(part => part.id) : []))).toEqual([
+      ["m1"],
+      ["m2"],
+    ]);
+  });
+
+  it("Should never cluster permission or clarification parts", () => {
+    const permission = (id: string): SessionTimelinePart => ({
+      kind: "data",
+      id,
+      name: "data-compozy-permission",
+      data: { type: "permission", request_id: id, decision: "allow-once" },
+      turnId: "turn-1",
+      timestamp: "2026-07-07T12:00:00Z",
+      state: "done",
+    });
+    const clarify = (id: string): SessionTimelinePart => ({
+      kind: "data",
+      id,
+      name: "data-compozy-event",
+      data: { type: "clarify", status: "pending", request: { request_id: id, question: "?" } },
+      turnId: "turn-1",
+      timestamp: "2026-07-07T12:00:00Z",
+      state: "done",
+    });
+
+    const rows = deriveSessionRows([
+      permission("p1"),
+      permission("p2"),
+      clarify("c1"),
+      clarify("c2"),
+    ]);
+
+    expect(rows).toHaveLength(4);
+    for (const row of rows) {
+      if (row.kind !== "data") throw new Error("expected data rows");
+      expect(row.count).toBe(1);
+    }
+  });
+});
+
+// Suite extension: subagent projection (`_uiux.md` S1, S2, S6, S8). Invariant: card-owned tool
+// calls never draw twice, adjacent same-turn cards group, live cards outlive turn folds, and
+// provider-native inner parts render only inside their card. Owning layer: timeline derivation.
+function subagentPart(
+  id: string,
+  toolCallId: string,
+  overrides: { turnId?: string; origin?: string; timestamp?: string } = {}
+): SessionTimelinePart {
+  return {
+    kind: "data",
+    id,
+    name: "data-compozy-subagent",
+    data: {
+      subagent_id: id,
+      tool_call_id: toolCallId,
+      origin: overrides.origin ?? "delegated",
+      title: `Task ${id}`,
+    },
+    turnId: overrides.turnId ?? "turn-1",
+    timestamp: overrides.timestamp ?? "2026-07-07T12:00:05Z",
+  };
+}
+
+const delegate = (index: number, overrides: Partial<SessionTimelineToolPart> = {}) =>
+  tool(index, {
+    toolName: "compozy__subagent_delegate",
+    args: { title: `Task ${index}` },
+    result: { subagent_id: `sub-${index}` },
+    ...overrides,
+  });
+
+describe("session timeline subagent cards", () => {
+  it("UT-W02: Should hide a delegate call that has a card and keep a failed delegate as a tool row", () => {
+    const rows = deriveSessionRows([
+      delegate(1),
+      subagentPart("sub-1", "tool-call-1"),
+      delegate(2, { isError: true, result: { error: "codex is not installed" } }),
+    ]);
+    expect(rows.map(row => row.kind)).toEqual(["subagents", "work"]);
+    const failed = rows[1];
+    if (failed?.kind !== "work") throw new Error("expected the failed delegate row");
+    expect(failed.entries.map(entry => entry.id)).toEqual(["tool-2"]);
+  });
+
+  it("UT-W03: Should group adjacent same-turn cards and split them across text or turns", () => {
+    const grouped = deriveSessionRows([
+      delegate(1),
+      delegate(2),
+      subagentPart("sub-1", "tool-call-1"),
+      subagentPart("sub-2", "tool-call-2"),
+      text("t1", "Waiting on both.", "turn-1"),
+      subagentPart("sub-3", "tool-call-3"),
+      subagentPart("sub-4", "tool-call-4", { turnId: "turn-2" }),
+    ]);
+    expect(grouped.map(row => row.kind)).toEqual(["subagents", "text", "subagents", "subagents"]);
+    const [group, , afterText, nextTurn] = grouped;
+    if (group?.kind !== "subagents") throw new Error("expected a group");
+    expect(group.id).toBe("subagent-group:sub-1");
+    expect(group.subagentIds).toEqual(["sub-1", "sub-2"]);
+    expect(afterText).toMatchObject({ id: "subagent:sub-3", subagentIds: ["sub-3"] });
+    expect(nextTurn).toMatchObject({ id: "subagent:sub-4", turnId: "turn-2" });
+
+    const expanded = deriveSessionRows(
+      [subagentPart("sub-1", "tool-call-1"), subagentPart("sub-2", "tool-call-2")],
+      { expandedWorkGroupIds: new Set(["subagent-group:sub-1"]) }
+    );
+    expect(expanded[0]).toMatchObject({ kind: "subagents", expanded: true });
+  });
+
+  it("UT-W04: Should keep live and unconfirmed cards outside the settled turn fold and fold settled ones", () => {
+    const parts: SessionTimelinePart[] = [
+      tool(1),
+      tool(2),
+      subagentPart("sub-live", "tool-call-9"),
+      tool(3),
+      subagentPart("sub-done", "tool-call-8"),
+      text("t1", "Both are on their way.", "turn-1"),
+    ];
+    const rows = deriveSessionRows(parts, {
+      foldSettledTurns: true,
+      settledSubagentIds: new Set(["sub-done"]),
+    });
+    expect(rows.map(row => row.kind)).toEqual(["turn-fold", "subagents", "text"]);
+    expect(rows[1]).toMatchObject({ id: "subagent:sub-live", live: true });
+    const fold = rows[0];
+    if (fold?.kind !== "turn-fold") throw new Error("expected a fold");
+    expect(fold.rows.map(row => row.id)).toContain("subagent:sub-done");
+
+    const settled = deriveSessionRows(parts, {
+      foldSettledTurns: true,
+      settledSubagentIds: new Set(["sub-live", "sub-done"]),
+    });
+    expect(settled.map(row => row.kind)).toEqual(["turn-fold", "text"]);
+    // A card the roster has not confirmed reads as running: it never folds.
+    const unconfirmed = deriveSessionRows(parts, { foldSettledTurns: true });
+    expect(unconfirmed.map(row => row.kind)).toEqual([
+      "turn-fold",
+      "subagents",
+      "subagents",
+      "text",
+    ]);
+  });
+
+  it("UT-W11: Should nest parts attributed to a native card and leave unknown parents in the flow", () => {
+    const inner = tool(2, { toolName: "Read", parentToolCallId: "toolu-native" });
+    const innerText: SessionTimelinePart = {
+      ...text("t-inner", "Found it."),
+      parentToolCallId: "toolu-native",
+    };
+    const orphan = tool(3, { toolName: "Grep", parentToolCallId: "toolu-unknown" });
+    const rows = deriveSessionRows([
+      tool(1, {
+        toolName: "Agent",
+        toolCallId: "toolu-native",
+        status: "running",
+        result: undefined,
+      }),
+      subagentPart("sub-native", "toolu-native", { origin: "provider_native" }),
+      inner,
+      innerText,
+      orphan,
+    ]);
+    expect(rows.map(row => row.kind)).toEqual(["subagents", "work"]);
+    const card = rows[0];
+    if (card?.kind !== "subagents") throw new Error("expected the native card");
+    expect(card.nested.get("sub-native")).toEqual([inner, innerText]);
+    const flow = rows[1];
+    if (flow?.kind !== "work") throw new Error("expected the parent's own work");
+    expect(flow.entries).toEqual([orphan]);
+  });
+
+  it("Should keep prose blocks apart when a card-owned call between them leaves the flow", () => {
+    const tick: SessionTimelinePart = {
+      kind: "data",
+      id: "tick",
+      name: "data-compozy-event",
+      data: { type: "tool_call", tool_call_id: "tool-call-1" },
+      turnId: "turn-1",
+    };
+    const rows = deriveSessionRows([
+      text("t1", "I'll pick this up when they wake me.", "turn-1"),
+      delegate(1),
+      tick,
+      text("t2", "The three subagents are still running.", "turn-1"),
+      subagentPart("sub-1", "tool-call-1"),
+    ]);
+    expect(rows.map(row => row.kind)).toEqual(["text", "text", "subagents"]);
+    expect(rows[0]).toMatchObject({ part: { text: "I'll pick this up when they wake me." } });
+
+    // A part that draws nothing right after the removed call keeps the separation for the next text.
+    const unnamed: SessionTimelinePart = {
+      kind: "data",
+      id: "unnamed-send",
+      name: "data-compozy-session-message",
+      data: { tool_call_id: "" },
+      turnId: "turn-1",
+    };
+    const quiet = deriveSessionRows([
+      text("t1", "I'll pick this up when they wake me.", "turn-1"),
+      delegate(1),
+      unnamed,
+      text("t2", "The three subagents are still running.", "turn-1"),
+      subagentPart("sub-1", "tool-call-1"),
+    ]);
+    expect(quiet.map(row => row.kind)).toEqual(["text", "text", "subagents"]);
+  });
+
+  // #896. Invariant: the parent's prose splits only where a row is drawn. The daemon closes the
+  // parent's text part at every interleaved event, so native inner work streaming beside the
+  // reply, a child event that adds no part, and an unnamed session-message part all fall between
+  // deltas, mid-word or mid code span, and must still read as one Markdown block.
+  it("Should keep one prose block across a silent prompt marker and split it at a drawn marker", () => {
+    const marker = (id: string, kind: string): SessionTimelinePart => ({
+      kind: "data",
+      id,
+      name: "data-compozy-event",
+      data: {
+        type: "transcript_marker.created",
+        marker: { kind, occurred_at: "2026-07-07T12:00:00Z", summary: kind },
+      },
+      turnId: "turn-1",
+    });
+    // A prompt queued for this busy session draws nothing: the reply reads through it.
+    const queued = deriveSessionRows([
+      text("t1", "The typecheck est", "turn-1"),
+      marker("queued", "transcript_marker.prompt_queued"),
+      text("t2", "ava clean.", "turn-1"),
+    ]);
+    expect(queued.map(row => row.kind)).toEqual(["text"]);
+    expect(queued[0]).toMatchObject({ part: { text: "The typecheck estava clean." } });
+
+    // A steer draws its line, so the prose on either side stays two blocks.
+    const steered = deriveSessionRows([
+      text("t1", "Before the steer.", "turn-1"),
+      marker("steer", "transcript_marker.prompt_steered"),
+      text("t2", "After the steer.", "turn-1"),
+    ]);
+    expect(steered.map(row => row.kind)).toEqual(["text", "data", "text"]);
+
+    // A silent marker right after a card-owned call keeps that call's separation.
+    const afterCall = deriveSessionRows([
+      text("t1", "I'll pick this up when they wake me.", "turn-1"),
+      delegate(1),
+      marker("queued", "transcript_marker.prompt_queued"),
+      text("t2", "The three subagents are still running.", "turn-1"),
+      subagentPart("sub-1", "tool-call-1"),
+    ]);
+    expect(afterCall.map(row => row.kind)).toEqual(["text", "text", "subagents"]);
+  });
+
+  it("Should keep one prose block when native inner work streams between its deltas", () => {
+    const inner = (index: number): SessionTimelinePart[] => [
+      tool(index, { parentToolCallId: "toolu", toolName: "Bash", status: "running" }),
+      {
+        kind: "data",
+        id: `inner-tick-${index}`,
+        name: "data-compozy-event",
+        data: { type: "tool_call", parent_tool_call_id: "toolu" },
+        turnId: "turn-1",
+        parentToolCallId: "toolu",
+      },
+    ];
+    const unnamed: SessionTimelinePart = {
+      kind: "data",
+      id: "unnamed-send",
+      name: "data-compozy-session-message",
+      data: { tool_call_id: "" },
+      turnId: "turn-1",
+    };
+    const rows = deriveSessionRows([
+      delegate(1, { toolName: "Agent", toolCallId: "toolu" }),
+      subagentPart("sub-n", "toolu", { origin: "provider_native" }),
+      text("t1", "- The typecheck est", "turn-1"),
+      ...inner(2),
+      text("t2", "ava clean before any ch", "turn-1"),
+      ...inner(3),
+      text("t3", "ange.", "turn-1"),
+      text("t4", "\n\nGallery links (`http://127.0.0.1:4400/?", "turn-1"),
+      unnamed,
+      text("t5", "p=mentorias&w=390`).", "turn-1"),
+    ]);
+
+    expect(rows.map(row => row.kind)).toEqual(["subagents", "text"]);
+    const prose = rows[1];
+    if (prose?.kind !== "text") throw new Error("expected one prose block");
+    expect(prose.part.text).toBe(
+      "- The typecheck estava clean before any change.\n\nGallery links (`http://127.0.0.1:4400/?p=mentorias&w=390`)."
+    );
+    expect(prose.parts.map(part => part.id)).toEqual(["t1", "t2", "t3", "t4", "t5"]);
+    const card = rows[0];
+    if (card?.kind !== "subagents") throw new Error("expected the native card");
+    expect(card.nested.get("sub-n")?.map(part => part.id)).toEqual([
+      "tool-2",
+      "inner-tick-2",
+      "tool-3",
+      "inner-tick-3",
+    ]);
+
+    // Visible rows still separate prose: the card, and a child's own text never joins the parent.
+    const separated = deriveSessionRows([
+      text("before", "Reviewing.", "turn-1"),
+      subagentPart("sub-n", "toolu", { origin: "provider_native" }),
+      text("after", "Done.", "turn-1"),
+      { ...text("orphan", "child aside", "turn-1"), parentToolCallId: "toolu-unknown" },
+    ]);
+    expect(separated.map(row => row.kind)).toEqual(["text", "subagents", "text", "text"]);
+  });
+
+  it("UT-W09: Should summarize subagent tools in their own verbs", () => {
+    const capabilities = (index: number, isError = false) =>
+      tool(index, { toolName: "compozy__subagent_capabilities", args: {}, isError });
+    const [checked] = deriveSessionRows([capabilities(1), capabilities(2)]);
+    expect(checked).toMatchObject({ kind: "work" });
+    if (checked?.kind !== "work") throw new Error("expected a summary");
+    expect(checked.summary?.label).toBe("Checked subagent capabilities 2 times");
+
+    const [tried] = deriveSessionRows([capabilities(1, true), capabilities(2, true)]);
+    if (tried?.kind !== "work") throw new Error("expected a summary");
+    expect(tried.summary?.label).toBe("Tried to check subagent capabilities");
+
+    const [mixed] = deriveSessionRows([
+      capabilities(1),
+      tool(2, { toolName: "compozy__subagent_status", args: {} }),
+    ]);
+    if (mixed?.kind !== "work") throw new Error("expected a summary");
+    expect(mixed.summary?.label).toBe("Checked subagent capabilities · Read subagent status");
+  });
+});
+
+// Suite extension: "Sent to" projection (agent collaboration `_uiux.md` S3). Invariant: a
+// `compozy__session_prompt` call that has a `data-compozy-session-message` part draws once, as
+// its own "session-message" row outside work groups, failed or not, and that row survives the
+// settled turn fold. Owning layer: timeline derivation.
+function sessionMessagePart(
+  id: string,
+  toolCallId: string,
+  overrides: { state?: string; turnId?: string; targetSessionId?: string } = {}
+): SessionTimelinePart {
+  return {
+    kind: "data",
+    id,
+    name: "data-compozy-session-message",
+    data: {
+      tool_call_id: toolCallId,
+      target_session_id: overrides.targetSessionId ?? "sess-c03f9d61b2e84a07",
+      target_workspace_id: "ws_alpha",
+      message_id: `msg-${id}`,
+      mode: "queue",
+      reply_watch_id: "rw-6e2d81a0",
+      state: overrides.state ?? "done",
+    },
+    turnId: overrides.turnId ?? "turn-1",
+    timestamp: "2026-07-07T12:00:05Z",
+  };
+}
+
+const sessionPrompt = (index: number, overrides: Partial<SessionTimelineToolPart> = {}) =>
+  tool(index, {
+    toolName: "compozy__session_prompt",
+    args: { session_id: "sess-c03f9d61b2e84a07", message: "Is the retry budget per job?" },
+    result: { status: "accepted" },
+    ...overrides,
+  });
+
+describe("session timeline sent messages", () => {
+  it("UT-065: Should draw a session_prompt call as its own row outside the work group", () => {
+    const rows = deriveSessionRows([
+      tool(1),
+      sessionPrompt(2),
+      sessionMessagePart("sm-1", "tool-call-2"),
+      tool(3),
+    ]);
+    expect(rows.map(row => row.kind)).toEqual(["work", "session-message", "work"]);
+    const [before, sent, after] = rows;
+    if (before?.kind !== "work" || after?.kind !== "work") throw new Error("expected work rows");
+    expect([...before.entries, ...after.entries].map(entry => entry.id)).toEqual([
+      "tool-1",
+      "tool-3",
+    ]);
+    if (sent?.kind !== "session-message") throw new Error("expected the sent row");
+    expect(sent.id).toBe("session-message:tool-call-2");
+    expect(sent.toolPart?.id).toBe("tool-2");
+  });
+
+  it("UT-065: Should keep a failed call inside its card instead of a failed tool row", () => {
+    const rows = deriveSessionRows([
+      sessionPrompt(1, { isError: true, result: { error: "Message chain limit reached." } }),
+      sessionMessagePart("sm-1", "tool-call-1", { state: "error" }),
+    ]);
+    expect(rows.map(row => row.kind)).toEqual(["session-message"]);
+    expect(rows[0]).toMatchObject({ toolPart: { isError: true } });
+  });
+
+  it("UT-065: Should keep a send made inside a provider-native subagent in that subagent's card", () => {
+    // Live stream shape: only the call carries the attribution; its card part inherits it.
+    const childCall = { ...sessionPrompt(2), parentToolCallId: "toolu-native" };
+    const childCard = sessionMessagePart("sm-child", "tool-call-2");
+    const rows = deriveSessionRows([
+      tool(1, {
+        toolName: "Agent",
+        toolCallId: "toolu-native",
+        status: "running",
+        result: undefined,
+      }),
+      subagentPart("sub-native", "toolu-native", { origin: "provider_native" }),
+      childCall,
+      childCard,
+    ]);
+    expect(rows.map(row => row.kind)).toEqual(["subagents"]);
+    const card = rows[0];
+    if (card?.kind !== "subagents") throw new Error("expected the native card");
+    const inner = card.nested.get("sub-native") ?? [];
+    expect(inner.map(part => part.id)).toEqual([childCall.id, childCard.id]);
+    expect(deriveSessionRows(inner).map(row => row.kind)).toEqual(["session-message"]);
+  });
+
+  it("UT-065: Should leave a session_prompt call with no part as a tool row", () => {
+    expect(deriveSessionRows([sessionPrompt(1)]).map(row => row.kind)).toEqual(["work"]);
+  });
+
+  it("Should keep the tool row and draw no raw data row for a part that names no target (#742)", () => {
+    // How an older daemon stored a settled Codex send: the part never named its target.
+    const rows = deriveSessionRows([
+      sessionPrompt(1),
+      sessionMessagePart("sm-1", "tool-call-1", { state: "running", targetSessionId: "" }),
+    ]);
+    expect(rows.map(row => row.kind)).toEqual(["work"]);
+  });
+
+  it("UT-065: Should keep the sent row visible when its settled turn folds", () => {
+    const rows = deriveSessionRows(
+      [
+        tool(1),
+        tool(2),
+        sessionPrompt(3),
+        sessionMessagePart("sm-1", "tool-call-3"),
+        text("t1", "Asked. Waiting for the answer.", "turn-1"),
+      ],
+      { foldSettledTurns: true }
+    );
+    expect(rows.map(row => row.kind)).toEqual(["turn-fold", "session-message", "text"]);
+  });
+});
+
+// Invariant: an allowed permission travels with its tool, without changing persisted parts or
+// counts. Owner: transcript-to-timeline derivation; canonical suite: this file (#1155).
+describe("allowed permission receipts", () => {
+  function permission(
+    id: string,
+    toolCallId: string | undefined,
+    decision: string | null = "allow-once",
+    turnId = "turn-1"
+  ): SessionTimelineDataPart {
+    return {
+      kind: "data",
+      id,
+      name: "data-compozy-permission",
+      data: {
+        type: "permission",
+        request_id: id,
+        turn_id: turnId,
+        title: "Read",
+        ...(toolCallId === undefined ? {} : { tool_call_id: toolCallId }),
+        ...(decision === null ? {} : { decision }),
+      },
+      turnId,
+      timestamp: "2026-07-07T12:00:01Z",
+      state: "done",
+    };
+  }
+
+  const workRows = (rows: readonly SessionRow[]) => rows.filter(row => row.kind === "work");
+
+  it.each([
+    ["before its tool", ["p", 1, 2, 3, 4]],
+    ["after its tool", [1, "p", 2, 3, 4]],
+    ["between two runs", [1, 2, "p", 3, 4]],
+  ])("Should not split the run when the permission arrives %s", (_, order) => {
+    const approval = permission("p", "tool-call-1");
+    const rows = deriveSessionRows(order.map(item => (item === "p" ? approval : tool(+item))));
+
+    expect(rows.map(row => row.kind)).toEqual(["work"]);
+    const [work] = rows;
+    if (work?.kind !== "work") throw new Error("expected one work row");
+    expect(work.summary?.label).toBe("Read 4 files");
+    expect(work.approvals?.get("tool-call-1")).toEqual([approval]);
+  });
+
+  it.each([
+    ["rejected", permission("p", "tool-call-1", "reject-once")],
+    ["pending or expired", permission("p", "tool-call-1", null)],
+    ["without an id", permission("p", undefined)],
+    ["with a blank id", permission("p", "  ")],
+    ["with no matching tool", permission("p", "tool-call-9")],
+    ["from another turn", permission("p", "tool-call-1", "allow-once", "turn-0")],
+  ])("Should keep a permission %s standalone", (_, standing) => {
+    const rows = deriveSessionRows([tool(1), standing, tool(2)]);
+
+    expect(rows.map(row => row.kind)).toEqual(["work", "data", "work"]);
+    expect(workRows(rows).every(row => row.approvals === undefined)).toBe(true);
+  });
+
+  it("Should keep the opened group when a pending permission between runs becomes allowed", () => {
+    const openedId = "work:turn-1:tool-call-3";
+    const anchors = new Map([
+      [
+        "work:turn-1:tool-call-1",
+        {
+          groupId: "work:turn-1:tool-call-1",
+          turnId: "turn-1",
+          anchorEntryId: "tool-call-1",
+        },
+      ],
+      [openedId, { groupId: openedId, turnId: "turn-1", anchorEntryId: "tool-call-3" }],
+    ]);
+    const options = { expandedWorkGroupIds: new Set([openedId]), workGroupAnchors: anchors };
+    const runs = (between: SessionTimelinePart) =>
+      deriveSessionRows([tool(1), tool(2), between, tool(3), tool(4)], options);
+
+    const pending = runs(permission("p", "tool-call-3", null));
+    expect(pending.map(row => row.kind)).toEqual(["work", "data", "work"]);
+    expect(pending[2]).toMatchObject({ id: openedId, expanded: true });
+
+    const allowed = runs(permission("p", "tool-call-3"));
+    expect(allowed.map(row => row.kind)).toEqual(["work"]);
+    expect(allowed[0]).toMatchObject({ id: openedId, expanded: true });
+  });
+
+  it("Should show the receipt of a running call once it stops running", () => {
+    const approval = permission("p", "tool-call-1");
+    const running = deriveSessionRows([tool(1, { status: "running" }), approval], {
+      activeTurnId: "turn-1",
+    });
+    expect(running.map(row => row.kind)).toEqual(["live-tool"]);
+
+    const settled = deriveSessionRows([tool(1), approval], { activeTurnId: "turn-1" });
+    expect(settled.map(row => row.kind)).toEqual(["work"]);
+    expect(workRows(settled)[0]?.approvals?.get("tool-call-1")).toEqual([approval]);
+  });
+
+  it("Should keep a settled receipt behind the turn fold with its tool", () => {
+    const rows = deriveSessionRows(
+      [tool(1), permission("p", "tool-call-1"), tool(2), text("answer", "Done", "turn-1")],
+      { foldSettledTurns: true }
+    );
+
+    expect(rows.map(row => row.kind)).toEqual(["turn-fold", "text"]);
+    const [fold] = rows;
+    if (fold?.kind !== "turn-fold") throw new Error("expected a fold");
+    expect(workRows(fold.rows)[0]?.approvals?.has("tool-call-1")).toBe(true);
+  });
+
+  it("Should not join prose across a receipt that left the flow", () => {
+    const rows = deriveSessionRows([
+      tool(1),
+      text("before", "Before", "turn-1"),
+      permission("p", "tool-call-1"),
+      text("after", "After", "turn-1"),
+    ]);
+
+    expect(rows.map(row => row.kind)).toEqual(["work", "text", "text"]);
+  });
+
+  it("Should treat a changed receipt as a row update", () => {
+    const parts = [tool(1), tool(2)];
+    const [bare] = deriveSessionRows(parts);
+    const [approved] = deriveSessionRows([...parts, permission("p", "tool-call-1")]);
+    const [always] = deriveSessionRows([...parts, permission("p", "tool-call-1", "allow-always")]);
+    if (!bare || !approved || !always) throw new Error("expected work rows");
+
+    expect(sessionRowEqual(bare, approved)).toBe(false);
+    expect(sessionRowEqual(approved, always)).toBe(false);
+    expect(sessionRowEqual(approved, approved)).toBe(true);
+  });
+
+  it("Should reserve height for a receipt the row shows", () => {
+    const content = (...extra: unknown[]) => ({
+      id: "turn-1",
+      role: "assistant",
+      content: [
+        { type: "tool-call", toolCallId: "call-1", toolName: "Read", result: "done" },
+        ...extra,
+      ],
+    });
+    const receipt = {
+      type: "data-compozy-permission",
+      data: { type: "permission", request_id: "p", tool_call_id: "call-1", decision: "allow-once" },
+    };
+
+    expect(estimateMessageSize(content(receipt))).toBeGreaterThan(estimateMessageSize(content()));
+  });
+});

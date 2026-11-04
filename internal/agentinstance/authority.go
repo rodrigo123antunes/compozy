@@ -1,0 +1,108 @@
+package agentinstance
+
+import (
+	"context"
+	"slices"
+	"strings"
+
+	"github.com/compozy/compozy/internal/store"
+	"github.com/compozy/compozy/internal/workspaceaccess"
+)
+
+type Caller struct {
+	SessionID, AgentName, ProfileID, InstanceID string
+	InstanceDepth                               int
+	PermissionPolicy                            store.SessionPermissionPolicy
+	Grant                                       string
+}
+
+type CallerReader interface {
+	InstanceCaller(context.Context, string) (Caller, error)
+}
+
+type Authority struct{ Callers CallerReader }
+
+// AuthorizeMemory requires a daemon-resolved instance lineage for the named agent.
+func (a Authority) AuthorizeMemory(ctx context.Context, sessionID, agentName, profileID string) error {
+	if a.Callers == nil || sessionID == "" {
+		return ErrForbidden
+	}
+	caller, err := a.Callers.InstanceCaller(ctx, sessionID)
+	if err != nil {
+		return err
+	}
+	if caller.InstanceID == "" || caller.AgentName != agentName || caller.ProfileID != profileID {
+		return ErrForbidden
+	}
+	return nil
+}
+
+func (a Authority) Authorize(
+	ctx context.Context,
+	actor workspaceaccess.ActorRef,
+	instance Instance,
+	verb string,
+) error {
+	if actor.Operator {
+		return nil
+	}
+	if actor.Kind != workspaceaccess.ActorAgentSession || actor.SessionID == "" || a.Callers == nil {
+		return ErrForbidden
+	}
+	caller, err := a.Callers.InstanceCaller(ctx, actor.SessionID)
+	if err != nil {
+		return err
+	}
+	if verb == "peers" && caller.InstanceID != "" && caller.ProfileID == instance.ProfileID {
+		return nil // The catalog owner still applies workspace access before pagination.
+	}
+	if caller.InstanceID != instance.ID || caller.AgentName != instance.AgentName ||
+		caller.ProfileID != instance.ProfileID {
+		return ErrForbidden
+	}
+	switch verb {
+	case "list",
+		"reports",
+		"skill_propose",
+		"skill_reviews",
+		"occurrence",
+		"pause",
+		"archive",
+		"ensure_main",
+		"check",
+		"check_dry_run",
+		"checks_off":
+		return nil
+	case "resume":
+		if !OperatorOnlyResume(instance.PauseReason) {
+			return nil
+		}
+	}
+	return ErrForbidden
+}
+
+func IntersectPermissions(a, b store.SessionPermissionPolicy) store.SessionPermissionPolicy {
+	a = store.NormalizeSessionPermissionPolicy(a)
+	b = store.NormalizeSessionPermissionPolicy(b)
+	return store.SessionPermissionPolicy{
+		Tools:          intersectAtoms(a.Tools, b.Tools),
+		Skills:         intersectAtoms(a.Skills, b.Skills),
+		MCPServers:     intersectAtoms(a.MCPServers, b.MCPServers),
+		WorkspacePaths: intersectAtoms(a.WorkspacePaths, b.WorkspacePaths),
+	}
+}
+func intersectAtoms(a, b []string) []string {
+	result := make([]string, 0)
+	for _, atom := range a {
+		if slices.Contains(b, atom) {
+			result = append(result, atom)
+		}
+	}
+	return result
+}
+
+const pauseReasonManual = "manual"
+
+func OperatorOnlyResume(reason string) bool {
+	return !strings.HasPrefix(reason, "definition_")
+}

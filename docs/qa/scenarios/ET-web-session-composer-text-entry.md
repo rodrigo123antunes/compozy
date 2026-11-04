@@ -1,0 +1,65 @@
+---
+id: ET-web-session-composer-text-entry
+area: ET
+title: Preserve exact text in the session composer
+persona: Bruno
+journey: J-17
+expected: In a newly created session, sequential keyboard entry preserves every character including spaces, opening and closing the Next prompt runtime selector does not alter the draft, and the same behavior remains correct after a refresh and deep-link return.
+entry_points: web agent detail New session; web destination session composer; web session deep link
+qa_status: pass
+bug_ids: BUG-20260906-runtime-selector-closing-focus; BUG-20260815-session-composer-draft-reload;BUG-20260825-session-composer-window-fails
+fix_status: fixed
+retest_status: pass
+fix_commits: f54e62b;acbbb25;current-pr-head;current-working-tree
+evidence: docs/qa/evidence/2026-08-26-release-ci-composer/CH-session-composer-text-entry-goal.png;docs/qa/evidence/2026-08-26-release-ci-composer/CH-session-composer-text-entry-deep-link.png
+last_report: docs/qa/reports/2026-08-26-release-ci-composer.md
+overlaps: ET-web-session-prompt-runtime-and-create-navigation; ET-web-runtime-selector-minimal-slider
+---
+
+QA impact 2026-08-02: the assistant-ui store notification owner was corrected after sequential keyboard input dropped spaces in React StrictMode. This scenario owns exact composer text entry; runtime snapshot and dispatch behavior remain owned by the overlapping scenarios.
+
+QA verdict 2026-08-02: passed in an isolated real daemon/Web lab. Sequential typing preserved normal spaces, leading/repeated/trailing spaces, and accented text before and after the runtime selector, refresh, and deep-link remount. No browser console warnings or errors were observed.
+
+QA impact 2026-08-05: reset because the composer input and assistant-ui trigger plumbing changed. The exact-text entry invariant must pass again as the adjacent canary for slash insertion.
+
+QA verdict 2026-08-05: passed in a newly created `slash-operator` session. Sequential keyboard entry preserved leading, repeated, and trailing spaces plus accented text before and after opening the runtime selector, after a full refresh, and from a fresh-browser deep link. No browser errors were observed.
+
+QA impact 2026-08-05 (review remediation): reset because programmatic assistant-ui changes now synchronize through the composer-state owner. Re-walk exact text and refresh persistence on the reviewed head.
+
+QA verdict 2026-08-05 (reviewed head): passed. The composer and persisted transcript retained the Unicode text and repeated spacing in `Revisão 😊 /browser-qa /browser-qa antes   do lançamento`; the same text remained in the session history after a cold Web reload.
+
+QA impact 2026-08-05 (composer redesign): reset — the composer input moved from a textarea to a Lexical contenteditable (@assistant-ui/react-lexical). Re-walk exact character preservation (spaces, Unicode, newlines), draft persistence across remount/refresh/deep link, and runtime-selector interaction with the draft.
+
+QA impact 2026-08-15 (attachments): reset remains `untested` because paste, drop, picker, preview removal, and attachment-aware send now share the composer input path. Re-walk exact text and draft persistence beside attachment interactions.
+
+QA verdict 2026-08-15 (attachments): passed after remediation. Sequential Unicode text and repeated spaces survived the next-prompt runtime selector, full reload, and return to the deep-linked session; only validated non-empty draft text rehydrated.
+
+QA impact 2026-08-25 (Lexical context): reset because the Lexical dependency graph and imperative composer synchronization changed. Re-walk editor mount, exact text entry, refresh persistence, and deep-link return on the corrected dependency graph.
+
+QA verdict 2026-08-25 (Lexical context): passed in the real local daemon/Web environment. A new session mounted the Lexical editor without a session-window error, preserved leading/repeated/trailing spaces and Unicode through the runtime-selector interaction, restored the exact draft from a fresh deep link, and accepted a second exact draft after remount.
+
+QA impact 2026-08-26 (release CI remediation): reset because programmatic draft hydration and
+imperative Lexical clearing changed again while repairing the unified assistant-ui dependency graph.
+
+QA verdict 2026-08-26 (release CI remediation): passed in a fresh isolated daemon and Web lab. The
+composer preserved leading, repeated, and trailing spaces plus emoji and Japanese text through the
+runtime selector and a full reload; a clean-browser deep link rendered the editor and accepted a
+second exact draft without console errors.
+
+QA re-walk 2026-09-06: selecting the runtime, closing with Escape, entering the composer and submitting now preserves composer focus through the popup exit. The provider/model-override browser journey asserts focus after the popup closes and passed with the combined repaired build. Existing model/effort persistence and ordinary Escape restoration also pass. See BUG-20260906-runtime-selector-closing-focus and `.cache/sessions-selector-root-integrated-green.log`.
+
+QA impact 2026-10-05 (dependency upgrades): assistant-ui now commits hydrated text asynchronously.
+Re-walk a nonempty draft through composer remount and project switching; wait for hydration to
+complete, edit the draft again, and confirm neither stale text nor another project replaces it.
+The existing session-thread and empty-desktop suites own the hydration and isolation regressions.
+
+QA verdict 2026-10-05 (dependency upgrades): passed on the production build in an isolated
+daemon/Web lab. Repeated spaces and Unicode survived project remount, subsequent editing and
+full reload. Evidence: `docs/qa/evidence/2026-10-05-dependency-upgrades/draft-reload.json`
+and `draft-reload.png`.
+
+QA review regression 2026-10-05: an edit committed during asynchronous restoration must
+replace the saved draft even when the restored text was never observed. The existing
+session-thread suite verifies this with the real assistant-ui runtime (147 tests passed);
+the regression fails against the preceding implementation. Ordinary remount behavior remains
+covered by the same suite and the production-browser evidence above.

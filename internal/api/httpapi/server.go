@@ -1,371 +1,380 @@
 package httpapi
 
 import (
-	"context"
-	"errors"
 	"fmt"
-	"io/fs"
 	"log/slog"
-	"net"
-	"net/http"
-	"strconv"
-	"strings"
 	"sync"
 	"time"
 
-	"github.com/gin-gonic/gin"
+	authproviders "github.com/compozy/compozy/internal/providers"
+
+	"github.com/compozy/compozy/internal/agentmemory"
+
+	"github.com/compozy/compozy/internal/session"
 
 	"github.com/compozy/compozy/internal/api/core"
+	"github.com/compozy/compozy/internal/api/ginutil"
+	"github.com/compozy/compozy/internal/cmdpalette"
+	compozyconfig "github.com/compozy/compozy/internal/config"
+	"github.com/compozy/compozy/internal/doctor"
+	"github.com/compozy/compozy/internal/store"
+	toolspkg "github.com/compozy/compozy/internal/tools"
+	"github.com/compozy/compozy/internal/workspaceaccess"
+	"github.com/gin-gonic/gin"
 )
 
 const (
-	defaultHost              = "127.0.0.1"
+	serverLocalhostKey       = "localhost"
+	defaultPollInterval      = 100 * time.Millisecond
 	defaultReadHeaderTimeout = 5 * time.Second
+	defaultReadTimeout       = 30 * time.Second
 	defaultIdleTimeout       = 60 * time.Second
 )
-
-// PortUpdater persists the selected HTTP port in daemon state.
-type PortUpdater interface {
-	SetHTTPPort(context.Context, int) error
-}
 
 // Option customizes HTTP server construction.
 type Option func(*Server)
 
-// Server exposes the daemon API over localhost HTTP.
+// Server exposes the daemon API over TCP HTTP.
 type Server struct {
 	mu sync.Mutex
 
-	host        string
-	port        int
-	logger      *slog.Logger
-	handlers    *core.Handlers
-	engine      *gin.Engine
-	portUpdater PortUpdater
-	staticFS    fs.FS
-	devProxy    *devProxyHandler
-	devProxyURL string
+	homePaths             compozyconfig.HomePaths
+	config                compozyconfig.Config
+	configSet             bool
+	host                  string
+	port                  int
+	portSet               bool
+	logger                *slog.Logger
+	startedAt             time.Time
+	now                   func() time.Time
+	pollInterval          time.Duration
+	sessions              core.SessionManager
+	drainController       core.DaemonDrainController
+	subagents             session.SubagentService
+	sessionMonitors       core.SessionMonitorService
+	sessionProcesses      core.SessionProcessService
+	sessionCatalog        core.SessionCatalog
+	taskDesignations      core.TaskDesignationStore
+	skillExposureStore    store.SkillExposureRepository
+	skillExposureEvents   store.EventSummaryStore
+	tasks                 core.TaskService
+	observer              core.Observer
+	schemaStreams         core.SchemaStreamStatusReader
+	automation            core.AutomationManager
+	loops                 core.LoopService
+	profiles              core.ProfileService
+	supportBundles        core.SupportBundleService
+	tools                 core.ToolRegistry
+	toolArtifacts         toolspkg.ToolArtifactStore
+	sessionAttachments    core.SessionAttachmentStore
+	sessionFiles          core.SessionFileSearcher
+	toolsets              core.ToolsetRegistry
+	toolApprovals         core.ToolApprovalIssuer
+	approvalGrants        core.ToolApprovalGrantService
+	approvalCoordinator   toolspkg.ApprovalCoordinator
+	cmdPalette            cmdpalette.Registry
+	clarify               toolspkg.ClarifyBroker
+	settings              core.SettingsService
+	settingsRestart       core.SettingsRestartController
+	settingsUpdate        core.SettingsUpdateController
+	vault                 core.VaultService
+	workspaces            core.WorkspaceService
+	worktrees             core.WorktreeService
+	workspaceAccess       workspaceaccess.Policy
+	onboarding            core.OnboardingStore
+	agentCatalog          core.AgentCatalog
+	agentSync             core.AgentDefinitionSync
+	contextWindowResolver core.ContextWindowResolver
+	modelCatalog          core.ModelCatalogService
+	providerUsage         core.ProviderUsageService
+	marketplaceCatalog    core.MarketplaceCatalogService
+	agentContext          core.AgentContextService
+	coordinatorRole       core.CoordinatorRoleResolver
+	roles                 core.RolesStatusProvider
+	soulAuthoring         core.SoulAuthoringService
+	agentMemory           *agentmemory.Store
+	soulHistoryPurger     core.SoulHistoryPurger
+	soulRefresher         core.SoulRefresher
+	heartbeatAuthor       core.HeartbeatAuthoringService
+	heartbeatPurger       core.HeartbeatHistoryPurger
+	heartbeatStatus       core.HeartbeatStatusService
+	heartbeatWake         core.HeartbeatWakeService
+	agentInstances        *core.AgentInstanceAPI
+	sessionHealth         core.SessionHealthReader
+	wakeEvents            core.HeartbeatWakeEventReader
+	skillsRegistry        core.SkillsRegistry
+	skillResources        core.SkillResourceSyncer
+	runtimeMemory         doctor.RuntimeMemorySnapshotSource
+	hostLoad              doctor.HostLoadSnapshotSource
+	deadEntities          doctor.DeadEntitySource
+	agentLoader           core.AgentLoader
+	resourceAuth          []gin.HandlerFunc
+	httpExtendedServices
 
-	httpServer   *http.Server
-	listener     net.Listener
-	serveDone    chan struct{}
-	serveErr     error
-	streamCancel context.CancelFunc
-	started      bool
+	engine       *gin.Engine
+	handlers     *Handlers
+	staticSource string
+	generation   *serverGeneration
+	state        serverState
 	actualPort   int
+
+	onProviderAuthSuccess func()
+	providerAuthVerdicts  *authproviders.AuthVerdicts
 }
 
-// WithHandlers injects the shared transport handlers.
-func WithHandlers(handlers *core.Handlers) Option {
+// WithSupportBundleService injects the daemon-owned support bundle operation service.
+func WithSupportBundleService(service core.SupportBundleService) Option {
 	return func(server *Server) {
-		server.handlers = handlers
+		server.supportBundles = service
 	}
 }
 
-// WithHost overrides the HTTP bind host.
-func WithHost(host string) Option {
+// WithToolRegistry injects the executable tool registry.
+func WithToolRegistry(registry core.ToolRegistry) Option {
 	return func(server *Server) {
-		server.host = strings.TrimSpace(host)
+		server.tools = registry
 	}
 }
 
-// WithPort overrides the HTTP bind port.
-func WithPort(port int) Option {
+// WithToolsetRegistry injects the named toolset projection registry.
+func WithToolsetRegistry(registry core.ToolsetRegistry) Option {
 	return func(server *Server) {
-		server.port = port
+		server.toolsets = registry
 	}
 }
 
-// WithLogger injects the server logger.
-func WithLogger(logger *slog.Logger) Option {
+// WithSettingsService injects the daemon-owned settings service.
+func WithSettingsService(service core.SettingsService) Option {
 	return func(server *Server) {
-		server.logger = logger
+		server.settings = service
 	}
 }
 
-// WithEngine overrides the Gin engine used by the server.
+// WithSettingsRestartController injects the daemon-owned restart action surface for settings handlers.
+func WithSettingsRestartController(controller core.SettingsRestartController) Option {
+	return func(server *Server) {
+		server.settingsRestart = controller
+	}
+}
+
+// WithSettingsUpdateController injects the daemon-owned update status surface for settings handlers.
+func WithSettingsUpdateController(controller core.SettingsUpdateController) Option {
+	return func(server *Server) {
+		server.settingsUpdate = controller
+	}
+}
+
+// WithVaultService injects the daemon-owned vault control surface.
+func WithVaultService(service core.VaultService) Option {
+	return func(server *Server) {
+		server.vault = service
+	}
+}
+
+// WithWorkspaceResolver injects the runtime workspace resolver/service.
+func WithWorkspaceResolver(workspaces core.WorkspaceService) Option {
+	return func(server *Server) {
+		server.workspaces = workspaces
+	}
+}
+
+// WithWorktreeService injects the workspace-scoped worktree service.
+func WithWorktreeService(worktrees core.WorktreeService) Option {
+	return func(server *Server) {
+		server.worktrees = worktrees
+	}
+}
+
+// WithWorkspaceAccessPolicy injects the cross-workspace decision policy.
+func WithWorkspaceAccessPolicy(policy workspaceaccess.Policy) Option {
+	return func(server *Server) {
+		server.workspaceAccess = policy
+	}
+}
+
+// WithOnboardingStore injects the first-run onboarding completion store.
+func WithOnboardingStore(store core.OnboardingStore) Option {
+	return func(server *Server) {
+		server.onboarding = store
+	}
+}
+
+// WithSkillsRegistry injects the skills registry surfaced by the daemon.
+func WithSkillsRegistry(registry core.SkillsRegistry) Option {
+	return func(server *Server) {
+		server.skillsRegistry = registry
+	}
+}
+
+// WithSkillResourceSyncer injects the resource-backed skill syncer surfaced by the daemon.
+func WithSkillResourceSyncer(syncer core.SkillResourceSyncer) Option {
+	return func(server *Server) {
+		server.skillResources = syncer
+	}
+}
+
+// WithAgentContext injects the bounded agent situation context service.
+func WithAgentContext(service core.AgentContextService) Option {
+	return func(server *Server) {
+		server.agentContext = service
+	}
+}
+
+// WithCoordinatorRole injects the resolved coordinator policy reader.
+func WithCoordinatorRole(resolver core.CoordinatorRoleResolver) Option {
+	return func(server *Server) {
+		server.coordinatorRole = resolver
+	}
+}
+
+// WithRolesStatusProvider injects the effective role configuration reader.
+func WithRolesStatusProvider(provider core.RolesStatusProvider) Option {
+	return func(server *Server) {
+		server.roles = provider
+	}
+}
+
+// WithSessionHealthReader injects the metadata-only session health reader.
+func WithSessionHealthReader(reader core.SessionHealthReader) Option {
+	return func(server *Server) {
+		server.sessionHealth = reader
+	}
+}
+
+// WithAgentLoader overrides agent definition loading.
+func WithAgentLoader(loader core.AgentLoader) Option {
+	return func(server *Server) {
+		server.agentLoader = loader
+	}
+}
+
+// WithResourceService injects the shared operator-facing desired-state resource service.
+func WithResourceService(service core.ResourceService) Option {
+	return func(server *Server) {
+		server.resources = service
+	}
+}
+
+// WithResourceOperatorAuth gates HTTP resource routes behind explicit operator auth middleware.
+func WithResourceOperatorAuth(middleware ...gin.HandlerFunc) Option {
+	return func(server *Server) {
+		server.resourceAuth = append([]gin.HandlerFunc(nil), middleware...)
+	}
+}
+
+// WithExtensionService injects daemon-backed extension management handlers.
+func WithExtensionService(service ExtensionService) Option {
+	return func(server *Server) {
+		server.extensions = service
+	}
+}
+
+// WithEngine overrides the Gin engine used by the server, mainly for tests.
 func WithEngine(engine *gin.Engine) Option {
 	return func(server *Server) {
 		server.engine = engine
 	}
 }
 
-// WithPortUpdater persists the selected port after the listener binds.
-func WithPortUpdater(updater PortUpdater) Option {
-	return func(server *Server) {
-		server.portUpdater = updater
-	}
-}
-
-// WithDevProxyTarget enables development fallback proxying to a Vite server.
-func WithDevProxyTarget(target string) Option {
-	return func(server *Server) {
-		server.devProxyURL = strings.TrimSpace(target)
-	}
-}
-
-// New constructs a localhost HTTP API server.
+// New constructs an HTTP API server.
 func New(opts ...Option) (*Server, error) {
-	server := &Server{
-		host:   defaultHost,
-		port:   0,
-		logger: slog.Default(),
+	homePaths, err := compozyconfig.ResolveHomePaths()
+	if err != nil {
+		return nil, fmt.Errorf("httpapi: resolve home paths: %w", err)
 	}
-	for _, opt := range opts {
-		if opt != nil {
-			opt(server)
-		}
-	}
+
+	server := newDefaultServer(homePaths)
+	applyOptions(server, opts)
 	if err := server.finalize(); err != nil {
 		return nil, err
 	}
+
+	staticSource, err := newStaticFS()
+	if err != nil {
+		return nil, fmt.Errorf("httpapi: load frontend bundle: %w", err)
+	}
+	server.ensureEngine()
+	server.staticSource = staticSource.source
+	server.handlers = newHandlers(server.handlerConfig(staticSource.fs))
+	ginutil.QuietDebug(func() {
+		registerGatewayChallengeRoute(
+			server.engine,
+			server.surfaceSet,
+			server.gatewayTier,
+			server.gatewayChallenges,
+		)
+		RegisterSurfaceRoutes(server.engine, server.handlers, server.surfaceSet)
+	})
+
 	return server, nil
 }
 
-func (s *Server) finalize() error {
-	if s.handlers == nil {
-		return errors.New("httpapi: handlers are required")
+// WithProviderAuthVerdicts shares the daemon's last live provider sign-in verdicts.
+func WithProviderAuthVerdicts(verdicts *authproviders.AuthVerdicts) Option {
+	return func(server *Server) {
+		server.providerAuthVerdicts = verdicts
 	}
-	s.handlers = s.handlers.Clone()
-	if strings.TrimSpace(s.host) == "" {
-		s.host = defaultHost
-	}
-	if s.host != defaultHost {
-		return fmt.Errorf("httpapi: host must be %s", defaultHost)
-	}
-	if s.port < 0 || s.port > 65535 {
-		return fmt.Errorf("httpapi: invalid port %d", s.port)
-	}
-	if s.devProxyURL != "" {
-		devProxy, err := newDevProxyHandler(s.devProxyURL)
-		if err != nil {
-			return fmt.Errorf("httpapi: configure development frontend proxy: %w", err)
-		}
-		s.devProxy = devProxy
-	} else {
-		staticFS, err := newStaticFS()
-		if err != nil {
-			return fmt.Errorf("httpapi: load embedded frontend bundle: %w", err)
-		}
-		s.staticFS = staticFS
-	}
-	s.ensureEngine()
-	return nil
 }
 
-func (s *Server) ensureEngine() {
-	if s.engine != nil {
-		return
+// WithProviderAuthSuccess observes a successful live authentication probe.
+func WithProviderAuthSuccess(callback func()) Option {
+	return func(server *Server) {
+		server.onProviderAuthSuccess = callback
 	}
-
-	s.engine = gin.New()
-	s.engine.Use(core.RequestIDMiddleware())
-	s.engine.Use(gin.CustomRecovery(func(c *gin.Context, recovered any) {
-		core.RespondError(
-			c,
-			core.NewProblem(
-				http.StatusInternalServerError,
-				"internal_error",
-				http.StatusText(http.StatusInternalServerError),
-				nil,
-				fmt.Errorf("panic: %v", recovered),
-			),
-		)
-	}))
-	s.engine.Use(core.ErrorMiddleware())
-	if s.devProxy != nil {
-		s.engine.Use(devProxySecurityHeadersMiddleware())
-	} else {
-		s.engine.Use(securityHeadersMiddleware())
-	}
-	s.engine.Use(s.hostValidationMiddleware())
-	s.engine.Use(s.originValidationMiddleware())
-	s.engine.Use(s.activeWorkspaceMiddleware())
-	s.engine.Use(s.csrfMiddleware())
-	if s.devProxy != nil {
-		RegisterRoutes(s.engine, s.handlers, s.devProxy.serve)
-		return
-	}
-	staticHandler := newStaticHandler(s.staticFS, s.handlers.Now())
-	if staticHandler != nil {
-		RegisterRoutes(s.engine, s.handlers, staticHandler.serve)
-		return
-	}
-	RegisterRoutes(s.engine, s.handlers)
 }
 
-// Port reports the effective HTTP port.
-func (s *Server) Port() int {
-	if s == nil {
-		return 0
-	}
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	if s.actualPort > 0 {
-		return s.actualPort
-	}
-	return s.port
+// WithTaskDesignationStore injects persisted task fan-out summaries.
+func WithTaskDesignationStore(value core.TaskDesignationStore) Option {
+	return func(server *Server) { server.taskDesignations = value }
 }
 
-func (s *Server) reserveStart() error {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	if s.started {
-		return errors.New("httpapi: server already started")
-	}
-	s.started = true
-	return nil
+// WithSkillExposureStore injects the durable skill exposure projection and ledger.
+func WithSkillExposureStore(repository store.SkillExposureRepository, events store.EventSummaryStore) Option {
+	return func(server *Server) { server.skillExposureStore = repository; server.skillExposureEvents = events }
 }
 
-func (s *Server) rollbackStart() {
-	s.mu.Lock()
-	s.httpServer = nil
-	s.listener = nil
-	s.serveDone = nil
-	s.serveErr = nil
-	s.streamCancel = nil
-	s.started = false
-	s.actualPort = 0
-	s.mu.Unlock()
+// WithSoulAuthoring injects the managed Soul authoring surface.
+func WithSoulAuthoring(service core.SoulAuthoringService) Option {
+	return func(server *Server) {
+		server.soulAuthoring = service
+	}
 }
 
-func (s *Server) publishStartState(
-	streamDone <-chan struct{},
-	httpServer *http.Server,
-	ln net.Listener,
-	serveDone chan struct{},
-	streamCancel context.CancelFunc,
-	actualPort int,
-) {
-	s.mu.Lock()
-	s.handlers.SetStreamDone(streamDone)
-	s.handlers.SetHTTPPort(actualPort)
-	s.httpServer = httpServer
-	s.listener = ln
-	s.serveDone = serveDone
-	s.serveErr = nil
-	s.streamCancel = streamCancel
-	s.actualPort = actualPort
-	s.mu.Unlock()
+// WithSoulRefresher injects the session Soul refresh surface.
+func WithSoulRefresher(service core.SoulRefresher) Option {
+	return func(server *Server) {
+		server.soulRefresher = service
+	}
 }
 
-// Start begins serving the API over localhost TCP.
-func (s *Server) Start(ctx context.Context) error {
-	if s == nil {
-		return errors.New("httpapi: server is required")
+// WithHeartbeatAuthoring injects the managed Heartbeat authoring surface.
+func WithHeartbeatAuthoring(service core.HeartbeatAuthoringService) Option {
+	return func(server *Server) {
+		server.heartbeatAuthor = service
 	}
-	if ctx == nil {
-		return errors.New("httpapi: start context is required")
-	}
-	if err := ctx.Err(); err != nil {
-		return err
-	}
-
-	if err := s.reserveStart(); err != nil {
-		return err
-	}
-
-	address := net.JoinHostPort(s.host, strconv.Itoa(s.port))
-	var listenConfig net.ListenConfig
-	ln, err := listenConfig.Listen(ctx, "tcp", address)
-	if err != nil {
-		s.rollbackStart()
-		return fmt.Errorf("httpapi: listen on %q: %w", address, err)
-	}
-
-	actualPort := s.port
-	if tcpAddr, ok := ln.Addr().(*net.TCPAddr); ok && tcpAddr.Port > 0 {
-		actualPort = tcpAddr.Port
-	}
-	if s.portUpdater != nil {
-		if err := s.portUpdater.SetHTTPPort(ctx, actualPort); err != nil {
-			_ = ln.Close()
-			s.rollbackStart()
-			return fmt.Errorf("httpapi: persist http port: %w", err)
-		}
-	}
-
-	streamCtx, streamCancel := context.WithCancel(context.Background())
-	httpServer := &http.Server{
-		Handler:           s.engine,
-		ReadHeaderTimeout: defaultReadHeaderTimeout,
-		IdleTimeout:       defaultIdleTimeout,
-	}
-	serveDone := make(chan struct{})
-
-	s.publishStartState(streamCtx.Done(), httpServer, ln, serveDone, streamCancel, actualPort)
-
-	go func() {
-		defer close(serveDone)
-		if err := httpServer.Serve(ln); err != nil &&
-			!errors.Is(err, http.ErrServerClosed) &&
-			!errors.Is(err, net.ErrClosed) {
-			s.mu.Lock()
-			s.serveErr = fmt.Errorf("httpapi: serve %q: %w", address, err)
-			s.mu.Unlock()
-		}
-	}()
-
-	return nil
 }
 
-// Shutdown stops accepting new requests and drains active ones.
-func (s *Server) Shutdown(ctx context.Context) error {
-	if s == nil {
-		return nil
+// WithHeartbeatStatus injects the Heartbeat status/read surface.
+func WithHeartbeatStatus(service core.HeartbeatStatusService) Option {
+	return func(server *Server) {
+		server.heartbeatStatus = service
 	}
-	if ctx == nil {
-		ctx = context.Background()
-	}
-
-	s.mu.Lock()
-	httpServer := s.httpServer
-	listener := s.listener
-	serveDone := s.serveDone
-	streamCancel := s.streamCancel
-	serveErr := s.serveErr
-	s.httpServer = nil
-	s.listener = nil
-	s.serveDone = nil
-	s.streamCancel = nil
-	s.serveErr = nil
-	s.started = false
-	s.actualPort = 0
-	s.mu.Unlock()
-
-	var errs []error
-	if streamCancel != nil {
-		streamCancel()
-	}
-	if httpServer != nil {
-		if err := httpServer.Shutdown(ctx); err != nil {
-			errs = append(errs, fmt.Errorf("httpapi: shutdown http server: %w", err))
-		}
-	}
-	if listener != nil {
-		if err := listener.Close(); err != nil && !errors.Is(err, net.ErrClosed) {
-			errs = append(errs, fmt.Errorf("httpapi: close listener: %w", err))
-		}
-	}
-	if serveDone != nil {
-		if err := waitForServeDone(ctx, serveDone); err != nil {
-			errs = append(errs, err)
-		}
-	}
-	if serveErr != nil {
-		errs = append(errs, serveErr)
-	}
-	return errors.Join(errs...)
 }
 
-func waitForServeDone(ctx context.Context, done <-chan struct{}) error {
-	if done == nil {
-		return nil
+// WithHeartbeatWake injects the manual Heartbeat wake surface.
+func WithHeartbeatWake(service core.HeartbeatWakeService) Option {
+	return func(server *Server) {
+		server.heartbeatWake = service
 	}
-	select {
-	case <-done:
-		return nil
-	case <-ctx.Done():
-		return fmt.Errorf("httpapi: wait for serve shutdown: %w", ctx.Err())
+}
+
+// WithHeartbeatWakeEventReader injects the retained Heartbeat wake audit reader.
+func WithHeartbeatWakeEventReader(reader core.HeartbeatWakeEventReader) Option {
+	return func(server *Server) {
+		server.wakeEvents = reader
 	}
+}
+
+func WithAgentInstances(api *core.AgentInstanceAPI) Option {
+	return func(server *Server) { server.agentInstances = api }
 }

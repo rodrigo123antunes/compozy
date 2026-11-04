@@ -1,0 +1,76 @@
+package session
+
+import (
+	"context"
+	"errors"
+
+	"github.com/compozy/compozy/internal/events"
+)
+
+func (m *Manager) finishRecoveredStop(ctx context.Context, id string) error {
+	cleanupCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), defaultLifecycleTimeout)
+	defer cancel()
+	meta, err := m.readMetaWithContext(cleanupCtx, id)
+	if err != nil {
+		return err
+	}
+	snapshot := NotificationSessionFromInfo(m.sessionInfoFromMeta(cleanupCtx, &meta))
+	m.clearResumeReplay(id)
+	if m.hostedMCP != nil {
+		m.hostedMCP.ReleaseSession(id)
+	}
+	m.dispatchSessionPostStop(cleanupCtx, snapshot)
+	if m.notifier != nil {
+		m.notifier.OnSessionStopped(cleanupCtx, snapshot)
+	}
+	return nil
+}
+
+// settleRecoveredStop replays persistence, Goal cancellation and task recovery
+// before releasing the durable stop receipt.
+func (m *Manager) settleRecoveredStop(
+	ctx context.Context,
+	run *sessionStopRun,
+	settlement *recoveredStopSettlement,
+) error {
+	settleCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), defaultLifecycleTimeout)
+	defer cancel()
+	outcome := settlement.outcome
+	if outcome.Verified {
+		if err := m.writeRecoveredStopReceipt(run.recoveredID, settlement); err != nil {
+			return err
+		}
+	}
+	if err := m.persistRecoveredStop(settleCtx, run.recoveredID, outcome, settlement.detail, settlement); err != nil {
+		return err
+	}
+	eventType := events.SessionStopVerificationFailed
+	if outcome.Verified {
+		eventType = EventTypeSessionStopped
+	}
+	if err := m.recordRecoveredStopEvent(settleCtx, run.recoveredID, settlement, eventType, outcome); err != nil {
+		return err
+	}
+	if !outcome.Verified {
+		return nil
+	}
+	meta, err := m.readMetaWithContext(settleCtx, run.recoveredID)
+	if err != nil {
+		return errors.Join(ErrRecoveryPersistence, err)
+	}
+	info := m.sessionInfoFromMeta(settleCtx, &meta)
+	info.StopCause = outcome.Cause
+	if err := m.stopSessionGoals(settleCtx, info); err != nil {
+		return errors.Join(ErrRecoveryPersistence, err)
+	}
+	if err := m.recoverSupervisedWork(settleCtx, info, settlement.turnID); err != nil {
+		return err
+	}
+	if err := m.removeRecoveredStopReceipt(run.recoveredID); err != nil {
+		return err
+	}
+	m.mu.Lock()
+	run.recoveredSettlement = nil
+	m.mu.Unlock()
+	return m.finishRecoveredStop(ctx, run.recoveredID)
+}

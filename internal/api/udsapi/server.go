@@ -4,23 +4,50 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log/slog"
 	"net"
 	"net/http"
-	"os"
-	"path/filepath"
-	"strings"
 	"sync"
 	"time"
 
-	"github.com/gin-gonic/gin"
+	authproviders "github.com/compozy/compozy/internal/providers"
 
-	"github.com/compozy/compozy/internal/api/core"
+	"github.com/compozy/compozy/internal/agentmemory"
+
+	"github.com/compozy/compozy/internal/session"
+
+	core "github.com/compozy/compozy/internal/api/core"
+	"github.com/compozy/compozy/internal/cmdpalette"
 	compozyconfig "github.com/compozy/compozy/internal/config"
+	"github.com/compozy/compozy/internal/doctor"
+	mcppkg "github.com/compozy/compozy/internal/mcp"
+	"github.com/compozy/compozy/internal/store"
+	toolspkg "github.com/compozy/compozy/internal/tools"
+	"github.com/compozy/compozy/internal/workspaceaccess"
+	"github.com/gin-gonic/gin"
 )
 
 const (
+	defaultPollInterval      = 100 * time.Millisecond
 	defaultReadHeaderTimeout = 5 * time.Second
 	defaultIdleTimeout       = 60 * time.Second
+	maxSocketPathBytes       = 103
+)
+
+var (
+	ErrSessionManagerRequired    = errors.New("udsapi: session manager is required")
+	ErrTaskServiceRequired       = errors.New("udsapi: task service is required")
+	ErrObserverRequired          = errors.New("udsapi: observer is required")
+	ErrWorkspaceResolverRequired = errors.New("udsapi: workspace resolver is required")
+	ErrSocketPathTooLong         = errors.New("udsapi: socket path too long")
+)
+
+type serverState uint8
+
+const (
+	serverStateStopped serverState = iota
+	serverStateRunning
+	serverStateStopping
 )
 
 // Option customizes UDS server construction.
@@ -30,297 +57,323 @@ type Option func(*Server)
 type Server struct {
 	mu sync.Mutex
 
-	socketPath string
-	handlers   *core.Handlers
-	engine     *gin.Engine
+	homePaths             compozyconfig.HomePaths
+	config                compozyconfig.Config
+	configSet             bool
+	socketPath            string
+	logger                *slog.Logger
+	startedAt             time.Time
+	now                   func() time.Time
+	pollInterval          time.Duration
+	sessions              core.SessionManager
+	drainController       core.DaemonDrainController
+	subagents             session.SubagentService
+	sessionMonitors       core.SessionMonitorService
+	sessionProcesses      core.SessionProcessService
+	sessionCatalog        core.SessionCatalog
+	taskDesignations      core.TaskDesignationStore
+	skillExposureStore    store.SkillExposureRepository
+	skillExposureEvents   store.EventSummaryStore
+	tasks                 core.TaskService
+	observer              core.Observer
+	schemaStreams         core.SchemaStreamStatusReader
+	automation            core.AutomationManager
+	loops                 core.LoopService
+	profiles              core.ProfileService
+	supportBundles        core.SupportBundleService
+	tools                 core.ToolRegistry
+	toolArtifacts         toolspkg.ToolArtifactStore
+	sessionAttachments    core.SessionAttachmentStore
+	sessionFiles          core.SessionFileSearcher
+	toolsets              core.ToolsetRegistry
+	toolApprovals         core.ToolApprovalIssuer
+	approvalGrants        core.ToolApprovalGrantService
+	approvalCoordinator   toolspkg.ApprovalCoordinator
+	cmdPalette            cmdpalette.Registry
+	clarify               toolspkg.ClarifyBroker
+	settings              core.SettingsService
+	settingsRestart       core.SettingsRestartController
+	settingsUpdate        core.SettingsUpdateController
+	vault                 core.VaultService
+	workspaces            core.WorkspaceService
+	worktrees             core.WorktreeService
+	workspaceAccess       workspaceaccess.Policy
+	onboarding            core.OnboardingStore
+	agentCatalog          core.AgentCatalog
+	agentSync             core.AgentDefinitionSync
+	contextWindowResolver core.ContextWindowResolver
+	modelCatalog          core.ModelCatalogService
+	providerUsage         core.ProviderUsageService
+	marketplaceCatalog    core.MarketplaceCatalogService
+	agentContext          core.AgentContextService
+	soulAuthoring         core.SoulAuthoringService
+	agentMemory           *agentmemory.Store
+	soulHistoryPurger     core.SoulHistoryPurger
+	soulRefresher         core.SoulRefresher
+	heartbeatAuthor       core.HeartbeatAuthoringService
+	heartbeatPurger       core.HeartbeatHistoryPurger
+	heartbeatStatus       core.HeartbeatStatusService
+	heartbeatWake         core.HeartbeatWakeService
+	agentInstances        *core.AgentInstanceAPI
+	sessionHealth         core.SessionHealthReader
+	wakeEvents            core.HeartbeatWakeEventReader
+	coordinatorRole       core.CoordinatorRoleResolver
+	roles                 core.RolesStatusProvider
+	skillsRegistry        core.SkillsRegistry
+	skillResources        core.SkillResourceSyncer
+	runtimeMemory         doctor.RuntimeMemorySnapshotSource
+	hostLoad              doctor.HostLoadSnapshotSource
+	deadEntities          doctor.DeadEntitySource
+	agentLoader           core.AgentLoader
+	udsExtendedServices
 
+	engine       *gin.Engine
+	handlers     *Handlers
 	httpServer   *http.Server
 	listener     net.Listener
 	serveDone    chan struct{}
 	serveErr     error
 	streamCancel context.CancelFunc
-	started      bool
+	state        serverState
+
+	onProviderAuthSuccess func()
+	providerAuthVerdicts  *authproviders.AuthVerdicts
 }
 
-// WithHandlers injects the shared transport handlers.
-func WithHandlers(handlers *core.Handlers) Option {
+// Handlers expose request/response and SSE endpoints for the Compozy API.
+type Handlers struct {
+	*core.BaseHandlers
+	Extensions ExtensionService
+	HostedMCP  *mcppkg.HostedService
+	MCPHostAPI mcppkg.HostAPIInvoker
+}
+
+// WithResourceService injects the shared operator-facing desired-state resource service.
+func WithResourceService(service core.ResourceService) Option {
 	return func(server *Server) {
-		server.handlers = handlers
+		server.resources = service
 	}
 }
 
-// WithSocketPath overrides the Unix socket path.
-func WithSocketPath(path string) Option {
+// WithSupportBundleService injects the daemon-owned support bundle operation service.
+func WithSupportBundleService(service core.SupportBundleService) Option {
 	return func(server *Server) {
-		server.socketPath = strings.TrimSpace(path)
+		server.supportBundles = service
 	}
 }
 
-// WithEngine overrides the Gin engine used by the server.
+// WithToolRegistry injects the executable tool registry.
+func WithToolRegistry(registry core.ToolRegistry) Option {
+	return func(server *Server) {
+		server.tools = registry
+	}
+}
+
+// WithToolsetRegistry injects the named toolset projection registry.
+func WithToolsetRegistry(registry core.ToolsetRegistry) Option {
+	return func(server *Server) {
+		server.toolsets = registry
+	}
+}
+
+// WithSettingsService injects the daemon-owned settings service.
+func WithSettingsService(service core.SettingsService) Option {
+	return func(server *Server) {
+		server.settings = service
+	}
+}
+
+// WithSettingsRestartController injects the daemon-owned restart action surface for settings handlers.
+func WithSettingsRestartController(controller core.SettingsRestartController) Option {
+	return func(server *Server) {
+		server.settingsRestart = controller
+	}
+}
+
+// WithSettingsUpdateController injects the daemon-owned update status surface for settings handlers.
+func WithSettingsUpdateController(controller core.SettingsUpdateController) Option {
+	return func(server *Server) {
+		server.settingsUpdate = controller
+	}
+}
+
+// WithVaultService injects the daemon-owned vault control surface.
+func WithVaultService(service core.VaultService) Option {
+	return func(server *Server) {
+		server.vault = service
+	}
+}
+
+// WithWorkspaceResolver injects the runtime workspace resolver/service.
+func WithWorkspaceResolver(workspaces core.WorkspaceService) Option {
+	return func(server *Server) {
+		server.workspaces = workspaces
+	}
+}
+
+// WithWorktreeService injects the workspace-scoped worktree service.
+func WithWorktreeService(worktrees core.WorktreeService) Option {
+	return func(server *Server) {
+		server.worktrees = worktrees
+	}
+}
+
+// WithWorkspaceAccessPolicy injects the cross-workspace decision policy.
+func WithWorkspaceAccessPolicy(policy workspaceaccess.Policy) Option {
+	return func(server *Server) {
+		server.workspaceAccess = policy
+	}
+}
+
+// WithOnboardingStore injects the first-run onboarding completion store.
+func WithOnboardingStore(store core.OnboardingStore) Option {
+	return func(server *Server) {
+		server.onboarding = store
+	}
+}
+
+// WithSkillsRegistry injects the skills registry surfaced by the daemon.
+func WithSkillsRegistry(registry core.SkillsRegistry) Option {
+	return func(server *Server) {
+		server.skillsRegistry = registry
+	}
+}
+
+// WithSkillResourceSyncer injects the resource-backed skill syncer surfaced by the daemon.
+func WithSkillResourceSyncer(syncer core.SkillResourceSyncer) Option {
+	return func(server *Server) {
+		server.skillResources = syncer
+	}
+}
+
+// WithAgentContext injects the bounded agent situation context service.
+func WithAgentContext(service core.AgentContextService) Option {
+	return func(server *Server) {
+		server.agentContext = service
+	}
+}
+
+// WithSessionHealthReader injects the metadata-only session health reader.
+func WithSessionHealthReader(reader core.SessionHealthReader) Option {
+	return func(server *Server) {
+		server.sessionHealth = reader
+	}
+}
+
+// WithCoordinatorRole injects the resolved coordinator policy reader.
+func WithCoordinatorRole(resolver core.CoordinatorRoleResolver) Option {
+	return func(server *Server) {
+		server.coordinatorRole = resolver
+	}
+}
+
+// WithRolesStatusProvider injects the effective role configuration reader.
+func WithRolesStatusProvider(provider core.RolesStatusProvider) Option {
+	return func(server *Server) {
+		server.roles = provider
+	}
+}
+
+// WithAgentLoader overrides agent definition loading.
+func WithAgentLoader(loader core.AgentLoader) Option {
+	return func(server *Server) {
+		server.agentLoader = loader
+	}
+}
+
+// WithEngine overrides the Gin engine used by the server, mainly for tests.
 func WithEngine(engine *gin.Engine) Option {
 	return func(server *Server) {
 		server.engine = engine
 	}
 }
 
-// New constructs a UDS API server.
+// New constructs a Unix domain socket API server.
 func New(opts ...Option) (*Server, error) {
-	server := &Server{}
-	for _, opt := range opts {
-		if opt != nil {
-			opt(server)
-		}
+	homePaths, err := compozyconfig.ResolveHomePaths()
+	if err != nil {
+		return nil, fmt.Errorf("udsapi: resolve home paths: %w", err)
 	}
-	if strings.TrimSpace(server.socketPath) == "" {
-		paths, err := compozyconfig.ResolveHomePaths()
-		if err != nil {
-			return nil, fmt.Errorf("udsapi: resolve home paths: %w", err)
-		}
-		server.socketPath = paths.SocketPath
-	}
+
+	server := newDefaultServer(homePaths)
+	applyOptions(server, opts)
 	if err := server.finalize(); err != nil {
 		return nil, err
 	}
+
+	server.ensureEngine()
+	server.handlers = newHandlers(server.handlerConfig())
+	registerRoutes(server.engine, server.handlers)
+
 	return server, nil
 }
 
-func (s *Server) finalize() error {
-	if s.handlers == nil {
-		return errors.New("udsapi: handlers are required")
-	}
-	s.handlers = s.handlers.Clone()
-	if strings.TrimSpace(s.socketPath) == "" {
-		return errors.New("udsapi: socket path is required")
-	}
-	s.ensureEngine()
-	return nil
-}
-
-func (s *Server) ensureEngine() {
-	if s.engine != nil {
-		return
-	}
-
-	s.engine = gin.New()
-	s.engine.Use(core.RequestIDMiddleware())
-	s.engine.Use(gin.CustomRecovery(func(c *gin.Context, recovered any) {
-		core.RespondError(
-			c,
-			core.NewProblem(
-				http.StatusInternalServerError,
-				"internal_error",
-				http.StatusText(http.StatusInternalServerError),
-				nil,
-				fmt.Errorf("panic: %v", recovered),
-			),
-		)
-	}))
-	s.engine.Use(core.ErrorMiddleware())
-	RegisterRoutes(s.engine, s.handlers)
-}
-
-// Path reports the served Unix domain socket path.
-func (s *Server) Path() string {
-	if s == nil {
-		return ""
-	}
-	return s.socketPath
-}
-
-func (s *Server) reserveStart() error {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	if s.started {
-		return errors.New("udsapi: server already started")
-	}
-	s.started = true
-	return nil
-}
-
-func (s *Server) rollbackStart() {
-	s.mu.Lock()
-	s.httpServer = nil
-	s.listener = nil
-	s.serveDone = nil
-	s.serveErr = nil
-	s.streamCancel = nil
-	s.started = false
-	s.mu.Unlock()
-}
-
-func (s *Server) publishStartState(
-	streamDone <-chan struct{},
-	httpServer *http.Server,
-	ln net.Listener,
-	serveDone chan struct{},
-	streamCancel context.CancelFunc,
-) {
-	s.mu.Lock()
-	s.handlers.SetStreamDone(streamDone)
-	s.httpServer = httpServer
-	s.listener = ln
-	s.serveDone = serveDone
-	s.serveErr = nil
-	s.streamCancel = streamCancel
-	s.mu.Unlock()
-}
-
-// Start begins serving the API over the configured Unix domain socket.
-func (s *Server) Start(ctx context.Context) error {
-	if s == nil {
-		return errors.New("udsapi: server is required")
-	}
-	if ctx == nil {
-		return errors.New("udsapi: start context is required")
-	}
-	if err := ctx.Err(); err != nil {
-		return err
-	}
-
-	if err := s.reserveStart(); err != nil {
-		return err
-	}
-
-	socketPath := strings.TrimSpace(s.socketPath)
-	if err := ensureSocketParentDir(socketPath); err != nil {
-		s.rollbackStart()
-		return err
-	}
-	if err := removeSocketPath(socketPath); err != nil {
-		s.rollbackStart()
-		return err
-	}
-
-	var listenConfig net.ListenConfig
-	ln, err := listenConfig.Listen(ctx, "unix", socketPath)
-	if err != nil {
-		s.rollbackStart()
-		return fmt.Errorf("udsapi: listen on %q: %w", socketPath, err)
-	}
-	if err := os.Chmod(socketPath, 0o600); err != nil {
-		_ = ln.Close()
-		_ = os.Remove(socketPath)
-		s.rollbackStart()
-		return fmt.Errorf("udsapi: chmod socket %q: %w", socketPath, err)
-	}
-
-	streamCtx, streamCancel := context.WithCancel(context.Background())
-	httpServer := &http.Server{
-		Handler:           s.engine,
-		ReadHeaderTimeout: defaultReadHeaderTimeout,
-		IdleTimeout:       defaultIdleTimeout,
-	}
-	serveDone := make(chan struct{})
-
-	s.publishStartState(streamCtx.Done(), httpServer, ln, serveDone, streamCancel)
-
-	go func() {
-		defer close(serveDone)
-		if err := httpServer.Serve(ln); err != nil &&
-			!errors.Is(err, http.ErrServerClosed) &&
-			!errors.Is(err, net.ErrClosed) {
-			s.mu.Lock()
-			s.serveErr = fmt.Errorf("udsapi: serve %q: %w", socketPath, err)
-			s.mu.Unlock()
-		}
-	}()
-
-	return nil
-}
-
-// Shutdown stops accepting new requests, drains active ones, and removes the socket file.
-func (s *Server) Shutdown(ctx context.Context) error {
-	if s == nil {
-		return nil
-	}
-	if ctx == nil {
-		ctx = context.Background()
-	}
-
-	s.mu.Lock()
-	httpServer := s.httpServer
-	listener := s.listener
-	serveDone := s.serveDone
-	streamCancel := s.streamCancel
-	socketPath := s.socketPath
-	serveErr := s.serveErr
-	s.httpServer = nil
-	s.listener = nil
-	s.serveDone = nil
-	s.streamCancel = nil
-	s.serveErr = nil
-	s.started = false
-	s.mu.Unlock()
-
-	var errs []error
-	if streamCancel != nil {
-		streamCancel()
-	}
-	if httpServer != nil {
-		if err := httpServer.Shutdown(ctx); err != nil {
-			errs = append(errs, fmt.Errorf("udsapi: shutdown http server: %w", err))
-		}
-	}
-	if listener != nil {
-		if err := listener.Close(); err != nil && !errors.Is(err, net.ErrClosed) {
-			errs = append(errs, fmt.Errorf("udsapi: close listener: %w", err))
-		}
-	}
-	if serveDone != nil {
-		if err := waitForServeDone(ctx, serveDone); err != nil {
-			errs = append(errs, err)
-		}
-	}
-	if err := removeSocketPath(socketPath); err != nil {
-		errs = append(errs, err)
-	}
-	if serveErr != nil {
-		errs = append(errs, serveErr)
-	}
-	return errors.Join(errs...)
-}
-
-func waitForServeDone(ctx context.Context, done <-chan struct{}) error {
-	if done == nil {
-		return nil
-	}
-	select {
-	case <-done:
-		return nil
-	case <-ctx.Done():
-		return fmt.Errorf("udsapi: wait for serve shutdown: %w", ctx.Err())
+// WithProviderAuthVerdicts shares the daemon's last live provider sign-in verdicts.
+func WithProviderAuthVerdicts(verdicts *authproviders.AuthVerdicts) Option {
+	return func(server *Server) {
+		server.providerAuthVerdicts = verdicts
 	}
 }
 
-func ensureSocketParentDir(path string) error {
-	cleanPath := strings.TrimSpace(path)
-	if cleanPath == "" {
-		return errors.New("udsapi: socket path is required")
+// WithProviderAuthSuccess observes a successful live authentication probe.
+func WithProviderAuthSuccess(callback func()) Option {
+	return func(server *Server) {
+		server.onProviderAuthSuccess = callback
 	}
-	if err := os.MkdirAll(filepath.Dir(cleanPath), 0o700); err != nil {
-		return fmt.Errorf("udsapi: create socket directory for %q: %w", cleanPath, err)
-	}
-	return nil
 }
 
-func removeSocketPath(path string) error {
-	cleanPath := strings.TrimSpace(path)
-	if cleanPath == "" {
-		return nil
-	}
+// WithTaskDesignationStore injects persisted task fan-out summaries.
+func WithTaskDesignationStore(value core.TaskDesignationStore) Option {
+	return func(server *Server) { server.taskDesignations = value }
+}
 
-	info, err := os.Lstat(cleanPath)
-	switch {
-	case errors.Is(err, os.ErrNotExist):
-		return nil
-	case err != nil:
-		return fmt.Errorf("udsapi: stat socket %q: %w", cleanPath, err)
-	case info.Mode()&os.ModeSocket == 0:
-		return fmt.Errorf("udsapi: existing path %q is not a unix socket", cleanPath)
-	}
+// WithSkillExposureStore injects the durable skill exposure projection and ledger.
+func WithSkillExposureStore(repository store.SkillExposureRepository, events store.EventSummaryStore) Option {
+	return func(server *Server) { server.skillExposureStore = repository; server.skillExposureEvents = events }
+}
 
-	if err := os.Remove(cleanPath); err != nil && !errors.Is(err, os.ErrNotExist) {
-		return fmt.Errorf("udsapi: remove socket %q: %w", cleanPath, err)
+// WithSoulAuthoring injects the managed Soul authoring surface.
+func WithSoulAuthoring(service core.SoulAuthoringService) Option {
+	return func(server *Server) {
+		server.soulAuthoring = service
 	}
-	return nil
+}
+
+// WithSoulRefresher injects the session Soul refresh surface.
+func WithSoulRefresher(service core.SoulRefresher) Option {
+	return func(server *Server) {
+		server.soulRefresher = service
+	}
+}
+
+// WithHeartbeatAuthoring injects the managed Heartbeat authoring surface.
+func WithHeartbeatAuthoring(service core.HeartbeatAuthoringService) Option {
+	return func(server *Server) {
+		server.heartbeatAuthor = service
+	}
+}
+
+// WithHeartbeatStatus injects the Heartbeat status/read surface.
+func WithHeartbeatStatus(service core.HeartbeatStatusService) Option {
+	return func(server *Server) {
+		server.heartbeatStatus = service
+	}
+}
+
+// WithHeartbeatWake injects the manual Heartbeat wake surface.
+func WithHeartbeatWake(service core.HeartbeatWakeService) Option {
+	return func(server *Server) {
+		server.heartbeatWake = service
+	}
+}
+
+// WithHeartbeatWakeEventReader injects the retained Heartbeat wake audit reader.
+func WithHeartbeatWakeEventReader(reader core.HeartbeatWakeEventReader) Option {
+	return func(server *Server) {
+		server.wakeEvents = reader
+	}
+}
+
+func WithAgentInstances(api *core.AgentInstanceAPI) Option {
+	return func(server *Server) { server.agentInstances = api }
 }

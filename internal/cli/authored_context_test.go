@@ -1,0 +1,1030 @@
+package cli
+
+import (
+	"context"
+	"encoding/json"
+	"errors"
+	"io"
+	"net/http"
+	"net/http/httptest"
+	"net/url"
+	"os"
+	"path/filepath"
+	"strings"
+	"testing"
+	"time"
+
+	"bytes"
+
+	"github.com/charmbracelet/x/xpty"
+	"github.com/compozy/compozy/internal/api/contract"
+	"github.com/compozy/compozy/internal/api/core"
+	apitestutil "github.com/compozy/compozy/internal/api/testutil"
+	compozyconfig "github.com/compozy/compozy/internal/config"
+	"github.com/compozy/compozy/internal/heartbeat/source"
+	"github.com/compozy/compozy/internal/store"
+	"github.com/compozy/compozy/internal/store/globaldb"
+	workspacepkg "github.com/compozy/compozy/internal/workspace"
+	"github.com/gin-gonic/gin"
+)
+
+func TestAgentSoulCommands(t *testing.T) {
+	t.Run("Should inspect soul as json and human with workspace scope", func(t *testing.T) {
+		t.Parallel()
+
+		client := &stubClient{
+			getAgentSoulFn: func(_ context.Context, name string, query AgentQuery) (AgentSoulRecord, error) {
+				if name != "coder" {
+					t.Fatalf("GetAgentSoul() name = %q, want coder", name)
+				}
+				if query.Workspace != "checkout-api" {
+					t.Fatalf("GetAgentSoul() workspace = %q, want checkout-api", query.Workspace)
+				}
+				return AgentSoulRecord{
+					AgentName:        "coder",
+					Enabled:          true,
+					Present:          true,
+					Active:           true,
+					Valid:            true,
+					ValidationStatus: contract.AuthoredValidationValid,
+					Digest:           "sha256:soul",
+					SourcePath:       ".compozy/agents/coder/SOUL.md",
+				}, nil
+			},
+		}
+		deps := newWorkspaceTestDeps(t, client)
+
+		stdout, _, err := executeRootCommand(
+			t,
+			deps,
+			"agent",
+			"soul",
+			"inspect",
+			"coder",
+			"--workspace",
+			"checkout-api",
+			"--json",
+		)
+		if err != nil {
+			t.Fatalf("agent soul inspect --json error = %v", err)
+		}
+		if strings.Contains(stdout, "/Users/") {
+			t.Fatalf("agent soul inspect leaked absolute source path: %s", stdout)
+		}
+		var payload AgentSoulRecord
+		if err := json.Unmarshal([]byte(stdout), &payload); err != nil {
+			t.Fatalf("json.Unmarshal(agent soul inspect) error = %v", err)
+		}
+		if payload.AgentName != "coder" || payload.Digest != "sha256:soul" || !payload.Valid {
+			t.Fatalf("payload = %#v, want valid coder soul", payload)
+		}
+
+		human, _, err := executeRootCommand(
+			t,
+			deps,
+			"agent",
+			"soul",
+			"inspect",
+			"coder",
+			"--workspace",
+			"checkout-api",
+		)
+		if err != nil {
+			t.Fatalf("agent soul inspect human error = %v", err)
+		}
+		if !strings.Contains(human, "Agent Soul") || !strings.Contains(human, "sha256:soul") {
+			t.Fatalf("human output = %q, want soul summary", human)
+		}
+	})
+
+	t.Run("Should write soul with expected digest and file body", func(t *testing.T) {
+		t.Parallel()
+
+		bodyPath := filepath.Join(t.TempDir(), "SOUL.md")
+		if err := os.WriteFile(bodyPath, []byte("# Soul\n\nBe precise.\n"), 0o600); err != nil {
+			t.Fatalf("os.WriteFile(SOUL.md) error = %v", err)
+		}
+		client := &stubClient{
+			putAgentSoulFn: func(_ context.Context, name string, request AgentSoulPutRequest) (AgentSoulMutationRecord, error) {
+				if name != "coder" || request.AgentName != "coder" {
+					t.Fatalf("PutAgentSoul() agent = %q/%q, want coder", name, request.AgentName)
+				}
+				if request.WorkspaceID != "checkout-api" {
+					t.Fatalf("PutAgentSoul() workspace = %q, want checkout-api", request.WorkspaceID)
+				}
+				if request.ExpectedDigest != "sha256:old" {
+					t.Fatalf("PutAgentSoul() expected_digest = %q, want sha256:old", request.ExpectedDigest)
+				}
+				if request.Body != "# Soul\n\nBe precise.\n" {
+					t.Fatalf("PutAgentSoul() body = %q", request.Body)
+				}
+				return AgentSoulMutationRecord{
+					Soul: AgentSoulRecord{
+						AgentName:        "coder",
+						Valid:            true,
+						ValidationStatus: contract.AuthoredValidationValid,
+						Digest:           "sha256:new",
+					},
+					Revision: AgentSoulRevisionRecord{
+						ID:        "rev-1",
+						AgentName: "coder",
+						Action:    contract.AgentSoulRevisionPut,
+						NewDigest: "sha256:new",
+						CreatedAt: fixedTestNow,
+					},
+				}, nil
+			},
+		}
+
+		stdout, _, err := executeRootCommand(
+			t,
+			newWorkspaceTestDeps(t, client),
+			"agent",
+			"soul",
+			"write",
+			"coder",
+			"--file",
+			bodyPath,
+			"--expected-digest",
+			"sha256:old",
+			"--workspace",
+			"checkout-api",
+			"--json",
+		)
+		if err != nil {
+			t.Fatalf("agent soul write error = %v", err)
+		}
+		var payload AgentSoulMutationRecord
+		if err := json.Unmarshal([]byte(stdout), &payload); err != nil {
+			t.Fatalf("json.Unmarshal(agent soul write) error = %v", err)
+		}
+		if payload.Revision.ID != "rev-1" || payload.Soul.Digest != "sha256:new" {
+			t.Fatalf("payload = %#v, want mutation response", payload)
+		}
+	})
+
+	t.Run("Should create soul without expected digest when file is absent", func(t *testing.T) {
+		t.Parallel()
+
+		bodyPath := filepath.Join(t.TempDir(), "SOUL.md")
+		if err := os.WriteFile(bodyPath, []byte("# Soul\n\nCreate me.\n"), 0o600); err != nil {
+			t.Fatalf("os.WriteFile(SOUL.md) error = %v", err)
+		}
+		client := &stubClient{
+			putAgentSoulFn: func(_ context.Context, name string, request AgentSoulPutRequest) (AgentSoulMutationRecord, error) {
+				if name != "coder" || request.AgentName != "coder" {
+					t.Fatalf("PutAgentSoul() agent = %q/%q, want coder", name, request.AgentName)
+				}
+				if request.ExpectedDigest != "" {
+					t.Fatalf("PutAgentSoul() expected_digest = %q, want empty create digest", request.ExpectedDigest)
+				}
+				if request.WorkspaceID != "checkout-api" || request.Body != "# Soul\n\nCreate me.\n" {
+					t.Fatalf("PutAgentSoul() request = %#v", request)
+				}
+				return AgentSoulMutationRecord{
+					Soul: AgentSoulRecord{
+						AgentName:        "coder",
+						Valid:            true,
+						ValidationStatus: contract.AuthoredValidationValid,
+						Digest:           "sha256:created",
+					},
+					Revision: AgentSoulRevisionRecord{
+						ID:        "rev-create",
+						AgentName: "coder",
+						Action:    contract.AgentSoulRevisionPut,
+						NewDigest: "sha256:created",
+						CreatedAt: fixedTestNow,
+					},
+				}, nil
+			},
+		}
+
+		stdout, stderr, err := executeRootCommand(
+			t,
+			newWorkspaceTestDeps(t, client),
+			"agent",
+			"soul",
+			"write",
+			"coder",
+			"--file",
+			bodyPath,
+			"--workspace",
+			"checkout-api",
+			"--json",
+		)
+		if err != nil {
+			t.Fatalf("agent soul create error = %v; stderr=%s; stdout=%s", err, stderr, stdout)
+		}
+		var payload AgentSoulMutationRecord
+		if err := json.Unmarshal([]byte(stdout), &payload); err != nil {
+			t.Fatalf("json.Unmarshal(agent soul create) error = %v", err)
+		}
+		if payload.Revision.ID != "rev-create" || payload.Soul.Digest != "sha256:created" {
+			t.Fatalf("payload = %#v, want created soul mutation", payload)
+		}
+	})
+
+	t.Run("Should report stale soul conflicts deterministically", func(t *testing.T) {
+		t.Parallel()
+
+		bodyPath := filepath.Join(t.TempDir(), "SOUL.md")
+		if err := os.WriteFile(bodyPath, []byte("# Soul\n"), 0o600); err != nil {
+			t.Fatalf("os.WriteFile(SOUL.md) error = %v", err)
+		}
+		client := &stubClient{
+			putAgentSoulFn: func(context.Context, string, AgentSoulPutRequest) (AgentSoulMutationRecord, error) {
+				return AgentSoulMutationRecord{}, errors.New("soul_conflict: expected_digest is stale")
+			},
+		}
+		_, _, err := executeRootCommand(
+			t,
+			newWorkspaceTestDeps(t, client),
+			"agent",
+			"soul",
+			"write",
+			"coder",
+			"--file",
+			bodyPath,
+			"--expected-digest",
+			"sha256:old",
+			"--json",
+		)
+		if err == nil || !strings.Contains(err.Error(), "soul_conflict") {
+			t.Fatalf("agent soul write error = %v, want soul_conflict", err)
+		}
+	})
+}
+
+func TestAgentHeartbeatCommands(t *testing.T) {
+	t.Run("Should return heartbeat status json with session health", func(t *testing.T) {
+		t.Parallel()
+
+		client := &stubClient{
+			getAgentHeartbeatStatusFn: func(
+				_ context.Context,
+				name string,
+				request AgentHeartbeatStatusRequest,
+			) (AgentHeartbeatStatusRecord, error) {
+				if name != "coder" || request.AgentName != "coder" {
+					t.Fatalf("GetAgentHeartbeatStatus() agent = %q/%q, want coder", name, request.AgentName)
+				}
+				if request.WorkspaceID != "checkout-api" || request.SessionID != "sess-1" {
+					t.Fatalf("GetAgentHeartbeatStatus() request = %#v", request)
+				}
+				if !request.IncludeSessionHealth {
+					t.Fatalf("GetAgentHeartbeatStatus() IncludeSessionHealth = false, want true")
+				}
+				return AgentHeartbeatStatusRecord{
+					AgentName:        "coder",
+					Enabled:          true,
+					Present:          true,
+					Active:           true,
+					Valid:            true,
+					ValidationStatus: contract.AuthoredValidationValid,
+					Digest:           "sha256:heartbeat",
+					ConfigDigest:     "sha256:config",
+					SessionHealth: &SessionHealthRecord{
+						SessionID:       "sess-1",
+						WorkspaceID:     "ws-1",
+						AgentName:       "coder",
+						State:           contract.SessionHealthStateIdle,
+						Health:          contract.SessionHealthHealthy,
+						Attachable:      true,
+						EligibleForWake: true,
+						UpdatedAt:       fixedTestNow,
+					},
+				}, nil
+			},
+		}
+
+		stdout, _, err := executeRootCommand(
+			t,
+			newWorkspaceTestDeps(t, client),
+			"agent",
+			"heartbeat",
+			"status",
+			"coder",
+			"--workspace",
+			"checkout-api",
+			"--session",
+			"sess-1",
+			"--json",
+		)
+		if err != nil {
+			t.Fatalf("agent heartbeat status error = %v", err)
+		}
+		var payload AgentHeartbeatStatusRecord
+		if err := json.Unmarshal([]byte(stdout), &payload); err != nil {
+			t.Fatalf("json.Unmarshal(agent heartbeat status) error = %v", err)
+		}
+		if payload.ConfigDigest != "sha256:config" || payload.SessionHealth == nil ||
+			!payload.SessionHealth.EligibleForWake {
+			t.Fatalf("payload = %#v, want config digest and eligible session health", payload)
+		}
+	})
+
+	t.Run("Should write heartbeat with expected digest mapped to expected digest", func(t *testing.T) {
+		t.Parallel()
+
+		bodyPath := filepath.Join(t.TempDir(), "HEARTBEAT.md")
+		if err := os.WriteFile(bodyPath, []byte("# Heartbeat\n\nCheck in.\n"), 0o600); err != nil {
+			t.Fatalf("os.WriteFile(HEARTBEAT.md) error = %v", err)
+		}
+		client := &stubClient{
+			putAgentHeartbeatFn: func(
+				_ context.Context,
+				name string,
+				request AgentHeartbeatPutRequest,
+			) (AgentHeartbeatMutationRecord, error) {
+				if name != "coder" || request.ExpectedDigest != "sha256:old" {
+					t.Fatalf("PutAgentHeartbeat() = %q/%#v, want expected digest", name, request)
+				}
+				if request.WorkspaceID != "checkout-api" || request.Body != "# Heartbeat\n\nCheck in.\n" {
+					t.Fatalf("PutAgentHeartbeat() request = %#v", request)
+				}
+				return AgentHeartbeatMutationRecord{
+					Heartbeat: AgentHeartbeatRecord{
+						AgentName:        "coder",
+						Valid:            true,
+						ValidationStatus: contract.AuthoredValidationValid,
+						Digest:           "sha256:new",
+					},
+					Revision: AgentHeartbeatRevisionRecord{
+						ID:        "rev-hb-1",
+						AgentName: "coder",
+						Operation: contract.HeartbeatRevisionWrite,
+						NewDigest: "sha256:new",
+						CreatedAt: fixedTestNow,
+					},
+				}, nil
+			},
+		}
+
+		stdout, _, err := executeRootCommand(
+			t,
+			newWorkspaceTestDeps(t, client),
+			"agent",
+			"heartbeat",
+			"write",
+			"coder",
+			"--file",
+			bodyPath,
+			"--expected-digest",
+			"sha256:old",
+			"--workspace",
+			"checkout-api",
+			"--json",
+		)
+		if err != nil {
+			t.Fatalf("agent heartbeat write error = %v", err)
+		}
+		var payload AgentHeartbeatMutationRecord
+		if err := json.Unmarshal([]byte(stdout), &payload); err != nil {
+			t.Fatalf("json.Unmarshal(agent heartbeat write) error = %v", err)
+		}
+		if payload.Revision.ID != "rev-hb-1" || payload.Heartbeat.Digest != "sha256:new" {
+			t.Fatalf("payload = %#v, want heartbeat mutation", payload)
+		}
+	})
+
+	t.Run("Should create heartbeat without expected digest when file is absent", func(t *testing.T) {
+		t.Parallel()
+
+		bodyPath := filepath.Join(t.TempDir(), "HEARTBEAT.md")
+		if err := os.WriteFile(bodyPath, []byte("# Heartbeat\n\nCreate policy.\n"), 0o600); err != nil {
+			t.Fatalf("os.WriteFile(HEARTBEAT.md) error = %v", err)
+		}
+		client := &stubClient{
+			putAgentHeartbeatFn: func(
+				_ context.Context,
+				name string,
+				request AgentHeartbeatPutRequest,
+			) (AgentHeartbeatMutationRecord, error) {
+				if name != "coder" || request.AgentName != "coder" {
+					t.Fatalf("PutAgentHeartbeat() agent = %q/%q, want coder", name, request.AgentName)
+				}
+				if request.ExpectedDigest != "" {
+					t.Fatalf(
+						"PutAgentHeartbeat() expected_digest = %q, want empty create digest",
+						request.ExpectedDigest,
+					)
+				}
+				if request.WorkspaceID != "checkout-api" || request.Body != "# Heartbeat\n\nCreate policy.\n" {
+					t.Fatalf("PutAgentHeartbeat() request = %#v", request)
+				}
+				return AgentHeartbeatMutationRecord{
+					Heartbeat: AgentHeartbeatRecord{
+						AgentName:        "coder",
+						Valid:            true,
+						ValidationStatus: contract.AuthoredValidationValid,
+						Digest:           "sha256:heartbeat-created",
+					},
+					Revision: AgentHeartbeatRevisionRecord{
+						ID:        "rev-hb-create",
+						AgentName: "coder",
+						Operation: contract.HeartbeatRevisionWrite,
+						NewDigest: "sha256:heartbeat-created",
+						CreatedAt: fixedTestNow,
+					},
+				}, nil
+			},
+		}
+
+		stdout, stderr, err := executeRootCommand(
+			t,
+			newWorkspaceTestDeps(t, client),
+			"agent",
+			"heartbeat",
+			"write",
+			"coder",
+			"--file",
+			bodyPath,
+			"--workspace",
+			"checkout-api",
+			"--json",
+		)
+		if err != nil {
+			t.Fatalf("agent heartbeat create error = %v; stderr=%s; stdout=%s", err, stderr, stdout)
+		}
+		var payload AgentHeartbeatMutationRecord
+		if err := json.Unmarshal([]byte(stdout), &payload); err != nil {
+			t.Fatalf("json.Unmarshal(agent heartbeat create) error = %v", err)
+		}
+		if payload.Revision.ID != "rev-hb-create" || payload.Heartbeat.Digest != "sha256:heartbeat-created" {
+			t.Fatalf("payload = %#v, want heartbeat create mutation", payload)
+		}
+	})
+}
+
+func TestSessionAuthoredContextCommands(t *testing.T) {
+	t.Run("Should return session health and inspect json with closed enum values", func(t *testing.T) {
+		t.Parallel()
+
+		health := SessionHealthRecord{
+			SessionID:           "sess-1",
+			WorkspaceID:         "ws-1",
+			AgentName:           "coder",
+			State:               contract.SessionHealthStateIdle,
+			Health:              contract.SessionHealthHealthy,
+			Attachable:          true,
+			EligibleForWake:     true,
+			IneligibilityReason: "",
+			UpdatedAt:           fixedTestNow,
+		}
+		client := &stubClient{
+			getSessionHealthFn: func(_ context.Context, id string) (SessionHealthRecord, error) {
+				if id != "sess-1" {
+					t.Fatalf("GetSessionHealth() id = %q, want sess-1", id)
+				}
+				return health, nil
+			},
+			inspectSessionFn: func(_ context.Context, id string, query SessionInspectQuery) (SessionInspectRecord, error) {
+				if id != "sess-1" || !query.IncludeRecentWakeEvents {
+					t.Fatalf("InspectSession() = %q/%#v, want wake event expansion", id, query)
+				}
+				return SessionInspectRecord{SessionID: "sess-1", Health: health, ConfigDigest: "sha256:config"}, nil
+			},
+		}
+		deps := newWorkspaceTestDeps(t, client)
+
+		healthOut, _, err := executeRootCommand(t, deps, "session", "health", "sess-1", "--json")
+		if err != nil {
+			t.Fatalf("session health error = %v", err)
+		}
+		var healthPayload SessionHealthRecord
+		if err := json.Unmarshal([]byte(healthOut), &healthPayload); err != nil {
+			t.Fatalf("json.Unmarshal(session health) error = %v", err)
+		}
+		if healthPayload.State != contract.SessionHealthStateIdle ||
+			healthPayload.Health != contract.SessionHealthHealthy ||
+			!healthPayload.EligibleForWake {
+			t.Fatalf("health payload = %#v, want closed healthy idle state", healthPayload)
+		}
+
+		inspectOut, _, err := executeRootCommand(
+			t,
+			deps,
+			"session",
+			"inspect",
+			"sess-1",
+			"--include-wake-events",
+			"--json",
+		)
+		if err != nil {
+			t.Fatalf("session inspect error = %v", err)
+		}
+		var inspectPayload SessionInspectRecord
+		if err := json.Unmarshal([]byte(inspectOut), &inspectPayload); err != nil {
+			t.Fatalf("json.Unmarshal(session inspect) error = %v", err)
+		}
+		if inspectPayload.Health.State != contract.SessionHealthStateIdle ||
+			inspectPayload.ConfigDigest != "sha256:config" {
+			t.Fatalf("inspect payload = %#v, want health and config digest", inspectPayload)
+		}
+	})
+
+	t.Run("Should refresh session soul through managed client", func(t *testing.T) {
+		t.Parallel()
+
+		client := &stubClient{
+			refreshSessionSoulFn: func(
+				_ context.Context,
+				id string,
+				request SessionSoulRefreshRequest,
+			) (AgentSoulRecord, error) {
+				if id != "sess-1" || request.ExpectedDigest != "sha256:old" {
+					t.Fatalf("RefreshSessionSoul() = %q/%#v, want expected digest", id, request)
+				}
+				return AgentSoulRecord{
+					AgentName:        "coder",
+					Valid:            true,
+					ValidationStatus: contract.AuthoredValidationValid,
+					Digest:           "sha256:new",
+				}, nil
+			},
+		}
+
+		stdout, _, err := executeRootCommand(
+			t,
+			newWorkspaceTestDeps(t, client),
+			"session",
+			"soul",
+			"refresh",
+			"sess-1",
+			"--expected-digest",
+			"sha256:old",
+			"--json",
+		)
+		if err != nil {
+			t.Fatalf("session soul refresh error = %v", err)
+		}
+		var payload AgentSoulRecord
+		if err := json.Unmarshal([]byte(stdout), &payload); err != nil {
+			t.Fatalf("json.Unmarshal(session soul refresh) error = %v", err)
+		}
+		if payload.Digest != "sha256:new" {
+			t.Fatalf("payload = %#v, want refreshed digest", payload)
+		}
+	})
+
+	t.Run("Should not expose session heartbeat command", func(t *testing.T) {
+		t.Parallel()
+
+		root := newRootCommand(newWorkspaceTestDeps(t, &stubClient{}))
+		found, _, err := root.Find([]string{"session", "heartbeat"})
+		if err == nil && found != nil && found.Name() == "heartbeat" {
+			t.Fatal("session heartbeat command exists")
+		}
+		sessionCmd, _, err := root.Find([]string{"session"})
+		if err != nil {
+			t.Fatalf("find session command: %v", err)
+		}
+		usage := sessionCmd.UsageString()
+		if strings.Contains(usage, "heartbeat") {
+			t.Fatalf("session help contains forbidden heartbeat command:\n%s", usage)
+		}
+	})
+}
+
+type memoryHTTPClient struct {
+	*stubClient
+	transport *daemonClient
+}
+
+var _ DaemonClient = (*memoryHTTPClient)(nil)
+
+func (c *memoryHTTPClient) AgentMemory(
+	ctx context.Context,
+	name string,
+	query AgentQuery,
+	operation string,
+	body any,
+) (json.RawMessage, error) {
+	return c.transport.AgentMemory(ctx, name, query, operation, body)
+}
+
+func TestAgentMemoryCommands(t *testing.T) {
+	for _, tc := range []struct {
+		name, method, suffix, body string
+		args                       []string
+	}{
+		{"inspect", "GET", "", "", []string{"inspect", "triage"}},
+		{"add", "POST", "/entries", "remember", []string{"add", "triage", "remember", "--until", "2026-12-01"}},
+		{"replace", "PATCH", "/entries", "replacement", []string{"replace", "triage", "match", "replacement"}},
+		{"remove", "DELETE", "/entries", "match", []string{"remove", "triage", "match"}},
+		{"search", "POST", "/search", "preview", []string{"search", "triage", "preview", "--include-sessions"}},
+		{"history", "GET", "/history", "", []string{"history", "triage"}},
+		{"rollback", "POST", "/rollback", "revision-one", []string{"rollback", "triage", "revision-one"}},
+		{"write", "PUT", "", "digest-one", []string{"write", "triage", "--expected-digest", "digest-one"}},
+		{"validate", "POST", "/validate", "note body", []string{"validate", "triage"}},
+	} {
+		t.Run("Should send "+tc.name+" through the daemon client", func(t *testing.T) {
+			t.Parallel()
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if r.Method != tc.method || r.URL.Path != "/api/agents/triage/memory"+tc.suffix ||
+					r.URL.Query().Get("workspace") != "checkout-api" {
+					t.Errorf("unexpected request %s %s", r.Method, r.URL)
+				}
+				body, err := io.ReadAll(r.Body)
+				if err != nil {
+					t.Error(err)
+				}
+				if tc.body != "" && !strings.Contains(string(body), tc.body) {
+					t.Errorf("unexpected body %s", body)
+				}
+				w.Header().Set("Content-Type", "application/json")
+				if _, err := io.WriteString(
+					w,
+					`{"content":"note body","digest":"digest-one","budget":{"lines":1,"max_lines":200,"bytes":9,"max_bytes":24576}}`,
+				); err != nil {
+					t.Error(err)
+				}
+			}))
+			t.Cleanup(server.Close)
+			transport := &daemonClient{
+				target: LocalClientTarget("/tmp/compozy-memory.sock"),
+				httpClient: &http.Client{
+					Timeout: defaultUnixSocketClientTimeout,
+					Transport: roundTripperFunc(func(r *http.Request) (*http.Response, error) {
+						target, err := url.Parse(server.URL)
+						if err != nil {
+							return nil, err
+						}
+						r.URL.Scheme, r.URL.Host = target.Scheme, target.Host
+						return server.Client().Transport.RoundTrip(r)
+					}),
+				},
+			}
+			stub := &stubClient{}
+			withWorkspaceResolution(stub)
+			deps := newTestDeps(t, &memoryHTTPClient{stubClient: stub, transport: transport})
+			args := append([]string{"agent", "memory"}, tc.args...)
+			if tc.name == "write" || tc.name == "validate" {
+				path := filepath.Join(t.TempDir(), "MEMORY.md")
+				if err := os.WriteFile(path, []byte("note body"), 0o600); err != nil {
+					t.Fatal(err)
+				}
+				args = append(args, "--file", path)
+			}
+			args = append(args, "--workspace", "checkout-api", "--json")
+			output, _, err := executeRootCommand(t, deps, args...)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !strings.Contains(output, `"digest":"digest-one"`) &&
+				!strings.Contains(output, `"digest": "digest-one"`) {
+				t.Fatalf("unexpected output %s", output)
+			}
+		})
+	}
+}
+
+func TestAgentMemoryWriteConflictGuard(t *testing.T) {
+	t.Run("Should require an inspected digest before replacing memory", func(t *testing.T) {
+		t.Parallel()
+		path := filepath.Join(t.TempDir(), "MEMORY.md")
+		if err := os.WriteFile(path, []byte("edited notes"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		deps := newWorkspaceTestDeps(t, &stubClient{})
+		_, _, err := executeRootCommand(
+			t,
+			deps,
+			"agent",
+			"memory",
+			"write",
+			"triage",
+			"--file",
+			path,
+			"--workspace",
+			"checkout-api",
+		)
+		if err == nil || !strings.Contains(err.Error(), "--expected-digest is required") {
+			t.Fatalf("unexpected error %v", err)
+		}
+	})
+}
+
+type heartbeatSourcesHTTPClient struct {
+	*stubClient
+	transport *daemonClient
+}
+
+func (c *heartbeatSourcesHTTPClient) HeartbeatSources(
+	ctx context.Context,
+	name string,
+	query AgentQuery,
+) (contract.HeartbeatSourceCatalogPayload, error) {
+	return c.transport.HeartbeatSources(ctx, name, query)
+}
+
+func (c *heartbeatSourcesHTTPClient) HeartbeatScriptApproval(
+	ctx context.Context,
+	name, script string,
+	query AgentQuery,
+	hash string,
+	revoke bool,
+) error {
+	return c.transport.HeartbeatScriptApproval(ctx, name, script, query, hash, revoke)
+}
+
+// Invariant (IT-013 CLI boundary): operator confirmation approves exactly the
+// cataloged bytes through the production API, enabling the real script runner.
+// Owner and canonical suite: CLI authored heartbeat commands.
+func TestHeartbeatScriptApprovalRuntime(t *testing.T) {
+	t.Run("Should approve the reviewed hash through the CLI and execute its bytes", func(t *testing.T) {
+		t.Parallel()
+		root, err := filepath.EvalSymlinks(t.TempDir())
+		if err != nil {
+			t.Fatal(err)
+		}
+		home, err := compozyconfig.ResolveHomePathsFrom(filepath.Join(root, "home"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		cfg := compozyconfig.DefaultWithHome(home)
+		dir := filepath.Join(root, "coder")
+		if err := os.MkdirAll(filepath.Join(dir, "sources"), 0700); err != nil {
+			t.Fatal(err)
+		}
+		agentPath := filepath.Join(dir, "AGENT.md")
+		if err := os.WriteFile(agentPath, []byte("Agent"), 0600); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(
+			filepath.Join(dir, "sources", "poll"),
+			[]byte("#!/bin/sh\ncat >/dev/null\necho '{\"items\":[{\"key\":\"1\",\"title\":\"approved item\"}]}'\n"),
+			0700,
+		); err != nil {
+			t.Fatal(err)
+		}
+		dbPath := filepath.Join(root, "compozy.db")
+		if err := cliTestStoreSeed.Clone(dbPath); err != nil {
+			t.Fatal(err)
+		}
+		db, err := globaldb.OpenGlobalDB(t.Context(), dbPath)
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() {
+			if err := db.Close(context.Background()); err != nil {
+				t.Error(err)
+			}
+		})
+		workspaces := apitestutil.StubWorkspaceService{
+			ResolveFn: func(context.Context, string) (workspacepkg.ResolvedWorkspace, error) {
+				return workspacepkg.ResolvedWorkspace{
+					ID:          "checkout-api",
+					WorkspaceID: "checkout-api",
+					RootDir:     root,
+					Config:      cfg,
+					Agents: []compozyconfig.AgentDef{
+						{Name: "coder", SourcePath: agentPath, SourceLayer: "workspace"},
+					},
+				}, nil
+			},
+		}
+		handlers := core.NewBaseHandlers(
+			&core.BaseHandlerConfig{
+				HomePaths:      home,
+				Config:         cfg,
+				TransportName:  "httpapi",
+				Workspaces:     workspaces,
+				AgentInstances: &core.AgentInstanceAPI{Store: db.Instances()},
+			},
+		)
+		router := gin.New()
+		router.GET("/api/agents/:name/heartbeat/sources", handlers.GetAgentHeartbeatSources)
+		router.POST("/api/agents/:name/heartbeat/scripts/:script/approve", handlers.ApproveAgentHeartbeatScript)
+		router.DELETE("/api/agents/:name/heartbeat/scripts/:script/approve", handlers.RevokeAgentHeartbeatScript)
+		server := httptest.NewServer(router)
+		t.Cleanup(server.Close)
+		transport := &daemonClient{
+			target: LocalClientTarget("/tmp/compozy-source.sock"),
+			httpClient: &http.Client{Transport: roundTripperFunc(func(r *http.Request) (*http.Response, error) {
+				target, err := url.Parse(server.URL)
+				if err != nil {
+					return nil, err
+				}
+				r.URL.Scheme, r.URL.Host = target.Scheme, target.Host
+				return server.Client().Transport.RoundTrip(r)
+			})},
+		}
+		stub := &stubClient{}
+		withWorkspaceResolution(stub)
+		deps := newTestDeps(t, &heartbeatSourcesHTTPClient{stubClient: stub, transport: transport})
+		deps.getenv = func(string) string { return "" }
+		runner := &source.ScriptRunner{
+			DefinitionDir:  dir,
+			ProfileID:      store.DefaultProfileID,
+			Agent:          "coder",
+			ScriptsEnabled: true,
+			Timeout:        5 * time.Second,
+			MaxOutputBytes: 64 * 1024,
+			Approvals:      db.Instances(),
+		}
+		req := source.Request{Version: 1, SourceID: "s", Limits: source.Limits{MaxItems: 20, MaxStateBytes: 16 * 1024}}
+		if _, err := runner.Poll(t.Context(), source.Ref{ID: "s", Script: "poll"}, req); err == nil {
+			t.Fatal("unapproved script executed")
+		}
+		stdout, _, err := executeRootCommand(
+			t,
+			deps,
+			"agent",
+			"heartbeat",
+			"sources",
+			"approve",
+			"coder",
+			"poll",
+			"--workspace",
+			"checkout-api",
+			"--yes",
+			"--json",
+		)
+		var approvedOutput map[string]any
+		if err != nil {
+			t.Fatalf("approval=%s %v", stdout, err)
+		}
+		if err := json.Unmarshal([]byte(stdout), &approvedOutput); err != nil || approvedOutput["action"] != "approve" {
+			t.Fatalf("approval=%s %v", stdout, err)
+		}
+		_, hash, err := source.ReadScript(dir, "poll")
+		if err != nil {
+			t.Fatal(err)
+		}
+		approved, err := db.Instances().ApprovedHash(t.Context(), store.DefaultProfileID, dir, "poll")
+		if err != nil || approved != hash {
+			t.Fatalf("approved=%s want=%s %v", approved, hash, err)
+		}
+		baseArgs := []string{"agent", "heartbeat", "sources"}
+		catalogOut, _, err := executeRootCommand(t, deps, append(baseArgs, "coder", "--workspace", "checkout-api")...)
+		if err != nil || !strings.Contains(catalogOut, "SCRIPT  EXECUTABLE  APPROVED") ||
+			!strings.Contains(catalogOut, "poll    true") ||
+			!strings.Contains(catalogOut, "Scripts: enabled · Limits: 8 sources, 20 items per check") {
+			t.Fatalf("catalog=%q %v", catalogOut, err)
+		}
+		staleOut, _, err := executeRootCommand(
+			t,
+			deps,
+			append(
+				baseArgs,
+				"approve",
+				"coder",
+				"poll",
+				"--workspace",
+				"checkout-api",
+				"--sha256",
+				"sha256:stale",
+				"--yes",
+			)...)
+		if err == nil || !strings.Contains(err.Error(), "source_script_changed: poll is "+hash+", not sha256:stale") {
+			t.Fatalf("stale=%s %v", staleOut, err)
+		}
+		_, _, err = executeRootCommand(
+			t,
+			deps,
+			append(baseArgs, "approve", "coder", "poll", "--workspace", "checkout-api")...)
+		if err == nil || !strings.Contains(err.Error(), "requires --yes") {
+			t.Fatalf("noninteractive=%v", err)
+		}
+		device, err := xpty.NewUnixPty(80, 24)
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() {
+			if err := device.Close(); err != nil {
+				t.Error(err)
+			}
+		})
+		if _, err := device.Master().WriteString("y\n"); err != nil {
+			t.Fatal(err)
+		}
+		cmd := newRootCommand(deps)
+		var out, review bytes.Buffer
+		cmd.SetIn(device.Slave())
+		cmd.SetOut(&out)
+		cmd.SetErr(&review)
+		cmd.SetArgs(append(baseArgs, "approve", "coder", "poll", "--workspace", "checkout-api"))
+		if err := cmd.ExecuteContext(t.Context()); err != nil {
+			t.Fatal(err)
+		}
+		if out.String() != "Approved poll ("+hash+")\n" ||
+			!strings.Contains(review.String(), "Script poll (coder)\n  "+hash+"\n  3 lines, last modified ") ||
+			!strings.Contains(review.String(), "Approve this exact file to run on check-ins? [y/N] ") {
+			t.Fatalf("approve=%q review=%q", out.String(), review.String())
+		}
+
+		stdout, _, err = executeRootCommand(
+			t,
+			deps,
+			append(baseArgs, "approve", "coder", "poll", "--workspace", "checkout-api", "--sha256", hash, "--yes")...)
+		if err != nil || stdout != "Approved poll ("+hash+")\n" {
+			t.Fatalf("exact hash approval=%q %v", stdout, err)
+		}
+
+		result, err := runner.Poll(t.Context(), source.Ref{ID: "s", Script: "poll"}, req)
+		if err != nil || len(result.Items) != 1 || result.Items[0].Key != "1" {
+			t.Fatalf("result=%+v %v", result, err)
+		}
+		revoked, _, err := executeRootCommand(
+			t,
+			deps,
+			append(baseArgs, "revoke", "coder", "poll", "--workspace", "checkout-api", "--yes")...)
+		if err != nil || revoked != "Revoked approval for poll\n" {
+			t.Fatalf("revoke=%q %v", revoked, err)
+		}
+		if _, err := runner.Poll(t.Context(), source.Ref{ID: "s", Script: "poll"}, req); err == nil {
+			t.Fatal("revoked script executed")
+		}
+		deps.getenv = func(key string) string {
+			if key == "COMPOZY_SESSION_ID" {
+				return "sess-agent"
+			}
+			return ""
+		}
+		_, _, err = executeRootCommand(t, deps, append(baseArgs, "approve", "coder", "poll", "--yes")...)
+		if err == nil ||
+			!strings.Contains(
+				err.Error(),
+				"source_approval_operator_only: only the operator can approve or revoke source scripts",
+			) {
+			t.Fatalf("agent approval=%v", err)
+		}
+	})
+}
+
+func TestHeartbeatSourceCatalogOutput(t *testing.T) {
+	t.Parallel()
+	// Invariant: the operator can discover available kinds, empty scripts, limits and missing-agent errors.
+	// Owner and canonical suite: authored heartbeat CLI commands.
+	t.Run("Should explain missing agent without an explicit workspace", func(t *testing.T) {
+		t.Parallel()
+		client := &daemonClient{
+			target: LocalClientTarget("/tmp/compozy.sock"),
+			httpClient: &http.Client{Transport: roundTripperFunc(func(*http.Request) (*http.Response, error) {
+				return newHTTPResponse(404, `{"code":"agent_not_found","error":"missing"}`), nil
+			})},
+		}
+		_, err := client.HeartbeatSources(t.Context(), "typo", AgentQuery{})
+		if err == nil || err.Error() != `agent_not_found: agent "typo" not found` {
+			t.Fatalf("error=%v", err)
+		}
+	})
+	for _, tc := range []struct {
+		name, body, want string
+		status           int
+	}{
+		{name: "Should list a kind and empty scripts", status: 200, body: `{"scripts_enabled":true,"limits":{"max_per_agent":8,"max_items":20},"kinds":[{"kind":"forge-github/issues","title":"New GitHub issues","extension":"forge-github"}],"scripts":[]}`, want: "KIND                 TITLE              FROM\nforge-github/issues  New GitHub issues  extension forge-github\nSCRIPT  EXECUTABLE  APPROVED\n(none)\nScripts: enabled · Limits: 8 sources, 20 items per check\n"},
+		{name: "Should show empty catalogs and disabled scripts", status: 200, body: `{"scripts_enabled":false,"limits":{"max_per_agent":2,"max_items":5},"kinds":[],"scripts":[]}`, want: "KIND  TITLE  FROM\n(none)\nSCRIPT  EXECUTABLE  APPROVED\n(none)\nScripts: disabled · Limits: 2 sources, 5 items per check\n"},
+		{name: "Should explain a missing agent", status: 404, body: `{"code":"agent_not_found","error":"agent_not_found: agent definition was not found"}`, want: `agent_not_found: agent "typo" not found in checkout-api`},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if r.Method != http.MethodGet || r.URL.Path != "/api/agents/typo/heartbeat/sources" ||
+					r.URL.Query().Get("workspace") != "checkout-api" {
+					t.Errorf("request=%s %s", r.Method, r.URL)
+				}
+				w.Header().Set("Content-Type", "application/json")
+				w.WriteHeader(tc.status)
+				if _, err := io.WriteString(w, tc.body); err != nil {
+					t.Error(err)
+				}
+			}))
+			t.Cleanup(server.Close)
+			target, err := url.Parse(server.URL)
+			if err != nil {
+				t.Fatal(err)
+			}
+			transport := &daemonClient{
+				target: LocalClientTarget("/tmp/compozy.sock"),
+				httpClient: &http.Client{Transport: roundTripperFunc(func(r *http.Request) (*http.Response, error) {
+					r.URL.Scheme, r.URL.Host = target.Scheme, target.Host
+					return server.Client().Transport.RoundTrip(r)
+				})},
+			}
+			stub := &stubClient{}
+			withWorkspaceResolution(stub)
+			deps := newTestDeps(t, &heartbeatSourcesHTTPClient{stubClient: stub, transport: transport})
+			stdout, _, err := executeRootCommand(
+				t,
+				deps,
+				"agent",
+				"heartbeat",
+				"sources",
+				"typo",
+				"--workspace",
+				"checkout-api",
+			)
+			if tc.status != 200 {
+				if err == nil || err.Error() != tc.want {
+					t.Fatalf("error=%v, want %s", err, tc.want)
+				}
+				return
+			}
+			if err != nil || stdout != tc.want {
+				t.Fatalf("output=%q err=%v, want %q", stdout, err, tc.want)
+			}
+		})
+	}
+}

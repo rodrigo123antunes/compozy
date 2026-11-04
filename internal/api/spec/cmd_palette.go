@@ -1,0 +1,335 @@
+package spec
+
+import "github.com/compozy/compozy/internal/api/contract"
+
+const (
+	cmdPaletteApprovalNotFoundDescription    = "Approval not found"
+	cmdPaletteApprovalUnavailableDescription = "Tool approval unavailable"
+	cmdPaletteInvalidWorkspaceDescription    = "Invalid workspace"
+	cmdPaletteInvalidRequestDescription      = "Invalid request"
+	cmdPaletteUnavailableDescription         = "Command palette unavailable"
+	cmdPaletteCommandNotFoundDescription     = "Command not found"
+	cmdPaletteViewNotFoundDescription        = "View not found"
+	cmdPaletteInvokeOperationID              = "invokeCmdPaletteCommand"
+	cmdPaletteOpenViewOperationID            = "openCmdPaletteViewSession"
+	cmdPaletteAdmitViewEventOperationID      = "admitCmdPaletteViewSessionEvent"
+	cmdPaletteCloseViewOperationID           = "closeCmdPaletteViewSession"
+)
+
+var (
+	cmdPaletteTransports     = []Transport{TransportHTTP, TransportUDS}
+	cmdPaletteOperationSpecs = []OperationSpec{
+		{
+			Method: httpMethodGet, Path: "/api/cmd-palette/commands",
+			AppAccess:   AppAccessDenied,
+			OperationID: "listCmdPaletteCommands", Summary: "List command palette commands",
+			Tags: []string{specCmdPaletteKey}, Transports: cmdPaletteTransports,
+			Parameters: withProfileScope(
+				queryParam("workspace", "Workspace id, name, or path", true),
+				queryParam("client", "Attached client whose context resolves availability", false),
+			),
+			Responses: []ResponseSpec{
+				{Status: 200, Description: "OK", Body: contract.CmdPaletteCommandsResponse{}},
+				{Status: 400, Description: cmdPaletteInvalidWorkspaceDescription, Body: contract.CmdPaletteError{}},
+				{Status: 503, Description: cmdPaletteUnavailableDescription, Body: contract.CmdPaletteError{}},
+			},
+		},
+		{
+			Method: httpMethodGet, Path: "/api/cmd-palette/clients",
+			AppAccess:   AppAccessDenied,
+			OperationID: "listCmdPaletteClients", Summary: "List attached command palette clients",
+			Tags: []string{specCmdPaletteKey}, Transports: cmdPaletteTransports,
+			Parameters: withProfileScope(queryParam("workspace", "Workspace id, name, or path", true)),
+			Responses: []ResponseSpec{
+				{Status: 200, Description: "OK", Body: []contract.CmdPaletteClient{}},
+				{Status: 400, Description: cmdPaletteInvalidWorkspaceDescription, Body: contract.CmdPaletteError{}},
+				{Status: 503, Description: cmdPaletteUnavailableDescription, Body: contract.CmdPaletteError{}},
+			},
+		},
+		{
+			Method: httpMethodGet, Path: "/api/cmd-palette/rank-signals",
+			AppAccess:   AppAccessDenied,
+			OperationID: "getCmdPaletteRankSignals", Summary: "Get command palette rank signals",
+			Tags: []string{specCmdPaletteKey}, Transports: cmdPaletteTransports,
+			Parameters: withProfileScope(queryParam("workspace", "Workspace id, name, or path", true)),
+			Responses: []ResponseSpec{
+				{Status: 200, Description: "OK", Body: contract.CmdPaletteRankSignalsResponse{}},
+				{Status: 400, Description: cmdPaletteInvalidWorkspaceDescription, Body: contract.CmdPaletteError{}},
+				{Status: 503, Description: cmdPaletteUnavailableDescription, Body: contract.CmdPaletteError{}},
+			},
+		},
+		{
+			Method: httpMethodPost, Path: "/api/cmd-palette/usage",
+			AppAccess:   AppAccessDenied,
+			OperationID: "recordCmdPaletteUsage", Summary: "Record command palette usage",
+			Tags: []string{specCmdPaletteKey}, Transports: cmdPaletteTransports,
+			Parameters:  withProfileScope(),
+			RequestBody: contract.CmdPaletteUsageRequest{},
+			Responses: []ResponseSpec{
+				{Status: 204, Description: "Recorded"},
+				{Status: 400, Description: cmdPaletteInvalidRequestDescription, Body: contract.CmdPaletteError{}},
+				{Status: 404, Description: cmdPaletteCommandNotFoundDescription, Body: contract.CmdPaletteError{}},
+				{Status: 503, Description: cmdPaletteUnavailableDescription, Body: contract.CmdPaletteError{}},
+			},
+		},
+		{
+			Method: httpMethodPut, Path: "/api/cmd-palette/pins/{id}",
+			AppAccess:   AppAccessDenied,
+			OperationID: "pinCmdPaletteCommand", Summary: "Pin one command palette command",
+			Tags: []string{specCmdPaletteKey}, Transports: cmdPaletteTransports,
+			Parameters: withProfileSelector(
+				pathParam("id", "Canonical command id"),
+				queryParam("workspace", "Workspace id, name, or path", true),
+			),
+			Responses: []ResponseSpec{
+				{Status: 200, Description: "Pinned", Body: contract.CmdPalettePinResponse{}},
+				{Status: 400, Description: cmdPaletteInvalidWorkspaceDescription, Body: contract.CmdPaletteError{}},
+				{Status: 404, Description: cmdPaletteCommandNotFoundDescription, Body: contract.CmdPaletteError{}},
+				{Status: 503, Description: cmdPaletteUnavailableDescription, Body: contract.CmdPaletteError{}},
+			},
+		},
+		{
+			Method: httpMethodDelete, Path: "/api/cmd-palette/pins/{id}",
+			AppAccess:   AppAccessDenied,
+			OperationID: "unpinCmdPaletteCommand", Summary: "Unpin one command palette command",
+			Tags: []string{specCmdPaletteKey}, Transports: cmdPaletteTransports,
+			Parameters: withProfileSelector(
+				pathParam("id", "Canonical command id"),
+				queryParam("workspace", "Workspace id, name, or path", true),
+			),
+			Responses: []ResponseSpec{
+				{Status: 200, Description: "Unpinned", Body: contract.CmdPalettePinResponse{}},
+				{Status: 400, Description: cmdPaletteInvalidWorkspaceDescription, Body: contract.CmdPaletteError{}},
+				{Status: 404, Description: cmdPaletteCommandNotFoundDescription, Body: contract.CmdPaletteError{}},
+				{Status: 503, Description: cmdPaletteUnavailableDescription, Body: contract.CmdPaletteError{}},
+			},
+		},
+		{
+			Method: httpMethodGet, Path: "/api/cmd-palette/personalization",
+			AppAccess:   AppAccessDenied,
+			OperationID: "getCmdPalettePersonalization", Summary: "Get command palette personalization summary",
+			Tags: []string{specCmdPaletteKey}, Transports: cmdPaletteTransports,
+			Parameters: withProfileScope(queryParam("workspace", "Workspace id, name, or path", true)),
+			Responses: []ResponseSpec{
+				{Status: 200, Description: "OK", Body: contract.CmdPalettePersonalizationResponse{}},
+				{Status: 400, Description: cmdPaletteInvalidWorkspaceDescription, Body: contract.CmdPaletteError{}},
+				{Status: 503, Description: cmdPaletteUnavailableDescription, Body: contract.CmdPaletteError{}},
+			},
+		},
+		{
+			Method: httpMethodDelete, Path: "/api/cmd-palette/personalization",
+			AppAccess:   AppAccessDenied,
+			OperationID: "resetCmdPalettePersonalization", Summary: "Reset command palette personalization",
+			Tags: []string{specCmdPaletteKey}, Transports: cmdPaletteTransports,
+			Parameters: withProfileSelector(queryParam("workspace", "Workspace id, name, or path", true)),
+			Responses: []ResponseSpec{
+				{Status: 200, Description: "Reset", Body: contract.CmdPalettePersonalizationResetResponse{}},
+				{Status: 400, Description: cmdPaletteInvalidWorkspaceDescription, Body: contract.CmdPaletteError{}},
+				{Status: 503, Description: cmdPaletteUnavailableDescription, Body: contract.CmdPaletteError{}},
+			},
+		},
+		{
+			Method: httpMethodPost, Path: "/api/cmd-palette/commands/{id}/invoke",
+			AppAccess:   AppAccessDenied,
+			OperationID: cmdPaletteInvokeOperationID, Summary: "Invoke one command palette command",
+			Tags: []string{specCmdPaletteKey}, Transports: cmdPaletteTransports,
+			Parameters: withProfileSelector(
+				pathParam("id", "Canonical command id"),
+				headerParam("X-Compozy-Client-Token", "Attached client identity token"),
+			),
+			RequestBody: contract.CmdPaletteInvokeRequest{},
+			Responses: []ResponseSpec{
+				{Status: 200, Description: "Completed", Body: contract.CmdPaletteInvokeResult{}},
+				{Status: 202, Description: "Approval pending", Body: contract.CmdPaletteInvokeResult{}},
+				{Status: 400, Description: cmdPaletteInvalidRequestDescription, Body: contract.CmdPaletteError{}},
+				{Status: 401, Description: "Invalid client attachment", Body: contract.CmdPaletteError{}},
+				{Status: 404, Description: cmdPaletteCommandNotFoundDescription, Body: contract.CmdPaletteError{}},
+				{Status: 409, Description: "Invocation conflict", Body: contract.CmdPaletteError{}},
+				{Status: 412, Description: "Command unavailable", Body: contract.CmdPaletteError{}},
+				{Status: 422, Description: "Invalid command arguments", Body: contract.CmdPaletteError{}},
+				{Status: 503, Description: cmdPaletteUnavailableDescription, Body: contract.CmdPaletteError{}},
+			},
+		},
+		{
+			Method: httpMethodGet, Path: "/api/cmd-palette/views/{id}",
+			AppAccess:   AppAccessDenied,
+			OperationID: "getCmdPaletteView", Summary: "Get one declarative command palette view",
+			Tags: []string{specCmdPaletteKey}, Transports: cmdPaletteTransports,
+			Parameters: withProfileScope(
+				pathParam("id", "Canonical view id"),
+				queryParam("workspace", "Workspace id, name, or path", true),
+			),
+			Responses: []ResponseSpec{
+				{Status: 200, Description: "OK", Body: contract.CmdPaletteViewEnvelope{}},
+				{Status: 400, Description: cmdPaletteInvalidWorkspaceDescription, Body: contract.CmdPaletteError{}},
+				{Status: 404, Description: cmdPaletteViewNotFoundDescription, Body: contract.CmdPaletteError{}},
+				{Status: 422, Description: "Invalid view payload", Body: contract.CmdPaletteError{}},
+				{Status: 503, Description: cmdPaletteUnavailableDescription, Body: contract.CmdPaletteError{}},
+			},
+		},
+		{
+			Method: httpMethodGet, Path: "/api/cmd-palette/views/{id}/stream",
+			AppAccess:   AppAccessDenied,
+			OperationID: "streamCmdPaletteView", Summary: "Stream declarative command palette view patches",
+			Tags: []string{specCmdPaletteKey}, Transports: cmdPaletteTransports,
+			Parameters: withProfileScope(
+				pathParam("id", "Canonical view id"),
+				queryParam("workspace", "Workspace id, name, or path", true),
+				queryParam("after", "Last applied patch sequence", false),
+				queryParam("stream_epoch", "Stream epoch required when after is greater than zero", false),
+			),
+			Responses: []ResponseSpec{
+				{
+					Status: 200, Description: "Revision-fenced view patch stream",
+					Body: contract.CmdPaletteViewPatch{}, ContentType: specContentTypeEventStream,
+				},
+				{Status: 400, Description: "Invalid stream cursor", Body: contract.CmdPaletteError{}},
+				{Status: 404, Description: cmdPaletteViewNotFoundDescription, Body: contract.CmdPaletteError{}},
+				{Status: 422, Description: "Invalid view payload", Body: contract.CmdPaletteError{}},
+				{Status: 503, Description: cmdPaletteUnavailableDescription, Body: contract.CmdPaletteError{}},
+			},
+		},
+		{
+			Method: httpMethodPost, Path: "/api/cmd-palette/views/{id}/open",
+			AppAccess:   AppAccessDenied,
+			OperationID: cmdPaletteOpenViewOperationID, Summary: "Open one programmable command palette view",
+			Tags: []string{specCmdPaletteKey}, Transports: cmdPaletteTransports,
+			Parameters: withProfileSelector(
+				pathParam("id", "Canonical view id"),
+				headerParam("X-Compozy-Client-Token", "Attached client identity token"),
+			),
+			RequestBody: contract.CmdPaletteViewSessionOpenRequest{},
+			Responses: []ResponseSpec{
+				{Status: 200, Description: "Opened", Body: contract.CmdPaletteViewSessionOpenResponse{}},
+				{Status: 400, Description: cmdPaletteInvalidRequestDescription, Body: contract.CmdPaletteError{}},
+				{Status: 401, Description: "Invalid client attachment", Body: contract.CmdPaletteError{}},
+				{Status: 404, Description: cmdPaletteViewNotFoundDescription, Body: contract.CmdPaletteError{}},
+				{Status: 422, Description: "View is not programmable", Body: contract.CmdPaletteError{}},
+				{Status: 503, Description: cmdPaletteUnavailableDescription, Body: contract.CmdPaletteError{}},
+			},
+		},
+		{
+			Method: httpMethodGet, Path: "/api/cmd-palette/view-sessions/{session}/stream",
+			AppAccess:   AppAccessDenied,
+			OperationID: "streamCmdPaletteViewSession", Summary: "Stream one programmable command palette view",
+			Tags: []string{specCmdPaletteKey}, Transports: cmdPaletteTransports,
+			Parameters: []ParameterSpec{
+				pathParam("session", "Opaque view session id"),
+				queryParam("token", "Opaque session stream token", true),
+			},
+			Responses: []ResponseSpec{
+				{
+					Status: 200, Description: "Session-scoped view frames",
+					Body: contract.ViewFrame{}, ContentType: specContentTypeEventStream,
+				},
+				{Status: 403, Description: "Invalid stream token", Body: contract.CmdPaletteError{}},
+				{Status: 410, Description: "View session is gone", Body: contract.CmdPaletteError{}},
+			},
+		},
+		{
+			Method: httpMethodPost, Path: "/api/cmd-palette/view-sessions/{session}/events",
+			AppAccess:   AppAccessDenied,
+			OperationID: cmdPaletteAdmitViewEventOperationID, Summary: "Send one programmable view event",
+			Tags: []string{specCmdPaletteKey}, Transports: cmdPaletteTransports,
+			Parameters: []ParameterSpec{
+				pathParam("session", "Opaque view session id"),
+				headerParam("X-Compozy-Client-Token", "Attached client identity token"),
+			},
+			RequestBody: contract.CmdPaletteViewSessionEventRequest{},
+			Responses: []ResponseSpec{
+				{Status: 202, Description: "Accepted", Body: contract.CmdPaletteViewSessionAccepted{}},
+				{Status: 400, Description: cmdPaletteInvalidRequestDescription, Body: contract.CmdPaletteError{}},
+				{Status: 403, Description: "Session ownership mismatch", Body: contract.CmdPaletteError{}},
+				{Status: 409, Description: "View event cap reached", Body: contract.CmdPaletteError{}},
+				{Status: 410, Description: "View session is gone", Body: contract.CmdPaletteError{}},
+			},
+		},
+		{
+			Method: httpMethodDelete, Path: "/api/cmd-palette/view-sessions/{session}",
+			AppAccess:   AppAccessDenied,
+			OperationID: cmdPaletteCloseViewOperationID, Summary: "Close one programmable command palette view",
+			Tags: []string{specCmdPaletteKey}, Transports: cmdPaletteTransports,
+			Parameters: []ParameterSpec{
+				pathParam("session", "Opaque view session id"),
+				headerParam("X-Compozy-Client-Token", "Attached client identity token"),
+			},
+			Responses: []ResponseSpec{
+				{Status: 200, Description: "Closed", Body: contract.CmdPaletteViewSessionClosed{}},
+				{Status: 403, Description: "Session ownership mismatch", Body: contract.CmdPaletteError{}},
+			},
+		},
+		{
+			Method: httpMethodGet, Path: "/api/cmd-palette/stream",
+			AppAccess:   AppAccessDenied,
+			OperationID: "streamCmdPalette", Summary: "Stream command palette catalog invalidations",
+			Tags: []string{specCmdPaletteKey}, Transports: cmdPaletteTransports,
+			Parameters: withProfileScope(queryParam("workspace", "Workspace id, name, or path", true)),
+			Responses: []ResponseSpec{
+				{
+					Status: 200, Description: "Catalog invalidation stream",
+					Body: contract.CmdPaletteCatalogChangedEvent{}, ContentType: specContentTypeEventStream,
+				},
+				{Status: 400, Description: cmdPaletteInvalidWorkspaceDescription, Body: contract.CmdPaletteError{}},
+				{Status: 503, Description: cmdPaletteUnavailableDescription, Body: contract.CmdPaletteError{}},
+			},
+		},
+		{
+			Method: httpMethodGet, Path: "/api/tools/approvals/{id}",
+			AppAccess:   AppAccessDenied,
+			OperationID: "getPendingToolApproval", Summary: "Get one pending tool approval lifecycle",
+			Tags: []string{specToolsKey}, Transports: cmdPaletteTransports,
+			Parameters: []ParameterSpec{
+				pathParam("id", "Stable approval id"),
+				queryParam("profile", "Profile that owns the approval", false),
+			},
+			Responses: []ResponseSpec{
+				{Status: 200, Description: "OK", Body: contract.ToolApprovalStatusResponse{}},
+				{Status: 404, Description: cmdPaletteApprovalNotFoundDescription, Body: contract.CmdPaletteError{}},
+				{Status: 503, Description: cmdPaletteApprovalUnavailableDescription, Body: contract.CmdPaletteError{}},
+			},
+		},
+		{
+			Method: httpMethodPost, Path: "/api/tools/approvals/{id}/resolve",
+			AppAccess:   AppAccessDenied,
+			OperationID: "resolvePendingToolApproval", Summary: "Approve or deny one pending tool approval",
+			Tags: []string{specToolsKey}, Transports: cmdPaletteTransports,
+			Parameters: []ParameterSpec{
+				pathParam("id", "Stable approval id"),
+				queryParam("profile", "Profile that owns the approval", false),
+			},
+			RequestBody: contract.ResolveToolApprovalRequest{},
+			Responses: []ResponseSpec{
+				{
+					Status:      200,
+					Description: "Decision recorded; execution may still be running",
+					Body:        contract.ToolApprovalStatusResponse{},
+				},
+				{Status: 400, Description: cmdPaletteInvalidRequestDescription, Body: contract.CmdPaletteError{}},
+				{Status: 403, Description: "Local operator surface required", Body: contract.ErrorPayload{}},
+				{Status: 404, Description: cmdPaletteApprovalNotFoundDescription, Body: contract.CmdPaletteError{}},
+				{Status: 409, Description: "Approval already terminal", Body: contract.CmdPaletteError{}},
+				{Status: 503, Description: cmdPaletteApprovalUnavailableDescription, Body: contract.CmdPaletteError{}},
+			},
+		},
+		{
+			Method: httpMethodPost, Path: "/api/tools/approvals/{id}/cancel",
+			AppAccess:   AppAccessDenied,
+			OperationID: "cancelPendingToolApproval", Summary: "Cancel one pending tool approval",
+			Tags: []string{specToolsKey}, Transports: cmdPaletteTransports,
+			Parameters: []ParameterSpec{
+				pathParam("id", "Stable approval id"),
+				queryParam("profile", "Profile that owns the approval", false),
+			},
+			Responses: []ResponseSpec{
+				{Status: 200, Description: "Canceled", Body: contract.ToolApprovalStatusResponse{}},
+				{Status: 404, Description: cmdPaletteApprovalNotFoundDescription, Body: contract.CmdPaletteError{}},
+				{Status: 409, Description: "Approval already terminal", Body: contract.CmdPaletteError{}},
+				{Status: 503, Description: cmdPaletteApprovalUnavailableDescription, Body: contract.CmdPaletteError{}},
+			},
+		},
+	}
+)
+
+func cmdPaletteOperations() []OperationSpec {
+	return cloneOperationSpecs(cmdPaletteOperationSpecs)
+}

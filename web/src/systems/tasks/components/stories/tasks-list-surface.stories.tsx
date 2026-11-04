@@ -1,0 +1,270 @@
+import type { Meta, StoryObj } from "@storybook/react-vite";
+import { ListChecks } from "@compozy/ui/icons";
+import { useState } from "react";
+
+import { UIProvider, useTopbarSlot } from "@compozy/ui";
+import { OsWindowFrame } from "@/systems/os/components";
+import { ownerFromRow } from "@/systems/profiles";
+
+import { TasksListSurface } from "../tasks-list-surface";
+import type { TasksListSurfaceProps } from "../tasks-list-surface";
+import { TasksListToolbar } from "../tasks-list-toolbar";
+import type { TaskFilterOwnerOption } from "../../lib/tasks-list-filters";
+import { countTasksByStatus } from "../../lib/task-formatters";
+import type {
+  TaskListItem,
+  TaskListSortKey,
+  TaskPriority,
+  TaskRecordsFilter,
+  TaskStatus,
+} from "../../types";
+import {
+  LOOP_TASK_FIXTURES,
+  aggregateProfileTaskFixture,
+  buildTaskFixture,
+  loopRunGoneTaskFixture,
+} from "./fixtures";
+
+const FIXTURE_TASKS = [
+  buildTaskFixture({
+    id: "task_a",
+    status: "in_progress",
+    title: "Investigate auth middleware leak",
+  }),
+  buildTaskFixture({
+    id: "task_b",
+    status: "ready",
+    title: "Wire /healthz to status footer",
+    priority: "medium",
+  }),
+  buildTaskFixture({
+    id: "task_c",
+    status: "blocked",
+    title: "Land RFC-002 protocol receipt schema",
+    priority: "urgent",
+  }),
+  buildTaskFixture({
+    id: "task_d",
+    status: "pending",
+    title: "Define agent execution profile defaults",
+    priority: "medium",
+  }),
+  buildTaskFixture({
+    id: "task_e",
+    status: "completed",
+    title: "Patch SQLite migration registry race on first boot",
+    priority: "high",
+  }),
+  buildTaskFixture({
+    id: "task_f",
+    status: "failed",
+    title: "Backfill task_runs.queue_position for legacy rows",
+    priority: "high",
+  }),
+];
+
+const OWNER_OPTIONS: TaskFilterOwnerOption[] = [
+  { ref: "Coder", kind: "agent_session" },
+  { ref: "Reviewer", kind: "agent_session" },
+  { ref: "pedro@", kind: "human" },
+];
+
+interface TasksListStoryProps extends Omit<Partial<TasksListSurfaceProps>, "tasks"> {
+  tasks?: TaskListItem[];
+  initialRecordsFilter?: TaskRecordsFilter;
+}
+
+const STORY_PROFILE_SCOPE = {
+  aggregate: false,
+  destination: "default",
+  scopeLabel: "default",
+  ownerOf: () => ({ id: "00000000000000000000000000", name: "default", archived: false }),
+};
+
+const AGGREGATE_PROFILE_SCOPE = {
+  aggregate: true,
+  scopeLabel: null,
+  ownerOf: ownerFromRow,
+};
+
+function Stateful(props: TasksListStoryProps) {
+  const [statusFilter, setStatusFilter] = useState<TaskStatus | null>(null);
+  const [ownerFilter, setOwnerFilter] = useState<TaskFilterOwnerOption | null>(null);
+  const [priorityFilter, setPriorityFilter] = useState<TaskPriority | null>(null);
+  const [sortBy, setSortBy] = useState<TaskListSortKey>("recent");
+  const [searchQuery, setSearchQuery] = useState("");
+  const [recordsFilter, setRecordsFilter] = useState<TaskRecordsFilter>(
+    props.initialRecordsFilter ?? "work"
+  );
+  const tasks = props.tasks ?? FIXTURE_TASKS;
+
+  return (
+    <UIProvider reducedMotion="always">
+      <div className="flex h-screen items-center justify-center bg-rail p-10">
+        <OsWindowFrame className="h-full max-h-[720px] w-full max-w-[1080px]" title="Tasks">
+          <TasksListStoryRoute
+            ownerFilter={ownerFilter}
+            priorityFilter={priorityFilter}
+            props={props}
+            recordsFilter={recordsFilter}
+            searchQuery={searchQuery}
+            setOwnerFilter={setOwnerFilter}
+            setPriorityFilter={setPriorityFilter}
+            setRecordsFilter={setRecordsFilter}
+            setSearchQuery={setSearchQuery}
+            setSortBy={setSortBy}
+            setStatusFilter={setStatusFilter}
+            sortBy={sortBy}
+            statusFilter={statusFilter}
+            tasks={tasks}
+          />
+        </OsWindowFrame>
+      </div>
+    </UIProvider>
+  );
+}
+
+function TasksListStoryRoute({
+  ownerFilter,
+  priorityFilter,
+  props,
+  recordsFilter,
+  searchQuery,
+  setOwnerFilter,
+  setPriorityFilter,
+  setRecordsFilter,
+  setSearchQuery,
+  setSortBy,
+  setStatusFilter,
+  sortBy,
+  statusFilter,
+  tasks,
+}: {
+  ownerFilter: TaskFilterOwnerOption | null;
+  priorityFilter: TaskPriority | null;
+  props: TasksListStoryProps;
+  recordsFilter: TaskRecordsFilter;
+  searchQuery: string;
+  setOwnerFilter: (value: TaskFilterOwnerOption | null) => void;
+  setPriorityFilter: (value: TaskPriority | null) => void;
+  setRecordsFilter: (value: TaskRecordsFilter) => void;
+  setSearchQuery: (value: string) => void;
+  setSortBy: (value: TaskListSortKey) => void;
+  setStatusFilter: (value: TaskStatus | null) => void;
+  sortBy: TaskListSortKey;
+  statusFilter: TaskStatus | null;
+  tasks: TaskListItem[];
+}) {
+  const { tasks: _tasks, initialRecordsFilter: _initialRecordsFilter, ...surfaceProps } = props;
+  useTopbarSlot({
+    glyph: <ListChecks />,
+    count: tasks.length,
+    toolbar: (
+      <TasksListToolbar
+        onOwnerChange={setOwnerFilter}
+        onPriorityChange={setPriorityFilter}
+        onRecordsFilterChange={setRecordsFilter}
+        onSearchQueryChange={setSearchQuery}
+        onSortChange={setSortBy}
+        onStatusChange={setStatusFilter}
+        ownerFilter={ownerFilter}
+        ownerOptions={OWNER_OPTIONS}
+        priorityFilter={priorityFilter}
+        recordsFilter={recordsFilter}
+        searchQuery={searchQuery}
+        sortBy={sortBy}
+        statusCounts={props.statusCounts ?? countTasksByStatus(tasks)}
+        statusFilter={statusFilter}
+      />
+    ),
+  });
+
+  return (
+    <TasksListSurface
+      profile={STORY_PROFILE_SCOPE}
+      filterState={
+        statusFilter || ownerFilter || priorityFilter || searchQuery ? "active" : "inactive"
+      }
+      onShowWorkItems={() => setRecordsFilter("work")}
+      recordsFilter={recordsFilter}
+      searchQuery={searchQuery}
+      statusCounts={props.statusCounts ?? countTasksByStatus(tasks)}
+      tasks={tasks}
+      {...surfaceProps}
+    />
+  );
+}
+
+const meta: Meta<typeof TasksListSurface> = {
+  title: "systems/tasks/components/TasksListSurface",
+  component: TasksListSurface,
+  parameters: {
+    layout: "fullscreen",
+    docs: {
+      description: {
+        component: "Backend-filtered task list with exact status facets and explicit continuation.",
+      },
+    },
+  },
+};
+
+export default meta;
+type Story = StoryObj<typeof TasksListSurface>;
+
+export const Default: Story = {
+  args: {},
+  render: () => <Stateful />,
+};
+
+export const Loading: Story = {
+  args: {},
+  render: () => <Stateful isLoading tasks={[]} />,
+};
+
+export const Empty: Story = {
+  args: {},
+  render: () => <Stateful tasks={[]} />,
+};
+
+export const ErrorState: Story = {
+  args: {},
+  render: () => <Stateful tasks={[]} errorMessage="CompozyOS unreachable on /api/tasks." />,
+};
+
+export const SingleGroup: Story = {
+  args: {},
+  render: () => <Stateful tasks={FIXTURE_TASKS.filter(task => task.status === "in_progress")} />,
+};
+
+/** Reveal on: Loop execution records join the same row geometry as work items. */
+export const RevealedLoopRecords: Story = {
+  args: {},
+  render: () => (
+    <Stateful
+      initialRecordsFilter="loop"
+      tasks={[...LOOP_TASK_FIXTURES, ...FIXTURE_TASKS.slice(0, 2)]}
+    />
+  ),
+};
+
+/** Reveal on, nothing to reveal — filter-scoped, never the generic empty. */
+export const RevealedEmpty: Story = {
+  args: {},
+  render: () => <Stateful initialRecordsFilter="loop" tasks={[]} />,
+};
+
+/** Retention removed the run: the record stays, says so, and carries no link. */
+export const RevealedRunDeleted: Story = {
+  args: {},
+  render: () => <Stateful initialRecordsFilter="loop" tasks={[loopRunGoneTaskFixture]} />,
+};
+
+export const AggregateOwners: Story = {
+  args: {},
+  render: () => (
+    <Stateful
+      profile={AGGREGATE_PROFILE_SCOPE}
+      tasks={[FIXTURE_TASKS[0]!, aggregateProfileTaskFixture]}
+    />
+  ),
+};

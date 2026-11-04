@@ -1,16 +1,432 @@
 @import "tailwindcss";
+/* Inter Variable (wght 100–900) carries the 425 regular; Geist Mono Variable
+   covers code, paths and the terminal. */
+@import "@fontsource-variable/inter";
+@import "@fontsource-variable/geist-mono";
 @import "@compozy/ui/tokens.css";
+@import "shadcn/tailwind.css";
 
-@source "../../packages/ui/src";
+/*
+ * Tailwind v4 scans relative to this stylesheet and ignores external workspace
+ * packages by default. Register shared UI sources so embedded builds emit the
+ * utility classes used by @compozy/ui primitives such as Button.
+ */
+@source "../../packages/ui/src/**/*.{ts,tsx}";
+@source "../../node_modules/streamdown/dist/*.js";
 
-@layer base {
-  body {
-    background:
-      radial-gradient(circle at top left, rgba(214, 242, 74, 0.045), transparent 24%),
-      linear-gradient(180deg, rgba(255, 255, 255, 0.012), transparent 18%), var(--background);
+#app {
+  min-height: 100%;
+}
+
+/* Session composer Lexical editor — @assistant-ui/react-lexical renders fixed
+   aui-lexical-* class names on library-owned nodes, so tokens style them here
+   instead of Tailwind utilities. */
+.aui-lexical-editor {
+  position: relative;
+}
+
+.aui-lexical-input {
+  outline: none;
+  white-space: pre-wrap;
+  word-break: break-word;
+  caret-color: var(--color-fg);
+}
+
+.aui-lexical-input p {
+  margin: 0;
+}
+
+/* The same globe affordance a sent user link carries (lucide globe, ink of the link). */
+.aui-lexical-input span[style*="--compozy-composer-link"]::before {
+  content: "";
+  display: inline-block;
+  width: 0.9em;
+  height: 0.9em;
+  margin-inline-end: 0.25em;
+  vertical-align: -0.1em;
+  background-color: currentColor;
+  mask: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='black' stroke-width='1.75' stroke-linecap='round' stroke-linejoin='round'%3E%3Ccircle cx='12' cy='12' r='10'/%3E%3Cpath d='M12 2a14.5 14.5 0 0 0 0 20 14.5 14.5 0 0 0 0-20'/%3E%3Cpath d='M2 12h20'/%3E%3C/svg%3E")
+    center / contain no-repeat;
+}
+
+.aui-lexical-placeholder {
+  position: absolute;
+  inset-block-start: 0;
+  inset-inline-start: 0;
+  pointer-events: none;
+  color: var(--color-muted-foreground);
+}
+
+/* Marketplace install flash — one success-tint fade when a row just landed (state, not accent). */
+@keyframes marketplace-card-flash {
+  0% {
+    background-color: var(--color-success-tint);
+  }
+  100% {
+    background-color: var(--color-canvas-soft);
   }
 }
 
-@utility eyebrow {
-  @apply font-eyebrow text-[10px] leading-4 font-medium tracking-[0.14em] uppercase;
+.marketplace-card-flash {
+  animation: marketplace-card-flash 1.4s var(--ease-out) 1;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .marketplace-card-flash {
+    animation: none;
+    background-color: var(--color-elevated);
+  }
+}
+
+/* Runtime speed switch: the bolt zaps as fast engages (design ref:
+   runtime-selector-variations.html). Global reduced-motion collapse in
+   @compozy/ui tokens-runtime.css zeroes this out. */
+@keyframes runtime-speed-bolt {
+  0% {
+    transform: scale(0.6) rotate(-14deg);
+  }
+  55% {
+    transform: scale(1.2) rotate(7deg);
+  }
+  100% {
+    transform: scale(1) rotate(0deg);
+  }
+}
+
+.runtime-speed-bolt {
+  animation: runtime-speed-bolt 420ms var(--ease-spring);
+}
+
+/* Session live-thinking shimmer — a shimmering text label only (design ref:
+   session.css §05). Reduced motion falls back to static subtle text because the
+   effect relies on background-clip, which a zeroed animation alone can't undo. */
+@keyframes session-shimmer {
+  from {
+    background-position: 180% 0;
+  }
+  to {
+    background-position: -20% 0;
+  }
+}
+
+.session-shimmer {
+  background: linear-gradient(
+    90deg,
+    var(--color-subtle) 0%,
+    var(--color-subtle) 40%,
+    var(--color-fg-strong) 50%,
+    var(--color-subtle) 60%,
+    var(--color-subtle) 100%
+  );
+  background-size: 200% 100%;
+  -webkit-background-clip: text;
+  background-clip: text;
+  color: transparent;
+  animation: session-shimmer 2s linear infinite;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .session-shimmer {
+    animation: none;
+    background: none;
+    color: var(--color-subtle);
+  }
+}
+
+/* Session work rail — the steps behind an open work group hang off one spine
+   that starts under the group's glyph, each joined by a quarter-curve branch
+   (design ref: MonoCode phase rail). The spine color is opaque so the spine and
+   the curve never double up where they overlap. The last step's spine stops at
+   its branch. Opening fades the steps in; reduced motion opens instantly. */
+.session-rail {
+  --session-rail-color: var(--color-line-strong);
+  animation: session-rail-open var(--duration-slow) var(--ease-out) both;
+}
+
+/* The spine sits under the center of the header's 18px glyph well (4px pad +
+   9px), so it reads as dropping out of the group's glyph. */
+.session-rail-step {
+  position: relative;
+  padding-left: 24px;
+}
+
+.session-rail-step::before,
+.session-rail-step::after {
+  content: "";
+  position: absolute;
+  left: 12px;
+  pointer-events: none;
+}
+
+.session-rail-step::before {
+  top: 0;
+  height: 100%;
+  width: 1px;
+  background: var(--session-rail-color);
+}
+
+.session-rail-step:last-child::before {
+  height: 6px;
+}
+
+.session-rail-step::after {
+  top: 4px;
+  width: 9px;
+  height: 8px;
+  border-bottom: 1px solid var(--session-rail-color);
+  border-left: 1px solid var(--session-rail-color);
+  border-bottom-left-radius: 8px;
+}
+
+/* Assistant prose rests one step under full ink so its bold and headings carry
+   emphasis (design ref: MonoCode agent-markdown, p/li at ~78%). */
+.session-answer p,
+.session-answer li {
+  color: color-mix(in oklab, var(--color-fg) 82%, transparent);
+}
+
+/* An opened turn fold: its rows sit beside one spine that drops from the fold's
+   glyph (same 12px axis as the work-group rail). */
+.session-fold-body {
+  position: relative;
+  padding-left: 24px;
+}
+
+.session-fold-body::before {
+  content: "";
+  position: absolute;
+  top: 2px;
+  bottom: 6px;
+  left: 12px;
+  width: 1px;
+  background: var(--session-rail-color);
+  pointer-events: none;
+}
+
+/* Prose inside an opened turn fold is process, not result: one ink step quieter
+   than the answer, its headings reduced to bold lines (design ref: MonoCode
+   fold prose). */
+.session-fold-body p,
+.session-fold-body li {
+  color: color-mix(in oklab, var(--color-fg) 65%, transparent);
+}
+
+.session-fold-body strong,
+.session-fold-body em {
+  color: color-mix(in oklab, var(--color-fg) 80%, transparent);
+}
+
+.session-fold-body :is(h1, h2, h3, h4, h5, h6) {
+  margin-top: 0.75rem;
+  margin-bottom: 0.25rem;
+  font-size: var(--text-small-body);
+  font-weight: 600;
+  color: color-mix(in oklab, var(--color-fg) 80%, transparent);
+}
+
+@keyframes session-rail-open {
+  from {
+    opacity: 0;
+    transform: translateY(-3px);
+  }
+  to {
+    opacity: 1;
+    transform: none;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .session-rail {
+    animation: none;
+  }
+}
+
+/* Live reasoning line — breathes between two ink steps while the agent thinks
+   (design ref: MonoCode zen-thinking-pulse). Reduced motion holds it still. */
+@keyframes session-thinking-pulse {
+  0%,
+  100% {
+    opacity: 0.45;
+  }
+  50% {
+    opacity: 1;
+  }
+}
+
+.session-thinking-pulse {
+  animation: session-thinking-pulse 1.8s ease-in-out infinite;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .session-thinking-pulse {
+    animation: none;
+  }
+}
+
+/* Session working row — three 4px dots on a stepped 2s duty cycle (design ref:
+   session.css §05). The component itself swaps to a static label under reduced
+   motion; the global collapse in tokens-runtime.css also zeroes this. */
+@keyframes session-working-pulse {
+  0%,
+  40% {
+    opacity: 1;
+  }
+  50%,
+  90% {
+    opacity: 0.35;
+  }
+  100% {
+    opacity: 1;
+  }
+}
+
+.session-working-dots > span {
+  animation: session-working-pulse 2s steps(6) infinite;
+}
+
+.session-working-dots > span:nth-child(2) {
+  animation-delay: 200ms;
+}
+
+.session-working-dots > span:nth-child(3) {
+  animation-delay: 400ms;
+}
+
+/* First-run setup step change: the incoming pane fades and rises so the panel
+   reads as one surface changing shape, not two panels swapping. */
+@keyframes onboarding-setup-pane-in {
+  from {
+    opacity: 0;
+    transform: translateY(8px);
+  }
+}
+
+/* Reduced motion is owned globally by `@compozy/ui` tokens-runtime.css, which collapses
+   every animation/transition duration — this class adds no local override. */
+.onboarding-setup-pane-in {
+  animation: onboarding-setup-pane-in var(--duration-shell-slow) var(--ease-out) both;
+}
+
+/* Genie minimize (os-v2.css `.win.is-minimizing` verbatim): the window folds
+   into its dock item before the minimize commits. Reduced motion (system OR
+   in-product toggle) skips the class entirely — minimize is instant. */
+.os-window-minimizing {
+  transition:
+    transform 0.3s var(--ease-spring),
+    opacity 0.28s ease;
+  pointer-events: none;
+}
+
+/* Desktop switch slide/crossfade. Keyframes (not transitions) so the motion
+   fires even when the transition intent and the active-desktop flip land in
+   one render — zoom, cross-desktop focus, and remote switches arrive that way. */
+@keyframes os-desk-in-later {
+  from {
+    transform: translateX(var(--distance-desk-slide));
+    opacity: 0;
+  }
+}
+
+@keyframes os-desk-in-earlier {
+  from {
+    transform: translateX(calc(-1 * var(--distance-desk-slide)));
+    opacity: 0;
+  }
+}
+
+/* Out keyframes carry explicit `from` blocks: the leaving desktop's base
+   style is already opacity 0 (inactive), so the implicit from would hide it. */
+@keyframes os-desk-out-later {
+  from {
+    transform: translateX(0);
+    opacity: 1;
+  }
+  to {
+    transform: translateX(calc(-1 * var(--distance-desk-slide)));
+    opacity: 0;
+  }
+}
+
+@keyframes os-desk-out-earlier {
+  from {
+    transform: translateX(0);
+    opacity: 1;
+  }
+  to {
+    transform: translateX(var(--distance-desk-slide));
+    opacity: 0;
+  }
+}
+
+@keyframes os-desk-fade-in {
+  from {
+    opacity: 0;
+  }
+}
+
+@keyframes os-desk-fade-out {
+  from {
+    opacity: 1;
+  }
+  to {
+    opacity: 0;
+  }
+}
+
+/* Workspaces overview (Command-Tab switcher) entries. Components skip these
+   classes entirely under the in-product reduced-motion setting; the media
+   query covers the system preference. */
+@keyframes os-wsov-in {
+  from {
+    opacity: 0;
+    transform: translateY(var(--distance-workspaces-stage-entry))
+      scale(var(--scale-workspaces-stage-entry));
+  }
+}
+
+@keyframes os-wsov-menu-in {
+  from {
+    opacity: 0;
+    transform: translateY(var(--distance-workspaces-menu-entry));
+  }
+}
+
+@keyframes os-wsov-cap-swap {
+  from {
+    opacity: 0;
+    transform: translateY(var(--distance-workspaces-caption-entry));
+  }
+}
+
+.os-wsov-in {
+  animation: os-wsov-in var(--duration-slow) var(--ease-out);
+}
+
+.os-wsov-menu-in {
+  animation: os-wsov-menu-in var(--duration-base) var(--ease-out);
+}
+
+.os-wsov-cap-swap {
+  animation: os-wsov-cap-swap var(--duration-base) var(--ease-out);
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .os-wsov-in,
+  .os-wsov-menu-in,
+  .os-wsov-cap-swap {
+    animation: none;
+  }
+}
+
+/* Find in conversation (S8): match marks through the CSS Custom Highlight API,
+   registered by the session viewport — a neutral glaze on every hit, the active
+   hit in the accent tint. Highlight pseudo-elements take colour only. */
+::highlight(session-find-match) {
+  background-color: var(--color-bar-fill);
+  color: var(--color-fg);
+}
+
+::highlight(session-find-active) {
+  background-color: var(--color-brand-tint-strong);
+  color: var(--color-fg);
 }

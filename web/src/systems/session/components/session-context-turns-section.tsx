@@ -1,0 +1,193 @@
+import { describeCost } from "@/lib/cost-provenance";
+import { Fragment, useState } from "react";
+import { Button, Collapsible, CollapsibleContent } from "@compozy/ui";
+import { History, Minimize2 } from "@compozy/ui/icons";
+import type { SessionUsageTurnsResponse } from "../types";
+import { formatContextTokens, formatContextTurn } from "../lib/context-format";
+import {
+  describeSessionCompactionMarkers,
+  type SessionCompactionMarkerView,
+} from "../lib/session-context-view";
+import {
+  SessionInspectorDisclosureHead,
+  SessionInspectorEmpty,
+  SessionInspectorSection,
+} from "./session-inspector-section";
+import { SessionContextTurnsSkeleton } from "./session-inspector-skeleton";
+
+const VISIBLE_TURNS = 50;
+
+type Turn = SessionUsageTurnsResponse["turns"][number];
+
+/** "in · out · cache" plus what CompozyOS delivered; absent counters have no clause. */
+function turnDetails(turn: Turn): string[] {
+  const usage = turn.usage;
+  const parts: string[] = [];
+  if (usage?.input_tokens != null) parts.push(`in ${formatContextTokens(usage.input_tokens)}`);
+  if (usage?.output_tokens != null) parts.push(`out ${formatContextTokens(usage.output_tokens)}`);
+  if (usage?.cache_read_tokens != null)
+    parts.push(`cache ${formatContextTokens(usage.cache_read_tokens)}`);
+  if (usage?.cache_write_tokens != null)
+    parts.push(`cache write ${formatContextTokens(usage.cache_write_tokens)}`);
+  if (usage?.total_tokens != null && usage.input_tokens == null && usage.output_tokens == null)
+    parts.push(`${formatContextTokens(usage.total_tokens)} tokens`);
+  if (turn.injected) parts.push(`≈ ${formatContextTokens(turn.injected.tokens)} injected`);
+  return parts;
+}
+
+function SessionContextTurnRow({ turn }: { turn: Turn }) {
+  const usage = turn.usage;
+  const context = usage?.context_used;
+  // Per-turn ACP cost is an agent report, not a catalog estimate.
+  const cost = describeCost({
+    status: usage?.cost_amount != null ? "actual" : undefined,
+    source: "agent_reported",
+    amount: usage?.cost_amount,
+    currency: usage?.cost_currency,
+  });
+  const details = turnDetails(turn);
+  return (
+    <li
+      className="grid grid-cols-[3.75rem_minmax(0,1fr)_auto] items-center gap-2 px-2.5 py-1.75 text-form-label text-muted-foreground"
+      data-testid="session-context-turn-row"
+    >
+      <span className="truncate font-mono text-mono-id text-subtle" title={turn.turn_id}>
+        Turn {formatContextTurn(turn.turn_id)}
+      </span>
+      <span className="flex min-w-0 flex-col gap-0.5">
+        {context != null ? (
+          <span className="font-mono text-mono-id tabular-nums text-fg">
+            {formatContextTokens(context)}
+            <small className="text-faint">
+              {usage?.context_size != null
+                ? ` / ${formatContextTokens(usage.context_size)}`
+                : " used"}
+            </small>
+          </span>
+        ) : null}
+        {details.length > 0 ? (
+          <span className="text-micro leading-4 text-faint">{details.join(" · ")}</span>
+        ) : null}
+      </span>
+      <dl className="text-right font-mono text-mono-id tabular-nums">
+        <dt className="sr-only">Turn cost</dt>
+        <dd className={cost.hasCost ? "text-muted-foreground" : "text-faint"}>{cost.value}</dd>
+      </dl>
+    </li>
+  );
+}
+
+/** Only the figures the daemon recorded: before and after, before alone, or nothing. */
+function compactionTokens({ before, after }: SessionCompactionMarkerView): string | undefined {
+  const from = before != null ? formatContextTokens(before) : undefined;
+  const to = after != null ? formatContextTokens(after) : undefined;
+  if (from && to) return `${from} → ${to}`;
+  if (from) return from;
+  return to ? `→ ${to}` : undefined;
+}
+
+/** An observed agent compaction: who started it, how it ended, and the window before and after. */
+function SessionContextCompactionMarker({ marker }: { marker: SessionCompactionMarkerView }) {
+  const tokens = compactionTokens(marker);
+  return (
+    <li
+      className="flex items-start gap-1.75 px-2.5 py-1.5 text-micro leading-4 text-subtle"
+      data-status={marker.status}
+      data-testid="session-context-compaction-marker"
+      data-trigger={marker.trigger}
+    >
+      <Minimize2 aria-hidden="true" className="mt-0.75 size-2.75 shrink-0" />
+      <span>
+        {marker.label} ·{" "}
+        <span className={marker.status === "failed" ? "text-destructive" : undefined}>
+          {marker.statusLabel}
+        </span>
+        {tokens ? (
+          <>
+            {" "}
+            · <b className="font-mono font-medium tabular-nums text-muted-foreground">{tokens}</b>
+          </>
+        ) : null}
+      </span>
+    </li>
+  );
+}
+
+function turnsMeta(count: number, unavailable: boolean): string | undefined {
+  if (count > 0) return `${count.toLocaleString()} ${count === 1 ? "turn" : "turns"}`;
+  return unavailable ? "unavailable" : undefined;
+}
+
+/** Ships folded: the head carries the count, the per-turn history opens on demand. */
+export function SessionContextTurnsSection({
+  data,
+  unavailable = false,
+  loading = false,
+  defaultOpen = false,
+}: {
+  data?: SessionUsageTurnsResponse;
+  unavailable?: boolean;
+  /** The first read is in flight: placeholder turns, not "No turns yet". */
+  loading?: boolean;
+  defaultOpen?: boolean;
+}) {
+  const [showAll, setShowAll] = useState(false);
+  const turns = [...(data?.turns ?? [])].sort((a, b) => b.sequence - a.sequence);
+  const capped = !showAll && turns.length > VISIBLE_TURNS;
+  const visible = capped ? turns.slice(0, VISIBLE_TURNS) : turns;
+  const oldest = visible.at(-1)?.sequence ?? 0;
+  const rows = [
+    ...visible.map(turn => ({
+      sequence: turn.sequence,
+      key: `turn/${turn.turn_id}`,
+      content: <SessionContextTurnRow turn={turn} />,
+    })),
+    ...describeSessionCompactionMarkers(data).flatMap(marker => {
+      if (capped && marker.sequence < oldest) return [];
+      return [
+        {
+          sequence: marker.sequence,
+          key: `compaction/${marker.key}`,
+          content: <SessionContextCompactionMarker marker={marker} />,
+        },
+      ];
+    }),
+  ].sort((a, b) => b.sequence - a.sequence);
+  return (
+    <SessionInspectorSection data-testid="session-context-turns">
+      <Collapsible defaultOpen={defaultOpen}>
+        <SessionInspectorDisclosureHead meta={turnsMeta(turns.length, unavailable)}>
+          Turns
+        </SessionInspectorDisclosureHead>
+        <CollapsibleContent className="flex flex-col gap-2.25 pt-2.25">
+          {unavailable ? (
+            <p className="text-micro leading-4 text-faint">Turn usage unavailable</p>
+          ) : null}
+          {loading && rows.length === 0 ? (
+            <SessionContextTurnsSkeleton />
+          ) : rows.length ? (
+            <div className="flex flex-col overflow-hidden rounded-lg bg-sunken py-1">
+              <ul>
+                {rows.map(row => (
+                  <Fragment key={row.key}>{row.content}</Fragment>
+                ))}
+              </ul>
+              {capped ? (
+                <div className="flex justify-center p-1.5">
+                  <Button variant="ghost" size="xs" onClick={() => setShowAll(true)}>
+                    Show earlier turns
+                    <span className="font-mono text-mono-id tabular-nums text-faint">
+                      {(turns.length - VISIBLE_TURNS).toLocaleString()}
+                    </span>
+                  </Button>
+                </div>
+              ) : null}
+            </div>
+          ) : !unavailable ? (
+            <SessionInspectorEmpty icon={History} title="No turns yet" />
+          ) : null}
+        </CollapsibleContent>
+      </Collapsible>
+    </SessionInspectorSection>
+  );
+}

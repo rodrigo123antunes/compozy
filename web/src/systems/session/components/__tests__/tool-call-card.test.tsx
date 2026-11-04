@@ -1,0 +1,954 @@
+import { fireEvent, render, screen, waitFor, within } from "@testing-library/react";
+import userEvent from "@testing-library/user-event";
+import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+
+import {
+  DEV_SERVER_TERMINAL,
+  SSH_STAGING_TERMINAL,
+} from "@/systems/terminal/mocks/terminal-fixtures";
+import { terminalCatalogQuery, terminalScope, type TerminalInfo } from "@/systems/terminal/parts";
+
+import { sessionDetailOptions } from "../../lib/query-options";
+import { SessionRuntimeRenderProvider } from "../../lib/session-runtime-render-context";
+import type { SessionPayload, UIMessage } from "../../types";
+import { SessionToolCallRow } from "../tool-call-card";
+
+/** The catalog stream is a network boundary; a seeded cache must stay put. */
+vi.mock("@/lib/ticketed-event-source", () => ({
+  createStreamEventSource: () => ({
+    addEventListener: () => undefined,
+    removeEventListener: () => undefined,
+    close: () => undefined,
+    onmessage: null,
+    onerror: null,
+    onopen: null,
+  }),
+}));
+
+const ARTIFACT_ID_A = `art_${"a".repeat(64)}`;
+const ARTIFACT_ID_B = `art_${"b".repeat(64)}`;
+const ARTIFACT_URI_A = `compozy://tool-artifacts/${ARTIFACT_ID_A}`;
+const ARTIFACT_URI_B = `compozy://tool-artifacts/${ARTIFACT_ID_B}`;
+
+function createQueryClient() {
+  return new QueryClient({
+    defaultOptions: { queries: { retry: false } },
+  });
+}
+
+function encodedBytes(bytes: Uint8Array): string {
+  let binary = "";
+  for (const byte of bytes) binary += String.fromCharCode(byte);
+  return globalThis.btoa(binary);
+}
+
+function requestURL(input: RequestInfo | URL): URL {
+  if (input instanceof Request) return new URL(input.url);
+  return new URL(String(input), "http://localhost");
+}
+
+function truncatedMessage(uri = ARTIFACT_URI_A, preview = "bounded preview"): UIMessage {
+  return makeToolMessage({
+    toolName: "compozy__session_search",
+    toolResult: {
+      preview,
+      truncated: true,
+      artifacts: [
+        {
+          uri,
+          name: "tool-result.json",
+          mime_type: "application/vnd.compozy.tool-result+json",
+          bytes: 256,
+          sha256: uri.slice(-64),
+        },
+      ],
+    },
+  });
+}
+
+function artifactRow(workspaceId: string, message: UIMessage, queryClient = createQueryClient()) {
+  return (
+    <QueryClientProvider client={queryClient}>
+      <SessionRuntimeRenderProvider sessionId="session-artifact-test" workspaceId={workspaceId}>
+        <SessionToolCallRow message={message} defaultExpanded />
+      </SessionRuntimeRenderProvider>
+    </QueryClientProvider>
+  );
+}
+
+function makeToolMessage(overrides: Partial<UIMessage> = {}): UIMessage {
+  return {
+    id: "tc-1",
+    role: "tool_call",
+    content: "",
+    toolName: "Read",
+    toolInput: { file_path: "/src/main.ts" },
+    timestamp: Date.now(),
+    ...overrides,
+  };
+}
+
+const TERMINAL_ID = DEV_SERVER_TERMINAL.id;
+
+function terminalMessage(
+  envelope: Record<string, unknown>,
+  input: Record<string, unknown> = { command: "bun run dev" },
+  terminalId = TERMINAL_ID
+): UIMessage {
+  return makeToolMessage({
+    role: "tool_result",
+    toolName: "compozy__terminal_exec",
+    toolInput: input,
+    toolResult: { rawOutput: { terminal_id: terminalId, ...envelope } },
+  });
+}
+
+/**
+ * A terminal row inside its transcript: the workspace from the render context
+ * and the profile from the session itself, with the catalog seeded for it.
+ */
+function terminalRow(
+  message: UIMessage,
+  options: { profileName?: string; catalog?: TerminalInfo[]; expanded?: boolean } = {}
+) {
+  const client = createQueryClient();
+  if (options.profileName) {
+    client.setQueryData(sessionDetailOptions("ws-atlas", "sess-77ab").queryKey, {
+      id: "sess-77ab",
+      profile_name: options.profileName,
+    } as unknown as SessionPayload);
+    client.setQueryData(
+      terminalCatalogQuery(terminalScope("ws-atlas", options.profileName)).queryKey,
+      options.catalog ?? []
+    );
+  }
+  return (
+    <QueryClientProvider client={client}>
+      <SessionRuntimeRenderProvider sessionId="sess-77ab" workspaceId="ws-atlas">
+        <SessionToolCallRow message={message} defaultExpanded={options.expanded ?? true} />
+      </SessionRuntimeRenderProvider>
+    </QueryClientProvider>
+  );
+}
+
+function queryRoot(): HTMLElement | null {
+  return document.querySelector<HTMLElement>('[data-slot="tool-call-row"]');
+}
+
+function queryStatusIndicator(): HTMLElement | null {
+  return document.querySelector<HTMLElement>('[data-slot="tool-call-row-status"]');
+}
+
+function queryToolName(): HTMLElement | null {
+  return document.querySelector<HTMLElement>('[data-slot="tool-call-row-tool"]');
+}
+
+function queryPreview(): HTMLElement | null {
+  return document.querySelector<HTMLElement>('[data-slot="tool-call-row-preview"]');
+}
+
+function queryBody(): HTMLElement | null {
+  return document.querySelector<HTMLElement>('[data-slot="tool-call-row-body"]');
+}
+
+describe("Session SessionToolCallRow — wraps <SessionToolCallRow> from @compozy/ui", () => {
+  // This suite owns terminal-vs-tool rendering. Canvas drawing is browser I/O;
+  // model an unavailable drawing context while retaining the real terminal block.
+  beforeEach(() => {
+    vi.spyOn(HTMLCanvasElement.prototype, "getContext").mockReturnValue(null);
+  });
+
+  afterEach(() => {
+    vi.restoreAllMocks();
+  });
+
+  it("Should map Bash command summaries to the row preview slot", () => {
+    const longCommand =
+      "compozy tool invoke compozy__tool_info --input " + '{"tool_id":"compozy__skill_view"}';
+    render(
+      <SessionToolCallRow
+        message={makeToolMessage({
+          toolName: "Bash",
+          toolInput: { command: longCommand },
+        })}
+      />
+    );
+    expect(queryToolName()).toHaveTextContent(/^Running$/);
+    const preview = queryPreview();
+    expect(preview).not.toBeNull();
+    expect(preview?.textContent).toContain("compozy tool invoke");
+    expect(preview?.className).toContain("truncate");
+  });
+
+  it("Should keep an acknowledged empty delegation settled while the parent continues", () => {
+    // Invariant: receiving a result ends its spinner even without output content.
+    // Owner: tool-row presentation; canonical suite: this file.
+    render(
+      <SessionToolCallRow
+        message={makeToolMessage({
+          role: "tool_result",
+          toolName: "compozy__subagent_delegate",
+          toolInput: { task: "Write documentation" },
+          toolResult: undefined,
+        })}
+      />
+    );
+    expect(queryRoot()?.getAttribute("data-status")).toBe("empty");
+  });
+
+  it("Should render the pending row state (muted, no glyph) for an in-flight tool with empty input", () => {
+    render(<SessionToolCallRow message={makeToolMessage({ toolInput: {} })} />);
+    expect(queryRoot()?.getAttribute("data-status")).toBe("pending");
+    expect(queryStatusIndicator()).toBeNull();
+  });
+
+  it("Should map an in-flight tool with input to the running row state with a Spinner", () => {
+    render(<SessionToolCallRow message={makeToolMessage()} />);
+    expect(queryRoot()?.getAttribute("data-status")).toBe("running");
+    const indicator = queryStatusIndicator();
+    expect(indicator?.getAttribute("data-status")).toBe("running");
+    expect(indicator?.getAttribute("aria-label")).toBe("Running");
+    expect(indicator).not.toHaveClass("text-success");
+    expect(indicator).not.toHaveClass("text-destructive");
+    expect(screen.getByRole("status", { name: "Running" })).toBe(indicator);
+    expect(queryToolName()).toHaveTextContent(/^Reading$/);
+    expect(queryPreview()).toHaveTextContent("/src/main.ts");
+    expect(queryPreview()).toHaveAttribute("data-variant", "chip");
+  });
+
+  it("Should read a resultless tool as an absorbed failure once the owning turn settles", () => {
+    render(<SessionToolCallRow message={makeToolMessage()} turnSettled />);
+
+    // No result after the turn settled is a failure the turn moved past, not
+    // the failure that ended it (ADR-009): subtle ×, never danger.
+    expect(queryRoot()).toHaveAttribute("data-status", "absorbed");
+    expect(queryStatusIndicator()).toHaveAttribute("aria-label", "Failed");
+    expect(queryToolName()).toHaveTextContent(/^Read$/);
+    expect(queryPreview()).toHaveTextContent("Tool call failed");
+  });
+
+  // Completion is the resting state: success carries no glyph, the verb and
+  // its object read the call, and the trigger still names the state.
+  it("Should map meaningful output to the success row state with no glyph", () => {
+    render(<SessionToolCallRow message={makeToolMessage({ toolResult: { content: "file" } })} />);
+    expect(queryRoot()?.getAttribute("data-status")).toBe("success");
+    expect(queryStatusIndicator()).toBeNull();
+    expect(
+      screen.getByRole("button", { name: /Toggle tool call \(success\)/ })
+    ).toBeInTheDocument();
+    expect(queryToolName()).toHaveTextContent(/^Read$/);
+    expect(queryPreview()).toHaveTextContent("/src/main.ts");
+  });
+
+  it("Should expose a successful file diff through the expandable trigger description", () => {
+    render(
+      <SessionToolCallRow
+        message={makeToolMessage({
+          toolName: "Edit",
+          toolInput: {
+            file_path: "/src/main.ts",
+            old_string: "before",
+            new_string: "after",
+          },
+          toolResult: { content: "updated" },
+        })}
+      />
+    );
+
+    expect(document.querySelector('[data-slot="tool-call-row-stat"]')).toHaveTextContent("+1−1");
+    expect(screen.getByRole("button", { name: /1 addition, 1 deletion/ })).toBeInTheDocument();
+  });
+
+  it("Should promote a neutral tool to success only once the turn settles, never before", () => {
+    const message = makeToolMessage({ toolResult: {} });
+    const { rerender } = render(<SessionToolCallRow message={message} turnSettled={false} />);
+    expect(queryRoot()?.getAttribute("data-status")).toBe("empty");
+    expect(queryStatusIndicator()).toBeNull();
+
+    rerender(<SessionToolCallRow message={message} turnSettled />);
+    expect(queryRoot()?.getAttribute("data-status")).toBe("success");
+    expect(queryStatusIndicator()).toBeNull();
+  });
+
+  it("Should map a runtime error to failed with a neutral heading and the error-first-line preview", async () => {
+    const user = userEvent.setup();
+    // Danger only when the failure ended the turn (ADR-009).
+    render(
+      <SessionToolCallRow
+        message={makeToolMessage({ toolResult: { error: "not found" }, toolError: true })}
+        turnFailed
+      />
+    );
+    expect(queryRoot()?.getAttribute("data-status")).toBe("failed");
+    const indicator = queryStatusIndicator();
+    expect(indicator?.getAttribute("data-status")).toBe("failed");
+    expect(indicator?.getAttribute("aria-label")).toBe("Error");
+    expect(indicator?.getAttribute("class")).toContain("text-destructive");
+    expect(screen.getByRole("img", { name: "Error" })).toBe(indicator);
+    // The verb keeps its tense and the row text never turns danger — the ×
+    // glyph plus the error-first-line preview carry the failure.
+    expect(queryToolName()).toHaveTextContent(/^Read$/);
+    expect(queryToolName()?.className).not.toContain("text-destructive");
+    expect(document.querySelector('[data-slot="tool-call-row-preview"]')).toHaveTextContent(
+      "not found"
+    );
+    // Failed rows stay collapsed; expanding reveals the error detail.
+    expect(document.querySelector('[data-slot="tool-call-row-error"]')).toBeNull();
+    await user.click(document.querySelector('[data-slot="tool-call-row-trigger"]') as HTMLElement);
+    expect(document.querySelector('[data-slot="tool-call-row-error"]')).toHaveTextContent(
+      "not found"
+    );
+  });
+
+  // ADR-009 / US-026.AC-3: a failure the turn absorbed is information — subtle ×
+  // plus the word "failed" — never the danger glyph.
+  it("Should read an absorbed failure as a subtle × with the word failed, not danger", () => {
+    render(
+      <SessionToolCallRow
+        message={makeToolMessage({
+          toolName: "Bash",
+          toolInput: { command: "deploy" },
+          toolResult: { stderr: "bash: deploy: command not found" },
+        })}
+      />
+    );
+    expect(queryRoot()?.getAttribute("data-status")).toBe("absorbed");
+    const indicator = queryStatusIndicator();
+    expect(indicator?.getAttribute("aria-label")).toBe("Failed");
+    expect(indicator?.getAttribute("class")).toContain("text-subtle");
+    expect(indicator?.getAttribute("class")).not.toContain("text-destructive");
+    expect(screen.getByTestId("tool-call-state-word")).toHaveTextContent("failed");
+    const headingEl = queryToolName();
+    expect(headingEl).toHaveTextContent(/^Ran$/);
+    expect(headingEl?.className).not.toContain("text-destructive");
+    expect(headingEl?.className).toContain("text-subtle");
+    expect(queryPreview()).toHaveTextContent("bash: deploy: command not found");
+  });
+
+  // COPY.md "Subagent Terms": the subagent family names a failed attempt ("Tried to …");
+  // every other tool keeps its verb tense, as above.
+  it("Should name a failed subagent tool call as an attempt and a settled one in the past", () => {
+    const { rerender } = render(
+      <SessionToolCallRow
+        message={makeToolMessage({
+          toolName: "compozy__subagent_delegate",
+          toolInput: { title: "Run the checkout e2e suite" },
+          toolResult: { error: "The codex runtime isn't installed in this workspace." },
+          toolError: true,
+        })}
+      />
+    );
+    expect(queryToolName()).toHaveTextContent("Tried to delegate a subagent");
+    rerender(
+      <SessionToolCallRow
+        message={makeToolMessage({
+          toolName: "compozy__subagent_status",
+          toolInput: { subagent_id: "sub-1" },
+          toolResult: { stdout: "running" },
+        })}
+      />
+    );
+    expect(queryToolName()).toHaveTextContent("Read subagent status");
+  });
+
+  it("Should render a non-empty generic failure preview when the runtime supplies no error body", async () => {
+    const user = userEvent.setup();
+    render(<SessionToolCallRow message={makeToolMessage({ toolError: true })} />);
+
+    expect(queryRoot()).toHaveAttribute("data-status", "absorbed");
+    expect(queryPreview()).toHaveTextContent("Tool call failed");
+    await user.click(document.querySelector('[data-slot="tool-call-row-trigger"]') as HTMLElement);
+    expect(document.querySelector('[data-slot="tool-call-row-error"]')).toHaveTextContent(
+      "Tool call failed"
+    );
+  });
+
+  it("Should use stderr as the failure preview for a non-Bash tool", () => {
+    render(
+      <SessionToolCallRow
+        message={makeToolMessage({
+          toolName: "Read",
+          toolError: true,
+          toolResult: { stderr: "read denied\nworkspace is read-only" },
+        })}
+      />
+    );
+
+    expect(queryPreview()).toHaveTextContent("read denied workspace is read-only");
+  });
+
+  // ADR-009: the call that was running when the operator stopped the turn reads
+  // "stopped" in settled ink, with no glyph at all.
+  it("Should read a call cut by the operator's stop as stopped with no glyph", () => {
+    render(
+      <SessionToolCallRow
+        message={makeToolMessage({ toolName: "Bash", toolInput: { command: "go test" } })}
+        interrupted
+        turnSettled
+      />
+    );
+    expect(queryRoot()).toHaveAttribute("data-status", "stopped");
+    expect(queryStatusIndicator()).toBeNull();
+    expect(screen.getByTestId("tool-call-state-word")).toHaveTextContent("stopped");
+    expect(queryToolName()).toHaveTextContent(/^Ran$/);
+    expect(queryPreview()).toHaveTextContent("go test");
+  });
+
+  it("Should toggle the specialized output body by click and keyboard", async () => {
+    const user = userEvent.setup();
+    render(<SessionToolCallRow message={makeToolMessage()} />);
+    const rowTrigger = document.querySelector<HTMLElement>('[data-slot="tool-call-row-trigger"]');
+    expect(rowTrigger).not.toBeNull();
+    expect(rowTrigger).toHaveAttribute("aria-expanded", "false");
+    expect(queryBody()).toBeNull();
+
+    await user.click(rowTrigger as HTMLElement);
+    expect(queryBody()).not.toBeNull();
+    expect(screen.getByTestId("read-content")).toHaveTextContent("/src/main.ts");
+
+    // SUT_IS_CORRECT_BECAUSE native buttons own Enter/Space activation; userEvent
+    // exercises the browser interaction instead of bypassing it with keydown only.
+    (rowTrigger as HTMLElement).focus();
+    await user.keyboard("{Enter}");
+    expect(queryBody()).toBeNull();
+    await user.keyboard(" ");
+    expect(queryBody()).not.toBeNull();
+  });
+
+  it("Should keep the body open when interacting inside it so text selection stays safe", () => {
+    render(<SessionToolCallRow message={makeToolMessage({ toolResult: { content: "abc" } })} />);
+    const rowTrigger = document.querySelector<HTMLElement>('[data-slot="tool-call-row-trigger"]');
+    fireEvent.click(rowTrigger as HTMLElement);
+    expect(rowTrigger).toHaveAttribute("aria-expanded", "true");
+    expect(queryBody()).not.toBeNull();
+
+    const body = queryBody();
+    expect(body).not.toBeNull();
+    fireEvent.pointerDown(body as HTMLElement);
+    fireEvent.click(body as HTMLElement);
+
+    expect(rowTrigger).toHaveAttribute("aria-expanded", "true");
+    expect(queryBody()).not.toBeNull();
+  });
+
+  it("Should render a supervised terminal as one collapsed tool row with no screen", async () => {
+    // Invariant: a finished terminal call reads like every other tool row —
+    // verb, the terminal's name, one outcome — and its screen stays closed.
+    render(
+      terminalRow(
+        terminalMessage(
+          { exit_code: 0, duration_ms: 161_000, output: "VITE ready in 412 ms" },
+          { command: "bun run dev", title: "dev server" }
+        ),
+        { expanded: false }
+      )
+    );
+
+    const row = await screen.findByTestId("tool-call-row");
+    expect(row).toHaveAttribute("data-terminal-id", TERMINAL_ID);
+    expect(queryToolName()).toHaveTextContent("Used terminal");
+    expect(queryPreview()).toHaveTextContent("dev server");
+    expect(row).toHaveTextContent("2m 41s");
+    expect(queryStatusIndicator()).toBeNull();
+    expect(queryBody()).toBeNull();
+    expect(row.querySelector("[data-slot='terminal-view']")).toBeNull();
+    expect(row).not.toHaveTextContent("Succeeded");
+  });
+
+  it("Should intercept a hosted-MCP terminal open carrying a string envelope", async () => {
+    render(
+      artifactRow(
+        "ws-terminal",
+        makeToolMessage({
+          toolName: "mcp__compozy-hosted-tools__compozy__terminal_open",
+          toolInput: {},
+          toolResult: {
+            rawOutput: {
+              content: '{"terminal_id":"term-51e7b88e4515"}',
+              raw_output: '{"terminal_id":"term-51e7b88e4515"}',
+            },
+          },
+        })
+      )
+    );
+
+    // An open without an exit is a terminal that is still there.
+    expect(await screen.findByTestId("tool-call-row")).toHaveAttribute(
+      "data-terminal-id",
+      "term-51e7b88e4515"
+    );
+    expect(queryStatusIndicator()).toHaveAttribute("data-status", "running");
+  });
+
+  it("Should show an explicit empty state, never the tool envelope, when nothing was printed", async () => {
+    // The reported case: the agent stopped waiting before any output arrived.
+    // MCP serializes the envelope into `content`; it must never read as output.
+    const envelope = {
+      terminal_id: TERMINAL_ID,
+      command_id: "cmd-1",
+      duration_ms: 0,
+      exit_code: null,
+      output: "",
+      signal: null,
+      still_running: true,
+      truncated: false,
+      untrusted: true,
+    };
+    const { container } = render(
+      terminalRow(
+        makeToolMessage({
+          toolName: "compozy__terminal_exec",
+          toolInput: { command: "bun run test" },
+          toolResult: { content: JSON.stringify(envelope), rawOutput: { structured: envelope } },
+        })
+      )
+    );
+
+    expect(await screen.findByTestId("terminal-content-empty")).toHaveTextContent("No output yet");
+    expect(container).not.toHaveTextContent("command_id");
+    expect(container.querySelector("[data-slot='terminal-view']")).toBeNull();
+    expect(queryStatusIndicator()).toHaveAttribute("data-status", "running");
+  });
+
+  it("Should state a non-zero exit once, as a plain code beside the settled mark", async () => {
+    render(terminalRow(terminalMessage({ exit_code: 1, duration_ms: 4_200, output: "FAIL" })));
+
+    const row = await screen.findByTestId("tool-call-row");
+    expect(queryStatusIndicator()).toHaveAttribute("data-status", "absorbed");
+    expect(row.querySelector("[data-slot='tool-call-row-stat']")).toHaveTextContent("exit 1 · 4s");
+    expect(row).not.toHaveTextContent(/finished with errors|failed/i);
+  });
+
+  it("Should finish a still-running envelope when the catalog already exited", async () => {
+    render(
+      terminalRow(
+        terminalMessage(
+          { output: "Connection to staging closed.", still_running: true },
+          { command: "ssh staging" },
+          SSH_STAGING_TERMINAL.id
+        ),
+        {
+          profileName: "work",
+          catalog: [
+            { ...SSH_STAGING_TERMINAL, exit: { ...SSH_STAGING_TERMINAL.exit!, code: 255 } },
+          ],
+        }
+      )
+    );
+
+    // The catalog's exit is the runtime's truth: one outcome, its own span.
+    const row = await screen.findByTestId("tool-call-row");
+    await waitFor(() => expect(queryPreview()).toHaveTextContent("ssh staging"));
+    expect(queryStatusIndicator()).toHaveAttribute("data-status", "absorbed");
+    expect(row.querySelector("[data-slot='tool-call-row-stat']")).toHaveTextContent(
+      "exit 255 · 12m"
+    );
+    await waitFor(() =>
+      expect(row.querySelector("[data-live]")).toHaveAttribute("data-live", "false")
+    );
+  });
+
+  it("Should title a terminal from the catalog or a human name, never the argv", async () => {
+    render(
+      terminalRow(terminalMessage({ exit_code: 0, output: "ok" }, { command: "bun run dev" }), {
+        expanded: false,
+      })
+    );
+
+    await screen.findByTestId("tool-call-row");
+    expect(queryPreview()).toBeNull();
+    expect(screen.queryByText("bun run dev")).not.toBeInTheDocument();
+  });
+
+  it("Should stream a catalog-confirmed running PTY in the session's own profile", async () => {
+    render(
+      terminalRow(terminalMessage({ output: "VITE ready", still_running: true }), {
+        profileName: "work",
+        catalog: [DEV_SERVER_TERMINAL],
+      })
+    );
+
+    await waitFor(() =>
+      expect(
+        document.querySelector(`[data-testid='session-terminal-block-${TERMINAL_ID}']`)
+      ).toHaveAttribute("data-live", "true")
+    );
+    expect(queryPreview()).toHaveTextContent("dev server");
+    expect(queryStatusIndicator()).toHaveAttribute("data-status", "running");
+  });
+
+  it.each(["pipe", "missing", "unknown profile"])(
+    "Should keep the recorded screen without a socket for a %s terminal",
+    async mode => {
+      render(
+        terminalRow(
+          terminalMessage({ output: "retained output", still_running: true }),
+          mode === "unknown profile"
+            ? {}
+            : {
+                profileName: "work",
+                catalog: mode === "pipe" ? [{ ...DEV_SERVER_TERMINAL, mode: "pipe" }] : [],
+              }
+        )
+      );
+
+      await waitFor(() =>
+        expect(
+          document.querySelector(`[data-testid='session-terminal-block-${TERMINAL_ID}']`)
+        ).toHaveAttribute("data-live", "false")
+      );
+    }
+  );
+
+  it("Should render the specialized output dispatcher inside the inline body", () => {
+    render(
+      <SessionToolCallRow
+        message={makeToolMessage({
+          toolName: "Bash",
+          toolInput: { command: "printf abc" },
+          toolResult: { stdout: "abc" },
+        })}
+      />
+    );
+    const rowTrigger = document.querySelector<HTMLElement>('[data-slot="tool-call-row-trigger"]');
+    fireEvent.click(rowTrigger as HTMLElement);
+
+    expect(screen.getByTestId("bash-command")).toHaveTextContent("$ printf abc");
+    expect(queryBody()).toHaveTextContent("abc");
+  });
+
+  it("Should preserve the Edit output renderer inside the inline body", () => {
+    render(
+      <SessionToolCallRow
+        message={makeToolMessage({
+          toolName: "Edit",
+          toolInput: {
+            file_path: "/src/app.ts",
+            old_string: "const oldValue = true;",
+            new_string: "const oldValue = false;",
+          },
+          toolResult: { content: "Applied patch successfully." },
+        })}
+      />
+    );
+
+    const rowTrigger = document.querySelector<HTMLElement>('[data-slot="tool-call-row-trigger"]');
+    fireEvent.click(rowTrigger as HTMLElement);
+
+    expect(screen.getByTestId("edit-content")).toBeInTheDocument();
+    expect(queryBody()).toHaveTextContent("/src/app.ts");
+    expect(queryBody()).toHaveTextContent("const oldValue = true;");
+    expect(queryBody()).toHaveTextContent("const oldValue = false;");
+  });
+
+  it("Should keep MCP and dynamic tools on the generic output renderer", () => {
+    render(
+      <SessionToolCallRow
+        message={makeToolMessage({
+          toolName: "mcp__context7__resolve-library-id",
+          toolInput: { libraryName: "react" },
+          toolResult: { content: "/websites/react_dev" },
+        })}
+      />
+    );
+
+    const rowTrigger = document.querySelector<HTMLElement>('[data-slot="tool-call-row-trigger"]');
+    fireEvent.click(rowTrigger as HTMLElement);
+
+    expect(queryToolName()).toHaveTextContent(/^Used$/);
+    expect(queryPreview()).toHaveTextContent("resolve library id (Context7)");
+    expect(queryPreview()).not.toHaveTextContent("mcp__context7");
+    // Input and output each sit under their own label — never the input under "Output".
+    expect(document.querySelector('[data-slot="tool-call-row-input"]')).toHaveTextContent(
+      '"libraryName": "react"'
+    );
+    expect(document.querySelector('[data-slot="tool-call-row-output"]')).toHaveTextContent(
+      "/websites/react_dev"
+    );
+  });
+
+  // Invariant: an opened row never hides a field its payload carries.
+  it("Should keep a title-named shell tool's extra fields on the generic renderer", () => {
+    render(
+      <SessionToolCallRow
+        message={makeToolMessage({
+          toolName: "Terminal",
+          toolInput: { command: "bun test", cwd: "/repo/web", timeout: 120 },
+          toolResult: { stdout: "ok" },
+        })}
+      />
+    );
+    fireEvent.click(document.querySelector('[data-slot="tool-call-row-trigger"]') as HTMLElement);
+
+    expect(queryToolName()).toHaveTextContent(/^Ran$/);
+    expect(document.querySelector('[data-slot="tool-call-row-input"]')).toHaveTextContent(
+      '"cwd": "/repo/web"'
+    );
+    expect(document.querySelector('[data-slot="tool-call-row-output"]')).toHaveTextContent("ok");
+  });
+
+  it("Should keep a title-named shell tool's description on the generic renderer", () => {
+    render(
+      <SessionToolCallRow
+        message={makeToolMessage({
+          toolName: "Terminal",
+          toolInput: { command: "bun test", description: "Run the web suite" },
+          toolResult: { stdout: "ok" },
+        })}
+      />
+    );
+    fireEvent.click(document.querySelector('[data-slot="tool-call-row-trigger"]') as HTMLElement);
+
+    expect(document.querySelector('[data-slot="tool-call-row-input"]')).toHaveTextContent(
+      '"description": "Run the web suite"'
+    );
+  });
+
+  it("Should render a title-named shell tool through the command view when it holds the payload", () => {
+    render(
+      <SessionToolCallRow
+        message={makeToolMessage({
+          toolName: "Terminal",
+          toolInput: { command: "bun test" },
+          toolResult: { stdout: "ok" },
+        })}
+      />
+    );
+    fireEvent.click(document.querySelector('[data-slot="tool-call-row-trigger"]') as HTMLElement);
+
+    expect(screen.getByTestId("bash-command")).toHaveTextContent("$ bun test");
+  });
+
+  it("Should render specialized tool output while the tool is still running", () => {
+    render(<SessionToolCallRow message={makeToolMessage()} />);
+    const rowTrigger = document.querySelector<HTMLElement>('[data-slot="tool-call-row-trigger"]');
+    fireEvent.click(rowTrigger as HTMLElement);
+
+    expect(document.querySelector('[data-slot="tool-call-row-input"]')).toBeNull();
+    expect(screen.getByTestId("read-content")).toHaveTextContent("/src/main.ts");
+  });
+
+  it("Should copy the structured tool payload from the trailing actions cluster", async () => {
+    const writeText = vi.fn().mockResolvedValue(undefined);
+    Object.defineProperty(navigator, "clipboard", {
+      configurable: true,
+      value: { writeText },
+    });
+    render(<SessionToolCallRow message={makeToolMessage({ toolResult: { content: "abc" } })} />);
+
+    fireEvent.click(screen.getByRole("button", { name: "Copy tool details" }));
+
+    await waitFor(() => expect(writeText).toHaveBeenCalledTimes(1));
+    const payload = JSON.parse(writeText.mock.calls[0]?.[0] as string) as {
+      tool: string;
+      input: Record<string, unknown>;
+      output: Record<string, unknown>;
+    };
+    expect(payload.tool).toBe("Read");
+    expect(payload.input.file_path).toBe("/src/main.ts");
+    expect(payload.output.content).toBe("abc");
+  });
+
+  it("Should append each artifact byte page once and decode UTF-8 only after concatenation", async () => {
+    const user = userEvent.setup();
+    const fullResult = JSON.stringify({ content: [{ type: "text", text: "ação D6 complete" }] });
+    const resultBytes = new TextEncoder().encode(fullResult);
+    const multibyteStart = resultBytes.findIndex(byte => byte === 0xc3);
+    expect(multibyteStart).toBeGreaterThan(0);
+    const splitOffset = multibyteStart + 1;
+    const chunks = [resultBytes.slice(0, splitOffset), resultBytes.slice(splitOffset)];
+    const fetchMock = vi.spyOn(globalThis, "fetch").mockImplementation(async input => {
+      const url = requestURL(input);
+      const offset = Number(url.searchParams.get("offset") ?? "0");
+      const chunk = offset === 0 ? chunks[0] : chunks[1];
+      if (!chunk) throw new Error(`Unexpected artifact offset ${offset}`);
+      const nextOffset = offset + chunk.byteLength;
+      return new Response(
+        JSON.stringify({
+          artifact: { uri: ARTIFACT_URI_A, bytes: resultBytes.byteLength },
+          offset,
+          bytes: chunk.byteLength,
+          total_bytes: resultBytes.byteLength,
+          data_base64: encodedBytes(chunk),
+          next_offset: nextOffset,
+          eof: nextOffset === resultBytes.byteLength,
+        }),
+        { headers: { "Content-Type": "application/json" } }
+      );
+    });
+
+    render(artifactRow("ws-artifact-a", truncatedMessage()));
+    await user.click(screen.getByRole("button", { name: "Open full result" }));
+    const loadMore = await screen.findByRole("button", { name: "Load more" });
+    await user.click(loadMore);
+
+    await waitFor(() => {
+      // Pages append into the same plain mono pre — content loads in place.
+      expect(screen.getByTestId("full-tool-result").textContent).toBe(fullResult);
+    });
+    expect(screen.queryByRole("button", { name: "Load more" })).not.toBeInTheDocument();
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+    expect(requestURL(fetchMock.mock.calls[0]![0]).pathname).toBe(
+      `/api/workspaces/ws-artifact-a/tool-artifacts/${ARTIFACT_ID_A}`
+    );
+    expect(requestURL(fetchMock.mock.calls[0]![0]).searchParams.get("offset")).toBe("0");
+    expect(requestURL(fetchMock.mock.calls[1]![0]).searchParams.get("offset")).toBe(
+      String(splitOffset)
+    );
+  });
+
+  it("Should isolate retained-result pages by workspace and artifact identity", async () => {
+    const user = userEvent.setup();
+    const queryClient = createQueryClient();
+    const fetchMock = vi.spyOn(globalThis, "fetch").mockImplementation(async input => {
+      const url = requestURL(input);
+      const workspace = url.pathname.includes("ws-artifact-b") ? "ws-artifact-b" : "ws-artifact-a";
+      const uri = workspace === "ws-artifact-b" ? ARTIFACT_URI_B : ARTIFACT_URI_A;
+      const bytes = new TextEncoder().encode(JSON.stringify({ workspace }));
+      return new Response(
+        JSON.stringify({
+          artifact: { uri, bytes: bytes.byteLength },
+          offset: 0,
+          bytes: bytes.byteLength,
+          total_bytes: bytes.byteLength,
+          data_base64: encodedBytes(bytes),
+          next_offset: bytes.byteLength,
+          eof: true,
+        }),
+        { headers: { "Content-Type": "application/json" } }
+      );
+    });
+    const { rerender } = render(
+      artifactRow("ws-artifact-a", truncatedMessage(ARTIFACT_URI_A), queryClient)
+    );
+    await user.click(screen.getByRole("button", { name: "Open full result" }));
+    await waitFor(() =>
+      expect(screen.getByTestId("full-tool-result")).toHaveTextContent("ws-artifact-a")
+    );
+
+    rerender(artifactRow("ws-artifact-b", truncatedMessage(ARTIFACT_URI_B), queryClient));
+    await waitFor(() =>
+      expect(screen.getByTestId("full-tool-result")).toHaveTextContent("ws-artifact-b")
+    );
+    expect(screen.getByTestId("full-tool-result")).not.toHaveTextContent("ws-artifact-a");
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+    expect(requestURL(fetchMock.mock.calls[1]![0]).pathname).toBe(
+      `/api/workspaces/ws-artifact-b/tool-artifacts/${ARTIFACT_ID_B}`
+    );
+  });
+
+  it("Should keep the bounded preview visible when the retained result is unavailable", async () => {
+    const user = userEvent.setup();
+    vi.spyOn(globalThis, "fetch").mockResolvedValue(
+      new Response(JSON.stringify({ error: { code: "tool_not_found", message: "not found" } }), {
+        status: 404,
+        headers: { "Content-Type": "application/json" },
+      })
+    );
+
+    render(artifactRow("ws-artifact-a", truncatedMessage()));
+    expect(screen.getByText("bounded preview")).toBeInTheDocument();
+    await user.click(screen.getByRole("button", { name: "Open full result" }));
+
+    // Load failure is a danger text line — never an Alert card — and a gone
+    // artifact (404) offers no Retry.
+    expect(await screen.findByTestId("artifact-error")).toHaveTextContent(
+      "This retained result is no longer available"
+    );
+    expect(screen.getByText("bounded preview")).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "Retry" })).not.toBeInTheDocument();
+  });
+
+  // Invariant (BUG-20260906-find-specialized-tool-field): a find reveal names the field the
+  // daemon matched; the row opens and renders that field's whole raw payload beside the
+  // tool's own display, so the searched text is on screen even when the specialized
+  // renderer never shows it or the bounded preview would have cut it. Without a reveal the
+  // specialized display is unchanged. Owner: SessionToolCallRow. Canonical suite: this file.
+  it("Should render the matched raw input beside a specialized Read display on a find reveal", () => {
+    const message = makeToolMessage({
+      toolInput: { file_path: "notes/ação-café.md", query: "ação λ café" },
+      toolResult: { stdout: "# café\n" },
+    });
+    const revealed = render(
+      <SessionToolCallRow message={message} revealOpen revealField="input" />
+    );
+    expect(screen.getByTestId("read-content")).toHaveTextContent("notes/ação-café.md");
+    const matched = screen.getByTestId("tool-matched-field");
+    expect(matched).toHaveAttribute("data-field", "input");
+    expect(matched).toHaveTextContent("Input");
+    expect(matched).toHaveTextContent('"query": "ação λ café"');
+    expect(queryRoot()).toHaveAttribute("data-expanded", "true");
+
+    revealed.unmount();
+
+    // Outside navigation the specialized display stands alone.
+    render(<SessionToolCallRow message={message} defaultExpanded />);
+    expect(screen.getByTestId("read-content")).toBeInTheDocument();
+    expect(screen.queryByTestId("tool-matched-field")).not.toBeInTheDocument();
+  });
+
+  it("Should reveal a matched output past the bounded preview in full, keeping the strip", () => {
+    const lines = Array.from({ length: 260 }, (_, index) =>
+      index === 250 ? "needle λ line" : `line ${index + 1}`
+    );
+    const message = makeToolMessage({
+      toolName: "Bash",
+      toolInput: { command: "cat notes.txt" },
+      toolResult: { stdout: lines.join("\n") },
+    });
+    render(<SessionToolCallRow message={message} revealOpen revealField="output" />);
+    const matched = screen.getByTestId("tool-matched-field");
+    expect(matched).toHaveAttribute("data-field", "output");
+    expect(matched).toHaveTextContent("needle λ line");
+    // The matched payload starts whole; the tool's own bounded display keeps its preview.
+    expect(within(matched).getByTestId("detail-payload-note")).toHaveTextContent("All 260 lines");
+    expect(within(matched).getByTestId("detail-payload-show-all")).toHaveTextContent("Show less");
+    // A header field needs no body payload: title/tool name/file already show.
+    render(<SessionToolCallRow message={message} revealOpen revealField="tool_name" />);
+    expect(screen.getAllByTestId("tool-matched-field")).toHaveLength(1);
+  });
+});
+
+// Invariant: title summaries leave the exact title, input, and output available for keyboard disclosure/copy/find.
+// Owner: session tool card; canonical suite: tool-call-card.
+it("Should disclose a long provider title and copy its exact original payload", async () => {
+  const user = userEvent.setup();
+  const title = "Inspect fixture\n" + "ação 👩🏽‍💻 ".repeat(80) + "title-tail";
+  const message = makeToolMessage({
+    toolName: "Bash",
+    toolTitle: title,
+    toolInput: { command: "printf 'input-tail'" },
+    toolResult: { stdout: "output-tail" },
+  });
+  render(<SessionToolCallRow message={message} turnSettled />);
+  expect(queryToolName()).toHaveTextContent(/^Ran$/);
+  expect(queryPreview()).not.toHaveTextContent("title-tail");
+  const trigger = screen.getByRole("button", { name: /Ran.*Toggle tool call/ });
+  trigger.focus();
+  await user.keyboard("{Enter}");
+  expect(screen.getByLabelText("Tool title").textContent).toBe(title);
+  const writeText = vi.spyOn(navigator.clipboard, "writeText");
+  await user.click(screen.getByRole("button", { name: "Copy tool details" }));
+  await waitFor(() => expect(writeText).toHaveBeenCalled());
+  expect(JSON.parse(writeText.mock.calls[0]![0])).toMatchObject({
+    tool: "Bash",
+    title,
+    input: message.toolInput,
+    output: message.toolResult,
+  });
+});
+
+it("Should show a title-only unknown tool in full when find reveals its title", () => {
+  const title = "provider description ".repeat(80) + "title-only-tail";
+  render(
+    <SessionToolCallRow
+      message={makeToolMessage({ toolName: title, toolInput: undefined })}
+      turnSettled
+      revealOpen
+      revealField="title"
+    />
+  );
+  expect(screen.getByLabelText("Tool title").textContent).toBe(title);
+  expect(queryToolName()).toHaveTextContent("Used tool");
+});

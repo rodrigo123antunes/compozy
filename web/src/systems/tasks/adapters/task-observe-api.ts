@@ -1,0 +1,67 @@
+import {
+  apiClient,
+  apiRequestFailed,
+  defaultApiErrorMessage,
+  requireResponseData,
+} from "@/lib/api-client";
+
+import { normalizeTaskInboxFilter } from "../lib/task-inbox-query";
+import type {
+  TaskDashboardFilter,
+  TaskDashboardView,
+  TaskInboxFilter,
+  TaskInboxView,
+} from "../types";
+import { normalizeOptionalText, TasksApiError } from "./tasks-api-errors";
+
+function normalizeDashboardFilter(filters: TaskDashboardFilter = {}): TaskDashboardFilter {
+  return {
+    all_workspaces: filters.all_workspaces || undefined,
+    workspace_ids:
+      filters.all_workspaces && filters.workspace_ids?.length
+        ? [...new Set(filters.workspace_ids)].sort()
+        : undefined,
+    scope: filters.scope,
+    workspace: normalizeOptionalText(filters.workspace),
+    worktree: normalizeOptionalText(filters.worktree),
+    owner_kind: filters.owner_kind,
+    owner_ref: normalizeOptionalText(filters.owner_ref),
+    origin_kind: filters.origin_kind,
+    profile: normalizeOptionalText(filters.profile),
+    all_profiles: filters.all_profiles,
+  };
+}
+
+export async function getTaskDashboard(
+  filters: TaskDashboardFilter = {},
+  signal?: AbortSignal
+): Promise<TaskDashboardView> {
+  const { data, error, response } = await apiClient.GET("/api/observe/tasks/dashboard", {
+    params: { query: normalizeDashboardFilter(filters) },
+    signal,
+  });
+  if (apiRequestFailed(response, error)) {
+    throw new TasksApiError(
+      defaultApiErrorMessage("Failed to fetch task dashboard", response, error),
+      response.status
+    );
+  }
+  return requireResponseData(data, response, "Failed to fetch task dashboard").dashboard;
+}
+
+export async function getTaskInbox(
+  filters: TaskInboxFilter = {},
+  signal?: AbortSignal
+): Promise<TaskInboxView> {
+  const { data, error, response } = await apiClient.GET("/api/observe/tasks/inbox", {
+    params: { query: normalizeTaskInboxFilter(filters) },
+    signal,
+  });
+  if (apiRequestFailed(response, error)) {
+    throw new TasksApiError(
+      defaultApiErrorMessage("Failed to fetch task inbox", response, error),
+      response.status
+    );
+  }
+  return requireResponseData(data, response, "Failed to fetch task inbox").inbox;
+}

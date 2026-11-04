@@ -1,0 +1,189 @@
+package cli
+
+import (
+	"bufio"
+	"context"
+	"errors"
+	"fmt"
+	"io"
+	"os"
+
+	"strings"
+
+	compozydaemon "github.com/compozy/compozy/internal/daemon"
+	extensionpkg "github.com/compozy/compozy/internal/extension"
+	"github.com/spf13/cobra"
+)
+
+type extensionCommandClient interface {
+	extensionClientAPI
+	toolInvocationClient
+}
+
+func loadExtensionRecords(cmd *cobra.Command, deps commandDeps, workspaceRef string) ([]ExtensionRecord, error) {
+	client, running, err := daemonClientIfRunning(cmd.Context(), deps)
+	if err != nil {
+		return nil, err
+	}
+	if running {
+		if err := prepareExtensionProfileRead(cmd, deps, client); err != nil {
+			return nil, err
+		}
+		if strings.TrimSpace(workspaceRef) == "" {
+			return client.ListExtensions(cmd.Context())
+		}
+		workspaceID, err := resolveCLIWorkspaceRouteRef(cmd, deps, client, workspaceRef)
+		if err != nil {
+			return nil, err
+		}
+		return client.ListExtensionsScoped(cmd.Context(), workspaceID)
+	}
+	if strings.TrimSpace(workspaceRef) != "" {
+		return nil, errors.New("cli: workspace-scoped extension reads require a running daemon")
+	}
+
+	return withLocalExtensionRegistry(
+		cmd.Context(),
+		deps,
+		func(_ *runtimeContext, registry localExtensionRegistry) ([]ExtensionRecord, error) {
+			infos, err := registry.List()
+			if err != nil {
+				return nil, err
+			}
+
+			items := make([]ExtensionRecord, 0, len(infos))
+			for infoIndex := range infos {
+				item, err := localExtensionRecord(cmd.Context(), &infos[infoIndex], deps.now, deps.getenv)
+				if err != nil {
+					return nil, err
+				}
+				items = append(items, item)
+			}
+			return items, nil
+		},
+	)
+}
+
+func extensionStatus(
+	cmd *cobra.Command,
+	deps commandDeps,
+	workspaceRef string,
+	name string,
+) (ExtensionRecord, error) {
+	client, err := requireExtensionDaemonClient(cmd.Context(), deps)
+	if err != nil {
+		return ExtensionRecord{}, err
+	}
+	if err := prepareExtensionProfileRead(cmd, deps, client); err != nil {
+		return ExtensionRecord{}, err
+	}
+	if strings.TrimSpace(workspaceRef) == "" {
+		return client.ExtensionStatus(cmd.Context(), name)
+	}
+	workspaceID, err := resolveCLIWorkspaceRouteRef(cmd, deps, client, workspaceRef)
+	if err != nil {
+		return ExtensionRecord{}, err
+	}
+	return client.ExtensionStatusScoped(cmd.Context(), workspaceID, name)
+}
+
+func prepareExtensionProfileRead(cmd *cobra.Command, deps commandDeps, client workspaceLookupClient) error {
+	requested, err := commandProfileSelectionRequested(cmd, deps)
+	if err != nil {
+		return err
+	}
+	if !requested {
+		return nil
+	}
+	profiles := optionalProfileResolutionClient(client)
+	if err := prepareProfileReadSelection(cmd, deps, profiles, client, false); err != nil {
+		return fmt.Errorf("cli: resolve extension profile: %w", err)
+	}
+	return nil
+}
+
+func extensionProvenance(ctx context.Context, deps commandDeps, name string) (ExtensionProvenanceRecord, error) {
+	client, err := requireExtensionDaemonClient(ctx, deps)
+	if err != nil {
+		return ExtensionProvenanceRecord{}, err
+	}
+	return client.ExtensionProvenance(ctx, name)
+}
+
+func requireExtensionDaemonClient(ctx context.Context, deps commandDeps) (extensionCommandClient, error) {
+	client, running, err := daemonClientIfRunning(ctx, deps)
+	if err != nil {
+		return nil, err
+	}
+	if !running {
+		return nil, errors.New("cli: extension operations require a running daemon")
+	}
+	return client, nil
+}
+
+func confirmExtensionUnverifiedInstall(cmd *cobra.Command, allowUnverified bool, yes bool) error {
+	if !allowUnverified || yes {
+		return nil
+	}
+	mode, err := resolveOutputFormat(cmd)
+	if err != nil {
+		return err
+	}
+	if mode != OutputHuman {
+		return errors.New("cli: --allow-unverified requires --yes for structured output")
+	}
+	message := "This extension checksum is unverified. Continue with allow_unverified? [y/N] "
+	if _, err := fmt.Fprint(cmd.ErrOrStderr(), message); err != nil {
+		return fmt.Errorf("cli: write extension trust prompt: %w", err)
+	}
+	line, err := bufio.NewReader(cmd.InOrStdin()).ReadString('\n')
+	if err != nil && !errors.Is(err, io.EOF) {
+		return fmt.Errorf("cli: read extension trust prompt: %w", err)
+	}
+	answer := strings.ToLower(strings.TrimSpace(line))
+	if answer != "y" && answer != yesFlagName {
+		return errors.New("cli: extension install declined")
+	}
+	return nil
+}
+
+func withLocalExtensionRegistry[T any](
+	ctx context.Context,
+	deps commandDeps,
+	fn func(runtime *runtimeContext, registry localExtensionRegistry) (T, error),
+) (result T, err error) {
+	runtime, err := loadRuntimeContext(deps)
+	if err != nil {
+		return result, err
+	}
+	if err := deps.ensureHome(runtime.HomePaths); err != nil {
+		return result, err
+	}
+
+	// Reachability can change after the daemon probe. Own the same singleton
+	// lease through close so offline migration/install cannot race daemon boot.
+	lock, err := compozydaemon.AcquireLock(runtime.HomePaths.DaemonLock, os.Getpid())
+	if err != nil {
+		return result, fmt.Errorf("cli: reserve offline extension database: %w", err)
+	}
+	defer func() { err = errors.Join(err, lock.Release()) }()
+
+	globalDB, err := openLocalGlobalDatabase(ctx, runtime.HomePaths.DatabaseFile, "extension")
+	if err != nil {
+		return result, err
+	}
+	defer func() {
+		closeErr := globalDB.Close(ctx)
+		if closeErr == nil {
+			return
+		}
+		closeErr = fmt.Errorf("cli: close extension database %q: %w", runtime.HomePaths.DatabaseFile, closeErr)
+		if err == nil {
+			err = closeErr
+			return
+		}
+		err = errors.Join(err, closeErr)
+	}()
+
+	return fn(runtime, extensionpkg.NewRegistry(globalDB.DB(), extensionpkg.WithRegistryReadDB(globalDB.ReadDB())))
+}

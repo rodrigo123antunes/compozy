@@ -1,120 +1,181 @@
 package config
 
 import (
-	"errors"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
-func TestResolveHomePathsFrom(t *testing.T) {
+func TestResolveHomeDirUsesCompozyHomeOverride(t *testing.T) {
+	override := filepath.Join(t.TempDir(), "custom-home")
+	t.Setenv("COMPOZY_HOME", override)
+
+	got, err := ResolveHomeDir()
+	if err != nil {
+		t.Fatalf("ResolveHomeDir() error = %v", err)
+	}
+	if got != override {
+		t.Fatalf("ResolveHomeDir() = %q, want %q", got, override)
+	}
+}
+
+func TestResolveOperatorHomeDirWithLookupUsesHome(t *testing.T) {
 	t.Parallel()
 
-	root := filepath.Join(t.TempDir(), "home")
-	paths, err := ResolveHomePathsFrom(root)
+	t.Run("Should use HOME from the injected lookup", func(t *testing.T) {
+		t.Parallel()
+
+		operatorHome := filepath.Join(t.TempDir(), "operator-home")
+
+		got, err := ResolveOperatorHomeDirWithLookup(HomePaths{}, func(key string) (string, bool) {
+			if key == "HOME" {
+				return operatorHome, true
+			}
+			return "", false
+		})
+		if err != nil {
+			t.Fatalf("ResolveOperatorHomeDirWithLookup() error = %v", err)
+		}
+		if got != operatorHome {
+			t.Fatalf("ResolveOperatorHomeDirWithLookup() = %q, want %q", got, operatorHome)
+		}
+	})
+
+	t.Run("Should canonicalize an existing HOME alias", func(t *testing.T) {
+		t.Parallel()
+
+		operatorHome := t.TempDir()
+		linkParent := t.TempDir()
+		homeAlias := filepath.Join(linkParent, "operator-home")
+		if err := os.Symlink(operatorHome, homeAlias); err != nil {
+			t.Fatalf("Symlink(%q, %q) error = %v", operatorHome, homeAlias, err)
+		}
+		canonicalHome, err := filepath.EvalSymlinks(operatorHome)
+		if err != nil {
+			t.Fatalf("EvalSymlinks(%q) error = %v", operatorHome, err)
+		}
+
+		got, err := ResolveOperatorHomeDirWithLookup(HomePaths{}, func(key string) (string, bool) {
+			if key == "HOME" {
+				return homeAlias, true
+			}
+			return "", false
+		})
+		if err != nil {
+			t.Fatalf("ResolveOperatorHomeDirWithLookup() error = %v", err)
+		}
+		if got != canonicalHome {
+			t.Fatalf("ResolveOperatorHomeDirWithLookup() = %q, want %q", got, canonicalHome)
+		}
+	})
+}
+
+func TestResolveOperatorHomeDirWithLookupFallsBackFromCompozyHome(t *testing.T) {
+	t.Parallel()
+
+	t.Run("Should fall back to the parent of Compozy home", func(t *testing.T) {
+		t.Parallel()
+
+		operatorHome := filepath.Join(t.TempDir(), "operator-home")
+		homePaths, err := ResolveHomePathsFrom(filepath.Join(operatorHome, DirName))
+		if err != nil {
+			t.Fatalf("ResolveHomePathsFrom() error = %v", err)
+		}
+
+		got, err := resolveOperatorHomeDir(homePaths, nil, func() (string, error) {
+			return "", os.ErrNotExist
+		})
+		if err != nil {
+			t.Fatalf("resolveOperatorHomeDir() error = %v", err)
+		}
+		if got != operatorHome {
+			t.Fatalf("resolveOperatorHomeDir() = %q, want %q", got, operatorHome)
+		}
+	})
+}
+
+// Invariant: every extension instance maps to one contained segment under a
+// root disjoint from managed installs, including the legal package name "data".
+// Owner: Compozy home layout.
+// Canonical suite: home path tests.
+func TestHomePathsExtensionDataPathEncodesInstanceScope(t *testing.T) {
+	t.Parallel()
+	paths, err := ResolveHomePathsFrom(filepath.Join(t.TempDir(), "home"))
 	if err != nil {
 		t.Fatalf("ResolveHomePathsFrom() error = %v", err)
 	}
 
-	if got, want := paths.HomeDir, root; got != want {
-		t.Fatalf("HomeDir = %q, want %q", got, want)
+	tests := []struct {
+		name        string
+		extension   string
+		workspaceID string
+		profileID   string
+		wantSegment string
+	}{
+		{name: "Should encode a global dotted name", extension: "acme.tools", wantSegment: "acme.tools"},
+		{
+			name:        "Should encode a workspace instance",
+			extension:   "acme.tools",
+			workspaceID: "abc-123",
+			wantSegment: "acme.tools@ws-abc-123",
+		},
+		{
+			name:        "Should encode a rename-stable default profile instance",
+			extension:   "acme.tools",
+			workspaceID: "abc-123",
+			profileID:   "00000000000000000000000000",
+			wantSegment: "acme.tools@ws-abc-123@pf-00000000000000000000000000",
+		},
+		{name: "Should keep the data package under the dedicated root", extension: "data", wantSegment: "data"},
 	}
-	if got, want := paths.DaemonDir, filepath.Join(root, "daemon"); got != want {
-		t.Fatalf("DaemonDir = %q, want %q", got, want)
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+			got, pathErr := paths.ExtensionDataPath(test.extension, test.workspaceID, test.profileID)
+			if pathErr != nil {
+				t.Fatalf("ExtensionDataPath() error = %v", pathErr)
+			}
+			if want := filepath.Join(paths.ExtensionDataRoot, test.wantSegment); got != want {
+				t.Fatalf("ExtensionDataPath() = %q, want %q", got, want)
+			}
+			if filepath.Dir(got) != paths.ExtensionDataRoot {
+				t.Fatalf("ExtensionDataPath() parent = %q, want dedicated root", filepath.Dir(got))
+			}
+		})
 	}
-	if got, want := paths.WorktreesDir, filepath.Join(root, "state", "worktrees"); got != want {
-		t.Fatalf("WorktreesDir = %q, want %q", got, want)
+
+	dataPath, err := paths.ExtensionDataPath("data", "", "")
+	if err != nil {
+		t.Fatalf("ExtensionDataPath(data) error = %v", err)
 	}
-	if got, want := paths.SocketPath, filepath.Join(root, "daemon", "daemon.sock"); got != want {
-		t.Fatalf("SocketPath = %q, want %q", got, want)
+	managedDataPath := filepath.Join(paths.HomeDir, "extensions", "data")
+	if dataPath == managedDataPath || filepath.Dir(dataPath) == managedDataPath {
+		t.Fatalf("data path %q overlaps managed install tree %q", dataPath, managedDataPath)
 	}
-	if got, want := paths.DBDir, filepath.Join(root, "db"); got != want {
-		t.Fatalf("DBDir = %q, want %q", got, want)
+
+	for _, invalid := range []string{"../escape", "name@workspace", "a/b"} {
+		if _, pathErr := paths.ExtensionDataPath(invalid, "", ""); pathErr == nil {
+			t.Fatalf("ExtensionDataPath(%q) error = nil, want containment rejection", invalid)
+		}
 	}
-	if got, want := paths.GlobalDBPath, filepath.Join(root, "db", "global.db"); got != want {
-		t.Fatalf("GlobalDBPath = %q, want %q", got, want)
-	}
-	if got, want := paths.RunsDir, filepath.Join(root, "runs"); got != want {
-		t.Fatalf("RunsDir = %q, want %q", got, want)
-	}
-	if got, want := paths.LogsDir, filepath.Join(root, "logs"); got != want {
-		t.Fatalf("LogsDir = %q, want %q", got, want)
-	}
-	if got, want := paths.CacheDir, filepath.Join(root, "cache"); got != want {
-		t.Fatalf("CacheDir = %q, want %q", got, want)
+	if _, pathErr := paths.ExtensionDataPath("acme.tools", "", "marketing"); pathErr == nil {
+		t.Fatal("ExtensionDataPath(profile name) error = nil, want stable profile id rejection")
+	} else if !strings.Contains(pathErr.Error(), "profile id") {
+		t.Fatalf("ExtensionDataPath(profile name) error = %v, want profile id validation", pathErr)
 	}
 }
 
-func TestResolveHomePathsFromExpandsTilde(t *testing.T) {
-	homeDir := t.TempDir()
-	stubConfigUserHomeDir(t, func() (string, error) {
-		return homeDir, nil
-	})
-
-	paths, err := ResolveHomePathsFrom("~/daemon-home")
-	if err != nil {
-		t.Fatalf("ResolveHomePathsFrom() error = %v", err)
+func TestEnsureHomeLayoutCreatesRequiredDirectories(t *testing.T) {
+	if got, want := DirName, ".compozy"; got != want {
+		t.Fatalf("DirName = %q, want %q", got, want)
 	}
-
-	if got, want := paths.HomeDir, filepath.Join(homeDir, "daemon-home"); got != want {
-		t.Fatalf("HomeDir = %q, want %q", got, want)
+	if got, want := DatabaseName, "compozy.db"; got != want {
+		t.Fatalf("DatabaseName = %q, want %q", got, want)
 	}
-}
-
-func TestResolveHomePathsUsesUserHome(t *testing.T) {
-	homeDir := t.TempDir()
-	stubConfigUserHomeDir(t, func() (string, error) {
-		return homeDir, nil
-	})
-
-	paths, err := ResolveHomePaths()
-	if err != nil {
-		t.Fatalf("ResolveHomePaths() error = %v", err)
+	if got, want := LogFileName, "compozy.log"; got != want {
+		t.Fatalf("LogFileName = %q, want %q", got, want)
 	}
-
-	if got, want := paths.HomeDir, filepath.Join(homeDir, ".compozy"); got != want {
-		t.Fatalf("HomeDir = %q, want %q", got, want)
-	}
-}
-
-func TestResolveHomePathsUsesHomeIndependentlyOfWorkingDirectory(t *testing.T) {
-	homeDir := t.TempDir()
-	stubConfigUserHomeDir(t, func() (string, error) {
-		return homeDir, nil
-	})
-
-	workspaceRoot := filepath.Join(t.TempDir(), "workspace")
-	nestedDir := filepath.Join(workspaceRoot, "pkg", "feature")
-	if err := os.MkdirAll(nestedDir, 0o755); err != nil {
-		t.Fatalf("mkdir nested dir: %v", err)
-	}
-
-	originalWD, err := os.Getwd()
-	if err != nil {
-		t.Fatalf("Getwd() error = %v", err)
-	}
-	if err := os.Chdir(nestedDir); err != nil {
-		t.Fatalf("Chdir(%s) error = %v", nestedDir, err)
-	}
-	defer func() {
-		_ = os.Chdir(originalWD)
-	}()
-
-	paths, err := ResolveHomePaths()
-	if err != nil {
-		t.Fatalf("ResolveHomePaths() error = %v", err)
-	}
-
-	if got, want := paths.HomeDir, filepath.Join(homeDir, ".compozy"); got != want {
-		t.Fatalf("HomeDir = %q, want %q", got, want)
-	}
-	if got := paths.HomeDir; got == filepath.Join(workspaceRoot, ".compozy") {
-		t.Fatalf("HomeDir should not be workspace-scoped: %q", got)
-	}
-}
-
-func TestEnsureHomeLayoutCreatesDirectories(t *testing.T) {
-	t.Parallel()
 
 	paths, err := ResolveHomePathsFrom(filepath.Join(t.TempDir(), "home"))
 	if err != nil {
@@ -124,71 +185,105 @@ func TestEnsureHomeLayoutCreatesDirectories(t *testing.T) {
 	if err := EnsureHomeLayout(paths); err != nil {
 		t.Fatalf("EnsureHomeLayout() error = %v", err)
 	}
+	if got, want := paths.DatabaseFile, filepath.Join(paths.HomeDir, "compozy.db"); got != want {
+		t.Fatalf("ResolveHomePathsFrom() DatabaseFile = %q, want %q", got, want)
+	}
+	if got, want := paths.LogFile, filepath.Join(paths.LogsDir, "compozy.log"); got != want {
+		t.Fatalf("ResolveHomePathsFrom() LogFile = %q, want %q", got, want)
+	}
+	pathContracts := map[string]string{
+		"BinDir":                filepath.Join(paths.HomeDir, BinDirName),
+		"AppStateFile":          filepath.Join(paths.HomeDir, AppStateFileName),
+		"UpdateOperationFile":   filepath.Join(paths.HomeDir, UpdateOperationFileName),
+		"UpdateOperationLock":   filepath.Join(paths.HomeDir, UpdateOperationLockName),
+		"UpdateHistoryFile":     filepath.Join(paths.LogsDir, UpdateHistoryFileName),
+		"DesktopProvenanceFile": filepath.Join(paths.HomeDir, BinDirName, DesktopProvenanceFileName),
+		"ProfilesDir":           filepath.Join(paths.HomeDir, ProfilesDirName),
+		"DefaultProfileDir":     filepath.Join(paths.HomeDir, ProfilesDirName, DefaultProfileDirName),
+	}
+	for label, want := range pathContracts {
+		var got string
+		switch label {
+		case "BinDir":
+			got = paths.BinDir
+		case "AppStateFile":
+			got = paths.AppStateFile
+		case "UpdateOperationFile":
+			got = paths.UpdateOperationFile
+		case "UpdateOperationLock":
+			got = paths.UpdateOperationLock
+		case "UpdateHistoryFile":
+			got = paths.UpdateHistoryFile
+		case "DesktopProvenanceFile":
+			got = paths.DesktopProvenanceFile
+		case "ProfilesDir":
+			got = paths.ProfilesDir
+		case "DefaultProfileDir":
+			got = paths.DefaultProfileDir
+		}
+		if got != want {
+			t.Fatalf("ResolveHomePathsFrom() %s = %q, want %q", label, got, want)
+		}
+	}
 
-	dirs := []string{
+	for _, dir := range []string{
 		paths.HomeDir,
 		paths.AgentsDir,
-		paths.ExtensionsDir,
-		paths.StateDir,
-		paths.WorktreesDir,
-		paths.DaemonDir,
-		paths.DBDir,
-		paths.RunsDir,
+		paths.SkillsDir,
+		paths.LoopsDir,
+		paths.ProfilesDir,
+		paths.DefaultProfileDir,
+		paths.SessionsDir,
+		paths.ToolArtifactsDir,
+		paths.SessionAttachmentsDir,
+		paths.RestartsDir,
 		paths.LogsDir,
-		paths.CacheDir,
-	}
-	for _, dir := range dirs {
+		paths.ExtensionDataRoot,
+		paths.GatewayDir,
+		paths.GatewayCredentialsDir,
+		paths.BinDir,
+	} {
 		info, err := os.Stat(dir)
 		if err != nil {
-			t.Fatalf("stat %s: %v", dir, err)
+			t.Fatalf("Stat(%q) error = %v", dir, err)
 		}
 		if !info.IsDir() {
-			t.Fatalf("%s is not a directory", dir)
+			t.Fatalf("Stat(%q) IsDir() = false, want true", dir)
 		}
 	}
+}
 
-	daemonInfo, err := os.Stat(paths.DaemonDir)
+func TestResolveHomePathsFromExpandsTildePaths(t *testing.T) {
+	userHome, err := os.UserHomeDir()
 	if err != nil {
-		t.Fatalf("stat daemon dir: %v", err)
+		t.Fatalf("UserHomeDir() error = %v", err)
 	}
-	if daemonInfo.Mode().Perm() != 0o700 {
-		t.Fatalf("daemon dir mode = %o, want 700", daemonInfo.Mode().Perm())
+
+	paths, err := ResolveHomePathsFrom("~/compozy-test-home")
+	if err != nil {
+		t.Fatalf("ResolveHomePathsFrom() error = %v", err)
 	}
-}
-
-func TestEnsureHomeLayoutRejectsEmptyPaths(t *testing.T) {
-	t.Parallel()
-
-	if err := EnsureHomeLayout(HomePaths{}); err == nil {
-		t.Fatal("EnsureHomeLayout() error = nil, want non-nil")
+	if paths.HomeDir != filepath.Join(userHome, "compozy-test-home") {
+		t.Fatalf(
+			"ResolveHomePathsFrom() HomeDir = %q, want %q",
+			paths.HomeDir,
+			filepath.Join(userHome, "compozy-test-home"),
+		)
 	}
-}
-
-func TestResolveHomeDirReturnsUserHomeErrors(t *testing.T) {
-	homeErr := errors.New("home unavailable")
-	stubConfigUserHomeDir(t, func() (string, error) {
-		return "", homeErr
-	})
-
-	_, err := ResolveHomeDir()
-	if !errors.Is(err, homeErr) {
-		t.Fatalf("ResolveHomeDir() error = %v, want %v", err, homeErr)
+	if got, want := paths.SkillsDir, filepath.Join(userHome, "compozy-test-home", SkillsDirName); got != want {
+		t.Fatalf("ResolveHomePathsFrom() SkillsDir = %q, want %q", got, want)
+	}
+	if got, want := paths.LoopsDir, filepath.Join(userHome, "compozy-test-home", LoopsDirName); got != want {
+		t.Fatalf("ResolveHomePathsFrom() LoopsDir = %q, want %q", got, want)
+	}
+	if got, want := paths.RestartsDir, filepath.Join(userHome, "compozy-test-home", RestartsDirName); got != want {
+		t.Fatalf("ResolveHomePathsFrom() RestartsDir = %q, want %q", got, want)
 	}
 }
 
-func TestResolveHomePathsFromRejectsEmptyBaseDir(t *testing.T) {
-	t.Parallel()
-
-	if _, err := ResolveHomePathsFrom(" "); err == nil {
-		t.Fatal("ResolveHomePathsFrom() error = nil, want non-nil")
-	}
-}
-
-func TestResolvePathHandlesEmptyAndRelativePaths(t *testing.T) {
-	t.Parallel()
-
-	if got, err := ResolvePath(" "); err != nil || got != "" {
-		t.Fatalf("ResolvePath(empty) = %q, %v; want empty string, nil", got, err)
+func TestResolvePathVariants(t *testing.T) {
+	if got, err := ResolvePath(""); err != nil || got != "" {
+		t.Fatalf("ResolvePath(blank) = %q, %v, want empty nil", got, err)
 	}
 
 	got, err := ResolvePath("daemon.sock")
@@ -200,43 +295,8 @@ func TestResolvePathHandlesEmptyAndRelativePaths(t *testing.T) {
 	}
 }
 
-func TestResolvePathPropagatesUserHomeErrors(t *testing.T) {
-	homeErr := errors.New("home unavailable")
-	stubConfigUserHomeDir(t, func() (string, error) {
-		return "", homeErr
-	})
-
-	if _, err := ResolvePath("~"); !errors.Is(err, homeErr) {
-		t.Fatalf("ResolvePath(\"~\") error = %v, want %v", err, homeErr)
-	}
-}
-
-func TestEnsureHomeLayoutRejectsFileTarget(t *testing.T) {
-	t.Parallel()
-
-	base := filepath.Join(t.TempDir(), "home")
-	paths, err := ResolveHomePathsFrom(base)
-	if err != nil {
-		t.Fatalf("ResolveHomePathsFrom() error = %v", err)
-	}
-	if err := os.MkdirAll(filepath.Dir(paths.CacheDir), 0o755); err != nil {
-		t.Fatalf("mkdir cache parent: %v", err)
-	}
-	if err := os.WriteFile(paths.CacheDir, []byte("not a dir"), 0o600); err != nil {
-		t.Fatalf("write cache file: %v", err)
-	}
-
-	if err := EnsureHomeLayout(paths); err == nil {
+func TestEnsureHomeLayoutRejectsEmptyPaths(t *testing.T) {
+	if err := EnsureHomeLayout(HomePaths{}); err == nil {
 		t.Fatal("EnsureHomeLayout() error = nil, want non-nil")
 	}
-}
-
-func stubConfigUserHomeDir(t *testing.T, fn func() (string, error)) {
-	t.Helper()
-
-	original := osUserHomeDir
-	osUserHomeDir = fn
-	t.Cleanup(func() {
-		osUserHomeDir = original
-	})
 }

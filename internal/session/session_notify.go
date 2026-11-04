@@ -1,0 +1,248 @@
+package session
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"log/slog"
+	"strings"
+	"time"
+	"unicode/utf8"
+
+	compozyconfig "github.com/compozy/compozy/internal/config"
+	redactpkg "github.com/compozy/compozy/internal/redact"
+)
+
+const (
+	NotificationTitleMaxChars = 80
+	NotificationBodyMaxChars  = 240
+	NotificationRateWindow    = time.Second
+)
+
+var ErrInvalidNotification = errors.New("session: invalid operator notification")
+
+type NotifyOutcome string
+
+const (
+	NotifyOutcomeDelivered      NotifyOutcome = "delivered"
+	NotifyOutcomeNoClient       NotifyOutcome = "no-client"
+	NotifyOutcomeMutedWorkspace NotifyOutcome = "muted-workspace"
+	NotifyOutcomeRateLimited    NotifyOutcome = "rate-limited"
+)
+
+const NotifyKindHeartbeatSourceUnapproved = "heartbeat_source_unapproved"
+
+type NotifyRequest struct {
+	Kind        string
+	Action      string
+	Resource    string
+	SessionID   string
+	ProfileID   string
+	WorkspaceID string
+	Title       string
+	Body        string
+}
+
+type NotifyResult struct {
+	Outcome      NotifyOutcome
+	RetryAfterMS int64
+}
+
+type OperatorNotification struct {
+	Kind           string
+	Action         string
+	Resource       string
+	NotificationID string
+	SessionID      string
+	ProfileID      string
+	WorkspaceID    string
+	Title          string
+	Body           string
+	At             time.Time
+}
+
+// AttentionWorkspaceMuteReader reads the typed profile/workspace mute relation.
+type AttentionWorkspaceMuteReader interface {
+	IsAttentionWorkspaceMuted(ctx context.Context, profileID string, workspaceID string) (bool, error)
+}
+
+// SetAttentionConfig applies the live notification policy.
+func (m *Manager) SetAttentionConfig(cfg compozyconfig.AttentionConfig) error {
+	if m == nil {
+		return errors.New("session: manager is required")
+	}
+	m.notifyMu.Lock()
+	m.notifyConfig = cfg
+	m.notifyMu.Unlock()
+	return nil
+}
+
+// PublishOperatorNotification validates, rate-limits, and publishes one sanitized event.
+func (m *Manager) PublishOperatorNotification(
+	ctx context.Context,
+	req NotifyRequest,
+) (NotifyResult, error) {
+	// Source notices are already limited to persisted status transitions.
+	return m.publishOperatorNotification(ctx, req, req.Kind != NotifyKindHeartbeatSourceUnapproved)
+}
+
+func (m *Manager) publishOperatorNotification(
+	ctx context.Context, req NotifyRequest, rateLimit bool,
+) (NotifyResult, error) {
+	if m == nil {
+		return NotifyResult{}, errors.New("session: manager is required")
+	}
+	if ctx == nil {
+		return NotifyResult{}, errors.New("session: notification context is required")
+	}
+	if err := ctx.Err(); err != nil {
+		return NotifyResult{}, fmt.Errorf("session: publish operator notification: %w", err)
+	}
+	notification, err := m.sanitizedOperatorNotification(req)
+	if err != nil {
+		return NotifyResult{}, err
+	}
+	if m.attentionWorkspaceMutes == nil {
+		return NotifyResult{}, errors.New("session: attention workspace mute reader is required")
+	}
+	muted, err := m.attentionWorkspaceMutes.IsAttentionWorkspaceMuted(
+		ctx,
+		notification.ProfileID,
+		notification.WorkspaceID,
+	)
+	if err != nil {
+		return NotifyResult{}, fmt.Errorf("session: read attention workspace mute: %w", err)
+	}
+	m.notifyMu.Lock()
+	if retryAfter := m.notificationRetryAfterLocked(
+		notification.SessionID,
+		notification.At,
+	); rateLimit &&
+		retryAfter > 0 {
+		m.notifyMu.Unlock()
+		result := NotifyResult{
+			Outcome: NotifyOutcomeRateLimited, RetryAfterMS: retryAfter.Milliseconds(),
+		}
+		m.logNotificationOutcome(ctx, notification, result, 0)
+		return result, nil
+	}
+	if rateLimit {
+		m.notifyLastBySession[notification.SessionID] = notification.At
+	}
+	m.notifyMu.Unlock()
+	if muted {
+		result := NotifyResult{Outcome: NotifyOutcomeMutedWorkspace}
+		m.logNotificationOutcome(ctx, notification, result, 0)
+		return result, nil
+	}
+
+	delivered := m.publishSessionCatalogEventCount(CatalogEvent{
+		Name:                 CatalogEventNameOperatorNotification,
+		ProfileID:            notification.ProfileID,
+		WorkspaceID:          notification.WorkspaceID,
+		SessionID:            notification.SessionID,
+		OperatorNotification: &notification,
+	})
+	if delivered == 0 {
+		result := NotifyResult{Outcome: NotifyOutcomeNoClient}
+		m.logNotificationOutcome(ctx, notification, result, 0)
+		return result, nil
+	}
+	result := NotifyResult{Outcome: NotifyOutcomeDelivered}
+	m.logNotificationOutcome(ctx, notification, result, delivered)
+	return result, nil
+}
+
+func (m *Manager) sanitizedOperatorNotification(req NotifyRequest) (OperatorNotification, error) {
+	sessionID := strings.TrimSpace(req.SessionID)
+	profileID := strings.TrimSpace(req.ProfileID)
+	workspaceID := strings.TrimSpace(req.WorkspaceID)
+	if sessionID == "" {
+		return OperatorNotification{}, invalidNotification("session_id", "is required")
+	}
+	if profileID == "" {
+		return OperatorNotification{}, invalidNotification("profile_id", "is required")
+	}
+	if workspaceID == "" && req.Kind != NotifyKindHeartbeatSourceUnapproved {
+		return OperatorNotification{}, invalidNotification("workspace_id", "is required")
+	}
+	title := sanitizeNotificationText(req.Title)
+	body := sanitizeNotificationText(req.Body)
+	if title == "" {
+		return OperatorNotification{}, invalidNotification("title", "is required")
+	}
+	if utf8.RuneCountInString(title) > NotificationTitleMaxChars {
+		return OperatorNotification{}, invalidNotification(
+			"title", fmt.Sprintf("must be at most %d characters", NotificationTitleMaxChars),
+		)
+	}
+	if utf8.RuneCountInString(body) > NotificationBodyMaxChars {
+		return OperatorNotification{}, invalidNotification(
+			"body", fmt.Sprintf("must be at most %d characters", NotificationBodyMaxChars),
+		)
+	}
+	notificationID, err := m.newNotificationID()
+	if err != nil {
+		return OperatorNotification{}, fmt.Errorf("session: generate operator notification id: %w", err)
+	}
+	notificationID = strings.TrimSpace(notificationID)
+	if notificationID == "" {
+		return OperatorNotification{}, errors.New("session: generated operator notification id is empty")
+	}
+	return OperatorNotification{
+		Kind:   req.Kind,
+		Action: notificationDetail(req.Action), Resource: notificationDetail(req.Resource),
+		NotificationID: notificationID,
+		SessionID:      sessionID, ProfileID: profileID, WorkspaceID: workspaceID,
+		Title: title, Body: body, At: m.now().UTC(),
+	}, nil
+}
+
+func (m *Manager) notificationRetryAfterLocked(sessionID string, now time.Time) time.Duration {
+	last, exists := m.notifyLastBySession[sessionID]
+	if !exists {
+		return 0
+	}
+	retryAt := last.Add(NotificationRateWindow)
+	if !now.Before(retryAt) {
+		return 0
+	}
+	retryAfter := retryAt.Sub(now)
+	return ((retryAfter + time.Millisecond - 1) / time.Millisecond) * time.Millisecond
+}
+
+func sanitizeNotificationText(value string) string {
+	return strings.Join(strings.Fields(redactpkg.String(value)), " ")
+}
+
+func (m *Manager) logNotificationOutcome(
+	ctx context.Context,
+	notification OperatorNotification,
+	result NotifyResult,
+	deliveredSubscribers int,
+) {
+	logger := m.logger
+	if logger == nil {
+		logger = slog.Default()
+	}
+	logger.InfoContext(ctx, "session operator notification",
+		"session_id", notification.SessionID,
+		"workspace_id", notification.WorkspaceID,
+		"outcome", result.Outcome,
+		"retry_after_ms", result.RetryAfterMS,
+		"delivered_subscribers", deliveredSubscribers,
+	)
+}
+
+func invalidNotification(field string, detail string) error {
+	return fmt.Errorf("%w: %s %s", ErrInvalidNotification, field, detail)
+}
+
+func notificationDetail(value string) string {
+	value = sanitizeNotificationText(value)
+	runes := []rune(value)
+	if len(runes) > NotificationBodyMaxChars {
+		return string(runes[:NotificationBodyMaxChars])
+	}
+	return value
+}

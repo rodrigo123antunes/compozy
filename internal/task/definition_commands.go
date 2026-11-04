@@ -1,0 +1,53 @@
+package task
+
+import (
+	"context"
+)
+
+// CreateTaskDefinitionMutation commits a task definition, optional execution
+// profile intent, and every causal event as one persistence command.
+type CreateTaskDefinitionMutation struct {
+	Task    Task
+	Profile *ExecutionProfile
+	Events  []Event
+}
+
+// UpdateTaskDefinitionMutation commits a task-row update, optional execution
+// profile intent, and every causal event as one persistence command.
+type UpdateTaskDefinitionMutation struct {
+	Task          Task
+	UpdateTaskRow bool
+	Actor         ActorContext
+	Events        []Event
+}
+
+// ExecutionProfileMutation commits one profile replacement and its event.
+type ExecutionProfileMutation struct {
+	Actor   ActorContext
+	Profile ExecutionProfile
+	Event   Event
+}
+
+// WorktreePolicyMutation commits one worktree block patch and its event.
+type WorktreePolicyMutation struct {
+	Actor  ActorContext
+	TaskID string
+	Policy WorktreePolicy
+	Event  Event
+}
+
+// ExecutionProfileDeleteMutation commits one profile deletion and its event.
+type ExecutionProfileDeleteMutation struct {
+	Actor  ActorContext
+	TaskID string
+	Event  Event
+}
+
+// DefinitionStore owns atomic task-definition and profile commands.
+type DefinitionStore interface {
+	CreateTaskDefinition(ctx context.Context, mutation *CreateTaskDefinitionMutation) error
+	UpdateTaskDefinition(ctx context.Context, mutation *UpdateTaskDefinitionMutation) (ExecutionProfile, error)
+	SetTaskExecutionProfile(ctx context.Context, mutation *ExecutionProfileMutation) (ExecutionProfile, error)
+	SetTaskWorktreePolicy(ctx context.Context, mutation *WorktreePolicyMutation) (ExecutionProfile, error)
+	DeleteTaskExecutionProfile(ctx context.Context, mutation ExecutionProfileDeleteMutation) error
+}

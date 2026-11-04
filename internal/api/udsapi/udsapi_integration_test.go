@@ -1,0 +1,3512 @@
+//go:build integration
+
+package udsapi
+
+import (
+	"bufio"
+	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"io"
+	"net"
+	"net/http"
+	"os"
+	"slices"
+	"strings"
+	"sync"
+	"testing"
+	"time"
+
+	"github.com/compozy/compozy/internal/acp"
+	"github.com/compozy/compozy/internal/api/contract"
+	"github.com/compozy/compozy/internal/api/core"
+	apitestutil "github.com/compozy/compozy/internal/api/testutil"
+	automationpkg "github.com/compozy/compozy/internal/automation"
+	compozyconfig "github.com/compozy/compozy/internal/config"
+	"github.com/compozy/compozy/internal/observe"
+	profilepkg "github.com/compozy/compozy/internal/profile"
+	"github.com/compozy/compozy/internal/resources"
+	"github.com/compozy/compozy/internal/session"
+	"github.com/compozy/compozy/internal/store/globaldb"
+	"github.com/compozy/compozy/internal/store/workspacedb"
+	taskpkg "github.com/compozy/compozy/internal/task"
+	terminalpkg "github.com/compozy/compozy/internal/terminal"
+	terminaljournal "github.com/compozy/compozy/internal/terminal/journal"
+	toolspkg "github.com/compozy/compozy/internal/tools"
+	"github.com/compozy/compozy/internal/transcript"
+	"github.com/compozy/compozy/internal/windowmanager"
+	workspacepkg "github.com/compozy/compozy/internal/workspace"
+	"github.com/gorilla/websocket"
+)
+
+func TestUDSFullRoundTripWithRealSessionManager(t *testing.T) {
+	runtime := newIntegrationRuntime(t)
+
+	statusResp := mustUnixRequest(t, runtime.client, http.MethodGet, "http://unix/api/status", nil, nil)
+	if statusResp.StatusCode != http.StatusOK {
+		t.Fatalf("daemon status = %d, want %d", statusResp.StatusCode, http.StatusOK)
+	}
+	closeHTTPBody(t, statusResp.Body)
+
+	createResp := mustUnixRequest(
+		t,
+		runtime.client,
+		http.MethodPost,
+		"http://unix/api/sessions",
+		[]byte(`{"agent_name":"coder","name":"demo","workspace_path":"`+runtime.workspace+`"}`),
+		nil,
+	)
+	if createResp.StatusCode != http.StatusCreated {
+		body := readAndCloseHTTPBody(t, createResp)
+		t.Fatalf(
+			"create session status = %d, want %d; body=%s",
+			createResp.StatusCode,
+			http.StatusCreated,
+			string(body),
+		)
+	}
+	var created struct {
+		Session sessionPayload `json:"session"`
+	}
+	decodeHTTPJSON(t, createResp, &created)
+	if created.Session.ID == "" {
+		t.Fatal("expected created session id")
+	}
+	if created.Session.WorkspaceID == "" {
+		t.Fatal("expected created session workspace id")
+	}
+	waitForIntegrationSessionActive(t, runtime.manager, created.Session.ID)
+
+	listResp := mustUnixRequest(
+		t,
+		runtime.client,
+		http.MethodGet,
+		"http://unix/api/sessions?all_workspaces=true&profile=default",
+		nil,
+		nil,
+	)
+	if listResp.StatusCode != http.StatusOK {
+		t.Fatalf("list sessions status = %d, want %d", listResp.StatusCode, http.StatusOK)
+	}
+	var listed struct {
+		Sessions []sessionPayload `json:"sessions"`
+	}
+	decodeHTTPJSON(t, listResp, &listed)
+	if len(listed.Sessions) != 1 || listed.Sessions[0].ID != created.Session.ID {
+		t.Fatalf("listed sessions = %#v", listed.Sessions)
+	}
+	tasksAfterManualSession, err := runtime.registry.ListTasks(t.Context(), taskpkg.Query{Limit: 10})
+	if err != nil {
+		t.Fatalf("ListTasks(after manual session) error = %v", err)
+	}
+	if len(tasksAfterManualSession) != 0 {
+		t.Fatalf("tasks after manual session = %#v, want none", tasksAfterManualSession)
+	}
+	runsAfterManualSession, err := runtime.registry.ListTaskRunsByStatus(
+		t.Context(),
+		[]taskpkg.RunStatus{
+			taskpkg.TaskRunStatusQueued,
+			taskpkg.TaskRunStatusClaimed,
+			taskpkg.TaskRunStatusStarting,
+			taskpkg.TaskRunStatusRunning,
+		},
+	)
+	if err != nil {
+		t.Fatalf("ListTaskRunsByStatus(after manual session) error = %v", err)
+	}
+	if len(runsAfterManualSession) != 0 {
+		t.Fatalf("open task runs after manual session = %#v, want none", runsAfterManualSession)
+	}
+
+	promptResp := mustUnixRequest(
+		t,
+		runtime.client,
+		http.MethodPost,
+		sessionAPIPath(created.Session.WorkspaceID, created.Session.ID, "/prompt"),
+		integrationPromptJSON(t, "hello"),
+		nil,
+	)
+	if promptResp.StatusCode != http.StatusOK {
+		body := readAndCloseHTTPBody(t, promptResp)
+		t.Fatalf("prompt status = %d, want %d; body=%s", promptResp.StatusCode, http.StatusOK, string(body))
+	}
+	if got := promptResp.Header.Get("x-vercel-ai-ui-message-stream"); got != "v1" {
+		t.Fatalf("x-vercel-ai-ui-message-stream = %q, want v1", got)
+	}
+	promptBody, err := io.ReadAll(promptResp.Body)
+	closeHTTPBody(t, promptResp.Body)
+	if err != nil {
+		t.Fatalf("io.ReadAll(prompt SSE) error = %v", err)
+	}
+	promptEvents := parseSSE(t, string(promptBody))
+	if len(promptEvents) < 5 {
+		t.Fatalf("prompt SSE events = %d, want at least 5; body=%s", len(promptEvents), string(promptBody))
+	}
+	if string(promptEvents[len(promptEvents)-1].Data) != "[DONE]" {
+		t.Fatalf("last prompt SSE data = %q, want [DONE]", string(promptEvents[len(promptEvents)-1].Data))
+	}
+
+	partTypes := make([]string, 0, len(promptEvents))
+	for _, record := range promptEvents[:len(promptEvents)-1] {
+		if len(record.Data) == 0 || string(record.Data) == "[DONE]" {
+			continue
+		}
+		var payload struct {
+			Type string `json:"type"`
+		}
+		if err := json.Unmarshal(record.Data, &payload); err != nil {
+			t.Fatalf("json.Unmarshal(prompt part) error = %v; data=%s", err, string(record.Data))
+		}
+		partTypes = append(partTypes, payload.Type)
+	}
+	hasType := func(target string) bool {
+		return slices.Contains(partTypes, target)
+	}
+	if !hasType("start") || !hasType("text-start") || !hasType("text-delta") ||
+		!hasType("text-end") || !hasType("finish") {
+		t.Fatalf("prompt SSE part types = %#v", partTypes)
+	}
+
+	eventsResp := mustUnixRequest(
+		t,
+		runtime.client,
+		http.MethodGet,
+		sessionAPIPath(created.Session.WorkspaceID, created.Session.ID, "/events"),
+		nil,
+		nil,
+	)
+	if eventsResp.StatusCode != http.StatusOK {
+		t.Fatalf("session events status = %d, want %d", eventsResp.StatusCode, http.StatusOK)
+	}
+	var events struct {
+		Events []sessionEventPayload `json:"events"`
+	}
+	decodeHTTPJSON(t, eventsResp, &events)
+	if len(events.Events) < 2 {
+		t.Fatalf("persisted session events = %d, want at least 2", len(events.Events))
+	}
+
+	stopResp := mustUnixRequest(
+		t,
+		runtime.client,
+		http.MethodDelete,
+		sessionAPIPath(created.Session.WorkspaceID, created.Session.ID, ""),
+		nil,
+		nil,
+	)
+	if stopResp.StatusCode != http.StatusNoContent {
+		body := readAndCloseHTTPBody(t, stopResp)
+		t.Fatalf("stop session status = %d, want %d; body=%s", stopResp.StatusCode, http.StatusNoContent, string(body))
+	}
+	closeHTTPBody(t, stopResp.Body)
+}
+
+func TestUDSWindowManagerWebSocketStream(t *testing.T) {
+	t.Run("Should stream one client fence and drain over the Unix socket", func(t *testing.T) {
+		t.Parallel()
+		runtime := newIntegrationRuntime(t)
+		const workspaceID = "window-manager-workspace"
+		streamURL := "ws://unix/api/workspaces/" + workspaceID + "/window-manager/stream"
+		dialer := websocket.Dialer{
+			NetDialContext: func(ctx context.Context, _, _ string) (net.Conn, error) {
+				var netDialer net.Dialer
+				return netDialer.DialUnix(
+					ctx,
+					"unix",
+					nil,
+					&net.UnixAddr{Name: runtime.socket, Net: "unix"},
+				)
+			},
+		}
+
+		missingDialContext, cancelMissingDial := context.WithTimeout(t.Context(), time.Second)
+		missingConnection, response, err := dialer.DialContext(
+			missingDialContext,
+			streamURL+"?client_id=missing",
+			nil,
+		)
+		cancelMissingDial()
+		if err != nil {
+			if response != nil && response.Body != nil {
+				closeHTTPBody(t, response.Body)
+			}
+			t.Fatalf("DialContext(missing client) error = %v", err)
+		}
+		t.Cleanup(func() {
+			if closeErr := missingConnection.Close(); closeErr != nil {
+				t.Errorf("missing-client websocket Close() error = %v", closeErr)
+			}
+		})
+		if deadlineErr := missingConnection.SetReadDeadline(time.Now().Add(time.Second)); deadlineErr != nil {
+			t.Fatalf("SetReadDeadline(missing-client frame) error = %v", deadlineErr)
+		}
+		var terminal contract.WindowManagerErrorFrame
+		if readErr := missingConnection.ReadJSON(&terminal); readErr != nil {
+			t.Fatalf("ReadJSON(missing-client error) error = %v", readErr)
+		}
+		if terminal.Type != contract.WindowManagerFrameError ||
+			terminal.Error.Code != contract.WindowManagerErrorClientNotFound ||
+			terminal.Error.WorkspaceID != workspaceID {
+			t.Fatalf("missing-client terminal frame = %+v", terminal)
+		}
+		if deadlineErr := missingConnection.SetReadDeadline(time.Now().Add(time.Second)); deadlineErr != nil {
+			t.Fatalf("SetReadDeadline(missing client) error = %v", deadlineErr)
+		}
+		_, _, readErr := missingConnection.ReadMessage()
+		if !websocket.IsCloseError(readErr, websocket.ClosePolicyViolation) {
+			t.Fatalf("ReadMessage(missing client) error = %v, want policy-violation close", readErr)
+		}
+
+		registerResponse := mustUnixRequest(
+			t,
+			runtime.client,
+			http.MethodPost,
+			"http://unix/api/workspaces/"+workspaceID+"/window-manager/clients",
+			[]byte(`{"workspace_id":"`+workspaceID+`","client_id":"client-a"}`),
+			nil,
+		)
+		if registerResponse.StatusCode != http.StatusCreated {
+			body := readAndCloseHTTPBody(t, registerResponse)
+			t.Fatalf(
+				"register client status = %d, want %d; body=%s",
+				registerResponse.StatusCode,
+				http.StatusCreated,
+				string(body),
+			)
+		}
+		var registered contract.WindowManagerClientView
+		decodeHTTPJSON(t, registerResponse, &registered)
+		if registered.ClientID != "client-a" || registered.PresentationRevision != 1 {
+			t.Fatalf("registered client = %+v", registered)
+		}
+
+		registeredDialContext, cancelRegisteredDial := context.WithTimeout(t.Context(), time.Second)
+		connection, response, err := dialer.DialContext(
+			registeredDialContext,
+			streamURL+"?client_id=client-a",
+			nil,
+		)
+		cancelRegisteredDial()
+		if err != nil {
+			if response != nil && response.Body != nil {
+				closeHTTPBody(t, response.Body)
+			}
+			t.Fatalf("DialContext(registered client) error = %v", err)
+		}
+		t.Cleanup(func() {
+			if closeErr := connection.Close(); closeErr != nil {
+				t.Errorf("registered-client websocket Close() error = %v", closeErr)
+			}
+		})
+		if deadlineErr := connection.SetReadDeadline(time.Now().Add(time.Second)); deadlineErr != nil {
+			t.Fatalf("SetReadDeadline(client fence) error = %v", deadlineErr)
+		}
+		var fence contract.WindowManagerSnapshotFrame
+		if readErr := connection.ReadJSON(&fence); readErr != nil {
+			t.Fatalf("ReadJSON(client fence) error = %v", readErr)
+		}
+		if fence.Type != contract.WindowManagerFrameSnapshot ||
+			fence.WorkspaceID != workspaceID ||
+			fence.Client == nil ||
+			fence.Client.ClientID != "client-a" ||
+			fence.Client.PresentationRevision != 1 {
+			t.Fatalf("client-bound fence = %+v", fence)
+		}
+
+		shutdownContext, cancel := context.WithTimeout(context.WithoutCancel(t.Context()), 2*time.Second)
+		defer cancel()
+		if shutdownErr := runtime.server.Shutdown(shutdownContext); shutdownErr != nil {
+			t.Fatalf("server.Shutdown() error = %v", shutdownErr)
+		}
+		if deadlineErr := connection.SetReadDeadline(time.Now().Add(time.Second)); deadlineErr != nil {
+			t.Fatalf("SetReadDeadline(shutdown) error = %v", deadlineErr)
+		}
+		_, _, readErr = connection.ReadMessage()
+		if !websocket.IsCloseError(readErr, websocket.CloseGoingAway) {
+			t.Fatalf("ReadMessage(shutdown) error = %v, want going-away close", readErr)
+		}
+	})
+}
+
+func TestUDSSessionTranscriptEndpointIncludesSyntheticTurns(t *testing.T) {
+	runtime := newIntegrationRuntime(t)
+	created := createLiveIntegrationSessionPayload(t, runtime)
+	sessionID := created.ID
+
+	const promptTimeout = 5 * time.Second
+
+	userCtx, cancelUser := context.WithTimeout(t.Context(), promptTimeout)
+	userEvents, userErr := runtime.manager.Prompt(userCtx, sessionID, "hello")
+	collectIntegrationPromptEvents(t, mustIntegrationPrompt(t, userEvents, userErr), promptTimeout)
+	cancelUser()
+
+	syntheticCtx, cancelSynthetic := context.WithTimeout(t.Context(), promptTimeout)
+	syntheticEvents, syntheticErr := runtime.manager.PromptSynthetic(
+		syntheticCtx,
+		sessionID,
+		session.SyntheticPromptOpts{
+			Message: "daemon wake-up",
+			Metadata: acp.PromptSyntheticMeta{
+				TaskRunID: "run-1",
+				Reason:    "task_run_completed",
+				Summary:   "background work finished",
+			},
+		},
+	)
+	collectIntegrationPromptEvents(t, mustIntegrationPrompt(t, syntheticEvents, syntheticErr), promptTimeout)
+	cancelSynthetic()
+
+	resp := mustUnixRequest(
+		t,
+		runtime.client,
+		http.MethodGet,
+		sessionAPIPath(created.WorkspaceID, sessionID, "/transcript"),
+		nil,
+		nil,
+	)
+	if resp.StatusCode != http.StatusOK {
+		body := readAndCloseHTTPBody(t, resp)
+		t.Fatalf("transcript status = %d, want %d; body=%s", resp.StatusCode, http.StatusOK, string(body))
+	}
+
+	var payload contract.SessionTranscriptResponse
+	decodeHTTPJSON(t, resp, &payload)
+	messages := transcript.MessagesFromEntries(payload.Entries)
+	if len(messages) != 5 {
+		t.Fatalf("len(messages) = %d, want 5", len(messages))
+	}
+	if got := messages[0].Role; got != transcript.UIRoleUser {
+		t.Fatalf("messages[0].Role = %q, want %q", got, transcript.UIRoleUser)
+	}
+	if got := transcript.UIMessageText(messages[0]); got != "hello" {
+		t.Fatalf("messages[0] text = %q, want %q", got, "hello")
+	}
+	if got := messages[1].Role; got != transcript.UIRoleAssistant {
+		t.Fatalf("messages[1].Role = %q, want %q", got, transcript.UIRoleAssistant)
+	}
+	if got := messages[2].Role; got != transcript.UIRoleSystem {
+		t.Fatalf("messages[2].Role = %q, want %q", got, transcript.UIRoleSystem)
+	}
+	if got := transcript.UIMessageText(messages[2]); got != "daemon wake-up" {
+		t.Fatalf("messages[2] text = %q, want %q", got, "daemon wake-up")
+	}
+	// Dispatch acknowledgment and agent output are persisted by independent owners.
+	dispatchReceipt, syntheticReply := messages[3], messages[4]
+	if len(dispatchReceipt.Parts) != 1 || dispatchReceipt.Parts[0].Type != "data-compozy-event" {
+		dispatchReceipt, syntheticReply = syntheticReply, dispatchReceipt
+	}
+	if len(dispatchReceipt.Parts) != 1 || dispatchReceipt.Parts[0].Type != "data-compozy-event" {
+		t.Fatalf("dispatchReceipt = %#v, want queue dispatch marker", dispatchReceipt)
+	}
+	var marker acp.AgentEvent
+	if err := json.Unmarshal(dispatchReceipt.Parts[0].Data, &marker); err != nil {
+		t.Fatalf("decode queue dispatch marker: %v", err)
+	}
+	if marker.Title != transcript.MarkerPromptAccepted {
+		t.Fatalf("queue dispatch marker = %q, want %q", marker.Title, transcript.MarkerPromptAccepted)
+	}
+	if got := syntheticReply.Role; got != transcript.UIRoleAssistant {
+		t.Fatalf("syntheticReply.Role = %q, want %q", got, transcript.UIRoleAssistant)
+	}
+}
+
+func TestUDSResourceCRUDRoundTrip(t *testing.T) {
+	runtime := newIntegrationRuntime(t)
+
+	createResp := mustUnixRequest(
+		t,
+		runtime.client,
+		http.MethodPut,
+		"http://unix/api/resources/integration.fixture/demo",
+		[]byte(`{"scope":{"kind":"user"},"spec":{"enabled":true}}`),
+		nil,
+	)
+	if createResp.StatusCode != http.StatusCreated {
+		body := readAndCloseHTTPBody(t, createResp)
+		t.Fatalf(
+			"create resource status = %d, want %d; body=%s",
+			createResp.StatusCode,
+			http.StatusCreated,
+			string(body),
+		)
+	}
+	var created contract.ResourceResponse
+	decodeHTTPJSON(t, createResp, &created)
+	if created.Record.Version != 1 {
+		t.Fatalf("created version = %d, want 1", created.Record.Version)
+	}
+	if strings.TrimSpace(string(created.Record.Spec)) != `{"enabled":true}` {
+		t.Fatalf("created spec = %s, want enabled true", string(created.Record.Spec))
+	}
+
+	updateResp := mustUnixRequest(
+		t,
+		runtime.client,
+		http.MethodPut,
+		"http://unix/api/resources/integration.fixture/demo",
+		[]byte(
+			fmt.Sprintf(
+				`{"scope":{"kind":"user"},"expected_version":%d,"spec":{"enabled":false}}`,
+				created.Record.Version,
+			),
+		),
+		nil,
+	)
+	if updateResp.StatusCode != http.StatusOK {
+		body := readAndCloseHTTPBody(t, updateResp)
+		t.Fatalf("update resource status = %d, want %d; body=%s", updateResp.StatusCode, http.StatusOK, string(body))
+	}
+	var updated contract.ResourceResponse
+	decodeHTTPJSON(t, updateResp, &updated)
+	if updated.Record.Version != 2 {
+		t.Fatalf("updated version = %d, want 2", updated.Record.Version)
+	}
+	if strings.TrimSpace(string(updated.Record.Spec)) != `{"enabled":false}` {
+		t.Fatalf("updated spec = %s, want enabled false", string(updated.Record.Spec))
+	}
+
+	getResp := mustUnixRequest(
+		t,
+		runtime.client,
+		http.MethodGet,
+		"http://unix/api/resources/integration.fixture/demo",
+		nil,
+		nil,
+	)
+	if getResp.StatusCode != http.StatusOK {
+		body := readAndCloseHTTPBody(t, getResp)
+		t.Fatalf("get resource status = %d, want %d; body=%s", getResp.StatusCode, http.StatusOK, string(body))
+	}
+	var fetched contract.ResourceResponse
+	decodeHTTPJSON(t, getResp, &fetched)
+	if fetched.Record.Version != updated.Record.Version {
+		t.Fatalf("fetched version = %d, want %d", fetched.Record.Version, updated.Record.Version)
+	}
+
+	listResp := mustUnixRequest(
+		t,
+		runtime.client,
+		http.MethodGet,
+		"http://unix/api/resources/integration.fixture?scope_kind=user",
+		nil,
+		nil,
+	)
+	if listResp.StatusCode != http.StatusOK {
+		body := readAndCloseHTTPBody(t, listResp)
+		t.Fatalf("list resources status = %d, want %d; body=%s", listResp.StatusCode, http.StatusOK, string(body))
+	}
+	var listed contract.ResourcesResponse
+	decodeHTTPJSON(t, listResp, &listed)
+	if len(listed.Records) != 1 || listed.Records[0].ID != "demo" ||
+		listed.Records[0].Version != updated.Record.Version {
+		t.Fatalf("listed records = %#v, want updated demo record", listed.Records)
+	}
+
+	staleDelete := mustUnixRequest(
+		t,
+		runtime.client,
+		http.MethodDelete,
+		"http://unix/api/resources/integration.fixture/demo",
+		[]byte(fmt.Sprintf(`{"expected_version":%d}`, created.Record.Version)),
+		nil,
+	)
+	if staleDelete.StatusCode != http.StatusConflict {
+		body := readAndCloseHTTPBody(t, staleDelete)
+		t.Fatalf(
+			"stale delete status = %d, want %d; body=%s",
+			staleDelete.StatusCode,
+			http.StatusConflict,
+			string(body),
+		)
+	}
+	closeHTTPBody(t, staleDelete.Body)
+
+	deleteResp := mustUnixRequest(
+		t,
+		runtime.client,
+		http.MethodDelete,
+		"http://unix/api/resources/integration.fixture/demo",
+		[]byte(fmt.Sprintf(`{"expected_version":%d}`, updated.Record.Version)),
+		nil,
+	)
+	if deleteResp.StatusCode != http.StatusNoContent {
+		body := readAndCloseHTTPBody(t, deleteResp)
+		t.Fatalf(
+			"delete resource status = %d, want %d; body=%s",
+			deleteResp.StatusCode,
+			http.StatusNoContent,
+			string(body),
+		)
+	}
+	closeHTTPBody(t, deleteResp.Body)
+
+	getResp = mustUnixRequest(
+		t,
+		runtime.client,
+		http.MethodGet,
+		"http://unix/api/resources/integration.fixture/demo",
+		nil,
+		nil,
+	)
+	if getResp.StatusCode != http.StatusNotFound {
+		body := readAndCloseHTTPBody(t, getResp)
+		t.Fatalf(
+			"get deleted resource status = %d, want %d; body=%s",
+			getResp.StatusCode,
+			http.StatusNotFound,
+			string(body),
+		)
+	}
+}
+
+func TestUDSToolResourceCRUDRoundTripTriggersProjection(t *testing.T) {
+	t.Parallel()
+
+	t.Run("Should create update tool resource and trigger projection", func(t *testing.T) {
+		t.Parallel()
+
+		runtime := newIntegrationRuntime(t)
+
+		createResp := mustUnixRequest(
+			t,
+			runtime.client,
+			http.MethodPut,
+			"http://unix/api/resources/tool/lookup",
+			[]byte(`{
+				"scope":{"kind":"user"},
+				"spec":{
+					"id":" dyn__lookup ",
+					"backend":{"kind":"native_go","native_name":" lookup "},
+					"description":" search workspace ",
+					"input_schema":{"type":"object"},
+					"read_only":true,
+					"source":{"kind":"dynamic","owner":" udsapi "},
+					"visibility":"operator",
+					"risk":"read"
+				}
+			}`),
+			nil,
+		)
+		if createResp.StatusCode != http.StatusCreated {
+			body, err := io.ReadAll(createResp.Body)
+			if err != nil {
+				t.Fatalf("io.ReadAll(create tool resource body) error = %v", err)
+			}
+			if err := createResp.Body.Close(); err != nil {
+				t.Fatalf("create tool resource body close error = %v", err)
+			}
+			t.Fatalf(
+				"create tool resource status = %d, want %d; body=%s",
+				createResp.StatusCode,
+				http.StatusCreated,
+				string(body),
+			)
+		}
+		var created contract.ResourceResponse
+		decodeHTTPJSON(t, createResp, &created)
+		var createdSpec map[string]any
+		if err := json.Unmarshal(created.Record.Spec, &createdSpec); err != nil {
+			t.Fatalf("json.Unmarshal(created tool spec) error = %v", err)
+		}
+		backend, ok := createdSpec["backend"].(map[string]any)
+		if !ok {
+			t.Fatalf("created tool backend = %#v, want object", createdSpec["backend"])
+		}
+		source, ok := createdSpec["source"].(map[string]any)
+		if !ok {
+			t.Fatalf("created tool source = %#v, want object", createdSpec["source"])
+		}
+		inputSchema, ok := createdSpec["input_schema"].(map[string]any)
+		if !ok {
+			t.Fatalf("created tool input_schema = %#v, want object", createdSpec["input_schema"])
+		}
+		if createdSpec["id"] != "dyn__lookup" ||
+			createdSpec["description"] != "search workspace" ||
+			createdSpec["visibility"] != "operator" ||
+			createdSpec["risk"] != "read" ||
+			createdSpec["read_only"] != true ||
+			inputSchema["type"] != "object" ||
+			backend["kind"] != "native_go" ||
+			backend["native_name"] != "lookup" ||
+			source["kind"] != "dynamic" ||
+			source["owner"] != "udsapi" {
+			t.Fatalf("created tool spec = %#v, want normalized fields", createdSpec)
+		}
+
+		waitForProjectedToolRevision(t, runtime, 1)
+		revision, records := runtime.toolCatalog.snapshot()
+		if revision != 1 || len(records) != 1 || records[0].Spec.ID != toolspkg.ToolID("dyn__lookup") {
+			t.Fatalf("tool projection after create = revision:%d records:%#v, want lookup@1", revision, records)
+		}
+
+		updateResp := mustUnixRequest(
+			t,
+			runtime.client,
+			http.MethodPut,
+			"http://unix/api/resources/tool/lookup",
+			[]byte(fmt.Sprintf(`{
+				"scope":{"kind":"user"},
+				"expected_version":%d,
+				"spec":{
+					"id":"dyn__lookup",
+					"backend":{"kind":"native_go","native_name":"lookup"},
+					"description":"search workspace v2",
+					"input_schema":{"type":"object"},
+					"read_only":true,
+					"source":{"kind":"dynamic","owner":"udsapi"},
+					"visibility":"operator",
+					"risk":"read"
+				}
+			}`, created.Record.Version)),
+			nil,
+		)
+		if updateResp.StatusCode != http.StatusOK {
+			body, err := io.ReadAll(updateResp.Body)
+			if err != nil {
+				t.Fatalf("io.ReadAll(update tool resource body) error = %v", err)
+			}
+			if err := updateResp.Body.Close(); err != nil {
+				t.Fatalf("update tool resource body close error = %v", err)
+			}
+			t.Fatalf(
+				"update tool resource status = %d, want %d; body=%s",
+				updateResp.StatusCode,
+				http.StatusOK,
+				string(body),
+			)
+		}
+		var updated contract.ResourceResponse
+		decodeHTTPJSON(t, updateResp, &updated)
+		waitForProjectedToolRevision(t, runtime, 2)
+
+		_, records = runtime.toolCatalog.snapshot()
+		if got, want := len(records), 1; got != want {
+			t.Fatalf("projected tool count after update = %d, want %d", got, want)
+		}
+		if got, want := records[0].Spec.ID, toolspkg.ToolID("dyn__lookup"); got != want {
+			t.Fatalf("projected tool ID after update = %q, want %q", got, want)
+		}
+		if got, want := records[0].Spec.Description, "search workspace v2"; got != want {
+			t.Fatalf("projected tool description = %q, want %q", got, want)
+		}
+	})
+}
+
+func TestUDSAutomationJobsRoundTrip(t *testing.T) {
+	runtime := newIntegrationRuntime(t)
+
+	createResp := mustUnixRequest(
+		t,
+		runtime.client,
+		http.MethodPost,
+		"http://unix/api/automation/jobs",
+		[]byte(
+			`{"scope":"global","name":"nightly-review","agent_name":"coder","prompt":"review repo","schedule":{"mode":"every","interval":"1h"}}`,
+		),
+		nil,
+	)
+	if createResp.StatusCode != http.StatusCreated {
+		body := readAndCloseHTTPBody(t, createResp)
+		t.Fatalf("create job status = %d, want %d; body=%s", createResp.StatusCode, http.StatusCreated, string(body))
+	}
+	var created contract.JobResponse
+	decodeHTTPJSON(t, createResp, &created)
+	if created.Job.ID == "" {
+		t.Fatal("expected created automation job id")
+	}
+
+	updateResp := mustUnixRequest(
+		t,
+		runtime.client,
+		http.MethodPatch,
+		"http://unix/api/automation/jobs/"+created.Job.ID,
+		[]byte(`{"prompt":"review repo now"}`),
+		nil,
+	)
+	if updateResp.StatusCode != http.StatusOK {
+		body := readAndCloseHTTPBody(t, updateResp)
+		t.Fatalf("update job status = %d, want %d; body=%s", updateResp.StatusCode, http.StatusOK, string(body))
+	}
+	var updated contract.JobResponse
+	decodeHTTPJSON(t, updateResp, &updated)
+	if updated.Job.Prompt != "review repo now" {
+		t.Fatalf("updated job prompt = %q, want %q", updated.Job.Prompt, "review repo now")
+	}
+
+	triggerResp := mustUnixRequest(
+		t,
+		runtime.client,
+		http.MethodPost,
+		"http://unix/api/automation/jobs/"+created.Job.ID+"/trigger",
+		nil,
+		nil,
+	)
+	if triggerResp.StatusCode != http.StatusOK {
+		body := readAndCloseHTTPBody(t, triggerResp)
+		t.Fatalf("trigger job status = %d, want %d; body=%s", triggerResp.StatusCode, http.StatusOK, string(body))
+	}
+	var run contract.RunResponse
+	decodeHTTPJSON(t, triggerResp, &run)
+	if run.Run.JobID != created.Job.ID {
+		t.Fatalf("job run = %#v, want job_id %q", run.Run, created.Job.ID)
+	}
+
+	runsResp := mustUnixRequest(
+		t,
+		runtime.client,
+		http.MethodGet,
+		"http://unix/api/automation/jobs/"+created.Job.ID+"/runs",
+		nil,
+		nil,
+	)
+	if runsResp.StatusCode != http.StatusOK {
+		body := readAndCloseHTTPBody(t, runsResp)
+		t.Fatalf("job runs status = %d, want %d; body=%s", runsResp.StatusCode, http.StatusOK, string(body))
+	}
+	var runs contract.RunsResponse
+	decodeHTTPJSON(t, runsResp, &runs)
+	if !containsAutomationRun(runs.Runs, run.Run.ID) {
+		t.Fatalf("job runs missing %q: %#v", run.Run.ID, runs.Runs)
+	}
+
+	deleteResp := mustUnixRequest(
+		t,
+		runtime.client,
+		http.MethodDelete,
+		"http://unix/api/automation/jobs/"+created.Job.ID,
+		nil,
+		nil,
+	)
+	if deleteResp.StatusCode != http.StatusNoContent {
+		body := readAndCloseHTTPBody(t, deleteResp)
+		t.Fatalf("delete job status = %d, want %d; body=%s", deleteResp.StatusCode, http.StatusNoContent, string(body))
+	}
+	closeHTTPBody(t, deleteResp.Body)
+}
+
+func TestUDSAutomationResourceWritesProjectJobsAndTriggers(t *testing.T) {
+	runtime := newIntegrationRuntime(t)
+
+	jobID := "resource-job"
+	jobApplies := runtime.reconcileEvents.count(automationpkg.JobResourceKind)
+	createJobResp := mustUnixRequest(
+		t,
+		runtime.client,
+		http.MethodPut,
+		"http://unix/api/resources/automation.job/"+jobID,
+		[]byte(
+			`{"scope":{"kind":"user"},"spec":{"scope":"global","name":"resource-job","agent_name":"coder","prompt":"review from resource","schedule":{"mode":"every","interval":"1h"},"enabled":true,"source":"dynamic"}}`,
+		),
+		nil,
+	)
+	if createJobResp.StatusCode != http.StatusCreated {
+		body := readAndCloseHTTPBody(t, createJobResp)
+		t.Fatalf(
+			"create automation.job resource status = %d, want %d; body=%s",
+			createJobResp.StatusCode,
+			http.StatusCreated,
+			string(body),
+		)
+	}
+	var createdJobResource contract.ResourceResponse
+	decodeHTTPJSON(t, createJobResp, &createdJobResource)
+	runtime.reconcileEvents.waitFor(t, automationpkg.JobResourceKind, jobApplies)
+	projectedJob := assertAutomationJobPrompt(t, runtime, jobID, "review from resource")
+	if projectedJob.Source != automationpkg.JobSourceDynamic {
+		t.Fatalf("projected job source = %q, want %q", projectedJob.Source, automationpkg.JobSourceDynamic)
+	}
+
+	triggerRunResp := mustUnixRequest(
+		t,
+		runtime.client,
+		http.MethodPost,
+		"http://unix/api/automation/jobs/"+jobID+"/trigger",
+		nil,
+		nil,
+	)
+	if triggerRunResp.StatusCode != http.StatusOK {
+		body := readAndCloseHTTPBody(t, triggerRunResp)
+		t.Fatalf(
+			"trigger resource job status = %d, want %d; body=%s",
+			triggerRunResp.StatusCode,
+			http.StatusOK,
+			string(body),
+		)
+	}
+	var jobRun contract.RunResponse
+	decodeHTTPJSON(t, triggerRunResp, &jobRun)
+	if jobRun.Run.JobID != jobID {
+		t.Fatalf("resource job run = %#v, want job_id %q", jobRun.Run, jobID)
+	}
+
+	jobApplies = runtime.reconcileEvents.count(automationpkg.JobResourceKind)
+	updateJobResp := mustUnixRequest(
+		t,
+		runtime.client,
+		http.MethodPut,
+		"http://unix/api/resources/automation.job/"+jobID,
+		[]byte(fmt.Sprintf(
+			`{"scope":{"kind":"user"},"expected_version":%d,"spec":{"scope":"global","name":"resource-job","agent_name":"coder","prompt":"review after resource update","schedule":{"mode":"every","interval":"1h"},"enabled":true,"source":"dynamic"}}`,
+			createdJobResource.Record.Version,
+		)),
+		nil,
+	)
+	if updateJobResp.StatusCode != http.StatusOK {
+		body := readAndCloseHTTPBody(t, updateJobResp)
+		t.Fatalf(
+			"update automation.job resource status = %d, want %d; body=%s",
+			updateJobResp.StatusCode,
+			http.StatusOK,
+			string(body),
+		)
+	}
+	var updatedJobResource contract.ResourceResponse
+	decodeHTTPJSON(t, updateJobResp, &updatedJobResource)
+	runtime.reconcileEvents.waitFor(t, automationpkg.JobResourceKind, jobApplies)
+	assertAutomationJobPrompt(t, runtime, jobID, "review after resource update")
+
+	runResp := mustUnixRequest(
+		t,
+		runtime.client,
+		http.MethodGet,
+		"http://unix/api/automation/runs/"+jobRun.Run.ID,
+		nil,
+		nil,
+	)
+	if runResp.StatusCode != http.StatusOK {
+		body := readAndCloseHTTPBody(t, runResp)
+		t.Fatalf("get resource job run status = %d, want %d; body=%s", runResp.StatusCode, http.StatusOK, string(body))
+	}
+	var fetchedRun contract.RunResponse
+	decodeHTTPJSON(t, runResp, &fetchedRun)
+	if fetchedRun.Run.ID != jobRun.Run.ID || fetchedRun.Run.JobID != jobID {
+		t.Fatalf("fetched resource job run = %#v, want run %q for job %q", fetchedRun.Run, jobRun.Run.ID, jobID)
+	}
+
+	triggerID := "resource-trigger"
+	triggerApplies := runtime.reconcileEvents.count(automationpkg.TriggerResourceKind)
+	createTriggerResp := mustUnixRequest(
+		t,
+		runtime.client,
+		http.MethodPut,
+		"http://unix/api/resources/automation.trigger/"+triggerID,
+		[]byte(
+			`{"scope":{"kind":"user"},"spec":{"scope":"global","name":"resource-trigger","agent_name":"coder","prompt":"inspect {{ index .Data \"session_id\" }}","event":"session.stopped","enabled":true,"source":"dynamic"}}`,
+		),
+		nil,
+	)
+	if createTriggerResp.StatusCode != http.StatusCreated {
+		body := readAndCloseHTTPBody(t, createTriggerResp)
+		t.Fatalf(
+			"create automation.trigger resource status = %d, want %d; body=%s",
+			createTriggerResp.StatusCode,
+			http.StatusCreated,
+			string(body),
+		)
+	}
+	var createdTriggerResource contract.ResourceResponse
+	decodeHTTPJSON(t, createTriggerResp, &createdTriggerResource)
+	runtime.reconcileEvents.waitFor(t, automationpkg.TriggerResourceKind, triggerApplies)
+	projectedTrigger := assertAutomationTriggerPrompt(t, runtime, triggerID, `inspect {{ index .Data "session_id" }}`)
+	if projectedTrigger.Source != automationpkg.JobSourceDynamic {
+		t.Fatalf("projected trigger source = %q, want %q", projectedTrigger.Source, automationpkg.JobSourceDynamic)
+	}
+
+	triggerApplies = runtime.reconcileEvents.count(automationpkg.TriggerResourceKind)
+	updateTriggerResp := mustUnixRequest(
+		t,
+		runtime.client,
+		http.MethodPut,
+		"http://unix/api/resources/automation.trigger/"+triggerID,
+		[]byte(fmt.Sprintf(
+			`{"scope":{"kind":"user"},"expected_version":%d,"spec":{"scope":"global","name":"resource-trigger","agent_name":"coder","prompt":"inspect resource {{ index .Data \"session_id\" }}","event":"session.stopped","enabled":true,"source":"dynamic"}}`,
+			createdTriggerResource.Record.Version,
+		)),
+		nil,
+	)
+	if updateTriggerResp.StatusCode != http.StatusOK {
+		body := readAndCloseHTTPBody(t, updateTriggerResp)
+		t.Fatalf(
+			"update automation.trigger resource status = %d, want %d; body=%s",
+			updateTriggerResp.StatusCode,
+			http.StatusOK,
+			string(body),
+		)
+	}
+	var updatedTriggerResource contract.ResourceResponse
+	decodeHTTPJSON(t, updateTriggerResp, &updatedTriggerResource)
+	runtime.reconcileEvents.waitFor(t, automationpkg.TriggerResourceKind, triggerApplies)
+	assertAutomationTriggerPrompt(t, runtime, triggerID, `inspect resource {{ index .Data "session_id" }}`)
+
+	triggerApplies = runtime.reconcileEvents.count(automationpkg.TriggerResourceKind)
+	deleteTriggerResp := mustUnixRequest(
+		t,
+		runtime.client,
+		http.MethodDelete,
+		"http://unix/api/resources/automation.trigger/"+triggerID,
+		[]byte(fmt.Sprintf(`{"expected_version":%d}`, updatedTriggerResource.Record.Version)),
+		nil,
+	)
+	if deleteTriggerResp.StatusCode != http.StatusNoContent {
+		body := readAndCloseHTTPBody(t, deleteTriggerResp)
+		t.Fatalf(
+			"delete automation.trigger resource status = %d, want %d; body=%s",
+			deleteTriggerResp.StatusCode,
+			http.StatusNoContent,
+			string(body),
+		)
+	}
+	closeHTTPBody(t, deleteTriggerResp.Body)
+	runtime.reconcileEvents.waitFor(t, automationpkg.TriggerResourceKind, triggerApplies)
+	assertAutomationTriggerMissing(t, runtime, triggerID)
+
+	jobApplies = runtime.reconcileEvents.count(automationpkg.JobResourceKind)
+	deleteJobResp := mustUnixRequest(
+		t,
+		runtime.client,
+		http.MethodDelete,
+		"http://unix/api/resources/automation.job/"+jobID,
+		[]byte(fmt.Sprintf(`{"expected_version":%d}`, updatedJobResource.Record.Version)),
+		nil,
+	)
+	if deleteJobResp.StatusCode != http.StatusNoContent {
+		body := readAndCloseHTTPBody(t, deleteJobResp)
+		t.Fatalf(
+			"delete automation.job resource status = %d, want %d; body=%s",
+			deleteJobResp.StatusCode,
+			http.StatusNoContent,
+			string(body),
+		)
+	}
+	closeHTTPBody(t, deleteJobResp.Body)
+	runtime.reconcileEvents.waitFor(t, automationpkg.JobResourceKind, jobApplies)
+	assertAutomationJobMissing(t, runtime, jobID)
+
+	runAfterDeleteResp := mustUnixRequest(
+		t,
+		runtime.client,
+		http.MethodGet,
+		"http://unix/api/automation/runs/"+jobRun.Run.ID,
+		nil,
+		nil,
+	)
+	if runAfterDeleteResp.StatusCode != http.StatusOK {
+		body := readAndCloseHTTPBody(t, runAfterDeleteResp)
+		t.Fatalf(
+			"get run after resource delete status = %d, want %d; body=%s",
+			runAfterDeleteResp.StatusCode,
+			http.StatusOK,
+			string(body),
+		)
+	}
+	var runAfterDelete contract.RunResponse
+	decodeHTTPJSON(t, runAfterDeleteResp, &runAfterDelete)
+	if runAfterDelete.Run.ID != jobRun.Run.ID || runAfterDelete.Run.JobID != jobID {
+		t.Fatalf("run after resource delete = %#v, want run %q for job %q", runAfterDelete.Run, jobRun.Run.ID, jobID)
+	}
+}
+
+func TestUDSAutomationTriggerRunsAndOmitsWebhookRoutes(t *testing.T) {
+	t.Run("Should expose the latest completed trigger run over UDS", func(t *testing.T) {
+		t.Parallel()
+		runtime := newIntegrationRuntime(t)
+
+		resolveResp := mustUnixRequest(
+			t,
+			runtime.client,
+			http.MethodPost,
+			"http://unix/api/workspaces/resolve",
+			[]byte(`{"path":"`+runtime.workspace+`"}`),
+			nil,
+		)
+		if resolveResp.StatusCode != http.StatusOK {
+			body := readAndCloseHTTPBody(t, resolveResp)
+			t.Fatalf(
+				"resolve workspace status = %d, want %d; body=%s",
+				resolveResp.StatusCode,
+				http.StatusOK,
+				string(body),
+			)
+		}
+		var resolved contract.WorkspaceResponse
+		decodeHTTPJSON(t, resolveResp, &resolved)
+		if resolved.Workspace.ID == "" {
+			t.Fatal("expected resolved workspace id")
+		}
+		createdSession := createIntegrationSessionPayload(t, runtime)
+		if createdSession.WorkspaceID != resolved.Workspace.ID {
+			t.Fatalf(
+				"created session workspace_id = %q, want resolved workspace id %q",
+				createdSession.WorkspaceID,
+				resolved.Workspace.ID,
+			)
+		}
+
+		createResp := mustUnixRequest(
+			t,
+			runtime.client,
+			http.MethodPost,
+			"http://unix/api/automation/triggers",
+			[]byte(
+				`{"scope":"workspace","workspace_id":"`+createdSession.WorkspaceID+`","name":"session-stop-review","agent_name":"coder","prompt":"review {{ index .Data \"session_id\" }}","event":"session.stopped","filter":{"data.session_type":"user"}}`,
+			),
+			nil,
+		)
+		if createResp.StatusCode != http.StatusCreated {
+			body := readAndCloseHTTPBody(t, createResp)
+			t.Fatalf(
+				"create trigger status = %d, want %d; body=%s",
+				createResp.StatusCode,
+				http.StatusCreated,
+				string(body),
+			)
+		}
+		var created contract.TriggerResponse
+		decodeHTTPJSON(t, createResp, &created)
+		if created.Trigger.ID == "" {
+			t.Fatal("expected created automation trigger id")
+		}
+
+		updateResp := mustUnixRequest(
+			t,
+			runtime.client,
+			http.MethodPatch,
+			"http://unix/api/automation/triggers/"+created.Trigger.ID,
+			[]byte(`{"prompt":"inspect {{ index .Data \"session_id\" }}"}`),
+			nil,
+		)
+		if updateResp.StatusCode != http.StatusOK {
+			body := readAndCloseHTTPBody(t, updateResp)
+			t.Fatalf("update trigger status = %d, want %d; body=%s", updateResp.StatusCode, http.StatusOK, string(body))
+		}
+		var updated contract.TriggerResponse
+		decodeHTTPJSON(t, updateResp, &updated)
+		if updated.Trigger.Prompt != `inspect {{ index .Data "session_id" }}` {
+			t.Fatalf("updated trigger prompt = %q", updated.Trigger.Prompt)
+		}
+
+		for _, path := range []string{"/api/automation/triggers", "/api/automation/triggers/" + created.Trigger.ID} {
+			response := mustUnixRequest(t, runtime.client, http.MethodGet, "http://unix"+path, nil, nil)
+			if response.StatusCode != http.StatusOK {
+				body := readAndCloseHTTPBody(t, response)
+				t.Fatalf("never-run trigger status = %d; body=%s", response.StatusCode, body)
+			}
+			body := readAndCloseHTTPBody(t, response)
+			if strings.Contains(string(body), `"last_run"`) {
+				t.Fatalf("never-run trigger must omit last_run: %s", body)
+			}
+		}
+
+		stopIntegrationSession(t, runtime, createdSession.WorkspaceID, createdSession.ID)
+
+		var runs contract.RunsResponse
+		deadline := time.After(2 * time.Second)
+		ticker := time.NewTicker(25 * time.Millisecond)
+		defer ticker.Stop()
+		for {
+			runsResp := mustUnixRequest(
+				t,
+				runtime.client,
+				http.MethodGet,
+				"http://unix/api/automation/triggers/"+created.Trigger.ID+"/runs?limit=1",
+				nil,
+				nil,
+			)
+			if runsResp.StatusCode != http.StatusOK {
+				body := readAndCloseHTTPBody(t, runsResp)
+				t.Fatalf("trigger runs status = %d, want %d; body=%s", runsResp.StatusCode, http.StatusOK, string(body))
+			}
+
+			runs = contract.RunsResponse{}
+			decodeHTTPJSON(t, runsResp, &runs)
+			if len(runs.Runs) == 1 && runs.Runs[0].Status == automationpkg.RunCompleted {
+				break
+			}
+
+			select {
+			case <-deadline:
+				t.Fatalf("expected trigger run history, got %#v", runs.Runs)
+			case <-ticker.C:
+			}
+		}
+		runID := runs.Runs[0].ID
+
+		runResp := mustUnixRequest(
+			t,
+			runtime.client,
+			http.MethodGet,
+			"http://unix/api/automation/runs/"+runID,
+			nil,
+			nil,
+		)
+		if runResp.StatusCode != http.StatusOK {
+			body := readAndCloseHTTPBody(t, runResp)
+			t.Fatalf("get trigger run status = %d, want %d; body=%s", runResp.StatusCode, http.StatusOK, string(body))
+		}
+		var run contract.RunResponse
+		decodeHTTPJSON(t, runResp, &run)
+		if run.Run.TriggerID != created.Trigger.ID {
+			t.Fatalf("trigger run = %#v, want trigger_id %q", run.Run, created.Trigger.ID)
+		}
+
+		for _, path := range []string{"/api/automation/triggers", "/api/automation/triggers/" + created.Trigger.ID} {
+			response := mustUnixRequest(t, runtime.client, http.MethodGet, "http://unix"+path, nil, nil)
+			if response.StatusCode != http.StatusOK {
+				body := readAndCloseHTTPBody(t, response)
+				t.Fatalf("trigger summary status = %d; body=%s", response.StatusCode, body)
+			}
+			var summary *contract.AutomationLastRunPayload
+			if path == "/api/automation/triggers" {
+				var result contract.TriggersResponse
+				decodeHTTPJSON(t, response, &result)
+				if len(result.Triggers) != 1 {
+					t.Fatalf("listed triggers = %#v", result.Triggers)
+				}
+				summary = result.Triggers[0].LastRun
+			} else {
+				var result contract.TriggerResponse
+				decodeHTTPJSON(t, response, &result)
+				summary = result.Trigger.LastRun
+			}
+			latest := runs.Runs[0]
+			if summary == nil || summary.ID != latest.ID || summary.Status != latest.Status ||
+				summary.StartedAt == nil || latest.StartedAt == nil || !summary.StartedAt.Equal(*latest.StartedAt) ||
+				summary.EndedAt == nil || latest.EndedAt == nil || !summary.EndedAt.Equal(*latest.EndedAt) || summary.SkipReason != "" {
+				t.Fatalf("%s last_run = %#v, latest run = %#v", path, summary, latest)
+			}
+		}
+
+		webhookResp := mustUnixRequest(
+			t,
+			runtime.client,
+			http.MethodPost,
+			"http://unix/api/webhooks/global/deploy-review--wbh_test",
+			[]byte(`{"payload":"deploy"}`),
+			nil,
+		)
+		if webhookResp.StatusCode != http.StatusNotFound {
+			body := readAndCloseHTTPBody(t, webhookResp)
+			t.Fatalf(
+				"webhook route status = %d, want %d; body=%s",
+				webhookResp.StatusCode,
+				http.StatusNotFound,
+				string(body),
+			)
+		}
+		closeHTTPBody(t, webhookResp.Body)
+
+		deleteResp := mustUnixRequest(
+			t,
+			runtime.client,
+			http.MethodDelete,
+			"http://unix/api/automation/triggers/"+created.Trigger.ID,
+			nil,
+			nil,
+		)
+		if deleteResp.StatusCode != http.StatusNoContent {
+			body := readAndCloseHTTPBody(t, deleteResp)
+			t.Fatalf(
+				"delete trigger status = %d, want %d; body=%s",
+				deleteResp.StatusCode,
+				http.StatusNoContent,
+				string(body),
+			)
+		}
+		closeHTTPBody(t, deleteResp.Body)
+	})
+}
+
+func TestUDSSessionStreamReconnectsWithLastEventID(t *testing.T) {
+	runtime := newIntegrationRuntime(t)
+	created := createIntegrationSessionPayload(t, runtime)
+	sessionID := created.ID
+	sendPrompt(t, runtime, created.WorkspaceID, sessionID, "hello")
+	stopIntegrationSession(t, runtime, created.WorkspaceID, sessionID)
+
+	streamResp := mustUnixRequest(
+		t,
+		runtime.client,
+		http.MethodGet,
+		sessionAPIPath(created.WorkspaceID, sessionID, "/stream?frames=raw&limit=200"),
+		nil,
+		nil,
+	)
+	if streamResp.StatusCode != http.StatusOK {
+		body := readAndCloseHTTPBody(t, streamResp)
+		t.Fatalf("session stream status = %d, want %d; body=%s", streamResp.StatusCode, http.StatusOK, string(body))
+	}
+	initial := collectLiveSSEUntilEvent(t, streamResp.Body, session.EventTypeSessionStopped, 2*time.Second)
+	if len(initial) < 3 {
+		t.Fatalf("initial stream events = %d, want 3", len(initial))
+	}
+	if initial[len(initial)-1].Event != session.EventTypeSessionStopped {
+		t.Fatalf("last event = %q, want %q", initial[len(initial)-1].Event, session.EventTypeSessionStopped)
+	}
+
+	headers := map[string]string{"Last-Event-ID": initial[0].ID}
+	replayResp := mustUnixRequest(
+		t,
+		runtime.client,
+		http.MethodGet,
+		sessionAPIPath(created.WorkspaceID, sessionID, "/stream?frames=raw&limit=200"),
+		nil,
+		headers,
+	)
+	if replayResp.StatusCode != http.StatusOK {
+		body := readAndCloseHTTPBody(t, replayResp)
+		t.Fatalf("replay stream status = %d, want %d; body=%s", replayResp.StatusCode, http.StatusOK, string(body))
+	}
+	replayed := collectLiveSSE(t, replayResp.Body, 2, 2*time.Second)
+	if len(replayed) < 2 {
+		t.Fatalf("replayed events = %d, want 2", len(replayed))
+	}
+	if replayed[0].ID != initial[1].ID {
+		t.Fatalf("replayed first id = %q, want %q", replayed[0].ID, initial[1].ID)
+	}
+	if replayed[0].ID == initial[0].ID {
+		t.Fatalf("replayed first id = %q, should skip Last-Event-ID", replayed[0].ID)
+	}
+}
+
+func TestUDSShutdownWaitsForInflightRequests(t *testing.T) {
+	homePaths := newTestHomePaths(t)
+	socketPath := shortSocketPath(t)
+	cfg := compozyconfig.DefaultWithHome(homePaths)
+	cfg.Daemon.Socket = socketPath
+
+	entered := make(chan struct{}, 1)
+	release := make(chan struct{})
+	server, err := New(
+		WithHomePaths(homePaths),
+		WithConfig(&cfg),
+		WithSocketPath(socketPath),
+		WithLogger(discardLogger()),
+		WithSessionManager(&stubSessionManager{
+			ListAllFn: func(context.Context) ([]*session.Info, error) {
+				entered <- struct{}{}
+				<-release
+				return []*session.Info{newSessionInfo("sess-1")}, nil
+			},
+		}),
+		WithTaskService(&stubTaskManager{}),
+		WithObserver(stubObserver{
+			HealthFn: func(context.Context) (observe.Health, error) { return observe.Health{Status: "ok"}, nil },
+		}),
+		WithWorkspaceResolver(stubWorkspaceService{}),
+	)
+	if err != nil {
+		t.Fatalf("New() error = %v", err)
+	}
+	if err := server.Start(t.Context()); err != nil {
+		t.Fatalf("Start() error = %v", err)
+	}
+	released := false
+	defer func() {
+		if !released {
+			close(release)
+		}
+		if err := server.Shutdown(t.Context()); err != nil {
+			t.Errorf("server.Shutdown() error = %v", err)
+		}
+	}()
+
+	client := newUnixClient(t, socketPath)
+	respCh := make(chan *http.Response, 1)
+	errCh := make(chan error, 1)
+	go func() {
+		resp, err := client.Get("http://unix/api/sessions?all_workspaces=true&profile=default")
+		if err != nil {
+			errCh <- err
+			return
+		}
+		respCh <- resp
+	}()
+
+	select {
+	case <-entered:
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for in-flight request")
+	}
+
+	shutdownDone := make(chan error, 1)
+	shutdownStarted := registerUDSServerShutdownSignal(t, server)
+	go func() {
+		ctx, cancel := context.WithTimeout(t.Context(), 2*time.Second)
+		defer cancel()
+		shutdownDone <- server.Shutdown(ctx)
+	}()
+	waitForUDSServerSignal(t, shutdownStarted, "UDS shutdown to start draining")
+	select {
+	case err := <-shutdownDone:
+		t.Fatalf("Shutdown() returned early: %v", err)
+	default:
+	}
+
+	close(release)
+	released = true
+
+	select {
+	case err := <-shutdownDone:
+		if err != nil {
+			t.Fatalf("Shutdown() error = %v", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for shutdown")
+	}
+
+	select {
+	case err := <-errCh:
+		t.Fatalf("request error = %v", err)
+	case resp := <-respCh:
+		if resp.StatusCode != http.StatusOK {
+			body := readAndCloseHTTPBody(t, resp)
+			t.Fatalf("request status = %d, want %d; body=%s", resp.StatusCode, http.StatusOK, string(body))
+		}
+		closeHTTPBody(t, resp.Body)
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for request response")
+	}
+}
+
+func TestUDSShutdownCancelsPersistentStreams(t *testing.T) {
+	t.Run("Should cancel an active session catalog stream before the shutdown deadline", func(t *testing.T) {
+		t.Parallel()
+
+		homePaths := newTestHomePaths(t)
+		socketPath := shortSocketPath(t)
+		cfg := compozyconfig.DefaultWithHome(homePaths)
+		cfg.Daemon.Socket = socketPath
+		events := make(chan session.CatalogEvent)
+		server, err := New(
+			WithHomePaths(homePaths),
+			WithConfig(&cfg),
+			WithSocketPath(socketPath),
+			WithLogger(discardLogger()),
+			WithSessionManager(&stubSessionManager{
+				SubscribeCatalogFn: func(context.Context, session.CatalogScope) (<-chan session.CatalogEvent, func(), error) {
+					return events, func() {}, nil
+				},
+			}),
+			WithTaskService(&stubTaskManager{}),
+			WithObserver(stubObserver{}),
+			WithWorkspaceResolver(stubWorkspaceService{}),
+		)
+		if err != nil {
+			t.Fatalf("New() error = %v", err)
+		}
+		if err := server.Start(t.Context()); err != nil {
+			t.Fatalf("Start() error = %v", err)
+		}
+		t.Cleanup(func() {
+			cleanupCtx, cancelCleanup := context.WithTimeout(context.WithoutCancel(t.Context()), 2*time.Second)
+			defer cancelCleanup()
+			if err := server.Shutdown(cleanupCtx); err != nil {
+				t.Errorf("Shutdown() during cleanup error = %v", err)
+			}
+		})
+
+		streamResponse := mustUnixRequest(
+			t,
+			newUnixClient(t, socketPath),
+			http.MethodGet,
+			"http://unix/api/sessions/catalog-stream?all_workspaces=true",
+			nil,
+			nil,
+		)
+		if streamResponse.StatusCode != http.StatusOK {
+			body := readAndCloseHTTPBody(t, streamResponse)
+			t.Fatalf("stream status = %d, want %d; body=%s", streamResponse.StatusCode, http.StatusOK, body)
+		}
+		if contentType := streamResponse.Header.Get("Content-Type"); contentType != "text/event-stream" {
+			closeHTTPBody(t, streamResponse.Body)
+			t.Fatalf("stream content type = %q, want text/event-stream", contentType)
+		}
+
+		streamDone := make(chan error, 1)
+		go func() {
+			_, readErr := io.Copy(io.Discard, streamResponse.Body)
+			streamDone <- errors.Join(readErr, streamResponse.Body.Close())
+		}()
+
+		shutdownCtx, cancel := context.WithTimeout(t.Context(), 500*time.Millisecond)
+		defer cancel()
+		if err := server.Shutdown(shutdownCtx); err != nil {
+			t.Fatalf("Shutdown() error = %v", err)
+		}
+
+		select {
+		case err := <-streamDone:
+			if err != nil {
+				t.Fatalf("stream close error = %v", err)
+			}
+		case <-shutdownCtx.Done():
+			t.Fatalf("stream remained active after shutdown: %v", shutdownCtx.Err())
+		}
+	})
+}
+
+func TestUDSTaskRoutesRoundTrip(t *testing.T) {
+	runtime := newIntegrationRuntime(t)
+
+	created := createIntegrationTask(t, runtime, []byte(`{
+		"scope":"global",
+		"title":"Ship task routes",
+		"description":"Expose the transport routes",
+		"owner":{"kind":"pool","ref":"ops"},
+		"metadata":{"priority":"high"}
+	}`))
+	if created.ID == "" {
+		t.Fatal("expected created task id")
+	}
+	if created.Scope != taskpkg.ScopeGlobal {
+		t.Fatalf("created scope = %q, want %q", created.Scope, taskpkg.ScopeGlobal)
+	}
+
+	if created.Owner == nil || created.Owner.Kind != taskpkg.OwnerKindPool || created.Owner.Ref != "ops" {
+		t.Fatalf("created owner = %#v, want pool/ops", created.Owner)
+	}
+	if created.Origin.Kind != taskpkg.OriginKindUDS {
+		t.Fatalf("created origin.kind = %q, want %q", created.Origin.Kind, taskpkg.OriginKindUDS)
+	}
+	if created.CreatedBy.Ref != "local-user" {
+		t.Fatalf("created created_by.ref = %q, want %q", created.CreatedBy.Ref, "local-user")
+	}
+	if got := strings.TrimSpace(string(created.Metadata)); got != `{"priority":"high"}` {
+		t.Fatalf("created metadata = %s, want %s", got, `{"priority":"high"}`)
+	}
+
+	listResp := mustUnixRequest(
+		t,
+		runtime.client,
+		http.MethodGet,
+		"http://unix/api/tasks?scope=global&status=ready&owner_kind=pool&owner_ref=ops",
+		nil,
+		nil,
+	)
+	if listResp.StatusCode != http.StatusOK {
+		body := readAndCloseHTTPBody(t, listResp)
+		t.Fatalf("list tasks status = %d, want %d; body=%s", listResp.StatusCode, http.StatusOK, string(body))
+	}
+	var listed contract.TasksResponse
+	decodeHTTPJSON(t, listResp, &listed)
+	if len(listed.Tasks) != 1 || listed.Tasks[0].ID != created.ID {
+		t.Fatalf("listed tasks = %#v, want created task", listed.Tasks)
+	}
+
+	getResp := mustUnixRequest(t, runtime.client, http.MethodGet, "http://unix/api/tasks/"+created.ID, nil, nil)
+	if getResp.StatusCode != http.StatusOK {
+		body := readAndCloseHTTPBody(t, getResp)
+		t.Fatalf("get task status = %d, want %d; body=%s", getResp.StatusCode, http.StatusOK, string(body))
+	}
+	var detail contract.TaskDetailResponse
+	decodeHTTPJSON(t, getResp, &detail)
+	if detail.Task.Task.ID != created.ID {
+		t.Fatalf("detail task id = %q, want %q", detail.Task.Task.ID, created.ID)
+	}
+	if len(detail.Task.Children) != 0 || len(detail.Task.Runs) != 0 {
+		t.Fatalf("detail task children/runs = %#v, want empty", detail.Task)
+	}
+
+	updateResp := mustUnixRequest(t, runtime.client, http.MethodPatch, "http://unix/api/tasks/"+created.ID, []byte(`{
+		"title":"Ship task routes now",
+		"description":"Expose the task and run transports everywhere",
+		"clear_owner":true
+	}`), nil)
+	if updateResp.StatusCode != http.StatusOK {
+		body := readAndCloseHTTPBody(t, updateResp)
+		t.Fatalf("update task status = %d, want %d; body=%s", updateResp.StatusCode, http.StatusOK, string(body))
+	}
+	var updated contract.TaskResponse
+	decodeHTTPJSON(t, updateResp, &updated)
+	if updated.Task.Title != "Ship task routes now" {
+		t.Fatalf("updated title = %q, want %q", updated.Task.Title, "Ship task routes now")
+	}
+	if updated.Task.Description != "Expose the task and run transports everywhere" {
+		t.Fatalf("updated description = %q", updated.Task.Description)
+	}
+
+	if updated.Task.Owner != nil {
+		t.Fatalf("updated owner = %#v, want nil", updated.Task.Owner)
+	}
+
+	updatedListResp := mustUnixRequest(
+		t,
+		runtime.client,
+		http.MethodGet,
+		"http://unix/api/tasks?scope=global&status=ready",
+		nil,
+		nil,
+	)
+	if updatedListResp.StatusCode != http.StatusOK {
+		body := readAndCloseHTTPBody(t, updatedListResp)
+		t.Fatalf(
+			"updated list tasks status = %d, want %d; body=%s",
+			updatedListResp.StatusCode,
+			http.StatusOK,
+			string(body),
+		)
+	}
+	var updatedList contract.TasksResponse
+	decodeHTTPJSON(t, updatedListResp, &updatedList)
+	if len(updatedList.Tasks) != 1 || updatedList.Tasks[0].ID != created.ID {
+		t.Fatalf("updated list tasks = %#v, want created task", updatedList.Tasks)
+	}
+}
+
+func TestUDSTaskRunLifecycleRoutesRoundTrip(t *testing.T) {
+	runtime := newIntegrationRuntime(t)
+	workspaceID := createIntegrationSessionPayload(t, runtime).WorkspaceID
+	created := createIntegrationTask(
+		t,
+		runtime,
+		fmt.Appendf(nil, `{"scope":"workspace","workspace":%q,"title":"Run task routes"}`, workspaceID),
+	)
+
+	queued := enqueueIntegrationTaskRun(
+		t,
+		runtime,
+		created.ID,
+		`{"idempotency_key":"enqueue-1"}`,
+	)
+	if queued.Status != taskpkg.TaskRunStatusQueued {
+		t.Fatalf("queued status = %q, want %q", queued.Status, taskpkg.TaskRunStatusQueued)
+	}
+
+	listQueuedResp := mustUnixRequest(
+		t,
+		runtime.client,
+		http.MethodGet,
+		"http://unix/api/tasks/"+created.ID+"/runs?status=queued&limit=1",
+		nil,
+		nil,
+	)
+	if listQueuedResp.StatusCode != http.StatusOK {
+		body := readAndCloseHTTPBody(t, listQueuedResp)
+		t.Fatalf(
+			"list queued runs status = %d, want %d; body=%s",
+			listQueuedResp.StatusCode,
+			http.StatusOK,
+			string(body),
+		)
+	}
+	var queuedList contract.TaskRunsResponse
+	decodeHTTPJSON(t, listQueuedResp, &queuedList)
+	if len(queuedList.Runs) != 1 || queuedList.Runs[0].ID != queued.ID {
+		t.Fatalf("queued runs = %#v, want queued run", queuedList.Runs)
+	}
+
+	startResp := mustUnixRequest(
+		t,
+		runtime.client,
+		http.MethodPost,
+		"http://unix/api/task-runs/"+queued.ID+"/start",
+		[]byte(`{"idempotency_key":"start-1"}`),
+		nil,
+	)
+	if startResp.StatusCode != http.StatusOK {
+		body := readAndCloseHTTPBody(t, startResp)
+		t.Fatalf("start run status = %d, want %d; body=%s", startResp.StatusCode, http.StatusOK, string(body))
+	}
+	var started contract.TaskRunResponse
+	decodeHTTPJSON(t, startResp, &started)
+	if started.Run.Status != taskpkg.TaskRunStatusRunning {
+		t.Fatalf("started status = %q, want %q", started.Run.Status, taskpkg.TaskRunStatusRunning)
+	}
+	if started.Run.SessionID == "" {
+		t.Fatal("expected started run session id")
+	}
+
+	completeResp := mustUnixRequest(
+		t,
+		runtime.client,
+		http.MethodPost,
+		"http://unix/api/task-runs/"+queued.ID+"/complete",
+		[]byte(`{"result":{"ok":true}}`),
+		nil,
+	)
+	if completeResp.StatusCode != http.StatusOK {
+		body := readAndCloseHTTPBody(t, completeResp)
+		t.Fatalf("complete run status = %d, want %d; body=%s", completeResp.StatusCode, http.StatusOK, string(body))
+	}
+	var completed contract.TaskRunResponse
+	decodeHTTPJSON(t, completeResp, &completed)
+	if completed.Run.Status != taskpkg.TaskRunStatusCompleted {
+		t.Fatalf("completed status = %q, want %q", completed.Run.Status, taskpkg.TaskRunStatusCompleted)
+	}
+
+	secondRun := enqueueIntegrationTaskRun(t, runtime, created.ID, `{"idempotency_key":"enqueue-2"}`)
+	attachResp := mustUnixRequest(
+		t,
+		runtime.client,
+		http.MethodPost,
+		"http://unix/api/task-runs/"+secondRun.ID+"/attach-session",
+		[]byte(`{"session_id":"sess-resume-1"}`),
+		nil,
+	)
+	if attachResp.StatusCode != http.StatusOK {
+		body := readAndCloseHTTPBody(t, attachResp)
+		t.Fatalf("attach run session status = %d, want %d; body=%s", attachResp.StatusCode, http.StatusOK, string(body))
+	}
+	var attached contract.TaskRunResponse
+	decodeHTTPJSON(t, attachResp, &attached)
+	if attached.Run.Status != taskpkg.TaskRunStatusStarting {
+		t.Fatalf("attached status = %q, want %q", attached.Run.Status, taskpkg.TaskRunStatusStarting)
+	}
+	if attached.Run.SessionID != "sess-resume-1" {
+		t.Fatalf("attached session_id = %q, want %q", attached.Run.SessionID, "sess-resume-1")
+	}
+
+	failResp := mustUnixRequest(
+		t,
+		runtime.client,
+		http.MethodPost,
+		"http://unix/api/task-runs/"+secondRun.ID+"/fail",
+		[]byte(`{"error":"boom","metadata":{"step":"attach"}}`),
+		nil,
+	)
+	if failResp.StatusCode != http.StatusOK {
+		body := readAndCloseHTTPBody(t, failResp)
+		t.Fatalf("fail run status = %d, want %d; body=%s", failResp.StatusCode, http.StatusOK, string(body))
+	}
+	var failed contract.TaskRunResponse
+	decodeHTTPJSON(t, failResp, &failed)
+	if failed.Run.Status != taskpkg.TaskRunStatusFailed {
+		t.Fatalf("failed status = %q, want %q", failed.Run.Status, taskpkg.TaskRunStatusFailed)
+	}
+
+	thirdRun := enqueueIntegrationTaskRun(t, runtime, created.ID, `{"idempotency_key":"enqueue-3"}`)
+	cancelResp := mustUnixRequest(
+		t,
+		runtime.client,
+		http.MethodPost,
+		"http://unix/api/task-runs/"+thirdRun.ID+"/cancel",
+		[]byte(`{"reason":"operator cancelled"}`),
+		nil,
+	)
+	if cancelResp.StatusCode != http.StatusOK {
+		body := readAndCloseHTTPBody(t, cancelResp)
+		t.Fatalf("cancel run status = %d, want %d; body=%s", cancelResp.StatusCode, http.StatusOK, string(body))
+	}
+	var cancelled contract.TaskRunResponse
+	decodeHTTPJSON(t, cancelResp, &cancelled)
+	if cancelled.Run.Status != taskpkg.TaskRunStatusCanceled {
+		t.Fatalf("cancelled status = %q, want %q", cancelled.Run.Status, taskpkg.TaskRunStatusCanceled)
+	}
+
+	finalRunsResp := mustUnixRequest(
+		t,
+		runtime.client,
+		http.MethodGet,
+		"http://unix/api/tasks/"+created.ID+"/runs",
+		nil,
+		nil,
+	)
+	if finalRunsResp.StatusCode != http.StatusOK {
+		body := readAndCloseHTTPBody(t, finalRunsResp)
+		t.Fatalf("final list runs status = %d, want %d; body=%s", finalRunsResp.StatusCode, http.StatusOK, string(body))
+	}
+	var finalRuns contract.TaskRunsResponse
+	decodeHTTPJSON(t, finalRunsResp, &finalRuns)
+	if len(finalRuns.Runs) != 3 {
+		t.Fatalf("len(final runs) = %d, want 3", len(finalRuns.Runs))
+	}
+
+	seenStatuses := map[taskpkg.RunStatus]int{}
+	for _, run := range finalRuns.Runs {
+		seenStatuses[run.Status]++
+	}
+	if seenStatuses[taskpkg.TaskRunStatusCompleted] != 1 || seenStatuses[taskpkg.TaskRunStatusFailed] != 1 ||
+		seenStatuses[taskpkg.TaskRunStatusCanceled] != 1 {
+		t.Fatalf("final run statuses = %#v, want one completed, failed, cancelled", seenStatuses)
+	}
+}
+
+func TestUDSTaskPublishRunDetailAndLiveRoutesRoundTrip(t *testing.T) {
+	runtime := newIntegrationRuntime(t)
+
+	draft := createIntegrationTask(t, runtime, []byte(`{
+		"scope":"global",
+		"title":"Draft live task routes",
+		"draft":true
+	}`))
+	if draft.Status != taskpkg.TaskStatusDraft {
+		t.Fatalf("draft status = %q, want %q", draft.Status, taskpkg.TaskStatusDraft)
+	}
+
+	publishResp := mustUnixRequest(
+		t,
+		runtime.client,
+		http.MethodPost,
+		"http://unix/api/tasks/"+draft.ID+"/publish",
+		[]byte(`{"idempotency_key":"publish-live-1"}`),
+		nil,
+	)
+	if publishResp.StatusCode != http.StatusOK {
+		body := readAndCloseHTTPBody(t, publishResp)
+		t.Fatalf("publish task status = %d, want %d; body=%s", publishResp.StatusCode, http.StatusOK, string(body))
+	}
+	var published contract.TaskExecutionResponse
+	decodeHTTPJSON(t, publishResp, &published)
+	if published.Task.Status != taskpkg.TaskStatusReady {
+		t.Fatalf("published status = %q, want %q", published.Task.Status, taskpkg.TaskStatusReady)
+	}
+	if published.Run.Status != taskpkg.TaskRunStatusQueued {
+		t.Fatalf("published run status = %q, want %q", published.Run.Status, taskpkg.TaskRunStatusQueued)
+	}
+
+	run := published.Run
+	startResp := mustUnixRequest(
+		t,
+		runtime.client,
+		http.MethodPost,
+		"http://unix/api/task-runs/"+run.ID+"/start",
+		[]byte(`{"idempotency_key":"start-live-1"}`),
+		nil,
+	)
+	if startResp.StatusCode != http.StatusOK {
+		body := readAndCloseHTTPBody(t, startResp)
+		t.Fatalf("start run status = %d, want %d; body=%s", startResp.StatusCode, http.StatusOK, string(body))
+	}
+	var started contract.TaskRunResponse
+	decodeHTTPJSON(t, startResp, &started)
+	if started.Run.Status != taskpkg.TaskRunStatusRunning {
+		t.Fatalf("started run status = %q, want %q", started.Run.Status, taskpkg.TaskRunStatusRunning)
+	}
+
+	runDetailResp := mustUnixRequest(t, runtime.client, http.MethodGet, "http://unix/api/task-runs/"+run.ID, nil, nil)
+	if runDetailResp.StatusCode != http.StatusOK {
+		body := readAndCloseHTTPBody(t, runDetailResp)
+		t.Fatalf("run detail status = %d, want %d; body=%s", runDetailResp.StatusCode, http.StatusOK, string(body))
+	}
+	var runDetail contract.TaskRunDetailResponse
+	decodeHTTPJSON(t, runDetailResp, &runDetail)
+	if runDetail.Run.Run.ID != run.ID {
+		t.Fatalf("run detail run id = %q, want %q", runDetail.Run.Run.ID, run.ID)
+	}
+	if runDetail.Run.Task.ID != draft.ID {
+		t.Fatalf("run detail task id = %q, want %q", runDetail.Run.Task.ID, draft.ID)
+	}
+
+	timelineResp := mustUnixRequest(
+		t,
+		runtime.client,
+		http.MethodGet,
+		"http://unix/api/tasks/"+draft.ID+"/timeline?limit=20",
+		nil,
+		nil,
+	)
+	if timelineResp.StatusCode != http.StatusOK {
+		body := readAndCloseHTTPBody(t, timelineResp)
+		t.Fatalf("timeline status = %d, want %d; body=%s", timelineResp.StatusCode, http.StatusOK, string(body))
+	}
+	var timeline contract.TaskTimelineResponse
+	decodeHTTPJSON(t, timelineResp, &timeline)
+	if len(timeline.Timeline) == 0 {
+		t.Fatal("timeline = empty, want task activity")
+	}
+	foundRunTimeline := false
+	for _, item := range timeline.Timeline {
+		if item.Task.ID != draft.ID {
+			t.Fatalf("timeline task id = %q, want %q", item.Task.ID, draft.ID)
+		}
+		if item.Run != nil && item.Run.ID == run.ID {
+			foundRunTimeline = true
+		}
+	}
+	if !foundRunTimeline {
+		t.Fatalf("timeline = %#v, want run %q in at least one item", timeline.Timeline, run.ID)
+	}
+
+	treeResp := mustUnixRequest(t, runtime.client, http.MethodGet, "http://unix/api/tasks/"+draft.ID+"/tree", nil, nil)
+	if treeResp.StatusCode != http.StatusOK {
+		body := readAndCloseHTTPBody(t, treeResp)
+		t.Fatalf("tree status = %d, want %d; body=%s", treeResp.StatusCode, http.StatusOK, string(body))
+	}
+	var tree contract.TaskTreeResponse
+	decodeHTTPJSON(t, treeResp, &tree)
+	if tree.Tree.Root.Task.ID != draft.ID {
+		t.Fatalf("tree root id = %q, want %q", tree.Tree.Root.Task.ID, draft.ID)
+	}
+
+	streamResp := mustUnixRequest(
+		t,
+		runtime.client,
+		http.MethodGet,
+		"http://unix/api/tasks/"+draft.ID+"/stream?after_sequence=0",
+		nil,
+		nil,
+	)
+	if streamResp.StatusCode != http.StatusOK {
+		body := readAndCloseHTTPBody(t, streamResp)
+		t.Fatalf("task stream status = %d, want %d; body=%s", streamResp.StatusCode, http.StatusOK, string(body))
+	}
+	if got := streamResp.Header.Get("Content-Type"); !strings.HasPrefix(got, "text/event-stream") {
+		closeHTTPBody(t, streamResp.Body)
+		t.Fatalf("task stream content-type = %q, want text/event-stream", got)
+	}
+	records := collectLiveSSE(t, streamResp.Body, 1, 2*time.Second)
+	if len(records) == 0 {
+		t.Fatal("task stream records = 0, want at least one SSE event")
+	}
+	if records[0].Event != "" {
+		t.Fatalf("task stream first record = %#v, want payload-owned event identity", records[0])
+	}
+	var streamPayload contract.TaskStreamEventPayload
+	if err := json.Unmarshal(records[0].Data, &streamPayload); err != nil {
+		t.Fatalf("json.Unmarshal(task stream event) error = %v; record=%#v", err, records[0])
+	}
+	if streamPayload.Type != "task.created" {
+		t.Fatalf("task stream payload type = %q, want task.created", streamPayload.Type)
+	}
+	if streamPayload.Timeline.Task.ID != draft.ID {
+		t.Fatalf("task stream timeline task id = %q, want %q", streamPayload.Timeline.Task.ID, draft.ID)
+	}
+}
+
+func TestUDSTaskDashboardInboxApprovalAndTriageRoutesRoundTrip(t *testing.T) {
+	runtime := newIntegrationRuntime(t)
+
+	approvalTask := createIntegrationTask(t, runtime, []byte(`{
+		"scope":"global",
+		"title":"Needs approval",
+		"approval_policy":"manual"
+	}`))
+	if approvalTask.ApprovalState != taskpkg.ApprovalStatePending {
+		t.Fatalf("approval task approval_state = %q, want %q", approvalTask.ApprovalState, taskpkg.ApprovalStatePending)
+	}
+
+	rejectTask := createIntegrationTask(t, runtime, []byte(`{
+		"scope":"global",
+		"title":"Reject me",
+		"approval_policy":"manual"
+	}`))
+	triageTask := createIntegrationTask(t, runtime, []byte(`{
+		"scope":"global",
+		"title":"Archive me"
+	}`))
+	dismissTask := createIntegrationTask(t, runtime, []byte(`{
+		"scope":"global",
+		"title":"Dismiss me"
+	}`))
+
+	dashboardResp := mustUnixRequest(
+		t,
+		runtime.client,
+		http.MethodGet,
+		"http://unix/api/observe/tasks/dashboard",
+		nil,
+		nil,
+	)
+	if dashboardResp.StatusCode != http.StatusOK {
+		body := readAndCloseHTTPBody(t, dashboardResp)
+		t.Fatalf("dashboard status = %d, want %d; body=%s", dashboardResp.StatusCode, http.StatusOK, string(body))
+	}
+	var dashboard contract.TaskDashboardResponse
+	decodeHTTPJSON(t, dashboardResp, &dashboard)
+	if dashboard.Dashboard.Totals.TasksTotal < 4 {
+		t.Fatalf("dashboard tasks_total = %d, want at least 4", dashboard.Dashboard.Totals.TasksTotal)
+	}
+	if dashboard.Dashboard.Totals.AwaitingApprovalTasks < 2 {
+		t.Fatalf(
+			"dashboard awaiting_approval_tasks = %d, want at least 2",
+			dashboard.Dashboard.Totals.AwaitingApprovalTasks,
+		)
+	}
+
+	inboxResp := mustUnixRequest(
+		t,
+		runtime.client,
+		http.MethodGet,
+		"http://unix/api/observe/tasks/inbox?lane=approvals&limit=10",
+		nil,
+		nil,
+	)
+	if inboxResp.StatusCode != http.StatusOK {
+		body := readAndCloseHTTPBody(t, inboxResp)
+		t.Fatalf("inbox approvals status = %d, want %d; body=%s", inboxResp.StatusCode, http.StatusOK, string(body))
+	}
+	var inbox contract.TaskInboxResponse
+	decodeHTTPJSON(t, inboxResp, &inbox)
+	approvalsGroup := requireUDSInboxGroup(t, inbox.Inbox.Groups, contract.TaskInboxLaneApprovals)
+	if approvalsGroup.Count < 2 {
+		t.Fatalf("approvals count = %d, want at least 2", approvalsGroup.Count)
+	}
+	if !udsInboxGroupHasTask(approvalsGroup, approvalTask.ID) || !udsInboxGroupHasTask(approvalsGroup, rejectTask.ID) {
+		t.Fatalf("approvals group items = %#v, want approval and reject tasks", approvalsGroup.Items)
+	}
+
+	approveBody := []byte(`{"idempotency_key":"approve-uds-approval-task"}`)
+	approveResp := mustUnixRequest(
+		t,
+		runtime.client,
+		http.MethodPost,
+		"http://unix/api/tasks/"+approvalTask.ID+"/approve",
+		approveBody,
+		nil,
+	)
+	if approveResp.StatusCode != http.StatusCreated {
+		body := readAndCloseHTTPBody(t, approveResp)
+		t.Fatalf("approve status = %d, want %d; body=%s", approveResp.StatusCode, http.StatusCreated, string(body))
+	}
+	var approved contract.TaskExecutionResponse
+	decodeHTTPJSON(t, approveResp, &approved)
+	if approved.Task.ApprovalState != taskpkg.ApprovalStateApproved {
+		t.Fatalf("approved approval_state = %q, want %q", approved.Task.ApprovalState, taskpkg.ApprovalStateApproved)
+	}
+	if approved.Run.Status != taskpkg.TaskRunStatusQueued {
+		t.Fatalf("approved run status = %q, want %q", approved.Run.Status, taskpkg.TaskRunStatusQueued)
+	}
+
+	approveAgainResp := mustUnixRequest(
+		t,
+		runtime.client,
+		http.MethodPost,
+		"http://unix/api/tasks/"+approvalTask.ID+"/approve",
+		approveBody,
+		nil,
+	)
+	if approveAgainResp.StatusCode != http.StatusCreated {
+		body := readAndCloseHTTPBody(t, approveAgainResp)
+		t.Fatalf(
+			"approve again status = %d, want %d; body=%s",
+			approveAgainResp.StatusCode,
+			http.StatusCreated,
+			string(body),
+		)
+	}
+	var approvedAgain contract.TaskExecutionResponse
+	decodeHTTPJSON(t, approveAgainResp, &approvedAgain)
+	if approvedAgain.Run.ID != approved.Run.ID {
+		t.Fatalf("approve again run id = %q, want %q", approvedAgain.Run.ID, approved.Run.ID)
+	}
+
+	rejectResp := mustUnixRequest(
+		t,
+		runtime.client,
+		http.MethodPost,
+		"http://unix/api/tasks/"+rejectTask.ID+"/reject",
+		nil,
+		nil,
+	)
+	if rejectResp.StatusCode != http.StatusOK {
+		body := readAndCloseHTTPBody(t, rejectResp)
+		t.Fatalf("reject status = %d, want %d; body=%s", rejectResp.StatusCode, http.StatusOK, string(body))
+	}
+	var rejected contract.TaskResponse
+	decodeHTTPJSON(t, rejectResp, &rejected)
+	if rejected.Task.ApprovalState != taskpkg.ApprovalStateRejected {
+		t.Fatalf("rejected approval_state = %q, want %q", rejected.Task.ApprovalState, taskpkg.ApprovalStateRejected)
+	}
+
+	readResp := mustUnixRequest(
+		t,
+		runtime.client,
+		http.MethodPost,
+		"http://unix/api/tasks/"+triageTask.ID+"/triage/read",
+		nil,
+		nil,
+	)
+	if readResp.StatusCode != http.StatusOK {
+		body := readAndCloseHTTPBody(t, readResp)
+		t.Fatalf("triage read status = %d, want %d; body=%s", readResp.StatusCode, http.StatusOK, string(body))
+	}
+	var readState contract.TaskTriageStateResponse
+	decodeHTTPJSON(t, readResp, &readState)
+	if !readState.Triage.Read {
+		t.Fatalf("triage read payload = %#v, want read=true", readState.Triage)
+	}
+
+	archiveResp := mustUnixRequest(
+		t,
+		runtime.client,
+		http.MethodPost,
+		"http://unix/api/tasks/"+triageTask.ID+"/triage/archive",
+		nil,
+		nil,
+	)
+	if archiveResp.StatusCode != http.StatusOK {
+		body := readAndCloseHTTPBody(t, archiveResp)
+		t.Fatalf("triage archive status = %d, want %d; body=%s", archiveResp.StatusCode, http.StatusOK, string(body))
+	}
+	var archived contract.TaskTriageStateResponse
+	decodeHTTPJSON(t, archiveResp, &archived)
+	if !archived.Triage.Archived {
+		t.Fatalf("triage archive payload = %#v, want archived=true", archived.Triage)
+	}
+
+	dismissResp := mustUnixRequest(
+		t,
+		runtime.client,
+		http.MethodPost,
+		"http://unix/api/tasks/"+dismissTask.ID+"/triage/dismiss",
+		nil,
+		nil,
+	)
+	if dismissResp.StatusCode != http.StatusOK {
+		body := readAndCloseHTTPBody(t, dismissResp)
+		t.Fatalf("triage dismiss status = %d, want %d; body=%s", dismissResp.StatusCode, http.StatusOK, string(body))
+	}
+	var dismissed contract.TaskTriageStateResponse
+	decodeHTTPJSON(t, dismissResp, &dismissed)
+	if !dismissed.Triage.Dismissed {
+		t.Fatalf("triage dismiss payload = %#v, want dismissed=true", dismissed.Triage)
+	}
+
+	readMissingResp := mustUnixRequest(
+		t,
+		runtime.client,
+		http.MethodPost,
+		"http://unix/api/tasks/task-missing/triage/read",
+		nil,
+		nil,
+	)
+	if readMissingResp.StatusCode != http.StatusNotFound {
+		body := readAndCloseHTTPBody(t, readMissingResp)
+		t.Fatalf(
+			"triage read missing status = %d, want %d; body=%s",
+			readMissingResp.StatusCode,
+			http.StatusNotFound,
+			string(body),
+		)
+	}
+	closeHTTPBody(t, readMissingResp.Body)
+
+	inboxAfterResp := mustUnixRequest(
+		t,
+		runtime.client,
+		http.MethodGet,
+		"http://unix/api/observe/tasks/inbox?lane=approvals&limit=10",
+		nil,
+		nil,
+	)
+	if inboxAfterResp.StatusCode != http.StatusOK {
+		body := readAndCloseHTTPBody(t, inboxAfterResp)
+		t.Fatalf(
+			"inbox approvals after actions status = %d, want %d; body=%s",
+			inboxAfterResp.StatusCode,
+			http.StatusOK,
+			string(body),
+		)
+	}
+	var inboxAfter contract.TaskInboxResponse
+	decodeHTTPJSON(t, inboxAfterResp, &inboxAfter)
+	if got := requireUDSInboxGroup(t, inboxAfter.Inbox.Groups, contract.TaskInboxLaneApprovals).Count; got != 0 {
+		t.Fatalf("approvals count after approve/reject = %d, want 0", got)
+	}
+
+	archivedInboxResp := mustUnixRequest(
+		t,
+		runtime.client,
+		http.MethodGet,
+		"http://unix/api/observe/tasks/inbox?lane=archived&limit=10",
+		nil,
+		nil,
+	)
+	if archivedInboxResp.StatusCode != http.StatusOK {
+		body := readAndCloseHTTPBody(t, archivedInboxResp)
+		t.Fatalf(
+			"inbox archived status = %d, want %d; body=%s",
+			archivedInboxResp.StatusCode,
+			http.StatusOK,
+			string(body),
+		)
+	}
+	var archivedInbox contract.TaskInboxResponse
+	decodeHTTPJSON(t, archivedInboxResp, &archivedInbox)
+	if !udsInboxGroupHasTask(
+		requireUDSInboxGroup(t, archivedInbox.Inbox.Groups, contract.TaskInboxLaneArchived),
+		triageTask.ID,
+	) {
+		t.Fatalf("archived inbox groups = %#v, want task %q", archivedInbox.Inbox.Groups, triageTask.ID)
+	}
+}
+
+type integrationRuntime struct {
+	client          *http.Client
+	server          *Server
+	manager         *session.Manager
+	tasks           *taskpkg.Service
+	observer        *observe.Observer
+	registry        *globaldb.GlobalDB
+	resourceDriver  resources.ReconcileDriver
+	reconcileEvents *integrationReconcileEventSink
+	toolCatalog     *integrationToolCatalog
+	socket          string
+	workspace       string
+}
+
+type integrationToolCatalog struct {
+	mu       sync.Mutex
+	revision int64
+	records  []resources.Record[toolspkg.Tool]
+	changed  chan struct{}
+}
+
+type integrationReconcileEventSink struct {
+	mu      sync.Mutex
+	counts  map[resources.ResourceKind]uint64
+	changed chan struct{}
+}
+
+func newIntegrationReconcileEventSink() *integrationReconcileEventSink {
+	return &integrationReconcileEventSink{
+		counts:  make(map[resources.ResourceKind]uint64),
+		changed: make(chan struct{}),
+	}
+}
+
+func (s *integrationReconcileEventSink) ObserveReconcileEvent(_ context.Context, event resources.ReconcileEvent) {
+	if event.Type != resources.ReconcileEventApplied {
+		return
+	}
+
+	s.mu.Lock()
+	s.counts[event.Kind.Normalize()]++
+	close(s.changed)
+	s.changed = make(chan struct{})
+	s.mu.Unlock()
+}
+
+func (s *integrationReconcileEventSink) count(kind resources.ResourceKind) uint64 {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.counts[kind.Normalize()]
+}
+
+func (s *integrationReconcileEventSink) waitFor(t *testing.T, kind resources.ResourceKind, after uint64) {
+	t.Helper()
+
+	ctx, cancel := context.WithTimeout(t.Context(), 2*time.Second)
+	defer cancel()
+	for {
+		s.mu.Lock()
+		count := s.counts[kind.Normalize()]
+		changed := s.changed
+		s.mu.Unlock()
+		if count > after {
+			return
+		}
+
+		select {
+		case <-changed:
+		case <-ctx.Done():
+			t.Fatalf("timed out waiting for reconcile apply of %q after %d events: %v", kind, after, ctx.Err())
+		}
+	}
+}
+
+type integrationToolPlan struct {
+	revision   int64
+	operations int
+	records    []resources.Record[toolspkg.Tool]
+}
+
+func (p *integrationToolPlan) Kind() resources.ResourceKind { return toolspkg.ToolResourceKind }
+func (p *integrationToolPlan) Revision() int64              { return p.revision }
+func (p *integrationToolPlan) OperationCount() int          { return p.operations }
+
+type integrationToolProjector struct {
+	catalog *integrationToolCatalog
+}
+
+func (p *integrationToolProjector) Kind() resources.ResourceKind {
+	return toolspkg.ToolResourceKind
+}
+
+func (p *integrationToolProjector) DependsOn() []resources.ResourceKind {
+	return nil
+}
+
+func (p *integrationToolProjector) Build(
+	_ context.Context,
+	records []resources.Record[toolspkg.Tool],
+) (resources.ProjectionPlan, error) {
+	var revision int64
+	cloned := make([]resources.Record[toolspkg.Tool], 0, len(records))
+	for _, record := range records {
+		if record.Version > revision {
+			revision = record.Version
+		}
+		next := record
+		next.Spec = cloneIntegrationTool(record.Spec)
+		cloned = append(cloned, next)
+	}
+	return &integrationToolPlan{
+		revision:   revision,
+		operations: len(records),
+		records:    cloned,
+	}, nil
+}
+
+func (p *integrationToolProjector) Apply(_ context.Context, plan resources.ProjectionPlan) error {
+	typed, ok := plan.(*integrationToolPlan)
+	if !ok {
+		return fmt.Errorf("integration tool plan type = %T, want *integrationToolPlan", plan)
+	}
+	p.catalog.replace(typed.revision, typed.records)
+	return nil
+}
+
+type integrationAutomationJobProjector struct {
+	manager *automationpkg.Manager
+}
+
+func (p *integrationAutomationJobProjector) Kind() resources.ResourceKind {
+	return automationpkg.JobResourceKind
+}
+
+func (p *integrationAutomationJobProjector) DependsOn() []resources.ResourceKind {
+	return nil
+}
+
+func (p *integrationAutomationJobProjector) Build(
+	ctx context.Context,
+	records []resources.Record[automationpkg.Job],
+) (resources.ProjectionPlan, error) {
+	return p.manager.BuildJobResourceState(ctx, records)
+}
+
+func (p *integrationAutomationJobProjector) Apply(ctx context.Context, plan resources.ProjectionPlan) error {
+	return p.manager.ApplyJobResourceState(ctx, plan)
+}
+
+type integrationAutomationTriggerProjector struct {
+	manager *automationpkg.Manager
+}
+
+func (p *integrationAutomationTriggerProjector) Kind() resources.ResourceKind {
+	return automationpkg.TriggerResourceKind
+}
+
+func (p *integrationAutomationTriggerProjector) DependsOn() []resources.ResourceKind {
+	return nil
+}
+
+func (p *integrationAutomationTriggerProjector) Build(
+	ctx context.Context,
+	records []resources.Record[automationpkg.Trigger],
+) (resources.ProjectionPlan, error) {
+	return p.manager.BuildTriggerResourceState(ctx, records)
+}
+
+func (p *integrationAutomationTriggerProjector) Apply(ctx context.Context, plan resources.ProjectionPlan) error {
+	return p.manager.ApplyTriggerResourceState(ctx, plan)
+}
+
+func newIntegrationToolCatalog() *integrationToolCatalog {
+	return &integrationToolCatalog{changed: make(chan struct{})}
+}
+
+func (c *integrationToolCatalog) replace(revision int64, records []resources.Record[toolspkg.Tool]) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.revision = revision
+	c.records = cloneIntegrationToolRecords(records)
+	close(c.changed)
+	c.changed = make(chan struct{})
+}
+
+func (c *integrationToolCatalog) snapshot() (int64, []resources.Record[toolspkg.Tool]) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.revision, cloneIntegrationToolRecords(c.records)
+}
+
+func cloneIntegrationToolRecords(records []resources.Record[toolspkg.Tool]) []resources.Record[toolspkg.Tool] {
+	if len(records) == 0 {
+		return nil
+	}
+	cloned := make([]resources.Record[toolspkg.Tool], 0, len(records))
+	for _, record := range records {
+		next := record
+		next.Spec = cloneIntegrationTool(record.Spec)
+		cloned = append(cloned, next)
+	}
+	return cloned
+}
+
+func cloneIntegrationTool(spec toolspkg.Tool) toolspkg.Tool {
+	cloned := spec
+	cloned.ToolPresentation = toolspkg.CloneToolPresentation(spec.ToolPresentation)
+	cloned.ToolExecutionMetadata = toolspkg.CloneToolExecutionMetadata(spec.ToolExecutionMetadata)
+	if len(spec.InputSchema) > 0 {
+		cloned.InputSchema = append([]byte(nil), spec.InputSchema...)
+	}
+	return cloned
+}
+
+func assertAutomationJobPrompt(
+	t *testing.T,
+	runtime integrationRuntime,
+	jobID string,
+	wantPrompt string,
+) contract.JobPayload {
+	t.Helper()
+
+	resp := mustUnixRequest(t, runtime.client, http.MethodGet, "http://unix/api/automation/jobs/"+jobID, nil, nil)
+	if resp.StatusCode != http.StatusOK {
+		body := readAndCloseHTTPBody(t, resp)
+		t.Fatalf(
+			"get automation job %q status = %d, want %d; body=%s",
+			jobID,
+			resp.StatusCode,
+			http.StatusOK,
+			string(body),
+		)
+	}
+	var payload contract.JobResponse
+	decodeHTTPJSON(t, resp, &payload)
+	if payload.Job.Prompt != wantPrompt {
+		t.Fatalf("automation job %q prompt = %q, want %q", jobID, payload.Job.Prompt, wantPrompt)
+	}
+	return payload.Job
+}
+
+func assertAutomationJobMissing(t *testing.T, runtime integrationRuntime, jobID string) {
+	t.Helper()
+
+	resp := mustUnixRequest(t, runtime.client, http.MethodGet, "http://unix/api/automation/jobs/"+jobID, nil, nil)
+	if resp.StatusCode != http.StatusNotFound {
+		body := readAndCloseHTTPBody(t, resp)
+		t.Fatalf(
+			"get deleted automation job %q status = %d, want %d; body=%s",
+			jobID,
+			resp.StatusCode,
+			http.StatusNotFound,
+			string(body),
+		)
+	}
+	closeHTTPBody(t, resp.Body)
+}
+
+func assertAutomationTriggerPrompt(
+	t *testing.T,
+	runtime integrationRuntime,
+	triggerID string,
+	wantPrompt string,
+) contract.TriggerPayload {
+	t.Helper()
+
+	resp := mustUnixRequest(
+		t,
+		runtime.client,
+		http.MethodGet,
+		"http://unix/api/automation/triggers/"+triggerID,
+		nil,
+		nil,
+	)
+	if resp.StatusCode != http.StatusOK {
+		body := readAndCloseHTTPBody(t, resp)
+		t.Fatalf(
+			"get automation trigger %q status = %d, want %d; body=%s",
+			triggerID,
+			resp.StatusCode,
+			http.StatusOK,
+			string(body),
+		)
+	}
+	var payload contract.TriggerResponse
+	decodeHTTPJSON(t, resp, &payload)
+	if payload.Trigger.Prompt != wantPrompt {
+		t.Fatalf("automation trigger %q prompt = %q, want %q", triggerID, payload.Trigger.Prompt, wantPrompt)
+	}
+	return payload.Trigger
+}
+
+func assertAutomationTriggerMissing(t *testing.T, runtime integrationRuntime, triggerID string) {
+	t.Helper()
+
+	resp := mustUnixRequest(
+		t,
+		runtime.client,
+		http.MethodGet,
+		"http://unix/api/automation/triggers/"+triggerID,
+		nil,
+		nil,
+	)
+	if resp.StatusCode != http.StatusNotFound {
+		body := readAndCloseHTTPBody(t, resp)
+		t.Fatalf(
+			"get deleted automation trigger %q status = %d, want %d; body=%s",
+			triggerID,
+			resp.StatusCode,
+			http.StatusNotFound,
+			string(body),
+		)
+	}
+	closeHTTPBody(t, resp.Body)
+}
+
+func waitForProjectedToolRevision(t *testing.T, runtime integrationRuntime, want int64) {
+	t.Helper()
+
+	ctx, cancel := context.WithTimeout(t.Context(), 2*time.Second)
+	defer cancel()
+	for {
+		runtime.toolCatalog.mu.Lock()
+		revision := runtime.toolCatalog.revision
+		changed := runtime.toolCatalog.changed
+		runtime.toolCatalog.mu.Unlock()
+		if revision >= want {
+			return
+		}
+		select {
+		case <-changed:
+		case <-ctx.Done():
+			revision, records := runtime.toolCatalog.snapshot()
+			t.Fatalf(
+				"timed out waiting for projected tool revision %d (got %d, records=%#v): %v",
+				want,
+				revision,
+				records,
+				ctx.Err(),
+			)
+		}
+	}
+}
+
+type integrationTaskSessionExecutor struct {
+	started int
+}
+
+func (e *integrationTaskSessionExecutor) StartTaskSession(
+	_ context.Context,
+	_ *taskpkg.StartTaskSession,
+) (*taskpkg.SessionRef, error) {
+	e.started++
+	return &taskpkg.SessionRef{SessionID: fmt.Sprintf("task-sess-%d", e.started)}, nil
+}
+
+func (*integrationTaskSessionExecutor) AttachTaskSession(
+	_ context.Context,
+	_ string,
+	sessionID string,
+) (*taskpkg.SessionRef, error) {
+	return &taskpkg.SessionRef{SessionID: sessionID}, nil
+}
+
+func (*integrationTaskSessionExecutor) RequestTaskStop(context.Context, string, taskpkg.StopReason) error {
+	return nil
+}
+
+func (*integrationTaskSessionExecutor) ForceTaskStop(context.Context, string, taskpkg.StopReason) error {
+	return nil
+}
+
+type integrationNotifierFanout struct {
+	notifiers []session.Notifier
+}
+
+func (f *integrationNotifierFanout) OnSessionCreated(ctx context.Context, sess *session.Session) {
+	for _, notifier := range f.notifiers {
+		notifier.OnSessionCreated(ctx, sess)
+	}
+}
+
+func (f *integrationNotifierFanout) OnSessionStopped(ctx context.Context, sess *session.Session) {
+	for _, notifier := range f.notifiers {
+		notifier.OnSessionStopped(ctx, sess)
+	}
+}
+
+func (f *integrationNotifierFanout) OnAgentEvent(ctx context.Context, sessionID string, event any) {
+	for _, notifier := range f.notifiers {
+		notifier.OnAgentEvent(ctx, sessionID, event)
+	}
+}
+
+type integrationDriver struct {
+	mu       sync.Mutex
+	nextPID  int
+	nextSess int
+	states   map[*session.AgentProcess]chan struct{}
+}
+
+func newIntegrationDriver() *integrationDriver {
+	return &integrationDriver{
+		nextPID:  2000,
+		nextSess: 1,
+		states:   make(map[*session.AgentProcess]chan struct{}),
+	}
+}
+
+// Synthetic process handles are identified by their completion channel, not the host PID table.
+func (*integrationDriver) VerifyExit(proc *session.AgentProcess) (bool, error) {
+	if proc == nil {
+		return false, errors.New("integration driver: process is required")
+	}
+	select {
+	case <-proc.Done():
+		return true, nil
+	default:
+		return false, nil
+	}
+}
+
+func (d *integrationDriver) Start(_ context.Context, opts acp.StartOpts) (*session.AgentProcess, error) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+
+	d.nextPID++
+	d.nextSess++
+	done := make(chan struct{})
+	sessionID := strings.TrimSpace(opts.ResumeSessionID)
+	if sessionID == "" {
+		sessionID = fmt.Sprintf("acp-session-%d", d.nextSess)
+	}
+
+	proc := session.NewAgentProcess(session.AgentProcessOptions{
+		PID:       d.nextPID,
+		AgentName: opts.AgentName,
+		Command:   opts.Command,
+		Cwd:       opts.Cwd,
+		SessionID: sessionID,
+		Caps: acp.Caps{
+			SupportsLoadSession: true,
+		},
+		StartedAt: time.Now().UTC(),
+		Done:      done,
+		Wait: func() error {
+			<-done
+			return nil
+		},
+	})
+	d.states[proc] = done
+	return proc, nil
+}
+
+func (d *integrationDriver) Prompt(
+	_ context.Context,
+	proc *session.AgentProcess,
+	req acp.PromptRequest,
+) (<-chan acp.AgentEvent, error) {
+	ch := make(chan acp.AgentEvent, 2)
+	ch <- acp.AgentEvent{
+		Type:      "agent_message",
+		SessionID: proc.SessionID,
+		TurnID:    req.TurnID,
+		Timestamp: time.Now().UTC(),
+		Text:      req.Message,
+	}
+	ch <- acp.AgentEvent{
+		Type:       "done",
+		SessionID:  proc.SessionID,
+		TurnID:     req.TurnID,
+		Timestamp:  time.Now().UTC(),
+		StopReason: "end_turn",
+	}
+	close(ch)
+	return ch, nil
+}
+
+func (d *integrationDriver) Cancel(context.Context, *session.AgentProcess) error {
+	return nil
+}
+
+func (d *integrationDriver) Stop(_ context.Context, proc *session.AgentProcess) error {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+
+	done, ok := d.states[proc]
+	if !ok {
+		return nil
+	}
+	select {
+	case <-done:
+	default:
+		close(done)
+	}
+	delete(d.states, proc)
+	return nil
+}
+
+func newIntegrationRuntime(t *testing.T) integrationRuntime {
+	t.Helper()
+
+	homePaths := newTestHomePaths(t)
+	socketPath := shortSocketPath(t)
+	writeAgentDef(t, homePaths, "coder")
+
+	workspace := t.TempDir()
+	cfg := compozyconfig.DefaultWithHome(homePaths)
+	cfg.Daemon.Socket = socketPath
+	cfg.Providers = map[string]compozyconfig.ProviderConfig{
+		"fake": {Command: "fake-agent"},
+	}
+	// Profile-aware resolution reads the fixture's actual home configuration.
+	if err := os.WriteFile(
+		homePaths.ConfigFile,
+		[]byte("[providers.fake]\ncommand = \"fake-agent\"\n"),
+		0o600,
+	); err != nil {
+		t.Fatalf("write integration provider config: %v", err)
+	}
+
+	registry, err := globaldb.OpenGlobalDB(t.Context(), homePaths.DatabaseFile)
+	if err != nil {
+		t.Fatalf("OpenGlobalDB() error = %v", err)
+	}
+	t.Cleanup(func() {
+		if err := registry.Close(context.Background()); err != nil {
+			t.Errorf("registry.Close() error = %v", err)
+		}
+	})
+	resourceKernel, err := resources.NewKernel(registry.DB())
+	if err != nil {
+		t.Fatalf("resources.NewKernel() error = %v", err)
+	}
+	resourceActor := resources.MutationActor{
+		Kind: resources.MutationActorKindDaemon,
+		ID:   "uds-integration",
+		Source: resources.ResourceSource{
+			Kind: resources.ResourceSourceKind("daemon"),
+			ID:   "uds-integration",
+		},
+		MaxScope: resources.ResourceScope{Kind: resources.ResourceScopeKindUser},
+	}
+	resourceCodecs := resources.NewCodecRegistry()
+	toolCodec, err := toolspkg.NewResourceCodec()
+	if err != nil {
+		t.Fatalf("toolspkg.NewResourceCodec() error = %v", err)
+	}
+	if err := resources.RegisterCodec(resourceCodecs, toolCodec); err != nil {
+		t.Fatalf("resources.RegisterCodec(tool) error = %v", err)
+	}
+	jobCodec, err := automationpkg.NewJobResourceCodec()
+	if err != nil {
+		t.Fatalf("automation.NewJobResourceCodec() error = %v", err)
+	}
+	if err := resources.RegisterCodec(resourceCodecs, jobCodec); err != nil {
+		t.Fatalf("resources.RegisterCodec(automation.job) error = %v", err)
+	}
+	jobResourceStore, err := resources.NewStore(resourceKernel, jobCodec)
+	if err != nil {
+		t.Fatalf("resources.NewStore(automation.job) error = %v", err)
+	}
+	triggerCodec, err := automationpkg.NewTriggerResourceCodec()
+	if err != nil {
+		t.Fatalf("automation.NewTriggerResourceCodec() error = %v", err)
+	}
+	if err := resources.RegisterCodec(resourceCodecs, triggerCodec); err != nil {
+		t.Fatalf("resources.RegisterCodec(automation.trigger) error = %v", err)
+	}
+	triggerResourceStore, err := resources.NewStore(resourceKernel, triggerCodec)
+	if err != nil {
+		t.Fatalf("resources.NewStore(automation.trigger) error = %v", err)
+	}
+	var resourceDriver resources.ReconcileDriver
+	resourceTrigger := func(ctx context.Context, kind resources.ResourceKind, reason resources.ReconcileReason) error {
+		switch kind.Normalize() {
+		case toolspkg.ToolResourceKind, automationpkg.JobResourceKind, automationpkg.TriggerResourceKind:
+		default:
+			return nil
+		}
+		if resourceDriver == nil {
+			return nil
+		}
+		_, err := resourceDriver.Trigger(ctx, kind, reason)
+		return err
+	}
+
+	profiles, err := profilepkg.NewManager(
+		profilepkg.WithStore(registry),
+		profilepkg.WithHomePaths(homePaths),
+		profilepkg.WithLogger(discardLogger()),
+	)
+	if err != nil {
+		t.Fatalf("profile.NewManager() error = %v", err)
+	}
+	fanout := &integrationNotifierFanout{}
+	resolver, err := workspacepkg.NewResolver(
+		registry,
+		workspacepkg.WithHomePaths(homePaths),
+		workspacepkg.WithOperatorHomeDir(t.TempDir()),
+		workspacepkg.WithProfileAvailabilityChecker(profiles),
+		workspacepkg.WithLogger(discardLogger()),
+		workspacepkg.WithConfigLoader(func(string) (compozyconfig.Config, error) { return cfg, nil }),
+		workspacepkg.WithProfileConfigLoader(func(root, profile string) (compozyconfig.Config, error) {
+			return compozyconfig.LoadForHome(
+				homePaths,
+				compozyconfig.WithWorkspaceRoot(root),
+				compozyconfig.WithProfile(profile),
+			)
+		}),
+	)
+	if err != nil {
+		t.Fatalf("workspace.NewResolver() error = %v", err)
+	}
+	terminalDatabases, err := workspacedb.NewPool(homePaths.HomeDir, func(
+		resolveCtx context.Context,
+		workspaceID string,
+	) (workspacedb.ResolvedRoot, error) {
+		resolved, resolveErr := resolver.Resolve(resolveCtx, workspaceID)
+		if resolveErr != nil {
+			return workspacedb.ResolvedRoot{}, resolveErr
+		}
+		return workspacedb.ResolvedRoot{
+			RootDir:     resolved.RootDir,
+			WorkspaceID: resolved.WorkspaceID,
+		}, nil
+	})
+	if err != nil {
+		t.Fatalf("workspacedb.NewPool() error = %v", err)
+	}
+	journal, err := terminaljournal.New(t.Context(), terminaljournal.Options{
+		Databases: terminalDatabases,
+		HomeDir:   homePaths.HomeDir,
+		Logger:    discardLogger(),
+	})
+	if err != nil {
+		t.Fatalf("terminaljournal.New() error = %v", err)
+	}
+	terminalManager, err := terminalpkg.NewManager(
+		terminalpkg.WithWorkspaceResolver(resolver),
+		terminalpkg.WithLogger(discardLogger()),
+		terminalpkg.WithJournal(journal),
+	)
+	if err != nil {
+		t.Fatalf("terminal.NewManager() error = %v", err)
+	}
+	if err := terminalManager.Start(context.Background()); err != nil {
+		t.Fatalf("terminalManager.Start() error = %v", err)
+	}
+	t.Cleanup(func() {
+		ctx, cancel := context.WithTimeout(context.WithoutCancel(t.Context()), 3*time.Second)
+		defer cancel()
+		if err := terminalManager.Shutdown(ctx); err != nil {
+			t.Errorf("terminalManager.Shutdown() error = %v", err)
+		}
+	})
+
+	manager, err := session.NewManager(
+		session.WithHomePaths(homePaths),
+		session.WithWorkspaceResolver(resolver),
+		session.WithLogger(discardLogger()),
+		session.WithDriver(newIntegrationDriver()),
+		session.WithNotifier(fanout),
+		session.WithSessionCatalog(registry),
+		session.WithSessionPromptAdmissionStore(registry),
+		session.WithSessionInputQueueStore(registry),
+	)
+	if err != nil {
+		t.Fatalf("session.NewManager() error = %v", err)
+	}
+	t.Cleanup(func() {
+		ctx, cancel := context.WithTimeout(context.WithoutCancel(t.Context()), 2*time.Second)
+		defer cancel()
+		if err := manager.Shutdown(ctx); err != nil {
+			t.Errorf("manager.Shutdown() error = %v", err)
+		}
+	})
+	windowManager, err := windowmanager.NewService(
+		windowmanager.NewMemoryRepository(),
+		windowmanager.NewMemoryWorkspaceResolver("window-manager-workspace"),
+		nil,
+		windowmanager.DefaultConfig(),
+	)
+	if err != nil {
+		t.Fatalf("windowmanager.NewService() error = %v", err)
+	}
+	t.Cleanup(func() {
+		if closeErr := windowManager.Close(); closeErr != nil {
+			t.Errorf("windowManager.Close() error = %v", closeErr)
+		}
+	})
+
+	observer, err := observe.New(
+		t.Context(),
+		observe.WithHomePaths(homePaths),
+		observe.WithRegistry(registry),
+		observe.WithSessionSource(manager),
+		observe.WithLogger(discardLogger()),
+	)
+	if err != nil {
+		t.Fatalf("observe.New() error = %v", err)
+	}
+	fanout.notifiers = append(fanout.notifiers, observer)
+
+	automationManager, err := automationpkg.New(
+		automationpkg.WithStore(registry),
+		automationpkg.WithSessions(manager),
+		automationpkg.WithWorkspaceResolver(resolver),
+		automationpkg.WithConfig(cfg.Automation),
+		automationpkg.WithLogger(discardLogger()),
+
+		automationpkg.WithResourceDefinitions(jobResourceStore, triggerResourceStore, resourceActor, resourceTrigger),
+	)
+	if err != nil {
+		t.Fatalf("automation.New() error = %v", err)
+	}
+	if err := automationManager.Start(t.Context()); err != nil {
+		t.Fatalf("automationManager.Start() error = %v", err)
+	}
+	fanout.notifiers = append(fanout.notifiers, automationManager.SessionObserver())
+	t.Cleanup(func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		defer cancel()
+		if err := automationManager.Shutdown(ctx); err != nil {
+			t.Errorf("automationManager.Shutdown() error = %v", err)
+		}
+	})
+
+	taskExecutor := &integrationTaskSessionExecutor{}
+	taskManager, err := taskpkg.NewManager(
+		taskpkg.WithStore(registry),
+		taskpkg.WithSessionExecutor(taskExecutor),
+	)
+	if err != nil {
+		t.Fatalf("task.NewManager() error = %v", err)
+	}
+
+	toolCatalog := newIntegrationToolCatalog()
+	reconcileEvents := newIntegrationReconcileEventSink()
+	toolRegistration, err := resources.NewTypedProjectorRegistration(
+		toolCodec,
+		&integrationToolProjector{catalog: toolCatalog},
+	)
+	if err != nil {
+		t.Fatalf("resources.NewTypedProjectorRegistration(tool) error = %v", err)
+	}
+	jobRegistration, err := resources.NewTypedProjectorRegistration(
+		jobCodec,
+		&integrationAutomationJobProjector{manager: automationManager},
+	)
+	if err != nil {
+		t.Fatalf("resources.NewTypedProjectorRegistration(automation.job) error = %v", err)
+	}
+	triggerRegistration, err := resources.NewTypedProjectorRegistration(
+		triggerCodec,
+		&integrationAutomationTriggerProjector{manager: automationManager},
+	)
+	if err != nil {
+		t.Fatalf("resources.NewTypedProjectorRegistration(automation.trigger) error = %v", err)
+	}
+	resourceDriver, err = resources.NewReconcileDriver(
+		resourceKernel,
+		resourceActor,
+		[]resources.ProjectorRegistration{toolRegistration, jobRegistration, triggerRegistration},
+		resources.WithReconcileLogger(discardLogger()),
+		resources.WithReconcileEventSink(reconcileEvents),
+	)
+	if err != nil {
+		t.Fatalf("resources.NewReconcileDriver() error = %v", err)
+	}
+	t.Cleanup(func() {
+		if err := resourceDriver.Close(context.Background()); err != nil {
+			t.Errorf("resourceDriver.Close() error = %v", err)
+		}
+	})
+	resourceService, err := core.NewOperatorResourceService(&core.ResourceServiceConfig{
+		RawStore:      resourceKernel,
+		CodecRegistry: resourceCodecs,
+		Trigger:       resourceTrigger,
+	})
+	if err != nil {
+		t.Fatalf("core.NewOperatorResourceService() error = %v", err)
+	}
+
+	server, err := New(
+		WithHomePaths(homePaths),
+		WithConfig(&cfg),
+		WithSocketPath(socketPath),
+		WithLogger(discardLogger()),
+		WithSessionManager(manager),
+		WithSessionCatalog(registry),
+		WithTaskService(taskManager),
+		WithObserver(observer),
+		WithResourceService(resourceService),
+		WithAutomation(automationManager),
+		WithWorkspaceResolver(resolver),
+		WithWindowManagerProvider(apitestutil.SingleProfileWindowManagers{Manager: windowManager}),
+		WithTerminalProvider(terminalManager),
+		WithPollInterval(10*time.Millisecond),
+	)
+	if err != nil {
+		t.Fatalf("udsapi.New() error = %v", err)
+	}
+	if err := server.Start(t.Context()); err != nil {
+		t.Fatalf("server.Start() error = %v", err)
+	}
+	t.Cleanup(func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		defer cancel()
+		if err := server.Shutdown(ctx); err != nil {
+			t.Errorf("server.Shutdown() error = %v", err)
+		}
+	})
+
+	return integrationRuntime{
+		client:          newUnixClient(t, socketPath),
+		server:          server,
+		manager:         manager,
+		tasks:           taskManager,
+		observer:        observer,
+		registry:        registry,
+		resourceDriver:  resourceDriver,
+		reconcileEvents: reconcileEvents,
+		toolCatalog:     toolCatalog,
+		socket:          socketPath,
+		workspace:       workspace,
+	}
+}
+
+func createIntegrationSession(t *testing.T, runtime integrationRuntime) string {
+	t.Helper()
+
+	return createIntegrationSessionPayload(t, runtime).ID
+}
+
+func createIntegrationSessionPayload(t *testing.T, runtime integrationRuntime) sessionPayload {
+	t.Helper()
+	return createIntegrationSessionPayloadFromRequest(t, runtime, map[string]any{
+		"agent_name":     "coder",
+		"workspace_path": runtime.workspace,
+	})
+}
+
+func createLiveIntegrationSessionPayload(t *testing.T, runtime integrationRuntime) sessionPayload {
+	t.Helper()
+	return createIntegrationSessionPayloadFromRequest(t, runtime, map[string]any{
+		"agent_name":     "coder",
+		"workspace_path": runtime.workspace,
+	})
+}
+
+func createIntegrationSessionPayloadFromRequest(
+	t *testing.T,
+	runtime integrationRuntime,
+	request map[string]any,
+) sessionPayload {
+	t.Helper()
+
+	body, err := json.Marshal(request)
+	if err != nil {
+		t.Fatalf("json.Marshal(create session body) error = %v", err)
+	}
+
+	resp := mustUnixRequest(
+		t,
+		runtime.client,
+		http.MethodPost,
+		"http://unix/api/sessions",
+		body,
+		nil,
+	)
+	if resp.StatusCode != http.StatusCreated {
+		body := readAndCloseHTTPBody(t, resp)
+		t.Fatalf("create session status = %d, want %d; body=%s", resp.StatusCode, http.StatusCreated, string(body))
+	}
+	var created struct {
+		Session sessionPayload `json:"session"`
+	}
+	decodeHTTPJSON(t, resp, &created)
+	if created.Session.ID == "" {
+		t.Fatal("expected created session id")
+	}
+	if created.Session.WorkspaceID == "" {
+		t.Fatal("expected created session workspace id")
+	}
+	waitForIntegrationSessionActive(t, runtime.manager, created.Session.ID)
+	return created.Session
+}
+
+func waitForIntegrationSessionActive(t *testing.T, manager *session.Manager, sessionID string) {
+	t.Helper()
+
+	info, err := manager.Status(t.Context(), sessionID)
+	if err != nil {
+		t.Fatalf("Status(%q) error = %v", sessionID, err)
+	}
+	if info != nil && info.State == session.StateActive {
+		return
+	}
+
+	catalogEvents, cancel, err := manager.SubscribeSessionCatalogEvents(
+		t.Context(),
+		session.CatalogScope{AllWorkspaces: true},
+	)
+	if err != nil {
+		t.Fatalf("SubscribeSessionCatalogEvents() error = %v", err)
+	}
+	defer cancel()
+
+	info, err = manager.Status(t.Context(), sessionID)
+	if err != nil {
+		t.Fatalf("Status(%q) after catalog subscription error = %v", sessionID, err)
+	}
+	if info != nil && info.State == session.StateActive {
+		return
+	}
+
+	ctx, cancelTimeout := context.WithTimeout(t.Context(), 5*time.Second)
+	defer cancelTimeout()
+	for {
+		select {
+		case event, ok := <-catalogEvents:
+			if !ok {
+				t.Fatalf("session catalog stream closed while waiting for session %q to become active", sessionID)
+			}
+			if event.Kind != session.CatalogEventUpserted || event.SessionID != sessionID {
+				continue
+			}
+
+			info, err = manager.Status(t.Context(), sessionID)
+			if err != nil {
+				t.Fatalf("Status(%q) after catalog event error = %v", sessionID, err)
+			}
+			if info != nil && info.State == session.StateActive {
+				return
+			}
+		case <-ctx.Done():
+			t.Fatalf("session %q did not become active: info=%#v: %v", sessionID, info, ctx.Err())
+		}
+	}
+}
+
+func createIntegrationTask(t *testing.T, runtime integrationRuntime, body []byte) contract.TaskPayload {
+	t.Helper()
+
+	resp := mustUnixRequest(t, runtime.client, http.MethodPost, "http://unix/api/tasks", body, nil)
+	if resp.StatusCode != http.StatusCreated {
+		payload := readAndCloseHTTPBody(t, resp)
+		t.Fatalf("create task status = %d, want %d; body=%s", resp.StatusCode, http.StatusCreated, string(payload))
+	}
+	var created contract.TaskResponse
+	decodeHTTPJSON(t, resp, &created)
+	return created.Task
+}
+
+func enqueueIntegrationTaskRun(
+	t *testing.T,
+	runtime integrationRuntime,
+	taskID string,
+	body string,
+) contract.TaskRunPayload {
+	t.Helper()
+
+	resp := mustUnixRequest(
+		t,
+		runtime.client,
+		http.MethodPost,
+		"http://unix/api/tasks/"+taskID+"/runs",
+		[]byte(body),
+		nil,
+	)
+	if resp.StatusCode != http.StatusCreated {
+		payload := readAndCloseHTTPBody(t, resp)
+		t.Fatalf("enqueue run status = %d, want %d; body=%s", resp.StatusCode, http.StatusCreated, string(payload))
+	}
+	var created contract.TaskRunResponse
+	decodeHTTPJSON(t, resp, &created)
+	return created.Run
+}
+
+func requireUDSInboxGroup(
+	t *testing.T,
+	groups []contract.TaskInboxLaneGroupPayload,
+	lane contract.TaskInboxLane,
+) contract.TaskInboxLaneGroupPayload {
+	t.Helper()
+
+	for _, group := range groups {
+		if group.Lane == lane {
+			return group
+		}
+	}
+	t.Fatalf("task inbox lane %q not found in %#v", lane, groups)
+	return contract.TaskInboxLaneGroupPayload{}
+}
+
+func udsInboxGroupHasTask(group contract.TaskInboxLaneGroupPayload, taskID string) bool {
+	for _, item := range group.Items {
+		if item.Task.ID == taskID {
+			return true
+		}
+	}
+	return false
+}
+
+func sessionAPIPath(workspaceID string, sessionID string, suffix string) string {
+	return fmt.Sprintf("http://unix/api/workspaces/%s/sessions/%s%s", workspaceID, sessionID, suffix)
+}
+
+func sendPrompt(t *testing.T, runtime integrationRuntime, workspaceID string, sessionID string, message string) {
+	t.Helper()
+
+	body := integrationPromptJSON(t, message)
+
+	resp := mustUnixRequest(
+		t,
+		runtime.client,
+		http.MethodPost,
+		sessionAPIPath(workspaceID, sessionID, "/prompt"),
+		body,
+		nil,
+	)
+	if resp.StatusCode != http.StatusOK {
+		body := readAndCloseHTTPBody(t, resp)
+		t.Fatalf("prompt status = %d, want %d; body=%s", resp.StatusCode, http.StatusOK, string(body))
+	}
+	if _, err := io.ReadAll(resp.Body); err != nil {
+		t.Fatalf("io.ReadAll(prompt response) error = %v", err)
+	}
+	if err := resp.Body.Close(); err != nil {
+		t.Fatalf("prompt response close error = %v", err)
+	}
+}
+
+func integrationPromptJSON(t *testing.T, message string) []byte {
+	t.Helper()
+
+	identity := strings.NewReplacer("/", "-", " ", "-").Replace(t.Name() + "-" + message)
+	body, err := json.Marshal(map[string]string{
+		"message":         message,
+		"message_id":      "msg-" + identity,
+		"idempotency_key": "idem-" + identity,
+	})
+	if err != nil {
+		t.Fatalf("json.Marshal(prompt body) error = %v", err)
+	}
+	return body
+}
+
+func mustIntegrationPrompt(t *testing.T, events <-chan acp.AgentEvent, err error) <-chan acp.AgentEvent {
+	t.Helper()
+	if err != nil {
+		t.Fatalf("prompt submission error = %v", err)
+	}
+	return events
+}
+
+func collectIntegrationPromptEvents(
+	t *testing.T,
+	events <-chan acp.AgentEvent,
+	timeout time.Duration,
+) []acp.AgentEvent {
+	t.Helper()
+
+	collected := make([]acp.AgentEvent, 0, 4)
+	timer := time.NewTimer(timeout)
+	defer timer.Stop()
+
+Loop:
+	for {
+		select {
+		case event, ok := <-events:
+			if !ok {
+				break Loop
+			}
+			collected = append(collected, event)
+		case <-timer.C:
+			t.Fatalf("timed out waiting for prompt events after %v", timeout)
+		}
+	}
+	if len(collected) == 0 {
+		t.Fatal("prompt events = 0, want completed prompt stream")
+	}
+	if got := collected[len(collected)-1].Type; got != acp.EventTypeDone {
+		t.Fatalf("last prompt event type = %q, want %q", got, acp.EventTypeDone)
+	}
+	return collected
+}
+
+func stopIntegrationSession(t *testing.T, runtime integrationRuntime, workspaceID string, sessionID string) {
+	t.Helper()
+
+	resp := mustUnixRequest(
+		t,
+		runtime.client,
+		http.MethodPost,
+		sessionAPIPath(workspaceID, sessionID, "/stop"),
+		nil,
+		nil,
+	)
+	if resp.StatusCode != http.StatusNoContent {
+		body := readAndCloseHTTPBody(t, resp)
+		t.Fatalf("stop status = %d, want %d; body=%s", resp.StatusCode, http.StatusNoContent, string(body))
+	}
+	closeHTTPBody(t, resp.Body)
+}
+
+func mustUnixRequest(
+	t *testing.T,
+	client *http.Client,
+	method, url string,
+	body []byte,
+	headers map[string]string,
+) *http.Response {
+	t.Helper()
+
+	var reader io.Reader
+	if len(body) > 0 {
+		reader = strings.NewReader(string(body))
+	}
+	ctx, cancel := context.WithCancel(t.Context())
+	t.Cleanup(cancel)
+	req, err := http.NewRequestWithContext(ctx, method, url, reader)
+	if err != nil {
+		cancel()
+		t.Fatalf("http.NewRequestWithContext() error = %v", err)
+	}
+	if len(body) > 0 {
+		req.Header.Set("Content-Type", "application/json")
+	}
+	for key, value := range headers {
+		req.Header.Set(key, value)
+	}
+
+	resp, err := client.Do(req)
+	if err != nil {
+		cancel()
+		t.Fatalf("client.Do() error = %v", err)
+	}
+	resp.Body = &integrationResponseBody{ReadCloser: resp.Body, cancel: cancel}
+	return resp
+}
+
+// Cancel the request before closing its body so an in-flight stream read cannot enter draining.
+type integrationResponseBody struct {
+	io.ReadCloser
+	cancel context.CancelFunc
+}
+
+func (b *integrationResponseBody) Close() error {
+	b.cancel()
+	return b.ReadCloser.Close()
+}
+
+func decodeHTTPJSON(t *testing.T, resp *http.Response, dest any) {
+	t.Helper()
+
+	body, err := io.ReadAll(resp.Body)
+	closeErr := resp.Body.Close()
+	if err != nil {
+		t.Fatalf("io.ReadAll(response) error = %v", err)
+	}
+	if closeErr != nil {
+		t.Fatalf("response body close error = %v", closeErr)
+	}
+	if err := json.Unmarshal(body, dest); err != nil {
+		t.Fatalf("json.Unmarshal(response) error = %v; body=%s", err, string(body))
+	}
+}
+
+func readAndCloseHTTPBody(t *testing.T, resp *http.Response) []byte {
+	t.Helper()
+
+	body, readErr := io.ReadAll(resp.Body)
+	closeErr := resp.Body.Close()
+	if err := errors.Join(readErr, closeErr); err != nil {
+		t.Fatalf("read and close HTTP response body: %v", err)
+	}
+	return body
+}
+
+func closeHTTPBody(t *testing.T, body io.Closer) {
+	t.Helper()
+
+	if err := body.Close(); err != nil {
+		t.Errorf("close HTTP response body: %v", err)
+	}
+}
+
+func containsAutomationRun(runs []contract.RunPayload, id string) bool {
+	for _, run := range runs {
+		if run.ID == id {
+			return true
+		}
+	}
+	return false
+}
+
+func registerUDSServerShutdownSignal(t *testing.T, server *Server) <-chan struct{} {
+	t.Helper()
+
+	server.mu.Lock()
+	httpServer := server.httpServer
+	server.mu.Unlock()
+	if httpServer == nil {
+		t.Fatal("UDS HTTP server was not initialized")
+	}
+	started := make(chan struct{})
+	httpServer.RegisterOnShutdown(sync.OnceFunc(func() { close(started) }))
+	return started
+}
+
+func waitForUDSServerSignal(t *testing.T, signal <-chan struct{}, name string) {
+	t.Helper()
+
+	ctx, cancel := context.WithTimeout(context.WithoutCancel(t.Context()), 2*time.Second)
+	defer cancel()
+	select {
+	case <-signal:
+	case <-ctx.Done():
+		t.Fatalf("timed out waiting for %s: %v", name, ctx.Err())
+	}
+}
+
+const liveSSEJoinTimeout = 2 * time.Second
+
+type liveSSEStreamResult struct {
+	err error
+}
+
+type liveSSEStream struct {
+	cancel  context.CancelFunc
+	records <-chan sseRecord
+	result  <-chan liveSSEStreamResult
+}
+
+func collectLiveSSE(t *testing.T, body io.ReadCloser, want int, timeout time.Duration) []sseRecord {
+	t.Helper()
+
+	return collectLiveSSEMatching(
+		t,
+		body,
+		want+1,
+		timeout,
+		func(records []sseRecord) bool { return len(records) >= want },
+		fmt.Sprintf("%d SSE records", want),
+	)
+}
+
+func collectLiveSSEUntilEvent(t *testing.T, body io.ReadCloser, wantEvent string, timeout time.Duration) []sseRecord {
+	t.Helper()
+
+	return collectLiveSSEMatching(
+		t,
+		body,
+		8,
+		timeout,
+		func(records []sseRecord) bool {
+			return len(records) > 0 && records[len(records)-1].Event == wantEvent
+		},
+		fmt.Sprintf("SSE event %q", wantEvent),
+	)
+}
+
+func collectLiveSSEMatching(
+	t *testing.T,
+	body io.ReadCloser,
+	buffer int,
+	timeout time.Duration,
+	done func([]sseRecord) bool,
+	want string,
+) []sseRecord {
+	t.Helper()
+
+	stream := startLiveSSEStream(t.Context(), body, buffer)
+	deadline := time.NewTimer(timeout)
+	defer deadline.Stop()
+
+	records := make([]sseRecord, 0, buffer)
+	var primaryErr error
+	var terminalResult *liveSSEStreamResult
+	for !done(records) && primaryErr == nil && terminalResult == nil {
+		select {
+		case record, ok := <-stream.records:
+			if !ok {
+				continue
+			}
+			records = append(records, record)
+		case result := <-stream.result:
+			terminalResult = &result
+			for record := range stream.records {
+				records = append(records, record)
+			}
+			if !done(records) {
+				primaryErr = fmt.Errorf("live SSE ended after %d records before %s", len(records), want)
+			}
+		case <-deadline.C:
+			primaryErr = fmt.Errorf("timed out waiting for %s; got %d records", want, len(records))
+		}
+	}
+
+	stream.cancel()
+	if terminalResult == nil {
+		joinCtx, cancelJoin := context.WithTimeout(context.WithoutCancel(t.Context()), liveSSEJoinTimeout)
+		defer cancelJoin()
+		select {
+		case result := <-stream.result:
+			terminalResult = &result
+		case <-joinCtx.Done():
+			primaryErr = errors.Join(
+				primaryErr,
+				fmt.Errorf("live SSE reader did not terminate: %w", joinCtx.Err()),
+			)
+		}
+	}
+	if terminalResult != nil {
+		primaryErr = errors.Join(primaryErr, terminalResult.err)
+	}
+	if primaryErr != nil {
+		t.Fatalf("collect live SSE: %v", primaryErr)
+	}
+	return records
+}
+
+func startLiveSSEStream(ctx context.Context, body io.ReadCloser, buffer int) liveSSEStream {
+	streamCtx, cancel := context.WithCancel(ctx)
+	recordCh := make(chan sseRecord, buffer)
+	resultCh := make(chan liveSSEStreamResult, 1)
+	go readLiveSSEStream(streamCtx, body, recordCh, resultCh)
+	return liveSSEStream{cancel: cancel, records: recordCh, result: resultCh}
+}
+
+func readLiveSSEStream(
+	ctx context.Context,
+	body io.ReadCloser,
+	recordCh chan<- sseRecord,
+	resultCh chan<- liveSSEStreamResult,
+) {
+	defer close(recordCh)
+
+	var closeOnce sync.Once
+	var closeErr error
+	closeBody := func() {
+		closeOnce.Do(func() {
+			closeErr = body.Close()
+		})
+	}
+	stopCloseOnCancel := context.AfterFunc(ctx, closeBody)
+	emit := func(record sseRecord) bool {
+		select {
+		case recordCh <- record:
+			return true
+		case <-ctx.Done():
+			return false
+		}
+	}
+
+	scanner := bufio.NewScanner(body)
+	current := sseRecord{}
+	for scanner.Scan() {
+		line := scanner.Text()
+		if line == "" {
+			if !emit(current) {
+				break
+			}
+			current = sseRecord{}
+			continue
+		}
+		switch {
+		case strings.HasPrefix(line, "id: "):
+			current.ID = strings.TrimPrefix(line, "id: ")
+		case strings.HasPrefix(line, "event: "):
+			current.Event = strings.TrimPrefix(line, "event: ")
+		case strings.HasPrefix(line, "data: "):
+			current.Data = append(current.Data, []byte(strings.TrimPrefix(line, "data: "))...)
+		}
+	}
+	if ctx.Err() == nil && (current.Event != "" || current.ID != "" || len(current.Data) > 0) {
+		emit(current)
+	}
+	scanErr := scanner.Err()
+	if ctx.Err() != nil {
+		scanErr = nil
+	}
+	stopCloseOnCancel()
+	closeBody()
+	resultCh <- liveSSEStreamResult{err: errors.Join(scanErr, closeErr)}
+}

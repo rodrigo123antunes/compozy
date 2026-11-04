@@ -1,0 +1,317 @@
+import { describe, expect, it, vi } from "vitest";
+
+import { SESSION_ATTACHMENT_DATA_TYPE } from "../attachment-kinds";
+import { createSessionPromptChatTransport } from "../session-prompt-chat-transport";
+import type { SessionPromptAttachment } from "../../types";
+
+const userMessage = (id: string, text = "Continue the durable transcript") => ({
+  id,
+  parts: [{ text, type: "text" as const }],
+  role: "user" as const,
+});
+
+function streamResponse() {
+  return new Response(
+    [
+      'data: {"type":"start","messageId":"prompt-transport-turn"}\n\n',
+      'data: {"type":"finish","finishReason":"stop"}\n\n',
+      "data: [DONE]\n\n",
+    ].join(""),
+    {
+      headers: { "content-type": "text/event-stream" },
+    }
+  );
+}
+
+describe("session prompt chat transport", () => {
+  // Invariant: HTTP error envelopes never become raw chat error text.
+  // Owner: prompt transport; canonical suite: this file.
+  it("renders missing attachment recovery copy instead of the JSON envelope", async () => {
+    const transport = createSessionPromptChatTransport({
+      api: "/prompt",
+      fetch: async () =>
+        Response.json(
+          {
+            error: 'session: open prompt attachment "image.png": attachments: attachment not found',
+          },
+          { status: 404 }
+        ),
+    });
+    await expect(
+      transport.sendMessages({
+        abortSignal: undefined,
+        chatId: "session-001",
+        messageId: undefined,
+        messages: [userMessage("missing-image")],
+        trigger: "submit-message",
+      })
+    ).rejects.toThrow(
+      "An attachment is no longer available. Send again to upload the retained file"
+    );
+  });
+
+  it("sends the optimistic user id as message_id and retains one idempotency key for retries", async () => {
+    const fetch = vi.fn<(input: RequestInfo | URL, init?: RequestInit) => Promise<Response>>(
+      async () => streamResponse()
+    );
+    const onPromptPrepared = vi.fn();
+    const transport = createSessionPromptChatTransport({
+      api: "/prompt",
+      fetch,
+      onPromptPrepared,
+    });
+    const latest = userMessage("message-002", "Send only this turn");
+    const messages = [
+      userMessage("message-001", "Already persisted"),
+      {
+        id: "assistant-001",
+        parts: [{ text: "Persisted answer", type: "text" as const }],
+        role: "assistant" as const,
+      },
+      latest,
+    ];
+
+    await transport.sendMessages({
+      abortSignal: undefined,
+      chatId: "session-001",
+      messageId: undefined,
+      messages,
+      trigger: "submit-message",
+    });
+    await transport.sendMessages({
+      abortSignal: undefined,
+      chatId: "session-001",
+      messageId: undefined,
+      messages,
+      trigger: "submit-message",
+    });
+
+    const first = JSON.parse(String(fetch.mock.calls[0]?.[1]?.body)) as Record<string, unknown>;
+    const second = JSON.parse(String(fetch.mock.calls[1]?.[1]?.body)) as Record<string, unknown>;
+    expect(first).toMatchObject({
+      message_id: "message-002",
+      messages: [latest],
+    });
+    expect(typeof first.idempotency_key).toBe("string");
+    expect(first.idempotency_key).toBe(second.idempotency_key);
+    expect(first).not.toHaveProperty("message");
+    expect(first).not.toHaveProperty("messageId");
+    // The prepared envelope handed to the runtime is byte-for-byte what left on
+    // the wire, on the retry too: the same message_id and the same retained key,
+    // so a lost acknowledgment can be replayed by the exact identity.
+    expect(onPromptPrepared).toHaveBeenCalledTimes(2);
+    expect(onPromptPrepared).toHaveBeenNthCalledWith(1, { body: first, messages: [latest] });
+    expect(onPromptPrepared).toHaveBeenLastCalledWith({ body: second, messages: [latest] });
+    expect(second).toMatchObject({
+      idempotency_key: first.idempotency_key,
+      message_id: "message-002",
+    });
+  });
+
+  it("mints a separate key for the next submitted user message and retains the runtime snapshot", async () => {
+    const fetch = vi.fn<(input: RequestInfo | URL, init?: RequestInit) => Promise<Response>>(
+      async () => streamResponse()
+    );
+    const runtime = { provider: "codex", reasoning_effort: "high" as const };
+    const transport = createSessionPromptChatTransport({
+      api: "/prompt",
+      fetch,
+      getRuntimeSnapshot: () => runtime,
+    });
+
+    await transport.sendMessages({
+      abortSignal: undefined,
+      chatId: "session-001",
+      messageId: undefined,
+      messages: [userMessage("message-001")],
+      trigger: "submit-message",
+    });
+    await transport.sendMessages({
+      abortSignal: undefined,
+      chatId: "session-001",
+      messageId: undefined,
+      messages: [userMessage("message-002")],
+      trigger: "submit-message",
+    });
+
+    const first = JSON.parse(String(fetch.mock.calls[0]?.[1]?.body)) as Record<string, unknown>;
+    const second = JSON.parse(String(fetch.mock.calls[1]?.[1]?.body)) as Record<string, unknown>;
+    expect(first.idempotency_key).not.toBe(second.idempotency_key);
+    expect(second).toMatchObject({ message_id: "message-002", runtime });
+  });
+
+  it("preserves a shared idempotency key when the transport is recreated", async () => {
+    const fetch = vi.fn<(input: RequestInfo | URL, init?: RequestInit) => Promise<Response>>(
+      async () => streamResponse()
+    );
+    const idempotencyKeys = new Map<string, string>();
+    const messages = [userMessage("message-001")];
+    const firstTransport = createSessionPromptChatTransport({
+      api: "/prompt",
+      fetch,
+      idempotencyKeys,
+    });
+
+    await firstTransport.sendMessages({
+      abortSignal: undefined,
+      chatId: "session-001",
+      messageId: undefined,
+      messages,
+      trigger: "submit-message",
+    });
+
+    const recreatedTransport = createSessionPromptChatTransport({
+      api: "/prompt",
+      fetch,
+      idempotencyKeys,
+    });
+    await recreatedTransport.sendMessages({
+      abortSignal: undefined,
+      chatId: "session-001",
+      messageId: undefined,
+      messages,
+      trigger: "submit-message",
+    });
+
+    const first = JSON.parse(String(fetch.mock.calls[0]?.[1]?.body)) as Record<string, unknown>;
+    const retry = JSON.parse(String(fetch.mock.calls[1]?.[1]?.body)) as Record<string, unknown>;
+    expect(first.idempotency_key).toEqual(expect.stringMatching(/\S/));
+    expect(retry.idempotency_key).toBe(first.idempotency_key);
+  });
+
+  it("mints an idempotency key from cryptographic random bytes without randomUUID", async () => {
+    const getRandomValues = vi.fn((bytes: Uint8Array) => {
+      bytes.set(
+        Uint8Array.from([
+          0x00, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88, 0x99, 0xaa, 0xbb, 0xcc, 0xdd, 0xee,
+          0xff,
+        ])
+      );
+      return bytes;
+    });
+    vi.stubGlobal("crypto", { getRandomValues });
+    const fetch = vi.fn<(input: RequestInfo | URL, init?: RequestInit) => Promise<Response>>(
+      async () => streamResponse()
+    );
+    const transport = createSessionPromptChatTransport({ api: "/prompt", fetch });
+
+    try {
+      await transport.sendMessages({
+        abortSignal: undefined,
+        chatId: "session-001",
+        messageId: undefined,
+        messages: [userMessage("message-001")],
+        trigger: "submit-message",
+      });
+
+      const body = JSON.parse(String(fetch.mock.calls[0]?.[1]?.body)) as Record<string, unknown>;
+      expect(getRandomValues).toHaveBeenCalledWith(expect.any(Uint8Array));
+      expect(body.idempotency_key).toBe("00112233-4455-4677-8899-aabbccddeeff");
+    } finally {
+      vi.unstubAllGlobals();
+    }
+  });
+
+  it("maps complete attachment data parts onto the prompt body", async () => {
+    const fetch = vi.fn<(input: RequestInfo | URL, init?: RequestInit) => Promise<Response>>(
+      async () => streamResponse()
+    );
+    const transport = createSessionPromptChatTransport({ api: "/prompt", fetch });
+    const attachment: SessionPromptAttachment = {
+      bytes: 32,
+      height: 10,
+      id: "att_deadbeef",
+      kind: "image",
+      mime_type: "image/png",
+      name: "shot.png",
+      sha256: "b".repeat(64),
+      width: 10,
+    };
+
+    await transport.sendMessages({
+      abortSignal: undefined,
+      chatId: "session-001",
+      messageId: undefined,
+      messages: [
+        {
+          id: "message-att",
+          parts: [
+            { text: "Look at this", type: "text" as const },
+            { type: SESSION_ATTACHMENT_DATA_TYPE, data: attachment },
+          ],
+          role: "user" as const,
+        },
+      ],
+      trigger: "submit-message",
+    });
+
+    const body = JSON.parse(String(fetch.mock.calls[0]?.[1]?.body)) as Record<string, unknown>;
+    expect(body.attachments).toEqual([attachment]);
+  });
+
+  it("reuses the prepared user message when the same submission is retried", async () => {
+    const fetch = vi.fn<(input: RequestInfo | URL, init?: RequestInit) => Promise<Response>>(
+      async () => streamResponse()
+    );
+    const latest = userMessage("message-quote", "What failed?");
+    let prepares = 0;
+    const transport = createSessionPromptChatTransport({
+      api: "/prompt",
+      fetch,
+      prepareUserMessage: () => {
+        prepares += 1;
+        return userMessage("message-quote", `<envelope>${prepares}</envelope>\n\nWhat failed?`);
+      },
+    });
+
+    await transport.sendMessages({
+      abortSignal: undefined,
+      chatId: "session-001",
+      messageId: undefined,
+      messages: [latest],
+      trigger: "submit-message",
+    });
+    await transport.sendMessages({
+      abortSignal: undefined,
+      chatId: "session-001",
+      messageId: undefined,
+      messages: [latest],
+      trigger: "submit-message",
+    });
+
+    const first = JSON.parse(String(fetch.mock.calls[0]?.[1]?.body)) as { messages: unknown[] };
+    const second = JSON.parse(String(fetch.mock.calls[1]?.[1]?.body)) as { messages: unknown[] };
+    expect(prepares).toBe(1);
+    expect(second.messages).toEqual(first.messages);
+  });
+
+  it("prepares the latest user message before the prompt body is built", async () => {
+    const fetch = vi.fn<(input: RequestInfo | URL, init?: RequestInit) => Promise<Response>>(
+      async () => streamResponse()
+    );
+    const latest = userMessage("message-quote", "What failed?");
+    const prepared = userMessage(
+      "message-quote",
+      '<terminal_context terminal="term-4f21c9a03b7e" lines="1-1">\n1 | FAIL\n</terminal_context>\n\nWhat failed?'
+    );
+    const transport = createSessionPromptChatTransport({
+      api: "/prompt",
+      fetch,
+      prepareUserMessage: message => {
+        expect(message).toEqual(latest);
+        return prepared;
+      },
+    });
+
+    await transport.sendMessages({
+      abortSignal: undefined,
+      chatId: "session-001",
+      messageId: undefined,
+      messages: [latest],
+      trigger: "submit-message",
+    });
+
+    const body = JSON.parse(String(fetch.mock.calls[0]?.[1]?.body)) as Record<string, unknown>;
+    expect(body.messages).toEqual([prepared]);
+  });
+});

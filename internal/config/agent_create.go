@@ -1,0 +1,281 @@
+package config
+
+import (
+	"crypto/sha256"
+	"errors"
+	"fmt"
+	"math"
+	"os"
+	"path/filepath"
+	"slices"
+	"strings"
+
+	hookspkg "github.com/compozy/compozy/internal/hooks"
+	speedpkg "github.com/compozy/compozy/internal/speed"
+	"github.com/goccy/go-yaml"
+)
+
+var (
+	// ErrInvalidAgentDefinition marks validation failures while authoring an AGENT.md file.
+	ErrInvalidAgentDefinition = errors.New("config: invalid agent definition")
+	// ErrAgentDefinitionExists marks a create request that would overwrite an existing AGENT.md file.
+	ErrAgentDefinitionExists = errors.New("config: agent definition already exists")
+)
+
+// AgentDefinitionDraft captures the simple AGENT.md fields supported by authoring surfaces.
+type AgentDefinitionDraft struct {
+	SessionApproval string
+	PermissionRules []PermissionRule
+	DisplayName     string         `json:"display_name,omitempty" yaml:"display_name,omitempty" toml:"display_name,omitempty"`
+	Description     string         `json:"description,omitempty"  yaml:"description,omitempty"  toml:"description,omitempty"`
+	Kind            string         `json:"kind,omitempty"         yaml:"kind,omitempty"         toml:"kind,omitempty"`
+	Appearance      map[string]any `json:"appearance,omitempty"   yaml:"appearance,omitempty"   toml:"appearance,omitempty"`
+
+	WorkspaceAccess string
+	Name            string
+	Provider        string
+	Command         string
+	SessionEnv      SessionEnv
+	Model           string
+	ReasoningEffort string
+	Speed           speedpkg.Speed
+	ACPOptions      []ACPOptionSelection
+	Tools           []string
+	Toolsets        []string
+	DenyTools       []string
+	Permissions     string
+	Skills          AgentSkillsConfig
+	CategoryPath    []string
+	MCPServers      []MCPServer
+	Hooks           []hookspkg.HookDecl
+	FallbackChain   []RoleFallback
+	Prompt          string
+}
+
+// CreateAgentDefFile renders, validates, and persists one AGENT.md definition.
+func CreateAgentDefFile(path string, draft AgentDefinitionDraft, overwrite bool) (AgentDef, error) {
+	normalizedPath := strings.TrimSpace(path)
+	if normalizedPath == "" {
+		return AgentDef{}, fmt.Errorf("config: agent definition path is required")
+	}
+
+	if overwrite {
+		current, err := LoadAgentDefFile(normalizedPath)
+		if err != nil && !errors.Is(err, os.ErrNotExist) {
+			return AgentDef{}, err
+		}
+		if err == nil && current.EffectiveKind() != (AgentDef{Kind: draft.Kind}).EffectiveKind() {
+			return AgentDef{}, ErrAgentKindImmutable
+		}
+		if !EqualAgentAppearance(current.Appearance, draft.Appearance) {
+			if err := ValidateAgentAppearance(draft.Appearance); err != nil {
+				return AgentDef{}, errors.Join(ErrInvalidAgentDefinition, err)
+			}
+		}
+	} else if err := ValidateAgentAppearance(draft.Appearance); err != nil {
+		return AgentDef{}, errors.Join(ErrInvalidAgentDefinition, err)
+	}
+	contents, agent, err := RenderAgentDefinition(draft)
+	if err != nil {
+		return AgentDef{}, err
+	}
+	write := writePersistedFile
+	if !overwrite {
+		write = writePersistedFileExclusive
+	}
+	if err := write(normalizedPath, contents); err != nil {
+		if !overwrite && errors.Is(err, os.ErrExist) {
+			return AgentDef{}, errors.Join(
+				ErrAgentDefinitionExists,
+				fmt.Errorf("config: agent definition already exists at %s: %w", normalizedPath, err),
+			)
+		}
+		return AgentDef{}, fmt.Errorf("config: write agent definition %q: %w", normalizedPath, err)
+	}
+
+	agent.SourcePath = filepath.Clean(normalizedPath)
+	return agent, nil
+}
+
+// RenderAgentDefinition renders a draft to AGENT.md bytes and validates by parsing the result.
+func RenderAgentDefinition(draft AgentDefinitionDraft) ([]byte, AgentDef, error) {
+	draft.Kind, _ = CanonicalAgentKind(draft.Kind)
+	agentName := NormalizeAgentName(draft.Name)
+	if err := ValidateAuthoredAgentName(agentName); err != nil {
+		return nil, AgentDef{}, errors.Join(ErrInvalidAgentDefinition, err)
+	}
+	agent := AgentDef{
+		Name: agentName,
+		DisplayName: strings.TrimSpace(
+			draft.DisplayName,
+		),
+		Description:     draft.Description,
+		Kind:            draft.Kind,
+		Appearance:      canonicalAgentAppearance(draft.Appearance),
+		Provider:        strings.TrimSpace(draft.Provider),
+		Command:         strings.TrimSpace(draft.Command),
+		SessionEnv:      MergeSessionEnv(nil, draft.SessionEnv),
+		Model:           strings.TrimSpace(draft.Model),
+		ReasoningEffort: strings.TrimSpace(draft.ReasoningEffort),
+		Tools:           trimAgentDefinitionAtoms(draft.Tools),
+		Toolsets:        trimAgentDefinitionAtoms(draft.Toolsets),
+		DenyTools:       trimAgentDefinitionAtoms(draft.DenyTools),
+		Permissions:     strings.TrimSpace(draft.Permissions),
+		WorkspaceAccess: draft.WorkspaceAccess,
+		SessionApproval: draft.SessionApproval,
+		PermissionRules: append([]PermissionRule(nil), draft.PermissionRules...),
+		Skills:          AgentSkillsConfig{Disabled: trimAgentDefinitionAtoms(draft.Skills.Disabled)},
+		CategoryPath:    trimAgentDefinitionAtoms(draft.CategoryPath),
+		MCPServers:      cloneMCPServers(draft.MCPServers),
+		Hooks:           cloneHookDecls(draft.Hooks),
+		FallbackChain:   normalizeRoleFallbacks(draft.FallbackChain),
+		Prompt:          strings.TrimSpace(draft.Prompt),
+	}
+	agent.SetSpeed(draft.Speed)
+	agent.SetACPOptions(draft.ACPOptions)
+	agent = canonicalAgentDefinition(agent)
+	agent.Skills = normalizeAgentSkillsConfig(agent.Skills)
+	agent.CategoryPath = normalizeAgentCategoryPath(agent.CategoryPath)
+	if err := agent.Validate(); err != nil {
+		return nil, AgentDef{}, errors.Join(ErrInvalidAgentDefinition, err)
+	}
+
+	parsed := parsedAgentDef{}
+	if err := applyAgentDefToParsed(&parsed, agent); err != nil {
+		return nil, AgentDef{}, fmt.Errorf("config: render agent definition fields: %w", err)
+	}
+	frontmatter, err := yaml.Marshal(parsed)
+	if err != nil {
+		return nil, AgentDef{}, fmt.Errorf("config: render agent frontmatter: %w", err)
+	}
+	contents := renderAgentMarkdown(frontmatter, agent.Prompt)
+	validated, err := ParseAgentDef(contents)
+	if err != nil {
+		return nil, AgentDef{}, errors.Join(
+			ErrInvalidAgentDefinition,
+			fmt.Errorf("config: validate generated agent definition: %w", err),
+		)
+	}
+	if validated.Name != agentName {
+		return nil, AgentDef{}, errors.Join(
+			ErrInvalidAgentDefinition,
+			fmt.Errorf("config: generated agent name %q does not match %q", validated.Name, agentName),
+		)
+	}
+	return contents, validated, nil
+}
+
+// AgentDefinitionDraftFromDef preserves every AGENT.md-authored field in a mutable draft.
+func AgentDefinitionDraftFromDef(agent AgentDef) AgentDefinitionDraft {
+	canonical := canonicalAgentDefinition(CloneAgentDef(agent))
+	return AgentDefinitionDraft{
+		Name: canonical.Name,
+		DisplayName: strings.TrimSpace(
+			canonical.DisplayName,
+		),
+		Description:     canonical.Description,
+		Kind:            canonical.Kind,
+		Appearance:      CloneAgentAppearance(canonical.Appearance),
+		Provider:        canonical.Provider,
+		Command:         canonical.Command,
+		SessionEnv:      MergeSessionEnv(nil, canonical.SessionEnv),
+		Model:           canonical.Model,
+		ReasoningEffort: canonical.ReasoningEffort,
+		Speed:           canonical.SpeedValue(),
+		ACPOptions:      CloneACPOptionSelections(canonical.ACPOptionsValue()),
+		Tools:           cloneStrings(canonical.Tools),
+		Toolsets:        cloneStrings(canonical.Toolsets),
+		DenyTools:       cloneStrings(canonical.DenyTools),
+		Permissions:     canonical.Permissions,
+		WorkspaceAccess: canonical.WorkspaceAccess,
+		SessionApproval: canonical.SessionApproval,
+		PermissionRules: append([]PermissionRule(nil), canonical.PermissionRules...),
+		Skills:          normalizeAgentSkillsConfig(canonical.Skills),
+		CategoryPath:    cloneStrings(canonical.CategoryPath),
+		MCPServers:      cloneMCPServers(canonical.MCPServers),
+		Hooks:           cloneHookDecls(canonical.Hooks),
+		FallbackChain:   normalizeRoleFallbacks(canonical.FallbackChain),
+		Prompt:          canonical.Prompt,
+	}
+}
+
+// AgentDefinitionDigest returns the canonical semantic digest used for update CAS.
+func AgentDefinitionDigest(agent AgentDef) (string, error) {
+	contents, _, err := RenderAgentDefinition(AgentDefinitionDraftFromDef(agent))
+	if err != nil {
+		return "", fmt.Errorf("config: render agent definition digest: %w", err)
+	}
+	digest := sha256.Sum256(contents)
+	return fmt.Sprintf("%x", digest[:]), nil
+}
+
+func canonicalAgentDefinition(agent AgentDef) AgentDef {
+	agent.SetSpeed(agent.SpeedValue())
+	agent.SetACPOptions(canonicalACPOptionSelections(agent.ACPOptionsValue()))
+	agent.Tools = sortedAgentDefinitionAtoms(agent.Tools)
+	agent.Toolsets = sortedAgentDefinitionAtoms(agent.Toolsets)
+	agent.DenyTools = sortedAgentDefinitionAtoms(agent.DenyTools)
+	agent.Skills.Disabled = sortedAgentDefinitionAtoms(agent.Skills.Disabled)
+	agent.MCPServers = cloneMCPServers(agent.MCPServers)
+	for index := range agent.MCPServers {
+		slices.Sort(agent.MCPServers[index].Auth.Scopes)
+	}
+	slices.SortFunc(agent.MCPServers, func(left MCPServer, right MCPServer) int {
+		if byName := strings.Compare(left.Name, right.Name); byName != 0 {
+			return byName
+		}
+		return strings.Compare(string(left.Transport), string(right.Transport))
+	})
+	return agent
+}
+
+// canonicalAgentAppearance renders whole numbers as integers. Catalog records reach the renderer
+// through a JSON round trip that turns `version: 1` into a float, which would render `1.0` and
+// change the definition digest of an unchanged file.
+func canonicalAgentAppearance(appearance map[string]any) map[string]any {
+	result := CloneAgentAppearance(appearance)
+	for key, value := range result {
+		result[key] = canonicalAppearanceNumber(value)
+	}
+	return result
+}
+
+func canonicalAppearanceNumber(value any) any {
+	switch v := value.(type) {
+	case float64:
+		if v == math.Trunc(v) && math.Abs(v) <= maxExactFloatInteger {
+			return int64(v)
+		}
+		return v
+	case map[string]any:
+		return canonicalAgentAppearance(v)
+	case []any:
+		for index := range v {
+			v[index] = canonicalAppearanceNumber(v[index])
+		}
+		return v
+	default:
+		return value
+	}
+}
+
+// maxExactFloatInteger is the largest integer a float64 holds exactly (2^53).
+const maxExactFloatInteger = 1 << 53
+
+func sortedAgentDefinitionAtoms(values []string) []string {
+	atoms := trimAgentDefinitionAtoms(values)
+	slices.Sort(atoms)
+	return slices.Compact(atoms)
+}
+
+func trimAgentDefinitionAtoms(values []string) []string {
+	atoms := make([]string, 0, len(values))
+	for _, value := range values {
+		trimmed := strings.TrimSpace(value)
+		if trimmed == "" {
+			continue
+		}
+		atoms = append(atoms, trimmed)
+	}
+	return atoms
+}

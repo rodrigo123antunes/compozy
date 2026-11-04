@@ -1,0 +1,68 @@
+package task
+
+import (
+	"encoding/json"
+	"errors"
+	"fmt"
+	"strings"
+)
+
+func nextRunAttempt(runs []Run) int {
+	maxAttempt := 0
+	for _, run := range runs {
+		maxAttempt = max(maxAttempt, int(run.Attempt))
+	}
+	return maxAttempt + 1
+}
+
+func errorsJoin(errs ...error) error {
+	return errors.Join(errs...)
+}
+
+func runBootRecoveryError(run Run, recovery RunBootRecovery) string {
+	sessionID := strings.TrimSpace(run.SessionID)
+	switch {
+	case sessionID != "" && recovery.Classification != "" && recovery.Detail != "":
+		return fmt.Sprintf(
+			"orphaned on boot: session %q classified as %s (%s)",
+			sessionID,
+			recovery.Classification,
+			recovery.Detail,
+		)
+	case sessionID != "" && recovery.Classification != "":
+		return fmt.Sprintf(
+			"orphaned on boot: session %q classified as %s",
+			sessionID,
+			recovery.Classification,
+		)
+	case sessionID != "" && recovery.SessionState != "":
+		return fmt.Sprintf("orphaned on boot: session %q is %s", sessionID, recovery.SessionState)
+	case sessionID != "":
+		return fmt.Sprintf("orphaned on boot: session %q is not live", sessionID)
+	default:
+		return "orphaned on boot: run has no live session"
+	}
+}
+
+func runBootRecoveryMetadata(run Run, recovery RunBootRecovery) (json.RawMessage, error) {
+	payload, err := marshalTaskEventPayload(map[string]string{
+		runBootRecoveryReasonKey: normalizedBootRecoveryReason(recovery.Reason),
+		"previous_status":        run.Status.Normalize().String(),
+		sessionEvidenceIDKey:     strings.TrimSpace(run.SessionID),
+		"session_state":          strings.TrimSpace(recovery.SessionState),
+		"classification":         strings.TrimSpace(recovery.Classification),
+		"detail":                 strings.TrimSpace(recovery.Detail),
+	})
+	if err != nil {
+		return nil, fmt.Errorf("task: marshal boot recovery metadata: %w", err)
+	}
+	return payload, nil
+}
+
+func normalizedBootRecoveryReason(reason string) string {
+	trimmed := strings.TrimSpace(reason)
+	if trimmed == "" {
+		return managerOrphanedOnBootKey
+	}
+	return trimmed
+}

@@ -1,0 +1,414 @@
+package providers
+
+import (
+	"context"
+	"encoding/json"
+	"maps"
+	"strings"
+	"sync"
+	"time"
+
+	compozyconfig "github.com/compozy/compozy/internal/config"
+	diagcontract "github.com/compozy/compozy/internal/diagnosticcontract"
+)
+
+const (
+	defaultPreStartCacheTTL      = 30 * time.Second
+	defaultPreStartCacheCapacity = 128
+)
+
+// PreStarter owns a bounded cache of provider pre-start probe reports for one
+// daemon composition. Entries use LRU eviction; ties are resolved by the
+// explicit comparable key order so eviction stays deterministic.
+type PreStarter struct {
+	mu                  sync.Mutex
+	entries             map[preStartCacheKey]preStartCacheEntry
+	now                 func() time.Time
+	ttl                 time.Duration
+	capacity            int
+	access              uint64
+	generation          uint64
+	cacheKey            preStartCacheHMACKey
+	cacheReady          bool
+	profileAvailability ProfileAvailabilityChecker
+	verdicts            *AuthVerdicts
+}
+
+type preStartCacheEntry struct {
+	report    PreStartReport
+	expiresAt time.Time
+	usedAt    uint64
+}
+
+type preStartCacheCandidate struct {
+	key   preStartCacheKey
+	entry preStartCacheEntry
+}
+
+// PreStarterOption configures one PreStarter.
+type PreStarterOption func(*PreStarter)
+
+// WithAuthVerdicts records every live status-command verdict a pre-start probe produces.
+func WithAuthVerdicts(verdicts *AuthVerdicts) PreStarterOption {
+	return func(starter *PreStarter) {
+		starter.verdicts = verdicts
+	}
+}
+
+// NewPreStarter constructs an isolated pre-start probe cache for one daemon.
+func NewPreStarter(options ...PreStarterOption) *PreStarter {
+	return newPreStarter(options...)
+}
+
+// newPreStarter applies internal cache policy overrides for package tests.
+func newPreStarter(options ...PreStarterOption) *PreStarter {
+	starter := &PreStarter{
+		entries:  make(map[preStartCacheKey]preStartCacheEntry),
+		now:      time.Now,
+		ttl:      defaultPreStartCacheTTL,
+		capacity: defaultPreStartCacheCapacity,
+	}
+	starter.cacheKey, starter.cacheReady = newPreStartCacheHMACKey()
+	for _, option := range options {
+		if option != nil {
+			option(starter)
+		}
+	}
+	if starter.now == nil {
+		starter.now = time.Now
+	}
+	if starter.ttl <= 0 {
+		starter.ttl = defaultPreStartCacheTTL
+	}
+	if starter.capacity <= 0 {
+		starter.capacity = defaultPreStartCacheCapacity
+	}
+	return starter
+}
+
+// PreStart classifies provider-auth readiness before a provider subprocess is
+// spawned. It caches only final, explicitly scoped probe results.
+func (s *PreStarter) PreStart(
+	ctx context.Context,
+	provider compozyconfig.ProviderConfig,
+	env *ProbeEnv,
+) PreStartReport {
+	normalized := env.Normalize()
+	if err := s.checkProfileAvailability(ctx, &normalized); err != nil {
+		return preStartErrorReport(&normalized, err)
+	}
+	if s == nil || !preStartContextCacheable(ctx) {
+		return runPreStart(ctx, provider, &normalized, s.authVerdicts())
+	}
+	key, cacheable := s.newPreStartCacheKey(provider, &normalized)
+	if !cacheable {
+		return runPreStart(ctx, provider, &normalized, s.authVerdicts())
+	}
+
+	now := s.now()
+	s.mu.Lock()
+	s.deleteExpiredLocked(now)
+	if entry, ok := s.entries[key]; ok {
+		entry.usedAt = s.nextAccessLocked()
+		s.entries[key] = entry
+		report, cloneable := clonePreStartReport(entry.report)
+		s.mu.Unlock()
+		if cloneable {
+			return report
+		}
+		return runPreStart(ctx, provider, &normalized, s.authVerdicts())
+	}
+	generation := s.generation
+	s.mu.Unlock()
+
+	report := runPreStart(ctx, provider, &normalized, s.authVerdicts())
+	if !preStartContextCacheable(ctx) || !preStartReportSafeForCache(report, provider, &normalized) {
+		return report
+	}
+	cachedReport, cloneable := clonePreStartReport(report)
+	if !cloneable {
+		return report
+	}
+
+	now = s.now()
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.deleteExpiredLocked(now)
+	if generation != s.generation || !preStartContextCacheable(ctx) {
+		return cachedReport
+	}
+	s.entries[key] = preStartCacheEntry{
+		report:    cachedReport,
+		expiresAt: now.Add(s.ttl),
+		usedAt:    s.nextAccessLocked(),
+	}
+	s.evictOverflowLocked()
+	returned, returnedCloneable := clonePreStartReport(cachedReport)
+	if !returnedCloneable {
+		return report
+	}
+	return returned
+}
+
+func (s *PreStarter) authVerdicts() *AuthVerdicts {
+	if s == nil {
+		return nil
+	}
+	return s.verdicts
+}
+
+// Clear drops every cached report owned by this starter. The generation prevents
+// a probe that began before Clear from repopulating the new configuration cache.
+func (s *PreStarter) Clear() {
+	if s == nil {
+		return
+	}
+	s.mu.Lock()
+	s.clearLocked()
+	s.mu.Unlock()
+}
+
+func withPreStartCacheTTL(ttl time.Duration) PreStarterOption {
+	return func(starter *PreStarter) {
+		starter.ttl = ttl
+	}
+}
+
+func withPreStartCacheCapacity(capacity int) PreStarterOption {
+	return func(starter *PreStarter) {
+		starter.capacity = capacity
+	}
+}
+
+func withPreStartClock(now func() time.Time) PreStarterOption {
+	return func(starter *PreStarter) {
+		starter.now = now
+	}
+}
+
+func preStartContextCacheable(ctx context.Context) bool {
+	return ctx != nil && ctx.Err() == nil && context.Cause(ctx) == nil
+}
+
+func (s *PreStarter) deleteExpiredLocked(now time.Time) {
+	maps.DeleteFunc(s.entries, func(_ preStartCacheKey, entry preStartCacheEntry) bool {
+		return !now.Before(entry.expiresAt)
+	})
+}
+
+func (s *PreStarter) nextAccessLocked() uint64 {
+	if s.access == ^uint64(0) {
+		s.rebaseAccessOrderLocked()
+	}
+	s.access++
+	return s.access
+}
+
+func (s *PreStarter) rebaseAccessOrderLocked() {
+	entries := make([]preStartCacheCandidate, 0, len(s.entries))
+	for key, entry := range s.entries {
+		entries = append(entries, preStartCacheCandidate{key: key, entry: entry})
+	}
+	for index := range entries {
+		for next := index + 1; next < len(entries); next++ {
+			if preStartEntryLess(entries[next], entries[index]) {
+				entries[index], entries[next] = entries[next], entries[index]
+			}
+		}
+	}
+	for index, item := range entries {
+		item.entry.usedAt = uint64(index + 1)
+		s.entries[item.key] = item.entry
+	}
+	s.access = uint64(len(entries))
+}
+
+func (s *PreStarter) evictOverflowLocked() {
+	for len(s.entries) > s.capacity {
+		var victim preStartCacheCandidate
+		found := false
+		for key, entry := range s.entries {
+			candidate := preStartCacheCandidate{key: key, entry: entry}
+			if !found || preStartEntryLess(candidate, victim) {
+				victim = candidate
+				found = true
+			}
+		}
+		delete(s.entries, victim.key)
+	}
+}
+
+func preStartEntryLess(left preStartCacheCandidate, right preStartCacheCandidate) bool {
+	if left.entry.usedAt != right.entry.usedAt {
+		return left.entry.usedAt < right.entry.usedAt
+	}
+	return preStartCacheKeyLess(left.key, right.key)
+}
+
+func clonePreStartReport(report PreStartReport) (PreStartReport, bool) {
+	if report.Cause != nil {
+		return PreStartReport{}, false
+	}
+	if report.Item == nil {
+		return PreStartReport{}, true
+	}
+	item := *report.Item
+	evidence, cloneable := clonePreStartEvidence(item.Evidence)
+	if !cloneable {
+		return PreStartReport{}, false
+	}
+	item.Evidence = evidence
+	return PreStartReport{Item: &item}, true
+}
+
+func preStartReportSafeForCache(
+	report PreStartReport,
+	provider compozyconfig.ProviderConfig,
+	env *ProbeEnv,
+) bool {
+	if report.Cause != nil {
+		return false
+	}
+	if report.Item == nil {
+		return true
+	}
+	for _, value := range preStartSensitiveInputs(provider, env) {
+		if value != "" && preStartReportContains(report.Item, value) {
+			return false
+		}
+	}
+	return true
+}
+
+func preStartSensitiveInputs(provider compozyconfig.ProviderConfig, env *ProbeEnv) []string {
+	launchResolution := env.launchResolution()
+	values := []string{
+		strings.TrimSpace(provider.Command),
+		strings.TrimSpace(provider.AuthStatusCmd),
+		strings.TrimSpace(provider.AuthLoginCmd),
+		launchResolution.ResolvedExecutable(),
+		authStatusCommandExecutable(env),
+	}
+	for _, slot := range provider.EffectiveCredentialSlots() {
+		values = append(values, strings.TrimSpace(slot.SecretRef))
+	}
+	for _, entry := range env.CommandEnv {
+		_, value, ok := strings.Cut(entry, "=")
+		if ok && strings.TrimSpace(value) != "" {
+			values = append(values, value)
+		}
+	}
+	return values
+}
+
+func preStartReportContains(item *diagcontract.DiagnosticItem, value string) bool {
+	if item == nil {
+		return false
+	}
+	for _, field := range []string{
+		item.ID,
+		item.Code,
+		item.Severity,
+		item.Category,
+		item.Title,
+		item.Message,
+		item.SuggestedCommand,
+		item.DocURL,
+		item.DataFreshness,
+	} {
+		if strings.Contains(field, value) {
+			return true
+		}
+	}
+	return preStartEvidenceContains(item.Evidence, value)
+}
+
+func preStartEvidenceContains(evidence map[string]any, value string) bool {
+	for key, nested := range evidence {
+		if strings.Contains(key, value) || preStartEvidenceValueContains(nested, value) {
+			return true
+		}
+	}
+	return false
+}
+
+func preStartEvidenceValueContains(nested any, value string) bool {
+	switch typed := nested.(type) {
+	case string:
+		return strings.Contains(typed, value)
+	case []byte:
+		return strings.Contains(string(typed), value)
+	case json.RawMessage:
+		return strings.Contains(string(typed), value)
+	case []string:
+		for _, item := range typed {
+			if strings.Contains(item, value) {
+				return true
+			}
+		}
+	case []any:
+		for _, item := range typed {
+			if preStartEvidenceValueContains(item, value) {
+				return true
+			}
+		}
+	case map[string]any:
+		return preStartEvidenceContains(typed, value)
+	case map[string]string:
+		for key, item := range typed {
+			if strings.Contains(key, value) || strings.Contains(item, value) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+func clonePreStartEvidence(evidence map[string]any) (map[string]any, bool) {
+	if len(evidence) == 0 {
+		return nil, true
+	}
+	cloned := make(map[string]any, len(evidence))
+	for key, value := range evidence {
+		copyValue, cloneable := clonePreStartEvidenceValue(value)
+		if !cloneable {
+			return nil, false
+		}
+		cloned[key] = copyValue
+	}
+	return cloned, true
+}
+
+func clonePreStartEvidenceValue(value any) (any, bool) {
+	switch typed := value.(type) {
+	case nil, string, bool,
+		int, int8, int16, int32, int64,
+		uint, uint8, uint16, uint32, uint64,
+		float32, float64, json.Number, time.Time:
+		return typed, true
+	case []byte:
+		return append([]byte(nil), typed...), true
+	case json.RawMessage:
+		return append(json.RawMessage(nil), typed...), true
+	case []string:
+		return append([]string(nil), typed...), true
+	case []any:
+		cloned := make([]any, len(typed))
+		for index, nested := range typed {
+			copyValue, cloneable := clonePreStartEvidenceValue(nested)
+			if !cloneable {
+				return nil, false
+			}
+			cloned[index] = copyValue
+		}
+		return cloned, true
+	case map[string]any:
+		return clonePreStartEvidence(typed)
+	case map[string]string:
+		cloned := make(map[string]string, len(typed))
+		maps.Copy(cloned, typed)
+		return cloned, true
+	default:
+		return nil, false
+	}
+}

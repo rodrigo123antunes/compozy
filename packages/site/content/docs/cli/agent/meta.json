@@ -1,0 +1,19 @@
+{
+    "title": "Agent",
+    "pages": [
+        "index",
+        "activity",
+        "create",
+        "delete",
+        "draft",
+        "duplicate",
+        "info",
+        "list",
+        "update",
+        "heartbeat",
+        "instance",
+        "memory",
+        "skill",
+        "soul"
+    ]
+}

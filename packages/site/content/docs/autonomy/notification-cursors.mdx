@@ -1,0 +1,32 @@
+---
+title: Task Event Cursors
+description: Durable task-status projection progress and reconnecting task event streams.
+---
+
+Task events remain the source for status projections and live updates. A consumer cursor records how
+far one projection has processed the durable event stream. It does not grant task or run authority.
+
+## Projection progress
+
+The runtime retains `notification_cursors` for the task-status projection. Its consumer identity,
+stream, subject, and sequence isolate independent projections. Advancing a cursor never claims a
+run, changes a lease, completes a task, or submits a review verdict.
+
+## SSE resume seeding
+
+Event-bearing task list, detail, and dashboard payloads include `latest_event_seq`, the maximum
+durable task-event sequence for the task, or `0` when there are no events. Clients open
+`/api/tasks/{id}/stream?after_sequence=<latest_event_seq>` from the rendered read payload to cover
+events that arrive between the initial read and stream subscription.
+
+The endpoint emits standard SSE `message` frames. Parse each frame's JSON and dispatch on its
+`type` field. On reconnect, `Last-Event-ID` takes precedence over `after_sequence`, including the
+literal value `0`. An invalid `Last-Event-ID` is rejected rather than replaced with the query value.
+
+`latest_event_seq` is a read projection, separate from the stored projection cursor. Inspect the
+stream state from the task's **Inspect → Stream** pane.
+
+## Related pages
+
+- [Task Runs and Leases](/docs/autonomy/task-runs-and-leases)
+- [Review Gate](/docs/autonomy/review-gate)

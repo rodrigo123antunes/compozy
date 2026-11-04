@@ -1,0 +1,3498 @@
+package extensionpkg
+
+import (
+	"bufio"
+	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"maps"
+	"os"
+	"path/filepath"
+	"slices"
+	"strings"
+	"sync"
+	"testing"
+	"time"
+
+	extensioncontract "github.com/compozy/compozy/internal/extension/contract"
+	extensionprotocol "github.com/compozy/compozy/internal/extensionprotocol"
+	"github.com/compozy/compozy/internal/fileutil"
+	hookspkg "github.com/compozy/compozy/internal/hooks"
+	"github.com/compozy/compozy/internal/modelcatalog"
+	"github.com/compozy/compozy/internal/resources"
+	skillspkg "github.com/compozy/compozy/internal/skills"
+	"github.com/compozy/compozy/internal/store"
+	"github.com/compozy/compozy/internal/subprocess"
+	"github.com/compozy/compozy/internal/testutil"
+	"github.com/compozy/compozy/internal/toolruntime"
+	toolspkg "github.com/compozy/compozy/internal/tools"
+	workspacepkg "github.com/compozy/compozy/internal/workspace"
+)
+
+const (
+	extensionHelperEnvKey      = "COMPOZY_TEST_EXTENSION_HELPER"
+	extensionHelperScenarioKey = "COMPOZY_TEST_EXTENSION_SCENARIO"
+	extensionHelperMarkerKey   = "COMPOZY_TEST_EXTENSION_MARKER"
+)
+
+func TestExtensionManagerHelperProcess(_ *testing.T) {
+	if os.Getenv(extensionHelperEnvKey) != "1" {
+		return
+	}
+
+	server := newExtensionHelperServer(
+		os.Getenv(extensionHelperScenarioKey),
+		strings.TrimSpace(os.Getenv(extensionHelperMarkerKey)),
+	)
+	os.Exit(server.run())
+}
+
+func TestManagerStartRegistersResourcesAndActivatesExtension(t *testing.T) {
+	t.Parallel()
+
+	withDaemonVersion(t, "0.5.0")
+	env := newRegistryTestEnv(t)
+	fixture := createManagerTestExtension(t, managerTestManifest("ext-runtime", managerManifestOptions{
+		command:      "fake-extension",
+		withSkills:   true,
+		withAgents:   true,
+		withHooks:    true,
+		withMCP:      true,
+		capabilities: []string{"tool.provider"},
+		permissions:  []string{"sessions/list"},
+	}), map[string]string{
+		"skills/ext-review/SKILL.md": managerSkillFile("ext-review", "External review workflow"),
+		"agents/coder/AGENT.md":      managerAgentFile("ext-agent"),
+	})
+	installManagerFixture(t, env.registry, fixture, SourceUser, true)
+
+	fakeProc := newFakeProcess(101)
+	launcher := &fakeLauncher{queue: []*fakeProcess{fakeProc}}
+	processRegistry := toolruntime.NewRegistry(toolruntime.NewMemoryStore())
+
+	manager := NewManager(
+		env.registry,
+		WithHostMethodHandler("sessions/list", func(_ context.Context, _ json.RawMessage) (any, error) {
+			return []map[string]string{{"id": "sess-1"}}, nil
+		}),
+		WithHealthCheckTimeout(20*time.Millisecond),
+		WithDefaultHookTimeout(25*time.Millisecond),
+		withProcessLauncher(launcher.launch),
+		withHealthPollBounds(time.Millisecond, 2*time.Millisecond),
+		WithProcessRegistry(processRegistry),
+	)
+
+	if err := manager.Start(testutil.Context(t)); err != nil {
+		t.Fatalf("Start() error = %v", err)
+	}
+	t.Cleanup(func() {
+		if err := manager.Stop(testutil.Context(t)); err != nil {
+			t.Fatalf("Stop() cleanup error = %v", err)
+		}
+	})
+
+	if got := launcher.launchCount(); got != 1 {
+		t.Fatalf("launch count = %d, want 1", got)
+	}
+	launcher.mu.Lock()
+	launchConfig := launcher.config[0]
+	launcher.mu.Unlock()
+	if launchConfig.ProcessRegistry != processRegistry {
+		t.Fatalf("LaunchConfig.ProcessRegistry = %p, want %p", launchConfig.ProcessRegistry, processRegistry)
+	}
+	if launchConfig.ProcessRecord.Source != toolruntime.ProcessSourceExtension ||
+		launchConfig.ProcessRecord.Owner.ExtensionName != "ext-runtime" {
+		t.Fatalf("LaunchConfig.ProcessRecord = %#v, want extension ownership", launchConfig.ProcessRecord)
+	}
+	if len(fakeProc.initRequests()) != 1 {
+		t.Fatalf("len(initialize requests) = %d, want 1", len(fakeProc.initRequests()))
+	}
+
+	request := fakeProc.initRequests()[0]
+	if request.ProtocolVersion != defaultProtocolVersion {
+		t.Fatalf("initialize protocol version = %q, want %q", request.ProtocolVersion, defaultProtocolVersion)
+	}
+	if strings.TrimSpace(request.SessionNonce) == "" {
+		t.Fatal("initialize session nonce = empty, want daemon-issued nonce")
+	}
+	if !slices.Equal(request.Capabilities.GrantedPermissions, []extensionprotocol.HostAPIMethod{
+		extensionprotocol.HostAPIMethodSessionsList,
+	}) {
+		t.Fatalf("initialize granted permissions = %#v, want [sessions/list]", request.Capabilities.GrantedPermissions)
+	}
+	if !slices.Equal(request.Methods.ExtensionServices, []string{"provide_tools", "tools/call"}) {
+		t.Fatalf("initialize extension services = %#v, want tool provider methods", request.Methods.ExtensionServices)
+	}
+
+	decls, err := manager.HookDeclarationsForProfiles(testutil.Context(t), []ProfileLens{{
+		ID: store.DefaultProfileID, Name: "default",
+	}})
+	if err != nil {
+		t.Fatalf("HookDeclarationsForProfiles() error = %v", err)
+	}
+	if len(decls) != 1 {
+		t.Fatalf("len(HookDeclarationsForProfiles()) = %d, want 1", len(decls))
+	}
+	if got, want := decls[0].Name, "ext-runtime-hook"; got != want {
+		t.Fatalf("HookDeclarations()[0].Name = %q, want %q", got, want)
+	}
+	if got, want := decls[0].Source, hookspkg.HookSourceExtension; got != want {
+		t.Fatalf("HookDeclarations()[0].Source = %q, want %q", got, want)
+	}
+	if got, want := decls[0].Priority, int32(300); got != want {
+		t.Fatalf("HookDeclarations()[0].Priority = %d, want %d", got, want)
+	}
+	if got, want := decls[0].Metadata["extension"], "ext-runtime"; got != want {
+		t.Fatalf("HookDeclarations()[0].Metadata[extension] = %q, want %q", got, want)
+	}
+
+	agents := manager.AgentDefinitions()
+	if len(agents) != 1 || agents[0].Name != "ext-agent" {
+		t.Fatalf("AgentDefinitions() = %#v, want ext-agent", agents)
+	}
+
+	loaded, err := manager.Get("ext-runtime")
+	if err != nil {
+		t.Fatalf("Get(ext-runtime) error = %v", err)
+	}
+	if len(loaded.Skills) != 1 || loaded.Skills[0].Meta.Name != "ext-review" {
+		t.Fatalf("Get(ext-runtime).Skills = %#v, want ext-review extension snapshot", loaded.Skills)
+	}
+	if got, want := loaded.Skills[0].InstalledFromExtension, "ext-runtime"; got != want {
+		t.Fatalf("Get(ext-runtime).Skills[0].InstalledFromExtension = %q, want %q", got, want)
+	}
+	if !loaded.Status.Active {
+		t.Fatalf("Get(ext-runtime).Status.Active = false, want true")
+	}
+	if loaded.Manifest == nil || loaded.Manifest.Resources.MCPServers["kubectl"].Command == "" {
+		t.Fatalf(
+			"Get(ext-runtime).Manifest.Resources.MCPServers = %#v, want kubectl manifest declaration",
+			loaded.Manifest,
+		)
+	}
+	if got, want := loaded.Status.Phase, ExtensionPhaseActivate; got != want {
+		t.Fatalf("Get(ext-runtime).Status.Phase = %q, want %q", got, want)
+	}
+}
+
+func TestManagerProfileRuntimeIsolation(t *testing.T) {
+	t.Parallel()
+	t.Run("Should run all-profile workspace installations through restart", func(t *testing.T) {
+		t.Parallel()
+		testInstalledWorkspaceRuntimeLifecycle(t)
+	})
+	// Invariant: each explicit profile installation, including default, runs
+	// under its own profile/workspace ceiling and can restart without a global base process.
+	// Owner: extension runtime lifecycle; canonical suite: manager profile isolation.
+	t.Run("Should start and restart explicit profile installations with real subprocesses", func(t *testing.T) {
+		t.Parallel()
+		testInstalledProfileRuntimeLifecycle(t, "")
+	})
+	t.Run(
+		"Should start and restart workspace profile installations without exposing a global runtime",
+		func(t *testing.T) {
+			t.Parallel()
+			testInstalledProfileRuntimeLifecycle(t, "ws-profile-runtime")
+		},
+	)
+
+	withDaemonVersion(t, "0.5.0")
+	env := newRegistryTestEnv(t)
+	fixture := createManagerTestExtension(t, managerTestManifest("ext-profile-secret", managerManifestOptions{
+		command:      "fake-extension",
+		requiresEnv:  []string{"BOUND_SECRET"},
+		capabilities: []string{extensionprotocol.CapabilityToolProvider},
+	}), nil)
+	installManagerFixture(t, env.registry, fixture, SourceUser, true)
+	bindings := &envResolutionBindingStore{bindings: map[string][]EnvBinding{
+		envResolutionBindingKey(fixture.manifest.Name, "", ""): {{
+			ExtensionName: fixture.manifest.Name,
+			EnvName:       "BOUND_SECRET",
+			SecretRef:     "vault:shared",
+		}},
+		envResolutionBindingKey(fixture.manifest.Name, "profile-marketing", ""): {{
+			ExtensionName: fixture.manifest.Name,
+			ProfileID:     "profile-marketing",
+			EnvName:       "BOUND_SECRET",
+			SecretRef:     "vault:marketing",
+		}},
+	}}
+	launcher := &fakeLauncher{queue: []*fakeProcess{
+		newFakeProcess(101), newFakeProcess(202), newFakeProcess(303),
+	}}
+	manager := NewManager(
+		env.registry,
+		WithEnvBindingStore(bindings),
+		WithSecretResolver(envResolutionSecretResolver{values: map[string]string{
+			"vault:shared":            "shared-value",
+			"vault:marketing":         "marketing-value",
+			"vault:marketing-updated": "updated-marketing-value",
+		}}),
+		WithProfileNameResolver(fixedProfileNameResolver{"profile-marketing": "marketing"}),
+		withProcessLauncher(launcher.launch),
+	)
+	if err := manager.Start(testutil.Context(t)); err != nil {
+		t.Fatalf("Start() error = %v", err)
+	}
+	t.Cleanup(func() {
+		if err := manager.Stop(testutil.Context(t)); err != nil {
+			t.Fatalf("Stop() cleanup error = %v", err)
+		}
+	})
+
+	profileKey := ProfileInstanceKey(fixture.manifest.Name, "profile-marketing", "")
+	if _, err := manager.ProvideToolsForInstance(testutil.Context(t), profileKey); err != nil {
+		t.Fatalf("ProvideToolsForInstance(marketing) error = %v", err)
+	}
+	launcher.mu.Lock()
+	configs := slices.Clone(launcher.config)
+	launcher.mu.Unlock()
+	if len(configs) != 2 {
+		t.Fatalf("launch configs = %d, want base and marketing runtimes", len(configs))
+	}
+	if got := launchEnvValue(configs[0].Env, "BOUND_SECRET"); got != "shared-value" {
+		t.Fatalf("default runtime BOUND_SECRET = %q, want shared-value", got)
+	}
+	if got := launchEnvValue(configs[1].Env, "BOUND_SECRET"); got != "marketing-value" {
+		t.Fatalf("marketing runtime BOUND_SECRET = %q, want marketing-value", got)
+	}
+	if configs[0].ProcessRecord.Owner.ExtensionName == configs[1].ProcessRecord.Owner.ExtensionName {
+		t.Fatalf("runtime owners = %q, want profile-specific identity", configs[0].ProcessRecord.Owner.ExtensionName)
+	}
+
+	bindings.bindings[envResolutionBindingKey(fixture.manifest.Name, "profile-marketing", "")][0].SecretRef =
+		"vault:marketing-updated"
+	if err := manager.InvalidateProfileRuntime(testutil.Context(t), profileKey); err != nil {
+		t.Fatalf("InvalidateProfileRuntime(marketing) error = %v", err)
+	}
+	if _, err := manager.ProvideToolsForInstance(testutil.Context(t), profileKey); err != nil {
+		t.Fatalf("ProvideToolsForInstance(updated marketing) error = %v", err)
+	}
+	launcher.mu.Lock()
+	configs = slices.Clone(launcher.config)
+	launcher.mu.Unlock()
+	if len(configs) != 3 {
+		t.Fatalf("launch configs after binding update = %d, want three", len(configs))
+	}
+	if got := launchEnvValue(configs[2].Env, "BOUND_SECRET"); got != "updated-marketing-value" {
+		t.Fatalf("updated marketing runtime BOUND_SECRET = %q, want updated-marketing-value", got)
+	}
+}
+
+func testInstalledWorkspaceRuntimeLifecycle(t *testing.T) {
+	t.Helper()
+	withDaemonVersion(t, "0.5.0")
+	env := newRegistryTestEnv(t)
+	profileID := insertActiveRegistryProfile(t, env, "marketing")
+	const workspaceID = "ws-all-profiles"
+	if _, err := env.db.ExecContext(t.Context(), `INSERT INTO workspaces
+ (id, root_dir, name, created_at, updated_at) VALUES (?, ?, ?, ?, ?)`, workspaceID, t.TempDir(), "Runtime scope",
+		store.FormatTimestamp(env.installedAt), store.FormatTimestamp(env.installedAt)); err != nil {
+		t.Fatal(err)
+	}
+	fixture := createManagerTestExtension(t, managerTestManifest("workspace-runtime", managerManifestOptions{
+		command: helperCommand(t), args: helperArgs(), withEnv: helperEnv("default", ""),
+		capabilities:     []string{extensionprotocol.CapabilityToolProvider},
+		resourceFamilies: []string{"tools"}, resourceMaxScope: "user",
+	}), nil)
+	if err := env.registry.Install(fixture.manifest, fixture.dir, fixture.checksum, WithInstallScope(
+		InstallationScope{WorkspaceID: workspaceID},
+	)); err != nil {
+		t.Fatal(err)
+	}
+	manager := NewManager(env.registry, WithProfileNameResolver(fixedProfileNameResolver{
+		profileID: "marketing", store.DefaultProfileID: "default",
+	}))
+	if err := manager.Start(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		ctx, cancel := context.WithTimeout(context.WithoutCancel(t.Context()), 10*time.Second)
+		defer cancel()
+		if err := manager.Stop(ctx); err != nil {
+			t.Error(err)
+		}
+	})
+	key := InstanceKey{Name: fixture.manifest.Name, WorkspaceID: workspaceID}
+	initial, err := manager.GetForInstance(key)
+	if err != nil || !initial.Status.Active || initial.Status.PID == 0 || initial.DevLink != nil ||
+		initial.Status.WorkspaceID != workspaceID ||
+		!slices.Contains(initial.GrantedResourceScopes, resources.ResourceScopeKindWorkspace) ||
+		slices.Contains(initial.GrantedResourceScopes, resources.ResourceScopeKindUser) {
+		t.Fatalf("workspace runtime = %#v, %v", initial, err)
+	}
+	for _, id := range []string{store.DefaultProfileID, profileID} {
+		view := ProfileInstanceKey(key.Name, id, workspaceID)
+		tools, err := manager.ProvideToolsForInstance(t.Context(), view)
+		if err != nil || len(tools) != 1 {
+			t.Fatalf("workspace profile %s tools = %#v, %v", id, tools, err)
+		}
+		if id != store.DefaultProfileID {
+			profile, err := manager.GetForInstance(view)
+			if err != nil || !profile.Status.Active || profile.Status.PID == 0 ||
+				profile.Status.PID == initial.Status.PID ||
+				!slices.Contains(profile.GrantedResourceScopes, resources.ResourceScopeKindWorkspaceProfile) ||
+				slices.Contains(profile.GrantedResourceScopes, resources.ResourceScopeKindWorkspace) {
+				t.Fatalf("isolated workspace profile runtime = %#v, %v", profile, err)
+			}
+		}
+		logs, err := manager.Logs(view, ExtensionLogCursor{})
+		if err != nil || logs.StreamEpoch == "" {
+			t.Fatalf("workspace profile %s logs = %#v, %v", id, logs, err)
+		}
+	}
+	for _, other := range []string{"", "other-workspace"} {
+		if _, err := manager.GetForInstance(
+			InstanceKey{Name: key.Name, WorkspaceID: other},
+		); !errors.Is(
+			err,
+			ErrExtensionNotFound,
+		) {
+			t.Fatalf("workspace runtime leaked into %q: %v", other, err)
+		}
+	}
+	if err := manager.Reload(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	restarted, err := manager.GetForInstance(key)
+	if err != nil || !restarted.Status.Active || restarted.Status.PID == 0 ||
+		restarted.Status.PID == initial.Status.PID || restarted.DevLink != nil {
+		t.Fatalf("workspace restart = %#v, %v", restarted, err)
+	}
+}
+
+func testInstalledProfileRuntimeLifecycle(t *testing.T, workspaceID string) {
+	t.Helper()
+	withDaemonVersion(t, "0.5.0")
+	env := newRegistryTestEnv(t)
+	profileID := insertActiveRegistryProfile(t, env, "marketing")
+	workspaceRoot := t.TempDir()
+	if workspaceID != "" {
+		if _, err := env.db.ExecContext(t.Context(), `INSERT INTO workspaces
+ (id, root_dir, name, created_at, updated_at) VALUES (?, ?, ?, ?, ?)`, workspaceID, workspaceRoot, "Runtime scope",
+			store.FormatTimestamp(env.installedAt), store.FormatTimestamp(env.installedAt)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	fixture := createManagerTestExtension(t, managerTestManifest("installed-profile-runtime", managerManifestOptions{
+		command: helperCommand(t), args: helperArgs(), withEnv: helperEnv("default", ""),
+		capabilities:     []string{extensionprotocol.CapabilityToolProvider},
+		resourceFamilies: []string{"tools"}, resourceMaxScope: "user",
+	}), nil)
+	if err := env.registry.Install(fixture.manifest, fixture.dir, fixture.checksum, WithInstallScope(
+		InstallationScope{ProfileID: profileID, WorkspaceID: workspaceID},
+	)); err != nil {
+		t.Fatal(err)
+	}
+	if err := env.registry.AttachInstallation(t.Context(), fixture.manifest.Name, InstallationScope{
+		ProfileID: store.DefaultProfileID, WorkspaceID: workspaceID,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	manager := NewManager(env.registry, WithProfileNameResolver(fixedProfileNameResolver{
+		profileID: "marketing", store.DefaultProfileID: "default",
+	}))
+	if workspaceID != "" {
+		WithWorkspaceResolver(newHostAPIFakeWorkspaceResolver(&workspacepkg.ResolvedWorkspace{
+			ID: workspaceID, RootDir: workspaceRoot,
+		}))(manager)
+	}
+	if err := manager.Start(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		ctx, cancel := context.WithTimeout(context.WithoutCancel(t.Context()), 10*time.Second)
+		defer cancel()
+		if err := manager.Stop(ctx); err != nil {
+			t.Error(err)
+		}
+	})
+	if global := manager.Statuses(); len(global) != 1 || global[0].Registered || global[0].PID != 0 {
+		t.Fatalf("global package state = %#v, want no unqualified runtime", global)
+	}
+	if workspaceID != "" {
+		for _, otherWorkspace := range []string{"", "unrelated-workspace"} {
+			if _, err := manager.GetForInstance(ProfileInstanceKey(
+				fixture.manifest.Name, profileID, otherWorkspace,
+			)); !errors.Is(err, ErrExtensionNotFound) {
+				t.Fatalf("workspace installation visible in %q: %v", otherWorkspace, err)
+			}
+		}
+	}
+	pids := map[string]int{}
+	streams := map[string]string{}
+	for _, id := range []string{store.DefaultProfileID, profileID} {
+		view := ProfileInstanceKey(fixture.manifest.Name, id, workspaceID)
+		snapshot, err := manager.GetForInstance(view)
+		if err != nil || !snapshot.Status.Active || !snapshot.Status.Registered || snapshot.Status.PID == 0 {
+			t.Fatalf("profile %q startup = %#v, %v", id, snapshot, err)
+		}
+		ceiling := resources.ResourceScopeKindProfile
+		if workspaceID != "" {
+			ceiling = resources.ResourceScopeKindWorkspaceProfile
+		}
+		if !slices.Contains(snapshot.GrantedResourceScopes, ceiling) ||
+			slices.Contains(snapshot.GrantedResourceScopes, resources.ResourceScopeKindUser) {
+			t.Fatalf("profile %q resource ceiling = %#v", id, snapshot.GrantedResourceScopes)
+		}
+		pids[id] = snapshot.Status.PID
+		logs, err := manager.Logs(view, ExtensionLogCursor{})
+		if err != nil {
+			t.Fatal(err)
+		}
+		exactLogs, err := manager.Logs(InstanceKey{
+			Name: fixture.manifest.Name, ProfileID: id, WorkspaceID: workspaceID,
+		}, ExtensionLogCursor{})
+		if err != nil || logs.StreamEpoch == "" || logs.StreamEpoch != exactLogs.StreamEpoch {
+			t.Fatalf("profile %q log stream aliases disagree: %#v, %#v, %v", id, logs, exactLogs, err)
+		}
+		streams[id] = logs.StreamEpoch
+		response, err := manager.ProvideToolsForInstance(t.Context(), view)
+		if err != nil || len(response) != 1 {
+			t.Fatalf("profile %q tool discovery = %#v, %v", id, response, err)
+		}
+	}
+	if pids[store.DefaultProfileID] == pids[profileID] {
+		t.Fatalf("profile installations share a subprocess: %#v", pids)
+	}
+	if streams[store.DefaultProfileID] == streams[profileID] {
+		t.Fatalf("profile installations share a log stream: %#v", streams)
+	}
+	for _, id := range []string{store.DefaultProfileID, profileID} {
+		if err := manager.InvalidateProfileRuntime(
+			t.Context(),
+			InstanceKey{Name: fixture.manifest.Name, ProfileID: id, WorkspaceID: workspaceID},
+		); err != nil {
+			t.Fatal(err)
+		}
+		view := ProfileInstanceKey(fixture.manifest.Name, id, workspaceID)
+		if _, err := manager.ProvideToolsForInstance(t.Context(), view); err != nil {
+			t.Fatalf("profile %q restart = %v", id, err)
+		}
+		restarted, err := manager.GetForInstance(view)
+		if err != nil || !restarted.Status.Active || restarted.Status.PID == pids[id] {
+			t.Fatalf("profile %q restarted snapshot = %#v, %v", id, restarted, err)
+		}
+	}
+	// Archived profile attachments remain durable but must not launch at boot.
+	if _, err := env.db.ExecContext(
+		t.Context(),
+		`UPDATE profiles SET state = 'archived', archived_at = ? WHERE id = ?`,
+		store.FormatTimestamp(env.installedAt), profileID,
+	); err != nil {
+		t.Fatal(err)
+	}
+	if err := manager.Reload(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	archived, err := manager.GetForInstance(ProfileInstanceKey(fixture.manifest.Name, profileID, workspaceID))
+	if err != nil || archived.Status.Active || archived.Status.PID != 0 {
+		t.Fatalf("archived profile runtime = %#v, %v; want no running subprocess", archived, err)
+	}
+}
+
+type fixedProfileNameResolver map[string]string
+
+func (r fixedProfileNameResolver) ProfileName(_ context.Context, profileID string) (string, error) {
+	name := strings.TrimSpace(r[strings.TrimSpace(profileID)])
+	if name == "" {
+		return "", fmt.Errorf("profile %q is unavailable", profileID)
+	}
+	return name, nil
+}
+
+func launchEnvValue(values []string, name string) string {
+	prefix := strings.TrimSpace(name) + "="
+	for _, value := range values {
+		if result, ok := strings.CutPrefix(value, prefix); ok {
+			return result
+		}
+	}
+	return ""
+}
+
+// Invariant: a live extension projection contains shared resources plus only
+// the selected profile's placements, and a placement update moves ownership
+// without copying resource content.
+// Owner: extension manager profile projection.
+// Canonical suite: extension manager tests.
+// Covers IT-053 and IT-054.
+func TestManagerProjectsLiveResourcesByProfile(t *testing.T) {
+	t.Parallel()
+	// Invariant: persisted attachment reach, including default-profile identity,
+	// governs reads and startup. Owner: manager; canonical suite: this profile suite.
+	t.Run("Should exclude unattached profiles and workspaces from published package reads", func(t *testing.T) {
+		t.Parallel()
+		testManagerInstallationReadIsolation(t)
+	})
+	t.Run("Should project every profile resource family without cross-profile leakage", func(t *testing.T) {
+		t.Parallel()
+		testManagerProjectsLiveResourcesByProfile(t)
+	})
+	t.Run("Should filter every manifest resource family through one profile lens", func(t *testing.T) {
+		t.Parallel()
+		testProjectManifestResourcesForProfile(t)
+	})
+}
+
+func testManagerInstallationReadIsolation(t *testing.T) {
+	t.Helper()
+	withDaemonVersion(t, "0.6.0")
+	env := newRegistryTestEnv(t)
+	profileID := insertActiveRegistryProfile(t, env, "marketing")
+	workspaceID := "ws-installation-reads"
+	if _, err := env.db.ExecContext(t.Context(), `INSERT INTO workspaces
+ (id, root_dir, name, created_at, updated_at) VALUES (?, ?, ?, ?, ?)`, workspaceID, t.TempDir(), "Read scope",
+		store.FormatTimestamp(env.installedAt), store.FormatTimestamp(env.installedAt)); err != nil {
+		t.Fatal(err)
+	}
+	fixture := createManagerTestExtension(t, `[extension]
+name = "scoped-read-kit"
+version = "1.0.0"
+min_compozy_version = "0.5.0"
+[[resources.skills]]
+path = "skills/shared"
+`, map[string]string{"skills/shared/SKILL.md": managerSkillFile("shared", "Scoped skill")})
+	scope := InstallationScope{ProfileID: profileID, WorkspaceID: workspaceID}
+	if err := env.registry.Install(
+		fixture.manifest,
+		fixture.dir,
+		fixture.checksum,
+		WithInstallScope(scope),
+	); err != nil {
+		t.Fatal(err)
+	}
+	manager := NewManager(env.registry)
+	if err := manager.Start(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		if err := manager.Stop(testutil.Context(t)); err != nil {
+			t.Error(err)
+		}
+	})
+	if got := manager.Statuses(); len(got) != 1 || got[0].Registered || got[0].Active {
+		t.Fatalf("scoped-only startup = %#v, want no global publication", got)
+	}
+	for _, tc := range []struct {
+		profileID, profileName, workspaceID string
+		visible                             bool
+	}{
+		{profileID, "marketing", workspaceID, true},
+		{profileID, "marketing", "foreign", false},
+		{profileID, "marketing", "", false},
+		{store.DefaultProfileID, "default", workspaceID, false},
+	} {
+		key := InstanceKey{Name: fixture.manifest.Name, WorkspaceID: tc.workspaceID}
+		projected, enabled, err := manager.ProjectForProfile(t.Context(), key, ProfileLens{
+			ID: tc.profileID, Name: tc.profileName,
+		})
+		if !tc.visible {
+			if !errors.Is(err, ErrExtensionNotFound) {
+				t.Fatalf("projection for %+v = %#v, %v, want not found", tc, projected, err)
+			}
+			continue
+		}
+		if err != nil || !enabled || projected == nil || len(projected.Skills) != 1 ||
+			projected.Status.WorkspaceID != workspaceID || !projected.Status.Registered || !projected.Status.Active {
+			t.Fatalf("scoped runtime projection = %#v, enabled=%v, err=%v", projected, enabled, err)
+		}
+	}
+	if got := manager.ListForWorkspace("foreign"); len(got) != 0 {
+		t.Fatalf("foreign workspace inventory = %#v", got)
+	}
+	if got := manager.ListForWorkspace(workspaceID); len(got) != 1 {
+		t.Fatalf("own workspace inventory = %#v", got)
+	}
+	if err := env.registry.AttachInstallation(t.Context(), fixture.manifest.Name, InstallationScope{
+		ProfileID: store.DefaultProfileID,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := manager.Reload(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	global, err := manager.Get(fixture.manifest.Name)
+	if err != nil || !global.Status.Registered {
+		t.Fatalf("default-profile attachment = %#v, %v", global, err)
+	}
+	if err := env.registry.DetachInstallation(t.Context(), fixture.manifest.Name, InstallationScope{
+		ProfileID: store.DefaultProfileID,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := manager.Get(fixture.manifest.Name); !errors.Is(err, ErrExtensionNotFound) {
+		t.Fatalf("read after detach = %v, want not found despite retained runtime", err)
+	}
+	if _, err := manager.ProvideToolsForInstance(
+		t.Context(),
+		GlobalInstanceKey(fixture.manifest.Name),
+	); !errors.Is(
+		err,
+		ErrExtensionNotFound,
+	) {
+		t.Fatalf("runtime call after detach = %v, want not found", err)
+	}
+}
+
+func testProjectManifestResourcesForProfile(t *testing.T) {
+	t.Helper()
+
+	paths := []ManifestResourcePath{
+		{Path: "shared"},
+		{Path: "x", Profile: "x"},
+		{Path: "y", Profile: "y"},
+	}
+	resources := ResourcesConfig{
+		Skills:     slices.Clone(paths),
+		Loops:      slices.Clone(paths),
+		Agents:     slices.Clone(paths),
+		Automation: slices.Clone(paths),
+		Layouts:    slices.Clone(paths),
+		Hooks: []HookConfig{
+			{Name: "shared"},
+			{Name: "x", Profile: "x"},
+			{Name: "y", Profile: "y"},
+		},
+		Tools: map[string]ToolConfig{
+			"shared": {},
+			"x":      {Profile: "x"},
+			"y":      {Profile: "y"},
+		},
+		MCPServers: map[string]MCPServerConfig{
+			"shared": {},
+			"x":      {Profile: "x"},
+			"y":      {Profile: "y"},
+		},
+		CommandGroups: []manifestCommandGroupSpec{
+			{Path: "shared"},
+			{Path: "x", Profile: "x"},
+			{Path: "y", Profile: "y"},
+		},
+		CmdPalette: CmdPaletteConfig{
+			Commands: []CmdPaletteCommand{
+				{ID: "shared", Action: CmdPaletteAction{Kind: "navigate"}},
+				{ID: "x", Profile: "x", Action: CmdPaletteAction{Kind: "navigate"}},
+				{ID: "y", Profile: "y", Action: CmdPaletteAction{Kind: "navigate"}},
+				{ID: "x-tool", Action: CmdPaletteAction{Kind: "tool", Tool: "x"}},
+				{ID: "y-tool", Action: CmdPaletteAction{Kind: "tool", Tool: "y"}},
+			},
+			Views: []CmdPaletteView{
+				{ID: "shared"},
+				{ID: "x", Profile: "x"},
+				{ID: "y", Profile: "y"},
+				{ID: "x-tool", Source: &CmdPaletteViewSource{Tool: "x"}},
+				{ID: "y-tool", Source: &CmdPaletteViewSource{Tool: "y"}},
+			},
+		},
+	}
+
+	projectManifestResourcesForProfile(&resources, "x")
+	for family, values := range map[string][]ManifestResourcePath{
+		"skills": resources.Skills, "loops": resources.Loops, "agents": resources.Agents,
+		"automation": resources.Automation, "layouts": resources.Layouts,
+	} {
+		if !slices.Equal(values, paths[:2]) {
+			t.Fatalf("%s projection = %#v, want shared and x", family, values)
+		}
+	}
+	if len(resources.Hooks) != 2 {
+		t.Fatalf("hook projection = %#v, want shared and x", resources.Hooks)
+	}
+	if got := []string{resources.Hooks[0].Name, resources.Hooks[1].Name}; !slices.Equal(got, []string{"shared", "x"}) {
+		t.Fatalf("hook projection = %#v, want shared and x", resources.Hooks)
+	}
+	for family, values := range map[string][]string{
+		"tools":       sortedMapKeys(resources.Tools),
+		"mcp_servers": sortedMapKeys(resources.MCPServers),
+	} {
+		if !slices.Equal(values, []string{"shared", "x"}) {
+			t.Fatalf("%s projection = %#v, want shared and x", family, values)
+		}
+	}
+	if len(resources.CommandGroups) != 2 {
+		t.Fatalf("command group projection = %#v, want shared and x", resources.CommandGroups)
+	}
+	if got := []string{
+		resources.CommandGroups[0].Path,
+		resources.CommandGroups[1].Path,
+	}; !slices.Equal(
+		got,
+		[]string{"shared", "x"},
+	) {
+		t.Fatalf("command group projection = %#v, want shared and x", resources.CommandGroups)
+	}
+	commandIDs := make([]string, 0, len(resources.CmdPalette.Commands))
+	for _, command := range resources.CmdPalette.Commands {
+		commandIDs = append(commandIDs, command.ID)
+	}
+	if !slices.Equal(commandIDs, []string{"shared", "x", "x-tool"}) {
+		t.Fatalf("command palette commands = %#v, want shared, x, and x-tool", commandIDs)
+	}
+	viewIDs := make([]string, 0, len(resources.CmdPalette.Views))
+	for _, view := range resources.CmdPalette.Views {
+		viewIDs = append(viewIDs, view.ID)
+	}
+	if !slices.Equal(viewIDs, []string{"shared", "x", "x-tool"}) {
+		t.Fatalf("command palette views = %#v, want shared, x, and x-tool", viewIDs)
+	}
+}
+
+func testManagerProjectsLiveResourcesByProfile(t *testing.T) {
+	t.Helper()
+
+	withDaemonVersion(t, "0.6.0")
+	env := newRegistryTestEnv(t)
+	fixture := createManagerTestExtension(t, `[extension]
+name = "profile-kit"
+version = "1.0.0"
+min_compozy_version = "0.5.0"
+
+[[resources.skills]]
+path = "skills/shared"
+
+[[resources.skills]]
+path = "skills/x-one"
+profile = "x"
+
+[[resources.skills]]
+path = "skills/x-two"
+profile = "x"
+
+[[resources.skills]]
+path = "skills/y-one"
+profile = "y"
+
+[[resources.hooks]]
+name = "shared-hook"
+event = "turn.start"
+command = "/bin/sh"
+
+[[resources.hooks]]
+name = "x-hook"
+event = "turn.start"
+command = "/bin/sh"
+profile = "x"
+
+[[resources.hooks]]
+name = "y-hook"
+event = "turn.start"
+command = "/bin/sh"
+profile = "y"
+`, map[string]string{
+		"skills/shared/SKILL.md": managerSkillFile("shared", "Shared"),
+		"skills/x-one/SKILL.md":  managerSkillFile("x-one", "X one"),
+		"skills/x-two/SKILL.md":  managerSkillFile("x-two", "X two"),
+		"skills/y-one/SKILL.md":  managerSkillFile("y-one", "Y one"),
+	})
+	installManagerFixture(t, env.registry, fixture, SourceUser, true)
+	const (
+		xProfileID = "01ARZ3NDEKTSV4RRFFQ69G5FAV"
+		yProfileID = "01BX5ZZKBKACTAV9WEVGEMMVRZ"
+	)
+	now := store.FormatTimestamp(time.Now().UTC())
+	if _, err := env.db.ExecContext(t.Context(), `INSERT INTO profiles (id, name, color, icon, state, created_at) VALUES
+		(?, 'x', '#112233', 'x', 'active', ?),
+		(?, 'y', '#334455', 'y', 'active', ?)`, xProfileID, now, yProfileID, now); err != nil {
+		t.Fatalf("insert profile fixtures error = %v", err)
+	}
+	info, err := env.registry.Get(fixture.manifest.Name)
+	if err != nil {
+		t.Fatalf("registry.Get() error = %v", err)
+	}
+	manager := NewManager(env.registry)
+	manager.extensions[fixture.manifest.Name] = &managedExtension{
+		key: GlobalInstanceKey(fixture.manifest.Name), info: *info,
+		rootDir: fixture.dir, manifest: fixture.manifest, registered: true, active: true,
+	}
+
+	project := func(t *testing.T, id, name string) (*Extension, bool) {
+		t.Helper()
+		projected, enabled, projectErr := manager.ProjectForProfile(
+			testutil.Context(t),
+			GlobalInstanceKey(fixture.manifest.Name),
+			ProfileLens{ID: id, Name: name},
+		)
+		if projectErr != nil {
+			t.Fatalf("ProjectForProfile(%s) error = %v", name, projectErr)
+		}
+		return projected, enabled
+	}
+	assertSkills := func(t *testing.T, extension *Extension, want []string) {
+		t.Helper()
+		got := make([]string, 0, len(extension.Skills))
+		for _, skill := range extension.Skills {
+			got = append(got, skill.Meta.Name)
+		}
+		slices.Sort(got)
+		slices.Sort(want)
+		if !slices.Equal(got, want) {
+			t.Fatalf("projected skills = %#v, want %#v", got, want)
+		}
+	}
+
+	xProjection, enabled := project(t, xProfileID, "x")
+	if !enabled {
+		t.Fatal("ProjectForProfile(x) enabled = false, want true")
+	}
+	assertSkills(t, xProjection, []string{"shared", "x-one", "x-two"})
+	if got := manifestResourcePaths(xProjection.Manifest.Resources.Skills); !slices.Equal(
+		got,
+		[]string{"skills/shared", "skills/x-one", "skills/x-two", "skills/y-one"},
+	) {
+		t.Fatalf("ProjectForProfile(x).Manifest.Resources.Skills = %#v, want complete placement manifest", got)
+	}
+	yProjection, enabled := project(t, yProfileID, "y")
+	if !enabled {
+		t.Fatal("ProjectForProfile(y) enabled = false, want true")
+	}
+	assertSkills(t, yProjection, []string{"shared", "y-one"})
+	profileHooks, err := manager.HookDeclarationsForProfiles(testutil.Context(t), []ProfileLens{
+		{ID: xProfileID, Name: "x"},
+		{ID: yProfileID, Name: "y"},
+	})
+	if err != nil {
+		t.Fatalf("HookDeclarationsForProfiles() error = %v", err)
+	}
+	ownersByHook := make(map[string][]string)
+	for _, declaration := range profileHooks {
+		ownersByHook[declaration.Name] = append(ownersByHook[declaration.Name], declaration.PlacementProfileID())
+	}
+	if !slices.Equal(ownersByHook["shared-hook"], []string{xProfileID, yProfileID}) ||
+		!slices.Equal(ownersByHook["x-hook"], []string{xProfileID}) ||
+		!slices.Equal(ownersByHook["y-hook"], []string{yProfileID}) {
+		t.Fatalf("profile hook owners = %#v, want shared plus isolated x/y declarations", ownersByHook)
+	}
+
+	if err := env.registry.SetEnabledForProfile(fixture.manifest.Name, xProfileID, false); err != nil {
+		t.Fatalf("SetEnabledForProfile(x disabled) error = %v", err)
+	}
+	liveExtension := manager.extensions[fixture.manifest.Name]
+	delete(manager.extensions, fixture.manifest.Name)
+	xProjection, enabled = project(t, xProfileID, "x")
+	if enabled {
+		t.Fatal("ProjectForProfile(x disabled) enabled = true, want false [IT-053]")
+	}
+	assertSkills(t, xProjection, []string{"shared", "x-one", "x-two"})
+	manager.extensions[fixture.manifest.Name] = liveExtension
+
+	if err := env.registry.SetEnabledForProfile(fixture.manifest.Name, xProfileID, true); err != nil {
+		t.Fatalf("SetEnabledForProfile(x enabled) error = %v", err)
+	}
+	manager.extensions[fixture.manifest.Name].manifest.Resources.Skills[2].Profile = "y"
+	xProjection, _ = project(t, xProfileID, "x")
+	yProjection, _ = project(t, yProfileID, "y")
+	assertSkills(t, xProjection, []string{"shared", "x-one"})
+	assertSkills(t, yProjection, []string{"shared", "x-two", "y-one"})
+}
+
+func TestManagerInitializeRuntimeRequestEncodesEmptyCapabilitiesAsArrays(t *testing.T) {
+	t.Parallel()
+
+	manager := NewManager(nil)
+	request := manager.initializeRuntimeRequest(
+		&managedExtension{
+			info:     ExtensionInfo{Source: SourceUser},
+			manifest: &Manifest{Name: "empty-capabilities", Version: "0.1.0"},
+		},
+		EffectiveGrant{},
+		subprocess.InitializeRuntime{},
+		&hostAPIResourceSession{Actor: resources.MutationActor{SessionNonce: "nonce"}},
+	)
+	payload, err := json.Marshal(request)
+	if err != nil {
+		t.Fatalf("json.Marshal(initialize request) error = %v", err)
+	}
+	var wire subprocess.InitializeRequest
+	if err := json.Unmarshal(payload, &wire); err != nil {
+		t.Fatalf("json.Unmarshal(initialize request) error = %v", err)
+	}
+	if wire.Capabilities.Provides == nil || wire.Capabilities.GrantedPermissions == nil ||
+		wire.Capabilities.GrantedResourceKinds == nil || wire.Capabilities.GrantedResourceScopes == nil {
+		t.Fatalf("initialize capabilities = %#v, want JSON arrays for every empty grant", wire.Capabilities)
+	}
+}
+
+func TestExtensionSkillInstalledFrom(t *testing.T) {
+	t.Parallel()
+
+	registrySlug := "acme/marketplace-ext"
+	tests := []struct {
+		name string
+		info ExtensionInfo
+		want string
+	}{
+		{
+			name: "Should prefer marketplace registry slug",
+			info: ExtensionInfo{
+				Name:         "runtime-name",
+				RegistrySlug: &registrySlug,
+				Provenance: ExtensionProvenance{
+					Slug: "acme/provenance-ext",
+				},
+			},
+			want: "acme/marketplace-ext",
+		},
+		{
+			name: "Should use provenance slug when registry slug is absent",
+			info: ExtensionInfo{
+				Name: "runtime-name",
+				Provenance: ExtensionProvenance{
+					Slug: "acme/provenance-ext",
+				},
+			},
+			want: "acme/provenance-ext",
+		},
+		{
+			name: "Should fall back to extension name for local installs",
+			info: ExtensionInfo{Name: "runtime-name"},
+			want: "runtime-name",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			if got := extensionSkillInstalledFrom(&tt.info); got != tt.want {
+				t.Fatalf("extensionSkillInstalledFrom() = %q, want %q", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestManagerStartSkipsDisabledExtensions(t *testing.T) {
+	t.Parallel()
+
+	withDaemonVersion(t, "0.5.0")
+	env := newRegistryTestEnv(t)
+	fixture := createManagerTestExtension(t, managerTestManifest("ext-disabled", managerManifestOptions{
+		command:      "fake-extension",
+		capabilities: []string{"tool.provider"},
+		permissions:  []string{"sessions/list"},
+	}), nil)
+	installManagerFixture(t, env.registry, fixture, SourceUser, false)
+
+	launcher := &fakeLauncher{}
+	manager := NewManager(env.registry, withProcessLauncher(launcher.launch))
+
+	if err := manager.Start(testutil.Context(t)); err != nil {
+		t.Fatalf("Start() error = %v", err)
+	}
+	t.Cleanup(func() {
+		if err := manager.Stop(testutil.Context(t)); err != nil {
+			t.Fatalf("Stop() cleanup error = %v", err)
+		}
+	})
+
+	if got := launcher.launchCount(); got != 0 {
+		t.Fatalf("launch count = %d, want 0", got)
+	}
+
+	statuses := manager.Statuses()
+	if len(statuses) != 1 || statuses[0].Enabled {
+		t.Fatalf("Statuses() = %#v, want one disabled extension", statuses)
+	}
+}
+
+func TestManagerWorkspaceScopedResourceSessionBindsOwningWorkspace(t *testing.T) {
+	t.Parallel()
+
+	t.Run("Should bind a workspace-source extension to its owning workspace", func(t *testing.T) {
+		t.Parallel()
+
+		workspaceRoot := t.TempDir()
+		resolved := &workspacepkg.ResolvedWorkspace{
+			ID:          "ws-extension",
+			RootDir:     workspaceRoot,
+			Name:        "extension-workspace",
+			WorkspaceID: "ws-extension-stable",
+		}
+		manager := NewManager(
+			nil,
+			WithWorkspaceResolver(newHostAPIFakeWorkspaceResolver(resolved)),
+		)
+		resourceSession, err := manager.newHostAPIResourceSession(t.Context(), &managedExtension{
+			info: ExtensionInfo{
+				Name:   "workspace-extension",
+				Source: SourceWorkspace,
+			},
+			rootDir: workspaceRoot,
+		})
+		if err != nil {
+			t.Fatalf("newHostAPIResourceSession() error = %v", err)
+		}
+		if got := resourceSession.Actor.MaxScope; got.Kind != resources.ResourceScopeKindWorkspace ||
+			got.ID != resolved.ID {
+			t.Fatalf("resource session max scope = %#v, want workspace %q", got, resolved.ID)
+		}
+	})
+
+	t.Run("Should keep a daemon-managed marketplace extension global", func(t *testing.T) {
+		t.Parallel()
+
+		manager := NewManager(nil)
+		resourceSession, err := manager.newHostAPIResourceSession(t.Context(), &managedExtension{
+			info: ExtensionInfo{
+				Name:   "marketplace-extension",
+				Source: SourceMarketplace,
+			},
+			rootDir: t.TempDir(),
+		})
+		if err != nil {
+			t.Fatalf("newHostAPIResourceSession() error = %v", err)
+		}
+		if got := resourceSession.Actor.MaxScope; got.Kind != resources.ResourceScopeKindUser ||
+			got.ID != "" {
+			t.Fatalf("resource session max scope = %#v, want user scope", got)
+		}
+	})
+}
+
+func TestManagerStartContinuesAfterParseFailure(t *testing.T) {
+	t.Parallel()
+
+	t.Run("Should preserve failures while reloading a healthy extension", func(t *testing.T) {
+		t.Parallel()
+
+		withDaemonVersion(t, "0.5.0")
+		env := newRegistryTestEnv(t)
+
+		badFixture := createManagerTestExtension(t, managerTestManifest("ext-bad", managerManifestOptions{
+			command:      "fake-extension",
+			capabilities: []string{"tool.provider"},
+			permissions:  []string{"sessions/list"},
+		}), nil)
+		installManagerFixture(t, env.registry, badFixture, SourceUser, true)
+		writeFile(t, filepath.Join(badFixture.dir, manifestTOMLFileName), "not = [valid")
+
+		goodFixture := createManagerTestExtension(t, managerTestManifest("ext-good", managerManifestOptions{
+			command:      "fake-extension",
+			capabilities: []string{"tool.provider"},
+			permissions:  []string{"sessions/list"},
+			withHooks:    true,
+		}), nil)
+		installManagerFixture(t, env.registry, goodFixture, SourceUser, true)
+
+		launcher := &fakeLauncher{queue: []*fakeProcess{newFakeProcess(202)}}
+		manager := NewManager(
+			env.registry,
+			withProcessLauncher(launcher.launch),
+			withHealthPollBounds(time.Millisecond, 2*time.Millisecond),
+		)
+
+		err := manager.Start(testutil.Context(t))
+		if err == nil {
+			t.Fatal("Start() error = nil, want joined parse failure")
+		}
+		if !strings.Contains(err.Error(), `extension "ext-bad" parse`) {
+			t.Fatalf("Start() error = %v, want parse phase detail for ext-bad", err)
+		}
+		t.Cleanup(func() {
+			if stopErr := manager.Stop(testutil.Context(t)); stopErr != nil {
+				t.Fatalf("Stop() cleanup error = %v", stopErr)
+			}
+		})
+
+		if got := launcher.launchCount(); got != 1 {
+			t.Fatalf("launch count = %d, want 1 for ext-good only", got)
+		}
+		launcher.queue = append(launcher.queue, newFakeProcess(303))
+		if err := manager.ReloadForExtensions(t.Context(), []string{"ext-good"}); err != nil {
+			t.Fatalf("unrelated parse failure blocked reload: %v", err)
+		}
+		if got := launcher.launchCount(); got != 2 {
+			t.Fatalf("selected reload launches = %d, want 2", got)
+		}
+
+		bad, err := manager.Get("ext-bad")
+		if err != nil || bad.Status.LastError == "" {
+			t.Fatalf("unrelated failure must remain visible: %#v, %v", bad, err)
+		}
+		good, err := manager.Get("ext-good")
+		if err != nil {
+			t.Fatalf("Get(ext-good) error = %v", err)
+		}
+		if good.Status.PID != 303 {
+			t.Fatalf("selected reload PID = %d, want 303", good.Status.PID)
+		}
+		if !good.Status.Active {
+			t.Fatalf("Get(ext-good).Status.Active = false, want true")
+		}
+	})
+}
+
+func TestManagerSelectedReloadStopFailures(t *testing.T) {
+	t.Parallel()
+	for _, selectedFailure := range []bool{false, true} {
+		name := "Should keep an unrelated shutdown failure from aborting the selected reload"
+		if selectedFailure {
+			name = "Should return the selected extension shutdown failure"
+		}
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+			withDaemonVersion(t, "0.5.0")
+			env := newRegistryTestEnv(t)
+			for _, name := range []string{"a-bad-stop", "z-good-stop"} {
+				fixture := createManagerTestExtension(
+					t,
+					managerTestManifest(
+						name,
+						managerManifestOptions{command: "fake-extension", capabilities: []string{"tool.provider"}},
+					),
+					nil,
+				)
+				installManagerFixture(t, env.registry, fixture, SourceUser, true)
+			}
+			stopErr := errors.New("selected shutdown boundary failure")
+			bad := newFakeProcess(101)
+			bad.shutdownFn = func(context.Context) error { bad.close(nil); return stopErr }
+			launcher := &fakeLauncher{
+				queue: []*fakeProcess{bad, newFakeProcess(202), newFakeProcess(303), newFakeProcess(404)},
+			}
+			manager := NewManager(env.registry, withProcessLauncher(launcher.launch))
+			if err := manager.Start(t.Context()); err != nil {
+				t.Fatal(err)
+			}
+			t.Cleanup(func() {
+				if err := manager.Stop(context.Background()); err != nil {
+					t.Error(err)
+				}
+			})
+			target := "z-good-stop"
+			if selectedFailure {
+				target = "a-bad-stop"
+			}
+			err := manager.ReloadForExtensions(t.Context(), []string{target})
+			if selectedFailure {
+				if !errors.Is(err, stopErr) {
+					t.Fatalf("selected stop failure = %v", err)
+				}
+			} else if err != nil {
+				t.Fatalf("unrelated stop rejected reload: %v", err)
+			}
+			good, err := manager.Get("z-good-stop")
+			if err != nil || !good.Status.Active || good.Status.PID != 404 {
+				t.Fatalf("healthy target was not relaunched: %#v, %v", good, err)
+			}
+		})
+	}
+}
+
+func TestManagerStartRejectsIncompatibleManifest(t *testing.T) {
+	t.Parallel()
+
+	withDaemonVersion(t, "0.5.0")
+	env := newRegistryTestEnv(t)
+	fixture := createManagerTestExtension(t, managerTestManifest("ext-incompatible", managerManifestOptions{
+		command:      "fake-extension",
+		capabilities: []string{"tool.provider"},
+		permissions:  []string{"sessions/list"},
+	}), nil)
+	installManagerFixture(t, env.registry, fixture, SourceUser, true)
+	writeFile(
+		t,
+		filepath.Join(fixture.dir, manifestTOMLFileName),
+		managerTestManifest("ext-incompatible", managerManifestOptions{
+			command:      "fake-extension",
+			minVersion:   "9.0.0",
+			capabilities: []string{"tool.provider"},
+			permissions:  []string{"sessions/list"},
+		}),
+	)
+
+	launcher := &fakeLauncher{}
+	manager := NewManager(env.registry, withProcessLauncher(launcher.launch))
+
+	err := manager.Start(testutil.Context(t))
+	if err == nil {
+		t.Fatal("Start() error = nil, want incompatibility error")
+	}
+	if !errors.Is(err, ErrManifestIncompatible) {
+		t.Fatalf("Start() error = %v, want ErrManifestIncompatible", err)
+	}
+	if got := launcher.launchCount(); got != 0 {
+		t.Fatalf("launch count = %d, want 0", got)
+	}
+}
+
+func TestManagerCrashTriggersRestartWithBackoff(t *testing.T) {
+	t.Parallel()
+
+	withDaemonVersion(t, "0.5.0")
+	env := newRegistryTestEnv(t)
+	fixture := createManagerTestExtension(t, managerTestManifest("ext-restart", managerManifestOptions{
+		command:      "fake-extension",
+		capabilities: []string{"tool.provider"},
+		permissions:  []string{"sessions/list"},
+	}), nil)
+	installManagerFixture(t, env.registry, fixture, SourceUser, true)
+
+	first := newFakeProcess(301)
+	second := newFakeProcess(302)
+	launcher := &fakeLauncher{queue: []*fakeProcess{first, second}}
+
+	manager := NewManager(
+		env.registry,
+		withProcessLauncher(launcher.launch),
+		withRestartBackoffMax(2*time.Millisecond),
+		withHealthPollBounds(time.Millisecond, 2*time.Millisecond),
+	)
+
+	if err := manager.Start(testutil.Context(t)); err != nil {
+		t.Fatalf("Start() error = %v", err)
+	}
+	t.Cleanup(func() {
+		if err := manager.Stop(testutil.Context(t)); err != nil {
+			t.Fatalf("Stop() cleanup error = %v", err)
+		}
+	})
+
+	first.crash(errors.New("boom"))
+
+	waitForManagerCondition(t, time.Second, func() bool {
+		if launcher.launchCount() != 2 {
+			return false
+		}
+		loaded, err := manager.Get("ext-restart")
+		return err == nil && loaded.Status.Active && loaded.Status.PID == 302
+	})
+
+	loaded, err := manager.Get("ext-restart")
+	if err != nil {
+		t.Fatalf("Get(ext-restart) error = %v", err)
+	}
+	if !loaded.Status.Active || loaded.Status.PID != 302 {
+		t.Fatalf("Get(ext-restart).Status = %#v, want restarted process pid 302", loaded.Status)
+	}
+}
+
+func TestManagerStartDetachesSupervisorFromStartContext(t *testing.T) {
+	t.Parallel()
+
+	withDaemonVersion(t, "0.5.0")
+	env := newRegistryTestEnv(t)
+	fixture := createManagerTestExtension(t, managerTestManifest("ext-detached", managerManifestOptions{
+		command:      "fake-extension",
+		capabilities: []string{"tool.provider"},
+		permissions:  []string{"sessions/list"},
+	}), nil)
+	installManagerFixture(t, env.registry, fixture, SourceUser, true)
+
+	first := newFakeProcess(601)
+	second := newFakeProcess(602)
+	launcher := &fakeLauncher{queue: []*fakeProcess{first, second}}
+
+	manager := NewManager(
+		env.registry,
+		withProcessLauncher(launcher.launch),
+		withRestartBackoffMax(2*time.Millisecond),
+		withHealthPollBounds(time.Millisecond, 2*time.Millisecond),
+	)
+
+	startCtx, cancelStart := context.WithCancel(testutil.Context(t))
+	if err := manager.Start(startCtx); err != nil {
+		t.Fatalf("Start() error = %v", err)
+	}
+	cancelStart()
+	t.Cleanup(func() {
+		if err := manager.Stop(testutil.Context(t)); err != nil {
+			t.Fatalf("Stop() cleanup error = %v", err)
+		}
+	})
+
+	first.crash(errors.New("boom"))
+
+	waitForManagerCondition(t, time.Second, func() bool {
+		if launcher.launchCount() != 2 {
+			return false
+		}
+		loaded, err := manager.Get("ext-detached")
+		return err == nil && loaded.Status.Active && loaded.Status.PID == 602
+	})
+}
+
+func TestManagerDisablesExtensionAfterConsecutiveFailures(t *testing.T) {
+	t.Parallel()
+
+	withDaemonVersion(t, "0.5.0")
+	env := newRegistryTestEnv(t)
+	fixture := createManagerTestExtension(t, managerTestManifest("ext-flaky", managerManifestOptions{
+		command:      "fake-extension",
+		capabilities: []string{"tool.provider"},
+		permissions:  []string{"sessions/list"},
+		withHooks:    true,
+	}), nil)
+	installManagerFixture(t, env.registry, fixture, SourceUser, true)
+
+	queue := make([]*fakeProcess, 0, 5)
+	for pid := 401; pid <= 405; pid++ {
+		proc := newFakeProcess(pid)
+		proc.initHook = func(p *fakeProcess) func() {
+			return func() {
+				go p.crash(errors.New("panic"))
+			}
+		}(proc)
+		queue = append(queue, proc)
+	}
+	launcher := &fakeLauncher{queue: queue}
+	checker := &CapabilityChecker{}
+
+	manager := NewManager(
+		env.registry,
+		WithCapabilityChecker(checker),
+		withProcessLauncher(launcher.launch),
+		withRestartBackoffMax(2*time.Millisecond),
+		withHealthPollBounds(time.Millisecond, 2*time.Millisecond),
+	)
+
+	if err := manager.Start(testutil.Context(t)); err != nil {
+		t.Fatalf("Start() error = %v", err)
+	}
+	t.Cleanup(func() {
+		if err := manager.Stop(testutil.Context(t)); err != nil {
+			t.Fatalf("Stop() cleanup error = %v", err)
+		}
+	})
+
+	waitForManagerCondition(t, time.Second, func() bool {
+		info, err := env.registry.Get("ext-flaky")
+		return err == nil && !info.Enabled
+	})
+
+	if got := launcher.launchCount(); got != 5 {
+		t.Fatalf("launch count = %d, want 5 before disable", got)
+	}
+
+	decls, err := manager.HookDeclarationsForProfiles(testutil.Context(t), []ProfileLens{{
+		ID: store.DefaultProfileID, Name: "default",
+	}})
+	if err != nil {
+		t.Fatalf("HookDeclarationsForProfiles() error = %v", err)
+	}
+	if len(decls) != 0 {
+		t.Fatalf("HookDeclarationsForProfiles() = %#v, want resources removed after disable", decls)
+	}
+	checker.mu.RLock()
+	grantCount := len(checker.grants)
+	checker.mu.RUnlock()
+	if grantCount != 0 {
+		t.Fatalf("capability grants after crash-loop disable = %d, want zero", grantCount)
+	}
+}
+
+func TestManagerStopUsesRealSubprocessShutdown(t *testing.T) {
+	t.Parallel()
+
+	withDaemonVersion(t, "0.5.0")
+	env := newRegistryTestEnv(t)
+	markerPath := filepath.Join(t.TempDir(), "shutdown.marker")
+	fixture := createManagerTestExtension(t, managerTestManifest("ext-stop", managerManifestOptions{
+		command:      helperCommand(t),
+		args:         helperArgs(),
+		withEnv:      helperEnv("default", markerPath),
+		capabilities: []string{"tool.provider"},
+		permissions:  []string{"sessions/list"},
+	}), nil)
+	installManagerFixture(t, env.registry, fixture, SourceUser, true)
+
+	manager := NewManager(
+		env.registry,
+		WithHealthCheckTimeout(25*time.Millisecond),
+		WithDefaultHookTimeout(25*time.Millisecond),
+		WithSubprocessSignalGrace(15*time.Millisecond),
+	)
+
+	if err := manager.Start(testutil.Context(t)); err != nil {
+		t.Fatalf("Start() error = %v", err)
+	}
+
+	if err := manager.Stop(testutil.Context(t)); err != nil {
+		t.Fatalf("Stop() error = %v", err)
+	}
+	if _, err := os.Stat(markerPath); err != nil {
+		t.Fatalf("os.Stat(%q) error = %v, want shutdown marker", markerPath, err)
+	}
+}
+
+func TestManagerStopKillsHungSubprocessAfterTimeout(t *testing.T) {
+	t.Parallel()
+
+	withDaemonVersion(t, "0.5.0")
+	env := newRegistryTestEnv(t)
+	fixture := createManagerTestExtension(t, managerTestManifest("ext-hang", managerManifestOptions{
+		command:      helperCommand(t),
+		args:         helperArgs(),
+		withEnv:      helperEnv("shutdown_hang", ""),
+		capabilities: []string{"tool.provider"},
+		permissions:  []string{"sessions/list"},
+		shutdown:     40 * time.Millisecond,
+	}), nil)
+	installManagerFixture(t, env.registry, fixture, SourceUser, true)
+
+	manager := NewManager(
+		env.registry,
+		WithHealthCheckTimeout(20*time.Millisecond),
+		WithSubprocessSignalGrace(20*time.Millisecond),
+	)
+
+	if err := manager.Start(testutil.Context(t)); err != nil {
+		t.Fatalf("Start() error = %v", err)
+	}
+
+	if err := manager.Stop(testutil.Context(t)); err != nil {
+		t.Fatalf("Stop() error = %v", err)
+	}
+
+	statuses := manager.Statuses()
+	if len(statuses) != 1 || statuses[0].Active {
+		t.Fatalf("Statuses() after Stop = %#v, want inactive extension", statuses)
+	}
+}
+
+func TestNewManagerAppliesOptionsAndRestoresDefaults(t *testing.T) {
+	t.Parallel()
+
+	manager := NewManager(
+		nil,
+		WithCapabilityChecker(nil),
+		WithLogger(nil),
+		WithNow(nil),
+		WithGetenv(nil),
+		WithHostMethodHandler(" sessions/list ", func(context.Context, json.RawMessage) (any, error) {
+			return "ok", nil
+		}),
+		WithInitializeTimeout(0),
+		WithHealthCheckTimeout(0),
+		WithDefaultHookTimeout(0),
+		WithSubprocessSignalGrace(0),
+		withProcessLauncher(nil),
+		withRestartBackoffMax(0),
+		withRestartFailureThreshold(0),
+		withHealthPollBounds(0, 0),
+	)
+
+	if manager.capChecker == nil {
+		t.Fatal("capChecker = nil, want default checker")
+	}
+	if manager.logger == nil {
+		t.Fatal("logger = nil, want default logger")
+	}
+	if manager.now == nil {
+		t.Fatal("now = nil, want default clock")
+	}
+	if manager.getenv == nil {
+		t.Fatal("getenv = nil, want default env resolver")
+	}
+
+	if manager.launch == nil {
+		t.Fatal("launch = nil, want default launcher")
+	}
+	if got, want := manager.initializeTimeout, defaultInitializeTimeout; got != want {
+		t.Fatalf("initializeTimeout = %v, want %v", got, want)
+	}
+	if got, want := manager.healthCheckTimeout, defaultHealthCheckTimeout; got != want {
+		t.Fatalf("healthCheckTimeout = %v, want %v", got, want)
+	}
+	if got, want := manager.defaultHookTimeout, defaultHookTimeout; got != want {
+		t.Fatalf("defaultHookTimeout = %v, want %v", got, want)
+	}
+	if got, want := manager.restartBackoffMax, defaultRestartBackoffMax; got != want {
+		t.Fatalf("restartBackoffMax = %v, want %v", got, want)
+	}
+	if got, want := manager.restartFailureThreshold, DefaultRestartFailureThreshold; got != want {
+		t.Fatalf("restartFailureThreshold = %d, want %d", got, want)
+	}
+	if got, want := manager.healthPollFloor, defaultHealthPollFloor; got != want {
+		t.Fatalf("healthPollFloor = %v, want %v", got, want)
+	}
+	if got, want := manager.healthPollCeiling, defaultHealthPollCeiling; got != want {
+		t.Fatalf("healthPollCeiling = %v, want %v", got, want)
+	}
+	if got, want := manager.subprocessSignalGrace, defaultSubprocessSignalGrace; got != want {
+		t.Fatalf("subprocessSignalGrace = %v, want %v", got, want)
+	}
+	if _, ok := manager.hostMethods["sessions/list"]; !ok {
+		t.Fatalf("hostMethods = %#v, want trimmed sessions/list key", manager.hostMethods)
+	}
+}
+
+func TestManagerReloadValidatesAndRestarts(t *testing.T) {
+	t.Parallel()
+
+	t.Run("Should reject nil manager", func(t *testing.T) {
+		t.Parallel()
+
+		var nilManager *Manager
+		if err := nilManager.Reload(testutil.Context(t)); !errors.Is(err, ErrManagerRequired) {
+			t.Fatalf("nil manager Reload() error = %v, want %v", err, ErrManagerRequired)
+		}
+	})
+
+	t.Run("Should reject canceled context", func(t *testing.T) {
+		t.Parallel()
+
+		manager := NewManager(nil)
+		ctx, cancel := context.WithCancel(testutil.Context(t))
+		cancel()
+		if err := manager.Reload(ctx); !errors.Is(err, context.Canceled) {
+			t.Fatalf("Reload(canceled context) error = %v, want %v", err, context.Canceled)
+		}
+	})
+
+	t.Run("Should reject missing registry", func(t *testing.T) {
+		t.Parallel()
+
+		manager := NewManager(nil)
+		err := manager.Reload(testutil.Context(t))
+		if !errors.Is(err, ErrRegistryRequired) {
+			t.Fatalf("Reload() error = %v, want %v", err, ErrRegistryRequired)
+		}
+	})
+
+	t.Run("Should restart loaded extensions", func(t *testing.T) {
+		t.Parallel()
+
+		withDaemonVersion(t, "0.5.0")
+		env := newRegistryTestEnv(t)
+		fixture := createManagerTestExtension(t, managerTestManifest("ext-reload", managerManifestOptions{
+			command:      "fake-extension",
+			capabilities: []string{"tool.provider"},
+			permissions:  []string{"sessions/list"},
+		}), nil)
+		installManagerFixture(t, env.registry, fixture, SourceUser, true)
+
+		firstProc := newFakeProcess(101)
+		secondProc := newFakeProcess(202)
+		launcher := &fakeLauncher{queue: []*fakeProcess{firstProc, secondProc}}
+		startedManager := NewManager(
+			env.registry,
+			withProcessLauncher(launcher.launch),
+			withHealthPollBounds(time.Millisecond, 2*time.Millisecond),
+		)
+		if err := startedManager.Start(testutil.Context(t)); err != nil {
+			t.Fatalf("Start() error = %v", err)
+		}
+		t.Cleanup(func() {
+			if err := startedManager.Stop(testutil.Context(t)); err != nil {
+				t.Fatalf("Stop() cleanup error = %v", err)
+			}
+		})
+
+		if got, want := launcher.launchCount(), 1; got != want {
+			t.Fatalf("launch count after Start() = %d, want %d", got, want)
+		}
+
+		if err := startedManager.Reload(testutil.Context(t)); err != nil {
+			t.Fatalf("Reload(started manager) error = %v", err)
+		}
+
+		if got, want := launcher.launchCount(), 2; got != want {
+			t.Fatalf("launch count after Reload() = %d, want %d", got, want)
+		}
+		if got, want := firstProc.shutdownCnt, 1; got != want {
+			t.Fatalf("first process shutdown count = %d, want %d", got, want)
+		}
+		if got, want := len(secondProc.initRequests()), 1; got != want {
+			t.Fatalf("len(second process initialize requests) = %d, want %d", got, want)
+		}
+		statuses := startedManager.Statuses()
+		if got, want := len(statuses), 1; got != want {
+			t.Fatalf("len(Statuses()) = %d, want %d", got, want)
+		}
+		if got, want := statuses[0].PID, 202; got != want {
+			t.Fatalf("Statuses()[0].PID = %d, want %d after reload restart", got, want)
+		}
+	})
+
+	t.Run("Should serialize overlapping reloads", func(t *testing.T) {
+		t.Parallel()
+
+		withDaemonVersion(t, "0.5.0")
+		env := newRegistryTestEnv(t)
+		fixture := createManagerTestExtension(t, managerTestManifest("ext-reload-serialized", managerManifestOptions{
+			command:      "fake-extension",
+			capabilities: []string{"tool.provider"},
+			permissions:  []string{"sessions/list"},
+		}), nil)
+		installManagerFixture(t, env.registry, fixture, SourceUser, true)
+
+		secondInitializeStarted := make(chan struct{})
+		releaseSecondInitialize := make(chan struct{})
+		releaseSecond := sync.OnceFunc(func() { close(releaseSecondInitialize) })
+		t.Cleanup(releaseSecond)
+
+		firstProc := newFakeProcess(301)
+		secondProc := newFakeProcess(302)
+		secondProc.initHook = func() {
+			close(secondInitializeStarted)
+			<-releaseSecondInitialize
+		}
+		thirdProc := newFakeProcess(303)
+		launcher := &fakeLauncher{queue: []*fakeProcess{firstProc, secondProc, thirdProc}}
+		thirdLaunchStarted := make(chan struct{})
+		thirdLaunch := sync.OnceFunc(func() { close(thirdLaunchStarted) })
+		launch := func(ctx context.Context, cfg subprocess.LaunchConfig) (processHandle, error) {
+			process, err := launcher.launch(ctx, cfg)
+			if launcher.launchCount() >= 3 {
+				thirdLaunch()
+			}
+			return process, err
+		}
+
+		manager := NewManager(
+			env.registry,
+			withProcessLauncher(launch),
+			withHealthPollBounds(time.Millisecond, 2*time.Millisecond),
+		)
+		if err := manager.Start(testutil.Context(t)); err != nil {
+			t.Fatalf("Start() error = %v", err)
+		}
+		t.Cleanup(func() {
+			if err := manager.Stop(testutil.Context(t)); err != nil {
+				t.Fatalf("Stop() cleanup error = %v", err)
+			}
+		})
+
+		firstReloadErr := make(chan error, 1)
+		go func() {
+			firstReloadErr <- manager.Reload(testutil.Context(t))
+		}()
+		select {
+		case <-secondInitializeStarted:
+		case <-time.After(time.Second):
+			t.Fatal("first Reload() did not reach the second process initialization")
+		}
+
+		secondReloadStarted := make(chan struct{})
+		secondReloadErr := make(chan error, 1)
+		go func() {
+			close(secondReloadStarted)
+			secondReloadErr <- manager.Reload(testutil.Context(t))
+		}()
+		<-secondReloadStarted
+
+		select {
+		case <-thirdLaunchStarted:
+			t.Fatal("overlapping Reload() launched a third process before the first reload completed")
+		case <-time.After(100 * time.Millisecond):
+		}
+
+		releaseSecond()
+		for index, errCh := range []<-chan error{firstReloadErr, secondReloadErr} {
+			select {
+			case err := <-errCh:
+				if err != nil {
+					t.Fatalf("Reload() call %d error = %v", index+1, err)
+				}
+			case <-time.After(time.Second):
+				t.Fatalf("Reload() call %d did not complete", index+1)
+			}
+		}
+
+		statuses := manager.Statuses()
+		if got, want := len(statuses), 1; got != want {
+			t.Fatalf("len(Statuses()) = %d, want %d", got, want)
+		}
+		if got, want := statuses[0].PID, 303; got != want {
+			t.Fatalf("Statuses()[0].PID = %d, want %d after serialized reloads", got, want)
+		}
+	})
+}
+
+func TestManagerHelperPathsAndAccessors(t *testing.T) {
+	t.Parallel()
+
+	withDaemonVersion(t, "0.5.0")
+	env := newRegistryTestEnv(t)
+	fixture := createManagerTestExtension(t, managerTestManifest("ext-fallback", managerManifestOptions{
+		command:      "fake-extension",
+		capabilities: []string{"tool.provider"},
+		permissions:  []string{"sessions/list"},
+	}), nil)
+	installManagerFixture(t, env.registry, fixture, SourceUser, true)
+
+	manager := NewManager(env.registry)
+
+	fallback, err := manager.Get("ext-fallback")
+	if err != nil {
+		t.Fatalf("Get(ext-fallback) error = %v", err)
+	}
+	if fallback.Info.Name != "ext-fallback" || !fallback.Status.Enabled {
+		t.Fatalf("Get(ext-fallback) = %#v, want registry-backed enabled snapshot", fallback)
+	}
+	if _, err := manager.Get(" "); err == nil {
+		t.Fatal("Get(empty) error = nil, want validation error")
+	}
+
+	now := time.Now().UTC()
+	proc := newFakeProcess(707)
+	proc.health = subprocess.HealthState{
+		Healthy:       true,
+		Message:       "healthy",
+		LastCheckedAt: now,
+	}
+
+	manager.extensions = map[string]*managedExtension{
+		"zeta": {
+			info:                ExtensionInfo{Name: "zeta", Version: "1.0.0", Source: SourceUser, Enabled: true},
+			process:             proc,
+			active:              true,
+			registered:          true,
+			phase:               ExtensionPhaseActivate,
+			generation:          2,
+			awaitingStability:   true,
+			consecutiveFailures: 2,
+			restartBackoff:      2 * time.Second,
+			healthInterval:      40 * time.Millisecond,
+			runtime:             subprocess.InitializeRuntime{ShutdownTimeoutMS: 321},
+		},
+		"alpha": {
+			info:       ExtensionInfo{Name: "alpha", Version: "0.1.0", Source: SourceMarketplace, Enabled: false},
+			registered: false,
+			phase:      ExtensionPhaseDiscover,
+		},
+	}
+
+	listed := manager.List()
+	if got := []string{listed[0].Name, listed[1].Name}; !slices.Equal(got, []string{"alpha", "zeta"}) {
+		t.Fatalf("List() names = %#v, want sorted alpha/zeta", got)
+	}
+
+	statuses := manager.Statuses()
+	if got := []string{statuses[0].Name, statuses[1].Name}; !slices.Equal(got, []string{"alpha", "zeta"}) {
+		t.Fatalf("Statuses() names = %#v, want sorted alpha/zeta", got)
+	}
+	if statuses[1].PID != 707 || !statuses[1].Healthy || statuses[1].HealthMessage != "healthy" {
+		t.Fatalf("Statuses()[1] = %#v, want pid/health from process", statuses[1])
+	}
+
+	manager.markStable("zeta", 2)
+	if manager.extensions["zeta"].awaitingStability {
+		t.Fatal("awaitingStability = true, want false after markStable")
+	}
+	if manager.extensions["zeta"].consecutiveFailures != 0 || manager.extensions["zeta"].restartBackoff != 0 {
+		t.Fatalf(
+			"post-markStable failures/backoff = %d/%v, want 0/0",
+			manager.extensions["zeta"].consecutiveFailures,
+			manager.extensions["zeta"].restartBackoff,
+		)
+	}
+
+	current, interval, ok := manager.currentProcess("zeta", 2)
+	if !ok || current == nil || current.PID() != 707 || interval != 40*time.Millisecond {
+		t.Fatalf("currentProcess() = (%v, %v, %v), want process pid 707 and interval 40ms", current, interval, ok)
+	}
+	if manager.shouldStopSupervision("zeta", 2, proc) {
+		t.Fatal("shouldStopSupervision() = true, want false for current process")
+	}
+	manager.stopping = true
+	if !manager.shouldStopSupervision("zeta", 2, proc) {
+		t.Fatal("shouldStopSupervision() = false, want true while stopping")
+	}
+	manager.stopping = false
+
+	if got, want := manager.shutdownDeadlineForProcess("zeta", 2), 321*time.Millisecond; got != want {
+		t.Fatalf("shutdownDeadlineForProcess() = %v, want %v", got, want)
+	}
+	if got, want := manager.healthPollInterval(0), manager.healthPollCeiling; got != want {
+		t.Fatalf("healthPollInterval(0) = %v, want %v", got, want)
+	}
+	if got, want := manager.healthPollInterval(time.Millisecond), manager.healthPollFloor; got != want {
+		t.Fatalf("healthPollInterval(1ms) = %v, want %v", got, want)
+	}
+
+	select {
+	case <-manager.lifecycleDone():
+	default:
+		t.Fatal("lifecycleDone() returned open bridge, want closed bridge when lifecycle is nil")
+	}
+	if manager.lifecycleContext().Done() != nil {
+		t.Fatal("lifecycleContext() returned cancellable context, want background context")
+	}
+
+	if got := restartBackoff(0, 5*time.Second); got != 0 {
+		t.Fatalf("restartBackoff(0) = %v, want 0", got)
+	}
+	if got := restartBackoff(10, 5*time.Second); got != 5*time.Second {
+		t.Fatalf("restartBackoff(10) = %v, want capped 5s", got)
+	}
+
+	if !requiresSubprocess(&Manifest{Permissions: PermissionsConfig{Requires: []string{"sessions/list"}}}) {
+		t.Fatal("requiresSubprocess(permissions-only) = false, want true")
+	}
+	if !requiresSubprocess(
+		&Manifest{Resources: ResourcesConfig{Publish: ResourceGrantRequest{Families: []string{"tools"}}}},
+	) {
+		t.Fatal("requiresSubprocess(resource-publish) = false, want true")
+	}
+	if requiresSubprocess(&Manifest{}) {
+		t.Fatal("requiresSubprocess(empty manifest) = true, want false")
+	}
+	if got, want := skillSourceForExtension(SourceWorkspace), skillspkg.SourceWorkspace; got != want {
+		t.Fatalf("skillSourceForExtension(workspace) = %v, want %v", got, want)
+	}
+	if got, want := skillSourceForExtension(ExtensionSource(99)), skillspkg.SourceUser; got != want {
+		t.Fatalf("skillSourceForExtension(default) = %v, want %v", got, want)
+	}
+	if _, err := loadManifestAtPath(filepath.Join(t.TempDir(), "extension.txt")); err == nil {
+		t.Fatal("loadManifestAtPath(.txt) error = nil, want unsupported-extension error")
+	}
+}
+
+func TestManagerResolveCommandKeepsPathLikeValuesInsideExtensionRoot(t *testing.T) {
+	t.Parallel()
+
+	t.Run("Should preserve contained and absolute command paths", func(t *testing.T) {
+		t.Parallel()
+
+		manager := NewManager(nil)
+		root := t.TempDir()
+		inside := filepath.Join(root, "bin", "tool")
+		canonicalRoot, err := filepath.EvalSymlinks(root)
+		if err != nil {
+			t.Fatalf("filepath.EvalSymlinks(root) error = %v", err)
+		}
+		canonicalInside := filepath.Join(canonicalRoot, "bin", "tool")
+
+		got, err := manager.resolveCommand(root, "./bin/tool")
+		if err != nil {
+			t.Fatalf("resolveCommand(relative) error = %v", err)
+		}
+		if got != canonicalInside {
+			t.Fatalf("resolveCommand(relative) = %q, want %q", got, canonicalInside)
+		}
+
+		got, err = manager.resolveCommand(root, inside)
+		if err != nil {
+			t.Fatalf("resolveCommand(absolute inside) error = %v", err)
+		}
+		if got != inside {
+			t.Fatalf("resolveCommand(absolute inside) = %q, want %q", got, inside)
+		}
+
+		outsideCommand := filepath.Join(t.TempDir(), "tool")
+		got, err = manager.resolveCommand(root, outsideCommand)
+		if err != nil {
+			t.Fatalf("resolveCommand(absolute outside) error = %v", err)
+		}
+		if got != outsideCommand {
+			t.Fatalf("resolveCommand(absolute outside) = %q, want %q", got, outsideCommand)
+		}
+
+		got, err = manager.resolveCommand(root, "node")
+		if err != nil {
+			t.Fatalf("resolveCommand(bare) error = %v", err)
+		}
+		if got != "node" {
+			t.Fatalf("resolveCommand(bare) = %q, want %q", got, "node")
+		}
+
+		if _, err := manager.resolveCommand(root, "../outside/tool"); !errors.Is(err, ErrPathEscapesExtensionRoot) {
+			t.Fatalf("resolveCommand(escape) error = %v, want %v", err, ErrPathEscapesExtensionRoot)
+		}
+
+		if _, err := resolveResourcePath(root, "../skills"); !errors.Is(err, ErrPathEscapesExtensionRoot) {
+			t.Fatalf("resolveResourcePath(escape) error = %v, want %v", err, ErrPathEscapesExtensionRoot)
+		}
+
+		resourceRoot, err := resolveResourcePath(root, "skills")
+		if err != nil {
+			t.Fatalf("resolveResourcePath(within root) error = %v", err)
+		}
+		wantResourceRoot := filepath.Join(canonicalRoot, "skills")
+		if resourceRoot != wantResourceRoot {
+			t.Fatalf("resolveResourcePath(within root) = %q, want %q", resourceRoot, wantResourceRoot)
+		}
+	})
+}
+
+func TestManagerResolveEnvMapUsesSafeBaselineOnly(t *testing.T) {
+	t.Parallel()
+
+	manager := NewManager(nil, WithGetenv(func(key string) string {
+		switch key {
+		case "PATH":
+			return "/usr/bin:/bin"
+		case "HOME":
+			return "/tmp/home"
+		case "LANG":
+			return "en_US.UTF-8"
+		case "SECRET_TOKEN":
+			return "top-secret"
+		default:
+			return ""
+		}
+	}))
+
+	env, cleanups, err := manager.resolveEnvMap(t.Context(), t.TempDir(), map[string]string{
+		"APP_MODE": "sandbox",
+		"PATH":     "/custom/bin",
+	}, nil)
+	if err != nil {
+		t.Fatalf("resolveEnvMap() error = %v", err)
+	}
+	t.Cleanup(func() { runExtensionRedactionCleanups(cleanups) })
+
+	decoded := envListToMap(t, env)
+	if decoded["PATH"] != "/custom/bin" {
+		t.Fatalf("PATH = %q, want %q", decoded["PATH"], "/custom/bin")
+	}
+	if decoded["HOME"] != "/tmp/home" {
+		t.Fatalf("HOME = %q, want %q", decoded["HOME"], "/tmp/home")
+	}
+	if decoded["LANG"] != "en_US.UTF-8" {
+		t.Fatalf("LANG = %q, want %q", decoded["LANG"], "en_US.UTF-8")
+	}
+	if decoded["APP_MODE"] != "sandbox" {
+		t.Fatalf("APP_MODE = %q, want %q", decoded["APP_MODE"], "sandbox")
+	}
+	if _, ok := decoded["SECRET_TOKEN"]; ok {
+		t.Fatalf("resolveEnvMap() leaked SECRET_TOKEN in %#v", decoded)
+	}
+}
+
+func TestManagerCloneExtensionReturnsIsolatedSnapshot(t *testing.T) {
+	t.Parallel()
+
+	t.Run("Should isolate mutable runtime and permission snapshots", func(t *testing.T) {
+		t.Parallel()
+
+		manager := NewManager(nil)
+		ext := &managedExtension{
+			info: ExtensionInfo{
+				Name:    "snapshot",
+				Version: "1.0.0",
+				Source:  SourceUser,
+				Enabled: true,
+				Capabilities: CapabilitiesConfig{
+					Provides: []string{"tool.provider"},
+				},
+				Permissions: PermissionsConfig{
+					Requires: []string{"sessions/list"},
+				},
+			},
+			manifest: &Manifest{
+				Gateway: &GatewayRequirement{Permissions: []string{"gateway.private"}},
+				Name:    "snapshot",
+				Version: "1.0.0",
+				Resources: ResourcesConfig{
+					Skills: []ManifestResourcePath{{Path: "skills/"}},
+					Publish: ResourceGrantRequest{
+						Families: []string{"tools"},
+						MaxScope: resources.ResourceScopeKindWorkspace,
+					},
+				},
+				Capabilities: CapabilitiesConfig{
+					Provides: []string{"tool.provider"},
+				},
+				Permissions: PermissionsConfig{
+					Requires: []string{"sessions/list"},
+				},
+				Subprocess: SubprocessConfig{
+					Command: "snapshot-extension",
+					Args:    []string{"--config", "snapshot.toml"},
+					Env: map[string]string{
+						"TOKEN": "value",
+					},
+				},
+			},
+			skills: []*skillspkg.Skill{{
+				Meta: skillspkg.SkillMeta{
+					Name:        "snapshot-skill",
+					Description: "Snapshot skill",
+					Metadata: map[string]any{
+						"nested": map[string]any{"value": "original"},
+						"list":   []any{"original", map[string]any{"child": "value"}},
+					},
+				},
+				Hooks: []hookspkg.HookDecl{{
+					Name:      "snapshot-hook",
+					Args:      []string{"cleanup"},
+					Env:       map[string]string{"PHASE": "stop"},
+					SecretEnv: map[string]string{"TOKEN": "vault:hooks/snapshot-hook/token"},
+				}},
+				MCPServers: []skillspkg.MCPServerDecl{{
+					Name:    "snapshot-server",
+					Command: "server",
+					Args:    []string{"--once"},
+					Env:     map[string]string{"ROOT": "/tmp/original"},
+				}},
+				Provenance: &skillspkg.Provenance{
+					Hash: "hash-original",
+				},
+			}},
+			grantedResourceKinds:  []resources.ResourceKind{resources.ResourceKind("tool")},
+			grantedResourceScopes: []resources.ResourceScopeKind{resources.ResourceScopeKindWorkspace},
+			initialize: &subprocess.InitializeResponse{
+				ImplementedMethods:  []string{"shutdown"},
+				SupportedHookEvents: []string{"turn.start"},
+				AcceptedCapabilities: subprocess.AcceptedCapabilities{
+					Provides:    []string{"tool.provider"},
+					Permissions: []extensionprotocol.HostAPIMethod{"sessions/list"},
+				},
+			},
+		}
+
+		clone := manager.cloneExtension(ext)
+		if clone == nil {
+			t.Fatal("cloneExtension() = nil, want snapshot")
+			return
+		}
+
+		clone.Info.Capabilities.Provides[0] = "changed"
+		clone.Info.Permissions.Requires[0] = "changed"
+		clone.Manifest.Resources.Skills[0].Path = "changed"
+		clone.Manifest.Gateway.Permissions[0] = "gateway.public"
+		clone.Manifest.Subprocess.Env["TOKEN"] = "changed"
+		clone.Manifest.Resources.Publish.Families[0] = "changed"
+		clone.Skills[0].Meta.Name = "changed"
+		clone.Skills[0].Meta.Metadata["nested"].(map[string]any)["value"] = "changed"
+		clone.Skills[0].Meta.Metadata["list"].([]any)[0] = "changed"
+		clone.Skills[0].Meta.Metadata["list"].([]any)[1].(map[string]any)["child"] = "changed"
+		clone.Skills[0].Hooks[0].Args[0] = "changed"
+		clone.Skills[0].Hooks[0].SecretEnv["TOKEN"] = "vault:hooks/snapshot-hook/changed"
+		clone.Skills[0].MCPServers[0].Env["ROOT"] = "/tmp/changed"
+		clone.Skills[0].Provenance.Hash = "hash-changed"
+		clone.GrantedResourceKinds[0] = resources.ResourceKind("changed")
+		clone.GrantedResourceScopes[0] = resources.ResourceScopeKindUser
+		clone.InitializeResult.ImplementedMethods[0] = "changed"
+		clone.InitializeResult.AcceptedCapabilities.Provides[0] = "changed"
+
+		if ext.manifest.Gateway.Permissions[0] != "gateway.private" {
+			t.Fatalf("original gateway permissions mutated to %#v", ext.manifest.Gateway.Permissions)
+		}
+		if ext.info.Capabilities.Provides[0] != "tool.provider" {
+			t.Fatalf("original capabilities mutated to %#v", ext.info.Capabilities.Provides)
+		}
+		if ext.info.Permissions.Requires[0] != "sessions/list" {
+			t.Fatalf("original permissions mutated to %#v", ext.info.Permissions.Requires)
+		}
+		if ext.manifest.Resources.Skills[0].Path != "skills/" {
+			t.Fatalf("original manifest resources mutated to %#v", ext.manifest.Resources.Skills)
+		}
+		if ext.manifest.Resources.Publish.Families[0] != "tools" {
+			t.Fatalf("original manifest publish request mutated to %#v", ext.manifest.Resources.Publish)
+		}
+		if ext.manifest.Subprocess.Env["TOKEN"] != "value" {
+			t.Fatalf("original manifest env mutated to %#v", ext.manifest.Subprocess.Env)
+		}
+		if ext.skills[0].Meta.Name != "snapshot-skill" {
+			t.Fatalf("original skill name mutated to %q", ext.skills[0].Meta.Name)
+		}
+		if ext.skills[0].Meta.Metadata["nested"].(map[string]any)["value"] != "original" {
+			t.Fatalf("original skill metadata mutated to %#v", ext.skills[0].Meta.Metadata)
+		}
+		if ext.skills[0].Meta.Metadata["list"].([]any)[0] != "original" {
+			t.Fatalf("original skill metadata list mutated to %#v", ext.skills[0].Meta.Metadata["list"])
+		}
+		if ext.skills[0].Hooks[0].Args[0] != "cleanup" {
+			t.Fatalf("original skill hook args mutated to %#v", ext.skills[0].Hooks[0].Args)
+		}
+		if got, want := ext.skills[0].Hooks[0].SecretEnv["TOKEN"], "vault:hooks/snapshot-hook/token"; got != want {
+			t.Fatalf("original skill hook secret env mutated to %q, want %q", got, want)
+		}
+		if ext.skills[0].MCPServers[0].Env["ROOT"] != "/tmp/original" {
+			t.Fatalf("original skill MCP env mutated to %#v", ext.skills[0].MCPServers[0].Env)
+		}
+		if ext.skills[0].Provenance.Hash != "hash-original" {
+			t.Fatalf("original skill provenance mutated to %#v", ext.skills[0].Provenance)
+		}
+		if ext.grantedResourceKinds[0] != resources.ResourceKind("tool") {
+			t.Fatalf("original granted resource kinds mutated to %#v", ext.grantedResourceKinds)
+		}
+		if ext.grantedResourceScopes[0] != resources.ResourceScopeKindWorkspace {
+			t.Fatalf("original granted resource scopes mutated to %#v", ext.grantedResourceScopes)
+		}
+		if ext.initialize.ImplementedMethods[0] != "shutdown" {
+			t.Fatalf("original initialize methods mutated to %#v", ext.initialize.ImplementedMethods)
+		}
+		if ext.initialize.AcceptedCapabilities.Provides[0] != "tool.provider" {
+			t.Fatalf("original initialize provides mutated to %#v", ext.initialize.AcceptedCapabilities.Provides)
+		}
+	})
+}
+
+func TestManagerDirectPhaseAndMonitorBranches(t *testing.T) {
+	t.Parallel()
+
+	withDaemonVersion(t, "0.5.0")
+	manager := NewManager(nil, WithGetenv(func(key string) string {
+		if key == "EXT_MODE" {
+			return "resolved-mode"
+		}
+		return ""
+	}))
+
+	discover := &managedExtension{info: ExtensionInfo{Name: "ext-discover"}}
+	if err := manager.discoverExtension(discover); err == nil {
+		t.Fatal("discoverExtension() error = nil, want missing manifest path")
+	}
+	discover.info.ManifestPath = manifestTOMLFileName
+	if err := manager.discoverExtension(discover); err == nil {
+		t.Fatal("discoverExtension() error = nil, want invalid relative manifest path")
+	}
+
+	resolved, err := manager.resolveString("/tmp/ext", "{{config_dir}}/{{env:EXT_MODE}}")
+	if err != nil {
+		t.Fatalf("resolveString() error = %v", err)
+	}
+	if got, want := resolved, "/tmp/ext/resolved-mode"; got != want {
+		t.Fatalf("resolveString() = %q, want %q", got, want)
+	}
+	if _, err := manager.resolveString("/tmp/ext", "{{env:EXT_TOKEN"); err == nil {
+		t.Fatal("resolveString(invalid template) error = nil, want template error")
+	}
+
+	validate := &managedExtension{info: ExtensionInfo{Name: "ext-validate", Source: SourceUser}}
+	if err := manager.validateExtension(validate); err == nil {
+		t.Fatal("validateExtension(nil manifest) error = nil, want manifest-required error")
+	}
+	validate.manifest = &Manifest{Name: "other", Version: "1.0.0", MinCompozyVersion: "0.5.0"}
+	if err := manager.validateExtension(validate); err == nil {
+		t.Fatal("validateExtension(name mismatch) error = nil, want mismatch error")
+	}
+	validate.info.Version = "1.0.0"
+	validate.manifest = &Manifest{Name: "ext-validate", Version: "2.0.0", MinCompozyVersion: "0.5.0"}
+	if err := manager.validateExtension(validate); err == nil {
+		t.Fatal("validateExtension(version mismatch) error = nil, want mismatch error")
+	}
+	validate.info.Version = ""
+	validate.manifest = &Manifest{
+		Name:              "ext-validate",
+		Version:           "1.0.0",
+		MinCompozyVersion: "0.5.0",
+		Permissions:       PermissionsConfig{Requires: []string{"sessions/list"}},
+	}
+	if err := manager.validateExtension(validate); err == nil {
+		t.Fatal("validateExtension(missing subprocess command) error = nil, want subprocess validation error")
+	}
+
+	lite := &managedExtension{
+		info: ExtensionInfo{Name: "ext-lite", Source: SourceUser, Enabled: true},
+		manifest: &Manifest{
+			Name:              "ext-lite",
+			Version:           "1.0.0",
+			MinCompozyVersion: "0.5.0",
+		},
+	}
+	if err := manager.validateExtension(lite); err != nil {
+		t.Fatalf("validateExtension(lite) error = %v", err)
+	}
+	preparedLite, err := manager.prepareExtensionStartup(t.Context(), lite)
+	if err != nil {
+		t.Fatalf("prepareExtensionStartup(lite) error = %v", err)
+	}
+	lifecycleCtx, lifecycleCancel := context.WithCancel(t.Context())
+	t.Cleanup(lifecycleCancel)
+	manager.mu.Lock()
+	manager.started = true
+	manager.lifecycleCtx = lifecycleCtx
+	manager.cancel = lifecycleCancel
+	manager.mu.Unlock()
+	// Invariant: a declarative startup commits without a subprocess. Owner: startup transaction; canonical phase suite.
+	if err := manager.commitPreparedExtensionWithPublish(t.Context(), lite, preparedLite, nil); err != nil {
+		t.Fatalf("commitPreparedExtensionWithPublish(lite) error = %v", err)
+	}
+	if !lite.active || lite.phase != ExtensionPhaseActivate {
+		t.Fatalf("lite extension after activate = %#v, want active activate-phase extension", lite)
+	}
+
+	rootDir := t.TempDir()
+	skillsDir := filepath.Join(rootDir, "skills")
+	if err := os.MkdirAll(skillsDir, 0o755); err != nil {
+		t.Fatalf("os.MkdirAll(%q) error = %v", skillsDir, err)
+	}
+	writeFile(t, filepath.Join(skillsDir, "SKILL.md"), managerSkillFile("missing-registry", "Needs registry"))
+	referencesDir := filepath.Join(skillsDir, "references")
+	if err := os.MkdirAll(referencesDir, 0o755); err != nil {
+		t.Fatalf("os.MkdirAll(%q) error = %v", referencesDir, err)
+	}
+	writeFile(t, filepath.Join(referencesDir, "context.md"), "# Supporting context\n")
+	skillExt := &managedExtension{
+		info:    ExtensionInfo{Name: "ext-skills", Source: SourceUser},
+		rootDir: rootDir,
+		manifest: &Manifest{
+			Name:              "ext-skills",
+			Version:           "1.0.0",
+			MinCompozyVersion: "0.5.0",
+			Resources: ResourcesConfig{
+				Skills: []ManifestResourcePath{{Path: "skills"}},
+			},
+		},
+	}
+	declarations, err := manager.stageExtensionDeclarations(t.Context(), skillExt)
+	if err != nil {
+		t.Fatalf("stageExtensionDeclarations(skills) error = %v", err)
+	}
+	if len(declarations.skills) != 1 || declarations.skills[0].Meta.Name != "missing-registry" {
+		t.Fatalf(
+			"stageExtensionDeclarations(skills).skills = %#v, want loaded extension skill snapshot",
+			declarations.skills,
+		)
+	}
+
+	manager.capChecker.Register("ext-host", SourceUser, &Manifest{
+		Permissions: PermissionsConfig{Requires: []string{"sessions/list"}},
+	})
+	allowed := manager.wrapHostHandler(
+		"ext-host",
+		"sessions/list",
+		nil,
+		func(_ context.Context, _ json.RawMessage) (any, error) {
+			return "ok", nil
+		},
+	)
+	result, err := allowed(t.Context(), json.RawMessage(`{}`))
+	if err != nil || result != "ok" {
+		t.Fatalf("wrapHostHandler allowed call = (%v, %v), want (ok, nil)", result, err)
+	}
+
+	resourceSession := &hostAPIResourceSession{
+		Actor: resources.MutationActor{
+			Kind:         resources.MutationActorKindExtension,
+			ID:           "ext-host",
+			SessionNonce: "nonce-wrap",
+			Source: resources.ResourceSource{
+				Kind: resources.ResourceSourceKind("extension"),
+				ID:   "ext-host",
+			},
+			MaxScope:      resources.ResourceScope{Kind: resources.ResourceScopeKindUser},
+			GrantedKinds:  []resources.ResourceKind{"tool.definition"},
+			GrantedScopes: []resources.ResourceScopeKind{resources.ResourceScopeKindUser},
+		},
+	}
+	injected := manager.wrapHostHandler(
+		InstanceKey{Name: "ext-host", ProfileID: "profile-host", WorkspaceID: "workspace-host"},
+		"sessions/list",
+		resourceSession,
+		func(ctx context.Context, _ json.RawMessage) (any, error) {
+			if got := hostAPIExtensionNameFromContext(ctx); got != "ext-host" {
+				t.Fatalf("hostAPIExtensionNameFromContext(ctx) = %q, want ext-host", got)
+			}
+			key, ok := hostAPIInstanceKeyFromContext(ctx)
+			if !ok || key.ProfileID != "profile-host" || key.WorkspaceID != "workspace-host" {
+				t.Fatalf("hostAPIInstanceKeyFromContext(ctx) = %#v, %t, want profile/workspace scope", key, ok)
+			}
+
+			session, ok := hostAPIResourceSessionFromContext(ctx)
+			if !ok {
+				t.Fatal("hostAPIResourceSessionFromContext(ctx) = false, want true")
+			}
+			if got := session.Actor.SessionNonce; got != "nonce-wrap" {
+				t.Fatalf("session.Actor.SessionNonce = %q, want nonce-wrap", got)
+			}
+			return "injected", nil
+		},
+	)
+	result, err = injected(t.Context(), json.RawMessage(`{}`))
+	if err != nil || result != "injected" {
+		t.Fatalf("wrapHostHandler injected call = (%v, %v), want (injected, nil)", result, err)
+	}
+
+	denied := manager.wrapHostHandler(
+		"ext-denied",
+		"sessions/list",
+		nil,
+		func(_ context.Context, _ json.RawMessage) (any, error) {
+			return "never", nil
+		},
+	)
+	if _, err := denied(t.Context(), nil); err == nil {
+		t.Fatal("wrapHostHandler denied call error = nil, want capability denial")
+	}
+
+	monitorManager := NewManager(nil, withHealthPollBounds(time.Millisecond, time.Millisecond))
+	monitorCtx := t.Context()
+	monitorManager.lifecycleCtx = monitorCtx
+	unhealthy := newFakeProcess(808)
+	unhealthy.health = subprocess.HealthState{
+		Healthy:       false,
+		Message:       "probe failed",
+		LastError:     "rpc timeout",
+		LastCheckedAt: time.Now().UTC(),
+	}
+	monitorManager.extensions = map[string]*managedExtension{
+		"ext-health": {
+			info:           ExtensionInfo{Name: "ext-health"},
+			process:        unhealthy,
+			generation:     1,
+			healthInterval: 4 * time.Millisecond,
+			runtime:        subprocess.InitializeRuntime{ShutdownTimeoutMS: 7},
+		},
+	}
+
+	shouldRecover, reason := monitorManager.monitorProcess("ext-health", 1, unhealthy, 4*time.Millisecond)
+	if !shouldRecover {
+		t.Fatal("monitorProcess() shouldRecover = false, want true for unhealthy process")
+	}
+	if reason == nil || !strings.Contains(reason.Error(), "health check failed") ||
+		!strings.Contains(reason.Error(), "rpc timeout") {
+		t.Fatalf("monitorProcess() reason = %v, want joined health failure detail", reason)
+	}
+	if unhealthy.shutdownCnt != 1 {
+		t.Fatalf("Shutdown count = %d, want 1 after unhealthy process", unhealthy.shutdownCnt)
+	}
+}
+
+type managerFixture struct {
+	dir      string
+	manifest *Manifest
+	checksum string
+}
+
+type managerManifestOptions struct {
+	command          string
+	args             []string
+	withEnv          map[string]string
+	requiresEnv      []string
+	withSkills       bool
+	withAgents       bool
+	withHooks        bool
+	withMCP          bool
+	resourceFamilies []string
+	resourceMaxScope string
+	minVersion       string
+	capabilities     []string
+	permissions      []string
+	shutdown         time.Duration
+}
+
+type fakeLauncher struct {
+	mu     sync.Mutex
+	queue  []*fakeProcess
+	config []subprocess.LaunchConfig
+}
+
+func (l *fakeLauncher) launch(_ context.Context, cfg subprocess.LaunchConfig) (processHandle, error) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	l.config = append(l.config, cfg)
+	if len(l.queue) == 0 {
+		return nil, errors.New("no fake processes queued")
+	}
+	process := l.queue[0]
+	l.queue = l.queue[1:]
+	return process, nil
+}
+
+func (l *fakeLauncher) launchCount() int {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return len(l.config)
+}
+
+type fakeProcess struct {
+	mu          sync.Mutex
+	pid         int
+	done        chan struct{}
+	waitErr     error
+	closed      bool
+	initReqs    []subprocess.InitializeRequest
+	initResp    subprocess.InitializeResponse
+	initErr     error
+	initHook    func()
+	health      subprocess.HealthState
+	handlers    map[string]subprocess.HandlerFunc
+	callFn      func(context.Context, string, any, any) error
+	shutdownFn  func(context.Context) error
+	shutdownCnt int
+}
+
+func newFakeProcess(pid int) *fakeProcess {
+	return &fakeProcess{
+		pid:      pid,
+		done:     make(chan struct{}),
+		handlers: make(map[string]subprocess.HandlerFunc),
+		health: subprocess.HealthState{
+			Healthy: true,
+		},
+	}
+}
+
+func (p *fakeProcess) HandleMethod(method string, handler subprocess.HandlerFunc) error {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.handlers[method] = handler
+	return nil
+}
+
+func (p *fakeProcess) Initialize(
+	_ context.Context,
+	req subprocess.InitializeRequest,
+) (subprocess.InitializeResponse, error) {
+	p.mu.Lock()
+	p.initReqs = append(p.initReqs, req)
+	resp := p.initResp
+	err := p.initErr
+	hook := p.initHook
+	p.mu.Unlock()
+
+	if err != nil {
+		return subprocess.InitializeResponse{}, err
+	}
+	if resp.ProtocolVersion == "" {
+		resp = fakeInitializeResponse(req)
+	}
+	if hook != nil {
+		hook()
+	}
+	return resp, nil
+}
+
+func (p *fakeProcess) Call(ctx context.Context, method string, params, result any) error {
+	p.mu.Lock()
+	callFn := p.callFn
+	p.mu.Unlock()
+	if callFn != nil {
+		return callFn(ctx, method, params, result)
+	}
+	return nil
+}
+
+func (p *fakeProcess) Shutdown(ctx context.Context) error {
+	p.mu.Lock()
+	p.shutdownCnt++
+	shutdownFn := p.shutdownFn
+	p.mu.Unlock()
+
+	if shutdownFn != nil {
+		return shutdownFn(ctx)
+	}
+	p.close(nil)
+	return nil
+}
+
+func (p *fakeProcess) Done() <-chan struct{} {
+	return p.done
+}
+
+func (p *fakeProcess) Wait() error {
+	<-p.done
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.waitErr
+}
+
+func (p *fakeProcess) HealthState() subprocess.HealthState {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.health
+}
+
+func (p *fakeProcess) PID() int {
+	return p.pid
+}
+
+func (p *fakeProcess) initRequests() []subprocess.InitializeRequest {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return append([]subprocess.InitializeRequest(nil), p.initReqs...)
+}
+
+func (p *fakeProcess) crash(err error) {
+	p.close(err)
+}
+
+func (p *fakeProcess) close(err error) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if p.closed {
+		return
+	}
+	p.closed = true
+	p.waitErr = err
+	close(p.done)
+}
+
+func fakeInitializeResponse(req subprocess.InitializeRequest) subprocess.InitializeResponse {
+	implemented := append([]string{"health_check", "shutdown"}, req.Methods.ExtensionServices...)
+	slices.Sort(implemented)
+	return subprocess.InitializeResponse{
+		ProtocolVersion: req.ProtocolVersion,
+		ExtensionInfo: subprocess.InitializeExtensionInfo{
+			Name:    req.Extension.Name,
+			Version: req.Extension.Version,
+		},
+		AcceptedCapabilities: subprocess.AcceptedCapabilities{
+			Provides:    slices.Clone(req.Capabilities.Provides),
+			Permissions: slices.Clone(req.Capabilities.GrantedPermissions),
+		},
+		ImplementedMethods:  implemented,
+		SupportedHookEvents: []string{string(hookspkg.HookTurnStart)},
+		Supports: subprocess.InitializeSupports{
+			HealthCheck: true,
+		},
+	}
+}
+
+type extensionHelperServer struct {
+	scenario string
+	marker   string
+
+	mu         sync.Mutex
+	writer     *bufio.Writer
+	pendingReq string
+	extension  string
+}
+
+func newExtensionHelperServer(scenario string, marker string) *extensionHelperServer {
+	return &extensionHelperServer{
+		scenario: strings.TrimSpace(scenario),
+		marker:   marker,
+		writer:   bufio.NewWriter(os.Stdout),
+	}
+}
+
+func (h *extensionHelperServer) run() int {
+	scanner := bufio.NewScanner(os.Stdin)
+	scanner.Buffer(make([]byte, 0, 1024), 10<<20)
+
+	for scanner.Scan() {
+		line := strings.TrimSpace(scanner.Text())
+		if line == "" {
+			continue
+		}
+
+		var envelope map[string]json.RawMessage
+		if err := json.Unmarshal([]byte(line), &envelope); err != nil {
+			return 1
+		}
+
+		if _, ok := envelope["method"]; ok {
+			var req helperRequest
+			if err := json.Unmarshal([]byte(line), &req); err != nil {
+				return 1
+			}
+			if err := h.handleRequest(req); err != nil {
+				return 1
+			}
+			continue
+		}
+
+		var response helperResponse
+		if err := json.Unmarshal([]byte(line), &response); err != nil {
+			return 1
+		}
+		h.handleResponse(response)
+	}
+
+	if err := scanner.Err(); err != nil {
+		return 1
+	}
+	return 0
+}
+
+func (h *extensionHelperServer) handleRequest(req helperRequest) error {
+	switch req.Method {
+	case "$/cancelRequest":
+		return nil
+	case "initialize":
+		var params subprocess.InitializeRequest
+		if err := json.Unmarshal(req.Params, &params); err != nil {
+			return err
+		}
+		if h.scenario == "connectivity_secret_error" {
+			return h.sendError(req.ID, -32050, "api_key=sk-connectivity-secret", map[string]string{
+				"token": "sk-connectivity-secret",
+			})
+		}
+		if h.scenario == "connectivity_secret_stdout" {
+			return h.writeRaw("api_key=sk-connectivity-secret\n")
+		}
+		response := fakeInitializeResponse(params)
+		if h.scenario == "heartbeat_source" {
+			response.HeartbeatSourceKinds = []extensionprotocol.HeartbeatSourceKind{
+				{
+					Kind:  "issues",
+					Title: "Issues",
+					ParamsSchema: json.RawMessage(
+						`{"type":"object","required":["repo"],"properties":{"repo":{"type":"string"}}}`,
+					),
+				},
+			}
+		}
+		if h.scenario == "connectivity_unimplemented" {
+			response.ImplementedMethods = slices.DeleteFunc(response.ImplementedMethods, func(method string) bool {
+				return method == string(extensionprotocol.ExtensionServiceMethodConnectivityTeardown)
+			})
+		}
+		h.mu.Lock()
+		h.extension = params.Extension.Name
+		h.mu.Unlock()
+		if err := h.sendResult(req.ID, response); err != nil {
+			return err
+		}
+		if h.scenario == "record_initialize" || h.scenario == "auto_exit_record_initialize" ||
+			h.scenario == "connectivity_teardown_hang" || h.scenario == "connectivity_crash_after_establish" ||
+			h.scenario == "connectivity_teardown_refused" || h.scenario == "connectivity_malformed" ||
+			h.scenario == "connectivity_crash" {
+			if err := h.recordInitialize(params, response); err != nil {
+				return err
+			}
+		}
+
+		switch h.scenario {
+		case "host_call":
+			h.mu.Lock()
+			h.pendingReq = "host-1"
+			h.mu.Unlock()
+			go func() {
+				time.Sleep(15 * time.Millisecond)
+				if err := h.sendRequest("host-1", "sessions/list", map[string]string{"workspace": "ext"}); err != nil {
+					os.Exit(1)
+				}
+			}()
+			return nil
+		case "auto_exit":
+			if h.marker != "" {
+				if err := appendMarkerLine(h.marker, fmt.Sprintf("%d", os.Getpid())); err != nil {
+					return err
+				}
+			}
+			go func() {
+				time.Sleep(15 * time.Millisecond)
+				os.Exit(1)
+			}()
+		case "auto_exit_record_initialize":
+			go func() {
+				time.Sleep(15 * time.Millisecond)
+				os.Exit(1)
+			}()
+		case "connectivity_malformed":
+			go func() {
+				time.Sleep(15 * time.Millisecond)
+				if err := h.writeRaw("{malformed-json-rpc\n"); err != nil {
+					os.Exit(1)
+				}
+			}()
+		case "connectivity_crash":
+			go func() {
+				time.Sleep(15 * time.Millisecond)
+				os.Exit(1)
+			}()
+		}
+		return nil
+	case "health_check":
+		if err := h.sendResult(req.ID, subprocess.HealthCheckResponse{Healthy: true}); err != nil {
+			return err
+		}
+		if h.scenario == "retired_host_call" {
+			h.mu.Lock()
+			h.pendingReq = "host-retired"
+			h.mu.Unlock()
+			return h.sendRequest("host-retired", "memory/recall", map[string]string{"query": "needle"})
+		}
+		return nil
+
+	case "heartbeat/source_poll":
+		return h.sendResult(
+			req.ID,
+			map[string]any{
+				"items": []map[string]string{{"key": "issue:1", "title": "New issue"}},
+				"state": map[string]int{"cursor": 1},
+			},
+		)
+	case "models/list":
+		var params extensioncontract.ModelSourceListParams
+		if err := json.Unmarshal(req.Params, &params); err != nil {
+			return err
+		}
+		if h.scenario == "model_source_error" {
+			return h.sendError(req.ID, -32020, "Model source unavailable", map[string]string{
+				"error": "model source unavailable",
+			})
+		}
+		sourceID, err := modelcatalog.SourceKindExtensionID(h.extensionName())
+		if err != nil {
+			return err
+		}
+		providerID := strings.TrimSpace(params.ProviderID)
+		if providerID == "" {
+			providerID = "codex"
+		}
+		row := extensioncontract.ModelSourceRow{
+			SourceID:    sourceID,
+			ProviderID:  providerID,
+			ModelID:     "subprocess-model",
+			DisplayName: "Subprocess Model",
+			Priority:    modelcatalog.PriorityExtension,
+		}
+		if h.scenario == "model_source_malformed" {
+			row.ModelID = ""
+		}
+		return h.sendResult(req.ID, extensioncontract.ModelSourceListResponse{
+			Rows: []extensioncontract.ModelSourceRow{row},
+		})
+	case "provide_tools":
+		return h.sendResult(req.ID, h.toolRuntimeDescriptors())
+	case "tools/call":
+		var params toolspkg.ExtensionToolCallRequest
+		if err := json.Unmarshal(req.Params, &params); err != nil {
+			return err
+		}
+		if h.scenario == "tool_call_slow" {
+			time.Sleep(200 * time.Millisecond)
+		}
+		if h.scenario == "tool_call_error" {
+			return h.sendError(req.ID, -32010, "Tool execution failed", map[string]string{
+				"error": "handler failed",
+			})
+		}
+		prefix := "search"
+		if h.scenario == "tool_call_generation_marker" {
+			prefix = "generation:" + h.marker
+		}
+		return h.sendResult(req.ID, toolspkg.ExtensionToolCallResponse{
+			Result: toolspkg.ToolResult{
+				Content: []toolspkg.ToolContent{{
+					Type: "text",
+					Text: fmt.Sprintf("%s:%s", prefix, strings.TrimSpace(string(params.Input))),
+				}},
+			},
+		})
+	case string(extensionprotocol.ExtensionServiceMethodConnectivityEstablish):
+		var params extensioncontract.ConnectivityEstablishRequest
+		if err := json.Unmarshal(req.Params, &params); err != nil {
+			return err
+		}
+		tier := strings.TrimSpace(params.Tier)
+		if h.scenario == "connectivity_wrong_tier" {
+			tier = "public"
+		}
+		endpointURL := "https://gateway.example.test"
+		if h.scenario == "connectivity_endpoint" {
+			endpointURL = h.marker
+		}
+		if err := h.sendResult(req.ID, extensioncontract.ConnectivityReachability{
+			Tier: tier,
+			Endpoints: []extensioncontract.ConnectivityAdvertisedEndpoint{{
+				URL: endpointURL, Scheme: "https", Stability: "stable",
+			}},
+			Health: "healthy",
+		}); err != nil {
+			return err
+		}
+		if h.scenario == "connectivity_crash_after_establish" {
+			if err := appendMarkerLine(h.marker, fmt.Sprintf("%d", os.Getpid())); err != nil {
+				return err
+			}
+			go func() {
+				time.Sleep(5 * time.Millisecond)
+				os.Exit(1)
+			}()
+		}
+		return nil
+	case string(extensionprotocol.ExtensionServiceMethodConnectivityStatus):
+		var params extensioncontract.ConnectivityStatusRequest
+		if err := json.Unmarshal(req.Params, &params); err != nil {
+			return err
+		}
+		endpointURL := "https://gateway.example.test"
+		if h.scenario == "connectivity_endpoint" {
+			endpointURL = h.marker
+		}
+		return h.sendResult(req.ID, extensioncontract.ConnectivityReachability{
+			Tier: strings.TrimSpace(params.Tier),
+			Endpoints: []extensioncontract.ConnectivityAdvertisedEndpoint{{
+				URL: endpointURL, Scheme: "https", Stability: "stable",
+			}},
+			Health: "healthy",
+		})
+	case string(extensionprotocol.ExtensionServiceMethodConnectivityTeardown):
+		if h.scenario == "connectivity_method_not_found" {
+			return h.sendError(req.ID, -32601, "Method not found", nil)
+		}
+		if h.scenario == "connectivity_teardown_hang" {
+			select {}
+		}
+		if h.scenario == "connectivity_teardown_refused" {
+			return h.sendResult(req.ID, extensioncontract.ConnectivityTeardownResponse{Stopped: false})
+		}
+		return h.sendResult(req.ID, extensioncontract.ConnectivityTeardownResponse{Stopped: true})
+	case "shutdown":
+		if h.scenario == "shutdown_hang" {
+			select {}
+		}
+		if h.marker != "" && h.scenario != "tool_call_generation_marker" &&
+			h.scenario != "connectivity_endpoint" && h.scenario != "connectivity_teardown_refused" {
+			if err := os.WriteFile(h.marker, []byte("shutdown"), 0o600); err != nil {
+				return err
+			}
+		}
+		if err := h.sendResult(req.ID, subprocess.ShutdownResponse{Acknowledged: true}); err != nil {
+			return err
+		}
+		return nil
+	default:
+		return h.sendResult(req.ID, map[string]any{})
+	}
+}
+
+func (h *extensionHelperServer) toolRuntimeDescriptors() toolspkg.ExtensionProvideToolsResponse {
+	id, err := toolspkg.CanonicalToolID("ext", h.extensionName(), "search")
+	if err != nil {
+		id = "ext__helper__search"
+	}
+	descriptor := toolspkg.ExtensionToolRuntimeDescriptor{
+		ID:                id,
+		Handler:           "search",
+		InputSchemaDigest: "1dc63095e8672403bbe40fa26719d175e695c0167f6daad6b9655f6506491f01",
+		ReadOnly:          true,
+		Risk:              toolspkg.RiskRead,
+	}
+	switch h.scenario {
+	case "tool_runtime_handler_mismatch":
+		descriptor.Handler = "lookup"
+	case "tool_runtime_schema_mismatch":
+		descriptor.InputSchemaDigest = "bad-digest"
+	case "tool_runtime_risk_mismatch":
+		descriptor.ReadOnly = false
+		descriptor.Risk = toolspkg.RiskMutating
+	case "tool_runtime_missing_handler":
+		descriptor.Handler = ""
+	}
+	return toolspkg.ExtensionProvideToolsResponse{
+		Tools: []toolspkg.ExtensionToolRuntimeDescriptor{descriptor},
+	}
+}
+
+func (h *extensionHelperServer) extensionName() string {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	return strings.TrimSpace(h.extension)
+}
+
+func (h *extensionHelperServer) handleResponse(resp helperResponse) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	if h.pendingReq == "" || fmt.Sprint(resp.ID) != h.pendingReq || h.marker == "" {
+		return
+	}
+	if h.scenario == "retired_host_call" && len(resp.Error) > 0 {
+		if err := fileutil.AtomicWriteFile(h.marker, resp.Error, 0o600); err != nil {
+			h.pendingReq = ""
+			return
+		}
+	}
+	if len(resp.Result) > 0 {
+		if err := fileutil.AtomicWriteFile(h.marker, resp.Result, 0o600); err != nil {
+			h.pendingReq = ""
+			return
+		}
+	}
+	h.pendingReq = ""
+}
+
+func (h *extensionHelperServer) sendRequest(id string, method string, params any) error {
+	payload := map[string]any{
+		"jsonrpc": "2.0",
+		"id":      id,
+		"method":  method,
+		"params":  params,
+	}
+	return h.write(payload)
+}
+
+func (h *extensionHelperServer) sendResult(id any, result any) error {
+	payload := map[string]any{
+		"jsonrpc": "2.0",
+		"id":      id,
+		"result":  result,
+	}
+	return h.write(payload)
+}
+
+func (h *extensionHelperServer) sendError(id any, code int, message string, data any) error {
+	payload := map[string]any{
+		"jsonrpc": "2.0",
+		"id":      id,
+		"error": map[string]any{
+			"code":    code,
+			"message": message,
+			"data":    data,
+		},
+	}
+	return h.write(payload)
+}
+
+func (h *extensionHelperServer) write(payload any) error {
+	data, err := json.Marshal(payload)
+	if err != nil {
+		return err
+	}
+
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	if _, err := h.writer.Write(append(data, '\n')); err != nil {
+		return err
+	}
+	return h.writer.Flush()
+}
+
+func (h *extensionHelperServer) writeRaw(payload string) error {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	if _, err := h.writer.WriteString(payload); err != nil {
+		return err
+	}
+	return h.writer.Flush()
+}
+
+func (h *extensionHelperServer) recordInitialize(
+	request subprocess.InitializeRequest,
+	response subprocess.InitializeResponse,
+) error {
+	if strings.TrimSpace(h.marker) == "" {
+		return nil
+	}
+
+	payload, err := json.Marshal(struct {
+		Request  subprocess.InitializeRequest  `json:"request"`
+		Response subprocess.InitializeResponse `json:"response"`
+	}{
+		Request:  request,
+		Response: response,
+	})
+	if err != nil {
+		return err
+	}
+	return appendMarkerLine(h.marker, string(payload))
+}
+
+type helperRequest struct {
+	ID     any             `json:"id"`
+	Method string          `json:"method"`
+	Params json.RawMessage `json:"params"`
+}
+
+type helperResponse struct {
+	ID     any             `json:"id"`
+	Result json.RawMessage `json:"result"`
+	Error  json.RawMessage `json:"error"`
+}
+
+func createManagerTestExtension(t *testing.T, manifestContent string, files map[string]string) managerFixture {
+	t.Helper()
+
+	dir := t.TempDir()
+	writeFile(t, filepath.Join(dir, manifestTOMLFileName), manifestContent)
+	for relPath, content := range files {
+		absPath := filepath.Join(dir, relPath)
+		if err := os.MkdirAll(filepath.Dir(absPath), 0o755); err != nil {
+			t.Fatalf("os.MkdirAll(%q) error = %v", filepath.Dir(absPath), err)
+		}
+		writeFile(t, absPath, content)
+	}
+
+	manifest, err := LoadManifest(dir)
+	if err != nil {
+		t.Fatalf("LoadManifest(%q) error = %v", dir, err)
+	}
+	checksum, err := ComputeDirectoryChecksum(dir)
+	if err != nil {
+		t.Fatalf("ComputeDirectoryChecksum(%q) error = %v", dir, err)
+	}
+
+	return managerFixture{
+		dir:      dir,
+		manifest: manifest,
+		checksum: checksum,
+	}
+}
+
+func installManagerFixture(
+	t *testing.T,
+	registry *Registry,
+	fixture managerFixture,
+	source ExtensionSource,
+	enabled bool,
+) {
+	t.Helper()
+
+	if err := registry.Install(fixture.manifest, fixture.dir, fixture.checksum, WithInstallSource(source)); err != nil {
+		t.Fatalf("Install(%q) error = %v", fixture.manifest.Name, err)
+	}
+	if !enabled {
+		if err := registry.Disable(fixture.manifest.Name); err != nil {
+			t.Fatalf("Disable(%q) error = %v", fixture.manifest.Name, err)
+		}
+	}
+}
+
+func managerSkillFile(name string, description string) string {
+	return fmt.Sprintf(
+		`---
+name: %s
+description: %s
+---
+Use this skill carefully.
+`,
+		name,
+		description,
+	)
+}
+
+func managerAgentFile(name string) string {
+	return fmt.Sprintf(
+		`---
+name: %s
+provider: codex
+---
+Prompt body.
+`,
+		name,
+	)
+}
+
+func managerTestManifest(name string, opts managerManifestOptions) string {
+	minVersion := opts.minVersion
+	if minVersion == "" {
+		minVersion = "0.5.0"
+	}
+	command := opts.command
+	if command == "" {
+		command = "fake-extension"
+	}
+	capabilities := opts.capabilities
+	if len(capabilities) == 0 {
+		capabilities = []string{"tool.provider"}
+	}
+	permissions := opts.permissions
+	if len(permissions) == 0 {
+		permissions = []string{"sessions/list"}
+	}
+
+	var builder strings.Builder
+	fmt.Fprintf(&builder, `[extension]
+name = %q
+version = "0.2.1"
+description = "Extension manager test fixture"
+min_compozy_version = %q
+`, name, minVersion)
+	if len(opts.requiresEnv) > 0 {
+		builder.WriteString("requires_env = " + tomlStringArray(opts.requiresEnv) + "\n")
+	}
+	builder.WriteString(`
+[resources]
+`)
+	if opts.withSkills {
+		builder.WriteString(`[[resources.skills]]
+path = "skills/"
+`)
+	}
+	if opts.withAgents {
+		builder.WriteString(`[[resources.agents]]
+path = "agents/"
+`)
+	}
+	if opts.withHooks {
+		builder.WriteString(`
+[[resources.hooks]]
+name = "` + name + `-hook"
+event = "turn.start"
+mode = "sync"
+executor.kind = "subprocess"
+executor.command = "./bin/hook"
+executor.args = ["--hook"]
+`)
+	}
+	if opts.withMCP {
+		builder.WriteString(`
+[resources.mcp_servers]
+[resources.mcp_servers.kubectl]
+command = "mcp-kubectl"
+args = ["--context", "prod"]
+`)
+	}
+	if len(opts.resourceFamilies) > 0 || strings.TrimSpace(opts.resourceMaxScope) != "" {
+		builder.WriteString(`
+[resources.publish]
+`)
+		if len(opts.resourceFamilies) > 0 {
+			builder.WriteString("families = " + tomlStringArray(opts.resourceFamilies) + "\n")
+		}
+		if scope := strings.TrimSpace(opts.resourceMaxScope); scope != "" {
+			builder.WriteString(`max_scope = "` + scope + `"
+`)
+		}
+	}
+
+	builder.WriteString(`
+[capabilities]
+provides = ` + tomlStringArray(capabilities) + `
+
+`)
+	builder.WriteString(`[permissions]
+requires = ` + tomlStringArray(permissions) + `
+
+[subprocess]
+command = ` + fmt.Sprintf("%q", command) + `
+`)
+	if len(opts.args) > 0 {
+		builder.WriteString(`args = ` + tomlStringArray(opts.args) + `
+`)
+	}
+	if opts.shutdown > 0 {
+		builder.WriteString(`shutdown_timeout = "` + opts.shutdown.String() + `"
+`)
+	}
+	if len(opts.withEnv) > 0 {
+		builder.WriteString(`
+[subprocess.env]
+`)
+		keys := make([]string, 0, len(opts.withEnv))
+		for key := range opts.withEnv {
+			keys = append(keys, key)
+		}
+		slices.Sort(keys)
+		for _, key := range keys {
+			fmt.Fprintf(&builder, "%s = %q\n", key, opts.withEnv[key])
+		}
+	}
+	return builder.String()
+}
+
+func helperCommand(t *testing.T) string {
+	t.Helper()
+	command, err := os.Executable()
+	if err != nil {
+		t.Fatalf("os.Executable() error = %v", err)
+	}
+	return command
+}
+
+func helperArgs() []string {
+	return []string{
+		"-test.run=TestExtensionManagerHelperProcess",
+	}
+}
+
+func helperEnv(scenario string, markerPath string) map[string]string {
+	env := map[string]string{
+		extensionHelperEnvKey:      "1",
+		extensionHelperScenarioKey: scenario,
+	}
+	if strings.TrimSpace(markerPath) != "" {
+		env[extensionHelperMarkerKey] = markerPath
+	}
+	return env
+}
+
+func appendMarkerLine(path string, line string) (err error) {
+	target := strings.TrimSpace(path)
+	if target == "" {
+		return nil
+	}
+	if err := os.MkdirAll(filepath.Dir(target), 0o755); err != nil {
+		return err
+	}
+	file, err := os.OpenFile(target, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o600)
+	if err != nil {
+		return err
+	}
+	defer func() {
+		if closeErr := file.Close(); closeErr != nil && err == nil {
+			err = closeErr
+		}
+	}()
+	_, err = fmt.Fprintf(file, "%s\n", strings.TrimSpace(line))
+	return err
+}
+
+func markerLineCount(path string) int {
+	payload, err := os.ReadFile(strings.TrimSpace(path))
+	if err != nil {
+		return 0
+	}
+	count := 0
+	for line := range strings.SplitSeq(string(payload), "\n") {
+		if strings.TrimSpace(line) == "" {
+			continue
+		}
+		count++
+	}
+	return count
+}
+
+func envListToMap(t testing.TB, env []string) map[string]string {
+	t.Helper()
+
+	decoded := make(map[string]string, len(env))
+	for _, entry := range env {
+		key, value, ok := strings.Cut(entry, "=")
+		if !ok {
+			t.Fatalf("env entry %q missing '=' separator", entry)
+		}
+		decoded[key] = value
+	}
+	return decoded
+}
+
+func waitForManagerCondition(t *testing.T, timeout time.Duration, fn func() bool) {
+	t.Helper()
+
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		if fn() {
+			return
+		}
+		time.Sleep(time.Millisecond)
+	}
+	t.Fatal("timed out waiting for manager condition")
+}
+
+func TestManagerReusesUnchangedSkillParses(t *testing.T) {
+	t.Parallel()
+	t.Run("Should reject escaping sidecars before loading a skill", func(t *testing.T) {
+		t.Parallel()
+		root := t.TempDir()
+		writeCachedSkills(t, root, "alpha")
+		file := cachedSkillFile(t, root, "alpha")
+		outside := filepath.Join(t.TempDir(), "outside.json")
+		writeFile(t, outside, `{}`)
+		if err := os.Symlink(outside, filepath.Join(filepath.Dir(file), "mcp.json")); err != nil {
+			t.Fatal(err)
+		}
+		manager := NewManager(nil)
+		_, err := manager.cachedSkillResource(
+			file,
+			skillspkg.SourceUser,
+			func(string, skillspkg.SkillSource) (*skillspkg.Skill, error) {
+				t.Fatal("escaped sidecar reached loader")
+				return nil, nil
+			},
+		)
+		if err == nil || !strings.Contains(err.Error(), "escapes") {
+			t.Fatalf("cache error = %v", err)
+		}
+	})
+
+	t.Run("Should release deleted and renamed parses when another skill fails loading", func(t *testing.T) {
+		t.Parallel()
+		root := t.TempDir()
+		writeCachedSkills(t, root, "alpha", "beta", "gamma")
+		manager := NewManager(nil)
+		ext := cachedSkillExtension(GlobalInstanceKey("ext-cache"), root, "skills")
+		loadCachedSkills(t, manager, ext)
+		removed, renamed, broken := cachedSkillFile(
+			t,
+			root,
+			"alpha",
+		), cachedSkillFile(
+			t,
+			root,
+			"beta",
+		), cachedSkillFile(
+			t,
+			root,
+			"gamma",
+		)
+		if err := os.Remove(removed); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Rename(renamed, renamed+".old"); err != nil {
+			t.Fatal(err)
+		}
+		writeFile(t, broken, "---\ninvalid: [\n---\n")
+		if _, err := manager.loadSkillResources(ext); err == nil {
+			t.Fatal("expected malformed skill failure")
+		}
+		if got := cachedSkillFiles(manager); !slices.Equal(got, []string{broken}) {
+			t.Fatalf("cached files = %v, want only existing skill", got)
+		}
+	})
+
+	t.Run("Should reuse skill parses across projections and observe file and sidecar edits", func(t *testing.T) {
+		t.Parallel()
+		root := t.TempDir()
+		file := filepath.Join(root, "SKILL.md")
+		content := "---\nname: cached\ndescription: first\n---\nBody\n"
+		if err := os.WriteFile(file, []byte(content), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		manager := NewManager(nil)
+		reads := 0
+		load := func(path string, source skillspkg.SkillSource) (*skillspkg.Skill, error) {
+			reads++
+			return skillspkg.ParseSkillFileWithSource(path, source)
+		}
+		for range 5 {
+			skill, err := manager.cachedSkillResource(file, skillspkg.SourceUser, load)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if skill.Meta.Description != "first" {
+				t.Fatalf("description = %q", skill.Meta.Description)
+			}
+			skill.Meta.Description = "changed by caller"
+		}
+		if reads != 1 {
+			t.Fatalf("filesystem parses = %d, want 1", reads)
+		}
+		if err := os.WriteFile(file, []byte(strings.ReplaceAll(content, "first", "second")), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		skill, err := manager.cachedSkillResource(file, skillspkg.SourceUser, load)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if reads != 2 || skill.Meta.Description != "second" {
+			t.Fatalf("parses=%d, description=%q", reads, skill.Meta.Description)
+		}
+		sidecar := filepath.Join(root, "mcp.json")
+		if err := os.WriteFile(sidecar, []byte(`{"mcpServers":{"local":{"command":"example"}}}`), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		skill, err = manager.cachedSkillResource(file, skillspkg.SourceUser, load)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if reads != 3 || len(skill.MCPServers) != 1 {
+			t.Fatalf("parses=%d, servers=%#v", reads, skill.MCPServers)
+		}
+		if err := os.Remove(sidecar); err != nil {
+			t.Fatal(err)
+		}
+		skill, err = manager.cachedSkillResource(file, skillspkg.SourceUser, load)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if reads != 4 || len(skill.MCPServers) != 0 {
+			t.Fatalf("parses=%d, servers=%#v", reads, skill.MCPServers)
+		}
+	})
+
+	t.Run(
+		"Should release superseded, removed, and unloaded skill parses while siblings stay cached",
+		func(t *testing.T) {
+			t.Parallel()
+			firstInstall, secondInstall := t.TempDir(), t.TempDir()
+			writeCachedSkills(t, firstInstall, "alpha", "beta")
+			writeCachedSkills(t, secondInstall, "alpha")
+			manager := NewManager(nil)
+			global := GlobalInstanceKey("ext-cache")
+			profile := InstanceKey{Name: "ext-cache", ProfileID: "profile-b"}
+			sibling := cachedSkillExtension(profile, firstInstall, "skills/beta")
+			loadCachedSkills(t, manager, cachedSkillExtension(global, firstInstall, "skills"))
+			loadCachedSkills(t, manager, sibling)
+			loadCachedSkills(t, manager, sibling)
+			want := []string{cachedSkillFile(t, firstInstall, "alpha"), cachedSkillFile(t, firstInstall, "beta")}
+			if got := cachedSkillFiles(manager); !slices.Equal(got, want) {
+				t.Fatalf("cached files = %#v, want %#v", got, want)
+			}
+
+			loadCachedSkills(t, manager, cachedSkillExtension(global, secondInstall, "skills"))
+			want = []string{cachedSkillFile(t, firstInstall, "beta"), cachedSkillFile(t, secondInstall, "alpha")}
+			if got := cachedSkillFiles(manager); !slices.Equal(got, want) {
+				t.Fatalf("cached files after reinstall = %#v, want sibling and current installation %#v", got, want)
+			}
+
+			if err := os.RemoveAll(filepath.Join(secondInstall, "skills", "alpha")); err != nil {
+				t.Fatal(err)
+			}
+			loadCachedSkills(t, manager, cachedSkillExtension(global, secondInstall, "skills"))
+			want = []string{cachedSkillFile(t, firstInstall, "beta")}
+			if got := cachedSkillFiles(manager); !slices.Equal(got, want) {
+				t.Fatalf("cached files after skill removal = %#v, want %#v", got, want)
+			}
+
+			if err := manager.unregisterResources(t.Context(), sibling); err != nil {
+				t.Fatalf("unregisterResources() error = %v", err)
+			}
+			if got := cachedSkillFiles(manager); len(got) != 0 {
+				t.Fatalf("cached files after unload = %#v, want none", got)
+			}
+		},
+	)
+
+	t.Run("Should expire idle projection owners while recently used siblings stay cached", func(t *testing.T) {
+		t.Parallel()
+		root := t.TempDir()
+		writeCachedSkills(t, root, "stale", "fresh")
+		now := time.Date(2026, 11, 3, 12, 0, 0, 0, time.UTC)
+		manager := NewManager(nil, WithNow(func() time.Time { return now }))
+		reads := 0
+		removed := cachedSkillExtension(
+			InstanceKey{Name: "ext-cache", ProfileID: "profile-removed", WorkspaceID: "ws"}, root, "skills/stale",
+		)
+		fresh := cachedSkillExtension(
+			InstanceKey{Name: "ext-cache", ProfileID: "profile-live", WorkspaceID: "ws"}, root, "skills/fresh",
+		)
+		loadCachedSkills(t, manager, removed)
+		loadCachedSkills(t, manager, fresh)
+		now = now.Add(skillResourceOwnerTTL / 2)
+		loadCachedSkills(t, manager, fresh)
+		now = now.Add(skillResourceOwnerTTL/2 + time.Minute)
+		want := []string{cachedSkillFile(t, root, "fresh"), cachedSkillFile(t, root, "stale")}
+		if got := cachedSkillFiles(manager); !slices.Equal(got, want) {
+			t.Fatalf("cached files before expiry pass = %#v, want %#v", got, want)
+		}
+		file := cachedSkillFile(t, root, "fresh")
+		for range 3 {
+			if _, err := manager.cachedSkillResource(file, skillspkg.SourceUser, func(
+				path string, source skillspkg.SkillSource,
+			) (*skillspkg.Skill, error) {
+				reads++
+				return skillspkg.ParseSkillFileWithSource(path, source)
+			}); err != nil {
+				t.Fatal(err)
+			}
+			loadCachedSkills(t, manager, fresh)
+		}
+		if reads != 0 {
+			t.Fatalf("fresh sibling parses after expiry pass = %d, want 0", reads)
+		}
+		want = []string{cachedSkillFile(t, root, "fresh")}
+		if got := cachedSkillFiles(manager); !slices.Equal(got, want) {
+			t.Fatalf("cached files after expiry pass = %#v, want idle projection released %#v", got, want)
+		}
+	})
+}
+
+func writeCachedSkills(t *testing.T, root string, names ...string) {
+	t.Helper()
+	for _, name := range names {
+		dir := filepath.Join(root, "skills", name)
+		if err := os.MkdirAll(dir, 0o755); err != nil {
+			t.Fatal(err)
+		}
+		writeFile(t, filepath.Join(dir, "SKILL.md"), managerSkillFile(name, "cached "+name))
+	}
+}
+
+func cachedSkillFile(t *testing.T, root string, name string) string {
+	t.Helper()
+	canonical, err := filepath.EvalSymlinks(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return filepath.Join(canonical, "skills", name, "SKILL.md")
+}
+
+func cachedSkillExtension(key InstanceKey, root string, paths ...string) *managedExtension {
+	resources := make([]ManifestResourcePath, 0, len(paths))
+	for _, path := range paths {
+		resources = append(resources, ManifestResourcePath{Path: path})
+	}
+	return &managedExtension{
+		key:      key,
+		info:     ExtensionInfo{Name: "ext-cache", Source: SourceUser},
+		rootDir:  root,
+		manifest: &Manifest{Name: "ext-cache", Resources: ResourcesConfig{Skills: resources}},
+	}
+}
+
+func cachedSkillFiles(manager *Manager) []string {
+	manager.skillResourceCacheMu.Lock()
+	defer manager.skillResourceCacheMu.Unlock()
+	return slices.Sorted(maps.Keys(manager.skillResourceCache))
+}
+
+func loadCachedSkills(t *testing.T, manager *Manager, ext *managedExtension) {
+	t.Helper()
+	if _, err := manager.loadSkillResources(ext); err != nil {
+		t.Fatalf("loadSkillResources(%s) error = %v", ext.instanceKey().runtimeID(), err)
+	}
+}

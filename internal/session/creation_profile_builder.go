@@ -1,0 +1,62 @@
+package session
+
+import (
+	"github.com/compozy/compozy/internal/acp"
+	speedpkg "github.com/compozy/compozy/internal/speed"
+	"github.com/compozy/compozy/internal/store"
+	workspacepkg "github.com/compozy/compozy/internal/workspace"
+	"github.com/compozy/compozy/internal/workspaceaccess"
+)
+
+// CreationProfileInput is the resolved, secret-free creation policy material.
+type CreationProfileInput struct {
+	Scope           workspacepkg.ScopeKind
+	AgentName       string
+	Provider        string
+	Model           string
+	ReasoningEffort string
+	Speed           speedpkg.Speed
+	ACPOptions      []acp.SessionConfigOptionSelection
+	ProfileID       string
+	WorkspaceID     string
+	CWD             string
+	WorktreeRef     string
+	Permissions     string
+	AllowedTools    []string
+	AgentTools      []string
+	AgentToolsets   []string
+	DeniedTools     []string
+	RuntimeMode     string
+	PromptOverlay   string
+	ContractOverlay string
+}
+
+// BuildCreationProfile constructs the current canonical profile used by daemon and Manager.
+func BuildCreationProfile(input CreationProfileInput) store.SessionCreationProfile {
+	version := store.SessionCreationProfileVersion
+	if input.Scope == workspacepkg.ScopeUser {
+		input.WorkspaceID = workspaceaccess.UserSelector
+		version = store.UserSessionCreationProfileVersion
+	}
+	return store.NormalizeSessionCreationProfile(store.SessionCreationProfile{
+		Version:         version,
+		AgentName:       input.AgentName,
+		Provider:        input.Provider,
+		Model:           input.Model,
+		ReasoningEffort: input.ReasoningEffort,
+		Speed:           input.Speed,
+		ACPOptions:      storeOptionSelectionsFromACP(input.ACPOptions),
+		ProfileID:       input.ProfileID,
+		WorkspaceID:     input.WorkspaceID,
+		CWD:             input.CWD,
+		WorktreeRef:     input.WorktreeRef,
+		Permissions:     input.Permissions,
+		AllowedTools:    input.AllowedTools,
+		AgentTools:      input.AgentTools,
+		AgentToolsets:   input.AgentToolsets,
+		DeniedTools:     input.DeniedTools,
+		RuntimeMode:     input.RuntimeMode,
+		PromptOverlay:   input.PromptOverlay,
+		ContractOverlay: input.ContractOverlay,
+	})
+}

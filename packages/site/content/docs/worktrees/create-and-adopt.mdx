@@ -1,0 +1,145 @@
+---
+title: Create or Adopt a Worktree
+description: Create a managed linked checkout, follow its setup phases, or adopt an existing Git worktree.
+---
+
+Create a Worktree when CompozyOS should choose the managed path and run the workspace bootstrap.
+Adopt one when `git worktree list` already contains the checkout.
+
+## Create a managed Worktree
+
+### 1. Check the repository
+
+```bash
+compozy worktree list --workspace . --refresh -o json
+```
+
+Expected result:
+
+```json
+[]
+```
+
+The CLI list is the registered-record projection. Use `compozy__worktree_list` or
+`GET /api/workspaces/{workspace_id}/worktrees` when automation also needs discovered checkouts and
+the repository capability diagnostic. If creation returns `workspace_not_git_backed`, register the
+repository root as the workspace before continuing.
+
+### 2. Create from a base ref
+
+```bash
+compozy worktree create feature-auth --workspace . --base main -o json
+```
+
+The response is accepted before filesystem work finishes. IDs and paths vary, but the initial shape
+is:
+
+```json
+{
+  "id": "wt_01...",
+  "name": "feature-auth",
+  "branch": "feature-auth",
+  "state": "pending",
+  "pending_phase": "branch",
+  "origin": "manual"
+}
+```
+
+Use `--branch <branch>` to choose the new branch, `--existing-branch <branch>` to attach an existing
+branch, or `--path <absolute-path>` to override managed placement. A new branch base resolves from
+`--base`, the repository's remote default, then the current branch.
+
+### 3. Wait for readiness
+
+```bash
+compozy worktree inspect feature-auth --workspace . -o json
+```
+
+Creation advances through `branch`, `checkout`, `copy`, and `setup`. The Worktree becomes selectable
+only after:
+
+```json
+{
+  "worktree": {
+    "name": "feature-auth",
+    "state": "ready",
+    "setup_state": "none"
+  }
+}
+```
+
+With a non-empty `setup_command`, `setup_state` becomes `ok` after a successful bootstrap.
+The Web dialog follows the accepted Worktree by ID through these phases. When that row reaches
+`ready`, the Web app selects it and closes the dialog. A failed `setup_command` still produces a
+usable `ready` Worktree with `setup_state: "failed"`. A branch or checkout failure is rolled back —
+the checkout and its Git registration first, then a branch the creation made — and the Worktree
+stays listed as `failed`, with `pending_phase` naming the failed phase and `create_error` the
+cause. The Web dialog shows that cause. A failed Worktree keeps its name until you dismiss it:
+
+```bash
+compozy worktree inspect feature-auth --workspace . -o json
+compozy worktree dismiss feature-auth --workspace . -o json
+```
+
+The checkout runs under `worktrees.checkout_timeout` (default `15m`). If a very large repository
+reports `checkout exceeded worktrees.checkout_timeout`, raise it and create the Worktree again.
+
+Cancel only while it is pending:
+
+```bash
+compozy worktree cancel feature-auth --workspace . -o json
+```
+
+## Use the checkout in an existing session
+
+In an idle session's environment control, choose **Use worktree…** or **Change worktree…**.
+Select a ready checkout, or choose **New worktree…** and wait for materialization to finish, then
+confirm **Use worktree**. Creation alone does not change the session. Binding keeps its ID,
+transcript, and window; the next turn runs in the checkout. Files are not moved between checkouts.
+See [session environment changes](/docs/worktrees/navigation#change-an-existing-sessions-environment)
+for refusal conditions, CLI commands, and concurrency checks.
+
+## Adopt an existing linked checkout
+
+### 1. Confirm Git owns it
+
+```bash
+git -C /src/acme worktree list
+```
+
+The candidate must be a linked Worktree for the same repository. The main checkout, an unrelated
+repository, a bare checkout, or an unreadable `.git` pointer is refused.
+
+### 2. Adopt the absolute path
+
+```bash
+compozy worktree adopt /src/acme-feature-auth --workspace /src/acme -o json
+```
+
+Expected result:
+
+```json
+{
+  "id": "wt_01...",
+  "name": "feature-auth",
+  "path": "/src/acme-feature-auth",
+  "state": "ready",
+  "origin": "adopted"
+}
+```
+
+Adoption is idempotent: repeating it returns the existing record. If that exact recorded path was
+`missing`, adoption verifies the Git identity and restores the same record to `ready`.
+
+## Bootstrap contract
+
+Managed creation applies `[worktrees]` in this order:
+
+1. Create or attach the branch and linked checkout.
+2. Copy ignored, untracked files matched by the relative Git pathspecs in `copy_list`, without
+   overwriting repository files.
+3. Run `setup_command` inside the new Worktree with `setup_timeout`.
+4. Publish `worktree.created` only after the record is ready.
+
+See [Worktree configuration](/docs/worktrees/configuration) for an annotated setup and validation
+rules.

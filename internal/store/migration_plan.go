@@ -1,0 +1,220 @@
+package store
+
+import (
+	"bytes"
+	"cmp"
+	"context"
+	"database/sql"
+	"database/sql/driver"
+	"errors"
+	"fmt"
+	"io/fs"
+	"path/filepath"
+	"slices"
+	"sync"
+
+	"github.com/pressly/goose/v3"
+)
+
+type preparedMigration struct {
+	path    string
+	version int64
+	useTx   bool
+	up      []string
+	down    []string
+}
+
+type migrationPlan struct {
+	gooseFS  fs.FS
+	prepared []preparedMigration
+}
+
+type migrationPlanCacheEntry struct {
+	prepare func() (*migrationPlan, error)
+}
+
+type migrationPlanCacheStore struct {
+	mu      sync.Mutex
+	entries map[string]*migrationPlanCacheEntry
+}
+
+var migrationPlanCache = migrationPlanCacheStore{
+	entries: make(map[string]*migrationPlanCacheEntry),
+}
+
+func prepareMigrationPlan(directory migrationDirectory) (*migrationPlan, error) {
+	entry := migrationPlanCache.loadOrCreate(directory.sumDigest, directory)
+	return entry.prepare()
+}
+
+func (c *migrationPlanCacheStore) loadOrCreate(
+	digest string,
+	directory migrationDirectory,
+) *migrationPlanCacheEntry {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	if entry := c.entries[digest]; entry != nil {
+		return entry
+	}
+	entry := &migrationPlanCacheEntry{
+		prepare: sync.OnceValues(func() (*migrationPlan, error) {
+			return compileMigrationPlan(directory)
+		}),
+	}
+	c.entries[digest] = entry
+	return entry
+}
+
+func compileMigrationPlan(directory migrationDirectory) (*migrationPlan, error) {
+	rawDirectory := newMigrationPlanFS()
+	preparedMigrations := make([]preparedMigration, 0, directory.migrationCount)
+	versions := make(map[int64]string, directory.migrationCount)
+
+	for _, file := range directory.files {
+		if filepath.Ext(file.path) != migrationSQLFileExtension {
+			if err := rawDirectory.addFile(file.path, file.contents); err != nil {
+				return nil, fmt.Errorf("copy migration support file %s: %w", file.path, err)
+			}
+			continue
+		}
+		version, err := migrationFileVersion(file.path)
+		if err != nil {
+			return nil, err
+		}
+		if previous, exists := versions[version]; exists {
+			return nil, fmt.Errorf(
+				"store: migration files %q and %q share version %d",
+				previous,
+				file.path,
+				version,
+			)
+		}
+		versions[version] = file.path
+
+		if requiresOriginalGooseParser(file.contents) {
+			if err := rawDirectory.addFile(file.path, file.contents); err != nil {
+				return nil, fmt.Errorf("copy dynamic migration %s: %w", file.path, err)
+			}
+			continue
+		}
+		parsed, err := parseMigrationSQL(file.path, file.contents)
+		if err != nil {
+			return nil, err
+		}
+		preparedMigrations = append(preparedMigrations, preparedMigration{
+			path:    file.path,
+			version: version,
+			useTx:   parsed.useTx,
+			up:      parsed.up,
+			down:    parsed.down,
+		})
+	}
+
+	slices.SortFunc(preparedMigrations, func(left, right preparedMigration) int {
+		return cmp.Compare(left.version, right.version)
+	})
+	return &migrationPlan{gooseFS: rawDirectory, prepared: preparedMigrations}, nil
+}
+
+func requiresOriginalGooseParser(contents []byte) bool {
+	return bytes.Contains(bytes.ToUpper(contents), []byte("+GOOSE ENVSUB"))
+}
+
+func (p *migrationPlan) gooseMigrations() []*goose.Migration {
+	migrations := make([]*goose.Migration, 0, len(p.prepared))
+	for _, prepared := range p.prepared {
+		var migration *goose.Migration
+		if prepared.useTx {
+			migration = goose.NewGoMigration(
+				prepared.version,
+				&goose.GoFunc{RunTx: func(ctx context.Context, tx *sql.Tx) error {
+					return executePreparedMigration(ctx, tx, prepared.path, "up", prepared.up)
+				}},
+				&goose.GoFunc{RunTx: func(ctx context.Context, tx *sql.Tx) error {
+					return executePreparedMigration(ctx, tx, prepared.path, "down", prepared.down)
+				}},
+			)
+		} else {
+			migration = goose.NewGoMigration(
+				prepared.version,
+				&goose.GoFunc{RunDB: func(ctx context.Context, db *sql.DB) error {
+					return executePreparedMigrationWithoutTransaction(ctx, db, prepared.path, "up", prepared.up)
+				}},
+				&goose.GoFunc{RunDB: func(ctx context.Context, db *sql.DB) error {
+					return executePreparedMigrationWithoutTransaction(ctx, db, prepared.path, "down", prepared.down)
+				}},
+			)
+		}
+		migrations = append(migrations, migration)
+	}
+	return migrations
+}
+
+func (p *migrationPlan) requiresIndependentConnection() bool {
+	return slices.ContainsFunc(p.prepared, func(migration preparedMigration) bool {
+		return !migration.useTx
+	})
+}
+
+type migrationStatementExecutor interface {
+	ExecContext(context.Context, string, ...any) (sql.Result, error)
+}
+
+func executePreparedMigration(
+	ctx context.Context,
+	executor migrationStatementExecutor,
+	path string,
+	direction string,
+	statements []string,
+) error {
+	for index, statement := range statements {
+		if _, err := executor.ExecContext(ctx, statement); err != nil {
+			return fmt.Errorf(
+				"execute %s migration %s statement %d: %w",
+				direction,
+				path,
+				index+1,
+				err,
+			)
+		}
+	}
+	return nil
+}
+
+func executePreparedMigrationWithoutTransaction(
+	ctx context.Context,
+	db *sql.DB,
+	path string,
+	direction string,
+	statements []string,
+) (retErr error) {
+	conn, err := db.Conn(ctx)
+	if err != nil {
+		return fmt.Errorf("acquire connection for %s migration %s: %w", direction, path, err)
+	}
+	defer func() {
+		retErr = finishPreparedMigrationConnection(conn, retErr)
+	}()
+	return executePreparedMigration(ctx, conn, path, direction, statements)
+}
+
+func finishPreparedMigrationConnection(conn *sql.Conn, migrationErr error) error {
+	if migrationErr == nil {
+		if err := conn.Close(); err != nil {
+			return fmt.Errorf("close migration connection: %w", err)
+		}
+		return nil
+	}
+
+	discardErr := conn.Raw(func(any) error {
+		return driver.ErrBadConn
+	})
+	if discardErr != nil && !errors.Is(discardErr, driver.ErrBadConn) && !errors.Is(discardErr, sql.ErrConnDone) {
+		migrationErr = errors.Join(migrationErr, fmt.Errorf("discard failed migration connection: %w", discardErr))
+	}
+	if closeErr := conn.Close(); closeErr != nil && !errors.Is(closeErr, sql.ErrConnDone) {
+		migrationErr = errors.Join(migrationErr, fmt.Errorf("close failed migration connection: %w", closeErr))
+	}
+	return migrationErr
+}

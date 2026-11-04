@@ -1,0 +1,26 @@
+{
+    "title": "Extension",
+    "pages": [
+        "index",
+        "build",
+        "commands",
+        "dev",
+        "disable",
+        "enable",
+        "exec",
+        "init",
+        "install",
+        "inventory",
+        "list",
+        "logs",
+        "provenance",
+        "publish",
+        "reload",
+        "remove",
+        "search",
+        "status",
+        "update",
+        "validate",
+        "secrets"
+    ]
+}

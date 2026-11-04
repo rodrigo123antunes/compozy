@@ -1,0 +1,202 @@
+-- name: ListLoopNodeControls :many
+SELECT control.* FROM loop_node_controls AS control
+JOIN loop_runs AS run ON run.id = control.loop_run_id
+WHERE run.workspace_id = sqlc.arg(workspace_id) AND control.loop_run_id = sqlc.arg(loop_run_id)
+ORDER BY control.node_id ASC;
+
+-- name: ListLoopNodeAttempts :many
+SELECT attempt.* FROM loop_node_attempts AS attempt
+JOIN loop_runs AS run ON run.id = attempt.loop_run_id
+WHERE run.workspace_id = sqlc.arg(workspace_id) AND attempt.loop_run_id = sqlc.arg(loop_run_id)
+ORDER BY attempt.generation ASC, attempt.node_id ASC, attempt.item_index ASC, attempt.attempt ASC;
+
+-- name: ListLoopNodeWaits :many
+SELECT wait_row.* FROM loop_node_waits AS wait_row
+JOIN loop_runs AS run ON run.id = wait_row.loop_run_id
+WHERE run.workspace_id = sqlc.arg(workspace_id) AND wait_row.loop_run_id = sqlc.arg(loop_run_id)
+  AND wait_row.claim_state IN ('waiting', 'intervention_required')
+ORDER BY wait_row.generation ASC, wait_row.node_id ASC, wait_row.item_index ASC;
+
+-- name: ListWaitingLoopNodeInventory :many
+SELECT run.workspace_id, run.id AS loop_run_id, run.loop_name, wait_row.generation, wait_row.node_id,
+  wait_row.item_index, wait_row.created_at AS state_at
+FROM loop_node_waits AS wait_row
+JOIN loop_runs AS run ON run.id = wait_row.loop_run_id
+WHERE (CAST(sqlc.arg(all_workspaces) AS BOOLEAN) OR run.workspace_id = sqlc.arg(filter_workspace_id))
+ AND (NOT CAST(sqlc.arg(all_workspaces) AS BOOLEAN) OR run.workspace_id = '' OR run.workspace_id IN (SELECT id FROM workspaces))
+ AND (CAST(sqlc.arg(all_profiles) AS BOOLEAN) OR run.profile_id = sqlc.arg(profile_id))
+  AND wait_row.claim_state IN ('waiting', 'intervention_required')
+  AND (CAST(sqlc.arg(filter_loop_name) AS TEXT) = '' OR run.loop_name = CAST(sqlc.arg(filter_loop_name) AS TEXT))
+  AND (CAST(sqlc.arg(filter_run_id) AS TEXT) = '' OR run.id = CAST(sqlc.arg(filter_run_id) AS TEXT))
+  AND (
+    CAST(sqlc.arg(has_cursor) AS INTEGER) = 0
+    OR wait_row.created_at > sqlc.arg(cursor_at)
+    OR (wait_row.created_at = sqlc.arg(cursor_at) AND run.id > sqlc.arg(cursor_run_id))
+    OR (wait_row.created_at = sqlc.arg(cursor_at) AND run.id = sqlc.arg(cursor_run_id)
+      AND wait_row.generation > sqlc.arg(cursor_generation))
+    OR (wait_row.created_at = sqlc.arg(cursor_at) AND run.id = sqlc.arg(cursor_run_id)
+      AND wait_row.generation = sqlc.arg(cursor_generation) AND wait_row.node_id > sqlc.arg(cursor_node_id))
+    OR (wait_row.created_at = sqlc.arg(cursor_at) AND run.id = sqlc.arg(cursor_run_id)
+      AND wait_row.generation = sqlc.arg(cursor_generation) AND wait_row.node_id = sqlc.arg(cursor_node_id)
+      AND wait_row.item_index > sqlc.arg(cursor_item_index))
+  )
+ORDER BY wait_row.created_at ASC, run.id ASC, wait_row.generation ASC,
+  wait_row.node_id ASC, wait_row.item_index ASC
+LIMIT sqlc.arg(page_limit);
+
+-- name: ListQuarantinedLoopNodeInventory :many
+SELECT run.workspace_id, run.id AS loop_run_id, run.loop_name, run.generation, control.node_id,
+  0 AS item_index, control.quarantined_at AS state_at
+FROM loop_node_controls AS control
+JOIN loop_runs AS run ON run.id = control.loop_run_id
+WHERE (CAST(sqlc.arg(all_workspaces) AS BOOLEAN) OR run.workspace_id = sqlc.arg(filter_workspace_id))
+ AND (NOT CAST(sqlc.arg(all_workspaces) AS BOOLEAN) OR run.workspace_id = '' OR run.workspace_id IN (SELECT id FROM workspaces))
+ AND (CAST(sqlc.arg(all_profiles) AS BOOLEAN) OR run.profile_id = sqlc.arg(profile_id)) AND control.quarantined = 1
+  AND control.quarantined_at IS NOT NULL
+  AND (CAST(sqlc.arg(filter_loop_name) AS TEXT) = '' OR run.loop_name = CAST(sqlc.arg(filter_loop_name) AS TEXT))
+  AND (CAST(sqlc.arg(filter_run_id) AS TEXT) = '' OR run.id = CAST(sqlc.arg(filter_run_id) AS TEXT))
+  AND (
+    CAST(sqlc.arg(has_cursor) AS INTEGER) = 0
+    OR control.quarantined_at > sqlc.arg(cursor_at)
+    OR (control.quarantined_at = sqlc.arg(cursor_at)
+      AND run.id > sqlc.arg(cursor_run_id))
+    OR (control.quarantined_at = sqlc.arg(cursor_at)
+      AND run.id = sqlc.arg(cursor_run_id) AND run.generation > sqlc.arg(cursor_generation))
+    OR (control.quarantined_at = sqlc.arg(cursor_at)
+      AND run.id = sqlc.arg(cursor_run_id) AND run.generation = sqlc.arg(cursor_generation)
+      AND control.node_id > sqlc.arg(cursor_node_id))
+  )
+ORDER BY state_at ASC, run.id ASC, run.generation ASC, control.node_id ASC
+LIMIT sqlc.arg(page_limit);
+
+-- name: ListAttentionLoopNodeInventory :many
+SELECT run.workspace_id, run.id AS loop_run_id, run.loop_name, run.generation, control.node_id,
+  0 AS item_index, control.updated_at AS state_at
+FROM loop_node_controls AS control
+JOIN loop_runs AS run ON run.id = control.loop_run_id
+WHERE (CAST(sqlc.arg(all_workspaces) AS BOOLEAN) OR run.workspace_id = sqlc.arg(filter_workspace_id))
+ AND (NOT CAST(sqlc.arg(all_workspaces) AS BOOLEAN) OR run.workspace_id = '' OR run.workspace_id IN (SELECT id FROM workspaces))
+ AND (CAST(sqlc.arg(all_profiles) AS BOOLEAN) OR run.profile_id = sqlc.arg(profile_id)) AND control.attention_flag != ''
+  AND (CAST(sqlc.arg(filter_loop_name) AS TEXT) = '' OR run.loop_name = CAST(sqlc.arg(filter_loop_name) AS TEXT))
+  AND (CAST(sqlc.arg(filter_run_id) AS TEXT) = '' OR run.id = CAST(sqlc.arg(filter_run_id) AS TEXT))
+  AND (
+    CAST(sqlc.arg(has_cursor) AS INTEGER) = 0
+    OR control.updated_at > sqlc.arg(cursor_at)
+    OR (control.updated_at = sqlc.arg(cursor_at) AND run.id > sqlc.arg(cursor_run_id))
+    OR (control.updated_at = sqlc.arg(cursor_at) AND run.id = sqlc.arg(cursor_run_id)
+      AND run.generation > sqlc.arg(cursor_generation))
+    OR (control.updated_at = sqlc.arg(cursor_at) AND run.id = sqlc.arg(cursor_run_id)
+      AND run.generation = sqlc.arg(cursor_generation) AND control.node_id > sqlc.arg(cursor_node_id))
+  )
+ORDER BY control.updated_at ASC, run.id ASC, run.generation ASC, control.node_id ASC
+LIMIT sqlc.arg(page_limit);
+
+-- name: ListRetryingLoopNodeInventory :many
+SELECT run.workspace_id, run.id AS loop_run_id, run.loop_name, output.generation, output.node_id,
+  output.item_index, output.next_attempt_at AS state_at
+FROM loop_generation_outputs AS output
+JOIN loop_runs AS run ON run.id = output.loop_run_id
+WHERE (CAST(sqlc.arg(all_workspaces) AS BOOLEAN) OR run.workspace_id = sqlc.arg(filter_workspace_id))
+ AND (NOT CAST(sqlc.arg(all_workspaces) AS BOOLEAN) OR run.workspace_id = '' OR run.workspace_id IN (SELECT id FROM workspaces))
+ AND (CAST(sqlc.arg(all_profiles) AS BOOLEAN) OR run.profile_id = sqlc.arg(profile_id))
+  AND output.status = 'retrying' AND output.next_attempt_at IS NOT NULL
+  AND (CAST(sqlc.arg(filter_loop_name) AS TEXT) = '' OR run.loop_name = CAST(sqlc.arg(filter_loop_name) AS TEXT))
+  AND (CAST(sqlc.arg(filter_run_id) AS TEXT) = '' OR run.id = CAST(sqlc.arg(filter_run_id) AS TEXT))
+  AND (
+    CAST(sqlc.arg(has_cursor) AS INTEGER) = 0
+    OR output.next_attempt_at > sqlc.arg(cursor_at)
+    OR (output.next_attempt_at = sqlc.arg(cursor_at) AND run.id > sqlc.arg(cursor_run_id))
+    OR (output.next_attempt_at = sqlc.arg(cursor_at) AND run.id = sqlc.arg(cursor_run_id)
+      AND output.generation > sqlc.arg(cursor_generation))
+    OR (output.next_attempt_at = sqlc.arg(cursor_at) AND run.id = sqlc.arg(cursor_run_id)
+      AND output.generation = sqlc.arg(cursor_generation) AND output.node_id > sqlc.arg(cursor_node_id))
+    OR (output.next_attempt_at = sqlc.arg(cursor_at) AND run.id = sqlc.arg(cursor_run_id)
+      AND output.generation = sqlc.arg(cursor_generation) AND output.node_id = sqlc.arg(cursor_node_id)
+      AND output.item_index > sqlc.arg(cursor_item_index))
+  )
+ORDER BY output.next_attempt_at ASC, run.id ASC, output.generation ASC,
+  output.node_id ASC, output.item_index ASC
+LIMIT sqlc.arg(page_limit);
+
+-- name: GetLoopAdmissionClaim :one
+SELECT * FROM loop_admission_claims
+WHERE profile_id = sqlc.arg(profile_id) AND workspace_id = sqlc.arg(workspace_id)
+  AND loop_name = sqlc.arg(loop_name)
+  AND source_key = sqlc.arg(source_key)
+  AND event_key = sqlc.arg(event_key);
+
+-- name: DeleteExpiredLoopAdmissionClaims :execrows
+DELETE FROM loop_admission_claims
+WHERE expires_at <= sqlc.arg(expires_before);
+
+-- name: ListLoopEffectOutbox :many
+SELECT effect.* FROM loop_effect_outbox AS effect
+JOIN loop_runs AS run ON run.id = effect.loop_run_id
+WHERE run.workspace_id = sqlc.arg(workspace_id) AND effect.loop_run_id = sqlc.arg(loop_run_id)
+ORDER BY effect.created_at ASC, effect.delivery_id ASC;
+
+-- name: InsertLoopEffectOutbox :exec
+INSERT INTO loop_effect_outbox (
+  loop_run_id, delivery_id, source_event_id, trigger, generation,
+  node_id, item_index, entry_index, entry_json, state, attempts, created_at
+) VALUES (
+  sqlc.arg(loop_run_id), sqlc.arg(delivery_id), sqlc.arg(source_event_id), sqlc.arg(trigger),
+  sqlc.arg(generation), sqlc.arg(node_id), sqlc.arg(item_index), sqlc.arg(entry_index),
+  sqlc.arg(entry_json), 'pending', 0, sqlc.arg(created_at)
+);
+
+-- name: ListPendingLoopEffects :many
+SELECT effect.loop_run_id, run.workspace_id, effect.delivery_id,
+       effect.source_event_id, effect.trigger, effect.generation, effect.node_id,
+       effect.item_index, effect.entry_index, effect.entry_json, effect.state,
+       effect.attempts, effect.created_at, effect.delivered_at
+FROM loop_effect_outbox AS effect
+JOIN loop_runs AS run ON run.id = effect.loop_run_id
+WHERE effect.state = 'pending'
+ORDER BY effect.created_at ASC, effect.loop_run_id ASC, effect.delivery_id ASC
+LIMIT sqlc.arg(page_limit);
+
+-- name: ClosePendingLoopEffect :execrows
+UPDATE loop_effect_outbox
+SET state = sqlc.arg(state), attempts = attempts + 1, delivered_at = sqlc.arg(delivered_at)
+WHERE loop_run_id = sqlc.arg(loop_run_id)
+  AND delivery_id = sqlc.arg(delivery_id)
+  AND state = 'pending';
+
+-- name: ListSessionLoopWork :many
+SELECT lr.id, lr.created_at, lr.status,
+ CAST((lr.origin_kind = 'session' AND (lr.origin_session_id = sqlc.arg(session_id)
+  OR EXISTS (SELECT 1 FROM loop_session_bindings binding
+   JOIN loop_goal_checkpoints checkpoint ON checkpoint.loop_run_id = binding.loop_run_id
+    AND checkpoint.binding_handle = binding.handle AND checkpoint.binding_epoch = binding.binding_epoch
+   WHERE binding.loop_run_id = lr.id AND binding.session_id = sqlc.arg(session_id)
+    AND binding.state = 'active'))) AS INTEGER) AS owns_goal,
+ CAST(COALESCE((SELECT MAX(tr.lease_until) FROM task_runs tr
+  WHERE tr.loop_run_id = lr.id AND tr.status IN ('claimed','starting','running')), '') AS TEXT) AS lease_until,
+ EXISTS(SELECT 1 FROM loop_node_controls control WHERE control.loop_run_id = lr.id
+  AND (control.attention_flag != '' OR control.quarantined = 1)) AS needs_attention,
+ CAST(COALESCE((SELECT MAX(tr.ended_at) FROM task_runs tr
+  WHERE tr.loop_run_id = lr.id AND tr.run_kind = 'coordinator' AND tr.status = 'completed'), '') AS TEXT) AS reconciled_at
+FROM loop_runs lr
+WHERE lr.workspace_id = sqlc.arg(workspace_id)
+AND (sqlc.arg(all_profiles) = 1 OR lr.profile_id = sqlc.arg(profile_id))
+AND lr.status NOT IN ('done','no-op','blocked','failed','exhausted','stalled','canceled')
+AND (lr.origin_session_id = sqlc.arg(session_id) OR lr.id = sqlc.arg(owner_run_id)
+ OR EXISTS (SELECT 1 FROM task_runs bound WHERE bound.loop_run_id = lr.id AND bound.session_id = sqlc.arg(session_id))
+ OR EXISTS (SELECT 1 FROM loop_session_bindings binding WHERE binding.loop_run_id = lr.id
+  AND binding.session_id = sqlc.arg(session_id) AND binding.state = 'active'))
+ORDER BY lr.id;
+
+-- name: ListExpirylessLoopEventWaits :many
+SELECT wait.loop_run_id, wait.generation, wait.node_id, wait.item_index, wait.created_at
+FROM loop_node_waits wait JOIN loop_runs run ON run.id = wait.loop_run_id
+WHERE wait.kind = 'event' AND wait.claim_state = 'waiting' AND wait.next_escalation_at IS NULL
+AND run.status NOT IN ('done','no-op','blocked','failed','exhausted','stalled','canceled')
+ORDER BY wait.loop_run_id, wait.generation, wait.node_id, wait.item_index
+LIMIT sqlc.arg(page_limit);
+
+-- name: BackfillLoopEventWaitDeadline :execrows
+UPDATE loop_node_waits SET next_escalation_at = sqlc.arg(deadline)
+WHERE loop_run_id = sqlc.arg(loop_run_id) AND generation = sqlc.arg(generation)
+AND node_id = sqlc.arg(node_id) AND item_index = sqlc.arg(item_index)
+AND kind = 'event' AND claim_state = 'waiting' AND next_escalation_at IS NULL;

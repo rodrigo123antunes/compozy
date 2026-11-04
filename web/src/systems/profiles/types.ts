@@ -1,0 +1,55 @@
+import type { OperationRequestBody, OperationResponse } from "@/lib/api-contract";
+
+/** A profile row as the daemon returns it. */
+export type ProfilePayload = OperationResponse<"listProfiles", 200>[number];
+
+export type CreateProfileParams = OperationRequestBody<"createProfile">;
+export type UpdateProfileParams = OperationRequestBody<"updateProfile">;
+export type RenameProfileParams = OperationRequestBody<"renameProfile">;
+
+type ProfileSelectionResponse = OperationResponse<"getProfileSelections", 200>;
+export type ProfileSelectionPayload = Extract<ProfileSelectionResponse, unknown[]>[number];
+export type ProfileSelectionResult = OperationResponse<"putProfileSelection", 200>;
+export type ProfileSelectionParams = OperationRequestBody<"putProfileSelection">;
+
+export type RenameProfilePlan = OperationResponse<"prepareProfileRename", 200>;
+export type ArchiveProfilePlan = OperationResponse<"prepareProfileArchive", 200>;
+export type DeleteProfilePlan = OperationResponse<"prepareProfileDelete", 200>;
+
+export type RenameProfileResult = OperationResponse<"renameProfile", 200>;
+export type ArchiveProfileResult = OperationResponse<"archiveProfile", 200>;
+export type UnarchiveProfileResult = OperationResponse<"unarchiveProfile", 200>;
+export type DeleteProfileResult = OperationResponse<"deleteProfile", 200>;
+
+export type ProfileRemovalSummary = DeleteProfilePlan["removed"];
+export type ProfileRepoCandidate = RenameProfilePlan["repo_candidates"][number];
+export type ProfilePlacement = RenameProfilePlan["dormant_placements"][number];
+
+export type ProfileOperation = OperationResponse<"listProfileOperations", 200>[number];
+
+/** The reserved aggregate state. Never persisted as a daemon remembered choice. */
+export const PROFILE_AGGREGATE = "@all" as const;
+
+/**
+ * What a client is currently looking through: one real profile, or the labeled
+ * aggregate. It is one global per-client view shared by every workspace, not the
+ * remembered choice.
+ */
+export type ProfileView = { kind: "profile"; profile: string } | { kind: "aggregate" };
+
+export type ProfileLifecycleFlow =
+  | "create"
+  | "update"
+  | "rename"
+  | "archive"
+  | "unarchive"
+  | "delete";
+
+/** What the palette or Settings hands to the canonical dialog host. */
+export type ProfileLifecycleTargetFlow = Exclude<ProfileLifecycleFlow, "create">;
+
+/** Create may carry a suggestion; every other lifecycle flow requires its target. */
+export type ProfileDialogIntent =
+  | { flow: "create"; profile?: string }
+  | { flow: "rename"; profile: string; newName?: string }
+  | { flow: Exclude<ProfileLifecycleTargetFlow, "rename">; profile: string };

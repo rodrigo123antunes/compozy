@@ -1,0 +1,434 @@
+import { describe, expect, it, vi } from "vitest";
+import { InfiniteQueryObserver, QueryClient } from "@tanstack/react-query";
+import type { LoopBreadthTarget } from "@/systems/workspace";
+import { loopCatalogFixtures } from "../../mocks/fixtures";
+import type { LoopAggregateBreadth } from "../../types";
+
+import {
+  goalTurnsOptions,
+  loopConfigOptions,
+  loopDetailOptions,
+  loopNodeInventoryOptions,
+  loopRequestDetailOptions,
+  loopRequestAttentionOptions,
+  loopRequestsOptions,
+  loopRunDetailOptions,
+  loopRunDiffOptions,
+  loopRunBriefingOptions,
+  loopRunRosterOptions,
+  loopRunTimelineOptions,
+  loopRunsListOptions,
+  loopRunsOptions,
+  loopsAggregateOptions,
+  loopsCatalogOptions,
+} from "../query-options";
+
+describe("loop query-options", () => {
+  it("Should retain the catalog profile through pagination and isolate its cached population", async () => {
+    const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    const requests: URL[] = [];
+    const fetch = vi.spyOn(globalThis, "fetch").mockImplementation(async input => {
+      const url = new URL((input as Request).url);
+      requests.push(url);
+      const selected = url.searchParams.get("profile") === "engineering";
+      const aggregate = url.searchParams.get("all_profiles") === "true";
+      const secondPage = url.searchParams.has("cursor");
+      return Response.json(
+        {
+          loops: selected ? loopCatalogFixtures.slice(secondPage ? 1 : 0, secondPage ? 2 : 1) : [],
+          facets: { categories: {}, kinds: {}, statuses: {} },
+          page: {
+            total: selected ? 2 : 0,
+            limit: 1,
+            has_more: selected && !secondPage,
+            next_cursor: selected && !secondPage ? "engineering-page-2" : undefined,
+          },
+        },
+        {
+          status: selected || aggregate || url.searchParams.get("profile") === "studio" ? 200 : 400,
+        }
+      );
+    });
+    const options = loopsCatalogOptions("ws_a", { profile: "engineering", limit: 1 });
+    const observer = new InfiniteQueryObserver(client, options);
+    try {
+      await client.fetchInfiniteQuery(options);
+      const result = await observer.fetchNextPage();
+      expect(result.data?.pages.flatMap(page => page.loops)).toEqual(
+        loopCatalogFixtures.slice(0, 2)
+      );
+      expect(requests[1]?.searchParams.get("profile")).toBe("engineering");
+      expect(requests[1]?.searchParams.get("cursor")).toBe("engineering-page-2");
+      expect(result.hasNextPage).toBe(false);
+
+      const studio = await client.fetchInfiniteQuery(
+        loopsCatalogOptions("ws_a", { profile: "studio", limit: 1 })
+      );
+      const aggregate = await client.fetchInfiniteQuery(
+        loopsCatalogOptions("ws_a", { all_profiles: true, limit: 1 })
+      );
+      expect(studio.pages[0]?.loops).toEqual([]);
+      expect(aggregate.pages[0]?.loops).toEqual([]);
+      expect(requests).toHaveLength(4);
+      expect(requests[2]?.searchParams.get("profile")).toBe("studio");
+      expect(requests[3]?.searchParams.get("all_profiles")).toBe("true");
+      expect(requests[3]?.searchParams.has("profile")).toBe(false);
+      expect(client.getQueryData(options.queryKey)).toEqual(result.data);
+    } finally {
+      observer.destroy();
+      client.clear();
+      fetch.mockRestore();
+    }
+  });
+
+  it("Should page Goal turns by the server cursor and isolate workspace and Profile caches", async () => {
+    const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    const requests: URL[] = [];
+    const fetch = vi.spyOn(globalThis, "fetch").mockImplementation(async input => {
+      const url = new URL((input as Request).url);
+      requests.push(url);
+      return Response.json({
+        turns: [],
+        next_after_seq: url.searchParams.has("after_seq") ? null : 9,
+      });
+    });
+    const options = goalTurnsOptions("ws_a", "run_1");
+    const observer = new InfiniteQueryObserver(client, options);
+    try {
+      await client.fetchInfiniteQuery(options);
+      const result = await observer.fetchNextPage();
+      expect(requests[1]?.searchParams.get("after_seq")).toBe("9");
+      expect(result.data).toEqual({
+        pages: [
+          { turns: [], next_after_seq: 9 },
+          { turns: [], next_after_seq: null },
+        ],
+        pageParams: [undefined, 9],
+      });
+      expect(result.hasNextPage).toBe(false);
+      await observer.fetchNextPage();
+      expect(requests).toHaveLength(2);
+
+      await client.fetchInfiniteQuery(goalTurnsOptions("ws_b", "run_1"));
+      await client.fetchInfiniteQuery(goalTurnsOptions("ws_a", "run_1", true, false, "other"));
+      expect(requests).toHaveLength(4);
+      expect(requests[2]?.pathname).toBe("/api/workspaces/ws_b/loop-runs/run_1/turns");
+      expect(requests[2]?.searchParams.has("after_seq")).toBe(false);
+      expect(requests[3]?.searchParams.has("after_seq")).toBe(false);
+      expect(client.getQueryData(options.queryKey)).toEqual(result.data);
+    } finally {
+      observer.destroy();
+      client.clear();
+      fetch.mockRestore();
+    }
+  });
+
+  // Invariant: a list read keeps its previous rows through a filter change inside one scope, so the
+  // toolbar never blanks the list for the length of a fetch, and never across scopes, where the
+  // previous rows would be another workspace's or profile's.
+  it("Should bridge a filter change inside one scope for the list reads and never across scopes", () => {
+    type Bridge = (
+      previous: unknown,
+      query: { queryKey: readonly unknown[] } | undefined
+    ) => unknown;
+    const rows = { rows: ["previous"] };
+    const bridgeOf = (options: { placeholderData?: unknown }) => {
+      expect(typeof options.placeholderData).toBe("function");
+      return options.placeholderData as Bridge;
+    };
+
+    const catalog = bridgeOf(loopsCatalogOptions("ws_a", { limit: 50, q: "b" }));
+    expect(
+      catalog(rows, { queryKey: loopsCatalogOptions("ws_a", { limit: 50, q: "a" }).queryKey })
+    ).toBe(rows);
+    expect(
+      catalog(rows, { queryKey: loopsCatalogOptions("ws_b", { limit: 50, q: "a" }).queryKey })
+    ).toBeUndefined();
+
+    const batch = bridgeOf(loopsAggregateOptions({ all_workspaces: true }, { limit: 50, q: "b" }));
+    expect(
+      batch(rows, {
+        queryKey: loopsAggregateOptions({ all_workspaces: true }, { limit: 50, q: "a" }).queryKey,
+      })
+    ).toBe(rows);
+    expect(
+      batch(rows, { queryKey: loopsCatalogOptions("ws_a", { limit: 50, q: "a" }).queryKey })
+    ).toBeUndefined();
+
+    const roster = bridgeOf(
+      loopRunsListOptions({ kind: "workspace", workspaceId: "ws_a" }, { origin: "session" })
+    );
+    expect(
+      roster(rows, {
+        queryKey: loopRunsListOptions({ kind: "workspace", workspaceId: "ws_a" }, {}).queryKey,
+      })
+    ).toBe(rows);
+    expect(
+      roster(rows, {
+        queryKey: loopRunsListOptions({ kind: "workspace", workspaceId: "ws_b" }, {}).queryKey,
+      })
+    ).toBeUndefined();
+
+    const inventory = bridgeOf(
+      loopNodeInventoryOptions("ws_a", { loop: "delivery", state: "waiting" })
+    );
+    expect(
+      inventory(rows, {
+        queryKey: loopNodeInventoryOptions("ws_a", { state: "waiting" }).queryKey,
+      })
+    ).toBe(rows);
+    expect(
+      inventory(rows, {
+        queryKey: loopNodeInventoryOptions("ws_a", { state: "attention" }).queryKey,
+      })
+    ).toBeUndefined();
+  });
+
+  it("Should key each option by its workspace-scoped query key", () => {
+    expect(loopsCatalogOptions("ws_a").queryKey).toEqual([
+      "loops",
+      "catalog",
+      "ws_a",
+      "",
+      "",
+      "",
+      "",
+      "",
+      "",
+      "",
+    ]);
+    expect(loopDetailOptions("ws_a", "delivery").queryKey).toEqual([
+      "loops",
+      "detail",
+      "ws_a",
+      "delivery",
+    ]);
+    expect(loopRunDetailOptions("ws_a", "run_1").queryKey).toEqual([
+      "loops",
+      "run-detail",
+      "ws_a",
+      "run_1",
+      { profile: "default" },
+    ]);
+  });
+
+  it("Should gate detail/config/run reads on both the workspace and the resource id", () => {
+    expect(loopDetailOptions("", "delivery").enabled).toBe(false);
+    expect(loopDetailOptions("ws_a", "").enabled).toBe(false);
+    expect(loopDetailOptions("ws_a", "delivery").enabled).toBe(true);
+
+    expect(loopConfigOptions("ws_a", "").enabled).toBe(false);
+    expect(loopRunDetailOptions("ws_a", "").enabled).toBe(false);
+    expect(loopRunDetailOptions("", "run_1").enabled).toBe(false);
+  });
+
+  it("Should leave catalog enablement to the hook and gate runs on the workspace", () => {
+    expect(loopsCatalogOptions("ws_a").enabled).toBeUndefined();
+    expect(loopsCatalogOptions("ws_a").initialPageParam).toBeUndefined();
+    expect(loopsCatalogOptions("ws_a").refetchInterval).toBeUndefined();
+    expect(loopRunsOptions("ws_a").enabled).toBe(true);
+    expect(loopRunsOptions("").enabled).toBe(false);
+  });
+
+  it("Should poll a live run detail but stop once the run reaches a terminal state", () => {
+    const { refetchInterval } = loopRunDetailOptions("ws_a", "run_1");
+    const asFn = refetchInterval as (query: {
+      state: { data?: { run: { status: string } } };
+    }) => number | false;
+    expect(asFn({ state: { data: { run: { status: "running" } } } })).toBe(15_000);
+    expect(asFn({ state: { data: { run: { status: "exhausted" } } } })).toBe(false);
+    expect(asFn({ state: { data: undefined } })).toBe(15_000);
+  });
+
+  it("Should default the request inventory to pending and page by cursor", () => {
+    const options = loopRequestsOptions("ws_a");
+    expect(options.queryKey).toEqual(["loops", "requests", "ws_a", "pending", "", "50", ""]);
+    expect(options.initialPageParam).toBeUndefined();
+    expect(options.enabled).toBe(true);
+    expect(loopRequestsOptions("").enabled).toBe(false);
+    expect(loopRequestsOptions("ws_a", { state: "resolved" }).queryKey).toContain("resolved");
+  });
+
+  it("Should key the loops badge per breadth and profile and disable it without a workspace", () => {
+    const workspace = { kind: "workspace", workspaceId: "ws_a" } as const;
+    expect(loopRequestAttentionOptions(workspace, { profile: "default" }).queryKey).toEqual([
+      "loops",
+      "requests",
+      "ws_a",
+      "attention",
+      "",
+      "default",
+    ]);
+    const aggregate: LoopBreadthTarget = {
+      kind: "aggregate",
+      params: { all_workspaces: true, workspace_ids: ["ws_b", "@user"] },
+    };
+    expect(loopRequestAttentionOptions(aggregate, { all_profiles: true }).queryKey).toEqual([
+      "loops",
+      "requests",
+      "@all",
+      "attention",
+      "@user,ws_b",
+      "@all",
+    ]);
+    expect(
+      loopRequestAttentionOptions({ kind: "workspace", workspaceId: "" }, { profile: "default" })
+        .enabled
+    ).toBe(false);
+    expect(
+      loopRequestAttentionOptions(workspace, { profile: "default" }, true, false).refetchInterval
+    ).toBe(false);
+  });
+
+  it("Should key All projects runs and definitions apart from any workspace and by their filter", () => {
+    const params: LoopAggregateBreadth = { all_workspaces: true, workspace_ids: ["ws_b", "ws_a"] };
+    const runs = loopRunsListOptions({ kind: "aggregate", params }, { origin: "session" });
+    expect(runs.queryKey.slice(0, 3)).toEqual(["loops", "runs", "@all"]);
+    expect(runs.queryKey.at(-1)).toBe("ws_a,ws_b");
+    expect(runs.refetchInterval).toBe(15_000);
+    // A workspace target shares the workspace roster's cache entry exactly.
+    expect(loopRunsListOptions({ kind: "workspace", workspaceId: "ws_a" }).queryKey).toEqual(
+      loopRunsOptions("ws_a").queryKey
+    );
+    const catalog = loopsAggregateOptions(params, { q: " triage " });
+    expect(catalog.queryKey.slice(0, 4)).toEqual(["loops", "catalog", "@all", "triage"]);
+    expect(catalog.queryKey.at(-1)).toBe("ws_a,ws_b");
+  });
+
+  it("Should stop paging the request inventory when the daemon returns no cursor", () => {
+    const { getNextPageParam } = loopRequestsOptions("ws_a");
+    const page = { aggregates: { pending: 2 }, items: [], next_cursor: "" };
+    expect(getNextPageParam(page, [page], undefined, [undefined])).toBeUndefined();
+    expect(getNextPageParam({ ...page, next_cursor: "c2" }, [page], undefined, [undefined])).toBe(
+      "c2"
+    );
+  });
+
+  it("Should gate the request detail read on workspace, run, and node", () => {
+    expect(loopRequestDetailOptions("ws_a", "run_1", 3, "ask_node", 1).queryKey).toEqual([
+      "loops",
+      "requests",
+      "detail",
+      "ws_a",
+      "run_1",
+      3,
+      "ask_node",
+      "1",
+      { profile: "default" },
+    ]);
+    expect(loopRequestDetailOptions("", "run_1", 3, "ask_node").enabled).toBe(false);
+    expect(loopRequestDetailOptions("ws_a", "", 3, "ask_node").enabled).toBe(false);
+    expect(loopRequestDetailOptions("ws_a", "run_1", 3, "").enabled).toBe(false);
+
+    expect(loopRequestDetailOptions("ws_a", "run_1", 3, "ask_node", 0, false).enabled).toBe(false);
+  });
+
+  it("Should leave the fenced story to the stream instead of re-anchoring it", () => {
+    // Every read of the newest window is unpinned, so anything that triggers one
+    // slides the loaded window up and drops the oldest pages. A timer or a window
+    // regaining focus is not a lifecycle event and has no business doing that.
+    const options = loopRunTimelineOptions("ws_a", "run_1");
+    expect(options.refetchOnWindowFocus).toBe(false);
+    expect(options.refetchInterval).toBeUndefined();
+    expect(options.queryKey).toEqual([
+      "loops",
+      "run-reads",
+      "ws_a",
+      "run_1",
+      "timeline",
+      "notable",
+      "50",
+      "",
+      { profile: "default" },
+    ]);
+  });
+
+  it("Should keep refreshing a diff while either compared side is still executing", () => {
+    const { refetchInterval } = loopRunDiffOptions("ws_a", "run_1", { against_run: "run_2" });
+    const asFn = refetchInterval as (query: {
+      state: { data?: { against: { status: string }; base: { status: string } } };
+    }) => number | false;
+    expect(
+      asFn({ state: { data: { base: { status: "done" }, against: { status: "running" } } } })
+    ).toBe(15_000);
+    expect(
+      asFn({ state: { data: { base: { status: "done" }, against: { status: "canceled" } } } })
+    ).toBe(false);
+    expect(asFn({ state: { data: undefined } })).toBe(15_000);
+  });
+  it("Should stop polling the briefing once the run is terminal", () => {
+    const options = loopRunBriefingOptions("ws_a", "run_1");
+    expect(options.queryKey).toEqual([
+      "loops",
+      "run-reads",
+      "ws_a",
+      "run_1",
+      "briefing",
+      { profile: "default" },
+    ]);
+    const asFn = options.refetchInterval as (query: {
+      state: { data?: { status: string } };
+    }) => number | false;
+    // A terminal run's briefing is immutable; polling it forever is pure noise.
+    expect(asFn({ state: { data: { status: "done" } } })).toBe(false);
+    expect(asFn({ state: { data: { status: "running" } } })).toBeGreaterThan(0);
+    expect(asFn({ state: { data: undefined } })).toBeGreaterThan(0);
+
+    expect(loopRunBriefingOptions("", "run_1").enabled).toBe(false);
+    expect(loopRunBriefingOptions("ws_a", "").enabled).toBe(false);
+    expect(loopRunBriefingOptions("ws_a", "run_1", false).enabled).toBe(false);
+  });
+
+  it("Should page the roster on its served cursor and stop polling a terminal run", () => {
+    const options = loopRunRosterOptions("ws_a", "run_1", { state: "failed" });
+    // The page size is normalized into the key, so two page sizes are two caches.
+    expect(options.queryKey).toEqual([
+      "loops",
+      "run-reads",
+      "ws_a",
+      "run_1",
+      "roster",
+      "failed",
+      "",
+      "200",
+      { profile: "default" },
+    ]);
+    expect(options.initialPageParam).toBeUndefined();
+    // Continuation is the daemon's opaque cursor, never a client-computed offset.
+    expect(options.getNextPageParam({ next_cursor: "cur_2" } as never, [], undefined, [])).toBe(
+      "cur_2"
+    );
+    expect(
+      options.getNextPageParam({ next_cursor: "" } as never, [], undefined, [])
+    ).toBeUndefined();
+
+    const asFn = options.refetchInterval as (query: {
+      state: { data?: { pages: { run_status: string }[] } };
+    }) => number | false;
+    expect(asFn({ state: { data: { pages: [{ run_status: "done" }] } } })).toBe(false);
+    expect(asFn({ state: { data: { pages: [{ run_status: "running" }] } } })).toBeGreaterThan(0);
+
+    expect(loopRunRosterOptions("", "run_1").enabled).toBe(false);
+    expect(loopRunRosterOptions("ws_a", "").enabled).toBe(false);
+    expect(loopRunRosterOptions("ws_a", "run_1", {}, false).enabled).toBe(false);
+  });
+
+  it("Should default the story to the notable view and page it backward on a cursor", () => {
+    const options = loopRunTimelineOptions("ws_a", "run_1");
+    expect(options.initialPageParam).toBeUndefined();
+    expect(options.getNextPageParam({ next_cursor: "cur_9" } as never, [], undefined, [])).toBe(
+      "cur_9"
+    );
+    expect(
+      options.getNextPageParam({ next_cursor: undefined } as never, [], undefined, [])
+    ).toBeUndefined();
+    // `all` is a separate fenced history, so it must not share the cache.
+    expect(loopRunTimelineOptions("ws_a", "run_1", { view: "all" }).queryKey).not.toEqual(
+      options.queryKey
+    );
+
+    expect(loopRunTimelineOptions("", "run_1").enabled).toBe(false);
+    expect(loopRunTimelineOptions("ws_a", "").enabled).toBe(false);
+    expect(loopRunTimelineOptions("ws_a", "run_1", {}, false).enabled).toBe(false);
+  });
+});

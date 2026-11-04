@@ -1,0 +1,61 @@
+package contract
+
+// RoleResolutionMode identifies how one configured background role finds its identity.
+type RoleResolutionMode string
+
+const (
+	RoleResolutionModeBuiltin RoleResolutionMode = "builtin"
+	RoleResolutionModeCatalog RoleResolutionMode = "catalog"
+	RoleResolutionModeInherit RoleResolutionMode = "inherit"
+)
+
+// RoleFallbackStatus is one configured fallback route in declaration order. Agent
+// payloads reuse it for `fallback_chain` so both projections share one route shape.
+type RoleFallbackStatus struct {
+	SessionEnv      map[string]SessionEnvBindingPayload `json:"session_env,omitempty"`
+	Provider        string                              `json:"provider"`
+	Model           string                              `json:"model"`
+	ReasoningEffort string                              `json:"reasoning_effort,omitempty"`
+	Speed           Speed                               `json:"speed,omitempty"`
+	ACPOptions      []AgentACPOptionSelection           `json:"acp_options,omitempty"`
+	// Command is the configured route account (operator configuration surface).
+	Command string `json:"command,omitempty"`
+	// CommandFingerprint is `sha256:` over Command, the same value fallback events and
+	// transcript markers carry; present exactly when Command is set so clients can label
+	// a route without printing the command.
+	CommandFingerprint string `json:"command_fingerprint,omitempty"`
+}
+
+// RoleDiagnostic reports a current configuration-resolution problem without simulating an invocation.
+type RoleDiagnostic struct {
+	Code    string `json:"code"`
+	Message string `json:"message"`
+	Agent   string `json:"agent,omitempty"`
+}
+
+// RoleStatus is the effective configuration projection for one background role.
+type RoleStatus struct {
+	Role            string                    `json:"role"`
+	Enabled         bool                      `json:"enabled"`
+	ResolutionMode  RoleResolutionMode        `json:"resolution_mode"`
+	Agent           *string                   `json:"agent"`
+	Provider        *string                   `json:"provider"`
+	Model           *string                   `json:"model"`
+	ReasoningEffort *string                   `json:"reasoning_effort"`
+	Speed           *Speed                    `json:"speed"`
+	ACPOptions      []AgentACPOptionSelection `json:"acp_options"`
+	Timeout         *string                   `json:"timeout,omitzero"`
+	FallbackChain   []RoleFallbackStatus      `json:"fallback_chain"`
+	Provenance      map[string]string         `json:"provenance"`
+	Diagnostics     []RoleDiagnostic          `json:"diagnostics"`
+}
+
+// RolesResponse wraps the closed role roster.
+type RolesResponse struct {
+	Roles []RoleStatus `json:"roles"`
+}
+
+// RoleStatusResponse wraps one role projection.
+type RoleStatusResponse struct {
+	Role RoleStatus `json:"role"`
+}

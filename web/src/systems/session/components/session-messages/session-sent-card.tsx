@@ -1,0 +1,207 @@
+import { ArrowUpRight, CornerDownRight, Pause, Scissors } from "@compozy/ui/icons";
+import { useReducedMotionConfig } from "motion/react";
+import type { ReactNode } from "react";
+
+import type {
+  SessionMessageMode,
+  SessionReplyOutcome,
+  SessionSentCallState,
+} from "@/systems/session/lib/session-message-payload";
+import { Spinner, StatusDot, cn, type StatusDotTone } from "@compozy/ui";
+
+import {
+  SessionMessageChip,
+  SessionMessagePartyLabel,
+  SessionMessageTime,
+} from "./session-message-frame";
+import {
+  SESSION_MESSAGE_FRAME_CLASS,
+  sessionPartyPhrase,
+  type SessionPartyVerb,
+  type SessionMessageOpen,
+  type SessionMessageParty,
+} from "./session-message-party";
+
+/** The sent card's right side: no state when no reply was asked for; waiting until the reply exists. */
+export type SessionSentReplyState = "none" | "waiting" | SessionReplyOutcome;
+
+const VERB: Record<SessionSentCallState, SessionPartyVerb> = {
+  sending: "Sending to",
+  sent: "Sent to",
+  failed: "Could not send to",
+};
+
+const REPLY_WORD: Record<SessionReplyOutcome, string> = {
+  completed: "Replied",
+  failed: "Failed",
+  canceled: "Canceled",
+  dropped: "Dropped",
+  expired: "No reply",
+  unknown: "Unknown",
+};
+
+const REPLY_TONE: Record<SessionReplyOutcome, StatusDotTone> = {
+  completed: "success",
+  failed: "destructive",
+  canceled: "faint",
+  dropped: "faint",
+  expired: "faint",
+  unknown: "faint",
+};
+
+function SessionSentReply({
+  callState,
+  reply,
+}: {
+  callState: SessionSentCallState;
+  reply: SessionSentReplyState;
+}) {
+  const reduced = useReducedMotionConfig();
+  if (callState === "sending") {
+    return (
+      <span
+        className="inline-flex items-center gap-1.5 text-transcript-caption whitespace-nowrap text-subtle"
+        data-testid="session-sent-reply-state"
+        data-state="sending"
+      >
+        <Spinner className="size-2.75" />
+        Sending…
+      </span>
+    );
+  }
+  if (callState === "failed" || reply === "none") return null;
+  const tone: StatusDotTone = reply === "waiting" ? "success" : REPLY_TONE[reply];
+  const word = reply === "waiting" ? "Waiting for reply" : REPLY_WORD[reply];
+  return (
+    <span
+      className={cn(
+        "inline-flex items-center gap-1.5 text-transcript-caption whitespace-nowrap",
+        tone === "success"
+          ? "text-muted-foreground"
+          : tone === "destructive"
+            ? "text-destructive"
+            : "text-subtle"
+      )}
+      data-testid="session-sent-reply-state"
+      data-state={reply}
+    >
+      <StatusDot tone={tone} className={cn(reply === "waiting" && !reduced && "animate-pulse")} />
+      {word}
+    </span>
+  );
+}
+
+/** How the send landed: Steered or Interrupted from the daemon's delivery, and Held for a paused agent. */
+function SessionSentChips({ mode, held }: { mode: SessionMessageMode; held: boolean }) {
+  return (
+    <>
+      {mode === "steer" ? (
+        <SessionMessageChip icon={<CornerDownRight aria-hidden="true" />}>
+          Steered
+        </SessionMessageChip>
+      ) : null}
+      {mode === "interrupt" ? (
+        <SessionMessageChip icon={<Scissors aria-hidden="true" />}>Interrupted</SessionMessageChip>
+      ) : null}
+      {held ? (
+        <SessionMessageChip icon={<Pause aria-hidden="true" />}>
+          Held until it resumes
+        </SessionMessageChip>
+      ) : null}
+    </>
+  );
+}
+
+export interface SessionSentCardProps {
+  target: SessionMessageParty;
+  callState: SessionSentCallState;
+  mode: SessionMessageMode;
+  /** The first line of the message; on a failed call, the error replaces it. */
+  firstLine: string;
+  error: string | null;
+  reply: SessionSentReplyState;
+  /** The `in_reply_to` correlation chip; absent when the send answers nothing. */
+  replyTo?: ReactNode;
+  timestampMs: number | null;
+  onOpenTarget?: SessionMessageOpen;
+  /** The target is paused: the message waits for its resume (S12). */
+  held?: boolean;
+}
+
+/**
+ * A `compozy__session_prompt` call in the sender's transcript (S3, VC-04): one
+ * row with the arrow-out tile, "Sent to {title}", the steer or interrupt chip,
+ * the message's first line, and whether the target answered.
+ */
+export function SessionSentCard({
+  target,
+  callState,
+  mode,
+  firstLine,
+  error,
+  reply,
+  replyTo,
+  timestampMs,
+  onOpenTarget,
+  held = false,
+}: SessionSentCardProps) {
+  const failed = callState === "failed";
+  const verb = VERB[callState];
+  const lineTwo = failed ? (error ?? firstLine) : firstLine;
+  const replyWord =
+    failed || callState === "sending" || reply === "none"
+      ? null
+      : reply === "waiting"
+        ? "waiting for reply"
+        : REPLY_WORD[reply].toLowerCase();
+  const showHeld = held && !failed;
+  const name = `${sessionPartyPhrase(verb, target)}${showHeld ? ", held until it resumes" : ""}`;
+  return (
+    <article
+      aria-label={replyWord ? `${name}, ${replyWord}` : name}
+      aria-busy={target.pending || undefined}
+      data-testid="session-sent-card"
+      data-state={callState}
+      data-reply={reply}
+      data-held={held || undefined}
+      className={cn(
+        SESSION_MESSAGE_FRAME_CLASS,
+        "grid min-h-11.5 grid-cols-[24px_minmax(0,1fr)_auto] items-center gap-x-2.5 py-1.75 pr-3 pl-2.25"
+      )}
+    >
+      <span
+        aria-hidden="true"
+        className={cn(
+          "grid size-6 place-items-center rounded-full border bg-surface-2",
+          failed
+            ? "border-destructive/40 text-destructive"
+            : "border-line-strong text-muted-foreground"
+        )}
+      >
+        <ArrowUpRight className="size-3" />
+      </span>
+      <span className="flex min-w-0 flex-col gap-px">
+        <span className="flex min-w-0 items-center gap-1.5">
+          <SessionMessagePartyLabel verb={verb} party={target} onOpen={onOpenTarget} />
+          <SessionSentChips mode={mode} held={showHeld} />
+          {replyTo}
+        </span>
+        {lineTwo ? (
+          <span
+            className={cn(
+              "min-w-0 truncate text-transcript-caption",
+              failed ? "text-destructive" : "text-muted-foreground"
+            )}
+            data-testid="session-sent-line-two"
+          >
+            {lineTwo}
+          </span>
+        ) : null}
+      </span>
+      <span className="inline-flex shrink-0 items-center gap-2.5">
+        <SessionSentReply callState={callState} reply={reply} />
+        <SessionMessageTime timestampMs={timestampMs} />
+      </span>
+    </article>
+  );
+}

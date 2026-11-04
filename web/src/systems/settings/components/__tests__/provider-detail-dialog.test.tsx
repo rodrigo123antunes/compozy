@@ -1,0 +1,552 @@
+import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
+import { render, screen, within } from "@testing-library/react";
+import userEvent from "@testing-library/user-event";
+import { useState, type ReactNode } from "react";
+import { describe, expect, it, vi } from "vitest";
+
+import { ProviderDetailDialog } from "../provider-detail-dialog";
+import {
+  emptyProviderDraft,
+  providerDraftFromEntry,
+  withProviderAuthMode,
+} from "@/systems/settings/lib/provider-draft";
+import type { ProviderDraft, SettingsProviderEntry } from "@/systems/settings";
+
+const nativeProvider: SettingsProviderEntry = {
+  name: "codex",
+  default: false,
+  command_available: true,
+  settings: {
+    command: "npx -y @agentclientprotocol/codex-acp@latest",
+    display_name: "Codex",
+    models: { default: "gpt-5.6-sol", curated: [{ id: "gpt-5.6-sol" }] },
+    harness: "acp",
+    auth_mode: "native_cli",
+    env_policy: "filtered",
+    home_policy: "operator",
+    auth_status_command: "codex auth status",
+  },
+  auth_status: {
+    mode: "native_cli",
+    env_policy: "filtered",
+    home_policy: "operator",
+    state: "needs_login",
+    login: {
+      configured: true,
+      executable: "codex",
+      presence: "present",
+      recommended_action: "login",
+      source: "auth_login_command",
+    },
+  },
+  source_metadata: {
+    available_targets: ["global-config"],
+    effective_source: { kind: "global-config", scope: "user" },
+  },
+};
+
+const boundSecretProvider: SettingsProviderEntry = {
+  name: "openrouter",
+  default: false,
+  command_available: true,
+  settings: {
+    command: "npx -y pi-acp@latest",
+    display_name: "OpenRouter",
+    models: { default: "openai/gpt-5.4", curated: [{ id: "openai/gpt-5.4" }] },
+    harness: "pi_acp",
+    runtime_provider: "openrouter",
+    auth_mode: "bound_secret",
+    env_policy: "filtered",
+    home_policy: "operator",
+    credential_slots: [
+      {
+        name: "api_key",
+        target_env: "OPENROUTER_API_KEY",
+        secret_ref: "vault:providers/openrouter/api-key",
+        kind: "api_key",
+        required: true,
+      },
+    ],
+  },
+  credentials: [
+    {
+      name: "api_key",
+      target_env: "OPENROUTER_API_KEY",
+      secret_ref: "vault:providers/openrouter/api-key",
+      present: true,
+      required: true,
+    },
+  ],
+  source_metadata: {
+    available_targets: ["global-config"],
+    effective_source: { kind: "global-config", scope: "user" },
+  },
+};
+
+const nativeACPProvider: SettingsProviderEntry = {
+  name: "agy",
+  default: false,
+  command_available: true,
+  settings: {
+    command: "agy_acp_server.par --uid=",
+    display_name: "Google Antigravity",
+    models: { default: "", curated: [] },
+    harness: "acp",
+    auth_mode: "native_cli",
+    env_policy: "filtered",
+    home_policy: "operator",
+    auth_status_command: "",
+    auth_acp_method: "oauth-personal",
+  },
+  auth_status: {
+    mode: "native_cli",
+    env_policy: "filtered",
+    home_policy: "operator",
+    state: "unknown",
+    code: "provider_classification_unknown",
+    message:
+      "Provider owns authentication through its native CLI; run a provider auth probe for live status.",
+    login: {
+      configured: true,
+      executable: "agy_acp_server.par",
+      presence: "present",
+      recommended_action: "inspect",
+      source: "auth_acp_method",
+    },
+  },
+  source_metadata: {
+    available_targets: ["global-config"],
+    effective_source: { kind: "builtin-provider", scope: "user" },
+  },
+};
+
+interface HarnessProps {
+  mode: "inspect" | "edit" | "create";
+  entry?: SettingsProviderEntry | null;
+  initialDraft?: ProviderDraft;
+  onSave?: () => void;
+}
+
+/**
+ * Mirrors the page hook's inspector state machine so tab and footer entry
+ * points are exercised through the transition they actually drive.
+ */
+function Harness({
+  mode: initialMode,
+  entry = null,
+  initialDraft,
+  onSave = vi.fn(),
+}: HarnessProps) {
+  const [mode, setMode] = useState(initialMode);
+  const [draft, setDraft] = useState<ProviderDraft>(initialDraft ?? emptyProviderDraft());
+  return (
+    <ProviderDetailDialog
+      canSave
+      draft={mode === "inspect" ? null : draft}
+      entry={entry}
+      error={null}
+      isDeleting={false}
+      isSaving={false}
+      mode={mode}
+      onCancelEdit={() => setMode(current => (current === "edit" ? "inspect" : current))}
+      onDraftChange={updater => setDraft(current => updater(current))}
+      onOpenChange={vi.fn()}
+      onRefreshCatalog={vi.fn()}
+      onRequestDelete={vi.fn()}
+      onSave={onSave}
+      onSwitchToEdit={() => {
+        if (mode !== "inspect" || !entry) return;
+        setDraft(providerDraftFromEntry(entry));
+        setMode("edit");
+      }}
+      open
+      warnings={undefined}
+    />
+  );
+}
+
+function renderDialog(props: HarnessProps) {
+  const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+  const wrapper = ({ children }: { children: ReactNode }) => (
+    <QueryClientProvider client={queryClient}>{children}</QueryClientProvider>
+  );
+  return render(<Harness {...props} />, { wrapper });
+}
+
+function dialog() {
+  return screen.getByTestId("provider-detail-dialog");
+}
+
+describe("ProviderDetailDialog", () => {
+  it("Should render the create header and safe native credential controls", () => {
+    renderDialog({ mode: "create" });
+
+    const header = dialog().querySelector('[data-slot="entity-dialog-header"]');
+    expect(header).not.toBeNull();
+    expect(header?.querySelector('[data-slot="entity-dialog-header-icon"]')).not.toBeNull();
+    expect(screen.getByTestId("provider-detail-title")).toHaveTextContent("Create provider");
+    // The title already names the entity, so create carries no redundant eyebrow.
+    expect(within(dialog()).queryByText("Provider")).toBeNull();
+    expect(within(dialog()).getByText("Connect an agent app to CompozyOS.")).toBeInTheDocument();
+    // A provider surface configures a provider; it never chooses a runtime.
+    expect(dialog().querySelector('[data-slot="runtime-selector"]')).toBeNull();
+    expect(screen.queryByTestId("runtime-selector-trigger")).not.toBeInTheDocument();
+
+    expect(
+      screen.queryByTestId("settings-providers-editor-credential-slots")
+    ).not.toBeInTheDocument();
+    expect(
+      screen.queryByTestId("settings-providers-editor-credential-slot-0")
+    ).not.toBeInTheDocument();
+    expect(
+      screen.queryByTestId("settings-providers-editor-auth-login-command-input")
+    ).not.toBeInTheDocument();
+    expect(screen.getByTestId("settings-providers-editor-auth-login-descriptor")).toHaveTextContent(
+      "Not configured"
+    );
+    expect(screen.getByTestId("settings-providers-editor-auth-status-command-input")).toBeVisible();
+  });
+
+  it("Should reveal credential slots only after auth ownership becomes bound_secret", async () => {
+    const user = userEvent.setup();
+    renderDialog({ mode: "create" });
+
+    await user.click(screen.getByTestId("settings-providers-editor-auth-mode-bound_secret"));
+
+    expect(screen.getByTestId("settings-providers-editor-credential-slot-0")).toBeVisible();
+    expect(
+      screen.getByTestId("settings-providers-editor-credential-slot-0-target-env-input")
+    ).toBeVisible();
+    // Leaving the mode takes the slots with it — the daemon rejects them elsewhere.
+    await user.click(screen.getByTestId("settings-providers-editor-auth-mode-native_cli"));
+    expect(
+      screen.queryByTestId("settings-providers-editor-credential-slot-0")
+    ).not.toBeInTheDocument();
+  });
+
+  it("Should offer a write input only for a vault-backed credential ref", async () => {
+    const user = userEvent.setup();
+    renderDialog({
+      mode: "create",
+      initialDraft: withProviderAuthMode(emptyProviderDraft(), "bound_secret"),
+    });
+
+    const secretRef = screen.getByTestId(
+      "settings-providers-editor-credential-slot-0-secret-ref-input"
+    );
+    await user.click(secretRef);
+    await user.paste("env:OPENAI_API_KEY");
+    expect(
+      screen.getByTestId("settings-providers-editor-credential-slot-0-value-unavailable")
+    ).toBeVisible();
+    expect(screen.queryByLabelText("Credential value")).not.toBeInTheDocument();
+
+    await user.clear(secretRef);
+    await user.paste("vault:providers/openai/api-key");
+    expect(screen.getByLabelText("Credential value")).toBeVisible();
+  });
+
+  it("Should keep a stored credential rotate-only on edit", async () => {
+    const user = userEvent.setup();
+    renderDialog({
+      mode: "edit",
+      entry: boundSecretProvider,
+      initialDraft: providerDraftFromEntry(boundSecretProvider),
+    });
+
+    const presence = screen.getByTestId(
+      "settings-providers-editor-credential-slot-0-value-presence"
+    );
+    expect(presence).toHaveTextContent("vault:providers/openrouter/api-key → OPENROUTER_API_KEY");
+    expect(screen.queryByLabelText("Credential value")).not.toBeInTheDocument();
+
+    await user.click(
+      screen.getByTestId("settings-providers-editor-credential-slot-0-value-replace")
+    );
+    const input = screen.getByLabelText("Credential value");
+    expect(input).toHaveValue("");
+    expect(input).toHaveAttribute("type", "password");
+  });
+
+  it("Should render the provider name as immutable identity on edit", () => {
+    renderDialog({
+      mode: "edit",
+      entry: nativeProvider,
+      initialDraft: providerDraftFromEntry(nativeProvider),
+    });
+
+    const identity = screen.getByTestId("settings-providers-editor-identity");
+    expect(identity).toHaveTextContent("codex");
+    expect(screen.queryByTestId("settings-providers-editor-name-input")).not.toBeInTheDocument();
+    expect(screen.getByTestId("provider-detail-title")).toHaveTextContent("Edit Codex");
+  });
+
+  it("Should keep runtime fields in Advanced and require a runtime provider only for pi_acp", async () => {
+    const user = userEvent.setup();
+    renderDialog({ mode: "create" });
+
+    expect(screen.queryByTestId("settings-providers-editor-model-input")).not.toBeInTheDocument();
+
+    await user.click(screen.getByTestId("settings-providers-editor-mode-advanced"));
+
+    expect(screen.getByTestId("settings-providers-editor-model-input")).toBeVisible();
+    expect(screen.getByTestId("settings-providers-editor-harness-input")).toBeVisible();
+    expect(screen.getByTestId("settings-providers-editor-home-policy-input")).toBeVisible();
+    // Advanced appends; the required basics never disappear.
+    expect(screen.getByTestId("settings-providers-editor-name-input")).toBeVisible();
+
+    const runtimeProvider = screen.getByTestId("settings-providers-editor-runtime-provider");
+    expect(within(runtimeProvider).queryByText("required")).not.toBeInTheDocument();
+
+    await user.selectOptions(
+      screen.getByTestId("settings-providers-editor-harness-input"),
+      "pi_acp"
+    );
+
+    expect(within(runtimeProvider).getByText("required")).toBeVisible();
+  });
+
+  it("Should open the edit form from the Configure tab without losing inspect", async () => {
+    const user = userEvent.setup();
+    renderDialog({ mode: "inspect", entry: nativeProvider });
+
+    expect(screen.getByTestId("provider-detail-title")).toHaveTextContent("Codex");
+    expect(screen.queryByTestId("settings-providers-editor-mode-advanced")).not.toBeInTheDocument();
+    expect(screen.getByTestId("inspect-auth-mode")).toHaveTextContent("native_cli");
+
+    await user.click(screen.getByTestId("provider-detail-tab-configure"));
+
+    expect(screen.getByTestId("settings-providers-editor-basics")).toBeVisible();
+    expect(screen.getByTestId("provider-detail-title")).toHaveTextContent("Edit Codex");
+
+    await user.click(screen.getByTestId("provider-detail-tab-overview"));
+    expect(screen.getByTestId("provider-detail-summary")).toBeVisible();
+    expect(screen.queryByTestId("settings-providers-editor-basics")).not.toBeInTheDocument();
+  });
+
+  it("Should open on a status summary with technical details folded away", async () => {
+    const user = userEvent.setup();
+    renderDialog({
+      mode: "inspect",
+      entry: {
+        ...nativeProvider,
+        session_env_status: [
+          {
+            name: "GH_TOKEN",
+            target_env: "GH_TOKEN",
+            secret_ref: "vault:providers/codex/github",
+            required: true,
+            present: true,
+            source: "vault",
+          },
+          {
+            name: "SSH_AUTH_SOCK",
+            target_env: "SSH_AUTH_SOCK",
+            secret_ref: "env:SSH_AUTH_SOCK",
+            required: false,
+            present: false,
+            source: "env",
+          },
+        ],
+      },
+    });
+
+    expect(screen.getByTestId("inspect-login-descriptor-executable")).toHaveTextContent("codex");
+    expect(screen.getByTestId("inspect-login-descriptor-action")).toHaveTextContent(
+      "Next: Sign in with the provider CLI."
+    );
+    expect(screen.queryByText("codex login")).not.toBeInTheDocument();
+
+    const summary = screen.getByTestId("provider-detail-summary");
+    expect(summary).toBeVisible();
+    expect(within(summary).getByTestId("provider-detail-summary-status")).toHaveTextContent(
+      "Needs sign-in"
+    );
+    expect(within(summary).getByTestId("inspect-default-model")).toHaveTextContent("gpt-5.6-sol");
+    expect(screen.getByTestId("provider-detail-status")).toHaveTextContent("Needs sign-in");
+    expect(screen.getByTestId("inspect-command")).not.toBeVisible();
+
+    await user.click(within(dialog()).getByRole("button", { name: "Technical details" }));
+    expect(screen.getByTestId("inspect-command")).toBeVisible();
+    expect(screen.getByTestId("inspect-auth-status")).toHaveTextContent("Needs sign-in");
+    const token = screen.getByTestId("inspect-credential-GH_TOKEN");
+    expect(token).toHaveTextContent("vault:providers/codex/github");
+    expect(within(token).getByText("Set")).toBeVisible();
+    expect(within(token).queryByRole("textbox")).not.toBeInTheDocument();
+    const socket = screen.getByTestId("inspect-credential-SSH_AUTH_SOCK");
+    expect(socket).toHaveTextContent("env:SSH_AUTH_SOCK");
+    expect(within(socket).getByText("Optional")).toBeVisible();
+
+    await user.click(screen.getByTestId("provider-detail-summary-action"));
+    expect(screen.getByTestId("settings-providers-editor-basics")).toBeVisible();
+  });
+
+  it("Should check an unverified sign-in in place without opening the editor", async () => {
+    // Invariant: "Check sign-in" runs the live probe; the daemon keeps the verdict for the row.
+    const fetchMock = vi.fn(async (input: RequestInfo | URL) => {
+      const url = input instanceof Request ? input.url : String(input);
+      if (url.includes("/auth/probe")) {
+        return Response.json({
+          provider: "agy",
+          auth_status: { ...nativeACPProvider.auth_status!, state: "authenticated" },
+        });
+      }
+      return Response.json({}, { status: 404 });
+    });
+    vi.stubGlobal("fetch", fetchMock);
+    const user = userEvent.setup();
+    try {
+      renderDialog({ mode: "inspect", entry: nativeACPProvider });
+      const action = screen.getByTestId("provider-detail-summary-action");
+      expect(action).toHaveTextContent("Check sign-in");
+
+      await user.click(action);
+
+      await vi.waitFor(() => {
+        const probe = fetchMock.mock.calls
+          .map(([input]) => input)
+          .find(input =>
+            (input instanceof Request ? input.url : String(input)).includes("/auth/probe")
+          );
+        expect(probe).toBeInstanceOf(Request);
+        expect((probe as Request).method).toBe("POST");
+        expect((probe as Request).url).toContain("/api/providers/agy/auth/probe");
+      });
+      expect(screen.queryByTestId("settings-providers-editor-basics")).not.toBeInTheDocument();
+    } finally {
+      vi.unstubAllGlobals();
+    }
+  });
+
+  it("Should show when a verified sign-in was last checked", () => {
+    renderDialog({
+      mode: "inspect",
+      entry: {
+        ...nativeACPProvider,
+        auth_status: {
+          ...nativeACPProvider.auth_status!,
+          state: "authenticated",
+          code: undefined,
+          message: undefined,
+          last_probe_at: new Date(Date.now() - 3 * 60_000).toISOString(),
+        },
+      },
+    });
+
+    expect(screen.getByTestId("provider-detail-summary-status")).toHaveTextContent("Ready");
+    expect(screen.getByTestId("provider-detail-checked-at")).toHaveTextContent("Checked");
+  });
+
+  it("Should offer delete only for providers the operator can remove", () => {
+    const builtin: SettingsProviderEntry = {
+      ...nativeProvider,
+      source_metadata: {
+        available_targets: ["global-config"],
+        effective_source: { kind: "builtin-provider", scope: "user" },
+      },
+    } as SettingsProviderEntry;
+    const { unmount } = renderDialog({ mode: "inspect", entry: builtin });
+    expect(screen.queryByTestId("provider-detail-delete")).not.toBeInTheDocument();
+    unmount();
+
+    renderDialog({ mode: "inspect", entry: nativeProvider });
+    expect(screen.getByTestId("provider-detail-delete")).toHaveTextContent("Delete provider");
+  });
+
+  it("Should reopen on the Simple tier after an Advanced edit of another provider", async () => {
+    const user = userEvent.setup();
+    const { rerender } = renderDialog({
+      mode: "edit",
+      entry: nativeProvider,
+      initialDraft: providerDraftFromEntry(nativeProvider),
+    });
+
+    await user.click(screen.getByTestId("settings-providers-editor-mode-advanced"));
+    expect(screen.getByTestId("settings-providers-editor-model-input")).toBeVisible();
+
+    // The page keeps this dialog mounted between openings.
+    rerender(
+      <Harness
+        entry={boundSecretProvider}
+        initialDraft={providerDraftFromEntry(boundSecretProvider)}
+        mode="edit"
+      />
+    );
+
+    expect(screen.queryByTestId("settings-providers-editor-model-input")).not.toBeInTheDocument();
+    expect(screen.getByTestId("settings-providers-editor-basics")).toBeVisible();
+  });
+
+  it("Should open the edit form from the inspect footer action", async () => {
+    const user = userEvent.setup();
+    renderDialog({ mode: "inspect", entry: nativeProvider });
+
+    await user.click(screen.getByTestId("provider-detail-edit"));
+
+    expect(screen.getByTestId("settings-providers-editor-basics")).toBeVisible();
+    expect(screen.getByTestId("provider-detail-save")).toHaveTextContent("Save provider");
+  });
+
+  it("Should edit the protocol sign-in method without credential controls", async () => {
+    const user = userEvent.setup();
+    renderDialog({
+      mode: "edit",
+      entry: nativeACPProvider,
+      initialDraft: providerDraftFromEntry(nativeACPProvider),
+    });
+
+    const method = screen.getByTestId("settings-providers-editor-auth-acp-method-input");
+    expect(method).toBeVisible();
+    expect(method).toHaveValue("oauth-personal");
+    expect(screen.getByLabelText(/Sign-in method/)).toBe(method);
+
+    // Native auth mounts no secret, key, ref, or rotation controls.
+    expect(
+      screen.queryByTestId("settings-providers-editor-credential-slots")
+    ).not.toBeInTheDocument();
+    expect(screen.queryByLabelText("Credential value")).not.toBeInTheDocument();
+    expect(screen.queryByText("Rotate")).not.toBeInTheDocument();
+
+    // Presence is availability truth, not sign-in truth; the protocol source
+    // never carries the command-only write-only-config badge.
+    const descriptor = screen.getByTestId("settings-providers-editor-auth-login-descriptor");
+    expect(
+      within(descriptor).getByTestId("settings-providers-editor-auth-login-descriptor-executable")
+    ).toHaveTextContent("agy_acp_server.par");
+    expect(within(descriptor).queryByText("write-only config")).not.toBeInTheDocument();
+
+    await user.clear(method);
+    await user.type(method, "oauth-device");
+    expect(method).toHaveValue("oauth-device");
+  });
+
+  it("Should badge only the command-owned login source as write-only config", () => {
+    renderDialog({
+      mode: "edit",
+      entry: nativeACPProvider,
+      initialDraft: providerDraftFromEntry(nativeACPProvider),
+    });
+    expect(
+      within(screen.getByTestId("settings-providers-editor-auth-login-descriptor")).queryByText(
+        "write-only config"
+      )
+    ).not.toBeInTheDocument();
+  });
+
+  it("Should hide the sign-in method when the harness cannot use it", async () => {
+    const user = userEvent.setup();
+    renderDialog({ mode: "create" });
+
+    expect(screen.getByTestId("settings-providers-editor-auth-acp-method-input")).toBeVisible();
+
+    await user.click(screen.getByTestId("settings-providers-editor-mode-advanced"));
+    await user.selectOptions(
+      screen.getByTestId("settings-providers-editor-harness-input"),
+      "pi_acp"
+    );
+
+    expect(
+      screen.queryByTestId("settings-providers-editor-auth-acp-method-input")
+    ).not.toBeInTheDocument();
+  });
+});

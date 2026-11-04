@@ -1,0 +1,77 @@
+import { shallowEqual } from "@xstate/store";
+
+import { getOsAppDescriptor, osAppId } from "../lib/app-catalog";
+import { windowManagerCommandsAvailable } from "../lib/window-manager-command-availability";
+import { useDesktop } from "./use-desktop";
+import {
+  useDesktopOverviewSegmentRequest,
+  usePendingWindowManagerCommand,
+  useWindowManagerConflict,
+  useWindowManagerDiagnostic,
+  useWindowManagerOverlay,
+} from "./use-window-manager-store";
+
+/** Runtime inputs for the desktop overview and connection diagnostic surfaces. */
+export function useDesktopManagerSurfaces() {
+  const overlay = useWindowManagerOverlay();
+  const overviewSegmentRequest = useDesktopOverviewSegmentRequest();
+  const conflict = useWindowManagerConflict();
+  const diagnostic = useWindowManagerDiagnostic();
+  const pending = usePendingWindowManagerCommand();
+  const hydration = useDesktop(state => state.hydration);
+  const connectionStatus = useDesktop(state => state.connectionStatus);
+  const activeDesktopId = useDesktop(state => state.activeDesktopId);
+  const canMutate = useDesktop(windowManagerCommandsAvailable);
+  const overviewOpen = overlay?.kind === "desktops-overview";
+  const projection = useDesktop(
+    state =>
+      overviewOpen
+        ? { desktops: state.desktops, projections: state.projections, windows: state.windows }
+        : null,
+    shallowEqual
+  );
+  const windowsByDesktop = new Map<
+    string,
+    Array<NonNullable<typeof projection>["windows"][string]>
+  >();
+  for (const windowRecord of Object.values(projection?.windows ?? {})) {
+    const records = windowsByDesktop.get(windowRecord.desktopId);
+    if (records) records.push(windowRecord);
+    else windowsByDesktop.set(windowRecord.desktopId, [windowRecord]);
+  }
+  const desktops = (projection?.desktops ?? []).map(desktop => {
+    const windowRecords = windowsByDesktop.get(desktop.id) ?? [];
+    return {
+      id: desktop.id,
+      name: desktop.name,
+      projection: projection?.projections[desktop.id],
+      windowRecords,
+      windows: windowRecords.flatMap(window => {
+        const app = osAppId(window.app);
+        if (app === null) return [];
+        return [
+          {
+            id: window.id,
+            title: getOsAppDescriptor(app).title,
+            detail: window.instanceKey ?? undefined,
+          },
+        ];
+      }),
+    };
+  });
+
+  return {
+    activeDesktopId,
+    canMutate,
+    connectionStatus,
+    conflict,
+    desktops,
+    diagnostic,
+    hydration,
+    overlay,
+    overviewSegmentRequest,
+    pending,
+  };
+}
+
+export type DesktopManagerSurfacesModel = ReturnType<typeof useDesktopManagerSurfaces>;

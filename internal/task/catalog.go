@@ -1,0 +1,398 @@
+package task
+
+import (
+	"cmp"
+	"context"
+	"errors"
+	"fmt"
+	"slices"
+	"strings"
+	"time"
+
+	"github.com/compozy/compozy/internal/listcursor"
+	"github.com/compozy/compozy/internal/store"
+)
+
+const (
+	// CatalogScopeAll includes global tasks and the workspace selected by the query.
+	CatalogScopeAll CatalogScope = "all"
+	// CatalogScopeGlobal includes only global tasks.
+	CatalogScopeGlobal CatalogScope = "global"
+	// CatalogScopeWorkspace includes only tasks from the selected workspace.
+	CatalogScopeWorkspace CatalogScope = "workspace"
+
+	// CatalogSortRecent orders tasks by their latest durable activity.
+	CatalogSortRecent CatalogSort = "recent"
+	// CatalogSortPriority orders tasks by priority and then latest durable activity.
+	CatalogSortPriority CatalogSort = "priority"
+
+	// DefaultCatalogLimit bounds public task catalog reads when no limit is supplied.
+	DefaultCatalogLimit = 50
+	// MaxCatalogLimit bounds one public task catalog page.
+	MaxCatalogLimit = 200
+
+	taskCatalogCursorVersion = 1
+	taskCatalogCursorKind    = "task_catalog"
+)
+
+var (
+	// ErrCatalogCursorInvalid reports a malformed cursor or one reused with a different query.
+	ErrCatalogCursorInvalid = errors.New("task: catalog cursor is invalid")
+)
+
+// CatalogScope identifies the visibility boundary applied to a catalog query.
+type CatalogScope string
+
+// Normalize returns the canonical catalog scope.
+func (s CatalogScope) Normalize() CatalogScope {
+	return CatalogScope(Scope(s).Normalize())
+}
+
+// CatalogSort identifies a supported task catalog ordering.
+type CatalogSort string
+
+// Normalize returns the canonical catalog sort.
+func (s CatalogSort) Normalize() CatalogSort {
+	return CatalogSort(strings.ToLower(strings.TrimSpace(string(s))))
+}
+
+// CatalogQuery captures one bounded task catalog request.
+type CatalogQuery struct {
+	ReadScope        store.ReadScope
+	Scope            CatalogScope
+	WorkspaceID      string
+	AllWorkspaces    bool
+	WorkspaceIDs     []string
+	Status           Status
+	Priority         Priority
+	IncludeDrafts    bool
+	ApprovalState    ApprovalState
+	OwnerKind        OwnerKind
+	OwnerRef         string
+	ParentTaskID     string
+	WorktreeID       string
+	ExcludeCreatedBy []ActorRef
+	LoopRunID        string
+	Search           string
+	Sort             CatalogSort
+	Cursor           string
+	Limit            int
+}
+
+// CatalogStatusFacet is one exact status count before the page cut.
+type CatalogStatusFacet struct {
+	Status Status `json:"status"`
+	Count  int    `json:"count"`
+}
+
+// CatalogOwnerFacet is one exact assigned-owner count before the page cut.
+type CatalogOwnerFacet struct {
+	Owner Ownership `json:"owner"`
+	Count int       `json:"count"`
+}
+
+// CatalogPage is one stable, counted task catalog page.
+type CatalogPage struct {
+	Tasks        []Summary
+	StatusFacets []CatalogStatusFacet
+	OwnerFacets  []CatalogOwnerFacet
+	NextCursor   string
+	HasMore      bool
+	Total        int
+	Limit        int
+}
+
+// CatalogCursor is the captured ordering tuple of the last returned row.
+type CatalogCursor struct {
+	PriorityRank int       `json:"priority_rank"`
+	ActivityAt   time.Time `json:"activity_at"`
+	TaskID       string    `json:"task_id"`
+}
+
+type catalogFingerprint struct {
+	ProfileID        string        `json:"profile_id"`
+	AllProfiles      bool          `json:"all_profiles"`
+	Scope            CatalogScope  `json:"scope"`
+	WorkspaceID      string        `json:"workspace_id"`
+	AllWorkspaces    bool          `json:"all_workspaces,omitzero"`
+	WorkspaceIDs     []string      `json:"workspace_ids,omitempty"`
+	Status           Status        `json:"status"`
+	Priority         Priority      `json:"priority"`
+	IncludeDrafts    bool          `json:"include_drafts"`
+	ApprovalState    ApprovalState `json:"approval_state"`
+	OwnerKind        OwnerKind     `json:"owner_kind"`
+	OwnerRef         string        `json:"owner_ref"`
+	ParentTaskID     string        `json:"parent_task_id"`
+	WorktreeID       string        `json:"worktree_id"`
+	ExcludeCreatedBy []ActorRef    `json:"exclude_created_by"`
+	LoopRunID        string        `json:"loop_run_id"`
+	Search           string        `json:"q"`
+	Sort             CatalogSort   `json:"sort"`
+}
+
+// CatalogReader is the batched persistence capability used by public task catalogs.
+type CatalogReader interface {
+	ListTaskCatalog(ctx context.Context, query CatalogQuery) (CatalogPage, error)
+}
+
+// CatalogManager is the public task catalog capability exposed by Service.
+type CatalogManager interface {
+	ListTaskCatalog(ctx context.Context, query CatalogQuery, actor ActorContext) (CatalogPage, error)
+}
+
+// NormalizeCatalogQuery validates and canonicalizes one public task catalog request.
+func NormalizeCatalogQuery(query CatalogQuery) (CatalogQuery, error) {
+	normalizedReadScope, err := normalizeTaskReadScope(query.ReadScope)
+	if err != nil {
+		return CatalogQuery{}, fmt.Errorf("%w: %w", ErrValidation, err)
+	}
+	query.ReadScope = normalizedReadScope
+	query = normalizeCatalogQuery(query)
+
+	if err := validateCatalogQuery(query); err != nil {
+		return CatalogQuery{}, err
+	}
+	if query.Cursor != "" {
+		if _, err := DecodeCatalogCursor(query); err != nil {
+			return CatalogQuery{}, err
+		}
+	}
+	return query, nil
+}
+
+func normalizeCatalogQuery(query CatalogQuery) CatalogQuery {
+	query.Scope = query.Scope.Normalize()
+	if query.Scope == "" {
+		query.Scope = CatalogScopeAll
+	}
+	query.WorkspaceID = strings.TrimSpace(query.WorkspaceID)
+	query.WorkspaceIDs = normalizeWorkspaceIDs(query.WorkspaceIDs)
+	query.Status = query.Status.Normalize()
+	query.Priority = query.Priority.Normalize()
+	query.ApprovalState = query.ApprovalState.Normalize()
+	query.OwnerKind = query.OwnerKind.Normalize()
+	query.OwnerRef = strings.TrimSpace(query.OwnerRef)
+	query.ParentTaskID = strings.TrimSpace(query.ParentTaskID)
+	query.WorktreeID = strings.TrimSpace(query.WorktreeID)
+	query.ExcludeCreatedBy = normalizeCatalogActorRefs(query.ExcludeCreatedBy)
+	query.LoopRunID = strings.TrimSpace(query.LoopRunID)
+	query.Search = strings.ToLower(strings.TrimSpace(query.Search))
+	query.Sort = query.Sort.Normalize()
+	query.Cursor = strings.TrimSpace(query.Cursor)
+	if query.Sort == "" {
+		query.Sort = CatalogSortRecent
+	}
+	if query.Limit == 0 {
+		query.Limit = DefaultCatalogLimit
+	}
+	return query
+}
+
+func validateCatalogQuery(query CatalogQuery) error {
+	if err := validateCatalogScope(query); err != nil {
+		return err
+	}
+	if err := validateCatalogFilters(query); err != nil {
+		return err
+	}
+	return validateCatalogPage(query)
+}
+
+func validateCatalogScope(query CatalogQuery) error {
+	if query.AllWorkspaces && (query.WorkspaceID != "" || query.Scope != CatalogScopeAll) {
+		return fmt.Errorf("%w: all_workspaces conflicts with scope or workspace", ErrValidation)
+	}
+	if len(query.WorkspaceIDs) != 0 && !query.AllWorkspaces {
+		return fmt.Errorf("%w: workspace_ids requires all_workspaces", ErrValidation)
+	}
+	switch query.Scope {
+	case CatalogScopeAll:
+	case CatalogScopeGlobal:
+		if query.WorkspaceID != "" {
+			return fmt.Errorf("%w: task_catalog.workspace_id must be empty for global scope", ErrValidation)
+		}
+	case CatalogScopeWorkspace:
+		if query.WorkspaceID == "" {
+			return fmt.Errorf("%w: task_catalog.workspace_id is required for workspace scope", ErrValidation)
+		}
+	default:
+		return fmt.Errorf("%w: task_catalog.scope has unsupported value %q", ErrValidation, query.Scope)
+	}
+	if query.WorktreeID != "" && query.WorkspaceID == "" {
+		return fmt.Errorf("%w: task_catalog.workspace_id is required with worktree_id", ErrValidation)
+	}
+	return nil
+}
+
+func validateCatalogFilters(query CatalogQuery) error {
+	if query.Status != "" {
+		if err := query.Status.Validate("task_catalog.status"); err != nil {
+			return err
+		}
+	}
+	if query.Priority != "" {
+		if err := query.Priority.Validate("task_catalog.priority"); err != nil {
+			return err
+		}
+	}
+	if query.ApprovalState != "" {
+		if err := query.ApprovalState.Validate("task_catalog.approval_state"); err != nil {
+			return err
+		}
+	}
+	if query.OwnerKind != "" {
+		if err := query.OwnerKind.Validate("task_catalog.owner_kind"); err != nil {
+			return err
+		}
+	}
+	for index := range query.ExcludeCreatedBy {
+		if err := query.ExcludeCreatedBy[index].Validate(
+			fmt.Sprintf("task_catalog.exclude_created_by[%d]", index),
+		); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func validateCatalogPage(query CatalogQuery) error {
+	if query.Sort != CatalogSortRecent && query.Sort != CatalogSortPriority {
+		return fmt.Errorf("%w: task_catalog.sort has unsupported value %q", ErrValidation, query.Sort)
+	}
+	if query.Limit < 1 || query.Limit > MaxCatalogLimit {
+		return fmt.Errorf(
+			"%w: task_catalog.limit must be between 1 and %d: %d",
+			ErrValidation,
+			MaxCatalogLimit,
+			query.Limit,
+		)
+	}
+	return nil
+}
+
+// EncodeCatalogCursor captures the last returned row without relying on later anchor lookup.
+func EncodeCatalogCursor(query CatalogQuery, summary *Summary) (string, error) {
+	normalized, err := NormalizeCatalogQuery(CatalogQueryWithoutCursor(query))
+	if err != nil {
+		return "", err
+	}
+	fingerprint, err := taskCatalogFingerprint(normalized)
+	if err != nil {
+		return "", err
+	}
+	encoded, err := listcursor.Encode(
+		taskCatalogCursorVersion,
+		taskCatalogCursorKind,
+		fingerprint,
+		CatalogCursor{
+			PriorityRank: PriorityRank(summary.Priority),
+			ActivityAt:   summary.LastActivityAt.UTC(),
+			TaskID:       strings.TrimSpace(summary.ID),
+		},
+	)
+	if err != nil {
+		return "", fmt.Errorf("task: encode catalog cursor: %w", err)
+	}
+	return encoded, nil
+}
+
+// DecodeCatalogCursor verifies and decodes a query-bound task catalog cursor.
+func DecodeCatalogCursor(query CatalogQuery) (CatalogCursor, error) {
+	query = normalizeCatalogQuery(query)
+	fingerprint, err := taskCatalogFingerprint(query)
+	if err != nil {
+		return CatalogCursor{}, err
+	}
+	cursor, err := listcursor.Decode[CatalogCursor](
+		query.Cursor,
+		taskCatalogCursorVersion,
+		taskCatalogCursorKind,
+		fingerprint,
+		listcursor.DefaultMaxEncodedSize,
+	)
+	if err != nil {
+		return CatalogCursor{}, fmt.Errorf("%w: %w", ErrCatalogCursorInvalid, err)
+	}
+	if cursor.ActivityAt.IsZero() || strings.TrimSpace(cursor.TaskID) == "" {
+		return CatalogCursor{}, fmt.Errorf("%w: cursor position is incomplete", ErrCatalogCursorInvalid)
+	}
+	return cursor, nil
+}
+
+// CatalogQueryWithoutCursor returns the query identity used to encode a next cursor.
+func CatalogQueryWithoutCursor(query CatalogQuery) CatalogQuery {
+	query.Cursor = ""
+	return query
+}
+
+func taskCatalogFingerprint(query CatalogQuery) (string, error) {
+	fingerprint, err := listcursor.Fingerprint(catalogFingerprint{
+		ProfileID:        query.ReadScope.ProfileID,
+		AllProfiles:      query.ReadScope.AllProfiles,
+		Scope:            query.Scope,
+		WorkspaceID:      query.WorkspaceID,
+		AllWorkspaces:    query.AllWorkspaces,
+		WorkspaceIDs:     query.WorkspaceIDs,
+		Status:           query.Status,
+		Priority:         query.Priority,
+		IncludeDrafts:    query.IncludeDrafts,
+		ApprovalState:    query.ApprovalState,
+		OwnerKind:        query.OwnerKind,
+		OwnerRef:         query.OwnerRef,
+		ParentTaskID:     query.ParentTaskID,
+		WorktreeID:       query.WorktreeID,
+		ExcludeCreatedBy: query.ExcludeCreatedBy,
+		LoopRunID:        query.LoopRunID,
+		Search:           query.Search,
+		Sort:             query.Sort,
+	})
+	if err != nil {
+		return "", fmt.Errorf("task: fingerprint catalog query: %w", err)
+	}
+	return fingerprint, nil
+}
+
+func normalizeCatalogActorRefs(refs []ActorRef) []ActorRef {
+	normalized := make([]ActorRef, 0, len(refs))
+	seen := make(map[ActorRef]struct{}, len(refs))
+	for _, ref := range refs {
+		candidate := ActorRef{Kind: ref.Kind.Normalize(), Ref: strings.TrimSpace(ref.Ref)}
+		if candidate.IsZero() {
+			continue
+		}
+		if _, exists := seen[candidate]; exists {
+			continue
+		}
+		seen[candidate] = struct{}{}
+		normalized = append(normalized, candidate)
+	}
+	slices.SortFunc(normalized, func(a, b ActorRef) int {
+		return cmp.Or(cmp.Compare(a.Kind, b.Kind), cmp.Compare(a.Ref, b.Ref))
+	})
+	return normalized
+}
+
+// PriorityRank returns the canonical highest-first task priority rank.
+func PriorityRank(priority Priority) int {
+	switch priority.Normalize() {
+	case PriorityUrgent:
+		return 4
+	case PriorityHigh:
+		return 3
+	case PriorityMedium:
+		return 2
+	case PriorityLow:
+		return 1
+	default:
+		return 0
+	}
+}
+
+func normalizeWorkspaceIDs(ids []string) []string {
+	result := slices.Clone(ids)
+	for i := range result {
+		result[i] = strings.TrimSpace(result[i])
+	}
+	slices.Sort(result)
+	return slices.Compact(result)
+}

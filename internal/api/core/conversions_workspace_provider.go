@@ -1,0 +1,183 @@
+package core
+
+import (
+	"bytes"
+	"encoding/json"
+	"maps"
+
+	"path/filepath"
+	"slices"
+	"strings"
+
+	"github.com/compozy/compozy/internal/api/contract"
+
+	compozyconfig "github.com/compozy/compozy/internal/config"
+
+	workspacepkg "github.com/compozy/compozy/internal/workspace"
+)
+
+// WorkspacePayloadFromWorkspace converts a workspace into the shared payload.
+func WorkspacePayloadFromWorkspace(workspace workspacepkg.Workspace) contract.WorkspacePayload {
+	addDirs := make([]string, 0, len(workspace.AdditionalDirs))
+	addDirs = append(addDirs, workspace.AdditionalDirs...)
+
+	return contract.WorkspacePayload{
+		ArchivedAt:   workspace.ArchivedAt,
+		RootMissing:  workspace.RootMissing,
+		ID:           workspace.ID,
+		RootDir:      workspace.RootDir,
+		AddDirs:      addDirs,
+		Name:         workspace.Name,
+		DefaultAgent: workspace.DefaultAgent,
+		CreatedAt:    workspace.CreatedAt,
+		UpdatedAt:    workspace.UpdatedAt,
+	}
+}
+
+// WorkspaceSkillPayloads converts workspace skill paths into response payloads.
+func WorkspaceSkillPayloads(skills []workspacepkg.SkillPath) []contract.WorkspaceSkillPayload {
+	payload := make([]contract.WorkspaceSkillPayload, 0, len(skills))
+	for _, skill := range skills {
+		name := strings.TrimSpace(skill.Name)
+		if name == "" {
+			name = filepath.Base(skill.Dir)
+		}
+		payload = append(payload, contract.WorkspaceSkillPayload{
+			Name:   name,
+			Dir:    skill.Dir,
+			Source: skill.Source,
+		})
+	}
+	return payload
+}
+
+// SessionProviderOptionPayloadsFromConfig converts the merged workspace config
+// into a stable, UI-ready list of visible provider options.
+func SessionProviderOptionPayloadsFromConfig(cfg *compozyconfig.Config) []contract.SessionProviderOptionPayload {
+	payloadsByName := make(map[string]contract.SessionProviderOptionPayload, len(compozyconfig.BuiltinProviders()))
+	for name := range compozyconfig.BuiltinProviders() {
+		payload, ok := sessionProviderOptionPayloadFromConfig(cfg, name)
+		if !ok {
+			continue
+		}
+		payloadsByName[payload.Name] = payload
+	}
+	if cfg != nil {
+		for name := range cfg.Providers {
+			payload, ok := sessionProviderOptionPayloadFromConfig(cfg, name)
+			if !ok {
+				continue
+			}
+			payloadsByName[payload.Name] = payload
+		}
+	}
+
+	defaultProvider := ""
+	if cfg != nil {
+		defaultProvider = compozyconfig.CanonicalProviderName(cfg.Defaults.Provider)
+	}
+	return sortSessionProviderOptionPayloads(payloadsByName, defaultProvider)
+}
+
+func sessionProviderOptionPayloadFromConfig(
+	cfg *compozyconfig.Config,
+	name string,
+) (contract.SessionProviderOptionPayload, bool) {
+	providerName := compozyconfig.CanonicalProviderName(name)
+	if providerName == "" {
+		return contract.SessionProviderOptionPayload{}, false
+	}
+	var resolved compozyconfig.ProviderConfig
+	var err error
+	if cfg == nil {
+		var empty compozyconfig.Config
+		resolved, err = empty.ResolveProvider(providerName)
+	} else {
+		resolved, err = cfg.ResolveProvider(providerName)
+	}
+	if err != nil {
+		return contract.SessionProviderOptionPayload{}, false
+	}
+	runtimeProvider := strings.TrimSpace(resolved.RuntimeProviderName(providerName))
+	return contract.SessionProviderOptionPayload{
+		Name:             providerName,
+		DisplayName:      strings.TrimSpace(resolved.DisplayName),
+		Harness:          string(resolved.EffectiveHarness()),
+		RuntimeProvider:  runtimeProvider,
+		RuntimeStrategy:  providerRuntimeStrategy(providerName, runtimeProvider),
+		RuntimeLiveApply: providerRuntimeLiveApply(providerName, runtimeProvider),
+		AuthMode:         string(resolved.EffectiveAuthMode()),
+		EnvPolicy:        string(resolved.EffectiveEnvPolicy()),
+		HomePolicy:       string(resolved.EffectiveHomePolicy()),
+	}, true
+}
+
+func sessionProviderOptionPayloads(names []string) []contract.SessionProviderOptionPayload {
+	values := make(map[string]contract.SessionProviderOptionPayload, len(names))
+	for _, name := range names {
+		trimmed := strings.TrimSpace(name)
+		if trimmed == "" {
+			continue
+		}
+		values[trimmed] = contract.SessionProviderOptionPayload{
+			Name: trimmed,
+		}
+	}
+	return sortSessionProviderOptionPayloads(values, "")
+}
+
+func sortSessionProviderOptionPayloads(
+	values map[string]contract.SessionProviderOptionPayload,
+	defaultProvider string,
+) []contract.SessionProviderOptionPayload {
+	names := slices.Sorted(maps.Keys(values))
+	defaultProvider = compozyconfig.CanonicalProviderName(defaultProvider)
+	if defaultProvider != "" {
+		for i, name := range names {
+			if name != defaultProvider {
+				continue
+			}
+			copy(names[1:i+1], names[:i])
+			names[0] = defaultProvider
+			break
+		}
+	}
+	payloads := make([]contract.SessionProviderOptionPayload, 0, len(names))
+	for _, name := range names {
+		payloads = append(payloads, values[name])
+	}
+	return payloads
+}
+
+// PayloadJSON coerces raw strings into valid JSON response bodies.
+func PayloadJSON(raw string) json.RawMessage {
+	trimmed := strings.TrimSpace(raw)
+	if trimmed == "" {
+		return json.RawMessage("null")
+	}
+	if json.Valid([]byte(trimmed)) {
+		return json.RawMessage(trimmed)
+	}
+
+	encoded, err := json.Marshal(trimmed)
+	if err != nil {
+		return json.RawMessage("null")
+	}
+	return json.RawMessage(encoded)
+}
+
+func payloadJSONBytes(raw []byte) json.RawMessage {
+	trimmed := bytes.TrimSpace(raw)
+	if len(trimmed) == 0 {
+		return json.RawMessage("null")
+	}
+	if json.Valid(trimmed) {
+		return append(json.RawMessage(nil), trimmed...)
+	}
+
+	encoded, err := json.Marshal(string(trimmed))
+	if err != nil {
+		return json.RawMessage("null")
+	}
+	return json.RawMessage(encoded)
+}

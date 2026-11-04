@@ -1,0 +1,123 @@
+package store
+
+import (
+	"encoding/json"
+	"fmt"
+	"strings"
+	"time"
+
+	eventspkg "github.com/compozy/compozy/internal/events"
+)
+
+type EventSummary struct {
+	ID              string
+	ProfileID       string
+	ProfileName     string
+	ProfileColor    string
+	ProfileIcon     string
+	ProfileEmoji    string
+	ProfileArchived bool
+	SessionID       string
+	WorkspaceID     string
+	Sequence        int64
+	Type            string
+	AgentName       string
+	Provider        string
+	Outcome         string
+	*EventSummaryContentState
+	EventCorrelation
+	ParentSessionID string
+	RootSessionID   string
+	SpawnDepth      int
+	Summary         string
+	Timestamp       time.Time
+}
+
+// EventSummaryContentState keeps the optional payload compact while preserving
+// EventSummary's value-oriented Content field for readers.
+type EventSummaryContentState struct {
+	Content json.RawMessage
+}
+
+// Validate ensures the summary contains the required identifying fields.
+func (s EventSummary) Validate() error {
+	if err := requireField(s.ProfileID, "event summary profile_id"); err != nil {
+		return err
+	}
+	eventType := strings.TrimSpace(s.Type)
+	if err := requireField(eventType, "event summary type"); err != nil {
+		return err
+	}
+	if err := eventspkg.ValidatePublicName(eventType); err != nil {
+		return fmt.Errorf("store: invalid event summary type: %w", err)
+	}
+	if !eventspkg.ValidOutcome(s.Outcome) {
+		return fmt.Errorf("store: invalid event summary outcome %q", s.Outcome)
+	}
+	if eventSummaryAllowsGlobalScope(eventType) {
+		return nil
+	}
+	if err := requireField(s.WorkspaceID, "event summary workspace_id"); err != nil {
+		return err
+	}
+	if err := requireField(s.SessionID, "event summary session id"); err != nil {
+		return err
+	}
+	return requireField(s.AgentName, "event summary agent name")
+}
+
+func cloneNormalizedTimestamp(value *time.Time) *time.Time {
+	if value == nil || value.IsZero() {
+		return nil
+	}
+	return new(value.UTC())
+}
+
+func eventSummaryAllowsGlobalScope(eventType string) bool {
+	return eventspkg.AllowsGlobalScope(eventType)
+}
+
+// EventSummaryQuery filters event summaries through one explicit profile or the
+// AllProfiles aggregate.
+type EventSummaryQuery struct {
+	// SequenceOrder selects a bounded recent stream window; Forward selects its next page, including cursor zero.
+	SequenceOrder bool
+	Forward       bool
+	ReadScope     ReadScope
+	SessionID     string
+	WorkspaceID   string
+	WorktreeID    string
+	AgentName     string
+	Type          string
+	TaskID        string
+	RunID         string
+	ActorKind     string
+	ActorID       string
+	Provider      string
+	Outcome       string
+	Component     string
+	ErrorOnly     bool
+	AfterSequence int64
+	Since         time.Time
+	Limit         int
+}
+
+// Validate rejects an implicit profile lens before checking query bounds.
+func (q EventSummaryQuery) Validate() error {
+	if err := q.ReadScope.Validate(); err != nil {
+		return err
+	}
+	if err := requirePositiveLimit(q.Limit, "event summary limit"); err != nil {
+		return err
+	}
+	if q.AfterSequence < 0 {
+		return fmt.Errorf("store: invalid event summary after sequence %d", q.AfterSequence)
+	}
+	if !eventspkg.ValidOutcome(q.Outcome) {
+		return fmt.Errorf("store: invalid event summary outcome %q", q.Outcome)
+	}
+	if !eventspkg.ValidComponent(q.Component) {
+		return fmt.Errorf("store: invalid event summary component %q", q.Component)
+	}
+	return nil
+}

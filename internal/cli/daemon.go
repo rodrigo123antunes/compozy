@@ -2,493 +2,447 @@ package cli
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
-	"net/url"
 	"os"
-	"strconv"
+	"path/filepath"
 	"strings"
+	"sync"
+	"syscall"
 	"time"
 
-	apiclient "github.com/compozy/compozy/internal/api/client"
-	apicore "github.com/compozy/compozy/internal/api/core"
 	compozyconfig "github.com/compozy/compozy/internal/config"
-	"github.com/compozy/compozy/internal/daemon"
-	"github.com/compozy/compozy/internal/version"
+	compozydaemon "github.com/compozy/compozy/internal/daemon"
+
+	"github.com/compozy/compozy/internal/procutil"
+	compozyupdate "github.com/compozy/compozy/internal/update"
+
 	"github.com/spf13/cobra"
 )
 
-var (
-	queryDaemonCommandStatus       = daemon.QueryStatus
-	newDaemonCommandClientFromInfo = daemonClientFromInfo
-	runCLIDaemonForeground         = daemon.Run
-)
-
 const (
-	daemonHTTPPortEnv            = "COMPOZY_DAEMON_HTTP_PORT"
-	daemonWebDevProxyEnv         = "COMPOZY_WEB_DEV_PROXY"
-	daemonWebDevProxyFlag        = "--web-dev-proxy"
-	daemonStartInternalChildFlag = "internal-child"
+	daemonStartedValue = "Started"
+	daemonStatusValue  = "Status"
+	versionValue       = "Version"
+	daemonDaemonKey    = "daemon"
+	daemonDisabledKey  = "disabled"
+	daemonStartKey     = "start"
+	daemonStopKey      = "stop"
+	daemonStartedAtKey = "started_at"
+	daemonStatusKey    = "status"
+	versionKey         = "version"
 )
 
-type daemonStartState struct {
-	outputFormat      string
-	foreground        bool
-	internalChild     bool
-	webDevProxyTarget string
+const internalChildFlagName = "internal-child"
+const exitWhenOrphanedFlagName = "exit-when-orphaned"
+
+type daemonProcess interface {
+	PID() int
+	Done() <-chan struct{}
+	Wait() error
+	Terminate() error
 }
 
-type daemonStatusState struct {
-	outputFormat string
-}
-
-type daemonStopState struct {
-	outputFormat string
-	force        bool
-}
-
-type daemonStatusOutput struct {
-	State  string                `json:"state"`
-	Health apicore.DaemonHealth  `json:"health"`
-	Daemon *apicore.DaemonStatus `json:"daemon,omitempty"`
-}
-
-type daemonStopOutput struct {
-	Accepted bool   `json:"accepted"`
-	Force    bool   `json:"force"`
-	State    string `json:"state"`
-}
-
-func newDaemonCommand() *cobra.Command {
+func newDaemonCommand(deps commandDeps) *cobra.Command {
 	cmd := &cobra.Command{
-		Use:          "daemon",
-		Short:        "Manage the home-scoped daemon bootstrap lifecycle",
-		SilenceUsage: true,
+		Use:               daemonDaemonKey,
+		Short:             "Manage the CompozyOS daemon",
+		PersistentPreRunE: func(cmd *cobra.Command, _ []string) error { return rejectMachineProfileFlag(cmd) },
 	}
+	configureMachineProfileFlag(cmd, true)
 
-	cmd.AddCommand(
-		newDaemonStartCommand(),
-		newDaemonStatusCommand(),
-		newDaemonStopCommand(),
-	)
+	cmd.AddCommand(newDaemonProfileCommand(deps))
+	cmd.AddCommand(newDaemonStartCommand(deps))
+	cmd.AddCommand(newDaemonBootstrapCommand(deps))
+	cmd.AddCommand(newDaemonRelaunchCommand(deps))
+	cmd.AddCommand(newDaemonUpdateCoordinatorCommand(deps))
+	cmd.AddCommand(newDaemonAppTransitionCommand(deps))
+	cmd.AddCommand(newDaemonAppDiagnosticBundleCommand(deps))
+	cmd.AddCommand(newDaemonStopCommand(deps))
 	return cmd
 }
 
-func newDaemonStartCommand() *cobra.Command {
-	state := &daemonStartState{outputFormat: operatorOutputFormatText}
+func newDaemonUpdateCoordinatorCommand(deps commandDeps) *cobra.Command {
+	var operationID string
+	var executorGeneration string
 	cmd := &cobra.Command{
-		Use:          "start",
-		Short:        "Start the home-scoped daemon singleton in the background",
-		SilenceUsage: true,
-		Long: `Start the shared home-scoped daemon singleton.
-
-By default this command detaches, waits for daemon readiness, and returns the
-same status view exposed by "compozy daemon status". Use --foreground to keep
-the daemon attached to the current terminal.`,
-		Example: `  compozy daemon start
-  compozy daemon start --format json
-  compozy daemon start --foreground
-  compozy daemon start --foreground --web-dev-proxy http://127.0.0.1:3000`,
-		RunE: state.run,
+		Use:    "update-coordinator",
+		Short:  "Internal detached update coordinator",
+		Hidden: true,
+		Args:   cobra.NoArgs,
+		RunE: func(cmd *cobra.Command, _ []string) error {
+			return runDaemonUpdateCoordinator(cmd.Context(), deps, operationID, executorGeneration)
+		},
 	}
-	cmd.Flags().BoolVar(&state.foreground, "foreground", false, "Run the daemon in the foreground")
-	cmd.Flags().StringVar(
-		&state.outputFormat,
-		"format",
-		operatorOutputFormatText,
-		"Output format: text or json",
-	)
-	cmd.Flags().BoolVar(&state.internalChild, daemonStartInternalChildFlag, false, "Internal detached child mode")
-	cmd.Flags().StringVar(
-		&state.webDevProxyTarget,
-		"web-dev-proxy",
-		"",
-		"Development frontend origin to proxy through the daemon, for example http://127.0.0.1:3000",
-	)
-	if err := cmd.Flags().MarkHidden(daemonStartInternalChildFlag); err != nil {
-		panic(err)
-	}
+	cmd.Flags().StringVar(&operationID, "operation-id", "", "Update operation id")
+	cmd.Flags().StringVar(&executorGeneration, "executor-generation", "", "Update executor generation")
+	mustMarkFlagRequired(cmd, "operation-id")
+	mustMarkFlagRequired(cmd, "executor-generation")
 	return cmd
 }
 
-func newDaemonStatusCommand() *cobra.Command {
-	state := &daemonStatusState{outputFormat: operatorOutputFormatText}
-	cmd := &cobra.Command{
-		Use:          "status",
-		Short:        "Show the current daemon readiness state",
-		SilenceUsage: true,
-		RunE:         state.run,
+func runDaemonUpdateCoordinator(
+	ctx context.Context,
+	deps commandDeps,
+	operationID string,
+	executorGeneration string,
+) error {
+	manager, homePaths, err := resolveUpdateManager(deps)
+	if err != nil {
+		return err
 	}
-	cmd.Flags().StringVar(
-		&state.outputFormat,
-		"format",
-		operatorOutputFormatText,
-		"Output format: text or json",
+	operation, err := manager.OperationStore().Read(ctx)
+	if err != nil {
+		return err
+	}
+	if operation == nil || operation.ID != strings.TrimSpace(operationID) || operation.Holder == nil ||
+		operation.Holder.ExecutorGeneration != strings.TrimSpace(executorGeneration) {
+		return compozyupdate.ErrExecutorFenced
+	}
+	startedAt, err := procutil.StartedAt(os.Getpid())
+	if err != nil {
+		return fmt.Errorf("cli: resolve detached update executor identity: %w", err)
+	}
+	holder := *operation.Holder
+	holder.PID = os.Getpid()
+	holder.PIDStartTime = startedAt
+	holder.ProcessToken = procutil.CreationProcessToken(holder.PID)
+	holder.Surface = compozyupdate.ActorDaemon
+	holder.LeaseExpiresAt = deps.now().UTC().Add(compozyupdate.DefaultLeaseDuration)
+	transitionKind := compozyupdate.TransitionRenewLease
+	fenceGeneration := executorGeneration
+	live, err := manager.OperationStore().HolderLive(operation.Holder)
+	if err != nil {
+		return err
+	}
+	if !live {
+		transitionKind = compozyupdate.TransitionAcquireLease
+		fenceGeneration = ""
+	}
+	operation, err = manager.OperationStore().Transition(
+		ctx,
+		operation.ID,
+		fenceGeneration,
+		operation.Revision,
+		compozyupdate.Transition{
+			Kind: transitionKind, Actor: compozyupdate.ActorDaemon, Target: operation.ActiveTarget,
+			Holder: &holder, Percent: operation.Percent,
+		},
 	)
+	if err != nil {
+		return err
+	}
+	runtime := newCLIUpdateRuntime(deps, homePaths)
+	coordinator, err := compozyupdate.NewCoordinator(compozyupdate.CoordinatorConfig{
+		Store: manager.OperationStore(), ReleaseManager: manager, BinaryManager: manager, Runtime: runtime,
+	})
+	if err != nil {
+		return err
+	}
+	return coordinator.Run(ctx, operation.ID, holder.ExecutorGeneration)
+}
+
+func newDaemonStartCommand(deps commandDeps) *cobra.Command {
+	var (
+		foreground       bool
+		internalChild    bool
+		exitWhenOrphaned bool
+	)
+
+	cmd := &cobra.Command{
+		Use:   daemonStartKey,
+		Short: "Start the CompozyOS daemon",
+		Example: `  # Start CompozyOS in the background and wait for readiness
+  compozy daemon start
+
+  # Keep logs attached to the current terminal
+  compozy daemon start --foreground`,
+		RunE: func(cmd *cobra.Command, _ []string) error {
+			if internalChild {
+				return runDaemonForegroundChild(cmd.Context(), deps, exitWhenOrphaned)
+			}
+			if foreground {
+				return runDaemonForeground(cmd.Context(), deps, exitWhenOrphaned)
+			}
+			status, err := runDaemonDetached(cmd.Context(), deps)
+			if err != nil {
+				return err
+			}
+			return writeCommandOutput(cmd, daemonStatusBundle(status, deps.now))
+		},
+	}
+	cmd.Flags().BoolVar(&foreground, "foreground", false, "Run the daemon in the foreground")
+	cmd.Flags().BoolVar(&internalChild, internalChildFlagName, false, "Internal detached child mode")
+	mustMarkFlagHidden(cmd, internalChildFlagName)
+	cmd.Flags().BoolVar(
+		&exitWhenOrphaned,
+		exitWhenOrphanedFlagName,
+		false,
+		"Exit when the parent process exits (test harness use)",
+	)
+	mustMarkFlagHidden(cmd, exitWhenOrphanedFlagName)
 	return cmd
 }
 
-func newDaemonStopCommand() *cobra.Command {
-	state := &daemonStopState{
-		outputFormat: operatorOutputFormatText,
-		force:        true,
+func newDaemonRelaunchCommand(deps commandDeps) *cobra.Command {
+	return &cobra.Command{
+		Use:    "relaunch",
+		Short:  "Internal daemon relaunch helper",
+		Hidden: true,
+		RunE: func(cmd *cobra.Command, _ []string) error {
+			runtime, err := loadRuntimeContext(deps)
+			if err != nil {
+				return err
+			}
+
+			return deps.runRelaunchHelper(cmd.Context(), &compozydaemon.RelaunchHelperConfig{
+				HomePaths:      runtime.HomePaths,
+				ReleaseTimeout: compozydaemon.GracefulShutdownTimeout(&runtime.Config) + 5*time.Second,
+				OperationID:    strings.TrimSpace(os.Getenv(compozydaemon.RestartOperationEnvKey)),
+				Executable:     deps.executable,
+				Sandbox:        os.Environ(),
+			})
+		},
 	}
-	cmd := &cobra.Command{
-		Use:          "stop",
-		Short:        "Request graceful shutdown of the running daemon",
-		SilenceUsage: true,
-		RunE:         state.run,
-	}
-	cmd.Flags().BoolVar(&state.force, "force", state.force, "Cancel active runs before stopping the daemon")
-	cmd.Flags().StringVar(
-		&state.outputFormat,
-		"format",
-		operatorOutputFormatText,
-		"Output format: text or json",
-	)
-	return cmd
 }
 
-func (s *daemonStartState) run(cmd *cobra.Command, _ []string) error {
-	format, err := normalizeOperatorOutputFormat(s.outputFormat)
+func newDaemonStopCommand(deps commandDeps) *cobra.Command {
+	return &cobra.Command{
+		Use:   daemonStopKey,
+		Short: "Stop the CompozyOS daemon",
+		Example: `  # Ask the running daemon to stop
+  compozy daemon stop`,
+		RunE: func(cmd *cobra.Command, _ []string) error {
+			runtime, err := loadRuntimeContext(deps)
+			if err != nil {
+				return err
+			}
+
+			info, running, err := daemonInfo(runtime.HomePaths, deps)
+			if err != nil {
+				return err
+			}
+			if !running {
+				return errors.New("cli: daemon is not running")
+			}
+
+			if err := deps.signalProcess(info.PID, syscall.SIGTERM); err != nil {
+				return err
+			}
+
+			status, err := waitForDaemonStop(cmd.Context(), deps, runtime, info)
+			if err != nil {
+				return err
+			}
+			return writeCommandOutput(cmd, daemonStatusBundle(status, deps.now))
+		},
+	}
+}
+
+func runDaemonForeground(ctx context.Context, deps commandDeps, exitWhenOrphaned bool) error {
+	return runDaemonForegroundMode(ctx, deps, exitWhenOrphaned, true)
+}
+
+func runDaemonForegroundChild(ctx context.Context, deps commandDeps, exitWhenOrphaned bool) error {
+	return runDaemonForegroundMode(ctx, deps, exitWhenOrphaned, false)
+}
+
+func runDaemonForegroundMode(
+	ctx context.Context,
+	deps commandDeps,
+	exitWhenOrphaned bool,
+	acquireUpdateLock bool,
+) (returnErr error) {
+	deps = deps.withDaemonRuntimeDefaults()
+	runtime, err := loadRuntimeContext(deps)
 	if err != nil {
-		return withExitCode(1, err)
+		return err
+	}
+	if err := deps.ensureHome(runtime.HomePaths); err != nil {
+		return err
+	}
+	refreshDesktopOwnedRuntimePathBeforeStart(ctx, deps, runtime.HomePaths)
+	var updateLock *compozydaemon.UpdateLock
+	if acquireUpdateLock {
+		updateLock, err = acquireDaemonStartUpdateLock(daemonStartUpdateLockPath(runtime.HomePaths))
+		if err != nil {
+			return err
+		}
+		defer func() {
+			if updateLock != nil {
+				returnErr = errors.Join(returnErr, updateLock.Release())
+			}
+		}()
 	}
 
-	mode := daemon.RunModeDetached
-	if s.foreground {
-		mode = daemon.RunModeForeground
+	if _, running, err := daemonInfo(runtime.HomePaths, deps); err != nil {
+		return err
+	} else if running {
+		return errors.New("cli: daemon already running")
 	}
 
-	httpPort, err := cliDaemonHTTPPortFromEnv()
+	runner, err := deps.newDaemon()
 	if err != nil {
-		return withExitCode(1, err)
+		return err
 	}
-	webDevProxyTarget, err := resolveDaemonWebDevProxyTarget(s.webDevProxyTarget)
+	if updateLock != nil {
+		if err := updateLock.Release(); err != nil {
+			return err
+		}
+		updateLock = nil
+	}
+
+	// A harness-launched daemon self-terminates gracefully when its launcher
+	// dies abruptly (SIGKILL / test timeout), which would otherwise orphan it.
+	if exitWhenOrphaned {
+		watchCtx, cancel := context.WithCancel(ctx)
+		var watchers sync.WaitGroup
+		watchers.Go(func() {
+			procutil.WatchParentExit(watchCtx, 0, cancel)
+		})
+		defer func() {
+			cancel()
+			watchers.Wait()
+		}()
+		ctx = watchCtx
+	}
+	return runner.Run(ctx)
+}
+
+func runDaemonDetached(ctx context.Context, deps commandDeps) (
+	status DaemonStatus,
+	returnErr error,
+) {
+	runtime, err := loadRuntimeContext(deps)
 	if err != nil {
-		return withExitCode(1, err)
+		return DaemonStatus{}, err
 	}
-	runOptions := daemon.RunOptions{
-		Version:           version.String(),
-		HTTPPort:          httpPort,
-		Mode:              mode,
-		WebDevProxyTarget: webDevProxyTarget,
+	if err := deps.ensureHome(runtime.HomePaths); err != nil {
+		return DaemonStatus{}, err
 	}
-
-	if s.foreground {
-		ctx, stop := signalCommandContext(cmd)
-		defer stop()
-		return runCLIDaemonForeground(ctx, runOptions)
-	}
-
-	if s.internalChild {
-		return runCLIDaemonForeground(commandContextOrBackground(cmd), runOptions)
-	}
-
-	restoreEnv, err := overrideDaemonWebDevProxyEnv(runOptions.WebDevProxyTarget)
+	updateLock, err := acquireDaemonStartUpdateLock(daemonStartUpdateLockPath(runtime.HomePaths))
 	if err != nil {
-		return withExitCode(2, err)
+		return DaemonStatus{}, err
 	}
 	defer func() {
-		if restoreErr := restoreEnv(); restoreErr != nil {
-			slog.Warn(
-				"failed to restore daemon web dev proxy override",
-				"env",
-				daemonWebDevProxyEnv,
-				"error",
-				restoreErr,
-			)
-		}
+		returnErr = errors.Join(returnErr, updateLock.Release())
 	}()
 
-	ctx, stop := signalCommandContext(cmd)
-	defer stop()
-	client, err := newCLIDaemonBootstrap().ensure(ctx)
-	if err != nil {
-		return withExitCode(2, err)
+	if info, running, err := daemonInfo(runtime.HomePaths, deps); err != nil {
+		return DaemonStatus{}, err
+	} else if running {
+		return DaemonStatus{}, fmt.Errorf("cli: daemon already running (pid=%d)", info.PID)
 	}
-	daemonStatus, err := client.DaemonStatus(ctx)
+
+	child, err := deps.spawnDetached(ctx, runtime.HomePaths)
 	if err != nil {
-		return mapDaemonCommandError(err)
+		return DaemonStatus{}, err
 	}
-	health, err := client.Health(ctx)
+	if child == nil {
+		return DaemonStatus{}, errors.New("cli: detached daemon process is required")
+	}
+
+	status, err = waitForDaemonStart(ctx, deps, child)
 	if err != nil {
-		return mapDaemonCommandError(err)
+		return DaemonStatus{}, err
 	}
-	return writeDaemonStatusOutput(cmd, format, &daemonStatus, health, string(daemon.ReadyStateReady))
+	return status, nil
 }
 
-func (s *daemonStatusState) run(cmd *cobra.Command, _ []string) error {
-	format, err := normalizeOperatorOutputFormat(s.outputFormat)
-	if err != nil {
-		return withExitCode(1, err)
-	}
+func daemonStartUpdateLockPath(homePaths compozyconfig.HomePaths) string {
+	return filepath.Join(homePaths.HomeDir, compozyconfig.UpdateLockName)
+}
 
-	ctx := cmd.Context()
-	status, err := queryDaemonCommandStatus(ctx, compozyconfig.HomePaths{}, daemon.ProbeOptions{})
+func acquireDaemonStartUpdateLock(path string) (*compozydaemon.UpdateLock, error) {
+	startedAt, err := procutil.StartedAt(os.Getpid())
 	if err != nil {
-		return withExitCode(2, fmt.Errorf("query daemon status: %w", err))
+		return nil, fmt.Errorf("cli: resolve daemon start identity: %w", err)
 	}
-	if status.Info == nil || status.State == daemon.ReadyStateStopped {
-		return writeDaemonStatusOutput(
-			cmd,
-			format,
-			nil,
-			apicore.DaemonHealth{Ready: false},
-			string(daemon.ReadyStateStopped),
+	lock, err := compozydaemon.AcquireUpdateLock(path, compozydaemon.UpdateLockOwner{
+		PID:       os.Getpid(),
+		StartedAt: startedAt,
+	})
+	if err != nil {
+		return nil, fmt.Errorf("cli: acquire daemon start mutation lock: %w", err)
+	}
+	return lock, nil
+}
+
+// waitForDaemonStart observes readiness until success, actual exit, or caller cancellation.
+// Polling windows report slow startup without killing a possibly migrating daemon.
+func waitForDaemonStart(ctx context.Context, deps commandDeps, child daemonProcess) (DaemonStatus, error) {
+	for {
+		status, err := waitForDaemonStartWindow(ctx, deps, child)
+		if err != nil && ctx != nil && ctx.Err() != nil && child != nil {
+			return status, fmt.Errorf(
+				"cli: stopped waiting for daemon pid=%d; it may still be starting; inspect the runtime log before retrying: %w",
+				child.PID(),
+				err,
+			)
+		}
+		if !errors.Is(err, context.DeadlineExceeded) {
+			return status, err
+		}
+		slog.InfoContext(
+			ctx,
+			"cli: daemon is still starting; waiting for readiness or process exit",
+			"pid",
+			child.PID(),
 		)
 	}
-
-	client, err := newDaemonCommandClientFromInfo(*status.Info)
-	if err != nil {
-		return withExitCode(2, fmt.Errorf("build daemon status client: %w", err))
-	}
-	daemonStatus, err := client.DaemonStatus(ctx)
-	if err != nil {
-		return mapDaemonCommandError(err)
-	}
-	health, err := client.Health(ctx)
-	if err != nil {
-		return mapDaemonCommandError(err)
-	}
-
-	stateName := string(status.State)
-	if health.Ready {
-		stateName = string(daemon.ReadyStateReady)
-	}
-	return writeDaemonStatusOutput(cmd, format, &daemonStatus, health, stateName)
 }
 
-func (s *daemonStopState) run(cmd *cobra.Command, _ []string) error {
-	format, err := normalizeOperatorOutputFormat(s.outputFormat)
+// waitForDaemonStartWindow checks process exit and daemon readiness within one polling window.
+func waitForDaemonStartWindow(ctx context.Context, deps commandDeps, child daemonProcess) (DaemonStatus, error) {
+	if err := requirePollingContext(ctx); err != nil {
+		return DaemonStatus{}, err
+	}
+	if child == nil {
+		return DaemonStatus{}, errors.New("cli: detached daemon process is required")
+	}
+	childPID := child.PID()
+	if childPID <= 0 {
+		return DaemonStatus{}, errors.New("cli: detached daemon process pid is required")
+	}
+	client, err := clientFromDeps(deps)
 	if err != nil {
-		return withExitCode(1, err)
+		return DaemonStatus{}, err
 	}
 
-	ctx := cmd.Context()
-	status, err := queryDaemonCommandStatus(ctx, compozyconfig.HomePaths{}, daemon.ProbeOptions{})
-	if err != nil {
-		return withExitCode(2, fmt.Errorf("query daemon status before stop: %w", err))
-	}
-	if status.Info == nil || status.State == daemon.ReadyStateStopped {
-		return writeDaemonStopOutput(cmd, format, false, s.force, string(daemon.ReadyStateStopped))
+	processAlive := deps.processAlive
+	if processAlive == nil {
+		processAlive = procutil.Alive
 	}
 
-	client, err := newDaemonCommandClientFromInfo(*status.Info)
-	if err != nil {
-		return withExitCode(2, fmt.Errorf("build daemon stop client: %w", err))
-	}
-	if err := client.StopDaemon(ctx, s.force); err != nil {
-		return mapDaemonCommandError(err)
-	}
-	return writeDaemonStopOutput(cmd, format, true, s.force, string(status.State))
-}
-
-func daemonClientFromInfo(info daemon.Info) (daemonCommandClient, error) {
-	target := apiclient.Target{
-		SocketPath: info.SocketPath,
-		HTTPPort:   info.HTTPPort,
-	}
-	return apiclient.New(target)
-}
-
-func cliDaemonRunOptionsFromEnv(mode daemon.RunMode) (daemon.RunOptions, error) {
-	httpPort, err := cliDaemonHTTPPortFromEnv()
-	if err != nil {
-		return daemon.RunOptions{}, err
-	}
-	webDevProxyTarget, err := resolveDaemonWebDevProxyTarget("")
-	if err != nil {
-		return daemon.RunOptions{}, err
-	}
-	return daemon.RunOptions{
-		Version:           version.String(),
-		HTTPPort:          httpPort,
-		Mode:              mode,
-		WebDevProxyTarget: webDevProxyTarget,
-	}, nil
-}
-
-func commandContextOrBackground(cmd *cobra.Command) context.Context {
-	if cmd != nil && cmd.Context() != nil {
-		return cmd.Context()
-	}
-	return context.Background()
-}
-
-func resolveDaemonWebDevProxyTarget(flagValue string) (string, error) {
-	if strings.TrimSpace(flagValue) != "" {
-		return normalizeDaemonWebDevProxyTarget(flagValue, daemonWebDevProxyFlag)
-	}
-	return cliDaemonWebDevProxyFromEnv()
-}
-func cliDaemonHTTPPortFromEnv() (int, error) {
-	rawValue, ok := os.LookupEnv(daemonHTTPPortEnv)
-	if !ok {
-		return 0, nil
-	}
-
-	value := strings.TrimSpace(rawValue)
-	if value == "" {
-		return 0, nil
-	}
-
-	port, err := strconv.Atoi(value)
-	if err != nil {
-		return 0, fmt.Errorf("parse %s=%q: %w", daemonHTTPPortEnv, rawValue, err)
-	}
-	if port == 0 {
-		return daemon.EphemeralHTTPPort, nil
-	}
-	return port, nil
-}
-
-func cliDaemonWebDevProxyFromEnv() (string, error) {
-	rawValue, ok := os.LookupEnv(daemonWebDevProxyEnv)
-	if !ok {
-		return "", nil
-	}
-	return normalizeDaemonWebDevProxyTarget(rawValue, daemonWebDevProxyEnv)
-}
-
-func normalizeDaemonWebDevProxyTarget(rawValue string, source string) (string, error) {
-	value := strings.TrimSpace(rawValue)
-	if value == "" {
-		return "", nil
-	}
-	sourceValue := fmt.Sprintf("%s=%q", source, rawValue)
-	if !strings.Contains(value, "://") {
-		return "", fmt.Errorf("%s must use http or https", sourceValue)
-	}
-
-	target, err := url.Parse(value)
-	if err != nil {
-		return "", fmt.Errorf("parse %s: %w", sourceValue, err)
-	}
-	if target.Scheme != "http" && target.Scheme != "https" {
-		return "", fmt.Errorf("%s must use http or https", sourceValue)
-	}
-	if strings.TrimSpace(target.Host) == "" {
-		return "", fmt.Errorf("%s must include a host", sourceValue)
-	}
-	return target.String(), nil
-}
-
-func overrideDaemonWebDevProxyEnv(value string) (func() error, error) {
-	previousValue, hadPrevious := os.LookupEnv(daemonWebDevProxyEnv)
-	if strings.TrimSpace(value) == "" {
-		return func() error { return nil }, nil
-	}
-	if err := os.Setenv(daemonWebDevProxyEnv, value); err != nil {
-		return nil, fmt.Errorf("set %s=%q: %w", daemonWebDevProxyEnv, value, err)
-	}
-	return func() error {
-		if hadPrevious {
-			if err := os.Setenv(daemonWebDevProxyEnv, previousValue); err != nil {
-				return fmt.Errorf("restore %s=%q: %w", daemonWebDevProxyEnv, previousValue, err)
+	return pollUntil(
+		ctx,
+		deps.startTimeout,
+		deps.pollInterval,
+		child.Done(),
+		"cli: daemon did not become ready before timeout",
+		func(pollCtx context.Context, event pollEvent) (DaemonStatus, bool, error) {
+			if event == pollEventInterrupt {
+				if err := child.Wait(); err != nil {
+					return DaemonStatus{}, true, fmt.Errorf("cli: detached daemon exited before readiness: %w", err)
+				}
+				return DaemonStatus{}, true, errors.New("cli: detached daemon exited before readiness")
 			}
-			return nil
-		}
-		if err := os.Unsetenv(daemonWebDevProxyEnv); err != nil {
-			return fmt.Errorf("unset %s: %w", daemonWebDevProxyEnv, err)
-		}
-		return nil
-	}, nil
-}
 
-func writeDaemonStatusOutput(
-	cmd *cobra.Command,
-	format string,
-	status *apicore.DaemonStatus,
-	health apicore.DaemonHealth,
-	state string,
-) error {
-	if format == operatorOutputFormatJSON {
-		payload := daemonStatusOutput{
-			State:  state,
-			Health: health,
-			Daemon: status,
-		}
-		if err := writeOperatorJSON(cmd.OutOrStdout(), payload); err != nil {
-			return withExitCode(2, fmt.Errorf("write daemon status json: %w", err))
-		}
-		return nil
-	}
-
-	if status == nil {
-		_, err := fmt.Fprintln(cmd.OutOrStdout(), state)
-		if err != nil {
-			return withExitCode(2, fmt.Errorf("write daemon status: %w", err))
-		}
-		return nil
-	}
-
-	const daemonStatusTextFormat = "" +
-		"state: %s\n" +
-		"ready: %t\n" +
-		"degraded: %t\n" +
-		"pid: %d\n" +
-		"version: %s\n" +
-		"started_at: %s\n" +
-		"socket: %s\n" +
-		"http_port: %d\n" +
-		"active_runs: %d\n" +
-		"workspaces: %d\n"
-
-	_, err := fmt.Fprintf(
-		cmd.OutOrStdout(),
-		daemonStatusTextFormat,
-		state,
-		health.Ready,
-		health.Degraded,
-		status.PID,
-		status.Version,
-		status.StartedAt.Format(time.RFC3339Nano),
-		status.SocketPath,
-		status.HTTPPort,
-		status.ActiveRunCount,
-		status.WorkspaceCount,
+			status, statusErr := client.DaemonStatus(pollCtx)
+			if statusErr == nil && daemonReadyAs(status, childPID) {
+				return status, true, nil
+			}
+			if !processAlive(childPID) {
+				return DaemonStatus{}, true, errors.New("cli: detached daemon exited before readiness")
+			}
+			return DaemonStatus{}, false, nil
+		},
 	)
-	if err != nil {
-		return withExitCode(2, fmt.Errorf("write daemon status: %w", err))
-	}
-	for _, detail := range health.Details {
-		if _, detailErr := fmt.Fprintf(
-			cmd.OutOrStdout(),
-			"detail: %s (%s)\n",
-			detail.Message,
-			detail.Code,
-		); detailErr != nil {
-			return withExitCode(2, fmt.Errorf("write daemon status detail: %w", detailErr))
-		}
-	}
-	return nil
 }
 
-func writeDaemonStopOutput(
-	cmd *cobra.Command,
-	format string,
-	accepted bool,
-	force bool,
-	state string,
-) error {
-	if format == operatorOutputFormatJSON {
-		if err := writeOperatorJSON(cmd.OutOrStdout(), daemonStopOutput{
-			Accepted: accepted,
-			Force:    force,
-			State:    state,
-		}); err != nil {
-			return withExitCode(2, fmt.Errorf("write daemon stop json: %w", err))
-		}
-		return nil
-	}
-
-	message := "daemon already stopped"
-	if accepted {
-		message = "daemon stop requested"
-	}
-	if _, err := fmt.Fprintln(cmd.OutOrStdout(), message); err != nil {
-		return withExitCode(2, fmt.Errorf("write daemon stop output: %w", err))
-	}
-	return nil
+// daemonReadyAs reports whether status is the running readiness answer of the expected daemon pid.
+// Start waits expect their spawned child; bootstrap attach waits expect the live lock owner.
+func daemonReadyAs(status DaemonStatus, pid int) bool {
+	return pid > 0 && status.PID == pid && strings.TrimSpace(status.Status) == daemonRunningStatus
 }

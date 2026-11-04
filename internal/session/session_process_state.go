@@ -1,0 +1,144 @@
+package session
+
+import (
+	"fmt"
+	"strings"
+	"time"
+
+	"github.com/compozy/compozy/internal/acp"
+	speedpkg "github.com/compozy/compozy/internal/speed"
+	"github.com/compozy/compozy/internal/store"
+)
+
+const sessionModelConfigKey = "model"
+
+// A rollback configures the observed speed, while the session keeps its prior intent.
+// Resolve that intent against the live options instead of persisting the rollback's request.
+func (s *Session) speedResolutionForCapsLocked(caps acp.Caps) *speedpkg.Resolution {
+	resolution := caps.SpeedResolution
+	if resolution != nil && s.Speed != "" && resolution.Requested != s.Speed {
+		return acp.ResolveCurrentSpeed(s.Speed, caps.ConfigOptions)
+	}
+	return speedpkg.CloneResolution(resolution)
+}
+
+func (s *Session) captureProcessCapabilitiesLocked() {
+	if s.process == nil {
+		return
+	}
+	s.ACPCaps = s.process.CapsSnapshot()
+	s.ACPCapsKnown = true
+	s.SpeedResolution = s.speedResolutionForCapsLocked(s.ACPCaps)
+}
+
+func (s *Session) retainStoppingProcess(proc *AgentProcess, now time.Time) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.State != StateStopping || (s.process != nil && s.process != proc) {
+		return fmt.Errorf("%w: cannot retain process while %s", ErrInvalidStateTransition, s.State)
+	}
+	s.updateFromProcessLocked(proc, now, false)
+	return nil
+}
+
+func (s *Session) updateFromProcessLocked(proc *AgentProcess, now time.Time, adoptCurrentModel bool) {
+	if s.process != proc {
+		s.AdvertisedCommands = nil
+	}
+	s.process = proc
+	if proc != nil {
+		caps := proc.CapsSnapshot()
+		s.ACPSessionID = strings.TrimSpace(proc.SessionID)
+		s.ACPCaps = cloneCaps(caps)
+		s.ACPCapsKnown = true
+		s.SpeedResolution = s.speedResolutionForCapsLocked(caps)
+		if currentModel := currentACPModel(caps.ConfigOptions); adoptCurrentModel && currentModel != "" {
+			s.Model = currentModel
+		}
+		if s.Liveness == nil {
+			s.Liveness = &store.SessionLivenessMeta{}
+		}
+		s.Liveness.SubprocessPID = proc.PID
+		if !proc.StartedAt.IsZero() {
+			startedAt := proc.StartedAt.UTC()
+			s.Liveness.SubprocessStartedAt = &startedAt
+		}
+		if !now.IsZero() {
+			lastUpdateAt := now.UTC()
+			s.Liveness.LastUpdateAt = &lastUpdateAt
+		}
+		s.Liveness.StallState = ""
+		s.Liveness.StallReason = ""
+	}
+	if !now.IsZero() {
+		s.UpdatedAt = now
+	}
+}
+
+func (s *Session) activateWithProcess(
+	proc *AgentProcess,
+	now time.Time,
+	adoptCurrentModel bool,
+	preserveStopReason bool,
+) error {
+	if s == nil {
+		return ErrSessionNotFound
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if !canTransition(s.State, StateActive) {
+		return fmt.Errorf("%w: %s -> %s", ErrInvalidStateTransition, s.State, StateActive)
+	}
+	s.State = StateActive
+	if proc == nil {
+		s.RuntimeStatus = RuntimeStatusUnbound
+	} else {
+		s.RuntimeStatus = RuntimeStatusReady
+		if s.RuntimeGeneration == 0 {
+			s.RuntimeGeneration = 1
+		}
+		if s.RuntimeTransition == RuntimeTransitionNone {
+			s.RuntimeTransition = RuntimeTransitionInitialBind
+		}
+	}
+	s.RuntimeFailure = ""
+	s.RuntimeRecovery = nil
+	if !preserveStopReason {
+		s.stopCause = CauseNone
+		if s.stopReason != store.StopAgentCrashed {
+			s.stopReason = ""
+			s.stopDetail = ""
+			s.failure = nil
+		}
+	}
+	s.updateFromProcessLocked(proc, now, adoptCurrentModel)
+	return nil
+}
+
+func currentACPModel(options []acp.SessionConfigOption) string {
+	for _, option := range options {
+		if strings.TrimSpace(option.ID) == sessionModelConfigKey ||
+			strings.TrimSpace(option.Category) == sessionModelConfigKey {
+			return strings.TrimSpace(option.CurrentValueID)
+		}
+	}
+	return ""
+}
+
+func (s *Session) setEffectivePermissions(value string) {
+	if s == nil {
+		return
+	}
+	s.mu.Lock()
+	s.EffectivePermissions = strings.TrimSpace(value)
+	s.mu.Unlock()
+}
+
+func (s *Session) effectivePermissions() string {
+	if s == nil {
+		return ""
+	}
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return strings.TrimSpace(s.EffectivePermissions)
+}

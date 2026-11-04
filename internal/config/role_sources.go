@@ -1,0 +1,118 @@
+package config
+
+import (
+	"maps"
+	"strings"
+)
+
+const (
+	RoleFieldSourceDefault          = "default"
+	RoleFieldSourceGlobal           = "global"
+	RoleFieldSourceProfile          = "profile"
+	RoleFieldSourceWorkspace        = "workspace"
+	RoleFieldSourceWorkspaceProfile = "workspace_profile"
+	RoleFieldEnabled                = "enabled"
+	RoleFieldAgent                  = "agent"
+	RoleFieldProvider               = "provider"
+	RoleFieldModel                  = "model"
+	RoleFieldReasoning              = "reasoning_effort"
+	RoleFieldSpeed                  = "speed"
+	RoleFieldACPOptions             = "acp_options"
+	RoleFieldFallbacks              = "fallback_chain"
+)
+
+// RoleFieldSources records which config layer last wrote each routed role field.
+type RoleFieldSources map[RoleName]map[string]string
+
+// RoleFieldSource reports the winning config layer for one routed role field.
+func (c *Config) RoleFieldSource(role RoleName, field string) string {
+	if c == nil || c.RoleSources == nil {
+		return ""
+	}
+	return strings.TrimSpace(c.RoleSources[role][strings.TrimSpace(field)])
+}
+
+// CloneRoleFieldSources returns an ownership-safe copy of role source metadata.
+func CloneRoleFieldSources(sources RoleFieldSources) RoleFieldSources {
+	if sources == nil {
+		return nil
+	}
+	cloned := make(RoleFieldSources, len(sources))
+	for role, fields := range sources {
+		clonedFields := make(map[string]string, len(fields))
+		maps.Copy(clonedFields, fields)
+		cloned[role] = clonedFields
+	}
+	return cloned
+}
+
+func defaultRoleFieldSources() RoleFieldSources {
+	sources := make(RoleFieldSources, len(allRoleNames))
+	for _, role := range allRoleNames {
+		fields := []string{
+			RoleFieldEnabled,
+			RoleFieldProvider,
+			RoleFieldModel,
+			RoleFieldReasoning,
+			RoleFieldSpeed,
+			RoleFieldACPOptions,
+			RoleFieldFallbacks,
+		}
+		fields = append(fields, RoleFieldAgent)
+		if role == RoleCoordinator {
+			fields = append(fields, "ttl", "max_children", "max_active_sessions_per_workspace")
+		}
+		sources[role] = make(map[string]string, len(fields))
+		for _, field := range fields {
+			sources[role][field] = RoleFieldSourceDefault
+		}
+	}
+	return sources
+}
+
+func (o rolesOverlay) recordSources(dst *Config, source string) {
+	if dst == nil {
+		return
+	}
+	if dst.RoleSources == nil {
+		dst.RoleSources = defaultRoleFieldSources()
+	}
+	recordRoleOverlaySources(dst.RoleSources, RoleCoordinator, o.Coordinator.roleOverlay, source)
+	recordRoleOverlaySources(dst.RoleSources, RoleAutoTitle, o.AutoTitle, source)
+	recordSource(dst.RoleSources, RoleCoordinator, "ttl", source, o.Coordinator.TTL != nil)
+	recordSource(dst.RoleSources, RoleCoordinator, "max_children", source, o.Coordinator.MaxChildren != nil)
+	recordSource(
+		dst.RoleSources,
+		RoleCoordinator,
+		"max_active_sessions_per_workspace",
+		source,
+		o.Coordinator.MaxActiveSessionsPerWorkspace != nil,
+	)
+}
+
+func recordRoleOverlaySources(sources RoleFieldSources, role RoleName, overlay roleOverlay, source string) {
+	recordSource(sources, role, RoleFieldEnabled, source, overlay.Enabled != nil)
+	recordSource(sources, role, RoleFieldAgent, source, overlay.Agent != nil)
+	recordSource(sources, role, RoleFieldProvider, source, overlay.Provider != nil)
+	recordSource(sources, role, RoleFieldModel, source, overlay.Model != nil)
+	recordSource(sources, role, RoleFieldReasoning, source, overlay.ReasoningEffort != nil)
+	recordSource(sources, role, RoleFieldSpeed, source, overlay.Speed != nil)
+	recordSource(sources, role, RoleFieldACPOptions, source, overlay.ACPOptions != nil)
+	recordSource(sources, role, RoleFieldFallbacks, source, overlay.FallbackChain != nil)
+}
+
+func recordSource(
+	sources RoleFieldSources,
+	role RoleName,
+	field string,
+	source string,
+	present bool,
+) {
+	if !present {
+		return
+	}
+	if sources[role] == nil {
+		sources[role] = make(map[string]string)
+	}
+	sources[role][field] = source
+}

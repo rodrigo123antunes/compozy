@@ -1,0 +1,291 @@
+package session
+
+import (
+	"context"
+	"log/slog"
+	"sync"
+	"sync/atomic"
+	"time"
+
+	"github.com/compozy/compozy/internal/acp"
+	"github.com/compozy/compozy/internal/admission"
+	compozyconfig "github.com/compozy/compozy/internal/config"
+	loggerpkg "github.com/compozy/compozy/internal/logger"
+	"github.com/compozy/compozy/internal/mention"
+	"github.com/compozy/compozy/internal/modelcatalog"
+	"github.com/compozy/compozy/internal/session/inputqueue"
+	speedpkg "github.com/compozy/compozy/internal/speed"
+	"github.com/compozy/compozy/internal/store"
+	"github.com/compozy/compozy/internal/store/sessiondb"
+	toolspkg "github.com/compozy/compozy/internal/tools"
+	workspacepkg "github.com/compozy/compozy/internal/workspace"
+	"github.com/compozy/compozy/internal/workspaceaccess"
+)
+
+// CreateOpts defines the inputs required to create a new session.
+type CreateOpts struct {
+	// InstanceID is supplied only by the daemon's instance service.
+	InstanceID       string
+	Origin           workspaceaccess.Origin
+	Scope            workspacepkg.ScopeKind
+	DesiredSessionID string
+	ProfileID        string
+	AgentName        string
+	Provider         string
+	Model            string
+	ReasoningEffort  string
+	Speed            speedpkg.Speed
+	ACPOptions       []acp.SessionConfigOptionSelection
+	CWD              string
+	Permissions      compozyconfig.PermissionMode
+	Name             string
+	Workspace        string
+	WorkspacePath    string
+	// Worktree names an existing ready worktree within the resolved parent workspace.
+	Worktree        string
+	PromptOverlay   string
+	ContractOverlay string
+	RuntimeMode     string
+	Type            Type
+	Lineage         *store.SessionLineage
+	// ProvenanceParentSessionID links an internal system session to its informational origin.
+	// It does not grant spawn governance and is unavailable on public create surfaces.
+	ProvenanceParentSessionID string
+	ParentSoulDigest          string
+	// AllowedToolsOverride is a concrete subset narrowing of the resolved agent tool policy.
+	AllowedToolsOverride []string
+	// DeniedToolsOverride adds internal deny patterns without widening the resolved agent policy.
+	DeniedToolsOverride []string
+	CreationProfile     *store.SessionCreationProfile
+	CreationIdentity    *store.SessionCreationIdentity
+	// Command is an explicit launch command for this attempt (a fallback route's
+	// account). Empty keeps the provider-aware resolution and spawn inheritance.
+	Command    string
+	SessionEnv compozyconfig.SessionEnv
+	// Derivation and ImportedContext are set only by the continue/fork derive path.
+	Derivation      *store.SessionDerivation
+	ImportedContext *store.SessionImportedContext
+	// deriveReceipt commits the child together with its derive receipt.
+	deriveReceipt *store.SessionDerivationReceipt
+	// ChainOwner declares who owns the fallback chain for this launch; role-owned
+	// launches pass ChainOwnerCaller so the session layer performs exactly one route.
+	ChainOwner ChainOwner
+	// DiscardStartFailure prevents internal retry attempts from leaving durable
+	// session artifacts when provider startup fails before Create returns.
+	DiscardStartFailure bool
+	// deriveSelectsRuntime records the explicit runtime fields as the child's selected runtime.
+	deriveSelectsRuntime bool
+}
+
+// CreateAcceptedOpts carries one logical user-session creation request.
+type CreateAcceptedOpts struct {
+	Session CreateOpts
+}
+
+// StoreOpener opens the per-session events store for the exact immutable owner.
+// Implementations must forward both owner fields unchanged to the storage boundary.
+type StoreOpener func(ctx context.Context, owner store.SessionDBOwner, path string) (EventRecorder, error)
+
+// QueryStoreOpener opens the read-only per-session events store for the exact
+// immutable owner. Implementations must forward both owner fields unchanged.
+type QueryStoreOpener func(ctx context.Context, owner store.SessionDBOwner, path string) (EventReadCloser, error)
+
+type sessionDBFamilyLeaseAcquirer func(context.Context, string) (*sessiondb.FamilyLease, error)
+
+type sessionMetaReader func(path string) (store.SessionMeta, error)
+
+// IDGenerator returns a unique identifier or the entropy failure that prevented allocation.
+type IDGenerator func() (string, error)
+
+// HostedMCPLauncher mints and releases session-bound hosted MCP launch records.
+type HostedMCPLauncher interface {
+	Launch(ctx context.Context, req HostedMCPLaunchRequest) (compozyconfig.MCPServer, error)
+	ArmLaunch(ctx context.Context, sessionID string) error
+	WaitForBind(ctx context.Context, sessionID string) error
+	BindRun(ctx context.Context, sessionID, runID string, generation int64) error
+	ReleaseRun(sessionID, runID string, generation int64)
+	CancelLaunch(sessionID string)
+	ReleaseSession(sessionID string)
+}
+
+// HostedMCPLaunchRequest describes the session identity for a hosted MCP entry.
+type HostedMCPLaunchRequest struct {
+	SessionID   string
+	ProfileID   string
+	WorkspaceID string
+	AgentName   string
+}
+
+// ProviderSecretResolver resolves provider-bound secret refs at launch time.
+type ProviderSecretResolver interface {
+	ResolveRef(ctx context.Context, ref string) (string, error)
+}
+
+// ProfileNameResolver maps stable profile ids to the current vault/resource name.
+type ProfileNameResolver interface {
+	ProfileName(ctx context.Context, profileID string) (string, error)
+}
+
+// Option customizes the session manager.
+type Option func(*Manager)
+
+type sessionReservation struct {
+	workspaceID string
+}
+
+type sessionResumeRun struct {
+	done    chan struct{}
+	session *Session
+	err     error
+}
+
+// Manager owns active session lifecycle and runtime orchestration.
+type Manager struct {
+	instanceCeiling            InstanceCeilingReader
+	instancePaused             func(context.Context, store.InstancePauseTrip) error
+	metadataCacheMu            sync.Mutex
+	metadataCache              map[string]cachedSessionMetadata
+	restartInputsHeld          sync.Map
+	daemonShutdown             atomic.Pointer[daemonShutdownStop]
+	pullRequestReader          PullRequestReader
+	catalogRefreshes           map[[32]byte]time.Time
+	branchSnapshots            BranchSnapshotReader
+	branchSnapshotSaver        BranchSnapshotSaver
+	replyWatches               ReplyWatchService
+	laterMu                    sync.Mutex
+	laterOpMu                  sync.Mutex
+	laterProcesses             LaterProcessReleaser
+	subagents                  SubagentService
+	metadataWarnings           loggerpkg.FailureWarnings
+	supervisionMu              sync.Mutex
+	workSignals                *WorkSignalRegistry
+	mu                         sync.RWMutex
+	lifecycleMu                sync.Mutex
+	worktreeDeliveryFences     map[string]bool
+	worktreeBindingUses        map[string]int
+	worktreeBindingNotifiers   []WorktreeBindingNotifier
+	sessions                   map[string]*Session
+	pending                    map[string]sessionReservation
+	finalizing                 map[string]*sessionFinalization
+	stopRuns                   map[string]*sessionStopRun
+	turnStopRuns               map[string]*turnStopRun
+	conversationFinalizing     map[string]chan struct{}
+	conversationOperationMu    sync.Mutex
+	conversationOperationLocks map[string]*conversationOperationLock
+	promptDrains               map[chan struct{}]struct{}
+	activePromptRuns           map[string]PromptRunIdentity
+	spawnMu                    sync.Mutex
+	managedInputMu             sync.Mutex
+	managedInputLeases         map[string]managedInputLease
+	goalCommandMu              sync.RWMutex
+	supervisedRecoveryMu       sync.RWMutex
+	supervisedWorkRecovery     SupervisedWorkRecovery
+	promptAdmissionMu          sync.Mutex
+	promptAdmissionLocks       map[string]*promptAdmissionLock
+	resumeReplayMu             sync.Mutex
+	resumeReplays              map[string]string
+	startLifecycle             sessionStartLifecycle
+	resumeLifecycle            sessionResumeLifecycle
+	processWatchLifecycle      sessionProcessWatchLifecycle
+
+	soulLocksMu             sync.Mutex
+	soulLocks               map[string]chan struct{}
+	sessionHealthHookMu     sync.Mutex
+	sessionHealthHookLast   map[string]time.Time
+	streamEventsMu          sync.Mutex
+	streamEvents            *sessionEventBroadcaster
+	catalogEventsMu         sync.Mutex
+	catalogEvents           *sessionCatalogBroadcaster
+	attentionCommitMu       sync.Mutex
+	presenceMu              sync.Mutex
+	presenceLeases          map[sessionPresenceKey]sessionPresenceLease
+	notifyMu                sync.Mutex
+	notifyConfig            compozyconfig.AttentionConfig
+	attentionWorkspaceMutes AttentionWorkspaceMuteReader
+	notifyLastBySession     map[string]time.Time
+	waitRegistry            *sessionWaitRegistry
+	spawnWakeMu             sync.Mutex
+	spawnWakeEventIDs       map[string]struct{}
+	spawnWakeEventOrder     []string
+
+	logger                     *slog.Logger
+	driver                     AgentDriver
+	notifier                   Notifier
+	sessionWindowReconciler    WindowReconciler
+	windowReconciliationCtx    context.Context
+	windowReconciliationCancel context.CancelFunc
+	windowReconciliationMu     sync.Mutex
+	windowReconciliationClosed bool
+	windowReconciliationWG     sync.WaitGroup
+	turnEndNotifier            TurnEndNotifier
+	spawnWakeNotifier          SpawnWakeNotifier
+	inputAugmenter             PromptInputAugmenter
+	commandService             CommandService
+	inputQueue                 *inputqueue.Service
+	inputQueueStore            store.SessionInputQueueStore
+	promptAdmissionStore       store.SessionPromptAdmissionStore
+	attachmentOpener           AttachmentOpener
+	attachmentScopeLease       attachmentScopeLease
+	managedInputLifecycle      ManagedInputLifecycle
+	workAdmission              admission.Checker
+	goalCommandHandler         GoalCommandHandler
+	startupOverlay             StartupPromptOverlay
+	hooks                      HookSet
+	agentResolver              AgentResolver
+	providerSecrets            ProviderSecretResolver
+	profileNames               ProfileNameResolver
+	modelCatalog               modelcatalog.Service
+	skillRegistry              SkillRegistry
+	mentionRenderer            MentionReferenceRenderer
+	// mentionPathProbe replaces probeMentionPath at admission when set; tests count filesystem probes with it.
+	mentionPathProbe             func(workingDir string, relative string) (mention.Kind, bool)
+	toolsetCatalog               toolspkg.ToolsetCatalog
+	toolUniverse                 []toolspkg.ToolID
+	mcpResolver                  MCPResolver
+	hostedMCP                    HostedMCPLauncher
+	soulStore                    SoulSnapshotStore
+	soulRunChecker               SoulRunActivityChecker
+	sessionHealthStore           HealthStore
+	sessionCatalog               store.SessionCatalog
+	eventLedger                  store.EventSummaryStore
+	attentionStore               store.SessionAttentionStore
+	creationStore                store.SessionCreationStore
+	transcriptEpochStore         store.SessionTranscriptEpochStore
+	homePaths                    compozyconfig.HomePaths
+	workspace                    WorkspaceResolver
+	worktreeResolver             WorktreeResolver
+	workspaceAccess              workspaceaccess.Policy
+	readSessionMeta              sessionMetaReader
+	openStore                    StoreOpener
+	openQueryStore               QueryStoreOpener
+	queryStoreExplicit           bool
+	queryStoreRuntime            *queryStoreRuntime
+	assembler                    PromptAssembler
+	supervision                  compozyconfig.SessionSupervisionConfig
+	stopConfig                   compozyconfig.SessionStopConfig
+	busyInput                    compozyconfig.SessionBusyInputConfig
+	busyInputMu                  sync.RWMutex
+	messaging                    compozyconfig.SessionMessagingConfig
+	deriveConfig                 compozyconfig.SessionDeriveConfig
+	sessionHealthStaleAfter      time.Duration
+	lifecycleCtx                 context.Context
+	now                          func() time.Time
+	newSessionID                 IDGenerator
+	newTurnID                    IDGenerator
+	newRunID                     IDGenerator
+	newRepairEventID             IDGenerator
+	newInteractionID             IDGenerator
+	newPresenceLeaseID           IDGenerator
+	newNotificationID            IDGenerator
+	newWaitID                    IDGenerator
+	newWaitTimer                 waitTimerFactory
+	newWaitAfterFunc             waitAfterFunc
+	acquireSessionDBFamilyLease  sessionDBFamilyLeaseAcquirer
+	removeAllPath                func(path string) error
+	promptBufSize                int
+	promptRecoveryDelays         []time.Duration
+	authRecoveryDelays           []time.Duration
+	authRecoveryWindow           time.Duration
+	soulRefreshTimeout           time.Duration
+	sessionHealthHookMinInterval time.Duration
+}

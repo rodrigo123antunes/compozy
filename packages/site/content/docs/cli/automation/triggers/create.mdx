@@ -1,0 +1,60 @@
+---
+title: "compozy automation triggers create"
+description: "Create an automation trigger"
+---
+
+## compozy automation triggers create
+
+Create an automation trigger
+
+```
+compozy automation triggers create [flags]
+```
+
+### Options
+
+```
+      --agent string                     Agent definition name; choose either --agent or --loop
+      --enabled                          Create the trigger enabled or disabled
+      --endpoint-slug string             Public endpoint slug for webhook events
+      --event string                     Trigger event: session.created, session.stopped, hook.<hook_name>.completed, webhook, or ext.*
+      --filter stringArray               Exact-match filter(s): key=value or comma-separated key=value pairs
+  -h, --help                             help for create
+      --loop string                      Loop name; choose either --loop or --agent
+      --loop-input stringArray           Static Loop input as key=value; repeat for multiple inputs
+      --loop-input-mapping stringArray   Loop input mapping as key=template; repeat for multiple mappings
+      --loop-workspace string            Workspace that owns the Loop; required for global automation
+      --name string                      Trigger name
+      --prompt string                    Agent prompt body; must be empty for Loop targets
+      --retry string                     Retry policy: "none", "backoff", or "backoff:<max_retries>:<base_delay>"
+      --scope string                     Trigger scope: user (aliases: @user, global) or workspace
+      --target-instance string           Always-on agent name, not an instance ID, whose check receives the event
+      --webhook-id string                Stable webhook identifier override for webhook events
+      --webhook-secret-value string      Write-only webhook secret value
+      --workspace string                 Override workspace binding (ID, name, or path)
+```
+
+### Options inherited from parent commands
+
+```
+      --json             Emit JSON output
+  -o, --output string    Output format: human, json, jsonl, or toon (default "human")
+      --profile string   Act as a profile for this command
+```
+
+## Output Formats
+
+The root `-o, --output` flag accepts these values. A renderer is supported only when this command writes that result; `jsonl` is for commands that emit one JSON record per line.
+
+| Format  | Command result                          |
+| ------- | --------------------------------------- |
+| `human` | Interactive terminal rendering          |
+| `json`  | Machine-readable JSON rendering         |
+| `jsonl` | One JSON record per line when supported |
+| `toon`  | Compact agent-readable rendering        |
+
+Example:
+
+```bash
+compozy automation triggers create -o json
+```

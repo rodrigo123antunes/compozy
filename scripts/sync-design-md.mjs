@@ -1,0 +1,397 @@
+#!/usr/bin/env bun
+import { readFileSync, writeFileSync } from "node:fs";
+import { join } from "node:path";
+
+const q = String.fromCharCode(96);
+const root = process.cwd();
+const args = new Set(process.argv.slice(2));
+const designPath = join(root, "DESIGN.md");
+const runtimeCss = ["tokens.css", "terminal-tokens.css"]
+  .map(file => readFileSync(join(root, "packages/ui/src", file), "utf8"))
+  .join("\n");
+// The light theme re-declares theme-scoped tokens under `[data-theme="light"]:root`;
+// every other value is shared with the (default) dark theme.
+const lightCss = readFileSync(join(root, "packages/ui/src/tokens-light.css"), "utf8");
+const siteCss = readFileSync(join(root, "packages/site/app/global.css"), "utf8");
+const design = readFileSync(designPath, "utf8");
+const colorGroups = {
+  "surface-ramp":
+    "rail rail-hover rail-selected desk canvas canvas-soft sunken surface-2 selected code-bg sidebar elevated well hover disabled",
+  hairlines: "line line-soft line-strong line-focus",
+  "text-ladder": "fg fg-strong fg-2 fg-3 muted-foreground subtle faint",
+  primary: "primary primary-hover primary-foreground",
+  brand:
+    "brand brand-hover brand-strong brand-ink brand-tint brand-tint-strong brand-dim brand-glow attn",
+  "glaze-ladder": "bar-fill",
+};
+const componentSizeTokenPattern =
+  /^(basis|breakpoint|container|height|min-width|size|space|spacing|width)-|^overlay-blur$/;
+// Matched against every declaration, not just @theme, so a `:root`-scoped font
+// token (L-023) still reaches the table.
+const fontTokenPattern = /^font-/;
+const runtimeTheme = parseTheme(
+  runtimeCss,
+  "packages/ui/src/tokens.css + packages/ui/src/terminal-tokens.css"
+);
+const runtimeDecls = parseDecls(runtimeCss);
+const siteTheme = parseTheme(siteCss, "packages/site/app/global.css");
+const siteDecls = parseDecls(siteCss);
+const runtime = new Map(runtimeDecls.map(({ name, value }) => [name, value]));
+const lightOverrides = new Map(
+  parseDecls(lightBlock(lightCss)).map(({ name, value }) => [name, value])
+);
+const light = new Map([...runtime, ...lightOverrides]);
+
+const body = replaceGeneratedSections(stripFrontmatter(design));
+const nextDesign = emitFrontmatter() + "\n\n" + body.trimStart();
+
+const siteAuditPassed = !args.has("--audit-site") || auditSite();
+if (args.has("--write")) {
+  if (nextDesign !== design) writeFileSync(designPath, nextDesign);
+  process.exit(siteAuditPassed ? 0 : 1);
+}
+const designIsCurrent = nextDesign === design;
+if (!designIsCurrent) process.stdout.write(diffWindow(design, nextDesign));
+if (!siteAuditPassed || (args.has("--check") && !designIsCurrent)) process.exit(1);
+
+function parseTheme(css, label) {
+  const matches = Array.from(css.matchAll(/@theme(?:\s+inline)?\s*\{([\s\S]*?)\n\}/g));
+  if (matches.length === 0) throw new Error("Could not locate @theme block in " + label);
+  return matches.flatMap(match => parseDecls(match[1]));
+}
+
+function lightBlock(css) {
+  const match = css.match(/\[data-theme="light"\]:root\s*\{([\s\S]*?)\n\}/);
+  if (!match) throw new Error('Could not locate [data-theme="light"]:root in tokens-light.css');
+  return match[1];
+}
+
+function parseDecls(css) {
+  return Array.from(css.matchAll(/--([a-zA-Z0-9-]+)\s*:\s*([^;]+);/g), match => ({
+    name: match[1],
+    value: match[2].replace(/\s+/g, " ").trim(),
+  }));
+}
+
+function stripFrontmatter(text) {
+  if (!text.startsWith("---\n")) return text;
+  const end = text.indexOf("\n---", 4);
+  return end === -1 ? text : text.slice(end + 5).replace(/^\n+/, "");
+}
+
+function replaceGeneratedSections(text) {
+  const sections = [
+    ...Object.entries(colorGroups).map(([id, stems]) => [id, themedTable(colorNames(stems))]),
+    ["signal", signalTable()],
+    ["owner-avatar", themedTable(prefixNames(runtimeTheme, "color-avatar-"))],
+    ["terminal-ansi", themedTable(terminalRampNames())],
+    ["fonts", tokenTable(namedRows(runtimeDecls, fontTokenPattern))],
+    ["type-ladder", typeTable()],
+    ["tracking-ladder", tokenTable(prefixRows(runtimeTheme, "tracking-"))],
+    ["radii", tokenTable(prefixRows(runtimeTheme, "radius", true))],
+    ["component-sizes", tokenTable(namedRows(runtimeDecls, componentSizeTokenPattern))],
+    ["shadows", themedTable(prefixNames(runtimeTheme, "shadow-"))],
+    [
+      "shell-backdrop",
+      themedTable(
+        namedRows(runtimeDecls, /^(workspaces-edge-|wallpaper-)/).map(([name]) => name.slice(2))
+      ),
+    ],
+    ["motion", tokenTable(namedRows(runtimeTheme, /^(distance|duration|ease|scale)-/))],
+    [
+      "site-clamps",
+      tokenTable(namedRows(siteTheme, /^text-site-|^text-group-label|^leading-doc-body$/)),
+    ],
+    ["site-layout", tokenTable(namedRows(siteDecls, /^site-/))],
+  ];
+  for (const [id, content] of sections) text = replaceSection(text, id, content);
+  return text;
+}
+
+function replaceSection(text, id, content) {
+  const re = new RegExp("<!-- BEGIN:tokens:" + id + " -->[\\s\\S]*?<!-- END:tokens:" + id + " -->");
+  if (!re.test(text)) throw new Error("DESIGN.md is missing marker pair tokens:" + id);
+  return text.replace(
+    re,
+    "<!-- BEGIN:tokens:" + id + " -->\n\n" + content.trim() + "\n\n<!-- END:tokens:" + id + " -->"
+  );
+}
+
+function colorNames(stems) {
+  return stems.split(" ").map(stem => "color-" + stem);
+}
+
+// The terminal ramp pairs each canonical `:root --terminal-*` literal with a
+// mechanical `@theme --color-terminal-*` adapter. The table
+// documents the canonical names — the identity the emulator bridge resolves —
+// because the alias is `var(--terminal-X)` for every one of them and listing
+// forty rows to say that twenty times would bury the palette.
+function terminalRampNames() {
+  return namedRows(runtimeDecls, /^terminal-/).map(([name]) => name.slice(2));
+}
+
+function namedRows(decls, re) {
+  return decls.filter(({ name }) => re.test(name)).map(({ name, value }) => ["--" + name, value]);
+}
+
+// `--shadow-*: var(--theme-shadow-*)` adapters exist only so Tailwind reads the
+// variable at runtime; the spec shows each theme's literal behind them.
+function themeValue(theme, name) {
+  const value = theme.get(name);
+  const adapter = value?.match(/^var\(--(theme-[a-zA-Z0-9-]+)\)$/);
+  return adapter && theme.has(adapter[1]) ? theme.get(adapter[1]) : value;
+}
+
+function resolveThemeAdapters(decls, theme) {
+  return decls.map(({ name }) => ({ name, value: themeValue(theme, name) }));
+}
+
+function prefixNames(decls, prefix) {
+  return decls.filter(({ name }) => name.startsWith(prefix)).map(({ name }) => name);
+}
+
+// One row per token: its dark (default) value and its light value.
+function themedTable(names) {
+  const rows = names.map(name => [
+    code("--" + name),
+    code(themeValue(runtime, name)),
+    code(themeValue(light, name)),
+  ]);
+  return markdownTable(["Token", "Dark", "Light"], rows);
+}
+
+function prefixRows(decls, prefix, includeBase = false) {
+  return decls
+    .filter(
+      ({ name }) => (name === prefix || name.startsWith(prefix)) && (includeBase || name !== prefix)
+    )
+    .map(({ name, value }) => ["--" + name, value]);
+}
+
+function signalTable() {
+  const rows = "success warning destructive info neutral"
+    .split(" ")
+    .map(stem => [
+      stem.charAt(0).toUpperCase() + stem.slice(1),
+      code("--color-" + stem),
+      code(runtime.get("color-" + stem)),
+      code(light.get("color-" + stem)),
+      code(runtime.get("color-" + stem + "-tint")),
+      code(light.get("color-" + stem + "-tint")),
+    ]);
+  return markdownTable(["Role", "Token", "Dark", "Light", "Tint dark", "Tint light"], rows);
+}
+
+function typeTable() {
+  const rows = [];
+  for (const { name, value } of runtimeTheme) {
+    if (!name.startsWith("text-") || name.endsWith("--line-height")) continue;
+    const stem = name.slice("text-".length);
+    rows.push([
+      code("--" + name),
+      code(value),
+      code(runtime.get("text-" + stem + "--line-height")),
+      code(runtime.get("tracking-" + stem)),
+    ]);
+  }
+  return markdownTable(["Token", "Size", "Line", "Tracking"], rows);
+}
+
+function tokenTable(rows) {
+  rows = rows.map(([name, value]) => [code(name), code(value)]);
+  const pairs = rows.length > 20 ? 3 : rows.length > 10 ? 2 : 1;
+  const body = [];
+  for (let idx = 0; idx < rows.length; idx += pairs) {
+    const chunk = rows.slice(idx, idx + pairs).flat();
+    while (chunk.length < pairs * 2) chunk.push("");
+    body.push(chunk);
+  }
+  return markdownTable(Array.from({ length: pairs }, () => ["Token", "Value"]).flat(), body);
+}
+
+function markdownTable(headers, rows) {
+  const allRows = [headers, ...rows];
+  const widths = headers.map((_, idx) =>
+    Math.max(3, ...allRows.map(row => String(row[idx] ?? "").length))
+  );
+  const separator = widths.map(width => "-".repeat(width));
+  return [headers, separator, ...rows]
+    .map(
+      row =>
+        "| " + row.map((cell, idx) => String(cell ?? "").padEnd(widths[idx])).join(" | ") + " |"
+    )
+    .join("\n");
+}
+
+function code(value) {
+  return value ? q + value + q : "";
+}
+
+function emitFrontmatter() {
+  const lines = [
+    "---",
+    "# Generated from:",
+    "#   packages/ui/src/tokens.css         (runtime)",
+    "#   packages/ui/src/terminal-tokens.css (terminal runtime)",
+    "#   packages/ui/src/tokens-light.css   (light theme overrides)",
+    "#   packages/site/app/global.css       (site extensions)",
+    "# by scripts/sync-design-md.mjs.",
+    "# Do not edit by hand. Run make codegen to refresh.",
+    "spec_version: 1",
+    "name: CompozyOS",
+    "tokens:",
+    "  runtime:",
+    yamlMap("colors", namespaceMap(runtimeTheme, "color"), 4),
+    yamlMap("colors-light", lightOverrideMap("color"), 4),
+    yamlMap(
+      "fonts",
+      mapNamed(runtimeDecls, fontTokenPattern, name => name.slice("font-".length)),
+      4
+    ),
+    yamlMap("typography", typographyMap(), 4),
+    yamlMap("rounded", radiusMap(), 4),
+    "    motion:",
+    yamlMap("distance", namespaceMap(runtimeTheme, "distance"), 6),
+    yamlMap("duration", namespaceMap(runtimeTheme, "duration"), 6),
+    yamlMap("ease", namespaceMap(runtimeTheme, "ease"), 6),
+    yamlMap("scale", namespaceMap(runtimeTheme, "scale"), 6),
+    yamlMap("shadow", namespaceMap(resolveThemeAdapters(runtimeTheme, runtime), "shadow"), 4),
+    yamlMap("shadow-light", lightOverrideMap("shadow"), 4),
+    yamlMap(
+      "sizes",
+      mapNamed(runtimeDecls, componentSizeTokenPattern, name => name),
+      4
+    ),
+    "  site:",
+    yamlMap(
+      "typography-clamps",
+      mapNamed(siteTheme, /^text-site-|^text-group-label|^leading-doc-body$/, name =>
+        name.replace(/^(?:text-site-|text-|leading-)/, "")
+      ),
+      4
+    ),
+    yamlMap(
+      "layout",
+      mapNamed(siteDecls, /^site-/, name => name.replace(/^site-/, "")),
+      4
+    ),
+    "---",
+  ];
+  return lines.join("\n");
+}
+
+// The @theme tokens of one namespace whose light value differs from dark.
+function lightOverrideMap(ns) {
+  const changed = runtimeTheme.filter(
+    ({ name }) => name.startsWith(ns + "-") && themeValue(light, name) !== themeValue(runtime, name)
+  );
+  return namespaceMap(resolveThemeAdapters(changed, light), ns);
+}
+
+function namespaceMap(decls, ns) {
+  return mapNamed(decls, new RegExp("^" + ns + "-"), name => name.slice(ns.length + 1));
+}
+
+function mapNamed(decls, re, key) {
+  return Object.fromEntries(
+    namedRows(decls, re).map(([name, value]) => [key(name.replace(/^--/, "")), value])
+  );
+}
+
+function typographyMap() {
+  const rows = [];
+  for (const { name, value } of runtimeTheme) {
+    if (!name.startsWith("text-") || name.endsWith("--line-height")) continue;
+    const stem = name.slice(5);
+    const attrs = { size: value };
+    const line = runtime.get("text-" + stem + "--line-height");
+    const tracking = runtime.get("tracking-" + stem);
+    if (line) attrs.line = line;
+    if (tracking) attrs.tracking = tracking;
+    rows.push([stem, attrs]);
+  }
+  return Object.fromEntries(rows);
+}
+
+function radiusMap() {
+  const rows = [];
+  for (const { name, value } of runtimeTheme) {
+    if (name !== "radius" && !name.startsWith("radius-")) continue;
+    rows.push([name === "radius" ? "DEFAULT" : name.slice("radius-".length), value]);
+  }
+  return Object.fromEntries(rows);
+}
+
+function yamlMap(name, values, indent) {
+  const pad = " ".repeat(indent);
+  return [
+    pad + name + ":",
+    ...Object.entries(values).map(([key, value]) => pad + "  " + key + ": " + yamlValue(value)),
+  ].join("\n");
+}
+
+function yamlValue(value) {
+  if (value && typeof value === "object") {
+    return (
+      "{ " +
+      Object.entries(value)
+        .map(([key, val]) => key + ": " + JSON.stringify(val))
+        .join(", ") +
+      " }"
+    );
+  }
+  // Font stacks embed double quotes; oxfmt rewrites those to YAML single-quoted
+  // scalars, so emit that form or codegen and bun-lint fight over DESIGN.md.
+  const text = String(value);
+  if (text.includes('"') && !text.includes("'")) return "'" + text + "'";
+  return JSON.stringify(text);
+}
+
+function auditSite() {
+  let passed = true;
+  for (const { name, value } of siteTheme) {
+    const selfRef = value.match(/^var\(--([a-zA-Z0-9-]+)\)$/)?.[1];
+    if (selfRef === name && !runtime.has(name)) {
+      passed = false;
+      console.error(
+        "audit-site: --" +
+          name +
+          " self-references a token that runtime tokens.css does not declare"
+      );
+    }
+  }
+  const darkBlock = siteCss.match(/\.dark\s*\{([\s\S]*?)\n\}/)?.[1] ?? "";
+  const stale = {
+    "#141312": "var(--color-canvas) / #171615",
+    "#1e1c1b": "var(--color-canvas-soft) / #1f1e1c",
+    "#2e2c2b": "var(--color-elevated) / #2a2927",
+    "#3c3a39": "var(--color-line) / rgba(255, 255, 255, 0.055)",
+    "#e5e5e7": "var(--color-fg) / #eeedeb",
+    "#8e8e93": "var(--color-muted-foreground) / #a4a29e",
+  };
+  for (const [hex, expected] of Object.entries(stale)) {
+    if (darkBlock.toLowerCase().includes(hex)) {
+      passed = false;
+      console.error("audit-site: stale " + hex + " in .dark block; expected " + expected);
+    }
+  }
+  return passed;
+}
+
+function diffWindow(before, after) {
+  const a = before.split("\n");
+  const b = after.split("\n");
+  let first = 0;
+  while (first < a.length && first < b.length && a[first] === b[first]) first += 1;
+  const start = Math.max(0, first - 8);
+  const oldChunk = a.slice(start, first + 24).map(line => "- " + line);
+  const newChunk = b.slice(start, first + 24).map(line => "+ " + line);
+  return [
+    "DESIGN.md is out of sync. Run make codegen or scripts/sync-design-md.mjs --write.",
+    "--- DESIGN.md:" + (start + 1),
+    ...oldChunk,
+    "+++ DESIGN.md:" + (start + 1),
+    ...newChunk,
+    "",
+  ].join("\n");
+}

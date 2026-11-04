@@ -1,0 +1,207 @@
+import { Play } from "@compozy/ui/icons";
+import { type FormEvent, useLayoutEffect, useRef } from "react";
+
+import {
+  Dialog,
+  DialogContent,
+  dialogShellClass,
+  EntityDialogBody,
+  EntityDialogFooter,
+  EntityDialogHeader,
+  EntityModeToolbar,
+  FieldError,
+  type EntityMode,
+} from "@compozy/ui";
+
+import { SessionCreateAdvancedSection } from "./session-create-advanced-section";
+import { SessionEnvironmentField } from "./session-environment-field";
+import { SessionCreateSimpleSection } from "./session-create-simple-section";
+import type { AgentPayload } from "@/systems/agent";
+import {
+  SessionDestinationRow,
+  type DestinationKind,
+  type SessionDestinationAxis,
+} from "@/systems/workspace";
+
+export interface SessionCreateDialogProps {
+  /** Inline pickers, present only for the aggregated axes (ADR-003). */
+  destinationAxes?: { project?: SessionDestinationAxis; profile?: SessionDestinationAxis };
+  open: boolean;
+  restoreFocusOnClose: boolean;
+  onOpenChange: (open: boolean) => void;
+  mode: EntityMode;
+  onModeChange: (mode: EntityMode) => void;
+  agents: AgentPayload[];
+  scope: DestinationKind;
+  destinationLabel: string;
+  sessionRoot: string;
+  destinationReady: boolean;
+  sessionName: string;
+  onSessionNameChange: (next: string) => void;
+  selectedAgentName: string;
+  onAgentChange: (agentName: string) => void;
+  /** Absent when the selected workspace is not git-backed. */
+  environment?: React.ComponentProps<typeof SessionEnvironmentField>;
+  environmentListingState?: "loading" | "ready" | "error" | "unsupported";
+  environmentListingError?: string;
+  onSubmit: () => void;
+  isSubmitting: boolean;
+  /** A submit is waiting on its worktree; Cancel stops that, not the dialog. */
+  isAwaitingEnvironment: boolean;
+  onCancelEnvironment: () => void;
+  submitError: string | null;
+}
+
+function SessionCreateDialog({
+  open,
+  restoreFocusOnClose,
+  onOpenChange,
+  mode,
+  onModeChange,
+  agents,
+  scope,
+  destinationLabel,
+  sessionRoot,
+  destinationReady,
+  sessionName,
+  onSessionNameChange,
+  selectedAgentName,
+  onAgentChange,
+  environment,
+  environmentListingState = "unsupported",
+  environmentListingError,
+  onSubmit,
+  isSubmitting,
+  isAwaitingEnvironment,
+  onCancelEnvironment,
+  submitError,
+  destinationAxes,
+}: SessionCreateDialogProps) {
+  const restoreFocusOnCloseRef = useRef(restoreFocusOnClose);
+  useLayoutEffect(() => {
+    restoreFocusOnCloseRef.current = restoreFocusOnClose;
+  }, [restoreFocusOnClose]);
+
+  const trimmedSelectedAgentName = selectedAgentName.trim();
+  const hasAgents = agents.length > 0;
+  const hasSelectedAgent = agents.some(agent => agent.name === trimmedSelectedAgentName);
+  const canSubmit =
+    !isSubmitting && destinationReady && !isAwaitingEnvironment && hasAgents && hasSelectedAgent;
+
+  const handleSubmit = (event: FormEvent<HTMLFormElement>) => {
+    event.preventDefault();
+    if (!canSubmit) return;
+    onSubmit();
+  };
+
+  const handleOpenChange = (nextOpen: boolean) => {
+    if (isSubmitting && !nextOpen) return;
+    onOpenChange(nextOpen);
+  };
+
+  // While a worktree is being created, Cancel is about that creation — the
+  // operator asked to stop making an environment, not to discard what they wrote.
+  const handleCancel = () => {
+    if (isAwaitingEnvironment) {
+      onCancelEnvironment();
+      return;
+    }
+    handleOpenChange(false);
+  };
+
+  return (
+    <Dialog onOpenChange={handleOpenChange} open={open}>
+      <DialogContent
+        className={`grid-rows-[auto_auto_minmax(0,1fr)_auto] text-fg ${dialogShellClass("sm")}`}
+        data-testid="session-create-dialog"
+        finalFocus={isSubmitting ? false : () => restoreFocusOnCloseRef.current}
+        showCloseButton={false}
+        unframed
+      >
+        <EntityDialogHeader
+          eyebrow="New session"
+          icon={Play}
+          onClose={isSubmitting ? undefined : () => handleOpenChange(false)}
+          title="Start session"
+        />
+
+        <EntityModeToolbar mode={mode} onModeChange={onModeChange} testIdPrefix="session-create" />
+
+        <form className="contents" onSubmit={handleSubmit}>
+          <EntityDialogBody className="flex flex-col gap-4">
+            <SessionCreateSimpleSection
+              agents={agents}
+              isSubmitting={isSubmitting}
+              onAgentChange={onAgentChange}
+              selectedAgentName={selectedAgentName}
+              workspaceSelected={destinationReady}
+            />
+
+            {mode === "advanced" ? (
+              <SessionCreateAdvancedSection
+                environment={environment}
+                environmentListingError={environmentListingError}
+                environmentListingState={environmentListingState}
+                isSubmitting={isSubmitting || isAwaitingEnvironment}
+                onSessionNameChange={onSessionNameChange}
+                sessionName={sessionName}
+              />
+            ) : null}
+
+            {submitError ? (
+              <FieldError
+                className="mt-4 text-form-hint text-destructive"
+                data-testid="session-create-submit-error"
+              >
+                {submitError}
+              </FieldError>
+            ) : null}
+
+            {isAwaitingEnvironment ? (
+              <p
+                aria-live="polite"
+                className="mt-4 text-form-hint text-subtle"
+                data-testid="session-create-environment-status"
+                role="status"
+              >
+                Creating the environment. The session starts once it is ready.
+              </p>
+            ) : null}
+
+            {isSubmitting ? (
+              <p
+                aria-live="polite"
+                className="mt-4 text-form-hint text-subtle"
+                data-testid="session-create-pending-status"
+                role="status"
+              >
+                Starting your session…
+              </p>
+            ) : null}
+          </EntityDialogBody>
+
+          <EntityDialogFooter
+            hint={
+              <SessionDestinationRow
+                destination={destinationLabel}
+                disabled={isSubmitting}
+                profile={destinationAxes?.profile}
+                project={destinationAxes?.project}
+                root={sessionRoot}
+                scope={scope}
+              />
+            }
+            isSaving={isSubmitting}
+            onCancel={handleCancel}
+            primaryDisabled={!canSubmit}
+            primaryLabel="Start session"
+            primaryTestId="session-create-submit"
+            primaryType="submit"
+          />
+        </form>
+      </DialogContent>
+    </Dialog>
+  );
+}
+
+export { SessionCreateDialog };

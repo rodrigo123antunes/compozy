@@ -1,0 +1,392 @@
+package spec
+
+import "github.com/compozy/compozy/internal/api/contract"
+
+const (
+	specAPIWorktreesPath           = "/api/workspaces/{workspace_id}/worktrees"
+	specAPIWorktreePath            = specAPIWorktreesPath + "/{worktree_id}"
+	specAPIWorktreeStatusPath      = specAPIWorktreePath + "/status"
+	specAPIWorktreeExitPath        = specAPIWorktreePath + "/exit"
+	specAPIWorktreeStreamPath      = specAPIWorktreePath + "/stream"
+	specAPIWorktreeCatalogPath     = "/api/worktrees/catalog-stream"
+	worktreeUnavailableDescription = "Worktree service is unavailable"
+	worktreeNotFoundDescription    = "Worktree or workspace not found"
+)
+
+func registryWorktreeOperations() []OperationSpec {
+	return []OperationSpec{
+		listWorktreesOperationSpec(),
+		createWorktreeOperationSpec(),
+		adoptWorktreeOperationSpec(),
+		inspectWorktreeOperationSpec(),
+		worktreeStatusOperationSpec(),
+		worktreeExitPlanOperationSpec(),
+		prepareWorktreeExitPlanOperationSpec(),
+		runWorktreeExitActionOperationSpec(),
+		cancelWorktreeExitActionOperationSpec(),
+		cancelWorktreeOperationSpec(),
+		removeWorktreeOperationSpec(),
+		removeDiscoveredWorktreeOperationSpec(),
+		dismissWorktreeOperationSpec(),
+		streamWorktreeOperationSpec(),
+		streamWorktreeCatalogOperationSpec(),
+	}
+}
+
+func listWorktreesOperationSpec() OperationSpec {
+	return OperationSpec{
+		Method: httpMethodGet, Path: specAPIWorktreesPath, AppAccess: AppAccessDenied, OperationID: "listWorktrees",
+		Summary: "List registered and discovered worktrees", Tags: []string{specWorktreesKey},
+		Transports: []Transport{TransportHTTP, TransportUDS},
+		Parameters: append(worktreeWorkspaceParams(), boolQueryParam("refresh", "Refresh Git discovery and status")),
+		Responses: []ResponseSpec{
+			{Status: 200, Description: "OK", Body: contract.WorktreesResponse{}},
+			{Status: 400, Description: "Invalid worktree list query", Body: contract.ErrorPayload{}},
+			{Status: 404, Description: specWorkspaceNotFoundDescription, Body: contract.ErrorPayload{}},
+			{Status: 500, Description: specInternalServerErrorDescription, Body: contract.ErrorPayload{}},
+			{Status: 503, Description: worktreeUnavailableDescription, Body: contract.ErrorPayload{}},
+		},
+	}
+}
+
+func createWorktreeOperationSpec() OperationSpec {
+	return OperationSpec{
+		Method: httpMethodPost, Path: specAPIWorktreesPath, AppAccess: AppAccessDenied, OperationID: "createWorktree",
+		Summary: "Accept a worktree creation", Tags: []string{specWorktreesKey},
+		Transports:  []Transport{TransportHTTP, TransportUDS},
+		Parameters:  withProfileSelector(worktreeWorkspaceParams()...),
+		RequestBody: contract.CreateWorktreeRequest{},
+		Responses: append(worktreeMutationResponses(),
+			ResponseSpec{Status: 202, Description: specAcceptedDescription, Body: contract.WorktreeResponse{}},
+		),
+	}
+}
+
+func adoptWorktreeOperationSpec() OperationSpec {
+	return OperationSpec{
+		Method:      httpMethodPost,
+		Path:        specAPIWorktreesPath + "/adopt",
+		AppAccess:   AppAccessDenied,
+		OperationID: "adoptWorktree",
+		Summary:     "Adopt an existing linked worktree", Tags: []string{specWorktreesKey},
+		Transports:  []Transport{TransportHTTP, TransportUDS},
+		Parameters:  withProfileSelector(worktreeWorkspaceParams()...),
+		RequestBody: contract.AdoptWorktreeRequest{},
+		Responses: append(worktreeMutationResponses(),
+			ResponseSpec{Status: 200, Description: "OK", Body: contract.WorktreeResponse{}},
+		),
+	}
+}
+
+func inspectWorktreeOperationSpec() OperationSpec {
+	return OperationSpec{
+		Method: httpMethodGet, Path: specAPIWorktreePath, AppAccess: AppAccessDenied, OperationID: "inspectWorktree",
+		Summary: "Inspect one worktree", Tags: []string{specWorktreesKey},
+		Transports: []Transport{TransportHTTP, TransportUDS}, Parameters: worktreeRouteParams(),
+		Responses: []ResponseSpec{
+			{Status: 200, Description: "OK", Body: contract.WorktreeInspectionResponse{}},
+			{Status: 404, Description: worktreeNotFoundDescription, Body: contract.ErrorPayload{}},
+			{Status: 500, Description: specInternalServerErrorDescription, Body: contract.ErrorPayload{}},
+			{Status: 503, Description: worktreeUnavailableDescription, Body: contract.ErrorPayload{}},
+		},
+	}
+}
+
+func worktreeStatusOperationSpec() OperationSpec {
+	return OperationSpec{
+		Method:      httpMethodGet,
+		Path:        specAPIWorktreeStatusPath,
+		AppAccess:   AppAccessDenied,
+		OperationID: "getWorktreeStatus",
+		Summary:     "Read or refresh worktree status",
+		Tags:        []string{specWorktreesKey},
+		Transports:  []Transport{TransportHTTP, TransportUDS},
+		Parameters: append(worktreeRouteParams(),
+			boolQueryParam("refresh", "Refresh local Git status"),
+			boolQueryParam("forge", "Refresh the serving forge provider"),
+		),
+		Responses: []ResponseSpec{
+			{Status: 200, Description: "OK", Body: contract.WorktreeStatusResponse{}},
+			{Status: 400, Description: "Invalid status query", Body: contract.ErrorPayload{}},
+			{Status: 404, Description: worktreeNotFoundDescription, Body: contract.ErrorPayload{}},
+			{Status: 409, Description: "Worktree status is unavailable", Body: contract.ErrorPayload{}},
+			{Status: 500, Description: specInternalServerErrorDescription, Body: contract.ErrorPayload{}},
+			{Status: 502, Description: "Forge provider error", Body: contract.ErrorPayload{}},
+			{Status: 503, Description: "Worktree or forge service is unavailable", Body: contract.ErrorPayload{}},
+		},
+	}
+}
+
+func worktreeExitPlanOperationSpec() OperationSpec {
+	return OperationSpec{
+		Method:      httpMethodGet,
+		Path:        specAPIWorktreeExitPath,
+		AppAccess:   AppAccessDenied,
+		OperationID: "getWorktreeExitPlan",
+		Summary:     "Read the worktree exit plan",
+		Tags:        []string{specWorktreesKey},
+		Transports: []Transport{
+			TransportHTTP,
+			TransportUDS,
+		},
+		Parameters: append(
+			worktreeRouteParams(),
+			ParameterSpec{
+				Name: specIncludeKey,
+				In:   specParameterInQuery,
+				Kind: specArrayKind,
+				Description: "Exact worktree-relative reviewed file paths; " +
+					"scoped plans return a complete include set and fingerprint.",
+			},
+		),
+		Responses: []ResponseSpec{
+			{Status: 200, Description: "OK", Body: contract.WorktreeExitPlanResponse{}},
+			{Status: 404, Description: worktreeNotFoundDescription, Body: contract.ErrorPayload{}},
+			{Status: 409, Description: "Worktree exit plan is unavailable", Body: contract.ErrorPayload{}},
+			{Status: 500, Description: specInternalServerErrorDescription, Body: contract.ErrorPayload{}},
+			{Status: 503, Description: worktreeUnavailableDescription, Body: contract.ErrorPayload{}},
+		},
+	}
+}
+
+func prepareWorktreeExitPlanOperationSpec() OperationSpec {
+	operation := worktreeExitPlanOperationSpec()
+	operation.Method = httpMethodPost
+	operation.Path = specAPIWorktreeExitPath + "/prepare"
+	operation.OperationID = "prepareWorktreeExitPlan"
+	operation.Summary = "Resolve forge capabilities and prepare the worktree exit plan"
+	operation.Parameters = worktreeRouteParams()
+	return operation
+}
+
+func runWorktreeExitActionOperationSpec() OperationSpec {
+	return OperationSpec{
+		Method: httpMethodPost, Path: specAPIWorktreeExitPath + "/actions",
+		AppAccess:   AppAccessDenied,
+		OperationID: "runWorktreeExitAction", Summary: "Run a worktree exit action",
+		Tags: []string{specWorktreesKey}, Transports: []Transport{TransportHTTP, TransportUDS},
+		Parameters: worktreeRouteParams(), RequestBody: contract.RunWorktreeExitActionRequest{},
+		Responses: append(
+			worktreeExitMutationResponses(),
+			ResponseSpec{
+				Status:      202,
+				Description: specAcceptedDescription,
+				Body:        contract.WorktreeExitOperationResponse{},
+			},
+		),
+	}
+}
+
+func cancelWorktreeExitActionOperationSpec() OperationSpec {
+	return OperationSpec{
+		Method: httpMethodPost, Path: specAPIWorktreeExitPath + "/cancel",
+		AppAccess:   AppAccessDenied,
+		OperationID: "cancelWorktreeExitAction", Summary: "Cancel a worktree exit action",
+		Tags: []string{specWorktreesKey}, Transports: []Transport{TransportHTTP, TransportUDS},
+		Parameters: worktreeRouteParams(), RequestBody: contract.CancelWorktreeExitActionRequest{},
+		Responses: append(worktreeExitMutationResponses(),
+			ResponseSpec{Status: 204, Description: specNoContentDescription},
+		),
+	}
+}
+
+func worktreeExitMutationResponses() []ResponseSpec {
+	return []ResponseSpec{
+		{Status: 400, Description: "Invalid worktree exit request", Body: contract.ErrorPayload{}},
+		{Status: 404, Description: worktreeNotFoundDescription, Body: contract.ErrorPayload{}},
+		{Status: 409, Description: "Worktree exit action conflict", Body: contract.ErrorPayload{}},
+		{Status: 500, Description: specInternalServerErrorDescription, Body: contract.ErrorPayload{}},
+		{Status: 502, Description: "Forge provider error", Body: contract.ErrorPayload{}},
+		{Status: 503, Description: "Worktree or forge service is unavailable", Body: contract.ErrorPayload{}},
+	}
+}
+
+func cancelWorktreeOperationSpec() OperationSpec {
+	return worktreeNoContentOperation(
+		httpMethodPost, specAPIWorktreePath+"/cancel", "cancelWorktreeCreate", "Cancel a pending worktree creation",
+	)
+}
+
+// removeWorktreeOperationSpec keeps the singular HTTP/UDS removal contract,
+// including explicit force acknowledgement and optional profile selection.
+func removeWorktreeOperationSpec() OperationSpec {
+	return OperationSpec{
+		Method:      httpMethodDelete,
+		Path:        specAPIWorktreePath,
+		AppAccess:   AppAccessDenied,
+		OperationID: "removeWorktree",
+		Summary:     "Remove a worktree",
+		Tags:        []string{specWorktreesKey},
+		Transports:  []Transport{TransportHTTP, TransportUDS},
+		Parameters: withWorktreeCleanupProfile(append(worktreeRouteParams(),
+			boolQueryParam("force", "Confirm destructive removal; with delete_branch, also delete an unmerged branch"),
+			worktreeDeleteBranchParam(),
+		)...),
+		Responses: []ResponseSpec{
+			worktreeCleanupBranchResponse(),
+			{Status: 204, Description: specNoContentDescription},
+			{Status: 400, Description: "Invalid removal query", Body: contract.ErrorPayload{}},
+			{Status: 403, Description: "Profile does not permit removal", Body: contract.ErrorPayload{}},
+			{Status: 404, Description: worktreeNotFoundDescription, Body: contract.ErrorPayload{}},
+			{
+				Status:      409,
+				Description: "Removal requires another decision",
+				Body:        contract.WorktreeRemovalRefusalPayload{},
+			},
+			{Status: 500, Description: specInternalServerErrorDescription, Body: contract.ErrorPayload{}},
+			{Status: 503, Description: worktreeUnavailableDescription, Body: contract.ErrorPayload{}},
+		},
+	}
+}
+
+// removeDiscoveredWorktreeOperationSpec removes a Git-only checkout by its listed
+// path and answers refusals with the same 409 payload as record removal.
+func removeDiscoveredWorktreeOperationSpec() OperationSpec {
+	return OperationSpec{
+		Method:      httpMethodPost,
+		Path:        specAPIWorktreesPath + "/discovered/remove",
+		AppAccess:   AppAccessDenied,
+		OperationID: "removeDiscoveredWorktree",
+		Summary:     "Remove a discovered worktree",
+		Tags:        []string{specWorktreesKey},
+		Transports:  []Transport{TransportHTTP, TransportUDS},
+		Parameters:  withProfileSelector(worktreeWorkspaceParams()...),
+		RequestBody: contract.RemoveDiscoveredWorktreeRequest{},
+		Responses: []ResponseSpec{
+			{Status: 204, Description: specNoContentDescription},
+			{Status: 400, Description: "Invalid discovered removal request", Body: contract.ErrorPayload{}},
+			{Status: 403, Description: "Hook or profile does not permit removal", Body: contract.ErrorPayload{}},
+			{Status: 404, Description: "Discovered worktree or workspace not found", Body: contract.ErrorPayload{}},
+			{
+				Status:      409,
+				Description: "Removal requires another decision",
+				Body:        contract.WorktreeRemovalRefusalPayload{},
+			},
+			{Status: 500, Description: specInternalServerErrorDescription, Body: contract.ErrorPayload{}},
+			{Status: 503, Description: worktreeUnavailableDescription, Body: contract.ErrorPayload{}},
+		},
+	}
+}
+
+// dismissWorktreeOperationSpec exposes the same profile authority as removal
+// while retaining the established metadata-only tombstone operation.
+func dismissWorktreeOperationSpec() OperationSpec {
+	op := worktreeNoContentOperation(
+		httpMethodPost, specAPIWorktreePath+"/dismiss", "dismissWorktree", "Dismiss a worktree tombstone",
+	)
+	op.Parameters = withWorktreeCleanupProfile(append(op.Parameters,
+		worktreeDeleteBranchParam(),
+		boolQueryParam("force", "With delete_branch, also delete an unmerged branch"),
+	)...)
+	op.Responses = append(op.Responses, worktreeCleanupBranchResponse())
+	return op
+}
+
+// worktreeDeleteBranchParam is the additive opt-in shared by removal and dismissal.
+func worktreeDeleteBranchParam() ParameterSpec {
+	return boolQueryParam(
+		"delete_branch",
+		"Also delete the recorded local branch after cleanup. The root checkout HEAD and default "+
+			"branches are kept; an unmerged branch is kept unless force is set.",
+	)
+}
+
+func worktreeCleanupBranchResponse() ResponseSpec {
+	return ResponseSpec{
+		Status:      200,
+		Description: "Cleaned up; reports the requested local branch deletion",
+		Body:        contract.WorktreeCleanupResponse{},
+	}
+}
+
+func streamWorktreeOperationSpec() OperationSpec {
+	return OperationSpec{
+		Method:      httpMethodGet,
+		Path:        specAPIWorktreeStreamPath,
+		AppAccess:   AppAccessDenied,
+		OperationID: "streamWorktree",
+		Summary:     "Stream durable worktree lifecycle events",
+		Tags:        []string{specWorktreesKey},
+		Transports:  []Transport{TransportHTTP, TransportUDS},
+		Parameters: append(worktreeRouteParams(),
+			afterSequenceQueryParam("Replay events after this durable sequence"),
+			optionalLastEventIDHeaderParam("Resume after this durable sequence"),
+		),
+		Responses: []ResponseSpec{
+			{
+				Status:      200,
+				Description: "Canonical worktree event stream",
+				Body:        map[string]any{},
+				ContentType: specContentTypeEventStream,
+			},
+			{Status: 400, Description: "Invalid stream cursor", Body: contract.ErrorPayload{}},
+			{Status: 404, Description: worktreeNotFoundDescription, Body: contract.ErrorPayload{}},
+			{Status: 500, Description: specInternalServerErrorDescription, Body: contract.ErrorPayload{}},
+			{Status: 503, Description: "Worktree stream is unavailable", Body: contract.ErrorPayload{}},
+		},
+	}
+}
+
+func streamWorktreeCatalogOperationSpec() OperationSpec {
+	return OperationSpec{
+		Method:      httpMethodGet,
+		Path:        specAPIWorktreeCatalogPath,
+		AppAccess:   AppAccessDenied,
+		OperationID: "streamWorktreeCatalog",
+		Summary:     "Stream worktree catalog changes across workspaces", Tags: []string{specWorktreesKey},
+		Transports: []Transport{TransportHTTP, TransportUDS},
+		Responses: []ResponseSpec{
+			{Status: 101, Description: specEventStreamUpgrade},
+			{Status: 200, Description: "Workspace-identified worktree catalog event stream",
+				Body: contract.WorktreeCatalogEventPayload{}, ContentType: specContentTypeEventStream},
+			{Status: 500, Description: specInternalServerErrorDescription, Body: contract.ErrorPayload{}},
+			{Status: 503, Description: "Worktree catalog stream is unavailable", Body: contract.ErrorPayload{}},
+		},
+	}
+}
+
+func worktreeNoContentOperation(method, path, operationID, summary string) OperationSpec {
+	return OperationSpec{
+		AppAccess: AppAccessDenied,
+		Method:    method, Path: path, OperationID: operationID, Summary: summary,
+		Tags: []string{specWorktreesKey}, Transports: []Transport{TransportHTTP, TransportUDS},
+		Parameters: worktreeRouteParams(),
+		Responses: append(worktreeMutationResponses(),
+			ResponseSpec{Status: 204, Description: specNoContentDescription},
+		),
+	}
+}
+
+func worktreeMutationResponses() []ResponseSpec {
+	return []ResponseSpec{
+		{Status: 400, Description: "Invalid worktree request", Body: contract.ErrorPayload{}},
+		{Status: 403, Description: specForbiddenDescription, Body: contract.ErrorPayload{}},
+		{Status: 404, Description: worktreeNotFoundDescription, Body: contract.ErrorPayload{}},
+		{Status: 409, Description: "Worktree operation conflict", Body: contract.ErrorPayload{}},
+		{Status: 422, Description: "Invalid worktree configuration", Body: contract.ErrorPayload{}},
+		{Status: 500, Description: specInternalServerErrorDescription, Body: contract.ErrorPayload{}},
+		{Status: 503, Description: worktreeUnavailableDescription, Body: contract.ErrorPayload{}},
+	}
+}
+
+func worktreeWorkspaceParams() []ParameterSpec {
+	return []ParameterSpec{pathParam("workspace_id", "Workspace id or path")}
+}
+
+func worktreeRouteParams() []ParameterSpec {
+	return []ParameterSpec{
+		pathParam("workspace_id", "Workspace id or path"),
+		pathParam("worktree_id", "Worktree id, name, or path"),
+	}
+}
+
+// withWorktreeCleanupProfile documents the compatibility boundary: omitted
+// operator selectors infer ownership, while authenticated agents stay scoped.
+func withWorktreeCleanupProfile(params ...ParameterSpec) []ParameterSpec {
+	return append(params, queryParam(
+		specProfileKey,
+		"Act as this profile by name. If omitted, operator requests infer the target record owner; "+
+			"authenticated agents remain scoped to their session profile.",
+		false,
+	))
+}

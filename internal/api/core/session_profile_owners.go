@@ -1,0 +1,59 @@
+package core
+
+import (
+	"context"
+	"fmt"
+
+	"github.com/compozy/compozy/internal/api/contract"
+	profilepkg "github.com/compozy/compozy/internal/profile"
+)
+
+// decorateSessionOwners applies the same owner projection used by native session reads.
+func (h *BaseHandlers) decorateSessionOwners(
+	ctx context.Context,
+	payloads []contract.SessionPayload,
+) ([]contract.SessionPayload, error) {
+	if h == nil {
+		return SessionPayloadsWithProfileOwners(ctx, payloads, nil)
+	}
+	return SessionPayloadsWithProfileOwners(ctx, payloads, h.Profiles)
+}
+
+// ProfileOwnerReader supplies labels without ownership counts or credential details.
+type ProfileOwnerReader interface {
+	ListIdentities(context.Context) ([]profilepkg.Profile, error)
+}
+
+// SessionPayloadsWithProfileOwners requires current owner labels rather than emitting misleading empty names.
+func SessionPayloadsWithProfileOwners(
+	ctx context.Context,
+	payloads []contract.SessionPayload,
+	profiles ProfileOwnerReader,
+) ([]contract.SessionPayload, error) {
+	if len(payloads) == 0 {
+		return payloads, nil
+	}
+	owners, err := profileOwnerIdentities(ctx, profiles)
+	if err != nil {
+		return nil, err
+	}
+	for index := range payloads {
+		owner, found := owners[payloads[index].ProfileID]
+		if !found {
+			return nil, fmt.Errorf(
+				"api: session %q profile owner %q not found",
+				payloads[index].ID,
+				payloads[index].ProfileID,
+			)
+		}
+		if payloads[index].ProfileID == "" && profiles == nil {
+			payloads[index].ProfileID = owner.ID
+		}
+		payloads[index].ProfileName = owner.Name
+		payloads[index].ProfileColor = owner.Color
+		payloads[index].ProfileIcon = owner.Icon
+		payloads[index].ProfileEmoji = owner.Emoji
+		payloads[index].ProfileArchived = owner.Archived
+	}
+	return payloads, nil
+}

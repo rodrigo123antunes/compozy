@@ -1,0 +1,321 @@
+import { useState } from "react";
+
+import {
+  ActionResultBanner,
+  Button,
+  Checkbox,
+  Dialog,
+  DialogContent,
+  DialogDescription,
+  DialogFooter,
+  DialogHeader,
+  DialogTitle,
+  Disclosure,
+  Field,
+  FieldDescription,
+  FieldError,
+  FieldHeader,
+  FieldLabel,
+  HelpTip,
+  Input,
+  Label,
+  RadioGroup,
+  RadioGroupItem,
+  Spinner,
+} from "@compozy/ui";
+
+import type { ExtensionInstallRequest } from "../types";
+import type { ExtensionInstallPreview } from "@/systems/extensions";
+import { ExtensionInputFields } from "./extension-input-fields";
+import {
+  buildExtensionInstallRequest,
+  createExtensionInstallForm,
+  EXTENSION_INSTALL_SOURCES,
+  validateExtensionInstallForm,
+  type ExtensionInstallFieldError,
+  type ExtensionInstallForm,
+  type ExtensionInstallSource,
+} from "./extension-install-model";
+import { useExtensionInputForm } from "./use-extension-input-form";
+
+export interface ExtensionInstallDialogProps {
+  error?: string | null;
+  /** Source preselected when the dialog opens from a specific Add ▾ item. */
+  initialSource?: ExtensionInstallSource;
+  open: boolean;
+  pending?: boolean;
+  preview?: ExtensionInstallPreview | null;
+  onFormChange?: () => void;
+  onOpenChange: (open: boolean) => void;
+  onSubmit: (request: ExtensionInstallRequest) => void;
+}
+
+/**
+ * Source-union install for extensions the curated catalog does not carry. Consent for unverified
+ * archives is not granted here — the daemon's explicit trust dialog owns that decision.
+ */
+export function ExtensionInstallDialog({
+  error,
+  initialSource = "local_path",
+  open,
+  pending = false,
+  preview = null,
+  onFormChange,
+  onOpenChange,
+  onSubmit,
+}: ExtensionInstallDialogProps) {
+  const [form, setForm] = useState<ExtensionInstallForm>(() =>
+    createExtensionInstallForm(initialSource)
+  );
+  // Any acquisition change (source, ref, version, asset, previewed digest) rebuilds the input
+  // draft, so secrets typed for one preview never carry into another.
+  const acquisitionIdentity = JSON.stringify([
+    form.source,
+    form.ref,
+    form.version,
+    form.asset,
+    preview?.digest_sha256,
+  ]);
+  const inputForm = useExtensionInputForm(preview?.inputs ?? [], acquisitionIdentity);
+  const [fieldErrors, setFieldErrors] = useState<ExtensionInstallFieldError>({});
+  const patch = (next: Partial<ExtensionInstallForm>) => {
+    setFieldErrors({});
+    onFormChange?.();
+    setForm(current => ({ ...current, ...next }));
+  };
+
+  return (
+    <Dialog
+      onOpenChange={next => {
+        if (!next) {
+          setForm(createExtensionInstallForm(initialSource));
+          setFieldErrors({});
+        }
+        onOpenChange(next);
+      }}
+      open={open}
+    >
+      <DialogContent
+        className="flex max-h-[min(var(--height-modal-md),80vh)] flex-col sm:max-w-(--width-modal-sm)"
+        data-testid="extension-install-dialog"
+        unframed
+      >
+        <form
+          className="flex min-h-0 flex-1 flex-col"
+          onSubmit={event => {
+            event.preventDefault();
+            const errors = validateExtensionInstallForm(form);
+            setFieldErrors(errors);
+            if (Object.keys(errors).length > 0 || !inputForm.valid) return;
+            onSubmit({
+              ...buildExtensionInstallRequest(form),
+              ...(Object.keys(inputForm.inputs).length ? { inputs: inputForm.inputs } : {}),
+            });
+          }}
+        >
+          <DialogHeader variant="ruled">
+            <DialogTitle>Install an extension</DialogTitle>
+            <DialogDescription>
+              Install from GitHub, a git link, or a folder on this computer.
+            </DialogDescription>
+          </DialogHeader>
+
+          <div className="flex min-h-0 flex-1 flex-col gap-4 overflow-y-auto px-5 py-4">
+            <ExtensionInstallSourceFields form={form} errors={fieldErrors} onChange={patch} />
+
+            <ExtensionInstallMoreOptions form={form} onChange={patch} />
+
+            {preview ? <ExtensionInstallSummary preview={preview} /> : null}
+            {preview && preview.inputs.length > 0 ? (
+              <ExtensionInputFields disabled={pending} form={inputForm} key={acquisitionIdentity} />
+            ) : null}
+
+            {error ? (
+              <ActionResultBanner
+                data-testid="extension-install-error"
+                role="alert"
+                title={error}
+                tone="destructive"
+              />
+            ) : null}
+          </div>
+
+          <DialogFooter variant="ruled">
+            <Button
+              disabled={pending}
+              onClick={() => onOpenChange(false)}
+              type="button"
+              variant="ghost"
+            >
+              Cancel
+            </Button>
+            <Button
+              data-testid="extension-install-submit"
+              disabled={pending || !inputForm.valid}
+              type="submit"
+            >
+              {pending ? <Spinner aria-hidden="true" className="size-3.5" /> : null}
+              {pending ? "Working…" : preview ? "Install" : "Review install"}
+            </Button>
+          </DialogFooter>
+        </form>
+      </DialogContent>
+    </Dialog>
+  );
+}
+
+/** Version, asset, and the unverified opt-in: rarely needed, so they start folded. */
+function ExtensionInstallMoreOptions({
+  form,
+  onChange: patch,
+}: {
+  form: ExtensionInstallForm;
+  onChange: (next: Partial<ExtensionInstallForm>) => void;
+}) {
+  return (
+    <Disclosure data-testid="extension-install-more-options" label="More options">
+      <div className="flex flex-col gap-4 pt-3">
+        {form.source !== "local_path" ? (
+          <Field>
+            <FieldHeader>
+              <FieldLabel htmlFor="extension-install-version">Version</FieldLabel>
+              <HelpTip label="About version">
+                Optional. Leave empty to take the latest release the source resolves.
+              </HelpTip>
+            </FieldHeader>
+            <Input
+              data-testid="extension-install-version"
+              id="extension-install-version"
+              onChange={event => patch({ version: event.target.value })}
+              placeholder="0.4.2"
+              value={form.version}
+            />
+          </Field>
+        ) : null}
+
+        {form.source === "github" ? (
+          <Field>
+            <FieldHeader>
+              <FieldLabel htmlFor="extension-install-asset">Asset</FieldLabel>
+              <HelpTip label="About asset">
+                Optional. Required only when a release publishes several archives.
+              </HelpTip>
+            </FieldHeader>
+            <Input
+              data-testid="extension-install-asset"
+              id="extension-install-asset"
+              onChange={event => patch({ asset: event.target.value })}
+              placeholder="hello_darwin_arm64.tar.gz"
+              value={form.asset}
+            />
+          </Field>
+        ) : null}
+        <Field orientation="horizontal">
+          <Checkbox
+            aria-describedby="extension-install-unverified-hint"
+            checked={form.allowUnverified}
+            data-testid="extension-install-allow-unverified"
+            id="extension-install-unverified"
+            onCheckedChange={checked => patch({ allowUnverified: checked === true })}
+          />
+          <div className="grid gap-1">
+            <FieldLabel htmlFor="extension-install-unverified">
+              Allow an unverified package
+            </FieldLabel>
+            <FieldDescription id="extension-install-unverified-hint">
+              You confirm the warnings before anything is installed.
+            </FieldDescription>
+          </div>
+        </Field>
+      </div>
+    </Disclosure>
+  );
+}
+
+export function ExtensionInstallSummary({ preview }: { preview: ExtensionInstallPreview }) {
+  return (
+    <div
+      className="divide-y divide-line-soft border-y border-line-soft"
+      data-testid="extension-install-summary"
+    >
+      {preview.declared_profiles.map(profile => (
+        <div className="flex items-center gap-2 py-2.5 text-small-body" key={profile.name}>
+          <span className="min-w-0 flex-1 text-fg">
+            {profile.create ? "Creates" : "Uses"} profile {profile.name}
+          </span>
+          {(profile.credentials?.length ?? 0) > 0 ? (
+            <span className="text-warning">
+              Needs {profile.credentials?.length ?? 0}{" "}
+              {(profile.credentials?.length ?? 0) === 1 ? "credential" : "credentials"}
+            </span>
+          ) : null}
+        </div>
+      ))}
+      {preview.placements.length > 0 ? (
+        <div className="py-2.5 text-small-body text-muted-foreground">
+          {preview.placements.length} {preview.placements.length === 1 ? "resource" : "resources"}
+        </div>
+      ) : null}
+    </div>
+  );
+}
+
+function ExtensionInstallSourceFields({
+  form,
+  errors: fieldErrors,
+  onChange: patch,
+}: {
+  form: ExtensionInstallForm;
+  errors: ExtensionInstallFieldError;
+  onChange: (next: Partial<ExtensionInstallForm>) => void;
+}) {
+  const source = EXTENSION_INSTALL_SOURCES.find(item => item.value === form.source);
+  return (
+    <>
+      <Field>
+        <FieldLabel id="extension-install-source-label">Source</FieldLabel>
+        <RadioGroup
+          aria-labelledby="extension-install-source-label"
+          className="grid gap-2"
+          data-testid="extension-install-source"
+          onValueChange={value => patch({ source: value as ExtensionInstallSource })}
+          value={form.source}
+        >
+          {EXTENSION_INSTALL_SOURCES.map(option => (
+            <div className="flex items-center gap-2" key={option.value}>
+              <RadioGroupItem
+                data-testid={`extension-install-source-${option.value}`}
+                id={`extension-install-source-${option.value}`}
+                value={option.value}
+              />
+              <Label htmlFor={`extension-install-source-${option.value}`}>{option.label}</Label>
+            </div>
+          ))}
+        </RadioGroup>
+      </Field>
+
+      <Field data-invalid={fieldErrors.ref ? true : undefined}>
+        <FieldHeader>
+          <FieldLabel htmlFor="extension-install-ref">{source?.refLabel ?? "Reference"}</FieldLabel>
+          {source?.hint ? (
+            <HelpTip label={`About ${source.refLabel.toLowerCase()}`}>{source.hint}</HelpTip>
+          ) : null}
+        </FieldHeader>
+        <Input
+          aria-describedby={fieldErrors.ref ? "extension-install-ref-error" : undefined}
+          aria-invalid={fieldErrors.ref ? true : undefined}
+          data-testid="extension-install-ref"
+          id="extension-install-ref"
+          onChange={event => patch({ ref: event.target.value })}
+          placeholder={source?.refPlaceholder}
+          value={form.ref}
+        />
+        {fieldErrors.ref ? (
+          <FieldError data-testid="extension-install-ref-error" id="extension-install-ref-error">
+            {fieldErrors.ref}
+          </FieldError>
+        ) : null}
+      </Field>
+    </>
+  );
+}

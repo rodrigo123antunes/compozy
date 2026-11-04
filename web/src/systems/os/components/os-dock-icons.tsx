@@ -1,0 +1,105 @@
+/**
+ * Dock glyph set copied from OpenDesign `os-v2.js` ICONS — kept as presentational
+ * SVG markup so Visual Contract dock anatomy matches the prototype paths, not
+ * Lucide substitutes. Every path draws at the app-wide lucide stroke
+ * (`ICON_STROKE_WIDTH`), set once on the root so the rail matches the foot and
+ * topbar glyphs.
+ */
+import type { SVGProps } from "react";
+
+import { ICON_STROKE_WIDTH } from "@compozy/ui/lib/icon-stroke";
+
+import type { DockIconId } from "../lib/os-dock-model";
+
+type GlyphProps = SVGProps<SVGSVGElement>;
+
+function DockGlyph({ children, className, ...props }: GlyphProps & { children: React.ReactNode }) {
+  return (
+    <svg
+      viewBox="0 0 20 20"
+      aria-hidden="true"
+      className={className ?? "size-5"}
+      fill="none"
+      stroke="currentColor"
+      strokeWidth={ICON_STROKE_WIDTH}
+      {...props}
+    >
+      {children}
+    </svg>
+  );
+}
+
+const DOCK_ICON_GLYPHS = {
+  sessions: (props: GlyphProps) => (
+    <DockGlyph {...props}>
+      <path
+        d="M4 4.5h12a1.5 1.5 0 0 1 1.5 1.5v7a1.5 1.5 0 0 1-1.5 1.5H9l-3.4 2.6a.5.5 0 0 1-.8-.4v-2.2H4A1.5 1.5 0 0 1 2.5 13V6A1.5 1.5 0 0 1 4 4.5Z"
+        strokeLinejoin="round"
+      />
+    </DockGlyph>
+  ),
+  dashboard: (props: GlyphProps) => (
+    <DockGlyph {...props}>
+      <rect x="3" y="3" width="6" height="8" rx="1.6" />
+      <rect x="11" y="3" width="6" height="4" rx="1.6" />
+      <rect x="11" y="9" width="6" height="8" rx="1.6" />
+      <rect x="3" y="13" width="6" height="4" rx="1.6" />
+    </DockGlyph>
+  ),
+  terminal: (props: GlyphProps) => (
+    <DockGlyph {...props}>
+      <path d="m5 6.6 3.5 3.4L5 13.4" strokeLinecap="round" strokeLinejoin="round" />
+      <path d="M10.8 14.4h4.2" strokeLinecap="round" />
+    </DockGlyph>
+  ),
+  agents: (props: GlyphProps) => (
+    <DockGlyph {...props}>
+      <rect x="4" y="6" width="12" height="9" rx="2.4" />
+      <path d="M10 6V3.2M7.5 10.4h.01M12.5 10.4h.01" strokeLinecap="round" />
+      <path d="M7 13h6" strokeLinecap="round" />
+    </DockGlyph>
+  ),
+  tasks: (props: GlyphProps) => (
+    <DockGlyph {...props}>
+      <path
+        d="m3.5 6 1.6 1.6L8 4.7M3.5 13l1.6 1.6L8 11.7M10.5 6.5H17M10.5 13.5H17"
+        strokeLinecap="round"
+        strokeLinejoin="round"
+      />
+    </DockGlyph>
+  ),
+  loops: (props: GlyphProps) => (
+    <DockGlyph {...props}>
+      <path
+        d="M13.5 4.5H8a4 4 0 0 0-4 4v.5M6.5 15.5H12a4 4 0 0 0 4-4V11M11 2l2.5 2.5L11 7M9 18l-2.5-2.5L9 13"
+        strokeLinecap="round"
+        strokeLinejoin="round"
+      />
+    </DockGlyph>
+  ),
+  automations: (props: GlyphProps) => (
+    <DockGlyph {...props}>
+      <path d="M11 2.5 4.5 11h4l-.9 6.5L14.5 9h-4z" strokeLinejoin="round" />
+    </DockGlyph>
+  ),
+  marketplace: (props: GlyphProps) => (
+    <DockGlyph {...props}>
+      <path
+        d="M4 7.5 5 4h10l1 3.5M4 7.5h12M4 7.5V15a1 1 0 0 0 1 1h10a1 1 0 0 0 1-1V7.5M8 10.5h4"
+        strokeLinecap="round"
+        strokeLinejoin="round"
+      />
+    </DockGlyph>
+  ),
+  vault: (props: GlyphProps) => (
+    <DockGlyph {...props}>
+      <circle cx="7.5" cy="8" r="3.8" />
+      <path d="m10.4 10.6 5.6 5.6M13.5 13.5l1.8-1.8M15.5 15.5l1.6-1.6" strokeLinecap="round" />
+    </DockGlyph>
+  ),
+} as const satisfies Record<DockIconId, (props: GlyphProps) => React.ReactNode>;
+
+export function DockIcon({ name, ...props }: GlyphProps & { name: DockIconId }) {
+  const Glyph = DOCK_ICON_GLYPHS[name];
+  return <Glyph {...props} />;
+}

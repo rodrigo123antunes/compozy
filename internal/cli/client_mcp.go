@@ -1,0 +1,168 @@
+package cli
+
+import (
+	"context"
+	"net/http"
+	"net/url"
+	"strings"
+
+	"github.com/compozy/compozy/internal/api/contract"
+)
+
+// SettingsMCPAuthTarget selects one exact daemon-owned MCP credential set.
+type SettingsMCPAuthTarget struct {
+	Owner       string
+	Name        string
+	Scope       contract.SettingsLayeredScopeKind
+	WorkspaceID string
+	Profile     string
+}
+
+// SettingsMCPAuthBeginRecord is the verifier-free daemon OAuth handoff.
+type SettingsMCPAuthBeginRecord = contract.SettingsMCPAuthBeginResponse
+
+// SettingsMCPAuthBeginRequest selects automatic or manual callback delivery.
+type SettingsMCPAuthBeginRequest = contract.SettingsMCPAuthBeginRequest
+
+// SettingsMCPAuthExchangeRequest is the secret-bearing one-time exchange body.
+type SettingsMCPAuthExchangeRequest = contract.SettingsMCPAuthExchangeRequest
+
+// SettingsMCPAuthStatusRecord is the redacted daemon OAuth status.
+type SettingsMCPAuthStatusRecord = contract.SettingsMCPAuthStatusPayload
+
+// MCPSettingsClient exposes settings-owned MCP management.
+type MCPSettingsClient interface {
+	ListSettingsMCPServers(
+		ctx context.Context,
+		scope contract.SettingsLayeredScopeKind,
+		workspaceID string,
+		profile string,
+	) (contract.SettingsMCPServersResponse, error)
+	GetSettingsMCPAuthStatus(ctx context.Context, target SettingsMCPAuthTarget) (SettingsMCPAuthStatusRecord, error)
+	BeginSettingsMCPAuth(
+		ctx context.Context,
+		target SettingsMCPAuthTarget,
+		request SettingsMCPAuthBeginRequest,
+	) (SettingsMCPAuthBeginRecord, error)
+	ExchangeSettingsMCPAuth(
+		ctx context.Context,
+		target SettingsMCPAuthTarget,
+		request SettingsMCPAuthExchangeRequest,
+	) (SettingsMCPAuthStatusRecord, error)
+	LogoutSettingsMCPAuth(ctx context.Context, target SettingsMCPAuthTarget) (SettingsMCPAuthStatusRecord, error)
+}
+
+func (c *daemonClient) ListSettingsMCPServers(
+	ctx context.Context,
+	scope contract.SettingsLayeredScopeKind,
+	workspaceID string,
+	profile string,
+) (contract.SettingsMCPServersResponse, error) {
+	query := url.Values{}
+	query.Set("scope", strings.TrimSpace(string(scope)))
+	if normalized := strings.TrimSpace(workspaceID); normalized != "" {
+		query.Set("workspace_id", normalized)
+	}
+	if normalized := strings.TrimSpace(profile); normalized != "" {
+		query.Set(profileFlagName, normalized)
+	}
+	var response contract.SettingsMCPServersResponse
+	if err := c.doJSON(ctx, http.MethodGet, "/api/settings/mcp-servers", query, nil, &response); err != nil {
+		return contract.SettingsMCPServersResponse{}, err
+	}
+	return response, nil
+}
+
+func (c *daemonClient) GetSettingsMCPAuthStatus(
+	ctx context.Context,
+	target SettingsMCPAuthTarget,
+) (SettingsMCPAuthStatusRecord, error) {
+	var response SettingsMCPAuthStatusRecord
+	if err := c.doJSON(
+		ctx,
+		http.MethodGet,
+		settingsMCPAuthPath(target, "status"),
+		settingsMCPAuthQuery(target),
+		nil,
+		&response,
+	); err != nil {
+		return SettingsMCPAuthStatusRecord{}, err
+	}
+	return response, nil
+}
+
+func (c *daemonClient) BeginSettingsMCPAuth(
+	ctx context.Context,
+	target SettingsMCPAuthTarget,
+	request SettingsMCPAuthBeginRequest,
+) (SettingsMCPAuthBeginRecord, error) {
+	var response SettingsMCPAuthBeginRecord
+	if err := c.doJSON(
+		ctx,
+		http.MethodPost,
+		settingsMCPAuthPath(target, "begin"),
+		settingsMCPAuthQuery(target),
+		request,
+		&response,
+	); err != nil {
+		return SettingsMCPAuthBeginRecord{}, err
+	}
+	return response, nil
+}
+
+func (c *daemonClient) ExchangeSettingsMCPAuth(
+	ctx context.Context,
+	target SettingsMCPAuthTarget,
+	request SettingsMCPAuthExchangeRequest,
+) (SettingsMCPAuthStatusRecord, error) {
+	var response SettingsMCPAuthStatusRecord
+	if err := c.doJSON(
+		ctx,
+		http.MethodPost,
+		settingsMCPAuthPath(target, "exchange"),
+		settingsMCPAuthQuery(target),
+		request,
+		&response,
+	); err != nil {
+		return SettingsMCPAuthStatusRecord{}, err
+	}
+	return response, nil
+}
+
+func (c *daemonClient) LogoutSettingsMCPAuth(
+	ctx context.Context,
+	target SettingsMCPAuthTarget,
+) (SettingsMCPAuthStatusRecord, error) {
+	var response SettingsMCPAuthStatusRecord
+	if err := c.doJSON(
+		ctx,
+		http.MethodPost,
+		settingsMCPAuthPath(target, "logout"),
+		settingsMCPAuthQuery(target),
+		nil,
+		&response,
+	); err != nil {
+		return SettingsMCPAuthStatusRecord{}, err
+	}
+	return response, nil
+}
+
+func settingsMCPAuthPath(target SettingsMCPAuthTarget, action string) string {
+	return "/api/settings/mcp-servers/" + url.PathEscape(strings.TrimSpace(target.Name)) +
+		"/auth/" + strings.TrimSpace(action)
+}
+
+func settingsMCPAuthQuery(target SettingsMCPAuthTarget) url.Values {
+	query := url.Values{}
+	if owner := strings.TrimSpace(target.Owner); owner != "" {
+		query.Set("owner", owner)
+	}
+	query.Set("scope", strings.TrimSpace(string(target.Scope)))
+	if workspaceID := strings.TrimSpace(target.WorkspaceID); workspaceID != "" {
+		query.Set("workspace_id", workspaceID)
+	}
+	if profile := strings.TrimSpace(target.Profile); profile != "" {
+		query.Set(profileFlagName, profile)
+	}
+	return query
+}

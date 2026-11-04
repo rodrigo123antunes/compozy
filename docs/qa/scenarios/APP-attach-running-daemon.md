@@ -1,0 +1,47 @@
+---
+id: APP-attach-running-daemon
+area: APP
+title: Attach to my already-running runtime and touch nothing
+persona: Dora
+journey: J-desktop-attach-daily
+expected: With a healthy runtime and an active session, the app shows the identical workspace/session state the browser tab shows (same origin, same local UI state), no second daemon appears, the existing process is never terminated, and side-by-side actions reflect live in both surfaces.
+entry_points: dock/launcher icon with a running daemon; browser tab open side by side
+qa_status: pass
+bug_ids: BUG-20260810-desktop-runtime-stalls
+fix_status: fixed
+retest_status: pass
+fix_commits: b415f24b; b3aa3d27; bd610cfa; 02b55a46
+evidence: docs/qa/reports/2026-08-17-electron-shell.md
+last_report: docs/qa/reports/2026-08-17-electron-shell.md
+overlaps:
+---
+
+PRD stories: US-003 (attach, zero writes; AC-3 isolated home; EC-1 stale record; EC-2 foreign
+squatter; EC-3 unhealthy), US-020 (browser coexistence AC-1/AC-2, EC-1 different homes never
+mixed). Test IDs: E2E-003, E2E-018; IT-001, IT-004, IT-026, IT-027, IT-028; UT-013–UT-023,
+UT-089–UT-091.
+
+Per-OS evidence: macOS and Linux capture process-table before/after app open (no spawn),
+same-origin proof (session + local UI state parity with the tab), and the live two-way sync walk
+(E2E-011). Both use Playwright `_electron` plus the recorded manual sync check.
+Isolated-home labs only: the lab manifest's `COMPOZY_HOME` must be the one resolved — never the
+operator default home.
+
+QA impact 2026-08-11: the startup resolver now waits for a live recorded daemon and restricts any
+automatic repair to verified desktop-owned processes. The isolated macOS walk reopened the app,
+kept daemon PID `89043`, and retained one listener. Browser/session parity and the shipping OS
+matrix remain blocked for artifact verification.
+
+Issue 1252 — relaunch the app while the daemon is still booting: start the runtime (or let an
+update relaunch it) so it holds `daemon.lock` but has not yet published `daemon.json` or opened its
+listener — a slow boot migration on a large database is the natural trigger. Open the app or press
+"Retry operation" during that window. Expected: the bootstrap stream shows one `start` attempt,
+then `attach started` naming the booting pid, then `Attached to the running CompozyOS runtime.`
+with that same pid once it is ready. There is no "could not start" screen, no `retrying` burst, and
+exactly one daemon process for the home. If the booting daemon exits, or stays unready past the
+attach deadline, the failure names the running daemon pid, not "detached daemon exited before
+readiness". A dead lock owner (stale lock) still recovers through normal start retries.
+Evidence 2026-11-04 (isolated `COMPOZY_HOME`, macOS, working-tree build): three runs of a
+foreground `daemon start` with `daemon bootstrap` launched while the daemon held the lock without
+`daemon.json` all ended `ready completed attach <same pid>` with one daemon process. A lock holder
+killed mid-wait ended `attach failed` naming its pid.

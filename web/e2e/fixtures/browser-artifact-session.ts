@@ -1,0 +1,400 @@
+import { mkdtemp } from "node:fs/promises";
+import path from "node:path";
+
+import type { BrowserContext, ConsoleMessage, Page, Request, Response } from "@playwright/test";
+
+import {
+  type ArtifactManifest,
+  type ArtifactCollector,
+  type BrowserConsoleEntry,
+  type BrowserNetworkEntry,
+  type BrowserRouteState,
+  mirrorBrowserScreenshotForQA,
+  persistBrowserArtifacts,
+} from "./artifacts";
+
+export interface BrowserArtifactSessionOptions {
+  collector: ArtifactCollector;
+  context: BrowserContext;
+  qaOutputRootDir?: string;
+}
+
+export class BrowserArtifactSession {
+  private readonly collector: ArtifactCollector;
+  private readonly context: BrowserContext;
+  private readonly tempDirPromise: Promise<string>;
+  private readonly consoleEntries: BrowserConsoleEntry[] = [];
+  private readonly networkEntries: BrowserNetworkEntry[] = [];
+  private readonly qaOutputRootDir?: string;
+  private readonly screenshotPaths: string[] = [];
+  private readonly pages = new Set<Page>();
+
+  private persistedManifest: ArtifactManifest | null = null;
+
+  private constructor(options: BrowserArtifactSessionOptions) {
+    this.collector = options.collector;
+    this.context = options.context;
+    this.qaOutputRootDir = options.qaOutputRootDir?.trim() || undefined;
+    this.tempDirPromise = mkdtemp(path.join(this.collector.rootDir, ".capture-"));
+  }
+
+  static async start(options: BrowserArtifactSessionOptions): Promise<BrowserArtifactSession> {
+    const session = new BrowserArtifactSession(options);
+    await session.context.tracing.start({ screenshots: false, snapshots: true });
+
+    for (const page of session.context.pages()) {
+      session.attachPage(page);
+    }
+    session.context.on("page", page => {
+      session.attachPage(page);
+    });
+
+    return session;
+  }
+
+  async captureScreenshot(name = "final", page?: Page): Promise<string | null> {
+    const targetPage = page ?? this.selectPage();
+    if (targetPage === null) {
+      return null;
+    }
+
+    const tempDir = await this.tempDirPromise;
+    const filePath = path.join(tempDir, `${sanitizePathComponent(name)}.png`);
+    await targetPage.screenshot({ fullPage: true, path: filePath, animations: "disabled" });
+    this.screenshotPaths.push(filePath);
+    if (this.qaOutputRootDir) {
+      await mirrorBrowserScreenshotForQA(filePath, this.qaOutputRootDir, name);
+    }
+    return filePath;
+  }
+
+  async persist(page?: Page): Promise<ArtifactManifest> {
+    if (this.persistedManifest !== null) {
+      return this.persistedManifest;
+    }
+
+    const targetPage = page ?? this.selectPage();
+
+    if (this.screenshotPaths.length === 0) {
+      await this.captureScreenshot("final", targetPage ?? undefined);
+    }
+
+    const tempDir = await this.tempDirPromise;
+    const tracePath = path.join(tempDir, "trace.zip");
+    await this.context.tracing.stop({ path: tracePath });
+
+    const routeState = targetPage ? await captureRouteState(targetPage) : undefined;
+
+    this.persistedManifest = await persistBrowserArtifacts(this.collector, {
+      tracePath,
+      screenshotPaths: this.screenshotPaths,
+      consoleEntries: this.consoleEntries,
+      networkEntries: this.networkEntries,
+      routeState,
+    });
+    return this.persistedManifest;
+  }
+
+  private attachPage(page: Page): void {
+    if (this.pages.has(page)) {
+      return;
+    }
+
+    this.pages.add(page);
+    page.on("console", message => {
+      this.consoleEntries.push(consoleEntryFromMessage(message));
+    });
+    page.on("pageerror", error => {
+      this.consoleEntries.push({
+        type: "pageerror",
+        text: error.message,
+      });
+    });
+    page.on("response", response => {
+      this.networkEntries.push(networkEntryFromResponse(response));
+    });
+    page.on("requestfailed", request => {
+      this.networkEntries.push(networkEntryFromFailedRequest(request));
+    });
+  }
+
+  private selectPage(): Page | null {
+    for (const page of [...this.pages].reverse()) {
+      if (!page.isClosed()) {
+        return page;
+      }
+    }
+    return null;
+  }
+}
+
+function consoleEntryFromMessage(message: ConsoleMessage): BrowserConsoleEntry {
+  const location = message.location();
+  return {
+    type: message.type(),
+    text: message.text(),
+    location:
+      location.url === "" && location.lineNumber === 0 && location.columnNumber === 0
+        ? undefined
+        : {
+            url: location.url || undefined,
+            line_number: location.lineNumber || undefined,
+            column_number: location.columnNumber || undefined,
+          },
+  };
+}
+
+function networkEntryFromResponse(response: Response): BrowserNetworkEntry {
+  const request = response.request();
+  return {
+    event: "response",
+    url: response.url(),
+    method: request.method(),
+    resource_type: request.resourceType(),
+    status: response.status(),
+    ok: response.ok(),
+  };
+}
+
+function networkEntryFromFailedRequest(request: Request): BrowserNetworkEntry {
+  const failure = request.failure();
+  return {
+    event: "requestfailed",
+    url: request.url(),
+    method: request.method(),
+    resource_type: request.resourceType(),
+    failure: failure?.errorText ?? "unknown request failure",
+  };
+}
+
+function sanitizePathComponent(value: string): string {
+  const trimmed = value.trim().toLowerCase();
+  if (trimmed === "") {
+    return "artifact";
+  }
+  return trimmed.replace(/[^a-z0-9._-]+/g, "-");
+}
+
+export async function captureRouteState(page: Pick<Page, "evaluate">): Promise<BrowserRouteState> {
+  return await page.evaluate(() => {
+    const readText = (testId: string) =>
+      document.querySelector<HTMLElement>(`[data-testid="${testId}"]`)?.textContent?.trim() ||
+      undefined;
+    const readHomeMetricValue = (labelPrefix: string) => {
+      const prefix = labelPrefix.toLowerCase();
+      const metrics = document.querySelectorAll<HTMLElement>(
+        '[data-slot="home-kpi-strip"] [data-slot="metric"]'
+      );
+      for (const metric of metrics) {
+        const label = metric
+          .querySelector<HTMLElement>('[data-slot="metric-label"]')
+          ?.textContent?.trim()
+          .toLowerCase();
+        if (label?.startsWith(prefix)) {
+          return (
+            metric.querySelector<HTMLElement>('[data-slot="metric-value"]')?.textContent?.trim() ||
+            undefined
+          );
+        }
+      }
+      return undefined;
+    };
+    const countByPrefix = (prefix: string) =>
+      document.querySelectorAll(`[data-testid^="${prefix}"]`).length;
+    const countSettingsProviderCards = () =>
+      [
+        ...document.querySelectorAll<HTMLElement>('[data-testid^="settings-page-providers-card-"]'),
+      ].filter(element => element.querySelector('[data-testid$="-edit"]') !== null).length;
+    const countSettingsMCPServerRows = () =>
+      [
+        ...document.querySelectorAll<HTMLElement>(
+          '[data-testid^="settings-page-mcp-servers-row-"]'
+        ),
+      ].filter(
+        element =>
+          element.tagName.toLowerCase() === "tr" ||
+          element.querySelector('[data-testid$="-delete"]') !== null
+      ).length;
+    const readPathContainerId = (pattern: RegExp) => {
+      const match = window.location.pathname.match(pattern);
+      const value = match?.[1];
+      return value ? decodeURIComponent(value) : undefined;
+    };
+    const countAutomationRunCards = () =>
+      [...document.querySelectorAll<HTMLElement>("[data-testid]")]
+        .map(element => element.dataset.testid || "")
+        .filter(testId => /^automation-run-(?!list|now-|drawer-|open-|retries-)/.test(testId))
+        .length;
+    // The merged Automations app has no tabs; detail routes still name the daemon entity.
+    const automationActiveTab = window.location.pathname.match(
+      /^\/automations\/(jobs|triggers)(?:\/|$)/
+    )?.[1] as "jobs" | "triggers" | undefined;
+    // Catalog scope now lives in the list route URL (`?scope=`); absent means "all".
+    const automationScopeParam = new URLSearchParams(window.location.search).get("scope");
+    const automationScopeFilter = /^\/automations\/?$/.test(window.location.pathname)
+      ? automationScopeParam === "global" || automationScopeParam === "workspace"
+        ? automationScopeParam
+        : ("all" as const)
+      : undefined;
+    const topbarTitle = readText("topbar-title-text");
+    const automationSelectedItem = document.querySelector('[data-testid="automation-detail-panel"]')
+      ? topbarTitle
+      : undefined;
+    // The one editor form names the daemon entity its Starts choice saves as.
+    const automationEditorEntity = document
+      .querySelector('[data-testid="automation-form"]')
+      ?.getAttribute("data-entity");
+    const automationEditorKind =
+      automationEditorEntity === "job" || automationEditorEntity === "trigger"
+        ? automationEditorEntity
+        : undefined;
+    const tasksActiveMode = (["dashboard", "inbox", "kanban", "list"] as const).find(
+      mode =>
+        document.querySelector(`[data-testid="tasks-mode-${mode}"][aria-current="page"]`) !== null
+    );
+    const tasksSelectedTask = readPathContainerId(/\/tasks\/([^/?#]+)/);
+    const tasksSelectedRun = readPathContainerId(/\/tasks\/[^/]+\/runs\/([^/?#]+)/);
+    const tasksViewVisible =
+      document.querySelector('[data-testid="tasks-dashboard-view"]') !== null ||
+      document.querySelector('[data-testid="tasks-inbox-view"]') !== null ||
+      document.querySelector('[data-testid="task-list-surface"]') !== null ||
+      document.querySelector('[data-testid="tasks-detail-content"]') !== null ||
+      document.querySelector('[data-testid="tasks-run-detail-content"]') !== null ||
+      document.querySelector('[data-testid="task-editor-surface"]') !== null;
+    const tasksReviewCount = countByPrefix("tasks-run-review-");
+    const skillsDetailRouteItem = readPathContainerId(/\/marketplace\/skill\/([^/?#]+)/);
+    const skillsSelectedItem = skillsDetailRouteItem;
+    const skillsEnabledText = document
+      .querySelector<HTMLElement>("#marketplace-skill-enabled-label")
+      ?.textContent?.trim()
+      .toLowerCase();
+    const skillsEnabledState = skillsEnabledText?.includes("disabled")
+      ? "disabled"
+      : skillsEnabledText?.includes("enabled")
+        ? "enabled"
+        : undefined;
+    const settingsActiveSection = readPathContainerId(/\/settings\/([^/?#]+)/);
+
+    return {
+      url: window.location.href,
+      pathname: window.location.pathname,
+      title: document.title,
+      automation_active_tab: automationActiveTab,
+      automation_delete_visible:
+        document.querySelector('[data-testid="automation-delete-btn"]') !== null,
+      automation_detail_overflow_visible:
+        document.querySelector('[data-testid="automation-detail-overflow"]') !== null,
+      automation_enabled_toggle_visible:
+        document.querySelector('[data-testid="automation-enable-switch"]') !== null,
+      automation_editor_kind: automationEditorKind,
+      automation_editor_open:
+        document.querySelector('[data-testid="automation-editor-dialog"]') !== null,
+      automation_item_count:
+        countByPrefix("automation-row-job-") +
+        countByPrefix("automation-row-trigger-") +
+        countByPrefix("automation-card-job-") +
+        countByPrefix("automation-card-trigger-"),
+      automation_run_count: countAutomationRunCards(),
+      automation_inspect_visible:
+        document.querySelector('[data-testid="automation-inspect-btn"]') !== null,
+      automation_run_list_visible:
+        document.querySelector('[data-testid="automation-run-list"]') !== null,
+      automation_scope_filter: automationScopeFilter,
+      automation_selected_item: automationSelectedItem,
+      automation_run_now_visible:
+        document.querySelector('[data-testid="automation-run-now-btn"]') !== null,
+      // Runs expose their session link inside the expanded drawer, and only when the
+      // daemon recorded a session id.
+      automation_session_link_count: [
+        ...document.querySelectorAll<HTMLAnchorElement>(
+          'a[data-testid^="automation-run-open-"][href^="/session/"]'
+        ),
+      ].filter(link => link.closest("[hidden]") === null).length,
+      automation_view_visible:
+        document.querySelector('[data-testid="automations-shell"]') !== null ||
+        document.querySelector('[data-testid="automation-detail-panel"]') !== null,
+      chat_view_visible: document.querySelector('[data-testid="chat-view"]') !== null,
+      session_view_toggle_visible:
+        document.querySelector('[data-testid="session-view-toggle"]') !== null,
+      home_activity_count: document.querySelectorAll('[data-slot="home-activity-row"]').length,
+      home_agent_count: document.querySelectorAll('[data-slot="home-agent-row"]').length,
+      home_completed_today_value: readHomeMetricValue("Completed today"),
+      home_connection_status: document.querySelector<HTMLElement>(
+        '[data-testid="home-connection-indicator"]'
+      )?.dataset.status,
+      home_metric_count: document.querySelectorAll(
+        '[data-slot="home-kpi-strip"] [data-slot="metric"]'
+      ).length,
+      home_needs_you_value: readHomeMetricValue("Needs you"),
+      home_run_count: document.querySelectorAll('[data-slot="home-run-card"]').length,
+      home_scope_text:
+        document.querySelector<HTMLElement>('[data-slot="home-page-meta"]')?.textContent?.trim() ||
+        undefined,
+      home_usage_value: readHomeMetricValue("Usage"),
+      home_view_visible: document.querySelector('[data-testid="home-body"]') !== null,
+      home_working_now_value: readHomeMetricValue("Working now"),
+      skills_content_visible: document.querySelector('[data-testid="content-body"]') !== null,
+      skills_detail_visible:
+        skillsDetailRouteItem !== undefined &&
+        document.querySelector('[data-testid="marketplace-detail"]') !== null,
+      skills_enabled_state: skillsEnabledState,
+      skills_item_count: countByPrefix("marketplace-installed-card-"),
+      skills_search_active:
+        (document.querySelector<HTMLInputElement>('[data-testid="marketplace-kind-search-skill"]')
+          ?.value ?? "") !== "",
+      skills_selected_item: skillsSelectedItem,
+      skills_view_visible:
+        document.querySelector('[data-testid="marketplace-kind-skill"]') !== null ||
+        (skillsDetailRouteItem !== undefined &&
+          document.querySelector('[data-testid="marketplace-detail"]') !== null),
+      settings_action_result_visible:
+        document.querySelector('[data-testid^="settings-page-"][data-testid$="-action-result"]') !==
+        null,
+      settings_active_section: settingsActiveSection,
+      settings_mcp_server_count: countSettingsMCPServerRows(),
+      settings_provider_card_count: countSettingsProviderCards(),
+      settings_restart_notice_visible:
+        document.querySelector(
+          '[data-testid^="settings-page-"][data-testid$="-restart-notice"]'
+        ) !== null,
+      settings_save_bar_visible:
+        document.querySelector('[data-testid^="settings-page-"][data-testid$="-save-bar"]') !==
+        null,
+      settings_section_count: document.querySelectorAll(
+        '[data-testid="settings-section-nav"] a[data-testid^="settings-section-"]'
+      ).length,
+      settings_view_visible: document.querySelector('[data-testid="settings-shell"]') !== null,
+      vault_delete_dialog_open:
+        document.querySelector('[data-testid="settings-vault-delete"]') !== null,
+      vault_editor_open: document.querySelector('[data-testid="settings-vault-editor"]') !== null,
+      vault_secret_count: countByPrefix("vault-secrets-row"),
+      message_count: document.querySelectorAll(
+        '[data-testid="message-bubble-user"], [data-testid="message-bubble-assistant"]'
+      ).length,
+      permission_prompt_visible: document.querySelector('[data-testid="permission-dock"]') !== null,
+      processing_indicator_visible:
+        document.querySelector('[data-testid="processing-indicator"]') !== null,
+      session_name: readText("session-name"),
+      stop_button_visible: document.querySelector('[data-testid="stop-button"]') !== null,
+      tasks_active_mode: tasksActiveMode,
+      tasks_children_count: countByPrefix("tasks-detail-subtask-"),
+      tasks_dependencies_count: countByPrefix("tasks-detail-dependency-"),
+      tasks_detail_cancel_visible:
+        document.querySelector('[data-testid="tasks-detail-cancel"]') !== null,
+      tasks_detail_delete_dialog_open:
+        document.querySelector('[data-testid="tasks-detail-delete-dialog"]') !== null,
+      tasks_detail_visible: document.querySelector('[data-testid="tasks-detail-content"]') !== null,
+      tasks_inbox_count: document.querySelectorAll('[data-testid^="tasks-inbox-item-"][data-lane]')
+        .length,
+      tasks_review_count: tasksReviewCount,
+      tasks_run_cancel_visible: document.querySelector('[data-testid="tasks-run-cancel"]') !== null,
+      tasks_run_detail_visible:
+        document.querySelector('[data-testid="tasks-run-detail-content"]') !== null,
+      tasks_selected_run: tasksSelectedRun,
+      tasks_selected_task: tasksSelectedTask,
+      tasks_task_count: countByPrefix("task-card-"),
+      tasks_view_visible: tasksViewVisible,
+      tool_card_count: countByPrefix("tool-call-card"),
+    };
+  });
+}

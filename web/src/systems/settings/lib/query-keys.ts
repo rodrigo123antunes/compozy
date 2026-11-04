@@ -1,0 +1,138 @@
+import type {
+  SettingsApplyRecordsFilter,
+  SettingsAttentionFilter,
+  SettingsCmdPaletteFilter,
+  SettingsHookListFilter,
+  SettingsMCPServerListFilter,
+  SettingsMCPServerGetFilter,
+  SettingsPersonaFilter,
+  SettingsSectionName,
+  SettingsSectionSlug,
+  SettingsSkillsFilter,
+} from "../types";
+
+function normalizeText(value?: string | null): string {
+  if (value == null) {
+    return "";
+  }
+
+  const trimmed = value.trim();
+  return trimmed;
+}
+
+export type SettingsSectionKey = SettingsSectionName | SettingsSectionSlug;
+
+export const settingsKeys = {
+  all: ["settings"] as const,
+
+  sections: () => [...settingsKeys.all, "section"] as const,
+  section: (section: SettingsSectionKey) => [...settingsKeys.sections(), section] as const,
+  personaSection: (filter: SettingsPersonaFilter) =>
+    [
+      ...settingsKeys.section("persona"),
+      filter.scope ?? "",
+      normalizeText(filter.workspace_id),
+      normalizeText(filter.profile),
+    ] as const,
+  windowManagerLayoutsRoot: () => [...settingsKeys.section("window-manager"), "layouts"] as const,
+  windowManagerLayoutProfiles: (workspaceId: string, profile: string) =>
+    [
+      ...settingsKeys.windowManagerLayoutsRoot(),
+      "profiles",
+      normalizeText(workspaceId),
+      normalizeText(profile),
+    ] as const,
+  windowManagerLayoutReview: (
+    workspaceId: string,
+    profile: string,
+    revision: number,
+    fingerprint: string
+  ) =>
+    [
+      ...settingsKeys.windowManagerLayoutsRoot(),
+      "review",
+      normalizeText(workspaceId),
+      normalizeText(profile),
+      revision,
+      fingerprint,
+    ] as const,
+  // Scope AND profile are part of the key: one entry serving every profile would
+  // show another profile's source list after a lens switch.
+  skillsSection: (filter: SettingsSkillsFilter = {}) =>
+    [
+      ...settingsKeys.section("skills"),
+      filter.scope ?? "",
+      normalizeText(filter.workspace_id),
+      normalizeText(filter.profile),
+      normalizeText(filter.agent_name),
+    ] as const,
+  // Scope is part of the key: user, profile, and workspace answer differently,
+  // so one entry serving all of them would show another scope's setting.
+  cmdPaletteSection: (filter: SettingsCmdPaletteFilter = {}) =>
+    [
+      ...settingsKeys.section("cmd-palette"),
+      filter.scope ?? "",
+      normalizeText(filter.workspace_id),
+      normalizeText(filter.profile),
+    ] as const,
+  attentionSection: (filter: SettingsAttentionFilter) =>
+    [
+      ...settingsKeys.section("attention"),
+      filter.scope ?? "",
+      normalizeText(filter.profile),
+    ] as const,
+
+  rolesStatus: () => [...settingsKeys.all, "roles-status"] as const,
+
+  collections: () => [...settingsKeys.all, "collection"] as const,
+
+  providersRoot: () => [...settingsKeys.collections(), "providers"] as const,
+  providersList: () => [...settingsKeys.providersRoot(), "list"] as const,
+  providerDetail: (name: string) => [...settingsKeys.providersRoot(), "detail", name] as const,
+
+  hooksRoot: () => [...settingsKeys.collections(), "hooks"] as const,
+  hooksList: (filter: SettingsHookListFilter = {}) =>
+    [
+      ...settingsKeys.hooksRoot(),
+      "list",
+      filter.scope ?? "",
+      normalizeText(filter.workspace_id),
+      normalizeText(filter.profile),
+    ] as const,
+
+  mcpRoot: () => [...settingsKeys.collections(), "mcp-servers"] as const,
+  mcpLists: () => [...settingsKeys.mcpRoot(), "list"] as const,
+  mcpDetail: (name: string, filter: SettingsMCPServerGetFilter = {}) =>
+    [
+      ...settingsKeys.mcpRoot(),
+      "detail",
+      normalizeText(name),
+      filter.scope ?? "",
+      normalizeText(filter.workspace_id),
+      normalizeText(filter.profile),
+      normalizeText(filter.owner),
+    ] as const,
+  mcpList: (filter: SettingsMCPServerListFilter = {}) =>
+    [
+      ...settingsKeys.mcpLists(),
+      filter.scope ?? "",
+      normalizeText(filter.workspace_id),
+      normalizeText(filter.profile),
+    ] as const,
+
+  restartRoot: () => [...settingsKeys.all, "restart"] as const,
+  restartStatus: (operationId: string) => [...settingsKeys.restartRoot(), operationId] as const,
+
+  applyRoot: () => [...settingsKeys.all, "apply"] as const,
+  applyRecords: (filter: SettingsApplyRecordsFilter = {}) =>
+    [
+      ...settingsKeys.applyRoot(),
+      "records",
+      filter.status ?? "",
+      normalizeText(filter.actor),
+      filter.limit ?? "",
+    ] as const,
+
+  updateStatus: () => [...settingsKeys.all, "update"] as const,
+  updateApply: () => [...settingsKeys.all, "update", "apply"] as const,
+};

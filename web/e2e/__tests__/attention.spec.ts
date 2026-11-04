@@ -1,0 +1,629 @@
+import { randomUUID } from "node:crypto";
+import { mkdir } from "node:fs/promises";
+import path from "node:path";
+import { fileURLToPath } from "node:url";
+
+import type { Locator, Page, Route } from "@playwright/test";
+
+import { sessionWindow, setGlobalScope } from "../fixtures/os-navigation";
+import {
+  type BrowserRuntime,
+  type WorkspacePayload,
+  waitForSeedSessionActive,
+} from "../fixtures/runtime";
+import { expect, test } from "../fixtures/test";
+import { completeOnboardingIfPrompted, ensureProjectWorkspace } from "../fixtures/workspace";
+
+/**
+ * Browser journeys for the attention program (E2E-009..E2E-015).
+ *
+ * Runtime truth comes from isolated acpmock sessions. Transport overrides are
+ * limited to presentation boundaries that cannot be produced by an acpmock
+ * turn: an unavailable notification ledger and an agent that reports an unknown badge.
+ * E2E-020 (system notifications) belongs to the desktop lane.
+ */
+
+const fixtureRoot = path.resolve(
+  path.dirname(fileURLToPath(import.meta.url)),
+  "..",
+  "..",
+  "..",
+  "internal",
+  "testutil",
+  "acpmock",
+  "testdata"
+);
+const attentionFixture = path.join(fixtureRoot, "attention_truth_fixture.json");
+const faultFixture = path.join(fixtureRoot, "driver_fault_fixture.json");
+const attentionAgent = "attention-agent";
+const faultAgent = "attention-fault-agent";
+
+const bell = {
+  trigger: '[data-slot="os-menubar-bell"]',
+  popover: "os-bell-popover",
+  needsYou: "os-bell-needs-you",
+  finished: "os-bell-finished",
+  empty: "os-bell-empty",
+  disconnected: "os-bell-disconnected",
+} as const;
+
+interface SessionPayload {
+  id: string;
+  agent_name: string;
+  badge: string;
+  state: string;
+  workspace_id: string;
+}
+
+interface SessionEnvelope {
+  session: SessionPayload;
+}
+
+interface SessionsEnvelope {
+  sessions: SessionPayload[];
+  page: {
+    has_more: boolean;
+    limit: number;
+    next_cursor?: string | null;
+    total: number;
+  };
+}
+
+test.use({
+  runtimeOptions: {
+    seed: {
+      mockAgents: [
+        {
+          agentName: attentionAgent,
+          fixtureAgent: "attention",
+          fixturePath: attentionFixture,
+        },
+        {
+          agentName: faultAgent,
+          fixtureAgent: "faulty",
+          fixturePath: faultFixture,
+        },
+      ],
+    },
+  },
+});
+
+test.beforeEach(async ({ appPage: page, runtime }) => {
+  await ensureProjectWorkspace(page, runtime);
+  await completeOnboardingIfPrompted(page);
+});
+
+test.describe("E2E-009 attention bell", () => {
+  test("Should acknowledge attention durably and navigate to the session a row names", async ({
+    appPage: page,
+    runtime,
+    browserArtifacts,
+  }) => {
+    await test.step("Should separate Needs you from Finished, count only needs-you, and acknowledge durably", async () => {
+      await page.locator(bell.trigger).click();
+      await expect(page.getByTestId(bell.empty)).toContainText("All quiet");
+      await page.keyboard.press("Escape");
+      await expect(page.getByTestId(bell.popover)).toBeHidden();
+
+      const workspace = await globalWorkspace(runtime);
+      const failed = await createFailedSession(runtime, workspace);
+      const done = await createDoneSession(runtime, workspace);
+
+      await page.locator(bell.trigger).click();
+      const popover = page.getByTestId(bell.popover);
+      await expect(popover).toBeVisible();
+      await expect(popover.getByTestId(`os-attention-session-${failed.id}`)).toBeVisible();
+      await expect(popover.getByTestId(`os-attention-session-${done.id}`)).toBeVisible();
+      await expect(popover.getByTestId(bell.needsYou)).toBeVisible();
+      await expect(popover.getByTestId(bell.finished)).toBeVisible();
+
+      await expect(page.locator(bell.trigger)).toHaveAccessibleName("Attention, 1 waiting");
+      await expect(page.locator(`${bell.trigger} [data-slot="pill"]`)).toHaveText("1");
+
+      const row = popover.getByTestId(`os-attention-session-${failed.id}`);
+      await expect(row).toBeVisible();
+      await row
+        .locator("..")
+        .getByRole("button", { name: /^Mark .* as read$/ })
+        .click();
+      await expect(row).toBeHidden();
+      const source = await runtime.requestJSON<SessionEnvelope>(
+        sessionAPIPath(workspace.id, failed.id)
+      );
+      expect(source.session.badge).toBe(failed.badge);
+      expect(source.session.state).toBe(failed.state);
+      await reloadShell(page);
+      await page.locator(bell.trigger).click();
+      await expect(page.getByTestId(`os-attention-session-${failed.id}`)).toBeHidden();
+      await browserArtifacts.captureScreenshot("acknowledged-bell", page);
+      await page.keyboard.press("Escape");
+      await expect(page.getByTestId(bell.popover)).toBeHidden();
+    });
+    await test.step("Should land on the session a row names, switching workspace when needed", async () => {
+      const workspace = await createWorkspace(runtime, "attention-jump");
+      const failed = await createFailedSession(runtime, workspace);
+      await reloadShell(page);
+
+      await page.locator(bell.trigger).click();
+      await page.getByTestId(`os-attention-session-${failed.id}`).click();
+
+      await expect(page.getByTestId(bell.popover)).toBeHidden();
+      await expect(sessionWindow(page, failed.id)).toBeVisible();
+      await expect(page.locator('[data-slot="os-menubar-workspace"]')).toContainText(
+        workspace.name
+      );
+    });
+  });
+
+  test("Should state that a disconnected source is frozen and uncounted", async ({
+    appPage: page,
+  }) => {
+    // The bell reads the notification ledger, independently of the session catalog stream.
+    await page.route(/\/api\/notifications\/attention(?:\?.*)?$/, route => route.abort());
+    await Promise.all([
+      page.waitForEvent(
+        "requestfailed",
+        request => new URL(request.url()).pathname === "/api/notifications/attention"
+      ),
+      page.reload(),
+    ]);
+    await completeOnboardingIfPrompted(page);
+
+    await page.locator(bell.trigger).click();
+    await expect(page.getByTestId(bell.disconnected)).toContainText(
+      "Some notifications can't update right now."
+    );
+  });
+});
+
+test.describe("E2E-010 needs-you toasts", () => {
+  test("Should toast an unfocused session and land on it when activated", async ({
+    appPage: page,
+    runtime,
+  }) => {
+    const workspace = await globalWorkspace(runtime);
+    const session = await createSession(runtime, workspace, faultAgent);
+    await promptSession(runtime, session, "trigger crash mid-stream");
+    await waitForBadge(runtime, session.id, "failed");
+
+    const toast = page.getByTestId("os-attention-toast-needs-you").first();
+    await expect(toast).toBeVisible();
+    await toast.click();
+    await expect(sessionWindow(page, session.id)).toBeVisible();
+  });
+
+  test("Should stay silent for the session already on screen", async ({
+    appPage: page,
+    runtime,
+  }) => {
+    const workspace = await globalWorkspace(runtime);
+    const session = await createSession(runtime, workspace, faultAgent);
+    await page.goto(runtime.url(sessionPath(faultAgent, session.id)), {
+      waitUntil: "domcontentloaded",
+    });
+    await expect(sessionWindow(page, session.id)).toBeVisible();
+
+    await promptSession(runtime, session, "trigger crash mid-stream");
+    await waitForBadge(runtime, session.id, "failed");
+    await expect(page.getByTestId("os-attention-toast-needs-you")).toHaveCount(0);
+  });
+});
+
+test.describe("E2E-011 coalesced completions", () => {
+  test("Should group near-simultaneous completions into one toast opening the bell", async ({
+    appPage: page,
+    runtime,
+  }) => {
+    const workspace = await globalWorkspace(runtime);
+    const first = await createSession(runtime, workspace, attentionAgent);
+    const second = await createSession(runtime, workspace, attentionAgent);
+
+    await Promise.all([
+      promptSession(runtime, first, "complete turn"),
+      promptSession(runtime, second, "complete turn"),
+    ]);
+    await Promise.all([
+      waitForBadge(runtime, first.id, "done"),
+      waitForBadge(runtime, second.id, "done"),
+    ]);
+
+    const grouped = page.getByTestId("os-attention-toast-finished").first();
+    await expect(grouped).toContainText("2 sessions finished");
+    await grouped.getByRole("button", { name: "Review finished" }).click();
+    await expect(page.getByTestId(bell.finished)).toBeVisible();
+  });
+});
+
+test.describe("Sessions Kanban E2E-004 waiting is not done", () => {
+  test("Should hold the finished toast while a child works, then fire it once", async ({
+    appPage: page,
+    runtime,
+  }) => {
+    const workspace = await globalWorkspace(runtime);
+    const coordinator = await createSession(runtime, workspace, attentionAgent);
+    const created = await runtime.requestJSON<SessionEnvelope>("/api/sessions", {
+      method: "POST",
+      body: JSON.stringify({
+        agent_name: attentionAgent,
+        workspace: workspace.id,
+        parent_session_id: coordinator.id,
+      }),
+    });
+    await waitForSeedSessionActive(runtime, created.session.id);
+
+    // The coordinator settles its turn while its child is live: waiting, not done.
+    await promptSession(runtime, coordinator, "complete turn");
+    const waiting = await waitForBadge(runtime, coordinator.id, "waiting");
+    expect((waiting as SessionPayload & { waiting_on?: string }).waiting_on).toBe("sessions");
+    const modal = await openSessionsModal(page);
+    const row = modal.getByTestId(`os-sessions-modal-session-${coordinator.id}`);
+    const mark = row.getByRole("img", { name: "Session badge: waiting" });
+    await expect(mark).toHaveAttribute("data-waiting-on", "sessions");
+    await expect(row.locator("..")).toContainText("Waiting on sessions");
+    await page.keyboard.press("Escape");
+    await expect(modal).toBeHidden();
+    // A whole coalescing window passes without a finished delivery.
+    await page.waitForTimeout(6_000);
+    await expect(page.getByTestId("os-attention-toast-finished")).toHaveCount(0);
+
+    // The last child stops: the coordinator becomes done by itself and announces it once.
+    const stopped = await fetch(
+      runtime.url(sessionAPIPath(workspace.id, created.session.id, "/stop")),
+      { method: "POST" }
+    );
+    expect(stopped.ok).toBe(true);
+    await waitForBadge(runtime, coordinator.id, "done");
+    const toast = page.getByTestId("os-attention-toast-finished");
+    await expect(toast).toHaveCount(1);
+    await expect(toast).toContainText("Finished while you were away");
+  });
+});
+
+test.describe("E2E-012 tab title count", () => {
+  test("Should carry the cross-workspace needs-you total across navigation and clear at zero", async ({
+    appPage: page,
+    runtime,
+  }) => {
+    const workspace = await createWorkspace(runtime, "attention-title");
+    await createFailedSession(runtime, workspace);
+    await expect(page).toHaveTitle(/^\(1\) /);
+    const before = await page.title();
+    await page.goto(runtime.url("/settings/attention"));
+    await expect(page).toHaveTitle(before);
+
+    await page.locator(bell.trigger).click();
+    await page.getByTestId(bell.popover).getByRole("button", { name: "Clear all" }).click();
+    await expect(page).not.toHaveTitle(/^\(/);
+  });
+});
+
+test.describe("E2E-013 Settings → Attention", () => {
+  test("Should show platform state and persist delivery toggles and workspace muting", async ({
+    appPage: page,
+    runtime,
+  }) => {
+    await test.step("Should render the system channel's real platform state", async () => {
+      await page.goto(runtime.url("/settings/attention"));
+      await expect(
+        page.getByTestId(/^settings-attention-system-(default|denied|unsupported)$/)
+      ).toBeVisible();
+      await expect(page.getByTestId("settings-attention-system")).toHaveAttribute(
+        "aria-checked",
+        "false"
+      );
+    });
+    await test.step("Should keep a muted workspace's bell rows while silencing delivery", async () => {
+      const workspace = await createWorkspace(runtime, "attention-muted");
+      const failed = await createFailedSession(runtime, workspace);
+      await reloadShell(page);
+      await page.goto(runtime.url("/settings/attention"));
+      const muted = page.waitForResponse(
+        response =>
+          response.request().method() === "PATCH" &&
+          response.url().includes("/api/settings/attention")
+      );
+      await page.getByTestId("settings-attention-mute-picker").selectOption(workspace.id);
+      expect((await muted).ok()).toBe(true);
+      await expect(page.getByTestId(`settings-attention-unmute-${workspace.id}`)).toBeVisible();
+
+      await page.locator(bell.trigger).click();
+      await expect(page.getByTestId(`os-attention-session-${failed.id}`)).toHaveAttribute(
+        "data-muted",
+        "true"
+      );
+    });
+    await test.step("Should round-trip the delivery toggles without a save bar", async () => {
+      await page.goto(runtime.url("/settings/attention"));
+      const sound = page.getByTestId("settings-attention-sound");
+      await expect(sound).toBeVisible();
+      await expect(page.getByTestId("settings-page-attention-save-bar")).toHaveCount(0);
+
+      await sound.click();
+      await page.reload();
+      await expect(page.getByTestId("settings-attention-sound")).toHaveAttribute(
+        "aria-checked",
+        "false"
+      );
+    });
+  });
+});
+
+test.describe("E2E-014 All workspaces breadth", () => {
+  // All projects is the menubar globe (AP); the list is flat by default and Group by
+  // project gives each project its own independently loaded group.
+  test("Should widen to every workspace, grouped and labelled, and persist breadth across reload", async ({
+    appPage: page,
+    runtime,
+  }) => {
+    const first = await createWorkspace(runtime, "attention-groups-first");
+    const second = await createWorkspace(runtime, "attention-groups-second");
+    await createSession(runtime, first, attentionAgent);
+    await createSession(runtime, second, attentionAgent);
+    await reloadShell(page);
+
+    await setGlobalScope(page, true);
+    const modal = await openSessionsModal(page);
+    await groupSessionsByProject(page, modal);
+    await expect(modal.getByTestId(`os-sessions-modal-group-project:${first.id}`)).toBeVisible();
+    await expect(modal.getByTestId(`os-sessions-modal-group-project:${second.id}`)).toBeVisible();
+    await reloadShell(page);
+
+    await expect(page.getByTestId("os-global-scope-toggle")).toHaveAttribute(
+      "aria-pressed",
+      "true"
+    );
+    // Narrow again so the persisted breadth returns to its default for the suites that follow.
+    await setGlobalScope(page, false);
+  });
+
+  test("Should isolate a failing workspace instead of blanking the list", async ({
+    appPage: page,
+    runtime,
+  }) => {
+    const healthy = await createWorkspace(runtime, "attention-healthy");
+    const project = await createWorkspace(runtime, "attention-unreachable");
+    const healthySession = await createSession(runtime, healthy, attentionAgent);
+    await createSession(runtime, project, attentionAgent);
+    await reloadShell(page);
+    await failWorkspaceSessionCatalog(page, project.id);
+
+    await setGlobalScope(page, true);
+    const modal = await openSessionsModal(page);
+    await groupSessionsByProject(page, modal);
+    await expect(
+      modal.getByTestId(`os-sessions-modal-group-project:${project.id}-retry`)
+    ).toBeVisible();
+    await expect(modal.getByText("Couldn’t load sessions")).toBeVisible();
+    await expect(modal.getByTestId(`os-sessions-modal-session-${healthySession.id}`)).toBeVisible();
+    await page.keyboard.press("Escape");
+    await expect(modal).toBeHidden();
+    await setGlobalScope(page, false);
+  });
+});
+
+test.describe("E2E-015 sidebar badges and sort", () => {
+  test("Should label badges accessibly and float needs-you sessions when attention-first is chosen", async ({
+    appPage: page,
+    runtime,
+  }) => {
+    const workspace = await globalWorkspace(runtime);
+    const done = await createDoneSession(runtime, workspace);
+    const failed = await createFailedSession(runtime, workspace);
+
+    const modal = await openSessionsModal(page);
+    await expect(
+      modal.getByTestId(`os-sessions-modal-session-${failed.id}`).getByRole("img")
+    ).toHaveAttribute("aria-label", "Session badge: failed");
+    await expect(
+      modal.getByTestId(`os-sessions-modal-session-${done.id}`).getByRole("img")
+    ).toHaveAttribute("aria-label", "Session badge: done");
+    await modal.getByTestId("os-sessions-modal-view-options-trigger").click();
+    await page.getByTestId("os-sessions-modal-sort-attention").click();
+
+    const first = modal.getByTestId(/^os-sessions-modal-session-/).first();
+    await expect(first).toHaveAttribute("data-status", "failed");
+    await expect(first).toHaveAttribute("data-testid", `os-sessions-modal-session-${failed.id}`);
+    await expect(modal.getByTestId(`os-sessions-modal-session-${done.id}`)).toBeVisible();
+  });
+
+  test("Should render an unreporting session honestly as unknown", async ({
+    appPage: page,
+    runtime,
+  }) => {
+    const workspace = await globalWorkspace(runtime);
+    const session = await createSession(runtime, workspace, attentionAgent);
+    await overrideSessionBadge(page, workspace.id, session.id, "provider-state-unreported");
+    try {
+      await reloadShell(page);
+
+      const modal = await openSessionsModal(page);
+      const row = modal.getByTestId(`os-sessions-modal-session-${session.id}`);
+      await expect(row.getByRole("img")).toHaveAttribute("aria-label", "Session badge: unknown");
+      await expect(row.getByRole("img")).toHaveAttribute("data-badge", "unknown");
+    } finally {
+      await page.unrouteAll({ behavior: "ignoreErrors" });
+    }
+  });
+});
+
+async function globalWorkspace(runtime: BrowserRuntime): Promise<WorkspacePayload> {
+  if (!runtime.paths?.homeDir) {
+    throw new Error("attention E2E requires a launch-mode runtime");
+  }
+  return await runtime.resolveWorkspace(runtime.paths.workspaceDir);
+}
+
+async function createWorkspace(runtime: BrowserRuntime, label: string): Promise<WorkspacePayload> {
+  if (!runtime.paths?.homeDir) {
+    throw new Error("attention E2E requires a launch-mode runtime");
+  }
+  // Project workspaces must sit outside COMPOZY_HOME. Directories below the
+  // runtime home are internal state and are intentionally absent from the
+  // operator's workspace catalog.
+  const rootDir = `${runtime.paths.homeDir}-${label}-${randomUUID()}`;
+  await mkdir(rootDir, { recursive: true });
+  return await runtime.resolveWorkspace(rootDir);
+}
+
+async function createSession(
+  runtime: BrowserRuntime,
+  workspace: WorkspacePayload,
+  agentName: string
+): Promise<SessionPayload> {
+  const payload = await runtime.requestJSON<SessionEnvelope>("/api/sessions", {
+    method: "POST",
+    body: JSON.stringify({ agent_name: agentName, workspace: workspace.id }),
+  });
+  await waitForSeedSessionActive(runtime, payload.session.id);
+  return payload.session;
+}
+
+async function createFailedSession(
+  runtime: BrowserRuntime,
+  workspace: WorkspacePayload
+): Promise<SessionPayload> {
+  const session = await createSession(runtime, workspace, faultAgent);
+  await promptSession(runtime, session, "trigger crash mid-stream");
+  return await waitForBadge(runtime, session.id, "failed");
+}
+
+async function createDoneSession(
+  runtime: BrowserRuntime,
+  workspace: WorkspacePayload
+): Promise<SessionPayload> {
+  const session = await createSession(runtime, workspace, attentionAgent);
+  await promptSession(runtime, session, "complete turn");
+  return await waitForBadge(runtime, session.id, "done");
+}
+
+async function promptSession(
+  runtime: BrowserRuntime,
+  session: SessionPayload,
+  message: string
+): Promise<void> {
+  const response = await fetch(
+    runtime.url(sessionAPIPath(session.workspace_id, session.id, "/prompt")),
+    {
+      headers: { "content-type": "application/json" },
+      method: "POST",
+      body: JSON.stringify({
+        idempotency_key: randomUUID(),
+        message,
+        message_id: randomUUID(),
+      }),
+    }
+  );
+  if (!response.ok) {
+    throw new Error(`prompt failed with ${response.status}: ${await response.text()}`);
+  }
+  expect(response.headers.get("content-type")).toContain("text/event-stream");
+  await response.text();
+}
+
+async function waitForBadge(
+  runtime: BrowserRuntime,
+  sessionID: string,
+  badge: string
+): Promise<SessionPayload> {
+  let current: SessionPayload | undefined;
+  await expect
+    .poll(
+      async () => {
+        const payload = await runtime.requestJSON<SessionEnvelope>(
+          `/api/sessions/${encodeURIComponent(sessionID)}?include_health=true`
+        );
+        current = payload.session;
+        return payload.session.badge;
+      },
+      { timeout: 30_000 }
+    )
+    .toBe(badge);
+  if (!current) throw new Error(`session ${sessionID} never produced badge ${badge}`);
+  return current;
+}
+
+async function openSessionsModal(page: Page) {
+  await page.getByRole("menuitem", { name: "Session", exact: true }).click();
+  await expect(page.getByTestId("os-menu-session")).toBeVisible();
+  await page.getByTestId("os-menubar-command-shell.sessions.toggle").click();
+  const modal = page.getByTestId("os-sessions-modal");
+  await expect(modal).toBeVisible();
+  return modal;
+}
+
+async function reloadShell(page: Page): Promise<void> {
+  await page.reload({ waitUntil: "domcontentloaded" });
+  await completeOnboardingIfPrompted(page);
+}
+
+async function groupSessionsByProject(page: Page, modal: Locator): Promise<void> {
+  await modal.getByTestId("os-sessions-modal-view-options-trigger").click();
+  await page.getByTestId("os-sessions-modal-group-by-project").click();
+  await page.keyboard.press("Escape");
+}
+
+async function failWorkspaceSessionCatalog(page: Page, workspaceID: string): Promise<void> {
+  await page.route("**/api/**/sessions?*", async route => {
+    const url = new URL(route.request().url());
+    const ids = [url.searchParams.get("workspace_id"), ...url.searchParams.getAll("workspace_ids")];
+    if (ids.includes(workspaceID) || url.pathname.includes(`/workspaces/${workspaceID}/sessions`)) {
+      await route.fulfill({ status: 500, json: { error: "workspace unreachable" } });
+      return;
+    }
+    await route.continue();
+  });
+}
+
+async function overrideSessionBadge(
+  page: Page,
+  workspaceID: string,
+  sessionID: string,
+  badge: string
+): Promise<void> {
+  await page.route("**/api/sessions?*", async route => {
+    const url = new URL(route.request().url());
+    if (
+      url.searchParams.get("workspace_id") !== workspaceID ||
+      url.searchParams.has("attention") ||
+      url.searchParams.has("archive") ||
+      url.searchParams.has("badge")
+    ) {
+      await route.continue();
+      return;
+    }
+    const response = await fetchRouteAcrossDaemonTransition(route);
+    const payload = (await response.json()) as SessionsEnvelope;
+    await route.fulfill({
+      response,
+      json: {
+        ...payload,
+        sessions: payload.sessions.map(session =>
+          session.id === sessionID ? { ...session, badge } : session
+        ),
+      },
+    });
+  });
+}
+
+async function fetchRouteAcrossDaemonTransition(route: Route) {
+  for (let attempt = 0; attempt < 4; attempt += 1) {
+    try {
+      return await route.fetch({ maxRetries: 3 });
+    } catch (error) {
+      const retryable = String(error).includes("ECONNREFUSED");
+      if (!retryable || attempt === 3) throw error;
+      await new Promise(resolve => setTimeout(resolve, 250 * 2 ** attempt));
+    }
+  }
+  throw new Error("unreachable route fetch retry state");
+}
+
+function sessionPath(agentName: string, sessionID: string): string {
+  return `/agents/${agentName}/sessions/${sessionID}`;
+}
+
+function sessionAPIPath(workspaceID: string, sessionID: string, suffix = ""): string {
+  return `/api/workspaces/${encodeURIComponent(workspaceID)}/sessions/${encodeURIComponent(
+    sessionID
+  )}${suffix}`;
+}

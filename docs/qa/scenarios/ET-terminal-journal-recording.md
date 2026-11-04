@@ -1,0 +1,56 @@
+---
+id: ET-terminal-journal-recording
+area: ET
+title: Inspect command history and recordings
+persona: Dora
+journey: J-audit-terminal-work
+expected: Journal filters change the server query, approximate boundaries are labeled, filtered misses are distinct from an empty history, and a recording replays from its owning profile with its retention stated.
+entry_points: Terminal window head Journal toggle; terminal journal CLI; terminal recording download; terminal selection to active session composer
+qa_status: pass
+bug_ids: BUG-20260826-terminal-journal-workspace-id; BUG-20260826-terminal-config-set-unsupported; BUG-20260906-terminal-selection-resize-loop
+fix_status: fixed
+retest_status:
+fix_commits: b745ebcbcfe6
+evidence: web/e2e/__tests__/terminal.spec.ts E2E-007; docs/qa/reports/2026-08-31-terminal-stabilization.md
+last_report: docs/qa/reports/2026-08-31-terminal-stabilization.md
+overlaps:
+---
+
+reset 2026-08-31: the Journal opens from the window head's toggle (with a back affordance) — the journal tab no longer exists; the prior verdict predates that surface.
+Flagged by integrated-terminal task 06. Task 10 owns the real-user walk, evidence, and verdict.
+
+2026-08-30 CI repair flag: a visible agent-owned exec could publish its exit before its exact
+journal row became queryable. Reset for E2E-003 after terminal finalization is reordered.
+
+2026-08-30 CI repair re-walk: passed 5/5. E2E-003 observed the exited visible terminal and then
+queried the same terminal's `approved_once` row on every isolated run; the owning manager package
+also passed completely under `-race`.
+
+Walk:
+
+1. Run exact and estimated commands, then open the Journal from the window head's toggle.
+2. Filter by actor, time, terminal, and failed result; clear one filter and then all filters.
+3. Verify an empty filtered result does not claim the project has no history.
+4. Replay a recording and return to its journal row; compare the CLI and browser record.
+5. Select a bounded terminal range and send it to the active session composer; verify the `<terminal_context>` source terminal, line range, and untrusted marker survive sending.
+6. With an isolated `COMPOZY_HOME`, execute terminal commands in two registered workspaces. Verify their databases and SQLite sidecars live under `<home>/workspaces/<registered-id>/`, with no SQLite files created in either project's `.compozy/`. Reopen the stores and verify history and profile isolation; a second daemon home must have independent history. Unregister a workspace after restarting with its project root missing and verify only its home-owned database is removed. A pre-existing project-local database must remain untouched and must not be read.
+
+2026-08-30 CI repair re-walk: passed. Current-tree E2E-001 and E2E-020 proved that Bash prompt
+integration persists the operator's real command rather than its own prompt hook, both through the CLI
+journal and the profile-scoped Web journal. The PTY marker regression passed under `-race`.
+
+QA re-walk 2026-09-06: real mouse selection of two rendered terminal rows keeps the floating actions stable, sends both lines with their source terminal ID, receives the conversation reply and retains Choose/Copy when the conversation closes. The canonical E2E-008 fails on the old build and passes on the corrected one (18.2s total); packaged desktop clipboard/zoom/IME passes12.8s. See BUG-20260906-terminal-selection-resize-loop and the integrated report.
+
+SQLite audit 2026-10-09: Run retention while an unrelated writer is held and no files have expired; it must complete without acquiring the writer. With expired records, preserve surviving shared-path references and command history while removing only expired file records. The workspace database retention suite owns these checks.
+
+See [SQLite performance and contention evidence](../reports/2026-10-09-sqlite-performance.md)
+for exact verification and limits. These backend checks do not replace or promote the
+scenario's historical browser/provider verdict.
+
+Storage verification 2026-10-21: `TestOpen` and the terminal journal suite passed with real SQLite
+and `-race`, covering step 6's home/workspace partition, reopen, retired-file preservation and
+removal without a project root. The existing HTTP/WebSocket, UDS/WebSocket and ACP terminal
+integration journeys also passed with real terminal processes. This storage slice does not
+replace the historical browser recording/selection verdict.
+
+PR #973 offline regression: open an uncached journal after the browser goes offline. The unlocked journal must keep its loading region visible while its first read is paused; it must not render a blank panel. Reconnect and verify history replaces the placeholder. A journal that has never been opened remains locked and does not fetch.

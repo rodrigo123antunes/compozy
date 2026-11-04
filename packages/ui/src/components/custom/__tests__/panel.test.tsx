@@ -1,0 +1,44 @@
+import { render } from "@testing-library/react";
+import { describe, expect, it } from "vitest";
+
+import { Panel } from "../panel";
+
+describe("Panel", () => {
+  it("Should render head slots with title, meta, and right content", () => {
+    const { container } = render(
+      <Panel title="Queue health" meta="14d" right={<button type="button">Open</button>}>
+        body
+      </Panel>
+    );
+
+    expect(container.querySelector('[data-slot="panel-title"]')?.textContent).toBe("Queue health");
+    expect(container.querySelector('[data-slot="panel-meta"]')?.textContent).toBe("14d");
+    expect(container.querySelector('[data-slot="panel-right"]')?.textContent).toBe("Open");
+    expect(container.querySelector('[data-slot="panel-body"]')?.textContent).toBe("body");
+  });
+
+  it("Should omit the head entirely when no head slot is provided", () => {
+    const { container } = render(<Panel>rows</Panel>);
+
+    expect(container.querySelector('[data-slot="panel-head"]')).toBeNull();
+    expect(container.querySelector('[data-slot="panel-body"]')?.textContent).toBe("rows");
+  });
+
+  it("Should pin the foot row after the body", () => {
+    const { container } = render(<Panel foot={<a href="/tasks">View tasks</a>}>rows</Panel>);
+
+    const body = container.querySelector('[data-slot="panel-body"]');
+    const foot = container.querySelector('[data-slot="panel-foot"]');
+    expect(foot?.textContent).toBe("View tasks");
+    expect(body?.nextElementSibling).toBe(foot);
+  });
+
+  it("Should sit on the shared Surface card as a section", () => {
+    const { container } = render(<Panel title="Queue">rows</Panel>);
+    const panel = container.querySelector<HTMLElement>('[data-slot="panel"]');
+    expect(panel?.tagName).toBe("SECTION");
+    expect(panel).toHaveAttribute("data-variant", "card");
+    expect(panel).toHaveClass("bg-card", "shadow-card", "rounded-lg");
+    expect(panel).not.toHaveClass("bg-canvas");
+  });
+});

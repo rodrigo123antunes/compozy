@@ -1,0 +1,2018 @@
+// Suite: useSessionLiveTail
+// Invariants: the infinite transcript cache owns cursor/fences, preserves loaded history, and
+// retains readonly array identity while the exact message sequence is unchanged; burst intake is
+// bounded and reconciles from an authoritative cursor; Goal snapshot frames invalidate only their
+// exact read models without mutating transcript pages. Over the Kanban board (#1052) delta bursts
+// reread the session's own reads every time but the catalogs the board lists at most every 5 s.
+// Owning layer: session live-tail query orchestration.
+// Canonical suite: this hook's existing live-tail test suite.
+// Boundary IN: REST transcript pages, transcript SSE frames, Goal/command frames, and terminal frames.
+// Boundary OUT: real HTTP transport and final thread visuals.
+import {
+  focusManager,
+  QueryClient,
+  QueryClientProvider,
+  QueryObserver,
+  useQuery,
+} from "@tanstack/react-query";
+import { act, renderHook, waitFor } from "@testing-library/react";
+import { createElement, type ReactNode } from "react";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+
+import { primarySessionFixture, sessionTranscriptFixture } from "../../mocks/fixtures";
+import {
+  SessionWindowPresentationContext,
+  type SessionWindowPresentation,
+} from "../../contexts/session-window-presentation-context";
+import { sessionKeys } from "../../lib/query-keys";
+import { SESSION_BOARD_DRAWER_CATALOG_REFRESH_MS } from "../session-live-tail-runtime";
+import { invalidateSessionMutationQueries } from "../../lib/session-query-invalidation";
+import { sessionUsageOptions } from "../../lib/query-options";
+import { isSessionStreamLive } from "../../lib/session-stream-liveness";
+import type { SessionTranscriptData } from "../../lib/session-transcript-query";
+import type {
+  NormalizedSessionTranscriptResponse,
+  SessionMessage,
+  SessionPayload,
+  SessionState,
+  SessionTranscriptPage,
+} from "../../types";
+import {
+  getSessionDebugCounters,
+  resetSessionDebugTelemetry,
+  SESSION_DEBUG_EVENTS,
+} from "../../lib/session-observability";
+import { MAX_RECONNECT_ATTEMPTS } from "../session-live-tail-store-contract";
+import { createCatalogReconciler } from "../session-catalog-reconciliation";
+import { useSessionLiveTail } from "../use-session-live-tail";
+import type { SessionStreamEventSource } from "../use-session-live-tail";
+
+interface StreamCursor {
+  afterSequence?: number;
+  epoch?: number;
+  generation?: number;
+}
+
+vi.mock("../../adapters/session-api", () => ({
+  buildSessionStreamUrl: (workspaceId: string, id: string, cursor: StreamCursor = {}) => {
+    const path = `/api/workspaces/${encodeURIComponent(workspaceId)}/sessions/${encodeURIComponent(id)}/stream`;
+    const params = new URLSearchParams({ frames: "transcript" });
+    if (cursor.afterSequence !== undefined && cursor.afterSequence > 0) {
+      params.set("after_sequence", String(cursor.afterSequence));
+    }
+    if (cursor.epoch !== undefined) params.set("epoch", String(cursor.epoch));
+    if (cursor.generation !== undefined) params.set("generation", String(cursor.generation));
+    return `${path}?${params.toString()}`;
+  },
+  fetchSession: vi.fn(),
+  fetchSessionEvents: vi.fn(),
+  fetchSessionHistory: vi.fn(),
+  fetchSessionRecap: vi.fn(),
+  fetchSessionTranscript: vi.fn(),
+  fetchSessionUsage: vi.fn(),
+  fetchSessions: vi.fn(),
+  SessionApiError: class SessionApiError extends Error {},
+  SessionNotFoundError: class SessionNotFoundError extends Error {},
+}));
+
+import {
+  fetchSession,
+  fetchSessionTranscript,
+  fetchSessionUsage,
+} from "../../adapters/session-api";
+import type { SubagentRoster } from "../../lib/subagent-roster";
+
+function fixtureWorkspaceId(): string {
+  const workspaceId = primarySessionFixture.workspace_id;
+  if (!workspaceId) throw new Error("primary session fixture must include workspace_id");
+  return workspaceId;
+}
+
+const WORKSPACE_ID = fixtureWorkspaceId();
+const SESSION_ID = primarySessionFixture.id;
+const STREAM_URL = `/api/workspaces/${WORKSPACE_ID}/sessions/${SESSION_ID}/stream?frames=transcript`;
+
+class FakeSessionEventSource implements SessionStreamEventSource {
+  readonly listeners = new Map<string, Set<EventListenerOrEventListenerObject>>();
+  closed = false;
+  onmessage: ((event: MessageEvent) => void) | null = null;
+  onerror: ((event: Event) => void) | null = null;
+
+  constructor(readonly url: string) {}
+
+  addEventListener(type: string, listener: EventListenerOrEventListenerObject) {
+    const listeners = this.listeners.get(type) ?? new Set<EventListenerOrEventListenerObject>();
+    listeners.add(listener);
+    this.listeners.set(type, listeners);
+  }
+
+  removeEventListener(type: string, listener: EventListenerOrEventListenerObject) {
+    this.listeners.get(type)?.delete(listener);
+  }
+
+  emit(type: string, payload: unknown, lastEventId = "") {
+    const event = { data: JSON.stringify(payload), lastEventId } as MessageEvent;
+    for (const listener of this.listeners.get(type) ?? []) {
+      if (typeof listener === "function") listener(event);
+      else listener.handleEvent(event);
+    }
+  }
+
+  close() {
+    this.closed = true;
+  }
+}
+
+function createQueryClient(): QueryClient {
+  return new QueryClient({
+    defaultOptions: {
+      queries: { retry: false },
+      mutations: { retry: false },
+    },
+  });
+}
+
+function createWrapper(queryClient: QueryClient) {
+  return ({ children }: { children: ReactNode }) =>
+    createElement(QueryClientProvider, { client: queryClient }, children);
+}
+
+function sessionWithState(state: SessionState): SessionPayload {
+  return { ...primarySessionFixture, state };
+}
+
+function transcriptResponse(
+  messages: SessionMessage[],
+  options: {
+    epoch?: number;
+    generation?: number;
+    firstSequence?: number;
+    hasOlder?: boolean;
+    limit?: number;
+    nextBeforeSequence?: number;
+  } = {}
+): NormalizedSessionTranscriptResponse {
+  const firstSequence = options.firstSequence ?? 1;
+  const entries = messages.map((message, index) => ({
+    message,
+    sequence: firstSequence + index,
+    start_sequence: firstSequence + index,
+  }));
+  const maxSequence = entries.at(-1)?.sequence ?? 0;
+  return {
+    entries,
+    epoch: options.epoch ?? 1,
+    generation: options.generation ?? 1,
+    has_older: options.hasOlder ?? false,
+    limit: options.limit ?? Math.max(messages.length, 200),
+    max_sequence: maxSequence,
+    ...(options.nextBeforeSequence === undefined
+      ? {}
+      : { next_before_sequence: options.nextBeforeSequence }),
+  };
+}
+
+function transcriptPage(
+  messages: SessionMessage[],
+  options: Parameters<typeof transcriptResponse>[1] = {}
+): SessionTranscriptPage {
+  const response = transcriptResponse(messages, options);
+  return { ...response, cursor: response.max_sequence };
+}
+
+function seededTranscriptData(...pages: SessionTranscriptPage[]): SessionTranscriptData {
+  return { pages, pageParams: pages.map(() => undefined) };
+}
+
+function textMessage(id: string, text: string): SessionMessage {
+  return { id, role: "assistant", parts: [{ type: "text", text }] };
+}
+
+function clarifyMessage(id: string): SessionMessage {
+  return {
+    id,
+    role: "assistant",
+    parts: [
+      {
+        type: "data-compozy-event",
+        data: {
+          type: "clarify",
+          session_id: SESSION_ID,
+          turn_id: "clarify:req-1",
+          raw: {
+            status: "pending",
+            request: {
+              request_id: "req-1",
+              workspace_id: WORKSPACE_ID,
+              session_id: SESSION_ID,
+              agent_name: primarySessionFixture.agent_name,
+              question: "Which path?",
+              choices: ["Fast", "Safe"],
+              asked_at: "2026-07-16T00:00:00Z",
+              deadline: "2026-07-16T00:05:00Z",
+            },
+            at: "2026-07-16T00:00:00Z",
+          },
+        },
+      },
+    ] as unknown as SessionMessage["parts"],
+  };
+}
+
+function clarifyDeltaFrame(message: SessionMessage) {
+  return {
+    cursor: 2,
+    entries: [{ message, sequence: 2, start_sequence: 2 }],
+    epoch: 1,
+    generation: 1,
+    has_more: false,
+    max_sequence: 2,
+    session_id: SESSION_ID,
+  };
+}
+
+function renderLiveTail(
+  options: {
+    enabled?: boolean;
+    queryClient?: QueryClient;
+    sources?: FakeSessionEventSource[];
+    presentation?: SessionWindowPresentation;
+  } = {}
+) {
+  const queryClient = options.queryClient ?? createQueryClient();
+  const sources = options.sources ?? [];
+  const eventSourceFactory = (url: string) => {
+    const source = new FakeSessionEventSource(url);
+    sources.push(source);
+    return source;
+  };
+  const QueryWrapper = createWrapper(queryClient);
+  const rendered = renderHook(
+    () =>
+      useSessionLiveTail({
+        enabled: options.enabled,
+        workspaceId: WORKSPACE_ID,
+        sessionId: SESSION_ID,
+        eventSourceFactory,
+      }),
+    {
+      wrapper: ({ children }: { children: ReactNode }) =>
+        createElement(
+          SessionWindowPresentationContext,
+          { value: options.presentation ?? "window" },
+          createElement(QueryWrapper, null, children)
+        ),
+    }
+  );
+  return { ...rendered, queryClient, sources };
+}
+
+function seedActiveSession(queryClient: QueryClient) {
+  queryClient.setQueryData(
+    sessionKeys.detail(WORKSPACE_ID, SESSION_ID),
+    sessionWithState("active")
+  );
+}
+
+describe("useSessionLiveTail", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    resetSessionDebugTelemetry();
+    vi.mocked(fetchSession).mockResolvedValue(sessionWithState("active"));
+    vi.mocked(fetchSessionTranscript).mockResolvedValue(transcriptResponse([]));
+  });
+
+  afterEach(() => {
+    focusManager.setFocused(undefined);
+    vi.useRealTimers();
+    vi.restoreAllMocks();
+    resetSessionDebugTelemetry();
+  });
+
+  it("Should open the stream even when the initial transcript request fails", async () => {
+    const transcriptError = new Error("transcript endpoint returned 500");
+    vi.mocked(fetchSessionTranscript).mockRejectedValue(transcriptError);
+
+    const { result, sources } = renderLiveTail();
+
+    await waitFor(() => expect(sources).toHaveLength(1));
+    await waitFor(() => expect(result.current.isError).toBe(true));
+
+    expect(sources[0]?.url).toBe(STREAM_URL);
+    expect(result.current.error).toBe(transcriptError);
+    expect(result.current.messages).toEqual([]);
+    expect(getSessionDebugCounters()[SESSION_DEBUG_EVENTS.transcriptFetchFailed]).toBe(1);
+  });
+
+  it("Should recover a failed live transcript through the bounded polling refetch", async () => {
+    vi.useFakeTimers();
+    vi.mocked(fetchSessionTranscript)
+      .mockRejectedValueOnce(new Error("transcript endpoint returned 500"))
+      .mockResolvedValueOnce(transcriptResponse([sessionTranscriptFixture[0]!]));
+    const queryClient = createQueryClient();
+    seedActiveSession(queryClient);
+
+    const { result } = renderLiveTail({ queryClient });
+
+    await act(async () => {
+      await vi.waitFor(() => expect(result.current.isError).toBe(true));
+      await vi.advanceTimersByTimeAsync(5_000);
+      await vi.waitFor(() => expect(result.current.messages).toHaveLength(1));
+    });
+    expect(fetchSessionTranscript).toHaveBeenCalledTimes(2);
+    expect(fetchSessionTranscript).toHaveBeenNthCalledWith(
+      2,
+      WORKSPACE_ID,
+      SESSION_ID,
+      {},
+      expect.any(AbortSignal)
+    );
+  });
+
+  it("Should back off a transcript recovery that keeps failing", async () => {
+    vi.useFakeTimers();
+    vi.mocked(fetchSessionTranscript).mockRejectedValue(new Error("transcript failed validation"));
+    const queryClient = createQueryClient();
+    seedActiveSession(queryClient);
+
+    const { result } = renderLiveTail({ queryClient });
+
+    await act(async () => {
+      await vi.waitFor(() => expect(result.current.isError).toBe(true));
+    });
+    const settledCalls = vi.mocked(fetchSessionTranscript).mock.calls.length;
+    const callsAfter = async (ms: number) => {
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(ms);
+      });
+      return vi.mocked(fetchSessionTranscript).mock.calls.length - settledCalls;
+    };
+
+    expect(await callsAfter(5_000)).toBe(1);
+    expect(await callsAfter(5_000)).toBe(1);
+    expect(await callsAfter(5_000)).toBe(2);
+    expect(await callsAfter(20_000)).toBe(3);
+    expect(await callsAfter(40_000)).toBe(4);
+    expect(await callsAfter(60_000)).toBe(5);
+    expect(await callsAfter(60_000)).toBe(6);
+  });
+
+  it("Should start repair retries at the base delay and back off", async () => {
+    vi.useFakeTimers();
+    const queryClient = createQueryClient();
+    seedActiveSession(queryClient);
+    const { result, sources } = renderLiveTail({ queryClient });
+    await act(async () => {
+      await vi.waitFor(() => expect(sources).toHaveLength(1));
+      await vi.waitFor(() => expect(result.current.isPending).toBe(false));
+    });
+    const repairTimes: number[] = [];
+    vi.mocked(fetchSessionTranscript).mockImplementation(async () => {
+      repairTimes.push(Date.now());
+      throw new Error("transcript failed validation");
+    });
+
+    // A malformed message envelope cannot be salvaged by dropping parts, so the frame
+    // fails to apply and the store repairs from the transcript.
+    const malformed = {
+      ...textMessage("m-bad", "bad"),
+      role: "bogus",
+    } as unknown as SessionMessage;
+    act(() => sources[0]?.emit("transcript_delta", clarifyDeltaFrame(malformed), "2"));
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(40_000);
+    });
+
+    const gaps = repairTimes.slice(1).map((time, index) => time - repairTimes[index]!);
+    expect(gaps).toEqual([5_000, 10_000, 20_000]);
+  });
+
+  it("Should finish an active transcript recovery before applying a terminal frame", async () => {
+    vi.useFakeTimers();
+    vi.mocked(fetchSession)
+      .mockResolvedValueOnce(sessionWithState("active"))
+      .mockResolvedValue(sessionWithState("stopped"));
+    let recoveryResolved = false;
+    let abortedBeforeResolution = false;
+    let resolveRecovery: ((response: NormalizedSessionTranscriptResponse) => void) | undefined;
+    vi.mocked(fetchSessionTranscript)
+      .mockRejectedValueOnce(new Error("transcript endpoint returned 500"))
+      .mockImplementationOnce(
+        (_workspaceId, _sessionId, _query, signal) =>
+          new Promise((resolve, reject) => {
+            resolveRecovery = resolve;
+            signal?.addEventListener(
+              "abort",
+              () => {
+                abortedBeforeResolution = !recoveryResolved;
+                reject(new DOMException("Aborted", "AbortError"));
+              },
+              { once: true }
+            );
+          })
+      );
+    const queryClient = createQueryClient();
+    seedActiveSession(queryClient);
+    const { result, sources } = renderLiveTail({ queryClient });
+
+    await act(async () => {
+      await vi.waitFor(() => expect(result.current.isError).toBe(true));
+      await vi.advanceTimersByTimeAsync(5_000);
+      await vi.waitFor(() => expect(fetchSessionTranscript).toHaveBeenCalledTimes(2));
+    });
+
+    act(() => {
+      sources[0]?.emit(
+        "session_stopped",
+        {
+          agent_name: primarySessionFixture.agent_name,
+          content: {},
+          id: "session-stopped-during-recovery",
+          sequence: 2,
+          session_id: SESSION_ID,
+          spawn_depth: 0,
+          timestamp: "2026-07-07T12:00:00Z",
+          turn_id: "turn-terminal",
+          type: "session_stopped",
+        },
+        "2"
+      );
+    });
+
+    expect(sources[0]?.closed).toBe(true);
+    expect(abortedBeforeResolution).toBe(false);
+    expect(resolveRecovery).toBeTypeOf("function");
+
+    await act(async () => {
+      queryClient.setQueryData(
+        sessionKeys.transcript(WORKSPACE_ID, SESSION_ID),
+        seededTranscriptData(transcriptPage([]))
+      );
+      await vi.waitFor(() => expect(result.current.isError).toBe(false));
+    });
+    expect(
+      queryClient.getQueryData<SessionPayload>(sessionKeys.detail(WORKSPACE_ID, SESSION_ID))?.state
+    ).toBe("active");
+
+    await act(async () => {
+      recoveryResolved = true;
+      resolveRecovery?.(transcriptResponse([sessionTranscriptFixture[0]!]));
+      await vi.waitFor(() =>
+        expect(
+          queryClient.getQueryData<SessionPayload>(sessionKeys.detail(WORKSPACE_ID, SESSION_ID))
+            ?.state
+        ).toBe("stopped")
+      );
+    });
+    expect(result.current.messages).toHaveLength(1);
+    expect(abortedBeforeResolution).toBe(false);
+  });
+
+  it("Should append older pages and preserve them across a same-fence snapshot", async () => {
+    vi.mocked(fetchSessionTranscript)
+      .mockResolvedValueOnce(
+        transcriptResponse([sessionTranscriptFixture[1]!], {
+          firstSequence: 20,
+          hasOlder: true,
+          nextBeforeSequence: 20,
+        })
+      )
+      .mockResolvedValueOnce(
+        transcriptResponse([sessionTranscriptFixture[0]!], { firstSequence: 1 })
+      );
+    const queryClient = createQueryClient();
+    seedActiveSession(queryClient);
+    const { result, sources } = renderLiveTail({ queryClient });
+
+    await waitFor(() => expect(result.current.messages).toHaveLength(1));
+    act(() => result.current.loadOlder());
+    await waitFor(() => expect(result.current.messages).toHaveLength(2));
+    expect(fetchSessionTranscript).toHaveBeenNthCalledWith(
+      2,
+      WORKSPACE_ID,
+      SESSION_ID,
+      { before_sequence: 20 },
+      expect.any(AbortSignal)
+    );
+
+    act(() => {
+      sources[0]?.emit(
+        "transcript_snapshot",
+        {
+          entries: [
+            {
+              message: sessionTranscriptFixture[2]!,
+              sequence: 30,
+              start_sequence: 30,
+            },
+          ],
+          epoch: 1,
+          generation: 1,
+          has_older: true,
+          max_sequence: 30,
+          next_before_sequence: 20,
+          reset: false,
+          session_id: SESSION_ID,
+        },
+        "30"
+      );
+    });
+
+    await waitFor(() => expect(result.current.messages).toHaveLength(3));
+    expect(result.current.messages.map(message => message.id)).toEqual([
+      sessionTranscriptFixture[0]?.id,
+      sessionTranscriptFixture[1]?.id,
+      sessionTranscriptFixture[2]?.id,
+    ]);
+    expect(
+      queryClient.getQueryData<SessionTranscriptData>(
+        sessionKeys.transcript(WORKSPACE_ID, SESSION_ID)
+      )?.pages
+    ).toHaveLength(2);
+  });
+
+  // Invariant (BUG-20260906-promoted-turn-missing-live): a mutation's transcript reread
+  // (the detail-prefix invalidation every busy verb settles through) never drops entries
+  // the live stream already applied — the refetched head reconciles by start sequence and
+  // keeps the stream cursor; only a reread from another epoch/generation replaces the load.
+  // Owner: `sessionTranscriptOptions` over the live-tail cache. Boundary IN: REST page +
+  // SSE delta; boundary OUT: the thread's messages and the stream cursor.
+  it("Should keep live-applied entries when a mutation reread refetches the transcript", async () => {
+    vi.mocked(fetchSessionTranscript).mockResolvedValue(
+      transcriptResponse([sessionTranscriptFixture[0]!, sessionTranscriptFixture[1]!], {
+        firstSequence: 1,
+      })
+    );
+    const queryClient = createQueryClient();
+    seedActiveSession(queryClient);
+    const { result, sources } = renderLiveTail({ queryClient });
+    await waitFor(() => expect(result.current.messages).toHaveLength(2));
+
+    act(() => {
+      sources[0]?.emit(
+        "transcript_delta",
+        {
+          cursor: 3,
+          entries: [{ message: sessionTranscriptFixture[2]!, sequence: 3, start_sequence: 3 }],
+          epoch: 1,
+          generation: 1,
+          has_more: false,
+          max_sequence: 3,
+          session_id: SESSION_ID,
+        },
+        "3"
+      );
+    });
+    await waitFor(() => expect(result.current.messages).toHaveLength(3));
+
+    // The daemon answers the reread from before the delta materialized: the
+    // stream already carried entry 3 and will not carry it again.
+    await act(async () => {
+      await invalidateSessionMutationQueries(queryClient, WORKSPACE_ID, SESSION_ID);
+    });
+    await waitFor(() => expect(fetchSessionTranscript).toHaveBeenCalledTimes(2));
+    expect(result.current.messages.map(message => message.id)).toEqual([
+      sessionTranscriptFixture[0]?.id,
+      sessionTranscriptFixture[1]?.id,
+      sessionTranscriptFixture[2]?.id,
+    ]);
+    const head = queryClient.getQueryData<SessionTranscriptData>(
+      sessionKeys.transcript(WORKSPACE_ID, SESSION_ID)
+    )?.pages[0];
+    expect(head?.cursor).toBe(3);
+    expect(head?.max_sequence).toBe(3);
+
+    // A reread from another generation is a history rewrite and replaces the load.
+    vi.mocked(fetchSessionTranscript).mockResolvedValue(
+      transcriptResponse([sessionTranscriptFixture[3]!], { firstSequence: 1, generation: 2 })
+    );
+    await act(async () => {
+      await invalidateSessionMutationQueries(queryClient, WORKSPACE_ID, SESSION_ID);
+    });
+    await waitFor(() =>
+      expect(result.current.messages.map(message => message.id)).toEqual([
+        sessionTranscriptFixture[3]?.id,
+      ])
+    );
+  });
+
+  it("Should not poll immutable older pages while the healthy SSE stream is open", async () => {
+    vi.useFakeTimers();
+    vi.mocked(fetchSessionTranscript)
+      .mockResolvedValueOnce(
+        transcriptResponse([sessionTranscriptFixture[1]!], {
+          firstSequence: 20,
+          hasOlder: true,
+          nextBeforeSequence: 20,
+        })
+      )
+      .mockResolvedValueOnce(
+        transcriptResponse([sessionTranscriptFixture[0]!], { firstSequence: 1 })
+      );
+    const queryClient = createQueryClient();
+    seedActiveSession(queryClient);
+    const { result } = renderLiveTail({ queryClient });
+
+    await act(async () => {
+      await vi.waitFor(() => expect(result.current.messages).toHaveLength(1));
+      result.current.loadOlder();
+      await vi.waitFor(() => expect(result.current.messages).toHaveLength(2));
+    });
+    vi.mocked(fetchSessionTranscript).mockClear();
+
+    await act(async () => vi.advanceTimersByTimeAsync(20_000));
+
+    expect(fetchSessionTranscript).not.toHaveBeenCalled();
+    expect(result.current.messages).toHaveLength(2);
+  });
+
+  // Invariant: the live edge owns transcript freshness, while explicit invalidation and a
+  // disconnected observer still reread every retained page. Owner: transcript query policy;
+  // canonical suite: useSessionLiveTail (real Query observers, adapter-boundary I/O mocks).
+  it("Should reuse live transcript pages on focus and mount but reread after disconnect", async () => {
+    const queryClient = createQueryClient();
+    seedActiveSession(queryClient);
+    const key = sessionKeys.transcript(WORKSPACE_ID, SESSION_ID);
+    const head = transcriptPage([sessionTranscriptFixture[1]!], {
+      firstSequence: 20,
+      hasOlder: true,
+      nextBeforeSequence: 20,
+    });
+    const older = transcriptPage([sessionTranscriptFixture[0]!]);
+    queryClient.setQueryData(key, seededTranscriptData(head, older));
+    vi.mocked(fetchSessionTranscript).mockImplementation(async (_workspace, _id, params) =>
+      params?.before_sequence === 20 ? older : head
+    );
+    const { result, sources } = renderLiveTail({ queryClient });
+    await waitFor(() => expect(result.current.messages).toHaveLength(2));
+    act(() =>
+      sources[0]?.emit("transcript_delta", {
+        cursor: 20,
+        entries: [],
+        epoch: 1,
+        generation: 1,
+        has_more: false,
+        max_sequence: 20,
+        session_id: SESSION_ID,
+      })
+    );
+    await waitFor(() => expect(isSessionStreamLive(SESSION_ID)).toBe(true));
+    const expireTranscript = () => {
+      queryClient.setQueryData(key, queryClient.getQueryData(key), {
+        updatedAt: Date.now() - 20_000,
+      });
+    };
+    await act(async () => {
+      expireTranscript();
+      focusManager.setFocused(false);
+      focusManager.setFocused(true);
+    });
+    expect(fetchSessionTranscript).not.toHaveBeenCalled();
+
+    const background = renderLiveTail({ queryClient, enabled: false });
+    await waitFor(() => expect(background.result.current.messages).toHaveLength(2));
+    expect(fetchSessionTranscript).not.toHaveBeenCalled();
+
+    await act(async () => {
+      await queryClient.invalidateQueries({ queryKey: key, exact: true });
+    });
+    expect(fetchSessionTranscript).toHaveBeenCalledTimes(2);
+    expect(result.current.messages.map(message => message.id)).toEqual([
+      sessionTranscriptFixture[0]?.id,
+      sessionTranscriptFixture[1]?.id,
+    ]);
+
+    act(() => sources[0]?.onerror?.(new Event("error")));
+    await waitFor(() => expect(isSessionStreamLive(SESSION_ID)).toBe(false));
+    await act(async () => {
+      expireTranscript();
+      focusManager.setFocused(false);
+      focusManager.setFocused(true);
+    });
+    await waitFor(() => expect(fetchSessionTranscript).toHaveBeenCalledTimes(4));
+    expect(result.current.messages).toHaveLength(2);
+    background.unmount();
+  });
+
+  it("Should replace every loaded page only for an explicit reset snapshot", async () => {
+    vi.useFakeTimers();
+    const queryClient = createQueryClient();
+    seedActiveSession(queryClient);
+    queryClient.setQueryData(
+      sessionKeys.transcript(WORKSPACE_ID, SESSION_ID),
+      seededTranscriptData(
+        transcriptPage([sessionTranscriptFixture[1]!], {
+          firstSequence: 20,
+          hasOlder: true,
+          nextBeforeSequence: 20,
+        }),
+        transcriptPage([sessionTranscriptFixture[0]!], { firstSequence: 1 })
+      )
+    );
+    const { result, sources } = renderLiveTail({ queryClient });
+    await act(async () => {
+      await vi.waitFor(() => expect(sources).toHaveLength(1));
+    });
+
+    act(() => {
+      sources[0]?.emit(
+        "transcript_snapshot",
+        {
+          entries: [
+            {
+              message: sessionTranscriptFixture[2]!,
+              sequence: 5,
+              start_sequence: 5,
+            },
+          ],
+          epoch: 2,
+          generation: 1,
+          has_older: false,
+          max_sequence: 5,
+          reason: "epoch_mismatch",
+          reset: true,
+          session_id: SESSION_ID,
+        },
+        "5"
+      );
+    });
+    await act(async () => {
+      await vi.waitFor(() =>
+        expect(result.current.messages.map(message => message.id)).toEqual([
+          sessionTranscriptFixture[2]?.id,
+        ])
+      );
+    });
+
+    expect(
+      queryClient.getQueryData<SessionTranscriptData>(
+        sessionKeys.transcript(WORKSPACE_ID, SESSION_ID)
+      )?.pages
+    ).toHaveLength(1);
+    act(() => sources[0]?.onerror?.(new Event("error")));
+    await act(async () => vi.advanceTimersByTimeAsync(250));
+    expect(sources[1]?.url).toBe(`${STREAM_URL}&after_sequence=5&epoch=2&generation=1`);
+  });
+
+  it("Should order and deduplicate delta batches by stable start sequence", async () => {
+    vi.mocked(fetchSessionTranscript).mockResolvedValue(
+      transcriptResponse([sessionTranscriptFixture[0]!, sessionTranscriptFixture[1]!], {
+        firstSequence: 4,
+      })
+    );
+    const revisedSecond = {
+      ...sessionTranscriptFixture[1]!,
+      parts: [{ type: "text", text: "Revised launch summary.", state: "done" }],
+    } as SessionMessage;
+    const { result, sources } = renderLiveTail();
+    await waitFor(() => expect(result.current.messages).toHaveLength(2));
+
+    act(() => {
+      sources[0]?.emit(
+        "transcript_delta",
+        {
+          cursor: 8,
+          entries: [
+            { message: sessionTranscriptFixture[2]!, sequence: 7, start_sequence: 7 },
+            { message: revisedSecond, sequence: 8, start_sequence: 5 },
+          ],
+          epoch: 1,
+          generation: 1,
+          has_more: false,
+          max_sequence: 8,
+          session_id: SESSION_ID,
+        },
+        "8"
+      );
+    });
+
+    await waitFor(() => expect(result.current.messages).toHaveLength(3));
+    expect(result.current.messages.map(message => message.id)).toEqual([
+      sessionTranscriptFixture[0]?.id,
+      sessionTranscriptFixture[1]?.id,
+      sessionTranscriptFixture[2]?.id,
+    ]);
+    expect(JSON.stringify(result.current.messages[1])).toContain("Revised launch summary");
+  });
+
+  it("Should reconcile and reconnect when transcript intake outruns ordered application", async () => {
+    const queryClient = createQueryClient();
+    seedActiveSession(queryClient);
+    const { result, sources } = renderLiveTail({ queryClient });
+    await waitFor(() => expect(result.current.status).toBe("success"));
+    await waitFor(() => expect(sources).toHaveLength(1));
+
+    vi.mocked(fetchSessionTranscript).mockClear();
+    vi.mocked(fetchSessionTranscript).mockResolvedValue(
+      transcriptResponse([textMessage("reconciled", "Authoritative tail")], {
+        firstSequence: 300,
+      })
+    );
+
+    act(() => {
+      for (let sequence = 1; sequence <= 256; sequence += 1) {
+        sources[0]?.emit(
+          "transcript_delta",
+          {
+            cursor: sequence,
+            entries: [],
+            epoch: 1,
+            generation: 1,
+            has_more: false,
+            max_sequence: sequence,
+            session_id: SESSION_ID,
+          },
+          String(sequence)
+        );
+      }
+    });
+
+    await waitFor(() => expect(sources[0]?.closed).toBe(true));
+    await waitFor(() => expect(fetchSessionTranscript).toHaveBeenCalledTimes(1));
+    await waitFor(() => expect(sources).toHaveLength(2));
+    expect(sources[1]?.url).toBe(`${STREAM_URL}&after_sequence=300&epoch=1&generation=1`);
+    await waitFor(() => expect(result.current.messages[0]?.id).toBe("reconciled"));
+  });
+
+  it("Should keep every page bounded while rolling live overflow into loaded history", async () => {
+    const messages = Array.from({ length: 6 }, (_, index) =>
+      textMessage(`bounded-${index + 1}`, `Bounded message ${index + 1}`)
+    );
+    const queryClient = createQueryClient();
+    seedActiveSession(queryClient);
+    queryClient.setQueryData(
+      sessionKeys.transcript(WORKSPACE_ID, SESSION_ID),
+      seededTranscriptData(
+        transcriptPage(messages.slice(2, 4), {
+          firstSequence: 3,
+          hasOlder: true,
+          nextBeforeSequence: 3,
+          limit: 2,
+        }),
+        transcriptPage(messages.slice(0, 2), { firstSequence: 1, limit: 2 })
+      )
+    );
+    const { result, sources } = renderLiveTail({ queryClient });
+    await waitFor(() => expect(result.current.messages).toHaveLength(4));
+
+    act(() => {
+      sources[0]?.emit(
+        "transcript_delta",
+        {
+          cursor: 6,
+          entries: [
+            { message: messages[4]!, sequence: 5, start_sequence: 5 },
+            { message: messages[5]!, sequence: 6, start_sequence: 6 },
+          ],
+          epoch: 1,
+          generation: 1,
+          has_more: false,
+          max_sequence: 6,
+          session_id: SESSION_ID,
+        },
+        "6"
+      );
+    });
+    await waitFor(() => expect(result.current.messages).toHaveLength(6));
+
+    let data = queryClient.getQueryData<SessionTranscriptData>(
+      sessionKeys.transcript(WORKSPACE_ID, SESSION_ID)
+    );
+    expect(data?.pages.map(page => page.entries.length)).toEqual([2, 2, 2]);
+    expect(data?.pages[0]?.cursor).toBe(6);
+    expect(result.current.messages.map(message => message.id)).toEqual(
+      messages.map(message => message.id)
+    );
+
+    const revisedFourth = textMessage("bounded-4", "Bounded message 4 revised");
+    act(() => {
+      sources[0]?.emit(
+        "transcript_delta",
+        {
+          cursor: 8,
+          entries: [{ message: revisedFourth, sequence: 8, start_sequence: 4 }],
+          epoch: 1,
+          generation: 1,
+          has_more: false,
+          max_sequence: 8,
+          session_id: SESSION_ID,
+        },
+        "8"
+      );
+    });
+    await waitFor(() =>
+      expect(JSON.stringify(result.current.messages)).toContain("Bounded message 4 revised")
+    );
+
+    data = queryClient.getQueryData<SessionTranscriptData>(
+      sessionKeys.transcript(WORKSPACE_ID, SESSION_ID)
+    );
+    expect(data?.pages.every(page => page.entries.length <= page.limit)).toBe(true);
+    expect(data?.pages[0]?.cursor).toBe(8);
+    expect(result.current.messages).toHaveLength(6);
+  });
+
+  it("Should advance the cache cursor for an empty delta and reconnect from cache fences", async () => {
+    vi.useFakeTimers();
+    const queryClient = createQueryClient();
+    seedActiveSession(queryClient);
+    const { result, sources } = renderLiveTail({ queryClient });
+    await act(async () => {
+      await vi.waitFor(() => expect(result.current.status).toBe("success"));
+    });
+
+    act(() => {
+      sources[0]?.emit(
+        "transcript_delta",
+        {
+          cursor: 12,
+          entries: [],
+          epoch: 1,
+          generation: 1,
+          has_more: false,
+          max_sequence: 12,
+          session_id: SESSION_ID,
+        },
+        "12"
+      );
+    });
+    await act(async () => {
+      await vi.waitFor(() => {
+        const data = queryClient.getQueryData<SessionTranscriptData>(
+          sessionKeys.transcript(WORKSPACE_ID, SESSION_ID)
+        );
+        expect(data?.pages[0]?.cursor).toBe(12);
+      });
+    });
+
+    act(() => sources[0]?.onerror?.(new Event("error")));
+    await act(async () => vi.advanceTimersByTimeAsync(250));
+    expect(sources[1]?.url).toBe(`${STREAM_URL}&after_sequence=12&epoch=1&generation=1`);
+  });
+
+  it("Should read an externally advanced cache cursor when reconnecting", async () => {
+    vi.useFakeTimers();
+    const queryClient = createQueryClient();
+    seedActiveSession(queryClient);
+    queryClient.setQueryData(
+      sessionKeys.transcript(WORKSPACE_ID, SESSION_ID),
+      seededTranscriptData(transcriptPage([], { epoch: 4, generation: 7 }))
+    );
+    const { sources } = renderLiveTail({ queryClient });
+    await act(async () => {
+      await vi.waitFor(() => expect(sources).toHaveLength(1));
+    });
+    queryClient.setQueryData<SessionTranscriptData>(
+      sessionKeys.transcript(WORKSPACE_ID, SESSION_ID),
+      existing => {
+        const head = existing?.pages[0];
+        return existing && head
+          ? { ...existing, pages: [{ ...head, cursor: 44 }, ...existing.pages.slice(1)] }
+          : existing;
+      }
+    );
+
+    act(() => sources[0]?.onerror?.(new Event("error")));
+    await act(async () => vi.advanceTimersByTimeAsync(250));
+    expect(sources[1]?.url).toBe(`${STREAM_URL}&after_sequence=44&epoch=4&generation=7`);
+  });
+
+  it("Should invalidate Goal without advancing the transcript cursor or replacing pages", async () => {
+    vi.useFakeTimers();
+    const queryClient = createQueryClient();
+    seedActiveSession(queryClient);
+    const transcriptKey = sessionKeys.transcript(WORKSPACE_ID, SESSION_ID);
+    const goalKey = sessionKeys.goal(WORKSPACE_ID, SESSION_ID);
+    queryClient.setQueryData(
+      transcriptKey,
+      seededTranscriptData(
+        transcriptPage([textMessage("tail-3", "Tail 3"), textMessage("tail-4", "Tail 4")], {
+          firstSequence: 3,
+          hasOlder: true,
+          limit: 2,
+          nextBeforeSequence: 3,
+        }),
+        transcriptPage([textMessage("older-1", "Older 1"), textMessage("older-2", "Older 2")], {
+          firstSequence: 1,
+          limit: 2,
+        })
+      )
+    );
+    queryClient.setQueryData(goalKey, null);
+
+    const { result, sources } = renderLiveTail({ queryClient });
+    await act(async () => {
+      await vi.waitFor(() => {
+        expect(sources).toHaveLength(1);
+        expect(result.current.status).toBe("success");
+      });
+    });
+
+    const transcriptBefore = queryClient.getQueryData<SessionTranscriptData>(transcriptKey);
+    const invalidateQueries = vi.spyOn(queryClient, "invalidateQueries");
+
+    act(() => {
+      sources[0]?.emit(
+        "goal_snapshot_changed",
+        {
+          bound_session_id: SESSION_ID,
+          cause: "status",
+          revision: 7,
+          run_id: "run-goal-1",
+          session_id: SESSION_ID,
+        },
+        "99"
+      );
+    });
+
+    expect(invalidateQueries).toHaveBeenCalledWith({
+      queryKey: goalKey,
+      exact: true,
+    });
+    expect(queryClient.getQueryData<SessionTranscriptData>(transcriptKey)).toBe(transcriptBefore);
+    expect(
+      transcriptBefore?.pages.map(page => page.entries.map(entry => entry.start_sequence))
+    ).toEqual([
+      [3, 4],
+      [1, 2],
+    ]);
+
+    act(() => sources[0]?.onerror?.(new Event("error")));
+    await act(async () => vi.advanceTimersByTimeAsync(250));
+
+    expect(sources[1]?.url).toBe(`${STREAM_URL}&after_sequence=4&epoch=1&generation=1`);
+  });
+
+  // UT-W01 (stream half): both roster events are registered explicitly (L-017) and write the
+  // client-held roster; a reconnect holds rows stale until the next snapshot.
+  it("Should feed the subagent roster from the stream and hold it stale from loss to resync", async () => {
+    vi.useFakeTimers();
+    const queryClient = createQueryClient();
+    seedActiveSession(queryClient);
+    const rosterKey = sessionKeys.subagentRoster(WORKSPACE_ID, SESSION_ID);
+    const { result, sources } = renderLiveTail({ queryClient });
+    await act(async () => {
+      await vi.waitFor(() => expect(result.current.status).toBe("success"));
+    });
+    const subagent = {
+      subagent_id: "sub-1",
+      workspace_id: WORKSPACE_ID,
+      parent_session_id: SESSION_ID,
+      parent_turn_id: "turn-1",
+      child_session_id: "sess-child",
+      origin: "delegated",
+      provider_tool_call_id: null,
+      title: "Audit webhooks",
+      role: "general",
+      status: "running",
+      work_state: "working",
+      runtime: { agent: "codex", provider: "codex", model: "", reasoning_effort: "", speed: "" },
+      depth: 1,
+      progress: "",
+      result: null,
+      result_preview: "",
+      result_truncated: false,
+      error: null,
+      wait_timed_out: false,
+      delivery: "none",
+      started_at: "2026-10-08T21:00:00.000Z",
+      settled_at: null,
+      updated_at: "2026-10-08T21:00:01.000Z",
+    };
+
+    act(() => {
+      sources[0]?.emit("subagents_snapshot", {
+        session_id: SESSION_ID,
+        subagents: [{ ...subagent, status: "queued", child_session_id: null }],
+      });
+    });
+    expect(queryClient.getQueryData<SubagentRoster>(rosterKey)).toMatchObject({
+      rows: [{ id: "sub-1", status: "queued", child_session_id: null }],
+    });
+
+    act(() => {
+      sources[0]?.emit("subagent_updated", {
+        session_id: SESSION_ID,
+        subagent: { ...subagent, progress: "Reading", updated_at: "2026-10-08T21:00:05.000Z" },
+      });
+    });
+    expect(queryClient.getQueryData<SubagentRoster>(rosterKey)).toMatchObject({
+      rows: [
+        { id: "sub-1", status: "running", child_session_id: "sess-child", progress: "Reading" },
+      ],
+      staleIds: new Set(),
+    });
+
+    // Stale the moment the stream drops, before any reconnect (m19).
+    act(() => sources[0]?.onerror?.(new Event("error")));
+    expect(sources).toHaveLength(1);
+    expect(queryClient.getQueryData<SubagentRoster>(rosterKey)?.staleIds).toEqual(
+      new Set(["sub-1"])
+    );
+    await act(async () => vi.advanceTimersByTimeAsync(250));
+    expect(sources).toHaveLength(2);
+    act(() => {
+      sources[1]?.emit("subagents_snapshot", { session_id: SESSION_ID, subagents: [subagent] });
+    });
+    expect(queryClient.getQueryData<SubagentRoster>(rosterKey)?.staleIds.size).toBe(0);
+  });
+
+  it("Should wake only the exact session command projection", async () => {
+    const queryClient = createQueryClient();
+    seedActiveSession(queryClient);
+    const transcriptKey = sessionKeys.transcript(WORKSPACE_ID, SESSION_ID);
+    const commandsKey = sessionKeys.commands(WORKSPACE_ID, SESSION_ID);
+    const otherWorkspaceCommandsKey = sessionKeys.commands("ws_other", SESSION_ID);
+    const otherSessionCommandsKey = sessionKeys.commands(WORKSPACE_ID, "sess_other");
+    queryClient.setQueryData(
+      transcriptKey,
+      seededTranscriptData(transcriptPage([textMessage("tail-1", "Tail")]))
+    );
+    queryClient.setQueryData(commandsKey, { commands: [], revision: "before" });
+    queryClient.setQueryData(otherWorkspaceCommandsKey, {
+      commands: [],
+      revision: "other-workspace",
+    });
+    queryClient.setQueryData(otherSessionCommandsKey, {
+      commands: [],
+      revision: "other-session",
+    });
+    const transcriptBefore = queryClient.getQueryData<SessionTranscriptData>(transcriptKey);
+    const { sources } = renderLiveTail({ queryClient });
+    await act(async () => {
+      await vi.waitFor(() => expect(sources).toHaveLength(1));
+    });
+    const invalidateQueries = vi.spyOn(queryClient, "invalidateQueries");
+
+    act(() => {
+      sources[0]?.emit(
+        "session_commands_changed",
+        { session_id: SESSION_ID, revision: "after" },
+        ""
+      );
+    });
+
+    expect(invalidateQueries).toHaveBeenCalledWith({ queryKey: commandsKey, exact: true });
+    expect(invalidateQueries).not.toHaveBeenCalledWith({
+      queryKey: otherWorkspaceCommandsKey,
+      exact: true,
+    });
+    expect(invalidateQueries).not.toHaveBeenCalledWith({
+      queryKey: otherSessionCommandsKey,
+      exact: true,
+    });
+    expect(queryClient.getQueryData<SessionTranscriptData>(transcriptKey)).toBe(transcriptBefore);
+  });
+
+  it("Should wake the exact clarifications projection on a clarify transcript delta", async () => {
+    vi.mocked(fetchSessionTranscript).mockResolvedValue(
+      transcriptResponse([textMessage("m1", "hi")])
+    );
+    const { result, sources, queryClient } = renderLiveTail();
+    await waitFor(() => expect(result.current.messages).toHaveLength(1));
+
+    const invalidateQueries = vi.spyOn(queryClient, "invalidateQueries");
+    act(() => {
+      sources[0]?.emit("transcript_delta", clarifyDeltaFrame(clarifyMessage("clarify-1")), "2");
+    });
+
+    expect(invalidateQueries).toHaveBeenCalledWith({
+      queryKey: sessionKeys.clarifications(WORKSPACE_ID, SESSION_ID),
+      exact: true,
+    });
+  });
+
+  it("Should not wake the clarifications projection on an ordinary transcript delta", async () => {
+    vi.mocked(fetchSessionTranscript).mockResolvedValue(
+      transcriptResponse([textMessage("m1", "hi")])
+    );
+    const { result, sources, queryClient } = renderLiveTail();
+    await waitFor(() => expect(result.current.messages).toHaveLength(1));
+
+    const inputKey = sessionKeys.inputQueue(WORKSPACE_ID, SESSION_ID);
+    queryClient.setQueryData(inputKey, { inputs: [] });
+    const invalidateQueries = vi.spyOn(queryClient, "invalidateQueries");
+    act(() => {
+      sources[0]?.emit(
+        "transcript_delta",
+        clarifyDeltaFrame(textMessage("m2", "plain answer")),
+        "2"
+      );
+    });
+
+    expect(invalidateQueries).not.toHaveBeenCalledWith({
+      queryKey: sessionKeys.clarifications(WORKSPACE_ID, SESSION_ID),
+      exact: true,
+    });
+    await waitFor(() => expect(queryClient.getQueryState(inputKey)?.isInvalidated).toBe(true));
+  });
+
+  it.each(["upserted", "deleted"])(
+    "Should reconcile the User catalog on a workspace-less %s wake",
+    kind => {
+      const queryClient = createQueryClient();
+      const userKey = [...sessionKeys.workspaceLists("@user"), { profile: "default" }];
+      const aggregateKey = [...sessionKeys.workspaceLists(""), { profile: "default" }];
+      const projectKey = [...sessionKeys.workspaceLists(WORKSPACE_ID), { profile: "default" }];
+      for (const key of [userKey, aggregateKey, projectKey])
+        queryClient.setQueryData(key, { sessions: [] });
+      const reconciler = createCatalogReconciler(queryClient);
+      try {
+        reconciler.wake("", { workspace_id: "", profile_name: "default", kind });
+        expect(queryClient.getQueryState(userKey)?.isInvalidated).toBe(true);
+        expect(queryClient.getQueryState(aggregateKey)?.isInvalidated).toBe(true);
+        expect(queryClient.getQueryState(projectKey)?.isInvalidated).toBe(false);
+      } finally {
+        reconciler.close();
+        queryClient.clear();
+      }
+    }
+  );
+
+  it.each([
+    ["window", false],
+    ["board-drawer", false],
+  ] as const)(
+    "Should bound catalog rereads to the freshness window in a %s",
+    async (presentation, everyBurst) => {
+      vi.mocked(fetchSessionTranscript).mockResolvedValue(
+        transcriptResponse([textMessage("m1", "hi")])
+      );
+      const { result, sources, queryClient } = renderLiveTail({ presentation });
+      await waitFor(() => expect(result.current.messages).toHaveLength(1));
+      const inputKey = sessionKeys.inputQueue(WORKSPACE_ID, SESSION_ID);
+      const boardKey = [...sessionKeys.workspaceLists(WORKSPACE_ID), "board", {}];
+      const burst = async (sequence: number) => {
+        queryClient.setQueryData(inputKey, { inputs: [] });
+        queryClient.setQueryData(boardKey, { pages: [] });
+        act(() => {
+          sources[0]?.emit(
+            "transcript_delta",
+            {
+              ...clarifyDeltaFrame(textMessage(`m${sequence}`, "more")),
+              cursor: sequence,
+              entries: [
+                {
+                  message: textMessage(`m${sequence}`, "more"),
+                  sequence,
+                  start_sequence: sequence,
+                },
+              ],
+              max_sequence: sequence,
+            },
+            String(sequence)
+          );
+        });
+        await waitFor(() => expect(queryClient.getQueryState(inputKey)?.isInvalidated).toBe(true));
+        return queryClient.getQueryState(boardKey)?.isInvalidated;
+      };
+
+      // Both presentations keep catalog work at the shared freshness cadence.
+      const now = vi.spyOn(Date, "now");
+      now.mockReturnValue(1_000_000);
+      expect(await burst(2)).toBe(true);
+      expect(await burst(3)).toBe(everyBurst);
+      // The live tail does not schedule a trailing catalog read. A quiet board
+      // relies on its own periodic reread; a new delta can refresh after the window.
+      vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+      now.mockReturnValue(1_000_000 + SESSION_BOARD_DRAWER_CATALOG_REFRESH_MS);
+      await act(async () => vi.advanceTimersByTimeAsync(SESSION_BOARD_DRAWER_CATALOG_REFRESH_MS));
+      expect(queryClient.getQueryState(boardKey)?.isInvalidated).toBe(false);
+      vi.useRealTimers();
+      expect(await burst(4)).toBe(true);
+      now.mockRestore();
+    }
+  );
+
+  it("Should reject a mismatched delta and reconnect without replacing history", async () => {
+    vi.useFakeTimers();
+    vi.mocked(fetchSessionTranscript).mockResolvedValue(
+      transcriptResponse([sessionTranscriptFixture[0]!])
+    );
+    const { result, sources } = renderLiveTail();
+    await act(async () => {
+      await vi.waitFor(() => expect(result.current.messages).toHaveLength(1));
+    });
+
+    act(() => {
+      sources[0]?.emit(
+        "transcript_delta",
+        {
+          cursor: 9,
+          entries: [{ message: sessionTranscriptFixture[1]!, sequence: 9, start_sequence: 9 }],
+          epoch: 1,
+          generation: 2,
+          has_more: false,
+          max_sequence: 9,
+          session_id: SESSION_ID,
+        },
+        "9"
+      );
+    });
+    // One paint applies the queued batch, then the first reconnect delay elapses.
+    await act(async () => vi.advanceTimersByTimeAsync(16));
+    await act(async () => vi.advanceTimersByTimeAsync(250));
+
+    expect(result.current.messages.map(message => message.id)).toEqual([
+      sessionTranscriptFixture[0]?.id,
+    ]);
+    expect(sources[0]?.closed).toBe(true);
+    expect(sources[1]?.url).toBe(`${STREAM_URL}&after_sequence=1&epoch=1&generation=1`);
+  });
+
+  it("Should apply frames queued within one paint as one ordered cache write equal to sequential application", async () => {
+    vi.mocked(fetchSessionTranscript).mockResolvedValue(
+      transcriptResponse([sessionTranscriptFixture[0]!])
+    );
+    const deltas = [1, 2, 3].map(index => ({
+      cursor: index + 1,
+      entries: [
+        {
+          message: textMessage(`batched-${index}`, `Batched message ${index}`),
+          sequence: index + 1,
+          start_sequence: index + 1,
+        },
+      ],
+      epoch: 1,
+      generation: 1,
+      has_more: false,
+      max_sequence: index + 1,
+      session_id: SESSION_ID,
+    }));
+    const transcriptKey = sessionKeys.transcript(WORKSPACE_ID, SESSION_ID);
+
+    const sequential = renderLiveTail();
+    await waitFor(() => expect(sequential.result.current.messages).toHaveLength(1));
+    for (const [index, delta] of deltas.entries()) {
+      act(() => sequential.sources[0]?.emit("transcript_delta", delta, String(delta.cursor)));
+      await waitFor(() => expect(sequential.result.current.messages).toHaveLength(index + 2));
+    }
+
+    const batched = renderLiveTail();
+    await waitFor(() => expect(batched.result.current.messages).toHaveLength(1));
+    const setQueryData = vi.spyOn(batched.queryClient, "setQueryData");
+    act(() => {
+      for (const delta of deltas) {
+        batched.sources[0]?.emit("transcript_delta", delta, String(delta.cursor));
+      }
+    });
+    await waitFor(() => expect(batched.result.current.messages).toHaveLength(4));
+
+    const transcriptWrites = setQueryData.mock.calls.filter(
+      ([queryKey]) => JSON.stringify(queryKey) === JSON.stringify(transcriptKey)
+    );
+    expect(transcriptWrites).toHaveLength(1);
+    expect(batched.result.current.messages.map(message => message.id)).toEqual([
+      sessionTranscriptFixture[0]?.id,
+      "batched-1",
+      "batched-2",
+      "batched-3",
+    ]);
+    expect(batched.queryClient.getQueryData(transcriptKey)).toEqual(
+      sequential.queryClient.getQueryData(transcriptKey)
+    );
+    expect(batched.result.current.transport.phase).toBe("live");
+  });
+
+  it("Should keep the in-order prefix and reconnect from it when a batched frame breaks the fence", async () => {
+    vi.useFakeTimers();
+    vi.mocked(fetchSessionTranscript).mockResolvedValue(
+      transcriptResponse([sessionTranscriptFixture[0]!])
+    );
+    const { result, sources } = renderLiveTail();
+    await act(async () => {
+      await vi.waitFor(() => expect(result.current.messages).toHaveLength(1));
+    });
+    const delta = (sequence: number, generation: number) => ({
+      cursor: sequence,
+      entries: [
+        {
+          message: textMessage(`fenced-${sequence}`, `Fenced message ${sequence}`),
+          sequence,
+          start_sequence: sequence,
+        },
+      ],
+      epoch: 1,
+      generation,
+      has_more: false,
+      max_sequence: sequence,
+      session_id: SESSION_ID,
+    });
+
+    act(() => {
+      sources[0]?.emit("transcript_delta", delta(2, 1), "2");
+      sources[0]?.emit("transcript_delta", delta(9, 2), "9");
+      sources[0]?.emit("transcript_delta", delta(3, 1), "3");
+    });
+    await act(async () => vi.advanceTimersByTimeAsync(16));
+    await act(async () => vi.advanceTimersByTimeAsync(250));
+
+    expect(result.current.messages.map(message => message.id)).toEqual([
+      sessionTranscriptFixture[0]?.id,
+      "fenced-2",
+    ]);
+    expect(sources[0]?.closed).toBe(true);
+    expect(sources[1]?.url).toBe(`${STREAM_URL}&after_sequence=2&epoch=1&generation=1`);
+  });
+
+  it("Should preserve unchanged ThreadMessage identities across a delta update", async () => {
+    vi.mocked(fetchSessionTranscript).mockResolvedValue(
+      transcriptResponse([sessionTranscriptFixture[0]!, sessionTranscriptFixture[1]!])
+    );
+    const { result, rerender, sources } = renderLiveTail();
+    await waitFor(() => expect(result.current.messages).toHaveLength(2));
+    const unchanged = result.current.messages;
+    const first = result.current.messages[0];
+    const second = result.current.messages[1];
+
+    rerender();
+    expect(result.current.messages).toBe(unchanged);
+
+    act(() => {
+      sources[0]?.emit(
+        "transcript_delta",
+        {
+          cursor: 3,
+          entries: [{ message: sessionTranscriptFixture[2]!, sequence: 3, start_sequence: 3 }],
+          epoch: 1,
+          generation: 1,
+          has_more: false,
+          max_sequence: 3,
+          session_id: SESSION_ID,
+        },
+        "3"
+      );
+    });
+    await waitFor(() => expect(result.current.messages).toHaveLength(3));
+
+    expect(result.current.messages[0]).toBe(first);
+    expect(result.current.messages[1]).toBe(second);
+  });
+
+  it("Should back off exponentially without refetching on transport errors", async () => {
+    vi.useFakeTimers();
+    const queryClient = createQueryClient();
+    seedActiveSession(queryClient);
+    const { result, sources } = renderLiveTail({ queryClient });
+    await act(async () => {
+      await vi.waitFor(() => expect(result.current.status).toBe("success"));
+    });
+    vi.mocked(fetchSessionTranscript).mockClear();
+
+    expect(sources[0]?.listeners.has("error")).toBe(false);
+
+    act(() => sources[0]?.onerror?.(new Event("error")));
+    await act(async () => vi.advanceTimersByTimeAsync(250));
+    act(() => sources[1]?.onerror?.(new Event("error")));
+    await act(async () => vi.advanceTimersByTimeAsync(500));
+
+    expect(sources).toHaveLength(3);
+    expect(fetchSessionTranscript).not.toHaveBeenCalled();
+  });
+
+  it("Should project terminal failure state and close without reconnecting", async () => {
+    vi.useFakeTimers();
+    vi.mocked(fetchSession).mockResolvedValue(sessionWithState("stopped"));
+    const queryClient = createQueryClient();
+    seedActiveSession(queryClient);
+    const { result, sources } = renderLiveTail({ queryClient });
+    await act(async () => {
+      await vi.waitFor(() => expect(result.current.status).toBe("success"));
+    });
+
+    act(() => {
+      sources[0]?.emit(
+        "session_stopped",
+        {
+          agent_name: primarySessionFixture.agent_name,
+          content: {},
+          failure: { kind: "process_exit", summary: "provider exited before response" },
+          id: "session-stopped-fixture",
+          sequence: 9,
+          session_id: SESSION_ID,
+          spawn_depth: 0,
+          stop_detail: "provider exited before response",
+          stop_reason: "agent_crashed",
+          timestamp: "2026-07-07T12:00:00Z",
+          turn_id: "turn-terminal",
+          type: "session_stopped",
+        },
+        "9"
+      );
+    });
+    await act(async () => {
+      await vi.waitFor(() =>
+        expect(result.current.messages.at(-1)?.id).toBe(`session-stopped-${SESSION_ID}`)
+      );
+      await vi.advanceTimersByTimeAsync(4_000);
+    });
+
+    expect(sources[0]?.closed).toBe(true);
+    expect(sources).toHaveLength(1);
+    expect(JSON.stringify(result.current.messages.at(-1))).toContain(
+      "provider exited before response"
+    );
+  });
+
+  it("Should apply accepted transcript frames before closing on a terminal frame", async () => {
+    const queryClient = createQueryClient();
+    seedActiveSession(queryClient);
+    vi.mocked(fetchSessionTranscript).mockResolvedValue(
+      transcriptResponse(sessionTranscriptFixture.slice(0, 2))
+    );
+    const { result, sources } = renderLiveTail({ queryClient });
+    await act(async () => {
+      await vi.waitFor(() => expect(result.current.status).toBe("success"));
+    });
+
+    act(() => {
+      sources[0]?.emit(
+        "transcript_delta",
+        {
+          cursor: 3,
+          entries: [{ message: sessionTranscriptFixture[2]!, sequence: 3, start_sequence: 3 }],
+          epoch: 1,
+          generation: 1,
+          has_more: false,
+          max_sequence: 3,
+          session_id: SESSION_ID,
+        },
+        "3"
+      );
+      sources[0]?.emit(
+        "session_stopped",
+        {
+          agent_name: primarySessionFixture.agent_name,
+          content: {},
+          id: "session-stopped-after-delta",
+          sequence: 4,
+          session_id: SESSION_ID,
+          spawn_depth: 0,
+          timestamp: "2026-07-07T12:00:00Z",
+          turn_id: "turn-terminal",
+          type: "session_stopped",
+        },
+        "4"
+      );
+    });
+
+    await waitFor(() => expect(result.current.messages).toHaveLength(3));
+    expect(result.current.messages.at(-1)?.id).toBe(sessionTranscriptFixture[2]?.id);
+    expect(sources[0]?.closed).toBe(true);
+  });
+
+  it("Should not open a stream for a stopped session", async () => {
+    const queryClient = createQueryClient();
+    queryClient.setQueryData(
+      sessionKeys.detail(WORKSPACE_ID, SESSION_ID),
+      sessionWithState("stopped")
+    );
+    vi.mocked(fetchSession).mockResolvedValue(sessionWithState("stopped"));
+
+    const { result, sources } = renderLiveTail({ queryClient });
+    await waitFor(() => expect(result.current.status).toBe("success"));
+    expect(sources).toHaveLength(0);
+  });
+
+  it("Should suspend session-detail polling when live tail is disabled", async () => {
+    vi.useFakeTimers();
+    const queryClient = createQueryClient();
+    seedActiveSession(queryClient);
+
+    const { result, sources } = renderLiveTail({ enabled: false, queryClient });
+    await act(async () => {
+      await vi.waitFor(() => expect(result.current.status).toBe("success"));
+    });
+    await act(async () => vi.advanceTimersByTimeAsync(10_000));
+
+    expect(fetchSession).not.toHaveBeenCalled();
+    expect(sources).toHaveLength(0);
+  });
+
+  // Invariant: retries are bounded (US-018.AC-2). Past the cap the transport reads
+  // `failed` with the count, arms no timer, and only the operator's Try again rereads
+  // the transcript and reopens the stream from the durable cursor with a fresh budget.
+  it("Should give up visibly after the reconnect cap and reopen only on Try again", async () => {
+    vi.useFakeTimers();
+    const queryClient = createQueryClient();
+    seedActiveSession(queryClient);
+    queryClient.setQueryData(
+      sessionKeys.transcript(WORKSPACE_ID, SESSION_ID),
+      seededTranscriptData(transcriptPage([sessionTranscriptFixture[0]!], { firstSequence: 1 }))
+    );
+    const { result, sources } = renderLiveTail({ queryClient });
+    await act(async () => {
+      await vi.waitFor(() => expect(sources).toHaveLength(1));
+    });
+    vi.mocked(fetchSessionTranscript).mockClear();
+
+    for (let attempt = 1; attempt <= MAX_RECONNECT_ATTEMPTS; attempt += 1) {
+      act(() => sources.at(-1)?.onerror?.(new Event("error")));
+      expect(result.current.transport).toMatchObject({
+        phase: "waiting-reconnect",
+        reconnectAttempt: attempt,
+      });
+      await act(async () => vi.advanceTimersByTimeAsync(4_000));
+    }
+    expect(sources).toHaveLength(MAX_RECONNECT_ATTEMPTS + 1);
+    expect(result.current.transport.phase).toBe("connecting");
+
+    // One more failure crosses the cap: no new source, no timer, a stated failure.
+    act(() => sources.at(-1)?.onerror?.(new Event("error")));
+    await act(async () => vi.advanceTimersByTimeAsync(10_000));
+    expect(sources).toHaveLength(MAX_RECONNECT_ATTEMPTS + 1);
+    expect(sources.at(-1)?.closed).toBe(true);
+    expect(result.current.transport.phase).toBe("failed");
+    expect(result.current.transport.failure?.attempts).toBe(MAX_RECONNECT_ATTEMPTS);
+    expect(fetchSessionTranscript).not.toHaveBeenCalled();
+
+    act(() => result.current.retry());
+    await act(async () => {
+      await vi.waitFor(() => expect(fetchSessionTranscript).toHaveBeenCalledTimes(1));
+      await vi.waitFor(() => expect(sources).toHaveLength(MAX_RECONNECT_ATTEMPTS + 2));
+    });
+    expect(sources.at(-1)?.url).toBe(`${STREAM_URL}&after_sequence=1&epoch=1&generation=1`);
+    expect(result.current.transport.phase).toBe("connecting");
+    expect(result.current.transport.failure).toBeNull();
+  });
+
+  // Invariant: the session's stream-backed reads see its stream as live exactly while this
+  // tail holds the live edge, so a dropped or closed stream returns them to fallback polling.
+  it("Should mark the session stream live only while the transport is on the live edge", async () => {
+    vi.useFakeTimers();
+    const queryClient = createQueryClient();
+    seedActiveSession(queryClient);
+    const { result, sources, unmount } = renderLiveTail({ queryClient });
+    await act(async () => {
+      await vi.waitFor(() => expect(sources).toHaveLength(1));
+    });
+    expect(isSessionStreamLive(SESSION_ID)).toBe(false);
+
+    act(() =>
+      sources[0]?.emit("transcript_delta", clarifyDeltaFrame(textMessage("m-1", "one")), "2")
+    );
+    await act(async () => {
+      await vi.waitFor(() => expect(result.current.transport.phase).toBe("live"));
+    });
+    expect(isSessionStreamLive(SESSION_ID)).toBe(true);
+
+    act(() => sources[0]?.onerror?.(new Event("error")));
+    expect(result.current.transport.phase).toBe("waiting-reconnect");
+    expect(isSessionStreamLive(SESSION_ID)).toBe(false);
+
+    await act(async () => vi.advanceTimersByTimeAsync(250));
+    act(() =>
+      sources[1]?.emit("transcript_delta", clarifyDeltaFrame(textMessage("m-2", "two")), "3")
+    );
+    await act(async () => {
+      await vi.waitFor(() => expect(result.current.transport.phase).toBe("live"));
+    });
+    expect(isSessionStreamLive(SESSION_ID)).toBe(true);
+    unmount();
+    expect(isSessionStreamLive(SESSION_ID)).toBe(false);
+  });
+
+  // Invariant: a mounted stream-backed read switches cadence when stream ownership changes,
+  // not after the timer it armed under the previous ownership.
+  it("Should re-arm stream-backed reads at once when the stream gains or loses the live edge", async () => {
+    vi.useFakeTimers();
+    vi.mocked(fetchSessionUsage).mockResolvedValue({} as never);
+    const queryClient = createQueryClient();
+    seedActiveSession(queryClient);
+    // The read lives in its own root, as in production, so live-tail renders never touch it.
+    renderHook(() => useQuery(sessionUsageOptions(WORKSPACE_ID, SESSION_ID, "active")), {
+      wrapper: createWrapper(queryClient),
+    });
+    await act(async () => vi.advanceTimersByTimeAsync(1));
+    expect(fetchSessionUsage).toHaveBeenCalledTimes(1);
+
+    const { result, sources } = renderLiveTail({ queryClient });
+    await act(async () => {
+      await vi.waitFor(() => expect(sources).toHaveLength(1));
+    });
+    act(() =>
+      sources[0]?.emit("transcript_delta", clarifyDeltaFrame(textMessage("m-1", "one")), "2")
+    );
+    await act(async () => {
+      await vi.waitFor(() => expect(result.current.transport.phase).toBe("live"));
+    });
+    await act(async () => vi.advanceTimersByTimeAsync(6_000));
+    expect(fetchSessionUsage).toHaveBeenCalledTimes(1);
+
+    act(() => sources[0]?.onerror?.(new Event("error")));
+    await act(async () => vi.advanceTimersByTimeAsync(5_100));
+    expect(fetchSessionUsage).toHaveBeenCalledTimes(2);
+  });
+
+  // Invariant: a reopen after a drop reads "catching up" until the replayed frames drain,
+  // then the live edge; the transport records when it was last live and when it degraded.
+  it("Should read catching up after a drop until the replay drains", async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(100_000);
+    const queryClient = createQueryClient();
+    seedActiveSession(queryClient);
+    const { result, sources } = renderLiveTail({ queryClient });
+    await act(async () => {
+      await vi.waitFor(() => expect(sources).toHaveLength(1));
+    });
+    expect(result.current.transport.phase).toBe("connecting");
+    expect(result.current.transport.degradedAt).toBeGreaterThanOrEqual(100_000);
+
+    act(() =>
+      sources[0]?.emit("transcript_delta", clarifyDeltaFrame(textMessage("m-1", "one")), "2")
+    );
+    await act(async () => {
+      await vi.waitFor(() => expect(result.current.transport.phase).toBe("live"));
+    });
+    expect(result.current.transport.catchingUp).toBe(false);
+    expect(result.current.transport.degradedAt).toBeNull();
+    expect(result.current.transport.lastLiveAt).toBeGreaterThanOrEqual(100_000);
+
+    vi.setSystemTime(105_000);
+    act(() => sources[0]?.onerror?.(new Event("error")));
+    expect(result.current.transport).toMatchObject({
+      degradedAt: 105_000,
+      phase: "waiting-reconnect",
+      reconnectAttempt: 1,
+    });
+    await act(async () => vi.advanceTimersByTimeAsync(250));
+    expect(sources).toHaveLength(2);
+    expect(result.current.transport).toMatchObject({ catchingUp: true, phase: "connecting" });
+
+    act(() =>
+      sources[1]?.emit(
+        "transcript_delta",
+        {
+          ...clarifyDeltaFrame(textMessage("m-2", "two")),
+          cursor: 3,
+          max_sequence: 3,
+          entries: [{ message: textMessage("m-2", "two"), sequence: 3, start_sequence: 3 }],
+        },
+        "3"
+      )
+    );
+    await act(async () => {
+      await vi.waitFor(() =>
+        expect(result.current.messages.map(message => message.id)).toContain("m-2")
+      );
+    });
+    expect(result.current.transport).toMatchObject({
+      catchingUp: false,
+      phase: "live",
+      reconnectAttempt: 0,
+    });
+  });
+
+  // Invariant: a reset snapshot over loaded history of another generation is stated
+  // (US-017.AC-3): the view follows the daemon and names the generation it moved to.
+  it("Should state a history reset when a reset snapshot replaces another generation", async () => {
+    const queryClient = createQueryClient();
+    seedActiveSession(queryClient);
+    queryClient.setQueryData(
+      sessionKeys.transcript(WORKSPACE_ID, SESSION_ID),
+      seededTranscriptData(transcriptPage([sessionTranscriptFixture[0]!], { firstSequence: 1 }))
+    );
+    const { result, sources } = renderLiveTail({ queryClient });
+    await waitFor(() => expect(sources).toHaveLength(1));
+    expect(result.current.transport.historyReset).toBeNull();
+
+    act(() => {
+      sources[0]?.emit(
+        "transcript_snapshot",
+        {
+          entries: [{ message: sessionTranscriptFixture[2]!, sequence: 3, start_sequence: 3 }],
+          epoch: 1,
+          generation: 4,
+          has_older: false,
+          max_sequence: 3,
+          reason: "generation_mismatch",
+          reset: true,
+          session_id: SESSION_ID,
+        },
+        "3"
+      );
+    });
+    await waitFor(() =>
+      expect(result.current.messages.map(message => message.id)).toEqual([
+        sessionTranscriptFixture[2]?.id,
+      ])
+    );
+    expect(result.current.transport.historyReset?.generation).toBe(4);
+  });
+
+  // Invariant (task_06 req. 2 client half): `stream.consumer_degraded` marks the view as
+  // catching up until an applied frame reaches `through_sequence` — an empty delta carrying
+  // the watermark counts; an unrelated empty apply queue does not end it. The event carries
+  // no SSE id and never moves the resume cursor.
+  it("Should read catching up from a shed marker until the replay reaches its watermark", async () => {
+    vi.useFakeTimers();
+    const queryClient = createQueryClient();
+    seedActiveSession(queryClient);
+    const { result, sources } = renderLiveTail({ queryClient });
+    await act(async () => {
+      await vi.waitFor(() => expect(sources).toHaveLength(1));
+    });
+    act(() =>
+      sources[0]?.emit("transcript_delta", clarifyDeltaFrame(textMessage("m-1", "one")), "2")
+    );
+    await act(async () => {
+      await vi.waitFor(() => expect(result.current.transport.phase).toBe("live"));
+    });
+    expect(result.current.transport.catchingUp).toBe(false);
+
+    act(() =>
+      sources[0]?.emit("stream.consumer_degraded", {
+        after_sequence: 2,
+        refresh: true,
+        session_id: SESSION_ID,
+        through_sequence: 6,
+      })
+    );
+    expect(result.current.transport.catchingUp).toBe(true);
+    expect(result.current.transport.phase).toBe("live");
+    expect(isSessionStreamLive(SESSION_ID)).toBe(false);
+
+    // A frame short of the watermark drains the queue but does not end the catch-up.
+    const frame = (id: string, sequence: number) => ({
+      ...clarifyDeltaFrame(textMessage(id, id)),
+      cursor: sequence,
+      entries: [{ message: textMessage(id, id), sequence, start_sequence: sequence }],
+      max_sequence: sequence,
+    });
+    act(() => sources[0]?.emit("transcript_delta", frame("m-4", 4), "4"));
+    await act(async () => {
+      await vi.waitFor(() =>
+        expect(result.current.messages.map(message => message.id)).toContain("m-4")
+      );
+    });
+    expect(result.current.transport.catchingUp).toBe(true);
+    expect(isSessionStreamLive(SESSION_ID)).toBe(false);
+
+    // An empty delta carrying the watermark cursor ends it.
+    act(() =>
+      sources[0]?.emit(
+        "transcript_delta",
+        { ...frame("m-4", 4), cursor: 6, entries: [], max_sequence: 6 },
+        "6"
+      )
+    );
+    await act(async () => {
+      await vi.waitFor(() => expect(result.current.transport.catchingUp).toBe(false));
+    });
+    expect(isSessionStreamLive(SESSION_ID)).toBe(true);
+    // The marker never advanced the resume cursor on its own: the reconnect resumes after 6, the last applied frame.
+    act(() => sources[0]?.onerror?.(new Event("error")));
+    await act(async () => vi.advanceTimersByTimeAsync(250));
+    expect(sources[1]?.url).toBe(`${STREAM_URL}&after_sequence=6&epoch=1&generation=1`);
+  });
+
+  // Invariant (US-017.EC-1): a reset in the SAME generation — retention erased the
+  // cursor the view held — is stated with the daemon's reason, not only a generation change.
+  it("Should state a same-generation reset with the daemon's reason", async () => {
+    const queryClient = createQueryClient();
+    seedActiveSession(queryClient);
+    queryClient.setQueryData(
+      sessionKeys.transcript(WORKSPACE_ID, SESSION_ID),
+      seededTranscriptData(transcriptPage([sessionTranscriptFixture[0]!], { firstSequence: 1 }))
+    );
+    const { result, sources } = renderLiveTail({ queryClient });
+    await waitFor(() => expect(sources).toHaveLength(1));
+
+    act(() => {
+      sources[0]?.emit(
+        "transcript_snapshot",
+        {
+          entries: [{ message: sessionTranscriptFixture[2]!, sequence: 40, start_sequence: 40 }],
+          epoch: 1,
+          generation: 1,
+          has_older: false,
+          max_sequence: 40,
+          reason: "cursor_expired",
+          reset: true,
+          session_id: SESSION_ID,
+        },
+        "40"
+      );
+    });
+    await waitFor(() =>
+      expect(result.current.messages.map(message => message.id)).toEqual([
+        sessionTranscriptFixture[2]?.id,
+      ])
+    );
+    expect(result.current.transport.historyReset).toMatchObject({
+      generation: 1,
+      reason: "cursor_expired",
+    });
+  });
+});
+
+// Invariant: named usage signals trigger two bounded rereads and never advance transcript cursors.
+// Owner and canonical suite: live-tail orchestration (the fake source owns the stream I/O boundary).
+describe("Session context stream signals", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    vi.mocked(fetchSession).mockResolvedValue(sessionWithState("active"));
+    vi.mocked(fetchSessionTranscript).mockResolvedValue(transcriptResponse([]));
+  });
+  afterEach(() => {
+    vi.useRealTimers();
+    vi.restoreAllMocks();
+  });
+
+  it("Should register and detach the named usage listener and debounce burst rereads", async () => {
+    vi.useFakeTimers();
+    const queryClient = createQueryClient();
+    seedActiveSession(queryClient);
+    const usageReads = [
+      sessionKeys.usage(WORKSPACE_ID, SESSION_ID),
+      sessionKeys.usageTurns(WORKSPACE_ID, SESSION_ID),
+    ].map(queryKey => {
+      queryClient.setQueryData(queryKey, {});
+      const queryFn = vi.fn(async () => ({}));
+      const observer = new QueryObserver(queryClient, { queryKey, queryFn, staleTime: Infinity });
+      return { queryFn, unsubscribe: observer.subscribe(() => undefined) };
+    });
+    const { sources, unmount } = renderLiveTail({ queryClient });
+    await act(async () => {
+      await vi.waitFor(() => expect(sources).toHaveLength(1));
+    });
+    const source = sources[0]!;
+    expect(source.listeners.get("session_usage_changed")?.size).toBe(1);
+    const before = queryClient.getQueryData(sessionKeys.transcript(WORKSPACE_ID, SESSION_ID));
+    act(() => {
+      for (const sequence of [412, 413, 414])
+        source.emit("session_usage_changed", { sequence, turn_id: "turn-12", kind: "usage" });
+    });
+    await act(async () => vi.advanceTimersByTimeAsync(249));
+    for (const read of usageReads) expect(read.queryFn).not.toHaveBeenCalled();
+    await act(async () => vi.advanceTimersByTimeAsync(1));
+    for (const read of usageReads) expect(read.queryFn).toHaveBeenCalledTimes(1);
+    expect(queryClient.getQueryData(sessionKeys.transcript(WORKSPACE_ID, SESSION_ID))).toBe(before);
+    act(() =>
+      source.emit("session_usage_changed", { sequence: 415, turn_id: "turn-12", kind: "done" })
+    );
+    unmount();
+    for (const read of usageReads) expect(read.queryFn).toHaveBeenCalledTimes(2);
+    await act(async () => vi.advanceTimersByTimeAsync(250));
+    for (const read of usageReads) {
+      expect(read.queryFn).toHaveBeenCalledTimes(2);
+      read.unsubscribe();
+    }
+    expect(source.listeners.get("session_usage_changed")?.size).toBe(0);
+    expect(source.closed).toBe(true);
+    queryClient.clear();
+  });
+
+  it("Should not reread usage from a transcript delta and should clear retention on explicit reset", async () => {
+    const queryClient = createQueryClient();
+    seedActiveSession(queryClient);
+    const { sources, unmount } = renderLiveTail({ queryClient });
+    await waitFor(() => expect(sources).toHaveLength(1));
+    const usageKeys = [
+      sessionKeys.usage(WORKSPACE_ID, SESSION_ID),
+      sessionKeys.usageTurns(WORKSPACE_ID, SESSION_ID),
+    ];
+    for (const key of usageKeys) queryClient.setQueryData(key, {});
+    act(() =>
+      sources[0]!.emit("transcript_delta", {
+        cursor: 5,
+        entries: [],
+        epoch: 1,
+        generation: 1,
+        has_more: false,
+        max_sequence: 5,
+        session_id: SESSION_ID,
+      })
+    );
+    await waitFor(() =>
+      expect(
+        queryClient.getQueryData<SessionTranscriptData>(
+          sessionKeys.transcript(WORKSPACE_ID, SESSION_ID)
+        )?.pages[0]?.cursor
+      ).toBe(5)
+    );
+    for (const key of usageKeys) expect(queryClient.getQueryState(key)?.isInvalidated).toBe(false);
+    queryClient.setQueryData(sessionKeys.usage(WORKSPACE_ID, SESSION_ID), {
+      context: { state: "reported", sequence: 412, used: 89_700 },
+      turn_count: 12,
+    });
+    act(() =>
+      sources[0]!.emit("transcript_snapshot", {
+        entries: [],
+        epoch: 2,
+        generation: 2,
+        has_older: false,
+        max_sequence: 0,
+        cursor: 0,
+        session_id: SESSION_ID,
+        reset: "conversation_cleared",
+      })
+    );
+    await waitFor(() =>
+      expect(queryClient.getQueryData(sessionKeys.contextReset(WORKSPACE_ID, SESSION_ID))).toBe(1)
+    );
+    expect(queryClient.getQueryData(sessionKeys.usage(WORKSPACE_ID, SESSION_ID))).toBeUndefined();
+    unmount();
+    queryClient.clear();
+  });
+});

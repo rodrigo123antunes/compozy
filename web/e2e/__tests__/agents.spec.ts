@@ -1,0 +1,499 @@
+import { fileURLToPath } from "node:url";
+import path from "node:path";
+
+import { appWindow, ensureAppWindow, openAppWindow } from "../fixtures/os-navigation";
+import { sessionLifecycleSelectors } from "../fixtures/selectors";
+import type { Page } from "@playwright/test";
+
+import { expect, test } from "../fixtures/test";
+import { ensureProjectWorkspace, completeOnboardingIfPrompted } from "../fixtures/workspace";
+import { humanizeAgentSlug } from "@/systems/agent/lib/agent-identity";
+
+const browserLifecycleFixture = path.resolve(
+  path.dirname(fileURLToPath(import.meta.url)),
+  "..",
+  "..",
+  "..",
+  "internal",
+  "testutil",
+  "acpmock",
+  "testdata",
+  "browser_session_lifecycle_fixture.json"
+);
+const mockAgentProvider = "acpmock";
+const reasoningCatalogModel = "qa-browser-model-alt";
+const reasoningCatalogModelLabel = "QA Browser Model Alt";
+
+test.use({ viewport: { width: 1440, height: 900 } });
+
+test.beforeEach(async ({ appPage, runtime }) => {
+  await ensureProjectWorkspace(appPage, runtime);
+});
+
+test.describe("seeded agent detail", () => {
+  test.use({
+    runtimeOptions: {
+      seed: {
+        mockAgents: [
+          {
+            fixturePath: browserLifecycleFixture,
+            fixtureAgent: "browser-lifecycle-agent",
+            agentName: "agent-detail-primary",
+          },
+          {
+            fixturePath: browserLifecycleFixture,
+            fixtureAgent: "browser-lifecycle-agent",
+            agentName: "agent-detail-secondary",
+            category_path: ["Engineering"],
+          },
+        ],
+      },
+    },
+  });
+
+  test("operator inspects, duplicates, edits, creates, and deletes agents", async ({
+    appPage,
+    runtime,
+  }) => {
+    await test.step("operator opens an agent detail page and changes the session command picker selection", async () => {
+      const ui = sessionLifecycleSelectors(appPage);
+
+      await completeOnboardingIfPrompted(ui);
+      const agentsWin = await openAppWindow(appPage, "Agents", "agents");
+      const fleet = sessionLifecycleSelectors(agentsWin);
+      await expect.poll(() => new URL(appPage.url()).pathname).toBe("/agents");
+
+      await expect(fleet.agentRow("agent-detail-primary")).toBeVisible();
+      await expect(fleet.agentRow("agent-detail-secondary")).toBeVisible();
+      await fleet.agentRow("agent-detail-primary").click();
+      await expect.poll(() => new URL(appPage.url()).pathname).toBe("/agents/agent-detail-primary");
+
+      await expect(appPage.getByTestId("agent-detail-page")).toBeVisible();
+      await expect(appPage.getByTestId("agent-detail-header-name")).toHaveText(
+        "Agent Detail Primary"
+      );
+      await expect(appPage.getByTestId("agent-profile-kind")).toHaveText("On-demand");
+      await expect(appPage.getByTestId("agent-setup-check-ins")).toHaveCount(0);
+
+      await appPage.getByTestId("agent-setup-tools").click();
+      await expect.poll(() => new URL(appPage.url()).searchParams.get("panel")).toBe("tools");
+      await expect(appPage.getByTestId("agent-profile-panel")).toBeVisible();
+      await expect(appPage.getByTestId("agent-mcp-empty")).toBeVisible();
+      await appPage.keyboard.press("Escape");
+      await expect(appPage.getByTestId("agent-profile-panel")).toHaveCount(0);
+
+      await fleet.agentPageNewSession.click();
+      const trigger = appPage.getByTestId("session-create-agent-select");
+      await expect(trigger).toBeVisible();
+      await trigger.click();
+
+      const secondary = appPage.getByTestId("agent-command-item-agent-detail-secondary");
+      await expect(secondary).toBeVisible();
+      await secondary.click();
+      await expect(trigger).toContainText(humanizeAgentSlug("agent-detail-secondary"));
+
+      await trigger.click();
+      await expect(secondary).toHaveAttribute("data-checked", "true");
+
+      await appPage.keyboard.press("Escape");
+      await appPage.keyboard.press("Escape");
+      await expect(appPage.getByTestId("session-create-dialog")).toHaveCount(0);
+    });
+
+    await test.step("operator duplicates an agent from the overflow menu", async () => {
+      await appPage.goto(runtime.url("/agents"), { waitUntil: "domcontentloaded" });
+      const ui = sessionLifecycleSelectors(appPage);
+      await completeOnboardingIfPrompted(ui);
+      const agentsWin = await ensureAppWindow(appPage, "Agents", "agents");
+      const fleet = sessionLifecycleSelectors(agentsWin);
+      await fleet.agentRow("agent-detail-primary").click();
+
+      await appPage.getByTestId("agent-page-overflow").click();
+      await appPage.getByTestId("agent-page-duplicate").click();
+      await expect(appPage.getByTestId("agent-create-dialog")).toBeVisible();
+      await expect(appPage.getByTestId("agent-create-name")).toHaveValue("");
+      await expect(appPage.getByText("MCP servers are not copied.")).toHaveCount(0);
+
+      await appPage.keyboard.press("Escape");
+      await expect(appPage.getByTestId("agent-create-dialog")).toHaveCount(0);
+    });
+
+    await test.step("operator renames an agent in place and the slug stays", async () => {
+      await appPage.goto(runtime.url("/agents"), { waitUntil: "domcontentloaded" });
+      const ui = sessionLifecycleSelectors(appPage);
+      await completeOnboardingIfPrompted(ui);
+      const agentsWin = await ensureAppWindow(appPage, "Agents", "agents");
+      const fleet = sessionLifecycleSelectors(agentsWin);
+      await fleet.agentRow("agent-detail-primary").click();
+      await expect(appPage.getByTestId("agent-detail-page")).toBeVisible();
+
+      await appPage.getByRole("button", { name: /^Edit name:/ }).click();
+      const saveResponse = appPage.waitForResponse(
+        response =>
+          response.request().method() === "PUT" &&
+          response.url().includes("/api/agents/agent-detail-primary")
+      );
+      await appPage.getByRole("textbox", { name: "Name" }).fill("Primary Captain");
+      await appPage.keyboard.press("Enter");
+      expect((await saveResponse).ok()).toBe(true);
+      await expect(appPage.getByTestId("agent-detail-header-name")).toHaveText("Primary Captain");
+      await expect.poll(() => new URL(appPage.url()).pathname).toBe("/agents/agent-detail-primary");
+    });
+
+    await test.step("an old settings link lands on the home's own control", async () => {
+      await appPage.goto(runtime.url("/agents/agent-detail-primary/settings?section=runtime"), {
+        waitUntil: "domcontentloaded",
+      });
+      await completeOnboardingIfPrompted(sessionLifecycleSelectors(appPage));
+      await expect(appPage.getByTestId("agent-profile-panel")).toHaveCount(0);
+      await expect(appPage.getByTestId("agent-setup-model-select")).toBeVisible();
+    });
+
+    await test.step("operator creates an agent with a persisted model and reasoning default", async () => {
+      if (!runtime.paths) {
+        throw new Error("agent create browser test requires launch-mode runtime paths");
+      }
+
+      const workspace = await runtime.resolveWorkspace(runtime.paths.workspaceDir);
+      await appPage.goto(runtime.url("/agents"), { waitUntil: "domcontentloaded" });
+      await completeOnboardingIfPrompted(sessionLifecycleSelectors(appPage));
+
+      await appPage.getByTestId("agents-topbar-create").click();
+      await expect(appPage.getByTestId("agent-create-dialog")).toBeVisible();
+      await appPage.getByTestId("agent-create-name").fill("reasoning-default-agent");
+      await expect(appPage.getByTestId("agent-create-runtime")).toBeVisible();
+
+      const runtimeTrigger = appPage.getByTestId("agent-create-runtime-select");
+      await runtimeTrigger.click();
+      await expect(appPage.getByTestId("runtime-selector-popup")).toBeVisible();
+      await appPage
+        .locator(`[data-provider="${mockAgentProvider}"][data-model="${reasoningCatalogModel}"]`)
+        .click();
+
+      const reasoningStrip = appPage.getByTestId("runtime-selector-reasoning");
+      await expect(reasoningStrip).toHaveAttribute("data-reasoning-mode", "levels");
+      const reasoningSlider = reasoningStrip.getByRole("slider");
+      await reasoningSlider.press("End");
+      await expect(reasoningSlider).toHaveAttribute("aria-valuetext", "High");
+      await appPage.keyboard.press("Escape");
+      await expect(runtimeTrigger).toContainText(reasoningCatalogModelLabel);
+      await expect(runtimeTrigger).toContainText("High");
+
+      await appPage
+        .getByTestId("agent-create-prompt")
+        .locator('[contenteditable="true"]')
+        .fill("Keep runtime selection truthful.");
+
+      const createRequestPromise = appPage.waitForRequest(
+        request => request.method() === "POST" && new URL(request.url()).pathname === "/api/agents"
+      );
+      const createResponsePromise = appPage.waitForResponse(
+        response =>
+          response.request().method() === "POST" &&
+          new URL(response.url()).pathname === "/api/agents"
+      );
+      await appPage.getByTestId("submit-agent-create").click();
+
+      const createRequest = await createRequestPromise;
+      const createResponse = await createResponsePromise;
+      expect(new URL(createRequest.url()).searchParams.get("profile")).toBe("default");
+      expect(createRequest.postDataJSON()).toMatchObject({
+        scope: "workspace",
+        agent: {
+          name: "reasoning-default-agent",
+          provider: mockAgentProvider,
+          model: reasoningCatalogModel,
+          reasoning_effort: "high",
+          prompt: "Keep runtime selection truthful.",
+        },
+      });
+      expect(createResponse.ok()).toBe(true);
+
+      const created = (await createResponse.json()) as {
+        agent: { name: string; provider: string; model?: string; reasoning_effort?: string };
+      };
+      expect(created.agent).toMatchObject({
+        name: "reasoning-default-agent",
+        provider: mockAgentProvider,
+        model: reasoningCatalogModel,
+        reasoning_effort: "high",
+      });
+      await expect
+        .poll(() => new URL(appPage.url()).pathname)
+        .toBe("/agents/reasoning-default-agent");
+
+      const rehydrated = await runtime.requestJSON<{
+        agent: { name: string; provider: string; model?: string; reasoning_effort?: string };
+      }>(`/api/agents/reasoning-default-agent?workspace=${encodeURIComponent(workspace.id)}`);
+      expect(rehydrated.agent).toMatchObject({
+        name: "reasoning-default-agent",
+        provider: mockAgentProvider,
+        model: reasoningCatalogModel,
+        reasoning_effort: "high",
+      });
+    });
+
+    await test.step("operator deletes an agent from the overflow with typed confirm", async () => {
+      await appPage.goto(runtime.url("/agents"), { waitUntil: "domcontentloaded" });
+      const ui = sessionLifecycleSelectors(appPage);
+      await completeOnboardingIfPrompted(ui);
+      const agentsWin = await ensureAppWindow(appPage, "Agents", "agents");
+      const fleet = sessionLifecycleSelectors(agentsWin);
+      await fleet.agentRow("agent-detail-secondary").click();
+      await appPage.getByTestId("agent-page-overflow").click();
+      await appPage.getByTestId("agent-page-delete").click();
+      await expect(appPage.getByTestId("agent-delete-dialog")).toBeVisible();
+      await expect(appPage.getByTestId("agent-delete-confirm")).toBeDisabled();
+      await appPage.getByTestId("agent-delete-confirm-typing").fill("agent-detail-secondary");
+      await expect(appPage.getByTestId("agent-delete-confirm")).toBeEnabled();
+      await appPage.getByTestId("agent-delete-confirm").click();
+      await expect.poll(() => new URL(appPage.url()).pathname).toBe("/agents");
+      await expect(fleet.agentRow("agent-detail-secondary")).toHaveCount(0);
+    });
+  });
+});
+
+/** Creates an always-on agent through the create screen, unstarted, at the given permission level. */
+async function createAlwaysOnAgent(
+  appPage: Page,
+  runtime: { url: (path: string) => string },
+  name: string,
+  level?: "approve-all"
+) {
+  await appPage.goto(runtime.url("/agents"), { waitUntil: "domcontentloaded" });
+  await completeOnboardingIfPrompted(sessionLifecycleSelectors(appPage));
+  await appPage.getByTestId("agents-topbar-create").click();
+  await expect(appPage.getByTestId("agent-create-dialog")).toBeVisible();
+  await appPage.getByTestId("agent-create-name").fill(name);
+  const runtimeTrigger = appPage.getByTestId("agent-create-runtime-select");
+  await runtimeTrigger.click();
+  await expect(appPage.getByTestId("runtime-selector-popup")).toBeVisible();
+  await appPage
+    .locator(`[data-provider="${mockAgentProvider}"][data-model="${reasoningCatalogModel}"]`)
+    .click();
+  await appPage.keyboard.press("Escape");
+  await expect(runtimeTrigger).toContainText(reasoningCatalogModelLabel);
+  await appPage
+    .getByTestId("agent-create-prompt")
+    .locator('[contenteditable="true"]')
+    .fill("Watch the repository and report what needs attention.");
+
+  // A runtime available in both scopes survives switching to Always-on's global scope.
+  const alwaysOn = appPage.getByTestId("agent-create-kind-always-on");
+  await expect(alwaysOn).toContainText("Always-on");
+  await expect(appPage.getByTestId("agent-create-kind-on-demand")).toContainText("On-demand");
+  await alwaysOn.click();
+  await expect(runtimeTrigger).toContainText(reasoningCatalogModelLabel);
+  await appPage.getByTestId("agent-create-where").click();
+  await appPage.getByText("Decide later", { exact: true }).click();
+  await expect(appPage.getByTestId("agent-create-where")).toContainText("Decide later");
+
+  await appPage.getByRole("button", { name: "Advanced", exact: true }).click();
+  const acceptEdits = appPage.getByTestId("agent-create-permissions-approve-edits");
+  await expect(acceptEdits).toContainText("Accept edits");
+  await expect(acceptEdits).toHaveAttribute("aria-checked", "true");
+  if (level) {
+    const fullAccess = appPage.getByTestId(`agent-create-permissions-${level}`);
+    await expect(fullAccess).toContainText("Full access");
+    await fullAccess.click();
+  }
+
+  const createRequest = appPage.waitForRequest(
+    request => request.method() === "POST" && new URL(request.url()).pathname === "/api/agents"
+  );
+  const createResponse = appPage.waitForResponse(
+    response =>
+      response.request().method() === "POST" && new URL(response.url()).pathname === "/api/agents"
+  );
+  await appPage.getByTestId("submit-agent-create").click();
+  expect((await createRequest).postDataJSON()).toMatchObject({
+    scope: "global",
+    agent: {
+      name,
+      kind: "always_on",
+      provider: mockAgentProvider,
+      model: reasoningCatalogModel,
+      ...(level ? { permissions: level } : {}),
+    },
+  });
+  const response = await createResponse;
+  expect(response.ok(), await response.text()).toBe(true);
+  await expect.poll(() => new URL(appPage.url()).pathname).toBe(`/agents/${name}`);
+}
+
+test.describe("always-on agent vocabulary", () => {
+  // The seed registers the acpmock provider and its catalog models for the create screen.
+  test.use({
+    runtimeOptions: {
+      seed: {
+        mockAgents: [
+          {
+            fixturePath: browserLifecycleFixture,
+            fixtureAgent: "browser-lifecycle-agent",
+            agentName: "always-on-vocabulary-seed",
+          },
+        ],
+      },
+    },
+  });
+
+  test("E2E-001: an always-on agent created at Full access reads Always-on and Full access", async ({
+    appPage,
+    runtime,
+  }) => {
+    await createAlwaysOnAgent(appPage, runtime, "watch-captain", "approve-all");
+    await expect(appPage.getByTestId("agent-profile-kind")).toHaveText("Always-on");
+    await expect(appPage.getByTestId("agent-setup-permissions")).toContainText("Full access");
+    await expect(appPage.getByText(/Stays on/)).toHaveCount(0);
+  });
+
+  test("E2E-002: the setup rows and pages use one noun, and old slugs still open them", async ({
+    appPage,
+    runtime,
+  }) => {
+    await createAlwaysOnAgent(appPage, runtime, "watch-setup");
+    await expect(appPage.getByText("Setup", { exact: true })).toBeVisible();
+    const setupRows = [
+      ["agent-setup-behavior", /^Instructions/],
+      ["agent-setup-model", /^Model/],
+      ["agent-setup-check-ins", /^Heartbeat/],
+      ["agent-setup-memory", /^Memory/],
+      ["agent-setup-tools", /^Tools/],
+      ["agent-setup-permissions", /^Permissions/],
+    ] as const;
+    for (const [testId, title] of setupRows) {
+      await expect(appPage.getByTestId(testId)).toHaveText(title);
+    }
+
+    await appPage.getByTestId("agent-setup-check-ins").click();
+    await expect.poll(() => new URL(appPage.url()).pathname).toBe("/agents/watch-setup/check-ins");
+    const agentsWindow = appWindow(appPage, "agents");
+    const content = agentsWindow.locator('[data-slot="page-content"]');
+    await expect(appPage.getByRole("heading", { level: 1, name: "Heartbeat" })).toBeVisible();
+    await expect(content.getByRole("heading", { level: 2, name: "Heartbeat" })).toBeVisible();
+
+    await appPage.goto(runtime.url("/agents/watch-setup/what-it-does"), {
+      waitUntil: "domcontentloaded",
+    });
+    await completeOnboardingIfPrompted(sessionLifecycleSelectors(appPage));
+    await expect(appPage.getByRole("heading", { level: 1, name: "Instructions" })).toBeVisible();
+    await expect(content.getByRole("heading", { level: 2, name: "Instructions" })).toBeVisible();
+  });
+});
+
+test.describe("fleet scan journey", () => {
+  test.use({
+    runtimeOptions: {
+      seed: {
+        mockAgents: [
+          {
+            fixturePath: browserLifecycleFixture,
+            fixtureAgent: "browser-lifecycle-agent",
+            agentName: "fleet-release",
+            category_path: ["Engineering", "Release"],
+          },
+          {
+            fixturePath: browserLifecycleFixture,
+            fixtureAgent: "browser-lifecycle-agent",
+            agentName: "fleet-ops",
+            category_path: ["Operations"],
+          },
+        ],
+      },
+    },
+  });
+
+  test("operator lands on /agents, searches, filters by maker, clears, and opens an agent", async ({
+    appPage,
+  }) => {
+    const ui = sessionLifecycleSelectors(appPage);
+    await completeOnboardingIfPrompted(ui);
+    const agentsWin = await openAppWindow(appPage, "Agents", "agents");
+    const fleet = sessionLifecycleSelectors(agentsWin);
+    await expect.poll(() => new URL(appPage.url()).pathname).toBe("/agents");
+
+    await expect(fleet.agentRow("fleet-release")).toBeVisible();
+    await expect(fleet.agentRow("fleet-ops")).toBeVisible();
+
+    await expect(appPage.getByTestId("agents-section-on-demand")).toBeVisible();
+    await appPage.getByTestId("listing-view-rows").click();
+    await expect.poll(() => new URL(appPage.url()).searchParams.get("view")).toBe("rows");
+    await expect(fleet.agentRow("fleet-release")).toBeVisible();
+    await appPage.getByTestId("listing-view-cards").click();
+    await expect.poll(() => new URL(appPage.url()).searchParams.get("view")).toBeNull();
+
+    await appPage.getByTestId("agent-fleet-search").fill("release");
+    await expect.poll(() => new URL(appPage.url()).searchParams.get("q")).toBe("release");
+    await expect(fleet.agentRow("fleet-release")).toBeVisible();
+    await expect(fleet.agentRow("fleet-ops")).toHaveCount(0);
+
+    const search = appPage.getByTestId("agent-fleet-search");
+    await appPage.getByTestId("agent-fleet-filters-add").click();
+    await appPage.getByRole("option", { name: "Made by" }).click();
+    await appPage.getByRole("option", { name: "An extension" }).click();
+    await expect.poll(() => new URL(appPage.url()).searchParams.get("owner")).toBe("extension");
+
+    await search.fill("ops");
+    await expect(search).toHaveValue("ops");
+    await expect.poll(() => new URL(appPage.url()).searchParams.get("q")).toBe("ops");
+    await expect(appPage.getByTestId("agent-fleet-filtered-empty")).toBeVisible();
+    await appPage.getByTestId("agent-fleet-clear-filters").click();
+    await expect.poll(() => new URL(appPage.url()).search).toBe("");
+    await expect(fleet.agentRow("fleet-ops")).toBeVisible();
+
+    await fleet.agentRow("fleet-release").click();
+    await expect.poll(() => new URL(appPage.url()).pathname).toBe("/agents/fleet-release");
+  });
+});
+
+test.describe("empty-fleet first-contact journey", () => {
+  test("operator sees first-run empty copy and can open New agent", async ({
+    appPage,
+    runtime,
+  }) => {
+    await appPage.route("**/api/agents**", async route => {
+      const url = new URL(route.request().url());
+      if (url.pathname === "/api/agents/catalog") {
+        await route.fulfill({
+          status: 200,
+          contentType: "application/json",
+          body: JSON.stringify({
+            agents: [],
+            facets: { active: 0, categories: [], idle: 0, total: 0 },
+            page: {
+              has_more: false,
+              limit: Number(url.searchParams.get("limit") ?? "50"),
+              total: 0,
+            },
+            sessions_available: true,
+          }),
+        });
+        return;
+      }
+      if (url.pathname !== "/api/agents") {
+        await route.fallback();
+        return;
+      }
+      await route.fulfill({
+        status: 200,
+        contentType: "application/json",
+        body: JSON.stringify({ agents: [] }),
+      });
+    });
+    await appPage.goto(runtime.url("/agents"), { waitUntil: "domcontentloaded" });
+    const ui = sessionLifecycleSelectors(appPage);
+    await completeOnboardingIfPrompted(ui);
+    await expect.poll(() => new URL(appPage.url()).pathname).toBe("/agents");
+
+    await expect(appPage.getByTestId("agent-fleet-empty")).toBeVisible();
+    await expect(appPage.getByText("No agents yet")).toBeVisible();
+    await expect(
+      appPage.getByText(
+        "An agent is an assistant with its own instructions and model. Create one to start working with it."
+      )
+    ).toBeVisible();
+    await expect(appPage.getByTestId("agents-topbar-create")).toHaveCount(0);
+    await appPage.getByTestId("agent-fleet-empty-create").click();
+    await expect(appPage.getByTestId("agent-create-dialog")).toBeVisible();
+  });
+});

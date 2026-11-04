@@ -1,0 +1,152 @@
+import { useId, useState } from "react";
+import { ChevronDown, Gauge } from "@compozy/ui/icons";
+
+import { Button, HelpTip, SkeletonRegion, cn } from "@compozy/ui";
+
+import { withOccurrenceKeys } from "@/lib/occurrence-keys";
+
+import type { LoopStepsProgressModel } from "../../lib/loop-run-progress";
+import { type LoopRosterReach, loopRosterReachNote } from "../../lib/loop-run-registers-view";
+import { LoopSection } from "../loop-section";
+import { LOOP_PROGRESS_SEGMENT_CLASS } from "./loop-progress-segment-class";
+import {
+  PROGRESS_CARD_CLASS,
+  PROGRESS_HEADING_CLASS,
+  PROGRESS_META_CLASS,
+} from "./loop-run-page-classes";
+import { LoopRunStepRow } from "./loop-run-step-row";
+import { LoopRunStepRowsSkeleton } from "./loop-run-step-rows-skeleton";
+
+interface LoopRunStepsProgressProps {
+  progress: LoopStepsProgressModel;
+  /** The loop's stated goal; falls back to the run identity when no contract loads. */
+  goal?: string;
+  doneWhen?: string;
+  /** How much of the roster the step list below was built from. */
+  reach?: LoopRosterReach;
+  /** The roster has not answered: the step list shows its skeleton rather than being absent. */
+  stepsPending?: boolean;
+}
+
+/**
+ * How far along the run is, in steps and rounds.
+ *
+ * Two channels, and they do not overlap. The bar is magnitude: it says how much
+ * of the round has settled and nothing else, which is why a parked segment keeps
+ * the informational ink instead of shouting. The alarm-bearing state lives one
+ * line below on each step's chip, where tone, glyph and word travel together.
+ * Colouring both would spend two channels on one fact.
+ */
+export function LoopRunStepsProgress({
+  progress,
+  goal,
+  doneWhen,
+  reach,
+  stepsPending = false,
+}: LoopRunStepsProgressProps) {
+  // The served counts above stay exact whatever the roster read (SI-12). The step
+  // list below is built from the roster itself, so a partial read makes it short —
+  // and it has to say so rather than read as the whole round.
+  const reachNote = reach ? loopRosterReachNote(reach) : null;
+  // In-page state like the register's lane; opens in place so hidden rows
+  // return in graph order.
+  const [showAll, setShowAll] = useState(false);
+  const listId = useId();
+  const fold = progress.fold;
+  const rows = fold && !showAll ? progress.steps.filter(step => !step.quiet) : progress.steps;
+  return (
+    <LoopSection
+      data-testid="loop-run-progress"
+      gist={progress.label}
+      icon={<Gauge aria-hidden="true" />}
+      title="Progress"
+    >
+      <div className={PROGRESS_CARD_CLASS}>
+        <div className="p-4">
+          <div className="flex items-start gap-1">
+            <h2 className={PROGRESS_HEADING_CLASS} data-testid="loop-run-progress-label">
+              {goal ?? progress.label}
+            </h2>
+            {/* The finish line is reference, not headline: one tap away. */}
+            {doneWhen ? (
+              <HelpTip className="mt-1" data-testid="loop-run-done-when" label="When is it done?">
+                {doneWhen}
+              </HelpTip>
+            ) : null}
+          </div>
+          {progress.segments.length > 0 ? (
+            <div
+              aria-label={progress.ariaLabel}
+              className="mt-4 flex h-1.5 gap-1"
+              data-testid="loop-run-progress-bar"
+              role="img"
+            >
+              {withOccurrenceKeys(progress.segments, segment => segment).map(
+                ({ item: segment, key }) => (
+                  <span
+                    className={`flex-1 rounded-pill ${LOOP_PROGRESS_SEGMENT_CLASS[segment]}`}
+                    data-state={segment}
+                    key={key}
+                  />
+                )
+              )}
+            </div>
+          ) : null}
+          <div className={PROGRESS_META_CLASS}>
+            <span data-testid="loop-run-progress-meta">{progress.leftMeta}</span>
+            {progress.rightMeta ? (
+              <span className="whitespace-nowrap text-subtle" data-testid="loop-run-progress-right">
+                {progress.rightMeta}
+              </span>
+            ) : null}
+          </div>
+          {rows.length > 0 ? (
+            <ul className="mt-4 flex flex-col" data-testid="loop-run-step-list" id={listId}>
+              {rows.map(step => (
+                <LoopRunStepRow key={step.key} step={step} />
+              ))}
+            </ul>
+          ) : stepsPending ? (
+            <SkeletonRegion label="Loading steps">
+              <LoopRunStepRowsSkeleton />
+            </SkeletonRegion>
+          ) : null}
+          {fold ? (
+            // The summary keeps the folded rows' fates on screen while hidden.
+            <div
+              className="flex flex-wrap items-center gap-x-3 gap-y-1 border-t border-line-soft pt-2"
+              data-testid="loop-run-step-fold"
+            >
+              <Button
+                aria-controls={listId}
+                aria-expanded={showAll}
+                data-testid="loop-run-step-fold-toggle"
+                onClick={() => setShowAll(open => !open)}
+                size="sm"
+                type="button"
+                variant="ghost"
+              >
+                {showAll ? "Show fewer steps" : `${fold.hiddenCount} more steps`}
+                <ChevronDown
+                  aria-hidden="true"
+                  className={cn(
+                    "transition-transform motion-reduce:transition-none",
+                    showAll && "rotate-180"
+                  )}
+                />
+              </Button>
+              <span className="text-form-hint text-subtle" data-testid="loop-run-step-fold-summary">
+                {fold.summary}
+              </span>
+            </div>
+          ) : null}
+          {reachNote ? (
+            <p className="mt-3 text-form-hint text-subtle" data-testid="loop-run-progress-reach">
+              {reachNote}
+            </p>
+          ) : null}
+        </div>
+      </div>
+    </LoopSection>
+  );
+}

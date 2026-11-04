@@ -1,0 +1,834 @@
+package transcript
+
+import (
+	"encoding/json"
+	"reflect"
+	"slices"
+	"strings"
+	"testing"
+	"time"
+
+	"github.com/compozy/compozy/internal/acp"
+	commandpkg "github.com/compozy/compozy/internal/command"
+	"github.com/compozy/compozy/internal/mention"
+	speedpkg "github.com/compozy/compozy/internal/speed"
+	"github.com/compozy/compozy/internal/store"
+)
+
+func TestParseLooseEventBuildsToolResultFromLoosePayload(t *testing.T) {
+	t.Parallel()
+
+	parsed := parseLooseEvent(event{Type: acp.EventTypeToolResult}, map[string]any{
+		"type":         acp.EventTypeToolResult,
+		"tool_call_id": "call-loose",
+		"title":        "Bash",
+		"rawInput": map[string]any{
+			"command": "pwd",
+		},
+		"rawOutput": map[string]any{
+			"stdout": "workspace\n",
+		},
+	})
+
+	if got := parsed.ToolCallID; got != "call-loose" {
+		t.Fatalf("ToolCallID = %q, want %q", got, "call-loose")
+	}
+	if got := parsed.ToolName; got != "Bash" {
+		t.Fatalf("ToolName = %q, want %q", got, "Bash")
+	}
+	if got := string(parsed.ToolInput); got != `{"command":"pwd"}` {
+		t.Fatalf("ToolInput = %s, want JSON command payload", got)
+	}
+	if parsed.ToolResult == nil {
+		t.Fatal("ToolResult = nil, want populated result")
+	}
+	if got := parsed.ToolResult.Stdout; got != "workspace\n" {
+		t.Fatalf("ToolResult.Stdout = %q, want %q", got, "workspace\n")
+	}
+	if parsed.ToolError {
+		t.Fatal("ToolError = true, want false")
+	}
+
+	if got := string(firstNonEmptyRaw(nil, json.RawMessage(`{"ok":true}`))); got != `{"ok":true}` {
+		t.Fatalf("firstNonEmptyRaw() = %s, want non-empty raw payload", got)
+	}
+	if got := firstNonNil(nil, "", "value"); got != "" {
+		t.Fatalf("firstNonNil(nil, \"\", \"value\") = %#v, want empty string first", got)
+	}
+}
+
+func TestMarshalAgentEventBuildsCanonicalPayload(t *testing.T) {
+	t.Parallel()
+
+	totalTokens := int64(4)
+	payload, err := MarshalAgentEvent(acp.AgentEvent{
+		Type:      acp.EventTypeDone,
+		SessionID: "acp-1",
+		TurnID:    "turn-1",
+		Timestamp: time.Date(2026, 4, 3, 15, 0, 0, 0, time.UTC),
+		Text:      "done",
+		Error:     "none",
+		Usage: &acp.TokenUsage{
+			TurnID:      "turn-1",
+			TotalTokens: &totalTokens,
+			Timestamp:   time.Date(2026, 4, 3, 15, 0, 1, 0, time.UTC),
+		},
+	})
+	if err != nil {
+		t.Fatalf("MarshalAgentEvent(structured) error = %v", err)
+	}
+
+	var decoded map[string]any
+	if err := json.Unmarshal([]byte(payload), &decoded); err != nil {
+		t.Fatalf("json.Unmarshal(payload) error = %v", err)
+	}
+	if decoded["schema"] != CanonicalSchema {
+		t.Fatalf("decoded[schema] = %v, want %q", decoded["schema"], CanonicalSchema)
+	}
+	if decoded["type"] != acp.EventTypeDone {
+		t.Fatalf("decoded[type] = %v, want %q", decoded["type"], acp.EventTypeDone)
+	}
+	if decoded["text"] != "done" {
+		t.Fatalf("decoded[text] = %v, want %q", decoded["text"], "done")
+	}
+}
+
+func TestMarshalAgentEventExtractsToolResultShapeWithoutPersistingRaw(t *testing.T) {
+	t.Run("Should extract structured tool result fields without persisting raw payloads", func(t *testing.T) {
+		t.Parallel()
+
+		payload, err := MarshalAgentEvent(acp.AgentEvent{
+			Type: acp.EventTypeToolResult,
+			Raw: json.RawMessage(`{
+				"sessionUpdate":"tool_call_update",
+				"status":"failed",
+				"rawOutput":{"stderr":"boom"},
+				"content":[{"type":"content","content":{"type":"text","text":"boom"}}],
+				"_meta":{"claudeCode":{"toolName":"Bash"}},
+				"rawInput":{"command":"pwd"}
+			}`),
+			Title: "tool result",
+		})
+		if err != nil {
+			t.Fatalf("MarshalAgentEvent(raw) error = %v", err)
+		}
+
+		var decoded struct {
+			Schema     string          `json:"schema"`
+			ToolName   string          `json:"tool_name"`
+			ToolInput  json.RawMessage `json:"tool_input"`
+			ToolError  bool            `json:"tool_error"`
+			ToolResult ToolResult      `json:"tool_result"`
+			Raw        json.RawMessage `json:"raw"`
+		}
+		if err := json.Unmarshal([]byte(payload), &decoded); err != nil {
+			t.Fatalf("json.Unmarshal(raw payload) error = %v", err)
+		}
+		if decoded.Schema != CanonicalSchema {
+			t.Fatalf("Schema = %q, want %q", decoded.Schema, CanonicalSchema)
+		}
+		if decoded.ToolName != "Bash" {
+			t.Fatalf("ToolName = %q, want %q", decoded.ToolName, "Bash")
+		}
+		if got := string(decoded.ToolInput); got != `{"command":"pwd"}` {
+			t.Fatalf("ToolInput = %s, want command payload", got)
+		}
+		if !decoded.ToolError {
+			t.Fatal("ToolError = false, want true")
+		}
+		if decoded.ToolResult.Stderr != "boom" || decoded.ToolResult.Error != "boom" {
+			t.Fatalf("ToolResult = %#v, want stderr/error boom", decoded.ToolResult)
+		}
+		if len(decoded.Raw) != 0 {
+			t.Fatalf("Raw = %s, want empty persisted raw payload", string(decoded.Raw))
+		}
+	})
+}
+
+func TestBuildToolResultDecodesRawJSONObjectPayload(t *testing.T) {
+	t.Parallel()
+
+	t.Run("ShouldDecodeRawJSONObjectPayload", func(t *testing.T) {
+		result := buildToolResult("Read", false, "", json.RawMessage(`{
+			"stdout":"workspace\n",
+			"content":"workspace\n",
+			"structuredPatch":{"ops":[{"op":"replace","path":"/tmp/demo.txt"}]}
+		}`))
+		if result == nil {
+			t.Fatal("buildToolResult() = nil, want populated result")
+			return
+		}
+		if got := result.Stdout; got != "workspace\n" {
+			t.Fatalf("Stdout = %q, want %q", got, "workspace\n")
+		}
+		if got := result.Content; got != "workspace\n" {
+			t.Fatalf("Content = %q, want %q", got, "workspace\n")
+		}
+		if len(result.StructuredPatch) == 0 {
+			t.Fatal("StructuredPatch = empty, want preserved patch payload")
+		}
+	})
+}
+
+func TestUnmarshalAgentEventRoundTripPreservesStructuredFieldsWithoutRaw(t *testing.T) {
+	t.Run("Should preserve redacted Goal metadata across canonical and UI payloads", func(t *testing.T) {
+		t.Parallel()
+
+		original := acp.AgentEvent{Type: acp.EventTypeUserMessage}.WithGoalPromptMeta(&acp.GoalPromptMeta{
+			Kind:  acp.GoalPromptKindWork,
+			RunID: "run-goal", NodeID: "node-goal", PromptID: "COMPOZY_CLAIM_goal-secret",
+			Generation: 2, ItemIndex: 3, PromptAttempt: 1, Turn: new(4),
+		})
+		content, err := MarshalAgentEvent(original)
+		if err != nil {
+			t.Fatalf("MarshalAgentEvent() error = %v", err)
+		}
+		assertNoDisplayLeaks(t, content, []string{"COMPOZY_CLAIM_goal-secret"})
+		decoded, err := UnmarshalAgentEvent(content)
+		if err != nil {
+			t.Fatalf("UnmarshalAgentEvent() error = %v", err)
+		}
+		want := original.GoalPromptMeta()
+		want.PromptID = "compozy_claim_[REDACTED]"
+		if got := decoded.GoalPromptMeta(); !reflect.DeepEqual(got, want) {
+			t.Fatalf("decoded Goal metadata = %#v, want %#v", got, want)
+		}
+		ui := UIAgentEventPayloadFromEvent(original)
+		if !reflect.DeepEqual(ui.Goal, want) || original.GoalPromptMeta().PromptID != "COMPOZY_CLAIM_goal-secret" {
+			t.Fatalf("UI Goal metadata = %#v, want preserved redacted metadata and unchanged source", ui.Goal)
+		}
+	})
+
+	t.Run("Should round-trip a delivery receipt and redact display names without mutating input", func(t *testing.T) {
+		t.Parallel()
+		original := acp.AgentEvent{
+			Type:   acp.EventTypePromptDelivery,
+			TurnID: "turn",
+		}.WithDelivery(&acp.DeliveryManifest{
+			TurnID:   "turn",
+			SentAt:   time.Date(2026, 9, 12, 1, 2, 3, 0, time.UTC),
+			Estimate: acp.TextEstimateMethod,
+			Spans: []acp.DeliveredSpan{
+				{Key: "skills", Kind: "text", Bytes: 4, Tokens: new(int64(1)), Unchanged: true, StartupDedup: true},
+				{Key: "attachment", Kind: "binary", Bytes: 9, Name: "compozy_claim_secret"},
+			},
+		})
+		content, err := MarshalAgentEvent(original)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var raw map[string]json.RawMessage
+		if err := json.Unmarshal([]byte(content), &raw); err != nil {
+			t.Fatal(err)
+		}
+		if len(raw["delivery"]) == 0 || strings.Contains(content, "compozy_claim_secret") ||
+			!strings.Contains(content, `"unchanged":false`) ||
+			!strings.Contains(content, `"startup_dedup":true`) ||
+			strings.Contains(content, `"hook_modified"`) {
+			t.Fatalf("canonical delivery = %s", content)
+		}
+		decoded, err := UnmarshalAgentEvent(content)
+		if err != nil {
+			t.Fatal(err)
+		}
+		expected := RedactAgentEvent(original)
+		if !reflect.DeepEqual(decoded.DeliveryManifest(), expected.DeliveryManifest()) {
+			t.Fatalf("decoded = %#v, want %#v", decoded.DeliveryManifest(), expected.DeliveryManifest())
+		}
+		ui := UIAgentEventPayloadFromEvent(original)
+		if !reflect.DeepEqual(ui.Delivery, expected.DeliveryManifest()) ||
+			original.DeliveryManifest().Spans[1].Name != "compozy_claim_secret" {
+			t.Fatal("UI lost receipt or redaction mutated source")
+		}
+	})
+	t.Run("Should keep an empty delivery span list as an array", func(t *testing.T) {
+		t.Parallel()
+		original := acp.AgentEvent{
+			Type:   acp.EventTypePromptDelivery,
+			TurnID: "turn-maintenance",
+		}.WithDelivery(&acp.DeliveryManifest{
+			TurnID:   "turn-maintenance",
+			SentAt:   time.Date(2026, 10, 8, 1, 2, 3, 0, time.UTC),
+			Estimate: acp.TextEstimateMethod,
+			Spans:    []acp.DeliveredSpan{},
+		})
+		content, err := MarshalAgentEvent(original)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !strings.Contains(content, `"spans":[]`) {
+			t.Fatalf("canonical delivery = %s, want an empty spans array", content)
+		}
+		ui, err := json.Marshal(UIAgentEventPayloadFromEvent(original))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !strings.Contains(string(ui), `"spans":[]`) {
+			t.Fatalf("UI delivery = %s, want an empty spans array", ui)
+		}
+	})
+	t.Run("Should sanitize and round-trip usage metadata with the carrying ledger sequence", func(t *testing.T) {
+		t.Parallel()
+		usage := &acp.TokenUsage{TurnID: "turn-usage", CacheReadTokens: new(int64(4)), Meta: map[string]any{
+			"_claude/origin": "result",
+			"nested": map[string]any{
+				"deeper": map[string]any{"claim_token": "secret", "note": "compozy_claim_secret"},
+			},
+		}}
+		original := acp.AgentEvent{Type: acp.EventTypeUsage, SessionID: "session", TurnID: usage.TurnID, Usage: usage}
+		redacted := RedactAgentEvent(original)
+		if redacted.Usage == usage || *redacted.Usage.CacheReadTokens != 4 {
+			t.Fatal("usage counters or source ownership changed")
+		}
+		content, err := MarshalAgentEvent(original)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if strings.Contains(content, "claim_token") || strings.Contains(content, "compozy_claim_secret") {
+			t.Fatalf("unsafe content = %s", content)
+		}
+		decoded, err := UnmarshalAgentEvent(content)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !reflect.DeepEqual(decoded.Usage.Meta, redacted.Usage.Meta) {
+			t.Fatalf("metadata = %#v, want %#v", decoded.Usage.Meta, redacted.Usage.Meta)
+		}
+		nested := decoded.Usage.Meta["nested"].(map[string]any)["deeper"].(map[string]any)
+		if nested["note"] != "compozy_claim_[REDACTED]" {
+			t.Fatalf("nested metadata = %#v", nested)
+		}
+		if usage.Meta["nested"].(map[string]any)["deeper"].(map[string]any)["claim_token"] != "secret" {
+			t.Fatal("redaction mutated original metadata")
+		}
+		stored := decodeStoredEvent(
+			store.SessionEvent{Content: content, SessionID: "session", TurnID: usage.TurnID, Sequence: 17},
+		)
+		payload := uiTokenUsagePayloadFromUsage(stored.agent.Usage)
+		if payload.Sequence == nil || *payload.Sequence != 17 || !reflect.DeepEqual(payload.Meta, decoded.Usage.Meta) {
+			t.Fatalf("UI usage = %#v", payload)
+		}
+	})
+
+	t.Run("Should preserve actionable provider occurrences in stored and streamed errors", func(t *testing.T) {
+		t.Parallel()
+		at := time.Date(2026, 9, 5, 12, 0, 0, 0, time.UTC)
+		original := acp.AgentEvent{
+			Type: acp.EventTypeError, SessionID: "session", TurnID: "turn", Timestamp: at,
+			Failure: &store.SessionFailure{Kind: store.FailurePrompt, Summary: "rate limited"},
+			ProviderError: &acp.ProviderErrorDiagnostic{
+				Code:            acp.ProviderErrorRateLimited,
+				Provider:        "provider-a",
+				NextAction:      acp.ProviderFailureActionRetry,
+				Guidance:        "retry later token=provider-secret",
+				OccurrenceCount: 2,
+				FirstSeenAt:     at,
+				LastSeenAt:      at.Add(time.Minute),
+			},
+		}
+		payload, err := MarshalAgentEvent(original)
+		if err != nil {
+			t.Fatalf("marshal provider error: %v", err)
+		}
+		if strings.Contains(payload, "provider-secret") {
+			t.Fatalf("stored payload leaked provider secret: %s", payload)
+		}
+		replayed, err := UnmarshalAgentEvent(payload)
+		if err != nil {
+			t.Fatalf("replay provider error: %v", err)
+		}
+		live := UIAgentEventPayloadFromEvent(original)
+		restored := UIAgentEventPayloadFromEvent(replayed)
+		if live.ProviderError == nil || restored.ProviderError == nil ||
+			!reflect.DeepEqual(live.ProviderError, restored.ProviderError) {
+			t.Fatalf("live/replayed provider diagnostics = %#v / %#v", live.ProviderError, restored.ProviderError)
+		}
+		if got := restored.ProviderError; got.Code != acp.ProviderErrorRateLimited ||
+			got.NextAction != acp.ProviderFailureActionRetry ||
+			got.OccurrenceCount != 2 ||
+			!got.FirstSeenAt.Equal(at) ||
+			!got.LastSeenAt.Equal(at.Add(time.Minute)) {
+			t.Fatalf("replayed provider diagnostic = %#v", got)
+		}
+		live.ProviderError.OccurrenceCount = 99
+		if original.ProviderError.OccurrenceCount != 2 || restored.ProviderError.OccurrenceCount != 2 {
+			t.Fatal("provider diagnostic aliases a published event")
+		}
+	})
+
+	t.Run("Should round-trip structured fields without restoring canonical raw payloads", func(t *testing.T) {
+		t.Parallel()
+
+		wantAttachments := []acp.EventAttachment{{
+			ID:       "att-image",
+			Name:     "diagram.png",
+			MIMEType: "image/png",
+			Bytes:    2048,
+			SHA256:   "sha256-diagram",
+			Kind:     "image",
+			Width:    1280,
+			Height:   720,
+		}}
+		wantInvocations := []commandpkg.Invocation{{
+			Ref: commandpkg.SkillRef{
+				CommandID: "skill:extension:ops-4f1:review",
+				Name:      "review",
+				Source: commandpkg.Source{
+					Kind:  "extension",
+					ID:    "ops",
+					Key:   "ops",
+					Scope: "workspace",
+				},
+			},
+			Token: "/ops:review",
+			Start: 7,
+			End:   18,
+		}}
+		wantMentions := []mention.Mention{
+			{
+				Kind: mention.KindFile, Token: "@internal/acp/client_prompt.go",
+				Target: "internal/acp/client_prompt.go", Label: "client_prompt.go", Start: 7, End: 37,
+			},
+			{Kind: mention.KindFolder, Token: "@web/src", Target: "web/src/", Label: "src/", Start: 42, End: 50},
+		}
+		event := (acp.AgentEvent{
+			Type:             acp.EventTypeAgentMessage,
+			SessionID:        "acp-1",
+			TurnID:           "turn-1",
+			Timestamp:        time.Date(2026, 4, 11, 2, 0, 0, 0, time.UTC),
+			Text:             "hello",
+			Title:            "assistant",
+			Error:            "",
+			PromptStopReason: acp.PromptStopReasonMaxTokens,
+			Raw:              json.RawMessage(`{"chunk":1}`),
+		}).WithAvailableCommands([]store.SessionAdvertisedCommand{
+			{Name: "compact", Description: "Compact context"},
+			{Name: "review", Description: "Review changes"},
+		}).WithRequestID("req-1").WithAttachments(wantAttachments).
+			WithSkillInvocations(wantInvocations).WithMentions(wantMentions).WithPromptRuntime(&acp.PromptRuntime{
+			Provider:        "codex",
+			Model:           "gpt-5.6",
+			ReasoningEffort: "high",
+			Speed:           speedpkg.SpeedFast,
+		})
+		payload, err := MarshalAgentEvent(event)
+		if err != nil {
+			t.Fatalf("MarshalAgentEvent() error = %v", err)
+		}
+		if strings.Contains(strings.ToLower(payload), "base64") {
+			t.Fatalf("MarshalAgentEvent() payload contains inline attachment content: %s", payload)
+		}
+		var storedPayload struct {
+			Attachments []map[string]any `json:"attachments"`
+		}
+		if err := json.Unmarshal([]byte(payload), &storedPayload); err != nil {
+			t.Fatalf("json.Unmarshal(payload) error = %v", err)
+		}
+		for _, attachment := range storedPayload.Attachments {
+			for _, forbidden := range []string{"body", "content", "data", "bytes_base64"} {
+				if _, ok := attachment[forbidden]; ok {
+					t.Fatalf("stored attachment contains forbidden %q field: %#v", forbidden, attachment)
+				}
+			}
+		}
+
+		event, err = UnmarshalAgentEvent(payload)
+		if err != nil {
+			t.Fatalf("UnmarshalAgentEvent() error = %v", err)
+		}
+		if got, want := event.Type, acp.EventTypeAgentMessage; got != want {
+			t.Fatalf("Type = %q, want %q", got, want)
+		}
+		if got, want := event.SessionID, "acp-1"; got != want {
+			t.Fatalf("SessionID = %q, want %q", got, want)
+		}
+		if got, want := event.TurnID, "turn-1"; got != want {
+			t.Fatalf("TurnID = %q, want %q", got, want)
+		}
+		if got, want := event.RequestIDValue(), "req-1"; got != want {
+			t.Fatalf("RequestID = %q, want %q", got, want)
+		}
+		if got, want := event.Text, "hello"; got != want {
+			t.Fatalf("Text = %q, want %q", got, want)
+		}
+		if got, want := event.PromptStopReason, acp.PromptStopReasonMaxTokens; got != want {
+			t.Fatalf("PromptStopReason = %q, want %q", got, want)
+		}
+		if got, want := event.PromptRuntimeSnapshot(), (&acp.PromptRuntime{
+			Provider:        "codex",
+			Model:           "gpt-5.6",
+			ReasoningEffort: "high",
+			Speed:           speedpkg.SpeedFast,
+		}); !reflect.DeepEqual(got, want) {
+			t.Fatalf("PromptRuntime = %#v, want %#v", got, want)
+		}
+		if got, want := event.AvailableCommandSet().Values(), []store.SessionAdvertisedCommand{
+			{Name: "compact", Description: "Compact context"},
+			{Name: "review", Description: "Review changes"},
+		}; !slices.EqualFunc(got, want, store.SessionAdvertisedCommandsEqual) {
+			t.Fatalf("AvailableCommands = %#v, want %#v", got, want)
+		}
+		if !slices.Equal(event.SkillInvocations(), wantInvocations) {
+			t.Fatalf("SkillInvocations = %#v, want %#v", event.SkillInvocations(), wantInvocations)
+		}
+		if !slices.Equal(event.Mentions(), wantMentions) {
+			t.Fatalf("Mentions = %#v, want %#v", event.Mentions(), wantMentions)
+		}
+		if got := event.Attachments(); !slices.Equal(got, wantAttachments) {
+			t.Fatalf("Attachments = %#v, want %#v", got, wantAttachments)
+		}
+		if len(event.Raw) != 0 {
+			t.Fatalf("Raw = %s, want empty canonical raw payload", string(event.Raw))
+		}
+	})
+
+	t.Run("Should round-trip typed tool metadata ahead of conflicting legacy raw metadata", func(t *testing.T) {
+		t.Parallel()
+
+		payload, err := MarshalAgentEvent((acp.AgentEvent{
+			Type:       acp.EventTypeToolResult,
+			Timestamp:  time.Date(2026, 6, 11, 2, 0, 0, 0, time.UTC),
+			ToolCallID: "call-typed",
+			Raw: json.RawMessage(`{
+				"_meta":{"claudeCode":{"toolName":"legacy__shell"}},
+				"rawInput":{"command":"legacy"},
+				"status":"completed"
+			}`),
+		}).WithTool("typed__shell", json.RawMessage(`{"command":"typed"}`), true))
+		if err != nil {
+			t.Fatalf("MarshalAgentEvent() error = %v", err)
+		}
+
+		event, err := UnmarshalAgentEvent(payload)
+		if err != nil {
+			t.Fatalf("UnmarshalAgentEvent() error = %v", err)
+		}
+		if got, want := event.ToolName(), "typed__shell"; got != want {
+			t.Fatalf("ToolName = %q, want %q", got, want)
+		}
+		if got, want := string(event.ToolInput()), `{"command":"typed"}`; got != want {
+			t.Fatalf("ToolInput = %s, want %s", got, want)
+		}
+		if !event.ToolError() {
+			t.Fatal("ToolError = false, want true")
+		}
+	})
+
+	t.Run("Should round-trip a redacted tool failure detail for presentation consumers", func(t *testing.T) {
+		t.Parallel()
+
+		payload, err := MarshalAgentEvent(acp.AgentEvent{
+			Type:       acp.EventTypeToolResult,
+			Timestamp:  time.Date(2026, 6, 11, 2, 0, 0, 0, time.UTC),
+			ToolCallID: "call-failure-detail",
+			Raw: json.RawMessage(`{
+				"_meta":{"claudeCode":{"toolName":"Bash"}},
+				"status":"failed",
+				"content":"command failed: password=hunter2"
+			}`),
+		})
+		if err != nil {
+			t.Fatalf("MarshalAgentEvent() error = %v", err)
+		}
+
+		event, err := UnmarshalAgentEvent(payload)
+		if err != nil {
+			t.Fatalf("UnmarshalAgentEvent() error = %v", err)
+		}
+		if !event.ToolError() {
+			t.Fatal("ToolError = false, want true")
+		}
+		if got := event.ToolErrorDetail(); strings.Contains(got, "hunter2") || !strings.Contains(got, "[REDACTED]") {
+			t.Fatalf("ToolErrorDetail = %q, want redacted failure detail", got)
+		}
+	})
+
+	t.Run("Should preserve typed tool success ahead of stale legacy failure", func(t *testing.T) {
+		t.Parallel()
+
+		payload, err := MarshalAgentEvent((acp.AgentEvent{
+			Type:       acp.EventTypeToolResult,
+			Timestamp:  time.Date(2026, 6, 11, 2, 0, 0, 0, time.UTC),
+			ToolCallID: "call-typed-success",
+			Raw: json.RawMessage(`{
+				"_meta":{"claudeCode":{"toolName":"legacy__shell"}},
+				"rawInput":{"command":"legacy"},
+				"status":"failed",
+				"content":"stale legacy failure"
+			}`),
+		}).WithTool("typed__shell", json.RawMessage(`{"command":"typed"}`), false))
+		if err != nil {
+			t.Fatalf("MarshalAgentEvent() error = %v", err)
+		}
+
+		event, err := UnmarshalAgentEvent(payload)
+		if err != nil {
+			t.Fatalf("UnmarshalAgentEvent() error = %v", err)
+		}
+		if got, want := event.ToolName(), "typed__shell"; got != want {
+			t.Fatalf("ToolName = %q, want %q", got, want)
+		}
+		if event.ToolError() {
+			t.Fatal("ToolError = true, want typed success")
+		}
+	})
+
+	t.Run("Should backfill absent typed tool metadata from legacy raw fields", func(t *testing.T) {
+		t.Parallel()
+
+		payload, err := MarshalAgentEvent(acp.AgentEvent{
+			Type:       acp.EventTypeToolResult,
+			Timestamp:  time.Date(2026, 6, 11, 2, 0, 1, 0, time.UTC),
+			ToolCallID: "call-legacy",
+			Raw: json.RawMessage(`{
+				"_meta":{"claudeCode":{"toolName":"legacy__read"}},
+				"rawInput":{"path":"README.md"},
+				"status":"failed"
+			}`),
+		})
+		if err != nil {
+			t.Fatalf("MarshalAgentEvent() error = %v", err)
+		}
+
+		event, err := UnmarshalAgentEvent(payload)
+		if err != nil {
+			t.Fatalf("UnmarshalAgentEvent() error = %v", err)
+		}
+		if got, want := event.ToolName(), "legacy__read"; got != want {
+			t.Fatalf("ToolName = %q, want %q", got, want)
+		}
+		if got, want := string(event.ToolInput()), `{"path":"README.md"}`; got != want {
+			t.Fatalf("ToolInput = %s, want %s", got, want)
+		}
+		if !event.ToolError() {
+			t.Fatal("ToolError = false, want true")
+		}
+	})
+
+	t.Run("Should preserve typed tool metadata when legacy raw is malformed", func(t *testing.T) {
+		t.Parallel()
+
+		payload, err := MarshalAgentEvent((acp.AgentEvent{
+			Type:       acp.EventTypeToolCall,
+			Timestamp:  time.Date(2026, 6, 11, 2, 0, 2, 0, time.UTC),
+			ToolCallID: "call-malformed",
+			Raw:        json.RawMessage(`{"rawInput":`),
+		}).WithTool("typed__search", json.RawMessage(`{"query":"typed metadata"}`), false))
+		if err != nil {
+			t.Fatalf("MarshalAgentEvent() error = %v", err)
+		}
+
+		event, err := UnmarshalAgentEvent(payload)
+		if err != nil {
+			t.Fatalf("UnmarshalAgentEvent() error = %v", err)
+		}
+		if got, want := event.ToolName(), "typed__search"; got != want {
+			t.Fatalf("ToolName = %q, want %q", got, want)
+		}
+		if got, want := string(event.ToolInput()), `{"query":"typed metadata"}`; got != want {
+			t.Fatalf("ToolInput = %s, want %s", got, want)
+		}
+		if event.ToolError() {
+			t.Fatal("ToolError = true, want false")
+		}
+	})
+}
+
+func TestSubagentCodecContract(t *testing.T) {
+	// UT-037 / UT-038: unknown parent identities survive persistence without requiring a roster.
+	t.Run("Should round-trip native attribution and status through the ledger and stream", func(t *testing.T) {
+		t.Parallel()
+		original := acp.AgentEvent{
+			Type:       acp.EventTypeToolCall,
+			SessionID:  "parent",
+			TurnID:     "turn",
+			ToolCallID: "inner",
+		}.WithProviderToolMetadata(
+			"toolu_missing",
+			"Read",
+			"pending",
+		)
+		content, err := MarshalAgentEvent(original)
+		if err != nil {
+			t.Fatal(err)
+		}
+		decoded, err := UnmarshalAgentEvent(content)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if decoded.ParentToolCallID() != original.ParentToolCallID() || decoded.ProviderToolName() != "Read" ||
+			decoded.ToolStatus() != "pending" || decoded.TurnID != original.TurnID {
+			t.Fatalf("decoded = %#v", decoded)
+		}
+		live, replay := UIAgentEventPayloadFromEvent(original), UIAgentEventPayloadFromEvent(decoded)
+		if live.ParentToolCallID != replay.ParentToolCallID || live.ProviderToolName != replay.ProviderToolName ||
+			live.Status != replay.Status || live.TurnID != original.TurnID || replay.TurnID != original.TurnID {
+			t.Fatalf("stream attribution changed: %#v / %#v", live, replay)
+		}
+	})
+	// Invariant: a native task observation survives the ledger with redaction, keeping absent and empty summaries distinct.
+	t.Run("Should round-trip a redacted native task observation", func(t *testing.T) {
+		t.Parallel()
+		background := true
+		observation := &acp.NativeTaskObservation{
+			Source:     acp.NativeTaskSourceClaudeSDK,
+			Kind:       acp.NativeTaskKindState,
+			TaskID:     "agent-a",
+			RunID:      "0002",
+			ToolCallID: "toolu_agent",
+			Status:     acp.NativeTaskStatusFailed,
+			Summary:    new("leaked password=hunter2"),
+			Error:      "boom password=hunter2",
+			Usage:      &acp.NativeTaskUsage{TotalTokens: 9, ToolUses: 2, DurationMs: 30},
+			Background: &background,
+			EventUUID:  "u-1",
+		}
+		original := acp.AgentEvent{
+			Type: acp.EventTypeNativeTask, SessionID: "parent", TurnID: "turn", ToolCallID: "toolu_agent",
+			Timestamp: time.Date(2026, 10, 27, 0, 0, 0, 0, time.UTC),
+		}.WithNativeTask(observation)
+		content, err := MarshalAgentEvent(original)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if strings.Contains(content, "hunter2") {
+			t.Fatalf("stored observation leaked a secret: %s", content)
+		}
+		decoded, err := UnmarshalAgentEvent(content)
+		if err != nil {
+			t.Fatal(err)
+		}
+		task := decoded.NativeTask()
+		if decoded.Type != acp.EventTypeNativeTask || decoded.ToolCallID != "toolu_agent" || task == nil ||
+			task.ToolCallID != "toolu_agent" || task.Kind != acp.NativeTaskKindState || task.TaskID != "agent-a" ||
+			task.RunID != "0002" || task.Status != acp.NativeTaskStatusFailed || task.Summary == nil ||
+			!strings.Contains(*task.Summary, "[REDACTED]") || !strings.Contains(task.Error, "[REDACTED]") ||
+			task.Usage == nil || *task.Usage != *observation.Usage || task.Background == nil ||
+			!*task.Background || task.EventUUID != "u-1" || !task.Terminal() {
+			t.Fatalf("decoded observation = %#v", task)
+		}
+		observation.Kind, observation.Status = acp.NativeTaskKindProgress, ""
+		for _, summary := range []*string{new(""), nil} {
+			observation.Summary = summary
+			content, err := MarshalAgentEvent(original.WithNativeTask(observation))
+			if err != nil {
+				t.Fatal(err)
+			}
+			decoded, err := UnmarshalAgentEvent(content)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if task := decoded.NativeTask(); (task.Summary == nil) != (summary == nil) || task.Terminal() {
+				t.Fatalf("summary %v decoded as %#v", summary, task)
+			}
+		}
+	})
+	// Invariant: a native summary is the subagent result: it is stored beyond the compaction display cap,
+	// and any cut, made at the decoder or the codec, survives the ledger as truncation provenance.
+	t.Run("Should store native task summaries under the result bound with truncation provenance", func(t *testing.T) {
+		t.Parallel()
+		long := strings.Repeat("résumé ", 3000) // > 16 KiB of non-ASCII text.
+		oversized := strings.Repeat("é", acp.NativeTaskSummaryMaxBytes/2+5)
+		for name, tc := range map[string]struct {
+			summary       string
+			decoderCut    bool
+			want          string
+			wantTruncated bool
+		}{
+			"beyond display cap": {summary: long, want: long},
+			"decoder cut":        {summary: "prefix", decoderCut: true, want: "prefix", wantTruncated: true},
+			"codec cut": {
+				summary: oversized, want: strings.Repeat("é", acp.NativeTaskSummaryMaxBytes/2), wantTruncated: true,
+			},
+		} {
+			event := acp.AgentEvent{
+				Type:       acp.EventTypeNativeTask,
+				TurnID:     "turn",
+				ToolCallID: "toolu_agent",
+			}.WithNativeTask(
+				&acp.NativeTaskObservation{
+					Kind: acp.NativeTaskKindState, TaskID: "agent-a", ToolCallID: "toolu_agent",
+					Status: acp.NativeTaskStatusCompleted, Summary: new(tc.summary), SummaryTruncated: tc.decoderCut,
+				},
+			)
+			content, err := MarshalAgentEvent(event)
+			if err != nil {
+				t.Fatal(err)
+			}
+			decoded, err := UnmarshalAgentEvent(content)
+			if err != nil {
+				t.Fatal(err)
+			}
+			task := decoded.NativeTask()
+			if task == nil || task.Summary == nil || *task.Summary != tc.want ||
+				task.SummaryTruncated != tc.wantTruncated {
+				t.Fatalf("%s: decoded truncated=%v", name, task != nil && task.SummaryTruncated)
+			}
+		}
+	})
+	// UT-039: absent fields retain the pre-feature wire contract.
+	t.Run("Should keep legacy canonical events free of attribution fields", func(t *testing.T) {
+		t.Parallel()
+		legacy := `{"schema":"compozy.session.event.v1","type":"agent_message","session_id":"parent","turn_id":"turn","timestamp":"2026-10-08T00:00:00Z","text":"hello"}`
+		event, err := UnmarshalAgentEvent(legacy)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if event.ParentToolCallID() != "" || event.ProviderToolName() != "" {
+			t.Fatalf("legacy attribution = %#v", event)
+		}
+		encoded, err := MarshalAgentEvent(event)
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, key := range []string{"parent_tool_call_id", "provider_tool_name"} {
+			if strings.Contains(encoded, key) {
+				t.Fatalf("legacy event gained %s: %s", key, encoded)
+			}
+		}
+	})
+}
+
+// UT-004 UT-007: redact structured origin without treating authored text as attribution.
+func TestPromptOriginCodec(t *testing.T) {
+	t.Parallel()
+	t.Run("Should preserve attributed authored text through codec and redaction", func(t *testing.T) {
+		t.Parallel()
+		origin := &acp.PromptOriginMeta{
+			Kind:        "session",
+			SessionID:   "sess-a",
+			WorkspaceID: "ws-a",
+			AgentName:   "coder",
+			TitleAtSend: "sender",
+			Hop:         3,
+		}
+		text := `[Message from session "Evil"] authored content`
+		event := (acp.AgentEvent{Type: acp.EventTypeUserMessage, Text: text, TurnID: "turn-a"}).WithPromptOrigin(origin)
+		encoded, err := MarshalAgentEvent(event)
+		if err != nil {
+			t.Fatal(err)
+		}
+		decoded, err := UnmarshalAgentEvent(encoded)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !reflect.DeepEqual(decoded.PromptOrigin(), origin) || decoded.Text != text {
+			t.Fatal(decoded, decoded.PromptOrigin())
+		}
+		redacted := RedactAgentEvent(event).PromptOrigin()
+		if redacted.SessionID != origin.SessionID || redacted.Hop != 3 ||
+			redacted.TitleAtSend != redactDisplayString(origin.TitleAtSend) {
+			t.Fatal(redacted)
+		}
+		secret := *origin
+		secret.TitleAtSend = "token sk-proj-" + strings.Repeat("a", 60)
+		if RedactAgentEvent(
+			event.WithPromptOrigin(&secret),
+		).PromptOrigin().
+			TitleAtSend != redactDisplayString(
+			secret.TitleAtSend,
+		) {
+			t.Fatal("origin title bypasses display redaction")
+		}
+	})
+}

@@ -1,0 +1,340 @@
+{
+  "manifest_version": 3,
+  "generated_at": "2026-09-12T10:00:00Z",
+  "entries": [
+    {
+      "entry_id": "herdr-bridge",
+      "name": "herdr bridge",
+      "description": "Follow CompozyOS agents and Loops in herdr with live status, readable messages, and automatic pane cleanup",
+      "version": "0.3.3",
+      "published_at": "2026-09-08T15:26:31Z",
+      "install_slug": "AlexandreAkao/herdr-bridge-compozy",
+      "artifact_url": "https://raw.githubusercontent.com/compozy/compozy/main/catalog/artifacts/herdr-bridge-v0.3.3.tar.gz",
+      "digest_sha256": "79fcf4123cddff61046f073d155130327ad55fdcd5c6dc82368b0fb559a2b687",
+      "tier": "community",
+      "format": "compozy",
+      "author": "Alexandre Akira",
+      "repository": "https://github.com/AlexandreAkao/herdr-bridge-compozy"
+    },
+    {
+      "entry_id": "context7",
+      "name": "Context7",
+      "description": "Fetch current, version-specific library documentation and code examples.",
+      "version": "3.2.3",
+      "install_slug": "compozy/context7",
+      "artifact_url": "https://raw.githubusercontent.com/compozy/compozy/main/catalog/artifacts/context7-v3.2.3.tar.gz",
+      "digest_sha256": "f7c5225fd44d1f2d5402503701f6d921fbe10487cbd6a7c5cc792578e6b757d5",
+      "tier": "official",
+      "format": "compozy",
+      "author": "CompozyOS",
+      "repository": "https://github.com/compozy/compozy/tree/main/catalog/packages/context7",
+      "icon": "https://raw.githubusercontent.com/compozy/compozy/main/catalog/icons/context7.png",
+      "inputs": [
+        {
+          "id": "context7_api_key",
+          "prompt": "Context7 API key (optional)",
+          "type": "secret",
+          "required": false,
+          "binding": {
+            "type": "env",
+            "name": "CONTEXT7_API_KEY"
+          }
+        }
+      ]
+    },
+    {
+      "entry_id": "github",
+      "name": "GitHub",
+      "description": "Inspect GitHub repositories, issues, pull requests, and releases with GitHub's official MCP server.",
+      "version": "1.8.0",
+      "install_slug": "compozy/github",
+      "artifact_url": "https://raw.githubusercontent.com/compozy/compozy/main/catalog/artifacts/github-v1.8.0.tar.gz",
+      "digest_sha256": "1eaca16de1ba34e2c4fcf59e57c6b9796a719d58ad065c6e1146005298db4e2a",
+      "tier": "official",
+      "format": "compozy",
+      "author": "CompozyOS",
+      "repository": "https://github.com/compozy/compozy/tree/main/catalog/packages/github",
+      "icon": "https://raw.githubusercontent.com/compozy/compozy/main/catalog/icons/github.svg",
+      "inputs": [
+        {
+          "id": "github_personal_access_token",
+          "prompt": "GitHub personal access token",
+          "type": "secret",
+          "required": true,
+          "binding": {
+            "type": "env",
+            "name": "GITHUB_PERSONAL_ACCESS_TOKEN"
+          }
+        }
+      ]
+    },
+    {
+      "entry_id": "linear",
+      "name": "Linear",
+      "description": "Work with Linear issues, projects, and team knowledge through its hosted MCP server.",
+      "version": "1.0.0",
+      "install_slug": "compozy/linear",
+      "artifact_url": "https://raw.githubusercontent.com/compozy/compozy/main/catalog/artifacts/linear-v1.0.0.tar.gz",
+      "digest_sha256": "82da17546988423b26657b0b0110d14c066964a39efc688e8bcd367a82ca82c5",
+      "tier": "official",
+      "format": "compozy",
+      "author": "CompozyOS",
+      "repository": "https://github.com/compozy/compozy/tree/main/catalog/packages/linear",
+      "icon": "https://raw.githubusercontent.com/compozy/compozy/main/catalog/icons/linear.svg"
+    },
+    {
+      "entry_id": "notion",
+      "name": "Notion",
+      "description": "Search and manage Notion workspace content through Notion's hosted MCP server.",
+      "version": "1.0.0",
+      "install_slug": "compozy/notion",
+      "artifact_url": "https://raw.githubusercontent.com/compozy/compozy/main/catalog/artifacts/notion-v1.0.0.tar.gz",
+      "digest_sha256": "b0aa14aa18df960f4ae13ae657220bbbba4c56713ce9e07e1e13332164d48973",
+      "tier": "official",
+      "format": "compozy",
+      "author": "CompozyOS",
+      "repository": "https://github.com/compozy/compozy/tree/main/catalog/packages/notion",
+      "icon": "https://raw.githubusercontent.com/compozy/compozy/main/catalog/icons/notion.png"
+    },
+    {
+      "entry_id": "sentry",
+      "name": "Sentry",
+      "description": "Investigate Sentry issues, events, projects, and releases through its hosted MCP server.",
+      "version": "1.0.0",
+      "install_slug": "compozy/sentry",
+      "artifact_url": "https://raw.githubusercontent.com/compozy/compozy/main/catalog/artifacts/sentry-v1.0.0.tar.gz",
+      "digest_sha256": "a78436694e83f3a4a937642d01f41eda09fdbaac2cba6b3b79f629b0b595e567",
+      "tier": "official",
+      "format": "compozy",
+      "author": "CompozyOS",
+      "repository": "https://github.com/compozy/compozy/tree/main/catalog/packages/sentry",
+      "icon": "https://raw.githubusercontent.com/compozy/compozy/main/catalog/icons/sentry.svg"
+    },
+    {
+      "entry_id": "postgres",
+      "name": "PostgreSQL (Yaw Labs)",
+      "description": "Query PostgreSQL with Yaw Labs' maintained MCP server; it is read-only by default.",
+      "version": "0.7.0",
+      "install_slug": "compozy/postgres",
+      "artifact_url": "https://raw.githubusercontent.com/compozy/compozy/main/catalog/artifacts/postgres-v0.7.0.tar.gz",
+      "digest_sha256": "8493cae3b5f196b5f3afcdc35e7958671b1af8f99ba553fafb1b452a3634c3ce",
+      "tier": "official",
+      "format": "compozy",
+      "author": "CompozyOS",
+      "repository": "https://github.com/compozy/compozy/tree/main/catalog/packages/postgres",
+      "icon": "https://raw.githubusercontent.com/compozy/compozy/main/catalog/icons/postgres.png",
+      "inputs": [
+        {
+          "id": "database_url",
+          "prompt": "PostgreSQL connection URL",
+          "type": "secret",
+          "required": true,
+          "binding": {
+            "type": "env",
+            "name": "DATABASE_URL"
+          }
+        }
+      ]
+    },
+    {
+      "entry_id": "supabase",
+      "name": "Supabase",
+      "description": "Work with a selected Supabase project through Supabase's hosted MCP server in read-only mode.",
+      "version": "1.0.0",
+      "install_slug": "compozy/supabase",
+      "artifact_url": "https://raw.githubusercontent.com/compozy/compozy/main/catalog/artifacts/supabase-v1.0.0.tar.gz",
+      "digest_sha256": "4b326b6ae63ad5c6e75ca983a950b57572213b0c44c17e63c2478a1ab5739423",
+      "tier": "official",
+      "format": "compozy",
+      "author": "CompozyOS",
+      "repository": "https://github.com/compozy/compozy/tree/main/catalog/packages/supabase",
+      "icon": "https://raw.githubusercontent.com/compozy/compozy/main/catalog/icons/supabase.png",
+      "inputs": [
+        {
+          "id": "project_ref",
+          "prompt": "Supabase project reference",
+          "type": "identifier",
+          "required": true,
+          "binding": {
+            "type": "url_query",
+            "name": "project_ref"
+          }
+        }
+      ]
+    },
+    {
+      "entry_id": "brave-search",
+      "name": "Brave Search",
+      "description": "Search the web through Brave's official MCP server.",
+      "version": "2.1.0",
+      "install_slug": "compozy/brave-search",
+      "artifact_url": "https://raw.githubusercontent.com/compozy/compozy/main/catalog/artifacts/brave-search-v2.1.0.tar.gz",
+      "digest_sha256": "c07b6a38a4fb986cae3c936c692d4c83d86c9902d41dbce346fb45e434630f35",
+      "tier": "official",
+      "format": "compozy",
+      "author": "CompozyOS",
+      "repository": "https://github.com/compozy/compozy/tree/main/catalog/packages/brave-search",
+      "icon": "https://raw.githubusercontent.com/compozy/compozy/main/catalog/icons/brave-search.png",
+      "inputs": [
+        {
+          "id": "brave_api_key",
+          "prompt": "Brave Search API key",
+          "type": "secret",
+          "required": true,
+          "binding": {
+            "type": "env",
+            "name": "BRAVE_API_KEY"
+          }
+        }
+      ]
+    },
+    {
+      "entry_id": "playwright",
+      "name": "Playwright",
+      "description": "Automate browser workflows with Microsoft's Playwright MCP server in headless mode.",
+      "version": "0.0.78",
+      "install_slug": "compozy/playwright",
+      "artifact_url": "https://raw.githubusercontent.com/compozy/compozy/main/catalog/artifacts/playwright-v0.0.78.tar.gz",
+      "digest_sha256": "221c9a2b6f088aca2c81a7f35638f37e1d4f6a5d5092f30c444af2eef40f8ded",
+      "tier": "official",
+      "format": "compozy",
+      "author": "CompozyOS",
+      "repository": "https://github.com/compozy/compozy/tree/main/catalog/packages/playwright",
+      "icon": "https://raw.githubusercontent.com/compozy/compozy/main/catalog/icons/playwright.png"
+    },
+    {
+      "entry_id": "stripe",
+      "name": "Stripe",
+      "description": "Inspect Stripe customers, payments, invoices, and subscriptions through Stripe's hosted MCP server.",
+      "version": "1.0.0",
+      "install_slug": "compozy/stripe",
+      "artifact_url": "https://raw.githubusercontent.com/compozy/compozy/main/catalog/artifacts/stripe-v1.0.0.tar.gz",
+      "digest_sha256": "69a0d0ff87d7e37145445dafda0a8ffdecf90427ac8107ad107d039d2534e809",
+      "tier": "official",
+      "format": "compozy",
+      "author": "CompozyOS",
+      "repository": "https://github.com/compozy/compozy/tree/main/catalog/packages/stripe",
+      "icon": "https://raw.githubusercontent.com/compozy/compozy/main/catalog/icons/stripe.svg"
+    },
+    {
+      "entry_id": "posthog",
+      "name": "PostHog",
+      "description": "Analyze product data, feature flags, and observability signals through PostHog's hosted MCP server.",
+      "version": "1.0.0",
+      "install_slug": "compozy/posthog",
+      "artifact_url": "https://raw.githubusercontent.com/compozy/compozy/main/catalog/artifacts/posthog-v1.0.0.tar.gz",
+      "digest_sha256": "bfb9e98638fddaba3c6380d40da026b01bc7efb0e49f2108cec716910de39b20",
+      "tier": "official",
+      "format": "compozy",
+      "author": "CompozyOS",
+      "repository": "https://github.com/compozy/compozy/tree/main/catalog/packages/posthog",
+      "icon": "https://raw.githubusercontent.com/compozy/compozy/main/catalog/icons/posthog.svg"
+    },
+    {
+      "entry_id": "airtable",
+      "name": "Airtable",
+      "description": "Search and manage Airtable bases through Airtable's hosted MCP server.",
+      "version": "1.0.0",
+      "install_slug": "compozy/airtable",
+      "artifact_url": "https://raw.githubusercontent.com/compozy/compozy/main/catalog/artifacts/airtable-v1.0.0.tar.gz",
+      "digest_sha256": "57a83cb3ad511fff7dd6f8fd4d520ca859322b0039843c0d794697c48fab146b",
+      "tier": "official",
+      "format": "compozy",
+      "author": "CompozyOS",
+      "repository": "https://github.com/compozy/compozy/tree/main/catalog/packages/airtable",
+      "icon": "https://raw.githubusercontent.com/compozy/compozy/main/catalog/icons/airtable.png"
+    },
+    {
+      "entry_id": "gitlab",
+      "name": "GitLab",
+      "description": "Work with GitLab projects, issues, merge requests, and pipelines through GitLab's hosted MCP server.",
+      "version": "1.0.0",
+      "install_slug": "compozy/gitlab",
+      "artifact_url": "https://raw.githubusercontent.com/compozy/compozy/main/catalog/artifacts/gitlab-v1.0.0.tar.gz",
+      "digest_sha256": "1a5e523fc56f9f6d9ad448fc6c074a4573ef7f431bb02fb3207a2e1aa489d53b",
+      "tier": "official",
+      "format": "compozy",
+      "author": "CompozyOS",
+      "repository": "https://github.com/compozy/compozy/tree/main/catalog/packages/gitlab",
+      "icon": "https://raw.githubusercontent.com/compozy/compozy/main/catalog/icons/gitlab.png"
+    },
+    {
+      "entry_id": "atlassian",
+      "name": "Atlassian",
+      "description": "Work with Atlassian products through Atlassian's hosted MCP server.",
+      "version": "1.0.0",
+      "install_slug": "compozy/atlassian",
+      "artifact_url": "https://raw.githubusercontent.com/compozy/compozy/main/catalog/artifacts/atlassian-v1.0.0.tar.gz",
+      "digest_sha256": "c9dc9a708cb2a8c7a4972ce3c10613aade47fb7b4d453940bc51c9fd78b543d8",
+      "tier": "official",
+      "format": "compozy",
+      "author": "CompozyOS",
+      "repository": "https://github.com/compozy/compozy/tree/main/catalog/packages/atlassian",
+      "icon": "https://raw.githubusercontent.com/compozy/compozy/main/catalog/icons/atlassian.svg"
+    },
+    {
+      "entry_id": "grafana",
+      "name": "Grafana",
+      "description": "Inspect Grafana dashboards, metrics, logs, traces, and alerts with write tools disabled.",
+      "version": "1.0.0",
+      "install_slug": "compozy/grafana",
+      "artifact_url": "https://raw.githubusercontent.com/compozy/compozy/main/catalog/artifacts/grafana-v1.0.0.tar.gz",
+      "digest_sha256": "6e4fe1cdd81b622f810e2c523836342bf9271c2723d78ad2887fa67b7c46a6f3",
+      "tier": "official",
+      "format": "compozy",
+      "author": "CompozyOS",
+      "repository": "https://github.com/compozy/compozy/tree/main/catalog/packages/grafana",
+      "icon": "https://raw.githubusercontent.com/compozy/compozy/main/catalog/icons/grafana.svg",
+      "inputs": [
+        {
+          "id": "grafana_url",
+          "prompt": "Grafana URL",
+          "type": "string",
+          "required": true,
+          "binding": {
+            "type": "env",
+            "name": "GRAFANA_URL"
+          }
+        },
+        {
+          "id": "grafana_service_account_token",
+          "prompt": "Grafana service account token",
+          "type": "secret",
+          "required": true,
+          "binding": {
+            "type": "env",
+            "name": "GRAFANA_SERVICE_ACCOUNT_TOKEN"
+          }
+        }
+      ]
+    },
+    {
+      "entry_id": "calcom",
+      "name": "Cal.com",
+      "description": "Manage Cal.com scheduling through Cal.com's hosted MCP server.",
+      "version": "1.0.0",
+      "install_slug": "compozy/calcom",
+      "artifact_url": "https://raw.githubusercontent.com/compozy/compozy/main/catalog/artifacts/calcom-v1.0.0.tar.gz",
+      "digest_sha256": "5f080f39a1946685bbf590d90d52c868f599bad1b5ff60f01001c44f4563884f",
+      "tier": "official",
+      "format": "compozy",
+      "author": "CompozyOS",
+      "repository": "https://github.com/compozy/compozy/tree/main/catalog/packages/calcom",
+      "icon": "https://raw.githubusercontent.com/compozy/compozy/main/catalog/icons/calcom.png"
+    },
+    {
+      "entry_id": "cloudflare",
+      "name": "Cloudflare Code Mode",
+      "description": "Use Cloudflare's Code Mode MCP server to progressively discover and call Cloudflare APIs.",
+      "version": "1.0.0",
+      "install_slug": "compozy/cloudflare",
+      "artifact_url": "https://raw.githubusercontent.com/compozy/compozy/main/catalog/artifacts/cloudflare-v1.0.0.tar.gz",
+      "digest_sha256": "cd55074a6a013f64aa2df596864a9c9964af5a9b1377a623cd9a7d747f893283",
+      "tier": "official",
+      "format": "compozy",
+      "author": "CompozyOS",
+      "repository": "https://github.com/compozy/compozy/tree/main/catalog/packages/cloudflare",
+      "icon": "https://raw.githubusercontent.com/compozy/compozy/main/catalog/icons/cloudflare.png"
+    }
+  ]
+}

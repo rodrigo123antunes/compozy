@@ -1,0 +1,54 @@
+package daemon
+
+import (
+	"context"
+	"errors"
+)
+
+func (d *Daemon) bootResourceWatchers(ctx context.Context, state *bootState, cleanup *bootCleanup) error {
+	agentSkillResources := state.agentSkillResources
+	hookBindings := state.hookBindings
+	if state.skillsRegistry != nil {
+		if hookBindings == nil {
+			return errors.New("daemon: hook bindings are required before starting the skills watcher")
+		}
+		state.skillsCancel, state.skillsDone = startSkillsWatcher(
+			ctx,
+			state.skillsRegistry,
+			state.cfg.Skills.PollInterval,
+			workspaceSkillWatcherRoots(
+				d.homePaths, state.registry, bootProfileCatalog{state: state},
+			),
+			workspaceAgentWatcherRoots(
+				d.homePaths, state.registry, bootProfileCatalog{state: state},
+			),
+			func(refreshCtx context.Context) error {
+				state.workspaceResolver.InvalidateAll()
+				var syncErr error
+				if agentSkillResources != nil {
+					syncErr = agentSkillResources.Sync(refreshCtx)
+				}
+				return errors.Join(syncErr, hookBindings.Sync(refreshCtx))
+			},
+		)
+		cleanup.add(func(cleanupCtx context.Context) error {
+			return stopSkillsWatcher(cleanupCtx, state.skillsCancel, state.skillsDone)
+		})
+	}
+
+	loopResources := state.loopResources
+	if loopResources != nil {
+		state.loopsCancel, state.loopsDone = startLoopWatcher(
+			ctx,
+			state.cfg.Skills.PollInterval,
+			[]string{d.homePaths.LoopsDir},
+			workspaceLoopWatcherRoots(d.homePaths, state.registry),
+			loopResources,
+			state.logger,
+		)
+		cleanup.add(func(cleanupCtx context.Context) error {
+			return stopLoopWatcher(cleanupCtx, state.loopsCancel, state.loopsDone)
+		})
+	}
+	return nil
+}

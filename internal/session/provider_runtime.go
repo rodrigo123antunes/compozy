@@ -1,0 +1,220 @@
+package session
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"strings"
+
+	"github.com/compozy/compozy/internal/acp"
+	compozyconfig "github.com/compozy/compozy/internal/config"
+	"github.com/compozy/compozy/internal/providerenv"
+	authproviders "github.com/compozy/compozy/internal/providers"
+	"github.com/compozy/compozy/internal/subprocess"
+	"github.com/compozy/compozy/internal/vault"
+)
+
+const (
+	providerRuntimeAPIKeyKey = "api_key"
+)
+
+type envProviderSecretResolver struct {
+	lookupEnv func(string) (string, bool)
+}
+
+const (
+	runtimeProviderAnthropic = "anthropic"
+	runtimeProviderClaude    = "claude"
+	runtimeProviderCodex     = "codex"
+)
+
+func (r envProviderSecretResolver) ResolveRef(ctx context.Context, ref string) (string, error) {
+	if ctx == nil {
+		return "", errors.New("session: provider secret context is required")
+	}
+	if err := ctx.Err(); err != nil {
+		return "", err
+	}
+	normalized := vault.NormalizeRef(ref)
+	if !vault.IsEnvRef(normalized) {
+		return "", fmt.Errorf("%w: %s", vault.ErrUnsupportedSecretRef, normalized)
+	}
+	if r.lookupEnv == nil {
+		return "", errors.New("session: provider env lookup is not configured")
+	}
+	envName := strings.TrimSpace(strings.TrimPrefix(normalized, "env:"))
+	value, ok := r.lookupEnv(envName)
+	if !ok || strings.TrimSpace(value) == "" {
+		return "", fmt.Errorf("%w: env:%s", vault.ErrMissingSecret, envName)
+	}
+	return value, nil
+}
+
+func (m *Manager) prepareProviderForStart(
+	ctx context.Context,
+	session *Session,
+	resolved compozyconfig.ResolvedAgent,
+	opts acp.StartOpts,
+) (acp.StartOpts, error) {
+	opts, secretBindings, err := m.prepareProviderStartPolicies(ctx, resolved, opts)
+	if err != nil {
+		return acp.StartOpts{}, err
+	}
+	if session != nil {
+		session.addProviderSecretRedactions(secretBindings.redactionCleanups)
+	}
+	if resolved.Harness == compozyconfig.ProviderHarnessPiACP &&
+		resolved.AuthMode == compozyconfig.ProviderAuthModeBoundSecret {
+		runtimeDir, err := m.materializePiRuntime(session, resolved, secretBindings.injectedTargetEnvs)
+		if err != nil {
+			return acp.StartOpts{}, err
+		}
+		opts.Env = setSessionStartEnvValue(opts.Env, "PI_CODING_AGENT_DIR", runtimeDir)
+	}
+	return opts, nil
+}
+
+// prepareProviderStartPolicies resolves launch isolation and authentication before setting provider environment.
+func (m *Manager) prepareProviderStartPolicies(
+	ctx context.Context,
+	resolved compozyconfig.ResolvedAgent,
+	opts acp.StartOpts,
+) (acp.StartOpts, providerSecretBindings, error) {
+	command, err := sessionEnvironmentCommand(opts.Command, resolved.SessionEnv)
+	if err != nil {
+		return acp.StartOpts{}, providerSecretBindings{}, err
+	}
+	opts.Command = command
+	profileSlots, err := authproviders.ProfileCredentialSlots(
+		ctx,
+		resolved.Provider,
+		resolved.ProfileName,
+		resolved.CredentialSlots,
+		providerSecretMetadataResolver{resolver: m.providerSecrets},
+	)
+	if err != nil {
+		return acp.StartOpts{}, providerSecretBindings{}, err
+	}
+	resolved.CredentialSlots = profileSlots
+	opts.Env = setProviderStartEnv(opts.Env, resolved, opts.PreferredModel)
+
+	if resolved.HomePolicy == compozyconfig.ProviderHomePolicyIsolated {
+		opts.Env, err = providerenv.ApplyHomePolicy(
+			m.homePaths,
+			strings.TrimSpace(resolved.Provider),
+			resolved.HomePolicy,
+			opts.Env,
+		)
+		if err != nil {
+			return acp.StartOpts{}, providerSecretBindings{}, fmt.Errorf("session: apply provider home policy: %w", err)
+		}
+	}
+	if resolved.Harness == compozyconfig.ProviderHarnessPiACP &&
+		resolved.AuthMode == compozyconfig.ProviderAuthModeNativeCLI {
+		opts.Env, err = providerenv.ApplyPiAgentDirPolicy(
+			m.homePaths,
+			strings.TrimSpace(resolved.Provider),
+			resolved.HomePolicy,
+			opts.Env,
+		)
+		if err != nil {
+			return acp.StartOpts{}, providerSecretBindings{}, fmt.Errorf(
+				"session: apply pi auth directory policy: %w",
+				err,
+			)
+		}
+	}
+	secretBindings, err := m.injectProviderSecrets(ctx, resolved, opts.Env)
+	if err != nil {
+		return acp.StartOpts{}, providerSecretBindings{}, err
+	}
+	opts.Env = secretBindings.env
+	opts.ProviderName = strings.TrimSpace(resolved.Provider)
+	providerConfig := providerConfigFromResolvedAgent(resolved)
+	opts.ProviderConfig = &providerConfig
+	return opts, secretBindings, nil
+}
+
+// setProviderStartEnv seeds logical session metadata and the independently validated native transport.
+func setProviderStartEnv(env []string, resolved compozyconfig.ResolvedAgent, preferredModel string) []string {
+	env = setSessionStartEnvValue(env, "COMPOZY_PROVIDER", strings.TrimSpace(resolved.Provider))
+	env = setSessionStartEnvValue(env, "COMPOZY_PROVIDER_HARNESS", string(resolved.Harness))
+	env = setSessionStartEnvValue(env, "COMPOZY_PROVIDER_AUTH_MODE", string(resolved.AuthMode))
+	env = setSessionStartEnvValue(env, "COMPOZY_PROVIDER_ENV_POLICY", string(resolved.EnvPolicy))
+	env = setSessionStartEnvValue(env, "COMPOZY_PROVIDER_HOME_POLICY", string(resolved.HomePolicy))
+	env = setSessionStartEnvValue(env, "COMPOZY_MODEL", strings.TrimSpace(resolved.Model))
+	return setProviderModelEnv(env, resolved, preferredModel)
+}
+
+func providerProbeEnvForStart(
+	m *Manager,
+	session *Session,
+	resolved compozyconfig.ResolvedAgent,
+	env []string,
+	cwd string,
+) authproviders.ProbeEnv {
+	probe := authproviders.ProbeEnv{
+		ProviderName:  strings.TrimSpace(resolved.Provider),
+		HomePaths:     m.homePaths,
+		PreStartScope: providerPreStartScopeForSession(session, env),
+		LookupEnv:     providerLookupEnv(env),
+		Vault:         providerSecretMetadataResolver{resolver: m.providerSecrets},
+		CommandEnv:    append([]string(nil), env...),
+		CommandDir:    cwd,
+	}
+	probe.LookPath = providerLookPath(probe.CommandEnv, probe.CommandDir)
+	probe.ResolveCommand = authproviders.DefaultProviderAuthCommandResolver
+	probe.RunCommand = authproviders.DefaultProviderAuthCommandRunner
+	return probe
+}
+
+func (m *Manager) finalizeProviderProbeEnvForStart(
+	session *Session,
+	resolved compozyconfig.ResolvedAgent,
+	opts acp.StartOpts,
+) acp.StartOpts {
+	if m == nil || opts.ProviderConfig == nil || strings.TrimSpace(opts.ProviderName) == "" {
+		return opts
+	}
+	next := opts
+	providerConfig := *opts.ProviderConfig
+	providerConfig.Command = next.Command
+	providerConfig.CommandIsBuiltin = resolved.CommandIsBuiltin
+	next.ProviderConfig = &providerConfig
+	probeEnv := providerProbeEnvForStart(m, session, resolved, next.Env, next.Cwd)
+	next.ProviderAuthEnv = &probeEnv
+	return next
+}
+
+func providerPreStartScopeForSession(
+	session *Session,
+	env []string,
+) authproviders.PreStartScope {
+	if session == nil {
+		return authproviders.PreStartScope{}
+	}
+	info := session.Info()
+	if info == nil {
+		return authproviders.PreStartScope{}
+	}
+	scope := authproviders.PreStartScope{
+		WorkspaceID:  strings.TrimSpace(info.WorkspaceID),
+		ProfileID:    strings.TrimSpace(info.ProfileID),
+		HomeIdentity: providerHomeIdentity(env),
+	}
+	return scope
+}
+
+func providerHomeIdentity(env []string) string {
+	lookupEnv := providerLookupEnv(env)
+	for _, key := range []string{"HOME", "USERPROFILE"} {
+		if value, ok := lookupEnv(key); ok && strings.TrimSpace(value) != "" {
+			return strings.TrimSpace(value)
+		}
+	}
+	return ""
+}
+
+func providerLookupEnv(env []string) func(string) (string, bool) {
+	return subprocess.LookupEnvFunc(env)
+}

@@ -1,0 +1,102 @@
+---
+id: ET-web-agent-detail-tab-parity
+area: ET
+title: Agent detail tab panelbox and content contracts
+persona: Bruno
+journey: J-31
+expected: The agent profile opens focused Model, Tools, Instructions, Heartbeat, Memory, and Where it works pages. Each page retains its profile/project binding. Saves honor digest conflicts and the unsaved guard. Starting instructions remain editable when no SOUL.md exists; heartbeats distinguish dry-run summaries from a real occurrence and expose bounded audit details.
+entry_points: web /agents/$name and /agents/$name/$page
+qa_status: partial
+bug_ids:
+fix_status:
+retest_status:
+fix_commits:
+evidence: /Users/pedronauck/dev/qa-labs/compozy-qa-et-current-source-20260730-061655-910372-lab/qa-artifacts/qa;docs/qa/evidence/2026-07-30-session-runtime-selector/09-agent-detail-sessions.png;docs/qa/evidence/2026-07-30-session-runtime-selector/runtime-selector-proof.md;docs/qa/evidence/2026-08-01-loops-paper-adoption/session-create-dialog-narrow.png;docs/qa/evidence/2026-08-01-loops-paper-adoption/session-create-dialog-desktop.png; docs/qa/reports/artifacts/2026-11-03-stays-on-hardening-qa/ (2026-11-03 always-on QA walk)
+last_report: docs/qa/reports/2026-11-03-vocabulary-alignment-qa.md
+overlaps: RT-agent-overview-canonical-metrics; RT-076
+---
+
+Added by agent-detail OpenDesign tab parity 2026-07-17 after aligning Overview/Instructions/Configuration/Sessions composition to frozen agent-detail.html (SHA-1 4a4c214402cc83a06ff8ab7c607b9c0d6cfc12bc).
+
+QA impact 2026-07-18: Configuration MCP servers now use the shared `ListingRow` primitive while
+preserving transport and redacted environment-key metadata. Status remains untested; no QA replay
+ran.
+
+QA impact 2026-07-19: the detail-header runtime selector now surfaces failures from its active
+provider source and exposes a source-specific retry action instead of remaining silently disabled.
+Status remains untested; no QA replay ran.
+
+QA impact 2026-07-22: the live runtime selector moved from the detail topbar into Overview Runtime
+as the Model category above Command/Permissions. Status remains untested; no QA replay ran.
+
+QA impact 2026-08-01: session-create focus and workspace ownership changed during adjacent Loop QA.
+The scenario was reset to untested, then re-walked through the official Web E2E lane: same-workspace
+creation navigated to its composer, and E2E-022 created a session in a second workspace and opened
+that workspace/session route. Narrow and desktop Storybook captures verified the workspace selector,
+runtime deferral notice, and reachable Start session action. Status returned to pass.
+
+QA impact 2026-09-17 (issue #653): the Instructions tab renders AGENT.md through `DescriptionCard`,
+which now takes the reading-tier prose ladder (H1 22 px, H2 18 px, H3 16 px, heading top margins up to
+32 px), semibold emphasis, accent-strong links, and framed tables. Panel geometry and the tab contracts
+are untouched. Not walked: the Instructions tab in a live runtime; confirm a long AGENT.md still reads
+comfortably inside the panelbox and that no horizontal overflow appears.
+
+QA impact 2026-09-28 (ui-normie-pass): Overview drops the At a glance rail and the Command row
+(Command stays in Configuration), panels move from `AgentPanelBox` to the shared `Panel`, permission
+values render through one plain vocabulary ("Ask before every action" / "Ask before changes" /
+"Accept edits" / "Auto-review" / "Full access"), the Sessions tab drops its duplicate stats grid in favour of
+filter counts and loses the Iterations column, and a failed session list offers Retry. Status reset to
+untested; not walked.
+
+2026-10-05: Deferred from this QA cycle by the user's explicit scope reduction.
+Coverage remains outstanding; this skip is not a passing result. Resume from the dated
+report's session matrix in a future QA cycle.
+
+QA impact 2026-10-19 (issue #828): Configuration shows effective `session_env` references with
+source, presence, and required/optional metadata. In an isolated workspace, declare an optional
+missing environment reference and a Vault reference on an agent and its fallback route. Verify
+that Configuration displays metadata without secret values or an editable secret field. Change
+only the prompt in Settings, save, and reread the definition: both environment maps must survive.
+Compare the metadata with `agent show -o json` in the same workspace/profile. Live replay and
+rendered evidence remain pending; focused projection and edit-preservation tests are not a pass
+for this scenario.
+
+QA impact 2026-10-28 (canonical loader reuse): open agent detail/settings in
+All projects, User, a project, and explicit project/User-bound windows. Loader and
+mounted hooks must share definition, exact metrics, active/archived session keys and
+provider/override keys. The default detail path uses two session lists, without extra
+user-only or count probes. A per-window worktree filter remains outside route intent.
+The existing route-preloading and agent-session deep-link suites own scope/cache parity;
+targeted real-daemon rendering is recorded in
+`docs/qa/reports/2026-10-28-tanstack-data-loading.md`.
+
+QA impact 2026-11-01 (always-on F2): the fleet, the four tabs and the settings modal are gone, replaced
+by the team list and the agent's home. See `ET-web-agents-team-profile`; old `?tab=` and
+`settings?section=` links land on the matching panel or page. Status remains untested; no QA replay
+ran for this scenario.
+
+2026-11-02 scope update: the focused editor routes replace the four-tab contract above. Historic
+receipts remain historical. Repeat the profile and editor walk against the merged PR before
+claiming current verification; include same-named definitions in two projects and two profiles.
+
+QA impact 2026-11-03 (always-on hardening S5/S15): permission values now use the five-level
+vocabulary ("Ask before every action" / "Ask before changes" / "Accept edits" / "Auto-review"
+/ "Full access"), with "Follow Settings" for an on-demand agent with nothing set. The Model
+panel no longer carries a permissions field; the level, approval reach and exceptions live on the
+agent's Permissions page (`MS-web-agent-permissions`). Not walked.
+
+QA verification 2026-11-03 (always-on hardening, soh/qa 583415ef5): Partial. Only the S5/S15 vocabulary was checked. The agent Permissions page and Settings → General both list the five levels with the same labels and descriptions (screenshots `05-s5-permissions-levels.png`, `15-s15-settings-levels.png`). The full tab-parity walk was not repeated.
+
+QA impact 2026-11-03 (#1199 vocabulary, v0.5.1): the focused pages read Instructions, Heartbeat, Memory and Tools, the setup section reads Setup, and the permission labels read Accept edits, Auto-review and Full access. URLs `what-it-does` and `check-ins` are unchanged. Not walked; S4 walks it on the integration head.
+
+QA regression 2026-11-03 (main CI repair): focused editor content uses an H2 below the shell's
+H1 so Heartbeat and Instructions each have one page-level heading. Keep `agents.spec.ts`
+E2E-002 unchanged and verify both existing slugs in CI; local E2E is deferred because the
+shared host is overloaded.
+
+Focused validation: `bunx turbo run test --filter=./web --only --
+src/systems/agent/components/__tests__/agent-editors.test.tsx` passed all 36 tests,
+and `bunx turbo run typecheck --filter=./web --only` passed after building the missing
+`@compozy/client` declarations. File lint and formatting passed. An initial unrelated
+memory-history wait timed out; the unchanged case passed on repetition. Browser E2E remains
+owned by CI.

@@ -1,0 +1,1549 @@
+// Suite: integrated terminal public activation.
+// Invariant: the production browser loads Terminal only on demand and its CSP
+// admits only the same-origin terminal socket.
+// Owning layer: browser OS shell. Canonical suite: this terminal E2E file.
+import { execFile, spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
+import { chmod, writeFile } from "node:fs/promises";
+import path from "node:path";
+import process from "node:process";
+import { fileURLToPath } from "node:url";
+import { promisify, stripVTControlCharacters } from "node:util";
+
+import type { Locator, Page } from "@playwright/test";
+
+import { reloadDaemonServedPage } from "../fixtures/navigation";
+import {
+  focusUserScope,
+  focusWindowThroughPalette,
+  openAppWindow,
+  setGlobalScope,
+  windowFrame,
+} from "../fixtures/os-navigation";
+import { type BrowserRuntime, type RuntimePaths } from "../fixtures/runtime";
+import {
+  closeTerminalWatchers,
+  connectTerminalWatcher,
+  watcherGrid,
+} from "../fixtures/terminal-watcher";
+import { expect, test } from "../fixtures/test";
+import { ensureProjectWorkspace } from "../fixtures/workspace";
+import { TERMINAL_SUBPROTOCOL } from "../../src/generated/terminal-wire";
+
+const execFileAsync = promisify(execFile);
+const repositoryRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../../..");
+const macOSPtyBridge = path.join(repositoryRoot, "web/e2e/fixtures/pty-bridge.exp");
+const CLI_EXIT_FAILURE = 1;
+const CLI_EXIT_DATA_ERROR = 65;
+const CLI_EXIT_UNAVAILABLE = 69;
+const CLI_EXIT_CONFIG_INVALID = 78;
+
+// Invariant: separate browser keystrokes redraw a real zsh prompt before Enter,
+// and reconnect/CLI quote retain that same screen. Owner: terminal browser stream.
+for (const glyph of [">", "❯"]) {
+  test(`E2E-020: zsh prompt ${glyph} redraws each key with shell integration disabled`, async ({
+    appPage,
+    runtime,
+    browserArtifacts,
+  }) => {
+    assertLaunchRuntime(runtime);
+    test.skip(process.platform === "win32", "zsh prompt reproduction requires a Unix PTY");
+    const { stdout: shellPath } = await execFileAsync("which", ["zsh"]);
+    const workspace = await runtimeWorkspace(runtime);
+    await writeFile(
+      path.join(runtime.paths.operatorHomeDir, ".zshrc"),
+      `bindkey -e\nPROMPT=$'%F{blue}%~%f\\n%F{magenta}${glyph}%f '\nRPROMPT=''\n`,
+      { mode: 0o600 }
+    );
+    const general = await runtime.requestJSON<{
+      config: Record<string, unknown> & { terminal: Record<string, unknown> };
+    }>("/api/settings/general");
+    await runtime.requestJSON("/api/settings/general", {
+      method: "PATCH",
+      body: JSON.stringify({
+        config: {
+          ...general.config,
+          terminal: { ...general.config.terminal, shell_integration: false },
+        },
+      }),
+    });
+    const restart = await runtime.requestJSON<SettingsRestartAction>(
+      "/api/settings/actions/restart",
+      { method: "POST", body: "{}" }
+    );
+    await expect
+      .poll(async () => await pollRestartStatus(runtime, restart.status_url), { timeout: 45_000 })
+      .toBe("ready");
+    await reloadDaemonServedPage(appPage, runtime, "/", { readyTestId: "os-desktop" });
+    const opened = await runTerminalCLI<TerminalEnvelope>(runtime.paths, [
+      "open",
+      "--workspace",
+      workspace.id,
+      "--shell",
+      shellPath.trim(),
+      "--title",
+      "unicode-prompt",
+      "--detach",
+      "-o",
+      "json",
+    ]);
+    const terminalID = opened.terminal.id;
+    await ensureProjectWorkspace(appPage, runtime);
+    await openAppWindow(appPage, "Terminal", "terminal");
+    let window = focusedTerminalWindow(appPage);
+    await expect(window.getByTestId(`terminal-pane-${terminalID}`)).toBeVisible();
+    let log = await interactiveTerminalLog(window);
+    await expect
+      .poll(async () => (await terminalScreen(runtime, workspace.id, terminalID)).content)
+      .toContain(glyph);
+    await expect(log.getByText(glyph, { exact: true })).toBeVisible();
+    await log.click();
+    for (const [index, key] of [..."abc"].entries()) {
+      await appPage.keyboard.press(key);
+      await expect
+        .poll(async () => (await terminalScreen(runtime, workspace.id, terminalID)).content)
+        .toContain(`${glyph} ${"abc".slice(0, index + 1)}`);
+      await expect(
+        log.getByText(`${glyph} ${"abc".slice(0, index + 1)}`, { exact: true })
+      ).toBeVisible();
+      await browserArtifacts.captureScreenshot(
+        `prompt-${glyph === ">" ? "ascii" : "unicode"}-key-${key}`,
+        appPage
+      );
+    }
+    const quote = await runTerminalCLI<{ quote: string }>(runtime.paths, [
+      "quote",
+      terminalID,
+      "--workspace",
+      workspace.id,
+      "--lines",
+      "1-40",
+      "-o",
+      "json",
+    ]);
+    expect(stripVTControlCharacters(quote.quote)).toContain(
+      `${glyph === ">" ? "&gt;" : glyph} abc`
+    );
+    expect(quote.quote).not.toContain("�");
+    await appPage.reload({ waitUntil: "domcontentloaded" });
+    window = focusedTerminalWindow(appPage);
+    log = await interactiveTerminalLog(window);
+    await expect(log.getByText(`${glyph} abc`, { exact: true })).toBeVisible();
+    await log.click();
+    await appPage.keyboard.press("Backspace");
+    await expect
+      .poll(async () =>
+        (await terminalScreen(runtime, workspace.id, terminalID)).content
+          .trimEnd()
+          .endsWith(`${glyph} ab`)
+      )
+      .toBe(true);
+    await expect(log.getByText(`${glyph} ab`, { exact: true })).toBeVisible();
+    await appPage.keyboard.press("Control+u");
+    await appPage.keyboard.type("printf 'unicode-input-%s\\n' ready", { delay: 20 });
+    await appPage.keyboard.press("Enter");
+    await expect
+      .poll(async () => (await terminalScreen(runtime, workspace.id, terminalID)).content)
+      .toContain("unicode-input-ready");
+    await expect(log.getByText("unicode-input-ready", { exact: true })).toBeVisible();
+    await browserArtifacts.captureScreenshot(
+      `prompt-${glyph === ">" ? "ascii" : "unicode"}-reconnected`,
+      appPage
+    );
+  });
+}
+
+interface TerminalRecord {
+  capabilities: { interactive: boolean };
+  cwd: string;
+  id: string;
+  mode: string;
+  profile_name: string;
+  shell: string;
+  state: string;
+  title: string;
+  viewers: number;
+  workspace_id: string;
+}
+
+interface TerminalListEnvelope {
+  terminals: TerminalRecord[];
+}
+
+interface TerminalEnvelope {
+  terminal: TerminalRecord;
+}
+
+interface TerminalJournalEnvelope {
+  entries: Array<{
+    actor: { kind: string; id: string };
+    approval: string;
+    command: string;
+    command_id: string;
+    detected_by: string;
+    exit_cause: string;
+    exit_code: number | null;
+    profile_name: string;
+    recording?: string | null;
+    terminal_id: string | null;
+  }>;
+  next: string | null;
+}
+
+interface TerminalReadEnvelope {
+  busy: boolean;
+  content: string;
+  seq: number;
+  truncated: boolean;
+  untrusted: boolean;
+}
+
+interface SettingsRestartAction {
+  status_url: string;
+}
+
+interface SettingsRestartStatus {
+  status: string;
+}
+
+interface InteractiveCLI {
+  child: ChildProcessWithoutNullStreams;
+  output: () => string;
+  waitForExit: () => Promise<number>;
+  waitForOutput: (needle: string | RegExp) => Promise<string>;
+  write: (input: string | Uint8Array) => Promise<void>;
+}
+
+function assertLaunchRuntime(
+  runtime: BrowserRuntime
+): asserts runtime is BrowserRuntime & { paths: RuntimePaths } {
+  if (!runtime.paths) throw new Error("Terminal E2E requires a launch-mode runtime.");
+}
+
+function cliEnv(paths: RuntimePaths): NodeJS.ProcessEnv {
+  return {
+    ...process.env,
+    COMPOZY_HOME: paths.homeDir,
+    HOME: paths.operatorHomeDir,
+    PATH: [path.dirname(paths.cliShim), process.env.PATH ?? ""]
+      .filter(Boolean)
+      .join(path.delimiter),
+  };
+}
+
+async function runTerminalCLI<T>(paths: RuntimePaths, args: string[]): Promise<T> {
+  const { stdout } = await execFileAsync(paths.cliShim, ["terminal", ...args], {
+    env: cliEnv(paths),
+  });
+  return JSON.parse(stdout.trim()) as T;
+}
+
+async function runTerminalCLIFailure(paths: RuntimePaths, args: string[]) {
+  try {
+    await execFileAsync(paths.cliShim, ["terminal", ...args], { env: cliEnv(paths) });
+  } catch (error) {
+    const failure = error as { code?: number; stderr?: string };
+    return { code: failure.code, payload: JSON.parse((failure.stderr ?? "").trim()) as unknown };
+  }
+  throw new Error(`terminal command unexpectedly succeeded: ${args.join(" ")}`);
+}
+
+async function runTerminalCLITextFailure(paths: RuntimePaths, args: string[]) {
+  try {
+    await execFileAsync(paths.cliShim, ["terminal", ...args], { env: cliEnv(paths) });
+  } catch (error) {
+    const failure = error as { code?: number; stderr?: string };
+    return { code: failure.code, stderr: failure.stderr ?? "" };
+  }
+  throw new Error(`terminal command unexpectedly succeeded: ${args.join(" ")}`);
+}
+
+async function runtimeWorkspace(runtime: BrowserRuntime & { paths: RuntimePaths }) {
+  return runtime.seeded.workspace ?? (await runtime.resolveWorkspace(runtime.paths.workspaceDir));
+}
+
+async function pollRestartStatus(runtime: BrowserRuntime, statusURL: string): Promise<string> {
+  try {
+    return (await runtime.requestJSON<SettingsRestartStatus>(statusURL)).status;
+  } catch {
+    return "restarting";
+  }
+}
+
+function shellQuote(value: string): string {
+  return `'${value.replaceAll("'", `'\\''`)}'`;
+}
+
+function startInteractiveCLI(paths: RuntimePaths, args: string[]): InteractiveCLI {
+  const command = [paths.cliShim, ...args].map(shellQuote).join(" ");
+  const launcher = process.platform === "darwin" ? "/usr/bin/expect" : "script";
+  const scriptArgs =
+    process.platform === "darwin"
+      ? ["-f", macOSPtyBridge, paths.cliShim, ...args]
+      : ["-qfec", command, "/dev/null"];
+  const child = spawn(launcher, scriptArgs, {
+    env: cliEnv(paths),
+    stdio: "pipe",
+  });
+  let captured = "";
+  let pendingQueries = "";
+  const answerPrimaryDeviceQuery = () => {
+    child.stdin.write("\u001b[?1;2c");
+    return "";
+  };
+  const append = (chunk: Buffer) => {
+    const output = chunk.toString("utf8").replaceAll("\r", "");
+    captured += output;
+    // The piped PTY has no emulator to answer Fish's required DA1 handshake.
+    // Preserve split queries and report only basic VT100 capabilities.
+    pendingQueries += output;
+    pendingQueries = pendingQueries
+      .replaceAll("\u001b[c", answerPrimaryDeviceQuery)
+      .replaceAll("\u001b[0c", answerPrimaryDeviceQuery)
+      .slice(-3);
+  };
+  child.stdout.on("data", append);
+  child.stderr.on("data", append);
+
+  const waitForOutput = async (needle: string | RegExp): Promise<string> => {
+    const matches = () =>
+      typeof needle === "string" ? captured.includes(needle) : needle.test(captured);
+    if (matches()) return captured;
+    return await new Promise<string>((resolve, reject) => {
+      const timeout = setTimeout(() => {
+        cleanup();
+        reject(new Error(`Timed out waiting for ${String(needle)} in:\n${captured}`));
+      }, 20_000);
+      const inspect = () => {
+        if (!matches()) return;
+        cleanup();
+        resolve(captured);
+      };
+      const closed = (code: number | null) => {
+        cleanup();
+        reject(
+          new Error(`Interactive CLI exited ${String(code)} before ${String(needle)}:\n${captured}`)
+        );
+      };
+      const cleanup = () => {
+        clearTimeout(timeout);
+        child.stdout.off("data", inspect);
+        child.stderr.off("data", inspect);
+        child.off("close", closed);
+      };
+      child.stdout.on("data", inspect);
+      child.stderr.on("data", inspect);
+      // `exit` may precede the final stdout/stderr chunks. `close` is the first
+      // lifecycle event that proves both streams have drained.
+      child.on("close", closed);
+    });
+  };
+
+  return {
+    child,
+    output: () => captured,
+    waitForExit: async () =>
+      await new Promise<number>((resolve, reject) => {
+        if (child.exitCode !== null) {
+          resolve(child.exitCode);
+          return;
+        }
+        child.once("error", reject);
+        child.once("exit", code => resolve(code ?? 1));
+      }),
+    waitForOutput,
+    write: async input =>
+      await new Promise<void>((resolve, reject) => {
+        child.stdin.write(input, error => {
+          if (error) {
+            reject(error);
+            return;
+          }
+          resolve();
+        });
+      }),
+  };
+}
+
+async function visibleTerminalPaneID(window: Locator): Promise<string> {
+  const pane = window.locator('[data-testid^="terminal-pane-term-"]:visible').first();
+  await pane.waitFor({ state: "visible" });
+  const testId = await pane.getAttribute("data-testid");
+  const prefix = "terminal-pane-";
+  if (!testId?.startsWith(`${prefix}term-`)) {
+    throw new Error(`Unexpected terminal pane id: ${testId}`);
+  }
+  return testId.slice(prefix.length);
+}
+
+/**
+ * The size-vote bar reports the daemon's settled size, and every viewer holds
+ * that same size. The bar's own appearance reflows the writer's grid by a row,
+ * so the comparison reads the size the watcher holds now rather than the one
+ * its ATTACHED frame carried.
+ */
+async function expectSizeVoteToMatchWatcher(
+  page: Page,
+  window: Locator,
+  terminalId: string
+): Promise<void> {
+  const bar = window.getByTestId("terminal-size-vote");
+  await expect(bar).toBeVisible();
+  await expect
+    .poll(async () => {
+      const grid = await watcherGrid(page, terminalId);
+      if (grid === null) return "watcher has no grid yet";
+      const text = (await bar.textContent()) ?? "";
+      return text.includes(`${grid.cols}×${grid.rows}`)
+        ? "match"
+        : `${text} vs ${grid.cols}×${grid.rows}`;
+    })
+    .toBe("match");
+}
+
+async function terminalScreen(runtime: BrowserRuntime, workspaceId: string, terminalId: string) {
+  return await runtime.requestJSON<TerminalReadEnvelope>(
+    `/api/workspaces/${encodeURIComponent(workspaceId)}/terminals/${encodeURIComponent(
+      terminalId
+    )}/read?view=screen&profile=default`
+  );
+}
+
+async function interactiveTerminalLog(window: Locator): Promise<Locator> {
+  const log = window.locator('[role="log"]:visible').last();
+  await expect(log).toBeVisible();
+  await expect(log).toHaveAttribute("data-readonly", "false");
+  return log;
+}
+
+function focusedTerminalWindow(page: Page): Locator {
+  return page.locator(
+    '[data-slot="os-window-frame"][data-focused] [data-slot="os-window-surface"][data-app="terminal"][data-stack-active]'
+  );
+}
+
+function structuredTerminalErrorCode(payload: unknown): string | undefined {
+  if (payload === null || typeof payload !== "object") return undefined;
+  const record = payload as Record<string, unknown>;
+  if (typeof record.code === "string") return record.code;
+  if (record.error === null || typeof record.error !== "object") return undefined;
+  const nested = record.error as Record<string, unknown>;
+  return typeof nested.code === "string" ? nested.code : undefined;
+}
+
+test("E2E-001: CLI golden path opens, runs, lists, and journals a terminal", async ({
+  runtime,
+}) => {
+  assertLaunchRuntime(runtime);
+  const workspace = await runtimeWorkspace(runtime);
+  const attached = startInteractiveCLI(runtime.paths, [
+    "terminal",
+    "open",
+    "--workspace",
+    workspace.id,
+    "--title",
+    "e2e-golden",
+  ]);
+  await attached.waitForOutput(/opened .* — attached\. Detach: Ctrl-\\ Ctrl-\\/u);
+  await attached.write("printf 'terminal-golden-path\\n'\n");
+  await attached.waitForOutput(/terminal-golden-path\n/u);
+  await attached.write("\u001c\u001c");
+  await attached.waitForOutput("[detached — terminal keeps running]");
+  expect(await attached.waitForExit()).toBe(0);
+
+  const listed = await runTerminalCLI<TerminalListEnvelope>(runtime.paths, [
+    "list",
+    "--workspace",
+    workspace.id,
+    "-o",
+    "json",
+  ]);
+  const opened = listed.terminals.find(terminal => terminal.title === "e2e-golden");
+  expect(opened).toMatchObject({ state: "running", mode: "pty" });
+  if (!opened) throw new Error("Attached terminal was absent from the list.");
+  const history = await runTerminalCLI<{ quote: string }>(runtime.paths, [
+    "quote",
+    opened.id,
+    "--workspace",
+    workspace.id,
+    "--lines",
+    "1-200",
+    "-o",
+    "json",
+  ]);
+  expect(history.quote).toContain("terminal-golden-path");
+  await expect
+    .poll(async () => {
+      const journal = await runTerminalCLI<TerminalJournalEnvelope>(runtime.paths, [
+        "journal",
+        "--workspace",
+        workspace.id,
+        "--since",
+        "1h",
+        "-o",
+        "json",
+      ]);
+      return journal.entries.find(entry => entry.command.includes("terminal-golden-path"));
+    })
+    .toMatchObject({
+      terminal_id: opened.id,
+      actor: { kind: "human" },
+      approval: "human",
+      detected_by: "marker",
+      exit_code: 0,
+    });
+});
+
+test("E2E-002: browser restores terminal tabs and confirms group termination", async ({
+  appPage,
+  runtime,
+}) => {
+  assertLaunchRuntime(runtime);
+  const workspace = await runtimeWorkspace(runtime);
+  await ensureProjectWorkspace(appPage, runtime);
+  // Opening the Terminal app lands in a working terminal directly: the id-less
+  // route creates one, with no launcher or empty state in between.
+  const createResponsePromise = appPage.waitForResponse(
+    response =>
+      response.request().method() === "POST" &&
+      new URL(response.url()).pathname === `/api/workspaces/${workspace.id}/terminals`
+  );
+  await openAppWindow(appPage, "Terminal", "terminal");
+  expect((await createResponsePromise).status()).toBe(201);
+  const firstActiveWindow = focusedTerminalWindow(appPage);
+  const firstID = await visibleTerminalPaneID(firstActiveWindow);
+  await focusWindowThroughPalette(appPage, firstActiveWindow);
+  let window = firstActiveWindow;
+  const firstLog = await interactiveTerminalLog(window);
+  await firstLog.click();
+  await appPage.keyboard.type("printf 'first-screen-intact\\n'");
+  await appPage.keyboard.press("Enter");
+  await expect
+    .poll(async () => (await terminalScreen(runtime, workspace.id, firstID)).content)
+    .toContain("first-screen-intact");
+
+  // Another terminal joins this frame as an OS window tab — the deck is the
+  // only tab strip anywhere.
+  const secondCreatePromise = appPage.waitForResponse(
+    response =>
+      response.request().method() === "POST" &&
+      new URL(response.url()).pathname === `/api/workspaces/${workspace.id}/terminals`
+  );
+  await window.getByTestId("terminal-new").click();
+  expect((await secondCreatePromise).status()).toBe(201);
+  const frame = appPage.locator('[data-slot="os-window-frame"][data-focused]');
+  await expect(frame.locator('[role="tab"]')).toHaveCount(2);
+  const secondActiveWindow = focusedTerminalWindow(appPage);
+  const secondID = await visibleTerminalPaneID(secondActiveWindow);
+  expect(secondID).not.toBe(firstID);
+  window = secondActiveWindow;
+  const secondLog = await interactiveTerminalLog(window);
+  await secondLog.click();
+  await appPage.keyboard.type("printf 'second-screen-intact\\n'");
+  await appPage.keyboard.press("Enter");
+  await expect
+    .poll(async () => (await terminalScreen(runtime, workspace.id, secondID)).content)
+    .toContain("second-screen-intact");
+  for (let index = 0; index < 8; index += 1) {
+    await frame
+      .locator('[data-testid^="os-window-tab-"] [role="tab"]')
+      .nth(index % 2)
+      .click();
+  }
+
+  await appPage.reload({ waitUntil: "domcontentloaded" });
+  const restoredFrame = appPage.locator('[data-slot="os-window-frame"][data-focused]');
+  await expect(restoredFrame.locator('[role="tab"]')).toHaveCount(2);
+  // Reattach re-votes the grid size, and a transient shrink may reflow the
+  // focused viewport (ADR-015 sizes by writers). Retention is therefore
+  // asserted on the unfocused PTY, which cast no vote, while the focused one
+  // proves the stronger fact: the same process answers through the restored
+  // attachment.
+  const restoredWindow = focusedTerminalWindow(appPage);
+  const restoredID = await visibleTerminalPaneID(restoredWindow);
+  expect([firstID, secondID]).toContain(restoredID);
+  const retainedID = restoredID === firstID ? secondID : firstID;
+  const retainedMarker = retainedID === firstID ? "first-screen-intact" : "second-screen-intact";
+  await expect
+    .poll(async () => (await terminalScreen(runtime, workspace.id, retainedID)).content)
+    .toContain(retainedMarker);
+  const restoredLog = await interactiveTerminalLog(restoredWindow);
+  await restoredLog.click();
+  await appPage.keyboard.type("printf 'reattach-live\\n'");
+  await appPage.keyboard.press("Enter");
+  await expect
+    .poll(async () => (await terminalScreen(runtime, workspace.id, restoredID)).content)
+    .toContain("reattach-live");
+  const running = await runTerminalCLI<TerminalListEnvelope>(runtime.paths, [
+    "list",
+    "--workspace",
+    workspace.id,
+    "-o",
+    "json",
+  ]);
+  expect(running.terminals.filter(terminal => [firstID, secondID].includes(terminal.id))).toEqual(
+    expect.arrayContaining([
+      expect.objectContaining({ id: firstID, state: "running" }),
+      expect.objectContaining({ id: secondID, state: "running" }),
+    ])
+  );
+
+  // Cancel preserves every process and the complete group. Confirm terminates
+  // exactly these two terminals before the daemon removes their windows.
+  const restored = focusedTerminalWindow(appPage);
+  await focusWindowThroughPalette(appPage, restored);
+  // All projects is its own desktop (AP), so the close runs on the project's desktop.
+  await windowFrame(restored).getByRole("button", { name: "Close window" }).click();
+  const confirmation = appPage.getByTestId("terminal-close-dialog");
+  await expect(confirmation).toBeVisible();
+  await confirmation.getByRole("button", { name: "Cancel", exact: true }).click();
+  await expect(restored).toBeVisible();
+  const survivors = await runTerminalCLI<TerminalListEnvelope>(runtime.paths, [
+    "list",
+    "--workspace",
+    workspace.id,
+    "-o",
+    "json",
+  ]);
+  expect(
+    survivors.terminals.filter(
+      terminal => [firstID, secondID].includes(terminal.id) && terminal.state === "running"
+    )
+  ).toHaveLength(2);
+  await windowFrame(restored).getByRole("button", { name: "Close window" }).click();
+  await confirmation.getByRole("button", { name: "Terminate and close" }).click();
+  await expect(restored).toBeHidden();
+  await expect
+    .poll(async () => {
+      const result = await runTerminalCLI<TerminalListEnvelope>(runtime.paths, [
+        "list",
+        "--workspace",
+        workspace.id,
+        "-o",
+        "json",
+      ]);
+      return result.terminals.filter(
+        terminal => [firstID, secondID].includes(terminal.id) && terminal.state === "running"
+      ).length;
+    })
+    .toBe(0);
+  await appPage.reload({ waitUntil: "domcontentloaded" });
+  await expect(appPage.locator('[data-slot="os-window-surface"][data-app="terminal"]')).toHaveCount(
+    0
+  );
+
+  const firstQuote = await runTerminalCLI<{ quote: string }>(runtime.paths, [
+    "quote",
+    firstID,
+    "--workspace",
+    workspace.id,
+    "--lines",
+    "1-200",
+    "-o",
+    "json",
+  ]);
+  expect(firstQuote.quote).toContain("first-screen-intact");
+});
+
+// Invariant: desktop viewer identity and a terminal's data binding remain independent.
+// Owner: browser terminal lifecycle; this suite exercises real registration, PTY, and close.
+for (const destination of ["global-project", "global-user", "user"] as const) {
+  test(`E2E-020: ${destination} terminal creation and bound close`, async ({
+    appPage,
+    runtime,
+    browserArtifacts,
+  }) => {
+    assertLaunchRuntime(runtime);
+    const workspace = await runtimeWorkspace(runtime);
+    const target = destination === "global-project" ? workspace.id : "@user";
+    const partition = destination === "user" ? "user" : "global";
+    await ensureProjectWorkspace(appPage, runtime);
+    if (partition === "global") await setGlobalScope(appPage, true);
+    else await focusUserScope(appPage);
+    const created = appPage.waitForResponse(
+      response =>
+        response.request().method() === "POST" &&
+        new URL(response.url()).pathname ===
+          `/api/workspaces/${encodeURIComponent(target)}/terminals`
+    );
+    if (partition === "global") {
+      // All projects: the dock's Terminal item opens the launcher dialog, not a window.
+      await appPage
+        .locator('[data-slot="os-dock"]:visible, [data-slot="os-dock-tabbar"]:visible')
+        .getByRole("button", { name: "Terminal" })
+        .click();
+      const launcher = appPage.getByRole("dialog").getByTestId("terminal-launcher");
+      await expect(launcher).toBeVisible();
+      await launcher.getByTestId(`terminal-launcher-new-${target}`).click();
+    } else {
+      await openAppWindow(appPage, "Terminal", "terminal");
+    }
+    const response = await created;
+    expect(response.status()).toBe(201);
+    expect(response.request().headers()["x-compozy-client-workspace"]).toBe(partition);
+    expect(response.request().headers()["x-compozy-client-id"]).toMatch(/^web-/);
+    let terminal = focusedTerminalWindow(appPage);
+    const firstID = await visibleTerminalPaneID(terminal);
+    const log = await interactiveTerminalLog(terminal);
+    await log.click();
+    await appPage.keyboard.type("PS1='$ '; clear; printf 'bound-%s\\n' terminal-live");
+    await appPage.keyboard.press("Enter");
+    await expect
+      .poll(async () => (await terminalScreen(runtime, target, firstID)).content)
+      .toContain("bound-terminal-live");
+    await expect(log).toContainText("bound-terminal-live");
+    await browserArtifacts.captureScreenshot(`${destination}-attached`, appPage);
+    const nextCreated = appPage.waitForResponse(
+      response =>
+        response.request().method() === "POST" &&
+        new URL(response.url()).pathname ===
+          `/api/workspaces/${encodeURIComponent(target)}/terminals`
+    );
+    await terminal.getByTestId("terminal-new").click();
+    expect((await nextCreated).status()).toBe(201);
+    terminal = focusedTerminalWindow(appPage);
+    const secondID = await visibleTerminalPaneID(terminal);
+    expect(secondID).not.toBe(firstID);
+    const secondLog = await interactiveTerminalLog(terminal);
+    await secondLog.click();
+    await appPage.keyboard.type("PS1='$ '; clear; printf 'second-%s\\n' terminal-live");
+    await appPage.keyboard.press("Enter");
+    await expect
+      .poll(async () => (await terminalScreen(runtime, target, secondID)).content)
+      .toContain("second-terminal-live");
+    await expect(secondLog).toContainText("second-terminal-live");
+    await windowFrame(terminal).getByRole("button", { name: "Close window" }).click();
+    const confirmation = appPage.getByTestId("terminal-close-dialog");
+    await expect(confirmation).toBeVisible();
+    await browserArtifacts.captureScreenshot(`${destination}-confirm`, appPage);
+    await confirmation.getByRole("button", { name: "Cancel", exact: true }).click();
+    const list = () =>
+      runtime.requestJSON<TerminalListEnvelope>(
+        `/api/workspaces/${encodeURIComponent(target)}/terminals`
+      );
+    expect(
+      (await list()).terminals.filter(
+        item => [firstID, secondID].includes(item.id) && item.state === "running"
+      )
+    ).toHaveLength(2);
+    await windowFrame(terminal).getByRole("button", { name: "Close window" }).click();
+    await confirmation.getByRole("button", { name: "Terminate and close" }).click();
+    await expect(terminal).toBeHidden();
+    await expect
+      .poll(
+        async () =>
+          (await list()).terminals.filter(
+            item => [firstID, secondID].includes(item.id) && item.state === "running"
+          ).length
+      )
+      .toBe(0);
+    await browserArtifacts.captureScreenshot(`${destination}-closed`, appPage);
+
+    // Recreate a persisted window whose terminal no longer exists through the public WM API.
+    const wmPath = `/api/workspaces/${partition}/window-manager`;
+    const snapshot = await runtime.requestJSON<{ revision: number }>(wmPath);
+    await runtime.requestJSON(`${wmPath}/commands`, {
+      method: "POST",
+      body: JSON.stringify({
+        workspace_id: partition,
+        command_id: "window.open",
+        expected_revision: snapshot.revision,
+        actor: { kind: "e2e", id: "terminal" },
+        origin: "web-e2e",
+        payload: {
+          window: {
+            id: "e2e-missing-terminal",
+            app: "terminal",
+            instance_key: "term-missing",
+            route: { pathname: "/terminal/term-missing", search: { workspace: target } },
+            desktop_id: "desktop-default",
+            insert_tiled: false,
+            floating_rect: { x: 0.1, y: 0.1, width: 0.6, height: 0.6 },
+          },
+        },
+      }),
+    });
+    const missing = appPage.locator('[data-slot="os-window-surface"][data-app="terminal"]');
+    await expect(missing).toBeVisible();
+    await browserArtifacts.captureScreenshot(`${destination}-missing`, appPage);
+    await windowFrame(missing).getByRole("button", { name: "Close window" }).click();
+    await expect(missing).toBeHidden();
+    await expect(confirmation).toBeHidden();
+    await expect(appPage.getByText("Could not close terminal", { exact: true })).toBeHidden();
+    await browserArtifacts.captureScreenshot(`${destination}-missing-closed`, appPage);
+    await appPage.reload({ waitUntil: "domcontentloaded" });
+    await expect(missing).toHaveCount(0);
+  });
+}
+
+test("E2E-020: terminal window close preserves Stop and retries after disconnect", async ({
+  appPage,
+  runtime,
+}) => {
+  assertLaunchRuntime(runtime);
+  const workspace = await runtimeWorkspace(runtime);
+  await ensureProjectWorkspace(appPage, runtime);
+  const terminal = await openAppWindow(appPage, "Terminal", "terminal");
+  const terminalID = await visibleTerminalPaneID(terminal);
+  const log = await interactiveTerminalLog(terminal);
+  await log.click();
+  await appPage.keyboard.type("printf 'work-before-stop\\n'");
+  await appPage.keyboard.press("Enter");
+  await expect
+    .poll(async () => (await terminalScreen(runtime, workspace.id, terminalID)).content)
+    .toContain("work-before-stop");
+  await expect(terminal.getByTestId("terminal-close")).toHaveCount(0);
+
+  await windowFrame(terminal).getByRole("button", { name: "Close window" }).click();
+  const confirmation = appPage.getByTestId("terminal-close-dialog");
+  await expect(confirmation).toBeVisible();
+  await appPage.context().setOffline(true);
+  try {
+    await confirmation.getByRole("button", { name: "Terminate and close" }).click();
+    await expect(appPage.getByText("Could not close terminal", { exact: true })).toBeVisible();
+    await expect(terminal).toBeVisible();
+  } finally {
+    await appPage.context().setOffline(false);
+  }
+  const stillRunning = await runTerminalCLI<TerminalEnvelope>(runtime.paths, [
+    "get",
+    terminalID,
+    "--workspace",
+    workspace.id,
+    "-o",
+    "json",
+  ]);
+  expect(stillRunning.terminal.state).toBe("running");
+  await appPage.reload({ waitUntil: "domcontentloaded" });
+  const restored = focusedTerminalWindow(appPage);
+  expect(await visibleTerminalPaneID(restored)).toBe(terminalID);
+  await restored.getByTestId("terminal-stop").click();
+  await expect
+    .poll(
+      async () =>
+        (
+          await runTerminalCLI<TerminalEnvelope>(runtime.paths, [
+            "get",
+            terminalID,
+            "--workspace",
+            workspace.id,
+            "-o",
+            "json",
+          ])
+        ).terminal.state
+    )
+    .toBe("exited");
+  await expect(restored).toBeVisible();
+  await windowFrame(restored).getByRole("button", { name: "Close window" }).click();
+  await expect(restored).toBeHidden();
+  await expect(confirmation).not.toBeVisible();
+});
+
+test("E2E-007: journal filters update the real browser query", async ({ appPage, runtime }) => {
+  assertLaunchRuntime(runtime);
+  const workspace = await runtimeWorkspace(runtime);
+  const general = await runtime.requestJSON<{
+    config: Record<string, unknown> & {
+      terminal: Record<string, unknown>;
+    };
+  }>("/api/settings/general");
+  await runtime.requestJSON("/api/settings/general", {
+    method: "PATCH",
+    body: JSON.stringify({
+      config: {
+        ...general.config,
+        terminal: { ...general.config.terminal, shell_integration: false },
+      },
+    }),
+  });
+  const restart = await runtime.requestJSON<SettingsRestartAction>(
+    "/api/settings/actions/restart",
+    { method: "POST", body: "{}" }
+  );
+  await expect
+    .poll(async () => await pollRestartStatus(runtime, restart.status_url), { timeout: 45_000 })
+    .toBe("ready");
+  await reloadDaemonServedPage(appPage, runtime, "/", { readyTestId: "os-desktop" });
+  await runTerminalCLI<unknown>(runtime.paths, [
+    "exec",
+    "--workspace",
+    workspace.id,
+    "-o",
+    "json",
+    "--",
+    "/bin/sh",
+    "-c",
+    "false",
+  ]);
+  const terminal = await runTerminalCLI<TerminalEnvelope>(runtime.paths, [
+    "open",
+    "--workspace",
+    workspace.id,
+    "--shell",
+    "/bin/sh",
+    "--detach",
+    "-o",
+    "json",
+  ]);
+  const terminalID = terminal.terminal.id;
+  await ensureProjectWorkspace(appPage, runtime);
+  await openAppWindow(appPage, "Terminal", "terminal");
+  const window = focusedTerminalWindow(appPage);
+  // The dock adopts the newest running detached terminal — the CLI-opened one.
+  await expect(window.getByTestId(`terminal-pane-${terminalID}`)).toBeVisible();
+  await interactiveTerminalLog(window);
+  await runTerminalCLI(runtime.paths, [
+    "record",
+    "start",
+    terminalID,
+    "--workspace",
+    workspace.id,
+    "-o",
+    "json",
+  ]);
+  await window.locator('[role="log"]:visible').last().click();
+  await appPage.keyboard.type("false", { delay: 50 });
+  await appPage.keyboard.press("Enter");
+  await expect
+    .poll(async () => (await terminalScreen(runtime, workspace.id, terminalID)).content)
+    .toContain("false");
+  let observedEntries: TerminalJournalEnvelope["entries"] = [];
+  await expect
+    .poll(async () => {
+      const journal = await runTerminalCLI<TerminalJournalEnvelope>(runtime.paths, [
+        "journal",
+        "--workspace",
+        workspace.id,
+        "-o",
+        "json",
+      ]);
+      observedEntries = journal.entries;
+      return journal.entries;
+    })
+    .toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          terminal_id: terminalID,
+          command: "false",
+          actor: expect.objectContaining({ kind: "human" }),
+          detected_by: "idle",
+        }),
+      ])
+    );
+  const failedRow = observedEntries.find(
+    entry => entry.terminal_id === terminalID && entry.command === "false"
+  );
+  if (!failedRow) throw new Error("Failed approximate journal row was not created.");
+  const exactFailedRow = observedEntries.find(
+    entry => entry.terminal_id === null && entry.detected_by === "exact" && entry.exit_code === 1
+  );
+  if (!exactFailedRow) throw new Error("Exact failed journal row was not created.");
+  await runTerminalCLI(runtime.paths, [
+    "record",
+    "stop",
+    terminalID,
+    "--workspace",
+    workspace.id,
+    "-o",
+    "json",
+  ]);
+
+  // Owner: browser terminal host (E2E-007). An unlocked, uncached journal keeps its
+  // loading region while the first read is offline, then resumes without reopening.
+  await appPage.context().setOffline(true);
+  try {
+    await window.getByTestId("terminal-journal-toggle").click();
+    await expect(window.getByTestId("terminal-journal")).toBeVisible();
+    await expect(window.getByRole("status")).toContainText("Loading the journal");
+  } finally {
+    await appPage.context().setOffline(false);
+  }
+  await expect(window.getByTestId(`terminal-journal-row-${failedRow.command_id}`)).toBeVisible();
+  await window.getByTestId("terminal-journal-filters-add").click();
+  await appPage.getByRole("option", { name: "Who" }).click();
+  await appPage.getByRole("option", { name: "A person" }).click();
+  await expect(window.getByTestId(`terminal-journal-row-${failedRow.command_id}`)).toBeVisible();
+  await expect(
+    window.getByTestId(`terminal-journal-confidence-${failedRow.command_id}`)
+  ).toHaveText("estimated");
+  const replay = window.getByTestId(`terminal-journal-replay-${failedRow.command_id}`);
+  await expect(replay).toBeVisible();
+  await replay.click();
+  await expect(window.getByTestId("terminal-recording-player")).toBeVisible();
+  await window.getByTestId("terminal-recording-open-journal").click();
+  await expect(window.getByTestId("terminal-journal-detail")).toBeVisible();
+  await appPage.keyboard.press("Escape");
+  await expect(window.getByTestId("terminal-journal-detail")).toBeHidden();
+
+  await window.getByTestId("terminal-journal-filters-add").click();
+  await appPage.getByRole("option", { name: "Result" }).click();
+  await appPage.getByRole("option", { name: "Finished with errors" }).click();
+  await expect(
+    window.getByTestId(`terminal-journal-row-${exactFailedRow.command_id}`)
+  ).toBeVisible();
+
+  await window.getByTestId("terminal-journal-filters-add").click();
+  await appPage.getByRole("option", { name: "Terminal" }).click();
+  await appPage.getByPlaceholder("term-…").fill("term-000000000000");
+  await expect(window.getByTestId("terminal-journal-filtered-empty")).toContainText(
+    "No matches in the rows loaded"
+  );
+});
+
+test("E2E-009: the workspace cap names the terminal that can be closed", async ({
+  appPage,
+  runtime,
+}) => {
+  assertLaunchRuntime(runtime);
+  const workspace = await runtimeWorkspace(runtime);
+  const terminals: TerminalRecord[] = [];
+  for (let index = 1; index <= 8; index += 1) {
+    const opened = await runTerminalCLI<TerminalEnvelope>(runtime.paths, [
+      "open",
+      "--workspace",
+      workspace.id,
+      "--title",
+      `cap-owner-${index}`,
+      "--detach",
+      "-o",
+      "json",
+    ]);
+    terminals.push(opened.terminal);
+  }
+
+  await ensureProjectWorkspace(appPage, runtime);
+  const window = await openAppWindow(appPage, "Terminal", "terminal");
+  // The dock adopts one of the running terminals; asking for a fresh one at
+  // the cap surfaces the way out instead of a dead create.
+  await visibleTerminalPaneID(window);
+  await window.getByTestId("terminal-new").click();
+  const dialog = appPage.getByTestId("terminal-limit-dialog");
+  await expect(dialog).toBeVisible();
+  await expect(dialog).toContainText(terminals[0]!.id);
+  await expect(dialog).toContainText(terminals[7]!.id);
+  await expect(dialog).toContainText("8 of 8 terminals are open");
+  await expect(dialog).toContainText("terminal.max_per_workspace 8");
+  await appPage.keyboard.press("Escape");
+  const capFrame = appPage.locator('[data-slot="os-window-frame"][data-focused]');
+  await capFrame.getByRole("button", { name: "Close window" }).click();
+
+  try {
+    for (let index = 0; index < 16; index += 1) {
+      await connectTerminalWatcher(appPage, runtime, workspace.id, terminals[0]!.id);
+    }
+    const attachPath = `/api/workspaces/${encodeURIComponent(
+      workspace.id
+    )}/terminals/${encodeURIComponent(terminals[0]!.id)}/attach-ticket?profile=default`;
+    const rejected = await appPage.request.post(runtime.url(attachPath), {
+      data: { mode: "read" },
+    });
+    expect(rejected.status()).toBe(409);
+    expect(await rejected.json()).toMatchObject({
+      error: {
+        code: "subscriber_limit_reached",
+        message: "terminal subscriber limit reached",
+        details: { current: 16, max: 16 },
+      },
+    });
+  } finally {
+    await closeTerminalWatchers(appPage);
+  }
+});
+
+test("E2E-011: two CLI attachments share input, detach, and deliver single SIGQUIT", async ({
+  runtime,
+}) => {
+  assertLaunchRuntime(runtime);
+  const workspace = await runtimeWorkspace(runtime);
+  const shellFixture = path.join(runtime.paths.workspaceDir, ".terminal-e2e-sigquit.sh");
+  await writeFile(
+    shellFixture,
+    [
+      "#!/bin/sh",
+      "trap 'printf \"single-sigquit-received\\n\"' QUIT",
+      "while :; do",
+      "  if IFS= read -r line; then",
+      '    eval "$line"',
+      "  fi",
+      "done",
+      "",
+    ].join("\n"),
+    { mode: 0o700 }
+  );
+  await chmod(shellFixture, 0o700);
+  const opened = await runTerminalCLI<TerminalEnvelope>(runtime.paths, [
+    "open",
+    "--workspace",
+    workspace.id,
+    "--shell",
+    shellFixture,
+    "--title",
+    "attach-modes",
+    "--detach",
+    "-o",
+    "json",
+  ]);
+
+  const first = startInteractiveCLI(runtime.paths, [
+    "terminal",
+    "attach",
+    opened.terminal.id,
+    "--workspace",
+    workspace.id,
+  ]);
+  await first.waitForOutput(`[attached to ${opened.terminal.id} — shared input is active.`);
+  await first.write("printf 'first-cli-writer\\n'\n");
+  await first.waitForOutput("first-cli-writer");
+
+  const second = startInteractiveCLI(runtime.paths, [
+    "terminal",
+    "attach",
+    opened.terminal.id,
+    "--workspace",
+    workspace.id,
+  ]);
+  await second.waitForOutput(`[attached to ${opened.terminal.id} — shared input is active.`);
+  await second.write("printf 'second-cli-writer\\n'\n");
+  await second.waitForOutput("second-cli-writer");
+  await second.write("\u001c");
+  await second.waitForOutput("single-sigquit-received");
+  await second.write("\u001c\u001c");
+  await second.waitForOutput("[detached — terminal keeps running]");
+  expect(await second.waitForExit()).toBe(0);
+  await first.write("\u001c\u001c");
+  await first.waitForOutput("[detached — terminal keeps running]");
+  expect(await first.waitForExit()).toBe(0);
+  const sharedScreen = (await terminalScreen(runtime, workspace.id, opened.terminal.id)).content;
+  expect(sharedScreen).toContain("first-cli-writer");
+  expect(sharedScreen).toContain("second-cli-writer");
+
+  await runTerminalCLI(runtime.paths, [
+    "kill",
+    opened.terminal.id,
+    "--workspace",
+    workspace.id,
+    "-o",
+    "json",
+  ]);
+  const exited = await runTerminalCLITextFailure(runtime.paths, [
+    "attach",
+    opened.terminal.id,
+    "--workspace",
+    workspace.id,
+  ]);
+  // HTTP 409 is a caller-state conflict and maps to the CLI's stable EX_DATAERR code.
+  expect(exited.code).toBe(65);
+  expect(exited.stderr).toContain("terminal_exited");
+  expect(exited.stderr).toMatch(/exited|signaled/u);
+});
+
+test("E2E-014: alternate-screen TUI reflows, matches a watcher, and restores primary", async ({
+  appPage,
+  runtime,
+}) => {
+  test.setTimeout(150_000);
+  assertLaunchRuntime(runtime);
+  const workspace = await runtimeWorkspace(runtime);
+  const binary = path.join(runtime.paths.workspaceDir, ".terminal-e2e-tui");
+  await execFileAsync("go", ["build", "-o", binary, "./internal/terminal/testdata/tui"], {
+    cwd: repositoryRoot,
+  });
+  const wrapper = path.join(runtime.paths.workspaceDir, ".terminal-e2e-tui.sh");
+  await writeFile(wrapper, `#!/bin/sh\nexec ${shellQuote(binary)} hold\n`, { mode: 0o700 });
+  await chmod(wrapper, 0o700);
+  const opened = await runTerminalCLI<TerminalEnvelope>(runtime.paths, [
+    "open",
+    "--workspace",
+    workspace.id,
+    "--shell",
+    wrapper,
+    "--title",
+    "tui-fidelity",
+    "--detach",
+    "-o",
+    "json",
+  ]);
+
+  await ensureProjectWorkspace(appPage, runtime);
+  await openAppWindow(appPage, "Terminal", "terminal");
+  const firstWindow = focusedTerminalWindow(appPage);
+  await expect(firstWindow.getByTestId(`terminal-pane-${opened.terminal.id}`)).toBeVisible();
+  await expect
+    .poll(async () => (await terminalScreen(runtime, workspace.id, opened.terminal.id)).content)
+    .toContain("terminal tui");
+  expect((await terminalScreen(runtime, workspace.id, opened.terminal.id)).content).toContain(
+    "second row"
+  );
+  await interactiveTerminalLog(firstWindow);
+  const originalGrid = await connectTerminalWatcher(
+    appPage,
+    runtime,
+    workspace.id,
+    opened.terminal.id
+  );
+  try {
+    await expect(firstWindow.getByTestId("terminal-viewers")).toContainText("2");
+    await expectSizeVoteToMatchWatcher(appPage, firstWindow, opened.terminal.id);
+  } finally {
+    await closeTerminalWatchers(appPage);
+  }
+  const resizeHandle = windowFrame(firstWindow)
+    .locator("xpath=..")
+    .locator('[style*="cursor: se-resize"]');
+  await expect(resizeHandle).toBeVisible();
+  const handleBox = await resizeHandle.boundingBox();
+  const frameBox = await windowFrame(firstWindow).boundingBox();
+  if (!handleBox || !frameBox) throw new Error("Terminal window resize handle has no layout box.");
+  // The corner handle straddles the frame edge, which can sit on the viewport
+  // edge on the full-bleed desk: grab the half that overlaps the frame.
+  const resizeX = Math.min(handleBox.x + handleBox.width, frameBox.x + frameBox.width) - 2;
+  const resizeY = Math.min(handleBox.y + handleBox.height, frameBox.y + frameBox.height) - 2;
+  await appPage.mouse.move(resizeX, resizeY);
+  await appPage.mouse.down();
+  await appPage.mouse.move(resizeX - 160, resizeY - 80, { steps: 12 });
+  await appPage.mouse.up();
+  const resizedGrid = await connectTerminalWatcher(
+    appPage,
+    runtime,
+    workspace.id,
+    opened.terminal.id
+  );
+  try {
+    expect(resizedGrid).not.toEqual(originalGrid);
+    await expect(firstWindow.getByTestId("terminal-viewers")).toContainText("2");
+    await expectSizeVoteToMatchWatcher(appPage, firstWindow, opened.terminal.id);
+  } finally {
+    await closeTerminalWatchers(appPage);
+  }
+
+  await interactiveTerminalLog(firstWindow);
+  await firstWindow.getByRole("log").click();
+  await appPage.keyboard.type("x");
+  await appPage.keyboard.press("Enter");
+  await expect
+    .poll(async () => (await terminalScreen(runtime, workspace.id, opened.terminal.id)).content)
+    .toContain("primary screen");
+  await expect(firstWindow.getByTestId("terminal-exit-bar")).toBeVisible({ timeout: 20_000 });
+});
+
+test("E2E-015: terminal settings expose defaults and reject an invalid limit", async ({
+  appPage,
+  runtime,
+}) => {
+  const general = await runtime.requestJSON<{
+    config: { terminal: { max_per_workspace: number; recording_retention_days: number } };
+  }>("/api/settings/general");
+  expect(general.config.terminal).toMatchObject({
+    max_per_workspace: 8,
+    recording_retention_days: 30,
+  });
+  await ensureProjectWorkspace(appPage, runtime);
+  const settings = await openAppWindow(appPage, "Settings", "settings");
+  await settings.getByTestId("settings-section-nav").getByText("Terminal", { exact: true }).click();
+  await expect(settings.getByTestId("settings-terminal-default-shell")).toBeVisible();
+  // Limits live in the page's Advanced fold.
+  await settings
+    .getByTestId("settings-page-terminal-advanced")
+    .getByTestId("settings-advanced-toggle")
+    .click();
+  const limit = settings.getByTestId("settings-terminal-max-per-workspace");
+  await expect(limit).toHaveValue("8");
+  await limit.fill("0");
+  const limitRow = settings.getByTestId("settings-terminal-max-per-workspace-row");
+  await expect(limitRow.getByRole("alert")).toHaveText("Value must be 1 or greater.");
+  await expect(settings.getByTestId("settings-page-terminal-save")).toBeDisabled();
+});
+
+test("E2E-016: CLI returns structured selector, timeout, and missing-terminal failures", async ({
+  runtime,
+}) => {
+  assertLaunchRuntime(runtime);
+  const workspace = await runtimeWorkspace(runtime);
+  expect(
+    await runTerminalCLI<TerminalListEnvelope>(runtime.paths, [
+      "list",
+      "--workspace",
+      workspace.id,
+      "-o",
+      "json",
+    ])
+  ).toEqual({ terminals: [] });
+  expect(
+    await runTerminalCLI<TerminalJournalEnvelope>(runtime.paths, [
+      "journal",
+      "--workspace",
+      workspace.id,
+      "-o",
+      "json",
+    ])
+  ).toEqual({ entries: [], next: null });
+  expect(
+    await runTerminalCLI<{ pending: unknown[]; resolved: unknown[] }>(runtime.paths, [
+      "input-requests",
+      "--workspace",
+      workspace.id,
+      "-o",
+      "json",
+    ])
+  ).toEqual({ pending: [], resolved: [] });
+
+  const cases: Array<{ args: string[]; code: string; exitCode: number }> = [
+    {
+      args: [
+        "list",
+        "--workspace",
+        workspace.id,
+        "--profile",
+        "default",
+        "--all-profiles",
+        "-o",
+        "json",
+      ],
+      code: "profile_selection_conflict",
+      exitCode: CLI_EXIT_FAILURE,
+    },
+    {
+      args: [
+        "open",
+        "--workspace",
+        workspace.id,
+        "--cwd",
+        "services/gone",
+        "--detach",
+        "-o",
+        "json",
+      ],
+      code: "invalid_cwd",
+      exitCode: CLI_EXIT_CONFIG_INVALID,
+    },
+    {
+      args: ["exec", "--workspace", workspace.id, "--yield", "100ms", "-o", "json", "--", "true"],
+      code: "timeout_out_of_range",
+      exitCode: CLI_EXIT_FAILURE,
+    },
+    {
+      args: ["get", "term-doesnotexist", "--workspace", workspace.id, "-o", "json"],
+      code: "terminal_not_found",
+      exitCode: CLI_EXIT_UNAVAILABLE,
+    },
+  ];
+  for (const testCase of cases) {
+    const failure = await runTerminalCLIFailure(runtime.paths, testCase.args);
+    expect(failure.code).toBe(testCase.exitCode);
+    expect(structuredTerminalErrorCode(failure.payload)).toBe(testCase.code);
+  }
+
+  const shellFixture = path.join(runtime.paths.workspaceDir, ".terminal-e2e-flags.sh");
+  await writeFile(shellFixture, "#!/bin/sh\nprintf 'quote-one\\nquote-two\\n'\nexec /bin/sh\n", {
+    mode: 0o700,
+  });
+  await chmod(shellFixture, 0o700);
+  const opened = await runTerminalCLI<TerminalEnvelope>(runtime.paths, [
+    "open",
+    "--workspace",
+    workspace.id,
+    "--shell",
+    shellFixture,
+    "--title",
+    "flag-matrix",
+    "--detach",
+    "-o",
+    "json",
+  ]);
+  expect(opened.terminal).toMatchObject({
+    workspace_id: workspace.id,
+    shell: shellFixture,
+    title: "flag-matrix",
+    state: "running",
+  });
+  await expect
+    .poll(async () => (await terminalScreen(runtime, workspace.id, opened.terminal.id)).content)
+    .toContain("quote-two");
+  const quote = await runTerminalCLI<{ quote: string }>(runtime.paths, [
+    "quote",
+    opened.terminal.id,
+    "--workspace",
+    workspace.id,
+    "--lines",
+    "1-2",
+    "-o",
+    "json",
+  ]);
+  expect(JSON.stringify(quote)).toContain(`<terminal_context terminal=\\"${opened.terminal.id}\\"`);
+
+  const noInput = await runTerminalCLIFailure(runtime.paths, [
+    "respond",
+    opened.terminal.id,
+    "--workspace",
+    workspace.id,
+    "-o",
+    "json",
+  ]);
+  expect(noInput).toMatchObject({
+    code: CLI_EXIT_FAILURE,
+  });
+  expect(structuredTerminalErrorCode(noInput.payload)).toBe("input_request_not_found");
+
+  await runTerminalCLI(runtime.paths, [
+    "record",
+    "start",
+    opened.terminal.id,
+    "--workspace",
+    workspace.id,
+    "-o",
+    "json",
+  ]);
+  const recordTwice = await runTerminalCLIFailure(runtime.paths, [
+    "record",
+    "start",
+    opened.terminal.id,
+    "--workspace",
+    workspace.id,
+    "-o",
+    "json",
+  ]);
+  expect(structuredTerminalErrorCode(recordTwice.payload)).toBe("recording_already_started");
+  await runTerminalCLI(runtime.paths, [
+    "record",
+    "stop",
+    opened.terminal.id,
+    "--workspace",
+    workspace.id,
+    "-o",
+    "json",
+  ]);
+  const stopIdle = await runTerminalCLIFailure(runtime.paths, [
+    "record",
+    "stop",
+    opened.terminal.id,
+    "--workspace",
+    workspace.id,
+    "-o",
+    "json",
+  ]);
+  expect(structuredTerminalErrorCode(stopIdle.payload)).toBe("recording_not_active");
+
+  await runTerminalCLI(runtime.paths, [
+    "kill",
+    opened.terminal.id,
+    "--workspace",
+    workspace.id,
+    "-o",
+    "json",
+  ]);
+  // Close is idempotent: killing an already-ended terminal reports its
+  // recorded exit instead of a conflict. Signaling a dead process stays a
+  // structured failure — there is nothing left to deliver the signal to.
+  const killedAgain = await runTerminalCLI<{ exit: { cause: string } }>(runtime.paths, [
+    "kill",
+    opened.terminal.id,
+    "--workspace",
+    workspace.id,
+    "-o",
+    "json",
+  ]);
+  expect(killedAgain.exit.cause).toMatch(/exited|signaled/u);
+  const signalFailure = await runTerminalCLIFailure(runtime.paths, [
+    "signal",
+    opened.terminal.id,
+    "--signal",
+    "INT",
+    "--workspace",
+    workspace.id,
+    "-o",
+    "json",
+  ]);
+  expect(signalFailure.code).toBe(CLI_EXIT_DATA_ERROR);
+  expect(structuredTerminalErrorCode(signalFailure.payload)).toBe("terminal_exited");
+});
+
+async function terminalSocketCSPProbe(page: Page) {
+  return await page.evaluate(async terminalSubprotocol => {
+    const violations: string[] = [];
+    const onViolation = (event: SecurityPolicyViolationEvent) => {
+      if (event.effectiveDirective === "connect-src") violations.push(event.blockedURI);
+    };
+    const attempt = async (url: string) => {
+      await new Promise<void>(resolve => {
+        const socket = new WebSocket(url, terminalSubprotocol);
+        socket.onopen = () => {
+          socket.close();
+          queueMicrotask(resolve);
+        };
+        socket.onerror = () => queueMicrotask(resolve);
+      });
+    };
+    document.addEventListener("securitypolicyviolation", onViolation);
+    const protocol = window.location.protocol === "https:" ? "wss:" : "ws:";
+    await attempt(
+      `${protocol}//${window.location.host}/api/workspaces/csp-probe/terminals/term-probe/stream?mode=read&ticket=invalid`
+    );
+    const sameOriginViolations = violations.length;
+    violations.length = 0;
+    await attempt(`${protocol}//example.com/compozy-terminal-cross-origin`);
+    const crossOriginViolations = violations.length;
+    document.removeEventListener("securitypolicyviolation", onViolation);
+    return { sameOriginViolations, crossOriginViolations };
+  }, TERMINAL_SUBPROTOCOL);
+}
+
+test("E2E-017: production CSP admits the same-origin terminal socket and refuses cross-origin", async ({
+  appPage,
+}) => {
+  const result = await terminalSocketCSPProbe(appPage);
+
+  expect(result.sameOriginViolations).toBe(0);
+  expect(result.crossOriginViolations).toBeGreaterThan(0);
+});
+
+// Cold resource observation must precede the first dock activation in this journey.
+test("E2E-019 / E2E-018: keyboard activation lazily loads a working terminal from the dock", async ({
+  appPage,
+  runtime,
+}) => {
+  assertLaunchRuntime(runtime);
+  const workspace = await runtimeWorkspace(runtime);
+  await ensureProjectWorkspace(appPage, runtime);
+  await test.step("the controller chunk stays cold until keyboard activation", async () => {
+    const terminalChunkLoaded = async () =>
+      await appPage.evaluate(() =>
+        performance
+          .getEntriesByType("resource")
+          .some(entry => entry.name.includes("terminal-window"))
+      );
+    expect(await terminalChunkLoaded()).toBe(false);
+    const chunkResponse = appPage.waitForResponse(response =>
+      /\/assets\/terminal-window-[^/]+\.js(?:\?|$)/u.test(response.url())
+    );
+    const launcher = appPage
+      .locator('[data-slot="os-dock"]:visible, [data-slot="os-dock-tabbar"]:visible')
+      .getByRole("button", { exact: true, name: "Terminal" });
+    await launcher.focus();
+    await appPage.keyboard.press("Enter");
+    expect((await chunkResponse).ok()).toBe(true);
+    await expect(focusedTerminalWindow(appPage).getByTestId("terminal-window")).toBeVisible();
+  });
+
+  await test.step("the opened terminal accepts keyboard input", async () => {
+    const terminalWindow = appPage.locator(
+      '[data-slot="os-window-surface"][data-app="terminal"][data-stack-active]'
+    );
+    await expect(terminalWindow).toBeVisible();
+    // One activation is the whole flow: the window resolves straight into a
+    // terminal, with no launcher step in between.
+    const terminalId = await visibleTerminalPaneID(terminalWindow);
+
+    const journalToggle = terminalWindow.getByTestId("terminal-journal-toggle");
+    await journalToggle.focus();
+    await expect(journalToggle).toBeFocused();
+
+    const log = await interactiveTerminalLog(terminalWindow);
+    const input = log.getByRole("textbox", { name: "Terminal input", exact: true });
+    await input.focus();
+    await expect(input).toBeFocused();
+    await appPage.keyboard.type("printf 'keyboard-terminal-%s\\n' ready");
+    await appPage.keyboard.press("Enter");
+    await expect
+      .poll(async () => (await terminalScreen(runtime, workspace.id, terminalId)).content)
+      .toContain("keyboard-terminal-ready");
+  });
+});

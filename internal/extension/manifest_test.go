@@ -1,0 +1,2633 @@
+package extensionpkg
+
+import (
+	"encoding/json"
+	"errors"
+	"fmt"
+	"os"
+	"path/filepath"
+	"reflect"
+	"slices"
+	"strings"
+	"testing"
+	"time"
+
+	"github.com/compozy/compozy/internal/extension/agentplugin"
+	extensionprotocol "github.com/compozy/compozy/internal/extensionprotocol"
+	hookspkg "github.com/compozy/compozy/internal/hooks"
+	"github.com/compozy/compozy/internal/marketplace"
+	"github.com/compozy/compozy/internal/resources"
+	toolspkg "github.com/compozy/compozy/internal/tools"
+	"github.com/compozy/compozy/internal/version"
+)
+
+// Invariant: resources.cmd_palette is a closed, safe manifest family whose
+// references and authored strings are validated before an extension starts.
+// Owner: extension manifest loading and validation.
+// Canonical suite: extension manifest tests.
+func TestManifestCmdPaletteValidation(t *testing.T) {
+	t.Parallel()
+
+	t.Run("Should validate and round-trip the complete palette family [UT-055]", func(t *testing.T) {
+		t.Parallel()
+		manifest := cmdPaletteTestManifest("notes")
+		if err := manifest.Validate(); err != nil {
+			t.Fatalf("Manifest.Validate() error = %v", err)
+		}
+		encoded, err := encodeManifestTOML(manifest)
+		if err != nil {
+			t.Fatalf("encodeManifestTOML() error = %v", err)
+		}
+		roundTrip, err := loadManifestTOMLContent("extension.toml", encoded)
+		if err != nil {
+			t.Fatalf("loadManifestTOMLContent() error = %v", err)
+		}
+		palette := roundTrip.Resources.CmdPalette
+		if !reflect.DeepEqual(palette, manifest.Resources.CmdPalette) {
+			t.Fatalf("round-trip palette = %#v, want %#v", palette, manifest.Resources.CmdPalette)
+		}
+	})
+
+	tests := []struct {
+		name   string
+		mutate func(*Manifest)
+		field  string
+		text   string
+	}{
+		{
+			name: "Should reject duplicate command ids [UT-056]",
+			mutate: func(manifest *Manifest) {
+				manifest.Resources.CmdPalette.Commands[1].ID = "capture"
+			},
+			field: "cmd_palette.commands[1].id", text: `duplicate "capture"`,
+		},
+		{
+			name: "Should reject an unknown action tool [UT-058]",
+			mutate: func(manifest *Manifest) {
+				manifest.Resources.CmdPalette.Commands[0].Action.Tool = "purge_archved"
+			},
+			field: "cmd_palette.commands[0].action.tool", text: `unknown tool "purge_archved"`,
+		},
+		{
+			name: "Should reject hostile title length [UT-059]",
+			mutate: func(manifest *Manifest) {
+				manifest.Resources.CmdPalette.Commands[0].Title = strings.Repeat("x", 10_000)
+			},
+			field: "cmd_palette.commands[0].title", text: "at most 256 characters",
+		},
+		{
+			name: "Should reject title control characters [UT-059]",
+			mutate: func(manifest *Manifest) {
+				manifest.Resources.CmdPalette.Commands[0].Title = "Capture\u0000note"
+			},
+			field: "cmd_palette.commands[0].title", text: "control characters",
+		},
+		{
+			name: "Should reject overlong command ids [UT-059]",
+			mutate: func(manifest *Manifest) {
+				manifest.Resources.CmdPalette.Commands[0].ID = strings.Repeat("x", 65)
+			},
+			field: "cmd_palette.commands[0].id", text: "at most 64 characters",
+		},
+		{
+			name: "Should require dropdown options [UT-059]",
+			mutate: func(manifest *Manifest) {
+				manifest.Resources.CmdPalette.Commands[0].Arguments = []CmdPaletteArgument{{
+					Name: "tag", Type: "dropdown",
+				}}
+			},
+			field: "cmd_palette.commands[0].arguments[0].options", text: "at least one value",
+		},
+		{
+			name: "Should reject hostile confirmation body text [UT-059]",
+			mutate: func(manifest *Manifest) {
+				manifest.Resources.CmdPalette.Commands[2].Confirmation.Body = "Purge\u0000archived"
+			},
+			field: "cmd_palette.commands[2].confirmation.body", text: "control characters",
+		},
+		{
+			name: "Should reject an invalid shortcut chord [UT-062]",
+			mutate: func(manifest *Manifest) {
+				manifest.Resources.CmdPalette.Commands[0].DefaultShortcut = "meta+Küche"
+			},
+			field: "cmd_palette.commands[0].default_shortcut", text: `token "Küche" is unsupported`,
+		},
+		{
+			name: "Should reject a non-read-only declarative source [SI-18]",
+			mutate: func(manifest *Manifest) {
+				tool := manifest.Resources.Tools["list_recent"]
+				tool.ReadOnly = false
+				tool.Risk = string(toolspkg.RiskMutating)
+				manifest.Resources.Tools["list_recent"] = tool
+			},
+			field: "cmd_palette.views[0].source.tool", text: "read-only risk class",
+		},
+		{
+			name: "Should reject a non-emoji icon grapheme",
+			mutate: func(manifest *Manifest) {
+				manifest.Resources.CmdPalette.Commands[0].Icon = "文"
+			},
+			field: "cmd_palette.commands[0].icon", text: "lowercase icon token or one emoji grapheme",
+		},
+		{
+			name: "Should reject extra action targets in documented field order",
+			mutate: func(manifest *Manifest) {
+				manifest.Resources.CmdPalette.Commands[0].Action.View = "recent"
+			},
+			field: "cmd_palette.commands[0].action.view", text: "is not allowed for tool actions",
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+			manifest := cmdPaletteTestManifest("notes")
+			test.mutate(manifest)
+			err := manifest.Validate()
+			if err == nil {
+				t.Fatalf("Manifest.Validate() error = nil, want %q and %q", test.field, test.text)
+			}
+			validationErr, ok := errors.AsType[*ManifestValidationError](err)
+			if !ok || validationErr.Field != test.field || !strings.Contains(validationErr.Message, test.text) {
+				t.Fatalf("Manifest.Validate() error = %v, want field %q and message %q", err, test.field, test.text)
+			}
+		})
+	}
+}
+
+func cmdPaletteTestManifest(name string) *Manifest {
+	singleFlight := true
+	retrySafe := false
+	tool := func(handler string, risk toolspkg.RiskClass, readOnly bool) ToolConfig {
+		return ToolConfig{
+			Description: handler, Handler: handler,
+			Backend:     ToolBackendConfig{Kind: string(toolspkg.BackendExtensionHost), Handler: handler},
+			InputSchema: json.RawMessage(`{"type":"object"}`), Risk: string(risk), ReadOnly: readOnly,
+			Visibility: string(toolspkg.VisibilityModel), Destructive: risk == toolspkg.RiskDestructive,
+		}
+	}
+	return &Manifest{
+		Name: name, Version: "0.1.0", MinCompozyVersion: "0.3.0-beta.1",
+		Capabilities: CapabilitiesConfig{Provides: []string{extensionprotocol.CapabilityToolProvider}},
+		Subprocess:   SubprocessConfig{Command: "./notes"},
+		Resources: ResourcesConfig{
+			Tools: map[string]ToolConfig{
+				"capture_note":   tool("capture_note", toolspkg.RiskMutating, false),
+				"list_recent":    tool("list_recent", toolspkg.RiskRead, true),
+				"purge_archived": tool("purge_archived", toolspkg.RiskDestructive, false),
+			},
+			CmdPalette: CmdPaletteConfig{
+				Commands: []CmdPaletteCommand{
+					{
+						ID: "capture", Title: "Capture note", Section: "Notes", Icon: "notebook-pen",
+						Keywords:        []string{"jot", "memo"},
+						Arguments:       []CmdPaletteArgument{{Name: "title", Type: "text", Required: true}},
+						Action:          CmdPaletteAction{Kind: "tool", Tool: "capture_note"},
+						DefaultShortcut: "alt+shift+KeyN",
+						Execution:       &CmdPaletteExecutionPolicy{SingleFlight: &singleFlight, RetrySafe: &retrySafe},
+					},
+					{
+						ID: "recent", Title: "Recent notes", Section: "Notes", Icon: "clock-3",
+						Action: CmdPaletteAction{Kind: "view", View: "recent"},
+					},
+					{
+						ID: "purge", Title: "Purge archived notes", Section: "Notes", Icon: "trash-2",
+						Action: CmdPaletteAction{Kind: "tool", Tool: "purge_archived"}, Destructive: true,
+						Confirmation: &CmdPaletteConfirmation{Title: "Purge archived notes?", Confirm: "Purge"},
+					},
+				},
+				Views: []CmdPaletteView{{
+					ID: "recent", Title: "Recent notes", Kind: "list",
+					Source: &CmdPaletteViewSource{Tool: "list_recent"},
+				}},
+			},
+		},
+	}
+}
+
+// Invariant: a supported portable root synthesizes a deterministic,
+// resource-only manifest while native precedence and compatibility remain unchanged.
+// Owner: extension manifest loading and synthesis.
+// Canonical suite: extension manifest tests.
+func TestLoadManifestSynthesizesAgentPluginPackages(t *testing.T) {
+	t.Parallel()
+
+	t.Run("Should map skills and both MCP transports deterministically", func(t *testing.T) {
+		t.Parallel()
+		root := writeAgentPluginManifestFixture(t)
+		first, err := LoadManifest(root)
+		if err != nil {
+			t.Fatalf("LoadManifest(first) error = %v", err)
+		}
+		second, err := LoadManifest(root)
+		if err != nil {
+			t.Fatalf("LoadManifest(second) error = %v", err)
+		}
+		if !reflect.DeepEqual(first, second) {
+			t.Fatalf("LoadManifest() results differ:\nfirst=%#v\nsecond=%#v", first, second)
+		}
+		if first.Format != FormatAgentPlugin || first.Name != "acme.tools" || first.Version != "1.2.0" {
+			t.Fatalf("LoadManifest() identity = %#v, want agent-plugin acme.tools@1.2.0", first)
+		}
+		if got, want := manifestResourcePaths(first.Resources.Skills), []string{
+			filepath.Join("skills", "release", "SKILL.md"),
+			filepath.Join("skills", "review", "SKILL.md"),
+		}; !reflect.DeepEqual(got, want) {
+			t.Fatalf("Skills = %#v, want %#v", got, want)
+		}
+		if err := validateStaticKitResources(t.Context(), root, first); err != nil {
+			t.Fatalf("validateStaticKitResources() error = %v", err)
+		}
+		stdio := first.Resources.MCPServers["local"]
+		canonicalRoot, err := filepath.EvalSymlinks(root)
+		if err != nil {
+			t.Fatalf("filepath.EvalSymlinks(root) error = %v", err)
+		}
+		if stdio.Transport != "stdio" || stdio.Command != "node" ||
+			stdio.CWD != canonicalRoot || len(stdio.Env) == 0 {
+			t.Fatalf("stdio server = %#v, want mapped command and env", stdio)
+		}
+		remote := first.Resources.MCPServers["remote"]
+		if remote.Transport != "http" || remote.URL != "https://example.com/mcp" ||
+			remote.Headers["X-Tenant"] != "acme" {
+			t.Fatalf("remote server = %#v, want mapped http server", remote)
+		}
+		if len(first.Capabilities.Provides) != 0 || len(first.Permissions.Requires) != 0 ||
+			first.Subprocess.Command != "" {
+			t.Fatalf("portable manifest gained runtime authority: %#v", first)
+		}
+	})
+
+	t.Run("Should waive only portable compatibility metadata", func(t *testing.T) {
+		t.Parallel()
+		portable := &Manifest{Format: FormatAgentPlugin, Name: "portable"}
+		if err := portable.Validate(); err != nil {
+			t.Fatalf("portable Validate() error = %v", err)
+		}
+		native := &Manifest{Format: FormatCompozy, Name: "native", Version: "1.0.0"}
+		if err := native.Validate(); err == nil {
+			t.Fatal("native Validate() error = nil, want min_compozy_version requirement")
+		}
+	})
+
+	t.Run("Should keep a selected invalid native manifest from falling back", func(t *testing.T) {
+		t.Parallel()
+		root := writeAgentPluginManifestFixture(t)
+		writeFile(t, filepath.Join(root, manifestTOMLFileName), "[extension\n")
+		manifest, err := LoadManifest(root)
+		if err == nil || manifest != nil {
+			t.Fatalf("LoadManifest() = %#v, %v; want native parse failure", manifest, err)
+		}
+	})
+
+	t.Run("Should keep a valid native manifest authoritative", func(t *testing.T) {
+		t.Parallel()
+		root := writeAgentPluginManifestFixture(t)
+		writeFile(t, filepath.Join(root, manifestTOMLFileName), `[extension]
+name = "native"
+version = "1.0.0"
+min_compozy_version = "0.0.0"
+`)
+		manifest, err := LoadManifest(root)
+		if err != nil {
+			t.Fatalf("LoadManifest() error = %v", err)
+		}
+		if manifest.Format != FormatCompozy || manifest.Name != "native" {
+			t.Fatalf("LoadManifest() = %#v, want native manifest", manifest)
+		}
+	})
+}
+
+// Invariant: component skips retain scope and stable ordering in the canonical diagnostic shape.
+// Owner: extension ingestion diagnostics adapter.
+// Canonical suite: extension manifest tests.
+func TestAgentPluginDiagnosticsPreserveScopeAndOrder(t *testing.T) {
+	t.Parallel()
+	t.Run("Should retain diagnostic scope and stable ordering", func(t *testing.T) {
+		t.Parallel()
+		values := []agentplugin.Diagnostic{
+			{Scope: "skill:zeta", Message: "missing description"},
+			{Scope: "mcp:alpha", Message: "sse transport is not supported"},
+			{Scope: "mcp:alpha", Message: "invalid mcp server entry"},
+		}
+		first := AgentPluginDiagnostics("acme.tools", values)
+		second := AgentPluginDiagnostics("acme.tools", values)
+		if !reflect.DeepEqual(first, second) {
+			t.Fatalf("AgentPluginDiagnostics() is not deterministic:\nfirst=%#v\nsecond=%#v", first, second)
+		}
+		if len(first) != 3 {
+			t.Fatalf("diagnostics len = %d, want 3", len(first))
+		}
+		for _, item := range first {
+			if item.Code != "extension_agent_plugin_component_skipped" || item.Severity != "warn" ||
+				item.Category != "extension" {
+				t.Fatalf("diagnostic = %#v, want canonical portable skip", item)
+			}
+			if scope, ok := item.Evidence["scope"].(string); !ok || scope == "" {
+				t.Fatalf("diagnostic evidence = %#v, want scope", item.Evidence)
+			}
+		}
+		if first[0].Message != `mcp server "alpha": invalid mcp server entry` ||
+			first[1].Message != `mcp server "alpha": sse transport is not supported` {
+			t.Fatalf("diagnostic order = %#v, want scope then message", first)
+		}
+	})
+}
+
+func writeAgentPluginManifestFixture(t *testing.T) string {
+	t.Helper()
+	root := t.TempDir()
+	if err := os.CopyFS(root, os.DirFS(filepath.Join("testdata", "agent-plugin-conformant"))); err != nil {
+		t.Fatalf("CopyFS(agent-plugin-conformant) error = %v", err)
+	}
+	return root
+}
+
+func TestLoadManifest_ParsesTOMLAndJSONEquivalently(t *testing.T) {
+	withDaemonVersion(t, "0.6.0")
+
+	tomlDir := t.TempDir()
+	writeFile(t, filepath.Join(tomlDir, manifestTOMLFileName), validManifestTOML)
+
+	jsonDir := t.TempDir()
+	writeFile(t, filepath.Join(jsonDir, manifestJSONFileName), validManifestJSON)
+
+	gotTOML, err := LoadManifest(tomlDir)
+	if err != nil {
+		t.Fatalf("LoadManifest(toml): %v", err)
+	}
+
+	gotJSON, err := LoadManifest(jsonDir)
+	if err != nil {
+		t.Fatalf("LoadManifest(json): %v", err)
+	}
+
+	want := expectedManifest()
+	t.Run("ShouldMatchExpectedManifestFromTOML", func(t *testing.T) {
+		if !reflect.DeepEqual(*gotTOML, want) {
+			t.Fatalf("unexpected TOML manifest\n got: %#v\nwant: %#v", *gotTOML, want)
+		}
+	})
+	t.Run("ShouldMatchExpectedManifestFromJSON", func(t *testing.T) {
+		if !reflect.DeepEqual(*gotJSON, want) {
+			t.Fatalf("unexpected JSON manifest\n got: %#v\nwant: %#v", *gotJSON, want)
+		}
+	})
+}
+
+func TestLoadManifestResourcePathCompatibility(t *testing.T) {
+	t.Parallel()
+	for _, test := range []struct {
+		name     string
+		fileName string
+		content  string
+	}{
+		{
+			name:     "Should normalize TOML string paths while preserving explicit placements",
+			fileName: manifestTOMLFileName,
+			content: `[extension]
+name = "passive-kit"
+version = "0.1.0"
+min_compozy_version = "0.3.0-beta.13"
+[resources]
+skills = [" skills/shared ", {path = "skills/studio", profile = "studio"}]
+agents = ["agents"]
+loops = ["loops"]
+automation = ["automation"]
+layouts = ["layouts"]
+`,
+		},
+		{
+			name:     "Should normalize JSON string paths while preserving explicit placements",
+			fileName: manifestJSONFileName,
+			content:  `{"extension":{"name":"passive-kit","version":"0.1.0","min_compozy_version":"0.3.0-beta.13"},"resources":{"skills":[" skills/shared ",{"path":"skills/studio","profile":"studio"}],"agents":["agents"],"loops":["loops"],"automation":["automation"],"layouts":["layouts"]}}`,
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+			dir := t.TempDir()
+			writeFile(t, filepath.Join(dir, test.fileName), test.content)
+			manifest, err := LoadManifest(dir)
+			if err != nil {
+				t.Fatalf("LoadManifest() error = %v", err)
+			}
+			want := ResourcesConfig{
+				Skills:     []ManifestResourcePath{{Path: "skills/shared"}, {Path: "skills/studio", Profile: "studio"}},
+				Agents:     []ManifestResourcePath{{Path: "agents"}},
+				Loops:      []ManifestResourcePath{{Path: "loops"}},
+				Automation: []ManifestResourcePath{{Path: "automation"}},
+				Layouts:    []ManifestResourcePath{{Path: "layouts"}},
+			}
+			if !reflect.DeepEqual(manifest.Resources, want) {
+				t.Fatalf("Resources = %#v, want %#v", manifest.Resources, want)
+			}
+			encoded, err := encodeManifestTOML(manifest)
+			if err != nil {
+				t.Fatalf("encodeManifestTOML() error = %v", err)
+			}
+			roundTrip, err := loadManifestTOMLContent(manifestTOMLFileName, encoded)
+			if err != nil {
+				t.Fatalf("loadManifestTOMLContent() error = %v", err)
+			}
+			if !reflect.DeepEqual(roundTrip.Resources, want) {
+				t.Fatalf("round-trip resources = %#v, want %#v", roundTrip.Resources, want)
+			}
+		})
+	}
+}
+
+func TestLoadManifestV2RejectsUnknownAndLegacyContracts(t *testing.T) {
+	withDaemonVersion(t, "0.6.0")
+
+	tests := []struct {
+		name          string
+		fileName      string
+		content       string
+		wantField     string
+		wantFragments []string
+	}{
+		{
+			name:     "Should reject unknown fields in a TOML resource path",
+			fileName: manifestTOMLFileName,
+			content: `[extension]
+name = "unknown-placement"
+version = "0.1.0"
+min_compozy_version = "0.3.0-beta.13"
+[[resources.agents]]
+path = "agents"
+profiel = "studio"
+`,
+			wantField:     "resources.agents.profiel",
+			wantFragments: []string{"unknown manifest field"},
+		},
+		{
+			name:          "Should reject unknown fields in a JSON resource path",
+			fileName:      manifestJSONFileName,
+			content:       `{"extension":{"name":"unknown-placement","version":"0.1.0","min_compozy_version":"0.3.0-beta.13"},"resources":{"agents":[{"path":"agents","profiel":"studio"}]}}`,
+			wantField:     "resources.profiel",
+			wantFragments: []string{"unknown manifest field"},
+		},
+		{
+			name:     "Should reject retired Network participation in TOML with Gateway guidance",
+			fileName: manifestTOMLFileName,
+			content: `[extension]
+name = "retired-participation"
+version = "0.1.0"
+min_compozy_version = "0.6.0"
+[network_participation]
+permissions = ["network.gateway.private"]
+`,
+			wantField:     "network_participation",
+			wantFragments: []string{"[gateway]", "confirm"},
+		},
+		{
+			name:          "Should reject retired Network participation in JSON with Gateway guidance",
+			fileName:      manifestJSONFileName,
+			content:       `{"extension":{"name":"retired-participation","version":"0.1.0","min_compozy_version":"0.6.0"},"network_participation":{"permissions":["network.gateway.private"]}}`,
+			wantField:     "network_participation",
+			wantFragments: []string{"[gateway]", "confirm"},
+		},
+		{
+			name:     "Should reject an unknown provide and list the closed set",
+			fileName: manifestTOMLFileName,
+			content: `[extension]
+name = "unknown-provide"
+version = "0.1.0"
+min_compozy_version = "0.6.0"
+
+[capabilities]
+provides = ["prompt.provider"]
+`,
+			wantField: "capabilities.provides[0]",
+			wantFragments: []string{
+				"prompt.provider",
+				"loop.watch_source",
+				"view.provider",
+				"model.source",
+				"tool.provider",
+			},
+		},
+		{
+			name:     "Should reject an unknown permission",
+			fileName: manifestTOMLFileName,
+			content: `[extension]
+name = "unknown-permission"
+version = "0.1.0"
+min_compozy_version = "0.6.0"
+
+[permissions]
+requires = ["sessions/does-not-exist"]
+`,
+			wantField:     "permissions.requires[0]",
+			wantFragments: []string{"sessions/does-not-exist", "unknown Host API permission"},
+		},
+		{
+			name:     "Should reject a legacy actions section",
+			fileName: manifestTOMLFileName,
+			content: `[extension]
+name = "legacy-actions"
+version = "0.1.0"
+min_compozy_version = "0.6.0"
+
+[actions]
+requires = ["sessions/list"]
+`,
+			wantField:     "actions",
+			wantFragments: []string{"[actions]", "[permissions]"},
+		},
+		{
+			name:     "Should reject a legacy security section in JSON",
+			fileName: manifestJSONFileName,
+			content: `{
+  "extension": {
+    "name": "legacy-security",
+    "version": "0.1.0",
+    "min_compozy_version": "0.6.0"
+  },
+  "security": {"capabilities": ["session.read"]}
+}`,
+			wantField:     "security",
+			wantFragments: []string{"[security]", "[permissions]"},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			dir := t.TempDir()
+			writeFile(t, filepath.Join(dir, tt.fileName), tt.content)
+
+			_, err := LoadManifest(dir)
+			if err == nil {
+				t.Fatal("LoadManifest() error = nil, want manifest validation error")
+			}
+
+			validationErr, validationErrMatched := errors.AsType[*ManifestValidationError](err)
+			if !validationErrMatched {
+				t.Fatalf("LoadManifest() error = %T, want *ManifestValidationError", err)
+			}
+			if validationErr.Field != tt.wantField {
+				t.Fatalf("validation field = %q, want %q", validationErr.Field, tt.wantField)
+			}
+			for _, fragment := range tt.wantFragments {
+				if !strings.Contains(err.Error(), fragment) {
+					t.Fatalf("LoadManifest() error = %v, want fragment %q", err, fragment)
+				}
+			}
+		})
+	}
+}
+
+func TestLoadManifestEnforcesMinimumCompozyVersionBoundary(t *testing.T) {
+	tests := []struct {
+		name    string
+		minimum string
+		wantErr bool
+	}{
+		{name: "Should accept the stamped daemon version", minimum: "0.6.0"},
+		{name: "Should reject one patch above the stamped daemon version", minimum: "0.6.1", wantErr: true},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			withDaemonVersion(t, "0.6.0")
+			dir := t.TempDir()
+			content := strings.Replace(
+				validManifestTOML,
+				"min_compozy_version = \"0.5.0\"",
+				"min_compozy_version = \""+tt.minimum+"\"",
+				1,
+			)
+			writeFile(t, filepath.Join(dir, manifestTOMLFileName), content)
+
+			_, err := LoadManifest(dir)
+			if !tt.wantErr {
+				if err != nil {
+					t.Fatalf("LoadManifest() error = %v, want nil", err)
+				}
+				return
+			}
+			if err == nil {
+				t.Fatal("LoadManifest() error = nil, want compatibility error")
+			}
+			if _, ok := errors.AsType[*ManifestCompatibilityError](err); !ok {
+				t.Fatalf("LoadManifest() error = %T, want *ManifestCompatibilityError", err)
+			}
+		})
+	}
+}
+
+func TestLoadManifest_FiltersBlankStringEntries(t *testing.T) {
+	withDaemonVersion(t, "0.6.0")
+
+	dir := t.TempDir()
+	writeFile(t, filepath.Join(dir, manifestTOMLFileName), `[extension]
+name = "filtered"
+version = "0.2.1"
+description = "Normalization coverage"
+min_compozy_version = "0.5.0"
+
+[[resources.skills]]
+path = "skills/"
+
+[[resources.skills]]
+path = "  "
+
+[[resources.skills]]
+path = ""
+
+[[resources.agents]]
+path = "agents/"
+
+[[resources.agents]]
+path = "\t"
+
+[capabilities]
+provides = ["view.provider", "   "]
+
+[permissions]
+requires = ["sessions/list", ""]
+
+[subprocess]
+command = "compozy-ext-filtered"
+args = ["--config", " ", "\t", "config.toml"]
+
+`)
+
+	manifest, err := LoadManifest(dir)
+	if err != nil {
+		t.Fatalf("LoadManifest() error = %v", err)
+	}
+	if !reflect.DeepEqual(manifestResourcePaths(manifest.Resources.Skills), []string{"skills/"}) {
+		t.Fatalf("Resources.Skills = %#v, want %#v", manifest.Resources.Skills, []string{"skills/"})
+	}
+	if !reflect.DeepEqual(manifestResourcePaths(manifest.Resources.Agents), []string{"agents/"}) {
+		t.Fatalf("Resources.Agents = %#v, want %#v", manifest.Resources.Agents, []string{"agents/"})
+	}
+	if !reflect.DeepEqual(manifest.Capabilities.Provides, []string{"view.provider"}) {
+		t.Fatalf("Capabilities.Provides = %#v, want %#v", manifest.Capabilities.Provides, []string{"view.provider"})
+	}
+	if !reflect.DeepEqual(manifest.Permissions.Requires, []string{"sessions/list"}) {
+		t.Fatalf("Actions.Requires = %#v, want %#v", manifest.Permissions.Requires, []string{"sessions/list"})
+	}
+	if !reflect.DeepEqual(manifest.Subprocess.Args, []string{"--config", "config.toml"}) {
+		t.Fatalf("Subprocess.Args = %#v, want %#v", manifest.Subprocess.Args, []string{"--config", "config.toml"})
+	}
+}
+
+// Invariant: declared profiles and resource placements cross the manifest
+// boundary as normalized typed values, never as unvalidated strings.
+// Owner: extension manifest normalization and validation.
+// Canonical suite: extension manifest tests.
+// Covers UT-054.
+func TestLoadManifestNormalizesDeclaredProfilesAndPlacements(t *testing.T) {
+	t.Run("Should normalize declared profile placements", func(t *testing.T) {
+		t.Parallel()
+		testLoadManifestNormalizesDeclaredProfilesAndPlacements(t)
+	})
+}
+
+func testLoadManifestNormalizesDeclaredProfilesAndPlacements(t *testing.T) {
+	t.Helper()
+	withDaemonVersion(t, "0.6.0")
+	dir := t.TempDir()
+	writeFile(t, filepath.Join(dir, manifestTOMLFileName), `[extension]
+name = "growth-kit"
+version = "1.0.0"
+min_compozy_version = "0.5.0"
+
+[[profiles]]
+name = "growth"
+color = "#5FBF85"
+icon = "chart-line"
+
+[profiles.defaults]
+agent = "growth-analyst"
+provider = "openai"
+
+[[profiles.credentials]]
+provider = "openai"
+slot = "api_key"
+
+[[resources.skills]]
+path = "skills/tweet-writer"
+profile = "growth"
+
+[[resources.skills]]
+path = "skills/changelog-writer"
+
+[[resources.cmd_palette.commands]]
+id = "report"
+title = "Growth report"
+icon = "chart-line"
+profile = "growth"
+action = { kind = "navigate", app = "sessions" }
+`)
+
+	manifest, err := LoadManifest(dir)
+	if err != nil {
+		t.Fatalf("LoadManifest() error = %v", err)
+	}
+	if len(manifest.Profiles) != 1 {
+		t.Fatalf("Profiles = %#v, want one declaration", manifest.Profiles)
+	}
+	declaration := manifest.Profiles[0]
+	if declaration.Name != "growth" || declaration.Color != "#5fbf85" ||
+		declaration.Defaults.Agent != "growth-analyst" || len(declaration.Credentials) != 1 {
+		t.Fatalf("Profiles[0] = %#v, want normalized growth declaration", declaration)
+	}
+	if got := manifest.Resources.Skills; len(got) != 2 || got[0].Path != "skills/tweet-writer" ||
+		got[0].Profile != "growth" || got[1].Profile != "" {
+		t.Fatalf("Resources.Skills = %#v, want placed and unplaced paths", got)
+	}
+	if got := manifest.Resources.CmdPalette.Commands; len(got) != 1 || got[0].Profile != "growth" {
+		t.Fatalf("CmdPalette.Commands = %#v, want growth placement", got)
+	}
+}
+
+// Invariant: credential identity is provider/slot after whitespace
+// normalization, so equivalent declarations cannot be stored twice.
+// Owner: extension manifest normalization and validation.
+// Canonical suite: extension manifest tests.
+func TestLoadManifestRejectsCredentialDuplicatesAfterNormalization(t *testing.T) {
+	t.Parallel()
+	t.Run("Should treat whitespace variants as one credential requirement", func(t *testing.T) {
+		t.Parallel()
+		withDaemonVersion(t, "0.6.0")
+		dir := t.TempDir()
+		writeFile(t, filepath.Join(dir, manifestTOMLFileName), `[extension]
+name = "credential-duplicates"
+version = "1.0.0"
+min_compozy_version = "0.5.0"
+
+[capabilities]
+provides = ["view.provider"]
+
+[permissions]
+requires = ["sessions/list"]
+
+[[profiles]]
+name = "marketing"
+
+[[profiles.credentials]]
+provider = " openai "
+slot = " api_key "
+
+[[profiles.credentials]]
+provider = "openai"
+slot = "api_key"
+`)
+		_, err := LoadManifest(dir)
+		if err == nil || !strings.Contains(err.Error(), "duplicate credential requirement") {
+			t.Fatalf("LoadManifest() error = %v, want normalized duplicate rejection", err)
+		}
+		if _, ok := errors.AsType[*ManifestValidationError](err); !ok {
+			t.Fatalf("LoadManifest() error type = %T, want *ManifestValidationError", err)
+		}
+	})
+}
+
+func TestManifestPlacementMatrixReportsDormantProfileResources(t *testing.T) {
+	t.Parallel()
+	t.Run("Should keep all declarations and mark only absent profile placements dormant [UT-056]", func(t *testing.T) {
+		t.Parallel()
+		manifest := &Manifest{Resources: ResourcesConfig{Skills: []ManifestResourcePath{
+			{Path: "skills/shared"},
+			{Path: "skills/growth", Profile: "growth"},
+			{Path: "skills/finance", Profile: "finance"},
+		}}}
+
+		matrix := manifest.PlacementMatrix()
+		if len(matrix) != 3 || matrix[0].Profile != "" || matrix[1].Profile != "growth" {
+			t.Fatalf("PlacementMatrix() = %#v, want shared then name-bound rows", matrix)
+		}
+		dormant := manifest.DormantPlacements([]string{"default", "growth"})
+		if len(dormant) != 1 || dormant[0].Resource != "skills/finance" || dormant[0].Profile != "finance" {
+			t.Fatalf("DormantPlacements() = %#v, want absent finance placement", dormant)
+		}
+	})
+}
+
+// Invariant: invalid or reserved declarations and grammar-invalid placements
+// fail before an extension can be installed or built.
+// Owner: extension manifest validation.
+// Canonical suite: extension manifest tests.
+func TestLoadManifestRejectsInvalidProfileDeclarationsAndPlacements(t *testing.T) {
+	withDaemonVersion(t, "0.6.0")
+	for _, testCase := range []struct {
+		name     string
+		fragment string
+		field    string
+	}{
+		{name: "Should reject invalid declared names", fragment: "[[profiles]]\nname = \"Growth Team\"", field: "profiles[0].name"},
+		{name: "Should reject reserved declared names", fragment: "[[profiles]]\nname = \"global\"", field: "profiles[0].name"},
+		{name: "Should reject invalid placement names", fragment: "[[resources.skills]]\npath = \"skills\"\nprofile = \"Growth Team\"", field: "resources.skills[0].profile"},
+	} {
+		t.Run(testCase.name, func(t *testing.T) {
+			dir := t.TempDir()
+			writeFile(t, filepath.Join(dir, manifestTOMLFileName), `[extension]
+name = "profile-validation"
+version = "1.0.0"
+min_compozy_version = "0.5.0"
+
+`+testCase.fragment+"\n")
+			_, err := LoadManifest(dir)
+			validationErr, ok := errors.AsType[*ManifestValidationError](err)
+			if !ok {
+				t.Fatalf("LoadManifest() error = %T %v, want ManifestValidationError", err, err)
+			}
+			if validationErr.Field != testCase.field {
+				t.Fatalf("validation field = %q, want %q", validationErr.Field, testCase.field)
+			}
+		})
+	}
+}
+
+func TestCloneHookDeclDeepCopiesMatcherPointers(t *testing.T) {
+	t.Parallel()
+
+	t.Run("Should clone matcher pointers independently", func(t *testing.T) {
+		t.Parallel()
+
+		toolReadOnly := true
+		decl := hookspkg.HookDecl{
+			Matcher: hookspkg.HookMatcher{
+				ToolReadOnly: &toolReadOnly,
+
+				CompactionMatcher: &hookspkg.CompactionMatcher{
+					Trigger: "agent",
+				},
+				Autonomy: &hookspkg.AutonomyMatcher{
+					TaskID: "task-1",
+				},
+			},
+		}
+
+		cloned := cloneHookDecl(decl)
+		cloned.Matcher.Trigger = "requested"
+		cloned.Matcher.Autonomy.TaskID = "task-2"
+		*cloned.Matcher.ToolReadOnly = false
+
+		if got, want := decl.Matcher.Trigger, "agent"; got != want {
+			t.Fatalf("source CompactionMatcher.Trigger = %q, want %q", got, want)
+		}
+		if got, want := decl.Matcher.Autonomy.TaskID, "task-1"; got != want {
+			t.Fatalf("source Autonomy.TaskID = %q, want %q", got, want)
+		}
+		if got, want := *decl.Matcher.ToolReadOnly, true; got != want {
+			t.Fatalf("source ToolReadOnly = %v, want %v", got, want)
+		}
+	})
+}
+
+func TestLoadManifestRequiresEnvValidationAndMissingDetection(t *testing.T) {
+	withDaemonVersion(t, "0.6.0")
+
+	dir := t.TempDir()
+	writeFile(t, filepath.Join(dir, manifestTOMLFileName), `[extension]
+name = "env-ext"
+version = "0.2.1"
+description = "Environment requirement coverage"
+min_compozy_version = "0.5.0"
+requires_env = ["PRESENT_TOKEN", "MISSING_TOKEN"]
+`)
+	t.Setenv("PRESENT_TOKEN", "configured")
+	t.Setenv("MISSING_TOKEN", "")
+
+	manifest, err := LoadManifest(dir)
+	if err != nil {
+		t.Fatalf("LoadManifest() error = %v", err)
+	}
+	if !reflect.DeepEqual(manifest.RequiresEnv, []string{"PRESENT_TOKEN", "MISSING_TOKEN"}) {
+		t.Fatalf("RequiresEnv = %#v, want present+missing", manifest.RequiresEnv)
+	}
+	if got, want := manifest.MissingEnv(os.Getenv), []string{"MISSING_TOKEN"}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("MissingEnv() = %#v, want %#v", got, want)
+	}
+}
+
+func TestLoadManifestRejectsInvalidRequiresEnv(t *testing.T) {
+	withDaemonVersion(t, "0.6.0")
+
+	tests := []struct {
+		name    string
+		values  string
+		wantErr string
+	}{
+		{
+			name:    "invalid env name",
+			values:  `["TOKEN", "BAD-NAME"]`,
+			wantErr: "requires_env[1]",
+		},
+		{
+			name:    "duplicate env name",
+			values:  `["TOKEN", "TOKEN"]`,
+			wantErr: "duplicate",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			dir := t.TempDir()
+			writeFile(t, filepath.Join(dir, manifestTOMLFileName), `[extension]
+name = "invalid-env-ext"
+version = "0.2.1"
+min_compozy_version = "0.5.0"
+requires_env = `+tt.values+`
+`)
+
+			_, err := LoadManifest(dir)
+			if err == nil {
+				t.Fatal("LoadManifest() error = nil, want invalid requires_env")
+			}
+			if !errors.Is(err, ErrManifestInvalid) || !strings.Contains(err.Error(), tt.wantErr) {
+				t.Fatalf("LoadManifest() error = %v, want ErrManifestInvalid with %q", err, tt.wantErr)
+			}
+		})
+	}
+}
+
+func TestNormalizeMCPServersDropsBlankKeysAndUsesDeterministicCollisions(t *testing.T) {
+	t.Parallel()
+
+	got := normalizeMCPServers(map[string]MCPServerConfig{
+		"  ": {
+			Command: "ignored",
+		},
+		" foo": {
+			Command: " first ",
+			Env: map[string]string{
+				" BAR ": " first ",
+			},
+		},
+		"foo": {
+			Command: " second ",
+			Env: map[string]string{
+				" ":     "ignored",
+				" BAR ": "second",
+				"BAR":   "final",
+			},
+		},
+	})
+
+	want := map[string]MCPServerConfig{
+		"foo": {
+			Command: "second",
+			Env: map[string]string{
+				"BAR": "final",
+			},
+		},
+	}
+
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("normalizeMCPServers() = %#v, want %#v", got, want)
+	}
+}
+
+func TestNormalizeToolsDropsBlankKeysAndUsesDeterministicCollisions(t *testing.T) {
+	t.Parallel()
+
+	got := normalizeTools(map[string]ToolConfig{
+		" ": {
+			Description: "ignored",
+		},
+		" lookup ": {
+			Description: " first ",
+			Backend: ToolBackendConfig{
+				Kind:    " extension_host ",
+				Handler: " lookup ",
+			},
+			InputSchema: json.RawMessage(`{"type":"object","title":"First"}`),
+		},
+		"lookup": {
+			Description: " second ",
+			Backend: ToolBackendConfig{
+				Kind:    " extension_host ",
+				Handler: " lookup ",
+			},
+			InputSchema: json.RawMessage(`{"type":"object","title":"Second"}`),
+			ReadOnly:    true,
+			Toolsets:    []string{" ext__lookup__read ", " "},
+		},
+	})
+
+	want := map[string]ToolConfig{
+		"lookup": {
+			Description: "second",
+			Backend: ToolBackendConfig{
+				Kind:    "extension_host",
+				Handler: "lookup",
+			},
+			InputSchema: json.RawMessage(`{"type":"object","title":"Second"}`),
+			ReadOnly:    true,
+			Toolsets:    []string{"ext__lookup__read"},
+		},
+	}
+
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("normalizeTools() = %#v, want %#v", got, want)
+	}
+}
+
+func TestLoadManifest_ParsesResourcePublishRequest(t *testing.T) {
+	withDaemonVersion(t, "0.6.0")
+
+	dir := t.TempDir()
+	writeFile(t, filepath.Join(dir, manifestTOMLFileName), `[extension]
+name = "resource-grants"
+version = "0.2.1"
+min_compozy_version = "0.5.0"
+
+[resources.publish]
+families = ["tools", "mcp_servers"]
+max_scope = "workspace"
+
+[subprocess]
+command = "compozy-ext-resource-grants"
+`)
+
+	manifest, err := LoadManifest(dir)
+	if err != nil {
+		t.Fatalf("LoadManifest() error = %v, want nil", err)
+	}
+	if !reflect.DeepEqual(manifest.Resources.Publish.Families, []string{"tools", "mcp_servers"}) {
+		t.Fatalf("Resources.Publish.Families = %#v, want tools+mcp_servers", manifest.Resources.Publish.Families)
+	}
+	if got, want := manifest.Resources.Publish.MaxScope, resources.ResourceScopeKindWorkspace; got != want {
+		t.Fatalf("Resources.Publish.MaxScope = %q, want %q", got, want)
+	}
+}
+
+func TestLoadManifestRejectsInvalidToolMetadata(t *testing.T) {
+	testCases := []struct {
+		name     string
+		toolJSON string
+		wantText string
+	}{
+		{
+			name: "Should Reject Reserved Compozy Namespace",
+			toolJSON: `"id": "compozy__skill_view",
+        "description": "Search",
+        "backend": {"kind": "extension_host", "handler": "lookup"},
+        "read_only": true`,
+			wantText: "extension tools cannot claim compozy__ namespace",
+		},
+		{
+			name: "Should Reject Invalid Tool ID",
+			toolJSON: `"id": "Bad",
+        "description": "Search",
+        "backend": {"kind": "extension_host", "handler": "lookup"},
+        "read_only": true`,
+			wantText: "id_invalid_format",
+		},
+		{
+			name: "Should Reject Missing Handler",
+			toolJSON: `"description": "Search",
+        "backend": {"kind": "extension_host"},
+        "read_only": true`,
+			wantText: "handler_missing",
+		},
+		{
+			name: "Should Reject Invalid Handler Binding",
+			toolJSON: `"description": "Search",
+        "backend": {"kind": "extension_host", "handler": "bad handler"},
+        "read_only": true`,
+			wantText: "handler_missing",
+		},
+		{
+			name: "Should Reject Invalid Risk Class",
+			toolJSON: `"description": "Search",
+        "backend": {"kind": "extension_host", "handler": "lookup"},
+        "risk": "danger",
+        "read_only": true`,
+			wantText: "unsupported risk class",
+		},
+		{
+			name: "Should Reject Non Object Input Schema",
+			toolJSON: `"description": "Search",
+        "backend": {"kind": "extension_host", "handler": "lookup"},
+        "input_schema": false,
+        "read_only": true`,
+			wantText: "schema_invalid",
+		},
+		{
+			name: "Should Reject Invalid Toolset ID",
+			toolJSON: `"description": "Search",
+        "backend": {"kind": "extension_host", "handler": "lookup"},
+        "toolsets": ["bad.toolset"],
+        "read_only": true`,
+			wantText: "toolsets",
+		},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			withDaemonVersion(t, "0.6.0")
+
+			dir := t.TempDir()
+			writeFile(t, filepath.Join(dir, manifestJSONFileName), fmt.Sprintf(`{
+  "extension": {
+    "name": "tool-metadata",
+    "version": "0.2.1",
+    "min_compozy_version": "0.5.0"
+  },
+  "resources": {
+    "tools": {
+      "lookup": {
+        %s
+      }
+    }
+  }
+}`, tc.toolJSON))
+
+			_, err := LoadManifest(dir)
+			if err == nil {
+				t.Fatal("LoadManifest() error = nil, want invalid tool metadata")
+			}
+			if !errors.Is(err, ErrManifestInvalid) || !strings.Contains(err.Error(), tc.wantText) {
+				t.Fatalf("LoadManifest() error = %v, want ErrManifestInvalid containing %q", err, tc.wantText)
+			}
+		})
+	}
+}
+
+func TestNormalizeStringMapDropsBlankKeysAndUsesDeterministicCollisions(t *testing.T) {
+	t.Parallel()
+
+	got := normalizeStringMap(map[string]string{
+		"   ":   "ignored",
+		" KEY":  "first",
+		"KEY":   "second",
+		"\tKEY": "third",
+	})
+
+	want := map[string]string{
+		"KEY": "second",
+	}
+
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("normalizeStringMap() = %#v, want %#v", got, want)
+	}
+}
+
+func TestCloneBoolPointer(t *testing.T) {
+	t.Parallel()
+
+	if cloneBoolPointer(nil) != nil {
+		t.Fatal("cloneBoolPointer(nil) = non-nil, want nil")
+	}
+
+	value := true
+	cloned := cloneBoolPointer(&value)
+	if cloned == nil || *cloned != value {
+		t.Fatalf("cloneBoolPointer(&value) = %#v, want %v", cloned, value)
+	}
+	if cloned == &value {
+		t.Fatal("cloneBoolPointer(&value) returned original pointer")
+	}
+}
+
+func TestLoadManifest_ValidationErrors(t *testing.T) {
+	testCases := []struct {
+		name          string
+		daemonVersion string
+		fileName      string
+		content       string
+		wantErr       error
+		wantField     string
+	}{
+		{
+			name:          "missing name",
+			daemonVersion: "0.6.0",
+			fileName:      manifestTOMLFileName,
+			content: `[extension]
+version = "0.2.1"
+min_compozy_version = "0.5.0"
+`,
+			wantErr:   ErrManifestInvalid,
+			wantField: "name",
+		},
+		{
+			name:          "missing version",
+			daemonVersion: "0.6.0",
+			fileName:      manifestTOMLFileName,
+			content: `[extension]
+name = "sample-view"
+min_compozy_version = "0.5.0"
+`,
+			wantErr:   ErrManifestInvalid,
+			wantField: "version",
+		},
+		{
+			name:          "unknown minimum daemon version TOML key",
+			daemonVersion: "0.6.0",
+			fileName:      manifestTOMLFileName,
+			content: `[extension]
+name = "sample-view"
+version = "0.2.1"
+min_other_version = "0.5.0"
+`,
+			wantErr:   ErrManifestInvalid,
+			wantField: "min_compozy_version",
+		},
+		{
+			name:          "unknown minimum daemon version JSON key",
+			daemonVersion: "0.6.0",
+			fileName:      manifestJSONFileName,
+			content: `{
+  "extension": {
+    "name": "sample-view",
+    "version": "0.2.1",
+    "min_other_version": "0.5.0"
+  }
+}
+`,
+			wantErr:   ErrManifestInvalid,
+			wantField: "min_compozy_version",
+		},
+		{
+			name:          "invalid version semver",
+			daemonVersion: "0.6.0",
+			fileName:      manifestJSONFileName,
+			content: `{
+  "extension": {
+    "name": "sample-view",
+    "version": "latest",
+    "min_compozy_version": "0.5.0"
+  }
+}
+`,
+			wantErr:   ErrManifestInvalid,
+			wantField: "version",
+		},
+		{
+			name:          "invalid capability name",
+			daemonVersion: "0.6.0",
+			fileName:      manifestJSONFileName,
+			content: `{
+  "extension": {
+    "name": "sample-view",
+    "version": "0.2.1",
+    "min_compozy_version": "0.5.0"
+  },
+  "capabilities": {
+    "provides": ["bad capability"]
+  }
+}
+`,
+			wantErr:   ErrManifestInvalid,
+			wantField: "capabilities.provides[0]",
+		},
+		{
+			name:          "Should reject an unknown JSON resource field",
+			daemonVersion: "0.6.0",
+			fileName:      manifestJSONFileName,
+			content: `{
+  "extension": {
+    "name": "sample-view",
+    "version": "0.2.1",
+    "min_compozy_version": "0.5.0"
+  },
+  "resources": {
+    "bundles": ["bundles"]
+  }
+}
+`,
+			wantErr:   ErrManifestInvalid,
+			wantField: "resources.bundles",
+		},
+		{
+			name:          "incompatible minimum compozy version",
+			daemonVersion: "0.4.0",
+			fileName:      manifestTOMLFileName,
+			content:       validManifestTOML,
+			wantErr:       ErrManifestIncompatible,
+		},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			withDaemonVersion(t, tc.daemonVersion)
+
+			dir := t.TempDir()
+			writeFile(t, filepath.Join(dir, tc.fileName), tc.content)
+
+			_, err := LoadManifest(dir)
+			if err == nil {
+				t.Fatal("LoadManifest() error = nil, want non-nil")
+			}
+			if !errors.Is(err, tc.wantErr) {
+				t.Fatalf("LoadManifest() error = %v, want %v", err, tc.wantErr)
+			}
+
+			if tc.wantField == "" {
+				return
+			}
+
+			validationErr, validationErrMatched := errors.AsType[*ManifestValidationError](err)
+			if !validationErrMatched {
+				t.Fatalf("LoadManifest() error = %T, want *ManifestValidationError", err)
+			}
+			if validationErr.Field != tc.wantField {
+				t.Fatalf("validation field = %q, want %q", validationErr.Field, tc.wantField)
+			}
+		})
+	}
+}
+
+func TestManifestValidateRejectsUnknownResourcePublishFamily(t *testing.T) {
+	t.Parallel()
+
+	t.Run("Should reject an unknown resource publication family", func(t *testing.T) {
+		t.Parallel()
+
+		manifest := expectedManifest()
+		manifest.Resources.Publish = ResourceGrantRequest{
+			Families: []string{"unknown_family"},
+			MaxScope: resources.ResourceScopeKindUser,
+		}
+
+		err := manifest.Validate()
+		if err == nil {
+			t.Fatal("Validate() error = nil, want non-nil")
+		}
+
+		validationErr, validationErrMatched := errors.AsType[*ManifestValidationError](err)
+		if !validationErrMatched {
+			t.Fatalf("Validate() error type = %T, want *ManifestValidationError", err)
+		}
+		if got, want := validationErr.Field, "resources.publish"; got != want {
+			t.Fatalf("Validate() field = %q, want %q", got, want)
+		}
+	})
+}
+
+func TestManifestValidateRejectsInvalidResourcePublishScope(t *testing.T) {
+	t.Parallel()
+
+	manifest := expectedManifest()
+	manifest.Resources.Publish = ResourceGrantRequest{
+		Families: []string{"tools"},
+		MaxScope: resources.ResourceScopeKind("session"),
+	}
+
+	err := manifest.Validate()
+	if err == nil {
+		t.Fatal("Validate() error = nil, want non-nil")
+	}
+
+	validationErr, validationErrMatched := errors.AsType[*ManifestValidationError](err)
+	if !validationErrMatched {
+		t.Fatalf("Validate() error type = %T, want *ManifestValidationError", err)
+	}
+	if got, want := validationErr.Field, "resources.publish"; got != want {
+		t.Fatalf("Validate() field = %q, want %q", got, want)
+	}
+}
+
+func TestLoadManifest_PrefersTOMLWhenBothFilesExist(t *testing.T) {
+	withDaemonVersion(t, "0.6.0")
+
+	dir := t.TempDir()
+	writeFile(t, filepath.Join(dir, manifestTOMLFileName), validManifestTOML)
+	writeFile(t, filepath.Join(dir, manifestJSONFileName), `{
+  "extension": {
+    "name": "json-fallback",
+    "version": "0.2.1",
+    "min_compozy_version": "0.5.0"
+  }
+}`)
+
+	manifest, err := LoadManifest(dir)
+	if err != nil {
+		t.Fatalf("LoadManifest() error = %v", err)
+	}
+	if manifest.Name != expectedManifest().Name {
+		t.Fatalf("manifest.Name = %q, want %q", manifest.Name, expectedManifest().Name)
+	}
+}
+
+func TestLoadManifest_ReturnsTypedNotFoundError(t *testing.T) {
+	dir := t.TempDir()
+
+	_, err := LoadManifest(dir)
+	if err == nil {
+		t.Fatal("LoadManifest() error = nil, want ErrManifestNotFound")
+	}
+	if !errors.Is(err, ErrManifestNotFound) {
+		t.Fatalf("LoadManifest() error = %v, want ErrManifestNotFound", err)
+	}
+
+	notFoundErr, notFoundErrMatched := errors.AsType[*ManifestNotFoundError](err)
+	if !notFoundErrMatched {
+		t.Fatalf("LoadManifest() error = %T, want *ManifestNotFoundError", err)
+	}
+	if notFoundErr.Dir != dir {
+		t.Fatalf("ManifestNotFoundError.Dir = %q, want %q", notFoundErr.Dir, dir)
+	}
+}
+
+func TestLoadManifest_AcceptsUnknownTopLevelSections(t *testing.T) {
+	withDaemonVersion(t, "0.6.0")
+
+	dir := t.TempDir()
+	writeFile(t, filepath.Join(dir, manifestJSONFileName), `{
+  "extension": {
+    "name": "future-friendly",
+    "version": "0.2.1",
+    "min_compozy_version": "0.5.0"
+  },
+  "future": {
+    "mode": "enabled"
+  }
+}`)
+
+	manifest, err := LoadManifest(dir)
+	if err != nil {
+		t.Fatalf("LoadManifest() error = %v", err)
+	}
+	if manifest.Name != "future-friendly" {
+		t.Fatalf("manifest.Name = %q, want %q", manifest.Name, "future-friendly")
+	}
+}
+
+func TestLoadManifest_RejectsConflictingRootAndWrappedValues(t *testing.T) {
+	withDaemonVersion(t, "0.6.0")
+
+	dir := t.TempDir()
+	writeFile(t, filepath.Join(dir, manifestJSONFileName), `{
+  "name": "root-name",
+  "extension": {
+    "name": "wrapped-name",
+    "version": "0.2.1",
+    "min_compozy_version": "0.5.0"
+  }
+}`)
+
+	_, err := LoadManifest(dir)
+	if err == nil {
+		t.Fatal("LoadManifest() error = nil, want conflict error")
+	}
+	if !errors.Is(err, ErrManifestInvalid) {
+		t.Fatalf("LoadManifest() error = %v, want ErrManifestInvalid", err)
+	}
+
+	validationErr, validationErrMatched := errors.AsType[*ManifestValidationError](err)
+	if !validationErrMatched {
+		t.Fatalf("LoadManifest() error = %T, want *ManifestValidationError", err)
+	}
+	if validationErr.Field != "name" {
+		t.Fatalf("validation field = %q, want %q", validationErr.Field, "name")
+	}
+}
+
+func TestDuration_UnmarshalJSON(t *testing.T) {
+	testCases := []struct {
+		name    string
+		payload string
+		want    Duration
+		wantErr bool
+	}{
+		{
+			name:    "string",
+			payload: `"5s"`,
+			want:    duration(5 * time.Second),
+		},
+		{
+			name:    "nanoseconds",
+			payload: `5000000000`,
+			want:    duration(5 * time.Second),
+		},
+		{
+			name:    "null",
+			payload: `null`,
+			want:    0,
+		},
+		{
+			name:    "invalid",
+			payload: `"nope"`,
+			wantErr: true,
+		},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			var got Duration
+			err := json.Unmarshal([]byte(tc.payload), &got)
+			if tc.wantErr {
+				if err == nil {
+					t.Fatal("json.Unmarshal() error = nil, want non-nil")
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("json.Unmarshal() error = %v", err)
+			}
+			if got != tc.want {
+				t.Fatalf("duration = %v, want %v", time.Duration(got), time.Duration(tc.want))
+			}
+		})
+	}
+}
+
+func TestParseSemanticVersion_PrereleaseComparison(t *testing.T) {
+	alpha1, ok := parseSemanticVersion("1.2.3-alpha.1+build.5")
+	if !ok {
+		t.Fatal("parseSemanticVersion(alpha.1) = false, want true")
+	}
+
+	alpha2, ok := parseSemanticVersion("1.2.3-alpha.2")
+	if !ok {
+		t.Fatal("parseSemanticVersion(alpha.2) = false, want true")
+	}
+
+	release, ok := parseSemanticVersion("1.2.3")
+	if !ok {
+		t.Fatal("parseSemanticVersion(release) = false, want true")
+	}
+
+	if compareSemanticVersions(alpha1, alpha2) >= 0 {
+		t.Fatalf("compareSemanticVersions(alpha1, alpha2) = %d, want < 0", compareSemanticVersions(alpha1, alpha2))
+	}
+	if compareSemanticVersions(release, alpha2) <= 0 {
+		t.Fatalf("compareSemanticVersions(release, alpha2) = %d, want > 0", compareSemanticVersions(release, alpha2))
+	}
+}
+
+func TestManifestValidate_RejectsInvalidPermissionName(t *testing.T) {
+	withDaemonVersion(t, "0.6.0")
+
+	manifest := expectedManifest()
+	manifest.Permissions.Requires = []string{"bad action"}
+
+	err := manifest.Validate()
+	if err == nil {
+		t.Fatal("Validate() error = nil, want ErrManifestInvalid")
+	}
+	if !errors.Is(err, ErrManifestInvalid) {
+		t.Fatalf("Validate() error = %v, want ErrManifestInvalid", err)
+	}
+
+	validationErr, validationErrMatched := errors.AsType[*ManifestValidationError](err)
+	if !validationErrMatched {
+		t.Fatalf("Validate() error = %T, want *ManifestValidationError", err)
+	}
+	if validationErr.Field != "permissions.requires[0]" {
+		t.Fatalf("validation field = %q, want %q", validationErr.Field, "permissions.requires[0]")
+	}
+}
+
+func TestManifestHelpers_ErrorFormattingAndDurationMethods(t *testing.T) {
+	notFound := &ManifestNotFoundError{
+		Dir:   "/tmp/ext",
+		Paths: []string{"/tmp/ext/extension.toml", "/tmp/ext/extension.json"},
+	}
+	if got := notFound.Error(); got == "" {
+		t.Fatal("ManifestNotFoundError.Error() returned empty string")
+	}
+
+	validationErr := &ManifestValidationError{
+		Field:   "version",
+		Value:   "latest",
+		Message: "must be a semantic version",
+	}
+	if got := validationErr.Error(); got == "" {
+		t.Fatal("ManifestValidationError.Error() returned empty string")
+	}
+
+	compatibilityErr := &ManifestCompatibilityError{
+		CurrentVersion: "0.4.0",
+		MinVersion:     "0.5.0",
+	}
+	if got := compatibilityErr.Error(); got == "" {
+		t.Fatal("ManifestCompatibilityError.Error() returned empty string")
+	}
+
+	zero := duration(0)
+	if !zero.IsZero() {
+		t.Fatal("Duration.IsZero() = false, want true")
+	}
+
+	value := duration(5 * time.Second)
+	if value.IsZero() {
+		t.Fatal("Duration.IsZero() = true, want false")
+	}
+	if value.String() != "5s" {
+		t.Fatalf("Duration.String() = %q, want %q", value.String(), "5s")
+	}
+
+	text, err := value.MarshalText()
+	if err != nil {
+		t.Fatalf("Duration.MarshalText() error = %v", err)
+	}
+	if string(text) != "5s" {
+		t.Fatalf("Duration.MarshalText() = %q, want %q", string(text), "5s")
+	}
+
+	encoded, err := value.MarshalJSON()
+	if err != nil {
+		t.Fatalf("Duration.MarshalJSON() error = %v", err)
+	}
+	if string(encoded) != `"5s"` {
+		t.Fatalf("Duration.MarshalJSON() = %s, want %s", string(encoded), `"5s"`)
+	}
+}
+
+func TestLoadManifest_RejectsManifestDirectoryEntries(t *testing.T) {
+	dir := t.TempDir()
+
+	if err := os.Mkdir(filepath.Join(dir, manifestTOMLFileName), 0o700); err != nil {
+		t.Fatalf("os.Mkdir(toml manifest dir): %v", err)
+	}
+
+	_, err := LoadManifest(dir)
+	if err == nil {
+		t.Fatal("LoadManifest() error = nil, want non-nil")
+	}
+}
+
+// TestValidateDaemonCompatibilityNormalizesDaemonBuildVersions preserves release and prerelease comparisons.
+func TestValidateDaemonCompatibilityNormalizesDaemonBuildVersions(t *testing.T) {
+	tests := []struct {
+		name       string
+		current    string
+		minVersion string
+		wantErr    bool
+	}{
+		{
+			name:       "Should accept current git-describe build at the manifest minimum",
+			current:    "v0.0.9-2-gd2731f105-dirty",
+			minVersion: "0.0.9",
+		},
+		{
+			name:       "Should accept dirty release tag at the manifest minimum",
+			current:    "v0.0.9-dirty",
+			minVersion: "0.0.9",
+		},
+		{
+			name:       "Should accept plain release tag at the manifest minimum",
+			current:    "v0.0.9",
+			minVersion: "0.0.9",
+		},
+		{
+			name:       "Should preserve prerelease semantics instead of widening compatibility",
+			current:    "v1.0.0-rc.1",
+			minVersion: "1.0.0",
+			wantErr:    true,
+		},
+		{
+			name:       "Should preserve short non git describe suffix",
+			current:    "v0.0.9-2-gd2731",
+			minVersion: "0.0.9",
+			wantErr:    true,
+		},
+		{
+			name:       "Should preserve non numeric git describe count",
+			current:    "v0.0.9-build-gd2731f105",
+			minVersion: "0.0.9",
+			wantErr:    true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			withDaemonVersion(t, tt.current)
+
+			err := ValidateDaemonCompatibility(tt.minVersion)
+			if tt.wantErr {
+				if err == nil {
+					t.Fatal("ValidateDaemonCompatibility() error = nil, want non-nil")
+				}
+				compatibility, ok := errors.AsType[*ManifestCompatibilityError](err)
+				if !ok || compatibility.CurrentVersion != tt.current || compatibility.MinVersion != tt.minVersion {
+					t.Fatalf(
+						"compatibility error = %#v, want current %q and minimum %q",
+						err,
+						tt.current,
+						tt.minVersion,
+					)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("ValidateDaemonCompatibility() error = %v", err)
+			}
+		})
+	}
+}
+
+func TestSemanticVersion_HelperValidation(t *testing.T) {
+	if _, ok := parseSemanticVersion("1.2"); ok {
+		t.Fatal("parseSemanticVersion(1.2) = true, want false")
+	}
+	if _, ok := parseSemanticVersion("1.2.3+build..5"); ok {
+		t.Fatal("parseSemanticVersion(invalid build metadata) = true, want false")
+	}
+
+	if !validIdentifierPart("memory") {
+		t.Fatal("validIdentifierPart(memory) = false, want true")
+	}
+	if validIdentifierPart("1memory") {
+		t.Fatal("validIdentifierPart(1memory) = true, want false")
+	}
+
+	if !validIdentifierList("alpha.1", false) {
+		t.Fatal("validIdentifierList(alpha.1) = false, want true")
+	}
+	if validIdentifierList("alpha..1", false) {
+		t.Fatal("validIdentifierList(alpha..1) = true, want false")
+	}
+
+	if !validPrereleasePart("alpha-1") {
+		t.Fatal("validPrereleasePart(alpha-1) = false, want true")
+	}
+	if validPrereleasePart("alpha!") {
+		t.Fatal("validPrereleasePart(alpha!) = true, want false")
+	}
+
+	left, ok := parseSemanticVersion("1.2.3-alpha.beta")
+	if !ok {
+		t.Fatal("parseSemanticVersion(alpha.beta) = false, want true")
+	}
+	right, ok := parseSemanticVersion("1.2.3-alpha.1")
+	if !ok {
+		t.Fatal("parseSemanticVersion(alpha.1) = false, want true")
+	}
+	if compareSemanticVersions(left, right) <= 0 {
+		t.Fatalf("compareSemanticVersions(alpha.beta, alpha.1) = %d, want > 0", compareSemanticVersions(left, right))
+	}
+}
+
+func withDaemonVersion(t *testing.T, current string) {
+	t.Helper()
+
+	active, activeOK := parseSemanticVersion(version.Current().Version)
+	required, requiredOK := parseSemanticVersion(current)
+	if strings.TrimSpace(current) == extensionTestDaemonVersion ||
+		(strings.TrimSpace(current) == "0.5.0" && activeOK && requiredOK &&
+			compareSemanticVersions(active, required) >= 0) {
+		return
+	}
+	t.Cleanup(version.OverrideVersionForTesting(current))
+}
+
+func writeFile(t *testing.T, path, content string) {
+	t.Helper()
+
+	if err := os.WriteFile(path, []byte(content), 0o600); err != nil {
+		t.Fatalf("os.WriteFile(%q): %v", path, err)
+	}
+}
+
+func duration(value time.Duration) Duration {
+	return Duration(value)
+}
+
+func expectedManifest() Manifest {
+	return Manifest{
+		Format:            FormatCompozy,
+		Name:              "sample-view",
+		Version:           "0.2.1",
+		Description:       "Sample view provider for Compozy",
+		MinCompozyVersion: "0.5.0",
+		Resources: ResourcesConfig{
+			Skills: []ManifestResourcePath{{Path: "skills/"}},
+			Agents: []ManifestResourcePath{{Path: "agents/"}},
+			Hooks: []HookConfig{
+				{
+					Name:     "workspace-context",
+					Event:    "prompt.post_assemble",
+					Mode:     "sync",
+					Priority: new(20),
+					Timeout:  duration(5 * time.Second),
+					Matcher: HookMatcherConfig{
+						WorkspaceRoot: "{{workspace_root}}",
+						ToolName:      "write_file",
+					},
+					Executor: HookExecutorConfig{
+						Kind:    "subprocess",
+						Command: "node",
+						Args:    []string{"dist/index.js", "--hook", "prompt_post_assemble"},
+						Env: map[string]string{
+							"NODE_ENV": "production",
+						},
+					},
+				},
+			},
+			Tools: map[string]ToolConfig{
+				"lookup": {
+					Description: "Search workspace content",
+					Backend: ToolBackendConfig{
+						Kind:    "extension_host",
+						Handler: "lookup",
+					},
+					ReadOnly: true,
+				},
+			},
+			MCPServers: map[string]MCPServerConfig{
+				"kubectl": {
+					Command: "mcp-kubectl",
+					Args:    []string{"--context", "production"},
+					Env: map[string]string{
+						"KUBECONFIG": "{{env:KUBECONFIG}}",
+					},
+				},
+			},
+		},
+		Capabilities: CapabilitiesConfig{
+			Provides: []string{"view.provider"},
+		},
+		Permissions: PermissionsConfig{
+			Requires: []string{"sessions/list", "sessions/events"},
+		},
+		Subprocess: SubprocessConfig{
+			Command:             "compozy-ext-pgvector",
+			Args:                []string{"--config", "{{config_dir}}/pgvector.toml"},
+			HealthCheckInterval: duration(30 * time.Second),
+			ShutdownTimeout:     duration(10 * time.Second),
+			Env: map[string]string{
+				"PGVECTOR_URL": "{{env:PGVECTOR_URL}}",
+			},
+		},
+	}
+}
+
+const validManifestTOML = `[extension]
+name = "sample-view"
+version = "0.2.1"
+description = "Sample view provider for Compozy"
+min_compozy_version = "0.5.0"
+
+[[resources.skills]]
+path = "skills/"
+
+[[resources.agents]]
+path = "agents/"
+
+[resources.tools.lookup]
+description = "Search workspace content"
+read_only = true
+
+[resources.tools.lookup.backend]
+kind = "extension_host"
+handler = "lookup"
+
+[[resources.hooks]]
+name = "workspace-context"
+event = "prompt.post_assemble"
+mode = "sync"
+priority = 20
+timeout = "5s"
+executor.kind = "subprocess"
+executor.command = "node"
+executor.args = ["dist/index.js", "--hook", "prompt_post_assemble"]
+executor.env = { NODE_ENV = "production" }
+
+[resources.hooks.matcher]
+workspace_root = "{{workspace_root}}"
+tool_name = "write_file"
+
+[resources.mcp_servers.kubectl]
+command = "mcp-kubectl"
+args = ["--context", "production"]
+env = { KUBECONFIG = "{{env:KUBECONFIG}}" }
+
+[capabilities]
+provides = ["view.provider"]
+
+[permissions]
+requires = ["sessions/list", "sessions/events"]
+
+[subprocess]
+command = "compozy-ext-pgvector"
+args = ["--config", "{{config_dir}}/pgvector.toml"]
+health_check_interval = "30s"
+shutdown_timeout = "10s"
+
+[subprocess.env]
+PGVECTOR_URL = "{{env:PGVECTOR_URL}}"
+
+[future]
+mode = "enabled"
+`
+
+const validManifestJSON = `{
+  "extension": {
+    "name": "sample-view",
+    "version": "0.2.1",
+    "description": "Sample view provider for Compozy",
+    "min_compozy_version": "0.5.0"
+  },
+  "resources": {
+    "skills": [{"path": "skills/"}],
+    "agents": [{"path": "agents/"}],
+    "tools": {
+      "lookup": {
+        "description": "Search workspace content",
+        "backend": {
+          "kind": "extension_host",
+          "handler": "lookup"
+        },
+        "read_only": true
+      }
+    },
+    "hooks": [
+      {
+        "name": "workspace-context",
+        "event": "prompt.post_assemble",
+        "mode": "sync",
+        "priority": 20,
+        "timeout": "5s",
+        "matcher": {
+          "workspace_root": "{{workspace_root}}",
+          "tool_name": "write_file"
+        },
+        "executor": {
+          "kind": "subprocess",
+          "command": "node",
+          "args": ["dist/index.js", "--hook", "prompt_post_assemble"],
+          "env": {
+            "NODE_ENV": "production"
+          }
+        }
+      }
+    ],
+    "mcp_servers": {
+      "kubectl": {
+        "command": "mcp-kubectl",
+        "args": ["--context", "production"],
+        "env": {
+          "KUBECONFIG": "{{env:KUBECONFIG}}"
+        }
+      }
+    }
+  },
+  "capabilities": {
+    "provides": ["view.provider"]
+  },
+  "permissions": {
+    "requires": ["sessions/list", "sessions/events"]
+  },
+  "subprocess": {
+    "command": "compozy-ext-pgvector",
+    "args": ["--config", "{{config_dir}}/pgvector.toml"],
+    "health_check_interval": "30s",
+    "shutdown_timeout": "10s",
+    "env": {
+      "PGVECTOR_URL": "{{env:PGVECTOR_URL}}"
+    }
+  },
+  "future": {
+    "mode": "enabled"
+  }
+}`
+
+// Invariant: packaged inputs retain typed defaults and bind only to compatible declared servers.
+// Owner: extension manifest decoder and validator. Canonical suite: manifest_test.go.
+func TestManifestPackagedInputs(t *testing.T) {
+	t.Parallel()
+	t.Run("Should reject invalid scope and authentication policy", func(t *testing.T) {
+		t.Parallel()
+		cases := []struct {
+			name   string
+			server MCPServerConfig
+		}{
+			{"unknown scope", MCPServerConfig{DefaultScope: "session"}},
+			{"unknown method", MCPServerConfig{Transport: "http", Auth: &MCPServerAuthConfig{Method: "token"}}},
+			{"OAuth on stdio", MCPServerConfig{Transport: "stdio", Auth: &MCPServerAuthConfig{Method: "oauth"}}},
+			{
+				"none with OAuth fields",
+				MCPServerConfig{
+					Transport: "http",
+					Auth:      &MCPServerAuthConfig{Method: "none", IssuerURL: "https://issuer.example"},
+				},
+			},
+			{
+				"insecure issuer",
+				MCPServerConfig{
+					Transport: "http",
+					Auth: &MCPServerAuthConfig{
+						Method:       "oauth",
+						Registration: "dynamic",
+						IssuerURL:    "http://issuer.example",
+					},
+				},
+			},
+			{
+				"dynamic client id",
+				MCPServerConfig{
+					Transport: "http",
+					Auth:      &MCPServerAuthConfig{Method: "oauth", Registration: "dynamic", ClientID: "client"},
+				},
+			},
+			{
+				"duplicate scopes",
+				MCPServerConfig{
+					Transport: "http",
+					Auth: &MCPServerAuthConfig{
+						Method:       "oauth",
+						Registration: "dynamic",
+						Scopes:       []string{"read", "read"},
+					},
+				},
+			},
+		}
+		for _, test := range cases {
+			t.Run("Should reject "+test.name, func(t *testing.T) {
+				t.Parallel()
+				err := validateManifestMCPPolicies(map[string]MCPServerConfig{"example": test.server})
+				if err == nil {
+					t.Fatal("invalid policy accepted")
+				}
+				validationErr, ok := errors.AsType[*ManifestValidationError](err)
+				if !ok ||
+					!strings.HasPrefix(validationErr.Field, "resources.mcp_servers.example.") {
+					t.Fatalf("diagnostic = %v", err)
+				}
+			})
+		}
+	})
+
+	fixtures := []struct{ name, toml string }{
+		{"context7", `name = "context7"
+version = "3.2.3"
+description = "Fetch current, version-specific library documentation and code examples."
+min_compozy_version = "0.5.0"
+
+# Asked at install. A secret goes to the vault under the bound env name; other
+# values are stored with the installed extension and reloaded on restart.
+[[inputs]]
+id = "context7_api_key"
+prompt = "Context7 API key (optional)"
+type = "secret"            # secret | string | identifier | boolean
+required = false
+binding = { type = "env", name = "CONTEXT7_API_KEY" }
+
+[resources.mcp_servers.context7]
+transport = "stdio"
+command = "npx"
+args = ["-y", "@upstash/context7-mcp@3.2.3"]
+# env / secret_env keep their map shape: ENV_NAME = "<binding name>". For an
+# input-backed variable the binding name is the input id.
+secret_env = { CONTEXT7_API_KEY = "context7_api_key" }
+default_scope = "global"
+`},
+		{"linear", `name = "linear"
+version = "1.0.0"
+min_compozy_version = "0.5.0"
+[[inputs]]
+id = "workspace_id"
+prompt = "Workspace id"
+type = "identifier"
+required = true
+binding = { type = "url_query", name = "workspace" }
+
+[resources.mcp_servers.linear]
+transport = "http"
+url = "https://mcp.linear.app/mcp?workspace="
+default_scope = "global"
+
+[resources.mcp_servers.linear.auth]
+method = "oauth"
+registration = "dynamic"
+issuer_url = "https://mcp.linear.app"
+scopes = ["read", "write"]
+`},
+	}
+	for _, fixture := range fixtures {
+		t.Run("Should load and round-trip frozen "+fixture.name+" inputs [UT-020]", func(t *testing.T) {
+			t.Parallel()
+			manifest, err := loadManifestTOMLContent("extension.toml", []byte(fixture.toml))
+			if err != nil {
+				t.Fatal(err)
+			}
+			if len(manifest.Inputs) != 1 {
+				t.Fatalf("inputs = %#v", manifest.Inputs)
+			}
+			server := manifest.Resources.MCPServers[fixture.name]
+			if server.DefaultScope != "global" {
+				t.Fatalf("scope = %q", server.DefaultScope)
+			}
+			if fixture.name == "context7" && server.SecretEnv["CONTEXT7_API_KEY"] != "context7_api_key" {
+				t.Fatalf("secret_env = %#v", server.SecretEnv)
+			}
+			if fixture.name == "linear" &&
+				(server.Auth == nil || server.Auth.Method != "oauth" || server.Auth.Registration != "dynamic" || server.Auth.IssuerURL != "https://mcp.linear.app" || !reflect.DeepEqual(server.Auth.Scopes, []string{"read", "write"})) {
+				t.Fatalf("auth = %#v", server.Auth)
+			}
+			encoded, err := encodeManifestTOML(manifest)
+			if err != nil {
+				t.Fatal(err)
+			}
+			decoded, err := loadManifestTOMLContent("extension.toml", encoded)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !reflect.DeepEqual(decoded.Inputs, manifest.Inputs) ||
+				!reflect.DeepEqual(decoded.Resources.MCPServers, manifest.Resources.MCPServers) {
+				t.Fatalf("round trip changed inputs or servers: %s", encoded)
+			}
+		})
+	}
+	t.Run("Should retain native boolean defaults and derive only required env names", func(t *testing.T) {
+		t.Parallel()
+		raw := `name = "example"
+version = "1.0.0"
+min_compozy_version = "0.5.0"
+requires_env = ["DEBUG"]
+[[inputs]]
+id = "debug"
+prompt = "Enable debugging"
+type = "boolean"
+required = true
+default = false
+binding = {type = "env", name = "DEBUG"}
+[resources.mcp_servers.example]
+command = "example"
+env = { DEBUG = "debug" }
+`
+		manifest, err := loadManifestTOMLContent("extension.toml", []byte(raw))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if string(manifest.Inputs[0].Default) != "false" ||
+			!reflect.DeepEqual(manifest.RequiresEnv, []string{"DEBUG"}) {
+			t.Fatalf("manifest = %#v", manifest)
+		}
+		encoded, err := encodeManifestTOML(manifest)
+		if err != nil {
+			t.Fatal(err)
+		}
+		decoded, err := loadManifestTOMLContent("extension.toml", encoded)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !reflect.DeepEqual(decoded.Inputs, manifest.Inputs) {
+			t.Fatalf("defaults changed: %s", encoded)
+		}
+		cloned := cloneManifest(manifest)
+		cloned.Inputs[0].Default[0] = 't'
+		if string(manifest.Inputs[0].Default) != "false" {
+			t.Fatal("clone shares default storage")
+		}
+	})
+	t.Run("Should reject explicit null defaults in JSON", func(t *testing.T) {
+		t.Parallel()
+		_, err := loadManifestJSONContent(
+			"extension.json",
+			[]byte(
+				`{"name":"example","version":"1.0.0","min_compozy_version":"0.5.0","inputs":[{"id":"debug","prompt":"Debug","type":"boolean","binding":{"type":"env","name":"DEBUG"},"default":null}],"resources":{"mcp_servers":{"example":{"command":"example","env":{"DEBUG":"debug"}}}}}`,
+			),
+		)
+		if err == nil || !strings.Contains(err.Error(), "default must be a boolean") {
+			t.Fatalf("error = %v", err)
+		}
+	})
+	tests := []struct {
+		name      string
+		mutate    func(*Manifest)
+		grammarOK bool
+		want      string
+	}{
+		{"duplicate ids", func(m *Manifest) {
+			other := m.Inputs[0]
+			other.Binding.Name = "SECOND"
+			m.Inputs = append(m.Inputs, other)
+		}, false, "inputs[1].id"},
+		{
+			"duplicate bindings",
+			func(m *Manifest) { other := m.Inputs[0]; other.ID = "second"; m.Inputs = append(m.Inputs, other) },
+			false,
+			"inputs[1].binding",
+		},
+		{
+			"secret URL",
+			func(m *Manifest) { m.Inputs[0].Type = "secret"; m.Inputs[0].Binding.Type = "url_query" },
+			false,
+			"inputs[0].binding",
+		},
+		{
+			"secret default",
+			func(m *Manifest) { m.Inputs[0].Type = "secret"; m.Inputs[0].Default = json.RawMessage(`"secret"`) },
+			false,
+			"inputs[0].default",
+		},
+		{"unbound input", func(m *Manifest) { m.Resources.MCPServers = nil }, true, "inputs[0].binding"},
+		{"query on stdio", func(m *Manifest) {
+			m.Inputs[0].Binding = marketplace.InputBinding{Type: "url_query", Name: "workspace"}
+			m.Resources.MCPServers["example"] = MCPServerConfig{
+				Command: "example",
+				URL:     "https://example.com?workspace=",
+			}
+		}, true, "inputs[0].binding"},
+		{"wrong input id", func(m *Manifest) {
+			m.Resources.MCPServers["example"] = MCPServerConfig{
+				Command: "example",
+				Env:     map[string]string{"REGION": "another"},
+			}
+		}, true, "inputs[0].binding"},
+		{"secret in plain env", func(m *Manifest) { m.Inputs[0].Type = "secret" }, true, "inputs[0].binding"},
+	}
+	for _, test := range tests {
+		t.Run("Should reject "+test.name+" with a positioned diagnostic [UT-022]", func(t *testing.T) {
+			t.Parallel()
+			manifest := &Manifest{
+				Inputs: []ManifestInput{
+					{
+						ID:      "region",
+						Prompt:  "Region",
+						Type:    "string",
+						Binding: marketplace.InputBinding{Type: "env", Name: "REGION"},
+					},
+				},
+				Resources: ResourcesConfig{
+					MCPServers: map[string]MCPServerConfig{
+						"example": {Command: "example", Env: map[string]string{"REGION": "region"}},
+					},
+				},
+			}
+			test.mutate(manifest)
+			grammarErr := marketplace.ValidateInputGrammar(manifest.Inputs)
+			if (grammarErr == nil) != test.grammarOK {
+				t.Fatalf("grammar error = %v, valid = %v", grammarErr, test.grammarOK)
+			}
+			err := ValidateManifestInputs(manifest)
+			if err == nil || !strings.Contains(err.Error(), test.want) {
+				t.Fatalf("manifest error = %v, want %q", err, test.want)
+			}
+		})
+	}
+}
+
+// Invariant: packaged servers preserve approved launch/auth/input definitions and match their current feed.
+// Owner: curated package manifests. Canonical suite: manifest_test.go.
+func TestManifestCuratedMCPPackages(t *testing.T) {
+	t.Parallel()
+	t.Run("Should preserve all seventeen approved server definitions [UT-007]", func(t *testing.T) {
+		t.Parallel()
+		data, err := os.ReadFile(filepath.Join("testdata", "mcp_to_extension", "approved.json"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		var approved struct {
+			Entries []struct {
+				ID     string          `json:"entry_id"`
+				Inputs []ManifestInput `json:"inputs"`
+				Server MCPServerConfig `json:"server"`
+			} `json:"entries"`
+		}
+		if err := json.Unmarshal(data, &approved); err != nil {
+			t.Fatal(err)
+		}
+		if len(approved.Entries) != 17 {
+			t.Fatalf("approved server count = %d, want 17", len(approved.Entries))
+		}
+		feed, err := os.ReadFile(filepath.Join("..", "..", "catalog", "v3", "extensions.json"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		document, err := marketplace.DecodeDocument(feed)
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, entry := range approved.Entries {
+			manifest, err := LoadManifest(filepath.Join("..", "..", "catalog", "packages", entry.ID))
+			if err != nil {
+				t.Fatalf("%s: %v", entry.ID, err)
+			}
+			if len(manifest.Resources.MCPServers) != 1 ||
+				!reflect.DeepEqual(manifest.Resources.MCPServers[entry.ID], entry.Server) {
+				t.Fatalf("%s server = %#v, want %#v", entry.ID, manifest.Resources.MCPServers, entry.Server)
+			}
+			if !reflect.DeepEqual(manifest.Inputs, entry.Inputs) {
+				t.Fatalf("%s inputs = %#v, want %#v", entry.ID, manifest.Inputs, entry.Inputs)
+			}
+			index := slices.IndexFunc(
+				document.Entries,
+				func(item marketplace.Entry) bool { return item.EntryID == entry.ID },
+			)
+			if index < 0 {
+				t.Fatalf("%s missing from current feed", entry.ID)
+			}
+			current := document.Entries[index]
+			var payload struct {
+				Inputs []ManifestInput `json:"inputs"`
+			}
+			if err := json.Unmarshal(current.Payload, &payload); err != nil {
+				t.Fatal(err)
+			}
+			if current.Version != manifest.Version || !reflect.DeepEqual(payload.Inputs, entry.Inputs) {
+				t.Fatalf("%s feed version/inputs differ from its approved package", entry.ID)
+			}
+		}
+	})
+}
+
+// Invariant: typed readiness uses active instance values and reports missing env names separately from URL input IDs.
+// Owner: extension manifest readiness. Canonical suite: manifest_test.go.
+func TestManifestInputReadiness(t *testing.T) {
+	t.Parallel()
+	cases := []struct {
+		name          string
+		input         ManifestInput
+		record        *InputValueRecord
+		env           string
+		missingInputs []string
+		missingEnv    []string
+	}{
+		{
+			name: "accept a stored URL identifier without process env",
+			input: ManifestInput{
+				ID:       "workspace_id",
+				Type:     "identifier",
+				Required: true,
+				Binding:  marketplace.InputBinding{Type: "url_query", Name: "ws"},
+			},
+			record: &InputValueRecord{Type: "identifier", Value: json.RawMessage(`"team"`), Active: true},
+		},
+		{
+			name: "ignore process env for a missing URL identifier",
+			input: ManifestInput{
+				ID:       "workspace_id",
+				Type:     "identifier",
+				Required: true,
+				Binding:  marketplace.InputBinding{Type: "url_query", Name: "ws"},
+			},
+			env:           "team",
+			missingInputs: []string{"workspace_id"},
+		},
+		{
+			name: "ignore an inactive URL row",
+			input: ManifestInput{
+				ID:       "workspace_id",
+				Type:     "identifier",
+				Required: true,
+				Binding:  marketplace.InputBinding{Type: "url_query", Name: "ws"},
+			},
+			record:        &InputValueRecord{Type: "identifier", Value: json.RawMessage(`"team"`)},
+			missingInputs: []string{"workspace_id"},
+		},
+		{
+			name: "accept a false boolean default",
+			input: ManifestInput{
+				ID:       "read_only",
+				Type:     "boolean",
+				Required: true,
+				Binding:  marketplace.InputBinding{Type: "url_query", Name: "read_only"},
+				Default:  json.RawMessage(`false`),
+			},
+		},
+		{
+			name: "accept an active secret reference",
+			input: ManifestInput{
+				ID:       "token",
+				Type:     "secret",
+				Required: true,
+				Binding:  marketplace.InputBinding{Type: "env", Name: "TOKEN"},
+			},
+			record: &InputValueRecord{
+				Type:      "secret",
+				SecretRef: "vault:extensions/global/example/env/TOKEN",
+				Active:    true,
+			},
+		},
+		{
+			name: "accept process env for a required secret",
+			input: ManifestInput{
+				ID:       "token",
+				Type:     "secret",
+				Required: true,
+				Binding:  marketplace.InputBinding{Type: "env", Name: "TOKEN"},
+			},
+			env: "private-value",
+		},
+		{
+			name: "report the env name for a missing secret",
+			input: ManifestInput{
+				ID:       "token",
+				Type:     "secret",
+				Required: true,
+				Binding:  marketplace.InputBinding{Type: "env", Name: "TOKEN"},
+			},
+			missingEnv: []string{"TOKEN"},
+		},
+		{
+			name: "ignore an inactive secret reference",
+			input: ManifestInput{
+				ID:       "token",
+				Type:     "secret",
+				Required: true,
+				Binding:  marketplace.InputBinding{Type: "env", Name: "TOKEN"},
+			},
+			record:     &InputValueRecord{Type: "secret", SecretRef: "vault:extensions/global/example/env/TOKEN"},
+			missingEnv: []string{"TOKEN"},
+		},
+		{
+			name: "accept an active non-secret env row",
+			input: ManifestInput{
+				ID:       "mode",
+				Type:     "string",
+				Required: true,
+				Binding:  marketplace.InputBinding{Type: "env", Name: "MODE"},
+			},
+			record: &InputValueRecord{Type: "string", Value: json.RawMessage(`"readonly"`), Active: true},
+		},
+	}
+	for _, tc := range cases {
+		t.Run("Should "+tc.name+" [UT-071]", func(t *testing.T) {
+			t.Parallel()
+			manifest := &Manifest{Inputs: []ManifestInput{tc.input}}
+			manifest.RequiresEnv = manifestRequiredEnv(nil, manifest.Inputs)
+			state := InputState{Values: map[string]InputValueRecord{}}
+			if tc.record != nil {
+				state.Values[tc.input.ID] = *tc.record
+			}
+			ready := InputReadiness(manifest, state, func(string) string { return tc.env })
+			if !slices.Equal(ready.MissingInputs, tc.missingInputs) || !slices.Equal(ready.MissingEnv, tc.missingEnv) {
+				t.Fatalf("readiness = %#v, want inputs %v env %v", ready, tc.missingInputs, tc.missingEnv)
+			}
+			if tc.input.Binding.Type == "url_query" && len(manifest.RequiresEnv) != 0 {
+				t.Fatal("URL inputs leaked into requires_env")
+			}
+		})
+	}
+}
+
+func TestClientPluginManifestPackages(t *testing.T) {
+	for _, tc := range []struct {
+		name            string
+		skills, servers int
+	}{
+		{"open-design", 0, 1}, {"loop-engineering", 7, 0},
+	} {
+		t.Run("Should load the authored "+tc.name+" resources without changing files", func(t *testing.T) {
+			t.Parallel()
+			root := filepath.Join("testdata", "client-plugins", tc.name)
+			before, err := ComputeDirectoryChecksum(root)
+			if err != nil {
+				t.Fatal(err)
+			}
+			manifest, err := LoadManifestWithAgentPluginDataDir(root, filepath.Join(t.TempDir(), "data"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			if manifest.Layout != "claude-plugin" || manifest.Name != tc.name ||
+				len(manifest.Resources.Skills) != tc.skills ||
+				len(manifest.Resources.MCPServers) != tc.servers {
+				t.Fatalf("unexpected client projection: %#v, diagnostics=%#v", manifest, manifest.IngestDiagnostics)
+			}
+			if tc.servers == 1 && manifest.Resources.MCPServers["open-design"].Command != "od" {
+				t.Fatalf("MCP command = %#v", manifest.Resources.MCPServers)
+			}
+			after, err := ComputeDirectoryChecksum(root)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if before != after {
+				t.Fatal("loading changed package bytes")
+			}
+			metadata, err := resolveManifestPath(root)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if filepath.Clean(PackageRootFromManifest(metadata)) != filepath.Clean(root) {
+				t.Fatalf("package root = %q", PackageRootFromManifest(metadata))
+			}
+			loaded, err := loadManifestAtPath(metadata)
+			if err != nil || loaded.Layout != manifest.Layout {
+				t.Fatalf("reload located manifest = %#v, %v", loaded, err)
+			}
+		})
+	}
+	t.Run("Should retain the actual path in unsupported client schema errors", func(t *testing.T) {
+		t.Parallel()
+		root := t.TempDir()
+		file := filepath.Join(root, ".codex-plugin", "plugin.json")
+		if err := os.MkdirAll(filepath.Dir(file), 0o700); err != nil {
+			t.Fatal(err)
+		}
+		writeFile(t, file, `{"name":"future","$schema":"https://agent-plugins.org/schemas/2.0.0/plugin.schema.json"}`)
+		_, err := LoadManifest(root)
+		if !errors.Is(err, agentplugin.ErrSchemaUnsupported) || !strings.Contains(err.Error(), file) {
+			t.Fatalf("schema error = %v", err)
+		}
+	})
+}
+
+// Invariant: retired manifest entries cannot block a kept extension or relax unknown-entry validation.
+// Owner: extension manifest ingestion. Canonical suite: manifest_test.go.
+func TestManifestRetiredMemoryEntries(t *testing.T) {
+	t.Parallel()
+	t.Run("Should filter retired provides methods and consent [UT-021]", func(t *testing.T) {
+		t.Parallel()
+		manifest := expectedManifest()
+		manifest.Capabilities.Provides = []string{"memory.backend", "tool.provider"}
+		manifest.Permissions.Requires = []string{
+			"memory/recall",
+			"sessions/list",
+			"memory.read",
+			"memory/store",
+			"memory/forget",
+			"memory.write",
+		}
+		dropped := dropRetiredMemoryManifestEntries(&manifest)
+		if !reflect.DeepEqual(manifest.Capabilities.Provides, []string{"tool.provider"}) ||
+			!reflect.DeepEqual(manifest.Permissions.Requires, []string{"sessions/list"}) ||
+			len(dropped) != 6 {
+			t.Fatalf("filtered manifest = %#v, dropped = %#v", manifest, dropped)
+		}
+		if !slices.Contains(dropped, "capabilities.provides=memory.backend") ||
+			!slices.Contains(dropped, "permissions.requires=memory/recall") ||
+			!slices.Contains(dropped, "permissions.requires=memory.read") {
+			t.Fatalf("dropped = %#v", dropped)
+		}
+		if err := manifest.Validate(); err != nil {
+			t.Fatalf("Validate() = %v", err)
+		}
+		if again := dropRetiredMemoryManifestEntries(&manifest); len(again) != 0 {
+			t.Fatalf("second filter = %#v", again)
+		}
+		manifest.Capabilities.Provides = append(manifest.Capabilities.Provides, "unknown.backend")
+		dropRetiredMemoryManifestEntries(&manifest)
+		if _, ok := errors.AsType[*ManifestValidationError](manifest.Validate()); !ok {
+			t.Fatal("Validate() should retain unknown capability error")
+		}
+	})
+	for _, format := range []string{"toml", "json"} {
+		t.Run("Should load retired entries through "+format+" install ingestion [UT-021]", func(t *testing.T) {
+			t.Parallel()
+			manifest := expectedManifest()
+			manifest.Resources.Tools = nil
+			manifest.Capabilities.Provides = []string{"memory.backend"}
+			manifest.Permissions.Requires = []string{"memory/store", "memory.write", "sessions/list"}
+			var content []byte
+			var err error
+			if format == "toml" {
+				content, err = encodeManifestTOML(&manifest)
+			} else {
+				content, err = json.Marshal(manifest)
+			}
+			if err != nil {
+				t.Fatal(err)
+			}
+			dir := t.TempDir()
+			if err := os.WriteFile(filepath.Join(dir, "extension."+format), content, 0o600); err != nil {
+				t.Fatal(err)
+			}
+			loaded, err := LoadManifest(dir)
+			if err != nil {
+				t.Fatalf("LoadManifest() = %v", err)
+			}
+			if len(loaded.Capabilities.Provides) != 0 ||
+				!reflect.DeepEqual(loaded.Permissions.Requires, []string{"sessions/list"}) {
+				t.Fatalf("loaded manifest = %#v", loaded)
+			}
+		})
+	}
+}
+
+// Invariant: retired matcher keys preserve hook execution for all native compaction observations.
+func TestManifestCompactionMatcher(t *testing.T) {
+	t.Parallel()
+	for _, format := range []string{"toml", "json"} {
+		t.Run("Should ignore retired matcher keys in "+format+" [UT-041]", func(t *testing.T) {
+			t.Parallel()
+			manifest := expectedManifest()
+			manifest.Resources.Tools = nil
+			manifest.Resources.Hooks = []HookConfig{
+				{
+					Name:    "compaction",
+					Event:   "context.pre_compact",
+					Mode:    "sync",
+					Command: "echo",
+					Matcher: HookMatcherConfig{CompactionReason: "token_limit", CompactionStrategy: "summary"},
+				},
+			}
+			var content []byte
+			var err error
+			if format == "toml" {
+				content, err = encodeManifestTOML(&manifest)
+			} else {
+				content, err = json.Marshal(manifest)
+			}
+			if err != nil {
+				t.Fatal(err)
+			}
+			dir := t.TempDir()
+			if err := os.WriteFile(filepath.Join(dir, "extension."+format), content, 0o600); err != nil {
+				t.Fatal(err)
+			}
+			loaded, err := LoadManifest(dir)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if len(loaded.Resources.Hooks) != 1 {
+				t.Fatalf("hooks = %#v", loaded.Resources.Hooks)
+			}
+			matcher := hookConfigMatcher(loaded.Resources.Hooks[0].Matcher)
+			for _, trigger := range []string{"requested", "agent"} {
+				if !matcher.MatchesContextCompact(hookspkg.ContextCompactionPayload{Trigger: trigger}) {
+					t.Fatalf("matcher rejected %s", trigger)
+				}
+			}
+		})
+	}
+}

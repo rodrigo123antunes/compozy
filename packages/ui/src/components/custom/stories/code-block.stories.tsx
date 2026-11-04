@@ -1,0 +1,242 @@
+import type { Meta, StoryObj } from "@storybook/react-vite";
+import { expect, fn, userEvent, waitFor, within } from "storybook/test";
+
+import { CodeBlock, CopyIconButton } from "../code-block";
+
+const meta: Meta<typeof CodeBlock> = {
+  title: "components/custom/CodeBlock",
+  component: CodeBlock,
+  parameters: {
+    layout: "padded",
+    docs: {
+      description: {
+        component:
+          "Code block per DESIGN.md §4. Canvas-deep container, JetBrains Mono body at 14px/1.6, Vitesse syntax highlighting via Shiki, optional language eyebrow, and a ghost copy button with success/failure feedback. Plain code by default; `showPrompt` opts into the accent `$ ` shell prompt for real terminal transcripts.",
+      },
+    },
+  },
+};
+
+export default meta;
+type Story = StoryObj<typeof meta>;
+
+export const ShellCommand: Story = {
+  args: {
+    code: "compozy start",
+    showPrompt: true,
+  },
+  parameters: {
+    docs: {
+      description: {
+        story: "Opt-in shell prompt: a real terminal transcript with the accent `$ ` prompt.",
+      },
+    },
+  },
+};
+
+export const MultilineWithoutPrompt: Story = {
+  args: {
+    language: "typescript",
+    themeMode: "dark",
+    code: `export function greet(name: string) {
+  return \`Hello, \${name}\`;
+}`,
+  },
+  parameters: {
+    docs: {
+      description: {
+        story: "The default read: source code rendered plainly, with no shell prompt injected.",
+      },
+    },
+  },
+};
+
+export const LanguageLabel: Story = {
+  args: {
+    caption: "compozy task",
+    language: "bash",
+    showPrompt: true,
+    code: `# inspect status and start one task
+compozy status
+compozy task list
+compozy task start task-102 \\
+    --idempotency-key review-482`,
+  },
+  parameters: {
+    docs: {
+      description: {
+        story:
+          "Language eyebrow in the top-left. Comment (`#`) and indented continuation lines skip the prompt.",
+      },
+    },
+  },
+};
+
+export const UnknownLanguageFallback: Story = {
+  args: {
+    language: "not-a-language",
+    code: ['<unsafe-tag data-value="render as text">', "  escaped: true", "</unsafe-tag>"].join(
+      "\n"
+    ),
+  },
+  parameters: {
+    docs: {
+      description: {
+        story:
+          "Unsupported language labels remain visible, but the body falls back to escaped plain text.",
+      },
+    },
+  },
+};
+
+export const LineNumbersAndHighlights: Story = {
+  args: {
+    showLineNumbers: true,
+    highlightLines: [2, 4],
+    language: "typescript",
+    code: [
+      "type AgentState = 'idle' | 'running' | 'blocked';",
+      "const state: AgentState = 'running';",
+      "const canResume = state !== 'blocked';",
+      "console.log({ state, canResume });",
+    ].join("\n"),
+  },
+};
+
+export const WrappedLongLine: Story = {
+  args: {
+    wrapLines: true,
+    language: "json",
+    code: JSON.stringify(
+      {
+        event: "task_completed",
+        task_id: "task-102",
+        summary:
+          "This deliberately long value wraps inside the block without forcing a horizontal scroll.",
+      },
+      null,
+      2
+    ),
+  },
+};
+
+export const CopyDisabled: Story = {
+  args: {
+    copyable: false,
+    code: "compozy start",
+  },
+  parameters: {
+    docs: {
+      description: {
+        story: "Static code block with the copy affordance hidden.",
+      },
+    },
+  },
+};
+
+export const CopyInteraction: Story = {
+  args: {
+    code: "compozy status",
+  },
+  parameters: {
+    docs: {
+      description: {
+        story: "Interaction test: click copy, assert checkmark appears, assert revert after 1.5s.",
+      },
+    },
+  },
+  play: async ({ canvasElement, step }) => {
+    const canvas = within(canvasElement);
+    const writeText = fn(async (_value: string) => undefined);
+    const original = Object.getOwnPropertyDescriptor(navigator, "clipboard");
+    Object.defineProperty(navigator, "clipboard", {
+      configurable: true,
+      value: { writeText },
+    });
+    try {
+      await step("Copy button renders with the copy glyph", async () => {
+        const root = canvasElement.querySelector<HTMLElement>('[data-slot="code-block"]');
+        await expect(root).not.toBeNull();
+        const button = await canvas.findByRole("button", { name: "Copy to clipboard" });
+        await expect(button.querySelector('[data-slot="copy-idle-icon"]')).not.toBeNull();
+      });
+      await step("Clicking copy invokes navigator.clipboard.writeText", async () => {
+        const button = await canvas.findByRole("button", { name: "Copy to clipboard" });
+        await userEvent.click(button);
+        await waitFor(() => expect(writeText).toHaveBeenCalledWith("compozy status"));
+      });
+      await step("Button swaps to the check glyph", async () => {
+        const success = await canvas.findByRole("button", { name: "Copied" });
+        await expect(success.getAttribute("data-copied")).toBe("true");
+        await expect(success.querySelector('[data-slot="copy-success-icon"]')).not.toBeNull();
+      });
+      await step("Button reverts to copy glyph after ~1.5s", async () => {
+        await waitFor(
+          async () => {
+            const reverted = await canvas.findByRole("button", { name: "Copy to clipboard" });
+            await expect(reverted.getAttribute("data-copied")).toBeNull();
+            await expect(reverted.querySelector('[data-slot="copy-idle-icon"]')).not.toBeNull();
+          },
+          { timeout: 2500 }
+        );
+      });
+    } finally {
+      if (original) {
+        Object.defineProperty(navigator, "clipboard", original);
+      } else {
+        Reflect.deleteProperty(navigator as unknown as { clipboard?: unknown }, "clipboard");
+      }
+    }
+  },
+};
+
+export const Truncated: Story = {
+  args: {
+    code: ["First line", "Second line", "Third line", "Fourth line"].join("\n"),
+    truncateLines: 2,
+  },
+};
+
+export const CopyFailure: Story = {
+  args: {
+    code: "compozy status",
+  },
+  play: async ({ canvasElement, step }) => {
+    const canvas = within(canvasElement);
+    const original = Object.getOwnPropertyDescriptor(navigator, "clipboard");
+    Object.defineProperty(navigator, "clipboard", {
+      configurable: true,
+      value: {
+        writeText: fn(async (_value: string) => {
+          throw new Error("blocked");
+        }),
+      },
+    });
+    try {
+      await step("Clicking copy exposes failure feedback", async () => {
+        const button = await canvas.findByRole("button", { name: "Copy to clipboard" });
+        await userEvent.click(button);
+        const failed = await canvas.findByRole("button", { name: "Copy failed" });
+        await expect(failed.getAttribute("data-copy-state")).toBe("failed");
+      });
+    } finally {
+      if (original) {
+        Object.defineProperty(navigator, "clipboard", original);
+      } else {
+        Reflect.deleteProperty(navigator as unknown as { clipboard?: unknown }, "clipboard");
+      }
+    }
+  },
+};
+
+export const StandaloneCopyButton: Story = {
+  args: {
+    code: "compozy status",
+  },
+  render: args => (
+    <div className="flex items-center gap-3 rounded-md border border-line bg-canvas-soft p-3">
+      <span className="font-mono text-small-body text-muted-foreground">{args.code}</span>
+      <CopyIconButton value={args.code} />
+    </div>
+  ),
+};

@@ -1,0 +1,776 @@
+package vault
+
+import (
+	"bytes"
+	"context"
+	"encoding/base64"
+	"encoding/hex"
+	"errors"
+	"os"
+	"path/filepath"
+	"slices"
+	"strings"
+	"sync"
+	"testing"
+	"time"
+
+	"github.com/zalando/go-keyring"
+)
+
+type staticKeyProvider struct {
+	key []byte
+}
+
+type memoryKeyring struct {
+	getCalls        int
+	values          map[string]string
+	getErr          error
+	corruptReadback bool
+}
+
+var _ Keyring = (*memoryKeyring)(nil)
+
+func (r *memoryKeyring) Get(service, account string) (string, error) {
+	r.getCalls++
+	if r.getErr != nil {
+		return "", r.getErr
+	}
+	value, ok := r.values[service+account]
+	if !ok {
+		return "", keyring.ErrNotFound
+	}
+	if r.corruptReadback {
+		return strings.Repeat("x", keySizeBytes), nil
+	}
+	return value, nil
+}
+
+func (r *memoryKeyring) Set(service, account, value string) error {
+	r.values[service+account] = value
+	return nil
+}
+
+func (r *memoryKeyring) Delete(service, account string) error {
+	delete(r.values, service+account)
+	return nil
+}
+
+func TestVaultKeyringMigration(t *testing.T) {
+	t.Parallel()
+	t.Run("Should verify all records and make repeated migration idempotent", func(t *testing.T) {
+		t.Parallel()
+		home := t.TempDir()
+		fileKeys := NewFileKeyProvider(home, func(string) (string, bool) { return "", false })
+		store := newMemoryVaultStore()
+		service, err := NewService(store, fileKeys)
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, ref := range []string{"vault:providers/custom/one", "vault:profiles/work/providers/custom/two"} {
+			if _, err := service.PutSecret(t.Context(), ref, "token", "migration-secret"); err != nil {
+				t.Fatal(err)
+			}
+		}
+		ring := &memoryKeyring{values: map[string]string{}}
+		for range 2 {
+			activated := false
+			count, err := MigrateToKeyring(t.Context(), home, store, ring, func() error {
+				readbackService, err := NewService(store, NewOSKeyProvider(home, ring))
+				if err != nil {
+					return err
+				}
+				value, err := readbackService.ResolveRef(t.Context(), "vault:providers/custom/one")
+				if err != nil {
+					return err
+				}
+				if value != "migration-secret" {
+					return errors.New("readback changed plaintext")
+				}
+				activated = true
+				return nil
+			})
+			if err != nil || count != 2 || !activated {
+				t.Fatalf("migration: verified=%d activated=%t error=%v", count, activated, err)
+			}
+		}
+		if _, err := os.Stat(filepath.Join(home, "vault.key")); err != nil {
+			t.Fatal("migration removed source key", err)
+		}
+		cached := NewOSKeyProvider(home, ring)
+		before := ring.getCalls
+		first, err := cached.Key()
+		if err != nil {
+			t.Fatal(err)
+		}
+		second, err := cached.Key()
+		if err != nil || !bytes.Equal(first, second) || ring.getCalls != before+1 {
+			t.Fatal("cached provider queried the OS repeatedly", err)
+		}
+		clear(first)
+		third, err := cached.Key()
+		if err != nil || !bytes.Equal(second, third) {
+			t.Fatal("caller mutated cached key", err)
+		}
+		if _, err := NewOSKeyProvider(t.TempDir(), ring).Key(); err == nil {
+			t.Fatal("another home accessed the migrated key")
+		}
+	})
+	for _, failure := range []string{"locked", "readback", "ciphertext", "activation"} {
+		t.Run("Should preserve the source on "+failure+" failure", func(t *testing.T) {
+			t.Parallel()
+			home := t.TempDir()
+			fileKeys := NewFileKeyProvider(home, func(string) (string, bool) { return "", false })
+			original, err := fileKeys.Key()
+			if err != nil {
+				t.Fatal(err)
+			}
+			store := newMemoryVaultStore()
+			ring := &memoryKeyring{values: map[string]string{}}
+			switch failure {
+			case "locked":
+				ring.getErr = errors.New("locked private-payload-canary")
+			case "readback":
+				ring.corruptReadback = true
+			case "ciphertext":
+				store.records["vault:providers/custom/token"] = Record{
+					Ref:            "vault:providers/custom/token",
+					Kind:           "token",
+					EncryptedValue: "corrupt",
+				}
+			}
+			activated := false
+			_, err = MigrateToKeyring(t.Context(), home, store, ring, func() error {
+				if failure == "activation" {
+					return errors.New("config write failed")
+				}
+				activated = true
+				return nil
+			})
+			if err == nil || activated || len(ring.values) != 0 {
+				t.Fatalf(
+					"failed migration changed state: activated=%t entries=%d error=%v",
+					activated,
+					len(ring.values),
+					err,
+				)
+			}
+			if strings.Contains(err.Error(), "private-payload-canary") {
+				t.Fatal("keyring diagnostic leaked payload")
+			}
+			current, err := readKeyFile(filepath.Join(home, "vault.key"))
+			if err != nil || !bytes.Equal(original, current) {
+				t.Fatal("failed migration changed source key", err)
+			}
+		})
+	}
+}
+
+func (p staticKeyProvider) Key() ([]byte, error) {
+	return append([]byte(nil), p.key...), nil
+}
+
+type memoryVaultStore struct {
+	records map[string]Record
+}
+
+func newMemoryVaultStore() *memoryVaultStore {
+	return &memoryVaultStore{records: make(map[string]Record)}
+}
+
+func (s *memoryVaultStore) PutVaultSecret(_ context.Context, record Record) error {
+	if existing, ok := s.records[record.Ref]; ok {
+		record.CreatedAt = existing.CreatedAt
+	}
+	s.records[record.Ref] = record
+	return nil
+}
+
+func (s *memoryVaultStore) GetVaultSecret(_ context.Context, ref string) (Record, error) {
+	record, ok := s.records[NormalizeRef(ref)]
+	if !ok {
+		return Record{}, ErrSecretNotFound
+	}
+	return record, nil
+}
+
+func (s *memoryVaultStore) ListVaultSecrets(_ context.Context, prefix string) ([]Record, error) {
+	records := make([]Record, 0, len(s.records))
+	for ref, record := range s.records {
+		if RefMatchesPrefix(ref, prefix) {
+			records = append(records, record)
+		}
+	}
+	slices.SortFunc(records, func(a, b Record) int {
+		return strings.Compare(a.Ref, b.Ref)
+	})
+	return records, nil
+}
+
+func TestServicePutSecretReturnsPersistedMetadataAndPreservesKindOnRotation(t *testing.T) {
+	t.Parallel()
+
+	t.Run("Should preserve created timestamp and kind when rotating without kind", func(t *testing.T) {
+		t.Parallel()
+
+		ctx := t.Context()
+		store := newMemoryVaultStore()
+		current := time.Date(2026, 5, 2, 9, 0, 0, 0, time.UTC)
+		service, err := NewService(
+			store,
+			staticKeyProvider{key: []byte("01234567890123456789012345678901")},
+			WithNow(func() time.Time { return current }),
+		)
+		if err != nil {
+			t.Fatalf("NewService() error = %v", err)
+		}
+
+		ref := "vault:sessions/sess-1/github-token"
+		created, err := service.PutSecret(ctx, ref, "token", "first-secret-value")
+		if err != nil {
+			t.Fatalf("PutSecret(first) error = %v", err)
+		}
+
+		current = current.Add(time.Hour)
+		rotated, err := service.PutSecret(ctx, ref, "", "rotated-secret-value")
+		if err != nil {
+			t.Fatalf("PutSecret(rotated) error = %v", err)
+		}
+
+		if rotated.Kind != "token" {
+			t.Fatalf("rotated.Kind = %q, want preserved token kind", rotated.Kind)
+		}
+		if !rotated.CreatedAt.Equal(created.CreatedAt) {
+			t.Fatalf("rotated.CreatedAt = %v, want original %v", rotated.CreatedAt, created.CreatedAt)
+		}
+		if !rotated.UpdatedAt.Equal(current) {
+			t.Fatalf("rotated.UpdatedAt = %v, want %v", rotated.UpdatedAt, current)
+		}
+		resolved, err := service.ResolveRef(ctx, ref)
+		if err != nil {
+			t.Fatalf("ResolveRef(rotated) error = %v", err)
+		}
+		if resolved != "rotated-secret-value" {
+			t.Fatalf("ResolveRef(rotated) = %q, want rotated plaintext", resolved)
+		}
+	})
+}
+
+func (s *memoryVaultStore) DeleteVaultSecret(_ context.Context, ref string) error {
+	normalized := NormalizeRef(ref)
+	if _, ok := s.records[normalized]; !ok {
+		return ErrSecretNotFound
+	}
+	delete(s.records, normalized)
+	return nil
+}
+
+func TestServiceStoresEncryptedSecretsAndResolvesRefs(t *testing.T) {
+	t.Parallel()
+
+	t.Run("Should store encrypted vault value and resolve vault and env refs", func(t *testing.T) {
+		t.Parallel()
+
+		ctx := t.Context()
+		store := newMemoryVaultStore()
+		now := time.Date(2026, 5, 1, 12, 0, 0, 0, time.UTC)
+		service, err := NewService(
+			store,
+			staticKeyProvider{key: []byte("01234567890123456789012345678901")},
+			WithNow(func() time.Time { return now }),
+			WithLookupEnv(func(key string) (string, bool) {
+				if key == "OPENROUTER_API_KEY" {
+					return "env-secret-value", true
+				}
+				return "", false
+			}),
+		)
+		if err != nil {
+			t.Fatalf("NewService() error = %v", err)
+		}
+
+		metadata, err := service.PutSecret(
+			ctx,
+			"vault:providers/openrouter/api-key",
+			"api_key",
+			"vault-secret-value",
+		)
+		if err != nil {
+			t.Fatalf("PutSecret() error = %v", err)
+		}
+		if !metadata.Present || metadata.Ref != "vault:providers/openrouter/api-key" || metadata.Kind != "api_key" {
+			t.Fatalf("PutSecret() metadata = %#v, want present api_key metadata", metadata)
+		}
+		record := store.records["vault:providers/openrouter/api-key"]
+		if !strings.HasPrefix(record.EncryptedValue, encryptedPrefix) {
+			t.Fatalf("stored encrypted value = %q, want %q prefix", record.EncryptedValue, encryptedPrefix)
+		}
+		if strings.Contains(record.EncryptedValue, "vault-secret-value") {
+			t.Fatalf("stored encrypted value leaked plaintext: %q", record.EncryptedValue)
+		}
+
+		resolvedVault, err := service.ResolveRef(ctx, "vault:providers/openrouter/api-key")
+		if err != nil {
+			t.Fatalf("ResolveRef(vault) error = %v", err)
+		}
+		if resolvedVault != "vault-secret-value" {
+			t.Fatalf("ResolveRef(vault) = %q, want plaintext", resolvedVault)
+		}
+		resolvedEnv, err := service.ResolveRef(ctx, "env:OPENROUTER_API_KEY")
+		if err != nil {
+			t.Fatalf("ResolveRef(env) error = %v", err)
+		}
+		if resolvedEnv != "env-secret-value" {
+			t.Fatalf("ResolveRef(env) = %q, want env value", resolvedEnv)
+		}
+
+		listed, err := service.ListMetadata(ctx, "vault:providers/openrouter/")
+		if err != nil {
+			t.Fatalf("ListMetadata() error = %v", err)
+		}
+		if len(listed) != 1 || listed[0].Ref != metadata.Ref || !listed[0].Present {
+			t.Fatalf("ListMetadata() = %#v, want one redacted metadata row", listed)
+		}
+		if err := service.DeleteSecret(ctx, metadata.Ref); err != nil {
+			t.Fatalf("DeleteSecret() error = %v", err)
+		}
+		if _, err := service.ResolveRef(ctx, metadata.Ref); !errors.Is(err, ErrSecretNotFound) {
+			t.Fatalf("ResolveRef(deleted) error = %v, want ErrSecretNotFound", err)
+		}
+	})
+
+	t.Run("Should reject ciphertext moved to another ref or kind", func(t *testing.T) {
+		t.Parallel()
+
+		tests := []struct {
+			name       string
+			sourceRef  string
+			sourceKind string
+			tamper     func(Record) Record
+			resolveRef string
+		}{
+			{
+				name:       "Should reject another ref",
+				sourceRef:  "vault:providers/openrouter/api-key",
+				sourceKind: "api_key",
+				tamper: func(record Record) Record {
+					record.Ref = "vault:providers/other/api-key"
+					return record
+				},
+				resolveRef: "vault:providers/other/api-key",
+			},
+			{
+				name:       "Should reject another kind",
+				sourceRef:  "vault:providers/openrouter/api-key",
+				sourceKind: "api_key",
+				tamper: func(record Record) Record {
+					record.Kind = "refresh_token"
+					return record
+				},
+				resolveRef: "vault:providers/openrouter/api-key",
+			},
+			{
+				name:       "Should reject a ref and kind pair with ambiguous concatenation",
+				sourceRef:  "vault:providers/p/a",
+				sourceKind: "bc",
+				tamper: func(record Record) Record {
+					record.Ref = "vault:providers/p/ab"
+					record.Kind = "c"
+					return record
+				},
+				resolveRef: "vault:providers/p/ab",
+			},
+		}
+
+		for _, tc := range tests {
+			t.Run(tc.name, func(t *testing.T) {
+				t.Parallel()
+
+				store := newMemoryVaultStore()
+				service, err := NewService(
+					store,
+					staticKeyProvider{key: []byte("01234567890123456789012345678901")},
+				)
+				if err != nil {
+					t.Fatalf("NewService() error = %v", err)
+				}
+				if _, err := service.PutSecret(
+					t.Context(),
+					tc.sourceRef,
+					tc.sourceKind,
+					"bound-secret-value",
+				); err != nil {
+					t.Fatalf("PutSecret() error = %v", err)
+				}
+				tampered := tc.tamper(store.records[tc.sourceRef])
+				store.records[tampered.Ref] = tampered
+
+				value, err := service.ResolveRef(t.Context(), tc.resolveRef)
+				if err == nil {
+					t.Fatalf("ResolveRef() = %q, want authentication failure", value)
+				}
+				if strings.Contains(err.Error(), "bound-secret-value") {
+					t.Fatalf("ResolveRef() error leaked plaintext: %v", err)
+				}
+			})
+		}
+	})
+}
+
+func TestServiceRejectsUnsupportedAndMissingSecretRefs(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name string
+		run  func(*Service) error
+		want error
+	}{
+		{
+			name: "Should reject storing env refs",
+			run: func(service *Service) error {
+				_, err := service.PutSecret(t.Context(), "env:OPENROUTER_API_KEY", "api_key", "secret")
+				return err
+			},
+			want: ErrUnsupportedSecretRef,
+		},
+		{
+			name: "Should reject unsupported refs",
+			run: func(service *Service) error {
+				_, err := service.ResolveRef(t.Context(), "file:/tmp/secret")
+				return err
+			},
+			want: ErrUnsupportedSecretRef,
+		},
+		{
+			name: "Should report missing env refs",
+			run: func(service *Service) error {
+				_, err := service.ResolveRef(t.Context(), "env:MISSING_API_KEY")
+				return err
+			},
+			want: ErrMissingSecret,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			service, err := NewService(
+				newMemoryVaultStore(),
+				staticKeyProvider{key: []byte("01234567890123456789012345678901")},
+				WithLookupEnv(func(string) (string, bool) { return "", false }),
+			)
+			if err != nil {
+				t.Fatalf("NewService() error = %v", err)
+			}
+			if err := tc.run(service); !errors.Is(err, tc.want) {
+				t.Fatalf("service operation error = %v, want %v", err, tc.want)
+			}
+		})
+	}
+}
+
+func TestSecretRefValidationSupportsSessionNamespace(t *testing.T) {
+	t.Parallel()
+
+	t.Run("Should accept session vault refs and return sessions namespace", func(t *testing.T) {
+		t.Parallel()
+
+		ref := "vault:sessions/sess-1/github-token"
+		if err := ValidateSecretRef(ref); err != nil {
+			t.Fatalf("ValidateSecretRef() error = %v", err)
+		}
+		namespace, err := SecretRefNamespace(ref)
+		if err != nil {
+			t.Fatalf("SecretRefNamespace() error = %v", err)
+		}
+		if namespace != "sessions" {
+			t.Fatalf("SecretRefNamespace() = %q, want sessions", namespace)
+		}
+	})
+
+	t.Run("Should accept session vault prefixes and return sessions namespace", func(t *testing.T) {
+		t.Parallel()
+
+		prefix := "vault:sessions/sess-1/"
+		if err := ValidateSecretRefPrefix(prefix); err != nil {
+			t.Fatalf("ValidateSecretRefPrefix() error = %v", err)
+		}
+		namespace, err := SecretRefPrefixNamespace(prefix)
+		if err != nil {
+			t.Fatalf("SecretRefPrefixNamespace() error = %v", err)
+		}
+		if namespace != "sessions" {
+			t.Fatalf("SecretRefPrefixNamespace() = %q, want sessions", namespace)
+		}
+	})
+
+	t.Run("Should accept profile credential refs and return profiles namespace [UT-035]", func(t *testing.T) {
+		t.Parallel()
+
+		ref := "vault:profiles/marketing/providers/openai/api_key"
+		if err := ValidateSecretRef(ref); err != nil {
+			t.Fatalf("ValidateSecretRef() error = %v", err)
+		}
+		namespace, err := SecretRefNamespace(ref)
+		if err != nil {
+			t.Fatalf("SecretRefNamespace() error = %v", err)
+		}
+		if namespace != "profiles" {
+			t.Fatalf("SecretRefNamespace() = %q, want profiles", namespace)
+		}
+	})
+
+	t.Run("Should match exact refs or slash-delimited children for prefixes", func(t *testing.T) {
+		t.Parallel()
+
+		if !RefMatchesPrefix("vault:sessions/sess-1/github-token", "vault:sessions/sess-1") {
+			t.Fatal("RefMatchesPrefix() should match slash-delimited session children")
+		}
+		if RefMatchesPrefix("vault:sessions/sess-10/github-token", "vault:sessions/sess-1") {
+			t.Fatal("RefMatchesPrefix() matched sibling session prefix")
+		}
+	})
+
+	t.Run("Should reject unsupported vault namespaces", func(t *testing.T) {
+		t.Parallel()
+
+		for _, namespace := range []string{"unknown", "bridges", "sandbox"} {
+			if err := ValidateNamespace(namespace); !errors.Is(err, ErrUnsupportedSecretRef) {
+				t.Fatalf("ValidateNamespace(%q) error = %v, want ErrUnsupportedSecretRef", namespace, err)
+			}
+			ref := "vault:" + namespace + "/owner/token"
+			if err := ValidateSecretRef(ref); !errors.Is(err, ErrUnsupportedSecretRef) {
+				t.Fatalf("ValidateSecretRef(%q) error = %v, want ErrUnsupportedSecretRef", ref, err)
+			}
+			prefix := "vault:" + namespace + "/owner/"
+			if err := ValidateSecretRefPrefix(prefix); !errors.Is(err, ErrUnsupportedSecretRef) {
+				t.Fatalf("ValidateSecretRefPrefix(%q) error = %v, want ErrUnsupportedSecretRef", prefix, err)
+			}
+		}
+	})
+}
+
+func TestFileKeyProviderLoadsEnvAndCreatesKeyFile(t *testing.T) {
+	t.Parallel()
+
+	t.Run("Should load supported COMPOZY_VAULT_KEY encodings", func(t *testing.T) {
+		t.Parallel()
+
+		rawKey := "01234567890123456789012345678901"
+		tests := []struct {
+			name  string
+			value string
+		}{
+			{name: "Should load raw key", value: rawKey},
+			{name: "Should load base64 key", value: base64.StdEncoding.EncodeToString([]byte(rawKey))},
+			{name: "Should load hex key", value: hex.EncodeToString([]byte(rawKey))},
+		}
+
+		for _, tc := range tests {
+			t.Run(tc.name, func(t *testing.T) {
+				t.Parallel()
+
+				provider := NewFileKeyProvider(t.TempDir(), func(key string) (string, bool) {
+					if key == "COMPOZY_VAULT_KEY" {
+						return tc.value, true
+					}
+					return "", false
+				})
+				got, err := provider.Key()
+				if err != nil {
+					t.Fatalf("Key() error = %v", err)
+				}
+				if string(got) != rawKey {
+					t.Fatalf("Key() = %q, want raw key bytes", string(got))
+				}
+			})
+		}
+	})
+
+	t.Run("Should create and reuse daemon key file with restricted permissions", func(t *testing.T) {
+		t.Parallel()
+
+		homeDir := filepath.Join(t.TempDir(), "compozy-home")
+		provider := NewFileKeyProvider(homeDir, func(string) (string, bool) { return "", false })
+		first, err := provider.Key()
+		if err != nil {
+			t.Fatalf("Key(first) error = %v", err)
+		}
+		if len(first) != keySizeBytes {
+			t.Fatalf("Key(first) length = %d, want %d", len(first), keySizeBytes)
+		}
+		info, err := os.Stat(filepath.Join(homeDir, "vault.key"))
+		if err != nil {
+			t.Fatalf("Stat(vault.key) error = %v", err)
+		}
+		if got := info.Mode().Perm(); got != 0o600 {
+			t.Fatalf("vault.key permissions = %o, want 0600", got)
+		}
+		dirInfo, err := os.Stat(homeDir)
+		if err != nil {
+			t.Fatalf("Stat(homeDir) error = %v", err)
+		}
+		if got := dirInfo.Mode().Perm(); got != 0o700 {
+			t.Fatalf("homeDir permissions = %o, want 0700", got)
+		}
+
+		second, err := provider.Key()
+		if err != nil {
+			t.Fatalf("Key(second) error = %v", err)
+		}
+		if !bytes.Equal(second, first) {
+			t.Fatalf("Key(second) = %x, want reused key %x", second, first)
+		}
+	})
+
+	t.Run("Should tighten preexisting key directory before creating daemon key file", func(t *testing.T) {
+		t.Parallel()
+
+		homeDir := filepath.Join(t.TempDir(), "compozy-home")
+		if err := os.MkdirAll(homeDir, 0o755); err != nil {
+			t.Fatalf("MkdirAll(homeDir) error = %v", err)
+		}
+		if err := os.Chmod(homeDir, 0o755); err != nil {
+			t.Fatalf("Chmod(homeDir) error = %v", err)
+		}
+
+		provider := NewFileKeyProvider(homeDir, func(string) (string, bool) { return "", false })
+		if _, err := provider.Key(); err != nil {
+			t.Fatalf("Key() error = %v", err)
+		}
+
+		info, err := os.Stat(homeDir)
+		if err != nil {
+			t.Fatalf("Stat(homeDir) error = %v", err)
+		}
+		if got := info.Mode().Perm(); got != 0o700 {
+			t.Fatalf("homeDir permissions = %#o, want %#o", got, os.FileMode(0o700))
+		}
+	})
+
+	t.Run("Should reject preexisting key files with group or other permissions", func(t *testing.T) {
+		t.Parallel()
+
+		homeDir := filepath.Join(t.TempDir(), "compozy-home")
+		keyPath := filepath.Join(homeDir, "vault.key")
+		if err := os.MkdirAll(homeDir, 0o700); err != nil {
+			t.Fatalf("MkdirAll(%q) error = %v", homeDir, err)
+		}
+		rawKey := []byte("01234567890123456789012345678901")
+		if err := os.WriteFile(keyPath, []byte(base64.StdEncoding.EncodeToString(rawKey)+"\n"), 0o644); err != nil {
+			t.Fatalf("WriteFile(%q) error = %v", keyPath, err)
+		}
+
+		provider := NewFileKeyProvider(homeDir, func(string) (string, bool) { return "", false })
+		key, err := provider.Key()
+		if err == nil {
+			t.Fatalf("Key() error = nil with key %x, want permission rejection", key)
+		}
+		if !strings.Contains(err.Error(), "must not grant group or other permissions") {
+			t.Fatalf("Key() error = %q, want permission guidance", err)
+		}
+	})
+
+	t.Run("Should reject preexisting key symlinks", func(t *testing.T) {
+		t.Parallel()
+
+		homeDir := filepath.Join(t.TempDir(), "compozy-home")
+		if err := os.MkdirAll(homeDir, 0o700); err != nil {
+			t.Fatalf("MkdirAll(%q) error = %v", homeDir, err)
+		}
+		targetPath := filepath.Join(homeDir, "target.key")
+		rawKey := []byte("01234567890123456789012345678901")
+		if err := os.WriteFile(targetPath, []byte(base64.StdEncoding.EncodeToString(rawKey)+"\n"), 0o600); err != nil {
+			t.Fatalf("WriteFile(%q) error = %v", targetPath, err)
+		}
+		keyPath := filepath.Join(homeDir, "vault.key")
+		if err := os.Symlink(targetPath, keyPath); err != nil {
+			t.Fatalf("Symlink(%q, %q) error = %v", targetPath, keyPath, err)
+		}
+
+		provider := NewFileKeyProvider(homeDir, func(string) (string, bool) { return "", false })
+		key, err := provider.Key()
+		if err == nil {
+			t.Fatalf("Key() error = nil with key %x, want symlink rejection", key)
+		}
+		if !strings.Contains(err.Error(), "must not be a symlink") {
+			t.Fatalf("Key() error = %q, want symlink guidance", err)
+		}
+	})
+
+	t.Run("Should return the persisted key for concurrent first-use callers", func(t *testing.T) {
+		t.Parallel()
+
+		homeDir := filepath.Join(t.TempDir(), "compozy-home")
+		const workers = 128
+		start := make(chan struct{})
+		results := make([][]byte, workers)
+		errs := make([]error, workers)
+		var wait sync.WaitGroup
+		wait.Add(workers)
+		for idx := range workers {
+			go func() {
+				defer wait.Done()
+				<-start
+				provider := NewFileKeyProvider(homeDir, func(string) (string, bool) { return "", false })
+				results[idx], errs[idx] = provider.Key()
+			}()
+		}
+		close(start)
+		wait.Wait()
+
+		for idx, err := range errs {
+			if err != nil {
+				t.Fatalf("Key(worker %d) error = %v", idx, err)
+			}
+		}
+		payload, err := os.ReadFile(filepath.Join(homeDir, "vault.key"))
+		if err != nil {
+			t.Fatalf("ReadFile(vault.key) error = %v", err)
+		}
+		persisted, err := decodeKey(strings.TrimSpace(string(payload)))
+		if err != nil {
+			t.Fatalf("decodeKey(vault.key) error = %v", err)
+		}
+		for idx, result := range results {
+			if !bytes.Equal(result, persisted) {
+				t.Fatalf("Key(worker %d) = %x, want persisted key %x", idx, result, persisted)
+			}
+		}
+	})
+}
+
+func TestDecryptValueRejectsMalformedPayloads(t *testing.T) {
+	t.Parallel()
+	identity, err := newCiphertextIdentity("vault:providers/openrouter/api-key", "api_key")
+	if err != nil {
+		t.Fatalf("newCiphertextIdentity() error = %v", err)
+	}
+
+	tests := []struct {
+		name      string
+		encrypted string
+	}{
+		{name: "Should reject missing prefix", encrypted: "not-encrypted"},
+		{name: "Should reject unversioned ciphertext", encrypted: "aes-gcm:obsolete"},
+		{name: "Should reject invalid base64", encrypted: encryptedPrefix + "%%%"},
+		{
+			name:      "Should reject truncated ciphertext",
+			encrypted: encryptedPrefix + base64.StdEncoding.EncodeToString([]byte("short")),
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			if _, err := decryptValue(
+				[]byte("01234567890123456789012345678901"),
+				tc.encrypted,
+				identity,
+			); err == nil {
+				t.Fatalf("decryptValue(%q) error = nil, want malformed payload failure", tc.encrypted)
+			}
+		})
+	}
+}

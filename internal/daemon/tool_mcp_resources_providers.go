@@ -1,0 +1,188 @@
+package daemon
+
+import (
+	"context"
+
+	"fmt"
+	"log/slog"
+	"slices"
+	"strings"
+
+	compozyconfig "github.com/compozy/compozy/internal/config"
+	extensionpkg "github.com/compozy/compozy/internal/extension"
+	"github.com/compozy/compozy/internal/extensioninput"
+	"github.com/compozy/compozy/internal/resources"
+
+	workspacepkg "github.com/compozy/compozy/internal/workspace"
+)
+
+func daemonConfigMCPDeclarationProvider(
+	cfg *compozyconfig.Config,
+	homePaths compozyconfig.HomePaths,
+	registry workspaceRegistryReader,
+	workspaceResolver workspacepkg.RuntimeResolver,
+	logger *slog.Logger,
+) toolMCPConfigDeclarationProvider {
+	return func(ctx context.Context, override *compozyconfig.Config) (toolMCPDesiredResources, error) {
+		desired := toolMCPDesiredResources{}
+		active := cfg
+		if override != nil {
+			active = override
+		}
+		if active == nil {
+			return desired, nil
+		}
+		userScope := resources.ResourceScope{Kind: resources.ResourceScopeKindUser}
+		for _, server := range active.MCPServers {
+			desired.mcpServers = append(desired.mcpServers, mcpServerPublicationInput{
+				sourceKey: "config/global/" + strings.TrimSpace(server.Name),
+				scope:     userScope,
+				spec:      cloneDaemonMCPServer(server),
+			})
+		}
+
+		workspaces, err := registeredWorkspaces(ctx, registry, workspaceResolver, logger)
+		if err != nil {
+			return toolMCPDesiredResources{}, err
+		}
+		for idx := range workspaces {
+			resolved := &workspaces[idx]
+			scope := resources.ResourceScope{
+				Kind: resources.ResourceScopeKindWorkspace,
+				ID:   strings.TrimSpace(resolved.ID),
+			}
+			// The resolved config merges user and profile layers; publish only servers the
+			// workspace declares so inherited servers keep their declaring scope as OAuth owner.
+			declared, err := compozyconfig.WorkspaceDeclaredMCPServerNames(homePaths, resolved.RootDir)
+			if err != nil {
+				// One unreadable workspace must not block every other publication; keep what
+				// it already published until its declarations read again.
+				if logger != nil {
+					logger.WarnContext(ctx, "daemon: workspace MCP declarations unavailable; keeping published servers",
+						"workspace_id", scope.ID, "error", err)
+				}
+				desired.heldMCPScopes = append(desired.heldMCPScopes, scope)
+				continue
+			}
+			for _, server := range resolved.Config.MCPServers {
+				if _, ok := declared[strings.TrimSpace(server.Name)]; !ok {
+					continue
+				}
+				desired.mcpServers = append(desired.mcpServers, mcpServerPublicationInput{
+					sourceKey: "config/workspace/" + scope.ID + "/" + strings.TrimSpace(server.Name),
+					scope:     scope,
+					spec:      cloneDaemonMCPServer(server),
+				})
+			}
+		}
+
+		return desired, nil
+	}
+}
+
+func extensionManifestToolMCPDeclarationProvider(
+	registry *extensionpkg.Registry,
+	runtime func() extensionRuntime,
+	getenv func(string) string,
+	profiles extensionProfileCatalog,
+	inputs extensionInputReader,
+) toolMCPDeclarationProvider {
+	return func(ctx context.Context) (toolMCPDesiredResources, error) {
+		return collectExtensionManifestToolMCPDeclarations(ctx, registry, runtime, getenv, profiles, inputs)
+	}
+}
+
+func collectExtensionManifestToolMCPDeclarations(
+	ctx context.Context,
+	registry *extensionpkg.Registry,
+	runtime func() extensionRuntime,
+	getenv func(string) string,
+	profiles extensionProfileCatalog,
+	inputs extensionInputReader,
+) (toolMCPDesiredResources, error) {
+	if err := ctx.Err(); err != nil {
+		return toolMCPDesiredResources{}, err
+	}
+	if registry == nil || runtime == nil {
+		return toolMCPDesiredResources{}, nil
+	}
+	manager := runtime()
+	if manager == nil {
+		return toolMCPDesiredResources{}, nil
+	}
+
+	infos, err := registry.List()
+	if err != nil {
+		return toolMCPDesiredResources{}, fmt.Errorf("daemon: list extensions for tool/mcp sync: %w", err)
+	}
+	slices.SortFunc(infos, func(left, right extensionpkg.ExtensionInfo) int {
+		return strings.Compare(left.Name, right.Name)
+	})
+
+	desired := toolMCPDesiredResources{}
+	snapshots, err := extensionProfileResourceSnapshots(ctx, registry, manager, infos, profiles)
+	if err != nil {
+		return toolMCPDesiredResources{}, err
+	}
+	for _, snapshot := range snapshots {
+		ext := snapshot.extension
+		if ext == nil || ext.Manifest == nil || !ext.Status.Registered {
+			continue
+		}
+
+		tools, err := extensionpkg.ResolveManifestToolResources(ext.Manifest)
+		if err != nil {
+			return toolMCPDesiredResources{}, fmt.Errorf(
+				"daemon: resolve extension %q tools: %w",
+				ext.Info.Name,
+				err,
+			)
+		}
+		for _, tool := range tools {
+			desired.tools = append(desired.tools, toolPublicationInput{
+				sourceKey: "extension/" + ext.Info.Name + "/tool/" + strings.TrimSpace(tool.ID.String()),
+				scope:     snapshot.scope,
+				owner:     extensionOwner(ext.Info.Name),
+				spec:      cloneToolSpec(tool),
+			})
+		}
+
+		inputState, err := inputs.load(ctx, extensioninput.Instance{
+			Extension: ext.Info.Name, ProfileID: snapshot.profileID, WorkspaceID: ext.Status.WorkspaceID,
+		}, ext.Manifest)
+		if err != nil {
+			return toolMCPDesiredResources{}, err
+		}
+		readiness := extensionpkg.InputReadiness(ext.Manifest, inputState, getenv)
+		if len(ext.Manifest.Inputs) > 0 && (len(readiness.MissingInputs) > 0 || len(readiness.MissingEnv) > 0) {
+			continue
+		}
+		if err := appendExtensionMCPServerDeclarations(&desired, ext, inputState, getenv, snapshot.scope); err != nil {
+			return toolMCPDesiredResources{}, err
+		}
+	}
+
+	return desired, nil
+}
+
+func appendExtensionMCPServerDeclarations(
+	desired *toolMCPDesiredResources,
+	ext *extensionpkg.Extension,
+	inputState extensionpkg.InputState,
+	getenv func(string) string,
+	scope resources.ResourceScope,
+) error {
+	servers, err := extensionpkg.ResolveManifestMCPServerResources(ext.RootDir, ext.Manifest, inputState, getenv)
+	if err != nil {
+		return fmt.Errorf("daemon: resolve extension %q mcp servers: %w", ext.Info.Name, err)
+	}
+	for _, server := range servers {
+		desired.mcpServers = append(desired.mcpServers, mcpServerPublicationInput{
+			sourceKey: "extension/" + ext.Info.Name + "/mcp_server/" + strings.TrimSpace(server.Name),
+			scope:     scope,
+			owner:     extensionOwner(ext.Info.Name),
+			spec:      cloneDaemonMCPServer(server.MCPServer),
+		})
+	}
+	return nil
+}

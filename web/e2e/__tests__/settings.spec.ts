@@ -1,0 +1,848 @@
+import { mkdtemp } from "node:fs/promises";
+import os from "node:os";
+import path from "node:path";
+import process from "node:process";
+
+import { reloadDaemonServedPage } from "../fixtures/navigation";
+import { appWindow, switchWorkspace } from "../fixtures/os-navigation";
+import { settingsOperatorSelectors, sessionLifecycleSelectors } from "../fixtures/selectors";
+import {
+  browserSettingsOperatorFlowScenario,
+  cleanupBrowserSettingsFixtures,
+  seedBrowserSettingsFixtures,
+} from "../fixtures/runtime";
+import { expect, test } from "../fixtures/test";
+import { ensureProjectWorkspace, completeOnboardingIfPrompted } from "../fixtures/workspace";
+import {
+  settingsUpdateApplyingFixture,
+  settingsUpdateBothAvailableFixture,
+  settingsUpdateRolledBackFixture,
+} from "@/systems/settings/mocks/settings-update-fixture";
+
+/** Host-install shapes the update projection can report, shared by the update journeys. */
+const updateFixtures = {
+  bothAvailable: settingsUpdateBothAvailableFixture,
+  applying: settingsUpdateApplyingFixture,
+  rolledBack: settingsUpdateRolledBackFixture,
+} as const;
+
+test.use({
+  runtimeOptions: {
+    env: {
+      ...process.env,
+      COMPOZY_TEST_TELEGRAM_TOKEN: "telegram-bot-token",
+    },
+    extensionsAllowUnverified: true,
+  },
+});
+
+test("operator can navigate the settings shell and complete a restart-aware general save that survives refresh polling", async ({
+  appPage,
+  browserArtifacts,
+  runtime,
+}) => {
+  const sessionUI = sessionLifecycleSelectors(appPage);
+
+  await ensureProjectWorkspace(appPage, runtime);
+  await completeOnboardingIfPrompted(sessionUI);
+  await appPage.goto(runtime.url("/settings/general"), { waitUntil: "domcontentloaded" });
+  const settingsWin = appWindow(appPage, "settings");
+  await expect(settingsWin).toBeVisible({ timeout: 20_000 });
+  const settingsUI = settingsOperatorSelectors(settingsWin);
+  await expect(settingsUI.shell.shell).toBeVisible({ timeout: 20_000 });
+  await expect(settingsUI.shell.sectionNav).toBeVisible({ timeout: 20_000 });
+
+  await expect
+    .poll(async () => normalizeTexts(await settingsUI.shell.sectionItems.allTextContents()))
+    .toEqual([
+      "General",
+      "Terminal",
+      "Appearance",
+      "Layouts",
+      "Profiles",
+      "Providers",
+      "Provider usage",
+      "Palette",
+      "Notifications",
+      "Diagnostics",
+      "Roles",
+      "Skills",
+      "MCP servers",
+      "Automation",
+      "Remote access",
+      "Hooks",
+      "Extensions",
+      "Marketplace",
+    ]);
+
+  await expect.poll(() => new URL(appPage.url()).pathname).toBe("/settings/general");
+  await expect(settingsUI.shell.sectionLink("general")).toHaveAttribute("aria-current", "page");
+  await expect(settingsUI.general.page).toBeVisible();
+
+  await settingsUI.shell.sectionLink("automation").click();
+  await expect.poll(() => new URL(appPage.url()).pathname).toBe("/settings/automation");
+  await expect(settingsUI.shell.sectionLink("automation")).toHaveAttribute("aria-current", "page");
+
+  await settingsUI.shell.sectionLink("hooks").click();
+  await expect.poll(() => new URL(appPage.url()).pathname).toBe("/settings/hooks");
+  await expect(settingsUI.shell.sectionActive("hooks")).toBeVisible();
+
+  await settingsUI.shell.sectionLink("extensions").click();
+  await expect.poll(() => new URL(appPage.url()).pathname).toBe("/settings/extensions");
+  await expect(settingsUI.shell.sectionActive("extensions")).toBeVisible();
+
+  await appPage.goBack({ waitUntil: "domcontentloaded" });
+  await expect.poll(() => new URL(appPage.url()).pathname).toBe("/settings/hooks");
+  await appPage.goForward({ waitUntil: "domcontentloaded" });
+  await expect.poll(() => new URL(appPage.url()).pathname).toBe("/settings/extensions");
+
+  await settingsUI.shell.sectionLink("general").click();
+  await expect.poll(() => new URL(appPage.url()).pathname).toBe("/settings/general");
+  await expect(settingsUI.general.page).toBeVisible();
+
+  const nextIdleRelease = await nextIdleReleaseValue(settingsUI.general.idleReleaseInput);
+  await settingsUI.general.idleReleaseInput.selectOption(nextIdleRelease);
+  await expect(settingsUI.general.saveButton).toBeEnabled();
+  await settingsUI.general.saveButton.click();
+
+  await expect(settingsUI.general.restartNotice).toBeVisible();
+  await expect(settingsUI.general.restartNotice).toContainText("Restart needed");
+  await expect(settingsUI.general.restartTrigger).toBeVisible();
+  await browserArtifacts.captureScreenshot("tc-func-001-settings-shell-navigation", appPage);
+
+  const restartResponse = appPage.waitForResponse(
+    response =>
+      new URL(response.url()).pathname === "/api/settings/actions/restart" &&
+      response.request().method() === "POST"
+  );
+  await settingsUI.general.restartTrigger.click();
+  const operationID = ((await (await restartResponse).json()) as { operation_id: string })
+    .operation_id;
+  expect(operationID).toMatch(/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i);
+
+  await expect(settingsUI.general.restartNotice).toContainText("Restarting…");
+  await browserArtifacts.captureScreenshot("tc-func-002-general-restart-polling", appPage);
+
+  await reloadDaemonServedPage(appPage, runtime, "/settings/general", {
+    readyTestId: "settings-page-general",
+  });
+  if (!(await settingsUI.general.restartNotice.isVisible().catch(() => false))) {
+    const payload = await runtime.requestJSON<{ status: string }>(
+      `/api/settings/actions/restart/${encodeURIComponent(operationID)}`
+    );
+    expect(payload.status).toBe("ready");
+  }
+
+  await expect
+    .poll(
+      async () => {
+        try {
+          const payload = await runtime.requestJSON<{ status: string }>(
+            `/api/settings/actions/restart/${encodeURIComponent(operationID)}`
+          );
+          return payload.status;
+        } catch {
+          return "unavailable";
+        }
+      },
+      {
+        timeout: 45_000,
+      }
+    )
+    .toBe("ready");
+
+  if (await settingsUI.general.restartNotice.isVisible().catch(() => false)) {
+    await expect(settingsUI.general.restartNotice).toContainText("Restarted");
+  }
+  await browserArtifacts.captureScreenshot("tc-int-016-general-restart-ready", appPage);
+});
+
+test("Herdr E2E-018 / E2E-017: Terminal preset lifecycle and shortcut alternates update the live cheatsheet", async ({
+  appPage,
+  runtime,
+}) => {
+  await test.step("Terminal preset previews, applies, reverts, and re-applies idempotently", async () => {
+    const sessionUI = sessionLifecycleSelectors(appPage);
+    const workspaceRoot = await mkdtemp(path.join(os.tmpdir(), "compozy-shortcuts-preset-"));
+    const workspace = await runtime.resolveWorkspace(workspaceRoot);
+    const before = await runtime.requestJSON<{
+      config: { shortcuts: Record<string, string[]> } & Record<string, unknown>;
+    }>("/api/settings/window-manager");
+
+    try {
+      await ensureProjectWorkspace(appPage, runtime);
+      await completeOnboardingIfPrompted(sessionUI);
+      await appPage.goto(runtime.url("/"), { waitUntil: "domcontentloaded" });
+      await switchWorkspace(appPage, workspace.id, workspace.name);
+      await appPage.goto(runtime.url("/settings/layouts"), { waitUntil: "domcontentloaded" });
+
+      const settingsWin = appWindow(appPage, "settings");
+      await expect(settingsWin.getByTestId("settings-page-layouts")).toBeVisible({
+        timeout: 20_000,
+      });
+      const preset = settingsWin.getByTestId("terminal-shortcut-preset");
+      await preset.getByRole("button", { name: "Preview" }).click();
+      await expect(preset).toContainText("window.tab.jump");
+      await expect(preset).toContainText("desktop.switch");
+      await expect(preset).toContainText(/[⌘⌃]1–8/u);
+      await expect(preset).toContainText(/[⌘⌃]1–9/u);
+      await expect(preset).toContainText("Control+Alt can alias AltGr");
+
+      const firstApplyResponse = appPage.waitForResponse(
+        response =>
+          new URL(response.url()).pathname === "/api/settings/window-manager" &&
+          response.request().method() === "PATCH"
+      );
+      await preset.getByRole("button", { name: "Apply preset" }).click();
+      expect((await firstApplyResponse).ok()).toBe(true);
+      await expect(preset).toContainText("Applied");
+      await expect(preset.getByRole("button", { name: "Revert" })).toBeVisible();
+      const revertResponse = appPage.waitForResponse(
+        response =>
+          new URL(response.url()).pathname === "/api/settings/window-manager" &&
+          response.request().method() === "PATCH"
+      );
+      await preset.getByRole("button", { name: "Revert" }).click();
+      expect((await revertResponse).ok()).toBe(true);
+      await expect(settingsWin.getByTestId("settings-page-layouts-save-bar")).toHaveCount(0);
+
+      await preset.getByRole("button", { name: "Preview" }).click();
+      const saveResponse = appPage.waitForResponse(
+        response =>
+          new URL(response.url()).pathname === "/api/settings/window-manager" &&
+          response.request().method() === "PATCH"
+      );
+      await preset.getByRole("button", { name: "Apply preset" }).click();
+      expect((await saveResponse).ok()).toBe(true);
+
+      await appPage.goto(runtime.url("/settings/general"), { waitUntil: "domcontentloaded" });
+      await appPage.goto(runtime.url("/settings/layouts"), { waitUntil: "domcontentloaded" });
+      await preset.getByRole("button", { name: "Preview" }).click();
+      await expect(preset.getByRole("button", { name: "Apply preset" })).toBeDisabled();
+    } finally {
+      await runtime.requestJSON("/api/settings/window-manager", {
+        method: "PATCH",
+        body: JSON.stringify({ config: before.config }),
+      });
+    }
+  });
+
+  await test.step("Shortcut alternates persist and refresh the live cheatsheet", async () => {
+    const sessionUI = sessionLifecycleSelectors(appPage);
+    const workspaceRoot = await mkdtemp(path.join(os.tmpdir(), "compozy-shortcuts-settings-"));
+    const workspace = await runtime.resolveWorkspace(workspaceRoot);
+
+    await ensureProjectWorkspace(appPage, runtime);
+    await completeOnboardingIfPrompted(sessionUI);
+    await appPage.goto(runtime.url("/"), { waitUntil: "domcontentloaded" });
+    await switchWorkspace(appPage, workspace.id, workspace.name);
+    await appPage.goto(runtime.url("/settings/layouts"), { waitUntil: "domcontentloaded" });
+
+    const settingsWin = appWindow(appPage, "settings");
+    await expect(settingsWin.getByTestId("settings-page-layouts")).toBeVisible({ timeout: 20_000 });
+
+    const newTab = settingsWin.getByTestId("window-manager-shortcut-window.tab.new");
+    await newTab.getByRole("button", { name: "Add an alternate shortcut for New tab" }).click();
+    const saveResponse = appPage.waitForResponse(
+      response =>
+        new URL(response.url()).pathname === "/api/settings/window-manager" &&
+        response.request().method() === "PATCH"
+    );
+    await appPage.keyboard.press("Alt+r");
+    expect((await saveResponse).ok()).toBe(true);
+    await expect(newTab).toContainText("⌥R");
+
+    await appPage.keyboard.press("Shift+/");
+    const cheatsheet = appPage.getByTestId("os-shortcuts-dialog");
+    await expect(cheatsheet).toBeVisible();
+    await expect(cheatsheet.getByTestId("os-shortcut-row-window.tab.new")).toContainText("⌥R");
+    await appPage.keyboard.press("Escape");
+
+    await newTab.getByRole("button", { name: "New tab shortcut" }).click();
+    await appPage.keyboard.press("Control+Alt+ArrowLeft");
+    const conflict = settingsWin.getByTestId("shortcut-conflict-window.tab.new");
+    await expect(conflict).toContainText("⌃⌥← is already used by Tile left half");
+    await expect(conflict).toContainText("Overwriting leaves Tile left half unbound.");
+    await expect(conflict.getByRole("button", { name: "Overwrite" })).toBeVisible();
+    await expect(conflict.getByRole("button", { name: "Cancel" })).toBeVisible();
+    await expect(settingsWin.getByTestId("window-manager-shortcut-sidebar.toggle")).toContainText(
+      "Shadowed"
+    );
+    const resetResponse = appPage.waitForResponse(
+      response =>
+        new URL(response.url()).pathname === "/api/settings/window-manager" &&
+        response.request().method() === "PATCH"
+    );
+    await newTab.getByRole("button", { name: "Reset New tab to its default shortcut" }).click();
+    expect((await resetResponse).ok()).toBe(true);
+  });
+});
+
+test("operator can distinguish skills actions that apply now from policy changes that require restart", async ({
+  appPage,
+  browserArtifacts,
+  runtime,
+}) => {
+  const sessionUI = sessionLifecycleSelectors(appPage);
+  const seeded = await seedBrowserSettingsFixtures(runtime, {
+    disabledSkills: [browserSettingsOperatorFlowScenario.skills.disabledSkill],
+  });
+
+  try {
+    await ensureProjectWorkspace(appPage, runtime);
+    await completeOnboardingIfPrompted(sessionUI);
+    await appPage.goto(runtime.url("/settings/skills"), { waitUntil: "domcontentloaded" });
+    const settingsWin = appWindow(appPage, "settings");
+    await expect(settingsWin).toBeVisible({ timeout: 20_000 });
+    const settingsUI = settingsOperatorSelectors(settingsWin);
+
+    await expect(settingsUI.skills.page).toBeVisible();
+    await expect(settingsUI.skills.disabledList).toBeVisible();
+    await expect(
+      settingsUI.skills.disabledToggle(browserSettingsOperatorFlowScenario.skills.disabledSkill)
+    ).toBeVisible();
+
+    await settingsUI.skills
+      .disabledToggle(browserSettingsOperatorFlowScenario.skills.disabledSkill)
+      .click();
+    await expect(settingsUI.skills.disabledSave).toBeEnabled();
+    await settingsUI.skills.disabledSave.click();
+
+    await expect(settingsUI.skills.disabledMessage).toContainText("applied immediately");
+    await expect(settingsUI.skills.restartNotice).not.toBeVisible();
+
+    await settingsWin.getByTestId("settings-page-skills-enabled-switch").click();
+    await expect(settingsUI.skills.save).toBeEnabled();
+    await settingsUI.skills.save.click();
+
+    await expect(settingsUI.skills.restartNotice).toBeVisible();
+    await expect(settingsUI.skills.restartNotice).toContainText("Restart needed");
+    await browserArtifacts.captureScreenshot("tc-func-005-skills-applied-now-vs-restart", appPage);
+  } finally {
+    await cleanupBrowserSettingsFixtures(runtime, seeded);
+  }
+});
+
+test("operator can replace a builtin provider with a config overlay and delete it back to builtin fallback", async ({
+  appPage,
+  browserArtifacts,
+  runtime,
+}) => {
+  const sessionUI = sessionLifecycleSelectors(appPage);
+  const builtinProviderName = await pickBuiltinProviderName(runtime);
+
+  await ensureProjectWorkspace(appPage, runtime);
+  await completeOnboardingIfPrompted(sessionUI);
+  await appPage.goto(runtime.url("/settings/providers"), { waitUntil: "domcontentloaded" });
+  const settingsWin = appWindow(appPage, "settings");
+  await expect(settingsWin).toBeVisible({ timeout: 20_000 });
+  const settingsUI = settingsOperatorSelectors(settingsWin);
+
+  await expect(settingsUI.providers.page).toBeVisible();
+  await expect(settingsUI.providers.list).toBeVisible();
+  await expect(settingsUI.providers.card(builtinProviderName)).toBeVisible();
+
+  await settingsUI.providers.card(builtinProviderName).click();
+  await settingsUI.providers.editorEdit.click();
+  await expect(settingsUI.providers.editor).toBeVisible();
+  await settingsUI.providers.editorCommandInput.fill(
+    browserSettingsOperatorFlowScenario.providers.overlayCommand
+  );
+  // Runtime and model overrides live in the Advanced tier of the provider editor.
+  await settingsUI.providers.editorModeAdvanced.click();
+  await settingsUI.providers.editorModelInput.fill(
+    browserSettingsOperatorFlowScenario.providers.overlayModel
+  );
+  await settingsUI.providers.editorSave.click();
+
+  await expect(settingsUI.providers.editor).toBeHidden();
+  await expect(settingsUI.providers.actionResult).toContainText(
+    `Saved provider "${builtinProviderName}"`
+  );
+  await expect(settingsUI.providers.actionResult).toContainText("restart required");
+  await settingsUI.providers.card(builtinProviderName).click();
+  await settingsUI.providers.inspectorTechnical.getByTestId("settings-advanced-toggle").click();
+  await expect(settingsUI.providers.inspectorCommand).toContainText(
+    browserSettingsOperatorFlowScenario.providers.overlayCommand
+  );
+  // The overlay's effective source is the global config, replacing the builtin.
+  await expect(
+    settingsUI.providers.inspectorSource.getByTestId("inspect-source-effective")
+  ).toHaveText("From settings");
+  await expect(
+    settingsUI.providers.inspectorSource.getByTestId("inspect-source-shadowed")
+  ).toContainText("Built in");
+  await settingsUI.providers.editorDelete.click();
+  await expect(settingsUI.providers.deleteDialog).toBeVisible();
+  await settingsUI.providers.deleteConfirm.click();
+
+  await expect(settingsUI.providers.actionResult).toContainText(
+    `Reset "${builtinProviderName}" to its default setup`
+  );
+  await expect(settingsUI.providers.card(builtinProviderName)).toBeVisible();
+  await settingsUI.providers.card(builtinProviderName).click();
+  await expect(
+    settingsUI.providers.inspectorSource.getByTestId("inspect-source-effective")
+  ).toHaveText("Built in");
+  await browserArtifacts.captureScreenshot(
+    "tc-func-008-providers-crud-and-builtin-fallback",
+    appPage
+  );
+});
+
+test("operator can manage MCP servers across global and workspace scopes with visible target semantics", async ({
+  appPage,
+  browserArtifacts,
+  runtime,
+}) => {
+  const sessionUI = sessionLifecycleSelectors(appPage);
+  const settingsUI = settingsOperatorSelectors(appPage);
+  const workspaceRoot = await mkdtemp(path.join(os.tmpdir(), "compozy-settings-mcp-workspace-"));
+  const workspace = await runtime.resolveWorkspace(workspaceRoot);
+
+  await ensureProjectWorkspace(appPage, runtime);
+  await completeOnboardingIfPrompted(sessionUI);
+  await appPage.goto(runtime.url("/settings/mcp"), {
+    waitUntil: "domcontentloaded",
+  });
+
+  await expect(settingsUI.mcpServers.page).toBeVisible();
+
+  await appPage.getByTestId("settings-page-mcp-scope-workspace").click();
+  await appPage.getByTestId("settings-page-mcp-workspace").selectOption(workspace.id);
+
+  await createMCPServerViaUI(settingsUI, {
+    name: browserSettingsOperatorFlowScenario.mcpServers.workspace.name,
+    command: browserSettingsOperatorFlowScenario.mcpServers.workspace.command,
+    target: browserSettingsOperatorFlowScenario.mcpServers.workspace.target,
+  });
+
+  await expect(
+    settingsUI.mcpServers.rowSource(browserSettingsOperatorFlowScenario.mcpServers.workspace.name)
+  ).toHaveText(`project settings · project · ${workspace.id}`);
+  await expect(
+    settingsUI.mcpServers.row(browserSettingsOperatorFlowScenario.mcpServers.workspace.name)
+  ).toBeVisible();
+
+  await appPage.getByTestId("settings-page-mcp-scope-user").click();
+
+  await createMCPServerViaUI(settingsUI, {
+    name: browserSettingsOperatorFlowScenario.mcpServers.global.name,
+    command: browserSettingsOperatorFlowScenario.mcpServers.global.command,
+    target: browserSettingsOperatorFlowScenario.mcpServers.global.target,
+  });
+
+  await expect(
+    settingsUI.mcpServers.rowSource(browserSettingsOperatorFlowScenario.mcpServers.global.name)
+  ).toHaveText("mcp.json · personal");
+  await expect(
+    settingsUI.mcpServers.row(browserSettingsOperatorFlowScenario.mcpServers.global.name)
+  ).toBeVisible();
+
+  await appPage.reload({ waitUntil: "domcontentloaded" });
+  await appPage.getByTestId("settings-page-mcp-scope-workspace").click();
+  await appPage.getByTestId("settings-page-mcp-workspace").selectOption(workspace.id);
+  await expect(
+    settingsUI.mcpServers.row(browserSettingsOperatorFlowScenario.mcpServers.workspace.name)
+  ).toBeVisible();
+
+  await settingsUI.mcpServers
+    .editRow(browserSettingsOperatorFlowScenario.mcpServers.workspace.name)
+    .click();
+  await expect(settingsUI.mcpServers.editor).toBeVisible();
+  await settingsUI.mcpServers.editorRemove.click();
+  await expect(settingsUI.mcpServers.deleteDialog).toContainText(workspace.id);
+  const removedResponse = appPage.waitForResponse(
+    response =>
+      response.request().method() === "DELETE" &&
+      new URL(response.url()).pathname ===
+        `/api/settings/mcp-servers/${browserSettingsOperatorFlowScenario.mcpServers.workspace.name}`
+  );
+  await settingsUI.mcpServers.deleteConfirm.click();
+  const removed = await removedResponse;
+  expect(removed.ok()).toBe(true);
+  const removal = await removed.json();
+  expect(removal).toMatchObject({ applied: true, next_action: "none" });
+  expect(removal.restart_required ?? false).toBe(false);
+  await expect(
+    settingsUI.mcpServers.row(browserSettingsOperatorFlowScenario.mcpServers.workspace.name)
+  ).not.toBeVisible();
+  await appPage.getByTestId("settings-page-mcp-scope-user").click();
+  await expect(
+    settingsUI.mcpServers.row(browserSettingsOperatorFlowScenario.mcpServers.global.name)
+  ).toBeVisible();
+  await browserArtifacts.captureScreenshot("tc-int-011-mcp-workspace-scope", appPage);
+});
+
+test("operator can manage restart-aware hooks and extension policy on split settings routes", async ({
+  appPage,
+  browserArtifacts,
+  runtime,
+}) => {
+  const sessionUI = sessionLifecycleSelectors(appPage);
+  const seeded = await seedBrowserSettingsFixtures(runtime, {
+    hooks: [
+      {
+        name: browserSettingsOperatorFlowScenario.hooks.hookName,
+        declaration: {
+          name: browserSettingsOperatorFlowScenario.hooks.hookName,
+          event: "turn.end",
+          mode: "sync",
+          command: "/bin/echo",
+          args: ["settings-hook"],
+          matcher: {},
+          required: true,
+          enabled: true,
+        },
+      },
+    ],
+  });
+
+  try {
+    await ensureProjectWorkspace(appPage, runtime);
+    await completeOnboardingIfPrompted(sessionUI);
+    await appPage.goto(runtime.url("/settings/hooks"), {
+      waitUntil: "domcontentloaded",
+    });
+    const settingsWin = appWindow(appPage, "settings");
+    await expect(settingsWin).toBeVisible({ timeout: 20_000 });
+    const settingsUI = settingsOperatorSelectors(settingsWin);
+
+    await expect(settingsUI.hooks.page).toBeVisible();
+    await expect(
+      settingsUI.hooks.hookToggle(browserSettingsOperatorFlowScenario.hooks.hookName)
+    ).toBeVisible();
+
+    await settingsUI.hooks.hookToggle(browserSettingsOperatorFlowScenario.hooks.hookName).click();
+    await expect(
+      settingsUI.hooks.hookToggle(browserSettingsOperatorFlowScenario.hooks.hookName)
+    ).not.toBeChecked();
+    await expect(settingsUI.hooks.restartNotice).toBeVisible();
+
+    // Prove failure-fatality (`required`) and dispatch enablement (`enabled`) are
+    // independent fields: disabling the hook flips `enabled` to false while
+    // `required` stays true in the real daemon response.
+    const hooksResponse = await runtime.requestJSON<{
+      hooks: Array<{ name: string; declaration: { enabled?: boolean; required?: boolean } }>;
+    }>("/api/settings/hooks");
+    const toggledHook = hooksResponse.hooks.find(
+      hook => hook.name === browserSettingsOperatorFlowScenario.hooks.hookName
+    );
+    expect(toggledHook?.declaration.enabled).toBe(false);
+    expect(toggledHook?.declaration.required).toBe(true);
+
+    await appPage.goto(runtime.url("/settings/extensions"), {
+      waitUntil: "domcontentloaded",
+    });
+    await expect(settingsUI.extensions.page).toBeVisible();
+    await expect(settingsUI.hooks.hooksList).toHaveCount(0);
+
+    await expect(settingsUI.extensions.githubEnabled).toBeChecked();
+    // The GitHub API URL lives in the page's Advanced fold.
+    await settingsWin
+      .getByTestId("settings-page-extensions-advanced")
+      .getByTestId("settings-advanced-toggle")
+      .click();
+    await settingsUI.extensions.githubBaseURLInput.fill("https://github.example/api/v3");
+    await expect(settingsUI.extensions.save).toBeEnabled();
+    await settingsUI.extensions.save.click();
+
+    await expect(settingsUI.extensions.restartNotice).toBeVisible();
+    await browserArtifacts.captureScreenshot("tc-func-012-extensions-policy", appPage);
+  } finally {
+    await cleanupBrowserSettingsFixtures(runtime, seeded);
+  }
+});
+
+test("operator routes a background role, persists it across reload, and keeps builtins out of the Agents fleet", async ({
+  appPage,
+  browserArtifacts,
+  runtime,
+}) => {
+  const sessionUI = sessionLifecycleSelectors(appPage);
+  const settingsUI = settingsOperatorSelectors(appPage);
+
+  await ensureProjectWorkspace(appPage, runtime);
+  await completeOnboardingIfPrompted(sessionUI);
+  const catalog = await runtime.requestJSON<{
+    models: Array<{ display_name?: string; model_id: string; provider_id: string }>;
+  }>("/api/model-catalog/models?include_stale=true&view=all");
+  const next =
+    catalog.models.find(model => model.model_id === "claude-haiku-4-5") ?? catalog.models[0];
+  if (!next) throw new Error("model catalog must advertise a background-role candidate");
+  const nextModel = next.model_id;
+  const nextModelLabel = next.display_name?.trim() || nextModel;
+  const nextProvider = next.provider_id;
+  await appPage.goto(runtime.url("/settings/roles"), { waitUntil: "domcontentloaded" });
+
+  await expect(settingsUI.roles.page).toBeVisible({ timeout: 20_000 });
+  // Coordinator ships disabled — the header switch projects that truthfully
+  // without expanding the row.
+  await expect(settingsUI.roles.enabledSwitch("coordinator")).toHaveAttribute(
+    "aria-checked",
+    "false"
+  );
+  // Nothing is pinned yet, so no route chip is invented for auto_title.
+  await expect(settingsUI.roles.routeSummary("auto_title")).toHaveCount(0);
+
+  await settingsUI.roles.toggle("auto_title").click();
+  await settingsUI.roles.runtimeSelect("auto_title").click();
+  await expect(appPage.getByTestId("runtime-selector-popup")).toBeVisible();
+  // Pick the provider-backed catalog row so the selector owns the complete
+  // provider/model decision instead of treating a known model as a custom ID.
+  await appPage.getByTestId("runtime-selector-search").fill(nextModel);
+  await appPage
+    .locator(`[role="option"][data-provider="${nextProvider}"][data-model="${nextModel}"]`)
+    .click();
+  await appPage.keyboard.press("Escape");
+  await expect(appPage.getByTestId("runtime-selector-popup")).toHaveCount(0);
+  await expect(settingsUI.roles.runtimeSelect("auto_title")).toContainText(nextModelLabel);
+  await expect(settingsUI.roles.saveButton).toBeEnabled();
+
+  const applyResponse = appPage.waitForResponse(
+    response =>
+      new URL(response.url()).pathname === "/api/settings/roles" &&
+      response.request().method() === "PATCH"
+  );
+  await settingsUI.roles.saveButton.click();
+  await applyResponse;
+  await expect(settingsUI.roles.saveMessage).toContainText("applied immediately");
+  await browserArtifacts.captureScreenshot("e2e-006-roles-auto-title-saved", appPage);
+
+  // The routed model survives a reload — panel and daemon config agree.
+  await reloadDaemonServedPage(appPage, runtime, "/settings/roles", {
+    readyTestId: "settings-page-roles",
+  });
+  await expect(settingsUI.roles.routeSummary("auto_title")).toContainText(
+    `${nextProvider} · ${nextModel}`
+  );
+
+  const section = await runtime.requestJSON<{ config: { auto_title: { model: string } } }>(
+    "/api/settings/roles"
+  );
+  expect(section.config.auto_title.model).toBe(nextModel);
+
+  // Virtual builtins never enter the Agents fleet.
+  await appPage.goto(runtime.url("/agents"), { waitUntil: "domcontentloaded" });
+  await expect(appPage.getByTestId("agent-fleet-empty")).toHaveCount(0);
+  await expect(sessionUI.agentRow("general")).toBeVisible();
+  await expect(sessionUI.agentRow("coordinator")).toHaveCount(0);
+  await browserArtifacts.captureScreenshot("e2e-006-agents-fleet-no-builtins", appPage);
+});
+
+/**
+ * E2E-020 — one-click update from a plain browser: the single Update action issues
+ * every eligible target in one ordered request, progress renders from the polled projection, and the terminal
+ * outcome is read back rather than assumed (US-029 EC-2/EC-5).
+ */
+test("browser operator updates CompozyOS in one click and reads progress and terminal truth from the daemon", async ({
+  appPage,
+  runtime,
+}) => {
+  const sessionUI = sessionLifecycleSelectors(appPage);
+  await ensureProjectWorkspace(appPage, runtime);
+  await completeOnboardingIfPrompted(sessionUI);
+
+  let updatePayload: unknown = updateFixtures.bothAvailable;
+  const applyTargets: string[] = [];
+  await appPage.route("**/api/settings/update", async route => {
+    await route.fulfill({ json: updatePayload });
+  });
+  await appPage.route("**/api/settings/update/apply", async route => {
+    const body = route.request().postDataJSON() as { targets: string[] };
+    applyTargets.push(...body.targets);
+    // Apply only acknowledges acquisition; the GET above becomes the progress feed.
+    updatePayload = updateFixtures.applying;
+    await route.fulfill({
+      json: {
+        targets: body.targets,
+        status: "accepted",
+        operation_id: "op-e2e",
+        message: "Started the requested updates.",
+        holder: null,
+      },
+    });
+  });
+
+  await appPage.goto(runtime.url("/settings/general"), { waitUntil: "domcontentloaded" });
+  const settingsWin = appWindow(appPage, "settings");
+  await expect(settingsWin).toBeVisible({ timeout: 20_000 });
+  const settingsUI = settingsOperatorSelectors(settingsWin);
+  await expect(settingsUI.general.updateApply()).toBeVisible({ timeout: 20_000 });
+
+  await settingsUI.general.updateApply().click();
+  await expect.poll(() => applyTargets).toEqual(["runtime", "app"]);
+
+  // The visible label is one plain "Updating"; the daemon's phase rides on data-phase.
+  await expect(settingsUI.general.updateProgress()).toHaveAttribute("data-phase", "install", {
+    timeout: 20_000,
+  });
+  await expect(settingsUI.general.updateApply()).toHaveCount(0);
+
+  // Terminal truth arrives through the polled read, including rollback.
+  updatePayload = updateFixtures.rolledBack;
+  await expect(settingsUI.general.updateStatus).toContainText("went back to 0.5.0", {
+    timeout: 20_000,
+  });
+  await expect(settingsUI.general.updateLastError).toContainText("health check failed after swap");
+});
+
+test("operator can inspect and edit the Antigravity sign-in method without credential controls", async ({
+  appPage,
+  browserArtifacts,
+  runtime,
+}) => {
+  const sessionUI = sessionLifecycleSelectors(appPage);
+  await ensureProjectWorkspace(appPage, runtime);
+  await completeOnboardingIfPrompted(sessionUI);
+
+  const seeded = await seedBrowserSettingsFixtures(runtime, {
+    providers: [
+      {
+        name: "agy",
+        settings: { command: "/bin/true", auth_acp_method: "oauth-personal" },
+      },
+    ],
+  });
+
+  try {
+    await appPage.goto(runtime.url("/settings/providers"), { waitUntil: "domcontentloaded" });
+    const settingsWin = appWindow(appPage, "settings");
+    await expect(settingsWin).toBeVisible({ timeout: 20_000 });
+    const settingsUI = settingsOperatorSelectors(settingsWin);
+    await expect(settingsUI.providers.page).toBeVisible();
+
+    const agyCard = settingsWin.getByTestId("settings-page-providers-card-agy");
+    await expect(agyCard).toBeVisible();
+    await expect(agyCard.getByTestId("settings-page-providers-card-agy-name")).toContainText(
+      "Google Antigravity"
+    );
+    // Presence is not readiness: the cheap declared read stays unverified, never Ready.
+    await expect(agyCard.getByTestId("settings-page-providers-card-agy-status")).toContainText(
+      "Sign-in unverified"
+    );
+    await browserArtifacts.captureScreenshot("agy-settings-card-unverified", appPage);
+
+    // Keyboard path: the card is a native button, so Enter opens the inspector.
+    await agyCard.focus();
+    await appPage.keyboard.press("Enter");
+    const detail = settingsWin.getByTestId("provider-detail-dialog");
+    await expect(detail).toBeVisible();
+    await detail.getByTestId("provider-detail-edit").click();
+    await expect(
+      detail.getByTestId("settings-providers-editor-auth-acp-method-input")
+    ).toBeVisible();
+
+    const methodInput = detail.getByTestId("settings-providers-editor-auth-acp-method-input");
+    await expect(methodInput).toHaveValue("oauth-personal");
+    await expect(detail.getByLabel(/Sign-in method/)).toBeVisible();
+    // Native auth mounts no secret, key, ref, or rotation controls.
+    await expect(
+      detail.getByTestId("settings-providers-editor-auth-login-descriptor")
+    ).toContainText("true");
+    await expect(
+      detail.getByTestId("settings-providers-editor-auth-login-descriptor")
+    ).not.toContainText("write-only config");
+    await expect(
+      detail.locator('[data-testid^="settings-providers-editor-credential-slot"]')
+    ).toHaveCount(0);
+    await expect(detail.getByLabel("Credential value")).toHaveCount(0);
+
+    // An unrelated edit preserves the stored method across save and reopen.
+    await detail.getByTestId("settings-providers-editor-display-name-input").fill("AGY Renamed");
+    await detail.getByTestId("provider-detail-save").click();
+    await expect(detail).toBeHidden();
+    await expect(settingsUI.providers.actionResult).toContainText('Saved provider "agy"');
+    // Focus returns to the card that opened the dialog.
+    await expect(agyCard).toBeFocused();
+
+    await agyCard.click();
+    await expect(detail).toBeVisible();
+    await detail.getByTestId("provider-detail-edit").click();
+    await expect(detail.getByTestId("settings-providers-editor-auth-acp-method-input")).toHaveValue(
+      "oauth-personal"
+    );
+    await browserArtifacts.captureScreenshot("agy-settings-method-preserved", appPage);
+
+    // Narrow viewport: the editor keeps every control reachable without clipping.
+    await appPage.setViewportSize({ width: 375, height: 820 });
+    const narrowMethodInput = detail.getByTestId("settings-providers-editor-auth-acp-method-input");
+    await narrowMethodInput.scrollIntoViewIfNeeded();
+    await expect(narrowMethodInput).toBeVisible();
+    const overflow = await detail
+      .getByTestId("provider-detail-body")
+      .evaluate(element => element.scrollWidth - element.clientWidth <= 1);
+    expect(overflow).toBe(true);
+    await browserArtifacts.captureScreenshot("agy-settings-method-narrow", appPage);
+  } finally {
+    await cleanupBrowserSettingsFixtures(runtime, seeded);
+  }
+});
+
+function normalizeTexts(values: string[]): string[] {
+  return values.map(value => value.trim()).filter(value => value !== "");
+}
+
+async function nextIdleReleaseValue(
+  input: ReturnType<typeof settingsOperatorSelectors>["general"]["idleReleaseInput"]
+): Promise<string> {
+  const currentValue = Number.parseInt((await input.inputValue()) || "0", 10);
+  const primary = browserSettingsOperatorFlowScenario.general.primaryIdleReleaseSeconds;
+  const fallback = browserSettingsOperatorFlowScenario.general.fallbackIdleReleaseSeconds;
+  return String(currentValue === primary ? fallback : primary);
+}
+
+async function pickBuiltinProviderName(runtime: {
+  requestJSON<T>(pathname: string, init?: RequestInit): Promise<T>;
+}) {
+  const payload = await runtime.requestJSON<{
+    providers: Array<{
+      name: string;
+      source_metadata: { effective_source: { kind: string } };
+    }>;
+  }>("/api/settings/providers");
+  const builtinProvider =
+    payload.providers.find(
+      provider =>
+        provider.name === "codex" &&
+        provider.source_metadata.effective_source.kind === "builtin-provider"
+    ) ??
+    payload.providers.find(
+      provider => provider.source_metadata.effective_source.kind === "builtin-provider"
+    );
+
+  if (!builtinProvider) {
+    throw new Error("Expected at least one builtin provider in the settings providers list.");
+  }
+
+  return builtinProvider.name;
+}
+
+async function createMCPServerViaUI(
+  settingsUI: ReturnType<typeof settingsOperatorSelectors>,
+  input: {
+    command: string;
+    name: string;
+    target: "auto" | "config" | "sidecar";
+  }
+) {
+  await settingsUI.mcpServers.create.click();
+  await expect(settingsUI.mcpServers.editor).toBeVisible();
+  await settingsUI.mcpServers.editorNameInput.fill(input.name);
+  await settingsUI.mcpServers.editorCommandInput.fill(input.command);
+  await settingsUI.mcpServers.editorTargetInput.selectOption(input.target);
+  const savedResponse = settingsUI.mcpServers.editorSave
+    .page()
+    .waitForResponse(
+      response =>
+        response.request().method() === "PUT" &&
+        new URL(response.url()).pathname === `/api/settings/mcp-servers/${input.name}`
+    );
+  await settingsUI.mcpServers.editorSave.click();
+  const saved = await savedResponse;
+  expect(saved.ok()).toBe(true);
+  const mutation = await saved.json();
+  expect(mutation).toMatchObject({ applied: true, next_action: "none" });
+  expect(mutation.restart_required ?? false).toBe(false);
+  await expect(settingsUI.mcpServers.editor).toBeHidden();
+}

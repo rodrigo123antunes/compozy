@@ -1,0 +1,1418 @@
+package core
+
+import (
+	"bytes"
+	"context"
+	"encoding/json"
+	"errors"
+	"io"
+	"log/slog"
+	"net/http"
+	"net/http/httptest"
+	"os"
+	"path/filepath"
+	"reflect"
+	"strings"
+	"sync"
+	"testing"
+	"time"
+
+	"github.com/compozy/compozy/internal/acp"
+
+	"github.com/compozy/compozy/internal/api/contract"
+	commandpkg "github.com/compozy/compozy/internal/command"
+	eventspkg "github.com/compozy/compozy/internal/events"
+	"github.com/compozy/compozy/internal/session"
+	"github.com/compozy/compozy/internal/store"
+	"github.com/compozy/compozy/internal/transcript"
+	"github.com/gin-gonic/gin"
+)
+
+type streamTestFlushWriter struct {
+	bytes.Buffer
+}
+
+func (streamTestFlushWriter) Flush() {}
+
+type streamTestFailWriter struct {
+	err error
+}
+
+func (w streamTestFailWriter) Write([]byte) (int, error) {
+	return 0, w.err
+}
+
+func (streamTestFailWriter) Flush() {}
+
+type rawStreamSubscriberStub struct {
+	sessionManagerStub
+	after  []int64
+	events <-chan store.SessionEvent
+}
+
+func (s *rawStreamSubscriberStub) SubscribeSessionEvents(
+	_ context.Context,
+	_ string,
+	afterSequence int64,
+) (<-chan store.SessionEvent, func(), error) {
+	s.after = append(s.after, afterSequence)
+	return s.events, func() {}, nil
+}
+
+type wakeStreamSubscriberStub struct {
+	*rawStreamSubscriberStub
+	wakeCalls int
+	wakes     <-chan store.SessionEvent
+}
+
+type commandStreamManagerStub struct {
+	sessionManagerStub
+	catalog    commandpkg.Catalog
+	commandErr error
+}
+
+func (s *commandStreamManagerStub) CommandCatalog(
+	ctx context.Context,
+	_ string,
+) (commandpkg.Catalog, error) {
+	if err := ctx.Err(); err != nil {
+		return commandpkg.Catalog{}, err
+	}
+	if s.commandErr != nil {
+		return commandpkg.Catalog{}, s.commandErr
+	}
+	return s.catalog, nil
+}
+
+func (s *wakeStreamSubscriberStub) SubscribeSessionEventWakes(
+	context.Context,
+	string,
+) (<-chan store.SessionEvent, func(), error) {
+	s.wakeCalls++
+	return s.wakes, func() {}, nil
+}
+
+func streamTestSessionInfo(id string) *session.Info {
+	now := time.Date(2026, 4, 3, 12, 0, 0, 0, time.UTC)
+	return &session.Info{
+		ID:              id,
+		Name:            "demo",
+		AgentName:       "coder",
+		WorkspaceID:     "ws-workspace",
+		Workspace:       "/workspace",
+		State:           session.StateActive,
+		TranscriptEpoch: 3,
+		CreatedAt:       now,
+		UpdatedAt:       now,
+	}
+}
+
+func TestTranscriptStreamErrorHandling(t *testing.T) {
+	t.Parallel()
+
+	t.Run("Should emit one terminal error and cancel the live subscription", func(t *testing.T) {
+		t.Parallel()
+
+		initializeErr := errors.New("projection unavailable")
+		handlers := &BaseHandlers{Sessions: sessionManagerStub{
+			events: func(context.Context, string, store.EventQuery) ([]store.SessionEvent, error) { return nil, nil },
+			transcriptPage: func(
+				context.Context,
+				string,
+				transcript.PageQuery,
+			) (transcript.Page, error) {
+				return transcript.Page{}, initializeErr
+			},
+		}}
+		gin.SetMode(gin.TestMode)
+		ctx, _ := gin.CreateTestContext(httptest.NewRecorder())
+		ctx.Request = httptest.NewRequestWithContext(t.Context(), "GET", "/stream", http.NoBody)
+		writer := &streamTestFlushWriter{}
+		cancelCalls := 0
+
+		handlers.streamTranscriptSessionEvents(
+			ctx,
+			writer,
+			"sess-a",
+			streamTestSessionInfo("sess-a"),
+			store.EventQuery{Limit: 2},
+			nil,
+			sessionStreamOptions{frameMode: contract.SessionStreamFrameTranscript},
+			sessionEventStreamSubscription{
+				events: make(chan store.SessionEvent),
+				cancel: func() { cancelCalls++ },
+			},
+		)
+
+		if cancelCalls != 1 {
+			t.Fatalf("subscription cancel calls = %d, want 1", cancelCalls)
+		}
+		if got := strings.Count(writer.String(), "event: error"); got != 1 {
+			t.Fatalf("terminal error frames = %d, want 1; body=%s", got, writer.String())
+		}
+		for _, fragment := range []string{"initialize transcript stream", "projection unavailable"} {
+			if !strings.Contains(writer.String(), fragment) {
+				t.Fatalf("terminal error body missing %q: %s", fragment, writer.String())
+			}
+		}
+	})
+
+	t.Run("Should log a terminal error write failure", func(t *testing.T) {
+		t.Parallel()
+
+		var logs bytes.Buffer
+		handlers := &BaseHandlers{Logger: slog.New(slog.NewJSONHandler(&logs, nil))}
+		handlers.writeTranscriptStreamError(
+			streamTestFailWriter{err: errors.New("stream sink closed")},
+			errors.New("projection unavailable"),
+		)
+		for _, fragment := range []string{
+			`"msg":"api: failed to emit sse message"`,
+			`"event":"error"`,
+			"stream sink closed",
+		} {
+			if !strings.Contains(logs.String(), fragment) {
+				t.Fatalf("SSE failure log missing %q: %s", fragment, logs.String())
+			}
+		}
+	})
+
+	t.Run("Should close without a warning or error frame when the session is removed", func(t *testing.T) {
+		t.Parallel()
+
+		var logs bytes.Buffer
+		stopped := streamTestSessionInfo("sess-a")
+		stopped.State = session.StateStopped
+		events := make(chan store.SessionEvent, 1)
+		events <- store.SessionEvent{Type: session.EventTypeSessionStopped}
+		handlers := &BaseHandlers{
+			Logger: slog.New(slog.NewJSONHandler(&logs, &slog.HandlerOptions{Level: slog.LevelDebug})),
+			Sessions: sessionManagerStub{
+				events: func(context.Context, string, store.EventQuery) ([]store.SessionEvent, error) { return nil, nil },
+				status: func(context.Context, string) (*session.Info, error) {
+					return stopped, nil
+				},
+				transcriptChanges: func(
+					context.Context,
+					string,
+					transcript.ChangeQuery,
+				) (transcript.ChangePage, error) {
+					return transcript.ChangePage{}, session.ErrSessionNotFound
+				},
+			},
+		}
+		gin.SetMode(gin.TestMode)
+		ctx, _ := gin.CreateTestContext(httptest.NewRecorder())
+		ctx.Request = httptest.NewRequestWithContext(t.Context(), "GET", "/stream", http.NoBody)
+		writer := &streamTestFlushWriter{}
+
+		handlers.pushAndStreamSessionTranscript(
+			ctx,
+			writer,
+			"sess-a",
+			streamTestSessionInfo("sess-a"),
+			transcriptStreamState{cursor: 7, generation: 2, epoch: 3},
+			2,
+			sessionEventStreamSubscription{events: events, cancel: func() {}},
+		)
+
+		if strings.Contains(writer.String(), "event: error") {
+			t.Fatalf("stream emitted an error frame after deletion: %s", writer.String())
+		}
+		if strings.Contains(logs.String(), `"level":"WARN"`) {
+			t.Fatalf("stream logged expected deletion at warning level: %s", logs.String())
+		}
+	})
+
+	t.Run("Should continue transcript delivery when the command catalog is unavailable", func(t *testing.T) {
+		t.Parallel()
+
+		catalogErr := errors.New("catalog temporarily unavailable")
+		var logs bytes.Buffer
+		info := streamTestSessionInfo("sess-command")
+		info.State = session.StateStopped
+		manager := &commandStreamManagerStub{
+			events: func(context.Context, string, store.EventQuery) ([]store.SessionEvent, error) { return nil, nil },
+			transcriptPage: func(
+				context.Context,
+				string,
+				transcript.PageQuery,
+			) (transcript.Page, error) {
+				return transcript.Page{Generation: 1}, nil
+			},
+			commandErr: catalogErr,
+		}
+		handlers := &BaseHandlers{
+			Sessions: manager,
+			Logger:   slog.New(slog.NewJSONHandler(&logs, nil)),
+		}
+		gin.SetMode(gin.TestMode)
+		ctx, _ := gin.CreateTestContext(httptest.NewRecorder())
+		ctx.Request = httptest.NewRequestWithContext(t.Context(), "GET", "/stream", http.NoBody)
+		writer := &streamTestFlushWriter{}
+
+		handlers.streamTranscriptSessionEvents(
+			ctx,
+			writer,
+			"sess-command",
+			info,
+			store.EventQuery{Limit: 2},
+			nil,
+			sessionStreamOptions{frameMode: contract.SessionStreamFrameTranscript},
+			sessionEventStreamSubscription{},
+		)
+
+		if strings.Contains(writer.String(), "event: error") {
+			t.Fatalf("stream emitted terminal error for auxiliary catalog failure: %s", writer.String())
+		}
+		for _, fragment := range []string{"event: transcript_snapshot", "event: session_stopped"} {
+			if !strings.Contains(writer.String(), fragment) {
+				t.Fatalf("stream body missing %q after catalog failure: %s", fragment, writer.String())
+			}
+		}
+		if !strings.Contains(logs.String(), catalogErr.Error()) {
+			t.Fatalf("catalog failure log missing %q: %s", catalogErr, logs.String())
+		}
+	})
+}
+
+func TestSessionStreamFallbackCancelsSubscriptionBeforePolling(t *testing.T) {
+	t.Parallel()
+
+	testCases := []struct {
+		name  string
+		event *store.SessionEvent
+	}{
+		{name: "Should cancel raw subscription before polling after closed subscription"},
+		{
+			name:  "Should cancel raw subscription before polling after sequence gap",
+			event: &store.SessionEvent{Sequence: 3},
+		},
+	}
+
+	for _, testCase := range testCases {
+		t.Run(testCase.name, func(t *testing.T) {
+			t.Parallel()
+
+			streamDone := make(chan struct{})
+			handlers := &BaseHandlers{PollInterval: time.Hour}
+			handlers.SetStreamDone(streamDone)
+			gin.SetMode(gin.TestMode)
+			ctx, _ := gin.CreateTestContext(httptest.NewRecorder())
+			ctx.Request = httptest.NewRequestWithContext(t.Context(), "GET", "/stream", http.NoBody)
+			writer := &streamTestFlushWriter{}
+
+			events := make(chan store.SessionEvent, 1)
+			if testCase.event != nil {
+				events <- *testCase.event
+			}
+			close(events)
+			canceled := make(chan struct{})
+			subscription := sessionEventStreamSubscription{
+				events: events,
+				cancel: sync.OnceFunc(func() { close(canceled) }),
+			}
+
+			done := make(chan struct{})
+			go func() {
+				defer close(done)
+				handlers.pushAndStreamSessionEvents(
+					ctx,
+					writer,
+					"sess-a",
+					streamTestSessionInfo("sess-a"),
+					store.EventQuery{},
+					1,
+					subscription,
+				)
+			}()
+
+			waitForStreamTestSignal(t, canceled, "subscription cancel")
+			close(streamDone)
+			waitForStreamTestSignal(t, done, "stream fallback return")
+		})
+	}
+}
+
+func TestSubscribeSessionEventStreamMode(t *testing.T) {
+	t.Parallel()
+
+	t.Run("Should use wake-only subscriptions for transcript streams", func(t *testing.T) {
+		t.Parallel()
+
+		wakes := make(chan store.SessionEvent)
+		manager := &wakeStreamSubscriberStub{
+			rawStreamSubscriberStub: &rawStreamSubscriberStub{},
+			wakes:                   wakes,
+		}
+		handlers := &BaseHandlers{Sessions: manager}
+
+		subscription, err := handlers.subscribeSessionEventStream(
+			t.Context(),
+			"sess-a",
+			99,
+			contract.SessionStreamFrameTranscript,
+		)
+		if err != nil {
+			t.Fatalf("subscribeSessionEventStream() error = %v", err)
+		}
+		if !subscription.active() || subscription.events != wakes {
+			t.Fatal("transcript subscription is inactive or did not use wake channel")
+		}
+		if manager.wakeCalls != 1 || len(manager.after) != 0 {
+			t.Fatalf(
+				"wake/raw calls = %d/%#v, want one wake and no filtered subscription",
+				manager.wakeCalls,
+				manager.after,
+			)
+		}
+	})
+
+	t.Run("Should fall back to transcript polling when only filtered subscriptions exist", func(t *testing.T) {
+		t.Parallel()
+
+		manager := &rawStreamSubscriberStub{}
+		handlers := &BaseHandlers{Sessions: manager}
+
+		subscription, err := handlers.subscribeSessionEventStream(
+			t.Context(),
+			"sess-a",
+			99,
+			contract.SessionStreamFrameTranscript,
+		)
+		if err != nil {
+			t.Fatalf("subscribeSessionEventStream() error = %v", err)
+		}
+		if subscription.active() || len(manager.after) != 0 {
+			t.Fatalf(
+				"transcript subscription = %#v raw calls=%#v, want inactive polling fallback",
+				subscription,
+				manager.after,
+			)
+		}
+	})
+
+	t.Run("Should preserve filtered subscriptions for raw streams", func(t *testing.T) {
+		t.Parallel()
+
+		events := make(chan store.SessionEvent)
+		manager := &rawStreamSubscriberStub{events: events}
+		handlers := &BaseHandlers{Sessions: manager}
+
+		subscription, err := handlers.subscribeSessionEventStream(
+			t.Context(),
+			"sess-a",
+			99,
+			contract.SessionStreamFrameRaw,
+		)
+		if err != nil {
+			t.Fatalf("subscribeSessionEventStream() error = %v", err)
+		}
+		if !subscription.active() || subscription.events != events {
+			t.Fatal("raw subscription is inactive or did not use filtered channel")
+		}
+		if len(manager.after) != 1 || manager.after[0] != 99 {
+			t.Fatalf("raw subscription cursors = %#v, want [99]", manager.after)
+		}
+	})
+}
+
+func TestTranscriptPushTreatsRawSequenceAsWakeOnly(t *testing.T) {
+	t.Parallel()
+
+	t.Run("Should use raw sequence only to wake transcript replay", func(t *testing.T) {
+		t.Parallel()
+
+		streamDone := make(chan struct{})
+		statusCalls := 0
+		pageCalls := 0
+		handlers := &BaseHandlers{
+			Sessions: sessionManagerStub{
+				events: func(context.Context, string, store.EventQuery) ([]store.SessionEvent, error) { return nil, nil },
+				status: func(_ context.Context, id string) (*session.Info, error) {
+					statusCalls++
+					info := streamTestSessionInfo(id)
+					info.TranscriptEpoch = 4
+					return info, nil
+				},
+				transcriptPage: func(
+					context.Context,
+					string,
+					transcript.PageQuery,
+				) (transcript.Page, error) {
+					pageCalls++
+					close(streamDone)
+					return transcript.Page{
+						Entries:     []transcript.Entry{{StartSequence: 1, Sequence: 1}},
+						Generation:  5,
+						MaxSequence: 1,
+					}, nil
+				},
+				transcriptChanges: func(
+					context.Context,
+					string,
+					transcript.ChangeQuery,
+				) (transcript.ChangePage, error) {
+					t.Fatal("TranscriptChanges() called before epoch reset snapshot")
+					return transcript.ChangePage{}, nil
+				},
+			},
+			PollInterval: time.Hour,
+		}
+		handlers.SetStreamDone(streamDone)
+		gin.SetMode(gin.TestMode)
+		ctx, _ := gin.CreateTestContext(httptest.NewRecorder())
+		ctx.Request = httptest.NewRequestWithContext(t.Context(), "GET", "/stream", http.NoBody)
+		eventWake := make(chan store.SessionEvent, 1)
+		eventWake <- store.SessionEvent{Sequence: 1}
+		writer := &streamTestFlushWriter{}
+
+		handlers.pushAndStreamSessionTranscript(
+			ctx,
+			writer,
+			"sess-a",
+			streamTestSessionInfo("sess-a"),
+			transcriptStreamState{cursor: 10, generation: 4, epoch: 3},
+			2,
+			sessionEventStreamSubscription{events: eventWake, cancel: func() {}},
+		)
+
+		if statusCalls != 1 || pageCalls != 1 {
+			t.Fatalf("status/page calls = %d/%d, want one refresh from lower raw sequence", statusCalls, pageCalls)
+		}
+		for _, fragment := range []string{
+			"event: transcript_snapshot",
+			`"epoch":4`,
+			`"generation":5`,
+			`"reset":true`,
+			`"reason":"epoch_mismatch"`,
+		} {
+			if !strings.Contains(writer.String(), fragment) {
+				t.Fatalf("stream body missing %q: %s", fragment, writer.String())
+			}
+		}
+	})
+}
+
+func TestTranscriptPushDrainsPersistedEventsBeforeStopping(t *testing.T) {
+	t.Parallel()
+	t.Run("Should deliver persisted transcript entries before the terminal event", func(t *testing.T) {
+		t.Parallel()
+
+		stopped := streamTestSessionInfo("sess-a")
+		stopped.State = session.StateStopped
+		changeCalls := 0
+		handlers := &BaseHandlers{
+			Sessions: sessionManagerStub{
+				events: func(context.Context, string, store.EventQuery) ([]store.SessionEvent, error) { return nil, nil },
+				status: func(context.Context, string) (*session.Info, error) {
+					return stopped, nil
+				},
+				transcriptChanges: func(
+					_ context.Context,
+					_ string,
+					query transcript.ChangeQuery,
+				) (transcript.ChangePage, error) {
+					changeCalls++
+					switch query.AfterSequence {
+					case 6:
+						return transcript.ChangePage{
+							Entries: []transcript.Entry{{
+								StartSequence: 7,
+								Sequence:      7,
+								Message: transcript.UIMessage{
+									ID:   "assistant-output",
+									Role: transcript.UIRoleAssistant,
+								},
+							}},
+							Generation: 4, MaxSequence: 7, NextAfter: 7,
+						}, nil
+					case 7:
+						return transcript.ChangePage{
+							Entries: []transcript.Entry{{
+								StartSequence: 8,
+								Sequence:      8,
+								Message: transcript.UIMessage{
+									ID:   "file-mutation-marker",
+									Role: transcript.UIRoleAssistant,
+								},
+							}},
+							Generation: 4, MaxSequence: 8, NextAfter: 8,
+						}, nil
+					case 8:
+						return transcript.ChangePage{
+							Generation: 4, MaxSequence: 9, NextAfter: 9,
+						}, nil
+					default:
+						t.Fatalf("TranscriptChanges() cursor = %d, want 6, 7, or 8", query.AfterSequence)
+						return transcript.ChangePage{}, nil
+					}
+				},
+			},
+			PollInterval: time.Hour,
+		}
+		gin.SetMode(gin.TestMode)
+		ctx, _ := gin.CreateTestContext(httptest.NewRecorder())
+		ctx.Request = httptest.NewRequestWithContext(t.Context(), "GET", "/stream", http.NoBody)
+		wakes := make(chan store.SessionEvent, 3)
+		wakes <- store.SessionEvent{Sequence: 7, Type: "agent_message"}
+		wakes <- store.SessionEvent{Sequence: 8, Type: "transcript_marker.created"}
+		wakes <- store.SessionEvent{Sequence: 9, Type: session.EventTypeSessionStopped}
+		writer := &streamTestFlushWriter{}
+
+		handlers.pushAndStreamSessionTranscript(
+			ctx,
+			writer,
+			"sess-a",
+			streamTestSessionInfo("sess-a"),
+			transcriptStreamState{
+				cursor: 6, generation: 4, epoch: 3, commandCheckedAt: time.Now(),
+			},
+			2,
+			sessionEventStreamSubscription{events: wakes, cancel: func() {}},
+		)
+
+		if changeCalls != 3 {
+			t.Fatalf("TranscriptChanges() calls = %d, want 3", changeCalls)
+		}
+		body := writer.String()
+		markerAt := strings.Index(body, `"id":"file-mutation-marker"`)
+		stoppedAt := strings.Index(body, "event: session_stopped")
+		if markerAt < 0 || stoppedAt < 0 || markerAt > stoppedAt {
+			t.Fatalf("stream did not deliver the final marker before stopping: %s", body)
+		}
+	})
+}
+
+// Invariant UT-114 / IT-044: a buffered token wake burst produces one ordered
+// transcript delta at the durable watermark. Owner: the core streaming suite.
+func TestTranscriptPushCoalescesWakeWatermarks(t *testing.T) {
+	t.Run("Should coalesce buffered wakes through the durable watermark", func(t *testing.T) {
+		t.Parallel()
+		streamDone := make(chan struct{})
+		wakes := make(chan store.SessionEvent, 100)
+		for sequence := int64(2); sequence <= 101; sequence++ {
+			wakes <- store.SessionEvent{Sequence: sequence, Type: "agent_message"}
+		}
+		queries := 0
+		info := streamTestSessionInfo("sess-burst")
+		handlers := &BaseHandlers{Sessions: sessionManagerStub{
+			events: func(context.Context, string, store.EventQuery) ([]store.SessionEvent, error) { return nil, nil },
+			status: func(context.Context, string) (*session.Info, error) { return info, nil },
+			transcriptChanges: func(_ context.Context, _ string, query transcript.ChangeQuery) (transcript.ChangePage, error) {
+				queries++
+				if query.AfterSequence != 1 || query.Limit != 200 {
+					t.Fatalf("change query = %#v, want bounded replay after 1", query)
+				}
+				close(streamDone)
+				return transcript.ChangePage{
+					Generation: 4, MaxSequence: 101, NextAfter: 101,
+					Entries: []transcript.Entry{{StartSequence: 2, Sequence: 101,
+						Message: transcript.UIMessage{ID: "burst", Role: transcript.UIRoleAssistant}}},
+				}, nil
+			},
+		}}
+		handlers.SetStreamDone(streamDone)
+		gin.SetMode(gin.TestMode)
+		ctx, _ := gin.CreateTestContext(httptest.NewRecorder())
+		ctx.Request = httptest.NewRequestWithContext(t.Context(), "GET", "/stream", http.NoBody)
+		writer := &streamTestFlushWriter{}
+		handlers.pushAndStreamSessionTranscript(ctx, writer, info.ID, info,
+			transcriptStreamState{cursor: 1, generation: 4, epoch: 3, commandCheckedAt: time.Now()},
+			200, sessionEventStreamSubscription{events: wakes, cancel: func() {}})
+		if queries != 1 || strings.Count(writer.String(), "event: transcript_delta") != 1 {
+			t.Fatalf("burst queries = %d, body = %s; want one coalesced delta", queries, writer.String())
+		}
+		for line := range strings.SplitSeq(writer.String(), "\n") {
+			if !strings.HasPrefix(line, "data: ") {
+				continue
+			}
+			var payload contract.TranscriptDeltaPayload
+			if err := json.Unmarshal([]byte(strings.TrimPrefix(line, "data: ")), &payload); err != nil {
+				t.Fatal(err)
+			}
+			if payload.Cursor != 101 || len(payload.Entries) != 1 || payload.Entries[0].Sequence != 101 {
+				t.Fatalf("delta = %#v, want complete burst through 101", payload)
+			}
+		}
+	})
+}
+
+func TestTranscriptReconnectFence(t *testing.T) {
+	t.Parallel()
+
+	epoch := int64(3)
+	generation := int64(4)
+	testCases := []struct {
+		name               string
+		cursor             int64
+		expectedEpoch      *int64
+		expectedGeneration *int64
+		want               string
+	}{
+		{
+			name:   "Should allow an initial subscription without reconnect fences",
+			cursor: 0,
+		},
+		{
+			name:   "Should reset a reconnect missing expected identity",
+			cursor: 7,
+			want:   contract.TranscriptSnapshotReasonFenceMissing,
+		},
+		{
+			name:               "Should reset an epoch mismatch",
+			cursor:             7,
+			expectedEpoch:      new(int64(2)),
+			expectedGeneration: &generation,
+			want:               contract.TranscriptSnapshotReasonEpochMismatch,
+		},
+		{
+			name:               "Should reset a generation mismatch",
+			cursor:             7,
+			expectedEpoch:      &epoch,
+			expectedGeneration: new(int64(3)),
+			want:               contract.TranscriptSnapshotReasonGenerationMismatch,
+		},
+		{
+			name:               "Should reset a cursor beyond the projection max",
+			cursor:             13,
+			expectedEpoch:      &epoch,
+			expectedGeneration: &generation,
+			want:               contract.TranscriptSnapshotReasonSequenceReset,
+		},
+		{
+			name:               "Should preserve loaded history for a valid reconnect",
+			cursor:             7,
+			expectedEpoch:      &epoch,
+			expectedGeneration: &generation,
+		},
+	}
+
+	for _, testCase := range testCases {
+		t.Run(testCase.name, func(t *testing.T) {
+			t.Parallel()
+
+			got := transcriptReconnectResetReason(
+				testCase.cursor,
+				testCase.expectedEpoch,
+				testCase.expectedGeneration,
+				epoch,
+				generation,
+				12,
+			)
+			if got != testCase.want {
+				t.Fatalf("transcriptReconnectResetReason() = %q, want %q", got, testCase.want)
+			}
+		})
+	}
+}
+
+// Invariant: a reconnect with a rewritten or retired cursor receives a stated
+// bounded snapshot, never a partial delta. Owner: stream initialization suite.
+func TestInitializeTranscriptStream(t *testing.T) {
+	t.Parallel()
+	t.Run("Should replay usage committed between its read and the transcript watermark", func(t *testing.T) {
+		t.Parallel()
+		info := streamTestSessionInfo("sess-a")
+		handlers := &BaseHandlers{Sessions: sessionManagerStub{
+			status: func(context.Context, string) (*session.Info, error) { return info, nil },
+			events: func(_ context.Context, _ string, query store.EventQuery) ([]store.SessionEvent, error) {
+				if query.Type != "" {
+					return nil, nil
+				}
+				if query.AfterSequence != 12 {
+					t.Fatalf("usage cursor = %d, want 12", query.AfterSequence)
+				}
+				return []store.SessionEvent{{Sequence: 14, TurnID: "A", Type: acp.EventTypeDone}}, nil
+			},
+			transcriptChanges: func(context.Context, string, transcript.ChangeQuery) (transcript.ChangePage, error) {
+				return transcript.ChangePage{Generation: 4, MaxSequence: 14, NextAfter: 14}, nil
+			},
+		}}
+		writer := &streamTestFlushWriter{}
+		state, err := handlers.initializeTranscriptStream(t.Context(), writer, "sess-a", info, 10, 50,
+			sessionStreamOptions{expectedEpoch: new(int64(3)), expectedGeneration: new(int64(4))},
+			[]store.SessionEvent{{Sequence: 12, TurnID: "A", Type: acp.EventTypeUsage}})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if state.cursor != 14 {
+			t.Fatalf("transcript cursor = %d, want 14", state.cursor)
+		}
+		state.commandCheckedAt = time.Now()
+		state, _, err = handlers.refreshTranscriptStream(t.Context(), writer, "sess-a", info, state, 50, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if state.usageCursor != 14 || strings.Count(writer.String(), "event: session_usage_changed") != 2 ||
+			!strings.Contains(writer.String(), `"sequence":14,"turn_id":"A","kind":"done"`) {
+			t.Fatalf("usage catchup state=%#v frames=%s", state, writer.String())
+		}
+	})
+
+	t.Run("Should confirm the current watermark when reconnecting without new entries", func(t *testing.T) {
+		t.Parallel()
+		handlers := &BaseHandlers{Sessions: sessionManagerStub{
+			events: func(context.Context, string, store.EventQuery) ([]store.SessionEvent, error) { return nil, nil },
+			transcriptChanges: func(context.Context, string, transcript.ChangeQuery) (transcript.ChangePage, error) {
+				return transcript.ChangePage{Generation: 4, MaxSequence: 7, NextAfter: 7}, nil
+			},
+		}}
+		writer := &streamTestFlushWriter{}
+		state, err := handlers.initializeTranscriptStream(t.Context(), writer, "sess-a",
+			streamTestSessionInfo("sess-a"), 7, 2,
+			sessionStreamOptions{expectedEpoch: new(int64(3)), expectedGeneration: new(int64(4))}, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if state.cursor != 7 || state.generation != 4 || state.epoch != 3 {
+			t.Fatalf("stream state = %#v, want unchanged watermark 7/4/3", state)
+		}
+		body := writer.String()
+		if strings.Count(body, "event: transcript_delta\n") != 1 || strings.Contains(body, "transcript_snapshot") {
+			t.Fatalf("initial stream = %q, want one delta confirming the existing watermark", body)
+		}
+		var payload contract.TranscriptDeltaPayload
+		for line := range strings.SplitSeq(body, "\n") {
+			if data, ok := strings.CutPrefix(line, "data: "); ok {
+				if err := json.Unmarshal([]byte(data), &payload); err != nil {
+					t.Fatal(err)
+				}
+			}
+		}
+		if payload.Cursor != 7 || payload.MaxSequence != 7 || payload.Generation != 4 ||
+			payload.Epoch != 3 || payload.HasMore || payload.Entries == nil || len(payload.Entries) != 0 {
+			t.Fatalf("initial delta = %#v, want an empty caught-up frame at 7/4/3", payload)
+		}
+	})
+	for _, tc := range []struct {
+		name       string
+		epoch, min int64
+		reason     string
+	}{
+		{"epoch mismatch", 2, 0, contract.TranscriptSnapshotReasonEpochMismatch},
+		{"retention removed cursor", 3, 7, contract.TranscriptSnapshotReasonCursorExpired},
+	} {
+		t.Run("Should reset "+tc.name, func(t *testing.T) {
+			t.Parallel()
+			pageCalls := 0
+			changeCalls := 0
+			handlers := &BaseHandlers{Sessions: sessionManagerStub{
+				events: func(context.Context, string, store.EventQuery) ([]store.SessionEvent, error) { return nil, nil },
+				transcriptPage: func(
+					context.Context,
+					string,
+					transcript.PageQuery,
+				) (transcript.Page, error) {
+					pageCalls++
+					return transcript.Page{
+						Entries:     []transcript.Entry{{StartSequence: 7, Sequence: 7}},
+						Generation:  4,
+						MaxSequence: 7,
+					}, nil
+				},
+				transcriptChanges: func(
+					context.Context,
+					string,
+					transcript.ChangeQuery,
+				) (transcript.ChangePage, error) {
+					changeCalls++
+					return transcript.ChangePage{Generation: 4, MinSequence: tc.min, MaxSequence: 7, NextAfter: 5}, nil
+				},
+			}}
+			writer := &streamTestFlushWriter{}
+			wantEpoch := tc.epoch
+			wantGeneration := int64(4)
+
+			state, err := handlers.initializeTranscriptStream(
+				t.Context(),
+				writer,
+				"sess-a",
+				streamTestSessionInfo("sess-a"),
+				5,
+				2,
+				sessionStreamOptions{
+					expectedEpoch:      &wantEpoch,
+					expectedGeneration: &wantGeneration,
+				},
+				nil,
+			)
+			if err != nil {
+				t.Fatalf("initializeTranscriptStream() error = %v", err)
+			}
+			if state.cursor != 7 || state.generation != 4 || state.epoch != 3 {
+				t.Fatalf("stream state = %#v, want cursor/generation/epoch 7/4/3", state)
+			}
+			if pageCalls != 1 || changeCalls != 1 {
+				t.Fatalf(
+					"page/change calls = %d/%d, want one fence read and one reset snapshot",
+					pageCalls,
+					changeCalls,
+				)
+			}
+			for _, fragment := range []string{
+				"event: transcript_snapshot",
+				"id: 7",
+				`"reset":true`,
+				`"reason":"` + tc.reason + `"`,
+			} {
+				if !strings.Contains(writer.String(), fragment) {
+					t.Fatalf("stream body missing %q: %s", fragment, writer.String())
+				}
+			}
+			if strings.Contains(writer.String(), "event: transcript_delta") {
+				t.Fatalf("stream body contains a delta during reset: %s", writer.String())
+			}
+		})
+	}
+}
+
+func TestWriteGoalSnapshotChangedEvents(t *testing.T) {
+	t.Parallel()
+
+	t.Run("Should emit the latest indexed Goal signal without a transcript delta", func(t *testing.T) {
+		t.Parallel()
+
+		handlers := &BaseHandlers{Sessions: sessionManagerStub{
+			events: func(context.Context, string, store.EventQuery) ([]store.SessionEvent, error) { return nil, nil },
+			latestEvent: func(
+				_ context.Context,
+				sessionID string,
+				eventType string,
+			) (*store.SessionEvent, error) {
+				if sessionID != "sess-a" || eventType != session.EventTypeGoalSnapshotChanged {
+					t.Fatalf("LatestSessionEventByType(%q, %q), want sess-a Goal snapshot", sessionID, eventType)
+				}
+				return &store.SessionEvent{
+					Sequence: 12,
+					Type:     session.EventTypeGoalSnapshotChanged,
+					Content:  `{"run_id":"run-1","status":"running"}`,
+				}, nil
+			},
+		}}
+		writer := &streamTestFlushWriter{}
+
+		if err := handlers.writeGoalSnapshotChangedEvents(
+			t.Context(),
+			writer,
+			"sess-a",
+			11,
+			nil,
+		); err != nil {
+			t.Fatalf("writeGoalSnapshotChangedEvents() error = %v", err)
+		}
+
+		body := writer.String()
+		for _, fragment := range []string{
+			"event: goal_snapshot_changed",
+			`data: {"run_id":"run-1","status":"running"}`,
+		} {
+			if !strings.Contains(body, fragment) {
+				t.Fatalf("Goal snapshot stream body missing %q: %s", fragment, body)
+			}
+		} // Invariant: an out-of-band Goal snapshot cannot skip an undelivered transcript gap.
+		if strings.Contains(body, "id:") {
+			t.Fatalf("Goal side signal advanced the transcript cursor: %s", body)
+		}
+
+		if strings.Contains(body, "event: transcript_delta") {
+			t.Fatalf("Goal snapshot signal was emitted as a transcript delta: %s", body)
+		}
+	})
+}
+
+func TestWriteSessionCommandsChangedUsesRevisionAsWakeSignal(t *testing.T) {
+	t.Parallel()
+	t.Run("Should emit only a changed command revision", func(t *testing.T) {
+		t.Parallel()
+
+		first, err := commandpkg.BuildCatalog(commandpkg.DefaultBuiltins(), nil, nil)
+		if err != nil {
+			t.Fatalf("BuildCatalog(first) error = %v", err)
+		}
+		manager := &commandStreamManagerStub{catalog: first}
+		handlers := &BaseHandlers{Sessions: manager}
+		writer := &streamTestFlushWriter{}
+		revision, err := handlers.writeSessionCommandsChanged(
+			t.Context(), writer, "sess-command", "",
+		)
+		if err != nil {
+			t.Fatalf("writeSessionCommandsChanged(initial) error = %v", err)
+		}
+		if revision != first.Revision || writer.Len() != 0 {
+			t.Fatalf("initial revision/body = %q/%q, want silent initialization", revision, writer.String())
+		}
+
+		second, err := commandpkg.BuildCatalog(
+			commandpkg.DefaultBuiltins(),
+			[]commandpkg.AgentSpec{{Name: "compact", SourceID: "coder"}},
+			nil,
+		)
+		if err != nil {
+			t.Fatalf("BuildCatalog(second) error = %v", err)
+		}
+		manager.catalog = second
+		revision, err = handlers.writeSessionCommandsChanged(
+			t.Context(), writer, "sess-command", revision,
+		)
+		if err != nil {
+			t.Fatalf("writeSessionCommandsChanged(changed) error = %v", err)
+		}
+		if revision != second.Revision {
+			t.Fatalf("changed revision = %q, want %q", revision, second.Revision)
+		}
+		for _, fragment := range []string{
+			"event: session_commands_changed",
+			`"session_id":"sess-command"`,
+			`"revision":"` + second.Revision + `"`,
+		} {
+			if !strings.Contains(writer.String(), fragment) {
+				t.Fatalf("command wake body missing %q: %s", fragment, writer.String())
+			}
+		}
+		if strings.Contains(writer.String(), `"commands"`) {
+			t.Fatalf("command wake frame contains catalog data: %s", writer.String())
+		}
+
+		stableWriter := &streamTestFlushWriter{}
+		revision, err = handlers.writeSessionCommandsChanged(
+			t.Context(),
+			stableWriter,
+			"sess-command",
+			second.Revision,
+		)
+		if err != nil {
+			t.Fatalf("writeSessionCommandsChanged(unchanged) error = %v", err)
+		}
+		if revision != second.Revision || stableWriter.Len() != 0 {
+			t.Fatalf(
+				"unchanged revision/body = %q/%q, want silent no-op",
+				revision,
+				stableWriter.String(),
+			)
+		}
+	})
+
+	t.Run("Should retain the previous revision when the catalog read fails", func(t *testing.T) {
+		t.Parallel()
+
+		catalogErr := errors.New("catalog temporarily unavailable")
+		var logs bytes.Buffer
+		handlers := &BaseHandlers{
+			Sessions: &commandStreamManagerStub{commandErr: catalogErr},
+			Logger:   slog.New(slog.NewJSONHandler(&logs, nil)),
+		}
+		writer := &streamTestFlushWriter{}
+
+		revision, err := handlers.writeSessionCommandsChanged(
+			t.Context(),
+			writer,
+			"sess-command",
+			"revision-before",
+		)
+		if err != nil {
+			t.Fatalf("writeSessionCommandsChanged() error = %v", err)
+		}
+		if revision != "revision-before" || writer.Len() != 0 {
+			t.Fatalf("revision/body = %q/%q, want unchanged and empty", revision, writer.String())
+		}
+		if !strings.Contains(logs.String(), catalogErr.Error()) {
+			t.Fatalf("catalog failure log missing %q: %s", catalogErr, logs.String())
+		}
+	})
+}
+
+func TestWriteTranscriptChangePages(t *testing.T) {
+	t.Parallel()
+
+	t.Run("Should drain repairs and advance through an empty visible change page", func(t *testing.T) {
+		t.Parallel()
+
+		calls := make([]transcript.ChangeQuery, 0, 2)
+		handlers := &BaseHandlers{Sessions: sessionManagerStub{
+			transcriptChanges: func(
+				_ context.Context,
+				_ string,
+				query transcript.ChangeQuery,
+			) (transcript.ChangePage, error) {
+				calls = append(calls, query)
+				switch len(calls) {
+				case 1:
+					return transcript.ChangePage{
+						Entries: []transcript.Entry{{
+							StartSequence: 2,
+							Sequence:      9,
+							Message: transcript.UIMessage{
+								ID:   "historical-tool-entry",
+								Role: transcript.UIRoleAssistant,
+							},
+						}},
+						Generation:  4,
+						MaxSequence: 12,
+						HasMore:     true,
+						NextAfter:   9,
+					}, nil
+				default:
+					return transcript.ChangePage{
+						Entries:     []transcript.Entry{},
+						Generation:  4,
+						MaxSequence: 12,
+						NextAfter:   9,
+					}, nil
+				}
+			},
+			events: func(context.Context, string, store.EventQuery) ([]store.SessionEvent, error) {
+				t.Fatal("Events() called for transcript changes")
+				return nil, nil
+			},
+		}}
+		writer := &streamTestFlushWriter{}
+
+		cursor, generation, err := handlers.writeTranscriptChangePages(
+			t.Context(),
+			writer,
+			"sess-a",
+			streamTestSessionInfo("sess-a"),
+			7,
+			2,
+			nil,
+		)
+		if err != nil {
+			t.Fatalf("writeTranscriptChangePages() error = %v", err)
+		}
+		if cursor != 12 || generation != 4 {
+			t.Fatalf("cursor/generation = %d/%d, want 12/4", cursor, generation)
+		}
+		if len(calls) != 2 || calls[0].AfterSequence != 7 || calls[1].AfterSequence != 9 {
+			t.Fatalf("TranscriptChanges() calls = %#v, want cursors 7 then 9", calls)
+		}
+		body := writer.String()
+		if got, want := strings.Count(body, "event: transcript_delta"), 2; got != want {
+			t.Fatalf("transcript delta frames = %d, want %d\n%s", got, want, body)
+		}
+		for _, fragment := range []string{
+			"id: 9",
+			`"start_sequence":2`,
+			`"entries":[]`,
+		} {
+			if !strings.Contains(body, fragment) {
+				t.Fatalf("stream body missing %q: %s", fragment, body)
+			}
+		}
+	})
+
+	t.Run("Should reject a generation change after a zero-generation page", func(t *testing.T) {
+		t.Parallel()
+
+		calls := 0
+		handlers := &BaseHandlers{Sessions: sessionManagerStub{
+			events: func(context.Context, string, store.EventQuery) ([]store.SessionEvent, error) { return nil, nil },
+			transcriptChanges: func(
+				context.Context,
+				string,
+				transcript.ChangeQuery,
+			) (transcript.ChangePage, error) {
+				calls++
+				if calls == 1 {
+					return transcript.ChangePage{
+						Entries:     []transcript.Entry{{StartSequence: 8, Sequence: 8}},
+						Generation:  0,
+						MaxSequence: 9,
+						HasMore:     true,
+						NextAfter:   8,
+					}, nil
+				}
+				return transcript.ChangePage{
+					Entries:     []transcript.Entry{{StartSequence: 9, Sequence: 9}},
+					Generation:  1,
+					MaxSequence: 9,
+					NextAfter:   9,
+				}, nil
+			},
+		}}
+
+		_, _, err := handlers.writeTranscriptChangePages(
+			t.Context(),
+			&streamTestFlushWriter{},
+			"sess-a",
+			streamTestSessionInfo("sess-a"),
+			7,
+			2,
+			nil,
+		)
+		if !errors.Is(err, transcript.ErrProjectionIncompatible) {
+			t.Fatalf("writeTranscriptChangePages() error = %v, want projection incompatibility", err)
+		}
+	})
+}
+
+func waitForStreamTestSignal(t *testing.T, signal <-chan struct{}, label string) {
+	t.Helper()
+
+	timer := time.NewTimer(time.Second)
+	defer timer.Stop()
+	select {
+	case <-signal:
+	case <-timer.C:
+		t.Fatalf("timed out waiting for %s", label)
+	}
+}
+
+func TestWriteUsageChangedEvents(t *testing.T) {
+	t.Parallel()
+	for _, tc := range []struct {
+		name string
+		poll bool
+	}{{"Should emit each pushed usage change without advancing the transcript cursor", false}, {"Should read every usage change after the polling cursor", true}} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			events := []store.SessionEvent{
+				{Sequence: 10, Type: acp.EventTypeUsage},
+				{Sequence: 11, Type: acp.EventTypeAgentMessage},
+				{Sequence: 12, TurnID: "A", Type: acp.EventTypeUsage},
+				{
+					Sequence: 13,
+					TurnID:   "A",
+					Type:     acp.EventTypeCompaction,
+					Content:  `{"compaction":{"compaction_id":"c1","status":"in_progress"}}`,
+				},
+				{
+					Sequence: 14,
+					TurnID:   "A",
+					Type:     acp.EventTypeCompaction,
+					Content:  `{"compaction":{"compaction_id":"c1","status":"completed"}}`,
+				},
+				{Sequence: 15, TurnID: "A", Type: eventspkg.SessionCompactionFired},
+				{Sequence: 16, TurnID: "A", Type: acp.EventTypeDone},
+				{Sequence: 17, TurnID: "A", Type: acp.EventTypePromptDelivery},
+				{Sequence: 18, TurnID: "A", Type: acp.EventTypeAgentMessage},
+			}
+			calls := 0
+			handlers := &BaseHandlers{
+				Sessions: sessionManagerStub{
+					eventMetadata: func(_ context.Context, id string, query store.EventQuery) ([]store.EventMetadata, error) {
+						calls++
+						if id != "sess-a" || query.AfterSequence != 10 {
+							t.Fatalf("poll scope=%s %#v", id, query)
+						}
+						var result []store.EventMetadata
+						for _, event := range events {
+							if (query.Type == "" || event.Type == query.Type) && event.Sequence > query.AfterSequence {
+								result = append(result, store.EventMetadata{
+									Sequence: event.Sequence, TurnID: event.TurnID, Type: event.Type,
+								})
+							}
+						}
+						return result, nil
+					},
+				},
+			}
+			supplied := events
+			if tc.poll {
+				supplied = nil
+			}
+			writer := &streamTestFlushWriter{}
+			cursor, err := handlers.writeUsageChangedEvents(t.Context(), writer, "sess-a", 10, supplied)
+			if err != nil {
+				t.Fatal(err)
+			}
+			body := writer.String()
+			if cursor != 18 || strings.Count(body, "event: session_usage_changed") != 6 ||
+				strings.Contains(body, "id:") ||
+				strings.Contains(body, `"sequence":10`) {
+				t.Fatalf("usage frames=%s", body)
+			}
+			if (tc.poll && calls != 1) || (!tc.poll && calls != 0) {
+				t.Fatalf("poll calls=%d", calls)
+			}
+			golden, err := os.ReadFile(filepath.Join("testdata", "session-context", "usage-changed.json"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			var want map[string]any
+			if err := json.Unmarshal(golden, &want); err != nil {
+				t.Fatal(err)
+			}
+			wants := []map[string]any{
+				want,
+				{"sequence": float64(13), "turn_id": "A", "kind": acp.EventTypeCompaction},
+				{"sequence": float64(14), "turn_id": "A", "kind": acp.EventTypeCompaction},
+				{"sequence": float64(15), "turn_id": "A", "kind": eventspkg.SessionCompactionFired},
+				{"sequence": float64(16), "turn_id": "A", "kind": acp.EventTypeDone},
+				{"sequence": float64(17), "turn_id": "A", "kind": acp.EventTypePromptDelivery},
+			}
+			var got []map[string]any
+			for line := range strings.SplitSeq(body, "\n") {
+				if strings.HasPrefix(line, "data: ") {
+					var payload map[string]any
+					if err := json.Unmarshal([]byte(strings.TrimPrefix(line, "data: ")), &payload); err != nil {
+						t.Fatal(err)
+					}
+					got = append(got, payload)
+				}
+			}
+			if !reflect.DeepEqual(got, wants) {
+				t.Fatalf("usage changes=%#v want=%#v", got, wants)
+			}
+			if _, err := handlers.writeUsageChangedEvents(t.Context(), writer, "sess-a", cursor, events); err != nil {
+				t.Fatal(err)
+			}
+			if writer.String() != body {
+				t.Fatal("repeated ledger events emitted duplicate usage changes")
+			}
+		})
+	}
+	t.Run("Should propagate read and stream write failures", func(t *testing.T) {
+		t.Parallel()
+		failure := errors.New("ledger unavailable")
+		h := &BaseHandlers{
+			Sessions: sessionManagerStub{
+				eventMetadata: func(context.Context, string, store.EventQuery) ([]store.EventMetadata, error) { return nil, failure },
+			},
+		}
+		if _, err := h.writeUsageChangedEvents(
+			t.Context(),
+			&streamTestFlushWriter{},
+			"sess-a",
+			0,
+			nil,
+		); !errors.Is(
+			err,
+			failure,
+		) {
+			t.Fatalf("read error=%v", err)
+		}
+		writer := &streamTestFailWriter{err: failure}
+		if _, err := h.writeUsageChangedEvents(
+			t.Context(),
+			writer,
+			"sess-a",
+			0,
+			[]store.SessionEvent{{Sequence: 1, Type: acp.EventTypeDone}},
+		); !errors.Is(
+			err,
+			failure,
+		) {
+			t.Fatalf("write error=%v", err)
+		}
+	})
+}
+
+// IT-019: the parent stream seeds subagents before forwarding committed updates.
+func TestSubagentStreamOrdering(t *testing.T) {
+	t.Parallel()
+	for _, push := range []bool{false, true} {
+		name := "Should seed and forward subagents through polling"
+		if push {
+			name = "Should seed and forward subagents through push"
+		}
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+			info := streamTestSessionInfo("parent")
+			service := &subagentStreamStub{t: t, updates: make(chan session.SubagentUpdate, 1)}
+			service.updates <- session.SubagentUpdate{ParentSessionID: "parent", Subagent: session.Subagent{SessionSubagent: store.SessionSubagent{ID: "sub-1", Status: "completed"}}}
+			close(service.updates)
+			manager := sessionManagerStub{
+				events: func(context.Context, string, store.EventQuery) ([]store.SessionEvent, error) {
+					return []store.SessionEvent{}, nil
+				},
+				transcriptPage: func(context.Context, string, transcript.PageQuery) (transcript.Page, error) {
+					return transcript.Page{Generation: 1}, nil
+				},
+			}
+			handlers := &BaseHandlers{
+				Sessions:     manager,
+				Subagents:    service,
+				PollInterval: time.Hour,
+				Logger:       slog.New(slog.NewTextHandler(io.Discard, nil)),
+			}
+			ctx, _ := gin.CreateTestContext(httptest.NewRecorder())
+			ctx.Request = httptest.NewRequestWithContext(t.Context(), "GET", "/stream", http.NoBody)
+			writer := &streamTestFlushWriter{}
+			subscription := sessionEventStreamSubscription{}
+			if push {
+				subscription.events = make(chan store.SessionEvent)
+				subscription.cancel = func() {}
+			}
+			handlers.streamTranscriptSessionEvents(
+				ctx,
+				writer,
+				"parent",
+				info,
+				store.EventQuery{Limit: 200},
+				nil,
+				sessionStreamOptions{frameMode: contract.SessionStreamFrameTranscript},
+				subscription,
+			)
+			body := writer.String()
+			snapshot := strings.Index(body, "event: transcript_snapshot")
+			subagents := strings.Index(body, "event: subagents_snapshot")
+			updated := strings.Index(body, "event: subagent_updated")
+			if snapshot < 0 || subagents <= snapshot || updated <= subagents ||
+				!strings.Contains(body, `"status":"completed"`) ||
+				!service.canceled {
+				t.Fatalf("invalid ordering or subscription cleanup (canceled=%v): %s", service.canceled, body)
+			}
+		})
+	}
+}
+
+// Greptile 711: the snapshot replaces the client roster, so it must carry every page.
+func TestSubagentSnapshotCarriesEveryPage(t *testing.T) {
+	t.Parallel()
+	t.Run("Should follow the cursor past the first page", func(t *testing.T) {
+		t.Parallel()
+		service := &subagentStreamStub{t: t, subscribed: true, pages: map[string]store.SubagentPage{
+			"":       {Items: []store.SessionSubagent{{ID: "sub-new", Status: "running"}}, NextCursor: "page-2"},
+			"page-2": {Items: []store.SessionSubagent{{ID: "sub-old", Status: "completed"}}},
+		}}
+		handlers := &BaseHandlers{Subagents: service}
+		writer := &streamTestFlushWriter{}
+		if err := handlers.writeSubagentsSnapshot(
+			t.Context(),
+			writer,
+			"parent",
+			streamTestSessionInfo("parent"),
+		); err != nil {
+			t.Fatal(err)
+		}
+		body := writer.String()
+		if !strings.Contains(body, `"sub-new"`) || !strings.Contains(body, `"sub-old"`) {
+			t.Fatalf("snapshot dropped a page: %s", body)
+		}
+	})
+}
+
+type subagentStreamStub struct {
+	session.SubagentService
+	t          *testing.T
+	updates    chan session.SubagentUpdate
+	subscribed bool
+	canceled   bool
+	pages      map[string]store.SubagentPage
+}
+
+var _ session.SubagentService = (*subagentStreamStub)(nil)
+var _ session.SubagentUpdateSubscriber = (*subagentStreamStub)(nil)
+
+func (s *subagentStreamStub) SubscribeSubagentUpdates(
+	_ context.Context,
+	id string,
+) (<-chan session.SubagentUpdate, func(), error) {
+	s.t.Helper()
+	if id != "parent" {
+		s.t.Fatalf("subscription id = %s", id)
+	}
+	s.subscribed = true
+	return s.updates, func() { s.canceled = true }, nil
+}
+func (s *subagentStreamStub) List(_ context.Context, q store.SubagentListQuery) (store.SubagentPage, error) {
+	s.t.Helper()
+	if !s.subscribed || q.ParentSessionID != "parent" || q.Limit != 200 || q.WorkspaceID != "ws-workspace" {
+		s.t.Fatalf("unfenced snapshot: %+v", q)
+	}
+	if s.pages != nil {
+		return s.pages[q.Cursor], nil
+	}
+	return store.SubagentPage{Items: []store.SessionSubagent{{ID: "sub-1", Status: "running"}}}, nil
+}

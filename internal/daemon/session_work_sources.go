@@ -1,0 +1,276 @@
+package daemon
+
+import (
+	"context"
+	"errors"
+	"time"
+
+	looppkg "github.com/compozy/compozy/internal/loop"
+	"github.com/compozy/compozy/internal/monitor"
+	"github.com/compozy/compozy/internal/session"
+	"github.com/compozy/compozy/internal/store"
+	taskpkg "github.com/compozy/compozy/internal/task"
+	"github.com/compozy/compozy/internal/toolruntime"
+)
+
+type sessionLoopWorkReader interface {
+	ListSessionLoopWork(context.Context, store.ReadScope, string, string, looppkg.RunID) ([]looppkg.SessionWork, error)
+}
+
+type sessionWorkSources struct {
+	state   *bootState
+	manager *session.Manager
+	now     func() time.Time
+}
+
+func (s sessionWorkSources) tools(ctx context.Context, id string) ([]session.WorkSignal, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	if s.state.processRegistry == nil {
+		return nil, errors.New("tool process registry is unavailable")
+	}
+	result := make([]session.WorkSignal, 0)
+	for _, observation := range s.state.processRegistry.Observations(id) {
+		until := observation.VerifiedAt.Add(2 * toolruntime.SweepInterval)
+		result = append(result, session.WorkSignal{
+			Kind: session.WorkSignalToolRunning, Since: observation.Record.CreatedAt,
+			Ref: observation.Record.ID, ValidUntil: until, StaleAttention: true,
+		})
+	}
+	return result, nil
+}
+
+func (s sessionWorkSources) children(ctx context.Context, id string) ([]session.WorkSignal, error) {
+	parent, err := s.manager.Status(ctx, id)
+	if err != nil {
+		return nil, err
+	}
+	rows, err := s.state.registry.ListSessions(ctx, store.SessionListQuery{
+		ReadScope: store.ReadScope{ProfileID: parent.ProfileID}, WorkspaceID: parent.WorkspaceID,
+		ParentSessionID: id,
+	})
+	if err != nil {
+		return nil, err
+	}
+	result := make([]session.WorkSignal, 0)
+	for i := range rows {
+		row := &rows[i]
+		// A session continued or forked from this one is not its child and keeps no work.
+		if store.HierarchyParentSessionID(row.Lineage) != id {
+			continue
+		}
+		// A daemon-owned child (auto-title) is not work the session delegated: it must
+		// not hold the parent waiting, like it stays out of catalogs and metrics.
+		if session.IsInternalSpawnRole(row.Lineage.SpawnRole) {
+			continue
+		}
+		info, err := s.manager.Status(ctx, row.ID)
+		if err != nil {
+			return nil, err
+		}
+		until := s.now().Add(2 * toolruntime.SweepInterval)
+		switch info.State {
+		case session.StateStarting, session.StateActive:
+			finished, err := s.childDelegationFinished(ctx, row.ID, row.Lineage.SpawnRole)
+			if err != nil {
+				return nil, err
+			}
+			if finished {
+				continue
+			}
+		case session.StateStopping:
+			child, ok := s.manager.Get(info.ID)
+			if !ok {
+				return nil, errors.New("stopping child has no live stop episode")
+			}
+			until = child.StoppingDeadline(s.state.cfg.Session.Stop.CooperativeGrace)
+			if until.IsZero() {
+				return nil, errors.New("stopping child has no stop deadline")
+			}
+		default:
+			continue
+		}
+		result = append(result, session.WorkSignal{Kind: session.WorkSignalActiveChild,
+			Since: info.CreatedAt, Ref: info.ID, ValidUntil: until, StaleAttention: info.State == session.StateStopping,
+		})
+	}
+	return result, nil
+}
+
+// A completed delegation can keep its ACP session alive without keeping its parent waiting.
+func (s sessionWorkSources) childDelegationFinished(ctx context.Context, id, role string) (bool, error) {
+	if role != store.SubagentSpawnRole {
+		return false, nil
+	}
+	db, ok := s.state.registry.(store.SubagentStore)
+	if !ok {
+		return false, errors.New("subagent store is unavailable")
+	}
+	row, err := db.GetSubagentByChild(ctx, id)
+	if errors.Is(err, store.ErrSubagentNotFound) {
+		return false, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	return store.IsSubagentStatusTerminal(row.Status), nil
+}
+
+func (s sessionWorkSources) leases(ctx context.Context, id string) ([]session.WorkSignal, error) {
+	if s.state.tasks == nil {
+		return nil, errors.New("task store is unavailable")
+	}
+	info, err := s.manager.Status(ctx, id)
+	if err != nil {
+		return nil, err
+	}
+	rows, err := s.state.tasks.store.ListTaskRuns(ctx, taskpkg.RunQuery{
+		ReadScope: store.ReadScope{ProfileID: info.ProfileID}, SessionID: id,
+	})
+	if err != nil {
+		return nil, err
+	}
+	result := make([]session.WorkSignal, 0)
+	for i := range rows {
+		row := &rows[i]
+		switch row.Status {
+		case taskpkg.TaskRunStatusClaimed, taskpkg.TaskRunStatusStarting, taskpkg.TaskRunStatusRunning:
+			if row.LeaseUntil.IsZero() {
+				continue
+			}
+			result = append(result, session.WorkSignal{Kind: session.WorkSignalTaskLease,
+				Since: row.ClaimedAt, Ref: row.ID, ValidUntil: row.LeaseUntil,
+			})
+		}
+	}
+	return result, nil
+}
+
+func (s sessionWorkSources) loopWork(ctx context.Context, id string) ([]looppkg.SessionWork, error) {
+	reader, ok := s.state.registry.(sessionLoopWorkReader)
+	if !ok {
+		return nil, errors.New("loop work store is unavailable")
+	}
+	info, err := s.manager.Status(ctx, id)
+	if err != nil {
+		return nil, err
+	}
+	var judgeRunID looppkg.RunID
+	if s.state.tasks != nil && s.state.tasks.loopJudges != nil {
+		judgeRunID = s.state.tasks.loopJudges.executions.loopRunForSession(id)
+	}
+	return reader.ListSessionLoopWork(ctx, store.ReadScope{ProfileID: info.ProfileID}, info.WorkspaceID, id, judgeRunID)
+}
+
+// loops projects durable Loop work, omitting quiet paused or watching Runs that require no attention.
+func (s sessionWorkSources) loops(ctx context.Context, id string) ([]session.WorkSignal, error) {
+	rows, err := s.loopWork(ctx, id)
+	if err != nil {
+		return nil, err
+	}
+	result := make([]session.WorkSignal, 0, len(rows))
+	for _, row := range rows {
+		if (row.Status == looppkg.StatusPaused || row.Status == looppkg.StatusWatching) && !row.NeedsAttention &&
+			len(row.Waits) == 0 {
+			continue
+		}
+		result = append(result, sessionLoopWorkSignal(row))
+	}
+	return result, nil
+}
+
+// Durable leases and admitted wait deadlines bound activity; reading a run never renews it.
+func sessionLoopWorkSignal(row looppkg.SessionWork) session.WorkSignal {
+	until := row.ReconciledAt.Add(2 * defaultMechanicalSchedulerInterval)
+	if initial := row.Since.Add(2 * defaultMechanicalSchedulerInterval); initial.After(until) {
+		until = initial
+	}
+	if row.LeaseUntil.After(until) {
+		until = row.LeaseUntil
+	}
+	attention := ""
+	if row.NeedsAttention {
+		attention = "Loop work requires attention; inspect the run's node failures and quarantine."
+	}
+	if row.Status == looppkg.StatusNeedsApproval {
+		attention = "The Goal or Loop is waiting for approval; inspect the run's pending request."
+	}
+	for _, wait := range row.Waits {
+		if wait.ClaimState == looppkg.WaitClaimInterventionRequired {
+			attention = "A Loop wait requires intervention; inspect the run's pending request."
+			continue
+		}
+		deadline := wait.ResumeAt
+		if wait.NextEscalationAt != nil && (deadline == nil || wait.NextEscalationAt.Before(*deadline)) {
+			deadline = wait.NextEscalationAt
+		}
+		if deadline != nil && deadline.Add(2*defaultMechanicalSchedulerInterval).After(until) {
+			until = deadline.Add(2 * defaultMechanicalSchedulerInterval)
+		}
+	}
+	return session.WorkSignal{
+		Kind: session.WorkSignalLoopRun, Since: row.Since, Ref: string(row.RunID), ValidUntil: until,
+		StaleAttention: attention == "", AttentionReason: attention,
+	}
+}
+
+func (s sessionWorkSources) waits(ctx context.Context, id string) ([]session.WorkSignal, error) {
+	rows, err := s.loopWork(ctx, id)
+	if err != nil {
+		return nil, err
+	}
+	result := make([]session.WorkSignal, 0)
+	for i := range rows {
+		row := &rows[i]
+		for _, wait := range row.Waits {
+			if wait.ClaimState != looppkg.WaitClaimWaiting && wait.ClaimState != looppkg.WaitClaimClaimed {
+				continue
+			}
+			deadline := wait.ResumeAt
+			if wait.NextEscalationAt != nil && (deadline == nil || wait.NextEscalationAt.Before(*deadline)) {
+				deadline = wait.NextEscalationAt
+			}
+			if deadline == nil {
+				return nil, errors.New("scheduled wait has no admission deadline")
+			}
+			result = append(result, session.WorkSignal{Kind: session.WorkSignalScheduledWait,
+				Since: wait.CreatedAt, Ref: string(row.RunID) + ":" + string(wait.NodeID), ValidUntil: *deadline,
+			})
+		}
+	}
+	return result, nil
+}
+
+// replies delegates to the reply-watch service, which owns the watch states and the target liveness rule.
+func (s sessionWorkSources) replies(ctx context.Context, id string) ([]session.WorkSignal, error) {
+	service := s.manager.ReplyWatches()
+	if service == nil {
+		return nil, errors.New("reply watch service is unavailable")
+	}
+	return service.AwaitingReplySignals(ctx, id, s.now().Add(2*toolruntime.SweepInterval))
+}
+
+func (s sessionWorkSources) monitors(ctx context.Context, id string) ([]session.WorkSignal, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	if s.state.sessionMonitors == nil {
+		return nil, errors.New("monitor service is unavailable")
+	}
+	result := make([]session.WorkSignal, 0)
+	for _, item := range s.state.sessionMonitors.List(id) {
+		if item.Status != monitor.StatusActive && item.Status != monitor.StatusDelivering {
+			continue
+		}
+		validUntil := item.DeadlineAt
+		if item.Status == monitor.StatusDelivering {
+			validUntil = s.now().Add(2 * toolruntime.SweepInterval)
+		}
+		result = append(result, session.WorkSignal{
+			Kind: session.WorkSignalActiveMonitor, Since: item.CreatedAt,
+			Ref: item.ID, ValidUntil: validUntil,
+		})
+	}
+	return result, nil
+}

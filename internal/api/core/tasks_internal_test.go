@@ -1,0 +1,707 @@
+package core
+
+import (
+	"bytes"
+	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"net/http"
+	"net/http/httptest"
+	"reflect"
+	"strings"
+	"testing"
+	"time"
+
+	compozyconfig "github.com/compozy/compozy/internal/config"
+	"github.com/compozy/compozy/internal/gateway"
+	"github.com/compozy/compozy/internal/workspaceaccess"
+
+	"github.com/compozy/compozy/internal/agentidentity"
+	"github.com/compozy/compozy/internal/api/contract"
+	"github.com/compozy/compozy/internal/session"
+	"github.com/compozy/compozy/internal/store"
+	taskpkg "github.com/compozy/compozy/internal/task"
+	workspacepkg "github.com/compozy/compozy/internal/workspace"
+	"github.com/gin-gonic/gin"
+)
+
+type workspaceGetterFunc func(context.Context, string) (workspacepkg.Workspace, error)
+
+func (f workspaceGetterFunc) Get(ctx context.Context, ref string) (workspacepkg.Workspace, error) {
+	return f(ctx, ref)
+}
+
+type workspaceServiceStub struct {
+	get     workspaceGetterFunc
+	resolve func(context.Context, string) (workspacepkg.ResolvedWorkspace, error)
+	list    func(context.Context) ([]workspacepkg.Workspace, error)
+}
+
+func (s workspaceServiceStub) Register(context.Context, workspacepkg.RegisterOptions) (workspacepkg.Workspace, error) {
+	return workspacepkg.Workspace{}, workspacepkg.ErrWorkspaceNotFound
+}
+
+func (s workspaceServiceStub) Unregister(context.Context, string) error {
+	return workspacepkg.ErrWorkspaceNotFound
+}
+
+func (s workspaceServiceStub) Update(context.Context, string, workspacepkg.UpdateOptions) error {
+	return workspacepkg.ErrWorkspaceNotFound
+}
+
+func (s workspaceServiceStub) List(ctx context.Context) ([]workspacepkg.Workspace, error) {
+	if s.list != nil {
+		return s.list(ctx)
+	}
+	return nil, nil
+}
+
+func (s workspaceServiceStub) Get(ctx context.Context, ref string) (workspacepkg.Workspace, error) {
+	return s.get(ctx, ref)
+}
+
+func (s workspaceServiceStub) Resolve(
+	ctx context.Context,
+	ref string,
+) (workspacepkg.ResolvedWorkspace, error) {
+	if s.resolve != nil {
+		return s.resolve(ctx, ref)
+	}
+	return workspacepkg.ResolvedWorkspace{}, workspacepkg.ErrWorkspaceNotFound
+}
+
+func (s workspaceServiceStub) ResolveOrRegister(context.Context, string) (workspacepkg.ResolvedWorkspace, error) {
+	return workspacepkg.ResolvedWorkspace{}, workspacepkg.ErrWorkspaceNotFound
+}
+
+func assertTaskValidationError(t *testing.T, err error, wantSubstring string) {
+	t.Helper()
+	if !errors.Is(err, taskpkg.ErrValidation) {
+		t.Fatalf("error = %v, want task validation error", err)
+	}
+	if wantSubstring != "" && !strings.Contains(err.Error(), wantSubstring) {
+		t.Fatalf("error = %q, want substring %q", err.Error(), wantSubstring)
+	}
+}
+
+func TestStatusForTaskAgentIdentityErrors(t *testing.T) {
+	t.Parallel()
+
+	t.Run("Should map agent identity failures to stable task statuses", func(t *testing.T) {
+		t.Parallel()
+
+		if got := StatusForTaskError(agentidentity.ErrIdentityRequired); got != http.StatusUnauthorized {
+			t.Fatalf("StatusForTaskError(identity required) = %d, want %d", got, http.StatusUnauthorized)
+		}
+		if got := StatusForTaskError(agentidentity.ErrIdentityLookupUnavailable); got != http.StatusServiceUnavailable {
+			t.Fatalf(
+				"StatusForTaskError(identity lookup unavailable) = %d, want %d",
+				got,
+				http.StatusServiceUnavailable,
+			)
+		}
+		if got := StatusForTaskError(agentidentity.ErrIdentityUnauthorized); got != http.StatusForbidden {
+			t.Fatalf("StatusForTaskError(identity unauthorized) = %d, want %d", got, http.StatusForbidden)
+		}
+		if got := StatusForAgentIdentityError(
+			fmt.Errorf("resolve target: %w", workspacepkg.ErrWorkspaceNotFound),
+		); got != http.StatusNotFound {
+			t.Fatalf("StatusForAgentIdentityError(workspace not found) = %d, want %d", got, http.StatusNotFound)
+		}
+	})
+}
+
+func TestTaskActorContextAndTransportHelpers(t *testing.T) {
+	t.Parallel()
+
+	gin.SetMode(gin.TestMode)
+
+	testCases := []struct {
+		name      string
+		transport string
+		wantKind  taskpkg.OriginKind
+	}{
+		{name: "uds", transport: "uds-api", wantKind: taskpkg.OriginKindUDS},
+		{name: "web", transport: "web-ui", wantKind: taskpkg.OriginKindWeb},
+		{name: "cli", transport: "compozy-cli", wantKind: taskpkg.OriginKindCLI},
+		{name: "default", transport: "api-core-test", wantKind: taskpkg.OriginKindHTTP},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			recorder := httptest.NewRecorder()
+			ctx, _ := gin.CreateTestContext(recorder)
+			ctx.Request = httptest.NewRequestWithContext(t.Context(), http.MethodGet, "/tasks", http.NoBody)
+			handlers := &BaseHandlers{TransportName: tc.transport}
+
+			actor, err := handlers.taskActorContext(ctx, taskActionGet)
+			if err != nil {
+				t.Fatalf("taskActorContext() error = %v", err)
+			}
+			if actor.Actor.Ref != defaultTaskActorRef || actor.Origin.Kind != tc.wantKind ||
+				actor.Origin.Ref != "tasks.get" {
+				t.Fatalf("taskActorContext() = %#v", actor)
+			}
+		})
+	}
+
+	t.Run("Should custom resolver", func(t *testing.T) {
+		t.Parallel()
+
+		recorder := httptest.NewRecorder()
+		ctx, _ := gin.CreateTestContext(recorder)
+		ctx.Request = httptest.NewRequestWithContext(t.Context(), http.MethodGet, "/tasks", http.NoBody)
+		handlers := &BaseHandlers{
+			TaskActorContextResolver: func(_ *gin.Context, action string) (taskpkg.ActorContext, error) {
+				return taskpkg.DeriveHumanActorContext("user-2", taskpkg.OriginKindHTTP, "custom."+action)
+			},
+		}
+
+		actor, err := handlers.taskActorContext(ctx, taskActionList)
+		if err != nil {
+			t.Fatalf("taskActorContext(custom) error = %v", err)
+		}
+		if actor.Actor.Ref != "user-2" || actor.Origin.Ref != "custom.list" {
+			t.Fatalf("taskActorContext(custom) = %#v", actor)
+		}
+	})
+
+	t.Run("Should use validated agent identity headers", func(t *testing.T) {
+		t.Parallel()
+
+		recorder := httptest.NewRecorder()
+		ctx, _ := gin.CreateTestContext(recorder)
+		ctx.Request = httptest.NewRequestWithContext(t.Context(), http.MethodPost, "/tasks", http.NoBody)
+		ctx.Request.Header.Set(agentidentity.HeaderSessionID, "sess-agent")
+		ctx.Request.Header.Set(agentidentity.HeaderAgent, "coder")
+		handlers := &BaseHandlers{
+			TransportName: "uds-api",
+			Sessions: sessionManagerStub{status: func(_ context.Context, id string) (*session.Info, error) {
+				if id != "sess-agent" {
+					t.Fatalf("session id = %q, want sess-agent", id)
+				}
+				return &session.Info{
+					ID:          "sess-agent",
+					AgentName:   "coder",
+					WorkspaceID: "ws-1",
+					ProfileID:   store.DefaultProfileID,
+					State:       session.StateActive,
+				}, nil
+			}},
+			Workspaces: workspaceServiceStub{get: func(_ context.Context, ref string) (workspacepkg.Workspace, error) {
+				switch ref {
+				case "/workspace/subdir":
+					return workspacepkg.Workspace{ID: "ws-1", RootDir: "/workspace"}, nil
+				case "/foreign/subdir":
+					return workspacepkg.Workspace{ID: "ws-2", RootDir: "/foreign"}, nil
+				default:
+					return workspacepkg.Workspace{}, workspacepkg.ErrWorkspaceNotFound
+				}
+			}, resolve: func(
+				_ context.Context,
+				ref string,
+			) (workspacepkg.ResolvedWorkspace, error) {
+				switch ref {
+				case "/workspace/subdir":
+					return workspacepkg.ResolvedWorkspace{
+						ID: "ws-1", RootDir: "/workspace",
+						WorkspaceID: "01J10000000000000000000000",
+					}, nil
+				case "/foreign/subdir":
+					return workspacepkg.ResolvedWorkspace{
+						ID: "ws-2", RootDir: "/foreign",
+						WorkspaceID: "01J10000000000000000000001",
+					}, nil
+				default:
+					return workspacepkg.ResolvedWorkspace{}, workspacepkg.ErrWorkspaceNotFound
+				}
+			}},
+		}
+
+		actor, err := handlers.taskActorContextForWorkspace(ctx, taskActionCreate, "/workspace/subdir")
+		if err != nil {
+			t.Fatalf("taskActorContextForWorkspace(agent) error = %v", err)
+		}
+		if actor.Actor.Kind != taskpkg.ActorKindAgentSession ||
+			actor.Actor.Ref != "sess-agent" ||
+			actor.Origin.Kind != taskpkg.OriginKindUDS ||
+			actor.Origin.Ref != "tasks.create" {
+			t.Fatalf("taskActorContextForWorkspace(agent) = %#v", actor)
+		}
+
+		_, err = handlers.taskActorContextForWorkspace(ctx, taskActionCreate, "/foreign/subdir")
+		if !errors.Is(err, agentidentity.ErrIdentityUnauthorized) {
+			t.Fatalf("foreign taskActorContextForWorkspace() error = %v, want ErrIdentityUnauthorized", err)
+		}
+
+		_, err = handlers.taskActorContextForWorkspace(ctx, taskActionCreate, "/missing/subdir")
+		if !errors.Is(err, workspacepkg.ErrWorkspaceNotFound) {
+			t.Fatalf("missing taskActorContextForWorkspace() error = %v, want ErrWorkspaceNotFound", err)
+		}
+		if got := StatusForAgentIdentityError(err); got != http.StatusNotFound {
+			t.Fatalf("StatusForAgentIdentityError(missing workspace) = %d, want %d", got, http.StatusNotFound)
+		}
+	})
+
+	t.Run("Should authenticate before looking up a target workspace", func(t *testing.T) {
+		t.Parallel()
+
+		recorder := httptest.NewRecorder()
+		ctx, _ := gin.CreateTestContext(recorder)
+		ctx.Request = httptest.NewRequestWithContext(t.Context(), http.MethodPost, "/tasks", http.NoBody)
+		ctx.Request.Header.Set(agentidentity.HeaderSessionID, "sess-agent")
+		ctx.Request.Header.Set(agentidentity.HeaderAgent, "reviewer")
+		var workspaceLookups int
+		handlers := &BaseHandlers{
+			TransportName: "uds-api",
+			Sessions: sessionManagerStub{status: func(context.Context, string) (*session.Info, error) {
+				return &session.Info{
+					ID:          "sess-agent",
+					AgentName:   "coder",
+					WorkspaceID: "ws-1",
+					ProfileID:   store.DefaultProfileID,
+					State:       session.StateActive,
+				}, nil
+			}},
+			Workspaces: workspaceServiceStub{get: func(
+				context.Context,
+				string,
+			) (workspacepkg.Workspace, error) {
+				workspaceLookups++
+				return workspacepkg.Workspace{ID: "ws-2"}, nil
+			}},
+		}
+
+		_, err := handlers.taskActorContextForWorkspace(ctx, taskActionCreate, "ws-2")
+		if !errors.Is(err, agentidentity.ErrIdentityMismatch) {
+			t.Fatalf("taskActorContextForWorkspace() error = %v, want ErrIdentityMismatch", err)
+		}
+		if workspaceLookups != 0 {
+			t.Fatalf("workspace lookups = %d, want 0 before caller authentication", workspaceLookups)
+		}
+	})
+}
+
+func TestTaskParsingAndValidationHelpers(t *testing.T) {
+	t.Parallel()
+
+	gin.SetMode(gin.TestMode)
+	handlers := &BaseHandlers{
+		TransportName: "api-core-test",
+		Workspaces: workspaceServiceStub{get: func(_ context.Context, ref string) (workspacepkg.Workspace, error) {
+			if ref != "alpha" {
+				t.Fatalf("workspace ref = %q, want %q", ref, "alpha")
+			}
+			return workspacepkg.Workspace{ID: "ws-alpha"}, nil
+		}},
+	}
+
+	recorder := httptest.NewRecorder()
+	ctx, _ := gin.CreateTestContext(recorder)
+	ctx.Request = httptest.NewRequestWithContext(
+		t.Context(),
+		http.MethodGet,
+		"/tasks?scope=workspace&workspace=alpha&status=ready&owner_kind=pool&owner_ref=reviewers&parent_task_id=task-root&participation_channel=builders&limit=3",
+		http.NoBody,
+	)
+
+	transportQuery, err := ParseTaskListQuery(ctx)
+	if err != nil {
+		t.Fatalf("ParseTaskListQuery() error = %v", err)
+	}
+	query, err := handlers.taskListDomainQuery(
+		t.Context(), store.ReadScope{ProfileID: store.DefaultProfileID}, transportQuery,
+	)
+	if err != nil {
+		t.Fatalf("taskListDomainQuery() error = %v", err)
+	}
+	if query.WorkspaceID != "ws-alpha" || query.Status != taskpkg.TaskStatusReady ||
+		query.OwnerKind != taskpkg.OwnerKindPool {
+		t.Fatalf("taskListDomainQuery() = %#v", query)
+	}
+
+	runRecorder := httptest.NewRecorder()
+	runCtx, _ := gin.CreateTestContext(runRecorder)
+	runCtx.Request = httptest.NewRequestWithContext(
+		t.Context(),
+		http.MethodGet,
+		"/tasks/task-1/runs?status=running&session_id=sess-1&participation_channel=builders&limit=1",
+		http.NoBody,
+	)
+
+	runQuery, err := parseTaskRunListQuery(runCtx)
+	if err != nil {
+		t.Fatalf("parseTaskRunListQuery() error = %v", err)
+	}
+	if runQuery.Status != taskpkg.TaskRunStatusRunning ||
+		runQuery.SessionID != "sess-1" ||
+		runQuery.Limit != 1 {
+		t.Fatalf("parseTaskRunListQuery() = %#v", runQuery)
+	}
+
+	if _, err := addTaskDependencyFromRequest(
+		"task-1",
+		contract.AddTaskDependencyRequest{DependsOnTaskID: "task-2"},
+	); err != nil {
+		t.Fatalf("addTaskDependencyFromRequest() error = %v", err)
+	}
+	if _, err := startTaskRunFromRequest(contract.StartTaskRunRequest{IdempotencyKey: "start-1"}); err != nil {
+		t.Fatalf("startTaskRunFromRequest() error = %v", err)
+	}
+	if _, err := completeTaskRunFromRequest(
+		contract.CompleteTaskRunRequest{Result: json.RawMessage(`{"ok":true}`)},
+	); err != nil {
+		t.Fatalf("completeTaskRunFromRequest() error = %v", err)
+	}
+	if _, err := cancelTaskRunFromRequest(
+		contract.CancelTaskRunRequest{Reason: "stop", Metadata: json.RawMessage(`{"source":"test"}`)},
+	); err != nil {
+		t.Fatalf("cancelTaskRunFromRequest() error = %v", err)
+	}
+	if _, err := cancelTaskFromRequest(
+		contract.CancelTaskRequest{Reason: "stop", Metadata: json.RawMessage(`{"source":"test"}`)},
+	); err != nil {
+		t.Fatalf("cancelTaskFromRequest() error = %v", err)
+	}
+
+	if _, err := attachTaskRunSessionIDFromRequest(contract.AttachTaskRunSessionRequest{}); err == nil {
+		t.Fatal("attachTaskRunSessionIDFromRequest() error = nil, want non-nil")
+	} else {
+		assertTaskValidationError(t, err, "session_id is required")
+	}
+	if _, err := failTaskRunFromRequest(contract.FailTaskRunRequest{}); err == nil {
+		t.Fatal("failTaskRunFromRequest() error = nil, want non-nil")
+	} else {
+		assertTaskValidationError(t, err, "run_failure.error is required")
+	}
+
+	if _, err := enqueueTaskRunFromRequest(
+		"task-1",
+		contract.EnqueueTaskRunRequest{},
+	); err != nil {
+		t.Fatalf("enqueueTaskRunFromRequest(empty) error = %v", err)
+	}
+	if _, err := requiredPathID("", "task id"); err == nil {
+		t.Fatal("requiredPathID(empty) error = nil, want non-nil")
+	} else {
+		assertTaskValidationError(t, err, "task id is required")
+	}
+
+	invalidRecorder := httptest.NewRecorder()
+	invalidCtx, _ := gin.CreateTestContext(invalidRecorder)
+	invalidCtx.Request = httptest.NewRequestWithContext(
+		t.Context(),
+		http.MethodGet,
+		"/tasks?limit=bad",
+		http.NoBody,
+	)
+	if _, err := ParseTaskListQuery(invalidCtx); err == nil {
+		t.Fatal("ParseTaskListQuery(invalid limit) error = nil, want non-nil")
+	} else {
+		assertTaskValidationError(t, err, `invalid integer "bad"`)
+	}
+
+	t.Run("Should reject a bounded query before workspace lookup", func(t *testing.T) {
+		t.Parallel()
+
+		boundedRecorder := httptest.NewRecorder()
+		boundedCtx, _ := gin.CreateTestContext(boundedRecorder)
+		boundedCtx.Request = httptest.NewRequestWithContext(
+			t.Context(),
+			http.MethodGet,
+			"/tasks?scope=workspace&workspace=missing&limit=-1",
+			http.NoBody,
+		)
+		if _, err := ParseTaskListQuery(boundedCtx); err == nil {
+			t.Fatal("ParseTaskListQuery(invalid bounded query) error = nil, want non-nil")
+		} else {
+			assertTaskValidationError(t, err, "task_query.limit")
+		}
+	})
+
+	invalidRunRecorder := httptest.NewRecorder()
+	invalidRunCtx, _ := gin.CreateTestContext(invalidRunRecorder)
+	invalidRunCtx.Request = httptest.NewRequestWithContext(
+		t.Context(),
+		http.MethodGet,
+		"/tasks/task-1/runs?limit=bad",
+		http.NoBody,
+	)
+	if _, err := parseTaskRunListQuery(invalidRunCtx); err == nil {
+		t.Fatal("parseTaskRunListQuery(invalid limit) error = nil, want non-nil")
+	} else {
+		assertTaskValidationError(t, err, `invalid integer "bad"`)
+	}
+
+	decodeRecorder := httptest.NewRecorder()
+	decodeCtx, _ := gin.CreateTestContext(decodeRecorder)
+	decodeCtx.Request = httptest.NewRequestWithContext(
+		t.Context(),
+		http.MethodPost,
+		"/tasks",
+		bytes.NewBufferString(`{"broken":`),
+	)
+	decodeCtx.Request.Header.Set("Content-Type", "application/json")
+	var payload contract.CancelTaskRequest
+	if err := decodeOptionalJSON(decodeCtx, &payload); err == nil {
+		t.Fatal("decodeOptionalJSON(invalid) error = nil, want non-nil")
+	} else if !strings.Contains(err.Error(), "unexpected EOF") {
+		t.Fatalf("decodeOptionalJSON(invalid) error = %q, want unexpected EOF", err.Error())
+	}
+
+	unknownRecorder := httptest.NewRecorder()
+	unknownCtx, _ := gin.CreateTestContext(unknownRecorder)
+	unknownCtx.Request = httptest.NewRequestWithContext(
+		t.Context(),
+		http.MethodPost,
+		"/tasks/task-1/runs",
+		bytes.NewBufferString(`{"unsupported_field":"builders"}`),
+	)
+	unknownCtx.Request.Header.Set("Content-Type", "application/json")
+	var enqueuePayload contract.EnqueueTaskRunRequest
+	if err := decodeOptionalJSON(unknownCtx, &enqueuePayload); err == nil {
+		t.Fatal("decodeOptionalJSON(unknown field) error = nil, want non-nil")
+	} else if !errors.Is(err, ErrUnknownJSONField) || !strings.Contains(err.Error(), "unsupported_field") {
+		t.Fatalf("decodeOptionalJSON(unknown field) error = %q, want unknown_field with field named", err.Error())
+	}
+}
+
+func TestTaskHandlerInfrastructureHelpers(t *testing.T) {
+	t.Parallel()
+
+	t.Run("Should expose nil-safe payload and required service helpers", func(t *testing.T) {
+		t.Parallel()
+
+		gin.SetMode(gin.TestMode)
+
+		recorder := httptest.NewRecorder()
+		ctx, _ := gin.CreateTestContext(recorder)
+		handlers := &BaseHandlers{TransportName: "api-core-test"}
+
+		service, ok := handlers.requireTaskManager(ctx)
+		if ok || service != nil {
+			t.Fatalf("requireTaskManager() = (%v, %v), want (nil, false)", service, ok)
+		}
+
+		if !reflect.DeepEqual(TaskPayloadFromTask(nil), contract.TaskPayload{}) {
+			t.Fatal("TaskPayloadFromTask(nil) should return zero payload")
+		}
+		if !reflect.DeepEqual(TaskRunPayloadFromRun(nil), contract.TaskRunPayload{}) {
+			t.Fatal("TaskRunPayloadFromRun(nil) should return zero payload")
+		}
+		if !reflect.DeepEqual(TaskDetailPayloadFromView(nil), contract.TaskDetailPayload{}) {
+			t.Fatal("TaskDetailPayloadFromView(nil) should return zero payload")
+		}
+
+		idOnly := json.RawMessage("{\"ok\":true}")
+		ptr := cloneRawMessagePtr(&idOnly)
+		if ptr == nil || string(*ptr) != "{\"ok\":true}" {
+			t.Fatalf("cloneRawMessagePtr() = %v", ptr)
+		}
+	})
+}
+
+func TestTaskRunPayloadFromRunExposesLeaseStateWithoutRawClaimToken(t *testing.T) {
+	t.Run("Should not expose raw claim tokens and should expose lease state", func(t *testing.T) {
+		t.Parallel()
+
+		claimedAt := time.Date(2026, 4, 26, 10, 0, 0, 0, time.UTC)
+		run := taskpkg.Run{
+			ID:            "run-lease",
+			TaskID:        "task-lease",
+			Status:        taskpkg.TaskRunStatusRunning,
+			Attempt:       1,
+			RecoveryCount: 2,
+			ClaimedBy:     &taskpkg.ActorIdentity{Kind: taskpkg.ActorKindDaemon, Ref: "scheduler"},
+			SessionID:     "sess-lease",
+			RunWorktreeState: &taskpkg.RunWorktreeState{
+				WorktreeID:           "wt-run-lease",
+				ResolvedWorktreeMode: taskpkg.WorktreeModeRef,
+				ResolvedWorktreeRef:  "feature/lease",
+			},
+			Origin:         taskpkg.Origin{Kind: taskpkg.OriginKindDaemon, Ref: "scheduler"},
+			ClaimTokenHash: "sha256:" + strings.Repeat("c", 64),
+			LeaseUntil:     claimedAt.Add(15 * time.Minute),
+			HeartbeatAt:    claimedAt.Add(time.Minute),
+
+			QueuedAt:           claimedAt.Add(-time.Minute),
+			ClaimedAt:          claimedAt,
+			StartedAt:          claimedAt.Add(time.Minute),
+			DesignationGroupID: "designation-group",
+			Error:              "provider rejected compozy_claim_error-secret",
+			Metadata: json.RawMessage(
+				`{"keep":"metadata","claim_token":"raw-secret-token","nested":{"claim_token":"nested-secret"},` +
+					`"designation":{"index":1,"brief":"Review with compozy_claim_designation-secret"}}`,
+			),
+		}
+		run.SetResult(json.RawMessage(`[{"ok":true},{"claim_token":"result-secret"}]`))
+
+		payload := TaskRunPayloadFromRun(&run)
+		if payload.ClaimTokenHash != run.ClaimTokenHash {
+			t.Fatalf("ClaimTokenHash = %q, want %q", payload.ClaimTokenHash, run.ClaimTokenHash)
+		}
+		if payload.LeaseUntil == nil || !payload.LeaseUntil.Equal(run.LeaseUntil) {
+			t.Fatalf("LeaseUntil = %v, want %v", payload.LeaseUntil, run.LeaseUntil)
+		}
+		if payload.HeartbeatAt == nil || !payload.HeartbeatAt.Equal(run.HeartbeatAt) {
+			t.Fatalf("HeartbeatAt = %v, want %v", payload.HeartbeatAt, run.HeartbeatAt)
+		}
+		if payload.RecoveryCount != int(run.RecoveryCount) {
+			t.Fatalf("RecoveryCount = %d, want %d", payload.RecoveryCount, run.RecoveryCount)
+		}
+		if payload.WorktreeID != run.WorktreeIDValue() ||
+			payload.ResolvedWorktreeMode != contract.ResolvedWorktreeMode(run.ResolvedWorktreeModeValue()) ||
+			payload.ResolvedWorktreeRef != run.ResolvedWorktreeRefValue() {
+			t.Fatalf("worktree projection = %#v, want run snapshot %#v", payload, run)
+		}
+
+		content, err := json.Marshal(payload)
+		if err != nil {
+			t.Fatalf("Marshal(TaskRunPayload) error = %v", err)
+		}
+		encoded := string(content)
+		if strings.Contains(encoded, `"claim_token"`) {
+			t.Fatalf("TaskRunPayload JSON exposed raw claim_token field: %s", encoded)
+		}
+		for _, rawValue := range []string{
+			"raw-secret-token",
+			"nested-secret",
+			"result-secret",
+			"compozy_claim_error-secret",
+			"compozy_claim_designation-secret",
+		} {
+			if strings.Contains(encoded, rawValue) {
+				t.Fatalf("TaskRunPayload JSON exposed raw token value %q: %s", rawValue, encoded)
+			}
+		}
+		if payload.Designation == nil || payload.Designation.Index != 1 ||
+			strings.Contains(payload.Designation.Brief, "compozy_claim_designation-secret") ||
+			!strings.Contains(payload.Designation.Brief, "compozy_claim_[REDACTED]") {
+			t.Fatalf("TaskRunPayload designation = %#v, want redacted index-1 projection", payload.Designation)
+		}
+		if !strings.Contains(encoded, `"claim_token_hash"`) || !strings.Contains(encoded, run.ClaimTokenHash) {
+			t.Fatalf("TaskRunPayload JSON = %s, want claim_token_hash", encoded)
+		}
+		if !strings.Contains(encoded, `"keep":"metadata"`) {
+			t.Fatalf("TaskRunPayload JSON = %s, want non-sensitive metadata preserved", encoded)
+		}
+	})
+}
+
+func TestTaskExecutionRequestFromRequestValidatesDomainRequest(t *testing.T) {
+	t.Parallel()
+
+	t.Run("Should reject oversized execution metadata", func(t *testing.T) {
+		t.Parallel()
+
+		oversizedMetadata := json.RawMessage(`"` + strings.Repeat("x", taskpkg.MaxMetadataBytes) + `"`)
+		_, err := taskExecutionRequestFromRequest(contract.TaskExecutionRequest{Metadata: oversizedMetadata})
+		if !errors.Is(err, taskpkg.ErrPayloadTooLarge) {
+			t.Fatalf("taskExecutionRequestFromRequest() error = %v, want %v", err, taskpkg.ErrPayloadTooLarge)
+		}
+	})
+}
+
+func TestResolveTaskCatalogWorkspaceUserReference(t *testing.T) {
+	t.Parallel()
+	t.Run("Should map the User reference to global-scope tasks without a registry lookup", func(t *testing.T) {
+		t.Parallel()
+		h := &BaseHandlers{}
+		scope := taskpkg.CatalogScopeWorkspace
+		workspaceID := "stale"
+		if err := h.resolveTaskCatalogWorkspace(
+			t.Context(),
+			workspaceaccess.UserSelector,
+			&scope,
+			&workspaceID,
+		); err != nil {
+			t.Fatalf("resolveTaskCatalogWorkspace(@user) error = %v", err)
+		}
+		if scope != taskpkg.CatalogScopeGlobal || workspaceID != "" {
+			t.Fatalf("scope = %q workspace = %q, want global User rows", scope, workspaceID)
+		}
+	})
+}
+
+func TestAgentWorkspaceRefUserReference(t *testing.T) {
+	t.Parallel()
+	for _, tc := range []struct{ query, want string }{
+		{query: "workspace=@user", want: ""},
+		{query: "workspace=ws-a", want: "ws-a"},
+		{query: "", want: ""},
+	} {
+		t.Run("Should map "+tc.query+" to the agent selector", func(t *testing.T) {
+			t.Parallel()
+			c, _ := gin.CreateTestContext(httptest.NewRecorder())
+			c.Request = httptest.NewRequestWithContext(t.Context(), http.MethodGet, "/agents?"+tc.query, nil)
+			if got := agentWorkspaceRef(c); got != tc.want {
+				t.Fatalf("agentWorkspaceRef(%q) = %q, want %q (User selects the user layer)", tc.query, got, tc.want)
+			}
+		})
+	}
+}
+
+func TestRequestOperatorOriginAppTokens(t *testing.T) {
+	t.Parallel()
+	t.Run("Should never let an app token carry the unrestricted grant", func(t *testing.T) {
+		t.Parallel()
+		c, _ := gin.CreateTestContext(httptest.NewRecorder())
+		c.Request = httptest.NewRequestWithContext(t.Context(), http.MethodPost, "/sessions", nil)
+		c.Request = c.Request.WithContext(
+			ContextWithAppToken(
+				c.Request.Context(),
+				gateway.AppToken{Session: gateway.DeviceSession{ID: "app-origin"}},
+			),
+		)
+		origin := requestOperatorOrigin(c)
+		if origin.ID != "app-origin" || origin.Kind != workspaceaccess.ActorApp ||
+			origin.Effective(workspaceaccess.Unrestricted) != "" {
+			t.Fatalf(
+				"app token origin = %#v, effective = %q, want no grant",
+				origin,
+				origin.Effective(workspaceaccess.Unrestricted),
+			)
+		}
+	})
+	t.Run("Should keep the operator origin without an app token", func(t *testing.T) {
+		t.Parallel()
+		c, _ := gin.CreateTestContext(httptest.NewRecorder())
+		c.Request = httptest.NewRequestWithContext(t.Context(), http.MethodPost, "/sessions", nil)
+		if got := requestOperatorOrigin(
+			c,
+		).Effective(workspaceaccess.Unrestricted); got != workspaceaccess.Unrestricted {
+			t.Fatalf("operator effective grant = %q, want unrestricted", got)
+		}
+	})
+}
+
+func TestInheritedUserAgentWithoutProjectWork(t *testing.T) {
+	t.Parallel()
+	user := map[string]struct{}{"general": {}}
+	for _, tc := range []struct {
+		name  string
+		entry AgentCatalogEntry
+		total int
+		want  bool
+	}{
+		{name: "Should drop an inherited User agent without project sessions", entry: AgentCatalogEntry{Def: compozyconfig.AgentDef{Name: "general", SourceLayer: "user"}}, want: true},
+		{name: "Should keep an inherited User agent with project sessions", entry: AgentCatalogEntry{Def: compozyconfig.AgentDef{Name: "general", SourceLayer: "user"}}, total: 1},
+		{name: "Should keep a project override of a User agent", entry: AgentCatalogEntry{Def: compozyconfig.AgentDef{Name: "general", SourceLayer: "project"}}},
+		{name: "Should keep a project-only agent", entry: AgentCatalogEntry{Def: compozyconfig.AgentDef{Name: "reviewer", SourceLayer: "user"}}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			metrics := map[string]session.AgentSessionMetrics{tc.entry.Def.Name: {Total: tc.total}}
+			if got := inheritedUserAgentWithoutProjectWork(&tc.entry, user, metrics); got != tc.want {
+				t.Fatalf("inheritedUserAgentWithoutProjectWork() = %t, want %t", got, tc.want)
+			}
+		})
+	}
+}
+
+func (s workspaceServiceStub) SetArchived(context.Context, string, bool) (workspacepkg.Workspace, error) {
+	return workspacepkg.Workspace{}, workspacepkg.ErrWorkspaceNotFound
+}

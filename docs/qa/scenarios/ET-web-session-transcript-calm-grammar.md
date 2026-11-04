@@ -1,0 +1,197 @@
+---
+id: ET-web-session-transcript-calm-grammar
+area: ET
+title: Session transcript renders the calm-surface grammar
+persona: Théo
+journey: J-14
+expected: One or multiple live tool rows appear above a calm completed-tools summary. Settled turns fold once; interrupted turns remain open with a truthful stop cause. Absorbed failures keep the group neutral and expose the individual failed row. Find searches the full retained projection, opens the exact field/fold, preserves focus through live updates and archive invalidation, and downloads complete payloads; the message trail supports previews and deliberate jumps.
+entry_points: web session window transcript; session transcript REST + SSE
+qa_status: untested
+bug_ids: BUG-20260906-injected-guidance-missing-history
+fix_status: pending
+retest_status: pending
+fix_commits:
+evidence: docs/qa/reports/2026-09-06-sessions-stability.md
+last_report: docs/qa/reports/2026-10-02-untested.md
+overlaps: RT-session-message-reload, ET-tool-result-artifact-recovery, ET-web-session-thread-full-bleed
+---
+
+2026-08-20 retry: skipped by explicit user instruction. No real-provider transcript was created or inspected.
+
+story: As a person supervising agent work I read a calm, text-first transcript where settled work collapses to semantic summaries and only failures and the live tail demand attention.
+
+QA pass 2026-10-18 (issue #791, targeted): a real isolated Claude Goal reproduced
+one-row-per-call rendering. Goal-attributed hidden receipts and usage now preserve
+one `Ran 4 commands` disclosure; clicking it reveals all four original calls while
+the next running call remains separate. Ordinary prompt grouping is the canary;
+860 px settlement was also inspected. This does not revalidate the other historical
+navigation, failure, or typography journeys in this scenario. Evidence and limits:
+[issue #791 report](../reports/2026-10-18-issue-791-claude-tool-grouping.md).
+
+errors:
+
+inventory: Needs QA — introduced by the session transcript redesign (calm-surface vocabulary, 2026-07-29).
+
+QA impact 2026-08-03: reset for calm busy-input feedback and the single active-turn working row.
+
+QA impact 2026-08-20: reset by the normie-friendly UI foundation pass. The calm one-line runtime
+markers this file asserts changed rendering — `runtime-activity-notice.tsx` meta and the marker kind
+string moved from `font-mono` to sans with `tabular-nums`, and the same de-mono pass hit
+`chat-message-bubble.tsx`'s system role and `marker.tsx`. The thread's own empty and error copy also
+changed: "Start a conversation. The assistant thread replays persisted history and continues live
+over the daemon stream." → "Start the conversation. Everything you and the agent do here is saved.",
+and "Transcript unavailable" → "Couldn't load this conversation".
+
+QA impact 2026-09-28: reset by the session normie pass. Transcript markers no longer print raw kinds
+(`transcript_marker.*`, failure kinds, history-reset generations); they ride on `data-marker-kind`,
+`data-failure-kind`, and `data-reset-generation`. The empty thread now reads "Send {agent} a message
+to get started."; the error, starting, startup-failure, and sync-failed panes are `Empty` states
+("Couldn't load this conversation" + Try again, "Getting {agent} ready…", "{agent} couldn't start" +
+Check agent settings). The working row no longer repeats the running tool, and a stop/failure the
+turn fold already names adds no second status line.
+
+The calm grammar itself — summary collapse, the last-4 live tail, failures staying individually
+visible, "Worked for Ns" as the only border, interrupted turns never folding — is unchanged by the
+pass. What needs the walk is whether the transcript still reads as calm now that the system lines are
+sans: the pass's premise is that the front door stopped reading like syslog, and the failure mode to
+watch for is the opposite one, where de-mono'd meta stops being distinguishable from real content.
+The 24px tool rows should be intact — transcript geometry was explicitly excluded from the type lift.
+
+QA pass 2026-08-03: lifecycle markers stayed durable but invisible as warning noise; expected cancellation no longer projected provider failure; active turns rendered exactly one working row above the composer.
+
+QA impact 2026-08-03 (CodeRabbit remediation): reset after a live steer/interrupt walk exposed the singular `transcript_marker.prompt_cancel` as duplicate warning noise.
+
+QA pass 2026-08-03 (CodeRabbit remediation): after the canonical lifecycle filter fix, a fresh load rendered no prompt-cancel warning while preserving the settled replacement conversation and one active-turn Working row.
+
+QA blocked 2026-08-25 (ENG-135): the isolated web shell reached setup, but the transcript journey could not be seeded because `internal/demoseed/seed.go:79` references the unavailable `GlobalDB.ListPresets` method. Focused UI tests passed; real-user transcript verification remains pending until the daemon seed compiles.
+
+QA impact 2026-09-06 (sessions-stability tasks07/08): final task10 owns the new
+quiet transcript and long-history navigation walk. Find must search unloaded older
+history, load its context, open the containing fold and preserve query focus while
+new output streams. The full-history message trail must show one operator-message
+tick (compressed beyond its threshold), preview the message and final reply, and
+jump under user scroll ownership. Include no-matches, rewind-archive invalidation,
+and return-to-bottom states. Backend search/outline parity and workspace denial pass
+in memory/task_08.md of the owning spec; these checks do not verify browser behavior.
+Historical evidence above remains scoped to the earlier grammar. New visual acceptance
+is pending task10 and must follow the task07/task08 normative artboards.
+
+QA 2026-09-06 integrated verdict: Selected new grammar and navigation branches passed: all task07/08 visual rows and substates, actual3,023-message history, unloaded Unicode input and all text/title/output/error/filename fields, exact nested landing, focus/trail/no-match/bottom ownership, full260-line browser download, and generation1→2 archive invalidation while Find remained focused. The report retains each repair/re-walk and the distinction between controlled runtime and deterministic visual fixtures.
+
+QA impact 2026-09-10: the thinking indicator now re-arms an early timer callback until its existing flicker-guard deadline, preventing an indefinitely hidden pending state. The canonical thread-status timing tests and full conversation/runtime suites passed. Evidence and browser verification are owned by `docs/qa/reports/2026-09-10-release-integration-repair.md`.
+
+## Bounded summaries (issue #598)
+
+Use the sanitized `SessionsStability/Working/LongSummaries` story, then repeat the
+relevant transcript flow against the isolated browser runtime. At 360, 860, and
+1600 px, summaries stay on one line: tool/reasoning/live/activity/Goal text uses a
+maximum 24 rem readable measure; headings use at most 20 rem. Smaller containers
+shrink these bounds. Session sidebar and deck tabs retain their existing tighter
+constraints. Full message bodies and intentionally expanded content remain readable.
+
+- Inspect a multiline heredoc, an unbroken path, Unicode graphemes, a provider title
+  separate from tool identity, concurrent tools, and running/settled/error states.
+- Confirm the Working row remains 22 px high, elapsed time and stop/composer controls
+  stay visible, and no horizontal page overflow appears. Repeat at 200% zoom and
+  with reduced motion; opening a summary popup must not shift the transcript.
+- Use Tab and Enter to inspect live tool/activity details, Escape to return focus,
+  and the tool/reasoning/Goal disclosure to inspect complete originals. Window head
+  titles reveal their full label on pointer activation or Enter from keyboard focus.
+  The action is named `Show full title: <title>` while the heading retains the title
+  itself in both its accessible name and text content; it must remain
+  distinguishable from a same-named dock navigation action. Selecting the window
+  through the command palette must still find its original title.
+- Copy a full tool payload and compare its title/input/output with the fixture.
+  Find a unique tail omitted from a summary; the matching title/name/input body
+  must open in both running and settled tools. Closing the reveal remains reader-owned.
+
+Verification record: [issue #598 report](../reports/2026-09-10-session-summary-truncation.md).
+Post-merge action naming, clipboard coverage, and final CI evidence:
+[main remediation](../reports/2026-09-10-merged-pr-ci-review-remediation.md).
+
+
+PR #635 review follow-up: an `error` event carrying only nonblank `text` must render the session
+failure alert and preserve that original detail. An empty error stays hidden; an explicitly attributed
+timeout/cancel stop stays non-failing unless it carries an independent failure/provider diagnostic.
+The session library suite owns classification; the component suite owns alert/detail rendering.
+Both cases failed before the production fix and passed afterwards. The existing daemon-served
+session E2E owns the surrounding transcript integration; this is not a new live-provider failure trial.
+
+QA impact 2026-09-17 (issue #653): full message bodies now render the prose heading ladder
+(H1–H3 at 22 / 18 / 16 px over the 15 px body, H4 at body size in semibold, H5–H6 as a muted
+13.5 px label tier), semibold emphasis, accent-strong links with a same-color underline, a 14 px
+paragraph rhythm, and framed tables with a tinted header. The calm grammar itself — folding, the
+live tail, Find, the message trail — is untouched; transcript row geometry is not part of the change.
+Walk: read a long answer with headings, a table, nested lists, links, a blockquote, and a fenced
+block at 360, 860, and 1600 px. A wide table must scroll inside its own frame, identifiers in cells
+must not break mid-word, and no horizontal page overflow may appear.
+
+QA 2026-09-17 (issue #653), Storybook only: `systems-session-components-messagemarkdown--long-answer`,
+`--narrow-column`, and `--rich-content` were inspected with computed styles against `main`. At a
+352 px column the table scrolled inside its frame (453 px of content) with no page overflow, and
+`message_bodies` stayed on one line. Not walked: a live-runtime transcript in the web session window. The
+frontmatter status is left as recorded because the last real-runtime walk predates this change.
+
+2026-10-05: Deferred from this QA cycle by the user's explicit scope reduction.
+Coverage remains outstanding; this skip is not a passing result. Resume from the dated
+report's session matrix in a future QA cycle.
+
+QA impact 2026-10-09 (session-transcript-ui): grouping, live-row, fold, and find semantics are unchanged; the presentation changed. Work-group headers show the dominant kind glyph, which hands its place to a chevron on hover or open (no trailing chevron, no grey check). Opened groups hang their steps off a curved rail. Tool rows read verb + mono object chip with copy and chevron on hover and no success glyph. The live row shimmers the verb beside the same chip. Group sentences count calls by the kind their rows show ("searched once"/"searched N times" replaces "searched N files"). The user message's actions surface on hover. Needs a fresh walk; no QA session ran.
+
+QA impact 2026-10-10 (session-transcript-ui, second MonoCode pass): the settled-turn fold loses its bottom rule. Its clock glyph hands its place to a chevron on hover or open, and an opened fold sets its rows beside one spine with interim prose a step quieter than the answer. Group and fold sentences join their clauses with " · " ("Worked for 4m 12s · Ran 6 commands · Edited 2 files"), and a one-file clause names the file ("Read app.ts"); directory listings count as "Listed N directories". Live reasoning rests as one pulsing line of its latest paragraph and opens only on toggle or inside a disclosed group. Edit and Write rows open a diff card: path, a colored +a −d stat, aligned removed/added/context lines collapsed to 12 with "Show full diff". The error detail turns danger only when the failure ended the turn. Needs a fresh walk; no QA session ran.
+
+
+QA impact 2026-10-09 (agent-collaboration tasks 03/05): the transcript gains three row shapes — the
+left-aligned session message card on agent-sent user turns, the "Reply from" card on
+`session_reply` wakes, and the "Sent to" card that replaces `compozy__session_prompt` tool rows
+outside work groups and stays visible when a settled turn folds. Re-walk the fold and work-group
+steps with a session message in the turn. Coverage for the new rows: `ET-web-session-message-card`.
+
+QA impact 2026-10-18 (issues #800/#802): a long tool call that crosses a Goal turn now shows its
+failure on the turn that started it, and the transcript still loads. One malformed part is dropped
+and no longer hides the conversation behind "Couldn't load this conversation". A failing
+transcript recovery now backs off 5s → 60s instead of refetching every 5s. Verified against the
+real events of a session that had hit the error (9,797 events reprojected, client normalization
+passes). Needs a fresh live walk.
+
+QA walk 2026-10-19 (#835, scoped): an isolated source-built daemon and deterministic ACP fixture streamed an edit and four native reviewers. The changed-files summary stayed absent throughout child updates, appeared once after settlement, expanded to its file row, and persisted on reload. Live cards remained visible. Focused pass only; other steps and real-provider paths retain their previous status. Report: `docs/qa/reports/2026-10-19-issue-835-transcript-flicker.md`.
+
+Review re-walk 2026-10-19 (#835): fresh-browser stopped history also retains the saved file summary after a one-time authoritative roster read, without interval polling. The live streaming scenario was repeated and passed. See the same scoped report.
+
+
+## Parent turn liveness (issues #851–#852)
+
+Use a real Claude parent and at least four asynchronous Compozy subagents. Keep
+parent Write/Edit/Read/Bash work before delegation, during child work, and after
+the last child settles. Observe both the sending composer and an independent
+session window with a per-message MutationObserver. The daemon's active turn ID
+keeps each parent segment inline between calls and across completion steers;
+changed-file roll-ups wait for settlement. Record changed-file and fold state
+transitions for every segment, including the pre/post-child windows. Require
+zero duplicate-key and render-phase update warnings, no live delegation row once
+its terminal receipt/card arrives, and no count reset when stopping a later turn.
+Reload and compare the finished transcript. Current run and limits:
+[issues 851–854 report](../reports/2026-10-19-issues-851-854.md).
+
+## Steers delivered mid-call (issue #923)
+
+The daemon projects a turn steered mid-call as several assistant messages: the
+turn's first chunk, one marker message per delivered steer (landing between a
+pending call and its result), and the turn's `-2` continuation. They must read
+as one turn: the pieces keep the inline row rhythm, only the turn's last piece
+opens the turn gap, and a steer marker whose row draws nothing (its identity is
+bound to a loaded bubble, or an older marker of the same identity) mounts no
+empty shell. Each distinct subagent wake keeps its own `message_id`; events
+persisted before the fix carry `[REDACTED]` and render one steer row.
+
+Walk: in a live parent turn, delegate subagents, let two finish while a
+`compozy__subagent_status` call is pending, and watch the live turn, then
+reload. Expect no blank band between the user bubble, the tool rows, the
+"Steered" rows, and the turn's work summary; repeat with an operator steer
+mid-call (its marker row draws nothing because the bubble's meta line owns it).
+
+Verification 2026-10-23 (issue #923), Storybook + component suite only: the
+sanitized projection of the reported session renders in
+`SessionsStability/Working/SteeredWakesMidTool` and `…/SteeredWakesRedactedIdentity`
+with a uniform rhythm (before: an empty 22 px shell and a turn gap after every
+piece). Not walked: a live-runtime parent turn with real subagent wakes.

@@ -1,0 +1,153 @@
+import { useState } from "react";
+import type { Meta, StoryObj } from "@storybook/react-vite";
+
+import { ListingPage, ListingToolbar, type ListingViewMode } from "@compozy/ui";
+import { Repeat2 } from "@compozy/ui/icons";
+
+import { LoopCatalog } from "../catalog/loop-catalog";
+import { LoopCatalogFilters } from "../catalog/loop-catalog-filters";
+import { LoopCatalogLede } from "../catalog/loop-catalog-lede";
+import { LoopCatalogSkeleton } from "../catalog/loop-catalog-skeleton";
+import type { LoopCatalogFilter, LoopStatusFilter } from "../../lib/loop-catalog";
+import { hasActiveLoopFilters, loopCategory, matchesLoopFilter } from "../../lib/loop-catalog";
+import { loopCatalogFixtures } from "../../mocks/fixtures";
+import { LoopsStoryShell } from "./loops-story-shell";
+
+const meta: Meta<typeof LoopCatalog> = {
+  title: "systems/loops/components/LoopCatalog",
+  component: LoopCatalog,
+  parameters: { layout: "fullscreen" },
+};
+
+export default meta;
+type Story = StoryObj<typeof meta>;
+
+const DEFAULT_FILTER: LoopCatalogFilter = { kind: "all", category: null, status: null };
+
+function CatalogHarness({
+  initialStatus = null,
+  initialView = "rows" as ListingViewMode,
+}: {
+  initialStatus?: LoopStatusFilter | null;
+  initialView?: ListingViewMode;
+}) {
+  const [filter, setFilter] = useState<LoopCatalogFilter>({
+    ...DEFAULT_FILTER,
+    status: initialStatus,
+  });
+  const [searchQuery, setSearchQuery] = useState("");
+  const [view, setView] = useState<ListingViewMode>(initialView);
+  const normalizedQuery = searchQuery.trim().toLowerCase();
+  const entries = loopCatalogFixtures.filter(
+    entry =>
+      matchesLoopFilter(entry, filter) &&
+      (normalizedQuery === "" ||
+        `${entry.name} ${entry.contract.goal}`.toLowerCase().includes(normalizedQuery))
+  );
+
+  const toolbar = (
+    <ListingToolbar>
+      <ListingToolbar.Leading>
+        <ListingToolbar.Search
+          aria-label="Search loops"
+          onChange={setSearchQuery}
+          placeholder="Search loops"
+          value={searchQuery}
+        />
+        <ListingToolbar.Filters>
+          <LoopCatalogFilters
+            categoryOptions={[
+              ...new Set(loopCatalogFixtures.flatMap(entry => loopCategory(entry) ?? [])),
+            ].sort()}
+            filter={filter}
+            onFiltersChange={setFilter}
+          />
+        </ListingToolbar.Filters>
+      </ListingToolbar.Leading>
+      <ListingToolbar.Trailing>
+        <ListingToolbar.ViewToggle onChange={setView} value={view} />
+      </ListingToolbar.Trailing>
+    </ListingToolbar>
+  );
+
+  return (
+    <LoopsStoryShell crumb="Loops" glyph={<Repeat2 />} toolbar={toolbar}>
+      <ListingPage data-testid="loops-catalog">
+        <LoopCatalogLede total={entries.length} workspaceLabel="launch-hq" />
+        <LoopCatalog
+          entries={entries}
+          facets={{
+            categories: {},
+            kinds: { read_only: entries.length },
+            statuses: {},
+          }}
+          hasActiveFilters={hasActiveLoopFilters(searchQuery, filter)}
+          onClearFilters={() => {
+            setFilter(DEFAULT_FILTER);
+            setSearchQuery("");
+          }}
+          onRun={() => {}}
+          view={view}
+        />
+      </ListingPage>
+    </LoopsStoryShell>
+  );
+}
+
+export const Default: Story = {
+  args: {},
+  render: () => <CatalogHarness />,
+};
+
+export const Cards: Story = {
+  args: {},
+  render: () => <CatalogHarness initialView="cards" />,
+};
+
+/** A status the roster has none of: the truthful empty state plus Clear filters (EC-1). */
+export const NoMatchingStatus: Story = {
+  args: {},
+  render: () => <CatalogHarness initialStatus="canceled" />,
+};
+
+/** Zero loops: lede stays up; the catalog Empty is the only roster empty. */
+export const EmptyRoster: Story = {
+  args: {},
+  render: () => (
+    <LoopsStoryShell crumb="Loops" glyph={<Repeat2 />}>
+      <ListingPage data-testid="loops-catalog">
+        <LoopCatalogLede total={0} workspaceLabel="launch-hq" />
+        <LoopCatalog
+          entries={[]}
+          hasActiveFilters={false}
+          onClearFilters={() => {}}
+          onRun={() => {}}
+          view="rows"
+        />
+      </ListingPage>
+    </LoopsStoryShell>
+  ),
+};
+
+/** The first read has not answered: the lede and one group in the shape the view shows. */
+export const Loading: Story = {
+  args: {},
+  render: () => (
+    <LoopsStoryShell crumb="Loops" glyph={<Repeat2 />}>
+      <ListingPage data-testid="loops-loading">
+        <LoopCatalogSkeleton view="rows" workspaceLabel="launch-hq" />
+      </ListingPage>
+    </LoopsStoryShell>
+  ),
+};
+
+export const LoadingCards: Story = {
+  args: {},
+  render: () => (
+    <LoopsStoryShell crumb="Loops" glyph={<Repeat2 />}>
+      <ListingPage data-testid="loops-loading">
+        <LoopCatalogSkeleton view="cards" workspaceLabel="launch-hq" />
+      </ListingPage>
+    </LoopsStoryShell>
+  ),
+};

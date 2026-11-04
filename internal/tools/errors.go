@@ -1,0 +1,229 @@
+package tools
+
+import (
+	"errors"
+	"fmt"
+	"reflect"
+	"strings"
+)
+
+const nilErrorText = "<nil>"
+
+var (
+	// ErrToolNotFound reports an unknown tool id.
+	ErrToolNotFound = errors.New("tools: tool not found")
+	// ErrToolConflict reports a canonical id or sanitized-name conflict.
+	ErrToolConflict = errors.New("tools: tool conflict")
+	// ErrToolUnavailable reports an unavailable tool.
+	ErrToolUnavailable = errors.New("tools: tool unavailable")
+	// ErrToolDenied reports policy denial.
+	ErrToolDenied = errors.New("tools: tool denied")
+	// ErrToolApprovalRequired reports required approval.
+	ErrToolApprovalRequired = errors.New("tools: tool approval required")
+	// ErrToolInvalidInput reports invalid tool input.
+	ErrToolInvalidInput = errors.New("tools: invalid tool input")
+	// ErrToolResultTooLarge reports result budget overflow.
+	ErrToolResultTooLarge = errors.New("tools: tool result too large")
+	// ErrToolResultPersistence reports oversized result offload failure.
+	ErrToolResultPersistence = errors.New("tools: tool result persistence failed")
+	// ErrToolBackendFailed reports a backend adapter failure.
+	ErrToolBackendFailed = errors.New("tools: backend failed")
+	// ErrToolCanceled reports call cancellation.
+	ErrToolCanceled = errors.New("tools: tool call canceled")
+	// ErrToolTimedOut reports call deadline expiration.
+	ErrToolTimedOut = errors.New("tools: tool call timed out")
+)
+
+// ErrorCode is the stable public tool error code.
+type ErrorCode string
+
+const ErrorCodeSessionMessageHopLimit ErrorCode = "message_hop_limit"
+
+// ErrorCodeSessionMessageRateLimited reports an exhausted per sender→target session message budget.
+const ErrorCodeSessionMessageRateLimited ErrorCode = "message_rate_limited"
+
+const (
+	// ErrorCodeNotFound maps to ErrToolNotFound.
+	ErrorCodeNotFound ErrorCode = "tool_not_found"
+	// ErrorCodeConflict maps to ErrToolConflict.
+	ErrorCodeConflict ErrorCode = "tool_conflict"
+	// ErrorCodeUnavailable maps to ErrToolUnavailable.
+	ErrorCodeUnavailable ErrorCode = "tool_unavailable"
+	// ErrorCodeDenied maps to ErrToolDenied.
+	ErrorCodeDenied ErrorCode = "tool_denied"
+	// ErrorCodeApprovalRequired maps to ErrToolApprovalRequired.
+	ErrorCodeApprovalRequired ErrorCode = "tool_approval_required"
+	// ErrorCodeInvalidInput maps to ErrToolInvalidInput.
+	ErrorCodeInvalidInput ErrorCode = "tool_invalid_input"
+	// ErrorCodeInvalidRequest reports a native tool request validation failure.
+	ErrorCodeInvalidRequest ErrorCode = "invalid_request"
+	// ErrorCodeResultTooLarge maps to ErrToolResultTooLarge.
+	ErrorCodeResultTooLarge ErrorCode = "tool_result_too_large"
+	// ErrorCodeResultPersistenceFailed maps to ErrToolResultPersistence.
+	ErrorCodeResultPersistenceFailed ErrorCode = "tool_result_persistence_failed"
+	// ErrorCodeBackendFailed maps to ErrToolBackendFailed.
+	ErrorCodeBackendFailed ErrorCode = "tool_backend_failed"
+	// ErrorCodeCanceled maps to ErrToolCanceled.
+	ErrorCodeCanceled ErrorCode = "tool_canceled"
+	// ErrorCodeTimedOut maps to ErrToolTimedOut.
+	ErrorCodeTimedOut ErrorCode = "tool_timed_out"
+	// ErrorCodeModelNotFound reports an unknown provider-model curation target.
+	ErrorCodeModelNotFound ErrorCode = "model_not_found"
+	// ErrorCodeReasoningEffortUnsupported reports an unavailable model effort.
+	ErrorCodeReasoningEffortUnsupported ErrorCode = "reasoning_effort_unsupported"
+	// ErrorCodeAgentNameReserved reports an authored agent identity reserved for daemon roles.
+	ErrorCodeAgentNameReserved ErrorCode = "agent_name_reserved"
+	// ErrorCodeSessionBusy reports exclusive prompt admission contention.
+	ErrorCodeSessionBusy                 ErrorCode = "session_busy"
+	ErrorCodeWorkspaceBusy               ErrorCode = "workspace_busy"
+	ErrorCodeWorkspaceArchived           ErrorCode = "workspace_archived"
+	ErrorCodeWorkspaceRootMissing        ErrorCode = "workspace_root_missing"
+	ErrorCodeSessionWorktreeConflict     ErrorCode = "session_worktree_conflict"
+	ErrorCodeWorktreeNotFound            ErrorCode = "worktree_not_found"
+	ErrorCodeWorktreeNotReady            ErrorCode = "worktree_not_ready"
+	ErrorCodeWorktreeMissing             ErrorCode = "worktree_missing"
+	ErrorCodeWorktreeOperationInProgress ErrorCode = "worktree_operation_in_progress"
+	ErrorCodeWorktreeSessionActive       ErrorCode = "worktree_session_active"
+	// ErrorCodeCompactionUnsupported reports a missing native compaction capability.
+	ErrorCodeCompactionUnsupported ErrorCode = "compaction_unsupported"
+	// ErrorCodeSessionArchiveStopFailed reports a stop-first archive whose stop
+	// failed, leaving the session unarchived.
+	ErrorCodeSessionArchiveStopFailed ErrorCode = "session_archive_stop_failed"
+	// ErrorCodeSessionInLater reports a session parked in Later.
+	ErrorCodeSessionInLater ErrorCode = "session_in_later"
+	// ErrorCodeSubagentLaterFollowsParent reports a subagent parked on its own.
+	ErrorCodeSubagentLaterFollowsParent ErrorCode = "subagent_later_follows_parent"
+	// ErrorCodeSessionLaterStopFailed reports a Move to Later whose stop failed,
+	// leaving the session out of Later.
+	ErrorCodeSessionLaterStopFailed ErrorCode = "session_later_stop_failed"
+	// ErrorCodeAttentionRequiresAction reports a Needs you that waits on an answer,
+	// a sign-in, or a stop and cannot be marked as seen.
+	ErrorCodeAttentionRequiresAction ErrorCode = "attention_requires_action"
+	// ErrorCodeAgentInstanceNotFound reports a message target agent with no instance in scope.
+	ErrorCodeAgentInstanceNotFound ErrorCode = "agent_instance_not_found"
+	// ErrorCodeAgentInstanceStarting reports a target instance without a main session yet.
+	ErrorCodeAgentInstanceStarting ErrorCode = "agent_instance_starting"
+)
+
+// ToolError carries stable reason codes with a wrapped cause.
+type ToolError struct {
+	Code          ErrorCode        `json:"code"`
+	ToolID        ToolID           `json:"tool_id,omitempty"`
+	Message       string           `json:"message"`
+	ReasonCodes   []ReasonCode     `json:"reason_codes,omitempty"`
+	Operator      *OperatorFailure `json:"operator,omitzero"`
+	PartialResult *ToolResult      `json:"partial_result,omitzero"`
+	Err           error            `json:"-"`
+	HTTPStatus    int              `json:"-"`
+	PublicMessage string           `json:"-"`
+}
+
+// WithPartialResult returns a cloned error carrying a redacted bounded result preview.
+func (e *ToolError) WithPartialResult(result ToolResult) *ToolError {
+	if e == nil {
+		return nil
+	}
+	cloned := *e
+	cloned.PartialResult = new(cloneToolResult(result))
+	return &cloned
+}
+
+// Error returns the public error message.
+func (e *ToolError) Error() string {
+	if e == nil {
+		return nilErrorText
+	}
+	if e.Message != "" {
+		return e.Message
+	}
+	if e.Err != nil {
+		return e.Err.Error()
+	}
+	return string(e.Code)
+}
+
+// Unwrap returns the wrapped cause.
+func (e *ToolError) Unwrap() error {
+	if e == nil {
+		return nil
+	}
+	return e.Err
+}
+
+// NewToolError builds a stable tool error envelope.
+func NewToolError(code ErrorCode, id ToolID, message string, err error, reasons ...ReasonCode) *ToolError {
+	return &ToolError{
+		Code:        code,
+		ToolID:      id,
+		Message:     message,
+		ReasonCodes: append([]ReasonCode(nil), reasons...),
+		Err:         err,
+	}
+}
+
+// ValidationError describes deterministic contract validation failures.
+type ValidationError struct {
+	Field  string
+	Reason ReasonCode
+	Detail string
+}
+
+// Error returns a stable validation message.
+func (e *ValidationError) Error() string {
+	if e == nil {
+		return nilErrorText
+	}
+	var builder strings.Builder
+	builder.WriteString("tools: validation failed")
+	if e.Field != "" {
+		builder.WriteString(": ")
+		builder.WriteString(e.Field)
+	}
+	if e.Reason != "" {
+		builder.WriteString(": ")
+		builder.WriteString(string(e.Reason))
+	}
+	if e.Detail != "" {
+		builder.WriteString(": ")
+		builder.WriteString(e.Detail)
+	}
+	return builder.String()
+}
+
+// NewValidationError builds a deterministic validation error.
+func NewValidationError(field string, reason ReasonCode, detail string) *ValidationError {
+	return &ValidationError{Field: field, Reason: reason, Detail: detail}
+}
+
+// ReasonOf extracts the primary deterministic reason from an error.
+func ReasonOf(err error) (ReasonCode, bool) {
+	if validation, ok := errors.AsType[*ValidationError](err); ok {
+		return validation.Reason, true
+	}
+	if toolErr, ok := errors.AsType[*ToolError](err); ok && len(toolErr.ReasonCodes) > 0 {
+		return toolErr.ReasonCodes[0], true
+	}
+	return "", false
+}
+
+func wrapField(err error, field string) error {
+	if validation, ok := errors.AsType[*ValidationError](err); ok {
+		return NewValidationError(field, validation.Reason, validation.Detail)
+	}
+	return fmt.Errorf("%s: %w", field, err)
+}
+
+func isNilInterface(value any) bool {
+	if value == nil {
+		return true
+	}
+	// An error interface can hold a typed nil of any nil-capable kind. Reflection
+	// is required to inspect that dynamic representation; this runs only on error paths.
+	reflected := reflect.ValueOf(value)
+	switch reflected.Kind() {
+	case reflect.Chan, reflect.Func, reflect.Interface, reflect.Map, reflect.Pointer, reflect.Slice:
+		return reflected.IsNil()
+	default:
+		return false
+	}
+}

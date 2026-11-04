@@ -1,0 +1,1591 @@
+import { moveSessionToLater, resumeSessionFromLater } from "../session-later-api";
+import { markSessionSeen } from "../session-mark-seen-api";
+import { fetchSessionSubagents, cancelSubagent } from "../subagent-api";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import {
+  expectFetchRequest,
+  fetchRequest,
+  mockEmptyResponse,
+  mockJsonResponse,
+} from "@/test/fetch-test-utils";
+import {
+  SessionApiError,
+  SessionGoalCommandError,
+  SessionNotFoundError,
+  buildSessionStreamUrl,
+  archiveSession,
+  cancelQueuedSessionPrompt,
+  cancelSessionPrompt,
+  clearSessionRuntime,
+  clearSessionConversation,
+  compactSession,
+  createSession,
+  deleteSession,
+  fetchSession,
+  fetchSessionEvents,
+  fetchSessionInputs,
+  fetchSessionRecap,
+  fetchSessionTranscript,
+  mutateSessionGoal,
+  fetchSessions,
+  repairSession,
+  renameSession,
+  promoteSessionInputToSteer,
+  replaceSessionInput,
+  rewindSession,
+  sendSessionPrompt,
+  setSessionRuntime,
+  stopSession,
+  unarchiveSession,
+} from "../session-api";
+import { fetchSessionCommands } from "../session-command-api";
+import { cancelSessionMonitor, fetchSessionMonitors } from "../session-monitor-api";
+import {
+  fetchSessionProcesses,
+  terminateProcesses,
+  terminateSessionProcesses,
+} from "../session-processes-api";
+import { searchSessionFiles } from "../session-files-api";
+import { createMswFetch } from "@/test/msw-fetch";
+import { sessionContextHandlers } from "../../mocks/context-handlers";
+import { primarySessionFixture } from "../../mocks/fixtures";
+import {
+  sessionContextTurnsFixture,
+  sessionContextUsageFixture,
+} from "../../mocks/context-fixtures";
+import { fetchSessionUsage, fetchSessionUsageTurns } from "../session-history-api";
+
+const mockSession = {
+  id: "sess-001",
+  name: "Test Session",
+  agent_name: "claude-agent",
+  workspace_id: "ws_alpha",
+  workspace_path: "/tmp/test",
+  state: "active",
+  created_at: "2026-04-01T00:00:00Z",
+  updated_at: "2026-04-01T01:00:00Z",
+};
+const WORKSPACE_ID = mockSession.workspace_id;
+
+const mockRepair = {
+  session_id: "sess-001",
+  issues: [
+    {
+      code: "event_sequence_gap",
+      severity: "warning",
+      turn_id: "turn-1",
+      detail: "gap before sequence 4",
+    },
+  ],
+  actions: [
+    {
+      code: "append_terminal_error",
+      turn_id: "turn-1",
+      event_id: "ev-repair-1",
+      persisted: false,
+    },
+  ],
+  persisted: false,
+};
+
+beforeEach(() => {
+  vi.stubGlobal("fetch", vi.fn());
+});
+
+afterEach(() => {
+  vi.restoreAllMocks();
+});
+
+describe("fetchSessions", () => {
+  it("preserves the counted page envelope", async () => {
+    const sessions = [mockSession, { ...mockSession, id: "sess-002", name: "Second" }];
+    const response = {
+      sessions,
+      page: { has_more: true, limit: 2, next_cursor: "cursor-2", total: 205 },
+    };
+    mockJsonResponse(response);
+
+    const result = await fetchSessions();
+
+    expect(result).toEqual(response);
+    expect(result.page.total).toBe(205);
+    await expectFetchRequest({ path: "/api/sessions?all_workspaces=true" });
+  });
+
+  it("passes abort signal to fetch", async () => {
+    mockJsonResponse({ sessions: [], page: { has_more: false, limit: 50, total: 0 } });
+
+    const controller = new AbortController();
+    await fetchSessions({}, controller.signal);
+
+    await expectFetchRequest({
+      path: "/api/sessions?all_workspaces=true",
+      signal: controller.signal,
+    });
+  });
+
+  it("forwards stable filters and the opaque cursor", async () => {
+    mockJsonResponse({ sessions: [], page: { has_more: false, limit: 25, total: 0 } });
+
+    await fetchSessions({
+      workspace_id: "ws_alpha",
+      agent: "claude-agent",
+      state: "active",
+      resumable: true,
+      archive: "only",
+      sort: "last_activity",
+      cursor: "cursor-1",
+      limit: 25,
+    });
+
+    const url = new URL(fetchRequest().url);
+    expect(url.pathname).toBe("/api/sessions");
+    expect(Object.fromEntries(url.searchParams)).toEqual({
+      agent: "claude-agent",
+      archive: "only",
+      cursor: "cursor-1",
+      limit: "25",
+      resumable: "true",
+      sort: "last_activity",
+      state: "active",
+      workspace_id: "ws_alpha",
+    });
+  });
+
+  it("omits blank and undefined filters", async () => {
+    mockJsonResponse({ sessions: [], page: { has_more: false, limit: 50, total: 0 } });
+
+    await fetchSessions({ workspace_id: "   ", q: undefined });
+
+    await expectFetchRequest({ path: "/api/sessions?all_workspaces=true" });
+  });
+
+  it("throws on non-ok response", async () => {
+    vi.mocked(globalThis.fetch).mockResolvedValue(new Response(null, { status: 500 }));
+
+    await expect(fetchSessions()).rejects.toThrow("Failed to fetch sessions: 500");
+  });
+});
+
+describe("fetchSessionCommands", () => {
+  it("reads the normalized workspace-fenced command catalog", async () => {
+    const response = { commands: [], revision: "revision-1" };
+    mockJsonResponse(response);
+
+    await expect(fetchSessionCommands(" ws_alpha ", " sess-001 ")).resolves.toEqual(response);
+
+    await expectFetchRequest({
+      path: "/api/workspaces/ws_alpha/sessions/sess-001/commands",
+    });
+  });
+});
+
+describe("mutateSessionGoal", () => {
+  it("sends the structured Goal operation to the session route", async () => {
+    const response = {
+      outcome: "paused",
+      reason_code: null,
+      replaced_run_id: null,
+      snapshot: null,
+    };
+    mockJsonResponse(response);
+
+    await expect(
+      mutateSessionGoal("ws_alpha", "sess-001", { operation: "pause" })
+    ).resolves.toEqual(response);
+
+    await expectFetchRequest({
+      body: { operation: "pause" },
+      method: "POST",
+      path: "/api/workspaces/ws_alpha/sessions/sess-001/goal",
+    });
+  });
+});
+
+describe("buildSessionStreamUrl", () => {
+  it("uses the cache fence for reconnects without the removed replay parameter", () => {
+    const url = new URL(
+      buildSessionStreamUrl(WORKSPACE_ID, "sess-001", {
+        afterSequence: 18,
+        epoch: 3,
+        generation: 7,
+      }),
+      "http://localhost"
+    );
+
+    expect(url.searchParams.get("frames")).toBe("transcript");
+    expect(url.searchParams.get("after_sequence")).toBe("18");
+    expect(url.searchParams.get("epoch")).toBe("3");
+    expect(url.searchParams.get("generation")).toBe("7");
+    expect(url.searchParams.has("replay")).toBe(false);
+  });
+});
+
+describe("createSession", () => {
+  it("sends correct POST body with agent_name", async () => {
+    mockJsonResponse({ session: mockSession });
+
+    const result = await createSession({ agent_name: "claude-agent" });
+
+    expect(result).toEqual(mockSession);
+    await expectFetchRequest({
+      body: { agent_name: "claude-agent" },
+      method: "POST",
+      path: "/api/sessions",
+    });
+  });
+
+  it("allows create session without agent_name", async () => {
+    mockJsonResponse({ session: mockSession });
+
+    await createSession({});
+
+    await expectFetchRequest({
+      body: {},
+      method: "POST",
+      path: "/api/sessions",
+    });
+  });
+
+  it("sends optional name and workspace", async () => {
+    mockJsonResponse({ session: mockSession });
+
+    await createSession({
+      agent_name: "claude-agent",
+      name: "My Session",
+      workspace: "/home",
+    });
+
+    await expectFetchRequest({
+      body: {
+        agent_name: "claude-agent",
+        name: "My Session",
+        workspace: "/home",
+      },
+      method: "POST",
+      path: "/api/sessions",
+    });
+  });
+
+  it("preserves parent session provenance when creating a recovery fork", async () => {
+    mockJsonResponse({ session: mockSession });
+
+    await createSession({
+      agent_name: "codex-agent",
+      parent_session_id: "sess-dead",
+      workspace: "ws_alpha",
+    });
+
+    await expectFetchRequest({
+      body: {
+        agent_name: "codex-agent",
+        parent_session_id: "sess-dead",
+        workspace: "ws_alpha",
+      },
+      method: "POST",
+      path: "/api/sessions",
+    });
+  });
+
+  it("sends workspace_path when creating from an explicit path", async () => {
+    mockJsonResponse({ session: mockSession });
+
+    await createSession({
+      agent_name: "claude-agent",
+      workspace_path: "/workspace/demo",
+    });
+
+    await expectFetchRequest({
+      body: {
+        agent_name: "claude-agent",
+        workspace_path: "/workspace/demo",
+      },
+      method: "POST",
+      path: "/api/sessions",
+    });
+  });
+
+  it("throws 'Max sessions reached' on 409", async () => {
+    vi.mocked(globalThis.fetch).mockResolvedValue(new Response(null, { status: 409 }));
+
+    await expect(createSession({ agent_name: "claude-agent" })).rejects.toThrow(
+      "Max sessions reached"
+    );
+  });
+
+  it("throws generic error for other failures", async () => {
+    vi.mocked(globalThis.fetch).mockResolvedValue(new Response(null, { status: 500 }));
+
+    await expect(createSession({ agent_name: "claude-agent" })).rejects.toThrow(
+      "Failed to create session: 500"
+    );
+  });
+});
+
+describe("fetchSession", () => {
+  it("returns single SessionPayload on success", async () => {
+    mockJsonResponse({ session: mockSession });
+
+    const result = await fetchSession(WORKSPACE_ID, "sess-001");
+
+    expect(result).toEqual(mockSession);
+    await expectFetchRequest({
+      path: "/api/workspaces/ws_alpha/sessions/sess-001?include_health=true&all_profiles=true",
+    });
+  });
+
+  it("throws 404 error for unknown session", async () => {
+    vi.mocked(globalThis.fetch).mockResolvedValue(new Response(null, { status: 404 }));
+
+    await expect(fetchSession(WORKSPACE_ID, "unknown")).rejects.toThrow(
+      "Session not found: unknown"
+    );
+  });
+
+  it("encodes session id in URL", async () => {
+    mockJsonResponse({ session: mockSession });
+
+    await fetchSession(WORKSPACE_ID, "id with spaces");
+
+    await expectFetchRequest({
+      path: "/api/workspaces/ws_alpha/sessions/id%20with%20spaces?include_health=true&all_profiles=true",
+    });
+  });
+});
+
+describe("renameSession", () => {
+  it("patches the workspace-scoped session name and returns the durable session", async () => {
+    const renamed = { ...mockSession, name: "Release review" };
+    mockJsonResponse({ session: renamed });
+    const controller = new AbortController();
+
+    await expect(
+      renameSession(
+        WORKSPACE_ID,
+        "sess-001",
+        "design",
+        { name: "Release review" },
+        controller.signal
+      )
+    ).resolves.toEqual(renamed);
+    await expectFetchRequest({
+      body: { name: "Release review" },
+      method: "PATCH",
+      path: "/api/workspaces/ws_alpha/sessions/sess-001?profile=design",
+      signal: controller.signal,
+    });
+  });
+});
+
+describe("stopSession", () => {
+  it("requests an asynchronous stop by default and resolves with the acceptance", async () => {
+    const accepted = {
+      escalated: false,
+      session_id: "sess-001",
+      state: "stopping",
+      status: "stopping",
+      stop_cause: "user_requested",
+      verified: false,
+    };
+    mockJsonResponse(accepted, { status: 202 });
+    const controller = new AbortController();
+
+    await expect(
+      stopSession(WORKSPACE_ID, "sess-001", "studio", { signal: controller.signal })
+    ).resolves.toEqual(accepted);
+
+    await expectFetchRequest({
+      body: { wait: false },
+      method: "POST",
+      path: "/api/workspaces/ws_alpha/sessions/sess-001/stop?profile=studio",
+      signal: controller.signal,
+    });
+  });
+
+  // A retry of `stop_verification_failed` waits on the daemon's settled answer,
+  // which is allowed to be unverified again: the adapter surfaces it as-is.
+  it("waits for the settled outcome when asked and surfaces an unverified answer", async () => {
+    const unverified = {
+      attention: "stop_verification_failed",
+      escalated: true,
+      phase: "forced",
+      session_id: "sess-001",
+      state: "stopping",
+      status: "stopping",
+      stop_cause: "user_requested",
+      stopped_after: "20s",
+      verified: false,
+    };
+    mockJsonResponse(unverified);
+
+    await expect(stopSession(WORKSPACE_ID, "sess-001", "studio", { wait: true })).resolves.toEqual(
+      unverified
+    );
+
+    await expectFetchRequest({
+      body: { wait: true },
+      method: "POST",
+      path: "/api/workspaces/ws_alpha/sessions/sess-001/stop?profile=studio",
+    });
+  });
+
+  it("resolves when the session is already stopped", async () => {
+    const alreadyStopped = {
+      escalated: false,
+      session_id: "sess-001",
+      state: "stopped",
+      status: "already-stopped",
+      verified: true,
+    };
+    mockJsonResponse(alreadyStopped);
+
+    await expect(stopSession(WORKSPACE_ID, "sess-001", "studio")).resolves.toEqual(alreadyStopped);
+
+    await expectFetchRequest({
+      body: { wait: false },
+      method: "POST",
+      path: "/api/workspaces/ws_alpha/sessions/sess-001/stop?profile=studio",
+    });
+  });
+
+  it("throws 404 error for unknown session", async () => {
+    vi.mocked(globalThis.fetch).mockResolvedValue(new Response(null, { status: 404 }));
+
+    await expect(stopSession(WORKSPACE_ID, "unknown", "studio")).rejects.toThrow(
+      "Session not found: unknown"
+    );
+  });
+
+  it("throws generic error for other failures", async () => {
+    vi.mocked(globalThis.fetch).mockResolvedValue(new Response(null, { status: 500 }));
+
+    await expect(stopSession(WORKSPACE_ID, "sess-001", "studio")).rejects.toThrow(
+      'Failed to stop session "sess-001": 500'
+    );
+  });
+});
+
+describe("session runtime selection", () => {
+  it("persists the complete selection with the current revision", async () => {
+    mockJsonResponse({ session: mockSession });
+
+    await setSessionRuntime(WORKSPACE_ID, "sess-001", {
+      expected_revision: 4,
+      runtime: {
+        provider: "claude",
+        model: "claude-fable-5",
+        reasoning_effort: "max",
+        speed: "fast",
+      },
+    });
+
+    await expectFetchRequest({
+      body: {
+        expected_revision: 4,
+        runtime: {
+          provider: "claude",
+          model: "claude-fable-5",
+          reasoning_effort: "max",
+          speed: "fast",
+        },
+      },
+      method: "PUT",
+      path: "/api/workspaces/ws_alpha/sessions/sess-001/runtime",
+    });
+  });
+
+  it("clears the selection with an explicit revision fence", async () => {
+    mockJsonResponse({ session: mockSession });
+
+    await clearSessionRuntime(WORKSPACE_ID, "sess-001", 5);
+
+    const request = await fetchRequest();
+    const url = new URL(request.url);
+    expect(request.method).toBe("DELETE");
+    expect(url.pathname).toBe("/api/workspaces/ws_alpha/sessions/sess-001/runtime");
+    expect(url.searchParams.get("expected_revision")).toBe("5");
+  });
+});
+
+describe("deleteSession", () => {
+  it("calls DELETE endpoint", async () => {
+    mockEmptyResponse();
+
+    await deleteSession(WORKSPACE_ID, "sess-001", "work");
+
+    await expectFetchRequest({
+      method: "DELETE",
+      path: "/api/workspaces/ws_alpha/sessions/sess-001?profile=work",
+    });
+  });
+
+  it("throws 404 error for unknown session", async () => {
+    vi.mocked(globalThis.fetch).mockResolvedValue(new Response(null, { status: 404 }));
+
+    await expect(deleteSession(WORKSPACE_ID, "unknown", "work")).rejects.toThrow(
+      "Session not found: unknown"
+    );
+  });
+
+  it("throws generic error for other failures", async () => {
+    vi.mocked(globalThis.fetch).mockResolvedValue(new Response(null, { status: 500 }));
+
+    await expect(deleteSession(WORKSPACE_ID, "sess-001", "work")).rejects.toThrow(
+      'Failed to delete session "sess-001": 500'
+    );
+  });
+});
+
+describe("session archive", () => {
+  it("archives a stopped session through its workspace endpoint", async () => {
+    const archivedSession = { ...mockSession, archived_at: "2026-08-04T12:00:00Z" };
+    mockJsonResponse({ session: archivedSession });
+
+    await expect(archiveSession(WORKSPACE_ID, mockSession.id, "design")).resolves.toEqual(
+      archivedSession
+    );
+    await expectFetchRequest({
+      method: "POST",
+      path: "/api/workspaces/ws_alpha/sessions/sess-001/archive?profile=design",
+    });
+  });
+
+  it("asks the daemon to stop a live session before archiving it", async () => {
+    const archivedSession = {
+      ...mockSession,
+      state: "stopped",
+      archived_at: "2026-08-04T12:00:00Z",
+    };
+    mockJsonResponse({ session: archivedSession });
+
+    await expect(
+      archiveSession(WORKSPACE_ID, mockSession.id, "design", undefined, true)
+    ).resolves.toEqual(archivedSession);
+    await expectFetchRequest({
+      method: "POST",
+      path: "/api/workspaces/ws_alpha/sessions/sess-001/archive?profile=design&stop=true",
+    });
+  });
+
+  it("restores an archived session through its workspace endpoint", async () => {
+    const restoredSession = { ...mockSession, archived_at: null };
+    mockJsonResponse({ session: restoredSession });
+
+    await expect(unarchiveSession(WORKSPACE_ID, mockSession.id, "design")).resolves.toEqual(
+      restoredSession
+    );
+    await expectFetchRequest({
+      method: "POST",
+      path: "/api/workspaces/ws_alpha/sessions/sess-001/unarchive?profile=design",
+    });
+  });
+});
+
+describe("session Later", () => {
+  it("parks a session with its reason and return date through its workspace endpoint", async () => {
+    const parked = {
+      ...mockSession,
+      state: "stopped",
+      later: { parked_at: "2026-08-04T12:00:00Z", reason: "Vendor", pending_messages: 0 },
+    };
+    mockJsonResponse({ session: parked });
+
+    await expect(
+      moveSessionToLater(WORKSPACE_ID, mockSession.id, "design", {
+        reason: "Vendor",
+        return_at: "2026-08-10T09:00:00Z",
+      })
+    ).resolves.toEqual(parked);
+    await expectFetchRequest({
+      method: "POST",
+      path: "/api/workspaces/ws_alpha/sessions/sess-001/later?profile=design",
+      body: { reason: "Vendor", return_at: "2026-08-10T09:00:00Z" },
+    });
+  });
+
+  it("carries the daemon's refusal code when a subagent cannot move on its own", async () => {
+    mockJsonResponse(
+      { code: "subagent_later_follows_parent", error: "subagents move with their parent" },
+      { status: 409 }
+    );
+    const error = await moveSessionToLater(WORKSPACE_ID, "sess-001", "design", {}).catch(
+      (reason: unknown) => reason
+    );
+    expect(error).toBeInstanceOf(SessionApiError);
+    expect(error).toMatchObject({ code: "subagent_later_follows_parent", status: 409 });
+  });
+
+  it("brings a parked session back through its workspace endpoint", async () => {
+    const back = { ...mockSession, later: null };
+    mockJsonResponse({ session: back });
+
+    await expect(resumeSessionFromLater(WORKSPACE_ID, mockSession.id, "design")).resolves.toEqual(
+      back
+    );
+    await expectFetchRequest({
+      method: "POST",
+      path: "/api/workspaces/ws_alpha/sessions/sess-001/resume-later?profile=design",
+      body: {},
+    });
+  });
+
+  it("marks a session's Needs you as seen through its workspace endpoint", async () => {
+    const seen = { ...mockSession, attention_dismissible: false };
+    mockJsonResponse({ session: seen });
+
+    await expect(markSessionSeen(WORKSPACE_ID, mockSession.id, "design")).resolves.toEqual(seen);
+    await expectFetchRequest({
+      method: "POST",
+      path: "/api/workspaces/ws_alpha/sessions/sess-001/mark-seen?profile=design",
+    });
+  });
+
+  it("carries the daemon's refusal code when the session still waits on an answer", async () => {
+    mockJsonResponse(
+      {
+        code: "attention_requires_action",
+        error: "session sess-001 needs you to answer its question",
+      },
+      { status: 409 }
+    );
+    const error = await markSessionSeen(WORKSPACE_ID, "sess-001", "design").catch(
+      (reason: unknown) => reason
+    );
+    expect(error).toBeInstanceOf(SessionApiError);
+    expect(error).toMatchObject({ code: "attention_requires_action", status: 409 });
+  });
+});
+
+describe("compactSession", () => {
+  const receipt = {
+    command: "compact",
+    prompt_id: "prompt-compact-1",
+    session_id: "sess-001",
+    status: "accepted",
+  };
+
+  it("posts an empty body to the compact route and resolves with the 202 receipt", async () => {
+    mockJsonResponse(receipt, { status: 202 });
+    const controller = new AbortController();
+
+    await expect(compactSession(WORKSPACE_ID, "sess-001", controller.signal)).resolves.toEqual(
+      receipt
+    );
+
+    await expectFetchRequest({
+      body: {},
+      method: "POST",
+      path: "/api/workspaces/ws_alpha/sessions/sess-001/compact",
+      signal: controller.signal,
+    });
+  });
+
+  it.each(["session_busy", "compaction_unsupported"])(
+    "carries the %s code and the daemon message on a 409",
+    async code => {
+      mockJsonResponse({ code, error: `daemon says ${code}` }, { status: 409 });
+
+      const error = await compactSession(WORKSPACE_ID, "sess-001").catch(
+        (reason: unknown) => reason
+      );
+
+      expect(error).toBeInstanceOf(SessionApiError);
+      expect(error).toMatchObject({
+        code,
+        message: `daemon says ${code}`,
+        sessionId: "sess-001",
+        status: 409,
+      });
+    }
+  );
+
+  it("reports an unknown session as not found", async () => {
+    mockJsonResponse({ error: "session not found" }, { status: 404 });
+
+    await expect(compactSession(WORKSPACE_ID, "unknown")).rejects.toBeInstanceOf(
+      SessionNotFoundError
+    );
+  });
+});
+
+describe("cancelSessionPrompt", () => {
+  it("calls POST prompt cancel endpoint", async () => {
+    mockEmptyResponse();
+
+    // A daemon that sent no body leaves the verdict unknown, never invented.
+    await expect(cancelSessionPrompt(WORKSPACE_ID, "sess-001")).resolves.toBeNull();
+
+    await expectFetchRequest({
+      method: "POST",
+      path: "/api/workspaces/ws_alpha/sessions/sess-001/prompt/cancel",
+    });
+  });
+
+  it("returns the daemon's cancel verdict from the 200 body", async () => {
+    mockJsonResponse({ outcome: "nothing-in-flight", session_id: "sess-001" });
+
+    await expect(cancelSessionPrompt(WORKSPACE_ID, "sess-001")).resolves.toEqual({
+      outcome: "nothing-in-flight",
+      session_id: "sess-001",
+    });
+  });
+
+  it("throws 404 error for unknown session", async () => {
+    vi.mocked(globalThis.fetch).mockResolvedValue(new Response(null, { status: 404 }));
+
+    await expect(cancelSessionPrompt(WORKSPACE_ID, "unknown")).rejects.toThrow(
+      "Session not found: unknown"
+    );
+  });
+
+  it("passes abort signal to fetch", async () => {
+    mockEmptyResponse();
+
+    const controller = new AbortController();
+    await cancelSessionPrompt(WORKSPACE_ID, "sess-001", controller.signal);
+
+    await expectFetchRequest({
+      method: "POST",
+      path: "/api/workspaces/ws_alpha/sessions/sess-001/prompt/cancel",
+      signal: controller.signal,
+    });
+  });
+});
+
+describe("sendSessionPrompt", () => {
+  it.each(["goal_replace_required", "goal_replace_stale"])(
+    "preserves the typed %s rejection for the replacement action",
+    async reason => {
+      const goal = {
+        outcome: "error",
+        reason_code: reason,
+        replaced_run_id: null,
+        snapshot: { run_id: "run-current", objective: "Keep current work" },
+      };
+      mockJsonResponse({ prompt: { status: "goal", goal } }, { status: 409 });
+
+      const error = await sendSessionPrompt(WORKSPACE_ID, "sess-001", {
+        idempotency_key: "idempotency-001",
+        message_id: "message-001",
+        messages: [
+          {
+            id: "message-001",
+            role: "user",
+            parts: [{ type: "text", text: "/goal New objective" }],
+          },
+        ],
+        mode: "steer",
+      }).catch(error => error);
+
+      expect(error).toBeInstanceOf(SessionGoalCommandError);
+      expect(error).toMatchObject({ status: 409, sessionId: "sess-001", result: goal });
+    }
+  );
+
+  it("unwraps the Goal result from the durable prompt envelope", async () => {
+    const goalResult = {
+      outcome: "cleared" as const,
+      reason_code: null,
+      replaced_run_id: null,
+      snapshot: null,
+    };
+    mockJsonResponse({ prompt: { goal: goalResult, status: "accepted" } });
+
+    const result = await sendSessionPrompt(WORKSPACE_ID, "sess-001", {
+      idempotency_key: "idempotency-001",
+      message_id: "message-001",
+      messages: [
+        {
+          id: "message-001",
+          parts: [{ text: "/goal clear", type: "text" }],
+          role: "user",
+        },
+      ],
+    });
+
+    expect(result).toEqual(goalResult);
+    await expectFetchRequest({
+      body: {
+        idempotency_key: "idempotency-001",
+        message_id: "message-001",
+        messages: [
+          {
+            id: "message-001",
+            parts: [{ text: "/goal clear", type: "text" }],
+            role: "user",
+          },
+        ],
+      },
+      method: "POST",
+      path: "/api/workspaces/ws_alpha/sessions/sess-001/prompt",
+    });
+  });
+});
+
+describe("sendSessionPrompt busy-send answers", () => {
+  const request = {
+    idempotency_key: "idempotency-002",
+    message_id: "message-002",
+    messages: [
+      {
+        id: "message-002",
+        parts: [{ text: "Focus on the failing test.", type: "text" }],
+        role: "user" as const,
+      },
+    ],
+    mode: "steer" as const,
+  };
+
+  it("returns the disposition envelope for a busy send", async () => {
+    mockJsonResponse(
+      {
+        prompt: {
+          delivery: "direct",
+          disposition: "steering",
+          idempotency_key: "idempotency-002",
+          message_id: "message-002",
+          queue_position: 0,
+          replayed: false,
+          status: "steering",
+          steer_delivery: "injected",
+          turn_id: "turn-001",
+        },
+      },
+      { status: 202 }
+    );
+
+    const result = await sendSessionPrompt(WORKSPACE_ID, "sess-001", request);
+
+    expect(result).toMatchObject({ disposition: "steering", steer_delivery: "injected" });
+    await expectFetchRequest({
+      body: request,
+      method: "POST",
+      path: "/api/workspaces/ws_alpha/sessions/sess-001/prompt",
+    });
+  });
+
+  it("releases a direct-turn event stream and reports the turn as direct", async () => {
+    // The turn ended before admission: the daemon started a direct turn and
+    // streamed it. The stream must be released, never awaited to completion.
+    const cancel = vi.fn(() => Promise.resolve());
+    const body = new ReadableStream<Uint8Array>({
+      cancel,
+      start() {
+        // Never closes on its own — a live prompt stream.
+      },
+    });
+    vi.mocked(globalThis.fetch).mockResolvedValue(
+      new Response(body, {
+        headers: { "Content-Type": "text/event-stream", "x-vercel-ai-ui-message-stream": "v1" },
+        status: 200,
+      })
+    );
+
+    const result = await sendSessionPrompt(WORKSPACE_ID, "sess-001", request);
+
+    expect(result).toEqual({
+      direct_turn: true,
+      idempotency_key: "idempotency-002",
+      message_id: "message-002",
+    });
+    expect(cancel).toHaveBeenCalledOnce();
+  });
+
+  it("carries the daemon's refusal code and current turn on the typed error", async () => {
+    mockJsonResponse(
+      {
+        code: "active_turn_mismatch",
+        current_turn_id: "turn-002",
+        error: "session: active turn mismatch: expected turn-001, active turn-002",
+      },
+      { status: 409 }
+    );
+
+    await expect(sendSessionPrompt(WORKSPACE_ID, "sess-001", request)).rejects.toMatchObject({
+      code: "active_turn_mismatch",
+      currentTurnId: "turn-002",
+      name: "SessionApiError",
+      status: 409,
+    });
+  });
+});
+
+describe("rewindSession", () => {
+  it("sends the durable message identity and transcript fence, then returns the draft", async () => {
+    mockJsonResponse({
+      rewind: { draft_text: "Use the earlier plan instead." },
+      session: mockSession,
+    });
+    const controller = new AbortController();
+
+    const result = await rewindSession(
+      WORKSPACE_ID,
+      "sess-001",
+      "design",
+      {
+        expected_epoch: 3,
+        expected_generation: 7,
+        expected_max_sequence: 19,
+        idempotency_key: "rewind-idempotency-001",
+        message_id: "message-001",
+      },
+      controller.signal
+    );
+
+    expect(result).toEqual({
+      rewind: { draft_text: "Use the earlier plan instead." },
+      session: mockSession,
+    });
+    await expectFetchRequest({
+      body: {
+        expected_epoch: 3,
+        expected_generation: 7,
+        expected_max_sequence: 19,
+        idempotency_key: "rewind-idempotency-001",
+        message_id: "message-001",
+      },
+      method: "POST",
+      path: "/api/workspaces/ws_alpha/sessions/sess-001/rewind?profile=design",
+      signal: controller.signal,
+    });
+  });
+});
+
+describe("session input queue operations", () => {
+  const input = {
+    delivery: "after_turn" as const,
+    enqueued_at: "2026-08-03T18:00:00Z",
+    id: "input-001",
+    mode: "queue" as const,
+    queue_generation: 2,
+    session_id: "sess-001",
+    status: "queued",
+    text: "Run the next check.",
+  };
+
+  it("lists the daemon-owned pending queue in workspace scope", async () => {
+    mockJsonResponse({ inputs: [input] });
+
+    await expect(fetchSessionInputs(WORKSPACE_ID, "sess-001")).resolves.toEqual({
+      inputs: [input],
+    });
+
+    await expectFetchRequest({
+      path: "/api/workspaces/ws_alpha/sessions/sess-001/prompt/queue",
+    });
+  });
+
+  it("replaces the exact queued entry with a fresh durable identity", async () => {
+    const replacement = { ...input, id: "input-002", text: "Run focused tests." };
+    mockJsonResponse({ input: replacement });
+
+    await expect(
+      replaceSessionInput(WORKSPACE_ID, "sess-001", input.id, {
+        idempotency_key: "idem-edit-001",
+        message_id: "message-edit-001",
+        text: replacement.text,
+      })
+    ).resolves.toEqual(replacement);
+
+    await expectFetchRequest({
+      body: {
+        idempotency_key: "idem-edit-001",
+        message_id: "message-edit-001",
+        text: replacement.text,
+      },
+      method: "PUT",
+      path: "/api/workspaces/ws_alpha/sessions/sess-001/prompt/queue/input-001",
+    });
+  });
+
+  it("promotes and cancels the exact queued entry", async () => {
+    mockJsonResponse({
+      prompt: {
+        delivery: "interrupt_then_prompt",
+        idempotency_key: "idem-steer-001",
+        message_id: "message-steer-001",
+        replayed: false,
+        status: "steering",
+      },
+    });
+
+    await promoteSessionInputToSteer(WORKSPACE_ID, "sess-001", input.id, {
+      expected_turn_id: "turn-active",
+      idempotency_key: "idem-steer-001",
+      message_id: "message-steer-001",
+      text: input.text,
+    });
+
+    await expectFetchRequest({
+      body: {
+        expected_turn_id: "turn-active",
+        idempotency_key: "idem-steer-001",
+        message_id: "message-steer-001",
+        text: input.text,
+      },
+      method: "POST",
+      path: "/api/workspaces/ws_alpha/sessions/sess-001/prompt/queue/input-001/steer",
+    });
+
+    mockJsonResponse({
+      prompt: {
+        delivery: "none",
+        idempotency_key: "",
+        message_id: "",
+        replayed: false,
+        status: "canceled",
+      },
+    });
+    await cancelQueuedSessionPrompt(WORKSPACE_ID, "sess-001", input.id);
+
+    await expectFetchRequest({
+      callIndex: 1,
+      method: "DELETE",
+      path: "/api/workspaces/ws_alpha/sessions/sess-001/prompt/queue/input-001",
+    });
+  });
+});
+
+describe("fetchSessionRecap", () => {
+  it("calls GET recap endpoint with limit", async () => {
+    const recap = {
+      session: mockSession,
+      recent_markers: [],
+      recent_messages: [],
+      pending_inputs: 0,
+      pending_markers: 0,
+      snapshot: {
+        generated_at: "2026-04-01T01:00:00Z",
+        event_cursor: 4,
+        transcript_cursor: 4,
+        queue_generation: 0,
+        consistency: "read_snapshot",
+      },
+    };
+    mockJsonResponse({ recap });
+
+    const result = await fetchSessionRecap(WORKSPACE_ID, "sess-001", 5);
+
+    expect(result).toEqual(recap);
+    const request = fetchRequest();
+    const url = new URL(request.url);
+    expect(request.method).toBe("GET");
+    expect(url.pathname).toBe("/api/workspaces/ws_alpha/sessions/sess-001/recap");
+    expect(url.searchParams.get("limit")).toBe("5");
+  });
+});
+
+describe("repairSession", () => {
+  it("calls POST repair endpoint with query flags and returns the repair payload", async () => {
+    mockJsonResponse({ repair: mockRepair });
+
+    const result = await repairSession(WORKSPACE_ID, "sess-001", {
+      dry_run: true,
+      force: true,
+    });
+
+    expect(result).toEqual(mockRepair);
+    const request = fetchRequest();
+    const url = new URL(request.url);
+    expect(request.method).toBe("POST");
+    expect(url.pathname).toBe("/api/workspaces/ws_alpha/sessions/sess-001/repair");
+    expect(url.searchParams.get("dry_run")).toBe("true");
+    expect(url.searchParams.get("force")).toBe("true");
+  });
+
+  it("throws 404 error for unknown session", async () => {
+    vi.mocked(globalThis.fetch).mockResolvedValue(new Response(null, { status: 404 }));
+
+    await expect(repairSession(WORKSPACE_ID, "unknown")).rejects.toBeInstanceOf(
+      SessionNotFoundError
+    );
+    await expect(repairSession(WORKSPACE_ID, "unknown")).rejects.toThrow(
+      "Session not found: unknown"
+    );
+  });
+
+  it("throws typed adapter error for non-404 failures", async () => {
+    vi.mocked(globalThis.fetch).mockResolvedValue(new Response(null, { status: 500 }));
+
+    await expect(repairSession(WORKSPACE_ID, "sess-001")).rejects.toBeInstanceOf(SessionApiError);
+    await expect(repairSession(WORKSPACE_ID, "sess-001")).rejects.toMatchObject({
+      message: 'Failed to repair session "sess-001": 500',
+      status: 500,
+      sessionId: "sess-001",
+    });
+  });
+
+  it("passes abort signal to fetch", async () => {
+    mockJsonResponse({ repair: mockRepair });
+
+    const controller = new AbortController();
+    await repairSession(WORKSPACE_ID, "sess-001", {}, controller.signal);
+
+    await expectFetchRequest({
+      method: "POST",
+      path: "/api/workspaces/ws_alpha/sessions/sess-001/repair",
+      signal: controller.signal,
+    });
+  });
+});
+
+describe("clearSessionConversation", () => {
+  it("calls POST clear endpoint and returns the refreshed session payload", async () => {
+    mockJsonResponse({ session: mockSession });
+
+    const result = await clearSessionConversation(WORKSPACE_ID, "sess-001");
+
+    expect(result).toEqual(mockSession);
+    await expectFetchRequest({
+      method: "POST",
+      path: "/api/workspaces/ws_alpha/sessions/sess-001/clear",
+    });
+  });
+
+  it("throws 409 when a prompt is still running", async () => {
+    vi.mocked(globalThis.fetch).mockResolvedValue(new Response(null, { status: 409 }));
+
+    await expect(clearSessionConversation(WORKSPACE_ID, "sess-001")).rejects.toThrow(
+      'Cannot clear session "sess-001" while a prompt is still running'
+    );
+  });
+
+  it("throws on invalid response payload", async () => {
+    mockJsonResponse({ nope: true });
+
+    await expect(clearSessionConversation(WORKSPACE_ID, "sess-001")).rejects.toThrow(
+      'Failed to clear session "sess-001": invalid response payload'
+    );
+  });
+});
+
+describe("fetchSessionEvents", () => {
+  const mockEvents = [
+    {
+      id: "evt-1",
+      session_id: "sess-001",
+      sequence: 1,
+      turn_id: "turn-1",
+      type: "agent_message",
+      agent_name: "claude-agent",
+      content: { text: "Hello" },
+      timestamp: "2026-04-01T00:00:00Z",
+    },
+  ];
+
+  it("returns parsed events array", async () => {
+    mockJsonResponse({ events: mockEvents });
+
+    const result = await fetchSessionEvents(WORKSPACE_ID, "sess-001");
+
+    expect(result).toEqual(mockEvents);
+    await expectFetchRequest({ path: "/api/workspaces/ws_alpha/sessions/sess-001/events" });
+  });
+
+  it("passes query params correctly", async () => {
+    mockJsonResponse({ events: [] });
+
+    await fetchSessionEvents(WORKSPACE_ID, "sess-001", {
+      since: "2026-04-01T00:00:00Z",
+      limit: 50,
+      after_sequence: 10,
+      type: "agent_message",
+      agent_name: "claude-agent",
+      turn_id: "turn-1",
+    });
+
+    const request = fetchRequest();
+    const url = new URL(request.url);
+    expect(url.pathname).toBe("/api/workspaces/ws_alpha/sessions/sess-001/events");
+    expect(url.searchParams.get("since")).toBe("2026-04-01T00:00:00Z");
+    expect(url.searchParams.get("limit")).toBe("50");
+    expect(url.searchParams.get("after_sequence")).toBe("10");
+    expect(url.searchParams.get("type")).toBe("agent_message");
+    expect(url.searchParams.get("agent_name")).toBe("claude-agent");
+    expect(url.searchParams.get("turn_id")).toBe("turn-1");
+  });
+
+  it("omits undefined params", async () => {
+    mockJsonResponse({ events: [] });
+
+    await fetchSessionEvents(WORKSPACE_ID, "sess-001", { limit: 10 });
+
+    const request = fetchRequest();
+    const url = new URL(request.url);
+    expect(url.searchParams.get("limit")).toBe("10");
+    expect(url.searchParams.has("since")).toBe(false);
+    expect(url.searchParams.has("type")).toBe(false);
+  });
+
+  it("throws 404 for unknown session", async () => {
+    vi.mocked(globalThis.fetch).mockResolvedValue(new Response(null, { status: 404 }));
+
+    await expect(fetchSessionEvents(WORKSPACE_ID, "unknown")).rejects.toThrow(
+      "Session not found: unknown"
+    );
+  });
+});
+
+describe("fetchSessionTranscript", () => {
+  const mockTranscript = {
+    epoch: 2,
+    generation: 4,
+    max_sequence: 12,
+    has_older: true,
+    next_before_sequence: 8,
+    limit: 2,
+    entries: [
+      {
+        sequence: 1,
+        start_sequence: 1,
+        message: {
+          id: "evt-1",
+          role: "assistant",
+          parts: [{ type: "text", text: "Hello", state: "done" }],
+        },
+      },
+      {
+        sequence: 2,
+        start_sequence: 2,
+        message: {
+          id: "tool-1",
+          role: "assistant",
+          parts: [
+            {
+              type: "tool-Read",
+              toolCallId: "tool-1",
+              state: "output-available",
+              input: { file_path: "/tmp/file.ts" },
+              output: {
+                type: "tool_result",
+                title: "Read",
+                raw: { stdout: "done", file_path: "/tmp/file.ts" },
+              },
+            },
+          ],
+        },
+      },
+    ],
+  };
+
+  it("preserves transcript fences, page metadata, and stable entry sequences", async () => {
+    mockJsonResponse(mockTranscript);
+
+    const result = await fetchSessionTranscript(WORKSPACE_ID, "sess-001", {
+      before_sequence: 20,
+      limit: 2,
+    });
+
+    expect(result).toEqual(mockTranscript);
+    expect(result.entries.map(entry => entry.start_sequence)).toEqual([1, 2]);
+    const url = new URL(fetchRequest().url);
+    expect(url.pathname).toBe("/api/workspaces/ws_alpha/sessions/sess-001/transcript");
+    expect(Object.fromEntries(url.searchParams)).toEqual({
+      before_sequence: "20",
+      limit: "2",
+    });
+  });
+
+  it("returns an empty transcript without treating it as an invalid AI SDK message list", async () => {
+    const empty = {
+      entries: [],
+      epoch: 1,
+      generation: 1,
+      max_sequence: 0,
+      has_older: false,
+      limit: 200,
+    };
+    mockJsonResponse(empty);
+
+    const result = await fetchSessionTranscript(WORKSPACE_ID, "sess-001");
+
+    expect(result).toEqual(empty);
+    await expectFetchRequest({
+      path: "/api/workspaces/ws_alpha/sessions/sess-001/transcript",
+    });
+  });
+
+  it("returns CompozyOS errored tool parts with raw output payloads", async () => {
+    const blockedTranscript = {
+      epoch: 1,
+      generation: 1,
+      max_sequence: 1,
+      has_older: false,
+      limit: 200,
+      entries: [
+        {
+          sequence: 1,
+          start_sequence: 1,
+          message: {
+            id: "blocked-turn",
+            role: "assistant",
+            parts: [
+              {
+                type: "tool-Attempt blocked terminal write",
+                toolCallId: "tool-blocked-1",
+                state: "output-error",
+                input: { command: "touch browser-blocked.txt" },
+                output: {
+                  type: "tool_result",
+                  title: "Attempt blocked terminal write",
+                  error: "terminal/create denied before writing workspace marker",
+                },
+                errorText: "terminal/create denied before writing workspace marker",
+              },
+              {
+                type: "text",
+                text: "Permission blocked diagnostic: terminal/create denied before writing workspace marker.",
+                state: "done",
+              },
+            ],
+          },
+        },
+      ],
+    };
+    mockJsonResponse(blockedTranscript);
+
+    const result = await fetchSessionTranscript(WORKSPACE_ID, "sess-001");
+
+    expect(result).toEqual(blockedTranscript);
+    expect(result.entries[0]?.message.parts).toHaveLength(2);
+    expect(result.entries[0]?.message.parts?.[1]).toMatchObject({
+      text: "Permission blocked diagnostic: terminal/create denied before writing workspace marker.",
+      type: "text",
+    });
+  });
+
+  // Invariant (S18): a compaction item survives transcript normalization whole — the
+  // `system` role, the agent's own (vendor) status, and the optional summary and error.
+  it("Should carry compaction items with any agent status through normalization", async () => {
+    const compactionTranscript = {
+      epoch: 1,
+      generation: 1,
+      max_sequence: 3,
+      has_older: false,
+      limit: 200,
+      entries: ["in_progress", "compaction_paused", "failed"].map((status, index) => ({
+        sequence: index + 1,
+        start_sequence: index + 1,
+        message: {
+          id: `compaction:c${index}`,
+          role: "system",
+          parts: [
+            {
+              type: "data-compozy-compaction",
+              id: `c${index}`,
+              data: {
+                kind: "compaction",
+                compaction_id: `c${index}`,
+                status,
+                started_at: "2026-10-08T14:02:11Z",
+                ...(status === "failed" ? { error: "context window exceeded" } : {}),
+              },
+            },
+          ],
+        },
+      })),
+    };
+    mockJsonResponse(compactionTranscript);
+
+    const result = await fetchSessionTranscript(WORKSPACE_ID, "sess-001");
+
+    expect(result).toEqual(compactionTranscript);
+  });
+
+  it("throws 404 for unknown session", async () => {
+    vi.mocked(globalThis.fetch).mockResolvedValue(new Response(null, { status: 404 }));
+
+    await expect(fetchSessionTranscript(WORKSPACE_ID, "unknown")).rejects.toThrow(
+      "Session not found: unknown"
+    );
+  });
+});
+
+// Invariant: usage reads preserve the aggregate/context and turn-union contracts through their workspace-scoped HTTP routes.
+// Owner and canonical suite: session API adapter; MSW supplies only the transport boundary.
+
+describe("session context HTTP adapters", () => {
+  it("Should read context and union turns and preserve workspace errors", async () => {
+    vi.stubGlobal(
+      "fetch",
+      createMswFetch(() =>
+        sessionContextHandlers(new Map([[primarySessionFixture.id, primarySessionFixture]]))
+      )
+    );
+    const workspace = primarySessionFixture.workspace_id!;
+    await expect(fetchSessionUsage(workspace, primarySessionFixture.id)).resolves.toEqual(
+      sessionContextUsageFixture
+    );
+    await expect(fetchSessionUsageTurns(workspace, primarySessionFixture.id)).resolves.toEqual(
+      sessionContextTurnsFixture
+    );
+    await expect(
+      fetchSessionUsageTurns("foreign-workspace", primarySessionFixture.id)
+    ).rejects.toBeInstanceOf(SessionNotFoundError);
+  });
+});
+
+describe("searchSessionFiles", () => {
+  it("Should search a session's files across profiles so non-default profile sessions resolve", async () => {
+    mockJsonResponse({ entries: [], truncated: false });
+    await searchSessionFiles(WORKSPACE_ID, "sess-001", { q: "main", limit: 50 });
+    await expectFetchRequest({
+      path: "/api/workspaces/ws_alpha/sessions/sess-001/files?q=main&limit=50&all_profiles=true",
+    });
+  });
+});
+
+describe("profile-bound session monitors", () => {
+  // Without a selector the daemon reads only the default profile, so other-profile sessions 404.
+  it("reads the session's monitors across profiles and cancels in its owner's profile", async () => {
+    mockJsonResponse({ monitors: [] });
+    await fetchSessionMonitors(WORKSPACE_ID, "sess-001");
+    await expectFetchRequest({
+      path: "/api/workspaces/ws_alpha/sessions/sess-001/monitors?all_profiles=true",
+    });
+    mockJsonResponse({ monitor: { monitor_id: "mon-1", status: "canceled" } });
+    await cancelSessionMonitor(WORKSPACE_ID, "sess-001", "design", "mon-1");
+    await expectFetchRequest({
+      method: "POST",
+      path: "/api/workspaces/ws_alpha/sessions/sess-001/monitors/mon-1/cancel?profile=design",
+      callIndex: 1,
+    });
+  });
+
+  it("reports a missing session on the list and a settled monitor on cancel", async () => {
+    mockJsonResponse({ error: "session not found" }, { status: 404 });
+    await expect(fetchSessionMonitors(WORKSPACE_ID, "sess-001")).rejects.toBeInstanceOf(
+      SessionNotFoundError
+    );
+    mockJsonResponse({ error: "monitor not found" }, { status: 404 });
+    const canceled = cancelSessionMonitor(WORKSPACE_ID, "sess-001", "design", "mon-1");
+    await expect(canceled).rejects.toBeInstanceOf(SessionApiError);
+    await expect(canceled).rejects.not.toBeInstanceOf(SessionNotFoundError);
+  });
+});
+
+describe("session processes", () => {
+  // A User session reports an empty workspace_id; its process routes live under @user.
+  it("reads and stops a User session's processes under @user in its owner's profile", async () => {
+    mockJsonResponse({ supported: true, scanned_at: "2026-10-29T12:00:00Z", items: [] });
+    await fetchSessionProcesses("", "sess-001", "design");
+    await expectFetchRequest({
+      path: "/api/workspaces/%40user/sessions/sess-001/processes?profile=design",
+    });
+    mockJsonResponse({ supported: true, results: [] });
+    await terminateSessionProcesses("", "sess-001", "design", { all: true });
+    await expectFetchRequest({
+      method: "POST",
+      path: "/api/workspaces/%40user/sessions/sess-001/processes/terminate?profile=design",
+      callIndex: 1,
+      body: { all: true },
+    });
+  });
+
+  it("Should keep aggregate termination batches within each target profile", async () => {
+    const targets = ["default", "design", "default"].map((profile, index) => ({
+      pid: 2000 + index,
+      started_at: "2026-10-29T12:00:00Z",
+      profile,
+    }));
+    vi.mocked(globalThis.fetch).mockImplementation(async input => {
+      const request = input as Request;
+      const profile = new URL(request.url).searchParams.get("profile");
+      const body = (await request.clone().json()) as {
+        targets: { pid: number; started_at: string }[];
+      };
+      for (const target of body.targets) {
+        expect(profile).toBe(targets.find(item => item.pid === target.pid)?.profile);
+        expect(target).not.toHaveProperty("profile");
+      }
+      return new Response(
+        JSON.stringify({
+          supported: true,
+          results: body.targets.map(target => ({ ...target, outcome: "terminated" })),
+        }),
+        { status: 200, headers: { "Content-Type": "application/json" } }
+      );
+    });
+    const response = await terminateProcesses(targets);
+    expect(globalThis.fetch).toHaveBeenCalledTimes(3);
+    expect(response.results.map(result => result.pid)).toEqual(targets.map(target => target.pid));
+  });
+
+  // The operator route takes at most 100 targets; Stop all over more must still stop every one.
+  it("stops left-running processes in sequential batches the route accepts and answers once per target", async () => {
+    const targets = Array.from({ length: 250 }, (_, index) => ({
+      pid: 1000 + index,
+      started_at: "2026-10-29T12:00:00Z",
+    }));
+    let inFlight = 0;
+    let maxInFlight = 0;
+    vi.mocked(globalThis.fetch).mockImplementation(async input => {
+      inFlight += 1;
+      maxInFlight = Math.max(maxInFlight, inFlight);
+      await new Promise(resolve => setTimeout(resolve, 0));
+      inFlight -= 1;
+      const body = (await (input as Request).clone().json()) as { targets: typeof targets };
+      if (body.targets[0]!.pid === 1100) {
+        return new Response(JSON.stringify({ error: "scan unavailable" }), {
+          status: 503,
+          headers: { "Content-Type": "application/json" },
+        });
+      }
+      return new Response(
+        JSON.stringify({
+          supported: true,
+          results: body.targets.map(target => ({ ...target, outcome: "terminated" })),
+        }),
+        { status: 200, headers: { "Content-Type": "application/json" } }
+      );
+    });
+
+    const response = await terminateProcesses(targets);
+
+    const sizes = await Promise.all(
+      vi.mocked(globalThis.fetch).mock.calls.map(async ([input]) => {
+        const request = input as Request;
+        expect(new URL(request.url).pathname).toBe("/api/processes/terminate");
+        return ((await request.clone().json()) as { targets: unknown[] }).targets.length;
+      })
+    );
+    expect(sizes).toEqual([100, 100, 50]);
+    // Batches go one after another, never piling up on the daemon.
+    expect(maxInFlight).toBe(1);
+    expect(response.results.map(result => result.pid)).toEqual(targets.map(target => target.pid));
+    const refused = response.results.filter(result => result.outcome === "failed");
+    expect(refused).toHaveLength(100);
+    expect(refused[0]).toMatchObject({ pid: 1100, error: "scan unavailable" });
+    expect(response.results.filter(result => result.outcome === "terminated")).toHaveLength(150);
+  });
+
+  it("rejects with the daemon's refusal when no batch is accepted", async () => {
+    mockJsonResponse({ error: "operator scope required" }, { status: 403 });
+    await expect(
+      terminateProcesses(
+        Array.from({ length: 201 }, (_, index) => ({
+          pid: 1000 + index,
+          started_at: "2026-10-29T12:00:00Z",
+        }))
+      )
+    ).rejects.toThrow("operator scope required");
+  });
+});
+
+describe("profile-bound subagents", () => {
+  it("reads the identified parent's roster across profiles and cancels in its owner's profile", async () => {
+    mockJsonResponse({ subagents: [], next_cursor: null });
+    await fetchSessionSubagents(WORKSPACE_ID, "sess-001", { limit: 200, cursor: "next" });
+    await expectFetchRequest({
+      path: "/api/workspaces/ws_alpha/sessions/sess-001/subagents?all_profiles=true&limit=200&cursor=next",
+    });
+    mockJsonResponse({ subagent_id: "sub-1", status: "cancel_requested" }, { status: 202 });
+    await cancelSubagent(WORKSPACE_ID, "sub-1", "design");
+    await expectFetchRequest({
+      method: "POST",
+      path: "/api/workspaces/ws_alpha/subagents/sub-1/cancel?profile=design",
+      callIndex: 1,
+      body: { reason: "" },
+    });
+  });
+});

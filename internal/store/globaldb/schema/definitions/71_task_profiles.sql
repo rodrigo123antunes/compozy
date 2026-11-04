@@ -1,0 +1,62 @@
+CREATE TABLE task_execution_profiles (
+			task_id                  TEXT PRIMARY KEY REFERENCES tasks(id) ON DELETE CASCADE,
+			coordinator_mode         TEXT NOT NULL DEFAULT 'inherit' CHECK (
+				coordinator_mode IN ('inherit', 'guided')
+			),
+			coordinator_agent_name   TEXT NOT NULL DEFAULT '',
+			coordinator_provider     TEXT NOT NULL DEFAULT '',
+			coordinator_model        TEXT NOT NULL DEFAULT '',
+			coordinator_guidance     TEXT NOT NULL DEFAULT '',
+			worker_mode              TEXT NOT NULL DEFAULT 'inherit' CHECK (
+				worker_mode IN ('inherit', 'select')
+			),
+			worker_agent_name        TEXT NOT NULL DEFAULT '',
+			worker_provider          TEXT NOT NULL DEFAULT '',
+			worker_model             TEXT NOT NULL DEFAULT '',
+			worker_reasoning_effort  TEXT NOT NULL DEFAULT '',
+			worker_speed             TEXT NOT NULL DEFAULT '' CHECK (worker_speed IN ('', 'normal', 'fast')),
+			worker_acp_options_json  TEXT NOT NULL DEFAULT '[]' CHECK (json_valid(worker_acp_options_json)),
+			review_agent_name        TEXT NOT NULL DEFAULT '',
+			review_provider          TEXT NOT NULL DEFAULT '',
+			review_model             TEXT NOT NULL DEFAULT '',
+			review_reasoning_effort  TEXT NOT NULL DEFAULT '',
+			review_speed             TEXT NOT NULL DEFAULT '' CHECK (review_speed IN ('', 'normal', 'fast')),
+			review_acp_options_json  TEXT NOT NULL DEFAULT '[]' CHECK (json_valid(review_acp_options_json)),
+			worktree_mode            TEXT NOT NULL DEFAULT 'inherit' CHECK (
+				worktree_mode IN ('inherit', 'none', 'ref', 'per_run')
+			),
+			worktree_ref             TEXT NOT NULL DEFAULT '',
+			created_at               TEXT NOT NULL,
+			updated_at               TEXT NOT NULL,
+			runtime_mode             TEXT NOT NULL DEFAULT 'default' CHECK (
+				runtime_mode IN ('default', 'evidence')
+			),
+			CHECK (
+				(worktree_mode = 'ref') = (worktree_ref <> '')
+			)
+		);
+
+CREATE TABLE task_profile_agents (
+			task_id     TEXT NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+			role        TEXT NOT NULL CHECK (role IN ('worker', 'review', 'participant')),
+			preference  TEXT NOT NULL CHECK (preference IN ('required', 'allowed', 'preferred')),
+			agent_name  TEXT NOT NULL CHECK (agent_name <> ''),
+			PRIMARY KEY (task_id, role, preference, agent_name)
+		);
+
+CREATE TABLE task_profile_capabilities (
+			task_id       TEXT NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+			role          TEXT NOT NULL CHECK (role IN ('worker', 'review', 'participant')),
+			preference    TEXT NOT NULL CHECK (preference IN ('required', 'preferred')),
+			capability_id TEXT NOT NULL CHECK (capability_id <> ''),
+			PRIMARY KEY (task_id, role, preference, capability_id)
+		);
+
+CREATE INDEX task_execution_profiles_task_id_idx
+			ON task_execution_profiles(task_id);
+
+CREATE INDEX task_profile_agents_lookup_idx
+			ON task_profile_agents(role, preference, agent_name, task_id);
+
+CREATE INDEX task_profile_capabilities_lookup_idx
+			ON task_profile_capabilities(role, preference, capability_id, task_id);

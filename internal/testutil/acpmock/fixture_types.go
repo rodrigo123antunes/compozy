@@ -1,0 +1,218 @@
+package acpmock
+
+import (
+	"encoding/json"
+	"strings"
+)
+
+const FixtureVersion = 2
+
+type StepKind string
+
+const (
+	StepKindAssistant      StepKind = "assistant"
+	StepKindThought        StepKind = "thought"
+	StepKindToolCall       StepKind = "tool_call"
+	StepKindNativeToolCall StepKind = "native_tool_call"
+	StepKindPermission     StepKind = "permission"
+	StepKindCommand        StepKind = "command_exec"
+	StepKindDriverControl  StepKind = "driver_control"
+)
+
+// Fixture describes one deterministic multi-agent ACP mock scenario.
+type Fixture struct {
+	Version int            `json:"version"`
+	Agents  []AgentFixture `json:"agents"`
+}
+
+// AgentFixture describes one named ACP mock agent inside a fixture file.
+type AgentFixture struct {
+	// SteerOutcome advertises the steering extension and returns this scripted outcome.
+	SteerOutcome    string   `json:"steer_outcome,omitempty"`
+	Name            string   `json:"name"`
+	Provider        string   `json:"provider"`
+	Model           string   `json:"model,omitempty"`
+	ReasoningEffort string   `json:"reasoning_effort,omitempty"`
+	Permissions     string   `json:"permissions,omitempty"`
+	Tools           []string `json:"tools,omitempty"`
+	Prompt          string   `json:"prompt,omitempty"`
+	LoadSession     *bool    `json:"load_session,omitzero"`
+	// ForkSession advertises the unstable ACP session/fork capability; the driver answers
+	// session/fork with a clone id after sending clone-id updates first (OpenCode shape).
+	ForkSession bool `json:"fork_session,omitzero"`
+	// ForkError makes session/fork fail with this message.
+	ForkError string `json:"fork_error,omitempty"`
+	// LoadMissing makes session/load fail with ACP resource-not-found for any id.
+	LoadMissing bool `json:"load_missing,omitzero"`
+	// LoadDelayMS holds session/load open to script a provider that resumes slowly.
+	LoadDelayMS   int                          `json:"load_delay_ms,omitzero"`
+	ConfigOptions []SessionConfigOptionFixture `json:"config_options,omitempty"`
+	Turns         []TurnFixture                `json:"turns"`
+}
+
+// SupportsLoadSession reports the fixture's advertised ACP session/load capability.
+func (a AgentFixture) SupportsLoadSession() bool {
+	return a.LoadSession == nil || *a.LoadSession
+}
+
+// SessionConfigOptionFixture describes one deterministic ACP session config select option.
+type SessionConfigOptionFixture struct {
+	ID       string                            `json:"id"`
+	Name     string                            `json:"name"`
+	Category string                            `json:"category,omitempty"`
+	Current  string                            `json:"current"`
+	Values   []SessionConfigOptionValueFixture `json:"values"`
+}
+
+// SessionConfigOptionValueFixture describes one selectable ACP config option value.
+type SessionConfigOptionValueFixture struct {
+	Value string `json:"value"`
+	Label string `json:"label,omitempty"`
+	// RejectSet makes session/set_config_option to this advertised value fail, which
+	// scripts a start that ACP accepted (session/new returned) and then failed.
+	RejectSet bool `json:"reject_set,omitzero"`
+}
+
+// RejectsConfigValue reports whether the fixture scripts a set_config_option failure.
+func (a AgentFixture) RejectsConfigValue(configID string, value string) bool {
+	for _, option := range a.ConfigOptions {
+		if strings.TrimSpace(option.ID) != strings.TrimSpace(configID) {
+			continue
+		}
+		for _, candidate := range option.Values {
+			if candidate.RejectSet && strings.TrimSpace(candidate.Value) == strings.TrimSpace(value) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// TurnFixture describes one deterministic prompt turn for an agent.
+type TurnFixture struct {
+	UsageUpdates []UsageUpdate `json:"usage_updates,omitempty"`
+	Name         string        `json:"name,omitempty"`
+	Match        TurnMatch     `json:"match"`
+	Steps        []Step        `json:"steps"`
+	StopReason   string        `json:"stop_reason,omitempty"`
+	Usage        *TurnUsage    `json:"usage,omitzero"`
+}
+
+// TurnUsage scripts deterministic aggregate token usage for one ACP prompt response.
+type UsageUpdate struct {
+	Used int            `json:"used"`
+	Size int            `json:"size"`
+	Meta map[string]any `json:"meta,omitempty"`
+}
+
+type TurnUsage struct {
+	CacheReadTokens  *int `json:"cache_read_tokens,omitzero"`
+	CacheWriteTokens *int `json:"cache_write_tokens,omitzero"`
+	InputTokens      int  `json:"input_tokens"`
+	OutputTokens     int  `json:"output_tokens"`
+	TotalTokens      *int `json:"total_tokens,omitzero"`
+}
+
+// TurnMatch routes a prompt to a turn fixture using stable prompt fields.
+type TurnMatch struct {
+	CompactionNotice *bool  `json:"compaction_notice,omitempty"`
+	SituationFull    *bool  `json:"situation_full,omitempty"`
+	TurnSource       string `json:"turn_source,omitempty"`
+	UserText         string `json:"user_text,omitempty"`
+	// UserTextContains matches a substring after the same canonical whitespace normalization as UserText.
+	UserTextContains string `json:"user_text_contains,omitempty"`
+	// RawUserTextContains matches a substring before prompt augmentation is stripped.
+	RawUserTextContains string `json:"raw_user_text_contains,omitempty"`
+
+	Goal  *TurnMatchGoal  `json:"goal,omitempty"`
+	Judge *TurnMatchJudge `json:"judge,omitempty"`
+}
+
+// TurnMatchGoal captures exact Goal prompt metadata fields.
+type TurnMatchGoal struct {
+	Kind          string `json:"kind,omitempty"`
+	RunID         string `json:"run_id,omitempty"`
+	NodeID        string `json:"node_id,omitempty"`
+	Generation    int64  `json:"generation,omitzero"`
+	ItemIndex     *int   `json:"item_index,omitzero"`
+	Turn          *int   `json:"turn,omitzero"`
+	PromptAttempt *int   `json:"prompt_attempt,omitzero"`
+	PromptID      string `json:"prompt_id,omitempty"`
+}
+
+// TurnMatchJudge captures exact daemon-owned judge prompt metadata fields.
+type TurnMatchJudge struct {
+	Role          string `json:"role,omitempty"`
+	Attempt       int    `json:"attempt,omitzero"`
+	CorrelationID string `json:"correlation_id,omitempty"`
+	GateID        string `json:"gate_id,omitempty"`
+	CriterionID   string `json:"criterion_id,omitempty"`
+}
+
+// Step describes one deterministic ACP action emitted or executed by the driver.
+type Step struct {
+	OmitToolCallID bool     `json:"omit_tool_call_id,omitzero"`
+	Kind           StepKind `json:"kind"`
+
+	Text   string   `json:"text,omitempty"`
+	Chunks []string `json:"chunks,omitempty"`
+	// BurstCount repeats Text without delivery pacing to exercise transport pressure.
+	BurstCount int `json:"burst_count,omitzero"`
+
+	ToolID      string          `json:"tool_id,omitempty"`
+	ToolCallID  string          `json:"tool_call_id,omitempty"`
+	Title       string          `json:"title,omitempty"`
+	ToolKind    string          `json:"tool_kind,omitempty"`
+	Path        string          `json:"path,omitempty"`
+	Status      string          `json:"status,omitempty"`
+	ContentText string          `json:"content_text,omitempty"`
+	RawInput    json.RawMessage `json:"raw_input,omitempty"`
+	RawOutput   json.RawMessage `json:"raw_output,omitempty"`
+
+	ExpectDecision string `json:"expect_decision,omitempty"`
+	EmitDecision   bool   `json:"emit_decision,omitzero"`
+	EmitText       string `json:"emit_text,omitempty"`
+
+	Command              string             `json:"command,omitempty"`
+	Args                 []string           `json:"args,omitempty"`
+	Cwd                  string             `json:"cwd,omitempty"`
+	ExpectExitCode       *int               `json:"expect_exit_code,omitzero"`
+	ExpectOutputContains string             `json:"expect_output_contains,omitempty"`
+	ExpectErrorContains  string             `json:"expect_error_contains,omitempty"`
+	EmitOutput           bool               `json:"emit_output,omitzero"`
+	DriverControl        *DriverControlStep `json:"driver_control,omitzero"`
+}
+
+// DriverControlStep injects driver-level protocol or lifecycle faults.
+type DriverControlStep struct {
+	Action     DriverControlAction `json:"action"`
+	RawJSONRPC string              `json:"raw_jsonrpc,omitempty"`
+	Async      bool                `json:"async,omitzero"`
+	DelayMS    int                 `json:"delay_ms,omitzero"`
+	// ErrorMessage is the JSON-RPC error message fail_prompt answers session/prompt with.
+	ErrorMessage string `json:"error_message,omitempty"`
+	// ErrorCode is the optional JSON-RPC error code for fail_prompt (default -32603).
+	ErrorCode int `json:"error_code,omitzero"`
+	// WhenPathMissing makes fail_prompt fire only while this path, relative to the driver's
+	// working directory, is absent; otherwise the step passes and the turn continues. It lets a
+	// lab remove and restore a stand-in provider credential.
+	WhenPathMissing string `json:"when_path_missing,omitempty"`
+}
+
+// DriverControlAction identifies one supported driver fault injection action.
+type DriverControlAction string
+
+const (
+	DriverControlDisconnect       DriverControlAction = "disconnect"
+	DriverControlWriteRawJSONRPC  DriverControlAction = "write_raw_jsonrpc"
+	DriverControlBlockUntilCancel DriverControlAction = "block_until_cancel"
+	DriverControlDelay            DriverControlAction = "delay"
+	// DriverControlHoldIgnoringCancel keeps the turn open for delay_ms while ignoring
+	// prompt cancellation, so stop ladders must escalate past the cooperative phase.
+	DriverControlHoldIgnoringCancel DriverControlAction = "hold_ignoring_cancel"
+	// DriverControlFailPrompt answers the matched session/prompt with a JSON-RPC error
+	// carrying error_message, the shape a provider rate limit or auth lapse reaches the
+	// daemon in after the session was accepted.
+	DriverControlFailPrompt   DriverControlAction = "fail_prompt"
+	DriverControlWaitForSteer DriverControlAction = "wait_for_steer"
+)

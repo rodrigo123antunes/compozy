@@ -1,0 +1,1789 @@
+package session
+
+import (
+	"context"
+	"encoding/base64"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"log/slog"
+	"os"
+	"path/filepath"
+	"runtime"
+	"slices"
+	"strings"
+	"sync"
+	"sync/atomic"
+	"testing"
+	"time"
+
+	"github.com/compozy/compozy/internal/acp"
+	attachmentspkg "github.com/compozy/compozy/internal/attachments"
+	compozyconfig "github.com/compozy/compozy/internal/config"
+	"github.com/compozy/compozy/internal/store"
+	"github.com/compozy/compozy/internal/store/sessiondb"
+	"github.com/compozy/compozy/internal/testutil"
+	workspacepkg "github.com/compozy/compozy/internal/workspace"
+)
+
+type signalingAttachmentScopeLease struct {
+	permits              chan struct{}
+	uploadLeaseAttempted chan struct{}
+	mu                   sync.Mutex
+	acquisitions         int
+	deleted              bool
+}
+
+func newSignalingAttachmentScopeLease() *signalingAttachmentScopeLease {
+	lease := &signalingAttachmentScopeLease{
+		permits:              make(chan struct{}, 1),
+		uploadLeaseAttempted: make(chan struct{}),
+	}
+	lease.permits <- struct{}{}
+	return lease
+}
+
+func (s *signalingAttachmentScopeLease) AcquireScopeLease(
+	ctx context.Context,
+	_ string,
+	_ string,
+) (attachmentspkg.ScopeLeaseGuard, error) {
+	s.mu.Lock()
+	s.acquisitions++
+	if s.acquisitions == 2 {
+		close(s.uploadLeaseAttempted)
+	}
+	s.mu.Unlock()
+
+	select {
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	case <-s.permits:
+		return &signalingAttachmentScopeLeaseGuard{lease: s}, nil
+	}
+}
+
+func (s *signalingAttachmentScopeLease) Put(ctx context.Context) error {
+	guard, err := s.AcquireScopeLease(ctx, "ws-delete-race", "sess-delete-race")
+	if err != nil {
+		return err
+	}
+	defer guard.Release()
+
+	s.mu.Lock()
+	deleted := s.deleted
+	s.mu.Unlock()
+	if deleted {
+		return attachmentspkg.ErrNotFound
+	}
+	return nil
+}
+
+type signalingAttachmentScopeLeaseGuard struct {
+	lease *signalingAttachmentScopeLease
+	once  sync.Once
+}
+
+func (g *signalingAttachmentScopeLeaseGuard) Release() {
+	if g == nil || g.lease == nil {
+		return
+	}
+	g.once.Do(func() { g.lease.permits <- struct{}{} })
+}
+
+func (g *signalingAttachmentScopeLeaseGuard) MarkDeleted() {
+	if g == nil || g.lease == nil {
+		return
+	}
+	g.lease.mu.Lock()
+	g.lease.deleted = true
+	g.lease.mu.Unlock()
+}
+
+var _ attachmentScopeLease = (*signalingAttachmentScopeLease)(nil)
+
+type nonReentrantAttachmentScopeLease struct {
+	mu     sync.Mutex
+	active bool
+}
+
+func (s *nonReentrantAttachmentScopeLease) AcquireScopeLease(
+	_ context.Context,
+	_ string,
+	_ string,
+) (attachmentspkg.ScopeLeaseGuard, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.active {
+		return nil, errors.New("nested attachment scope lease")
+	}
+	s.active = true
+	return &nonReentrantAttachmentScopeLeaseGuard{lease: s}, nil
+}
+
+type nonReentrantAttachmentScopeLeaseGuard struct {
+	lease *nonReentrantAttachmentScopeLease
+	once  sync.Once
+}
+
+func (g *nonReentrantAttachmentScopeLeaseGuard) Release() {
+	if g == nil || g.lease == nil {
+		return
+	}
+	g.once.Do(func() {
+		g.lease.mu.Lock()
+		g.lease.active = false
+		g.lease.mu.Unlock()
+	})
+}
+
+func (*nonReentrantAttachmentScopeLeaseGuard) MarkDeleted() {}
+
+var _ attachmentScopeLease = (*nonReentrantAttachmentScopeLease)(nil)
+
+type sessionWindowReconcilerFunc func(context.Context, string, string, string) error
+
+func (f sessionWindowReconcilerFunc) ReconcileDeletedSession(
+	ctx context.Context,
+	profileID string,
+	workspaceID string,
+	sessionID string,
+) error {
+	return f(ctx, profileID, workspaceID, sessionID)
+}
+
+func TestManagerDelete(t *testing.T) {
+	t.Parallel()
+	// Invariant: with the opt-in the tree goes deepest first, so a failure leaves
+	// what remains reachable from the root; without it only the target goes.
+	t.Run("Should delete descendants deepest first, then the root", func(t *testing.T) {
+		t.Parallel()
+		paged := &pagedRecordingSessionCatalog{recordingSessionCatalog: newRecordingSessionCatalog()}
+		catalog := &sessionTreeCatalog{familyArchiveCatalog: &familyArchiveCatalog{
+			pagedRecordingSessionCatalog: paged, members: map[string][]string{},
+		}}
+		h := newHarness(t, WithSessionCatalog(catalog))
+		parent := createSession(t, h)
+		child := createSession(t, h)
+		grandchild := createSession(t, h)
+		catalog.setMembers(parent.ID, child.ID, grandchild.ID)
+
+		deleted, err := h.manager.DeleteWithChildren(t.Context(), h.workspaceID, parent.ID)
+		if err != nil {
+			t.Fatalf("DeleteWithChildren() error = %v", err)
+		}
+		if want := []string{grandchild.ID, child.ID, parent.ID}; !slices.Equal(deleted, want) {
+			t.Fatalf("deleted = %v, want %v", deleted, want)
+		}
+		for _, id := range deleted {
+			if _, err := h.manager.Status(t.Context(), id); !errors.Is(err, ErrSessionNotFound) {
+				t.Fatalf("Status(%s) after tree delete = %v, want not found", id, err)
+			}
+		}
+	})
+
+	t.Run("Should keep the root and name the child when a descendant delete fails", func(t *testing.T) {
+		t.Parallel()
+		paged := &pagedRecordingSessionCatalog{recordingSessionCatalog: newRecordingSessionCatalog()}
+		catalog := &sessionTreeCatalog{familyArchiveCatalog: &familyArchiveCatalog{
+			pagedRecordingSessionCatalog: paged, members: map[string][]string{},
+		}}
+		h := newHarness(t, WithSessionCatalog(catalog))
+		parent := createSession(t, h)
+		child := createSession(t, h)
+		grandchild := createSession(t, h)
+		catalog.setMembers(parent.ID, child.ID, grandchild.ID)
+		catalog.failDelete = child.ID
+
+		deleted, err := h.manager.DeleteWithChildren(t.Context(), h.workspaceID, parent.ID)
+		if err == nil || !strings.Contains(err.Error(), child.ID) {
+			t.Fatalf("DeleteWithChildren() error = %v, want it to name %s", err, child.ID)
+		}
+		if !slices.Equal(deleted, []string{grandchild.ID}) {
+			t.Fatalf("deleted = %v, want only %s", deleted, grandchild.ID)
+		}
+		if _, err := h.manager.Status(t.Context(), parent.ID); err != nil {
+			t.Fatalf("Status(root) after failed child = %v, want reachable", err)
+		}
+	})
+
+	t.Run("Should leave children in place when the plain delete targets their parent", func(t *testing.T) {
+		t.Parallel()
+		paged := &pagedRecordingSessionCatalog{recordingSessionCatalog: newRecordingSessionCatalog()}
+		catalog := &sessionTreeCatalog{familyArchiveCatalog: &familyArchiveCatalog{
+			pagedRecordingSessionCatalog: paged, members: map[string][]string{},
+		}}
+		h := newHarness(t, WithSessionCatalog(catalog))
+		parent := createSession(t, h)
+		child := createSession(t, h)
+		catalog.setMembers(parent.ID, child.ID)
+		if err := h.manager.Delete(t.Context(), parent.ID); err != nil {
+			t.Fatalf("Delete() error = %v", err)
+		}
+		if _, err := h.manager.Status(t.Context(), child.ID); err != nil {
+			t.Fatalf("Status(child) after parent delete = %v, want reachable", err)
+		}
+	})
+
+	// Invariant: failed Goal settlement preserves stopped history and attachments for a safe retry.
+	// Owner: session deletion; canonical manager lifecycle suite with the Goal I/O boundary injected.
+	for _, restart := range []bool{false, true} {
+		t.Run(fmt.Sprintf("Should settle pending deletion after restart %t", restart), func(t *testing.T) {
+			t.Parallel()
+			h := newHarness(t)
+			active := createSession(t, h)
+			attachmentPath := writeSessionAttachmentFixture(t, h, active.ID, "retain-until-commit")
+			settlementErr := errors.New("Goal settlement unavailable")
+			handler := &stopGoalHandler{stop: func(context.Context, *Info) error { return settlementErr }}
+			h.manager.SetGoalCommandHandler(handler)
+			if err := h.manager.Stop(t.Context(), active.ID); !errors.Is(err, ErrRecoveryPersistence) ||
+				!errors.Is(err, settlementErr) {
+				t.Fatalf("partial stop error = %v", err)
+			}
+			if !h.manager.hasPendingStopSettlement(active.ID) {
+				t.Fatal("partial stop lost its recovery receipt")
+			}
+			manager := h.manager
+			if restart {
+				h.manager.removeActive(active.ID)
+				manager = newManagerWithHarness(t, h, WithGoalCommandHandler(handler))
+				cleanupTestManager(t, manager)
+			}
+			if err := manager.Delete(t.Context(), active.ID); !errors.Is(err, settlementErr) ||
+				!errors.Is(err, ErrRecoveryPersistence) {
+				t.Fatalf("delete error = %v", err)
+			}
+			wantState := StateStopping
+			if restart {
+				wantState = StateStopped
+			}
+			if info, err := manager.Status(t.Context(), active.ID); err != nil || info.State != wantState {
+				t.Fatalf("preserved session = %#v, error = %v", info, err)
+			}
+			if meta := readMeta(t, active.MetaPath()); meta.State != string(StateStopped) {
+				t.Fatalf("persisted history state = %q, want stopped", meta.State)
+			}
+			if content, err := os.ReadFile(attachmentPath); err != nil || string(content) != "retain-until-commit" {
+				t.Fatalf("preserved attachment = %q, error = %v", content, err)
+			}
+			manager.SetGoalCommandHandler(&stopGoalHandler{stop: func(context.Context, *Info) error { return nil }})
+			if err := manager.Delete(t.Context(), active.ID); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := manager.Status(t.Context(), active.ID); !errors.Is(err, ErrSessionNotFound) {
+				t.Fatalf("deleted status error = %v", err)
+			}
+		})
+	}
+	t.Run("Should reject stop requests after deleting a previously stopped session", func(t *testing.T) {
+		t.Parallel()
+		h := newHarness(t)
+		active := createSession(t, h)
+		if err := h.manager.Stop(t.Context(), active.ID); err != nil {
+			t.Fatal(err)
+		}
+		if err := h.manager.Delete(t.Context(), active.ID); err != nil {
+			t.Fatal(err)
+		}
+		for range 2 {
+			if err := h.manager.RequestStop(
+				t.Context(),
+				active.ID,
+				CauseUserRequested,
+			); !errors.Is(
+				err,
+				ErrSessionNotFound,
+			) {
+				t.Fatalf("stop deleted session = %v, want ErrSessionNotFound", err)
+			}
+		}
+	})
+
+	t.Run("Should retain recovered session history until process exit is verified", func(t *testing.T) {
+		t.Parallel()
+		h := newHarness(t)
+		active := seedRecoveredUnverifiedStop(t, h)
+		before := readStoredEvents(t, active)
+		if err := h.manager.Delete(testutil.Context(t), active.ID); !errors.Is(err, ErrStopVerificationFailed) {
+			t.Fatalf("delete bypassed unverified recovered process: %v", err)
+		}
+		meta := readMeta(t, active.MetaPath())
+		if meta.State != string(StateStopping) || len(readStoredEvents(t, active)) != len(before) {
+			t.Fatal("rejected delete changed recovered history or terminal truth")
+		}
+	})
+
+	cases := []struct {
+		name string
+		run  func(*testing.T)
+	}{
+		{
+			name: "Should remove a User session's attachments from the reserved User directory",
+			run: func(t *testing.T) {
+				ctx := testutil.Context(t)
+				homePaths, err := compozyconfig.ResolveHomePathsFrom(t.TempDir())
+				if err != nil {
+					t.Fatalf("ResolveHomePathsFrom() error = %v", err)
+				}
+				if err := compozyconfig.EnsureHomeLayout(homePaths); err != nil {
+					t.Fatalf("EnsureHomeLayout() error = %v", err)
+				}
+				const sessionID = "sess-user-delete"
+				sessionDir := filepath.Join(homePaths.SessionAttachmentsDir, attachmentspkg.ScopeDir(""), sessionID)
+				if err := os.MkdirAll(sessionDir, 0o700); err != nil {
+					t.Fatalf("MkdirAll(User attachment fixture) error = %v", err)
+				}
+				if err := os.WriteFile(filepath.Join(sessionDir, "notes.txt"), []byte("user"), 0o600); err != nil {
+					t.Fatalf("WriteFile(User attachment fixture) error = %v", err)
+				}
+				manager := &Manager{homePaths: homePaths, attachmentScopeLease: newSignalingAttachmentScopeLease()}
+				staged, err := manager.stageSessionAttachmentDelete(ctx, "", sessionID, "delete-user")
+				if err != nil {
+					t.Fatalf("stageSessionAttachmentDelete(User) error = %v", err)
+				}
+				if err := manager.commitStagedAttachmentDelete(ctx, staged); err != nil {
+					t.Fatalf("commitStagedAttachmentDelete(User) error = %v", err)
+				}
+				if err := staged.Release(); err != nil {
+					t.Fatalf("Release(User staged delete) error = %v", err)
+				}
+				if _, err := os.Stat(sessionDir); !errors.Is(err, os.ErrNotExist) {
+					t.Fatalf("User attachment directory still present after deletion: %v", err)
+				}
+			},
+		},
+		{
+			name: "Should fence a concurrent attachment upload until deletion commits",
+			run: func(t *testing.T) {
+				ctx := testutil.Context(t)
+				homePaths, err := compozyconfig.ResolveHomePathsFrom(t.TempDir())
+				if err != nil {
+					t.Fatalf("ResolveHomePathsFrom() error = %v", err)
+				}
+				if err := compozyconfig.EnsureHomeLayout(homePaths); err != nil {
+					t.Fatalf("EnsureHomeLayout() error = %v", err)
+				}
+				const workspaceID = "ws-delete-race"
+				const sessionID = "sess-delete-race"
+				attachmentPath := filepath.Join(
+					homePaths.SessionAttachmentsDir,
+					workspaceID,
+					sessionID,
+					"before.txt",
+				)
+				if err := os.MkdirAll(filepath.Dir(attachmentPath), 0o700); err != nil {
+					t.Fatalf("MkdirAll(attachment fixture) error = %v", err)
+				}
+				if err := os.WriteFile(attachmentPath, []byte("before"), 0o600); err != nil {
+					t.Fatalf("WriteFile(attachment fixture) error = %v", err)
+				}
+
+				lease := newSignalingAttachmentScopeLease()
+				manager := &Manager{homePaths: homePaths, attachmentScopeLease: lease}
+				staged, err := manager.stageSessionAttachmentDelete(ctx, workspaceID, sessionID, "delete-race")
+				if err != nil {
+					t.Fatalf("stageSessionAttachmentDelete() error = %v", err)
+				}
+				t.Cleanup(func() {
+					if releaseErr := staged.Release(); releaseErr != nil {
+						t.Errorf("Release(staged attachment delete) error = %v", releaseErr)
+					}
+				})
+
+				putDone := make(chan error, 1)
+				go func() { putDone <- lease.Put(ctx) }()
+				select {
+				case <-lease.uploadLeaseAttempted:
+				case <-ctx.Done():
+					t.Fatalf("concurrent upload did not reach scope lease acquisition: %v", ctx.Err())
+				}
+				select {
+				case putErr := <-putDone:
+					t.Fatalf("Put(concurrent) returned before deletion commit: %v", putErr)
+				default:
+				}
+
+				if err := manager.commitStagedAttachmentDelete(ctx, staged); err != nil {
+					t.Fatalf("commitStagedAttachmentDelete() error = %v", err)
+				}
+				select {
+				case putErr := <-putDone:
+					if !errors.Is(putErr, attachmentspkg.ErrNotFound) {
+						t.Fatalf("Put(after committed delete) error = %v, want attachment not found", putErr)
+					}
+				case <-ctx.Done():
+					t.Fatalf("Put(concurrent) did not finish after delete released the lease: %v", ctx.Err())
+				}
+			},
+		},
+		{
+			name: "Should reject malformed session deletion tombstones at the parser boundary",
+			run: func(t *testing.T) {
+				tests := []struct {
+					name  string
+					value string
+				}{
+					{
+						name:  "Should reject an unknown tombstone prefix",
+						value: ".compozy-delete-unknown-c2Vzcw.delete-1",
+					},
+					{
+						name: "Should reject a tombstone without a target separator",
+						value: sessionDeleteStagedPrefix +
+							base64.RawURLEncoding.EncodeToString([]byte("sess-1")),
+					},
+					{
+						name:  "Should reject a tombstone without a deletion identifier",
+						value: sessionDeleteStagedPrefix + base64.RawURLEncoding.EncodeToString([]byte("sess-1")) + ".",
+					},
+					{
+						name:  "Should reject an invalid encoded session identifier",
+						value: sessionDeleteCommittedPrefix + "%%%" + ".delete-1",
+					},
+					{
+						name: "Should reject an invalid stored session identifier",
+						value: sessionDeleteStagedPrefix +
+							base64.RawURLEncoding.EncodeToString([]byte("../sess-1")) + ".delete-1",
+					},
+				}
+				for _, test := range tests {
+					t.Run(test.name, func(t *testing.T) {
+						t.Parallel()
+
+						state, target, deletionID, err := parseSessionDeleteTombstoneParts(test.value)
+						if !errors.Is(err, errInvalidSessionDeleteTombstone) {
+							t.Fatalf(
+								"parseSessionDeleteTombstoneParts(%q) error = %v, want %v",
+								test.value,
+								err,
+								errInvalidSessionDeleteTombstone,
+							)
+						}
+						if state != 0 || target != "" || deletionID != "" {
+							t.Fatalf(
+								"parseSessionDeleteTombstoneParts(%q) = (%d, %q, %q), want zero values",
+								test.value,
+								state,
+								target,
+								deletionID,
+							)
+						}
+					})
+				}
+			},
+		},
+		{
+			name: "Should preserve a system child when its provenance parent is deleted",
+			run: func(t *testing.T) {
+				h := newHarness(t)
+				parent := createSession(t, h)
+				child, err := h.manager.Create(testutil.Context(t), new(CreateOpts{
+					AgentName: "coder", Workspace: h.workspaceID, Type: SessionTypeSystem,
+					ProvenanceParentSessionID: parent.ID,
+				}))
+				if err != nil {
+					t.Fatalf("Create(system child) error = %v", err)
+				}
+
+				if err := h.manager.Delete(testutil.Context(t), parent.ID); err != nil {
+					t.Fatalf("Delete(parent) error = %v", err)
+				}
+				info, err := h.manager.Status(testutil.Context(t), child.ID)
+				if err != nil {
+					t.Fatalf("Status(child after parent deletion) error = %v", err)
+				}
+				if info.Lineage == nil || info.Lineage.ParentSessionID != parent.ID ||
+					info.Lineage.RootSessionID != parent.ID {
+					t.Fatalf("child lineage = %#v, want preserved dangling provenance to %q", info.Lineage, parent.ID)
+				}
+				if err := h.manager.Delete(testutil.Context(t), child.ID); err != nil {
+					t.Fatalf("Delete(child with missing parent) error = %v", err)
+				}
+			},
+		},
+		{
+			name: "Should remove a stopped user session from durable counts",
+			run: func(t *testing.T) {
+				catalog := newRecordingSessionCatalog()
+				h := newHarness(t, WithSessionCatalog(catalog))
+				session := createSession(t, h)
+				attachmentPath := writeSessionAttachmentFixture(t, h, session.ID, "delete-me")
+
+				if err := h.manager.Stop(testutil.Context(t), session.ID); err != nil {
+					t.Fatalf("Stop() error = %v", err)
+				}
+
+				if _, err := os.Stat(session.SessionDir()); err != nil {
+					t.Fatalf("Stat(session dir before delete) error = %v", err)
+				}
+				events, cancel, err := h.manager.SubscribeSessionCatalogEvents(
+					testutil.Context(t),
+					CatalogScope{ReadScope: store.ReadScope{AllProfiles: true}, AllWorkspaces: true},
+				)
+				if err != nil {
+					t.Fatalf("SubscribeSessionCatalogEvents() error = %v", err)
+				}
+				defer cancel()
+
+				if err := h.manager.Delete(testutil.Context(t), session.ID); err != nil {
+					t.Fatalf("Delete() error = %v", err)
+				}
+
+				if _, err := os.Stat(session.SessionDir()); !errors.Is(err, os.ErrNotExist) {
+					t.Fatalf("Stat(session dir after delete) error = %v, want os.ErrNotExist", err)
+				}
+				if _, err := os.Stat(attachmentPath); !errors.Is(err, os.ErrNotExist) {
+					t.Fatalf("Stat(attachment after delete) error = %v, want os.ErrNotExist", err)
+				}
+				if _, err := h.manager.Status(testutil.Context(t), session.ID); !errors.Is(err, ErrSessionNotFound) {
+					t.Fatalf("Status(after delete) error = %v, want %v", err, ErrSessionNotFound)
+				}
+
+				infos, err := h.manager.ListAll(testutil.Context(t))
+				if err != nil {
+					t.Fatalf("ListAll() error = %v", err)
+				}
+				for _, info := range infos {
+					if info != nil && info.ID == session.ID {
+						t.Fatalf("ListAll() still returned deleted session %q", session.ID)
+					}
+				}
+				assertDeletedUserSessionCatalogTruth(t, catalog, events, h.workspaceID, session.ID)
+			},
+		},
+		{
+			name: "Should stop and delete an active user session from durable counts",
+			run: func(t *testing.T) {
+				catalog := newRecordingSessionCatalog()
+				h := newHarness(t, WithSessionCatalog(catalog))
+				session := createSession(t, h)
+				events, cancel, err := h.manager.SubscribeSessionCatalogEvents(
+					testutil.Context(t),
+					CatalogScope{ReadScope: store.ReadScope{AllProfiles: true}, AllWorkspaces: true},
+				)
+				if err != nil {
+					t.Fatalf("SubscribeSessionCatalogEvents() error = %v", err)
+				}
+				defer cancel()
+
+				if got := h.driver.stopCalls; got != 0 {
+					t.Fatalf("driver stop calls before delete = %d, want 0", got)
+				}
+
+				if err := h.manager.Delete(testutil.Context(t), session.ID); err != nil {
+					t.Fatalf("Delete(active) error = %v", err)
+				}
+
+				if got := h.driver.stopCalls; got != 1 {
+					t.Fatalf("driver stop calls after delete = %d, want 1", got)
+				}
+				if _, ok := h.manager.Get(session.ID); ok {
+					t.Fatalf("Get(%q) after delete = found, want missing", session.ID)
+				}
+				if _, err := os.Stat(session.SessionDir()); !errors.Is(err, os.ErrNotExist) {
+					t.Fatalf("Stat(session dir after delete) error = %v, want os.ErrNotExist", err)
+				}
+				assertDeletedUserSessionCatalogTruth(t, catalog, events, h.workspaceID, session.ID)
+			},
+		},
+		{
+			name: "Should wait for active stored readers before committing deletion",
+			run: func(t *testing.T) {
+				catalog := newRecordingSessionCatalog()
+				catalog.requireExistingUpdates()
+				h := newHarness(
+					t,
+					WithSessionCatalog(catalog),
+					withDefaultQueryStoreRuntime(),
+				)
+				shutdownQueryStoreRuntimeForTest(t, h.manager)
+				session := createSession(t, h)
+				ctx := testutil.Context(t)
+
+				reader, err := h.manager.queryStoreRuntime.Open(
+					ctx,
+					testSessionDBOwner(session.ID, session.WorkspaceID),
+					session.DBPath(),
+				)
+				if err != nil {
+					t.Fatalf("Open(stored reader) error = %v", err)
+				}
+				t.Cleanup(func() {
+					if closeErr := reader.Close(testutil.Context(t)); closeErr != nil {
+						t.Errorf("Close(stored reader cleanup) error = %v", closeErr)
+					}
+				})
+
+				deleteDone := make(chan error, 1)
+				go func() {
+					deleteDone <- h.manager.Delete(ctx, session.ID)
+				}()
+
+				for {
+					probe, openErr := h.manager.queryStoreRuntime.Open(
+						ctx,
+						testSessionDBOwner(session.ID, session.WorkspaceID),
+						session.DBPath(),
+					)
+					if errors.Is(openErr, sessiondb.ErrReadOnlyPoolQuiescing) {
+						break
+					}
+					if openErr != nil {
+						t.Fatalf("Open(quiescence probe) error = %v", openErr)
+					}
+					if closeErr := probe.Close(ctx); closeErr != nil {
+						t.Fatalf("Close(quiescence probe) error = %v", closeErr)
+					}
+					select {
+					case deleteErr := <-deleteDone:
+						t.Fatalf("Delete() returned before stored reader closed: %v", deleteErr)
+					default:
+						runtime.Gosched()
+					}
+				}
+
+				select {
+				case deleteErr := <-deleteDone:
+					t.Fatalf("Delete() returned while stored reader was active: %v", deleteErr)
+				default:
+				}
+				if _, err := os.Stat(session.SessionDir()); err != nil {
+					t.Fatalf("Stat(session dir while deletion quiesced) error = %v", err)
+				}
+				if _, ok := catalog.get(session.ID); !ok {
+					t.Fatalf("catalog lost session %q while deletion quiesced", session.ID)
+				}
+				if err := reader.Close(ctx); err != nil {
+					t.Fatalf("Close(stored reader) error = %v", err)
+				}
+				select {
+				case deleteErr := <-deleteDone:
+					if deleteErr != nil {
+						t.Fatalf("Delete() error = %v", deleteErr)
+					}
+				case <-ctx.Done():
+					t.Fatalf("Delete() did not finish after stored reader closed: %v", ctx.Err())
+				}
+
+				if _, err := os.Stat(session.SessionDir()); !errors.Is(err, os.ErrNotExist) {
+					t.Fatalf("Stat(session dir after delete) error = %v, want os.ErrNotExist", err)
+				}
+				if _, ok := catalog.get(session.ID); ok {
+					t.Fatalf("catalog still returned deleted session %q", session.ID)
+				}
+			},
+		},
+		{
+			name: "Should refuse a foreign database family before staging deletion",
+			run: func(t *testing.T) {
+				h := newHarness(t)
+				target := createSession(t, h)
+				foreign := createSession(t, h)
+				if err := h.manager.Stop(testutil.Context(t), target.ID); err != nil {
+					t.Fatalf("Stop(target) error = %v", err)
+				}
+				if err := h.manager.Stop(testutil.Context(t), foreign.ID); err != nil {
+					t.Fatalf("Stop(foreign) error = %v", err)
+				}
+
+				substituteManagerSessionDBFamily(t, target.DBPath(), foreign.DBPath())
+				before := readManagerSessionDBFamilyDigest(t, target.DBPath())
+				err := h.manager.Delete(testutil.Context(t), target.ID)
+				if !errors.Is(err, sessiondb.ErrSessionDBOwnerMismatch) {
+					t.Fatalf("Delete(foreign family) error = %v, want owner mismatch", err)
+				}
+				assertManagerSessionDBFamilyUnchanged(t, target.DBPath(), before)
+				if _, statErr := os.Stat(target.SessionDir()); statErr != nil {
+					t.Fatalf("Stat(target session directory after refusal) error = %v", statErr)
+				}
+			},
+		},
+		{
+			name: "Should refuse metadata relabeled as another session without touching either directory",
+			run: func(t *testing.T) {
+				h := newHarness(t)
+				target := createSession(t, h)
+				foreign := createSession(t, h)
+				if err := h.manager.Stop(testutil.Context(t), target.ID); err != nil {
+					t.Fatalf("Stop(target) error = %v", err)
+				}
+				if err := h.manager.Stop(testutil.Context(t), foreign.ID); err != nil {
+					t.Fatalf("Stop(foreign) error = %v", err)
+				}
+
+				metaPath := store.SessionMetaFile(target.SessionDir())
+				meta, err := store.ReadSessionMeta(metaPath)
+				if err != nil {
+					t.Fatalf("ReadSessionMeta(target) error = %v", err)
+				}
+				meta.ID = foreign.ID
+				meta.WorkspaceID = foreign.WorkspaceID
+				if meta.Lineage != nil {
+					meta.Lineage.RootSessionID = foreign.ID
+				}
+				encodedMeta, err := json.Marshal(meta)
+				if err != nil {
+					t.Fatalf("json.Marshal(relabeled target metadata) error = %v", err)
+				}
+				if err := os.WriteFile(metaPath, encodedMeta, 0o600); err != nil {
+					t.Fatalf("os.WriteFile(relabeled target metadata) error = %v", err)
+				}
+				targetBefore := readManagerSessionDBFamilyDigest(t, target.DBPath())
+				foreignBefore := readManagerSessionDBFamilyDigest(t, foreign.DBPath())
+
+				err = h.manager.Delete(testutil.Context(t), target.ID)
+				if !errors.Is(err, ErrSessionNotFound) {
+					t.Fatalf("Delete(relabeled metadata) error = %v, want ErrSessionNotFound", err)
+				}
+				assertManagerSessionDBFamilyUnchanged(t, target.DBPath(), targetBefore)
+				assertManagerSessionDBFamilyUnchanged(t, foreign.DBPath(), foreignBefore)
+				for _, sessionDir := range []string{target.SessionDir(), foreign.SessionDir()} {
+					if _, statErr := os.Stat(sessionDir); statErr != nil {
+						t.Fatalf("Stat(%q after refusal) error = %v", sessionDir, statErr)
+					}
+				}
+			},
+		},
+		{
+			name: "Should return session not found when catalog and artifacts are absent",
+			run: func(t *testing.T) {
+				catalog := newRecordingSessionCatalog()
+				h := newHarness(t, WithSessionCatalog(catalog))
+
+				err := h.manager.Delete(testutil.Context(t), "sess-missing-delete")
+				if !errors.Is(err, ErrSessionNotFound) {
+					t.Fatalf("Delete(missing) error = %v, want ErrSessionNotFound", err)
+				}
+			},
+		},
+		{
+			name: "Should ignore concurrent stop races that report session not found",
+			run: func(t *testing.T) {
+				called := false
+
+				err := stopSessionBeforeDelete(
+					testutil.Context(t),
+					"sess-race",
+					func(context.Context, string, StopCause, string) error {
+						called = true
+						return ErrSessionNotFound
+					},
+				)
+				if err != nil {
+					t.Fatalf("stopSessionBeforeDelete() error = %v, want nil", err)
+				}
+				if !called {
+					t.Fatal("stopSessionBeforeDelete() did not call the stop function")
+				}
+			},
+		},
+		{
+			name: "Should wrap stop errors with delete context",
+			run: func(t *testing.T) {
+				h := newHarness(t)
+				cleanupTestManager(t, h.manager)
+				session := createSession(t, h)
+				stopErr := errors.New("driver stop failed")
+				h.driver.stopHook = func(*fakeProcess) error {
+					return stopErr
+				}
+				h.driver.cancelHook = h.driver.stopHook
+				h.driver.killHook = h.driver.stopHook
+				t.Cleanup(h.driver.lastProcess().exit)
+
+				err := h.manager.Delete(testutil.Context(t), session.ID)
+				if !errors.Is(err, stopErr) {
+					t.Fatalf("Delete() error = %v, want wrapped stop error", err)
+				}
+				if !strings.Contains(err.Error(), `session: stop "`) {
+					t.Fatalf("Delete() error = %q, want stop context", err.Error())
+				}
+				if meta := readMeta(t, session.MetaPath()); meta.State != string(StateStopping) {
+					t.Fatal("failed termination removed history or persisted a false terminal state")
+				}
+			},
+		},
+		{
+			name: "Should restore the staged directory when catalog deletion fails",
+			run: func(t *testing.T) {
+				catalog := newRecordingSessionCatalog()
+				h := newHarness(
+					t,
+					WithSessionCatalog(catalog),
+					withDefaultQueryStoreRuntime(),
+				)
+				shutdownQueryStoreRuntimeForTest(t, h.manager)
+				session := createSession(t, h)
+				attachmentPath := writeSessionAttachmentFixture(t, h, session.ID, "restore-me")
+				// Invariant: deletion rollback restores history without resurrecting stopped execution.
+				// Owner: session deletion; canonical manager deletion rollback case.
+				var goalCanceled atomic.Bool
+				h.manager.SetGoalCommandHandler(&stopGoalHandler{stop: func(_ context.Context, info *Info) error {
+					if info.ID != session.ID || info.StopCause != CauseUserRequested {
+						t.Errorf("deletion stop identity = %#v", info)
+					}
+					goalCanceled.Store(true)
+					return nil
+				}})
+				deleteErr := errors.New("catalog delete failed")
+				catalog.deleteErr = deleteErr
+
+				err := h.manager.Delete(testutil.Context(t), session.ID)
+				if !errors.Is(err, deleteErr) {
+					t.Fatalf("Delete() error = %v, want %v", err, deleteErr)
+				}
+				if !goalCanceled.Load() || session.Info().State != StateStopped {
+					t.Fatal("catalog rollback resurrected execution or omitted Goal cancellation")
+				}
+				if _, err := os.Stat(session.SessionDir()); err != nil {
+					t.Fatalf("Stat(restored session dir) error = %v", err)
+				}
+				if payload, err := os.ReadFile(attachmentPath); err != nil || string(payload) != "restore-me" {
+					t.Fatalf("ReadFile(restored attachment) = %q, %v", payload, err)
+				}
+				listed, err := catalog.ListSessions(testutil.Context(t), store.SessionListQuery{
+					WorkspaceID: h.workspaceID,
+					SessionType: string(SessionTypeUser),
+				})
+				if err != nil {
+					t.Fatalf("ListSessions() error = %v", err)
+				}
+				if len(listed) != 1 || listed[0].ID != session.ID {
+					t.Fatalf("ListSessions() = %#v, want preserved session %q", listed, session.ID)
+				}
+				entries, err := os.ReadDir(h.homePaths.SessionsDir)
+				if err != nil {
+					t.Fatalf("ReadDir(sessions) error = %v", err)
+				}
+				for _, entry := range entries {
+					if strings.HasPrefix(entry.Name(), sessionDeleteTombstonePrefix) {
+						t.Fatalf("rollback left deletion tombstone %q", entry.Name())
+					}
+				}
+				reopened, err := h.manager.queryStoreRuntime.Open(
+					testutil.Context(t),
+					testSessionDBOwner(session.ID, session.WorkspaceID),
+					session.DBPath(),
+				)
+				if err != nil {
+					t.Fatalf("Open(stored reader after catalog failure) error = %v", err)
+				}
+				if err := reopened.Close(testutil.Context(t)); err != nil {
+					t.Fatalf("Close(reopened stored reader) error = %v", err)
+				}
+			},
+		},
+		{
+			name: "Should keep a staged tombstone leased until catalog rollback restores it",
+			run: func(t *testing.T) {
+				ctx := testutil.Context(t)
+				catalog := newRecordingSessionCatalog()
+				h := newHarness(t, WithSessionCatalog(catalog), withDefaultQueryStoreRuntime())
+				shutdownQueryStoreRuntimeForTest(t, h.manager)
+				session := createSession(t, h)
+				if err := h.manager.Stop(ctx, session.ID); err != nil {
+					t.Fatalf("Stop() error = %v", err)
+				}
+
+				deleteEntered := make(chan struct{})
+				releaseDelete := make(chan struct{})
+				catalogErr := errors.New("catalog delete interrupted")
+				catalog.deleteHook = func(hookCtx context.Context, id string) error {
+					if id != session.ID {
+						return fmt.Errorf("unexpected catalog delete id %q", id)
+					}
+					close(deleteEntered)
+					select {
+					case <-releaseDelete:
+						return catalogErr
+					case <-hookCtx.Done():
+						return hookCtx.Err()
+					}
+				}
+
+				deleteDone := make(chan error, 1)
+				go func() {
+					deleteDone <- h.manager.Delete(ctx, session.ID)
+				}()
+				select {
+				case <-deleteEntered:
+				case <-ctx.Done():
+					t.Fatalf("Delete() did not reach catalog mutation: %v", ctx.Err())
+				}
+
+				tombstonePath, tombstoneName := findSessionDeleteTombstone(t, h.homePaths.SessionsDir)
+				cleanupAttempted := make(chan struct{})
+				cleanupManager := &Manager{
+					homePaths:      h.homePaths,
+					sessionCatalog: catalog,
+					removeAllPath:  nil,
+					lifecycleCtx:   ctx,
+					acquireSessionDBFamilyLease: func(
+						acquireCtx context.Context,
+						path string,
+					) (*sessiondb.FamilyLease, error) {
+						close(cleanupAttempted)
+						return sessiondb.AcquireFamilyLease(acquireCtx, path)
+					},
+				}
+				cleanupDone := make(chan error, 1)
+				go func() {
+					cleanupDone <- cleanupManager.cleanupSessionDeleteTombstone(tombstonePath, tombstoneName)
+				}()
+				select {
+				case <-cleanupAttempted:
+				case <-ctx.Done():
+					t.Fatalf("concurrent cleanup did not attempt the family lease: %v", ctx.Err())
+				}
+				select {
+				case cleanupErr := <-cleanupDone:
+					t.Fatalf("concurrent cleanup crossed the held family lease: %v", cleanupErr)
+				default:
+				}
+
+				close(releaseDelete)
+				select {
+				case deleteErr := <-deleteDone:
+					if !errors.Is(deleteErr, catalogErr) {
+						t.Fatalf("Delete() error = %v, want %v", deleteErr, catalogErr)
+					}
+				case <-ctx.Done():
+					t.Fatalf("Delete() did not roll back after catalog failure: %v", ctx.Err())
+				}
+				select {
+				case cleanupErr := <-cleanupDone:
+					if cleanupErr == nil {
+						t.Fatal("concurrent cleanup error = nil after rollback removed its tombstone")
+					}
+				case <-ctx.Done():
+					t.Fatalf("concurrent cleanup did not finish after rollback released the lease: %v", ctx.Err())
+				}
+
+				if _, err := os.Stat(session.SessionDir()); err != nil {
+					t.Fatalf("Stat(restored session directory) error = %v", err)
+				}
+				assertNoSessionDeleteTombstones(t, h.homePaths.SessionsDir)
+				reader, err := sessiondb.OpenSessionDBReadOnly(
+					ctx,
+					testSessionDBOwner(session.ID, session.WorkspaceID),
+					session.DBPath(),
+				)
+				if err != nil {
+					t.Fatalf("OpenSessionDBReadOnly(restored) error = %v", err)
+				}
+				if err := reader.Close(ctx); err != nil {
+					t.Fatalf("Close(restored reader) error = %v", err)
+				}
+			},
+		},
+		{
+			name: "Should recover an interrupted staged tombstone from every catalog state",
+			run: func(t *testing.T) {
+				tests := []struct {
+					name           string
+					catalogKnown   bool
+					catalogPresent bool
+					wantRestored   bool
+				}{
+					{
+						name:         "Should restore conservatively when catalog ownership is unknown",
+						wantRestored: true,
+					},
+					{
+						name:           "Should restore when the catalog still owns the session",
+						catalogKnown:   true,
+						catalogPresent: true,
+						wantRestored:   true,
+					},
+					{
+						name:         "Should finish deletion when the catalog no longer owns the session",
+						catalogKnown: true,
+					},
+				}
+				for _, test := range tests {
+					t.Run(test.name, func(t *testing.T) {
+						t.Parallel()
+
+						ctx := testutil.Context(t)
+						catalog := newRecordingSessionCatalog()
+						managerOptions := []Option(nil)
+						if test.catalogKnown {
+							managerOptions = append(managerOptions, WithSessionCatalog(catalog))
+						}
+						h := newHarness(t, managerOptions...)
+						session := createSession(t, h)
+						attachmentPath := writeSessionAttachmentFixture(t, h, session.ID, "recover-me")
+						if err := h.manager.Stop(ctx, session.ID); err != nil {
+							t.Fatalf("Stop() error = %v", err)
+						}
+
+						info, err := h.manager.Status(ctx, session.ID)
+						if err != nil {
+							t.Fatalf("Status() error = %v", err)
+						}
+						staged, err := h.manager.stageSessionDirectoryDelete(ctx, session.ID, info)
+						if err != nil {
+							t.Fatalf("stageSessionDirectoryDelete() error = %v", err)
+						}
+						if err := errors.Join(staged.capabilities.Release(), staged.attachments.Release()); err != nil {
+							t.Fatalf("release(staged crash simulation) error = %v", err)
+						}
+						if _, err := os.Stat(session.SessionDir()); !errors.Is(err, os.ErrNotExist) {
+							t.Fatalf("Stat(original before recovery) error = %v, want os.ErrNotExist", err)
+						}
+						if test.catalogKnown && !test.catalogPresent {
+							if err := catalog.DeleteSession(ctx, session.ID); err != nil {
+								t.Fatalf("DeleteSession(catalog crash state) error = %v", err)
+							}
+						}
+
+						managerOptions = append(
+							managerOptions,
+							WithLogger(slog.New(slog.NewTextHandler(os.Stderr, nil))),
+						)
+						recoveryManager := newManagerWithHarness(t, h, managerOptions...)
+						shutdownQueryStoreRuntimeForTest(t, recoveryManager)
+						_, statErr := os.Stat(session.SessionDir())
+						if test.wantRestored {
+							if statErr != nil {
+								t.Fatalf("Stat(restored staged session) error = %v", statErr)
+							}
+							reader, err := sessiondb.OpenSessionDBReadOnly(
+								ctx,
+								testSessionDBOwner(session.ID, session.WorkspaceID),
+								session.DBPath(),
+							)
+							if err != nil {
+								t.Fatalf("OpenSessionDBReadOnly(restored staged session) error = %v", err)
+							}
+							if err := reader.Close(ctx); err != nil {
+								t.Fatalf("Close(restored staged reader) error = %v", err)
+							}
+							if payload, err := os.ReadFile(
+								attachmentPath,
+							); err != nil ||
+								string(payload) != "recover-me" {
+								t.Fatalf("ReadFile(restored staged attachment) = %q, %v", payload, err)
+							}
+						} else if !errors.Is(statErr, os.ErrNotExist) {
+							t.Fatalf("Stat(deleted staged session) error = %v, want os.ErrNotExist", statErr)
+						}
+						if !test.wantRestored {
+							if _, err := os.Stat(attachmentPath); !errors.Is(err, os.ErrNotExist) {
+								t.Fatalf("Stat(deleted staged attachment) error = %v, want os.ErrNotExist", err)
+							}
+						}
+						assertNoSessionDeleteTombstones(t, h.homePaths.SessionsDir)
+					})
+				}
+			},
+		},
+		{
+			name: "Should retain cleanup tombstones without reporting a partial deletion",
+			run: func(t *testing.T) {
+				catalog := newRecordingSessionCatalog()
+				h := newHarness(
+					t,
+					WithSessionCatalog(catalog),
+					withDefaultQueryStoreRuntime(),
+				)
+				shutdownQueryStoreRuntimeForTest(t, h.manager)
+				session := createSession(t, h)
+				if err := h.manager.Stop(testutil.Context(t), session.ID); err != nil {
+					t.Fatalf("Stop() error = %v", err)
+				}
+				removeErr := errors.New("cleanup unavailable")
+				h.manager.removeAllPath = func(string) error { return removeErr }
+
+				if err := h.manager.Delete(testutil.Context(t), session.ID); err != nil {
+					t.Fatalf("Delete() error = %v, want logical deletion with deferred cleanup", err)
+				}
+				if _, err := h.manager.Status(testutil.Context(t), session.ID); !errors.Is(err, ErrSessionNotFound) {
+					t.Fatalf("Status(after logical delete) error = %v, want %v", err, ErrSessionNotFound)
+				}
+				entries, err := os.ReadDir(h.homePaths.SessionsDir)
+				if err != nil {
+					t.Fatalf("ReadDir(sessions) error = %v", err)
+				}
+				foundTombstone := false
+				for _, entry := range entries {
+					foundTombstone = foundTombstone || strings.HasPrefix(entry.Name(), sessionDeleteTombstonePrefix)
+				}
+				if !foundTombstone {
+					t.Fatal("deferred cleanup did not retain a deletion tombstone")
+				}
+				recoveryManager := newManagerWithHarness(t, h, WithSessionCatalog(catalog))
+				shutdownQueryStoreRuntimeForTest(t, recoveryManager)
+				assertNoSessionDeleteTombstones(t, h.homePaths.SessionsDir)
+				reader, openErr := h.manager.queryStoreRuntime.Open(
+					testutil.Context(t),
+					testSessionDBOwner(session.ID, session.WorkspaceID),
+					session.DBPath(),
+				)
+				if errors.Is(openErr, sessiondb.ErrReadOnlyPoolQuiescing) {
+					t.Fatal("stored reader pool remained quiesced after logical deletion")
+				}
+				if openErr == nil {
+					if err := reader.Close(testutil.Context(t)); err != nil {
+						t.Fatalf("Close(stored reader after logical delete) error = %v", err)
+					}
+				}
+			},
+		},
+		{
+			name: "Should reject workspace removal while a session start is reserved",
+			run: func(t *testing.T) {
+				ctx := testutil.Context(t)
+				db, err := openSessionTestGlobalDB(ctx, filepath.Join(t.TempDir(), "global.db"))
+				if err != nil {
+					t.Fatalf("OpenGlobalDB() error = %v", err)
+				}
+				t.Cleanup(func() {
+					if err := db.Close(testutil.Context(t)); err != nil {
+						t.Errorf("Close() error = %v", err)
+					}
+				})
+				h := newHarness(t, WithSessionCatalog(db))
+				now := time.Date(2026, 7, 14, 9, 0, 0, 0, time.UTC)
+				if err := db.InsertWorkspace(ctx, workspacepkg.Workspace{
+					ID: h.workspaceID, RootDir: h.workspace, Name: h.workspaceName,
+					CreatedAt: now, UpdatedAt: now,
+				}); err != nil {
+					t.Fatalf("InsertWorkspace() error = %v", err)
+				}
+				resolver, err := workspacepkg.NewResolver(
+					db,
+					workspacepkg.WithHomePaths(h.homePaths),
+					workspacepkg.WithConfigLoader(func(string) (compozyconfig.Config, error) { return h.cfg, nil }),
+				)
+				if err != nil {
+					t.Fatalf("NewResolver() error = %v", err)
+				}
+				resolver.SetUnregisterPreparer(
+					func(ctx context.Context, workspace workspacepkg.Workspace) (workspacepkg.UnregisterPreparation, error) {
+						return h.manager.PrepareWorkspaceRemoval(ctx, workspace.ID)
+					},
+				)
+
+				startEntered := make(chan struct{})
+				releaseStart := make(chan struct{})
+				h.driver.startHook = func(opts acp.StartOpts, _ int) (*fakeProcess, error) {
+					close(startEntered)
+					<-releaseStart
+					return newFakeProcess(opts.AgentName, opts.Command, opts.Cwd, "acp-starting"), nil
+				}
+				type createResult struct {
+					session *Session
+					err     error
+				}
+				created := make(chan createResult, 1)
+				go func() {
+					session, createErr := h.manager.Create(ctx, new(CreateOpts{
+						AgentName: "coder", Workspace: h.workspaceID,
+					}))
+					created <- createResult{session: session, err: createErr}
+				}()
+				select {
+				case <-startEntered:
+				case <-ctx.Done():
+					t.Fatalf("Create() did not reach provider start: %v", ctx.Err())
+				}
+
+				unregisterErr := resolver.Unregister(ctx, h.workspaceID)
+				if !errors.Is(unregisterErr, workspacepkg.ErrWorkspaceHasActiveSessions) {
+					t.Fatalf(
+						"Unregister(starting workspace) error = %v, want %v",
+						unregisterErr,
+						workspacepkg.ErrWorkspaceHasActiveSessions,
+					)
+				}
+				if _, err := db.GetWorkspace(ctx, h.workspaceID); err != nil {
+					t.Fatalf("GetWorkspace(after rejected unregister) error = %v", err)
+				}
+				metaPath := store.SessionMetaFile(filepath.Join(h.homePaths.SessionsDir, "sess-1"))
+				meta, err := store.ReadSessionMeta(metaPath)
+				if err != nil {
+					t.Fatalf("ReadSessionMeta(starting) error = %v", err)
+				}
+				if meta.State != string(StateStarting) || meta.WorkspaceID != h.workspaceID {
+					t.Fatalf("starting session metadata = %#v", meta)
+				}
+
+				close(releaseStart)
+				var result createResult
+				select {
+				case result = <-created:
+				case <-ctx.Done():
+					t.Fatalf("Create() did not finish after release: %v", ctx.Err())
+				}
+				if result.err != nil || result.session == nil || result.session.Info().State != StateActive {
+					t.Fatalf("Create() result = session:%#v error:%v", result.session, result.err)
+				}
+				t.Cleanup(func() {
+					if err := h.manager.Stop(testutil.Context(t), result.session.ID); err != nil {
+						t.Errorf("Stop() cleanup error = %v", err)
+					}
+				})
+			},
+		},
+		{
+			name: "Should retain a missing workspace until explicit staged removal",
+			run: func(t *testing.T) {
+				ctx := testutil.Context(t)
+				db, err := openSessionTestGlobalDB(ctx, filepath.Join(t.TempDir(), "global.db"))
+				if err != nil {
+					t.Fatalf("OpenGlobalDB() error = %v", err)
+				}
+				t.Cleanup(func() {
+					if err := db.Close(testutil.Context(t)); err != nil {
+						t.Errorf("Close() error = %v", err)
+					}
+				})
+				h := newHarness(t, WithSessionCatalog(db))
+				h.manager.attachmentScopeLease = &nonReentrantAttachmentScopeLease{}
+				now := time.Date(2026, 7, 14, 8, 0, 0, 0, time.UTC)
+				if err := db.InsertWorkspace(ctx, workspacepkg.Workspace{
+					ID:        h.workspaceID,
+					RootDir:   h.workspace,
+					Name:      h.workspaceName,
+					CreatedAt: now,
+					UpdatedAt: now,
+				}); err != nil {
+					t.Fatalf("InsertWorkspace() error = %v", err)
+				}
+				session := createSession(t, h)
+				attachmentPath := writeSessionAttachmentFixture(t, h, session.ID, "workspace-session")
+				orphanPath := filepath.Join(
+					h.homePaths.SessionAttachmentsDir,
+					h.workspaceID,
+					"orphan-session",
+					"orphan.bin",
+				)
+				if err := os.MkdirAll(filepath.Dir(orphanPath), 0o700); err != nil {
+					t.Fatalf("MkdirAll(orphan attachment) error = %v", err)
+				}
+				if err := os.WriteFile(orphanPath, []byte("orphan"), 0o600); err != nil {
+					t.Fatalf("WriteFile(orphan attachment) error = %v", err)
+				}
+				if err := h.manager.Stop(ctx, session.ID); err != nil {
+					t.Fatalf("Stop() error = %v", err)
+				}
+				if _, err := db.DB().ExecContext(
+					ctx,
+					`INSERT INTO permission_log (
+						id, session_id, agent_name, action, resource, decision, policy_used, timestamp
+					) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+					"perm-workspace-prune",
+					session.ID,
+					"coder",
+					"invoke",
+					"compozy__task_run_complete",
+					"allow",
+					"test",
+					now.Format(time.RFC3339Nano),
+				); err != nil {
+					t.Fatalf("Insert permission_log error = %v", err)
+				}
+				if _, err := db.DB().ExecContext(
+					ctx,
+					`INSERT INTO token_stats (
+						id, session_id, agent_name, turn_count, updated_at
+					) VALUES (?, ?, ?, ?, ?)`,
+					"tokens-workspace-prune",
+					session.ID,
+					"coder",
+					1,
+					now.Format(time.RFC3339Nano),
+				); err != nil {
+					t.Fatalf("Insert token_stats error = %v", err)
+				}
+
+				resolver, err := workspacepkg.NewResolver(
+					db,
+					workspacepkg.WithHomePaths(h.homePaths),
+					workspacepkg.WithConfigLoader(func(string) (compozyconfig.Config, error) { return h.cfg, nil }),
+				)
+				if err != nil {
+					t.Fatalf("NewResolver() error = %v", err)
+				}
+				resolver.SetUnregisterPreparer(
+					func(ctx context.Context, workspace workspacepkg.Workspace) (workspacepkg.UnregisterPreparation, error) {
+						return h.manager.PrepareWorkspaceRemoval(ctx, workspace.ID)
+					},
+				)
+				if err := os.RemoveAll(h.workspace); err != nil {
+					t.Fatalf("RemoveAll(workspace) error = %v", err)
+				}
+
+				workspaces, err := resolver.List(ctx)
+				if err != nil {
+					t.Fatalf("List() error = %v", err)
+				}
+				if len(workspaces) != 1 || !workspaces[0].RootMissing {
+					t.Fatalf("List() = %#v, want flagged missing workspace", workspaces)
+				}
+				if _, err := db.GetWorkspace(ctx, h.workspaceID); err != nil {
+					t.Fatalf("missing workspace registration lost: %v", err)
+				}
+				if _, err := os.Stat(session.SessionDir()); err != nil {
+					t.Fatalf("missing workspace session history lost: %v", err)
+				}
+				if err := resolver.Unregister(ctx, h.workspaceID); err != nil {
+					t.Fatalf("explicit Unregister() error = %v", err)
+				}
+				if _, err := db.GetWorkspace(ctx, h.workspaceID); !errors.Is(err, workspacepkg.ErrWorkspaceNotFound) {
+					t.Fatalf("GetWorkspace() error = %v, want %v", err, workspacepkg.ErrWorkspaceNotFound)
+				}
+				if _, err := os.Stat(session.SessionDir()); !errors.Is(err, os.ErrNotExist) {
+					t.Fatalf("Stat(session dir after prune) error = %v, want os.ErrNotExist", err)
+				}
+				for _, path := range []string{attachmentPath, orphanPath} {
+					if _, err := os.Stat(path); !errors.Is(err, os.ErrNotExist) {
+						t.Fatalf("Stat(workspace attachment %q) error = %v, want os.ErrNotExist", path, err)
+					}
+				}
+				for _, table := range []string{"permission_log", "token_stats"} {
+					var count int
+					if err := db.DB().QueryRowContext(
+						ctx,
+						"SELECT COUNT(*) FROM "+table+" WHERE session_id = ?",
+						session.ID,
+					).Scan(&count); err != nil {
+						t.Fatalf("Count %s error = %v", table, err)
+					}
+					if count != 0 {
+						t.Fatalf("%s rows after workspace prune = %d, want 0", table, count)
+					}
+				}
+			},
+		},
+		{
+			name: "Should finish a partially committed workspace deletion on an in-process retry",
+			run: func(t *testing.T) {
+				ctx := testutil.Context(t)
+				db, err := openSessionTestGlobalDB(ctx, filepath.Join(t.TempDir(), "global.db"))
+				if err != nil {
+					t.Fatalf("OpenGlobalDB() error = %v", err)
+				}
+				t.Cleanup(func() {
+					if err := db.Close(testutil.Context(t)); err != nil {
+						t.Errorf("Close() error = %v", err)
+					}
+				})
+				h := newHarness(t, WithSessionCatalog(db), withDefaultQueryStoreRuntime())
+				cleanupTestManager(t, h.manager)
+				now := time.Date(2026, 8, 28, 9, 0, 0, 0, time.UTC)
+				if err := db.InsertWorkspace(ctx, workspacepkg.Workspace{
+					ID: h.workspaceID, RootDir: h.workspace, Name: h.workspaceName,
+					CreatedAt: now, UpdatedAt: now,
+				}); err != nil {
+					t.Fatalf("InsertWorkspace() error = %v", err)
+				}
+				sessions := []*Session{createSession(t, h), createSession(t, h)}
+				for _, session := range sessions {
+					if err := h.manager.Stop(ctx, session.ID); err != nil {
+						t.Fatalf("Stop(%q) error = %v", session.ID, err)
+					}
+				}
+
+				resolver, err := workspacepkg.NewResolver(
+					db,
+					workspacepkg.WithHomePaths(h.homePaths),
+					workspacepkg.WithConfigLoader(func(string) (compozyconfig.Config, error) { return h.cfg, nil }),
+				)
+				if err != nil {
+					t.Fatalf("NewResolver() error = %v", err)
+				}
+				resolver.SetUnregisterPreparer(
+					func(ctx context.Context, workspace workspacepkg.Workspace) (workspacepkg.UnregisterPreparation, error) {
+						return h.manager.PrepareWorkspaceRemoval(ctx, workspace.ID)
+					},
+				)
+
+				cleanupErr := errors.New("session tombstone cleanup interrupted")
+				cleanupCalls := make(map[string]int)
+				failedPath := ""
+				h.manager.removeAllPath = func(path string) error {
+					cleanupCalls[path]++
+					if failedPath == "" {
+						failedPath = path
+						return cleanupErr
+					}
+					return os.RemoveAll(path)
+				}
+
+				if err := resolver.Unregister(ctx, h.workspaceID); !errors.Is(err, cleanupErr) {
+					t.Fatalf("Unregister(first attempt) error = %v, want %v", err, cleanupErr)
+				}
+				if len(cleanupCalls) != len(sessions) {
+					t.Fatalf(
+						"session cleanup paths after first attempt = %d, want %d",
+						len(cleanupCalls),
+						len(sessions),
+					)
+				}
+				for path, calls := range cleanupCalls {
+					if calls != 1 {
+						t.Fatalf("cleanup calls for %q after first attempt = %d, want 1", path, calls)
+					}
+				}
+				if _, err := os.Stat(failedPath); err != nil {
+					t.Fatalf("Stat(retained committed tombstone) error = %v", err)
+				}
+				if _, err := db.GetWorkspace(ctx, h.workspaceID); !errors.Is(err, workspacepkg.ErrWorkspaceNotFound) {
+					t.Fatalf(
+						"GetWorkspace(after logical delete) error = %v, want %v",
+						err,
+						workspacepkg.ErrWorkspaceNotFound,
+					)
+				}
+				if _, err := db.GetWorkspaceDeletionIntent(ctx, h.workspaceID); err != nil {
+					t.Fatalf("GetWorkspaceDeletionIntent(after partial commit) error = %v", err)
+				}
+
+				if err := resolver.Unregister(ctx, h.workspaceID); err != nil {
+					t.Fatalf("Unregister(retry) error = %v", err)
+				}
+				for path, calls := range cleanupCalls {
+					want := 1
+					if path == failedPath {
+						want = 2
+					}
+					if calls != want {
+						t.Fatalf("cleanup calls for %q after retry = %d, want %d", path, calls, want)
+					}
+				}
+				assertNoSessionDeleteTombstones(t, h.homePaths.SessionsDir)
+				if _, err := db.GetWorkspaceDeletionIntent(
+					ctx,
+					h.workspaceID,
+				); !errors.Is(err, workspacepkg.ErrWorkspaceDeletionIntentNotFound) {
+					t.Fatalf(
+						"GetWorkspaceDeletionIntent(after retry) error = %v, want %v",
+						err,
+						workspacepkg.ErrWorkspaceDeletionIntentNotFound,
+					)
+				}
+			},
+		},
+		{
+			name: "Should reconcile deleted session windows only after catalog commit",
+			run: func(t *testing.T) {
+				catalog := newRecordingSessionCatalog()
+				reconciled := false
+				var reconciledProfile, reconciledWorkspace, reconciledSession string
+				h := newHarness(
+					t,
+					WithSessionCatalog(catalog),
+					WithWindowReconciler(sessionWindowReconcilerFunc(
+						func(_ context.Context, profileID, workspaceID, sessionID string) error {
+							if _, exists := catalog.get(sessionID); exists {
+								t.Errorf("window reconciliation ran before catalog deletion for %q", sessionID)
+							}
+							reconciledProfile = profileID
+							reconciledWorkspace = workspaceID
+							reconciledSession = sessionID
+							reconciled = true
+							return nil
+						},
+					)),
+				)
+				session := createSession(t, h)
+				if err := h.manager.Stop(testutil.Context(t), session.ID); err != nil {
+					t.Fatalf("Stop() error = %v", err)
+				}
+				if err := h.manager.Delete(testutil.Context(t), session.ID); err != nil {
+					t.Fatalf("Delete() error = %v", err)
+				}
+				if !reconciled || reconciledProfile != session.ProfileID ||
+					reconciledWorkspace != session.WorkspaceID || reconciledSession != session.ID {
+					t.Fatalf(
+						"deleted session window reconciliation scope=(%q,%q,%q), want (%q,%q,%q)",
+						reconciledProfile,
+						reconciledWorkspace,
+						reconciledSession,
+						session.ProfileID,
+						session.WorkspaceID,
+						session.ID,
+					)
+				}
+
+				failureCatalog := newRecordingSessionCatalog()
+				failureErr := errors.New("catalog delete failed")
+				failureCatalog.deleteErr = failureErr
+				failureCalls := 0
+				failureHarness := newHarness(
+					t,
+					WithSessionCatalog(failureCatalog),
+					WithWindowReconciler(sessionWindowReconcilerFunc(
+						func(context.Context, string, string, string) error {
+							failureCalls++
+							return nil
+						},
+					)),
+				)
+				failureSession := createSession(t, failureHarness)
+				if err := failureHarness.manager.Stop(testutil.Context(t), failureSession.ID); err != nil {
+					t.Fatalf("Stop(failure case) error = %v", err)
+				}
+				if err := failureHarness.manager.Delete(
+					testutil.Context(t),
+					failureSession.ID,
+				); !errors.Is(err, failureErr) {
+					t.Fatalf("Delete(failure case) error = %v, want %v", err, failureErr)
+				}
+				if failureCalls != 0 {
+					t.Fatalf("window reconciliation calls after catalog rollback = %d, want 0", failureCalls)
+				}
+			},
+		},
+		{
+			name: "Should retry failed deleted-session window reconciliation from a durable tombstone",
+			run: func(t *testing.T) {
+				catalog := newRecordingSessionCatalog()
+				var calls atomic.Int32
+				retryErr := errors.New("temporary window-manager failure")
+				h := newHarness(
+					t,
+					WithSessionCatalog(catalog),
+					WithWindowReconciler(sessionWindowReconcilerFunc(
+						func(context.Context, string, string, string) error {
+							if calls.Add(1) == 1 {
+								return retryErr
+							}
+							return nil
+						},
+					)),
+				)
+				cleanupTestManager(t, h.manager)
+				session := createSession(t, h)
+				if err := h.manager.Stop(testutil.Context(t), session.ID); err != nil {
+					t.Fatalf("Stop() error = %v", err)
+				}
+				if err := h.manager.Delete(testutil.Context(t), session.ID); err != nil {
+					t.Fatalf("Delete() error = %v", err)
+				}
+				if _, _, err := sessionDeleteTombstoneForTest(h.homePaths.SessionsDir); err != nil {
+					t.Fatalf("session deletion tombstone after failed reconciliation: %v", err)
+				}
+
+				deadline := time.Now().Add(4 * time.Second)
+				for {
+					_, _, tombstoneErr := sessionDeleteTombstoneForTest(h.homePaths.SessionsDir)
+					if errors.Is(tombstoneErr, os.ErrNotExist) {
+						break
+					}
+					if tombstoneErr != nil {
+						t.Fatalf("scan deletion tombstone retry: %v", tombstoneErr)
+					}
+					if time.Now().After(deadline) {
+						t.Fatalf("deletion tombstone remained after retry; reconciliation calls=%d", calls.Load())
+					}
+					time.Sleep(10 * time.Millisecond)
+				}
+				if got := calls.Load(); got < 2 {
+					t.Fatalf("window reconciliation calls = %d, want initial failure plus retry", got)
+				}
+			},
+		},
+		{
+			name: "Should retry a retained deleted-session tombstone during manager restart",
+			run: func(t *testing.T) {
+				catalog := newRecordingSessionCatalog()
+				var firstCalls atomic.Int32
+				retryErr := errors.New("window manager unavailable during shutdown")
+				h := newHarness(
+					t,
+					WithSessionCatalog(catalog),
+					WithWindowReconciler(sessionWindowReconcilerFunc(
+						func(context.Context, string, string, string) error {
+							firstCalls.Add(1)
+							return retryErr
+						},
+					)),
+				)
+				session := createSession(t, h)
+				if err := h.manager.Stop(testutil.Context(t), session.ID); err != nil {
+					t.Fatalf("Stop() error = %v", err)
+				}
+				if err := h.manager.Delete(testutil.Context(t), session.ID); err != nil {
+					t.Fatalf("Delete() error = %v", err)
+				}
+				if firstCalls.Load() != 1 {
+					t.Fatalf("initial reconciliation calls = %d, want 1", firstCalls.Load())
+				}
+				if err := h.manager.Shutdown(testutil.Context(t)); err != nil {
+					t.Fatalf("Shutdown(initial manager) error = %v", err)
+				}
+
+				var restartCalls atomic.Int32
+				restarted := newManagerWithHarness(
+					t,
+					h,
+					WithSessionCatalog(catalog),
+					WithWindowReconciler(sessionWindowReconcilerFunc(
+						func(context.Context, string, string, string) error {
+							restartCalls.Add(1)
+							return nil
+						},
+					)),
+				)
+				cleanupTestManager(t, restarted)
+				_, _, err := sessionDeleteTombstoneForTest(h.homePaths.SessionsDir)
+				if !errors.Is(err, os.ErrNotExist) {
+					t.Fatalf("session deletion tombstone after restart = %v, want os.ErrNotExist", err)
+				}
+				if restartCalls.Load() != 1 {
+					t.Fatalf("restart reconciliation calls = %d, want 1", restartCalls.Load())
+				}
+			},
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			tc.run(t)
+		})
+	}
+}
+
+func withDefaultQueryStoreRuntime() Option {
+	return func(manager *Manager) {
+		manager.openQueryStore = nil
+		manager.queryStoreExplicit = false
+	}
+}
+
+func shutdownQueryStoreRuntimeForTest(t *testing.T, manager *Manager) {
+	t.Helper()
+	t.Cleanup(func() {
+		if err := manager.shutdownQueryStoreRuntime(testutil.Context(t)); err != nil {
+			t.Errorf("shutdownQueryStoreRuntime() error = %v", err)
+		}
+	})
+}
+
+func findSessionDeleteTombstone(t *testing.T, sessionsDir string) (string, string) {
+	t.Helper()
+	entries, err := os.ReadDir(sessionsDir)
+	if err != nil {
+		t.Fatalf("ReadDir(sessions) error = %v", err)
+	}
+	for _, entry := range entries {
+		if entry.IsDir() && strings.HasPrefix(entry.Name(), sessionDeleteTombstonePrefix) {
+			return filepath.Join(sessionsDir, entry.Name()), entry.Name()
+		}
+	}
+	t.Fatal("session deletion tombstone was not found")
+	return "", ""
+}
+
+func sessionDeleteTombstoneForTest(sessionsDir string) (string, string, error) {
+	entries, err := os.ReadDir(sessionsDir)
+	if err != nil {
+		return "", "", err
+	}
+	for _, entry := range entries {
+		if entry.IsDir() && strings.HasPrefix(entry.Name(), sessionDeleteTombstonePrefix) {
+			return filepath.Join(sessionsDir, entry.Name()), entry.Name(), nil
+		}
+	}
+	return "", "", os.ErrNotExist
+}
+
+func assertNoSessionDeleteTombstones(t *testing.T, sessionsDir string) {
+	t.Helper()
+	entries, err := os.ReadDir(sessionsDir)
+	if err != nil {
+		t.Fatalf("ReadDir(sessions) error = %v", err)
+	}
+	for _, entry := range entries {
+		if entry.IsDir() && strings.HasPrefix(entry.Name(), sessionDeleteTombstonePrefix) {
+			t.Fatalf("unexpected session deletion tombstone %q", entry.Name())
+		}
+	}
+}
+
+func writeSessionAttachmentFixture(t *testing.T, h *harness, sessionID string, contents string) string {
+	t.Helper()
+	path := filepath.Join(h.homePaths.SessionAttachmentsDir, h.workspaceID, sessionID, "attachment.bin")
+	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+		t.Fatalf("MkdirAll(attachment fixture) error = %v", err)
+	}
+	if err := os.WriteFile(path, []byte(contents), 0o600); err != nil {
+		t.Fatalf("WriteFile(attachment fixture) error = %v", err)
+	}
+	return path
+}
+
+func assertDeletedUserSessionCatalogTruth(
+	t *testing.T,
+	catalog *recordingSessionCatalog,
+	events <-chan CatalogEvent,
+	workspaceID string,
+	sessionID string,
+) {
+	t.Helper()
+
+	listed, err := catalog.ListSessions(testutil.Context(t), store.SessionListQuery{
+		WorkspaceID: workspaceID,
+		SessionType: string(SessionTypeUser),
+	})
+	if err != nil {
+		t.Fatalf("ListSessions(after delete) error = %v", err)
+	}
+	if len(listed) != 0 {
+		t.Fatalf("ListSessions(after delete) = %#v, want exact count 0", listed)
+	}
+	for {
+		select {
+		case event, ok := <-events:
+			if !ok {
+				t.Fatal("catalog event stream closed before delete event")
+			}
+			if event.Kind != CatalogEventDeleted {
+				continue
+			}
+			if event.WorkspaceID != workspaceID || event.SessionID != sessionID {
+				t.Fatalf("deleted catalog event = %#v, want workspace %q session %q", event, workspaceID, sessionID)
+			}
+			return
+		default:
+			t.Fatalf("deleted catalog event missing for session %q", sessionID)
+		}
+	}
+}
+
+type instanceProtectedCatalog struct{ *recordingSessionCatalog }
+
+var _ instanceMainGuard = (*instanceProtectedCatalog)(nil)
+
+func (*instanceProtectedCatalog) GuardInstanceMain(context.Context, string) error {
+	return store.ErrSessionIsInstanceMain
+}
+
+func TestInstanceMainRuntimeGuard(t *testing.T) {
+	t.Run("Should refuse archive with stop and delete before stopping an instance main", func(t *testing.T) {
+		t.Parallel()
+		catalog := &instanceProtectedCatalog{recordingSessionCatalog: newRecordingSessionCatalog()}
+		h := newHarness(t, WithSessionCatalog(catalog))
+		active := createSession(t, h)
+		if err := h.manager.Delete(t.Context(), active.ID); !errors.Is(err, store.ErrSessionIsInstanceMain) {
+			t.Fatalf("delete: %v", err)
+		}
+		if _, err := h.manager.ArchiveWithStop(
+			t.Context(),
+			active.WorkspaceID,
+			active.ID,
+		); !errors.Is(
+			err,
+			store.ErrSessionIsInstanceMain,
+		) {
+			t.Fatalf("archive: %v", err)
+		}
+		if _, ok := h.manager.Get(active.ID); !ok {
+			t.Fatal("refused operation stopped the instance main")
+		}
+	})
+}

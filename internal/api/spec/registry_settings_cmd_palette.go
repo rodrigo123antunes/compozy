@@ -1,0 +1,38 @@
+package spec
+
+import "github.com/compozy/compozy/internal/api/contract"
+
+func getSettingsCmdPaletteOperationSpec() OperationSpec {
+	return OperationSpec{
+		Method: httpMethodGet, Path: specAPISettingsCmdPalettePath,
+		AppAccess:   AppAccessDenied,
+		OperationID: "getSettingsCmdPalette", Summary: "Read command-palette settings",
+		Tags: []string{specSettingsKey}, Transports: []Transport{TransportHTTP, TransportUDS},
+		Parameters: settingsLayeredParameters(),
+		Responses: []ResponseSpec{
+			{Status: 200, Description: "OK", Body: contract.SettingsCmdPaletteResponse{}},
+			{Status: 400, Description: specInvalidSettingsScopeDescription, Body: contract.ErrorPayload{}},
+			{Status: 404, Description: specWorkspaceNotFoundDescription, Body: contract.ErrorPayload{}},
+			{Status: 500, Description: specInternalServerErrorDescription, Body: contract.ErrorPayload{}},
+		},
+	}
+}
+
+func updateSettingsCmdPaletteOperationSpec() OperationSpec {
+	return OperationSpec{
+		Method: httpMethodPatch, Path: specAPISettingsCmdPalettePath,
+		AppAccess:   AppAccessDenied,
+		OperationID: "updateSettingsCmdPalette", Summary: "Update command-palette settings",
+		Tags: []string{specSettingsKey}, Transports: []Transport{TransportHTTP, TransportUDS},
+		Parameters:  settingsLayeredParameters(),
+		RequestBody: contract.UpdateSettingsCmdPaletteRequest{},
+		Responses: []ResponseSpec{
+			{Status: 200, Description: "OK", Body: contract.SettingsCmdPaletteResponse{}},
+			{Status: 400, Description: specInvalidSettingsPayloadDescription, Body: contract.ErrorPayload{}},
+			{Status: 403, Description: specForbiddenDescription, Body: contract.ErrorPayload{}},
+			{Status: 404, Description: specWorkspaceNotFoundDescription, Body: contract.ErrorPayload{}},
+			{Status: 422, Description: specInvalidSettingsPayloadDescription, Body: contract.ErrorPayload{}},
+			{Status: 500, Description: specInternalServerErrorDescription, Body: contract.ErrorPayload{}},
+		},
+	}
+}

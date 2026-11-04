@@ -1,0 +1,796 @@
+/* ============================================================
+   COMPOZYOS SESSION TRANSCRIPT — session.css
+   Text-first, calm-surface vocabulary for everything rendered
+   inside a session chat: messages, tool calls, groups, folds,
+   markers, decisions, goal strip, outcomes, markdown.
+
+   Authority chain (highest first):
+     1. packages/ui/src/tokens.css        (production token truth)
+     2. design-system/ds-core.css         (prototype-canonical mirror)
+     3. This file                         (session-surface vocabulary)
+
+   Reference discipline (t3code + synara, adapted to Compozy tokens):
+   - One column (46rem) shared by transcript AND composer.
+   - Assistant prose is naked markdown. User is a borderless
+     4%-ink block. No avatars, no role labels, no bubbles with
+     borders, no shadows inside the transcript.
+   - Tool calls are single muted text lines at 24px. Status is a
+     glyph, never a badge: success check is GREY; only the ×
+     failure glyph is red. Row text never turns red.
+   - Consecutive settled calls collapse to one semantic summary
+     line ("Ran 2 commands · Edited 3 files"). Settled turns fold
+     behind "Worked for 42s" — the only divider on the surface.
+   - Decisions (permission, clarification) dock to the composer.
+     Session-level failures are ONE banner above the transcript.
+     Nothing tinted lives between messages.
+   - Color budget inside the transcript: danger × glyph, diff
+     numerals, link color, running accent dot. Everything else is
+     one neutral ramp (--fg → --muted → --subtle → --faint).
+   ============================================================ */
+
+:root{
+  color-scheme: dark;
+  --rail:#0c0b0b; --canvas:#131211; --canvas-soft:#1a1918; --canvas-tint:#1c1b1a; --elevated:#232220;
+  --fg:#ececef; --fg-strong:#f6f6f8; --muted:#9a9a9f; --subtle:#76767c; --faint:#545458;
+  --line:rgba(255,255,255,.055); --line-soft:rgba(255,255,255,.03); --line-strong:rgba(255,255,255,.09);
+  --accent:#e8572a; --accent-hover:#d14e25; --accent-strong:#f6874f; --accent-ink:#17110f;
+  --accent-tint:rgba(232,87,42,.10); --accent-tint-strong:rgba(232,87,42,.16); --accent-dim:rgba(232,87,42,.24);
+  --success:#5fbf85; --success-tint:rgba(95,191,133,.08);
+  --warning:#d6a647; --warning-tint:rgba(214,166,71,.08);
+  --danger:#e0635a;  --danger-tint:rgba(224,99,90,.09);
+  --info:#8e8eb5;    --info-tint:rgba(142,142,181,.12);
+  --neutral:#7a7a80; --neutral-tint:rgba(150,150,155,.06);
+  --row-hover:rgba(255,255,255,.022); --row-selected:rgba(255,255,255,.03);
+  --input-fill:rgba(255,255,255,.025); --badge-fill:rgba(255,255,255,.05);
+  --btn-fill:rgba(255,255,255,.04); --btn-hover:rgba(255,255,255,.07);
+  --surface-glaze:rgba(255,255,255,.04);
+  --scrim:rgba(0,0,0,.55);
+  --radius-xxs:3px; --radius-xs:4px; --radius-sm:5px; --radius:6px; --radius-md:8px; --radius-lg:10px; --radius-xl:14px; --radius-pill:9999px;
+  --font-sans:"Geist",-apple-system,BlinkMacSystemFont,system-ui,sans-serif;
+  --font-mono:"JetBrains Mono Variable","JetBrains Mono","SF Mono",ui-monospace,Menlo,monospace;
+  --dur:140ms; --dur-fast:100ms; --dur-slow:200ms;
+  --ease:cubic-bezier(.2,0,0,1); --ease-in-out:cubic-bezier(.4,0,0,.2,1);
+  --shadow-overlay:0 24px 48px -12px rgba(0,0,0,.65), 0 0 0 1px rgba(255,255,255,.045);
+  --highlight:inset 0 1px 0 rgba(255,255,255,.035);
+  --focus-ring:0 0 0 2px rgba(255,255,255,.5);
+  --focus-ring-inset:inset 0 0 0 2px rgba(255,255,255,.5);
+  --z-menu:40; --z-scrim:60; --z-sheet:61;
+
+  /* session-surface derived tokens (all derived from the ramp above) */
+  --chat-col:46rem;                       /* one column for transcript + composer */
+  --chat-fill-user:rgba(255,255,255,.045);/* the ONLY message surface */
+  --chat-fill-code:rgba(255,255,255,.03); /* code / "source input" wash          */
+  --chat-gap-turn:18px;                   /* between turns                        */
+  --chat-gap-row:7px;                     /* inside a turn (work rows, commentary)*/
+  --chat-indent:25px;                     /* expanded detail alignment (18+7)     */
+  --dur-disclosure:220ms;                 /* one shared disclosure motion         */
+}
+
+/* ============ BASE ============ */
+*{box-sizing:border-box;margin:0;padding:0}
+[hidden]{display:none!important}
+html,body{height:100%}
+body{
+  font-family:var(--font-sans);font-size:13.5px;line-height:1.5;letter-spacing:-.006em;
+  color:var(--fg);background:var(--canvas);
+  -webkit-font-smoothing:antialiased;-moz-osx-font-smoothing:grayscale;
+}
+button{font:inherit;letter-spacing:inherit;color:inherit;background:none;border:0;cursor:pointer}
+input,textarea{font:inherit;letter-spacing:inherit;color:inherit}
+ul{list-style:none}
+svg{display:block}
+code,.mono{font-family:var(--font-mono);font-variant-numeric:tabular-nums;-webkit-font-smoothing:subpixel-antialiased;font-feature-settings:normal}
+kbd{font-family:var(--font-mono);font-size:10px;color:var(--subtle)}
+:focus-visible{outline:none;box-shadow:var(--focus-ring)}
+.eyebrow{font-size:10px;font-weight:600;letter-spacing:.08em;text-transform:uppercase;color:var(--subtle)}
+.dotsep{display:inline-block;width:2px;height:2px;border-radius:50%;background:var(--faint);vertical-align:middle;margin:0 6px}
+
+.btn{
+  display:inline-flex;align-items:center;justify-content:center;gap:6px;
+  height:26px;padding:0 10px;border-radius:var(--radius-md);
+  font-size:12px;font-weight:500;letter-spacing:-.005em;
+  border:1px solid var(--line);background:var(--btn-fill);color:var(--fg);
+  transition:background var(--dur) var(--ease),border-color var(--dur) var(--ease),color var(--dur) var(--ease);
+}
+.btn svg{width:14px;height:14px}
+.btn:hover{background:var(--btn-hover);border-color:var(--line-strong);color:var(--fg-strong)}
+.btn:active:not(:disabled){transform:translateY(1px)}
+.btn:disabled{opacity:.45;cursor:default;pointer-events:none}
+.btn--primary{background:var(--accent);border-color:transparent;color:var(--accent-ink);box-shadow:var(--highlight)}
+.btn--primary:hover{background:var(--accent-hover);color:var(--accent-ink)}
+.btn--ghost{background:transparent;border-color:transparent}
+.btn--ghost:hover{background:var(--row-hover);border-color:transparent}
+.btn--danger-ghost{background:transparent;border-color:transparent;color:var(--muted)}
+.btn--danger-ghost:hover{background:var(--danger-tint);border-color:transparent;color:var(--danger)}
+.btn--sm{height:22px;padding:0 9px;font-size:11px}
+.btn--sm svg{width:12px;height:12px}
+
+/* ============ 01 · TRANSCRIPT FRAME ============ */
+/* One centered column; the transcript owns NO surface of its own —
+   it sits directly on --canvas. No cards, no panels, no rails. */
+.chat-scroll{height:100%;overflow-y:auto;overscroll-behavior-y:contain;scrollbar-gutter:stable}
+.chat-col{width:100%;max-width:var(--chat-col);margin-inline:auto;min-width:0;padding-inline:20px}
+.transcript{display:flex;flex-direction:column;padding-block:16px 24px}
+
+/* Rhythm: 7px inside a turn, 18px between turns. No dividers between
+   messages — the turn fold rule is the only horizontal line. */
+.t-row{padding-bottom:var(--chat-gap-row)}
+.t-row--turn-end{padding-bottom:var(--chat-gap-turn)}
+
+/* ============ 02 · MESSAGES ============ */
+/* User — right-aligned borderless block on a 4.5% ink wash.
+   No border, no shadow, no avatar, no "You" label. */
+.msg-user{display:flex;flex-direction:column;align-items:flex-end;gap:3px}
+.msg-user__bubble{
+  max-width:80%;width:max-content;min-width:0;
+  padding:7px 12px;border-radius:var(--radius-lg);
+  background:var(--chat-fill-user);
+  font-size:13.5px;line-height:1.6;color:var(--fg);
+  overflow-wrap:anywhere;
+}
+.msg-user__bubble code{font-size:12px;background:rgba(255,255,255,.07);border-radius:var(--radius-xxs);padding:1px 4px}
+
+/* Assistant — naked markdown at full column width. Zero chrome:
+   no bubble, no background, no border, no label. */
+.msg-assistant{min-width:0;font-size:13.5px;line-height:1.62;color:var(--fg)}
+
+/* Hover-revealed meta (timestamp · copy). Only on the
+   terminal message of a settled turn — never mid-work. */
+.msg-meta{
+  display:flex;align-items:center;gap:8px;margin-top:3px;
+  font-size:11px;color:var(--subtle);font-variant-numeric:tabular-nums;
+  opacity:0;pointer-events:none;
+  transition:opacity var(--dur-slow) var(--ease);
+}
+.msg-user .msg-meta{justify-content:flex-end;padding-right:2px}
+.t-msg:hover .msg-meta,.t-msg:focus-within .msg-meta{opacity:1;pointer-events:auto}
+.msg-meta button{display:inline-flex;align-items:center;gap:4px;color:var(--subtle);border-radius:var(--radius-xs);padding:1px 3px}
+.msg-meta button:hover{color:var(--fg)}
+.msg-meta svg{width:11px;height:11px}
+
+/* Long user messages clamp with a mask, never truncate text */
+.msg-user__bubble[data-clamped="true"]{
+  max-height:176px;overflow:hidden;
+  -webkit-mask-image:linear-gradient(to bottom,#000 calc(100% - 28px),transparent);
+          mask-image:linear-gradient(to bottom,#000 calc(100% - 28px),transparent);
+}
+.msg-more{font-size:11px;color:var(--subtle);padding:1px 4px;border-radius:var(--radius-xs)}
+.msg-more:hover{color:var(--fg)}
+
+/* ============ 03 · TOOL CALL ROW ============ */
+/* One 24px line: icon well · verb · mono preview · chevron · status
+   glyph. Text NEVER turns red — failure is carried by the glyph only.
+   Row font sits at 12.5px, one step under prose; color separates it. */
+.trow{
+  display:flex;flex-direction:column;min-width:0;
+  border-radius:var(--radius);
+}
+.trow__line{
+  display:flex;align-items:center;gap:7px;min-height:24px;min-width:0;
+  padding:1px 4px;border-radius:var(--radius);
+  text-align:left;width:100%;
+  transition:background var(--dur) var(--ease);
+}
+.trow[data-expandable="true"] .trow__line{cursor:pointer}
+.trow[data-expandable="true"] .trow__line:hover{background:var(--row-hover)}
+.trow__icon{
+  display:flex;align-items:center;justify-content:center;
+  width:18px;height:18px;flex:none;color:var(--subtle);
+}
+.trow__icon svg{width:13px;height:13px;stroke-width:1.8}
+.trow__text{display:flex;align-items:baseline;gap:7px;min-width:0;flex:1;font-size:12.5px;line-height:20px}
+.trow__verb{flex:none;font-weight:500;color:var(--muted);transition:color var(--dur) var(--ease)}
+.trow__prev{
+  min-width:0;flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;
+  font-family:var(--font-mono);font-size:11.5px;color:var(--subtle);
+}
+.trow__line:hover .trow__verb{color:var(--fg)}
+.trow__aside{display:flex;align-items:center;gap:2px;flex:none;color:var(--subtle)}
+.trow__chev{width:16px;height:16px;display:grid;place-items:center;color:var(--faint)}
+.trow__chev svg{width:11px;height:11px;transition:transform var(--dur-slow) var(--ease)}
+.trow[data-open="true"] .trow__chev svg{transform:rotate(180deg)}
+.trow__status{width:16px;height:16px;display:grid;place-items:center}
+.trow__status svg{width:11px;height:11px}
+/* status glyphs — grey check, red ×, grey spinner. Never a badge. */
+.trow[data-status="success"] .trow__status{color:var(--subtle)}
+.trow[data-status="failed"]  .trow__status{color:var(--danger)}
+.trow[data-status="running"] .trow__status{color:var(--subtle)}
+.trow__spin{animation:trow-spin .9s linear infinite}
+@keyframes trow-spin{to{transform:rotate(360deg)}}
+/* per-file diff stat on edit rows — the only color on a rest-state row */
+.diffstat{display:inline-flex;gap:5px;font-family:var(--font-mono);font-size:11px;font-variant-numeric:tabular-nums;flex:none}
+.diffstat b{font-weight:500;color:var(--success)}
+.diffstat i{font-style:normal;font-weight:500;color:var(--danger)}
+
+/* Expanded detail — indented mono behind a 1px rail, aligned under
+   the verb. No card, no header, no syntax theatre. */
+.trow__detail{
+  margin:2px 0 4px var(--chat-indent);
+  border-left:1px solid var(--line);padding-left:11px;
+  overflow:hidden;
+}
+.trow__detail pre{
+  max-height:240px;overflow:auto;
+  font-family:var(--font-mono);font-size:11px;line-height:1.7;
+  color:var(--muted);white-space:pre-wrap;word-break:break-word;
+}
+.trow__detail .add{color:var(--success)}
+.trow__detail .del{color:var(--danger)}
+.trow__detail .ctx{color:var(--subtle)}
+.trow__detail .err{color:var(--danger)}
+.trow__detail-cap{font-size:10px;font-weight:600;letter-spacing:.07em;text-transform:uppercase;color:var(--faint);margin:7px 0 3px}
+.trow__detail-cap:first-child{margin-top:0}
+
+/* Retained full result (ToolResultArtifact) — a quiet action line in
+   the same detail rail. Pages load in place; failure is danger text
+   with a Retry, never an Alert card. */
+.trow__artifact{display:flex;flex-direction:column;gap:3px;margin-top:6px}
+.trow__artifact-line{display:flex;align-items:baseline;gap:8px}
+.trow__open{font-size:11px;font-weight:500;color:var(--info);padding:1px 2px;border-radius:var(--radius-xs)}
+.trow__open:hover{text-decoration:underline;text-underline-offset:2px}
+.trow__bytes{font-family:var(--font-mono);font-size:10px;color:var(--faint);font-variant-numeric:tabular-nums}
+.trow__artifact-err{font-size:11px;color:var(--danger)}
+.trow__artifact-err button{margin-left:6px;font-size:11px;color:var(--info)}
+.trow__artifact-err button:hover{text-decoration:underline;text-underline-offset:2px}
+
+/* ============ 04 · GROUPING & FOLDING ============ */
+/* Collapsed group — same 24px geometry as a tool row; a semantic
+   label with counts, joined by middle dots. No count badge, no
+   duration, no border, no fill. */
+.tgroup-sum{
+  display:inline-flex;align-items:center;gap:7px;min-height:24px;
+  padding:1px 4px;border-radius:var(--radius);
+  font-size:12.5px;font-weight:500;color:var(--muted);text-align:left;
+  transition:color var(--dur) var(--ease),background var(--dur) var(--ease);
+}
+.tgroup-sum:hover{color:var(--fg);background:var(--row-hover)}
+.tgroup-sum .trow__icon{color:var(--subtle)}
+.tgroup-sum .trow__chev{color:var(--faint)}
+.tgroup__body{display:flex;flex-direction:column;gap:2px;padding-top:2px}
+
+/* Overflow toggle — bare text, same geometry, no chrome */
+.tmore{
+  display:inline-flex;align-items:center;gap:6px;min-height:22px;
+  padding:0 4px;margin-left:var(--chat-indent);
+  font-size:11.5px;color:var(--subtle);border-radius:var(--radius-xs);
+}
+.tmore:hover{color:var(--fg)}
+
+/* Turn fold — "Worked for 42s". The ONLY divider in the transcript. */
+.turnfold{padding-bottom:6px;margin-bottom:10px;border-bottom:1px solid var(--line)}
+.turnfold__btn{
+  display:inline-flex;align-items:center;gap:5px;
+  margin-left:-2px;padding:1px 4px;border-radius:var(--radius-xs);
+  font-size:12px;color:var(--subtle);font-variant-numeric:tabular-nums;
+  transition:color var(--dur) var(--ease);
+}
+.turnfold__btn:hover{color:var(--fg)}
+.turnfold__btn svg{width:11px;height:11px;color:var(--faint);transition:transform var(--dur-slow) var(--ease)}
+.turnfold[data-open="true"] .turnfold__btn svg{transform:rotate(90deg)}
+.turnfold__body{padding:4px 0 2px;display:flex;flex-direction:column;gap:2px}
+/* Interrupted turns never fold — a quiet danger-text line, no banner */
+.turnfold--stopped{border-bottom-color:var(--line)}
+.turnfold--stopped .turnfold__label{
+  display:inline-flex;align-items:center;gap:6px;
+  font-size:12px;color:var(--danger);
+}
+.turnfold--stopped .turnfold__label svg{width:12px;height:12px}
+
+/* ============ 05 · THINKING & STREAMING ============ */
+/* Live thinking — a shimmering text label, nothing else */
+.shimmer{
+  --shine:rgba(246,246,248,.9);
+  background:linear-gradient(90deg,var(--subtle) 0%,var(--subtle) 40%,var(--shine) 50%,var(--subtle) 60%,var(--subtle) 100%);
+  background-size:200% 100%;-webkit-background-clip:text;background-clip:text;
+  color:transparent;animation:shimmer 2s linear infinite;
+}
+@keyframes shimmer{from{background-position:180% 0}to{background-position:-20% 0}}
+.thinking-live{font-size:12.5px;font-weight:500;padding:2px 4px}
+/* Settled thinking — same collapsed row grammar as a tool call */
+.thinking .trow__verb{color:var(--muted)}
+.thinking__body{
+  margin:2px 0 4px var(--chat-indent);
+  border-left:1px solid var(--line);padding-left:11px;
+  font-size:12px;line-height:1.6;color:var(--muted);
+  max-height:240px;overflow-y:auto;
+}
+
+/* Working row — three 4px dots on a stepped duty cycle + a
+   self-ticking elapsed label. The smallest, dimmest text here. */
+.working{display:flex;align-items:center;gap:8px;min-height:22px;padding:1px 4px}
+.working__dots{display:inline-flex;gap:3px}
+.working__dots i{width:4px;height:4px;border-radius:50%;background:var(--faint);animation:wpulse 2s steps(6) infinite}
+.working__dots i:nth-child(2){animation-delay:.2s}
+.working__dots i:nth-child(3){animation-delay:.4s}
+@keyframes wpulse{0%,40%{opacity:1}50%,90%{opacity:.35}100%{opacity:1}}
+.working__label{font-size:11.5px;color:var(--subtle);font-variant-numeric:tabular-nums}
+@media (prefers-reduced-motion:reduce){
+  .working__dots i,.shimmer{animation:none}
+  .shimmer{color:var(--subtle);background:none}
+}
+
+/* ============ 06 · SYSTEM EVENTS (markers, errors) ============ */
+/* Everything that used to be a tinted Alert card becomes a marker
+   line: 12px glyph + one muted sentence. Tone lives in the glyph. */
+.marker{display:flex;align-items:flex-start;gap:7px;min-height:22px;padding:2px 4px;font-size:12px;line-height:1.55;color:var(--subtle)}
+.marker svg{width:12px;height:12px;flex:none;margin-top:2.5px;color:var(--faint)}
+.marker b{font-weight:500;color:var(--muted)}
+.marker[data-tone="danger"] svg{color:var(--danger)}
+.marker[data-tone="warning"] svg{color:var(--warning)}
+.marker[data-tone="info"] svg{color:var(--info)}
+.marker__meta{font-family:var(--font-mono);font-size:10.5px;color:var(--faint)}
+
+/* Lifecycle rule — session started / resumed / compacted: a centered
+   mono caption between hairlines. Structural, not a banner. */
+.liferule{display:flex;align-items:center;gap:10px;padding:6px 0}
+.liferule::before,.liferule::after{content:"";height:1px;flex:1;background:var(--line-soft)}
+.liferule span{font-family:var(--font-mono);font-size:10px;letter-spacing:.05em;color:var(--faint);white-space:nowrap}
+
+/* Session-level failure — the ONE banner allowed, above the
+   transcript (never between messages). Hairline + 4% wash. */
+.banner{
+  display:flex;align-items:flex-start;gap:9px;
+  margin:12px 0 4px;padding:10px 12px;
+  border:1px solid color-mix(in srgb,var(--danger) 28%,transparent);
+  border-radius:var(--radius-lg);
+  background:color-mix(in srgb,var(--danger) 4%,transparent);
+  font-size:12.5px;line-height:1.5;color:var(--fg);
+}
+.banner svg{width:13px;height:13px;flex:none;margin-top:2px;color:var(--danger)}
+.banner b{font-weight:600;color:var(--fg-strong)}
+.banner p{color:var(--muted);font-size:12px}
+.banner__x{margin-left:auto;flex:none;width:20px;height:20px;display:grid;place-items:center;border-radius:var(--radius-xs);color:var(--subtle)}
+.banner__x:hover{color:var(--fg);background:var(--row-hover)}
+.banner__x svg{width:12px;height:12px;margin:0;color:currentColor}
+.banner--warning{border-color:color-mix(in srgb,var(--warning) 28%,transparent);background:color-mix(in srgb,var(--warning) 4%,transparent)}
+.banner--warning svg{color:var(--warning)}
+
+/* ============ 07 · DECISIONS (composer dock) ============ */
+/* Permission + clarification leave the transcript and dock above the
+   composer. No red wash, no shield theatre — emphasis is tracking
+   and geometry. The transcript keeps only one-line receipts. */
+.dock{
+  border:1px solid var(--line-strong);border-bottom:0;
+  border-radius:var(--radius-lg) var(--radius-lg) 0 0;
+  background:var(--canvas-soft);
+  padding:11px 14px 12px;
+}
+.dock__head{display:flex;align-items:center;gap:8px;flex-wrap:wrap}
+.dock__eyebrow{font-size:10px;font-weight:600;letter-spacing:.14em;text-transform:uppercase;color:var(--subtle)}
+.dock__title{font-size:12.5px;font-weight:500;color:var(--fg)}
+.dock__count{font-family:var(--font-mono);font-size:10px;color:var(--faint);font-variant-numeric:tabular-nums}
+.dock__body{margin-top:8px}
+.dock__pre{
+  border:1px solid var(--line);border-radius:var(--radius-md);
+  background:var(--chat-fill-code);padding:8px 10px;
+  font-family:var(--font-mono);font-size:11px;line-height:1.6;color:var(--fg);
+  max-height:130px;overflow:auto;white-space:pre-wrap;word-break:break-word;
+}
+.dock__meta{margin-top:5px;font-size:11px;color:var(--subtle)}
+.dock__meta code{font-size:10.5px;color:var(--muted)}
+.dock__actions{display:flex;align-items:center;gap:7px;margin-top:10px}
+.dock__actions .spacer{flex:1}
+/* clarification choice rows — list rows with numeric shortcuts */
+.choice{display:flex;flex-direction:column;gap:2px;margin-top:8px}
+.choice__row{
+  display:flex;align-items:center;gap:9px;width:100%;
+  min-height:30px;padding:4px 8px;border-radius:var(--radius-md);
+  font-size:12.5px;color:var(--fg);text-align:left;
+  border:1px solid transparent;
+  transition:background var(--dur) var(--ease),border-color var(--dur) var(--ease);
+}
+.choice__row:hover{background:var(--row-hover);border-color:var(--line)}
+.choice__row[aria-pressed="true"]{border-color:var(--line-strong);background:var(--row-selected)}
+.choice__key{
+  width:18px;height:18px;flex:none;display:grid;place-items:center;
+  border:1px solid var(--line);border-radius:var(--radius-xs);
+  font-family:var(--font-mono);font-size:10px;color:var(--subtle);font-variant-numeric:tabular-nums;
+}
+.choice__hint{margin-left:auto;font-size:11px;color:var(--subtle)}
+/* deadline hint — static mono, never ticks */
+.dock__deadline{margin-left:auto;font-family:var(--font-mono);font-size:10px;color:var(--faint);font-variant-numeric:tabular-nums}
+/* free-text answer — rendered when the question has no bounded choices */
+.choice__free{display:flex;flex-direction:column;gap:7px;margin-top:8px}
+.choice__free textarea{
+  width:100%;resize:none;min-height:52px;
+  border:1px solid var(--line);border-radius:var(--radius-md);
+  background:var(--elevated);padding:7px 9px;
+  font:inherit;font-size:12.5px;line-height:1.5;color:var(--fg);
+}
+.choice__free textarea::placeholder{color:var(--subtle)}
+.choice__free textarea:focus{outline:none;border-color:var(--accent-dim)}
+.choice__free-bar{display:flex;align-items:center}
+.choice__free-bar .spacer{flex:1}
+/* quiet dock status lines — submitting / retryable error */
+.dock__status{margin-top:7px;font-size:11px;color:var(--subtle)}
+.dock__status[data-tone="danger"]{color:var(--danger)}
+/* reject split menu — keeps all four ACP decisions reachable (key 4
+   fires reject-always even while the menu is closed) */
+.dock__reject{position:relative;display:inline-flex;gap:1px}
+.dock__reject-chev{padding:0 4px}
+.dock__reject-chev svg{width:11px;height:11px;transition:transform var(--dur-slow) var(--ease)}
+.dock__reject[data-open="true"] .dock__reject-chev svg{transform:rotate(180deg)}
+.dock__menu{
+  position:absolute;right:0;bottom:calc(100% + 5px);min-width:158px;
+  border:1px solid var(--line-strong);border-radius:var(--radius-md);
+  background:var(--elevated);box-shadow:var(--shadow-overlay);
+  padding:3px;display:none;z-index:5;
+}
+.dock__reject[data-open="true"] .dock__menu{display:block}
+.dock__menu button{
+  display:flex;align-items:center;gap:8px;width:100%;
+  min-height:28px;padding:3px 8px;border-radius:var(--radius-xs);
+  font-size:12px;color:var(--danger);text-align:left;
+}
+.dock__menu button:hover{background:var(--row-hover)}
+.dock__menu kbd{margin-left:auto;font-family:var(--font-mono);font-size:9px;color:var(--faint)}
+
+/* In-transcript receipts — one quiet line each, same marker grammar */
+.receipt{display:flex;align-items:center;gap:7px;min-height:22px;padding:2px 4px;font-size:12px;color:var(--subtle)}
+.receipt svg{width:12px;height:12px;flex:none;color:var(--faint)}
+.receipt b{font-weight:500;color:var(--muted)}
+.receipt code{font-family:var(--font-mono);font-size:11px;color:var(--muted)}
+.receipt[data-tone="allowed"] svg{color:var(--success)}
+.receipt[data-tone="rejected"] svg{color:var(--danger)}
+
+/* ============ 08 · GOAL STRIP ============ */
+/* Replaces GoalStatusChip. One 30px line above the transcript inside
+   the same column; expands to quiet text facts. No icon tile, no
+   pills, no meter grid, no control bar. */
+.goalstrip{border-bottom:1px solid var(--line);padding:5px 0 7px;margin-bottom:6px}
+.goalstrip__line{
+  display:flex;align-items:center;gap:8px;width:100%;min-height:24px;
+  padding:1px 4px;border-radius:var(--radius);text-align:left;
+  transition:background var(--dur) var(--ease);
+}
+.goalstrip__line:hover{background:var(--row-hover)}
+.goalstrip__dot{width:6px;height:6px;border-radius:50%;flex:none;background:var(--neutral)}
+.goalstrip[data-state="active"] .goalstrip__dot{background:var(--accent);animation:goal-pulse 2.4s var(--ease) infinite}
+.goalstrip[data-state="blocked"] .goalstrip__dot{background:var(--warning)}
+.goalstrip[data-state="done"] .goalstrip__dot{background:var(--success)}
+@keyframes goal-pulse{0%,100%{box-shadow:0 0 0 0 var(--accent-tint)}50%{box-shadow:0 0 0 4px transparent}}
+.goalstrip__kicker{font-size:10px;font-weight:600;letter-spacing:.08em;text-transform:uppercase;color:var(--subtle);flex:none}
+.goalstrip__obj{min-width:0;flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-size:12.5px;color:var(--fg)}
+.goalstrip__fact{flex:none;font-family:var(--font-mono);font-size:10.5px;color:var(--subtle);font-variant-numeric:tabular-nums}
+.goalstrip__chev{width:14px;height:14px;color:var(--faint);flex:none}
+.goalstrip__chev svg{width:11px;height:11px;transition:transform var(--dur-slow) var(--ease)}
+.goalstrip[data-open="true"] .goalstrip__chev svg{transform:rotate(180deg)}
+.goalstrip__body{padding:6px 4px 2px;display:flex;flex-direction:column;gap:5px}
+.goalstrip__row{display:flex;gap:10px;font-size:12px;line-height:1.55}
+.goalstrip__k{flex:none;width:76px;color:var(--faint);font-size:11px;padding-top:1px}
+.goalstrip__v{color:var(--muted);min-width:0}
+.goalstrip__v a{color:var(--info);text-decoration:none}
+.goalstrip__v a:hover{text-decoration:underline;text-underline-offset:2px}
+.goalstrip[data-state="paused"] .goalstrip__dot{background:var(--warning)}
+.goalstrip[data-state="moved"] .goalstrip__dot{background:var(--faint)}
+.goalstrip__mono{font-family:var(--font-mono);font-size:10.5px;color:var(--subtle)}
+/* body Actions row — prefill stages a /goal command into the composer,
+   never auto-sends (goal-status-controls prefill affordance) */
+.goalstrip__acts{display:flex;align-items:center;gap:6px}
+.goalstrip__act{
+  display:inline-flex;align-items:center;gap:5px;
+  padding:1px 7px;min-height:22px;border-radius:var(--radius-xs);
+  font-size:11.5px;color:var(--muted);border:1px solid transparent;
+  transition:color var(--dur) var(--ease),background var(--dur) var(--ease);
+}
+.goalstrip__act:hover{color:var(--fg);background:var(--row-hover);border-color:var(--line)}
+.goalstrip__act svg{width:11px;height:11px;color:var(--subtle)}
+/* goal marker inside the transcript (was GoalPromptNotice card) */
+.marker--goal .marker__meta{margin-left:2px}
+
+/* ============ 09 · TURN OUTCOMES ============ */
+/* Changed files — one line, expandable to bare file lines. No card. */
+.changed{min-width:0}
+.changed__sum{
+  display:inline-flex;align-items:center;gap:7px;min-height:24px;
+  padding:1px 4px;border-radius:var(--radius);
+  font-size:12.5px;font-weight:500;color:var(--muted);
+}
+.changed__sum:hover{color:var(--fg);background:var(--row-hover)}
+.changed__body{display:flex;flex-direction:column;gap:1px;margin:2px 0 2px var(--chat-indent);border-left:1px solid var(--line);padding-left:11px}
+.changed__file{display:flex;align-items:center;gap:8px;min-height:22px;font-size:12px}
+.changed__file svg{width:12px;height:12px;color:var(--faint);flex:none}
+.changed__dir{color:var(--subtle);font-family:var(--font-mono);font-size:11px}
+.changed__name{color:var(--fg);font-family:var(--font-mono);font-size:11px}
+.changed__file .diffstat{margin-left:auto}
+
+/* Todo / plan progress — TodoWrite renders as task lines, never JSON */
+.todo{display:flex;flex-direction:column;gap:1px;padding:2px 4px}
+.todo__cap{font-size:10px;font-weight:600;letter-spacing:.07em;text-transform:uppercase;color:var(--faint);margin-bottom:3px}
+.todo__item{display:flex;align-items:flex-start;gap:8px;min-height:22px;font-size:12.5px;line-height:1.55;color:var(--muted)}
+.todo__glyph{width:16px;height:16px;flex:none;display:grid;place-items:center;margin-top:1px}
+.todo__glyph svg{width:11px;height:11px}
+.todo__glyph .dot-pending{width:6px;height:6px;border-radius:50%;border:1.4px solid var(--faint)}
+.todo__item[data-state="done"]{color:var(--subtle);text-decoration:line-through;text-decoration-color:var(--faint)}
+.todo__item[data-state="done"] .todo__glyph{color:var(--subtle)}
+.todo__item[data-state="active"]{color:var(--fg)}
+.todo__item[data-state="active"] .todo__glyph{color:var(--accent)}
+.todo__item[data-state="active"] .todo__glyph i{width:6px;height:6px;border-radius:50%;background:var(--accent);animation:goal-pulse 2.4s var(--ease) infinite}
+
+/* ============ 10 · MARKDOWN (assistant prose) ============ */
+.md{overflow-wrap:anywhere;word-break:break-word;min-width:0}
+.md>:first-child{margin-top:0}
+.md>:last-child{margin-bottom:0}
+.md p,.md ul,.md ol,.md blockquote,.md pre,.md table{margin:9px 0}
+.md strong{font-weight:600;color:var(--fg-strong)}
+.md h1,.md h2,.md h3,.md h4{margin:18px 0 6px;font-weight:600;line-height:1.3;letter-spacing:-.01em;color:var(--fg-strong)}
+.md h1{font-size:17px}.md h2{font-size:15.5px}.md h3{font-size:14px}.md h4{font-size:13.5px}
+.md ul,.md ol{padding-left:20px}
+.md ul{list-style:disc}.md ol{list-style:decimal}
+.md ul ul{list-style:circle}.md ul ul ul{list-style:square}
+.md li{margin-top:3px}
+.md li::marker{color:var(--faint)}
+.md a{color:var(--info);text-decoration:none}
+.md a:hover{text-decoration:underline;text-decoration-thickness:from-font;text-underline-offset:.18em}
+.md blockquote{border-left:2px solid var(--line-strong);padding-left:11px;color:var(--muted)}
+.md code{font-family:var(--font-mono);font-size:11.5px;background:var(--badge-fill);border-radius:var(--radius-xxs);padding:1px 4px}
+.md pre{border-radius:var(--radius-md);background:var(--chat-fill-code);border:1px solid var(--line-soft);padding:9px 11px;overflow-x:auto}
+.md pre code{background:none;border-radius:0;padding:0;font-size:11.5px;line-height:1.65;color:var(--fg)}
+.md hr{border:0;border-top:1px solid var(--line);margin:16px 0}
+.md table{width:100%;border-collapse:collapse;font-size:12px}
+.md th{text-align:left;font-weight:600;color:var(--muted);font-size:11px}
+.md th,.md td{padding:5px 10px 5px 0;border-bottom:1px solid var(--line-soft)}
+/* fenced block with header (filename/lang + copy) */
+.codeblock{margin:9px 0;border:1px solid var(--line-soft);border-radius:var(--radius-md);background:var(--chat-fill-code);overflow:hidden}
+.codeblock__head{display:flex;align-items:center;justify-content:space-between;gap:8px;padding:3px 5px 3px 11px;color:var(--subtle)}
+.codeblock__title{font-family:var(--font-mono);font-size:10.5px}
+.codeblock__title b{font-weight:500;color:var(--muted)}
+.codeblock__act{display:inline-flex;gap:1px}
+.codeblock__act button{width:22px;height:22px;display:grid;place-items:center;border-radius:var(--radius-xs);color:var(--subtle)}
+.codeblock__act button:hover{color:var(--fg);background:var(--row-hover)}
+.codeblock__act svg{width:12px;height:12px}
+.codeblock pre{margin:0;border:0;border-radius:0;background:none;padding:8px 11px 10px}
+
+/* ============ 11 · COMPOSER ============ */
+/* Same column as the transcript; the canvas continues — no zone
+   border, the scroll fade does the separation. One calm field:
+   hairline border, elevated fill, a single circular accent send.
+   Focus is the accent moment. */
+.composer-zone{background:var(--canvas);padding:6px 0 16px}
+.composer{
+  display:flex;flex-direction:column;gap:7px;
+  border:1px solid var(--line);border-radius:var(--radius-lg);
+  background:var(--elevated);padding:11px 10px 9px 14px;
+  box-shadow:var(--highlight);
+  transition:border-color var(--dur) var(--ease);
+}
+.composer:hover{border-color:var(--line-strong)}
+.composer:focus-within{border-color:var(--accent-dim)}
+.dock+ .composer,.composer--docked{border-top-left-radius:0;border-top-right-radius:0}
+.composer textarea{
+  border:0;background:none;outline:none;resize:none;
+  font-size:13px;line-height:1.55;color:var(--fg);min-height:21px;max-height:180px;
+}
+.composer textarea::placeholder{color:var(--faint)}
+.composer__bar{display:flex;align-items:center;gap:8px;min-height:28px}
+.composer__hint{display:inline-flex;align-items:center;gap:5px;font-size:10.5px;color:var(--faint)}
+.composer__hint kbd{
+  border:1px solid var(--line);border-radius:var(--radius-xxs);
+  padding:1px 4px;background:var(--canvas-soft);
+  font-size:9px;color:var(--subtle);
+}
+.composer__bar .spacer{flex:1}
+.composer__send{
+  width:28px;height:28px;border-radius:var(--radius-pill);
+  display:grid;place-items:center;background:var(--accent);color:var(--accent-ink);
+  box-shadow:var(--highlight);
+  transition:background var(--dur) var(--ease),transform var(--dur) var(--ease);
+}
+.composer__send:hover{background:var(--accent-hover)}
+.composer__send:active{transform:translateY(1px)}
+.composer__send:disabled{background:var(--btn-fill);color:var(--faint);box-shadow:none;cursor:default}
+.composer__send svg{width:13px;height:13px}
+.composer__stop{
+  width:28px;height:28px;border-radius:var(--radius-pill);
+  display:grid;place-items:center;background:transparent;border:1px solid var(--line);color:var(--muted);
+  transition:background var(--dur) var(--ease),border-color var(--dur) var(--ease),color var(--dur) var(--ease);
+}
+.composer__stop:hover{background:var(--danger-tint);border-color:transparent;color:var(--danger)}
+.composer__stop svg{width:11px;height:11px}
+/* decision shortcut chips on dock actions */
+.dock__actions kbd{margin-left:3px;font-size:9px;color:inherit;opacity:.6}
+
+/* ============ 12 · DISCLOSURE MOTION ============ */
+/* One motion for every expand/collapse on the surface:
+   grid-rows 0fr→1fr + opacity, 220ms, ease-out. */
+.disclose{display:grid;grid-template-rows:0fr;transition:grid-template-rows var(--dur-disclosure) var(--ease),opacity var(--dur-disclosure) var(--ease);opacity:0}
+.disclose>*{min-height:0;overflow:hidden}
+[data-open="true"]>.disclose,[data-open="true"]+.disclose{grid-template-rows:1fr;opacity:1}
+@media (prefers-reduced-motion:reduce){.disclose{transition:none}}
+
+/* ============ 13 · QUEUED PROMPTS (composer strip) ============ */
+/* Follow-ups staged while a turn runs (SessionComposerQueuedPrompts).
+   Rows fuse onto the composer top; each row is a real durable queue
+   entry the daemon accepted. Steer injects it into the running turn,
+   edit moves it back into the field, remove cancels it. Quiet grammar:
+   no fills, no accent — the queue is bookkeeping, not an event. */
+.qstrip{
+  border:1px solid var(--line);border-bottom:0;
+  border-radius:var(--radius-lg) var(--radius-lg) 0 0;
+  background:var(--elevated);
+}
+.dock+.qstrip{border-radius:0}
+.qstrip+.composer{border-top-left-radius:0;border-top-right-radius:0}
+/* an emptied (hidden) strip must not leave the composer with squared corners */
+.qstrip[hidden]+.composer:not(.composer--docked){border-top-left-radius:var(--radius-lg);border-top-right-radius:var(--radius-lg)}
+.qrow{display:flex;align-items:center;gap:8px;min-height:32px;padding:3px 7px 3px 13px}
+.qrow+.qrow{border-top:1px solid var(--line-soft)}
+/* one quiet settle flash when a draft lands in the queue */
+.qrow[data-new]{animation:qrow-in .45s var(--ease)}
+@keyframes qrow-in{from{background:var(--badge-fill)}to{background:transparent}}
+.qrow>svg{width:13px;height:13px;flex:none;color:var(--faint)}
+.qrow__text{flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-size:12px;color:var(--muted)}
+.qrow__acts{display:flex;align-items:center;gap:1px;flex:none}
+.qrow__steer{
+  display:inline-flex;align-items:center;gap:5px;height:22px;padding:0 8px;
+  border-radius:var(--radius-sm);font-size:11px;font-weight:500;color:var(--muted);
+  transition:background var(--dur-fast) var(--ease),color var(--dur-fast) var(--ease);
+}
+.qrow__steer:hover{background:var(--row-hover);color:var(--fg-strong)}
+.qrow__steer svg{width:11px;height:11px}
+.qrow__ib{
+  display:grid;place-items:center;width:22px;height:22px;border-radius:var(--radius-sm);color:var(--faint);
+  transition:background var(--dur-fast) var(--ease),color var(--dur-fast) var(--ease);
+}
+.qrow__ib:hover{background:var(--row-hover);color:var(--fg)}
+.qrow__ib svg{width:11.5px;height:11.5px}
+
+/* ============ 14 · RUNTIME SELECTOR (composer · variation A) ============ */
+/* Provider/model/reasoning selector, "flat palette" anatomy from
+   runtime-selector-variations.html (chosen proposal A): one column,
+   provider filter as a 32px chip line, favorites on-row, reasoning
+   slider + ACP speed switch in a single footer line. Trigger rides
+   the composer bar at 28px (compact context — parity is anatomy,
+   not literal height). Accent budget: slider fill + selected row. */
+.rtsel{position:relative;flex:none;--spring:cubic-bezier(.3,1.35,.35,1)}
+.rtpop{
+  position:absolute;bottom:calc(100% + 8px);left:0;z-index:var(--z-menu);
+  width:320px;max-height:440px;
+  background:var(--canvas);border:1px solid var(--line-strong);border-radius:var(--radius-lg);
+  box-shadow:var(--shadow-overlay);overflow:hidden;display:flex;flex-direction:column;
+}
+.provglyph{display:grid;place-items:center;flex:none;color:var(--muted)}
+.provglyph svg{width:14px;height:14px}
+/* trigger — parity with trigger.tsx anatomy, compact 28px for the bar */
+.pmr{
+  display:inline-flex;align-items:center;gap:7px;height:28px;padding:0 9px;
+  background:var(--btn-fill);border:1px solid var(--line);border-radius:var(--radius-md);
+  user-select:none;transition:border-color var(--dur) var(--ease),background var(--dur) var(--ease);
+}
+.pmr:hover{background:var(--btn-hover);border-color:var(--line-strong)}
+.pmr[aria-expanded="true"]{border-color:var(--accent-dim)}
+.pmr__name{font-size:12px;font-weight:520;color:var(--fg-strong);max-width:150px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.pmr__chev{width:12px;height:12px;color:var(--faint);transition:transform var(--dur) var(--ease),color var(--dur) var(--ease)}
+.pmr[aria-expanded="true"] .pmr__chev{transform:rotate(180deg);color:var(--fg)}
+.pmr__bolt{display:grid;place-items:center;color:var(--accent-strong);flex:none}
+.pmr__bolt svg{width:11px;height:11px}
+/* canonical 7-bar intensity meter */
+.im{display:inline-flex;align-items:flex-end;gap:2px;height:12px}
+.im i{width:2px;border-radius:1px;background:var(--faint);opacity:.5}
+.im i[data-on]{background:var(--accent);opacity:1}
+.im[data-hollow] i{opacity:.35}
+.im i:nth-child(1){height:4px}.im i:nth-child(2){height:5px}.im i:nth-child(3){height:6.5px}.im i:nth-child(4){height:8px}
+.im i:nth-child(5){height:9.5px}.im i:nth-child(6){height:11px}.im i:nth-child(7){height:12px}
+/* search row */
+.srch{display:flex;align-items:center;gap:8px;flex:none;height:36px;border-bottom:1px solid var(--line-soft);padding:0 11px}
+.srch svg{width:13px;height:13px;color:var(--faint);flex:none}
+.srch input{flex:1;min-width:0;background:transparent;border:0;outline:none;font-size:12.5px;color:var(--fg-strong)}
+.srch input::placeholder{color:var(--faint)}
+.iconbtn{
+  display:grid;place-items:center;width:22px;height:22px;border-radius:var(--radius-sm);background:transparent;
+  color:var(--faint);flex:none;transition:background var(--dur-fast) var(--ease),color var(--dur-fast) var(--ease);
+}
+.iconbtn:hover{background:var(--row-hover);color:var(--fg-strong)}
+.iconbtn svg{width:13px;height:13px}
+.iconbtn[data-spin] svg{animation:rtspin .8s linear infinite}
+@keyframes rtspin{to{transform:rotate(360deg)}}
+/* provider filter chips */
+.chips{display:flex;align-items:center;gap:3px;flex:none;height:32px;padding:0 7px;border-bottom:1px solid var(--line-soft)}
+.chip{
+  display:grid;place-items:center;width:24px;height:24px;border-radius:var(--radius-sm);background:transparent;
+  color:var(--subtle);position:relative;transition:background var(--dur-fast) var(--ease),color var(--dur-fast) var(--ease);
+}
+.chip:hover{background:var(--row-hover);color:var(--fg)}
+.chip[data-on]{background:var(--row-selected);color:var(--fg-strong);box-shadow:inset 0 0 0 1px var(--line-strong)}
+.chip svg{width:13px;height:13px}
+.chip[data-dim]{opacity:.45}
+.chips__sep{width:1px;height:14px;background:var(--line);margin:0 3px;flex:none}
+.chips__sp{flex:1}
+.chips[data-searching] .chip{opacity:.4;pointer-events:none}
+/* model rows */
+.mlist{overflow-y:auto;padding:5px 5px 6px;flex:1;min-height:0;max-height:264px;scrollbar-width:thin;scrollbar-color:var(--line-strong) transparent}
+.ghead{
+  position:sticky;top:0;z-index:1;display:flex;align-items:center;gap:6px;padding:7px 7px 3px;background:var(--canvas);
+  font-size:9.5px;font-weight:600;letter-spacing:.05em;text-transform:uppercase;color:var(--faint);
+}
+.ghead .dotv{width:5px;height:5px;border-radius:50%;background:var(--success);margin-left:auto}
+.ghead .dotv[data-tone="warning"]{background:var(--warning)}
+.mrow{
+  display:flex;align-items:center;gap:8px;width:100%;padding:0 7px;height:28px;border-radius:var(--radius);
+  text-align:left;transition:background var(--dur-fast) var(--ease);
+}
+.mrow:hover{background:var(--row-hover)}
+.mrow[data-sel]{background:var(--accent-tint)}
+.mrow__name{font-size:12.5px;font-weight:500;color:var(--fg);overflow:hidden;text-overflow:ellipsis;white-space:nowrap;letter-spacing:-.008em}
+.mrow[data-sel] .mrow__name{color:var(--fg-strong)}
+.mrow__brain{color:var(--faint);flex:none;display:grid;place-items:center}
+.mrow__brain svg{width:11.5px;height:11.5px}
+.mrow__sp{flex:1}
+.mrow__un{font-size:10.5px;color:var(--warning);white-space:nowrap;flex:none}
+.mrow__check{color:var(--accent-strong);flex:none;display:none}
+.mrow__check svg{width:12px;height:12px}
+.mrow[data-sel] .mrow__check{display:grid}
+.mrow__star{
+  display:grid;place-items:center;width:18px;height:18px;border-radius:var(--radius-xs);
+  color:var(--faint);flex:none;opacity:0;transition:opacity var(--dur-fast) var(--ease),color var(--dur-fast) var(--ease);
+}
+.mrow:hover .mrow__star{opacity:1}
+.mrow__star[data-fav]{opacity:1;color:var(--warning)}
+.mrow__star svg{width:11.5px;height:11.5px}
+.mrow__star[data-fav] svg{fill:currentColor}
+.rtempty{padding:26px 18px;text-align:center;font-size:12px;color:var(--subtle);line-height:1.55}
+.customrow{
+  display:flex;align-items:center;gap:8px;margin:4px 2px 2px;padding:7px 9px;width:calc(100% - 4px);
+  border:1px dashed var(--line-strong);border-radius:var(--radius);font-size:12px;color:var(--muted);text-align:left;
+  transition:border-color var(--dur) var(--ease),color var(--dur) var(--ease);
+}
+.customrow:hover{border-color:var(--accent-dim);color:var(--fg-strong)}
+.customrow svg{width:11px;height:11px;flex:none}
+.customrow .mono{font-size:11px;color:var(--fg)}
+/* reasoning slider (.rz) — quiet control: 16px track, 20px thumb,
+   accent only on the fill (locked reasoning-slider contract) */
+.rz{--rz-h:16px;--rz-thumb:20px;position:relative;touch-action:none;user-select:none;flex:1;min-width:0}
+.rz__track{position:relative;height:24px;cursor:pointer;border-radius:var(--radius);outline:none}
+.rz__rail{
+  position:absolute;left:0;right:0;top:50%;height:var(--rz-h);transform:translateY(-50%);
+  border-radius:var(--radius-pill);background:var(--canvas-soft);box-shadow:inset 0 0 0 1px var(--line-soft);
+}
+.rz__fill{position:absolute;top:2px;bottom:2px;left:2px;border-radius:var(--radius-pill);background:var(--accent);transition:width 260ms var(--spring)}
+.rz[data-unset] .rz__fill{background:var(--btn-fill)}
+.rz[data-drag] .rz__fill{transition:none}
+.rz__dot{position:absolute;top:50%;width:3px;height:3px;border-radius:50%;background:var(--faint);transform:translate(-50%,-50%)}
+.rz__thumb{
+  position:absolute;top:50%;width:var(--rz-thumb);height:var(--rz-thumb);border-radius:50%;background:var(--fg-strong);
+  box-shadow:0 0 0 2px var(--canvas);transform:translateY(-50%);transition:left 260ms var(--spring);
+}
+.rz[data-drag] .rz__thumb{transition:none;transform:translateY(-50%) scale(1.05)}
+.rz__tip{
+  position:absolute;bottom:calc(100% + 3px);transform:translateX(-50%);font-family:var(--font-mono);font-size:9.5px;
+  color:var(--fg);background:var(--elevated);border:1px solid var(--line-strong);border-radius:var(--radius-xs);
+  padding:1px 5px;white-space:nowrap;opacity:0;pointer-events:none;transition:opacity var(--dur-fast) var(--ease),left 260ms var(--spring);
+}
+.rz[data-drag] .rz__tip{transition:opacity var(--dur-fast) var(--ease)}
+.rz__track:hover .rz__tip,.rz[data-drag] .rz__tip,.rz__track:focus-visible .rz__tip{opacity:1}
+/* footer line: reasoning + speed in one pass */
+.rzline{display:flex;align-items:center;gap:10px;flex:none;height:44px;padding:0 12px;border-top:1px solid var(--line-soft);background:var(--canvas)}
+.rzline .eyebrow{font-size:9.5px;flex:none;letter-spacing:.05em}
+.rznote{display:flex;align-items:center;gap:8px;flex:none;height:38px;padding:0 12px;border-top:1px solid var(--line-soft);font-size:11.5px;color:var(--subtle)}
+.rznote>svg{width:12.5px;height:12.5px;color:var(--faint);flex:none}
+.rznote__sp{flex:1}
+/* ACP speed switch (PR #267: speed normal|fast) — bolt rides the thumb */
+.spdsw{display:inline-flex;align-items:center;gap:7px;height:24px;padding:0;background:transparent;flex:none;user-select:none}
+.spdsw__lbl{font-size:11px;font-weight:560;color:var(--subtle);letter-spacing:-.005em;transition:color var(--dur) var(--ease)}
+.spdsw:hover .spdsw__lbl{color:var(--fg)}
+.spdsw[aria-checked="true"] .spdsw__lbl{color:var(--fg-strong)}
+.spdsw__track{
+  position:relative;width:40px;height:22px;border-radius:var(--radius-pill);background:var(--canvas-soft);
+  box-shadow:inset 0 0 0 1px var(--line-soft);flex:none;transition:background 260ms var(--ease),box-shadow 260ms var(--ease);
+}
+.spdsw[aria-checked="true"] .spdsw__track{background:var(--accent-tint-strong);box-shadow:inset 0 0 0 1px var(--accent-dim)}
+.spdsw__thumb{
+  position:absolute;top:2px;left:2px;width:18px;height:18px;border-radius:var(--radius-pill);
+  display:grid;place-items:center;background:var(--elevated);color:var(--faint);
+  box-shadow:0 0 0 1px var(--line-strong),0 1px 2px rgba(0,0,0,.35);
+  transition:transform 300ms var(--spring),width 160ms var(--ease),background 260ms var(--ease),color 260ms var(--ease);
+}
+.spdsw[aria-checked="true"] .spdsw__thumb{transform:translateX(18px);background:var(--fg-strong);color:var(--accent)}
+.spdsw:not([disabled]):active .spdsw__thumb{width:22px}
+.spdsw[aria-checked="true"]:not([disabled]):active .spdsw__thumb{transform:translateX(14px)}
+.spdsw__thumb svg{width:12px;height:12px}
+.spdsw[data-anim] .spdsw__thumb svg{animation:boltzap 420ms var(--spring)}
+@keyframes boltzap{0%{transform:scale(.6) rotate(-14deg)}55%{transform:scale(1.2) rotate(7deg)}100%{transform:scale(1) rotate(0deg)}}
+.spdsw[disabled]{opacity:.4;cursor:not-allowed;pointer-events:none}
+@media (prefers-reduced-motion:reduce){
+  .spdsw__thumb,.spdsw__track,.rz__fill,.rz__thumb,.rz__tip{transition:none}
+  .spdsw[data-anim] .spdsw__thumb svg{animation:none}
+}

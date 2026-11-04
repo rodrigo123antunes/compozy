@@ -1,0 +1,71 @@
+import { createStreamEventSource } from "@/lib/ticketed-event-source";
+
+const TRANSCRIPT_SNAPSHOT_EVENT = "transcript_snapshot";
+const TRANSCRIPT_DELTA_EVENT = "transcript_delta";
+const GOAL_SNAPSHOT_CHANGED_EVENT = "goal_snapshot_changed";
+const SESSION_COMMANDS_CHANGED_EVENT = "session_commands_changed";
+const SESSION_STOPPED_EVENT = "session_stopped";
+const SESSION_DONE_EVENT = "done";
+/** A slow watcher was shed (task_04); the server replays the gap on this stream right after. */
+const STREAM_CONSUMER_DEGRADED_EVENT = "stream.consumer_degraded";
+/** The parent's subagent roster: the full rows after subscribe, then one row per change (L-017). */
+const SUBAGENTS_SNAPSHOT_EVENT = "subagents_snapshot";
+const SUBAGENT_UPDATED_EVENT = "subagent_updated";
+
+export interface SessionStreamEventSource {
+  addEventListener: (type: string, listener: EventListenerOrEventListenerObject) => void;
+  removeEventListener?: (type: string, listener: EventListenerOrEventListenerObject) => void;
+  close: () => void;
+  onmessage: ((event: MessageEvent) => void) | null;
+  onerror: ((event: Event) => void) | null;
+}
+
+export type SessionStreamEventSourceFactory = (url: string) => SessionStreamEventSource;
+
+export interface SessionStreamListeners {
+  commandsChanged: EventListener;
+  usageChanged: EventListener;
+  degraded: EventListener;
+  delta: EventListener;
+  goalSnapshot: EventListener;
+  snapshot: EventListener;
+  subagentsSnapshot: EventListener;
+  subagentUpdated: EventListener;
+  terminal: EventListener;
+}
+
+export function defaultEventSourceFactory(url: string): SessionStreamEventSource {
+  return createStreamEventSource(url);
+}
+
+export function attachSessionStreamSource(
+  source: SessionStreamEventSource,
+  handleError: (event: Event) => void,
+  listeners: SessionStreamListeners
+): () => void {
+  source.onmessage = null;
+  source.onerror = handleError;
+  source.addEventListener(TRANSCRIPT_SNAPSHOT_EVENT, listeners.snapshot);
+  source.addEventListener(TRANSCRIPT_DELTA_EVENT, listeners.delta);
+  source.addEventListener(GOAL_SNAPSHOT_CHANGED_EVENT, listeners.goalSnapshot);
+  source.addEventListener(SESSION_COMMANDS_CHANGED_EVENT, listeners.commandsChanged);
+  source.addEventListener("session_usage_changed", listeners.usageChanged);
+  source.addEventListener(SESSION_STOPPED_EVENT, listeners.terminal);
+  source.addEventListener(SESSION_DONE_EVENT, listeners.terminal);
+  source.addEventListener(STREAM_CONSUMER_DEGRADED_EVENT, listeners.degraded);
+  source.addEventListener(SUBAGENTS_SNAPSHOT_EVENT, listeners.subagentsSnapshot);
+  source.addEventListener(SUBAGENT_UPDATED_EVENT, listeners.subagentUpdated);
+  return () => {
+    if (!source.removeEventListener) return;
+    source.removeEventListener(TRANSCRIPT_SNAPSHOT_EVENT, listeners.snapshot);
+    source.removeEventListener(TRANSCRIPT_DELTA_EVENT, listeners.delta);
+    source.removeEventListener(GOAL_SNAPSHOT_CHANGED_EVENT, listeners.goalSnapshot);
+    source.removeEventListener(SESSION_COMMANDS_CHANGED_EVENT, listeners.commandsChanged);
+    source.removeEventListener("session_usage_changed", listeners.usageChanged);
+    source.removeEventListener(SESSION_STOPPED_EVENT, listeners.terminal);
+    source.removeEventListener(SESSION_DONE_EVENT, listeners.terminal);
+    source.removeEventListener(STREAM_CONSUMER_DEGRADED_EVENT, listeners.degraded);
+    source.removeEventListener(SUBAGENTS_SNAPSHOT_EVENT, listeners.subagentsSnapshot);
+    source.removeEventListener(SUBAGENT_UPDATED_EVENT, listeners.subagentUpdated);
+  };
+}

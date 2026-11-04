@@ -1,0 +1,130 @@
+package daemon
+
+import (
+	"context"
+	"errors"
+	"fmt"
+
+	compozyconfig "github.com/compozy/compozy/internal/config"
+
+	extensionpkg "github.com/compozy/compozy/internal/extension"
+
+	"github.com/compozy/compozy/internal/support"
+)
+
+func extensionRuntimeHasRegisteredEntries(
+	ctx context.Context,
+	registry *extensionpkg.Registry,
+	runtime extensionRuntime,
+) bool {
+	if ctx == nil || registry == nil || runtime == nil {
+		return false
+	}
+	if err := ctx.Err(); err != nil {
+		return false
+	}
+
+	infos, err := registry.List()
+	if err != nil {
+		return false
+	}
+
+	for infoIndex := range infos {
+		if !infos[infoIndex].Enabled {
+			continue
+		}
+
+		ext, err := runtime.Get(infos[infoIndex].Name)
+		if err != nil || ext == nil {
+			continue
+		}
+		if ext.Status.Registered {
+			return true
+		}
+	}
+
+	return false
+}
+
+func (d *Daemon) bootServers(ctx context.Context, state *bootState, cleanup *bootCleanup) error {
+	httpServer, err := d.httpFactory(ctx, state.deps)
+	if err != nil {
+		return fmt.Errorf("daemon: create http server: %w", err)
+	}
+	if err := httpServer.Start(ctx); err != nil {
+		return fmt.Errorf("daemon: start http server: %w", err)
+	}
+	cleanup.add(func(ctx context.Context) error {
+		return httpServer.Shutdown(ctx)
+	})
+
+	udsServer, err := d.udsFactory(ctx, state.deps)
+	if err != nil {
+		return fmt.Errorf("daemon: create uds server: %w", err)
+	}
+	if err := udsServer.Start(ctx); err != nil {
+		return fmt.Errorf("daemon: start uds server: %w", err)
+	}
+	cleanup.add(func(ctx context.Context) error {
+		return udsServer.Shutdown(ctx)
+	})
+
+	info := Info{
+		HTTPHost:  state.cfg.HTTP.Host,
+		PID:       d.pid(),
+		Port:      resolveDaemonPort(state.cfg.HTTP.Port, httpServer),
+		StartedAt: state.startedAt,
+	}
+	state.httpServer = httpServer
+	state.udsServer = udsServer
+	state.info = info
+	return nil
+}
+
+func (d *Daemon) bootSupportBundles(state *bootState, cleanup *bootCleanup) error {
+	if state == nil {
+		return errors.New("daemon: boot support bundles state is required")
+	}
+	if cleanup == nil {
+		return errors.New("daemon: boot support bundles cleanup is required")
+	}
+	configSnapshot := support.ConfigSnapshotFunc(nil)
+	if activeSettings, ok := state.deps.Settings.(interface {
+		ActiveConfig(context.Context) (compozyconfig.Config, error)
+	}); ok {
+		configSnapshot = func(ctx context.Context) (compozyconfig.Config, error) {
+			return activeSettings.ActiveConfig(ctx)
+		}
+	}
+	snapshots := d.supportBundleSnapshotHandlers(state)
+	service := support.NewService(&support.Builder{
+		HomePaths:      d.homePaths,
+		Config:         state.cfg,
+		ConfigSnapshot: configSnapshot,
+		Now:            d.now,
+		Sources: support.Sources{
+			Status: func(ctx context.Context) (any, error) {
+				return snapshots.StatusSnapshot(ctx)
+			},
+			Doctor: func(ctx context.Context) (any, error) {
+				return snapshots.DoctorSnapshot(ctx)
+			},
+			Providers: func(ctx context.Context) (any, error) {
+				return snapshots.ProviderListSnapshot(ctx)
+			},
+			ConfigApplyRecords: func(ctx context.Context) (any, error) {
+				return snapshots.ConfigApplyRecordsSnapshot(ctx)
+			},
+			EventSummaries: func(ctx context.Context) (any, error) {
+				return snapshots.EventSummariesSnapshot(ctx)
+			},
+			Sessions: func(ctx context.Context) (any, error) {
+				return snapshots.SessionsSnapshot(ctx)
+			},
+		},
+	})
+	state.supportBundles = service
+	state.deps.SupportBundles = service
+	cleanup.add(service.Shutdown)
+	return nil
+}

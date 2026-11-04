@@ -1,0 +1,278 @@
+package acp
+
+import (
+	"context"
+	"crypto/sha256"
+	"fmt"
+	"log/slog"
+	"os/exec"
+	"sync"
+	"time"
+
+	acpsdk "github.com/coder/acp-go-sdk"
+	compozyconfig "github.com/compozy/compozy/internal/config"
+	"github.com/compozy/compozy/internal/mcpbridge"
+	speedpkg "github.com/compozy/compozy/internal/speed"
+	"github.com/compozy/compozy/internal/subprocess"
+	"github.com/compozy/compozy/internal/toolruntime"
+)
+
+// AgentProcess represents one running ACP-backed agent subprocess.
+type AgentProcess struct {
+	modeProviderName string
+	executionPolicy  string
+	PID              int
+	AgentName        string
+	Command          string
+	Args             []string
+	Cwd              string
+	SessionID        string
+	StartedAt        time.Time
+	KernelToken      string
+
+	capsMu          sync.RWMutex
+	caps            Caps
+	configRevision  uint64
+	runtimeConfigMu sync.Mutex
+	managed         *subprocess.Process
+	handle          Handle
+	toolHostMu      sync.Mutex
+	toolHost        ToolHost
+	toolGateway     ToolExecutionGateway
+	cmd             *exec.Cmd
+	conn            *acpsdk.Connection
+	stderr          *lockedBuffer
+	processCtx      context.Context
+	cancelProcess   context.CancelFunc
+	permissions     permissionPolicy
+	terminals       *terminalManager
+	terminalCore    TerminalHost
+	terminalScope   LocalTerminalScope
+	processRegistry *toolruntime.Registry
+	processRecord   *toolruntime.Handle
+
+	// sessionMCP is the session/new and session/load MCP payload; mcpBridges
+	// are the loopback HTTP bridges this process owns until it exits.
+	sessionMCPMu     sync.Mutex
+	sessionMCP       []acpsdk.McpServer
+	hostedIdentity   hostedToolIdentity
+	mcpBridges       []*mcpbridge.Bridge
+	mcpBridgesClosed bool
+
+	terminalProcessMu sync.Mutex
+	terminalProcesses map[string]*toolruntime.Handle
+	toolPrecheckMu    sync.Mutex
+	toolPrechecks     []providerNativeToolPrecheck
+
+	waitMu        sync.RWMutex
+	waitErr       error
+	done          chan struct{}
+	stopRequested bool
+	stopMu        sync.RWMutex
+
+	permissionDenials *PermissionDenials
+	reviewerMode      string
+	providerName      string
+	providerAuthMode  compozyconfig.ProviderAuthMode
+	providerFailureMu sync.Mutex
+	providerFailures  map[string]ProviderErrorDiagnostic
+
+	logger       *slog.Logger
+	compactionMu sync.Mutex
+	compactions  map[string]*compactionState
+	// compactionTerminalOrder lists retained terminal compactions oldest first;
+	// retiredCompactions keeps only the ids of evicted ones so late updates drop.
+	compactionTerminalOrder []string
+	retiredCompactions      map[string]struct{}
+	unknownUpdates          map[string]struct{}
+	usageAliasWarning       sync.Once
+	usageRangeWarning       sync.Once
+	triagePolicyErr         error // Protected by promptMu; a mode violation permanently fences new prompts.
+	promptMu                sync.RWMutex
+	activePrompt            *activePromptState
+
+	pendingPermissionMu    sync.Mutex
+	pendingPermissions     map[string]*pendingPermission
+	permissionRequestSeq   uint64
+	permissionTimeout      time.Duration
+	permissionWaitResolver PermissionWaitResolver
+	hostedApprovals        hostedApprovals
+	hostedAnnounced        hostedAnnouncements
+	compozySessionID       string
+	controlTimeout         time.Duration
+
+	systemPromptMu       sync.Mutex
+	systemPrompt         string
+	systemPromptSent     bool
+	deliveredSections    map[string][sha256.Size]byte
+	systemPromptDelivery SystemPromptDeliveryMode
+	startupManifest      StartupManifest
+	promptCacheControl   *promptCacheControl
+
+	childTasksMu      sync.Mutex
+	childTasks        map[*processChildTask]struct{}
+	childTasksClosing bool
+
+	// sessionRoutes routes inbound ACP traffic by session id; forkMu serializes
+	// session/fork calls so at most one fork capture is open (ADR-003).
+	sessionRoutes sessionRouter
+	forkMu        sync.Mutex
+
+	// claudeTasks correlates Claude SDK task messages to native Agent/Task calls.
+	claudeTasks claudeTaskTracker
+}
+
+type pendingPermission struct {
+	requestID          string
+	turnID             string
+	response           chan permissionDecision
+	supportedDecisions map[permissionDecision]struct{}
+	resolvedBy         string
+}
+
+// Done returns a channel that closes when the subprocess exits.
+func (p *AgentProcess) Done() <-chan struct{} {
+	return p.done
+}
+
+// Wait blocks until the subprocess exits and returns its final error state.
+func (p *AgentProcess) Wait() error {
+	<-p.Done()
+	p.waitMu.RLock()
+	defer p.waitMu.RUnlock()
+	return p.waitErr
+}
+
+// Stderr returns the currently captured stderr output for the subprocess.
+func (p *AgentProcess) Stderr() string {
+	if p.handle != nil {
+		return p.handle.Stderr()
+	}
+	if p.managed != nil {
+		return p.managed.Stderr()
+	}
+	if p.stderr == nil {
+		return ""
+	}
+	return p.stderr.String()
+}
+
+// ExitStatus returns the OS exit facts exposed by the underlying process handle.
+func (p *AgentProcess) ExitStatus() (subprocess.ExitStatus, bool) {
+	if p == nil {
+		return subprocess.ExitStatus{}, false
+	}
+	if provider, ok := p.handle.(interface {
+		ExitStatus() (subprocess.ExitStatus, bool)
+	}); ok {
+		return provider.ExitStatus()
+	}
+	if p.managed != nil {
+		return p.managed.ExitStatus()
+	}
+	if p.cmd != nil {
+		return subprocess.ExitStatusFromProcessState(p.cmd.ProcessState)
+	}
+	return subprocess.ExitStatus{}, false
+}
+
+// HealthState returns the latest managed subprocess health snapshot.
+func (p *AgentProcess) HealthState() subprocess.HealthState {
+	if p == nil || p.managed == nil {
+		return subprocess.HealthState{}
+	}
+	return p.managed.HealthState()
+}
+
+// CapsSnapshot returns the latest ACP capability/config snapshot.
+func (p *AgentProcess) CapsSnapshot() Caps {
+	if p == nil {
+		return Caps{}
+	}
+	p.capsMu.RLock()
+	defer p.capsMu.RUnlock()
+	caps := CloneCaps(p.caps)
+	caps.PermissionModeDegraded = p.permissionModeDegraded(caps)
+	return caps
+}
+
+func (p *AgentProcess) setCaps(caps Caps) {
+	if p == nil {
+		return
+	}
+	p.capsMu.Lock()
+	defer p.capsMu.Unlock()
+	p.caps = CloneCaps(caps)
+	p.configRevision++
+}
+
+func (p *AgentProcess) setConfigOptions(options []SessionConfigOption) {
+	if p == nil {
+		return
+	}
+	p.capsMu.Lock()
+	defer p.capsMu.Unlock()
+	p.setConfigOptionsLocked(options)
+}
+
+func (p *AgentProcess) setConfigOptionsLocked(options []SessionConfigOption) {
+	p.configRevision++
+	p.caps.ConfigOptions = preserveSyntheticModelConfigOption(p.caps.ConfigOptions, options)
+	if resolution := p.caps.SpeedResolution; resolution != nil {
+		p.caps.SpeedResolution = ResolveCurrentSpeed(resolution.Requested, p.caps.ConfigOptions)
+	}
+}
+
+func (p *AgentProcess) setSpeedResolution(resolution *speedpkg.Resolution) {
+	if p == nil {
+		return
+	}
+	p.capsMu.Lock()
+	defer p.capsMu.Unlock()
+	p.caps.SpeedResolution = speedpkg.CloneResolution(resolution)
+	if resolution != nil && resolution.Status == speedpkg.ResolutionApplied {
+		p.caps.SpeedResolution = ResolveCurrentSpeed(resolution.Requested, p.caps.ConfigOptions)
+	}
+}
+
+// ToolHost returns the local tool host used by this process.
+func (p *AgentProcess) ToolHost() ToolHost {
+	if p == nil {
+		return nil
+	}
+	p.toolHostMu.Lock()
+	defer p.toolHostMu.Unlock()
+	return p.toolHost
+}
+
+func (p *AgentProcess) setWaitError(err error) {
+	p.waitMu.Lock()
+	defer p.waitMu.Unlock()
+	p.waitErr = err
+}
+
+func (p *AgentProcess) stopWasRequested() bool {
+	p.stopMu.RLock()
+	defer p.stopMu.RUnlock()
+	return p.stopRequested
+}
+
+func (p *AgentProcess) markStopRequested() {
+	p.stopMu.Lock()
+	defer p.stopMu.Unlock()
+	p.stopRequested = true
+}
+
+func (p *AgentProcess) checkpointProcessOwner(ctx context.Context) error {
+	if p == nil || p.processRecord == nil {
+		return nil
+	}
+	if err := p.processRecord.Checkpoint(ctx, toolruntime.ProcessCheckpoint{
+		Owner: &toolruntime.ProcessOwner{
+			SessionID: p.SessionID,
+		},
+	}); err != nil {
+		return fmt.Errorf("acp: checkpoint process owner: %w", err)
+	}
+	return nil
+}

@@ -4,401 +4,416 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"os"
-	"strings"
+	"log/slog"
+
+	"sync"
 	"time"
 
+	core "github.com/compozy/compozy/internal/api/core"
+	attachmentspkg "github.com/compozy/compozy/internal/attachments"
+	"github.com/compozy/compozy/internal/cmdpalette"
+
 	compozyconfig "github.com/compozy/compozy/internal/config"
+	"github.com/compozy/compozy/internal/deadentity"
+	extensionpkg "github.com/compozy/compozy/internal/extension"
+	"github.com/compozy/compozy/internal/extensioninput"
+	"github.com/compozy/compozy/internal/extensionmcp"
+	"github.com/compozy/compozy/internal/gateway"
+	"github.com/compozy/compozy/internal/heartbeat"
+	hookspkg "github.com/compozy/compozy/internal/hooks"
+	looppkg "github.com/compozy/compozy/internal/loop"
+	marketplacepkg "github.com/compozy/compozy/internal/marketplace"
+	mcppkg "github.com/compozy/compozy/internal/mcp"
+	mcpauth "github.com/compozy/compozy/internal/mcp/auth"
+	monitorpkg "github.com/compozy/compozy/internal/monitor"
+	"github.com/compozy/compozy/internal/profile"
+	"github.com/compozy/compozy/internal/sessionprocess"
+
+	"github.com/compozy/compozy/internal/resources"
+
+	"github.com/compozy/compozy/internal/agentmemory"
+	"github.com/compozy/compozy/internal/session"
+	terminalpkg "github.com/compozy/compozy/internal/terminal"
+
+	"github.com/compozy/compozy/internal/situation"
+	"github.com/compozy/compozy/internal/skills"
+	"github.com/compozy/compozy/internal/soul"
+
+	"github.com/compozy/compozy/internal/toolruntime"
+	toolspkg "github.com/compozy/compozy/internal/tools"
+	"github.com/compozy/compozy/internal/vault"
+	workspacepkg "github.com/compozy/compozy/internal/workspace"
+	"github.com/compozy/compozy/internal/workspaceaccess"
+	"github.com/compozy/compozy/internal/worktree"
 )
-
-var acquireDaemonLock = func(path string, pid int, processAlive func(int) bool) (*Lock, error) {
-	return acquireLock(path, pid, lockDeps{
-		processAlive: processAlive,
-	})
-}
-
-var resolveDaemonHomePaths = compozyconfig.ResolveHomePaths
-
-// StartOutcome describes the bootstrap result for one daemon start attempt.
-type StartOutcome string
 
 const (
-	StartOutcomeStarted        StartOutcome = "started"
-	StartOutcomeAlreadyRunning StartOutcome = "already_running"
+	bootNameKey   = "name"
+	bootSourceKey = "source"
 )
 
-// StartOptions control daemon bootstrap behavior.
-type StartOptions struct {
-	HomePaths    compozyconfig.HomePaths
-	Version      string
-	PID          int
-	HTTPPort     int
-	Now          func() time.Time
-	ProcessAlive func(int) bool
-	Healthy      func(context.Context, Info) error
-	Prepare      func(context.Context, *Host) error
+type bootState struct {
+	agentInstances      *core.AgentInstanceAPI
+	subagents           session.SubagentService
+	cfg                 compozyconfig.Config
+	logger              *slog.Logger
+	closeLogger         func() error
+	lock                *Lock
+	harnessResolver     *HarnessContextResolver
+	harnessRecorder     *harnessLifecycleRecorder
+	runtimeWorkers      daemonRuntimeWorkers
+	skillsRegistry      *skills.Registry
+	mcpResolver         *skills.MCPResolver
+	situationContext    *situation.Service
+	promptAssembler     session.PromptAssembler
+	startupOverlay      session.StartupPromptOverlay
+	promptAugmenter     session.PromptInputAugmenter
+	commandService      session.CommandService
+	notifier            *hooksNotifier
+	registry            Registry
+	profiles            *profile.Manager
+	deadEntities        *deadentity.Service
+	loopTargetHealth    *loopTargetHealthSlot
+	processRegistry     *toolruntime.Registry
+	terminals           *terminalpkg.Service
+	terminalPermissions *terminalPermissionBridge
+	workspaceResolver   *workspacepkg.Resolver
+	worktrees           *worktree.Service
+	windowManagerBootState
+	sessions              SessionManager
+	sessionWakeBridge     *sessionWakeBridge
+	sessionMonitors       *monitorpkg.Service
+	monitorPullRequests   *sessionMonitorPullRequests
+	sessionWatchGate      chan struct{}
+	sessionProcesses      *sessionprocess.Service
+	hostedMCP             *mcppkg.HostedService
+	providerVault         *vault.Service
+	modelCatalog          *modelCatalogRuntime
+	providerUsage         *providerUsageRuntime
+	marketplace           *marketplaceRuntime
+	marketplaceNotifier   marketplacepkg.Notifier
+	tasks                 *taskRuntime
+	subprocessHealth      *subprocessHealthEscalator
+	reviewRequests        *runReviewRequestedForwarder
+	spawnReaper           *spawnReaper
+	scheduler             *schedulerRuntime
+	coordinator           *coordinatorRuntime
+	gateway               gateway.Policy
+	gatewayVerifier       *gateway.EndpointVerifier
+	accessPolicy          workspaceaccess.Policy
+	accessConsent         *workspaceAccessConsentCache
+	toolRegistry          toolspkg.Registry
+	mcpToolProvider       daemonMCPToolProvider
+	toolArtifacts         toolspkg.ToolArtifactStore
+	sessionAttachments    attachmentspkg.Store
+	toolsets              core.ToolsetRegistry
+	toolApprovals         toolspkg.ApprovalTokenIssuer
+	approvalCoordinator   toolspkg.ApprovalCoordinator
+	cmdPalette            cmdpalette.Registry
+	viewPatches           *extensionCmdPaletteProvider
+	clarify               *clarifyBridge
+	observer              Observer
+	lifecycleObservers    *sessionLifecycleFanout
+	hookTelemetrySinks    *hookTelemetryFanout
+	hooks                 hookRuntime
+	hookDispatcher        *hookspkg.Hooks
+	hookBindings          hookBindingPublisher
+	resourceKernel        *resources.Kernel
+	resourceCodecs        *resources.CodecRegistry
+	agentMemory           *agentmemory.Store
+	agentCatalog          *resourceCatalog[compozyconfig.AgentDef]
+	roleResolver          *roleResolver
+	soulCatalog           *resourceCatalog[soul.ResourceSpec]
+	heartbeatCatalog      *resourceCatalog[heartbeat.ResourceSpec]
+	toolCatalog           *resourceCatalog[toolspkg.Tool]
+	mcpServerCatalog      *resourceCatalog[compozyconfig.MCPServer]
+	extensionEnvBindings  extensionpkg.EnvBindingStore
+	extensionInputs       extensioninput.Store
+	extensionMCP          extensionmcp.Store
+	mcpAuthGeneration     *mcpauth.MutationGeneration
+	mcpAuthStatus         toolspkg.MCPAuthStatusProvider
+	mcpRuntimeHealth      *mcppkg.RuntimeHealthRegistry
+	mcpStdioPool          *mcppkg.StdioSessionPool
+	toolProjectionEpoch   *mcppkg.ProjectionEpoch
+	agentProbeConfig      *agentProbeConfigState
+	loopCatalog           *resourceCatalog[looppkg.ResourceSpec]
+	agentSkillResources   agentSkillPublisher
+	toolMCPResources      toolMCPPublisher
+	loopResources         loopResourcePublisher
+	extensionKitResources extensionKitResourcePublisher
+	extMu                 sync.RWMutex
+	extensions            extensionRuntime
+	resourceReconcile     resources.ReconcileDriver
+	automation            automationRuntime
+	supportBundles        supportBundleShutdowner
+	updateManager         settingsUpdateManager
+	backgroundUpdates     *backgroundUpdateRuntime
+	httpServer            Server
+	udsServer             Server
+	skillsCancel          context.CancelFunc
+	skillsDone            chan struct{}
+	loopsCancel           context.CancelFunc
+	loopsDone             chan struct{}
+	goalOutboxCancel      context.CancelFunc
+	goalOutboxDone        chan struct{}
+	effectRelayCancel     context.CancelFunc
+	effectRelayDone       chan struct{}
+	startedAt             time.Time
+	info                  Info
+	deps                  RuntimeDeps
+
+	sessionWindowReconciler session.WindowReconciler
 }
 
-// StartResult captures the result of a daemon bootstrap attempt.
-type StartResult struct {
-	Outcome StartOutcome
-	Paths   compozyconfig.HomePaths
-	Info    Info
-	Host    *Host
+type daemonMCPToolProvider interface {
+	ForgetMCPServer(workspaceID string, serverName string)
+	ForgetWorkspace(workspaceID string)
 }
 
-// Status captures the last known daemon readiness view.
-type Status struct {
-	Paths   compozyconfig.HomePaths
-	State   ReadyState
-	Healthy bool
-	Info    *Info
-}
-
-// Host owns one daemon bootstrap instance and its singleton lock.
-type Host struct {
-	paths        compozyconfig.HomePaths
-	lock         *Lock
-	info         Info
-	now          func() time.Time
-	processAlive func(int) bool
-	healthy      func(context.Context, Info) error
-}
-
-// Start bootstraps the daemon home layout, acquires singleton ownership, and marks readiness.
-func Start(ctx context.Context, opts StartOptions) (_ StartResult, retErr error) {
+// boot completes migrations, required services, and restart reconciliation before publishing readiness.
+func (d *Daemon) boot(ctx context.Context) (err error) {
 	if ctx == nil {
-		ctx = context.Background()
+		return errors.New("daemon: boot context is required")
 	}
 
-	resolved, err := normalizeStartOptions(opts)
-	if err != nil {
-		return StartResult{}, err
+	if err := d.beginBoot(); err != nil {
+		return err
 	}
-	if err := compozyconfig.EnsureHomeLayout(resolved.HomePaths); err != nil {
-		return StartResult{}, fmt.Errorf("daemon: ensure home layout: %w", err)
+	ctx = d.admission.BeginBoot(ctx)
+	defer d.finishBoot(&err)
+
+	state := &bootState{
+		mcpAuthGeneration:   mcpauth.NewMutationGeneration(),
+		toolProjectionEpoch: mcppkg.NewProjectionEpoch(),
+	}
+	cleanup := &bootCleanup{}
+	defer cleanup.run(ctx, &err)
+
+	if err := d.bootComponents(ctx, state, cleanup); err != nil {
+		return err
+	}
+	if err := d.publishDaemonInfo(state, cleanup); err != nil {
+		return err
+	}
+	if err := d.startBackgroundUpdates(ctx, state, cleanup); err != nil {
+		return err
+	}
+	if err := d.reconcileSupersededRestarts(); err != nil {
+		state.logger.WarnContext(ctx, "daemon: reconcile abandoned restart observations", "error", err)
+	}
+	if err := d.markRestartReadyIfRequested(state.info); err != nil {
+		return err
 	}
 
-	lock, err := acquireDaemonLock(resolved.HomePaths.LockPath, resolved.PID, resolved.ProcessAlive)
-	if err != nil {
-		info, alreadyRunning := existingHealthyDaemonInfo(ctx, resolved.HomePaths.InfoPath, resolved.Healthy)
-		if alreadyRunning {
-			return StartResult{
-				Outcome: StartOutcomeAlreadyRunning,
-				Paths:   resolved.HomePaths,
-				Info:    info,
-			}, nil
-		}
-		return StartResult{}, err
-	}
-
-	host := &Host{
-		paths:        resolved.HomePaths,
-		lock:         lock,
-		now:          resolved.Now,
-		processAlive: resolved.ProcessAlive,
-		healthy:      resolved.Healthy,
-	}
-	defer func() {
-		if retErr == nil {
-			return
-		}
-		retErr = errors.Join(retErr, host.Close(context.Background()))
-	}()
-
-	if err := host.cleanupStaleRuntime(ctx); err != nil {
-		return StartResult{}, err
-	}
-
-	host.info = Info{
-		PID:        resolved.PID,
-		Version:    strings.TrimSpace(resolved.Version),
-		SocketPath: resolved.HomePaths.SocketPath,
-		HTTPPort:   resolved.HTTPPort,
-		StartedAt:  resolved.Now().UTC(),
-		State:      ReadyStateStarting,
-	}
-	if err := WriteInfo(host.paths.InfoPath, host.info); err != nil {
-		return StartResult{}, fmt.Errorf("daemon: write starting info: %w", err)
-	}
-
-	if resolved.Prepare != nil {
-		if err := resolved.Prepare(ctx, host); err != nil {
-			return StartResult{}, fmt.Errorf("daemon: prepare startup: %w", err)
-		}
-	}
-	if err := host.MarkReady(ctx); err != nil {
-		return StartResult{}, err
-	}
-
-	return StartResult{
-		Outcome: StartOutcomeStarted,
-		Paths:   host.paths,
-		Info:    host.info,
-		Host:    host,
-	}, nil
-}
-
-// QueryStatus reports the current daemon readiness without guessing from the filesystem layout.
-func QueryStatus(ctx context.Context, paths compozyconfig.HomePaths, opts ProbeOptions) (Status, error) {
-	if ctx == nil {
-		ctx = context.Background()
-	}
-
-	resolvedPaths, processAlive, healthy, err := normalizeProbeOptions(paths, opts)
-	if err != nil {
-		return Status{}, err
-	}
-
-	info, err := ReadInfo(resolvedPaths.InfoPath)
-	if err != nil {
-		if errors.Is(err, os.ErrNotExist) {
-			return Status{Paths: resolvedPaths, State: ReadyStateStopped}, nil
-		}
-		return Status{}, err
-	}
-
-	healthyErr := healthy(ctx, info)
-	status := Status{
-		Paths:   resolvedPaths,
-		State:   info.State,
-		Healthy: healthyErr == nil,
-		Info:    &info,
-	}
-	if !processAlive(info.PID) {
-		status.State = ReadyStateStopped
-		status.Healthy = false
-	}
-
-	return status, nil
-}
-
-// ProbeOptions control readiness checks for an existing daemon instance.
-type ProbeOptions struct {
-	ProcessAlive func(int) bool
-	Healthy      func(context.Context, Info) error
-}
-
-// Paths returns the home-scoped daemon paths for this host.
-func (h *Host) Paths() compozyconfig.HomePaths {
-	if h == nil {
-		return compozyconfig.HomePaths{}
-	}
-	return h.paths
-}
-
-// Info returns the current persisted daemon discovery info for this host.
-func (h *Host) Info() Info {
-	if h == nil {
-		return Info{}
-	}
-	return h.info
-}
-
-// MarkReady persists the ready state once startup preparation is complete.
-func (h *Host) MarkReady(_ context.Context) error {
-	if h == nil {
-		return errors.New("daemon: host is required")
-	}
-	h.info.State = ReadyStateReady
-	if err := WriteInfo(h.paths.InfoPath, h.info); err != nil {
-		return fmt.Errorf("daemon: write ready info: %w", err)
-	}
+	d.publishBootState(state)
 	return nil
 }
 
-// SetHTTPPort persists the effective HTTP port once the transport listener binds.
-func (h *Host) SetHTTPPort(_ context.Context, port int) error {
-	if h == nil {
-		return errors.New("daemon: host is required")
-	}
-	if port < 0 || port > 65535 {
-		return fmt.Errorf("daemon: daemon http port must be between 0 and 65535: %d", port)
-	}
-
-	h.info.HTTPPort = port
-	if err := WriteInfo(h.paths.InfoPath, h.info); err != nil {
-		return fmt.Errorf("daemon: write daemon info with http port: %w", err)
-	}
-	return nil
-}
-
-// Close removes daemon discovery state and releases singleton ownership.
-func (h *Host) Close(_ context.Context) error {
-	if h == nil {
-		return nil
-	}
-
-	var errs []error
-	currentInfo, err := ReadInfo(h.paths.InfoPath)
-	if err == nil {
-		if sameInfoOwner(currentInfo, h.info) {
-			if removeErr := RemoveInfo(h.paths.InfoPath); removeErr != nil {
-				errs = append(errs, removeErr)
-			}
-		}
-	} else if !errors.Is(err, os.ErrNotExist) {
-		errs = append(errs, err)
-	}
-
-	if releaseErr := h.lock.Release(); releaseErr != nil {
-		errs = append(errs, releaseErr)
-	}
-
-	h.lock = nil
-	return errors.Join(errs...)
-}
-
-func (h *Host) cleanupStaleRuntime(ctx context.Context) error {
-	info, err := ReadInfo(h.paths.InfoPath)
-	switch {
-	case err == nil:
-		if sameInfoOwner(info, h.info) {
-			return nil
-		}
-		if err := h.healthy(ctx, info); err == nil {
-			return fmt.Errorf("daemon: healthy daemon info already exists for pid %d", info.PID)
-		}
-		if err := RemoveInfo(h.paths.InfoPath); err != nil {
-			return err
-		}
-	case errors.Is(err, os.ErrNotExist):
-		// Nothing to clean up.
-	default:
-		if removeErr := RemoveInfo(h.paths.InfoPath); removeErr != nil {
-			return errors.Join(err, removeErr)
-		}
-	}
-
-	if h.lock.StalePID() > 0 || shouldRemoveSocket(h.paths.SocketPath) {
-		if err := removeSocketPath(h.paths.SocketPath); err != nil {
-			return err
-		}
-	}
-
-	return nil
-}
-
-func sameInfoOwner(a, b Info) bool {
-	return a.PID > 0 && a.PID == b.PID && a.StartedAt.Equal(b.StartedAt)
-}
-
-func existingHealthyDaemonInfo(
-	ctx context.Context,
-	infoPath string,
-	healthy func(context.Context, Info) error,
-) (Info, bool) {
-	info, err := ReadInfo(infoPath)
-	if err != nil {
-		return Info{}, false
-	}
-	if healthy(ctx, info) != nil {
-		return Info{}, false
-	}
-	return info, true
-}
-
-func normalizeStartOptions(opts StartOptions) (StartOptions, error) {
-	resolvedPaths, processAlive, healthy, err := normalizeProbeOptions(opts.HomePaths, ProbeOptions{
-		ProcessAlive: opts.ProcessAlive,
-		Healthy:      opts.Healthy,
+func (d *Daemon) publishDaemonInfo(state *bootState, cleanup *bootCleanup) error {
+	cleanup.add(func(context.Context) error {
+		return RemoveInfo(d.homePaths.DaemonInfo)
 	})
-	if err != nil {
-		return StartOptions{}, err
-	}
-
-	now := opts.Now
-	if now == nil {
-		now = time.Now
-	}
-
-	pid := opts.PID
-	if pid <= 0 {
-		pid = os.Getpid()
-	}
-
-	return StartOptions{
-		HomePaths:    resolvedPaths,
-		Version:      opts.Version,
-		PID:          pid,
-		HTTPPort:     normalizedDaemonHTTPPort(opts.HTTPPort),
-		Now:          now,
-		ProcessAlive: processAlive,
-		Healthy:      healthy,
-		Prepare:      opts.Prepare,
-	}, nil
-}
-
-func normalizedDaemonHTTPPort(port int) int {
-	switch port {
-	case EphemeralHTTPPort:
-		return 0
-	case 0:
-		return DefaultHTTPPort
-	default:
-		return port
-	}
-}
-
-func normalizeProbeOptions(
-	paths compozyconfig.HomePaths,
-	opts ProbeOptions,
-) (compozyconfig.HomePaths, func(int) bool, func(context.Context, Info) error, error) {
-	resolvedPaths := paths
-	if strings.TrimSpace(resolvedPaths.HomeDir) == "" {
-		loadedPaths, err := resolveDaemonHomePaths()
-		if err != nil {
-			return compozyconfig.HomePaths{}, nil, nil, err
-		}
-		resolvedPaths = loadedPaths
-	}
-
-	processAlive := opts.ProcessAlive
-	if processAlive == nil {
-		processAlive = ProcessAlive
-	}
-
-	healthy := opts.Healthy
-	if healthy == nil {
-		healthy = func(_ context.Context, info Info) error {
-			if err := info.Validate(); err != nil {
-				return err
-			}
-			if info.State != ReadyStateReady {
-				return fmt.Errorf("daemon: daemon is not ready (state=%s)", info.State)
-			}
-			if !processAlive(info.PID) {
-				return fmt.Errorf("daemon: daemon pid %d is not running", info.PID)
-			}
-			return nil
-		}
-	}
-
-	return resolvedPaths, processAlive, healthy, nil
-}
-
-func shouldRemoveSocket(path string) bool {
-	return strings.TrimSpace(path) != ""
-}
-
-func removeSocketPath(path string) error {
-	cleanPath := strings.TrimSpace(path)
-	if cleanPath == "" {
-		return nil
-	}
-
-	info, err := os.Lstat(cleanPath)
-	if err != nil {
-		if errors.Is(err, os.ErrNotExist) {
-			return nil
-		}
-		return fmt.Errorf("daemon: stat daemon socket %q: %w", cleanPath, err)
-	}
-	if info.IsDir() {
-		return fmt.Errorf("daemon: daemon socket path %q is a directory", cleanPath)
-	}
-	if err := os.Remove(cleanPath); err != nil && !errors.Is(err, os.ErrNotExist) {
-		return fmt.Errorf("daemon: remove stale daemon socket %q: %w", cleanPath, err)
+	if err := WriteInfo(d.homePaths.DaemonInfo, state.info); err != nil {
+		return fmt.Errorf("daemon: publish daemon info: %w", err)
 	}
 	return nil
+}
+
+func (d *Daemon) beginBoot() error {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+
+	if d.shutdown != nil {
+		select {
+		case <-d.shutdown.done:
+			if d.shutdown.result != nil {
+				return fmt.Errorf("daemon: previous shutdown incomplete: %w", d.shutdown.result)
+			}
+			// Preserve the existing reusable composition-root behavior while
+			// rearming readiness for the new runtime generation.
+			d.shutdown = nil
+			d.readyCh = make(chan struct{})
+			d.readyClosed = false
+		default:
+			return errDaemonShutdownInProgress
+		}
+	}
+	if d.booting ||
+		d.lock != nil ||
+		d.registry != nil ||
+		d.sessions != nil ||
+		d.modelCatalog != nil ||
+		d.marketplace != nil ||
+		d.gateway != nil ||
+		d.toolRegistry != nil ||
+		d.observer != nil ||
+		d.resourceReconcile != nil ||
+		d.automation != nil {
+		return errors.New("daemon: already booted")
+	}
+	d.booting = true
+	d.admission.Undrain()
+	return nil
+}
+
+func (d *Daemon) bootPromptProviders(ctx context.Context, state *bootState) error {
+	var appendProviders []session.PromptProvider
+
+	if state.cfg.Skills.Enabled {
+		provider, err := d.bootSkillsPromptProvider(ctx, state)
+		if err != nil {
+			return err
+		}
+		appendProviders = append(appendProviders, provider)
+	}
+	return d.bootHarnessPromptRuntime(state, appendProviders)
+}
+
+func (d *Daemon) bootSkillsPromptProvider(
+	ctx context.Context,
+	state *bootState,
+) (session.PromptProvider, error) {
+	skillsCfg := d.skillsRegistryConfig(&state.cfg)
+	state.skillsRegistry = skills.NewRegistry(
+		skillsCfg,
+		skills.WithLogger(state.logger),
+		skills.WithActivationContextProvider(newSkillActivationContextProvider(state)),
+	)
+	if err := state.skillsRegistry.LoadAll(ctx); err != nil {
+		return nil, fmt.Errorf("daemon: load skills registry: %w", err)
+	}
+	state.commandService = newSessionCommandService(
+		state.skillsRegistry,
+		func() session.AgentResolver { return agentCatalogDependency(state.agentCatalog) },
+		func() promptSkillsWorkspaceResolver { return state.workspaceResolver },
+		bootProfileNameResolver{state: state},
+	)
+	state.mcpResolver = skills.NewMCPResolver(state.logger)
+	return skills.NewBoundedCatalogProvider(state.skillsRegistry, startupSkillsSectionBudget), nil
+}
+
+func (d *Daemon) bootHarnessPromptRuntime(
+	state *bootState,
+	appendProviders []session.PromptProvider,
+) error {
+	state.situationContext = d.buildSituationContext(state)
+	state.harnessResolver = NewHarnessContextResolver(HarnessRuntimeSignals{
+		RuntimeIdentityPromptSectionEnabled: true,
+		SituationPromptSectionEnabled:       state.situationContext != nil,
+		SkillsPromptSectionEnabled:          state.skillsRegistry != nil,
+		ToolsPromptSectionEnabled:           state.cfg.Tools.Enabled,
+		SkillsAugmenter:                     state.skillsRegistry != nil,
+		SituationAugmenter:                  state.situationContext != nil,
+		SyntheticTurnsEnabled:               true,
+		DetachedTaskRuntimeEnabled:          true,
+	},
+		WithHarnessSkillInjectionHome(d.homePaths),
+		WithHarnessSkillInjectionLogger(state.logger),
+	)
+	state.harnessRecorder = newHarnessLifecycleRecorder(state.logger, d.now)
+	state.agentMemory = agentmemory.NewStore(d.homePaths.HomeDir)
+	state.promptAssembler = NewComposedAssembler(
+		WithSectionSelector(NewSectionSelector(state.harnessResolver, state.harnessRecorder)),
+		WithPromptSectionDescriptors(lateAgentMemoryPromptDescriptor(
+			state.agentMemory,
+			func() *resourceCatalog[compozyconfig.AgentDef] { return state.agentCatalog },
+		)),
+		WithPromptSectionDescriptors(
+			defaultStartupPromptSectionDescriptorsFromProviders(
+				appendProviders,
+				state.situationContext,
+			)...,
+		),
+	)
+	state.startupOverlay = compozyRuntimePromptOverlay{}
+	skillsCatalogAugmenter := newSkillsCatalogAugmenterState(
+		state.skillsRegistry,
+		func() session.AgentResolver {
+			return agentCatalogDependency(state.agentCatalog)
+		},
+		func() promptSkillsWorkspaceResolver {
+			return state.workspaceResolver
+		},
+		bootProfileNameResolver{state: state},
+	)
+	var skillsCatalog session.PromptInputAugmenter
+	if skillsCatalogAugmenter != nil {
+		skillsCatalog = skillsCatalogAugmenter.Augment
+	}
+	promptAugmenterDescriptors := defaultPromptInputAugmenterDescriptors(
+		skillsCatalog,
+		state.situationContext.Augment,
+	)
+	if skillsCatalogAugmenter != nil {
+		for index := range promptAugmenterDescriptors {
+			if promptAugmenterDescriptors[index].Name == HarnessAugmenterSkills {
+				promptAugmenterDescriptors[index].PolicyAugmenter = skillsCatalogAugmenter.AugmentWithPolicy
+			}
+		}
+	}
+	promptAugmenter, err := newPromptInputCompositeAugmenter(
+		state.logger,
+		state.harnessResolver,
+		state.harnessRecorder,
+		promptAugmenterDescriptors...,
+	)
+	if err != nil {
+		return fmt.Errorf("daemon: build prompt input composite: %w", err)
+	}
+	state.promptAugmenter = promptAugmenter
+	return nil
+}
+
+func (d *Daemon) buildSituationContext(state *bootState) *situation.Service {
+	return situation.NewService(situation.Deps{
+		ContextUsage: instanceContextObservation(state),
+		CompactionBoundary: func(ctx context.Context, id string) (*int64, error) {
+			reader, ok := state.sessions.(interface {
+				CompletedCompactionBoundary(context.Context, string) (*int64, error)
+			})
+			if !ok {
+				return nil, nil
+			}
+			return reader.CompletedCompactionBoundary(ctx, id)
+		},
+		Subagents: func() situation.SubagentProvider {
+			provider, ok := state.registry.(situation.SubagentProvider)
+			if !ok {
+				return nil
+			}
+			return provider
+		},
+		Now: d.now,
+		WorkspaceResolverFunc: func() situation.WorkspaceResolver {
+			return state.workspaceResolver
+		},
+		AgentResolverFunc: func() situation.AgentResolver {
+			return agentCatalogDependency(state.agentCatalog, agentSidecarCatalogs{
+				soul:      state.soulCatalog,
+				heartbeat: state.heartbeatCatalog,
+			})
+		},
+		SkillRegistryFunc: func() situation.SkillRegistry {
+			if state.skillsRegistry == nil {
+				return nil
+			}
+			return state.skillsRegistry
+		},
+		TaskStoreFunc: func() situation.TaskStore {
+			if state.tasks == nil {
+				return nil
+			}
+			return state.tasks.store
+		},
+		SoulSnapshotsFunc: func() situation.SoulSnapshotStore {
+			return soulSnapshotStoreDependency(state.registry)
+		},
+		SpawnAllowanceFunc: func() situation.SpawnAllowanceResolver {
+			resolver, ok := state.sessions.(situation.SpawnAllowanceResolver)
+			if !ok {
+				return nil
+			}
+			return resolver
+		},
+	})
 }

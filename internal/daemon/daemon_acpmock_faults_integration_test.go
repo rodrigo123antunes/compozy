@@ -1,0 +1,1093 @@
+//go:build integration && !windows
+
+package daemon
+
+import (
+	"bytes"
+	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"io"
+	"net"
+	"net/http"
+	"net/url"
+	"os"
+	"strings"
+	"syscall"
+	"testing"
+	"time"
+
+	compozycontract "github.com/compozy/compozy/internal/api/contract"
+	compozyconfig "github.com/compozy/compozy/internal/config"
+	eventspkg "github.com/compozy/compozy/internal/events"
+	"github.com/compozy/compozy/internal/store"
+	taskpkg "github.com/compozy/compozy/internal/task"
+	"github.com/compozy/compozy/internal/testutil/acpmock"
+	e2etest "github.com/compozy/compozy/internal/testutil/e2e"
+	toolspkg "github.com/compozy/compozy/internal/tools"
+)
+
+const (
+	faultyMockAgentName      = "mock-faulty"
+	recoverableMockAgentName = "mock-recoverable-fault"
+)
+
+func TestDaemonE2EACPmockTransportStorm(t *testing.T) {
+	acpmock.RequireDriver(t)
+	t.Run("Should persist all fifty thousand chunks while an HTTP watcher stops reading", func(t *testing.T) {
+		harness := e2etest.StartRuntimeHarness(t, &e2etest.RuntimeHarnessOptions{
+			MockAgents: []e2etest.MockAgentSpec{{
+				FixturePath:  mockFixturePath(t, "transport_storm_fixture.json"),
+				FixtureAgent: "transport-storm", AgentName: "mock-transport-storm",
+			}},
+		})
+		ctx, cancel := context.WithTimeout(t.Context(), 60*time.Second)
+		defer cancel()
+		created := createFixtureBackedSession(t, ctx, harness, "mock-transport-storm", "transport storm")
+		slow := openGatedSessionStream(t, ctx, harness, created.ID)
+		defer func() {
+			if err := slow.Body.Close(); err != nil {
+				t.Error(err)
+			}
+		}()
+		if _, err := harness.PromptSessionHTTP(ctx, created.ID, "flood transport"); err != nil {
+			diagnosticCtx, cancelDiagnostic := context.WithTimeout(t.Context(), 5*time.Second)
+			defer cancelDiagnostic()
+			if captureErr := harness.CaptureSessionEvents(diagnosticCtx, created.ID); captureErr != nil {
+				t.Logf("capture stalled storm: %v", captureErr)
+			}
+			state, stateErr := harness.GetSession(diagnosticCtx, created.ID)
+			t.Logf(
+				"stalled storm runtime=%#v state error=%v; artifacts=%s",
+				state.Runtime,
+				stateErr,
+				harness.Artifacts.RootDir(),
+			)
+			t.Fatal(err)
+		}
+		var stored compozycontract.SessionEventsResponse
+		if err := harness.UDSJSON(
+			ctx,
+			http.MethodGet,
+			"/api/workspaces/"+harness.WorkspaceID+"/sessions/"+created.ID+"/events?limit=1000",
+			nil,
+			&stored,
+		); err != nil {
+			t.Fatal(err)
+		}
+		if len(stored.Events) == 0 || stored.Events[0].Sequence != 1 {
+			t.Fatal("storm evidence must include the complete durable event window")
+		}
+		var text strings.Builder
+		completed := false
+		for _, event := range decodeAgentEvents(t, stored.Events) {
+			if event.Type == "error" {
+				t.Fatalf("storm failed: %#v", event)
+			}
+			if event.Type == "agent_message" && strings.HasPrefix(event.Text, "0123456789abcdef") {
+				text.WriteString(event.Text)
+			}
+			completed = completed || event.Type == "agent_message" && event.Text == "storm complete"
+		}
+		want := strings.Repeat("0123456789abcdef0123456789abcdef", 50000)
+		if !completed || text.String() != want {
+			t.Fatalf(
+				"persisted storm bytes = %d, want %d; completed=%v; events=%d",
+				text.Len(),
+				len(want),
+				completed,
+				len(stored.Events),
+			)
+		}
+		if err := harness.Artifacts.CaptureJSON(e2etest.ArtifactKindEvents, stored.Events); err != nil {
+			t.Fatal(err)
+		}
+		var logs compozycontract.LogsListResponse
+		waitForRuntimeCondition(t, "slow watcher degrade marker", 10*time.Second, func() bool {
+			err := harness.HTTPJSON(ctx, http.MethodGet,
+				"/api/logs?session_id="+created.ID+"&type=stream.consumer_degraded&limit=100", nil, &logs)
+			return err == nil && len(logs.Events) > 0
+		})
+		if len(logs.Events) != 1 {
+			t.Fatalf("degrade events = %d, want one per shed watcher", len(logs.Events))
+		}
+		degraded := logs.Events[0]
+		var correlation struct {
+			TurnID string `json:"turn_id"`
+		}
+		if err := json.Unmarshal(degraded.Content, &correlation); err != nil {
+			t.Fatal(err)
+		}
+		if degraded.SessionID != created.ID || degraded.WorkspaceID != harness.WorkspaceID ||
+			correlation.TurnID == "" || degraded.ActorID != "daemon" || degraded.ActorKind != "system" {
+			t.Fatalf("degrade correlation = %#v", degraded)
+		}
+	})
+}
+
+func TestDaemonE2EACPmockTransportWedge(t *testing.T) {
+	acpmock.RequireDriver(t)
+	t.Run("Should release a wedged provider through the public cancellation path", func(t *testing.T) {
+		harness := e2etest.StartRuntimeHarness(t, &e2etest.RuntimeHarnessOptions{
+			MockAgents: []e2etest.MockAgentSpec{{
+				FixturePath:  mockFixturePath(t, "transport_storm_fixture.json"),
+				FixtureAgent: "transport-storm", AgentName: "mock-transport-wedge",
+			}},
+		})
+		ctx, cancel := context.WithTimeout(t.Context(), 20*time.Second)
+		defer cancel()
+		created := createFixtureBackedSession(t, ctx, harness, "mock-transport-wedge", "transport wedge")
+		var cancellation compozycontract.SessionPromptCancelResponse
+		stream, err := harness.PromptSessionHTTPWithEvents(
+			ctx,
+			created.ID,
+			"wedge transport",
+			func(record e2etest.SSEEvent) error {
+				if record.Event != "agent_message" || cancellation.TurnID != "" {
+					return nil
+				}
+				return harness.HTTPJSON(ctx, http.MethodPost,
+					"/api/workspaces/"+harness.WorkspaceID+"/sessions/"+created.ID+"/prompt/cancel", nil, &cancellation)
+			},
+		)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if cancellation.Outcome != "canceled" || cancellation.TurnID == "" || !sseStreamContainsEvent(stream, "done") {
+			t.Fatalf("wedged turn cancellation = %#v; stream=%#v", cancellation, stream)
+		}
+		stored, err := harness.SessionEvents(ctx, created.ID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		terminal := false
+		for _, event := range decodeAgentEvents(t, stored.Events) {
+			terminal = terminal || event.Type == "done" && event.PromptStopReason == "cancelled"
+		}
+		if !terminal {
+			t.Fatal("wedged turn did not persist its cancellation terminal")
+		}
+		// The public ledger must replay verified turn completion after cancellation settles.
+		waitForRuntimeCondition(t, "durable turn quiescence receipt", 10*time.Second, func() bool {
+			current, err := harness.SessionEvents(ctx, created.ID)
+			if err != nil {
+				return false
+			}
+			for _, event := range current.Events {
+				if event.Type != eventspkg.SessionTurnQuiesced {
+					continue
+				}
+				var payload struct {
+					Raw struct {
+						Verified  bool   `json:"verified"`
+						TurnID    string `json:"turn_id"`
+						StopCause string `json:"stop_cause"`
+					} `json:"raw"`
+				}
+				if err := json.Unmarshal(event.Content, &payload); err != nil {
+					t.Fatal(err)
+				}
+				if !payload.Raw.Verified || payload.Raw.TurnID != cancellation.TurnID ||
+					payload.Raw.StopCause != "user_requested" {
+					t.Fatalf("turn quiescence receipt = %#v", payload)
+				}
+				return true
+			}
+			return false
+		})
+	})
+}
+
+func openGatedSessionStream(
+	t *testing.T, ctx context.Context, harness *e2etest.RuntimeHarness, sessionID string,
+) *http.Response {
+	t.Helper()
+	// Set the receive window before TCP negotiation. Shrinking it after dialing
+	// still lets Linux buffer this entire storm, so the peer never backpressures
+	// the SSE writer and the intended slow-consumer condition is not exercised.
+	dialer := &net.Dialer{Control: func(_, _ string, connection syscall.RawConn) error {
+		var bufferErr error
+		controlErr := connection.Control(func(fd uintptr) {
+			bufferErr = syscall.SetsockoptInt(int(fd), syscall.SOL_SOCKET, syscall.SO_RCVBUF, 1024)
+		})
+		return errors.Join(controlErr, bufferErr)
+	}}
+	transport := &http.Transport{DialContext: dialer.DialContext}
+	t.Cleanup(transport.CloseIdleConnections)
+	request, err := http.NewRequestWithContext(
+		ctx,
+		http.MethodGet,
+		harness.HTTPURL(
+			"/api/workspaces/"+harness.WorkspaceID+"/sessions/"+sessionID+"/stream?frames=raw&limit=200",
+		),
+		nil,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	response, err := (&http.Client{Transport: transport}).Do(request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if response.StatusCode != http.StatusOK {
+		body, readErr := io.ReadAll(response.Body)
+		closeErr := response.Body.Close()
+		t.Fatalf("open gated stream = %d: %s; %v", response.StatusCode, body, errors.Join(readErr, closeErr))
+	}
+	// The body remains unread until the test has observed durable completion.
+	return response
+}
+
+func TestDaemonE2EACPmockCrashMidStreamRecoversInterruptedTurn(t *testing.T) {
+	acpmock.RequireDriver(t)
+
+	t.Run(
+		"Should replace the runtime and complete the same turn after the ACP mock crashes mid-stream",
+		func(t *testing.T) {
+			t.Parallel()
+
+			harness, session := startRecoverableFaultMockSession(t)
+			ctx, cancel := context.WithTimeout(t.Context(), 20*time.Second)
+			defer cancel()
+
+			promptStarted := time.Now()
+			stream, err := harness.PromptSessionHTTP(ctx, session.ID, "trigger crash mid-stream")
+			if err != nil {
+				t.Fatalf("PromptSessionHTTP() error = %v", err)
+			}
+			if elapsed := time.Since(promptStarted); elapsed > 15*time.Second {
+				t.Fatalf("PromptSessionHTTP() elapsed = %s, want recovered completion within 15s", elapsed)
+			}
+			assertRecoveredPromptProjection(t, ctx, harness, session.ID, stream)
+
+			cliSession := createFixtureBackedSession(
+				t,
+				ctx,
+				harness,
+				recoverableMockAgentName,
+				"faulty-cli-session",
+			)
+			stdout, stderr, cliErr := harness.CLI.Run(
+				ctx,
+				"session", "prompt", cliSession.ID, "trigger crash mid-stream", "-o", "jsonl",
+			)
+			if cliErr != nil {
+				t.Fatalf("CLI recovered prompt error = %v; stdout=%s stderr=%s", cliErr, stdout, stderr)
+			}
+			if !strings.Contains(stdout, "partial before crash") ||
+				!strings.Contains(stdout, "recovered interrupted turn") ||
+				strings.Contains(stdout, `"type":"error"`) {
+				t.Fatalf(
+					"CLI recovered prompt stdout = %q, want partial and recovered output without terminal error",
+					stdout,
+				)
+			}
+
+			nativeSession := createFixtureBackedSession(
+				t,
+				ctx,
+				harness,
+				recoverableMockAgentName,
+				"faulty-native-session",
+			)
+			var nativeResponse compozycontract.ToolInvokeResponse
+			if err := harness.HTTPJSON(
+				ctx,
+				http.MethodPost,
+				"/api/tools/"+url.PathEscape(toolspkg.ToolIDSessionPrompt.String())+"/invoke",
+				compozycontract.ToolInvokeRequest{
+					WorkspaceID: harness.WorkspaceID,
+					Input: json.RawMessage(fmt.Sprintf(
+						`{"session_id":%q,"message":"trigger crash mid-stream","message_id":"msg-native-crash","idempotency_key":"idem-native-crash"}`,
+						nativeSession.ID,
+					)),
+				},
+				&nativeResponse,
+			); err != nil {
+				t.Fatalf("native recovered prompt error = %v", err)
+			}
+			if nativeResponse.Status != "completed" || len(nativeResponse.Result.Content) != 1 ||
+				nativeResponse.Result.Content[0].Text != "accepted" {
+				t.Fatalf("native prompt response = %#v, want accepted asynchronous dispatch", nativeResponse)
+			}
+			waitForRuntimeCondition(t, "native prompt recovered", 15*time.Second, func() bool {
+				eventsResponse, eventsErr := harness.SessionEvents(ctx, nativeSession.ID)
+				if eventsErr != nil {
+					return false
+				}
+				events := decodeAgentEvents(t, eventsResponse.Events)
+				return containsAgentEvent(events, compozycontract.AgentEventPayload{
+					Type: "agent_message", Text: "recovered interrupted turn",
+				}) && containsAgentEvent(events, compozycontract.AgentEventPayload{Type: "done"})
+			})
+			nativeProjection, err := harness.GetSession(ctx, nativeSession.ID)
+			if err != nil {
+				t.Fatalf("GetSession(native recovered prompt) error = %v", err)
+			}
+			if got, want := nativeProjection.Runtime.Generation, int64(2); got != want {
+				t.Fatalf("native recovered runtime generation = %d, want %d", got, want)
+			}
+			if got, want := string(nativeProjection.Runtime.Transition), "automatic_recovery"; got != want {
+				t.Fatalf("native recovered runtime transition = %q, want %q", got, want)
+			}
+		},
+	)
+}
+
+func TestDaemonE2EACPmockCrashEscalatesBoundTaskRun(t *testing.T) {
+	acpmock.RequireDriver(t)
+
+	t.Run("Should expose a crashed task session as needs attention across status surfaces", func(t *testing.T) {
+		t.Parallel()
+
+		harness := startFaultyMockHarness(t)
+		ctx, cancel := context.WithTimeout(t.Context(), 30*time.Second)
+		defer cancel()
+
+		taskRecord := createFaultyProfiledTask(t, ctx, harness)
+		run := enqueueTaskRunViaUDS(t, ctx, harness, taskRecord.ID)
+		claimant := createFixtureBackedSession(t, ctx, harness, faultyMockAgentName, "faulty-claimant")
+		var claimResponse compozycontract.AgentTaskClaimResponse
+		agentUDSJSON(
+			t,
+			ctx,
+			harness,
+			claimant,
+			http.MethodPost,
+			"/api/agent/tasks/claim-next",
+			compozycontract.AgentTaskClaimNextRequest{
+				RunID:        run.ID,
+				WorkspaceID:  harness.WorkspaceID,
+				LeaseSeconds: 30,
+			},
+			&claimResponse,
+		)
+		claimed := claimResponse.Claim.Run
+		if got, want := claimed.Status.Normalize(), taskpkg.TaskRunStatusClaimed; got != want {
+			t.Fatalf("claimed run status = %q, want %q", got, want)
+		}
+		started, err := harness.StartClaimedTaskRunForSession(
+			ctx,
+			run.ID,
+			&claimant,
+			compozycontract.StartTaskRunRequest{IdempotencyKey: "start-" + run.ID},
+		)
+		if err != nil {
+			t.Fatalf("StartTaskRun(%q) error = %v", run.ID, err)
+		}
+		if got, want := started.Status.Normalize(), taskpkg.TaskRunStatusRunning; got != want {
+			t.Fatalf("started run status = %q, want %q", got, want)
+		}
+		if strings.TrimSpace(started.SessionID) == "" {
+			t.Fatal("started run session_id = empty, want task-bound session")
+		}
+
+		stream, err := harness.PromptSessionHTTP(ctx, started.SessionID, "trigger persistent crash mid-stream")
+		if err != nil {
+			t.Fatalf("PromptSessionHTTP() error = %v", err)
+		}
+		if !sseStreamContainsEvent(stream, "error") {
+			t.Fatalf("prompt stream = %#v, want error event after process exit", stream)
+		}
+
+		waitForRuntimeCondition(t, "crashed task run needs attention", 10*time.Second, func() bool {
+			runs, listErr := harness.ListTaskRuns(ctx, taskRecord.ID, nil)
+			if listErr != nil {
+				return false
+			}
+			current, ok := findTaskRunPayload(runs, run.ID)
+			return ok && current.Status.Normalize() == taskpkg.TaskRunStatusNeedsAttention
+		})
+
+		sessionInfo, err := harness.GetSession(ctx, started.SessionID)
+		if err != nil {
+			t.Fatalf("GetSession(%q) error = %v", started.SessionID, err)
+		}
+		if got, want := sessionInfo.StopReason, store.StopAgentCrashed; got != want {
+			t.Fatalf("task session stop reason = %q, want %q", got, want)
+		}
+
+		detail, err := harness.GetTask(ctx, taskRecord.ID)
+		if err != nil {
+			t.Fatalf("GetTask(%q) error = %v", taskRecord.ID, err)
+		}
+		if got := countTaskEvents(detail.Events, eventspkg.TaskRunNeedsAttention, run.ID); got != 1 {
+			t.Fatalf("needs-attention event count = %d, want 1; events=%#v", got, detail.Events)
+		}
+
+		statusPath := "/api/status?workspace=" + url.QueryEscape(harness.WorkspaceRoot)
+		var httpStatus compozycontract.StatusPayload
+		if err := harness.HTTPJSON(ctx, http.MethodGet, statusPath, nil, &httpStatus); err != nil {
+			t.Fatalf("HTTP status error = %v", err)
+		}
+		var udsStatus compozycontract.StatusPayload
+		if err := harness.UDSJSON(ctx, http.MethodGet, statusPath, nil, &udsStatus); err != nil {
+			t.Fatalf("UDS status error = %v", err)
+		}
+		var cliStatus compozycontract.StatusPayload
+		if err := harness.CLI.RunJSON(ctx, &cliStatus, "status", "-o", "json"); err != nil {
+			t.Fatalf("CLI JSON status error = %v", err)
+		}
+		for surface, status := range map[string]compozycontract.StatusPayload{
+			"HTTP": httpStatus,
+			"UDS":  udsStatus,
+			"CLI":  cliStatus,
+		} {
+			if got := taskRunTotal(status.Tasks, taskpkg.TaskRunStatusNeedsAttention); got != 1 {
+				t.Fatalf("%s needs_attention total = %d, want 1; totals=%#v", surface, got, status.Tasks.RunTotals)
+			}
+		}
+
+		stdout, stderr, err := harness.CLI.Run(ctx, "status")
+		if err != nil {
+			t.Fatalf("CLI human status error = %v; stderr=%s", err, strings.TrimSpace(stderr))
+		}
+		if !strings.Contains(stdout, "Subprocess Health") ||
+			!strings.Contains(stdout, "Needs Attention") ||
+			!strings.Contains(stdout, "1 task runs") {
+			t.Fatalf("CLI human status = %q, want subprocess and needs-attention summaries", stdout)
+		}
+	})
+}
+
+func TestDaemonE2EACPmockInvalidFrameProjectsRuntimeFailure(t *testing.T) {
+	acpmock.RequireDriver(t)
+
+	t.Run("Should project runtime failure when the ACP mock emits an invalid frame", func(t *testing.T) {
+		t.Parallel()
+
+		harness, session := startFaultyMockSession(t)
+		ctx, cancel := context.WithTimeout(t.Context(), 20*time.Second)
+		defer cancel()
+
+		stream, err := harness.PromptSessionHTTP(ctx, session.ID, "trigger invalid frame")
+		if err != nil {
+			t.Fatalf("PromptSessionHTTP() error = %v", err)
+		}
+		assertFaultPromptProjection(
+			t,
+			ctx,
+			harness,
+			session.ID,
+			stream,
+			"partial before invalid frame",
+			false,
+		)
+	})
+}
+
+func TestDaemonE2EACPmockPermissionDisconnectProjectsRuntimeFailure(t *testing.T) {
+	acpmock.RequireDriver(t)
+
+	t.Run("Should project runtime failure when the ACP mock disconnects during permission", func(t *testing.T) {
+		t.Parallel()
+
+		harness, session := startFaultyMockSession(t)
+		ctx, cancel := context.WithTimeout(t.Context(), 20*time.Second)
+		defer cancel()
+
+		stream, err := harness.PromptSessionHTTP(ctx, session.ID, "trigger permission disconnect")
+		if err != nil {
+			t.Fatalf("PromptSessionHTTP() error = %v", err)
+		}
+		assertFaultPromptProjection(
+			t,
+			ctx,
+			harness,
+			session.ID,
+			stream,
+			"",
+			true,
+		)
+	})
+}
+
+func TestDaemonE2EACPmockBlockedCancelStopsPromptWithoutOrphaning(t *testing.T) {
+	acpmock.RequireDriver(t)
+
+	t.Run("Should stop a blocked prompt without orphaning runtime liveness", func(t *testing.T) {
+		t.Parallel()
+
+		harness, session := startFaultyMockSession(t, func(cfg *compozyconfig.Config) {
+			cfg.Session.Supervision.ActivityHeartbeatInterval = 20 * time.Millisecond
+			cfg.Session.Supervision.ProgressNotifyInterval = 20 * time.Millisecond
+			cfg.Session.Supervision.QuietAfter = 0
+			cfg.Session.Supervision.StopGrace = 0
+		})
+
+		ctx, cancel := context.WithTimeout(t.Context(), 20*time.Second)
+		defer cancel()
+
+		stream, err := harness.PromptSessionHTTPUntil(
+			ctx,
+			session.ID,
+			"block until canceled",
+			func(event e2etest.SSEEvent) bool {
+				return event.Event == "runtime_progress"
+			},
+		)
+		if err != nil {
+			t.Fatalf("PromptSessionHTTPUntil(blocked progress) error = %v", err)
+		}
+		if !sseStreamContainsEvent(stream, "runtime_progress") {
+			t.Fatalf("prompt stream = %#v, want runtime_progress before explicit stop", stream)
+		}
+
+		sessionStream, err := harness.StreamSessionRawHTTPUntil(ctx, session.ID, func(event e2etest.SSEEvent) bool {
+			return event.Event == "runtime_progress"
+		})
+		if err != nil {
+			t.Fatalf("StreamSessionRawHTTPUntil(runtime_progress) error = %v", err)
+		}
+		if !sseStreamContainsEvent(sessionStream, "runtime_progress") {
+			t.Fatalf("session stream = %#v, want runtime_progress replay", sessionStream)
+		}
+
+		if err := harness.StopSession(ctx, session.ID); err != nil {
+			t.Fatalf("StopSession(%q) error = %v", session.ID, err)
+		}
+
+		waitForRuntimeCondition(t, "blocked ACP session stopped", 10*time.Second, func() bool {
+			current, err := harness.GetSession(ctx, session.ID)
+			return err == nil && string(current.State) == "stopped"
+		})
+
+		sessionInfo, err := harness.GetSession(ctx, session.ID)
+		if err != nil {
+			t.Fatalf("GetSession(%q) error = %v", session.ID, err)
+		}
+		if got, want := string(sessionInfo.State), "stopped"; got != want {
+			t.Fatalf("sessionInfo.State = %q, want %q", got, want)
+		}
+		if got, want := sessionInfo.StopReason, store.StopUserCanceled; got != want {
+			t.Fatalf("sessionInfo.StopReason = %q, want %q", got, want)
+		}
+
+		meta := mustReadSessionMeta(t, harness, session.ID)
+		if meta.Liveness == nil {
+			t.Fatal("meta.Liveness = nil, want persisted liveness metadata")
+		}
+		if got := meta.Liveness.SubprocessPID; got != 0 {
+			t.Fatalf("meta.Liveness.SubprocessPID = %d, want 0 after clean stop", got)
+		}
+		if got := strings.TrimSpace(meta.Liveness.StallState); got != "" {
+			t.Fatalf("meta.Liveness.StallState = %q, want empty after clean stop", got)
+		}
+		if got := strings.TrimSpace(meta.Liveness.StallReason); got != "" {
+			t.Fatalf("meta.Liveness.StallReason = %q, want empty after clean stop", got)
+		}
+
+		eventsResp := mustSessionEvents(t, ctx, harness, session.ID)
+		events := decodeAgentEvents(t, eventsResp.Events)
+		if !containsAgentEvent(events, compozycontract.AgentEventPayload{Type: "runtime_progress"}) {
+			t.Fatalf("events = %#v, want runtime_progress before blocked peer stop", events)
+		}
+		assertNoFatalBlockedCancelError(t, events)
+
+		if err := harness.CaptureSessionTranscript(ctx, session.ID); err != nil {
+			t.Fatalf("CaptureSessionTranscript() error = %v", err)
+		}
+		if err := harness.CaptureSessionEvents(ctx, session.ID); err != nil {
+			t.Fatalf("CaptureSessionEvents() error = %v", err)
+		}
+	})
+}
+
+func startFaultyMockSession(
+	t testing.TB,
+	mutateConfig ...func(*compozyconfig.Config),
+) (*e2etest.RuntimeHarness, compozycontract.SessionPayload) {
+	t.Helper()
+
+	harness := startFaultyMockHarness(t, mutateConfig...)
+
+	ctx, cancel := context.WithTimeout(t.Context(), 20*time.Second)
+	defer cancel()
+	session := createFixtureBackedSession(t, ctx, harness, faultyMockAgentName, "faulty-session")
+	return harness, session
+}
+
+func startRecoverableFaultMockSession(t testing.TB) (*e2etest.RuntimeHarness, compozycontract.SessionPayload) {
+	t.Helper()
+
+	harness := startFaultyMockHarness(t)
+	ctx, cancel := context.WithTimeout(t.Context(), 20*time.Second)
+	defer cancel()
+	session := createFixtureBackedSession(t, ctx, harness, recoverableMockAgentName, "recoverable-fault-session")
+	return harness, session
+}
+
+func assertDeadSessionPromptRejected(
+	t testing.TB,
+	ctx context.Context,
+	harness *e2etest.RuntimeHarness,
+	sessionID string,
+) {
+	t.Helper()
+
+	messageID, err := store.NewID("msg")
+	if err != nil {
+		t.Fatalf("generate dead-session message id error = %v", err)
+	}
+	idempotencyKey, err := store.NewID("idem")
+	if err != nil {
+		t.Fatalf("generate dead-session idempotency key error = %v", err)
+	}
+	payload, err := json.Marshal(compozycontract.SendPromptRequest{
+		Message:        "continue after disconnect",
+		MessageID:      messageID,
+		IdempotencyKey: idempotencyKey,
+	})
+	if err != nil {
+		t.Fatalf("marshal dead-session prompt error = %v", err)
+	}
+	path := "/api/workspaces/" + url.PathEscape(harness.WorkspaceID) +
+		"/sessions/" + url.PathEscape(sessionID) + "/prompt"
+	request, err := http.NewRequestWithContext(
+		ctx,
+		http.MethodPost,
+		harness.HTTPURL(path),
+		bytes.NewReader(payload),
+	)
+	if err != nil {
+		t.Fatalf("create dead-session prompt request error = %v", err)
+	}
+	request.Header.Set("Content-Type", "application/json")
+	response, err := harness.HTTPClient.Do(request)
+	if err != nil {
+		t.Fatalf("send dead-session prompt request error = %v", err)
+	}
+	body, readErr := io.ReadAll(response.Body)
+	closeErr := response.Body.Close()
+	if err := errors.Join(readErr, closeErr); err != nil {
+		t.Fatalf("read dead-session prompt response error = %v", err)
+	}
+	if response.StatusCode != http.StatusConflict {
+		t.Fatalf("dead-session prompt status = %d, want %d; body=%s", response.StatusCode, http.StatusConflict, body)
+	}
+	var failure compozycontract.ErrorPayload
+	if err := json.Unmarshal(body, &failure); err != nil {
+		t.Fatalf("decode dead-session prompt response error = %v; body=%s", err, body)
+	}
+	if !strings.Contains(failure.Error, "not attachable") {
+		t.Fatalf("dead-session prompt error = %q, want attachability context", failure.Error)
+	}
+}
+
+func startFaultyMockHarness(
+	t testing.TB,
+	mutateConfig ...func(*compozyconfig.Config),
+) *e2etest.RuntimeHarness {
+	t.Helper()
+
+	return e2etest.StartRuntimeHarness(t, &e2etest.RuntimeHarnessOptions{
+		ConfigSeed: e2etest.ConfigSeedOptions{
+			Mutate: func(cfg *compozyconfig.Config) {
+				for _, mutate := range mutateConfig {
+					if mutate != nil {
+						mutate(cfg)
+					}
+				}
+			},
+		},
+		MockAgents: []e2etest.MockAgentSpec{
+			{
+				FixturePath:  mockFixturePath(t, "driver_fault_fixture.json"),
+				FixtureAgent: "faulty",
+				AgentName:    faultyMockAgentName,
+			},
+			{
+				FixturePath:  mockFixturePath(t, "driver_fault_fixture.json"),
+				FixtureAgent: "recoverable-fault",
+				AgentName:    recoverableMockAgentName,
+			},
+		},
+	})
+
+}
+
+func createFaultyProfiledTask(
+	t testing.TB,
+	ctx context.Context,
+	harness *e2etest.RuntimeHarness,
+) compozycontract.TaskPayload {
+	t.Helper()
+
+	var response compozycontract.TaskResponse
+	request := compozycontract.CreateTaskRequest{
+		Scope:     taskpkg.ScopeWorkspace,
+		Workspace: harness.WorkspaceID,
+		Title:     "Escalate crashed task subprocess",
+	}
+	if err := harness.UDSJSON(ctx, http.MethodPost, "/api/tasks", request, &response); err != nil {
+		t.Fatalf("UDS create faulty-profiled task error = %v", err)
+	}
+
+	profileRequest := compozycontract.SetTaskExecutionProfileRequest{
+		Worker: taskpkg.WorkerProfile{
+			Mode:      taskpkg.WorkerModeSelect,
+			AgentName: faultyMockAgentName,
+		},
+	}
+	var profileResponse compozycontract.TaskExecutionProfileResponse
+	profilePath := "/api/tasks/" + url.PathEscape(response.Task.ID) + "/execution-profile"
+	if err := harness.UDSJSON(ctx, http.MethodPut, profilePath, profileRequest, &profileResponse); err != nil {
+		t.Fatalf("UDS set faulty task execution profile error = %v", err)
+	}
+	if got, want := profileResponse.Profile.Worker.AgentName, faultyMockAgentName; got != want {
+		t.Fatalf("stored worker agent = %q, want %q", got, want)
+	}
+	return response.Task
+}
+
+func countTaskEvents(events []compozycontract.TaskEventPayload, eventType string, runID string) int {
+	count := 0
+	for _, event := range events {
+		if event.EventType == eventType && event.RunID == runID {
+			count++
+		}
+	}
+	return count
+}
+
+func taskRunTotal(health compozycontract.TaskHealthPayload, status taskpkg.RunStatus) int {
+	total := 0
+	for _, row := range health.RunTotals {
+		if row.Status == status.String() {
+			total += row.Count
+		}
+	}
+	return total
+}
+
+func assertRecoveredPromptProjection(
+	t testing.TB,
+	ctx context.Context,
+	harness *e2etest.RuntimeHarness,
+	sessionID string,
+	stream []e2etest.SSEEvent,
+) {
+	t.Helper()
+
+	for _, want := range []string{
+		"runtime_recovery_started",
+		"runtime_recovery_succeeded",
+		"finish",
+	} {
+		if !sseStreamContainsEvent(stream, want) {
+			t.Fatalf("prompt stream = %#v, want %q event", stream, want)
+		}
+	}
+	if sseStreamContainsEvent(stream, "runtime_recovery_exhausted") ||
+		sseStreamContainsEvent(stream, "error") {
+		t.Fatalf("prompt stream = %#v, want successful recovery without terminal error", stream)
+	}
+	for _, want := range []string{"partial before crash", "recovered interrupted turn"} {
+		if !e2etest.RecordsContainTextDelta(stream, want) {
+			t.Fatalf("prompt stream = %#v, want assistant text delta %q", stream, want)
+		}
+	}
+
+	httpSession := mustHTTPSession(t, ctx, harness, sessionID)
+	udsSession, err := harness.GetSession(ctx, sessionID)
+	if err != nil {
+		t.Fatalf("GetSession(%q) error = %v", sessionID, err)
+	}
+	for surface, current := range map[string]compozycontract.SessionPayload{
+		"HTTP": httpSession,
+		"UDS":  udsSession,
+	} {
+		if current.Failure != nil {
+			t.Fatalf("%s session failure = %#v, want none after recovery", surface, current.Failure)
+		}
+		if got, want := current.Runtime.Generation, int64(2); got != want {
+			t.Fatalf("%s runtime generation = %d, want %d", surface, got, want)
+		}
+		if got, want := string(current.Runtime.Status), "ready"; got != want {
+			t.Fatalf("%s runtime status = %q, want %q", surface, got, want)
+		}
+		if got, want := string(current.Runtime.Transition), "automatic_recovery"; got != want {
+			t.Fatalf("%s runtime transition = %q, want %q", surface, got, want)
+		}
+		if current.Runtime.Recovery != nil {
+			t.Fatalf("%s runtime recovery = %#v, want cleared after success", surface, current.Runtime.Recovery)
+		}
+	}
+
+	transcript := mustSessionTranscript(t, ctx, harness, sessionID)
+	content := joinTranscriptContent(sessionTranscriptMessages(transcript))
+	for _, want := range []string{"partial before crash", "recovered interrupted turn"} {
+		if !strings.Contains(content, want) {
+			t.Fatalf("transcript = %q, want fragment %q", content, want)
+		}
+	}
+
+	eventsResp := mustSessionEvents(t, ctx, harness, sessionID)
+	events := decodeAgentEvents(t, eventsResp.Events)
+	wantCounts := map[string]int{
+		"user_message":               1,
+		"runtime_recovery_started":   1,
+		"runtime_recovery_succeeded": 1,
+		"done":                       1,
+	}
+	for eventType, want := range wantCounts {
+		got := 0
+		for _, event := range events {
+			if event.Type == eventType {
+				got++
+			}
+		}
+		if got != want {
+			t.Fatalf("events of type %q = %d, want %d; events=%#v", eventType, got, want, events)
+		}
+	}
+	turnID := ""
+	for _, event := range events {
+		if event.Type == "error" || event.Type == "runtime_recovery_exhausted" {
+			t.Fatalf("events = %#v, want no terminal recovery failure", events)
+		}
+		switch event.Type {
+		case "user_message", "agent_message", "runtime_recovery_started", "runtime_recovery_succeeded", "done":
+			if event.TurnID == "" {
+				t.Fatalf("event %#v has no turn id", event)
+			}
+			if turnID == "" {
+				turnID = event.TurnID
+			}
+			if event.TurnID != turnID {
+				t.Fatalf("event turn id = %q, want interrupted turn %q; event=%#v", event.TurnID, turnID, event)
+			}
+		}
+	}
+
+	if err := harness.CaptureSessionTranscript(ctx, sessionID); err != nil {
+		t.Fatalf("CaptureSessionTranscript() error = %v", err)
+	}
+	if err := harness.CaptureSessionEvents(ctx, sessionID); err != nil {
+		t.Fatalf("CaptureSessionEvents() error = %v", err)
+	}
+}
+
+func assertFaultPromptProjection(
+	t testing.TB,
+	ctx context.Context,
+	harness *e2etest.RuntimeHarness,
+	sessionID string,
+	stream []e2etest.SSEEvent,
+	wantTranscriptFragment string,
+	wantPermission bool,
+) {
+	t.Helper()
+
+	if !sseStreamContainsEvent(stream, "error") {
+		t.Fatalf("prompt stream = %#v, want error event", stream)
+	}
+	if wantTranscriptFragment != "" && !e2etest.RecordsContainTextDelta(stream, wantTranscriptFragment) {
+		t.Fatalf("prompt stream = %#v, want assistant text delta %q", stream, wantTranscriptFragment)
+	}
+	if wantPermission && !sseStreamContainsEvent(stream, "permission") {
+		t.Fatalf("prompt stream = %#v, want permission event before failure", stream)
+	}
+
+	httpSession := mustHTTPSession(t, ctx, harness, sessionID)
+	udsSession, err := harness.GetSession(ctx, sessionID)
+	if err != nil {
+		t.Fatalf("GetSession(%q) error = %v", sessionID, err)
+	}
+	if got, want := httpSession.ID, sessionID; got != want {
+		t.Fatalf("HTTP session ID = %q, want %q", got, want)
+	}
+	if got, want := udsSession.ID, sessionID; got != want {
+		t.Fatalf("UDS session ID = %q, want %q", got, want)
+	}
+	if udsSession.Failure == nil || udsSession.Failure.Kind != store.FailureProcess {
+		t.Fatalf("UDS session failure = %#v, want process_exit", udsSession.Failure)
+	}
+	assertCrashBundleExitCode(t, udsSession.Failure.CrashBundlePath, 23)
+
+	transcript := mustSessionTranscript(t, ctx, harness, sessionID)
+	content := joinTranscriptContent(sessionTranscriptMessages(transcript))
+	if wantTranscriptFragment != "" && !strings.Contains(content, wantTranscriptFragment) {
+		t.Fatalf("transcript = %q, want fragment %q", content, wantTranscriptFragment)
+	}
+	if wantPermission && strings.Contains(content, "allow-always") {
+		t.Fatalf("transcript = %q, want no approval decision after disconnect", content)
+	}
+
+	eventsResp := mustSessionEvents(t, ctx, harness, sessionID)
+	events := decodeAgentEvents(t, eventsResp.Events)
+	if wantTranscriptFragment != "" && !containsAgentEvent(events, compozycontract.AgentEventPayload{
+		Type: "agent_message",
+		Text: wantTranscriptFragment,
+	}) {
+		t.Fatalf("events = %#v, want agent_message %q", events, wantTranscriptFragment)
+	}
+	if !containsAgentEvent(events, compozycontract.AgentEventPayload{Type: "error"}) {
+		t.Fatalf("events = %#v, want error event", events)
+	}
+	var errorEvent *compozycontract.AgentEventPayload
+	for index := range events {
+		if events[index].Type == "error" {
+			errorEvent = &events[index]
+			break
+		}
+	}
+	if errorEvent == nil || errorEvent.Failure == nil {
+		t.Fatalf("events = %#v, want typed error failure", events)
+	}
+	if got, want := errorEvent.Failure.Kind, store.FailureProcess; got != want {
+		t.Fatalf("error event failure kind = %q, want %q", got, want)
+	}
+	if got, want := errorEvent.Failure.CrashBundlePath, udsSession.Failure.CrashBundlePath; got != want {
+		t.Fatalf("error event crash bundle = %q, want final session bundle %q", got, want)
+	}
+	assertCrashBundleExitCode(t, errorEvent.Failure.CrashBundlePath, 23)
+	if containsAgentEvent(events, compozycontract.AgentEventPayload{Type: "done"}) {
+		t.Fatalf("events = %#v, want no done event after runtime failure", events)
+	}
+	if wantPermission && !containsAgentEvent(events, compozycontract.AgentEventPayload{Type: "permission"}) {
+		t.Fatalf("events = %#v, want permission event", events)
+	}
+
+	if err := harness.CaptureSessionTranscript(ctx, sessionID); err != nil {
+		t.Fatalf("CaptureSessionTranscript() error = %v", err)
+	}
+	if err := harness.CaptureSessionEvents(ctx, sessionID); err != nil {
+		t.Fatalf("CaptureSessionEvents() error = %v", err)
+	}
+
+	assertArtifactExists(t, harness, e2etest.ArtifactKindTranscript)
+	assertArtifactExists(t, harness, e2etest.ArtifactKindEvents)
+}
+
+func assertRawProcessFailureTerminal(
+	t testing.TB,
+	ctx context.Context,
+	harness *e2etest.RuntimeHarness,
+	sessionID string,
+) {
+	t.Helper()
+
+	records, err := harness.StreamSessionRawHTTPUntil(ctx, sessionID, func(event e2etest.SSEEvent) bool {
+		return event.Event == "session_stopped"
+	})
+	if err != nil {
+		t.Fatalf("StreamSessionRawHTTPUntil(session_stopped) error = %v", err)
+	}
+
+	errorIndex := -1
+	stoppedIndex := -1
+	var terminal compozycontract.AgentEventPayload
+	for index, record := range records {
+		switch record.Event {
+		case "error":
+			if errorIndex >= 0 {
+				continue
+			}
+			var envelope compozycontract.SessionEventPayload
+			if err := json.Unmarshal(record.Data, &envelope); err != nil {
+				t.Fatalf("json.Unmarshal(raw error envelope) error = %v; data=%s", err, record.Data)
+			}
+			if err := json.Unmarshal(envelope.Content, &terminal); err != nil {
+				t.Fatalf("json.Unmarshal(raw error content) error = %v; content=%s", err, envelope.Content)
+			}
+			errorIndex = index
+		case "session_stopped":
+			stoppedIndex = index
+		}
+	}
+	if errorIndex < 0 || stoppedIndex < 0 || errorIndex >= stoppedIndex {
+		t.Fatalf("raw session records = %#v, want error before session_stopped", records)
+	}
+	if terminal.Type != "error" || terminal.Failure == nil || terminal.Failure.Kind != store.FailureProcess {
+		t.Fatalf("raw terminal event = %#v, want process_exit error", terminal)
+	}
+	assertCrashBundleExitCode(t, terminal.Failure.CrashBundlePath, 23)
+}
+
+func assertCrashBundleExitCode(t testing.TB, path string, want int) {
+	t.Helper()
+	if strings.TrimSpace(path) == "" {
+		t.Fatal("crash bundle path = empty, want process diagnostics")
+	}
+	payload, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("ReadFile(crash bundle %q) error = %v", path, err)
+	}
+	var bundle struct {
+		Process *struct {
+			ExitCode *int   `json:"exit_code"`
+			Signal   string `json:"signal"`
+		} `json:"process"`
+	}
+	if err := json.Unmarshal(payload, &bundle); err != nil {
+		t.Fatalf("json.Unmarshal(crash bundle %q) error = %v", path, err)
+	}
+	if bundle.Process == nil || bundle.Process.ExitCode == nil || *bundle.Process.ExitCode != want {
+		t.Fatalf("crash bundle process = %#v, want exit_code %d", bundle.Process, want)
+	}
+	if bundle.Process.Signal != "" {
+		t.Fatalf("crash bundle signal = %q, want empty for numeric exit", bundle.Process.Signal)
+	}
+}
+
+func assertNoFatalBlockedCancelError(t testing.TB, events []compozycontract.AgentEventPayload) {
+	t.Helper()
+
+	for _, event := range events {
+		if event.Type != "error" {
+			continue
+		}
+		if event.Failure != nil && event.Failure.Kind == store.FailureCanceled {
+			continue
+		}
+		t.Fatalf("events = %#v, want no fatal error after explicit blocked prompt cancellation", events)
+	}
+}
+
+func mustHTTPSession(
+	t testing.TB,
+	ctx context.Context,
+	harness *e2etest.RuntimeHarness,
+	sessionID string,
+) compozycontract.SessionPayload {
+	t.Helper()
+
+	var response compozycontract.SessionResponse
+	if err := harness.HTTPJSON(
+		ctx,
+		http.MethodGet,
+		"/api/workspaces/"+url.PathEscape(harness.WorkspaceID)+"/sessions/"+url.PathEscape(sessionID),
+		nil,
+		&response,
+	); err != nil {
+		t.Fatalf("HTTP session %q error = %v", sessionID, err)
+	}
+	return response.Session
+}
+
+func sseStreamContainsEvent(records []e2etest.SSEEvent, want string) bool {
+	for _, record := range records {
+		if record.Event == want {
+			return true
+		}
+	}
+	return false
+}
+
+func assertArtifactExists(
+	t testing.TB,
+	harness *e2etest.RuntimeHarness,
+	kind e2etest.ArtifactKind,
+) {
+	t.Helper()
+
+	path, ok := harness.Artifacts.ArtifactPath(kind)
+	if !ok {
+		t.Fatalf("ArtifactPath(%s) = missing, want present", kind)
+	}
+	if _, err := os.Stat(path); err != nil {
+		t.Fatalf("os.Stat(%q) error = %v", path, err)
+	}
+}

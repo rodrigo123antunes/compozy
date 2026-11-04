@@ -1,0 +1,317 @@
+import { isReasoningEffort, type ReasoningEffort, type RuntimeSpeed } from "@/lib/api-contract";
+
+import {
+  parseAgentCreateCategoryPath,
+  type AgentCreatePermission,
+  type AgentCreatePermissionChoice,
+} from "./agent-create-draft";
+import {
+  invalidPermissionRule,
+  permissionRuleDraftsFromAgent,
+  permissionRulesEqual,
+  permissionRulesPayload,
+  PERMISSION_RULE_LIMIT,
+  type PermissionRuleDraft,
+} from "./agent-permission-rules";
+import { isAgentPermissionLevel } from "./agent-permissions";
+import { joinAgentCategorySegments } from "./agent-category";
+import {
+  normalizeRuntimeSpeed,
+  resolveAgentRuntimeValue,
+  runtimeACPSelections,
+} from "./agent-effective-runtime";
+import type { AgentPayload, UpdateAgentParams } from "../types";
+import {
+  runtimeACPSelectionsEqual,
+  type RuntimeACPOptionSelection,
+  type RuntimeSelectorValue,
+} from "@/systems/runtime";
+
+/** Authored fallback route in its replacement (write) shape. */
+export type AgentSettingsFallbackRoute = NonNullable<
+  UpdateAgentParams["agent"]["fallback_chain"]
+>[number];
+
+/** Whose requests an always-on agent can answer; `""` keeps the daemon default (`children`). */
+export type AgentSessionApproval = "" | "children" | "workspace";
+
+export interface AgentSettingsDraft {
+  sessionEnv?: AgentPayload["session_env"];
+  name: string;
+  categoryPath: string;
+  provider: string;
+  model: string;
+  reasoningEffort: ReasoningEffort | "";
+  speed: RuntimeSpeed | "";
+  /** Typed ACP overrides; undefined means inherit provider defaults. */
+  acpOptions?: RuntimeACPOptionSelection[];
+  command: string;
+  prompt: string;
+  /** Selected RadioCard value; null when legacy string requires explicit choice. */
+  permissions: AgentCreatePermissionChoice | null;
+  /** Raw permissions from the read payload when unrecognized. */
+  legacyPermissions: string | null;
+  tools: string[];
+  toolsets: string[];
+  denyTools: string[];
+  disabledSkills: string[];
+  /**
+   * Authored fallback routes carried verbatim: the update is a full replacement,
+   * so omitting them would erase routes the Web offers no controls for.
+   */
+  fallbackChain: AgentSettingsFallbackRoute[];
+  definitionDigest: string;
+  origin: AgentPayload["origin"];
+  /** The operator-authored workspace grant (`unrestricted`), carried through every save. */
+  workspaceAccess: AgentWorkspaceAccess;
+  /** The definition's source layer, for the grant's trusted-source rule. */
+  layer: string;
+  /** Operator-authored exceptions, carried through every save. */
+  permissionRules: PermissionRuleDraft[];
+  sessionApproval: AgentSessionApproval;
+}
+
+/** `""` follows the permission mode for other projects; `unrestricted` crosses them all. */
+export type AgentWorkspaceAccess = "" | "unrestricted";
+
+/** Operator-authored layers. Marketplace, extension, and bundled definitions never carry the grant. */
+const GRANT_TRUSTED_LAYERS = new Set([
+  "user",
+  "profile",
+  "additional",
+  "project",
+  "project_profile",
+]);
+
+/** Whether this definition's Access can be edited here (USW S6: untrusted sources are read-only). */
+export function agentWorkspaceAccessEditable(draft: Pick<AgentSettingsDraft, "layer">): boolean {
+  return GRANT_TRUSTED_LAYERS.has(draft.layer);
+}
+
+export interface AgentSettingsValidation {
+  fields: Partial<
+    Record<"provider" | "prompt" | "categoryPath" | "permissions" | "permissionRules", string>
+  >;
+  canSave: boolean;
+  categorySegments: string[];
+  requiresExplicitPermissions: boolean;
+}
+
+export function isKnownPermission(
+  value: string | null | undefined
+): value is AgentCreatePermission {
+  return isAgentPermissionLevel(value);
+}
+
+export function buildSettingsDraftFromAgent(agent: AgentPayload): AgentSettingsDraft {
+  const rawPermissions = agent.permissions?.trim() ?? "";
+  const known = isKnownPermission(rawPermissions);
+  const emptyOrInherit = rawPermissions.length === 0;
+  return {
+    name: agent.name,
+    sessionEnv: agent.session_env ? structuredClone(agent.session_env) : undefined,
+    categoryPath: joinAgentCategorySegments(agent.category_path ?? []),
+    provider: agent.provider ?? "",
+    model: agent.model ?? "",
+    reasoningEffort:
+      agent.reasoning_effort && isReasoningEffort(agent.reasoning_effort)
+        ? agent.reasoning_effort
+        : "",
+    speed: normalizeRuntimeSpeed(agent.speed),
+    acpOptions: runtimeACPSelections(agent.acp_options),
+    command: agent.command ?? "",
+    prompt: agent.prompt ?? "",
+    permissions: known ? rawPermissions : emptyOrInherit ? "" : null,
+    legacyPermissions: known || emptyOrInherit ? null : rawPermissions,
+    tools: [...(agent.tools ?? [])],
+    toolsets: [...(agent.toolsets ?? [])],
+    denyTools: [...(agent.deny_tools ?? [])],
+    disabledSkills: [...(agent.skills?.disabled ?? [])],
+    fallbackChain: (agent.fallback_chain ?? []).map(toFallbackRouteInput),
+    definitionDigest: agent.definition_digest,
+    origin: agent.origin,
+    workspaceAccess: agent.workspace_access === "unrestricted" ? "unrestricted" : "",
+    layer: agent.layer?.trim() || (agent.origin === "workspace" ? "project" : "user"),
+    permissionRules: permissionRuleDraftsFromAgent(agent.permission_rules),
+    sessionApproval: sessionApprovalFrom(agent.session_approval),
+  };
+}
+
+function sessionApprovalFrom(value: string | undefined): AgentSessionApproval {
+  return value === "children" || value === "workspace" ? value : "";
+}
+
+export function isAgentSettingsDraftDirty(draft: AgentSettingsDraft, agent: AgentPayload): boolean {
+  const baseline = buildSettingsDraftFromAgent(agent);
+  return (
+    draft.categoryPath !== baseline.categoryPath ||
+    draft.provider !== baseline.provider ||
+    draft.model !== baseline.model ||
+    draft.reasoningEffort !== baseline.reasoningEffort ||
+    draft.speed !== baseline.speed ||
+    !runtimeACPSelectionsEqual(draft.acpOptions, baseline.acpOptions) ||
+    draft.command !== baseline.command ||
+    draft.prompt !== baseline.prompt ||
+    draft.permissions !== baseline.permissions ||
+    !sameList(draft.tools, baseline.tools) ||
+    !sameList(draft.toolsets, baseline.toolsets) ||
+    !sameList(draft.denyTools, baseline.denyTools) ||
+    !sameList(draft.disabledSkills, baseline.disabledSkills) ||
+    draft.workspaceAccess !== baseline.workspaceAccess ||
+    draft.sessionApproval !== baseline.sessionApproval ||
+    !permissionRulesEqual(draft.permissionRules, baseline.permissionRules)
+  );
+}
+
+export function validateAgentSettingsDraft(draft: AgentSettingsDraft): AgentSettingsValidation {
+  const fields: AgentSettingsValidation["fields"] = {};
+  const category = parseAgentCreateCategoryPath(draft.categoryPath);
+  if (category.error) fields.categoryPath = category.error;
+
+  if (
+    draft.provider.trim().length === 0 &&
+    (draft.model.trim().length > 0 || draft.reasoningEffort !== "")
+  ) {
+    fields.provider = "Choose a provider before setting model or reasoning overrides.";
+  }
+  if (draft.prompt.trim().length === 0) {
+    fields.prompt = "Prompt is required.";
+  }
+
+  const requiresExplicitPermissions = draft.permissions === null;
+  if (requiresExplicitPermissions) {
+    fields.permissions = draft.legacyPermissions
+      ? `Unrecognized permission mode: ${draft.legacyPermissions}`
+      : "Choose a permission mode.";
+  }
+
+  const invalidRule = invalidPermissionRule(draft.permissionRules);
+  if (invalidRule) fields.permissionRules = invalidRule.message;
+  else if (draft.permissionRules.length > PERMISSION_RULE_LIMIT) {
+    fields.permissionRules = `Keep it to ${PERMISSION_RULE_LIMIT} exceptions or fewer.`;
+  }
+
+  return {
+    fields,
+    canSave: Object.keys(fields).length === 0,
+    categorySegments: category.segments,
+    requiresExplicitPermissions,
+  };
+}
+
+export function buildUpdateAgentParams(
+  draft: AgentSettingsDraft,
+  workspaceId: string | null | undefined
+): UpdateAgentParams | null {
+  const validation = validateAgentSettingsDraft(draft);
+  if (!validation.canSave || draft.permissions === null) return null;
+
+  const provider = draft.provider.trim();
+  const prompt = draft.prompt.trim();
+  const model = draft.model.trim();
+  const command = draft.command.trim();
+  const reasoningEffort = isReasoningEffort(draft.reasoningEffort) ? draft.reasoningEffort : "";
+  const permissions = draft.permissions === "" ? undefined : draft.permissions;
+  const workspace = workspaceId?.trim() ?? "";
+
+  return {
+    expected_digest: draft.definitionDigest,
+    ...(draft.origin === "workspace" && workspace.length > 0 ? { workspace } : {}),
+    agent: {
+      name: draft.name,
+      ...(draft.sessionEnv ? { session_env: structuredClone(draft.sessionEnv) } : {}),
+      prompt,
+      ...(provider.length > 0 ? { provider } : {}),
+      ...(model.length > 0 ? { model } : {}),
+      ...(command.length > 0 ? { command } : {}),
+      ...(reasoningEffort !== "" ? { reasoning_effort: reasoningEffort } : {}),
+      ...(draft.speed !== "" ? { speed: draft.speed } : {}),
+      ...(draft.acpOptions !== undefined ? { acp_options: [...draft.acpOptions] } : {}),
+      ...(permissions ? { permissions } : {}),
+      ...(validation.categorySegments.length > 0
+        ? { category_path: validation.categorySegments }
+        : {}),
+      ...(draft.tools.length > 0 ? { tools: [...draft.tools] } : {}),
+      ...(draft.toolsets.length > 0 ? { toolsets: [...draft.toolsets] } : {}),
+      ...(draft.denyTools.length > 0 ? { deny_tools: [...draft.denyTools] } : {}),
+      ...(draft.disabledSkills.length > 0
+        ? { skills: { disabled: [...draft.disabledSkills] } }
+        : { skills: null }),
+      ...(draft.fallbackChain.length > 0
+        ? { fallback_chain: draft.fallbackChain.map(route => ({ ...route })) }
+        : {}),
+      // The update replaces the definition: omitting the grant would revoke it.
+      ...(draft.workspaceAccess ? { workspace_access: draft.workspaceAccess } : {}),
+      ...(draft.sessionApproval ? { session_approval: draft.sessionApproval } : {}),
+      // An empty list clears the exceptions; the daemon keeps them only when the field is absent.
+      permission_rules: permissionRulesPayload(draft.permissionRules),
+    },
+  };
+}
+
+/** Drops read-only projection fields (command_fingerprint) and empty optionals. */
+function toFallbackRouteInput(
+  route: NonNullable<AgentPayload["fallback_chain"]>[number]
+): AgentSettingsFallbackRoute {
+  const reasoningEffort = route.reasoning_effort?.trim() ?? "";
+  const command = route.command?.trim() ?? "";
+  return {
+    provider: route.provider,
+    ...(route.session_env ? { session_env: structuredClone(route.session_env) } : {}),
+    model: route.model,
+    ...(reasoningEffort.length > 0 ? { reasoning_effort: reasoningEffort } : {}),
+    ...(route.speed ? { speed: route.speed } : {}),
+    ...(route.acp_options && route.acp_options.length > 0
+      ? { acp_options: route.acp_options.map(option => ({ ...option })) }
+      : {}),
+    ...(command.length > 0 ? { command } : {}),
+  };
+}
+
+function sameList(left: readonly string[], right: readonly string[]): boolean {
+  if (left.length !== right.length) return false;
+  return left.every((value, index) => value === right[index]);
+}
+
+type AgentEffectiveRuntime = AgentPayload["effective_runtime"];
+
+/** Effective reasoning applies only while the draft still points at the effective model. */
+function inheritedReasoningEffort(
+  effective: AgentEffectiveRuntime,
+  selectedModel: string,
+  providerMatchesEffective: boolean
+): string {
+  if (!providerMatchesEffective || selectedModel !== effective?.model?.trim()) return "";
+  return effective?.reasoning_effort ?? "";
+}
+
+/**
+ * Runtime selector value for the settings draft: draft overrides win, and the
+ * agent's effective runtime fills whatever the draft leaves blank.
+ */
+export function agentSettingsRuntimeValue(
+  agent: AgentPayload,
+  draft: AgentSettingsDraft
+): RuntimeSelectorValue {
+  const effective = agent.effective_runtime;
+  const effectiveProvider = effective?.provider?.trim() ?? "";
+  const provider = draft.provider.trim() || effectiveProvider;
+  const providerMatchesEffective = provider === effectiveProvider;
+  const inheritedModel = providerMatchesEffective ? (effective?.model?.trim() ?? "") : "";
+  const model = draft.model.trim() || inheritedModel;
+  const acpOptions = draft.acpOptions ?? resolveAgentRuntimeValue(agent).acp_options;
+  return {
+    provider,
+    model,
+    reasoning_effort:
+      draft.reasoningEffort || inheritedReasoningEffort(effective, model, providerMatchesEffective),
+    ...(acpOptions ? { acp_options: acpOptions } : {}),
+  };
+}
+
+export function agentSettingsRuntimeSpeed(
+  agent: AgentPayload,
+  draft: AgentSettingsDraft
+): RuntimeSpeed {
+  return draft.speed || agent.effective_runtime?.speed || "normal";
+}

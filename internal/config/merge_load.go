@@ -1,0 +1,317 @@
+package config
+
+import (
+	"cmp"
+	"errors"
+	"fmt"
+	"log/slog"
+	"maps"
+	"sync"
+
+	burnttoml "github.com/BurntSushi/toml"
+)
+
+const configBaseURLKey = "base_url"
+
+var warnShellScopeDeprecation = sync.OnceFunc(func() { slog.Warn(ShellScopeDeprecationWarning) })
+
+// ApplyConfigOverlayFile deep-merges an optional TOML config file into dst.
+func ApplyConfigOverlayFile(path string, dst *Config) error {
+	if dst == nil {
+		return errors.New("config: destination config is required")
+	}
+
+	overlay, err := loadConfigOverlayFile(path)
+	if err != nil {
+		return err
+	}
+
+	if err := applyConfigOverlay(dst, &overlay, RoleFieldSourceGlobal); err != nil {
+		return err
+	}
+	return nil
+}
+
+func applyConfigOverlay(dst *Config, overlay *configOverlay, roleSource string) error {
+	if roleSource != RoleFieldSourceGlobal && overlay.Agents.Heartbeat.Sources.present() {
+		slog.Warn("config: [agents.heartbeat.sources] is daemon-wide; overlay ignored")
+		overlay.Agents.Heartbeat.Sources = heartbeatSourcesOverlay{}
+	}
+	if roleSource != RoleFieldSourceGlobal && overlay.Permissions.ProviderFullAccess != nil &&
+		*overlay.Permissions.ProviderFullAccess {
+		return fmt.Errorf("permissions.provider_full_access can only be enabled in the global config")
+	}
+	if err := overlay.Apply(dst); err != nil {
+		return err
+	}
+	if overlay.Skills.Sources != nil || overlay.Skills.CustomSources != nil {
+		if err := dst.Skills.ValidateForScope(skillSourceWriteScope(roleSource)); err != nil {
+			return err
+		}
+	}
+	overlay.Roles.recordSources(dst, roleSource)
+	overlay.Loops.recordInputSources(&dst.Loops, roleSource)
+	return nil
+}
+
+func skillSourceWriteScope(roleSource string) WriteScope {
+	switch roleSource {
+	case RoleFieldSourceProfile:
+		return WriteScopeProfile
+	case RoleFieldSourceWorkspace, RoleFieldSourceWorkspaceProfile:
+		return WriteScopeWorkspace
+	default:
+		return WriteScopeUser
+	}
+}
+
+func loadConfigOverlayFile(path string) (configOverlay, error) {
+	return loadPersistedConfigOverlay(path, loadConfigOverlayBytes)
+}
+
+func loadConfigOverlayBytes(contents []byte, source string) (configOverlay, error) {
+	var overlay configOverlay
+
+	meta, err := burnttoml.Decode(string(contents), &overlay)
+	if err != nil {
+		return overlay, FileError{Op: "decode", Path: source, Err: err}
+	}
+
+	if undecoded := meta.Undecoded(); len(undecoded) > 0 {
+		undecoded = withoutDynamicLoopInputKeys(undecoded)
+		if len(undecoded) == 0 {
+			return overlay, nil
+		}
+		unknown := &UnknownKeysError{Path: source, Keys: uniqueTOMLKeys(undecoded)}
+		if err := rejectRemovedLoopRuntimeKeys(source, undecoded); err != nil {
+			unknown.Err = err
+			return overlay, unknown
+		}
+		if err := rejectRemovedProviderModelKeys(source, undecoded); err != nil {
+			unknown.Err = err
+			return overlay, unknown
+		}
+		if err := rejectRemovedExtensionMarketplaceKeys(source, undecoded); err != nil {
+			unknown.Err = err
+			return overlay, unknown
+		}
+		return overlay, unknown
+	}
+
+	if overlay.Shell != nil && overlay.Shell.Sessions.Scope != nil {
+		warnShellScopeDeprecation()
+	}
+	return overlay, nil
+}
+
+func withoutDynamicLoopInputKeys(keys []burnttoml.Key) []burnttoml.Key {
+	filtered := make([]burnttoml.Key, 0, len(keys))
+	for _, key := range keys {
+		if len(key) >= 4 && key[0] == LoopsConfigKey && key[1] == LoopInputsConfigKey {
+			continue
+		}
+		filtered = append(filtered, key)
+	}
+	return filtered
+}
+
+func rejectRemovedExtensionMarketplaceKeys(source string, keys []burnttoml.Key) error {
+	replacements := map[string]string{
+		"allow_unverified": "extensions.trust.allow_unverified",
+		configBaseURLKey:   "extensions.sources.github.base_url",
+		"registry":         "extensions.sources.github.enabled",
+	}
+	var removedSection burnttoml.Key
+	for _, key := range sortedTOMLKeys(keys) {
+		if len(key) < 2 || key[0] != "extensions" || key[1] != toolSurfaceMarketplaceKey {
+			continue
+		}
+		if len(key) < 3 {
+			removedSection = key
+			continue
+		}
+		replacement := cmp.Or(replacements[key[2]], "extensions.trust or extensions.sources")
+		return fmt.Errorf(
+			"removed config key %q in %q: use %q",
+			key.String(),
+			source,
+			replacement,
+		)
+	}
+	if len(removedSection) > 0 {
+		return fmt.Errorf(
+			"removed config key %q in %q: use %q",
+			removedSection.String(),
+			source,
+			"extensions.trust or extensions.sources",
+		)
+	}
+	return nil
+}
+
+func rejectRemovedLoopRuntimeKeys(source string, keys []burnttoml.Key) error {
+	for _, key := range sortedTOMLKeys(keys) {
+		for _, segment := range key {
+			if segment != "model_defaults" {
+				continue
+			}
+			return fmt.Errorf(
+				"removed config key %q in %q: use runtime_defaults; see MIGRATION_GUIDE.md#per-task-runtime-selection",
+				key.String(),
+				source,
+			)
+		}
+	}
+	return nil
+}
+
+func rejectRemovedProviderModelKeys(source string, keys []burnttoml.Key) error {
+	for _, key := range sortedTOMLKeys(keys) {
+		if len(key) != 3 || key[0] != providersConfigKey {
+			continue
+		}
+		if key[2] == "aliases" {
+			return fmt.Errorf(
+				"removed config key %q in %q: aliases was removed; reference providers by canonical name",
+				key.String(),
+				source,
+			)
+		}
+		replacement := ""
+		switch key[2] {
+		case "default_model":
+			replacement = fmt.Sprintf("providers.%s.models.default", key[1])
+		case "supported_models":
+			replacement = fmt.Sprintf("providers.%s.models.curated", key[1])
+		case "supports_reasoning_effort":
+			replacement = fmt.Sprintf("providers.%s.models.curated[].reasoning_efforts", key[1])
+		}
+		if replacement != "" {
+			return fmt.Errorf(
+				"removed config key %q in %q: use %q",
+				key.String(),
+				source,
+				replacement,
+			)
+		}
+	}
+	return nil
+}
+
+func (o httpOverlay) Apply(dst *HTTPConfig) {
+	if o.Host != nil {
+		dst.Host = *o.Host
+	}
+	if o.Port != nil {
+		dst.Port = *o.Port
+	}
+}
+
+func (o defaultsOverlay) Apply(dst *DefaultsConfig) {
+	if o.Agent != nil {
+		dst.Agent = *o.Agent
+	}
+	if o.Provider != nil {
+		if CanonicalProviderName(*o.Provider) != CanonicalProviderName(dst.Provider) {
+			// The inherited model and reasoning were chosen for the provider this
+			// layer replaces; keeping them would run that model on another provider.
+			dst.Model, dst.ReasoningEffort = "", ""
+		}
+		dst.Provider = *o.Provider
+	}
+	if o.Model != nil {
+		dst.Model = *o.Model
+	}
+	if o.ReasoningEffort != nil {
+		dst.ReasoningEffort = *o.ReasoningEffort
+	}
+}
+
+func (o agentsOverlay) Apply(dst *AgentsConfig) {
+	o.applyAlwaysOn(&dst.AlwaysOn)
+	o.Soul.Apply(&dst.Soul)
+	o.Heartbeat.Apply(&dst.Heartbeat)
+	applyAgentOverrideOverlays(o.Overrides, &dst.Overrides)
+}
+
+func (o soulOverlay) Apply(dst *SoulConfig) {
+	if o.Enabled != nil {
+		dst.Enabled = *o.Enabled
+	}
+	if o.MaxBodyBytes != nil {
+		dst.MaxBodyBytes = *o.MaxBodyBytes
+	}
+	if o.ContextProjectionBytes != nil {
+		dst.ContextProjectionBytes = *o.ContextProjectionBytes
+	}
+}
+
+func (o heartbeatOverlay) Apply(dst *HeartbeatConfig) {
+	o.Sources.Apply(&dst.Sources)
+	if o.TriageModels != nil {
+		dst.TriageModels = maps.Clone(o.TriageModels)
+	}
+	if o.MaxInterval != nil {
+		dst.MaxInterval = *o.MaxInterval
+	}
+	if o.MaxConcurrentTriage != nil {
+		dst.MaxConcurrentTriage = *o.MaxConcurrentTriage
+	}
+	if o.QuietBackoffCap != nil {
+		dst.QuietBackoffCap = *o.QuietBackoffCap
+	}
+	if o.FatigueLimit != nil {
+		dst.FatigueLimit = *o.FatigueLimit
+	}
+	if o.Enabled != nil {
+		dst.Enabled = *o.Enabled
+	}
+	if o.MaxBodyBytes != nil {
+		dst.MaxBodyBytes = *o.MaxBodyBytes
+	}
+	if o.ContextProjectionBytes != nil {
+		dst.ContextProjectionBytes = *o.ContextProjectionBytes
+	}
+	if o.MinInterval != nil {
+		dst.MinInterval = *o.MinInterval
+	}
+	if o.DefaultInterval != nil {
+		dst.DefaultInterval = *o.DefaultInterval
+	}
+	if o.WakeCooldown != nil {
+		dst.WakeCooldown = *o.WakeCooldown
+	}
+	if o.MaxWakesPerCycle != nil {
+		dst.MaxWakesPerCycle = *o.MaxWakesPerCycle
+	}
+	if o.ActiveSessionOnly != nil {
+		dst.ActiveSessionOnly = *o.ActiveSessionOnly
+	}
+	if o.AllowActiveHoursPreferences != nil {
+		dst.AllowActiveHoursPreferences = *o.AllowActiveHoursPreferences
+	}
+	if o.WakeEventRetention != nil {
+		dst.WakeEventRetention = *o.WakeEventRetention
+	}
+	if o.SessionHealthStaleAfter != nil {
+		dst.SessionHealthStaleAfter = *o.SessionHealthStaleAfter
+	}
+	if o.SessionHealthHookMinInterval != nil {
+		dst.SessionHealthHookMinInterval = *o.SessionHealthHookMinInterval
+	}
+}
+
+func (o limitsOverlay) Apply(dst *LimitsConfig) {
+	if o.MaxConcurrentAgents != nil {
+		dst.MaxConcurrentAgents = *o.MaxConcurrentAgents
+	}
+}
+
+func (o permissionsOverlay) Apply(dst *PermissionsConfig) {
+	if o.Mode != nil {
+		dst.Mode = *o.Mode
+	}
+	if o.ProviderFullAccess != nil {
+		dst.ProviderFullAccess = *o.ProviderFullAccess
+	}
+}

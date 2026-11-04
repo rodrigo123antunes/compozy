@@ -2,175 +2,184 @@ package httpapi
 
 import (
 	"bytes"
-	"crypto/sha256"
-	"encoding/hex"
+	"cmp"
 	"fmt"
+	"io"
 	"io/fs"
 	"net/http"
+	"os"
 	"path"
+	"path/filepath"
+	"regexp"
 	"strings"
-	"sync"
-	"time"
 
+	webassets "github.com/compozy/compozy-web-assets"
 	"github.com/gin-gonic/gin"
-
-	webassets "github.com/compozy/compozy/web"
 )
 
-type staticHandler struct {
-	staticFS  fs.FS
-	startedAt time.Time
+const webDistDirEnvVar = "COMPOZY_WEB_DIST_DIR"
 
-	etagMu sync.RWMutex
-	etags  map[string]string
+const productionContentSecurityPolicy = "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; " +
+	"img-src 'self' data: blob:; font-src 'self'; connect-src 'self'; worker-src 'self' blob:; " +
+	"frame-src 'none'; frame-ancestors 'none'; object-src 'none'; base-uri 'self'; form-action 'self'"
+
+type staticSourceFS struct {
+	fs     fs.FS
+	source string
 }
 
-func newStaticFS() (fs.FS, error) {
-	return staticFSFromRoot(webassets.DistFS, "dist")
+func newStaticFS() (staticSourceFS, error) {
+	if override := strings.TrimSpace(os.Getenv(webDistDirEnvVar)); override != "" {
+		return newLocalStaticFS(override)
+	}
+	return newEmbeddedStaticFS()
 }
 
-func staticFSFromRoot(root fs.FS, dir string) (fs.FS, error) {
-	staticFS, err := fs.Sub(root, dir)
+func newEmbeddedStaticFS() (staticSourceFS, error) {
+	staticFS, err := fs.Sub(webassets.DistFS, webassets.DistDir)
 	if err != nil {
-		return nil, fmt.Errorf("embedded bundle directory %q: %w", dir, err)
+		return staticSourceFS{}, fmt.Errorf("embedded web bundle directory %q: %w", webassets.DistDir, err)
 	}
 	if _, err := fs.Stat(staticFS, "index.html"); err != nil {
-		return nil, fmt.Errorf("embedded bundle missing index.html: %w", err)
+		return staticSourceFS{}, fmt.Errorf("embedded web bundle missing index.html: %w", err)
 	}
-	return staticFS, nil
+	return staticSourceFS{
+		fs:     staticFS,
+		source: fmt.Sprintf("embedded %s/%s", "github.com/compozy/compozy-web-assets", webassets.DistDir),
+	}, nil
 }
 
-func newStaticHandler(staticFS fs.FS, startedAt time.Time) *staticHandler {
-	if staticFS == nil {
-		return nil
+func newLocalStaticFS(dir string) (staticSourceFS, error) {
+	absDir, err := filepath.Abs(dir)
+	if err != nil {
+		return staticSourceFS{}, fmt.Errorf("%s resolve %q: %w", webDistDirEnvVar, dir, err)
 	}
-	return &staticHandler{
-		staticFS:  staticFS,
-		startedAt: startedAt,
-		etags:     make(map[string]string),
+	//nolint:gosec // dir is the operator-chosen web dist directory, not request input.
+	info, err := os.Stat(absDir)
+	if err != nil {
+		return staticSourceFS{}, fmt.Errorf("%s stat %q: %w", webDistDirEnvVar, absDir, err)
 	}
+	if !info.IsDir() {
+		return staticSourceFS{}, fmt.Errorf("%s %q is not a directory", webDistDirEnvVar, absDir)
+	}
+	indexPath := filepath.Join(absDir, "index.html")
+	//nolint:gosec // dir is the operator-chosen web dist directory, not request input.
+	indexInfo, err := os.Stat(indexPath)
+	if err != nil {
+		return staticSourceFS{}, fmt.Errorf(
+			"%s missing readable index.html at %q: %w",
+			webDistDirEnvVar,
+			indexPath,
+			err,
+		)
+	}
+	if indexInfo.IsDir() {
+		return staticSourceFS{}, fmt.Errorf("%s index.html at %q is a directory", webDistDirEnvVar, indexPath)
+	}
+	//nolint:gosec // dir is the operator-chosen web dist directory, not request input.
+	file, err := os.Open(indexPath)
+	if err != nil {
+		return staticSourceFS{}, fmt.Errorf("%s open index.html at %q: %w", webDistDirEnvVar, indexPath, err)
+	}
+	if err := file.Close(); err != nil {
+		return staticSourceFS{}, fmt.Errorf("%s close index.html at %q: %w", webDistDirEnvVar, indexPath, err)
+	}
+	return staticSourceFS{
+		fs:     os.DirFS(absDir),
+		source: webDistDirEnvVar + "=" + absDir,
+	}, nil
 }
 
-func (h *staticHandler) serve(c *gin.Context) {
+func (h *Handlers) serveStaticRoute(c *gin.Context) {
 	if c == nil {
 		return
 	}
 	if h == nil || h.staticFS == nil {
-		respondStaticNotFound(c)
+		respondNotFound(c)
 		return
 	}
 
 	requestPath := normalizedRequestPath(c.Request.URL.Path)
 	if isStaticBypassPath(requestPath) || !isStaticRequestMethod(c.Request.Method) {
-		respondStaticNotFound(c)
+		respondNotFound(c)
 		return
 	}
 
-	if assetPath, ok := h.resolveAsset(requestPath); ok {
-		if assetPath == "" {
-			respondStaticNotFound(c)
-			return
-		}
-		h.serveAsset(c, assetPath)
+	if asset, ok := h.resolveStaticAsset(requestPath); ok {
+		h.serveAsset(c, asset)
 		return
 	}
-	if shouldServeSPAIndex(requestPath) {
+	if shouldServeSPAIndex(requestPath, c.GetHeader("Accept")) {
 		h.serveAsset(c, "index.html")
 		return
 	}
 
-	respondStaticNotFound(c)
+	respondNotFound(c)
 }
 
-func (h *staticHandler) resolveAsset(requestPath string) (string, bool) {
+func (h *Handlers) resolveStaticAsset(requestPath string) (string, bool) {
 	if h == nil || h.staticFS == nil {
 		return "", false
 	}
 
-	assetPath := strings.TrimPrefix(path.Clean("/"+strings.TrimSpace(requestPath)), "/")
-	if assetPath == "." || assetPath == "" {
+	asset := strings.TrimPrefix(path.Clean("/"+strings.TrimSpace(requestPath)), "/")
+	if asset == "." || asset == "" {
 		return "index.html", true
 	}
-	info, err := fs.Stat(h.staticFS, assetPath)
+	if info, err := fs.Stat(h.staticFS, asset); err == nil && !info.IsDir() {
+		return asset, true
+	}
+
+	return "", false
+}
+
+func (h *Handlers) serveAsset(c *gin.Context, asset string) {
+	cleanAsset := strings.TrimPrefix(asset, "/")
+	file, err := h.staticFS.Open(cleanAsset)
 	if err != nil {
-		return "", false
-	}
-	if info.IsDir() {
-		return "", true
-	}
-	return assetPath, true
-}
-
-func (h *staticHandler) serveAsset(c *gin.Context, assetPath string) {
-	clean := strings.TrimPrefix(assetPath, "/")
-	data, err := fs.ReadFile(h.staticFS, clean)
-	if err != nil {
-		respondStaticNotFound(c)
+		respondNotFound(c)
 		return
 	}
-
-	etag := h.etagFor(clean, data)
-	applyStaticCacheHeaders(c, clean, etag)
-	if match := c.Request.Header.Get("If-None-Match"); match != "" && etagMatches(match, etag) {
-		c.Status(http.StatusNotModified)
-		return
-	}
-
-	http.ServeContent(c.Writer, c.Request, path.Base(assetPath), h.startedAt, bytes.NewReader(data))
-}
-
-func (h *staticHandler) etagFor(assetPath string, data []byte) string {
-	h.etagMu.RLock()
-	if tag, ok := h.etags[assetPath]; ok {
-		h.etagMu.RUnlock()
-		return tag
-	}
-	h.etagMu.RUnlock()
-
-	sum := sha256.Sum256(data)
-	tag := fmt.Sprintf("%q", hex.EncodeToString(sum[:16]))
-
-	h.etagMu.Lock()
-	h.etags[assetPath] = tag
-	h.etagMu.Unlock()
-	return tag
-}
-
-func applyStaticCacheHeaders(c *gin.Context, assetPath string, etag string) {
-	header := c.Writer.Header()
-	header.Set("ETag", etag)
-	header.Set("X-Content-Type-Options", "nosniff")
-	if isImmutableAsset(assetPath) {
-		header.Set("Cache-Control", "public, max-age=31536000, immutable")
-		return
-	}
-	header.Set("Cache-Control", "no-cache")
-}
-
-func isImmutableAsset(assetPath string) bool {
-	clean := strings.TrimPrefix(strings.TrimSpace(assetPath), "/")
-	if clean == "" {
-		return false
-	}
-	if strings.HasPrefix(clean, "assets/") {
-		return true
-	}
-	return false
-}
-
-func etagMatches(ifNoneMatch string, etag string) bool {
-	if ifNoneMatch == "*" {
-		return true
-	}
-	candidates := strings.Split(ifNoneMatch, ",")
-	for _, candidate := range candidates {
-		trimmed := strings.TrimSpace(candidate)
-		trimmed = strings.TrimPrefix(trimmed, "W/")
-		if trimmed == etag {
-			return true
+	defer func() {
+		if err := file.Close(); err != nil {
+			h.Logger.Debug("httpapi: close static asset failed", "asset", cleanAsset, "error", err)
 		}
+	}()
+	info, err := file.Stat()
+	if err != nil {
+		respondNotFound(c)
+		return
 	}
-	return false
+	modified := cmp.Or(info.ModTime(), h.StartedAt)
+	c.Header("Content-Security-Policy", productionContentSecurityPolicy)
+	c.Header("Cache-Control", staticCacheControl(cleanAsset))
+
+	if seeker, ok := file.(io.ReadSeeker); ok {
+		http.ServeContent(c.Writer, c.Request, path.Base(asset), modified, seeker)
+		return
+	}
+
+	data, err := io.ReadAll(file)
+	if err != nil {
+		respondNotFound(c)
+		return
+	}
+	http.ServeContent(c.Writer, c.Request, path.Base(asset), modified, bytes.NewReader(data))
+}
+
+// fingerprintedAsset matches Vite's build output, assets/<name>-<8-character hash>.<ext>. Public
+// files copied under assets/ keep their own subdirectories (emojibase), so they never match.
+var fingerprintedAsset = regexp.MustCompile(`^assets/[^/]+-[A-Za-z0-9_-]{8}\.[A-Za-z0-9]+$`)
+
+// staticCacheControl makes clients revalidate the SPA shell and every unversioned file before
+// reusing a cached copy. Without it a browser may keep a heuristically fresh index.html across a
+// runtime update and boot the previous release's bundle (#742). A fingerprinted file's URL
+// changes with its content, so it can be cached for good.
+func staticCacheControl(asset string) string {
+	if fingerprintedAsset.MatchString(asset) {
+		return "public, max-age=31536000, immutable"
+	}
+	return "no-cache"
 }
 
 func normalizedRequestPath(rawPath string) string {
@@ -182,7 +191,10 @@ func normalizedRequestPath(rawPath string) string {
 }
 
 func isStaticBypassPath(requestPath string) bool {
-	return requestPath == "/api" || strings.HasPrefix(requestPath, "/api/")
+	return requestPath == "/api" ||
+		strings.HasPrefix(requestPath, "/api/") ||
+		requestPath == "/ws" ||
+		strings.HasPrefix(requestPath, "/ws/")
 }
 
 func isStaticRequestMethod(method string) bool {
@@ -194,13 +206,18 @@ func isStaticRequestMethod(method string) bool {
 	}
 }
 
-func shouldServeSPAIndex(requestPath string) bool {
+func shouldServeSPAIndex(requestPath string, accept string) bool {
 	if requestPath == "/" {
 		return true
 	}
-	return !strings.Contains(path.Base(requestPath), ".")
+	if strings.Contains(strings.ToLower(accept), "text/html") {
+		return true
+	}
+
+	lastSegment := path.Base(requestPath)
+	return !strings.Contains(lastSegment, ".")
 }
 
-func respondStaticNotFound(c *gin.Context) {
+func respondNotFound(c *gin.Context) {
 	c.String(http.StatusNotFound, "404 page not found")
 }

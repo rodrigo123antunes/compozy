@@ -1,0 +1,4926 @@
+package httpapi
+
+import (
+	"bytes"
+	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"log/slog"
+	"maps"
+	"net/http"
+	"net/http/httptest"
+	"os"
+	"path/filepath"
+	"reflect"
+	"slices"
+	"strings"
+	"sync/atomic"
+	"testing"
+	"time"
+
+	"github.com/compozy/compozy/internal/acp"
+	"github.com/compozy/compozy/internal/api/contract"
+	core "github.com/compozy/compozy/internal/api/core"
+	apitestutil "github.com/compozy/compozy/internal/api/testutil"
+	compozyconfig "github.com/compozy/compozy/internal/config"
+	"github.com/compozy/compozy/internal/diagnostics"
+	mcpauth "github.com/compozy/compozy/internal/mcp/auth"
+	"github.com/compozy/compozy/internal/mention"
+	monitorpkg "github.com/compozy/compozy/internal/monitor"
+	"github.com/compozy/compozy/internal/observe"
+	profilepkg "github.com/compozy/compozy/internal/profile"
+	"github.com/compozy/compozy/internal/session"
+	"github.com/compozy/compozy/internal/sessionprocess"
+	settingspkg "github.com/compozy/compozy/internal/settings"
+	"github.com/compozy/compozy/internal/store"
+	taskpkg "github.com/compozy/compozy/internal/task"
+	"github.com/compozy/compozy/internal/transcript"
+	workspacepkg "github.com/compozy/compozy/internal/workspace"
+	"github.com/gin-gonic/gin"
+)
+
+func TestRegisterRoutesCoversTechSpecEndpoints(t *testing.T) {
+	t.Run("Should cover the registered HTTP route contract", func(t *testing.T) {
+		t.Parallel()
+		assertRegisteredRouteContract(t)
+	})
+}
+
+func assertRegisteredRouteContract(t *testing.T) {
+	t.Helper()
+	homePaths := newTestHomePaths(t)
+	handlers := newTestHandlers(t, &stubSessionManager{}, stubObserver{}, homePaths)
+	engine := newTestRouter(t, handlers)
+
+	routes := engine.Routes()
+	got := make([]string, 0, len(routes))
+	for _, route := range routes {
+		got = append(got, route.Method+" "+route.Path)
+	}
+	slices.Sort(got)
+
+	want := []string{
+		"DELETE /api/workspaces/:workspace_id/sessions/:session_id/links",
+		"GET /api/workspaces/:workspace_id/sessions/:session_id/links",
+		"POST /api/workspaces/:workspace_id/sessions/:session_id/links",
+		"POST /api/workspaces/:workspace_id/sessions/:session_id/links/refresh",
+		"GET /api/workspaces/:workspace_id/sessions/:session_id/link-candidates",
+		"DELETE /api/app-tokens/:app_token_id",
+		"GET /api/app-tokens",
+		"GET /api/processes",
+		"POST /api/processes/terminate",
+		"GET /api/workspaces/:workspace_id/sessions/:session_id/processes",
+		"POST /api/workspaces/:workspace_id/sessions/:session_id/processes/terminate",
+		"GET /api/openapi.json",
+		"PATCH /api/app-tokens/:app_token_id",
+		"POST /api/app-tokens",
+		"DELETE /api/profiles/:name",
+		"GET /api/profiles",
+		"GET /api/profiles/:name",
+		"GET /api/profiles/:name/archive-plan",
+		"GET /api/profiles/:name/delete-plan",
+		"GET /api/profiles/:name/rename-plan",
+		"GET /api/profiles/ops",
+		"GET /api/profiles/selection",
+		"PATCH /api/profiles/:name",
+		"POST /api/profiles",
+		"POST /api/profiles/:name/archive",
+		"POST /api/profiles/:name/rename",
+		"POST /api/profiles/:name/unarchive",
+		"POST /api/profiles/ops/:op_id/retry",
+		"PUT /api/profiles/selection",
+		"DELETE /api/cmd-palette/personalization",
+		"DELETE /api/cmd-palette/pins/:id",
+		"DELETE /api/cmd-palette/view-sessions/:session",
+		"DELETE /api/agents/:name/heartbeat",
+		"DELETE /api/agents/:name/memory/entries",
+		"DELETE /api/agents/:name/soul",
+		"DELETE /api/automation/jobs/:id",
+		"DELETE /api/automation/triggers/:id",
+		"DELETE /api/extensions/:name",
+		"DELETE /api/extensions/:name/secrets/:env_name",
+		"DELETE /api/tool-approval-grants/:id",
+		"DELETE /api/settings/hooks/:name",
+		"DELETE /api/settings/mcp-servers/:name",
+		"DELETE /api/settings/providers/:name",
+		"DELETE /api/workspaces/:workspace_id/sessions/:session_id",
+		"DELETE /api/workspaces/:workspace_id/sessions/:session_id/attachments/:attachment_id",
+		"DELETE /api/workspaces/:workspace_id/sessions/:session_id/parent",
+		"DELETE /api/workspaces/:workspace_id/sessions/:session_id/runtime",
+		"DELETE /api/workspaces/:workspace_id/terminals/:id",
+		"DELETE /api/tasks/:id",
+		"DELETE /api/tasks/:id/dependencies/:depends_on_id",
+		"DELETE /api/tasks/:id/execution-profile",
+		"DELETE /api/vault/secrets",
+		"DELETE /api/workspaces/:workspace_id",
+		"DELETE /api/workspaces/:workspace_id/worktrees/:worktree_id",
+		"DELETE /api/workspaces/:workspace_id/window-manager/clients/:client_id",
+		"DELETE /api/workspaces/:workspace_id/window-manager/layout-profiles/:profile_id",
+		"GET /api/workspaces/:workspace_id/window-manager",
+		"GET /api/workspaces/:workspace_id/window-manager/clients",
+		"GET /api/workspaces/:workspace_id/window-manager/layout",
+		"GET /api/workspaces/:workspace_id/window-manager/layout-profiles",
+		"GET /api/workspaces/:workspace_id/window-manager/stream",
+		"GET /api/workspaces/:workspace_id/terminals",
+		"GET /api/workspaces/:workspace_id/terminals/:id",
+		"GET /api/workspaces/:workspace_id/terminals/:id/read",
+		"GET /api/workspaces/:workspace_id/terminals/:id/stream",
+		"GET /api/workspaces/:workspace_id/terminals/artifacts/:id",
+		"GET /api/workspaces/:workspace_id/terminals/input-requests",
+		"GET /api/workspaces/:workspace_id/terminals/journal",
+		"GET /api/workspaces/:workspace_id/terminals/recordings/:id",
+		"GET /api/workspaces/:workspace_id/terminals/stream",
+		"POST /api/workspaces/:workspace_id/window-manager/clients",
+		"POST /api/workspaces/:workspace_id/window-manager/commands",
+		"POST /api/workspaces/:workspace_id/window-manager/layout/validate",
+		"POST /api/workspaces/:workspace_id/window-manager/preview",
+		"PUT /api/workspaces/:workspace_id/window-manager/layout",
+		"PUT /api/workspaces/:workspace_id/window-manager/layout-profiles/:profile_id",
+		"POST /api/workspaces/:workspace_id/terminals",
+		"POST /api/workspaces/:workspace_id/terminals/:id/attach-ticket",
+		"POST /api/workspaces/:workspace_id/terminals/:id/input-requests/:request_id/answer",
+		"POST /api/workspaces/:workspace_id/terminals/:id/input-requests/:request_id/reject",
+		"POST /api/workspaces/:workspace_id/terminals/:id/recording",
+		"POST /api/workspaces/:workspace_id/terminals/:id/signal",
+		"POST /api/workspaces/:workspace_id/terminals/:id/wait",
+		"POST /api/workspaces/:workspace_id/terminals/exec",
+		"GET /api/agent/context",
+		"GET /api/agent/coordinator/config",
+		"GET /api/agent/me",
+		"GET /api/agent/soul",
+		"GET /api/agents",
+		"GET /api/agents/:name",
+		"GET /api/agents/:name/heartbeat",
+		"GET /api/agents/:name/heartbeat/sources",
+		"POST /api/agents/:name/heartbeat/scripts/:script/approve",
+		"DELETE /api/agents/:name/heartbeat/scripts/:script/approve",
+		"GET /api/agents/:name/activity",
+		"GET /api/agents/:name/memory",
+		"GET /api/agents/:name/memory/history",
+		"GET /api/permissions",
+		"GET /api/agents/:name/heartbeat/history",
+		"GET /api/agents/:name/heartbeat/status",
+		"GET /api/agents/:name/soul",
+		"GET /api/agents/:name/soul/history",
+		"GET /api/agents/catalog",
+		"GET /api/automation/jobs",
+		"GET /api/automation/jobs/:id",
+		"GET /api/automation/jobs/:id/runs",
+		"GET /api/cmd-palette/clients",
+		"GET /api/cmd-palette/commands",
+		"GET /api/cmd-palette/personalization",
+		"GET /api/cmd-palette/rank-signals",
+		"GET /api/cmd-palette/stream",
+		"GET /api/cmd-palette/views/:id",
+		"GET /api/cmd-palette/views/:id/stream",
+		"GET /api/cmd-palette/view-sessions/:session/stream",
+		"GET /api/automation/runs",
+		"GET /api/automation/runs/:id",
+		"GET /api/automation/triggers",
+		"GET /api/automation/triggers/:id",
+		"GET /api/automation/triggers/:id/runs",
+		"GET /api/workspaces/:workspace_id/automation/suggestions",
+		"GET /api/doctor",
+		"POST /api/drain",
+		"GET /api/extensions",
+		"GET /api/extensions/commands",
+		"GET /api/extensions/search",
+		"GET /api/extensions/:name",
+		"GET /api/extensions/:name/preview",
+		"GET /api/extensions/:name/inventory",
+		"GET /api/extensions/:name/enablement",
+		"GET /api/extensions/:name/logs",
+		"GET /api/extensions/:name/provenance",
+		"GET /api/extensions/:name/secrets",
+		"GET /api/hooks/catalog",
+		"GET /api/hooks/events",
+		"GET /api/notifications/attention",
+		"GET /api/tool-approval-grants",
+		"GET /api/workspaces/:workspace_id/hooks/runs",
+		"GET /api/logs",
+		"GET /api/logs/stream",
+		"GET /api/mcp/oauth/callback",
+		"GET /api/marketplace",
+		"GET /api/marketplace/entries/:entry_id",
+		"GET /api/marketplace/sources",
+		"POST /api/marketplace/sources",
+		"PATCH /api/marketplace/sources/:name",
+		"DELETE /api/marketplace/sources/:name",
+		"POST /api/marketplace/sources/:name/refresh",
+		"GET /api/settings/marketplace",
+		"PATCH /api/settings/marketplace",
+		"GET /api/status",
+		"GET /api/status/identity",
+		"POST /api/undrain",
+		"GET /api/onboarding",
+		"POST /api/onboarding/complete",
+		"DELETE /api/onboarding",
+		"GET /api/fs/browse",
+		"GET /api/observe/overview",
+		"DELETE /api/agent-instances/:id",
+		"GET /api/agent-instances",
+		"GET /api/agent-skill-reviews",
+		"GET /api/agent-skill-reviews/:id",
+		"POST /api/agent-skill-reviews/:id/approve",
+		"POST /api/agent-skill-reviews/:id/reject",
+		"GET /api/agent-instances/:id",
+		"GET /api/agent-instances/:id/away",
+		"GET /api/agent-instances/:id/check-ins",
+		"GET /api/agent-instances/:id/occurrences/:occurrence",
+		"GET /api/agent-instances/:id/reports",
+		"GET /api/permissions/rollup",
+		"GET /api/workspaces/:workspace_id/sessions/:session_id/pending-interactions",
+		"POST /api/agent-instances",
+		"POST /api/agent-instances/:id/ensure-main",
+		"POST /api/agent-instances/:id/pause",
+		"POST /api/agent-instances/:id/resume",
+		"POST /api/agent-instances/adopt",
+
+		"GET /api/observe/tasks/dashboard",
+		"GET /api/observe/tasks/inbox",
+		"GET /api/openai/v1/models",
+		"GET /api/model-catalog/*catalog_path",
+		"GET /api/provider-usage",
+		"GET /api/provider-usage/providers/:provider_id",
+		"GET /api/provider-usage/stream",
+		"POST /api/provider-usage/refresh",
+		"GET /api/providers",
+		"GET /api/providers/:provider_id",
+		"GET /api/roles",
+		"GET /api/roles/:role",
+		"GET /api/sessions",
+		"GET /api/sessions/attention-summary",
+		"GET /api/sessions/facets",
+		"GET /api/sessions/catalog-stream",
+		"GET /api/sessions/:session_id",
+		"GET /api/sessions/:session_id/owner",
+		"GET /api/workspaces/:workspace_id/sessions",
+		"GET /api/workspaces/:workspace_id/sessions/:session_id/subagents",
+		"GET /api/workspaces/:workspace_id/sessions/:session_id/monitors",
+		"POST /api/workspaces/:workspace_id/sessions/:session_id/monitors/:monitor_id/cancel",
+		"GET /api/workspaces/:workspace_id/subagents/:subagent_id",
+		"POST /api/workspaces/:workspace_id/subagents/:subagent_id/cancel",
+		"GET /api/workspaces/:workspace_id/sessions/:session_id",
+		"GET /api/workspaces/:workspace_id/sessions/:session_id/clarifications",
+		"GET /api/workspaces/:workspace_id/sessions/:session_id/events",
+		"GET /api/workspaces/:workspace_id/sessions/:session_id/commands",
+		"GET /api/workspaces/:workspace_id/sessions/:session_id/files",
+		"GET /api/workspaces/:workspace_id/sessions/:session_id/goal",
+		"POST /api/workspaces/:workspace_id/sessions/:session_id/goal",
+		"GET /api/workspaces/:workspace_id/sessions/:session_id/health",
+		"GET /api/workspaces/:workspace_id/sessions/:session_id/history",
+		"GET /api/workspaces/:workspace_id/sessions/:session_id/inspect",
+		"GET /api/workspaces/:workspace_id/sessions/:session_id/interactions",
+		"GET /api/workspaces/:workspace_id/sessions/:session_id/prompt/queue",
+		"GET /api/workspaces/:workspace_id/sessions/:session_id/recap",
+		"GET /api/workspaces/:workspace_id/sessions/:session_id/usage",
+		"GET /api/workspaces/:workspace_id/sessions/:session_id/usage/turns",
+		"GET /api/workspaces/:workspace_id/sessions/:session_id/status",
+		"GET /api/workspaces/:workspace_id/sessions/:session_id/transcript",
+		"GET /api/sessions/:session_id/transcript",
+		"GET /api/sessions/:session_id/status",
+		"GET /api/sessions/:session_id/events",
+		"GET /api/sessions/:session_id/history",
+		"GET /api/sessions/:session_id/stream",
+		"GET /api/sessions/:session_id/transcript/search",
+		"GET /api/sessions/:session_id/transcript/outline",
+		"GET /api/workspaces/:workspace_id/sessions/:session_id/transcript/search",
+		"GET /api/workspaces/:workspace_id/sessions/:session_id/transcript/outline",
+		"GET /api/workspaces/:workspace_id/sessions/:session_id/stream",
+		"GET /api/workspaces/:workspace_id/sessions/:session_id/tools",
+		"GET /api/workspaces/:workspace_id/sessions/:session_id/attachments/:attachment_id/bytes",
+		"GET /api/workspaces/:workspace_id/tool-artifacts/:artifact_id",
+		"GET /api/settings/actions/restart/:operation_id",
+		"GET /api/settings/apply",
+		"GET /api/settings/automation",
+		"GET /api/settings/general",
+		"GET /api/settings/persona",
+		"GET /api/settings/update",
+		"GET /api/settings/hooks",
+		"GET /api/settings/hooks-extensions",
+		"GET /api/settings/mcp-servers",
+		"GET /api/settings/mcp-servers/:name",
+		"GET /api/settings/mcp-servers/:name/auth/status",
+		"POST /api/settings/mcp-servers/:name/auth/begin",
+		"POST /api/settings/mcp-servers/:name/auth/exchange",
+		"POST /api/settings/mcp-servers/:name/auth/logout",
+		"GET /api/settings/attention",
+		"GET /api/settings/shell",
+		"GET /api/settings/provider-usage",
+		"GET /api/settings/cmd-palette",
+		"GET /api/settings/window-manager",
+		"GET /api/settings/observability",
+		"GET /api/settings/observability/log-tail",
+		"GET /api/settings/providers",
+		"GET /api/settings/providers/:name",
+		"GET /api/settings/roles",
+		"GET /api/settings/skills",
+		"GET /api/support/bundles/:operation_id",
+		"GET /api/support/bundles/:operation_id/download",
+		"GET /api/skills",
+		"GET /api/skills/:name",
+		"GET /api/skills/:name/content",
+		"GET /api/skills/:name/shadows",
+		"GET /api/scheduler",
+		"GET /api/scheduler/backlog",
+		"GET /api/tasks",
+		"GET /api/tasks/:id",
+		"GET /api/tasks/:id/blocks",
+		"GET /api/tasks/:id/inspect",
+		"GET /api/tasks/:id/execution-profile",
+		"GET /api/tasks/:id/reviews",
+		"GET /api/tasks/:id/stream",
+		"GET /api/tasks/:id/timeline",
+		"GET /api/tasks/:id/tree",
+		"GET /api/tasks/:id/runs",
+		"GET /api/runs/:id/inspect",
+		"GET /api/task-runs/:id",
+		"GET /api/task-runs/:id/result",
+		"GET /api/task-runs/:id/reviews",
+		"GET /api/task-reviews/:id",
+		"GET /api/tools",
+		"GET /api/tools/approvals/:id",
+		"GET /api/tools/:id",
+		"GET /api/toolsets",
+		"GET /api/toolsets/:id",
+		"GET /api/vault/secrets",
+		"GET /api/vault/secrets/metadata",
+		"GET /api/workspaces",
+		"GET /api/workspaces/:workspace_id",
+		"GET /api/worktrees/catalog-stream",
+		"GET /api/workspaces/:workspace_id/worktrees",
+		"GET /api/workspaces/:workspace_id/worktrees/:worktree_id",
+		"GET /api/workspaces/:workspace_id/worktrees/:worktree_id/exit",
+		"GET /api/workspaces/:workspace_id/worktrees/:worktree_id/status",
+		"GET /api/workspaces/:workspace_id/worktrees/:worktree_id/stream",
+		"GET /api/workspaces/:workspace_id/loop-runs",
+		"GET /api/workspaces/:workspace_id/loop-runs/:run_id",
+		"GET /api/workspaces/:workspace_id/loop-runs/:run_id/diff",
+		"GET /api/workspaces/:workspace_id/loop-runs/:run_id/events",
+		"GET /api/workspaces/:workspace_id/loop-runs/:run_id/briefing",
+		"GET /api/workspaces/:workspace_id/loop-runs/:run_id/nodes",
+		"GET /api/workspaces/:workspace_id/loop-runs/:run_id/nodes/:node_id/request",
+		"GET /api/workspaces/:workspace_id/loop-runs/:run_id/timeline",
+		"GET /api/workspaces/:workspace_id/loop-runs/:run_id/turns",
+		"GET /api/workspaces/:workspace_id/loop-requests",
+		"GET /api/workspaces/:workspace_id/loops",
+		"GET /api/loops",
+		"GET /api/loop-runs",
+		"GET /api/agents/aggregate",
+		"GET /api/automation/suggestions",
+		"GET /api/terminals",
+		"GET /api/terminals/catalog-stream",
+		"GET /api/worktrees",
+		"GET /api/loop-requests",
+		"GET /api/workspaces/:workspace_id/loops/:name",
+		"GET /api/workspaces/:workspace_id/loops/:name/annotations",
+		"GET /api/workspaces/:workspace_id/loops/:name/config",
+		"GET /api/workspaces/:workspace_id/loops/:name/input-defaults",
+		"GET /api/workspaces/:workspace_id/loops/:name/input-defaults/:key",
+		"PATCH /api/automation/jobs/:id",
+		"PATCH /api/automation/triggers/:id",
+		"PATCH /api/settings/automation",
+		"PATCH /api/settings/attention",
+		"PATCH /api/settings/shell",
+		"PATCH /api/settings/provider-usage",
+		"PATCH /api/settings/cmd-palette",
+		"PATCH /api/settings/general",
+		"PATCH /api/settings/persona",
+		"PATCH /api/settings/hooks-extensions",
+		"PATCH /api/settings/window-manager",
+		"PATCH /api/settings/observability",
+		"PATCH /api/settings/roles",
+		"PATCH /api/settings/skills",
+		"PATCH /api/tasks/:id",
+		"PATCH /api/workspaces/:workspace_id",
+		"PATCH /api/workspaces/:workspace_id/loops/:name",
+		"PATCH /api/workspaces/:workspace_id/sessions/:session_id",
+		"POST /api/agent/notify",
+		"POST /api/agent/soul/validate",
+		"POST /api/agent/spawn",
+		"POST /api/agent/tasks/:run_id/complete",
+		"POST /api/agent/tasks/:run_id/fail",
+		"POST /api/agent/tasks/:run_id/heartbeat",
+		"POST /api/agent/tasks/:run_id/release",
+		"POST /api/agent/tasks/:run_id/start",
+		"POST /api/agents/:name/duplicate",
+		"POST /api/agent/tasks/claim-next",
+		"POST /api/agents",
+		"POST /api/agents/draft-instructions",
+		"POST /api/agents/:name/heartbeat/rollback",
+		"POST /api/agents/:name/heartbeat/validate",
+		"POST /api/agents/:name/heartbeat/wake",
+		"POST /api/agents/:name/soul/rollback",
+		"POST /api/agents/:name/soul/validate",
+		"POST /api/agent-instances/:id/away",
+		"POST /api/agent-instances/:id/check",
+		"POST /api/agents/:name/memory/entries",
+		"POST /api/agents/:name/memory/rollback",
+		"POST /api/agents/:name/memory/search",
+		"POST /api/agents/:name/memory/validate",
+		"POST /api/automation/jobs",
+		"POST /api/automation/jobs/:id/trigger",
+		"POST /api/automation/triggers",
+		"POST /api/workspaces/:workspace_id/worktrees",
+		"POST /api/workspaces/:workspace_id/worktrees/adopt",
+		"POST /api/workspaces/:workspace_id/worktrees/discovered/remove",
+		"POST /api/workspaces/:workspace_id/worktrees/:worktree_id/cancel",
+		"POST /api/workspaces/:workspace_id/worktrees/:worktree_id/dismiss",
+		"POST /api/workspaces/:workspace_id/worktrees/:worktree_id/exit/actions",
+		"POST /api/workspaces/:workspace_id/worktrees/:worktree_id/exit/prepare",
+		"POST /api/workspaces/:workspace_id/worktrees/:worktree_id/exit/cancel",
+		"POST /api/workspaces/:workspace_id/automation/suggestions/:suggestion_id/accept",
+		"POST /api/workspaces/:workspace_id/automation/suggestions/:suggestion_id/dismiss",
+		"POST /api/marketplace/refresh",
+		"POST /api/model-catalog/*catalog_path",
+		"POST /api/providers/:provider_id/auth/probe",
+		"POST /api/runs/:id/fail",
+		"POST /api/runs/:id/release",
+		"POST /api/runs/:id/recover",
+		"POST /api/runs/:id/retry",
+		"POST /api/runs/bulk/fail",
+		"POST /api/runs/bulk/release",
+		"POST /api/scheduler/drain",
+		"POST /api/scheduler/pause",
+		"POST /api/scheduler/resume",
+		"POST /api/workspaces/:workspace_id/loop-runs/:run_id/approve",
+		"POST /api/workspaces/:workspace_id/loop-runs/:run_id/cancel",
+		"POST /api/workspaces/:workspace_id/loop-runs/:run_id/fork",
+		"POST /api/workspaces/:workspace_id/loop-runs/:run_id/nodes/:node_id/cancel",
+		"POST /api/workspaces/:workspace_id/loop-runs/:run_id/nodes/:node_id/amend",
+		"POST /api/workspaces/:workspace_id/loop-runs/:run_id/nodes/:node_id/pause",
+		"POST /api/workspaces/:workspace_id/loop-runs/:run_id/nodes/:node_id/requeue",
+		"POST /api/workspaces/:workspace_id/loop-runs/:run_id/nodes/:node_id/respond",
+		"POST /api/workspaces/:workspace_id/loop-runs/:run_id/nodes/:node_id/resume",
+		"POST /api/workspaces/:workspace_id/loop-runs/:run_id/pause",
+		"POST /api/workspaces/:workspace_id/loop-runs/:run_id/resume",
+		"POST /api/workspaces/:workspace_id/loop-runs/:run_id/rerun",
+		"GET /api/workspaces/:workspace_id/loop-nodes",
+		"POST /api/workspaces/:workspace_id/loops",
+		"POST /api/workspaces/:workspace_id/loops/:name/run",
+		"POST /api/workspaces/:workspace_id/loops/:name/validate",
+		"POST /api/extensions",
+		"POST /api/extensions/preview-install",
+		"POST /api/extensions/:name/reload",
+		"POST /api/extensions/dev",
+		"POST /api/extensions/update",
+		"POST /api/notifications/attention/acknowledge",
+		"POST /api/sessions",
+		"POST /api/sessions/:session_id/pull-request/refresh",
+		"POST /api/workspaces/:workspace_id/sessions/:session_id/approve",
+		"POST /api/workspaces/:workspace_id/sessions/:session_id/clarifications/:request_id/answer",
+		"POST /api/workspaces/:workspace_id/sessions/:session_id/compact",
+		"POST /api/workspaces/:workspace_id/sessions/:session_id/clear",
+		"POST /api/workspaces/:workspace_id/sessions/:session_id/rewind",
+		"POST /api/workspaces/:workspace_id/sessions/:session_id/continue",
+		"POST /api/workspaces/:workspace_id/sessions/:session_id/fork",
+		"GET /api/workspaces/:workspace_id/sessions/:session_id/derive/preview",
+		"POST /api/workspaces/:workspace_id/sessions/:session_id/prompt",
+		"POST /api/workspaces/:workspace_id/sessions/:session_id/prompt/cancel",
+		"POST /api/workspaces/:workspace_id/sessions/:session_id/presence",
+		"POST /api/workspaces/:workspace_id/sessions/:session_id/wait",
+		"POST /api/workspaces/:workspace_id/sessions/:session_id/steer",
+		"POST /api/workspaces/:workspace_id/sessions/:session_id/prompt/queue/:queue_entry_id/steer",
+		"DELETE /api/workspaces/:workspace_id/sessions/:session_id/prompt/queue/:queue_entry_id",
+		"DELETE /api/workspaces/:workspace_id/sessions/:session_id/prompt/queue",
+		"POST /api/workspaces/:workspace_id/sessions/:session_id/repair",
+		"POST /api/workspaces/:workspace_id/sessions/:session_id/attach",
+		"POST /api/workspaces/:workspace_id/sessions/:session_id/attachments",
+		"POST /api/workspaces/:workspace_id/sessions/:session_id/worktree-fork",
+		"PUT /api/workspaces/:workspace_id/sessions/:session_id/worktree",
+		"DELETE /api/workspaces/:workspace_id/sessions/:session_id/worktree",
+		"POST /api/workspaces/:workspace_id/sessions/:session_id/archive",
+		"GET /api/workspaces/:workspace_id/sessions/:session_id/descendants",
+		"POST /api/workspaces/:workspace_id/sessions/:session_id/soul/refresh",
+		"POST /api/workspaces/:workspace_id/sessions/:session_id/stop",
+		"POST /api/workspaces/:workspace_id/sessions/:session_id/unarchive",
+		"POST /api/workspaces/:workspace_id/sessions/:session_id/later",
+		"POST /api/workspaces/:workspace_id/sessions/:session_id/resume-later",
+		"POST /api/workspaces/:workspace_id/sessions/:session_id/mark-seen",
+		"POST /api/workspaces/:workspace_id/sessions/:session_id/move",
+		"POST /api/workspaces/:workspace_id/sessions/:session_id/move-to-profile",
+		"GET /api/workspaces/:workspace_id/session-folders",
+		"POST /api/workspaces/:workspace_id/session-folders",
+		"PATCH /api/workspaces/:workspace_id/session-folders/:folder_id",
+		"DELETE /api/workspaces/:workspace_id/session-folders/:folder_id",
+		"PUT /api/workspaces/:workspace_id/session-order/folders",
+		"PUT /api/workspaces/:workspace_id/session-order/sessions",
+		"GET /api/workspace-folders",
+		"POST /api/workspace-folders",
+		"PATCH /api/workspace-folders/:folder_id",
+		"DELETE /api/workspace-folders/:folder_id",
+		"PUT /api/workspace-order/folders",
+		"PUT /api/workspace-order/workspaces",
+		"POST /api/workspace-order/move",
+		"POST /api/workspaces/:workspace_id/sessions/:session_id/tools/search",
+		"POST /api/settings/actions/restart",
+		"POST /api/settings/reload",
+		"POST /api/settings/update/check",
+		"POST /api/settings/update/apply",
+		"POST /api/settings/update/cancel",
+		"POST /api/support/bundles",
+		"POST /api/skills/:name/disable",
+		"POST /api/skills/:name/enable",
+		"POST /api/skills/:name/expose",
+		"POST /api/skills/:name/unexpose",
+		"POST /api/task-runs/:id/attach-session",
+		"POST /api/task-runs/:id/cancel",
+		"POST /api/task-runs/:id/complete",
+		"POST /api/task-runs/:id/fail",
+		"POST /api/task-runs/:id/reviews",
+		"POST /api/task-runs/:id/start",
+		"POST /api/task-reviews/:id/verdict",
+		"POST /api/tasks",
+		"POST /api/tasks/:id/approve",
+		"POST /api/tasks/:id/blocks",
+		"POST /api/tasks/:id/blocks/:block_id/clear",
+		"POST /api/tasks/:id/cancel",
+		"POST /api/tasks/:id/children",
+		"POST /api/tasks/:id/dependencies",
+		"POST /api/tasks/:id/pause",
+		"POST /api/tasks/:id/publish",
+		"POST /api/tasks/:id/recover",
+		"POST /api/tasks/:id/reject",
+		"POST /api/tasks/:id/resume",
+		"POST /api/tasks/:id/runs",
+		"POST /api/tasks/:id/runs/fan-out",
+		"POST /api/tasks/:id/start",
+		"POST /api/tasks/:id/triage/archive",
+		"POST /api/tasks/:id/triage/dismiss",
+		"POST /api/tasks/:id/triage/read",
+		"POST /api/cmd-palette/commands/:id/invoke",
+		"POST /api/cmd-palette/view-sessions/:session/events",
+		"POST /api/cmd-palette/views/:id/open",
+		"POST /api/cmd-palette/usage",
+		"POST /api/tools/approvals/:id/cancel",
+		"POST /api/tools/approvals/:id/resolve",
+		"PUT /api/cmd-palette/pins/:id",
+		"POST /api/tools/:id/approvals",
+		"POST /api/tools/:id/invoke",
+		"POST /api/tools/search",
+		"POST /api/webhooks/global/:endpoint",
+		"POST /api/webhooks/workspaces/:workspace_id/:endpoint",
+		"POST /api/workspaces",
+		"POST /api/workspaces/:workspace_id/archive",
+		"POST /api/workspaces/:workspace_id/unarchive",
+		"POST /api/workspaces/resolve",
+		"PUT /api/agents/:name/heartbeat",
+		"PATCH /api/agent-instances/:id",
+		"PATCH /api/agents/:name/memory/entries",
+		"PUT /api/agents/:name/memory",
+		"PUT /api/agents/:name/soul",
+		"PUT /api/agents/:name",
+		"PUT /api/extensions/:name",
+		"PUT /api/extensions/:name/enablement",
+		"PUT /api/extensions/:name/secrets",
+		"PUT /api/settings/hooks/:name",
+		"PUT /api/settings/mcp-servers/:name",
+		"PUT /api/settings/providers/:name",
+		"PUT /api/tool-approval-grants",
+		"PUT /api/workspaces/:workspace_id/loops/:name/annotations",
+		"PUT /api/workspaces/:workspace_id/loops/:name/config",
+		"PUT /api/workspaces/:workspace_id/loops/:name/input-defaults",
+		"PUT /api/workspaces/:workspace_id/loops/:name/input-defaults/:key",
+		"PUT /api/tasks/:id/execution-profile",
+		"PATCH /api/tasks/:id/execution-profile/worktree",
+		"PUT /api/vault/secrets",
+		"PUT /api/workspaces/:workspace_id/sessions/:session_id/prompt/queue/:queue_entry_id",
+		"PUT /api/workspaces/:workspace_id/sessions/:session_id/parent",
+		"PUT /api/workspaces/:workspace_id/sessions/:session_id/runtime",
+		"DELETE /api/workspaces/:workspace_id/loops/:name",
+		"DELETE /api/workspaces/:workspace_id/loops/:name/input-defaults/:key",
+		"DELETE /api/agents/:name",
+	}
+	slices.Sort(want)
+
+	if len(got) != len(want) {
+		t.Fatalf(
+			"len(routes) = %d, want %d; missing=%v unexpected=%v",
+			len(got),
+			len(want),
+			routeDifference(want, got),
+			routeDifference(got, want),
+		)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Fatalf("route[%d] = %q, want %q", i, got[i], want[i])
+		}
+	}
+}
+
+func routeDifference(left []string, right []string) []string {
+	rightSet := make(map[string]struct{}, len(right))
+	for _, route := range right {
+		rightSet[route] = struct{}{}
+	}
+	difference := make([]string, 0)
+	for _, route := range left {
+		if _, ok := rightSet[route]; !ok {
+			difference = append(difference, route)
+		}
+	}
+	return difference
+}
+func TestRegisterRoutesRejectsLegacyStatusSurfaces(t *testing.T) {
+	t.Parallel()
+
+	homePaths := newTestHomePaths(t)
+	handlers := newTestHandlers(t, &stubSessionManager{}, stubObserver{}, homePaths)
+	engine := newTestRouter(t, handlers)
+
+	for _, path := range []string{"/api/daemon/status", "/api/observe/health"} {
+		resp := performRequest(t, engine, http.MethodGet, path, nil)
+		if resp.Code != http.StatusNotFound {
+			t.Fatalf("GET %s status = %d, want %d", path, resp.Code, http.StatusNotFound)
+		}
+	}
+}
+
+func TestRegisterRoutesRejectsLegacyMarketplaceSurfaces(t *testing.T) {
+	t.Parallel()
+
+	engine := newTestRouter(
+		t,
+		newTestHandlers(t, &stubSessionManager{}, stubObserver{}, newTestHomePaths(t)),
+	)
+	for _, route := range []struct{ method, path string }{
+		{http.MethodGet, "/api/marketplace/search"},
+		{http.MethodGet, "/api/marketplace/mcp"},
+		{http.MethodGet, "/api/marketplace/skill"},
+		{http.MethodGet, "/api/marketplace/extension"},
+		{http.MethodGet, "/api/marketplace/mcp/github"},
+		{http.MethodGet, "/api/marketplace/skill/review"},
+		{http.MethodGet, "/api/marketplace/extension/review"},
+		{http.MethodGet, "/api/skills/marketplace/search"},
+		{http.MethodGet, "/api/skills/marketplace/info"},
+		{http.MethodGet, "/api/extensions/marketplace"},
+		{http.MethodPost, "/api/skills/marketplace/install"},
+		{http.MethodPost, "/api/skills/marketplace/update"},
+		{http.MethodDelete, "/api/skills/marketplace/review"},
+	} {
+		t.Run("Should return 404 for "+route.method+" "+route.path, func(t *testing.T) {
+			t.Parallel()
+
+			response := performRequest(t, engine, route.method, route.path, nil)
+			if response.Code != http.StatusNotFound {
+				t.Fatalf(
+					"%s %s status = %d, want %d; body=%s",
+					route.method,
+					route.path,
+					response.Code,
+					http.StatusNotFound,
+					response.Body.String(),
+				)
+			}
+		})
+	}
+}
+
+func TestRegisterRoutesRejectsLegacyProviderModelCatalogSurfaces(t *testing.T) {
+	t.Parallel()
+
+	homePaths := newTestHomePaths(t)
+	handlers := newTestHandlers(t, &stubSessionManager{}, stubObserver{}, homePaths)
+	engine := newTestRouter(t, handlers)
+
+	for _, tc := range []struct {
+		method string
+		path   string
+	}{
+		{method: http.MethodGet, path: "/api/providers/models"},
+		{method: http.MethodGet, path: "/api/providers/codex/models"},
+		{method: http.MethodPost, path: "/api/providers/codex/models/refresh"},
+		{method: http.MethodGet, path: "/api/providers/codex/models/status"},
+	} {
+		resp := performRequest(t, engine, tc.method, tc.path, nil)
+		if resp.Code != http.StatusNotFound {
+			t.Fatalf("%s %s status = %d, want %d", tc.method, tc.path, resp.Code, http.StatusNotFound)
+		}
+	}
+}
+
+func TestTaskBlockHandlersReturnStatusAndBodies(t *testing.T) {
+	t.Parallel()
+
+	now := time.Date(2026, 7, 3, 14, 0, 0, 0, time.UTC)
+	const rawClaimToken = "compozy_claim_secret"
+
+	newEngine := func(t *testing.T, manager *apitestutil.StubTaskManager) *gin.Engine {
+		t.Helper()
+
+		return newTestRouter(t, newTestHandlersWithAutomationTasksAndWorkspace(
+			t,
+			&stubSessionManager{},
+			stubObserver{},
+			nil,
+			manager,
+
+			stubWorkspaceService{},
+			newTestHomePaths(t),
+		))
+	}
+
+	t.Run("Should create a block response without leaking raw claim tokens", func(t *testing.T) {
+		t.Parallel()
+
+		var blockReq taskpkg.BlockRequest
+		engine := newEngine(t, &apitestutil.StubTaskManager{
+			BlockTaskFn: func(_ context.Context, req taskpkg.BlockRequest, actor taskpkg.ActorContext) (taskpkg.TaskBlock, error) {
+				blockReq = req
+				return taskpkg.TaskBlock{
+					ID:        "block-1",
+					TaskID:    req.TaskID,
+					Kind:      req.Kind,
+					Reason:    "waiting on " + rawClaimToken,
+					Details:   json.RawMessage(`{"note":"` + rawClaimToken + `"}`),
+					CreatedBy: actor.Actor,
+					CreatedAt: now,
+				}, nil
+			},
+		})
+
+		recorder := performRequestWithHeaders(
+			t,
+			engine,
+			http.MethodPost,
+			"/api/tasks/task-1/blocks",
+			[]byte(`{"kind":"needs_input","reason":"creator decision","run_id":"run-1"}`),
+			map[string]string{"X-Compozy-Claim-Token": rawClaimToken},
+		)
+		if recorder.Code != http.StatusCreated {
+			t.Fatalf("block status = %d, want %d; body=%s", recorder.Code, http.StatusCreated, recorder.Body.String())
+		}
+		if blockReq.TaskID != "task-1" || blockReq.RunID != "run-1" || blockReq.ClaimToken != rawClaimToken {
+			t.Fatalf("block request = %#v, want task/run/claim token propagated", blockReq)
+		}
+		if strings.Contains(recorder.Body.String(), rawClaimToken) {
+			t.Fatalf("block response leaked raw claim token: %s", recorder.Body.String())
+		}
+		var response contract.TaskBlockResponse
+		decodeJSONResponse(t, recorder, &response)
+		if response.Block.ID != "block-1" || response.Block.TaskID != "task-1" {
+			t.Fatalf("block response = %#v, want block-1 for task-1", response.Block)
+		}
+	})
+
+	t.Run("Should list blocks with include cleared and redact raw claim tokens", func(t *testing.T) {
+		t.Parallel()
+
+		listIncludeCleared := false
+		engine := newEngine(t, &apitestutil.StubTaskManager{
+			ListTaskBlocksFn: func(
+				_ context.Context,
+				taskID string,
+				includeCleared bool,
+				_ taskpkg.ActorContext,
+			) ([]taskpkg.TaskBlock, error) {
+				listIncludeCleared = includeCleared
+				return []taskpkg.TaskBlock{{
+					ID:        "block-1",
+					TaskID:    taskID,
+					Kind:      taskpkg.BlockKindNeedsInput,
+					Reason:    "waiting on " + rawClaimToken,
+					Details:   json.RawMessage(`{"note":"` + rawClaimToken + `"}`),
+					CreatedAt: now,
+				}}, nil
+			},
+		})
+
+		recorder := performRequest(t, engine, http.MethodGet, "/api/tasks/task-1/blocks?include_cleared=true", nil)
+		if recorder.Code != http.StatusOK {
+			t.Fatalf("list status = %d, want %d; body=%s", recorder.Code, http.StatusOK, recorder.Body.String())
+		}
+		if !listIncludeCleared {
+			t.Fatal("ListTaskBlocks includeCleared = false, want true")
+		}
+		if strings.Contains(recorder.Body.String(), rawClaimToken) {
+			t.Fatalf("list response leaked raw claim token: %s", recorder.Body.String())
+		}
+		var response contract.TaskBlocksResponse
+		decodeJSONResponse(t, recorder, &response)
+		if len(response.Blocks) != 1 || response.Blocks[0].ID != "block-1" {
+			t.Fatalf("list response = %#v, want block-1", response.Blocks)
+		}
+	})
+
+	for _, tc := range []struct {
+		name   string
+		blocks []taskpkg.TaskBlock
+	}{
+		{name: "Should serialize a nil block inventory as an empty array"},
+		{name: "Should preserve an empty block inventory as an array", blocks: []taskpkg.TaskBlock{}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			engine := newEngine(t, &apitestutil.StubTaskManager{
+				ListTaskBlocksFn: func(context.Context, string, bool, taskpkg.ActorContext) ([]taskpkg.TaskBlock, error) {
+					return tc.blocks, nil
+				},
+			})
+			recorder := performRequest(t, engine, http.MethodGet, "/api/tasks/task-1/blocks", nil)
+			if recorder.Code != http.StatusOK {
+				t.Fatalf("list status = %d, want 200; body=%s", recorder.Code, recorder.Body.String())
+			}
+			var response contract.TaskBlocksResponse
+			decodeJSONResponse(t, recorder, &response)
+			if response.Blocks == nil || len(response.Blocks) != 0 {
+				t.Fatalf("list response = %s, want an empty blocks array", recorder.Body.String())
+			}
+		})
+	}
+
+	t.Run("Should get blocked task details without leaking raw claim tokens", func(t *testing.T) {
+		t.Parallel()
+
+		engine := newEngine(t, &apitestutil.StubTaskManager{
+			GetTaskFn: func(_ context.Context, id string, _ taskpkg.ActorContext) (*taskpkg.View, error) {
+				blockedReasons := []taskpkg.BlockedReason{{
+					Source:  taskpkg.BlockedSourceBlock,
+					Kind:    taskpkg.BlockKindNeedsInput,
+					Reason:  "waiting on " + rawClaimToken,
+					BlockID: "block-1",
+				}}
+				return &taskpkg.View{
+					Summary: taskpkg.Summary{
+						ID:             id,
+						ProfileID:      store.DefaultProfileID,
+						Title:          "Blocked task " + rawClaimToken,
+						Status:         taskpkg.TaskStatusBlocked,
+						PausedReason:   "paused on " + rawClaimToken,
+						NeedsAttention: &taskpkg.NeedsAttention{Reason: "attention " + rawClaimToken},
+						BlockedReasons: &blockedReasons,
+					},
+					Task: taskpkg.Task{
+						ID:           id,
+						ProfileID:    store.DefaultProfileID,
+						Title:        "Blocked task " + rawClaimToken,
+						Description:  "description " + rawClaimToken,
+						Status:       taskpkg.TaskStatusBlocked,
+						WakeCreator:  true,
+						Paused:       true,
+						PausedReason: "paused on " + rawClaimToken,
+						NeedsAttention: &taskpkg.NeedsAttention{
+							Reason: "attention " + rawClaimToken,
+						},
+						Metadata: json.RawMessage(`{"note":"` + rawClaimToken + `"}`),
+					},
+				}, nil
+			},
+		})
+
+		recorder := performRequest(t, engine, http.MethodGet, "/api/tasks/task-1", nil)
+		if recorder.Code != http.StatusOK {
+			t.Fatalf("get status = %d, want %d; body=%s", recorder.Code, http.StatusOK, recorder.Body.String())
+		}
+		if strings.Contains(recorder.Body.String(), rawClaimToken) {
+			t.Fatalf("get response leaked raw claim token: %s", recorder.Body.String())
+		}
+		if !strings.Contains(recorder.Body.String(), "compozy_claim_[REDACTED]") {
+			t.Fatalf("get response = %s, want redacted claim token marker", recorder.Body.String())
+		}
+		var response contract.TaskDetailResponse
+		decodeJSONResponse(t, recorder, &response)
+		if got := response.Task.Task.BlockedReasons; len(got) != 1 || got[0].BlockID != "block-1" {
+			t.Fatalf("get blocked_reasons = %#v, want block-1", got)
+		}
+	})
+
+	t.Run("Should clear a task block and return clear metadata", func(t *testing.T) {
+		t.Parallel()
+
+		clearNote := ""
+		engine := newEngine(t, &apitestutil.StubTaskManager{
+			ClearTaskBlockFn: func(
+				_ context.Context,
+				taskID string,
+				blockID string,
+				note string,
+				actor taskpkg.ActorContext,
+			) (taskpkg.TaskBlock, error) {
+				clearNote = note
+				return taskpkg.TaskBlock{
+					ID:        blockID,
+					TaskID:    taskID,
+					Kind:      taskpkg.BlockKindNeedsInput,
+					Reason:    "creator answered",
+					CreatedAt: now.Add(-time.Minute),
+					ClearedAt: now,
+					ClearedBy: actor.Actor,
+					ClearNote: note,
+				}, nil
+			},
+		})
+
+		recorder := performRequest(
+			t,
+			engine,
+			http.MethodPost,
+			"/api/tasks/task-1/blocks/block-1/clear",
+			mustJSONBody(t, contract.ClearTaskBlockRequest{Note: "resolved"}),
+		)
+		if recorder.Code != http.StatusOK {
+			t.Fatalf("clear status = %d, want %d; body=%s", recorder.Code, http.StatusOK, recorder.Body.String())
+		}
+		if clearNote != "resolved" {
+			t.Fatalf("clear note = %q, want resolved", clearNote)
+		}
+		var response contract.TaskBlockResponse
+		decodeJSONResponse(t, recorder, &response)
+		if response.Block.ClearedAt == nil || response.Block.ClearedBy == nil {
+			t.Fatalf("clear response = %#v, want clear metadata", response.Block)
+		}
+	})
+
+	t.Run("Should recover a task and return the ready task", func(t *testing.T) {
+		t.Parallel()
+
+		recoverNote := ""
+		engine := newEngine(t, &apitestutil.StubTaskManager{
+			RecoverTaskFn: func(
+				_ context.Context,
+				id string,
+				note string,
+				_ taskpkg.ActorContext,
+			) (*taskpkg.Task, error) {
+				recoverNote = note
+				return &taskpkg.Task{
+					ID:          id,
+					Title:       "Recovered task",
+					Status:      taskpkg.TaskStatusReady,
+					WakeCreator: true,
+				}, nil
+			},
+		})
+
+		recorder := performRequest(
+			t,
+			engine,
+			http.MethodPost,
+			"/api/tasks/task-1/recover",
+			mustJSONBody(t, contract.RecoverTaskRequest{Note: "operator reviewed"}),
+		)
+		if recorder.Code != http.StatusOK {
+			t.Fatalf("recover status = %d, want %d; body=%s", recorder.Code, http.StatusOK, recorder.Body.String())
+		}
+		if recoverNote != "operator reviewed" {
+			t.Fatalf("recover note = %q, want operator reviewed", recoverNote)
+		}
+		var response contract.TaskResponse
+		decodeJSONResponse(t, recorder, &response)
+		if response.Task.ID != "task-1" || response.Task.Status != taskpkg.TaskStatusReady {
+			t.Fatalf("recover response task = %#v, want ready task-1", response.Task)
+		}
+	})
+}
+
+func TestTaskBlockHandlersReturnDeterministicErrorBodies(t *testing.T) {
+	t.Parallel()
+
+	homePaths := newTestHomePaths(t)
+	tests := []struct {
+		name       string
+		method     string
+		path       string
+		body       []byte
+		manager    *apitestutil.StubTaskManager
+		wantStatus int
+	}{
+		{
+			name:   "block missing task",
+			method: http.MethodPost,
+			path:   "/api/tasks/missing/blocks",
+			body:   []byte(`{"kind":"needs_input","reason":"missing task"}`),
+			manager: &apitestutil.StubTaskManager{
+				BlockTaskFn: func(context.Context, taskpkg.BlockRequest, taskpkg.ActorContext) (taskpkg.TaskBlock, error) {
+					return taskpkg.TaskBlock{}, taskpkg.ErrTaskNotFound
+				},
+			},
+			wantStatus: http.StatusNotFound,
+		},
+		{
+			name:   "block invalid kind or reason",
+			method: http.MethodPost,
+			path:   "/api/tasks/task-1/blocks",
+			body:   []byte(`{"kind":"missing","reason":"bad kind"}`),
+			manager: &apitestutil.StubTaskManager{
+				BlockTaskFn: func(context.Context, taskpkg.BlockRequest, taskpkg.ActorContext) (taskpkg.TaskBlock, error) {
+					return taskpkg.TaskBlock{}, errors.Join(taskpkg.ErrValidation, errors.New("invalid task block"))
+				},
+			},
+			wantStatus: http.StatusUnprocessableEntity,
+		},
+		{
+			name:   "clear already cleared block",
+			method: http.MethodPost,
+			path:   "/api/tasks/task-1/blocks/block-1/clear",
+			body:   []byte(`{"note":"again"}`),
+			manager: &apitestutil.StubTaskManager{
+				ClearTaskBlockFn: func(
+					context.Context,
+					string,
+					string,
+					string,
+					taskpkg.ActorContext,
+				) (taskpkg.TaskBlock, error) {
+					return taskpkg.TaskBlock{}, taskpkg.ErrConflict
+				},
+			},
+			wantStatus: http.StatusConflict,
+		},
+		{
+			name:   "list returns 404 body when service reports task not found",
+			method: http.MethodGet,
+			path:   "/api/tasks/foreign-task/blocks?include_cleared=true",
+			manager: &apitestutil.StubTaskManager{
+				ListTaskBlocksFn: func(
+					_ context.Context,
+					taskID string,
+					includeCleared bool,
+					_ taskpkg.ActorContext,
+				) ([]taskpkg.TaskBlock, error) {
+					if taskID != "foreign-task" || !includeCleared {
+						t.Fatalf("ListTaskBlocks task/include = %q/%v, want foreign-task/true", taskID, includeCleared)
+					}
+					return nil, taskpkg.ErrTaskNotFound
+				},
+			},
+			wantStatus: http.StatusNotFound,
+		},
+		{
+			name:   "recover non escalated task",
+			method: http.MethodPost,
+			path:   "/api/tasks/task-1/recover",
+			body:   []byte(`{"note":"too soon"}`),
+			manager: &apitestutil.StubTaskManager{
+				RecoverTaskFn: func(context.Context, string, string, taskpkg.ActorContext) (*taskpkg.Task, error) {
+					return nil, taskpkg.ErrInvalidStatusTransition
+				},
+			},
+			wantStatus: http.StatusConflict,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run("Should "+tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			engine := newTestRouter(t, newTestHandlersWithAutomationTasksAndWorkspace(
+				t,
+				&stubSessionManager{},
+				stubObserver{},
+				nil,
+				tc.manager,
+
+				stubWorkspaceService{},
+				homePaths,
+			))
+			recorder := performRequest(t, engine, tc.method, tc.path, tc.body)
+			if recorder.Code != tc.wantStatus {
+				t.Fatalf(
+					"%s %s status = %d, want %d; body=%s",
+					tc.method,
+					tc.path,
+					recorder.Code,
+					tc.wantStatus,
+					recorder.Body.String(),
+				)
+			}
+			var payload contract.ErrorPayload
+			decodeJSONResponse(t, recorder, &payload)
+			if payload.Error == "" {
+				t.Fatalf("error payload = %#v, want message", payload)
+			}
+		})
+	}
+}
+
+func TestRemovedRoutesUseUnknownRouteBehaviorIT011(t *testing.T) {
+	t.Parallel()
+	handlers := newTestHandlers(t, &stubSessionManager{}, stubObserver{}, newTestHomePaths(t))
+	engine := newTestRouter(t, handlers)
+	for _, tc := range []struct{ method, path string }{
+		{http.MethodGet, "/api/memory"},
+		{http.MethodPost, "/api/memory/search"},
+		{http.MethodGet, "/api/settings/memory"},
+		{http.MethodGet, "/api/workspaces/ws_alpha/memory/sessions/sess-1/ledger"},
+	} {
+		t.Run("Should use unknown route behavior for "+tc.method+" "+tc.path, func(t *testing.T) {
+			t.Parallel()
+			unknown := httptest.NewRecorder()
+			engine.ServeHTTP(unknown, httptest.NewRequestWithContext(t.Context(), tc.method, "/api/nope", http.NoBody))
+			response := httptest.NewRecorder()
+			engine.ServeHTTP(response, httptest.NewRequestWithContext(t.Context(), tc.method, tc.path, http.NoBody))
+			if response.Code != http.StatusNotFound || response.Code != unknown.Code ||
+				response.Body.String() != unknown.Body.String() ||
+				response.Header().Get("Content-Type") != unknown.Header().Get("Content-Type") {
+				t.Fatalf(
+					"retired route response = %d %q %q, unknown = %d %q %q",
+					response.Code,
+					response.Body.String(),
+					response.Header().Get("Content-Type"),
+					unknown.Code,
+					unknown.Body.String(),
+					unknown.Header().Get("Content-Type"),
+				)
+			}
+		})
+	}
+}
+
+func TestWorktreeRoutesMatchTransportParityContractIT033(t *testing.T) {
+	t.Parallel()
+
+	homePaths := newTestHomePaths(t)
+	handlers := newTestHandlers(t, &stubSessionManager{}, stubObserver{}, homePaths)
+	engine := newTestRouter(t, handlers)
+
+	apitestutil.AssertWorktreeRouteParity(t, apitestutil.WorktreeRouteKeysFromGin(engine.Routes()))
+}
+
+func TestRegisterRoutesSkipsNilHandlers(t *testing.T) {
+	t.Parallel()
+
+	gin.SetMode(gin.TestMode)
+	engine := gin.New()
+
+	RegisterRoutes(engine, nil)
+
+	if got := len(engine.Routes()); got != 0 {
+		t.Fatalf("len(routes) = %d, want 0", got)
+	}
+}
+
+func TestDaemonAPIRoutesReturnForbiddenOnNonLoopbackHost(t *testing.T) {
+	t.Parallel()
+
+	homePaths := newTestHomePaths(t)
+	if err := os.WriteFile(homePaths.LogFile, []byte("daemon booted\n"), 0o644); err != nil {
+		t.Fatalf("os.WriteFile(%q) error = %v", homePaths.LogFile, err)
+	}
+
+	handlers := newTestHandlersWithSettingsAndExtensions(
+		t,
+		"0.0.0.0",
+		&stubSettingsService{},
+		&stubSettingsRestartController{},
+		stubExtensionService{
+			ListFn: func(context.Context) ([]contract.ExtensionPayload, error) {
+				return []contract.ExtensionPayload{{Name: "demo", State: "registered"}}, nil
+			},
+			StatusFn: func(_ context.Context, name string) (contract.ExtensionPayload, error) {
+				return contract.ExtensionPayload{Name: name, State: "registered"}, nil
+			},
+		},
+		homePaths,
+	)
+	done := make(chan struct{})
+	close(done)
+	handlers.setStreamDone(done)
+	engine := newTestRouter(t, handlers)
+
+	tests := []string{
+		"/api/settings/general",
+		"/api/settings/skills",
+		"/api/settings/automation",
+		"/api/settings/attention",
+		"/api/settings/shell",
+		"/api/settings/provider-usage",
+		"/api/settings/window-manager",
+		"/api/settings/observability",
+		"/api/settings/hooks-extensions",
+		"/api/settings/providers",
+		"/api/settings/providers/demo",
+		"/api/settings/mcp-servers",
+		"/api/settings/hooks",
+		"/api/settings/actions/restart/op-123",
+		"/api/extensions",
+		"/api/extensions/demo",
+	}
+
+	for _, path := range tests {
+		t.Run("Should reject "+path+" off loopback", func(t *testing.T) {
+			recorder := performRequest(t, engine, http.MethodGet, path, nil)
+			if recorder.Code != http.StatusForbidden {
+				t.Fatalf(
+					"GET %s status = %d, want %d; body=%s",
+					path,
+					recorder.Code,
+					http.StatusForbidden,
+					recorder.Body.String(),
+				)
+			}
+			var payload contract.ErrorPayload
+			decodeJSONResponse(t, recorder, &payload)
+			if payload.Error != errLoopbackAPIRequired.Error() {
+				t.Fatalf("error = %q, want %q", payload.Error, errLoopbackAPIRequired.Error())
+			}
+		})
+	}
+
+	t.Run("Should block daemon log tail reads on non-loopback HTTP", func(t *testing.T) {
+		recorder := performRequest(t, engine, http.MethodGet, "/api/settings/observability/log-tail", nil)
+		if recorder.Code != http.StatusForbidden {
+			t.Fatalf(
+				"GET /api/settings/observability/log-tail status = %d, want %d; body=%s",
+				recorder.Code,
+				http.StatusForbidden,
+				recorder.Body.String(),
+			)
+		}
+		var payload contract.ErrorPayload
+		decodeJSONResponse(t, recorder, &payload)
+		if payload.Error != errLoopbackAPIRequired.Error() {
+			t.Fatalf("error = %q, want %q", payload.Error, errLoopbackAPIRequired.Error())
+		}
+	})
+}
+
+func TestSettingsAndExtensionMutationsReturnForbiddenOnNonLoopbackHost(t *testing.T) {
+	t.Parallel()
+
+	homePaths := newTestHomePaths(t)
+	handlers := newTestHandlersWithSettingsAndExtensions(
+		t,
+		"0.0.0.0",
+		&stubSettingsService{
+			BeginMCPAuthFn: func(
+				context.Context,
+				settingspkg.MCPAuthBeginRequest,
+			) (mcpauth.BeginResult, error) {
+				t.Fatal("BeginMCPAuth should not be called when HTTP mutations are blocked")
+				return mcpauth.BeginResult{}, nil
+			},
+			ExchangeMCPAuthFn: func(
+				context.Context,
+				settingspkg.MCPAuthExchangeRequest,
+			) (mcpauth.Status, error) {
+				t.Fatal("ExchangeMCPAuth should not be called when HTTP mutations are blocked")
+				return mcpauth.Status{}, nil
+			},
+			LogoutMCPAuthFn: func(
+				context.Context,
+				settingspkg.MCPAuthTargetRequest,
+			) (mcpauth.Status, error) {
+				t.Fatal("LogoutMCPAuth should not be called when HTTP mutations are blocked")
+				return mcpauth.Status{}, nil
+			},
+			UpdateSectionFn: func(context.Context, settingspkg.SectionUpdateRequest) (settingspkg.MutationResult, error) {
+				t.Fatal("UpdateSection should not be called when HTTP mutations are blocked")
+				return settingspkg.MutationResult{}, nil
+			},
+			PutCollectionItemFn: func(context.Context, settingspkg.CollectionItemPutRequest) (settingspkg.MutationResult, error) {
+				t.Fatal("PutCollectionItem should not be called when HTTP mutations are blocked")
+				return settingspkg.MutationResult{}, nil
+			},
+			DeleteCollectionItemFn: func(context.Context, settingspkg.CollectionItemDeleteRequest) (settingspkg.MutationResult, error) {
+				t.Fatal("DeleteCollectionItem should not be called when HTTP mutations are blocked")
+				return settingspkg.MutationResult{}, nil
+			},
+		},
+		&stubSettingsRestartController{
+			RequestRestartFn: func(context.Context) (core.SettingsRestartOperation, error) {
+				t.Fatal("RequestRestart should not be called when HTTP mutations are blocked")
+				return core.SettingsRestartOperation{}, nil
+			},
+		},
+		stubExtensionService{
+			InstallFn: func(context.Context, contract.InstallExtensionRequest, taskpkg.ActorContext) (contract.ExtensionPayload, error) {
+				t.Fatal("Install should not be called when HTTP mutations are blocked")
+				return contract.ExtensionPayload{}, nil
+			},
+			SetEnablementFn: func(
+				context.Context,
+				string,
+				contract.SetExtensionEnablementRequest,
+				taskpkg.ActorContext,
+			) (contract.ExtensionEnablementPayload, error) {
+				t.Fatal("SetEnablement should not be called when HTTP mutations are blocked")
+				return contract.ExtensionEnablementPayload{}, nil
+			},
+		},
+		homePaths,
+	)
+	engine := newTestRouter(t, handlers)
+
+	tests := []struct {
+		method string
+		path   string
+		body   []byte
+	}{
+		{method: http.MethodPatch, path: "/api/settings/general", body: []byte(`{}`)},
+		{method: http.MethodPatch, path: "/api/settings/skills", body: []byte(`{}`)},
+		{method: http.MethodPatch, path: "/api/settings/automation", body: []byte(`{}`)},
+
+		{method: http.MethodPatch, path: "/api/settings/attention", body: []byte(`{}`)},
+		{method: http.MethodPatch, path: "/api/settings/shell", body: []byte(`{}`)},
+		{method: http.MethodPatch, path: "/api/settings/provider-usage", body: []byte(`{}`)},
+		{method: http.MethodPatch, path: "/api/settings/window-manager", body: []byte(`{}`)},
+		{method: http.MethodPatch, path: "/api/settings/observability", body: []byte(`{}`)},
+		{method: http.MethodPatch, path: "/api/settings/hooks-extensions", body: []byte(`{}`)},
+		{method: http.MethodPut, path: "/api/settings/providers/demo", body: []byte(`{}`)},
+		{method: http.MethodDelete, path: "/api/settings/providers/demo"},
+		{method: http.MethodPut, path: "/api/settings/mcp-servers/server-a", body: []byte(`{}`)},
+		{
+			method: http.MethodPost,
+			path:   "/api/settings/mcp-servers/server-a/auth/begin?scope=global",
+			body:   []byte(`{"mode":"automatic"}`),
+		},
+		{
+			method: http.MethodPost,
+			path:   "/api/settings/mcp-servers/server-a/auth/exchange?scope=global",
+			body:   []byte(`{"code":"secret-code"}`),
+		},
+		{
+			method: http.MethodPost,
+			path:   "/api/settings/mcp-servers/server-a/auth/logout?scope=global",
+		},
+		{method: http.MethodDelete, path: "/api/settings/mcp-servers/server-a"},
+
+		{method: http.MethodPut, path: "/api/settings/hooks/capture", body: []byte(`{}`)},
+		{method: http.MethodDelete, path: "/api/settings/hooks/capture"},
+		{method: http.MethodPost, path: "/api/settings/update/check"},
+		{method: http.MethodPost, path: "/api/settings/actions/restart", body: []byte(`{}`)},
+		{method: http.MethodPost, path: "/api/extensions", body: []byte(`{}`)},
+		{
+			method: http.MethodPut,
+			path:   "/api/extensions/demo/enablement",
+			body:   []byte(`{"profile":"default","enabled":false}`),
+		},
+		{method: http.MethodPost, path: "/api/marketplace/refresh", body: []byte(`{}`)},
+	}
+
+	for _, tc := range tests {
+		t.Run("Should reject "+tc.method+" "+tc.path, func(t *testing.T) {
+			recorder := performRequest(t, engine, tc.method, tc.path, tc.body)
+			if recorder.Code != http.StatusForbidden {
+				t.Fatalf(
+					"%s %s status = %d, want %d; body=%s",
+					tc.method,
+					tc.path,
+					recorder.Code,
+					http.StatusForbidden,
+					recorder.Body.String(),
+				)
+			}
+
+			var payload contract.ErrorPayload
+			decodeJSONResponse(t, recorder, &payload)
+			if payload.Error != errLoopbackAPIRequired.Error() {
+				t.Fatalf("error = %q, want %q", payload.Error, errLoopbackAPIRequired.Error())
+			}
+		})
+	}
+}
+
+func TestMCPAuthCallbackHonorsLoopbackBindAndReturnsStaticPages(t *testing.T) {
+	t.Parallel()
+
+	t.Run("Should refuse automatic callback on a non-loopback bind", func(t *testing.T) {
+		t.Parallel()
+
+		homePaths := newTestHomePaths(t)
+		handlers := newTestHandlersWithSettingsAndExtensions(
+			t,
+			"0.0.0.0",
+			&stubSettingsService{
+				CompleteMCPAuthFn: func(context.Context, string) (mcpauth.Status, error) {
+					t.Fatal("CompleteMCPAuthCallback should not run on a non-loopback bind")
+					return mcpauth.Status{}, nil
+				},
+			},
+			&stubSettingsRestartController{},
+			stubExtensionService{},
+			homePaths,
+		)
+		response := performRequest(
+			t,
+			newTestRouter(t, handlers),
+			http.MethodGet,
+			"/api/mcp/oauth/callback?code=sensitive-code&state=public-state",
+			nil,
+		)
+		if response.Code != http.StatusForbidden {
+			t.Fatalf(
+				"callback status = %d, want %d; body=%s",
+				response.Code,
+				http.StatusForbidden,
+				response.Body.String(),
+			)
+		}
+		var payload contract.ErrorPayload
+		decodeJSONResponse(t, response, &payload)
+		if payload.Error != errLoopbackMCPCallbackRequired.Error() {
+			t.Fatalf("callback error = %q, want %q", payload.Error, errLoopbackMCPCallbackRequired.Error())
+		}
+		if strings.Contains(response.Body.String(), "sensitive-code") ||
+			strings.Contains(response.Body.String(), "public-state") {
+			t.Fatalf("callback refusal leaked inbound OAuth material: %s", response.Body.String())
+		}
+	})
+
+	t.Run("Should complete on loopback without reflecting callback material", func(t *testing.T) {
+		t.Parallel()
+
+		homePaths := newTestHomePaths(t)
+		handlers := newTestHandlersWithSettingsAndExtensions(
+			t,
+			"127.0.0.1",
+			&stubSettingsService{
+				CompleteMCPAuthFn: func(_ context.Context, callbackURL string) (mcpauth.Status, error) {
+					if !strings.Contains(callbackURL, "code=sensitive-code") ||
+						!strings.Contains(callbackURL, "state=public-state") {
+						t.Fatalf("callback URL = %q", callbackURL)
+					}
+					return mcpauth.Status{
+						Status:       mcpauth.StatusAuthenticated,
+						TokenPresent: true,
+					}, nil
+				},
+			},
+			&stubSettingsRestartController{},
+			stubExtensionService{},
+			homePaths,
+		)
+		response := performRequest(
+			t,
+			newTestRouter(t, handlers),
+			http.MethodGet,
+			"/api/mcp/oauth/callback?code=sensitive-code&state=public-state",
+			nil,
+		)
+		if response.Code != http.StatusOK {
+			t.Fatalf(
+				"callback status = %d, want %d; body=%s",
+				response.Code,
+				http.StatusOK,
+				response.Body.String(),
+			)
+		}
+		if !strings.Contains(response.Body.String(), "Authorization complete") {
+			t.Fatalf("callback body = %q, want static completion page", response.Body.String())
+		}
+		if strings.Contains(response.Body.String(), "sensitive-code") ||
+			strings.Contains(response.Body.String(), "public-state") {
+			t.Fatalf("callback success leaked inbound OAuth material: %s", response.Body.String())
+		}
+	})
+
+	t.Run("Should omit callback query and exchange body from request logs", func(t *testing.T) {
+		t.Parallel()
+
+		var logs bytes.Buffer
+		logger := slog.New(slog.NewTextHandler(&logs, &slog.HandlerOptions{Level: slog.LevelDebug}))
+		engine := gin.New()
+		engine.Use(requestLoggingMiddleware(logger))
+		engine.GET("/api/mcp/oauth/callback", func(c *gin.Context) {
+			c.Status(http.StatusOK)
+		})
+		engine.POST("/api/settings/mcp-servers/:name/auth/exchange", func(c *gin.Context) {
+			c.Status(http.StatusOK)
+		})
+		callback := performRequest(
+			t,
+			engine,
+			http.MethodGet,
+			"/api/mcp/oauth/callback?code=sensitive-log-code&state=sensitive-log-state",
+			nil,
+		)
+		if callback.Code != http.StatusOK {
+			t.Fatalf("callback log probe status = %d, want %d", callback.Code, http.StatusOK)
+		}
+		exchange := performRequest(
+			t,
+			engine,
+			http.MethodPost,
+			"/api/settings/mcp-servers/linear/auth/exchange?scope=global",
+			[]byte(`{"code":"sensitive-body-code","redirect_url":"sensitive-redirect-url"}`),
+		)
+		if exchange.Code != http.StatusOK {
+			t.Fatalf("exchange log probe status = %d, want %d", exchange.Code, http.StatusOK)
+		}
+		serialized := logs.String()
+		for _, forbidden := range []string{
+			"sensitive-log-code",
+			"sensitive-log-state",
+			"sensitive-body-code",
+			"sensitive-redirect-url",
+		} {
+			if strings.Contains(serialized, forbidden) {
+				t.Fatalf("request logs leaked %q: %s", forbidden, serialized)
+			}
+		}
+		if !strings.Contains(serialized, "/api/mcp/oauth/callback") ||
+			!strings.Contains(serialized, "/api/settings/mcp-servers/:name/auth/exchange") {
+			t.Fatalf("request logs are missing redacted route paths: %s", serialized)
+		}
+	})
+}
+
+func TestSettingsAndExtensionMutationsReachHandlersOnLoopbackHost(t *testing.T) {
+	t.Parallel()
+
+	homePaths := newTestHomePaths(t)
+	settingsService := &stubSettingsService{}
+	restartController := &stubSettingsRestartController{}
+	var (
+		installedReq   contract.InstallExtensionRequest
+		enablementName string
+		enablementReq  contract.SetExtensionEnablementRequest
+	)
+	handlers := newTestHandlersWithSettingsAndExtensions(
+		t,
+		"127.0.0.1",
+		settingsService,
+		restartController,
+		stubExtensionService{
+			InstallFn: func(_ context.Context, req contract.InstallExtensionRequest, _ taskpkg.ActorContext) (contract.ExtensionPayload, error) {
+				installedReq = req
+				return contract.ExtensionPayload{Name: "demo", State: "registered"}, nil
+			},
+			SetEnablementFn: func(
+				_ context.Context,
+				name string,
+				req contract.SetExtensionEnablementRequest,
+				_ taskpkg.ActorContext,
+			) (contract.ExtensionEnablementPayload, error) {
+				enablementName = name
+				enablementReq = req
+				return contract.ExtensionEnablementPayload(req), nil
+			},
+		},
+		homePaths,
+	)
+	engine := newTestRouter(t, handlers)
+
+	tests := []struct {
+		name       string
+		method     string
+		path       string
+		body       []byte
+		wantStatus int
+		assert     func(t *testing.T)
+		assertBody func(t *testing.T, recorder *httptest.ResponseRecorder)
+	}{
+		{
+			name:       "patch section",
+			method:     http.MethodPatch,
+			path:       "/api/settings/general",
+			wantStatus: http.StatusOK,
+			body: mustJSONBody(t, contract.UpdateSettingsGeneralRequest{
+				Config: contract.SettingsGeneralConfigPayload{
+					Limits: contract.SettingsLimitsPayload{MaxConcurrentAgents: 2},
+					Permissions: contract.SettingsPermissionsPayload{
+						Mode: contract.SettingsPermissionModeApproveReads,
+					},
+					SessionTimeout: "30m",
+					HTTP:           contract.SettingsHTTPPayload{Host: "127.0.0.1", Port: 2123},
+					Daemon:         contract.SettingsDaemonPayload{Socket: "/tmp/compozy.sock"},
+					Terminal:       defaultSettingsTerminalPayload(),
+				},
+			}),
+			assert: func(t *testing.T) {
+				t.Helper()
+				if settingsService.LastUpdateSectionRequest.Section != settingspkg.SectionGeneral {
+					t.Fatalf(
+						"LastUpdateSectionRequest.Section = %q, want %q",
+						settingsService.LastUpdateSectionRequest.Section,
+						settingspkg.SectionGeneral,
+					)
+				}
+			},
+		},
+		{
+			name:       "put scoped collection",
+			method:     http.MethodPut,
+			path:       "/api/settings/mcp-servers/server-a?scope=workspace&workspace_id=ws-1&target=sidecar",
+			wantStatus: http.StatusOK,
+			body: mustJSONBody(t, contract.PutSettingsMCPServerRequest{
+				Server: contract.SettingsMCPServerPayload{Name: "server-a", Command: "mcpd"},
+			}),
+			assert: func(t *testing.T) {
+				t.Helper()
+				if settingsService.LastPutCollectionRequest.Collection != settingspkg.CollectionMCPServers ||
+					settingsService.LastPutCollectionRequest.Scope != settingspkg.ScopeWorkspace ||
+					settingsService.LastPutCollectionRequest.WorkspaceID != "ws-1" {
+					t.Fatalf("LastPutCollectionRequest = %#v", settingsService.LastPutCollectionRequest)
+				}
+			},
+		},
+		{
+			name:       "Should reject retired catalog installation",
+			method:     http.MethodPost,
+			path:       "/api/settings/mcp-servers/install",
+			body:       []byte(`{"entry_id":"github","values":{}}`),
+			wantStatus: http.StatusNotFound,
+			assertBody: func(t *testing.T, recorder *httptest.ResponseRecorder) {
+				t.Helper()
+				if !strings.Contains(recorder.Body.String(), "404") {
+					t.Fatalf("removed install body: %s", recorder.Body.String())
+				}
+			},
+		},
+		{
+			name:       "delete scoped collection",
+			method:     http.MethodDelete,
+			path:       "/api/settings/mcp-servers/server-a?scope=workspace&workspace_id=ws-1&target=sidecar",
+			wantStatus: http.StatusOK,
+			assert: func(t *testing.T) {
+				t.Helper()
+				if settingsService.LastDeleteCollectionRequest.Collection != settingspkg.CollectionMCPServers ||
+					settingsService.LastDeleteCollectionRequest.Scope != settingspkg.ScopeWorkspace ||
+					settingsService.LastDeleteCollectionRequest.WorkspaceID != "ws-1" {
+					t.Fatalf("LastDeleteCollectionRequest = %#v", settingsService.LastDeleteCollectionRequest)
+				}
+			},
+		},
+		{
+			name:       "restart action",
+			method:     http.MethodPost,
+			path:       "/api/settings/actions/restart",
+			body:       []byte(`{}`),
+			wantStatus: http.StatusAccepted,
+			assert: func(t *testing.T) {
+				t.Helper()
+				if restartController.RequestRestartCalls != 1 {
+					t.Fatalf("RequestRestartCalls = %d, want 1", restartController.RequestRestartCalls)
+				}
+			},
+		},
+		{
+			name:       "install extension",
+			method:     http.MethodPost,
+			path:       "/api/extensions",
+			wantStatus: http.StatusCreated,
+			body: mustJSONBody(t, contract.InstallExtensionRequest{
+				Source: contract.InstallExtensionSourceLocalPath,
+				Ref:    "/extensions/demo",
+			}),
+			assert: func(t *testing.T) {
+				t.Helper()
+				if installedReq.Source != contract.InstallExtensionSourceLocalPath ||
+					installedReq.Ref != "/extensions/demo" {
+					t.Fatalf("installedReq = %#v", installedReq)
+				}
+			},
+		},
+		{
+			name:       "Should set extension profile enablement",
+			method:     http.MethodPut,
+			path:       "/api/extensions/demo/enablement",
+			body:       []byte(`{"profile":"finance","enabled":false}`),
+			wantStatus: http.StatusOK,
+			assert: func(t *testing.T) {
+				t.Helper()
+				if enablementName != "demo" || enablementReq.Profile != "finance" || enablementReq.Enabled {
+					t.Fatalf("enablement = name:%q req:%#v", enablementName, enablementReq)
+				}
+			},
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			recorder := performRequest(t, engine, tc.method, tc.path, tc.body)
+			if recorder.Code != tc.wantStatus {
+				t.Fatalf(
+					"%s %s status = %d, want %d; body=%s",
+					tc.method,
+					tc.path,
+					recorder.Code,
+					tc.wantStatus,
+					recorder.Body.String(),
+				)
+			}
+			if tc.assert != nil {
+				tc.assert(t)
+			}
+			if tc.assertBody != nil {
+				tc.assertBody(t, recorder)
+			}
+		})
+	}
+}
+
+func TestCreateSessionHandlerReturnsSessionID(t *testing.T) {
+	t.Parallel()
+
+	homePaths := newTestHomePaths(t)
+	manager := &stubSessionManager{
+		CreateFn: func(_ context.Context, optsInput *session.CreateOpts) (*session.Session, error) {
+			opts := *optsInput
+
+			if opts.AgentName != "coder" || opts.Name != "demo" || opts.Workspace != "alpha" ||
+				opts.WorkspacePath != "" {
+				t.Fatalf("Create() opts = %#v", opts)
+			}
+			return newSession("sess-123"), nil
+		},
+	}
+	handlers := newTestHandlers(t, manager, stubObserver{}, homePaths)
+	engine := newTestRouter(t, handlers)
+
+	recorder := performRequest(
+		t,
+		engine,
+		http.MethodPost,
+		"/api/sessions",
+		[]byte(`{"agent_name":"coder","name":"demo","workspace":"alpha"}`),
+	)
+	if recorder.Code != http.StatusCreated {
+		t.Fatalf("status = %d, want %d; body=%s", recorder.Code, http.StatusCreated, recorder.Body.String())
+	}
+
+	var response struct {
+		Session sessionPayload `json:"session"`
+	}
+	decodeJSONResponse(t, recorder, &response)
+	if response.Session.ID != "sess-123" {
+		t.Fatalf("session.id = %q, want %q", response.Session.ID, "sess-123")
+	}
+	if response.Session.WorkspaceID != "ws-workspace" || response.Session.WorkspacePath != "/workspace" {
+		t.Fatalf("session workspace = %#v", response.Session)
+	}
+}
+
+func TestCreateSessionHandlerAllowsMissingAgent(t *testing.T) {
+	t.Parallel()
+
+	homePaths := newTestHomePaths(t)
+	manager := &stubSessionManager{
+		CreateFn: func(_ context.Context, optsInput *session.CreateOpts) (*session.Session, error) {
+			opts := *optsInput
+
+			if opts.AgentName != "" {
+				t.Fatalf("Create() AgentName = %q, want empty", opts.AgentName)
+			}
+			if opts.WorkspacePath == "" || opts.Workspace != "" {
+				t.Fatalf("Create() workspace opts = %#v", opts)
+			}
+			return newSession("sess-default"), nil
+		},
+	}
+	engine := newTestRouter(t, newTestHandlers(t, manager, stubObserver{}, homePaths))
+
+	recorder := performRequest(
+		t,
+		engine,
+		http.MethodPost,
+		"/api/sessions",
+		[]byte(`{"name":"demo","workspace_path":"/workspace"}`),
+	)
+	if recorder.Code != http.StatusCreated {
+		t.Fatalf("status = %d, want %d; body=%s", recorder.Code, http.StatusCreated, recorder.Body.String())
+	}
+}
+
+func TestListSessionsHandlerReturnsAllSessions(t *testing.T) {
+	t.Parallel()
+
+	homePaths := newTestHomePaths(t)
+	manager := &stubSessionManager{
+		ListAllFn: func(context.Context) ([]*session.Info, error) {
+			return []*session.Info{newSessionInfo("sess-a"), newSessionInfo("sess-b")}, nil
+		},
+	}
+	handlers := newTestHandlers(t, manager, stubObserver{}, homePaths)
+	engine := newTestRouter(t, handlers)
+
+	recorder := performRequest(t, engine, http.MethodGet, "/api/sessions?all_workspaces=true", nil)
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d", recorder.Code, http.StatusOK)
+	}
+
+	var response struct {
+		Sessions []sessionPayload                  `json:"sessions"`
+		Page     contract.CountedCursorPagePayload `json:"page"`
+	}
+	decodeJSONResponse(t, recorder, &response)
+	if len(response.Sessions) != 2 {
+		t.Fatalf("len(sessions) = %d, want 2", len(response.Sessions))
+	}
+	if response.Page.Total != 2 || response.Page.Limit != session.DefaultListLimit {
+		t.Fatalf("page = %#v, want HTTP counted page metadata", response.Page)
+	}
+}
+
+func TestListSessionsHandlerFiltersByWorkspace(t *testing.T) {
+	t.Parallel()
+
+	homePaths := newTestHomePaths(t)
+	infoA := newSessionInfo("sess-a")
+	infoB := newSessionInfo("sess-b")
+	infoB.WorkspaceID = "ws-beta"
+	infoB.Workspace = "/other"
+
+	manager := &stubSessionManager{
+		ListAllFn: func(context.Context) ([]*session.Info, error) {
+			return []*session.Info{infoA, infoB}, nil
+		},
+	}
+	workspaces := stubWorkspaceService{
+		GetFn: func(_ context.Context, ref string) (workspacepkg.Workspace, error) {
+			if ref != "alpha" {
+				t.Fatalf("Get() ref = %q, want alpha", ref)
+			}
+			return workspacepkg.Workspace{ID: "ws-workspace", Name: "alpha"}, nil
+		},
+	}
+	engine := newTestRouter(t, newTestHandlersWithWorkspace(t, manager, stubObserver{}, workspaces, homePaths))
+
+	recorder := performRequest(t, engine, http.MethodGet, "/api/sessions?workspace_id=alpha", nil)
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d; body=%s", recorder.Code, http.StatusOK, recorder.Body.String())
+	}
+
+	var response struct {
+		Sessions []sessionPayload                  `json:"sessions"`
+		Page     contract.CountedCursorPagePayload `json:"page"`
+	}
+	decodeJSONResponse(t, recorder, &response)
+	if len(response.Sessions) != 1 || response.Sessions[0].ID != "sess-a" {
+		t.Fatalf("sessions = %#v", response.Sessions)
+	}
+	if response.Sessions[0].WorkspaceID != "ws-workspace" {
+		t.Fatalf("workspace_id = %q, want ws-workspace", response.Sessions[0].WorkspaceID)
+	}
+	if response.Page.Total != 1 {
+		t.Fatalf("page total = %d, want workspace-scoped total 1", response.Page.Total)
+	}
+}
+
+func TestCreateWorkspaceHandlerRegistersWorkspace(t *testing.T) {
+	t.Parallel()
+
+	homePaths := newTestHomePaths(t)
+	rootDir := t.TempDir()
+	addDir := filepath.Join(t.TempDir(), "shared")
+	if err := os.MkdirAll(addDir, 0o755); err != nil {
+		t.Fatalf("os.MkdirAll(addDir) error = %v", err)
+	}
+
+	workspaces := stubWorkspaceService{
+		RegisterFn: func(_ context.Context, opts workspacepkg.RegisterOptions) (workspacepkg.Workspace, error) {
+			if opts.RootDir != rootDir || opts.Name != "alpha" || len(opts.AdditionalDirs) != 1 ||
+				opts.AdditionalDirs[0] != addDir || opts.DefaultAgent != "coder" {
+				t.Fatalf("Register() opts = %#v", opts)
+			}
+			return workspacepkg.Workspace{
+				ID:             "ws_alpha123",
+				RootDir:        rootDir,
+				AdditionalDirs: []string{addDir},
+				Name:           "alpha",
+				DefaultAgent:   "coder",
+
+				CreatedAt: time.Date(2026, 4, 3, 12, 0, 0, 0, time.UTC),
+				UpdatedAt: time.Date(2026, 4, 3, 12, 0, 0, 0, time.UTC),
+			}, nil
+		},
+	}
+	engine := newTestRouter(
+		t,
+		newTestHandlersWithWorkspace(t, &stubSessionManager{}, stubObserver{}, workspaces, homePaths),
+	)
+
+	body, err := json.Marshal(map[string]any{
+		"root_dir":      rootDir,
+		"name":          "alpha",
+		"add_dirs":      []string{addDir},
+		"default_agent": "coder",
+	})
+	if err != nil {
+		t.Fatalf("json.Marshal(create workspace request) error = %v", err)
+	}
+	recorder := performRequest(t, engine, http.MethodPost, "/api/workspaces", body)
+	if recorder.Code != http.StatusCreated {
+		t.Fatalf("status = %d, want %d; body=%s", recorder.Code, http.StatusCreated, recorder.Body.String())
+	}
+
+	var response struct {
+		Workspace workspacePayload `json:"workspace"`
+	}
+	decodeJSONResponse(t, recorder, &response)
+	if response.Workspace.ID != "ws_alpha123" {
+		t.Fatalf("workspace.id = %q, want ws_alpha123", response.Workspace.ID)
+	}
+}
+
+func TestListWorkspacesHandlerReturnsRegisteredRows(t *testing.T) {
+	t.Parallel()
+
+	homePaths := newTestHomePaths(t)
+	rootDir := t.TempDir()
+	workspaces := stubWorkspaceService{
+		ListFn: func(context.Context) ([]workspacepkg.Workspace, error) {
+			return []workspacepkg.Workspace{{
+				ID:        "ws_alpha",
+				RootDir:   rootDir,
+				Name:      "alpha",
+				CreatedAt: time.Date(2026, 4, 3, 12, 0, 0, 0, time.UTC),
+				UpdatedAt: time.Date(2026, 4, 3, 12, 5, 0, 0, time.UTC),
+			}}, nil
+		},
+	}
+	engine := newTestRouter(
+		t,
+		newTestHandlersWithWorkspace(t, &stubSessionManager{}, stubObserver{}, workspaces, homePaths),
+	)
+
+	recorder := performRequest(t, engine, http.MethodGet, "/api/workspaces", nil)
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d; body=%s", recorder.Code, http.StatusOK, recorder.Body.String())
+	}
+
+	var response struct {
+		Workspaces []workspacePayload `json:"workspaces"`
+	}
+	decodeJSONResponse(t, recorder, &response)
+	if len(response.Workspaces) != 1 || response.Workspaces[0].ID != "ws_alpha" {
+		t.Fatalf("workspaces = %#v", response.Workspaces)
+	}
+}
+
+func TestDaemonStatusHandlerReturnsUserHomeDir(t *testing.T) {
+	t.Run("ShouldReturnResolvedUserHomeDir", func(t *testing.T) {
+		t.Parallel()
+
+		homePaths := newTestHomePaths(t)
+		manager := &stubSessionManager{
+			ListAllFn: func(context.Context) ([]*session.Info, error) {
+				return nil, nil
+			},
+		}
+		observer := stubObserver{
+			HealthFn: func(context.Context) (observe.Health, error) {
+				return observe.Health{Status: "ok", Version: "dev"}, nil
+			},
+		}
+		engine := newTestRouter(t, newTestHandlers(t, manager, observer, homePaths))
+
+		recorder := performRequest(t, engine, http.MethodGet, "/api/status", nil)
+		if recorder.Code != http.StatusOK {
+			t.Fatalf("status = %d, want %d; body=%s", recorder.Code, http.StatusOK, recorder.Body.String())
+		}
+
+		var response contract.StatusPayload
+		decodeJSONResponse(t, recorder, &response)
+
+		userHomeDir, err := os.UserHomeDir()
+		if err != nil {
+			t.Fatalf("os.UserHomeDir() error = %v", err)
+		}
+		resolvedUserHomeDir, err := compozyconfig.ResolvePath(userHomeDir)
+		if err != nil {
+			t.Fatalf("ResolvePath(user home) error = %v", err)
+		}
+
+		if response.Daemon.UserHomeDir != resolvedUserHomeDir {
+			t.Fatalf("daemon.user_home_dir = %q, want %q", response.Daemon.UserHomeDir, resolvedUserHomeDir)
+		}
+		if response.Daemon.UserHomeDir == homePaths.HomeDir {
+			t.Fatalf(
+				"daemon.user_home_dir = %q, should not match compozy home %q",
+				response.Daemon.UserHomeDir,
+				homePaths.HomeDir,
+			)
+		}
+	})
+}
+
+func TestRuntimeIdentityHandlerStaysIndependentFromRuntimeAggregation(t *testing.T) {
+	t.Run("Should return identity without runtime aggregation", func(t *testing.T) {
+		t.Parallel()
+
+		var sessionCalls atomic.Int32
+		var observerCalls atomic.Int32
+		homePaths := newTestHomePaths(t)
+		manager := &stubSessionManager{
+			ListAllFn: func(context.Context) ([]*session.Info, error) {
+				sessionCalls.Add(1)
+				return nil, errors.New("session aggregation must not run")
+			},
+		}
+		observer := stubObserver{
+			HealthFn: func(context.Context) (observe.Health, error) {
+				observerCalls.Add(1)
+				return observe.Health{}, errors.New("observer aggregation must not run")
+			},
+		}
+		engine := newTestRouter(t, newTestHandlers(t, manager, observer, homePaths))
+
+		recorder := performRequest(t, engine, http.MethodGet, "/api/status/identity", nil)
+		if recorder.Code != http.StatusOK {
+			t.Fatalf("status = %d, want %d; body=%s", recorder.Code, http.StatusOK, recorder.Body.String())
+		}
+		if sessionCalls.Load() != 0 || observerCalls.Load() != 0 {
+			t.Fatalf(
+				"identity aggregation calls = sessions:%d observer:%d, want zero",
+				sessionCalls.Load(),
+				observerCalls.Load(),
+			)
+		}
+
+		var response map[string]json.RawMessage
+		decodeJSONResponse(t, recorder, &response)
+		if len(response) != 2 || response["schema_version"] == nil || response["daemon"] == nil {
+			t.Fatalf(
+				"identity response keys = %v, want schema_version and daemon only",
+				slices.Sorted(maps.Keys(response)),
+			)
+		}
+		var daemon contract.DaemonIdentityPayload
+		if err := json.Unmarshal(response["daemon"], &daemon); err != nil {
+			t.Fatalf("json.Unmarshal(daemon identity) error = %v", err)
+		}
+		if daemon.PID <= 0 || daemon.StartedAt.IsZero() || daemon.HTTPHost != "127.0.0.1" ||
+			daemon.HTTPPort != 2123 || daemon.UserHomeDir == "" || daemon.Version == "" {
+			t.Fatalf("daemon identity = %#v, want complete bounded runtime identity", daemon)
+		}
+	})
+}
+
+func TestGetWorkspaceHandlerReturnsDetail(t *testing.T) {
+	t.Parallel()
+
+	homePaths := newTestHomePaths(t)
+	rootDir := t.TempDir()
+	sharedSkillDir := filepath.Join(rootDir, ".compozy", "skills", "marketing", "brief")
+	resolved := workspacepkg.ResolvedWorkspace{
+		ID:          "ws_alpha",
+		RootDir:     rootDir,
+		Name:        "alpha",
+		CreatedAt:   time.Date(2026, 4, 3, 12, 0, 0, 0, time.UTC),
+		UpdatedAt:   time.Date(2026, 4, 3, 12, 0, 0, 0, time.UTC),
+		WorkspaceID: "ws_alpha",
+		Config: compozyconfig.Config{
+			Providers: map[string]compozyconfig.ProviderConfig{
+				"alpha": {Command: "alpha --acp"},
+			},
+		},
+		Agents: []compozyconfig.AgentDef{{
+			Name:     "coder",
+			Provider: "fake",
+			Prompt:   "hello",
+		}},
+		Skills: []workspacepkg.SkillPath{{
+			Name:   "campaign-brief",
+			Dir:    sharedSkillDir,
+			Source: "workspace",
+		}},
+		ProfileDeclarations: []workspacepkg.ProfileDeclaration{{
+			Name: "marketing",
+			Path: filepath.Join(rootDir, ".compozy", "profiles", "marketing"),
+		}},
+	}
+	manager := &stubSessionManager{
+		ListAllFn: func(context.Context) ([]*session.Info, error) {
+			info := newSessionInfo("sess-a")
+			info.WorkspaceID = "ws_alpha"
+			return []*session.Info{info}, nil
+		},
+	}
+	workspaces := stubWorkspaceService{
+		ResolveFn: func(_ context.Context, ref string) (workspacepkg.ResolvedWorkspace, error) {
+			if ref != "ws_alpha" {
+				t.Fatalf("Resolve() ref = %q, want ws_alpha", ref)
+			}
+			return resolved, nil
+		},
+	}
+	engine := newTestRouter(t, newTestHandlersWithWorkspace(t, manager, stubObserver{}, workspaces, homePaths))
+
+	recorder := performRequest(t, engine, http.MethodGet, "/api/workspaces/ws_alpha", nil)
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d; body=%s", recorder.Code, http.StatusOK, recorder.Body.String())
+	}
+
+	var response contract.WorkspaceDetailPayload
+	decodeJSONResponse(t, recorder, &response)
+	if response.Workspace.ID != "ws_alpha" || len(response.Sessions) != 1 || len(response.Agents) != 1 ||
+		len(response.Skills) != 1 {
+		t.Fatalf("workspace detail = %#v", response)
+	}
+	if response.Skills[0].Name != "campaign-brief" {
+		t.Fatalf("skill name = %q, want campaign-brief", response.Skills[0].Name)
+	}
+	if len(response.ProfileHints) != 1 || response.ProfileHints[0].Name != "marketing" ||
+		response.ProfileHints[0].Action != "compozy profile create marketing" {
+		t.Fatalf("profile hints = %#v, want dormant marketing declaration", response.ProfileHints)
+	}
+	providerNames := make([]string, 0, len(response.Providers))
+	for _, provider := range response.Providers {
+		providerNames = append(providerNames, provider.Name)
+	}
+	expectedNames := []string{
+		"agy",
+		"alpha",
+		"claude",
+		"codex",
+		"copilot",
+		"cursor",
+		"gemini",
+		"kimi-cli",
+		"moonshot",
+		"opencode",
+		"openrouter",
+		"pi",
+		"qwen-code",
+		"vercel-ai-gateway",
+		"xai",
+		"zai",
+	}
+	if !slices.Equal(providerNames, expectedNames) {
+		t.Fatalf("provider names = %#v, want %#v", providerNames, expectedNames)
+	}
+}
+
+func TestUpdateWorkspaceHandlerUpdatesWorkspace(t *testing.T) {
+	t.Parallel()
+
+	homePaths := newTestHomePaths(t)
+	rootDir := t.TempDir()
+	addDir := filepath.Join(t.TempDir(), "shared")
+	if err := os.MkdirAll(addDir, 0o755); err != nil {
+		t.Fatalf("os.MkdirAll(addDir) error = %v", err)
+	}
+
+	var updated bool
+	workspaces := stubWorkspaceService{
+		GetFn: func(_ context.Context, _ string) (workspacepkg.Workspace, error) {
+			if !updated {
+				return workspacepkg.Workspace{ID: "ws_alpha", RootDir: rootDir, Name: "alpha"}, nil
+			}
+			return workspacepkg.Workspace{
+				ID:             "ws_alpha",
+				RootDir:        rootDir,
+				Name:           "beta",
+				AdditionalDirs: []string{addDir},
+				DefaultAgent:   "reviewer",
+			}, nil
+		},
+		UpdateFn: func(_ context.Context, id string, opts workspacepkg.UpdateOptions) error {
+			if id != "ws_alpha" || opts.Name == nil || *opts.Name != "beta" || opts.AdditionalDirs == nil ||
+				len(*opts.AdditionalDirs) != 1 || (*opts.AdditionalDirs)[0] != addDir ||
+				opts.DefaultAgent == nil || *opts.DefaultAgent != "reviewer" {
+				t.Fatalf("Update() id=%q opts=%#v", id, opts)
+			}
+			updated = true
+			return nil
+		},
+	}
+	engine := newTestRouter(
+		t,
+		newTestHandlersWithWorkspace(t, &stubSessionManager{}, stubObserver{}, workspaces, homePaths),
+	)
+
+	body, err := json.Marshal(map[string]any{
+		"name":          "beta",
+		"add_dirs":      []string{addDir},
+		"default_agent": "reviewer",
+	})
+	if err != nil {
+		t.Fatalf("json.Marshal(update workspace request) error = %v", err)
+	}
+	recorder := performRequest(t, engine, http.MethodPatch, "/api/workspaces/ws_alpha", body)
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d; body=%s", recorder.Code, http.StatusOK, recorder.Body.String())
+	}
+
+	var response struct {
+		Workspace workspacePayload `json:"workspace"`
+	}
+	decodeJSONResponse(t, recorder, &response)
+	if response.Workspace.Name != "beta" || len(response.Workspace.AddDirs) != 1 {
+		t.Fatalf("workspace = %#v", response.Workspace)
+	}
+}
+
+func TestDeleteWorkspaceHandlerReturnsNoContent(t *testing.T) {
+	t.Parallel()
+
+	homePaths := newTestHomePaths(t)
+	workspaces := stubWorkspaceService{
+		GetFn: func(context.Context, string) (workspacepkg.Workspace, error) {
+			return workspacepkg.Workspace{ID: "ws_alpha", Name: "alpha"}, nil
+		},
+		UnregisterFn: func(_ context.Context, id string) error {
+			if id != "ws_alpha" {
+				t.Fatalf("Unregister() id = %q, want ws_alpha", id)
+			}
+			return nil
+		},
+	}
+	engine := newTestRouter(
+		t,
+		newTestHandlersWithWorkspace(t, &stubSessionManager{}, stubObserver{}, workspaces, homePaths),
+	)
+
+	recorder := performRequest(t, engine, http.MethodDelete, "/api/workspaces/ws_alpha", nil)
+	if recorder.Code != http.StatusNoContent {
+		t.Fatalf("status = %d, want %d; body=%s", recorder.Code, http.StatusNoContent, recorder.Body.String())
+	}
+	if recorder.Body.Len() != 0 {
+		t.Fatalf("body = %q, want empty", recorder.Body.String())
+	}
+}
+
+func TestResolveWorkspaceHandlerReturnsWorkspace(t *testing.T) {
+	t.Parallel()
+
+	homePaths := newTestHomePaths(t)
+	rootDir := t.TempDir()
+	workspaces := stubWorkspaceService{
+		ResolveOrRegisterFn: func(_ context.Context, path string) (workspacepkg.ResolvedWorkspace, error) {
+			if path != rootDir {
+				t.Fatalf("ResolveOrRegister() path = %q, want %q", path, rootDir)
+			}
+			return workspacepkg.ResolvedWorkspace{
+				ID:          "ws_alpha",
+				RootDir:     rootDir,
+				Name:        "alpha",
+				CreatedAt:   time.Date(2026, 4, 3, 12, 0, 0, 0, time.UTC),
+				UpdatedAt:   time.Date(2026, 4, 3, 12, 0, 0, 0, time.UTC),
+				WorkspaceID: "ws_alpha",
+			}, nil
+		},
+	}
+	engine := newTestRouter(
+		t,
+		newTestHandlersWithWorkspace(t, &stubSessionManager{}, stubObserver{}, workspaces, homePaths),
+	)
+
+	body, err := json.Marshal(map[string]any{"path": rootDir})
+	if err != nil {
+		t.Fatalf("json.Marshal(resolve workspace request) error = %v", err)
+	}
+	recorder := performRequest(t, engine, http.MethodPost, "/api/workspaces/resolve", body)
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d; body=%s", recorder.Code, http.StatusOK, recorder.Body.String())
+	}
+
+	var response struct {
+		Workspace workspacePayload `json:"workspace"`
+	}
+	decodeJSONResponse(t, recorder, &response)
+	if response.Workspace.ID != "ws_alpha" {
+		t.Fatalf("workspace.id = %q, want ws_alpha", response.Workspace.ID)
+	}
+}
+
+func TestDeleteSessionHandlerReturnsNoContent(t *testing.T) {
+	t.Parallel()
+
+	t.Run("ShouldReturnNoContent", func(t *testing.T) {
+		t.Parallel()
+
+		homePaths := newTestHomePaths(t)
+		manager := &stubSessionManager{
+			DeleteFn: func(_ context.Context, id string) error {
+				if id != "sess-123" {
+					t.Fatalf("Delete() id = %q, want sess-123", id)
+				}
+				return nil
+			},
+		}
+		handlers := newTestHandlers(t, manager, stubObserver{}, homePaths)
+		engine := newTestRouter(t, handlers)
+
+		recorder := performRequest(t, engine, http.MethodDelete, "/api/workspaces/ws-workspace/sessions/sess-123", nil)
+		if recorder.Code != http.StatusNoContent {
+			t.Fatalf("status = %d, want %d", recorder.Code, http.StatusNoContent)
+		}
+		if got := recorder.Body.String(); got != "" {
+			t.Fatalf("body = %q, want empty", got)
+		}
+	})
+}
+
+func TestStopSessionHandlerReturnsStopped(t *testing.T) {
+	t.Parallel()
+
+	homePaths := newTestHomePaths(t)
+	manager := &stubSessionManager{
+		StopFn: func(_ context.Context, id string) error {
+			if id != "sess-123" {
+				t.Fatalf("Stop() id = %q, want sess-123", id)
+			}
+			return nil
+		},
+	}
+	handlers := newTestHandlers(t, manager, stubObserver{}, homePaths)
+	engine := newTestRouter(t, handlers)
+
+	recorder := performRequest(t, engine, http.MethodPost, "/api/workspaces/ws-workspace/sessions/sess-123/stop", nil)
+	if recorder.Code != http.StatusNoContent {
+		t.Fatalf("status = %d, want %d", recorder.Code, http.StatusNoContent)
+	}
+	if got := recorder.Body.String(); got != "" {
+		t.Fatalf("body = %q, want empty", got)
+	}
+}
+
+func TestPromptSessionHandlerReturnsAISDKSSEStream(t *testing.T) {
+	t.Parallel()
+
+	homePaths := newTestHomePaths(t)
+	var gotOpts session.SendPromptOpts
+	manager := &stubSessionManager{
+		SendPromptFn: func(_ context.Context, _ string, opts session.SendPromptOpts) (session.SendPromptResult, error) {
+			gotOpts = opts
+			ch := make(chan acp.AgentEvent, 4)
+			ch <- acp.AgentEvent{
+				Type:      "agent_message",
+				TurnID:    "turn-1",
+				Timestamp: time.Date(2026, 4, 3, 12, 0, 0, 0, time.UTC),
+				Text:      "hello",
+			}
+			ch <- acp.AgentEvent{
+				Type:       "tool_call",
+				TurnID:     "turn-1",
+				Timestamp:  time.Date(2026, 4, 3, 12, 0, 1, 0, time.UTC),
+				Title:      "read_file",
+				ToolCallID: "call-1",
+			}
+			ch <- acp.AgentEvent{
+				Type:       "tool_result",
+				TurnID:     "turn-1",
+				Timestamp:  time.Date(2026, 4, 3, 12, 0, 2, 0, time.UTC),
+				ToolCallID: "call-1",
+			}
+			ch <- acp.AgentEvent{
+				Type:       "done",
+				TurnID:     "turn-1",
+				Timestamp:  time.Date(2026, 4, 3, 12, 0, 3, 0, time.UTC),
+				StopReason: "end_turn",
+			}
+			close(ch)
+			return session.SendPromptResult{Status: "accepted", Events: ch, NewTurnID: "turn-1"}, nil
+		},
+	}
+	handlers := newTestHandlers(t, manager, stubObserver{}, homePaths)
+	engine := newTestRouter(t, handlers)
+
+	recorder := performRequest(
+		t,
+		engine,
+		http.MethodPost,
+		"/api/workspaces/ws-workspace/sessions/sess-123/prompt",
+		[]byte(
+			`{"message_id":"msg-ai-sdk-stream","idempotency_key":"idem-ai-sdk-stream",`+
+				`"messages":[{"id":"msg-ai-sdk-stream","role":"user",`+
+				`"parts":[{"type":"text","text":"hello"}]}]}`,
+		),
+	)
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d; body=%s", recorder.Code, http.StatusOK, recorder.Body.String())
+	}
+	if gotOpts.Message != "hello" ||
+		gotOpts.MessageID != "msg-ai-sdk-stream" ||
+		gotOpts.IdempotencyKey != "idem-ai-sdk-stream" {
+		t.Fatalf("SendPrompt() opts = %#v, want canonical message identity", gotOpts)
+	}
+	if got := recorder.Header().Get("Content-Type"); got != "text/event-stream" {
+		t.Fatalf("Content-Type = %q, want text/event-stream", got)
+	}
+	if got := recorder.Header().Get("x-vercel-ai-ui-message-stream"); got != "v1" {
+		t.Fatalf("x-vercel-ai-ui-message-stream = %q, want v1", got)
+	}
+
+	records := parseSSE(t, recorder.Body.String())
+	if len(records) < 5 {
+		t.Fatalf("len(records) = %d, want at least 5; body=%s", len(records), recorder.Body.String())
+	}
+	if string(records[len(records)-1].Data) != "[DONE]" {
+		t.Fatalf("last data = %q, want [DONE]", string(records[len(records)-1].Data))
+	}
+
+	var finishPart struct {
+		Type         string `json:"type"`
+		FinishReason string `json:"finishReason,omitempty"`
+	}
+	var finishFields map[string]json.RawMessage
+	for _, record := range records {
+		if len(record.Data) > 0 && string(record.Data) != "[DONE]" {
+			var payload struct {
+				Type string `json:"type"`
+			}
+			if err := json.Unmarshal(record.Data, &payload); err != nil {
+				t.Fatalf("json.Unmarshal(part type) error = %v; data=%s", err, string(record.Data))
+			}
+			if payload.Type == "finish" {
+				if err := json.Unmarshal(record.Data, &finishPart); err != nil {
+					t.Fatalf("json.Unmarshal(finish part) error = %v; data=%s", err, string(record.Data))
+				}
+				if err := json.Unmarshal(record.Data, &finishFields); err != nil {
+					t.Fatalf("json.Unmarshal(finish fields) error = %v; data=%s", err, string(record.Data))
+				}
+			}
+		}
+	}
+
+	var promptParts []map[string]any
+	for _, record := range records[:len(records)-1] {
+		if len(record.Data) == 0 || string(record.Data) == "[DONE]" {
+			continue
+		}
+		var part map[string]any
+		if err := json.Unmarshal(record.Data, &part); err != nil {
+			t.Fatalf("json.Unmarshal(part) error = %v; data=%s", err, string(record.Data))
+		}
+		promptParts = append(promptParts, part)
+	}
+
+	types := make([]string, 0, len(promptParts))
+	for _, part := range promptParts {
+		if value, ok := part["type"].(string); ok {
+			types = append(types, value)
+		}
+	}
+	if !contains(types, "start") || !contains(types, "text-start") || !contains(types, "text-delta") ||
+		!contains(types, "tool-input-start") ||
+		!contains(types, "tool-input-available") ||
+		!contains(types, "tool-output-available") ||
+		!contains(types, "finish") {
+		t.Fatalf("part types = %#v", types)
+	}
+	if got := finishPart.FinishReason; got != "stop" {
+		t.Fatalf("finishPart.FinishReason = %q, want %q", got, "stop")
+	}
+	if _, ok := finishFields["stopReason"]; ok {
+		t.Fatalf("finish part unexpectedly includes stopReason: %s", finishFields["stopReason"])
+	}
+}
+
+func TestPromptSessionHandlerRequiresAcceptedTurnIDForAISDKStream(t *testing.T) {
+	t.Parallel()
+
+	t.Run("ShouldRejectAcceptedStreamWithoutDurableTurnID", func(t *testing.T) {
+		t.Parallel()
+
+		homePaths := newTestHomePaths(t)
+		manager := &stubSessionManager{
+			SendPromptFn: func(context.Context, string, session.SendPromptOpts) (session.SendPromptResult, error) {
+				ch := make(chan acp.AgentEvent)
+				close(ch)
+				return session.SendPromptResult{Status: "accepted", Events: ch}, nil
+			},
+		}
+		handlers := newTestHandlers(t, manager, stubObserver{}, homePaths)
+		engine := newTestRouter(t, handlers)
+
+		recorder := performRequest(
+			t,
+			engine,
+			http.MethodPost,
+			"/api/workspaces/ws-workspace/sessions/sess-123/prompt",
+			[]byte(`{"message":"hello","message_id":"msg-accepted-turn","idempotency_key":"idem-accepted-turn"}`),
+		)
+		if recorder.Code != http.StatusInternalServerError {
+			t.Fatalf(
+				"status = %d, want %d; body=%s",
+				recorder.Code,
+				http.StatusInternalServerError,
+				recorder.Body.String(),
+			)
+		}
+		if body := recorder.Body.String(); !strings.Contains(body, "Internal Server Error") {
+			t.Fatalf("body = %q, want internal server error", body)
+		}
+	})
+}
+
+func TestPromptSessionHandlerPreservesToolInputAfterOutOfOrderToolResult(t *testing.T) {
+	t.Parallel()
+
+	t.Run("ShouldEmitRealToolInputAfterAForcedPlaceholder", func(t *testing.T) {
+		homePaths := newTestHomePaths(t)
+		manager := &stubSessionManager{
+			SendPromptFn: func(context.Context, string, session.SendPromptOpts) (session.SendPromptResult, error) {
+				ch := make(chan acp.AgentEvent, 3)
+				ch <- acp.AgentEvent{
+					Type:       "tool_result",
+					TurnID:     "turn-1",
+					Timestamp:  time.Date(2026, 4, 3, 12, 0, 1, 0, time.UTC),
+					ToolCallID: "call-1",
+				}
+				ch <- acp.AgentEvent{
+					Type:       "tool_call",
+					TurnID:     "turn-1",
+					Timestamp:  time.Date(2026, 4, 3, 12, 0, 2, 0, time.UTC),
+					Title:      "read_file",
+					ToolCallID: "call-1",
+					Raw: json.RawMessage(
+						`{"access_token":"provider-token","note":"compozy_claim_RAWTOKEN123",` +
+							`"authorization":"Bearer provider-token","tool_input":` +
+							`{"path":"README.md","client_secret":"secret-value"}}`,
+					),
+				}
+				ch <- acp.AgentEvent{
+					Type:       "done",
+					TurnID:     "turn-1",
+					Timestamp:  time.Date(2026, 4, 3, 12, 0, 3, 0, time.UTC),
+					StopReason: "end_turn",
+				}
+				close(ch)
+				return session.SendPromptResult{Status: "accepted", Events: ch, NewTurnID: "turn-1"}, nil
+			},
+		}
+		handlers := newTestHandlers(t, manager, stubObserver{}, homePaths)
+		engine := newTestRouter(t, handlers)
+
+		recorder := performRequest(
+			t,
+			engine,
+			http.MethodPost,
+			"/api/workspaces/ws-workspace/sessions/sess-123/prompt",
+			[]byte(
+				`{"message_id":"msg-tool-order","idempotency_key":"idem-tool-order",`+
+					`"messages":[{"id":"msg-tool-order","role":"user",`+
+					`"parts":[{"type":"text","text":"hello"}]}]}`,
+			),
+		)
+		if recorder.Code != http.StatusOK {
+			t.Fatalf("status = %d, want %d; body=%s", recorder.Code, http.StatusOK, recorder.Body.String())
+		}
+
+		records := parseSSE(t, recorder.Body.String())
+		if len(records) < 2 {
+			t.Fatalf("len(records) = %d, want at least 2; body=%s", len(records), recorder.Body.String())
+		}
+
+		var toolInputs []map[string]any
+		for _, record := range records[:len(records)-1] {
+			if len(record.Data) == 0 || string(record.Data) == "[DONE]" {
+				continue
+			}
+			var part map[string]any
+			if err := json.Unmarshal(record.Data, &part); err != nil {
+				t.Fatalf("json.Unmarshal(part) error = %v; data=%s", err, string(record.Data))
+			}
+			if part["type"] == "tool-input-available" {
+				toolInputs = append(toolInputs, part)
+			}
+		}
+
+		if len(toolInputs) != 2 {
+			t.Fatalf("len(toolInputs) = %d, want 2; body=%s", len(toolInputs), recorder.Body.String())
+		}
+
+		firstInput, ok := toolInputs[0]["input"].(map[string]any)
+		if !ok {
+			t.Fatalf("first tool input = %#v, want object", toolInputs[0]["input"])
+		}
+		if len(firstInput) != 0 {
+			t.Fatalf("first tool input = %#v, want provisional empty object", firstInput)
+		}
+
+		secondInput, ok := toolInputs[1]["input"].(map[string]any)
+		if !ok {
+			t.Fatalf("second tool input = %#v, want object", toolInputs[1]["input"])
+		}
+		if got, want := secondInput["path"], "README.md"; got != want {
+			t.Fatalf("second tool input path = %#v, want %q", got, want)
+		}
+		if got, want := secondInput["client_secret"], "[REDACTED]"; got != want {
+			t.Fatalf("second tool input client_secret = %#v, want %q", got, want)
+		}
+		if got, want := toolInputs[1]["toolName"], "read_file"; got != want {
+			t.Fatalf("second tool input toolName = %#v, want %q", got, want)
+		}
+		for _, leaked := range []string{
+			"provider-token",
+			"secret-value",
+			"compozy_claim_RAWTOKEN123",
+			"Bearer provider-token",
+		} {
+			if strings.Contains(recorder.Body.String(), leaked) {
+				t.Fatalf("prompt SSE leaked %q in body=%s", leaked, recorder.Body.String())
+			}
+		}
+	})
+}
+
+func TestPromptSessionHandlerReturnsBusyInputDecision(t *testing.T) {
+	t.Run("ShouldReturnAcceptedQueuePayloadWhenPromptIsQueued", func(t *testing.T) {
+		t.Parallel()
+
+		homePaths := newTestHomePaths(t)
+		var gotOpts session.SendPromptOpts
+		manager := &stubSessionManager{
+			SendPromptFn: func(_ context.Context, id string, opts session.SendPromptOpts) (session.SendPromptResult, error) {
+				if id != "sess-123" {
+					t.Fatalf("SendPrompt() id = %q, want sess-123", id)
+				}
+				gotOpts = opts
+				return session.SendPromptResult{
+					Status:          "queued",
+					Mode:            session.BusyInputModeQueue,
+					Delivery:        store.SessionInputDeliveryAfterTurn,
+					QueueEntryID:    "inq-1",
+					QueuePosition:   2,
+					QueueGeneration: 4,
+				}, nil
+			},
+		}
+		handlers := newTestHandlers(t, manager, stubObserver{}, homePaths)
+		engine := newTestRouter(t, handlers)
+
+		recorder := performRequest(
+			t,
+			engine,
+			http.MethodPost,
+			"/api/workspaces/ws-workspace/sessions/sess-123/prompt",
+			[]byte(
+				`{"message_id":"client-queue-1","idempotency_key":"idem-queue-1",`+
+					`"messages":[{"id":"client-queue-1","role":"user",`+
+					`"parts":[{"type":"text","text":"queue me"}]}],"mode":"queue",`+
+					`"runtime":{"provider":"codex","model":"gpt-5.4","reasoning_effort":"high","speed":"fast"}}`,
+			),
+		)
+		if recorder.Code != http.StatusAccepted {
+			t.Fatalf("status = %d, want %d; body=%s", recorder.Code, http.StatusAccepted, recorder.Body.String())
+		}
+		if gotOpts.Message != "queue me" || gotOpts.Mode != session.BusyInputModeQueue ||
+			gotOpts.MessageID != "client-queue-1" || gotOpts.IdempotencyKey != "idem-queue-1" {
+			t.Fatalf("SendPrompt() opts = %#v, want queue me queue", gotOpts)
+		}
+		if gotOpts.Runtime == nil || gotOpts.Runtime.Provider != "codex" ||
+			gotOpts.Runtime.Model != "gpt-5.4" || gotOpts.Runtime.ReasoningEffort != "high" ||
+			gotOpts.Runtime.Speed != contract.SpeedFast {
+			t.Fatalf("SendPrompt() runtime = %#v, want codex gpt-5.4 high fast", gotOpts.Runtime)
+		}
+		var decoded contract.SendPromptResultResponse
+		if err := json.Unmarshal(recorder.Body.Bytes(), &decoded); err != nil {
+			t.Fatalf("json.Unmarshal(prompt result) error = %v; body=%s", err, recorder.Body.String())
+		}
+		if decoded.Prompt.Status != "queued" || decoded.Prompt.QueueEntryID != "inq-1" ||
+			decoded.Prompt.Delivery != contract.PromptDeliveryAfterTurn {
+			t.Fatalf("decoded prompt = %#v, want queued inq-1", decoded.Prompt)
+		}
+	})
+}
+
+func TestPromptSessionHandlerEnforcesDurableIdentityContract(t *testing.T) {
+	t.Parallel()
+
+	testCases := []struct {
+		name      string
+		body      string
+		wantError string
+	}{
+		{
+			name:      "ShouldRejectMissingMessageIdentity",
+			body:      `{"message":"hello","idempotency_key":"idem-missing-message"}`,
+			wantError: "message_id is required",
+		},
+		{
+			name:      "ShouldRejectMissingIdempotencyKey",
+			body:      `{"message":"hello","message_id":"msg-missing-idempotency"}`,
+			wantError: "idempotency_key is required",
+		},
+		{
+			name: "ShouldRejectUserMessageIDThatDiffersFromCanonicalIdentity",
+			body: `{"message_id":"msg-canonical","idempotency_key":"idem-canonical",` +
+				`"messages":[{"id":"msg-different","role":"user","content":"hello"}]}`,
+			wantError: "latest user message id must equal message_id",
+		},
+		{
+			name: "ShouldRejectTopLevelTextThatDiffersFromLatestUserMessage",
+			body: `{"message":"different","message_id":"msg-canonical","idempotency_key":"idem-canonical",` +
+				`"messages":[{"id":"msg-canonical","role":"user","content":"hello"}]}`,
+			wantError: "message must equal the latest user message text",
+		},
+	}
+
+	for _, testCase := range testCases {
+		t.Run(testCase.name, func(t *testing.T) {
+			t.Parallel()
+
+			engine := newTestRouter(t, newTestHandlers(t, &stubSessionManager{}, stubObserver{}, newTestHomePaths(t)))
+			recorder := performRequest(
+				t,
+				engine,
+				http.MethodPost,
+				"/api/workspaces/ws-workspace/sessions/sess-123/prompt",
+				[]byte(testCase.body),
+			)
+			if recorder.Code != http.StatusBadRequest {
+				t.Fatalf("status = %d, want %d; body=%s", recorder.Code, http.StatusBadRequest, recorder.Body.String())
+			}
+			if !strings.Contains(recorder.Body.String(), testCase.wantError) {
+				t.Fatalf("body = %q, want %q", recorder.Body.String(), testCase.wantError)
+			}
+		})
+	}
+}
+
+func TestPromptSessionHandlerReturnsDurableReplayEnvelope(t *testing.T) {
+	t.Parallel()
+	t.Run("ShouldReturnReplayedPromptEnvelopeWithAcceptedStatus", func(t *testing.T) {
+		t.Parallel()
+
+		manager := &stubSessionManager{
+			SendPromptFn: func(_ context.Context, _ string, opts session.SendPromptOpts) (session.SendPromptResult, error) {
+				return session.SendPromptResult{
+					Status:         "queued",
+					MessageID:      opts.MessageID,
+					IdempotencyKey: opts.IdempotencyKey,
+					Replayed:       true,
+					Delivery:       store.SessionInputDeliveryAfterTurn,
+					QueueEntryID:   "inq-replayed",
+				}, nil
+			},
+		}
+		engine := newTestRouter(t, newTestHandlers(t, manager, stubObserver{}, newTestHomePaths(t)))
+		recorder := performRequest(
+			t,
+			engine,
+			http.MethodPost,
+			"/api/workspaces/ws-workspace/sessions/sess-123/prompt",
+			[]byte(`{"message":"retry me","message_id":"msg-replay","idempotency_key":"idem-replay"}`),
+		)
+		if recorder.Code != http.StatusAccepted {
+			t.Fatalf("status = %d, want %d; body=%s", recorder.Code, http.StatusAccepted, recorder.Body.String())
+		}
+		var decoded contract.SendPromptResultResponse
+		if err := json.Unmarshal(recorder.Body.Bytes(), &decoded); err != nil {
+			t.Fatalf("json.Unmarshal(replay response) error = %v; body=%s", err, recorder.Body.String())
+		}
+		if !decoded.Prompt.Replayed || decoded.Prompt.MessageID != "msg-replay" ||
+			decoded.Prompt.IdempotencyKey != "idem-replay" || decoded.Prompt.QueueEntryID != "inq-replayed" {
+			t.Fatalf("prompt replay = %#v", decoded.Prompt)
+		}
+	})
+}
+
+func TestSteerSessionPromptHandlerPropagatesDurableIdentity(t *testing.T) {
+	t.Parallel()
+
+	t.Run("Should stage steering with canonical identity and response envelope", func(t *testing.T) {
+		t.Parallel()
+
+		var gotOpts session.SteerPromptOpts
+		manager := &stubSessionManager{
+			SteerFn: func(_ context.Context, id string, opts session.SteerPromptOpts) (session.SendPromptResult, error) {
+				if id != "sess-123" {
+					t.Fatalf("SteerPrompt() id = %q, want sess-123", id)
+				}
+				gotOpts = opts
+				return session.SendPromptResult{
+					Status:         "steering",
+					MessageID:      opts.MessageID,
+					IdempotencyKey: opts.IdempotencyKey,
+					Delivery:       store.SessionInputDeliveryInterruptThenPrompt,
+					QueueEntryID:   "inq-steer",
+				}, nil
+			},
+		}
+		engine := newTestRouter(t, newTestHandlers(t, manager, stubObserver{}, newTestHomePaths(t)))
+		recorder := performRequest(
+			t,
+			engine,
+			http.MethodPost,
+			"/api/workspaces/ws-workspace/sessions/sess-123/steer",
+			[]byte(
+				`{"text":"focus on the race","message_id":"msg-steer","idempotency_key":"idem-steer","expected_turn_id":"turn-live","attachments":[{"id":"att_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","name":"screen.png","kind":"image","mime_type":"image/png"}]}`,
+			),
+		)
+		if recorder.Code != http.StatusAccepted {
+			t.Fatalf("status = %d, want %d; body=%s", recorder.Code, http.StatusAccepted, recorder.Body.String())
+		}
+		if gotOpts.Message != "focus on the race" || gotOpts.MessageID != "msg-steer" ||
+			gotOpts.IdempotencyKey != "idem-steer" || gotOpts.ExpectedTurnID != "turn-live" {
+			t.Fatalf("SteerPrompt() opts = %#v, want canonical identity", gotOpts)
+		}
+		if len(gotOpts.Attachments) != 1 || gotOpts.Attachments[0].Name != "screen.png" {
+			t.Fatalf("steer attachment metadata = %#v", gotOpts.Attachments)
+		}
+		var decoded contract.SendPromptResultResponse
+		if err := json.Unmarshal(recorder.Body.Bytes(), &decoded); err != nil {
+			t.Fatalf("json.Unmarshal(steer result) error = %v; body=%s", err, recorder.Body.String())
+		}
+		if decoded.Prompt.Status != "steering" ||
+			decoded.Prompt.Delivery != contract.PromptDeliveryInterruptThenPrompt ||
+			decoded.Prompt.MessageID != "msg-steer" ||
+			decoded.Prompt.IdempotencyKey != "idem-steer" || decoded.Prompt.QueueEntryID != "inq-steer" {
+			t.Fatalf("steer response = %#v", decoded.Prompt)
+		}
+	})
+}
+
+func TestSessionInputHandlersExposeAuthoritativeQueueMutations(t *testing.T) {
+	// Invariant: queue reads preserve stopped-session access and transport failures.
+	// Owner: HTTP boundary; canonical queue handler suite.
+	for _, tc := range []struct {
+		name     string
+		queueErr error
+		status   int
+	}{
+		{"Should read a stopped session queue", nil, http.StatusOK},
+		{"Should preserve queue storage failures", errors.New("queue store unavailable"), http.StatusInternalServerError},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			var queueReads, summaryReads int
+			manager := &stubSessionManager{
+				StatusFn: func(context.Context, string) (*session.Info, error) {
+					info := newSessionInfo("sess-123")
+					info.State = session.StateStopped
+					return info, nil
+				},
+				InputQueueFn: func(context.Context, string) (session.InputQueueSummary, error) {
+					summaryReads++
+					return session.InputQueueSummary{PendingInputs: 1, Cap: 7}, nil
+				},
+				ListPendingInputsFn: func(context.Context, string) ([]session.PendingInput, error) {
+					queueReads++
+					return []session.PendingInput{{
+						ID: "inq-stopped", SessionID: "sess-123", Text: "persisted follow-up",
+						Status: store.SessionInputQueueStatusQueued,
+					}}, tc.queueErr
+				},
+			}
+			engine := newTestRouter(t, newTestHandlers(t, manager, stubObserver{}, newTestHomePaths(t)))
+			response := performRequest(
+				t, engine, http.MethodGet, "/api/workspaces/ws-workspace/sessions/sess-123/prompt/queue", nil,
+			)
+			if response.Code != tc.status {
+				t.Fatalf("queue status = %d, want %d; body=%s", response.Code, tc.status, response.Body.String())
+			}
+			if tc.queueErr != nil {
+				var payload contract.ErrorPayload
+				if err := json.Unmarshal(response.Body.Bytes(), &payload); err != nil {
+					t.Fatal(err)
+				}
+				// HTTP masks internal storage details. Verify that contract and prove
+				// the failed queue read short-circuited the subsequent summary read.
+				if payload.Error != http.StatusText(http.StatusInternalServerError) ||
+					strings.Contains(response.Body.String(), tc.queueErr.Error()) ||
+					queueReads != 1 || summaryReads != 0 {
+					t.Fatalf(
+						"storage failure response = %#v, queue reads = %d, summary reads = %d",
+						payload, queueReads, summaryReads,
+					)
+				}
+			} else {
+				var payload contract.SessionInputListResponse
+				if err := json.Unmarshal(response.Body.Bytes(), &payload); err != nil {
+					t.Fatal(err)
+				}
+				if queueReads != 1 || summaryReads != 1 || len(payload.Inputs) != 1 ||
+					payload.Inputs[0].ID != "inq-stopped" || payload.Inputs[0].Text != "persisted follow-up" ||
+					payload.Inputs[0].Status != contract.SessionInputQueued ||
+					payload.Queue == nil || payload.Queue.Cap != 7 || payload.Queue.Entries != 1 {
+					t.Fatalf("stopped queue response = %#v, queue reads = %d, summary reads = %d",
+						payload, queueReads, summaryReads)
+				}
+			}
+		})
+	}
+	t.Run("Should clear with operator attribution and preserve per-entry outcomes", func(t *testing.T) {
+		t.Parallel()
+		manager := &stubSessionManager{
+			ClearPendingInputsFn: func(_ context.Context, id string, caller session.PromptCaller) (session.ClearPendingInputsResult, error) {
+				if id != "sess-123" || caller.Kind != "human" || caller.ID == "" || caller.Source == "" {
+					t.Fatalf("clear identity = %q, %#v", id, caller)
+				}
+				return session.ClearPendingInputsResult{
+					ClearedCount: 1, QueueGeneration: 2,
+					Inputs: []session.PendingInput{
+						{ID: "removed", Status: "canceled", OwnerKind: "agent", OwnerID: "reviewer"},
+						{ID: "active", Status: "dispatching"},
+					},
+				}, nil
+			},
+		}
+		engine := newTestRouter(t, newTestHandlers(t, manager, stubObserver{}, newTestHomePaths(t)))
+		recorder := performRequest(t, engine, http.MethodDelete,
+			"/api/workspaces/ws-workspace/sessions/sess-123/prompt/queue", nil)
+		if recorder.Code != http.StatusOK {
+			t.Fatalf("clear status = %d, body=%s", recorder.Code, recorder.Body.String())
+		}
+		var result contract.SessionInputClearResponse
+		if err := json.Unmarshal(recorder.Body.Bytes(), &result); err != nil {
+			t.Fatal(err)
+		}
+		if result.ClearedCount != 1 || result.QueueGeneration != 2 || len(result.Inputs) != 2 ||
+			result.Inputs[0].Status != contract.SessionInputCanceled || result.Inputs[0].OwnerID != "reviewer" ||
+			result.Inputs[1].Status != contract.SessionInputDispatching {
+			t.Fatalf("clear response = %#v", result)
+		}
+	})
+	t.Parallel()
+
+	now := time.Date(2026, 8, 3, 18, 0, 0, 0, time.UTC)
+	pending := session.PendingInput{
+		ID: "inq-1", SessionID: "sess-123", MessageID: "msg-1", IdempotencyKey: "idem-1",
+		Status: store.SessionInputQueueStatusQueued, Mode: session.BusyInputModeQueue,
+		Delivery: store.SessionInputDeliveryAfterTurn, Text: "queued input @web/src",
+		QueueGeneration: 4, EnqueuedAt: now,
+		Mentions: []mention.Mention{{
+			Kind: mention.KindFolder, Token: "@web/src", Target: "web/src/", Label: "src/", Start: 13, End: 21,
+		}},
+	}
+	var replaceOpts session.ReplacePendingInputOpts
+	var promoteOpts session.PromotePendingInputOpts
+	manager := &stubSessionManager{
+		InputQueueFn: func(context.Context, string) (session.InputQueueSummary, error) {
+			return session.InputQueueSummary{PendingInputs: 2, Cap: 7}, nil
+		},
+		ListPendingInputsFn: func(_ context.Context, id string) ([]session.PendingInput, error) {
+			if id != "sess-123" {
+				t.Fatalf("ListPendingInputs() id = %q, want sess-123", id)
+			}
+			return []session.PendingInput{pending}, nil
+		},
+		ReplacePendingInputFn: func(
+			_ context.Context,
+			id string,
+			entryID string,
+			opts session.ReplacePendingInputOpts,
+		) (session.PendingInput, error) {
+			if id != "sess-123" || entryID != "inq-1" {
+				t.Fatalf("ReplacePendingInput() target = %q/%q, want sess-123/inq-1", id, entryID)
+			}
+			replaceOpts = opts
+			replaced := pending
+			replaced.ID = "inq-2"
+			replaced.Text = opts.Text
+			replaced.MessageID = opts.MessageID
+			replaced.IdempotencyKey = opts.IdempotencyKey
+			return replaced, nil
+		},
+		PromotePendingInputFn: func(
+			_ context.Context,
+			id string,
+			entryID string,
+			opts session.PromotePendingInputOpts,
+		) (session.SendPromptResult, error) {
+			if id != "sess-123" || entryID != "inq-1" {
+				t.Fatalf("PromotePendingInputToSteer() target = %q/%q, want sess-123/inq-1", id, entryID)
+			}
+			promoteOpts = opts
+			return session.SendPromptResult{
+				Status: "steering", Mode: session.BusyInputModeSteer,
+				Delivery:  store.SessionInputDeliveryInterruptThenPrompt,
+				MessageID: opts.MessageID, IdempotencyKey: opts.IdempotencyKey, QueueEntryID: "inq-3",
+			}, nil
+		},
+	}
+	engine := newTestRouter(t, newTestHandlers(t, manager, stubObserver{}, newTestHomePaths(t)))
+
+	t.Run("Should count only the public list while retaining the daemon capacity", func(t *testing.T) {
+		recorder := performRequest(
+			t,
+			engine,
+			http.MethodGet,
+			"/api/workspaces/ws-workspace/sessions/sess-123/prompt/queue",
+			nil,
+		)
+		if recorder.Code != http.StatusOK {
+			t.Fatalf("status = %d, want 200; body=%s", recorder.Code, recorder.Body.String())
+		}
+		var response contract.SessionInputListResponse
+		if err := json.Unmarshal(recorder.Body.Bytes(), &response); err != nil {
+			t.Fatalf("json.Unmarshal(list inputs) error = %v", err)
+		}
+		if response.Queue == nil || response.Queue.Cap != 7 || response.Queue.Entries != 1 {
+			t.Fatalf("queue summary = %#v, want daemon cap and current entry count", response.Queue)
+		}
+		if len(response.Inputs) != 1 || response.Inputs[0].ID != pending.ID ||
+			response.Inputs[0].Delivery != contract.PromptDeliveryAfterTurn {
+			t.Fatalf("inputs = %#v, want authoritative pending input", response.Inputs)
+		}
+		wantMentions := []contract.SessionInputMentionPayload{{
+			Kind: "folder", Token: "@web/src", Target: "web/src/", Label: "src/", Start: 13, End: 21,
+		}}
+		if !reflect.DeepEqual(response.Inputs[0].Mentions, wantMentions) {
+			t.Fatalf("input mentions = %#v, want %#v", response.Inputs[0].Mentions, wantMentions)
+		}
+	})
+
+	t.Run("Should atomically replace one queued input", func(t *testing.T) {
+		recorder := performRequest(
+			t,
+			engine,
+			http.MethodPut,
+			"/api/workspaces/ws-workspace/sessions/sess-123/prompt/queue/inq-1",
+			[]byte(`{"text":"replacement","message_id":"msg-2","idempotency_key":"idem-2"}`),
+		)
+		if recorder.Code != http.StatusOK {
+			t.Fatalf("status = %d, want 200; body=%s", recorder.Code, recorder.Body.String())
+		}
+		if replaceOpts.Text != "replacement" || replaceOpts.MessageID != "msg-2" ||
+			replaceOpts.IdempotencyKey != "idem-2" {
+			t.Fatalf("ReplacePendingInput() opts = %#v", replaceOpts)
+		}
+		var response contract.SessionInputResponse
+		if err := json.Unmarshal(recorder.Body.Bytes(), &response); err != nil {
+			t.Fatalf("json.Unmarshal(replace input) error = %v", err)
+		}
+		if response.Input.ID != "inq-2" || response.Input.Text != "replacement" {
+			t.Fatalf("replacement input = %#v", response.Input)
+		}
+	})
+
+	t.Run("Should forward attachment-only promotion with an expected turn fence", func(t *testing.T) {
+		recorder := performRequest(
+			t,
+			engine,
+			http.MethodPost,
+			"/api/workspaces/ws-workspace/sessions/sess-123/prompt/queue/inq-1/steer",
+			[]byte(
+				`{"text":"","message_id":"msg-3","idempotency_key":"idem-3","expected_turn_id":"turn-live"}`,
+			),
+		)
+		if recorder.Code != http.StatusAccepted {
+			t.Fatalf("status = %d, want 202; body=%s", recorder.Code, recorder.Body.String())
+		}
+		if promoteOpts.Text != "" || promoteOpts.ExpectedTurnID != "turn-live" ||
+			promoteOpts.MessageID != "msg-3" || promoteOpts.IdempotencyKey != "idem-3" {
+			t.Fatalf("PromotePendingInputToSteer() opts = %#v", promoteOpts)
+		}
+		var response contract.SendPromptResultResponse
+		if err := json.Unmarshal(recorder.Body.Bytes(), &response); err != nil {
+			t.Fatalf("json.Unmarshal(promote input) error = %v", err)
+		}
+		if response.Prompt.Status != "steering" ||
+			response.Prompt.Delivery != contract.PromptDeliveryInterruptThenPrompt {
+			t.Fatalf("promote response = %#v", response.Prompt)
+		}
+	})
+}
+
+func TestPromptSessionHandlerReturnsPromptAdmissionDiagnostics(t *testing.T) {
+	t.Parallel()
+
+	testCases := []struct {
+		name     string
+		err      error
+		wantCode string
+	}{
+		{
+			name:     "Should return idempotency conflict diagnostic",
+			err:      store.ErrSessionPromptIdempotencyConflict,
+			wantCode: contract.CodePromptIdempotencyConflict,
+		},
+		{
+			name:     "Should return message identity conflict diagnostic",
+			err:      store.ErrSessionPromptMessageConflict,
+			wantCode: contract.CodePromptMessageIdentityConflict,
+		},
+		{
+			name:     "Should return indeterminate dispatch diagnostic",
+			err:      store.ErrSessionPromptDispatchIndeterminate,
+			wantCode: contract.CodePromptDispatchIndeterminate,
+		},
+	}
+
+	for _, testCase := range testCases {
+		t.Run(testCase.name, func(t *testing.T) {
+			t.Parallel()
+
+			manager := &stubSessionManager{
+				SendPromptFn: func(context.Context, string, session.SendPromptOpts) (session.SendPromptResult, error) {
+					return session.SendPromptResult{}, testCase.err
+				},
+			}
+			engine := newTestRouter(t, newTestHandlers(t, manager, stubObserver{}, newTestHomePaths(t)))
+			recorder := performRequest(
+				t,
+				engine,
+				http.MethodPost,
+				"/api/workspaces/ws-workspace/sessions/sess-123/prompt",
+				[]byte(`{"message":"collision","message_id":"msg-collision","idempotency_key":"idem-collision"}`),
+			)
+			if recorder.Code != http.StatusConflict {
+				t.Fatalf("status = %d, want %d; body=%s", recorder.Code, http.StatusConflict, recorder.Body.String())
+			}
+			var decoded contract.ErrorPayload
+			decodeJSONResponse(t, recorder, &decoded)
+			if decoded.Diagnostic == nil || decoded.Diagnostic.Code != testCase.wantCode {
+				t.Fatalf("collision payload = %#v, want diagnostic %q", decoded, testCase.wantCode)
+			}
+		})
+	}
+}
+
+func TestPromptSessionHandlerPreservesRuntimeFailureDiagnostics(t *testing.T) {
+	t.Parallel()
+
+	testCases := []struct {
+		name             string
+		err              error
+		wantCode         string
+		wantEvidence     map[string]any
+		wantSuggestedCmd string
+	}{
+		{
+			name: "Should preserve negotiation diagnostics from the prompt handler",
+			err: diagnostics.NewStructuredError(
+				diagnostics.NewItem(diagnostics.ItemSpec{
+					ID:            "provider.negotiation.model_unavailable",
+					Code:          contract.CodeModelUnavailable,
+					Category:      contract.CategoryProvider,
+					Title:         "Requested model is unavailable",
+					Message:       "The requested model is unavailable for this provider.",
+					Severity:      contract.SeverityError,
+					DataFreshness: contract.FreshnessLive,
+				},
+					diagnostics.WithEvidence(map[string]any{
+						"stage":     "model",
+						"requested": "missing-model",
+					}),
+					diagnostics.WithSuggestedCommand("compozy settings providers get codex"),
+				),
+				&acp.NegotiationError{
+					Code:      acp.NegotiationCodeModelUnavailable,
+					Stage:     "model",
+					Requested: "missing-model",
+				},
+			),
+			wantCode: contract.CodeModelUnavailable,
+			wantEvidence: map[string]any{
+				"stage":     "model",
+				"requested": "missing-model",
+			},
+			wantSuggestedCmd: "compozy settings providers get codex",
+		},
+		{
+			name: "Should preserve provider authentication diagnostics from the prompt handler",
+			err: &acp.FailureError{
+				Kind:    store.FailureProviderAuth,
+				Summary: "provider authentication failed",
+				Err: diagnostics.NewStructuredError(
+					diagnostics.NewItem(diagnostics.ItemSpec{
+						ID:            "provider.auth.not_authenticated",
+						Code:          contract.CodeProviderNotAuthenticated,
+						Category:      contract.CategoryProvider,
+						Title:         "Provider is not authenticated",
+						Message:       "Sign in before sending a prompt.",
+						Severity:      contract.SeverityError,
+						DataFreshness: contract.FreshnessLive,
+					},
+						diagnostics.WithEvidence(map[string]any{
+							"provider": "codex",
+							"state":    "needs_login",
+						}),
+						diagnostics.WithSuggestedCommand("codex login"),
+					),
+					errors.New("provider authentication is required"),
+				),
+			},
+			wantCode: contract.CodeProviderNotAuthenticated,
+			wantEvidence: map[string]any{
+				"provider": "codex",
+				"state":    "needs_login",
+			},
+			wantSuggestedCmd: "codex login",
+		},
+	}
+
+	for _, testCase := range testCases {
+		t.Run(testCase.name, func(t *testing.T) {
+			t.Parallel()
+
+			homePaths := newTestHomePaths(t)
+			manager := &stubSessionManager{
+				SendPromptFn: func(context.Context, string, session.SendPromptOpts) (session.SendPromptResult, error) {
+					return session.SendPromptResult{}, testCase.err
+				},
+			}
+			engine := newTestRouter(t, newTestHandlers(t, manager, stubObserver{}, homePaths))
+			recorder := performRequest(
+				t,
+				engine,
+				http.MethodPost,
+				"/api/workspaces/ws-workspace/sessions/sess-123/prompt",
+				[]byte(
+					`{"message":"hello","message_id":"msg-runtime-diagnostic",`+
+						`"idempotency_key":"idem-runtime-diagnostic"}`,
+				),
+			)
+			if recorder.Code != http.StatusUnprocessableEntity {
+				t.Fatalf(
+					"status = %d, want %d; body=%s",
+					recorder.Code,
+					http.StatusUnprocessableEntity,
+					recorder.Body.String(),
+				)
+			}
+
+			var payload contract.ErrorPayload
+			decodeJSONResponse(t, recorder, &payload)
+			if payload.Diagnostic == nil {
+				t.Fatalf("error payload = %#v, want diagnostic", payload)
+			}
+			if payload.Diagnostic.Code != testCase.wantCode {
+				t.Fatalf("diagnostic code = %q, want %q", payload.Diagnostic.Code, testCase.wantCode)
+			}
+			if !maps.Equal(payload.Diagnostic.Evidence, testCase.wantEvidence) {
+				t.Fatalf("diagnostic evidence = %#v, want %#v", payload.Diagnostic.Evidence, testCase.wantEvidence)
+			}
+			if payload.Diagnostic.SuggestedCommand != testCase.wantSuggestedCmd {
+				t.Fatalf(
+					"diagnostic suggested command = %q, want %q",
+					payload.Diagnostic.SuggestedCommand,
+					testCase.wantSuggestedCmd,
+				)
+			}
+		})
+	}
+}
+
+func TestPromptSessionHandlerReturnsStructuredGoalDecision(t *testing.T) {
+	t.Run("Should return a direct authenticated Goal error body", func(t *testing.T) {
+		t.Parallel()
+
+		homePaths := newTestHomePaths(t)
+		var gotOpts session.SendPromptOpts
+		reason := session.GoalReasonNotActive
+		manager := &stubSessionManager{
+			SendPromptFn: func(_ context.Context, id string, opts session.SendPromptOpts) (session.SendPromptResult, error) {
+				if id != "sess-123" {
+					t.Fatalf("SendPrompt() id = %q, want sess-123", id)
+				}
+				gotOpts = opts
+				return session.SendPromptResult{
+					Status:         "goal",
+					MessageID:      opts.MessageID,
+					IdempotencyKey: opts.IdempotencyKey,
+					Goal: &session.GoalCommandResult{
+						Outcome: session.GoalOutcomeError, ReasonCode: &reason,
+					},
+				}, nil
+			},
+		}
+		engine := newTestRouter(t, newTestHandlers(t, manager, stubObserver{}, homePaths))
+		recorder := performRequest(
+			t,
+			engine,
+			http.MethodPost,
+			"/api/workspaces/ws-workspace/sessions/sess-123/prompt",
+			[]byte(`{"message":"/goal status","message_id":"msg-goal","idempotency_key":"idem-goal"}`),
+		)
+		if recorder.Code != http.StatusNotFound {
+			t.Fatalf("status = %d, want %d; body=%s", recorder.Code, http.StatusNotFound, recorder.Body.String())
+		}
+		if got := recorder.Header().Get("Content-Type"); got != "application/json; charset=utf-8" {
+			t.Fatalf("Content-Type = %q", got)
+		}
+		if !gotOpts.AllowCommands || gotOpts.Caller.Kind != string(taskpkg.ActorKindHuman) ||
+			gotOpts.Caller.ID != "local-user" || gotOpts.Caller.Source != string(taskpkg.OriginKindHTTP) {
+			t.Fatalf("SendPrompt() authenticated opts = %#v", gotOpts)
+		}
+		var decoded contract.SendPromptResultResponse
+		if err := json.Unmarshal(recorder.Body.Bytes(), &decoded); err != nil {
+			t.Fatalf("json.Unmarshal(Goal result) error = %v; body=%s", err, recorder.Body.String())
+		}
+		if decoded.Prompt.Goal == nil || decoded.Prompt.Goal.Outcome != contract.GoalOutcomeError ||
+			decoded.Prompt.Goal.ReasonCode == nil || *decoded.Prompt.Goal.ReasonCode != contract.GoalReasonNotActive {
+			t.Fatalf("prompt result = %#v", decoded)
+		}
+		if decoded.Prompt.MessageID != "msg-goal" || decoded.Prompt.IdempotencyKey != "idem-goal" {
+			t.Fatalf("prompt identity = %#v", decoded.Prompt)
+		}
+	})
+}
+
+func TestPromptSessionHandlerSeparatesPromptExecutionFromDelivery(t *testing.T) {
+	t.Parallel()
+
+	t.Run("ShouldCancelDeliveryOnlyAfterRequestCancellation", func(t *testing.T) {
+		homePaths := newTestHomePaths(t)
+		executionCtxCh := make(chan context.Context, 1)
+		deliveryCtxCh := make(chan context.Context, 1)
+		events := make(chan acp.AgentEvent)
+		manager := &stubSessionManager{
+			SendPromptFn: func(ctx context.Context, _ string, opts session.SendPromptOpts) (session.SendPromptResult, error) {
+				executionCtxCh <- ctx
+				deliveryCtxCh <- opts.DeliveryContext
+				return session.SendPromptResult{Status: "accepted", Events: events, NewTurnID: "turn-accepted"}, nil
+			},
+		}
+		handlers := newTestHandlers(t, manager, stubObserver{}, homePaths)
+		engine := newTestRouter(t, handlers)
+
+		requestCtx, cancel := context.WithCancel(t.Context())
+		req := httptest.NewRequestWithContext(
+			requestCtx,
+			http.MethodPost,
+			"/api/workspaces/ws-workspace/sessions/sess-123/prompt",
+			strings.NewReader(
+				`{"message":"hello","message_id":"msg-delivery-cancel","idempotency_key":"idem-delivery-cancel"}`,
+			),
+		)
+		req.Header.Set("Content-Type", "application/json")
+
+		recorder := httptest.NewRecorder()
+		done := make(chan struct{})
+		go func() {
+			engine.ServeHTTP(recorder, req)
+			close(done)
+		}()
+
+		var executionCtx context.Context
+		select {
+		case executionCtx = <-executionCtxCh:
+		case <-time.After(time.Second):
+			t.Fatal("SendPrompt() was not invoked")
+		}
+		var deliveryCtx context.Context
+		select {
+		case deliveryCtx = <-deliveryCtxCh:
+		case <-time.After(time.Second):
+			t.Fatal("SendPrompt() did not receive a delivery context")
+		}
+
+		cancel()
+
+		select {
+		case <-done:
+		case <-time.After(time.Second):
+			t.Fatal("handler did not return after request cancellation")
+		}
+
+		if err := executionCtx.Err(); err != nil {
+			t.Fatalf("execution context err = %v, want nil after request cancellation", err)
+		}
+		if !errors.Is(deliveryCtx.Err(), context.Canceled) {
+			t.Fatalf("delivery context err = %v, want context.Canceled", deliveryCtx.Err())
+		}
+		if body := recorder.Body.String(); !strings.Contains(body, `"type":"start","messageId":"turn-accepted"`) {
+			t.Fatalf("response body = %q, want early start frame with accepted turn id", body)
+		}
+		close(events)
+	})
+}
+
+func TestCancelSessionPromptHandlerReturnsOK(t *testing.T) {
+	t.Parallel()
+
+	homePaths := newTestHomePaths(t)
+	manager := &stubSessionManager{
+		CancelPromptFn: func(_ context.Context, id string) (session.PromptCancelResult, error) {
+			if id != "sess-123" {
+				t.Fatalf("CancelPrompt() id = %q, want sess-123", id)
+			}
+			return session.PromptCancelResult{
+				Outcome: session.PromptCancelOutcomeCanceled,
+				TurnID:  "turn-1",
+			}, nil
+		},
+	}
+	handlers := newTestHandlers(t, manager, stubObserver{}, homePaths)
+	engine := newTestRouter(t, handlers)
+
+	recorder := performRequest(
+		t,
+		engine,
+		http.MethodPost,
+		"/api/workspaces/ws-workspace/sessions/sess-123/prompt/cancel",
+		nil,
+	)
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d", recorder.Code, http.StatusOK)
+	}
+	var payload contract.SessionPromptCancelResponse
+	apitestutil.DecodeJSONResponse(t, recorder, &payload)
+	if payload.SessionID != "sess-123" || payload.Outcome != "canceled" || payload.TurnID != "turn-1" {
+		t.Fatalf("prompt cancel payload = %#v, want canceled turn", payload)
+	}
+}
+
+func TestSessionEventsAndHistoryHandlers(t *testing.T) {
+	t.Parallel()
+
+	homePaths := newTestHomePaths(t)
+	var gotQuery store.EventQuery
+	manager := &stubSessionManager{
+		StatusFn: func(context.Context, string) (*session.Info, error) {
+			return newSessionInfo("sess-123"), nil
+		},
+		EventsFn: func(_ context.Context, _ string, query store.EventQuery) ([]store.SessionEvent, error) {
+			gotQuery = query
+			return []store.SessionEvent{{
+				ID:        "ev-1",
+				SessionID: "sess-123",
+				Sequence:  7,
+				TurnID:    "turn-1",
+				Type:      "agent_message",
+				AgentName: "coder",
+				Content:   `{"text":"hello"}`,
+				Timestamp: time.Date(2026, 4, 3, 12, 0, 0, 0, time.UTC),
+			}}, nil
+		},
+		HistoryFn: func(context.Context, string, store.EventQuery) ([]store.TurnHistory, error) {
+			return []store.TurnHistory{{
+				TurnID: "turn-1",
+				Events: []store.SessionEvent{{
+					ID:        "ev-1",
+					SessionID: "sess-123",
+					Sequence:  7,
+					TurnID:    "turn-1",
+					Type:      "agent_message",
+					AgentName: "coder",
+					Content:   `{"text":"hello"}`,
+					Timestamp: time.Date(2026, 4, 3, 12, 0, 0, 0, time.UTC),
+				}},
+			}}, nil
+		},
+	}
+	handlers := newTestHandlers(t, manager, stubObserver{}, homePaths)
+	engine := newTestRouter(t, handlers)
+
+	eventsResp := performRequest(
+		t,
+		engine,
+		http.MethodGet,
+		"/api/workspaces/ws-workspace/sessions/sess-123/events?type=agent_message&agent_name=coder&turn_id=turn-1&after_sequence=5&limit=10&since=2026-04-03T12:00:00Z",
+		nil,
+	)
+	if eventsResp.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d; body=%s", eventsResp.Code, http.StatusOK, eventsResp.Body.String())
+	}
+	if gotQuery.Type != "agent_message" || gotQuery.AgentName != "coder" || gotQuery.TurnID != "turn-1" ||
+		gotQuery.AfterSequence != 5 ||
+		gotQuery.Limit != 10 {
+		t.Fatalf("query = %#v", gotQuery)
+	}
+
+	var events struct {
+		Events []sessionEventPayload `json:"events"`
+	}
+	decodeJSONResponse(t, eventsResp, &events)
+	if len(events.Events) != 1 || events.Events[0].Sequence != 7 {
+		t.Fatalf("events = %#v", events.Events)
+	}
+	if events.Events[0].WorkspaceID != "ws-workspace" || events.Events[0].WorkspacePath != "/workspace" {
+		t.Fatalf("event workspace = %#v", events.Events[0])
+	}
+
+	historyResp := performRequest(
+		t,
+		engine,
+		http.MethodGet,
+		"/api/workspaces/ws-workspace/sessions/sess-123/history",
+		nil,
+	)
+	if historyResp.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d; body=%s", historyResp.Code, http.StatusOK, historyResp.Body.String())
+	}
+
+	var history struct {
+		History []contract.TurnHistoryPayload `json:"history"`
+	}
+	decodeJSONResponse(t, historyResp, &history)
+	if len(history.History) != 1 || history.History[0].TurnID != "turn-1" {
+		t.Fatalf("history = %#v", history.History)
+	}
+	if got := history.History[0].Events[0]; got.WorkspaceID != "ws-workspace" || got.WorkspacePath != "/workspace" {
+		t.Fatalf("history event workspace = %#v", got)
+	}
+}
+
+func TestSessionTranscriptHandlerReturnsEntries(t *testing.T) {
+	t.Parallel()
+
+	homePaths := newTestHomePaths(t)
+	manager := &stubSessionManager{
+		StatusFn: func(_ context.Context, id string) (*session.Info, error) {
+			info := apitestutil.NewSessionInfo(id)
+			info.TranscriptEpoch = 5
+			return info, nil
+		},
+		TranscriptPageFn: func(_ context.Context, id string, query transcript.PageQuery) (transcript.Page, error) {
+			if id != "sess-123" || query.Limit != 200 || query.BeforeSequence != 0 {
+				t.Fatalf("TranscriptPage() call = %q %#v, want bounded default tail", id, query)
+			}
+			return transcript.Page{
+				Entries: []transcript.Entry{{
+					StartSequence: 1,
+					Sequence:      1,
+					Message: transcript.UIMessage{
+						ID:   "msg-1",
+						Role: transcript.UIRoleAssistant,
+						Parts: []transcript.UIMessagePart{{
+							Type:  "text",
+							Text:  "hello",
+							State: "done",
+						}},
+					},
+				}},
+				Generation:  4,
+				MaxSequence: 1,
+			}, nil
+		},
+	}
+	handlers := newTestHandlers(t, manager, stubObserver{}, homePaths)
+	engine := newTestRouter(t, handlers)
+
+	recorder := performRequest(
+		t,
+		engine,
+		http.MethodGet,
+		"/api/workspaces/ws-workspace/sessions/sess-123/transcript",
+		nil,
+	)
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d; body=%s", recorder.Code, http.StatusOK, recorder.Body.String())
+	}
+
+	var response contract.SessionTranscriptResponse
+	decodeJSONResponse(t, recorder, &response)
+	if len(response.Entries) != 1 {
+		t.Fatalf("len(entries) = %d, want 1", len(response.Entries))
+	}
+	if got := response.Entries[0].Sequence; got != 1 {
+		t.Fatalf("entries[0].Sequence = %d, want 1", got)
+	}
+	if got := response.Entries[0].Message.Parts[0].Text; got != "hello" {
+		t.Fatalf("entries[0].Message.Parts[0].Text = %q, want %q", got, "hello")
+	}
+	if response.Epoch != 5 || response.Generation != 4 || response.MaxSequence != 1 || response.Limit != 200 {
+		t.Fatalf("transcript page metadata = %#v", response)
+	}
+}
+
+func TestListAgentsAndHealthHandlers(t *testing.T) {
+	t.Parallel()
+
+	homePaths := newTestHomePaths(t)
+	writeAgentDef(t, homePaths, "coder")
+
+	handlers := newTestHandlers(t, &stubSessionManager{
+		ListAllFn: func(context.Context) ([]*session.Info, error) {
+			return []*session.Info{newSessionInfo("sess-1")}, nil
+		},
+	}, stubObserver{
+		HealthFn: func(context.Context) (observe.Health, error) {
+			return observe.Health{
+				Status:         "ok",
+				UptimeSeconds:  5,
+				ActiveSessions: 1,
+				ActiveAgents:   1,
+				Version:        "dev",
+			}, nil
+		},
+	}, homePaths)
+	engine := newTestRouter(t, handlers)
+
+	agentsResp := performRequest(t, engine, http.MethodGet, "/api/agents", nil)
+	if agentsResp.Code != http.StatusOK {
+		t.Fatalf("agents status = %d, want %d; body=%s", agentsResp.Code, http.StatusOK, agentsResp.Body.String())
+	}
+	var agents struct {
+		Agents []agentPayload `json:"agents"`
+	}
+	decodeJSONResponse(t, agentsResp, &agents)
+	if len(agents.Agents) != 1 || agents.Agents[0].Name != "coder" {
+		t.Fatalf("agents = %#v", agents.Agents)
+	}
+
+	healthResp := performRequest(t, engine, http.MethodGet, "/api/status", nil)
+	if healthResp.Code != http.StatusOK {
+		t.Fatalf("health status = %d, want %d; body=%s", healthResp.Code, http.StatusOK, healthResp.Body.String())
+	}
+	var health contract.StatusPayload
+	decodeJSONResponse(t, healthResp, &health)
+	if health.Health.Status != "ok" || health.Health.ActiveSessions != 1 {
+		t.Fatalf("health = %#v", health.Health)
+	}
+}
+
+func TestListLogsAndApproveHandlers(t *testing.T) {
+	t.Parallel()
+
+	homePaths := newTestHomePaths(t)
+	handlers := newTestHandlers(t, &stubSessionManager{}, stubObserver{
+		QueryEventsFn: func(context.Context, store.EventSummaryQuery) ([]store.EventSummary, error) {
+			return []store.EventSummary{{
+				ID:        "sum-1",
+				SessionID: "sess-1",
+				Type:      "agent_message",
+				AgentName: "coder",
+				Summary:   "hello",
+				Timestamp: time.Date(2026, 4, 3, 12, 0, 0, 0, time.UTC),
+			}}, nil
+		},
+	}, homePaths)
+	engine := newTestRouter(t, handlers)
+
+	observeResp := performRequest(
+		t,
+		engine,
+		http.MethodGet,
+		"/api/logs?workspace_id=ws-workspace&session_id=sess-1",
+		nil,
+	)
+	if observeResp.Code != http.StatusOK {
+		t.Fatalf("observe status = %d, want %d; body=%s", observeResp.Code, http.StatusOK, observeResp.Body.String())
+	}
+	var observed struct {
+		Events []logEventPayload `json:"events"`
+	}
+	decodeJSONResponse(t, observeResp, &observed)
+	if len(observed.Events) != 1 || observed.Events[0].ID != "sum-1" {
+		t.Fatalf("events = %#v", observed.Events)
+	}
+
+	approveResp := performRequest(
+		t,
+		engine,
+		http.MethodPost,
+		"/api/workspaces/ws-workspace/sessions/sess-1/approve",
+		nil,
+	)
+	if approveResp.Code != http.StatusBadRequest {
+		t.Fatalf("approve status = %d, want %d", approveResp.Code, http.StatusBadRequest)
+	}
+}
+
+func TestApproveSessionHandlerValidatesAndRoutes(t *testing.T) {
+	t.Parallel()
+
+	homePaths := newTestHomePaths(t)
+
+	t.Run("Should missing decision", func(t *testing.T) {
+		engine := newTestRouter(t, newTestHandlers(t, &stubSessionManager{}, stubObserver{}, homePaths))
+		recorder := performRequest(
+			t,
+			engine,
+			http.MethodPost,
+			"/api/workspaces/ws-workspace/sessions/sess-1/approve",
+			[]byte(`{"turn_id":"turn-1"}`),
+		)
+		if recorder.Code != http.StatusBadRequest {
+			t.Fatalf("status = %d, want %d; body=%s", recorder.Code, http.StatusBadRequest, recorder.Body.String())
+		}
+	})
+
+	t.Run("Should invalid decision", func(t *testing.T) {
+		engine := newTestRouter(t, newTestHandlers(t, &stubSessionManager{}, stubObserver{}, homePaths))
+		recorder := performRequest(
+			t,
+			engine,
+			http.MethodPost,
+			"/api/workspaces/ws-workspace/sessions/sess-1/approve",
+			[]byte(`{"turn_id":"turn-1","decision":"maybe"}`),
+		)
+		if recorder.Code != http.StatusBadRequest {
+			t.Fatalf("status = %d, want %d; body=%s", recorder.Code, http.StatusBadRequest, recorder.Body.String())
+		}
+	})
+
+	t.Run("Should session not found", func(t *testing.T) {
+		engine := newTestRouter(t, newTestHandlers(t, &stubSessionManager{
+			ApproveFn: func(context.Context, string, acp.ApproveRequest) (session.ApprovalResult, error) {
+				return session.ApprovalResult{}, session.ErrSessionNotFound
+			},
+		}, stubObserver{}, homePaths))
+		recorder := performRequest(
+			t,
+			engine,
+			http.MethodPost,
+			"/api/workspaces/ws-workspace/sessions/missing/approve",
+			[]byte(`{"turn_id":"turn-1","decision":"allow-once"}`),
+		)
+		if recorder.Code != http.StatusNotFound {
+			t.Fatalf("status = %d, want %d; body=%s", recorder.Code, http.StatusNotFound, recorder.Body.String())
+		}
+	})
+
+	t.Run("Should pending permission missing", func(t *testing.T) {
+		engine := newTestRouter(t, newTestHandlers(t, &stubSessionManager{
+			ApproveFn: func(context.Context, string, acp.ApproveRequest) (session.ApprovalResult, error) {
+				return session.ApprovalResult{}, session.ErrPendingPermissionNotFound
+			},
+		}, stubObserver{}, homePaths))
+		recorder := performRequest(
+			t,
+			engine,
+			http.MethodPost,
+			"/api/workspaces/ws-workspace/sessions/sess-1/approve",
+			[]byte(`{"turn_id":"turn-1","decision":"reject-once"}`),
+		)
+		if recorder.Code != http.StatusConflict {
+			t.Fatalf("status = %d, want %d; body=%s", recorder.Code, http.StatusConflict, recorder.Body.String())
+		}
+	})
+
+	t.Run("Should session not active", func(t *testing.T) {
+		engine := newTestRouter(t, newTestHandlers(t, &stubSessionManager{
+			ApproveFn: func(context.Context, string, acp.ApproveRequest) (session.ApprovalResult, error) {
+				return session.ApprovalResult{}, session.ErrSessionNotActive
+			},
+		}, stubObserver{}, homePaths))
+		recorder := performRequest(
+			t,
+			engine,
+			http.MethodPost,
+			"/api/workspaces/ws-workspace/sessions/sess-1/approve",
+			[]byte(`{"turn_id":"turn-1","decision":"reject-once"}`),
+		)
+		if recorder.Code != http.StatusBadRequest {
+			t.Fatalf("status = %d, want %d; body=%s", recorder.Code, http.StatusBadRequest, recorder.Body.String())
+		}
+	})
+
+	t.Run("Should valid request", func(t *testing.T) {
+		var (
+			gotID  string
+			gotReq acp.ApproveRequest
+		)
+		engine := newTestRouter(t, newTestHandlers(t, &stubSessionManager{
+			ApproveFn: func(
+				_ context.Context,
+				id string,
+				req acp.ApproveRequest,
+			) (session.ApprovalResult, error) {
+				gotID = id
+				gotReq = req
+				return session.ApprovalResult{
+					Outcome:   "applied",
+					RequestID: req.RequestID,
+					Decision:  req.Decision,
+				}, nil
+			},
+		}, stubObserver{}, homePaths))
+		recorder := performRequest(
+			t,
+			engine,
+			http.MethodPost,
+			"/api/workspaces/ws-workspace/sessions/sess-1/approve",
+			[]byte(`{"request_id":"req-1","turn_id":"turn-1","decision":"allow-always"}`),
+		)
+		if recorder.Code != http.StatusOK {
+			t.Fatalf("status = %d, want %d; body=%s", recorder.Code, http.StatusOK, recorder.Body.String())
+		}
+		if gotID != "sess-1" {
+			t.Fatalf("approve id = %q, want sess-1", gotID)
+		}
+		if gotReq.RequestID != "req-1" || gotReq.TurnID != "turn-1" || gotReq.Decision != "allow-always" {
+			t.Fatalf("approve request = %#v", gotReq)
+		}
+		var response contract.SessionApprovalResponse
+		decodeJSONResponse(t, recorder, &response)
+		if response.Outcome != "applied" || response.RequestID != "req-1" ||
+			response.Decision != "allow-always" {
+			t.Fatalf("approve response = %#v", response)
+		}
+	})
+}
+
+func TestErrorResponsesUseConsistentShape(t *testing.T) {
+	t.Parallel()
+
+	homePaths := newTestHomePaths(t)
+	engine := newTestRouter(t, newTestHandlers(t, &stubSessionManager{
+		ListAllFn: func(context.Context) ([]*session.Info, error) {
+			return nil, context.DeadlineExceeded
+		},
+	}, stubObserver{}, homePaths))
+
+	recorder := performRequest(t, engine, http.MethodGet, "/api/sessions?all_workspaces=true", nil)
+	if recorder.Code != http.StatusInternalServerError {
+		t.Fatalf("status = %d, want %d", recorder.Code, http.StatusInternalServerError)
+	}
+
+	var payload contract.ErrorPayload
+	decodeJSONResponse(t, recorder, &payload)
+	if payload.Error == "" {
+		t.Fatal("expected non-empty error payload")
+	}
+}
+
+func TestStatusForSessionErrorIncludesApprovalCases(t *testing.T) {
+	if status := core.StatusForSessionError(session.ErrSessionNotActive); status != http.StatusBadRequest {
+		t.Fatalf("statusForSessionError(ErrSessionNotActive) = %d, want %d", status, http.StatusBadRequest)
+	}
+	if status := core.StatusForSessionError(session.ErrPendingPermissionNotFound); status != http.StatusConflict {
+		t.Fatalf("statusForSessionError(ErrPendingPermissionNotFound) = %d, want %d", status, http.StatusConflict)
+	}
+	if status := core.StatusForSessionError(session.ErrPendingPermissionConflict); status != http.StatusConflict {
+		t.Fatalf("statusForSessionError(ErrPendingPermissionConflict) = %d, want %d", status, http.StatusConflict)
+	}
+	if status := core.StatusForSessionError(errors.New("boom")); status != http.StatusInternalServerError {
+		t.Fatalf("statusForSessionError(default) = %d, want %d", status, http.StatusInternalServerError)
+	}
+}
+
+func TestRequestLoggingClientIdentity(t *testing.T) {
+	t.Parallel()
+	for _, tc := range []struct{ name, value, want string }{
+		{"Should log a bounded opaque client identity", "web-client-123", "web-client-123"},
+		{"Should reject arbitrary client log content", "unsafe/token", "unidentified"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			var logs bytes.Buffer
+			engine := gin.New()
+			engine.Use(requestLoggingMiddleware(slog.New(slog.NewJSONHandler(
+				&logs, &slog.HandlerOptions{Level: slog.LevelDebug},
+			))))
+			engine.GET("/api/sessions", func(c *gin.Context) { c.Status(http.StatusOK) })
+			request := httptest.NewRequestWithContext(t.Context(), http.MethodGet, "/api/sessions", http.NoBody)
+			request.Header.Set("X-Compozy-Client-ID", tc.value)
+			response := httptest.NewRecorder()
+			engine.ServeHTTP(response, request)
+			if response.Code != http.StatusOK || !strings.Contains(logs.String(), `"client_id":"`+tc.want+`"`) {
+				t.Fatalf("status=%d log=%s", response.Code, logs.String())
+			}
+		})
+	}
+}
+
+func TestRequestLoggingLevels(t *testing.T) {
+	t.Parallel()
+	t.Run("Should record a disconnected HTTP client as 499", func(t *testing.T) {
+		t.Parallel()
+		var logs bytes.Buffer
+		started, finished := make(chan struct{}), make(chan struct{})
+		engine := gin.New()
+		engine.Use(func(c *gin.Context) { c.Next(); close(finished) })
+		engine.Use(requestLoggingMiddleware(slog.New(slog.NewJSONHandler(&logs, nil))))
+		engine.GET("/api/cancel", func(c *gin.Context) {
+			close(started)
+			<-c.Request.Context().Done()
+			core.RespondError(c, http.StatusInternalServerError, c.Request.Context().Err(), true)
+		})
+		server := httptest.NewServer(engine)
+		t.Cleanup(server.Close)
+		ctx, cancel := context.WithCancel(t.Context())
+		defer cancel()
+		request := httptest.NewRequestWithContext(ctx, http.MethodGet, server.URL+"/api/cancel", http.NoBody)
+		request.RequestURI = ""
+		client := &http.Client{Timeout: time.Second}
+		result := make(chan error, 1)
+		go func() {
+			response, err := client.Do(request)
+			if response != nil {
+				err = errors.Join(err, response.Body.Close())
+			}
+			result <- err
+		}()
+		select {
+		case <-started:
+		case <-t.Context().Done():
+			t.Fatal("request did not reach handler")
+		}
+		cancel()
+		if err := <-result; !errors.Is(err, context.Canceled) {
+			t.Fatalf("client = %v", err)
+		}
+		select {
+		case <-finished:
+		case <-t.Context().Done():
+			t.Fatal("request did not finish")
+		}
+		var entry map[string]any
+		if err := json.Unmarshal(logs.Bytes(), &entry); err != nil {
+			t.Fatal(err)
+		}
+		if entry["status"] != float64(499) || entry["level"] != "WARN" {
+			t.Fatalf("canceled request log = %s", logs.String())
+		}
+	})
+	for _, tc := range []struct {
+		name, method, wantLevel string
+		status                  int
+		configured              slog.Level
+	}{
+		{"Should omit successful polling at info", http.MethodGet, "", http.StatusOK, slog.LevelInfo},
+		{"Should retain successful polling at debug", http.MethodGet, "DEBUG", http.StatusOK, slog.LevelDebug},
+		{"Should omit successful preflights at info", http.MethodOptions, "", http.StatusOK, slog.LevelInfo},
+		{"Should retain mutations at info", http.MethodPost, "INFO", http.StatusOK, slog.LevelInfo},
+		{"Should retain rejected reads at warn", http.MethodGet, "WARN", http.StatusForbidden, slog.LevelInfo},
+		{"Should report client cancellations at warn", http.MethodGet, "WARN", 499, slog.LevelInfo},
+		{"Should retain failed reads at error", http.MethodGet, "ERROR", http.StatusServiceUnavailable, slog.LevelInfo},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			var logs bytes.Buffer
+			logger := slog.New(slog.NewJSONHandler(&logs, &slog.HandlerOptions{Level: tc.configured}))
+			engine := gin.New()
+			engine.Use(requestLoggingMiddleware(logger))
+			engine.Handle(tc.method, "/api/sessions", func(c *gin.Context) {
+				c.JSON(tc.status, gin.H{"observed": true})
+			})
+			response := performRequest(t, engine, tc.method, "/api/sessions?token=private-query", nil)
+			if response.Code != tc.status || response.Body.String() != `{"observed":true}` {
+				t.Fatalf("response = %d %s", response.Code, response.Body.String())
+			}
+			if tc.wantLevel == "" {
+				if logs.Len() != 0 {
+					t.Fatalf("routine read consumed the info log: %s", logs.String())
+				}
+				return
+			}
+			var entry map[string]any
+			if err := json.Unmarshal(logs.Bytes(), &entry); err != nil {
+				t.Fatalf("decode request log: %v", err)
+			}
+			if entry["level"] != tc.wantLevel || entry["method"] != tc.method ||
+				entry["status"] != float64(tc.status) || entry["path"] != "/api/sessions" ||
+				strings.Contains(logs.String(), "private-query") {
+				t.Fatalf("request log = %s", logs.String())
+			}
+		})
+	}
+}
+
+func TestCORSHeadersPresentOnResponses(t *testing.T) {
+	t.Parallel()
+
+	homePaths := newTestHomePaths(t)
+	engine := newTestRouter(t, newTestHandlers(t, &stubSessionManager{
+		ListAllFn: func(context.Context) ([]*session.Info, error) {
+			return []*session.Info{}, nil
+		},
+	}, stubObserver{}, homePaths))
+
+	req := httptest.NewRequestWithContext(
+		t.Context(),
+		http.MethodGet,
+		"http://127.0.0.1/api/sessions?all_workspaces=true",
+		http.NoBody,
+	)
+	req.Header.Set("Origin", "http://127.0.0.1")
+	recorder := httptest.NewRecorder()
+	engine.ServeHTTP(recorder, req)
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d; body=%s", recorder.Code, http.StatusOK, recorder.Body.String())
+	}
+	if got := recorder.Header().Get("Access-Control-Allow-Origin"); got != "http://127.0.0.1" {
+		t.Fatalf("Access-Control-Allow-Origin = %q, want %q", got, "http://127.0.0.1")
+	}
+}
+
+func TestExtensionKitAndSecretsRoutesReachHTTPService(t *testing.T) {
+	t.Parallel()
+
+	secretWrites := 0
+	secretDeletes := 0
+	service := stubExtensionService{
+		InventoryFn: func(_ context.Context, name string) (contract.ExtensionInventoryPayload, error) {
+			return contract.ExtensionInventoryPayload{Extension: name, Items: []contract.ExtensionKitItemPayload{{
+				Kind: "agent", Name: "writer", Live: true,
+			}}}, nil
+		},
+		PreviewFn: func(_ context.Context, name string) (contract.ExtensionEnablePreviewPayload, error) {
+			return contract.ExtensionEnablePreviewPayload{
+				Extension: name, AutomationStarting: []string{name + "/daily"},
+			}, nil
+		},
+		ListSecretsFn: func(
+			_ context.Context,
+			name string,
+			actor taskpkg.ActorContext,
+		) (contract.ExtensionSecretsPayload, error) {
+			if name != "kit" || !actor.Authority.Read {
+				t.Fatalf("ListExtensionSecrets() name=%q actor=%#v", name, actor)
+			}
+			return contract.ExtensionSecretsPayload{DeclaredEnv: []string{"API_KEY"}}, nil
+		},
+		SetSecretsFn: func(
+			_ context.Context,
+			name string,
+			req contract.SetExtensionSecretsRequest,
+			actor taskpkg.ActorContext,
+		) (contract.ExtensionSecretsPayload, error) {
+			if name != "kit" || !actor.Authority.Write || len(req.Bindings) != 1 ||
+				req.Bindings[0].EnvName != "API_KEY" || req.Bindings[0].Value == nil {
+				t.Fatal("SetExtensionSecrets() did not receive trusted actor and write-only value")
+			}
+			secretWrites++
+			return contract.ExtensionSecretsPayload{
+				DeclaredEnv:  []string{"API_KEY"},
+				BoundEnvKeys: []string{"API_KEY"},
+			}, nil
+		},
+		DeleteSecretFn: func(_ context.Context, name, envName string, actor taskpkg.ActorContext) error {
+			if name != "kit" || envName != "API_KEY" || !actor.Authority.Write {
+				t.Fatalf("DeleteExtensionSecret() name=%q env=%q actor=%#v", name, envName, actor)
+			}
+			secretDeletes++
+			return nil
+		},
+	}
+	handlers := newTestHandlersWithSettingsAndExtensions(
+		t,
+		"127.0.0.1",
+		&stubSettingsService{},
+		&stubSettingsRestartController{},
+		service,
+		newTestHomePaths(t),
+	)
+	engine := newTestRouter(t, handlers)
+
+	for _, testCase := range []struct {
+		name   string
+		path   string
+		assert func(*testing.T, *httptest.ResponseRecorder)
+	}{
+		{
+			name: "Should return the typed extension inventory",
+			path: "/api/extensions/kit/inventory",
+			assert: func(t *testing.T, response *httptest.ResponseRecorder) {
+				var payload contract.ExtensionInventoryPayload
+				decodeJSONResponse(t, response, &payload)
+				if payload.Extension != "kit" || len(payload.Items) != 1 ||
+					payload.Items[0].Kind != "agent" || payload.Items[0].Name != "writer" || !payload.Items[0].Live {
+					t.Fatalf("inventory payload = %#v, want live kit writer", payload)
+				}
+			},
+		},
+		{
+			name: "Should return the typed presence-only secret bindings",
+			path: "/api/extensions/kit/secrets",
+			assert: func(t *testing.T, response *httptest.ResponseRecorder) {
+				var payload contract.ExtensionSecretsPayload
+				decodeJSONResponse(t, response, &payload)
+				if !slices.Equal(payload.DeclaredEnv, []string{"API_KEY"}) || len(payload.BoundEnvKeys) != 0 {
+					t.Fatalf("secret payload = %#v, want declared API_KEY only", payload)
+				}
+			},
+		},
+	} {
+		t.Run(testCase.name, func(t *testing.T) {
+			response := performRequest(t, engine, http.MethodGet, testCase.path, nil)
+			if response.Code != http.StatusOK {
+				t.Fatalf("GET %s status=%d body=%s, want 200", testCase.path, response.Code, response.Body.String())
+			}
+			testCase.assert(t, response)
+		})
+	}
+	t.Run("Should set a secret without returning its value", func(t *testing.T) {
+		setResponse := performRequest(t, engine, http.MethodPut, "/api/extensions/kit/secrets", []byte(
+			`{"bindings":[{"env_name":"API_KEY","value":"planted-secret-value"}]}`,
+		))
+		if setResponse.Code != http.StatusOK {
+			t.Fatalf("PUT secrets status=%d body=%s, want 200", setResponse.Code, setResponse.Body.String())
+		}
+		var payload contract.ExtensionSecretsPayload
+		decodeJSONResponse(t, setResponse, &payload)
+		if !slices.Equal(payload.DeclaredEnv, []string{"API_KEY"}) ||
+			!slices.Equal(payload.BoundEnvKeys, []string{"API_KEY"}) {
+			t.Fatalf("secret mutation payload = %#v, want bound API_KEY", payload)
+		}
+	})
+	t.Run("Should delete a secret binding", func(t *testing.T) {
+		deleteResponse := performRequest(
+			t, engine, http.MethodDelete, "/api/extensions/kit/secrets/API_KEY", nil,
+		)
+		if deleteResponse.Code != http.StatusNoContent {
+			t.Fatalf("DELETE secrets status=%d body=%s", deleteResponse.Code, deleteResponse.Body.String())
+		}
+	})
+	if secretWrites != 1 || secretDeletes != 1 {
+		t.Fatalf("secret mutations writes=%d deletes=%d, want 1/1", secretWrites, secretDeletes)
+	}
+}
+
+func contains(values []string, target string) bool {
+	return slices.Contains(values, target)
+}
+
+// IT-026: transport handlers preserve native compaction acceptance and refusal codes.
+func TestCompactSessionHandler(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		err    error
+		status int
+		code   string
+	}{
+		{"Should accept native compaction", nil, http.StatusAccepted, ""},
+		{
+			"Should reject a stopped session",
+			errors.Join(session.ErrSessionNotActive, errors.New("session is stopped")),
+			http.StatusBadRequest,
+			"session_not_promptable",
+		},
+		{
+			"Should reject a starting session",
+			errors.Join(session.ErrSessionNotActive, errors.New("session is starting")),
+			http.StatusBadRequest,
+			"session_not_promptable",
+		},
+		{"Should reject a busy session", session.ErrPromptInProgress, http.StatusConflict, "session_busy"},
+		{"Should reject unsupported compaction", session.ErrCompactionUnsupported, http.StatusConflict, "compaction_unsupported"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			manager := &stubSessionManager{
+				RequestCompactionFn: func(_ context.Context, id string) (session.CompactionRequestResult, <-chan acp.AgentEvent, error) {
+					if id != "sess-123" {
+						t.Fatalf("request target=%q", id)
+					}
+					return session.CompactionRequestResult{
+						SessionID: id,
+						PromptID:  "prompt-compact",
+						Command:   "compact",
+					}, nil, tc.err
+				},
+			}
+			engine := newTestRouter(t, newTestHandlers(t, manager, stubObserver{}, newTestHomePaths(t)))
+			response := performRequest(
+				t,
+				engine,
+				http.MethodPost,
+				"/api/workspaces/ws-workspace/sessions/sess-123/compact",
+				[]byte("{}"),
+			)
+			if response.Code != tc.status {
+				t.Fatalf("status=%d body=%s", response.Code, response.Body.String())
+			}
+			if tc.err != nil {
+				var payload contract.ErrorPayload
+				decodeJSONResponse(t, response, &payload)
+				if payload.Code != tc.code {
+					t.Fatalf("code=%q want %q", payload.Code, tc.code)
+				}
+				return
+			}
+			var payload contract.SessionCompactResponse
+			decodeJSONResponse(t, response, &payload)
+			if payload.SessionID != "sess-123" || payload.PromptID != "prompt-compact" ||
+				payload.Command != "compact" ||
+				payload.Status != "accepted" {
+				t.Fatalf("receipt=%#v", payload)
+			}
+		})
+	}
+}
+
+type discardMonitorWaker struct{}
+
+func (discardMonitorWaker) WakeSession(context.Context, monitorpkg.Notification) error { return nil }
+
+// marketingProfileService resolves the "marketing" profile by name.
+type marketingProfileService struct {
+	core.ProfileService
+}
+
+func (marketingProfileService) Resolve(_ context.Context, in profilepkg.ResolveInput) (profilepkg.Resolution, error) {
+	if in.Flag != "marketing" {
+		return profilepkg.Resolution{}, profilepkg.ErrNotFound
+	}
+	return profilepkg.Resolution{Profile: profilepkg.Profile{
+		ID: "profile-marketing", Name: "marketing", State: profilepkg.StateActive,
+	}}, nil
+}
+
+type retainedProcessProfileService struct {
+	core.ProfileService
+	archived bool
+}
+
+func (s retainedProcessProfileService) Resolve(
+	context.Context, profilepkg.ResolveInput,
+) (profilepkg.Resolution, error) {
+	if s.archived {
+		return profilepkg.Resolution{}, profilepkg.ErrArchived
+	}
+	return profilepkg.Resolution{}, profilepkg.ErrNotFound
+}
+
+func (s retainedProcessProfileService) ListIdentities(context.Context) ([]profilepkg.Profile, error) {
+	if s.archived {
+		return []profilepkg.Profile{{ID: "profile-retained", Name: "retained", State: profilepkg.StateArchived}}, nil
+	}
+	return nil, nil
+}
+
+// Session monitors are operator-visible: the session payload reports active
+// monitors, and the operator lists and cancels them without waking the session.
+func TestSessionMonitorHandlers(t *testing.T) {
+	t.Parallel()
+	monitors, err := monitorpkg.NewService(t.Context(), nil, discardMonitorWaker{})
+	if err != nil {
+		t.Fatalf("NewService() error = %v", err)
+	}
+	t.Cleanup(func() { _ = monitors.Shutdown(context.Background()) })
+	created, err := monitors.Create(t.Context(), monitorpkg.Spec{
+		WorkspaceID: "ws-workspace", SessionID: "sess-123", Kind: monitorpkg.KindTimer,
+		Description: "check CI for PR #875", Delay: time.Hour,
+	})
+	if err != nil {
+		t.Fatalf("Create() error = %v", err)
+	}
+	handlers := newTestHandlers(t, &stubSessionManager{}, stubObserver{}, newTestHomePaths(t))
+	handlers.SessionMonitors = monitors
+	engine := newTestRouter(t, handlers)
+	base := "/api/workspaces/ws-workspace/sessions/sess-123"
+
+	t.Run("Should report active monitors on the session payload", func(t *testing.T) {
+		response := performRequest(t, engine, http.MethodGet, base, nil)
+		if response.Code != http.StatusOK {
+			t.Fatalf("status=%d body=%s", response.Code, response.Body.String())
+		}
+		var payload contract.SessionResponse
+		decodeJSONResponse(t, response, &payload)
+		if summary := payload.Session.MonitorSummary; summary == nil || summary.Active != 1 {
+			t.Fatalf("monitor_summary=%#v, want one active", summary)
+		}
+	})
+
+	t.Run("Should list and cancel the session's monitor", func(t *testing.T) {
+		response := performRequest(t, engine, http.MethodGet, base+"/monitors", nil)
+		if response.Code != http.StatusOK {
+			t.Fatalf("list status=%d body=%s", response.Code, response.Body.String())
+		}
+		var listed contract.SessionMonitorsResponse
+		decodeJSONResponse(t, response, &listed)
+		if len(listed.Monitors) != 1 || listed.Monitors[0].MonitorID != created.ID ||
+			listed.Monitors[0].Status != string(monitorpkg.StatusActive) ||
+			listed.Monitors[0].Description != "check CI for PR #875" {
+			t.Fatalf("monitors=%#v", listed.Monitors)
+		}
+
+		response = performRequest(t, engine, http.MethodPost, base+"/monitors/"+created.ID+"/cancel", []byte("{}"))
+		if response.Code != http.StatusOK {
+			t.Fatalf("cancel status=%d body=%s", response.Code, response.Body.String())
+		}
+		var canceled contract.SessionMonitorResponse
+		decodeJSONResponse(t, response, &canceled)
+		if canceled.Monitor.Status != string(monitorpkg.StatusCanceled) || canceled.Monitor.FiredAt == nil {
+			t.Fatalf("canceled=%#v", canceled.Monitor)
+		}
+		if counts := monitors.ActiveCounts([]string{"sess-123"}); len(counts) != 0 {
+			t.Fatalf("active after cancel=%v", counts)
+		}
+	})
+
+	t.Run("Should return not found for an unknown monitor", func(t *testing.T) {
+		response := performRequest(t, engine, http.MethodPost, base+"/monitors/mon-missing/cancel", []byte("{}"))
+		if response.Code != http.StatusNotFound {
+			t.Fatalf("status=%d body=%s", response.Code, response.Body.String())
+		}
+	})
+
+	t.Run("Should hide another profile's monitors from list and cancel", func(t *testing.T) {
+		foreign, err := monitors.Create(t.Context(), monitorpkg.Spec{
+			WorkspaceID: "ws-workspace", SessionID: "sess-foreign", Kind: monitorpkg.KindTimer,
+			Description: "foreign wake", Delay: time.Hour,
+		})
+		if err != nil {
+			t.Fatalf("Create() error = %v", err)
+		}
+		foreignHandlers := newTestHandlers(t, &stubSessionManager{
+			StatusFn: func(_ context.Context, id string) (*session.Info, error) {
+				return &session.Info{
+					ID: id, WorkspaceID: "ws-workspace", ProfileID: "profile-marketing",
+					State: session.StateActive,
+				}, nil
+			},
+		}, stubObserver{}, newTestHomePaths(t))
+		foreignHandlers.SessionMonitors = monitors
+		foreignEngine := newTestRouter(t, foreignHandlers)
+		foreignBase := "/api/workspaces/ws-workspace/sessions/sess-foreign"
+
+		response := performRequest(t, foreignEngine, http.MethodGet, foreignBase+"/monitors", nil)
+		if response.Code != http.StatusNotFound {
+			t.Fatalf("list status=%d body=%s", response.Code, response.Body.String())
+		}
+		response = performRequest(
+			t, foreignEngine, http.MethodPost, foreignBase+"/monitors/"+foreign.ID+"/cancel", []byte("{}"),
+		)
+		if response.Code != http.StatusNotFound {
+			t.Fatalf("cancel status=%d body=%s", response.Code, response.Body.String())
+		}
+		if counts := monitors.ActiveCounts([]string{"sess-foreign"}); counts["sess-foreign"] != 1 {
+			t.Fatalf("active after denied cancel=%v, want the monitor kept", counts)
+		}
+	})
+
+	// #956: the operator reaches another profile's session through the owner selector.
+	t.Run("Should list and cancel another profile's monitor through the profile selector", func(t *testing.T) {
+		owned, err := monitors.Create(t.Context(), monitorpkg.Spec{
+			WorkspaceID: "ws-workspace", SessionID: "sess-marketing", Kind: monitorpkg.KindTimer,
+			Description: "marketing wake", Delay: time.Hour,
+		})
+		if err != nil {
+			t.Fatalf("Create() error = %v", err)
+		}
+		ownerHandlers := newTestHandlers(t, &stubSessionManager{
+			StatusFn: func(_ context.Context, id string) (*session.Info, error) {
+				return &session.Info{
+					ID: id, WorkspaceID: "ws-workspace", ProfileID: "profile-marketing",
+					State: session.StateActive,
+				}, nil
+			},
+		}, stubObserver{}, newTestHomePaths(t))
+		ownerHandlers.SessionMonitors = monitors
+		ownerHandlers.Profiles = marketingProfileService{}
+		ownerEngine := newTestRouter(t, ownerHandlers)
+		ownerBase := "/api/workspaces/ws-workspace/sessions/sess-marketing/monitors"
+
+		for _, query := range []string{"?all_profiles=true", "?profile=marketing"} {
+			response := performRequest(t, ownerEngine, http.MethodGet, ownerBase+query, nil)
+			if response.Code != http.StatusOK {
+				t.Fatalf("list%s status=%d body=%s", query, response.Code, response.Body.String())
+			}
+			var listed contract.SessionMonitorsResponse
+			decodeJSONResponse(t, response, &listed)
+			if len(listed.Monitors) != 1 || listed.Monitors[0].MonitorID != owned.ID {
+				t.Fatalf("list%s monitors=%#v", query, listed.Monitors)
+			}
+		}
+
+		cancelPath := ownerBase + "/" + owned.ID + "/cancel"
+		response := performRequest(t, ownerEngine, http.MethodPost, cancelPath+"?all_profiles=true", []byte("{}"))
+		if response.Code != http.StatusBadRequest {
+			t.Fatalf("aggregate cancel status=%d body=%s", response.Code, response.Body.String())
+		}
+		var refused contract.ProfileErrorPayload
+		decodeJSONResponse(t, response, &refused)
+		if refused.Error.Code != "profile_selection_conflict" ||
+			refused.Error.Message != "all_profiles is only available for reads" {
+			t.Fatalf("aggregate cancel error=%#v", refused.Error)
+		}
+		if counts := monitors.ActiveCounts([]string{"sess-marketing"}); counts["sess-marketing"] != 1 {
+			t.Fatalf("active after refused cancel=%v, want the monitor kept", counts)
+		}
+		response = performRequest(t, ownerEngine, http.MethodPost, cancelPath+"?profile=marketing", []byte("{}"))
+		if response.Code != http.StatusOK {
+			t.Fatalf("owner cancel status=%d body=%s", response.Code, response.Body.String())
+		}
+		if counts := monitors.ActiveCounts([]string{"sess-marketing"}); len(counts) != 0 {
+			t.Fatalf("active after owner cancel=%v", counts)
+		}
+	})
+}
+
+// UT-012 UT-017: queue origin reaches HTTP and protects agent-authored edits/promotions.
+func TestSessionInputOriginContract(t *testing.T) {
+	t.Parallel()
+	t.Run("Should expose origin and refuse replace and promotion with conflict", func(t *testing.T) {
+		t.Parallel()
+		manager := &stubSessionManager{
+			ListPendingInputsFn: func(context.Context, string) ([]session.PendingInput, error) {
+				return []session.PendingInput{
+					{
+						ID:        "inq-1",
+						SessionID: "sess-123",
+						Text:      "Q?",
+						Origin: json.RawMessage(
+							`{"kind":"session","session_id":"sender","workspace_id":"ws-other","hop":2}`,
+						),
+					},
+					{ID: "inq-operator", SessionID: "sess-123", Text: "operator input"},
+				}, nil
+			},
+			ReplacePendingInputFn: func(context.Context, string, string, session.ReplacePendingInputOpts) (session.PendingInput, error) {
+				return session.PendingInput{}, store.ErrSessionInputAgentAuthored
+			},
+			PromotePendingInputFn: func(context.Context, string, string, session.PromotePendingInputOpts) (session.SendPromptResult, error) {
+				return session.SendPromptResult{}, store.ErrSessionInputAgentAuthored
+			},
+		}
+		engine := newTestRouter(t, newTestHandlers(t, manager, stubObserver{}, newTestHomePaths(t)))
+		base := "/api/workspaces/ws-workspace/sessions/sess-123/prompt/queue"
+		listed := performRequest(t, engine, http.MethodGet, base, nil)
+		var payload contract.SessionInputListResponse
+		if err := json.Unmarshal(listed.Body.Bytes(), &payload); err != nil {
+			t.Fatal(err)
+		}
+		if listed.Code != http.StatusOK || len(payload.Inputs) != 2 || payload.Inputs[0].Origin == nil ||
+			payload.Inputs[0].Origin.SessionID != "sender" ||
+			payload.Inputs[0].Origin.WorkspaceID != "ws-other" {
+			t.Fatal(listed.Code, listed.Body.String())
+		}
+		var raw struct {
+			Inputs []map[string]json.RawMessage `json:"inputs"`
+		}
+		if err := json.Unmarshal(listed.Body.Bytes(), &raw); err != nil {
+			t.Fatal(err)
+		}
+		if _, exists := raw.Inputs[1]["origin"]; exists {
+			t.Fatal("operator input carries origin", listed.Body.String())
+		}
+		for _, route := range []struct{ method, path string }{{http.MethodPut, base + "/inq-1"}, {http.MethodPost, base + "/inq-1/steer"}} {
+			response := performRequest(
+				t,
+				engine,
+				route.method,
+				route.path,
+				[]byte(`{"text":"edited","message_id":"new","idempotency_key":"key"}`),
+			)
+			var failure contract.ErrorPayload
+			if err := json.Unmarshal(response.Body.Bytes(), &failure); err != nil {
+				t.Fatal(err)
+			}
+			if response.Code != http.StatusConflict || failure.Code != "input_agent_authored" ||
+				failure.Error != store.ErrSessionInputAgentAuthored.Error() {
+				t.Fatal(response.Code, failure)
+			}
+		}
+	})
+}
+
+// Invariant: process reads/mutations retain session profile/workspace boundaries and reject ambiguous targets.
+// Owning layer: shared HTTP handlers; canonical suite: handlers_test.go (UDS reuses these handlers).
+func TestSessionProcessHandlers(t *testing.T) {
+	t.Parallel()
+	t.Run("Should restrict aggregate termination to retained owners in the selected profile", func(t *testing.T) {
+		t.Parallel()
+		processes := &handlerProcessService{}
+		handlers := newTestHandlers(t, &stubSessionManager{}, stubObserver{}, newTestHomePaths(t))
+		handlers.SessionProcesses = processes
+		response := performRequest(t, newTestRouter(t, handlers), http.MethodPost,
+			"/api/processes/terminate",
+			[]byte(`{"targets":[{"pid":123,"started_at":"2026-01-01T00:00:00Z"}]}`))
+		if response.Code != http.StatusOK || processes.calls != 1 ||
+			!strings.Contains(response.Body.String(), `"results"`) {
+			t.Fatalf("status=%d calls=%d body=%s", response.Code, processes.calls, response.Body.String())
+		}
+	})
+	t.Run("Should clean retained owners after their profile is archived or deleted", func(t *testing.T) {
+		t.Parallel()
+		for _, archived := range []bool{false, true} {
+			processes := &handlerProcessService{aggregateProfile: "profile-retained"}
+			handlers := newTestHandlers(t, &stubSessionManager{}, stubObserver{}, newTestHomePaths(t))
+			handlers.Profiles = retainedProcessProfileService{archived: archived}
+			handlers.SessionProcesses = processes
+			selector := "profile-retained"
+			if archived {
+				selector = "retained"
+			}
+			response := performRequest(t, newTestRouter(t, handlers), http.MethodPost,
+				"/api/processes/terminate?profile="+selector,
+				[]byte(`{"targets":[{"pid":123,"started_at":"2026-01-01T00:00:00Z"}]}`))
+			if response.Code != http.StatusOK || processes.calls != 1 {
+				t.Fatalf(
+					"archived=%t status=%d calls=%d body=%s",
+					archived,
+					response.Code,
+					processes.calls,
+					response.Body.String(),
+				)
+			}
+		}
+	})
+	t.Run("Should list process metadata and reject conflicting or foreign targets before mutation", func(t *testing.T) {
+		processes := &handlerProcessService{}
+		handlers := newTestHandlers(t, &stubSessionManager{}, stubObserver{}, newTestHomePaths(t))
+		handlers.SessionProcesses = processes
+		engine := newTestRouter(t, handlers)
+		base := "/api/workspaces/ws-workspace/sessions/sess-123"
+		response := performRequest(t, engine, http.MethodGet, base+"/processes", nil)
+		if response.Code != http.StatusOK {
+			t.Fatalf("status=%d body=%s", response.Code, response.Body.String())
+		}
+		var listed contract.SessionProcessesResponse
+		decodeJSONResponse(t, response, &listed)
+		if !listed.Supported || len(listed.Items) != 1 || listed.Items[0].Attribution != "lineage" {
+			t.Fatalf("list=%+v", listed)
+		}
+		for _, body := range []string{`{}`, `{"all":true,"targets":[{"pid":123,"started_at":"2026-01-01T00:00:00Z"}]}`, `{"targets":[{"pid":1,"started_at":"2026-01-01T00:00:00Z"}]}`, `{"include_tools":true,"targets":[{"pid":123,"started_at":"2026-01-01T00:00:00Z"}]}`} {
+			response = performRequest(t, engine, http.MethodPost, base+"/processes/terminate", []byte(body))
+			if response.Code != http.StatusBadRequest || processes.calls != 0 {
+				t.Fatalf("status=%d calls=%d body=%s", response.Code, processes.calls, response.Body.String())
+			}
+		}
+		response = performRequest(t, engine, http.MethodPost, base+"/processes/terminate", []byte(`{"all":true}`))
+		// Stop all leaves tool calls to the agent's turn unless the caller includes them.
+		if response.Code != http.StatusOK || processes.calls != 1 || processes.all != sessionprocess.AllLeftRunning ||
+			len(processes.targets) != 0 {
+			t.Fatalf(
+				"status=%d calls=%d all=%v targets=%v body=%s",
+				response.Code,
+				processes.calls,
+				processes.all,
+				processes.targets,
+				response.Body.String(),
+			)
+		}
+		response = performRequest(
+			t, engine, http.MethodPost, base+"/processes/terminate", []byte(`{"all":true,"include_tools":true}`),
+		)
+		if response.Code != http.StatusOK || processes.calls != 2 || processes.all != sessionprocess.AllIncludingTools {
+			t.Fatalf("status=%d calls=%d all=%v", response.Code, processes.calls, processes.all)
+		}
+		stamp := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
+		response = performRequest(
+			t,
+			engine,
+			http.MethodPost,
+			base+"/processes/terminate",
+			[]byte(`{"targets":[{"pid":123,"started_at":"2026-01-01T00:00:00Z"}]}`),
+		)
+		if response.Code != http.StatusOK || processes.calls != 3 || processes.all != sessionprocess.Targets ||
+			len(processes.targets) != 1 ||
+			processes.targets[0].PID != 123 ||
+			!processes.targets[0].StartedAt.Equal(stamp) {
+			t.Fatalf(
+				"status=%d calls=%d all=%v targets=%v",
+				response.Code,
+				processes.calls,
+				processes.all,
+				processes.targets,
+			)
+		}
+		foreign := newTestHandlers(
+			t,
+			&stubSessionManager{StatusFn: func(_ context.Context, id string) (*session.Info, error) {
+				return &session.Info{
+					ID:          id,
+					WorkspaceID: "ws-workspace",
+					ProfileID:   "foreign",
+					State:       session.StateActive,
+				}, nil
+			}},
+			stubObserver{},
+			newTestHomePaths(t),
+		)
+		foreign.SessionProcesses = processes
+		response = performRequest(
+			t,
+			newTestRouter(t, foreign),
+			http.MethodPost,
+			base+"/processes/terminate",
+			[]byte(`{"all":true}`),
+		)
+		if response.Code != http.StatusNotFound || processes.calls != 3 {
+			t.Fatalf("foreign status=%d calls=%d", response.Code, processes.calls)
+		}
+	})
+	// Invariants: keep tolerates scanner failure; unsupported terminate never mutates;
+	// committed lifecycle cleanup survives request cancellation with a bounded lifetime.
+	t.Run("Should retain keep lifecycle behavior when process inspection fails", func(t *testing.T) {
+		for _, policy := range []string{"", "keep", "terminate"} {
+			processes := &handlerProcessService{refreshErr: errors.New("process table unavailable")}
+			deleted := false
+			manager := &stubSessionManager{DeleteFn: func(context.Context, string) error { deleted = true; return nil }}
+			handlers := newTestHandlers(t, manager, stubObserver{}, newTestHomePaths(t))
+			handlers.SessionProcesses = processes
+			response := performRequest(
+				t,
+				newTestRouter(t, handlers),
+				http.MethodDelete,
+				"/api/workspaces/ws-workspace/sessions/sess-123?processes="+policy,
+				nil,
+			)
+			want := http.StatusNoContent
+			if policy == "terminate" {
+				want = http.StatusInternalServerError
+			}
+			if response.Code != want || deleted != (policy != "terminate") {
+				t.Fatalf(
+					"policy=%q status=%d deleted=%t body=%s",
+					policy,
+					response.Code,
+					deleted,
+					response.Body.String(),
+				)
+			}
+		}
+	})
+	// Invariant: unsuccessful cleanup outcomes remain a lifecycle conflict with an actionable body.
+	// Owner/canonical suite: HTTP TestSessionProcessHandlers; process service is the I/O boundary.
+	for _, outcome := range []string{"unproven", "failed"} {
+		t.Run("Should report deletion cleanup conflict for "+outcome, func(t *testing.T) {
+			handlers := newTestHandlers(
+				t,
+				&stubSessionManager{DeleteFn: func(context.Context, string) error { return nil }},
+				stubObserver{},
+				newTestHomePaths(t),
+			)
+			handlers.SessionProcesses = &handlerProcessService{
+				results: []sessionprocess.Result{{PID: 123, Outcome: outcome}},
+			}
+			response := performRequest(t, newTestRouter(t, handlers), http.MethodDelete,
+				"/api/workspaces/ws-workspace/sessions/sess-123?processes=terminate", nil)
+			if response.Code != http.StatusConflict ||
+				!strings.Contains(response.Body.String(), "process 123 termination is "+outcome) {
+				t.Fatalf("status=%d body=%s", response.Code, response.Body.String())
+			}
+		})
+	}
+
+	t.Run("Should reject unsupported termination before deleting the session", func(t *testing.T) {
+		deleted := false
+		handlers := newTestHandlers(
+			t,
+			&stubSessionManager{DeleteFn: func(context.Context, string) error { deleted = true; return nil }},
+			stubObserver{},
+			newTestHomePaths(t),
+		)
+		handlers.SessionProcesses = &handlerProcessService{unsupported: true}
+		response := performRequest(
+			t,
+			newTestRouter(t, handlers),
+			http.MethodDelete,
+			"/api/workspaces/ws-workspace/sessions/sess-123?processes=terminate",
+			nil,
+		)
+		if response.Code != http.StatusServiceUnavailable || deleted ||
+			!strings.Contains(response.Body.String(), http.StatusText(http.StatusServiceUnavailable)) {
+			t.Fatalf("status=%d deleted=%t body=%s", response.Code, deleted, response.Body.String())
+		}
+	})
+
+	// Invariant: accepted stop cleanup survives caller cancellation during archive/delete.
+	// Owning layer: HTTP lifecycle handlers; canonical suite: TestSessionProcessHandlers.
+	for _, verb := range []string{"archive", "delete"} {
+		t.Run("Should retain cleanup after disconnected "+verb, func(t *testing.T) {
+			ctx, cancel := context.WithCancel(t.Context())
+			defer cancel()
+			processes := &handlerProcessService{}
+			manager := &disconnectedProcessStopManager{cancel: cancel}
+			manager.StatusFn = func(_ context.Context, id string) (*session.Info, error) {
+				return &session.Info{ID: id, WorkspaceID: "ws-workspace", ProfileID: store.DefaultProfileID,
+					State: session.StateActive}, nil
+			}
+			manager.DeleteFn = func(ctx context.Context, _ string) error {
+				cancel()
+				return errors.Join(session.ErrDeleteStopAccepted, ctx.Err())
+			}
+			manager.ArchiveWithStopFn = func(ctx context.Context, _, _ string) (*session.Info, error) { cancel(); return nil, ctx.Err() }
+			handlers := newTestHandlers(t, manager, stubObserver{}, newTestHomePaths(t))
+			handlers.SessionProcesses = processes
+			method, path := http.MethodDelete, "/api/workspaces/ws-workspace/sessions/sess-123?processes=terminate"
+			if verb == "archive" {
+				method, path = http.MethodPost, "/api/workspaces/ws-workspace/sessions/sess-123/archive?stop=true&processes=terminate"
+			}
+			request := httptest.NewRequestWithContext(ctx, method, path, http.NoBody)
+			response := httptest.NewRecorder()
+			newTestRouter(t, handlers).ServeHTTP(response, request)
+			if response.Code < 400 || processes.afterStop == nil || processes.calls != 0 {
+				t.Fatalf("status=%d callback=%t cleanup=%d", response.Code, processes.afterStop != nil, processes.calls)
+			}
+			if err := processes.afterStop(t.Context()); err != nil {
+				t.Fatal(err)
+			}
+		})
+	}
+	t.Run("Should not clean up a canceled delete that never accepted a stop", func(t *testing.T) {
+		processes := &handlerProcessService{}
+		manager := &disconnectedProcessStopManager{}
+		manager.StatusFn = func(_ context.Context, id string) (*session.Info, error) {
+			return &session.Info{
+				ID:          id,
+				WorkspaceID: "ws-workspace",
+				ProfileID:   store.DefaultProfileID,
+				State:       session.StateStopped,
+			}, nil
+		}
+		manager.DeleteFn = func(context.Context, string) error { return context.Canceled }
+		handlers := newTestHandlers(t, manager, stubObserver{}, newTestHomePaths(t))
+		handlers.SessionProcesses = processes
+		response := performRequest(t, newTestRouter(t, handlers), http.MethodDelete,
+			"/api/workspaces/ws-workspace/sessions/sess-123?processes=terminate", nil)
+		if response.Code < 400 || processes.afterStop != nil || processes.calls != 0 {
+			t.Fatalf("status=%d callback=%t cleanup=%d", response.Code, processes.afterStop != nil, processes.calls)
+		}
+	})
+
+	t.Run("Should finish cleanup after deletion cancels the caller context", func(t *testing.T) {
+		ctx, cancel := context.WithCancel(t.Context())
+		defer cancel()
+		processes := &handlerProcessService{}
+		handlers := newTestHandlers(
+			t,
+			&stubSessionManager{DeleteFn: func(context.Context, string) error { cancel(); return nil }},
+			stubObserver{},
+			newTestHomePaths(t),
+		)
+		handlers.SessionProcesses = processes
+		request := httptest.NewRequestWithContext(
+			ctx,
+			http.MethodDelete,
+			"/api/workspaces/ws-workspace/sessions/sess-123?processes=terminate",
+			http.NoBody,
+		)
+		response := httptest.NewRecorder()
+		newTestRouter(t, handlers).ServeHTTP(response, request)
+		if response.Code != http.StatusNoContent || processes.calls != 1 || processes.terminateContextErr != nil ||
+			!processes.terminateHasDeadline {
+			t.Fatalf(
+				"status=%d calls=%d ctxErr=%v bounded=%t",
+				response.Code,
+				processes.calls,
+				processes.terminateContextErr,
+				processes.terminateHasDeadline,
+			)
+		}
+	})
+	t.Run("Should finish stop and cleanup after the caller disconnects", func(t *testing.T) {
+		for _, tc := range []struct {
+			name, body string
+			status     int
+		}{
+			{"Should finish a waited stop", `{"wait":true,"processes":"terminate"}`, http.StatusOK},
+			{"Should finish a legacy stop", `{"processes":"terminate"}`, http.StatusNoContent},
+		} {
+			t.Run(tc.name, func(t *testing.T) {
+				ctx, cancel := context.WithCancel(t.Context())
+				defer cancel()
+				processes := &handlerProcessService{}
+				manager := &disconnectedProcessStopManager{
+					cancel: cancel,
+					StatusFn: func(_ context.Context, id string) (*session.Info, error) {
+						return &session.Info{
+							ID:          id,
+							WorkspaceID: "ws-workspace",
+							ProfileID:   store.DefaultProfileID,
+							State:       session.StateActive,
+						}, nil
+					},
+				}
+				handlers := newTestHandlers(t, manager, stubObserver{}, newTestHomePaths(t))
+				handlers.SessionProcesses = processes
+				request := httptest.NewRequestWithContext(
+					ctx,
+					http.MethodPost,
+					"/api/workspaces/ws-workspace/sessions/sess-123/stop",
+					strings.NewReader(tc.body),
+				)
+				request.Header.Set("Content-Type", "application/json")
+				response := httptest.NewRecorder()
+				newTestRouter(t, handlers).ServeHTTP(response, request)
+				if response.Code != tc.status || processes.calls != 1 || manager.awaitErr != nil ||
+					processes.terminateContextErr != nil {
+					t.Fatalf(
+						"status=%d calls=%d wait=%v cleanup=%v body=%s",
+						response.Code,
+						processes.calls,
+						manager.awaitErr,
+						processes.terminateContextErr,
+						response.Body.String(),
+					)
+				}
+			})
+		}
+	})
+	// Invariant: only a timed-out stop schedules deferred cleanup; the original error response is preserved.
+	// Owner/canonical suite: HTTP session process policies.
+	for _, wait := range []bool{false, true} {
+		t.Run(fmt.Sprintf("Should preserve cleanup after stop deadline with wait=%t", wait), func(t *testing.T) {
+			processes := &handlerProcessService{}
+			manager := &disconnectedProcessStopManager{cancel: func() {}, stopErr: context.DeadlineExceeded,
+				StatusFn: func(_ context.Context, id string) (*session.Info, error) {
+					return &session.Info{
+						ID:          id,
+						WorkspaceID: "ws-workspace",
+						ProfileID:   store.DefaultProfileID,
+						State:       session.StateActive,
+					}, nil
+				},
+			}
+			handlers := newTestHandlers(t, manager, stubObserver{}, newTestHomePaths(t))
+			handlers.SessionProcesses = processes
+			body := `{"processes":"terminate"}`
+			if wait {
+				body = `{"wait":true,"processes":"terminate"}`
+			}
+			request := httptest.NewRequestWithContext(
+				t.Context(),
+				http.MethodPost,
+				"/api/workspaces/ws-workspace/sessions/sess-123/stop",
+				strings.NewReader(body),
+			)
+			request.Header.Set("Content-Type", "application/json")
+			response := httptest.NewRecorder()
+			newTestRouter(t, handlers).ServeHTTP(response, request)
+			if response.Code < 400 || processes.afterStop == nil || processes.calls != 0 {
+				t.Fatalf("status=%d callback=%t cleanup=%d", response.Code, processes.afterStop != nil, processes.calls)
+			}
+			manager.afterDeadline = true
+			if err := processes.afterStop(t.Context()); err != nil {
+				t.Fatal(err)
+			}
+		})
+	}
+	t.Run("Should keep by default and only terminate on an explicit lifecycle choice", func(t *testing.T) {
+		for _, choice := range []string{"", "?processes=keep", "?processes=terminate"} {
+			processes := &handlerProcessService{}
+			handlers := newTestHandlers(t, &stubSessionManager{}, stubObserver{}, newTestHomePaths(t))
+			handlers.SessionProcesses = processes
+			response := performRequest(
+				t,
+				newTestRouter(t, handlers),
+				http.MethodDelete,
+				"/api/workspaces/ws-workspace/sessions/sess-123"+choice,
+				nil,
+			)
+			want := 0
+			if choice == "?processes=terminate" {
+				want = 1
+			}
+			if response.Code != http.StatusNoContent || processes.calls != want {
+				t.Fatalf(
+					"choice=%s status=%d calls=%d body=%s",
+					choice,
+					response.Code,
+					processes.calls,
+					response.Body.String(),
+				)
+			}
+		}
+	})
+}
+
+type handlerProcessService struct {
+	results              []sessionprocess.Result
+	aggregateProfile     string
+	calls                int
+	refreshErr           error
+	unsupported          bool
+	targets              []sessionprocess.Identity
+	all                  sessionprocess.Scope
+	terminateContextErr  error
+	terminateHasDeadline bool
+	afterStop            func(context.Context) error
+}
+
+func (s *handlerProcessService) Refresh(context.Context) (sessionprocess.Snapshot, error) {
+	if s.refreshErr != nil {
+		return sessionprocess.Snapshot{}, s.refreshErr
+	}
+	if s.unsupported {
+		return sessionprocess.Snapshot{}, nil
+	}
+	return sessionprocess.Snapshot{
+		Supported: true,
+		ScannedAt: time.Now(),
+		Processes: []sessionprocess.Process{
+			{
+				PID: 123, StartedAt: time.Now(),
+				Owner: sessionprocess.Owner{
+					SessionID:   "sess-123",
+					WorkspaceID: "ws-workspace",
+					ProfileID:   store.DefaultProfileID,
+				},
+				Kind:        "background",
+				Attribution: "lineage",
+			},
+		},
+	}, nil
+}
+func (*handlerProcessService) Summary(string) sessionprocess.Summary {
+	return sessionprocess.Summary{Supported: true, Background: 1, Ports: []int{}}
+}
+func (*handlerProcessService) Acquire() func() { return func() {} }
+
+func (s *handlerProcessService) Terminate(
+	ctx context.Context,
+	id string,
+	targets []sessionprocess.Identity,
+	all sessionprocess.Scope,
+	allowed func(sessionprocess.Owner) bool,
+) ([]sessionprocess.Result, error) {
+	if id == "" {
+		profileID := s.aggregateProfile
+		if profileID == "" {
+			profileID = store.DefaultProfileID
+		}
+		if !allowed(sessionprocess.Owner{WorkspaceID: "foreign", ProfileID: profileID}) ||
+			allowed(sessionprocess.Owner{ProfileID: profileID, Live: true}) ||
+			allowed(sessionprocess.Owner{ProfileID: "foreign"}) {
+			return nil, errors.New("incorrect aggregate process mutation scope")
+		}
+	} else if !allowed(sessionprocess.Owner{SessionID: id, WorkspaceID: "ws-workspace", ProfileID: store.DefaultProfileID}) ||
+		allowed(sessionprocess.Owner{SessionID: id, WorkspaceID: "foreign", ProfileID: store.DefaultProfileID}) ||
+		allowed(sessionprocess.Owner{SessionID: id, WorkspaceID: "ws-workspace", ProfileID: "foreign"}) {
+		return nil, errors.New("incorrect process mutation scope")
+	}
+	s.calls++
+	s.targets, s.all = targets, all
+	s.terminateContextErr = ctx.Err()
+	_, s.terminateHasDeadline = ctx.Deadline()
+	return s.results, nil
+}
+func (s *handlerProcessService) AfterStop(_ string, await func(context.Context) error) {
+	s.afterStop = await
+}
+
+type disconnectedProcessStopManager struct {
+	stubSessionManager
+	cancel        context.CancelFunc
+	awaitErr      error
+	stopErr       error
+	afterDeadline bool
+}
+
+func (s *disconnectedProcessStopManager) RequestStop(context.Context, string, session.StopCause) error {
+	s.cancel()
+	return nil
+}
+func (s *disconnectedProcessStopManager) AwaitStopped(ctx context.Context, _ string) (session.StopOutcome, error) {
+	if s.stopErr != nil && !s.afterDeadline {
+		s.afterDeadline = true
+		return session.StopOutcome{}, s.stopErr
+	}
+	s.awaitErr = ctx.Err()
+	return session.StopOutcome{FinalState: session.StateStopped, Verified: s.awaitErr == nil}, s.awaitErr
+}
+
+func (s *disconnectedProcessStopManager) Stop(ctx context.Context, _ string) error {
+	s.cancel()
+	if s.stopErr != nil {
+		return s.stopErr
+	}
+	s.awaitErr = ctx.Err()
+	return s.awaitErr
+}

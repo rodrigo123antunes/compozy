@@ -1,0 +1,450 @@
+package store
+
+import (
+	"errors"
+	"fmt"
+	"strings"
+	"time"
+
+	speedpkg "github.com/compozy/compozy/internal/speed"
+)
+
+// SessionExecutionLocationState keeps the optional execution location compact inside SessionMeta.
+// Embedding preserves the flat session metadata JSON contract.
+type SessionExecutionLocationState struct {
+	WorktreeID string `json:"worktree_id,omitempty"`
+	CWD        string `json:"cwd,omitempty"`
+}
+
+// SessionAdvertisedCommandState keeps the optional command catalog compact inside SessionMeta.
+// Embedding preserves the flat session metadata JSON contract.
+type SessionAdvertisedCommandState struct {
+	AdvertisedCommands []SessionAdvertisedCommand `json:"advertised_commands,omitempty"`
+}
+
+// SessionRuntimeBindingState keeps optional runtime failure and selection state compact inside SessionMeta.
+// Embedding preserves the flat session metadata JSON contract.
+type SessionRuntimeBindingState struct {
+	RuntimeFailure      *string                       `json:"runtime_failure,omitzero"`
+	RuntimeSelection    *SessionRuntimeSelectionState `json:"runtime_selection,omitzero"`
+	PendingResumeReplay string                        `json:"pending_resume_replay,omitempty"`
+}
+
+// SessionProviderExecutionState keeps resolved provider execution settings compact inside SessionMeta.
+// Embedding preserves the flat session metadata JSON contract.
+type SessionProviderExecutionState struct {
+	EffectivePermissions      string `json:"effective_permissions,omitempty"`
+	EffectiveProviderAuthMode string `json:"effective_provider_auth_mode,omitempty"`
+}
+
+// SessionMeta is the atomically-written session metadata document.
+type SessionPermissionRule struct {
+	Kind     string `json:"kind,omitempty"`
+	Path     string `json:"path,omitempty"`
+	Decision string `json:"decision"`
+}
+
+type SessionMeta struct {
+	PermissionModeDegraded   bool                    `json:"permission_mode_degraded,omitzero"`
+	EffectiveSessionApproval string                  `json:"effective_session_approval,omitempty"`
+	PermissionRules          []SessionPermissionRule `json:"permission_rules,omitempty"`
+	InitiatorKind            string                  `json:"initiator_kind,omitempty"`
+	InitiatorID              string                  `json:"initiator_id,omitempty"`
+	EffectiveWorkspaceAccess string                  `json:"effective_workspace_access"`
+	ID                       string                  `json:"id"`
+	Name                     string                  `json:"name,omitempty"`
+	AgentName                string                  `json:"agent_name"`
+	Provider                 string                  `json:"provider,omitempty"`
+	Model                    string                  `json:"model,omitempty"`
+	ReasoningEffort          string                  `json:"reasoning_effort,omitempty"`
+	Speed                    speedpkg.Speed          `json:"speed,omitempty"`
+	*SessionRuntimeDetails
+	SpeedResolution   *speedpkg.Resolution     `json:"speed_resolution,omitzero"`
+	RuntimeStatus     SessionRuntimeStatus     `json:"runtime_status"`
+	RuntimeTransition SessionRuntimeTransition `json:"runtime_transition,omitempty"`
+	RuntimeGeneration int64                    `json:"runtime_generation,omitzero"`
+	*SessionRuntimeBindingState
+	*SessionProviderExecutionState
+	ProfileID   string `json:"profile_id"`
+	WorkspaceID string `json:"workspace_id,omitempty"`
+	*SessionExecutionLocationState
+	// Absent in older documents: their persisted execution location remains unchanged.
+	WorktreeTransition *SessionWorktreeTransition `json:"worktree_transition,omitzero"`
+
+	SessionType            string          `json:"session_type,omitempty"`
+	Lineage                *SessionLineage `json:"lineage,omitzero"`
+	State                  string          `json:"state"`
+	StopReason             *StopReason     `json:"stop_reason,omitzero"`
+	StopEscalated          bool            `json:"stop_escalated,omitzero"`
+	StopVerificationFailed bool            `json:"stop_verification_failed,omitzero"`
+	StopDetail             string          `json:"stop_detail,omitempty"`
+	Failure                *SessionFailure `json:"failure,omitempty"`
+	ACPSessionID           *string         `json:"acp_session_id,omitzero"`
+	// AcceptedRoute is the binding ACP accepted; it is written with ACPSessionID and
+	// cleared with it, and drives resume affinity.
+	AcceptedRoute *SessionAcceptedRoute `json:"accepted_route,omitzero"`
+	Liveness      *SessionLivenessMeta  `json:"liveness,omitzero"`
+	// RestartBoundary snapshots the last dispatched turn without adding transcript events.
+	// Older metadata omits it and is recovered from the existing prompt history.
+	RestartBoundary *SessionRestartCheckpoint `json:"restart_boundary,omitzero"`
+	// Derivation and ImportedContext are present only on continued or forked children.
+	Derivation      *SessionDerivation      `json:"derivation,omitzero"`
+	ImportedContext *SessionImportedContext `json:"imported_context,omitzero"`
+
+	CreationProfile    *SessionCreationProfile `json:"creation_profile,omitzero"`
+	CreationOptions    *SessionCreationOptions `json:"creation_options,omitzero"`
+	CreationProfileRef string                  `json:"creation_profile_ref,omitempty"`
+	PolicySpecDigest   string                  `json:"policy_spec_digest,omitempty"`
+	CreationDigest     string                  `json:"creation_digest,omitempty"`
+	*SessionAdvertisedCommandState
+
+	SoulSnapshotID   string    `json:"soul_snapshot_id,omitempty"`
+	SoulDigest       string    `json:"soul_digest,omitempty"`
+	ParentSoulDigest string    `json:"parent_soul_digest,omitempty"`
+	CreatedAt        time.Time `json:"created_at"`
+	UpdatedAt        time.Time `json:"updated_at"`
+}
+
+// SessionRestartCheckpoint binds recovery to the policy and route accepted at dispatch.
+type SessionRestartCheckpoint struct {
+	TurnID          string                `json:"turn_id"`
+	RuntimeRevision int64                 `json:"runtime_revision,omitempty"`
+	Delivery        string                `json:"delivery,omitempty"`
+	PolicyDigest    string                `json:"policy_digest,omitempty"`
+	Route           *SessionAcceptedRoute `json:"route,omitzero"`
+	Permissions     string                `json:"permissions,omitempty"`
+	WorktreeID      string                `json:"worktree_id,omitempty"`
+	CWD             string                `json:"cwd,omitempty"`
+	Reason          string                `json:"reason,omitempty"`
+}
+
+// CloneSessionRestartCheckpoint isolates a persisted recovery snapshot from later routing changes.
+func CloneSessionRestartCheckpoint(checkpoint *SessionRestartCheckpoint) *SessionRestartCheckpoint {
+	if checkpoint == nil {
+		return nil
+	}
+	cloned := *checkpoint
+	cloned.Route = CloneSessionAcceptedRoute(checkpoint.Route)
+	return &cloned
+}
+
+// WorktreeIDValue returns the optional worktree binding without exposing nil embedding details.
+func (m *SessionMeta) WorktreeIDValue() string {
+	if m == nil || m.SessionExecutionLocationState == nil {
+		return ""
+	}
+	return m.WorktreeID
+}
+
+// SetWorktreeID updates the optional worktree binding with value semantics.
+func (m *SessionMeta) SetWorktreeID(worktreeID string) {
+	if m.SessionExecutionLocationState == nil {
+		if worktreeID == "" {
+			return
+		}
+		m.SessionExecutionLocationState = &SessionExecutionLocationState{}
+	}
+	m.WorktreeID = worktreeID
+	m.clearEmptyExecutionLocationState()
+}
+
+// CWDValue returns the optional execution directory without exposing nil embedding details.
+func (m *SessionMeta) CWDValue() string {
+	if m == nil || m.SessionExecutionLocationState == nil {
+		return ""
+	}
+	return m.CWD
+}
+
+// SetCWD updates the optional execution directory with value semantics.
+func (m *SessionMeta) SetCWD(cwd string) {
+	if m.SessionExecutionLocationState == nil {
+		if cwd == "" {
+			return
+		}
+		m.SessionExecutionLocationState = &SessionExecutionLocationState{}
+	}
+	m.CWD = cwd
+	m.clearEmptyExecutionLocationState()
+}
+
+func (m *SessionMeta) clearEmptyExecutionLocationState() {
+	if m.WorktreeID == "" && m.CWD == "" {
+		m.SessionExecutionLocationState = nil
+	}
+}
+
+// AdvertisedCommandsValue returns the optional advertised command catalog.
+func (m *SessionMeta) AdvertisedCommandsValue() []SessionAdvertisedCommand {
+	if m == nil || m.SessionAdvertisedCommandState == nil {
+		return nil
+	}
+	return m.AdvertisedCommands
+}
+
+// SetAdvertisedCommands stores an ownership-safe advertised command catalog.
+func (m *SessionMeta) SetAdvertisedCommands(commands []SessionAdvertisedCommand) {
+	if len(commands) == 0 {
+		m.SessionAdvertisedCommandState = nil
+		return
+	}
+	m.SessionAdvertisedCommandState = &SessionAdvertisedCommandState{
+		AdvertisedCommands: CloneSessionAdvertisedCommands(commands),
+	}
+}
+
+// EffectiveProviderAuthModeValue returns the persisted provider authentication owner.
+func (m *SessionMeta) EffectiveProviderAuthModeValue() string {
+	if m == nil || m.SessionProviderExecutionState == nil {
+		return ""
+	}
+	return m.EffectiveProviderAuthMode
+}
+
+// SetEffectiveProviderAuthMode updates the optional provider authentication owner.
+func (m *SessionMeta) SetEffectiveProviderAuthMode(mode string) {
+	if m.SessionProviderExecutionState == nil {
+		if mode == "" {
+			return
+		}
+		m.SessionProviderExecutionState = &SessionProviderExecutionState{}
+	}
+	m.EffectiveProviderAuthMode = mode
+	m.clearEmptyProviderExecutionState()
+}
+
+// EffectivePermissionsValue returns the persisted permission mode.
+func (m *SessionMeta) EffectivePermissionsValue() string {
+	if m == nil || m.SessionProviderExecutionState == nil {
+		return ""
+	}
+	return m.EffectivePermissions
+}
+
+// SetEffectivePermissions updates the optional persisted permission mode.
+func (m *SessionMeta) SetEffectivePermissions(permissions string) {
+	if m.SessionProviderExecutionState == nil {
+		if permissions == "" {
+			return
+		}
+		m.SessionProviderExecutionState = &SessionProviderExecutionState{}
+	}
+	m.EffectivePermissions = permissions
+	m.clearEmptyProviderExecutionState()
+}
+
+func (m *SessionMeta) clearEmptyProviderExecutionState() {
+	if m.EffectivePermissions == "" && m.EffectiveProviderAuthMode == "" {
+		m.SessionProviderExecutionState = nil
+	}
+}
+
+// RuntimeFailureValue returns the normalized persisted runtime diagnostic.
+func (m *SessionMeta) RuntimeFailureValue() string {
+	if m == nil || m.SessionRuntimeBindingState == nil {
+		return ""
+	}
+	return SessionRuntimeFailureValue(m.RuntimeFailure)
+}
+
+// SetRuntimeFailure updates the optional runtime diagnostic with value semantics.
+func (m *SessionMeta) SetRuntimeFailure(failure string) {
+	pointer := SessionRuntimeFailurePointer(failure)
+	if m.SessionRuntimeBindingState == nil {
+		if pointer == nil {
+			return
+		}
+		m.SessionRuntimeBindingState = &SessionRuntimeBindingState{}
+	}
+	m.RuntimeFailure = pointer
+	m.clearEmptyRuntimeBindingState()
+}
+
+// RuntimeSelectionValue returns the persisted runtime selection state without exposing nil embedding details.
+func (m *SessionMeta) RuntimeSelectionValue() *SessionRuntimeSelectionState {
+	if m == nil || m.SessionRuntimeBindingState == nil {
+		return nil
+	}
+	return m.RuntimeSelection
+}
+
+// SetRuntimeSelection updates the optional runtime selection state with value semantics.
+func (m *SessionMeta) SetRuntimeSelection(selection *SessionRuntimeSelectionState) {
+	if m.SessionRuntimeBindingState == nil {
+		if selection == nil {
+			return
+		}
+		m.SessionRuntimeBindingState = &SessionRuntimeBindingState{}
+	}
+	m.RuntimeSelection = selection
+	m.clearEmptyRuntimeBindingState()
+}
+
+func (m *SessionMeta) PendingResumeReplayValue() string {
+	if m == nil || m.SessionRuntimeBindingState == nil {
+		return ""
+	}
+	return m.PendingResumeReplay
+}
+
+func (m *SessionMeta) SetPendingResumeReplay(block string) {
+	if m.SessionRuntimeBindingState == nil {
+		if block == "" {
+			return
+		}
+		m.SessionRuntimeBindingState = &SessionRuntimeBindingState{}
+	}
+	m.PendingResumeReplay = block
+	m.clearEmptyRuntimeBindingState()
+}
+
+func (m *SessionMeta) clearEmptyRuntimeBindingState() {
+	if m.RuntimeFailure == nil && m.RuntimeSelection == nil && m.PendingResumeReplay == "" {
+		m.SessionRuntimeBindingState = nil
+	}
+}
+
+// Validate ensures the metadata file remains aligned with the session index schema.
+func (m *SessionMeta) Validate() error {
+	if m == nil {
+		return errors.New("store: session meta is required")
+	}
+	if err := requireField(m.ID, "session id"); err != nil {
+		return err
+	}
+	if err := requireField(m.AgentName, "session agent name"); err != nil {
+		return err
+	}
+	if _, err := m.DatabaseOwner(); err != nil {
+		return err
+	}
+	if err := requireField(m.State, "session state"); err != nil {
+		return err
+	}
+	if m.StopReason != nil {
+		if err := validateSessionStopReason(*m.StopReason); err != nil {
+			return err
+		}
+	}
+	if err := ValidateSessionLineage(m.ID, m.Lineage); err != nil {
+		return err
+	}
+	if err := ValidateSessionLineageForType(m.SessionType, m.Lineage); err != nil {
+		return err
+	}
+	if m.Failure != nil {
+		if err := m.Failure.Validate(); err != nil {
+			return err
+		}
+	}
+	if err := m.Liveness.Validate(); err != nil {
+		return err
+	}
+	if err := validateSessionCreationMetadata(m); err != nil {
+		return err
+	}
+	if err := validateSessionSpeedMetadata(m.Speed, m.SpeedResolution); err != nil {
+		return err
+	}
+	if err := validateSessionRuntime(
+		m.RuntimeStatus,
+		m.RuntimeTransition,
+		m.RuntimeFailureValue(),
+	); err != nil {
+		return err
+	}
+	if err := ValidateSessionRuntimeSelectionState(m.RuntimeSelectionValue()); err != nil {
+		return err
+	}
+	if err := validateSessionAdvertisedCommands(m.AdvertisedCommandsValue()); err != nil {
+		return err
+	}
+	if err := validateSessionSoulProvenance(m.SoulSnapshotID, m.SoulDigest); err != nil {
+		return err
+	}
+	return nil
+}
+
+// validateSessionAdvertisedCommands rejects invalid or duplicate advertised commands.
+func validateSessionAdvertisedCommands(commands []SessionAdvertisedCommand) error {
+	seenCommands := make(map[string]struct{}, len(commands))
+	for _, command := range commands {
+		if err := command.Validate(); err != nil {
+			return err
+		}
+		name := strings.TrimSpace(command.Name)
+		if _, exists := seenCommands[name]; exists {
+			return fmt.Errorf("store: duplicate advertised command %q", name)
+		}
+		seenCommands[name] = struct{}{}
+	}
+	return nil
+}
+
+func validateSessionSpeedMetadata(speed speedpkg.Speed, resolution *speedpkg.Resolution) error {
+	if speed != "" {
+		if _, err := speedpkg.Parse(string(speed)); err != nil {
+			return fmt.Errorf("store: validate session speed: %w", err)
+		}
+	}
+	if resolution == nil {
+		return nil
+	}
+	if err := speedpkg.ValidateResolution(*resolution); err != nil {
+		return fmt.Errorf("store: validate session speed resolution: %w", err)
+	}
+	if speed == "" {
+		return fmt.Errorf("store: session speed resolution requires speed")
+	}
+	if resolution.Requested != speed {
+		return fmt.Errorf(
+			"store: session speed resolution requested %q does not match speed %q",
+			resolution.Requested,
+			speed,
+		)
+	}
+	return nil
+}
+
+func validateSessionCreationMetadata(meta *SessionMeta) error {
+	if err := ValidateSessionACPOptionSelections(meta.ACPOptionsValue()); err != nil {
+		return fmt.Errorf("store: validate session ACP options: %w", err)
+	}
+	identity := SessionCreationIdentity{
+		CreationProfileRef: meta.CreationProfileRef,
+		PolicySpecDigest:   meta.PolicySpecDigest,
+		CreationDigest:     meta.CreationDigest,
+	}
+	identityPresent := meta.CreationProfileRef != "" || meta.PolicySpecDigest != "" || meta.CreationDigest != ""
+	if !identityPresent && meta.CreationProfile == nil && meta.CreationOptions == nil {
+		return nil
+	}
+	if meta.CreationProfile == nil || meta.CreationOptions == nil {
+		return fmt.Errorf("store: session creation profile and options are required with identity")
+	}
+	if err := identity.Validate(); err != nil {
+		return err
+	}
+	profileRef, err := meta.CreationProfile.Ref()
+	if err != nil {
+		return err
+	}
+	if profileRef != identity.CreationProfileRef {
+		return fmt.Errorf("store: session creation profile ref does not match profile body")
+	}
+	policyDigest, err := meta.CreationProfile.PolicySpecDigest()
+	if err != nil {
+		return err
+	}
+	if policyDigest != identity.PolicySpecDigest {
+		return fmt.Errorf("store: session policy digest does not match profile body")
+	}
+	creationDigest, err := meta.CreationProfile.CreationDigest(*meta.CreationOptions)
+	if err != nil {
+		return err
+	}
+	if creationDigest != identity.CreationDigest {
+		return fmt.Errorf("store: session creation digest does not match metadata identity")
+	}
+	return nil
+}

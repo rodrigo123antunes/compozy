@@ -1,0 +1,31 @@
+{
+    "title": "Loop",
+    "pages": [
+        "index",
+        "approve",
+        "cancel",
+        "configure",
+        "create",
+        "delete",
+        "diff",
+        "edit",
+        "events",
+        "fork",
+        "inspect",
+        "list",
+        "nodes",
+        "pause",
+        "request",
+        "requests",
+        "rerun",
+        "respond",
+        "resume",
+        "run",
+        "runs",
+        "status",
+        "turns",
+        "validate",
+        "why",
+        "node"
+    ]
+}

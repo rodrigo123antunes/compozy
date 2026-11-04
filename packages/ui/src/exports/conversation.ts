@@ -1,0 +1,101 @@
+// Conversation and run surfaces: markdown, chat, tool calls.
+export {
+  Markdown,
+  STREAMDOWN_SAFE_CONFIG,
+  type MarkdownProps,
+} from "../components/custom/markdown";
+export {
+  StreamMarkdown,
+  type StreamMarkdownInlineCodeDecorator,
+  type StreamMarkdownLocalLinkComponent,
+  type StreamMarkdownProps,
+} from "../components/custom/stream-markdown";
+export { MarkdownAnchor } from "../components/custom/markdown-prose-parts";
+export {
+  composeMarkdownSlots,
+  type MarkdownSlotPlacement,
+  type StreamMarkdownSlot,
+  type StreamMarkdownSlots,
+} from "../components/custom/markdown-slots";
+export { DescriptionCard, type DescriptionCardProps } from "../components/custom/description-card";
+export {
+  RUN_STATUS_LABEL,
+  RUN_STATUS_TONE,
+  RunCard,
+  type RunCardProps,
+  type RunCardStatus,
+  type RunCardWarning,
+  type RunCardWarningTone,
+} from "../components/custom/run-card";
+export { AgentAvatar, type AgentAvatarProps } from "../components/custom/agent-avatar";
+export {
+  AGENT_AVATAR_STATE_LABEL,
+  type AgentAvatarAppearance,
+  type AgentAvatarBackground,
+  type AgentAvatarState,
+} from "../lib/agent-avatar";
+export {
+  OwnerAvatar,
+  type OwnerAvatarProps,
+  type OwnerAvatarSize,
+} from "../components/custom/owner-avatar";
+export {
+  TranscriptDisclosure,
+  type TranscriptDisclosureProps,
+} from "../components/custom/transcript-disclosure";
+export {
+  ToolCallRow,
+  type ToolCallRowProps,
+  type ToolCallRowSectionProps,
+  type ToolCallStatus,
+} from "../components/custom/tool-call-row";
+export {
+  DiffCard,
+  type DiffCardLine,
+  type DiffCardLineKind,
+  type DiffCardProps,
+} from "../components/custom/diff-card";
+export {
+  ToolCallStatusIcon,
+  type ToolCallStatusIconProps,
+} from "../components/custom/tool-call-status-icon";
+export { Marker, MarkerMeta, type MarkerProps, type MarkerTone } from "../components/custom/marker";
+export { Receipt, type ReceiptProps, type ReceiptTone } from "../components/custom/receipt";
+export {
+  ChoiceFree,
+  ChoiceFreeBar,
+  ChoiceFreeTextarea,
+  ChoiceHint,
+  ChoiceKey,
+  ChoiceList,
+  ChoiceRow,
+} from "../components/custom/choice";
+export { TypingDots, type TypingDotsProps } from "../components/custom/typing-dots";
+export {
+  CodeBlock,
+  CopyIconButton,
+  type CodeBlockDensity,
+  type CodeBlockHighlightState,
+  type CodeBlockProps,
+  type CopyIconButtonProps,
+} from "../components/custom/code-block";
+export {
+  COMPOZY_CODE_DEFAULT_THEME,
+  COMPOZY_CODE_SUPPORTED_LANGUAGES,
+  COMPOZY_CODE_THEMES,
+  normalizeCompozyCodeLanguage,
+  resolveCompozyCodeThemeName,
+  type CodeBlockResolvedTheme,
+  type CodeBlockThemeMode,
+  type CompozyCodeLanguage,
+  type CompozyCodeThemeName,
+} from "../lib/code-theme";
+export {
+  AGENT_SLOT_COUNT,
+  colorsFor,
+  HUMAN_SLOT_COUNT,
+  seed,
+  SYSTEM_SLOT_COUNT,
+  type OwnerColors,
+  type OwnerKind,
+} from "../lib/owner-palette";

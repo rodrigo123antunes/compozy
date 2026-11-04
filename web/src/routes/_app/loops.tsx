@@ -1,0 +1,36 @@
+import { createFileRoute } from "@tanstack/react-router";
+
+import { validateLoopsSearch } from "@/systems/loops";
+
+import type { TopbarRouteContext } from "@/types/topbar";
+import { createOsRouteSync } from "@/systems/os";
+
+export const Route = createFileRoute("/_app/loops")({
+  beforeLoad: (): { topbar: TopbarRouteContext } => ({
+    topbar: { crumb: { label: "Loops", to: "/loops" } },
+  }),
+  validateSearch: validateLoopsSearch,
+  loaderDeps: ({ search }) => ({
+    category: search.category,
+    kind:
+      search.kind === "read-only"
+        ? ("read_only" as const)
+        : search.kind === "workspace"
+          ? ("workspace" as const)
+          : undefined,
+    limit: 50,
+    q: search.q,
+    sort: "name" as const,
+    status: search.status,
+    workspace: search.workspace,
+  }),
+  loader: async ({ context, deps: { workspace, ...filters }, location }) =>
+    location.pathname.split("/").filter(Boolean).length === 1
+      ? (await import("./-loops-preload")).preloadLoopsRoute(
+          context.queryClient,
+          filters,
+          workspace
+        )
+      : undefined,
+  component: createOsRouteSync("loops"),
+});

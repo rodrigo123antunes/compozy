@@ -1,0 +1,97 @@
+package mcp
+
+import extensionprotocol "github.com/compozy/compozy/internal/extensionprotocol"
+
+const (
+	projectionReasonAgentsExcluded     = "agents are outside the approved MCP families"
+	projectionReasonAutomationExcluded = "automation is outside the approved MCP families"
+	projectionReasonModelsExcluded     = "models are outside the approved MCP families"
+	projectionReasonTargetOnly         = "target-only request has no workspace binding"
+)
+
+// Every Host API method must appear here. This table is deliberately explicit so registry drift fails closed.
+var hostAPIProjectionDecisions = map[extensionprotocol.HostAPIMethod]projectionDecision{
+	extensionprotocol.HostAPIMethodSessionsList:          {Publish: true},
+	extensionprotocol.HostAPIMethodSessionsCreate:        {Publish: true},
+	extensionprotocol.HostAPIMethodSessionsArchive:       {Publish: true},
+	extensionprotocol.HostAPIMethodSessionsUnarchive:     {Publish: true},
+	extensionprotocol.HostAPIMethodSessionsPrompt:        {Publish: true},
+	extensionprotocol.HostAPIMethodSessionsRuntimeSet:    {Publish: true},
+	extensionprotocol.HostAPIMethodSessionsRuntimeClear:  {Publish: true},
+	extensionprotocol.HostAPIMethodSessionsInputsList:    {Publish: true},
+	extensionprotocol.HostAPIMethodSessionsInputsReplace: {Publish: true},
+	extensionprotocol.HostAPIMethodSessionsInputsCancel:  {Publish: true},
+	extensionprotocol.HostAPIMethodSessionsInputsPromote: {Publish: true},
+	extensionprotocol.HostAPIMethodSessionsStop:          {Publish: true},
+	extensionprotocol.HostAPIMethodSessionsStatus:        {Publish: true},
+	extensionprotocol.HostAPIMethodSessionsEvents:        {Publish: true},
+	extensionprotocol.HostAPIMethodSessionsSoulRefresh:   {Publish: true},
+	extensionprotocol.HostAPIMethodSessionsHealthGet:     {Publish: true},
+	extensionprotocol.HostAPIMethodSessionsStatusGet:     {Publish: true},
+	extensionprotocol.HostAPIMethodObserveHealth: {
+		Reason: "observe is outside the approved MCP families",
+	},
+	extensionprotocol.HostAPIMethodListLogs: {Reason: "logs are outside the approved MCP families"},
+	extensionprotocol.HostAPIMethodSkillsList: {
+		Reason: "skills are outside the approved MCP families",
+	},
+	extensionprotocol.HostAPIMethodModelsList:              {Reason: projectionReasonModelsExcluded},
+	extensionprotocol.HostAPIMethodModelsRefresh:           {Reason: projectionReasonModelsExcluded},
+	extensionprotocol.HostAPIMethodModelsStatus:            {Reason: projectionReasonModelsExcluded},
+	extensionprotocol.HostAPIMethodAgentsSoulGet:           {Reason: projectionReasonAgentsExcluded},
+	extensionprotocol.HostAPIMethodAgentsSoulValidate:      {Reason: projectionReasonAgentsExcluded},
+	extensionprotocol.HostAPIMethodAgentsSoulPut:           {Reason: projectionReasonAgentsExcluded},
+	extensionprotocol.HostAPIMethodAgentsSoulDelete:        {Reason: projectionReasonAgentsExcluded},
+	extensionprotocol.HostAPIMethodAgentsSoulHistory:       {Reason: projectionReasonAgentsExcluded},
+	extensionprotocol.HostAPIMethodAgentsSoulRollback:      {Reason: projectionReasonAgentsExcluded},
+	extensionprotocol.HostAPIMethodAgentsHeartbeatGet:      {Reason: projectionReasonAgentsExcluded},
+	extensionprotocol.HostAPIMethodAgentsHeartbeatValidate: {Reason: projectionReasonAgentsExcluded},
+	extensionprotocol.HostAPIMethodAgentsHeartbeatPut:      {Reason: projectionReasonAgentsExcluded},
+	extensionprotocol.HostAPIMethodAgentsHeartbeatDelete:   {Reason: projectionReasonAgentsExcluded},
+	extensionprotocol.HostAPIMethodAgentsHeartbeatHistory:  {Reason: projectionReasonAgentsExcluded},
+	extensionprotocol.HostAPIMethodAgentsHeartbeatRollback: {Reason: projectionReasonAgentsExcluded},
+	extensionprotocol.HostAPIMethodAgentsHeartbeatStatus:   {Reason: projectionReasonAgentsExcluded},
+	extensionprotocol.HostAPIMethodAgentsHeartbeatWake:     {Reason: projectionReasonAgentsExcluded},
+	extensionprotocol.HostAPIMethodViewPatch: {
+		Reason: "method requires an extension-owned view session",
+	},
+	extensionprotocol.HostAPIMethodAutomationJobs:           {Reason: projectionReasonAutomationExcluded},
+	extensionprotocol.HostAPIMethodAutomationJobsGet:        {Reason: projectionReasonAutomationExcluded},
+	extensionprotocol.HostAPIMethodAutomationJobsCreate:     {Reason: projectionReasonAutomationExcluded},
+	extensionprotocol.HostAPIMethodAutomationJobsUpdate:     {Reason: projectionReasonAutomationExcluded},
+	extensionprotocol.HostAPIMethodAutomationJobsDelete:     {Reason: projectionReasonAutomationExcluded},
+	extensionprotocol.HostAPIMethodAutomationJobsTrigger:    {Reason: projectionReasonAutomationExcluded},
+	extensionprotocol.HostAPIMethodAutomationJobsRuns:       {Reason: projectionReasonAutomationExcluded},
+	extensionprotocol.HostAPIMethodAutomationTriggers:       {Reason: projectionReasonAutomationExcluded},
+	extensionprotocol.HostAPIMethodAutomationTriggersGet:    {Reason: projectionReasonAutomationExcluded},
+	extensionprotocol.HostAPIMethodAutomationTriggersCreate: {Reason: projectionReasonAutomationExcluded},
+	extensionprotocol.HostAPIMethodAutomationTriggersUpdate: {Reason: projectionReasonAutomationExcluded},
+	extensionprotocol.HostAPIMethodAutomationTriggersDelete: {Reason: projectionReasonAutomationExcluded},
+	extensionprotocol.HostAPIMethodAutomationTriggersRuns:   {Reason: projectionReasonAutomationExcluded},
+	extensionprotocol.HostAPIMethodAutomationTriggersFire:   {Reason: projectionReasonAutomationExcluded},
+	extensionprotocol.HostAPIMethodAutomationRuns:           {Reason: projectionReasonAutomationExcluded},
+	extensionprotocol.HostAPIMethodTasks:                    {Publish: true},
+	extensionprotocol.HostAPIMethodTasksGet:                 {Reason: projectionReasonTargetOnly},
+	extensionprotocol.HostAPIMethodTasksTimeline:            {Reason: projectionReasonTargetOnly},
+	extensionprotocol.HostAPIMethodTasksTree:                {Reason: projectionReasonTargetOnly},
+	extensionprotocol.HostAPIMethodTasksDashboard:           {Publish: true},
+	extensionprotocol.HostAPIMethodTasksInbox:               {Publish: true},
+	extensionprotocol.HostAPIMethodTasksCreate:              {Publish: true},
+	extensionprotocol.HostAPIMethodTasksUpdate:              {Reason: projectionReasonTargetOnly},
+	extensionprotocol.HostAPIMethodTasksCancel:              {Reason: projectionReasonTargetOnly},
+	extensionprotocol.HostAPIMethodTasksRuns:                {Reason: projectionReasonTargetOnly},
+	extensionprotocol.HostAPIMethodTasksRunsGet:             {Reason: projectionReasonTargetOnly},
+	extensionprotocol.HostAPIMethodTasksRunsResult:          {Reason: projectionReasonTargetOnly},
+	extensionprotocol.HostAPIMethodTasksRunsEnqueue:         {Reason: projectionReasonTargetOnly},
+	extensionprotocol.HostAPIMethodTasksRunsStart:           {Reason: projectionReasonTargetOnly},
+	extensionprotocol.HostAPIMethodTasksRunsAttachSession:   {Reason: projectionReasonTargetOnly},
+	extensionprotocol.HostAPIMethodTasksRunsComplete:        {Reason: projectionReasonTargetOnly},
+	extensionprotocol.HostAPIMethodTasksRunsFail:            {Reason: projectionReasonTargetOnly},
+	extensionprotocol.HostAPIMethodTasksRunsCancel:          {Reason: projectionReasonTargetOnly},
+	extensionprotocol.HostAPIMethodResourcesList:            {Publish: true},
+	extensionprotocol.HostAPIMethodResourcesGet:             {Publish: true},
+	extensionprotocol.HostAPIMethodResourcesSnapshot:        {Publish: true},
+	extensionprotocol.HostAPIMethodClarifyAsk: {
+		Reason: "clarify is outside the approved MCP families",
+	},
+}

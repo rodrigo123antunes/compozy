@@ -1,0 +1,206 @@
+import { Activity, AlertCircle } from "@compozy/ui/icons";
+import { useState } from "react";
+
+import {
+  Button,
+  cn,
+  Empty,
+  LiveBadge,
+  PillGroup,
+  Section,
+  Skeleton,
+  SkeletonRegion,
+  Timeline,
+  type PillGroupItem,
+} from "@compozy/ui";
+
+import {
+  humanizeTaskEvent,
+  matchesActivityFilter,
+  TASK_ACTIVITY_FILTERS,
+  type TaskActivityFilter,
+} from "../lib/task-activity-copy";
+import type { TaskTimelineItem } from "../types";
+import { TaskActivityItem } from "./task-activity-item";
+import { TaskTimelineSkeleton } from "./task-loading-skeletons";
+import { TASK_TIMELINE_CARD_CLASS } from "./task-surface-classes";
+
+export interface TaskActivityPanelProps {
+  items: readonly TaskTimelineItem[];
+  isLoading?: boolean;
+  errorMessage?: string | null;
+  isLive?: boolean;
+  onLoadMore?: () => void;
+  canLoadMore?: boolean;
+}
+
+const FILTER_LABEL: Record<TaskActivityFilter, string> = {
+  all: "All",
+  runs: "Runs",
+  reviews: "Reviews",
+  changes: "Changes",
+};
+
+const FILTER_ITEMS: ReadonlyArray<PillGroupItem<TaskActivityFilter>> = TASK_ACTIVITY_FILTERS.map(
+  value => ({
+    value,
+    label: FILTER_LABEL[value],
+    testId: `tasks-activity-filter-${value}`,
+  })
+);
+
+/** The filter pills a loading feed stands in with, one per real filter and as wide as its label. */
+const FILTER_SKELETONS = [
+  { id: "all", width: "w-8" },
+  { id: "runs", width: "w-12" },
+  { id: "reviews", width: "w-16" },
+  { id: "changes", width: "w-16" },
+] as const;
+
+/**
+ * The placeholder twin of the feed: the same section head, with the four filter pills and the
+ * timeline card as blocks. The call site owns the `SkeletonRegion` around it.
+ */
+export function TaskActivityFeedSkeleton() {
+  return (
+    <Section
+      aria-hidden="true"
+      tabs={
+        <div className="flex items-center gap-1">
+          {FILTER_SKELETONS.map(pill => (
+            <Skeleton
+              className={cn("h-(--height-pill-group-segment-sm) rounded-pill", pill.width)}
+              key={pill.id}
+            />
+          ))}
+        </div>
+      }
+    >
+      <div className={TASK_TIMELINE_CARD_CLASS}>
+        <TaskTimelineSkeleton events={5} />
+      </div>
+    </Section>
+  );
+}
+
+function emptyCopyFor(filter: TaskActivityFilter): { title: string; description: string } {
+  if (filter === "reviews") {
+    return {
+      title: "No review activity yet",
+      description: "Reviews appear here when a review policy is on.",
+    };
+  }
+  return {
+    title: "No activity recorded yet",
+    description: "Events land here as this task moves through its runs.",
+  };
+}
+
+/**
+ * Activity tab: humanized newest-first feed with one filter group
+ * (filtering replaces the old grouping modes) and the page's single LiveBadge
+ * while the task stream is attached.
+ *
+ * @see docs/design/opendesign/tasks/TASK-DETAILS-REDESIGN-PLAN.md §4.6
+ */
+export function TaskActivityPanel({
+  items,
+  isLoading = false,
+  errorMessage = null,
+  isLive = false,
+  onLoadMore,
+  canLoadMore = false,
+}: TaskActivityPanelProps) {
+  const [filter, setFilter] = useState<TaskActivityFilter>("all");
+
+  if (isLoading && items.length === 0) {
+    return (
+      <SkeletonRegion
+        className="w-full"
+        data-testid="tasks-activity-loading"
+        label="Loading activity"
+      >
+        <TaskActivityFeedSkeleton />
+      </SkeletonRegion>
+    );
+  }
+
+  if (errorMessage && items.length === 0) {
+    return (
+      <Empty
+        icon={AlertCircle}
+        title="Couldn't load activity"
+        description={errorMessage}
+        data-testid="tasks-activity-error"
+      />
+    );
+  }
+
+  if (items.length === 0) {
+    return (
+      <Empty
+        icon={Activity}
+        title="No activity recorded yet"
+        description="Events land here as this task moves through its runs."
+        data-testid="tasks-activity-empty"
+      />
+    );
+  }
+
+  const visible: Array<{ item: TaskTimelineItem; view: ReturnType<typeof humanizeTaskEvent> }> = [];
+  for (const item of items) {
+    const view = humanizeTaskEvent(item);
+    if (matchesActivityFilter(view, filter)) visible.push({ item, view });
+  }
+  const emptyCopy = emptyCopyFor(filter);
+
+  return (
+    <Section
+      aria-label="Task activity"
+      data-testid="tasks-activity-panel"
+      right={isLive ? <LiveBadge data-testid="tasks-activity-live" /> : undefined}
+      tabs={
+        <PillGroup<TaskActivityFilter>
+          aria-label="Filter activity"
+          data-testid="tasks-activity-filters"
+          items={FILTER_ITEMS}
+          onChange={setFilter}
+          size="sm"
+          value={filter}
+        />
+      }
+    >
+      <div className={TASK_TIMELINE_CARD_CLASS}>
+        {visible.length === 0 ? (
+          <Empty
+            className="pt-2 pb-5"
+            data-testid="tasks-activity-filter-empty"
+            description={emptyCopy.description}
+            icon={Activity}
+            size="compact"
+            title={emptyCopy.title}
+          />
+        ) : (
+          <Timeline ariaLabel="Task activity events">
+            {visible.map(({ item, view }) => (
+              <TaskActivityItem isLive={isLive} item={item} key={item.event_id} view={view} />
+            ))}
+          </Timeline>
+        )}
+      </div>
+      {canLoadMore && onLoadMore ? (
+        <div className="flex items-center justify-center pt-1">
+          <Button
+            data-testid="tasks-activity-load-more"
+            onClick={onLoadMore}
+            size="sm"
+            type="button"
+            variant="neutral"
+          >
+            Load more
+          </Button>
+        </div>
+      ) : null}
+    </Section>
+  );
+}

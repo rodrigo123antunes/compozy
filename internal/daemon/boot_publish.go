@@ -1,0 +1,72 @@
+package daemon
+
+func (d *Daemon) publishBootState(state *bootState) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+
+	d.config = state.cfg
+	d.logger = state.logger
+	d.closeLogger = state.closeLogger
+	d.booting = false
+	d.daemonRuntimeState = daemonRuntimeState{
+		subagents:             state.subagents,
+		lock:                  state.lock,
+		harnessResolver:       state.harnessResolver,
+		registry:              state.registry,
+		profiles:              state.profiles,
+		runtimeWorkers:        state.runtimeWorkers,
+		terminals:             state.terminals,
+		situationContext:      state.situationContext,
+		sessions:              state.sessions,
+		sessionWakeBridge:     state.sessionWakeBridge,
+		sessionMonitors:       state.sessionMonitors,
+		sessionProcesses:      state.sessionProcesses,
+		tasks:                 state.tasks,
+		coordinator:           state.coordinator,
+		spawnReaper:           state.spawnReaper,
+		scheduler:             state.scheduler,
+		gateway:               state.gateway,
+		toolRegistry:          state.toolRegistry,
+		clarify:               state.clarify,
+		hooks:                 state.hooks,
+		extensions:            state.currentExtensionRuntime(),
+		observer:              state.observer,
+		resourceReconcile:     state.resourceReconcile,
+		supportBundles:        state.supportBundles,
+		backgroundUpdates:     state.backgroundUpdates,
+		agentCatalog:          state.agentCatalog,
+		soulCatalog:           state.soulCatalog,
+		heartbeatCatalog:      state.heartbeatCatalog,
+		toolCatalog:           state.toolCatalog,
+		mcpServerCatalog:      state.mcpServerCatalog,
+		loopCatalog:           state.loopCatalog,
+		automation:            state.automation,
+		httpServer:            state.httpServer,
+		udsServer:             state.udsServer,
+		workspaceRuntimeState: newWorkspaceRuntimeState(state.workspaceResolver),
+		worktrees:             state.worktrees,
+		windowManagerStore:    state.windowManagerStore,
+		windowManagers:        state.windowManagers,
+		skillsRegistry:        state.skillsRegistry,
+		modelCatalog:          state.modelCatalog,
+		mcpStdioPool:          state.mcpStdioPool,
+		providerUsage:         state.providerUsage,
+		marketplace:           state.marketplace,
+		skillsCancel:          state.skillsCancel,
+		skillsDone:            state.skillsDone,
+		loopsCancel:           state.loopsCancel,
+		loopsDone:             state.loopsDone,
+		goalOutboxCancel:      state.goalOutboxCancel,
+		goalOutboxDone:        state.goalOutboxDone,
+		effectRelayCancel:     state.effectRelayCancel,
+		effectRelayDone:       state.effectRelayDone,
+		viewPatches:           state.viewPatches,
+		startedAt:             state.startedAt,
+		info:                  state.info,
+	}
+	d.admission.FinishBoot()
+	if !d.readyClosed {
+		close(d.readyCh)
+		d.readyClosed = true
+	}
+}

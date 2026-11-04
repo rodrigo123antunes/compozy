@@ -1,0 +1,461 @@
+// Package session orchestrates Compozy session lifecycle around ACP-backed agents.
+package session
+
+import (
+	"context"
+	"errors"
+	"strings"
+	"sync"
+	"time"
+
+	"github.com/compozy/compozy/internal/acp"
+	commandpkg "github.com/compozy/compozy/internal/command"
+	compozyconfig "github.com/compozy/compozy/internal/config"
+	"github.com/compozy/compozy/internal/resources"
+	skillspkg "github.com/compozy/compozy/internal/skills"
+	"github.com/compozy/compozy/internal/store"
+	"github.com/compozy/compozy/internal/subprocess"
+	"github.com/compozy/compozy/internal/toolruntime"
+	workspacepkg "github.com/compozy/compozy/internal/workspace"
+)
+
+// TurnSource classifies the origin of a prompt turn inside the daemon runtime.
+type TurnSource string
+
+const (
+	TurnSourceUser      TurnSource = TurnSource(acp.PromptTurnSourceUser)
+	TurnSourceSynthetic TurnSource = TurnSource(acp.PromptTurnSourceSynthetic)
+)
+
+// PromptOpts carries per-turn metadata through the session prompt pipeline.
+type PromptOpts struct {
+	Delivery        PromptDelivery
+	Message         string
+	TurnSource      TurnSource
+	PromptMeta      acp.PromptMeta
+	DeliveryContext context.Context
+	PrepareDelivery PromptDeliveryPreparer
+}
+
+// PromptDelivery controls context delivery for a prompt turn.
+type PromptDelivery string
+
+const (
+	PromptDeliveryNormal       PromptDelivery = ""
+	PromptDeliveryMaintenance  PromptDelivery = "maintenance"
+	PromptDeliveryAgentCommand PromptDelivery = "agent_command"
+)
+
+// PromptDeliveryInfo identifies a prompt whose agent-event stream is ready to start.
+type PromptDeliveryInfo struct {
+	SessionID string
+	TurnID    string
+}
+
+// PromptDeliveryPreparer runs after the provider accepts a prompt and before its first event is pumped.
+type PromptDeliveryPreparer func(context.Context, PromptDeliveryInfo) error
+
+// WindowReconciler removes durable session windows after a session
+// deletion has committed its catalog mutation.
+type WindowReconciler interface {
+	ReconcileDeletedSession(ctx context.Context, profileID, workspaceID, sessionID string) error
+}
+
+// PromptRunIdentity is the complete authority tuple for one active prompt run.
+type PromptRunIdentity struct {
+	TurnID      string
+	WorkspaceID string
+	ProfileID   string
+	SessionID   string
+	RunID       string
+	Generation  int64
+}
+
+// TurnEndNotifier is invoked once after a prompt run finishes dispatching.
+type TurnEndNotifier func(context.Context, PromptRunIdentity)
+
+// PromptInputAugmenter can add bounded daemon-local context before prompt dispatch.
+type PromptInputAugmenter func(ctx context.Context, session *Session, message string) (string, error)
+
+// CommandService projects and expands slash commands for one concrete session.
+type CommandService interface {
+	Catalog(
+		ctx context.Context,
+		info *Info,
+		agent compozyconfig.AgentDef,
+	) (commandpkg.Catalog, error)
+	Expand(
+		ctx context.Context,
+		info *Info,
+		agent compozyconfig.AgentDef,
+		invocations []commandpkg.Invocation,
+		message string,
+	) (string, error)
+}
+
+// AgentArtifacts returns an agent definition and resource ownership.
+type AgentArtifacts struct {
+	Agent               compozyconfig.AgentDef
+	ResourceID          string
+	OwnerKind           string
+	OwnerID             string
+	Scope               resources.ResourceScope
+	PackageOwned        bool
+	SoulSourcePath      string
+	SoulBody            string
+	HeartbeatSourcePath string
+	HeartbeatBody       string
+}
+
+// AgentArtifactResolver resolves agent provenance when available.
+type AgentArtifactResolver interface {
+	ResolveAgentArtifacts(name string, resolved *workspacepkg.ResolvedWorkspace) (AgentArtifacts, error)
+}
+
+func normalizeTurnSource(source TurnSource) TurnSource {
+	switch TurnSource(strings.TrimSpace(string(source))) {
+	case "", TurnSourceUser:
+		return TurnSourceUser
+	case TurnSourceSynthetic:
+		return TurnSourceSynthetic
+	default:
+		return ""
+	}
+}
+
+// AgentProcess is the session-owned handle for a running agent process.
+type AgentProcess struct {
+	PID         int
+	AgentName   string
+	Command     string
+	Args        []string
+	Cwd         string
+	SessionID   string
+	StartedAt   time.Time
+	KernelToken string
+
+	capsMu              sync.RWMutex
+	caps                acp.Caps
+	done                <-chan struct{}
+	waitFn              func() error
+	stderrFn            func() string
+	exitStatusFn        func() (subprocess.ExitStatus, bool)
+	healthStateFn       func() subprocess.HealthState
+	capsSnapshotFn      func() acp.Caps
+	pendingPermissionFn func() bool
+	approvePermissionFn func(context.Context, acp.ApproveRequest) error
+	requestPermissionFn func(context.Context, acp.RequestPermissionRequest) (acp.RequestPermissionResponse, error)
+	toolHostFn          func() acp.ToolHost
+	toolHost            acp.ToolHost
+	native              any
+	waitOverrideMu      sync.RWMutex
+	waitErrOverride     error
+}
+
+// AgentProcessOptions defines the exported fields and lifecycle hooks needed to construct an AgentProcess.
+type AgentProcessOptions struct {
+	PID               int
+	AgentName         string
+	Command           string
+	Args              []string
+	Cwd               string
+	SessionID         string
+	Caps              acp.Caps
+	StartedAt         time.Time
+	KernelToken       string
+	Done              <-chan struct{}
+	Wait              func() error
+	Stderr            func() string
+	ExitStatus        func() (subprocess.ExitStatus, bool)
+	HealthState       func() subprocess.HealthState
+	PendingPermission func() bool
+	ApprovePermission func(context.Context, acp.ApproveRequest) error
+	RequestPermission func(context.Context, acp.RequestPermissionRequest) (acp.RequestPermissionResponse, error)
+	CapsSnapshot      func() acp.Caps
+	ToolHost          acp.ToolHost
+}
+
+// NewAgentProcess constructs an AgentProcess for custom AgentDriver implementations.
+func NewAgentProcess(opts AgentProcessOptions) *AgentProcess {
+	done := opts.Done
+	if done == nil {
+		ch := make(chan struct{})
+		close(ch)
+		done = ch
+	}
+
+	waitFn := opts.Wait
+	if waitFn == nil {
+		waitFn = func() error {
+			<-done
+			return nil
+		}
+	}
+
+	stderrFn := opts.Stderr
+	if stderrFn == nil {
+		stderrFn = func() string { return "" }
+	}
+
+	return &AgentProcess{
+		PID:                 opts.PID,
+		AgentName:           opts.AgentName,
+		Command:             opts.Command,
+		Args:                append([]string(nil), opts.Args...),
+		Cwd:                 opts.Cwd,
+		SessionID:           opts.SessionID,
+		caps:                acp.CloneCaps(opts.Caps),
+		StartedAt:           opts.StartedAt,
+		KernelToken:         opts.KernelToken,
+		done:                done,
+		waitFn:              waitFn,
+		stderrFn:            stderrFn,
+		exitStatusFn:        opts.ExitStatus,
+		healthStateFn:       opts.HealthState,
+		capsSnapshotFn:      opts.CapsSnapshot,
+		pendingPermissionFn: opts.PendingPermission,
+		approvePermissionFn: opts.ApprovePermission,
+		requestPermissionFn: opts.RequestPermission,
+		toolHost:            opts.ToolHost,
+	}
+}
+
+// Done reports when the underlying runtime process exits.
+func (p *AgentProcess) Done() <-chan struct{} {
+	return p.done
+}
+
+// Wait blocks until the runtime process exits and returns its terminal error state.
+func (p *AgentProcess) Wait() error {
+	<-p.Done()
+	waitErr := p.waitFn()
+	p.waitOverrideMu.RLock()
+	override := p.waitErrOverride
+	p.waitOverrideMu.RUnlock()
+	return errors.Join(waitErr, override)
+}
+
+// Stderr returns any captured stderr output for the runtime process.
+func (p *AgentProcess) Stderr() string {
+	return p.stderrFn()
+}
+
+// ExitStatus returns the stable OS exit diagnostics exposed by the runtime process.
+func (p *AgentProcess) ExitStatus() (subprocess.ExitStatus, bool) {
+	if p == nil || p.exitStatusFn == nil {
+		return subprocess.ExitStatus{}, false
+	}
+	return p.exitStatusFn()
+}
+
+// HealthState returns the latest runtime health snapshot when the driver
+// exposes subprocess health monitoring.
+func (p *AgentProcess) HealthState() (subprocess.HealthState, bool) {
+	if p == nil || p.healthStateFn == nil {
+		return subprocess.HealthState{}, false
+	}
+	return p.healthStateFn(), true
+}
+
+// CapsSnapshot returns the latest ACP capability/config snapshot for this process.
+func (p *AgentProcess) CapsSnapshot() acp.Caps {
+	if p == nil {
+		return acp.Caps{}
+	}
+	if p.capsSnapshotFn != nil {
+		return acp.CloneCaps(p.capsSnapshotFn())
+	}
+	p.capsMu.RLock()
+	defer p.capsMu.RUnlock()
+	return acp.CloneCaps(p.caps)
+}
+
+func (p *AgentProcess) setCaps(caps acp.Caps) {
+	if p == nil {
+		return
+	}
+	p.capsMu.Lock()
+	p.caps = acp.CloneCaps(caps)
+	p.capsMu.Unlock()
+}
+
+// HasPendingPermission reports whether the runtime is waiting for an
+// interactive permission decision.
+func (p *AgentProcess) HasPendingPermission() bool {
+	return p != nil && p.pendingPermissionFn != nil && p.pendingPermissionFn()
+}
+
+// ToolHost returns the local tool host when the process exposes one.
+func (p *AgentProcess) ToolHost() acp.ToolHost {
+	if p == nil {
+		return nil
+	}
+	if p.toolHostFn != nil {
+		return p.toolHostFn()
+	}
+	return p.toolHost
+}
+
+// ApprovePermission resolves one pending interactive permission request.
+func (p *AgentProcess) ApprovePermission(ctx context.Context, req acp.ApproveRequest) error {
+	if p.approvePermissionFn == nil {
+		return errors.New("session: permission approval is not supported")
+	}
+	return p.approvePermissionFn(ctx, req)
+}
+
+// RequestPermission asks the active runtime permission path for a tool approval decision.
+func (p *AgentProcess) RequestPermission(
+	ctx context.Context,
+	req acp.RequestPermissionRequest,
+) (acp.RequestPermissionResponse, error) {
+	if p.requestPermissionFn == nil {
+		return acp.RequestPermissionResponse{}, errors.New("session: permission request is not supported")
+	}
+	return p.requestPermissionFn(ctx, req)
+}
+
+func (p *AgentProcess) setWaitErrorOverride(err error) {
+	if p == nil {
+		return
+	}
+	p.waitOverrideMu.Lock()
+	defer p.waitOverrideMu.Unlock()
+	p.waitErrOverride = err
+}
+
+func wrapACPProcess(proc *acp.AgentProcess) *AgentProcess {
+	if proc == nil {
+		return nil
+	}
+
+	return &AgentProcess{
+		PID:                 proc.PID,
+		AgentName:           proc.AgentName,
+		Command:             proc.Command,
+		Args:                append([]string(nil), proc.Args...),
+		Cwd:                 proc.Cwd,
+		SessionID:           proc.SessionID,
+		caps:                proc.CapsSnapshot(),
+		StartedAt:           proc.StartedAt,
+		KernelToken:         proc.KernelToken,
+		done:                proc.Done(),
+		waitFn:              proc.Wait,
+		stderrFn:            proc.Stderr,
+		exitStatusFn:        proc.ExitStatus,
+		healthStateFn:       proc.HealthState,
+		capsSnapshotFn:      proc.CapsSnapshot,
+		pendingPermissionFn: proc.HasPendingPermission,
+		approvePermissionFn: func(ctx context.Context, req acp.ApproveRequest) error {
+			if err := ctx.Err(); err != nil {
+				return err
+			}
+			return proc.ResolvePermission(req)
+		},
+		requestPermissionFn: func(
+			ctx context.Context,
+			req acp.RequestPermissionRequest,
+		) (acp.RequestPermissionResponse, error) {
+			if err := ctx.Err(); err != nil {
+				return acp.RequestPermissionResponse{}, err
+			}
+			return proc.RequestPermission(ctx, req)
+		},
+		toolHostFn: proc.ToolHost,
+		native:     proc,
+	}
+}
+
+// AgentDriver defines the ACP functionality consumed by the session manager.
+type AgentDriver interface {
+	Start(ctx context.Context, opts acp.StartOpts) (*AgentProcess, error)
+	Prompt(ctx context.Context, proc *AgentProcess, req acp.PromptRequest) (<-chan acp.AgentEvent, error)
+	Cancel(ctx context.Context, proc *AgentProcess) error
+	Stop(ctx context.Context, proc *AgentProcess) error
+}
+
+// RuntimeConfigurator is the optional driver surface for applying mutable ACP
+// settings at a prompt boundary without replacing the process.
+type RuntimeConfigurator interface {
+	ConfigureRuntime(ctx context.Context, proc *AgentProcess, config acp.RuntimeConfig) error
+}
+
+// StartupPromptReplacer is the optional driver surface for replacing startup guidance
+// that a live process has not delivered yet, after a live runtime switch rebuilt it.
+type StartupPromptReplacer interface {
+	ReplacePendingStartupPrompt(proc *AgentProcess, prompt string, manifest acp.StartupManifest) bool
+}
+
+// ForkDriver is the optional driver surface for ACP session/fork on a bound process.
+// The clone's traffic never reaches the process's bound session (ADR-003).
+type ForkDriver interface {
+	ForkSession(ctx context.Context, proc *AgentProcess, cwd string) (acp.ForkSessionResult, error)
+}
+
+// ErrScopedInterruptNotFound reports that no registered tool process matched a scoped interrupt.
+var ErrScopedInterruptNotFound = toolruntime.ErrProcessNotFound
+
+// ScopedInterrupter is the optional process-scoped interrupt surface for drivers.
+type ScopedInterrupter interface {
+	Interrupt(ctx context.Context, sessionID string, turnID string) (toolruntime.InterruptReport, error)
+}
+
+// EventRecorder is the per-session storage surface consumed by session/.
+type EventRecorder = store.EventRecorder
+
+// EventReadCloser is the read-only per-session storage surface consumed by query paths.
+type EventReadCloser = store.EventReadCloser
+
+// Notifier fans out session lifecycle and prompt events to downstream observers.
+type Notifier interface {
+	OnSessionCreated(ctx context.Context, session *Session)
+	OnSessionStopped(ctx context.Context, session *Session)
+	OnAgentEvent(ctx context.Context, sessionID string, event any)
+}
+
+// FinalizationNotifier is an optional lifecycle seam invoked after the process
+// stop, but before the recorder closes and the durable ledger is materialized.
+type FinalizationNotifier interface {
+	OnSessionFinalizing(ctx context.Context, session *Session)
+}
+
+// AgentEventNotifier is an optional notifier extension that receives the
+// active session alongside streamed agent events.
+type AgentEventNotifier interface {
+	OnAgentEventForSession(ctx context.Context, session *Session, event any)
+}
+
+// PromptAssembler assembles the prompt context for a new session start.
+type PromptAssembler interface {
+	Assemble(
+		ctx context.Context,
+		agent compozyconfig.AgentDef,
+		workspace *workspacepkg.ResolvedWorkspace,
+	) (string, error)
+}
+
+// AgentResolver resolves agent definitions from the daemon-authoritative catalog.
+type AgentResolver interface {
+	ResolveAgent(name string, resolved *workspacepkg.ResolvedWorkspace) (compozyconfig.AgentDef, error)
+}
+
+// AgentCatalogResolver enumerates the same scoped definitions used for target resolution.
+type AgentCatalogResolver interface {
+	AgentResolver
+	ListAgentDefinitions(resolved *workspacepkg.ResolvedWorkspace) []compozyconfig.AgentDef
+}
+
+// SkillRegistry resolves the active skill set for a workspace during session start.
+type SkillRegistry interface {
+	ForWorkspace(ctx context.Context, resolved *workspacepkg.ResolvedWorkspace) ([]*skillspkg.Skill, error)
+	ForAgentDef(
+		ctx context.Context,
+		resolved *workspacepkg.ResolvedWorkspace,
+		agent compozyconfig.AgentDef,
+	) ([]*skillspkg.Skill, error)
+}
+
+// MCPResolver resolves skill-declared MCP servers into runtime config entries.
+type MCPResolver interface {
+	Resolve(skills []*skillspkg.Skill) []compozyconfig.MCPServer
+}

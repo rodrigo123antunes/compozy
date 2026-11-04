@@ -1,0 +1,272 @@
+package settings
+
+import (
+	"context"
+	"errors"
+	"fmt"
+
+	compozyconfig "github.com/compozy/compozy/internal/config"
+	workspacepkg "github.com/compozy/compozy/internal/workspace"
+)
+
+const (
+	sectionsTimeoutKey = "timeout"
+)
+
+const (
+	sectionsDefaultsKey               = "defaults"
+	sectionsEnabledKey                = "enabled"
+	sectionsExtensionsKey             = "extensions"
+	sectionsTrustKey                  = "trust"
+	sectionsSourcesKey                = "sources"
+	sectionsGitHubKey                 = "github"
+	sectionsGitKey                    = "git"
+	sectionsDevKey                    = "dev"
+	sectionsHTTPKey                   = "http"
+	sectionsMarketplaceKey            = "marketplace"
+	sectionsMaxKey                    = "max"
+	sectionsModelKey                  = "model"
+	sectionsModeKey                   = "mode"
+	sectionsNoChangesValue            = "no changes"
+	sectionsOperatorWriteRateLimitKey = "operator_write_rate_limit"
+	sectionsProviderKey               = "provider"
+	sectionsReasoningEffortKey        = "reasoning_effort"
+	sectionsSpeedKey                  = "speed"
+	sectionsACPOptionsKey             = "acp_options"
+	sectionsFallbackChainKey          = "fallback_chain"
+	sectionsQueueKey                  = "queue"
+	sectionsResourcesKey              = "resources"
+	sectionsRestartKey                = "restart"
+	sectionsSessionKey                = "session"
+	sectionsSnapshotRateLimitKey      = "snapshot_rate_limit"
+	sectionsTranscriptsKey            = "transcripts"
+	sectionsWindowKey                 = "window"
+)
+
+func (s *service) GetSection(ctx context.Context, req SectionRequest) (SectionEnvelope, error) {
+	if req.Section == SectionAttention {
+		return s.getAttentionSection(ctx, req)
+	}
+	scope, workspaceID, agentName, err := s.resolveSectionScope(req.Section, req.Scope, req.WorkspaceID, req.AgentName)
+	if err != nil {
+		return SectionEnvelope{}, fmt.Errorf("settings: get section %q: %w", req.Section, err)
+	}
+
+	cfg, resolved, err := s.loadConfig(ctx, scope, workspaceID, req.ProfileName)
+	if err != nil {
+		return SectionEnvelope{}, fmt.Errorf("settings: load section %q config: %w", req.Section, err)
+	}
+
+	envelope := newSectionEnvelope(req.Section, scope, workspaceID, agentName)
+	envelope.ProfileName = req.ProfileName
+	envelope.ClientID = req.ClientID
+	envelope.ClientProfile = req.ClientProfile
+	if err := s.populateSectionEnvelope(ctx, &envelope, &cfg, resolved); err != nil {
+		return SectionEnvelope{}, err
+	}
+
+	return envelope, nil
+}
+
+func (s *service) UpdateSection(ctx context.Context, req SectionUpdateRequest) (MutationResult, error) {
+	if req.Section == SectionSkills {
+		if req.Skills == nil && req.SkillSourcesOverride == nil {
+			return MutationResult{}, validationError(errors.New("settings: skills section payload is required"))
+		}
+		result, err := s.updateSkillsSection(ctx, req)
+		return s.finalizeSectionUpdate(ctx, result, err)
+	}
+
+	result, err := s.updateConfigBackedSection(ctx, req)
+	return s.finalizeSectionUpdate(ctx, result, err)
+}
+
+func (s *service) resolveSectionScope(
+	section SectionName,
+	scope ScopeKind,
+	workspaceID string,
+	agentName string,
+) (ScopeKind, string, string, error) {
+	normalizedScope, normalizedWorkspaceID, err := s.normalizeReadScope(scope, workspaceID)
+	if err != nil {
+		return "", "", "", err
+	}
+	normalizedAgentName, err := normalizeAgentName(agentName)
+	if err != nil {
+		return "", "", "", err
+	}
+	if err := validateSectionScope(section, normalizedScope, normalizedAgentName); err != nil {
+		return "", "", "", err
+	}
+	return normalizedScope, normalizedWorkspaceID, normalizedAgentName, nil
+}
+
+func validateSectionScope(section SectionName, scope ScopeKind, agentName string) error {
+	if section == SectionRoles || section == SectionPersona || section == SectionWindowManager ||
+		section == SectionCmdPalette {
+		if scope == ScopeAgent {
+			return conflictError(
+				fmt.Errorf("settings: section %q does not support %s scope", section, scope),
+			)
+		}
+		return nil
+	}
+	if section != SectionSkills && scope != ScopeUser {
+		return conflictError(
+			fmt.Errorf("settings: section %q does not support %s scope", section, scope),
+		)
+	}
+	if section != SectionSkills {
+		return nil
+	}
+	if scope == ScopeAgent && agentName == "" {
+		return validationError(errors.New("settings: agent scope requires agent_name"))
+	}
+	return nil
+}
+
+func newSectionEnvelope(
+	section SectionName,
+	scope ScopeKind,
+	workspaceID string,
+	agentName string,
+) SectionEnvelope {
+	return SectionEnvelope{
+		Section:         section,
+		Scope:           scope,
+		WorkspaceID:     workspaceID,
+		AgentName:       agentName,
+		AvailableScopes: []ScopeKind{ScopeUser},
+	}
+}
+
+func (s *service) populateSectionEnvelope(
+	ctx context.Context,
+	envelope *SectionEnvelope,
+	cfg *compozyconfig.Config,
+	resolved *workspacepkg.ResolvedWorkspace,
+) error {
+	if populateSimpleSectionEnvelope(envelope, cfg) {
+		if envelope.Shell != nil {
+			revision, err := s.shellScopeRevision(ctx)
+			if err != nil {
+				return err
+			}
+			envelope.Shell.ScopeRevision = revision
+		}
+		return nil
+	}
+	switch envelope.Section {
+	case SectionGeneral:
+		envelope.Scope = ScopeUser
+		section, err := s.buildGeneralSection(ctx, cfg)
+		if err != nil {
+			return err
+		}
+		envelope.General = &section
+	case SectionSkills:
+		envelope.AvailableScopes = []ScopeKind{ScopeUser, ScopeProfile, ScopeWorkspace, ScopeAgent}
+		section, err := s.buildSkillsSection(
+			ctx,
+			cfg,
+			resolved,
+			envelope.Scope,
+			envelope.ProfileName,
+			envelope.AgentName,
+		)
+		if err != nil {
+			return err
+		}
+		envelope.Skills = &section
+	case SectionAutomation:
+		envelope.Scope = ScopeUser
+		section, err := s.buildAutomationSection(ctx, cfg)
+		if err != nil {
+			return err
+		}
+		envelope.Automation = &section
+	case SectionWindowManager:
+		envelope.AvailableScopes = []ScopeKind{ScopeUser, ScopeWorkspace}
+		section, err := s.buildWindowManagerSection(
+			ctx,
+			cfg,
+			envelope.WorkspaceID,
+			envelope.ClientID,
+			envelope.ClientProfile,
+		)
+		if err != nil {
+			return err
+		}
+		envelope.WindowManager = &section
+	case SectionObservability:
+		envelope.Scope = ScopeUser
+		section, err := s.buildObservabilitySection(ctx, cfg)
+		if err != nil {
+			return err
+		}
+		envelope.Observability = &section
+	case SectionHooksExtensions:
+		envelope.Scope = ScopeUser
+		section, err := s.buildHooksExtensionsSection(ctx, cfg)
+		if err != nil {
+			return err
+		}
+		envelope.HooksExtensions = &section
+	default:
+		return notFoundError(fmt.Errorf("settings: unknown section %q", envelope.Section))
+	}
+	return nil
+}
+
+func populateSimpleSectionEnvelope(envelope *SectionEnvelope, cfg *compozyconfig.Config) bool {
+	switch envelope.Section {
+	case SectionMarketplace:
+		value := cfg.Marketplace.Catalog
+		envelope.Marketplace = &value
+	case SectionPersona:
+		envelope.AvailableScopes = []ScopeKind{ScopeUser, ScopeProfile, ScopeWorkspace}
+		section := PersonaSection{Config: cfg.Defaults}
+		envelope.Persona = &section
+	case SectionRoles:
+		envelope.AvailableScopes = []ScopeKind{ScopeUser, ScopeWorkspace}
+		section := RolesSection{Config: compozyconfig.CloneRolesConfig(&cfg.Roles)}
+		envelope.Roles = &section
+	case SectionGateway:
+		envelope.Scope = ScopeUser
+		section := GatewaySection{Config: cfg.Gateway}
+		envelope.Gateway = &section
+	case SectionCmdPalette:
+		envelope.AvailableScopes = []ScopeKind{ScopeUser, ScopeProfile, ScopeWorkspace}
+		section := buildCmdPaletteSection(cfg)
+		envelope.CmdPalette = &section
+	case SectionProviderUsage:
+		section := ProviderUsageSection{Config: cfg.ProviderUsage.Clone()}
+		envelope.ProviderUsage = &section
+	case SectionShell:
+		envelope.Scope = ScopeUser
+		section := buildShellSection(cfg)
+		envelope.Shell = &section
+	default:
+		return false
+	}
+	return true
+}
+
+func (s *service) finalizeSectionUpdate(
+	ctx context.Context,
+	result MutationResult,
+	err error,
+) (MutationResult, error) {
+	if err != nil {
+		return MutationResult{}, err
+	}
+	if result.Scope == ScopeWorkspace {
+		if invalidator, ok := s.workspaceResolver.(interface{ Invalidate(string) }); ok {
+			invalidator.Invalidate(result.WorkspaceID)
+		}
+	}
+	if emitErr := s.emitSettingsChanged(ctx, result, "patch"); emitErr != nil {
+		return MutationResult{}, emitErr
+	}
+	return result, nil
+}

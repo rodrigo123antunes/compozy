@@ -1,0 +1,389 @@
+# Extensions
+
+## Contents
+
+- Extension kits
+- Packaged inputs and server auth
+- Built-in open design
+- Portable Agent Plugins
+- Install trust
+- Authoring and dev loop
+- Instance scoping
+- Dev overlay versus published install
+- Reload, last-good, and failure states
+- Logs and watch
+- Hooks
+
+## Extension Kits
+
+An extension kit is the static resource set shipped by one extension: skills, agents, Loops, automation jobs and triggers, layouts, and MCP sidecars. The manifest owns the paths. Installation enables the kit by default. Per-profile enablement and resource placement decide what is published in each profile.
+
+Declare static paths as tables, for example `[[resources.agents]]` with `path = "agents"` and an
+optional `profile`. Previous string arrays are normalized during loading through v0.3.0-beta.30;
+builds emit tables. Convert handwritten strings to `{ path = "..." }` entries before their removal
+in v0.3.0-beta.31. Omit `profile` to retain the previous all-profile visibility.
+
+Inspect the extension's shipped-versus-live view with `compozy extension inventory <name> -o json`, `GET /api/extensions/{name}/inventory`, or `compozy__extensions_inventory`. Use `--profile <name>` on the CLI; HTTP/UDS accepts `?workspace=<id>&profile=<name>` to inspect a particular instance. Native inventory uses the caller's trusted workspace and profile. Use `POST /api/extensions/preview-install` before installation to review declared profile creation or binding, credential requirements, placements, and any Gateway digest without changing state.
+
+In extension detail, `created_by_extension: true` confirms that this extension created the current
+profile ID. `false` covers existing-profile bindings and historical declarations whose creator was
+not recorded. An upgrade preserves those markers without inferring authorship or reseeding defaults.
+
+Extensions declare required environment variable names. Bind an existing Vault reference with `compozy extension secrets bind <name> --env <key> --vault-ref <ref> --profile <profile>`, or set a value through stdin or a hidden prompt. Set, bind, list, and unset resolve and transport the selected profile; without `--profile`, they use the normal profile-resolution chain. Add `--remote-header <server>:<header>` to bind that value to one declared remote MCP header. Reads expose bound key, server, and header names only, never values or Vault references.
+
+If a candidate extension changes its normalized gateway permission requirement, install or update returns `extension_gateway_confirmation_required` with the exact digest before changing package state. Inspect that digest and retry with `--confirm-gateway-requirement <digest>` or the equivalent `confirm_gateway_digest` request field. Do not confirm a stale or reconstructed digest. Confirmation records consent to those exact gateway permissions.
+
+A subprocess extension that publishes layouts directly declares the generic Host API permissions and `window_layouts` family. `resources/snapshot` is complete desired state for that extension source, not an append call: advance `source_version`, include every record that remains owned, and let omission delete stale records. Codec, kind, scope, and workspace-binding failure reject the snapshot atomically.
+
+Workspace-bound subprocesses keep that binding when running under a named profile. Domain Host API
+calls such as `tasks/create` inherit the workspace and profile; an explicit global scope or foreign
+workspace is refused. Resource calls retain their complete `workspace_profile` scope for resource
+kernel authorization. A tool approval authorizes the pending command without widening these scopes.
+
+Task create and detail responses preserve `draft` and the saved `wake_creator` setting. Draft tasks
+require publication before execution; `wake_creator` describes whether completion should notify
+their creator. Omitting that creation option keeps its default of `true`. Fresh detail reads also
+carry the persisted event cursor, current run, direct/inherited pause, block reasons and attention
+state. Read the fresh detail when following events; the creation result can precede its audit append.
+
+## Packaged Inputs And Server Auth
+
+Native manifests declare install values with `[[inputs]]`: unique `id`, `prompt`,
+`type = string|identifier|boolean|secret`, `required`, and `binding = {type, name}`.
+An `env` binding must match a server's `env` or `secret_env` key; the map value is the input id.
+A `url_query` binding must match a parameter declared in a remote server URL. Secrets require
+`secret_env`, cannot bind URLs, and cannot have defaults. Boolean defaults are booleans; other
+non-secret defaults are strings. Values are NUL-free and at most 8 KiB; identifier values use
+URL-safe unreserved characters.
+
+`[resources.mcp_servers.<name>.auth]` accepts `method = "oauth"`,
+`registration = "dynamic"`, optional `issuer_url`, and scopes. The issuer must be advertised by
+the protected resource. `default_scope` supplies the installation default and never expands an
+existing installation. Validate the package with `compozy extension validate <directory>`.
+
+`compozy-catalog publish` derives version, inputs, archive and digest from the package. It emits
+v3 extensions and presets only; change `catalog/sources.json` or the package, not generated feed JSON.
+The site reads the same v3 catalog. Root feeds and v2 fallback are removed.
+
+Install selectors are `scope = global|workspace`, `workspace_id` (registered ID), and `profile`
+(name) in HTTP/UDS/native requests. CLI equivalents are `--scope`, `--workspace <name|path|id>`,
+and `--profile`; the explicit flag wins over `COMPOZY_PROFILE`. An operator omitting the profile
+keeps all-profile installation. Agents remain bound to their trusted workspace/profile.
+With neither scope nor workspace selected, operators use the manifest servers' common default
+(`global` when undeclared); mixed defaults require an explicit scope. A workspace default requires
+trusted workspace context or an explicit workspace selector. Inputs and vault bindings use that exact cell. A `vault_ref` input must already belong to the same
+extension/profile/workspace under `vault:extensions/`; manual MCP references are not imported.
+
+Install typed values with `compozy extension install compozy/supabase --input project_ref=my-project`.
+Use `--input-file` for structured value/vault_ref envelopes; existing scoped extension-secret refs
+stay in that instance. The CLI derives types from the manifest. Required-field failures include
+`inputs` and candidate `input_definitions` in `extension_inputs_required`; prompt for those fields
+and retry the same scoped request. Inputs remain isolated by profile: an unconfigured profile
+publishes no packaged MCPs and does not block installation or restart in a configured profile.
+`extension_input_invalid` names the invalid input_id, and
+`extension_source_changed` requires reviewing the current artifact before retrying.
+
+Update requests accept the same scope/workspace/profile selectors. CLI `extension update` uses
+`--scope`, `--workspace`, and `--profile` (or `COMPOZY_PROFILE`); `--all` filters to that selected
+installation scope/profile. HTTP/UDS and `compozy__extensions_update` also accept typed `inputs`
+for one named extension. Updates retain every attachment and its creation time; package bytes are
+shared, while supplied inputs and rollback before-images address only the selected cell. A workspace
+caller cannot mutate an inherited global attachment as though it belonged to the workspace.
+Direct GitHub updates retain their acquisition origin and do not depend on the curated catalog.
+
+## Built-in Open Design
+
+The bundled `open-design` extension creates or binds the `open-design` profile. Its default agent
+is `open-design-designer`; `open-design-critic` provides independent review. The profile includes
+`open-design`, `open-design-review`, `open-design-browser`, and `open-design-setup` skills, the `open-design-review`
+Loop, and the read-only `ext__open_design__lint_artifact` tool. Two local references cover craft
+and the four artifact formats; there is no upstream library, download, or synchronization step.
+
+Use the designer for interface, site, HTML-slide, or visual-document requests. A short brief or a
+`_uiux.md` is valid. Outputs stay under the active workspace's `docs/design/`, with explicit paths
+preferred; the user opens HTML directly. This port uses native CompozyOS execution and does not
+require OpenDesign's app, daemon, or MCP server. It does not implement production application code.
+
+The designer has two targets. HTML is the default. The library target builds a prototype with the
+project's own component library and renders it through the project's toolchain. Its environment is
+recorded in `docs/design/prototyping.md`; when that record is missing or failing, the designer
+follows `open-design-setup` to inspect the project, reuse or add the smallest prototyping host, get
+the user's approval before changing the repository, prove a smoke prototype renders, and write the
+record. Library prototypes refresh rendered evidence HTML under `docs/design/` for lint and review.
+
+The lint tool accepts `paths: string[]` and obtains its root from authenticated workspace context.
+It requires Node.js, preserves original findings, reports file digests, and never writes artifacts.
+Its `passed` means zero original P0 findings. The optional review Loop uses an independent
+critic session and verifies the approved file digests before completion. Its optional `target`
+input (`auto`, `html`, `library`) binds the designer; a library result must list its prototype sources. Its skill passes per-run
+`config_overrides` of `iteration_cap: 3` and `reattempt_strategy: full_body` so runtime defaults
+cannot replace the workflow limits. Use the same overrides for direct invocations. The critic considers findings and
+specific source-backed exceptions. A normal design request does not start the Loop automatically.
+Use its skill and this reference's normal lifecycle surfaces to inspect or operate it.
+
+Browser inspection uses the local skill plus an available agent-browser CLI/browser and an
+image-capable harness. Missing browser support is reported, not replaced with a fabricated visual
+check. Source attribution and licenses ship with the extension; the selected content is maintained locally.
+
+## Portable Agent Plugins
+
+CompozyOS detects a package layout after source acquisition; there is no format flag. A root
+`extension.toml` or `extension.json` selects `compozy`. Root `plugin.json` alone selects
+`agent-plugin` and accepts Agent Plugins schema `1.0.0`. When both exist, the native manifest wins
+and install records the unused portable manifest as a note. Without a root manifest, `.claude-plugin/plugin.json`, `.codex-plugin/plugin.json`, then
+`.cursor-plugin/plugin.json` are tried in that order. Their client grammar adapter loads skills
+from `skills/` and declared paths, and MCP servers from a contained `mcpServers` JSON file or
+inline map. Authored commands/agents/hooks emit `client_component_ignored` and are not loaded.
+Package bytes are unchanged; provenance records the selected layout. Layout grants no trust.
+
+Portable ingestion synthesizes a resource-only extension from immediate child skills and `mcp.json`
+servers. `stdio` and `streamable-http` map into extension MCP resources; invalid components and `sse`
+servers are skipped independently. Install, status, inventory, list, HTTP/UDS, and native-tool reads
+carry `format` plus diagnostics. The marketplace `format` badge is display metadata only; acquired
+package detection is authoritative.
+
+Portable skill and MCP delivery is verified on managed Claude Code sessions. A provider configured
+with `session_mcp = false` receives no per-session MCP servers, so a package that requires hosted MCP
+fails before that provider launches.
+
+Recorded ingestion skips use `extension_agent_plugin_component_skipped`. Runtime availability uses
+live codes such as `extension_mcp_server_unhealthy`; reads sort ingest diagnostics before live ones so
+package validity is never confused with server health. Fatal detection codes are
+`extension_agent_plugin_schema_unsupported`,
+`extension_agent_plugin_not_manifest`, and `extension_agent_plugin_manifest_invalid`.
+
+`compozy extension validate <path> -o json` takes the portable branch without installing or executing
+code and returns `format`, `would_ingest`, and ordered issues. A warning-only report exits zero; a
+fatal issue exits nonzero.
+
+Every portable instance receives absolute `PLUGIN_ROOT` and `PLUGIN_DATA` values. The dedicated data
+directory is created immediately before its first stdio launch, survives updates, and is deleted on
+remove. A failed deletion is renamed out of the reusable instance key and reported as a quarantine
+warning; if quarantine also fails, removal fails and the instance remains installed.
+
+## Install Trust
+
+Bundled upgrades migrate superseded registrations such as `dev-cycle` to `spec-cycle`, preserving
+compatible installation scopes and profile enablement. Conflicting enablement or untranslatable
+inputs and credentials retain the old registration; inspect `compozy doctor` and migrate that state
+before using its suggested removal command. Doctor names the actual workspace and profile attachment;
+`--global` removes a global attachment or recovers an unattached registration, not every workspace.
+Successor enrollment and scope transfer commit together. The bundled-name translation expires in v0.6.0.
+
+One extension's startup failure remains visible in status without aborting another package's
+mutation. If a previous failed install left a package with no scoped installations, an operator
+can recover it with `compozy extension remove <name> --global`, then reinstall. Workspace agents
+cannot remove an orphaned global package through that recovery path.
+
+Install takes one closed source union — `curated`, `marketplace`, `github`, `git`, or `local_path` — plus a required
+`ref` and optional `version`, `asset`, and `allow_unverified`. `compozy extension install <source>`
+owns the shorthand: a filesystem path (`./`, `../`, or absolute) becomes `local_path`,
+`github:owner/repo[@ref]` and `git:<url>[@ref]` become their named sources, and a bare
+`owner/repo[@ref]` tries `curated` first and falls back to `github` only on a `404`. A path that does
+not exist fails naming that path instead of degrading into a slug lookup. Git URLs must use HTTPS,
+resolve only to public addresses, and carry no credentials, query, or fragment. Git installs require
+Git 2.37 or newer so the daemon can pin validated DNS answers; missing Git reports
+`extension_git_unavailable`, and an older version reports `extension_git_version_unsupported` (`503`).
+
+Curated refs resolve through the daemon-owned catalog: the runtime downloads the feed-owned artifact
+when the entry carries one, verifies the catalog-pinned SHA-256 before extraction, then persists
+separate catalog entry, archive digest, and extracted-tree checksum provenance. Official and community
+catalog tiers install with no consent. Every other install — curated `unverified` tier, `marketplace`, `github`,
+`git`, `local_path` — needs live policy `extensions.trust.allow_unverified` (default `true`) plus the
+request-level `--allow-unverified`, which is the whole consent. Policy off returns
+`extension_unverified_policy_blocked` with evidence path `/settings/extensions`; policy on without
+consent returns `extension_checksum_unverified`. Both are `422`. Human output prompts on
+`--allow-unverified` unless `--yes`; structured output requires `--yes`. The deleted key is
+`extensions.marketplace.allow_unverified`, and `compozy config set` names its replacement.
+
+Registered plugin sources use `POST /api/extensions` with `source: marketplace`, the listed
+`install_slug` as `ref`, and the listed `digest_sha256` as `expected_digest`. Preview and install
+retain that same pin. Plugins remain unverified regardless of layout or cache integrity. A cached
+package installs without contacting its source; missing/corrupt bytes are acquired again only if the
+live package has the same digest. `extension_source_changed` (409) requires a new listing and approval;
+`source_unreachable` (503) means the cache is unavailable and the source could not supply the package.
+Updates resolve `(source_ref, entry_id)` from installed provenance, so source renames keep identity.
+Changed bytes count as an update even when the declared version stays the same. Publication and
+rollback use the existing extension lifecycle; shared credentials and other attachments stay intact.
+
+A curated digest mismatch is `extension_archive_digest_mismatch`, terminal for that catalog version
+and with no unverified bypass. A GitHub release may carry an `<asset>.sha256` sidecar; when one
+exists the daemon verifies the archive against it before extraction and records `digest_matched`.
+That fact is integrity only: it never raises `registry_tier` above `unverified`, never sets
+`checksum_verified`, and never removes the consent requirement. Any digest failure aborts before the
+registry write, so no partial install survives. Registry tier and digest verification are provenance
+signals, not safety guarantees. `extension.digest.verify` event queries report `outcome=success` for
+matching bytes and `outcome=failure` for mismatches.
+
+Read the persisted decision with `compozy extension provenance <name> -o json`,
+`GET /api/extensions/{name}/provenance`, or `compozy__extensions_provenance`; `installed_from` is
+`bundled` for an extension shipped with CompozyOS, or `marketplace_registry`, `github`, `git_url`, or
+`local_path` for a separately installed extension. Bundled extensions carry the `official` registry
+tier and verified checksum evidence without unverified-install consent.
+
+An extension update commits when the registry, managed directory, and runtime reload all succeed.
+Post-commit backup or staging cleanup failure does not roll back or relabel that active update:
+`status` remains `updated`, and `warnings[]` contains `extension_update_cleanup_failed` with the
+cleanup target and residual path. Verify the active version before asking an operator to remove the
+residue.
+
+A batch update (`compozy extension update --all`, `POST /api/extensions/update` on HTTP and UDS,
+`compozy__extensions_update`) stops at the first failing target without discarding the progress
+before it. The response is `200` carrying every completed item plus the failed one, whose `status` is
+`failed` and whose `error` carries `extension_update_failed`. Targets after the failure are not
+attempted; resolve that item and re-run rather than reading the short list as success. Only a batch
+that completed nothing maps to an error status.
+
+Extension removal follows the same commit boundary. After the registry, managed directory, and
+runtime reload confirm removal, backup cleanup failure leaves `status` as `removed` and reports
+`extension_remove_cleanup_failed` with the residual path. Treat that path as cleanup debt; do not
+restore or operate the removed extension from it.
+
+Published reinstall uses the existing update transaction and selected attachment. Repeating the same
+acquisition and inputs preserves package and input/secret before-images without a runtime reload.
+A different classified `(source_ref, entry_id)` returns `extension_name_conflict` with `installed_origin`;
+display names do not participate in identity. Only an operator may associate an unclassified managed
+installation with a catalog entry. Publication failure restores the old package and selected input cell.
+
+For a configured plugin source, `compozy extension install team/tool --allow-unverified --yes`
+selects the source index and pins the listed digest before preview and installation. Existing curated
+acquisition refs keep priority if the same spelling collides; `marketplace:team/tool` explicitly selects
+the plugin. An unknown explicit marketplace source fails before acquisition; it is never interpreted
+as a GitHub repository. Inspect source state with `compozy marketplace sources list -o json`.
+
+## Authoring And Dev Loop
+
+Authoring runs `init` → `build` → `validate` → `dev` → `reload` → `logs` → `publish`. Native tool IDs
+and risk flags live in `references/native-tools.md`; what goes in the code lives in
+`references/extension-authoring.md`. CLI parity is
+`compozy extension init|build|validate|dev|reload|logs|publish`; HTTP/UDS parity is
+`POST /api/extensions/dev`, `POST /api/extensions/{name}/reload`, and
+`GET /api/extensions/{name}/logs`. Publish has no HTTP/UDS route.
+
+`build` publishes one immutable generation at `<origin>/dist/gen-<hash>`, where `generation_hash` is
+the 64-lowercase-hex checksum of that tree. For a code-backed source it compiles and runs SDK describe
+mode. For a native resource-only source with at least one declared skill, agent, Loop, automation, or
+layout path, it validates the handwritten manifest and copies those trees without running a build or
+describe command. A resource-only source cannot use a build-command override or declare a top-level
+subprocess, runtime capabilities, Host API permissions, hooks, tools, MCP servers,
+command groups, or dynamic resource publication; those contracts require `package.json` or `go.mod`.
+
+That hash is the only generation identity any surface accepts: `dev` takes
+`{origin_path, generation_hash}`, `reload` takes `{generation_hash}`, and the daemon reconstructs the
+directory, re-verifies the tree digest and manifest, and matches the manifest name before activation.
+A malformed, missing, mismatched, or escaping handle returns `400` (`extension: generation is
+invalid`); no path, symlink, or staging directory substitutes for it. `validate` is a read-only
+manifest, permission, and consent-area report that never executes extension code.
+
+`compozy extension dev` and `compozy extension reload` build locally and send the resulting hash. The
+native `compozy__extensions_dev` and `compozy__extensions_reload` never build: call
+`compozy__extensions_build` first and pass its `generation_hash`.
+
+`compozy extension publish [generation-directory] --repository <owner/name> --tag <tag> [--draft]`
+uploads that generation's archive plus its `<asset>.sha256` sidecar to a GitHub release and returns
+the release URL, asset URL, and digest; the directory defaults to the working directory. No surface
+accepts a credential field. The CLI reads `GITHUB_TOKEN` from its own process environment, while
+`compozy__extensions_publish` resolves `env:GITHUB_TOKEN` then `vault:github/publish` inside the
+daemon and registers the value for redaction. An unresolvable credential fails before any upload.
+
+## Instance Scoping
+
+Every runtime extension surface is keyed by instance — extension name plus workspace. The published
+installation is the global instance (empty workspace); a dev link is a workspace instance. Subprocess,
+operation coordinator, last-good generation, log ring, status, and events are per instance, so two
+workspaces linking the same extension share no process, logs, or failure state.
+
+Declared agents, skills, Loops, automations, and layouts use the same instance scope. Within an
+instance, resources are visible only when the extension is enabled for the active profile and the
+resource is unplaced or placed in that profile. Active dev instances populate only the linked
+workspace's catalogs and workspace detail. Reload swaps that workspace snapshot atomically, and
+unlinking removes it without mutating the published installation.
+
+The workspace is bound server-side — from the operator's resolved workspace or the agent session's
+trusted scope — never from a request body or tool input. An agent caller that names a different
+workspace is denied with `403` (`extension: workspace access denied`), and its list, status, logs, and
+event projections filter by that workspace. Global-instance logs stay operator-transport-only; reach
+them with `compozy extension logs <name> --global`.
+
+CLI `list` and `status` read the published global instance by default. Pass
+`compozy extension list --workspace <workspace>` or
+`compozy extension status <name> --workspace <workspace>` to inspect the effective workspace instance,
+including a dev overlay. The CLI resolves names and paths to the stable workspace registration ID before
+calling the existing scoped HTTP/UDS read.
+
+## Dev Overlay Versus Published Install
+
+A dev link is a side-table overlay, not an install. It never mutates or displaces the published row,
+and only `dev` creates one. When both exist, reads report `overrides_published: true` beside `dev`,
+`origin_path`, `generation_hash`, and `workspace_id`. `compozy extension remove <name>` inside a
+workspace unlinks only that overlay and restores the published installation; `--global` removes the
+published installation itself. Dev emits `extension.dev.{linked,unlinked}` and
+`extension.reload.{completed,failed}`.
+
+A dev-linked extension is a trusted tool-policy source in the workspace that linked it, so its tools
+need no catalog entry, archive digest, or `--allow-unverified` ceremony. Content-hash re-verification
+is the integrity boundary for dev instances; Install Trust governs published installs.
+
+## Reload, Last-Good, And Failure States
+
+Link, reload, unlink, and boot activation serialize through one per-instance coordinator. Reload starts
+the new generation before retiring the old one. When the new generation fails to activate, the instance
+restarts the last-good generation and the call returns the activation error while status reports
+`failure_code: "activation_failed"` and `last_error: "activation_failed; running <last-good hash>"`. A
+broken edit never takes the extension down; read status before assuming an outage.
+
+At daemon boot, a dev link whose origin no longer exists or now escapes the workspace root loads as
+`state: "error"` with `failure_code: "missing_origin"` instead of failing boot. Origin paths are
+canonicalized — symlinks resolved, containment enforced under the workspace root — at link time and on
+every load. `reload` or `logs` for a name with no overlay returns `409` (`extension: extension is not
+dev linked`).
+
+## Logs And Watch
+
+Each instance feeds a bounded 256 KiB drop-oldest ring from subprocess stderr, redacted at ingestion so
+no transport sees raw secrets. A snapshot carries an opaque `stream_epoch`; every entry carries that
+epoch plus its monotonic `sequence`, `timestamp`, `message`, and `generation_hash`. Resume only with the
+pair `after: <sequence>` and `stream_epoch: <epoch>` (CLI: `--after` plus `--stream-epoch`). The SSE
+stream publishes `extension_log` deltas and an atomic `extension_log_reset` snapshot when the daemon
+recreates the ring. Replace retained rows on reset, including an empty reset. The ring survives reloads
+because it belongs to the instance, but it is live retention rather than durable history: a dropped
+oldest entry is gone, and unlink/relink starts a new epoch.
+
+For `compozy extension logs --follow -o jsonl`, delta lines are log entries. A reset line has
+`event: "extension_log_reset"`, `stream_epoch`, and the complete replacement `logs` array; process an
+empty array too.
+
+`compozy extension dev --watch` closes the loop client-side. It polls the source tree every
+`extensions.dev.watch_interval` (default `2s`), skips `.git`, `dist`, and `node_modules`, and rebuilds
+plus reloads one change at a time. There is no daemon-side watcher.
+
+## Hooks
+
+Hooks are typed dispatch at the owning state transition. They are not a generic event bus and must not tail event/log tables to infer work.
+
+For `tool.*` hooks, match the canonical `tool_id` (for example `compozy__workspace_info`) and read
+that field from the payload. Use `tool_input` for an input patch. `tool_name` is a permission-event
+matcher; tool events do not accept it or `tool_namespace`.
+
+Hooks may deny, narrow, annotate, or observe. They must not bypass safety primitives such as claim tokens, leases, TTL, lineage, spawn caps, or permission narrowing.
+
+Skill-declared hooks are part of the skill contract. Keep hook declarations structured and validated, not buried in prose.
+
+The `context.pre_compact` and `context.post_compact` hooks are observation-only and match on
+`compaction_trigger` (`requested` or `agent`); see `references/runtime-operations.md`. An `AGENT.md` hook
+cannot target them, because the agent definition adds `matcher.agent_name` and the context family does
+not accept it; declare context hooks in `config.toml`, an extension manifest, or a skill. The retired
+matcher keys `compaction_reason` and `compaction_strategy` are ignored in `AGENT.md`, `SKILL.md`, and
+extension manifest hooks with one `agent.retired_entries_ignored`,
+`skills.retired_entries_ignored`, or `extension.retired_entries_ignored` warning per owner, and archived
+in a `config.toml` (see `references/configuration.md`).
+
+Manage hooks with `compozy__hooks_*` (list/info/events/runs/create/update/delete/enable/disable). Workspace-scoped declarations match the registered workspace ID shown by `compozy workspace info`, the same ID carried by their event payloads. Hook families are documented beside their domain: `loop.*` in `references/loops.md`, and `window_manager.*` in `references/window-management.md`.
+
+The `agent.heartbeat.wake.before` hook accepts `cancel: true` for proactive `timer` and
+`instance_check` sources. Legacy `scheduler`, `manual`, and `harness_reentry` sources ignore
+cancellation. Dry-run checks skip this hook. Cancellation creates no triage occurrence.
+
+For proactive wake cancellation, hooks may return `{"cancel":true,"reason":"maintenance_window"}`.
+The persisted wake event keeps `hook_cancelled` as its reason and records the supplied text in
+`detail`, redacted and bounded to 300 bytes. An omitted reason still cancels the check.

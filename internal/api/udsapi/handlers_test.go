@@ -1,0 +1,3381 @@
+package udsapi
+
+import (
+	"bytes"
+	"compress/gzip"
+	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"io"
+	"net/http"
+	"net/http/httptest"
+	"os"
+	"os/exec"
+	"path/filepath"
+	"reflect"
+	"runtime"
+	"runtime/pprof"
+	"slices"
+	"strings"
+	"testing"
+	"time"
+
+	"github.com/compozy/compozy/internal/api/httpapi"
+	"github.com/gin-gonic/gin"
+
+	"github.com/compozy/compozy/internal/acp"
+	"github.com/compozy/compozy/internal/admission"
+	"github.com/compozy/compozy/internal/api/contract"
+	core "github.com/compozy/compozy/internal/api/core"
+	apitestutil "github.com/compozy/compozy/internal/api/testutil"
+	compozyconfig "github.com/compozy/compozy/internal/config"
+	"github.com/compozy/compozy/internal/diagnostics"
+	hookspkg "github.com/compozy/compozy/internal/hooks"
+	"github.com/compozy/compozy/internal/observe"
+	"github.com/compozy/compozy/internal/session"
+	settingspkg "github.com/compozy/compozy/internal/settings"
+	"github.com/compozy/compozy/internal/store"
+	taskpkg "github.com/compozy/compozy/internal/task"
+	"github.com/compozy/compozy/internal/transcript"
+	"github.com/compozy/compozy/internal/windowmanager"
+	workspacepkg "github.com/compozy/compozy/internal/workspace"
+)
+
+type stubExtensionService = apitestutil.StubExtensionService
+
+func TestRegisterRoutesCoversTechSpecEndpoints(t *testing.T) {
+	t.Run("Should register every TechSpec endpoint", func(t *testing.T) {
+		t.Parallel()
+		homePaths := newTestHomePaths(t)
+		handlers := newTestHandlers(t, &stubSessionManager{}, stubObserver{}, homePaths)
+		engine := newTestRouter(t, handlers)
+
+		routes := engine.Routes()
+		got := make([]string, 0, len(routes))
+		for _, route := range routes {
+			got = append(got, route.Method+" "+route.Path)
+		}
+		slices.Sort(got)
+
+		want := []string{
+			"DELETE /api/workspaces/:workspace_id/sessions/:session_id/links",
+			"GET /api/workspaces/:workspace_id/sessions/:session_id/links",
+			"POST /api/workspaces/:workspace_id/sessions/:session_id/links",
+			"POST /api/workspaces/:workspace_id/sessions/:session_id/links/refresh",
+			"GET /api/workspaces/:workspace_id/sessions/:session_id/link-candidates",
+			"DELETE /api/app-tokens/:app_token_id",
+			"GET /api/app-tokens",
+			"GET /api/processes",
+			"POST /api/processes/terminate",
+			"GET /api/workspaces/:workspace_id/sessions/:session_id/processes",
+			"POST /api/workspaces/:workspace_id/sessions/:session_id/processes/terminate",
+			"GET /api/openapi.json",
+			"PATCH /api/app-tokens/:app_token_id",
+			"POST /api/app-tokens",
+			"DELETE /api/profiles/:name",
+			"GET /api/profiles",
+			"GET /api/profiles/:name",
+			"GET /api/profiles/:name/archive-plan",
+			"GET /api/profiles/:name/delete-plan",
+			"GET /api/profiles/:name/rename-plan",
+			"GET /api/profiles/ops",
+			"GET /api/profiles/selection",
+			"PATCH /api/profiles/:name",
+			"POST /api/profiles",
+			"POST /api/profiles/:name/archive",
+			"POST /api/profiles/:name/rename",
+			"POST /api/profiles/:name/unarchive",
+			"POST /api/profiles/ops/:op_id/retry",
+			"PUT /api/profiles/selection",
+			"DELETE /api/cmd-palette/personalization",
+			"DELETE /api/cmd-palette/pins/:id",
+			"DELETE /api/cmd-palette/view-sessions/:session",
+			"DELETE /api/agents/:name/heartbeat",
+			"DELETE /api/agents/:name/soul",
+			"DELETE /api/automation/jobs/:id",
+			"DELETE /api/automation/triggers/:id",
+			"DELETE /api/extensions/:name",
+			"DELETE /api/extensions/:name/secrets/:env_name",
+			"DELETE /api/tool-approval-grants/:id",
+			"DELETE /api/settings/hooks/:name",
+			"DELETE /api/settings/mcp-servers/:name",
+			"DELETE /api/settings/providers/:name",
+			"DELETE /api/resources/:kind/:id",
+			"DELETE /api/workspaces/:workspace_id/sessions/:session_id",
+			"DELETE /api/workspaces/:workspace_id/sessions/:session_id/attachments/:attachment_id",
+			"DELETE /api/workspaces/:workspace_id/sessions/:session_id/parent",
+			"DELETE /api/workspaces/:workspace_id/sessions/:session_id/runtime",
+			"DELETE /api/tasks/:id",
+			"DELETE /api/tasks/:id/dependencies/:depends_on_id",
+			"DELETE /api/tasks/:id/execution-profile",
+			"DELETE /api/vault/secrets",
+			"DELETE /api/workspaces/:workspace_id",
+			"DELETE /api/workspaces/:workspace_id/worktrees/:worktree_id",
+			"DELETE /api/workspaces/:workspace_id/window-manager/clients/:client_id",
+			"DELETE /api/workspaces/:workspace_id/window-manager/layout-profiles/:profile_id",
+			"GET /api/workspaces/:workspace_id/window-manager",
+			"GET /api/workspaces/:workspace_id/window-manager/clients",
+			"GET /api/workspaces/:workspace_id/window-manager/layout",
+			"GET /api/workspaces/:workspace_id/window-manager/layout-profiles",
+			"GET /api/workspaces/:workspace_id/window-manager/stream",
+			"POST /api/workspaces/:workspace_id/window-manager/clients",
+			"POST /api/workspaces/:workspace_id/window-manager/commands",
+			"POST /api/workspaces/:workspace_id/window-manager/layout/validate",
+			"POST /api/workspaces/:workspace_id/window-manager/preview",
+			"PUT /api/workspaces/:workspace_id/window-manager/layout",
+			"PUT /api/workspaces/:workspace_id/window-manager/layout-profiles/:profile_id",
+			"GET /api/agents",
+			"GET /api/agents/:name",
+			"GET /api/agents/catalog",
+			"GET /api/agents/:name/heartbeat",
+			"GET /api/agents/:name/heartbeat/sources",
+			"POST /api/agents/:name/heartbeat/scripts/:script/approve",
+			"DELETE /api/agents/:name/heartbeat/scripts/:script/approve",
+			"GET /api/agents/:name/heartbeat/history",
+			"GET /api/agents/:name/heartbeat/status",
+			"GET /api/agents/:name/soul",
+			"GET /api/agents/:name/soul/history",
+			"GET /api/agent/context",
+			"GET /api/agent/coordinator/config",
+			"GET /api/agent/me",
+			"GET /api/agent/soul",
+			"GET /api/automation/jobs",
+			"GET /api/automation/jobs/:id",
+			"GET /api/automation/jobs/:id/runs",
+			"GET /api/cmd-palette/clients",
+			"GET /api/cmd-palette/commands",
+			"GET /api/cmd-palette/personalization",
+			"GET /api/cmd-palette/rank-signals",
+			"GET /api/cmd-palette/stream",
+			"GET /api/cmd-palette/views/:id",
+			"GET /api/cmd-palette/views/:id/stream",
+			"GET /api/cmd-palette/view-sessions/:session/stream",
+			"GET /api/automation/runs",
+			"GET /api/automation/runs/:id",
+			"GET /api/automation/triggers",
+			"GET /api/automation/triggers/:id",
+			"GET /api/automation/triggers/:id/runs",
+			"GET /api/workspaces/:workspace_id/automation/suggestions",
+			"GET /api/doctor",
+			"POST /api/drain",
+			"GET /api/extensions",
+			"GET /api/extensions/commands",
+			"GET /api/extensions/search",
+			"GET /api/extensions/:name",
+			"GET /api/extensions/:name/inventory",
+			"GET /api/extensions/:name/preview",
+			"GET /api/extensions/:name/enablement",
+			"GET /api/extensions/:name/logs",
+			"GET /api/extensions/:name/provenance",
+			"GET /api/extensions/:name/secrets",
+			"GET /api/hooks/catalog",
+			"GET /api/hooks/events",
+			"GET /api/notifications/attention",
+			"GET /api/tool-approval-grants",
+			"GET /api/workspaces/:workspace_id/hooks/runs",
+			"GET /api/internal/hosted-mcp/projection",
+			"GET /api/internal/hosted-mcp/projection/stream",
+			"GET /api/logs",
+			"GET /api/logs/stream",
+			"GET /api/marketplace",
+			"GET /api/marketplace/entries/:entry_id",
+			"GET /api/marketplace/sources",
+			"POST /api/marketplace/sources",
+			"PATCH /api/marketplace/sources/:name",
+			"DELETE /api/marketplace/sources/:name",
+			"POST /api/marketplace/sources/:name/refresh",
+			"GET /api/settings/marketplace",
+			"PATCH /api/settings/marketplace",
+			"GET /api/status",
+			"GET /api/daemon/profile/:kind",
+			"GET /api/status/identity",
+			"POST /api/undrain",
+			"GET /api/onboarding",
+			"POST /api/onboarding/complete",
+			"DELETE /api/onboarding",
+			"GET /api/fs/browse",
+			"GET /api/observe/overview",
+			"DELETE /api/agent-instances/:id",
+			"GET /api/agent-instances",
+			"GET /api/agent-skill-reviews",
+			"GET /api/agent-skill-reviews/:id",
+			"POST /api/agent-skill-reviews/:id/approve",
+			"POST /api/agent-skill-reviews/:id/reject",
+			"GET /api/agent-instances/:id",
+			"GET /api/agent-instances/:id/away",
+			"GET /api/agent-instances/:id/check-ins",
+			"GET /api/agent-instances/:id/occurrences/:occurrence",
+			"GET /api/agents/:name/activity",
+			"GET /api/agents/:name/memory",
+			"GET /api/agents/:name/memory/history",
+			"GET /api/permissions",
+			"GET /api/agent-instances/:id/reports",
+			"GET /api/permissions/rollup",
+			"GET /api/workspaces/:workspace_id/sessions/:session_id/pending-interactions",
+			"POST /api/agent-instances",
+			"POST /api/agent-instances/:id/ensure-main",
+			"POST /api/agent-instances/:id/pause",
+			"POST /api/agent-instances/:id/resume",
+			"POST /api/agent-instances/adopt",
+			"DELETE /api/agents/:name/memory/entries",
+			"PATCH /api/agent-instances/:id",
+			"PATCH /api/agents/:name/memory/entries",
+			"POST /api/agent-instances/:id/away",
+			"POST /api/agent-instances/:id/check",
+			"POST /api/agents/:name/memory/entries",
+			"POST /api/agents/:name/memory/rollback",
+			"POST /api/agents/:name/memory/search",
+			"POST /api/agents/:name/memory/validate",
+			"PUT /api/agents/:name/memory",
+
+			"GET /api/observe/tasks/dashboard",
+			"GET /api/observe/tasks/inbox",
+			"GET /api/model-catalog/*catalog_path",
+			"GET /api/provider-usage",
+			"GET /api/provider-usage/providers/:provider_id",
+			"GET /api/provider-usage/stream",
+			"POST /api/provider-usage/refresh",
+			"GET /api/providers",
+			"GET /api/providers/:provider_id",
+			"GET /api/roles",
+			"GET /api/roles/:role",
+			"GET /api/resources",
+			"GET /api/resources/:kind",
+			"GET /api/resources/:kind/:id",
+			"GET /api/sessions",
+			"GET /api/sessions/attention-summary",
+			"GET /api/sessions/facets",
+			"GET /api/sessions/catalog-stream",
+			"GET /api/sessions/:session_id",
+			"GET /api/sessions/:session_id/owner",
+			"GET /api/workspaces/:workspace_id/sessions",
+			"GET /api/workspaces/:workspace_id/sessions/:session_id/subagents",
+			"GET /api/workspaces/:workspace_id/sessions/:session_id/monitors",
+			"POST /api/workspaces/:workspace_id/sessions/:session_id/monitors/:monitor_id/cancel",
+			"GET /api/workspaces/:workspace_id/subagents/:subagent_id",
+			"POST /api/workspaces/:workspace_id/subagents/:subagent_id/cancel",
+			"GET /api/workspaces/:workspace_id/sessions/:session_id",
+			"GET /api/workspaces/:workspace_id/sessions/:session_id/clarifications",
+			"GET /api/workspaces/:workspace_id/sessions/:session_id/events",
+			"GET /api/workspaces/:workspace_id/sessions/:session_id/commands",
+			"GET /api/workspaces/:workspace_id/sessions/:session_id/files",
+			"GET /api/workspaces/:workspace_id/sessions/:session_id/goal",
+			"POST /api/workspaces/:workspace_id/sessions/:session_id/goal",
+			"GET /api/workspaces/:workspace_id/sessions/:session_id/health",
+			"GET /api/workspaces/:workspace_id/sessions/:session_id/history",
+			"GET /api/workspaces/:workspace_id/sessions/:session_id/inspect",
+			"GET /api/workspaces/:workspace_id/sessions/:session_id/interactions",
+			"GET /api/workspaces/:workspace_id/sessions/:session_id/prompt/queue",
+			"GET /api/workspaces/:workspace_id/sessions/:session_id/recap",
+			"GET /api/workspaces/:workspace_id/sessions/:session_id/usage",
+			"GET /api/workspaces/:workspace_id/sessions/:session_id/usage/turns",
+			"GET /api/workspaces/:workspace_id/sessions/:session_id/status",
+			"GET /api/workspaces/:workspace_id/sessions/:session_id/transcript",
+			"GET /api/sessions/:session_id/transcript",
+			"GET /api/sessions/:session_id/status",
+			"GET /api/sessions/:session_id/events",
+			"GET /api/sessions/:session_id/history",
+			"GET /api/sessions/:session_id/stream",
+			"GET /api/sessions/:session_id/transcript/search",
+			"GET /api/sessions/:session_id/transcript/outline",
+			"GET /api/workspaces/:workspace_id/sessions/:session_id/transcript/search",
+			"GET /api/workspaces/:workspace_id/sessions/:session_id/transcript/outline",
+			"GET /api/workspaces/:workspace_id/sessions/:session_id/stream",
+			"GET /api/workspaces/:workspace_id/sessions/:session_id/tools",
+			"GET /api/workspaces/:workspace_id/sessions/:session_id/attachments/:attachment_id/bytes",
+			"GET /api/workspaces/:workspace_id/tool-artifacts/:artifact_id",
+			"GET /api/settings/actions/restart/:operation_id",
+			"GET /api/settings/apply",
+			"GET /api/settings/automation",
+			"GET /api/settings/general",
+			"GET /api/settings/persona",
+			"GET /api/settings/update",
+			"GET /api/settings/hooks",
+			"GET /api/settings/hooks-extensions",
+			"GET /api/settings/mcp-servers",
+			"GET /api/settings/mcp-servers/:name",
+			"GET /api/settings/mcp-servers/:name/auth/status",
+			"POST /api/settings/mcp-servers/:name/auth/begin",
+			"POST /api/settings/mcp-servers/:name/auth/exchange",
+			"POST /api/settings/mcp-servers/:name/auth/logout",
+			"GET /api/settings/attention",
+			"GET /api/settings/shell",
+			"GET /api/settings/provider-usage",
+			"GET /api/settings/cmd-palette",
+			"GET /api/settings/window-manager",
+			"GET /api/settings/observability",
+			"GET /api/settings/observability/log-tail",
+			"GET /api/settings/providers",
+			"GET /api/settings/providers/:name",
+			"GET /api/settings/roles",
+			"GET /api/settings/skills",
+			"GET /api/support/bundles/:operation_id",
+			"GET /api/support/bundles/:operation_id/download",
+			"GET /api/skills",
+			"GET /api/skills/:name",
+			"GET /api/skills/:name/content",
+			"GET /api/skills/:name/shadows",
+			"GET /api/scheduler",
+			"GET /api/scheduler/backlog",
+			"GET /api/task-runs/:id",
+			"GET /api/task-runs/:id/result",
+			"GET /api/task-runs/:id/reviews",
+			"GET /api/runs/:id/inspect",
+			"GET /api/task-reviews/:id",
+			"GET /api/tasks",
+			"GET /api/tasks/:id",
+			"GET /api/tasks/:id/blocks",
+			"GET /api/tasks/:id/inspect",
+			"GET /api/tasks/:id/execution-profile",
+			"GET /api/tasks/:id/reviews",
+			"GET /api/tasks/:id/stream",
+			"GET /api/tasks/:id/timeline",
+			"GET /api/tasks/:id/tree",
+			"GET /api/tasks/:id/runs",
+			"GET /api/tools",
+			"GET /api/tools/approvals/:id",
+			"GET /api/tools/:id",
+			"GET /api/toolsets",
+			"GET /api/toolsets/:id",
+			"GET /api/vault/secrets",
+			"GET /api/vault/secrets/metadata",
+			"GET /api/workspaces",
+			"GET /api/workspaces/:workspace_id",
+			"GET /api/worktrees/catalog-stream",
+			"GET /api/workspaces/:workspace_id/worktrees",
+			"GET /api/workspaces/:workspace_id/worktrees/:worktree_id",
+			"GET /api/workspaces/:workspace_id/worktrees/:worktree_id/exit",
+			"GET /api/workspaces/:workspace_id/worktrees/:worktree_id/status",
+			"GET /api/workspaces/:workspace_id/worktrees/:worktree_id/stream",
+			"GET /api/workspaces/:workspace_id/loop-runs",
+			"GET /api/workspaces/:workspace_id/loop-runs/:run_id",
+			"GET /api/workspaces/:workspace_id/loop-runs/:run_id/diff",
+			"GET /api/workspaces/:workspace_id/loop-runs/:run_id/events",
+			"GET /api/workspaces/:workspace_id/loop-runs/:run_id/briefing",
+			"GET /api/workspaces/:workspace_id/loop-runs/:run_id/nodes",
+			"GET /api/workspaces/:workspace_id/loop-runs/:run_id/nodes/:node_id/request",
+			"GET /api/workspaces/:workspace_id/loop-runs/:run_id/timeline",
+			"GET /api/workspaces/:workspace_id/loop-runs/:run_id/turns",
+			"GET /api/workspaces/:workspace_id/loop-requests",
+			"GET /api/workspaces/:workspace_id/loops",
+			"GET /api/loops",
+			"GET /api/loop-runs",
+			"GET /api/agents/aggregate",
+			"GET /api/automation/suggestions",
+			"GET /api/terminals",
+			"GET /api/terminals/catalog-stream",
+			"GET /api/worktrees",
+			"GET /api/loop-requests",
+			"GET /api/workspaces/:workspace_id/loops/:name",
+			"GET /api/workspaces/:workspace_id/loops/:name/annotations",
+			"GET /api/workspaces/:workspace_id/loops/:name/config",
+			"GET /api/workspaces/:workspace_id/loops/:name/input-defaults",
+			"GET /api/workspaces/:workspace_id/loops/:name/input-defaults/:key",
+			"PATCH /api/automation/jobs/:id",
+			"PATCH /api/automation/triggers/:id",
+			"PATCH /api/settings/automation",
+			"PATCH /api/settings/attention",
+			"PATCH /api/settings/shell",
+			"PATCH /api/settings/provider-usage",
+			"PATCH /api/settings/cmd-palette",
+			"PATCH /api/settings/general",
+			"PATCH /api/settings/persona",
+			"PATCH /api/settings/hooks-extensions",
+			"PATCH /api/settings/roles",
+			"PATCH /api/settings/window-manager",
+			"PATCH /api/settings/observability",
+			"PATCH /api/settings/skills",
+			"PATCH /api/tasks/:id",
+			"PATCH /api/workspaces/:workspace_id",
+			"PATCH /api/workspaces/:workspace_id/loops/:name",
+			"PATCH /api/workspaces/:workspace_id/sessions/:session_id",
+			"POST /api/automation/jobs",
+			"POST /api/automation/jobs/:id/trigger",
+			"POST /api/automation/triggers",
+			"POST /api/workspaces/:workspace_id/worktrees",
+			"POST /api/workspaces/:workspace_id/worktrees/adopt",
+			"POST /api/workspaces/:workspace_id/worktrees/discovered/remove",
+			"POST /api/workspaces/:workspace_id/worktrees/:worktree_id/cancel",
+			"POST /api/workspaces/:workspace_id/worktrees/:worktree_id/dismiss",
+			"POST /api/workspaces/:workspace_id/worktrees/:worktree_id/exit/actions",
+			"POST /api/workspaces/:workspace_id/worktrees/:worktree_id/exit/prepare",
+			"POST /api/workspaces/:workspace_id/worktrees/:worktree_id/exit/cancel",
+			"POST /api/workspaces/:workspace_id/automation/suggestions/:suggestion_id/accept",
+			"POST /api/workspaces/:workspace_id/automation/suggestions/:suggestion_id/dismiss",
+			"POST /api/agent/notify",
+			"POST /api/agent/soul/validate",
+			"POST /api/agent/spawn",
+			"POST /api/agent/tasks/:run_id/complete",
+			"POST /api/agent/tasks/:run_id/fail",
+			"POST /api/agent/tasks/:run_id/heartbeat",
+			"POST /api/agent/tasks/:run_id/release",
+			"POST /api/agent/tasks/:run_id/start",
+			"POST /api/agents/:name/duplicate",
+			"POST /api/agent/tasks/claim-next",
+			"POST /api/agents",
+			"POST /api/agents/draft-instructions",
+			"POST /api/agents/:name/heartbeat/rollback",
+			"POST /api/agents/:name/heartbeat/validate",
+			"POST /api/agents/:name/heartbeat/wake",
+			"POST /api/agents/:name/soul/rollback",
+			"POST /api/agents/:name/soul/validate",
+			"POST /api/extensions",
+			"POST /api/extensions/preview-install",
+			"POST /api/extensions/:name/reload",
+			"POST /api/extensions/dev",
+			"POST /api/extensions/update",
+			"POST /api/notifications/attention/acknowledge",
+			"POST /api/internal/hosted-mcp/bind",
+			"POST /api/internal/hosted-mcp/release",
+			"POST /api/internal/hosted-mcp/tools/call",
+			"POST /api/internal/mcp/host-api/invoke",
+			"POST /api/internal/mcp/host-api/session/close",
+			"POST /api/marketplace/refresh",
+			"POST /api/model-catalog/*catalog_path",
+			"POST /api/providers/:provider_id/auth/probe",
+			"POST /api/runs/:id/fail",
+			"POST /api/runs/:id/recover",
+			"POST /api/runs/:id/release",
+			"POST /api/runs/:id/retry",
+			"POST /api/runs/bulk/fail",
+			"POST /api/runs/bulk/release",
+			"POST /api/scheduler/drain",
+			"POST /api/scheduler/pause",
+			"POST /api/scheduler/resume",
+			"POST /api/workspaces/:workspace_id/loop-runs/:run_id/approve",
+			"POST /api/workspaces/:workspace_id/loop-runs/:run_id/cancel",
+			"POST /api/workspaces/:workspace_id/loop-runs/:run_id/fork",
+			"POST /api/workspaces/:workspace_id/loop-runs/:run_id/nodes/:node_id/cancel",
+			"POST /api/workspaces/:workspace_id/loop-runs/:run_id/nodes/:node_id/amend",
+			"POST /api/workspaces/:workspace_id/loop-runs/:run_id/nodes/:node_id/pause",
+			"POST /api/workspaces/:workspace_id/loop-runs/:run_id/nodes/:node_id/requeue",
+			"POST /api/workspaces/:workspace_id/loop-runs/:run_id/nodes/:node_id/respond",
+			"POST /api/workspaces/:workspace_id/loop-runs/:run_id/nodes/:node_id/resume",
+			"POST /api/workspaces/:workspace_id/loop-runs/:run_id/pause",
+			"POST /api/workspaces/:workspace_id/loop-runs/:run_id/resume",
+			"POST /api/workspaces/:workspace_id/loop-runs/:run_id/rerun",
+			"GET /api/workspaces/:workspace_id/loop-nodes",
+			"POST /api/workspaces/:workspace_id/loops",
+			"POST /api/workspaces/:workspace_id/loops/:name/run",
+			"POST /api/workspaces/:workspace_id/loops/:name/validate",
+			"POST /api/sessions",
+			"POST /api/sessions/:session_id/pull-request/refresh",
+			"POST /api/workspaces/:workspace_id/sessions/:session_id/approve",
+			"POST /api/workspaces/:workspace_id/sessions/:session_id/clarifications/:request_id/answer",
+			"POST /api/workspaces/:workspace_id/sessions/:session_id/compact",
+			"POST /api/workspaces/:workspace_id/sessions/:session_id/clear",
+			"POST /api/workspaces/:workspace_id/sessions/:session_id/rewind",
+			"POST /api/workspaces/:workspace_id/sessions/:session_id/continue",
+			"POST /api/workspaces/:workspace_id/sessions/:session_id/fork",
+			"GET /api/workspaces/:workspace_id/sessions/:session_id/derive/preview",
+			"POST /api/workspaces/:workspace_id/sessions/:session_id/prompt",
+			"POST /api/workspaces/:workspace_id/sessions/:session_id/prompt/cancel",
+			"POST /api/workspaces/:workspace_id/sessions/:session_id/presence",
+			"POST /api/workspaces/:workspace_id/sessions/:session_id/wait",
+			"POST /api/workspaces/:workspace_id/sessions/:session_id/steer",
+			"POST /api/workspaces/:workspace_id/sessions/:session_id/prompt/queue/:queue_entry_id/steer",
+			"DELETE /api/workspaces/:workspace_id/sessions/:session_id/prompt/queue/:queue_entry_id",
+			"DELETE /api/workspaces/:workspace_id/sessions/:session_id/prompt/queue",
+			"POST /api/workspaces/:workspace_id/sessions/:session_id/repair",
+			"POST /api/workspaces/:workspace_id/sessions/:session_id/attach",
+			"POST /api/workspaces/:workspace_id/sessions/:session_id/attachments",
+			"POST /api/workspaces/:workspace_id/sessions/:session_id/worktree-fork",
+			"PUT /api/workspaces/:workspace_id/sessions/:session_id/worktree",
+			"DELETE /api/workspaces/:workspace_id/sessions/:session_id/worktree",
+			"POST /api/workspaces/:workspace_id/sessions/:session_id/archive",
+			"GET /api/workspaces/:workspace_id/sessions/:session_id/descendants",
+			"POST /api/workspaces/:workspace_id/sessions/:session_id/soul/refresh",
+			"POST /api/workspaces/:workspace_id/sessions/:session_id/stop",
+			"POST /api/workspaces/:workspace_id/sessions/:session_id/unarchive",
+			"POST /api/workspaces/:workspace_id/sessions/:session_id/later",
+			"POST /api/workspaces/:workspace_id/sessions/:session_id/resume-later",
+			"POST /api/workspaces/:workspace_id/sessions/:session_id/mark-seen",
+			"POST /api/workspaces/:workspace_id/sessions/:session_id/move",
+			"POST /api/workspaces/:workspace_id/sessions/:session_id/move-to-profile",
+			"GET /api/workspaces/:workspace_id/session-folders",
+			"POST /api/workspaces/:workspace_id/session-folders",
+			"PATCH /api/workspaces/:workspace_id/session-folders/:folder_id",
+			"DELETE /api/workspaces/:workspace_id/session-folders/:folder_id",
+			"PUT /api/workspaces/:workspace_id/session-order/folders",
+			"PUT /api/workspaces/:workspace_id/session-order/sessions",
+			"GET /api/workspace-folders",
+			"POST /api/workspace-folders",
+			"PATCH /api/workspace-folders/:folder_id",
+			"DELETE /api/workspace-folders/:folder_id",
+			"PUT /api/workspace-order/folders",
+			"PUT /api/workspace-order/workspaces",
+			"POST /api/workspace-order/move",
+			"POST /api/workspaces/:workspace_id/sessions/:session_id/tools/search",
+			"POST /api/settings/actions/restart",
+			"POST /api/settings/reload",
+			"POST /api/settings/update/check",
+			"POST /api/settings/update/apply",
+			"POST /api/settings/update/cancel",
+			"POST /api/support/bundles",
+			"POST /api/skills/:name/disable",
+			"POST /api/skills/:name/enable",
+			"POST /api/skills/:name/expose",
+			"POST /api/skills/:name/unexpose",
+			"POST /api/task-runs/:id/attach-session",
+			"POST /api/task-runs/:id/cancel",
+			"POST /api/task-runs/:id/complete",
+			"POST /api/task-runs/:id/fail",
+			"POST /api/task-runs/:id/reviews",
+			"POST /api/task-runs/:id/start",
+			"POST /api/task-reviews/:id/verdict",
+			"POST /api/tasks",
+			"POST /api/tasks/:id/approve",
+			"POST /api/tasks/:id/blocks",
+			"POST /api/tasks/:id/blocks/:block_id/clear",
+			"POST /api/tasks/:id/cancel",
+			"POST /api/tasks/:id/children",
+			"POST /api/tasks/:id/dependencies",
+			"POST /api/tasks/:id/pause",
+			"POST /api/tasks/:id/publish",
+			"POST /api/tasks/:id/recover",
+			"POST /api/tasks/:id/reject",
+			"POST /api/tasks/:id/resume",
+			"POST /api/tasks/:id/runs",
+			"POST /api/tasks/:id/runs/fan-out",
+			"POST /api/tasks/:id/start",
+			"POST /api/tasks/:id/triage/archive",
+			"POST /api/tasks/:id/triage/dismiss",
+			"POST /api/tasks/:id/triage/read",
+			"POST /api/cmd-palette/commands/:id/invoke",
+			"POST /api/cmd-palette/view-sessions/:session/events",
+			"POST /api/cmd-palette/views/:id/open",
+			"POST /api/cmd-palette/usage",
+			"POST /api/tools/approvals/:id/cancel",
+			"POST /api/tools/approvals/:id/resolve",
+			"PUT /api/cmd-palette/pins/:id",
+			"POST /api/tools/:id/approvals",
+			"POST /api/tools/:id/invoke",
+			"POST /api/tools/search",
+			"POST /api/workspaces",
+			"POST /api/workspaces/:workspace_id/archive",
+			"POST /api/workspaces/:workspace_id/unarchive",
+			"POST /api/workspaces/resolve",
+			"POST /api/workspaces/:workspace_id/terminals",
+			"POST /api/workspaces/:workspace_id/terminals/:id/attach-ticket",
+			"POST /api/workspaces/:workspace_id/terminals/:id/input-requests/:request_id/answer",
+			"POST /api/workspaces/:workspace_id/terminals/:id/input-requests/:request_id/reject",
+			"POST /api/workspaces/:workspace_id/terminals/:id/recording",
+			"POST /api/workspaces/:workspace_id/terminals/:id/signal",
+			"POST /api/workspaces/:workspace_id/terminals/:id/wait",
+			"POST /api/workspaces/:workspace_id/terminals/exec",
+			"PUT /api/agents/:name/heartbeat",
+			"PUT /api/agents/:name/soul",
+			"PUT /api/agents/:name",
+			"PUT /api/extensions/:name",
+			"PUT /api/extensions/:name/enablement",
+			"PUT /api/extensions/:name/secrets",
+			"PUT /api/settings/hooks/:name",
+			"PUT /api/settings/mcp-servers/:name",
+			"PUT /api/settings/providers/:name",
+			"PUT /api/tool-approval-grants",
+			"PUT /api/resources/:kind/:id",
+			"PUT /api/workspaces/:workspace_id/loops/:name/annotations",
+			"PUT /api/workspaces/:workspace_id/loops/:name/config",
+			"PUT /api/workspaces/:workspace_id/loops/:name/input-defaults",
+			"PUT /api/workspaces/:workspace_id/loops/:name/input-defaults/:key",
+			"PUT /api/tasks/:id/execution-profile",
+			"PATCH /api/tasks/:id/execution-profile/worktree",
+			"PUT /api/vault/secrets",
+			"PUT /api/workspaces/:workspace_id/sessions/:session_id/prompt/queue/:queue_entry_id",
+			"PUT /api/workspaces/:workspace_id/sessions/:session_id/parent",
+			"PUT /api/workspaces/:workspace_id/sessions/:session_id/runtime",
+			"DELETE /api/workspaces/:workspace_id/loops/:name",
+			"DELETE /api/workspaces/:workspace_id/loops/:name/input-defaults/:key",
+			"DELETE /api/agents/:name",
+			"DELETE /api/workspaces/:workspace_id/terminals/:id",
+			"GET /api/workspaces/:workspace_id/terminals",
+			"GET /api/workspaces/:workspace_id/terminals/:id",
+			"GET /api/workspaces/:workspace_id/terminals/:id/read",
+			"GET /api/workspaces/:workspace_id/terminals/:id/stream",
+			"GET /api/workspaces/:workspace_id/terminals/artifacts/:id",
+			"GET /api/workspaces/:workspace_id/terminals/input-requests",
+			"GET /api/workspaces/:workspace_id/terminals/journal",
+			"GET /api/workspaces/:workspace_id/terminals/recordings/:id",
+			"GET /api/workspaces/:workspace_id/terminals/stream",
+		}
+		slices.Sort(want)
+
+		if len(got) != len(want) {
+			wantSet := make(map[string]struct{}, len(want))
+			for _, route := range want {
+				wantSet[route] = struct{}{}
+			}
+			gotSet := make(map[string]struct{}, len(got))
+			unexpected := make([]string, 0)
+			for _, route := range got {
+				gotSet[route] = struct{}{}
+				if _, ok := wantSet[route]; !ok {
+					unexpected = append(unexpected, route)
+				}
+			}
+			missing := make([]string, 0)
+			for _, route := range want {
+				if _, ok := gotSet[route]; !ok {
+					missing = append(missing, route)
+				}
+			}
+			t.Fatalf(
+				"len(routes) = %d, want %d; unexpected=%v missing=%v",
+				len(got),
+				len(want),
+				unexpected,
+				missing,
+			)
+		}
+		for i := range want {
+			if got[i] != want[i] {
+				t.Fatalf("route[%d] = %q, want %q", i, got[i], want[i])
+			}
+		}
+	})
+}
+
+func TestRegisterRoutesRejectsLegacyStatusSurfaces(t *testing.T) {
+	t.Parallel()
+
+	homePaths := newTestHomePaths(t)
+	handlers := newTestHandlers(t, &stubSessionManager{}, stubObserver{}, homePaths)
+	engine := newTestRouter(t, handlers)
+
+	for _, path := range []string{"/api/daemon/status", "/api/observe/health"} {
+		t.Run("Should return 404 for "+path, func(t *testing.T) {
+			t.Parallel()
+
+			resp := performRequest(t, engine, http.MethodGet, path, nil)
+			if resp.Code != http.StatusNotFound {
+				t.Fatalf("GET %s status = %d, want %d", path, resp.Code, http.StatusNotFound)
+			}
+		})
+	}
+}
+
+func TestRegisterRoutesRejectsLegacyMarketplaceSurfaces(t *testing.T) {
+	t.Parallel()
+
+	engine := newTestRouter(
+		t,
+		newTestHandlers(t, &stubSessionManager{}, stubObserver{}, newTestHomePaths(t)),
+	)
+	for _, route := range []struct{ method, path string }{
+		{http.MethodGet, "/api/marketplace/search"},
+		{http.MethodGet, "/api/marketplace/mcp"},
+		{http.MethodGet, "/api/marketplace/skill"},
+		{http.MethodGet, "/api/marketplace/extension"},
+		{http.MethodGet, "/api/marketplace/mcp/github"},
+		{http.MethodGet, "/api/marketplace/skill/review"},
+		{http.MethodGet, "/api/marketplace/extension/review"},
+		{http.MethodGet, "/api/skills/marketplace/search"},
+		{http.MethodGet, "/api/skills/marketplace/info"},
+		{http.MethodGet, "/api/extensions/marketplace"},
+		{http.MethodPost, "/api/skills/marketplace/install"},
+		{http.MethodPost, "/api/skills/marketplace/update"},
+		{http.MethodDelete, "/api/skills/marketplace/review"},
+	} {
+		t.Run("Should return 404 for "+route.method+" "+route.path, func(t *testing.T) {
+			t.Parallel()
+
+			response := performRequest(t, engine, route.method, route.path, nil)
+			if response.Code != http.StatusNotFound {
+				t.Fatalf(
+					"%s %s status = %d, want %d; body=%s",
+					route.method,
+					route.path,
+					response.Code,
+					http.StatusNotFound,
+					response.Body.String(),
+				)
+			}
+		})
+	}
+}
+
+func TestRegisterRoutesRejectsLegacyProviderModelCatalogSurfaces(t *testing.T) {
+	t.Parallel()
+
+	homePaths := newTestHomePaths(t)
+	handlers := newTestHandlers(t, &stubSessionManager{}, stubObserver{}, homePaths)
+	engine := newTestRouter(t, handlers)
+
+	for _, tc := range []struct {
+		method string
+		path   string
+	}{
+		{method: http.MethodGet, path: "/api/providers/models"},
+		{method: http.MethodGet, path: "/api/providers/codex/models"},
+		{method: http.MethodPost, path: "/api/providers/codex/models/refresh"},
+		{method: http.MethodGet, path: "/api/providers/codex/models/status"},
+	} {
+		t.Run("Should return 404 for "+tc.method+" "+tc.path, func(t *testing.T) {
+			t.Parallel()
+
+			resp := performRequest(t, engine, tc.method, tc.path, nil)
+			if resp.Code != http.StatusNotFound {
+				t.Fatalf("%s %s status = %d, want %d", tc.method, tc.path, resp.Code, http.StatusNotFound)
+			}
+		})
+	}
+}
+
+func TestRemovedRoutesUseUnknownRouteBehaviorIT011(t *testing.T) {
+	t.Parallel()
+	handlers := newTestHandlers(t, &stubSessionManager{}, stubObserver{}, newTestHomePaths(t))
+	engine := newTestRouter(t, handlers)
+	for _, tc := range []struct{ method, path string }{
+		{http.MethodGet, "/api/memory"},
+		{http.MethodPost, "/api/memory/search"},
+		{http.MethodGet, "/api/settings/memory"},
+		{http.MethodGet, "/api/workspaces/ws_alpha/memory/sessions/sess-1/ledger"},
+	} {
+		t.Run("Should use unknown route behavior for "+tc.method+" "+tc.path, func(t *testing.T) {
+			t.Parallel()
+			unknown := httptest.NewRecorder()
+			engine.ServeHTTP(unknown, httptest.NewRequestWithContext(t.Context(), tc.method, "/api/nope", http.NoBody))
+			response := httptest.NewRecorder()
+			engine.ServeHTTP(response, httptest.NewRequestWithContext(t.Context(), tc.method, tc.path, http.NoBody))
+			if response.Code != http.StatusNotFound || response.Code != unknown.Code ||
+				response.Body.String() != unknown.Body.String() ||
+				response.Header().Get("Content-Type") != unknown.Header().Get("Content-Type") {
+				t.Fatalf(
+					"retired route response = %d %q %q, unknown = %d %q %q",
+					response.Code,
+					response.Body.String(),
+					response.Header().Get("Content-Type"),
+					unknown.Code,
+					unknown.Body.String(),
+					unknown.Header().Get("Content-Type"),
+				)
+			}
+		})
+	}
+}
+
+func TestWorktreeRoutesMatchTransportParityContractIT033(t *testing.T) {
+	t.Parallel()
+
+	homePaths := newTestHomePaths(t)
+	handlers := newTestHandlers(t, &stubSessionManager{}, stubObserver{}, homePaths)
+	engine := newTestRouter(t, handlers)
+
+	apitestutil.AssertWorktreeRouteParity(t, apitestutil.WorktreeRouteKeysFromGin(engine.Routes()))
+}
+
+func TestTaskBlockHandlersReturnUDSStatusAndBody(t *testing.T) {
+	t.Parallel()
+
+	t.Run("Should return 201 with created block payload", func(t *testing.T) {
+		t.Parallel()
+
+		homePaths := newTestHomePaths(t)
+		now := time.Date(2026, 7, 3, 14, 0, 0, 0, time.UTC)
+		manager := &apitestutil.StubTaskManager{
+			BlockTaskFn: func(_ context.Context, req taskpkg.BlockRequest, actor taskpkg.ActorContext) (taskpkg.TaskBlock, error) {
+				return taskpkg.TaskBlock{
+					ID:        "block-uds",
+					TaskID:    req.TaskID,
+					Kind:      req.Kind,
+					Reason:    req.Reason,
+					CreatedBy: actor.Actor,
+					CreatedAt: now,
+				}, nil
+			},
+		}
+		engine := newTestRouter(t, newTestHandlersWithRuntime(
+			t,
+			&stubSessionManager{},
+			stubObserver{},
+			nil,
+			manager,
+
+			stubWorkspaceService{},
+			nil,
+			homePaths,
+		))
+
+		recorder := performRequest(
+			t,
+			engine,
+			http.MethodPost,
+			"/api/tasks/task-uds/blocks",
+			[]byte(`{"kind":"capability","reason":"missing gpu"}`),
+		)
+		if recorder.Code != http.StatusCreated {
+			t.Fatalf("status = %d, want %d; body=%s", recorder.Code, http.StatusCreated, recorder.Body.String())
+		}
+		var response contract.TaskBlockResponse
+		decodeJSONResponse(t, recorder, &response)
+		if response.Block.ID != "block-uds" ||
+			response.Block.TaskID != "task-uds" ||
+			response.Block.Kind != taskpkg.BlockKindCapability {
+			t.Fatalf("response.Block = %#v, want capability block for task-uds", response.Block)
+		}
+	})
+}
+
+func TestSettingsRoutesUseSharedCoreHandlers(t *testing.T) {
+	t.Parallel()
+
+	homePaths := newTestHomePaths(t)
+	if err := os.WriteFile(homePaths.LogFile, []byte("daemon booted\n"), 0o644); err != nil {
+		t.Fatalf("os.WriteFile(%q) error = %v", homePaths.LogFile, err)
+	}
+
+	settingsService := &stubSettingsService{
+		GetSectionFn: func(
+			_ context.Context,
+			req settingspkg.SectionRequest,
+		) (settingspkg.SectionEnvelope, error) {
+			envelope := settingsTestSectionEnvelope(req.Section, req.Scope, req.WorkspaceID)
+			envelope.ProfileName = req.ProfileName
+			switch req.Section {
+			case settingspkg.SectionAttention:
+				envelope.AvailableScopes = []settingspkg.ScopeKind{settingspkg.ScopeUser, settingspkg.ScopeProfile}
+				envelope.Attention = &settingspkg.AttentionSection{Config: settingspkg.AttentionSettings{
+					Toasts: true, Sound: true,
+				}}
+			case settingspkg.SectionShell:
+				envelope.Shell = &settingspkg.ShellSection{Config: compozyconfig.DefaultShellConfig()}
+			case settingspkg.SectionWindowManager:
+				envelope.WindowManager = &settingspkg.WindowManagerSection{
+					Config: compozyconfig.DefaultWindowManagerConfig(),
+				}
+			}
+			return envelope, nil
+		},
+	}
+	restartController := &stubSettingsRestartController{}
+	handlers := newTestHandlersWithSettingsAndExtensions(
+		t,
+		settingsService,
+		restartController,
+		stubExtensionService{},
+		homePaths,
+	)
+	engine := newTestRouter(t, handlers)
+
+	tests := []struct {
+		name       string
+		method     string
+		path       string
+		body       []byte
+		wantStatus int
+		assert     func(t *testing.T, recorder *httptest.ResponseRecorder)
+	}{
+		{
+			name:       "get general section",
+			method:     http.MethodGet,
+			path:       "/api/settings/general",
+			wantStatus: http.StatusOK,
+			assert: func(t *testing.T, recorder *httptest.ResponseRecorder) {
+				t.Helper()
+
+				var response contract.SettingsGeneralResponse
+				decodeJSONResponse(t, recorder, &response)
+				if response.Section != contract.SettingsSectionGeneral {
+					t.Fatalf("response.Section = %q, want %q", response.Section, contract.SettingsSectionGeneral)
+				}
+				if settingsService.LastGetSectionRequest.Section != settingspkg.SectionGeneral {
+					t.Fatalf(
+						"LastGetSectionRequest.Section = %q, want %q",
+						settingsService.LastGetSectionRequest.Section,
+						settingspkg.SectionGeneral,
+					)
+				}
+			},
+		},
+		{
+			name:       "patch general section",
+			method:     http.MethodPatch,
+			path:       "/api/settings/general",
+			wantStatus: http.StatusOK,
+			body: mustJSONBody(t, contract.UpdateSettingsGeneralRequest{
+				Config: contract.SettingsGeneralConfigPayload{
+					Limits: contract.SettingsLimitsPayload{MaxConcurrentAgents: 2},
+					Permissions: contract.SettingsPermissionsPayload{
+						Mode: contract.SettingsPermissionModeApproveReads,
+					},
+					SessionTimeout: "30m",
+					HTTP:           contract.SettingsHTTPPayload{Host: "127.0.0.1", Port: 2123},
+					Daemon:         contract.SettingsDaemonPayload{Socket: "/tmp/compozy.sock"},
+					Terminal:       validUDSTerminalSettingsPayload(),
+				},
+			}),
+			assert: func(t *testing.T, recorder *httptest.ResponseRecorder) {
+				t.Helper()
+
+				var response contract.SettingsUserSectionMutationResult
+				decodeJSONResponse(t, recorder, &response)
+				if response.Section != contract.SettingsSectionGeneral {
+					t.Fatalf("response.Section = %q, want %q", response.Section, contract.SettingsSectionGeneral)
+				}
+				if settingsService.LastUpdateSectionRequest.Section != settingspkg.SectionGeneral {
+					t.Fatalf(
+						"LastUpdateSectionRequest.Section = %q, want %q",
+						settingsService.LastUpdateSectionRequest.Section,
+						settingspkg.SectionGeneral,
+					)
+				}
+				if settingsService.LastUpdateSectionRequest.General == nil ||
+					settingsService.LastUpdateSectionRequest.General.Limits.MaxConcurrentAgents != 2 {
+					t.Fatalf(
+						"LastUpdateSectionRequest.General = %#v, want parsed payload",
+						settingsService.LastUpdateSectionRequest.General,
+					)
+				}
+			},
+		},
+		{
+			name:       "Should get attention section",
+			method:     http.MethodGet,
+			path:       "/api/settings/attention?scope=profile&profile=marketing",
+			wantStatus: http.StatusOK,
+			assert: func(t *testing.T, recorder *httptest.ResponseRecorder) {
+				t.Helper()
+
+				var response contract.SettingsAttentionResponse
+				decodeJSONResponse(t, recorder, &response)
+				if response.Section != contract.SettingsSectionAttention ||
+					response.Scope != contract.SettingsLayeredScopeProfile || response.Profile != "marketing" ||
+					!response.Config.Toasts || !response.Config.Sound {
+					t.Fatalf("attention response = %#v, want enabled defaults", response)
+				}
+				if settingsService.LastGetSectionRequest.Section != settingspkg.SectionAttention ||
+					settingsService.LastGetSectionRequest.Scope != settingspkg.ScopeProfile ||
+					settingsService.LastGetSectionRequest.ProfileName != "marketing" {
+					t.Fatalf(
+						"LastGetSectionRequest.Section = %q, want %q",
+						settingsService.LastGetSectionRequest.Section,
+						settingspkg.SectionAttention,
+					)
+				}
+			},
+		},
+		{
+			name:       "Should patch attention section",
+			method:     http.MethodPatch,
+			path:       "/api/settings/attention",
+			wantStatus: http.StatusOK,
+			body: func() []byte {
+				mutedWorkspaces := []string{"ws_0123456789abcdef"}
+				return mustJSONBody(t, contract.UpdateSettingsAttentionRequest{
+					Config: contract.UpdateSettingsAttentionPayload{
+						Toasts: false, Sound: false, System: true,
+						MutedWorkspaces: &mutedWorkspaces,
+					},
+				})
+			}(),
+			assert: func(t *testing.T, recorder *httptest.ResponseRecorder) {
+				t.Helper()
+
+				var response contract.SettingsUserSectionMutationResult
+				decodeJSONResponse(t, recorder, &response)
+				if response.Section != contract.SettingsSectionAttention {
+					t.Fatalf("response.Section = %q, want attention", response.Section)
+				}
+				request := settingsService.LastUpdateSectionRequest
+				if request.Section != settingspkg.SectionAttention || request.Attention == nil ||
+					!request.ReplaceAttentionWorkspaceMutes ||
+					request.Attention.Toasts || request.Attention.Sound || !request.Attention.System ||
+					!reflect.DeepEqual(
+						request.Attention.MutedWorkspaces,
+						[]string{"ws_0123456789abcdef"},
+					) {
+					t.Fatalf("LastUpdateSectionRequest = %#v, want parsed attention config", request)
+				}
+			},
+		},
+		{
+			name:       "Should get shell section",
+			method:     http.MethodGet,
+			path:       "/api/settings/shell",
+			wantStatus: http.StatusOK,
+			assert: func(t *testing.T, recorder *httptest.ResponseRecorder) {
+				t.Helper()
+
+				var response contract.SettingsShellResponse
+				decodeJSONResponse(t, recorder, &response)
+				if response.Section != contract.SettingsSectionShell ||
+					response.Config.Sessions.Sort != contract.SettingsShellSessionSortCreated ||
+					response.Config.Sessions.Scope != contract.SettingsShellSessionScopeWorkspace {
+					t.Fatalf("shell response = %#v, want default session preferences", response)
+				}
+				if settingsService.LastGetSectionRequest.Section != settingspkg.SectionShell {
+					t.Fatalf(
+						"LastGetSectionRequest.Section = %q, want %q",
+						settingsService.LastGetSectionRequest.Section,
+						settingspkg.SectionShell,
+					)
+				}
+			},
+		},
+		{
+			name:       "Should patch shell section",
+			method:     http.MethodPatch,
+			path:       "/api/settings/shell",
+			wantStatus: http.StatusOK,
+			body: mustJSONBody(t, contract.UpdateSettingsShellRequest{
+				Config: contract.SettingsShellPayload{Sessions: contract.SettingsShellSessionsPayload{
+					Sort:  contract.SettingsShellSessionSortAttention,
+					Scope: contract.SettingsShellSessionScopeAllWorkspaces,
+				}},
+			}),
+			assert: func(t *testing.T, recorder *httptest.ResponseRecorder) {
+				t.Helper()
+
+				var response contract.SettingsUserSectionMutationResult
+				decodeJSONResponse(t, recorder, &response)
+				if response.Section != contract.SettingsSectionShell {
+					t.Fatalf("response.Section = %q, want shell", response.Section)
+				}
+				request := settingsService.LastUpdateSectionRequest
+				if request.Section != settingspkg.SectionShell || request.Shell == nil ||
+					request.Shell.Sessions.Sort != compozyconfig.ShellSessionSortAttention ||
+					request.Shell.Sessions.Scope != compozyconfig.ShellSessionScopeAllWorkspaces {
+					t.Fatalf("LastUpdateSectionRequest = %#v, want parsed shell config", request)
+				}
+			},
+		},
+		{
+			name:       "Should get window-manager section",
+			method:     http.MethodGet,
+			path:       "/api/settings/window-manager",
+			wantStatus: http.StatusOK,
+			assert: func(t *testing.T, recorder *httptest.ResponseRecorder) {
+				t.Helper()
+
+				var response contract.SettingsWindowManagerResponse
+				decodeJSONResponse(t, recorder, &response)
+				if response.Section != contract.SettingsSectionWindowManager ||
+					response.Config.HistoryLimit != 50 {
+					t.Fatalf("window-manager response = %#v, want default global section", response)
+				}
+				if settingsService.LastGetSectionRequest.Section != settingspkg.SectionWindowManager {
+					t.Fatalf(
+						"LastGetSectionRequest.Section = %q, want %q",
+						settingsService.LastGetSectionRequest.Section,
+						settingspkg.SectionWindowManager,
+					)
+				}
+			},
+		},
+		{
+			name:       "Should patch window-manager section",
+			method:     http.MethodPatch,
+			path:       "/api/settings/window-manager",
+			wantStatus: http.StatusOK,
+			body: mustJSONBody(t, contract.UpdateSettingsWindowManagerRequest{
+				Config: new(validUDSWindowManagerSettingsPayload()),
+			}),
+			assert: func(t *testing.T, recorder *httptest.ResponseRecorder) {
+				t.Helper()
+
+				var response contract.SettingsUserSectionMutationResult
+				decodeJSONResponse(t, recorder, &response)
+				if response.Section != contract.SettingsSectionWindowManager {
+					t.Fatalf(
+						"response.Section = %q, want %q",
+						response.Section,
+						contract.SettingsSectionWindowManager,
+					)
+				}
+				request := settingsService.LastUpdateSectionRequest
+				if request.Section != settingspkg.SectionWindowManager ||
+					request.WindowManager == nil ||
+					request.WindowManager.HistoryLimit != 77 ||
+					request.WindowManager.NavStackLimit != 66 ||
+					request.WindowManager.ClosedEntryLimit != 18 ||
+					!slices.Equal(
+						request.WindowManager.Shortcuts["desktop.switch.next"],
+						windowmanager.ShortcutBinding{"Meta+ArrowRight"},
+					) {
+					t.Fatalf("LastUpdateSectionRequest = %#v, want parsed window-manager config", request)
+				}
+			},
+		},
+		{
+			name:       "list scoped mcp servers",
+			method:     http.MethodGet,
+			path:       "/api/settings/mcp-servers?scope=workspace&workspace_id=ws-1",
+			wantStatus: http.StatusOK,
+			assert: func(t *testing.T, recorder *httptest.ResponseRecorder) {
+				t.Helper()
+
+				var response contract.SettingsMCPServersResponse
+				decodeJSONResponse(t, recorder, &response)
+				if response.Scope != contract.SettingsLayeredScopeWorkspace || response.WorkspaceID != "ws-1" {
+					t.Fatalf(
+						"response meta = %#v, want workspace ws-1",
+						response.SettingsLayeredCollectionResponseMetaPayload,
+					)
+				}
+				if settingsService.LastListCollectionRequest.Collection != settingspkg.CollectionMCPServers ||
+					settingsService.LastListCollectionRequest.Scope != settingspkg.ScopeWorkspace ||
+					settingsService.LastListCollectionRequest.WorkspaceID != "ws-1" {
+					t.Fatalf("LastListCollectionRequest = %#v", settingsService.LastListCollectionRequest)
+				}
+			},
+		},
+		{
+			name:       "put scoped mcp server",
+			method:     http.MethodPut,
+			path:       "/api/settings/mcp-servers/server-a?scope=workspace&workspace_id=ws-1&target=sidecar",
+			wantStatus: http.StatusOK,
+			body: mustJSONBody(t, contract.PutSettingsMCPServerRequest{
+				Server: contract.SettingsMCPServerPayload{Name: "server-a", Command: "mcpd"},
+			}),
+			assert: func(t *testing.T, recorder *httptest.ResponseRecorder) {
+				t.Helper()
+
+				var response contract.SettingsLayeredCollectionMutationResult
+				decodeJSONResponse(t, recorder, &response)
+				if response.Scope != contract.SettingsLayeredScopeWorkspace || response.WorkspaceID != "ws-1" {
+					t.Fatalf("response = %#v, want workspace mutation metadata", response)
+				}
+				if settingsService.LastPutCollectionRequest.Collection != settingspkg.CollectionMCPServers ||
+					settingsService.LastPutCollectionRequest.Scope != settingspkg.ScopeWorkspace ||
+					settingsService.LastPutCollectionRequest.WorkspaceID != "ws-1" ||
+					settingsService.LastPutCollectionRequest.Target != settingspkg.TargetSidecar {
+					t.Fatalf("LastPutCollectionRequest = %#v", settingsService.LastPutCollectionRequest)
+				}
+				if settingsService.LastPutCollectionRequest.MCPServer == nil ||
+					settingsService.LastPutCollectionRequest.MCPServer.Command != "mcpd" {
+					t.Fatalf(
+						"LastPutCollectionRequest.MCPServer = %#v, want parsed server payload",
+						settingsService.LastPutCollectionRequest.MCPServer,
+					)
+				}
+			},
+		},
+		{
+			name:       "Should reject retired catalog installation",
+			method:     http.MethodPost,
+			path:       "/api/settings/mcp-servers/install",
+			body:       []byte(`{"entry_id":"github","values":{}}`),
+			wantStatus: http.StatusNotFound,
+			assert: func(t *testing.T, recorder *httptest.ResponseRecorder) {
+				t.Helper()
+				if !strings.Contains(recorder.Body.String(), "404") {
+					t.Fatalf("removed install body: %s", recorder.Body.String())
+				}
+			},
+		},
+		{
+			name:       "delete scoped mcp server",
+			method:     http.MethodDelete,
+			path:       "/api/settings/mcp-servers/server-a?scope=workspace&workspace_id=ws-1&target=sidecar",
+			wantStatus: http.StatusOK,
+			assert: func(t *testing.T, recorder *httptest.ResponseRecorder) {
+				t.Helper()
+
+				var response contract.SettingsLayeredCollectionMutationResult
+				decodeJSONResponse(t, recorder, &response)
+				if response.Scope != contract.SettingsLayeredScopeWorkspace || response.WorkspaceID != "ws-1" {
+					t.Fatalf("response = %#v, want workspace mutation metadata", response)
+				}
+				if settingsService.LastDeleteCollectionRequest.Collection != settingspkg.CollectionMCPServers ||
+					settingsService.LastDeleteCollectionRequest.Scope != settingspkg.ScopeWorkspace ||
+					settingsService.LastDeleteCollectionRequest.WorkspaceID != "ws-1" ||
+					settingsService.LastDeleteCollectionRequest.Target != settingspkg.TargetSidecar {
+					t.Fatalf("LastDeleteCollectionRequest = %#v", settingsService.LastDeleteCollectionRequest)
+				}
+			},
+		},
+		{
+			name:       "trigger restart action",
+			method:     http.MethodPost,
+			path:       "/api/settings/actions/restart",
+			body:       []byte(`{}`),
+			wantStatus: http.StatusAccepted,
+			assert: func(t *testing.T, recorder *httptest.ResponseRecorder) {
+				t.Helper()
+
+				var response contract.RestartActionResponse
+				decodeJSONResponse(t, recorder, &response)
+				if response.OperationID != "op-123" || response.StatusURL != "/api/settings/actions/restart/op-123" {
+					t.Fatalf("response = %#v, want restart payload shape", response)
+				}
+				if restartController.RequestRestartCalls != 1 {
+					t.Fatalf("RequestRestartCalls = %d, want 1", restartController.RequestRestartCalls)
+				}
+			},
+		},
+		{
+			name:       "poll restart action",
+			method:     http.MethodGet,
+			path:       "/api/settings/actions/restart/op-123",
+			wantStatus: http.StatusOK,
+			assert: func(t *testing.T, recorder *httptest.ResponseRecorder) {
+				t.Helper()
+
+				var response contract.RestartActionStatus
+				decodeJSONResponse(t, recorder, &response)
+				if response.OperationID != "op-123" || response.Status != contract.RestartOperationReady {
+					t.Fatalf("response = %#v, want persisted restart status payload", response)
+				}
+				if restartController.GetRestartOperationID != "op-123" {
+					t.Fatalf("GetRestartOperationID = %q, want %q", restartController.GetRestartOperationID, "op-123")
+				}
+			},
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			recorder := performRequest(t, engine, tc.method, tc.path, tc.body)
+			if recorder.Code != tc.wantStatus {
+				t.Fatalf(
+					"%s %s status = %d, want %d; body=%s",
+					tc.method,
+					tc.path,
+					recorder.Code,
+					tc.wantStatus,
+					recorder.Body.String(),
+				)
+			}
+			if tc.assert != nil {
+				tc.assert(t, recorder)
+			}
+		})
+	}
+}
+
+func validUDSTerminalSettingsPayload() contract.SettingsTerminalPayload {
+	terminal := compozyconfig.DefaultTerminalConfig()
+	return contract.SettingsTerminalPayload{
+		DefaultShell:           terminal.DefaultShell,
+		ShellIntegration:       terminal.ShellIntegration,
+		ScrollbackBytes:        terminal.ScrollbackBytes,
+		DetachedTTL:            terminal.DetachedTTL.String(),
+		ExitRetention:          terminal.ExitRetention.String(),
+		Recording:              terminal.Recording,
+		RecordingRetentionDays: terminal.RecordingRetentionDays,
+		MaxPerWorkspace:        terminal.MaxPerWorkspace,
+		MaxPerDaemon:           terminal.MaxPerDaemon,
+		MaxSubscribers:         terminal.MaxSubscribers,
+	}
+}
+
+func validUDSWindowManagerSettingsPayload() contract.SettingsWindowManagerConfigPayload {
+	return contract.SettingsWindowManagerConfigPayload{
+		NewWindowPolicy:     contract.SettingsWindowNewPolicyBesideFocus,
+		SmallViewportPolicy: contract.SettingsWindowSmallViewportPolicyReject,
+		FocusPolicy:         contract.SettingsWindowFocusPolicyDirectional,
+		FocusWrap:           true,
+		FocusFollowsPointer: true,
+		RaiseOnFocus:        false,
+		DragAwayPolicy:      contract.SettingsWindowDragAwayPolicyGroup,
+		GroupMoveModifier:   contract.SettingsWindowDragModifierControl,
+		SwapModifier:        contract.SettingsWindowDragModifierMeta,
+		HistoryLimit:        77,
+		NavStackLimit:       66,
+		ClosedEntryLimit:    18,
+		DesktopTransition:   contract.SettingsWindowDesktopTransitionCrossfade,
+		Gaps: contract.SettingsWindowManagerGapsPayload{
+			Inner: 12, Top: 18, Right: 14, Bottom: 16, Left: 20,
+		},
+		Snap: contract.SettingsWindowManagerSnapPayload{
+			EdgeBand:     40,
+			CornerReach:  180,
+			ExitSlack:    20,
+			RepeatRatios: []float64{0.4, 0.7, 0.3},
+		},
+		Bindings: contract.SettingsWindowManagerBindingPayload{
+			TopCenter:    contract.SettingsWindowBindingActionNone,
+			BottomCenter: contract.SettingsWindowBindingActionZoom,
+		},
+		Shortcuts: map[string]windowmanager.ShortcutBinding{"desktop.switch.next": {"Meta+ArrowRight"}},
+	}
+}
+
+func TestCreateSessionHandlerReturnsSessionID(t *testing.T) {
+	homePaths := newTestHomePaths(t)
+	manager := &stubSessionManager{
+		CreateFn: func(_ context.Context, optsInput *session.CreateOpts) (*session.Session, error) {
+			opts := *optsInput
+
+			if opts.AgentName != "coder" || opts.Name != "demo" || opts.Workspace != "alpha" ||
+				opts.WorkspacePath != "" {
+				t.Fatalf("Create() opts = %#v", opts)
+			}
+			return newSession("sess-123"), nil
+		},
+	}
+	handlers := newTestHandlers(t, manager, stubObserver{}, homePaths)
+	engine := newTestRouter(t, handlers)
+
+	recorder := performRequest(
+		t,
+		engine,
+		http.MethodPost,
+		"/api/sessions",
+		[]byte(`{"agent_name":"coder","name":"demo","workspace":"alpha"}`),
+	)
+	if recorder.Code != http.StatusCreated {
+		t.Fatalf("status = %d, want %d; body=%s", recorder.Code, http.StatusCreated, recorder.Body.String())
+	}
+
+	var response struct {
+		Session sessionPayload `json:"session"`
+	}
+	decodeJSONResponse(t, recorder, &response)
+	if response.Session.ID != "sess-123" {
+		t.Fatalf("session.id = %q, want %q", response.Session.ID, "sess-123")
+	}
+	if response.Session.WorkspaceID != "ws-workspace" || response.Session.WorkspacePath != "/workspace" {
+		t.Fatalf("session workspace = %#v", response.Session)
+	}
+}
+
+func TestCreateSessionHandlerAllowsMissingAgent(t *testing.T) {
+	homePaths := newTestHomePaths(t)
+	manager := &stubSessionManager{
+		CreateFn: func(_ context.Context, optsInput *session.CreateOpts) (*session.Session, error) {
+			opts := *optsInput
+
+			if opts.AgentName != "" {
+				t.Fatalf("Create() AgentName = %q, want empty", opts.AgentName)
+			}
+			if opts.WorkspacePath == "" || opts.Workspace != "" {
+				t.Fatalf("Create() workspace opts = %#v", opts)
+			}
+			return newSession("sess-default"), nil
+		},
+	}
+	engine := newTestRouter(t, newTestHandlers(t, manager, stubObserver{}, homePaths))
+
+	recorder := performRequest(
+		t,
+		engine,
+		http.MethodPost,
+		"/api/sessions",
+		[]byte(`{"name":"demo","workspace_path":"/workspace"}`),
+	)
+	if recorder.Code != http.StatusCreated {
+		t.Fatalf("status = %d, want %d; body=%s", recorder.Code, http.StatusCreated, recorder.Body.String())
+	}
+}
+
+func TestListSessionsHandlerReturnsAllSessions(t *testing.T) {
+	homePaths := newTestHomePaths(t)
+	manager := &stubSessionManager{
+		ListAllFn: func(context.Context) ([]*session.Info, error) {
+			return []*session.Info{newSessionInfo("sess-a"), newSessionInfo("sess-b")}, nil
+		},
+	}
+	handlers := newTestHandlers(t, manager, stubObserver{}, homePaths)
+	engine := newTestRouter(t, handlers)
+
+	recorder := performRequest(t, engine, http.MethodGet, "/api/sessions?all_workspaces=true", nil)
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d", recorder.Code, http.StatusOK)
+	}
+
+	var response struct {
+		Sessions []sessionPayload                  `json:"sessions"`
+		Page     contract.CountedCursorPagePayload `json:"page"`
+	}
+	decodeJSONResponse(t, recorder, &response)
+	if len(response.Sessions) != 2 {
+		t.Fatalf("len(sessions) = %d, want 2", len(response.Sessions))
+	}
+	if response.Page.Total != 2 || response.Page.Limit != session.DefaultListLimit {
+		t.Fatalf("page = %#v, want UDS counted page metadata", response.Page)
+	}
+}
+
+func TestListSessionsHandlerFiltersByWorkspace(t *testing.T) {
+	homePaths := newTestHomePaths(t)
+	infoA := newSessionInfo("sess-a")
+	infoB := newSessionInfo("sess-b")
+	infoB.WorkspaceID = "ws-beta"
+	infoB.Workspace = "/other"
+
+	manager := &stubSessionManager{
+		ListAllFn: func(context.Context) ([]*session.Info, error) {
+			return []*session.Info{infoA, infoB}, nil
+		},
+	}
+	workspaces := stubWorkspaceService{
+		GetFn: func(_ context.Context, ref string) (workspacepkg.Workspace, error) {
+			if ref != "alpha" {
+				t.Fatalf("Get() ref = %q, want alpha", ref)
+			}
+			return workspacepkg.Workspace{ID: "ws-workspace", Name: "alpha"}, nil
+		},
+	}
+	engine := newTestRouter(t, newTestHandlersWithWorkspace(t, manager, stubObserver{}, workspaces, homePaths))
+
+	recorder := performRequest(t, engine, http.MethodGet, "/api/sessions?workspace_id=alpha", nil)
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d; body=%s", recorder.Code, http.StatusOK, recorder.Body.String())
+	}
+
+	var response struct {
+		Sessions []sessionPayload                  `json:"sessions"`
+		Page     contract.CountedCursorPagePayload `json:"page"`
+	}
+	decodeJSONResponse(t, recorder, &response)
+	if len(response.Sessions) != 1 || response.Sessions[0].ID != "sess-a" {
+		t.Fatalf("sessions = %#v", response.Sessions)
+	}
+	if response.Sessions[0].WorkspaceID != "ws-workspace" {
+		t.Fatalf("workspace_id = %q, want ws-workspace", response.Sessions[0].WorkspaceID)
+	}
+	if response.Page.Total != 1 {
+		t.Fatalf("page total = %d, want workspace-scoped total 1", response.Page.Total)
+	}
+}
+
+func TestHookEventsHandlerAvailableOnUDSRouter(t *testing.T) {
+	t.Parallel()
+
+	homePaths := newTestHomePaths(t)
+	observer := stubObserver{
+		QueryHookEventsFn: func(_ context.Context, filter hookspkg.EventFilter) ([]hookspkg.EventDescriptor, error) {
+			if filter.Family != hookspkg.HookEventFamilyTool {
+				t.Fatalf("filter.Family = %q, want %q", filter.Family, hookspkg.HookEventFamilyTool)
+			}
+			if !filter.SyncOnly {
+				t.Fatal("filter.SyncOnly = false, want true")
+			}
+			return []hookspkg.EventDescriptor{{
+				Event:         hookspkg.HookToolPreCall,
+				Family:        hookspkg.HookEventFamilyTool,
+				SyncEligible:  true,
+				PayloadSchema: "ToolPreCallPayload",
+				PatchSchema:   "ToolCallPatch",
+			}}, nil
+		},
+	}
+	engine := newTestRouter(t, newTestHandlers(t, &stubSessionManager{}, observer, homePaths))
+
+	recorder := performRequest(t, engine, http.MethodGet, "/api/hooks/events?family=tool&sync_only=true", nil)
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d; body=%s", recorder.Code, http.StatusOK, recorder.Body.String())
+	}
+
+	var response struct {
+		Events []contract.HookEventPayload `json:"events"`
+	}
+	decodeJSONResponse(t, recorder, &response)
+	if got, want := len(response.Events), 1; got != want {
+		t.Fatalf("len(events) = %d, want %d", got, want)
+	}
+	if response.Events[0].Event != hookspkg.HookToolPreCall.String() {
+		t.Fatalf("events[0].Event = %q, want %q", response.Events[0].Event, hookspkg.HookToolPreCall)
+	}
+}
+
+func TestCreateWorkspaceHandlerRegistersWorkspace(t *testing.T) {
+	homePaths := newTestHomePaths(t)
+	rootDir := t.TempDir()
+	addDir := filepath.Join(t.TempDir(), "shared")
+	if err := os.MkdirAll(addDir, 0o755); err != nil {
+		t.Fatalf("os.MkdirAll(addDir) error = %v", err)
+	}
+
+	workspaces := stubWorkspaceService{
+		RegisterFn: func(_ context.Context, opts workspacepkg.RegisterOptions) (workspacepkg.Workspace, error) {
+			if opts.RootDir != rootDir || opts.Name != "alpha" || len(opts.AdditionalDirs) != 1 ||
+				opts.AdditionalDirs[0] != addDir || opts.DefaultAgent != "coder" {
+				t.Fatalf("Register() opts = %#v", opts)
+			}
+			return workspacepkg.Workspace{
+				ID:             "ws_alpha123",
+				RootDir:        rootDir,
+				AdditionalDirs: []string{addDir},
+				Name:           "alpha",
+				DefaultAgent:   "coder",
+
+				CreatedAt: time.Date(2026, 4, 3, 12, 0, 0, 0, time.UTC),
+				UpdatedAt: time.Date(2026, 4, 3, 12, 0, 0, 0, time.UTC),
+			}, nil
+		},
+	}
+	engine := newTestRouter(
+		t,
+		newTestHandlersWithWorkspace(t, &stubSessionManager{}, stubObserver{}, workspaces, homePaths),
+	)
+
+	body := mustJSONBody(t, map[string]any{
+		"root_dir":      rootDir,
+		"name":          "alpha",
+		"add_dirs":      []string{addDir},
+		"default_agent": "coder",
+	})
+	recorder := performRequest(t, engine, http.MethodPost, "/api/workspaces", body)
+	if recorder.Code != http.StatusCreated {
+		t.Fatalf("status = %d, want %d; body=%s", recorder.Code, http.StatusCreated, recorder.Body.String())
+	}
+
+	var response struct {
+		Workspace workspacePayload `json:"workspace"`
+	}
+	decodeJSONResponse(t, recorder, &response)
+	if response.Workspace.ID != "ws_alpha123" {
+		t.Fatalf("workspace.id = %q, want ws_alpha123", response.Workspace.ID)
+	}
+}
+
+func TestListWorkspacesHandlerReturnsRows(t *testing.T) {
+	homePaths := newTestHomePaths(t)
+	workspaces := stubWorkspaceService{
+		ListFn: func(context.Context) ([]workspacepkg.Workspace, error) {
+			return []workspacepkg.Workspace{{
+				ID:        "ws_alpha",
+				RootDir:   "/workspace",
+				Name:      "alpha",
+				CreatedAt: time.Date(2026, 4, 3, 12, 0, 0, 0, time.UTC),
+				UpdatedAt: time.Date(2026, 4, 3, 12, 5, 0, 0, time.UTC),
+			}}, nil
+		},
+	}
+	engine := newTestRouter(
+		t,
+		newTestHandlersWithWorkspace(t, &stubSessionManager{}, stubObserver{}, workspaces, homePaths),
+	)
+
+	recorder := performRequest(t, engine, http.MethodGet, "/api/workspaces", nil)
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d; body=%s", recorder.Code, http.StatusOK, recorder.Body.String())
+	}
+
+	var response struct {
+		Workspaces []workspacePayload `json:"workspaces"`
+	}
+	decodeJSONResponse(t, recorder, &response)
+	if len(response.Workspaces) != 1 || response.Workspaces[0].ID != "ws_alpha" {
+		t.Fatalf("workspaces = %#v", response.Workspaces)
+	}
+}
+
+func TestGetWorkspaceHandlerReturnsDetail(t *testing.T) {
+	homePaths := newTestHomePaths(t)
+	rootDir := t.TempDir()
+	sharedSkillDir := filepath.Join(rootDir, ".compozy", "skills", "marketing", "brief")
+	resolved := workspacepkg.ResolvedWorkspace{
+		ID:          "ws_alpha",
+		RootDir:     rootDir,
+		Name:        "alpha",
+		CreatedAt:   time.Date(2026, 4, 3, 12, 0, 0, 0, time.UTC),
+		UpdatedAt:   time.Date(2026, 4, 3, 12, 0, 0, 0, time.UTC),
+		WorkspaceID: "ws_alpha",
+		Config: compozyconfig.Config{
+			Providers: map[string]compozyconfig.ProviderConfig{
+				"alpha": {Command: "alpha --acp"},
+			},
+		},
+		Agents: []compozyconfig.AgentDef{{
+			Name:     "coder",
+			Provider: "fake",
+			Prompt:   "hello",
+		}},
+		Skills: []workspacepkg.SkillPath{{
+			Name:   "campaign-brief",
+			Dir:    sharedSkillDir,
+			Source: "workspace",
+		}},
+	}
+	manager := &stubSessionManager{
+		ListAllFn: func(context.Context) ([]*session.Info, error) {
+			info := newSessionInfo("sess-a")
+			info.WorkspaceID = "ws_alpha"
+			return []*session.Info{info}, nil
+		},
+	}
+	workspaces := stubWorkspaceService{
+		ResolveFn: func(_ context.Context, ref string) (workspacepkg.ResolvedWorkspace, error) {
+			if ref != "ws_alpha" {
+				t.Fatalf("Resolve() ref = %q, want ws_alpha", ref)
+			}
+			return resolved, nil
+		},
+	}
+	engine := newTestRouter(t, newTestHandlersWithWorkspace(t, manager, stubObserver{}, workspaces, homePaths))
+
+	recorder := performRequest(t, engine, http.MethodGet, "/api/workspaces/ws_alpha", nil)
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d; body=%s", recorder.Code, http.StatusOK, recorder.Body.String())
+	}
+
+	var response contract.WorkspaceDetailPayload
+	decodeJSONResponse(t, recorder, &response)
+	if response.Workspace.ID != "ws_alpha" || len(response.Sessions) != 1 || len(response.Agents) != 1 ||
+		len(response.Skills) != 1 {
+		t.Fatalf("workspace detail = %#v", response)
+	}
+	if response.Skills[0].Name != "campaign-brief" {
+		t.Fatalf("skill name = %q, want campaign-brief", response.Skills[0].Name)
+	}
+	expectedProviders := core.SessionProviderOptionPayloadsFromConfig(&resolved.Config)
+	if len(response.Providers) != len(expectedProviders) {
+		t.Fatalf("len(providers) = %d, want %d (%#v)", len(response.Providers), len(expectedProviders), response)
+	}
+	for i, want := range expectedProviders {
+		if got := response.Providers[i]; !reflect.DeepEqual(got, want) {
+			t.Fatalf("providers[%d] = %#v, want %#v", i, got, want)
+		}
+	}
+}
+
+func TestUpdateWorkspaceHandlerUpdatesWorkspace(t *testing.T) {
+	homePaths := newTestHomePaths(t)
+	rootDir := t.TempDir()
+	addDir := filepath.Join(t.TempDir(), "shared")
+	if err := os.MkdirAll(addDir, 0o755); err != nil {
+		t.Fatalf("os.MkdirAll(addDir) error = %v", err)
+	}
+
+	var updated bool
+	workspaces := stubWorkspaceService{
+		GetFn: func(_ context.Context, _ string) (workspacepkg.Workspace, error) {
+			if !updated {
+				return workspacepkg.Workspace{ID: "ws_alpha", RootDir: rootDir, Name: "alpha"}, nil
+			}
+			return workspacepkg.Workspace{
+				ID:             "ws_alpha",
+				RootDir:        rootDir,
+				Name:           "beta",
+				AdditionalDirs: []string{addDir},
+				DefaultAgent:   "reviewer",
+			}, nil
+		},
+		UpdateFn: func(_ context.Context, id string, opts workspacepkg.UpdateOptions) error {
+			if id != "ws_alpha" || opts.Name == nil || *opts.Name != "beta" || opts.AdditionalDirs == nil ||
+				len(*opts.AdditionalDirs) != 1 || (*opts.AdditionalDirs)[0] != addDir ||
+				opts.DefaultAgent == nil || *opts.DefaultAgent != "reviewer" {
+				t.Fatalf("Update() id=%q opts=%#v", id, opts)
+			}
+			updated = true
+			return nil
+		},
+	}
+	engine := newTestRouter(
+		t,
+		newTestHandlersWithWorkspace(t, &stubSessionManager{}, stubObserver{}, workspaces, homePaths),
+	)
+
+	body := mustJSONBody(t, map[string]any{
+		"name":          "beta",
+		"add_dirs":      []string{addDir},
+		"default_agent": "reviewer",
+	})
+	recorder := performRequest(t, engine, http.MethodPatch, "/api/workspaces/ws_alpha", body)
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d; body=%s", recorder.Code, http.StatusOK, recorder.Body.String())
+	}
+
+	var response struct {
+		Workspace workspacePayload `json:"workspace"`
+	}
+	decodeJSONResponse(t, recorder, &response)
+	if response.Workspace.Name != "beta" || len(response.Workspace.AddDirs) != 1 {
+		t.Fatalf("workspace = %#v", response.Workspace)
+	}
+}
+
+func TestDeleteWorkspaceHandlerReturnsNoContent(t *testing.T) {
+	homePaths := newTestHomePaths(t)
+	workspaces := stubWorkspaceService{
+		GetFn: func(context.Context, string) (workspacepkg.Workspace, error) {
+			return workspacepkg.Workspace{ID: "ws_alpha", Name: "alpha"}, nil
+		},
+		UnregisterFn: func(_ context.Context, id string) error {
+			if id != "ws_alpha" {
+				t.Fatalf("Unregister() id = %q, want ws_alpha", id)
+			}
+			return nil
+		},
+	}
+	engine := newTestRouter(
+		t,
+		newTestHandlersWithWorkspace(t, &stubSessionManager{}, stubObserver{}, workspaces, homePaths),
+	)
+
+	recorder := performRequest(t, engine, http.MethodDelete, "/api/workspaces/ws_alpha", nil)
+	if recorder.Code != http.StatusNoContent {
+		t.Fatalf("status = %d, want %d; body=%s", recorder.Code, http.StatusNoContent, recorder.Body.String())
+	}
+}
+
+func TestResolveWorkspaceHandlerReturnsWorkspace(t *testing.T) {
+	homePaths := newTestHomePaths(t)
+	rootDir := t.TempDir()
+	workspaces := stubWorkspaceService{
+		ResolveOrRegisterFn: func(_ context.Context, path string) (workspacepkg.ResolvedWorkspace, error) {
+			if path != rootDir {
+				t.Fatalf("ResolveOrRegister() path = %q, want %q", path, rootDir)
+			}
+			return workspacepkg.ResolvedWorkspace{
+				ID:          "ws_alpha",
+				RootDir:     rootDir,
+				Name:        "alpha",
+				CreatedAt:   time.Date(2026, 4, 3, 12, 0, 0, 0, time.UTC),
+				UpdatedAt:   time.Date(2026, 4, 3, 12, 0, 0, 0, time.UTC),
+				WorkspaceID: "ws_alpha",
+			}, nil
+		},
+	}
+	engine := newTestRouter(
+		t,
+		newTestHandlersWithWorkspace(t, &stubSessionManager{}, stubObserver{}, workspaces, homePaths),
+	)
+
+	recorder := performRequest(
+		t,
+		engine,
+		http.MethodPost,
+		"/api/workspaces/resolve",
+		mustJSONBody(t, map[string]string{"path": rootDir}),
+	)
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d; body=%s", recorder.Code, http.StatusOK, recorder.Body.String())
+	}
+
+	var response struct {
+		Workspace workspacePayload `json:"workspace"`
+	}
+	decodeJSONResponse(t, recorder, &response)
+	if response.Workspace.ID != "ws_alpha" {
+		t.Fatalf("workspace.id = %q, want ws_alpha", response.Workspace.ID)
+	}
+}
+
+func TestDeleteSessionHandlerReturnsNoContent(t *testing.T) {
+	t.Parallel()
+
+	t.Run("ShouldReturnNoContent", func(t *testing.T) {
+		t.Parallel()
+
+		homePaths := newTestHomePaths(t)
+		manager := &stubSessionManager{
+			DeleteFn: func(_ context.Context, id string) error {
+				if id != "sess-123" {
+					t.Fatalf("Delete() id = %q, want sess-123", id)
+				}
+				return nil
+			},
+		}
+		handlers := newTestHandlers(t, manager, stubObserver{}, homePaths)
+		engine := newTestRouter(t, handlers)
+
+		recorder := performRequest(t, engine, http.MethodDelete, "/api/workspaces/ws-workspace/sessions/sess-123", nil)
+		if recorder.Code != http.StatusNoContent {
+			t.Fatalf("status = %d, want %d", recorder.Code, http.StatusNoContent)
+		}
+		if got := recorder.Body.String(); got != "" {
+			t.Fatalf("body = %q, want empty", got)
+		}
+	})
+}
+
+func TestStopSessionHandlerReturnsStopped(t *testing.T) {
+	homePaths := newTestHomePaths(t)
+	manager := &stubSessionManager{
+		StopFn: func(_ context.Context, id string) error {
+			if id != "sess-123" {
+				t.Fatalf("Stop() id = %q, want sess-123", id)
+			}
+			return nil
+		},
+	}
+	handlers := newTestHandlers(t, manager, stubObserver{}, homePaths)
+	engine := newTestRouter(t, handlers)
+
+	recorder := performRequest(t, engine, http.MethodPost, "/api/workspaces/ws-workspace/sessions/sess-123/stop", nil)
+	if recorder.Code != http.StatusNoContent {
+		t.Fatalf("status = %d, want %d", recorder.Code, http.StatusNoContent)
+	}
+	if got := recorder.Body.String(); got != "" {
+		t.Fatalf("body = %q, want empty", got)
+	}
+}
+
+func TestAttachSessionHandlerReturnsSession(t *testing.T) {
+	homePaths := newTestHomePaths(t)
+	manager := &stubSessionManager{
+		AttachSessionFn: func(_ context.Context, req store.SessionAttachRequest) (store.SessionAttach, error) {
+			if req.SessionID != "sess-123" {
+				t.Fatalf("AttachSession() session id = %q, want sess-123", req.SessionID)
+			}
+			now := time.Date(2026, 4, 3, 12, 0, 1, 0, time.UTC)
+			return store.SessionAttach{
+				SessionID:       req.SessionID,
+				AttachedTo:      req.AttachedTo,
+				AttachedAt:      now,
+				AttachExpiresAt: now.Add(time.Minute),
+			}, nil
+		},
+	}
+	handlers := newTestHandlers(t, manager, stubObserver{}, homePaths)
+	engine := newTestRouter(t, handlers)
+
+	recorder := performRequest(t, engine, http.MethodPost, "/api/workspaces/ws-workspace/sessions/sess-123/attach", nil)
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d", recorder.Code, http.StatusOK)
+	}
+}
+
+func TestPromptSessionHandlerReturnsSSEStream(t *testing.T) {
+	t.Run("ShouldReturnAnSSEStream", func(t *testing.T) {
+		homePaths := newTestHomePaths(t)
+		manager := &stubSessionManager{
+			SendPromptFn: func(context.Context, string, session.SendPromptOpts) (session.SendPromptResult, error) {
+				ch := make(chan acp.AgentEvent, 2)
+				ch <- acp.AgentEvent{
+					Type:      "agent_message",
+					TurnID:    "turn-1",
+					Timestamp: time.Date(2026, 4, 3, 12, 0, 0, 0, time.UTC),
+					Text:      "hello",
+				}
+				ch <- acp.AgentEvent{
+					Type:       "done",
+					TurnID:     "turn-1",
+					Timestamp:  time.Date(2026, 4, 3, 12, 0, 1, 0, time.UTC),
+					StopReason: "end_turn",
+				}
+				close(ch)
+				return session.SendPromptResult{Status: "accepted", Events: ch, NewTurnID: "turn-1"}, nil
+			},
+		}
+		handlers := newTestHandlers(t, manager, stubObserver{}, homePaths)
+		engine := newTestRouter(t, handlers)
+
+		recorder := performRequest(
+			t,
+			engine,
+			http.MethodPost,
+			"/api/workspaces/ws-workspace/sessions/sess-123/prompt",
+			[]byte(`{"message":"hello","message_id":"msg-uds-stream","idempotency_key":"idem-uds-stream"}`),
+		)
+		if recorder.Code != http.StatusOK {
+			t.Fatalf("status = %d, want %d; body=%s", recorder.Code, http.StatusOK, recorder.Body.String())
+		}
+		if got := recorder.Header().Get("Content-Type"); got != "text/event-stream" {
+			t.Fatalf("Content-Type = %q, want text/event-stream", got)
+		}
+		if got := recorder.Header().Get("x-vercel-ai-ui-message-stream"); got != "v1" {
+			t.Fatalf("x-vercel-ai-ui-message-stream = %q, want v1", got)
+		}
+
+		records := parseSSE(t, recorder.Body.String())
+		if len(records) < 5 {
+			t.Fatalf("len(records) = %d, want at least 5; body=%s", len(records), recorder.Body.String())
+		}
+		if string(records[len(records)-1].Data) != "[DONE]" {
+			t.Fatalf("last data = %q, want [DONE]", string(records[len(records)-1].Data))
+		}
+
+		partTypes := make([]string, 0, len(records))
+		for _, record := range records[:len(records)-1] {
+			if len(record.Data) == 0 || string(record.Data) == "[DONE]" {
+				continue
+			}
+			var payload struct {
+				Type string `json:"type"`
+			}
+			if err := json.Unmarshal(record.Data, &payload); err != nil {
+				t.Fatalf("json.Unmarshal(prompt part) error = %v; data=%s", err, string(record.Data))
+			}
+			partTypes = append(partTypes, payload.Type)
+		}
+		hasType := func(target string) bool {
+			return slices.Contains(partTypes, target)
+		}
+		if !hasType("start") || !hasType("text-start") || !hasType("text-delta") ||
+			!hasType("text-end") || !hasType("finish") {
+			t.Fatalf("prompt part types = %#v", partTypes)
+		}
+	})
+}
+
+func TestPromptSessionHandlerRequiresAcceptedTurnIDForSSEStream(t *testing.T) {
+	t.Run("ShouldRejectAcceptedStreamWithoutDurableTurnID", func(t *testing.T) {
+		homePaths := newTestHomePaths(t)
+		manager := &stubSessionManager{
+			SendPromptFn: func(context.Context, string, session.SendPromptOpts) (session.SendPromptResult, error) {
+				ch := make(chan acp.AgentEvent)
+				close(ch)
+				return session.SendPromptResult{Status: "accepted", Events: ch}, nil
+			},
+		}
+		handlers := newTestHandlers(t, manager, stubObserver{}, homePaths)
+		engine := newTestRouter(t, handlers)
+
+		recorder := performRequest(
+			t,
+			engine,
+			http.MethodPost,
+			"/api/workspaces/ws-workspace/sessions/sess-123/prompt",
+			[]byte(
+				`{"message":"hello","message_id":"msg-uds-accepted-turn","idempotency_key":"idem-uds-accepted-turn"}`,
+			),
+		)
+		if recorder.Code != http.StatusInternalServerError {
+			t.Fatalf(
+				"status = %d, want %d; body=%s",
+				recorder.Code,
+				http.StatusInternalServerError,
+				recorder.Body.String(),
+			)
+		}
+		wantBody := "accepted prompt stream missing turn id"
+		if body := recorder.Body.String(); !strings.Contains(body, wantBody) {
+			t.Fatalf("body = %q, want missing turn id error", body)
+		}
+	})
+}
+
+func TestPromptSessionHandlerReturnsRawSSEStreamWhenRequested(t *testing.T) {
+	t.Run("ShouldReturnRawAgentEventsForBufferedCLIPath", func(t *testing.T) {
+		homePaths := newTestHomePaths(t)
+		manager := &stubSessionManager{
+			PromptFn: func(context.Context, string, string) (<-chan acp.AgentEvent, error) {
+				ch := make(chan acp.AgentEvent, 2)
+				ch <- acp.AgentEvent{
+					Type:      "agent_message",
+					TurnID:    "turn-1",
+					Timestamp: time.Date(2026, 4, 3, 12, 0, 0, 0, time.UTC),
+					Text:      "hello",
+				}
+				ch <- acp.AgentEvent{
+					Type:       "done",
+					TurnID:     "turn-1",
+					Timestamp:  time.Date(2026, 4, 3, 12, 0, 1, 0, time.UTC),
+					StopReason: "end_turn",
+				}
+				close(ch)
+				return ch, nil
+			},
+		}
+		handlers := newTestHandlers(t, manager, stubObserver{}, homePaths)
+		engine := newTestRouter(t, handlers)
+
+		recorder := performRequest(
+			t,
+			engine,
+			http.MethodPost,
+			"/api/workspaces/ws-workspace/sessions/sess-123/prompt?format=raw",
+			[]byte(`{"message":"hello","message_id":"msg-uds-raw","idempotency_key":"idem-uds-raw"}`),
+		)
+		if recorder.Code != http.StatusOK {
+			t.Fatalf("status = %d, want %d; body=%s", recorder.Code, http.StatusOK, recorder.Body.String())
+		}
+
+		records := parseSSE(t, recorder.Body.String())
+		if len(records) != 2 {
+			t.Fatalf("len(records) = %d, want 2; body=%s", len(records), recorder.Body.String())
+		}
+		if records[0].Event != "agent_message" || records[1].Event != "done" {
+			t.Fatalf("events = [%s %s], want [agent_message done]", records[0].Event, records[1].Event)
+		}
+	})
+	t.Run("Should preserve typed redacted compaction snapshots without raw data", func(t *testing.T) {
+		t.Parallel()
+		observation := &acp.CompactionObservation{
+			CompactionID: "compact-raw", Status: "failed",
+			Summary: "Retained summary token=secret", Error: "access_token=secret", Terminal: true,
+		}
+		redacted := transcript.RedactAgentEvent(acp.AgentEvent{Compaction: observation}).Compaction
+		manager := &stubSessionManager{
+			PromptFn: func(context.Context, string, string) (<-chan acp.AgentEvent, error) {
+				events := make(chan acp.AgentEvent, 1)
+				events <- acp.AgentEvent{
+					Type: acp.EventTypeCompaction, SessionID: "sess-123", TurnID: "turn-1",
+					Timestamp: time.Date(2026, 4, 3, 12, 0, 0, 0, time.UTC), Compaction: redacted,
+				}
+				close(events)
+				return events, nil
+			},
+		}
+		engine := newTestRouter(t, newTestHandlers(t, manager, stubObserver{}, newTestHomePaths(t)))
+		recorder := performRequest(t, engine, http.MethodPost,
+			"/api/workspaces/ws-workspace/sessions/sess-123/prompt?format=raw",
+			[]byte(`{"message":"hello","message_id":"msg-compact","idempotency_key":"idem-compact"}`))
+		if recorder.Code != http.StatusOK {
+			t.Fatalf("status = %d; body=%s", recorder.Code, recorder.Body.String())
+		}
+		records := parseSSE(t, recorder.Body.String())
+		if len(records) != 1 || records[0].Event != acp.EventTypeCompaction {
+			t.Fatalf("frames = %#v", records)
+		}
+		var payload contract.AgentEventPayload
+		if err := json.Unmarshal(records[0].Data, &payload); err != nil {
+			t.Fatal(err)
+		}
+		if payload.Compaction == nil || payload.Compaction.CompactionID != "compact-raw" ||
+			payload.Compaction.Status != "failed" || payload.Compaction.Summary != redacted.Summary ||
+			payload.Compaction.Error != redacted.Error || string(payload.Raw) != "null" ||
+			strings.Contains(string(records[0].Data), "secret") {
+			t.Fatalf("snapshot frame = %s", records[0].Data)
+		}
+	})
+}
+
+func TestSessionInputClearHandlerUsesSharedQueueContract(t *testing.T) {
+	t.Run("Should preserve per-entry clear outcomes over UDS", func(t *testing.T) {
+		t.Parallel()
+		manager := &stubSessionManager{
+			ClearPendingInputsFn: func(_ context.Context, id string, caller session.PromptCaller) (session.ClearPendingInputsResult, error) {
+				if id != "sess-123" || caller.Kind != "human" || caller.ID == "" || caller.Source == "" {
+					t.Fatalf("clear identity = %q, %#v", id, caller)
+				}
+				return session.ClearPendingInputsResult{
+					ClearedCount: 1, QueueGeneration: 2,
+					Inputs: []session.PendingInput{
+						{ID: "removed", Status: "canceled"}, {ID: "active", Status: "dispatching"},
+					},
+				}, nil
+			},
+		}
+		engine := newTestRouter(t, newTestHandlers(t, manager, stubObserver{}, newTestHomePaths(t)))
+		recorder := performRequest(t, engine, http.MethodDelete,
+			"/api/workspaces/ws-workspace/sessions/sess-123/prompt/queue", nil)
+		if recorder.Code != http.StatusOK {
+			t.Fatalf("clear status = %d, body=%s", recorder.Code, recorder.Body.String())
+		}
+		var result contract.SessionInputClearResponse
+		if err := json.Unmarshal(recorder.Body.Bytes(), &result); err != nil {
+			t.Fatal(err)
+		}
+		if result.ClearedCount != 1 || result.QueueGeneration != 2 || len(result.Inputs) != 2 ||
+			result.Inputs[0].Status != contract.SessionInputCanceled || result.Inputs[1].Status != contract.SessionInputDispatching {
+			t.Fatalf("clear response = %#v", result)
+		}
+	})
+}
+
+func TestPromptSessionRawHandlerPreservesBusyInputMode(t *testing.T) {
+	t.Run("ShouldForwardInterruptModeOnRawCLIPath", func(t *testing.T) {
+		t.Parallel()
+
+		homePaths := newTestHomePaths(t)
+		var gotOpts session.SendPromptOpts
+		manager := &stubSessionManager{
+			SendPromptFn: func(_ context.Context, id string, opts session.SendPromptOpts) (session.SendPromptResult, error) {
+				if id != "sess-123" {
+					t.Fatalf("SendPrompt() id = %q, want sess-123", id)
+				}
+				gotOpts = opts
+				return session.SendPromptResult{
+					Status:    "interrupting",
+					Mode:      opts.Mode,
+					Delivery:  store.SessionInputDeliveryInterruptThenPrompt,
+					NewTurnID: "turn-2",
+				}, nil
+			},
+		}
+		handlers := newTestHandlers(t, manager, stubObserver{}, homePaths)
+		engine := newTestRouter(t, handlers)
+
+		recorder := performRequest(
+			t,
+			engine,
+			http.MethodPost,
+			"/api/workspaces/ws-workspace/sessions/sess-123/prompt?format=raw",
+			[]byte(
+				`{"message":"replace","message_id":"client-replace-1","idempotency_key":"idem-replace-1",`+
+					`"mode":"interrupt","expected_turn_id":"turn-active","runtime":{"provider":"codex","model":"gpt-5.4","reasoning_effort":"high","speed":"fast"}}`,
+			),
+		)
+		if recorder.Code != http.StatusAccepted {
+			t.Fatalf("status = %d, want %d; body=%s", recorder.Code, http.StatusAccepted, recorder.Body.String())
+		}
+		if gotOpts.Message != "replace" || gotOpts.MessageID != "client-replace-1" ||
+			gotOpts.IdempotencyKey != "idem-replace-1" ||
+			gotOpts.Mode != session.BusyInputModeInterrupt || gotOpts.ExpectedTurnID != "turn-active" {
+			t.Fatalf("SendPrompt() opts = %#v, want interrupt replace", gotOpts)
+		}
+		if gotOpts.Runtime == nil || gotOpts.Runtime.Provider != "codex" ||
+			gotOpts.Runtime.Model != "gpt-5.4" || gotOpts.Runtime.ReasoningEffort != "high" ||
+			gotOpts.Runtime.Speed != contract.SpeedFast {
+			t.Fatalf("SendPrompt() runtime = %#v, want codex gpt-5.4 high fast", gotOpts.Runtime)
+		}
+		var decoded contract.SendPromptResultResponse
+		if err := json.Unmarshal(recorder.Body.Bytes(), &decoded); err != nil {
+			t.Fatalf("json.Unmarshal(prompt result) error = %v; body=%s", err, recorder.Body.String())
+		}
+		if decoded.Prompt.Mode != contract.PromptModeInterrupt ||
+			decoded.Prompt.Delivery != contract.PromptDeliveryInterruptThenPrompt {
+			t.Fatalf("decoded prompt = %#v, want interrupted mode", decoded.Prompt)
+		}
+	})
+}
+
+func TestSteerSessionPromptHandlerPropagatesDurableIdentity(t *testing.T) {
+	t.Parallel()
+	t.Run("Should stage steering with canonical message identity", func(t *testing.T) {
+		t.Parallel()
+
+		var gotOpts session.SteerPromptOpts
+		manager := &stubSessionManager{
+			SteerFn: func(ctx context.Context, id string, opts session.SteerPromptOpts) (session.SendPromptResult, error) {
+				if id != "sess-123" {
+					t.Fatalf("SteerPrompt() id = %q, want sess-123", id)
+				}
+				if err := ctx.Err(); err != nil {
+					t.Fatalf("SteerPrompt() context err = %v, want nil after request cancellation", err)
+				}
+				gotOpts = opts
+				return session.SendPromptResult{
+					Status:         "steering",
+					MessageID:      opts.MessageID,
+					IdempotencyKey: opts.IdempotencyKey,
+					Delivery:       store.SessionInputDeliveryInterruptThenPrompt,
+					QueueEntryID:   "inq-steer",
+				}, nil
+			},
+		}
+		engine := newTestRouter(t, newTestHandlers(t, manager, stubObserver{}, newTestHomePaths(t)))
+		requestCtx, cancel := context.WithCancel(t.Context())
+		cancel()
+		req := httptest.NewRequestWithContext(
+			requestCtx,
+			http.MethodPost,
+			"/api/workspaces/ws-workspace/sessions/sess-123/steer",
+			strings.NewReader(
+				`{"text":"focus on the race","message_id":"msg-steer","idempotency_key":"idem-steer","expected_turn_id":"turn-live"}`,
+			),
+		)
+		req.Header.Set("Content-Type", "application/json")
+		recorder := httptest.NewRecorder()
+		engine.ServeHTTP(recorder, req)
+		if recorder.Code != http.StatusAccepted {
+			t.Fatalf("status = %d, want %d; body=%s", recorder.Code, http.StatusAccepted, recorder.Body.String())
+		}
+		if gotOpts.Message != "focus on the race" || gotOpts.MessageID != "msg-steer" ||
+			gotOpts.IdempotencyKey != "idem-steer" || gotOpts.ExpectedTurnID != "turn-live" {
+			t.Fatalf("SteerPrompt() opts = %#v, want canonical identity", gotOpts)
+		}
+		var decoded contract.SendPromptResultResponse
+		if err := json.Unmarshal(recorder.Body.Bytes(), &decoded); err != nil {
+			t.Fatalf("json.Unmarshal(steer result) error = %v; body=%s", err, recorder.Body.String())
+		}
+		if decoded.Prompt.Status != "steering" ||
+			decoded.Prompt.Delivery != contract.PromptDeliveryInterruptThenPrompt ||
+			decoded.Prompt.MessageID != "msg-steer" ||
+			decoded.Prompt.IdempotencyKey != "idem-steer" || decoded.Prompt.QueueEntryID != "inq-steer" {
+			t.Fatalf("steer response = %#v", decoded.Prompt)
+		}
+	})
+}
+
+func TestPromptSessionHandlerReturnsStructuredGoalDecision(t *testing.T) {
+	t.Run("Should return the same direct authenticated Goal error body over UDS", func(t *testing.T) {
+		t.Parallel()
+
+		homePaths := newTestHomePaths(t)
+		var gotOpts session.SendPromptOpts
+		reason := session.GoalReasonNotActive
+		manager := &stubSessionManager{
+			SendPromptFn: func(_ context.Context, id string, opts session.SendPromptOpts) (session.SendPromptResult, error) {
+				if id != "sess-123" {
+					t.Fatalf("SendPrompt() id = %q, want sess-123", id)
+				}
+				gotOpts = opts
+				return session.SendPromptResult{
+					Status:         "goal",
+					MessageID:      opts.MessageID,
+					IdempotencyKey: opts.IdempotencyKey,
+					Goal: &session.GoalCommandResult{
+						Outcome: session.GoalOutcomeError, ReasonCode: &reason,
+					},
+				}, nil
+			},
+		}
+		engine := newTestRouter(t, newTestHandlers(t, manager, stubObserver{}, homePaths))
+		recorder := performRequest(
+			t,
+			engine,
+			http.MethodPost,
+			"/api/workspaces/ws-workspace/sessions/sess-123/prompt",
+			[]byte(`{"message":"/goal status","message_id":"msg-uds-goal","idempotency_key":"idem-uds-goal"}`),
+		)
+		if recorder.Code != http.StatusNotFound {
+			t.Fatalf("status = %d, want %d; body=%s", recorder.Code, http.StatusNotFound, recorder.Body.String())
+		}
+		if got := recorder.Header().Get("Content-Type"); got != "application/json; charset=utf-8" {
+			t.Fatalf("Content-Type = %q", got)
+		}
+		if !gotOpts.AllowCommands || gotOpts.Caller.Kind != string(taskpkg.ActorKindHuman) ||
+			gotOpts.Caller.ID != "local-user" || gotOpts.Caller.Source != string(taskpkg.OriginKindUDS) {
+			t.Fatalf("SendPrompt() authenticated opts = %#v", gotOpts)
+		}
+		var decoded contract.SendPromptResultResponse
+		if err := json.Unmarshal(recorder.Body.Bytes(), &decoded); err != nil {
+			t.Fatalf("json.Unmarshal(Goal result) error = %v; body=%s", err, recorder.Body.String())
+		}
+		if decoded.Prompt.Goal == nil || decoded.Prompt.Goal.Outcome != contract.GoalOutcomeError ||
+			decoded.Prompt.Goal.ReasonCode == nil || *decoded.Prompt.Goal.ReasonCode != contract.GoalReasonNotActive {
+			t.Fatalf("prompt result = %#v", decoded)
+		}
+		if decoded.Prompt.MessageID != "msg-uds-goal" || decoded.Prompt.IdempotencyKey != "idem-uds-goal" {
+			t.Fatalf("prompt identity = %#v", decoded.Prompt)
+		}
+	})
+}
+
+func TestPromptSessionHandlerSeparatesPromptExecutionFromDelivery(t *testing.T) {
+	t.Run("ShouldCancelDeliveryOnlyAfterRequestCancellation", func(t *testing.T) {
+		homePaths := newTestHomePaths(t)
+		executionCtxCh := make(chan context.Context, 1)
+		deliveryCtxCh := make(chan context.Context, 1)
+		events := make(chan acp.AgentEvent)
+		manager := &stubSessionManager{
+			SendPromptFn: func(ctx context.Context, _ string, opts session.SendPromptOpts) (session.SendPromptResult, error) {
+				executionCtxCh <- ctx
+				deliveryCtxCh <- opts.DeliveryContext
+				return session.SendPromptResult{Status: "accepted", Events: events, NewTurnID: "turn-accepted"}, nil
+			},
+		}
+		handlers := newTestHandlers(t, manager, stubObserver{}, homePaths)
+		engine := newTestRouter(t, handlers)
+
+		requestCtx, cancel := context.WithCancel(t.Context())
+		defer cancel()
+		req := httptest.NewRequestWithContext(
+			requestCtx,
+			http.MethodPost,
+			"/api/workspaces/ws-workspace/sessions/sess-123/prompt",
+			strings.NewReader(
+				`{"message":"hello","message_id":"msg-uds-delivery-cancel",`+
+					`"idempotency_key":"idem-uds-delivery-cancel"}`,
+			),
+		)
+		req.Header.Set("Content-Type", "application/json")
+
+		recorder := httptest.NewRecorder()
+		done := make(chan struct{})
+		go func() {
+			engine.ServeHTTP(recorder, req)
+			close(done)
+		}()
+
+		var executionCtx context.Context
+		select {
+		case executionCtx = <-executionCtxCh:
+		case <-time.After(time.Second):
+			t.Fatal("SendPrompt() was not invoked")
+		}
+		var deliveryCtx context.Context
+		select {
+		case deliveryCtx = <-deliveryCtxCh:
+		case <-time.After(time.Second):
+			t.Fatal("SendPrompt() did not receive a delivery context")
+		}
+
+		cancel()
+
+		select {
+		case <-done:
+		case <-time.After(time.Second):
+			t.Fatal("handler did not return after request cancellation")
+		}
+
+		if err := executionCtx.Err(); err != nil {
+			t.Fatalf("execution context err = %v, want nil after request cancellation", err)
+		}
+		if !errors.Is(deliveryCtx.Err(), context.Canceled) {
+			t.Fatalf("delivery context err = %v, want context.Canceled", deliveryCtx.Err())
+		}
+		if recorder.Code != http.StatusOK {
+			t.Fatalf("status = %d, want %d; body=%s", recorder.Code, http.StatusOK, recorder.Body.String())
+		}
+		if body := recorder.Body.String(); !strings.Contains(body, `"type":"start","messageId":"turn-accepted"`) {
+			t.Fatalf("response body = %q, want early start frame with accepted turn id", body)
+		}
+		close(events)
+	})
+
+	t.Run("ShouldCancelDeliveryOnlyWhenStreamShutsDown", func(t *testing.T) {
+		homePaths := newTestHomePaths(t)
+		executionCtxCh := make(chan context.Context, 1)
+		deliveryCtxCh := make(chan context.Context, 1)
+		events := make(chan acp.AgentEvent)
+		manager := &stubSessionManager{
+			SendPromptFn: func(ctx context.Context, _ string, opts session.SendPromptOpts) (session.SendPromptResult, error) {
+				executionCtxCh <- ctx
+				deliveryCtxCh <- opts.DeliveryContext
+				return session.SendPromptResult{Status: "accepted", Events: events, NewTurnID: "turn-accepted"}, nil
+			},
+		}
+		handlers := newTestHandlers(t, manager, stubObserver{}, homePaths)
+		streamDone := make(chan struct{})
+		handlers.setStreamDone(streamDone)
+		engine := newTestRouter(t, handlers)
+
+		requestCtx, cancel := context.WithCancel(t.Context())
+		defer cancel()
+		req := httptest.NewRequestWithContext(
+			requestCtx,
+			http.MethodPost,
+			"/api/workspaces/ws-workspace/sessions/sess-123/prompt",
+			strings.NewReader(
+				`{"message":"hello","message_id":"msg-uds-delivery-shutdown",`+
+					`"idempotency_key":"idem-uds-delivery-shutdown"}`,
+			),
+		)
+		req.Header.Set("Content-Type", "application/json")
+
+		recorder := httptest.NewRecorder()
+		done := make(chan struct{})
+		go func() {
+			engine.ServeHTTP(recorder, req)
+			close(done)
+		}()
+
+		var executionCtx context.Context
+		select {
+		case executionCtx = <-executionCtxCh:
+		case <-time.After(time.Second):
+			t.Fatal("SendPrompt() was not invoked")
+		}
+		var deliveryCtx context.Context
+		select {
+		case deliveryCtx = <-deliveryCtxCh:
+		case <-time.After(time.Second):
+			t.Fatal("SendPrompt() did not receive a delivery context")
+		}
+
+		close(streamDone)
+
+		select {
+		case <-done:
+		case <-time.After(time.Second):
+			t.Fatal("handler did not return after stream shutdown")
+		}
+
+		if err := executionCtx.Err(); err != nil {
+			t.Fatalf("execution context err = %v, want nil after stream shutdown", err)
+		}
+		if !errors.Is(deliveryCtx.Err(), context.Canceled) {
+			t.Fatalf("delivery context err = %v, want context.Canceled after stream shutdown", deliveryCtx.Err())
+		}
+		if recorder.Code != http.StatusOK {
+			t.Fatalf("status = %d, want %d; body=%s", recorder.Code, http.StatusOK, recorder.Body.String())
+		}
+		if body := recorder.Body.String(); !strings.Contains(body, `"type":"start","messageId":"turn-accepted"`) {
+			t.Fatalf("response body = %q, want early start frame with accepted turn id", body)
+		}
+		close(events)
+	})
+}
+
+func TestCancelSessionPromptHandlerReturnsOK(t *testing.T) {
+	homePaths := newTestHomePaths(t)
+	manager := &stubSessionManager{
+		CancelPromptFn: func(_ context.Context, id string) (session.PromptCancelResult, error) {
+			if id != "sess-123" {
+				t.Fatalf("CancelPrompt() id = %q, want sess-123", id)
+			}
+			return session.PromptCancelResult{
+				Outcome: session.PromptCancelOutcomeNothingInFlight,
+			}, nil
+		},
+	}
+	handlers := newTestHandlers(t, manager, stubObserver{}, homePaths)
+	engine := newTestRouter(t, handlers)
+
+	recorder := performRequest(
+		t,
+		engine,
+		http.MethodPost,
+		"/api/workspaces/ws-workspace/sessions/sess-123/prompt/cancel",
+		nil,
+	)
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d", recorder.Code, http.StatusOK)
+	}
+	var payload contract.SessionPromptCancelResponse
+	apitestutil.DecodeJSONResponse(t, recorder, &payload)
+	if payload.SessionID != "sess-123" || payload.Outcome != "nothing-in-flight" || payload.TurnID != "" {
+		t.Fatalf("prompt cancel payload = %#v, want nothing-in-flight", payload)
+	}
+}
+
+func TestPromptSessionHandlerRejectsEmptyMessage(t *testing.T) {
+	homePaths := newTestHomePaths(t)
+	handlers := newTestHandlers(t, &stubSessionManager{}, stubObserver{}, homePaths)
+	engine := newTestRouter(t, handlers)
+
+	recorder := performRequest(
+		t,
+		engine,
+		http.MethodPost,
+		"/api/workspaces/ws-workspace/sessions/sess-123/prompt",
+		[]byte(`{"message":""}`),
+	)
+	if recorder.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want %d", recorder.Code, http.StatusBadRequest)
+	}
+}
+
+func TestSessionEventsHandlerReturnsFilteredEvents(t *testing.T) {
+	homePaths := newTestHomePaths(t)
+	var gotQuery store.EventQuery
+	manager := &stubSessionManager{
+		StatusFn: func(context.Context, string) (*session.Info, error) {
+			return newSessionInfo("sess-123"), nil
+		},
+		EventsFn: func(_ context.Context, _ string, query store.EventQuery) ([]store.SessionEvent, error) {
+			gotQuery = query
+			return []store.SessionEvent{{
+				ID:        "ev-1",
+				SessionID: "sess-123",
+				Sequence:  7,
+				TurnID:    "turn-1",
+				Type:      "agent_message",
+				AgentName: "coder",
+				Content:   `{"text":"hello"}`,
+				Timestamp: time.Date(2026, 4, 3, 12, 0, 0, 0, time.UTC),
+			}}, nil
+		},
+	}
+	handlers := newTestHandlers(t, manager, stubObserver{}, homePaths)
+	engine := newTestRouter(t, handlers)
+
+	recorder := performRequest(
+		t,
+		engine,
+		http.MethodGet,
+		"/api/workspaces/ws-workspace/sessions/sess-123/events?type=agent_message&agent_name=coder&turn_id=turn-1&after_sequence=5&limit=10&since=2026-04-03T12:00:00Z",
+		nil,
+	)
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d; body=%s", recorder.Code, http.StatusOK, recorder.Body.String())
+	}
+	if gotQuery.Type != "agent_message" || gotQuery.AgentName != "coder" || gotQuery.TurnID != "turn-1" ||
+		gotQuery.AfterSequence != 5 ||
+		gotQuery.Limit != 10 {
+		t.Fatalf("query = %#v", gotQuery)
+	}
+
+	var response struct {
+		Events []sessionEventPayload `json:"events"`
+	}
+	decodeJSONResponse(t, recorder, &response)
+	if len(response.Events) != 1 || response.Events[0].Sequence != 7 {
+		t.Fatalf("events = %#v", response.Events)
+	}
+	if response.Events[0].WorkspaceID != "ws-workspace" || response.Events[0].WorkspacePath != "/workspace" {
+		t.Fatalf("event workspace = %#v", response.Events[0])
+	}
+}
+
+func TestSessionHistoryHandlerReturnsTurns(t *testing.T) {
+	homePaths := newTestHomePaths(t)
+	manager := &stubSessionManager{
+		StatusFn: func(context.Context, string) (*session.Info, error) {
+			return newSessionInfo("sess-123"), nil
+		},
+		HistoryFn: func(context.Context, string, store.EventQuery) ([]store.TurnHistory, error) {
+			return []store.TurnHistory{{
+				TurnID: "turn-1",
+				Events: []store.SessionEvent{{
+					ID:        "ev-1",
+					SessionID: "sess-123",
+					Sequence:  1,
+					TurnID:    "turn-1",
+					Type:      "agent_message",
+					AgentName: "coder",
+					Content:   `{"text":"hello"}`,
+					Timestamp: time.Date(2026, 4, 3, 12, 0, 0, 0, time.UTC),
+				}},
+			}}, nil
+		},
+	}
+	handlers := newTestHandlers(t, manager, stubObserver{}, homePaths)
+	engine := newTestRouter(t, handlers)
+
+	recorder := performRequest(t, engine, http.MethodGet, "/api/workspaces/ws-workspace/sessions/sess-123/history", nil)
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d; body=%s", recorder.Code, http.StatusOK, recorder.Body.String())
+	}
+
+	var response struct {
+		History []turnHistoryPayload `json:"history"`
+	}
+	decodeJSONResponse(t, recorder, &response)
+	if len(response.History) != 1 || response.History[0].TurnID != "turn-1" {
+		t.Fatalf("history = %#v", response.History)
+	}
+	if got := response.History[0].Events[0]; got.WorkspaceID != "ws-workspace" || got.WorkspacePath != "/workspace" {
+		t.Fatalf("history event workspace = %#v", got)
+	}
+}
+
+func TestSessionTranscriptHandlerReturnsEntries(t *testing.T) {
+	t.Parallel()
+
+	homePaths := newTestHomePaths(t)
+	manager := &stubSessionManager{
+		StatusFn: func(_ context.Context, id string) (*session.Info, error) {
+			info := newSessionInfo(id)
+			info.TranscriptEpoch = 5
+			return info, nil
+		},
+		TranscriptPageFn: func(_ context.Context, id string, query transcript.PageQuery) (transcript.Page, error) {
+			if id != "sess-123" || query.Limit != 200 || query.BeforeSequence != 0 {
+				t.Fatalf("TranscriptPage() call = %q %#v, want bounded default tail", id, query)
+			}
+			return transcript.Page{
+				Entries: []transcript.Entry{{
+					StartSequence: 1,
+					Sequence:      1,
+					Message: transcript.UIMessage{
+						ID:   "msg-1",
+						Role: transcript.UIRoleAssistant,
+						Parts: []transcript.UIMessagePart{{
+							Type:  "text",
+							Text:  "hello",
+							State: "done",
+						}},
+					},
+				}},
+				Generation:  4,
+				MaxSequence: 1,
+			}, nil
+		},
+	}
+	handlers := newTestHandlers(t, manager, stubObserver{}, homePaths)
+	engine := newTestRouter(t, handlers)
+
+	recorder := performRequest(
+		t,
+		engine,
+		http.MethodGet,
+		"/api/workspaces/ws-workspace/sessions/sess-123/transcript",
+		nil,
+	)
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d; body=%s", recorder.Code, http.StatusOK, recorder.Body.String())
+	}
+
+	var response contract.SessionTranscriptResponse
+	decodeJSONResponse(t, recorder, &response)
+	if len(response.Entries) != 1 {
+		t.Fatalf("len(entries) = %d, want 1", len(response.Entries))
+	}
+	if got := response.Entries[0].Sequence; got != 1 {
+		t.Fatalf("entries[0].Sequence = %d, want 1", got)
+	}
+	if got := response.Entries[0].Message.Parts[0].Text; got != "hello" {
+		t.Fatalf("entries[0].Message.Parts[0].Text = %q, want %q", got, "hello")
+	}
+	if response.Epoch != 5 || response.Generation != 4 || response.MaxSequence != 1 || response.Limit != 200 {
+		t.Fatalf("transcript page metadata = %#v", response)
+	}
+}
+
+func TestStreamSessionHandlerUsesLastEventID(t *testing.T) {
+	homePaths := newTestHomePaths(t)
+	var gotQuery store.EventQuery
+	manager := &stubSessionManager{
+		StatusFn: func(context.Context, string) (*session.Info, error) {
+			return newSessionInfo("sess-123"), nil
+		},
+		EventsFn: func(_ context.Context, _ string, query store.EventQuery) ([]store.SessionEvent, error) {
+			gotQuery = query
+			return []store.SessionEvent{{
+				ID:        "ev-2",
+				SessionID: "sess-123",
+				Sequence:  2,
+				TurnID:    "turn-1",
+				Type:      "done",
+				AgentName: "coder",
+				Content:   `{"stop_reason":"end_turn"}`,
+				Timestamp: time.Date(2026, 4, 3, 12, 0, 1, 0, time.UTC),
+			}}, nil
+		},
+	}
+	handlers := newTestHandlers(t, manager, stubObserver{}, homePaths)
+	done := make(chan struct{})
+	close(done)
+	handlers.setStreamDone(done)
+	engine := newTestRouter(t, handlers)
+
+	req := httptest.NewRequestWithContext(
+		t.Context(),
+		http.MethodGet,
+		"/api/workspaces/ws-workspace/sessions/sess-123/stream?frames=raw",
+		http.NoBody,
+	)
+	req.Header.Set("Last-Event-ID", "1")
+	recorder := httptest.NewRecorder()
+	engine.ServeHTTP(recorder, req)
+
+	if gotQuery.AfterSequence != 1 {
+		t.Fatalf("AfterSequence = %d, want 1", gotQuery.AfterSequence)
+	}
+	records := parseSSE(t, recorder.Body.String())
+	if len(records) != 1 || records[0].ID != "2" || records[0].Event != "done" {
+		t.Fatalf("records = %#v", records)
+	}
+	var payload sessionEventPayload
+	decodeSSEData(t, records[0], &payload)
+	if payload.WorkspaceID != "ws-workspace" || payload.WorkspacePath != "/workspace" {
+		t.Fatalf("stream payload workspace = %#v", payload)
+	}
+}
+
+func TestStreamSessionHandlerSyntheticStoppedEventIncludesWorkspaceContext(t *testing.T) {
+	homePaths := newTestHomePaths(t)
+	stoppedAt := time.Date(2026, 4, 3, 12, 0, 5, 0, time.UTC)
+	manager := &stubSessionManager{
+		StatusFn: func(context.Context, string) (*session.Info, error) {
+			info := newSessionInfo("sess-123")
+			info.State = session.StateStopped
+			info.UpdatedAt = stoppedAt
+			return info, nil
+		},
+		EventsFn: func(context.Context, string, store.EventQuery) ([]store.SessionEvent, error) {
+			return nil, nil
+		},
+	}
+	handlers := newTestHandlers(t, manager, stubObserver{}, homePaths)
+	engine := newTestRouter(t, handlers)
+
+	req := httptest.NewRequestWithContext(
+		t.Context(),
+		http.MethodGet,
+		"/api/workspaces/ws-workspace/sessions/sess-123/stream?frames=raw&limit=200",
+		http.NoBody,
+	)
+	recorder := httptest.NewRecorder()
+	engine.ServeHTTP(recorder, req)
+
+	records := parseSSE(t, recorder.Body.String())
+	if len(records) != 1 || records[0].Event != session.EventTypeSessionStopped {
+		t.Fatalf("records = %#v", records)
+	}
+	var payload sessionEventPayload
+	decodeSSEData(t, records[0], &payload)
+	if payload.WorkspaceID != "ws-workspace" || payload.WorkspacePath != "/workspace" {
+		t.Fatalf("stopped payload workspace = %#v", payload)
+	}
+	if payload.Timestamp != stoppedAt {
+		t.Fatalf("stopped payload timestamp = %v, want %v", payload.Timestamp, stoppedAt)
+	}
+}
+
+func TestListAgentsHandlerReturnsAvailableAgents(t *testing.T) {
+	homePaths := newTestHomePaths(t)
+	writeAgentDef(t, homePaths, "coder")
+	writeAgentDef(t, homePaths, "researcher")
+	handlers := newTestHandlers(t, &stubSessionManager{}, stubObserver{}, homePaths)
+	engine := newTestRouter(t, handlers)
+
+	recorder := performRequest(t, engine, http.MethodGet, "/api/agents", nil)
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d; body=%s", recorder.Code, http.StatusOK, recorder.Body.String())
+	}
+
+	var response struct {
+		Agents []agentPayload `json:"agents"`
+	}
+	decodeJSONResponse(t, recorder, &response)
+	if len(response.Agents) != 2 {
+		t.Fatalf("len(agents) = %d, want 2", len(response.Agents))
+	}
+	if response.Agents[0].Name != "coder" {
+		t.Fatalf("first agent = %q, want coder", response.Agents[0].Name)
+	}
+}
+
+func TestGetAgentHandlerReturnsAgent(t *testing.T) {
+	homePaths := newTestHomePaths(t)
+	writeAgentDef(t, homePaths, "coder")
+	handlers := newTestHandlers(t, &stubSessionManager{}, stubObserver{}, homePaths)
+	engine := newTestRouter(t, handlers)
+
+	recorder := performRequest(t, engine, http.MethodGet, "/api/agents/coder", nil)
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d; body=%s", recorder.Code, http.StatusOK, recorder.Body.String())
+	}
+
+	var response struct {
+		Agent agentPayload `json:"agent"`
+	}
+	decodeJSONResponse(t, recorder, &response)
+	if response.Agent.Name != "coder" || response.Agent.Provider != "fake" {
+		t.Fatalf("agent = %#v", response.Agent)
+	}
+}
+
+func TestListLogsHandlerReturnsEvents(t *testing.T) {
+	homePaths := newTestHomePaths(t)
+	observer := stubObserver{
+		QueryEventsFn: func(context.Context, store.EventSummaryQuery) ([]store.EventSummary, error) {
+			return []store.EventSummary{{
+				ID:        "sum-1",
+				SessionID: "sess-123",
+				Type:      "agent_message",
+				AgentName: "coder",
+				Summary:   "hello",
+				Timestamp: time.Date(2026, 4, 3, 12, 0, 0, 0, time.UTC),
+			}}, nil
+		},
+	}
+	handlers := newTestHandlers(t, &stubSessionManager{}, observer, homePaths)
+	engine := newTestRouter(t, handlers)
+
+	recorder := performRequest(t, engine, http.MethodGet, "/api/logs?workspace_id=ws-workspace", nil)
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d", recorder.Code, http.StatusOK)
+	}
+
+	var response struct {
+		Events []logEventPayload `json:"events"`
+	}
+	decodeJSONResponse(t, recorder, &response)
+	if len(response.Events) != 1 || response.Events[0].ID != "sum-1" {
+		t.Fatalf("events = %#v", response.Events)
+	}
+}
+
+func TestExtensionStatusHandlerTrimsName(t *testing.T) {
+	t.Parallel()
+
+	homePaths := newTestHomePaths(t)
+	handlers := newTestHandlersWithExtensions(t, &stubSessionManager{}, stubObserver{}, stubExtensionService{
+		StatusFn: func(_ context.Context, name string) (contract.ExtensionPayload, error) {
+			if name != "ext-a" {
+				t.Fatalf("Status() name = %q, want %q", name, "ext-a")
+			}
+			return contract.ExtensionPayload{Name: name, Enabled: true, State: "active"}, nil
+		},
+	}, homePaths)
+	engine := newTestRouter(t, handlers)
+
+	recorder := performRequest(t, engine, http.MethodGet, "/api/extensions/%20ext-a%20", nil)
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d; body=%s", recorder.Code, http.StatusOK, recorder.Body.String())
+	}
+
+	var response struct {
+		Extension contract.ExtensionPayload `json:"extension"`
+	}
+	decodeJSONResponse(t, recorder, &response)
+	if response.Extension.Name != "ext-a" {
+		t.Fatalf("extension.name = %q, want %q", response.Extension.Name, "ext-a")
+	}
+}
+
+func TestExtensionStatusHandlerRejectsBlankName(t *testing.T) {
+	t.Parallel()
+
+	homePaths := newTestHomePaths(t)
+	handlers := newTestHandlersWithExtensions(
+		t,
+		&stubSessionManager{},
+		stubObserver{},
+		stubExtensionService{},
+		homePaths,
+	)
+	engine := newTestRouter(t, handlers)
+
+	recorder := performRequest(t, engine, http.MethodGet, "/api/extensions/%20%20%20", nil)
+	if recorder.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want %d; body=%s", recorder.Code, http.StatusBadRequest, recorder.Body.String())
+	}
+}
+
+func TestHealthHandlerReturnsMetrics(t *testing.T) {
+	homePaths := newTestHomePaths(t)
+	observer := stubObserver{
+		HealthFn: func(context.Context) (observe.Health, error) {
+			return observe.Health{
+				Status:         "ok",
+				ActiveSessions: 3,
+			}, nil
+		},
+	}
+	handlers := newTestHandlers(t, &stubSessionManager{}, observer, homePaths)
+	engine := newTestRouter(t, handlers)
+
+	recorder := performRequest(t, engine, http.MethodGet, "/api/status", nil)
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d", recorder.Code, http.StatusOK)
+	}
+
+	var response contract.StatusPayload
+	decodeJSONResponse(t, recorder, &response)
+	if response.Health.ActiveSessions != 3 {
+		t.Fatalf("health.active_sessions = %d, want 3", response.Health.ActiveSessions)
+	}
+}
+
+func TestDaemonStatusHandlerReturnsRunningState(t *testing.T) {
+	homePaths := newTestHomePaths(t)
+	manager := &stubSessionManager{
+		ListAllFn: func(context.Context) ([]*session.Info, error) {
+			return []*session.Info{newSessionInfo("sess-1")}, nil
+		},
+	}
+	observer := stubObserver{
+		HealthFn: func(context.Context) (observe.Health, error) {
+			return observe.Health{Status: "ok", ActiveSessions: 1, Version: "dev"}, nil
+		},
+	}
+	handlers := newTestHandlers(t, manager, observer, homePaths)
+	engine := newTestRouter(t, handlers)
+
+	recorder := performRequest(t, engine, http.MethodGet, "/api/status", nil)
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d; body=%s", recorder.Code, http.StatusOK, recorder.Body.String())
+	}
+
+	var response contract.StatusPayload
+	decodeJSONResponse(t, recorder, &response)
+	if response.Daemon.Status != "running" {
+		t.Fatalf("daemon.status = %q, want running", response.Daemon.Status)
+	}
+	if response.Daemon.TotalSessions != 1 {
+		t.Fatalf("daemon.total_sessions = %d, want 1", response.Daemon.TotalSessions)
+	}
+}
+
+func TestHelperParsersAndPayloads(t *testing.T) {
+	if _, err := parseOptionalTime("bad-time"); err == nil {
+		t.Fatal("parseOptionalTime() error = nil, want non-nil")
+	}
+	if _, err := parseOptionalInt("bad"); err == nil {
+		t.Fatal("parseOptionalInt() error = nil, want non-nil")
+	}
+	if _, err := parseOptionalInt64("bad"); err == nil {
+		t.Fatal("parseOptionalInt64() error = nil, want non-nil")
+	}
+	if _, err := parseLogsCursor("bad"); err == nil {
+		t.Fatal("parseLogsCursor() error = nil, want non-nil")
+	} else if !strings.Contains(err.Error(), "invalid Last-Event-ID") {
+		t.Fatalf("parseLogsCursor() error = %q, want invalid Last-Event-ID", err)
+	}
+	if got := string(payloadJSON("not-json")); got != `"not-json"` {
+		t.Fatalf("payloadJSON(non-json) = %s, want %q", got, `"not-json"`)
+	}
+	if tokenUsagePayloadFromUsage(nil) != nil {
+		t.Fatal("tokenUsagePayloadFromUsage(nil) = non-nil, want nil")
+	}
+}
+
+func TestSessionErrorMappingUsesNotFoundAndConflict(t *testing.T) {
+	homePaths := newTestHomePaths(t)
+	manager := &stubSessionManager{
+		StatusFn: func(context.Context, string) (*session.Info, error) {
+			return nil, session.ErrSessionNotFound
+		},
+		CreateFn: func(context.Context, *session.CreateOpts) (*session.Session, error) {
+			return nil, session.ErrPromptInProgress
+		},
+	}
+	handlers := newTestHandlers(t, manager, stubObserver{}, homePaths)
+	engine := newTestRouter(t, handlers)
+
+	getResp := performRequest(t, engine, http.MethodGet, "/api/workspaces/ws-workspace/sessions/missing", nil)
+	if getResp.Code != http.StatusNotFound {
+		t.Fatalf("GET /api/workspaces/:workspace_id/sessions/:session_id status = %d, want 404", getResp.Code)
+	}
+
+	postResp := performRequest(
+		t,
+		engine,
+		http.MethodPost,
+		"/api/sessions",
+		[]byte(`{"agent_name":"coder","workspace":"alpha"}`),
+	)
+	if postResp.Code != http.StatusConflict {
+		t.Fatalf("POST /api/sessions status = %d, want 409", postResp.Code)
+	}
+}
+
+func TestExtensionKitAndSecretsRoutesReachUDSService(t *testing.T) {
+	t.Parallel()
+
+	secretWrites := 0
+	secretDeletes := 0
+	service := stubExtensionService{
+		InventoryFn: func(_ context.Context, name string) (contract.ExtensionInventoryPayload, error) {
+			return contract.ExtensionInventoryPayload{Extension: name, Items: []contract.ExtensionKitItemPayload{{
+				Kind: "agent", Name: "writer", Live: true,
+			}}}, nil
+		},
+		PreviewFn: func(_ context.Context, name string) (contract.ExtensionEnablePreviewPayload, error) {
+			return contract.ExtensionEnablePreviewPayload{
+				Extension: name, AutomationStarting: []string{name + "/daily"},
+			}, nil
+		},
+		ListSecretsFn: func(
+			_ context.Context,
+			name string,
+			actor taskpkg.ActorContext,
+		) (contract.ExtensionSecretsPayload, error) {
+			if name != "kit" || !actor.Authority.Read {
+				t.Fatalf("ListExtensionSecrets() name=%q actor=%#v", name, actor)
+			}
+			return contract.ExtensionSecretsPayload{DeclaredEnv: []string{"API_KEY"}}, nil
+		},
+		SetSecretsFn: func(
+			_ context.Context,
+			name string,
+			req contract.SetExtensionSecretsRequest,
+			actor taskpkg.ActorContext,
+		) (contract.ExtensionSecretsPayload, error) {
+			if name != "kit" || !actor.Authority.Write || len(req.Bindings) != 1 ||
+				req.Bindings[0].EnvName != "API_KEY" || req.Bindings[0].Value == nil {
+				t.Fatal("SetExtensionSecrets() did not receive trusted actor and write-only value")
+			}
+			secretWrites++
+			return contract.ExtensionSecretsPayload{
+				DeclaredEnv:  []string{"API_KEY"},
+				BoundEnvKeys: []string{"API_KEY"},
+			}, nil
+		},
+		DeleteSecretFn: func(_ context.Context, name, envName string, actor taskpkg.ActorContext) error {
+			if name != "kit" || envName != "API_KEY" || !actor.Authority.Write {
+				t.Fatalf("DeleteExtensionSecret() name=%q env=%q actor=%#v", name, envName, actor)
+			}
+			secretDeletes++
+			return nil
+		},
+	}
+	handlers := newTestHandlersWithExtensions(
+		t, &stubSessionManager{}, stubObserver{}, service, newTestHomePaths(t),
+	)
+	engine := newTestRouter(t, handlers)
+
+	for _, testCase := range []struct {
+		name   string
+		path   string
+		assert func(*testing.T, *httptest.ResponseRecorder)
+	}{
+		{
+			name: "Should return the typed extension inventory",
+			path: "/api/extensions/kit/inventory",
+			assert: func(t *testing.T, response *httptest.ResponseRecorder) {
+				var payload contract.ExtensionInventoryPayload
+				decodeJSONResponse(t, response, &payload)
+				if payload.Extension != "kit" || len(payload.Items) != 1 ||
+					payload.Items[0].Kind != "agent" || payload.Items[0].Name != "writer" || !payload.Items[0].Live {
+					t.Fatalf("inventory payload = %#v, want live kit writer", payload)
+				}
+			},
+		},
+		{
+			name: "Should return the typed presence-only secret bindings",
+			path: "/api/extensions/kit/secrets",
+			assert: func(t *testing.T, response *httptest.ResponseRecorder) {
+				var payload contract.ExtensionSecretsPayload
+				decodeJSONResponse(t, response, &payload)
+				if !slices.Equal(payload.DeclaredEnv, []string{"API_KEY"}) || len(payload.BoundEnvKeys) != 0 {
+					t.Fatalf("secret payload = %#v, want declared API_KEY only", payload)
+				}
+			},
+		},
+	} {
+		t.Run(testCase.name, func(t *testing.T) {
+			response := performRequest(t, engine, http.MethodGet, testCase.path, nil)
+			if response.Code != http.StatusOK {
+				t.Fatalf("GET %s status=%d body=%s, want 200", testCase.path, response.Code, response.Body.String())
+			}
+			testCase.assert(t, response)
+		})
+	}
+	t.Run("Should set a secret without returning its value", func(t *testing.T) {
+		setResponse := performRequest(t, engine, http.MethodPut, "/api/extensions/kit/secrets", []byte(
+			`{"bindings":[{"env_name":"API_KEY","value":"planted-secret-value"}]}`,
+		))
+		if setResponse.Code != http.StatusOK {
+			t.Fatalf("PUT secrets status=%d body=%s, want 200", setResponse.Code, setResponse.Body.String())
+		}
+		var payload contract.ExtensionSecretsPayload
+		decodeJSONResponse(t, setResponse, &payload)
+		if !slices.Equal(payload.DeclaredEnv, []string{"API_KEY"}) ||
+			!slices.Equal(payload.BoundEnvKeys, []string{"API_KEY"}) {
+			t.Fatalf("secret mutation payload = %#v, want bound API_KEY", payload)
+		}
+	})
+	t.Run("Should delete a secret binding", func(t *testing.T) {
+		deleteResponse := performRequest(
+			t, engine, http.MethodDelete, "/api/extensions/kit/secrets/API_KEY", nil,
+		)
+		if deleteResponse.Code != http.StatusNoContent {
+			t.Fatalf("DELETE secrets status=%d body=%s", deleteResponse.Code, deleteResponse.Body.String())
+		}
+	})
+	if secretWrites != 1 || secretDeletes != 1 {
+		t.Fatalf("secret mutations writes=%d deletes=%d, want 1/1", secretWrites, secretDeletes)
+	}
+}
+
+func TestObserveEventStreamUsesLastEventIDCursor(t *testing.T) {
+	homePaths := newTestHomePaths(t)
+	timestamp := time.Date(2026, 4, 3, 12, 0, 0, 0, time.UTC)
+	observer := stubObserver{
+		QueryEventsFn: func(context.Context, store.EventSummaryQuery) ([]store.EventSummary, error) {
+			return []store.EventSummary{
+				{
+					ID:        "sum-a",
+					SessionID: "sess-1",
+					Sequence:  1,
+					Type:      "agent_message",
+					AgentName: "coder",
+					Timestamp: timestamp,
+				},
+				{ID: "sum-b", SessionID: "sess-1", Sequence: 2, Type: "done", AgentName: "coder", Timestamp: timestamp},
+			}, nil
+		},
+	}
+	handlers := newTestHandlers(t, &stubSessionManager{}, observer, homePaths)
+	done := make(chan struct{})
+	close(done)
+	handlers.setStreamDone(done)
+	engine := newTestRouter(t, handlers)
+
+	req := httptest.NewRequestWithContext(
+		t.Context(),
+		http.MethodGet,
+		"/api/logs/stream?workspace_id=ws-workspace",
+		http.NoBody,
+	)
+	req.Header.Set("Last-Event-ID", timestamp.Format(time.RFC3339Nano)+"|00000000000000000001")
+	recorder := httptest.NewRecorder()
+	engine.ServeHTTP(recorder, req)
+
+	records := parseSSE(t, recorder.Body.String())
+	if len(records) == 0 {
+		t.Fatalf("expected at least one SSE record, got body=%s", recorder.Body.String())
+	}
+	if records[0].ID != timestamp.Format(time.RFC3339Nano)+"|00000000000000000002" {
+		t.Fatalf("record id = %q, want %q", records[0].ID, timestamp.Format(time.RFC3339Nano)+"|00000000000000000002")
+	}
+}
+
+func TestSessionDeriveRoutesOverUDS(t *testing.T) {
+	t.Parallel()
+
+	const base = "/api/workspaces/ws-workspace/sessions/"
+	derivedChild := func() session.DeriveResult {
+		child := newSessionInfo("sess-child")
+		child.WorkspaceID = "ws-workspace"
+		return session.DeriveResult{
+			Child: child, ChildSessionID: "sess-child", Kind: store.LineageKindContinue,
+			SourceSessionID: "sess-src", Seed: session.DeriveSeedReplay,
+		}
+	}
+	newEngine := func(t *testing.T, manager *stubSessionManager) http.Handler {
+		t.Helper()
+		// Derive routes never read the source through the repairing Status path.
+		manager.StatusFn = func(_ context.Context, id string) (*session.Info, error) {
+			t.Errorf("Status(%q) called by a derive route over UDS", id)
+			return nil, session.ErrSessionNotFound
+		}
+		return newTestRouter(t, newTestHandlers(t, manager, stubObserver{}, newTestHomePaths(t)))
+	}
+
+	t.Run(
+		"Should carry the committed child id, model code, and diagnostic message on a post-commit continue failure",
+		func(t *testing.T) {
+			t.Parallel()
+
+			engine := newEngine(t, &stubSessionManager{
+				ContinueFn: func(context.Context, session.ContinueSessionOpts) (session.DeriveResult, error) {
+					modelErr := diagnostics.NewStructuredError(
+						diagnostics.NewItem(diagnostics.ItemSpec{
+							ID: "provider.negotiation.model_unavailable", Code: contract.CodeModelUnavailable,
+							Category: contract.CategoryProvider, Title: "Provider configuration is unavailable",
+							Message: `acp: model "gone" is unavailable`, Severity: contract.SeverityError,
+							DataFreshness: contract.FreshnessLive,
+						}),
+						&acp.NegotiationError{Code: contract.CodeModelUnavailable, Stage: "model", Requested: "gone"},
+					)
+					return derivedChild(), fmt.Errorf("session: admit first message of derived session %q: %w",
+						"sess-child", &acp.AcceptedStartError{
+							Cause: fmt.Errorf("%w: stderr=2026/09/29 INFO connection closed", modelErr),
+						})
+				},
+			})
+			recorder := performRequest(t, engine, http.MethodPost, base+"sess-src/continue",
+				[]byte(`{"agent_name":"b","message":"go","idempotency_key":"k"}`))
+			var payload contract.SessionDeriveErrorPayload
+			decodeJSONResponse(t, recorder, &payload)
+			if recorder.Code != http.StatusUnprocessableEntity || payload.ChildSessionID != "sess-child" ||
+				payload.Code != contract.CodeModelUnavailable ||
+				payload.Error != `Provider configuration is unavailable: acp: model "gone" is unavailable` ||
+				strings.Contains(recorder.Body.String(), "stderr") {
+				t.Fatalf("status = %d payload = %#v, want 422 model_unavailable with its diagnostic message, "+
+					"child_session_id, and no agent stderr", recorder.Code, payload)
+			}
+		},
+	)
+
+	t.Run("Should replay a fork receipt for a deleted source without a source read", func(t *testing.T) {
+		t.Parallel()
+
+		engine := newEngine(t, &stubSessionManager{
+			ForkFn: func(context.Context, session.ForkSessionOpts) (session.DeriveResult, error) {
+				result := derivedChild()
+				result.Kind, result.Child, result.Replayed, result.ChildDeleted = store.LineageKindFork, nil, true, true
+				return result, nil
+			},
+		})
+		recorder := performRequest(t, engine, http.MethodPost, base+"sess-gone/fork",
+			[]byte(`{"idempotency_key":"k"}`))
+		var response contract.SessionDeriveResponse
+		decodeJSONResponse(t, recorder, &response)
+		if recorder.Code != http.StatusOK || !response.Derived.Replayed || !response.Derived.ChildDeleted {
+			t.Fatalf("status = %d response = %#v, want 200 replayed child_deleted", recorder.Code, response)
+		}
+	})
+
+	for _, tc := range []struct {
+		name   string
+		method string
+		path   string
+		body   string
+		err    error
+		status int
+		code   string
+	}{
+		{
+			name: "Should report invalid_request for a missing agent", method: http.MethodPost,
+			path: base + "sess-src/continue", body: `{"idempotency_key":"k"}`,
+			status: http.StatusBadRequest, code: "invalid_request",
+		},
+		{
+			name: "Should report session_not_found for a missing fork source", method: http.MethodPost,
+			path: base + "sess-gone/fork", body: `{"idempotency_key":"k"}`, err: session.ErrSessionNotFound,
+			status: http.StatusNotFound, code: "session_not_found",
+		},
+		{
+			name: "Should report new_work_admission_unavailable while draining", method: http.MethodPost,
+			path: base + "sess-src/fork", body: `{"idempotency_key":"k"}`, err: admission.ErrDraining,
+			status: http.StatusServiceUnavailable, code: "new_work_admission_unavailable",
+		},
+		{
+			name: "Should report session_not_found for a missing preview source", method: http.MethodGet,
+			path: base + "sess-gone/derive/preview", err: session.ErrSessionNotFound,
+			status: http.StatusNotFound, code: "session_not_found",
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			engine := newEngine(t, &stubSessionManager{
+				ContinueFn: func(context.Context, session.ContinueSessionOpts) (session.DeriveResult, error) {
+					return session.DeriveResult{}, tc.err
+				},
+				ForkFn: func(context.Context, session.ForkSessionOpts) (session.DeriveResult, error) {
+					return session.DeriveResult{}, tc.err
+				},
+				DerivePreviewFn: func(context.Context, string, string, string) (session.DerivePreview, error) {
+					return session.DerivePreview{}, tc.err
+				},
+			})
+			var body []byte
+			if tc.body != "" {
+				body = []byte(tc.body)
+			}
+			recorder := performRequest(t, engine, tc.method, tc.path, body)
+			var payload contract.ErrorPayload
+			decodeJSONResponse(t, recorder, &payload)
+			if recorder.Code != tc.status || payload.Code != tc.code {
+				t.Fatalf("status = %d code = %q, want %d %q; body=%s",
+					recorder.Code, payload.Code, tc.status, tc.code, recorder.Body.String())
+			}
+		})
+	}
+}
+
+// IT-026: transport handlers preserve native compaction acceptance and refusal codes.
+func TestCompactSessionHandler(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		err    error
+		status int
+		code   string
+	}{
+		{"Should accept native compaction", nil, http.StatusAccepted, ""},
+		{
+			"Should reject a stopped session",
+			errors.Join(session.ErrSessionNotActive, errors.New("session is stopped")),
+			http.StatusBadRequest,
+			"session_not_promptable",
+		},
+		{
+			"Should reject a starting session",
+			errors.Join(session.ErrSessionNotActive, errors.New("session is starting")),
+			http.StatusBadRequest,
+			"session_not_promptable",
+		},
+		{"Should reject a busy session", session.ErrPromptInProgress, http.StatusConflict, "session_busy"},
+		{"Should reject unsupported compaction", session.ErrCompactionUnsupported, http.StatusConflict, "compaction_unsupported"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			manager := &stubSessionManager{
+				RequestCompactionFn: func(_ context.Context, id string) (session.CompactionRequestResult, <-chan acp.AgentEvent, error) {
+					if id != "sess-123" {
+						t.Fatalf("request target=%q", id)
+					}
+					return session.CompactionRequestResult{
+						SessionID: id,
+						PromptID:  "prompt-compact",
+						Command:   "compact",
+					}, nil, tc.err
+				},
+			}
+			engine := newTestRouter(t, newTestHandlers(t, manager, stubObserver{}, newTestHomePaths(t)))
+			response := performRequest(
+				t,
+				engine,
+				http.MethodPost,
+				"/api/workspaces/ws-workspace/sessions/sess-123/compact",
+				[]byte("{}"),
+			)
+			if response.Code != tc.status {
+				t.Fatalf("status=%d body=%s", response.Code, response.Body.String())
+			}
+			if tc.err != nil {
+				var payload contract.ErrorPayload
+				decodeJSONResponse(t, response, &payload)
+				if payload.Code != tc.code {
+					t.Fatalf("code=%q want %q", payload.Code, tc.code)
+				}
+				return
+			}
+			var payload contract.SessionCompactResponse
+			decodeJSONResponse(t, response, &payload)
+			if payload.SessionID != "sess-123" || payload.PromptID != "prompt-compact" ||
+				payload.Command != "compact" ||
+				payload.Status != "accepted" {
+				t.Fatalf("receipt=%#v", payload)
+			}
+		})
+	}
+}
+
+func TestDaemonProfiles(t *testing.T) {
+	t.Parallel()
+	t.Run("Should capture runtime profiles exclusively over UDS with bounded sampling", func(t *testing.T) {
+		t.Parallel()
+		engine := gin.New()
+		RegisterRoutes(engine, &Handlers{BaseHandlers: core.NewBaseHandlers(nil)})
+		request := func(ctx context.Context, path string) *httptest.ResponseRecorder {
+			t.Helper()
+			response := httptest.NewRecorder()
+			engine.ServeHTTP(response, httptest.NewRequestWithContext(ctx, http.MethodGet, path, nil))
+			return response
+		}
+		for _, kind := range []string{"cpu", "heap", "allocs", "goroutine", "mutex", "block", "threadcreate"} {
+			path := "/api/daemon/profile/" + kind
+			if kind == "cpu" || kind == "mutex" || kind == "block" {
+				path += "?seconds=1"
+			}
+			response := request(t.Context(), path)
+			if response.Code != http.StatusOK {
+				t.Fatalf("%s: status=%d body=%s", kind, response.Code, response.Body)
+			}
+			reader, err := gzip.NewReader(bytes.NewReader(response.Body.Bytes()))
+			if err != nil {
+				t.Fatalf("%s: %v", kind, err)
+			}
+			data, err := io.ReadAll(reader)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := reader.Close(); err != nil {
+				t.Fatal(err)
+			}
+			if len(data) == 0 {
+				t.Fatalf("%s: empty profile", kind)
+			}
+			file := filepath.Join(t.TempDir(), kind+".pprof")
+			if err := os.WriteFile(file, response.Body.Bytes(), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			if output, err := exec.CommandContext(t.Context(), "go", "tool", "pprof", "-raw", "-symbolize=none", file).
+				CombinedOutput(); err != nil {
+				t.Fatalf("%s: invalid pprof: %v: %s", kind, err, output)
+			}
+		}
+		if rate := runtime.SetMutexProfileFraction(-1); rate != 0 {
+			t.Fatalf("mutex sampling left enabled: %d", rate)
+		}
+		for _, path := range []string{"cpu?seconds=0", "cpu?seconds=121", "cpu?seconds=abc", "heap?seconds=1", "unknown"} {
+			response := request(t.Context(), "/api/daemon/profile/"+path)
+			if response.Code != http.StatusBadRequest ||
+				!strings.Contains(response.Body.String(), "daemon_profile_invalid") {
+				t.Fatalf("%s: %d %s", path, response.Code, response.Body)
+			}
+		}
+		if err := pprof.StartCPUProfile(io.Discard); err != nil {
+			t.Fatal(err)
+		}
+		response := request(t.Context(), "/api/daemon/profile/cpu?seconds=1")
+		pprof.StopCPUProfile()
+		if response.Code != http.StatusConflict || !strings.Contains(response.Body.String(), "profile_busy") {
+			t.Fatalf("concurrent cpu: %d %s", response.Code, response.Body)
+		}
+		ctx, cancel := context.WithCancel(t.Context())
+		defer cancel()
+		active := &cancelSamplingContext{Context: ctx, cancel: cancel}
+		response = request(active, "/api/daemon/profile/mutex?seconds=120")
+		if active.observedRate != 1 {
+			t.Fatalf("capture never enabled mutex sampling: %d", active.observedRate)
+		}
+		if response.Code != http.StatusInternalServerError || !strings.Contains(response.Body.String(), "canceled") {
+			t.Fatalf("cancel: %d %s", response.Code, response.Body)
+		}
+		if rate := runtime.SetMutexProfileFraction(-1); rate != 0 {
+			t.Fatalf("cancellation left sampling enabled: %d", rate)
+		}
+		response = request(t.Context(), "/api/daemon/profile/mutex?seconds=1")
+		if response.Code != http.StatusOK {
+			t.Fatalf("capture after cancellation: %d %s", response.Code, response.Body)
+		}
+		if rate := runtime.SetMutexProfileFraction(-1); rate != 0 {
+			t.Fatalf("repeated capture left sampling enabled: %d", rate)
+		}
+		for _, surface := range []httpapi.SurfaceSet{httpapi.SurfaceSetLocal, httpapi.SurfaceSetPrivate, httpapi.SurfaceSetPublicIngress, httpapi.SurfaceSetPublicOperator, httpapi.SurfaceSetPublicCombined} {
+			httpEngine := gin.New()
+			httpapi.RegisterSurfaceRoutes(
+				httpEngine,
+				&httpapi.Handlers{BaseHandlers: core.NewBaseHandlers(nil)},
+				surface,
+			)
+			for _, route := range httpEngine.Routes() {
+				if strings.Contains(route.Path, "/daemon/profile") {
+					t.Fatalf("profile exposed on HTTP surface %s", surface)
+				}
+			}
+			response := httptest.NewRecorder()
+			httpEngine.ServeHTTP(
+				response,
+				httptest.NewRequestWithContext(t.Context(), http.MethodGet, "/api/daemon/profile/heap", nil),
+			)
+			if response.Code == http.StatusOK && response.Header().Get("Content-Type") == "application/octet-stream" {
+				t.Fatalf("profile served on HTTP surface %s", surface)
+			}
+		}
+	})
+}
+
+type cancelSamplingContext struct {
+	context.Context
+	cancel       context.CancelFunc
+	observedRate int
+}
+
+var _ context.Context = (*cancelSamplingContext)(nil)
+
+func (c *cancelSamplingContext) Done() <-chan struct{} {
+	if c.Err() == nil {
+		c.observedRate = runtime.SetMutexProfileFraction(-1)
+		c.cancel()
+	}
+	return c.Context.Done()
+}

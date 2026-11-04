@@ -1,0 +1,172 @@
+import {
+  validOpenInEditorParams,
+  validOpenInEditorResult,
+  type OpenInEditorErrorCode,
+  type OpenInEditorParams,
+  type OpenInEditorResult,
+} from "./open-in-editor-contract";
+import {
+  GLOBAL_SHORTCUT_STATUS_VALUES,
+  type GlobalShortcutBinding,
+  type GlobalShortcutRegistration,
+} from "../shortcuts/global-shortcut-types";
+
+export const PRODUCT_IPC_CHANNEL = "product:control";
+
+export const PRODUCT_METHOD_VALUES = [
+  "global_shortcuts.sync",
+  "global_shortcuts.status",
+  "theme.set",
+  "dialog.pick_directory",
+  "files.open_in_editor",
+] as const;
+export type ProductMethod = (typeof PRODUCT_METHOD_VALUES)[number];
+export const PRODUCT_METHODS = new Set<string>(PRODUCT_METHOD_VALUES);
+
+export const PRODUCT_EVENT_VALUES = ["shell:summon"] as const;
+export type ProductEvent = (typeof PRODUCT_EVENT_VALUES)[number];
+export const PRODUCT_EVENTS = new Set<string>(PRODUCT_EVENT_VALUES);
+
+export function isProductMethod(value: string): value is ProductMethod {
+  return PRODUCT_METHODS.has(value);
+}
+
+export function isProductEvent(value: string): value is ProductEvent {
+  return PRODUCT_EVENTS.has(value);
+}
+
+/** The renderer's theme preference, reported so native chrome and window backgrounds follow it. */
+export const THEME_PREFERENCE_VALUES = ["light", "dark", "system"] as const;
+export type ThemePreference = (typeof THEME_PREFERENCE_VALUES)[number];
+const THEME_PREFERENCES = new Set<string>(THEME_PREFERENCE_VALUES);
+
+export function isThemePreference(value: unknown): value is ThemePreference {
+  return typeof value === "string" && THEME_PREFERENCES.has(value);
+}
+
+const STATUSES = new Set<string>(GLOBAL_SHORTCUT_STATUS_VALUES);
+const REGISTRATION_KEYS = new Set([
+  "command_id",
+  "intended_chord",
+  "active_chord",
+  "status",
+  "reason",
+  "settings_url",
+]);
+
+/** Longest path the folder dialog accepts or reports; far above any real OS limit. */
+const MAX_DIRECTORY_PATH_LENGTH = 4096;
+
+/**
+ * An absolute POSIX or Windows path (`/x`, `C:\x`, `\\server\share`). The renderer cannot
+ * reach `node:path`, so both sides share this syntactic check.
+ */
+export function isAbsoluteDirectoryPath(value: unknown): value is string {
+  if (typeof value !== "string" || value.length === 0) return false;
+  if (value.length > MAX_DIRECTORY_PATH_LENGTH) return false;
+  // oxlint-disable-next-line no-control-regex -- control characters are exactly what is rejected.
+  if (/[\u0000-\u001f\u007f]/.test(value)) return false;
+  return (
+    value.startsWith("/") || /^[A-Za-z]:[\\/]/.test(value) || /^\\\\[^\\/]+[\\/][^\\/]+/.test(value)
+  );
+}
+
+/** Parameters of `dialog.pick_directory`: the folder the dialog opens in, when known. */
+export interface PickDirectoryParams {
+  default_path?: string;
+}
+
+/** The chosen folder, or `null` when the operator canceled the dialog. */
+export interface PickDirectoryResult {
+  path: string | null;
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function validBinding(value: unknown): value is GlobalShortcutBinding {
+  return (
+    isRecord(value) &&
+    Object.keys(value).length === 2 &&
+    typeof value.command_id === "string" &&
+    value.command_id.trim() !== "" &&
+    typeof value.chord === "string" &&
+    value.chord.trim() !== ""
+  );
+}
+
+function validRegistration(value: unknown): value is GlobalShortcutRegistration {
+  if (!isRecord(value)) return false;
+  if (Object.keys(value).some(key => !REGISTRATION_KEYS.has(key))) return false;
+  return (
+    typeof value.command_id === "string" &&
+    value.command_id.trim() !== "" &&
+    typeof value.intended_chord === "string" &&
+    value.intended_chord.trim() !== "" &&
+    typeof value.status === "string" &&
+    STATUSES.has(value.status) &&
+    (value.active_chord === undefined || typeof value.active_chord === "string") &&
+    (value.reason === undefined || typeof value.reason === "string") &&
+    (value.settings_url === undefined || typeof value.settings_url === "string")
+  );
+}
+
+export function validProductParams(method: ProductMethod, value: unknown): boolean {
+  if (!isRecord(value)) return false;
+  if (method === "files.open_in_editor") return validOpenInEditorParams(value);
+  if (method === "global_shortcuts.status") return Object.keys(value).length === 0;
+  if (method === "theme.set") {
+    return Object.keys(value).length === 1 && isThemePreference(value.preference);
+  }
+  if (method === "dialog.pick_directory") {
+    const keys = Object.keys(value);
+    if (keys.some(key => key !== "default_path")) return false;
+    return value.default_path === undefined || isAbsoluteDirectoryPath(value.default_path);
+  }
+  return (
+    Object.keys(value).length === 1 &&
+    Array.isArray(value.bindings) &&
+    value.bindings.every(validBinding)
+  );
+}
+
+export interface ProductResponses {
+  "global_shortcuts.sync": GlobalShortcutRegistration[];
+  "global_shortcuts.status": GlobalShortcutRegistration[];
+  "theme.set": { preference: ThemePreference };
+  "dialog.pick_directory": PickDirectoryResult;
+  "files.open_in_editor": OpenInEditorResult;
+}
+
+export function validProductResponse<M extends ProductMethod>(
+  method: M,
+  value: unknown
+): value is ProductResponses[M] {
+  if (method === "theme.set") {
+    return (
+      isRecord(value) && Object.keys(value).length === 1 && isThemePreference(value.preference)
+    );
+  }
+  if (method === "files.open_in_editor") return validOpenInEditorResult(value);
+  if (method === "dialog.pick_directory") {
+    return (
+      isRecord(value) &&
+      Object.keys(value).length === 1 &&
+      (value.path === null || isAbsoluteDirectoryPath(value.path))
+    );
+  }
+  return Array.isArray(value) && value.every(validRegistration);
+}
+
+export function validProductEventPayload(event: ProductEvent, value: unknown): boolean {
+  if (event !== "shell:summon" || !isRecord(value)) return false;
+  return (
+    Object.keys(value).length === 1 &&
+    typeof value.command_id === "string" &&
+    value.command_id.trim() !== ""
+  );
+}
+
+export type { GlobalShortcutBinding, GlobalShortcutRegistration };
+export type { OpenInEditorErrorCode, OpenInEditorParams, OpenInEditorResult };

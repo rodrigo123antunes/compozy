@@ -1,0 +1,314 @@
+---
+title: Removal and Recovery
+description: Remove a linked checkout after safety checks or recover a Worktree that disappeared outside CompozyOS.
+---
+
+Removal deletes the linked checkout, not operator-owned branches or Git history, unless you explicitly
+opt in to [deleting the local branch](#delete-the-local-branch). CompozyOS checks bound sessions,
+dirty files, unpushed commits, repository identity, and fresh cleanup evidence before it changes Git.
+
+## Remove a clean Worktree
+
+### 1. Read cleanup evidence
+
+```bash
+compozy worktree exit feature-auth --workspace . -o json
+```
+
+Continue only when `cleanup.safe` is true and the evidence matches the intended branch or merged pull
+request.
+
+A deleted upstream is a readable Git state: `has_upstream` remains true while `ahead` and `behind`
+are unknown. This commonly follows squash merge and remote branch deletion. It does not prove that
+local commits were merged.
+
+Refresh forge status before cleanup:
+
+```bash
+compozy worktree status feature-auth --workspace . --refresh --forge -o json
+```
+
+A fresh merged PR whose head SHA matches the current checkout permits removal without `--force`,
+even when squash merge leaves that SHA absent from remote branches. The exit plan reports forge
+cleanup evidence, and removal excludes those merged commits from its unpushed risk. The persisted cache does not retain the PR head SHA, so cleanup queries the provider for that proof
+when the cached merge is fresh. Missing, expired,
+or mismatched evidence retains the unpushed-work refusal. Dirty files and active sessions still block
+removal. Removal rechecks evidence after pre-remove hooks; a later local commit requires new evidence.
+
+### 2. Remove the linked checkout
+
+```bash
+compozy worktree remove feature-auth --workspace . -o json
+```
+
+Expected result:
+
+```json
+{
+  "action": "removed",
+  "worktree": {
+    "id": "wt_01...",
+    "name": "feature-auth",
+    "state": "removed"
+  }
+}
+```
+
+Mutation receipts always report the canonical Worktree ID, even when the command is addressed by
+name.
+
+An active bound session blocks removal with `worktree_session_active`. Removal never silently
+stops sessions. End the session through its own controls before retrying.
+
+## Review a refusal before force
+
+Commits whose patches already exist in the comparison base, local default branch, or any local remote-tracking ref do
+not count as unpushed removal risk. This includes cherry-picked and rebased landings with different
+commit IDs, even without an upstream or PR. Genuinely unique commits remain protected. Remote
+evidence uses locally available refs; fetch recent remote changes before retrying if needed.
+
+Dirty or unpushed work returns a structured conflict instead of deleting it:
+
+```json
+{
+  "code": "worktree_dirty_requires_force",
+  "error": "The worktree has uncommitted changes. Force removal discards them.",
+  "risk": {
+    "changed_files": 2,
+    "insertions": 4,
+    "deletions": 1,
+    "unpushed_commits": 3,
+    "exists_on_remote": false,
+    "leftover_files": 0
+  },
+  "downgrade": false
+}
+```
+
+Return to [Assisted exit](/docs/worktrees/assisted-exit) first. If the operator still intends to
+discard the checkout after reviewing those exact quantities, confirm explicitly:
+
+```bash
+compozy worktree remove feature-auth --workspace . --force -o json
+```
+
+`--force` alone does not delete an operator-owned branch. A remote branch may downgrade unpushed evidence,
+but it never hides dirty files or an unreadable safety check. The narrow exception is an unchanged
+runtime-owned per-run branch: CompozyOS compare-deletes it only while it still points at the recorded
+creation commit and emits `worktree.branch_reclaimed`.
+
+## Recover a half-removed checkout
+
+A removal that stops midway can leave a checkout folder behind after Git already deleted its `.git`
+link. Git still lists the entry as `prunable`, but refuses to remove it, even with `--force`.
+CompozyOS reports this state instead of failing, for a registered Worktree and for a discovered path:
+
+```json
+{
+  "code": "worktree_checkout_orphaned",
+  "error": "The checkout's Git metadata (.git) is missing; the directory is left over from an interrupted removal. Force removal deletes the leftover files and clears Git's entry.",
+  "risk": {
+    "changed_files": 0,
+    "insertions": 0,
+    "deletions": 0,
+    "unpushed_commits": 1,
+    "exists_on_remote": false,
+    "leftover_files": 1284
+  },
+  "downgrade": false
+}
+```
+
+Nothing is removed. `leftover_files` counts every file still in the folder, because Git can no longer
+tell which ones changed. `unpushed_commits` counts commits that only a detached HEAD still holds; a
+branch keeps its own commits. Copy anything you need out of the folder, then confirm:
+
+```bash
+compozy worktree remove perf-baseline --workspace . --force -o json
+compozy worktree remove --path /private/tmp/perf-baseline --workspace . --force -o json
+```
+
+CompozyOS deletes the leftover folder first, then clears only that entry from Git's list. If it stops
+in between, the same command retries the remaining Git cleanup before marking the removal complete.
+It checks the saved Git identity and leaves unrelated entries untouched. A Git lock still requires
+`--force`, even when the leftover folder is empty. In the app, the
+failed row shows the reason and **Force remove…** lists the leftover files before confirming.
+
+CompozyOS runs checkout removal independently of the request that started it, with a budget sized for
+large folders, so closing the app or a slow delete no longer interrupts Git midway. If the daemon
+stops during a removal, the next start finishes cleanup if the folder is already gone and its Git
+entry is unlocked. Leftover files, a lock, or an unreadable identity return the record to ready for
+your review.
+
+## Delete the local branch
+
+Branch deletion is opt-in. Add `--delete-branch` to `remove` (or to `dismiss` for a missing record)
+and CompozyOS deletes the recorded local branch after the checkout is gone:
+
+```bash
+compozy worktree remove feature-auth --workspace . --delete-branch -o json
+```
+
+Expected result adds a `branch` outcome:
+
+```json
+{
+  "action": "removed",
+  "worktree": { "id": "wt_01...", "name": "feature-auth", "state": "removed" },
+  "branch": { "name": "feature-auth", "deleted": true }
+}
+```
+
+The deletion follows Git's merged-only rule (`git branch -d`): the branch must be contained in its
+upstream, or in the main checkout's `HEAD` when it has no upstream. Add `--force` to delete a branch
+with unmerged commits as well. Some branches are always kept, and the outcome names why:
+
+| `reason`                | Kept because                                                                 |
+| ----------------------- | ---------------------------------------------------------------------------- |
+| `root_checkout_branch`  | The main checkout has the branch checked out.                                |
+| `default_branch`        | It is the remote default branch (`origin/HEAD`), or `main` without a remote. |
+| `not_fully_merged`      | It has commits that are not merged; retry with `--force` to delete them.     |
+| `checked_out_elsewhere` | Another worktree has the branch checked out.                                 |
+| `checkout_present`      | A directory reappeared at the recorded path; nothing there is touched.       |
+| `registration_present`  | Git still registers the worktree (for example, it is locked).                |
+| `branch_absent`         | The branch no longer exists, for example after per-run reclamation.          |
+| `no_branch`             | The worktree had no recorded branch.                                         |
+| `delete_failed`         | Git refused the deletion or the branch step could not run; see `detail`.     |
+
+A kept branch is an outcome, not an error: the checkout removal or record dismissal has still
+succeeded. Repeating the same command on the already-removed or dismissed record retries only the
+branch step, so `remove --delete-branch --force` is the way to delete an unmerged branch you have
+reviewed.
+
+For a missing record, `dismiss --delete-branch` first releases Git's stale registration for that
+record's path only, then deletes the branch. Other prunable worktrees stay registered.
+The registration must still match the saved branch and Git identity; a replacement registration
+is kept. When a remote exists but `origin/HEAD` is unknown, branch deletion is refused with
+`delete_failed` and diagnostic detail until the default is known. A failed Git read is reported as
+a failure, never as proof that the branch is already absent.
+
+HTTP and UDS clients pass `delete_branch=true` (plus `force=true` for unmerged branches) on
+`DELETE /api/workspaces/{workspace_id}/worktrees/{worktree_id}` or
+`POST .../{worktree_id}/dismiss`; the response is `200` with `{"branch": {...}}`. Requests without
+`delete_branch` keep their `204 No Content` response. The `compozy__worktree_remove` native tool
+accepts the same `delete_branch` input and returns the outcome as `branch`.
+
+## Recover a missing path
+
+Run a fresh discovery after a checkout is removed or moved outside CompozyOS:
+
+```bash
+compozy worktree list --workspace . --refresh -o json
+```
+
+The record becomes `missing`, retains history, and cannot host new sessions or runs.
+
+If the same linked checkout is back at its recorded path, restore it by adopting that path:
+
+```bash
+compozy worktree adopt /src/acme-feature-auth --workspace . -o json
+```
+
+Expected result is the original Worktree ID with `state: "ready"`. A different repository at that
+path is refused.
+
+If the path cannot return, clear only the retained record:
+
+```bash
+compozy worktree dismiss feature-auth --workspace . -o json
+```
+
+Expected result reports `action: "dismissed"`. Dismiss does not delete a filesystem path, a branch,
+session history, or task history. Add `--delete-branch` to also delete the local branch, as described
+in [Delete the local branch](#delete-the-local-branch). The retained record remains readable by its ID,
+but its name becomes available for a new Worktree. Every non-dismissed record, including `removed`,
+continues to reserve its name.
+
+When removal preserved the branch, reuse the released Worktree name by attaching that branch:
+
+```bash
+compozy worktree create feature-auth --workspace . --existing-branch <retained-branch> -o json
+```
+
+Use `feature-auth` for `<retained-branch>` when the original Worktree used its default branch. This
+creates a new Worktree ID while the dismissed record and its history remain readable by the old ID.
+Use `--branch <new-branch>` instead when the replacement should start from a different branch.
+
+## Remove a discovered Worktree
+
+A discovered row is a linked checkout that Git lists but CompozyOS never created or adopted, such as a
+checkout made by another tool. You can remove it without adopting it first.
+
+### 1. Find the exact path
+
+```bash
+compozy worktree list --workspace . --refresh -o json
+```
+
+Copy the entry's `path` from `discovered[]` exactly as listed. Git matches stale entries by that
+spelling, so on macOS `/private/tmp/...` and `/tmp/...` are different paths.
+
+### 2. Remove it by path
+
+```bash
+compozy worktree remove --path /private/tmp/detached-a217e52e --workspace . -o json
+```
+
+Expected result reports `action: "removed"` with that `path`. A stale entry, one Git reports as
+prunable because its directory is gone, only loses Git's record of it. A live checkout gets the same checks as
+a registered one: uncommitted changes, or commits that no branch, tag or remote keeps, are refused
+with `worktree_dirty_requires_force` or `worktree_unpushed_requires_force` and a `risk` inventory.
+Review it, then repeat with `--force` to discard that work.
+
+Removing a discovered Worktree never deletes its branch, so `--path` cannot be combined with a
+Worktree name or `--delete-branch`. A path that already has a CompozyOS record, in this or another
+workspace on the same repository, is refused with `worktree_registered`; remove that record by its
+name instead. The app sends `expect_stale` when it confirms clearing a stale entry, so a checkout that
+reappears in the meantime is refused with `worktree_discovered_changed` instead of being removed. In
+the app, choose
+**Delete worktree…** on a discovered row, or **Remove stale entry…** on a prunable one. Both open
+the batch confirmation below.
+
+## Remove several Worktrees in the app
+
+In the menubar workspace submenu or Workspaces overview, choose **Select worktrees…**.
+Select individual rows, use Shift to select a range, or choose **Select all**.
+Select all captures only eligible rows currently represented by that list; later arrivals are not
+added. Escape clears selection. Selection never navigates into a checkout or adopts a discovered one.
+
+Ready, missing and discovered rows can be selected together. Discovered rows are removed by their Git
+path, with no owner profile, and always keep their branch. **Remove N worktrees…** freezes the workspace and
+Worktree IDs. The confirmation separates checkout removal from dismissal of missing records and
+offers **Also delete local branches**, unchecked by default. Missing rows can also be resolved
+individually through **Clean up missing record…**, which retains **It's back** and offers the same
+branch opt-in. The single **Remove…** confirmation offers **Also delete local branch**; when an
+unmerged branch is kept, its notification offers **Delete anyway**.
+
+Each target receives fresh server checks and acts with its own owner profile, exactly as the
+single-row actions do, so rows owned by another profile can be cleaned up without switching
+profiles. Active/busy Worktrees, unknown lifecycle states, unreadable status, hook denials, dirty
+edits and unpublished work remain refused on the first attempt. For dirty or unpushed refusals,
+**Force remove…** opens a second confirmation with each eligible worktree's changed files and
+unique commits. Confirming retries only those targets with force; canceling removes nothing.
+With **Also delete local branches** selected, the force confirmation also warns that unmerged
+branches may be deleted. The root and default branches remain protected. Other refusal codes
+cannot be forced, and the batch never stops sessions. Rows whose owner profile is archived or no longer exists and rows with
+an active session are ineligible: their row action stays visible but disabled, and names the reason.
+
+Results report each success and refusal independently, including whether each branch was deleted
+or kept and why. Successful targets stay recorded in the
+result list; **Retry failed** reconciles the original IDs and retries only failed or unconfirmed
+items. A changed lifecycle state requires a new selection and confirmation. This is not an atomic
+batch: one refusal does not undo successful removals.
+
+Dismissing a missing record preserves files even if something reappeared at that path, plus Git
+history, sessions and task/Loop history, and its branch unless branch deletion was requested. Without
+that opt-in it does not prune Git's administrative entries; an unregistered stale Git checkout may
+appear separately as unavailable discovery. Repeating dismissal
+by the retained ID is safe. Refreshing or restarting does not revive the dismissed registry entry.
+
+Existing HTTP/UDS remove and dismiss clients may omit `profile`: operator requests infer the owner
+from the target record. Explicit selectors must match that owner, authenticated agents remain bound
+to their session profile, and archived owners are refused. The Web sends each row's owner as the
+explicit selector, for single and bulk cleanup alike; owners that are archived or no longer exist are
+refused.

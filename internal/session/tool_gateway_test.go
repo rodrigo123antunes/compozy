@@ -1,0 +1,125 @@
+package session
+
+import (
+	"context"
+	"encoding/json"
+	"errors"
+	"strings"
+	"testing"
+
+	"github.com/compozy/compozy/internal/acp"
+	hookspkg "github.com/compozy/compozy/internal/hooks"
+	"github.com/compozy/compozy/internal/testutil"
+)
+
+func TestProviderNativeToolGatewayIntercept(t *testing.T) {
+	t.Parallel()
+
+	t.Run("Should deny provider native tools for verdict only sessions", func(t *testing.T) {
+		t.Parallel()
+
+		h := newHarness(t)
+		session := &Session{}
+		gateway := newProviderNativeToolGateway(h.manager, session, RuntimeModeVerdictOnly, false)
+		_, err := gateway.Intercept(testutil.Context(t), acp.ToolExecutionRequest{
+			ToolID:   "Read",
+			ReadOnly: true,
+			Input:    json.RawMessage(`{"path":"internal/loop/goal/route.go"}`),
+		})
+		if !errors.Is(err, acp.ErrPermissionDenied) {
+			t.Fatalf("Intercept() error = %v, want ErrPermissionDenied", err)
+		}
+	})
+
+	t.Run("Should reject tool execution when tool pre call returns deny patch", func(t *testing.T) {
+		t.Parallel()
+
+		hooks := newNativeHookDispatcher(t,
+			[]hookspkg.HookDecl{{
+				Name:         "deny-tool-call",
+				Event:        hookspkg.HookToolPreCall,
+				Mode:         hookspkg.HookModeSync,
+				ExecutorKind: hookspkg.HookExecutorNative,
+				Matcher: hookspkg.HookMatcher{
+					ToolID: "compozy__write",
+				},
+			}},
+			map[string]hookspkg.Executor{
+				"deny-tool-call": hookspkg.NewTypedNativeExecutor(
+					func(
+						_ context.Context,
+						_ hookspkg.RegisteredHook,
+						payload hookspkg.ToolPreCallPayload,
+					) (hookspkg.ToolCallPatch, error) {
+						if payload.ToolID != "compozy__write" {
+							t.Fatalf("payload.ToolID = %q, want compozy__write", payload.ToolID)
+						}
+						return hookspkg.ToolCallPatch{
+							Deny:       true,
+							DenyReason: "blocked by hook",
+						}, nil
+					},
+				),
+			},
+		)
+
+		h := newHarness(t, WithHookSet(HookSet{Tools: hooks}))
+		session := createSession(t, h)
+		t.Cleanup(func() {
+			if err := h.manager.Stop(testutil.Context(t), session.ID); err != nil &&
+				!errors.Is(err, ErrSessionNotFound) {
+				t.Fatalf("Stop() error = %v", err)
+			}
+		})
+
+		gateway := newProviderNativeToolGateway(h.manager, session, "", false)
+		if gateway == nil {
+			t.Fatal("newProviderNativeToolGateway() = nil, want gateway")
+		}
+
+		_, err := gateway.Intercept(testutil.Context(t), acp.ToolExecutionRequest{
+			ToolID: "compozy__write",
+			Input: json.RawMessage(`{
+				"path": "/tmp/blocked.txt",
+				"content": "blocked"
+			}`),
+		})
+		if !errors.Is(err, acp.ErrPermissionDenied) {
+			t.Fatalf("Intercept() error = %v, want ErrPermissionDenied", err)
+		}
+	})
+
+	t.Run("Should refuse a shell wait only for a session that can redirect it", func(t *testing.T) {
+		t.Parallel()
+		h := newHarness(t)
+		session := createSession(t, h)
+		t.Cleanup(func() {
+			if err := h.manager.Stop(testutil.Context(t), session.ID); err != nil &&
+				!errors.Is(err, ErrSessionNotFound) {
+				t.Fatalf("Stop() error = %v", err)
+			}
+		})
+		watch := acp.ToolExecutionRequest{
+			ToolID:  "Run gh",
+			Execute: true,
+			Input:   json.RawMessage(`{"command":["bash","-lc","gh pr checks 1 --watch"]}`),
+		}
+
+		guarded := newProviderNativeToolGateway(h.manager, session, "", true)
+		_, err := guarded.Intercept(testutil.Context(t), watch)
+		if !errors.Is(err, acp.ErrPermissionDenied) || !strings.Contains(err.Error(), "compozy__monitor_create") {
+			t.Fatalf("guarded Intercept() error = %v, want a denial naming the monitor", err)
+		}
+
+		short := watch
+		short.Input = json.RawMessage(`{"command":["bash","-lc","git status"]}`)
+		if _, err := guarded.Intercept(testutil.Context(t), short); err != nil {
+			t.Fatalf("guarded Intercept(short) error = %v", err)
+		}
+
+		unguarded := newProviderNativeToolGateway(h.manager, session, "", false)
+		if _, err := unguarded.Intercept(testutil.Context(t), watch); err != nil {
+			t.Fatalf("unguarded Intercept() error = %v, want the wait allowed", err)
+		}
+	})
+}

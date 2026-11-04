@@ -1,0 +1,503 @@
+//go:build mage
+
+// Suite: Hermetic Go test lane policy
+// Invariant: Unit-test shards partition every main-module package and split-package test exactly once
+// under the duration-weighted (census) assignment; the SDK module remains a separate, single CI lane.
+// Boundary IN: Mage package selection, census weighting, concurrency policy, and environment scrubbing.
+// Boundary OUT: GitHub Actions runner orchestration in .github/workflows/ci.yml.
+
+package main
+
+import (
+	"bytes"
+	"os/exec"
+	"slices"
+	"strconv"
+	"strings"
+	"testing"
+)
+
+func TestGoUnitTestPackageLimitFor(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name         string
+		effectiveCPU int
+		parallelism  int
+		want         int
+	}{
+		{name: "Should keep one group on four CPUs", effectiveCPU: 4, parallelism: 4, want: 1},
+		{name: "Should keep one group on eight CPUs", effectiveCPU: 8, parallelism: 4, want: 1},
+		{name: "Should use the partial second group on twelve CPUs", effectiveCPU: 12, parallelism: 4, want: 2},
+		{name: "Should allow two groups on sixteen CPUs", effectiveCPU: 16, parallelism: 4, want: 2},
+		{name: "Should allow four groups on thirty two CPUs", effectiveCPU: 32, parallelism: 4, want: 4},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			if got := goUnitTestPackageLimitFor(tt.effectiveCPU, tt.parallelism); got != tt.want {
+				t.Fatalf(
+					"goUnitTestPackageLimitFor(%d, %d) = %d, want %d",
+					tt.effectiveCPU,
+					tt.parallelism,
+					got,
+					tt.want,
+				)
+			}
+		})
+	}
+}
+
+func TestGoTestSafetyArgs(t *testing.T) {
+	t.Parallel()
+
+	t.Run("Should limit disabled checkptr to the modernc dependency", func(t *testing.T) {
+		t.Parallel()
+		got := goTestSafetyArgs(false, false)
+		want := []string{"-race", "-gcflags=" + moderncCheckptrFlag, "-parallel=4"}
+		if !slices.Equal(got, want) {
+			t.Fatalf("goTestSafetyArgs(false, false) = %v, want %v", got, want)
+		}
+	})
+
+	t.Run("Should serialize the uncached audit without disabling race or checkptr", func(t *testing.T) {
+		t.Parallel()
+		got := goTestSafetyArgs(true, true)
+		want := []string{"-race", "-parallel=1", "-count=1"}
+		if !slices.Equal(got, want) {
+			t.Fatalf("goTestSafetyArgs(true, true) = %v, want %v", got, want)
+		}
+	})
+
+	t.Run("Should bypass the SDK result cache in the audit lane", func(t *testing.T) {
+		t.Parallel()
+		want := []string{"test", "-race", "-parallel=4", "-count=1", "./..."}
+		if got := goSDKTestArgs(true); !slices.Equal(got, want) {
+			t.Fatalf("goSDKTestArgs(true) = %v, want %v", got, want)
+		}
+	})
+}
+
+func TestParseGoTestShard(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name      string
+		indexRaw  string
+		totalRaw  string
+		want      goTestShard
+		wantOn    bool
+		wantError string
+	}{
+		{name: "Should disable sharding when both values are unset"},
+		{
+			name:     "Should parse a valid zero-based shard",
+			indexRaw: "1",
+			totalRaw: "2",
+			want:     goTestShard{index: 1, total: 2},
+			wantOn:   true,
+		},
+		{
+			name:      "Should reject a missing shard total",
+			indexRaw:  "0",
+			wantError: "must be set together",
+		},
+		{
+			name:      "Should reject a negative shard index",
+			indexRaw:  "-1",
+			totalRaw:  "2",
+			wantError: "non-negative integer",
+		},
+		{
+			name:      "Should reject a shard index outside the total",
+			indexRaw:  "2",
+			totalRaw:  "2",
+			wantError: "must be less than",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			got, enabled, err := parseGoTestShard(tt.indexRaw, tt.totalRaw)
+			if tt.wantError != "" {
+				if err == nil || !strings.Contains(err.Error(), tt.wantError) {
+					t.Fatalf(
+						"parseGoTestShard(%q, %q) error = %v, want containing %q",
+						tt.indexRaw,
+						tt.totalRaw,
+						err,
+						tt.wantError,
+					)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("parseGoTestShard(%q, %q) error = %v", tt.indexRaw, tt.totalRaw, err)
+			}
+			if enabled != tt.wantOn || got != tt.want {
+				t.Fatalf(
+					"parseGoTestShard(%q, %q) = (%+v, %t), want (%+v, %t)",
+					tt.indexRaw,
+					tt.totalRaw,
+					got,
+					enabled,
+					tt.want,
+					tt.wantOn,
+				)
+			}
+		})
+	}
+}
+
+func TestShouldRunSDKGoTests(t *testing.T) {
+	t.Parallel()
+
+	t.Run("Should run the SDK once in an unsharded local lane", func(t *testing.T) {
+		t.Parallel()
+		runSDK, err := shouldRunSDKGoTests("", "")
+		if err != nil {
+			t.Fatalf("shouldRunSDKGoTests() error = %v", err)
+		}
+		if !runSDK {
+			t.Fatal("unsharded unit lane must retain SDK coverage")
+		}
+	})
+
+	t.Run("Should leave the SDK to its dedicated CI job for every shard", func(t *testing.T) {
+		t.Parallel()
+		for index := range 3 {
+			runSDK, err := shouldRunSDKGoTests(strconv.Itoa(index), "3")
+			if err != nil {
+				t.Fatalf("shouldRunSDKGoTests(%d, 3) error = %v", index, err)
+			}
+			if runSDK {
+				t.Fatalf("shard %d unexpectedly selected the SDK suite", index)
+			}
+		}
+	})
+}
+
+func TestIntegrationPackageShardsCoverEveryTestOnce(t *testing.T) {
+	t.Parallel()
+	for _, packagePath := range []string{"github.com/compozy/compozy/internal/daemon", "github.com/compozy/compozy/internal/store"} {
+		t.Run(packagePath, func(t *testing.T) {
+			tests := []string{"TestAlpha", "TestBeta", "TestGamma", "TestDelta"}
+			assigned := []string{}
+			for index := range 3 {
+				invocations, err := shardGoPackageTestInvocations(
+					[]string{packagePath},
+					packagePath,
+					tests,
+					nil,
+					goTestShard{index: index, total: 3},
+				)
+				if err != nil {
+					t.Fatal(err)
+				}
+				for _, invocation := range invocations {
+					if !slices.Equal(invocation.packages, []string{packagePath}) || len(invocation.tests) == 0 {
+						t.Fatalf("unbounded split invocation: %+v", invocation)
+					}
+					assigned = append(assigned, invocation.tests...)
+				}
+			}
+			slices.Sort(assigned)
+			slices.Sort(tests)
+			if !slices.Equal(assigned, tests) {
+				t.Fatalf("integration assignments = %v, want exactly %v", assigned, tests)
+			}
+		})
+	}
+}
+
+func TestShardGoUnitTestInvocations(t *testing.T) {
+	t.Parallel()
+
+	collectAssignments := func(
+		t *testing.T,
+		packages []string,
+		splitTests []string,
+		census *goTestCensus,
+		total int,
+	) []string {
+		t.Helper()
+		assigned := make([]string, 0, len(packages)+len(splitTests)-1)
+		for shardIndex := range total {
+			invocations, err := shardGoUnitTestInvocations(
+				packages,
+				splitTests,
+				census,
+				goTestShard{index: shardIndex, total: total},
+			)
+			if err != nil {
+				t.Fatalf("shardGoUnitTestInvocations() for shard %d: %v", shardIndex, err)
+			}
+			for _, invocation := range invocations {
+				if slices.Equal(invocation.packages, []string{goSplitTestPackage}) {
+					if len(invocation.tests) == 0 {
+						t.Fatalf("split invocation without selected tests: %+v", invocation)
+					}
+					for _, testName := range invocation.tests {
+						assigned = append(assigned, "test:"+testName)
+					}
+					continue
+				}
+				if len(invocation.tests) != 0 {
+					t.Fatalf("regular package invocation unexpectedly selected tests: %+v", invocation)
+				}
+				for _, packagePath := range invocation.packages {
+					assigned = append(assigned, "package:"+packagePath)
+				}
+			}
+		}
+		slices.Sort(assigned)
+		return assigned
+	}
+
+	t.Run("Should assign every package and split-package test to exactly one shard", func(t *testing.T) {
+		t.Parallel()
+		packages := []string{
+			"package/d",
+			goSplitTestPackage,
+			"package/a",
+			"package/c",
+			"package/b",
+		}
+		splitTests := []string{"TestDelta", "TestAlpha", "TestCharlie", "TestBravo"}
+		assigned := collectAssignments(t, packages, splitTests, nil, 3)
+		want := []string{
+			"package:package/a",
+			"package:package/b",
+			"package:package/c",
+			"package:package/d",
+			"test:TestAlpha",
+			"test:TestBravo",
+			"test:TestCharlie",
+			"test:TestDelta",
+		}
+		if !slices.Equal(assigned, want) {
+			t.Fatalf("assignments across shards = %v, want %v", assigned, want)
+		}
+	})
+
+	t.Run("Should separate the heaviest packages across shards", func(t *testing.T) {
+		t.Parallel()
+		census := &goTestCensus{
+			DefaultPackageSeconds:   1,
+			DefaultSplitTestSeconds: 1,
+			Packages: map[string]float64{
+				"package/heavy-one": 100,
+				"package/heavy-two": 90,
+			},
+		}
+		packages := []string{"package/heavy-one", "package/heavy-two", "package/light", goSplitTestPackage}
+		splitTests := []string{"TestOnly"}
+
+		shardOfHeavy := make(map[string]int, 2)
+		for shardIndex := range 2 {
+			invocations, err := shardGoUnitTestInvocations(
+				packages,
+				splitTests,
+				census,
+				goTestShard{index: shardIndex, total: 2},
+			)
+			if err != nil {
+				t.Fatalf("shardGoUnitTestInvocations() for shard %d: %v", shardIndex, err)
+			}
+			for _, invocation := range invocations {
+				for _, packagePath := range invocation.packages {
+					if strings.HasPrefix(packagePath, "package/heavy-") {
+						shardOfHeavy[packagePath] = shardIndex
+					}
+				}
+			}
+		}
+		if len(shardOfHeavy) != 2 || shardOfHeavy["package/heavy-one"] == shardOfHeavy["package/heavy-two"] {
+			t.Fatalf("heavy packages share shard assignment: %v", shardOfHeavy)
+		}
+	})
+
+	t.Run("Should omit the split invocation for a shard that draws no split tests", func(t *testing.T) {
+		t.Parallel()
+		packages := []string{"package/a", "package/b", goSplitTestPackage}
+		splitTests := []string{"TestOnly"}
+
+		splitInvocations := 0
+		assigned := collectAssignments(t, packages, splitTests, nil, 2)
+		for shardIndex := range 2 {
+			invocations, err := shardGoUnitTestInvocations(
+				packages,
+				splitTests,
+				nil,
+				goTestShard{index: shardIndex, total: 2},
+			)
+			if err != nil {
+				t.Fatalf("shardGoUnitTestInvocations() for shard %d: %v", shardIndex, err)
+			}
+			for _, invocation := range invocations {
+				if len(invocation.tests) > 0 {
+					splitInvocations++
+				}
+			}
+		}
+		if splitInvocations != 1 {
+			t.Fatalf("split invocations across shards = %d, want exactly 1", splitInvocations)
+		}
+		want := []string{"package:package/a", "package:package/b", "test:TestOnly"}
+		if !slices.Equal(assigned, want) {
+			t.Fatalf("assignments across shards = %v, want %v", assigned, want)
+		}
+	})
+}
+
+func TestGoListPackagePaths(t *testing.T) {
+	t.Parallel()
+
+	t.Run("Should exclude Go download diagnostics from package selection", func(t *testing.T) {
+		t.Parallel()
+		cmd := exec.CommandContext(
+			t.Context(),
+			"sh",
+			"-c",
+			"printf 'example.com/first\\nexample.com/second\\n'; printf 'go: downloading example.com/module v1.2.3\\n' >&2",
+		)
+		got, err := goListPackagePaths(cmd)
+		if err != nil {
+			t.Fatalf("goListPackagePaths() error = %v", err)
+		}
+		want := []string{"example.com/first", "example.com/second"}
+		if !slices.Equal(got, want) {
+			t.Fatalf("goListPackagePaths() = %v, want %v", got, want)
+		}
+	})
+}
+
+func TestHermeticGoTestEnvFromBase(t *testing.T) {
+	t.Parallel()
+
+	t.Run("Should scrub ambient runtime-state vars and keep everything else", func(t *testing.T) {
+		t.Parallel()
+		base := []string{
+			"COMPOZY_HOME=/tmp/stale-qa-lab/runtime",
+			"COMPOZY_HTTP_PORT=54321",
+			"COMPOZY_TEST_DAEMON_BIN=/tmp/daemon",
+			"COMPOZY_LIVE_DISCOVERY_HELPER=/tmp/helper",
+			"PROVIDER_HOME=/tmp/stale-provider",
+			"PATH=/usr/bin",
+		}
+		var log bytes.Buffer
+		got := hermeticGoTestEnvFromBase(base, nil, &log)
+		for _, banned := range []string{"COMPOZY_HOME=/tmp/stale-qa-lab/runtime", "COMPOZY_HTTP_PORT=54321", "PROVIDER_HOME=/tmp/stale-provider"} {
+			if slices.Contains(got, banned) {
+				t.Fatalf("hermeticGoTestEnvFromBase() kept ambient %q; env = %v", banned, got)
+			}
+		}
+		for _, kept := range []string{"COMPOZY_TEST_DAEMON_BIN=/tmp/daemon", "COMPOZY_LIVE_DISCOVERY_HELPER=/tmp/helper", "PATH=/usr/bin"} {
+			if !slices.Contains(got, kept) {
+				t.Fatalf("hermeticGoTestEnvFromBase() dropped %q; env = %v", kept, got)
+			}
+		}
+		if !bytes.Contains(log.Bytes(), []byte("COMPOZY_HOME")) {
+			t.Fatalf("scrub note missing dropped var name; log = %q", log.String())
+		}
+	})
+
+	t.Run("Should let explicit lane overrides win over the scrub", func(t *testing.T) {
+		t.Parallel()
+		base := []string{"COMPOZY_WEB_DIST_DIR=/tmp/stale-dist"}
+		got := hermeticGoTestEnvFromBase(
+			base,
+			map[string]string{"COMPOZY_WEB_DIST_DIR": "/lane/dist", "CGO_ENABLED": "1"},
+			nil,
+		)
+		if !slices.Contains(got, "COMPOZY_WEB_DIST_DIR=/lane/dist") {
+			t.Fatalf("lane override missing; env = %v", got)
+		}
+		if !slices.Contains(got, "CGO_ENABLED=1") {
+			t.Fatalf("added override missing; env = %v", got)
+		}
+		if slices.Contains(got, "COMPOZY_WEB_DIST_DIR=/tmp/stale-dist") {
+			t.Fatalf("stale ambient value survived; env = %v", got)
+		}
+	})
+}
+
+// not parallel: t.Setenv mutates the process environment for the command environment.
+func TestRaceEnabledCommandEnv(t *testing.T) {
+	t.Setenv("CGO_ENABLED", "0")
+
+	t.Run("Should force cgo for race-enabled commands", func(t *testing.T) {
+		env := raceEnabledCommandEnv(nil)
+		if !slices.Contains(env, "CGO_ENABLED=1") {
+			t.Fatalf("raceEnabledCommandEnv() = %v, want CGO_ENABLED=1", env)
+		}
+		if slices.Contains(env, "CGO_ENABLED=0") {
+			t.Fatalf("raceEnabledCommandEnv() retained disabled cgo: %v", env)
+		}
+	})
+}
+
+func TestMergeEnvOverrides(t *testing.T) {
+	t.Parallel()
+
+	t.Run("Should replace existing entries and append new ones", func(t *testing.T) {
+		t.Parallel()
+		got := mergeEnvOverrides([]string{"A=1", "B=2"}, map[string]string{"B": "3", "C": "4"})
+		for _, want := range []string{"A=1", "B=3", "C=4"} {
+			if !slices.Contains(got, want) {
+				t.Fatalf("mergeEnvOverrides() = %v, want to contain %q", got, want)
+			}
+		}
+		if slices.Contains(got, "B=2") {
+			t.Fatalf("mergeEnvOverrides() kept stale entry; got %v", got)
+		}
+	})
+
+	t.Run("Should return a copy when no overrides are given", func(t *testing.T) {
+		t.Parallel()
+		base := []string{"A=1"}
+		got := mergeEnvOverrides(base, nil)
+		if len(got) != 1 || got[0] != "A=1" {
+			t.Fatalf("mergeEnvOverrides() = %v, want [A=1]", got)
+		}
+	})
+}
+
+func TestGlobalDBIntegrationConcurrency(t *testing.T) {
+	t.Parallel()
+	for _, tt := range []struct {
+		name     string
+		packages []string
+	}{
+		{name: "Should retain a regular-only selection", packages: []string{"example/api"}},
+		{name: "Should retain a GlobalDB-only selection", packages: []string{goSplitTestPackage}},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			got := isolateGlobalDBIntegrationTests(tt.packages)
+			if len(got) != 1 || !slices.Equal(got[0].packages, tt.packages) {
+				t.Fatalf("partition = %v, want one invocation of %v", got, tt.packages)
+			}
+		})
+	}
+	t.Run("Should isolate GlobalDB without dropping or duplicating packages", func(t *testing.T) {
+		t.Parallel()
+		packages := []string{"example/api", goSplitTestPackage, "example/daemon"}
+		invocations := isolateGlobalDBIntegrationTests(packages)
+		if len(invocations) != 2 {
+			t.Fatalf("invocations = %v, want two", invocations)
+		}
+		if !slices.Equal(invocations[0].packages, []string{"example/api", "example/daemon"}) ||
+			!slices.Equal(invocations[1].packages, []string{goSplitTestPackage}) {
+			t.Fatalf("unexpected partition: %v", invocations)
+		}
+		if !slices.Equal(packages, []string{"example/api", goSplitTestPackage, "example/daemon"}) {
+			t.Fatalf("input packages were mutated: %v", packages)
+		}
+		for index, want := range [][]string{{"-race", "-parallel=4"}, {"-race", "-parallel=1"}} {
+			if got := goIntegrationTestSafetyArgs(invocations[index].packages); !slices.Equal(got, want) {
+				t.Fatalf("invocation %d safety args = %v, want %v", index, got, want)
+			}
+		}
+	})
+}

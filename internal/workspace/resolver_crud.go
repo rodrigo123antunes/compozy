@@ -1,0 +1,423 @@
+package workspace
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"os"
+	"path/filepath"
+	"strings"
+
+	"github.com/compozy/compozy/internal/fileutil"
+)
+
+// Register persists a workspace registration hint and eagerly resolves it.
+func (r *Resolver) Register(ctx context.Context, opts RegisterOptions) (Workspace, error) {
+	if err := checkContext(ctx); err != nil {
+		return Workspace{}, err
+	}
+	if err := validateOptionalDefaultAgent(opts.DefaultAgent); err != nil {
+		return Workspace{}, err
+	}
+
+	r.registrationMu.Lock()
+	ws, err := r.createWorkspaceRegistration(ctx, opts)
+	r.registrationMu.Unlock()
+	if err != nil {
+		return Workspace{}, err
+	}
+
+	resolved, err := r.Resolve(ctx, ws.ID)
+	if err != nil {
+		deleteErr := r.rollbackDeleteWorkspace(ctx, ws.ID)
+		if deleteErr != nil && !errors.Is(deleteErr, ErrWorkspaceNotFound) {
+			return Workspace{}, errors.Join(
+				err,
+				fmt.Errorf("workspace: rollback workspace registration %q: %w", ws.ID, deleteErr),
+			)
+		}
+		return Workspace{}, err
+	}
+	if err := r.notifyChangeHook(ctx, "register", ws.ID); err != nil {
+		deleteErr := r.rollbackDeleteWorkspace(ctx, ws.ID)
+		if deleteErr != nil && !errors.Is(deleteErr, ErrWorkspaceNotFound) {
+			return Workspace{}, errors.Join(
+				err,
+				fmt.Errorf("workspace: rollback workspace registration %q: %w", ws.ID, deleteErr),
+			)
+		}
+		return Workspace{}, err
+	}
+
+	r.logger.Info("workspace.register",
+		"workspace_id", resolved.ID,
+		"root_dir", resolved.RootDir,
+		"name", resolved.Name,
+	)
+
+	return resolved.Workspace, nil
+}
+
+// Unregister removes a persisted workspace registration and its cached snapshot.
+func (r *Resolver) Unregister(ctx context.Context, id string) error {
+	if err := checkContext(ctx); err != nil {
+		return err
+	}
+
+	trimmedID := strings.TrimSpace(id)
+	if trimmedID == "" {
+		return errors.New("workspace: workspace id is required")
+	}
+
+	return r.unregisterWorkspace(ctx, trimmedID)
+}
+
+func wrapUnregisterRollbackError(workspaceID string, err error) error {
+	if err == nil {
+		return nil
+	}
+	return fmt.Errorf("workspace: roll back unregister preparation %q: %w", workspaceID, err)
+}
+
+// Update mutates an existing workspace registration.
+func (r *Resolver) Update(ctx context.Context, id string, opts UpdateOptions) error {
+	if err := checkContext(ctx); err != nil {
+		return err
+	}
+
+	trimmedID := strings.TrimSpace(id)
+	if trimmedID == "" {
+		return errors.New("workspace: workspace id is required")
+	}
+
+	ws, err := r.store.GetWorkspace(ctx, trimmedID)
+	if err != nil {
+		return fmt.Errorf("workspace: load workspace %q: %w", trimmedID, err)
+	}
+	previous := cloneWorkspace(ws)
+
+	if opts.Name != nil {
+		name := strings.TrimSpace(*opts.Name)
+		if name == "" {
+			return errors.New("workspace: workspace name is required")
+		}
+		if err := ValidateWorkspaceName(name); err != nil {
+			return err
+		}
+		ws.Name = name
+	}
+
+	if opts.AdditionalDirs != nil {
+		additionalDirs, normalizeErr := normalizeAdditionalDirs(ws.RootDir, *opts.AdditionalDirs)
+		if normalizeErr != nil {
+			return normalizeErr
+		}
+		ws.AdditionalDirs = additionalDirs
+	}
+
+	if opts.DefaultAgent != nil {
+		if err := validateOptionalDefaultAgent(*opts.DefaultAgent); err != nil {
+			return err
+		}
+		ws.DefaultAgent = strings.TrimSpace(*opts.DefaultAgent)
+	}
+
+	ws.UpdatedAt = r.now()
+	if err := r.store.UpdateWorkspace(ctx, ws); err != nil {
+		return fmt.Errorf("workspace: update workspace %q: %w", trimmedID, err)
+	}
+
+	r.Invalidate(trimmedID)
+	if err := r.notifyChangeHook(ctx, "update", trimmedID); err != nil {
+		restoreErr := r.rollbackUpdateWorkspace(ctx, previous)
+		if restoreErr != nil {
+			return errors.Join(
+				err,
+				fmt.Errorf("workspace: rollback workspace update %q: %w", trimmedID, restoreErr),
+			)
+		}
+		return err
+	}
+	return nil
+}
+
+func (r *Resolver) rollbackUpdateWorkspace(ctx context.Context, ws Workspace) error {
+	rollbackCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), rollbackDeleteTimeout)
+	defer cancel()
+
+	return r.store.UpdateWorkspace(rollbackCtx, ws)
+}
+
+// List returns every registered workspace in stable store order.
+func (r *Resolver) List(ctx context.Context) ([]Workspace, error) {
+	if err := checkContext(ctx); err != nil {
+		return nil, err
+	}
+
+	r.reconcileMu.Lock()
+	defer r.reconcileMu.Unlock()
+
+	workspaces, err := r.store.ListWorkspaces(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("workspace: list workspaces: %w", err)
+	}
+	workspaces, err = r.reconcileWorkspaceList(ctx, workspaces)
+	if err != nil {
+		return nil, err
+	}
+
+	return cloneWorkspaces(workspaces), nil
+}
+
+// Get resolves a persisted workspace registration without computing a full snapshot.
+func (r *Resolver) Get(ctx context.Context, idOrNameOrPath string) (Workspace, error) {
+	if err := checkContext(ctx); err != nil {
+		return Workspace{}, err
+	}
+
+	ws, err := r.lookupWorkspace(ctx, idOrNameOrPath)
+	if errors.Is(err, ErrWorkspaceRootMissing) && filepath.IsAbs(strings.TrimSpace(idOrNameOrPath)) {
+		path, pathErr := fileutil.CanonicalPathWithExistingPrefix(strings.TrimSpace(idOrNameOrPath))
+		if pathErr != nil {
+			return Workspace{}, pathErr
+		}
+		ws, err = r.store.GetWorkspaceByPath(ctx, path)
+	}
+	if err != nil {
+		return Workspace{}, err
+	}
+
+	return cloneWorkspace(r.withRootAvailability(ctx, ws)), nil
+}
+
+// ResolveRegistration validates the current workspace root and identity without loading runtime resources.
+func (r *Resolver) ResolveRegistration(ctx context.Context, idOrNameOrPath string) (Workspace, error) {
+	ws, _, err := r.resolveRegistration(ctx, idOrNameOrPath)
+	if err != nil {
+		return Workspace{}, err
+	}
+	return cloneWorkspace(ws), nil
+}
+
+// resolveRegistration rechecks the canonical root and durable identity for every registration lookup.
+func (r *Resolver) resolveRegistration(ctx context.Context, ref string) (Workspace, Identity, error) {
+	if err := checkContext(ctx); err != nil {
+		return Workspace{}, Identity{}, err
+	}
+	ws, err := r.lookupWorkspace(ctx, ref)
+	if err != nil {
+		return Workspace{}, Identity{}, err
+	}
+	refreshed, err := r.refreshRootDir(ctx, ws)
+	if err != nil {
+		return ws, Identity{}, err
+	}
+	identity, err := ensureIdentity(ctx, refreshed.RootDir, r.now, NewWorkspaceID)
+	return refreshed, identity, err
+}
+
+func (r *Resolver) nextWorkspaceName(ctx context.Context, rootDir string) (string, error) {
+	workspaces, err := r.store.ListWorkspaces(ctx)
+	if err != nil {
+		return "", fmt.Errorf("workspace: list workspaces for name dedup: %w", err)
+	}
+
+	taken := make(map[string]struct{}, len(workspaces))
+	for _, ws := range workspaces {
+		if name := strings.TrimSpace(ws.Name); name != "" {
+			taken[name] = struct{}{}
+		}
+	}
+
+	return UniqueWorkspaceName(rootDir, taken), nil
+}
+
+func (r *Resolver) lookupWorkspace(ctx context.Context, idOrNameOrPath string) (Workspace, error) {
+	target := strings.TrimSpace(idOrNameOrPath)
+	if target == "" {
+		return Workspace{}, errors.New("workspace: workspace identifier is required")
+	}
+
+	switch {
+	case strings.HasPrefix(target, "ws_"), strings.HasPrefix(target, "ws-"):
+		ws, err := r.store.GetWorkspace(ctx, target)
+		switch {
+		case err == nil:
+			return ws, nil
+		case !errors.Is(err, ErrWorkspaceNotFound):
+			return Workspace{}, fmt.Errorf("workspace: lookup workspace %q: %w", target, err)
+		}
+		ws, err = r.store.GetWorkspaceByName(ctx, target)
+		if err != nil {
+			return Workspace{}, fmt.Errorf("workspace: lookup workspace %q by name fallback: %w", target, err)
+		}
+		return ws, nil
+	case IsWorkspaceID(target):
+		ws, err := r.lookupWorkspaceByStableIdentity(ctx, target)
+		if err != nil {
+			return Workspace{}, fmt.Errorf("workspace: lookup workspace by stable identity %q: %w", target, err)
+		}
+		return ws, nil
+	case filepath.IsAbs(target):
+		canonicalPath, err := canonicalRoot(target)
+		if err != nil {
+			return Workspace{}, err
+		}
+		return r.lookupWorkspaceByCanonicalPath(ctx, canonicalPath)
+	default:
+		ws, err := r.store.GetWorkspaceByName(ctx, target)
+		if err != nil {
+			return Workspace{}, fmt.Errorf("workspace: lookup workspace by name %q: %w", target, err)
+		}
+		return ws, nil
+	}
+}
+
+func (r *Resolver) lookupWorkspaceByCanonicalPath(
+	ctx context.Context,
+	canonicalPath string,
+) (Workspace, error) {
+	ws, err := r.store.GetWorkspaceByPath(ctx, canonicalPath)
+	if err == nil {
+		return ws, nil
+	}
+	if !errors.Is(err, ErrWorkspaceNotFound) {
+		return Workspace{}, fmt.Errorf("workspace: lookup workspace by path %q: %w", canonicalPath, err)
+	}
+
+	ws, err = r.lookupWorkspaceByEnclosingRoot(ctx, canonicalPath)
+	if err == nil {
+		return ws, nil
+	}
+	if !errors.Is(err, ErrWorkspaceNotFound) {
+		return Workspace{}, err
+	}
+
+	ws, err = r.lookupWorkspaceBySameRoot(ctx, canonicalPath)
+	if err != nil {
+		if errors.Is(err, ErrWorkspaceNotFound) {
+			return Workspace{}, fmt.Errorf("workspace: lookup workspace by path %q: %w", canonicalPath, err)
+		}
+		return Workspace{}, err
+	}
+	return ws, nil
+}
+
+func (r *Resolver) lookupWorkspaceByStableIdentity(ctx context.Context, workspaceID string) (Workspace, error) {
+	if err := checkContext(ctx); err != nil {
+		return Workspace{}, err
+	}
+
+	workspaces, err := r.store.ListWorkspaces(ctx)
+	if err != nil {
+		return Workspace{}, fmt.Errorf("workspace: list workspaces for identity match: %w", err)
+	}
+
+	for _, ws := range workspaces {
+		if err := checkContext(ctx); err != nil {
+			return Workspace{}, err
+		}
+		rootDir := strings.TrimSpace(ws.RootDir)
+		if rootDir == "" {
+			continue
+		}
+		identity, err := loadIdentityFile(identityPath(rootDir))
+		switch {
+		case err == nil:
+			if identity.WorkspaceID == workspaceID {
+				return cloneWorkspace(ws), nil
+			}
+		case errors.Is(err, os.ErrNotExist):
+			continue
+		case errors.Is(err, ErrWorkspaceIdentityInvalid), errors.Is(err, ErrWorkspaceIdentityPermissionDenied):
+			return Workspace{}, err
+		default:
+			return Workspace{}, fmt.Errorf("workspace: load identity for workspace %q: %w", ws.ID, err)
+		}
+	}
+
+	return Workspace{}, ErrWorkspaceNotFound
+}
+
+func (r *Resolver) lookupWorkspaceBySameRoot(ctx context.Context, canonicalPath string) (Workspace, error) {
+	canonicalTarget, err := canonicalRoot(canonicalPath)
+	if err != nil {
+		if errors.Is(err, ErrWorkspaceRootMissing) || errors.Is(err, os.ErrNotExist) {
+			return Workspace{}, ErrWorkspaceNotFound
+		}
+		return Workspace{}, fmt.Errorf("workspace: canonicalize workspace root %q: %w", canonicalPath, err)
+	}
+	targetInfo, err := os.Stat(canonicalTarget)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return Workspace{}, ErrWorkspaceNotFound
+		}
+		return Workspace{}, fmt.Errorf("workspace: stat workspace root %q: %w", canonicalTarget, err)
+	}
+
+	workspaces, err := r.store.ListWorkspaces(ctx)
+	if err != nil {
+		return Workspace{}, fmt.Errorf("workspace: list workspaces for root match: %w", err)
+	}
+	for _, ws := range workspaces {
+		rootDir := strings.TrimSpace(ws.RootDir)
+		if rootDir == "" {
+			continue
+		}
+		candidateInfo, err := os.Stat(rootDir)
+		if err != nil {
+			if errors.Is(err, os.ErrNotExist) {
+				continue
+			}
+			return Workspace{}, fmt.Errorf("workspace: stat registered workspace root %q: %w", rootDir, err)
+		}
+		if os.SameFile(targetInfo, candidateInfo) {
+			return cloneWorkspace(ws), nil
+		}
+	}
+	return Workspace{}, ErrWorkspaceNotFound
+}
+
+func (r *Resolver) refreshRootDir(ctx context.Context, ws Workspace) (Workspace, error) {
+	rootDir := strings.TrimSpace(ws.RootDir)
+	if rootDir == "" {
+		return Workspace{}, errors.New("workspace: workspace root directory is required")
+	}
+
+	info, err := os.Stat(rootDir)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return Workspace{}, ErrWorkspaceRootMissing
+		}
+		return Workspace{}, fmt.Errorf("workspace: stat workspace root %q: %w", rootDir, err)
+	}
+	if !info.IsDir() {
+		return Workspace{}, fmt.Errorf("workspace: workspace root %q is not a directory", rootDir)
+	}
+
+	canonicalDir, err := filepath.EvalSymlinks(rootDir)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return Workspace{}, ErrWorkspaceRootMissing
+		}
+		return Workspace{}, fmt.Errorf("workspace: evaluate workspace root %q: %w", rootDir, err)
+	}
+	canonicalDir, err = filepath.Abs(canonicalDir)
+	if err != nil {
+		return Workspace{}, fmt.Errorf("workspace: resolve workspace root %q: %w", canonicalDir, err)
+	}
+
+	if canonicalDir == rootDir {
+		return ws, nil
+	}
+
+	updated := cloneWorkspace(ws)
+	updated.RootDir = canonicalDir
+	updated.UpdatedAt = r.now()
+	if err := r.store.UpdateWorkspace(ctx, updated); err != nil {
+		return Workspace{}, fmt.Errorf("workspace: update canonical workspace root %q: %w", canonicalDir, err)
+	}
+
+	r.Invalidate(updated.ID)
+	return updated, nil
+}

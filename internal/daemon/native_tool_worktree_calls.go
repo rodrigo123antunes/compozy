@@ -1,0 +1,255 @@
+package daemon
+
+import (
+	"context"
+	"fmt"
+	"log/slog"
+	"strings"
+	"time"
+
+	core "github.com/compozy/compozy/internal/api/core"
+	"github.com/compozy/compozy/internal/store"
+	toolspkg "github.com/compozy/compozy/internal/tools"
+	"github.com/compozy/compozy/internal/worktree"
+)
+
+const worktreeKey = "worktree"
+
+type nativeWorktreeListInput struct {
+	Workspace string `json:"workspace"`
+	Refresh   bool   `json:"refresh"`
+}
+
+type nativeWorktreeRefInput struct {
+	Workspace string `json:"workspace"`
+	Ref       string `json:"ref"`
+}
+
+type nativeWorktreeCreateInput struct {
+	Workspace      string `json:"workspace"`
+	Name           string `json:"name"`
+	Branch         string `json:"branch"`
+	BaseRef        string `json:"base_ref"`
+	ExistingBranch string `json:"existing_branch"`
+	Path           string `json:"path"`
+}
+
+type nativeWorktreeRemoveInput struct {
+	Workspace    string `json:"workspace"`
+	Ref          string `json:"ref"`
+	Path         string `json:"path"`
+	Force        bool   `json:"force"`
+	DeleteBranch bool   `json:"delete_branch"`
+}
+
+func (n *daemonNativeTools) worktreeList(
+	ctx context.Context,
+	scope toolspkg.Scope,
+	req toolspkg.CallRequest,
+) (toolspkg.ToolResult, error) {
+	var input nativeWorktreeListInput
+	if err := decodeNativeInput(req, &input); err != nil {
+		return toolspkg.ToolResult{}, err
+	}
+	workspaceID, err := n.nativeWorkspaceID(ctx, req.ToolID, input.Workspace, scope)
+	if err != nil {
+		return toolspkg.ToolResult{}, err
+	}
+	listing, err := n.deps.Worktrees.ListDetails(ctx, workspaceID, input.Refresh)
+	if err != nil {
+		return toolspkg.ToolResult{}, nativeWorktreeToolError(req.ToolID, err)
+	}
+	payload := core.WorktreesPayloadFromListing(listing)
+	return structuredResult(payload, fmt.Sprintf("%d worktrees", len(payload.Worktrees)))
+}
+
+func (n *daemonNativeTools) worktreeInspect(
+	ctx context.Context,
+	scope toolspkg.Scope,
+	req toolspkg.CallRequest,
+) (toolspkg.ToolResult, error) {
+	var input nativeWorktreeRefInput
+	if err := decodeNativeInput(req, &input); err != nil {
+		return toolspkg.ToolResult{}, err
+	}
+	workspaceID, ref, err := n.nativeWorktreeTarget(ctx, scope, req.ToolID, input.Workspace, input.Ref)
+	if err != nil {
+		return toolspkg.ToolResult{}, err
+	}
+	inspection, err := n.deps.Worktrees.Inspect(ctx, workspaceID, ref)
+	if err != nil {
+		return toolspkg.ToolResult{}, nativeWorktreeToolError(req.ToolID, err)
+	}
+	payload := core.WorktreeInspectionPayload(*inspection)
+	return structuredResult(payload, inspection.Worktree.ID)
+}
+
+func (n *daemonNativeTools) worktreeCreate(
+	ctx context.Context,
+	scope toolspkg.Scope,
+	req toolspkg.CallRequest,
+) (toolspkg.ToolResult, error) {
+	var input nativeWorktreeCreateInput
+	if err := decodeNativeInput(req, &input); err != nil {
+		return toolspkg.ToolResult{}, err
+	}
+	workspaceID, err := n.nativeWorkspaceID(ctx, req.ToolID, input.Workspace, scope)
+	if err != nil {
+		return toolspkg.ToolResult{}, err
+	}
+	item, err := n.deps.Worktrees.CreateAccepted(ctx, workspaceID, worktree.CreateOptions{
+		ProfileID: scope.ProfileID,
+		Name:      input.Name, Branch: input.Branch, BaseRef: input.BaseRef,
+		ExistingBranch: input.ExistingBranch, Path: input.Path, Origin: worktree.OriginManual,
+	})
+	if err != nil {
+		return toolspkg.ToolResult{}, nativeWorktreeToolError(req.ToolID, err)
+	}
+	if scope.SessionID != "" && scope.WorkspaceID == workspaceID {
+		if manager, ok := n.deps.Sessions.(core.SessionLinkedWorkManager); ok {
+			linkCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 10*time.Second)
+			defer cancel()
+			if err := manager.LinkSessionWork(
+				linkCtx,
+				scope.SessionID,
+				store.SessionWorkLink{
+					WorkspaceID:  workspaceID,
+					Branch:       item.Branch,
+					WorktreeID:   item.ID,
+					WorktreeName: item.Name,
+					Provenance:   "created",
+				},
+				true,
+			); err != nil {
+				slog.WarnContext(
+					linkCtx,
+					"accepted worktree automatic link failed",
+					"session_id",
+					scope.SessionID,
+					"worktree_id",
+					item.ID,
+					"error",
+					err,
+				)
+			}
+		}
+	}
+	payload := core.WorktreePayloadFromInspection(worktree.Inspection{
+		Worktree: *item, AgentActivity: worktree.AgentActivityIdle,
+	})
+	return structuredResult(map[string]any{worktreeKey: payload}, item.ID)
+}
+
+func (n *daemonNativeTools) worktreeRemove(
+	ctx context.Context,
+	scope toolspkg.Scope,
+	req toolspkg.CallRequest,
+) (toolspkg.ToolResult, error) {
+	var input nativeWorktreeRemoveInput
+	if err := decodeNativeInput(req, &input); err != nil {
+		return toolspkg.ToolResult{}, err
+	}
+	if strings.TrimSpace(input.Path) != "" {
+		return n.worktreeRemoveDiscovered(ctx, scope, req, input)
+	}
+	workspaceID, ref, err := n.nativeWorktreeTarget(ctx, scope, req.ToolID, input.Workspace, input.Ref)
+	if err != nil {
+		return toolspkg.ToolResult{}, err
+	}
+	item, err := n.deps.Worktrees.Resolve(ctx, workspaceID, ref)
+	if err != nil {
+		return toolspkg.ToolResult{}, nativeWorktreeToolError(req.ToolID, err)
+	}
+	worktreeID := item.ID
+	refusal, err := n.deps.Worktrees.Remove(ctx, workspaceID, worktreeID, input.Force)
+	if refusal != nil {
+		partial, marshalErr := structuredResult(core.WorktreeRemovalRefusalPayload(*refusal), refusal.Code)
+		if marshalErr != nil {
+			return toolspkg.ToolResult{}, marshalErr
+		}
+		return toolspkg.ToolResult{}, nativeWorktreeToolError(req.ToolID, err).WithPartialResult(partial)
+	}
+	if err != nil {
+		return toolspkg.ToolResult{}, nativeWorktreeToolError(req.ToolID, err)
+	}
+	result := map[string]any{"worktree_id": worktreeID, nativePayloadStateKey: string(worktree.StateRemoved)}
+	if input.DeleteBranch {
+		branch, err := core.CleanupBranchOutcome(ctx, n.deps.Worktrees, workspaceID, worktreeID, input.Force)
+		if err != nil {
+			partial, marshalErr := structuredResult(result, worktreeID)
+			if marshalErr != nil {
+				return toolspkg.ToolResult{}, marshalErr
+			}
+			return toolspkg.ToolResult{}, nativeWorktreeToolError(req.ToolID, err).WithPartialResult(partial)
+		}
+		result["branch"] = branch
+	}
+	return structuredResult(result, worktreeID)
+}
+
+// worktreeRemoveDiscovered removes a Git-only checkout by its listed path. It
+// shares the record removal refusal payload so callers reuse one force retry.
+func (n *daemonNativeTools) worktreeRemoveDiscovered(
+	ctx context.Context,
+	scope toolspkg.Scope,
+	req toolspkg.CallRequest,
+	input nativeWorktreeRemoveInput,
+) (toolspkg.ToolResult, error) {
+	if strings.TrimSpace(input.Ref) != "" || input.DeleteBranch {
+		return toolspkg.ToolResult{}, toolspkg.NewToolError(
+			toolspkg.ErrorCodeInvalidInput,
+			req.ToolID,
+			"path cannot be combined with ref or delete_branch",
+			toolspkg.ErrToolInvalidInput,
+			toolspkg.ReasonSchemaInvalid,
+		)
+	}
+	workspaceID, err := n.nativeWorkspaceID(ctx, req.ToolID, input.Workspace, scope)
+	if err != nil {
+		return toolspkg.ToolResult{}, err
+	}
+	path := input.Path
+	refusal, err := n.deps.Worktrees.RemoveDiscovered(
+		ctx, workspaceID, path, worktree.RemoveDiscoveredOptions{Force: input.Force},
+	)
+	if refusal != nil {
+		partial, marshalErr := structuredResult(core.WorktreeRemovalRefusalPayload(*refusal), refusal.Code)
+		if marshalErr != nil {
+			return toolspkg.ToolResult{}, marshalErr
+		}
+		return toolspkg.ToolResult{}, nativeWorktreeToolError(req.ToolID, err).WithPartialResult(partial)
+	}
+	if err != nil {
+		return toolspkg.ToolResult{}, nativeWorktreeToolError(req.ToolID, err)
+	}
+	return structuredResult(map[string]any{"path": path, nativePayloadStateKey: string(worktree.StateRemoved)}, path)
+}
+
+func (n *daemonNativeTools) nativeWorktreeTarget(
+	ctx context.Context,
+	scope toolspkg.Scope,
+	id toolspkg.ToolID,
+	workspace string,
+	ref string,
+) (string, string, error) {
+	workspaceID, err := n.nativeWorkspaceID(ctx, id, workspace, scope)
+	if err != nil {
+		return "", "", err
+	}
+	worktreeRef, err := requiredNativeString(id, "ref", ref)
+	if err != nil {
+		return "", "", err
+	}
+	return workspaceID, worktreeRef, nil
+}
+
+func nativeWorktreeToolError(id toolspkg.ToolID, err error) *toolspkg.ToolError {
+	mapped := nativeHTTPStatusToolError(id, err, core.StatusForWorktreeError(err))
+	toolErr, ok := mapped.(*toolspkg.ToolError)
+	if ok {
+		return toolErr
+	}
+	return toolspkg.NewToolError(
+		toolspkg.ErrorCodeBackendFailed, id, err.Error(), err, toolspkg.ReasonBackendUnhealthy,
+	)
+}

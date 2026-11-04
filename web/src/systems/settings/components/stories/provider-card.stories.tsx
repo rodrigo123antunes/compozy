@@ -1,0 +1,129 @@
+import type { Meta, StoryObj } from "@storybook/react-vite";
+import { fn } from "storybook/test";
+
+import { PanelSurface } from "@/storybook/story-layout";
+import type { SettingsProviderEntry } from "@/systems/settings";
+import { settingsProviderFixtures } from "@/systems/settings/mocks";
+
+import { ProviderCard, ProviderCardGrid, ProviderCardSkeleton } from "../provider-card";
+
+const claudeFixture: SettingsProviderEntry = {
+  ...settingsProviderFixtures[0]!,
+  auth_status: {
+    ...settingsProviderFixtures[0]!.auth_status!,
+    state: "authenticated",
+    login: {
+      ...settingsProviderFixtures[0]!.auth_status!.login,
+      recommended_action: undefined,
+    },
+  },
+};
+const codexFixture = settingsProviderFixtures[1]!;
+
+const binaryMissingFixture: SettingsProviderEntry = {
+  ...codexFixture,
+  name: "cursor",
+  default: false,
+  command_available: false,
+  settings: {
+    ...codexFixture.settings,
+    command: "cursor-agent acp",
+    display_name: "Cursor Agent",
+  },
+  source_metadata: {
+    available_targets: ["global-config"],
+    effective_source: { kind: "builtin-provider", scope: "user" },
+  },
+  credentials: undefined,
+};
+
+const needsSetupFixture: SettingsProviderEntry = {
+  ...codexFixture,
+  name: "zai",
+  default: false,
+  settings: {
+    ...codexFixture.settings,
+    command: "npx -y pi-acp@latest",
+    display_name: "z.ai",
+    auth_mode: "bound_secret",
+  },
+  credentials: [
+    {
+      name: "api_key",
+      target_env: "ZAI_API_KEY",
+      secret_ref: "env:ZAI_API_KEY",
+      required: true,
+      present: false,
+    },
+  ] as SettingsProviderEntry["credentials"],
+  auth_status: {
+    mode: "bound_secret",
+    env_policy: "filtered",
+    home_policy: "operator",
+    state: "missing_credential",
+    login: {
+      configured: false,
+      presence: "unknown",
+      recommended_action: "bind_secret",
+    },
+  },
+};
+
+const needsSignInFixture: SettingsProviderEntry = {
+  ...codexFixture,
+  auth_status: {
+    ...codexFixture.auth_status!,
+    state: "needs_login",
+    login: { ...codexFixture.auth_status!.login, recommended_action: "login" },
+  },
+};
+
+const unknownAuthFixture: SettingsProviderEntry = {
+  ...codexFixture,
+  name: "codex-unverified",
+  auth_status: { ...codexFixture.auth_status!, state: "unknown" },
+};
+
+const meta: Meta<typeof ProviderCard> = {
+  title: "systems/settings/components/ProviderCard",
+  component: ProviderCard,
+  parameters: {
+    layout: "fullscreen",
+    docs: {
+      description: {
+        component:
+          "Provider card per the settings redesign: logo well, name + Default pill, mono command, one humanized status line, plain-language sign-in summary. The whole card opens the inspector sheet.",
+      },
+    },
+  },
+};
+
+export default meta;
+type Story = StoryObj<typeof meta>;
+
+/**
+ * The truthful listing states: ready, setup, sign-in, unknown auth, and missing binary.
+ */
+export const CardStates: Story = {
+  args: {},
+  render: () => (
+    <PanelSurface className="grid max-w-[1100px] gap-3 p-6 sm:grid-cols-3">
+      <ProviderCard onOpen={fn()} provider={claudeFixture} />
+      <ProviderCard onOpen={fn()} provider={needsSetupFixture} />
+      <ProviderCard onOpen={fn()} provider={needsSignInFixture} />
+      <ProviderCard onOpen={fn()} provider={unknownAuthFixture} />
+      <ProviderCard onOpen={fn()} provider={binaryMissingFixture} />
+    </PanelSurface>
+  ),
+};
+
+/** Loading — the cards' real surface and slots with placeholders, in the same grid. */
+export const Loading: StoryObj = {
+  render: () => (
+    <PanelSurface className="w-full max-w-4xl p-6">
+      <ProviderCardGrid aria-hidden="true">
+        <ProviderCardSkeleton />
+      </ProviderCardGrid>
+    </PanelSurface>
+  ),
+};

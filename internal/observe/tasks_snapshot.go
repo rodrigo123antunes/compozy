@@ -1,0 +1,200 @@
+package observe
+
+import (
+	"context"
+	"database/sql"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"maps"
+	"slices"
+	"strings"
+
+	taskpkg "github.com/compozy/compozy/internal/task"
+)
+
+func (o *Observer) loadTaskSnapshot(ctx context.Context, query TaskSummaryQuery) (taskSnapshot, error) {
+	tasks, runs, err := o.loadTaskSnapshotTasksAndRuns(ctx, query)
+	if err != nil {
+		return taskSnapshot{}, err
+	}
+	tasksByID, taskIDs := taskSummaryIndex(tasks)
+	runs = filterRunsByWorktree(runs, query.WorktreeID)
+	runsByID := indexTaskSnapshotRuns(runs, taskIDs)
+	runs = filterRuns(runs, taskIDs, query)
+	events, err := o.loadTaskSnapshotEvents(ctx, taskIDs)
+	if err != nil {
+		return taskSnapshot{}, fmt.Errorf("observe: list task events for summary: %w", err)
+	}
+	events = filterEventsForTasks(events, taskIDs, runsByID, query.WorktreeID)
+
+	return taskSnapshot{
+		tasks:  tasks,
+		runs:   runs,
+		events: events,
+
+		tasksByID: tasksByID,
+	}, nil
+}
+
+func (o *Observer) loadTaskSnapshotEvents(
+	ctx context.Context,
+	taskIDs map[string]struct{},
+) ([]taskpkg.Event, error) {
+	if len(taskIDs) == 0 {
+		return []taskpkg.Event{}, nil
+	}
+	if source, ok := o.registry.(interface {
+		ListTaskEventsForTasks(context.Context, []string) ([]taskpkg.Event, error)
+	}); ok {
+		return source.ListTaskEventsForTasks(ctx, slices.Collect(maps.Keys(taskIDs)))
+	}
+	return o.registry.ListTaskEvents(ctx, taskpkg.EventQuery{})
+}
+
+func (o *Observer) loadTaskSnapshotTasksAndRuns(
+	ctx context.Context,
+	query TaskSummaryQuery,
+) ([]taskpkg.Summary, []taskpkg.Run, error) {
+	if ctx == nil {
+		return nil, nil, errors.New("observe: task summary context is required")
+	}
+	if err := query.Validate(); err != nil {
+		return nil, nil, err
+	}
+	tasks, err := o.registry.ListTasks(ctx, taskpkg.Query{
+		WorkspaceIDs: query.WorkspaceIDs,
+		ReadScope:    query.ReadScope,
+		Scope:        query.Scope,
+		WorkspaceID:  strings.TrimSpace(query.WorkspaceID),
+		OwnerKind:    query.OwnerKind.Normalize(),
+		OwnerRef:     strings.TrimSpace(query.OwnerRef),
+		Search:       strings.TrimSpace(query.Search),
+	})
+	if err != nil {
+		return nil, nil, fmt.Errorf("observe: list tasks for summary: %w", err)
+	}
+	tasks = filterTasksByOrigin(tasks, query.OriginKind)
+	tasks = filterTasksByCreatedBy(tasks, query.ExcludeCreatedBy)
+	runs, err := o.registry.ListTaskRuns(ctx, taskpkg.RunQuery{ReadScope: query.ReadScope})
+	if err != nil {
+		return nil, nil, fmt.Errorf("observe: list task runs for summary: %w", err)
+	}
+	tasks = filterTasksByWorktree(tasks, runs, query.WorktreeID)
+	dependencyCounts, err := o.loadTaskDependencyCounts(ctx, tasks)
+	if err != nil {
+		return nil, nil, err
+	}
+	for idx := range tasks {
+		taskID := strings.TrimSpace(tasks[idx].ID)
+		if taskID == "" {
+			continue
+		}
+		tasks[idx].DependencyCount = taskpkg.ClampSummaryCount(dependencyCounts[taskID])
+	}
+
+	return tasks, runs, nil
+}
+
+func indexTaskSnapshotRuns(runs []taskpkg.Run, taskIDs map[string]struct{}) map[string]taskpkg.Run {
+	runsByID := make(map[string]taskpkg.Run, len(runs))
+	for _, item := range runs {
+		if _, ok := taskIDs[strings.TrimSpace(item.TaskID)]; !ok {
+			continue
+		}
+		runID := strings.TrimSpace(item.ID)
+		if runID == "" {
+			continue
+		}
+		runsByID[runID] = item
+	}
+	return runsByID
+}
+
+func (o *Observer) loadTaskDependencyCounts(
+	ctx context.Context,
+	tasks []taskpkg.Summary,
+) (map[string]int, error) {
+	taskIDs := make([]string, 0, len(tasks))
+	seen := make(map[string]struct{}, len(tasks))
+	for idx := range tasks {
+		item := &tasks[idx]
+		taskID := strings.TrimSpace(item.ID)
+		if taskID == "" {
+			continue
+		}
+		if _, ok := seen[taskID]; ok {
+			continue
+		}
+		seen[taskID] = struct{}{}
+		taskIDs = append(taskIDs, taskID)
+	}
+	if len(taskIDs) == 0 {
+		return map[string]int{}, nil
+	}
+
+	if source, ok := o.registry.(interface{ ReadDB() *sql.DB }); ok {
+		return queryTaskDependencyCounts(ctx, source.ReadDB(), taskIDs)
+	}
+	return o.loadTaskDependencyCountsIndividually(ctx, taskIDs)
+}
+
+func (o *Observer) loadTaskDependencyCountsIndividually(
+	ctx context.Context,
+	taskIDs []string,
+) (map[string]int, error) {
+	counts := make(map[string]int, len(taskIDs))
+	for _, taskID := range taskIDs {
+		count, err := o.registry.CountDependencies(ctx, taskID)
+		if err != nil {
+			return nil, fmt.Errorf("observe: count dependencies for task %q: %w", taskID, err)
+		}
+		counts[taskID] = count
+	}
+	return counts, nil
+}
+
+func queryTaskDependencyCounts(
+	ctx context.Context,
+	db *sql.DB,
+	taskIDs []string,
+) (counts map[string]int, err error) {
+	taskIDsJSON, err := json.Marshal(taskIDs)
+	if err != nil {
+		return nil, fmt.Errorf("observe: encode dependency count task ids: %w", err)
+	}
+
+	rows, err := db.QueryContext(
+		ctx,
+		`SELECT dep.task_id, COUNT(1)
+		FROM task_dependencies dep
+		JOIN json_each(?) requested ON requested.value = dep.task_id
+		GROUP BY dep.task_id`,
+		string(taskIDsJSON),
+	)
+	if err != nil {
+		return nil, fmt.Errorf("observe: query dependency counts: %w", err)
+	}
+	defer func() {
+		if closeErr := rows.Close(); closeErr != nil {
+			err = errors.Join(
+				err,
+				fmt.Errorf("observe: close dependency count rows: %w", closeErr),
+			)
+		}
+	}()
+
+	counts = make(map[string]int, len(taskIDs))
+	for rows.Next() {
+		var taskID string
+		var count int
+		if err := rows.Scan(&taskID, &count); err != nil {
+			return nil, fmt.Errorf("observe: scan dependency counts: %w", err)
+		}
+		counts[strings.TrimSpace(taskID)] = count
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("observe: iterate dependency counts: %w", err)
+	}
+	return counts, nil
+}

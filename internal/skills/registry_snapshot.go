@@ -1,0 +1,327 @@
+package skills
+
+import (
+	"errors"
+	"fmt"
+	"io/fs"
+	"maps"
+	"path"
+	"path/filepath"
+	"slices"
+	"strings"
+	"time"
+
+	compozyconfig "github.com/compozy/compozy/internal/config"
+	"github.com/compozy/compozy/internal/filesnap"
+	hookspkg "github.com/compozy/compozy/internal/hooks"
+	"github.com/compozy/compozy/internal/skillscan"
+)
+
+func recordSidecarSnapshots(paths []string, snapshots map[string]filesnap.Snapshot) error {
+	for _, skillPath := range paths {
+		skillDir := filepath.Dir(skillPath)
+		for _, sidecarPath := range []string{
+			filepath.Join(skillDir, sidecarFileName),
+			filepath.Join(skillDir, compozyconfig.MCPJSONName),
+		} {
+			snapshot, err := filesnap.FromPath(sidecarPath)
+			if err != nil {
+				if errors.Is(err, fs.ErrNotExist) {
+					continue
+				}
+
+				return fmt.Errorf("skills: snapshot sidecar %q: %w", sidecarPath, err)
+			}
+
+			snapshots[sidecarPath] = snapshot
+		}
+		if _, hasProvenance := snapshots[filepath.Join(skillDir, sidecarFileName)]; hasProvenance {
+			recordSkillPayloadSnapshots(skillDir, snapshots)
+		}
+	}
+
+	return nil
+}
+
+// Marketplace verification hashes the whole payload, so auxiliary edits must invalidate discovery too.
+func recordSkillPayloadSnapshots(skillDir string, snapshots map[string]filesnap.Snapshot) {
+	// The callback handles entry errors so healthy payloads remain discoverable.
+	err := filepath.WalkDir(skillDir, func(path string, entry fs.DirEntry, walkErr error) error {
+		if walkErr != nil {
+			snapshots[path] = filesnap.Uncacheable()
+			return nil
+		}
+		info, err := entry.Info()
+		if err != nil {
+			snapshots[path] = filesnap.Uncacheable()
+			return nil
+		}
+		snapshots[path] = filesnap.FromInfo(path, info)
+		return nil
+	})
+	if err != nil {
+		snapshots[skillDir] = filesnap.Uncacheable()
+	}
+}
+
+func hasCriticalWarning(warnings []Warning) bool {
+	for _, warning := range warnings {
+		if warning.Severity == SeverityCritical {
+			return true
+		}
+	}
+	return false
+}
+
+func mergedSkillList(globalSkills, workspaceSkills map[string]*Skill) []*Skill {
+	if len(globalSkills) == 0 && len(workspaceSkills) == 0 {
+		return nil
+	}
+	if len(workspaceSkills) == 0 {
+		return cloneSortedSkillList(globalSkills)
+	}
+	if len(globalSkills) == 0 {
+		return cloneSortedSkillList(workspaceSkills)
+	}
+
+	names := slices.AppendSeq(make([]string, 0, len(globalSkills)+len(workspaceSkills)), maps.Keys(globalSkills))
+	names = slices.AppendSeq(names, maps.Keys(workspaceSkills))
+	slices.Sort(names)
+
+	skills := make([]*Skill, 0, len(names))
+	for _, name := range slices.Compact(names) {
+		if skill, ok := workspaceSkills[name]; ok {
+			cloned := cloneSkill(skill)
+			if global := globalSkills[name]; global != nil {
+				cloned.Diagnostics.ShadowedDefinitions = append(
+					cloneSkillDefinitionRefs(cloned.Diagnostics.ShadowedDefinitions),
+					shadowDefinitionRefsForWinner(global, time.Time{})...,
+				)
+			}
+			skills = append(skills, cloned)
+			continue
+		}
+		skills = append(skills, cloneSkill(globalSkills[name]))
+	}
+
+	return skills
+}
+
+func mergedSkillLayers(layers ...map[string]*Skill) []*Skill {
+	if len(layers) == 0 {
+		return nil
+	}
+	merged := make(map[string]*Skill)
+	for _, layer := range layers {
+		for name, skill := range layer {
+			if skill == nil {
+				continue
+			}
+			winner := cloneSkill(skill)
+			if loser := merged[name]; loser != nil {
+				winner.Diagnostics.ShadowedDefinitions = append(
+					cloneSkillDefinitionRefs(winner.Diagnostics.ShadowedDefinitions),
+					shadowDefinitionRefsForWinner(loser, time.Time{})...,
+				)
+			}
+			merged[name] = winner
+		}
+	}
+	return cloneSortedSkillList(merged)
+}
+
+func mergedSkillListWithDisabled(globalSkills, workspaceSkills map[string]*Skill, disabledSkills []string) []*Skill {
+	skills := mergedSkillList(globalSkills, workspaceSkills)
+	applyDisabledSkillList(skills, disabledSkills)
+	return skills
+}
+
+func applyDisabledSkillList(skills []*Skill, disabledSkills []string) {
+	if len(skills) == 0 || len(disabledSkills) == 0 {
+		return
+	}
+
+	disabled := make(map[string]struct{}, len(disabledSkills))
+	for _, name := range disabledSkills {
+		trimmed := strings.TrimSpace(name)
+		if trimmed == "" {
+			continue
+		}
+		disabled[trimmed] = struct{}{}
+	}
+	if len(disabled) == 0 {
+		return
+	}
+
+	for _, skill := range skills {
+		if skill == nil {
+			continue
+		}
+		if _, ok := disabled[strings.TrimSpace(skill.Meta.Name)]; ok {
+			skill.Enabled = false
+		}
+	}
+}
+
+func cloneSortedSkillList(skillsByName map[string]*Skill) []*Skill {
+	if len(skillsByName) == 0 {
+		return nil
+	}
+
+	names := slices.Sorted(maps.Keys(skillsByName))
+
+	cloned := make([]*Skill, 0, len(names))
+	for _, name := range names {
+		cloned = append(cloned, cloneSkill(skillsByName[name]))
+	}
+	return cloned
+}
+
+func cloneSkill(skill *Skill) *Skill {
+	if skill == nil {
+		return nil
+	}
+
+	clone := *skill
+	clone.Meta = cloneSkillMeta(skill.Meta)
+	clone.ActivationGates = cloneActivationGates(skill.ActivationGates)
+	clone.Activation = cloneSkillActivation(skill.Activation)
+	clone.MCPServers = cloneMCPServerDecls(skill.MCPServers)
+	if len(skill.Hooks) > 0 {
+		clone.Hooks = make([]hookspkg.HookDecl, 0, len(skill.Hooks))
+		for idx, decl := range skill.Hooks {
+			cloned := decl
+			cloned.Args = append([]string(nil), decl.Args...)
+			cloned.Env = cloneStringMap(decl.Env)
+			cloned.SecretEnv = cloneStringMap(decl.SecretEnv)
+			cloned.Metadata = cloneStringMap(decl.Metadata)
+			if decl.Matcher.ToolReadOnly != nil {
+				cloned.Matcher.ToolReadOnly = new(*decl.Matcher.ToolReadOnly)
+			}
+			clone.Hooks = append(clone.Hooks, normalizeSkillHookDecl(skill, cloned, idx, len(skill.Hooks)))
+		}
+	}
+	clone.Provenance = cloneProvenance(skill.Provenance)
+	clone.Diagnostics = cloneSkillDiagnostics(skill.Diagnostics)
+
+	return &clone
+}
+
+func cloneSkillMeta(meta SkillMeta) SkillMeta {
+	clone := meta
+	clone.Metadata = cloneMetadataMap(meta.Metadata)
+	return clone
+}
+
+func cloneMetadataMap(metadata map[string]any) map[string]any {
+	if metadata == nil {
+		return nil
+	}
+
+	clone := make(map[string]any, len(metadata))
+	for key, value := range metadata {
+		clone[key] = cloneMetadataValue(value)
+	}
+
+	return clone
+}
+
+func cloneMetadataValue(value any) any {
+	switch typed := value.(type) {
+	case map[string]any:
+		return cloneMetadataMap(typed)
+	case []any:
+		clone := make([]any, len(typed))
+		for i := range typed {
+			clone[i] = cloneMetadataValue(typed[i])
+		}
+		return clone
+	default:
+		return typed
+	}
+}
+
+func cloneMCPServerDecls(decls []MCPServerDecl) []MCPServerDecl {
+	if decls == nil {
+		return nil
+	}
+
+	clone := make([]MCPServerDecl, len(decls))
+	for i, decl := range decls {
+		clone[i] = MCPServerDecl{
+			Name:      decl.Name,
+			Command:   decl.Command,
+			Args:      append([]string(nil), decl.Args...),
+			Env:       cloneStringMap(decl.Env),
+			SecretEnv: cloneStringMap(decl.SecretEnv),
+		}
+	}
+
+	return clone
+}
+
+func cloneStringMap(input map[string]string) map[string]string {
+	return maps.Clone(input)
+}
+
+func cloneProvenance(provenance *Provenance) *Provenance {
+	if provenance == nil {
+		return nil
+	}
+
+	return new(*provenance)
+}
+
+func (r *Registry) globalSnapshotState() (map[string]filesnap.Snapshot, bool) {
+	if r == nil {
+		return make(map[string]filesnap.Snapshot), false
+	}
+
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+
+	return filesnap.Clone(r.globalSnapshots), r.globalLoaded
+}
+
+func parseBundledSkill(fsys fs.FS, skillPath string) (*Skill, error) {
+	skill, _, err := parseBundledSkillDocument(fsys, skillPath)
+	return skill, err
+}
+
+func readBundledSkillContent(fsys fs.FS, skillPath string) (string, error) {
+	_, body, err := parseBundledSkillDocument(fsys, skillPath)
+	if err != nil {
+		return "", err
+	}
+	return body, nil
+}
+
+func parseBundledSkillDocument(fsys fs.FS, skillPath string) (*Skill, string, error) {
+	content, err := fs.ReadFile(fsys, skillPath)
+	if err != nil {
+		return nil, "", fmt.Errorf("skills: read bundled skill %q: %w", skillPath, err)
+	}
+
+	dir := path.Dir(skillPath)
+	if dir == "." {
+		dir = ""
+	}
+
+	skill, body, err := parseSkillDocument(skillPath, dir, content, SourceBundled)
+	if err != nil {
+		return nil, "", err
+	}
+	if err := mergeSkillMCPSidecarFS(fsys, dir, skill); err != nil {
+		return nil, "", fmt.Errorf("skills: parse bundled skill %q MCP JSON: %w", skillPath, err)
+	}
+
+	return skill, body, nil
+}
+
+func scanBundledFS(fsys fs.FS) ([]string, error) {
+	paths, err := skillscan.ScanFS(fsys, ".")
+	if err != nil {
+		return nil, fmt.Errorf("skills: scan bundled skills: %w", err)
+	}
+	return paths, nil
+}

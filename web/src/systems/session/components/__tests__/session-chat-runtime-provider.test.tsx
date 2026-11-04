@@ -1,0 +1,3899 @@
+import { QueryClient, QueryClientProvider, QueryObserver } from "@tanstack/react-query";
+import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
+import userEvent from "@testing-library/user-event";
+import {
+  AssistantRuntimeProvider,
+  INTERNAL,
+  useAssistantTool,
+  useAui,
+  useAuiState,
+  useExternalStoreRuntime,
+  type ThreadMessage,
+} from "@assistant-ui/react";
+import { StrictMode, Suspense, use, useEffect, useLayoutEffect, useState } from "react";
+import { afterEach, beforeEach, describe, expect, it, onTestFinished, vi } from "vitest";
+
+import { observeGatewayAccess, type GatewayAccessSignal } from "@/lib/gateway-access-signal";
+import { resetGatewayStreamAuth } from "@/lib/gateway-stream-auth";
+import { SessionThread } from "@/components/assistant-ui/session-thread";
+import { createSessionPromptDispatchStore } from "@/components/assistant-ui/session-prompt-dispatch-store";
+import { toast, Toaster } from "@compozy/ui";
+import { formatMessageError } from "@/components/assistant-ui/session-thread-error";
+import { SessionTranscriptThreadProvider } from "@/systems/session/lib/session-transcript-thread-context";
+import { modelCatalogKeys } from "@/systems/model-catalog";
+
+import { sessionStore } from "@/systems/session/stores/session-store";
+import {
+  useSessionTranscriptThreadMessages,
+  useSessionTranscriptThreadStatus,
+} from "@/systems/session/hooks/use-session-transcript-thread-messages";
+import { mergeSessionThreadReadModel } from "@/systems/session/lib/session-thread-read-model";
+import { toReadonlyThreadMessages } from "@/systems/session/lib/session-thread-repository";
+import type { SessionTranscriptData } from "@/systems/session/lib/session-transcript-query";
+import type { SessionTranscriptThreadStatus } from "@/systems/session/lib/session-transcript-thread-context-value";
+import { primarySessionFixture, sessionTranscriptFixture } from "@/systems/session/mocks/fixtures";
+import { sessionRuntime as runtimeFixture } from "@/systems/session/mocks/runtime-fixture";
+import type { SessionInteractionRecord, TranscriptMessage } from "@/systems/session/types";
+
+import { SessionChatRuntimeProvider } from "../session-chat-runtime-provider";
+import {
+  SessionPromptRuntimeContext,
+  type SessionPromptRuntimeSnapshot,
+} from "../../contexts/session-prompt-runtime-context-value";
+import {
+  sessionPromptRuntimeInput,
+  sessionPromptRuntimeStoreLogic,
+} from "../../stores/session-prompt-runtime-store";
+import {
+  discardComposerDraftAttachments,
+  sessionKeys,
+  useClearSessionConversation,
+  useSessionTranscriptThreadState,
+} from "@/systems/session";
+import { sessionPromptRecovery } from "@/systems/session/lib/session-prompt-recovery";
+
+const SESSION_STREAM_QUERY = "frames=transcript";
+
+// The recovery owner, retained composer attachments, and sonner's toast list are
+// app-scoped: nothing one test leaves pending may reach the next.
+afterEach(() => {
+  sessionPromptRecovery.reset();
+  sessionStore.trigger.composerPromptRefusalDismissed({ sessionId: primarySessionFixture.id });
+  discardComposerDraftAttachments(primarySessionFixture.id);
+  toast.dismiss();
+});
+
+describe("formatMessageError", () => {
+  it("extracts provider failure detail from JSON-RPC error envelopes", () => {
+    expect(
+      formatMessageError(
+        '{"code":-32603,"message":"Internal error","data":{"error":"peer disconnected before response"}}'
+      )
+    ).toBe("peer disconnected before response");
+  });
+
+  it("does not produce empty message chrome for blank provider errors", () => {
+    expect(formatMessageError("")).toBeNull();
+  });
+
+  it("does not render raw JSON when no provider error detail exists", () => {
+    expect(formatMessageError('{"type":"abort"}')).toBeNull();
+  });
+});
+
+function jsonResponse(body: unknown, init?: ResponseInit) {
+  return new Response(JSON.stringify(body), {
+    headers: { "Content-Type": "application/json" },
+    ...init,
+  });
+}
+
+function uploadedAttachmentResponse(name: string, idCharacter: string): Response {
+  return jsonResponse(
+    {
+      attachment: {
+        bytes: name.length,
+        created_at: "2026-08-15T00:00:00Z",
+        height: 0,
+        id: `att_${idCharacter.repeat(64)}`,
+        kind: "file",
+        mime_type: "text/plain",
+        name,
+        sha256: idCharacter.repeat(64),
+        width: 0,
+      },
+    },
+    { status: 201 }
+  );
+}
+
+function transcriptEntries(messages: TranscriptMessage[], firstSequence = 1) {
+  return messages.map((message, index) => ({
+    message,
+    sequence: firstSequence + index,
+    start_sequence: firstSequence + index,
+  }));
+}
+
+function transcriptPayload(
+  messages: TranscriptMessage[],
+  options: {
+    firstSequence?: number;
+    hasOlder?: boolean;
+    nextBeforeSequence?: number;
+  } = {}
+) {
+  const entries = transcriptEntries(messages, options.firstSequence);
+  return {
+    entries,
+    epoch: 1,
+    generation: 1,
+    has_older: options.hasOlder ?? false,
+    limit: 200,
+    max_sequence: entries.at(-1)?.sequence ?? 0,
+    ...(options.nextBeforeSequence === undefined
+      ? {}
+      : { next_before_sequence: options.nextBeforeSequence }),
+  };
+}
+
+function transcriptCache(messages: TranscriptMessage[]): SessionTranscriptData {
+  const payload = transcriptPayload(messages);
+  return {
+    pages: [{ ...payload, cursor: payload.max_sequence }],
+    pageParams: [undefined],
+  };
+}
+
+function sseResponse(frames: string[]) {
+  const encoder = new TextEncoder();
+  return new Response(
+    new ReadableStream({
+      start(controller) {
+        for (const frame of frames) {
+          controller.enqueue(encoder.encode(frame));
+        }
+        controller.close();
+      },
+    }),
+    {
+      headers: {
+        "Content-Type": "text/event-stream",
+        "x-vercel-ai-ui-message-stream": "v1",
+      },
+    }
+  );
+}
+
+function openSseResponse(frames: string[]) {
+  const encoder = new TextEncoder();
+  let streamController!: ReadableStreamDefaultController<Uint8Array>;
+  const response = new Response(
+    new ReadableStream({
+      start(controller) {
+        streamController = controller;
+        for (const frame of frames) {
+          controller.enqueue(encoder.encode(frame));
+        }
+      },
+    }),
+    {
+      headers: {
+        "Content-Type": "text/event-stream",
+        "x-vercel-ai-ui-message-stream": "v1",
+      },
+    }
+  );
+  return {
+    response,
+    close(framesToFinish: string[]) {
+      for (const frame of framesToFinish) {
+        streamController.enqueue(encoder.encode(frame));
+      }
+      streamController.close();
+    },
+  };
+}
+
+function getPathname(input: RequestInfo | URL): string {
+  if (typeof input === "string") {
+    return new URL(input, "http://localhost").pathname;
+  }
+
+  if (input instanceof URL) {
+    return input.pathname;
+  }
+
+  return new URL(input.url, "http://localhost").pathname;
+}
+
+function getRequestURL(input: RequestInfo | URL): URL {
+  if (typeof input === "string") return new URL(input, "http://localhost");
+  if (input instanceof URL) return input;
+  return new URL(input.url, "http://localhost");
+}
+
+function getLastUserMessageID(init?: RequestInit): string {
+  if (typeof init?.body !== "string") return "";
+  const body: unknown = JSON.parse(init.body);
+  if (typeof body !== "object" || body === null || !("messages" in body)) return "";
+  const messages = body.messages;
+  if (!Array.isArray(messages)) return "";
+  for (const message of [...messages].reverse()) {
+    if (
+      typeof message === "object" &&
+      message !== null &&
+      "role" in message &&
+      message.role === "user" &&
+      "id" in message &&
+      typeof message.id === "string"
+    ) {
+      return message.id;
+    }
+  }
+  return "";
+}
+
+function createQueryClient() {
+  return new QueryClient({
+    defaultOptions: {
+      queries: {
+        retry: false,
+      },
+      mutations: {
+        retry: false,
+      },
+    },
+  });
+}
+
+function createDeferred<T>() {
+  let resolve!: (value: T | PromiseLike<T>) => void;
+  let reject!: (reason?: unknown) => void;
+  const promise = new Promise<T>((promiseResolve, promiseReject) => {
+    resolve = promiseResolve;
+    reject = promiseReject;
+  });
+  return { promise, reject, resolve };
+}
+
+function abortableResponse(response: Promise<Response>, signal?: AbortSignal | null) {
+  if (!signal) return response;
+  if (signal.aborted) {
+    return Promise.reject(new DOMException("The operation was aborted", "AbortError"));
+  }
+
+  return new Promise<Response>((resolve, reject) => {
+    const handleAbort = () => {
+      reject(new DOMException("The operation was aborted", "AbortError"));
+    };
+    signal.addEventListener("abort", handleAbort, { once: true });
+    void response.then(
+      result => {
+        signal.removeEventListener("abort", handleAbort);
+        resolve(result);
+      },
+      error => {
+        signal.removeEventListener("abort", handleAbort);
+        reject(error);
+      }
+    );
+  });
+}
+
+class FakeSessionEventSource {
+  readonly listeners = new Map<string, Set<EventListenerOrEventListenerObject>>();
+  closed = false;
+  onmessage: ((event: MessageEvent) => void) | null = null;
+  onerror: ((event: Event) => void) | null = null;
+
+  constructor(readonly url: string) {}
+
+  addEventListener(type: string, listener: EventListenerOrEventListenerObject) {
+    const listeners = this.listeners.get(type) ?? new Set<EventListenerOrEventListenerObject>();
+    listeners.add(listener);
+    this.listeners.set(type, listeners);
+  }
+
+  removeEventListener(type: string, listener: EventListenerOrEventListenerObject) {
+    this.listeners.get(type)?.delete(listener);
+  }
+
+  close() {
+    this.closed = true;
+  }
+
+  dispatch(type: string, payload: unknown, lastEventId: string) {
+    const event = new MessageEvent(type, { data: JSON.stringify(payload) });
+    Object.defineProperty(event, "lastEventId", { value: lastEventId });
+    if (type === "message") {
+      this.onmessage?.(event);
+    }
+    for (const listener of this.listeners.get(type) ?? []) {
+      if (typeof listener === "function") {
+        listener(event);
+      } else {
+        listener.handleEvent(event);
+      }
+    }
+  }
+}
+
+function TranscriptStateProbe() {
+  const state = useSessionTranscriptThreadState();
+
+  return (
+    <div
+      data-testid="transcript-state-probe"
+      data-status={state.status}
+      data-is-error={String(state.isError)}
+      data-is-pending={String(state.isPending)}
+      data-error-message={state.error?.message ?? ""}
+    >
+      {state.messages.length}
+    </div>
+  );
+}
+
+const TranscriptMessagesSubscriptionProbe = vi.fn(function TranscriptMessagesSubscriptionProbe() {
+  const messages = useSessionTranscriptThreadMessages();
+  return <output data-testid="transcript-messages-subscription-probe">{messages.length}</output>;
+});
+
+const TranscriptStatusSubscriptionProbe = vi.fn(function TranscriptStatusSubscriptionProbe() {
+  const status = useSessionTranscriptThreadStatus();
+  return <output data-testid="transcript-status-subscription-probe">{status}</output>;
+});
+
+interface RuntimeTranscriptCommit {
+  projectedIds: string[];
+  runtimeIds: string[];
+}
+
+function RuntimeTranscriptCoherenceProbe({
+  onCommit,
+}: {
+  onCommit: (sample: RuntimeTranscriptCommit) => void;
+}) {
+  const runtimeMessages = useAuiState(state => state.thread.messages);
+  const projectedMessages = useSessionTranscriptThreadMessages();
+
+  useLayoutEffect(() => {
+    onCommit({
+      projectedIds: projectedMessages.map(message => message.id),
+      runtimeIds: runtimeMessages.map(message => message.id),
+    });
+  }, [onCommit, projectedMessages, runtimeMessages]);
+
+  return null;
+}
+
+function ClearConversationButton() {
+  const aui = useAui();
+  const clearMutation = useClearSessionConversation({ workspaceId: fixtureWorkspaceId() });
+
+  return (
+    <button
+      type="button"
+      disabled={clearMutation.isPending}
+      onClick={() => {
+        clearMutation.mutate(primarySessionFixture.id, {
+          onSuccess: () => aui.thread.reset(),
+        });
+      }}
+    >
+      Clear test conversation
+    </button>
+  );
+}
+
+function RetryLatestAssistantMessageButton() {
+  const aui = useAui();
+  const latestAssistantMessageId = useAuiState(state => {
+    for (let index = state.thread.messages.length - 1; index >= 0; index -= 1) {
+      const message = state.thread.messages[index];
+      if (message?.role === "assistant") {
+        return message.id;
+      }
+    }
+    return null;
+  });
+
+  if (latestAssistantMessageId === null) {
+    return null;
+  }
+
+  return (
+    <button
+      type="button"
+      onClick={async () => {
+        await aui.thread.message({ id: latestAssistantMessageId }).reload();
+      }}
+    >
+      Retry latest assistant message
+    </button>
+  );
+}
+
+// The composer input is a Lexical contenteditable, so authored text lives in the
+// runtime composer rather than a textarea `value`. The probe exposes the same `aui`
+// handle the composer uses, so tests can author and read canonical prompt text.
+let composerAui: ReturnType<typeof useAui> | null = null;
+
+function ComposerAuiProbe() {
+  const aui = useAui();
+  useEffect(() => {
+    composerAui = aui;
+    return () => {
+      composerAui = null;
+    };
+  }, [aui]);
+  return null;
+}
+
+function requireComposerAui() {
+  if (!composerAui) {
+    throw new Error("composer runtime probe is not mounted");
+  }
+  return composerAui;
+}
+
+/** Typing-equivalent: replaces the whole composer text and parks the cursor at its end. */
+async function setComposerText(text: string) {
+  const aui = requireComposerAui();
+  await act(async () => {
+    aui.composer.setText(text);
+  });
+}
+
+function composerText(): string {
+  return requireComposerAui().composer.getState().text;
+}
+
+/** Counts mounts of the runtime subtree: a remount of the provider re-runs it. */
+function RuntimeMountProbe({ onMount }: { onMount: () => void }) {
+  useEffect(() => {
+    onMount();
+  }, [onMount]);
+  return null;
+}
+
+function renderSessionThread(
+  options: {
+    eventSourceFactory?: (url: string) => FakeSessionEventSource;
+    includeClearAction?: boolean;
+    includeRuntimeRetryControl?: boolean;
+    includeToaster?: boolean;
+    queryClient?: QueryClient;
+    includeTranscriptStateProbe?: boolean;
+    includeDecisionDock?: boolean;
+    isSessionRunning?: boolean;
+    canPrompt?: boolean;
+    liveTailEnabled?: boolean;
+    onCancelPrompt?: () => void;
+    onRuntimeMount?: () => void;
+    onRuntimeTranscriptCommit?: (sample: RuntimeTranscriptCommit) => void;
+    onUnconfirmedSend?: (messageId: string) => void;
+    runtimeSnapshot?: SessionPromptRuntimeSnapshot;
+    strictMode?: boolean;
+  } = {}
+) {
+  const queryClient = options.queryClient ?? createQueryClient();
+
+  const renderTree = () => {
+    const sessionRuntime = (
+      <QueryClientProvider client={queryClient}>
+        <SessionChatRuntimeProvider
+          sessionId={primarySessionFixture.id}
+          workspaceId={fixtureWorkspaceId()}
+          eventSourceFactory={options.eventSourceFactory}
+          liveTailEnabled={options.liveTailEnabled}
+        >
+          <ComposerAuiProbe />
+          {options.onRuntimeMount ? <RuntimeMountProbe onMount={options.onRuntimeMount} /> : null}
+          {options.onRuntimeTranscriptCommit ? (
+            <RuntimeTranscriptCoherenceProbe onCommit={options.onRuntimeTranscriptCommit} />
+          ) : null}
+          {options.includeTranscriptStateProbe ? <TranscriptStateProbe /> : null}
+          {options.onUnconfirmedSend ? (
+            <UnconfirmedSendProbe onUnconfirmed={options.onUnconfirmedSend} />
+          ) : null}
+          {options.includeClearAction ? <ClearConversationButton /> : null}
+          {options.includeRuntimeRetryControl ? <RetryLatestAssistantMessageButton /> : null}
+          <SessionThread
+            sessionId={primarySessionFixture.id}
+            agentName={primarySessionFixture.agent_name}
+            workspaceId={options.includeDecisionDock ? fixtureWorkspaceId() : undefined}
+            sessionState={options.includeDecisionDock ? "active" : undefined}
+            canPrompt={options.canPrompt ?? true}
+            isSessionRunning={options.isSessionRunning}
+            onCancelPrompt={options.onCancelPrompt ?? (() => {})}
+          />
+          {options.includeToaster ? <Toaster duration={500} /> : null}
+        </SessionChatRuntimeProvider>
+      </QueryClientProvider>
+    );
+    const tree = options.runtimeSnapshot
+      ? withRuntimeSnapshot(sessionRuntime, options.runtimeSnapshot)
+      : sessionRuntime;
+    return options.strictMode ? <StrictMode>{tree}</StrictMode> : tree;
+  };
+  const utils = render(renderTree());
+  return {
+    ...utils,
+    queryClient,
+    rerenderSessionThread: () => utils.rerender(renderTree()),
+  };
+}
+
+function withRuntimeSnapshot(
+  children: React.ReactNode,
+  runtimeSnapshot: SessionPromptRuntimeSnapshot
+) {
+  const store = sessionPromptRuntimeStoreLogic.createStore(
+    sessionPromptRuntimeInput({
+      agentName: primarySessionFixture.agent_name,
+      canPrompt: true,
+      effectiveRuntime: primarySessionFixture.runtime.effective,
+      selectedRuntime: primarySessionFixture.runtime.selected,
+      selectionRevision: primarySessionFixture.runtime.selection_revision,
+      sessionId: primarySessionFixture.id,
+      workspaceId: primarySessionFixture.workspace_id,
+    })
+  );
+  store.trigger.runtimeSelected({
+    value: {
+      provider: runtimeSnapshot.provider,
+      model: runtimeSnapshot.model ?? "",
+      reasoning_effort: runtimeSnapshot.reasoning_effort ?? "",
+    },
+  });
+  if (runtimeSnapshot.speed === "fast") {
+    store.trigger.speedSelected({ speed: "fast" });
+  }
+  return <SessionPromptRuntimeContext value={store}>{children}</SessionPromptRuntimeContext>;
+}
+
+function countTranscriptFetches(fetchMock: ReturnType<typeof vi.fn>): number {
+  return fetchMock.mock.calls.filter(([input]) => {
+    return (
+      getPathname(input as RequestInfo | URL) ===
+      `/api/workspaces/${primarySessionFixture.workspace_id}/sessions/${primarySessionFixture.id}/transcript`
+    );
+  }).length;
+}
+
+function countPromptFetches(fetchMock: ReturnType<typeof vi.fn>): number {
+  return fetchMock.mock.calls.filter(([input]) => {
+    return (
+      getPathname(input as RequestInfo | URL) ===
+      `/api/workspaces/${primarySessionFixture.workspace_id}/sessions/${primarySessionFixture.id}/prompt`
+    );
+  }).length;
+}
+
+function countQueueFetches(fetchMock: ReturnType<typeof vi.fn>): number {
+  return fetchMock.mock.calls.filter(([input]) => {
+    return (
+      getPathname(input as RequestInfo | URL) ===
+      `/api/workspaces/${primarySessionFixture.workspace_id}/sessions/${primarySessionFixture.id}/prompt/queue`
+    );
+  }).length;
+}
+
+function countSessionDetailFetches(fetchMock: ReturnType<typeof vi.fn>): number {
+  return fetchMock.mock.calls.filter(([input]) => {
+    return (
+      getPathname(input as RequestInfo | URL) ===
+      `/api/workspaces/${primarySessionFixture.workspace_id}/sessions/${primarySessionFixture.id}`
+    );
+  }).length;
+}
+
+/** Observes the app-scoped pending-ack hand-off the page controls subscribe to. */
+function UnconfirmedSendProbe({ onUnconfirmed }: { onUnconfirmed: (messageId: string) => void }) {
+  useEffect(
+    () =>
+      sessionPromptRecovery.subscribeUnconfirmed(
+        { workspaceId: fixtureWorkspaceId(), sessionId: primarySessionFixture.id },
+        envelope => onUnconfirmed(envelope.identity.messageId)
+      ),
+    [onUnconfirmed]
+  );
+  return null;
+}
+
+function countClarificationFetches(fetchMock: ReturnType<typeof vi.fn>): number {
+  return fetchMock.mock.calls.filter(([input]) => {
+    return (
+      getPathname(input as RequestInfo | URL) ===
+      `/api/workspaces/${primarySessionFixture.workspace_id}/sessions/${primarySessionFixture.id}/clarifications`
+    );
+  }).length;
+}
+
+function interactionFetchSearches(fetchMock: ReturnType<typeof vi.fn>): string[] {
+  return fetchMock.mock.calls
+    .map(([input]) => getRequestURL(input as RequestInfo | URL))
+    .filter(
+      url =>
+        url.pathname ===
+        `/api/workspaces/${primarySessionFixture.workspace_id}/sessions/${primarySessionFixture.id}/interactions`
+    )
+    .map(url => url.search);
+}
+
+function fixtureWorkspaceId(): string {
+  const workspaceId = primarySessionFixture.workspace_id;
+  if (!workspaceId) {
+    throw new Error("primary session fixture must include workspace_id");
+  }
+  return workspaceId;
+}
+
+describe("SessionChatRuntimeProvider", () => {
+  // Invariant: a replacement prompt request cancels the previous in-flight request,
+  // so stale transport work cannot outlive the current prompt. Owning layer: chat-runtime
+  // provider integration. Canonical suite: this file.
+  it("Should abort a superseded prompt request", () => {
+    const store = createSessionPromptDispatchStore();
+    const first = new AbortController();
+    const second = new AbortController();
+
+    store.trigger.requestStarted({ controller: first });
+    store.trigger.requestStarted({ controller: second });
+
+    expect(first.signal.aborted).toBe(true);
+    expect(store.getSnapshot().context).toMatchObject({
+      controller: second,
+      pending: true,
+    });
+  });
+
+  // Invariant: message subscribers ignore status and pagination-only transcript
+  // synchronization, while status subscribers ignore message-only synchronization.
+  // Owning layer: provider/thread integration. Canonical suite: this file.
+  it("isolates transcript subscribers from unrelated synchronized projection fields", async () => {
+    const initialMessages = toReadonlyThreadMessages(sessionTranscriptFixture.slice(0, 1));
+    const nextMessages = toReadonlyThreadMessages(sessionTranscriptFixture.slice(0, 2));
+    TranscriptMessagesSubscriptionProbe.mockClear();
+    TranscriptStatusSubscriptionProbe.mockClear();
+    const messageCommits = TranscriptMessagesSubscriptionProbe;
+    const statusCommits = TranscriptStatusSubscriptionProbe;
+    const retry = vi.fn();
+
+    function TranscriptSubscriptionHarness({
+      hasOlder,
+      isFetchingOlder,
+      messages,
+      status,
+    }: {
+      hasOlder: boolean;
+      isFetchingOlder: boolean;
+      messages: readonly ThreadMessage[];
+      status: SessionTranscriptThreadStatus;
+    }) {
+      const [children] = useState(() => (
+        <>
+          <TranscriptMessagesSubscriptionProbe />
+          <TranscriptStatusSubscriptionProbe />
+        </>
+      ));
+
+      return (
+        <SessionTranscriptThreadProvider
+          messages={messages}
+          status={status}
+          error={null}
+          hasOlder={hasOlder}
+          isFetchingOlder={isFetchingOlder}
+          retry={retry}
+        >
+          {children}
+        </SessionTranscriptThreadProvider>
+      );
+    }
+
+    const view = render(
+      <TranscriptSubscriptionHarness
+        messages={initialMessages}
+        status="success"
+        hasOlder={false}
+        isFetchingOlder={false}
+      />
+    );
+
+    expect(messageCommits).toHaveBeenCalledTimes(1);
+    expect(statusCommits).toHaveBeenCalledTimes(1);
+
+    view.rerender(
+      <TranscriptSubscriptionHarness
+        messages={initialMessages}
+        status="pending"
+        hasOlder={false}
+        isFetchingOlder={false}
+      />
+    );
+    await waitFor(() => expect(statusCommits).toHaveBeenCalledTimes(2));
+    expect(messageCommits).toHaveBeenCalledTimes(1);
+
+    view.rerender(
+      <TranscriptSubscriptionHarness
+        messages={initialMessages}
+        status="pending"
+        hasOlder
+        isFetchingOlder
+      />
+    );
+    await waitFor(() => {
+      expect(screen.getByTestId("transcript-status-subscription-probe")).toHaveTextContent(
+        "pending"
+      );
+    });
+    expect(messageCommits).toHaveBeenCalledTimes(1);
+    expect(statusCommits).toHaveBeenCalledTimes(2);
+
+    view.rerender(
+      <TranscriptSubscriptionHarness
+        messages={nextMessages}
+        status="pending"
+        hasOlder
+        isFetchingOlder
+      />
+    );
+    await waitFor(() => expect(messageCommits).toHaveBeenCalledTimes(2));
+    expect(statusCommits).toHaveBeenCalledTimes(2);
+  });
+
+  let transcriptMessages = sessionTranscriptFixture.slice(0, 2);
+  let sessionDetailResponse = primarySessionFixture;
+  let transcriptEpoch = 1;
+  let transcriptGeneration = 1;
+  let transcriptFetchShouldFail = false;
+  let transcriptResponsePromise: Promise<Response> | null = null;
+  let clearResponsePromise: Promise<Response> | null = null;
+  let rewindResponseGate: Promise<void> | null = null;
+  let rewindRefusal: Response | null = null;
+  let promptResponsePromise: Promise<Response> | null = null;
+  let attachmentUploadResponse: (() => Promise<Response>) | null = null;
+  let olderTranscriptResponsePromise: Promise<Response> | null = null;
+  let transcriptFirstSequence = 1;
+  let transcriptHasOlder = false;
+  let transcriptNextBeforeSequence: number | undefined;
+  let olderTranscriptMessages: TranscriptMessage[] = [];
+  let goalCommandFailureReason: "goal_objective_required" | "goal_objective_too_large" | null =
+    null;
+  let lastPromptMessageID = "";
+  let promptResponseSequence = 0;
+  let streamTickets: string[] = [];
+  let settledInteractions: SessionInteractionRecord[] = [];
+  let fetchMock: ReturnType<typeof vi.fn>;
+
+  beforeEach(() => {
+    composerAui = null;
+    sessionStore.trigger.sessionInteractionRemoved({ sessionId: primarySessionFixture.id });
+    transcriptMessages = sessionTranscriptFixture.slice(0, 2);
+    sessionDetailResponse = primarySessionFixture;
+    transcriptEpoch = 1;
+    transcriptGeneration = 1;
+    transcriptFetchShouldFail = false;
+    transcriptResponsePromise = null;
+    clearResponsePromise = null;
+    rewindResponseGate = null;
+    rewindRefusal = null;
+    promptResponsePromise = null;
+    attachmentUploadResponse = null;
+    olderTranscriptResponsePromise = null;
+    transcriptFirstSequence = 1;
+    transcriptHasOlder = false;
+    transcriptNextBeforeSequence = undefined;
+    olderTranscriptMessages = [];
+    goalCommandFailureReason = null;
+    lastPromptMessageID = "";
+    promptResponseSequence = 0;
+    streamTickets = [];
+    settledInteractions = [];
+    fetchMock = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const requestURL = getRequestURL(input);
+      const pathname = requestURL.pathname;
+
+      if (pathname === "/api/status") {
+        return jsonResponse(
+          {},
+          {
+            headers: {
+              "Content-Type": "application/json",
+              "X-Compozy-Gateway-Tier": streamTickets.length > 0 ? "private" : "local",
+            },
+          }
+        );
+      }
+
+      if (pathname === "/api/gateway/stream-tickets") {
+        const ticket = streamTickets.shift();
+        if (ticket) {
+          return jsonResponse(
+            { ticket, expires_at: "2026-08-07T00:00:00Z" },
+            {
+              status: 201,
+              headers: {
+                "Content-Type": "application/json",
+                "X-Compozy-Gateway-Tier": "private",
+              },
+            }
+          );
+        }
+        throw new Error("Remote stream ticket requested without a queued test ticket");
+      }
+
+      if (pathname === "/api/sessions") {
+        return jsonResponse({
+          sessions: [primarySessionFixture],
+          page: { has_more: false, limit: 50, total: 1 },
+        });
+      }
+
+      if (
+        pathname ===
+        `/api/workspaces/${primarySessionFixture.workspace_id}/sessions/${primarySessionFixture.id}`
+      ) {
+        return jsonResponse({ session: sessionDetailResponse });
+      }
+
+      if (
+        pathname ===
+        `/api/workspaces/${primarySessionFixture.workspace_id}/sessions/${primarySessionFixture.id}/transcript`
+      ) {
+        if (transcriptResponsePromise) {
+          return transcriptResponsePromise;
+        }
+        if (transcriptFetchShouldFail) {
+          return jsonResponse({ error: "recorder temporarily unavailable" }, { status: 500 });
+        }
+        if (requestURL.searchParams.has("before_sequence")) {
+          if (olderTranscriptResponsePromise) return olderTranscriptResponsePromise;
+          return jsonResponse(transcriptPayload(olderTranscriptMessages));
+        }
+        return jsonResponse({
+          ...transcriptPayload(transcriptMessages, {
+            firstSequence: transcriptFirstSequence,
+            hasOlder: transcriptHasOlder,
+            nextBeforeSequence: transcriptNextBeforeSequence,
+          }),
+          epoch: transcriptEpoch,
+          generation: transcriptGeneration,
+        });
+      }
+
+      if (
+        pathname ===
+        `/api/workspaces/${primarySessionFixture.workspace_id}/sessions/${primarySessionFixture.id}/clarifications`
+      ) {
+        return jsonResponse({ clarifications: [] });
+      }
+
+      if (
+        pathname ===
+        `/api/workspaces/${primarySessionFixture.workspace_id}/sessions/${primarySessionFixture.id}/interactions`
+      ) {
+        return jsonResponse({ interactions: settledInteractions });
+      }
+
+      if (
+        pathname ===
+        `/api/workspaces/${primarySessionFixture.workspace_id}/sessions/${primarySessionFixture.id}/prompt/queue`
+      ) {
+        return jsonResponse({ inputs: [] });
+      }
+
+      if (
+        pathname ===
+        `/api/workspaces/${primarySessionFixture.workspace_id}/sessions/${primarySessionFixture.id}/goal`
+      ) {
+        return jsonResponse({ goal: null });
+      }
+
+      if (
+        pathname ===
+        `/api/workspaces/${primarySessionFixture.workspace_id}/sessions/${primarySessionFixture.id}/rewind`
+      ) {
+        if (rewindRefusal) return rewindRefusal;
+        // The daemon keeps the prefix before the chosen message and hands its text back.
+        const body = input instanceof Request ? await input.clone().text() : String(init?.body);
+        const { message_id: messageId } = JSON.parse(body) as { message_id: string };
+        const cut = transcriptMessages.findIndex(message => message.id === messageId);
+        const rewound = transcriptMessages[cut];
+        transcriptMessages = transcriptMessages.slice(0, cut);
+        transcriptEpoch += 1;
+        const draftText = rewound?.parts.find(part => part.type === "text")?.text ?? "";
+        const response = (rewindResponseGate ?? Promise.resolve()).then(() =>
+          jsonResponse({ session: sessionDetailResponse, rewind: { draft_text: draftText } })
+        );
+        return abortableResponse(response, input instanceof Request ? input.signal : init?.signal);
+      }
+
+      if (
+        pathname ===
+        `/api/workspaces/${primarySessionFixture.workspace_id}/sessions/${primarySessionFixture.id}/clear`
+      ) {
+        if (clearResponsePromise) return clearResponsePromise;
+        return jsonResponse({ session: sessionDetailResponse });
+      }
+
+      if (
+        (input instanceof Request ? input.method : init?.method) === "DELETE" &&
+        pathname.startsWith(
+          `/api/workspaces/${primarySessionFixture.workspace_id}/sessions/${primarySessionFixture.id}/attachments/`
+        )
+      ) {
+        return new Response(null, { status: 204 });
+      }
+
+      if (
+        pathname ===
+        `/api/workspaces/${primarySessionFixture.workspace_id}/sessions/${primarySessionFixture.id}/attachments`
+      ) {
+        if (attachmentUploadResponse) return attachmentUploadResponse();
+        return jsonResponse(
+          {
+            attachment: {
+              bytes: 32,
+              created_at: "2026-08-15T00:00:00Z",
+              height: 10,
+              id: `att_${"a".repeat(64)}`,
+              kind: "file",
+              mime_type: "application/pdf",
+              name: "flatten-spec.pdf",
+              sha256: "b".repeat(64),
+              width: 0,
+            },
+          },
+          { status: 201 }
+        );
+      }
+
+      if (
+        pathname ===
+        `/api/workspaces/${primarySessionFixture.workspace_id}/sessions/${primarySessionFixture.id}/prompt`
+      ) {
+        lastPromptMessageID = getLastUserMessageID(init);
+        if (promptResponsePromise) {
+          return abortableResponse(promptResponsePromise, init?.signal);
+        }
+        if (goalCommandFailureReason) {
+          return jsonResponse(
+            {
+              prompt: {
+                goal: {
+                  outcome: "error",
+                  reason_code: goalCommandFailureReason,
+                  replaced_run_id: null,
+                  snapshot: null,
+                },
+                idempotency_key: "idempotency-goal-error",
+                message_id: lastPromptMessageID,
+                replayed: false,
+                status: "rejected",
+              },
+            },
+            { status: 422 }
+          );
+        }
+        promptResponseSequence += 1;
+        const runtimeMessageID = `turn-runtime-${String(promptResponseSequence).padStart(3, "0")}`;
+        const runtimeTextID = `${runtimeMessageID}-text-1`;
+        return sseResponse([
+          `data: {"type":"start","messageId":"${runtimeMessageID}"}\n\n`,
+          `data: {"type":"text-start","id":"${runtimeTextID}"}\n\n`,
+          `data: {"type":"text-delta","id":"${runtimeTextID}","delta":"Live runtime answer before transcript reconciliation."}\n\n`,
+          `data: {"type":"text-end","id":"${runtimeTextID}"}\n\n`,
+          'data: {"type":"finish","finishReason":"stop"}\n\n',
+          "data: [DONE]\n\n",
+        ]);
+      }
+
+      throw new Error(`Unhandled fetch in test: ${pathname}`);
+    });
+
+    vi.stubGlobal("fetch", fetchMock);
+    resetGatewayStreamAuth();
+  });
+
+  afterEach(() => {
+    cleanup();
+    vi.useRealTimers();
+    resetGatewayStreamAuth();
+    vi.unstubAllGlobals();
+    act(() => {
+      sessionStore.trigger.sessionInteractionRemoved({ sessionId: primarySessionFixture.id });
+    });
+  });
+
+  it("Should unmount a running readonly thread safely under StrictMode", async () => {
+    const consoleError = vi.spyOn(console, "error").mockImplementation(() => undefined);
+    try {
+      const view = renderSessionThread({ isSessionRunning: true, strictMode: true });
+
+      expect(
+        await screen.findByText("Summarize the launch blockers before the 18:30 UTC cutover.")
+      ).toBeInTheDocument();
+      expect(() => view.unmount()).not.toThrow();
+      expect(
+        consoleError.mock.calls.some(call =>
+          call.some(value =>
+            String(value).includes("Tried to unmount a fiber that is already unmounted")
+          )
+        )
+      ).toBe(false);
+    } finally {
+      consoleError.mockRestore();
+    }
+  });
+
+  // Invariant: discarded renders and closed session providers leave no live stream
+  // pipelines retaining their React trees. Owner: chat-runtime lifecycle; canonical suite: this file.
+  it("releases stream pipelines when a session closes or its render is abandoned", async () => {
+    const pending = new Set<Promise<void>>();
+    const originalPipeTo = ReadableStream.prototype.pipeTo;
+    const pipeTo = vi.spyOn(ReadableStream.prototype, "pipeTo").mockImplementation(function (
+      this: ReadableStream,
+      destination,
+      options
+    ) {
+      const promise = originalPipeTo.call(this, destination, options);
+      pending.add(promise);
+      void promise.then(
+        () => pending.delete(promise),
+        () => pending.delete(promise)
+      );
+      return promise;
+    });
+    try {
+      const never = new Promise<void>(() => {});
+      function SuspendSession() {
+        use(never);
+        return null;
+      }
+      const queryClient = createQueryClient();
+      let abandoned!: ReturnType<typeof render>;
+      await act(async () => {
+        abandoned = render(
+          <QueryClientProvider client={queryClient}>
+            <Suspense fallback="Opening session">
+              <SessionChatRuntimeProvider
+                sessionId={primarySessionFixture.id}
+                workspaceId={fixtureWorkspaceId()}
+                liveTailEnabled={false}
+              >
+                <SuspendSession />
+              </SessionChatRuntimeProvider>
+            </Suspense>
+          </QueryClientProvider>
+        );
+      });
+      expect(screen.getByText("Opening session")).toBeInTheDocument();
+      abandoned.unmount();
+      await waitFor(() => expect(pending.size).toBe(0));
+
+      for (let index = 0; index < 3; index += 1) {
+        const view = renderSessionThread({ strictMode: true, liveTailEnabled: false });
+        expect(
+          await screen.findByText("Summarize the launch blockers before the 18:30 UTC cutover.")
+        ).toBeInTheDocument();
+        const frames = [
+          { type: "start", messageId: `lifetime-turn-${index}` },
+          {
+            type: "tool-input-available",
+            toolCallId: `lifetime-tool-${index}`,
+            toolName: "Bash",
+            input: { command: "pwd" },
+          },
+          {
+            type: "tool-output-available",
+            toolCallId: `lifetime-tool-${index}`,
+            output: { stdout: "/workspace" },
+          },
+        ];
+        const prompt = openSseResponse(frames.map(frame => `data: ${JSON.stringify(frame)}\n\n`));
+        promptResponsePromise = Promise.resolve(prompt.response);
+        await setComposerText("Show the current directory");
+        fireEvent.click(screen.getByTestId("composer-send-button"));
+        await waitFor(() => expect(pending.size).toBeGreaterThan(0));
+        prompt.close(['data: {"type":"finish","finishReason":"stop"}\n\n', "data: [DONE]\n\n"]);
+        await waitFor(() =>
+          expect(screen.queryByTestId("composer-stop-button")).not.toBeInTheDocument()
+        );
+        expect(pending.size).toBeGreaterThan(0);
+        view.unmount();
+        await waitFor(() => expect(pending.size).toBe(0));
+        view.queryClient.clear();
+      }
+      queryClient.clear();
+    } finally {
+      pipeTo.mockRestore();
+    }
+  });
+
+  // Invariant: a released tracker never leaves a dead one for the next owner of the
+  // message repository. Guards the core patch in patches/README.md.
+  it.each(["a new host after disposal", "the same host after re-enabling"])(
+    "Should run tools with a live tracker for %s",
+    async scenario => {
+      const repository = new INTERNAL.MessageRepository();
+      const onAddToolResult = vi.fn();
+      const toolCall: ThreadMessage = {
+        id: "assistant-tool",
+        role: "assistant",
+        createdAt: new Date(0),
+        status: { type: "requires-action", reason: "tool-calls" },
+        content: [
+          {
+            type: "tool-call",
+            toolCallId: "call-1",
+            toolName: "echo",
+            args: {},
+            argsText: "{}",
+          },
+        ],
+        metadata: {
+          unstable_state: null,
+          unstable_annotations: [],
+          unstable_data: [],
+          steps: [],
+          custom: {},
+        },
+      };
+      function Host({ enabled, messages }: { enabled: boolean; messages: ThreadMessage[] }) {
+        const runtime = useExternalStoreRuntime({
+          messages,
+          onAddToolResult,
+          onNew: async () => undefined,
+          unstable_enableToolInvocations: enabled,
+          unstable_messageRepositoryInstance: repository,
+        });
+        return (
+          <AssistantRuntimeProvider runtime={runtime}>
+            <EchoTool />
+          </AssistantRuntimeProvider>
+        );
+      }
+      function EchoTool() {
+        useAssistantTool({
+          toolName: "echo",
+          parameters: { type: "object", properties: {} },
+          execute: async () => "echoed",
+        });
+        return null;
+      }
+
+      const first = render(<Host enabled messages={[]} />);
+      if (scenario === "a new host after disposal") {
+        first.unmount();
+        await act(async () => {
+          await new Promise(resolve => setTimeout(resolve, 0));
+        });
+        const second = render(<Host enabled messages={[]} />);
+        second.rerender(<Host enabled messages={[toolCall]} />);
+      } else {
+        first.rerender(<Host enabled={false} messages={[]} />);
+        first.rerender(<Host enabled messages={[]} />);
+        first.rerender(<Host enabled messages={[toolCall]} />);
+      }
+
+      await waitFor(() =>
+        expect(onAddToolResult).toHaveBeenCalledWith(
+          expect.objectContaining({ toolCallId: "call-1", result: "echoed" })
+        )
+      );
+    }
+  );
+
+  it("Should still render from cache after fake timers advance beyond the old 5-minute gcTime default", async () => {
+    vi.useFakeTimers();
+    const queryClient = createQueryClient();
+    const workspaceId = fixtureWorkspaceId();
+    const sessionId = primarySessionFixture.id;
+    queryClient.setQueryData(sessionKeys.detail(workspaceId, sessionId), primarySessionFixture);
+    const cachedTranscript = transcriptCache(transcriptMessages);
+    queryClient.setQueryData(sessionKeys.transcript(workspaceId, sessionId), cachedTranscript);
+
+    const firstRender = renderSessionThread({ queryClient });
+
+    await act(async () => {
+      await vi.waitFor(() => {
+        expect(
+          screen.getByText("Summarize the launch blockers before the 18:30 UTC cutover.")
+        ).toBeInTheDocument();
+        expect(screen.getByText("Launch readiness snapshot")).toBeInTheDocument();
+      });
+    });
+
+    firstRender.unmount();
+
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(5 * 60 * 1_000 + 1);
+    });
+
+    expect(queryClient.getQueryData(sessionKeys.transcript(workspaceId, sessionId))).toEqual(
+      cachedTranscript
+    );
+
+    renderSessionThread({ queryClient });
+
+    await act(async () => {
+      await vi.waitFor(() => {
+        expect(screen.queryByTestId("thread-transcript-skeleton")).not.toBeInTheDocument();
+        expect(screen.queryByText("Start a conversation.")).not.toBeInTheDocument();
+        expect(
+          screen.getByText("Summarize the launch blockers before the 18:30 UTC cutover.")
+        ).toBeInTheDocument();
+        expect(screen.getByText("Launch readiness snapshot")).toBeInTheDocument();
+      });
+    });
+  }, 10_000);
+
+  it("renders transcript rows when the runtime thread is transiently empty", async () => {
+    transcriptMessages = sessionTranscriptFixture.slice(0, 3);
+
+    renderSessionThread();
+
+    await waitFor(() => {
+      expect(
+        screen.getByText("Summarize the launch blockers before the 18:30 UTC cutover.")
+      ).toBeInTheDocument();
+      expect(screen.getByText("Launch readiness snapshot")).toBeInTheDocument();
+      expect(screen.getByTestId("tool-call-row")).toBeInTheDocument();
+    });
+
+    expect(screen.queryByText("Start a conversation.")).not.toBeInTheDocument();
+  }, 10_000);
+
+  it("Should show the skeleton on cold provider mount until the transcript resolves", async () => {
+    const transcriptResponse = createDeferred<Response>();
+    transcriptResponsePromise = transcriptResponse.promise;
+
+    renderSessionThread();
+
+    await waitFor(() => {
+      expect(countTranscriptFetches(fetchMock)).toBe(1);
+    });
+    expect(screen.getByTestId("thread-transcript-skeleton")).toBeInTheDocument();
+    expect(screen.queryByText("Start a conversation.")).not.toBeInTheDocument();
+
+    transcriptResponse.resolve(jsonResponse(transcriptPayload(transcriptMessages)));
+
+    expect(
+      await screen.findByText("Summarize the launch blockers before the 18:30 UTC cutover.")
+    ).toBeInTheDocument();
+    expect(screen.getByText("Launch readiness snapshot")).toBeInTheDocument();
+    expect(screen.queryByTestId("thread-transcript-skeleton")).not.toBeInTheDocument();
+    expect(screen.queryByText("Start a conversation.")).not.toBeInTheDocument();
+    expect(countTranscriptFetches(fetchMock)).toBe(1);
+  }, 10_000);
+
+  it("Should keep the live EventSource closed when liveTailEnabled is false", async () => {
+    const eventSourceFactory = vi.fn((url: string) => new FakeSessionEventSource(url));
+
+    renderSessionThread({ eventSourceFactory, liveTailEnabled: false });
+
+    expect(await screen.findByText("Launch readiness snapshot")).toBeInTheDocument();
+    expect(eventSourceFactory).not.toHaveBeenCalled();
+  });
+
+  it("Should suspend the live EventSource while a session mutation suppresses its tail", async () => {
+    const sources: FakeSessionEventSource[] = [];
+    const eventSourceFactory = vi.fn((url: string) => {
+      const source = new FakeSessionEventSource(url);
+      sources.push(source);
+      return source;
+    });
+
+    renderSessionThread({ eventSourceFactory });
+    await waitFor(() => expect(eventSourceFactory).toHaveBeenCalledTimes(1));
+
+    act(() => {
+      sessionStore.trigger.sessionLiveTailSuspended({ sessionId: primarySessionFixture.id });
+    });
+    await waitFor(() => expect(sources[0]?.closed).toBe(true));
+
+    act(() => {
+      sessionStore.trigger.sessionLiveTailResumed({ sessionId: primarySessionFixture.id });
+    });
+    await waitFor(() => expect(eventSourceFactory).toHaveBeenCalledTimes(2));
+  });
+
+  it("Should preserve a visible message anchor when older history and a live delta arrive together", async () => {
+    const user = userEvent.setup();
+    transcriptMessages = [sessionTranscriptFixture[1]!];
+    transcriptFirstSequence = 20;
+    transcriptHasOlder = true;
+    transcriptNextBeforeSequence = 20;
+    olderTranscriptMessages = [sessionTranscriptFixture[0]!];
+    const olderResponse = createDeferred<Response>();
+    olderTranscriptResponsePromise = olderResponse.promise;
+    const sources: FakeSessionEventSource[] = [];
+    let olderResolved = false;
+    const anchorMessageId = sessionTranscriptFixture[1]!.id;
+
+    renderSessionThread({
+      eventSourceFactory: url => {
+        const source = new FakeSessionEventSource(url);
+        sources.push(source);
+        return source;
+      },
+    });
+
+    const loadOlder = await screen.findByRole("button", { name: "Load older messages" });
+    const viewport = screen.getByTestId("chat-view");
+    Object.defineProperty(viewport, "clientHeight", { configurable: true, value: 500 });
+    Object.defineProperty(viewport, "scrollHeight", {
+      configurable: true,
+      get: () => (olderResolved ? 1_500 : 1_000),
+    });
+    Object.defineProperty(viewport, "scrollTo", {
+      configurable: true,
+      value: (options: ScrollToOptions) => {
+        viewport.scrollTop = options.top ?? viewport.scrollTop;
+      },
+    });
+    viewport.scrollTop = 320;
+    fireEvent.wheel(viewport, { deltaY: -1 });
+    fireEvent.scroll(viewport);
+    const anchorRow = viewport.querySelector(`[data-message-id="${anchorMessageId}"]`);
+    expect(anchorRow).toBeInstanceOf(HTMLElement);
+
+    await user.click(loadOlder);
+    const liveMessage: TranscriptMessage = {
+      id: "anchor-live-delta",
+      role: "assistant",
+      parts: [{ type: "text", text: "Live delta while history loads.", state: "done" }],
+    };
+    act(() => {
+      sources[0]?.dispatch(
+        "transcript_delta",
+        {
+          cursor: 21,
+          entries: [{ message: liveMessage, sequence: 21, start_sequence: 21 }],
+          epoch: 1,
+          generation: 1,
+          has_more: false,
+          max_sequence: 21,
+          session_id: primarySessionFixture.id,
+        },
+        "21"
+      );
+    });
+    expect(await screen.findByText("Live delta while history loads.")).toBeInTheDocument();
+
+    olderResolved = true;
+    olderResponse.resolve(jsonResponse(transcriptPayload(olderTranscriptMessages)));
+
+    expect(
+      await screen.findByText("Summarize the launch blockers before the 18:30 UTC cutover.")
+    ).toBeInTheDocument();
+    await waitFor(() => {
+      expect(viewport.querySelector(`[data-message-id="${anchorMessageId}"]`)).toBe(anchorRow);
+      expect(viewport.scrollTop).toBeGreaterThanOrEqual(320);
+    });
+    expect(screen.queryByRole("button", { name: "Load older messages" })).not.toBeInTheDocument();
+  }, 10_000);
+
+  it("Should fail loudly when workspaceId is empty", () => {
+    const queryClient = createQueryClient();
+    expect(() =>
+      render(
+        <QueryClientProvider client={queryClient}>
+          <SessionChatRuntimeProvider sessionId={primarySessionFixture.id} workspaceId=" ">
+            <SessionThread
+              sessionId={primarySessionFixture.id}
+              agentName={primarySessionFixture.agent_name}
+              canPrompt
+              onCancelPrompt={() => {}}
+            />
+          </SessionChatRuntimeProvider>
+        </QueryClientProvider>
+      )
+    ).toThrow("SessionChatRuntimeProvider requires a non-empty workspaceId");
+  });
+
+  it("Should render retained Global history without a project or writable runtime", async () => {
+    const queryClient = createQueryClient();
+    const message: TranscriptMessage = {
+      id: "global-retained-answer",
+      role: "assistant",
+      parts: [{ type: "text", text: "Retained Global work.", state: "done" }],
+    };
+    fetchMock.mockImplementation((input: RequestInfo | URL) => {
+      const url = new URL(input instanceof Request ? input.url : String(input));
+      if (url.pathname === `/api/sessions/${primarySessionFixture.id}/transcript`) {
+        return Promise.resolve(jsonResponse(transcriptPayload([message])));
+      }
+      return Promise.resolve(new Response(null, { status: 404 }));
+    });
+    const eventSourceFactory = vi.fn((url: string) => new FakeSessionEventSource(url));
+    render(
+      <QueryClientProvider client={queryClient}>
+        <SessionChatRuntimeProvider
+          sessionId={primarySessionFixture.id}
+          workspaceId=""
+          readOnly
+          eventSourceFactory={eventSourceFactory}
+        >
+          <SessionThread
+            sessionId={primarySessionFixture.id}
+            workspaceId=""
+            agentName={primarySessionFixture.agent_name}
+            readOnly
+            canPrompt={false}
+            liveDataEnabled={false}
+          />
+        </SessionChatRuntimeProvider>
+      </QueryClientProvider>
+    );
+    expect(await screen.findByText("Retained Global work.")).toBeInTheDocument();
+    expect(screen.queryByTestId("composer-input")).not.toBeInTheDocument();
+    expect(eventSourceFactory).not.toHaveBeenCalled();
+    expect(
+      fetchMock.mock.calls.every(
+        ([input]) =>
+          new URL(input instanceof Request ? input.url : String(input)).pathname ===
+          `/api/sessions/${primarySessionFixture.id}/transcript`
+      )
+    ).toBe(true);
+  });
+
+  // Invariant: only a completed operator Goal draft stages the final proposal;
+  // it never submits automatically or overwrites text authored while waiting.
+  // Owning layer and canonical suite: this chat-runtime/composer integration.
+  it.each([false, true])(
+    "Should stage a completed Goal draft while protecting authored text (%s)",
+    async preserveAuthored => {
+      const proposal =
+        "Report the workspace ID.\nverify: the ID matches kickoff.md\nconstraints: no file changes";
+      const openPrompt = openSseResponse([
+        'data: {"type":"start","messageId":"draft-answer"}\n\n',
+        'data: {"type":"text-start","id":"planning"}\n\n',
+        'data: {"type":"text-delta","id":"planning","delta":"I will propose an objective."}\n\n',
+        'data: {"type":"text-end","id":"planning"}\n\n',
+        'data: {"type":"text-start","id":"proposal"}\n\n',
+        `data: ${JSON.stringify({ type: "text-delta", id: "proposal", delta: proposal })}\n\n`,
+      ]);
+      promptResponsePromise = Promise.resolve(openPrompt.response);
+      const user = userEvent.setup();
+      renderSessionThread({ eventSourceFactory: url => new FakeSessionEventSource(url) });
+      await screen.findByTestId("composer-input");
+      await setComposerText("/goal draft Report the workspace identity without edits");
+      await user.click(screen.getByTestId("composer-send-button"));
+      await waitFor(() => expect(countPromptFetches(fetchMock)).toBe(1));
+      if (preserveAuthored) await setComposerText("Keep my own next message");
+      openPrompt.close([
+        'data: {"type":"text-end","id":"proposal"}\n\n',
+        'data: {"type":"finish","finishReason":"stop"}\n\n',
+        "data: [DONE]\n\n",
+      ]);
+      await waitFor(() => expect(screen.getByTestId("composer-send-button")).toBeEnabled());
+      await waitFor(() =>
+        expect(composerText()).toBe(
+          preserveAuthored ? "Keep my own next message" : `/goal ${proposal}`
+        )
+      );
+      expect(countPromptFetches(fetchMock)).toBe(1);
+    }
+  );
+
+  it.each(["ordinary", "unfinished", "cancelled"])(
+    "Should not prefill an %s answer as a Goal",
+    async outcome => {
+      const openPrompt = openSseResponse([
+        'data: {"type":"start","messageId":"not-a-complete-draft"}\n\n',
+        'data: {"type":"text-start","id":"proposal"}\n\n',
+        'data: {"type":"text-delta","id":"proposal","delta":"A proposed objective"}\n\n',
+      ]);
+      promptResponsePromise = Promise.resolve(openPrompt.response);
+      const user = userEvent.setup();
+      renderSessionThread({ eventSourceFactory: url => new FakeSessionEventSource(url) });
+      await screen.findByTestId("composer-input");
+      await setComposerText(
+        outcome === "ordinary" ? "Propose an objective" : "/goal draft Propose an objective"
+      );
+      await user.click(screen.getByTestId("composer-send-button"));
+      await screen.findByText("A proposed objective");
+      if (outcome === "cancelled") {
+        await user.click(screen.getByTestId("composer-stop-button"));
+      } else {
+        openPrompt.close(
+          outcome === "ordinary"
+            ? [
+                'data: {"type":"text-end","id":"proposal"}\n\n',
+                'data: {"type":"finish","finishReason":"stop"}\n\n',
+                "data: [DONE]\n\n",
+              ]
+            : []
+        );
+      }
+      await waitFor(() =>
+        expect(screen.queryByTestId("composer-stop-button")).not.toBeInTheDocument()
+      );
+      expect(composerText()).toBe("");
+      expect(countPromptFetches(fetchMock)).toBe(1);
+    }
+  );
+
+  it("Should mint a fresh gateway ticket for every remote prompt", async () => {
+    streamTickets = ["prompt-ticket-one", "prompt-ticket-two"];
+    const user = userEvent.setup();
+    renderSessionThread({ eventSourceFactory: url => new FakeSessionEventSource(url) });
+
+    await screen.findByTestId("composer-input");
+    await setComposerText("First remote prompt");
+    await user.click(screen.getByTestId("composer-send-button"));
+    await waitFor(() => expect(countPromptFetches(fetchMock)).toBe(1));
+
+    await setComposerText("Second remote prompt");
+    await waitFor(() => expect(screen.getByTestId("composer-send-button")).toBeEnabled());
+    await user.click(screen.getByTestId("composer-send-button"));
+    await waitFor(() => expect(countPromptFetches(fetchMock)).toBe(2));
+
+    const promptTickets = fetchMock.mock.calls
+      .map(([input]) => getRequestURL(input as RequestInfo | URL))
+      .filter(url => url.pathname.endsWith("/prompt"))
+      .map(url => url.searchParams.get("ticket"));
+    expect(promptTickets).toEqual(["prompt-ticket-one", "prompt-ticket-two"]);
+  });
+
+  // Invariant: a user prompt preempts optional model-catalog reads so browser
+  // connection pressure cannot keep the prompt from reaching the daemon.
+  // Owning layer: chat-runtime provider integration. Canonical suite: this file.
+  it("Should cancel an in-flight model catalog read before dispatching a prompt", async () => {
+    const queryClient = createQueryClient();
+    const catalogStarted = createDeferred<void>();
+    let catalogSignal: AbortSignal | undefined;
+    const catalogQuery = queryClient.fetchQuery({
+      queryKey: modelCatalogKeys.allModels("all", undefined, undefined, true),
+      queryFn: ({ signal }) => {
+        catalogSignal = signal;
+        catalogStarted.resolve();
+        return new Promise<never>((_resolve, reject) => {
+          signal.addEventListener(
+            "abort",
+            () => reject(new DOMException("The operation was aborted", "AbortError")),
+            { once: true }
+          );
+        });
+      },
+    });
+    void catalogQuery.catch(() => undefined);
+    await catalogStarted.promise;
+
+    const user = userEvent.setup();
+    renderSessionThread({ queryClient });
+    await screen.findByTestId("composer-input");
+    await setComposerText("Prompt while provider discovery is slow");
+    await user.click(screen.getByTestId("composer-send-button"));
+
+    await waitFor(() => expect(countPromptFetches(fetchMock)).toBe(1));
+    expect(catalogSignal?.aborted).toBe(true);
+  });
+
+  // Invariant: the prompt response replaces the transcript live tail while it
+  // is active, leaving one browser connection available for control requests.
+  // Owning layer: chat-runtime provider integration. Canonical suite: this file.
+  it("Should suspend the transcript live tail while a prompt stream is active", async () => {
+    vi.useFakeTimers({ toFake: ["setInterval", "clearInterval"] });
+    const promptResponse = openSseResponse([
+      'data: {"type":"start","messageId":"control-slot-turn"}\n\n',
+    ]);
+    promptResponsePromise = Promise.resolve(promptResponse.response);
+    const sources: FakeSessionEventSource[] = [];
+    const user = userEvent.setup();
+
+    renderSessionThread({
+      eventSourceFactory: url => {
+        const source = new FakeSessionEventSource(url);
+        sources.push(source);
+        return source;
+      },
+    });
+    await waitFor(() => expect(sources).toHaveLength(1));
+    expect(sources[0]?.closed).toBe(false);
+    const initialClarificationFetches = countClarificationFetches(fetchMock);
+
+    await setComposerText("Keep one control connection available");
+    await user.click(screen.getByTestId("composer-send-button"));
+    await waitFor(() => {
+      expect(countPromptFetches(fetchMock)).toBe(1);
+      expect(sources[0]?.closed).toBe(true);
+    });
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(1_000);
+    });
+    await waitFor(() =>
+      expect(countClarificationFetches(fetchMock)).toBeGreaterThan(initialClarificationFetches)
+    );
+
+    await act(async () => {
+      promptResponse.close([
+        'data: {"type":"finish","finishReason":"stop"}\n\n',
+        "data: [DONE]\n\n",
+      ]);
+    });
+    await waitFor(() => {
+      expect(sources).toHaveLength(2);
+      expect(sources[1]?.closed).toBe(false);
+    });
+  });
+
+  // Invariant (Part II POST topology, IT-048 client half): while the prompt POST streams,
+  // the transcript SSE stays closed and a bounded 1s control poll — session detail, queue,
+  // pending decisions — owns control-plane freshness; it stops at settle, when the tail
+  // reopens at the durable cursor with its fences.
+  // Owning layer: runtime extensions. Canonical suite: this file.
+  it("Should run the 1s control poll only for the POST's duration and hand off at settle", async () => {
+    vi.useFakeTimers({ toFake: ["setInterval", "clearInterval"] });
+    const promptResponse = openSseResponse([
+      'data: {"type":"start","messageId":"control-poll-turn"}\n\n',
+    ]);
+    promptResponsePromise = Promise.resolve(promptResponse.response);
+    const sources: FakeSessionEventSource[] = [];
+    const user = userEvent.setup();
+
+    renderSessionThread({
+      eventSourceFactory: url => {
+        const source = new FakeSessionEventSource(url);
+        sources.push(source);
+        return source;
+      },
+    });
+    await waitFor(() => expect(sources).toHaveLength(1));
+    await setComposerText("Keep the control plane fresh");
+    await user.click(screen.getByTestId("composer-send-button"));
+    await waitFor(() => {
+      expect(countPromptFetches(fetchMock)).toBe(1);
+      expect(sources[0]?.closed).toBe(true);
+    });
+    const queueBefore = countQueueFetches(fetchMock);
+    const detailBefore = countSessionDetailFetches(fetchMock);
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(1_000);
+    });
+    await waitFor(() => {
+      expect(countQueueFetches(fetchMock)).toBeGreaterThan(queueBefore);
+      expect(countSessionDetailFetches(fetchMock)).toBeGreaterThan(detailBefore);
+    });
+
+    await act(async () => {
+      promptResponse.close([
+        'data: {"type":"finish","finishReason":"stop"}\n\n',
+        "data: [DONE]\n\n",
+      ]);
+    });
+    await waitFor(() => {
+      expect(sources).toHaveLength(2);
+      expect(sources[1]?.closed).toBe(false);
+    });
+    // The reopened tail resumes from the durable cursor with its fences (settle handoff).
+    const reopened = new URL(sources[1]!.url, "http://localhost");
+    expect(reopened.searchParams.get("after_sequence")).toBe("2");
+    expect(reopened.searchParams.get("epoch")).toBe("1");
+    expect(reopened.searchParams.get("generation")).toBe("1");
+    // The bounded poll stops once the POST settled: no new queue rereads after the handoff quiets.
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(1_600);
+    });
+    const queueAfterSettle = countQueueFetches(fetchMock);
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(1_200);
+    });
+    expect(countQueueFetches(fetchMock)).toBe(queueAfterSettle);
+  });
+
+  // Invariant (Part II POST topology, IT-046 client half): a prompt POST that never got an
+  // answer is retained as pending-ack by identity — the draft is not restored as if unsent —
+  // and the live tail reopens immediately to catch up by cursor.
+  // Owning layer: chat runtime + dispatch store. Canonical suite: this file.
+  it("Should retain a prompt whose POST got no answer as pending-ack and reopen the tail at once", async () => {
+    const lost = createDeferred<Response>();
+    promptResponsePromise = lost.promise;
+    const unconfirmed: string[] = [];
+    const sources: FakeSessionEventSource[] = [];
+    const user = userEvent.setup();
+
+    renderSessionThread({
+      eventSourceFactory: url => {
+        const source = new FakeSessionEventSource(url);
+        sources.push(source);
+        return source;
+      },
+      onUnconfirmedSend: messageId => unconfirmed.push(messageId),
+    });
+    await waitFor(() => expect(sources).toHaveLength(1));
+    await setComposerText("Lost in transit");
+    await user.click(screen.getByTestId("composer-send-button"));
+
+    await waitFor(() => expect(countPromptFetches(fetchMock)).toBe(1));
+    lost.reject(new TypeError("Failed to fetch"));
+    await waitFor(() => expect(unconfirmed).toHaveLength(1));
+    expect(unconfirmed[0]).toBe(lastPromptMessageID);
+    // Not a rejection: the draft is not restored, the identity is what Retry replays.
+    await waitFor(() => expect(sources).toHaveLength(2));
+    expect(sources[1]?.closed).toBe(false);
+    expect(composerText()).toBe("");
+  });
+
+  // Invariant (task_06 req. 5, mid-POST disconnect after acceptance): a 2xx answer accepted
+  // the turn; if the body then breaks or ends before a terminal frame, the turn continues
+  // detached — no unconfirmed row, no restored duplicate draft — and the tail reopens at once.
+  it("Should treat a body error after an accepted answer as a detached turn, not a lost send", async () => {
+    const encoder = new TextEncoder();
+    promptResponsePromise = Promise.resolve(
+      new Response(
+        new ReadableStream({
+          start(controller) {
+            controller.enqueue(
+              encoder.encode('data: {"type":"start","messageId":"accepted-then-broken"}\n\n')
+            );
+            controller.error(new Error("socket hung up mid-body"));
+          },
+        }),
+        {
+          headers: {
+            "Content-Type": "text/event-stream",
+            "x-vercel-ai-ui-message-stream": "v1",
+          },
+        }
+      )
+    );
+    const unconfirmed: string[] = [];
+    const sources: FakeSessionEventSource[] = [];
+    const user = userEvent.setup();
+    renderSessionThread({
+      eventSourceFactory: url => {
+        const source = new FakeSessionEventSource(url);
+        sources.push(source);
+        return source;
+      },
+      onUnconfirmedSend: messageId => unconfirmed.push(messageId),
+    });
+    await waitFor(() => expect(sources).toHaveLength(1));
+    await setComposerText("Accepted then broken");
+    await user.click(screen.getByTestId("composer-send-button"));
+
+    await waitFor(() => expect(countPromptFetches(fetchMock)).toBe(1));
+    await waitFor(() => expect(sources).toHaveLength(2));
+    expect(sources[0]?.closed).toBe(true);
+    expect(sources[1]?.closed).toBe(false);
+    expect(composerText()).toBe("");
+    expect(unconfirmed).toEqual([]);
+  });
+
+  it("Should treat a premature stream end before a terminal frame as a detached turn", async () => {
+    const openPrompt = openSseResponse([
+      'data: {"type":"start","messageId":"accepted-then-eof"}\n\n',
+      'data: {"type":"text-start","id":"t1"}\n\n',
+      'data: {"type":"text-delta","id":"t1","delta":"Half a "}\n\n',
+    ]);
+    promptResponsePromise = Promise.resolve(openPrompt.response);
+    const unconfirmed: string[] = [];
+    const sources: FakeSessionEventSource[] = [];
+    const user = userEvent.setup();
+    renderSessionThread({
+      eventSourceFactory: url => {
+        const source = new FakeSessionEventSource(url);
+        sources.push(source);
+        return source;
+      },
+      onUnconfirmedSend: messageId => unconfirmed.push(messageId),
+    });
+    await waitFor(() => expect(sources).toHaveLength(1));
+    await setComposerText("Accepted then cut");
+    await user.click(screen.getByTestId("composer-send-button"));
+    await waitFor(() => expect(sources[0]?.closed).toBe(true));
+
+    // EOF with no finish frame and no [DONE].
+    openPrompt.close([]);
+    await waitFor(() => expect(sources).toHaveLength(2));
+    expect(sources[1]?.closed).toBe(false);
+    expect(composerText()).toBe("");
+    expect(unconfirmed).toEqual([]);
+    expect(countPromptFetches(fetchMock)).toBe(1);
+  });
+
+  // Invariant: a 5xx after headers is not an authoritative admission answer — the daemon
+  // may have recorded the send — so the identity is retained as pending-ack, like no answer.
+  it("Should retain a prompt answered with a 5xx as pending-ack instead of restoring the draft", async () => {
+    promptResponsePromise = Promise.resolve(
+      jsonResponse({ error: "gateway timeout" }, { status: 504 })
+    );
+    const unconfirmed: string[] = [];
+    const user = userEvent.setup();
+    renderSessionThread({
+      eventSourceFactory: url => new FakeSessionEventSource(url),
+      onUnconfirmedSend: messageId => unconfirmed.push(messageId),
+    });
+    await screen.findByTestId("composer-input");
+    await setComposerText("Timed out at the gateway");
+    await user.click(screen.getByTestId("composer-send-button"));
+
+    await waitFor(() => expect(unconfirmed).toHaveLength(1));
+    expect(unconfirmed[0]).toBe(lastPromptMessageID);
+    expect(composerText()).toBe("");
+  });
+
+  it("Should report a revoked device response from the prompt transport", async () => {
+    streamTickets = ["prompt-ticket"];
+    promptResponsePromise = Promise.resolve(
+      jsonResponse(
+        { error: "Device revoked", code: "gateway_device_revoked" },
+        {
+          status: 401,
+          headers: {
+            "Content-Type": "application/json",
+            "X-Compozy-Gateway-Tier": "private",
+          },
+        }
+      )
+    );
+    const signals: GatewayAccessSignal[] = [];
+    const unsubscribe = observeGatewayAccess(signal => signals.push(signal));
+    const user = userEvent.setup();
+
+    try {
+      renderSessionThread({ eventSourceFactory: url => new FakeSessionEventSource(url) });
+      await screen.findByTestId("composer-input");
+      await setComposerText("Prompt from a revoked device");
+      await user.click(screen.getByTestId("composer-send-button"));
+
+      await waitFor(() => expect(signals).toEqual(["revoked"]));
+      // The refusal returns the draft; let that settle before cleanup unmounts the composer.
+      await waitFor(() => expect(composerText()).toBe("Prompt from a revoked device"));
+    } finally {
+      unsubscribe();
+    }
+  });
+
+  it("Should not restore an attachment after the daemon accepted a stream that later fails", async () => {
+    const encoder = new TextEncoder();
+    promptResponsePromise = Promise.resolve(
+      new Response(
+        new ReadableStream({
+          start(controller) {
+            controller.enqueue(
+              encoder.encode('data: {"type":"start","messageId":"accepted-stream"}\n\n')
+            );
+            controller.error(new Error("stream disconnected after acceptance"));
+          },
+        }),
+        {
+          headers: {
+            "Content-Type": "text/event-stream",
+            "x-vercel-ai-ui-message-stream": "v1",
+          },
+        }
+      )
+    );
+    const user = userEvent.setup();
+    renderSessionThread();
+
+    await screen.findByTestId("composer-input");
+    await setComposerText("Accepted attachment");
+    await act(async () => {
+      await requireComposerAui().composer.addAttachment(
+        new File(["notes"], "notes.txt", { type: "text/plain" })
+      );
+    });
+    await user.click(screen.getByTestId("composer-send-button"));
+
+    await waitFor(() => expect(countPromptFetches(fetchMock)).toBe(1));
+    await waitFor(() => expect(composerText()).toBe(""));
+    expect(screen.queryByTestId("composer-attachment-tile")).not.toBeInTheDocument();
+  });
+
+  // Invariant (issue #815): a refused draft returns whole — its own text and files — and
+  // never overwrites or merges into a newer draft the operator is writing; it waits for
+  // the composer to be free.
+  it("Should hold a refused draft while a newer draft occupies the composer, then restore it whole", async () => {
+    const rejection = createDeferred<Response>();
+    promptResponsePromise = rejection.promise;
+    const user = userEvent.setup();
+    renderSessionThread();
+
+    await screen.findByTestId("composer-input");
+    await setComposerText("Rejected attachment");
+    await act(async () => {
+      await requireComposerAui().composer.addAttachment(
+        new File(["notes"], "notes.txt", { type: "text/plain" })
+      );
+    });
+    await user.click(screen.getByTestId("composer-send-button"));
+    await waitFor(() => expect(countPromptFetches(fetchMock)).toBe(1));
+    await setComposerText("Newer draft");
+    rejection.resolve(jsonResponse({ error: "prompt rejected" }, { status: 422 }));
+
+    await act(async () => {
+      await new Promise(resolve => window.setTimeout(resolve, 50));
+    });
+    expect(composerText()).toBe("Newer draft");
+    expect(screen.queryByTestId("composer-attachment-tile")).not.toBeInTheDocument();
+
+    await setComposerText("");
+    await waitFor(() => expect(composerText()).toBe("Rejected attachment"));
+    expect(await screen.findByTestId("composer-attachment-tile")).toBeInTheDocument();
+  });
+
+  // Invariant: rejected prompt files return to the composer in the draft's
+  // original order, even when an earlier upload has not finished yet.
+  // Owning layer: SessionPromptRecoveryBridge in the runtime provider.
+  // Canonical suite: this session chat runtime provider integration suite.
+  it("Should restore rejected attachments sequentially in draft order", async () => {
+    const rejection = createDeferred<Response>();
+    promptResponsePromise = rejection.promise;
+    let initialUpload = 0;
+    attachmentUploadResponse = async () => {
+      initialUpload += 1;
+      return uploadedAttachmentResponse(
+        initialUpload === 1 ? "first.txt" : "second.txt",
+        initialUpload === 1 ? "a" : "b"
+      );
+    };
+    const user = userEvent.setup();
+    renderSessionThread();
+
+    await screen.findByTestId("composer-input");
+    await setComposerText("Rejected ordered attachments");
+    await act(async () => {
+      await requireComposerAui().composer.addAttachment(
+        new File(["first"], "first.txt", { type: "text/plain" })
+      );
+      await requireComposerAui().composer.addAttachment(
+        new File(["second"], "second.txt", { type: "text/plain" })
+      );
+    });
+    await user.click(screen.getByTestId("composer-send-button"));
+    await waitFor(() => expect(countPromptFetches(fetchMock)).toBe(1));
+
+    const firstRestore = createDeferred<Response>();
+    let restoredUploadCount = 0;
+    attachmentUploadResponse = () => {
+      restoredUploadCount += 1;
+      if (restoredUploadCount === 1) return firstRestore.promise;
+      return Promise.resolve(uploadedAttachmentResponse("second.txt", "d"));
+    };
+    rejection.resolve(jsonResponse({ error: "prompt rejected" }, { status: 422 }));
+
+    await waitFor(() => expect(restoredUploadCount).toBe(1));
+    firstRestore.resolve(uploadedAttachmentResponse("first.txt", "c"));
+    await waitFor(() => expect(restoredUploadCount).toBe(2));
+    await waitFor(() =>
+      expect(
+        requireComposerAui()
+          .composer.getState()
+          .attachments.map(attachment => attachment.name)
+      ).toEqual(["first.txt", "second.txt"])
+    );
+  });
+
+  // Invariant (issue #815): a prompt's draft is consumed only by the daemon's
+  // acceptance. A runtime torn down mid-POST (navigation, a profile switch)
+  // neither aborts the admission nor drops the draft: a refusal names its
+  // reason and returns the text and files to that session's next composer.
+  // Owning layer: chat-runtime provider integration. Canonical suite: this file.
+  it("Should return a refused prompt's draft and files to its session after the runtime closed mid-request", async () => {
+    const refusal = createDeferred<Response>();
+    promptResponsePromise = refusal.promise;
+    render(<Toaster duration={5_000} />);
+    const user = userEvent.setup();
+    const first = renderSessionThread();
+
+    await screen.findByTestId("composer-input");
+    await setComposerText("Orchestrate issue 815");
+    await act(async () => {
+      await requireComposerAui().composer.addAttachment(
+        new File(["shot"], "shot.png", { type: "image/png" })
+      );
+    });
+    await user.click(screen.getByTestId("composer-send-button"));
+    await waitFor(() => expect(countPromptFetches(fetchMock)).toBe(1));
+    const promptRequest = fetchMock.mock.calls.find(([input]) =>
+      getPathname(input as RequestInfo | URL).endsWith("/prompt")
+    );
+
+    first.unmount();
+    expect((promptRequest?.[1] as RequestInit | undefined)?.signal?.aborted).toBe(false);
+    refusal.resolve(
+      jsonResponse(
+        {
+          error: "command: unavailable: /cy-orquestrate-issue",
+          code: "prompt_dispatch_indeterminate",
+        },
+        { status: 409 }
+      )
+    );
+    expect(
+      await screen.findByText(
+        "Message not sent: command: unavailable: /cy-orquestrate-issue. Your draft was kept."
+      )
+    ).toBeInTheDocument();
+
+    renderSessionThread();
+    await screen.findByTestId("composer-input");
+    await waitFor(() => expect(composerText()).toBe("Orchestrate issue 815"));
+    expect(await screen.findByTestId("composer-attachment-tile")).toBeInTheDocument();
+  });
+
+  it("Should restore two refused drafts separately instead of folding the later one into the first", async () => {
+    const scope = { workspaceId: fixtureWorkspaceId(), sessionId: primarySessionFixture.id };
+    const prompt = (id: string, text: string) => ({
+      messages: [{ id, parts: [{ text, type: "text" as const }], role: "user" as const }],
+    });
+    renderSessionThread();
+    await screen.findByTestId("composer-input");
+
+    sessionPromptRecovery.stage(scope, "refused-first", prompt("refused-first", "First refused"));
+    sessionPromptRecovery.stage(
+      scope,
+      "refused-second",
+      prompt("refused-second", "Second refused")
+    );
+    act(() => {
+      sessionPromptRecovery.recover(scope, "refused-first", [
+        new File(["a"], "first.txt", { type: "text/plain" }),
+      ]);
+      sessionPromptRecovery.recover(scope, "refused-second", [
+        new File(["b"], "second.txt", { type: "text/plain" }),
+      ]);
+    });
+
+    await waitFor(() => expect(composerText()).toBe("First refused"));
+    await waitFor(() =>
+      expect(
+        requireComposerAui()
+          .composer.getState()
+          .attachments.map(attachment => attachment.name)
+      ).toEqual(["first.txt"])
+    );
+
+    await act(async () => {
+      requireComposerAui().composer.setText("");
+      await requireComposerAui().composer.clearAttachments();
+    });
+    await waitFor(() => expect(composerText()).toBe("Second refused"));
+    await waitFor(() =>
+      expect(
+        requireComposerAui()
+          .composer.getState()
+          .attachments.map(attachment => attachment.name)
+      ).toEqual(["second.txt"])
+    );
+  });
+
+  it("Should keep the draft as unconfirmed, not refused, when a closed runtime's prompt gets a 5xx", async () => {
+    const answer = createDeferred<Response>();
+    promptResponsePromise = answer.promise;
+    render(<Toaster duration={5_000} />);
+    const user = userEvent.setup();
+    const first = renderSessionThread();
+
+    await screen.findByTestId("composer-input");
+    await setComposerText("Maybe recorded");
+    await user.click(screen.getByTestId("composer-send-button"));
+    await waitFor(() => expect(countPromptFetches(fetchMock)).toBe(1));
+
+    first.unmount();
+    answer.resolve(jsonResponse({ error: "gateway timeout" }, { status: 504 }));
+    expect(
+      await screen.findByText("Couldn't confirm the message was sent. Your draft was kept.")
+    ).toBeInTheDocument();
+    expect(screen.queryByText(/Message not sent/)).not.toBeInTheDocument();
+
+    renderSessionThread();
+    await screen.findByTestId("composer-input");
+    await waitFor(() => expect(composerText()).toBe("Maybe recorded"));
+  });
+
+  it("Should consume the draft when a prompt left by a closed runtime is accepted", async () => {
+    const acceptance = createDeferred<Response>();
+    promptResponsePromise = acceptance.promise;
+    const user = userEvent.setup();
+    const first = renderSessionThread();
+
+    await screen.findByTestId("composer-input");
+    await setComposerText("Accepted after leaving");
+    await user.click(screen.getByTestId("composer-send-button"));
+    await waitFor(() => expect(countPromptFetches(fetchMock)).toBe(1));
+
+    first.unmount();
+    acceptance.resolve(sseResponse([]));
+    await act(async () => {
+      await acceptance.promise;
+    });
+
+    renderSessionThread();
+    await screen.findByTestId("composer-input");
+    await act(async () => {
+      await new Promise(resolve => window.setTimeout(resolve, 0));
+    });
+    expect(composerText()).toBe("");
+    expect(screen.queryByTestId("composer-attachment-tile")).not.toBeInTheDocument();
+  });
+
+  // Invariant (#1142): a missing attachment returns the complete draft, re-uploads
+  // its retained file, and renders recovery copy instead of the HTTP JSON envelope.
+  // Owner: chat runtime; canonical suite: this provider integration suite.
+  it.each(["retry", "remove", "clear", "reopen", "remove-pending"])(
+    "Should recover a missing image with persistent feedback until %s",
+    async outcome => {
+      promptResponsePromise = Promise.resolve(
+        jsonResponse(
+          {
+            error: 'session: open prompt attachment "image.png": attachments: attachment not found',
+          },
+          { status: 404 }
+        )
+      );
+      // Distinct boundary responses prove retry consumes the fresh upload result.
+      // A real content-addressed store normally returns the same ID for unchanged bytes.
+      // Node Request cannot encode JSDOM Files; observe the actual multipart file boundary.
+      const multipartAppend = vi.spyOn(FormData.prototype, "append");
+      onTestFinished(() => multipartAppend.mockRestore());
+      let uploadCount = 0;
+      const delayedUpload = createDeferred<Response>();
+      let recoveredResponse: Response | undefined;
+      attachmentUploadResponse = async () => {
+        uploadCount += 1;
+        const response = await uploadedAttachmentResponse(
+          "image.png",
+          uploadCount === 1 ? "a" : "b"
+        ).json();
+        const reply = jsonResponse(
+          {
+            attachment: {
+              ...response.attachment,
+              kind: "image",
+              mime_type: "image/png",
+              height: 10,
+              width: 10,
+            },
+          },
+          { status: 201 }
+        );
+        if (uploadCount === 2 && outcome === "remove-pending") {
+          recoveredResponse = reply;
+          return delayedUpload.promise;
+        }
+        return reply;
+      };
+      const user = userEvent.setup();
+      const view = renderSessionThread({ includeToaster: true });
+      await screen.findByTestId("composer-input");
+      await setComposerText("Describe this image");
+      await act(async () => {
+        await requireComposerAui().composer.addAttachment(
+          new File(["image bytes"], "image.png", { type: "image/png" })
+        );
+      });
+      await user.click(screen.getByTestId("composer-send-button"));
+      await waitFor(() => expect(composerText()).toBe("Describe this image"));
+      expect(await screen.findByTestId("composer-attachment-tile")).toBeInTheDocument();
+      await waitFor(() => expect(uploadCount).toBe(2));
+      const uploads = fetchMock.mock.calls.filter(([input]) =>
+        getPathname(input).endsWith("/attachments")
+      );
+      expect(uploads).toHaveLength(2);
+      const fileParts = multipartAppend.mock.calls.filter(([field]) => field === "file");
+      const retryFile = fileParts[1]![1] as File;
+      expect(retryFile.name).toBe("image.png");
+      const retryBytes = await new Promise<string>((resolve, reject) => {
+        const reader = new FileReader();
+        reader.onload = () => resolve(String(reader.result));
+        reader.onerror = () => reject(reader.error);
+        reader.readAsText(retryFile);
+      });
+      expect(retryBytes).toBe("image bytes");
+      if (outcome === "remove-pending") {
+        await waitFor(() => expect(uploadCount).toBe(2));
+        await act(async () => {
+          const attachment = requireComposerAui().composer.getState().attachments[0]!;
+          await requireComposerAui().composer.attachment({ id: attachment.id }).remove();
+        });
+        await act(async () => {
+          delayedUpload.resolve(recoveredResponse!);
+        });
+        expect(screen.queryByTestId("composer-feedback-note")).not.toBeInTheDocument();
+        return;
+      }
+      const feedback = await screen.findByTestId("composer-feedback-note");
+      expect(feedback).toHaveTextContent(
+        "An attachment is no longer available. Send again to upload the retained file"
+      );
+      await act(async () => {
+        toast.dismiss();
+      });
+      expect(feedback).toBeInTheDocument();
+      expect(document.body.textContent).not.toContain('{"error"');
+      // A refused prompt belongs only in the recovered draft, never in the thread.
+      const sentImageBubbles = () =>
+        screen
+          .queryAllByTestId("user-message-bubble")
+          .filter(bubble => bubble.textContent?.includes("Describe this image"));
+      await waitFor(() => expect(sentImageBubbles()).toHaveLength(0));
+      if (outcome === "reopen") {
+        view.unmount();
+        renderSessionThread({ includeToaster: true });
+        await screen.findByTestId("composer-attachment-tile");
+        expect(await screen.findByTestId("composer-feedback-note")).toHaveTextContent(
+          "An attachment is no longer available"
+        );
+      }
+      if (outcome === "remove" || outcome === "clear") {
+        if (outcome === "clear")
+          await act(async () => {
+            await requireComposerAui().composer.reset();
+          });
+        else
+          await act(async () => {
+            const attachment = requireComposerAui().composer.getState().attachments[0]!;
+            await requireComposerAui().composer.attachment({ id: attachment.id }).remove();
+          });
+        await waitFor(() =>
+          expect(screen.queryByTestId("composer-feedback-note")).not.toBeInTheDocument()
+        );
+        return;
+      }
+      promptResponsePromise = null;
+      await user.click(screen.getByTestId("composer-send-button"));
+      await waitFor(() => expect(countPromptFetches(fetchMock)).toBe(2));
+      const prompts = fetchMock.mock.calls.filter(([input]) =>
+        getPathname(input).endsWith("/prompt")
+      );
+      const initialBody = JSON.parse(String(prompts[0]?.[1]?.body));
+      expect(initialBody.attachments).toEqual([
+        expect.objectContaining({ id: `att_${"a".repeat(64)}`, name: "image.png" }),
+      ]);
+      const retryBody = JSON.parse(String(prompts[1]?.[1]?.body));
+      expect(retryBody.attachments).toEqual([
+        expect.objectContaining({ id: `att_${"b".repeat(64)}`, name: "image.png" }),
+      ]);
+      await screen.findByText("Live runtime answer before transcript reconciliation.");
+      await waitFor(() => expect(sentImageBubbles()).toHaveLength(1));
+      expect(screen.queryByTestId("composer-feedback-note")).not.toBeInTheDocument();
+      await waitFor(() =>
+        expect(screen.queryByText(/Message not sent: An attachment/)).not.toBeInTheDocument()
+      );
+    }
+  );
+
+  it("Should name the daemon's reason when it refuses a prompt", async () => {
+    promptResponsePromise = Promise.resolve(
+      jsonResponse({ error: "session is archived" }, { status: 409 })
+    );
+    const user = userEvent.setup();
+    renderSessionThread({ includeToaster: true });
+
+    await screen.findByTestId("composer-input");
+    await setComposerText("Refused in place");
+    await user.click(screen.getByTestId("composer-send-button"));
+
+    expect(
+      await screen.findByText("Message not sent: session is archived. Your draft was kept.")
+    ).toBeInTheDocument();
+    await waitFor(() => expect(composerText()).toBe("Refused in place"));
+  });
+
+  // Invariant (UT-105, US-019.EC-1 / US-009.EC-4): cancelling a prompt never
+  // changes the runtime identity — no remount — so the transport settles while
+  // the composer draft and the runtime subtree stay in place. Owning layer:
+  // chat-runtime provider integration. Canonical suite: this file.
+  it("UT-105: Should settle a cancelled prompt without remounting the runtime or losing the draft", async () => {
+    const promptResponse = createDeferred<Response>();
+    const onCancelPrompt = vi.fn();
+    const onRuntimeMount = vi.fn();
+    const user = userEvent.setup();
+    promptResponsePromise = promptResponse.promise;
+
+    renderSessionThread({ onCancelPrompt, onRuntimeMount });
+
+    try {
+      await screen.findByTestId("composer-input");
+      await waitFor(() => expect(onRuntimeMount).toHaveBeenCalledOnce());
+      const runtimeBeforeCancel = requireComposerAui();
+
+      await setComposerText("cancel this one");
+      await user.click(screen.getByTestId("composer-send-button"));
+      await waitFor(() => expect(countPromptFetches(fetchMock)).toBe(1));
+      const promptRequest = fetchMock.mock.calls.find(([input]) =>
+        getPathname(input as RequestInfo | URL).endsWith("/prompt")
+      );
+      expect(await screen.findByText("cancel this one")).toBeInTheDocument();
+      // The operator keeps typing while the turn runs: that draft is theirs.
+      await setComposerText("next question, kept");
+
+      await user.click(screen.getByTestId("composer-stop-button"));
+
+      expect(onCancelPrompt).toHaveBeenCalledTimes(1);
+      await waitFor(() => {
+        expect((promptRequest?.[1] as RequestInit | undefined)?.signal?.aborted).toBe(true);
+        expect(screen.queryByTestId("composer-stop-button")).not.toBeInTheDocument();
+      });
+      expect(onRuntimeMount).toHaveBeenCalledOnce();
+      expect(requireComposerAui()).toBe(runtimeBeforeCancel);
+      expect(composerText()).toBe("next question, kept");
+      // The interrupted turn stays on screen at the point it was stopped.
+      expect(screen.getByText("cancel this one")).toBeInTheDocument();
+    } finally {
+      promptResponse.resolve(sseResponse([]));
+    }
+  });
+
+  it("Should retain completed work counts through prompt cancellation and transcript handoff", async () => {
+    // Invariant: canceling the transport cannot erase already acknowledged work.
+    // Owner: runtime/transcript handoff; canonical suite: this file.
+    const frames = [{ type: "start", messageId: "cancel-work-turn" }];
+    const toolFrames = [1, 2, 3].flatMap(index => [
+      {
+        type: "tool-input-available",
+        toolCallId: `cancel-call-${index}`,
+        toolName: "Bash",
+        input: { command: `echo ${index}` },
+      },
+      ...(index < 3
+        ? [
+            {
+              type: "tool-output-available",
+              toolCallId: `cancel-call-${index}`,
+              output: { stdout: String(index) },
+            },
+          ]
+        : []),
+    ]);
+    const openPrompt = openSseResponse(
+      [...frames, ...toolFrames].map(frame => `data: ${JSON.stringify(frame)}\n\n`)
+    );
+    promptResponsePromise = Promise.resolve(openPrompt.response);
+    const user = userEvent.setup();
+    renderSessionThread({
+      onCancelPrompt: vi.fn(),
+      eventSourceFactory: url => new FakeSessionEventSource(url),
+    });
+    await screen.findByTestId("composer-input");
+    await setComposerText("Check the three commands");
+    await user.click(screen.getByTestId("composer-send-button"));
+    const summary = await screen.findByTestId("work-summary-label");
+    expect(summary).toHaveTextContent("2");
+    const observed: number[] = [];
+    const observer = new MutationObserver(() =>
+      observed.push(screen.queryAllByTestId("work-summary-label").length)
+    );
+    observer.observe(document.body, { childList: true, subtree: true });
+    try {
+      await user.click(screen.getByTestId("composer-stop-button"));
+      await waitFor(() =>
+        expect(screen.queryByTestId("composer-stop-button")).not.toBeInTheDocument()
+      );
+      expect(screen.getByTestId("work-summary-label")).toHaveTextContent("2");
+      expect(observed).not.toContain(0);
+    } finally {
+      observer.disconnect();
+    }
+  });
+
+  it("Should preserve the first Goal transport and local cancellation across StrictMode replay", async () => {
+    const prompt =
+      '/goal Reply in exactly one sentence: "CompozyOS keeps agent work local-first and durable."';
+    const promptResponse = createDeferred<Response>();
+    const onCancelPrompt = vi.fn();
+    const sources: FakeSessionEventSource[] = [];
+    const user = userEvent.setup();
+    transcriptMessages = [
+      {
+        id: "session-create-hook-start",
+        role: "assistant",
+        parts: [{ type: "data-compozy-event", data: { type: "hook.dispatch.start" } }],
+      },
+      {
+        id: "session-create-hook-complete",
+        role: "assistant",
+        parts: [{ type: "data-compozy-event", data: { type: "hook.dispatch.complete" } }],
+      },
+    ];
+    transcriptEpoch = 0;
+    transcriptGeneration = 0;
+    promptResponsePromise = promptResponse.promise;
+
+    const view = renderSessionThread({
+      eventSourceFactory: url => {
+        const source = new FakeSessionEventSource(url);
+        sources.push(source);
+        return source;
+      },
+      onCancelPrompt,
+      strictMode: true,
+    });
+
+    try {
+      const composer = await screen.findByTestId("composer-input");
+      await waitFor(() => {
+        // Hook dispatches render no row: the loaded transcript reads as a fresh session.
+        expect(screen.getByText(/to get started/i)).toBeInTheDocument();
+        // The Lexical composer opts out of interaction via `inert`, not `disabled`.
+        expect(composer).not.toHaveAttribute("inert");
+        expect(sources).toHaveLength(2);
+        expect(sources[0]?.closed).toBe(true);
+        expect(sources[1]?.closed).toBe(false);
+      });
+      expect(countPromptFetches(fetchMock)).toBe(0);
+
+      await setComposerText(prompt);
+      await user.click(screen.getByTestId("composer-send-button"));
+
+      await waitFor(() => expect(countPromptFetches(fetchMock)).toBe(1));
+      const promptRequest = fetchMock.mock.calls.find(([input]) =>
+        getPathname(input as RequestInfo | URL).endsWith("/prompt")
+      );
+      expect((promptRequest?.[1] as RequestInit | undefined)?.signal?.aborted).toBe(false);
+      expect(await screen.findByText(prompt)).toBeInTheDocument();
+      // The status row reads Thinking until the first content, then Working.
+      expect(
+        await screen.findByRole("status", { name: /Working|Agent is responding/ })
+      ).toBeInTheDocument();
+
+      await user.click(screen.getByTestId("composer-stop-button"));
+
+      expect(onCancelPrompt).toHaveBeenCalledTimes(1);
+      await waitFor(() => {
+        expect((promptRequest?.[1] as RequestInit | undefined)?.signal?.aborted).toBe(true);
+        expect(screen.queryByTestId("composer-stop-button")).not.toBeInTheDocument();
+        const idleComposer = screen.getByTestId("composer-input");
+        expect(idleComposer).not.toHaveAttribute("inert");
+        expect(composerText()).toBe("");
+        expect(screen.getByTestId("composer-send-button")).toBeDisabled();
+      });
+    } finally {
+      promptResponse.resolve(
+        sseResponse([
+          'data: {"type":"start","messageId":"turn-runtime-strict-001"}\n\n',
+          'data: {"type":"finish","finishReason":"stop"}\n\n',
+          "data: [DONE]\n\n",
+        ])
+      );
+      view.unmount();
+    }
+  });
+
+  // Invariant: retrying an existing user turn after a provider rerender keeps
+  // its original idempotency key. Owning layer: session chat runtime provider
+  // integration. Canonical suite: this provider suite.
+  it("retains the prompt idempotency key when a rerendered provider retries the response", async () => {
+    const user = userEvent.setup();
+    const { rerenderSessionThread } = renderSessionThread({ includeRuntimeRetryControl: true });
+
+    await screen.findByTestId("composer-input");
+    await setComposerText("Retry this answer after the provider rerenders");
+    await user.click(screen.getByTestId("composer-send-button"));
+
+    await waitFor(() => expect(countPromptFetches(fetchMock)).toBe(1));
+    const firstPromptRequest = fetchMock.mock.calls.find(([input]) => {
+      return (
+        getPathname(input as RequestInfo | URL) ===
+        `/api/workspaces/${primarySessionFixture.workspace_id}/sessions/${primarySessionFixture.id}/prompt`
+      );
+    });
+    const firstPromptBody = JSON.parse(String(firstPromptRequest?.[1]?.body)) as {
+      idempotency_key: string;
+      message_id: string;
+    };
+
+    rerenderSessionThread();
+    await user.click(await screen.findByRole("button", { name: "Retry latest assistant message" }));
+
+    await waitFor(() => expect(countPromptFetches(fetchMock)).toBe(2));
+    const promptRequests = fetchMock.mock.calls.filter(([input]) => {
+      return (
+        getPathname(input as RequestInfo | URL) ===
+        `/api/workspaces/${primarySessionFixture.workspace_id}/sessions/${primarySessionFixture.id}/prompt`
+      );
+    });
+    const retryPromptRequest = promptRequests[1];
+    const retryPromptBody = JSON.parse(String(retryPromptRequest?.[1]?.body)) as {
+      idempotency_key: string;
+      message_id: string;
+    };
+
+    expect(retryPromptBody.message_id).toBe(firstPromptBody.message_id);
+    expect(retryPromptBody.idempotency_key).toBe(firstPromptBody.idempotency_key);
+  });
+
+  it.each([
+    ["goal_objective_required", "/goal", "Add an objective after /goal, then try again."],
+    [
+      "goal_objective_too_large",
+      `/goal ${"x".repeat(5_000)}`,
+      "Shorten the Goal objective, then try again.",
+    ],
+  ] as const)(
+    "Should render actionable guidance for %s while keeping its reason code internal",
+    async (reasonCode, prompt, guidance) => {
+      goalCommandFailureReason = reasonCode;
+      const user = userEvent.setup();
+      renderSessionThread();
+
+      const composer = await screen.findByTestId("composer-input");
+      await setComposerText(prompt);
+      await user.click(screen.getByTestId("composer-send-button"));
+
+      await waitFor(() => expect(countPromptFetches(fetchMock)).toBe(1));
+      expect(
+        sessionStore.getSnapshot().context.goalFeedback[primarySessionFixture.id]?.result
+          .reason_code
+      ).toBe(reasonCode);
+      expect(await screen.findByRole("alert")).toHaveTextContent(guidance);
+      expect(screen.queryByText(reasonCode)).not.toBeInTheDocument();
+      expect(composer).not.toHaveAttribute("inert");
+      await setComposerText("Retry draft");
+      expect(composerText()).toBe("Retry draft");
+      expect(screen.getByRole("alert")).toHaveTextContent(guidance);
+      expect(screen.getByTestId("composer-send-button")).toBeEnabled();
+      expect(countPromptFetches(fetchMock)).toBe(1);
+
+      goalCommandFailureReason = null;
+      await user.click(screen.getByTestId("composer-send-button"));
+      await waitFor(() => expect(countPromptFetches(fetchMock)).toBe(2));
+      await waitFor(() => expect(screen.queryByRole("alert")).not.toBeInTheDocument());
+      expect(
+        sessionStore.getSnapshot().context.goalFeedback[primarySessionFixture.id]?.result
+          .reason_code
+      ).toBe(reasonCode);
+    }
+  );
+
+  it("keeps locally sent prompts visible through transcript reconciliation", async () => {
+    const user = userEvent.setup();
+    const { queryClient } = renderSessionThread();
+
+    await waitFor(() => {
+      expect(screen.getByText("Launch readiness snapshot")).toBeInTheDocument();
+    });
+
+    await setComposerText("Continue from the reattached thread");
+    await user.click(screen.getByTestId("composer-send-button"));
+
+    await waitFor(() => {
+      expect(screen.getByText("Continue from the reattached thread")).toBeInTheDocument();
+      expect(
+        screen.getByText("Live runtime answer before transcript reconciliation.")
+      ).toBeInTheDocument();
+    });
+    expect(lastPromptMessageID).not.toBe("");
+
+    transcriptMessages = [
+      ...sessionTranscriptFixture.slice(0, 2),
+      {
+        id: lastPromptMessageID,
+        role: "user",
+        parts: [
+          {
+            type: "text",
+            text: "Continue from the reattached thread",
+            state: "done",
+          },
+        ],
+      },
+    ];
+    await queryClient.invalidateQueries({
+      queryKey: sessionKeys.transcript(fixtureWorkspaceId(), primarySessionFixture.id),
+    });
+
+    await waitFor(() => {
+      expect(screen.getAllByText("Continue from the reattached thread")).toHaveLength(1);
+      expect(
+        screen.getByText("Live runtime answer before transcript reconciliation.")
+      ).toBeInTheDocument();
+    });
+
+    transcriptMessages = [
+      ...transcriptMessages,
+      {
+        id: "turn-runtime-001",
+        role: "assistant",
+        parts: [
+          {
+            type: "text",
+            text: "Durable transcript answer after reconciliation.",
+            state: "done",
+          },
+        ],
+      },
+    ];
+    await queryClient.invalidateQueries({
+      queryKey: sessionKeys.transcript(fixtureWorkspaceId(), primarySessionFixture.id),
+    });
+
+    await waitFor(() => {
+      expect(screen.getAllByText("Continue from the reattached thread")).toHaveLength(1);
+      expect(
+        screen.getByText("Durable transcript answer after reconciliation.")
+      ).toBeInTheDocument();
+    });
+    const reconciledRows = screen.getAllByTestId("thread-message-row");
+    const promptIndex = reconciledRows.findIndex(row =>
+      row.textContent?.includes("Continue from the reattached thread")
+    );
+    const answerIndex = reconciledRows.findIndex(row =>
+      row.textContent?.includes("Durable transcript answer after reconciliation.")
+    );
+    expect(promptIndex).toBeGreaterThanOrEqual(0);
+    expect(answerIndex).toBeGreaterThan(promptIndex);
+
+    expect(
+      screen.queryByText("Live runtime answer before transcript reconciliation.")
+    ).not.toBeInTheDocument();
+    expect(
+      transcriptMessages.some(message => JSON.stringify(message).includes("Live runtime answer"))
+    ).toBe(false);
+    expect(
+      fetchMock.mock.calls.some(([input]) => {
+        return (
+          getPathname(input as RequestInfo | URL) ===
+          `/api/workspaces/${primarySessionFixture.workspace_id}/sessions/${primarySessionFixture.id}/prompt`
+        );
+      })
+    ).toBe(true);
+  }, 10_000);
+
+  it("Should project a newly completed runtime message in its first committed frame", async () => {
+    transcriptMessages = [];
+    const commits: RuntimeTranscriptCommit[] = [];
+    const user = userEvent.setup();
+    renderSessionThread({ onRuntimeTranscriptCommit: sample => commits.push(sample) });
+
+    await screen.findByTestId("composer-input");
+    await setComposerText("Finish in one turn");
+    await user.click(screen.getByTestId("composer-send-button"));
+    expect(
+      await screen.findByText("Live runtime answer before transcript reconciliation.")
+    ).toBeInTheDocument();
+
+    const completedRuntimeCommits = commits.filter(sample =>
+      sample.runtimeIds.includes("turn-runtime-001")
+    );
+    expect(completedRuntimeCommits.length).toBeGreaterThan(0);
+    expect(
+      completedRuntimeCommits.every(sample => sample.projectedIds.includes("turn-runtime-001"))
+    ).toBe(true);
+  });
+
+  // Invariant: the assistant transport binds the selected runtime, canonical
+  // authored text, and durable identities without discarding assistant-ui history.
+  // Owning layer: session chat transport integration. Canonical suite: this provider suite.
+  it("includes the selected runtime in the prompt transport body", async () => {
+    const runtime = {
+      model: "gpt-5.4",
+      provider: "codex",
+      reasoning_effort: "high" as const,
+      speed: "fast" as const,
+    };
+    const user = userEvent.setup();
+    renderSessionThread({ runtimeSnapshot: runtime });
+
+    await screen.findByTestId("composer-input");
+    await setComposerText("Use the selected runtime for this prompt");
+    await user.click(screen.getByTestId("composer-send-button"));
+
+    await waitFor(() => expect(countPromptFetches(fetchMock)).toBe(1));
+    const promptCall = fetchMock.mock.calls.find(([input]) => {
+      return (
+        getPathname(input as RequestInfo | URL) ===
+        `/api/workspaces/${primarySessionFixture.workspace_id}/sessions/${primarySessionFixture.id}/prompt`
+      );
+    });
+    const init = promptCall?.[1] as RequestInit | undefined;
+    const body = JSON.parse(String(init?.body)) as {
+      idempotency_key?: string;
+      message_id?: string;
+      message?: unknown;
+      messageId?: unknown;
+      messages?: Array<{ role?: string }>;
+      runtime?: unknown;
+    };
+    expect(body.runtime).toEqual(runtime);
+    expect(body.message).toBe("Use the selected runtime for this prompt");
+    expect(body.messages?.at(-1)).toEqual(expect.objectContaining({ role: "user" }));
+    expect(body.message_id).toBe(getLastUserMessageID(init));
+    expect(typeof body.idempotency_key).toBe("string");
+    expect(body.messageId).toBeUndefined();
+  });
+
+  // Invariant: a prompt the daemon accepts under another provider or model has
+  // rebound the session before answering, so every catalog showing its row —
+  // the All projects aggregate included — rereads at the answer, not at turn end.
+  // Owning layer: session chat transport integration. Canonical suite: this provider suite.
+  for (const testCase of [
+    { name: "rebinds", runtime: { provider: "claude", model: "claude-opus-5-5" }, rereads: 1 },
+    {
+      name: "changes the model of",
+      runtime: { provider: "codex", model: "gpt-6-astra" },
+      rereads: 1,
+    },
+    {
+      // An omitted model resolves to the agent default, not the bound model.
+      name: "defaults the model of",
+      runtime: { provider: "codex" },
+      boundModel: "gpt-6-astra",
+      rereads: 1,
+    },
+    { name: "keeps", runtime: { provider: "codex" }, rereads: 0 },
+  ] as {
+    name: string;
+    runtime: SessionPromptRuntimeSnapshot;
+    boundModel?: string;
+    rereads: number;
+  }[]) {
+    it(`Should reread catalog rows only when an accepted prompt ${testCase.name} the runtime`, async () => {
+      const queryClient = createQueryClient();
+      // The session runs Codex before the prompt, as its detail read reports.
+      const bound = runtimeFixture("codex");
+      sessionDetailResponse = {
+        ...primarySessionFixture,
+        runtime: testCase.boundModel
+          ? { ...bound, effective: { provider: "codex", model: testCase.boundModel } }
+          : bound,
+      };
+      queryClient.setQueryData(
+        sessionKeys.detail(fixtureWorkspaceId(), primarySessionFixture.id),
+        sessionDetailResponse
+      );
+      const catalogs = [
+        sessionKeys.list(),
+        sessionKeys.list({ workspace_id: fixtureWorkspaceId() }),
+      ];
+      const reads = catalogs.map(queryKey => {
+        const queryFn = vi.fn(async () => "catalog");
+        const observer = new QueryObserver(queryClient, { queryKey, queryFn, staleTime: Infinity });
+        return { queryFn, unsubscribe: observer.subscribe(() => undefined) };
+      });
+      // The turn stays open, so only the answer can reread the catalogs.
+      const promptResponse = openSseResponse([
+        'data: {"type":"start","messageId":"rebind-turn"}\n\n',
+      ]);
+      promptResponsePromise = Promise.resolve(promptResponse.response);
+      try {
+        await waitFor(() => reads.forEach(read => expect(read.queryFn).toHaveBeenCalledOnce()));
+        const user = userEvent.setup();
+        // Without the live tail, nothing else rereads the catalogs while the turn runs.
+        renderSessionThread({
+          queryClient,
+          liveTailEnabled: false,
+          runtimeSnapshot: testCase.runtime,
+        });
+        await screen.findByTestId("composer-input");
+        const transcriptReads = countTranscriptFetches(fetchMock);
+
+        await setComposerText("Answer on the selected runtime");
+        await user.click(screen.getByTestId("composer-send-button"));
+        // The accepted answer also reconciles the admitted input from the transcript.
+        await waitFor(() =>
+          expect(countTranscriptFetches(fetchMock)).toBeGreaterThan(transcriptReads)
+        );
+
+        for (const read of reads) {
+          await waitFor(() => expect(read.queryFn).toHaveBeenCalledTimes(1 + testCase.rereads));
+        }
+      } finally {
+        for (const read of reads) read.unsubscribe();
+        promptResponse.close([
+          'data: {"type":"finish","finishReason":"stop"}\n\n',
+          "data: [DONE]\n\n",
+        ]);
+      }
+    });
+  }
+
+  // Invariant: admitted input metadata renders during the POST without replacing
+  // its live assistant output. Owner and canonical suite: runtime provider integration.
+  it.each(["loaded", "pending"])(
+    "renders admitted directives while streaming with %s initial history",
+    async history => {
+      transcriptMessages = [];
+      const initialHistory = createDeferred<Response>();
+      if (history === "pending") transcriptResponsePromise = initialHistory.promise;
+      const answer = createDeferred<Response>();
+      promptResponsePromise = answer.promise;
+      const openPrompt = openSseResponse([
+        'data: {"type":"start","messageId":"turn-directives"}\n\n',
+        'data: {"type":"text-start","id":"answer"}\n\n',
+        'data: {"type":"text-delta","id":"answer","delta":"Still working"}\n\n',
+      ]);
+      const user = userEvent.setup();
+      const view = renderSessionThread();
+      try {
+        await screen.findByTestId("composer-input");
+        const text = "Olá 🧪 /review";
+        await setComposerText(text);
+        await user.click(screen.getByTestId("composer-send-button"));
+        await waitFor(() => expect(lastPromptMessageID).not.toBe(""));
+        transcriptMessages = [
+          {
+            id: lastPromptMessageID,
+            role: "user",
+            content: text,
+            parts: [{ type: "text", text }],
+            metadata: {
+              skill_invocations: [
+                { command_id: "skill:review", token: "/review", start: 7, end: 14 },
+              ],
+            },
+          },
+          {
+            id: "turn-directives",
+            role: "assistant",
+            parts: [{ type: "text", text: "Stale partial" }],
+          },
+        ] as typeof transcriptMessages;
+        transcriptResponsePromise = null;
+        answer.resolve(openPrompt.response);
+        if (history === "pending") {
+          await waitFor(() => expect(countTranscriptFetches(fetchMock)).toBe(2));
+          initialHistory.resolve(jsonResponse(transcriptPayload([])));
+        }
+        expect(await screen.findByTestId("session-skill-directive")).toHaveTextContent("/review");
+        expect(await screen.findByText("Still working")).toBeInTheDocument();
+        expect(screen.queryByText("Stale partial")).not.toBeInTheDocument();
+        expect(screen.getByTestId("composer-stop-button")).toBeInTheDocument();
+      } finally {
+        initialHistory.resolve(jsonResponse(transcriptPayload([])));
+        openPrompt.close([
+          'data: {"type":"text-end","id":"answer"}\n\n',
+          'data: {"type":"finish","finishReason":"stop"}\n\n',
+          "data: [DONE]\n\n",
+        ]);
+        view.unmount();
+      }
+    }
+  );
+
+  it("Should dock a live permission while the prompt stream remains open", async () => {
+    transcriptMessages = [];
+    const openPrompt = openSseResponse([
+      'data: {"type":"start","messageId":"turn-runtime-permission-001"}\n\n',
+      'data: {"type":"data-compozy-permission","id":"permission-live-001","data":{"type":"permission","session_id":"session_001","turn_id":"turn-runtime-permission-001","request_id":"permission-live-001","title":"Edit file","action":"session/request_permission","resource":"pending.txt","raw":{"options":[{"decision":"allow-once","option_id":"allow-once"},{"decision":"reject-once","option_id":"reject-once"}],"tool_input":{"path":"pending.txt"}}}}\n\n',
+    ]);
+    promptResponsePromise = Promise.resolve(openPrompt.response);
+    const user = userEvent.setup();
+    const view = renderSessionThread({ includeDecisionDock: true });
+
+    try {
+      await screen.findByTestId("composer-input");
+      await setComposerText("Request permission");
+      await user.click(screen.getByTestId("composer-send-button"));
+
+      expect(await screen.findByTestId("permission-dock")).toBeInTheDocument();
+      expect(screen.getByTestId("permission-dock-title")).toHaveTextContent("Edit file");
+    } finally {
+      openPrompt.close(['data: {"type":"finish","finishReason":"stop"}\n\n', "data: [DONE]\n\n"]);
+      view.unmount();
+    }
+  });
+
+  it("Should hide a completed runtime tail while an authoritative Clear is pending", async () => {
+    transcriptMessages = [];
+    const clearResponse = createDeferred<Response>();
+    clearResponsePromise = clearResponse.promise;
+    const user = userEvent.setup();
+    renderSessionThread({ includeClearAction: true, includeTranscriptStateProbe: true });
+
+    await screen.findByTestId("composer-input");
+    const prompt = "Clear me";
+    await setComposerText(prompt);
+    await user.click(screen.getByTestId("composer-send-button"));
+
+    expect(await screen.findByText(prompt)).toBeInTheDocument();
+    expect(
+      await screen.findByText("Live runtime answer before transcript reconciliation.")
+    ).toBeInTheDocument();
+
+    await user.click(screen.getByRole("button", { name: "Clear test conversation" }));
+
+    await waitFor(() => {
+      expect(screen.getByRole("button", { name: "Clear test conversation" })).toBeDisabled();
+    });
+    expect(screen.queryByText(prompt)).not.toBeInTheDocument();
+    expect(
+      screen.queryByText("Live runtime answer before transcript reconciliation.")
+    ).not.toBeInTheDocument();
+
+    clearResponse.resolve(jsonResponse({ session: sessionDetailResponse }));
+    await waitFor(() => {
+      expect(screen.getByRole("button", { name: "Clear test conversation" })).toBeEnabled();
+    });
+    expect(screen.queryByText(prompt)).not.toBeInTheDocument();
+  }, 10_000);
+
+  it("keeps distinct runtime and durable message ids visible even when metadata matches", () => {
+    const runtimeMessages = toReadonlyThreadMessages([
+      {
+        id: "client_temp_assistant_001",
+        role: "assistant",
+        metadata: { turn_id: "turn_promote_001" },
+        parts: [
+          {
+            type: "text",
+            text: "Promoted assistant response.",
+            state: "done",
+          },
+        ],
+      } as TranscriptMessage,
+    ]);
+    const transcriptMessages = toReadonlyThreadMessages([
+      {
+        id: "server_assistant_001",
+        role: "assistant",
+        metadata: { turn_id: "turn_promote_001", message_id: "client_temp_assistant_001" },
+        parts: [
+          {
+            type: "text",
+            text: "Promoted assistant response.",
+            state: "done",
+          },
+        ],
+      } as TranscriptMessage,
+    ]);
+
+    const merged = mergeSessionThreadReadModel({ transcriptMessages, runtimeMessages });
+
+    expect(merged.map(message => message.id)).toEqual([
+      "server_assistant_001",
+      "client_temp_assistant_001",
+    ]);
+  });
+
+  it("Should reconcile a user message only when its durable id exactly matches", () => {
+    const runtimeMessages = toReadonlyThreadMessages([
+      {
+        id: "client_user_001",
+        role: "user",
+        parts: [{ type: "text", text: "One authored prompt.", state: "done" }],
+      } as TranscriptMessage,
+    ]);
+    const transcriptMessages = toReadonlyThreadMessages([
+      {
+        id: "client_user_001",
+        role: "user",
+        parts: [{ type: "text", text: "One authored prompt.", state: "done" }],
+      } as TranscriptMessage,
+      {
+        id: "server_assistant_001",
+        role: "assistant",
+        parts: [{ type: "text", text: "One durable response.", state: "done" }],
+      } as TranscriptMessage,
+    ]);
+
+    const merged = mergeSessionThreadReadModel({ transcriptMessages, runtimeMessages });
+
+    expect(merged.map(message => message.id)).toEqual(["client_user_001", "server_assistant_001"]);
+  });
+
+  // Invariant: one provider failure renders one notice. The live stream's failure message
+  // has its own id, so the durable-only dedup (error vs provider_failure marker) cannot see it;
+  // the merge must not append a runtime failure the durable transcript already records for
+  // that turn, while a failure for a turn the transcript lacks stays visible.
+  it("Should not append a live provider failure the durable transcript already records", () => {
+    const rateLimited = (turnID: string) => ({
+      type: "data-compozy-event",
+      data: {
+        type: "error",
+        turn_id: turnID,
+        error: "acpmock is rate limited",
+        provider_error: {
+          code: "provider_rate_limited",
+          provider: "acpmock",
+          next_action: "handoff",
+          occurrence_count: 1,
+        },
+      },
+    });
+    const transcriptMessages = toReadonlyThreadMessages([
+      {
+        id: "evt_010",
+        role: "assistant",
+        parts: [rateLimited("turn_rate_001")],
+      } as unknown as TranscriptMessage,
+    ]);
+    const runtimeMessages = toReadonlyThreadMessages([
+      {
+        id: "stream_assistant_001",
+        role: "assistant",
+        parts: [rateLimited("turn_rate_001")],
+      } as unknown as TranscriptMessage,
+      {
+        id: "stream_assistant_002",
+        role: "assistant",
+        parts: [rateLimited("turn_rate_002")],
+      } as unknown as TranscriptMessage,
+    ]);
+
+    const merged = mergeSessionThreadReadModel({ transcriptMessages, runtimeMessages });
+
+    expect(merged.map(message => message.id)).toEqual(["evt_010", "stream_assistant_002"]);
+  });
+
+  it("Should let an empty authoritative transcript replace a stale runtime tail", () => {
+    const runtimeMessages = toReadonlyThreadMessages([
+      {
+        id: "stale_runtime_user_001",
+        role: "user",
+        parts: [{ type: "text", text: "Old prompt before clear", state: "done" }],
+      } as TranscriptMessage,
+    ]);
+
+    const merged = mergeSessionThreadReadModel({
+      transcriptMessages: [],
+      runtimeMessages,
+      includeRuntimeTail: false,
+    });
+
+    expect(merged).toEqual([]);
+  });
+
+  it("Should let same-count authoritative transcript content replace stale runtime content", () => {
+    const runtimeMessages = toReadonlyThreadMessages([
+      {
+        id: "stale_runtime_assistant_001",
+        role: "assistant",
+        parts: [{ type: "text", text: "Old assistant text", state: "done" }],
+      } as TranscriptMessage,
+    ]);
+    const transcriptMessages = toReadonlyThreadMessages([
+      {
+        id: "server_assistant_replacement_001",
+        role: "assistant",
+        parts: [{ type: "text", text: "Replacement assistant text", state: "done" }],
+      } as TranscriptMessage,
+    ]);
+
+    const merged = mergeSessionThreadReadModel({
+      transcriptMessages,
+      runtimeMessages,
+      includeRuntimeTail: false,
+    });
+
+    expect(merged.map(message => message.id)).toEqual(["server_assistant_replacement_001"]);
+  });
+
+  // ADR-006: progress ticks never become rows — the status row under the
+  // scroller carries elapsed and activity; the transcript stays quiet.
+  it("drops runtime progress ticks from the transcript instead of rendering them as rows", async () => {
+    transcriptMessages = [
+      ...sessionTranscriptFixture.slice(0, 1),
+      {
+        id: "transcript_runtime_001",
+        role: "assistant",
+        parts: [
+          {
+            type: "data-compozy-event",
+            data: {
+              type: "runtime_progress",
+              text: "Still working",
+              runtime: {
+                turn_id: "turn_001",
+                current_tool: "Bash",
+                elapsed_ms: 610_000,
+                elapsed_seconds: 610,
+                idle_seconds: 30,
+              },
+            },
+          },
+        ],
+      },
+    ];
+
+    renderSessionThread();
+
+    await waitFor(() => {
+      expect(screen.getByTestId("thread-messages")).toBeInTheDocument();
+    });
+
+    expect(screen.queryByTestId("runtime-activity-notice")).not.toBeInTheDocument();
+    expect(screen.queryByText("Still working")).not.toBeInTheDocument();
+  }, 10_000);
+
+  it("renders persisted session error events as failure notices", async () => {
+    transcriptMessages = [
+      ...sessionTranscriptFixture.slice(0, 1),
+      {
+        id: "transcript_error_001",
+        role: "assistant",
+        parts: [
+          {
+            type: "text",
+            text: "Partial response before failure.",
+            state: "done",
+          },
+          {
+            type: "data-compozy-event",
+            data: {
+              type: "error",
+              error:
+                '{"code":-32603,"message":"Internal error","data":{"error":"peer disconnected before response"}}',
+              failure: {
+                kind: "process_exit",
+                summary: "peer disconnected before response",
+              },
+            },
+          },
+        ],
+      },
+    ];
+
+    renderSessionThread();
+
+    await waitFor(() => {
+      expect(screen.getByTestId("session-error-notice")).toBeInTheDocument();
+    });
+
+    expect(screen.getByText("Partial response before failure.")).toBeInTheDocument();
+    expect(screen.getByTestId("session-error-notice")).toHaveTextContent("Session failed");
+    expect(screen.getByTestId("session-error-detail")).toHaveTextContent(
+      "peer disconnected before response"
+    );
+  }, 10_000);
+
+  it("does not render empty error chrome for incomplete message status without a detail", async () => {
+    transcriptMessages = [
+      ...sessionTranscriptFixture.slice(0, 1),
+      {
+        id: "transcript_empty_error_status_001",
+        role: "assistant",
+        status: {
+          type: "incomplete",
+          reason: "error",
+          error: "",
+        },
+        parts: [
+          {
+            type: "data-compozy-event",
+            data: {
+              type: "error",
+            },
+          },
+        ],
+      } as unknown as TranscriptMessage,
+    ];
+
+    renderSessionThread();
+
+    await waitFor(() => {
+      expect(
+        screen.getByText("Summarize the launch blockers before the 18:30 UTC cutover.")
+      ).toBeInTheDocument();
+    });
+
+    expect(screen.queryByTestId("session-message-error")).not.toBeInTheDocument();
+    expect(screen.queryByTestId("session-error-notice")).not.toBeInTheDocument();
+  }, 10_000);
+
+  it("keeps pending permissions out of the transcript and renders receipts for resolved ones", async () => {
+    transcriptMessages = [
+      ...sessionTranscriptFixture.slice(0, 1),
+      {
+        id: "transcript_permission_001",
+        role: "assistant",
+        parts: [
+          {
+            type: "data-compozy-permission",
+            data: {
+              type: "permission",
+              request_id: "turn_001:perm_pending",
+              title: "Edit pending file",
+              resource: "pending.txt",
+              action: "session/request_permission",
+              raw: { path: "pending.txt" },
+            },
+          },
+          {
+            type: "data-compozy-permission",
+            data: {
+              type: "permission",
+              request_id: "turn_001:perm_resolved",
+              title: "Edit resolved file",
+              resource: "resolved.txt",
+              action: "session/request_permission",
+              decision: "reject-always",
+              raw: { path: "resolved.txt" },
+            },
+          },
+        ],
+      },
+    ];
+
+    renderSessionThread();
+
+    // The resolved request keeps only its one-line receipt in the transcript.
+    await waitFor(() => {
+      expect(screen.getByTestId("permission-rejected-notice")).toBeInTheDocument();
+    });
+    expect(screen.getByTestId("permission-rejected-notice")).toHaveTextContent(
+      "Edit resolved file"
+    );
+    // The pending ask renders nothing in the transcript — it docks on the
+    // composer instead (owned by session-decision-dock.test.tsx).
+    expect(screen.queryByText(/pending\.txt/)).not.toBeInTheDocument();
+    expect(screen.queryByTestId("permission-prompt")).not.toBeInTheDocument();
+  }, 10_000);
+
+  function pendingPermissionTranscript(requestId: string): TranscriptMessage[] {
+    return [
+      ...sessionTranscriptFixture.slice(0, 1),
+      {
+        id: `transcript_permission_${requestId}`,
+        role: "assistant",
+        parts: [
+          {
+            type: "data-compozy-permission",
+            data: {
+              type: "permission",
+              request_id: requestId,
+              title: "compozy__terminal_exec",
+              action: "session/request_permission",
+              timestamp: "2026-09-05T10:00:00Z",
+              raw: {
+                tool_id: "compozy__terminal_exec",
+                tool_input: {
+                  command: "bun",
+                  args: ["test"],
+                  cwd: "~/dev/atlas-api",
+                  risk: "ordinary",
+                },
+              },
+            },
+          },
+        ],
+      } as TranscriptMessage,
+    ];
+  }
+
+  function restartExpiredRow(requestId: string): SessionInteractionRecord {
+    return {
+      session_id: "sess-1",
+      interaction_id: `int_${requestId}`,
+      kind: "permission",
+      provider_request_id: requestId,
+      turn_id: "turn_001",
+      title: "compozy__terminal_exec",
+      tool_id: "compozy__terminal_exec",
+      status: "canceled",
+      created_at: "2026-09-05T10:00:00Z",
+      resolved_at: "2026-09-05T10:02:00Z",
+      resolution: "failed-by-restart",
+      resolved_by: "system",
+    };
+  }
+
+  it("does not read the daemon's settled interactions while the transcript shows no undecided ask", async () => {
+    renderSessionThread();
+    await waitFor(() => expect(countClarificationFetches(fetchMock)).toBeGreaterThan(0));
+    expect(interactionFetchSearches(fetchMock)).toEqual([]);
+  });
+
+  it("re-reads settled interactions on the live cadence while an ask is still genuinely open, and permits selecting a message for a local edit", async () => {
+    vi.useFakeTimers();
+    transcriptMessages = pendingPermissionTranscript("turn_001:perm_open");
+
+    renderSessionThread();
+
+    await act(async () => {
+      await vi.waitFor(() =>
+        expect(interactionFetchSearches(fetchMock)).toEqual(["?status=canceled"])
+      );
+    });
+    expect(screen.getByTestId("permission-waiting-line")).toBeInTheDocument();
+    expect(screen.getByTestId("user-message-rewind")).toBeEnabled();
+
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(5_500);
+    });
+
+    expect(interactionFetchSearches(fetchMock)).toEqual(["?status=canceled", "?status=canceled"]);
+    expect(screen.getByTestId("user-message-rewind")).toBeEnabled();
+  }, 10_000);
+
+  it("stops re-reading once every open ask has a settled row, keeps the receipt, and releases rewind", async () => {
+    vi.useFakeTimers();
+    // No turn in flight: the daemon's running detail would itself hold rewind.
+    sessionDetailResponse = { ...primarySessionFixture, badge: "idle" };
+    settledInteractions = [restartExpiredRow("turn_001:perm_expired")];
+    transcriptMessages = pendingPermissionTranscript("turn_001:perm_expired");
+
+    renderSessionThread();
+
+    await act(async () => {
+      await vi.waitFor(() =>
+        expect(screen.getByTestId("permission-expired-receipt")).toBeInTheDocument()
+      );
+    });
+    const receipt = screen.getByTestId("permission-expired-receipt");
+    expect(receipt).toHaveAttribute("data-resolution", "failed-by-restart");
+    expect(receipt).toHaveTextContent(
+      "Not decided · CompozyOS restarted before you answered — bun test did not run"
+    );
+    expect(screen.queryByTestId("permission-waiting-line")).not.toBeInTheDocument();
+    expect(interactionFetchSearches(fetchMock)).toEqual(["?status=canceled"]);
+    // The other rewind blockers (pending clarifications, queued inputs) settle on
+    // their own reads; the settled ask must not be the one holding rewind.
+    await act(async () => {
+      await vi.waitFor(() => expect(screen.getByTestId("user-message-rewind")).toBeEnabled());
+    });
+
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(11_000);
+    });
+
+    expect(interactionFetchSearches(fetchMock)).toEqual(["?status=canceled"]);
+    expect(screen.getByTestId("permission-expired-receipt")).toBeInTheDocument();
+    expect(screen.getByTestId("user-message-rewind")).toBeEnabled();
+  }, 10_000);
+
+  // Invariant: selection/cancellation are local; submission rewinds once before sending,
+  // even when the selected row disappears before the rewind response arrives.
+  // Owner: composer/runtime integration; canonical suite: this file.
+  it("Should replace a draft locally and abandon an edit without changing the conversation", async () => {
+    const user = userEvent.setup();
+    sessionDetailResponse = { ...primarySessionFixture, state: "stopped", badge: "stopped" };
+    renderSessionThread({ canPrompt: false });
+    await screen.findByTestId("user-message-rewind");
+    await setComposerText("Unsent draft");
+    const original = transcriptMessages[0]!.parts.find(part => part.type === "text")!.text;
+    await user.click(screen.getByTestId("user-message-rewind"));
+    await waitFor(() => expect(composerText()).toBe(original));
+    expect(screen.queryByRole("dialog")).not.toBeInTheDocument();
+    expect(screen.getByTestId("composer-input")).not.toHaveAttribute("inert");
+    expect(transcriptEpoch).toBe(1);
+    await user.click(screen.getByRole("button", { name: "Cancel edit" }));
+    expect(composerText()).toBe("");
+    expect(transcriptEpoch).toBe(1);
+    await user.click(screen.getByTestId("user-message-rewind"));
+    await waitFor(() => expect(composerText()).toBe(original));
+    fireEvent.keyDown(screen.getByTestId("composer-input"), { key: "Escape" });
+    expect(screen.queryByRole("button", { name: "Cancel edit" })).not.toBeInTheDocument();
+    expect(transcriptEpoch).toBe(1);
+    await user.click(screen.getByTestId("user-message-rewind"));
+    await setComposerText("");
+    expect(screen.queryByRole("button", { name: "Cancel edit" })).not.toBeInTheDocument();
+    expect(transcriptMessages).toHaveLength(2);
+    expect(countPromptFetches(fetchMock)).toBe(0);
+  });
+
+  it.each([false, true])(
+    "Should send the edited prompt once after row removal (unmounted: %s)",
+    async unmountBeforeRewind => {
+      const user = userEvent.setup();
+      const queryClient = createQueryClient();
+      const gate = createDeferred<void>();
+      rewindResponseGate = gate.promise;
+      sessionDetailResponse = { ...primarySessionFixture, badge: "idle" };
+      const view = renderSessionThread({ queryClient });
+      await user.click(await screen.findByTestId("user-message-rewind"));
+      const draft = "Updated launch blockers\nbefore the cutover:\n\n- auth\n- billing";
+      await setComposerText(draft);
+      await user.click(screen.getByTestId("composer-send-button"));
+      await waitFor(() => expect(transcriptMessages).toHaveLength(0));
+      expect(countPromptFetches(fetchMock)).toBe(0);
+      expect(screen.getByTestId("composer-send-button")).toBeDisabled();
+      await act(async () => {
+        await queryClient.invalidateQueries({
+          queryKey: sessionKeys.transcript(fixtureWorkspaceId(), primarySessionFixture.id),
+        });
+      });
+      await waitFor(() =>
+        expect(screen.queryByTestId("user-message-rewind")).not.toBeInTheDocument()
+      );
+      if (unmountBeforeRewind) await act(async () => view.unmount());
+      await act(async () => {
+        gate.resolve();
+      });
+      await waitFor(() => expect(countPromptFetches(fetchMock)).toBe(1));
+      const sent = fetchMock.mock.calls.find(([input]) => getPathname(input).endsWith("/prompt"));
+      expect(String(sent?.[1]?.body)).toContain(JSON.stringify(draft).slice(1, -1));
+      expect(String(sent?.[1]?.body)).not.toContain("Summarize the launch blockers");
+      if (!unmountBeforeRewind) {
+        await waitFor(() => expect(composerText()).toBe(""));
+        expect(screen.queryByRole("button", { name: "Cancel edit" })).not.toBeInTheDocument();
+        await act(async () => view.unmount());
+      }
+    }
+  );
+
+  it("Should retain the edit and surface a daemon refusal without sending a new prompt", async () => {
+    const user = userEvent.setup();
+    rewindRefusal = jsonResponse(
+      { error: "The session still has pending inputs.", code: "session_rewind_busy" },
+      { status: 409 }
+    );
+    renderSessionThread({ includeToaster: true });
+    await user.click(await screen.findByTestId("user-message-rewind"));
+    await setComposerText("Keep this replacement");
+    await user.click(screen.getByTestId("composer-send-button"));
+    await screen.findByText("Couldn't edit this message.");
+    expect(screen.getByText("The session still has pending inputs.")).toBeInTheDocument();
+    expect(composerText()).toBe("Keep this replacement");
+    expect(transcriptMessages).toHaveLength(2);
+    expect(countPromptFetches(fetchMock)).toBe(0);
+    expect(screen.getByRole("button", { name: "Cancel edit" })).toBeEnabled();
+    rewindRefusal = null;
+    await user.click(screen.getByTestId("composer-send-button"));
+    await waitFor(() => expect(countPromptFetches(fetchMock)).toBe(1));
+    const requests = fetchMock.mock.calls
+      .map(([input]) => input)
+      .filter(
+        (input): input is Request =>
+          input instanceof Request && new URL(input.url).pathname.endsWith("/rewind")
+      );
+    expect(requests).toHaveLength(2);
+    expect(await requests[1]!.clone().json()).toEqual(await requests[0]!.clone().json());
+  });
+
+  function decidedPermissionTranscript(requestId: string, decision: string): TranscriptMessage[] {
+    const [user, ask] = pendingPermissionTranscript(requestId);
+    const part = (ask as { parts: { data: Record<string, unknown> }[] }).parts[0];
+    return [
+      user as TranscriptMessage,
+      { ...ask, parts: [{ ...part, data: { ...part?.data, decision } }] } as TranscriptMessage,
+    ];
+  }
+
+  function resolvedRow(requestId: string, resolvedBy: string): SessionInteractionRecord {
+    return {
+      ...restartExpiredRow(requestId),
+      status: "resolved",
+      resolution: "reject-once",
+      resolved_by: resolvedBy,
+    };
+  }
+
+  it("attributes a decided ask from the daemon's resolved row with one read and no polling", async () => {
+    vi.useFakeTimers();
+    settledInteractions = [resolvedRow("turn_001:perm_timeout", "timeout")];
+    transcriptMessages = decidedPermissionTranscript("turn_001:perm_timeout", "reject-once");
+
+    renderSessionThread();
+
+    await act(async () => {
+      await vi.waitFor(() =>
+        expect(screen.getByTestId("permission-rejected-notice")).toHaveAttribute(
+          "data-actor",
+          "timeout"
+        )
+      );
+    });
+    expect(screen.getByTestId("permission-rejected-notice")).toHaveTextContent(
+      "Timed out before anyone answered · bun test did not run"
+    );
+    expect(interactionFetchSearches(fetchMock)).toEqual(["?status=resolved"]);
+
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(11_000);
+    });
+
+    expect(interactionFetchSearches(fetchMock)).toEqual(["?status=resolved"]);
+  }, 10_000);
+
+  it("keeps a decided ask neutral when the daemon has no resolved row for it", async () => {
+    vi.useFakeTimers();
+    transcriptMessages = decidedPermissionTranscript("turn_001:perm_legacy", "reject-once");
+
+    renderSessionThread();
+
+    await act(async () => {
+      await vi.waitFor(() =>
+        expect(interactionFetchSearches(fetchMock)).toEqual(["?status=resolved"])
+      );
+    });
+    const receipt = screen.getByTestId("permission-rejected-notice");
+    expect(receipt).toHaveAttribute("data-actor", "unknown");
+    expect(receipt).toHaveTextContent("Not allowed · bun test did not run");
+    expect(receipt).not.toHaveTextContent("by you");
+
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(11_000);
+    });
+
+    expect(interactionFetchSearches(fetchMock)).toEqual(["?status=resolved"]);
+  }, 10_000);
+
+  it("routes a clarify data event to the clarification receipt, not the activity notice", async () => {
+    transcriptMessages = [
+      ...sessionTranscriptFixture.slice(0, 1),
+      {
+        id: "transcript_clarify_001",
+        role: "assistant",
+        parts: [
+          {
+            type: "data-compozy-event",
+            data: {
+              type: "clarify",
+              session_id: primarySessionFixture.id,
+              turn_id: "clarify:req-1",
+              raw: {
+                status: "resolved",
+                request: {
+                  request_id: "req-1",
+                  workspace_id: primarySessionFixture.workspace_id,
+                  session_id: primarySessionFixture.id,
+                  agent_name: primarySessionFixture.agent_name,
+                  question: "Which environment should deploy?",
+                  choices: ["staging", "production"],
+                  asked_at: "2026-07-16T00:00:00Z",
+                  deadline: "2026-07-16T00:05:00Z",
+                },
+                answer: { choice: 1, text: "", fallback: false },
+                at: "2026-07-16T00:00:10Z",
+              },
+            },
+          },
+        ],
+      },
+    ];
+
+    renderSessionThread();
+
+    await waitFor(() => {
+      expect(screen.getByTestId("clarification-receipt")).toBeInTheDocument();
+    });
+    expect(screen.getByTestId("clarification-receipt")).toHaveAttribute("data-status", "resolved");
+    expect(screen.getByTestId("clarification-receipt-answer")).toHaveTextContent("production");
+    expect(screen.queryByTestId("runtime-activity-notice")).not.toBeInTheDocument();
+  }, 10_000);
+
+  it("renders mixed text, reasoning, and unregistered tool parts in order after disclosure", async () => {
+    const user = userEvent.setup();
+    transcriptMessages = [
+      ...sessionTranscriptFixture.slice(0, 1),
+      {
+        id: "transcript_mixed_parts_001",
+        role: "assistant",
+        parts: [
+          {
+            type: "text",
+            text: "Before search.",
+            state: "done",
+          },
+          {
+            type: "reasoning",
+            text: "Need the current launch note before answering.",
+            state: "streaming",
+          },
+          {
+            type: "tool-WebSearch",
+            toolCallId: "tool_web_001",
+            state: "output-available",
+            input: {
+              query: "launch note",
+            },
+            output: {
+              type: "tool_result",
+              title: "WebSearch",
+              raw: {
+                content: "Launch note found.",
+              },
+            },
+          },
+          {
+            type: "text",
+            text: "After search.",
+            state: "done",
+          },
+        ],
+      },
+    ];
+
+    renderSessionThread();
+
+    const group = await screen.findByRole("button", { name: "1 tool · 1 thought · thinking" });
+    expect(group).toHaveAttribute("aria-expanded", "false");
+    expect(screen.getByText("Before search.")).toBeInTheDocument();
+    expect(screen.getByText("After search.")).toBeInTheDocument();
+    await user.click(group);
+    expect(await screen.findByTestId("tool-call-row")).toBeInTheDocument();
+
+    // Mixed activity opens together. The original streaming ThinkingBlock
+    // still opens its body automatically inside that disclosure.
+    const chat = screen.getByTestId("chat-view");
+    const reasoning = within(chat).getByTestId("thinking-content");
+    expect(reasoning).toHaveTextContent("Need the current launch note before answering.");
+    expect(
+      reasoning.compareDocumentPosition(within(chat).getByTestId("tool-call-row")) &
+        Node.DOCUMENT_POSITION_FOLLOWING
+    ).toBeTruthy();
+    const chatText = chat.textContent ?? "";
+    const beforeIndex = chatText.indexOf("Before search.");
+    const reasoningIndex = chatText.indexOf("Need the current launch note before answering.");
+    // The row heading is the visible tense-aware verb ("Searched the web"), not the raw tool id.
+    const toolIndex = chatText.indexOf("Searched the web");
+    const afterIndex = chatText.indexOf("After search.");
+
+    expect(beforeIndex).toBeGreaterThanOrEqual(0);
+    expect(reasoningIndex).toBeGreaterThan(beforeIndex);
+    expect(toolIndex).toBeGreaterThan(reasoningIndex);
+    expect(afterIndex).toBeGreaterThan(toolIndex);
+    expect(within(chat).getByTestId("tool-call-row")).toHaveTextContent(
+      "Searched the weblaunch note"
+    );
+  }, 10_000);
+
+  it("keeps unregistered data parts inside the settled turn fold instead of dropping them", async () => {
+    const user = userEvent.setup();
+    transcriptMessages = [
+      ...sessionTranscriptFixture.slice(0, 1),
+      {
+        id: "transcript_unknown_data_001",
+        role: "assistant",
+        parts: [
+          {
+            type: "text",
+            text: "Before data.",
+            state: "done",
+          },
+          {
+            type: "data-provider-note",
+            data: {
+              title: "Provider note",
+              detail: "Unregistered data event",
+            },
+          },
+          {
+            type: "text",
+            text: "After data.",
+            state: "done",
+          },
+        ],
+      },
+    ];
+
+    renderSessionThread();
+
+    // The settled turn keeps authored text visible and folds the unregistered data
+    // at its chronological position instead of dropping or moving it.
+    const fold = await screen.findByRole("button", { name: "Worked" });
+    expect(screen.getByText("After data.")).toBeInTheDocument();
+    expect(screen.queryByTestId("session-data-part")).not.toBeInTheDocument();
+
+    await user.click(fold);
+
+    await waitFor(() => {
+      expect(screen.getByTestId("session-data-part")).toBeInTheDocument();
+    });
+
+    const chat = screen.getByTestId("chat-view");
+    const chatText = chat.textContent ?? "";
+    const beforeIndex = chatText.indexOf("Before data.");
+    const dataIndex = chatText.indexOf("provider-note");
+    const afterIndex = chatText.indexOf("After data.");
+
+    expect(beforeIndex).toBeGreaterThanOrEqual(0);
+    expect(dataIndex).toBeGreaterThan(beforeIndex);
+    expect(afterIndex).toBeGreaterThan(dataIndex);
+    // The marker line names the raw event as mono meta — no payload preview card.
+    expect(within(chat).getByTestId("session-data-part")).toHaveTextContent("data-provider-note");
+  }, 10_000);
+
+  it("reconciles durable transcript after a live session stream event", async () => {
+    transcriptMessages = sessionTranscriptFixture.slice(0, 1);
+    const sources: FakeSessionEventSource[] = [];
+
+    renderSessionThread({
+      eventSourceFactory: url => {
+        const source = new FakeSessionEventSource(url);
+        sources.push(source);
+        return source;
+      },
+    });
+
+    await waitFor(() => {
+      expect(
+        screen.getByText("Summarize the launch blockers before the 18:30 UTC cutover.")
+      ).toBeInTheDocument();
+    });
+    await waitFor(() => {
+      expect(sources[0]?.url).toBe(
+        `/api/workspaces/${primarySessionFixture.workspace_id}/sessions/${primarySessionFixture.id}/stream?${SESSION_STREAM_QUERY}`
+      );
+    });
+
+    const liveMessage: TranscriptMessage = {
+      id: "transcript_assistant_live_tail_001",
+      role: "assistant",
+      parts: [{ type: "text", text: "Live reattached answer.", state: "done" }],
+    };
+    // The stream event is the I/O boundary that updates React state: dispatch
+    // it inside act so the runtime's reconciliation lands in the same flush.
+    await act(async () => {
+      sources[0]?.dispatch(
+        "transcript_delta",
+        {
+          session_id: primarySessionFixture.id,
+          epoch: 1,
+          generation: 1,
+          cursor: 2,
+          entries: [{ message: liveMessage, sequence: 2, start_sequence: 2 }],
+          has_more: false,
+          max_sequence: 2,
+        },
+        "2"
+      );
+    });
+
+    await waitFor(() => {
+      expect(screen.getByText("Live reattached answer.")).toBeInTheDocument();
+    });
+  }, 10_000);
+
+  it("merges a same-fence durable snapshot without an extra transcript request", async () => {
+    transcriptMessages = sessionTranscriptFixture.slice(0, 1);
+    const sources: FakeSessionEventSource[] = [];
+
+    renderSessionThread({
+      eventSourceFactory: url => {
+        const source = new FakeSessionEventSource(url);
+        sources.push(source);
+        return source;
+      },
+    });
+
+    await waitFor(() => {
+      expect(sources).toHaveLength(1);
+    });
+    await waitFor(() => {
+      expect(sources[0]?.listeners.get("transcript_snapshot")?.size).toBeGreaterThan(0);
+      expect(
+        screen.getByText("Summarize the launch blockers before the 18:30 UTC cutover.")
+      ).toBeInTheDocument();
+    });
+
+    const recoveredMessage: TranscriptMessage = {
+      id: "transcript_gap_recovery_001",
+      role: "assistant",
+      parts: [{ type: "text", text: "Recovered from the durable transcript.", state: "done" }],
+    };
+    await act(async () => {
+      sources[0]?.dispatch(
+        "transcript_snapshot",
+        {
+          session_id: primarySessionFixture.id,
+          epoch: 1,
+          generation: 1,
+          entries: [
+            { message: sessionTranscriptFixture[0]!, sequence: 1, start_sequence: 1 },
+            { message: recoveredMessage, sequence: 4, start_sequence: 4 },
+          ],
+          has_older: false,
+          max_sequence: 4,
+          reset: false,
+        },
+        "4"
+      );
+    });
+
+    await waitFor(() => {
+      expect(screen.getByText("Recovered from the durable transcript.")).toBeInTheDocument();
+    });
+
+    expect(countTranscriptFetches(fetchMock)).toBe(1);
+  }, 10_000);
+
+  it("Should close the provider stream on terminal frames and reopen only after the session becomes live", async () => {
+    vi.useFakeTimers();
+    transcriptMessages = sessionTranscriptFixture.slice(0, 1);
+    const sources: FakeSessionEventSource[] = [];
+    const queryClient = createQueryClient();
+    const workspaceId = fixtureWorkspaceId();
+    const sessionId = primarySessionFixture.id;
+    queryClient.setQueryData(sessionKeys.detail(workspaceId, sessionId), primarySessionFixture);
+
+    renderSessionThread({
+      queryClient,
+      eventSourceFactory: url => {
+        const source = new FakeSessionEventSource(url);
+        sources.push(source);
+        return source;
+      },
+    });
+
+    await act(async () => {
+      await vi.waitFor(() => {
+        expect(sources).toHaveLength(1);
+      });
+    });
+
+    sessionDetailResponse = { ...primarySessionFixture, state: "stopped" };
+    act(() => {
+      sources[0]?.dispatch(
+        "session_stopped",
+        {
+          id: "session-stopped-fixture",
+          session_id: sessionId,
+          sequence: 9,
+          type: "session_stopped",
+          timestamp: "2026-07-07T12:00:00Z",
+          turn_id: "turn-terminal",
+          agent_name: primarySessionFixture.agent_name,
+          content: {},
+          spawn_depth: 0,
+        },
+        "9"
+      );
+    });
+
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(4_000);
+    });
+
+    expect(sources[0]?.closed).toBe(true);
+    expect(sources).toHaveLength(1);
+
+    act(() => {
+      queryClient.setQueryData(sessionKeys.detail(workspaceId, sessionId), primarySessionFixture);
+    });
+
+    await act(async () => {
+      await vi.waitFor(() => {
+        expect(sources).toHaveLength(2);
+      });
+    });
+    expect(sources[1]?.url).toBe(
+      `/api/workspaces/${workspaceId}/sessions/${sessionId}/stream?${SESSION_STREAM_QUERY}&after_sequence=1&epoch=1&generation=1`
+    );
+  }, 10_000);
+
+  it("Should expose transcript fetch failure through provider context while attempting the stream", async () => {
+    transcriptFetchShouldFail = true;
+    const sources: FakeSessionEventSource[] = [];
+
+    renderSessionThread({
+      includeTranscriptStateProbe: true,
+      eventSourceFactory: url => {
+        const source = new FakeSessionEventSource(url);
+        sources.push(source);
+        return source;
+      },
+    });
+
+    await waitFor(() => {
+      expect(sources).toHaveLength(1);
+    });
+    await waitFor(() => {
+      expect(screen.getByTestId("transcript-state-probe")).toHaveAttribute("data-status", "error");
+    });
+
+    const state = screen.getByTestId("transcript-state-probe");
+    expect(sources[0]?.url).toBe(
+      `/api/workspaces/${primarySessionFixture.workspace_id}/sessions/${primarySessionFixture.id}/stream?${SESSION_STREAM_QUERY}`
+    );
+    expect(state).toHaveAttribute("data-is-error", "true");
+    expect(state).toHaveTextContent("0");
+    expect(state.getAttribute("data-error-message")).toContain("recorder temporarily unavailable");
+  }, 10_000);
+
+  it("Should expose large transcript histories in order through a bounded DOM window", async () => {
+    transcriptMessages = Array.from({ length: 80 }, (_, index) => ({
+      id: `transcript_large_${index}`,
+      role: index % 2 === 0 ? "user" : "assistant",
+      parts: [{ type: "text", text: `Large transcript message ${index}`, state: "done" }],
+    })) as TranscriptMessage[];
+
+    renderSessionThread({ includeTranscriptStateProbe: true });
+
+    await waitFor(() => {
+      expect(screen.getByTestId("transcript-state-probe")).toHaveTextContent("80");
+      const renderedRows = screen.getAllByTestId("thread-message-row");
+      expect(renderedRows.length).toBeGreaterThan(0);
+      expect(renderedRows.length).toBeLessThan(80);
+    });
+
+    const renderedRows = screen.getAllByTestId("thread-message-row");
+    const rowIndexes = renderedRows.map(row => Number(row.getAttribute("data-message-index")));
+    expect(rowIndexes).toEqual([...rowIndexes].sort((left, right) => left - right));
+    for (const [position, row] of renderedRows.entries()) {
+      expect(
+        within(row).getByText(`Large transcript message ${rowIndexes[position]}`)
+      ).toBeVisible();
+    }
+  }, 10_000);
+});

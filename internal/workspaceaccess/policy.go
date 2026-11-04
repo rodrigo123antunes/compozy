@@ -1,0 +1,107 @@
+package workspaceaccess
+
+import "context"
+
+// DenialHint is the canonical operator guidance returned by workspace-access seams.
+const DenialHint = "cross-workspace access is denied by this session's permission mode; " +
+	"ask the operator to set the agent's permissions.mode to approve-all, or approve the prompt when asked"
+
+// ActorKind identifies the trusted runtime origin of an access request.
+type ActorKind string
+
+const (
+	ActorAgentSession ActorKind = "agent_session"
+	ActorHuman        ActorKind = "human"
+	ActorExtension    ActorKind = "extension"
+	ActorAutomation   ActorKind = "automation"
+	ActorDaemon       ActorKind = "daemon"
+)
+
+// ActorRef carries daemon-validated actor identity into the policy.
+type ActorRef struct {
+	Kind        ActorKind
+	SessionID   string
+	WorkspaceID string
+	AgentName   string
+	Operator    bool
+}
+
+// Seam identifies the runtime boundary requesting cross-workspace access.
+type Seam string
+
+const (
+	SeamIdentity Seam = "identity"
+	SeamTask     Seam = "task"
+	SeamTool     Seam = "tool"
+	SeamSpawn    Seam = "spawn"
+	SeamCatalog  Seam = "catalog"
+)
+
+// Request is the complete input to one workspace-access decision.
+type Request struct {
+	Actor    ActorRef
+	Target   TargetRef
+	ReadOnly bool
+	Seam     Seam
+}
+
+// DecisionSource records the policy branch that produced a decision.
+type DecisionSource string
+
+const (
+	SourceAgentGrant     DecisionSource = "agent_grant"
+	SourceOperator       DecisionSource = "operator"
+	SourceSameWorkspace  DecisionSource = "same_workspace"
+	SourcePermissionMode DecisionSource = "permission_mode"
+	SourceSessionConsent DecisionSource = "session_consent"
+	SourceToolConsent    DecisionSource = "tool_consent"
+	SourceDenied         DecisionSource = "denied"
+)
+
+// Decision is the fail-closed result of one authorization request.
+type Decision struct {
+	Allowed        bool
+	Source         DecisionSource
+	PromptEligible bool
+	// Denial names the axis that refused a denied decision; empty when allowed.
+	Denial Denial
+	// NeedsGrantAfterConsent marks a prompt-eligible write to another profile or through an
+	// aggregate: an operator "allow" grants reach, but the write itself still needs the grant.
+	NeedsGrantAfterConsent bool
+}
+
+// Policy is the single decision funnel for cross-workspace access.
+type Policy interface {
+	Authorize(ctx context.Context, req Request) (Decision, error)
+}
+
+type TargetKind string
+
+const (
+	TargetWorkspace TargetKind = "workspace"
+	TargetUser      TargetKind = "user"
+	TargetAggregate TargetKind = "aggregate"
+	// TargetUnresolved is a named target, such as a session id, that resolves to no visible
+	// owner. The policy treats it as outside the actor's workspace and profile so a denied
+	// caller learns nothing about whether the target exists.
+	TargetUnresolved TargetKind = "unresolved"
+)
+
+type TargetRef struct {
+	Kind        TargetKind
+	WorkspaceID string
+	ProfileID   string
+	AllProfiles bool
+	Surface     string
+}
+
+// UserSelector is the reserved workspace selector naming the User scope.
+const UserSelector = "@user"
+
+// ScopeTarget translates an internal owner or an explicit User selector into a policy target.
+func ScopeTarget(workspaceID, profileID string) TargetRef {
+	if workspaceID == "" || workspaceID == "@user" {
+		return TargetRef{Kind: TargetUser, ProfileID: profileID}
+	}
+	return TargetRef{Kind: TargetWorkspace, WorkspaceID: workspaceID, ProfileID: profileID}
+}

@@ -1,0 +1,354 @@
+package globaldb
+
+import (
+	"context"
+	"database/sql"
+	"errors"
+	"fmt"
+
+	"github.com/compozy/compozy/internal/store/globaldb/sqlcgen"
+	taskpkg "github.com/compozy/compozy/internal/task"
+)
+
+var _ taskpkg.ExecutionProfileStore = (*TaskRepo)(nil)
+
+const (
+	profileRoleWorker      = "worker"
+	profileRoleReview      = "review"
+	profileRoleParticipant = "participant"
+
+	profilePreferenceAllowed   = "allowed"
+	profilePreferencePreferred = "preferred"
+	profilePreferenceRequired  = "required"
+)
+
+// GetExecutionProfile returns the persisted typed execution profile for one task.
+func (g *TaskRepo) GetExecutionProfile(
+	ctx context.Context,
+	taskID string,
+) (taskpkg.ExecutionProfile, error) {
+	if err := g.checkReady(ctx, "get task execution profile"); err != nil {
+		return taskpkg.ExecutionProfile{}, err
+	}
+	trimmedID, err := requireTaskValue(taskID, "task execution profile task id")
+	if err != nil {
+		return taskpkg.ExecutionProfile{}, err
+	}
+
+	profile, found, err := loadExecutionProfile(ctx, g.readDB, trimmedID)
+	if err != nil {
+		return taskpkg.ExecutionProfile{}, err
+	}
+	if !found {
+		return taskpkg.ExecutionProfile{}, taskpkg.ErrExecutionProfileNotFound
+	}
+	return profile, nil
+}
+
+// UpsertExecutionProfile replaces one task-owned execution profile and its selectors atomically.
+func (g *TaskRepo) UpsertExecutionProfile(
+	ctx context.Context,
+	profile *taskpkg.ExecutionProfile,
+) (stored taskpkg.ExecutionProfile, err error) {
+	if err := g.checkReady(ctx, "upsert task execution profile"); err != nil {
+		return taskpkg.ExecutionProfile{}, err
+	}
+	normalized, err := profile.Normalize(taskpkg.DefaultExecutionProfileValidationOptions())
+	if err != nil {
+		return taskpkg.ExecutionProfile{}, err
+	}
+
+	if err := g.withTaskImmediateTransaction(ctx, "upsert task execution profile", func(exec taskSQLExecutor) error {
+		var storeErr error
+		stored, storeErr = g.upsertExecutionProfileWithExecutor(ctx, exec, &normalized)
+		return storeErr
+	}); err != nil {
+		return taskpkg.ExecutionProfile{}, err
+	}
+	return stored, nil
+}
+
+func (g *TaskRepo) upsertExecutionProfileWithExecutor(
+	ctx context.Context,
+	exec taskSQLExecutor,
+	profile *taskpkg.ExecutionProfile,
+) (taskpkg.ExecutionProfile, error) {
+	normalized, err := profile.Normalize(taskpkg.DefaultExecutionProfileValidationOptions())
+	if err != nil {
+		return taskpkg.ExecutionProfile{}, err
+	}
+	if err := g.ensureTaskExistsWithExecutor(ctx, exec, normalized.TaskID); err != nil {
+		return taskpkg.ExecutionProfile{}, err
+	}
+
+	now := g.now().UTC()
+	existing, found, err := loadExecutionProfile(ctx, exec, normalized.TaskID)
+	if err != nil {
+		return taskpkg.ExecutionProfile{}, err
+	}
+	if found {
+		normalized.CreatedAt = existing.CreatedAt
+	}
+	if normalized.CreatedAt.IsZero() {
+		normalized.CreatedAt = now
+	}
+	normalized.UpdatedAt = now
+
+	if err := upsertExecutionProfileRow(ctx, exec, &normalized); err != nil {
+		return taskpkg.ExecutionProfile{}, err
+	}
+	if err := replaceExecutionProfileSelectors(ctx, exec, &normalized); err != nil {
+		return taskpkg.ExecutionProfile{}, err
+	}
+	return reloadExecutionProfile(ctx, exec, normalized.TaskID)
+}
+
+// DeleteExecutionProfile removes one profile and its selector rows.
+func (g *TaskRepo) DeleteExecutionProfile(ctx context.Context, taskID string) error {
+	if err := g.checkReady(ctx, "delete task execution profile"); err != nil {
+		return err
+	}
+	trimmedID, err := requireTaskValue(taskID, "task execution profile task id")
+	if err != nil {
+		return err
+	}
+
+	return g.withTaskImmediateTransaction(ctx, "delete task execution profile", func(exec taskSQLExecutor) error {
+		return deleteExecutionProfileWithExecutor(ctx, exec, trimmedID)
+	})
+}
+
+func deleteExecutionProfileWithExecutor(ctx context.Context, exec taskSQLExecutor, taskID string) error {
+	if err := deleteExecutionProfileSelectors(ctx, exec, taskID); err != nil {
+		return err
+	}
+	affected, err := sqlcgen.New(exec).DeleteTaskExecutionProfile(ctx, taskID)
+	if err != nil {
+		return fmt.Errorf("store: delete task execution profile %q: %w", taskID, err)
+	}
+	if affected == 0 {
+		return fmt.Errorf(
+			"store: task execution profile %q: %w",
+			taskID,
+			taskpkg.ErrExecutionProfileNotFound,
+		)
+	}
+	return nil
+}
+
+func loadExecutionProfile(
+	ctx context.Context,
+	exec taskSQLExecutor,
+	taskID string,
+) (taskpkg.ExecutionProfile, bool, error) {
+	row, err := sqlcgen.New(exec).GetTaskExecutionProfile(ctx, taskID)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return taskpkg.ExecutionProfile{}, false, nil
+		}
+		return taskpkg.ExecutionProfile{}, false, err
+	}
+	profile, err := executionProfileFromGenerated(row)
+	if err != nil {
+		return taskpkg.ExecutionProfile{}, false, err
+	}
+	if err := loadExecutionProfileSelectors(ctx, exec, &profile); err != nil {
+		return taskpkg.ExecutionProfile{}, false, err
+	}
+	normalized, err := profile.Normalize(taskpkg.DefaultExecutionProfileValidationOptions())
+	if err != nil {
+		return taskpkg.ExecutionProfile{}, false, fmt.Errorf(
+			"store: validate task execution profile %q: %w",
+			taskID,
+			err,
+		)
+	}
+	return normalized, true, nil
+}
+
+func reloadExecutionProfile(
+	ctx context.Context,
+	exec taskSQLExecutor,
+	taskID string,
+) (taskpkg.ExecutionProfile, error) {
+	profile, found, err := loadExecutionProfile(ctx, exec, taskID)
+	if err != nil {
+		return taskpkg.ExecutionProfile{}, err
+	}
+	if !found {
+		return taskpkg.ExecutionProfile{}, taskpkg.ErrExecutionProfileNotFound
+	}
+	return profile, nil
+}
+
+func replaceExecutionProfileSelectors(
+	ctx context.Context,
+	exec taskSQLExecutor,
+	profile *taskpkg.ExecutionProfile,
+) error {
+	if err := deleteExecutionProfileSelectors(ctx, exec, profile.TaskID); err != nil {
+		return err
+	}
+	if err := insertTaskProfileAgentSelectors(ctx, exec, profile); err != nil {
+		return err
+	}
+	return insertTaskProfileCapabilitySelectors(ctx, exec, profile)
+}
+
+func deleteExecutionProfileSelectors(ctx context.Context, exec taskSQLExecutor, taskID string) error {
+	queries := sqlcgen.New(exec)
+	deletes := []struct {
+		label string
+		apply func(context.Context, string) error
+	}{
+		{label: "task_profile_agents", apply: queries.DeleteTaskProfileAgents},
+		{label: "task_profile_capabilities", apply: queries.DeleteTaskProfileCapabilities},
+	}
+	for _, deletion := range deletes {
+		if err := deletion.apply(ctx, taskID); err != nil {
+			return fmt.Errorf("store: delete %s rows for task %q: %w", deletion.label, taskID, err)
+		}
+	}
+	return nil
+}
+
+func insertTaskProfileAgentSelectors(
+	ctx context.Context,
+	exec taskSQLExecutor,
+	profile *taskpkg.ExecutionProfile,
+) error {
+	rows := []profileSelectorRow{
+		{profileRoleWorker, profilePreferenceAllowed, profile.Worker.AllowedAgentNames},
+		{profileRoleWorker, profilePreferencePreferred, profile.Worker.PreferredAgentNames},
+		{profileRoleReview, profilePreferenceAllowed, profile.Review.AllowedAgentNames},
+		{profileRoleReview, profilePreferencePreferred, profile.Review.PreferredAgentNames},
+		{profileRoleParticipant, profilePreferenceAllowed, profile.Participants.AllowedAgentNames},
+		{profileRoleParticipant, profilePreferencePreferred, profile.Participants.PreferredAgentNames},
+	}
+	queries := sqlcgen.New(exec)
+	for _, row := range rows {
+		for _, value := range row.values {
+			if err := queries.InsertTaskProfileAgent(ctx, sqlcgen.InsertTaskProfileAgentParams{
+				TaskID: profile.TaskID, Role: row.role, Preference: row.preference, Value: value,
+			}); err != nil {
+				return fmt.Errorf("store: insert task_profile_agents selector for task %q: %w", profile.TaskID, err)
+			}
+		}
+	}
+	return nil
+}
+
+func insertTaskProfileCapabilitySelectors(
+	ctx context.Context,
+	exec taskSQLExecutor,
+	profile *taskpkg.ExecutionProfile,
+) error {
+	rows := []profileSelectorRow{
+		{profileRoleWorker, profilePreferenceRequired, profile.Worker.RequiredCapabilities},
+		{profileRoleWorker, profilePreferencePreferred, profile.Worker.PreferredCapabilities},
+		{profileRoleReview, profilePreferenceRequired, profile.Review.RequiredCapabilities},
+		{profileRoleReview, profilePreferencePreferred, profile.Review.PreferredCapabilities},
+		{profileRoleParticipant, profilePreferenceRequired, profile.Participants.RequiredCapabilities},
+		{profileRoleParticipant, profilePreferencePreferred, profile.Participants.PreferredCapabilities},
+	}
+	queries := sqlcgen.New(exec)
+	for _, row := range rows {
+		for _, value := range row.values {
+			if err := queries.InsertTaskProfileCapability(ctx, sqlcgen.InsertTaskProfileCapabilityParams{
+				TaskID: profile.TaskID, Role: row.role, Preference: row.preference, Value: value,
+			}); err != nil {
+				return fmt.Errorf(
+					"store: insert task_profile_capabilities selector for task %q: %w",
+					profile.TaskID,
+					err,
+				)
+			}
+		}
+	}
+	return nil
+}
+
+type profileSelectorRow struct {
+	role       string
+	preference string
+	values     []string
+}
+
+func loadExecutionProfileSelectors(
+	ctx context.Context,
+	exec taskSQLExecutor,
+	profile *taskpkg.ExecutionProfile,
+) error {
+	if err := loadTaskProfileAgentSelectors(ctx, exec, profile); err != nil {
+		return err
+	}
+	return loadTaskProfileCapabilitySelectors(ctx, exec, profile)
+}
+
+func loadTaskProfileAgentSelectors(
+	ctx context.Context,
+	exec taskSQLExecutor,
+	profile *taskpkg.ExecutionProfile,
+) error {
+	rows, err := sqlcgen.New(exec).ListTaskProfileAgents(ctx, profile.TaskID)
+	if err != nil {
+		return fmt.Errorf("store: query task_profile_agents selectors for task %q: %w", profile.TaskID, err)
+	}
+	for _, generated := range rows {
+		row := loadedProfileSelectorRow{generated.Role, generated.Preference, generated.Value}
+		switch {
+		case row.matches(profileRoleWorker, profilePreferenceAllowed):
+			profile.Worker.AllowedAgentNames = append(profile.Worker.AllowedAgentNames, row.value)
+		case row.matches(profileRoleWorker, profilePreferencePreferred):
+			profile.Worker.PreferredAgentNames = append(profile.Worker.PreferredAgentNames, row.value)
+		case row.matches(profileRoleReview, profilePreferenceAllowed):
+			profile.Review.AllowedAgentNames = append(profile.Review.AllowedAgentNames, row.value)
+		case row.matches(profileRoleReview, profilePreferencePreferred):
+			profile.Review.PreferredAgentNames = append(profile.Review.PreferredAgentNames, row.value)
+		case row.matches(profileRoleParticipant, profilePreferenceAllowed):
+			profile.Participants.AllowedAgentNames = append(profile.Participants.AllowedAgentNames, row.value)
+		case row.matches(profileRoleParticipant, profilePreferencePreferred):
+			profile.Participants.PreferredAgentNames = append(profile.Participants.PreferredAgentNames, row.value)
+		}
+	}
+	return nil
+}
+
+func loadTaskProfileCapabilitySelectors(
+	ctx context.Context,
+	exec taskSQLExecutor,
+	profile *taskpkg.ExecutionProfile,
+) error {
+	rows, err := sqlcgen.New(exec).ListTaskProfileCapabilities(ctx, profile.TaskID)
+	if err != nil {
+		return fmt.Errorf("store: query task_profile_capabilities selectors for task %q: %w", profile.TaskID, err)
+	}
+	for _, generated := range rows {
+		row := loadedProfileSelectorRow{generated.Role, generated.Preference, generated.Value}
+		switch {
+		case row.matches(profileRoleWorker, profilePreferenceRequired):
+			profile.Worker.RequiredCapabilities = append(profile.Worker.RequiredCapabilities, row.value)
+		case row.matches(profileRoleWorker, profilePreferencePreferred):
+			profile.Worker.PreferredCapabilities = append(profile.Worker.PreferredCapabilities, row.value)
+		case row.matches(profileRoleReview, profilePreferenceRequired):
+			profile.Review.RequiredCapabilities = append(profile.Review.RequiredCapabilities, row.value)
+		case row.matches(profileRoleReview, profilePreferencePreferred):
+			profile.Review.PreferredCapabilities = append(profile.Review.PreferredCapabilities, row.value)
+		case row.matches(profileRoleParticipant, profilePreferenceRequired):
+			profile.Participants.RequiredCapabilities = append(profile.Participants.RequiredCapabilities, row.value)
+		case row.matches(profileRoleParticipant, profilePreferencePreferred):
+			profile.Participants.PreferredCapabilities = append(profile.Participants.PreferredCapabilities, row.value)
+		}
+	}
+	return nil
+}
+
+type loadedProfileSelectorRow struct {
+	role       string
+	preference string
+	value      string
+}
+
+func (r loadedProfileSelectorRow) matches(role string, preference string) bool {
+	return r.role == role && r.preference == preference
+}

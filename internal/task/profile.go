@@ -1,0 +1,230 @@
+package task
+
+import (
+	"slices"
+	"strings"
+	"time"
+
+	speedpkg "github.com/compozy/compozy/internal/speed"
+)
+
+const (
+	// CoordinatorModeInherit uses daemon/workspace coordinator defaults.
+	CoordinatorModeInherit CoordinatorMode = "inherit"
+	// CoordinatorModeGuided injects task-specific guidance into the existing coordinator.
+	CoordinatorModeGuided CoordinatorMode = "guided"
+
+	// WorkerModeInherit uses normal task/run and workspace worker defaults.
+	WorkerModeInherit WorkerMode = "inherit"
+	// WorkerModeSelect narrows worker selection using the task profile.
+	WorkerModeSelect WorkerMode = "select"
+
+	// RuntimeModeDefault uses the normal task-session runtime contract.
+	RuntimeModeDefault RuntimeMode = "default"
+	// RuntimeModeEvidence explicitly allows runtime/browser/mobile evidence work.
+	RuntimeModeEvidence RuntimeMode = "evidence"
+)
+
+const (
+	defaultCoordinatorGuidanceMaxBytes = 8192
+	profileSelectorMaxBytes            = 128
+)
+
+// CoordinatorMode identifies task-specific coordinator bootstrap behavior.
+type CoordinatorMode string
+
+// WorkerMode identifies how a task narrows worker selection.
+type WorkerMode string
+
+// RuntimeMode identifies task-level runtime evidence behavior.
+type RuntimeMode string
+
+// ExecutionProfile is the typed task-owned orchestration selection state.
+type ExecutionProfile struct {
+	TaskID       string             `json:"task_id"`
+	Coordinator  CoordinatorProfile `json:"coordinator"`
+	Worker       WorkerProfile      `json:"worker"`
+	Review       ReviewProfile      `json:"review"`
+	Participants ParticipantPolicy  `json:"participants"`
+	Worktree     WorktreePolicy     `json:"worktree"`
+	Runtime      RuntimePolicy      `json:"runtime"`
+	CreatedAt    time.Time          `json:"created_at"`
+	UpdatedAt    time.Time          `json:"updated_at"`
+}
+
+// CoordinatorProfile supplies optional guidance to the existing coordinator runtime.
+type CoordinatorProfile struct {
+	Mode      CoordinatorMode `json:"mode"`
+	AgentName string          `json:"agent_name,omitempty"`
+	Provider  string          `json:"provider,omitempty"`
+	Model     string          `json:"model,omitempty"`
+	Guidance  string          `json:"guidance,omitempty"`
+}
+
+// WorkerProfile narrows eligible task workers without granting runtime authority.
+type WorkerProfile struct {
+	Mode                  WorkerMode           `json:"mode"`
+	AgentName             string               `json:"agent_name,omitempty"`
+	Provider              string               `json:"provider,omitempty"`
+	Model                 string               `json:"model,omitempty"`
+	ReasoningEffort       string               `json:"reasoning_effort,omitempty"`
+	Speed                 speedpkg.Speed       `json:"speed,omitempty"`
+	ACPOptions            []ACPOptionSelection `json:"acp_options,omitempty"`
+	AllowedAgentNames     []string             `json:"allowed_agent_names,omitempty"`
+	PreferredAgentNames   []string             `json:"preferred_agent_names,omitempty"`
+	RequiredCapabilities  []string             `json:"required_capabilities,omitempty"`
+	PreferredCapabilities []string             `json:"preferred_capabilities,omitempty"`
+}
+
+// ReviewProfile narrows reviewer execution shape; verdict authority stays in task review APIs.
+type ReviewProfile struct {
+	AgentName             string               `json:"agent_name,omitempty"`
+	Provider              string               `json:"provider,omitempty"`
+	Model                 string               `json:"model,omitempty"`
+	ReasoningEffort       string               `json:"reasoning_effort,omitempty"`
+	Speed                 speedpkg.Speed       `json:"speed,omitempty"`
+	ACPOptions            []ACPOptionSelection `json:"acp_options,omitempty"`
+	AllowedAgentNames     []string             `json:"allowed_agent_names,omitempty"`
+	PreferredAgentNames   []string             `json:"preferred_agent_names,omitempty"`
+	RequiredCapabilities  []string             `json:"required_capabilities,omitempty"`
+	PreferredCapabilities []string             `json:"preferred_capabilities,omitempty"`
+}
+
+// ParticipantPolicy is an upper-bound routing policy, not a permission grant.
+type ParticipantPolicy struct {
+	AllowedAgentNames     []string `json:"allowed_agent_names,omitempty"`
+	PreferredAgentNames   []string `json:"preferred_agent_names,omitempty"`
+	RequiredCapabilities  []string `json:"required_capabilities,omitempty"`
+	PreferredCapabilities []string `json:"preferred_capabilities,omitempty"`
+}
+
+// RuntimePolicy opts a task into broader runtime-evidence operations.
+type RuntimePolicy struct {
+	Mode RuntimeMode `json:"mode"`
+}
+
+// ExecutionProfileValidationOptions carries config-backed gates without coupling task to config.
+type ExecutionProfileValidationOptions struct {
+	AllowProviderOverride       bool
+	DefaultWorktreeMode         WorktreeMode
+	MaxCoordinatorGuidanceBytes int
+}
+
+// DefaultExecutionProfileValidationOptions returns the permissive built-in gates.
+func DefaultExecutionProfileValidationOptions() ExecutionProfileValidationOptions {
+	return ExecutionProfileValidationOptions{
+		AllowProviderOverride:       true,
+		DefaultWorktreeMode:         WorktreeModeInherit,
+		MaxCoordinatorGuidanceBytes: defaultCoordinatorGuidanceMaxBytes,
+	}
+}
+
+// Normalize returns the normalized coordinator mode.
+func (m CoordinatorMode) Normalize() CoordinatorMode {
+	return CoordinatorMode(strings.ToLower(strings.TrimSpace(string(m))))
+}
+
+// Normalize returns the normalized worker mode.
+func (m WorkerMode) Normalize() WorkerMode {
+	return WorkerMode(strings.ToLower(strings.TrimSpace(string(m))))
+}
+
+// Normalize returns the normalized runtime mode.
+func (m RuntimeMode) Normalize() RuntimeMode {
+	return RuntimeMode(strings.ToLower(strings.TrimSpace(string(m))))
+}
+
+func normalizeCoordinatorProfile(profile CoordinatorProfile) CoordinatorProfile {
+	profile.Mode = profile.Mode.Normalize()
+	if profile.Mode == "" {
+		profile.Mode = CoordinatorModeInherit
+	}
+	profile.AgentName = strings.TrimSpace(profile.AgentName)
+	profile.Provider = strings.TrimSpace(profile.Provider)
+	profile.Model = strings.TrimSpace(profile.Model)
+	profile.Guidance = strings.TrimSpace(profile.Guidance)
+	return profile
+}
+
+func normalizeWorkerProfile(profile WorkerProfile) (WorkerProfile, error) {
+	profile.Mode = profile.Mode.Normalize()
+	if profile.Mode == "" {
+		profile.Mode = WorkerModeInherit
+	}
+	profile.AgentName = strings.TrimSpace(profile.AgentName)
+	profile.Provider = strings.TrimSpace(profile.Provider)
+	profile.Model = strings.TrimSpace(profile.Model)
+	var err error
+	profile.ReasoningEffort, profile.Speed, profile.ACPOptions, err = normalizeProfileRuntime(
+		profile.ReasoningEffort,
+		profile.Speed,
+		profile.ACPOptions,
+		"task_execution_profile.worker",
+	)
+	if err != nil {
+		return WorkerProfile{}, err
+	}
+	profile.AllowedAgentNames = normalizeProfileSelectorList(profile.AllowedAgentNames)
+	profile.PreferredAgentNames = normalizeProfileSelectorList(profile.PreferredAgentNames)
+	profile.RequiredCapabilities = normalizeProfileSelectorList(profile.RequiredCapabilities)
+	profile.PreferredCapabilities = normalizeProfileSelectorList(profile.PreferredCapabilities)
+	return profile, nil
+}
+
+func normalizeReviewProfile(profile ReviewProfile) (ReviewProfile, error) {
+	profile.AgentName = strings.TrimSpace(profile.AgentName)
+	profile.Provider = strings.TrimSpace(profile.Provider)
+	profile.Model = strings.TrimSpace(profile.Model)
+	var err error
+	profile.ReasoningEffort, profile.Speed, profile.ACPOptions, err = normalizeProfileRuntime(
+		profile.ReasoningEffort,
+		profile.Speed,
+		profile.ACPOptions,
+		"task_execution_profile.review",
+	)
+	if err != nil {
+		return ReviewProfile{}, err
+	}
+	profile.AllowedAgentNames = normalizeProfileSelectorList(profile.AllowedAgentNames)
+	profile.PreferredAgentNames = normalizeProfileSelectorList(profile.PreferredAgentNames)
+	profile.RequiredCapabilities = normalizeProfileSelectorList(profile.RequiredCapabilities)
+	profile.PreferredCapabilities = normalizeProfileSelectorList(profile.PreferredCapabilities)
+	return profile, nil
+}
+
+func normalizeParticipantPolicy(policy ParticipantPolicy) ParticipantPolicy {
+	policy.AllowedAgentNames = normalizeProfileSelectorList(policy.AllowedAgentNames)
+	policy.PreferredAgentNames = normalizeProfileSelectorList(policy.PreferredAgentNames)
+	policy.RequiredCapabilities = normalizeProfileSelectorList(policy.RequiredCapabilities)
+	policy.PreferredCapabilities = normalizeProfileSelectorList(policy.PreferredCapabilities)
+	return policy
+}
+
+func normalizeRuntimePolicy(policy RuntimePolicy) RuntimePolicy {
+	policy.Mode = policy.Mode.Normalize()
+	if policy.Mode == "" {
+		policy.Mode = RuntimeModeDefault
+	}
+	return policy
+}
+
+func normalizeProfileSelectorList(values []string) []string {
+	if len(values) == 0 {
+		return nil
+	}
+	seen := make(map[string]struct{}, len(values))
+	normalized := make([]string, 0, len(values))
+	for _, value := range values {
+		trimmed := strings.TrimSpace(value)
+		if trimmed == "" {
+			continue
+		}
+		if _, ok := seen[trimmed]; ok {
+			continue
+		}
+		seen[trimmed] = struct{}{}
+		normalized = append(normalized, trimmed)
+	}
+	slices.Sort(normalized)
+	return normalized
+}

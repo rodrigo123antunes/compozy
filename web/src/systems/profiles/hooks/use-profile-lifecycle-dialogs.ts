@@ -1,0 +1,107 @@
+import { useArchivePlan, useDeletePlan, useRenamePlan } from "./use-profile-plans";
+import { useProfileLifecycle, type ProfileLifecycleState } from "./use-profile-lifecycle";
+import {
+  useArchiveProfile,
+  useCreateProfile,
+  useDeleteProfile,
+  useRenameProfile,
+  useUnarchiveProfile,
+  useUpdateProfileIdentity,
+} from "./use-profile-mutations";
+import type {
+  ArchiveProfilePlan,
+  DeleteProfilePlan,
+  ProfilePayload,
+  RenameProfilePlan,
+} from "../types";
+
+export interface ProfileLifecycleDialogsModel {
+  lifecycle: ProfileLifecycleState;
+  target: string;
+  profile: ProfilePayload | undefined;
+  workItems: number;
+  acceptedRepos: string[];
+  create: ReturnType<typeof useCreateProfile>;
+  rename: ReturnType<typeof useRenameProfile>;
+  update: ReturnType<typeof useUpdateProfileIdentity>;
+  archive: ReturnType<typeof useArchiveProfile>;
+  unarchive: ReturnType<typeof useUnarchiveProfile>;
+  remove: ReturnType<typeof useDeleteProfile>;
+  renamePlan: {
+    data: RenameProfilePlan | undefined;
+    isFetching: boolean;
+    error: unknown;
+    refetch: () => void;
+  };
+  archivePlan: {
+    data: ArchiveProfilePlan | undefined;
+    isFetching: boolean;
+    error: unknown;
+    refetch: () => void;
+  };
+  deletePlan: {
+    data: DeleteProfilePlan | undefined;
+    isFetching: boolean;
+    error: unknown;
+    refetch: () => void;
+  };
+}
+
+/**
+ * Everything the dialog host needs, assembled in one place.
+ *
+ * The host stays a switch over the open intent; the plan reads and the five
+ * mutations live here so no single component carries the whole lifecycle.
+ */
+export function useProfileLifecycleDialogs(
+  profiles: readonly ProfilePayload[],
+  onProfileRenamed?: () => Promise<unknown>
+): ProfileLifecycleDialogsModel {
+  const lifecycle = useProfileLifecycle();
+  const flow = lifecycle.intent?.flow;
+  const target = lifecycle.intent?.profile ?? "";
+  const profile = profiles.find(candidate => candidate.name === target);
+  const workItems = profile?.work_items ?? 0;
+
+  const renamePlan = useRenamePlan(target, lifecycle.renameName, flow === "rename");
+  const archivePlan = useArchivePlan(target, flow === "archive");
+  const deletePlan = useDeletePlan(target, flow === "delete" && workItems === 0);
+  // Offers start selected; retain only the operator's explicit declines.
+  const declinedRepos = new Set(lifecycle.declinedRepos);
+  const acceptedRepos: string[] = [];
+  for (const candidate of renamePlan.data?.repo_candidates ?? []) {
+    if (!declinedRepos.has(candidate.workspace_id)) acceptedRepos.push(candidate.workspace_id);
+  }
+
+  return {
+    lifecycle,
+    target,
+    profile,
+    workItems,
+    acceptedRepos,
+    create: useCreateProfile(),
+    rename: useRenameProfile({ onRenamed: onProfileRenamed }),
+    update: useUpdateProfileIdentity(),
+    archive: useArchiveProfile(),
+    unarchive: useUnarchiveProfile(),
+    remove: useDeleteProfile(),
+    renamePlan: {
+      data: renamePlan.data,
+      isFetching: renamePlan.isFetching,
+      error: renamePlan.error,
+      refetch: () => void renamePlan.refetch(),
+    },
+    archivePlan: {
+      data: archivePlan.data,
+      isFetching: archivePlan.isFetching,
+      error: archivePlan.error,
+      refetch: () => void archivePlan.refetch(),
+    },
+    deletePlan: {
+      data: deletePlan.data,
+      isFetching: deletePlan.isFetching,
+      error: deletePlan.error,
+      refetch: () => void deletePlan.refetch(),
+    },
+  };
+}

@@ -1,0 +1,135 @@
+import type { JSONValue } from "./base-types.js";
+import type {
+  HookEvent,
+  HookExecutorKind,
+  HookMatcher,
+  HookMode,
+  HostAPIMethod,
+  DescribeSubprocess,
+  DescribeResources,
+  DescribeProfile,
+  DescribeHookEvent,
+  DescribeGatewayRequirement,
+  ExtensionCommandGroupSpec,
+  ExtensionCommandSpec,
+  RiskClass,
+  SourceKind,
+  ToolID,
+  ToolsetID,
+  Visibility,
+} from "./generated/contracts.js";
+
+export * from "./base-types.js";
+export * from "./generated/contracts.js";
+
+export type ToolSource = SourceKind;
+
+export type ExtensionSourceTier = "bundled" | "user" | "workspace" | "marketplace";
+
+export interface HookExecutorConfig {
+  kind?: HookExecutorKind;
+  command?: string;
+  args?: string[];
+  env?: Record<string, string>;
+}
+
+export interface HookConfig {
+  name: string;
+  event: HookEvent;
+  mode?: HookMode;
+  required?: boolean;
+  priority?: number;
+  timeout?: string;
+  matcher?: HookMatcher;
+  command?: string;
+  args?: string[];
+  env?: Record<string, string>;
+  executor?: HookExecutorConfig;
+}
+
+export interface MCPServerConfig {
+  command: string;
+  args?: string[];
+  env?: Record<string, string>;
+}
+
+export interface ToolConfig {
+  id?: ToolID;
+  display_title?: string;
+  description?: string;
+  input_schema?: JSONValue;
+  output_schema?: JSONValue;
+  handler?: string;
+  backend?: {
+    kind?: "extension_host" | "mcp";
+    handler?: string;
+    server?: string;
+    tool?: string;
+  };
+  visibility?: Visibility;
+  risk?: RiskClass;
+  read_only?: boolean;
+  destructive?: boolean;
+  open_world?: boolean;
+  requires_interaction?: boolean;
+  concurrency_safe?: boolean;
+  max_result_bytes?: number;
+  toolsets?: ToolsetID[];
+  tags?: string[];
+  search_hints?: string[];
+  required_capabilities?: string[];
+  command?: ExtensionCommandSpec;
+}
+
+export interface ResourcesConfig extends DescribeResources {
+  hooks?: HookConfig[];
+  tools?: Record<string, ToolConfig>;
+  command_groups?: ExtensionCommandGroupSpec[];
+  mcp_servers?: Record<string, MCPServerConfig>;
+}
+
+export interface CapabilitiesConfig {
+  provides?: string[];
+}
+
+export interface PermissionsConfig {
+  requires?: HostAPIMethod[];
+}
+
+export interface SubprocessConfig {
+  command?: string;
+  args?: string[];
+  env?: Record<string, string>;
+  health_check_interval?: string;
+  shutdown_timeout?: string;
+}
+
+export interface ExtensionManifest {
+  name: string;
+  version: string;
+  description?: string;
+  min_compozy_version?: string;
+  resources?: ResourcesConfig;
+  capabilities?: CapabilitiesConfig;
+  permissions?: PermissionsConfig;
+  subprocess?: SubprocessConfig;
+  gateway?: DescribeGatewayRequirement;
+}
+
+export interface ExtensionDefinition extends Pick<
+  ExtensionManifest,
+  "name" | "version" | "description" | "capabilities" | "permissions"
+> {
+  requires_env?: string[];
+  profiles?: DescribeProfile[];
+  resources?: DescribeResources;
+  subprocess?: DescribeSubprocess;
+  supported_hook_events?: DescribeHookEvent[];
+  gateway?: DescribeGatewayRequirement;
+}
+
+export interface HealthCheckResult {
+  healthy: boolean;
+  message?: string;
+  details?: Record<string, JSONValue>;
+}

@@ -1,0 +1,136 @@
+// Foundation composites: identity marks, time, form scaffolds, selection lists.
+export { Icon, type IconProps, type IconSize } from "../components/icon";
+export { MonoId, type MonoIdProps, type MonoIdSize } from "../components/custom/mono-id";
+export { QrCode, type QrCodeProps, type QrCodeSize } from "../components/custom/qr-code";
+export { Time, type TimeMode, type TimeProps } from "../components/custom/time";
+export { Disclosure, type DisclosureProps } from "../components/custom/disclosure";
+export {
+  DirectoryPickerInput,
+  type DirectoryPickerInputProps,
+  type DirectoryPickerSuggestion,
+} from "../components/custom/directory-picker-input";
+export {
+  StatusDot,
+  type StatusDotProps,
+  type StatusDotSize,
+  type StatusDotTone,
+  type StatusDotVariant,
+} from "../components/custom/status-dot";
+export {
+  StateGlyph,
+  type StateGlyphProps,
+  type StateGlyphSize,
+  type StateGlyphState,
+} from "../components/custom/state-glyph";
+export {
+  FORMAT_TIME_FALLBACK,
+  formatAbsoluteTime,
+  formatDuration,
+  formatRelativeTime,
+  type FormatDurationOptions,
+} from "../lib/format-time";
+export { LaneTabs, type LaneTabsItem, type LaneTabsProps } from "../components/custom/lane-tabs";
+export {
+  Avatar,
+  AvatarBadge,
+  AvatarFallback,
+  AvatarGroup,
+  AvatarGroupCount,
+  AvatarImage,
+  type AvatarShape,
+  type AvatarSize,
+} from "../components/avatar";
+export { ButtonGroup, ButtonGroupSeparator, ButtonGroupText } from "../components/button-group";
+export { SplitButton } from "../components/custom/split-button";
+export type { SplitButtonActionProps, SplitButtonProps } from "../components/custom/split-button";
+export { buttonGroupVariants } from "../components/button-group-variants";
+export {
+  Field,
+  FieldContent,
+  FieldDescription,
+  FieldError,
+  FieldGroup,
+  FieldHeader,
+  FieldLabel,
+  FieldLegend,
+  FieldSeparator,
+  FieldSet,
+  FieldTitle,
+} from "../components/field";
+export {
+  InputGroup,
+  InputGroupAddon,
+  InputGroupButton,
+  InputGroupInput,
+  InputGroupText,
+  InputGroupTextarea,
+} from "../components/input-group";
+export {
+  Item,
+  ItemActions,
+  ItemContent,
+  ItemDescription,
+  ItemFooter,
+  ItemGroup,
+  ItemHeader,
+  ItemMedia,
+  ItemSelectionIndicator,
+  ItemSeparator,
+  ItemTitle,
+  type ItemAs,
+  type ItemIndicator,
+  type ItemIndicatorTone,
+  type ItemProps,
+  type ItemSelectionIndicatorProps,
+} from "../components/item";
+export {
+  NativeSelect,
+  NativeSelectOptGroup,
+  NativeSelectOption,
+} from "../components/native-select";
+export { Checkbox } from "../components/checkbox";
+export { RadioGroup, RadioGroupItem } from "../components/radio-group";
+export { Surface, type SurfaceProps, type SurfaceSize } from "../components/surface";
+export { Filters, FiltersWithSearch } from "../components/reui/filters";
+export { createFilter } from "../components/reui/hooks/filter-helpers";
+export type { Filter, FilterFieldConfig, FilterFieldsConfig } from "../components/reui/filters";
+export { Textarea, type TextareaProps, type TextareaVariant } from "../components/textarea";
+export { Toaster, type ToasterProps } from "../components/sonner";
+export {
+  toast,
+  type Toast,
+  type ToastAction,
+  type ToastId,
+  type ToastOptions,
+} from "../components/sonner-toast";
+export { DirectionProvider, useDirection } from "../components/direction";
+export { SymbolPicker, type SymbolPickerProps } from "../components/custom/symbol-picker";
+export { SpriteIcon, type SpriteIconProps } from "../components/custom/sprite-icon";
+export { ColorPicker, type ColorPickerProps } from "../components/custom/color-picker";
+export {
+  matchesSymbolQuery,
+  normalizeHexColor,
+  SYMBOL_PICKER_DEFAULT_LABELS,
+  type SymbolBackground,
+  type SymbolPickerLabels,
+  type SymbolIconOption,
+  type SymbolKind,
+  type SymbolSwatch,
+  type SymbolValue,
+} from "../lib/symbol-palette";
+export {
+  identityColorsFor,
+  identitySurfaceFor,
+  type IdentityColors,
+  type IdentityTheme,
+} from "../lib/identity-palette";
+export {
+  runViewTransition,
+  startTypedTransition,
+  viewTransitionName,
+  VIEW_TRANSITION_CLASS,
+  VIEW_TRANSITION_DRILL,
+  VIEW_TRANSITION_TYPE,
+  type RunViewTransitionOptions,
+} from "../lib/view-transition";
+export { useMeasure } from "../hooks/use-measure";

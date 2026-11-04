@@ -1,0 +1,107 @@
+package daemon
+
+import (
+	core "github.com/compozy/compozy/internal/api/core"
+	"github.com/compozy/compozy/internal/cmdpalette"
+	monitorpkg "github.com/compozy/compozy/internal/monitor"
+	"github.com/compozy/compozy/internal/session"
+	terminalpkg "github.com/compozy/compozy/internal/terminal"
+	toolspkg "github.com/compozy/compozy/internal/tools"
+)
+
+func (d *Daemon) nativeToolsDeps(
+	state *bootState,
+	registryRef func() toolspkg.Registry,
+) daemonNativeToolsDeps {
+	agentCatalog := nativeAgentCatalogDependency(state)
+	deps := daemonNativeToolsDeps{
+		AgentInstances:          func() *core.AgentInstanceAPI { return state.agentInstances },
+		AgentMemory:             state.agentMemory,
+		WorkspaceAccess:         state.accessPolicy,
+		WorkspaceAccessPrompter: nativeWorkspaceAccessPrompterForBoot(state),
+		Subagents:               func() session.SubagentService { return state.subagents },
+		Logger:                  state.logger,
+		Registry:                registryRef,
+		CmdPalette:              func() cmdpalette.Registry { return state.cmdPalette },
+		ToolArtifacts:           state.toolArtifacts,
+		Config:                  state.cfg,
+		Skills:                  skillsRegistryAPI(state.skillsRegistry),
+		SkillExposures:          state.registry,
+		SkillExposureEvents:     state.registry,
+		Sessions:                state.sessions,
+		Profiles:                state.profiles,
+		ProfileManager:          state.profiles,
+		SessionAttachments:      state.sessionAttachments,
+		Workspaces:              state.workspaceResolver,
+		Worktrees:               state.worktrees,
+		WorkspaceResolver:       state.workspaceResolver,
+		ModelCatalog:            state.deps.ModelCatalog,
+		ProviderUsage:           state.deps.ProviderUsage,
+		MarketplaceCatalog:      state.deps.MarketplaceCatalog,
+		Settings:                func() core.SettingsService { return state.deps.Settings },
+
+		Tasks:            state.deps.Tasks,
+		TaskDesignations: state.registry,
+		TaskClaimHandoff: taskClaimHandoffForState(state),
+		Roles:            roleResolverForState(state),
+
+		Gateway: func() core.GatewayService {
+			if state.deps.Gateway == nil {
+				return nil
+			}
+			return state.deps.Gateway
+		},
+		GatewayPermissionMode: nativeGatewayPermissionModeSource(state.sessions),
+		HomePaths:             d.homePaths,
+		Observer:              state.observer,
+		HookBindings:          state.hookBindings,
+		AgentCatalog:          agentCatalog,
+		Vault:                 state.providerVault,
+		AgentResolver:         agentCatalog,
+		HeartbeatStatus:       state.deps.HeartbeatStatus,
+		HeartbeatWake:         state.deps.HeartbeatWake,
+		SessionHealth:         state.deps.SessionHealth,
+		WakeEvents:            state.deps.WakeEvents,
+		Automation:            state.deps.Automation,
+		AutomationRuntime: func() core.AutomationManager {
+			return state.deps.Automation
+		},
+		TerminalExecApprover: state.terminalPermissions,
+		Monitors:             func() *monitorpkg.Service { return state.sessionMonitors },
+		Processes:            func() core.SessionProcessService { return sessionProcessService(state) },
+		Terminals: func() terminalpkg.Manager {
+			if state.terminals == nil {
+				return nil
+			}
+			return state.terminals
+		},
+	}
+	d.populateNativeExtensionDeps(&deps, state)
+	return deps
+}
+
+func (d *Daemon) populateNativeExtensionDeps(deps *daemonNativeToolsDeps, state *bootState) {
+	deps.ExtensionRegistry = extensionRegistryDependency(state.registry)
+	deps.Extensions = func() core.ExtensionService { return state.deps.Extensions }
+	deps.ExtensionRuntime = state.currentExtensionRuntime
+	deps.ExtensionConfig = state.cfg.Extensions
+	deps.ExtensionEvents = extensionEventSummaryStore(state.registry)
+	deps.ExtensionSecrets = state.providerVault
+	deps.AgentSkillsRuntime = func() agentSkillPublisher { return state.agentSkillResources }
+	deps.ToolMCP = state.toolMCPResources
+	deps.ApprovalGrants = state.deps.ApprovalGrants
+	deps.Clarify = func() toolspkg.ClarifyBroker { return state.clarify }
+	deps.LoopResources = state.loopResources
+	deps.Loops = func() core.LoopService { return state.deps.Loops }
+	if state.toolProjectionEpoch != nil {
+		deps.ProjectionEpoch = state.toolProjectionEpoch.Current
+	}
+	deps.Resources = state.deps.Resources
+	deps.WindowManagers = state.windowManagers
+}
+
+func nativeAgentCatalogDependency(state *bootState) *resourceAgentCatalog {
+	return agentCatalogDependency(state.agentCatalog, agentSidecarCatalogs{
+		soul: state.soulCatalog, heartbeat: state.heartbeatCatalog,
+	})
+}

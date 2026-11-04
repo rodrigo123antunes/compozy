@@ -1,0 +1,58 @@
+---
+title: "compozy task fan-out"
+description: "Enqueue designated sibling runs for one task"
+---
+
+## compozy task fan-out
+
+Enqueue designated sibling runs for one task
+
+```
+compozy task fan-out <task-id> [flags]
+```
+
+### Examples
+
+```
+  # Enqueue two sibling runs in separate worktrees
+  compozy task fan-out task_123 --worktree-per-run \
+    --idempotency-key review-task-123-v1 \
+    --designation "Review the API" --designation "Review the web app"
+
+  # Output example
+  compozy task fan-out task_123 --worktree-per-run --idempotency-key review-task-123-v1 --designation "Review the API"
+```
+
+### Options
+
+```
+      --designation stringArray   Designation brief for one sibling run; repeatable
+  -h, --help                      help for fan-out
+      --idempotency-key string    Fan-out idempotency key
+      --worktree-per-run          Create a dedicated worktree for each run
+```
+
+### Options inherited from parent commands
+
+```
+      --json             Emit JSON output
+  -o, --output string    Output format: human, json, jsonl, or toon (default "human")
+      --profile string   Act as a profile for this command
+```
+
+## Output Formats
+
+The root `-o, --output` flag accepts these values. A renderer is supported only when this command writes that result; `jsonl` is for commands that emit one JSON record per line.
+
+| Format  | Command result                          |
+| ------- | --------------------------------------- |
+| `human` | Interactive terminal rendering          |
+| `json`  | Machine-readable JSON rendering         |
+| `jsonl` | One JSON record per line when supported |
+| `toon`  | Compact agent-readable rendering        |
+
+Example:
+
+```bash
+compozy task fan-out task_123 --worktree-per-run --idempotency-key review-task-123-v1 --designation "Review the API" -o json
+```

@@ -1,98 +1,143 @@
-import createClient, { type Middleware } from "openapi-fetch";
+import createClient from "openapi-fetch";
 
-import type { paths as daemonPaths } from "@/generated/compozy-openapi";
-
-import { csrfMiddleware } from "./csrf";
+import type { paths as compozyPaths } from "@compozy/client";
+import { createClientId } from "./client-id";
+import { reportGatewayResponse } from "./gateway-access-signal";
 
 export const apiBaseUrl =
   typeof window === "undefined" ? "http://localhost" : window.location.origin;
 
-const runtimeFetch: typeof globalThis.fetch = (input, init) => globalThis.fetch(input, init);
+// openapi-fetch captures the fetch implementation at client creation time.
+// Delegate through globalThis.fetch so tests can stub it after module import.
+export const runtimeFetch: typeof globalThis.fetch = (input, init) => globalThis.fetch(input, init);
 
-export const daemonApiClient = createClient<daemonPaths>({
+export const apiClient = createClient<compozyPaths>({
   baseUrl: apiBaseUrl,
   fetch: runtimeFetch,
 });
 
-daemonApiClient.use(csrfMiddleware as Middleware);
+export const clientID = `web-${createClientId()}`;
 
-export type DaemonApiClient = typeof daemonApiClient;
+/**
+ * Single chokepoint for "this device's access ended". Only an explicit daemon
+ * code on a 401 counts (see `gateway-access-signal`), so ordinary failures and
+ * unrelated 401s pass through untouched.
+ *
+ * The parse is awaited rather than fired and forgotten: `openapi-fetch` awaits
+ * `onResponse`, so resolving here guarantees the terminal signal has already
+ * landed by the time the failing caller regains control. Otherwise that caller
+ * could render — or reuse — protected cached data in the window before the
+ * boundary learned the session was over. The body is read from a clone so the
+ * calling adapter still receives an unconsumed response.
+ */
+apiClient.use({
+  onRequest({ request }) {
+    request.headers.set("X-Compozy-Client-ID", clientID);
+    return request;
+  },
+  async onResponse({ response }) {
+    await reportGatewayResponse(response);
+    return undefined;
+  },
+});
 
-export interface TransportErrorShape {
-  code: string;
-  message: string;
-  request_id?: string;
-  details?: Record<string, unknown>;
-}
+export function apiErrorMessage(error: unknown): string | undefined {
+  if (typeof error === "string") {
+    const normalized = error.trim();
+    return normalized === "" ? undefined : normalized;
+  }
 
-export function toTransportError(error: unknown): TransportErrorShape | undefined {
-  if (!error || typeof error !== "object") {
+  if (error == null || typeof error !== "object") {
     return undefined;
   }
-  const code = Reflect.get(error, "code");
-  const message = Reflect.get(error, "message");
-  if (typeof code !== "string" || typeof message !== "string") {
-    const cause = Reflect.get(error, "cause");
-    if (cause !== undefined && cause !== error) {
-      return toTransportError(cause);
-    }
+
+  const candidate = Reflect.get(error, "error");
+  if (typeof candidate !== "string") {
     return undefined;
   }
-  const request_id = Reflect.get(error, "request_id");
-  const details = Reflect.get(error, "details");
-  return {
-    code,
-    message,
-    request_id: typeof request_id === "string" ? request_id : undefined,
-    details:
-      details && typeof details === "object" && !Array.isArray(details)
-        ? (details as Record<string, unknown>)
-        : undefined,
-  };
+
+  const normalized = candidate.trim();
+  return normalized === "" ? undefined : normalized;
 }
 
-export function isStaleWorkspaceError(error: unknown): boolean {
-  const transport = toTransportError(error);
-  return transport?.code === "workspace_context_stale";
+export function defaultApiErrorMessage(
+  fallback: string,
+  response: Response,
+  error: unknown
+): string {
+  return apiErrorMessage(error) ?? `${fallback}: ${response.status}`;
 }
 
-export function apiErrorMessage(error: unknown, fallback: string): string {
-  const transport = toTransportError(error);
-  const candidate = transport?.message?.trim();
-  if (candidate && candidate.length > 0) {
-    return candidate;
-  }
-  if (error instanceof Error) {
-    const message = error.message.trim();
-    if (message.length > 0) {
-      return message;
-    }
-  }
-  return fallback;
+export function apiRequestFailed(response: Response, error: unknown): boolean {
+  return !response.ok || error !== undefined;
 }
 
-export function requireData<T>(
+export function requireResponseData<T>(
   data: T | undefined,
   response: Response,
-  fallback: string,
-  error: unknown
+  fallback: string
 ): T {
-  if (data !== undefined) {
-    return data;
+  if (data === undefined) {
+    throw new Error(`${fallback}: empty response (${response.status})`);
   }
-  if (!response.ok || error !== undefined) {
-    throw new ApiRequestError(apiErrorMessage(error, fallback), response.status, error);
-  }
-  throw new ApiRequestError(`${fallback}: empty response`, response.status, error);
+  return data;
 }
 
-export class ApiRequestError extends Error {
-  readonly status: number;
-  readonly cause: unknown;
-  constructor(message: string, status: number, cause: unknown) {
-    super(message);
-    this.name = "ApiRequestError";
-    this.status = status;
-    this.cause = cause;
+function apiErrorStringField(error: unknown, key: string): string | undefined {
+  if (error == null || typeof error !== "object") {
+    return undefined;
   }
+  const candidate = Reflect.get(error, key);
+  if (typeof candidate !== "string") {
+    return undefined;
+  }
+  const normalized = candidate.trim();
+  return normalized === "" ? undefined : normalized;
+}
+
+/** The daemon's deterministic error code (`ErrorPayload.code`), when the body carries one. */
+export function apiErrorCode(error: unknown): string | undefined {
+  return apiErrorStringField(error, "code");
+}
+
+/** The turn the daemon reports as active on a fence refusal (`ErrorPayload.current_turn_id`). */
+export function apiErrorCurrentTurnId(error: unknown): string | undefined {
+  return apiErrorStringField(error, "current_turn_id");
+}
+
+/**
+ * The queue cap a `queue_full` refusal names (`diagnostic.evidence.queue_cap`),
+ * so the composer can say "N of N" and drop the queue affordance while full.
+ */
+export function apiErrorQueueCap(error: unknown): number | undefined {
+  if (error == null || typeof error !== "object") {
+    return undefined;
+  }
+  const diagnostic = Reflect.get(error, "diagnostic");
+  if (diagnostic == null || typeof diagnostic !== "object") {
+    return undefined;
+  }
+  const evidence = Reflect.get(diagnostic, "evidence");
+  if (evidence == null || typeof evidence !== "object") {
+    return undefined;
+  }
+  const cap = Reflect.get(evidence, "queue_cap");
+  return typeof cap === "number" && Number.isInteger(cap) && cap > 0 ? cap : undefined;
+}
+
+/**
+ * The human message of the structured diagnostic an error body carries
+ * (`diagnostic.title` and `diagnostic.message`), rendered as the daemon renders it.
+ */
+export function apiErrorDiagnosticMessage(error: unknown): string | undefined {
+  if (error == null || typeof error !== "object") {
+    return undefined;
+  }
+  const diagnostic = Reflect.get(error, "diagnostic");
+  const title = apiErrorStringField(diagnostic, "title");
+  const message = apiErrorStringField(diagnostic, "message");
+  if (title && message && message !== title) {
+    return `${title}: ${message}`;
+  }
+  return title ?? message;
 }

@@ -1,0 +1,455 @@
+import type { RawLoopNode } from "./codec";
+import { LOOP_CEILINGS } from "./loop-limits";
+import { environmentFields } from "./loop-node-environment-fields";
+import type { FieldSpec, TextFieldSpec } from "./loop-node-schema-types";
+
+export function str(value: unknown): string {
+  if (typeof value === "string") return value;
+  if (typeof value === "number" || typeof value === "boolean") return String(value);
+  return "";
+}
+
+export function idField(): TextFieldSpec {
+  return { type: "text", key: "id", label: "Node id", path: ["id"], mono: true };
+}
+
+export function inputFields(raw: RawLoopNode, inputNames: string[]): FieldSpec[] {
+  const current = str(raw.input_ref);
+  const options = current && !inputNames.includes(current) ? [current, ...inputNames] : inputNames;
+  const refField: FieldSpec =
+    options.length > 0
+      ? {
+          type: "select",
+          key: "input_ref",
+          label: "Input ref",
+          path: ["input_ref"],
+          options,
+          hint: "The declared loop input this node exposes into the graph.",
+        }
+      : {
+          type: "text",
+          key: "input_ref",
+          label: "Input ref",
+          path: ["input_ref"],
+          mono: true,
+          hint: "Must name a declared input — add inputs in the Loop's inputs block first.",
+        };
+  return [
+    idField(),
+    refField,
+    {
+      type: "static",
+      key: "produces",
+      label: "Produces",
+      value: `nodes.${str(raw.id)}.output`,
+      badge: "derived",
+    },
+    {
+      type: "hint",
+      key: "hint",
+      hint: "Exposes a declared typed input into the graph; produces derives from the input's declared type.",
+    },
+  ];
+}
+
+export function fileImportFields(raw: RawLoopNode): FieldSpec[] {
+  return [
+    idField(),
+    {
+      type: "text",
+      key: "pattern",
+      label: "Pattern",
+      path: ["pattern"],
+      mono: true,
+      reference: true,
+      hint: "Template over the loop namespace. Globs workspace files at generation start.",
+    },
+    {
+      type: "select",
+      key: "parse",
+      label: "Parse",
+      path: ["parse"],
+      options: ["json", "text"],
+    },
+    {
+      type: "static",
+      key: "produces",
+      label: "Produces",
+      value: `nodes.${str(raw.id)}.output`,
+      badge: "derived",
+    },
+    {
+      type: "hint",
+      key: "hint",
+      hint: "Large payloads are never inlined: files land in the content-addressed store and the output carries artifact refs.",
+    },
+  ];
+}
+
+export function watchSourceFields(raw: RawLoopNode): FieldSpec[] {
+  return [
+    idField(),
+    {
+      type: "textarea",
+      key: "watch",
+      label: "Watch spec",
+      path: ["watch"],
+      mono: true,
+      json: true,
+      hint: "The poll → ready → settle → confirm watch specification.",
+    },
+    {
+      type: "static",
+      key: "produces",
+      label: "Produces",
+      value: `nodes.${str(raw.id)}.output`,
+      badge: "derived",
+    },
+  ];
+}
+
+export function watchEventsFields(raw: RawLoopNode): FieldSpec[] {
+  return [
+    idField(),
+    {
+      type: "events",
+      key: "events",
+      label: "Subscriptions",
+      path: ["events"],
+      hint: "One or more internal-event subscriptions. Each names a supported hook kind and an optional CEL filter over `event`, `inputs`, and `nodes`.",
+    },
+    {
+      type: "static",
+      key: "produces",
+      label: "Produces",
+      value: `nodes.${str(raw.id)}.output`,
+      badge: "derived",
+    },
+    {
+      type: "hint",
+      key: "hint",
+      hint: "Parks the loop at zero cost until a subscribed internal event commits, then wakes and re-derives the matched batch from the durable ledger. A silent subscription is healthy dormancy — a watch-events loop never stalls on silence.",
+    },
+  ];
+}
+
+export function fanOutFields(_raw: RawLoopNode): FieldSpec[] {
+  return [
+    idField(),
+    {
+      type: "text",
+      key: "collection",
+      label: "Collection",
+      path: ["collection"],
+      mono: true,
+      reference: true,
+      hint: "Template resolving to a finite collection. Validated against the source's declared output schema at publish.",
+    },
+    { type: "number", key: "batch_size", label: "Batch size", path: ["batch_size"] },
+    { type: "number", key: "max_parallel", label: "Max parallel", path: ["max_parallel"] },
+    { type: "text", key: "bind_as", label: "Item name", path: ["bind_as"] },
+    { type: "text", key: "index_as", label: "Index name", path: ["index_as"] },
+    {
+      type: "number",
+      key: "max_fan_out",
+      label: "Max fan-out",
+      path: ["max_fan_out"],
+      hint: "Required positive author bound on the total logical branches.",
+    },
+    {
+      type: "hint",
+      key: "hint",
+      hint: "Fans the collection into batch branches; item and index enter scope inside the branch body. Pair with a collect barrier.",
+    },
+  ];
+}
+
+export function collectFields(_raw: RawLoopNode): FieldSpec[] {
+  return [
+    idField(),
+    { type: "static", key: "joins", label: "Joins", value: "paired fan-out", badge: "barrier" },
+    {
+      type: "hint",
+      key: "hint",
+      hint: "Barrier that waits for every fanned branch before the run continues.",
+    },
+  ];
+}
+
+export function gateFields(_raw: RawLoopNode): FieldSpec[] {
+  return [
+    idField(),
+    { type: "criteria", key: "criteria", label: "Criteria", path: ["criteria"] },
+    {
+      type: "select",
+      key: "verdict_policy",
+      label: "Verdict policy",
+      path: ["verdict_policy"],
+      options: ["revise_until_clean", "fixed_passes"],
+      hint: "revise_until_clean requires an agent-judge or human criterion as the verdict source.",
+    },
+    {
+      type: "text",
+      key: "on_pass",
+      label: "On pass → target",
+      path: ["on_result", "pass"],
+      mono: true,
+      json: true,
+      placeholder: '"continue" or {"route":"node_id"}',
+      hint: 'Use continue, revise, next_generation, escalate, halt, or {"route":"node_id"}. The object target must be a declared forward edge.',
+    },
+    {
+      type: "text",
+      key: "on_fail",
+      label: "On fail → target",
+      path: ["on_result", "fail"],
+      mono: true,
+      json: true,
+      placeholder: '"revise" or {"route":"node_id"}',
+      hint: 'Use continue, revise, next_generation, escalate, halt, or {"route":"node_id"}. The removed branch action is rejected.',
+    },
+    {
+      type: "number",
+      key: "max_revisions",
+      label: "Max revisions",
+      path: ["max_revisions"],
+      ceiling: LOOP_CEILINGS.gateMaxRevisions,
+    },
+    {
+      type: "hint",
+      key: "hint",
+      hint: "The judge emits a structured verdict; malformed output degrades to revise, never to pass.",
+    },
+  ];
+}
+
+export function branchFields(_raw: RawLoopNode): FieldSpec[] {
+  return [
+    idField(),
+    {
+      type: "text",
+      key: "condition",
+      label: "Condition",
+      path: ["condition"],
+      mono: true,
+      reference: true,
+      cel: true,
+      hint: "A CEL boolean over the loop namespace, autocompleted from the compiled reference schema. The visual builder is deferred.",
+    },
+  ];
+}
+
+export function subLoopFields(_raw: RawLoopNode): FieldSpec[] {
+  return [
+    idField(),
+    {
+      type: "static",
+      key: "body",
+      label: "Nested body",
+      value: "inline sub-loop",
+      badge: "nested",
+    },
+    {
+      type: "hint",
+      key: "hint",
+      hint: "An in-graph nested body. Cross-definition composition uses the run-loop action instead.",
+    },
+  ];
+}
+
+export function runAgentFields(raw: RawLoopNode): FieldSpec[] {
+  return [
+    idField(),
+    {
+      type: "text",
+      key: "agent",
+      label: "Agent",
+      path: ["params", "agent"],
+      mono: true,
+      required: true,
+      reference: true,
+      hint: "Interpolable agent profile ref; the profile stays the identity and config authority.",
+    },
+    {
+      type: "textarea",
+      key: "prompt",
+      label: "Prompt",
+      path: ["params", "prompt"],
+      mono: true,
+      required: true,
+      reference: true,
+      hint: "The node's work order, a template over the loop namespace. Type {{ to autocomplete references.",
+    },
+    {
+      type: "textarea",
+      key: "output_schema",
+      label: "Output schema",
+      path: ["params", "output_schema"],
+      mono: true,
+      json: true,
+      optionalLabel: "optional · JSON Schema",
+      hint: "Structured harvest. A validation failure feeds one FREE retry before the retry budget is touched.",
+    },
+    {
+      type: "fold",
+      key: "overrides",
+      label: "Overrides",
+      subLabel: "model · allowed_tools · max_turns",
+      fields: [
+        {
+          type: "text",
+          key: "model",
+          label: "model",
+          path: ["params", "model"],
+          mono: true,
+          placeholder: "profile default",
+        },
+        {
+          type: "text",
+          key: "allowed_tools",
+          label: "allowed_tools",
+          path: ["params", "allowed_tools"],
+          mono: true,
+          json: true,
+          placeholder: "profile default",
+        },
+        { type: "number", key: "max_turns", label: "max_turns", path: ["params", "max_turns"] },
+      ],
+    },
+    ...environmentFields(raw, "Inherit"),
+    {
+      type: "switch",
+      key: "isolated",
+      label: "Isolated session",
+      path: ["session", "isolated"],
+      subLabel: "Each task runs in its own one-shot session.",
+    },
+    {
+      type: "text",
+      key: "timeout",
+      label: "Timeout",
+      path: ["timeout"],
+      mono: true,
+      hint: "Per attempt. Must not exceed the deadline in Reliability (timeout_exceeds_deadline). The retry budget lives there too, plus one free schema-validation retry outside it.",
+    },
+    {
+      type: "static",
+      key: "produces",
+      label: "Produces",
+      value: `nodes.${str(raw.id)}.output`,
+      badge: "from schema",
+    },
+  ];
+}
+
+export function runLoopFields(_raw: RawLoopNode): FieldSpec[] {
+  return [
+    idField(),
+    {
+      type: "text",
+      key: "loop",
+      label: "Loop",
+      path: ["params", "loop"],
+      mono: true,
+      required: true,
+      reference: true,
+      hint: "The child loop name, interpolable so the executor swaps per run. Ancestry is cycle-guarded (depth ≤ 8).",
+    },
+    {
+      type: "select",
+      key: "mode",
+      label: "Mode",
+      path: ["params", "mode"],
+      options: ["await", "detach"],
+    },
+    {
+      type: "textarea",
+      key: "inputs",
+      label: "Inputs",
+      path: ["params", "inputs"],
+      mono: true,
+      json: true,
+      optionalLabel: "optional · template-interpolated map",
+      hint: "The child loop's declared inputs, each value template-interpolated over this loop's namespace.",
+    },
+    {
+      type: "textarea",
+      key: "config_overrides",
+      label: "Child config overrides",
+      path: ["params", "config_overrides"],
+      mono: true,
+      json: true,
+      optionalLabel: "optional · child-only JSON",
+      placeholder: '{"iteration_cap": 4, "budget_tokens": 250000}',
+      hint: "These settings apply only to this child run. The service accepts the same settings as a direct Loop run. It does not save them to the child definition.",
+    },
+    {
+      type: "select",
+      key: "on_parent_close",
+      label: "on_parent_close",
+      path: ["on_parent_close"],
+      options: ["terminate", "cancel", "abandon"],
+      clearOption: { value: "", label: "engine default (terminate)" },
+      hint: "What happens to the child when this run closes. Propagation is strictly parent → child; the key is legal only on run-loop nodes (parent_close_invalid).",
+    },
+    {
+      type: "hint",
+      key: "hint",
+      hint: "await yields-and-rewakes (never a held lease) until the child terminates; detach returns the child run id immediately.",
+    },
+  ];
+}
+
+export function transformFields(_raw: RawLoopNode): FieldSpec[] {
+  return [
+    idField(),
+    {
+      type: "textarea",
+      key: "map",
+      label: "Map",
+      path: ["params", "map"],
+      mono: true,
+      json: true,
+      hint: "Pure declarative reshaping: each output key is { from } | { value } | { template }. No side effects.",
+    },
+  ];
+}
+
+export function toolActionFields(_raw: RawLoopNode): FieldSpec[] {
+  return [
+    idField(),
+    {
+      type: "text",
+      key: "kind",
+      label: "Tool",
+      path: ["kind"],
+      mono: true,
+      required: true,
+      hint: "The literal ToolID this action calls (e.g. compozy__task_list). Reserved names are run-agent / run-loop / transform.",
+    },
+    {
+      type: "textarea",
+      key: "params",
+      label: "Params",
+      path: ["params"],
+      mono: true,
+      json: true,
+      hint: "The tool's input arguments, template-interpolated. A schema-generated form renders here once the registry input-schema read is wired.",
+    },
+    {
+      type: "hint",
+      key: "hint",
+      hint: "An action's kind IS the tool it calls. Optional harvest is declared in the DSL view.",
+    },
+  ];
+}
+
+/** The id + kind static fallback for an unrecognized class/kind. */
+export function fallbackFields(raw: RawLoopNode): FieldSpec[] {
+  const nodeClass = str(raw.class);
+  const kind = str(raw.kind);
+  return [
+    idField(),
+    { type: "static", key: "kind", label: "Kind", value: kind || "—", badge: nodeClass || "node" },
+  ];
+}

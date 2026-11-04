@@ -1,0 +1,121 @@
+package hooks
+
+import (
+	"errors"
+	"fmt"
+	"slices"
+)
+
+var ErrInvalidHookSource = errors.New("hooks: invalid hook source")
+
+// DefaultHookPriority returns the documented default priority for the source.
+func DefaultHookPriority(source HookSource) (int32, error) {
+	switch source {
+	case HookSourceNative:
+		return 1000, nil
+	case HookSourceConfig:
+		return 500, nil
+	case HookSourceExtension:
+		return 300, nil
+	case HookSourceAgentDefinition:
+		return 100, nil
+	case HookSourceSkill:
+		return 0, nil
+	default:
+		return 0, fmt.Errorf("%w: %d", ErrInvalidHookSource, source)
+	}
+}
+
+// SortResolvedHooks sorts the slice in place using deterministic dispatch
+// precedence.
+func SortResolvedHooks(hooks []*ResolvedHook) {
+	slices.SortStableFunc(hooks, func(left, right *ResolvedHook) int {
+		if resolvedHookLess(left, right) {
+			return -1
+		}
+		if resolvedHookLess(right, left) {
+			return 1
+		}
+		return 0
+	})
+}
+
+// OrderedResolvedHooks returns a sorted copy of the slice.
+func OrderedResolvedHooks(hooks []*ResolvedHook) []*ResolvedHook {
+	ordered := append([]*ResolvedHook(nil), hooks...)
+	SortResolvedHooks(ordered)
+	return ordered
+}
+
+func orderedResolvedHooksIfNeeded(hooks []*ResolvedHook) []*ResolvedHook {
+	if len(hooks) < 2 {
+		return hooks
+	}
+
+	for idx := 1; idx < len(hooks); idx++ {
+		if resolvedHookLess(hooks[idx], hooks[idx-1]) {
+			return OrderedResolvedHooks(hooks)
+		}
+	}
+
+	return hooks
+}
+
+func resolvedHookLess(left *ResolvedHook, right *ResolvedHook) bool {
+	if left == nil || right == nil {
+		return left != nil && right == nil
+	}
+
+	if left.Source != right.Source {
+		return hookSourceRank(left.Source) < hookSourceRank(right.Source)
+	}
+	if left.Priority != right.Priority {
+		return left.Priority > right.Priority
+	}
+	if left.Source == HookSourceSkill && left.Decl.SkillSource != right.Decl.SkillSource {
+		return hookSkillSourceRank(left.Decl.SkillSource) < hookSkillSourceRank(right.Decl.SkillSource)
+	}
+	if left.Name != right.Name {
+		return left.Name < right.Name
+	}
+
+	return false
+}
+
+func hookSourceRank(source HookSource) int {
+	switch source {
+	case HookSourceNative:
+		return 0
+	case HookSourceConfig:
+		return 1
+	case HookSourceExtension:
+		return 2
+	case HookSourceAgentDefinition:
+		return 3
+	case HookSourceSkill:
+		return 4
+	default:
+		return 5
+	}
+}
+
+func hookSkillSourceRank(source HookSkillSource) int {
+	switch source {
+	case HookSkillSourceBundled:
+		return 0
+	case HookSkillSourceMarketplace:
+		return 1
+	case HookSkillSourceUser:
+		return 2
+	case HookSkillSourceProfile:
+		return 3
+	case HookSkillSourceAdditional:
+		return 4
+	case HookSkillSourceWorkspace:
+		return 5
+	case HookSkillSourceWorkspaceProfile:
+		return 6
+	default:
+		return 7
+	}
+}

@@ -1,0 +1,4192 @@
+package config
+
+import (
+	"bytes"
+	"cmp"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"log/slog"
+	"maps"
+	"os"
+	"path/filepath"
+	"reflect"
+	"regexp"
+	"runtime"
+	"strings"
+	"testing"
+
+	"github.com/BurntSushi/toml"
+	"github.com/compozy/compozy/internal/diagnosticcontract"
+	"github.com/compozy/compozy/internal/diagnostics"
+	compozylogger "github.com/compozy/compozy/internal/logger"
+	"github.com/compozy/compozy/internal/reasoning"
+	speedpkg "github.com/compozy/compozy/internal/speed"
+	"gopkg.in/yaml.v3"
+)
+
+const expectedCodexModelsReleaseDate = "2026-06-26"
+
+func TestBuiltinProvidersContainExpectedCommands(t *testing.T) {
+	t.Parallel()
+
+	providers := BuiltinProviders()
+	tests := []struct {
+		name            string
+		command         string
+		harness         ProviderHarness
+		authMode        ProviderAuthMode
+		runtimeProvider string
+		defaultModel    string
+		noSessionMCP    bool
+		sessionMCPHTTP  bool
+		acpMethod       string
+		statusCommand   string
+		loginCommand    string
+		apiKeyEnv       string
+		required        bool
+	}{
+		{
+			name:         "claude",
+			command:      "npx -y @agentclientprotocol/claude-agent-acp@latest",
+			harness:      ProviderHarnessACP,
+			authMode:     ProviderAuthModeNativeCLI,
+			defaultModel: modelClaudeSonnet5ID,
+			loginCommand: "claude auth login",
+		},
+		{
+			name:         "codex",
+			command:      "npx -y @agentclientprotocol/codex-acp@latest",
+			harness:      ProviderHarnessACP,
+			authMode:     ProviderAuthModeNativeCLI,
+			defaultModel: modelGPT56SolID,
+			loginCommand: "codex login",
+		},
+		{
+			name:           "copilot",
+			command:        "copilot --acp --stdio",
+			harness:        ProviderHarnessACP,
+			authMode:       ProviderAuthModeNativeCLI,
+			sessionMCPHTTP: true,
+			loginCommand:   "copilot login",
+			acpMethod:      "copilot-login",
+		},
+		{name: "cursor", command: "cursor-agent acp", harness: ProviderHarnessACP, authMode: ProviderAuthModeNativeCLI},
+		{
+			name:         "gemini",
+			command:      "gemini --acp",
+			harness:      ProviderHarnessACP,
+			authMode:     ProviderAuthModeNativeCLI,
+			defaultModel: "gemini-3.1-pro-preview",
+		},
+		{
+			name:     "kimi-cli",
+			command:  "kimi acp",
+			harness:  ProviderHarnessACP,
+			authMode: ProviderAuthModeNativeCLI,
+		},
+		{
+			name:         "opencode",
+			command:      "opencode acp",
+			harness:      ProviderHarnessACP,
+			authMode:     ProviderAuthModeNativeCLI,
+			loginCommand: "opencode auth login",
+		},
+		{
+			name:         "qwen-code",
+			command:      "npx -y @qwen-code/qwen-code@latest --acp --experimental-skills",
+			harness:      ProviderHarnessACP,
+			authMode:     ProviderAuthModeNativeCLI,
+			defaultModel: "qwen3.6-plus",
+		},
+		{
+			name:            "pi",
+			command:         "npx -y pi-acp@latest",
+			harness:         ProviderHarnessPiACP,
+			authMode:        ProviderAuthModeNativeCLI,
+			runtimeProvider: "anthropic",
+			defaultModel:    "claude-opus-4-7",
+			loginCommand:    "npx -y pi-acp@latest --terminal-login",
+		},
+		{
+			name:            "openrouter",
+			command:         "npx -y pi-acp@latest",
+			harness:         ProviderHarnessPiACP,
+			authMode:        ProviderAuthModeBoundSecret,
+			runtimeProvider: "openrouter",
+			defaultModel:    "openai/gpt-5.4",
+			apiKeyEnv:       "OPENROUTER_API_KEY",
+			required:        true,
+		},
+		{
+			name:            "zai",
+			command:         "npx -y pi-acp@latest",
+			harness:         ProviderHarnessPiACP,
+			authMode:        ProviderAuthModeBoundSecret,
+			runtimeProvider: "zai",
+			defaultModel:    "glm-4.6",
+			apiKeyEnv:       "ZAI_API_KEY",
+			required:        true,
+		},
+		{
+			name:            "moonshot",
+			command:         "npx -y pi-acp@latest",
+			harness:         ProviderHarnessPiACP,
+			authMode:        ProviderAuthModeBoundSecret,
+			runtimeProvider: "kimi-coding",
+			defaultModel:    "kimi-k2-thinking",
+			apiKeyEnv:       "KIMI_API_KEY",
+			required:        true,
+		},
+		{
+			name:            "vercel-ai-gateway",
+			command:         "npx -y pi-acp@latest",
+			harness:         ProviderHarnessPiACP,
+			authMode:        ProviderAuthModeBoundSecret,
+			runtimeProvider: "vercel-ai-gateway",
+			defaultModel:    "anthropic/claude-opus-4-7",
+			apiKeyEnv:       "AI_GATEWAY_API_KEY",
+			required:        true,
+		},
+		{
+			name:            "xai",
+			command:         "npx -y pi-acp@latest",
+			harness:         ProviderHarnessPiACP,
+			authMode:        ProviderAuthModeBoundSecret,
+			runtimeProvider: "xai",
+			defaultModel:    "grok-4-fast-non-reasoning",
+			apiKeyEnv:       "XAI_API_KEY",
+			required:        true,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run("Should expose builtin provider "+tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			got, ok := providers[tc.name]
+			if !ok {
+				t.Fatalf("BuiltinProviders() missing %q", tc.name)
+			}
+			if got.Command != tc.command {
+				t.Fatalf("BuiltinProviders()[%q].Command = %q, want %q", tc.name, got.Command, tc.command)
+			}
+			if got.EffectiveHarness() != tc.harness {
+				t.Fatalf("BuiltinProviders()[%q].Harness = %q, want %q", tc.name, got.EffectiveHarness(), tc.harness)
+			}
+			if got.EffectiveAuthMode() != tc.authMode {
+				t.Fatalf("BuiltinProviders()[%q].AuthMode = %q, want %q", tc.name, got.EffectiveAuthMode(), tc.authMode)
+			}
+			if got.RuntimeProviderName(tc.name) != firstNonEmpty(tc.runtimeProvider, tc.name) {
+				t.Fatalf(
+					"BuiltinProviders()[%q].RuntimeProvider = %q, want %q",
+					tc.name,
+					got.RuntimeProviderName(tc.name),
+					firstNonEmpty(tc.runtimeProvider, tc.name),
+				)
+			}
+			if got.Models.Default != tc.defaultModel {
+				t.Fatalf(
+					"BuiltinProviders()[%q].Models.Default = %q, want %q",
+					tc.name,
+					got.Models.Default,
+					tc.defaultModel,
+				)
+			}
+			if tc.defaultModel != "" && !providerCuratedModelsContain(got.Models.Curated, tc.defaultModel) {
+				t.Fatalf(
+					"BuiltinProviders()[%q].Models.Curated = %#v, want default model %q",
+					tc.name,
+					got.Models.Curated,
+					tc.defaultModel,
+				)
+			}
+			if got.SessionMCPEnabled() == tc.noSessionMCP {
+				t.Fatalf(
+					"BuiltinProviders()[%q].SessionMCPEnabled() = %t, want %t",
+					tc.name,
+					got.SessionMCPEnabled(),
+					!tc.noSessionMCP,
+				)
+			}
+			if got.EffectiveACPMethod() != tc.acpMethod {
+				t.Fatalf(
+					"BuiltinProviders()[%q].AuthACPMethod = %q, want %q",
+					tc.name,
+					got.EffectiveACPMethod(),
+					tc.acpMethod,
+				)
+			}
+			if got.SessionMCPOverHTTP() != tc.sessionMCPHTTP {
+				t.Fatalf(
+					"BuiltinProviders()[%q].SessionMCPOverHTTP() = %t, want %t",
+					tc.name,
+					got.SessionMCPOverHTTP(),
+					tc.sessionMCPHTTP,
+				)
+			}
+			if strings.TrimSpace(got.AuthLoginCmd) != tc.loginCommand {
+				t.Fatalf(
+					"BuiltinProviders()[%q].AuthLoginCmd = %q, want %q",
+					tc.name,
+					got.AuthLoginCmd,
+					tc.loginCommand,
+				)
+			}
+			if strings.TrimSpace(got.AuthStatusCmd) != tc.statusCommand {
+				t.Fatalf(
+					"BuiltinProviders()[%q].AuthStatusCmd = %q, want %q",
+					tc.name,
+					got.AuthStatusCmd,
+					tc.statusCommand,
+				)
+			}
+			slots := got.EffectiveCredentialSlots()
+			if tc.apiKeyEnv == "" {
+				if len(slots) != 0 {
+					t.Fatalf("BuiltinProviders()[%q].CredentialSlots = %#v, want none", tc.name, slots)
+				}
+				return
+			}
+			if len(slots) != 1 {
+				t.Fatalf("BuiltinProviders()[%q].CredentialSlots = %#v, want one slot", tc.name, slots)
+			}
+			slot := slots[0]
+			if slot.Name != "api_key" || slot.Kind != "api_key" || slot.TargetEnv != tc.apiKeyEnv ||
+				slot.SecretRef != "env:"+tc.apiKeyEnv || slot.Required != tc.required {
+				t.Fatalf(
+					"BuiltinProviders()[%q].CredentialSlots[0] = %#v, want api_key env slot required=%t",
+					tc.name,
+					slot,
+					tc.required,
+				)
+			}
+		})
+	}
+
+	t.Run("Should keep process args and non-secret env valid for stdio", func(t *testing.T) {
+		t.Parallel()
+
+		server := MCPServer{
+			Name:      "local",
+			Transport: MCPServerTransportStdio,
+			Command:   "npx",
+			Args:      []string{"--verbose"},
+			Env:       map[string]string{"LOG_LEVEL": "debug"},
+		}
+		if err := server.Validate("mcp_servers[0]"); err != nil {
+			t.Fatalf("Validate(stdio MCP process fields) error = %v, want nil", err)
+		}
+	})
+}
+
+func providerCuratedModelsContain(models []ProviderModelConfig, id string) bool {
+	for _, model := range models {
+		if model.ID == id {
+			return true
+		}
+	}
+	return false
+}
+
+func TestBuiltinProviderModelCatalogMatchesCurrentContract(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name   string
+		models ProviderModelsConfig
+	}{
+		{
+			name: "claude",
+			models: ProviderModelsConfig{
+				Default: modelClaudeSonnet5ID,
+				Reasoning: ProviderReasoningConfig{
+					Apply: ReasoningApplyACPOption,
+				},
+				Curated: []ProviderModelConfig{
+					{
+						ID:                     modelClaudeFable5ID,
+						DisplayName:            "Claude Fable 5",
+						ContextWindow:          new(int64(1_000_000)),
+						MaxOutputTokens:        new(int64(128_000)),
+						SupportsTools:          new(true),
+						SupportsReasoning:      new(true),
+						ReasoningEfforts:       []string{"low", "medium", "high", "xhigh", "max"},
+						DefaultReasoningEffort: "high",
+						CostInputPerMillion:    new(10.0),
+						CostOutputPerMillion:   new(50.0),
+						Featured:               new(true),
+						ReleaseDate:            "2026-06-09",
+					},
+					{
+						ID:                     modelClaudeOpus5ID,
+						DisplayName:            "Claude Opus 5",
+						ContextWindow:          new(int64(1_000_000)),
+						MaxOutputTokens:        new(int64(128_000)),
+						SupportsTools:          new(true),
+						SupportsReasoning:      new(true),
+						ReasoningEfforts:       []string{"low", "medium", "high", "xhigh", "max"},
+						DefaultReasoningEffort: "medium",
+						CostInputPerMillion:    new(5.0),
+						CostOutputPerMillion:   new(25.0),
+						Featured:               new(true),
+					},
+					{
+						ID:                     modelClaudeOpus48ID,
+						DisplayName:            "Claude Opus 4.8",
+						ContextWindow:          new(int64(1_000_000)),
+						MaxOutputTokens:        new(int64(128_000)),
+						SupportsTools:          new(true),
+						SupportsReasoning:      new(true),
+						ReasoningEfforts:       []string{"low", "medium", "high", "xhigh", "max"},
+						DefaultReasoningEffort: "high",
+						CostInputPerMillion:    new(5.0),
+						CostOutputPerMillion:   new(25.0),
+						Featured:               new(false),
+					},
+					{
+						ID:                     modelClaudeSonnet5ID,
+						DisplayName:            "Claude Sonnet 5",
+						ContextWindow:          new(int64(1_000_000)),
+						MaxOutputTokens:        new(int64(128_000)),
+						SupportsTools:          new(true),
+						SupportsReasoning:      new(true),
+						ReasoningEfforts:       []string{"low", "medium", "high", "xhigh", "max"},
+						DefaultReasoningEffort: "high",
+						CostInputPerMillion:    new(3.0),
+						CostOutputPerMillion:   new(15.0),
+						Featured:               new(false),
+					},
+					{
+						ID:                   modelClaudeHaiku45CurrentID,
+						DisplayName:          "Claude Haiku 4.5",
+						ContextWindow:        new(int64(200_000)),
+						MaxOutputTokens:      new(int64(64_000)),
+						SupportsTools:        new(true),
+						SupportsReasoning:    new(true),
+						CostInputPerMillion:  new(1.0),
+						CostOutputPerMillion: new(5.0),
+					},
+				},
+			},
+		},
+		{
+			name: "codex",
+			models: ProviderModelsConfig{
+				Default: modelGPT56SolID,
+				Reasoning: ProviderReasoningConfig{
+					Apply: ReasoningApplyACPOption,
+				},
+				Curated: []ProviderModelConfig{
+					{
+						ID:                     modelGPT56SolID,
+						DisplayName:            "GPT-5.6 Sol",
+						ContextWindow:          new(int64(1_050_000)),
+						MaxOutputTokens:        new(int64(128_000)),
+						SupportsTools:          new(true),
+						SupportsReasoning:      new(true),
+						ReasoningEfforts:       []string{"none", "low", "medium", "high", "xhigh", "max"},
+						DefaultReasoningEffort: "medium",
+						CostInputPerMillion:    new(5.0),
+						CostOutputPerMillion:   new(30.0),
+						Featured:               new(true),
+						ReleaseDate:            expectedCodexModelsReleaseDate,
+					},
+					{
+						ID:                     modelGPT56TerraID,
+						DisplayName:            "GPT-5.6 Terra",
+						ContextWindow:          new(int64(1_050_000)),
+						MaxOutputTokens:        new(int64(128_000)),
+						SupportsTools:          new(true),
+						SupportsReasoning:      new(true),
+						ReasoningEfforts:       []string{"none", "low", "medium", "high", "xhigh", "max"},
+						DefaultReasoningEffort: "medium",
+						CostInputPerMillion:    new(2.5),
+						CostOutputPerMillion:   new(15.0),
+						Featured:               new(false),
+						ReleaseDate:            expectedCodexModelsReleaseDate,
+					},
+					{
+						ID:                     modelGPT56LunaID,
+						DisplayName:            "GPT-5.6 Luna",
+						ContextWindow:          new(int64(1_050_000)),
+						MaxOutputTokens:        new(int64(128_000)),
+						SupportsTools:          new(true),
+						SupportsReasoning:      new(true),
+						ReasoningEfforts:       []string{"none", "low", "medium", "high", "xhigh", "max"},
+						DefaultReasoningEffort: "medium",
+						CostInputPerMillion:    new(1.0),
+						CostOutputPerMillion:   new(6.0),
+						Featured:               new(false),
+						ReleaseDate:            expectedCodexModelsReleaseDate,
+					},
+				},
+			},
+		},
+	}
+
+	providers := BuiltinProviders()
+	for _, tc := range tests {
+		t.Run("Should expose exact current "+tc.name+" model metadata", func(t *testing.T) {
+			t.Parallel()
+
+			provider, ok := providers[tc.name]
+			if !ok {
+				t.Fatalf("BuiltinProviders() missing %q", tc.name)
+			}
+			if !reflect.DeepEqual(provider.Models, tc.models) {
+				t.Fatalf("BuiltinProviders()[%q].Models = %#v, want %#v", tc.name, provider.Models, tc.models)
+			}
+		})
+	}
+}
+
+func TestRepoRootConfigProviderDefaultsMatchBuiltinRegistry(t *testing.T) {
+	t.Parallel()
+
+	rootConfig := filepath.Join(repoRootFromConfigTest(t), "config.toml")
+	overlay := Config{Providers: map[string]ProviderConfig{}}
+	if err := ApplyConfigOverlayFile(rootConfig, &overlay); err != nil {
+		t.Fatalf("ApplyConfigOverlayFile(repo config) error = %v", err)
+	}
+
+	builtins := BuiltinProviders()
+	for name, provider := range overlay.Providers {
+		if provider.Models.Default == "" {
+			continue
+		}
+		builtin, ok := builtins[name]
+		if !ok {
+			t.Fatalf("repo config provider %q is not in the builtin registry", name)
+		}
+		if got, want := provider.Models.Default, builtin.Models.Default; got != want {
+			t.Fatalf("repo config provider %q models.default = %q, want builtin %q", name, got, want)
+		}
+	}
+}
+
+func repoRootFromConfigTest(t *testing.T) string {
+	t.Helper()
+
+	_, file, _, ok := runtime.Caller(0)
+	if !ok {
+		t.Fatal("runtime.Caller(0) failed")
+	}
+	return filepath.Clean(filepath.Join(filepath.Dir(file), "..", ".."))
+}
+
+func TestCanonicalProviderNameResolvesNewDriverAliases(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name string
+		want string
+	}{
+		{name: "kimi", want: "moonshot"},
+		{name: "kimi cli", want: "kimi-cli"},
+		{name: "kimi-code", want: "kimi-cli"},
+		{name: "qwen", want: "qwen-code"},
+		{name: "qwen code", want: "qwen-code"},
+	}
+
+	for _, tc := range tests {
+		t.Run("Should resolve "+tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			if got := CanonicalProviderName(tc.name); got != tc.want {
+				t.Fatalf("CanonicalProviderName(%q) = %q, want %q", tc.name, got, tc.want)
+			}
+		})
+	}
+}
+
+func firstNonEmpty(values ...string) string {
+	for _, value := range values {
+		if value != "" {
+			return value
+		}
+	}
+	return ""
+}
+
+func TestProviderConfigOverrideMergesWithBuiltins(t *testing.T) {
+	t.Parallel()
+
+	cfg := Config{
+		Providers: map[string]ProviderConfig{
+			"claude": {
+				Models: ProviderModelsConfig{Default: "claude-opus-override"},
+			},
+		},
+	}
+
+	provider, err := cfg.ResolveProvider("claude")
+	if err != nil {
+		t.Fatalf("ResolveProvider() error = %v", err)
+	}
+	if provider.Command == "" {
+		t.Fatal("ResolveProvider() Command = empty, want builtin command")
+	}
+	if provider.Models.Default != "claude-opus-override" {
+		t.Fatalf("ResolveProvider() Models.Default = %q, want %q", provider.Models.Default, "claude-opus-override")
+	}
+	if provider.EffectiveAuthMode() != ProviderAuthModeNativeCLI {
+		t.Fatalf("ResolveProvider() AuthMode = %q, want native_cli", provider.EffectiveAuthMode())
+	}
+	if slots := provider.EffectiveCredentialSlots(); len(slots) != 0 {
+		t.Fatalf("ResolveProvider() CredentialSlots = %#v, want no native CLI slots", slots)
+	}
+	provider.Models.Curated[0].ID = "mutated"
+	provider.Models.Curated[0].ReasoningEfforts[0] = "mutated"
+	if provider.Models.Curated[0].Featured != nil {
+		*provider.Models.Curated[0].Featured = false
+	}
+
+	second, err := cfg.ResolveProvider("claude")
+	if err != nil {
+		t.Fatalf("ResolveProvider(second) error = %v", err)
+	}
+	builtin := BuiltinProviders()["claude"]
+	for _, candidate := range []ProviderConfig{second, builtin} {
+		model := candidate.Models.Curated[0]
+		if model.ID != "claude-fable-5" || model.ReasoningEfforts[0] != "low" ||
+			model.Featured == nil || !*model.Featured {
+			t.Fatalf("builtin provider changed through resolved clone: %#v", model)
+		}
+	}
+}
+
+func TestProviderCredentialSlotOverridePreservesSecretRefSemantics(t *testing.T) {
+	t.Parallel()
+
+	t.Run("Should preserve existing slot required kind and secret ref", func(t *testing.T) {
+		t.Parallel()
+
+		provider := mergeProvider(
+			ProviderConfig{
+				Command: "custom-agent --acp",
+				CredentialSlots: []ProviderCredentialSlot{
+					{
+						Name:      "api_key",
+						TargetEnv: "OPENROUTER_API_KEY",
+						SecretRef: "vault:providers/openrouter/api-key",
+						Kind:      "api_key",
+						Required:  false,
+					},
+				},
+			},
+			ProviderConfig{
+				CredentialSlots: []ProviderCredentialSlot{
+					{
+						Name:      "api_key",
+						TargetEnv: "OPENROUTER_RUNTIME_KEY",
+						SecretRef: "vault:providers/openrouter/api-key",
+						Kind:      "api_key",
+						Required:  false,
+					},
+				},
+			},
+		)
+		slots := provider.EffectiveCredentialSlots()
+		if len(slots) != 1 {
+			t.Fatalf("EffectiveCredentialSlots() = %#v, want one slot", slots)
+		}
+		slot := slots[0]
+		if slot.TargetEnv != "OPENROUTER_RUNTIME_KEY" {
+			t.Fatalf("slot.TargetEnv = %q, want override env", slot.TargetEnv)
+		}
+		if slot.SecretRef != "vault:providers/openrouter/api-key" {
+			t.Fatalf("slot.SecretRef = %q, want preserved secret ref", slot.SecretRef)
+		}
+		if slot.Required {
+			t.Fatalf("slot.Required = true, want preserved optional slot")
+		}
+		if slot.Kind != "api_key" || slot.Name != "api_key" {
+			t.Fatalf("slot identity = %#v, want preserved api_key identity", slot)
+		}
+	})
+
+	t.Run("Should not synthesize compatibility slots for custom providers", func(t *testing.T) {
+		t.Parallel()
+
+		cfg := Config{
+			Providers: map[string]ProviderConfig{
+				"custom": {
+					Command: "custom-agent --acp",
+				},
+			},
+		}
+
+		provider, err := cfg.ResolveProvider("custom")
+		if err != nil {
+			t.Fatalf("ResolveProvider(custom) error = %v", err)
+		}
+		slots := provider.EffectiveCredentialSlots()
+		if len(slots) != 0 {
+			t.Fatalf("EffectiveCredentialSlots() = %#v, want no synthesized slots", slots)
+		}
+	})
+}
+
+func TestProviderOverlayCredentialSlotsReplaceExistingSlots(t *testing.T) {
+	t.Parallel()
+
+	t.Run("Should replace credential slots from overlay", func(t *testing.T) {
+		t.Parallel()
+
+		cfg := Config{
+			Providers: map[string]ProviderConfig{
+				"custom": {
+					Command: "custom-agent --acp",
+					CredentialSlots: []ProviderCredentialSlot{
+						{
+							Name:      "api_key",
+							TargetEnv: "CUSTOM_API_KEY",
+							SecretRef: "env:CUSTOM_API_KEY",
+							Kind:      "api_key",
+							Required:  false,
+						},
+					},
+				},
+			},
+		}
+		overlay, err := loadConfigOverlayBytes([]byte(`
+	[providers.custom]
+	[[providers.custom.credential_slots]]
+	name = "api_key"
+	target_env = "CUSTOM_RUNTIME_KEY"
+	secret_ref = "env:CUSTOM_RUNTIME_KEY"
+	kind = "api_key"
+	required = false
+	`), "inline")
+		if err != nil {
+			t.Fatalf("loadConfigOverlayBytes() error = %v", err)
+		}
+		if err := overlay.Apply(&cfg); err != nil {
+			t.Fatalf("Apply() error = %v", err)
+		}
+
+		slots := cfg.Providers["custom"].CredentialSlots
+		if len(slots) != 1 {
+			t.Fatalf("CredentialSlots = %#v, want one slot", slots)
+		}
+		if slots[0].TargetEnv != "CUSTOM_RUNTIME_KEY" || slots[0].SecretRef != "env:CUSTOM_RUNTIME_KEY" {
+			t.Fatalf("CredentialSlots[0] = %#v, want overlay credential slot", slots[0])
+		}
+		if slots[0].Required {
+			t.Fatalf("CredentialSlots[0].Required = true, want preserved false")
+		}
+	})
+}
+
+func TestProviderAuthModeValidation(t *testing.T) {
+	t.Parallel()
+
+	t.Run("Should reject credential slots on native builtins without explicit bound secret auth", func(t *testing.T) {
+		t.Parallel()
+
+		cfg := Config{
+			Providers: map[string]ProviderConfig{
+				"claude": {
+					CredentialSlots: []ProviderCredentialSlot{
+						apiKeyCredentialSlot("ANTHROPIC_API_KEY"),
+					},
+				},
+			},
+		}
+
+		_, err := cfg.ResolveProvider("claude")
+		if err == nil {
+			t.Fatal("ResolveProvider(native slot override) error = nil, want validation error")
+		}
+		if !strings.Contains(err.Error(), `auth_mode must be "bound_secret"`) {
+			t.Fatalf("ResolveProvider(native slot override) error = %v, want auth_mode guidance", err)
+		}
+	})
+
+	t.Run("Should allow explicit bound secret auth on native builtins", func(t *testing.T) {
+		t.Parallel()
+
+		cfg := Config{
+			Providers: map[string]ProviderConfig{
+				"claude": {
+					AuthMode: ProviderAuthModeBoundSecret,
+					CredentialSlots: []ProviderCredentialSlot{
+						apiKeyCredentialSlot("ANTHROPIC_API_KEY"),
+					},
+				},
+			},
+		}
+
+		provider, err := cfg.ResolveProvider("claude")
+		if err != nil {
+			t.Fatalf("ResolveProvider(bound native override) error = %v", err)
+		}
+		if got, want := provider.EffectiveAuthMode(), ProviderAuthModeBoundSecret; got != want {
+			t.Fatalf("ResolveProvider() AuthMode = %q, want %q", got, want)
+		}
+		if provider.AuthLoginCmd != "" {
+			t.Fatalf("ResolveProvider() AuthLoginCmd = %q, want empty", provider.AuthLoginCmd)
+		}
+	})
+
+	t.Run("Should clear inherited native auth commands when a builtin switches to none", func(t *testing.T) {
+		t.Parallel()
+
+		cfg := Config{
+			Providers: map[string]ProviderConfig{
+				"claude": {
+					AuthMode:     ProviderAuthModeNone,
+					NoneSecurity: ProviderNoneSecurityLocalTransport,
+				},
+			},
+		}
+
+		provider, err := cfg.ResolveProvider("claude")
+		if err != nil {
+			t.Fatalf("ResolveProvider(none native override) error = %v", err)
+		}
+		if got, want := provider.EffectiveAuthMode(), ProviderAuthModeNone; got != want {
+			t.Fatalf("ResolveProvider() AuthMode = %q, want %q", got, want)
+		}
+		if provider.AuthStatusCmd != "" || provider.AuthLoginCmd != "" {
+			t.Fatalf(
+				"ResolveProvider() auth commands = (%q, %q), want empty",
+				provider.AuthStatusCmd,
+				provider.AuthLoginCmd,
+			)
+		}
+		if slots := provider.EffectiveCredentialSlots(); len(slots) != 0 {
+			t.Fatalf("ResolveProvider() CredentialSlots = %#v, want empty", slots)
+		}
+	})
+
+	t.Run("Should clear inherited bound credentials when a builtin switches to native CLI", func(t *testing.T) {
+		t.Parallel()
+
+		cfg := Config{
+			Providers: map[string]ProviderConfig{
+				"openrouter": {AuthMode: ProviderAuthModeNativeCLI},
+			},
+		}
+
+		provider, err := cfg.ResolveProvider("openrouter")
+		if err != nil {
+			t.Fatalf("ResolveProvider(native bound override) error = %v", err)
+		}
+		if got, want := provider.EffectiveAuthMode(), ProviderAuthModeNativeCLI; got != want {
+			t.Fatalf("ResolveProvider() AuthMode = %q, want %q", got, want)
+		}
+		if slots := provider.EffectiveCredentialSlots(); len(slots) != 0 {
+			t.Fatalf("ResolveProvider() CredentialSlots = %#v, want empty", slots)
+		}
+	})
+
+	t.Run("Should reject bound secret auth without credential slots", func(t *testing.T) {
+		t.Parallel()
+
+		cfg := Config{
+			Providers: map[string]ProviderConfig{
+				"custom": {
+					Command:  "custom-agent --acp",
+					AuthMode: ProviderAuthModeBoundSecret,
+				},
+			},
+		}
+
+		_, err := cfg.ResolveProvider("custom")
+		if err == nil {
+			t.Fatal("ResolveProvider(bound without slots) error = nil, want validation error")
+		}
+		if !strings.Contains(err.Error(), "credential_slots is required") {
+			t.Fatalf("ResolveProvider(bound without slots) error = %v, want credential_slots guidance", err)
+		}
+	})
+
+	t.Run("Should reject credential slots when auth is none", func(t *testing.T) {
+		t.Parallel()
+
+		cfg := Config{
+			Providers: map[string]ProviderConfig{
+				"custom": {
+					Command:  "custom-agent --acp",
+					AuthMode: ProviderAuthModeNone,
+					CredentialSlots: []ProviderCredentialSlot{
+						apiKeyCredentialSlot("CUSTOM_API_KEY"),
+					},
+				},
+			},
+		}
+
+		_, err := cfg.ResolveProvider("custom")
+		if err == nil {
+			t.Fatal("ResolveProvider(none with slots) error = nil, want validation error")
+		}
+		if !strings.Contains(err.Error(), "cannot be set when auth_mode is none") {
+			t.Fatalf("ResolveProvider(none with slots) error = %v, want none guidance", err)
+		}
+	})
+
+	t.Run("Should reject status command when auth is none", func(t *testing.T) {
+		t.Parallel()
+
+		cfg := Config{
+			Providers: map[string]ProviderConfig{
+				"custom": {
+					Command:       "custom-agent --acp",
+					AuthMode:      ProviderAuthModeNone,
+					AuthStatusCmd: "custom-agent auth status",
+				},
+			},
+		}
+
+		_, err := cfg.ResolveProvider("custom")
+		if err == nil {
+			t.Fatal("ResolveProvider(none with status command) error = nil, want validation error")
+		}
+		if !strings.Contains(err.Error(), "auth_status_command cannot be set when auth_mode is none") {
+			t.Fatalf("ResolveProvider(none with status command) error = %v, want status command guidance", err)
+		}
+	})
+
+	t.Run("Should reject login command when auth is none", func(t *testing.T) {
+		t.Parallel()
+
+		cfg := Config{
+			Providers: map[string]ProviderConfig{
+				"custom": {
+					Command:      "custom-agent --acp",
+					AuthMode:     ProviderAuthModeNone,
+					AuthLoginCmd: "custom-agent auth login",
+				},
+			},
+		}
+
+		_, err := cfg.ResolveProvider("custom")
+		if err == nil {
+			t.Fatal("ResolveProvider(none with login command) error = nil, want validation error")
+		}
+		if !strings.Contains(err.Error(), "auth_login_command cannot be set when auth_mode is none") {
+			t.Fatalf("ResolveProvider(none with login command) error = %v, want login command guidance", err)
+		}
+	})
+
+	t.Run("Should reject invalid none security rationale", func(t *testing.T) {
+		t.Parallel()
+
+		cfg := Config{
+			Providers: map[string]ProviderConfig{
+				"custom": {
+					Command:      "custom-agent --acp",
+					AuthMode:     ProviderAuthModeNone,
+					NoneSecurity: ProviderNoneSecurity("public-write"),
+				},
+			},
+		}
+
+		_, err := cfg.ResolveProvider("custom")
+		if err == nil {
+			t.Fatal("ResolveProvider(invalid none_security) error = nil, want validation error")
+		}
+		if !strings.Contains(err.Error(), "none_security") {
+			t.Fatalf("ResolveProvider(invalid none_security) error = %v, want none_security guidance", err)
+		}
+	})
+}
+
+func TestProviderCredentialSlotValidateRestrictsSecretRefs(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name    string
+		ref     string
+		wantErr bool
+	}{
+		{name: "Should accept env ref", ref: "env:OPENROUTER_API_KEY"},
+		{name: "Should accept provider secret ref", ref: "vault:providers/openrouter/api-key"},
+		{
+			name: "Should accept provider secret ref with underscore slot",
+			ref:  "vault:providers/vercel-ai-gateway/api_key",
+		},
+		{name: "Should reject arbitrary vault suffix", ref: "vault:anything", wantErr: true},
+		{name: "Should reject provider secret ref without slot", ref: "vault:providers/openrouter", wantErr: true},
+		{
+			name:    "Should reject provider secret ref with uppercase provider",
+			ref:     "vault:providers/OpenRouter/api-key",
+			wantErr: true,
+		},
+		{
+			name:    "Should reject provider secret ref with uppercase slot",
+			ref:     "vault:providers/openrouter/API-key",
+			wantErr: true,
+		},
+		{name: "Should reject malformed env ref", ref: "env:OPENROUTER API KEY", wantErr: true},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			slot := ProviderCredentialSlot{
+				Name:      "api_key",
+				TargetEnv: "OPENROUTER_API_KEY",
+				SecretRef: tc.ref,
+				Kind:      "api_key",
+				Required:  true,
+			}
+			err := slot.Validate("providers.openrouter.credential_slots[0]")
+			if tc.wantErr && err == nil {
+				t.Fatalf("Validate(%q) error = nil, want validation failure", tc.ref)
+			}
+			if !tc.wantErr && err != nil {
+				t.Fatalf("Validate(%q) error = %v, want nil", tc.ref, err)
+			}
+		})
+	}
+}
+
+func TestResolveAgentModelOverridesProviderDefault(t *testing.T) {
+	homePaths, err := ResolveHomePathsFrom(filepath.Join(t.TempDir(), "home"))
+	if err != nil {
+		t.Fatalf("ResolveHomePathsFrom() error = %v", err)
+	}
+
+	cfg := DefaultWithHome(homePaths)
+	agent := AgentDef{
+		Name:     "coder",
+		Provider: "claude",
+		Model:    "agent-model",
+		Prompt:   "prompt",
+	}
+
+	resolved, err := cfg.ResolveAgent(agent)
+	if err != nil {
+		t.Fatalf("ResolveAgent() error = %v", err)
+	}
+	if resolved.Model != "agent-model" {
+		t.Fatalf("ResolveAgent() Model = %q, want %q", resolved.Model, "agent-model")
+	}
+}
+
+func TestResolveAgentAppliesProviderFullAccessPreference(t *testing.T) {
+	t.Parallel()
+
+	homePaths, err := ResolveHomePathsFrom(filepath.Join(t.TempDir(), "home"))
+	if err != nil {
+		t.Fatalf("ResolveHomePathsFrom() error = %v", err)
+	}
+	cfg := DefaultWithHome(homePaths)
+	cfg.Permissions.ProviderFullAccess = true
+
+	for _, tc := range []struct {
+		name        string
+		provider    string
+		agentOption string
+		agentMode   string
+		permissions string
+		wantOption  string
+		wantMode    string
+	}{
+		{name: "Should select Codex full access", provider: "codex", wantMode: "agent-full-access"},
+		{name: "Should select Claude bypass permissions", provider: "claude", wantMode: "bypassPermissions"},
+		{name: "Should select Copilot allow-all", provider: "copilot", wantOption: "allow_all", wantMode: "on"},
+		{
+			name: "Should let an agent narrow Copilot allow-all", provider: "copilot",
+			agentOption: "allow_all", agentMode: "off", wantOption: "allow_all", wantMode: "off",
+		},
+		{name: "Should let an agent narrow the provider mode", provider: "codex", agentMode: "read-only", wantMode: "read-only"},
+		{name: "Should preserve stricter Compozy permissions", provider: "claude", permissions: "approve-reads"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			agent := AgentDef{Name: "qa", Provider: tc.provider, Permissions: tc.permissions, Prompt: "prompt"}
+			if tc.agentMode != "" {
+				agent.SetACPOptions([]ACPOptionSelection{{ID: cmp.Or(tc.agentOption, "mode"), ValueID: tc.agentMode}})
+			}
+			resolved, err := cfg.ResolveAgent(agent)
+			if err != nil {
+				t.Fatalf("ResolveAgent() error = %v", err)
+			}
+			options := resolved.ACPOptionsValue()
+			if tc.wantMode == "" && len(options) == 0 {
+				return
+			}
+			wantOption := cmp.Or(tc.wantOption, "mode")
+			if len(options) != 1 || options[0].ID != wantOption || options[0].ValueID != tc.wantMode {
+				t.Fatalf("ResolveAgent() ACPOptions = %#v, want %s %q", options, wantOption, tc.wantMode)
+			}
+		})
+	}
+	t.Run("Should add Copilot allow-all beside an explicit task mode", func(t *testing.T) {
+		t.Parallel()
+		agent := AgentDef{Name: "qa", Provider: "copilot", Prompt: "prompt"}
+		agent.SetACPOptions([]ACPOptionSelection{{
+			ID: "mode", ValueID: "https://agentclientprotocol.com/protocol/session-modes#plan",
+		}})
+		resolved, err := cfg.ResolveAgent(agent)
+		if err != nil {
+			t.Fatalf("ResolveAgent() error = %v", err)
+		}
+		options := resolved.ACPOptionsValue()
+		got := map[string]string{}
+		for _, option := range options {
+			got[option.ID] = option.ValueID
+		}
+		if len(options) != 2 || len(got) != 2 || got["allow_all"] != "on" ||
+			got["mode"] != "https://agentclientprotocol.com/protocol/session-modes#plan" {
+			t.Fatalf("ResolveAgent() ACPOptions = %#v, want the explicit mode plus allow_all=on", got)
+		}
+	})
+	t.Run("Should keep an explicit mode for a provider without a full-access mapping", func(t *testing.T) {
+		t.Parallel()
+		agent := AgentDef{Name: "qa", Provider: "gemini", Prompt: "prompt"}
+		agent.SetACPOptions([]ACPOptionSelection{{ID: "mode", ValueID: "default"}})
+		resolved, err := cfg.ResolveAgent(agent)
+		if err != nil {
+			t.Fatalf("ResolveAgent() error = %v, want the explicit mode to win", err)
+		}
+		if options := resolved.ACPOptionsValue(); len(options) != 1 || options[0].ValueID != "default" {
+			t.Fatalf("ResolveAgent() ACPOptions = %#v, want the explicit mode", options)
+		}
+	})
+	t.Run("Should fail clearly for an unsupported provider", func(t *testing.T) {
+		t.Parallel()
+		_, err := cfg.ResolveAgent(AgentDef{Name: "qa", Provider: "gemini", Prompt: "prompt"})
+		if err == nil || !strings.Contains(err.Error(), "provider_full_access is unsupported") {
+			t.Fatalf("ResolveAgent() error = %v, want unsupported provider", err)
+		}
+	})
+}
+
+func TestLoadProviderFullAccessPreference(t *testing.T) {
+	t.Run("Should apply a provider mode to a resolved agent", func(t *testing.T) {
+		homePaths, err := ResolveHomePathsFrom(filepath.Join(t.TempDir(), "home"))
+		if err != nil {
+			t.Fatalf("ResolveHomePathsFrom() error = %v", err)
+		}
+		if err := EnsureHomeLayout(homePaths); err != nil {
+			t.Fatalf("EnsureHomeLayout() error = %v", err)
+		}
+		writeFile(t, homePaths.ConfigFile, `[permissions]
+provider_full_access = true
+
+[defaults]
+provider = "codex"
+`)
+
+		cfg, err := LoadForHome(homePaths, withoutDotEnv())
+		if err != nil {
+			t.Fatalf("LoadForHome() error = %v", err)
+		}
+		resolved, err := cfg.ResolveAgent(AgentDef{Name: "qa", Prompt: "prompt"})
+		if err != nil {
+			t.Fatalf("ResolveAgent() error = %v", err)
+		}
+		options := resolved.ACPOptionsValue()
+		if len(options) != 1 || options[0].ID != "mode" || options[0].ValueID != "agent-full-access" {
+			t.Fatalf("ResolveAgent() ACPOptions = %#v, want agent-full-access mode", options)
+		}
+	})
+}
+
+func TestWorkspaceCannotEnableProviderFullAccess(t *testing.T) {
+	t.Parallel()
+	t.Run("Should reject enabling provider full access from workspace config", func(t *testing.T) {
+		t.Parallel()
+		homePaths, err := ResolveHomePathsFrom(filepath.Join(t.TempDir(), "home"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := EnsureHomeLayout(homePaths); err != nil {
+			t.Fatal(err)
+		}
+		workspaceRoot := t.TempDir()
+		workspaceConfig := filepath.Join(workspaceRoot, ".compozy", "config.toml")
+		if err := os.MkdirAll(filepath.Dir(workspaceConfig), 0o700); err != nil {
+			t.Fatal(err)
+		}
+		writeFile(t, workspaceConfig, "[permissions]\nprovider_full_access = true\n")
+		_, err = LoadForHome(homePaths, WithWorkspaceRoot(workspaceRoot), withoutDotEnv())
+		if err == nil || !strings.Contains(err.Error(), "only be enabled in the global config") {
+			t.Fatalf("LoadForHome() error = %v, want workspace privilege refusal", err)
+		}
+	})
+}
+
+func TestResolveAgentPreservesRuntimeDefaults(t *testing.T) {
+	t.Parallel()
+
+	t.Run("Should preserve runtime defaults and ownership", func(t *testing.T) {
+		t.Parallel()
+
+		homePaths, err := ResolveHomePathsFrom(filepath.Join(t.TempDir(), "home"))
+		if err != nil {
+			t.Fatalf("ResolveHomePathsFrom() error = %v", err)
+		}
+
+		cfg := DefaultWithHome(homePaths)
+		agent := AgentDef{
+			Name:     "coder",
+			Provider: "claude",
+			Prompt:   "prompt",
+		}
+		agent.SetSpeed(speedpkg.SpeedFast)
+		agent.SetACPOptions([]ACPOptionSelection{
+			{ID: "thinking", BoolValue: new(true)},
+			{ID: "context", ValueID: "1m"},
+		})
+
+		resolved, err := cfg.ResolveAgent(agent)
+		if err != nil {
+			t.Fatalf("ResolveAgent() error = %v", err)
+		}
+		resolvedOptions := resolved.ACPOptionsValue()
+		if resolved.SpeedValue() != speedpkg.SpeedFast || len(resolvedOptions) != 2 {
+			t.Fatalf("ResolveAgent() runtime defaults = %#v", resolved)
+		}
+		if got := resolved.RuntimeSources.Speed; got != RuntimeValueSourceAgent {
+			t.Fatalf("ResolveAgent() speed source = %q, want agent", got)
+		}
+		if resolvedOptions[0].BoolValue == nil || !*resolvedOptions[0].BoolValue ||
+			resolvedOptions[1].ValueID != "1m" {
+			t.Fatalf("ResolveAgent() ACPOptions = %#v", resolvedOptions)
+		}
+		agentOptions := agent.ACPOptionsValue()
+		*agentOptions[0].BoolValue = false
+		agentOptions[1].ValueID = "changed"
+		if !*resolvedOptions[0].BoolValue || resolvedOptions[1].ValueID != "1m" {
+			t.Fatalf("ResolveAgent() ACPOptions alias source data: %#v", resolvedOptions)
+		}
+	})
+
+	t.Run("Should inherit the selected model default speed", func(t *testing.T) {
+		t.Parallel()
+
+		homePaths, err := ResolveHomePathsFrom(filepath.Join(t.TempDir(), "home"))
+		if err != nil {
+			t.Fatalf("ResolveHomePathsFrom() error = %v", err)
+		}
+		cfg := DefaultWithHome(homePaths)
+		cfg.Providers["cursor"] = ProviderConfig{Models: ProviderModelsConfig{
+			Default: "grok-4.5",
+			Curated: []ProviderModelConfig{{ID: "grok-4.5", DefaultSpeed: speedpkg.SpeedFast}},
+		}}
+
+		resolved, err := cfg.ResolveAgent(AgentDef{Name: "coder", Provider: "cursor", Prompt: "prompt"})
+		if err != nil {
+			t.Fatalf("ResolveAgent() error = %v", err)
+		}
+		if got := resolved.SpeedValue(); got != speedpkg.SpeedFast {
+			t.Fatalf("ResolveAgent() Speed = %q, want fast", got)
+		}
+		if got := resolved.RuntimeSources.Speed; got != RuntimeValueSourceModelDefault {
+			t.Fatalf("ResolveAgent() speed source = %q, want model_default", got)
+		}
+	})
+
+	t.Run("Should prefer an authored speed over the selected model default", func(t *testing.T) {
+		t.Parallel()
+
+		homePaths, err := ResolveHomePathsFrom(filepath.Join(t.TempDir(), "home"))
+		if err != nil {
+			t.Fatalf("ResolveHomePathsFrom() error = %v", err)
+		}
+		cfg := DefaultWithHome(homePaths)
+		cfg.Providers["cursor"] = ProviderConfig{Models: ProviderModelsConfig{
+			Default: "grok-4.5",
+			Curated: []ProviderModelConfig{{ID: "grok-4.5", DefaultSpeed: speedpkg.SpeedFast}},
+		}}
+		agent := AgentDef{Name: "coder", Provider: "cursor", Prompt: "prompt"}
+		agent.SetSpeed(speedpkg.SpeedNormal)
+
+		resolved, err := cfg.ResolveAgent(agent)
+		if err != nil {
+			t.Fatalf("ResolveAgent() error = %v", err)
+		}
+		if got := resolved.SpeedValue(); got != speedpkg.SpeedNormal {
+			t.Fatalf("ResolveAgent() Speed = %q, want normal", got)
+		}
+		if got := resolved.RuntimeSources.Speed; got != RuntimeValueSourceAgent {
+			t.Fatalf("ResolveAgent() speed source = %q, want agent", got)
+		}
+	})
+}
+
+func TestResolveAgentReasoningEffort(t *testing.T) {
+	t.Parallel()
+
+	t.Run("Should preserve the agent reasoning default for its provider", func(t *testing.T) {
+		t.Parallel()
+
+		homePaths, err := ResolveHomePathsFrom(filepath.Join(t.TempDir(), "home"))
+		if err != nil {
+			t.Fatalf("ResolveHomePathsFrom() error = %v", err)
+		}
+		cfg := DefaultWithHome(homePaths)
+		resolved, err := cfg.ResolveAgent(AgentDef{
+			Name:            "coder",
+			Provider:        "claude",
+			ReasoningEffort: providerReasoningMaxKey,
+			Prompt:          "prompt",
+		})
+		if err != nil {
+			t.Fatalf("ResolveAgent() error = %v", err)
+		}
+		if got, want := resolved.ReasoningEffort, providerReasoningMaxKey; got != want {
+			t.Fatalf("ResolveAgent() ReasoningEffort = %q, want %q", got, want)
+		}
+		if got, want := resolved.RuntimeSources.ReasoningEffort, RuntimeValueSourceAgent; got != want {
+			t.Fatalf("ResolveAgent() ReasoningEffort source = %q, want %q", got, want)
+		}
+	})
+
+	t.Run("Should resolve the selected model default when the provider changes", func(t *testing.T) {
+		t.Parallel()
+
+		homePaths, err := ResolveHomePathsFrom(filepath.Join(t.TempDir(), "home"))
+		if err != nil {
+			t.Fatalf("ResolveHomePathsFrom() error = %v", err)
+		}
+		cfg := DefaultWithHome(homePaths)
+		resolved, err := cfg.ResolveSessionAgentWithRuntime(AgentDef{
+			Name:            "coder",
+			Provider:        "claude",
+			ReasoningEffort: providerReasoningMaxKey,
+			Prompt:          "prompt",
+		}, RuntimeOverrides{Provider: "codex", Model: "gpt-5.6-terra"})
+		if err != nil {
+			t.Fatalf("ResolveSessionAgentWithRuntime() error = %v", err)
+		}
+		if got, want := resolved.ReasoningEffort, providerMediumKey; got != want {
+			t.Fatalf("ResolveSessionAgentWithRuntime() ReasoningEffort = %q, want %q", got, want)
+		}
+		if got, want := resolved.RuntimeSources.ReasoningEffort, RuntimeValueSourceModelDefault; got != want {
+			t.Fatalf("ResolveSessionAgentWithRuntime() ReasoningEffort source = %q, want %q", got, want)
+		}
+	})
+
+	t.Run("Should rederive the full provider runtime and apply reasoning overrides", func(t *testing.T) {
+		t.Parallel()
+
+		homePaths, err := ResolveHomePathsFrom(filepath.Join(t.TempDir(), "home"))
+		if err != nil {
+			t.Fatalf("ResolveHomePathsFrom() error = %v", err)
+		}
+		cfg := DefaultWithHome(homePaths)
+		resolved, err := cfg.ResolveSessionAgentWithRuntime(AgentDef{
+			Name: "coder", Provider: "claude", Command: "agent-command",
+			Model: "agent-model", ReasoningEffort: providerReasoningMaxKey, Prompt: "prompt",
+		}, RuntimeOverrides{Provider: "codex", Reasoning: providerHighKey})
+		if err != nil {
+			t.Fatalf("ResolveSessionAgentWithRuntime() error = %v", err)
+		}
+		provider, err := cfg.ResolveProvider("codex")
+		if err != nil {
+			t.Fatalf("ResolveProvider(codex) error = %v", err)
+		}
+		if resolved.Provider != "codex" || resolved.Command != provider.Command ||
+			resolved.Model != provider.Models.Default || resolved.ReasoningEffort != providerHighKey {
+			t.Fatalf("resolved runtime = %#v, want provider-derived codex runtime with high reasoning", resolved)
+		}
+	})
+
+	t.Run(
+		"Should apply an explicit route command after provider-aware resolution",
+		func(t *testing.T) { // UT-014, UT-033
+			t.Parallel()
+
+			homePaths, err := ResolveHomePathsFrom(filepath.Join(t.TempDir(), "home"))
+			if err != nil {
+				t.Fatalf("ResolveHomePathsFrom() error = %v", err)
+			}
+			cfg := DefaultWithHome(homePaths)
+			agent := AgentDef{
+				Name: "coder", Provider: "claude", Command: "agent-command", Model: "agent-model", Prompt: "prompt",
+			}
+			codex, err := cfg.ResolveProvider("codex")
+			if err != nil {
+				t.Fatalf("ResolveProvider(codex) error = %v", err)
+			}
+			for _, testCase := range []struct {
+				name         string
+				overrides    RuntimeOverrides
+				wantProvider string
+				wantCommand  string
+			}{
+				{
+					name:         "explicit command on the agent provider",
+					overrides:    RuntimeOverrides{Command: "X claude --acp"},
+					wantProvider: "claude",
+					wantCommand:  "X claude --acp",
+				},
+				{
+					name:         "empty command keeps the agent command on the same provider",
+					overrides:    RuntimeOverrides{Command: ""},
+					wantProvider: "claude",
+					wantCommand:  "agent-command",
+				},
+				{
+					name:         "explicit command on another provider",
+					overrides:    RuntimeOverrides{Provider: "codex", Command: "CODEX_HOME=/x codex acp"},
+					wantProvider: "codex",
+					wantCommand:  "CODEX_HOME=/x codex acp",
+				},
+				{
+					name:         "no command on another provider uses that provider command",
+					overrides:    RuntimeOverrides{Provider: "codex"},
+					wantProvider: "codex",
+					wantCommand:  codex.Command,
+				},
+			} {
+				t.Run("Should resolve "+testCase.name, func(t *testing.T) {
+					t.Parallel()
+
+					resolved, err := cfg.ResolveSessionAgentWithRuntime(agent, testCase.overrides)
+					if err != nil {
+						t.Fatalf("ResolveSessionAgentWithRuntime() error = %v", err)
+					}
+					if resolved.Provider != testCase.wantProvider || resolved.Command != testCase.wantCommand {
+						t.Fatalf(
+							"resolved (provider, command) = (%q, %q), want (%q, %q)",
+							resolved.Provider, resolved.Command, testCase.wantProvider, testCase.wantCommand,
+						)
+					}
+				})
+			}
+		},
+	)
+
+	t.Run("Should resolve the selected model default when the model changes within one provider", func(t *testing.T) {
+		t.Parallel()
+
+		homePaths, err := ResolveHomePathsFrom(filepath.Join(t.TempDir(), "home"))
+		if err != nil {
+			t.Fatalf("ResolveHomePathsFrom() error = %v", err)
+		}
+		cfg := DefaultWithHome(homePaths)
+		resolved, err := cfg.ResolveSessionAgentWithRuntime(AgentDef{
+			Name:            "coder",
+			Provider:        "codex",
+			Model:           modelGPT56SolID,
+			ReasoningEffort: providerMediumKey,
+			Prompt:          "prompt",
+		}, RuntimeOverrides{Provider: "codex", Model: "gpt-5.6-terra"})
+		if err != nil {
+			t.Fatalf("ResolveSessionAgentWithRuntime() error = %v", err)
+		}
+		if got, want := resolved.ReasoningEffort, providerMediumKey; got != want {
+			t.Fatalf("ResolveSessionAgentWithRuntime() ReasoningEffort = %q, want %q", got, want)
+		}
+		if got, want := resolved.RuntimeSources.ReasoningEffort, RuntimeValueSourceModelDefault; got != want {
+			t.Fatalf("ResolveSessionAgentWithRuntime() ReasoningEffort source = %q, want %q", got, want)
+		}
+	})
+
+	t.Run("Should inherit project provider and provider model defaults with provenance", func(t *testing.T) {
+		t.Parallel()
+
+		homePaths, err := ResolveHomePathsFrom(filepath.Join(t.TempDir(), "home"))
+		if err != nil {
+			t.Fatalf("ResolveHomePathsFrom() error = %v", err)
+		}
+		cfg := DefaultWithHome(homePaths)
+		cfg.Defaults.Provider = "codex"
+		resolved, err := cfg.ResolveAgent(AgentDef{Name: "coder", Prompt: "prompt"})
+		if err != nil {
+			t.Fatalf("ResolveAgent() error = %v", err)
+		}
+		if got, want := resolved.Provider, "codex"; got != want {
+			t.Fatalf("ResolveAgent() Provider = %q, want %q", got, want)
+		}
+		if got, want := resolved.Model, modelGPT56SolID; got != want {
+			t.Fatalf("ResolveAgent() Model = %q, want %q", got, want)
+		}
+		if got, want := resolved.ReasoningEffort, providerMediumKey; got != want {
+			t.Fatalf("ResolveAgent() ReasoningEffort = %q, want %q", got, want)
+		}
+		wantSources := ResolvedRuntimeSources{
+			Provider:        RuntimeValueSourceProjectDefault,
+			Model:           RuntimeValueSourceProviderDefault,
+			ReasoningEffort: RuntimeValueSourceModelDefault,
+			Permissions:     RuntimeValueSourceProjectDefault,
+		}
+		if got := resolved.RuntimeSources; got != wantSources {
+			t.Fatalf("ResolveAgent() RuntimeSources = %#v, want %#v", got, wantSources)
+		}
+	})
+
+	t.Run("Should reject reasoning effort when the provider does not support reasoning", func(t *testing.T) {
+		t.Parallel()
+
+		homePaths, err := ResolveHomePathsFrom(filepath.Join(t.TempDir(), "home"))
+		if err != nil {
+			t.Fatalf("ResolveHomePathsFrom() error = %v", err)
+		}
+		cfg := DefaultWithHome(homePaths)
+		cfg.Providers["no-reasoning"] = ProviderConfig{
+			Command: "mock-cli",
+			Models: ProviderModelsConfig{
+				Default: "mock-model",
+				Reasoning: ProviderReasoningConfig{
+					Apply: ReasoningApplyNone,
+				},
+			},
+		}
+		_, err = cfg.ResolveAgent(AgentDef{
+			Name:            "coder",
+			Provider:        "no-reasoning",
+			ReasoningEffort: providerHighKey,
+			Prompt:          "prompt",
+		})
+		assertErrorContains(t, err, "does not support reasoning effort")
+	})
+
+	t.Run("Should reject reasoning effort when provider reasoning apply is omitted", func(t *testing.T) {
+		t.Parallel()
+
+		homePaths, err := ResolveHomePathsFrom(filepath.Join(t.TempDir(), "home"))
+		if err != nil {
+			t.Fatalf("ResolveHomePathsFrom() error = %v", err)
+		}
+		cfg := DefaultWithHome(homePaths)
+		cfg.Providers["omitted-reasoning"] = ProviderConfig{
+			Command: "mock-cli",
+			Models: ProviderModelsConfig{
+				Default: "mock-model",
+			},
+		}
+		_, err = cfg.ResolveAgent(AgentDef{
+			Name:            "coder",
+			Provider:        "omitted-reasoning",
+			ReasoningEffort: providerHighKey,
+			Prompt:          "prompt",
+		})
+		assertErrorContains(t, err, "does not support reasoning effort")
+	})
+}
+
+// TestResolveAgentSessionRuntimeDefaults verifies runtime precedence and keeps
+// saved defaults from applying unsupported effort to the selected model.
+func TestResolveAgentSessionRuntimeDefaults(t *testing.T) {
+	t.Parallel()
+	t.Run("Should resolve Haiku without selectable effort and reject explicit unsupported values", func(t *testing.T) {
+		t.Parallel()
+		// Invariant: model capabilities govern effort for sessions, workers, and fallback routes.
+		// Owner: shared runtime resolution; canonical suite: this function.
+		cfg := &Config{
+			Defaults: DefaultsConfig{Provider: "claude", Model: modelClaudeHaiku45CurrentID, ReasoningEffort: "medium"},
+		}
+		agent := AgentDef{Name: "general", Prompt: "prompt"}
+		resolved, err := cfg.ResolveSessionAgentWithRuntime(agent, RuntimeOverrides{})
+		if err != nil || resolved.ReasoningEffort != "" {
+			t.Fatalf("Haiku runtime = %#v, %v; want no effort", resolved, err)
+		}
+		for _, effort := range []string{"medium", "none"} {
+			_, err := cfg.ResolveSessionAgentWithRuntime(agent, RuntimeOverrides{Reasoning: effort})
+			if err == nil || !strings.Contains(err.Error(), "omit reasoning_effort") {
+				t.Fatalf("explicit %q error = %v, want actionable unsupported effort", effort, err)
+			}
+			item, ok := diagnostics.ItemFromError(err)
+			if !ok || item.Code != diagnosticcontract.CodeReasoningEffortUnsupported {
+				t.Fatalf("explicit %q diagnostic = %#v, %v; want structured unsupported effort", effort, item, ok)
+			}
+		}
+	})
+
+	t.Run("Should preserve explicit selectable effort for live ACP negotiation", func(t *testing.T) {
+		t.Parallel()
+		cfg := &Config{Defaults: DefaultsConfig{Provider: "codex"}}
+		resolved, err := cfg.ResolveSessionAgentWithRuntime(
+			AgentDef{Name: "general", Prompt: "prompt"},
+			RuntimeOverrides{Model: modelGPT56SolID, Reasoning: "minimal"},
+		)
+		if err != nil || resolved.ReasoningEffort != "minimal" {
+			t.Fatalf("runtime = %#v, %v; want explicit effort negotiated by live ACP options", resolved, err)
+		}
+	})
+
+	t.Run("Should preserve live effort choices when curated metadata is incomplete", func(t *testing.T) {
+		t.Parallel()
+		cfg := &Config{
+			Defaults: DefaultsConfig{Provider: "opencode"},
+			Providers: map[string]ProviderConfig{"opencode": {Models: ProviderModelsConfig{
+				Curated: []ProviderModelConfig{{ID: "openrouter/acme/coding-default"}},
+			}}},
+		}
+		resolved, err := cfg.ResolveSessionAgentWithRuntime(
+			AgentDef{Name: "general", Prompt: "prompt"},
+			RuntimeOverrides{Model: "openrouter/acme/coding-default", Reasoning: "high"},
+		)
+		if err != nil || resolved.ReasoningEffort != "high" {
+			t.Fatalf("runtime = %#v, %v; want live ACP to negotiate explicit effort", resolved, err)
+		}
+	})
+
+	t.Run("Should preserve live effort choices when builtin capability metadata is incomplete", func(t *testing.T) {
+		t.Parallel()
+		// Invariant: absent capability metadata cannot override live ACP choices.
+		// Owner: shared runtime resolution; canonical suite: this function.
+		cfg := &Config{
+			Defaults: DefaultsConfig{Provider: providerGeminiKey},
+			Providers: map[string]ProviderConfig{providerGeminiKey: {Models: ProviderModelsConfig{
+				Reasoning: ProviderReasoningConfig{Apply: ReasoningApplyACPOption},
+			}}},
+		}
+		resolved, err := cfg.ResolveSessionAgentWithRuntime(
+			AgentDef{Name: "general", Prompt: "prompt"},
+			RuntimeOverrides{Model: providerGemini31ProPreviewPath, Reasoning: "high"},
+		)
+		if err != nil || resolved.ReasoningEffort != "high" {
+			t.Fatalf("runtime = %#v, %v; want live ACP to negotiate explicit effort", resolved, err)
+		}
+	})
+
+	sessionDefaultsConfig := func(t *testing.T, defaults DefaultsConfig) Config {
+		t.Helper()
+		homePaths, err := ResolveHomePathsFrom(filepath.Join(t.TempDir(), "home"))
+		if err != nil {
+			t.Fatalf("ResolveHomePathsFrom() error = %v", err)
+		}
+		cfg := DefaultWithHome(homePaths)
+		cfg.Defaults = defaults
+		return cfg
+	}
+	codexDefaults := DefaultsConfig{
+		Agent: DefaultAgentName, Provider: "codex", Model: modelGPT56TerraID, ReasoningEffort: providerHighKey,
+	}
+
+	t.Run("Should start a default-provider session on the saved model and reasoning", func(t *testing.T) {
+		t.Parallel()
+
+		cfg := sessionDefaultsConfig(t, codexDefaults)
+		resolved, err := cfg.ResolveAgent(AgentDef{Name: "general", Prompt: "prompt"})
+		if err != nil {
+			t.Fatalf("ResolveAgent() error = %v", err)
+		}
+		if resolved.Provider != "codex" || resolved.Model != modelGPT56TerraID ||
+			resolved.ReasoningEffort != providerHighKey {
+			t.Fatalf("resolved runtime = %s/%s/%s, want codex/%s/%s",
+				resolved.Provider, resolved.Model, resolved.ReasoningEffort, modelGPT56TerraID, providerHighKey)
+		}
+		sources := resolved.RuntimeSources
+		if sources.Model != RuntimeValueSourceProjectDefault ||
+			sources.ReasoningEffort != RuntimeValueSourceProjectDefault {
+			t.Fatalf("runtime sources = %#v, want project defaults for model and reasoning", sources)
+		}
+	})
+
+	t.Run("Should keep the provider defaults when no session model is saved", func(t *testing.T) {
+		t.Parallel()
+
+		cfg := sessionDefaultsConfig(t, DefaultsConfig{Agent: DefaultAgentName, Provider: "codex"})
+		resolved, err := cfg.ResolveAgent(AgentDef{Name: "general", Prompt: "prompt"})
+		if err != nil {
+			t.Fatalf("ResolveAgent() error = %v", err)
+		}
+		if resolved.Model != modelGPT56SolID || resolved.ReasoningEffort != providerMediumKey {
+			t.Fatalf("resolved runtime = %s/%s, want the unchanged codex defaults %s/%s",
+				resolved.Model, resolved.ReasoningEffort, modelGPT56SolID, providerMediumKey)
+		}
+		if got, want := resolved.RuntimeSources.Model, RuntimeValueSourceProviderDefault; got != want {
+			t.Fatalf("model source = %q, want %q", got, want)
+		}
+	})
+
+	t.Run("Should refine the provider default model with a saved reasoning effort", func(t *testing.T) {
+		t.Parallel()
+
+		cfg := sessionDefaultsConfig(t, DefaultsConfig{
+			Agent: DefaultAgentName, Provider: "codex", ReasoningEffort: providerReasoningLowKey,
+		})
+		resolved, err := cfg.ResolveAgent(AgentDef{Name: "general", Prompt: "prompt"})
+		if err != nil {
+			t.Fatalf("ResolveAgent() error = %v", err)
+		}
+		if resolved.Model != modelGPT56SolID || resolved.ReasoningEffort != providerReasoningLowKey {
+			t.Fatalf("resolved runtime = %s/%s, want %s/%s",
+				resolved.Model, resolved.ReasoningEffort, modelGPT56SolID, providerReasoningLowKey)
+		}
+	})
+
+	t.Run("Should use the model default when the saved reasoning is unsupported", func(t *testing.T) {
+		t.Parallel()
+		cfg := sessionDefaultsConfig(t, codexDefaults)
+		cfg.Providers["codex"] = ProviderConfig{Models: ProviderModelsConfig{
+			Curated: []ProviderModelConfig{{ID: modelGPT56TerraID,
+				ReasoningEfforts: []string{providerReasoningLowKey}, DefaultReasoningEffort: providerReasoningLowKey}},
+		}}
+		resolved, err := cfg.ResolveAgent(AgentDef{Name: "general", Prompt: "prompt"})
+		if err != nil {
+			t.Fatalf("ResolveAgent() error = %v", err)
+		}
+		if resolved.ReasoningEffort != providerReasoningLowKey ||
+			resolved.RuntimeSources.ReasoningEffort != RuntimeValueSourceModelDefault {
+			t.Fatalf(
+				"reasoning = %q from %v, want the supported model default",
+				resolved.ReasoningEffort,
+				resolved.RuntimeSources.ReasoningEffort,
+			)
+		}
+	})
+
+	t.Run("Should omit an unadvertised saved model effort without blocking startup", func(t *testing.T) {
+		t.Parallel()
+		cfg := sessionDefaultsConfig(t, codexDefaults)
+		cfg.Providers["codex"] = ProviderConfig{Models: ProviderModelsConfig{
+			Default: "custom-model",
+			Curated: []ProviderModelConfig{{ID: "custom-model", DefaultReasoningEffort: "high"}},
+		}}
+		resolved, err := cfg.ResolveAgent(AgentDef{Name: "general", Prompt: "prompt", Model: "custom-model"})
+		if err != nil {
+			t.Fatalf("ResolveAgent() error = %v", err)
+		}
+		if resolved.ReasoningEffort != "" || resolved.RuntimeSources.ReasoningEffort != RuntimeValueSourceUnspecified {
+			t.Fatalf("resolved runtime = %#v, want no unadvertised effort", resolved)
+		}
+	})
+
+	t.Run("Should never apply the saved model to an agent-authored provider", func(t *testing.T) {
+		t.Parallel()
+
+		cfg := sessionDefaultsConfig(t, codexDefaults)
+		claude, err := cfg.ResolveProvider("claude")
+		if err != nil {
+			t.Fatalf("ResolveProvider(claude) error = %v", err)
+		}
+		resolved, err := cfg.ResolveAgent(AgentDef{Name: "coder", Provider: "claude", Prompt: "prompt"})
+		if err != nil {
+			t.Fatalf("ResolveAgent() error = %v", err)
+		}
+		if resolved.Provider != "claude" || resolved.Model != claude.Models.Default ||
+			resolved.RuntimeSources.Model != RuntimeValueSourceProviderDefault {
+			t.Fatalf("resolved runtime = %#v, want the claude provider default", resolved)
+		}
+		if resolved.RuntimeSources.ReasoningEffort == RuntimeValueSourceProjectDefault {
+			t.Fatalf("reasoning = %q from the session defaults, want none on claude", resolved.ReasoningEffort)
+		}
+	})
+
+	t.Run("Should keep an agent-authored model on its own reasoning default", func(t *testing.T) {
+		t.Parallel()
+
+		cfg := sessionDefaultsConfig(t, codexDefaults)
+		resolved, err := cfg.ResolveAgent(AgentDef{Name: "coder", Model: modelGPT56LunaID, Prompt: "prompt"})
+		if err != nil {
+			t.Fatalf("ResolveAgent() error = %v", err)
+		}
+		if resolved.Model != modelGPT56LunaID || resolved.ReasoningEffort != providerMediumKey ||
+			resolved.RuntimeSources.ReasoningEffort != RuntimeValueSourceModelDefault {
+			t.Fatalf("resolved runtime = %s/%s from %q, want %s/%s from the model default",
+				resolved.Model, resolved.ReasoningEffort, resolved.RuntimeSources.ReasoningEffort,
+				modelGPT56LunaID, providerMediumKey)
+		}
+	})
+
+	t.Run("Should let explicit session runtime choices win over the saved defaults", func(t *testing.T) {
+		t.Parallel()
+
+		cfg := sessionDefaultsConfig(t, codexDefaults)
+		agent := AgentDef{Name: "general", Prompt: "prompt"}
+		for _, testCase := range []struct {
+			name          string
+			overrides     RuntimeOverrides
+			wantProvider  string
+			wantModel     string
+			wantReasoning string
+		}{
+			{
+				name:          "Should keep the saved model for a reasoning-only override",
+				overrides:     RuntimeOverrides{Reasoning: providerReasoningLowKey},
+				wantProvider:  "codex",
+				wantModel:     modelGPT56TerraID,
+				wantReasoning: providerReasoningLowKey,
+			},
+			{
+				name:          "Should use the model default for another model on the same provider",
+				overrides:     RuntimeOverrides{Provider: "codex", Model: modelGPT56LunaID},
+				wantProvider:  "codex",
+				wantModel:     modelGPT56LunaID,
+				wantReasoning: providerMediumKey,
+			},
+		} {
+			t.Run(testCase.name, func(t *testing.T) {
+				t.Parallel()
+				resolved, err := cfg.ResolveSessionAgentWithRuntime(agent, testCase.overrides)
+				if err != nil {
+					t.Fatalf("%s: ResolveSessionAgentWithRuntime() error = %v", testCase.name, err)
+				}
+				if resolved.Provider != testCase.wantProvider || resolved.Model != testCase.wantModel ||
+					resolved.ReasoningEffort != testCase.wantReasoning {
+					t.Fatalf("%s: resolved runtime = %s/%s/%s, want %s/%s/%s", testCase.name,
+						resolved.Provider, resolved.Model, resolved.ReasoningEffort,
+						testCase.wantProvider, testCase.wantModel, testCase.wantReasoning)
+				}
+			})
+		}
+
+		claude, err := cfg.ResolveProvider("claude")
+		if err != nil {
+			t.Fatalf("ResolveProvider(claude) error = %v", err)
+		}
+		resolved, err := cfg.ResolveSessionAgentWithRuntime(agent, RuntimeOverrides{Provider: "claude"})
+		if err != nil {
+			t.Fatalf("ResolveSessionAgentWithRuntime(claude) error = %v", err)
+		}
+		if resolved.Provider != "claude" || resolved.Model != claude.Models.Default {
+			t.Fatalf("provider override runtime = %s/%s, want claude/%s",
+				resolved.Provider, resolved.Model, claude.Models.Default)
+		}
+	})
+}
+
+func TestResolveAgentAllowsDirectACPProviderManagedModel(t *testing.T) {
+	t.Parallel()
+
+	tests := []string{"copilot", "kimi-cli"}
+	for _, provider := range tests {
+		t.Run("Should allow "+provider+" without resolved model", func(t *testing.T) {
+			t.Parallel()
+
+			homePaths, err := ResolveHomePathsFrom(filepath.Join(t.TempDir(), "home"))
+			if err != nil {
+				t.Fatalf("ResolveHomePathsFrom() error = %v", err)
+			}
+
+			cfg := DefaultWithHome(homePaths)
+			agent := AgentDef{
+				Name:     "coder",
+				Provider: provider,
+				Prompt:   "prompt",
+			}
+
+			resolved, err := cfg.ResolveAgent(agent)
+			if err != nil {
+				t.Fatalf("ResolveAgent() error = %v", err)
+			}
+			if resolved.Model != "" {
+				t.Fatalf("ResolveAgent() Model = %q, want provider-managed empty model", resolved.Model)
+			}
+			if resolved.RuntimeSources.Model != RuntimeValueSourceUnspecified {
+				t.Fatalf("ResolveAgent() model source = %q, want empty", resolved.RuntimeSources.Model)
+			}
+		})
+	}
+}
+
+func TestResolveAgentRejectsPiProviderWithoutModel(t *testing.T) {
+	t.Parallel()
+
+	homePaths, err := ResolveHomePathsFrom(filepath.Join(t.TempDir(), "home"))
+	if err != nil {
+		t.Fatalf("ResolveHomePathsFrom() error = %v", err)
+	}
+
+	cfg := DefaultWithHome(homePaths)
+	cfg.Providers["custom-pi"] = ProviderConfig{
+		Command:         "npx -y pi-acp@latest",
+		Harness:         ProviderHarnessPiACP,
+		RuntimeProvider: "custom",
+		CredentialSlots: []ProviderCredentialSlot{
+			apiKeyCredentialSlot("CUSTOM_API_KEY"),
+		},
+	}
+	_, err = cfg.ResolveAgent(AgentDef{
+		Name:     "coder",
+		Provider: "custom-pi",
+		Prompt:   "prompt",
+	})
+	if err == nil {
+		t.Fatal("ResolveAgent() error = nil, want model required error")
+	}
+	wantErr := `agent model is required when provider "custom-pi" has no default model`
+	if err.Error() != wantErr {
+		t.Fatalf("ResolveAgent() error = %q, want %q", err.Error(), wantErr)
+	}
+}
+
+func TestMergeMCPServersSameNameOverlaysFields(t *testing.T) {
+	t.Parallel()
+
+	merged := MergeMCPServers(
+		[]MCPServer{{Name: "github", Command: "npx", SecretEnv: map[string]string{"TOKEN": "env:GITHUB_TOKEN"}}},
+		[]MCPServer{{Name: "github", Args: []string{"-y"}, Env: map[string]string{"OTHER": "1"}}},
+	)
+
+	if len(merged) != 1 {
+		t.Fatalf("MergeMCPServers() len = %d, want 1", len(merged))
+	}
+	if merged[0].Command != "npx" {
+		t.Fatalf("MergeMCPServers() Command = %q, want %q", merged[0].Command, "npx")
+	}
+	if got, want := len(merged[0].Args), 1; got != want {
+		t.Fatalf("MergeMCPServers() Args len = %d, want %d (%#v)", got, want, merged[0].Args)
+	}
+	if got, want := merged[0].Args[0], "-y"; got != want {
+		t.Fatalf("MergeMCPServers() Args = %#v", merged[0].Args)
+	}
+	if merged[0].Env["OTHER"] != "1" || merged[0].SecretEnv["TOKEN"] != "env:GITHUB_TOKEN" {
+		t.Fatalf("MergeMCPServers() Env = %#v SecretEnv = %#v", merged[0].Env, merged[0].SecretEnv)
+	}
+}
+
+func TestMCPServerValidateSupportsRemotePreRegisteredOAuth(t *testing.T) {
+	t.Parallel()
+
+	// Invariant: automatic OAuth may pin a secure issuer but cannot embed client credentials.
+	// Owner: MCP config validation. Canonical suite: provider_test.go.
+	t.Run("Should validate a pinned issuer for automatic registration", func(t *testing.T) {
+		t.Parallel()
+		auth := MCPAuthConfig{
+			Registration: MCPAuthRegistrationAuto,
+			IssuerURL:    "https://issuer.example",
+			Scopes:       []string{"read"},
+		}
+		if err := auth.Validate("auth"); err != nil {
+			t.Fatal(err)
+		}
+		insecure := auth
+		insecure.IssuerURL = "http://issuer.example"
+		if err := insecure.Validate("auth"); err == nil {
+			t.Fatal("insecure issuer accepted")
+		}
+		for _, mutate := range []func(*MCPAuthConfig){func(a *MCPAuthConfig) { a.ClientID = "client" }, func(a *MCPAuthConfig) { a.ClientSecretRef = "vault:mcp/secret" }} {
+			invalid := auth
+			mutate(&invalid)
+			if err := invalid.Validate("auth"); err == nil {
+				t.Fatal("automatic registration accepted client credentials")
+			}
+		}
+	})
+
+	server := MCPServer{
+		Name:      "linear",
+		Transport: MCPServerTransportHTTP,
+		URL:       "https://mcp.example/mcp",
+		Auth: MCPAuthConfig{
+			Registration: MCPAuthRegistrationPreRegistered,
+			IssuerURL:    "https://auth.example",
+			ClientID:     "client-1",
+			Scopes:       []string{"read", "write"},
+		},
+	}
+	t.Run("Should validate a pre-registered remote OAuth config", func(t *testing.T) {
+		t.Parallel()
+		if err := server.Validate("mcp_servers[0]"); err != nil {
+			t.Fatalf("Validate(remote OAuth) error = %v", err)
+		}
+	})
+	t.Run("Should reject a missing pre-registered client ID", func(t *testing.T) {
+		t.Parallel()
+		invalid := server
+		invalid.Auth.ClientID = ""
+		if err := invalid.Validate("mcp_servers[0]"); err == nil {
+			t.Fatal("Validate(missing pre-registered client ID) error = nil, want validation failure")
+		}
+	})
+}
+
+func TestMCPOAuthConfigValidatesClientMetadataURL(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name string
+		url  string
+	}{
+		{name: "Should reject loopback HTTP", url: "http://127.0.0.1/client-metadata.json"},
+		{name: "Should reject an HTTPS root", url: "https://client.example/"},
+		{name: "Should reject credentials", url: "https://user:pass@client.example/metadata.json"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			config := MCPOAuthConfig{ClientMetadataURL: tt.url}
+			if err := config.Validate("mcp.oauth"); err == nil {
+				t.Fatalf("Validate(%q) error = nil, want client metadata URL rejection", tt.url)
+			}
+		})
+	}
+
+	config := MCPOAuthConfig{ClientMetadataURL: DefaultMCPClientMetadataURL}
+	if err := config.Validate("mcp.oauth"); err != nil {
+		t.Fatalf("Validate(default client metadata URL) error = %v", err)
+	}
+}
+
+func TestMCPServerValidateRejectsUnsafeStdioEnv(t *testing.T) {
+	t.Parallel()
+	// Invariant: published extension inputs may reference only their extension's secret namespace.
+	// Owner: MCP config validation; canonical suite: provider_test.go.
+	t.Run("Should allow owned extension inputs without opening sibling secret namespaces", func(t *testing.T) {
+		t.Parallel()
+		for _, tc := range []struct {
+			owner   string
+			ref     string
+			allowed bool
+		}{
+			{"extension:github", "vault:extensions/global/github/profiles/profile-a/env/TOKEN", true},
+			{"extension:github", "vault:extensions/ws/workspace-a/github/profiles/profile-a/env/TOKEN", true},
+			{"extension:github", "vault:extensions/global/other/env/TOKEN", false},
+			{"extension:github", "vault:extensions/ws/workspace-a/other/env/TOKEN", false},
+			{"manual", "vault:extensions/global/github/env/TOKEN", false},
+			{"", "vault:extensions/global/github/env/TOKEN", false},
+			{"extension:github", "vault:providers/github/TOKEN", false},
+			{"extension:github", "env:GITHUB_TOKEN", true},
+		} {
+			server := MCPServer{Name: "github", Owner: tc.owner, Command: "github-mcp",
+				SecretEnv: map[string]string{"TOKEN": tc.ref}}
+			if err := server.Validate("mcp_server"); (err == nil) != tc.allowed {
+				t.Fatalf("owner %q ref %q allowed=%t: %v", tc.owner, tc.ref, tc.allowed, err)
+			}
+		}
+	})
+
+	tests := []struct {
+		name string
+		key  string
+	}{
+		{name: "Should reject Node options", key: "NODE_OPTIONS"},
+		{name: "Should reject Python path", key: "PYTHONPATH"},
+		{name: "Should reject Python home", key: "PYTHONHOME"},
+		{name: "Should reject preload", key: "LD_PRELOAD"},
+		{name: "Should reject Darwin dynamic loader variables", key: "DYLD_INSERT_LIBRARIES"},
+		{name: "Should reject secret-like token variables", key: "GITHUB_TOKEN"},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			server := MCPServer{
+				Name:    "local",
+				Command: "npx",
+				Env:     map[string]string{tc.key: "value"},
+			}
+			err := server.Validate("mcp_servers[0]")
+			if err == nil {
+				t.Fatalf("Validate(%s) error = nil, want env validation failure", tc.key)
+			}
+		})
+	}
+
+	for _, tc := range tests[:5] {
+		t.Run(strings.Replace(tc.name, "Should reject", "Should reject secret", 1), func(t *testing.T) {
+			t.Parallel()
+
+			server := MCPServer{
+				Name:      "local",
+				Command:   "npx",
+				SecretEnv: map[string]string{tc.key: "vault:mcp/global/local/env/" + tc.key},
+			}
+			err := server.Validate("mcp_servers[0]")
+			if err == nil || !strings.Contains(err.Error(), ".secret_env."+tc.key+" is forbidden") {
+				t.Fatalf("Validate(secret_env %s) error = %v, want forbidden-key detail", tc.key, err)
+			}
+		})
+	}
+}
+
+func TestMCPServerValidateRejectsRemoteProcessFields(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name   string
+		mutate func(*MCPServer)
+		field  string
+	}{
+		{
+			name: "Should reject remote MCP args",
+			mutate: func(server *MCPServer) {
+				server.Args = []string{"--verbose"}
+			},
+			field: ".args",
+		},
+		{
+			name: "Should reject remote MCP env",
+			mutate: func(server *MCPServer) {
+				server.Env = map[string]string{"LOG_LEVEL": "debug"}
+			},
+			field: ".env",
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			server := MCPServer{
+				Name:      "remote",
+				Transport: MCPServerTransportHTTP,
+				URL:       "https://mcp.example/mcp",
+			}
+			tc.mutate(&server)
+			err := server.Validate("mcp_servers[0]")
+			if err == nil || !strings.Contains(err.Error(), tc.field) {
+				t.Fatalf("Validate(remote MCP %s) error = %v, want field validation", tc.field, err)
+			}
+		})
+	}
+}
+
+func TestMCPServerValidateHeaderFields(t *testing.T) {
+	t.Parallel()
+
+	t.Run("Should accept fixed headers and secret references for a remote server", func(t *testing.T) {
+		t.Parallel()
+		server := MCPServer{
+			Name: "remote", Transport: MCPServerTransportHTTP, URL: "https://mcp.example/mcp",
+			Headers:       map[string]string{"X-Tenant": "public"},
+			SecretHeaders: map[string]string{"Authorization": "vault:extensions/acme/env/API_TOKEN"},
+		}
+		if err := server.Validate("mcp_servers[0]"); err != nil {
+			t.Fatalf("Validate(remote headers) error = %v", err)
+		}
+	})
+
+	for _, test := range []struct {
+		name   string
+		server MCPServer
+		field  string
+	}{
+		{
+			name: "Should reject fixed headers on stdio",
+			server: MCPServer{
+				Name: "local", Command: "server", Headers: map[string]string{"X-Tenant": "public"},
+			},
+			field: ".headers",
+		},
+		{
+			name: "Should reject secret headers on stdio",
+			server: MCPServer{
+				Name: "local", Command: "server",
+				SecretHeaders: map[string]string{"Authorization": "vault:extensions/acme/env/API_TOKEN"},
+			},
+			field: ".secret_headers",
+		},
+		{
+			name: "Should reject package-owned credentials",
+			server: MCPServer{
+				Name: "remote", Transport: MCPServerTransportHTTP, URL: "https://mcp.example/mcp",
+				Headers: map[string]string{"Authorization": "embedded"},
+			},
+			field: "package_credential_forbidden",
+		},
+		{
+			name: "Should reject operator authorization when OAuth owns it",
+			server: MCPServer{
+				Name: "remote", Transport: MCPServerTransportHTTP, URL: "https://mcp.example/mcp",
+				SecretHeaders: map[string]string{"Authorization": "vault:extensions/acme/env/API_TOKEN"},
+				Auth:          MCPAuthConfig{Registration: MCPAuthRegistrationAuto},
+			},
+			field: "oauth_authorization_owned",
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+			err := test.server.Validate("mcp_servers[0]")
+			if err == nil || !strings.Contains(err.Error(), test.field) {
+				t.Fatalf("Validate() error = %v, want %q", err, test.field)
+			}
+		})
+	}
+}
+
+func TestMCPServerSecretHeadersSerializeReferencesOnly(t *testing.T) {
+	t.Parallel()
+
+	t.Run("Should serialize references without resolved secret values", func(t *testing.T) {
+		t.Parallel()
+
+		const (
+			secretRef      = "vault:extensions/acme/env/API_TOKEN"
+			resolvedSecret = "resolved-secret-must-not-serialize"
+		)
+		server := MCPServer{
+			Name: "remote", Transport: MCPServerTransportHTTP, URL: "https://mcp.example/mcp",
+			SecretHeaders: map[string]string{"Authorization": secretRef},
+		}
+		cloned := cloneMCPServer(server)
+		if cloned.SecretHeaders["Authorization"] != secretRef {
+			t.Fatalf("cloneMCPServer().SecretHeaders = %#v, want reference", cloned.SecretHeaders)
+		}
+
+		jsonBytes, err := json.Marshal(cloned)
+		if err != nil {
+			t.Fatalf("json.Marshal() error = %v", err)
+		}
+		yamlBytes, err := yaml.Marshal(cloned)
+		if err != nil {
+			t.Fatalf("yaml.Marshal() error = %v", err)
+		}
+		var tomlBytes bytes.Buffer
+		if err := toml.NewEncoder(&tomlBytes).Encode(cloned); err != nil {
+			t.Fatalf("toml.Encode() error = %v", err)
+		}
+		for format, payload := range map[string][]byte{
+			"json": jsonBytes, "yaml": yamlBytes, "toml": tomlBytes.Bytes(),
+		} {
+			if !bytes.Contains(payload, []byte(secretRef)) || bytes.Contains(payload, []byte(resolvedSecret)) {
+				t.Fatalf("%s serialization = %s, want reference and no resolved credential", format, payload)
+			}
+		}
+	})
+}
+
+func TestRedactedMCPServerDoesNotExposeEnvSecretValues(t *testing.T) {
+	t.Parallel()
+
+	t.Run("Should redact fixed and secret values without mutating the source", func(t *testing.T) {
+		t.Parallel()
+
+		server := MCPServer{
+			Name:    "github",
+			Command: "npx",
+			Headers: map[string]string{"X-Tenant": "tenant-value"},
+			SecretEnv: map[string]string{
+				"GITHUB_TOKEN": "env:GITHUB_TOKEN",
+			},
+			SecretHeaders: map[string]string{"Authorization": "vault:extensions/github/env/GITHUB_TOKEN"},
+		}
+		redacted := RedactedMCPServer(server)
+		if got := redacted.SecretEnv["GITHUB_TOKEN"]; got != RedactedValue() {
+			t.Fatalf("redacted secret env = %q, want placeholder", got)
+		}
+		if got := redacted.Headers["X-Tenant"]; got != RedactedValue() {
+			t.Fatalf("redacted fixed header = %q, want placeholder", got)
+		}
+		if got := redacted.SecretHeaders["Authorization"]; got != RedactedValue() {
+			t.Fatalf("redacted secret header = %q, want placeholder", got)
+		}
+		if server.SecretEnv["GITHUB_TOKEN"] != "env:GITHUB_TOKEN" {
+			t.Fatalf("source secret env mutated = %#v", server.SecretEnv)
+		}
+		if server.Headers["X-Tenant"] != "tenant-value" {
+			t.Fatalf("source fixed headers mutated = %#v", server.Headers)
+		}
+		if server.SecretHeaders["Authorization"] != "vault:extensions/github/env/GITHUB_TOKEN" {
+			t.Fatalf("source secret headers mutated = %#v", server.SecretHeaders)
+		}
+	})
+}
+
+func TestMergeMCPServersTrimmedNamesCollide(t *testing.T) {
+	t.Parallel()
+
+	merged := MergeMCPServers(
+		[]MCPServer{{Name: "  github  ", Command: "npx"}},
+		[]MCPServer{{Name: "github", Args: []string{"-y"}}},
+	)
+
+	if len(merged) != 1 {
+		t.Fatalf("MergeMCPServers() len = %d, want 1", len(merged))
+	}
+	if got, want := merged[0].Command, "npx"; got != want {
+		t.Fatalf("MergeMCPServers() Command = %q, want %q", got, want)
+	}
+	if got, want := len(merged[0].Args), 1; got != want {
+		t.Fatalf("MergeMCPServers() Args len = %d, want %d (%#v)", got, want, merged[0].Args)
+	}
+	if got, want := merged[0].Args[0], "-y"; got != want {
+		t.Fatalf("MergeMCPServers() Args[0] = %q, want %q", got, want)
+	}
+}
+
+func TestOverrideMCPServersSameNameReplacesObject(t *testing.T) {
+	t.Parallel()
+
+	merged := OverrideMCPServers(
+		[]MCPServer{
+			{
+				Name:      "github",
+				Command:   "npx",
+				Args:      []string{"-y"},
+				SecretEnv: map[string]string{"TOKEN": "env:GITHUB_TOKEN"},
+			},
+		},
+		[]MCPServer{{Name: "github", Command: "node"}},
+	)
+
+	if len(merged) != 1 {
+		t.Fatalf("OverrideMCPServers() len = %d, want 1", len(merged))
+	}
+	if got, want := merged[0].Command, "node"; got != want {
+		t.Fatalf("OverrideMCPServers() Command = %q, want %q", got, want)
+	}
+	if got := len(merged[0].Args); got != 0 {
+		t.Fatalf("OverrideMCPServers() Args = %#v, want replacement semantics", merged[0].Args)
+	}
+	if got := len(merged[0].Env); got != 0 {
+		t.Fatalf("OverrideMCPServers() Env = %#v, want replacement semantics", merged[0].Env)
+	}
+}
+
+func TestOverrideMCPServersTrimmedNamesCollide(t *testing.T) {
+	t.Parallel()
+
+	merged := OverrideMCPServers(
+		[]MCPServer{{Name: "  github  ", Command: "npx", Args: []string{"-y"}}},
+		[]MCPServer{{Name: "github", Command: "node"}},
+	)
+
+	if len(merged) != 1 {
+		t.Fatalf("OverrideMCPServers() len = %d, want 1", len(merged))
+	}
+	if got, want := merged[0].Command, "node"; got != want {
+		t.Fatalf("OverrideMCPServers() Command = %q, want %q", got, want)
+	}
+	if got := len(merged[0].Args); got != 0 {
+		t.Fatalf("OverrideMCPServers() Args = %#v, want replacement semantics", merged[0].Args)
+	}
+}
+
+func TestResolveAgentMergesTopLevelProviderAndAgentMCPServers(t *testing.T) {
+	t.Parallel()
+
+	homePaths, err := ResolveHomePathsFrom(filepath.Join(t.TempDir(), "home"))
+	if err != nil {
+		t.Fatalf("ResolveHomePathsFrom() error = %v", err)
+	}
+
+	cfg := DefaultWithHome(homePaths)
+	cfg.MCPServers = []MCPServer{
+		{Name: "global", Command: "global-command"},
+	}
+	cfg.Providers["claude"] = ProviderConfig{
+		MCPServers: []MCPServer{
+			{Name: "provider", Command: "provider-command"},
+		},
+	}
+
+	agent := AgentDef{
+		Name:     "coder",
+		Provider: "claude",
+		Prompt:   "prompt",
+		MCPServers: []MCPServer{
+			{Name: "agent", Command: "agent-command"},
+		},
+	}
+
+	resolved, err := cfg.ResolveAgent(agent)
+	if err != nil {
+		t.Fatalf("ResolveAgent() error = %v", err)
+	}
+
+	if got, want := len(resolved.MCPServers), 3; got != want {
+		t.Fatalf("ResolveAgent() MCPServers len = %d, want %d (%#v)", got, want, resolved.MCPServers)
+	}
+	if got, want := resolved.MCPServers[0].Name, "global"; got != want {
+		t.Fatalf("ResolveAgent() MCPServers[0].Name = %q, want %q", got, want)
+	}
+	if got, want := resolved.MCPServers[1].Name, "provider"; got != want {
+		t.Fatalf("ResolveAgent() MCPServers[1].Name = %q, want %q", got, want)
+	}
+	if got, want := resolved.MCPServers[2].Name, "agent"; got != want {
+		t.Fatalf("ResolveAgent() MCPServers[2].Name = %q, want %q", got, want)
+	}
+}
+
+func TestResolveProviderRejectsUnknownProvider(t *testing.T) {
+	t.Parallel()
+
+	cfg := Config{}
+	if _, err := cfg.ResolveProvider("unknown"); err == nil {
+		t.Fatal("ResolveProvider() error = nil, want non-nil")
+	} else if !errors.Is(err, ErrProviderUnavailable) {
+		t.Fatalf("ResolveProvider() error = %v, want ErrProviderUnavailable", err)
+	}
+}
+
+func TestResolveProviderMergesRuntimeOverrideHints(t *testing.T) {
+	t.Parallel()
+
+	homePaths, err := ResolveHomePathsFrom(filepath.Join(t.TempDir(), "home"))
+	if err != nil {
+		t.Fatalf("ResolveHomePathsFrom() error = %v", err)
+	}
+	cfg := DefaultWithHome(homePaths)
+	cfg.Providers["codex"] = ProviderConfig{
+		Models: ProviderModelsConfig{
+			Default: "gpt-manual",
+			Curated: []ProviderModelConfig{
+				{ID: "gpt-custom", DisplayName: "Custom GPT"},
+				{ID: "gpt-mini", DisplayName: "Mini GPT"},
+			},
+		},
+	}
+
+	provider, err := cfg.ResolveProvider("codex")
+	if err != nil {
+		t.Fatalf("ResolveProvider(codex) error = %v", err)
+	}
+	if got, want := provider.Models.Default, "gpt-manual"; got != want {
+		t.Fatalf("ResolveProvider(codex) Models.Default = %q, want %q", got, want)
+	}
+	wantModels := []ProviderModelConfig{
+		{ID: "gpt-custom", DisplayName: "Custom GPT"},
+		{ID: "gpt-mini", DisplayName: "Mini GPT"},
+	}
+	if !reflect.DeepEqual(provider.Models.Curated, wantModels) {
+		t.Fatalf("ResolveProvider(codex) Models.Curated = %#v, want %#v", provider.Models.Curated, wantModels)
+	}
+}
+
+func TestResolveProviderPreservesExplicitEmptyCuratedModels(t *testing.T) {
+	t.Parallel()
+
+	homePaths, err := ResolveHomePathsFrom(filepath.Join(t.TempDir(), "home"))
+	if err != nil {
+		t.Fatalf("ResolveHomePathsFrom() error = %v", err)
+	}
+	cfg := DefaultWithHome(homePaths)
+	cfg.Providers["codex"] = ProviderConfig{
+		Models: ProviderModelsConfig{
+			Curated: []ProviderModelConfig{},
+		},
+	}
+
+	provider, err := cfg.ResolveProvider("codex")
+	if err != nil {
+		t.Fatalf("ResolveProvider(codex) error = %v", err)
+	}
+	if got := len(provider.Models.Curated); got != 0 {
+		t.Fatalf("ResolveProvider(codex) Models.Curated len = %d, want 0", got)
+	}
+}
+
+func TestLoadProviderRuntimeOverrideHintsFromTOML(t *testing.T) {
+	t.Parallel()
+
+	homePaths, err := ResolveHomePathsFrom(filepath.Join(t.TempDir(), "home"))
+	if err != nil {
+		t.Fatalf("ResolveHomePathsFrom() error = %v", err)
+	}
+	if err := EnsureHomeLayout(homePaths); err != nil {
+		t.Fatalf("EnsureHomeLayout() error = %v", err)
+	}
+	writeFile(t, homePaths.ConfigFile, `
+[providers.codex.models]
+default = "gpt-manual"
+
+[[providers.codex.models.curated]]
+id = "gpt-custom"
+display_name = "Custom GPT"
+
+[[providers.codex.models.curated]]
+id = "gpt-mini"
+display_name = "Mini GPT"
+`)
+
+	cfg, err := LoadForHome(homePaths, withoutDotEnv())
+	if err != nil {
+		t.Fatalf("LoadForHome() error = %v", err)
+	}
+	provider, err := cfg.ResolveProvider("codex")
+	if err != nil {
+		t.Fatalf("ResolveProvider(codex) error = %v", err)
+	}
+	if got, want := provider.Models.Default, "gpt-manual"; got != want {
+		t.Fatalf("ResolveProvider(codex) Models.Default = %q, want %q", got, want)
+	}
+	wantModels := []ProviderModelConfig{
+		{ID: "gpt-custom", DisplayName: "Custom GPT"},
+		{ID: "gpt-mini", DisplayName: "Mini GPT"},
+	}
+	if !reflect.DeepEqual(provider.Models.Curated, wantModels) {
+		t.Fatalf("ResolveProvider(codex) Models.Curated = %#v, want %#v", provider.Models.Curated, wantModels)
+	}
+}
+
+func TestLoadRejectsBlankProviderCuratedModelID(t *testing.T) {
+	t.Parallel()
+
+	homePaths, err := ResolveHomePathsFrom(filepath.Join(t.TempDir(), "home"))
+	if err != nil {
+		t.Fatalf("ResolveHomePathsFrom() error = %v", err)
+	}
+	if err := EnsureHomeLayout(homePaths); err != nil {
+		t.Fatalf("EnsureHomeLayout() error = %v", err)
+	}
+	writeFile(t, homePaths.ConfigFile, `
+[[providers.codex.models.curated]]
+id = "gpt-custom"
+
+[[providers.codex.models.curated]]
+id = " "
+`)
+
+	_, err = LoadForHome(homePaths, withoutDotEnv())
+	if err == nil {
+		t.Fatal("LoadForHome() error = nil, want blank curated id validation")
+	}
+	if !strings.Contains(err.Error(), `providers.codex.models.curated[1].id is required`) {
+		t.Fatalf("LoadForHome() error = %v, want curated id index detail", err)
+	}
+}
+
+func TestLoadRejectsInvalidProviderModelsConfig(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name    string
+		config  string
+		wantErr string
+	}{
+		{
+			name: "Should reject duplicate curated model IDs",
+			config: `
+[[providers.codex.models.curated]]
+id = "gpt-5.4"
+
+[[providers.codex.models.curated]]
+id = "gpt-5.4"
+`,
+			wantErr: `providers.codex.models.curated[1].id duplicates "gpt-5.4"`,
+		},
+		{
+			name: "Should reject default reasoning effort outside allowed efforts",
+			config: `
+[[providers.codex.models.curated]]
+id = "gpt-5.4"
+reasoning_efforts = ["low", "medium"]
+default_reasoning_effort = "high"
+`,
+			wantErr: `providers.codex.models.curated[0].default_reasoning_effort must be listed in reasoning_efforts`,
+		},
+		{
+			name: "Should reject reasoning effort IDs with surrounding whitespace",
+			config: `
+[[providers.codex.models.curated]]
+id = "gpt-5.4"
+reasoning_efforts = [" high "]
+`,
+			wantErr: `providers.codex.models.curated[0].reasoning_efforts[0]`,
+		},
+		{
+			name: "Should reject default reasoning effort with surrounding whitespace",
+			config: `
+[[providers.codex.models.curated]]
+id = "gpt-5.4"
+reasoning_efforts = ["high"]
+default_reasoning_effort = " high "
+`,
+			wantErr: `providers.codex.models.curated[0].default_reasoning_effort`,
+		},
+		{
+			name: "Should reject an invalid default speed",
+			config: `
+[[providers.codex.models.curated]]
+id = "gpt-5.4"
+default_speed = "turbo"
+`,
+			wantErr: `providers.codex.models.curated[0].default_speed`,
+		},
+		{
+			name: "Should reject a negative cache read rate",
+			config: `
+[[providers.codex.models.curated]]
+id = "gpt-5.4"
+cost_cache_read_per_million = -0.1
+`,
+			wantErr: `providers.codex.models.curated[0].cost_cache_read_per_million must be finite and non-negative`,
+		},
+		{
+			name: "Should reject a non-finite reasoning rate",
+			config: `
+[[providers.codex.models.curated]]
+id = "gpt-5.4"
+cost_reasoning_per_million = nan
+`,
+			wantErr: `providers.codex.models.curated[0].cost_reasoning_per_million must be finite and non-negative`,
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			homePaths, err := ResolveHomePathsFrom(filepath.Join(t.TempDir(), "home"))
+			if err != nil {
+				t.Fatalf("ResolveHomePathsFrom() error = %v", err)
+			}
+			if err := EnsureHomeLayout(homePaths); err != nil {
+				t.Fatalf("EnsureHomeLayout() error = %v", err)
+			}
+			writeFile(t, homePaths.ConfigFile, tc.config)
+
+			_, err = LoadForHome(homePaths, withoutDotEnv())
+			if err == nil {
+				t.Fatal("LoadForHome() error = nil, want validation error")
+			}
+			if !strings.Contains(err.Error(), tc.wantErr) {
+				t.Fatalf("LoadForHome() error = %v, want %q", err, tc.wantErr)
+			}
+		})
+	}
+
+	t.Run("Should reject a non-canonical configured reasoning effort", func(t *testing.T) {
+		t.Parallel()
+
+		homePaths, err := ResolveHomePathsFrom(filepath.Join(t.TempDir(), "home"))
+		if err != nil {
+			t.Fatalf("ResolveHomePathsFrom() error = %v", err)
+		}
+		if err := EnsureHomeLayout(homePaths); err != nil {
+			t.Fatalf("EnsureHomeLayout() error = %v", err)
+		}
+		writeFile(t, homePaths.ConfigFile, `
+[[providers.codex.models.curated]]
+id = "gpt-5.4"
+reasoning_efforts = ["invalid effort"]
+`)
+
+		_, err = LoadForHome(homePaths, withoutDotEnv())
+
+		invalid, invalidMatched := errors.AsType[*reasoning.InvalidEffortError](err)
+		if !invalidMatched {
+			t.Fatalf("LoadForHome() error = %T %v, want *reasoning.InvalidEffortError", err, err)
+		}
+		if invalid.Path != "providers.codex.models.curated[0].reasoning_efforts[0]" ||
+			invalid.Value != "invalid effort" {
+			t.Fatalf("InvalidEffortError = %#v, want curated effort path and invalid effort value", invalid)
+		}
+	})
+}
+
+func TestLoadRejectsRemovedProviderKeys(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name            string
+		config          string
+		removedPath     string
+		messageFragment string
+	}{
+		{
+			name: "Should reject old default_model key",
+			config: `
+[providers.codex]
+default_model = "gpt-5.4"
+`,
+			removedPath:     `providers.codex.default_model`,
+			messageFragment: `use "providers.codex.models.default"`,
+		},
+		{
+			name: "Should reject old supported_models key",
+			config: `
+[providers.codex]
+supported_models = ["gpt-5.4"]
+`,
+			removedPath:     `providers.codex.supported_models`,
+			messageFragment: `use "providers.codex.models.curated"`,
+		},
+		{
+			name: "Should reject old supports_reasoning_effort key",
+			config: `
+[providers.codex]
+supports_reasoning_effort = true
+`,
+			removedPath:     `providers.codex.supports_reasoning_effort`,
+			messageFragment: `use "providers.codex.models.curated[].reasoning_efforts"`,
+		},
+		{
+			name: "Should reject removed provider aliases key",
+			config: `
+[providers.codex]
+aliases = ["openai"]
+`,
+			removedPath:     `providers.codex.aliases`,
+			messageFragment: "aliases was removed; reference providers by canonical name",
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			homePaths, err := ResolveHomePathsFrom(filepath.Join(t.TempDir(), "home"))
+			if err != nil {
+				t.Fatalf("ResolveHomePathsFrom() error = %v", err)
+			}
+			if err := EnsureHomeLayout(homePaths); err != nil {
+				t.Fatalf("EnsureHomeLayout() error = %v", err)
+			}
+			writeFile(t, homePaths.ConfigFile, tc.config)
+
+			_, err = LoadForHome(homePaths, withoutDotEnv())
+			if err == nil {
+				t.Fatal("LoadForHome() error = nil, want removed key error")
+			}
+			message := err.Error()
+			if !strings.Contains(message, `removed config key "`+tc.removedPath+`"`) ||
+				!strings.Contains(message, tc.messageFragment) {
+				t.Fatalf(
+					"LoadForHome() error = %v, want removed path %q and message fragment %q",
+					err,
+					tc.removedPath,
+					tc.messageFragment,
+				)
+			}
+		})
+	}
+}
+
+func TestModelCatalogModelsDevConfigValidatesDefaultsAndOverrides(t *testing.T) {
+	t.Parallel()
+
+	defaults := DefaultModelCatalogConfig().Sources.ModelsDev
+	if !defaults.EffectiveEnabled() {
+		t.Fatal("DefaultModelCatalogConfig().ModelsDev enabled = false, want true")
+	}
+	if got, want := defaults.EffectiveEndpoint(), defaultModelsDevEndpoint; got != want {
+		t.Fatalf("ModelsDev EffectiveEndpoint() = %q, want %q", got, want)
+	}
+	if got, want := defaults.EffectiveTTL(), defaultModelsDevTTL; got != want {
+		t.Fatalf("ModelsDev EffectiveTTL() = %q, want %q", got, want)
+	}
+	if got, want := defaults.EffectiveTimeout(), defaultModelsDevTimeout; got != want {
+		t.Fatalf("ModelsDev EffectiveTimeout() = %q, want %q", got, want)
+	}
+
+	enabled := false
+	override := ModelsDevSourceConfig{
+		Enabled:  &enabled,
+		Endpoint: "https://models.example.test/api.json",
+		TTL:      "2h",
+		Timeout:  "5s",
+	}
+	if err := override.Validate("model_catalog.sources.models_dev"); err != nil {
+		t.Fatalf("ModelsDev Validate(valid override) error = %v", err)
+	}
+	if override.EffectiveEnabled() {
+		t.Fatal("ModelsDev EffectiveEnabled() = true, want explicit false")
+	}
+	if got, want := override.EffectiveEndpoint(), "https://models.example.test/api.json"; got != want {
+		t.Fatalf("ModelsDev EffectiveEndpoint() = %q, want %q", got, want)
+	}
+
+	tests := []struct {
+		name           string
+		value          ModelsDevSourceConfig
+		wantErr        string
+		wantErrDetails string
+	}{
+		{
+			name:    "Should reject invalid endpoint",
+			value:   ModelsDevSourceConfig{Endpoint: "file:///tmp/models.json"},
+			wantErr: "model_catalog.sources.models_dev.endpoint must be an absolute HTTP(S) URL",
+		},
+		{
+			name:           "Should reject invalid TTL",
+			value:          ModelsDevSourceConfig{TTL: "soon"},
+			wantErr:        "model_catalog.sources.models_dev.ttl must be a positive duration",
+			wantErrDetails: `time: invalid duration "soon"`,
+		},
+		{
+			name:    "Should reject invalid timeout",
+			value:   ModelsDevSourceConfig{Timeout: "0s"},
+			wantErr: "model_catalog.sources.models_dev.timeout must be a positive duration",
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			err := tc.value.Validate("model_catalog.sources.models_dev")
+			if err == nil {
+				t.Fatal("ModelsDev Validate() error = nil, want validation error")
+			}
+			if !strings.Contains(err.Error(), tc.wantErr) {
+				t.Fatalf("ModelsDev Validate() error = %v, want %q", err, tc.wantErr)
+			}
+			if tc.wantErrDetails != "" && !strings.Contains(err.Error(), tc.wantErrDetails) {
+				t.Fatalf("ModelsDev Validate() error = %v, want parse details %q", err, tc.wantErrDetails)
+			}
+		})
+	}
+}
+
+func TestMarketplaceCatalogConfigValidatesDefaultsAndOverrides(t *testing.T) {
+	t.Parallel()
+
+	t.Run("Should expose the curated catalog defaults", func(t *testing.T) {
+		t.Parallel()
+
+		defaults := DefaultMarketplaceRuntimeConfig().Catalog
+		if got, want := defaults.EffectiveBaseURL(), DefaultMarketplaceCatalogBaseURL; got != want {
+			t.Fatalf("MarketplaceCatalog EffectiveBaseURL() = %q, want %q", got, want)
+		}
+		if got, want := defaults.EffectiveTTL(), DefaultMarketplaceCatalogTTL; got != want {
+			t.Fatalf("MarketplaceCatalog EffectiveTTL() = %q, want %q", got, want)
+		}
+		if got, want := defaults.EffectiveTimeout(), DefaultMarketplaceCatalogTimeout; got != want {
+			t.Fatalf("MarketplaceCatalog EffectiveTimeout() = %q, want %q", got, want)
+		}
+	})
+
+	t.Run("Should accept valid curated catalog overrides", func(t *testing.T) {
+		t.Parallel()
+
+		tests := []MarketplaceCatalogConfig{
+			{BaseURL: "https://catalog.example.test/v1", TTL: "30m", Timeout: "5s"},
+			{BaseURL: "file:///tmp/compozy-catalog", TTL: "30m", Timeout: "5s"},
+		}
+		for _, valid := range tests {
+			if err := valid.Validate("marketplace.catalog"); err != nil {
+				t.Fatalf("MarketplaceCatalog Validate(%q) error = %v", valid.BaseURL, err)
+			}
+		}
+	})
+
+	tests := []struct {
+		name    string
+		value   MarketplaceCatalogConfig
+		wantErr string
+	}{
+		{
+			name:    "Should reject an unsupported base URL scheme",
+			value:   MarketplaceCatalogConfig{BaseURL: "ftp://catalog.example.test"},
+			wantErr: "marketplace.catalog.base_url must be an absolute HTTP(S) or file URL",
+		},
+		{
+			name:    "Should reject a non-positive TTL",
+			value:   MarketplaceCatalogConfig{TTL: "0s"},
+			wantErr: "marketplace.catalog.ttl must be a positive duration",
+		},
+		{
+			name:    "Should reject a non-positive timeout",
+			value:   MarketplaceCatalogConfig{Timeout: "-1s"},
+			wantErr: "marketplace.catalog.timeout must be a positive duration",
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			err := tc.value.Validate("marketplace.catalog")
+			if err == nil {
+				t.Fatal("MarketplaceCatalog Validate() error = nil, want validation error")
+			}
+			if !strings.Contains(err.Error(), tc.wantErr) {
+				t.Fatalf("MarketplaceCatalog Validate() error = %v, want %q", err, tc.wantErr)
+			}
+		})
+	}
+}
+
+func TestMarketplacePluginSourceValidation(t *testing.T) {
+	t.Parallel()
+	t.Run("Should normalize surrounding whitespace in canonical source refs", func(t *testing.T) {
+		t.Parallel()
+		cfg := DefaultMarketplaceRuntimeConfig()
+		cfg.PluginSources = []MarketplacePluginSourceConfig{
+			{Name: "github", Source: " github:team/plugins "},
+			{Name: "git", Source: " git+https://GitHub.com/Owner/Repo.git/ "},
+			{Name: "local", Source: " file:///tmp/plugins "},
+		}
+		if err := cfg.Validate(); err != nil {
+			t.Fatal(err)
+		}
+	})
+	t.Run("Should accept distinct names for the same normalized origin", func(t *testing.T) {
+		t.Parallel()
+		cfg := DefaultMarketplaceRuntimeConfig()
+		cfg.PluginSources = []MarketplacePluginSourceConfig{
+			{Name: "team", Source: "github:team/plugins"},
+			{Name: "alias", Source: "github:TEAM/Plugins", Enabled: new(false)},
+		}
+		if err := cfg.Validate(); err != nil {
+			t.Fatal(err)
+		}
+	})
+	t.Run(
+		"Should accept public repository and local sources with explicit or inherited enabled state",
+		func(t *testing.T) {
+			t.Parallel()
+			cfg := DefaultMarketplaceRuntimeConfig()
+			cfg.PluginSources = []MarketplacePluginSourceConfig{
+				{Name: "github", Source: "github:team/plugins"},
+				{Name: "git", Source: "git+https://example.com/plugins.git", Enabled: new(false)},
+				{Name: "local", Source: "file:///tmp/plugins", Enabled: new(true)},
+			}
+			if err := cfg.Validate(); err != nil {
+				t.Fatal(err)
+			}
+			if !cfg.PluginSources[0].EffectiveEnabled(true) || cfg.PluginSources[0].EffectiveEnabled(false) ||
+				cfg.PluginSources[1].EffectiveEnabled(true) || !cfg.PluginSources[2].EffectiveEnabled(false) {
+				t.Fatal("source enabled precedence changed")
+			}
+		},
+	)
+	tests := []struct {
+		name         string
+		rows         []MarketplacePluginSourceConfig
+		path, reason string
+	}{
+		{
+			name:   "Should reject malformed names with their row position",
+			rows:   []MarketplacePluginSourceConfig{{Name: "Team Plugins", Source: "github:team/plugins"}},
+			path:   "[0].name",
+			reason: "match",
+		},
+		{
+			name:   "Should reject reserved feed names",
+			rows:   []MarketplacePluginSourceConfig{{Name: "compozy", Source: "github:team/plugins"}},
+			path:   "[0].name",
+			reason: "marketplace_source_name_reserved",
+		},
+		{
+			name:   "Should reject unsupported source schemes",
+			rows:   []MarketplacePluginSourceConfig{{Name: "team", Source: "ftp://example.com"}},
+			path:   "[0].source",
+			reason: "marketplace_source_invalid_ref",
+		},
+		{
+			name: "Should reject duplicate configured names",
+			rows: []MarketplacePluginSourceConfig{
+				{Name: "team", Source: "github:team/plugins"},
+				{Name: "team", Source: "github:other/plugins"},
+			},
+			path:   "[1].name",
+			reason: "marketplace_source_exists",
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			cfg := DefaultMarketplaceRuntimeConfig()
+			cfg.PluginSources = tc.rows
+			err := cfg.Validate()
+			if err == nil || !strings.Contains(err.Error(), "marketplace.plugin_sources"+tc.path) ||
+				!strings.Contains(err.Error(), tc.reason) {
+				t.Fatalf("source validation = %v", err)
+			}
+		})
+	}
+}
+
+func TestProviderModelsDiscoveryConfigRejectsUnsafeConfiguration(t *testing.T) {
+	t.Parallel()
+
+	enabled := true
+	tests := []struct {
+		name    string
+		value   ProviderModelsDiscoveryConfig
+		wantErr string
+	}{
+		{
+			name:    "Should reject multiline command",
+			value:   ProviderModelsDiscoveryConfig{Command: "models\nlist"},
+			wantErr: "providers.codex.models.discovery.command must be a single-line command",
+		},
+		{
+			name: "Should reject ambiguous command and endpoint",
+			value: ProviderModelsDiscoveryConfig{
+				Command:  "models list",
+				Endpoint: "https://models.example.test",
+			},
+			wantErr: "providers.codex.models.discovery.command and providers.codex.models.discovery.endpoint are mutually exclusive",
+		},
+		{
+			name:    "Should reject invalid endpoint",
+			value:   ProviderModelsDiscoveryConfig{Endpoint: "ftp://models.example.test"},
+			wantErr: "providers.codex.models.discovery.endpoint must be an absolute HTTP(S) URL",
+		},
+		{
+			name:    "Should reject enabled discovery without source",
+			value:   ProviderModelsDiscoveryConfig{Enabled: &enabled},
+			wantErr: "providers.codex.models.discovery requires command or endpoint when enabled",
+		},
+		{
+			name:    "Should reject invalid timeout",
+			value:   ProviderModelsDiscoveryConfig{Command: "models list", Timeout: "-1s"},
+			wantErr: "providers.codex.models.discovery.timeout must be a positive duration",
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			err := tc.value.Validate("providers.codex.models.discovery")
+			if err == nil {
+				t.Fatal("Discovery Validate() error = nil, want validation error")
+			}
+			if !strings.Contains(err.Error(), tc.wantErr) {
+				t.Fatalf("Discovery Validate() error = %v, want %q", err, tc.wantErr)
+			}
+		})
+	}
+}
+
+func TestResolveAgentDefaultsToolsAndPermissions(t *testing.T) {
+	homePaths, err := ResolveHomePathsFrom(filepath.Join(t.TempDir(), "home"))
+	if err != nil {
+		t.Fatalf("ResolveHomePathsFrom() error = %v", err)
+	}
+
+	cfg := DefaultWithHome(homePaths)
+	agent := AgentDef{
+		Name:     "coder",
+		Provider: "claude",
+		Prompt:   "prompt",
+	}
+
+	resolved, err := cfg.ResolveAgent(agent)
+	if err != nil {
+		t.Fatalf("ResolveAgent() error = %v", err)
+	}
+	if len(resolved.Tools) != 0 {
+		t.Fatalf("ResolveAgent() Tools = %#v, want empty default", resolved.Tools)
+	}
+	if resolved.Permissions != string(PermissionModeApproveAll) {
+		t.Fatalf("ResolveAgent() Permissions = %q, want %q", resolved.Permissions, PermissionModeApproveAll)
+	}
+}
+
+func TestResolveSessionAgent(t *testing.T) {
+	t.Parallel()
+
+	t.Run("Should match ResolveAgent when provider override is empty", func(t *testing.T) {
+		t.Parallel()
+
+		homePaths, err := ResolveHomePathsFrom(filepath.Join(t.TempDir(), "home"))
+		if err != nil {
+			t.Fatalf("ResolveHomePathsFrom() error = %v", err)
+		}
+
+		cfg := DefaultWithHome(homePaths)
+		cfg.MCPServers = []MCPServer{
+			{Name: "global", Command: "global-command"},
+		}
+
+		agent := AgentDef{
+			Name:        "coder",
+			Provider:    "claude",
+			Command:     "agent-command",
+			Model:       "agent-model",
+			Permissions: string(PermissionModeApproveReads),
+			Prompt:      "prompt",
+			Tools:       []string{"compozy__skill_view"},
+			Toolsets:    []string{"compozy__catalog"},
+			DenyTools:   []string{"compozy__task_*"},
+			MCPServers: []MCPServer{
+				{Name: "agent", Command: "agent-command"},
+			},
+		}
+
+		got, err := cfg.ResolveSessionAgent(agent, "")
+		if err != nil {
+			t.Fatalf("ResolveSessionAgent() error = %v", err)
+		}
+
+		want, err := cfg.ResolveAgent(agent)
+		if err != nil {
+			t.Fatalf("ResolveAgent() error = %v", err)
+		}
+
+		if !reflect.DeepEqual(got, want) {
+			t.Fatalf("ResolveSessionAgent() = %#v, want %#v", got, want)
+		}
+	})
+
+	t.Run("Should preserve agent runtime fields when override matches agent provider", func(t *testing.T) {
+		t.Parallel()
+
+		homePaths, err := ResolveHomePathsFrom(filepath.Join(t.TempDir(), "home"))
+		if err != nil {
+			t.Fatalf("ResolveHomePathsFrom() error = %v", err)
+		}
+
+		cfg := DefaultWithHome(homePaths)
+		cfg.Providers["claude"] = ProviderConfig{
+			Command: "provider-claude-command",
+			Models:  ProviderModelsConfig{Default: "provider-claude-model"},
+		}
+
+		agent := AgentDef{
+			Name:     "coder",
+			Provider: "claude",
+			Command:  "agent-command",
+			Model:    "agent-model",
+			Prompt:   "prompt",
+		}
+
+		resolved, err := cfg.ResolveSessionAgent(agent, "claude")
+		if err != nil {
+			t.Fatalf("ResolveSessionAgent() error = %v", err)
+		}
+		if got, want := resolved.Command, "agent-command"; got != want {
+			t.Fatalf("ResolveSessionAgent() Command = %q, want %q", got, want)
+		}
+		if got, want := resolved.Model, "agent-model"; got != want {
+			t.Fatalf("ResolveSessionAgent() Model = %q, want %q", got, want)
+		}
+	})
+
+	t.Run("Should preserve agent runtime fields when override matches default provider", func(t *testing.T) {
+		t.Parallel()
+
+		homePaths, err := ResolveHomePathsFrom(filepath.Join(t.TempDir(), "home"))
+		if err != nil {
+			t.Fatalf("ResolveHomePathsFrom() error = %v", err)
+		}
+
+		cfg := DefaultWithHome(homePaths)
+		cfg.Defaults.Provider = "claude"
+		cfg.Providers["claude"] = ProviderConfig{
+			Command: "provider-claude-command",
+			Models:  ProviderModelsConfig{Default: "provider-claude-model"},
+		}
+
+		agent := AgentDef{
+			Name:    "coder",
+			Command: "agent-command",
+			Model:   "agent-model",
+			Prompt:  "prompt",
+		}
+
+		resolved, err := cfg.ResolveSessionAgent(agent, "claude")
+		if err != nil {
+			t.Fatalf("ResolveSessionAgent() error = %v", err)
+		}
+		if got, want := resolved.Command, "agent-command"; got != want {
+			t.Fatalf("ResolveSessionAgent() Command = %q, want %q", got, want)
+		}
+		if got, want := resolved.Model, "agent-model"; got != want {
+			t.Fatalf("ResolveSessionAgent() Model = %q, want %q", got, want)
+		}
+	})
+
+	t.Run("Should use workspace-merged runtime fields from the override provider", func(t *testing.T) {
+		t.Parallel()
+
+		homePaths, err := ResolveHomePathsFrom(filepath.Join(t.TempDir(), "home"))
+		if err != nil {
+			t.Fatalf("ResolveHomePathsFrom() error = %v", err)
+		}
+
+		cfg := DefaultWithHome(homePaths)
+		cfg.MCPServers = []MCPServer{
+			{Name: "global", Command: "global-command"},
+		}
+		cfg.Providers["claude"] = ProviderConfig{
+			Command: "workspace-claude-command",
+			Models:  ProviderModelsConfig{Default: "workspace-claude-model"},
+			MCPServers: []MCPServer{
+				{Name: "provider-claude", Command: "provider-claude-command"},
+			},
+		}
+		cfg.Providers["codex"] = ProviderConfig{
+			Command: "workspace-codex-command",
+			Models:  ProviderModelsConfig{Default: "workspace-codex-model"},
+			MCPServers: []MCPServer{
+				{Name: "provider-codex", Command: "provider-codex-command"},
+				{Name: "shared-provider", Command: "shared-provider-codex", Args: []string{"--codex"}},
+			},
+		}
+
+		agent := AgentDef{
+			Name:     "coder",
+			Provider: "claude",
+			Command:  "agent-command",
+			Model:    "agent-model",
+			Prompt:   "prompt",
+			MCPServers: []MCPServer{
+				{Name: "agent", Command: "agent-command"},
+			},
+		}
+
+		resolved, err := cfg.ResolveSessionAgent(agent, "codex")
+		if err != nil {
+			t.Fatalf("ResolveSessionAgent() error = %v", err)
+		}
+
+		if got, want := resolved.Provider, "codex"; got != want {
+			t.Fatalf("ResolveSessionAgent() Provider = %q, want %q", got, want)
+		}
+		if got, want := resolved.Command, "workspace-codex-command"; got != want {
+			t.Fatalf("ResolveSessionAgent() Command = %q, want %q", got, want)
+		}
+		if got, want := resolved.Model, "workspace-codex-model"; got != want {
+			t.Fatalf("ResolveSessionAgent() Model = %q, want %q", got, want)
+		}
+		if resolved.Command == agent.Command {
+			t.Fatalf(
+				"ResolveSessionAgent() Command = %q, want provider-owned command instead of agent override",
+				resolved.Command,
+			)
+		}
+		if resolved.Model == agent.Model {
+			t.Fatalf(
+				"ResolveSessionAgent() Model = %q, want provider-owned default instead of agent override",
+				resolved.Model,
+			)
+		}
+		if got, want := resolved.AuthMode, ProviderAuthModeNativeCLI; got != want {
+			t.Fatalf("ResolveSessionAgent() AuthMode = %q, want %q", got, want)
+		}
+		if len(resolved.CredentialSlots) != 0 {
+			t.Fatalf("ResolveSessionAgent() CredentialSlots = %#v, want no native CLI slots", resolved.CredentialSlots)
+		}
+
+		if got, want := len(resolved.MCPServers), 4; got != want {
+			t.Fatalf("ResolveSessionAgent() MCPServers len = %d, want %d (%#v)", got, want, resolved.MCPServers)
+		}
+		if got, want := resolved.MCPServers[0].Name, "global"; got != want {
+			t.Fatalf("ResolveSessionAgent() MCPServers[0].Name = %q, want %q", got, want)
+		}
+		if got, want := mcpServerByName(
+			t,
+			resolved.MCPServers,
+			"provider-codex",
+		).Command, "provider-codex-command"; got != want {
+			t.Fatalf("ResolveSessionAgent() provider-codex Command = %q, want %q", got, want)
+		}
+		if got, want := mcpServerByName(
+			t,
+			resolved.MCPServers,
+			"shared-provider",
+		).Command, "shared-provider-codex"; got != want {
+			t.Fatalf("ResolveSessionAgent() shared-provider Command = %q, want %q", got, want)
+		}
+		if hasMCPServer(resolved.MCPServers, "provider-claude") {
+			t.Fatalf(
+				"ResolveSessionAgent() MCPServers = %#v, want provider-owned layer from selected provider only",
+				resolved.MCPServers,
+			)
+		}
+		if !hasMCPServer(resolved.MCPServers, "agent") {
+			t.Fatalf("ResolveSessionAgent() MCPServers = %#v, want agent-local layer preserved", resolved.MCPServers)
+		}
+	})
+
+	t.Run("Should use a runtime model override after selecting the override provider", func(t *testing.T) {
+		t.Parallel()
+
+		homePaths, err := ResolveHomePathsFrom(filepath.Join(t.TempDir(), "home"))
+		if err != nil {
+			t.Fatalf("ResolveHomePathsFrom() error = %v", err)
+		}
+
+		cfg := DefaultWithHome(homePaths)
+		cfg.Providers["codex"] = ProviderConfig{
+			Command: "workspace-codex-command",
+			Models:  ProviderModelsConfig{Default: "workspace-codex-model"},
+		}
+
+		agent := AgentDef{
+			Name:     "coder",
+			Provider: "claude",
+			Command:  "agent-command",
+			Model:    "agent-model",
+			Prompt:   "prompt",
+		}
+
+		resolved, err := cfg.ResolveSessionAgentWithRuntime(agent, RuntimeOverrides{
+			Provider: "codex",
+			Model:    "profile-model",
+		})
+		if err != nil {
+			t.Fatalf("ResolveSessionAgentWithRuntime() error = %v", err)
+		}
+		if got, want := resolved.Provider, "codex"; got != want {
+			t.Fatalf("ResolveSessionAgentWithRuntime() Provider = %q, want %q", got, want)
+		}
+		if got, want := resolved.Command, "workspace-codex-command"; got != want {
+			t.Fatalf("ResolveSessionAgentWithRuntime() Command = %q, want %q", got, want)
+		}
+		if got, want := resolved.Model, "profile-model"; got != want {
+			t.Fatalf("ResolveSessionAgentWithRuntime() Model = %q, want %q", got, want)
+		}
+	})
+
+	t.Run("Should reject an unknown override provider with the wrapped provider error", func(t *testing.T) {
+		t.Parallel()
+
+		homePaths, err := ResolveHomePathsFrom(filepath.Join(t.TempDir(), "home"))
+		if err != nil {
+			t.Fatalf("ResolveHomePathsFrom() error = %v", err)
+		}
+
+		cfg := DefaultWithHome(homePaths)
+		agent := AgentDef{
+			Name:     "coder",
+			Provider: "claude",
+			Prompt:   "prompt",
+		}
+
+		_, err = cfg.ResolveSessionAgent(agent, "missing")
+		if err == nil {
+			t.Fatal("ResolveSessionAgent() error = nil, want unknown provider failure")
+		}
+		if !errors.Is(err, ErrProviderUnavailable) {
+			t.Fatalf("ResolveSessionAgent() error = %v, want ErrProviderUnavailable", err)
+		}
+		if !strings.Contains(err.Error(), `resolve session agent with provider "missing"`) {
+			t.Fatalf("ResolveSessionAgent() error = %q, want session override context", err.Error())
+		}
+		if !strings.Contains(err.Error(), `unknown provider "missing"`) {
+			t.Fatalf("ResolveSessionAgent() error = %q, want unknown provider detail", err.Error())
+		}
+	})
+}
+
+func TestMCPServerValidateRejectsMissingFields(t *testing.T) {
+	t.Parallel()
+
+	if err := (MCPServer{}).Validate("mcp"); err == nil {
+		t.Fatal("MCPServer.Validate() error = nil, want non-nil")
+	}
+}
+
+func mcpServerByName(t *testing.T, servers []MCPServer, name string) MCPServer {
+	t.Helper()
+
+	for _, server := range servers {
+		if server.Name == name {
+			return server
+		}
+	}
+
+	t.Fatalf("MCP server %q not found in %#v", name, servers)
+
+	return MCPServer{}
+}
+
+func hasMCPServer(servers []MCPServer, name string) bool {
+	for _, server := range servers {
+		if server.Name == name {
+			return true
+		}
+	}
+
+	return false
+}
+
+func TestProviderSteerCapabilityConfig(t *testing.T) {
+	t.Parallel()
+	for _, value := range []SteerCapability{"", SteerCapabilityExtension, SteerCapabilityConcurrentPrompt, SteerCapabilityNone} {
+		t.Run("Should resolve steering override "+string(value), func(t *testing.T) {
+			t.Parallel()
+			cfg := Config{Providers: map[string]ProviderConfig{"codex": {SteerCapability: value}}}
+			provider, err := cfg.ResolveProvider("codex")
+			if err != nil {
+				t.Fatalf("ResolveProvider() error = %v", err)
+			}
+			if provider.SteerCapability != value {
+				t.Fatalf("steer capability = %q, want %q", provider.SteerCapability, value)
+			}
+		})
+	}
+	t.Run("Should reject an unknown steering mechanism at the config boundary", func(t *testing.T) {
+		t.Parallel()
+		cfg := Config{Providers: map[string]ProviderConfig{"codex": {SteerCapability: "auto"}}}
+		_, err := cfg.ResolveProvider("codex")
+		if err == nil || !strings.Contains(err.Error(), "providers.codex.steer_capability") {
+			t.Fatalf("ResolveProvider() error = %v", err)
+		}
+	})
+	t.Run("Should preserve an explicit none override through TOML overlays", func(t *testing.T) {
+		t.Parallel()
+		var overlay providerOverlay
+		if _, err := toml.Decode(`steer_capability = "none"`, &overlay); err != nil {
+			t.Fatal(err)
+		}
+		provider := ProviderConfig{SteerCapability: SteerCapabilityExtension}
+		overlay.Apply(&provider)
+		if provider.SteerCapability != SteerCapabilityNone {
+			t.Fatalf("steer capability = %q", provider.SteerCapability)
+		}
+	})
+}
+
+func TestProviderSessionMCPTransportConfig(t *testing.T) {
+	t.Parallel()
+	t.Run("Should bridge session MCP over HTTP when an overlay selects it", func(t *testing.T) {
+		t.Parallel()
+		var overlay providerOverlay
+		if _, err := toml.Decode(`session_mcp_transport = "http"
+reviewer_mode = "review"`, &overlay); err != nil {
+			t.Fatal(err)
+		}
+		provider := ProviderConfig{Command: "custom-agent --acp"}
+		overlay.Apply(&provider)
+		cfg := Config{Providers: map[string]ProviderConfig{"custom": provider}}
+		resolved, err := cfg.ResolveProvider("custom")
+		if err != nil {
+			t.Fatalf("ResolveProvider() error = %v", err)
+		}
+		if !resolved.SessionMCPOverHTTP() {
+			t.Fatalf("SessionMCPOverHTTP() = false for %#v", resolved.SessionMCPTransport)
+		}
+		agent, err := cfg.ResolveAgent(AgentDef{Name: "qa", Provider: "custom", Prompt: "prompt"})
+		if err != nil {
+			t.Fatalf("ResolveAgent() error = %v", err)
+		}
+		if !agent.SessionMCPOverHTTP {
+			t.Fatal("ResolvedAgent.SessionMCPOverHTTP = false, want true")
+		}
+		// Provider resolution owns preserving both independently configured
+		// launch capabilities when cloning and applying the same overlay.
+		if resolved.ReviewerMode != "review" || agent.ReviewerMode != "review" {
+			t.Fatalf("reviewer mode lost across provider resolution: %q, %q", resolved.ReviewerMode, agent.ReviewerMode)
+		}
+	})
+	t.Run("Should let an operator return Copilot to stdio session MCP", func(t *testing.T) {
+		t.Parallel()
+		cfg := Config{Providers: map[string]ProviderConfig{
+			"copilot": {SessionMCPTransport: MCPServerTransportStdio},
+		}}
+		resolved, err := cfg.ResolveProvider("copilot")
+		if err != nil {
+			t.Fatalf("ResolveProvider() error = %v", err)
+		}
+		if resolved.SessionMCPOverHTTP() {
+			t.Fatal("SessionMCPOverHTTP() = true, want the stdio override")
+		}
+	})
+	for _, tc := range []struct {
+		name     string
+		provider ProviderConfig
+		want     string
+	}{
+		{
+			name:     "Should reject an unknown session MCP transport",
+			provider: ProviderConfig{Command: "custom-agent --acp", SessionMCPTransport: "sse"},
+			want:     "providers.custom.session_mcp_transport must be one of stdio or http",
+		},
+		{
+			name: "Should reject the HTTP bridge outside the ACP harness",
+			provider: ProviderConfig{
+				Command: "npx -y pi-acp@latest", Harness: ProviderHarnessPiACP, RuntimeProvider: "anthropic",
+				SessionMCPTransport: MCPServerTransportHTTP,
+			},
+			want: `providers.custom.session_mcp_transport = "http" requires harness = "acp"`,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			cfg := Config{Providers: map[string]ProviderConfig{"custom": tc.provider}}
+			if _, err := cfg.ResolveProvider("custom"); err == nil || !strings.Contains(err.Error(), tc.want) {
+				t.Fatalf("ResolveProvider() error = %v, want %q", err, tc.want)
+			}
+		})
+	}
+}
+
+func TestProviderACPMethodValidation(t *testing.T) {
+	t.Parallel()
+
+	t.Run("Should accept a native ACP method and retain it through resolution", func(t *testing.T) {
+		t.Parallel()
+
+		cfg := Config{
+			Providers: map[string]ProviderConfig{
+				"custom": {
+					Command:       "custom-agent --acp",
+					Harness:       ProviderHarnessACP,
+					AuthMode:      ProviderAuthModeNativeCLI,
+					AuthACPMethod: "oauth-personal",
+				},
+			},
+		}
+
+		provider, err := cfg.ResolveProvider("custom")
+		if err != nil {
+			t.Fatalf("ResolveProvider(native ACP method) error = %v", err)
+		}
+		if got := provider.AuthACPMethod; got != "oauth-personal" {
+			t.Fatalf("ResolveProvider() AuthACPMethod = %q, want %q", got, "oauth-personal")
+		}
+		if got := provider.EffectiveACPMethod(); got != "oauth-personal" {
+			t.Fatalf("EffectiveACPMethod() = %q, want %q", got, "oauth-personal")
+		}
+
+		resolved, err := cfg.ResolveAgent(AgentDef{Name: "coder", Provider: "custom", Prompt: "prompt"})
+		if err != nil {
+			t.Fatalf("ResolveAgent(native ACP method) error = %v", err)
+		}
+		if got := resolved.AuthACPMethod; got != "oauth-personal" {
+			t.Fatalf("ResolveAgent() AuthACPMethod = %q, want %q", got, "oauth-personal")
+		}
+
+		if got := cloneProvider(provider).AuthACPMethod; got != "oauth-personal" {
+			t.Fatalf("cloneProvider() AuthACPMethod = %q, want %q", got, "oauth-personal")
+		}
+	})
+
+	for _, name := range []string{"custom", "agy"} {
+		t.Run("Should reject a method on pi_acp provider "+name, func(t *testing.T) {
+			t.Parallel()
+
+			cfg := Config{
+				Providers: map[string]ProviderConfig{
+					name: {
+						Command:         "pi-agent --acp",
+						Harness:         ProviderHarnessPiACP,
+						RuntimeProvider: name,
+						AuthMode:        ProviderAuthModeNativeCLI,
+						AuthACPMethod:   "oauth-personal",
+					},
+				},
+			}
+
+			_, err := cfg.ResolveProvider(name)
+			if err == nil {
+				t.Fatalf("ResolveProvider(%s pi_acp method) error = nil, want validation error", name)
+			}
+			if !strings.Contains(err.Error(), "providers."+name+".auth_acp_method") ||
+				!strings.Contains(err.Error(), `harness = "acp"`) {
+				t.Fatalf("ResolveProvider(%s pi_acp method) error = %v, want harness guidance", name, err)
+			}
+		})
+	}
+
+	t.Run("Should reject a method with incompatible auth modes", func(t *testing.T) {
+		t.Parallel()
+
+		for _, mode := range []ProviderAuthMode{ProviderAuthModeNone, ProviderAuthModeBoundSecret} {
+			t.Run(fmt.Sprintf("Should reject auth mode %s", mode), func(t *testing.T) {
+				t.Parallel()
+				provider := ProviderConfig{
+					Command:       "custom-agent --acp",
+					Harness:       ProviderHarnessACP,
+					AuthMode:      mode,
+					AuthACPMethod: "oauth-personal",
+				}
+				if mode == ProviderAuthModeBoundSecret {
+					provider.CredentialSlots = []ProviderCredentialSlot{apiKeyCredentialSlot("CUSTOM_API_KEY")}
+				} else {
+					provider.NoneSecurity = ProviderNoneSecurityLocalTransport
+				}
+				cfg := Config{Providers: map[string]ProviderConfig{"custom": provider}}
+
+				_, err := cfg.ResolveProvider("custom")
+				if err == nil {
+					t.Fatalf("ResolveProvider(%s method) error = nil, want validation error", mode)
+				}
+				if !strings.Contains(err.Error(), "providers.custom.auth_acp_method") {
+					t.Fatalf("ResolveProvider(%s method) error = %v, want field path", mode, err)
+				}
+			})
+		}
+	})
+
+	t.Run("Should trim and retain a padded method identifier", func(t *testing.T) {
+		t.Parallel()
+
+		cfg := Config{
+			Providers: map[string]ProviderConfig{
+				"custom": {
+					Command:       "custom-agent --acp",
+					Harness:       ProviderHarnessACP,
+					AuthMode:      ProviderAuthModeNativeCLI,
+					AuthACPMethod: "  oauth-personal ",
+				},
+			},
+		}
+
+		provider, err := cfg.ResolveProvider("custom")
+		if err != nil {
+			t.Fatalf("ResolveProvider(padded method) error = %v", err)
+		}
+		if got := provider.AuthACPMethod; got != "oauth-personal" {
+			t.Fatalf("ResolveProvider() AuthACPMethod = %q, want trimmed %q", got, "oauth-personal")
+		}
+	})
+
+	t.Run("Should reject malformed method identifiers", func(t *testing.T) {
+		t.Parallel()
+
+		for _, method := range []string{"oauth\x00personal", "oauth\npersonal", "oauth\x7fpersonal"} {
+			t.Run(fmt.Sprintf("Should reject method %q", method), func(t *testing.T) {
+				t.Parallel()
+				cfg := Config{
+					Providers: map[string]ProviderConfig{
+						"custom": {
+							Command:       "custom-agent --acp",
+							Harness:       ProviderHarnessACP,
+							AuthMode:      ProviderAuthModeNativeCLI,
+							AuthACPMethod: method,
+						},
+					},
+				}
+
+				_, err := cfg.ResolveProvider("custom")
+				if err == nil {
+					t.Fatalf("ResolveProvider(%q) error = nil, want validation error", method)
+				}
+				if !strings.Contains(err.Error(), "providers.custom.auth_acp_method") {
+					t.Fatalf("ResolveProvider(%q) error = %v, want field path", method, err)
+				}
+			})
+		}
+	})
+
+	t.Run("Should clear the inherited method on an explicit incompatible mode change", func(t *testing.T) {
+		t.Parallel()
+
+		for _, mode := range []ProviderAuthMode{ProviderAuthModeNone, ProviderAuthModeBoundSecret} {
+			t.Run(fmt.Sprintf("Should clear method for auth mode %s", mode), func(t *testing.T) {
+				t.Parallel()
+				merged := ProviderConfig{
+					Command:       "custom-agent --acp",
+					AuthStatusCmd: "custom-agent auth status",
+					AuthLoginCmd:  "custom-agent auth login",
+					AuthACPMethod: "oauth-personal",
+				}
+				applyProviderAuthModeOverride(&merged, ProviderConfig{AuthMode: mode})
+				if merged.AuthACPMethod != "" {
+					t.Fatalf(
+						"applyProviderAuthModeOverride(%s) AuthACPMethod = %q, want empty",
+						mode,
+						merged.AuthACPMethod,
+					)
+				}
+			})
+		}
+	})
+}
+
+func TestRetiredBuiltinProviders(t *testing.T) {
+	t.Parallel()
+
+	retired := []string{
+		"hermes", "openclaw", "blackbox", "cline", "goose", "junie",
+		"kiro", "openhands", "qoder", "mistral", "groq", "minimax",
+	}
+
+	t.Run("Should not expose retired providers as builtins", func(t *testing.T) {
+		t.Parallel()
+
+		builtins := BuiltinProviders()
+		for _, name := range retired {
+			if _, ok := builtins[name]; ok {
+				t.Fatalf("BuiltinProviders() contains retired provider %q", name)
+			}
+		}
+	})
+
+	t.Run("Should keep resolving an undeclared retired reference through the deprecation window", func(t *testing.T) {
+		t.Parallel()
+
+		cfg := DefaultWithHome(HomePaths{})
+		for _, name := range retired {
+			got, err := cfg.ResolveProvider(name)
+			if err != nil {
+				t.Fatalf("ResolveProvider(%q) error = %v", name, err)
+			}
+			if want := retiredBuiltinProviders[name]; !reflect.DeepEqual(got, want) {
+				t.Fatalf("ResolveProvider(%q) = %#v, want former builtin %#v", name, got, want)
+			}
+		}
+		mistral, err := cfg.ResolveProvider("mistral")
+		if err != nil {
+			t.Fatalf("ResolveProvider(mistral) error = %v", err)
+		}
+		if mistral.EffectiveHarness() != ProviderHarnessPiACP ||
+			mistral.EffectiveAuthMode() != ProviderAuthModeBoundSecret ||
+			mistral.RuntimeProviderName("mistral") != "mistral" {
+			t.Fatalf("ResolveProvider(mistral) = %#v, want pi_acp bound-secret runtime mistral", mistral)
+		}
+	})
+
+	t.Run("Should resolve agents and defaults that reference a retired provider", func(t *testing.T) {
+		t.Parallel()
+
+		cfg := DefaultWithHome(HomePaths{})
+		cfg.Defaults.Provider = "hermes-agent"
+		if err := cfg.validateProviders(); err != nil {
+			t.Fatalf("validateProviders() error = %v", err)
+		}
+		resolved, err := cfg.ResolveAgent(AgentDef{Name: "coder", Provider: "openclaw", Prompt: "prompt"})
+		if err != nil {
+			t.Fatalf("ResolveAgent(openclaw) error = %v", err)
+		}
+		if resolved.Provider != "openclaw" || resolved.Command != "openclaw acp" || resolved.SessionMCP {
+			t.Fatalf("ResolveAgent(openclaw) = %#v, want former openclaw launch", resolved)
+		}
+	})
+
+	t.Run("Should merge a partial override onto the former builtin definition", func(t *testing.T) {
+		t.Parallel()
+
+		cfg := DefaultWithHome(HomePaths{})
+		cfg.Providers["mistral"] = ProviderConfig{Models: ProviderModelsConfig{Default: "codestral-latest"}}
+		got, err := cfg.ResolveProvider("mistral")
+		if err != nil {
+			t.Fatalf("ResolveProvider(mistral) error = %v", err)
+		}
+		if got.Command != piACPCommand || got.Models.Default != "codestral-latest" ||
+			len(got.CredentialSlots) != 1 || got.CredentialSlots[0].TargetEnv != "MISTRAL_API_KEY" {
+			t.Fatalf("ResolveProvider(mistral) = %#v, want former definition with overridden default model", got)
+		}
+	})
+
+	t.Run("Should resolve the printed replacement as an equivalent custom provider", func(t *testing.T) {
+		t.Parallel()
+
+		for _, name := range retired {
+			var document struct {
+				Providers map[string]ProviderConfig `toml:"providers"`
+			}
+			replacement := retiredBuiltinProviderReplacement(name, retiredBuiltinProviders[name])
+			if _, err := toml.Decode(replacement, &document); err != nil {
+				t.Fatalf("decode %q replacement error = %v\n%s", name, err, replacement)
+			}
+			declared := document.Providers[name]
+			if _, retiredBase := retiredProviderBase(name, declared, true); retiredBase {
+				t.Fatalf("replacement for %q still depends on the retired definition:\n%s", name, replacement)
+			}
+			cfg := DefaultWithHome(HomePaths{})
+			cfg.Providers[name] = declared
+			got, err := cfg.ResolveProvider(name)
+			if err != nil {
+				t.Fatalf("ResolveProvider(%q) with replacement error = %v", name, err)
+			}
+			if want := retiredBuiltinProviders[name]; !reflect.DeepEqual(got, want) {
+				t.Fatalf("ResolveProvider(%q) with replacement = %#v, want %#v", name, got, want)
+			}
+		}
+	})
+
+	t.Run("Should resolve a self-declared custom provider without the retired definition", func(t *testing.T) {
+		t.Parallel()
+
+		cfg := DefaultWithHome(HomePaths{})
+		cfg.Providers["hermes"] = ProviderConfig{Command: "hermes acp --profile work"}
+		got, err := cfg.ResolveProvider("hermes")
+		if err != nil {
+			t.Fatalf("ResolveProvider(hermes) error = %v", err)
+		}
+		if got.Command != "hermes acp --profile work" || got.DisplayName != "" || got.AuthStatusCmd != "" {
+			t.Fatalf("ResolveProvider(hermes) = %#v, want only the declared custom provider", got)
+		}
+	})
+}
+
+func TestRetiredBuiltinProviderWarnings(t *testing.T) {
+	tests := []struct {
+		name      string
+		override  string
+		private   []string
+		ownsSlots bool
+	}{
+		{
+			name: "Should guide a partial model and login override",
+			override: `[providers.mistral]
+auth_login_command = "provider login raw-login-secret"
+[providers.mistral.models]
+default = "codestral-latest"`,
+			private: []string{"raw-login-secret", "codestral-latest"},
+		},
+		{
+			name: "Should guide an override that chose native CLI authentication",
+			override: `[providers.mistral]
+auth_mode = "native_cli"`,
+			ownsSlots: true,
+		},
+		{
+			name: "Should guide an override with its own vault credential slot",
+			override: `[[providers.mistral.credential_slots]]
+name = "api_key"
+target_env = "MISTRAL_API_KEY"
+secret_ref = "vault:providers/mistral/api_key"
+kind = "api_key"
+required = true`,
+			private:   []string{"providers/mistral/api_key"},
+			ownsSlots: true,
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			var logs bytes.Buffer
+			RouteRetiredProviderWarnings(compozylogger.WithRedaction(slog.New(slog.NewJSONHandler(&logs, nil))))
+			t.Cleanup(func() { RouteRetiredProviderWarnings(nil) })
+
+			cfg := DefaultWithHome(HomePaths{})
+			cfg.Defaults.Provider = "hermes-agent"
+			cfg.Providers = decodeRetiredTestProviders(t, tc.override)
+			cfg.WarnRetiredProviderReferences()
+			cfg.WarnRetiredProviderReferences()
+
+			records := retiredWarningRecords(t, logs.String())
+			if len(records) != 2 || records["hermes"] == nil || records["mistral"] == nil {
+				t.Fatalf("warnings = %s, want one each for hermes and mistral", logs.String())
+			}
+			for _, private := range append([]string{"[REDACTED]"}, tc.private...) {
+				if strings.Contains(logs.String(), private) {
+					t.Fatalf("warning log contains %q:\n%s", private, logs.String())
+				}
+			}
+			if action, _ := records["hermes"]["action"].(string); action != "add replacement to config.toml" {
+				t.Fatalf("hermes action = %q, want add instruction for an undeclared reference", action)
+			}
+			action, _ := records["mistral"]["action"].(string)
+			if !strings.Contains(action, "merge replacement into the existing [providers.mistral] tables") {
+				t.Fatalf("mistral action = %q, want merge instructions for an existing override", action)
+			}
+
+			replacement, _ := records["mistral"]["replacement"].(string)
+			if tc.ownsSlots &&
+				(strings.Contains(action, "secret_ref") || strings.Contains(replacement, "credential_slots")) {
+				t.Fatalf("guidance adds credentials the override owns: action=%q replacement=%q", action, replacement)
+			}
+			edited := applyRetiredWarningToTOML(t, tc.override, records["mistral"])
+			declared := DefaultWithHome(HomePaths{})
+			declared.Providers = decodeRetiredTestProviders(t, edited)
+			got, err := declared.ResolveProvider("mistral")
+			if err != nil {
+				t.Fatalf("ResolveProvider(edited mistral) error = %v\n%s", err, edited)
+			}
+			want, err := cfg.ResolveProvider("mistral")
+			if err != nil {
+				t.Fatalf("ResolveProvider(original mistral) error = %v", err)
+			}
+			if !reflect.DeepEqual(got, want) {
+				t.Fatalf("edited config resolves to %#v, want effective %#v\n%s", got, want, edited)
+			}
+		})
+	}
+}
+
+func decodeRetiredTestProviders(t *testing.T, contents string) map[string]ProviderConfig {
+	t.Helper()
+	var document struct {
+		Providers map[string]ProviderConfig `toml:"providers"`
+	}
+	if _, err := toml.Decode(contents, &document); err != nil {
+		t.Fatalf("decode providers error = %v\n%s", err, contents)
+	}
+	return document.Providers
+}
+
+func retiredWarningRecords(t *testing.T, output string) map[string]map[string]any {
+	t.Helper()
+	records := map[string]map[string]any{}
+	for line := range strings.SplitSeq(strings.TrimSpace(output), "\n") {
+		var record map[string]any
+		if err := json.Unmarshal([]byte(line), &record); err != nil {
+			t.Fatalf("decode warning %q: %v", line, err)
+		}
+		if record["msg"] != "provider.retired_builtin" || record["removed_in"] != "v0.5.0" {
+			t.Fatalf("warning = %#v, want provider.retired_builtin removed_in v0.5.0", record)
+		}
+		provider, _ := record["provider"].(string)
+		if _, dup := records[provider]; dup {
+			t.Fatalf("provider %q warned twice:\n%s", provider, output)
+		}
+		records[provider] = record
+	}
+	return records
+}
+
+// applyRetiredWarningToTOML performs the operator edit the warning describes on real TOML: merge
+// the replacement into the existing tables keeping set values, then fill the added secret_refs.
+func applyRetiredWarningToTOML(t *testing.T, existing string, record map[string]any) string {
+	t.Helper()
+	replacement, _ := record["replacement"].(string)
+	action, _ := record["action"].(string)
+	var current, added map[string]any
+	if _, err := toml.Decode(existing, &current); err != nil {
+		t.Fatalf("decode existing TOML error = %v", err)
+	}
+	if _, err := toml.Decode(replacement, &added); err != nil {
+		t.Fatalf("decode replacement error = %v\n%s", err, replacement)
+	}
+	fills := regexp.MustCompile(`(\w+) uses scheme "([a-z]+)" and name "([A-Z_]+)"`).FindAllStringSubmatch(action, -1)
+	addedProvider, _ := added["providers"].(map[string]any)["mistral"].(map[string]any)
+	if slots, ok := addedProvider["credential_slots"].([]map[string]any); ok {
+		for _, slot := range slots {
+			for _, fill := range fills {
+				if slot["name"] == fill[1] {
+					slot["secret_ref"] = fill[2] + ":" + fill[3]
+				}
+			}
+		}
+	}
+	merged := mergeRetiredTestTables(added, current)
+	var buffer bytes.Buffer
+	if err := toml.NewEncoder(&buffer).Encode(merged); err != nil {
+		t.Fatalf("encode edited TOML error = %v", err)
+	}
+	return buffer.String()
+}
+
+func mergeRetiredTestTables(base, kept map[string]any) map[string]any {
+	merged := make(map[string]any, len(base)+len(kept))
+	maps.Copy(merged, base)
+	for key, value := range kept {
+		baseTable, baseIsTable := merged[key].(map[string]any)
+		keptTable, keptIsTable := value.(map[string]any)
+		if baseIsTable && keptIsTable {
+			merged[key] = mergeRetiredTestTables(baseTable, keptTable)
+			continue
+		}
+		merged[key] = value
+	}
+	return merged
+}
+
+// Invariant: session environment declarations carry validated refs and required semantics across config formats.
+func TestProviderSessionEnvironment(t *testing.T) {
+	t.Parallel()
+	t.Run("Should decode references and optional bindings without changing native authentication", func(t *testing.T) {
+		t.Parallel()
+		var provider ProviderConfig
+		_, err := toml.Decode(`command = "claude --acp"
+auth_mode = "native_cli"
+[session_env]
+GH_TOKEN = "env:GH_TOKEN"
+JIRA_TOKEN = { ref = "vault:providers/claude/jira", required = false }
+SSH_AUTH_SOCK = "env:SSH_AUTH_SOCK"
+`, &provider)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := validateResolvedProvider("custom", provider); err != nil {
+			t.Fatal(err)
+		}
+		if !provider.SessionEnv["GH_TOKEN"].Required || provider.SessionEnv["JIRA_TOKEN"].Required {
+			t.Fatal("required semantics were not preserved")
+		}
+		if provider.SessionEnv["SSH_AUTH_SOCK"].Ref != "env:SSH_AUTH_SOCK" || len(provider.CredentialSlots) != 0 {
+			t.Fatal("socket declaration changed native authentication")
+		}
+	})
+	for _, test := range []struct{ declaration, reason string }{
+		{`"private-literal-canary"`, "ref must be a valid"},
+		{`{ ref = "private-literal-canary" }`, "ref must be a valid"},
+		{`{ ref = "env:GH_TOKEN", required = "yes" }`, "required must be a boolean"},
+		{`{ ref = "env:GH_TOKEN", surprise = true }`, "only ref and required"},
+		{`"env:bad-name"`, "ref must be a valid"},
+		{`"file:/tmp/token"`, "ref must be a valid"},
+	} {
+		t.Run("Should reject invalid declaration "+test.declaration, func(t *testing.T) {
+			t.Parallel()
+			var provider ProviderConfig
+			_, err := toml.Decode("[session_env]\nGH_TOKEN = "+test.declaration, &provider)
+			if err == nil || !strings.Contains(err.Error(), test.reason) {
+				t.Fatalf("declaration error = %v, want %s", err, test.reason)
+			}
+			if strings.Contains(err.Error(), "private-literal-canary") {
+				t.Fatal("error exposed literal value")
+			}
+		})
+	}
+	t.Run("Should merge declarations by name without sharing mutable state", func(t *testing.T) {
+		t.Parallel()
+		base := ProviderConfig{
+			SessionEnv: SessionEnv{
+				"GH_TOKEN":      {Ref: "env:BASE", Required: true},
+				"SSH_AUTH_SOCK": {Ref: "env:SSH_AUTH_SOCK", Required: false},
+			},
+		}
+		override := ProviderConfig{SessionEnv: SessionEnv{"GH_TOKEN": {Ref: "env:OVERRIDE", Required: false}}}
+		merged := mergeProvider(base, override)
+		if merged.SessionEnv["GH_TOKEN"].Ref != "env:OVERRIDE" || merged.SessionEnv["GH_TOKEN"].Required ||
+			len(merged.SessionEnv) != 2 {
+			t.Fatal("incorrect declaration merge")
+		}
+		merged.SessionEnv["GH_TOKEN"] = SessionEnvBinding{Ref: "env:CHANGED"}
+		if base.SessionEnv["GH_TOKEN"].Ref != "env:BASE" || override.SessionEnv["GH_TOKEN"].Ref != "env:OVERRIDE" {
+			t.Fatal("merge mutated its source")
+		}
+	})
+	t.Run("Should preserve agent declarations and fallback route declarations", func(t *testing.T) {
+		t.Parallel()
+		agent, err := ParseAgentDef([]byte(`---
+name: session-env-test
+session_env:
+  GH_TOKEN: env:GH_TOKEN
+  DBUS_SESSION_BUS_ADDRESS:
+    ref: env:DBUS_SESSION_BUS_ADDRESS
+    required: false
+fallback_chain:
+  - provider: claude
+    model: test
+    session_env:
+      GH_TOKEN: vault:providers/claude/alternate
+---
+Test agent.
+`))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !agent.SessionEnv["GH_TOKEN"].Required || agent.SessionEnv["DBUS_SESSION_BUS_ADDRESS"].Required {
+			t.Fatal("agent required semantics were not preserved")
+		}
+		if agent.FallbackChain[0].SessionEnv["GH_TOKEN"].Ref != "vault:providers/claude/alternate" {
+			t.Fatal("route declaration lost")
+		}
+		_, rendered, err := RenderAgentDefinition(AgentDefinitionDraftFromDef(agent))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !reflect.DeepEqual(rendered.SessionEnv, agent.SessionEnv) ||
+			!reflect.DeepEqual(rendered.FallbackChain, agent.FallbackChain) {
+			t.Fatal("authoring round trip lost session environment declarations")
+		}
+		cloned := CloneAgentDef(agent)
+		cloned.SessionEnv["GH_TOKEN"] = SessionEnvBinding{Ref: "env:CHANGED"}
+		cloned.FallbackChain[0].SessionEnv["GH_TOKEN"] = SessionEnvBinding{Ref: "env:CHANGED"}
+		if agent.SessionEnv["GH_TOKEN"].Ref != "env:GH_TOKEN" ||
+			agent.FallbackChain[0].SessionEnv["GH_TOKEN"].Ref != "vault:providers/claude/alternate" {
+			t.Fatal("clone mutated agent")
+		}
+	})
+	t.Run("Should reject reserved and malformed environment names", func(t *testing.T) {
+		t.Parallel()
+		for _, name := range []string{"COMPOZY_SESSION_ID", "bad-name", "", "KEY=value"} {
+			reason := "invalid environment variable name"
+			if name == "COMPOZY_SESSION_ID" {
+				reason = "environment names are reserved"
+			}
+			if err := (SessionEnv{name: {Ref: "env:GH_TOKEN"}}).Validate(
+				"session_env",
+			); err == nil ||
+				!strings.Contains(err.Error(), reason) {
+				t.Fatalf("accepted invalid name %q", name)
+			}
+		}
+	})
+}
+
+func TestReviewerModeTrustBoundary(t *testing.T) {
+	t.Parallel()
+	t.Run("Should reject unrestricted reviewers except the verified Claude pair", func(t *testing.T) {
+		t.Parallel()
+		for _, tc := range []struct {
+			provider string
+			mode     string
+			reject   bool
+		}{
+			{"claude", "auto", false}, {"codex", "agent", false},
+			{"custom", "smart", false}, {"custom", "auto", true},
+			{"claude", "bypassPermissions", true},
+			{"claude", "BYPASSPERMISSIONS", true},
+			{"custom", "Full-Access", true},
+			{"custom", "AuTo", true},
+			{"Claude", "Auto", false},
+			{"copilot", copilotAutopilotMode, true},
+			{"Copilot", strings.ToUpper(copilotAutopilotMode), true},
+		} {
+			p := builtinProviders[providerClaudeKey]
+			p.ReviewerMode = tc.mode
+			err := validateResolvedProvider(tc.provider, p)
+			if (err != nil) != tc.reject {
+				t.Fatalf("provider=%s reviewer=%s error=%v", tc.provider, tc.mode, err)
+			}
+		}
+	})
+	t.Run("Should drop the builtin reviewer mode when the provider is routed to another runtime", func(t *testing.T) {
+		t.Parallel()
+		rerouted := &Config{Providers: map[string]ProviderConfig{
+			providerClaudeKey: {RuntimeProvider: "acpmock", Command: "mock-acp"},
+		}}
+		resolved, err := rerouted.ResolveProvider(providerClaudeKey)
+		if err != nil {
+			t.Fatalf("ResolveProvider(rerouted claude) error = %v, want the inherited auto reviewer dropped", err)
+		}
+		if resolved.ReviewerMode != "" {
+			t.Fatalf("rerouted reviewer = %q, want none inherited from the Claude runtime", resolved.ReviewerMode)
+		}
+		explicit := &Config{Providers: map[string]ProviderConfig{
+			providerClaudeKey: {RuntimeProvider: "acpmock", Command: "mock-acp", ReviewerMode: "review"},
+		}}
+		resolved, err = explicit.ResolveProvider(providerClaudeKey)
+		if err != nil || resolved.ReviewerMode != "review" {
+			t.Fatalf("explicit rerouted reviewer = %q, %v; want review kept", resolved.ReviewerMode, err)
+		}
+		builtin, err := (&Config{}).ResolveProvider(providerClaudeKey)
+		if err != nil || builtin.ReviewerMode != "auto" {
+			t.Fatalf("builtin claude reviewer = %q, %v; want auto", builtin.ReviewerMode, err)
+		}
+	})
+	t.Run("Should drop workspace reviewer declarations while preserving global review", func(t *testing.T) {
+		t.Parallel()
+		overlay, err := loadWorkspaceConfigOverlayBytes(
+			[]byte("[providers.claude]\nreviewer_mode = 'bypassPermissions'\n"), "workspace.toml")
+		if err != nil {
+			t.Fatal(err)
+		}
+		p := builtinProviders[providerClaudeKey]
+		overlay.Providers["claude"].Apply(&p)
+		if p.ReviewerMode != "auto" {
+			t.Fatalf("reviewer=%q, want auto", p.ReviewerMode)
+		}
+	})
+}
+
+func TestResolveAgentAppliesOperatorOverride(t *testing.T) {
+	t.Parallel()
+
+	bundled := AgentDef{
+		Name:        "orchestrator",
+		Provider:    "claude",
+		Model:       "agent-model",
+		Permissions: string(PermissionModeAuto),
+		Appearance:  map[string]any{"icon": "compass"},
+		Prompt:      "packaged prompt",
+	}
+	loadWithOverrides := func(t *testing.T, global, workspace string) Config {
+		t.Helper()
+		homePaths, err := ResolveHomePathsFrom(filepath.Join(t.TempDir(), "home"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := EnsureHomeLayout(homePaths); err != nil {
+			t.Fatal(err)
+		}
+		writeFile(t, homePaths.ConfigFile, global)
+		workspaceRoot := t.TempDir()
+		if workspace != "" {
+			writeFile(t, filepath.Join(workspaceRoot, ".compozy", "config.toml"), workspace)
+		}
+		cfg, err := LoadForHome(homePaths, WithWorkspaceRoot(workspaceRoot), withoutDotEnv())
+		if err != nil {
+			t.Fatalf("LoadForHome() error = %v", err)
+		}
+		return cfg
+	}
+
+	t.Run("Should replace the level while the packaged prompt keeps tracking the source", func(t *testing.T) {
+		t.Parallel()
+		cfg := loadWithOverrides(t, "[agents.overrides.orchestrator]\npermissions = \"approve-all\"\n", "")
+		resolved, err := cfg.ResolveAgent(bundled)
+		if err != nil {
+			t.Fatalf("ResolveAgent() error = %v", err)
+		}
+		if resolved.Permissions != string(PermissionModeApproveAll) || !resolved.PermissionsConfigured {
+			t.Fatalf("Permissions = %q configured=%v, want approve-all configured", resolved.Permissions,
+				resolved.PermissionsConfigured)
+		}
+		if resolved.Prompt != bundled.Prompt || resolved.Model != bundled.Model {
+			t.Fatalf("resolved prompt/model = %q/%q, want source values", resolved.Prompt, resolved.Model)
+		}
+		if got := cfg.ApplyAgentOverride(bundled).Appearance; !maps.Equal(got, bundled.Appearance) {
+			t.Fatalf("overridden appearance = %#v, want packaged %#v", got, bundled.Appearance)
+		}
+		if got := resolved.RuntimeSources.Permissions; got != RuntimeValueSourceConfigOverride {
+			t.Fatalf("Permissions source = %q, want config_override", got)
+		}
+		if got := resolved.RuntimeSources.Model; got != RuntimeValueSourceAgent {
+			t.Fatalf("Model source = %q, want agent", got)
+		}
+		if bundled.Permissions != string(PermissionModeAuto) {
+			t.Fatalf("ResolveAgent() mutated the authored definition: %q", bundled.Permissions)
+		}
+	})
+
+	t.Run("Should merge a workspace layer per field over the global override", func(t *testing.T) {
+		t.Parallel()
+		cfg := loadWithOverrides(t,
+			"[agents.overrides.orchestrator]\npermissions = \"approve-all\"\nmodel = \"override-model\"\n",
+			"[agents.overrides.orchestrator]\npermissions = \"approve-reads\"\n",
+		)
+		resolved, err := cfg.ResolveAgent(bundled)
+		if err != nil {
+			t.Fatalf("ResolveAgent() error = %v", err)
+		}
+		if resolved.Permissions != string(PermissionModeApproveReads) || resolved.Model != "override-model" {
+			t.Fatalf("resolved = %q/%q, want approve-reads/override-model", resolved.Permissions, resolved.Model)
+		}
+	})
+
+	t.Run("Should leave other agents and unset fields unchanged", func(t *testing.T) {
+		t.Parallel()
+		cfg := loadWithOverrides(t, "[agents.overrides.reviewer]\npermissions = \"approve-all\"\n", "")
+		resolved, err := cfg.ResolveAgent(bundled)
+		if err != nil {
+			t.Fatalf("ResolveAgent() error = %v", err)
+		}
+		if resolved.Permissions != string(PermissionModeAuto) ||
+			resolved.RuntimeSources.Permissions != RuntimeValueSourceAgent {
+			t.Fatalf("resolved permissions = %q (%q), want authored auto", resolved.Permissions,
+				resolved.RuntimeSources.Permissions)
+		}
+	})
+
+	t.Run("Should let a session runtime selection outrank the override model", func(t *testing.T) {
+		t.Parallel()
+		cfg := loadWithOverrides(t,
+			"[agents.overrides.orchestrator]\npermissions = \"approve-all\"\nmodel = \"override-model\"\n", "")
+		resolved, err := cfg.ResolveSessionAgentWithRuntime(bundled, RuntimeOverrides{Model: "session-model"})
+		if err != nil {
+			t.Fatalf("ResolveSessionAgentWithRuntime() error = %v", err)
+		}
+		if resolved.Model != "session-model" || resolved.Permissions != string(PermissionModeApproveAll) {
+			t.Fatalf("resolved = %q/%q, want session-model/approve-all", resolved.Model, resolved.Permissions)
+		}
+		if resolved.RuntimeSources.Model == RuntimeValueSourceConfigOverride {
+			t.Fatal("Model source = config_override, want the session selection to own it")
+		}
+	})
+
+	t.Run("Should drop the authored model and command when the override changes provider", func(t *testing.T) {
+		t.Parallel()
+		cfg := loadWithOverrides(t, "[agents.overrides.orchestrator]\nprovider = \"codex\"\n", "")
+		agent := CloneAgentDef(bundled)
+		agent.Command = "claude-code-acp --custom"
+		resolved, err := cfg.ResolveAgent(agent)
+		if err != nil {
+			t.Fatalf("ResolveAgent() error = %v", err)
+		}
+		codex, err := cfg.ResolveProvider("codex")
+		if err != nil {
+			t.Fatalf("ResolveProvider(codex) error = %v", err)
+		}
+		if resolved.Provider != "codex" || resolved.Model != codex.Models.Default || resolved.Command != codex.Command {
+			t.Fatalf("resolved = %q/%q/%q, want codex defaults %q/%q", resolved.Provider, resolved.Model,
+				resolved.Command, codex.Models.Default, codex.Command)
+		}
+		if resolved.RuntimeSources.Provider != RuntimeValueSourceConfigOverride {
+			t.Fatalf("Provider source = %q, want config_override", resolved.RuntimeSources.Provider)
+		}
+	})
+
+	t.Run("Should keep project runtime defaults when the override repeats the default provider", func(t *testing.T) {
+		t.Parallel()
+		cfg := loadWithOverrides(t,
+			"[defaults]\nprovider = \"claude\"\nmodel = \"defaults-model\"\nreasoning_effort = \"high\"\n\n"+
+				"[agents.overrides.orchestrator]\nprovider = \"claude\"\n", "")
+		agent := AgentDef{Name: "orchestrator", Prompt: "packaged prompt"}
+		resolved, err := cfg.ResolveAgent(agent)
+		if err != nil {
+			t.Fatalf("ResolveAgent() error = %v", err)
+		}
+		if resolved.Provider != "claude" || resolved.Model != "defaults-model" || resolved.ReasoningEffort != "high" {
+			t.Fatalf("resolved = %q/%q/%q, want claude/defaults-model/high", resolved.Provider, resolved.Model,
+				resolved.ReasoningEffort)
+		}
+	})
+
+	t.Run("Should keep the override effort when a session selects the inherited default model", func(t *testing.T) {
+		t.Parallel()
+		cfg := loadWithOverrides(t,
+			"[defaults]\nprovider = \"claude\"\nmodel = \"defaults-model\"\n\n"+
+				"[agents.overrides.orchestrator]\nreasoning_effort = \"high\"\n", "")
+		agent := AgentDef{Name: "orchestrator", Prompt: "packaged prompt"}
+		resolved, err := cfg.ResolveSessionAgentWithRuntime(agent, RuntimeOverrides{Model: "defaults-model"})
+		if err != nil {
+			t.Fatalf("ResolveSessionAgentWithRuntime() error = %v", err)
+		}
+		if resolved.ReasoningEffort != "high" ||
+			resolved.RuntimeSources.ReasoningEffort != RuntimeValueSourceConfigOverride {
+			t.Fatalf("effort = %q (%q), want high from config_override", resolved.ReasoningEffort,
+				resolved.RuntimeSources.ReasoningEffort)
+		}
+	})
+
+	t.Run("Should reject an invalid override level at load", func(t *testing.T) {
+		t.Parallel()
+		homePaths, err := ResolveHomePathsFrom(filepath.Join(t.TempDir(), "home"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := EnsureHomeLayout(homePaths); err != nil {
+			t.Fatal(err)
+		}
+		writeFile(t, homePaths.ConfigFile, "[agents.overrides.orchestrator]\npermissions = \"root\"\n")
+		_, err = LoadForHome(homePaths, withoutDotEnv())
+		if err == nil || !strings.Contains(err.Error(), "agents.overrides.orchestrator.permissions") {
+			t.Fatalf("LoadForHome() error = %v, want override permissions validation", err)
+		}
+	})
+}

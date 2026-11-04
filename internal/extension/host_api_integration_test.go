@@ -1,0 +1,1049 @@
+//go:build integration
+
+package extensionpkg
+
+import (
+	"context"
+	"encoding/json"
+	"fmt"
+	"reflect"
+	"testing"
+	"time"
+
+	"github.com/compozy/compozy/internal/acp"
+	apicontract "github.com/compozy/compozy/internal/api/contract"
+	automationpkg "github.com/compozy/compozy/internal/automation"
+	hookspkg "github.com/compozy/compozy/internal/hooks"
+	looppkg "github.com/compozy/compozy/internal/loop"
+	"github.com/compozy/compozy/internal/loop/dsl"
+	observepkg "github.com/compozy/compozy/internal/observe"
+	"github.com/compozy/compozy/internal/resources"
+	"github.com/compozy/compozy/internal/session"
+	storepkg "github.com/compozy/compozy/internal/store"
+	taskpkg "github.com/compozy/compozy/internal/task"
+	"github.com/compozy/compozy/internal/testutil"
+)
+
+func withHostAPIHooks(hooks *hookspkg.Hooks) hostAPITestEnvOption {
+	return func(cfg *hostAPITestEnvConfig) {
+		cfg.hooks = hooks
+	}
+}
+
+func (d *hostAPIFakeDriver) promptCalls() []acp.PromptRequest {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+
+	return append([]acp.PromptRequest(nil), d.promptLog...)
+}
+
+func TestHostAPIIntegrationSessionLifecycleThroughHostAPI(t *testing.T) {
+	t.Run("Should project the prompt-selected runtime through session status", func(t *testing.T) {
+		env := newHostAPITestEnv(t)
+		env.grant(
+			"ext-integration",
+			[]string{"sessions/create", "sessions/prompt", "sessions/status", "sessions/events"},
+			[]string{"session.write", "session.read"},
+		)
+
+		createResult, err := env.call(t, "ext-integration", "sessions/create", map[string]string{
+			"agent":     "coder",
+			"workspace": env.workspaceID,
+		})
+		if err != nil {
+			t.Fatalf("Handle(sessions/create) error = %v", err)
+		}
+
+		var created hostAPISessionCreateResult
+		decodeResult(t, createResult, &created)
+		if created.SessionID == "" {
+			t.Fatal("sessions/create session_id = empty, want non-empty")
+		}
+		prompt, err := env.submitPromptWithRuntime(
+			t,
+			"ext-integration",
+			created.SessionID,
+			"integration prompt",
+			&apicontract.PromptRuntimeSelectionPayload{Provider: "fake-alt"},
+		)
+		if err != nil {
+			t.Fatalf("submitPrompt() error = %v", err)
+		}
+		if prompt.TurnID == "" {
+			t.Fatal("sessions/prompt turn_id = empty, want non-empty")
+		}
+
+		statusResult, err := env.call(t, "ext-integration", "sessions/status", map[string]string{
+			"workspace_id": env.workspaceID,
+			"session_id":   created.SessionID,
+		})
+		if err != nil {
+			t.Fatalf("Handle(sessions/status) error = %v", err)
+		}
+
+		var status hostAPISessionStatus
+		decodeResult(t, statusResult, &status)
+		if status.State == "" {
+			t.Fatal("sessions/status state = empty, want non-empty")
+		}
+		if status.Runtime.Effective == nil || status.Runtime.Effective.Provider != "fake-alt" {
+			t.Fatalf(
+				"sessions/status runtime = %#v effective = %#v, want effective fake-alt provider",
+				status.Runtime,
+				status.Runtime.Effective,
+			)
+		}
+
+		eventsResult, err := env.call(t, "ext-integration", "sessions/events", map[string]any{
+			"workspace_id": env.workspaceID,
+			"session_id":   created.SessionID,
+			"turn_id":      prompt.TurnID,
+			"limit":        10,
+		})
+		if err != nil {
+			t.Fatalf("Handle(sessions/events) error = %v", err)
+		}
+
+		var events []hostAPISessionEvent
+		decodeResult(t, eventsResult, &events)
+		if len(events) == 0 {
+			t.Fatal("sessions/events len = 0, want prompt events")
+		}
+	})
+}
+
+func TestHostAPIIntegrationSecondResourceSessionInvalidatesOlderNonce(t *testing.T) {
+	env := newHostAPITestEnv(t)
+	env.grantWithResources(
+		t,
+		"ext-resources",
+		[]string{"resources/snapshot"},
+		[]string{"resources.write"},
+		[]string{"tools"},
+		resources.ResourceScopeKindWorkspace,
+	)
+
+	firstNonce := "nonce-first"
+	env.activateResourceSession(t, "ext-resources", firstNonce)
+	if _, err := env.callResource(t, "ext-resources", firstNonce, "resources/snapshot", map[string]any{
+		"source_version": 1,
+		"records": []map[string]any{
+			{
+				"kind":  "tool",
+				"id":    "grep",
+				"scope": map[string]any{"kind": "workspace", "id": env.workspaceID},
+				"spec":  hostAPITestToolSpec("grep", "search workspace", "extension"),
+			},
+		},
+	}); err != nil {
+		t.Fatalf("first Handle(resources/snapshot) error = %v", err)
+	}
+
+	secondNonce := "nonce-second"
+	env.activateResourceSession(t, "ext-resources", secondNonce)
+
+	if _, err := env.callResource(t, "ext-resources", secondNonce, "resources/snapshot", map[string]any{
+		"source_version": 1,
+		"records": []map[string]any{
+			{
+				"kind":  "tool",
+				"id":    "grep",
+				"scope": map[string]any{"kind": "workspace", "id": env.workspaceID},
+				"spec":  hostAPITestToolSpec("grep", "search workspace v2", "extension"),
+			},
+		},
+	}); err != nil {
+		t.Fatalf("second Handle(resources/snapshot) error = %v", err)
+	}
+
+	_, err := env.callResource(t, "ext-resources", firstNonce, "resources/snapshot", map[string]any{
+		"source_version": 2,
+		"records": []map[string]any{
+			{
+				"kind":  "tool",
+				"id":    "grep",
+				"scope": map[string]any{"kind": "workspace", "id": env.workspaceID},
+				"spec":  hostAPITestToolSpec("grep", "stale workspace search", "extension"),
+			},
+		},
+	})
+	assertRPCErrorCode(t, err, 409)
+}
+
+func TestHostAPIIntegrationResourceSnapshotReplacesToolSetAndRemovesStaleTools(t *testing.T) {
+	env := newHostAPITestEnv(t)
+	env.grantWithResources(
+		t,
+		"ext-resources",
+		[]string{"resources/list", "resources/snapshot"},
+		[]string{"resources.read", "resources.write"},
+		[]string{"tools"},
+		resources.ResourceScopeKindWorkspace,
+	)
+
+	sessionNonce := "nonce-replace"
+	env.activateResourceSession(t, "ext-resources", sessionNonce)
+
+	if _, err := env.callResource(t, "ext-resources", sessionNonce, "resources/snapshot", map[string]any{
+		"source_version": 1,
+		"records": []map[string]any{
+			{
+				"kind":  "tool",
+				"id":    "grep",
+				"scope": map[string]any{"kind": "workspace", "id": env.workspaceID},
+				"spec":  hostAPITestToolSpec("grep", "search workspace", "extension"),
+			},
+		},
+	}); err != nil {
+		t.Fatalf("first Handle(resources/snapshot) error = %v", err)
+	}
+
+	if _, err := env.callResource(t, "ext-resources", sessionNonce, "resources/snapshot", map[string]any{
+		"source_version": 2,
+		"records": []map[string]any{
+			{
+				"kind":  "tool",
+				"id":    "lookup",
+				"scope": map[string]any{"kind": "workspace", "id": env.workspaceID},
+				"spec":  hostAPITestToolSpec("lookup", "lookup workspace", "extension"),
+			},
+		},
+	}); err != nil {
+		t.Fatalf("second Handle(resources/snapshot) error = %v", err)
+	}
+
+	listResult, err := env.callResource(t, "ext-resources", sessionNonce, "resources/list", map[string]any{
+		"kind": "tool",
+	})
+	if err != nil {
+		t.Fatalf("Handle(resources/list) error = %v", err)
+	}
+
+	var listed []hostAPIResourceRecord
+	decodeResult(t, listResult, &listed)
+	if got, want := len(listed), 1; got != want {
+		t.Fatalf("len(resources/list) = %d, want %d", got, want)
+	}
+	if got, want := listed[0].ID, "lookup"; got != want {
+		t.Fatalf("resources/list[0].ID = %q, want %q", got, want)
+	}
+}
+
+func TestHostAPIIntegrationExtensionCanCreateTaskAndEnqueueRun(t *testing.T) {
+	env := newHostAPITestEnv(t)
+	env.grant(
+		"ext-tasks",
+		[]string{"tasks/create", "tasks/get", "tasks/runs/enqueue"},
+		[]string{"task.write", "task.read"},
+	)
+
+	createResult, err := env.callFromWorkspace(t, "ext-tasks", "tasks/create", map[string]any{
+		"scope":     taskpkg.ScopeWorkspace,
+		"workspace": env.workspaceID,
+		"title":     "Extension-created task",
+	})
+	if err != nil {
+		t.Fatalf("Handle(tasks/create) error = %v", err)
+	}
+
+	var created apicontract.TaskPayload
+	decodeResult(t, createResult, &created)
+	if created.ID == "" {
+		t.Fatal("tasks/create id = empty, want non-empty")
+	}
+
+	enqueueResult, err := env.callFromWorkspace(t, "ext-tasks", "tasks/runs/enqueue", map[string]any{
+		"task_id":         created.ID,
+		"idempotency_key": "enqueue-int",
+	})
+	if err != nil {
+		t.Fatalf("Handle(tasks/runs/enqueue) error = %v", err)
+	}
+
+	var run apicontract.TaskRunPayload
+	decodeResult(t, enqueueResult, &run)
+	if run.ID == "" {
+		t.Fatal("tasks/runs/enqueue id = empty, want non-empty")
+	}
+	if got, want := run.Status, taskpkg.TaskRunStatusQueued; got != want {
+		t.Fatalf("tasks/runs/enqueue status = %q, want %q", got, want)
+	}
+
+	storedTask, err := env.registry.GetTask(testutil.Context(t), created.ID)
+	if err != nil {
+		t.Fatalf("registry.GetTask(%q) error = %v", created.ID, err)
+	}
+	if got, want := storedTask.CreatedBy.Kind, taskpkg.ActorKindExtension; got != want {
+		t.Fatalf("storedTask.CreatedBy.Kind = %q, want %q", got, want)
+	}
+	if got, want := storedTask.CreatedBy.Ref, "ext-tasks"; got != want {
+		t.Fatalf("storedTask.CreatedBy.Ref = %q, want %q", got, want)
+	}
+
+	storedRun, err := env.registry.GetTaskRun(testutil.Context(t), run.ID)
+	if err != nil {
+		t.Fatalf("registry.GetTaskRun(%q) error = %v", run.ID, err)
+	}
+	if got, want := storedRun.Origin.Kind, taskpkg.OriginKindExtension; got != want {
+		t.Fatalf("storedRun.Origin.Kind = %q, want %q", got, want)
+	}
+	if got, want := storedRun.Origin.Ref, "ext-tasks"; got != want {
+		t.Fatalf("storedRun.Origin.Ref = %q, want %q", got, want)
+	}
+
+	getResult, err := env.callFromWorkspace(t, "ext-tasks", "tasks/get", map[string]any{"id": created.ID})
+	if err != nil {
+		t.Fatalf("Handle(tasks/get) error = %v", err)
+	}
+
+	var detail apicontract.TaskDetailPayload
+	decodeResult(t, getResult, &detail)
+	if got, want := len(detail.Runs), 1; got != want {
+		t.Fatalf("len(tasks/get.runs) = %d, want %d", got, want)
+	}
+	if got, want := detail.Runs[0].ID, run.ID; got != want {
+		t.Fatalf("tasks/get.runs[0].ID = %q, want %q", got, want)
+	}
+}
+
+func TestHostAPIIntegrationStartRunAllocatesDedicatedSession(t *testing.T) {
+	env := newHostAPITestEnv(t)
+	env.grant(
+		"ext-tasks",
+		[]string{"tasks/create", "tasks/runs/enqueue", "tasks/runs/start"},
+		[]string{"task.write"},
+	)
+
+	createResult, err := env.callFromWorkspace(t, "ext-tasks", "tasks/create", map[string]any{
+		"scope":     taskpkg.ScopeWorkspace,
+		"workspace": env.workspaceID,
+		"title":     "Executable extension task",
+	})
+	if err != nil {
+		t.Fatalf("Handle(tasks/create) error = %v", err)
+	}
+
+	var created apicontract.TaskPayload
+	decodeResult(t, createResult, &created)
+
+	enqueueResult, err := env.callFromWorkspace(t, "ext-tasks", "tasks/runs/enqueue", map[string]any{
+		"task_id":         created.ID,
+		"idempotency_key": "enqueue-start-int",
+	})
+	if err != nil {
+		t.Fatalf("Handle(tasks/runs/enqueue) error = %v", err)
+	}
+
+	var queued apicontract.TaskRunPayload
+	decodeResult(t, enqueueResult, &queued)
+
+	startResult, err := env.callFromWorkspace(t, "ext-tasks", "tasks/runs/start", map[string]any{
+		"id":              queued.ID,
+		"idempotency_key": "start-start-int",
+	})
+	if err != nil {
+		t.Fatalf("Handle(tasks/runs/start) error = %v", err)
+	}
+
+	var started apicontract.TaskRunPayload
+	decodeResult(t, startResult, &started)
+	if got, want := started.Status, taskpkg.TaskRunStatusRunning; got != want {
+		t.Fatalf("tasks/runs/start status = %q, want %q", got, want)
+	}
+	if started.SessionID == "" {
+		t.Fatal("tasks/runs/start session_id = empty, want non-empty")
+	}
+
+	info, err := env.sessions.Status(testutil.Context(t), started.SessionID)
+	if err != nil {
+		t.Fatalf("sessions.Status(%q) error = %v", started.SessionID, err)
+	}
+	if got, want := info.WorkspaceID, env.workspaceID; got != want {
+		t.Fatalf("session.WorkspaceID = %q, want %q", got, want)
+	}
+	if got, want := info.Type, session.SessionTypeSystem; got != want {
+		t.Fatalf("session.Type = %q, want %q", got, want)
+	}
+	if got, want := info.State, session.StateActive; got != want {
+		t.Fatalf("session.State = %q, want %q", got, want)
+	}
+}
+
+func TestHostAPIIntegrationTaskReadAndAggregateSurfaces(t *testing.T) {
+	env := newHostAPITestEnv(t)
+	env.grant(
+		"ext-reader",
+		[]string{
+			"tasks",
+			"tasks/get",
+			"tasks/runs/get",
+			"tasks/timeline",
+			"tasks/tree",
+			"tasks/dashboard",
+			"tasks/inbox",
+		},
+		[]string{"task.read"},
+	)
+
+	actor := mustExtensionTaskActorContext(t, "seed-writer", env.workspaceID)
+	root, err := env.tasks.CreateTask(testutil.Context(t), taskpkg.CreateTask{
+		ProfileID:   storepkg.DefaultProfileID,
+		Scope:       taskpkg.ScopeWorkspace,
+		WorkspaceID: env.workspaceID,
+		Title:       "Integration root",
+	}, actor)
+	if err != nil {
+		t.Fatalf("tasks.CreateTask(root) error = %v", err)
+	}
+
+	child, err := env.tasks.CreateChildTask(testutil.Context(t), root.ID, taskpkg.CreateTask{
+		ProfileID:   storepkg.DefaultProfileID,
+		Scope:       taskpkg.ScopeWorkspace,
+		WorkspaceID: env.workspaceID,
+		Title:       "Integration child",
+		Owner: &taskpkg.Ownership{
+			Kind: taskpkg.OwnerKindExtension,
+			Ref:  "ext-reader",
+		},
+	}, actor)
+	if err != nil {
+		t.Fatalf("tasks.CreateChildTask(child) error = %v", err)
+	}
+
+	approvalTask, err := env.tasks.CreateTask(testutil.Context(t), taskpkg.CreateTask{
+		ProfileID:      storepkg.DefaultProfileID,
+		Scope:          taskpkg.ScopeWorkspace,
+		WorkspaceID:    env.workspaceID,
+		Title:          "Integration approval",
+		ApprovalPolicy: taskpkg.ApprovalPolicyManual,
+		Owner: &taskpkg.Ownership{
+			Kind: taskpkg.OwnerKindExtension,
+			Ref:  "ext-reader",
+		},
+	}, actor)
+	if err != nil {
+		t.Fatalf("tasks.CreateTask(approval) error = %v", err)
+	}
+
+	queued, err := env.tasks.EnqueueRun(testutil.Context(t), taskpkg.EnqueueRun{
+		TaskID:         child.ID,
+		IdempotencyKey: "integration-read-run",
+	}, actor)
+	if err != nil {
+		t.Fatalf("tasks.EnqueueRun() error = %v", err)
+	}
+	started, err := env.tasks.StartRun(testutil.Context(t), queued.ID, taskpkg.StartRun{
+		IdempotencyKey: "integration-read-start",
+	}, actor)
+	if err != nil {
+		t.Fatalf("tasks.StartRun() error = %v", err)
+	}
+
+	loopCoordinator, loopCell := seedHostAPIQuarantinedLoopCell(t, env, "ext-reader")
+
+	getResult, err := env.callFromWorkspace(t, "ext-reader", "tasks/get", map[string]any{"id": child.ID})
+	if err != nil {
+		t.Fatalf("Handle(tasks/get) error = %v", err)
+	}
+	var detail apicontract.TaskDetailPayload
+	decodeResult(t, getResult, &detail)
+	if got, want := detail.Task.ID, child.ID; got != want {
+		t.Fatalf("tasks/get.task.id = %q, want %q", got, want)
+	}
+
+	runDetailResult, err := env.callFromWorkspace(
+		t,
+		"ext-reader",
+		"tasks/runs/get",
+		map[string]any{"id": started.ID},
+	)
+	if err != nil {
+		t.Fatalf("Handle(tasks/runs/get) error = %v", err)
+	}
+	var runDetail apicontract.TaskRunDetailPayload
+	decodeResult(t, runDetailResult, &runDetail)
+	if got, want := runDetail.Run.ID, started.ID; got != want {
+		t.Fatalf("tasks/runs/get.run.id = %q, want %q", got, want)
+	}
+	if runDetail.Session == nil || runDetail.Session.SessionID == "" {
+		t.Fatal("tasks/runs/get.session = nil/empty, want session link")
+	}
+
+	timelineResult, err := env.callFromWorkspace(
+		t,
+		"ext-reader",
+		"tasks/timeline",
+		map[string]any{"id": child.ID, "limit": 10},
+	)
+	if err != nil {
+		t.Fatalf("Handle(tasks/timeline) error = %v", err)
+	}
+	var timeline []apicontract.TaskTimelineItemPayload
+	decodeResult(t, timelineResult, &timeline)
+	if len(timeline) == 0 {
+		t.Fatal("tasks/timeline len = 0, want events")
+	}
+
+	treeResult, err := env.callFromWorkspace(t, "ext-reader", "tasks/tree", map[string]any{"id": root.ID})
+	if err != nil {
+		t.Fatalf("Handle(tasks/tree) error = %v", err)
+	}
+	var tree apicontract.TaskTreePayload
+	decodeResult(t, treeResult, &tree)
+	if got, want := tree.Root.Task.ID, root.ID; got != want {
+		t.Fatalf("tasks/tree.root.task.id = %q, want %q", got, want)
+	}
+
+	dashboardResult, err := env.callFromWorkspace(t, "ext-reader", "tasks/dashboard", map[string]any{
+		"scope":     taskpkg.ScopeWorkspace,
+		"workspace": env.workspaceID,
+	})
+	if err != nil {
+		t.Fatalf("Handle(tasks/dashboard) error = %v", err)
+	}
+	var dashboard apicontract.TaskDashboardPayload
+	decodeResult(t, dashboardResult, &dashboard)
+	if dashboard.Totals.ActiveRuns < 1 {
+		t.Fatalf("tasks/dashboard active_runs = %d, want >= 1", dashboard.Totals.ActiveRuns)
+	}
+	if got, want := dashboard.Totals.TasksTotal, 3; got != want {
+		t.Fatalf("tasks/dashboard tasks_total = %d, want calm-default %d", got, want)
+	}
+
+	dashboardWorkspaceOnlyResult, err := env.callFromWorkspace(t, "ext-reader", "tasks/dashboard", map[string]any{
+		"workspace": env.workspaceID,
+	})
+	if err != nil {
+		t.Fatalf("Handle(tasks/dashboard workspace-only) error = %v", err)
+	}
+	var dashboardWorkspaceOnly apicontract.TaskDashboardPayload
+	decodeResult(t, dashboardWorkspaceOnlyResult, &dashboardWorkspaceOnly)
+	if dashboardWorkspaceOnly.Totals.TasksTotal < 1 {
+		t.Fatalf("tasks/dashboard workspace-only tasks_total = %d, want >= 1", dashboardWorkspaceOnly.Totals.TasksTotal)
+	}
+
+	inboxResult, err := env.callFromWorkspace(t, "ext-reader", "tasks/inbox", map[string]any{
+		"scope":     taskpkg.ScopeWorkspace,
+		"workspace": env.workspaceID,
+		"lane":      apicontract.TaskInboxLaneApprovals,
+		"limit":     10,
+	})
+	if err != nil {
+		t.Fatalf("Handle(tasks/inbox) error = %v", err)
+	}
+	var inbox apicontract.TaskInboxPayload
+	decodeResult(t, inboxResult, &inbox)
+	if inbox.Page.Total < 1 || len(inbox.Groups) == 0 {
+		t.Fatalf("tasks/inbox = %#v, want approval item", inbox)
+	}
+	if !taskInboxContainsTask(inbox.Groups, approvalTask.ID) {
+		t.Fatalf("tasks/inbox groups = %#v, want task %q", inbox.Groups, approvalTask.ID)
+	}
+	if taskInboxContainsTask(inbox.Groups, loopCell.ID) {
+		t.Fatalf("tasks/inbox groups = %#v, want Loop cell %q excluded", inbox.Groups, loopCell.ID)
+	}
+
+	overview, err := env.observer.QueryObserveOverview(testutil.Context(t), observepkg.OverviewQuery{
+		ReadScope:   storepkg.ReadScope{ProfileID: storepkg.DefaultProfileID},
+		TaskScope:   taskpkg.CatalogScopeWorkspace,
+		WorkspaceID: env.workspaceID,
+		Actor:       taskpkg.ActorIdentity{Kind: taskpkg.ActorKindExtension, Ref: "ext-reader"},
+	})
+	if err != nil {
+		t.Fatalf("observer.QueryObserveOverview() error = %v", err)
+	}
+	if !overviewAttentionContainsTask(overview.Attention.Items, loopCell.ID) {
+		t.Fatalf("observe overview attention = %#v, want Loop cell %q", overview.Attention.Items, loopCell.ID)
+	}
+
+	inboxWorkspaceOnlyResult, err := env.callFromWorkspace(t, "ext-reader", "tasks/inbox", map[string]any{
+		"workspace": env.workspaceID,
+		"lane":      apicontract.TaskInboxLaneApprovals,
+		"limit":     10,
+	})
+	if err != nil {
+		t.Fatalf("Handle(tasks/inbox workspace-only) error = %v", err)
+	}
+	var inboxWorkspaceOnly apicontract.TaskInboxPayload
+	decodeResult(t, inboxWorkspaceOnlyResult, &inboxWorkspaceOnly)
+	if !taskInboxContainsTask(inboxWorkspaceOnly.Groups, approvalTask.ID) {
+		t.Fatalf("tasks/inbox workspace-only groups = %#v, want task %q", inboxWorkspaceOnly.Groups, approvalTask.ID)
+	}
+
+	if _, err := env.tasks.CreateTask(testutil.Context(t), taskpkg.CreateTask{
+		ProfileID:   storepkg.DefaultProfileID,
+		Scope:       taskpkg.ScopeWorkspace,
+		WorkspaceID: env.workspaceID,
+		Title:       "Newest hidden draft",
+		Draft:       true,
+	}, actor); err != nil {
+		t.Fatalf("tasks.CreateTask(draft) error = %v", err)
+	}
+
+	listResult, err := env.callFromWorkspace(t, "ext-reader", "tasks", map[string]any{
+		"workspace": env.workspaceID,
+		"limit":     1,
+	})
+	if err != nil {
+		t.Fatalf("Handle(tasks) error = %v", err)
+	}
+	var listedPage apicontract.TasksResponse
+	decodeResult(t, listResult, &listedPage)
+	listed := listedPage.Tasks
+	if got, want := len(listed), 1; got != want {
+		t.Fatalf("len(tasks workspace-only) = %d, want %d", got, want)
+	}
+	if got, want := listedPage.Page.Total, 3; got != want {
+		t.Fatalf("tasks workspace-only page.total = %d, want %d", got, want)
+	}
+	if got, want := listedPage.Page.Limit, 1; got != want {
+		t.Fatalf("tasks workspace-only page.limit = %d, want %d", got, want)
+	}
+	if !listedPage.Page.HasMore || listedPage.Page.NextCursor == "" {
+		t.Fatalf("tasks workspace-only page = %#v, want bounded continuation", listedPage.Page)
+	}
+	if listed[0].Draft {
+		t.Fatalf("tasks workspace-only[0] = %#v, want non-draft item", listed[0])
+	}
+
+	includeResult, err := env.callFromWorkspace(t, "ext-reader", "tasks", map[string]any{
+		"workspace":    env.workspaceID,
+		"include_loop": true,
+		"limit":        20,
+	})
+	if err != nil {
+		t.Fatalf("Handle(tasks include_loop) error = %v", err)
+	}
+	var included apicontract.TasksResponse
+	decodeResult(t, includeResult, &included)
+	assertHostAPILoopCatalogItems(t, included.Tasks, loopCoordinator.ID, loopCell.ID)
+	for _, taskID := range []string{loopCoordinator.ID, loopCell.ID} {
+		detailResult, detailErr := env.callFromWorkspace(
+			t, "ext-reader", "tasks/get", map[string]any{"id": taskID},
+		)
+		if detailErr != nil {
+			t.Fatalf("Handle(tasks/get %q) error = %v", taskID, detailErr)
+		}
+		var loopDetail apicontract.TaskDetailPayload
+		decodeResult(t, detailResult, &loopDetail)
+		catalogLoop := hostAPILoopProvenanceForTask(t, included.Tasks, taskID)
+		if !reflect.DeepEqual(loopDetail.Task.Loop, catalogLoop) {
+			t.Fatalf("tasks/get %q Loop = %#v, want catalog parity %#v", taskID, loopDetail.Task.Loop, catalogLoop)
+		}
+	}
+
+	runResult, err := env.callFromWorkspace(t, "ext-reader", "tasks", map[string]any{
+		"workspace":   env.workspaceID,
+		"loop_run_id": "looprun-host-read",
+		"limit":       20,
+	})
+	if err != nil {
+		t.Fatalf("Handle(tasks loop_run_id) error = %v", err)
+	}
+	var runScoped apicontract.TasksResponse
+	decodeResult(t, runResult, &runScoped)
+	assertHostAPILoopCatalogItems(t, runScoped.Tasks, loopCoordinator.ID, loopCell.ID)
+
+	parentResult, err := env.callFromWorkspace(t, "ext-reader", "tasks", map[string]any{
+		"workspace":      env.workspaceID,
+		"parent_task_id": loopCoordinator.ID,
+		"limit":          20,
+	})
+	if err != nil {
+		t.Fatalf("Handle(tasks parent_task_id) error = %v", err)
+	}
+	var parentScoped apicontract.TasksResponse
+	decodeResult(t, parentResult, &parentScoped)
+	if len(parentScoped.Tasks) != 1 || parentScoped.Tasks[0].ID != loopCell.ID {
+		t.Fatalf("tasks parent drill-down = %#v, want Loop cell %q", parentScoped.Tasks, loopCell.ID)
+	}
+}
+
+func seedHostAPIQuarantinedLoopCell(
+	t *testing.T,
+	env *hostAPITestEnv,
+	ownerRef string,
+) (taskpkg.Task, taskpkg.Task) {
+	t.Helper()
+	ctx := testutil.Context(t)
+	now := env.currentTime()
+	definition, err := dsl.Parse([]byte(
+		`{"apiVersion":"compozy.loop/v1","kind":"Loop","meta":{"name":"host-read","version":1},` +
+			`"contract":{"goal":"test","definition_of_done":"done","iteration_cap":3,` +
+			`"no_progress":{"window":1},"budget":{"tokens":10,"wall_clock_sec":60}},` +
+			`"graph":{"nodes":[{"id":"review","class":"action","kind":"transform",` +
+			`"params":{"map":{"ok":{"value":true}}}}],"edges":[]}}`,
+	))
+	if err != nil {
+		t.Fatalf("dsl.Parse(host quarantine Loop) error = %v", err)
+	}
+	resolved, err := looppkg.NewCompiler().Compile(definition)
+	if err != nil {
+		t.Fatalf("loop.Compile(host quarantine Loop) error = %v", err)
+	}
+	effective, err := looppkg.ResolveEffectiveConfig(
+		resolved,
+		looppkg.DefaultLoopDefaults(),
+		nil,
+		looppkg.LoopConfig{},
+	)
+	if err != nil {
+		t.Fatalf("ResolveEffectiveConfig(host quarantine Loop) error = %v", err)
+	}
+	snapshot, digest, err := looppkg.BuildExecutedDefinitionSnapshot(resolved, effective)
+	if err != nil {
+		t.Fatalf("BuildExecutedDefinitionSnapshot(host quarantine Loop) error = %v", err)
+	}
+	run, err := env.registry.CreateLoopRunForStart(ctx, looppkg.Run{
+		ID:                 "looprun-host-read",
+		ProfileID:          storepkg.DefaultProfileID,
+		WorkspaceID:        looppkg.WorkspaceID(env.workspaceID),
+		LoopName:           "host read",
+		Status:             looppkg.StatusRunning,
+		ReattemptStrategy:  looppkg.ReattemptFailedOnly,
+		CreatedAt:          now,
+		StartedAt:          now,
+		LastProgressAt:     now,
+		DefinitionVersion:  resolved.DefinitionVersion,
+		DefinitionDigest:   digest,
+		DefinitionSnapshot: snapshot,
+		StartMetadata:      map[string]any{},
+		IterationCap:       3,
+		BudgetTokens:       10,
+		BudgetWallSec:      60,
+		BudgetOnExceeded:   dsl.BudgetExceededHalt,
+		Origin:             &looppkg.RunOrigin{Kind: looppkg.RunOriginCatalog},
+		Inputs:             map[string]any{"task": "host-read"},
+	}, dsl.ConcurrencyAllow)
+	if err != nil {
+		t.Fatalf("CreateLoopRunForStart(host quarantine Loop) error = %v", err)
+	}
+	loopActor, err := taskpkg.DeriveDaemonActorContext("loop-coordinator", "loop-coordinator")
+	if err != nil {
+		t.Fatalf("DeriveDaemonActorContext(loop-coordinator) error = %v", err)
+	}
+	claim, err := env.tasks.ClaimNextRun(ctx, taskpkg.ClaimCriteria{
+		Scope: taskpkg.ScopeWorkspace, WorkspaceID: env.workspaceID,
+		RunKind: taskpkg.RunKindCoordinator, ClaimerSessionID: "host-loop-quarantine",
+		ClaimedBy: &loopActor.Actor, LeaseDuration: time.Minute, Now: now.Add(time.Millisecond),
+	}, loopActor)
+	if err != nil {
+		t.Fatalf("ClaimNextRun(host quarantine coordinator) error = %v", err)
+	}
+	cellID := looppkg.NodeCellTaskID(run.ID, 2, "review", 0)
+	cellMetadata := json.RawMessage(
+		`{"loop_run_id":"looprun-host-read","loop_name":"host read",` +
+			`"generation":2,"node_id":"review","item_index":0}`,
+	)
+	quarantineEntry, err := json.Marshal(looppkg.QuarantineEntry{
+		NodeID: "review", InputRef: "loop-run:looprun-host-read:node:review:input",
+		Episodes: []looppkg.QuarantineEpisode{{
+			Generation: 2, QuarantinedAt: now,
+			Attempts: []looppkg.NodeAttempt{{
+				LoopRunID: run.ID, Generation: 2, NodeID: "review", Attempt: 1,
+				Disposition: looppkg.AttemptQuarantined, StartedAt: now,
+			}},
+		}},
+	})
+	if err != nil {
+		t.Fatalf("json.Marshal(host quarantine entry) error = %v", err)
+	}
+	if _, err := env.registry.CompleteCoordinatorAndEnqueueNext(
+		ctx,
+		taskpkg.CoordinatorCompletion{
+			RunID: claim.Run.ID, ClaimToken: claim.ClaimToken, Actor: loopActor, Now: now.Add(time.Second),
+			Plan: taskpkg.CoordinatorCompletionPlan{
+				NodeTasks: []taskpkg.CoordinatorTaskSpec{{
+					TaskID: cellID, Title: "Loop cell", Metadata: cellMetadata,
+				}},
+				NodeRuns: []taskpkg.EnqueueSpec{{
+					TaskID: cellID, RunKind: taskpkg.RunKindWorker, LoopRunID: string(run.ID),
+					IdempotencyKey: "host-loop-cell", Metadata: cellMetadata,
+				}},
+				Snapshot: taskpkg.GenerationSnapshot{
+					LoopRunID: string(run.ID), Generation: 2,
+					Payload: looppkg.GenerationSnapshotPayload{
+						GenerationProvenance: &looppkg.GenerationIntent{
+							Generation: 2, ParentGeneration: 1, Origin: looppkg.OriginReattempt,
+						},
+						Outputs: []looppkg.GenerationOutput{{
+							Generation: 2, NodeID: "review", Status: "quarantined", Attempt: 1,
+						}},
+						Controls: []looppkg.NodeControlMutation{{
+							Kind: looppkg.NodeControlMutationQuarantine, NodeID: "review",
+							QuarantineEntry: quarantineEntry, At: now.Add(time.Second),
+						}},
+					},
+				},
+			},
+		},
+		looppkg.NewStoreFinalizer(),
+	); err != nil {
+		t.Fatalf("CompleteCoordinatorAndEnqueueNext(host quarantine) error = %v", err)
+	}
+	coordinator, err := env.registry.GetTask(ctx, fmt.Sprintf("loop.%s.coordinator", run.ID))
+	if err != nil {
+		t.Fatalf("GetTask(host Loop coordinator) error = %v", err)
+	}
+	cell, err := env.registry.GetTask(ctx, cellID)
+	if err != nil {
+		t.Fatalf("GetTask(host quarantined cell) error = %v", err)
+	}
+	if cell.Status != taskpkg.TaskStatusNeedsAttention || cell.NeedsAttention == nil {
+		t.Fatalf("host quarantined cell = %#v, want production needs-attention park", cell)
+	}
+	cell.Owner = &taskpkg.Ownership{Kind: taskpkg.OwnerKindExtension, Ref: ownerRef}
+	if err := env.registry.UpdateTask(ctx, cell, loopActor); err != nil {
+		t.Fatalf("UpdateTask(host quarantined cell owner) error = %v", err)
+	}
+	return coordinator, cell
+}
+
+func hostAPILoopProvenanceForTask(
+	t testing.TB,
+	items []apicontract.TaskCatalogItemPayload,
+	taskID string,
+) *apicontract.LoopProvenance {
+	t.Helper()
+
+	for _, item := range items {
+		if item.ID == taskID {
+			return item.Loop
+		}
+	}
+	t.Fatalf("tasks Loop items = %#v, missing %q", items, taskID)
+	return nil
+}
+
+func assertHostAPILoopCatalogItems(
+	t testing.TB,
+	items []apicontract.TaskCatalogItemPayload,
+	coordinatorID string,
+	cellID string,
+) {
+	t.Helper()
+
+	wantRoles := map[string]apicontract.LoopProvenanceRole{
+		coordinatorID: apicontract.LoopProvenanceRoleCoordinator,
+		cellID:        apicontract.LoopProvenanceRoleCell,
+	}
+	seen := make(map[string]bool, len(wantRoles))
+	for _, item := range items {
+		wantRole, ok := wantRoles[item.ID]
+		if !ok {
+			continue
+		}
+		if item.Loop == nil || item.Loop.RunID != "looprun-host-read" || item.Loop.Role != wantRole {
+			t.Fatalf("tasks Loop item %q provenance = %#v, want run and role %q", item.ID, item.Loop, wantRole)
+		}
+		seen[item.ID] = true
+	}
+	for id := range wantRoles {
+		if !seen[id] {
+			t.Fatalf("tasks Loop items = %#v, missing %q", items, id)
+		}
+	}
+}
+
+func overviewAttentionContainsTask(items []observepkg.OverviewAttentionItem, taskID string) bool {
+	for _, item := range items {
+		if item.TaskID == taskID {
+			return true
+		}
+	}
+	return false
+}
+
+func taskInboxContainsTask(groups []apicontract.TaskInboxLaneGroupPayload, taskID string) bool {
+	for _, group := range groups {
+		for _, item := range group.Items {
+			if item.Task.ID == taskID {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+func decodeIntegrationResult(result any, target any) error {
+	encoded, err := json.Marshal(result)
+	if err != nil {
+		return fmt.Errorf("json.Marshal(result): %w", err)
+	}
+	if err := json.Unmarshal(encoded, target); err != nil {
+		return fmt.Errorf("json.Unmarshal(result): %w", err)
+	}
+	return nil
+}
+
+func TestHostAPIIntegrationUnauthorizedExtensionIsDeniedForEveryMethod(t *testing.T) {
+	env := newHostAPITestEnv(t)
+	env.grant("ext-denied", nil, nil)
+
+	session := env.createSession(t)
+	tests := []struct {
+		method string
+		params any
+	}{
+		{method: "sessions/list", params: map[string]any{"workspace": env.workspaceID}},
+		{method: "sessions/create", params: map[string]any{"agent": "coder", "workspace": env.workspaceID}},
+		{
+			method: "sessions/prompt",
+			params: map[string]any{"workspace_id": env.workspaceID, "session_id": session.ID, "message": "hello"},
+		},
+		{method: "sessions/stop", params: map[string]any{"workspace_id": env.workspaceID, "session_id": session.ID}},
+		{method: "sessions/status", params: map[string]any{"workspace_id": env.workspaceID, "session_id": session.ID}},
+		{
+			method: "sessions/events",
+			params: map[string]any{"workspace_id": env.workspaceID, "session_id": session.ID, "limit": 1},
+		},
+		{method: "observe/health", params: nil},
+		{method: "logs/list", params: map[string]any{"session_id": session.ID, "limit": 1}},
+		{method: "skills/list", params: map[string]any{"workspace": env.workspaceID}},
+		{method: "automation/jobs", params: map[string]any{"scope": "workspace", "workspace_id": env.workspaceID}},
+		{method: "automation/jobs/create", params: map[string]any{
+			"name":         "integration-job",
+			"scope":        "workspace",
+			"workspace_id": env.workspaceID,
+			"agent_name":   "coder",
+			"prompt":       "run integration job",
+			"schedule": map[string]any{
+				"mode":     "every",
+				"interval": "5m",
+			},
+		}},
+		{method: "automation/triggers/fire", params: map[string]any{
+			"event":        "ext.github.push",
+			"scope":        "workspace",
+			"workspace_id": env.workspaceID,
+		}},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.method, func(t *testing.T) {
+			_, err := env.call(t, "ext-denied", tt.method, tt.params)
+			assertCapabilityDenied(t, err, tt.method)
+		})
+	}
+}
+
+func TestHostAPIIntegrationAutomationTriggerFireDispatchesThroughTriggerEngine(t *testing.T) {
+	env := newHostAPITestEnv(t)
+	env.grant(
+		"ext-automation",
+		[]string{"automation/triggers/create", "automation/triggers/fire"},
+		[]string{"automation.write"},
+	)
+
+	createResult, err := env.call(t, "ext-automation", "automation/triggers/create", map[string]any{
+		"name":         "review-push",
+		"scope":        "workspace",
+		"workspace_id": env.workspaceID,
+		"agent_name":   "coder",
+		"event":        "ext.github.push",
+		"prompt":       `Review push to {{ index .Data "repo" }} by {{ index .Data "author" }}`,
+	})
+	if err != nil {
+		t.Fatalf("Handle(automation/triggers/create) error = %v", err)
+	}
+
+	var trigger automationpkg.Trigger
+	decodeResult(t, createResult, &trigger)
+	if trigger.ID == "" {
+		t.Fatal("automation/triggers/create id = empty, want non-empty")
+	}
+
+	fireResult, err := env.call(t, "ext-automation", "automation/triggers/fire", map[string]any{
+		"event":        "ext.github.push",
+		"scope":        "workspace",
+		"workspace_id": env.workspaceID,
+		"payload": map[string]any{
+			"repo":   "acme/api",
+			"author": "dev@acme.com",
+		},
+	})
+	if err != nil {
+		t.Fatalf("Handle(automation/triggers/fire) error = %v", err)
+	}
+
+	var result automationpkg.TriggerResult
+	decodeResult(t, fireResult, &result)
+	if result.Matched != 1 {
+		t.Fatalf("automation/triggers/fire matched = %d, want 1", result.Matched)
+	}
+	if len(result.Runs) != 1 {
+		t.Fatalf("automation/triggers/fire runs = %d, want 1", len(result.Runs))
+	}
+
+	prompts := env.driver.promptCalls()
+	if len(prompts) == 0 {
+		t.Fatal("driver prompt calls = 0, want trigger dispatch prompt")
+	}
+	if got, want := prompts[len(prompts)-1].Message, "Review push to acme/api by dev@acme.com"; got != want {
+		t.Fatalf("last prompt message = %q, want %q", got, want)
+	}
+}
+
+func TestHostAPIIntegrationAutomationPreFireHookMutatesPrompt(t *testing.T) {
+	hooks := hookspkg.NewHooks(
+		hookspkg.WithNativeDeclarations([]hookspkg.HookDecl{{
+			Name:         "mutate-automation-prompt",
+			Event:        hookspkg.HookAutomationJobPreFire,
+			Mode:         hookspkg.HookModeSync,
+			ExecutorKind: hookspkg.HookExecutorNative,
+		}}),
+		hookspkg.WithExecutorResolver(func(decl hookspkg.HookDecl) (hookspkg.Executor, error) {
+			return hookspkg.NewTypedNativeExecutor(
+				func(_ context.Context, _ hookspkg.RegisteredHook, payload hookspkg.AutomationJobPreFirePayload) (hookspkg.AutomationFirePatch, error) {
+					return hookspkg.AutomationFirePatch{Prompt: new(payload.Prompt + " with hook mutation")}, nil
+				},
+			), nil
+		}),
+	)
+	if err := hooks.Rebuild(t.Context()); err != nil {
+		t.Fatalf("hooks.Rebuild() error = %v", err)
+	}
+	t.Cleanup(hooks.Close)
+
+	env := newHostAPITestEnv(t, withHostAPIHooks(hooks))
+	env.grant(
+		"ext-automation",
+		[]string{"automation/jobs/create", "automation/jobs/trigger"},
+		[]string{"automation.write"},
+	)
+
+	createResult, err := env.call(t, "ext-automation", "automation/jobs/create", map[string]any{
+		"name":         "hooked-job",
+		"scope":        "workspace",
+		"workspace_id": env.workspaceID,
+		"agent_name":   "coder",
+		"prompt":       "Original prompt",
+		"schedule": map[string]any{
+			"mode":     "every",
+			"interval": "5m",
+		},
+	})
+	if err != nil {
+		t.Fatalf("Handle(automation/jobs/create) error = %v", err)
+	}
+
+	var created automationpkg.Job
+	decodeResult(t, createResult, &created)
+
+	if _, err := env.call(
+		t,
+		"ext-automation",
+		"automation/jobs/trigger",
+		map[string]any{"id": created.ID},
+	); err != nil {
+		t.Fatalf("Handle(automation/jobs/trigger) error = %v", err)
+	}
+
+	prompts := env.driver.promptCalls()
+	if len(prompts) == 0 {
+		t.Fatal("driver prompt calls = 0, want job dispatch prompt")
+	}
+	if got, want := prompts[len(prompts)-1].Message, "Original prompt with hook mutation"; got != want {
+		t.Fatalf("last prompt message = %q, want %q", got, want)
+	}
+}

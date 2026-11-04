@@ -1,0 +1,224 @@
+import {
+  BellOff,
+  Clock3,
+  KeyRound,
+  ListChecks,
+  MessageCircleQuestionMark,
+  TriangleAlert,
+  type LucideIcon,
+} from "@compozy/ui/icons";
+
+import type { ReactNode } from "react";
+
+import { Icon, Skeleton, SkeletonText, Time } from "@compozy/ui";
+
+import { cn } from "@/lib/utils";
+import { AgentMark } from "@/systems/agent/components/agent-mark";
+import { useAgentIdentityView } from "@/systems/agent/hooks/use-agent-identity-view";
+import { SessionBadgeGlyph } from "@/systems/session";
+
+import { LOOP_STORY_ICONS } from "@/systems/loops";
+
+import type { OsAttentionRow } from "../lib/attention-model";
+
+interface AgentReasonProps {
+  agentName: string;
+  reason: string;
+  workspaceId?: string;
+}
+
+function loopIcon(state: "waiting" | "attention"): LucideIcon {
+  return state === "waiting" ? LOOP_STORY_ICONS.waiting : LOOP_STORY_ICONS.attention;
+}
+
+const NEEDS_YOU_TONE = "bg-brand-tint text-brand";
+
+function NonSessionMark({ icon, tone }: { icon: LucideIcon; tone: string }) {
+  return (
+    <span
+      aria-hidden="true"
+      className={cn("grid size-4.5 shrink-0 place-items-center rounded-full", tone)}
+    >
+      <Icon as={icon} size="xs" />
+    </span>
+  );
+}
+
+function RowMark({ row }: { row: OsAttentionRow }) {
+  switch (row.kind) {
+    case "session":
+      return <SessionBadgeGlyph badge={row.badge} />;
+    // One "needs you" tone; the glyph carries the type. Warning stays for
+    // states that actually went wrong, never for an ordinary request.
+    case "task":
+      return <NonSessionMark icon={ListChecks} tone={NEEDS_YOU_TONE} />;
+    case "loop-request":
+      return <NonSessionMark icon={TriangleAlert} tone={NEEDS_YOU_TONE} />;
+    case "terminal-input":
+      return (
+        <NonSessionMark
+          icon={row.redacted ? KeyRound : MessageCircleQuestionMark}
+          tone={NEEDS_YOU_TONE}
+        />
+      );
+    case "loop-node":
+      return (
+        <NonSessionMark
+          icon={loopIcon(row.state)}
+          tone={row.state === "waiting" ? NEEDS_YOU_TONE : "bg-warning-tint text-warning"}
+        />
+      );
+  }
+}
+
+/** The agent leads the reason, with its face; the row's mark keeps saying what's wrong. */
+function AgentReason({ agentName, reason, workspaceId }: AgentReasonProps) {
+  const { appearance, label } = useAgentIdentityView(agentName, { workspace: workspaceId });
+  return (
+    <>
+      {agentName ? (
+        <AgentMark
+          aria-hidden="true"
+          appearance={appearance}
+          className="mr-1 align-[-2px]"
+          label={label}
+          quietIdle
+          size={14}
+          state="unknown"
+        />
+      ) : null}
+      {label ? `${label} — ${reason}` : reason}
+    </>
+  );
+}
+
+function rowReason(row: OsAttentionRow): ReactNode {
+  switch (row.kind) {
+    case "session":
+      return (
+        <AgentReason agentName={row.agentName} reason={row.reason} workspaceId={row.workspaceId} />
+      );
+    case "task":
+      return row.reason ?? "task approval";
+    case "loop-request":
+      return `${row.loopName} — ${row.requestKind}`;
+    case "terminal-input":
+      return (
+        <AgentReason agentName={row.agentName} reason={row.reason} workspaceId={row.workspaceId} />
+      );
+    case "loop-node":
+      return row.state;
+  }
+}
+
+function rowWorkspace(row: OsAttentionRow): string | null {
+  switch (row.kind) {
+    case "session":
+    case "loop-request":
+    case "terminal-input":
+      return row.workspaceLabel;
+    case "task":
+    case "loop-node":
+      return row.workspaceLabel ?? null;
+  }
+}
+
+function rowIsStale(row: OsAttentionRow): boolean {
+  switch (row.kind) {
+    case "session":
+    case "loop-request":
+    case "terminal-input":
+      return row.stale;
+    case "task":
+    case "loop-node":
+      return false;
+  }
+}
+
+/** The row's frame: mark, two lines, trailing time. Shared by the live row and its placeholder. */
+const BELL_ROW_CLASS =
+  "grid w-full grid-cols-[--spacing(4.5)_minmax(0,1fr)_auto] items-center gap-2.5 rounded-md px-2.5 py-1.5";
+
+export interface AttentionBellRowProps {
+  row: OsAttentionRow;
+  onSelect: (row: OsAttentionRow) => void;
+}
+
+/**
+ * One attention row: mark, title, why it is here, which workspace it belongs
+ * to, and how long it has waited. A muted workspace still shows its row and
+ * still counts — the mute mark makes the silence visible rather than
+ * mysterious. A stale row dims but stays activatable as a fallback jump.
+ */
+export function AttentionBellRow({ row, onSelect }: AttentionBellRowProps) {
+  const isSession = row.kind === "session";
+  const isLoopRequest = row.kind === "loop-request";
+  const isTerminalInput = row.kind === "terminal-input";
+  const stale = rowIsStale(row);
+  const muted = isSession && row.muted;
+  const workspace = rowWorkspace(row);
+  return (
+    <button
+      type="button"
+      className={cn(
+        BELL_ROW_CLASS,
+        "text-left transition-colors hover:bg-surface-2 focus-visible:bg-surface-2 focus-visible:shadow-focus-ring focus-visible:outline-none",
+        stale && "opacity-60"
+      )}
+      data-testid={`os-attention-${row.kind}-${row.id}`}
+      data-muted={muted ? "true" : undefined}
+      data-stale={stale ? "true" : undefined}
+      onClick={() => onSelect(row)}
+    >
+      <RowMark row={row} />
+      <span className="flex min-w-0 flex-col gap-px">
+        <span className="truncate text-small-body font-medium text-fg-strong">{row.title}</span>
+        <span className="flex min-w-0 items-center gap-1.5 text-eyebrow text-subtle">
+          <span className="truncate">{rowReason(row)}</span>
+          {workspace ? (
+            <span className="shrink-0 font-mono text-eyebrow text-faint">{workspace}</span>
+          ) : null}
+        </span>
+      </span>
+      <span className="flex shrink-0 items-center gap-1 text-eyebrow tabular-nums text-subtle">
+        {muted ? (
+          <Icon as={BellOff} size="sm" className="text-faint" aria-label="Notifications muted" />
+        ) : null}
+        {isSession ? <Time iso={row.changedAt} /> : null}
+        {isTerminalInput ? <Time iso={row.requestedAt} /> : null}
+        {isLoopRequest ? (
+          <span className="flex flex-col items-end">
+            <Time iso={row.openedAt} />
+            {row.expiresAt ? (
+              <span className="flex items-center gap-0.5 text-destructive">
+                <Icon as={Clock3} size="sm" />
+                <Time iso={row.expiresAt} />
+              </span>
+            ) : null}
+          </span>
+        ) : null}
+      </span>
+    </button>
+  );
+}
+
+/**
+ * One placeholder row: the live row's grid with the mark, the two lines and the time as blocks.
+ * The live row sits beside the acknowledge button, so the placeholder reserves that button's
+ * slot too. Presentational: the caller owns the busy region.
+ */
+export function AttentionBellRowSkeleton() {
+  return (
+    <div aria-hidden="true" className="flex min-w-0 animate-skeleton-reveal items-center">
+      <div className={BELL_ROW_CLASS}>
+        <Skeleton className="size-4.5 rounded-full" />
+        <span className="flex min-w-0 flex-col gap-px">
+          <SkeletonText className="w-40 text-small-body font-medium" />
+          <SkeletonText className="w-28 text-eyebrow" />
+        </span>
+        <SkeletonText className="w-8 text-eyebrow" />
+      </div>
+      <Skeleton className="size-button-icon-sm shrink-0 rounded-md" />
+    </div>
+  );
+}

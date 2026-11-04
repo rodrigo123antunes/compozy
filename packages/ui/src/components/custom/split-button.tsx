@@ -1,0 +1,216 @@
+import { useId, useState, type KeyboardEvent } from "react";
+
+import { ChevronDownIcon } from "../../icons";
+import { Button } from "../button";
+import { ButtonGroup } from "../button-group";
+import { DropdownMenu, DropdownMenuContent, DropdownMenuTrigger } from "../dropdown-menu";
+import { cn } from "../../lib/utils";
+
+type ButtonVariant = React.ComponentProps<typeof Button>["variant"];
+type ButtonSize = React.ComponentProps<typeof Button>["size"];
+type DataAttributes = { [key: `data-${string}`]: string | number | boolean | undefined };
+
+/**
+ * Pass-through attributes for the action segment only: test ids and domain
+ * `data-*` facts, a `title`, extra `aria-*`, and `disabled` for a primary that
+ * cannot run while its alternatives in the menu still can.
+ */
+export type SplitButtonActionProps = Pick<
+  React.ComponentProps<"button">,
+  "title" | "disabled" | "id"
+> &
+  Omit<React.AriaAttributes, "aria-disabled"> &
+  DataAttributes;
+
+export interface SplitButtonProps extends Omit<React.ComponentProps<"div">, "onSelect"> {
+  label: React.ReactNode;
+  icon?: React.ReactNode;
+  onAction: () => void;
+  /** Applied to both segments so the pair always reads as one control. */
+  variant?: ButtonVariant;
+  size?: ButtonSize;
+  /**
+   * The action is inoperable but still focusable, so assistive technology can
+   * reach it and read `blockedReason`. A natively disabled button is skipped by
+   * focus, which would make the explanation unreachable.
+   */
+  blocked?: boolean;
+  blockedReason?: string;
+  /** Hard-disables both segments — for in-flight work, not for policy. */
+  disabled?: boolean;
+  /** Required: no caller may ship an unlabelled menu trigger. */
+  menuLabel: string;
+  open?: boolean;
+  onOpenChange?: (open: boolean) => void;
+  menuProps?: Omit<React.ComponentProps<typeof DropdownMenuContent>, "children">;
+  /** Attributes for the action segment alone; the menu trigger is unaffected. */
+  actionProps?: SplitButtonActionProps;
+  /** Menu rows. Empty children collapse the control to a single button. */
+  children?: React.ReactNode;
+}
+
+// Both segments paint their fill under the transparent border box
+// (`bg-clip-border`), so the pair keeps one height and the seam reads as a
+// hairline in the primary's own ink instead of the canvas showing through. The
+// width is `!` because ButtonGroup zeroes every later segment's left border.
+const SEAM_CLASS = "border-l! border-l-primary-foreground/20";
+
+/**
+ * A primary action paired with a menu of its alternatives.
+ *
+ * `ButtonGroup` already owns the collapsed inner radii and the seam, so the two
+ * segments are ordinary `Button`s sharing one variant and size. The chevron
+ * stays operable while the action is blocked — the alternatives are exactly what
+ * an operator needs when the primary cannot run.
+ */
+export function SplitButton({
+  label,
+  icon,
+  onAction,
+  variant = "default",
+  size = "default",
+  blocked = false,
+  blockedReason,
+  disabled = false,
+  menuLabel,
+  open,
+  onOpenChange,
+  menuProps,
+  actionProps,
+  children,
+  className,
+  ...props
+}: SplitButtonProps) {
+  const {
+    disabled: actionDisabled = false,
+    "aria-describedby": actionDescribedBy,
+    ...restActionProps
+  } = actionProps ?? {};
+  const reasonId = useId();
+  const [internalOpen, setInternalOpen] = useState(false);
+  const hasMenu = Boolean(children);
+  const actionInert = disabled || actionDisabled;
+  const describedBy =
+    [actionDescribedBy, blocked && blockedReason ? reasonId : undefined]
+      .filter(Boolean)
+      .join(" ") || undefined;
+  const menuOpen = open ?? internalOpen;
+
+  function setMenuOpen(nextOpen: boolean) {
+    if (open === undefined) setInternalOpen(nextOpen);
+    onOpenChange?.(nextOpen);
+  }
+
+  function handleActionKeyDown(event: KeyboardEvent<HTMLButtonElement>) {
+    if (event.key === "ArrowDown" && hasMenu) {
+      event.preventDefault();
+      setMenuOpen(true);
+      return;
+    }
+    if ((event.key === " " || event.key === "Space") && !event.repeat) {
+      // Base UI does not synthesize the native Space click in every host
+      // environment. Owning it here keeps the split action keyboard-complete;
+      // preventing the key default also prevents a second browser click.
+      event.preventDefault();
+      if (!blocked && !actionInert) onAction();
+    }
+  }
+
+  return (
+    <ButtonGroup
+      className={cn("inline-flex items-stretch", className)}
+      data-blocked={blocked ? "" : undefined}
+      data-disabled={disabled ? "" : undefined}
+      data-slot="split-button"
+      data-variant={variant}
+      orientation="horizontal"
+      {...props}
+    >
+      <Button
+        {...restActionProps}
+        aria-describedby={describedBy}
+        aria-disabled={blocked || undefined}
+        className="gap-1.5 whitespace-nowrap bg-clip-border aria-disabled:pointer-events-none aria-disabled:cursor-not-allowed aria-disabled:bg-surface-2 aria-disabled:text-subtle aria-disabled:shadow-none"
+        data-size={size}
+        data-slot="split-button-action"
+        data-variant={variant}
+        disabled={actionInert}
+        onClick={blocked ? undefined : onAction}
+        onKeyDown={handleActionKeyDown}
+        size={size}
+        type="button"
+        variant={variant}
+      >
+        {icon}
+        {label}
+      </Button>
+      {blocked && blockedReason ? (
+        <span className="sr-only" id={reasonId}>
+          {blockedReason}
+        </span>
+      ) : null}
+      {hasMenu ? (
+        <SplitButtonMenu
+          disabled={disabled}
+          menuLabel={menuLabel}
+          menuProps={menuProps}
+          onOpenChange={setMenuOpen}
+          open={menuOpen}
+          size={size}
+          variant={variant}
+        >
+          {children}
+        </SplitButtonMenu>
+      ) : null}
+    </ButtonGroup>
+  );
+}
+
+function SplitButtonMenu({
+  open,
+  onOpenChange,
+  menuLabel,
+  menuProps,
+  variant,
+  size,
+  disabled,
+  children,
+}: Pick<SplitButtonProps, "menuLabel" | "menuProps" | "variant" | "size" | "children"> & {
+  open: boolean;
+  onOpenChange: (open: boolean) => void;
+  disabled: boolean;
+}) {
+  const { className: menuClassName, ...restMenuProps } = menuProps ?? {};
+  return (
+    <DropdownMenu onOpenChange={onOpenChange} open={open}>
+      <DropdownMenuTrigger
+        aria-label={menuLabel}
+        data-size={size}
+        data-slot="split-button-trigger"
+        data-variant={variant}
+        render={
+          <Button
+            className={cn(
+              // Square on the size ladder; the chevron takes the ladder glyph.
+              "aspect-square bg-clip-border px-0",
+              (variant === "default" || variant === "primary") && SEAM_CLASS
+            )}
+            disabled={disabled}
+            size={size}
+            type="button"
+            variant={variant}
+          />
+        }
+      >
+        <ChevronDownIcon aria-hidden="true" />
+      </DropdownMenuTrigger>
+      <DropdownMenuContent
+        align="end"
+        className={cn("w-max max-w-72 p-1", menuClassName)}
+        {...restMenuProps}
+      >
+        {children}
+      </DropdownMenuContent>
+    </DropdownMenu>
+  );
+}

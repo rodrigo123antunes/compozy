@@ -1,0 +1,13 @@
+{
+    "title": "Autonomy",
+    "icon": "ShieldCheck",
+    "pages": [
+        "index",
+        "coordinator",
+        "task-runs-and-leases",
+        "execution-profiles",
+        "review-gate",
+        "notification-cursors",
+        "safe-spawn"
+    ]
+}

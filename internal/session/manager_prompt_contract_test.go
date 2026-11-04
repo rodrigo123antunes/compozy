@@ -1,0 +1,4446 @@
+package session
+
+import (
+	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"io"
+	"os"
+	"runtime/pprof"
+	"slices"
+	"strings"
+	"sync"
+	"sync/atomic"
+	"testing"
+	"testing/synctest"
+	"time"
+	"unicode/utf8"
+
+	"github.com/compozy/compozy/internal/acp"
+	commandpkg "github.com/compozy/compozy/internal/command"
+	compozyconfig "github.com/compozy/compozy/internal/config"
+	eventspkg "github.com/compozy/compozy/internal/events"
+	hookspkg "github.com/compozy/compozy/internal/hooks"
+	"github.com/compozy/compozy/internal/profiling"
+	"github.com/compozy/compozy/internal/store"
+	"github.com/compozy/compozy/internal/subprocess"
+	"github.com/compozy/compozy/internal/testutil"
+	"github.com/compozy/compozy/internal/transcript"
+	workspacepkg "github.com/compozy/compozy/internal/workspace"
+)
+
+func TestPumpPromptReturnsWhenContextIsCanceledWhileWaitingForSource(t *testing.T) {
+	t.Parallel()
+
+	h := newHarness(t)
+	source := make(chan acp.AgentEvent)
+	out := make(chan acp.AgentEvent)
+	ctx, cancel := context.WithCancel(testutil.Context(t))
+
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		h.manager.pumpPrompt(
+			ctx,
+			ctx,
+			nil,
+			newPromptTurnDispatchState(nil, "turn-1", TurnSourceUser, ""),
+			source,
+			nil,
+			out,
+			nil,
+			nil,
+		)
+	}()
+
+	cancel()
+
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("pumpPrompt() did not return after context cancellation")
+	}
+
+	select {
+	case _, ok := <-out:
+		if ok {
+			t.Fatal("pumpPrompt() output channel remained open after cancellation")
+		}
+	default:
+		t.Fatal("pumpPrompt() did not close output channel")
+	}
+}
+
+func TestPumpPromptDrainsRuntimeEventsAfterTurnDone(t *testing.T) {
+	t.Parallel()
+
+	h := newHarness(t)
+	session := createSession(t, h)
+	t.Cleanup(func() {
+		reportSessionStop(t, h, session.ID)
+	})
+
+	source := make(chan acp.AgentEvent)
+	runtimeEvents := make(chan acp.AgentEvent, 1)
+	out := make(chan acp.AgentEvent)
+	done := make(chan struct{})
+	ctx := testutil.Context(t)
+
+	go func() {
+		defer close(done)
+		h.manager.pumpPrompt(
+			ctx,
+			ctx,
+			session,
+			newPromptTurnDispatchState(session, "turn-runtime-drain", TurnSourceUser, ""),
+			source,
+			runtimeEvents,
+			out,
+			nil,
+			nil,
+		)
+	}()
+
+	source <- acp.AgentEvent{Type: acp.EventTypeDone, TurnID: "turn-runtime-drain"}
+	first := receivePromptEvent(t, out)
+	if first.Type != acp.EventTypeDone {
+		t.Fatalf("first event type = %q, want %q", first.Type, acp.EventTypeDone)
+	}
+
+	runtimeEvents <- acp.AgentEvent{Type: acp.EventTypeRuntimeProgress, TurnID: "turn-runtime-drain"}
+	close(runtimeEvents)
+	second := receivePromptEvent(t, out)
+	if second.Type != acp.EventTypeRuntimeProgress {
+		t.Fatalf("second event type = %q, want %q", second.Type, acp.EventTypeRuntimeProgress)
+	}
+
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("pumpPrompt() did not return after draining runtime events")
+	}
+}
+
+func TestNextPromptPumpEventPrioritizesReadyRuntimeEvents(t *testing.T) {
+	t.Parallel()
+
+	t.Run("Should prefer a ready runtime event over a ready source event", func(t *testing.T) {
+		t.Parallel()
+
+		source := make(chan acp.AgentEvent, 1)
+		runtimeEvents := make(chan acp.AgentEvent, 1)
+		loop := &promptPumpLoopState{source: source, runtime: runtimeEvents}
+
+		source <- acp.AgentEvent{Type: acp.EventTypeError, TurnID: "turn-runtime-priority"}
+		runtimeEvents <- acp.AgentEvent{
+			Type:   acp.EventTypeRuntimeWarning,
+			TurnID: "turn-runtime-priority",
+		}
+
+		event, runtimeEvent, ok := nextPromptPumpEvent(testutil.Context(t), loop)
+		if !ok {
+			t.Fatal("nextPromptPumpEvent() ok = false, want true")
+		}
+		if !runtimeEvent {
+			t.Fatal("nextPromptPumpEvent() runtimeEvent = false, want true")
+		}
+		if got, want := event.Type, acp.EventTypeRuntimeWarning; got != want {
+			t.Fatalf("nextPromptPumpEvent() type = %q, want %q", got, want)
+		}
+
+		select {
+		case remaining := <-source:
+			if got, want := remaining.Type, acp.EventTypeError; got != want {
+				t.Fatalf("remaining source event type = %q, want %q", got, want)
+			}
+		default:
+			t.Fatal("source event drained unexpectedly")
+		}
+	})
+
+	t.Run("Should probe source closure after a prioritized runtime event", func(t *testing.T) {
+		t.Parallel()
+
+		source := make(chan acp.AgentEvent)
+		runtimeEvents := make(chan acp.AgentEvent, 2)
+		loop := &promptPumpLoopState{source: source, runtime: runtimeEvents}
+
+		runtimeEvents <- acp.AgentEvent{
+			Type:   acp.EventTypeRuntimeProgress,
+			TurnID: "turn-runtime-priority",
+		}
+		runtimeEvents <- acp.AgentEvent{
+			Type:   acp.EventTypeRuntimeProgress,
+			TurnID: "turn-runtime-priority",
+		}
+
+		event, runtimeEvent, ok := nextPromptPumpEvent(testutil.Context(t), loop)
+		if !ok {
+			t.Fatal("nextPromptPumpEvent() ok = false, want true")
+		}
+		if !runtimeEvent {
+			t.Fatal("nextPromptPumpEvent() runtimeEvent = false, want true")
+		}
+		if got, want := event.Type, acp.EventTypeRuntimeProgress; got != want {
+			t.Fatalf("nextPromptPumpEvent() type = %q, want %q", got, want)
+		}
+
+		close(source)
+		event, runtimeEvent, ok = nextPromptPumpEvent(testutil.Context(t), loop)
+		if !ok {
+			t.Fatal("nextPromptPumpEvent() ok = false, want buffered runtime event after source closure")
+		}
+		if !runtimeEvent {
+			t.Fatal("nextPromptPumpEvent() runtimeEvent = false, want true")
+		}
+		if got, want := event.Type, acp.EventTypeRuntimeProgress; got != want {
+			t.Fatalf("nextPromptPumpEvent() type = %q, want %q", got, want)
+		}
+		if loop.source != nil {
+			t.Fatal("loop source = non-nil, want closed source observed before draining more runtime events")
+		}
+	})
+}
+
+func TestPromptStreamsToRecorderAndNotifier(t *testing.T) {
+	t.Parallel()
+	t.Run("Should label batch persistence when capture starts during an active turn", func(t *testing.T) {
+		t.Parallel()
+		h := newHarness(t)
+		source := make(chan acp.AgentEvent, 2)
+		h.driver.promptHook = func(*fakeProcess, acp.PromptRequest) (<-chan acp.AgentEvent, error) { return source, nil }
+		session := createSession(t, h)
+		t.Cleanup(func() { reportSessionStop(t, h, session.ID) })
+		var observed atomic.Bool
+		provider := session.Info().Provider
+		session.mu.Lock()
+		session.recorder = &profileLabelRecorder{
+			EventRecorder: session.recorder,
+			observe: func(ctx context.Context, event store.SessionEvent) {
+				if event.Type != acp.EventTypeAgentMessage {
+					return
+				}
+				id, ok := pprof.Label(ctx, "session_id")
+				if !ok || id != session.ID {
+					t.Errorf("session label = %q, present=%v", id, ok)
+				}
+				value, ok := pprof.Label(ctx, "provider")
+				if !ok || value != provider {
+					t.Errorf("provider label = %q, present=%v", value, ok)
+				}
+				observed.Store(true)
+			},
+		}
+		session.mu.Unlock()
+		stream, err := h.manager.Prompt(t.Context(), session.ID, "stream")
+		if err != nil {
+			t.Fatal(err)
+		}
+		ctx, cancel := context.WithCancel(t.Context())
+		started, finished := make(chan struct{}), make(chan struct{})
+		var captureErr error
+		go func() {
+			defer close(finished)
+			captureErr = profiling.Capture(
+				&profileStartedContext{Context: ctx, started: started},
+				io.Discard,
+				"mutex",
+				120,
+			)
+		}()
+		t.Cleanup(func() {
+			cancel()
+			<-finished
+			if !errors.Is(captureErr, context.Canceled) {
+				t.Errorf("capture = %v", captureErr)
+			}
+		})
+		select {
+		case <-started:
+		case <-finished:
+			t.Fatalf("capture failed before sampling: %v", captureErr)
+		}
+		source <- acp.AgentEvent{Type: acp.EventTypeAgentMessage, Text: "chunk"}
+		source <- acp.AgentEvent{Type: acp.EventTypeDone}
+		close(source)
+		collectEvents(t, stream)
+		if !observed.Load() {
+			t.Fatal("batch persistence was not observed")
+		}
+	})
+
+	t.Run(
+		"Should persist cache counters and sanitized metadata while projecting only usage values",
+		func(t *testing.T) {
+			t.Parallel()
+			h := newHarness(t)
+			h.driver.promptHook = func(proc *fakeProcess, req acp.PromptRequest) (<-chan acp.AgentEvent, error) {
+				out := make(chan acp.AgentEvent, 2)
+				for _, kind := range []string{acp.EventTypeUsage, acp.EventTypeDone} {
+					out <- acp.AgentEvent{Type: kind, SessionID: proc.handle.SessionID, TurnID: req.TurnID, Timestamp: time.Date(2026, 9, 11, 12, 0, 0, 0, time.UTC), Usage: &acp.TokenUsage{TurnID: req.TurnID, InputTokens: new(int64(10)), OutputTokens: new(int64(2)), TotalTokens: new(int64(12)), CacheReadTokens: new(int64(4)), CacheWriteTokens: new(int64(5)), ContextUsed: new(int64(80)), ContextSize: new(int64(100)), Meta: map[string]any{"_claude/origin": "result", "nested": map[string]any{"claim_token": "secret", "note": "compozy_claim_secret"}}}}
+				}
+				close(out)
+				return out, nil
+			}
+			sess := createSession(t, h)
+			t.Cleanup(func() { reportSessionStop(t, h, sess.ID) })
+			stream, err := h.manager.Prompt(testutil.Context(t), sess.ID, "measure")
+			if err != nil {
+				t.Fatal(err)
+			}
+			delivered := collectEvents(t, stream)
+			if len(delivered) != 2 {
+				t.Fatalf("delivered = %#v", delivered)
+			}
+			stored, err := sess.recorderHandle().Query(testutil.Context(t), store.EventQuery{})
+			if err != nil {
+				t.Fatal(err)
+			}
+			for i, event := range delivered {
+				usage := event.Usage
+				if usage == nil || usage.CacheReadTokens == nil || *usage.CacheReadTokens != 4 ||
+					usage.Sequence != stored[i+1].Sequence ||
+					usage.Sequence <= 0 ||
+					usage.Meta["_claude/origin"] != "result" {
+					t.Fatalf("delivered usage = %#v", usage)
+				}
+				nested := usage.Meta["nested"].(map[string]any)
+				if _, exists := nested["claim_token"]; exists {
+					t.Fatal("claim key reached live delivery")
+				}
+				if nested["note"] != "compozy_claim_[REDACTED]" {
+					t.Fatalf("nested metadata = %#v", nested)
+				}
+			}
+			for _, event := range stored {
+				if strings.Contains(event.Content, "claim_token") ||
+					strings.Contains(event.Content, "compozy_claim_secret") {
+					t.Fatalf("unsafe stored event = %s", event.Content)
+				}
+			}
+			projected, err := sess.recorderHandle().ListTokenUsage(testutil.Context(t))
+			if err != nil {
+				t.Fatal(err)
+			}
+			if len(projected) != 1 || projected[0].CacheReadTokens == nil || *projected[0].CacheReadTokens != 4 ||
+				projected[0].CacheWriteTokens == nil ||
+				*projected[0].CacheWriteTokens != 5 ||
+				projected[0].InputTokens == nil ||
+				*projected[0].InputTokens != 10 ||
+				projected[0].ContextUsed == nil ||
+				*projected[0].ContextUsed != 80 {
+				t.Fatalf("projection = %#v", projected)
+			}
+		},
+	)
+
+	h := newHarness(t)
+	session := createSession(t, h)
+	t.Cleanup(func() {
+		reportSessionStop(t, h, session.ID)
+	})
+
+	eventsCh, err := h.manager.Prompt(testutil.Context(t), session.ID, "hello")
+	if err != nil {
+		t.Fatalf("Prompt() error = %v", err)
+	}
+	events := collectEvents(t, eventsCh)
+	if len(events) != 2 {
+		t.Fatalf("Prompt() events = %d, want 2", len(events))
+	}
+	if events[0].Type != acp.EventTypeAgentMessage {
+		t.Fatalf("first event type = %q, want %q", events[0].Type, acp.EventTypeAgentMessage)
+	}
+	if events[1].Type != acp.EventTypeDone {
+		t.Fatalf("second event type = %q, want %q", events[1].Type, acp.EventTypeDone)
+	}
+
+	stored, err := session.recorderHandle().Query(testutil.Context(t), store.EventQuery{})
+	if err != nil {
+		t.Fatalf("Query() error = %v", err)
+	}
+	if len(stored) != 3 {
+		t.Fatalf("stored events = %d, want 3", len(stored))
+	}
+	if got := stored[0].Type; got != acp.EventTypeUserMessage {
+		t.Fatalf("first stored event type = %q, want %q", got, acp.EventTypeUserMessage)
+	}
+	if got := h.notifier.eventCount(session.ID); got != 3 {
+		t.Fatalf("notifier events = %d, want 3", got)
+	}
+}
+
+func TestPromptPersistenceFailureStopsSessionBeforeLiveDelivery(t *testing.T) {
+	t.Parallel()
+
+	// Invariant: failed persistence is never delivered as successful output, and storage failures are not agent crashes.
+	// Owner: prompt lifecycle; canonical suite: prompt persistence failure.
+	for _, tc := range []struct {
+		name string
+		err  error
+		kind store.FailureKind
+	}{
+		{"projection", errors.New("projection failed token=super-secret"), store.FailureTransport},
+		{"storage", os.ErrPermission, store.FailurePrompt},
+	} {
+		t.Run(
+			"Should keep a failed single event out of live reload and turn completion for "+tc.name,
+			func(t *testing.T) {
+				t.Parallel()
+
+				recordErr := tc.err
+				recorder := &failingSinglePromptRecorder{failErr: recordErr}
+				h := newHarness(
+					t,
+					WithStore(func(context.Context, store.SessionDBOwner, string) (EventRecorder, error) {
+						return recorder, nil
+					}),
+				)
+				turnEnds := 0
+				h.manager.SetTurnEndNotifier(func(context.Context, PromptRunIdentity) { turnEnds++ })
+				h.driver.promptHook = func(proc *fakeProcess, req acp.PromptRequest) (<-chan acp.AgentEvent, error) {
+					events := make(chan acp.AgentEvent, 1)
+					go func() {
+						defer close(events)
+						events <- acp.AgentEvent{
+							Type:       acp.EventTypeToolCall,
+							SessionID:  proc.handle.SessionID,
+							TurnID:     req.TurnID,
+							ToolCallID: "call-failed",
+							Title:      "Read",
+						}
+					}()
+					return events, nil
+				}
+				session := createSession(t, h)
+				t.Cleanup(func() {
+					if _, active := h.manager.Get(session.ID); active {
+						if err := h.manager.Stop(testutil.Context(t), session.ID); err != nil &&
+							!errors.Is(err, ErrSessionNotFound) {
+							t.Errorf("Stop() cleanup error = %v", err)
+						}
+					}
+				})
+
+				eventsCh, err := h.manager.Prompt(testutil.Context(t), session.ID, "hello")
+				if err != nil {
+					t.Fatalf("Prompt() error = %v", err)
+				}
+				delivered := collectEvents(t, eventsCh)
+				if len(delivered) != 1 || delivered[0].Type != acp.EventTypeError ||
+					delivered[0].Failure == nil || delivered[0].Failure.Kind != tc.kind {
+					t.Fatalf("Prompt() delivered = %#v, want only projection failure", delivered)
+				}
+				if got := countAgentEvents(h.notifier.eventsForSession(session.ID), acp.EventTypeToolCall); got != 0 {
+					t.Fatalf("tool call notifier events = %d, want zero", got)
+				}
+				if turnEnds != 0 {
+					t.Fatalf("turn end notifications = %d, want zero", turnEnds)
+				}
+				h.notifier.waitForStopped(t, session.ID)
+				if _, active := h.manager.Get(session.ID); active {
+					t.Fatalf("Get(%q) found session after stopped notification", session.ID)
+				}
+				meta := readMeta(t, session.MetaPath())
+				if meta.Failure == nil || meta.Failure.Kind != tc.kind {
+					t.Fatalf("stopped session failure = %#v, want %s failure", meta.Failure, tc.kind)
+				}
+				if tc.kind == store.FailurePrompt && (meta.StopReason == nil || *meta.StopReason != store.StopError ||
+					!strings.Contains(meta.Failure.Summary, "session storage failed")) {
+					t.Fatalf("storage failure classification = %+v", meta)
+				}
+				if strings.Contains(meta.Failure.Summary, "super-secret") {
+					t.Fatalf("stopped session failure leaked secret: %q", meta.Failure.Summary)
+				}
+				reloaded, queryErr := recorder.Query(testutil.Context(t), store.EventQuery{})
+				if queryErr != nil {
+					t.Fatalf("Query(reload) error = %v", queryErr)
+				}
+				if got := countEventType(reloaded, acp.EventTypeToolCall); got != 0 {
+					t.Fatalf("reloaded tool_call rows = %d, want zero", got)
+				}
+			},
+		)
+	}
+}
+
+func TestPromptDeadlineDeliversRuntimeWarningBeforeError(t *testing.T) {
+	t.Parallel()
+
+	// Keep the deadline and stop budgets while advancing blocked time virtually.
+	synctest.Test(t, func(t *testing.T) {
+		h := newHarness(t, WithSessionSupervision(compozyconfig.SessionSupervisionConfig{
+			ActivityHeartbeatInterval: time.Hour,
+			ProgressNotifyInterval:    0,
+			QuietAfter:                0,
+			StopGrace:                 0,
+			TimeoutCancelGrace:        2 * time.Second,
+			PromptDeadline:            20 * time.Millisecond,
+		}))
+		session := createSession(t, h)
+		t.Cleanup(func() {
+			if err := h.manager.Stop(
+				testutil.Context(t),
+				session.ID,
+			); err != nil &&
+				!errors.Is(err, ErrSessionNotFound) {
+				t.Errorf("Stop(%q) cleanup error = %v", session.ID, err)
+			}
+		})
+
+		source := make(chan acp.AgentEvent, 1)
+		var promptTurnID string
+		h.driver.promptHook = func(_ *fakeProcess, req acp.PromptRequest) (<-chan acp.AgentEvent, error) {
+			promptTurnID = req.TurnID
+			return source, nil
+		}
+		// The deadline issues the cancel under test; the cleanup stop ladder later
+		// sends a second cooperative cancel to the already-quiesced turn, which must
+		// not replay the provider error into the closed source.
+		var deadlineCancel sync.Once
+		h.driver.cancelHook = func(proc *fakeProcess) error {
+			deadlineCancel.Do(func() {
+				source <- acp.AgentEvent{
+					Type:      acp.EventTypeError,
+					SessionID: proc.handle.SessionID,
+					TurnID:    promptTurnID,
+					Timestamp: time.Now().UTC(),
+					Error:     `{"code":-32603,"message":"Internal error","data":{"error":"context deadline exceeded"}}`,
+				}
+				close(source)
+			})
+			return nil
+		}
+
+		eventsCh, err := h.manager.Prompt(testutil.Context(t), session.ID, "long running")
+		if err != nil {
+			t.Fatalf("Prompt() error = %v", err)
+		}
+		events := collectEvents(t, eventsCh)
+		if got, want := len(events), 2; got != want {
+			t.Fatalf("Prompt() events = %d, want %d", got, want)
+		}
+		if got, want := events[0].Type, acp.EventTypeRuntimeWarning; got != want {
+			t.Fatalf("Prompt() first event type = %q, want %q", got, want)
+		}
+		if got, want := events[1].Type, acp.EventTypeError; got != want {
+			t.Fatalf("Prompt() second event type = %q, want %q", got, want)
+		}
+		if events[0].Runtime == nil || events[0].Runtime.DeadlineAt == nil {
+			t.Fatalf("Prompt() first runtime = %#v, want deadline payload", events[0].Runtime)
+		}
+		// The deadline cancels the turn in turn scope; the provider answers that cancel
+		// with a fatal transport error, so the session-scope ladder stops the process
+		// exactly once. Its cooperative phase may re-issue the cancel before the
+		// forced stop verifies exit, which the once-guarded hook above absorbs.
+		h.notifier.waitForStopped(t, session.ID)
+		if got := h.driver.cancelCalls; got < 1 {
+			t.Fatalf("driver cancel calls = %d, want at least 1", got)
+		}
+		if got := h.driver.stopCalls; got != 1 {
+			t.Fatalf("driver stop calls = %d, want 1", got)
+		}
+	})
+}
+
+func TestPromptFatalProcessFailureStopsSessionAndPreservesReadOnlyHistory(t *testing.T) {
+	t.Run("Should stop after automatic recovery is exhausted and preserve partial history", func(t *testing.T) {
+		t.Parallel()
+
+		h := newHarness(t)
+		h.manager.promptRecoveryDelays = []time.Duration{0, 0, 0}
+		session := createSession(t, h)
+		originalACP := session.Info().ACPSessionID
+		processExitErr := errors.New("acp subprocess exited: exit status 23")
+		h.driver.lastProcess().handle.exitStatusFn = func() (subprocess.ExitStatus, bool) {
+			return subprocess.ExitStatus{ExitCode: 23}, true
+		}
+		t.Cleanup(func() {
+			if _, ok := h.manager.Get(session.ID); ok {
+				reportSessionStop(t, h, session.ID)
+			}
+		})
+		h.driver.stopHook = func(proc *fakeProcess) error {
+			proc.crash(processExitErr, "codex stderr tail")
+			return nil
+		}
+
+		h.driver.promptHook = func(proc *fakeProcess, req acp.PromptRequest) (<-chan acp.AgentEvent, error) {
+			proc.handle.exitStatusFn = func() (subprocess.ExitStatus, bool) {
+				return subprocess.ExitStatus{ExitCode: 23}, true
+			}
+			events := make(chan acp.AgentEvent, 2)
+			go func() {
+				defer close(events)
+				events <- acp.AgentEvent{
+					Type:      acp.EventTypeAgentMessage,
+					SessionID: originalACP,
+					TurnID:    req.TurnID,
+					Timestamp: time.Now().UTC(),
+					Text:      "partial before disconnect",
+				}
+				events <- acp.AgentEvent{
+					Type:      acp.EventTypeError,
+					SessionID: originalACP,
+					TurnID:    req.TurnID,
+					Timestamp: time.Now().UTC(),
+					Error:     `RequestError -32603: peer disconnected before response`,
+					Failure: &store.SessionFailure{
+						Kind:    store.FailureProcess,
+						Summary: `RequestError -32603: peer disconnected before response`,
+					},
+				}
+			}()
+			return events, nil
+		}
+
+		eventsCh, err := h.manager.Prompt(testutil.Context(t), session.ID, "hello")
+		if err != nil {
+			t.Fatalf("Prompt() error = %v", err)
+		}
+		events := collectEvents(t, eventsCh)
+		if len(events) < 2 {
+			t.Fatalf("Prompt() events = %#v, want partial output and terminal failure", events)
+		}
+		if got, want := events[0].Type, acp.EventTypeAgentMessage; got != want {
+			t.Fatalf("Prompt() first event type = %q, want %q", got, want)
+		}
+		if got, want := events[0].Text, "partial before disconnect"; got != want {
+			t.Fatalf("Prompt() first event text = %q, want %q", got, want)
+		}
+		terminal := events[len(events)-1]
+		if terminal.Failure == nil || terminal.Failure.Kind != store.FailureProcess {
+			t.Fatalf("Prompt() failure = %#v, want process_exit", terminal.Failure)
+		}
+		if terminal.Failure.CrashBundlePath == "" {
+			t.Fatalf("Prompt() failure = %#v, want crash bundle path", terminal.Failure)
+		}
+		closedMeta := readMeta(t, session.MetaPath())
+		if closedMeta.State != string(StateStopped) || closedMeta.Failure == nil ||
+			closedMeta.Failure.Kind != store.FailureProcess {
+			t.Fatalf("meta after prompt stream close = %#v, want stopped process failure", closedMeta)
+		}
+		publicBundle := readCrashBundleDocument(t, terminal.Failure.CrashBundlePath)
+		if publicBundle.Process == nil || publicBundle.Process.ExitCode == nil ||
+			*publicBundle.Process.ExitCode != 23 {
+			t.Fatalf(
+				"public crash bundle process = %#v, want exit code 23 before stop",
+				publicBundle.Process,
+			)
+		}
+		if publicBundle.Process.Signal != "" {
+			t.Fatalf("public crash bundle signal = %q, want empty for numeric exit", publicBundle.Process.Signal)
+		}
+		if got, want := publicBundle.Stderr, "codex stderr tail"; got != want {
+			t.Fatalf("public crash bundle stderr = %q, want %q", got, want)
+		}
+
+		h.notifier.waitForStopped(t, session.ID)
+		if _, ok := h.manager.Get(session.ID); ok {
+			t.Fatalf("Get(%q) found session after stopped notification", session.ID)
+		}
+
+		if got, want := h.driver.stopCalls, len(h.manager.promptRecoveryDelays)+1; got != want {
+			t.Fatalf("driver stop calls = %d, want %d replaced and final runtimes", got, want)
+		}
+
+		meta := readMeta(t, session.MetaPath())
+		if got := meta.State; got != string(StateStopped) {
+			t.Fatalf("meta state = %q, want %q", got, StateStopped)
+		}
+		if meta.StopReason == nil || *meta.StopReason != store.StopAgentCrashed {
+			t.Fatalf("meta.StopReason = %#v, want %q", meta.StopReason, store.StopAgentCrashed)
+		}
+		if meta.Failure == nil || meta.Failure.Kind != store.FailureProcess {
+			t.Fatalf("meta.Failure = %#v, want process_exit", meta.Failure)
+		}
+		if got, want := meta.Failure.CrashBundlePath, terminal.Failure.CrashBundlePath; got != want {
+			t.Fatalf("meta crash bundle = %q, want event bundle %q", got, want)
+		}
+		if !strings.Contains(meta.StopDetail, processExitErr.Error()) {
+			t.Fatalf("meta.StopDetail = %q, want real process exit diagnostic %q", meta.StopDetail, processExitErr)
+		}
+		stored := readStoredEvents(t, session)
+		if !containsEventType(stored, acp.EventTypeAgentMessage) || containsEventType(stored, acp.EventTypeDone) {
+			t.Fatalf("stored events = %#v, want partial agent message and no done event", stored)
+		}
+		partial := storedEventByType(t, stored, acp.EventTypeAgentMessage)
+		if !strings.Contains(partial.Content, "partial before disconnect") {
+			t.Fatalf("stored agent message = %s, want persisted partial chunk", partial.Content)
+		}
+
+		startsBeforeRejectedPrompt := len(h.driver.startCalls)
+		_, err = h.manager.SendPrompt(testutil.Context(t), session.ID, SendPromptOpts{
+			Message:        "retry the dead session",
+			MessageID:      "message-dead-session-retry",
+			IdempotencyKey: "idempotency-dead-session-retry",
+		})
+		if !errors.Is(err, store.ErrSessionNotAttachable) {
+			t.Fatalf("SendPrompt(dead session) error = %v, want ErrSessionNotAttachable", err)
+		}
+		if got := len(h.driver.startCalls); got != startsBeforeRejectedPrompt {
+			t.Fatalf("dead-session Prompt() start calls = %d, want %d", got, startsBeforeRejectedPrompt)
+		}
+	})
+
+	for _, tc := range []struct {
+		name         string
+		userCanceled bool
+		wantPending  bool
+	}{
+		{name: "Should end a turn whose agent dies during daemon restart as a resumable interruption", wantPending: true},
+		{name: "Should not resume a user-canceled turn whose agent dies during daemon restart", userCanceled: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			h := newHarness(t)
+			h.manager.promptRecoveryDelays = []time.Duration{0, 0, 0}
+			session := createSession(t, h)
+			originalACP := session.Info().ACPSessionID
+			t.Cleanup(func() {
+				if _, ok := h.manager.Get(session.ID); ok {
+					reportSessionStop(t, h, session.ID)
+				}
+			})
+			h.driver.promptHook = func(proc *fakeProcess, req acp.PromptRequest) (<-chan acp.AgentEvent, error) {
+				events := make(chan acp.AgentEvent, 2)
+				go func() {
+					defer close(events)
+					events <- acp.AgentEvent{
+						Type:      acp.EventTypeAgentMessage,
+						SessionID: originalACP,
+						TurnID:    req.TurnID,
+						Timestamp: time.Now().UTC(),
+						Text:      "partial before shutdown",
+					}
+					// The host signals the daemon and its agents together: the agent dies while
+					// PrepareDaemonShutdown is still scanning, before it captured this turn.
+					if tc.userCanceled {
+						// The operator canceled the turn, but its stop was not verified yet.
+						active, _ := h.manager.Get(session.ID)
+						active.mu.Lock()
+						active.promptCancelRequested, active.currentPromptCancelTurn = true, req.TurnID
+						active.mu.Unlock()
+					}
+					h.manager.markDaemonShutdown(true)
+					proc.crash(errors.New("acp subprocess exited: signal: terminated"), "")
+					events <- acp.AgentEvent{
+						Type:      acp.EventTypeError,
+						SessionID: originalACP,
+						TurnID:    req.TurnID,
+						Timestamp: time.Now().UTC(),
+						Error:     "ACP subprocess exited unexpectedly",
+						Failure: &store.SessionFailure{
+							Kind:    store.FailureProcess,
+							Summary: "ACP subprocess exited unexpectedly",
+						},
+					}
+				}()
+				return events, nil
+			}
+
+			eventsCh, err := h.manager.Prompt(testutil.Context(t), session.ID, "hello")
+			if err != nil {
+				t.Fatalf("Prompt() error = %v", err)
+			}
+			events := collectEvents(t, eventsCh)
+			for _, event := range events {
+				if event.Failure != nil {
+					t.Fatalf("Prompt() event = %#v, want no turn failure during daemon shutdown", event)
+				}
+			}
+			h.notifier.waitForStopped(t, session.ID)
+
+			if got := len(h.driver.startCalls); got != 1 {
+				t.Fatalf("driver start calls = %d, want no runtime recovery during daemon shutdown", got)
+			}
+			meta := readMeta(t, session.MetaPath())
+			if meta.StopReason == nil || *meta.StopReason != store.StopShutdown {
+				t.Fatalf("meta.StopReason = %#v, want %q", meta.StopReason, store.StopShutdown)
+			}
+			if meta.Failure != nil {
+				t.Fatalf("meta.Failure = %#v, want no failure for a restart interruption", meta.Failure)
+			}
+			pending, err := h.manager.HasPendingRestart(testutil.Context(t), session.ID)
+			if err != nil {
+				t.Fatalf("HasPendingRestart() error = %v", err)
+			}
+			if pending != tc.wantPending {
+				t.Fatalf("HasPendingRestart() = %v, want %v", pending, tc.wantPending)
+			}
+		})
+	}
+
+	t.Run("Should classify an ACP error followed by exit code zero as a transport failure", func(t *testing.T) {
+		t.Parallel()
+
+		h := newHarness(t)
+		h.manager.promptRecoveryDelays = []time.Duration{0, 0, 0}
+		sess := createSession(t, h)
+		proc := h.driver.lastProcess()
+		proc.handle.exitStatusFn = func() (subprocess.ExitStatus, bool) {
+			return subprocess.ExitStatus{ExitCode: 0}, true
+		}
+		t.Cleanup(func() {
+			if _, ok := h.manager.Get(sess.ID); ok {
+				reportSessionStop(t, h, sess.ID)
+			}
+		})
+		h.driver.promptHook = func(_ *fakeProcess, req acp.PromptRequest) (<-chan acp.AgentEvent, error) {
+			events := make(chan acp.AgentEvent, 1)
+			events <- acp.AgentEvent{
+				Type:      acp.EventTypeError,
+				SessionID: sess.Info().ACPSessionID,
+				TurnID:    req.TurnID,
+				Timestamp: time.Now().UTC(),
+				Error:     "ACP connection closed after protocol error",
+				Failure: &store.SessionFailure{
+					Kind:    store.FailureTransport,
+					Summary: "ACP connection closed after protocol error",
+				},
+			}
+			close(events)
+			return events, nil
+		}
+
+		eventsCh, err := h.manager.Prompt(testutil.Context(t), sess.ID, "hello")
+		if err != nil {
+			t.Fatalf("Prompt() error = %v", err)
+		}
+		events := collectEvents(t, eventsCh)
+		if len(events) == 0 {
+			t.Fatal("Prompt() events = empty, want terminal transport failure")
+		}
+		terminal := events[len(events)-1]
+		if terminal.Failure == nil || terminal.Failure.Kind != store.FailureTransport {
+			t.Fatalf("Prompt() events = %#v, want terminal transport failure", events)
+		}
+		h.notifier.waitForStopped(t, sess.ID)
+		meta := readMeta(t, sess.MetaPath())
+		if meta.StopReason == nil || *meta.StopReason != store.StopError {
+			t.Fatalf("meta.StopReason = %#v, want %q", meta.StopReason, store.StopError)
+		}
+		if meta.Failure == nil || meta.Failure.Kind != store.FailureTransport {
+			t.Fatalf("meta.Failure = %#v, want transport failure", meta.Failure)
+		}
+	})
+}
+
+func TestPromptStreamClosureWithoutTerminalStopsSession(t *testing.T) {
+	t.Run("Should preserve partial output and stop on terminal-less stream closure", func(t *testing.T) {
+		t.Parallel()
+
+		h := newHarness(t)
+		h.manager.promptRecoveryDelays = []time.Duration{0, 0, 0}
+		sess := createSession(t, h)
+		proc := h.driver.lastProcess()
+		proc.handle.exitStatusFn = func() (subprocess.ExitStatus, bool) {
+			select {
+			case <-proc.done:
+				return subprocess.ExitStatus{ExitCode: 23}, true
+			default:
+				return subprocess.ExitStatus{}, false
+			}
+		}
+		var stoppedWhileActive atomic.Bool
+		h.driver.stopHook = func(proc *fakeProcess) error {
+			select {
+			case <-proc.done:
+			default:
+				stoppedWhileActive.Store(true)
+			}
+			proc.crash(errors.New("ACP transport closed before terminal event"), "codex stderr after EOF")
+			return nil
+		}
+		t.Cleanup(func() {
+			if _, ok := h.manager.Get(sess.ID); ok {
+				reportSessionStop(t, h, sess.ID)
+			}
+		})
+		h.driver.promptHook = func(proc *fakeProcess, req acp.PromptRequest) (<-chan acp.AgentEvent, error) {
+			proc.handle.exitStatusFn = func() (subprocess.ExitStatus, bool) {
+				select {
+				case <-proc.done:
+					return subprocess.ExitStatus{ExitCode: 23}, true
+				default:
+					return subprocess.ExitStatus{}, false
+				}
+			}
+			events := make(chan acp.AgentEvent, 1)
+			events <- acp.AgentEvent{
+				Type:      acp.EventTypeAgentMessage,
+				SessionID: proc.handle.SessionID,
+				TurnID:    req.TurnID,
+				Timestamp: time.Now().UTC(),
+				Text:      "partial before EOF",
+			}
+			close(events)
+			return events, nil
+		}
+
+		eventsCh, err := h.manager.Prompt(testutil.Context(t), sess.ID, "hello")
+		if err != nil {
+			t.Fatalf("Prompt() error = %v", err)
+		}
+		events := collectEvents(t, eventsCh)
+		if len(events) < 2 {
+			t.Fatalf("Prompt() events = %#v, want partial chunk and terminal failure", events)
+		}
+		if got, want := events[0].Text, "partial before EOF"; got != want {
+			t.Fatalf("Prompt() first event text = %q, want %q", got, want)
+		}
+		terminal := events[len(events)-1]
+		if terminal.Type != acp.EventTypeError || terminal.Failure == nil ||
+			terminal.Failure.Kind != store.FailureTransport {
+			t.Fatalf("Prompt() terminal event = %#v, want transport failure", terminal)
+		}
+		if !strings.Contains(terminal.Error, "ended before a terminal event") {
+			t.Fatalf("Prompt() terminal error = %q, want explicit incomplete-stream failure", terminal.Error)
+		}
+		if terminal.Failure.CrashBundlePath == "" {
+			t.Fatalf("Prompt() terminal failure = %#v, want public crash bundle path", terminal.Failure)
+		}
+		publicBundle := readCrashBundleDocument(t, terminal.Failure.CrashBundlePath)
+		if publicBundle.Process == nil || publicBundle.Process.ExitCode == nil ||
+			*publicBundle.Process.ExitCode != 23 {
+			t.Fatalf("public crash bundle process = %#v, want exit code 23 before stop", publicBundle.Process)
+		}
+		if got, want := publicBundle.Stderr, "codex stderr after EOF"; got != want {
+			t.Fatalf("public crash bundle stderr = %q, want %q", got, want)
+		}
+
+		h.notifier.waitForStopped(t, sess.ID)
+		if _, ok := h.manager.Get(sess.ID); ok {
+			t.Fatalf("Get(%q) found session after terminal-less stream closure", sess.ID)
+		}
+		if !stoppedWhileActive.Load() {
+			t.Fatal("process was not active when terminal-less stream closure initiated stop")
+		}
+		stored := readStoredEvents(t, sess)
+		if !containsEventType(stored, acp.EventTypeAgentMessage) ||
+			!containsEventType(stored, acp.EventTypeError) ||
+			containsEventType(stored, acp.EventTypeDone) {
+			t.Fatalf("stored events = %#v, want partial chunk, terminal error, and no done", stored)
+		}
+		persistedError := storedEventByType(t, stored, acp.EventTypeError)
+		persistedAgentEvent, err := transcript.UnmarshalAgentEvent(persistedError.Content)
+		if err != nil {
+			t.Fatalf("UnmarshalAgentEvent(error event) error = %v", err)
+		}
+		meta := readMeta(t, sess.MetaPath())
+		if persistedAgentEvent.Failure == nil || meta.Failure == nil {
+			t.Fatalf(
+				"persisted/final failures = %#v / %#v, want crash bundle evidence",
+				persistedAgentEvent.Failure,
+				meta.Failure,
+			)
+		}
+		if got, want := persistedAgentEvent.Failure.CrashBundlePath, terminal.Failure.CrashBundlePath; got != want {
+			t.Fatalf("persisted crash bundle = %q, want public event bundle %q", got, want)
+		}
+		if got, want := meta.Failure.CrashBundlePath, persistedAgentEvent.Failure.CrashBundlePath; got != want {
+			t.Fatalf("final crash bundle = %q, want event-linked bundle %q", got, want)
+		}
+		bundle := readCrashBundleDocument(t, meta.Failure.CrashBundlePath)
+		if bundle.Process == nil || bundle.Process.ExitCode == nil || *bundle.Process.ExitCode != 23 {
+			t.Fatalf("crash bundle process = %#v, want exit code 23 after process stop", bundle.Process)
+		}
+		if got, want := bundle.Stderr, "codex stderr after EOF"; got != want {
+			t.Fatalf("crash bundle stderr = %q, want %q", got, want)
+		}
+	})
+}
+
+func TestPromptGenericFailureKeepsSessionActive(t *testing.T) {
+	t.Parallel()
+	for _, code := range []string{acp.ProviderErrorAuthRequired, acp.ProviderErrorRateLimited} {
+		t.Run("Should persist "+code+" and accept the next turn without stopping", func(t *testing.T) {
+			t.Parallel()
+			h := newHarness(t)
+			// With the sign-in wait off, an auth loss keeps today's contract; TestPromptProviderAuthRecovery owns the wait.
+			h.manager.authRecoveryDelays = nil
+			session := createSession(t, h)
+			t.Cleanup(func() { reportSessionStop(t, h, session.ID) })
+			at := time.Date(2026, 9, 5, 12, 0, 0, 0, time.UTC)
+			var prompts atomic.Int32
+			h.driver.promptHook = func(_ *fakeProcess, req acp.PromptRequest) (<-chan acp.AgentEvent, error) {
+				stream := make(chan acp.AgentEvent, 1)
+				event := acp.AgentEvent{
+					Type:      acp.EventTypeDone,
+					SessionID: session.Info().ACPSessionID,
+					TurnID:    req.TurnID,
+					Timestamp: at,
+				}
+				if prompts.Add(1) == 1 {
+					event.Type = acp.EventTypeError
+					event.Error = "provider requires recovery"
+					event.Failure = &store.SessionFailure{Kind: store.FailurePrompt, Summary: event.Error}
+					event.ProviderError = &acp.ProviderErrorDiagnostic{
+						Code: code, Provider: "provider-a", NextAction: acp.ProviderFailureActionRetry,
+						Guidance: "retry after provider recovery", OccurrenceCount: 1, FirstSeenAt: at, LastSeenAt: at,
+					}
+					if code == acp.ProviderErrorAuthRequired {
+						event.ProviderError.NextAction = acp.ProviderFailureActionLogin
+					}
+				}
+				stream <- event
+				close(stream)
+				return stream, nil
+			}
+			for _, expected := range []string{acp.EventTypeError, acp.EventTypeDone} {
+				stream, err := h.manager.Prompt(t.Context(), session.ID, "continue")
+				if err != nil {
+					t.Fatalf("prompt before %s: %v", expected, err)
+				}
+				events := collectEvents(t, stream)
+				if len(events) != 1 || events[0].Type != expected {
+					t.Fatalf("prompt events = %#v, want %s", events, expected)
+				}
+			}
+			if current, ok := h.manager.Get(
+				session.ID,
+			); !ok || current != session ||
+				current.Info().State != StateActive {
+				t.Fatal("provider recovery did not preserve the active session")
+			}
+			if h.driver.stopCalls != 0 {
+				t.Fatalf("driver stop calls = %d, want none", h.driver.stopCalls)
+			}
+			stored, err := h.manager.Events(
+				t.Context(),
+				session.ID,
+				store.EventQuery{Type: acp.EventTypeError, Limit: 10},
+			)
+			if err != nil || len(stored) != 1 {
+				t.Fatalf("stored provider errors = %d, error = %v", len(stored), err)
+			}
+			replayed, err := transcript.UnmarshalAgentEvent(stored[0].Content)
+			if err != nil || replayed.ProviderError == nil || replayed.ProviderError.Code != code {
+				t.Fatalf("replayed provider error = %#v, error = %v", replayed.ProviderError, err)
+			}
+			marker := requireTranscriptMarker(t, h.manager, session.ID, transcript.MarkerProviderFailure)
+			wantFingerprint := providerCommandFingerprint(h.driver.startCalls[0].Command)
+			if got := marker.Evidence["provider_command_fingerprint"]; got != wantFingerprint {
+				t.Fatalf("provider failure route = %v, want %s", got, wantFingerprint)
+			}
+		})
+	}
+	// UT-015/UT-028: an agent chain never runs after acceptance; an operator runtime
+	// change replaces the accepted-route record and a resume follows it.
+	t.Run("Should keep a chained agent available and never advance after acceptance", func(t *testing.T) {
+		t.Parallel()
+		h := newHarness(t)
+		ledger := installFallbackAgent(t, h, claudeSeatOneRoute(h), codexRoute(h))
+		created, err := h.manager.Create(t.Context(), new(CreateOpts{AgentName: "reviewer", Workspace: h.workspaceID}))
+		if err != nil {
+			t.Fatalf("Create(reviewer) error = %v", err)
+		}
+		session, _ := h.manager.Get(created.ID)
+		t.Cleanup(func() {
+			if err := h.manager.Stop(
+				testutil.Context(t),
+				session.ID,
+			); err != nil &&
+				!errors.Is(err, ErrSessionNotFound) {
+				t.Errorf("Stop(%q) cleanup error = %v", session.ID, err)
+			}
+		})
+		var prompts atomic.Int32
+		h.driver.promptHook = func(_ *fakeProcess, req acp.PromptRequest) (<-chan acp.AgentEvent, error) {
+			stream := make(chan acp.AgentEvent, 1)
+			event := acp.AgentEvent{Type: acp.EventTypeDone, TurnID: req.TurnID, Timestamp: time.Now()}
+			if prompts.Add(1) == 1 {
+				event.Type = acp.EventTypeError
+				event.Error = "HTTP 429 rate limit exceeded"
+				event.Failure = &store.SessionFailure{Kind: store.FailurePrompt, Summary: event.Error}
+				event.ProviderError = &acp.ProviderErrorDiagnostic{
+					Code: acp.ProviderErrorRateLimited, Provider: "claude", NextAction: acp.ProviderFailureActionRetry,
+					OccurrenceCount: 1,
+				}
+			}
+			stream <- event
+			close(stream)
+			return stream, nil
+		}
+		for _, expected := range []string{acp.EventTypeError, acp.EventTypeDone} {
+			stream, err := h.manager.Prompt(t.Context(), session.ID, "continue")
+			if err != nil {
+				t.Fatalf("prompt before %s: %v", expected, err)
+			}
+			if events := collectEvents(t, stream); len(events) != 1 || events[0].Type != expected {
+				t.Fatalf("prompt events = %#v, want %s", events, expected)
+			}
+		}
+		if session.Info().State != StateActive || len(startCommands(h)) != 1 || len(ledger.fallbackRows()) != 0 {
+			t.Fatalf("after a turn refusal: state=%s starts=%v rows=%d, want active, one start, no fallback",
+				session.Info().State, startCommands(h), len(ledger.fallbackRows()))
+		}
+		stored, err := h.manager.Events(t.Context(), session.ID, store.EventQuery{Type: acp.EventTypeError, Limit: 10})
+		if err != nil || len(stored) != 1 {
+			t.Fatalf("stored provider errors = %d, error = %v", len(stored), err)
+		}
+		if replayed, err := transcript.UnmarshalAgentEvent(stored[0].Content); err != nil ||
+			replayed.ProviderError == nil || replayed.ProviderError.NextAction != acp.ProviderFailureActionHandoff {
+			// A post-acceptance refusal never advances the chain (no use_fallback); on a user
+			// session the session owner prescribes handoff (session-continue-fork ADR-006).
+			t.Fatalf("turn refusal next_action = %#v, error = %v, want handoff", replayed.ProviderError, err)
+		}
+
+		codexModel := h.cfg.Providers["codex"].Models.Default
+		if _, err := h.manager.SetRuntimeSelection(
+			t.Context(), session.ID, RuntimeSelection{Provider: "codex", Model: codexModel}, 0,
+		); err != nil {
+			t.Fatalf("SetRuntimeSelection(codex) error = %v", err)
+		}
+		stream, err := h.manager.Prompt(t.Context(), session.ID, "on codex")
+		if err != nil {
+			t.Fatalf("Prompt(codex) error = %v", err)
+		}
+		collectEvents(t, stream)
+		codexCommand := h.cfg.Providers["codex"].Command
+		if got := startCommands(h); len(got) != 2 || got[1] != codexCommand || len(ledger.fallbackRows()) != 0 {
+			t.Fatalf("runtime set starts = %v rows=%d, want the requested codex route and no fallback event",
+				got, len(ledger.fallbackRows()))
+		}
+		meta := readMeta(t, session.MetaPath())
+		if meta.AcceptedRoute == nil || meta.AcceptedRoute.Provider != "codex" || meta.AcceptedRoute.Attempt != 0 ||
+			meta.AcceptedRoute.CommandFingerprint != providerCommandFingerprint(codexCommand) ||
+			derefString(meta.ACPSessionID) != "acp-2" {
+			t.Fatalf("meta after runtime set = %#v acp=%v, want codex attempt 0 with acp-2",
+				meta.AcceptedRoute, meta.ACPSessionID)
+		}
+		if err := h.manager.Stop(t.Context(), session.ID); err != nil {
+			t.Fatalf("Stop() error = %v", err)
+		}
+		resumed, err := h.manager.Resume(t.Context(), session.ID)
+		if err != nil {
+			t.Fatalf("Resume() error = %v", err)
+		}
+		h.driver.mu.Lock()
+		resumeCall := h.driver.startCalls[len(h.driver.startCalls)-1]
+		h.driver.mu.Unlock()
+		if resumeCall.Command != codexCommand || resumeCall.ResumeSessionID != "acp-2" {
+			t.Fatalf(
+				"resume start = %q/%q, want the codex route loading acp-2",
+				resumeCall.Command,
+				resumeCall.ResumeSessionID,
+			)
+		}
+		session = resumed
+	})
+	t.Run("Should keep generic prompt failures active", func(t *testing.T) {
+		t.Parallel()
+		h := newHarness(t)
+		session := createSession(t, h)
+		t.Cleanup(func() {
+			if _, ok := h.manager.Get(session.ID); ok {
+				reportSessionStop(t, h, session.ID)
+			}
+		})
+
+		h.driver.promptHook = func(_ *fakeProcess, req acp.PromptRequest) (<-chan acp.AgentEvent, error) {
+			events := make(chan acp.AgentEvent, 1)
+			go func() {
+				defer close(events)
+				events <- acp.AgentEvent{
+					Type:      acp.EventTypeError,
+					SessionID: session.Info().ACPSessionID,
+					TurnID:    req.TurnID,
+					Timestamp: time.Now().UTC(),
+					Error:     `{"code":-32603,"message":"Internal error","data":{"details":"Tool invocation failed"}}`,
+					Failure: &store.SessionFailure{
+						Kind:    store.FailurePrompt,
+						Summary: `{"code":-32603,"message":"Internal error","data":{"details":"Tool invocation failed"}}`,
+					},
+				}
+			}()
+			return events, nil
+		}
+
+		eventsCh, err := h.manager.Prompt(testutil.Context(t), session.ID, "hello")
+		if err != nil {
+			t.Fatalf("Prompt() error = %v", err)
+		}
+		events := collectEvents(t, eventsCh)
+		if got, want := len(events), 1; got != want {
+			t.Fatalf("Prompt() events = %d, want %d", got, want)
+		}
+
+		if _, ok := h.manager.Get(session.ID); !ok {
+			t.Fatal("session removed after generic prompt failure, want still active")
+		}
+		if got := h.driver.stopCalls; got != 0 {
+			t.Fatalf("driver stop calls = %d, want 0", got)
+		}
+
+		resumed, err := h.manager.Resume(testutil.Context(t), session.ID)
+		if err != nil {
+			t.Fatalf("Resume(active) error = %v", err)
+		}
+		if resumed != session {
+			t.Fatalf("Resume(active) returned %p, want %p", resumed, session)
+		}
+	})
+}
+
+func TestCancelPrompt(t *testing.T) {
+	t.Parallel()
+
+	t.Run(
+		"Should deliver an accepted cancellation after the provider stream ends without replaying an active turn",
+		func(t *testing.T) {
+			t.Parallel()
+			h := newHarness(t)
+			active := createSession(t, h)
+			t.Cleanup(func() { reportSessionStop(t, h, active.ID) })
+			source := make(chan acp.AgentEvent)
+			h.driver.promptHook = func(*fakeProcess, acp.PromptRequest) (<-chan acp.AgentEvent, error) {
+				return source, nil
+			}
+			ctx := testutil.Context(t)
+			output, err := h.manager.Prompt(ctx, active.ID, "cancel before worker dispatch")
+			if err != nil {
+				t.Fatal(err)
+			}
+			run, owned, err := active.claimTurnStop("")
+			if err != nil || !owned {
+				t.Fatalf("claim turn stop = %t, %v", owned, err)
+			}
+			// Reproduce the scheduling gap between the accepted claim and its worker.
+			close(source)
+			collectEvents(t, output)
+			replay, err := h.manager.CancelPrompt(ctx, active.ID)
+			if err != nil || replay.Outcome != PromptCancelOutcomeNothingInFlight {
+				t.Errorf("cancel after prompt drain = %+v, %v; want nothing in flight", replay, err)
+			}
+			h.manager.executeTurnStop(ctx, run, CauseUserRequested)
+			if err := h.manager.WaitForPromptDrains(ctx); err != nil {
+				t.Fatal(err)
+			}
+			if got := h.driver.cancelCalls; got != 1 {
+				t.Errorf("provider cancel calls = %d, want 1", got)
+			}
+			if got := len(h.driver.interruptScopes); got != 1 {
+				t.Errorf("scoped interrupt calls = %d, want 1", got)
+			}
+			if run.err != nil || !run.outcome.Quiesced || run.outcome.Escalated {
+				t.Fatalf("turn stop = %+v, %v; want cooperative quiescence", run.outcome, run.err)
+			}
+		},
+	)
+
+	t.Run("Should keep the session active when the canceled provider stream closes without a terminal", func(
+		t *testing.T,
+	) {
+		t.Parallel()
+
+		h := newHarness(t)
+		session := createSession(t, h)
+		t.Cleanup(func() {
+			if _, ok := h.manager.Get(session.ID); ok {
+				reportSessionStop(t, h, session.ID)
+			}
+		})
+
+		firstPromptEvents := make(chan acp.AgentEvent)
+		promptStarted := make(chan struct{})
+		var promptCalls atomic.Int32
+		h.driver.promptHook = func(proc *fakeProcess, req acp.PromptRequest) (<-chan acp.AgentEvent, error) {
+			if promptCalls.Add(1) == 1 {
+				close(promptStarted)
+				return firstPromptEvents, nil
+			}
+			events := make(chan acp.AgentEvent, 1)
+			events <- acp.AgentEvent{
+				Type:      acp.EventTypeDone,
+				SessionID: proc.handle.SessionID,
+				TurnID:    req.TurnID,
+				Timestamp: time.Now().UTC(),
+			}
+			close(events)
+			return events, nil
+		}
+
+		eventsCh, err := h.manager.Prompt(testutil.Context(t), session.ID, "hello")
+		if err != nil {
+			t.Fatalf("Prompt() error = %v", err)
+		}
+
+		select {
+		case <-promptStarted:
+		case <-time.After(time.Second):
+			t.Fatal("driver prompt did not start")
+		}
+		if !session.IsPrompting() {
+			t.Fatal("session IsPrompting() = false after driver prompt started")
+		}
+
+		cancelResult, err := h.manager.CancelPrompt(
+			WithActingSession(testutil.Context(t), "sess-creator"),
+			session.ID,
+		)
+		if err != nil {
+			t.Fatalf("CancelPrompt() error = %v", err)
+		}
+		if cancelResult.Outcome != PromptCancelOutcomeCanceled || strings.TrimSpace(cancelResult.TurnID) == "" {
+			t.Fatalf("CancelPrompt() = %#v, want canceled turn", cancelResult)
+		}
+		repeated, err := h.manager.CancelPrompt(testutil.Context(t), session.ID)
+		if err != nil {
+			t.Fatalf("CancelPrompt(repeated) error = %v", err)
+		}
+		if repeated != cancelResult {
+			t.Fatalf("CancelPrompt(repeated) = %#v, want idempotent %#v", repeated, cancelResult)
+		}
+
+		close(firstPromptEvents)
+		var canceledEvents []acp.AgentEvent
+		waitForClose := time.NewTimer(2 * time.Second)
+		defer waitForClose.Stop()
+	drainCanceledPrompt:
+		for {
+			select {
+			case event, ok := <-eventsCh:
+				if !ok {
+					break drainCanceledPrompt
+				}
+				canceledEvents = append(canceledEvents, event)
+			case <-waitForClose.C:
+				t.Fatal("timed out waiting for canceled prompt output to close")
+			}
+		}
+		for _, event := range canceledEvents {
+			if event.Failure != nil && (event.Failure.Kind == store.FailureTransport ||
+				event.Failure.Kind == store.FailureProcess) {
+				t.Fatalf(
+					"canceled prompt event failure kind = %q, want no fatal runtime failure",
+					event.Failure.Kind,
+				)
+			}
+		}
+		if len(canceledEvents) != 1 || canceledEvents[0].Type != acp.EventTypeDone ||
+			canceledEvents[0].PromptStopReason != acp.PromptStopReasonCancelled {
+			t.Fatalf("canceled prompt events = %#v, want one canceled done event", canceledEvents)
+		}
+		if err := h.manager.WaitForPromptDrains(testutil.Context(t)); err != nil {
+			t.Fatalf("WaitForPromptDrains() error = %v", err)
+		}
+		if got := h.driver.cancelCalls; got != 1 {
+			t.Fatalf("driver cancel calls = %d, want 1", got)
+		}
+		if got := len(h.driver.interruptScopes); got != 1 {
+			t.Fatalf("driver interrupt calls = %d, want 1", got)
+		}
+		if got := h.driver.interruptScopes[0]; got.SessionID != session.ID || got.TurnID == "" {
+			t.Fatalf("driver interrupt scope = %#v, want session and turn", got)
+		}
+
+		if session.IsPrompting() {
+			t.Fatal("session IsPrompting() = true after canceled prompt drain")
+		}
+		marker := requireTranscriptMarker(t, h.manager, session.ID, transcript.MarkerPromptCancel)
+		if marker.Evidence["actor_kind"] != actingSessionActorKind ||
+			marker.Evidence["actor_id"] != "sess-creator" {
+			t.Fatalf("prompt cancel marker evidence = %#v, want acting session", marker.Evidence)
+		}
+		active, ok := h.manager.Get(session.ID)
+		if !ok {
+			t.Fatal("session removed after prompt cancellation")
+		}
+		if got := active.Info().State; got != StateActive {
+			t.Fatalf("session state = %q, want %q", got, StateActive)
+		}
+		if got := h.driver.stopCalls; got != 0 {
+			t.Fatalf("driver stop calls = %d, want 0", got)
+		}
+		if got := h.notifier.stoppedCount(); got != 0 {
+			t.Fatalf("post-stop notifications = %d, want 0", got)
+		}
+
+		nextEvents, err := h.manager.Prompt(testutil.Context(t), session.ID, "next prompt")
+		if err != nil {
+			t.Fatalf("next Prompt() error = %v", err)
+		}
+		if events := collectEvents(t, nextEvents); len(events) != 1 || events[0].Type != acp.EventTypeDone {
+			t.Fatalf("next Prompt() events = %#v, want one done event", events)
+		}
+	})
+
+	t.Run("Should cancel prompt setup before driver prompt is registered", func(t *testing.T) {
+		t.Parallel()
+
+		h := newHarness(t)
+		created, err := h.manager.CreateAccepted(testutil.Context(t), new(CreateAcceptedOpts{
+			Session: CreateOpts{AgentName: "coder", Workspace: h.workspaceID},
+		}))
+		if err != nil {
+			t.Fatalf("CreateAccepted() error = %v", err)
+		}
+		session, ok := h.manager.Get(created.ID)
+		if !ok {
+			t.Fatalf("Get(%q) did not find accepted session", created.ID)
+		}
+		t.Cleanup(func() {
+			if err := h.manager.Stop(testutil.Context(t), session.ID); err != nil &&
+				!errors.Is(err, ErrSessionNotFound) {
+				t.Errorf("Stop(%q) cleanup error = %v", session.ID, err)
+			}
+		})
+
+		startEntered := make(chan struct{})
+		h.driver.startContextHook = func(startCtx context.Context, _ acp.StartOpts, _ int) (*fakeProcess, error) {
+			close(startEntered)
+			<-startCtx.Done()
+			return nil, startCtx.Err()
+		}
+		promptResult := make(chan error, 1)
+		go func() {
+			_, promptErr := h.manager.Prompt(testutil.Context(t), session.ID, "cancel during setup")
+			promptResult <- promptErr
+		}()
+		select {
+		case <-startEntered:
+		case <-testutil.Context(t).Done():
+			t.Fatal("runtime binding did not start")
+		}
+		if !session.IsPrompting() || strings.TrimSpace(session.CurrentTurnID()) == "" {
+			t.Fatalf(
+				"prompt setup state = prompting:%t turn:%q, want owned turn",
+				session.IsPrompting(),
+				session.CurrentTurnID(),
+			)
+		}
+
+		result, err := h.manager.CancelPrompt(testutil.Context(t), session.ID)
+		if err != nil {
+			t.Fatalf("CancelPrompt() error = %v", err)
+		}
+		if result.Outcome != PromptCancelOutcomeCanceled || strings.TrimSpace(result.TurnID) == "" {
+			t.Fatalf("CancelPrompt() = %#v, want canceled setup turn", result)
+		}
+		select {
+		case promptErr := <-promptResult:
+			if !errors.Is(promptErr, context.Canceled) {
+				t.Fatalf("Prompt() error = %v, want context cancellation", promptErr)
+			}
+		case <-testutil.Context(t).Done():
+			t.Fatal("prompt setup did not stop after CancelPrompt()")
+		}
+		if _, err := h.manager.AwaitTurnQuiesced(testutil.Context(t), session.ID, result.TurnID); err != nil {
+			t.Fatal(err)
+		}
+		if session.IsPrompting() {
+			t.Fatal("session IsPrompting() = true after canceled setup")
+		}
+		if got := len(h.driver.promptCalls); got != 0 {
+			t.Fatalf("driver prompt calls = %d, want 0", got)
+		}
+		requireTranscriptMarker(t, h.manager, session.ID, transcript.MarkerPromptCancel)
+	})
+
+	t.Run("Should no-op when a prompting session loses its process handle", func(t *testing.T) {
+		t.Parallel()
+
+		h := newHarness(t)
+		session := createSession(t, h)
+		t.Cleanup(func() {
+			session.clearCurrentTurnSource()
+			reportSessionStop(t, h, session.ID)
+		})
+
+		session.setCurrentTurnSource(TurnSourceUser)
+		session.clearProcess(time.Now().UTC())
+
+		if _, err := h.manager.CancelPrompt(testutil.Context(t), session.ID); err != nil {
+			t.Fatalf("CancelPrompt() error = %v", err)
+		}
+		if got := h.driver.cancelCalls; got != 0 {
+			t.Fatalf("driver cancel calls = %d, want 0", got)
+		}
+	})
+
+	t.Run("Should ignore cancel errors once the process is already done", func(t *testing.T) {
+		t.Parallel()
+
+		cleanupCtx, cancelCleanup := context.WithTimeout(context.WithoutCancel(t.Context()), 45*time.Second)
+		t.Cleanup(cancelCleanup)
+		catalog := newRecordingSessionCatalog()
+		h := newHarness(t, WithSessionCatalog(catalog))
+		session := createSession(t, h)
+		t.Cleanup(func() {
+			reportSessionStop(t, h, session.ID)
+		})
+		stopping := make(chan struct{})
+		release := make(chan struct{})
+		releaseFinalization := sync.OnceFunc(func() { close(release) })
+		defer releaseFinalization()
+		signalStopping := sync.OnceFunc(func() { close(stopping) })
+		catalog.mu.Lock()
+		catalog.updateHook = func(update store.SessionStateUpdate) error {
+			if update.State == string(StateStopping) {
+				signalStopping()
+				select {
+				case <-release:
+				case <-cleanupCtx.Done():
+					return cleanupCtx.Err()
+				}
+			}
+			return nil
+		}
+		catalog.mu.Unlock()
+
+		session.setCurrentTurnSource(TurnSourceUser)
+		h.driver.cancelHook = func(_ *fakeProcess) error {
+			return errors.New("test: cancel after process exit")
+		}
+		h.driver.lastProcess().exit()
+		select {
+		case <-stopping:
+		case <-t.Context().Done():
+			t.Fatal("process exit did not begin finalization")
+		}
+
+		result, err := h.manager.CancelPrompt(t.Context(), session.ID)
+		if err != nil {
+			t.Fatalf("CancelPrompt() error = %v", err)
+		}
+		if result.Outcome != PromptCancelOutcomeNothingInFlight {
+			t.Fatalf("CancelPrompt() = %#v, want nothing in flight", result)
+		}
+		if got := h.driver.cancelCalls; got != 0 {
+			t.Fatalf("driver cancel calls = %d, want 0", got)
+		}
+	})
+
+	for _, scopedFailure := range []bool{false, true} {
+		name := "Should escalate a failed provider cancellation automatically"
+		if scopedFailure {
+			name = "Should escalate a failed scoped tool interruption automatically"
+		}
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+			h := newHarness(t)
+			session := createSession(t, h)
+			source := make(chan acp.AgentEvent)
+			closeSource := sync.OnceFunc(func() { close(source) })
+			t.Cleanup(closeSource)
+			h.driver.promptHook = func(*fakeProcess, acp.PromptRequest) (<-chan acp.AgentEvent, error) { return source, nil }
+			if scopedFailure {
+				h.driver.interruptErr = errors.New("test: scoped interrupt failure")
+			} else {
+				h.driver.cancelHook = func(*fakeProcess) error { return errors.New("test: provider cancel failure") }
+			}
+			h.driver.stopHook = func(proc *fakeProcess) error { closeSource(); proc.exit(); return nil }
+			t.Cleanup(func() { reportSessionStop(t, h, session.ID) })
+			events, err := h.manager.Prompt(t.Context(), session.ID, "cancel failing provider")
+			if err != nil {
+				t.Fatal(err)
+			}
+			result, err := h.manager.CancelPrompt(t.Context(), session.ID)
+			if err != nil || result.Outcome != PromptCancelOutcomeCanceled {
+				t.Fatalf("cancel admission = %#v, %v", result, err)
+			}
+			outcome, err := h.manager.AwaitTurnQuiesced(t.Context(), session.ID, result.TurnID)
+			if err != nil || !outcome.Quiesced || !outcome.Escalated || outcome.Phase != StopPhaseForced {
+				t.Fatalf("escalated outcome = %#v, %v", outcome, err)
+			}
+			collectEvents(t, events)
+			if session.Info().State != StateActive || session.IsPrompting() {
+				t.Fatal("session did not remain promptable after escalated cancellation")
+			}
+		})
+	}
+
+	t.Run("Should no-op for an active session without a prompt", func(t *testing.T) {
+		t.Parallel()
+
+		h := newHarness(t)
+		session := createSession(t, h)
+		t.Cleanup(func() {
+			reportSessionStop(t, h, session.ID)
+		})
+
+		result, err := h.manager.CancelPrompt(testutil.Context(t), session.ID)
+		if err != nil {
+			t.Fatalf("CancelPrompt() error = %v", err)
+		}
+		if result.Outcome != PromptCancelOutcomeNothingInFlight {
+			t.Fatalf("CancelPrompt() = %#v, want nothing-in-flight", result)
+		}
+		if got := h.driver.cancelCalls; got != 0 {
+			t.Fatalf("driver cancel calls = %d, want 0", got)
+		}
+	})
+
+	t.Run("Should no-op for a known stopped session", func(t *testing.T) {
+		t.Parallel()
+
+		h := newHarness(t)
+		session := createSession(t, h)
+		if err := h.manager.Stop(testutil.Context(t), session.ID); err != nil {
+			t.Fatalf("Stop() error = %v", err)
+		}
+
+		previousCancels := h.driver.cancelCalls
+		result, err := h.manager.CancelPrompt(testutil.Context(t), session.ID)
+		if err != nil {
+			t.Fatalf("CancelPrompt() error = %v", err)
+		}
+		if result.Outcome != PromptCancelOutcomeNothingInFlight {
+			t.Fatalf("CancelPrompt() = %#v, want nothing-in-flight", result)
+		}
+		if got := h.driver.cancelCalls; got != previousCancels {
+			t.Fatalf("driver cancel calls = %d, want unchanged %d", got, previousCancels)
+		}
+	})
+
+	t.Run("Should return ErrSessionNotFound for an unknown session", func(t *testing.T) {
+		t.Parallel()
+
+		h := newHarness(t)
+
+		_, err := h.manager.CancelPrompt(testutil.Context(t), "missing")
+		if !errors.Is(err, ErrSessionNotFound) {
+			t.Fatalf("CancelPrompt(missing) error = %v, want ErrSessionNotFound", err)
+		}
+	})
+}
+
+func TestPromptPersistsUserMessageBeforeDriverPrompt(t *testing.T) {
+	t.Parallel()
+
+	h := newHarness(t)
+	session := createSession(t, h)
+	t.Cleanup(func() {
+		reportSessionStop(t, h, session.ID)
+	})
+
+	var storedBeforePrompt []store.SessionEvent
+	h.driver.promptHook = func(_ *fakeProcess, req acp.PromptRequest) (<-chan acp.AgentEvent, error) {
+		events, err := session.recorderHandle().Query(testutil.Context(t), store.EventQuery{})
+		if err != nil {
+			return nil, err
+		}
+		storedBeforePrompt = events
+
+		ch := make(chan acp.AgentEvent, 1)
+		ch <- acp.AgentEvent{
+			Type:             acp.EventTypeDone,
+			TurnID:           req.TurnID,
+			StopReason:       string(acp.PromptStopReasonEndTurn),
+			PromptStopReason: acp.PromptStopReasonEndTurn,
+		}
+		close(ch)
+		return ch, nil
+	}
+
+	eventsCh, err := h.manager.Prompt(testutil.Context(t), session.ID, "remember me")
+	if err != nil {
+		t.Fatalf("Prompt() error = %v", err)
+	}
+	for event := range eventsCh {
+		_ = event
+	}
+
+	if len(storedBeforePrompt) != 1 {
+		t.Fatalf("storedBeforePrompt = %d events, want 1", len(storedBeforePrompt))
+	}
+	if got := storedBeforePrompt[0].Type; got != acp.EventTypeUserMessage {
+		t.Fatalf("storedBeforePrompt[0].Type = %q, want %q", got, acp.EventTypeUserMessage)
+	}
+	if !strings.Contains(storedBeforePrompt[0].Content, `"text":"remember me"`) {
+		t.Fatalf("stored user_message content = %s", storedBeforePrompt[0].Content)
+	}
+}
+
+func TestApplyAutomaticSessionTitleOwnsGeneratedIdentity(t *testing.T) {
+	t.Parallel()
+
+	t.Run("Should include the ellipsis inside the eight-word and sixty-four-rune bounds", func(t *testing.T) {
+		t.Parallel()
+
+		got := normalizeAutomaticSessionTitle(
+			"aaaaaaa bbbbbbb ccccccc ddddddd eeeeeee fffffff ggggggg hhhhhhhh ninth",
+		)
+		if words := strings.Fields(got); len(words) != automaticSessionTitleMaxWords {
+			t.Fatalf("normalized title words = %d, want %d; title=%q", len(words), automaticSessionTitleMaxWords, got)
+		}
+		if runes := utf8.RuneCountInString(got); runes != automaticSessionTitleMaxRunes {
+			t.Fatalf("normalized title runes = %d, want %d; title=%q", runes, automaticSessionTitleMaxRunes, got)
+		}
+		if !strings.HasSuffix(got, "…") {
+			t.Fatalf("normalized title = %q, want ellipsis", got)
+		}
+	})
+
+	t.Run("Should keep only clean title text from generator output", func(t *testing.T) {
+		t.Parallel()
+
+		tests := []struct {
+			name   string
+			output string
+			want   string
+		}{
+			{
+				name:   "trailing notice glued to the title",
+				output: "Fluxos automáticos de e-mails da plataforma**Notice:** Stop saying that",
+				want:   "Fluxos automáticos de e-mails da plataforma",
+			},
+			{
+				name:   "emphasized notice after a space",
+				output: "Checkout retry race **Reminder:** review your plan",
+				want:   "Checkout retry race",
+			},
+			{
+				name:   "plain notice after a sentence",
+				output: "Checkout retry race. Note: be brief",
+				want:   "Checkout retry race",
+			},
+			{
+				name:   "plain notice glued to the title",
+				output: "Checkout retry raceNotice: be brief",
+				want:   "Checkout retry race",
+			},
+			{name: "whole title emphasis", output: "**Checkout retry race**", want: "Checkout retry race"},
+			{
+				name:   "inline emphasis and code",
+				output: "Fix **checkout** `retry` _race_",
+				want:   "Fix checkout retry race",
+			},
+			{name: "heading", output: "## Checkout retry race", want: "Checkout retry race"},
+			{name: "label and quotes", output: "**Title:** \"Checkout retry race\"", want: "Checkout retry race"},
+			{name: "Portuguese label", output: "Título: Localizar resenhas", want: "Localizar resenhas"},
+			{name: "unaccented label", output: "Titulo: Localizar resenhas", want: "Localizar resenhas"},
+			{
+				name:   "title suggestion label in Portuguese",
+				output: "Sugestão de título: Localizar resenhas",
+				want:   "Localizar resenhas",
+			},
+			{
+				name:   "suggested label in Portuguese",
+				output: "Título sugerido: Localizar resenhas",
+				want:   "Localizar resenhas",
+			},
+			{
+				name:   "unaccented suggested label",
+				output: "titulo sugerido: Localizar resenhas",
+				want:   "Localizar resenhas",
+			},
+			{
+				name:   "session label in Portuguese",
+				output: "Título da sessão: Verificar importação",
+				want:   "Verificar importação",
+			},
+			{
+				name:   "unaccented session label",
+				output: "Titulo da sessao: Verificar importação",
+				want:   "Verificar importação",
+			},
+			{
+				name:   "emphasized quoted Portuguese label",
+				output: "**Título sugerido:** \"Localizar resenhas\"",
+				want:   "Localizar resenhas",
+			},
+			{
+				name:   "colon outside the emphasized label",
+				output: "**Título da sessão**: Verificar importação",
+				want:   "Verificar importação",
+			},
+			{
+				name:   "label inside curly quotes",
+				output: "“Título sugerido: Localizar resenhas”",
+				want:   "Localizar resenhas",
+			},
+			{name: "suggested label", output: "Suggested title: Checkout retry race", want: "Checkout retry race"},
+			{name: "session label", output: "Session title: Checkout retry race", want: "Checkout retry race"},
+			{
+				name:   "Spanish session label",
+				output: "Título de la sesión: Corregir reintentos",
+				want:   "Corregir reintentos",
+			},
+			{name: "French label", output: "Titre suggéré : Corriger les relances", want: "Corriger les relances"},
+			{name: "German label", output: "Vorgeschlagener Titel: Wiederholung beheben", want: "Wiederholung beheben"},
+			{name: "Italian label", output: "Titolo della sessione: Correggere i retry", want: "Correggere i retry"},
+			{
+				name:   "colon title with the word title",
+				output: "Fix title: colon handling",
+				want:   "Fix title: colon handling",
+			},
+			{
+				name:   "plural Portuguese colon title",
+				output: "Títulos de sessões: limpeza",
+				want:   "Títulos de sessões: limpeza",
+			},
+			{
+				name:   "label words opening a longer phrase",
+				output: "Título da sessão perdido: correção",
+				want:   "Título da sessão perdido: correção",
+			},
+			{name: "compound word before a colon", output: "Subtitle: sync fix", want: "Subtitle: sync fix"},
+			{
+				name:   "bare label before the title line",
+				output: "Título sugerido:\nLocalizar resenhas",
+				want:   "Localizar resenhas",
+			},
+			{name: "only a Portuguese label", output: "Título sugerido:", want: ""},
+			{name: "only an emphasized label", output: "**Session title:**", want: ""},
+			{name: "identifiers survive", output: "Fix auto_title 5*3 grid", want: "Fix auto_title 5*3 grid"},
+			{
+				name:   "lowercase notice word survives",
+				output: "Fix notice: banner spacing",
+				want:   "Fix notice: banner spacing",
+			},
+			{
+				name:   "multi-line keeps the first title line",
+				output: "Checkout retry race\n\nI kept it short.",
+				want:   "Checkout retry race",
+			},
+			{name: "CRLF lines", output: "Checkout retry race\r\nSecond line", want: "Checkout retry race"},
+			{
+				name:   "notice line before the title",
+				output: "**Notice:** Stop saying that\nCheckout retry race",
+				want:   "Checkout retry race",
+			},
+			{
+				name:   "preamble before the title",
+				output: "Here is a title:\n\nCheckout retry race",
+				want:   "Checkout retry race",
+			},
+			{
+				name:   "lowercase emphasized notice glued to the title",
+				output: "Checkout retry race**notice:** keep brief",
+				want:   "Checkout retry race",
+			},
+			{
+				name:   "underscore notice glued to the title",
+				output: "Checkout retry race__Notice:__ keep brief",
+				want:   "Checkout retry race",
+			},
+			{
+				name:   "language-tagged code fence",
+				output: "```text\nCheckout retry race\n```",
+				want:   "Checkout retry race",
+			},
+			{
+				name:   "emphasis around a colon phrase",
+				output: "Fix *checkout* retries: *race conditions*",
+				want:   "Fix checkout retries: race conditions",
+			},
+			{
+				name:   "Markdown link",
+				output: "[Checkout retries](https://example.com) fix",
+				want:   "Checkout retries fix",
+			},
+			{
+				name:   "Markdown link with parentheses in its destination",
+				output: "[Checkout retries](https://example.com/a_(draft)_v2) fix",
+				want:   "Checkout retries fix",
+			},
+			{name: "Markdown image only", output: "![](https://example.com/a.png)", want: ""},
+			{name: "quoted notice", output: "\"Notice: be brief\"", want: ""},
+			{name: "quoted notice inside a list item", output: "\"- Notice: be brief\"", want: ""},
+			{name: "only a notice", output: "**Notice:** Stop saying that", want: ""},
+			{name: "only punctuation", output: "--- … ()", want: ""},
+			{name: "empty", output: " \n\t", want: ""},
+		}
+		for _, test := range tests {
+			t.Run("Should handle "+test.name, func(t *testing.T) {
+				t.Parallel()
+
+				got := CleanAutomaticSessionTitle(test.output)
+				if got != test.want {
+					t.Fatalf("CleanAutomaticSessionTitle(%q) = %q, want %q", test.output, got, test.want)
+				}
+				if again := CleanAutomaticSessionTitle(got); again != got {
+					t.Fatalf("CleanAutomaticSessionTitle(%q) = %q, want idempotent", got, again)
+				}
+			})
+		}
+	})
+
+	t.Run("Should keep a session unnamed when the title is unusable", func(t *testing.T) {
+		t.Parallel()
+
+		h := newHarness(t)
+		session, err := h.manager.Create(testutil.Context(t), new(CreateOpts{
+			AgentName: "coder",
+			Workspace: h.workspaceID,
+			Type:      SessionTypeUser,
+		}))
+		if err != nil {
+			t.Fatalf("Create() error = %v", err)
+		}
+		applied, err := h.manager.ApplyAutomaticSessionTitle(
+			testutil.Context(t), session.ID, "**Notice:** Stop saying that",
+		)
+		if err != nil {
+			t.Fatalf("ApplyAutomaticSessionTitle() error = %v", err)
+		}
+		if applied || session.Info().Name != "" {
+			t.Fatalf("applied = %v, name = %q, want an unnamed session", applied, session.Info().Name)
+		}
+	})
+
+	t.Run("Should hide the generated title until identity persistence completes", func(t *testing.T) {
+		t.Parallel()
+
+		catalog := newRecordingSessionCatalog()
+		h := newHarness(t, WithSessionCatalog(catalog))
+		session, err := h.manager.Create(testutil.Context(t), new(CreateOpts{
+			AgentName: "coder",
+			Workspace: h.workspaceID,
+			Type:      SessionTypeUser,
+		}))
+		if err != nil {
+			t.Fatalf("Create() error = %v", err)
+		}
+		t.Cleanup(func() {
+			if stopErr := h.manager.Stop(testutil.Context(t), session.ID); stopErr != nil &&
+				!errors.Is(stopErr, ErrSessionNotFound) {
+				t.Errorf("Stop() error = %v", stopErr)
+			}
+		})
+
+		const wantTitle = "Checkout webhook retries"
+		persistenceStarted := make(chan struct{})
+		releasePersistence := make(chan struct{})
+		release := sync.OnceFunc(func() { close(releasePersistence) })
+		t.Cleanup(release)
+		catalog.registerHook = func(ctx context.Context, infoInput *store.SessionInfo) error {
+			info := *infoInput
+
+			if info.Name != wantTitle {
+				return nil
+			}
+			close(persistenceStarted)
+			select {
+			case <-releasePersistence:
+				return nil
+			case <-ctx.Done():
+				return ctx.Err()
+			}
+		}
+
+		type applyResult struct {
+			applied bool
+			err     error
+		}
+		resultCh := make(chan applyResult, 1)
+		go func() {
+			applied, applyErr := h.manager.ApplyAutomaticSessionTitle(
+				testutil.Context(t),
+				session.ID,
+				wantTitle,
+			)
+			resultCh <- applyResult{applied: applied, err: applyErr}
+		}()
+
+		select {
+		case <-persistenceStarted:
+		case <-time.After(time.Second):
+			t.Fatal("automatic title persistence did not reach the catalog")
+		}
+		if session.mu.TryRLock() {
+			session.mu.RUnlock()
+			t.Fatal("session read lock acquired during persistence, want blocked")
+		}
+
+		release()
+		result := <-resultCh
+		if result.err != nil {
+			t.Fatalf("ApplyAutomaticSessionTitle() error = %v", result.err)
+		}
+		if !result.applied {
+			t.Fatal("ApplyAutomaticSessionTitle() applied = false, want true")
+		}
+		if got := session.Info().Name; got != wantTitle {
+			t.Fatalf("session title after persistence = %q, want %q", got, wantTitle)
+		}
+	})
+
+	t.Run("Should persist the first generated title as durable session identity", func(t *testing.T) {
+		t.Parallel()
+
+		catalog := newRecordingSessionCatalog()
+		h := newHarness(t, WithSessionCatalog(catalog))
+		session, err := h.manager.Create(testutil.Context(t), new(CreateOpts{
+			AgentName: "coder",
+			Workspace: h.workspaceID,
+			Type:      SessionTypeUser,
+		}))
+		if err != nil {
+			t.Fatalf("Create() error = %v", err)
+		}
+		t.Cleanup(func() {
+			if stopErr := h.manager.Stop(testutil.Context(t), session.ID); stopErr != nil &&
+				!errors.Is(stopErr, ErrSessionNotFound) {
+				t.Errorf("Stop() error = %v", stopErr)
+			}
+		})
+		catalogEvents, cancelCatalogEvents, err := h.manager.SubscribeSessionCatalogEvents(
+			testutil.Context(t),
+			CatalogScope{ReadScope: store.ReadScope{AllProfiles: true}, AllWorkspaces: true},
+		)
+		if err != nil {
+			t.Fatalf("SubscribeSessionCatalogEvents() error = %v", err)
+		}
+		defer cancelCatalogEvents()
+
+		const wantTitle = "Checkout webhook retries"
+		applied, err := h.manager.ApplyAutomaticSessionTitle(testutil.Context(t), session.ID, wantTitle)
+		if err != nil {
+			t.Fatalf("ApplyAutomaticSessionTitle() error = %v", err)
+		}
+		if !applied {
+			t.Fatal("ApplyAutomaticSessionTitle() applied = false, want true")
+		}
+		reapplied, err := h.manager.ApplyAutomaticSessionTitle(
+			testutil.Context(t),
+			session.ID,
+			"Later title must lose",
+		)
+		if err != nil {
+			t.Fatalf("ApplyAutomaticSessionTitle(second) error = %v", err)
+		}
+		if reapplied {
+			t.Fatal("ApplyAutomaticSessionTitle(second) applied = true, want false")
+		}
+		if got := session.Info().Name; got != wantTitle {
+			t.Fatalf("session title = %q, want %q", got, wantTitle)
+		}
+		if got := readMeta(t, session.MetaPath()).Name; got != wantTitle {
+			t.Fatalf("persisted session title = %q, want %q", got, wantTitle)
+		}
+		catalogSessions, err := catalog.ListSessions(testutil.Context(t), store.SessionListQuery{
+			WorkspaceID: h.workspaceID,
+			SessionType: string(SessionTypeUser),
+		})
+		if err != nil {
+			t.Fatalf("ListSessions() error = %v", err)
+		}
+		if len(catalogSessions) != 1 || catalogSessions[0].Name != wantTitle {
+			t.Fatalf("catalog sessions = %#v, want one session titled %q", catalogSessions, wantTitle)
+		}
+		select {
+		case event := <-catalogEvents:
+			if event.Kind != CatalogEventUpserted || event.WorkspaceID != h.workspaceID ||
+				event.SessionID != session.ID {
+				t.Fatalf("catalog title event = %#v, want workspace-scoped upsert", event)
+			}
+		default:
+			t.Fatal("catalog title event was not published")
+		}
+
+		if err := h.manager.Stop(testutil.Context(t), session.ID); err != nil {
+			t.Fatalf("Stop() error = %v", err)
+		}
+		resumed, err := h.manager.Resume(testutil.Context(t), session.ID)
+		if err != nil {
+			t.Fatalf("Resume() error = %v", err)
+		}
+		if got := resumed.Info().Name; got != wantTitle {
+			t.Fatalf("resumed session title = %q, want %q", got, wantTitle)
+		}
+	})
+
+	t.Run("Should preserve explicit and internal session identities", func(t *testing.T) {
+		t.Parallel()
+
+		tests := []struct {
+			name        string
+			sessionName string
+			sessionType Type
+		}{
+			{
+				name:        "Should preserve an explicit user title",
+				sessionName: "Release review",
+				sessionType: SessionTypeUser,
+			},
+			{name: "Should leave a system session unnamed", sessionType: SessionTypeSystem},
+		}
+		for _, test := range tests {
+			t.Run(test.name, func(t *testing.T) {
+				t.Parallel()
+
+				h := newHarness(t)
+				session, err := h.manager.Create(testutil.Context(t), new(CreateOpts{
+					AgentName: "coder",
+					Name:      test.sessionName,
+					Workspace: h.workspaceID,
+					Type:      test.sessionType,
+				}))
+				if err != nil {
+					t.Fatalf("Create() error = %v", err)
+				}
+				t.Cleanup(func() {
+					if stopErr := h.manager.Stop(testutil.Context(t), session.ID); stopErr != nil &&
+						!errors.Is(stopErr, ErrSessionNotFound) {
+						t.Errorf("Stop() error = %v", stopErr)
+					}
+				})
+
+				applied, err := h.manager.ApplyAutomaticSessionTitle(
+					testutil.Context(t),
+					session.ID,
+					"Ignore internal bookkeeping",
+				)
+				if err != nil {
+					t.Fatalf("ApplyAutomaticSessionTitle() error = %v", err)
+				}
+				if applied {
+					t.Fatal("ApplyAutomaticSessionTitle() applied = true, want explicit/internal identity preserved")
+				}
+
+				if got := session.Info().Name; got != test.sessionName {
+					t.Fatalf("session title = %q, want preserved %q", got, test.sessionName)
+				}
+			})
+		}
+	})
+}
+
+func TestPromptRejectsConcurrentUserPromptWithoutPersistingSecondInput(t *testing.T) {
+	t.Parallel()
+
+	h := newHarness(t)
+	session := createSession(t, h)
+	t.Cleanup(func() {
+		if err := h.manager.Stop(testutil.Context(t), session.ID); err != nil {
+			t.Errorf("Stop() error = %v", err)
+		}
+	})
+
+	firstPromptEntered := make(chan struct{})
+	releaseFirstPrompt := make(chan struct{})
+	var releaseOnce sync.Once
+	t.Cleanup(func() {
+		releaseOnce.Do(func() {
+			close(releaseFirstPrompt)
+		})
+	})
+
+	h.driver.promptHook = func(_ *fakeProcess, req acp.PromptRequest) (<-chan acp.AgentEvent, error) {
+		events := make(chan acp.AgentEvent)
+		go func() {
+			defer close(events)
+			if req.TurnID != "turn-1" {
+				events <- acp.AgentEvent{
+					Type:             acp.EventTypeDone,
+					TurnID:           req.TurnID,
+					StopReason:       string(acp.PromptStopReasonEndTurn),
+					PromptStopReason: acp.PromptStopReasonEndTurn,
+				}
+				return
+			}
+
+			close(firstPromptEntered)
+			<-releaseFirstPrompt
+
+			ts := time.Now().UTC()
+			events <- acp.AgentEvent{
+				Type:      acp.EventTypeAgentMessage,
+				TurnID:    req.TurnID,
+				Timestamp: ts,
+				Text:      "first prompt complete",
+			}
+			events <- acp.AgentEvent{
+				Type:             acp.EventTypeDone,
+				TurnID:           req.TurnID,
+				Timestamp:        ts,
+				StopReason:       string(acp.PromptStopReasonEndTurn),
+				PromptStopReason: acp.PromptStopReasonEndTurn,
+			}
+		}()
+		return events, nil
+	}
+
+	firstEvents, err := h.manager.Prompt(testutil.Context(t), session.ID, "first prompt")
+	if err != nil {
+		t.Fatalf("Prompt(first) error = %v", err)
+	}
+	<-firstPromptEntered
+
+	_, err = h.manager.Prompt(testutil.Context(t), session.ID, "second prompt")
+	if !errors.Is(err, ErrPromptInProgress) {
+		t.Fatalf("Prompt(second) error = %v, want ErrPromptInProgress", err)
+	}
+	if got, want := len(h.driver.promptCalls), 1; got != want {
+		t.Fatalf("len(promptCalls) while first prompt active = %d, want %d", got, want)
+	}
+
+	storedWhileBusy, err := session.recorderHandle().Query(testutil.Context(t), store.EventQuery{})
+	if err != nil {
+		t.Fatalf("Query(while busy) error = %v", err)
+	}
+	if got, want := countEventType(storedWhileBusy, acp.EventTypeUserMessage), 1; got != want {
+		t.Fatalf("countEventType(user_message) while busy = %d, want %d", got, want)
+	}
+
+	releaseOnce.Do(func() {
+		close(releaseFirstPrompt)
+	})
+	_ = collectEvents(t, firstEvents)
+
+	storedAfterRelease, err := session.recorderHandle().Query(testutil.Context(t), store.EventQuery{})
+	if err != nil {
+		t.Fatalf("Query(after release) error = %v", err)
+	}
+	if got, want := countEventType(storedAfterRelease, acp.EventTypeUserMessage), 1; got != want {
+		t.Fatalf("countEventType(user_message) after release = %d, want %d", got, want)
+	}
+
+	thirdEvents, err := h.manager.Prompt(testutil.Context(t), session.ID, "third prompt")
+	if err != nil {
+		t.Fatalf("Prompt(third) error = %v", err)
+	}
+	_ = collectEvents(t, thirdEvents)
+
+	if got, want := len(h.driver.promptCalls), 2; got != want {
+		t.Fatalf("len(promptCalls) after recovery = %d, want %d", got, want)
+	}
+}
+
+func TestPromptAugmenterPreservesStoredUserMessageAndAugmentsDriverDispatch(t *testing.T) {
+	t.Parallel()
+
+	h := newHarness(t, WithPromptInputAugmenter(func(
+		_ context.Context,
+		_ *Session,
+		message string,
+	) (string, error) {
+		return "MEMORY RECALL\n\n" + message, nil
+	}))
+	session := createSession(t, h)
+	t.Cleanup(func() {
+		reportSessionStop(t, h, session.ID)
+	})
+
+	eventsCh, err := h.manager.Prompt(testutil.Context(t), session.ID, "remember me")
+	if err != nil {
+		t.Fatalf("Prompt() error = %v", err)
+	}
+	_ = collectEvents(t, eventsCh)
+
+	stored, err := session.recorderHandle().Query(testutil.Context(t), store.EventQuery{})
+	if err != nil {
+		t.Fatalf("Query() error = %v", err)
+	}
+	if len(stored) == 0 {
+		t.Fatal("stored events = 0, want at least one event")
+	}
+	if got := h.driver.promptCalls[0].Message; got != "MEMORY RECALL\n\nremember me" {
+		t.Fatalf("driver prompt message = %q, want augmented content", got)
+	}
+	if !strings.Contains(stored[0].Content, `"text":"remember me"`) {
+		t.Fatalf("stored user_message content = %s, want original message", stored[0].Content)
+	}
+	if strings.Contains(stored[0].Content, "MEMORY RECALL") {
+		t.Fatalf("stored user_message content = %s, want no augmentation block", stored[0].Content)
+	}
+}
+
+func TestPromptSkillCommandsPreserveAuthoredTextAndExpandOnlyOperatorIngress(t *testing.T) {
+	t.Parallel()
+
+	service := &promptCommandServiceStub{}
+	h := newHarness(t, WithCommandService(service))
+	sess := createSession(t, h)
+	t.Cleanup(func() {
+		reportSessionStop(t, h, sess.ID)
+	})
+
+	result, err := h.manager.SendPrompt(testutil.Context(t), sess.ID, SendPromptOpts{
+		Message: "Please /review this change", AllowCommands: true,
+		Caller: PromptCaller{Kind: "human", ID: "operator", Source: "http"},
+	})
+	if err != nil {
+		t.Fatalf("SendPrompt() error = %v", err)
+	}
+	_ = collectEvents(t, result.Events)
+	if got, want := service.catalogCalls, 1; got != want {
+		t.Fatalf("Catalog() calls = %d, want %d", got, want)
+	}
+	if len(service.expanded) != 1 || service.expanded[0].Token != "/review" {
+		t.Fatalf("Expand() invocations = %#v, want one /review", service.expanded)
+	}
+	if got, want := h.driver.promptCalls[0].Message, "VERIFIED REVIEW INSTRUCTIONS\n\nPlease /review this change"; got != want {
+		t.Fatalf("driver prompt message = %q, want %q", got, want)
+	}
+	stored := readStoredEvents(t, sess)
+	if len(stored) == 0 || !strings.Contains(stored[0].Content, `"text":"Please /review this change"`) ||
+		!strings.Contains(stored[0].Content, `"skill_invocations"`) {
+		t.Fatalf("stored prompt event = %#v, want authored text and durable invocation refs", stored)
+	}
+	if strings.Contains(stored[0].Content, "VERIFIED REVIEW INSTRUCTIONS") {
+		t.Fatalf("stored prompt event contains provider-only instructions: %s", stored[0].Content)
+	}
+
+	for _, caller := range []PromptCaller{
+		{},
+		{Kind: "agent", ID: "agent-1", Source: "native_tool"},
+	} {
+		_, err := h.manager.SendPrompt(testutil.Context(t), sess.ID, SendPromptOpts{
+			Message: "Please /review this untrusted prompt", AllowCommands: true, Caller: caller,
+		})
+		if err == nil {
+			t.Fatalf("SendPrompt(untrusted caller %#v) error = nil, want rejection", caller)
+		}
+	}
+	if got, want := service.catalogCalls, 1; got != want {
+		t.Fatalf("Catalog() calls after untrusted ingress = %d, want %d", got, want)
+	}
+	if got, want := len(h.driver.promptCalls), 1; got != want {
+		t.Fatalf("driver prompt calls after untrusted ingress = %d, want %d", got, want)
+	}
+
+	internalService := &promptCommandServiceStub{}
+	internalHarness := newHarness(t, WithCommandService(internalService))
+	internalSession := createSession(t, internalHarness)
+	t.Cleanup(func() {
+		reportSessionStop(t, internalHarness, internalSession.ID)
+	})
+	internalEvents, err := internalHarness.manager.Prompt(
+		testutil.Context(t),
+		internalSession.ID,
+		"Please /review this internal prompt",
+	)
+	if err != nil {
+		t.Fatalf("Prompt(internal) error = %v", err)
+	}
+	_ = collectEvents(t, internalEvents)
+	if internalService.catalogCalls != 0 || len(internalService.expanded) != 0 {
+		t.Fatalf(
+			"internal command service calls = catalog %d expanded %#v, want none",
+			internalService.catalogCalls,
+			internalService.expanded,
+		)
+	}
+	if got, want := internalHarness.driver.promptCalls[0].Message, "Please /review this internal prompt"; got != want {
+		t.Fatalf("internal driver message = %q, want literal %q", got, want)
+	}
+}
+
+type promptCommandServiceStub struct {
+	catalogCalls int
+	expanded     []commandpkg.Invocation
+}
+
+func (s *promptCommandServiceStub) Catalog(
+	context.Context,
+	*Info,
+	compozyconfig.AgentDef,
+) (commandpkg.Catalog, error) {
+	s.catalogCalls++
+	return commandpkg.BuildCatalog(commandpkg.DefaultBuiltins(), nil, []commandpkg.SkillSpec{{
+		Name: "review", Description: "Review carefully", Available: true,
+		Source: commandpkg.Source{Kind: "workspace", Scope: "workspace"},
+	}})
+}
+
+func (s *promptCommandServiceStub) Expand(
+	_ context.Context,
+	_ *Info,
+	_ compozyconfig.AgentDef,
+	invocations []commandpkg.Invocation,
+	message string,
+) (string, error) {
+	s.expanded = append(s.expanded, invocations...)
+	return "VERIFIED REVIEW INSTRUCTIONS\n\n" + message, nil
+}
+
+func TestPromptAugmenterPropagatesFailureAndSkipsDriverDispatch(t *testing.T) {
+	t.Parallel()
+
+	h := newHarness(t, WithPromptInputAugmenter(func(
+		_ context.Context,
+		_ *Session,
+		_ string,
+	) (string, error) {
+		return "", errors.New("boom")
+	}))
+	session := createSession(t, h)
+	t.Cleanup(func() {
+		reportSessionStop(t, h, session.ID)
+	})
+
+	if _, err := h.manager.Prompt(testutil.Context(t), session.ID, "remember me"); err == nil {
+		t.Fatal("Prompt() error = nil, want augmentation failure")
+	} else if !strings.Contains(err.Error(), "augment prompt input") {
+		t.Fatalf("Prompt() error = %v, want augmentation error context", err)
+	}
+	if got := len(h.driver.promptCalls); got != 0 {
+		t.Fatalf("len(driver.promptCalls) = %d, want 0 after augmentation failure", got)
+	}
+}
+
+func TestPromptAugmenterPropagatesCancellationAndSkipsDriverDispatch(t *testing.T) {
+	t.Parallel()
+
+	h := newHarness(t, WithPromptInputAugmenter(func(
+		_ context.Context,
+		_ *Session,
+		_ string,
+	) (string, error) {
+		return "", context.Canceled
+	}))
+	session := createSession(t, h)
+	t.Cleanup(func() {
+		reportSessionStop(t, h, session.ID)
+	})
+
+	if _, err := h.manager.Prompt(testutil.Context(t), session.ID, "remember me"); !errors.Is(err, context.Canceled) {
+		t.Fatalf("Prompt() error = %v, want context.Canceled", err)
+	}
+	if got := len(h.driver.promptCalls); got != 0 {
+		t.Fatalf("len(driver.promptCalls) = %d, want 0 after canceled augmentation", got)
+	}
+}
+
+func TestPromptWithOptsTracksTurnSourceAndClearsAfterPrompt(t *testing.T) {
+	t.Parallel()
+
+	h := newHarness(t)
+	session := createSession(t, h)
+	t.Cleanup(func() {
+		reportSessionStop(t, h, session.ID)
+	})
+
+	seenSources := make([]TurnSource, 0, 2)
+	h.driver.promptHook = func(_ *fakeProcess, req acp.PromptRequest) (<-chan acp.AgentEvent, error) {
+		seenSources = append(seenSources, session.CurrentTurnSource())
+
+		ch := make(chan acp.AgentEvent, 1)
+		ch <- acp.AgentEvent{Type: acp.EventTypeDone, TurnID: req.TurnID}
+		close(ch)
+		return ch, nil
+	}
+
+	firstEvents, err := h.manager.PromptWithOpts(testutil.Context(t), session.ID, PromptOpts{
+		Message: "user prompt",
+	})
+	if err != nil {
+		t.Fatalf("PromptWithOpts(user) error = %v", err)
+	}
+	_ = collectEvents(t, firstEvents)
+
+	if got := h.driver.promptCalls[0].Meta.TurnSource; got != acp.PromptTurnSourceUser {
+		t.Fatalf("user prompt source = %q, want user", got)
+	}
+	if !slices.Equal(seenSources, []TurnSource{TurnSourceUser}) {
+		t.Fatalf("seen turn sources = %#v, want user", seenSources)
+	}
+	if got := session.CurrentTurnSource(); got != "" {
+		t.Fatalf("CurrentTurnSource() after prompts = %q, want empty", got)
+	}
+}
+
+func TestPromptWithOptsRejectsSyntheticTurnSourceUntilDedicatedPathExists(t *testing.T) {
+	t.Parallel()
+
+	h := newHarness(t)
+	session := createSession(t, h)
+	t.Cleanup(func() {
+		reportSessionStop(t, h, session.ID)
+	})
+
+	_, err := h.manager.PromptWithOpts(testutil.Context(t), session.ID, PromptOpts{
+		Message:    "synthetic prompt",
+		TurnSource: TurnSourceSynthetic,
+	})
+	if err == nil {
+		t.Fatal("PromptWithOpts(synthetic) error = nil, want validation failure")
+	}
+	if !strings.Contains(err.Error(), "dedicated synthetic submission path") {
+		t.Fatalf("PromptWithOpts(synthetic) error = %v, want dedicated-path validation", err)
+	}
+	if got := len(h.driver.promptCalls); got != 0 {
+		t.Fatalf("len(promptCalls) = %d, want 0 when synthetic validation fails", got)
+	}
+}
+
+func TestApprovePermissionRoutesToActiveSession(t *testing.T) {
+	t.Parallel()
+
+	h := newHarness(t)
+	session := createSession(t, h)
+	t.Cleanup(func() {
+		reportSessionStop(t, h, session.ID)
+	})
+
+	var (
+		gotReq sessionApproveCapture
+		called bool
+	)
+	h.driver.approveHook = func(proc *fakeProcess, req acp.ApproveRequest) error {
+		called = true
+		gotReq = sessionApproveCapture{
+			SessionID: proc.handle.SessionID,
+			RequestID: req.RequestID,
+			TurnID:    req.TurnID,
+			Decision:  req.Decision,
+		}
+		return nil
+	}
+
+	result, err := h.manager.ApprovePermission(testutil.Context(t), session.ID, acp.ApproveRequest{
+		RequestID: "req-1",
+		TurnID:    "turn-1",
+		Decision:  "allow-once",
+	})
+	if err != nil {
+		t.Fatalf("ApprovePermission() error = %v", err)
+	}
+	if result.Outcome != store.PendingInteractionOutcomeApplied ||
+		result.RequestID != "req-1" || result.Decision != "allow-once" {
+		t.Fatalf("ApprovePermission() result = %#v", result)
+	}
+	if !called {
+		t.Fatal("ApprovePermission() did not reach the active session process")
+	}
+	if gotReq.RequestID != "req-1" || gotReq.TurnID != "turn-1" || gotReq.Decision != "allow-once" {
+		t.Fatalf("approve request = %#v", gotReq)
+	}
+}
+
+func TestApprovePermissionReturnsNotActiveForStoppedSession(t *testing.T) {
+	t.Parallel()
+
+	h := newHarness(t)
+	session := createSession(t, h)
+	if err := h.manager.Stop(testutil.Context(t), session.ID); err != nil {
+		t.Fatalf("Stop() error = %v", err)
+	}
+
+	_, err := h.manager.ApprovePermission(testutil.Context(t), session.ID, acp.ApproveRequest{
+		RequestID: "req-1",
+		Decision:  "allow-once",
+	})
+	if !errors.Is(err, ErrSessionNotActive) {
+		t.Fatalf("ApprovePermission(stopped) error = %v, want ErrSessionNotActive", err)
+	}
+}
+
+func TestApprovePermissionMapsPendingLookupErrors(t *testing.T) {
+	t.Parallel()
+
+	testCases := []struct {
+		name    string
+		hookErr error
+		wantErr error
+	}{
+		{
+			name:    "ShouldMapNotFound",
+			hookErr: acp.ErrPendingPermissionNotFound,
+			wantErr: ErrPendingPermissionNotFound,
+		},
+		{
+			name:    "ShouldMapConflict",
+			hookErr: acp.ErrPendingPermissionConflict,
+			wantErr: ErrPendingPermissionConflict,
+		},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			h := newHarness(t)
+			session := createSession(t, h)
+			t.Cleanup(func() {
+				reportSessionStop(t, h, session.ID)
+			})
+
+			h.driver.approveHook = func(*fakeProcess, acp.ApproveRequest) error {
+				return tc.hookErr
+			}
+			_, err := h.manager.ApprovePermission(testutil.Context(t), session.ID, acp.ApproveRequest{
+				RequestID: "req-1",
+				Decision:  "allow-once",
+			})
+			if !errors.Is(err, tc.wantErr) {
+				t.Fatalf("ApprovePermission() error = %v, want %v", err, tc.wantErr)
+			}
+		})
+	}
+}
+
+func TestProcessExitDuringActivePromptPersistsAgentCrashedStopReason(t *testing.T) {
+	t.Parallel()
+
+	t.Run("Should emit process failure before finalizing when process exits during active prompt", func(t *testing.T) {
+		t.Parallel()
+
+		h := newHarness(t)
+		h.manager.promptRecoveryDelays = []time.Duration{}
+		session := createSession(t, h)
+		proc := h.driver.lastProcess()
+		proc.handle.exitStatusFn = func() (subprocess.ExitStatus, bool) {
+			select {
+			case <-proc.done:
+				return subprocess.ExitStatus{ExitCode: 23}, true
+			default:
+				return subprocess.ExitStatus{}, false
+			}
+		}
+		t.Cleanup(func() {
+			if _, ok := h.manager.Get(session.ID); ok {
+				reportSessionStop(t, h, session.ID)
+			}
+		})
+
+		source := make(chan acp.AgentEvent, 1)
+
+		h.driver.promptHook = func(proc *fakeProcess, req acp.PromptRequest) (<-chan acp.AgentEvent, error) {
+			source <- acp.AgentEvent{
+				Type:      acp.EventTypeAgentMessage,
+				SessionID: proc.handle.SessionID,
+				TurnID:    req.TurnID,
+				Timestamp: time.Now().UTC(),
+				Text:      "partial before process exit",
+			}
+			return source, nil
+		}
+
+		eventsCh, err := h.manager.Prompt(testutil.Context(t), session.ID, "run a long command")
+		if err != nil {
+			t.Fatalf("Prompt() error = %v", err)
+		}
+		processExitErr := acp.WrapFailure(
+			store.FailureProcess,
+			"ACP subprocess exited unexpectedly",
+			errors.New("acp subprocess exited: exit status 23"),
+		)
+		if typedProcessExit, ok := errors.AsType[*acp.FailureError](
+			processExitErr,
+		); !ok ||
+			typedProcessExit.Kind != store.FailureProcess {
+			t.Fatalf("process exit error = %#v, want typed process_exit failure", processExitErr)
+		}
+		proc.crash(processExitErr, "codex stderr after process exit")
+		close(source)
+
+		events := collectEvents(t, eventsCh)
+		if len(events) < 2 {
+			t.Fatalf("Prompt() events = %#v, want partial chunk and process terminal", events)
+		}
+		if got, want := events[0].Text, "partial before process exit"; got != want {
+			t.Fatalf("Prompt() first event text = %q, want %q", got, want)
+		}
+		terminal := events[len(events)-1]
+		if terminal.Type != acp.EventTypeError || terminal.Failure == nil ||
+			terminal.Failure.Kind != store.FailureProcess {
+			t.Fatalf("Prompt() terminal event = %#v, want process_exit", terminal)
+		}
+		if terminal.Failure.CrashBundlePath == "" {
+			t.Fatalf("Prompt() terminal failure = %#v, want public crash bundle path", terminal.Failure)
+		}
+		publicBundle := readCrashBundleDocument(t, terminal.Failure.CrashBundlePath)
+		if publicBundle.Process == nil || publicBundle.Process.ExitCode == nil ||
+			*publicBundle.Process.ExitCode != 23 {
+			t.Fatalf("public crash bundle process = %#v, want exit code 23 before stop", publicBundle.Process)
+		}
+		if got, want := publicBundle.Stderr, "codex stderr after process exit"; got != want {
+			t.Fatalf("public crash bundle stderr = %q, want %q", got, want)
+		}
+
+		h.notifier.waitForStopped(t, session.ID)
+		if got := h.driver.stopCalls; got != 0 {
+			t.Fatalf("driver stop calls = %d, want none for an already exited process", got)
+		}
+		if got, want := h.notifier.stoppedCount(), 1; got != want {
+			t.Fatalf("stopped notifications = %d, want %d", got, want)
+		}
+
+		meta := readMeta(t, session.MetaPath())
+		if got, want := *meta.StopReason, store.StopAgentCrashed; got != want {
+			t.Fatalf("meta.StopReason = %q, want %q", got, want)
+		}
+		if meta.Failure == nil || meta.Failure.Kind != store.FailureProcess {
+			t.Fatalf("meta.Failure = %#v, want process_exit", meta.Failure)
+		}
+		if got, want := meta.Failure.CrashBundlePath, terminal.Failure.CrashBundlePath; got != want {
+			t.Fatalf("final crash bundle = %q, want public event bundle %q", got, want)
+		}
+
+		stored := readStoredEvents(t, session)
+		if !containsEventType(stored, acp.EventTypeAgentMessage) ||
+			!containsEventType(stored, acp.EventTypeError) ||
+			containsEventType(stored, acp.EventTypeDone) {
+			t.Fatalf("stored events = %#v, want partial chunk, process error, and no done", stored)
+		}
+		stopEvent := storedEventByType(t, stored, EventTypeSessionStopped)
+		stopPayload := decodeStoredEventPayload(t, stopEvent)
+		if got, want := stopPayload["stop_reason"], string(store.StopAgentCrashed); got != want {
+			t.Fatalf("session_stopped stop_reason = %v, want %q", got, want)
+		}
+	})
+
+	t.Run("Should promote a generic terminal when exit status proves the subprocess died", func(t *testing.T) {
+		t.Parallel()
+
+		h := newHarness(t)
+		h.manager.promptRecoveryDelays = []time.Duration{}
+		session := createSession(t, h)
+		proc := h.driver.lastProcess()
+		proc.handle.exitStatusFn = func() (subprocess.ExitStatus, bool) {
+			return subprocess.ExitStatus{ExitCode: 23}, true
+		}
+		h.driver.stopHook = func(proc *fakeProcess) error {
+			proc.crash(
+				acp.WrapFailure(
+					store.FailureProcess,
+					"ACP subprocess exited unexpectedly",
+					errors.New("acp subprocess exited: exit status 23"),
+				),
+				"codex stderr after status observation",
+			)
+			return nil
+		}
+		t.Cleanup(func() {
+			if _, ok := h.manager.Get(session.ID); ok {
+				reportSessionStop(t, h, session.ID)
+			}
+		})
+
+		h.driver.promptHook = func(_ *fakeProcess, req acp.PromptRequest) (<-chan acp.AgentEvent, error) {
+			source := make(chan acp.AgentEvent, 1)
+			source <- acp.AgentEvent{
+				Type:      acp.EventTypeError,
+				TurnID:    req.TurnID,
+				Timestamp: time.Now().UTC(),
+				Error:     "context canceled",
+				Failure: &store.SessionFailure{
+					Kind:    store.FailureCanceled,
+					Summary: "context canceled",
+				},
+			}
+			close(source)
+			return source, nil
+		}
+
+		eventsCh, err := h.manager.Prompt(testutil.Context(t), session.ID, "run a long command")
+		if err != nil {
+			t.Fatalf("Prompt() error = %v", err)
+		}
+		events := collectEvents(t, eventsCh)
+		if len(events) == 0 {
+			t.Fatal("Prompt() events = empty, want promoted terminal")
+		}
+		terminal := events[len(events)-1]
+		if terminal.Type != acp.EventTypeError || terminal.Failure == nil ||
+			terminal.Failure.Kind != store.FailureProcess {
+			t.Fatalf("Prompt() terminal event = %#v, want process_exit", terminal)
+		}
+		if !strings.Contains(terminal.Error, "exit code 23") {
+			t.Fatalf("Prompt() terminal error = %q, want stable exit status diagnostic", terminal.Error)
+		}
+		publicBundle := readCrashBundleDocument(t, terminal.Failure.CrashBundlePath)
+		if publicBundle.Process == nil || publicBundle.Process.ExitCode == nil ||
+			*publicBundle.Process.ExitCode != 23 {
+			t.Fatalf("public crash bundle process = %#v, want exit code 23 before stop", publicBundle.Process)
+		}
+		if got, want := publicBundle.Stderr, "codex stderr after status observation"; got != want {
+			t.Fatalf("public crash bundle stderr = %q, want %q", got, want)
+		}
+
+		h.notifier.waitForStopped(t, session.ID)
+		if got, want := h.driver.stopCalls, 1; got != want {
+			t.Fatalf("driver stop calls = %d, want %d", got, want)
+		}
+		if got, want := h.notifier.stoppedCount(), 1; got != want {
+			t.Fatalf("stopped notifications = %d, want %d", got, want)
+		}
+	})
+}
+
+func TestPromptSerializesSetupAgainstConcurrentStop(t *testing.T) {
+	t.Parallel()
+
+	h := newHarness(t)
+	session := createSession(t, h)
+
+	promptEntered := make(chan struct{})
+	releasePrompt := make(chan struct{})
+	h.driver.promptHook = func(_ *fakeProcess, _ acp.PromptRequest) (<-chan acp.AgentEvent, error) {
+		close(promptEntered)
+		<-releasePrompt
+		events := make(chan acp.AgentEvent)
+		close(events)
+		return events, nil
+	}
+
+	promptDone := make(chan error, 1)
+	go func() {
+		eventsCh, err := h.manager.Prompt(testutil.Context(t), session.ID, "hello")
+		if err != nil {
+			promptDone <- err
+			return
+		}
+		for event := range eventsCh {
+			_ = event
+		}
+		promptDone <- nil
+	}()
+
+	<-promptEntered
+
+	stopDone := make(chan error, 1)
+	go func() {
+		stopDone <- h.manager.Stop(testutil.Context(t), session.ID)
+	}()
+
+	select {
+	case err := <-stopDone:
+		t.Fatalf("Stop() returned before prompt setup finished: %v", err)
+	case <-time.After(50 * time.Millisecond):
+	}
+
+	close(releasePrompt)
+
+	if err := <-promptDone; err != nil {
+		t.Fatalf("Prompt() error = %v", err)
+	}
+	if err := <-stopDone; err != nil {
+		t.Fatalf("Stop() error = %v", err)
+	}
+}
+
+func TestWaitForPromptDrains(t *testing.T) {
+	t.Run("Should wait for active prompt pump exit", func(t *testing.T) {
+		t.Parallel()
+
+		h := newHarness(t)
+		session := createSession(t, h)
+		t.Cleanup(func() {
+			if err := h.manager.Stop(testutil.Context(t), session.ID); err != nil &&
+				!errors.Is(err, ErrSessionNotFound) {
+				t.Errorf("Stop(%q) cleanup error = %v", session.ID, err)
+			}
+		})
+
+		promptEvents := make(chan acp.AgentEvent)
+		h.driver.promptHook = func(_ *fakeProcess, _ acp.PromptRequest) (<-chan acp.AgentEvent, error) {
+			return promptEvents, nil
+		}
+
+		eventsCh, err := h.manager.Prompt(testutil.Context(t), session.ID, "hello")
+		if err != nil {
+			t.Fatalf("Prompt() error = %v", err)
+		}
+
+		waitDone := make(chan error, 1)
+		go func() {
+			ctx, cancel := context.WithTimeout(testutil.Context(t), 2*time.Second)
+			defer cancel()
+			waitDone <- h.manager.WaitForPromptDrains(ctx)
+		}()
+
+		select {
+		case err := <-waitDone:
+			t.Fatalf("WaitForPromptDrains() returned before prompt source closed: %v", err)
+		case <-time.After(50 * time.Millisecond):
+		}
+
+		promptEvents <- acp.AgentEvent{
+			Type:             acp.EventTypeDone,
+			StopReason:       string(acp.PromptStopReasonEndTurn),
+			PromptStopReason: acp.PromptStopReasonEndTurn,
+		}
+		close(promptEvents)
+		_ = collectEvents(t, eventsCh)
+
+		if err := <-waitDone; err != nil {
+			t.Fatalf("WaitForPromptDrains() error = %v", err)
+		}
+	})
+
+	t.Run("Should make shutdown wait for every tracked prompt drain", func(t *testing.T) {
+		t.Parallel()
+
+		h := newHarness(t)
+		finishDrain := h.manager.trackPromptDrain()
+		shutdownDone := make(chan error, 1)
+		go func() {
+			ctx, cancel := context.WithTimeout(testutil.Context(t), 2*time.Second)
+			defer cancel()
+			shutdownDone <- h.manager.Shutdown(ctx)
+		}()
+
+		select {
+		case err := <-shutdownDone:
+			t.Fatalf("Shutdown() returned before prompt drain completed: %v", err)
+		case <-time.After(50 * time.Millisecond):
+		}
+
+		finishDrain()
+		if err := <-shutdownDone; err != nil {
+			t.Fatalf("Shutdown() error = %v", err)
+		}
+	})
+
+	t.Run("Should cancel and join live process watchers during shutdown", func(t *testing.T) {
+		t.Parallel()
+
+		h := newHarness(t)
+		session := createSession(t, h)
+		events, err := h.manager.Prompt(testutil.Context(t), session.ID, "bind the runtime")
+		if err != nil {
+			t.Fatalf("Prompt(bind runtime) error = %v", err)
+		}
+		collectEvents(t, events)
+
+		proc := h.driver.lastProcess()
+		if proc == nil {
+			t.Fatal("bound process = nil")
+		}
+
+		ctx, cancel := context.WithTimeout(testutil.Context(t), 2*time.Second)
+		defer cancel()
+		if err := h.manager.Shutdown(ctx); err != nil {
+			t.Fatalf("Shutdown() error = %v", err)
+		}
+
+		select {
+		case <-proc.done:
+			t.Fatal("Shutdown() stopped the process, want only watcher cancellation")
+		default:
+		}
+		h.driver.mu.Lock()
+		stopCalls := h.driver.stopCalls
+		h.driver.mu.Unlock()
+		if stopCalls != 0 {
+			t.Fatalf("driver stop calls = %d, want 0", stopCalls)
+		}
+	})
+}
+
+func TestNormalizeEventSetsTimestampOnlyWhenZero(t *testing.T) {
+	t.Parallel()
+
+	h := newHarness(t)
+	session := createSession(t, h)
+	now := h.manager.now()
+
+	normalized := h.manager.normalizeEvent(session, "turn-1", acp.AgentEvent{})
+	if normalized.Timestamp.IsZero() {
+		t.Fatal("normalizeEvent() left zero timestamp")
+	}
+
+	explicit := time.Date(2026, 4, 3, 14, 0, 0, 0, time.UTC)
+	preserved := h.manager.normalizeEvent(session, "turn-1", acp.AgentEvent{Timestamp: explicit})
+	if !preserved.Timestamp.Equal(explicit) {
+		t.Fatalf("normalizeEvent() timestamp = %v, want %v", preserved.Timestamp, explicit)
+	}
+	if normalized.Timestamp.Before(now) {
+		t.Fatalf("normalizeEvent() timestamp = %v, want >= %v", normalized.Timestamp, now)
+	}
+	if normalized.PromptRuntimeSnapshot() == nil {
+		t.Fatal("normalizeEvent() runtime = nil, want session runtime fallback")
+	}
+	if normalized.PromptRuntimeSnapshot().Provider != session.Provider {
+		t.Fatalf(
+			"normalizeEvent() runtime provider = %q, want %q",
+			normalized.PromptRuntimeSnapshot().Provider,
+			session.Provider,
+		)
+	}
+}
+
+func TestCreateInvokesPromptAssemblerWhenConfigured(t *testing.T) {
+	t.Parallel()
+
+	t.Run("Should deliver the assembled startup context", func(t *testing.T) {
+		t.Parallel()
+
+		h := newHarness(t)
+
+		var (
+			called         bool
+			gotWorkspace   string
+			gotAgentName   string
+			gotAgentPrompt string
+		)
+		h.manager = newManagerWithHarness(
+			t,
+			h,
+			WithPromptAssembler(
+				promptAssemblerFunc(
+					func(_ context.Context, agent compozyconfig.AgentDef, workspace *workspacepkg.ResolvedWorkspace) (string, error) {
+						called = true
+						gotWorkspace = workspace.RootDir
+						gotAgentName = agent.Name
+						gotAgentPrompt = agent.Prompt
+						return agent.Prompt + "\n\nstartup context block", nil
+					},
+				),
+			),
+		)
+
+		session := createSession(t, h)
+		t.Cleanup(func() {
+			reportSessionStop(t, h, session.ID)
+		})
+
+		if !called {
+			t.Fatal("Create() did not invoke the configured prompt assembler")
+		}
+		if gotWorkspace != h.workspace {
+			t.Fatalf("assembler workspace = %q, want %q", gotWorkspace, h.workspace)
+		}
+		if gotAgentName != "coder" {
+			t.Fatalf("assembler agent name = %q, want %q", gotAgentName, "coder")
+		}
+		if gotAgentPrompt != "You are a coding assistant." {
+			t.Fatalf("assembler prompt = %q, want original agent prompt", gotAgentPrompt)
+		}
+		if got := h.driver.startCalls[0].SystemPrompt; got != "You are a coding assistant.\n\nstartup context block" {
+			t.Fatalf("start system prompt = %q, want assembled prompt", got)
+		}
+	})
+}
+
+func TestCreateInvokesStartupPromptOverlayWhenConfigured(t *testing.T) {
+	t.Parallel()
+
+	h := newHarness(t)
+
+	var (
+		called       bool
+		gotType      Type
+		gotWorkspace string
+	)
+	h.manager = newManagerWithHarness(
+		t,
+		h,
+		WithPromptAssembler(nil),
+		WithStartupPromptOverlay(
+			startupPromptOverlayFunc(func(
+				_ context.Context,
+				startup StartupPromptContext,
+				prompt string,
+			) (string, error) {
+				called = true
+				gotType = startup.SessionType
+				gotWorkspace = startup.Workspace
+				return prompt + "\n\noverlay block", nil
+			}),
+		),
+	)
+
+	session, err := h.manager.Create(testutil.Context(t), new(CreateOpts{
+		AgentName: "coder",
+		Name:      "session",
+		Workspace: h.workspaceID,
+	}))
+	if err != nil {
+		t.Fatalf("Create() error = %v", err)
+	}
+	t.Cleanup(func() {
+		reportSessionStop(t, h, session.ID)
+	})
+
+	if !called {
+		t.Fatal("Create() did not invoke the configured startup prompt overlay")
+	}
+	if gotType != SessionTypeUser {
+		t.Fatalf("startup overlay session type = %q, want %q", gotType, SessionTypeUser)
+	}
+	if gotWorkspace != h.workspace {
+		t.Fatalf("startup overlay workspace = %q, want %q", gotWorkspace, h.workspace)
+	}
+	if got := h.driver.startCalls[0].SystemPrompt; got != "You are a coding assistant.\n\noverlay block" {
+		t.Fatalf("start system prompt = %q, want overlay output", got)
+	}
+}
+
+func TestCreateUsesConfiguredPermissionsForUserSessions(t *testing.T) {
+	t.Parallel()
+
+	h := newHarness(t)
+	h.cfg.Permissions.Mode = compozyconfig.PermissionModeDenyAll
+	h.resolver.upsert(&workspacepkg.ResolvedWorkspace{
+		ID:      h.workspaceID,
+		RootDir: h.workspace,
+		Name:    h.workspaceName,
+		Config:  h.cfg,
+		Agents: []compozyconfig.AgentDef{
+			{
+				Name:     compozyconfig.DefaultAgentName,
+				Provider: "claude",
+				Prompt:   "You are a coding assistant.",
+			},
+			{
+				Name:     "coder",
+				Provider: "claude",
+				Prompt:   "You are a coding assistant.",
+			},
+		},
+	})
+	h.manager = newManagerWithHarness(t, h)
+
+	session, err := h.manager.Create(testutil.Context(t), new(CreateOpts{
+		AgentName: "coder",
+		Workspace: h.workspaceID,
+		Type:      SessionTypeUser,
+	}))
+	if err != nil {
+		t.Fatalf("Create() error = %v", err)
+	}
+	t.Cleanup(func() {
+		reportSessionStop(t, h, session.ID)
+	})
+
+	if got := h.driver.startCalls[0].Permissions; got != compozyconfig.PermissionModeDenyAll {
+		t.Fatalf("start permissions = %q, want %q", got, compozyconfig.PermissionModeDenyAll)
+	}
+}
+
+func TestCancelTurn(t *testing.T) {
+	t.Parallel()
+	t.Run("Should retain stopping when verified turn completion cannot be persisted", func(t *testing.T) {
+		t.Parallel()
+		h := newHarness(t)
+		session := createSession(t, h)
+		source := make(chan acp.AgentEvent)
+		closeSource := sync.OnceFunc(func() { close(source) })
+		h.driver.promptHook = func(*fakeProcess, acp.PromptRequest) (<-chan acp.AgentEvent, error) { return source, nil }
+		h.driver.cancelHook = func(*fakeProcess) error { closeSource(); return nil }
+		var fail atomic.Bool
+		fail.Store(true)
+		writeErr := errors.New("turn receipt unavailable")
+		session.setRecorder(&terminalWriteFailingRecorder{
+			EventRecorder: session.recorderHandle(), fail: &fail, writeErr: writeErr,
+			eventType: eventspkg.SessionTurnQuiesced,
+		})
+		t.Cleanup(func() {
+			fail.Store(false)
+			closeSource()
+			reportSessionStop(t, h, session.ID)
+		})
+		ctx, cancel := context.WithTimeout(t.Context(), 3*time.Second)
+		defer cancel()
+		stream, err := h.manager.Prompt(ctx, session.ID, "cancel with unavailable receipt")
+		if err != nil {
+			t.Fatal(err)
+		}
+		turnID := session.CurrentTurnID()
+		if err := h.manager.CancelTurn(ctx, session.ID, turnID, CauseUserRequested); err != nil {
+			t.Fatal(err)
+		}
+		outcome, err := h.manager.AwaitTurnQuiesced(ctx, session.ID, turnID)
+		if !errors.Is(err, writeErr) || !outcome.Quiesced {
+			t.Fatalf("physical quiescence and persistence failure = %#v, %v", outcome, err)
+		}
+		collectEvents(t, stream)
+		if session.Info().State != StateStopping ||
+			countEventType(readStoredEvents(t, session), eventspkg.SessionTurnQuiesced) != 0 {
+			t.Fatal("failed receipt released admission or claimed durable completion")
+		}
+		if _, err := h.manager.Prompt(ctx, session.ID, "must not dispatch"); !errors.Is(err, ErrSessionNotActive) {
+			t.Fatalf("new work after receipt failure = %v", err)
+		}
+	})
+
+	t.Run("Should preserve natural completion received during cooperative cancellation", func(t *testing.T) {
+		t.Parallel()
+		h := newHarness(t)
+		session := createSession(t, h)
+		previous := session.processHandle()
+		source := make(chan acp.AgentEvent, 1)
+		closeSource := sync.OnceFunc(func() { close(source) })
+		h.driver.promptHook = func(*fakeProcess, acp.PromptRequest) (<-chan acp.AgentEvent, error) { return source, nil }
+		h.driver.cancelHook = func(*fakeProcess) error {
+			source <- acp.AgentEvent{Type: acp.EventTypeDone, PromptStopReason: acp.PromptStopReasonEndTurn}
+			closeSource()
+			return nil
+		}
+		t.Cleanup(func() {
+			h.driver.mu.Lock()
+			h.driver.cancelHook = nil
+			h.driver.mu.Unlock()
+			closeSource()
+			reportSessionStop(t, h, session.ID)
+		})
+		ctx, cancel := context.WithTimeout(t.Context(), 3*time.Second)
+		defer cancel()
+		stream, err := h.manager.Prompt(ctx, session.ID, "finish naturally")
+		if err != nil {
+			t.Fatal(err)
+		}
+		turnID := session.CurrentTurnID()
+		if err := h.manager.CancelTurn(ctx, session.ID, turnID, CauseUserRequested); err != nil {
+			t.Fatal(err)
+		}
+		outcome, err := h.manager.AwaitTurnQuiesced(ctx, session.ID, turnID)
+		if err != nil || !outcome.Quiesced || outcome.Escalated {
+			t.Fatalf("natural completion outcome = %#v, %v", outcome, err)
+		}
+		delivered := collectEvents(t, stream)
+		if countAgentEvents(delivered, acp.EventTypeDone) != 1 {
+			t.Fatalf("terminal events = %#v", delivered)
+		}
+		for _, event := range delivered {
+			if event.Type == acp.EventTypeDone && event.PromptStopReason != acp.PromptStopReasonEndTurn {
+				t.Fatalf("natural completion reason = %q", event.PromptStopReason)
+			}
+		}
+		if session.Info().State != StateActive || session.processHandle() != previous || isProcessDone(previous) {
+			t.Fatal("natural completion did not preserve the active process")
+		}
+	})
+	t.Run("Should retain stopping and reject work when turn process death cannot be verified", func(t *testing.T) {
+		t.Parallel()
+		h := newHarness(t)
+		session := createSession(t, h)
+		previous := session.processHandle()
+		source := make(chan acp.AgentEvent)
+		closeSource := sync.OnceFunc(func() { close(source) })
+		h.driver.promptHook = func(*fakeProcess, acp.PromptRequest) (<-chan acp.AgentEvent, error) { return source, nil }
+		h.driver.cancelHook = func(*fakeProcess) error { return errors.New("cancel rejected") }
+		h.driver.stopHook = func(*fakeProcess) error { return errors.New("stop rejected") }
+		h.driver.killHook = func(*fakeProcess) error { return errors.New("kill rejected") }
+		t.Cleanup(func() {
+			h.driver.mu.Lock()
+			h.driver.cancelHook, h.driver.stopHook, h.driver.killHook = nil, nil, nil
+			h.driver.mu.Unlock()
+			closeSource()
+			reportSessionStop(t, h, session.ID)
+		})
+		ctx, cancel := context.WithTimeout(t.Context(), 3*time.Second)
+		defer cancel()
+		events, err := h.manager.Prompt(ctx, session.ID, "unresponsive provider")
+		if err != nil {
+			t.Fatal(err)
+		}
+		turnID := session.CurrentTurnID()
+		if err := h.manager.CancelTurn(ctx, session.ID, turnID, CauseUserRequested); err != nil {
+			t.Fatal(err)
+		}
+		outcome, err := h.manager.AwaitTurnQuiesced(ctx, session.ID, turnID)
+		if !errors.Is(err, ErrStopVerificationFailed) || outcome.Quiesced || outcome.Phase != StopPhaseKilled {
+			t.Fatalf("unverified outcome = %#v, %v", outcome, err)
+		}
+		if countEventType(readStoredEvents(t, session), eventspkg.SessionTurnQuiesced) != 0 {
+			t.Fatal("unverified process death produced a verified receipt")
+		}
+		if session.Info().State != StateStopping || session.processHandle() != previous || isProcessDone(previous) {
+			t.Fatal("unverified cancellation changed the process or reported terminal")
+		}
+		if meta := readMeta(t, session.MetaPath()); meta.State != string(StateStopping) {
+			t.Fatalf("persisted state = %q", meta.State)
+		}
+		if got := h.notifier.stoppedCount(); got != 0 {
+			t.Fatalf("stopped notifications = %d", got)
+		}
+		if _, err := h.manager.Prompt(ctx, session.ID, "must not dispatch"); !errors.Is(err, ErrSessionNotActive) {
+			t.Fatalf("new work admission = %v", err)
+		}
+		closeSource()
+		collectEvents(t, events)
+	})
+	t.Run("Should let a concurrent session stop prevent turn rebind", func(t *testing.T) {
+		t.Parallel()
+		h := newHarness(t)
+		session := createSession(t, h)
+		source := make(chan acp.AgentEvent)
+		closeSource := sync.OnceFunc(func() { close(source) })
+		entered, release := make(chan struct{}, 2), make(chan struct{})
+		unblock := sync.OnceFunc(func() { close(release) })
+		t.Cleanup(unblock)
+		t.Cleanup(closeSource)
+		h.driver.promptHook = func(*fakeProcess, acp.PromptRequest) (<-chan acp.AgentEvent, error) { return source, nil }
+		h.driver.cancelHook = func(proc *fakeProcess) error {
+			entered <- struct{}{}
+			<-release
+			closeSource()
+			proc.exit()
+			return nil
+		}
+		ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
+		defer cancel()
+		events, err := h.manager.Prompt(ctx, session.ID, "concurrent cancellation")
+		if err != nil {
+			t.Fatal(err)
+		}
+		turnID := session.CurrentTurnID()
+		if err := h.manager.CancelTurn(ctx, session.ID, turnID, CauseUserRequested); err != nil {
+			t.Fatal(err)
+		}
+		select {
+		case <-entered:
+		case <-ctx.Done():
+			t.Fatal(ctx.Err())
+		}
+		if err := h.manager.RequestStop(ctx, session.ID, CauseUserRequested); err != nil {
+			t.Fatal(err)
+		}
+		select {
+		case <-entered:
+		case <-ctx.Done():
+			t.Fatal(ctx.Err())
+		}
+		unblock()
+		turnOutcome, err := h.manager.AwaitTurnQuiesced(ctx, session.ID, turnID)
+		if err != nil || !turnOutcome.Quiesced {
+			t.Fatalf("turn outcome = %#v, %v", turnOutcome, err)
+		}
+		stopOutcome, err := h.manager.AwaitStopped(ctx, session.ID)
+		if err != nil || !stopOutcome.Verified || stopOutcome.FinalState != StateStopped {
+			t.Fatalf("session outcome = %#v, %v", stopOutcome, err)
+		}
+		collectEvents(t, events)
+		stored := readStoredEvents(t, session)
+		if got := countEventType(stored, eventspkg.SessionTurnQuiesced); got != 1 {
+			t.Fatalf("persisted turn quiescence receipts = %d, want 1", got)
+		}
+		quiesced := storedEventByType(t, stored, eventspkg.SessionTurnQuiesced)
+		stopped := storedEventByType(t, stored, EventTypeSessionStopped)
+		if quiesced.Sequence >= stopped.Sequence {
+			t.Fatalf("quiescence sequence %d must precede session stop %d", quiesced.Sequence, stopped.Sequence)
+		}
+		h.driver.mu.Lock()
+		starts, cancels := len(h.driver.startCalls), h.driver.cancelCalls
+		h.driver.mu.Unlock()
+		if starts != 1 || cancels != 2 {
+			t.Fatalf("starts=%d cancels=%d; want one process and one cancellation per scope", starts, cancels)
+		}
+	})
+	t.Run("Should join concurrent cancellation requests and reject an incorrect turn fence", func(t *testing.T) {
+		t.Parallel()
+		h := newHarness(t)
+		session := createSession(t, h)
+		for range 2 {
+			if err := h.manager.CancelTurn(
+				t.Context(),
+				session.ID,
+				"",
+				CauseUserRequested,
+			); !errors.Is(
+				err,
+				ErrPromptNotInProgress,
+			) {
+				t.Fatalf("idle cancellation = %v", err)
+			}
+		}
+		h.driver.mu.Lock()
+		idleSignals := h.driver.cancelCalls + h.driver.stopCalls + h.driver.killCalls
+		h.driver.mu.Unlock()
+		if idleSignals != 0 || session.Info().State != StateActive || session.IsPrompting() {
+			t.Fatal("repeated idle cancellation changed the active session or signaled its process")
+		}
+		source := make(chan acp.AgentEvent)
+		entered, release := make(chan struct{}), make(chan struct{})
+		unblock := sync.OnceFunc(func() { close(release) })
+		t.Cleanup(unblock)
+		h.driver.promptHook = func(*fakeProcess, acp.PromptRequest) (<-chan acp.AgentEvent, error) { return source, nil }
+		h.driver.cancelHook = func(*fakeProcess) error { close(entered); <-release; close(source); return nil }
+		events, err := h.manager.Prompt(t.Context(), session.ID, "wait for cancellation")
+		if err != nil {
+			t.Fatal(err)
+		}
+		turnID := session.CurrentTurnID()
+		if err := h.manager.CancelTurn(
+			t.Context(),
+			session.ID,
+			"wrong-turn",
+			CauseUserRequested,
+		); !errors.Is(
+			err,
+			ErrActiveTurnMismatch,
+		) {
+			t.Fatalf("fenced cancellation = %v", err)
+		}
+		if err := h.manager.CancelTurn(t.Context(), session.ID, turnID, CauseUserRequested); err != nil {
+			t.Fatal(err)
+		}
+		<-entered
+		var requests sync.WaitGroup
+		for range 16 {
+			requests.Go(func() {
+				if err := h.manager.CancelTurn(t.Context(), session.ID, turnID, CauseUserRequested); err != nil {
+					t.Errorf("joined cancellation: %v", err)
+				}
+			})
+		}
+		requests.Wait()
+		unblock()
+		outcome, err := h.manager.AwaitTurnQuiesced(t.Context(), session.ID, turnID)
+		if err != nil || !outcome.Quiesced || outcome.Escalated {
+			t.Fatalf("joined outcome = %#v, %v", outcome, err)
+		}
+		collectEvents(t, events)
+		h.driver.mu.Lock()
+		calls := h.driver.cancelCalls
+		h.driver.cancelHook = nil
+		h.driver.mu.Unlock()
+		if calls != 1 {
+			t.Fatalf("cooperative cancel calls = %d", calls)
+		}
+		reportSessionStop(t, h, session.ID)
+	})
+	for _, phase := range []StopPhase{StopPhaseCooperative, StopPhaseForced, StopPhaseKilled} {
+		t.Run("Should remain promptable after "+string(phase)+" cancellation", func(t *testing.T) {
+			t.Parallel()
+			grace := 20 * time.Millisecond
+			if phase == StopPhaseCooperative {
+				grace = 2 * time.Second
+			}
+			h := newHarness(t, WithSessionStopConfig(compozyconfig.SessionStopConfig{
+				CooperativeGrace: grace,
+			}))
+			session := createSession(t, h)
+			previous := session.processHandle()
+			source := make(chan acp.AgentEvent)
+			closeSource := sync.OnceFunc(func() { close(source) })
+			t.Cleanup(closeSource)
+			var prompts atomic.Int32
+			h.driver.promptHook = func(proc *fakeProcess, req acp.PromptRequest) (<-chan acp.AgentEvent, error) {
+				if prompts.Add(1) == 1 {
+					return source, nil
+				}
+				events := make(chan acp.AgentEvent, 1)
+				events <- acp.AgentEvent{Type: acp.EventTypeDone, TurnID: req.TurnID, SessionID: proc.handle.SessionID}
+				close(events)
+				return events, nil
+			}
+			h.driver.cancelHook = func(*fakeProcess) error {
+				if phase == StopPhaseCooperative {
+					closeSource()
+				}
+				return nil
+			}
+			h.driver.stopHook = func(proc *fakeProcess) error {
+				if phase == StopPhaseKilled && proc.handle == previous {
+					return errors.New("provider ignored forced stop")
+				}
+				closeSource()
+				proc.exit()
+				return nil
+			}
+			h.driver.killHook = func(proc *fakeProcess) error { closeSource(); proc.exit(); return nil }
+			t.Cleanup(func() { reportSessionStop(t, h, session.ID) })
+			candidateEntered, releaseCandidate := make(chan struct{}), make(chan struct{})
+			unblockCandidate := sync.OnceFunc(func() { close(releaseCandidate) })
+			t.Cleanup(unblockCandidate)
+			if phase != StopPhaseCooperative {
+				h.driver.startContextHook = func(startCtx context.Context, opts acp.StartOpts, _ int) (*fakeProcess, error) {
+					close(candidateEntered)
+					select {
+					case <-releaseCandidate:
+						return newFakeProcess(opts.AgentName, opts.Command, opts.Cwd, "replacement-runtime"), nil
+					case <-startCtx.Done():
+						return nil, startCtx.Err()
+					}
+				}
+			}
+			ctx, cancel := context.WithTimeout(t.Context(), 3*time.Second)
+			defer cancel()
+			events, err := h.manager.Prompt(ctx, session.ID, "first turn")
+			if err != nil {
+				t.Fatal(err)
+			}
+			turnID := session.CurrentTurnID()
+			if err := h.manager.CancelTurn(ctx, session.ID, turnID, CauseUserRequested); err != nil {
+				t.Fatal(err)
+			}
+			if phase != StopPhaseCooperative {
+				select {
+				case <-candidateEntered:
+				case <-ctx.Done():
+					t.Fatal(ctx.Err())
+				}
+				if session.CurrentTurnID() != "" {
+					t.Fatal("old turn has not drained before rebind")
+				}
+				if _, err := h.manager.Prompt(ctx, session.ID, "premature turn"); !errors.Is(err, ErrPromptInProgress) {
+					t.Errorf("prompt admission during rebind = %v", err)
+				}
+				if err := session.reserveConversationRewind(); !errors.Is(err, ErrConversationRewindBusy) {
+					session.releaseConversationRewind()
+					t.Errorf("rewind admission during rebind = %v", err)
+				}
+				if err := session.reserveWorktreeFork(); !errors.Is(err, ErrPromptInProgress) {
+					session.releaseWorktreeFork()
+					t.Errorf("fork admission during rebind = %v", err)
+				}
+				unblockCandidate()
+			}
+			outcome, err := h.manager.AwaitTurnQuiesced(ctx, session.ID, turnID)
+			if err != nil || !outcome.Quiesced || outcome.Phase != phase {
+				t.Fatalf("turn outcome = %#v, %v", outcome, err)
+			}
+			collectEvents(t, events)
+			// The lifecycle owner must persist one verified receipt before admitting another turn.
+			stored := readStoredEvents(t, session)
+			if countEventType(stored, eventspkg.SessionTurnQuiesced) != 1 {
+				t.Fatalf("turn completion receipts = %#v", stored)
+			}
+			for _, event := range stored {
+				if event.Type != eventspkg.SessionTurnQuiesced {
+					continue
+				}
+				var payload struct {
+					Raw turnQuiescedPayload `json:"raw"`
+				}
+				if err := json.Unmarshal([]byte(event.Content), &payload); err != nil {
+					t.Fatal(err)
+				}
+				if !payload.Raw.Verified || payload.Raw.Phase != phase || payload.Raw.TurnID != turnID ||
+					payload.Raw.StopCause != "user_requested" || payload.Raw.Escalated != outcome.Escalated {
+					t.Fatalf("durable turn outcome = %#v", payload.Raw)
+				}
+			}
+			if session.Info().State != StateActive || session.IsPrompting() {
+				t.Fatalf("session after cancel = %#v", session.Info())
+			}
+			if (session.processHandle() == previous) != (phase == StopPhaseCooperative) {
+				t.Fatal("unexpected process binding after cancellation")
+			}
+			next, err := h.manager.Prompt(ctx, session.ID, "next turn")
+			if err != nil {
+				t.Fatal(err)
+			}
+			if got := countAgentEvents(collectEvents(t, next), acp.EventTypeDone); got != 1 {
+				t.Fatalf("next turn completed events = %d", got)
+			}
+		})
+	}
+}
+
+// Invariant: cleanup retires one turn atomically and cannot erase newer ownership.
+// Owner: prompt lifecycle; canonical manager_prompt_contract_test.go suite.
+func TestPromptCompletionOwnership(t *testing.T) {
+	t.Parallel()
+	t.Run("Should preserve a newer turn when an older completion arrives late", func(t *testing.T) {
+		t.Parallel()
+		done := make(chan struct{})
+		sess := &Session{
+			currentTurnID:        "new-turn",
+			currentTurnSource:    TurnSourceUser,
+			currentPromptMessage: "new draft",
+			currentPromptDone:    done,
+		}
+		clearPromptState(sess, "old-turn")
+		if !sess.IsPrompting() || sess.CurrentTurnID() != "new-turn" || sess.CurrentPromptMessage() != "new draft" {
+			t.Fatal("late completion erased current ownership")
+		}
+		select {
+		case <-done:
+			t.Fatal("late completion closed current completion channel")
+		default:
+		}
+		clearPromptState(sess, "new-turn")
+		if sess.IsPrompting() || sess.CurrentTurnID() != "" || sess.CurrentPromptMessage() != "" {
+			t.Fatal("current completion left partial ownership")
+		}
+		select {
+		case <-done:
+		default:
+			t.Fatal("current completion did not close its channel")
+		}
+	})
+}
+
+func acceptFallbackReviewer(t *testing.T, h *harness) *Session {
+	t.Helper()
+	created, err := h.manager.CreateAccepted(testutil.Context(t), new(CreateAcceptedOpts{
+		Session: CreateOpts{AgentName: "reviewer", Workspace: h.workspaceID},
+	}))
+	if err != nil {
+		t.Fatalf("CreateAccepted(reviewer) error = %v", err)
+	}
+	session, ok := h.manager.Get(created.ID)
+	if !ok {
+		t.Fatalf("Get(%q) did not find accepted session", created.ID)
+	}
+	t.Cleanup(func() {
+		if err := h.manager.Stop(testutil.Context(t), session.ID); err != nil &&
+			!errors.Is(err, ErrSessionNotFound) {
+			t.Errorf("Stop(%q) cleanup error = %v", session.ID, err)
+		}
+	})
+	return session
+}
+
+// Invariant: a first bind advances through the agent chain only before ACP acceptance,
+// commits one ledger event before each fallback attempt, and leaves one attributed
+// provider_failure marker per refused route (IT-003, UT-012, UT-013).
+func TestPromptBindFallbackChain(t *testing.T) {
+	t.Parallel()
+
+	t.Run("Should bind on the first accepting route with attributed evidence", func(t *testing.T) {
+		t.Parallel()
+		h := newHarness(t)
+		ledger := installFallbackAgent(t, h, claudeSeatOneRoute(h), codexRoute(h))
+		refuseStartCommands(h, map[string]error{
+			fallbackSeatZero: rateLimitRefusal(),
+			fallbackSeatOne:  missingCLIRefusal(),
+		})
+		session := acceptFallbackReviewer(t, h)
+
+		events, err := h.manager.Prompt(testutil.Context(t), session.ID, "review the diff")
+		if err != nil {
+			t.Fatalf("Prompt() error = %v", err)
+		}
+		if got := collectEvents(t, events); len(got) == 0 || got[len(got)-1].Type != acp.EventTypeDone {
+			t.Fatalf("Prompt() events = %#v, want a completed turn", got)
+		}
+		codexCommand := h.cfg.Providers["codex"].Command
+		if got, want := startCommands(
+			h,
+		), []string{
+			fallbackSeatZero,
+			fallbackSeatOne,
+			codexCommand,
+		}; !slices.Equal(
+			got,
+			want,
+		) {
+			t.Fatalf("start commands = %v, want %v", got, want)
+		}
+		info := session.Info()
+		if info.ACPSessionID != "acp-3" || info.Provider != "codex" {
+			t.Fatalf("binding = %q on %q, want acp-3 on codex", info.ACPSessionID, info.Provider)
+		}
+		rows := ledger.fallbackRows()
+		if len(rows) != 2 {
+			t.Fatalf("session.fallback.used rows = %d, want 2", len(rows))
+		}
+		for index, want := range []string{fallbackSeatOne, codexCommand} {
+			payload := decodeFallbackPayload(t, rows[index])
+			if payload.Phase != fallbackPhaseBind || payload.Attempt != index+1 ||
+				payload.ProviderCommandFingerprint != providerCommandFingerprint(want) {
+				t.Fatalf("row %d payload = %#v, want bind attempt %d for %q", index, payload, index+1, want)
+			}
+			if rows[index].SessionID != session.ID || rows[index].WorkspaceID != h.workspaceID {
+				t.Fatalf("row %d correlation = %#v", index, rows[index])
+			}
+		}
+		markers := transcriptMarkersOfKind(t, h.manager, session.ID, transcript.MarkerProviderFailure)
+		if len(markers) != 2 {
+			t.Fatalf("provider_failure markers = %d, want one per refused route", len(markers))
+		}
+		for index, want := range []struct {
+			command string
+			action  acp.ProviderFailureAction
+		}{
+			{fallbackSeatZero, acp.ProviderFailureActionUseFallback},
+			{fallbackSeatOne, acp.ProviderFailureActionInstallCLI},
+		} {
+			evidence := markers[index].Evidence
+			if evidence["provider_command_fingerprint"] != providerCommandFingerprint(want.command) ||
+				evidence["next_action"] != string(want.action) || evidence["attempt"] != float64(index) {
+				t.Fatalf("marker %d evidence = %#v, want %s for %q", index, evidence, want.action, want.command)
+			}
+		}
+		if strings.Contains(markers[0].Summary, "SEAT=") ||
+			!strings.HasPrefix(markers[0].Summary, "Provider refused route 1") {
+			t.Fatalf("marker summary = %q", markers[0].Summary)
+		}
+		if stored := readStoredEvents(t, session); countEventType(stored, acp.EventTypeError) != 0 ||
+			countEventType(stored, EventTypeSessionStopped) != 0 {
+			t.Fatalf("stored events carry agent error/stop events for refused routes: %#v", stored)
+		}
+		meta := readMeta(t, session.MetaPath())
+		if meta.AcceptedRoute == nil || meta.AcceptedRoute.Attempt != 2 || meta.AcceptedRoute.Provider != "codex" ||
+			meta.AcceptedRoute.CommandFingerprint != providerCommandFingerprint(codexCommand) ||
+			derefString(meta.ACPSessionID) != "acp-3" {
+			t.Fatalf(
+				"meta accepted route = %#v acp=%v, want codex attempt 2 with acp-3",
+				meta.AcceptedRoute,
+				meta.ACPSessionID,
+			)
+		}
+	})
+
+	t.Run("Should stop accepted Claude startup when hosted tools cannot bind", func(t *testing.T) {
+		t.Parallel()
+		h := newHarness(t)
+		bindErr := errors.New("hosted bind deadline expired")
+		hosted := &recordingHostedMCPLauncher{
+			bindErr: bindErr,
+			server:  compozyconfig.MCPServer{Name: "compozy-hosted-tools", Command: "/bin/compozy"},
+		}
+		h.manager = newManagerWithHarness(t, h, WithHostedMCPLauncher(hosted))
+		ledger := installFallbackAgent(t, h, codexRoute(h))
+		workspace, err := h.resolver.Resolve(t.Context(), h.workspaceID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		for i := range workspace.Agents {
+			if workspace.Agents[i].Name == "reviewer" {
+				workspace.Agents[i].Command = "claude-agent-acp"
+			}
+		}
+		h.resolver.upsert(&workspace)
+		h.driver.startContextHook = func(ctx context.Context, opts acp.StartOpts, _ int) (*fakeProcess, error) {
+			proc := newFakeProcess(opts.AgentName, opts.Command, opts.Cwd, "acp-accepted")
+			if opts.FinalizeStartup == nil {
+				return proc, nil
+			}
+			_, _, err := opts.FinalizeStartup(ctx)
+			if err != nil {
+				// The ACP driver owns failed subprocess cleanup and returns no handle.
+				proc.exit()
+				return nil, acp.WrapAcceptedStart("acp-accepted", err)
+			}
+			return proc, nil
+		}
+		session := acceptFallbackReviewer(t, h)
+		_, err = h.manager.Prompt(t.Context(), session.ID, "review the diff")
+		if !errors.Is(err, bindErr) || !StartAccepted(err) {
+			t.Fatalf("Prompt() = %v, want accepted bind failure", err)
+		}
+		if got := startCommands(h); len(got) != 1 {
+			t.Fatalf("start commands = %v, want no fallback after acceptance", got)
+		}
+		if rows := ledger.fallbackRows(); len(rows) != 0 {
+			t.Fatalf("fallback rows = %d, want zero", len(rows))
+		}
+		hosted.mu.Lock()
+		canceled := slices.Contains(hosted.cancels, session.ID)
+		waited := slices.Equal(hosted.waits, []string{session.ID})
+		hosted.mu.Unlock()
+		if !canceled || !waited {
+			t.Fatal("failed startup did not wait for and cancel its own hosted launch")
+		}
+		h.driver.mu.Lock()
+		prompts := len(h.driver.promptCalls)
+		h.driver.mu.Unlock()
+		if prompts != 0 || session.runtimeBindingSnapshot().process != nil {
+			t.Fatalf("prompts = %d, want no model prompt or committed runtime after failure", prompts)
+		}
+	})
+
+	t.Run("Should stop the chain when an attempt is accepted and then fails", func(t *testing.T) {
+		t.Parallel()
+		h := newHarness(t)
+		ledger := installFallbackAgent(t, h, claudeSeatOneRoute(h), codexRoute(h))
+		refuseStartCommands(h, map[string]error{
+			fallbackSeatZero: rateLimitRefusal(),
+			fallbackSeatOne:  acp.WrapAcceptedStart("acp-seat-one", errors.New("set_config_option failed")),
+		})
+		session := acceptFallbackReviewer(t, h)
+
+		_, err := h.manager.Prompt(testutil.Context(t), session.ID, "review the diff")
+		if err == nil || !StartAccepted(err) {
+			t.Fatalf("Prompt() error = %v, want the accepted attempt's failure", err)
+		}
+		if got := startCommands(h); len(got) != 2 {
+			t.Fatalf("start commands = %v, want the chain to stop after the accepted attempt", got)
+		}
+		if rows := ledger.fallbackRows(); len(rows) != 1 {
+			t.Fatalf("session.fallback.used rows = %d, want 1", len(rows))
+		}
+	})
+
+	t.Run("Should run one bind sequence for concurrent first prompts", func(t *testing.T) {
+		t.Parallel()
+		h := newHarness(t)
+		ledger := installFallbackAgent(t, h, claudeSeatOneRoute(h))
+		release := make(chan struct{})
+		entered := make(chan struct{})
+		h.driver.startContextHook = func(_ context.Context, opts acp.StartOpts, sequence int) (*fakeProcess, error) {
+			if opts.Command == fallbackSeatZero {
+				return nil, rateLimitRefusal()
+			}
+			close(entered)
+			<-release
+			return newFakeProcess(opts.AgentName, opts.Command, opts.Cwd, fmt.Sprintf("acp-%d", sequence)), nil
+		}
+		session := acceptFallbackReviewer(t, h)
+		first := make(chan error, 1)
+		go func() {
+			events, err := h.manager.Prompt(testutil.Context(t), session.ID, "first")
+			if err == nil {
+				collectEvents(t, events)
+			}
+			first <- err
+		}()
+		select {
+		case <-entered:
+		case <-testutil.Context(t).Done():
+			t.Fatal("fallback attempt did not start")
+		}
+		secondEvents, secondErr := h.manager.Prompt(testutil.Context(t), session.ID, "second")
+		if secondErr != nil && !errors.Is(secondErr, ErrPromptInProgress) {
+			t.Fatalf("second Prompt() error = %v, want busy-input handling", secondErr)
+		}
+		if rows := ledger.fallbackRows(); len(rows) != 1 {
+			t.Fatalf("session.fallback.used rows during the sequence = %d, want 1", len(rows))
+		}
+		close(release)
+		if err := <-first; err != nil {
+			t.Fatalf("first Prompt() error = %v", err)
+		}
+		if secondErr == nil {
+			collectEvents(t, secondEvents)
+		}
+		if got := startCommands(h); len(got) != 2 {
+			t.Fatalf("start commands = %v, want exactly one bind sequence", got)
+		}
+		if rows := ledger.fallbackRows(); len(rows) != 1 {
+			t.Fatalf("session.fallback.used rows = %d, want 1", len(rows))
+		}
+	})
+
+	t.Run("Should restore the unbound binding when the prompt is canceled mid-sequence", func(t *testing.T) {
+		t.Parallel()
+		h := newHarness(t)
+		installFallbackAgent(t, h, claudeSeatOneRoute(h), codexRoute(h))
+		entered := make(chan struct{})
+		h.driver.startContextHook = func(startCtx context.Context, opts acp.StartOpts, _ int) (*fakeProcess, error) {
+			if opts.Command == fallbackSeatZero {
+				return nil, rateLimitRefusal()
+			}
+			close(entered)
+			<-startCtx.Done()
+			return nil, startCtx.Err()
+		}
+		session := acceptFallbackReviewer(t, h)
+		promptResult := make(chan error, 1)
+		go func() {
+			_, err := h.manager.Prompt(testutil.Context(t), session.ID, "cancel during fallback")
+			promptResult <- err
+		}()
+		select {
+		case <-entered:
+		case <-testutil.Context(t).Done():
+			t.Fatal("fallback attempt did not start")
+		}
+		canceled, err := h.manager.CancelPrompt(testutil.Context(t), session.ID)
+		if err != nil {
+			t.Fatalf("CancelPrompt() error = %v", err)
+		}
+		select {
+		case <-promptResult:
+		case <-testutil.Context(t).Done():
+			t.Fatal("canceled prompt did not return")
+		}
+		if _, err := h.manager.AwaitTurnQuiesced(testutil.Context(t), session.ID, canceled.TurnID); err != nil {
+			t.Fatalf("AwaitTurnQuiesced() error = %v", err)
+		}
+		info := session.Info()
+		if info.RuntimeStatus != RuntimeStatusUnbound || info.ACPSessionID != "" {
+			t.Fatalf("binding after cancel = %q acp=%q, want unbound", info.RuntimeStatus, info.ACPSessionID)
+		}
+		if got := startCommands(h); len(got) != 2 {
+			t.Fatalf("start commands = %v, want no attempt after cancellation", got)
+		}
+		if markers := transcriptMarkersOfKind(
+			t,
+			h.manager,
+			session.ID,
+			transcript.MarkerProviderFailure,
+		); len(
+			markers,
+		) != 1 ||
+			markers[0].Evidence["provider_command_fingerprint"] != providerCommandFingerprint(fallbackSeatZero) {
+			t.Fatalf("provider_failure markers = %#v, want the primary refusal retained", markers)
+		}
+		if stored := readStoredEvents(t, session); countEventType(stored, acp.EventTypeError) != 0 {
+			t.Fatalf("stored events carry agent errors after cancellation: %#v", stored)
+		}
+
+		h.driver.mu.Lock()
+		h.driver.startContextHook = nil
+		h.driver.mu.Unlock()
+		refuseStartCommands(h, nil)
+		events, err := h.manager.Prompt(testutil.Context(t), session.ID, "bind normally")
+		if err != nil {
+			t.Fatalf("later Prompt() error = %v", err)
+		}
+		collectEvents(t, events)
+		if got := session.Info().ACPSessionID; got == "" {
+			t.Fatal("later prompt did not bind the runtime")
+		}
+	})
+}
+
+func TestRequestCompaction(t *testing.T) {
+	t.Parallel()
+	for _, tc := range []struct {
+		name     string
+		commands []store.SessionAdvertisedCommand
+		want     string
+	}{
+		{name: "Should submit compact in maintenance mode", commands: []store.SessionAdvertisedCommand{{Name: "compact"}}, want: "compact"},
+		{name: "Should submit compress when compact is unavailable", commands: []store.SessionAdvertisedCommand{{Name: "compress"}}, want: "compress"},
+		{name: "Should prefer compact over compress", commands: []store.SessionAdvertisedCommand{{Name: "compress"}, {Name: "compact"}}, want: "compact"},
+		{name: "Should reject agents without compaction", commands: []store.SessionAdvertisedCommand{{Name: "review"}}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			h := newHarness(t, WithPromptInputAugmenter(func(context.Context, *Session, string) (string, error) {
+				return "", errors.New("maintenance must skip augmentation")
+			}))
+			session := createSession(t, h)
+			session.replaceAdvertisedCommands(tc.commands, h.manager.now())
+			result, events, err := h.manager.RequestCompaction(
+				WithCompactionRequestedBy(t.Context(), "tool"),
+				session.ID,
+			)
+			if tc.want == "" {
+				if !errors.Is(err, ErrCompactionUnsupported) {
+					t.Fatalf("error = %v", err)
+				}
+				h.driver.mu.Lock()
+				calls := len(h.driver.promptCalls)
+				h.driver.mu.Unlock()
+				if calls != 0 {
+					t.Fatalf("unsupported submitted %d prompts", calls)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatal(err)
+			}
+			collectEvents(t, events)
+			if result.Command != tc.want || result.PromptID == "" || result.SessionID != session.ID {
+				t.Fatalf("result = %#v", result)
+			}
+			h.driver.mu.Lock()
+			request := h.driver.promptCalls[0]
+			h.driver.mu.Unlock()
+			if request.Message != "/"+tc.want || !request.Maintenance || len(request.Sections) != 0 {
+				t.Fatalf("request = %#v", request)
+			}
+			ledger, err := session.recorderHandle().
+				Query(t.Context(), store.EventQuery{Type: "session.compaction.requested"})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if len(ledger) != 1 {
+				t.Fatalf("requested events = %d", len(ledger))
+			}
+			var payload struct {
+				Command     string `json:"command"`
+				RequestedBy string `json:"requested_by"`
+			}
+			requestedEvent, err := transcript.UnmarshalAgentEvent(ledger[0].Content)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := json.Unmarshal(requestedEvent.Raw, &payload); err != nil {
+				t.Fatal(err)
+			}
+			if payload.Command != tc.want || payload.RequestedBy != "tool" {
+				t.Fatalf("requested payload = %#v", payload)
+			}
+		})
+	}
+	t.Run("Should preserve the literal command against mutating input hooks", func(t *testing.T) {
+		t.Parallel()
+		dispatcher := &spyHookDispatcher{
+			dispatchInputPreSubmitFn: func(_ context.Context, payload hookspkg.InputPreSubmitPayload) (hookspkg.InputPreSubmitPayload, error) {
+				payload.Message = "hook instructions\n" + payload.Message
+				return payload, nil
+			},
+		}
+		h := newHarness(t, WithHookSet(fullHookSet(dispatcher)))
+		session := createSession(t, h)
+		session.replaceAdvertisedCommands([]store.SessionAdvertisedCommand{{Name: "compact"}}, h.manager.now())
+		_, events, err := h.manager.RequestCompaction(t.Context(), session.ID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		collectEvents(t, events)
+		h.driver.mu.Lock()
+		request := h.driver.promptCalls[0]
+		h.driver.mu.Unlock()
+		if request.Message != "/compact" || !request.Maintenance {
+			t.Fatalf("mutating hook changed maintenance=%#v", request)
+		}
+	})
+
+	t.Run("Should accept one concurrent request and reject an active turn", func(t *testing.T) {
+		t.Parallel()
+		h := newHarness(t)
+		session := createSession(t, h)
+		session.replaceAdvertisedCommands([]store.SessionAdvertisedCommand{{Name: "compact"}}, h.manager.now())
+		source := make(chan acp.AgentEvent, 1)
+		h.driver.promptHook = func(*fakeProcess, acp.PromptRequest) (<-chan acp.AgentEvent, error) { return source, nil }
+		type attempt struct {
+			events <-chan acp.AgentEvent
+			err    error
+		}
+		results := make(chan attempt, 2)
+		start := make(chan struct{})
+		var workers sync.WaitGroup
+		for range 2 {
+			workers.Go(func() {
+				<-start
+				_, events, err := h.manager.RequestCompaction(t.Context(), session.ID)
+				results <- attempt{events: events, err: err}
+			})
+		}
+		close(start)
+		workers.Wait()
+		close(results)
+		accepted := 0
+		var events <-chan acp.AgentEvent
+		for result := range results {
+			if result.err == nil {
+				accepted++
+				events = result.events
+			} else if !errors.Is(result.err, ErrPromptInProgress) {
+				t.Fatalf("error=%v", result.err)
+			}
+		}
+		if accepted != 1 {
+			t.Fatalf("accepted=%d", accepted)
+		}
+		if _, _, err := h.manager.RequestCompaction(t.Context(), session.ID); !errors.Is(err, ErrPromptInProgress) {
+			t.Fatalf("active turn error=%v", err)
+		}
+		source <- acp.AgentEvent{Type: acp.EventTypeDone, Timestamp: h.manager.now(), PromptStopReason: acp.PromptStopReasonEndTurn}
+		close(source)
+		collectEvents(t, events)
+		h.driver.mu.Lock()
+		calls := len(h.driver.promptCalls)
+		h.driver.mu.Unlock()
+		if calls != 1 {
+			t.Fatalf("driver calls=%d", calls)
+		}
+	})
+	t.Run("Should preserve pending context until the ordinary prompt", func(t *testing.T) {
+		t.Parallel()
+		var augmented atomic.Int32
+		h := newHarness(
+			t,
+			WithPromptInputAugmenter(func(_ context.Context, _ *Session, message string) (string, error) {
+				augmented.Add(1)
+				return message, nil
+			}),
+		)
+		session := createSession(t, h)
+		session.replaceAdvertisedCommands([]store.SessionAdvertisedCommand{{Name: "compact"}}, h.manager.now())
+		session.mu.Lock()
+		session.importedContext = &store.SessionImportedContext{}
+		session.mu.Unlock()
+		const replay = "pending imported and resumed context"
+		h.manager.stageResumeReplay(session.ID, replay)
+		_, events, err := h.manager.RequestCompaction(t.Context(), session.ID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		collectEvents(t, events)
+		if h.manager.pendingResumeReplay(session.ID) != replay || session.importedContextSnapshot().Consumed != nil {
+			t.Fatal("maintenance consumed pending context")
+		}
+		if augmented.Load() != 0 {
+			t.Fatal("maintenance invoked augmenter")
+		}
+		events, err = h.manager.Prompt(t.Context(), session.ID, "ordinary prompt")
+		if err != nil {
+			t.Fatal(err)
+		}
+		collectEvents(t, events)
+		h.driver.mu.Lock()
+		requests := slices.Clone(h.driver.promptCalls)
+		h.driver.mu.Unlock()
+		if requests[0].Message != "/compact" || !requests[0].Maintenance {
+			t.Fatalf("maintenance=%#v", requests[0])
+		}
+		if !strings.Contains(requests[1].Message, replay) || requests[1].Maintenance {
+			t.Fatalf("ordinary=%#v", requests[1])
+		}
+		if h.manager.pendingResumeReplay(session.ID) != "" || session.importedContextSnapshot().Consumed == nil ||
+			augmented.Load() != 1 {
+			t.Fatal("ordinary prompt did not consume pending context once")
+		}
+	})
+}
+
+// nativeOrderRecorder records the subagent transitions the prompt path drives, in order.
+type nativeOrderRecorder struct {
+	SubagentService
+	mu    sync.Mutex
+	calls []string
+}
+
+func (r *nativeOrderRecorder) record(call string) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.calls = append(r.calls, call)
+}
+
+func (r *nativeOrderRecorder) snapshot() []string {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return append([]string(nil), r.calls...)
+}
+
+func (r *nativeOrderRecorder) OnNativeToolEvent(_ context.Context, _ string, ev NativeSubagentEvent) error {
+	if ev.Task != nil {
+		r.record(fmt.Sprintf("task:%s:%s:%s", ev.ProviderToolCallID, ev.Task.Status, ev.ParentTurnID))
+		return nil
+	}
+	r.record(fmt.Sprintf("native:%s:%s:%t", ev.ProviderToolCallID, ev.Status, ev.Background))
+	return nil
+}
+
+func (r *nativeOrderRecorder) OnNativeTurnDone(_ context.Context, _, turn string, _ time.Time) error {
+	r.record("done:" + turn)
+	return nil
+}
+
+func (r *nativeOrderRecorder) OnParentTurnSettled(_ context.Context, _, turn string) error {
+	r.record("settled:" + turn)
+	return nil
+}
+
+func (r *nativeOrderRecorder) OnChildSettled(context.Context, string) error { return nil }
+
+func (r *nativeOrderRecorder) OnParentStopped(context.Context, string) error { return nil }
+
+func (r *nativeOrderRecorder) Summaries(context.Context, []string) (map[string]store.SubagentSummary, error) {
+	return map[string]store.SubagentSummary{}, nil
+}
+
+// Invariant: native Agent/Task events and the provider's answer reach the subagent service on the
+// persistence path, in ledger order and before turn settlement, even while nobody reads the prompt
+// stream (issue #766); owner: Manager prompt persistence.
+func TestNativeSubagentPersistenceOrder(t *testing.T) {
+	t.Parallel()
+	t.Run("Should ingest a background launch and the turn's answer before settling it", func(t *testing.T) {
+		t.Parallel()
+		// A one-event prompt buffer stalls the unread delivery pump after the first event.
+		h := newHarness(t, WithPromptBufferSize(1))
+		active := createSession(t, h)
+		t.Cleanup(func() { reportSessionStop(t, h, active.ID) })
+		recorder := &nativeOrderRecorder{}
+		h.manager.SetSubagentService(recorder)
+		source := make(chan acp.AgentEvent, 5)
+		h.driver.promptHook = func(*fakeProcess, acp.PromptRequest) (<-chan acp.AgentEvent, error) {
+			return source, nil
+		}
+		output, err := h.manager.Prompt(t.Context(), active.ID, "background work")
+		if err != nil {
+			t.Fatal(err)
+		}
+		turn := active.CurrentTurnID()
+		source <- acp.AgentEvent{Type: acp.EventTypeAgentMessage, Text: "Starting S1.", TurnID: turn}
+		source <- acp.AgentEvent{Type: acp.EventTypeToolCall, ToolCallID: "toolu_bg", TurnID: turn}.
+			WithProviderToolMetadata("", "Agent", "pending").
+			WithTool("Agent", json.RawMessage(`{"description":"S1","run_in_background":true}`), false)
+		source <- acp.AgentEvent{Type: acp.EventTypeToolResult, ToolCallID: "toolu_bg", TurnID: turn}.
+			WithProviderToolMetadata("", "Agent", "completed").
+			WithProviderToolAsync()
+		// The task's own terminal evidence is persisted and ingested before the turn's answer.
+		source <- acp.AgentEvent{
+			Type: acp.EventTypeNativeTask, ToolCallID: "toolu_bg", TurnID: turn,
+		}.WithNativeTask(&acp.NativeTaskObservation{
+			Kind: acp.NativeTaskKindState, TaskID: "agent-a", ToolCallID: "toolu_bg",
+			Status: acp.NativeTaskStatusCompleted, Summary: new("S1 done"),
+		})
+		source <- acp.AgentEvent{Type: acp.EventTypeDone, TurnID: turn, PromptStopReason: acp.PromptStopReasonEndTurn}
+		close(source)
+		// The prompt stream stays unread until the turn has settled.
+		waitForCondition(t, "turn settled", func() bool {
+			return slices.Contains(recorder.snapshot(), "settled:"+turn)
+		})
+		want := []string{
+			"native:toolu_bg:pending:true",
+			"native:toolu_bg:completed:true",
+			"task:toolu_bg:completed:" + turn,
+			"done:" + turn,
+			"settled:" + turn,
+		}
+		if got := recorder.snapshot(); !slices.Equal(got, want) {
+			t.Fatalf("calls = %q, want %q", got, want)
+		}
+		collectEvents(t, output)
+	})
+}
+
+// Invariant: only user/agent cancellation disposes delegated-turn delivery; owner: Manager cancellation (UT-061).
+func TestSubagentPromptCancel(t *testing.T) {
+	t.Parallel()
+	for _, cause := range []PromptCancelCause{PromptCancelUser, PromptCancelAgent, PromptCancelSyntheticAdmission, PromptCancelSteerFallback} {
+		t.Run("Should classify cancellation "+string(cause)+" UT-061", func(t *testing.T) {
+			t.Parallel()
+			h := newHarness(t)
+			active := createSession(t, h)
+			t.Cleanup(func() { reportSessionStop(t, h, active.ID) })
+			source := make(chan acp.AgentEvent)
+			h.driver.promptHook = func(*fakeProcess, acp.PromptRequest) (<-chan acp.AgentEvent, error) { return source, nil }
+			output, err := h.manager.Prompt(t.Context(), active.ID, "active parent")
+			if err != nil {
+				t.Fatal(err)
+			}
+			s, db, _ := newSubagentTestService(t)
+			db.rows["delegated"] = store.SessionSubagent{
+				ID:              "delegated",
+				ParentSessionID: active.ID,
+				ParentTurnID:    active.CurrentTurnID(),
+				Status:          "running",
+				Delivery:        "none",
+			}
+			h.manager.SetSubagentService(s)
+			result, err := h.manager.CancelPromptWithCause(t.Context(), active.ID, cause)
+			if err != nil || result.Outcome != PromptCancelOutcomeCanceled {
+				t.Fatal(result, err)
+			}
+			close(source)
+			collectEvents(t, output)
+			db.mu.Lock()
+			delivery := db.rows["delegated"].Delivery
+			db.mu.Unlock()
+			want := "none"
+			if cause == PromptCancelUser || cause == PromptCancelAgent {
+				want = "disposed"
+			}
+			if delivery != want {
+				t.Fatalf("delivery=%s want=%s", delivery, want)
+			}
+		})
+	}
+}
+
+func TestStandaloneAgentCommandDelivery(t *testing.T) {
+	t.Parallel()
+	for _, tc := range []struct {
+		name, message  string
+		human, command bool
+	}{
+		{"bare command", "/compact", true, true},
+		{"command arguments", "/compact keep decisions", true, true},
+		{"model command", "/model opus", true, true},
+		{"qualified command", "/plugin:review details", true, true},
+		{"case-sensitive command", "/Review", true, true},
+		{"normalized alias", "/plugin-review", true, false},
+		{"wrong case", "/review", true, false},
+		{"inline command", "explain /compact", true, false},
+		{"unknown command", "/unknown", true, false},
+		{"punctuation", "/compact,", true, false},
+		{"agent authored text", "/compact", false, false},
+	} {
+		t.Run("Should preserve context for "+tc.name, func(t *testing.T) {
+			t.Parallel()
+			var augmented atomic.Int32
+			h := newHarness(
+				t,
+				WithPromptInputAugmenter(func(ctx context.Context, _ *Session, message string) (string, error) {
+					augmented.Add(1)
+					acp.RegisterPromptSection(ctx, acp.PromptSection{Key: "test-context", Content: "pending context"})
+					return "pending context\n\n" + message, nil
+				}),
+			)
+			session := createSession(t, h)
+			session.replaceAdvertisedCommands(
+				[]store.SessionAdvertisedCommand{
+					{Name: "compact"},
+					{Name: "model"},
+					{Name: "plugin:review"},
+					{Name: "Review"},
+				},
+				h.manager.now(),
+			)
+			const replay = "pending resume replay"
+			h.manager.stageResumeReplay(session.ID, replay)
+			opts := SendPromptOpts{Message: tc.message}
+			if tc.human {
+				opts.AllowCommands = true
+				opts.Caller = PromptCaller{Kind: "human", ID: "operator", Source: "http"}
+			}
+			result, err := h.manager.SendPrompt(t.Context(), session.ID, opts)
+			if err != nil {
+				t.Fatal(err)
+			}
+			events := collectEvents(t, result.Events)
+			if len(events) == 0 {
+				t.Fatal("missing normal turn events")
+			}
+			h.driver.mu.Lock()
+			first := h.driver.promptCalls[0]
+			h.driver.mu.Unlock()
+			if first.AgentCommand != tc.command || first.Maintenance {
+				t.Fatalf("delivery = %#v", first)
+			}
+			if tc.command {
+				if first.Message != tc.message || len(first.Sections) != 0 || augmented.Load() != 0 {
+					t.Fatalf("command was augmented: %#v", first)
+				}
+				if h.manager.pendingResumeReplay(session.ID) != replay {
+					t.Fatal("command consumed replay")
+				}
+			} else if !strings.Contains(first.Message, replay) || augmented.Load() != 1 {
+				t.Fatalf("ordinary prompt missing context: %#v", first)
+			}
+			stream, err := h.manager.Prompt(t.Context(), session.ID, "ordinary prompt")
+			if err != nil {
+				t.Fatal(err)
+			}
+			collectEvents(t, stream)
+			h.driver.mu.Lock()
+			next := h.driver.promptCalls[1]
+			h.driver.mu.Unlock()
+			if next.AgentCommand || next.Maintenance || !strings.Contains(next.Message, "pending context") ||
+				len(next.Sections) != 1 {
+				t.Fatalf("ordinary delivery = %#v", next)
+			}
+			if tc.command && !strings.Contains(next.Message, replay) {
+				t.Fatal("next prompt lost replay")
+			}
+			if h.manager.pendingResumeReplay(session.ID) != "" {
+				t.Fatal("ordinary prompt retained replay")
+			}
+		})
+	}
+}
+
+func TestAgentCommandHonorsInputHooks(t *testing.T) {
+	t.Parallel()
+	for _, tc := range []struct {
+		name, rewrite string
+		denied        bool
+	}{
+		{"rewritten ordinary prompt", "explain /compact", false},
+		{"denied command", "", true},
+		{"leading whitespace", " \n/compact keep decisions\t ", false},
+	} {
+		t.Run("Should honor "+tc.name, func(t *testing.T) {
+			t.Parallel()
+			dispatcher := &spyHookDispatcher{
+				dispatchInputPreSubmitFn: func(_ context.Context, payload hookspkg.InputPreSubmitPayload) (hookspkg.InputPreSubmitPayload, error) {
+					if tc.denied {
+						return payload, errors.New("command denied")
+					}
+					payload.Message = tc.rewrite
+					return payload, nil
+				},
+			}
+			h := newHarness(t, WithHookSet(fullHookSet(dispatcher)))
+			session := createSession(t, h)
+			session.replaceAdvertisedCommands([]store.SessionAdvertisedCommand{{Name: "compact"}}, h.manager.now())
+			result, err := h.manager.SendPrompt(t.Context(), session.ID, SendPromptOpts{
+				Message:       "/compact",
+				AllowCommands: true,
+				Caller:        PromptCaller{Kind: "human", ID: "operator", Source: "http"},
+			})
+			if tc.denied {
+				if err == nil || !strings.Contains(err.Error(), "command denied") {
+					t.Fatalf("hook denial error = %v", err)
+				}
+				h.driver.mu.Lock()
+				defer h.driver.mu.Unlock()
+				if len(h.driver.promptCalls) != 0 {
+					t.Fatal("denied command reached driver")
+				}
+				return
+			}
+			if err != nil {
+				t.Fatal(err)
+			}
+			collectEvents(t, result.Events)
+			h.driver.mu.Lock()
+			defer h.driver.mu.Unlock()
+			request := h.driver.promptCalls[0]
+			wantCommand := tc.name == "leading whitespace"
+			want := tc.rewrite
+			if wantCommand {
+				want = strings.TrimSpace(want)
+			}
+			if request.AgentCommand != wantCommand || request.Message != want {
+				t.Fatalf("rewritten request = %#v", request)
+			}
+		})
+	}
+}
+
+func TestAgentCommandsFollowCurrentRuntime(t *testing.T) {
+	t.Parallel()
+	for _, replacement := range []string{"provider switch", "restart"} {
+		t.Run("Should discard old advertisements after "+replacement, func(t *testing.T) {
+			t.Parallel()
+			h := newHarness(
+				t,
+				WithPromptInputAugmenter(func(_ context.Context, _ *Session, message string) (string, error) {
+					return "current context\n\n" + message, nil
+				}),
+			)
+			session := createSession(t, h)
+			var calls atomic.Int32
+			h.driver.promptHook = func(_ *fakeProcess, request acp.PromptRequest) (<-chan acp.AgentEvent, error) {
+				events := make(chan acp.AgentEvent, 2)
+				if calls.Add(1) == 1 {
+					events <- (acp.AgentEvent{Type: acp.EventTypeAvailableCommands, TurnID: request.TurnID, Timestamp: h.manager.now()}).WithAvailableCommands([]store.SessionAdvertisedCommand{{Name: "context"}})
+				}
+				events <- acp.AgentEvent{Type: acp.EventTypeDone, TurnID: request.TurnID, Timestamp: h.manager.now()}
+				close(events)
+				return events, nil
+			}
+			opts := SendPromptOpts{
+				Message:       "/context",
+				AllowCommands: true,
+				Caller:        PromptCaller{Kind: "human", ID: "operator", Source: "http"},
+			}
+			for index := range 3 {
+				if index == 2 {
+					if replacement == "provider switch" {
+						opts.Runtime = &RuntimeSelection{Provider: "codex"}
+					} else {
+						if err := h.manager.Stop(t.Context(), session.ID); err != nil {
+							t.Fatal(err)
+						}
+						resumed, err := h.manager.Resume(t.Context(), session.ID)
+						if err != nil {
+							t.Fatal(err)
+						}
+						session = resumed
+					}
+				}
+				result, err := h.manager.SendPrompt(t.Context(), session.ID, opts)
+				if err != nil {
+					t.Fatal(err)
+				}
+				collectEvents(t, result.Events)
+				requests := managerPromptCalls(h)
+				got := requests[index]
+				if got.AgentCommand != (index == 1) {
+					t.Fatalf("turn %d delivery = %#v", index, got)
+				}
+				if index == 1 && got.Message != "/context" {
+					t.Fatalf("command = %q", got.Message)
+				}
+				if index != 1 && !strings.Contains(got.Message, "current context") {
+					t.Fatalf("ordinary prompt lost context: %q", got.Message)
+				}
+			}
+			if len(session.Info().AdvertisedCommands) != 0 {
+				t.Fatal("replacement retained old command catalog")
+			}
+		})
+	}
+}
+
+type profileLabelRecorder struct {
+	EventRecorder
+	observe func(context.Context, store.SessionEvent)
+}
+
+var _ EventRecorder = (*profileLabelRecorder)(nil)
+
+func (r *profileLabelRecorder) RecordPersisted(
+	ctx context.Context,
+	event store.SessionEvent,
+) (store.SessionEvent, error) {
+	r.observe(ctx, event)
+	return recordPersistedSessionEvent(ctx, r.EventRecorder, event)
+}
+
+type profileStartedContext struct {
+	context.Context
+	started chan struct{}
+	once    sync.Once
+}
+
+var _ context.Context = (*profileStartedContext)(nil)
+
+func (c *profileStartedContext) Done() <-chan struct{} {
+	c.once.Do(func() { close(c.started) })
+	return c.Context.Done()
+}

@@ -1,0 +1,77 @@
+---
+id: RT-session-prompt-cancel
+area: RT
+title: Cancel one prompt without stopping its session
+persona: Ada
+journey: J-15
+expected: compozy session prompt-cancel and compozy__session_prompt_cancel use the same idempotent cancellation path as HTTP/UDS, return the canceled turn once, report nothing-in-flight on repeat, and keep the session alive for a later prompt.
+entry_points: compozy session prompt-cancel; compozy__session_prompt_cancel; POST /api/workspaces/{workspace_id}/sessions/{session_id}/prompt/cancel over HTTP and UDS
+qa_status: pass
+bug_ids: BUG-20260906-cancel-exited-session-race
+fix_status: fixed
+retest_status: pass
+fix_commits:
+evidence: docs/qa/reports/2026-08-16-herdr-parity.md; /Users/pedronauck/dev/qa-labs/compozy-northstar-pay-20260816-141901-835450-lab/qa-artifacts/qa/bootstrap-manifest.json;docs/qa/reports/2026-09-01-issue-521-522-session-cancel-clear.md;/Users/pedronauck/dev/qa-labs/compozy-issue-521-522-session-cancel-clear-20260901-183338-907244-lab/qa-artifacts/qa;docs/qa/reports/2026-09-05-sessions-stability-task01-02.md;/Users/pedronauck/dev/qa-labs/compozy-sessions-stability-task01-02-20260905-154017-502928-lab/qa-artifacts/qa/evidence/walkB-prompt-cancel.json;/Users/pedronauck/dev/qa-labs/compozy-sessions-stability-task01-02-20260905-154017-502928-lab/qa-artifacts/qa/evidence/walkB-status-after-cancel.json;/Users/pedronauck/dev/qa-labs/compozy-sessions-stability-task01-02-20260905-154017-502928-lab/qa-artifacts/qa/evidence/walkB-prompt-followup.jsonl
+last_report: docs/qa/reports/2026-09-06-sessions-stability.md
+overlaps: RT-020; ET-web-session-transcript-calm-grammar
+---
+
+Start a blocking prompt, cancel it through each public surface, and submit a later prompt to the same
+session. Confirm the first result carries `canceled` plus the exact turn ID, a repeat returns
+`nothing-in-flight` with CLI exit `66`, concurrent cancel attempts converge on one provider cancel,
+a failed provider cancel can be retried, self and foreign-workspace native targets are denied, and
+the transcript does not render duplicate warning noise.
+
+QA impact 2026-08-16: Task 04 added the prompt-cancel CLI verb and scoped native tool while preserving
+the existing route's single production cancellation path. Flag only; task_08 owns execution.
+
+QA 2026-08-16 Herdr parity: The full runtime E2E exercised the public HTTP, UDS, CLI, and native-tool paths, including matching persisted projections, restart recovery, scoped denials, bounded wait/notify/cancel/stop races, and stable negative outcomes (65/66/69/75/78, agent_scope_denied, and queue-full).
+
+QA impact 2026-09-01: ACP prompt cancellation is now request-scoped, while session-scoped cancellation
+is reserved for whole-session Stop. Reset for repeat-cancel and next-turn integrity across public
+HTTP, UDS, CLI, native-tool, and provider-backed runtime surfaces.
+
+QA 2026-09-01: Codex-backed session `sess-a63b87a64ffa9285` canceled active turn
+`turn-8a40d61cac8706d7`, returned `nothing-in-flight` for repeated CLI, HTTP, and native-tool
+requests, and completed `NEXT_TURN_OK` on the same durable session without a late session cancel.
+
+QA impact 2026-09-05 sessions-stability task_02: prompt-cancel is now the turn scope of the shared stop
+ladder (cooperative grace, then forced/kill escalation with a fresh process rebind); the session never
+reads terminal and stays promptable.
+
+QA 2026-09-05: `compozy session prompt-cancel` on a held acpmock turn returned outcome canceled with the
+exact turn id, the session stayed active/idle/attachable, the next prompt answered STUBBORN_ACK, and an
+idle repeat returned nothing-in-flight with CLI exit 66. A cancel-ignoring turn escalated after the 10 s
+cooperative grace (session.stop_escalated scope turn, phase forced) and the session returned to idle.
+
+QA 2026-09-06 — sessions-stability selected scope: PASS for the selected turn-cancel/rebind branch. Public cancel settled the exact turn, idle repeat retained exit66, and subsequent prompts completed on the same durable session. Task01/02 exhaustive ladder proof is reused; current native and browser integration is recorded in the integrated report. Evidence: docs/qa/reports/2026-09-06-sessions-stability.md.
+
+QA re-walk 2026-09-06: Known-session cancellation remains nothing-in-flight when process exit races the stop claim. The deterministic canonical case fails before the production fix and passes afterward; real subprocess stop/resume integration and the complete session race suite pass. See BUG-20260906-cancel-exited-session-race and the integrated report.
+
+QA impact 2026-09-10: cancellation worker ordering now preserves the accepted provider signal when the stream drains before execution and reports nothing-in-flight for a subsequent request after the turn ends. The existing session cancellation suite owns the deterministic scheduling-gap regression. Current verification is recorded in `docs/qa/reports/2026-09-10-release-integration-repair.md`.
+
+2026-11-03 transport retest: abort a session/transcript read at the HTTP client. The access log
+must report `499` at WARN and omit `api: request failed` at ERROR. Cancel between a transcript
+read and its commit as well. A live-context double commit, deadline and SQLite lock error must
+remain server failures. This read cancellation must not cancel the agent's execution.
+
+2026-11-03 shutdown cancellation follow-up (#1245): cancel an active turn during daemon restart
+while restart-skip storage has a transient read or append failure. The bounded retry must persist
+one `turn_canceled` skip and the canceled turn must not resume. Hold the skip append open and verify
+that cancellation returns and the provider turn quiesces before storage is released. Cancel before
+the shutdown scan captures the interruption as well; the skip must still prevent continuation.
+Focused SQLite verification is owned by `TestDaemonShutdownResumeSkip` and
+`TestResumeInterruptedSession`. Public-surface and live-provider re-walks remain deferred under the
+merge train's host-load restriction.
+
+CI regression 2026-11-04: restart recovery must reject a turn with a durable prompt-cancel marker
+even while its asynchronous restart-skip checkpoint is pending. Hold the skip append open: cancellation
+must return and the provider turn must quiesce before the append is released. Keep the canonical
+`TestResumeInterruptedSession/Should_not_continue_a_turn_the_user_canceled_during_shutdown`
+assertion unchanged; scoped checks run without local race instrumentation per host policy.
+
+Cancellation-marker query correction 2026-11-04: persisted cancellation markers use the
+`transcript.marker.created` event type; `transcript_marker.prompt_cancel` is the marker kind in
+the payload. Restart recovery pages the matching turn markers and checks that kind, so it
+rejects canceled work while the asynchronous skip write is pending. Slow cancellation and
+restart tests retain their original assertions.

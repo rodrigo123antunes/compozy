@@ -1,0 +1,142 @@
+package cli
+
+import (
+	"time"
+
+	"github.com/compozy/compozy/internal/api/contract"
+)
+
+// CreateSessionRequest captures the shared daemon session creation payload.
+type CreateSessionRequest = contract.CreateSessionRequest
+
+// SessionRecord is the shared daemon session payload.
+type SessionRecord = contract.SessionPayload
+
+// SessionStopRecord is the shared termination result.
+type SessionStopRecord = contract.SessionStopPayload
+
+// SessionAttachmentRecord is the shared uploaded session attachment payload.
+type SessionAttachmentRecord = contract.SessionAttachmentPayload
+
+// RenameSessionRequest changes one user session's durable display name.
+type RenameSessionRequest = contract.RenameSessionRequest
+
+// SetSessionParentRequest adopts a parentless session as a child of another session.
+type SetSessionParentRequest = contract.SetSessionParentRequest
+
+// MoveSessionToProfileRequest copies a stopped session into another profile.
+type MoveSessionToProfileRequest = contract.MoveSessionToProfileRequest
+
+// MoveSessionToProfileResponse is the copy, the archived original, and the copy's worktree.
+type MoveSessionToProfileResponse = contract.MoveSessionToProfileResponse
+
+// SessionCommandsRecord is the unified session command catalog.
+type SessionCommandsRecord = contract.SessionCommandsResponse
+
+// SessionCommandRecord is one command in the unified session catalog.
+type SessionCommandRecord = contract.SessionCommandPayload
+
+// SetSessionRuntimeRequest selects the default runtime for future prompts.
+type SetSessionRuntimeRequest = contract.SetSessionRuntimeRequest
+
+// SessionRecapRecord is the shared deterministic session recap payload.
+type SessionRecapRecord = contract.RecapPayload
+
+// SessionSoulRefreshRequest captures the managed session Soul refresh payload.
+type SessionSoulRefreshRequest = contract.SessionSoulRefreshRequest
+
+// SessionHealthRecord is the shared session-health payload.
+type SessionHealthRecord = contract.SessionHealthPayload
+
+// SessionStatusRecord is the shared compact session status payload.
+type SessionStatusRecord = contract.SessionStatusResponse
+
+// SessionInteractionsRecord is the restart-durable pending-interaction projection.
+type SessionInteractionsRecord = contract.SessionInteractionsResponse
+
+// SessionAttentionSummaryRecord is the exact operator-wide attention aggregate.
+type SessionAttentionSummaryRecord = contract.SessionAttentionSummaryPayload
+
+// SessionInspectRecord is the shared detailed session inspect payload.
+type SessionInspectRecord = contract.SessionInspectResponse
+
+// SessionInspectQuery captures optional session inspect expansion fields.
+type SessionInspectQuery struct {
+	IncludeRecentWakeEvents bool
+}
+
+// ACPCapsRecord captures optional runtime capabilities exposed by the daemon API.
+type ACPCapsRecord = contract.ACPCapsPayload
+
+// SessionRepairRecord reports one session repair pass returned by the daemon API.
+type SessionRepairRecord = contract.SessionRepairPayload
+
+type SessionTranscriptRecord = contract.SessionTranscriptResponse
+
+type SessionRewindRequest = contract.SessionConversationRewindRequest
+
+type SessionRewindRecord = contract.SessionConversationRewindResponse
+
+// SessionRepairIssueRecord is one inconsistency reported by session repair.
+type SessionRepairIssueRecord = contract.SessionRepairIssuePayload
+
+// SessionRepairActionRecord is one planned or persisted repair action.
+type SessionRepairActionRecord = contract.SessionRepairActionPayload
+
+// SessionRepairQuery captures CLI repair modifiers.
+type SessionRepairQuery struct {
+	DryRun bool
+	Force  bool
+}
+
+// SessionApprovalRequest captures an interactive permission decision.
+type SessionApprovalRequest = contract.ApproveSessionRequest
+
+// SessionApprovalRecord is the shared session approval response payload.
+type SessionApprovalRecord = contract.SessionApprovalResponse
+
+// SessionPromptRequest captures a session prompt plus explicit busy-input mode.
+type SessionPromptRequest = contract.SendPromptRequest
+
+// SessionGoalCommandRequest is the typed CLI Goal control request.
+type SessionGoalCommandRequest = contract.SessionGoalCommandRequest
+
+// SessionPromptResultRecord is the shared non-streaming prompt outcome payload.
+type SessionPromptResultRecord = contract.SendPromptResultPayload
+
+// SessionInputRecord is one durable pending session input.
+type SessionInputRecord = contract.SessionInputPayload
+
+// SessionInputListRecord is the daemon response for pending session input.
+type SessionInputListRecord = contract.SessionInputListResponse
+
+// ReplaceSessionInputRequest replaces the authored text and identity of queued input.
+type ReplaceSessionInputRequest = contract.ReplaceSessionInputRequest
+
+// PromoteSessionInputRequest converts queued input into fenced steering input.
+type PromoteSessionInputRequest = contract.PromoteSessionInputRequest
+
+// SessionPromptRecord wraps prompt outcomes that may either stream events or return a busy-input decision.
+type SessionPromptRecord struct {
+	Prompt SessionPromptResultRecord   `json:"prompt"`
+	Goal   *contract.GoalCommandResult `json:"goal,omitzero"`
+	Events []AgentEventRecord          `json:"events,omitempty"`
+}
+
+// SessionEventRecord is one persisted session event row returned by the daemon API.
+type SessionEventRecord = contract.SessionEventPayload
+
+// TurnHistoryRecord groups session events by turn.
+type TurnHistoryRecord = contract.TurnHistoryPayload
+
+// SessionEventQuery captures the CLI filters for session event/history queries.
+type SessionEventQuery struct {
+	Forward       bool
+	Type          string
+	AgentName     string
+	TurnID        string
+	Since         time.Time
+	Last          int
+	AfterSequence int64
+	Archive       string
+}

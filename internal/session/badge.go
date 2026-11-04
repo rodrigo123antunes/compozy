@@ -1,0 +1,248 @@
+package session
+
+import (
+	"strings"
+	"time"
+
+	"github.com/compozy/compozy/internal/heartbeat"
+	"github.com/compozy/compozy/internal/store"
+)
+
+// Badge is the canonical user-facing session status token.
+type Badge string
+
+const (
+	BadgeRunning         Badge = "running"
+	BadgeIdle            Badge = "idle"
+	BadgeUnhealthy       Badge = "unhealthy"
+	BadgeHung            Badge = "hung"
+	BadgeWaitingForAuth  Badge = "waiting-for-auth"
+	BadgeWaitingForInput Badge = "waiting-for-input"
+	BadgeDone            Badge = "done"
+	BadgeStopped         Badge = "stopped"
+	BadgeFailed          Badge = "failed"
+	BadgeUnknown         Badge = "unknown"
+	BadgeNeedsAttention  Badge = "needs-attention"
+)
+
+// BadgeInputs are the runtime-truth fields used to compute a session badge.
+type BadgeInputs struct {
+	State                  State
+	StopVerificationFailed bool
+	SupervisionAttention   bool
+	HealthState            heartbeat.SessionHealthState
+	Health                 heartbeat.SessionHealthStatus
+	Failure                *store.SessionFailure
+	PendingAuth            bool
+	PendingClarify         bool
+	ActivePrompt           bool
+	Stalled                bool
+	Waiting                bool
+	// EndedEarly marks a settled turn that stopped without delivering or open work.
+	EndedEarly bool
+	// ReturnedFromLater marks a stopped session the daemon brought back from Later.
+	ReturnedFromLater bool
+	// FailureSeen marks a stopped session's failure the operator marked as seen.
+	FailureSeen         bool
+	Unseen              bool
+	IneligibilityReason string
+}
+
+// CanonicalBadge collapses runtime state, health, and failure classification into
+// the stable badge vocabulary used by API, CLI, and web clients.
+func CanonicalBadge(input BadgeInputs) Badge {
+	if (input.StopVerificationFailed || input.SupervisionAttention) && input.State != StateStopped {
+		return BadgeNeedsAttention
+	}
+	failure := store.CloneSessionFailure(input.Failure)
+	terminal := input.State == StateStopped ||
+		(input.State == "" && input.HealthState == heartbeat.SessionHealthStateStopped)
+	if terminal && terminalFailureKind(failure) {
+		return seenFailureBadge(input)
+	}
+	if input.PendingAuth || failureKindIsAuth(failure) {
+		return BadgeWaitingForAuth
+	}
+	if input.PendingClarify {
+		return BadgeWaitingForInput
+	}
+	if terminal && input.ReturnedFromLater {
+		return BadgeNeedsAttention
+	}
+	if terminal {
+		return BadgeStopped
+	}
+	if input.Stalled {
+		return BadgeHung
+	}
+	if badge, ok := degradedHealthBadge(input); ok {
+		return badge
+	}
+	if runningBadgeInput(input) {
+		return BadgeRunning
+	}
+	return settledBadge(input)
+}
+
+// seenFailureBadge keeps an unseen failure in Needs you; a failure the operator
+// marked as seen reads as a plain stop unless the session came back from Later.
+func seenFailureBadge(input BadgeInputs) Badge {
+	switch {
+	case !input.FailureSeen:
+		return BadgeFailed
+	case input.ReturnedFromLater:
+		return BadgeNeedsAttention
+	default:
+		return BadgeStopped
+	}
+}
+
+// settledBadge orders the badges of a session with no turn in flight: open work
+// first, then an early stop that needs the operator, then unseen and seen results.
+func settledBadge(input BadgeInputs) Badge {
+	if idleEligibleBadgeInput(input) && input.Waiting {
+		return BadgeWaiting
+	}
+	if input.State == StateActive && input.EndedEarly {
+		return BadgeNeedsAttention
+	}
+	if idleEligibleBadgeInput(input) && input.Unseen {
+		return BadgeDone
+	}
+	if idleEligibleBadgeInput(input) {
+		return BadgeIdle
+	}
+	return BadgeUnknown
+}
+
+func degradedHealthBadge(input BadgeInputs) (Badge, bool) {
+	if input.IneligibilityReason == string(heartbeat.SessionHealthReasonHung) ||
+		input.Health == heartbeat.SessionHealthDead ||
+		input.Health == heartbeat.SessionHealthStale {
+		return BadgeHung, true
+	}
+	if input.IneligibilityReason == string(heartbeat.SessionHealthReasonUnhealthy) ||
+		input.Health == heartbeat.SessionHealthDegraded {
+		return BadgeUnhealthy, true
+	}
+	return BadgeUnknown, false
+}
+
+func terminalFailureKind(failure *store.SessionFailure) bool {
+	if failure == nil {
+		return false
+	}
+	kind := failure.Normalize().Kind
+	return kind != "" && kind != store.FailureCanceled
+}
+
+// BadgeForInfo computes a badge from the session manager/catalog snapshot.
+func BadgeForInfo(info *Info) Badge {
+	if info == nil {
+		return BadgeUnknown
+	}
+	return CanonicalBadge(BadgeInputs{
+		State:                  info.State,
+		StopVerificationFailed: info.StopVerificationFailed,
+		SupervisionAttention:   supervisionNeedsAttention(info.Supervision),
+		Failure:                info.Failure,
+		PendingAuth: info.PendingPermission || info.PendingPermissionCount > 0 ||
+			infoFailureNeedsAuth(info.Failure),
+		PendingClarify:    info.PendingClarifyCount > 0,
+		Stalled:           infoHasDetectedStall(info),
+		Waiting:           waitingFromInfo(info),
+		EndedEarly:        strings.TrimSpace(info.EndedEarlyTurnID) != "",
+		ReturnedFromLater: info.LaterReturnedAt != nil,
+		FailureSeen:       info.FailureSeenAt != nil,
+		Unseen:            info.LastSettledRevision > info.LastSeenRevision,
+		ActivePrompt: info.Liveness != nil &&
+			info.Liveness.Activity != nil &&
+			strings.TrimSpace(info.Liveness.Activity.TurnID) != "",
+	})
+}
+
+// AttachableForInfo computes whether a session snapshot is eligible for an
+// explicit attach without consulting UI state or spawning a new runtime.
+func AttachableForInfo(info *Info, now time.Time) bool {
+	if info == nil || info.State != StateActive {
+		return false
+	}
+	switch BadgeForInfo(info) {
+	case BadgeHung, BadgeFailed, BadgeStopped, BadgeUnknown:
+		return false
+	}
+	if info.Failure != nil && strings.TrimSpace(string(info.Failure.Kind)) != "" {
+		return false
+	}
+	if infoHasDetectedStall(info) {
+		return false
+	}
+	if strings.TrimSpace(info.AttachedTo) == "" || info.AttachExpiresAt == nil {
+		return true
+	}
+	if now.IsZero() {
+		now = time.Now().UTC()
+	}
+	return !info.AttachExpiresAt.After(now.UTC())
+}
+
+func infoHasDetectedStall(info *Info) bool {
+	return info != nil &&
+		info.Liveness != nil &&
+		strings.TrimSpace(info.Liveness.StallState) == store.SessionStallStateDetected
+}
+
+// BadgeForHealth computes a badge from an explicit health row, preserving
+// session/failure precedence from the base session info when supplied.
+func BadgeForHealth(info *Info, health heartbeat.SessionHealth) Badge {
+	health = health.Normalize()
+	state := State("")
+	failure := (*store.SessionFailure)(nil)
+	if info != nil {
+		state = info.State
+		failure = info.Failure
+	}
+	pendingPermission := info != nil && info.PendingPermission
+	pendingPermissionCount := info != nil && info.PendingPermissionCount > 0
+	pendingClarify := info != nil && info.PendingClarifyCount > 0
+	unseen := info != nil && info.LastSettledRevision > info.LastSeenRevision
+	return CanonicalBadge(BadgeInputs{
+		State:                  state,
+		StopVerificationFailed: info != nil && info.StopVerificationFailed,
+		SupervisionAttention:   info != nil && supervisionNeedsAttention(info.Supervision),
+		HealthState:            health.State,
+		Health:                 health.Health,
+		Failure:                failure,
+		PendingAuth:            pendingPermission || pendingPermissionCount || infoFailureNeedsAuth(failure),
+		PendingClarify:         pendingClarify,
+		ActivePrompt:           health.ActivePrompt,
+		Unseen:                 unseen,
+		Waiting:                waitingFromInfo(info),
+		EndedEarly:             info != nil && strings.TrimSpace(info.EndedEarlyTurnID) != "",
+		ReturnedFromLater:      info != nil && info.LaterReturnedAt != nil,
+		FailureSeen:            info != nil && info.FailureSeenAt != nil,
+		IneligibilityReason:    health.IneligibilityReason,
+	})
+}
+
+func idleEligibleBadgeInput(input BadgeInputs) bool {
+	return input.State == StateActive || input.HealthState == heartbeat.SessionHealthStateIdle ||
+		input.HealthState == heartbeat.SessionHealthStateDetached
+}
+
+func failureKindIsAuth(failure *store.SessionFailure) bool {
+	if failure == nil {
+		return false
+	}
+	return failure.Normalize().Kind == store.FailureProviderAuth ||
+		failure.Normalize().Kind == store.FailurePermission
+}
+
+func infoFailureNeedsAuth(failure *store.SessionFailure) bool {
+	return failureKindIsAuth(failure)
+}
+
+func runningBadgeInput(input BadgeInputs) bool {
+	return input.State == StateStarting || input.State == StateStopping || input.ActivePrompt ||
+		input.HealthState == heartbeat.SessionHealthStatePrompting
+}

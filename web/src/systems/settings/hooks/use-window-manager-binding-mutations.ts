@@ -1,0 +1,104 @@
+import { useRef, useState } from "react";
+import { useMutation, useQueryClient } from "@tanstack/react-query";
+
+import {
+  cmdPaletteKeys,
+  updateWindowManagerBindings,
+  windowManagerKeys,
+  WindowManagerBindingsApplyError,
+  type WindowManagerBindingUpdate,
+  type WindowManagerBindingsResult,
+  type WindowManagerSettingsApply,
+  type WindowManagerSettingsSection,
+} from "@/systems/os";
+
+import { useProfileReadScope } from "@/systems/profiles";
+
+export interface WindowManagerBindingCommit {
+  shortcuts?: WindowManagerSettingsSection["config"]["shortcuts"];
+  globalShortcuts?: WindowManagerSettingsSection["config"]["globalShortcuts"];
+  aliases?: Readonly<Record<string, string>>;
+  overwrite?: boolean;
+}
+
+export interface WindowManagerBindingMutations {
+  commit: (update: WindowManagerBindingCommit) => Promise<WindowManagerSettingsSection>;
+  saving: boolean;
+  apply: WindowManagerSettingsApply | null;
+}
+
+/**
+ * The single write path for bindings and aliases.
+ *
+ * Each edit lands on its own — there is no draft to save — because a rebind has
+ * to dispatch the moment it is made (US-022.AC-3) and two surfaces editing at
+ * once must converge on whatever the daemon serialized (US-022.EC-4). The reply
+ * is the whole section, so it is seeded straight into the cache the shell reads
+ * and the palette catalog is re-read for the labels it carries.
+ */
+export function useWindowManagerBindingMutations(
+  workspaceId: string | null,
+  clientId?: string
+): WindowManagerBindingMutations {
+  const queryClient = useQueryClient();
+  const clientProfile = useProfileReadScope().destination;
+  const queue = useRef<Promise<void> | null>(null);
+  const [pendingCount, setPendingCount] = useState(0);
+  const [receipt, setReceipt] = useState<{
+    workspaceId: string | null;
+    clientId: string | undefined;
+    clientProfile: string;
+    apply: WindowManagerSettingsApply;
+  } | null>(null);
+  const reconcile = async (
+    result: WindowManagerBindingsResult,
+    scope: WindowManagerBindingUpdate
+  ) => {
+    queryClient.setQueryData(
+      windowManagerKeys.config(scope.workspaceId, scope.clientId, scope.clientProfile),
+      result.section
+    );
+    setReceipt({
+      workspaceId: scope.workspaceId,
+      clientId: scope.clientId,
+      clientProfile: scope.clientProfile ?? "default",
+      apply: result.apply,
+    });
+    await queryClient.invalidateQueries({
+      queryKey: cmdPaletteKeys.workspaceCatalogs(scope.workspaceId ?? ""),
+    });
+  };
+  const mutation = useMutation({
+    mutationFn: (update: WindowManagerBindingUpdate) => updateWindowManagerBindings(update),
+    onMutate: () => setReceipt(null),
+    onSuccess: reconcile,
+    onError: async (error, scope) => {
+      if (error instanceof WindowManagerBindingsApplyError) await reconcile(error.result, scope);
+    },
+  });
+
+  return {
+    commit: update => {
+      setPendingCount(count => count + 1);
+      const scope = clientId === undefined ? { workspaceId } : { workspaceId, clientId };
+      const run = () => mutation.mutateAsync({ ...update, ...scope, clientProfile });
+      const next = (queue.current ?? Promise.resolve()).then(run, run);
+      queue.current = next.then(
+        () => undefined,
+        () => undefined
+      );
+      return next
+        .then(result => result.section)
+        .finally(() => {
+          setPendingCount(count => Math.max(0, count - 1));
+        });
+    },
+    saving: pendingCount > 0,
+    apply:
+      receipt?.workspaceId === workspaceId &&
+      receipt.clientId === clientId &&
+      receipt.clientProfile === clientProfile
+        ? receipt.apply
+        : null,
+  };
+}

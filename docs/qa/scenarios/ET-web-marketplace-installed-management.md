@@ -1,0 +1,105 @@
+---
+id: ET-web-marketplace-installed-management
+area: ET
+title: Manage installed Marketplace extensions
+persona: Bruno
+journey: J-marketplace-acquisition
+expected: The installed shelf opens a flat local extension inventory independent of catalog pagination or availability. Rows show contents, enablement and overflow actions; the updates line and Update all preserve per-item results, including partial failure.
+entry_points: /marketplace/installed; Marketplace installed-count shelf
+qa_status: pass
+bug_ids: [BUG-20260913-marketplace-installed-plugin-panic, BUG-20260913-marketplace-instance-mutation-scope, BUG-20260913-marketplace-workspace-dev-state]
+fix_status:
+retest_status: pass
+fix_commits:
+evidence: docs/qa/evidence/2026-09-13-marketplace-catalog/inventory-after-workspace-removal.json
+last_report: docs/qa/reports/2026-09-13-marketplace-catalog.md
+overlaps: ET-web-extensions-manage; ET-web-extension-detail; ET-web-mcp-status-matrix
+---
+
+QA 2026-09-13: the current hard-cut contract passed the scoped live/API/browser walks and applicable unchanged owning integration checks. See the dated report for exact evidence and boundaries; historical notes below do not redefine the current catalog.
+
+
+Marketplace catalog task 01 (2026-09-12): Use catalog, GitHub and local-folder installations. Filter the inventory, toggle an extension, inspect details, and update two entries with one download failing. The successful entry remains updated and the failed entry retains its prior version.
+
+Marketplace catalog task 04: Install one package globally and in a workspace with different input
+values. Disable it, update it, and restart the daemon: both installations, values, enablement and
+reserved MCP names survive. Remove the workspace installation: its MCP allocation is released,
+the global installation and package remain unchanged. Remove the last installation: the package
+and its remaining MCP allocations retire. Also exercise an active development link to confirm that
+workspace removal unlinks the overlay through its existing lifecycle. HTTP/UDS and SQLite failure
+compensation have focused integration coverage; this final UI walk remains untested.
+
+Execution is deferred to tasks 09/10 by the loop delivery contract. Earlier evidence and notes below describe the previous surface and do not verify this contract.
+
+
+Skipped in the 2026-07-30 MCP 2026/catalog-v2 closeout: retained capture covers MCP installed UI only, not every Marketplace kind and its management actions.
+
+Use one installed item of each surviving kind and confirm detail refresh preserves the same runtime
+truth.
+
+QA impact 2026-07-18: MCP Installed now owns the generic stdio/http/sse editor. Retest global and
+workspace creation, editing a global item while a workspace is active, and exact-scope detail links.
+
+QA impact 2026-07-18: installed detail links now carry exact local identity, MCP edits preserve
+config versus sidecar ownership, hidden same-scope conflicts block saves, and success feedback names
+the write target plus restart lifecycle. Include a local MCP name that collides with a curated ID.
+
+QA impact 2026-07-18: Installed hydrates every catalog page before reporting update state, blocks
+partial truth when continuation fails, loads global skills without an active workspace, and retains
+installed skill tag search. MCP install toasts open the exact entry, scope, server, and workspace.
+
+QA impact 2026-07-18: MCP labels, detail links, edits, removals, and authorization dialogs now use
+`source_metadata.effective_source`, including inherited global definitions returned by a workspace
+collection and exact config-versus-sidecar ownership.
+
+QA impact 2026-07-18: an exact `installed_name` wins over another MCP definition sharing the same
+catalog entry, while an inherited global row no longer blocks creation of a workspace override with
+the same name. Confirm the installed detail and editor target the intended definition.
+
+QA impact 2026-07-18: successful acquisition feedback now runs on the shared motion tokens and
+releases its flash state from the animation lifecycle. Confirm the card flashes once without the
+former long fallback timing and remains operable afterward.
+
+QA impact 2026-07-18: installed mutations publish pending state by the exact MCP owner, skill, or
+extension identity, so sibling cards remain independently operable and explicit global detail links
+keep every action out of the active workspace scope.
+
+QA impact 2026-07-18: consolidated installed details preserve daemon-backed operational context.
+Skills show capabilities, recent calls, provenance, and resolver shadows; extensions show state,
+health, daemon/PID/uptime, capabilities, actions, environment, diagnostics, provenance, and kit inventory.
+
+QA impact 2026-07-18: switching the active workspace closes any open MCP definition editor before
+its captured scope can be saved. Installed Update actions also inherit the exact catalog-entry
+pending state, so the initiating card stays disabled until its mutation settles.
+
+QA impact 2026-08-02: the installed Marketplace has exactly three kinds and extension detail owns
+kit inventory. Reset for the next QA cycle.
+
+QA impact 2026-08-07: marketplace detail pages were rebuilt to the OpenDesign marketplace contract —
+kind-specific content is now the body (skill readme + calls/content/resolution; MCP
+authorization/connection/tools; extension kit/access/environment/diagnostics/logs) and the rail
+holds short collapsible property cards. Update and Authorize are OS-head primary actions only; the
+rail Manage card keeps the enable switch, overflow (Provenance/Remove), and trust badges. Reset to
+untested.
+
+QA impact 2026-09-28 (ui-normie-pass): Installed rows show an "On"/"Off" word beside the switch and
+no longer print the allocated MCP runtime name (it lives under the detail Server card's "Technical
+details"). The updates line uses a neutral dot. The detail Manage card shows one status word and one
+trust word; trust badges moved to the closed Advanced card. A dev overlay's menu item reads
+"Unlink local copy…". Empty search reads `No results for "<q>"`. Reset to untested.
+
+QA impact 2026-08-10: an installed Skill now labels its switch from daemon truth (`Enabled` or
+`Disabled`) after mutation, and extension Update opens an update-specific trust confirmation instead
+of install copy. This scenario remains untested for a fresh Skill toggle, Extension update-confirm,
+refresh, and exact-scope management walk.
+
+QA completion: blocked-verify 2026-08-10 — Bruno toggled the bundled `compozy` skill, confirmed the `Disabled` label
+survived reload, and restored `Enabled`; disabled and restored `spec-cycle` while runtime health and
+official trust stayed truthful; then installed Playwright in workspace scope and inspected its
+installed stdio detail. The isolated catalog exposed no extension update candidate, so the remaining
+update branch could not be walked without fabricated state; its detail contract is tracked by
+ET-web-extension-detail.
+
+QA impact 2026-08-25 (skill sources): reset because the installed skill detail gained a new daemon-backed control surface. The Exposures card now sits beside skill content, shadows, enable, and update, and origin attribution renders on the installed rows. Bundled skills must show no Exposures card at all — absent, not disabled — so the "only daemon-backed controls" claim in this scenario's promise has to be re-settled against the new card. Rides along in `CH-skill-expose-web-repair`.
+
+QA repair 2026-09-13 (final review): verify the required-authorization success notice, local manifest descriptions and real profile/workspace qualifiers. During a mixed-scope batch, observe 0-of-n and intermediate completion; completed groups regain controls while other groups remain pending. Open a global/profile row and a workspace row from Installed: the link and detail request must retain that row's profile/workspace independently of the active window selection. Targeted browser/request evidence and canonical owner receipts are in the dated Marketplace report and review-01 visual bundle.

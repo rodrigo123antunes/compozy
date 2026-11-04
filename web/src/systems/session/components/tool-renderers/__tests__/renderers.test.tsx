@@ -1,0 +1,436 @@
+import { fireEvent, render, screen } from "@testing-library/react";
+import { describe, expect, it, vi } from "vitest";
+
+import type { UIMessage } from "../../../types";
+
+vi.mock("@/lib/utils", () => ({
+  cn: (...args: unknown[]) => args.filter(Boolean).join(" "),
+}));
+
+import { BashContent } from "../bash-content";
+import { ReadContent } from "../read-content";
+import { WriteContent } from "../write-content";
+import { EditContent } from "../edit-content";
+import { SearchContent } from "../search-content";
+import { GenericContent } from "../generic-content";
+import { SessionToolCallRow } from "../../tool-call-card";
+
+function makeMessage(overrides: Partial<UIMessage> = {}): UIMessage {
+  return {
+    id: "tc-1",
+    role: "tool_call",
+    content: "",
+    timestamp: Date.now(),
+    ...overrides,
+  };
+}
+
+describe("BashContent", () => {
+  it("renders command and stdout from toolResult", () => {
+    render(
+      <BashContent
+        message={makeMessage({
+          toolName: "Bash",
+          toolInput: { command: "echo hello" },
+          toolResult: { stdout: "hello\nworld" },
+        })}
+      />
+    );
+    // The command renders as a `$ `-prefixed context line in the detail rail.
+    expect(screen.getByText(/echo hello/)).toBeInTheDocument();
+    // stdout is rendered in a pre element; getByText normalizes whitespace so use getAllByText
+    const matches = screen.getAllByText(/hello/);
+    expect(matches.length).toBeGreaterThanOrEqual(1);
+  });
+
+  it("renders stderr in error styling when present", () => {
+    render(
+      <BashContent
+        message={makeMessage({
+          toolName: "Bash",
+          toolInput: { command: "bad-cmd" },
+          toolResult: { stderr: "command not found" },
+        })}
+      />
+    );
+    // stderr renders as danger TEXT inside the muted detail pre — no tinted block.
+    const stderrEl = screen.getByTestId("bash-stderr");
+    expect(stderrEl).toHaveTextContent("command not found");
+    expect(stderrEl).toHaveClass("text-destructive");
+    expect(stderrEl.closest("pre")).not.toHaveClass("bg-destructive-tint");
+  });
+
+  it("renders without command when toolInput has no command", () => {
+    render(
+      <BashContent
+        message={makeMessage({
+          toolName: "Bash",
+          toolResult: { stdout: "output" },
+        })}
+      />
+    );
+    expect(screen.getByText("output")).toBeInTheDocument();
+    expect(screen.queryByText("$")).not.toBeInTheDocument();
+  });
+
+  it("counts and clamps stdout, stderr, and error as one combined output", () => {
+    const stdout = Array.from({ length: 10 }, (_, index) => `out-${index + 1}`).join("\n");
+    const stderr = Array.from({ length: 8 }, (_, index) => `stderr-${index + 1}`).join("\n");
+    const error = Array.from({ length: 5 }, (_, index) => `error-${index + 1}`).join("\n");
+    render(
+      <BashContent
+        message={makeMessage({
+          toolName: "Bash",
+          toolResult: { stdout, stderr, error },
+        })}
+      />
+    );
+
+    expect(screen.getByRole("button", { name: "Show full output (23 lines)" })).toBeInTheDocument();
+    expect(screen.getByText(/error-1/)).toBeInTheDocument();
+    expect(screen.queryByText(/error-3/)).not.toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole("button", { name: "Show full output (23 lines)" }));
+    expect(screen.getByText(/error-5/)).toBeInTheDocument();
+  });
+});
+
+describe("ReadContent", () => {
+  it("renders file path and line count from stdout", () => {
+    render(
+      <ReadContent
+        message={makeMessage({
+          toolName: "Read",
+          toolInput: { file_path: "/src/main.ts" },
+          toolResult: { stdout: "line1\nline2\nline3" },
+        })}
+      />
+    );
+    expect(screen.getByText("/src/main.ts")).toBeInTheDocument();
+    expect(screen.getByText("3 lines")).toBeInTheDocument();
+  });
+
+  it("renders file path and line count from content", () => {
+    render(
+      <ReadContent
+        message={makeMessage({
+          toolName: "Read",
+          toolInput: { file_path: "/src/app.tsx" },
+          toolResult: { content: "a\nb" },
+        })}
+      />
+    );
+    expect(screen.getByText("/src/app.tsx")).toBeInTheDocument();
+    expect(screen.getByText("2 lines")).toBeInTheDocument();
+  });
+
+  it("renders file path only when no result content", () => {
+    render(
+      <ReadContent
+        message={makeMessage({
+          toolName: "Read",
+          toolInput: { file_path: "/src/utils.ts" },
+        })}
+      />
+    );
+    expect(screen.getByText("/src/utils.ts")).toBeInTheDocument();
+  });
+});
+
+/** Each rendered diff line as `[kind, text]`, in order. */
+function diffLines(): Array<[string | null, string]> {
+  return [...document.querySelectorAll('[data-slot="diff-card-line"]')].map(line => [
+    line.getAttribute("data-kind"),
+    line.lastElementChild?.textContent ?? "",
+  ]);
+}
+
+describe("WriteContent", () => {
+  it("renders file path and content preview", () => {
+    render(
+      <WriteContent
+        message={makeMessage({
+          toolName: "Write",
+          toolInput: { file_path: "/out.txt", content: "hello world" },
+        })}
+      />
+    );
+    expect(screen.getByText("/out.txt")).toBeInTheDocument();
+    // Written content renders as added lines in the diff card.
+    expect(diffLines()).toEqual([["add", "hello world"]]);
+  });
+
+  it("collapses long content to its first lines until the reader opens the rest", () => {
+    const longContent = Array.from({ length: 40 }, (_, index) => `line ${index + 1}`).join("\n");
+    render(
+      <WriteContent
+        message={makeMessage({
+          toolName: "Write",
+          toolInput: { file_path: "/big.txt", content: longContent },
+        })}
+      />
+    );
+    expect(diffLines()).toHaveLength(12);
+    fireEvent.click(screen.getByRole("button", { name: "Show full diff (40 lines)" }));
+    expect(diffLines()).toHaveLength(40);
+  });
+});
+
+describe("EditContent", () => {
+  it("renders file path with old → new diff", () => {
+    render(
+      <EditContent
+        message={makeMessage({
+          toolName: "Edit",
+          toolInput: {
+            file_path: "/src/app.ts",
+            old_string: "const x = 1;",
+            new_string: "const x = 2;",
+          },
+        })}
+      />
+    );
+    expect(screen.getByText("/src/app.ts")).toBeInTheDocument();
+    expect(diffLines()).toEqual([
+      ["del", "const x = 1;"],
+      ["add", "const x = 2;"],
+    ]);
+    expect(document.querySelector('[data-slot="diff-card-stat"]')).toHaveTextContent("+1−1");
+  });
+
+  it("opens the collapsed diff just above its first change", () => {
+    const context = Array.from({ length: 20 }, (_, index) => `keep ${index + 1}`).join("\n");
+    render(
+      <EditContent
+        message={makeMessage({
+          toolName: "Edit",
+          toolInput: {
+            file_path: "/src/long.ts",
+            old_string: `${context}\nconst x = 1;`,
+            new_string: `${context}\nconst x = 2;`,
+          },
+        })}
+      />
+    );
+    // Twenty unchanged lines precede the change; the dozen shown still ends on it.
+    const shown = diffLines();
+    expect(shown).toHaveLength(12);
+    expect(shown.slice(-2)).toEqual([
+      ["del", "const x = 1;"],
+      ["add", "const x = 2;"],
+    ]);
+    expect(screen.getByRole("button", { name: "Show full diff (22 lines)" })).toBeInTheDocument();
+  });
+
+  it("renders only new string when no old string", () => {
+    render(
+      <EditContent
+        message={makeMessage({
+          toolName: "Edit",
+          toolInput: {
+            file_path: "/new.ts",
+            new_string: "export const y = 3;",
+          },
+        })}
+      />
+    );
+    expect(diffLines()).toEqual([["add", "export const y = 3;"]]);
+  });
+});
+
+describe("SearchContent", () => {
+  it("renders pattern and matched files list", () => {
+    render(
+      <SearchContent
+        message={makeMessage({
+          toolName: "Grep",
+          toolInput: { pattern: "TODO" },
+          toolResult: { stdout: "src/a.ts\nsrc/b.ts\nsrc/c.ts" },
+        })}
+      />
+    );
+    expect(screen.getByText("TODO")).toBeInTheDocument();
+    // shortenPath returns paths with ≤3 segments as-is
+    expect(screen.getByText("src/a.ts")).toBeInTheDocument();
+    expect(screen.getByText("src/b.ts")).toBeInTheDocument();
+    expect(screen.getByText("src/c.ts")).toBeInTheDocument();
+  });
+
+  it("names the glob as the search scope, else the shortened path", () => {
+    const { rerender } = render(
+      <SearchContent
+        message={makeMessage({
+          toolName: "Grep",
+          toolInput: { pattern: "TODO", glob: "*.ts", path: "/repo/web/src/systems" },
+        })}
+      />
+    );
+    expect(screen.getByText("in *.ts")).toBeInTheDocument();
+
+    rerender(
+      <SearchContent
+        message={makeMessage({
+          toolName: "Grep",
+          toolInput: { pattern: "TODO", path: "/repo/web/src/systems" },
+        })}
+      />
+    );
+    expect(screen.getByText("in web/src/systems")).toBeInTheDocument();
+  });
+
+  it("shows 'No matches' when result exists but empty", () => {
+    render(
+      <SearchContent
+        message={makeMessage({
+          toolName: "Grep",
+          toolInput: { pattern: "NOEXIST" },
+          toolResult: { stdout: "" },
+        })}
+      />
+    );
+    expect(screen.getByText("No matches")).toBeInTheDocument();
+  });
+});
+
+describe("GenericContent", () => {
+  it("renders toolInput as formatted JSON", () => {
+    render(
+      <GenericContent
+        message={makeMessage({
+          toolName: "CustomTool",
+          toolInput: { key: "value", num: 42 },
+        })}
+      />
+    );
+    expect(screen.getByText(/"key": "value"/)).toBeInTheDocument();
+    expect(screen.getByText(/"num": 42/)).toBeInTheDocument();
+  });
+
+  it("renders toolResult content as text", () => {
+    render(
+      <GenericContent
+        message={makeMessage({
+          toolName: "CustomTool",
+          toolResult: { content: "some output" },
+        })}
+      />
+    );
+    expect(screen.getByText("some output")).toBeInTheDocument();
+  });
+
+  it("renders toolResult error", () => {
+    render(
+      <GenericContent
+        message={makeMessage({
+          toolName: "CustomTool",
+          toolResult: { error: "something went wrong" },
+        })}
+      />
+    );
+    expect(screen.getByText("something went wrong")).toBeInTheDocument();
+  });
+
+  it.each([
+    ["preview", { preview: "preview output" }, "preview output"],
+    [
+      "artifacts",
+      {
+        artifacts: [
+          {
+            uri: "compozy://tool-artifacts/art_fixture",
+            name: "result.json",
+            mime_type: "application/json",
+            bytes: 12,
+            sha256: "fixture",
+          },
+        ],
+      },
+      "result.json",
+    ],
+    ["stderr", { stderr: "stderr output" }, "stderr output"],
+    ["filePath", { filePath: "/tmp/result.txt" }, "/tmp/result.txt"],
+    ["structuredPatch", { structuredPatch: [{ op: "replace" }] }, '"op": "replace"'],
+  ] satisfies Array<[string, NonNullable<UIMessage["toolResult"]>, string]>)(
+    "renders a result carried only by %s",
+    (_field, toolResult, expected) => {
+      render(
+        <GenericContent
+          message={makeMessage({
+            toolName: "CustomTool",
+            toolResult,
+          })}
+        />
+      );
+
+      expect(screen.getByText(expected, { exact: false })).toBeInTheDocument();
+    }
+  );
+});
+
+describe("Per-tool renderers inside the SessionToolCallRow inline body (task 25 — no regression)", () => {
+  const cases: Array<{ name: string; message: UIMessage; expected: string }> = [
+    {
+      name: "Bash",
+      message: makeMessage({
+        toolName: "Bash",
+        toolInput: { command: "echo hi" },
+        toolResult: { stdout: "bash-output-marker" },
+      }),
+      expected: "bash-output-marker",
+    },
+    {
+      name: "Read",
+      message: makeMessage({
+        toolName: "Read",
+        toolInput: { file_path: "/src/read-marker.ts" },
+        toolResult: { content: "a\nb" },
+      }),
+      expected: "/src/read-marker.ts",
+    },
+    {
+      name: "Write",
+      message: makeMessage({
+        toolName: "Write",
+        toolInput: { file_path: "/out.txt", content: "write-body-marker" },
+        toolResult: { content: "ok" },
+      }),
+      expected: "write-body-marker",
+    },
+    {
+      name: "Edit",
+      message: makeMessage({
+        toolName: "Edit",
+        toolInput: { file_path: "/src/edit-marker.ts", old_string: "a", new_string: "b" },
+        toolResult: { content: "ok" },
+      }),
+      expected: "/src/edit-marker.ts",
+    },
+    {
+      name: "Grep",
+      message: makeMessage({
+        toolName: "Grep",
+        toolInput: { pattern: "TODO" },
+        toolResult: { stdout: "src/grep-marker.ts" },
+      }),
+      expected: "src/grep-marker.ts",
+    },
+    {
+      name: "generic MCP",
+      message: makeMessage({
+        toolName: "mcp__context7__resolve-library-id",
+        toolInput: { libraryName: "react" },
+        toolResult: { content: "/websites/generic-marker" },
+      }),
+      expected: "/websites/generic-marker",
+    },
+  ];
+
+  for (const { name, message, expected } of cases) {
+    it(`Should mount the ${name} renderer unchanged inside the row's expanded body`, () => {
+      const { container } = render(<SessionToolCallRow message={message} defaultExpanded />);
+      const body = container.querySelector<HTMLElement>('[data-slot="tool-call-row-body"]');
+      expect(body).not.toBeNull();
+      expect(body).toHaveTextContent(expected);
+    });
+  }
+});

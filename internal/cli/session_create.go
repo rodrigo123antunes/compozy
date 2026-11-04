@@ -1,0 +1,110 @@
+package cli
+
+import (
+	"errors"
+	"strings"
+
+	"github.com/compozy/compozy/internal/workspaceaccess"
+
+	"github.com/compozy/compozy/internal/api/contract"
+	"github.com/spf13/cobra"
+)
+
+const sessionCreateExample = `  # Start a session in the current workspace using the configured default agent
+  compozy session new
+
+  # Start a named session for a specific registered workspace and agent
+  compozy session new --workspace checkout-api --agent reviewer --name review-api
+
+  # Auto-register an absolute workspace path before creating the session
+  compozy session new --cwd "$PWD" --agent reviewer
+
+  # Start a session inside a session folder
+  compozy session new --agent reviewer --folder sfold-1234
+
+  # Start a recovery session for a failed parent session
+  compozy session new --agent codex --parent sess_01J9R2K7M4T1 --lineage-kind recovery`
+
+const sessionNewWorktreeAutoValue = "__compozy_auto__"
+
+func newSessionCreateCommand(deps commandDeps) *cobra.Command {
+	var (
+		userScope    bool
+		agentName    string
+		cwd          string
+		name         string
+		workspaceRef string
+		parentID     string
+		lineageKind  string
+		folderID     string
+		worktreeRef  string
+		newWorktree  string
+	)
+	cmd := &cobra.Command{
+		Use:     sessionNewKey,
+		Short:   "Create a new session",
+		Example: sessionCreateExample,
+		RunE: func(cmd *cobra.Command, _ []string) error {
+			if strings.TrimSpace(lineageKind) != "" && strings.TrimSpace(parentID) == "" {
+				return errors.New("cli: --lineage-kind requires --parent")
+			}
+			client, err := clientFromDeps(deps)
+			if err != nil {
+				return err
+			}
+			if userScope {
+				workspaceRef = workspaceaccess.UserSelector
+			}
+			workspace, workspacePath, err := resolveSessionCreateWorkspace(cmd, deps, client, workspaceRef, cwd)
+			if err != nil {
+				return err
+			}
+			request := CreateSessionRequest{
+				AgentName:       agentName,
+				Name:            name,
+				Workspace:       workspace,
+				WorkspacePath:   workspacePath,
+				Worktree:        strings.TrimSpace(worktreeRef),
+				ParentSessionID: strings.TrimSpace(parentID),
+				LineageKind:     strings.TrimSpace(lineageKind),
+				FolderID:        strings.TrimSpace(folderID),
+			}
+			if cmd.Flags().Changed("new-worktree") {
+				name := strings.TrimSpace(newWorktree)
+				if name == sessionNewWorktreeAutoValue {
+					name = ""
+				}
+				request.NewWorktree = &contract.NewSessionWorktreeRequest{Name: name}
+			}
+			created, err := client.CreateSession(cmd.Context(), request)
+			if err != nil {
+				return err
+			}
+			return writeCommandOutput(cmd, sessionBundle(&created, deps.now))
+		},
+	}
+	cmd.Flags().BoolVar(&userScope, "user", false, "Create a session in User scope")
+	cmd.Flags().StringVar(&agentName, "agent", "", "Agent definition name (defaults to config default)")
+	cmd.Flags().
+		StringVar(&workspaceRef, workspaceSkillSource, "", "Override workspace (ID, name, or path)")
+	cmd.Flags().StringVar(&cwd, "cwd", "", "Absolute workspace directory to auto-register")
+	cmd.Flags().StringVar(&worktreeRef, "worktree", "", "Start in an existing ready worktree")
+	cmd.Flags().
+		StringVar(&newWorktree, "new-worktree", "", "Create a worktree before starting; optionally provide its name")
+	cmd.Flags().Lookup("new-worktree").NoOptDefVal = sessionNewWorktreeAutoValue
+	cmd.Flags().StringVar(&name, sessionNameKey, "", "Optional session label")
+	cmd.Flags().StringVar(&folderID, sessionFolderFlagName, "", "Create the session at the end of this session folder")
+	cmd.Flags().StringVar(&parentID, "parent", "", "Record a same-workspace parent session as creation provenance")
+	cmd.Flags().StringVar(
+		&lineageKind,
+		"lineage-kind",
+		"",
+		"Relation to --parent: provenance (default) or recovery",
+	)
+	cmd.MarkFlagsMutuallyExclusive("user", "workspace")
+	cmd.MarkFlagsMutuallyExclusive("user", "cwd")
+	cmd.MarkFlagsMutuallyExclusive("user", "worktree")
+	cmd.MarkFlagsMutuallyExclusive("user", "new-worktree")
+	cmd.MarkFlagsMutuallyExclusive("cwd", "worktree", "new-worktree")
+	return cmd
+}

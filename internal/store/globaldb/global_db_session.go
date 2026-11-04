@@ -1,0 +1,399 @@
+package globaldb
+
+import (
+	"context"
+	"database/sql"
+	"errors"
+	"fmt"
+	"strings"
+
+	"github.com/compozy/compozy/internal/store"
+	"github.com/compozy/compozy/internal/store/globaldb/sqlcgen"
+	"github.com/compozy/compozy/internal/worktree"
+)
+
+const sessionStateOrphaned = "orphaned"
+
+const (
+	globalDBSessionLocalKey   = "local"
+	sessionListSortActivity   = "last_activity"
+	sessionListResumableWhere = "state = 'active' AND (failure_kind IS NULL OR trim(failure_kind) = '') AND " +
+		"(stall_state IS NULL OR trim(stall_state) = '') AND " +
+		"archived_at IS NULL AND " +
+		"(attached_to = '' OR attach_expires_at IS NULL OR attach_expires_at <= ?)"
+)
+
+// RegisterSession inserts or refreshes a session index row.
+func (g *SessionRepo) RegisterSession(ctx context.Context, sessionInput *store.SessionInfo) error {
+	session := *sessionInput
+
+	if err := g.checkReady(ctx, "register session"); err != nil {
+		return err
+	}
+	if err := session.Validate(); err != nil {
+		return err
+	}
+
+	normalized := session
+	if normalized.CreatedAt.IsZero() {
+		normalized.CreatedAt = g.now()
+	}
+	if normalized.UpdatedAt.IsZero() {
+		normalized.UpdatedAt = normalized.CreatedAt
+	}
+
+	if err := g.withImmediateTransaction(ctx, "register session", func(exec globalSQLExecutor) error {
+		return g.admitSessionRegistration(ctx, exec, &(normalized))
+	}); err != nil {
+		return fmt.Errorf("store: register session %q: %w", normalized.ID, err)
+	}
+	return nil
+}
+
+// UpdateSessionState updates the mutable session state fields.
+func (g *SessionRepo) UpdateSessionState(ctx context.Context, update store.SessionStateUpdate) error {
+	if err := g.checkReady(ctx, "update session state"); err != nil {
+		return err
+	}
+	if err := update.Validate(); err != nil {
+		return err
+	}
+
+	updatedAt := update.UpdatedAt
+	if updatedAt.IsZero() {
+		updatedAt = g.now()
+	}
+
+	query, args, err := buildUpdateSessionStateStatement(update, updatedAt)
+	if err != nil {
+		return fmt.Errorf("store: build update session state %q: %w", update.ID, err)
+	}
+	// dynamic-sql: the mutable session-state field set is explicitly partial and alters assignments.
+	var result sql.Result
+	err = store.ExecuteWriteOperation(
+		ctx,
+		g.db,
+		"update session state",
+		func(ctx context.Context, tx *store.WriteTx) error {
+			if update.State != "" && update.State != globalDBSessionStateStopped {
+				workspaceID, err := sqlcgen.New(tx).GetSessionWorkspaceID(ctx, update.ID)
+				if err != nil && !errors.Is(err, sql.ErrNoRows) {
+					return err
+				}
+				if err := store.RequireWorkspaceActive(ctx, tx, workspaceID); err != nil {
+					return err
+				}
+			}
+			var execErr error
+			result, execErr = tx.ExecContext(ctx, query, args...)
+			return execErr
+		},
+	)
+	if err != nil {
+		return fmt.Errorf(
+			"store: update session state %q: %w",
+			update.ID,
+			mapSessionLaterConstraint(update.ID, mapSessionArchivedConstraint(update.ID, err)),
+		)
+	}
+	affected, err := result.RowsAffected()
+	if err != nil {
+		return fmt.Errorf("store: rows affected for session state %q: %w", update.ID, err)
+	}
+	if affected == 0 {
+		return fmt.Errorf("store: session %q not found", update.ID)
+	}
+	return nil
+}
+
+// ListSessions returns indexed sessions ordered by most recent update.
+func (g *SessionRepo) ListSessions(
+	ctx context.Context,
+	query store.SessionListQuery,
+) (sessions []store.SessionInfo, err error) {
+	if err := g.checkReady(ctx, "list sessions"); err != nil {
+		return nil, err
+	}
+	if err := query.Validate(); err != nil {
+		return nil, err
+	}
+	now := g.now()
+
+	sqlQuery := sessionInfoSelectQuery
+	where, args := store.BuildClauses(
+		store.ReadScopeClause("profile_id", query.ReadScope),
+		store.StringClause("id", query.ID),
+		store.StringClause("state", query.State),
+		store.StringClause("agent_name", query.AgentName),
+		store.SessionWorkspaceClause(query.WorkspaceID),
+		store.StringClause("worktree_id", query.WorktreeID),
+		store.StringClause("session_type", query.SessionType),
+		store.StringClause("parent_session_id", query.ParentSessionID),
+		store.StringClause("root_session_id", query.RootSessionID),
+		store.StringClause("spawn_role", query.SpawnRole),
+		store.StringClause("lineage_kind", string(query.LineageKind)),
+	)
+	where = appendSubagentSessionFilter(where, query.Subagents)
+	if query.Resumable {
+		where = append(
+			where,
+			sessionListResumableWhere,
+		)
+		args = append(args, store.FormatTimestamp(now))
+	}
+	where, args = appendSessionArchiveFilter(where, args, query.Archive)
+	sqlQuery = store.AppendWhere(sqlQuery, where)
+	sqlQuery += sessionListOrderClause(query.Sort)
+	sqlQuery, args = store.AppendLimit(sqlQuery, args, query.Limit)
+
+	// dynamic-sql: session catalog filters, resumability, ordering, and limit alter statement structure.
+	rows, err := g.readDB.QueryContext(ctx, sqlQuery, args...)
+	if err != nil {
+		return nil, fmt.Errorf("store: query sessions: %w", err)
+	}
+	defer func() {
+		if closeErr := rows.Close(); closeErr != nil {
+			err = errors.Join(err, fmt.Errorf("store: close session rows: %w", closeErr))
+		}
+	}()
+
+	sessions = make([]store.SessionInfo, 0)
+	for rows.Next() {
+		session, scanErr := scanSessionInfo(rows)
+		if scanErr != nil {
+			return nil, scanErr
+		}
+		if expiry := session.AttachExpiresAtValue(); expiry != nil && !expiry.After(now) {
+			session.SetAttach("", nil)
+		}
+		sessions = append(sessions, session)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("store: iterate sessions: %w", err)
+	}
+
+	return sessions, nil
+}
+
+func sessionListOrderClause(sortKey string) string {
+	switch strings.TrimSpace(sortKey) {
+	case sessionListSortActivity:
+		return " ORDER BY COALESCE(last_update_at, updated_at) DESC, updated_at DESC, id DESC"
+	default:
+		return " ORDER BY updated_at DESC, created_at DESC, id DESC"
+	}
+}
+
+// ReconcileSessions upserts on-disk sessions and marks missing ones as orphaned.
+func (g *SessionRepo) ReconcileSessions(
+	ctx context.Context,
+	sessions []store.SessionInfo,
+) (store.ReconcileResult, error) {
+	if err := g.checkReady(ctx, "reconcile sessions"); err != nil {
+		return store.ReconcileResult{}, err
+	}
+
+	var result store.ReconcileResult
+	err := g.withImmediateTransaction(ctx, "reconcile sessions", func(exec globalSQLExecutor) error {
+		existing, err := g.loadSessionIDs(ctx, exec)
+		if err != nil {
+			return err
+		}
+
+		attemptResult := store.ReconcileResult{
+			Indexed:  make([]string, 0),
+			Orphaned: make([]string, 0),
+		}
+		seen := make(map[string]store.SessionInfo, len(sessions))
+
+		for i := range sessions {
+			session := &sessions[i]
+			if err := session.Validate(); err != nil {
+				return err
+			}
+			normalized := *session
+			if normalized.CreatedAt.IsZero() {
+				normalized.CreatedAt = g.now()
+			}
+			if normalized.UpdatedAt.IsZero() {
+				normalized.UpdatedAt = normalized.CreatedAt
+			}
+			if prior, ok := seen[normalized.ID]; ok {
+				if prior.WorkspaceID != normalized.WorkspaceID {
+					return fmt.Errorf("%w: %s", store.ErrSessionWorkspaceMismatch, normalized.ID)
+				}
+				continue
+			}
+			seen[normalized.ID] = normalized
+			if _, ok := existing[normalized.ID]; !ok {
+				attemptResult.Indexed = append(attemptResult.Indexed, normalized.ID)
+			}
+			if err := g.registerSession(ctx, exec, &(normalized)); err != nil {
+				return fmt.Errorf("store: reconcile session %q: %w", normalized.ID, err)
+			}
+		}
+
+		orphanedAt := store.FormatTimestamp(g.now())
+		queries := sqlcgen.New(exec)
+		for id := range existing {
+			if _, ok := seen[id]; ok {
+				continue
+			}
+			if err := queries.MarkSessionOrphaned(ctx, sqlcgen.MarkSessionOrphanedParams{
+				State: sessionStateOrphaned, UpdatedAt: orphanedAt, ID: id,
+			}); err != nil {
+				return fmt.Errorf("store: mark orphaned session %q: %w", id, err)
+			}
+			attemptResult.Orphaned = append(attemptResult.Orphaned, id)
+		}
+
+		result = attemptResult
+		return nil
+	})
+	if err != nil {
+		return store.ReconcileResult{}, err
+	}
+	return result, nil
+}
+
+func (g *SessionRepo) admitSessionRegistration(
+	ctx context.Context, exec globalSQLExecutor, sessionInput *store.SessionInfo,
+) error {
+	session := *sessionInput
+
+	if session.State != globalDBSessionStateStopped {
+		if err := store.RequireWorkspaceActive(ctx, exec, session.WorkspaceID); err != nil {
+			return err
+		}
+	}
+	return g.registerSession(ctx, exec, &(session))
+}
+
+// registerSession mirrors catalog metadata during recovery without admitting runtime work.
+func (g *SessionRepo) registerSession(
+	ctx context.Context,
+	exec globalSQLExecutor,
+	sessionInput *store.SessionInfo,
+) error {
+	session := *sessionInput
+
+	record, err := newSessionCatalogRecord(&(session))
+	if err != nil {
+		return err
+	}
+	params, err := upsertSessionParams(&record)
+	if err != nil {
+		return err
+	}
+	queries := sqlcgen.New(exec)
+	affected, err := queries.UpsertSession(ctx, params)
+	if err != nil {
+		return mapProfileAdmissionConstraint(
+			session.ProfileID,
+			mapSessionLaterConstraint(session.ID, mapSessionArchivedConstraint(session.ID, err)),
+		)
+	}
+	if affected == 0 {
+		if availabilityErr := sessionWorktreeAvailabilityError(ctx, queries, &(session)); availabilityErr != nil {
+			return availabilityErr
+		}
+		existingWorkspaceID, err := queries.GetSessionWorkspaceID(ctx, session.ID)
+		if err != nil {
+			return fmt.Errorf("store: read existing workspace owner for session %q: %w", session.ID, err)
+		}
+		if existingWorkspaceID != params.WorkspaceID {
+			return fmt.Errorf("%w: %s", store.ErrSessionWorkspaceMismatch, session.ID)
+		}
+		return fmt.Errorf("store: session worktree owner does not match: %s", session.ID)
+	}
+	return nil
+}
+
+func sessionWorktreeAvailabilityError(
+	ctx context.Context,
+	queries *sqlcgen.Queries,
+	sessionInput *store.SessionInfo,
+) error {
+	session := *sessionInput
+
+	worktreeID := strings.TrimSpace(session.WorktreeID)
+	if worktreeID == "" {
+		return nil
+	}
+	row, err := queries.GetWorktreeByID(ctx, sqlcgen.GetWorktreeByIDParams{
+		WorkspaceID: strings.TrimSpace(session.WorkspaceID),
+		WorktreeID:  worktreeID,
+	})
+	if errors.Is(err, sql.ErrNoRows) {
+		return worktree.ErrNotFound
+	}
+	if err != nil {
+		return fmt.Errorf("store: read session worktree binding: %w", err)
+	}
+	switch worktree.State(row.State) {
+	case worktree.StateMissing, worktree.StateRemoved, worktree.StateDismissed:
+		return worktree.ErrMissing
+	case worktree.StateReady:
+		return nil
+	default:
+		return worktree.ErrNotReady
+	}
+}
+
+type sessionCatalogRecord struct {
+	session              store.SessionInfo
+	lineage              *store.SessionLineage
+	spawnBudgetJSON      string
+	permissionPolicyJSON string
+	activityJSON         string
+}
+
+func newSessionCatalogRecord(sessionInput *store.SessionInfo) (sessionCatalogRecord, error) {
+	session := *sessionInput
+
+	lineage := store.NormalizeSessionLineage(session.ID, session.Lineage)
+	if err := store.ValidateSessionLineage(session.ID, lineage); err != nil {
+		return sessionCatalogRecord{}, err
+	}
+	spawnBudgetJSON, err := store.EncodeSessionSpawnBudget(lineage.SpawnBudget)
+	if err != nil {
+		return sessionCatalogRecord{}, err
+	}
+	permissionPolicyJSON, err := store.EncodeSessionPermissionPolicy(lineage.PermissionPolicy)
+	if err != nil {
+		return sessionCatalogRecord{}, err
+	}
+	activityJSON, err := sessionLivenessActivityJSON(session.Liveness)
+	if err != nil {
+		return sessionCatalogRecord{}, err
+	}
+	return sessionCatalogRecord{
+		session:              session,
+		lineage:              lineage,
+		spawnBudgetJSON:      spawnBudgetJSON,
+		permissionPolicyJSON: permissionPolicyJSON,
+		activityJSON:         activityJSON,
+	}, nil
+}
+
+func sessionFailureKind(failure *store.SessionFailure) any {
+	if failure == nil {
+		return nil
+	}
+	normalized := failure.Normalize()
+	return store.NullableString(string(normalized.Kind))
+}
+
+func sessionFailureSummary(failure *store.SessionFailure) string {
+	if failure == nil {
+		return ""
+	}
+	return failure.Normalize().Summary
+}
+
+func sessionCrashBundlePath(failure *store.SessionFailure) string {
+	if failure == nil {
+		return ""
+	}
+	return failure.Normalize().CrashBundlePath
+}

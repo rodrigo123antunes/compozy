@@ -1,0 +1,197 @@
+package globaldb
+
+import (
+	"context"
+	"database/sql"
+	"errors"
+	"fmt"
+	"sync"
+	"sync/atomic"
+	"time"
+
+	"github.com/compozy/compozy/internal/store"
+	"github.com/compozy/compozy/internal/store/globaldb/sqlcgen"
+	"github.com/compozy/compozy/internal/store/telemetrydb"
+	taskpkg "github.com/compozy/compozy/internal/task"
+	compozyworkspace "github.com/compozy/compozy/internal/workspace"
+)
+
+type repoBase struct {
+	db           *sql.DB
+	readDB       *sql.DB
+	queries      *sqlcgen.Queries
+	readQueries  *sqlcgen.Queries
+	background   *store.BackgroundWriter
+	telemetry    *telemetrydb.Store
+	healthBuffer *sessionHealthBuffer
+	path         string
+	now          func() time.Time
+	closed       *atomic.Int32
+	tasks        *TaskRepo
+	sessions     *SessionRepo
+
+	outboxSignals       *outboxSignalHub
+	summaryPublications eventSummaryPublications
+}
+
+func newRepoBase(db, readDB *sql.DB, now func() time.Time, closed *atomic.Int32) *repoBase {
+	return &repoBase{
+		db:          db,
+		readDB:      readDB,
+		queries:     sqlcgen.New(db),
+		readQueries: sqlcgen.New(readDB),
+		now:         now,
+		closed:      closed,
+
+		outboxSignals: &outboxSignalHub{},
+	}
+}
+
+func (r *repoBase) checkReady(ctx context.Context, action string) error {
+	if r == nil || r.db == nil || r.queries == nil || r.closed == nil {
+		return errors.New("store: repository is required")
+	}
+	if r.closed.Load() != 0 {
+		return store.ErrClosed
+	}
+	if ctx == nil {
+		return fmt.Errorf("store: %s context is required", action)
+	}
+	return nil
+}
+
+func (r *repoBase) writeBackground(
+	ctx context.Context, operation string, fn func(context.Context, *store.WriteTx) error,
+) error {
+	if r.background == nil {
+		return store.ExecuteWriteOperation(ctx, r.db, operation, fn)
+	}
+	return r.background.Submit(ctx, operation, fn)
+}
+
+type WorkspaceRepo struct {
+	*repoBase
+	generateID func() (string, error)
+}
+type AppMetadataRepo struct{ *repoBase }
+type PermissionRepo struct{ *repoBase }
+type SessionRepo struct {
+	*repoBase
+	unattendedTurnLimit atomic.Int64
+}
+type TaskRepo struct {
+	*repoBase
+	runs                       *TaskRunRepo
+	newID                      func(prefix string) (string, error)
+	enqueueLoopCoordinatorWake func(
+		context.Context,
+		string,
+		string,
+		string,
+		taskpkg.Origin,
+		time.Time,
+	) (taskpkg.Run, bool, error)
+	taskEventObserverMu sync.RWMutex
+	taskEventObserver   taskpkg.EventObserver
+}
+
+type TaskRunRepo struct {
+	*repoBase
+	tasks                *TaskRepo
+	leaseSettlementsMu   sync.Mutex
+	leaseSettlements     map[string]string
+	leaseRecoveryVersion atomic.Uint64
+}
+type AutomationRepo struct{ *repoBase }
+
+type GatewayRepo struct{ *repoBase }
+
+type LoopRepo struct {
+	*repoBase
+	watchEvents *WatchEventsRepo
+	observe     *ObserveRepo
+}
+type GoalRepo struct{ *repoBase }
+type HeartbeatRepo struct{ *repoBase }
+type SoulRepo struct{ *repoBase }
+
+type ModelCatalogRepo struct{ *repoBase }
+type MarketplaceRepo struct{ *repoBase }
+type SkillExposureRepo struct{ *repoBase }
+type ObserveRepo struct{ *repoBase }
+type AttentionRepo struct{ *repoBase }
+type ToolRuntimeRepo struct{ *repoBase }
+type SessionProcessRepo struct{ *repoBase }
+type SessionMonitorRepo struct{ *repoBase }
+type VaultRepo struct{ *repoBase }
+type ExtensionEnvRepo struct{ *repoBase }
+type ExtensionInputRepo struct{ *repoBase }
+type ExtensionMCPRepo struct{ *repoBase }
+type WatchEventsRepo struct {
+	*repoBase
+	openSessionEventMetadata store.SessionEventMetadataOpener
+}
+type DeadEntityRepo struct{ *repoBase }
+type ApprovalGrantRepo struct{ *repoBase }
+type ApprovalPendingRepo struct{ *repoBase }
+type CmdPaletteRepo struct{ *repoBase }
+type WorktreeRepo struct{ *repoBase }
+
+func (g *GlobalDB) initializeRepositories(config openConfig) {
+	base := newRepoBase(g.db, g.readDB, func() time.Time { return g.now() }, &g.closed)
+	base.path = g.path
+	base.background = g.background
+	base.telemetry = g.telemetry
+	if g.background != nil {
+		base.healthBuffer = newSessionHealthBuffer(base, config.healthFlushInterval)
+		g.healthBuffer = base.healthBuffer
+	}
+	g.WorkspaceRepo = &WorkspaceRepo{
+		repoBase:   base,
+		generateID: compozyworkspace.NewWorkspaceID,
+	}
+	g.AppMetadataRepo = &AppMetadataRepo{repoBase: base}
+	g.PermissionRepo = &PermissionRepo{repoBase: base}
+	g.SessionRepo = &SessionRepo{repoBase: base}
+	g.unattendedTurnLimit.Store(300)
+	base.sessions = g.SessionRepo
+	taskRepo := &TaskRepo{repoBase: base, newID: store.NewID}
+	taskRunRepo := &TaskRunRepo{repoBase: base}
+	g.TaskRepo = taskRepo
+	g.TaskRunRepo = taskRunRepo
+	base.tasks = taskRepo
+	taskRepo.runs = taskRunRepo
+	taskRunRepo.tasks = taskRepo
+	g.AutomationRepo = &AutomationRepo{repoBase: base}
+	g.GatewayRepo = &GatewayRepo{repoBase: base}
+	loopRepo := &LoopRepo{repoBase: base}
+	g.LoopRepo = loopRepo
+	g.GoalRepo = &GoalRepo{repoBase: base}
+	g.HeartbeatRepo = &HeartbeatRepo{repoBase: base}
+	g.SoulRepo = &SoulRepo{repoBase: base}
+	g.ModelCatalogRepo = &ModelCatalogRepo{repoBase: base}
+	g.MarketplaceRepo = &MarketplaceRepo{repoBase: base}
+	g.SkillExposureRepo = &SkillExposureRepo{repoBase: base}
+	g.ObserveRepo = &ObserveRepo{repoBase: base}
+	g.NotificationRepo = &NotificationRepo{repoBase: base}
+	g.AttentionRepo = &AttentionRepo{repoBase: base}
+	g.ToolRuntimeRepo = &ToolRuntimeRepo{repoBase: base}
+	g.SessionProcessRepo = &SessionProcessRepo{repoBase: base}
+	g.SessionMonitorRepo = &SessionMonitorRepo{repoBase: base}
+	g.VaultRepo = &VaultRepo{repoBase: base}
+	g.ExtensionEnvRepo = &ExtensionEnvRepo{repoBase: base}
+	g.ExtensionInputs = &ExtensionInputRepo{repoBase: base}
+	g.ExtensionMCP = &ExtensionMCPRepo{repoBase: base}
+	g.WatchEventsRepo = &WatchEventsRepo{
+		repoBase:                 base,
+		openSessionEventMetadata: config.openSessionEventMetadata,
+	}
+	g.DeadEntityRepo = &DeadEntityRepo{repoBase: base}
+	g.ApprovalGrantRepo = &ApprovalGrantRepo{repoBase: base}
+	g.ApprovalPendingRepo = &ApprovalPendingRepo{repoBase: base}
+	g.CmdPaletteRepo = &CmdPaletteRepo{repoBase: base}
+	g.Worktrees = &WorktreeRepo{repoBase: base}
+	loopRepo.watchEvents = g.WatchEventsRepo
+	loopRepo.observe = g.ObserveRepo
+	taskRepo.enqueueLoopCoordinatorWake = loopRepo.enqueueLoopCoordinatorWakeWithRunID
+}

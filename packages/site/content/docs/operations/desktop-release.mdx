@@ -1,0 +1,146 @@
+---
+title: Desktop release operations
+description: Publish or repair the Electron update channels through verified GitHub release assets and audited branch updates.
+---
+
+Stable desktop builds read manifests from the `channel-stable` branch; builds from the v0.3 beta
+line read `channel-beta`. `channel-beta` is frozen on the bridge beta (`0.3.0-beta.39`), whose app
+reads `channel-stable`, so every older beta reaches stable through that bridge. Stable releases
+publish to `channel-stable` only. Each version's app packages remain immutable GitHub release
+assets. Publishing or repairing a channel creates one audit commit, then moves the branch
+with a compare-and-swap (CAS): the move succeeds only if the branch still has the revision the
+operation inspected.
+
+The release workflow is the normal publisher. Use the commands below when rehearsing the authority
+or repairing a published channel.
+
+## Required inputs
+
+Set `GITHUB_TOKEN` to a token that can read the release, create Git objects, and update the channel
+branch. Set `GITHUB_REPOSITORY` to `owner/name`.
+
+A publish workspace contains:
+
+- an authority directory with the six exact platform packages, `compat.json`, and
+  `checksums.txt`;
+- a channel directory with `latest-mac.yml`, `latest-linux.yml`, and `generation.json`.
+
+The authority directory must contain these exact versioned names:
+
+- `CompozyOS-<version>-mac-arm64.dmg`
+- `CompozyOS-<version>-mac-arm64.zip`
+- `CompozyOS-<version>-mac-x64.dmg`
+- `CompozyOS-<version>-mac-x64.zip`
+- `CompozyOS-<version>-linux-x64.AppImage`
+- `CompozyOS-<version>-linux-x64.deb`
+
+## Publish a generation
+
+```bash
+go run ./cmd/compozy-desktop-release publish \
+  --operation-id "desktop-release-<version>-publish" \
+  --channel stable \
+  --version "<version>" \
+  --repository "$GITHUB_REPOSITORY" \
+  --asset-dir .artifacts/authority \
+  --channel-dir .artifacts/channel \
+  -o json
+```
+
+Publish verifies the exact local inventory and checksum catalog, uploads or verifies every immutable
+release asset, creates one commit containing both platform manifests and `generation.json`, then
+moves `channel-<channel>`. The JSON result contains `operation`, `channel_ref_before`,
+`channel_ref_after`, `verified_inventory`, `audit_commit`, and `outcome`.
+
+Keep the operation ID stable when retrying an interrupted publish. The same ID converges to
+`already_completed` instead of creating another channel flip.
+
+The release's `compat.json` carries `min_app_version`: the oldest app live on any channel the
+release serves. A stable release also serves the frozen `channel-beta`, because the bridge app
+installed from it reads `channel-stable`:
+
+```bash
+go run ./cmd/compozy-desktop-release compatibility-channels --channel stable
+# {"channels":["stable","beta"]}
+go run ./cmd/compozy-desktop-release min-app-version --version <version> \
+  --live <channel-stable version, empty when unpublished> --live <channel-beta version>
+```
+
+## Leave the beta line through the bridge
+
+An installed beta runs an updater that only accepts newer betas of its own line, and its app reads
+`channel-beta`. The bridge release moves those installs onto `channel-stable` once:
+
+1. Merge the stable tooling to `main` while `RELEASE_AUTO_CHANNEL` is still `beta`.
+2. Dispatch the release workflow with `release_version=0.3.0-beta.39`, `release_channel=beta`,
+   and `desktop_feed=stable`. It publishes a beta prerelease and its `channel-beta` generation,
+   and its app reads `channel-stable`.
+3. Set `RELEASE_AUTO_CHANNEL=stable` and merge the stable release PR. Its generation lands on
+   `channel-stable`.
+
+Older betas update to the bridge, and the bridge updates to stable. Never publish to
+`channel-beta` again; a later generation there would break the bridge for installs that have not
+reached it yet.
+
+## Select a known-good generation
+
+Only a channel commit with the exact audit line `known_good=true` is eligible. Inspect the ordered
+history and its generation record:
+
+```bash
+git fetch origin channel-stable
+git log --format=fuller origin/channel-stable -- desktop/generation.json
+git show <commit>:desktop/generation.json
+```
+
+Confirm the requested `version`, `operation_id`, `published_at`, and `min_app_version`. Also
+confirm that the versioned GitHub release still contains every package plus `compat.json`. Repair
+refuses a generation with missing or empty assets.
+
+## Repair the channel
+
+```bash
+go run ./cmd/compozy-desktop-release repair \
+  --operation-id "desktop-release-<version>-repair-<incident-id>" \
+  --channel stable \
+  --version "<known-good-version>" \
+  --repository "$GITHUB_REPOSITORY" \
+  -o json
+```
+
+Repair copies the verified known-good manifest set into a new audit commit and CAS-moves the channel
+to that commit. Repair each affected channel separately. It does not mutate the older commit or the versioned release.
+
+## Recover from `channel_cas_conflict`
+
+`channel_cas_conflict` means another publisher moved the branch after this operation read it.
+Do not force-push or replay with a new operation ID immediately.
+
+1. Fetch the conflicting `channel-<channel>` branch and inspect its latest `desktop/generation.json`.
+2. If it already records your operation ID, retry the same command and accept
+   `already_completed`.
+3. If another valid operation won, decide whether that generation should remain live.
+4. Publish the newer intended generation or run `repair` against a verified known-good version
+   with a new incident-scoped operation ID.
+
+The other deterministic failures are `inventory_incomplete` for a missing or empty required asset
+and `verification_failed` for invalid versions, manifests, checksums, compatibility, or GitHub
+responses.
+
+## Inspect the live channel
+
+```bash
+git fetch origin channel-stable channel-beta
+git rev-parse origin/channel-stable origin/channel-beta
+git show origin/channel-stable:desktop/generation.json
+git show origin/channel-stable:desktop/latest-mac.yml
+git show origin/channel-stable:desktop/latest-linux.yml
+```
+
+The branch SHA must equal the command's `channel_ref_after` and `audit_commit`. The two manifests
+must name one version and point only to immutable
+`https://github.com/<owner>/<repo>/releases/download/v<version>/...` assets.
+
+The one-time Electron cutover already removed the retired distribution bucket and DNS record. They
+are not part of recurring release operations and must not be recreated as a fallback. Abandoned
+installs fail their own checks until the operator downloads the current GitHub release.

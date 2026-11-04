@@ -1,0 +1,232 @@
+package core
+
+import (
+	"cmp"
+	"context"
+	"errors"
+	"fmt"
+	"net/http"
+	"os"
+	"slices"
+	"strings"
+
+	"github.com/compozy/compozy/internal/api/contract"
+	compozyconfig "github.com/compozy/compozy/internal/config"
+	workspacepkg "github.com/compozy/compozy/internal/workspace"
+	"github.com/gin-gonic/gin"
+)
+
+type workspaceAgentEntries struct {
+	Entries       []AgentCatalogEntry
+	WorkspaceID   string
+	WorkspaceName string
+	WorkspaceRoot string
+	Config        compozyconfig.Config
+	Diagnostics   []workspacepkg.AgentDiagnostic
+}
+
+func (h *BaseHandlers) globalAgentEntries(
+	ctx context.Context,
+	profileID string,
+	profileName string,
+) (workspaceAgentEntries, error) {
+	cfg, err := h.activeConfig(ctx)
+	if err != nil {
+		return workspaceAgentEntries{}, err
+	}
+	resolved := workspaceAgentEntries{Config: cfg}
+	if h.AgentCatalog != nil {
+		resolved.Entries, err = h.AgentCatalog.ListAgentsForWorkspace(ctx, &workspacepkg.ResolvedWorkspace{
+			ProfileID: profileID, ProfileName: profileName,
+		})
+		return resolved, err
+	}
+	defs, err := compozyconfig.LoadWorkspaceAgentDefs("", nil, h.HomePaths, profileName)
+	if err != nil {
+		return workspaceAgentEntries{}, err
+	}
+	for _, def := range defs {
+		resolved.Entries = append(resolved.Entries, h.agentCatalogEntryFromDef(def, ""))
+	}
+	return resolved, nil
+}
+
+func (h *BaseHandlers) createAgentDraftAndPath(
+	ctx context.Context,
+	req contract.CreateAgentRequest,
+	profileNames ...string,
+) (compozyconfig.AgentDefinitionDraft, string, string, compozyconfig.Config, error) {
+	draft, err := createAgentDraftFromRequest(req)
+	if err != nil {
+		return compozyconfig.AgentDefinitionDraft{}, "", "", compozyconfig.Config{}, err
+	}
+
+	cfg, err := h.activeConfig(ctx)
+	if err != nil {
+		return compozyconfig.AgentDefinitionDraft{}, "", "", compozyconfig.Config{}, err
+	}
+	target, err := createAgentDefinitionTargetFor(
+		ctx, req, h.HomePaths, &cfg, h.Workspaces, h.transportName(), profileNames...,
+	)
+	if err != nil {
+		return compozyconfig.AgentDefinitionDraft{}, "", "", compozyconfig.Config{}, err
+	}
+	if err := validateAgentDraftRuntime(draft, &target.Config); err != nil {
+		return compozyconfig.AgentDefinitionDraft{}, "", "", compozyconfig.Config{}, err
+	}
+	return draft, target.Path, target.WorkspaceID, target.Config, nil
+}
+
+func (h *BaseHandlers) createAgentDefinitionPath(
+	ctx context.Context,
+	req contract.CreateAgentRequest,
+) (string, error) {
+	cfg, err := h.activeConfig(ctx)
+	if err != nil {
+		return "", err
+	}
+	return createAgentDefinitionPathFor(ctx, req, h.HomePaths, &cfg, h.Workspaces, h.transportName())
+}
+
+func (h *BaseHandlers) workspaceAgentEntriesWithDiagnostics(
+	ctx context.Context,
+	workspaceRef string,
+	profileNames ...string,
+) (workspaceAgentEntries, error) {
+	if h.Workspaces == nil {
+		return workspaceAgentEntries{},
+			fmt.Errorf("api: %w", workspacepkg.ErrWorkspaceResolverUnavailable)
+	}
+	profileName := ""
+	if len(profileNames) > 0 {
+		profileName = strings.TrimSpace(profileNames[0])
+	}
+	resolved, err := resolveWorkspaceAgentProfile(ctx, h.Workspaces, workspaceRef, profileName)
+	if err != nil {
+		return workspaceAgentEntries{}, err
+	}
+	entries, err := h.workspaceDetailAgentEntries(ctx, &resolved)
+	if err != nil {
+		return workspaceAgentEntries{}, err
+	}
+	workspaceID := strings.TrimSpace(resolved.ID)
+	for index := range entries {
+		if entries[index].Origin == contract.AgentOriginWorkspace {
+			entries[index].WorkspaceID = workspaceID
+		}
+	}
+	return workspaceAgentEntries{
+		Entries:       entries,
+		WorkspaceID:   workspaceID,
+		WorkspaceName: resolved.Name,
+		WorkspaceRoot: strings.TrimSpace(resolved.RootDir),
+		Config:        resolved.Config,
+		Diagnostics:   publicAgentDiagnostics(resolved.AgentDiagnostics),
+	}, nil
+}
+
+func publicAgentDiagnostics(diagnostics []workspacepkg.AgentDiagnostic) []workspacepkg.AgentDiagnostic {
+	visible := make([]workspacepkg.AgentDiagnostic, 0, len(diagnostics))
+	for _, diagnostic := range diagnostics {
+		if compozyconfig.IsReservedAgentName(diagnostic.Name) {
+			continue
+		}
+		visible = append(visible, diagnostic)
+	}
+	return visible
+}
+
+func (h *BaseHandlers) workspaceAgentDef(
+	ctx context.Context,
+	workspaceRef string,
+	name string,
+	profileNames ...string,
+) (AgentCatalogEntry, compozyconfig.Config, error) {
+	trimmedName := strings.TrimSpace(name)
+	if trimmedName == "" {
+		return AgentCatalogEntry{}, compozyconfig.Config{},
+			fmt.Errorf("api: agent name is required: %w", os.ErrNotExist)
+	}
+
+	resolved, err := h.workspaceAgentEntriesWithDiagnostics(ctx, workspaceRef, profileNames...)
+	if err != nil {
+		return AgentCatalogEntry{}, compozyconfig.Config{}, err
+	}
+	for i := range resolved.Entries {
+		entry := &resolved.Entries[i]
+		if strings.TrimSpace(entry.Def.Name) == trimmedName {
+			return *entry, resolved.Config, nil
+		}
+	}
+	workspaceLabel := workspaceDisplay(resolved.WorkspaceRoot, workspaceRef)
+	return AgentCatalogEntry{}, compozyconfig.Config{}, fmt.Errorf(
+		"api: agent %q is not available in workspace %q: %w",
+		trimmedName,
+		workspaceLabel,
+		workspacepkg.ErrAgentNotAvailable,
+	)
+}
+
+func (h *BaseHandlers) respondAgentEntries(
+	c *gin.Context,
+	entries []AgentCatalogEntry,
+	cfg *compozyconfig.Config,
+	diagnosticWorkspaceID string,
+	diagnostics ...[]workspacepkg.AgentDiagnostic,
+) {
+	diagnosticCount := 0
+	for _, group := range diagnostics {
+		diagnosticCount += len(group)
+	}
+	agents := make([]contract.AgentPayload, 0, len(entries)+diagnosticCount)
+	for i := range entries {
+		entry := &entries[i]
+		agents = append(agents, AgentPayloadFromEntryWithConfig(entry, cfg))
+	}
+	for _, group := range diagnostics {
+		for _, diagnostic := range group {
+			agents = append(agents, AgentPayloadFromDiagnostic(diagnostic, diagnosticWorkspaceID))
+		}
+	}
+	slices.SortFunc(agents, func(a, b contract.AgentPayload) int {
+		return cmp.Compare(a.Name, b.Name)
+	})
+	c.JSON(http.StatusOK, contract.AgentsResponse{Agents: agents})
+}
+
+func (h *BaseHandlers) agentCatalogEntryFromDef(
+	agent compozyconfig.AgentDef,
+	workspaceID string,
+) AgentCatalogEntry {
+	return AgentCatalogEntryFromDef(h.HomePaths, agent, strings.TrimSpace(workspaceID))
+}
+
+func statusForAgentWorkspaceError(err error) int {
+	switch {
+	case errors.Is(err, workspacepkg.ErrAgentNotAvailable), errors.Is(err, os.ErrNotExist):
+		return http.StatusNotFound
+	default:
+		return StatusForWorkspaceError(err)
+	}
+}
+
+func statusForCreateAgentError(err error) int {
+	switch {
+	case errors.Is(err, compozyconfig.ErrAgentNameReserved):
+		return http.StatusUnprocessableEntity
+	case errors.Is(err, errCreateAgentRequestInvalid),
+		errors.Is(err, compozyconfig.ErrInvalidAgentDefinition):
+		return http.StatusBadRequest
+	case errors.Is(err, compozyconfig.ErrAgentDefinitionExists):
+		return http.StatusConflict
+	case errors.Is(err, workspacepkg.ErrWorkspaceNotFound),
+		errors.Is(err, workspacepkg.ErrWorkspaceRootMissing),
+		errors.Is(err, workspacepkg.ErrWorkspaceNameTaken),
+		errors.Is(err, workspacepkg.ErrWorkspacePathTaken),
+		errors.Is(err, workspacepkg.ErrWorkspaceHasSessions),
+		errors.Is(err, workspacepkg.ErrWorkspaceResolverUnavailable):
+		return StatusForWorkspaceError(err)
+	default:
+		return http.StatusInternalServerError
+	}
+}

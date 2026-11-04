@@ -1,0 +1,325 @@
+package session
+
+import (
+	"fmt"
+	"path/filepath"
+	"slices"
+	"strings"
+
+	compozyconfig "github.com/compozy/compozy/internal/config"
+	"github.com/compozy/compozy/internal/store"
+	toolspkg "github.com/compozy/compozy/internal/tools"
+)
+
+// AllowedToolsPolicyError identifies an override rejected by the resolved Agent policy.
+type AllowedToolsPolicyError struct {
+	Tool          toolspkg.ToolID
+	DeniedByAgent bool
+}
+
+var _ error = &AllowedToolsPolicyError{}
+
+func (e *AllowedToolsPolicyError) Error() string {
+	if e.DeniedByAgent {
+		return fmt.Sprintf("%s: allowed_tools override tool %q is denied by agent profile", ErrValidation, e.Tool)
+	}
+	return fmt.Sprintf("%s: allowed_tools override tool %q widens agent profile", ErrValidation, e.Tool)
+}
+
+func (e *AllowedToolsPolicyError) Unwrap() error { return ErrValidation }
+
+// WithToolsetCatalog injects the catalog used to validate toolset-backed overrides.
+func WithToolsetCatalog(catalog toolspkg.ToolsetCatalog) Option {
+	return func(manager *Manager) {
+		manager.toolsetCatalog = catalog
+	}
+}
+
+// WithToolUniverse injects the concrete native tool IDs used to materialize
+// root-session delegation budgets from agent tool patterns and toolsets.
+func WithToolUniverse(ids []toolspkg.ToolID) Option {
+	return func(manager *Manager) {
+		manager.toolUniverse = append([]toolspkg.ToolID(nil), ids...)
+	}
+}
+
+func (s *sessionStartSpec) applyAllowedToolsOverride(
+	resolved *compozyconfig.ResolvedAgent,
+	catalog toolspkg.ToolsetCatalog,
+) error {
+	policy, dropped := toolspkg.DropRetiredToolReferences(toolspkg.ToolPolicy{Tools: s.allowedToolsOverride})
+	toolspkg.WarnRetiredToolReferences("session:"+s.sessionID, dropped)
+	override, hasOverride, err := normalizeAllowedToolsOverride(policy.Tools)
+	if err != nil {
+		return err
+	}
+	hasOverride = hasOverride || len(s.allowedToolsOverride) > 0
+	if !hasOverride {
+		return nil
+	}
+	if resolved == nil {
+		return fmt.Errorf("%w: resolved agent is required for allowed_tools override", ErrValidation)
+	}
+	if err := validateAllowedToolsOverrideSubset(*resolved, override, catalog); err != nil {
+		return err
+	}
+
+	resolved.ToolPolicyEnforced = true
+	resolved.Tools = append([]string(nil), override...)
+	resolved.Toolsets = nil
+
+	lineage := store.NormalizeSessionLineage(s.sessionID, s.lineage)
+	persistedOverride := override
+	if len(dropped) > 0 {
+		persistedOverride, _, err = normalizeAllowedToolsOverride(s.allowedToolsOverride)
+		if err != nil {
+			return err
+		}
+	}
+	lineage.PermissionPolicy.Tools = append([]string(nil), persistedOverride...)
+	lineage.PermissionPolicy = store.NormalizeSessionPermissionPolicy(lineage.PermissionPolicy)
+	if err := store.ValidateSessionLineage(s.sessionID, lineage); err != nil {
+		return fmt.Errorf("%w: allowed_tools override lineage policy: %w", ErrValidation, err)
+	}
+	s.lineage = lineage
+	return nil
+}
+
+func (s *sessionStartSpec) materializeRootDelegationPolicy(
+	definition compozyconfig.AgentDef,
+	resolved compozyconfig.ResolvedAgent,
+	catalog toolspkg.ToolsetCatalog,
+	universe []toolspkg.ToolID,
+) error {
+	if s == nil || s.instancePermissionCeiling != nil || strings.EqualFold(s.runtimeMode, RuntimeModeVerdictOnly) {
+		return nil
+	}
+	switch normalizeSessionType(s.sessionType) {
+	case SessionTypeUser, SessionTypeSystem:
+	default:
+		return nil
+	}
+	lineage := store.NormalizeSessionLineage(s.sessionID, s.lineage)
+	// Spawned sessions retain their parent-authorized policy.
+	if store.HierarchyParentSessionID(lineage) != "" {
+		return nil
+	}
+	if len(lineage.PermissionPolicy.Tools) == 0 && resolved.SessionMCP {
+		tools, err := concreteDelegationTools(resolved, catalog, universe)
+		if err != nil {
+			return err
+		}
+		lineage.PermissionPolicy.Tools = tools
+	}
+	// Preserve authored resource grants after the existing native-tool materialization.
+	if s.preserveDelegationPolicy {
+		s.lineage = lineage
+		return nil
+	}
+	lineage.PermissionPolicy.WorkspacePaths = append([]string{s.workspace.RootDir}, s.workspace.AdditionalDirs...)
+	lineage.PermissionPolicy.Skills = nil
+	for _, skill := range s.workspace.Skills {
+		name := strings.TrimSpace(skill.Name)
+		if name == "" && skill.Dir != "" {
+			name = filepath.Base(skill.Dir)
+		}
+		if !slices.Contains(definition.Skills.Disabled, name) {
+			lineage.PermissionPolicy.Skills = append(lineage.PermissionPolicy.Skills, name)
+		}
+	}
+	lineage.PermissionPolicy.MCPServers = nil
+	for _, server := range resolved.MCPServers {
+		lineage.PermissionPolicy.MCPServers = append(lineage.PermissionPolicy.MCPServers, server.Name)
+	}
+	lineage.PermissionPolicy = store.NormalizeSessionPermissionPolicy(lineage.PermissionPolicy)
+	if err := store.ValidateSessionLineage(s.sessionID, lineage); err != nil {
+		return fmt.Errorf("%w: root delegation lineage policy: %w", ErrValidation, err)
+	}
+	s.lineage = lineage
+	return nil
+}
+
+func (m *Manager) DelegationTools(resolved compozyconfig.ResolvedAgent) ([]string, error) {
+	return concreteDelegationTools(resolved, m.toolsetCatalog, m.toolUniverse)
+}
+
+func concreteDelegationTools(
+	resolved compozyconfig.ResolvedAgent,
+	catalog toolspkg.ToolsetCatalog,
+	universe []toolspkg.ToolID,
+) ([]string, error) {
+	denyPatterns, err := toolspkg.ParseToolPatterns(resolved.DenyTools)
+	if err != nil {
+		return nil, fmt.Errorf("%w: agent deny_tools policy is invalid: %w", ErrValidation, err)
+	}
+	candidates := make(map[toolspkg.ToolID]struct{})
+	// An Agent without an allowlist can use the native universe; preserve its denies below.
+	if !resolved.ToolPolicyEnforced && len(resolved.Tools) == 0 && len(resolved.Toolsets) == 0 {
+		for _, id := range universe {
+			candidates[id] = struct{}{}
+		}
+	}
+	for idx, raw := range resolved.Tools {
+		pattern, parseErr := toolspkg.ParseToolPattern(raw)
+		if parseErr != nil {
+			return nil, fmt.Errorf("%w: agent tools[%d] is invalid: %w", ErrValidation, idx, parseErr)
+		}
+		if !strings.Contains(pattern.String(), "*") {
+			candidates[toolspkg.ToolID(pattern.String())] = struct{}{}
+			continue
+		}
+		for _, id := range universe {
+			if pattern.Match(id) {
+				candidates[id] = struct{}{}
+			}
+		}
+	}
+	if len(universe) > 0 {
+		toolsets, parseErr := validateAllowedToolsOverrideToolsets(resolved.Toolsets)
+		if parseErr != nil {
+			return nil, parseErr
+		}
+		for _, toolsetID := range toolsets {
+			expanded, expandErr := catalog.Expand(toolsetID, universe)
+			if expandErr != nil {
+				return nil, fmt.Errorf("%w: expand agent toolset %q: %w", ErrValidation, toolsetID, expandErr)
+			}
+			for _, id := range expanded {
+				candidates[id] = struct{}{}
+			}
+		}
+	}
+	tools := make([]string, 0, len(candidates))
+	for id := range candidates {
+		if matchesAllowedToolsPattern(denyPatterns, id) {
+			continue
+		}
+		tools = append(tools, id.String())
+	}
+	slices.Sort(tools)
+	return tools, nil
+}
+
+// sessionCanRedirectShellWaits reports whether the session can call both tools a
+// shell-wait redirect names. Any doubt keeps the guard off: refusing a wait with
+// no replacement would leave the session no way to wait at all.
+func (m *Manager) sessionCanRedirectShellWaits(s *sessionStartSpec, resolved compozyconfig.ResolvedAgent) bool {
+	if s == nil || m.hostedMCP == nil || !resolved.SessionMCP ||
+		resolved.Harness == compozyconfig.ProviderHarnessPiACP ||
+		strings.EqualFold(s.runtimeMode, RuntimeModeVerdictOnly) {
+		return false
+	}
+	lineage := store.NormalizeSessionLineage(s.sessionID, s.lineage)
+	if IsInternalSpawnRole(lineage.SpawnRole) {
+		return false
+	}
+	allowed, err := concreteDelegationTools(resolved, m.toolsetCatalog, m.toolUniverse)
+	if err != nil {
+		return false
+	}
+	narrowed := store.NormalizeSessionPermissionPolicy(lineage.PermissionPolicy).Tools
+	for _, id := range []toolspkg.ToolID{toolspkg.ToolIDTerminalExec, toolspkg.ToolIDMonitorCreate} {
+		if !slices.Contains(allowed, id.String()) {
+			return false
+		}
+		if len(narrowed) > 0 && !slices.Contains(narrowed, id.String()) {
+			return false
+		}
+	}
+	return true
+}
+
+func normalizeAllowedToolsOverride(values []string) ([]string, bool, error) {
+	if len(values) == 0 {
+		return nil, false, nil
+	}
+	normalized := make([]string, 0, len(values))
+	seen := make(map[string]struct{}, len(values))
+	for idx, raw := range values {
+		trimmed := strings.TrimSpace(raw)
+		if trimmed == "" {
+			return nil, false, fmt.Errorf("%w: allowed_tools[%d] is required", ErrValidation, idx)
+		}
+		id := toolspkg.ToolID(trimmed)
+		if err := id.Validate(); err != nil {
+			return nil, false, fmt.Errorf(
+				"%w: allowed_tools[%d] %q must be a canonical ToolID: %w",
+				ErrValidation,
+				idx,
+				trimmed,
+				err,
+			)
+		}
+		if _, ok := seen[trimmed]; ok {
+			continue
+		}
+		seen[trimmed] = struct{}{}
+		normalized = append(normalized, trimmed)
+	}
+	slices.Sort(normalized)
+	return normalized, len(normalized) > 0, nil
+}
+
+func validateAllowedToolsOverrideSubset(
+	resolved compozyconfig.ResolvedAgent,
+	requested []string,
+	catalog toolspkg.ToolsetCatalog,
+) error {
+	allowPatterns, err := toolspkg.ParseToolPatterns(resolved.Tools)
+	if err != nil {
+		return fmt.Errorf("%w: agent tools policy is invalid: %w", ErrValidation, err)
+	}
+	denyPatterns, err := toolspkg.ParseToolPatterns(resolved.DenyTools)
+	if err != nil {
+		return fmt.Errorf("%w: agent deny_tools policy is invalid: %w", ErrValidation, err)
+	}
+	toolsets, err := validateAllowedToolsOverrideToolsets(resolved.Toolsets)
+	if err != nil {
+		return err
+	}
+
+	agentRestrictsTools := resolved.ToolPolicyEnforced || len(allowPatterns) > 0 || len(toolsets) > 0
+	for _, raw := range requested {
+		id := toolspkg.ToolID(raw)
+		if matchesAllowedToolsPattern(denyPatterns, id) {
+			return &AllowedToolsPolicyError{Tool: id, DeniedByAgent: true}
+		}
+		toolsetMember, err := catalog.Contains(id, toolsets)
+		if err != nil {
+			return fmt.Errorf("%w: resolve agent toolsets for allowed_tools override: %w", ErrValidation, err)
+		}
+		if !agentRestrictsTools || matchesAllowedToolsPattern(allowPatterns, id) || toolsetMember {
+			continue
+		}
+		return &AllowedToolsPolicyError{Tool: id}
+	}
+	return nil
+}
+
+func validateAllowedToolsOverrideToolsets(values []string) ([]toolspkg.ToolsetID, error) {
+	toolsets := make([]toolspkg.ToolsetID, 0, len(values))
+	for idx, raw := range values {
+		trimmed := strings.TrimSpace(raw)
+		id := toolspkg.ToolsetID(trimmed)
+		if err := id.Validate(); err != nil {
+			return nil, fmt.Errorf(
+				"%w: agent toolsets[%d] %q must be a canonical ToolsetID: %w",
+				ErrValidation,
+				idx,
+				trimmed,
+				err,
+			)
+		}
+		toolsets = append(toolsets, id)
+	}
+	return toolsets, nil
+}
+
+func matchesAllowedToolsPattern(patterns []toolspkg.ToolPattern, id toolspkg.ToolID) bool {
+	for _, pattern := range patterns {
+		if pattern.Match(id) {
+			return true
+		}
+	}
+	return false
+}

@@ -1,0 +1,218 @@
+{
+    "version": 2,
+    "agents": [
+        {
+            "name": "browser-lifecycle-agent",
+            "provider": "claude",
+            "permissions": "approve-reads",
+            "prompt": "You are the browser lifecycle test agent.",
+            "config_options": [
+                {
+                    "id": "model",
+                    "name": "Model",
+                    "current": "qa-browser-model",
+                    "values": [
+                        {
+                            "value": "qa-browser-model",
+                            "label": "QA Browser Model"
+                        },
+                        {
+                            "value": "qa-browser-model-alt",
+                            "label": "QA Browser Model Alt"
+                        }
+                    ]
+                },
+                {
+                    "id": "reasoning_effort",
+                    "name": "Reasoning effort",
+                    "current": "medium",
+                    "values": [
+                        {
+                            "value": "low",
+                            "label": "Low"
+                        },
+                        {
+                            "value": "medium",
+                            "label": "Medium"
+                        },
+                        {
+                            "value": "high",
+                            "label": "High"
+                        }
+                    ]
+                }
+            ],
+            "turns": [
+                {
+                    "name": "binding-fact",
+                    "match": {
+                        "turn_source": "user",
+                        "user_text": "Remember the binding fact: amber otter"
+                    },
+                    "steps": [
+                        {
+                            "kind": "assistant",
+                            "text": "Binding fact remembered."
+                        }
+                    ]
+                },
+                {
+                    "name": "binding-continued",
+                    "match": {
+                        "turn_source": "user",
+                        "user_text": "Check binding continuity",
+                        "raw_user_text_contains": "<compozy-environment-change>"
+                    },
+                    "steps": [
+                        {
+                            "kind": "assistant",
+                            "text": "Binding conversation continued."
+                        }
+                    ]
+                },
+                {
+                    "name": "browser-session-fix-pr-checks",
+                    "match": {
+                        "turn_source": "user",
+                        "user_text_contains": "The checks on pull request #932"
+                    },
+                    "steps": [
+                        {
+                            "kind": "assistant",
+                            "text": "I will inspect the failing PR checks."
+                        }
+                    ]
+                },
+                {
+                    "name": "browser-session-created",
+                    "match": {
+                        "turn_source": "user",
+                        "user_text": "e2e first message"
+                    },
+                    "steps": [
+                        {
+                            "kind": "assistant",
+                            "chunks": ["Session ready."]
+                        }
+                    ]
+                },
+                {
+                    "name": "browser-session-lifecycle",
+                    "match": {
+                        "turn_source": "user",
+                        "user_text": "run browser lifecycle flow"
+                    },
+                    "steps": [
+                        {
+                            "kind": "assistant",
+                            "chunks": ["Streaming response ", "started. "]
+                        },
+                        {
+                            "kind": "permission",
+                            "tool_call_id": "perm-browser-1",
+                            "title": "Edit lifecycle plan",
+                            "tool_kind": "edit",
+                            "path": "browser-session.txt",
+                            "raw_input": {
+                                "path": "browser-session.txt",
+                                "instruction": "allow browser lifecycle edit"
+                            },
+                            "status": "pending",
+                            "expect_decision": "allow-once",
+                            "emit_text": "Approval granted. "
+                        },
+                        {
+                            "kind": "assistant",
+                            "chunks": ["Session continued ", "after approval."]
+                        }
+                    ]
+                },
+                {
+                    "name": "browser-session-auto-title",
+                    "match": {
+                        "turn_source": "synthetic",
+                        "user_text_contains": "run browser lifecycle flow\n\nAssistant response:\nStreaming response started."
+                    },
+                    "steps": [
+                        {
+                            "kind": "assistant",
+                            "text": "Browser Lifecycle Flow"
+                        }
+                    ]
+                }
+            ]
+        },
+        {
+            "name": "browser-binding-replay",
+            "provider": "claude",
+            "permissions": "approve-reads",
+            "load_missing": true,
+            "prompt": "You are the binding replay test agent.",
+            "config_options": [
+                {
+                    "id": "model",
+                    "name": "Model",
+                    "current": "qa-browser-model",
+                    "values": [
+                        {
+                            "value": "qa-browser-model",
+                            "label": "QA Browser Model"
+                        },
+                        {
+                            "value": "qa-browser-model-alt",
+                            "label": "QA Browser Model Alt"
+                        }
+                    ]
+                },
+                {
+                    "id": "reasoning_effort",
+                    "name": "Reasoning effort",
+                    "current": "medium",
+                    "values": [
+                        {
+                            "value": "low",
+                            "label": "Low"
+                        },
+                        {
+                            "value": "medium",
+                            "label": "Medium"
+                        },
+                        {
+                            "value": "high",
+                            "label": "High"
+                        }
+                    ]
+                }
+            ],
+            "turns": [
+                {
+                    "name": "binding-fact",
+                    "match": {
+                        "turn_source": "user",
+                        "user_text": "Remember the binding fact: amber otter"
+                    },
+                    "steps": [
+                        {
+                            "kind": "assistant",
+                            "text": "Binding fact remembered."
+                        }
+                    ]
+                },
+                {
+                    "name": "binding-replayed",
+                    "match": {
+                        "turn_source": "user",
+                        "user_text": "Check binding continuity",
+                        "raw_user_text_contains": "amber otter"
+                    },
+                    "steps": [
+                        {
+                            "kind": "assistant",
+                            "text": "Binding conversation continued."
+                        }
+                    ]
+                }
+            ]
+        }
+    ]
+}

@@ -1,0 +1,348 @@
+package session
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"strings"
+
+	compozyconfig "github.com/compozy/compozy/internal/config"
+	"github.com/compozy/compozy/internal/store"
+	workspacepkg "github.com/compozy/compozy/internal/workspace"
+)
+
+// ErrCreateScopeConflict rejects project selectors supplied with explicit User scope.
+var ErrCreateScopeConflict = errors.New("session_create_scope_conflict")
+
+const sessionDefaultProfileName = "default"
+
+func resolveStoredSessionWorkspace(
+	ctx context.Context,
+	meta *store.SessionMeta,
+	resolver workspacepkg.RuntimeResolver,
+	profileNames ProfileNameResolver,
+) (workspacepkg.ResolvedWorkspace, error) {
+	if meta == nil {
+		return workspacepkg.ResolvedWorkspace{}, errors.New("session: session metadata is required")
+	}
+	if resolver == nil {
+		return workspacepkg.ResolvedWorkspace{}, errors.New("session: workspace resolver is required")
+	}
+
+	workspaceID := strings.TrimSpace(meta.WorkspaceID)
+	if workspaceID == "" {
+		return resolveUserWorkspace(ctx, resolver, meta.ProfileID)
+	}
+
+	resolved, err := resolveWorkspaceForProfile(ctx, resolver, profileNames, workspaceID, meta.ProfileID)
+	if err != nil {
+		return workspacepkg.ResolvedWorkspace{}, fmt.Errorf(
+			"session: resolve workspace %q for session %q: %w",
+			workspaceID,
+			meta.ID,
+			err,
+		)
+	}
+	return resolved, nil
+}
+
+func (m *Manager) resolveCreateWorkspace(
+	ctx context.Context,
+	opts *CreateOpts,
+) (workspacepkg.ResolvedWorkspace, error) {
+	resolver, err := m.requireWorkspaceResolver()
+	if err != nil {
+		return workspacepkg.ResolvedWorkspace{}, err
+	}
+
+	workspaceRef := strings.TrimSpace(opts.Workspace)
+	workspacePath := strings.TrimSpace(opts.WorkspacePath)
+	if opts.Scope == workspacepkg.ScopeUser {
+		if workspaceRef != "" || workspacePath != "" || opts.Worktree != "" || opts.CWD != "" {
+			return workspacepkg.ResolvedWorkspace{}, errors.Join(ErrValidation, ErrCreateScopeConflict)
+		}
+		return resolveUserWorkspace(ctx, resolver, normalizeCreateProfileID(opts.ProfileID))
+	}
+	if workspacepkg.ParseRef(workspaceRef).Kind == workspacepkg.RefUser {
+		if workspacePath != "" || opts.Worktree != "" || opts.CWD != "" {
+			return workspacepkg.ResolvedWorkspace{}, workspacepkg.ErrUserScopeWorktreeUnsupported
+		}
+		return resolveUserWorkspace(ctx, resolver, normalizeCreateProfileID(opts.ProfileID))
+	}
+
+	switch {
+	case workspaceRef == "" && workspacePath == "":
+		return workspacepkg.ResolvedWorkspace{}, errors.New("session: workspace or workspace path is required")
+	case workspaceRef != "" && workspacePath != "":
+		return workspacepkg.ResolvedWorkspace{}, errors.New(
+			"session: workspace and workspace path are mutually exclusive",
+		)
+	case workspacePath != "":
+		return m.resolveCreateWorkspacePath(ctx, resolver, workspacePath, opts.ProfileID)
+	default:
+		resolved, err := resolveWorkspaceForProfile(ctx, resolver, m.profileNames, workspaceRef, opts.ProfileID)
+		if err != nil {
+			return workspacepkg.ResolvedWorkspace{}, fmt.Errorf("session: resolve workspace %q: %w", workspaceRef, err)
+		}
+		return resolved, nil
+	}
+}
+
+// resolveCreateWorkspacePath registers or resolves a workspace path for the creating profile.
+func (m *Manager) resolveCreateWorkspacePath(
+	ctx context.Context,
+	resolver workspacepkg.RuntimeResolver,
+	workspacePath string,
+	profileID string,
+) (workspacepkg.ResolvedWorkspace, error) {
+	profileResolver, ok := resolver.(workspacepkg.ProfileRegistrationResolver)
+	if !ok {
+		return workspacepkg.ResolvedWorkspace{}, errors.New(
+			"session: workspace resolver does not support profile path registration",
+		)
+	}
+	profileID = strings.TrimSpace(profileID)
+	if profileID == "" || profileID == store.DefaultProfileID {
+		resolved, err := profileResolver.ResolveOrRegisterForProfile(ctx, workspacePath, sessionDefaultProfileName)
+		if err != nil {
+			return workspacepkg.ResolvedWorkspace{}, fmt.Errorf(
+				"session: resolve default profile workspace path %q: %w", workspacePath, err,
+			)
+		}
+		applyDefaultProfileIdentity(&resolved)
+		return requireActiveResolvedWorkspace(&resolved)
+	}
+	profileName, err := resolveProfileName(ctx, m.profileNames, profileID)
+	if err != nil {
+		return workspacepkg.ResolvedWorkspace{}, err
+	}
+	resolved, err := profileResolver.ResolveOrRegisterForProfile(ctx, workspacePath, profileName)
+	if err != nil {
+		return workspacepkg.ResolvedWorkspace{}, fmt.Errorf(
+			"session: resolve profile workspace path %q: %w", workspacePath, err,
+		)
+	}
+	resolved.ProfileID = profileID
+	return requireActiveResolvedWorkspace(&resolved)
+}
+
+func (m *Manager) resolveResumeWorkspace(
+	ctx context.Context,
+	meta *store.SessionMeta,
+) (workspacepkg.ResolvedWorkspace, error) {
+	resolver, err := m.requireWorkspaceResolver()
+	if err != nil {
+		return workspacepkg.ResolvedWorkspace{}, err
+	}
+
+	return resolveStoredSessionWorkspace(ctx, meta, resolver, m.profileNames)
+}
+
+func resolveWorkspaceForProfile(
+	ctx context.Context,
+	resolver workspacepkg.RuntimeResolver,
+	profileNames ProfileNameResolver,
+	workspaceRef string,
+	profileID string,
+) (workspacepkg.ResolvedWorkspace, error) {
+	if workspacepkg.ParseRef(workspaceRef).Kind == workspacepkg.RefUser {
+		return resolveUserWorkspace(ctx, resolver, profileID)
+	}
+	profileID = strings.TrimSpace(profileID)
+	if profileID == "" || profileID == store.DefaultProfileID {
+		profileResolver, ok := resolver.(workspacepkg.ProfileRuntimeResolver)
+		if !ok {
+			return workspacepkg.ResolvedWorkspace{}, errors.New(
+				"session: workspace resolver does not support profile layers",
+			)
+		}
+		resolved, err := profileResolver.ResolveForProfile(
+			ctx,
+			workspaceRef,
+			sessionDefaultProfileName,
+		)
+		if err != nil {
+			return workspacepkg.ResolvedWorkspace{}, err
+		}
+		applyDefaultProfileIdentity(&resolved)
+		return requireActiveResolvedWorkspace(&resolved)
+	}
+	profileName, err := resolveProfileName(ctx, profileNames, profileID)
+	if err != nil {
+		return workspacepkg.ResolvedWorkspace{}, err
+	}
+	profileResolver, ok := resolver.(workspacepkg.ProfileRuntimeResolver)
+	if !ok {
+		return workspacepkg.ResolvedWorkspace{}, errors.New(
+			"session: workspace resolver does not support profile layers",
+		)
+	}
+	resolved, err := profileResolver.ResolveForProfile(ctx, workspaceRef, profileName)
+	if err != nil {
+		return workspacepkg.ResolvedWorkspace{}, err
+	}
+	resolved.ProfileID = profileID
+	return requireActiveResolvedWorkspace(&resolved)
+}
+
+func applyDefaultProfileIdentity(resolved *workspacepkg.ResolvedWorkspace) {
+	if resolved == nil {
+		return
+	}
+	resolved.ProfileID = store.DefaultProfileID
+	resolved.ProfileName = sessionDefaultProfileName
+}
+
+func resolveProfileName(ctx context.Context, profileNames ProfileNameResolver, profileID string) (string, error) {
+	if profileNames == nil {
+		return "", errors.New("session: profile name resolver is required for profile workspace resolution")
+	}
+	profileName, err := profileNames.ProfileName(ctx, strings.TrimSpace(profileID))
+	if err != nil {
+		return "", fmt.Errorf("session: resolve profile name %q: %w", strings.TrimSpace(profileID), err)
+	}
+	return profileName, nil
+}
+
+func (m *Manager) requireWorkspaceResolver() (workspacepkg.RuntimeResolver, error) {
+	if m.workspace == nil {
+		return nil, errors.New("session: workspace resolver is required")
+	}
+	return m.workspace, nil
+}
+
+func resolveWorkspaceAgent(
+	agentName string,
+	resolvedWorkspace *workspacepkg.ResolvedWorkspace,
+) (compozyconfig.AgentDef, error) {
+	target := strings.TrimSpace(agentName)
+	if target == "" {
+		return compozyconfig.AgentDef{}, errors.New("session: agent name is required")
+	}
+	if resolvedWorkspace == nil {
+		return compozyconfig.AgentDef{}, errors.New("session: resolved workspace is required")
+	}
+
+	for _, agent := range resolvedWorkspace.Agents {
+		if strings.TrimSpace(agent.Name) != target {
+			continue
+		}
+		return agent, nil
+	}
+
+	return compozyconfig.AgentDef{}, fmt.Errorf("%w: %s", workspacepkg.ErrAgentNotAvailable, target)
+}
+
+func (m *Manager) resolveWorkspaceAgentArtifacts(
+	agentName string,
+	resolvedWorkspace *workspacepkg.ResolvedWorkspace,
+) (AgentArtifacts, error) {
+	if m != nil && m.agentResolver != nil {
+		if resolver, ok := m.agentResolver.(AgentArtifactResolver); ok {
+			return resolver.ResolveAgentArtifacts(agentName, resolvedWorkspace)
+		}
+		agent, err := m.agentResolver.ResolveAgent(agentName, resolvedWorkspace)
+		if err != nil {
+			return AgentArtifacts{}, err
+		}
+		return AgentArtifacts{Agent: agent}, nil
+	}
+	agent, err := resolveWorkspaceAgent(agentName, resolvedWorkspace)
+	if err != nil {
+		return AgentArtifacts{}, err
+	}
+	return AgentArtifacts{Agent: agent}, nil
+}
+
+func (m *Manager) resolveWorkspaceAgentArtifactsForSession(
+	agentName string,
+	sessionType Type,
+	resolvedWorkspace *workspacepkg.ResolvedWorkspace,
+) (AgentArtifacts, error) {
+	artifacts, err := m.resolveWorkspaceAgentArtifacts(agentName, resolvedWorkspace)
+	if err == nil {
+		return artifacts, nil
+	}
+	if !errors.Is(err, workspacepkg.ErrAgentNotAvailable) {
+		return AgentArtifacts{}, err
+	}
+
+	fallback, ok := builtinSessionAgentDef(agentName, sessionType)
+	if !ok {
+		return AgentArtifacts{}, err
+	}
+	return AgentArtifacts{Agent: fallback}, nil
+}
+
+func resolveWorkspaceSessionAgentForType(
+	agentName string,
+	provider string,
+	sessionType Type,
+	resolvedWorkspace *workspacepkg.ResolvedWorkspace,
+	agentResolver AgentResolver,
+) (compozyconfig.ResolvedAgent, error) {
+	if resolvedWorkspace == nil {
+		return compozyconfig.ResolvedAgent{}, errors.New("session: resolved workspace is required")
+	}
+
+	var (
+		agentDef compozyconfig.AgentDef
+		err      error
+	)
+	if agentResolver != nil {
+		agentDef, err = agentResolver.ResolveAgent(agentName, resolvedWorkspace)
+	} else {
+		agentDef, err = resolveWorkspaceAgent(agentName, resolvedWorkspace)
+	}
+	if err != nil {
+		if !errors.Is(err, workspacepkg.ErrAgentNotAvailable) {
+			return compozyconfig.ResolvedAgent{}, err
+		}
+		fallback, ok := builtinSessionAgentDef(agentName, sessionType)
+		if !ok {
+			return compozyconfig.ResolvedAgent{}, err
+		}
+		agentDef = fallback
+	}
+
+	resolved, err := resolvedWorkspace.Config.ResolveSessionAgent(agentDef, provider)
+	if err != nil {
+		return compozyconfig.ResolvedAgent{}, err
+	}
+	resolved.ProfileName = strings.TrimSpace(resolvedWorkspace.ProfileName)
+	return resolved, nil
+}
+
+func builtinSessionAgentDef(agentName string, sessionType Type) (compozyconfig.AgentDef, bool) {
+	expectedName := ""
+	switch normalizeSessionType(sessionType) {
+	case SessionTypeCoordinator:
+		expectedName = compozyconfig.BuiltinCoordinatorAgentName
+	default:
+		return compozyconfig.AgentDef{}, false
+	}
+	def, ok := compozyconfig.BuiltinAgentDef(agentName)
+	if !ok || def.Name != expectedName {
+		return compozyconfig.AgentDef{}, false
+	}
+	return def, true
+}
+
+func resolveUserWorkspace(
+	ctx context.Context,
+	resolver workspacepkg.RuntimeResolver,
+	profileID string,
+) (workspacepkg.ResolvedWorkspace, error) {
+	userResolver, ok := resolver.(workspacepkg.UserRuntimeResolver)
+	if !ok {
+		return workspacepkg.ResolvedWorkspace{}, errors.New("session: workspace resolver does not support User scope")
+	}
+	return userResolver.ResolveUser(ctx, normalizeCreateProfileID(profileID))
+}
+
+func requireActiveResolvedWorkspace(resolved *workspacepkg.ResolvedWorkspace) (workspacepkg.ResolvedWorkspace, error) {
+	if resolved.ArchivedAt != nil {
+		return workspacepkg.ResolvedWorkspace{}, store.ErrWorkspaceArchived
+	}
+	return *resolved, nil
+}

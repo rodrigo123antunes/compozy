@@ -1,0 +1,110 @@
+---
+id: RT-web-session-all-workspaces
+area: RT
+title: Browse sessions across every workspace without losing healthy groups
+persona: Théo
+journey: J-respond-to-agent-attention
+expected: The Sessions catalog offers one globe toggle — this workspace or every workspace. Both scopes expose bounded pages with explicit previous/next navigation and server search across history. Workspace groups show exact population counts, isolate one workspace's page failure, join and remove workspaces live, persist globally through `shell.sessions.scope`, and open a foreign session in its owner workspace.
+entry_points: web Sessions dock item; web session-window sidebar
+qa_status: skipped
+bug_ids:
+fix_status:
+retest_status:
+fix_commits:
+evidence: docs/qa/reports/2026-08-16-herdr-parity.md; /Users/pedronauck/dev/qa-labs/compozy-northstar-pay-20260816-141901-835450-lab/qa-artifacts/qa/screenshots/herdr-cross-workspace-needs-you-fixed.png; /Users/pedronauck/dev/qa-labs/compozy-northstar-pay-20260816-141901-835450-lab/qa-artifacts/qa/screenshots/herdr-attention-all-quiet-cleared.png; .compozy/tasks/herdr-parity/evidence/visual/task_03
+last_report: docs/qa/reports/2026-10-02-untested.md
+overlaps: RT-session-attention-catalog; ET-web-session-cross-workspace-confirm
+---
+
+Exercise more than 100 sessions in one workspace, a failing sibling workspace, live workspace
+join/removal, collapse, reload, and foreign activation. A failed group must not blank healthy groups,
+and actions scoped to the active runtime must never target a foreign row.
+
+QA impact 2026-08-16: Task 03 added the daemon-backed tri-state scope and cursor-complete grouped
+catalog. Flag only; Task 08 owns the real-user walk and evidence.
+
+QA 2026-08-16 Herdr parity: The isolated browser journey, focused attention Playwright lane, and full Web E2E exercised cross-workspace landing, permission resolution, counts, channel suppression, task canary, catalog scope/order, finished presence clearing, and honest quiet/stale states. The lab browser exposed its real notification capability; deterministic granted and denied branches ran in the canonical browser suite.
+
+QA impact 2026-08-17: The tri-state pill group collapsed to a single globe toggle and the
+agent-grouped `all` view was deleted; `shell.sessions.scope` is now `workspace` (default) or
+`all-workspaces`. The narrow breadth lists the workspace's complete catalog — the six-thread cap is
+gone. Re-walk: confirm the globe presses both ways, the CLI reports the same value, and the
+workspace groups still isolate a failure.
+
+Walk this cycle: blocked-verify — the web unit suites (5211 passing) and the rewritten Playwright
+legs cover the globe's pressed states, the daemon round trip, and workspace-group isolation, but an
+isolated QA lab with a live daemon was not started, so a persona walk through public entry points
+could not meet the qa-execution evidence standard.
+
+2026-08-23 qa-impact (Profiles): **reset from `blocked-verify` to `untested`** — phase 0 deleted the
+client-side catalog filtering this row's cross-workspace behavior was built on
+(`web/src/systems/session/hooks/use-session-catalog-streams.ts`) and moved narrowing into the
+daemon, and the catalog payload gained the profile field. Re-walk workspace breadth with a live
+daemon, confirming the browser never receives rows it then hides, that a failing workspace group
+still isolates, and that widening workspaces does not widen profiles. The profile axis of the same
+stream is owned by `ET-profile-stream-isolation`; what Global means for the data is owned by
+`MS-global-scope-no-workspace-work`.
+
+Global consumer acceptance: with the desktop data scope set to Global and no selected project,
+open Sessions through the palette and the shell modal while the saved session-list preference is
+Workspace. Verify that both issue the canonical profile-scoped `all_workspaces=true` catalog read,
+show persisted Global/project sessions, and preserve truthful attention rows. Selecting a project
+must return to that workspace's scoped catalog; an unresolved project selection must not become
+an implicit aggregate read. A null Global workspace is a valid unscoped destination, not a disabled
+catalog. The owning OS attention and palette suites cover this readiness distinction; the real
+browser retest remains the acceptance proof.
+
+QA impact 2026-09-29 (#679): With more than 200 sessions across multiple workspaces, verify that
+opening a palette catalog fetches one page of at most 100 rows and exact population facets.
+Next and Previous must reach older rows; searching a title/agent beyond the first page must find it
+without walking intervening pages. Chips retain whole-scope counts while search and badge filters
+change the visible page. A catalog wake rereads only the current visible page and preserves its
+cursor and keyboard focus. In grouped Sessions, collapse a workspace and confirm no record page
+is fetched for it; expand, navigate its history, and verify keyboard cycling uses that visible page.
+Refresh failures must retain known rows with Retry, while missing aggregate metadata stays unknown
+rather than showing a zero count. Repeat the catalog soak on the final built assets for 60 minutes;
+request growth must depend on visible consumers and wakes, not persisted history size.
+The automated soak runs in the release desktop nightly lane (`make test-e2e-desktop-nightly`).
+
+2026-10-05: Deferred from this QA cycle by the user's explicit scope reduction.
+Coverage remains outstanding; this skip is not a passing result. Resume from the dated
+report's session matrix in a future QA cycle.
+
+## Backend contract checks for All projects
+
+- Query `/api/sessions?all_workspaces=true&workspace_ids=<project>&workspace_ids=@user&limit=1`.
+  Follow cursors; every row must belong to the selected project or User. Reusing a cursor with a
+  different selection must fail. Empty selections and `global` filter values are rejected.
+- Read session facets with `all_profiles=true`: `by_profile` covers every eligible profile,
+  including groups with no row on the current page. Text and badge selections do not narrow facets.
+- PATCH `/api/settings/shell` with legacy `scope=all-workspaces`: verify the warning, explicit legacy
+  scope, and increasing revision on every repeated write. Set `group_by=profile`, write legacy scope
+  again, and reload; the explicit grouping must survive.
+- Open a global window with an unknown workspace binding: expect HTTP 400 `window_binding_invalid`.
+  `@user` succeeds. Saved snapshots remain structurally loadable after project removal.
+- Delete a session referenced from multiple profiles and project/global desktops; reload each partition.
+  The session view is empty and undo, navigation, and reopen cannot resurrect it. Unregistering a
+  bound project similarly retires every affected window onto its app's catalog.
+
+Backend evidence is owned by the session query/store, shell settings, window-manager lifecycle,
+and daemon partition reconciliation suites. Browser grouping and destination behavior are validated
+by the frontend slice and integrated journey.
+
+
+2026-10-21 backend gap follow-up: compare `compozy session list --all-workspaces` with the catalog. Its additional PROJECT column names registered projects and labels workspace-less rows User while retaining Workspace and all existing columns. The focused CLI suite covers the output contract; the full browser walk remains pending integration QA.
+
+Release review regression (#887): search while sessions are grouped. The modal header must omit the
+unfiltered total while a search is active; clearing the search restores the complete facets total.
+
+Issue #903 regression: in a session window under All projects with Group by project, collapse a workspace group and select sessions in other groups, then reload. The group stays collapsed and opens only on its toggle. Per-window rules: ET-web-session-sidebar-per-window.
+
+### Deferred profile identity and per-window folds
+
+With project grouping enabled, delay the profile catalog response and collapse a group in one
+window while a second window remains expanded. Resolve the profile catalog: both windows must
+keep their own choice. A newly opened window inherits the last-used folds. Rename that profile
+without changing its ID and verify the first window remains collapsed. Reusing the old profile
+name for a different ID must not transfer the old folds.
+
+Focused hook coverage: `use-session-list-groups.test.tsx`, W-15. Browser execution remains part
+of the owning scenario run; the focused hook test does not claim browser verification.

@@ -1,0 +1,413 @@
+package e2e
+
+import (
+	"errors"
+	"fmt"
+	"maps"
+	"os"
+	"path/filepath"
+	"slices"
+	"strings"
+	"sync/atomic"
+	"testing"
+	"time"
+
+	"github.com/BurntSushi/toml"
+	compozyconfig "github.com/compozy/compozy/internal/config"
+	"github.com/compozy/compozy/internal/testutil"
+	"github.com/goccy/go-yaml"
+)
+
+var socketPathCounter atomic.Uint64
+
+// AgentSeed defines one persisted AGENT.md fixture.
+type AgentSeed struct {
+	Name         string
+	Provider     string
+	Command      string
+	Model        string
+	Permissions  string
+	Tools        []string
+	Toolsets     []string
+	DenyTools    []string
+	CategoryPath []string
+	MCPServers   []compozyconfig.MCPServer
+	Prompt       string
+}
+
+// ConfigSeedOptions configures the seeded daemon runtime config.
+type ConfigSeedOptions struct {
+	Host            string
+	HTTPPort        int
+	SocketPath      string
+	DefaultAgent    string
+	DefaultProvider string
+
+	PermissionMode compozyconfig.PermissionMode
+	Providers      map[string]compozyconfig.ProviderConfig
+
+	AgentDefs []AgentSeed
+	Mutate    func(*compozyconfig.Config)
+}
+
+// WorkspaceSeedOptions configures the seeded workspace root.
+type WorkspaceSeedOptions struct {
+	Root  string
+	Files map[string]string
+}
+
+type configSeedFile struct {
+	Daemon      *configSeedDaemonSection      `toml:"daemon,omitempty"`
+	HTTP        *configSeedHTTPSection        `toml:"http,omitempty"`
+	Defaults    *configSeedDefaultsSection    `toml:"defaults,omitempty"`
+	Permissions *configSeedPermissionsSection `toml:"permissions,omitempty"`
+	Session     *compozyconfig.SessionConfig  `toml:"session,omitempty"`
+	Roles       *compozyconfig.RolesConfig    `toml:"roles,omitempty"`
+
+	Tools       *compozyconfig.ToolsConfig              `toml:"tools,omitempty"`
+	Marketplace *compozyconfig.MarketplaceRuntimeConfig `toml:"marketplace,omitempty"`
+	Extensions  *compozyconfig.ExtensionsConfig         `toml:"extensions,omitempty"`
+	Log         *compozyconfig.LogConfig                `toml:"log,omitempty"`
+	Providers   map[string]compozyconfig.ProviderConfig `toml:"providers,omitempty"`
+}
+
+type configSeedDaemonSection struct {
+	Socket string                         `toml:"socket"`
+	Load   compozyconfig.DaemonLoadConfig `toml:"load"`
+}
+
+type configSeedHTTPSection struct {
+	Host string `toml:"host"`
+	Port int    `toml:"port"`
+}
+
+type configSeedDefaultsSection struct {
+	Agent    string `toml:"agent,omitempty"`
+	Provider string `toml:"provider,omitempty"`
+}
+
+type configSeedPermissionsSection struct {
+	Mode compozyconfig.PermissionMode `toml:"mode,omitempty"`
+}
+
+// NewHomePaths creates an isolated Compozy home layout for one test run.
+func NewHomePaths(t testing.TB) compozyconfig.HomePaths {
+	t.Helper()
+
+	homePaths, err := compozyconfig.ResolveHomePathsFrom(t.TempDir())
+	if err != nil {
+		t.Fatalf("ResolveHomePathsFrom() error = %v", err)
+	}
+	if err := compozyconfig.EnsureHomeLayout(homePaths); err != nil {
+		t.Fatalf("EnsureHomeLayout() error = %v", err)
+	}
+	return homePaths
+}
+
+// SeedConfig writes a minimal config overlay and any requested agent definitions.
+func SeedConfig(t testing.TB, homePaths compozyconfig.HomePaths, opts ConfigSeedOptions) compozyconfig.Config {
+	t.Helper()
+
+	cfg := compozyconfig.DefaultWithHome(homePaths)
+	// Protocol journeys must not depend on the shared runner load; scenarios can opt in via Mutate.
+	cfg.Daemon.Load.AdmissionThreshold = 0
+	cfg.HTTP.Host = defaultString(opts.Host, "127.0.0.1")
+	if opts.HTTPPort > 0 {
+		cfg.HTTP.Port = opts.HTTPPort
+	} else {
+		cfg.HTTP.Port = testutil.FreeTCPPort(t)
+	}
+	cfg.Daemon.Socket = defaultString(opts.SocketPath, shortSocketPath(t))
+	if trimmed := strings.TrimSpace(opts.DefaultAgent); trimmed != "" {
+		cfg.Defaults.Agent = trimmed
+	}
+	if trimmed := strings.TrimSpace(opts.DefaultProvider); trimmed != "" {
+		cfg.Defaults.Provider = trimmed
+	}
+
+	if opts.PermissionMode != "" {
+		cfg.Permissions.Mode = opts.PermissionMode
+	}
+	if len(opts.Providers) > 0 {
+		cfg.Providers = cloneProviders(opts.Providers)
+	}
+
+	if opts.Mutate != nil {
+		opts.Mutate(&cfg)
+	}
+	if err := cfg.Validate(); err != nil {
+		t.Fatalf("seed config validate error = %v", err)
+	}
+	if err := writeSeedConfigFile(homePaths, &cfg); err != nil {
+		t.Fatalf("write seed config %q error = %v", homePaths.ConfigFile, err)
+	}
+
+	for _, agent := range opts.AgentDefs {
+		WriteAgentDef(t, homePaths, agent)
+	}
+
+	return cfg
+}
+
+func writeSeedConfigFile(homePaths compozyconfig.HomePaths, cfg *compozyconfig.Config) error {
+	if cfg == nil {
+		return errors.New("seed config is required")
+	}
+
+	overlay := configSeedFile{
+		Daemon: &configSeedDaemonSection{
+			Socket: cfg.Daemon.Socket,
+			Load:   cfg.Daemon.Load,
+		},
+		HTTP: &configSeedHTTPSection{
+			Host: cfg.HTTP.Host,
+			Port: cfg.HTTP.Port,
+		},
+		Defaults: &configSeedDefaultsSection{
+			Agent:    cfg.Defaults.Agent,
+			Provider: cfg.Defaults.Provider,
+		},
+		Session: cloneSessionConfig(cfg.Session),
+		Roles:   cloneRolesConfig(&cfg.Roles),
+
+		Tools:       cloneToolsConfig(&cfg.Tools),
+		Marketplace: &cfg.Marketplace,
+		Extensions:  &cfg.Extensions,
+		Log:         &cfg.Log,
+		Providers:   cloneProviders(cfg.Providers),
+	}
+	if cfg.Permissions.Mode != "" {
+		overlay.Permissions = &configSeedPermissionsSection{Mode: cfg.Permissions.Mode}
+	}
+
+	file, err := os.Create(homePaths.ConfigFile)
+	if err != nil {
+		return fmt.Errorf("os.Create(%q): %w", homePaths.ConfigFile, err)
+	}
+	if err := toml.NewEncoder(file).Encode(overlay); err != nil {
+		if closeErr := file.Close(); closeErr != nil {
+			return fmt.Errorf(
+				"toml encode config %q: %w (close error = %v)",
+				homePaths.ConfigFile,
+				err,
+				closeErr,
+			)
+		}
+		return fmt.Errorf("toml encode config %q: %w", homePaths.ConfigFile, err)
+	}
+	if err := file.Close(); err != nil {
+		return fmt.Errorf("close config %q: %w", homePaths.ConfigFile, err)
+	}
+	return nil
+}
+
+func cloneSessionConfig(cfg compozyconfig.SessionConfig) *compozyconfig.SessionConfig {
+	return new(cfg)
+}
+
+func cloneRolesConfig(cfg *compozyconfig.RolesConfig) *compozyconfig.RolesConfig {
+	return new(compozyconfig.CloneRolesConfig(cfg))
+}
+
+func cloneToolsConfig(cfg *compozyconfig.ToolsConfig) *compozyconfig.ToolsConfig {
+	if cfg == nil {
+		return nil
+	}
+	cloned := *cfg
+	cloned.Policy.TrustedSources = append([]string(nil), cfg.Policy.TrustedSources...)
+	return &cloned
+}
+
+// SeedWorkspace creates an isolated workspace root and any requested files.
+func SeedWorkspace(t testing.TB, opts WorkspaceSeedOptions) string {
+	t.Helper()
+
+	root := strings.TrimSpace(opts.Root)
+	if root == "" {
+		root = t.TempDir()
+	}
+	if err := os.MkdirAll(root, 0o755); err != nil {
+		t.Fatalf("os.MkdirAll(%q) error = %v", root, err)
+	}
+
+	for relativePath, contents := range opts.Files {
+		targetPath, err := seedWorkspaceTargetPath(root, relativePath)
+		if err != nil {
+			t.Fatalf("seed workspace path %q error = %v", relativePath, err)
+		}
+		if err := os.MkdirAll(filepath.Dir(targetPath), 0o755); err != nil {
+			t.Fatalf("os.MkdirAll(%q) error = %v", filepath.Dir(targetPath), err)
+		}
+		if err := os.WriteFile(targetPath, []byte(contents), 0o600); err != nil {
+			t.Fatalf("os.WriteFile(%q) error = %v", targetPath, err)
+		}
+	}
+
+	canonicalRoot, err := filepath.EvalSymlinks(root)
+	if err == nil {
+		return canonicalRoot
+	}
+	return root
+}
+
+func seedWorkspaceTargetPath(root string, relativePath string) (string, error) {
+	trimmedRoot := strings.TrimSpace(root)
+	if trimmedRoot == "" {
+		return "", fmt.Errorf("workspace root is required")
+	}
+	cleanedRoot := filepath.Clean(trimmedRoot)
+
+	targetPath := filepath.Clean(filepath.Join(cleanedRoot, relativePath))
+	relativeTarget, err := filepath.Rel(cleanedRoot, targetPath)
+	if err != nil {
+		return "", fmt.Errorf("rel workspace target %q: %w", targetPath, err)
+	}
+	if relativeTarget == "." {
+		return "", fmt.Errorf("workspace path %q must reference a file", relativePath)
+	}
+	if relativeTarget == ".." || strings.HasPrefix(relativeTarget, ".."+string(os.PathSeparator)) {
+		return "", fmt.Errorf("workspace path %q escapes root %q", relativePath, cleanedRoot)
+	}
+
+	return targetPath, nil
+}
+
+// WriteAgentDef persists one AGENT.md fixture under the supplied home.
+func WriteAgentDef(t testing.TB, homePaths compozyconfig.HomePaths, seed AgentSeed) {
+	t.Helper()
+
+	name := strings.TrimSpace(seed.Name)
+	if name == "" {
+		t.Fatal("agent seed name is required")
+	}
+
+	path := filepath.Join(homePaths.AgentsDir, name, "AGENT.md")
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		t.Fatalf("os.MkdirAll(%q) error = %v", filepath.Dir(path), err)
+	}
+
+	content, err := renderSeedAgentDef(seed)
+	if err != nil {
+		t.Fatalf("render seed agent def %q error = %v", name, err)
+	}
+
+	if err := os.WriteFile(path, []byte(content), 0o600); err != nil {
+		t.Fatalf("os.WriteFile(%q) error = %v", path, err)
+	}
+}
+
+type seedAgentDefFrontmatter struct {
+	Name         string                 `yaml:"name"`
+	Provider     string                 `yaml:"provider,omitempty"`
+	Command      string                 `yaml:"command,omitempty"`
+	Model        string                 `yaml:"model,omitempty"`
+	Permissions  string                 `yaml:"permissions,omitempty"`
+	Tools        []string               `yaml:"tools,omitempty"`
+	Toolsets     []string               `yaml:"toolsets,omitempty"`
+	DenyTools    []string               `yaml:"deny_tools,omitempty"`
+	CategoryPath []string               `yaml:"category_path,omitempty"`
+	MCPServers   []seedAgentMCPServerFM `yaml:"mcp_servers,omitempty"`
+}
+
+type seedAgentMCPServerFM struct {
+	Name      string            `yaml:"name"`
+	Command   string            `yaml:"command"`
+	Args      []string          `yaml:"args,omitempty"`
+	Env       map[string]string `yaml:"env,omitempty"`
+	SecretEnv map[string]string `yaml:"secret_env,omitempty"`
+}
+
+func renderSeedAgentDef(seed AgentSeed) (string, error) {
+	name := strings.TrimSpace(seed.Name)
+	if name == "" {
+		return "", fmt.Errorf("agent seed name is required")
+	}
+
+	metadata := seedAgentDefFrontmatter{
+		Name:         name,
+		Provider:     strings.TrimSpace(seed.Provider),
+		Command:      strings.TrimSpace(seed.Command),
+		Model:        strings.TrimSpace(seed.Model),
+		Permissions:  strings.TrimSpace(seed.Permissions),
+		Tools:        trimSeedValues(seed.Tools),
+		Toolsets:     trimSeedValues(seed.Toolsets),
+		DenyTools:    trimSeedValues(seed.DenyTools),
+		CategoryPath: trimSeedValues(seed.CategoryPath),
+		MCPServers:   make([]seedAgentMCPServerFM, 0, len(seed.MCPServers)),
+	}
+	for _, server := range seed.MCPServers {
+		metadata.MCPServers = append(metadata.MCPServers, seedAgentMCPServerFM{
+			Name:      strings.TrimSpace(server.Name),
+			Command:   strings.TrimSpace(server.Command),
+			Args:      append([]string(nil), server.Args...),
+			Env:       maps.Clone(server.Env),
+			SecretEnv: maps.Clone(server.SecretEnv),
+		})
+	}
+
+	frontmatterBytes, err := yaml.Marshal(metadata)
+	if err != nil {
+		return "", fmt.Errorf("marshal agent frontmatter: %w", err)
+	}
+
+	var builder strings.Builder
+	builder.WriteString("---\n")
+	builder.Write(frontmatterBytes)
+	builder.WriteString("---\n\n")
+	builder.WriteString(defaultString(seed.Prompt, "You are "+name+"."))
+	builder.WriteString("\n")
+	return builder.String(), nil
+}
+
+func trimSeedValues(values []string) []string {
+	if len(values) == 0 {
+		return nil
+	}
+
+	trimmed := make([]string, 0, len(values))
+	for _, value := range values {
+		trimmed = append(trimmed, strings.TrimSpace(value))
+	}
+	return trimmed
+}
+
+func shortSocketPath(t testing.TB) string {
+	t.Helper()
+
+	path := filepath.Join(
+		os.TempDir(),
+		fmt.Sprintf(
+			"compozy-e2e-%d-%d-%d.sock",
+			os.Getpid(),
+			time.Now().UTC().UnixNano(),
+			socketPathCounter.Add(1),
+		),
+	)
+	t.Cleanup(func() {
+		if err := os.Remove(path); err != nil && !errors.Is(err, os.ErrNotExist) {
+			t.Logf("remove socket %q error = %v", path, err)
+		}
+	})
+	return path
+}
+
+func cloneProviders(in map[string]compozyconfig.ProviderConfig) map[string]compozyconfig.ProviderConfig {
+	if len(in) == 0 {
+		return map[string]compozyconfig.ProviderConfig{}
+	}
+	out := make(map[string]compozyconfig.ProviderConfig, len(in))
+	maps.Copy(out, in)
+	return out
+}
+
+func defaultString(value string, fallback string) string {
+	trimmed := strings.TrimSpace(value)
+	if trimmed == "" {
+		return fallback
+	}
+	return trimmed
+}
+
+func sortStrings(values []string) {
+	slices.Sort(values)
+}

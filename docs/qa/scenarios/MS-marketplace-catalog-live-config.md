@@ -1,0 +1,44 @@
+---
+id: MS-marketplace-catalog-live-config
+area: MS
+title: Apply curated marketplace feed configuration live
+persona: Vera
+journey: J-extension-policy-admin
+expected: Valid marketplace.catalog base_url, ttl, and timeout values load and apply live from user config; profile and workspace overlays and scoped writes are rejected before persistence; invalid URLs or non-positive durations are rejected; a live user apply changes the source used by the next catalog refresh without restarting the daemon.
+entry_points: user config.toml; compozy config set marketplace.catalog.* --scope user; compozy__config_set scope=user; rejected profile and workspace config.toml/write attempts; marketplace.catalog.refresh event summaries; compozy.com/docs/configuration (config docs)
+qa_status: skipped
+bug_ids: BUG-20260715-marketplace-config-set-live; BUG-20260715-marketplace-native-config-policy; BUG-20260715-config-set-late-metadata
+fix_status: fixed
+retest_status: untested
+fix_commits: 8eeb8a38
+evidence: /Users/pedronauck/dev/qa-labs/compozy-marketplace-northstar-20260715-20260715-114240-757254-lab/qa-artifacts/qa/notes/marketplace-config-set-live.json; /Users/pedronauck/dev/qa-labs/compozy-marketplace-task11-final-20260715-20260716-011529-818379-lab/qa-artifacts/qa/notes/marketplace-config-reachability.json;/Users/pedronauck/dev/qa-labs/compozy-ms-wave2-current-20260730-061842-796290-lab/qa-artifacts/qa
+last_report: docs/qa/reports/2026-10-02-untested.md
+overlaps: MS-033; ET-marketplace-kill-switch
+---
+
+Marketplace catalog task02 (2026-09-13): HTTP(S) and file roots read only v3/extensions.json and v3/marketplaces.json. Missing or malformed v3 fails without root fallback, retaining last-good data as stale when available. Configured base_url stays unchanged. Apply a live source change and confirm these rules without restarting. Final tasks09/10 own the walk; earlier evidence below is historical.
+
+
+QA impact 2026-08-22: the public scope vocabulary hard-cut from `global` to `user`, and profile
+overlays add a second denied mutation path. Reset for the Task 13 denial and live-apply replay.
+
+The next settings-focused QA cycle should use two isolated local feed servers to prove that a live
+`base_url` change affects the next refresh, then submit invalid URL, zero TTL, and negative timeout
+values through the public configuration surfaces. Confirm the daemon preserves the prior active
+configuration after a failed apply and records refresh outcomes without exposing feed response data.
+
+2026-07-15 final retest: the public CLI and native tool preserve valid values after invalid URL and
+duration attempts. A live two-feed switch advanced the active generation, replaced two primary MCP
+rows with the single secondary row, then restored the primary feed without a restart. The replay
+also closed the slow-boot metadata path that previously reported local writes as applied without a
+daemon apply record.
+
+QA impact 2026-07-16: catalog config is now explicitly global-only. Add manual overlay, CLI, and
+native workspace rejection checks; historical global live-apply evidence remains relevant. Native
+global TTL/timeout set and unset must expose the settings apply record, advance the active generation
+on success, and return `applied=false`, `next_action=retry`, and reconciliation diagnostics when the
+runtime apply fails.
+
+2026-10-05: Deferred from this QA cycle by the user's explicit scope reduction.
+Coverage remains outstanding; this skip is not a passing result. Resume from the dated
+report's session matrix in a future QA cycle.

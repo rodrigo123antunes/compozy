@@ -1,0 +1,19 @@
+package workspace
+
+import "context"
+
+// Store persists and looks up registered workspaces.
+type Store interface {
+	SetWorkspaceArchived(ctx context.Context, id string, archived bool) (Workspace, error)
+	InsertWorkspace(ctx context.Context, ws Workspace) error
+	UpdateWorkspace(ctx context.Context, ws Workspace) error
+	DeleteWorkspace(ctx context.Context, id string) error
+	StageWorkspaceDeletion(ctx context.Context, id string) error
+	GetWorkspaceDeletionIntent(ctx context.Context, id string) (DeletionIntent, error)
+	ListWorkspaceDeletionIntents(ctx context.Context) ([]DeletionIntent, error)
+	CompleteWorkspaceDeletion(ctx context.Context, id string) error
+	GetWorkspace(ctx context.Context, id string) (Workspace, error)
+	GetWorkspaceByPath(ctx context.Context, rootDir string) (Workspace, error)
+	GetWorkspaceByName(ctx context.Context, name string) (Workspace, error)
+	ListWorkspaces(ctx context.Context) ([]Workspace, error)
+}

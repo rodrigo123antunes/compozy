@@ -1,0 +1,477 @@
+package acp
+
+import (
+	"context"
+	"crypto/sha256"
+	"encoding/json"
+	"errors"
+	"strings"
+	"sync"
+	"sync/atomic"
+
+	acpsdk "github.com/coder/acp-go-sdk"
+)
+
+type activePromptState struct {
+	steerMu               sync.Mutex
+	steerContext          context.Context
+	steerWG               sync.WaitGroup
+	finishing             bool
+	turnID                string
+	runID                 string
+	generation            int64
+	events                chan AgentEvent
+	ingest                *IngestGate
+	activity              chan struct{}
+	detached              chan struct{}
+	cancel                context.CancelFunc
+	cooperativeCancelSent atomic.Bool
+
+	sendMu sync.Mutex
+	closed bool
+
+	seenToolCalls        map[string]toolCallProjection
+	pendingToolResults   []AgentEvent
+	pendingToolResultIDs map[string]struct{}
+
+	usageMu sync.Mutex
+	usage   TokenUsage
+}
+
+type toolCallProjection struct {
+	parentToolCallID string
+	providerToolName string
+	status           string
+	title            string
+	name             string
+	kind             string
+	inputDigest      [sha256.Size]byte
+	hasInput         bool
+	prechecked       bool
+	hasResult        bool
+	syntheticResult  bool
+	// async records the provider's background-launch marker. It does not make an
+	// update visible on its own: it stamps the call's result (see sendEventLocked).
+	async bool
+}
+
+const maxPendingToolResults = 128
+
+func (p *AgentProcess) beginPrompt(
+	turnID string,
+	bufferSize int,
+	cancelFns ...context.CancelFunc,
+) (*activePromptState, error) {
+	return p.beginPromptState(turnID, "", 0, bufferSize, cancelFns...)
+}
+
+func (p *AgentProcess) beginPromptForRun(
+	turnID string,
+	runID string,
+	generation int64,
+	bufferSize int,
+	cancelFns ...context.CancelFunc,
+) (*activePromptState, error) {
+	runID = strings.TrimSpace(runID)
+	if runID == "" || generation <= 0 {
+		return nil, errors.New("acp: prompt run identity is incomplete")
+	}
+	return p.beginPromptState(turnID, runID, generation, bufferSize, cancelFns...)
+}
+
+func (p *AgentProcess) beginPromptState(
+	turnID string,
+	runID string,
+	generation int64,
+	bufferSize int,
+	cancelFns ...context.CancelFunc,
+) (*activePromptState, error) {
+	p.promptMu.Lock()
+	defer p.promptMu.Unlock()
+	if p.triagePolicyErr != nil {
+		return nil, p.triagePolicyErr
+	}
+	if p.activePrompt != nil {
+		return nil, errors.New("acp: prompt already in progress")
+	}
+	if bufferSize <= 0 {
+		bufferSize = 1
+	}
+	var cancel context.CancelFunc
+	if len(cancelFns) > 0 {
+		cancel = cancelFns[0]
+	}
+	active := &activePromptState{
+		turnID:               turnID,
+		runID:                runID,
+		generation:           generation,
+		events:               make(chan AgentEvent, bufferSize),
+		ingest:               NewIngestGate(defaultIngestCapacity, defaultIngestMaxBytes),
+		activity:             make(chan struct{}, 1),
+		detached:             make(chan struct{}),
+		cancel:               cancel,
+		seenToolCalls:        make(map[string]toolCallProjection),
+		pendingToolResultIDs: make(map[string]struct{}),
+	}
+	p.activePrompt = active
+	go p.forwardIngestEvents(active)
+	return active, nil
+}
+
+func (p *AgentProcess) endPrompt(active *activePromptState) {
+	if active == nil {
+		return
+	}
+
+	detached := false
+	p.promptMu.Lock()
+	if p.activePrompt == active {
+		p.activePrompt = nil
+		detached = true
+	}
+	p.promptMu.Unlock()
+	if detached {
+		close(active.detached)
+	}
+
+	active.sendMu.Lock()
+	defer active.sendMu.Unlock()
+	if !active.closed {
+		active.closed = true
+		active.ingest.Close(nil)
+	}
+}
+
+func (p *AgentProcess) currentPrompt() *activePromptState {
+	p.promptMu.RLock()
+	defer p.promptMu.RUnlock()
+	return p.activePrompt
+}
+
+func (p *AgentProcess) cancelCurrentPrompt() bool {
+	p.promptMu.RLock()
+	active := p.activePrompt
+	p.promptMu.RUnlock()
+	if active == nil || active.cancel == nil {
+		return false
+	}
+	active.cancel()
+	return true
+}
+
+func (p *AgentProcess) nextPromptText(message string, maintenance bool) (string, bool, SystemPromptDeliveryMode) {
+	if maintenance {
+		return message, false, ""
+	}
+	userMessage := strings.TrimSpace(message)
+
+	p.systemPromptMu.Lock()
+	defer p.systemPromptMu.Unlock()
+
+	systemPrompt := strings.TrimSpace(p.systemPrompt)
+	if p.systemPromptSent || systemPrompt == "" {
+		return userMessage, false, ""
+	}
+
+	delivery := p.systemPromptDelivery
+	if delivery == "" {
+		delivery = SystemPromptDeliveryFirstTurnPrefix
+	}
+	if delivery == SystemPromptDeliveryNative {
+		return userMessage, true, delivery
+	}
+	return strings.TrimSpace(
+		"Session instructions (treat as system guidance for this conversation):\n\n" +
+			systemPrompt +
+			"\n\nUser request:\n\n" +
+			userMessage,
+	), true, delivery
+}
+
+// ReplacePendingStartupPrompt swaps startup guidance that has not reached the provider:
+// it applies only to first-turn-prefix delivery before the first prompt is sent.
+func (p *AgentProcess) ReplacePendingStartupPrompt(prompt string, manifest StartupManifest) bool {
+	if p == nil {
+		return false
+	}
+	p.systemPromptMu.Lock()
+	defer p.systemPromptMu.Unlock()
+	if p.systemPromptSent || p.systemPromptDelivery == SystemPromptDeliveryNative ||
+		strings.TrimSpace(prompt) == "" {
+		return false
+	}
+	p.systemPrompt = prompt
+	p.startupManifest = CloneStartupManifest(manifest)
+	return true
+}
+
+func (p *AgentProcess) markSystemPromptSent() {
+	p.systemPromptMu.Lock()
+	defer p.systemPromptMu.Unlock()
+	p.systemPromptSent = true
+}
+
+func (p *AgentProcess) emitPromptEvent(event AgentEvent) {
+	p.promptMu.RLock()
+	active := p.activePrompt
+	p.promptMu.RUnlock()
+	if active == nil {
+		return
+	}
+
+	active.sendMu.Lock()
+	defer active.sendMu.Unlock()
+	if active.closed {
+		return
+	}
+	if active.deferToolResultLocked(event) {
+		return
+	}
+	if active.shouldSuppressToolCallLocked(event) {
+		return
+	}
+	if event.Type == EventTypeDone {
+		active.flushDeferredToolResultsLocked()
+	}
+	active.sendEventLocked(event)
+	if event.Type == EventTypeToolCall {
+		active.flushDeferredToolResultsForToolLocked(event.ToolCallID)
+		projection := active.seenToolCalls[strings.TrimSpace(event.ToolCallID)]
+		status := event.ToolStatus()
+		if !projection.hasResult &&
+			(status == string(acpsdk.ToolCallStatusCompleted) || status == string(acpsdk.ToolCallStatusFailed)) {
+			projection.syntheticResult = true
+			active.seenToolCalls[strings.TrimSpace(event.ToolCallID)] = projection
+			event.Type = EventTypeToolResult
+			active.sendEventLocked(event)
+		}
+	}
+}
+
+func (a *activePromptState) deferToolResultLocked(event AgentEvent) bool {
+	if a == nil || event.Type != EventTypeToolResult {
+		return false
+	}
+	toolCallID := strings.TrimSpace(event.ToolCallID)
+	if toolCallID == "" {
+		return false
+	}
+	if _, ok := a.seenToolCalls[toolCallID]; ok {
+		return false
+	}
+	if _, ok := a.pendingToolResultIDs[toolCallID]; ok {
+		return true
+	}
+	if len(a.pendingToolResults) >= maxPendingToolResults {
+		a.flushDeferredToolResultsLocked()
+		a.failIngest(ErrIngestSaturated)
+		return true
+	}
+	a.pendingToolResults = append(a.pendingToolResults, event)
+	a.pendingToolResultIDs[toolCallID] = struct{}{}
+	return true
+}
+
+func (a *activePromptState) shouldSuppressToolCallLocked(event AgentEvent) bool {
+	if a == nil || event.Type != EventTypeToolCall {
+		return false
+	}
+	toolCallID := strings.TrimSpace(event.ToolCallID)
+	if toolCallID == "" {
+		return false
+	}
+
+	projection := newToolCallProjection(event)
+	current, ok := a.seenToolCalls[toolCallID]
+	if !ok {
+		a.seenToolCalls[toolCallID] = projection
+		return false
+	}
+
+	merged, changed := current.merge(projection)
+	a.seenToolCalls[toolCallID] = merged
+	return !changed
+}
+
+func newToolCallProjection(event AgentEvent) toolCallProjection {
+	projection := toolCallProjection{
+		parentToolCallID: event.ParentToolCallID(),
+		providerToolName: event.ProviderToolName(),
+		status:           event.ToolStatus(),
+		title:            strings.TrimSpace(event.Title),
+		name:             strings.TrimSpace(event.ToolName()),
+		kind:             strings.TrimSpace(event.ToolKind()),
+		prechecked:       event.ToolPrechecked(),
+		async:            event.ProviderToolAsync(),
+	}
+	input := event.ToolInput()
+	if len(input) > 0 {
+		projection.inputDigest = sha256.Sum256(input)
+		projection.hasInput = true
+	}
+	return projection
+}
+
+func (p toolCallProjection) merge(next toolCallProjection) (toolCallProjection, bool) {
+	changed := false
+	if next.parentToolCallID != "" && next.parentToolCallID != p.parentToolCallID {
+		p.parentToolCallID = next.parentToolCallID
+		changed = true
+	}
+	if next.providerToolName != "" && next.providerToolName != p.providerToolName {
+		p.providerToolName = next.providerToolName
+		changed = true
+	}
+	if next.status != "" && next.status != p.status {
+		p.status = next.status
+		changed = true
+	}
+	if next.title != "" && next.title != p.title {
+		p.title = next.title
+		changed = true
+	}
+	if next.name != "" && next.name != p.name {
+		p.name = next.name
+		changed = true
+	}
+	if next.kind != "" && next.kind != p.kind {
+		p.kind = next.kind
+		changed = true
+	}
+	if next.hasInput && (!p.hasInput || next.inputDigest != p.inputDigest) {
+		p.inputDigest = next.inputDigest
+		p.hasInput = true
+		changed = true
+	}
+	if next.prechecked && !p.prechecked {
+		p.prechecked = true
+		changed = true
+	}
+	p.async = p.async || next.async
+	return p, changed
+}
+
+func (a *activePromptState) flushDeferredToolResultsForToolLocked(toolCallID string) {
+	if a == nil {
+		return
+	}
+	trimmed := strings.TrimSpace(toolCallID)
+	if trimmed == "" || len(a.pendingToolResults) == 0 {
+		return
+	}
+
+	remaining := a.pendingToolResults[:0]
+	remainingIDs := make(map[string]struct{}, len(a.pendingToolResultIDs))
+	for _, event := range a.pendingToolResults {
+		eventToolCallID := strings.TrimSpace(event.ToolCallID)
+		if eventToolCallID == trimmed {
+			a.sendEventLocked(event)
+			continue
+		}
+		remaining = append(remaining, event)
+		if eventToolCallID != "" {
+			remainingIDs[eventToolCallID] = struct{}{}
+		}
+	}
+	a.pendingToolResults = remaining
+	a.pendingToolResultIDs = remainingIDs
+}
+
+func (a *activePromptState) flushDeferredToolResultsLocked() {
+	if a == nil || len(a.pendingToolResults) == 0 {
+		return
+	}
+	pending := a.pendingToolResults
+	a.pendingToolResults = nil
+	a.pendingToolResultIDs = make(map[string]struct{})
+	for _, event := range pending {
+		a.sendEventLocked(event)
+	}
+}
+
+func (a *activePromptState) sendEventLocked(event AgentEvent) {
+	if a == nil {
+		return
+	}
+	event = a.stampAsyncToolResultLocked(event)
+	if event.Type == EventTypeToolResult {
+		projection := a.seenToolCalls[strings.TrimSpace(event.ToolCallID)]
+		if projection.syntheticResult && projection.hasResult {
+			if !toolResultHasOutput(event) {
+				return
+			}
+			event = event.WithToolResultUpdate()
+		}
+	}
+	if err := a.ingest.Admit(event); err != nil {
+		a.failIngest(err)
+		return
+	}
+	if event.Type == EventTypeToolResult {
+		id := strings.TrimSpace(event.ToolCallID)
+		projection := a.seenToolCalls[id]
+		projection.hasResult = true
+		a.seenToolCalls[id] = projection
+	}
+	select {
+	case a.activity <- struct{}{}:
+	default:
+	}
+}
+
+func toolResultHasOutput(event AgentEvent) bool {
+	const jsonNull = "null"
+	if event.Text != "" || event.Error != "" {
+		return true
+	}
+	var raw struct {
+		Output  json.RawMessage `json:"rawOutput"`
+		Content json.RawMessage `json:"content"`
+	}
+	if json.Unmarshal(event.Raw, &raw) != nil {
+		return false
+	}
+	output := strings.TrimSpace(string(raw.Output))
+	content := strings.TrimSpace(string(raw.Content))
+	return (output != "" && output != jsonNull) || (content != "" && content != jsonNull && content != "[]")
+}
+
+// stampAsyncToolResultLocked carries a background-launch marker that arrived on
+// an earlier update of the call (claude-agent-acp sends it from PostToolUse,
+// before the result) onto the result, so the persisted result says it is a
+// launch receipt rather than the work's outcome.
+func (a *activePromptState) stampAsyncToolResultLocked(event AgentEvent) AgentEvent {
+	if event.Type != EventTypeToolResult || event.ProviderToolAsync() {
+		return event
+	}
+	if projection, ok := a.seenToolCalls[strings.TrimSpace(event.ToolCallID)]; ok && projection.async {
+		return event.WithProviderToolAsync()
+	}
+	return event
+}
+
+func (p *AgentProcess) invalidatePromptOccupancy() {
+	active := p.currentPrompt()
+	if active == nil {
+		return
+	}
+	active.usageMu.Lock()
+	defer active.usageMu.Unlock()
+	active.usage.ContextUsed = nil
+	active.usage.ContextSize = nil
+}
+
+func (p *AgentProcess) mergePromptUsage(update TokenUsage) TokenUsage {
+	active := p.currentPrompt()
+	if active == nil {
+		return update
+	}
+	active.usageMu.Lock()
+	defer active.usageMu.Unlock()
+	if active.usage.IsZero() {
+		active.usage = update
+		return active.usage
+	}
+	active.usage = active.usage.Merge(update)
+	return active.usage
+}

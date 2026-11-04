@@ -1,0 +1,70 @@
+import { cva } from "class-variance-authority";
+
+const pillVariants = cva(
+  "inline-flex w-fit shrink-0 items-center justify-center gap-1.5 whitespace-nowrap rounded-pill transition-colors duration-base ease-out focus-visible:outline-none focus-visible:shadow-focus-ring disabled:cursor-not-allowed disabled:opacity-50 [&>svg]:pointer-events-none [&>svg]:size-3",
+  {
+    variants: {
+      tone: {
+        neutral: "bg-neutral-tint text-neutral-ink",
+        brand: "bg-brand-tint text-brand",
+        success: "bg-success-tint text-success",
+        warning: "bg-warning-tint text-warning",
+        destructive: "bg-destructive-tint text-destructive",
+        info: "bg-info-tint text-info",
+      },
+      size: {
+        xs: "h-pill-xs px-1.5 leading-none",
+        sm: "h-pill-sm px-2 leading-none",
+        md: "h-pill-md px-2.5 leading-none",
+        count: "h-3.75 min-w-3.75 gap-0 px-1 leading-none tabular-nums",
+      },
+      mono: {
+        true: "font-mono",
+        false: "font-sans",
+      },
+      solid: { true: "", false: "" },
+      form: {
+        tint: "",
+        hollow: "",
+        plain: "",
+      },
+      active: { true: "", false: "" },
+    },
+    compoundVariants: [
+      { mono: true, size: "xs", className: "text-mono-id font-semibold tracking-mono-id" },
+      { mono: true, size: "sm", className: "text-mono-id font-semibold tracking-mono-id" },
+      { mono: true, size: "md", className: "text-mono-id font-semibold tracking-mono-id" },
+      { mono: false, size: "xs", className: "text-eyebrow font-medium tracking-eyebrow" },
+      { mono: false, size: "sm", className: "text-eyebrow font-medium tracking-eyebrow" },
+      { mono: false, size: "md", className: "text-eyebrow font-medium tracking-eyebrow" },
+      { size: "count", className: "text-count font-semibold" },
+      { solid: true, tone: "neutral", className: "bg-muted-foreground text-canvas" },
+      { solid: true, tone: "brand", className: "bg-brand text-brand-ink" },
+      { solid: true, tone: "success", className: "bg-success text-canvas" },
+      { solid: true, tone: "warning", className: "bg-warning text-canvas" },
+      { solid: true, tone: "destructive", className: "bg-destructive text-canvas" },
+      { solid: true, tone: "info", className: "bg-info text-canvas" },
+      {
+        active: true,
+        className: "bg-surface-2 text-fg",
+      },
+      {
+        form: "hollow",
+        className: "bg-transparent text-subtle shadow-inset-strong",
+      },
+      {
+        form: "plain",
+        className: "h-auto bg-transparent px-0 text-muted-foreground",
+      },
+    ],
+    defaultVariants: {
+      tone: "neutral",
+      size: "sm",
+      mono: false,
+      solid: false,
+      form: "tint",
+    },
+  }
+);
+
+export { pillVariants };

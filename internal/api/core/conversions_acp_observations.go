@@ -1,0 +1,106 @@
+package core
+
+import (
+	"strings"
+
+	"github.com/compozy/compozy/internal/acp"
+	"github.com/compozy/compozy/internal/api/contract"
+	"github.com/compozy/compozy/internal/store"
+	"github.com/compozy/compozy/internal/transcript"
+)
+
+func availableCommandPayloads(commands []store.SessionAdvertisedCommand) []contract.ACPAvailableCommandPayload {
+	payloads := make([]contract.ACPAvailableCommandPayload, 0, len(commands))
+	for _, command := range commands {
+		payload := contract.ACPAvailableCommandPayload{
+			Name: strings.TrimSpace(command.Name), Description: strings.TrimSpace(command.Description),
+		}
+		if command.Input != nil {
+			payload.Input = &contract.ACPAvailableCommandInputPayload{Hint: strings.TrimSpace(command.Input.Hint)}
+		}
+		payloads = append(payloads, payload)
+	}
+	return payloads
+}
+
+// AgentEventPayloadFromEvent converts an agent event into the shared raw-stream payload.
+func AgentEventPayloadFromEvent(event acp.AgentEvent) contract.AgentEventPayload {
+	return contract.AgentEventPayload{
+		Type:              event.Type,
+		SessionID:         event.SessionID,
+		TurnID:            event.TurnID,
+		MessageID:         event.MessageIDValue(),
+		RequestID:         event.RequestIDValue(),
+		Timestamp:         event.Timestamp,
+		Text:              event.Text,
+		Title:             event.Title,
+		ToolCallID:        event.ToolCallID,
+		StopReason:        event.StopReason,
+		PromptStopReason:  contract.ACPPromptStopReason(event.PromptStopReason),
+		AvailableCommands: availableCommandPayloads(event.AvailableCommandSet().Values()),
+		Action:            event.Action,
+		Resource:          event.Resource,
+		Decision:          event.Decision,
+		Error:             event.Error,
+		Failure:           SessionFailurePayloadFromStore(event.Failure),
+		Usage:             TokenUsagePayloadFromUsage(event.Usage),
+		Compaction:        compactionSnapshotPayload(event.Compaction),
+		Delivery:          transcript.RedactAgentEvent(event).DeliveryManifest(),
+		ProviderError:     providerErrorDiagnosticPayload(event.ProviderError),
+		Origin:            promptOriginPayload(event.PromptOrigin()),
+		Goal: goalPromptMetaPayload(
+			event.GoalPromptMeta(),
+		),
+		Runtime:       runtimeActivityPayloadFromEvent(event.Runtime),
+		PromptRuntime: runtimeSelectionPayloadFromACP(event.PromptRuntimeSnapshot()),
+		Raw:           payloadJSONBytes(event.Raw),
+	}
+}
+
+func compactionSnapshotPayload(observation *acp.CompactionObservation) *contract.CompactionSnapshotPayload {
+	redacted := transcript.RedactAgentEvent(acp.AgentEvent{Compaction: observation}).Compaction
+	if redacted == nil {
+		return nil
+	}
+	return &contract.CompactionSnapshotPayload{
+		CompactionID: redacted.CompactionID, Status: redacted.Status,
+		Summary: redacted.Summary, Error: redacted.Error,
+	}
+}
+
+func runtimeSelectionPayloadFromACP(runtime *acp.PromptRuntime) *contract.RuntimeSelectionPayload {
+	if runtime == nil {
+		return nil
+	}
+	return &contract.RuntimeSelectionPayload{
+		Provider:        runtime.Provider,
+		Model:           runtime.Model,
+		ReasoningEffort: contract.ReasoningEffort(runtime.ReasoningEffort),
+		Speed:           runtime.Speed,
+		ACPOptions:      contract.ACPOptionSelectionPayloadsFromACP(runtime.ACPOptions),
+	}
+}
+
+func goalPromptMetaPayload(meta *acp.GoalPromptMeta) *contract.GoalPromptMeta {
+	normalized := acp.CloneGoalPromptMeta(meta)
+	if normalized == nil {
+		return nil
+	}
+	return &contract.GoalPromptMeta{
+		Kind:          contract.GoalPromptKind(normalized.Kind),
+		RunID:         normalized.RunID,
+		NodeID:        normalized.NodeID,
+		Generation:    normalized.Generation,
+		ItemIndex:     normalized.ItemIndex,
+		Turn:          normalized.Turn,
+		PromptAttempt: normalized.PromptAttempt,
+		PromptID:      normalized.PromptID,
+	}
+}
+
+func providerErrorDiagnosticPayload(diagnostic *acp.ProviderErrorDiagnostic) *acp.ProviderErrorDiagnostic {
+	if diagnostic == nil {
+		return nil
+	}
+	return transcript.RedactAgentEvent(acp.AgentEvent{ProviderError: diagnostic}).ProviderError
+}

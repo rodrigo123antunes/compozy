@@ -1,0 +1,141 @@
+package extensionpkg
+
+import (
+	"context"
+
+	"errors"
+
+	"strings"
+
+	"github.com/compozy/compozy/internal/acp"
+
+	"github.com/compozy/compozy/internal/session"
+	"github.com/compozy/compozy/internal/store"
+)
+
+type hostAPIPromptSubmission struct {
+	TurnID    string
+	Admission session.SendPromptResult
+}
+
+type hostAPIPromptRequest struct {
+	Message        string
+	MessageID      string
+	IdempotencyKey string
+	Mode           session.BusyInputMode
+	ExpectedTurnID string
+	Runtime        *session.RuntimeSelection
+}
+
+func (h *HostAPIHandler) submitPrompt(
+	ctx context.Context,
+	sessionID string,
+	request hostAPIPromptRequest,
+) (hostAPIPromptSubmission, error) {
+	if h.sessions == nil {
+		return hostAPIPromptSubmission{}, errors.New("extension: session manager is not configured")
+	}
+
+	lastSequence, err := h.latestSessionSequence(ctx, sessionID)
+	if err != nil {
+		return hostAPIPromptSubmission{}, err
+	}
+
+	promptCtx := context.WithoutCancel(ctx)
+	admission, err := h.submitRuntimePrompt(
+		promptCtx,
+		sessionID,
+		request,
+	)
+	if err != nil {
+		return hostAPIPromptSubmission{}, err
+	}
+	if admission.Events == nil {
+		return hostAPIPromptSubmission{Admission: admission}, nil
+	}
+	drainAgentEvents(admission.Events)
+
+	events, err := h.sessions.Events(ctx, sessionID, store.EventQuery{
+		AfterSequence: lastSequence,
+	})
+	if err != nil {
+		return hostAPIPromptSubmission{}, err
+	}
+
+	submission, err := promptSubmissionFromStoredEvents(events)
+	if err != nil {
+		return hostAPIPromptSubmission{}, err
+	}
+	submission.Admission = admission
+	return submission, nil
+}
+
+func (h *HostAPIHandler) submitRuntimePrompt(
+	ctx context.Context,
+	sessionID string,
+	request hostAPIPromptRequest,
+) (session.SendPromptResult, error) {
+	prompter, ok := h.sessions.(hostAPIRuntimePromptSessionManager)
+	if !ok {
+		return session.SendPromptResult{}, errors.New(
+			"extension: session manager does not support prompt runtime selection",
+		)
+	}
+	result, err := prompter.SendPrompt(ctx, sessionID, session.SendPromptOpts{
+		Message:        request.Message,
+		MessageID:      request.MessageID,
+		IdempotencyKey: request.IdempotencyKey,
+		Mode:           request.Mode,
+		ExpectedTurnID: request.ExpectedTurnID,
+		Runtime:        request.Runtime,
+	})
+	if err != nil {
+		return session.SendPromptResult{}, err
+	}
+	return result, nil
+}
+
+func promptSubmissionFromStoredEvents(events []store.SessionEvent) (hostAPIPromptSubmission, error) {
+	turnID := promptTurnIDFromStoredEvents(events)
+	if turnID == "" {
+		return hostAPIPromptSubmission{}, errors.New("extension: prompt turn id not found after prompt submission")
+	}
+
+	return hostAPIPromptSubmission{
+		TurnID: turnID,
+	}, nil
+}
+
+func promptTurnIDFromStoredEvents(events []store.SessionEvent) string {
+	for _, event := range events {
+		if !isPromptInitiatingStoredEventType(event.Type) {
+			continue
+		}
+		turnID := strings.TrimSpace(event.TurnID)
+		if turnID == "" {
+			continue
+		}
+		return turnID
+	}
+	return ""
+}
+
+func isPromptInitiatingStoredEventType(eventType string) bool {
+	switch strings.TrimSpace(eventType) {
+	case acp.EventTypeUserMessage, acp.EventTypeSyntheticReentry:
+		return true
+	default:
+		return false
+	}
+}
+
+func (h *HostAPIHandler) latestSessionSequence(ctx context.Context, sessionID string) (int64, error) {
+	events, err := h.sessions.Events(ctx, sessionID, store.EventQuery{Limit: 1})
+	if err != nil {
+		return 0, err
+	}
+	if len(events) == 0 {
+		return 0, nil
+	}
+	return events[len(events)-1].Sequence, nil
+}

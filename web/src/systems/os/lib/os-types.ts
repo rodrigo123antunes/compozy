@@ -1,0 +1,271 @@
+import type {
+  DesktopId,
+  DropPlacement,
+  FocusDirection,
+  GroupId,
+  LayoutAxis,
+  LayoutDesktop,
+  LayoutNodeId,
+  LayoutProjection,
+  LayoutRevision,
+  NormalizedRect,
+  WindowPlacement,
+  WindowManagerClientView,
+  WindowManagerRegisteredClientView,
+  WindowManagerConfig,
+  WindowManagerConnectionStatus,
+  WindowManagerSnapshot,
+} from "./window-manager-types";
+import type { GroupFrameEditInput } from "./frame-seams";
+import type { OsWindowFrameModel } from "./group-projection";
+import type { SnapCorner, SnapSide, SnapTarget } from "./snap-targets";
+
+/** The app surfaces rendered inside daemon-managed logical windows. */
+export type OsAppId =
+  | "dashboard"
+  | "new-tab"
+  | "session"
+  | "terminal"
+  | "tasks"
+  | "agents"
+  | "loops"
+  | "automations"
+  | "marketplace"
+  | "vault"
+  | "usage"
+  | "settings";
+
+export interface OsRect {
+  x: number;
+  y: number;
+  w: number;
+  h: number;
+}
+
+export interface OsWindowRoute {
+  pathname: string;
+  search: Record<string, unknown>;
+}
+
+/** What an app's loading fallback is told about the window it stands in for. */
+export interface OsWindowFallbackProps {
+  /** The route the window is about to render. */
+  route: OsWindowRoute;
+  /**
+   * The window reads every project's data: unbound, on the All projects desktop. Apps that list
+   * one project's items there and everything's here read it to pick the shape they load into.
+   */
+  aggregate: boolean;
+}
+
+/** Client projection of one authoritative daemon window. */
+export interface OsWindow {
+  id: string;
+  app: OsAppId;
+  instanceKey: string | null;
+  route: OsWindowRoute;
+  /** Durable navigation ancestors, oldest first; `route` stays the leaf (ADR-011). */
+  navStack: readonly OsWindowRoute[];
+  pinned: boolean;
+  desktopId: DesktopId;
+  placement: WindowPlacement;
+  rect: OsRect;
+  layer: number;
+  minimized: boolean;
+  zoomed: boolean;
+  groupId: GroupId | null;
+  nodeId: LayoutNodeId | null;
+  stackId: LayoutNodeId | null;
+  stackActive: boolean;
+  parentAxis: LayoutAxis | null;
+}
+
+export type OsWallpaper = "flat" | "ember" | "mesh" | "carbon";
+export type OsPresentation = "floating" | "compact";
+export type OsViewportState = "ready" | "rejected";
+export type OsHydration = "pending" | "live" | "degraded";
+export type OsArrangePreset = "two-up" | "grid" | "main-stack" | "columns";
+
+export interface OsOpenTarget {
+  app: OsAppId;
+  instanceKey?: string;
+  route?: OsWindowRoute;
+  /** Join this window's frame as a tab instead of opening standalone (ADR-005). */
+  stackTargetWindowId?: string;
+  /** Skip focus-first resolution and always create another instance (ADR-002). */
+  forceNewInstance?: boolean;
+  /**
+   * Explicit placement for a window this open creates. Omitted follows the
+   * daemon's new-window policy (a tab in the focused window by default):
+   * `split` tiles beside the focused window, `floating` opens a free window.
+   */
+  placement?: "split" | "floating";
+  /** Open onto this desktop instead of the client's active one. */
+  desktopId?: string;
+  /** Classified navigation intent when the target resolves to a live window (ADR-011). */
+  navigateMode?: OsNavigateMode;
+}
+
+/** Navigation intent, classified where it is known rather than inferred (ADR-011). */
+export type OsNavigateMode = "replace" | "push" | "pop";
+
+/** `window.close` breadth; the frame's traffic light closes the whole group. */
+export type OsCloseScope = "tab" | "group" | "others" | "right";
+
+export interface OsDesktopBounds {
+  /** Full shell width, before dock tracks consume the work area. */
+  viewportWidth?: number;
+  width: number;
+  height: number;
+  /** Viewport offset of the win-layer origin; converts client to layer coordinates. */
+  origin: { x: number; y: number };
+}
+
+/** Pointer context for a floating drop, in layer coordinates. */
+export interface OsFloatingDrop {
+  pointer: { x: number; y: number };
+  grabOffset: { x: number; y: number };
+}
+
+/**
+ * Proof a pointer release carries when the layout moved during the gesture: the
+ * daemon applies the command only while the dragged unit still sits where the
+ * gesture started (US-019).
+ */
+export interface GestureRebase {
+  expectedRevision: LayoutRevision;
+  sourceNodeId: LayoutNodeId | null;
+}
+
+export interface MoveWindowInput {
+  destinationDesktopId: DesktopId;
+  targetWindowId?: string;
+  placement: DropPlacement;
+  floatingRect?: OsRect;
+  moveGroup?: boolean;
+}
+
+export interface WindowManagerCommandOutcome {
+  accepted: boolean;
+  /** Total completion: diagnosed runtime failures resolve false instead of rejecting. */
+  completion: Promise<boolean>;
+}
+
+export interface WindowManagerOpenOutcome extends WindowManagerCommandOutcome {
+  windowId: string;
+}
+
+/**
+ * Selector surface derived from Query snapshots plus client-local presentation.
+ * It is never persisted and never owns a revision.
+ */
+export interface OsDesktopRuntimeStore {
+  snapshot: WindowManagerSnapshot | null;
+  windowManagerConfig: WindowManagerConfig | null;
+  client: WindowManagerClientView | null;
+  /** Registration proof retained locally; never projected by daemon streams. */
+  clientAttachmentToken: string | null;
+  desktops: readonly LayoutDesktop[];
+  projections: Readonly<Record<DesktopId, LayoutProjection>>;
+  frames: Readonly<Record<DesktopId, readonly OsWindowFrameModel[]>>;
+  windows: Readonly<Record<string, OsWindow>>;
+  activeDesktopId: DesktopId | null;
+  focusedId: string | null;
+  wallpaper: OsWallpaper;
+  reduceMotion: boolean;
+  presentation: OsPresentation;
+  viewportState: OsViewportState;
+  hydration: OsHydration;
+  loadError: Error | null;
+  connectionStatus: WindowManagerConnectionStatus;
+  desktopBounds: OsDesktopBounds | null;
+}
+
+export interface OsDesktopRuntime {
+  getState(): OsDesktopRuntimeStore;
+  getInitialState(): OsDesktopRuntimeStore;
+  subscribe(
+    listener: (state: OsDesktopRuntimeStore, previous: OsDesktopRuntimeStore) => void
+  ): () => void;
+}
+
+export interface WindowManagerController extends OsDesktopRuntime {
+  bind(binding: { workspaceId: string; clientId: string }): void;
+  unbind(): void;
+  setClient(client: WindowManagerClientView | WindowManagerRegisteredClientView | null): void;
+  setConnectionStatus(status: WindowManagerConnectionStatus): void;
+  setLoadError(error: Error | null): void;
+  openOrFocus(target: OsOpenTarget): WindowManagerOpenOutcome;
+  closeWindow(id: string, viewOnly?: boolean): Promise<boolean>;
+  focusWindow(id: string): WindowManagerCommandOutcome;
+  minimizeWindow(id: string): Promise<boolean>;
+  restoreWindow(id: string): WindowManagerCommandOutcome;
+  zoomWindow(id: string, rebase?: GestureRebase): WindowManagerCommandOutcome;
+  toggleFloating(id: string, floatingRect?: OsRect): WindowManagerCommandOutcome;
+  moveWindow(id: string, input: MoveWindowInput): WindowManagerCommandOutcome;
+  arrangeLayout(anchorId: string, preset: OsArrangePreset): void;
+  commitFloatingRect(
+    id: string,
+    rect: OsRect,
+    drop?: OsFloatingDrop,
+    moveGroup?: boolean,
+    rebase?: GestureRebase
+  ): WindowManagerCommandOutcome;
+  resizeLayout(splitId: string, boundaryIndex: number, delta: number): WindowManagerCommandOutcome;
+  resizeWindowFrame(windowId: string, frame: NormalizedRect): WindowManagerCommandOutcome;
+  resizeGroupFrames(
+    desktopId: string,
+    edits: readonly GroupFrameEditInput[]
+  ): WindowManagerCommandOutcome;
+  balanceLayout(groupId?: string, splitId?: string): void;
+  navigateWindow(
+    id: string,
+    route: OsWindowRoute,
+    mode?: OsNavigateMode
+  ): WindowManagerCommandOutcome;
+  retargetWindow(
+    id: string,
+    instanceKey: string,
+    route: OsWindowRoute
+  ): WindowManagerCommandOutcome;
+  popWindowRoute(id: string, expectedRoute?: OsWindowRoute): WindowManagerCommandOutcome;
+  groupWindows(
+    targetWindowId: string,
+    windowIds: readonly string[],
+    insertIndex?: number
+  ): WindowManagerCommandOutcome;
+  reorderStackMember(windowId: string, index: number): WindowManagerCommandOutcome;
+  activateStackMember(windowId: string): WindowManagerCommandOutcome;
+  pinWindow(windowId: string, pinned: boolean): WindowManagerCommandOutcome;
+  reopenWindow(): WindowManagerCommandOutcome;
+  closeWindowScoped(windowId: string, scope: OsCloseScope): Promise<boolean>;
+  setWallpaper(wallpaper: OsWallpaper): void;
+  setReduceMotion(on: boolean): void;
+  setDesktopBounds(bounds: OsDesktopBounds): void;
+  /** Creates a desktop; callers that act on it next pass their own ID. */
+  createDesktop(desktopId?: string): WindowManagerCommandOutcome;
+  renameDesktop(desktopId: string, name: string): void;
+  reorderDesktop(desktopId: string, order: number): void;
+  switchDesktop(desktopId: string): void;
+  switchDesktopDirection(direction: "previous" | "next"): void;
+  deleteDesktop(desktopId: string, destinationId: string | null): void;
+  moveWindowToDesktop(windowId: string, destinationDesktopId: string): void;
+  tileWindow(windowId: string, edge: SnapSide | SnapCorner): void;
+  applySnapTarget(
+    windowId: string,
+    target: SnapTarget,
+    moveGroup?: boolean,
+    rebase?: GestureRebase
+  ): WindowManagerCommandOutcome;
+  focusDirection(direction: FocusDirection): void;
+  undoLayout(): void;
+  redoLayout(): void;
+  balanceFocusedLayout(): void;
+  clearConflict(): void;
+  refreshSnapshot(): Promise<boolean>;
+}
+
+export const OS_COMPACT_BREAKPOINT = 960;
+/** Per-pane floor (shell-rail VC-03): seams and free edges stop at 220px on either axis. */
+export const OS_WINDOW_MIN_WIDTH = 220;
+export const OS_WINDOW_MIN_HEIGHT = 220;

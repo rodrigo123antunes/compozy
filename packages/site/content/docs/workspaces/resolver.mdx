@@ -1,0 +1,336 @@
+---
+title: Workspace Resolver
+description: How CompozyOS registers workspace roots, resolves the active workspace, and discovers project-local runtime resources.
+---
+
+A workspace is a registered project root with a stable identity. CompozyOS stores the registration in
+the global database, but the filesystem remains the source of truth. Each session starts by
+resolving a workspace snapshot: the canonical root directory, optional additional roots, the
+durable `workspace_id`, effective configuration, visible agents, and visible skill directories.
+
+The durable identity comes from `<workspace>/.compozy/workspace.toml`:
+
+```toml
+workspace_id = "01HXJ9YR4Q..."
+created_at   = "2026-05-04T14:30:00Z"
+realpath_at_creation = "/Users/you/dev/checkout-api"
+```
+
+The ULID travels with the directory, so moving the workspace directory (`mv`) keeps its identity.
+
+That is the portability model: copy the project directory with its `.compozy/` directory, register
+the new path, and the same project agents, skills, identity, and config overlay
+travel with it.
+
+<OperatorNote>
+  `compozy workspace add` registers a directory. It does not create or own the directory, and
+  `compozy workspace remove` leaves your project files on disk. It removes the registration and
+  CompozyOS's persisted history for stopped sessions in that workspace, plus workspace-scoped MCP
+  OAuth token rows and their encrypted Vault values. Global credentials and credentials owned by
+  other workspaces are preserved. Active sessions must be stopped or removed first.
+</OperatorNote>
+
+The operator home directory (`$HOME`) and `COMPOZY_HOME` are not workspaces. Daemon boot does not
+register them, and explicit or automatic registration refuses them with `workspace_home_forbidden`.
+Work that belongs to no project runs in the [User scope](/docs/user-scope) instead, and first-run
+setup can skip project folders and start there. Project names cannot be `user`, `global`, or start
+with `@` (`workspace_name_reserved`). Register a project root when it needs its own stable name,
+agents, skills, or config overlays.
+
+## What Gets Stored
+
+CompozyOS stores workspace registrations in the global catalog database at `~/.compozy/compozy.db`. The
+`workspaces` table stores:
+
+| Field                      | Meaning                                                    |
+| -------------------------- | ---------------------------------------------------------- |
+| `id`                       | Stable ID with a `ws_` prefix. Sessions reference this ID. |
+| `root_dir`                 | Canonical absolute root path after symlink evaluation.     |
+| `add_dirs`                 | JSON list of canonical additional roots.                   |
+| `name`                     | Human-friendly unique name for CLI and API lookup.         |
+| `default_agent`            | Optional workspace default agent override.                 |
+| `created_at`, `updated_at` | Registration timestamps.                                   |
+
+The ID is random and stable. The default name comes from the root directory basename, and CompozyOS adds
+numeric suffixes such as `repo-2` when another workspace already has the same name.
+
+## Typical `.compozy/` Layout
+
+```text
+my-repo/
+  .env
+  .compozy/
+    config.toml
+    mcp.json
+    agents/
+      reviewer/
+        AGENT.md
+        mcp.json
+    skills/
+      repo-map/
+        SKILL.md
+        mcp.json
+        references/
+          architecture.md
+```
+
+| Path                                                      | Used by                    | Behavior                                                                                     |
+| --------------------------------------------------------- | -------------------------- | -------------------------------------------------------------------------------------------- |
+| `<workspace>/.compozy/config.toml`                        | Config loader              | Overlays built-in defaults and global config for this workspace root.                        |
+| `<workspace>/.compozy/mcp.json`                           | Config loader              | Adds or replaces top-level MCP servers after workspace TOML is applied.                      |
+| `<workspace>/.compozy/agents/<name>/AGENT.md`             | Resolver                   | Makes an agent visible to sessions in this workspace.                                        |
+| `<workspace>/.compozy/agents/<name>/mcp.json`             | Agent loader               | Replaces same-name MCP servers declared inline in that agent definition.                     |
+| `<workspace>/.compozy/skills/<group>/.../<name>/SKILL.md` | Resolver + skills registry | Makes a skill leaf visible; optional groups do not change its frontmatter identity.          |
+| `<workspace>/.compozy/skills/<group>/.../<name>/mcp.json` | Skills registry            | Replaces same-name MCP servers declared at that skill leaf.                                  |
+| `<workspace>/.compozy/workspace.toml`                     | Workspace identity         | Stable workspace ULID.                                                                       |
+| `<workspace>/.compozy/compozy.db`                         | Workspace catalog DB       | Per-workspace catalog.                                                                       |
+| `<workspace>/.env`                                        | Config loader              | Optional. Loaded before `COMPOZY_HOME` is resolved when config is loaded for this workspace. |
+
+The resolver directly snapshots config, MCP sidecars, agent definitions, and skill definitions. Loading
+a workspace `config.toml` that still holds retired settings archives them as comments at the end of that
+file. If the file cannot be rewritten, the snapshot still loads with those settings inactive and the next
+load retries; see [Archived retired settings](/docs/configuration/config-toml#archived-retired-settings).
+
+## Resolution Inputs
+
+CompozyOS resolves a workspace reference from three forms:
+
+| Input          | Example                                | Lookup                                                             |
+| -------------- | -------------------------------------- | ------------------------------------------------------------------ |
+| Workspace ID   | `ws_8f33a913d23c4fd1`                  | Primary key lookup.                                                |
+| Workspace name | `checkout-api`                         | Unique name lookup.                                                |
+| Absolute path  | `/Users/you/src/checkout-api/internal` | Canonical path discovery of the nearest enclosing registered root. |
+
+Relative paths are not accepted by API workspace create/resolve requests or by `compozy session new
+--cwd`. The resolver itself also requires the path to exist and to be a directory.
+
+### CLI context chain
+
+Every workspace-scoped CLI command uses one precedence chain:
+
+1. A positional workspace ref, when the command accepts one.
+2. `--workspace <id|name|path>`.
+3. `COMPOZY_WORKSPACE`.
+4. A validated `COMPOZY_SESSION_ID` plus `COMPOZY_AGENT` identity.
+5. Current-working-directory discovery.
+
+`--workspace` is an override, not a prerequisite. Structured JSON, JSONL, and TOON output includes
+`resolution_source` so an agent can see which tier won. Partial, stale, global, or workspace-less
+session credentials fall through to cwd discovery. If no tier resolves, the command returns one
+deterministic error that names the attempted tiers and tells you to register the directory or pass
+an override.
+
+Cwd and path discovery choose the nearest registered root that contains the path. A nested
+registered workspace therefore wins over its parent. Canonical path comparison prevents sibling
+prefix matches and preserves symlink resolution. Additional directories extend agent and skill
+discovery only; they do not establish workspace ownership for cwd discovery.
+
+## Register A Workspace
+
+Use `compozy workspace add` when you want the directory to appear in `compozy workspace list` and to have a
+stable name:
+
+```bash
+compozy workspace add /Users/you/src/checkout-api --name checkout-api
+```
+
+The CLI resolves a relative root such as `.` or `../checkout-api` from your current directory.
+Direct HTTP and UDS registration requests still require an absolute `root_dir`; the daemon
+canonicalizes the path and enforces the home-folder restriction for every caller.
+
+Add a workspace-local default agent when this project should start a different agent from your
+global default:
+
+```bash
+compozy workspace add /Users/you/src/checkout-api \
+  --name checkout-api \
+  --default-agent reviewer
+```
+
+The command writes one registration row and immediately resolves it. If the root is missing, is not
+a directory, or contains invalid workspace config or agent definitions, the registration is rolled
+back. The operator home directory is reserved for user-wide resources and cannot be registered as a
+workspace; use a project directory beneath it instead.
+
+## Auto-Registration
+
+CompozyOS can also register a workspace on demand:
+
+```bash
+compozy session new --cwd /Users/you/src/checkout-api --agent reviewer
+```
+
+When `--cwd` points to a path outside every registered workspace, `ResolveOrRegister` canonicalizes
+the path, creates a registration, and resolves the new workspace before starting the session. A path
+inside a registered workspace resolves the nearest enclosing root and never creates a nested
+registration.
+
+If you run `compozy session new` without `--workspace` or `--cwd`, the CLI applies the shared context
+chain. Cwd is the final tier; an unregistered project directory is auto-registered, while any
+subdirectory of a registered project binds to its nearest enclosing workspace.
+
+Use `--workspace` when you want to override the inferred workspace with an existing registration by
+ID, name, or path:
+
+```bash
+compozy session new --workspace checkout-api --agent reviewer
+```
+
+`--workspace` and `--cwd` are mutually exclusive. The HTTP and UDS create-session contract mirrors
+that rule: send either `workspace` or `workspace_path`, not both.
+
+## Resolution Cascade
+
+For this setup:
+
+```text
+~/.compozy/
+  config.toml
+  agents/
+    general/AGENT.md
+    reviewer/AGENT.md
+  skills/
+    repo-map/SKILL.md
+
+/Users/you/src/checkout-api/
+  .compozy/
+    config.toml
+    agents/
+      reviewer/AGENT.md
+    skills/
+      repo-map/SKILL.md
+      payment-rules/SKILL.md
+```
+
+Running this command:
+
+```bash
+compozy session new --workspace checkout-api --agent reviewer
+```
+
+produces this cascade:
+
+1. `checkout-api` is looked up as a registered workspace name.
+2. The stored `root_dir` is checked with `os.Stat`.
+3. The root is canonicalized again with `EvalSymlinks`. If the canonical target changed, CompozyOS updates
+   the stored `root_dir`.
+4. Config is loaded as built-in defaults, then `~/.compozy/config.toml`, then `~/.compozy/mcp.json`, then
+   `<workspace>/.compozy/config.toml`, then `<workspace>/.compozy/mcp.json`.
+5. Agents are discovered from `<workspace>/.compozy/agents/`, then additional roots, then user-wide
+   `$COMPOZY_HOME/agents/`. User-wide agents remain visible through every workspace lens.
+6. Base skills are resolved from bundled plus user-wide `$COMPOZY_HOME/skills/`, then additional
+   roots, then `<workspace>/.compozy/skills/`. User-wide skills remain visible through every
+   workspace lens.
+7. If the winning agent has `skills/`, that agent-local directory overlays the base set last.
+8. Same-name agents and skills use first-wins or higher-precedence overlay behavior, so the
+   workspace `reviewer` and `repo-map` override the global ones.
+9. The session starts with `cwd` set to the workspace root and the resolved agent prompt.
+
+<Mermaid
+  chart={`flowchart TD
+Input[workspace input] --> Kind{ID, name, or path?}
+Kind -->|ID| ByID[load workspaces.id]
+Kind -->|name| ByName[load workspaces.name]
+Kind -->|absolute path| ByPath[canonical path lookup]
+ByID --> Root[stat and canonicalize root_dir]
+ByName --> Root
+ByPath --> Root
+Root --> Snapshot[snapshot config, mcp, agents, skills]
+Snapshot --> Cache{cache reusable?}
+Cache -->|yes| Cached[return cached ResolvedWorkspace]
+Cache -->|no| Build[load config and resources]
+Build --> Result[ResolvedWorkspace]
+Cached --> Result`}
+  caption="The resolver treats the database row as a stable registration and rebuilds the runtime snapshot from the filesystem when watched files change."
+/>
+
+## Cache And Refresh Behavior
+
+Resolved workspace snapshots are cached in memory by workspace ID. A cached snapshot is reused only
+when all watched file snapshots still match and the stored workspace fields still match.
+
+The resolver watches:
+
+| Watched path                                        | Why it matters                                            |
+| --------------------------------------------------- | --------------------------------------------------------- |
+| `~/.compozy/config.toml`                            | Global config changes can affect every workspace.         |
+| `~/.compozy/mcp.json`                               | Global top-level MCP sidecars can affect every workspace. |
+| `<workspace>/.compozy/config.toml`                  | Workspace config overlay.                                 |
+| `<workspace>/.compozy/mcp.json`                     | Workspace top-level MCP sidecar.                          |
+| Every discovered `AGENT.md` and adjacent `mcp.json` | Agent availability and startup settings.                  |
+| Every discovered `SKILL.md` and adjacent `mcp.json` | Workspace skill visibility and MCP sidecars.              |
+| Agent and skill directories                         | Additions and removals.                                   |
+
+Cache entries expire after 10 minutes of inactivity. The resolver also exposes an internal
+`Invalidate(workspaceID)` method used by update and unregister flows. There is no public
+`--force-refresh` CLI flag today.
+
+## Errors To Expect
+
+| Case                             | Result                                                                                                                   |
+| -------------------------------- | ------------------------------------------------------------------------------------------------------------------------ |
+| Unknown ID, name, or path        | `workspace not found`; HTTP status `404`. CLI inference errors also name every attempted tier and the registration fix.  |
+| Registered root no longer exists | `workspace root directory no longer exists`; HTTP status `410`.                                                          |
+| Root exists but is a file        | Validation error; HTTP status `500` through resolver paths or `400` for API path validation failures.                    |
+| Duplicate name                   | `workspace name already in use`; HTTP status `409`.                                                                      |
+| Duplicate canonical path         | `workspace path already registered`; HTTP status `409`.                                                                  |
+| Operator home directory          | `operator home directory cannot be registered as a workspace`; validation error.                                         |
+| Workspace still has sessions     | `workspace has sessions`; HTTP status `409` when unregistering. No registration, session, or credential data is deleted. |
+| Invalid config or agent file     | Resolution fails and the registration is not kept on a new add/auto-register.                                            |
+
+## Isolation And Cross-Workspace Access
+
+A resolved workspace is also the home scope an agent session works in. Sessions, tasks, spawned
+children, native tool calls, and workspace coordination commands use that workspace unless a request
+explicitly names another registered workspace. The daemon sends that crossing through one policy.
+
+A Worktree never creates another ownership scope. Its record and execution paths keep the parent
+`workspace_id` and add a `worktree_id`; configuration, agents, and skills still resolve from
+the workspace. See [Worktrees](/docs/worktrees) for the nested Git lifecycle and selection model.
+
+The User scope counts as its own scope: a User session reaching a project, or a project session
+reaching User, is a crossing too. The same workspace under a different profile is also a crossing.
+
+The session's permission mode is what that policy reads, unless the agent holds the operator-granted
+[`workspace_access: unrestricted`](/docs/user-scope/unrestricted-agents), which allows every
+crossing and audits it. `approve-all` crosses without asking,
+`deny-all` never crosses and never prompts, and `approve-reads` asks at the native-tool boundary
+while denying at every other one. A denial names `permissions.mode` in its hint, so an agent can tell
+you exactly what to change. [Permissions](/docs/sessions/permissions#cross-workspace-access)
+documents the full mapping, the prompt options, and the session-scoped answers.
+
+Your own access is unchanged. Operator commands, [All projects](/docs/all-projects) aggregate reads
+such as `GET /api/sessions?all_workspaces=true`, and the workspace catalog reach every registered
+workspace and the User scope. In Web, a session deep link that belongs to
+another workspace asks before it moves you: CompozyOS resolves only the owning workspace's id and name,
+shows a confirmation, and switches the active workspace and its windows only when you confirm.
+Cancelling keeps you where you are, and a link to a session that exists nowhere still resolves to the
+not-found state.
+
+### What This Boundary Covers Today
+
+This boundary is honest about its limits. It constrains agent requests at the
+runtime boundaries listed above and attempts a best-effort audit append for every policy evaluation.
+It is not a sandbox around the agent process.
+
+These gaps are known and accepted today:
+
+- An agent with shell access can edit config files on disk, including a `permissions` mode. That
+  exposure covers the whole permission setting and is not specific to workspaces; the event history
+  is what makes it visible.
+- A session-scoped answer to a cross-workspace prompt cannot be listed or revoked while the session
+  runs. Stopping the session clears it.
+- Global operator reads — the session catalog, the workspace catalog, and the session owner lookup
+  the deep-link confirmation uses — stay open on the local loopback interface, as they are today.
+
+Set `deny-all` for sessions that must never leave their workspace, and use the event history to see
+what actually crossed.
+
+## Related Pages
+
+- [Config Overlays](/docs/workspaces/config-overlays) explains the workspace TOML and MCP merge rules.
+- [Multi-Root Workspaces](/docs/workspaces/multi-root) shows how `--add-dir` changes discovery.
+- [Worktrees](/docs/worktrees) explains linked Git checkouts inside one workspace identity.
+- [Agent Definitions](/docs/agents/definitions) documents the current `AGENT.md` parser.
+- [Skills Overview](/docs/skills) explains skill precedence after workspace resolution.
+- [Permissions](/docs/sessions/permissions#cross-workspace-access) documents the permission modes that decide cross-workspace requests.

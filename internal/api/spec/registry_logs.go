@@ -1,0 +1,42 @@
+package spec
+
+import "github.com/compozy/compozy/internal/api/contract"
+
+func registryLogOperations() []OperationSpec {
+	return []OperationSpec{{
+		Method:      httpMethodGet,
+		Path:        "/api/logs",
+		AppAccess:   AppAccessDenied,
+		OperationID: "listLogs",
+		Summary:     "List runtime logs",
+		Tags:        []string{specLogsKey},
+		Transports:  []Transport{TransportHTTP, TransportUDS},
+		Parameters:  withProfileScope(logFilterQueryParams()...),
+		Responses: []ResponseSpec{
+			{Status: 200, Description: "OK", Body: contract.LogsListResponse{}},
+			{Status: 400, Description: specInvalidFilterDescription, Body: contract.ErrorPayload{}},
+			{Status: 500, Description: specInternalServerErrorDescription, Body: contract.ErrorPayload{}},
+		},
+	},
+		{
+			Method:      httpMethodGet,
+			Path:        "/api/logs/stream",
+			AppAccess:   AppAccessDenied,
+			OperationID: "streamLogs",
+			Summary:     "Stream runtime logs",
+			Tags:        []string{specLogsKey},
+			Transports:  []Transport{TransportHTTP, TransportUDS},
+			Parameters:  withProfileScope(logStreamQueryParams()...),
+			Responses: []ResponseSpec{
+				{Status: 101, Description: specEventStreamUpgrade},
+				{
+					Status:      200,
+					Description: "Log event stream",
+					Body:        contract.LogEventPayload{},
+					ContentType: specContentTypeEventStream,
+				},
+				{Status: 400, Description: specInvalidFilterDescription, Body: contract.ErrorPayload{}},
+				{Status: 500, Description: specInternalServerErrorDescription, Body: contract.ErrorPayload{}},
+			},
+		}}
+}

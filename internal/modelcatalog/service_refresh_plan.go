@@ -1,0 +1,374 @@
+package modelcatalog
+
+import (
+	"cmp"
+	"context"
+	"errors"
+	"maps"
+	"slices"
+	"strings"
+)
+
+// RefreshPlan buffers source replacements until a whole catalog generation is ready.
+type RefreshPlan struct {
+	owner   *CatalogService
+	store   *refreshPlanStore
+	sources *CatalogService
+}
+
+// NewRefreshPlan creates an isolated, read-through refresh generation.
+func (s *CatalogService) NewRefreshPlan() (*RefreshPlan, error) {
+	if s == nil || s.store == nil {
+		return nil, errors.New("model catalog: refresh plan service is required")
+	}
+	store := &refreshPlanStore{
+		base:         s.store,
+		replacements: make(map[string]SourceRowsReplacement),
+	}
+	return &RefreshPlan{
+		owner: s,
+		store: store,
+	}, nil
+}
+
+// Refresh stages one source refresh without publishing it to the durable store.
+func (p *RefreshPlan) Refresh(
+	ctx context.Context,
+	source Source,
+	opts RefreshOptions,
+) ([]SourceStatus, error) {
+	if p == nil || p.store == nil {
+		return nil, errors.New("model catalog: refresh plan is required")
+	}
+	if ctx == nil {
+		return nil, errors.New("model catalog: refresh plan context is required")
+	}
+	if source == nil {
+		return nil, errors.New("model catalog: refresh plan source is required")
+	}
+	contexts, err := resolveSourceExecutionContexts([]Source{source}, opts.ExecutionContext)
+	if err != nil {
+		return nil, err
+	}
+	opts.SourceID = source.ID()
+	opts.SourceContexts = contexts
+	staging := &CatalogService{store: p.store}
+	return staging.refreshSources(ctx, []Source{source}, opts, defaultNow(opts.Now))
+}
+
+// CommitRefreshPlan atomically publishes every staged source replacement.
+func (s *CatalogService) CommitRefreshPlan(ctx context.Context, plan *RefreshPlan) error {
+	if ctx == nil {
+		return errors.New("model catalog: commit refresh plan context is required")
+	}
+	if plan == nil || plan.store == nil || plan.owner != s {
+		return errors.New("model catalog: refresh plan does not belong to service")
+	}
+	if err := s.store.ReplaceSourceRowsBatch(ctx, plan.store.snapshot()); err != nil {
+		return err
+	}
+	if plan.sources != nil {
+		s.sourcesMu.Lock()
+		s.sources = plan.sources.sources
+		s.sourceByID = plan.sources.sourceByID
+		s.sourcesMu.Unlock()
+	}
+	return nil
+}
+
+// SetLiveSources stages the complete live source registry with its durable generation.
+func (p *RefreshPlan) SetLiveSources(live []*LiveProviderSource) error {
+	if p == nil || p.owner == nil {
+		return errors.New("model catalog: refresh plan is required")
+	}
+	sources := make([]Source, 0)
+	for _, source := range p.owner.sourcesSnapshot() {
+		if source.Kind() != SourceKindProviderLive {
+			sources = append(sources, source)
+		}
+	}
+	for _, source := range live {
+		if source == nil {
+			return errors.New("model catalog: live source is required")
+		}
+		sources = append(sources, source)
+	}
+	staged, err := NewService(p.owner.store, sources, MergeOptions{})
+	if err != nil {
+		return err
+	}
+	p.sources = staged
+	for _, source := range p.owner.sourcesSnapshot() {
+		if source.Kind() != SourceKindProviderLive {
+			continue
+		}
+		if _, exists := staged.sourceByID[source.ID()]; exists {
+			continue
+		}
+		owned, ok := source.(sourceProviderLister)
+		if !ok {
+			return errors.New("model catalog: live source provider ownership is required")
+		}
+		for _, providerID := range owned.ProviderIDs() {
+			key := removedSourceKey(source.ID(), providerID)
+			p.store.replacements[key] = SourceRowsReplacement{
+				SourceID:     source.ID(),
+				ProviderID:   providerID,
+				RemoveSource: true,
+			}
+		}
+	}
+	return nil
+}
+
+func (s *CatalogService) sourcesSnapshot() []Source {
+	s.sourcesMu.RLock()
+	defer s.sourcesMu.RUnlock()
+	return s.sources
+}
+
+type refreshPlanStore struct {
+	base         Store
+	replacements map[string]SourceRowsReplacement
+}
+
+var _ Store = (*refreshPlanStore)(nil)
+
+func (s *refreshPlanStore) ReplaceSourceRows(
+	ctx context.Context,
+	executionContext CatalogExecutionContext,
+	sourceID string,
+	providerID string,
+	rows []ModelRow,
+	status SourceStatus,
+) error {
+	if ctx == nil {
+		return errors.New("model catalog: stage source rows context is required")
+	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	key, err := refreshPlanSourceProviderKey(executionContext, sourceID, providerID)
+	if err != nil {
+		return err
+	}
+	s.replacements[key] = SourceRowsReplacement{
+		ExecutionContext: executionContext,
+		SourceID:         sourceID,
+		ProviderID:       providerID,
+		Rows:             cloneModelRows(rows),
+		Status:           status,
+	}
+	return nil
+}
+
+func (s *refreshPlanStore) ReplaceSourceRowsBatch(
+	ctx context.Context,
+	replacements []SourceRowsReplacement,
+) error {
+	if ctx == nil {
+		return errors.New("model catalog: stage source rows batch context is required")
+	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	next := make(map[string]SourceRowsReplacement, len(s.replacements)+len(replacements))
+	maps.Copy(next, s.replacements)
+	for _, replacement := range replacements {
+		key, err := replacementKey(replacement)
+		if err != nil {
+			return err
+		}
+		replacement.Rows = cloneModelRows(replacement.Rows)
+		next[key] = replacement
+	}
+	s.replacements = next
+	return nil
+}
+
+func (s *refreshPlanStore) ListRows(ctx context.Context, opts ListOptions) ([]ModelRow, error) {
+	rows, err := s.base.ListRows(ctx, opts)
+	if err != nil {
+		return nil, err
+	}
+	result := make([]ModelRow, 0, len(rows))
+	for _, row := range rows {
+		if replacementMatchesRow(s.replacements, row, opts) {
+			continue
+		}
+		result = append(result, row)
+	}
+	for _, replacement := range s.replacements {
+		if !replacementMatchesList(replacement, opts) {
+			continue
+		}
+		for _, row := range replacement.Rows {
+			if row.Stale && !opts.IncludeAll && !opts.IncludeStale {
+				continue
+			}
+			result = append(result, row)
+		}
+	}
+	return cloneModelRows(result), nil
+}
+
+func (s *refreshPlanStore) ListRowOwners(ctx context.Context, opts ListOptions) ([]SourceProviderKey, error) {
+	owners, err := s.base.ListRowOwners(ctx, opts)
+	if err != nil {
+		return nil, err
+	}
+	result := make([]SourceProviderKey, 0, len(owners))
+	for _, owner := range owners {
+		if !replacementMatchesSourceProvider(s.replacements, opts.SourceContexts, owner.SourceID, owner.ProviderID) {
+			result = append(result, owner)
+		}
+	}
+	for _, replacement := range s.replacements {
+		if !replacementMatchesList(replacement, opts) {
+			continue
+		}
+		if slices.ContainsFunc(replacement.Rows, func(row ModelRow) bool {
+			return !row.Stale || opts.IncludeAll || opts.IncludeStale
+		}) {
+			result = append(result, SourceProviderKey{
+				SourceID:   replacement.SourceID,
+				ProviderID: replacement.ProviderID,
+			})
+		}
+	}
+	slices.SortFunc(result, func(a, b SourceProviderKey) int {
+		return cmp.Or(cmp.Compare(a.SourceID, b.SourceID), cmp.Compare(a.ProviderID, b.ProviderID))
+	})
+	return slices.Compact(result), nil
+}
+
+func (s *refreshPlanStore) ListSourceStatus(
+	ctx context.Context,
+	opts StatusOptions,
+) ([]SourceStatus, error) {
+	statuses, err := s.base.ListSourceStatus(ctx, opts)
+	if err != nil {
+		return nil, err
+	}
+	result := make([]SourceStatus, 0, len(statuses)+len(s.replacements))
+	for _, status := range statuses {
+		if replacementMatchesStatus(s.replacements, status, opts) {
+			continue
+		}
+		result = append(result, status)
+	}
+	trimmedProviderID := strings.TrimSpace(opts.ProviderID)
+	for _, replacement := range s.replacements {
+		if (trimmedProviderID == "" || replacement.ProviderID == trimmedProviderID) &&
+			replacementContextSelected(replacement, opts.SourceContexts) {
+			result = append(result, replacement.Status)
+		}
+	}
+	slices.SortFunc(result, func(a, b SourceStatus) int {
+		return cmp.Or(cmp.Compare(a.ProviderID, b.ProviderID), cmp.Compare(a.SourceID, b.SourceID))
+	})
+	return cloneSourceStatuses(result), nil
+}
+
+func (s *refreshPlanStore) snapshot() []SourceRowsReplacement {
+	keys := slices.AppendSeq(make([]string, 0, len(s.replacements)), maps.Keys(s.replacements))
+	slices.Sort(keys)
+	replacements := make([]SourceRowsReplacement, 0, len(keys))
+	for _, key := range keys {
+		replacement := s.replacements[key]
+		replacement.Rows = cloneModelRows(replacement.Rows)
+		replacements = append(replacements, replacement)
+	}
+	return replacements
+}
+
+func replacementMatchesList(replacement SourceRowsReplacement, opts ListOptions) bool {
+	if !replacementContextSelected(replacement, opts.SourceContexts) {
+		return false
+	}
+	providerID := strings.TrimSpace(opts.ProviderID)
+	if providerID != "" && replacement.ProviderID != providerID {
+		return false
+	}
+	sourceID := strings.TrimSpace(opts.SourceID)
+	return sourceID == "" || replacement.SourceID == sourceID
+}
+
+func refreshPlanSourceProviderKey(
+	executionContext CatalogExecutionContext,
+	sourceID string,
+	providerID string,
+) (string, error) {
+	contextID, err := executionContext.ID()
+	if err != nil {
+		return "", err
+	}
+	return contextID + "\x00" + strings.TrimSpace(sourceID) + "\x00" + strings.TrimSpace(providerID), nil
+}
+
+func replacementMatchesRow(
+	replacements map[string]SourceRowsReplacement,
+	row ModelRow,
+	opts ListOptions,
+) bool {
+	return replacementMatchesSourceProvider(replacements, opts.SourceContexts, row.SourceID, row.ProviderID)
+}
+
+func replacementMatchesStatus(
+	replacements map[string]SourceRowsReplacement,
+	status SourceStatus,
+	opts StatusOptions,
+) bool {
+	return replacementMatchesSourceProvider(replacements, opts.SourceContexts, status.SourceID, status.ProviderID)
+}
+
+func removedSourceKey(sourceID, providerID string) string {
+	return "removed\x00" + sourceID + "\x00" + providerID
+}
+
+func replacementKey(replacement SourceRowsReplacement) (string, error) {
+	if replacement.RemoveSource {
+		return removedSourceKey(replacement.SourceID, replacement.ProviderID), nil
+	}
+	return refreshPlanSourceProviderKey(replacement.ExecutionContext, replacement.SourceID, replacement.ProviderID)
+}
+
+func replacementMatchesSourceProvider(
+	replacements map[string]SourceRowsReplacement,
+	contexts map[string]CatalogExecutionContext,
+	sourceID string,
+	providerID string,
+) bool {
+	if _, removed := replacements[removedSourceKey(sourceID, providerID)]; removed {
+		return true
+	}
+	executionContext, ok := contexts[sourceID]
+	if !ok {
+		return false
+	}
+	key, err := refreshPlanSourceProviderKey(executionContext, sourceID, providerID)
+	if err != nil {
+		return false
+	}
+	_, replaced := replacements[key]
+	return replaced
+}
+
+func replacementContextSelected(
+	replacement SourceRowsReplacement,
+	contexts map[string]CatalogExecutionContext,
+) bool {
+	if replacement.RemoveSource {
+		return false
+	}
+	selected, ok := contexts[replacement.SourceID]
+	if !ok {
+		return false
+	}
+	selectedID, err := selected.ID()
+	if err != nil {
+		return false
+	}
+	replacementID, err := replacement.ExecutionContext.ID()
+	return err == nil && selectedID == replacementID
+}

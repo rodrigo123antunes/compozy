@@ -1,0 +1,388 @@
+package skills
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"log/slog"
+	"path/filepath"
+	"slices"
+	"strings"
+	"sync"
+	"time"
+
+	"github.com/compozy/compozy/internal/filesnap"
+	"github.com/compozy/compozy/internal/skillscan"
+)
+
+const (
+	watcherAddedKey    = "added"
+	watcherModifiedKey = "modified"
+)
+
+const defaultWatcherInterval = 3 * time.Second
+
+type globalRefresher interface {
+	RefreshGlobal(ctx context.Context) error
+}
+
+type fileChange struct {
+	path   string
+	action string
+}
+
+// Watcher polls global skill directories and refreshes the registry when their
+// SKILL.md snapshots change.
+type Watcher struct {
+	registry globalRefresher
+	interval time.Duration
+	roots    []string
+	logger   *slog.Logger
+
+	callbackPending    bool
+	callbackRetryAt    time.Time
+	callbackBackoff    time.Duration
+	lastPollFailure    string
+	afterRefresh       func(context.Context) error
+	rootsProvider      func(context.Context) ([]string, error)
+	agentRoots         []string
+	agentRootsProvider func(context.Context) ([]string, error)
+	configuredRoots    func() ([]string, []string)
+
+	mu               sync.Mutex
+	initialized      bool
+	snapshots        map[string]filesnap.Snapshot
+	discoveries      map[string]skillscan.DirectoryResult
+	agentDiscoveries map[string]watcherAgentDiscovery
+}
+
+// NewWatcher constructs a watcher that polls the registry's global skill
+// directories. A non-positive interval falls back to the default poll interval.
+func NewWatcher(registry *Registry, interval time.Duration) *Watcher {
+	var roots []string
+	var agentRoots []string
+	snapshots := make(map[string]filesnap.Snapshot)
+	initialized := false
+	if registry != nil {
+		roots, agentRoots = registry.watcherRootsSnapshot()
+		snapshots, initialized = registry.globalSnapshotState()
+	}
+
+	watcher := &Watcher{
+		registry:    registry,
+		interval:    watcherInterval(interval),
+		roots:       roots,
+		agentRoots:  agentRoots,
+		logger:      slog.Default(),
+		initialized: initialized,
+		snapshots:   snapshots,
+	}
+	if registry != nil {
+		watcher.configuredRoots = registry.watcherRootsSnapshot
+	}
+	return watcher
+}
+
+// SetAgentRootsProvider installs the explicit agent-definition roots watched on each poll.
+func (w *Watcher) SetAgentRootsProvider(provider func(context.Context) ([]string, error)) {
+	if w == nil {
+		return
+	}
+	w.agentRootsProvider = provider
+}
+
+func newWatcher(registry globalRefresher, interval time.Duration, roots []string) *Watcher {
+	return &Watcher{
+		registry:  registry,
+		interval:  watcherInterval(interval),
+		roots:     watcherRoots(roots...),
+		logger:    slog.Default(),
+		snapshots: make(map[string]filesnap.Snapshot),
+	}
+}
+
+// SetAfterRefresh installs a callback retried independently after snapshots are committed.
+func (w *Watcher) SetAfterRefresh(callback func(context.Context) error) {
+	if w == nil {
+		return
+	}
+	w.afterRefresh = callback
+}
+
+// SetRootsProvider installs an optional callback that contributes additional
+// directories to watch on each poll, such as workspace-local skill roots.
+func (w *Watcher) SetRootsProvider(provider func(context.Context) ([]string, error)) {
+	if w == nil {
+		return
+	}
+	w.rootsProvider = provider
+}
+
+// Start runs the polling loop until the provided context is canceled.
+func (w *Watcher) Start(ctx context.Context) {
+	if ctx == nil {
+		return
+	}
+
+	if w.logger == nil {
+		w.logger = slog.Default()
+	}
+
+	w.logger.Info("skills: watcher started", "roots", w.roots, "interval", w.interval)
+	err := w.pollOnce(ctx)
+	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+		return
+	}
+	w.reportPollResult(err)
+
+	ticker := time.NewTicker(w.interval)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			err := w.pollOnce(ctx)
+			if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+				return
+			}
+			w.reportPollResult(err)
+		}
+	}
+}
+
+func (w *Watcher) pollOnce(ctx context.Context) error {
+	changed, snapshots, changes, err := w.detectChanges(ctx)
+	if err != nil {
+		return err
+	}
+	if !changed {
+		return w.retryCallback(ctx)
+	}
+
+	for _, change := range changes {
+		w.logger.Debug("skills: watcher detected change", "path", change.path, "action", change.action)
+	}
+
+	if err := checkRegistryContext(ctx); err != nil {
+		return err
+	}
+	if w.registry != nil {
+		if err := w.registry.RefreshGlobal(ctx); err != nil {
+			return fmt.Errorf("skills: refresh global registry: %w", err)
+		}
+	}
+	if err := checkRegistryContext(ctx); err != nil {
+		return err
+	}
+	w.commitSnapshots(snapshots)
+	w.callbackRetryAt, w.callbackBackoff = time.Time{}, 0
+	w.callbackPending = w.afterRefresh != nil
+	return w.retryCallback(ctx)
+}
+
+// A repeated cause keeps its first warning until recovery.
+func (w *Watcher) reportPollResult(err error) {
+	if err == nil {
+		if !w.callbackPending {
+			w.lastPollFailure = ""
+		}
+		return
+	}
+	cause := err.Error()
+	if cause == w.lastPollFailure {
+		w.logger.Debug("skills: watcher poll still failing", "error", err)
+		return
+	}
+	w.lastPollFailure = cause
+	w.logger.Warn("skills: watcher poll failed", "error", err)
+}
+
+func (w *Watcher) retryCallback(ctx context.Context) error {
+	if !w.callbackPending || time.Now().Before(w.callbackRetryAt) {
+		return nil
+	}
+	if err := checkRegistryContext(ctx); err != nil {
+		return err
+	}
+	if err := w.afterRefresh(ctx); err != nil {
+		if w.callbackBackoff == 0 {
+			w.callbackBackoff = watcherInterval(w.interval)
+		}
+		w.callbackBackoff = min(w.callbackBackoff*2, time.Minute)
+		w.callbackRetryAt = time.Now().Add(w.callbackBackoff)
+		return fmt.Errorf("skills: run watcher refresh callback: %w", err)
+	}
+	w.callbackPending = false
+	w.callbackBackoff = 0
+	w.callbackRetryAt = time.Time{}
+	return nil
+}
+
+func (w *Watcher) detectChanges(ctx context.Context) (bool, map[string]filesnap.Snapshot, []fileChange, error) {
+	if err := checkRegistryContext(ctx); err != nil {
+		return false, nil, nil, err
+	}
+
+	current, err := w.snapshotRoots(ctx)
+	if err != nil {
+		return false, nil, nil, err
+	}
+
+	w.mu.Lock()
+	defer w.mu.Unlock()
+
+	if !w.initialized {
+		w.snapshots = current
+		w.initialized = true
+		return false, nil, nil, nil
+	}
+
+	changes := diffSnapshots(w.snapshots, current)
+	if len(changes) == 0 {
+		return false, nil, nil, nil
+	}
+
+	return true, current, changes, nil
+}
+
+func (w *Watcher) commitSnapshots(snapshots map[string]filesnap.Snapshot) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+
+	w.snapshots = snapshots
+	if w.snapshots == nil {
+		w.snapshots = make(map[string]filesnap.Snapshot)
+	}
+	w.initialized = true
+}
+
+func (w *Watcher) currentRoots(ctx context.Context) ([]string, map[string]struct{}, error) {
+	if w == nil {
+		return nil, nil, nil
+	}
+	additionalRoots, err := resolveWatcherRootsProvider(ctx, w.rootsProvider, "skill")
+	if err != nil {
+		return nil, nil, err
+	}
+	additionalAgentRoots, err := resolveWatcherRootsProvider(ctx, w.agentRootsProvider, skillAgentKind)
+	if err != nil {
+		return nil, nil, err
+	}
+	baseRoots := append([]string(nil), w.roots...)
+	baseAgentRoots := append([]string(nil), w.agentRoots...)
+	if w.configuredRoots != nil {
+		baseRoots, baseAgentRoots = w.configuredRoots()
+	}
+	agentRoots := watcherRoots(append(baseAgentRoots, additionalAgentRoots...)...)
+	roots := make([]string, 0, len(baseRoots)+len(additionalRoots)+len(agentRoots))
+	roots = append(roots, baseRoots...)
+	roots = append(roots, additionalRoots...)
+	roots = append(roots, agentRoots...)
+	agentSet := make(map[string]struct{}, len(agentRoots))
+	for _, root := range agentRoots {
+		agentSet[root] = struct{}{}
+	}
+	return watcherRoots(roots...), agentSet, nil
+}
+
+func (r *Registry) watcherRootsSnapshot() ([]string, []string) {
+	if r == nil {
+		return nil, nil
+	}
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	skillRoots := make([]string, 0, len(r.cfg.GlobalSkillRoots)+1)
+	for _, root := range r.cfg.GlobalSkillRoots {
+		skillRoots = append(skillRoots, root.Dir)
+	}
+	agentRoots := watcherRoots(r.cfg.GlobalAgentsDir)
+	skillRoots = append(skillRoots, agentRoots...)
+	return watcherRoots(skillRoots...), agentRoots
+}
+
+func resolveWatcherRootsProvider(
+	ctx context.Context,
+	provider func(context.Context) ([]string, error),
+	kind string,
+) ([]string, error) {
+	if provider == nil {
+		return nil, nil
+	}
+	roots, err := provider(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("skills: resolve %s watcher roots: %w", kind, err)
+	}
+	return roots, nil
+}
+
+// diffSnapshots reports additions, removals, and captured filesystem changes in stable path order.
+func diffSnapshots(previous, current map[string]filesnap.Snapshot) []fileChange {
+	changes := make([]fileChange, 0)
+
+	for path, snapshot := range current {
+		previousSnapshot, ok := previous[path]
+		if !ok {
+			changes = append(changes, fileChange{path: path, action: watcherAddedKey})
+			continue
+		}
+
+		if !snapshot.Equal(previousSnapshot) {
+			changes = append(changes, fileChange{path: path, action: watcherModifiedKey})
+		}
+	}
+
+	for path := range previous {
+		if _, ok := current[path]; ok {
+			continue
+		}
+		changes = append(changes, fileChange{path: path, action: "deleted"})
+	}
+
+	slices.SortFunc(changes, func(left, right fileChange) int {
+		if cmp := strings.Compare(left.path, right.path); cmp != 0 {
+			return cmp
+		}
+		return strings.Compare(left.action, right.action)
+	})
+
+	return changes
+}
+
+func watcherInterval(interval time.Duration) time.Duration {
+	if interval <= 0 {
+		return defaultWatcherInterval
+	}
+
+	return interval
+}
+
+func watcherRoots(roots ...string) []string {
+	if len(roots) == 0 {
+		return nil
+	}
+
+	normalized := make([]string, 0, len(roots))
+	seen := make(map[string]struct{}, len(roots))
+	for _, root := range roots {
+		trimmed := strings.TrimSpace(root)
+		if trimmed == "" {
+			continue
+		}
+
+		absRoot, err := filepath.Abs(trimmed)
+		if err != nil {
+			absRoot = trimmed
+		}
+		if _, ok := seen[absRoot]; ok {
+			continue
+		}
+
+		seen[absRoot] = struct{}{}
+		normalized = append(normalized, absRoot)
+	}
+
+	slices.Sort(normalized)
+	return normalized
+}

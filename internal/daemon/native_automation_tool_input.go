@@ -1,0 +1,161 @@
+package daemon
+
+import (
+	"strings"
+
+	"github.com/compozy/compozy/internal/api/contract"
+
+	automationpkg "github.com/compozy/compozy/internal/automation"
+)
+
+type automationJobIDInput struct {
+	JobID       string `json:"job_id"`
+	WorkspaceID string `json:"workspace,omitempty"`
+}
+
+type automationTriggerIDInput struct {
+	TriggerID   string `json:"trigger_id"`
+	WorkspaceID string `json:"workspace,omitempty"`
+}
+
+type automationRunIDInput struct {
+	RunID       string `json:"run_id"`
+	WorkspaceID string `json:"workspace,omitempty"`
+}
+
+type automationJobCreateInput struct {
+	Scope       automationpkg.Scope            `json:"scope"`
+	Name        string                         `json:"name"`
+	AgentName   string                         `json:"agent_name"`
+	WorkspaceID string                         `json:"workspace,omitempty"`
+	Prompt      string                         `json:"prompt"`
+	Schedule    automationpkg.ScheduleSpec     `json:"schedule"`
+	Task        *automationpkg.JobTaskConfig   `json:"task,omitzero"`
+	Enabled     *bool                          `json:"enabled,omitzero"`
+	Retry       *automationpkg.RetryConfig     `json:"retry,omitzero"`
+	FireLimit   *automationpkg.FireLimitConfig `json:"fire_limit,omitzero"`
+}
+
+func (i automationJobCreateInput) request() contract.CreateJobRequest {
+	return contract.CreateJobRequest{
+		Scope:       i.Scope,
+		Name:        i.Name,
+		AgentName:   i.AgentName,
+		WorkspaceID: i.WorkspaceID,
+		Prompt:      i.Prompt,
+		Schedule:    i.Schedule,
+		Task:        i.Task,
+		Enabled:     i.Enabled,
+		Retry:       i.Retry,
+		FireLimit:   i.FireLimit,
+	}
+}
+
+type automationJobUpdateInput struct {
+	JobID       string                         `json:"job_id"`
+	WorkspaceID string                         `json:"workspace,omitempty"`
+	Name        *string                        `json:"name,omitzero"`
+	Prompt      *string                        `json:"prompt,omitzero"`
+	Schedule    *automationpkg.ScheduleSpec    `json:"schedule,omitzero"`
+	Task        *automationpkg.JobTaskConfig   `json:"task,omitzero"`
+	Enabled     *bool                          `json:"enabled,omitzero"`
+	Retry       *automationpkg.RetryConfig     `json:"retry,omitzero"`
+	FireLimit   *automationpkg.FireLimitConfig `json:"fire_limit,omitzero"`
+}
+
+func (i automationJobUpdateInput) request() contract.UpdateJobRequest {
+	return contract.UpdateJobRequest{
+		Name:      i.Name,
+		Prompt:    i.Prompt,
+		Schedule:  i.Schedule,
+		Task:      i.Task,
+		Enabled:   i.Enabled,
+		Retry:     i.Retry,
+		FireLimit: i.FireLimit,
+	}
+}
+
+type automationTriggerCreateInput struct {
+	TargetKind          automationpkg.TargetKind       `json:"target_kind,omitempty"`
+	TargetInstanceScope string                         `json:"target_instance_scope,omitempty"`
+	Scope               automationpkg.Scope            `json:"scope"`
+	Name                string                         `json:"name"`
+	AgentName           string                         `json:"agent_name"`
+	WorkspaceID         string                         `json:"workspace,omitempty"`
+	Prompt              string                         `json:"prompt"`
+	Event               string                         `json:"event"`
+	Filter              map[string]string              `json:"filter,omitempty"`
+	Enabled             *bool                          `json:"enabled,omitzero"`
+	Retry               *automationpkg.RetryConfig     `json:"retry,omitzero"`
+	FireLimit           *automationpkg.FireLimitConfig `json:"fire_limit,omitzero"`
+	WebhookID           string                         `json:"webhook_id,omitempty"`
+	EndpointSlug        string                         `json:"endpoint_slug,omitempty"`
+	WebhookSecretValue  *string                        `json:"webhook_secret_value,omitzero"`
+}
+
+func (i automationTriggerCreateInput) request() contract.CreateTriggerRequest {
+	return contract.CreateTriggerRequest{
+		TargetKind:          i.TargetKind,
+		TargetInstanceScope: i.TargetInstanceScope,
+		Scope:               i.Scope,
+		Name:                i.Name,
+		AgentName:           i.AgentName,
+		WorkspaceID:         i.WorkspaceID,
+		Prompt:              i.Prompt,
+		Event:               i.Event,
+		Filter:              i.Filter,
+		Enabled:             i.Enabled,
+		Retry:               i.Retry,
+		FireLimit:           i.FireLimit,
+		WebhookID:           i.WebhookID,
+		EndpointSlug:        i.EndpointSlug,
+	}
+}
+
+func (i automationTriggerCreateInput) webhookSecretWrite() automationpkg.WebhookSecretWrite {
+	write := automationpkg.WebhookSecretWrite{}
+	if i.WebhookSecretValue != nil {
+		value := strings.TrimSpace(*i.WebhookSecretValue)
+		write.Value = &value
+	}
+	return write
+}
+
+type automationTriggerUpdateInput struct {
+	TargetInstanceScope *string                        `json:"target_instance_scope,omitzero"`
+	TriggerID           string                         `json:"trigger_id"`
+	WorkspaceID         string                         `json:"workspace,omitempty"`
+	Name                *string                        `json:"name,omitzero"`
+	Prompt              *string                        `json:"prompt,omitzero"`
+	Event               *string                        `json:"event,omitzero"`
+	Filter              map[string]string              `json:"filter,omitempty"`
+	Enabled             *bool                          `json:"enabled,omitzero"`
+	Retry               *automationpkg.RetryConfig     `json:"retry,omitzero"`
+	FireLimit           *automationpkg.FireLimitConfig `json:"fire_limit,omitzero"`
+	WebhookID           *string                        `json:"webhook_id,omitzero"`
+	EndpointSlug        *string                        `json:"endpoint_slug,omitzero"`
+	WebhookSecretValue  *string                        `json:"webhook_secret_value,omitzero"`
+}
+
+func (i automationTriggerUpdateInput) request() contract.UpdateTriggerRequest {
+	return contract.UpdateTriggerRequest{
+		TargetInstanceScope: i.TargetInstanceScope,
+		Name:                i.Name,
+		Prompt:              i.Prompt,
+		Event:               i.Event,
+		Filter:              i.Filter,
+		Enabled:             i.Enabled,
+		Retry:               i.Retry,
+		FireLimit:           i.FireLimit,
+		WebhookID:           i.WebhookID,
+		EndpointSlug:        i.EndpointSlug,
+		WebhookSecretValue:  i.WebhookSecretValue,
+	}
+}
+
+func (i automationTriggerUpdateInput) webhookSecretWrite() *automationpkg.WebhookSecretWrite {
+	if i.WebhookSecretValue == nil {
+		return nil
+	}
+	return &automationpkg.WebhookSecretWrite{Value: new(strings.TrimSpace(*i.WebhookSecretValue))}
+}

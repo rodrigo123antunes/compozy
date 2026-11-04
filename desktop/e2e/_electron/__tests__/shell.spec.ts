@@ -1,0 +1,2626 @@
+import { createHash } from "node:crypto";
+import { createServer, request as forwardRequest } from "node:http";
+import type { AddressInfo } from "node:net";
+import {
+  cp,
+  chmod,
+  mkdir,
+  mkdtemp,
+  readFile,
+  realpath,
+  rm,
+  stat,
+  utimes,
+  writeFile,
+} from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join, resolve } from "node:path";
+import { fileURLToPath } from "node:url";
+
+import { extract } from "tar";
+import type { Locator, Page, Request } from "@playwright/test";
+
+import {
+  availableLoopbackPort,
+  expect,
+  productionPackagedExecutable,
+  test,
+  type DesktopInstance,
+} from "../fixtures";
+import { runCommand, startCommand, type RunningCommand } from "../process";
+import { completeOnboarding } from "../helpers";
+import { executableSha256File } from "../../../src/bootstrap/executable-digest";
+import { TERMINAL_SUBPROTOCOL } from "../../../../web/src/generated/terminal-wire";
+
+const testDirectory = fileURLToPath(new URL(".", import.meta.url));
+const repositoryRoot = resolve(testDirectory, "../../../..");
+const loginPathAgent = "desktop-login-path-agent";
+const loginPathFixtureAgent = "browser-lifecycle-agent";
+const loginPathPrompt = "e2e first message";
+
+async function jsonCommand(
+  desktop: DesktopInstance,
+  arguments_: readonly string[]
+): Promise<Record<string, unknown>> {
+  return JSON.parse((await desktop.cli(arguments_)).stdout) as Record<string, unknown>;
+}
+
+async function ensureProjectWorkspaceID(desktop: DesktopInstance, product: Page): Promise<string> {
+  let added = false;
+  let workspaces: unknown = JSON.parse(
+    (await desktop.cli(["workspace", "list", "-o", "json"])).stdout
+  );
+  if (!Array.isArray(workspaces)) throw new Error("Workspace list did not return an array.");
+  if (workspaces.length === 0) {
+    added = true;
+    const projectRoot = join(desktop.home, "workspace");
+    await mkdir(projectRoot, { recursive: true });
+    await desktop.cli(["workspace", "add", projectRoot, "--name", "desktop-e2e", "-o", "json"]);
+    workspaces = JSON.parse((await desktop.cli(["workspace", "list", "-o", "json"])).stdout);
+  }
+  if (!Array.isArray(workspaces)) throw new Error("Workspace list did not return an array.");
+  const first = workspaces[0];
+  if (!first || typeof first !== "object") {
+    throw new Error("Workspace registration did not produce a catalog row.");
+  }
+  const id = Reflect.get(first, "id");
+  if (typeof id !== "string" || id.trim() === "") {
+    throw new Error("The first workspace has no stable id.");
+  }
+  if (added) {
+    await product.reload({ waitUntil: "domcontentloaded" });
+    await expect(product.getByTestId("os-desktop")).toBeVisible();
+    // The switcher names the current destination (All projects, User, or a project).
+    await product.locator('[data-slot="os-menubar-workspace"]').click();
+    await product.getByTestId(`os-workspace-option-${id}`).click();
+    await expect
+      .poll(async () => {
+        return await product.evaluate(async workspaceID => {
+          const response = await fetch(
+            `/api/workspaces/${encodeURIComponent(workspaceID)}/window-manager/clients`
+          );
+          if (!response.ok) return false;
+          const payload = (await response.json()) as { clients?: unknown[] };
+          return Array.isArray(payload.clients) && payload.clients.length > 0;
+        }, id);
+      })
+      .toBe(true);
+    await expect(product.getByTestId("os-global-scope-toggle")).toHaveAttribute(
+      "aria-pressed",
+      "false"
+    );
+  }
+  return id;
+}
+
+async function waitForGlobalShortcut(
+  product: Page,
+  commandID: string,
+  status: "registered" | "failed_in_use"
+): Promise<Record<string, unknown>> {
+  let observed: Record<string, unknown> | undefined;
+  await expect
+    .poll(async () => {
+      observed = await product.evaluate(async id => {
+        const bridge = Reflect.get(window, "compozyShell") as
+          | {
+              globalShortcuts: {
+                status(): Promise<
+                  Array<{
+                    command_id: string;
+                    intended_chord: string;
+                    active_chord?: string;
+                    status: string;
+                  }>
+                >;
+              };
+            }
+          | undefined;
+        if (!bridge) return undefined;
+        return (await bridge.globalShortcuts.status()).find(item => item.command_id === id);
+      }, commandID);
+      return observed?.status;
+    })
+    .toBe(status);
+  if (!observed) throw new Error(`Global shortcut ${commandID} did not report status ${status}.`);
+  return observed;
+}
+
+async function invokeGlobalShortcut(desktop: DesktopInstance, accelerator: string): Promise<void> {
+  const invoked = await desktop.app.evaluate((_electron, value) => {
+    const invoke = Reflect.get(globalThis, "__compozyGlobalShortcutInvoke");
+    if (typeof invoke !== "function") return false;
+    return invoke(value) === true;
+  }, accelerator);
+  if (!invoked) throw new Error(`Global shortcut ${accelerator} is not registered.`);
+}
+
+async function pressProductAccelerator(desktop: DesktopInstance, keyCode: string): Promise<void> {
+  await desktop.app.evaluate(({ BrowserWindow }, key) => {
+    const productWindow = BrowserWindow.getAllWindows().find(window =>
+      /^https?:/u.test(window.webContents.getURL())
+    );
+    if (!productWindow) throw new Error("Product window missing before accelerator input.");
+    const modifiers: Electron.InputEvent["modifiers"] = [
+      process.platform === "darwin" ? "meta" : "control",
+    ];
+    productWindow.webContents.sendInputEvent({ type: "keyDown", keyCode: key, modifiers });
+    productWindow.webContents.sendInputEvent({ type: "keyUp", keyCode: key, modifiers });
+  }, keyCode);
+}
+
+async function connectDesktopTerminalWatcher(
+  page: Page,
+  workspaceID: string,
+  terminalID: string
+): Promise<{ cols: number; rows: number }> {
+  return await page.evaluate(
+    async input => {
+      const ticketResponse = await fetch(
+        `/api/workspaces/${encodeURIComponent(input.workspaceID)}/terminals/${encodeURIComponent(
+          input.terminalID
+        )}/attach-ticket?profile=default`,
+        {
+          body: JSON.stringify({ mode: "read" }),
+          headers: { "content-type": "application/json" },
+          method: "POST",
+        }
+      );
+      if (!ticketResponse.ok) {
+        throw new Error(`Terminal watcher ticket failed with ${ticketResponse.status}.`);
+      }
+      const payload = (await ticketResponse.json()) as { ticket?: unknown };
+      if (typeof payload.ticket !== "string" || payload.ticket === "") {
+        throw new Error("Terminal watcher ticket is missing.");
+      }
+      const protocol = window.location.protocol === "https:" ? "wss:" : "ws:";
+      const socket = new WebSocket(
+        `${protocol}//${window.location.host}/api/workspaces/${encodeURIComponent(
+          input.workspaceID
+        )}/terminals/${encodeURIComponent(
+          input.terminalID
+        )}/stream?mode=read&flow=drop&ticket=${encodeURIComponent(payload.ticket)}`,
+        input.subprotocol
+      );
+      socket.binaryType = "arraybuffer";
+      const attached = await new Promise<{ cols: number; rows: number }>((resolve, reject) => {
+        const timeout = window.setTimeout(
+          () => reject(new Error("Terminal watcher did not receive its attached frame.")),
+          20_000
+        );
+        socket.onmessage = event => {
+          if (!(event.data instanceof ArrayBuffer)) return;
+          const bytes = new Uint8Array(event.data);
+          if (bytes[0] !== 0x02 && bytes[0] !== 0x06) return;
+          const frame = JSON.parse(new TextDecoder().decode(bytes.subarray(1))) as {
+            cols: number;
+            rows: number;
+          };
+          Reflect.set(globalThis, "__compozyDesktopTerminalWatcherGrid", frame);
+          if (bytes[0] !== 0x02) return;
+          window.clearTimeout(timeout);
+          resolve(frame);
+        };
+        socket.onerror = () => {
+          window.clearTimeout(timeout);
+          reject(new Error("Terminal watcher failed to connect."));
+        };
+      });
+      Reflect.set(globalThis, "__compozyDesktopTerminalWatcher", socket);
+      return attached;
+    },
+    { subprotocol: TERMINAL_SUBPROTOCOL, terminalID, workspaceID }
+  );
+}
+
+async function expectDesktopTerminalGrid(
+  page: Page,
+  terminalWindow: Locator
+): Promise<{ cols: number; rows: number }> {
+  let settledGrid: { cols: number; rows: number } | undefined;
+  await expect
+    .poll(async () => {
+      const grid = await page.evaluate(
+        () =>
+          Reflect.get(globalThis, "__compozyDesktopTerminalWatcherGrid") as
+            | { cols: number; rows: number }
+            | undefined
+      );
+      if (!grid) return false;
+      settledGrid = grid;
+      const vote = await terminalWindow.getByTestId("terminal-size-vote").textContent();
+      return vote?.includes(`${grid.cols}×${grid.rows}`) ?? false;
+    })
+    .toBe(true);
+  if (!settledGrid) throw new Error("Terminal watcher has no settled grid.");
+  return settledGrid;
+}
+
+async function closeDesktopTerminalWatcher(page: Page): Promise<void> {
+  await page.evaluate(() => {
+    const socket = Reflect.get(globalThis, "__compozyDesktopTerminalWatcher");
+    if (socket instanceof WebSocket) socket.close();
+    Reflect.deleteProperty(globalThis, "__compozyDesktopTerminalWatcher");
+    Reflect.deleteProperty(globalThis, "__compozyDesktopTerminalWatcherGrid");
+  });
+}
+
+async function copyPaletteExtensionFixture(home: string): Promise<string> {
+  const source = join(home, "fixtures", "palette-fixture-go");
+  await cp(
+    join(repositoryRoot, "internal", "extension", "testdata", "palette-fixture-go"),
+    source,
+    {
+      recursive: true,
+    }
+  );
+  const modulePath = join(source, "go.mod");
+  const moduleFile = await readFile(modulePath, "utf8");
+  await writeFile(
+    modulePath,
+    `${moduleFile.trimEnd()}\n\nreplace github.com/compozy/compozy/sdk/go => ${join(repositoryRoot, "sdk", "go")}\n`,
+    { mode: 0o600 }
+  );
+  return source;
+}
+
+async function bootstrapEvents(home: string): Promise<readonly Record<string, unknown>[]> {
+  const contents = await readFile(join(home, "logs", "desktop-bootstrap.jsonl"), "utf8");
+  return contents
+    .split("\n")
+    .filter(Boolean)
+    .map(line => JSON.parse(line) as Record<string, unknown>);
+}
+
+interface ProviderFixture {
+  readonly path: string;
+  readonly agent: string;
+}
+
+async function prepareLoginPathProvider(
+  context: {
+    readonly environment: Record<string, string>;
+    readonly home: string;
+  },
+  providerFixture?: ProviderFixture
+): Promise<void> {
+  const operatorHome = join(context.home, "operator");
+  const loginBin = join(operatorHome, ".local", "bin");
+  const fixtureDir = join(context.home, "fixtures");
+  const driver = join(
+    fixtureDir,
+    process.platform === "win32" ? "acpmock-driver.exe" : "acpmock-driver"
+  );
+  const provider = join(loginBin, process.platform === "win32" ? "desktop-acp.cmd" : "desktop-acp");
+  const fixture =
+    providerFixture?.path ??
+    join(
+      repositoryRoot,
+      "internal",
+      "testutil",
+      "acpmock",
+      "testdata",
+      "browser_session_lifecycle_fixture.json"
+    );
+  const fixtureAgent = providerFixture?.agent ?? loginPathFixtureAgent;
+  const diagnostics = join(context.home, "logs", "desktop-login-path-provider.jsonl");
+  const agentDir = join(context.home, "agents", loginPathAgent);
+  await Promise.all([
+    mkdir(loginBin, { recursive: true, mode: 0o700 }),
+    mkdir(fixtureDir, { recursive: true, mode: 0o700 }),
+    mkdir(agentDir, { recursive: true, mode: 0o700 }),
+  ]);
+  const build = await runCommand(
+    "go",
+    ["build", "-o", driver, "./internal/testutil/acpmock/cmd/acpmock-driver"],
+    { cwd: repositoryRoot, env: process.env }
+  );
+  if (build.exitCode !== 0) {
+    throw new Error(build.stderr.trim() || "ACP provider fixture build failed.");
+  }
+  if (process.platform !== "win32") await chmod(driver, 0o700);
+
+  context.environment.COMPOZY_DESKTOP_TEST_DRIVER = driver;
+  context.environment.COMPOZY_DESKTOP_TEST_FIXTURE = fixture;
+  context.environment.COMPOZY_DESKTOP_TEST_DIAGNOSTICS = diagnostics;
+  context.environment.COMPOZY_DESKTOP_TEST_LOGIN_BIN = loginBin;
+  context.environment.HOME = operatorHome;
+  context.environment.PATH =
+    process.platform === "win32" ? (process.env.PATH ?? "") : "/usr/bin:/bin:/usr/sbin:/sbin";
+
+  if (process.platform === "win32") {
+    await writeFile(
+      provider,
+      [
+        "@echo off",
+        `"%COMPOZY_DESKTOP_TEST_DRIVER%" --fixture "%COMPOZY_DESKTOP_TEST_FIXTURE%" --agent "${fixtureAgent}" --diagnostics "%COMPOZY_DESKTOP_TEST_DIAGNOSTICS%"`,
+        "",
+      ].join("\r\n"),
+      { mode: 0o700 }
+    );
+  } else {
+    const loginShell = join(operatorHome, "login-shell");
+    context.environment.SHELL = loginShell;
+    await Promise.all([
+      writeFile(
+        provider,
+        `#!/bin/sh\nexec "$COMPOZY_DESKTOP_TEST_DRIVER" --fixture "$COMPOZY_DESKTOP_TEST_FIXTURE" --agent "${fixtureAgent}" --diagnostics "$COMPOZY_DESKTOP_TEST_DIAGNOSTICS"\n`,
+        { mode: 0o700 }
+      ),
+      writeFile(
+        loginShell,
+        '#!/bin/sh\nexport PATH="$COMPOZY_DESKTOP_TEST_LOGIN_BIN:/usr/bin:/bin:/usr/sbin:/sbin"\nexec /bin/sh "$@"\n',
+        { mode: 0o700 }
+      ),
+    ]);
+  }
+
+  const configPath = join(context.home, "config.toml");
+  const config = await readFile(configPath, "utf8");
+  await Promise.all([
+    writeFile(
+      configPath,
+      `${config}\n[providers.desktop-login-path]\ncommand = "desktop-acp"\ndisplay_name = "Desktop login PATH"\nauth_mode = "none"\nnone_security = "local_transport"\n\n[providers.desktop-login-path.models]\ndefault = "qa-browser-model"\n`
+    ),
+    writeFile(
+      join(agentDir, "AGENT.md"),
+      `---\nname: ${loginPathAgent}\nprovider: desktop-login-path\nmodel: qa-browser-model\npermissions: approve-reads\n---\n\nYou are the desktop login PATH test agent.\n`,
+      { mode: 0o600 }
+    ),
+  ]);
+}
+
+async function corruptRuntimeBundle(context: {
+  readonly bundleRuntimePath: string;
+  readonly environment: Record<string, string>;
+  readonly home: string;
+  readonly resourcesPath: string;
+}): Promise<void> {
+  const bundleRoot = join(context.home, "corrupt-runtime-bundle");
+  await mkdir(bundleRoot, { recursive: true, mode: 0o700 });
+  const runtimeName = process.platform === "win32" ? "compozy.exe" : "compozy";
+  await Promise.all([
+    cp(context.bundleRuntimePath, join(bundleRoot, runtimeName)),
+    cp(
+      join(context.resourcesPath, "runtime", "runtime-manifest.json"),
+      join(bundleRoot, "runtime-manifest.json")
+    ),
+  ]);
+  await writeFile(join(bundleRoot, runtimeName), "corrupted-runtime");
+  context.environment.COMPOZY_DESKTOP_BUNDLE_ROOT = bundleRoot;
+}
+
+async function buildRuntimeFixture(
+  output: string,
+  version: string,
+  environment: NodeJS.ProcessEnv
+): Promise<void> {
+  await mkdir(resolve(output, ".."), { recursive: true, mode: 0o700 });
+  const ldflags = [
+    `-X github.com/compozy/compozy/internal/version.Version=${version}`,
+    "-X github.com/compozy/compozy/internal/version.Commit=e2e",
+    "-X github.com/compozy/compozy/internal/version.BuildDate=2026-08-16T00:00:00Z",
+    "-X github.com/compozy/compozy/internal/version.MinAppVersion=0.0.0",
+  ].join(" ");
+  const build = await runCommand(
+    "go",
+    ["build", "-trimpath", "-ldflags", ldflags, "-o", output, "./cmd/compozy"],
+    { cwd: repositoryRoot, env: environment }
+  );
+  if (build.exitCode !== 0) {
+    throw new Error(build.stderr.trim() || "Fixture build failed.");
+  }
+  if (process.platform !== "win32") await chmod(output, 0o700);
+}
+
+async function prepareRuntimeBundle(
+  context: {
+    readonly environment: Record<string, string>;
+    readonly home: string;
+  },
+  version: string
+): Promise<void> {
+  const bundleRoot = join(context.home, `runtime-bundle-${version}`);
+  const runtimeName = process.platform === "win32" ? "compozy.exe" : "compozy";
+  const runtime = join(bundleRoot, runtimeName);
+  await buildRuntimeFixture(runtime, version, context.environment);
+  const digest = (await executableSha256File(runtime)).toString("hex");
+  await writeFile(
+    join(bundleRoot, "runtime-manifest.json"),
+    `${JSON.stringify({ schema_version: 1, asset: runtimeName, sha256: digest }, null, 2)}\n`,
+    { mode: 0o600 }
+  );
+  context.environment.COMPOZY_DESKTOP_BUNDLE_ROOT = bundleRoot;
+}
+
+async function startRuntimeFixture(runtime: string, environment: NodeJS.ProcessEnv): Promise<void> {
+  const started = await runCommand(runtime, ["daemon", "start"], { env: environment });
+  if (started.exitCode !== 0) {
+    throw new Error(started.stderr.trim() || "Fixture start failed.");
+  }
+}
+
+async function buildRuntimeUpdateCoordinator(
+  output: string,
+  environment: NodeJS.ProcessEnv
+): Promise<void> {
+  const build = await runCommand(
+    "go",
+    ["build", "-tags", "e2e", "-o", output, "./desktop/e2e/fixtures/runtimeupdate"],
+    { cwd: repositoryRoot, env: environment }
+  );
+  if (build.exitCode !== 0) {
+    throw new Error(build.stderr.trim() || "Update coordinator fixture build failed.");
+  }
+  if (process.platform !== "win32") await chmod(output, 0o700);
+}
+
+async function seedRuntimeUpdateCache(home: string): Promise<void> {
+  const cache = join(home, "cache");
+  await mkdir(cache, { recursive: true, mode: 0o700 });
+  const now = new Date().toISOString();
+  await writeFile(
+    join(cache, "update-state-stable.json"),
+    `${JSON.stringify(
+      {
+        latest_version: "0.3.1",
+        release_url: "https://example.test/releases/v0.3.1",
+        published_at: now,
+        checked_at: now,
+        assets: [{ Name: "fixture", DownloadURL: "https://example.test/fixture" }],
+      },
+      null,
+      2
+    )}\n`,
+    { mode: 0o600 }
+  );
+}
+
+async function waitForUpdateOperation(home: string): Promise<void> {
+  const operationPath = join(home, "update-operation.json");
+  const deadline = Date.now() + 5_000;
+  while (Date.now() < deadline) {
+    try {
+      await stat(operationPath);
+      return;
+    } catch (error) {
+      if (!(error instanceof Error && "code" in error && error.code === "ENOENT")) throw error;
+    }
+    await new Promise(resolveDelay => setTimeout(resolveDelay, 25));
+  }
+  throw new Error("The runtime update fixture did not create its durable operation in time.");
+}
+
+async function invalidAppOpenCode(desktop: DesktopInstance, target: string): Promise<string> {
+  try {
+    await desktop.cli(["app", "open", target, "-o", "json"]);
+  } catch (error) {
+    const payload = JSON.parse(error instanceof Error ? error.message : String(error)) as {
+      error?: { code?: unknown };
+    };
+    return typeof payload.error?.code === "string" ? payload.error.code : "";
+  }
+  throw new Error(`Invalid app target ${target} unexpectedly succeeded.`);
+}
+
+test("E2E-001 E2E-002: first run provisions offline and exposes every boot phase", async ({
+  launchDesktop,
+}) => {
+  const desktop = await launchDesktop({
+    environment: {
+      HTTP_PROXY: "http://127.0.0.1:9",
+      HTTPS_PROXY: "http://127.0.0.1:9",
+      NO_PROXY: "127.0.0.1,localhost,::1",
+    },
+  });
+  expect(
+    await desktop.app.evaluate(
+      ({ BrowserWindow }) =>
+        BrowserWindow.getAllWindows().filter(window => window.isFocused()).length
+    )
+  ).toBe(0);
+  const product = await desktop.product();
+  expect(
+    await desktop.app.evaluate(
+      ({ BrowserWindow }) =>
+        BrowserWindow.getAllWindows().filter(window => window.isFocused()).length
+    )
+  ).toBe(0);
+  await expect(product).toHaveTitle(/CompozyOS/u);
+  const events = await bootstrapEvents(desktop.home);
+  const completedPhases = events
+    .filter(event => event.status === "completed")
+    .map(event => event.phase);
+  expect(completedPhases).toEqual(["provision", "ready"]);
+  const firstSeenPhases = events
+    .map(event => event.phase)
+    .filter((phase, index, phases) => phases.indexOf(phase) === index);
+  expect(firstSeenPhases).toEqual(["resolve", "provision", "start", "ready"]);
+  const status = await jsonCommand(desktop, ["app", "status", "-o", "json"]);
+  expect(status).toMatchObject({ installed: true, running: true, state: "product" });
+  expect(status.runtime).toMatchObject({ attached: true, owned: true });
+  expect(
+    (
+      await stat(
+        join(desktop.home, "bin", process.platform === "win32" ? "compozy.exe" : "compozy")
+      )
+    ).isFile()
+  ).toBe(true);
+});
+
+test("E2E-002: corrupt bundled runtime fails before provisioning and remains retryable", async ({
+  launchDesktop,
+}) => {
+  const desktop = await launchDesktop({ prepare: corruptRuntimeBundle });
+  await expect(
+    desktop.boot.getByRole("heading", { name: "CompozyOS could not start" })
+  ).toBeVisible();
+  await expect(desktop.boot.getByText(/integrity check|Reinstall the app/u)).toBeVisible();
+  await expect(desktop.boot.getByRole("button", { name: "Retry operation" })).toBeVisible();
+  await expect(
+    stat(join(desktop.home, "bin", process.platform === "win32" ? "compozy.exe" : "compozy"))
+  ).rejects.toThrow();
+});
+
+test("E2E-003: runtime below the minimum stays on version-skew guidance", async ({
+  launchDesktop,
+}) => {
+  const desktop = await launchDesktop({
+    prepare: async ({ environment, home }) => {
+      const runtime = join(home, "bin", process.platform === "win32" ? "compozy.exe" : "compozy");
+      await buildRuntimeFixture(runtime, "0.3.0-beta.1", environment);
+      await startRuntimeFixture(runtime, environment);
+    },
+  });
+  await expect(
+    desktop.boot.getByRole("heading", { name: "CompozyOS needs an update" })
+  ).toBeVisible();
+  await expect(desktop.boot.getByText(/Runtime 0\.3\.0-beta\.1.*Repair or update/u)).toBeVisible();
+  await expect(desktop.boot.getByRole("button", { name: "Retry operation" })).toHaveCount(0);
+});
+
+test("E2E-007: quitting during bootstrap completes cleanup and preserves the daemon", async ({
+  launchDesktop,
+}) => {
+  const desktop = await launchDesktop({
+    prepare: async ({ home, environment }) => {
+      environment.COMPOZY_DESKTOP_E2E_READY_FILE = join(home, "withheld-product-ready");
+    },
+  });
+  await expect(async () => {
+    expect((await bootstrapEvents(desktop.home)).at(-1)?.phase).toBe("ready");
+  }).toPass({ timeout: 30_000 });
+  const initial = await jsonCommand(desktop, ["status", "-o", "json"]);
+  const initialDaemon = initial.daemon as Record<string, unknown>;
+  await desktop.closeShell();
+  expect(desktop.shellProcess.signalCode).toBeNull();
+  const alive = await jsonCommand(desktop, ["status", "-o", "json"]);
+  expect(alive).toMatchObject({ daemon: { status: "running", pid: initialDaemon.pid } });
+  const record = JSON.parse(await readFile(join(desktop.home, "app.json"), "utf8")) as Record<
+    string,
+    unknown
+  >;
+  expect(record.state).not.toBe("product");
+});
+
+test("E2E-007: quitting drains shell resources even when renderer unload cannot respond", async ({
+  launchDesktop,
+}) => {
+  const desktop = await launchDesktop();
+  const product = await desktop.product();
+  const before = await jsonCommand(desktop, ["status", "-o", "json"]);
+  await product.evaluate(() => {
+    window.addEventListener("beforeunload", () => {
+      // Reproduce the renderer-side close handshake that can outlive shell cleanup.
+      for (;;) {
+        // The renderer cannot acknowledge closing; only this isolated process is blocked.
+      }
+    });
+  });
+  try {
+    await desktop.closeShell();
+    expect(desktop.shellProcess.signalCode).toBeNull();
+    expect(desktop.shellProcess.exitCode).toBe(0);
+    const alive = await jsonCommand(desktop, ["status", "-o", "json"]);
+    expect(alive).toMatchObject({
+      daemon: { status: "running", pid: (before.daemon as Record<string, unknown>).pid },
+    });
+  } finally {
+    // A failed shutdown regression must not leak its intentionally blocked renderer.
+    if (desktop.shellProcess.exitCode === null && desktop.shellProcess.signalCode === null) {
+      desktop.shellProcess.kill("SIGKILL");
+    }
+  }
+});
+
+test("E2E-007: failed product-window disposal retains the previous startup diagnosis", async ({
+  launchDesktop,
+}) => {
+  const first = await launchDesktop();
+  await first.product();
+  const before = await jsonCommand(first, ["app", "diagnose", "-o", "json"]);
+  const windowState = join(first.home, "desktop-window.json");
+  // Reject the real atomic state write rather than replacing the close implementation.
+  await rm(windowState, { force: true });
+  await mkdir(windowState);
+  await first.closeShell();
+  await rm(windowState, { recursive: true });
+
+  const next = await launchDesktop({ home: first.home });
+  await next.product();
+  const diagnosis = await jsonCommand(next, ["app", "diagnose", "-o", "json"]);
+  expect(diagnosis.previous_crash).toMatchObject({
+    boot_id: before.boot_id,
+    boot_phase: "product",
+  });
+});
+
+test("E2E-005 E2E-007 E2E-024: healthy diagnostics and shell relaunch preserve daemon ownership", async ({
+  launchDesktop,
+}) => {
+  const first = await launchDesktop();
+  await first.product();
+  await test.step("E2E-024: healthy retry and diagnostic export", async () => {
+    const recordPath = join(first.home, "app.json");
+    await expect
+      .poll(async () => Reflect.get(JSON.parse(await readFile(recordPath, "utf8")), "state"))
+      .toBe("product");
+    const before = JSON.parse(await readFile(recordPath, "utf8")) as Record<string, unknown>;
+    expect(await jsonCommand(first, ["app", "retry", "-o", "json"])).toMatchObject({
+      action: "retry",
+      result: { ok: true },
+    });
+    const after = JSON.parse(await readFile(recordPath, "utf8")) as Record<string, unknown>;
+    expect(after).toMatchObject({ pid: before.pid, state: "product" });
+    const report = await jsonCommand(first, ["app", "diagnose", "-o", "json"]);
+    expect(report).toMatchObject({ schema_version: 1, boot_phase: "product" });
+    const bundle = await jsonCommand(first, ["app", "diagnose", "--bundle", "--yes", "-o", "json"]);
+    const bundlePath = Reflect.get(bundle.bundle as Record<string, unknown>, "path");
+    expect(typeof bundlePath).toBe("string");
+    expect((await stat(String(bundlePath))).isFile()).toBe(true);
+    const extracted = await mkdtemp(join(tmpdir(), "compozy-diagnostic-bundle-"));
+    try {
+      await extract({ cwd: extracted, file: String(bundlePath) });
+      const manifest = JSON.parse(await readFile(join(extracted, "manifest.json"), "utf8")) as {
+        kind?: unknown;
+        report?: { boot_id?: unknown };
+        schema_version?: unknown;
+      };
+      expect(manifest).toMatchObject({
+        schema_version: 1,
+        kind: "compozyos_desktop_diagnostics",
+        report: { boot_id: report.boot_id },
+      });
+    } finally {
+      await rm(extracted, { recursive: true, force: true });
+    }
+  });
+
+  await test.step("E2E-005 E2E-007: attach, restart, and preserve daemon ownership", async () => {
+    const initial = await jsonCommand(first, ["status", "-o", "json"]);
+    await first.closeShell();
+    const alive = await jsonCommand(first, ["status", "-o", "json"]);
+    const initialDaemon = initial.daemon as Record<string, unknown>;
+    expect(alive).toMatchObject({
+      daemon: { status: "running", pid: initialDaemon.pid },
+    });
+
+    const attached = await launchDesktop({ home: first.home });
+    await attached.product();
+    const attachEvents = await bootstrapEvents(first.home);
+    expect(attachEvents.at(-1)).toMatchObject({ phase: "ready", resolution: "attach" });
+    await attached.closeShell();
+    await attached.cli(["daemon", "stop"]);
+
+    const started = await launchDesktop({ home: first.home });
+    await started.product();
+    const startEvents = await bootstrapEvents(first.home);
+    expect(startEvents.at(-1)).toMatchObject({ phase: "ready", resolution: "start" });
+    const restarted = await jsonCommand(started, ["status", "-o", "json"]);
+    expect((restarted.daemon as Record<string, unknown>).pid).not.toBe(initialDaemon.pid);
+  });
+});
+
+test("an updated app replaces its stale app-owned runtime without deleting home state", async ({
+  launchDesktop,
+}) => {
+  const first = await launchDesktop({
+    prepare: async context => await prepareRuntimeBundle(context, "0.3.0-beta.20"),
+  });
+  await first.product();
+  const sentinel = join(first.home, "runtime-coherence-sentinel.txt");
+  await writeFile(sentinel, "preserve me\n", { mode: 0o600 });
+  const before = await jsonCommand(first, ["status", "-o", "json"]);
+  const beforeDaemon = before.daemon as Record<string, unknown>;
+  const installedRuntime = join(
+    first.home,
+    "bin",
+    process.platform === "win32" ? "compozy.exe" : "compozy"
+  );
+  await first.closeShell();
+
+  const updated = await launchDesktop({ home: first.home });
+  await updated.product();
+  const after = await jsonCommand(updated, ["status", "-o", "json"]);
+  const afterDaemon = after.daemon as Record<string, unknown>;
+  expect(afterDaemon.status).toBe("running");
+  expect(afterDaemon.pid).not.toBe(beforeDaemon.pid);
+  expect(afterDaemon.version).not.toBe(beforeDaemon.version);
+  expect(await readFile(sentinel, "utf8")).toBe("preserve me\n");
+
+  const [installedDigest, bundledDigest] = await Promise.all(
+    [installedRuntime, updated.bundleRuntimePath].map(async path =>
+      createHash("sha256")
+        .update(await readFile(path))
+        .digest("hex")
+    )
+  );
+  expect(installedDigest).toBe(bundledDigest);
+  const provenance = JSON.parse(
+    await readFile(join(first.home, "bin", ".desktop-provenance.json"), "utf8")
+  ) as Record<string, unknown>;
+  expect(provenance).toMatchObject({
+    installed_by: "desktop-app",
+    binary_sha256: installedDigest,
+    runtime_version: afterDaemon.version,
+  });
+  expect((await bootstrapEvents(first.home)).at(-1)).toMatchObject({
+    phase: "ready",
+    resolution: "provision",
+  });
+});
+
+test("E2E-006: bounded startup failure exposes retry, logs, quit, and recovers after repair", async ({
+  launchDesktop,
+}) => {
+  const runtimeName = process.platform === "win32" ? "compozy.exe" : "compozy";
+  const desktop = await launchDesktop({
+    prepare: async ({ home }) => {
+      const runtime = join(home, "bin", runtimeName);
+      await mkdir(resolve(runtime, ".."), { recursive: true, mode: 0o700 });
+      await writeFile(runtime, "#!/bin/sh\nexit 1\n", { mode: 0o700 });
+    },
+  });
+  await expect(
+    desktop.boot.getByRole("heading", { name: "CompozyOS could not start" })
+  ).toBeVisible();
+  for (const name of ["Retry operation", "Open logs", "Quit", "Load diagnostics"]) {
+    await expect(desktop.boot.getByRole("button", { name })).toBeVisible();
+  }
+  const events = await bootstrapEvents(desktop.home);
+  expect(
+    events.filter(event => event.phase === "start" && event.status === "started")
+  ).toHaveLength(5);
+  await cp(desktop.bundleRuntimePath, join(desktop.home, "bin", runtimeName));
+  if (process.platform !== "win32") await chmod(join(desktop.home, "bin", runtimeName), 0o700);
+  await desktop.boot.getByRole("button", { name: "Retry operation" }).click();
+  await expect(await desktop.product()).toHaveTitle(/CompozyOS/u);
+});
+
+test("E2E-008 E2E-009: native chrome, geometry, and menu and shortcut zoom survive relaunch", async ({
+  launchDesktop,
+}) => {
+  const desktop = await launchDesktop();
+  const product = await desktop.product();
+  if (process.platform === "darwin" || process.platform === "linux") {
+    const overlay = await product.evaluate(() => {
+      const windowControlsOverlay = Reflect.get(navigator, "windowControlsOverlay") as
+        | {
+            getTitlebarAreaRect(): DOMRect;
+            visible: boolean;
+          }
+        | undefined;
+      if (!windowControlsOverlay) return null;
+      const area = windowControlsOverlay.getTitlebarAreaRect();
+      return {
+        height: area.height,
+        narrowerThanWindow: area.width < window.innerWidth,
+        visible: windowControlsOverlay.visible,
+      };
+    });
+    expect(overlay).toEqual({
+      height: 52,
+      narrowerThanWindow: true,
+      visible: true,
+    });
+  }
+  // Zoom and geometry share the same native window persistence and relaunch.
+  await desktop.app.evaluate(({ Menu }) => {
+    const view = Menu.getApplicationMenu()?.items.find(item => item.label === "View");
+    if (!view?.submenu) throw new Error("The View menu is missing.");
+    const zoomIn = view.submenu.items.find(item => item.label === "Zoom In");
+    if (!zoomIn) throw new Error("The Zoom In menu item is missing.");
+    zoomIn.click();
+  });
+  await product.keyboard.press(`${process.platform === "darwin" ? "Meta" : "Control"}+-`);
+  await product.keyboard.press(`${process.platform === "darwin" ? "Meta" : "Control"}+=`);
+  const before = await desktop.app.evaluate(({ BrowserWindow }) =>
+    BrowserWindow.getAllWindows()
+      .find(window => {
+        const url = window.webContents.getURL();
+        return url.startsWith("http://") || url.startsWith("https://");
+      })
+      ?.webContents.getZoomLevel()
+  );
+  expect(before).toBe(1);
+  await product.reload();
+  await expect
+    .poll(
+      async () =>
+        await desktop.app.evaluate(({ BrowserWindow }) =>
+          BrowserWindow.getAllWindows()
+            .find(window => {
+              const url = window.webContents.getURL();
+              return url.startsWith("http://") || url.startsWith("https://");
+            })
+            ?.webContents.getZoomLevel()
+        )
+    )
+    .toBe(1);
+
+  await desktop.app.evaluate(({ BrowserWindow }) => {
+    const window = BrowserWindow.getAllWindows().find(candidate => {
+      const url = candidate.webContents.getURL();
+      return url.startsWith("http://") || url.startsWith("https://");
+    });
+    if (!window) throw new Error("Product window missing.");
+    window.setBounds({ x: 80, y: 70, width: 960, height: 720 });
+    window.maximize();
+  });
+  await desktop.closeShell();
+  const maximized = await launchDesktop({ home: desktop.home });
+  await maximized.product();
+  expect(
+    await maximized.app.evaluate(({ BrowserWindow }) =>
+      BrowserWindow.getAllWindows().some(window => window.isMaximized())
+    )
+  ).toBe(true);
+  expect(
+    await maximized.app.evaluate(({ BrowserWindow }) =>
+      BrowserWindow.getAllWindows()
+        .find(window => {
+          const url = window.webContents.getURL();
+          return url.startsWith("http://") || url.startsWith("https://");
+        })
+        ?.webContents.getZoomLevel()
+    )
+  ).toBe(1);
+  await maximized.closeShell();
+  await writeFile(
+    join(desktop.home, "desktop-window.json"),
+    `${JSON.stringify({ x: 999999, y: 999999, width: 960, height: 720, maximized: false, zoom_level: 0 })}\n`,
+    { mode: 0o600 }
+  );
+  const clamped = await launchDesktop({ home: desktop.home });
+  await clamped.product();
+  expect(
+    await clamped.app.evaluate(({ BrowserWindow, screen }) => {
+      const window = BrowserWindow.getAllWindows().find(candidate => {
+        const url = candidate.webContents.getURL();
+        return url.startsWith("http://") || url.startsWith("https://");
+      });
+      if (!window) return false;
+      const bounds = window.getBounds();
+      const area = screen.getDisplayMatching(bounds).workArea;
+      return (
+        bounds.x >= area.x &&
+        bounds.y >= area.y &&
+        bounds.x + bounds.width <= area.x + area.width &&
+        bounds.y + bounds.height <= area.y + area.height
+      );
+    })
+  ).toBe(true);
+});
+
+test("desktop-owned runtime resolves a provider available only on the login PATH", async ({
+  launchDesktop,
+}) => {
+  test.skip(process.platform === "win32", "Windows preserves the inherited desktop PATH");
+
+  const desktop = await launchDesktop({ prepare: prepareLoginPathProvider });
+  await desktop.product();
+  const created = await jsonCommand(desktop, [
+    "session",
+    "new",
+    "--cwd",
+    repositoryRoot,
+    "--agent",
+    loginPathAgent,
+    "-o",
+    "json",
+  ]);
+  const sessionID = typeof created.id === "string" ? created.id : "";
+  expect(sessionID).not.toBe("");
+
+  await desktop.cli(["session", "prompt", sessionID, loginPathPrompt, "-o", "json"]);
+  await expect
+    .poll(async () => {
+      try {
+        return await readFile(
+          join(desktop.home, "logs", "desktop-login-path-provider.jsonl"),
+          "utf8"
+        );
+      } catch (error) {
+        if (error instanceof Error && "code" in error && error.code === "ENOENT") return "";
+        throw error;
+      }
+    })
+    .toContain(loginPathPrompt);
+});
+
+const openPathsAgent = "open-paths-agent";
+const openPathsPrompt = "e2e mention a file";
+
+/** Spec #1167 E2E-001: a fixture agent that names `fixture.txt:7`, and a recording editor. */
+async function prepareOpenPathsDesktop(context: {
+  readonly environment: Record<string, string>;
+  readonly home: string;
+}): Promise<void> {
+  const fixtureDir = join(context.home, "fixtures");
+  const project = join(context.home, "project");
+  await Promise.all([
+    mkdir(fixtureDir, { recursive: true, mode: 0o700 }),
+    mkdir(project, { recursive: true, mode: 0o700 }),
+  ]);
+  const fixture = join(fixtureDir, "open-paths-fixture.json");
+  const recorder = join(fixtureDir, "record-argv.mjs");
+  const recorded = join(fixtureDir, "editor-argv.json");
+  await Promise.all([
+    writeFile(
+      fixture,
+      JSON.stringify({
+        version: 2,
+        agents: [
+          {
+            name: openPathsAgent,
+            provider: "claude",
+            permissions: "approve-reads",
+            prompt: "Name the changed file.",
+            config_options: [
+              {
+                id: "model",
+                name: "Model",
+                current: "qa-browser-model",
+                values: [{ value: "qa-browser-model", label: "QA Browser Model" }],
+              },
+            ],
+            turns: [
+              {
+                name: "mention-file",
+                match: { turn_source: "user" },
+                steps: [{ kind: "assistant", text: "I changed `fixture.txt:7` for you." }],
+              },
+            ],
+          },
+        ],
+      })
+    ),
+    writeFile(
+      recorder,
+      `import { writeFileSync } from "node:fs";\nwriteFileSync(${JSON.stringify(recorded)}, JSON.stringify(process.argv.slice(2)));\n`
+    ),
+    writeFile(join(project, "fixture.txt"), "one\ntwo\nthree\nfour\nfive\nsix\nseven\n"),
+  ]);
+  await prepareLoginPathProvider(context, { path: fixture, agent: openPathsAgent });
+  const configPath = join(context.home, "config.toml");
+  const config = await readFile(configPath, "utf8");
+  const editorCommand = `"${process.execPath}" "${recorder}" {path} {line}`;
+  await writeFile(configPath, `${config}\n[desktop]\neditor_command = '${editorCommand}'\n`);
+}
+
+test("E2E-001 (#1167): Cmd/Ctrl+click on a transcript path opens it in the configured editor", async ({
+  launchDesktop,
+}) => {
+  const desktop = await launchDesktop({ prepare: prepareOpenPathsDesktop });
+  const product = await desktop.product();
+  await completeOnboarding(product);
+  const project = await realpath(join(desktop.home, "project"));
+  const created = await jsonCommand(desktop, [
+    "session",
+    "new",
+    "--cwd",
+    project,
+    "--agent",
+    loginPathAgent,
+    "-o",
+    "json",
+  ]);
+  const sessionID = typeof created.id === "string" ? created.id : "";
+  expect(sessionID).not.toBe("");
+  await desktop.cli(["session", "prompt", sessionID, openPathsPrompt, "-o", "json"]);
+
+  // Any confirmation would mean the inside-workspace rule failed; record instead of showing it.
+  await desktop.app.evaluate(({ dialog }) => {
+    Reflect.set(globalThis, "__openPathDialogs", 0);
+    dialog.showMessageBox = (async () => {
+      Reflect.set(globalThis, "__openPathDialogs", 1);
+      return { response: 1, checkboxChecked: false };
+    }) as typeof dialog.showMessageBox;
+  });
+
+  await product.goto(new URL(`/session/${sessionID}`, product.url()).toString(), {
+    waitUntil: "domcontentloaded",
+  });
+  const path = product.locator("code", { hasText: "fixture.txt:7" }).first();
+  await expect(path).toBeVisible({ timeout: 30_000 });
+  await expect(product.getByRole("button", { name: "Open fixture.txt in editor" })).toHaveCount(1);
+  await path.click({ modifiers: [process.platform === "darwin" ? "Meta" : "Control"] });
+
+  const recorded = join(desktop.home, "fixtures", "editor-argv.json");
+  await expect
+    .poll(
+      async () => {
+        try {
+          return JSON.parse(await readFile(recorded, "utf8")) as unknown;
+        } catch (error) {
+          if (error instanceof Error && "code" in error && error.code === "ENOENT") return null;
+          throw error;
+        }
+      },
+      { timeout: 15_000 }
+    )
+    .toEqual([join(project, "fixture.txt"), "7"]);
+  expect(await desktop.app.evaluate(() => Reflect.get(globalThis, "__openPathDialogs"))).toBe(0);
+});
+
+test("E2E-010: external navigation opens only safe web URLs and never leaves the product", async ({
+  launchDesktop,
+}) => {
+  const desktop = await launchDesktop();
+  const product = await desktop.product();
+  await desktop.app.evaluate(({ shell }) => {
+    Reflect.set(globalThis, "__compozyExternalURLs", []);
+    Reflect.set(shell, "openExternal", async (url: string) => {
+      const urls = Reflect.get(globalThis, "__compozyExternalURLs") as string[];
+      urls.push(url);
+    });
+  });
+  await product.evaluate(() => {
+    const safe = document.createElement("a");
+    safe.href = "https://example.com/safe";
+    safe.target = "_blank";
+    document.body.append(safe);
+    safe.click();
+    window.open("file:///etc/passwd");
+    window.location.href = "https://example.com/top-level";
+  });
+  await expect
+    .poll(() => product.url())
+    .toMatch(/^https?:\/\/(?:127\.0\.0\.1|localhost|\[::1\]):\d+/u);
+  await expect
+    .poll(() => desktop.app.evaluate(() => Reflect.get(globalThis, "__compozyExternalURLs")))
+    .toEqual(["https://example.com/safe", "https://example.com/top-level"]);
+});
+
+test("E2E-011: the daemon-served shell preserves Settings, Chromium effects, and native Edit shortcuts", async ({
+  launchDesktop,
+}) => {
+  const desktop = await launchDesktop();
+  const product = await desktop.product();
+  await completeOnboarding(product);
+  await test.step("Settings navigation and Chromium effects", async () => {
+    await desktop.cli(["app", "open", "/settings/general"]);
+    await expect(product).toHaveURL(/\/settings\/general(?:\?|$)/u);
+    await expect(product.getByTestId("settings-shell")).toBeVisible();
+    await expect(product.getByTestId("settings-section-nav")).toBeVisible();
+    await expect(
+      product.locator('[data-testid="settings-section-nav"] a[data-testid^="settings-section-"]')
+    ).toHaveText([
+      "General",
+      "Terminal",
+      "Appearance",
+      "Layouts",
+      "Profiles",
+      "Providers",
+      "Provider usage",
+      "Palette",
+      "Notifications",
+      "Diagnostics",
+      "Roles",
+      "Skills",
+      "MCP servers",
+      "Automation",
+      "Remote access",
+      "Hooks",
+      "Extensions",
+      "Marketplace",
+    ]);
+    await expect(product.getByText("Updates", { exact: true })).toBeVisible();
+    for (const section of ["hooks", "extensions", "mcp", "marketplace", "general"] as const) {
+      await product.getByTestId(`settings-section-${section}`).click();
+      await expect(product).toHaveURL(new RegExp(`/settings/${section}(?:\\?|$)`, "u"));
+      await expect(product.getByTestId(`settings-page-${section}`)).toBeVisible();
+    }
+    expect(
+      await product.evaluate(() => ({
+        backdropFilter: CSS.supports("backdrop-filter", "blur(1px)"),
+        chromium: navigator.userAgent.includes("Chrome/"),
+      }))
+    ).toEqual({ backdropFilter: true, chromium: true });
+  });
+
+  await test.step("Native Edit shortcuts copy and paste editable content", async () => {
+    expect(
+      await desktop.app.evaluate(({ Menu }) => {
+        const edit = Menu.getApplicationMenu()?.items.find(item => item.label === "Edit");
+        return edit?.submenu?.items.map(item => item.role) ?? [];
+      })
+    ).toEqual(expect.arrayContaining(["cut", "copy", "paste", "selectall"]));
+    await product.evaluate(() => {
+      const source = document.createElement("input");
+      source.setAttribute("aria-label", "Copy source");
+      source.value = "Copied through the Electron Edit menu";
+      const target = document.createElement("input");
+      target.setAttribute("aria-label", "Paste target");
+      document.body.append(source, target);
+      source.focus();
+      source.select();
+    });
+
+    const modifier = process.platform === "darwin" ? "Meta" : "Control";
+    await product.keyboard.press(`${modifier}+C`);
+    await product.getByRole("textbox", { name: "Paste target" }).focus();
+    await product.keyboard.press(`${modifier}+V`);
+
+    await expect(product.getByRole("textbox", { name: "Paste target" })).toHaveValue(
+      "Copied through the Electron Edit menu"
+    );
+  });
+});
+
+/**
+ * A loopback proxy that strips Cache-Control, as every runtime before #742 served its shell: a
+ * document fetched through it is cached heuristically fresh, like the shell an update leaves behind.
+ */
+async function startPreviousRuntimeProxy(): Promise<{ readonly port: number; close(): void }> {
+  const proxy = createServer((request, response) => {
+    const target = new URL(request.url ?? "/");
+    const upstream = forwardRequest(
+      {
+        host: target.hostname,
+        port: target.port,
+        path: `${target.pathname}${target.search}`,
+        method: request.method,
+        headers: request.headers,
+      },
+      reply => {
+        const headers = { ...reply.headers };
+        delete headers["cache-control"];
+        response.writeHead(reply.statusCode ?? 502, headers);
+        reply.pipe(response);
+      }
+    );
+    upstream.on("error", () => response.destroy());
+    request.pipe(upstream);
+  });
+  await new Promise<void>(resolveListen => proxy.listen(0, "127.0.0.1", resolveListen));
+  return { port: (proxy.address() as AddressInfo).port, close: () => proxy.close() };
+}
+
+test("a relaunch replaces a shell the renderer cached before a runtime update (#742)", async ({
+  launchDesktop,
+}) => {
+  // The runtime serves the shell; an update must never boot the previous release's bundle from
+  // the renderer's HTTP cache. An old Last-Modified makes the cached shell heuristically fresh.
+  const dist = await mkdtemp(join(tmpdir(), "compozy-shell-cache-"));
+  const proxy = await startPreviousRuntimeProxy();
+  try {
+    await cp(join(repositoryRoot, "web", "dist"), dist, { recursive: true });
+    const index = join(dist, "index.html");
+    const original = await readFile(index, "utf8");
+    const stamp = (release: string) =>
+      original.replace("</head>", `<meta name="compozy-e2e-release" content="${release}"></head>`);
+    const release = (product: Page) =>
+      product.locator('meta[name="compozy-e2e-release"]').getAttribute("content");
+    const prepare = async ({ environment }: { environment: Record<string, string> }) => {
+      environment.COMPOZY_WEB_DIST_DIR = dist;
+    };
+    await writeFile(index, stamp("previous"));
+    const released = new Date(Date.now() - 30 * 24 * 60 * 60 * 1000);
+    await utimes(index, released, released);
+
+    const first = await launchDesktop({ prepare });
+    const product = await first.product();
+    const shell = new URL("/", product.url()).toString();
+    // Cache the shell the way an older runtime served it: through the proxy, without Cache-Control.
+    await first.app.evaluate(async ({ session }, port) => {
+      await session.defaultSession.clearCache();
+      await session.defaultSession.setProxy({
+        proxyRules: `http=127.0.0.1:${port}`,
+        proxyBypassRules: "<-loopback>",
+      });
+    }, proxy.port);
+    await product.goto(shell);
+    expect(await release(product)).toBe("previous");
+    await first.app.evaluate(async ({ session }) => {
+      await session.defaultSession.setProxy({ mode: "direct" });
+    });
+    await first.closeShell();
+
+    await writeFile(index, stamp("updated"));
+    const relaunched = await launchDesktop({ home: first.home, prepare });
+    expect(await release(await relaunched.product())).toBe("updated");
+  } finally {
+    proxy.close();
+    await rm(dist, { recursive: true, force: true });
+  }
+});
+
+test("native context menu copies text and preserves spelling preferences after relaunch", async ({
+  launchDesktop,
+}) => {
+  const desktop = await launchDesktop();
+  const product = await desktop.product();
+  await completeOnboarding(product);
+  await desktop.app.evaluate(({ Menu }) => {
+    const popup = Menu.prototype.popup;
+    Menu.prototype.popup = function (options) {
+      Reflect.set(globalThis, "__observedContextMenu", this);
+      return popup.call(this, options);
+    };
+  });
+  await product.evaluate(() => {
+    const input = document.createElement("textarea");
+    input.setAttribute("aria-label", "Native context source");
+    input.value = "Copy through the native context menu";
+    input.style.cssText =
+      "position:fixed;top:100px;left:100px;z-index:2147483647;width:400px;height:100px";
+    document.body.append(input);
+    input.focus();
+    input.select();
+  });
+  const input = product.getByRole("textbox", { name: "Native context source" });
+  await input.click({ button: "right" });
+  await expect
+    .poll(
+      async () =>
+        await desktop.app.evaluate(() => {
+          const menu = Reflect.get(globalThis, "__observedContextMenu") as
+            | Electron.Menu
+            | undefined;
+          return menu?.items.map(item => item.role);
+        })
+    )
+    .toEqual(expect.arrayContaining(["cut", "copy", "paste", "selectall"]));
+  await desktop.app.evaluate(({ BrowserWindow }) => {
+    const menu = Reflect.get(globalThis, "__observedContextMenu") as Electron.Menu;
+    menu.closePopup();
+    const window = BrowserWindow.getAllWindows().find(candidate =>
+      /^https?:/u.test(candidate.webContents.getURL())
+    );
+    if (!window) throw new Error("The product window is missing.");
+    window.focus();
+  });
+  await expect
+    .poll(() =>
+      desktop.app.evaluate(({ BrowserWindow }) =>
+        /^https?:/u.test(BrowserWindow.getFocusedWindow()?.webContents.getURL() ?? "")
+      )
+    )
+    .toBe(true);
+  await desktop.app.evaluate(({ BrowserWindow, Menu }) => {
+    const menu = Reflect.get(globalThis, "__observedContextMenu") as Electron.Menu;
+    const copy = menu.items.find(item => item.role === "copy");
+    if (!copy?.enabled) throw new Error("Copy is not available for the selected text.");
+    const window = BrowserWindow.getFocusedWindow();
+    if (!window) throw new Error("The product window is not focused.");
+    if (process.platform === "darwin") {
+      // AppKit dispatches native roles through the responder chain, not MenuItem.click.
+      Menu.sendActionToFirstResponder("copy:");
+    } else {
+      copy.click({}, window, window.webContents);
+    }
+    const spelling = menu.items.find(item => item.label === "Spelling")?.submenu;
+    if (process.platform !== "darwin") {
+      const languages = spelling?.items.find(item => item.label === "Languages")?.submenu;
+      for (const language of ["en-US", "pt-BR"]) {
+        const item = languages?.items.find(candidate => candidate.label === language);
+        if (!item) throw new Error(`Dictionary ${language} is missing.`);
+        if (!item.checked) item.click();
+      }
+      for (const language of ["en-US", "pt-BR"]) {
+        if (!window.webContents.session.getSpellCheckerLanguages().includes(language)) {
+          throw new Error(`Dictionary ${language} was not selected.`);
+        }
+      }
+    }
+    const check = spelling?.items.find(item => item.label === "Check spelling");
+    if (!check) throw new Error("Spelling setting missing.");
+    if (!check.checked) throw new Error("Spellchecking should start enabled.");
+    check.click();
+  });
+  await expect
+    .poll(async () => await desktop.app.evaluate(({ clipboard }) => clipboard.readText()))
+    .toBe("Copy through the native context menu");
+  await desktop.closeShell();
+  const persisted = JSON.parse(await readFile(join(desktop.home, "desktop-window.json"), "utf8"));
+  expect(persisted.spellcheck.enabled).toBe(false);
+  const reopened = await launchDesktop({ home: desktop.home });
+  await reopened.product();
+  expect(
+    await reopened.app.evaluate(({ BrowserWindow }) => {
+      const window = BrowserWindow.getAllWindows().find(candidate =>
+        /^https?:/u.test(candidate.webContents.getURL())
+      );
+      return window?.webContents.session.isSpellCheckerEnabled();
+    })
+  ).toBe(false);
+  if (process.platform !== "darwin") {
+    expect(
+      await reopened.app.evaluate(({ BrowserWindow }) =>
+        BrowserWindow.getAllWindows()
+          .find(candidate => /^https?:/u.test(candidate.webContents.getURL()))
+          ?.webContents.session.getSpellCheckerLanguages()
+      )
+    ).toEqual(expect.arrayContaining(["en-US", "pt-BR"]));
+  }
+  const reopenedProduct = await reopened.product();
+  const workspaceID = await ensureProjectWorkspaceID(reopened, reopenedProduct);
+  const tasksDockItem = reopenedProduct
+    .locator('[data-slot="os-dock"]')
+    .getByRole("button", { name: "Tasks", exact: true });
+  await tasksDockItem.click({ button: "right" });
+  await expect(reopenedProduct.getByTestId("os-dock-app-menu-tasks")).toBeVisible();
+  await reopenedProduct.getByTestId("os-dock-app-menu-tasks-tab").click();
+  await tasksDockItem.click({ button: "right" });
+  await reopenedProduct.getByTestId("os-dock-app-menu-tasks-tab").click();
+  await reopenedProduct
+    .locator('[data-testid^="os-window-tab-menu-"]')
+    .first()
+    .click({ button: "right" });
+  await expect(reopenedProduct.getByRole("menuitem", { name: "Close other tabs" })).toBeVisible();
+  await reopenedProduct.keyboard.press("Escape");
+
+  const definitionPath = join(reopened.home, "context-menu-loop.json");
+  await writeFile(
+    definitionPath,
+    JSON.stringify({
+      apiVersion: "compozy.loop/v1",
+      kind: "Loop",
+      meta: { name: "context-menu-loop", version: 1 },
+      contract: {
+        goal: "Verify the loop editor context menu in the desktop shell",
+        definition_of_done: "The wait completes",
+        stop_when: "nodes.wait.status == 'succeeded'",
+        iteration_cap: 1,
+        no_progress: { window: 1 },
+        budget: { on_exceeded: "halt" },
+      },
+      graph: {
+        nodes: [{ id: "wait", class: "control", kind: "wait", params: { for: "1s" } }],
+        edges: [],
+      },
+      start: [{ kind: "uds" }],
+    })
+  );
+  await reopened.cli([
+    "loop",
+    "create",
+    "--workspace",
+    workspaceID,
+    "--file",
+    definitionPath,
+    "-o",
+    "json",
+  ]);
+  await reopened.cli(["app", "open", "/loops/context-menu-loop/editor"]);
+  await reopenedProduct
+    .locator('[data-testid="loop-editor-node"][data-node-id="wait"]')
+    .click({ button: "right" });
+  for (const verb of ["duplicate", "copy", "delete"]) {
+    await expect(reopenedProduct.getByTestId(`loop-node-menu-${verb}`)).toBeEnabled();
+  }
+});
+
+test("E2E-018: the real Settings API projects a journaled runtime swap through restart", async ({
+  launchDesktop,
+}) => {
+  let coordinator = "";
+  let replacement = "";
+  let updateEnvironment: Readonly<Record<string, string>> = {};
+  let updateHome = "";
+  let updateProcess: RunningCommand | undefined;
+  let updateResult:
+    | Promise<{ readonly exitCode: number; readonly stderr: string; readonly stdout: string }>
+    | undefined;
+  const desktop = await launchDesktop({
+    prepare: async context => {
+      updateHome = context.home;
+      updateEnvironment = context.environment;
+      replacement = join(context.home, "bin", "compozy-next");
+      coordinator = join(context.home, "runtime-update-fixture");
+      await Promise.all([
+        buildRuntimeFixture(replacement, "0.3.1", context.environment),
+        buildRuntimeUpdateCoordinator(coordinator, context.environment),
+        seedRuntimeUpdateCache(context.home),
+      ]);
+    },
+  });
+  const product = await desktop.product();
+  await completeOnboarding(product);
+  const child = startCommand(
+    coordinator,
+    ["--home", updateHome, "--replacement", replacement, "--phase-delay", "2s"],
+    { env: updateEnvironment }
+  );
+  updateProcess = child;
+  updateResult = child.result;
+  await waitForUpdateOperation(updateHome);
+  await product.goto(new URL("/settings/general", product.url()).toString(), {
+    waitUntil: "domcontentloaded",
+  });
+  const liveStatus = await product.evaluate(async () => {
+    const response = await fetch("/api/settings/update");
+    if (!response.ok) throw new Error(`Update status failed with ${response.status}.`);
+    return (await response.json()) as Record<string, unknown>;
+  });
+  expect(liveStatus.operation).toMatchObject({ targets: ["runtime"] });
+
+  try {
+    await desktop.cli(["app", "open", "/settings/general"]);
+    const progress = product.getByTestId("settings-page-general-update-progress");
+    for (const phase of ["download", "verify", "install", "start"]) {
+      // The daemon's named phase rides on data-phase; the visible label is plain words.
+      await expect(progress).toHaveAttribute("data-phase", phase, { timeout: 30_000 });
+    }
+    if (!updateResult) throw new Error("The runtime update fixture did not start.");
+    const result = await updateResult;
+    expect(result.exitCode, result.stderr).toBe(0);
+    expect(result.stdout.trim()).not.toBe("");
+    await expect(product).toHaveTitle(/CompozyOS/u);
+    await expect
+      .poll(async () =>
+        Reflect.get(await jsonCommand(desktop, ["version", "-o", "json"]), "Version")
+      )
+      .toBe("0.3.1");
+    const historyRecords = (
+      await readFile(join(desktop.home, "logs", "update-history.jsonl"), "utf8")
+    )
+      .split("\n")
+      .filter(Boolean)
+      .map(line => JSON.parse(line) as Record<string, unknown>);
+    const terminal = historyRecords.at(-1);
+    expect(terminal).toMatchObject({ outcome: "updated" });
+    expect(terminal?.runtime).toMatchObject({ phase: "finalized", to_version: "0.3.1" });
+  } finally {
+    if (updateProcess && updateProcess.child.exitCode === null) {
+      updateProcess.child.kill();
+      await updateProcess.result;
+    }
+  }
+});
+
+test("E2E-012: renderer crashes reload within budget and surface the crash-loop dialog", async ({
+  launchDesktop,
+}) => {
+  const desktop = await launchDesktop();
+  let product = await desktop.product();
+  const originalURL = product.url();
+  await desktop.app.evaluate(() => {
+    Reflect.set(globalThis, "__compozyCrashDialogs", 0);
+    Reflect.set(globalThis, "__compozyCrashDecisions", []);
+    Reflect.set(globalThis, "__compozyCrashDialogObserver", () => {
+      const count = Reflect.get(globalThis, "__compozyCrashDialogs") as number;
+      Reflect.set(globalThis, "__compozyCrashDialogs", count + 1);
+    });
+    Reflect.set(globalThis, "__compozyCrashDecisionObserver", (decision: string) => {
+      const decisions = Reflect.get(globalThis, "__compozyCrashDecisions") as string[];
+      decisions.push(decision);
+    });
+  });
+  for (let index = 0; index < 4; index += 1) {
+    await desktop.app.evaluate(({ BrowserWindow }) => {
+      const window = BrowserWindow.getAllWindows().find(candidate => {
+        const url = candidate.webContents.getURL();
+        return url.startsWith("http://") || url.startsWith("https://");
+      });
+      if (!window) throw new Error("Product window missing before renderer crash.");
+      window.webContents.forcefullyCrashRenderer();
+    });
+    await expect
+      .poll(
+        async () =>
+          await desktop.app.evaluate(
+            () => (Reflect.get(globalThis, "__compozyCrashDecisions") as string[]).length
+          )
+      )
+      .toBe(index + 1);
+    if (index < 3) {
+      await expect
+        .poll(async () => {
+          product = await desktop.product();
+          return await product
+            .getByTestId("os-desktop")
+            .isVisible()
+            .catch(() => false);
+        })
+        .toBe(true);
+      expect(product.url()).toBe(originalURL);
+    }
+  }
+  expect(
+    await desktop.app.evaluate(() => Reflect.get(globalThis, "__compozyCrashDecisions"))
+  ).toEqual(["reload", "reload", "reload", "dialog"]);
+  await expect
+    .poll(
+      async () => await desktop.app.evaluate(() => Reflect.get(globalThis, "__compozyCrashDialogs"))
+    )
+    .toBe(1);
+  expect(
+    ((await jsonCommand(desktop, ["status", "-o", "json"])).daemon as Record<string, unknown>)
+      .status
+  ).toBe("running");
+});
+
+test("E2E-004 E2E-013 E2E-014: running deep links reject hostile paths and launch bursts reuse one window", async ({
+  launchDesktop,
+}) => {
+  const desktop = await launchDesktop();
+  const product = await desktop.product();
+  await test.step("E2E-013 E2E-014: running deep links preserve the validation boundary", async () => {
+    await desktop.spawnSecondary(["compozyos://open/agents"]);
+    await expect(product).toHaveURL(/\/agents(?:\?|$)/u);
+    await desktop.spawnSecondary(["compozyos://open/route-that-does-not-exist"]);
+    await expect(product.getByRole("heading", { name: "Page not found" })).toBeVisible();
+    for (const hostile of [
+      "compozyos://open/http://evil.com",
+      "compozyos://open/../../etc",
+      "compozyos://open//host",
+    ]) {
+      await desktop.spawnSecondary([hostile]);
+      await expect(product).toHaveURL(/^https?:\/\/(?:127\.0\.0\.1|localhost|\[::1\]):\d+\/$/u);
+    }
+  });
+
+  await test.step("E2E-004: launch bursts reuse one window and deliver the last deep link", async () => {
+    await Promise.all([
+      desktop.spawnSecondary([]),
+      desktop.spawnSecondary(["compozyos://open/tasks"]),
+    ]);
+    await desktop.spawnSecondary(["compozyos://open/settings/general"]);
+    await expect(product).toHaveURL(/\/settings\/general(?:\?|$)/u);
+    const windows = await desktop.app.evaluate(
+      ({ BrowserWindow }) =>
+        BrowserWindow.getAllWindows().filter(window => {
+          const url = window.webContents.getURL();
+          return url.startsWith("http://") || url.startsWith("https://");
+        }).length
+    );
+    expect(windows).toBe(1);
+    expect(
+      await desktop.app.evaluate(({ BrowserWindow }) =>
+        BrowserWindow.getAllWindows().some(window => window.isVisible())
+      )
+    ).toBe(true);
+  });
+});
+
+test("E2E-015 E2E-025: cold-start deep links and CLI paths preserve the validation boundary", async ({
+  launchDesktop,
+}) => {
+  const cold = await launchDesktop({ argv: ["compozyos://open/settings/general"] });
+  const coldProduct = await cold.product();
+  await expect(coldProduct).toHaveURL(/\/settings\/general(?:\?|$)/u);
+  await completeOnboarding(coldProduct);
+  await cold.closeShell();
+  const hostile = await launchDesktop({ home: cold.home, argv: ["compozyos://open/../../etc"] });
+  const product = await hostile.product();
+  await expect(product).toHaveURL(/^https?:\/\/(?:127\.0\.0\.1|localhost|\[::1\]):\d+\/$/u);
+  await hostile.cli(["app", "open", "/tasks"]);
+  await expect(product).toHaveURL(/\/tasks(?:\?|$)/u);
+  for (const invalid of ["../etc", "/../etc", "//host", "/http://evil.com", "/bad\\path"]) {
+    expect(await invalidAppOpenCode(hostile, invalid)).toBe("invalid_target_path");
+  }
+});
+
+test("Terminal E2E-013: packaged shell preserves terminal input, accelerators, refit, and IME", async ({
+  launchDesktop,
+}) => {
+  const desktop = await launchDesktop({
+    environment: { COMPOZY_DESKTOP_E2E_FOREGROUND: "1" },
+  });
+  const product = await desktop.product();
+  await completeOnboarding(product);
+  const workspaceID = await ensureProjectWorkspaceID(desktop, product);
+
+  await product.locator('[data-slot="os-dock-item"][data-app="terminal"]').click();
+  const terminalWindow = product.getByTestId("terminal-window");
+  await expect(terminalWindow).toBeVisible();
+  // Opening the Terminal app resolves straight into a live PTY; there is no
+  // empty state to click through.
+  const terminalGrid = terminalWindow.getByRole("log");
+  await expect(terminalGrid).toBeVisible();
+  await expect(terminalGrid).toHaveAttribute("data-renderer", /^(dom|webgl)$/u);
+  await expect(terminalGrid).toHaveAttribute("data-readonly", "false");
+  const acceleratorModifier = process.platform === "darwin" ? "Meta" : "Control";
+  await terminalGrid.click();
+  await product.keyboard.type("echo desktop-shell-echo");
+  await product.keyboard.press("Enter");
+  await expect(terminalGrid).toContainText("desktop-shell-echo");
+
+  const pasteCommand = "echo desktop-clipboard-paste";
+  await product.evaluate(async value => await navigator.clipboard.writeText(value), pasteCommand);
+  await terminalGrid.click();
+  await product.keyboard.press(`${acceleratorModifier}+V`);
+  await product.keyboard.press("Enter");
+  const pastedRow = terminalWindow
+    .locator(".xterm-accessibility-tree > div", { hasText: "desktop-clipboard-paste" })
+    .last();
+  await expect(pastedRow).toBeVisible();
+  const pastedBox = await pastedRow.boundingBox();
+  if (!pastedBox) throw new Error("Pasted terminal output has no layout box.");
+  await product.mouse.move(pastedBox.x - 1, pastedBox.y + pastedBox.height / 2);
+  await product.mouse.down();
+  await product.mouse.move(pastedBox.x + pastedBox.width + 1, pastedBox.y + pastedBox.height / 2, {
+    steps: 8,
+  });
+  await product.mouse.up();
+  await product.keyboard.press(`${acceleratorModifier}+C`);
+  await expect
+    .poll(async () => await desktop.app.evaluate(({ clipboard }) => clipboard.readText()))
+    .toContain("desktop-clipboard-paste");
+
+  const terminalList = await jsonCommand(desktop, [
+    "terminal",
+    "list",
+    "--workspace",
+    workspaceID,
+    "-o",
+    "json",
+  ]);
+  const terminals = terminalList.terminals;
+  if (!Array.isArray(terminals) || terminals.length !== 1) {
+    throw new Error("Desktop Terminal test did not produce exactly one terminal.");
+  }
+  const terminalID = Reflect.get(terminals[0], "id");
+  if (typeof terminalID !== "string" || terminalID === "") {
+    throw new Error("Desktop Terminal test terminal has no stable id.");
+  }
+  await connectDesktopTerminalWatcher(product, workspaceID, terminalID);
+  try {
+    const initialGrid = await expectDesktopTerminalGrid(product, terminalWindow);
+
+    const productZoomFactor = async () =>
+      await desktop.app.evaluate(({ BrowserWindow }) => {
+        const productWindow = BrowserWindow.getAllWindows().find(window =>
+          /^https?:/u.test(window.webContents.getURL())
+        );
+        if (!productWindow) throw new Error("Product window missing before terminal zoom probe.");
+        return productWindow.webContents.getZoomFactor();
+      });
+    const initialZoomFactor = await productZoomFactor();
+    await pressProductAccelerator(desktop, "=");
+    await expect.poll(productZoomFactor).not.toBe(initialZoomFactor);
+    await expect
+      .poll(async () => await terminalWindow.getByTestId("terminal-size-vote").textContent())
+      .not.toContain(`${initialGrid.cols}×${initialGrid.rows}`);
+    await expectDesktopTerminalGrid(product, terminalWindow);
+    await pressProductAccelerator(desktop, "-");
+  } finally {
+    await closeDesktopTerminalWatcher(product);
+  }
+
+  await product.keyboard.press(`${acceleratorModifier}+K`);
+  await expect(product.getByRole("dialog", { name: "Command palette" })).toBeVisible();
+  await expect(terminalGrid).toContainText("desktop-shell-echo");
+  await product.keyboard.press("Escape");
+  await expect(product.getByRole("dialog", { name: "Command palette" })).toBeHidden();
+
+  const terminalInput = terminalWindow.locator(".xterm-helper-textarea");
+  await terminalInput.focus();
+  const imeEvidencePath = join(desktop.home, "terminal-ime-evidence.txt");
+  const imePayload = `node -e "require('node:fs').appendFileSync(process.argv[1], '漢字\\n'); process.stdout.write('\\x1b[2J\\x1b[H漢字\\n')" ${JSON.stringify(imeEvidencePath)}`;
+  await terminalInput.evaluate(input => {
+    input.addEventListener(
+      "compositionend",
+      () => {
+        input.dataset.e2eCompositionEnded = "true";
+      },
+      { once: true }
+    );
+  });
+  const cdp = await product.context().newCDPSession(product);
+  await cdp.send("Input.imeSetComposition", {
+    text: imePayload,
+    selectionStart: imePayload.length,
+    selectionEnd: imePayload.length,
+  });
+  await cdp.send("Input.insertText", { text: imePayload });
+  await expect(terminalInput).toHaveAttribute("data-e2e-composition-ended", "true");
+  await expect(
+    terminalWindow.locator(".xterm-accessibility-tree > div", { hasText: "appendFileSync" }).last()
+  ).toBeVisible();
+  await product.keyboard.press("Enter");
+  await expect(terminalGrid).toContainText("漢字");
+  await expect
+    .poll(async () => {
+      try {
+        return await readFile(imeEvidencePath, "utf8");
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code === "ENOENT") return "";
+        throw error;
+      }
+    })
+    .toBe("漢字\n");
+});
+
+test("E2E-034: packaged windows enforce security boundaries and intentional debugging", async ({
+  launchDesktop,
+}) => {
+  const desktop = await launchDesktop({
+    environment: { COMPOZY_DESKTOP_E2E_FOREGROUND: "1" },
+  });
+  const product = await desktop.product();
+  expect(await product.evaluate(async () => await Notification.requestPermission())).toBe(
+    "granted"
+  );
+  expect(await product.evaluate(() => Notification.permission)).toBe("granted");
+  expect(
+    await product.evaluate(async () => {
+      const frame = document.createElement("iframe");
+      // An initial about:blank frame inherits this origin without a CSP-blocked navigation.
+      const loaded = new Promise<void>(resolve => {
+        frame.onload = () => resolve();
+      });
+      document.body.append(frame);
+      try {
+        await loaded;
+        const frameNotification = Reflect.get(
+          frame.contentWindow!,
+          "Notification"
+        ) as typeof Notification;
+        return await frameNotification.requestPermission();
+      } finally {
+        frame.remove();
+      }
+    })
+  ).toBe("denied");
+
+  const clipboardValue = "Copied through the packaged Electron product window";
+  expect(
+    await product.evaluate(async value => {
+      await navigator.clipboard.writeText(value);
+      return true;
+    }, clipboardValue)
+  ).toBe(true);
+  expect(await desktop.app.evaluate(({ clipboard }) => clipboard.readText())).toBe(clipboardValue);
+
+  // Playwright's page keyboard does not enter Electron's native input path on macOS;
+  // sendInputEvent supplies the exact Control+Option+I chord that a physical keypress emits.
+  await desktop.app.evaluate(({ BrowserWindow }) => {
+    const productWindow = BrowserWindow.getAllWindows().find(window =>
+      /^https?:/u.test(window.webContents.getURL())
+    );
+    if (!productWindow) throw new Error("Product window missing before shortcut probe.");
+    productWindow.webContents.sendInputEvent({
+      type: "keyDown",
+      keyCode: "I",
+      modifiers: ["control", "alt"],
+    });
+    productWindow.webContents.sendInputEvent({
+      type: "keyUp",
+      keyCode: "I",
+      modifiers: ["control", "alt"],
+    });
+  });
+  await expect
+    .poll(
+      async () =>
+        await desktop.app.evaluate(({ BrowserWindow }) =>
+          BrowserWindow.getAllWindows().some(window => window.webContents.isDevToolsOpened())
+        )
+    )
+    .toBe(true);
+  // Detached DevTools can own native focus; sendInputEvent requires the product window focused.
+  const nativeProduct = await desktop.app.browserWindow(product);
+  await nativeProduct.evaluate(window => {
+    window.focus();
+    window.webContents.focus();
+  });
+  await expect.poll(() => nativeProduct.evaluate(window => window.isFocused())).toBe(true);
+  await desktop.app.evaluate(({ BrowserWindow }) => {
+    const productWindow = BrowserWindow.getAllWindows().find(window =>
+      /^https?:/u.test(window.webContents.getURL())
+    );
+    if (!productWindow) throw new Error("Product window missing before shortcut close.");
+    productWindow.webContents.sendInputEvent({
+      type: "keyDown",
+      keyCode: "I",
+      modifiers: ["control", "alt"],
+    });
+    productWindow.webContents.sendInputEvent({
+      type: "keyUp",
+      keyCode: "I",
+      modifiers: ["control", "alt"],
+    });
+  });
+  await expect
+    .poll(
+      async () =>
+        await desktop.app.evaluate(({ BrowserWindow }) =>
+          BrowserWindow.getAllWindows().some(window => window.webContents.isDevToolsOpened())
+        )
+    )
+    .toBe(false);
+  expect(
+    await product.evaluate(() => ({
+      nodeRequire: typeof Reflect.get(globalThis, "require"),
+      nodeProcess: typeof Reflect.get(globalThis, "process"),
+      webviewConstructor: document.createElement("webview").constructor.name,
+      windowOpen: window.open("about:blank"),
+    }))
+  ).toEqual({
+    nodeRequire: "undefined",
+    nodeProcess: "undefined",
+    webviewConstructor: "HTMLElement",
+    windowOpen: null,
+  });
+  const productResponse = await product.request.get(product.url());
+  const productCSP = productResponse.headers()["content-security-policy"] ?? "";
+  for (const directive of [
+    "connect-src 'self'",
+    "font-src 'self'",
+    "worker-src 'self' blob:",
+    "frame-src 'none'",
+    "frame-ancestors 'none'",
+    "object-src 'none'",
+    "base-uri 'self'",
+    "form-action 'self'",
+  ]) {
+    expect(productCSP).toContain(directive);
+  }
+  expect(productCSP).not.toContain("'unsafe-eval'");
+  await product.addInitScript(() => {
+    Reflect.set(globalThis, "__compozyCSPViolations", [] as string[]);
+    document.addEventListener("securitypolicyviolation", event => {
+      const violations = Reflect.get(globalThis, "__compozyCSPViolations");
+      if (Array.isArray(violations)) violations.push(event.violatedDirective);
+    });
+  });
+  await product.reload({ waitUntil: "domcontentloaded" });
+  const initialCSPViolations = await product.evaluate(async () => {
+    await document.fonts.ready;
+    const violations = Reflect.get(globalThis, "__compozyCSPViolations");
+    return Array.isArray(violations) ? violations : [];
+  });
+  expect(initialCSPViolations.filter(directive => directive.startsWith("font-src"))).toEqual([]);
+  const cspProbe = await product.evaluate(async terminalSubprotocol => {
+    const observeViolations = async (
+      probe: () => Promise<void> | void,
+      expectedViolation: boolean
+    ) => {
+      const directives: string[] = [];
+      let resolveViolation: () => void = () => undefined;
+      const violation = new Promise<void>(resolve => {
+        resolveViolation = resolve;
+      });
+      const onViolation = (event: SecurityPolicyViolationEvent) => {
+        directives.push(event.violatedDirective);
+        resolveViolation();
+      };
+      document.addEventListener("securitypolicyviolation", onViolation);
+      try {
+        await probe();
+        if (expectedViolation) {
+          await Promise.race([
+            violation,
+            new Promise<void>(resolve => window.setTimeout(resolve, 2_000)),
+          ]);
+        } else {
+          await new Promise<void>(resolve => requestAnimationFrame(() => resolve()));
+        }
+        return directives;
+      } finally {
+        document.removeEventListener("securitypolicyviolation", onViolation);
+      }
+    };
+    Reflect.deleteProperty(globalThis, "__compozyInlineScriptRan");
+    const inlineScriptDirectives = await observeViolations(() => {
+      const script = document.createElement("script");
+      script.textContent = "globalThis.__compozyInlineScriptRan = true";
+      document.body.append(script);
+      script.remove();
+    }, true);
+    const attemptSocket = async (url: string) => {
+      await new Promise<void>(resolveAttempt => {
+        let socket: WebSocket | null = null;
+        let timeout: number | undefined;
+        let settled = false;
+        const finish = () => {
+          if (settled) return;
+          settled = true;
+          if (timeout !== undefined) window.clearTimeout(timeout);
+          resolveAttempt();
+        };
+        try {
+          socket = new WebSocket(url, terminalSubprotocol);
+        } catch {
+          finish();
+          return;
+        }
+        timeout = window.setTimeout(() => {
+          socket?.close();
+          finish();
+        }, 2_000);
+        socket.onopen = () => {
+          socket.close();
+          finish();
+        };
+        socket.onerror = finish;
+      });
+    };
+    const socketProtocol = window.location.protocol === "https:" ? "wss:" : "ws:";
+    const sameOriginSocketDirectives = await observeViolations(
+      () =>
+        attemptSocket(
+          `${socketProtocol}//${window.location.host}/api/workspaces/csp-probe/terminals/term-probe/stream?mode=read&ticket=invalid`
+        ),
+      false
+    );
+    const crossOriginSocketDirectives = await observeViolations(
+      () => attemptSocket(`${socketProtocol}//example.com/compozy-terminal-cross-origin`),
+      true
+    );
+    return {
+      inlineScriptDirectives,
+      sameOriginSocketDirectives,
+      crossOriginSocketDirectives,
+      inlineScriptRan: Reflect.get(globalThis, "__compozyInlineScriptRan") === true,
+    };
+  }, TERMINAL_SUBPROTOCOL);
+  expect(cspProbe.inlineScriptRan).toBe(false);
+  expect(
+    cspProbe.inlineScriptDirectives.some(directive => directive.startsWith("script-src"))
+  ).toBe(true);
+  expect(cspProbe.sameOriginSocketDirectives).not.toContain("connect-src");
+  expect(cspProbe.crossOriginSocketDirectives).toContain("connect-src");
+
+  await desktop.closeShell();
+  const productionHome = await mkdtemp(join(tmpdir(), "compozy-electron-security-"));
+  const debugPort = await availableLoopbackPort();
+  const production = startCommand(
+    productionPackagedExecutable(),
+    [`--remote-debugging-port=${debugPort}`],
+    {
+      env: {
+        ...process.env,
+        COMPOZY_DESKTOP_BUNDLE_ROOT: join(productionHome, "missing-runtime"),
+        COMPOZY_DESKTOP_E2E: "1",
+        COMPOZY_HOME: productionHome,
+      },
+    }
+  );
+  let productionProbeError: Error | null = null;
+  const productionCleanupErrors: Error[] = [];
+  try {
+    await expect
+      .poll(async () => {
+        try {
+          const state = JSON.parse(
+            await readFile(join(productionHome, "app.json"), "utf8")
+          ) as Record<string, unknown>;
+          return state.pid;
+        } catch (error) {
+          if (error instanceof Error && "code" in error && error.code === "ENOENT") return 0;
+          throw error;
+        }
+      })
+      .toBe(production.child.pid);
+    const probeDeadline = Date.now() + 1_000;
+    while (Date.now() < probeDeadline) {
+      try {
+        await fetch(`http://127.0.0.1:${debugPort}/json/version`, {
+          signal: AbortSignal.timeout(100),
+        });
+        throw new Error("The production desktop exposed a remote-debugging endpoint.");
+      } catch (error) {
+        if (!(error instanceof TypeError || error instanceof DOMException)) throw error;
+      }
+    }
+  } catch (error) {
+    productionProbeError = error instanceof Error ? error : new Error(String(error));
+  } finally {
+    if (production.child.exitCode === null && !production.child.kill("SIGTERM")) {
+      productionCleanupErrors.push(
+        new Error("The production security probe could not stop the process.")
+      );
+    }
+    try {
+      await production.result;
+    } catch (error) {
+      productionCleanupErrors.push(error instanceof Error ? error : new Error(String(error)));
+    }
+    try {
+      await rm(productionHome, { recursive: true, force: true });
+    } catch (error) {
+      productionCleanupErrors.push(error instanceof Error ? error : new Error(String(error)));
+    }
+  }
+  if (productionProbeError) {
+    if (productionCleanupErrors.length > 0) {
+      throw new AggregateError(
+        [productionProbeError, ...productionCleanupErrors],
+        "The production security probe and its cleanup failed."
+      );
+    }
+    throw productionProbeError;
+  }
+  if (productionCleanupErrors.length === 1) throw productionCleanupErrors[0];
+  if (productionCleanupErrors.length > 1) {
+    throw new AggregateError(
+      productionCleanupErrors,
+      "The production security probe could not clean up."
+    );
+  }
+  const failed = await launchDesktop({ prepare: corruptRuntimeBundle });
+  const bootCSP = await failed.boot
+    .locator('meta[http-equiv="Content-Security-Policy"]')
+    .getAttribute("content");
+  expect(bootCSP).toBe(
+    "default-src 'none'; script-src 'self'; style-src 'self'; img-src 'self'; base-uri 'none'; form-action 'none'"
+  );
+  expect(
+    await failed.boot.evaluate(async () => {
+      Reflect.set(globalThis, "__compozyInlineExecuted", false);
+      const script = document.createElement("script");
+      script.textContent = "globalThis.__compozyInlineExecuted = true";
+      document.head.append(script);
+      await new Promise(resolveDelay => setTimeout(resolveDelay, 50));
+      return Reflect.get(globalThis, "__compozyInlineExecuted");
+    })
+  ).toBe(false);
+});
+
+test("E2E-027: a global summon restores and focuses the palette without crossing an open modal", async ({
+  launchDesktop,
+}) => {
+  const desktop = await launchDesktop({
+    environment: { COMPOZY_DESKTOP_E2E_FOREGROUND: "1" },
+  });
+  const product = await desktop.product();
+  await completeOnboarding(product);
+  await ensureProjectWorkspaceID(desktop, product);
+  await waitForGlobalShortcut(product, "palette.summon.global", "registered");
+
+  const focusFixture = await desktop.app.evaluate(async ({ BrowserWindow }) => {
+    const productWindow = BrowserWindow.getAllWindows().find(window =>
+      /^https?:/u.test(window.webContents.getURL())
+    );
+    if (!productWindow) throw new Error("Product window missing before global summon.");
+    productWindow.minimize();
+    const other = new BrowserWindow({ width: 320, height: 240, show: true });
+    other.setTitle("Shortcut focus fixture");
+    await other.loadURL("about:blank");
+    other.focus();
+    return { id: other.id, ownsFocus: other.isFocused() };
+  });
+  expect(
+    await desktop.app.evaluate(({ BrowserWindow }) => {
+      const productWindow = BrowserWindow.getAllWindows().find(window =>
+        /^https?:/u.test(window.webContents.getURL())
+      );
+      return productWindow?.isMinimized() ?? false;
+    })
+  ).toBe(true);
+
+  await invokeGlobalShortcut(desktop, "CommandOrControl+Shift+Space");
+  await expect(product.getByRole("dialog", { name: "Command palette" })).toBeVisible();
+  const productWindowState = async () =>
+    await desktop.app.evaluate(({ BrowserWindow }) => {
+      const productWindow = BrowserWindow.getAllWindows().find(window =>
+        /^https?:/u.test(window.webContents.getURL())
+      );
+      return productWindow
+        ? { focused: productWindow.isFocused(), minimized: productWindow.isMinimized() }
+        : null;
+    });
+  await expect.poll(async () => (await productWindowState())?.minimized).toBe(false);
+  if (focusFixture.ownsFocus || process.platform !== "darwin") {
+    await expect.poll(async () => (await productWindowState())?.focused).toBe(true);
+  }
+  await desktop.app.evaluate(
+    ({ BrowserWindow }, windowID) => BrowserWindow.fromId(windowID)?.destroy(),
+    focusFixture.id
+  );
+  await product.bringToFront();
+  await product.keyboard.press("Escape");
+  await expect(product.getByRole("dialog", { name: "Command palette" })).toHaveCount(0);
+
+  await product.getByRole("menuitem", { name: "Session", exact: true }).click();
+  await product.getByTestId("os-menubar-command-session.new").click();
+  const modal = product.getByRole("dialog").first();
+  await expect(modal).toBeVisible();
+  await invokeGlobalShortcut(desktop, "CommandOrControl+Shift+Space");
+  await expect(product.getByRole("dialog", { name: "Command palette" })).toHaveCount(0);
+  await expect
+    .poll(async () => await modal.evaluate(node => node.contains(document.activeElement)))
+    .toBe(true);
+});
+
+test("E2E-028: an argument command global hotkey summons directly into argument mode", async ({
+  launchDesktop,
+}) => {
+  let extensionSource = "";
+  const desktop = await launchDesktop({
+    environment: { COMPOZY_DESKTOP_E2E_FOREGROUND: "1" },
+    prepare: async context => {
+      extensionSource = await copyPaletteExtensionFixture(join(context.home, "workspace"));
+    },
+  });
+  const product = await desktop.product();
+  await completeOnboarding(product);
+  const workspaceID = await ensureProjectWorkspaceID(desktop, product);
+  await waitForGlobalShortcut(product, "palette.summon.global", "registered");
+  await desktop.cli([
+    "extension",
+    "dev",
+    extensionSource,
+    "--workspace",
+    workspaceID,
+    "-o",
+    "json",
+  ]);
+  await desktop.cli([
+    "cmd-palette",
+    "bind",
+    "ext.notes.capture",
+    "meta+alt+KeyN",
+    "--global",
+    "--workspace",
+    workspaceID,
+    "-o",
+    "json",
+  ]);
+  await product.reload({ waitUntil: "domcontentloaded" });
+  await expect(product.getByTestId("os-desktop")).toBeVisible();
+  await waitForGlobalShortcut(product, "ext.notes.capture", "registered");
+
+  await product.keyboard.press(process.platform === "darwin" ? "Meta+K" : "Control+K");
+  await product.getByRole("combobox").fill("capture note");
+  await expect(product.getByTestId("os-palette-command-ext.notes.capture")).toBeVisible();
+  await product.keyboard.press("Escape");
+  await expect(product.getByRole("dialog", { name: "Command palette" })).toHaveCount(0);
+
+  await desktop.app.evaluate(async ({ BrowserWindow }) => {
+    const other = new BrowserWindow({ width: 320, height: 240, show: true });
+    other.setTitle("Argument shortcut focus fixture");
+    await other.loadURL("about:blank");
+    other.focus();
+  });
+  await invokeGlobalShortcut(desktop, "CommandOrControl+Alt+N");
+  await expect(product.getByTestId("os-palette-args")).toBeVisible();
+  await expect(product.getByTestId("os-palette-arg-title")).toBeFocused();
+  await desktop.app.evaluate(({ BrowserWindow }) => {
+    BrowserWindow.getAllWindows()
+      .filter(window => window.getTitle() === "Argument shortcut focus fixture")
+      .forEach(window => window.destroy());
+  });
+});
+
+test("E2E-029: a captured replacement restores the previous binding and relaunch reports fresh truth", async ({
+  launchDesktop,
+}) => {
+  const desktop = await launchDesktop({
+    environment: { COMPOZY_DESKTOP_E2E_FOREGROUND: "1" },
+  });
+  const product = await desktop.product();
+  await completeOnboarding(product);
+  const workspaceID = await ensureProjectWorkspaceID(desktop, product);
+  await waitForGlobalShortcut(product, "palette.summon.global", "registered");
+  expect(
+    await desktop.app.evaluate(({ globalShortcut }) =>
+      globalShortcut.register("CommandOrControl+Alt+Space", () => undefined)
+    )
+  ).toBe(true);
+
+  await desktop.cli([
+    "cmd-palette",
+    "bind",
+    "palette.summon.global",
+    "meta+alt+Space",
+    "--global",
+    "--workspace",
+    workspaceID,
+    "-o",
+    "json",
+  ]);
+  await product.goto(new URL("/settings/layouts", product.url()).toString(), {
+    waitUntil: "domcontentloaded",
+  });
+  const failed = await waitForGlobalShortcut(product, "palette.summon.global", "failed_in_use");
+  expect(failed).toMatchObject({
+    active_chord: "meta+shift+Space",
+    intended_chord: "meta+alt+Space",
+  });
+  const globalSection = product.getByTestId("window-manager-global-hotkeys");
+  await expect(globalSection).toContainText("unavailable — in use by another application");
+  await expect(globalSection).toContainText("captured");
+
+  await invokeGlobalShortcut(desktop, "CommandOrControl+Shift+Space");
+  await expect(product.getByRole("dialog", { name: "Command palette" })).toBeVisible();
+  await desktop.closeShell();
+
+  const relaunched = await launchDesktop({
+    home: desktop.home,
+    environment: { COMPOZY_DESKTOP_E2E_FOREGROUND: "1" },
+  });
+  const relaunchedProduct = await relaunched.product();
+  const registered = await waitForGlobalShortcut(
+    relaunchedProduct,
+    "palette.summon.global",
+    "registered"
+  );
+  expect(registered).toMatchObject({
+    active_chord: "meta+alt+Space",
+    intended_chord: "meta+alt+Space",
+  });
+  await relaunched.cli(["app", "open", "/settings/layouts"]);
+  await expect(relaunchedProduct.getByTestId("window-manager-global-hotkeys")).toContainText(
+    "active"
+  );
+});
+
+test("E2E-030: a plain browser explains global hotkeys while keeping the in-app palette chord", async ({
+  launchDesktop,
+  playwright,
+}) => {
+  const desktop = await launchDesktop();
+  const product = await desktop.product();
+  await completeOnboarding(product);
+  const browser = await playwright.chromium.launch();
+  try {
+    const page = await browser.newPage();
+    await page.goto(new URL("/settings/layouts", product.url()).toString());
+    const globalSection = page.getByTestId("window-manager-global-hotkeys");
+    await expect(globalSection).toContainText("desktop only");
+    await expect(globalSection).toContainText("requires desktop shell");
+    await expect(
+      globalSection.getByRole("button", { name: /Record global hotkey/u }).first()
+    ).toBeDisabled();
+
+    await expect(page.locator('[data-slot="os-menubar-command"]')).toHaveAttribute(
+      "aria-keyshortcuts",
+      /^(?:Meta|Control)\+/u
+    );
+    if (process.platform === "darwin") {
+      // Chromium reserves Command-based browser shortcuts before Playwright can
+      // deliver them; dispatch the same renderer event the registry consumes.
+      await page.evaluate(() => {
+        const applePlatform = /^(?:Mac|iPhone|iPad|iPod)/iu.test(navigator.platform);
+        document.dispatchEvent(
+          new KeyboardEvent("keydown", {
+            key: "p",
+            code: "KeyP",
+            metaKey: applePlatform,
+            ctrlKey: !applePlatform,
+            shiftKey: true,
+            bubbles: true,
+            cancelable: true,
+          })
+        );
+      });
+    } else {
+      await page.keyboard.press("Control+K");
+    }
+    await expect(page.getByRole("dialog", { name: "Command palette" })).toBeVisible();
+  } finally {
+    await browser.close();
+  }
+});
+
+// Invariant: real desktop uptime and catalog activity keep per-client requests within a fixed budget.
+// Owner: packaged renderer and real daemon; canonical Electron shell E2E suite.
+test("@nightly Should bound catalog requests during sixty minutes of native desktop uptime", async ({
+  launchDesktop,
+}, testInfo) => {
+  test.setTimeout(90 * 60_000);
+  let ownedDesktop: DesktopInstance | undefined;
+  let ownedProduct: Page | undefined;
+  let receiptWorkspaceID: string | undefined;
+  let receiptRunID: string | undefined;
+  let sourceHead: string | undefined;
+  let runtimePath: string | undefined;
+  let stage = "source-head";
+  let seeded = 0;
+  let failed = false;
+  let failure: unknown;
+  const cleanupErrors: unknown[] = [];
+  const budget: Record<string, number> = {
+    "/api/sessions": 26,
+    "/api/sessions/facets": 13,
+    "/api/sessions/attention-summary": 13,
+  };
+  const requests: Array<{ elapsed_ms: number; path: string; query: string; client_id: string }> =
+    [];
+  const windows: Record<string, number[]> = {};
+  const maxima: Record<string, number> = {};
+  const clientIDs = new Set<string>();
+  const lifecycle: Array<{
+    elapsed_ms: number;
+    visible: boolean;
+    focused: boolean;
+    loop_status: string;
+    churn: number;
+  }> = [];
+  const violations: string[] = [];
+  let began = 0;
+  let measured = false;
+  let completed = false;
+  let churn = 0;
+  const onRequest = (request: Request) => {
+    if (!measured || request.method() !== "GET") return;
+    const url = new URL(request.url());
+    const path = url.pathname;
+    const pathLimit = budget[path];
+    if (pathLimit === undefined) return;
+    const clientID = request.headers()["x-compozy-client-id"] ?? "";
+    if (!/^web-[A-Za-z0-9_-]{1,76}$/u.test(clientID)) {
+      violations.push(`Missing renderer client identity: ${path}`);
+      return;
+    }
+    clientIDs.add(clientID);
+    const elapsed = performance.now() - began;
+    requests.push({ elapsed_ms: elapsed, path, query: url.search, client_id: clientID });
+    for (const [key, limit] of [
+      [path, pathLimit],
+      ["all", 52],
+    ] as const) {
+      const window = windows[key] ?? (windows[key] = []);
+      window.push(elapsed);
+      while (window[0] !== undefined && window[0] < elapsed - 60_000) window.shift();
+      maxima[key] = Math.max(maxima[key] ?? 0, window.length);
+      if (window.length > limit)
+        violations.push(`${key}: ${window.length} > ${limit} in rolling 60s`);
+    }
+  };
+  try {
+    const head = await runCommand("git", ["rev-parse", "HEAD"], {
+      cwd: repositoryRoot,
+      env: process.env,
+    });
+    sourceHead = head.stdout.trim();
+    expect(head.exitCode).toBe(0);
+    stage = "desktop-launch";
+    const desktop = await launchDesktop({
+      prepare: async context => {
+        runtimePath = context.bundleRuntimePath;
+        await prepareLoginPathProvider(context);
+      },
+      environment: { COMPOZY_DESKTOP_E2E_FOREGROUND: "1" },
+    });
+    ownedDesktop = desktop;
+    stage = "renderer-boot";
+    const product = await desktop.product();
+    ownedProduct = product;
+    stage = "onboarding";
+    await completeOnboarding(product);
+    stage = "workspace";
+    const workspaceID = await ensureProjectWorkspaceID(desktop, product);
+    receiptWorkspaceID = workspaceID;
+    const createStoppedSession = async (name: string) => {
+      const created = await jsonCommand(desktop, [
+        "session",
+        "new",
+        "--workspace",
+        workspaceID,
+        "--agent",
+        loginPathAgent,
+        "--name",
+        name,
+        "-o",
+        "json",
+      ]);
+      expect(typeof created.id).toBe("string");
+      const stopped = await jsonCommand(desktop, [
+        "session",
+        "stop",
+        String(created.id),
+        "--wait",
+        "-o",
+        "json",
+      ]);
+      expect(stopped).toMatchObject({ session_id: created.id, state: "stopped", verified: true });
+    };
+    stage = "seed-history";
+    for (let index = 0; index < 600; index++) {
+      await createStoppedSession(`catalog-history-${index}`);
+      seeded++;
+    }
+    stage = "verify-history";
+    const history = await product.request.get(
+      new URL(
+        `/api/sessions?workspace_id=${encodeURIComponent(workspaceID)}&state=stopped&limit=1`,
+        product.url()
+      ).toString()
+    );
+    expect(history.ok()).toBe(true);
+    expect((await history.json()).page.total).toBeGreaterThanOrEqual(600);
+
+    stage = "create-loop";
+    const definition = {
+      apiVersion: "compozy.loop/v1",
+      kind: "Loop",
+      meta: { name: "catalog-uptime", version: 1 },
+      contract: {
+        goal: "Keep a real Loop active during the catalog regression",
+        definition_of_done: "The wait completes",
+        stop_when: "nodes.wait.status == 'succeeded'",
+        iteration_cap: 1,
+        no_progress: { window: 1 },
+        budget: { on_exceeded: "halt" },
+      },
+      graph: {
+        nodes: [{ id: "wait", class: "control", kind: "wait", params: { for: "90m" } }],
+        edges: [],
+      },
+      start: [{ kind: "uds" }],
+    };
+    const definitionPath = join(desktop.home, "catalog-uptime.json");
+    await writeFile(definitionPath, JSON.stringify(definition));
+    await desktop.cli([
+      "loop",
+      "create",
+      "--workspace",
+      workspaceID,
+      "--file",
+      definitionPath,
+      "-o",
+      "json",
+    ]);
+    stage = "start-loop";
+    const started = await jsonCommand(desktop, [
+      "loop",
+      "run",
+      "--workspace",
+      workspaceID,
+      "--name",
+      "catalog-uptime",
+      "--no-prompt",
+      "-o",
+      "json",
+    ]);
+    const runID = (started.run as { id: string }).id;
+    expect(typeof runID).toBe("string");
+    expect(runID).not.toBe("");
+    receiptRunID = runID;
+    const runURL = new URL(
+      `/api/workspaces/${encodeURIComponent(workspaceID)}/loop-runs/${encodeURIComponent(runID)}`,
+      product.url()
+    ).toString();
+    stage = "open-catalog";
+    await product.getByRole("menuitem", { name: "Session", exact: true }).click();
+    await product.getByTestId("os-menubar-command-shell.sessions.toggle").click();
+    await expect(product.getByTestId("os-sessions-modal")).toBeVisible();
+    const window = await desktop.app.browserWindow(product);
+    await window.evaluate(nativeWindow => {
+      nativeWindow.show();
+      nativeWindow.focus();
+    });
+    await expect.poll(() => product.evaluate(() => document.hasFocus())).toBe(true);
+    // Initial navigation/seed reconciliation is outside the steady-state budget.
+    await product.waitForTimeout(10_000);
+    product.on("request", onRequest);
+    began = performance.now();
+    measured = true;
+    stage = "measurement";
+    while (performance.now() - began < 3_600_000) {
+      const native = await window.evaluate(nativeWindow => ({
+        visible: nativeWindow.isVisible(),
+        focused: nativeWindow.isFocused(),
+      }));
+      const run = await product.request.get(runURL);
+      expect(run.ok()).toBe(true);
+      const status = (await run.json()).run.status as string;
+      lifecycle.push({
+        elapsed_ms: performance.now() - began,
+        ...native,
+        loop_status: status,
+        churn,
+      });
+      expect(native).toEqual({ visible: true, focused: true });
+      expect(await product.evaluate(() => document.visibilityState)).toBe("visible");
+      expect(status).toBe("running");
+      expect(violations).toEqual([]);
+      // Public lifecycle changes keep delivering real catalog wakes throughout.
+      await createStoppedSession(`catalog-churn-${churn++}`);
+      await product.waitForTimeout(
+        Math.min(10_000, Math.max(0, 3_600_000 - (performance.now() - began)))
+      );
+    }
+    expect(performance.now() - began).toBeGreaterThanOrEqual(3_600_000);
+    expect(churn).toBeGreaterThan(100);
+    expect(clientIDs.size).toBe(1);
+    expect(requests.some(request => request.path === "/api/sessions")).toBe(true);
+    expect(violations).toEqual([]);
+    completed = true;
+    stage = "completed";
+  } catch (error) {
+    failed = true;
+    failure = error;
+    throw error;
+  } finally {
+    measured = false;
+    const elapsedMS = began === 0 ? 0 : performance.now() - began;
+    ownedProduct?.off("request", onRequest);
+    let runtimeDigest: string | undefined;
+    if (runtimePath) {
+      try {
+        runtimeDigest = (await executableSha256File(runtimePath)).toString("hex");
+      } catch (error) {
+        cleanupErrors.push(error);
+      }
+    }
+    if (ownedDesktop) {
+      if (receiptWorkspaceID && receiptRunID) {
+        try {
+          await ownedDesktop.cli([
+            "loop",
+            "cancel",
+            "--workspace",
+            receiptWorkspaceID,
+            "--run-id",
+            receiptRunID,
+            "-o",
+            "json",
+          ]);
+        } catch (error) {
+          cleanupErrors.push(error);
+        }
+      }
+    }
+    try {
+      const receiptPath = testInfo.outputPath("catalog-sixty-minute-rate.json");
+      await writeFile(
+        receiptPath,
+        JSON.stringify(
+          {
+            head: sourceHead,
+            runtime_sha256: runtimeDigest,
+            setup_stage: stage,
+            error: failed
+              ? failure instanceof Error
+                ? { message: failure.message, stack: failure.stack }
+                : String(failure)
+              : undefined,
+            cleanup_errors: cleanupErrors.map(String),
+            completed,
+            elapsed_ms: elapsedMS,
+            seed_stopped_sessions: seeded,
+            workspace_id: receiptWorkspaceID,
+            run_id: receiptRunID,
+            budget,
+            combined_budget: 52,
+            minute_buckets: requests.reduce<Record<string, Record<string, number>>>(
+              (buckets, request) => {
+                const minute = String(Math.floor(request.elapsed_ms / 60_000));
+                const bucket = buckets[minute] ?? (buckets[minute] = {});
+                bucket[request.path] = (bucket[request.path] ?? 0) + 1;
+                return buckets;
+              },
+              {}
+            ),
+            client_ids: [...clientIDs],
+            maxima,
+            churn,
+            lifecycle,
+            requests,
+            violations,
+          },
+          null,
+          2
+        )
+      );
+      await testInfo.attach("catalog-sixty-minute-rate", {
+        path: receiptPath,
+        contentType: "application/json",
+      });
+    } catch (error) {
+      cleanupErrors.push(error);
+    }
+    // launchDesktop's existing finalizer closes only this shell and its daemon,
+    // including any active session left by a failed public churn command.
+  }
+  if (cleanupErrors.length > 0) {
+    throw new AggregateError(cleanupErrors, "Catalog regression artifact or cleanup failed.");
+  }
+});

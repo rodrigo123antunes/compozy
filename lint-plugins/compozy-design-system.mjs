@@ -1,0 +1,259 @@
+/**
+ * OXC/ESLint Plugin: Compozy design-system rules.
+ *
+ * The rules below protect design-system contracts that are easy to regress with
+ * inline Tailwind classes or direct lucide imports. Rules are intentionally
+ * small and filename-scoped so they can be registered before their severity
+ * ramp without blocking in-flight consumer migrations.
+ */
+
+import {
+  extractStringValues,
+  isFrontendSourcePath,
+  isTestOrStoryPath,
+  noBannedImports,
+  noDesignGlazeRgba,
+  noInlineDesignTuples,
+  noInlineEyebrow,
+  normalizeFilename,
+  splitClassTokens,
+  THEME_BLIND_INK_LITERAL_RE,
+  THEME_BLIND_INK_RE,
+} from "./compozy-design-system-core-rules.mjs";
+
+/**
+ * Tokens whose `<prefix>-(--<name>)` arbitrary form is flagged because the
+ * bare utility `<prefix>-<name>` (or a renamed canonical form) exists in
+ * `packages/ui/src/tokens.css` `@theme`. The lint rule does NOT attempt the
+ * rewrite — that is the job of `scripts/codemod/tokens-bare-utilities.mjs`.
+ * The whitelist below covers runtime vars (Radix-injected, JS-resolved
+ * sizing, or component-internal tokens kept in `:root`) that legitimately
+ * stay in arbitrary form.
+ */
+const PREFER_BARE_UTILITY_WHITELIST = new Set([
+  // Radix-injected (popover, tooltip, dropdown, select, menu, accordion)
+  "anchor-width",
+  "anchor-height",
+  "available-width",
+  "available-height",
+  "transform-origin",
+  "accordion-panel-height",
+  // Base UI-injected (collapsible)
+  "collapsible-panel-height",
+  "fd-docs-row-1",
+  // App-injected runtime
+  "detail-inspector-width",
+  "tree-padding",
+  // Component-internal sizing kept in :root (NOT in @theme — see L-023)
+  "width-modal-sm",
+  "width-modal-md",
+  "width-modal-lg",
+  "width-modal-xl",
+  "size-catalog-logo",
+  "size-provider-logo-well",
+  "height-pill-group-segment-md",
+  "height-pill-group-segment-sm",
+  "space-pill-group-segment-sm-x",
+  "space-pill-group-segment-md-x",
+  // Eyebrow utility uses arbitrary length syntax internally (allowed)
+  "length:--text-eyebrow",
+]);
+
+const PREFER_BARE_RE =
+  /\b([a-zA-Z][a-zA-Z0-9]*(?:-[a-zA-Z][a-zA-Z0-9]*){0,2})-\(--([a-zA-Z0-9-]+)\)/g;
+
+/**
+ * Theme namespaces each sizing utility reads in Tailwind v4 (tailwindcss 4.3
+ * `dist/lib.js`). A bare `min-w-<stem>` resolves `--min-width-<stem>`, never
+ * `--width-<stem>`, so `min-w-(--width-x)` has no bare form: suggesting
+ * `min-w-x` produces a class that generates no CSS.
+ */
+const SPACING = "spacing";
+const SIZING_UTILITY_NAMESPACES = new Map([
+  ["w", ["width", SPACING, "container"]],
+  ["min-w", ["min-width", SPACING, "container"]],
+  ["max-w", ["max-width", SPACING, "container"]],
+  ["h", ["height", SPACING]],
+  ["min-h", ["min-height", "height", SPACING]],
+  ["max-h", ["max-height", "height", SPACING]],
+  ["size", ["size", SPACING]],
+  ["basis", ["flex-basis", SPACING, "container"]],
+  ...["p", "px", "py", "pt", "pr", "pb", "pl", "ps", "pe"].map(p => [p, ["padding", SPACING]]),
+  ...["m", "mx", "my", "mt", "mr", "mb", "ml", "ms", "me"].map(p => [p, ["margin", SPACING]]),
+  ...["gap", "gap-x", "gap-y"].map(p => [p, ["gap", SPACING]]),
+  ...["inset", "inset-x", "inset-y", "top", "right", "bottom", "left", "start", "end"].map(p => [
+    p,
+    ["inset", SPACING],
+  ]),
+]);
+
+/** Sizing namespaces a token name can start with, longest first. */
+const SIZING_NAMESPACES = [...new Set([...SIZING_UTILITY_NAMESPACES.values()].flat())].sort(
+  (a, b) => b.length - a.length
+);
+
+/**
+ * True when the bare utility would read `--<name>`: either the prefix is not a
+ * sizing utility (colors, radius, shadows…), or the token's namespace is one
+ * the sizing utility reads. A token outside every sizing namespace keeps the
+ * old behaviour (flagged unless whitelisted).
+ */
+function hasBareForm(prefix, name) {
+  const namespaces = SIZING_UTILITY_NAMESPACES.get(prefix);
+  if (!namespaces) return true;
+  const namespace = SIZING_NAMESPACES.find(candidate => name.startsWith(candidate + "-"));
+  if (!namespace) return true;
+  return namespaces.includes(namespace);
+}
+
+function findArbitraryTokenViolations(value) {
+  if (!value || typeof value !== "string") return [];
+  const out = [];
+  for (const match of value.matchAll(PREFER_BARE_RE)) {
+    const [, prefix, name] = match;
+    if (PREFER_BARE_UTILITY_WHITELIST.has(name)) continue;
+    if (name.startsWith("radix-")) continue;
+    if (!hasBareForm(prefix, name)) continue;
+    out.push({ prefix, name, full: match[0] });
+  }
+  return out;
+}
+
+const preferBareTokenUtility = {
+  meta: {
+    type: "problem",
+    docs: {
+      description:
+        "Prefer the bare Tailwind v4 utility over arbitrary-value `(--token)` syntax when the token exists in @theme. Run scripts/codemod/tokens-bare-utilities.mjs to auto-fix.",
+      recommended: false,
+    },
+    messages: {
+      preferBare:
+        'Use the bare utility instead of "{{full}}". Run `node scripts/codemod/tokens-bare-utilities.mjs --write` from the repo root. See L-023.',
+    },
+    schema: [],
+  },
+  create(context) {
+    const filename = context.filename || "";
+    if (!isFrontendSourcePath(filename) || isTestOrStoryPath(normalizeFilename(filename))) {
+      return {};
+    }
+    return {
+      JSXAttribute(node) {
+        if (!node.name || node.name.name !== "className") return;
+        const values = extractStringValues(node.value);
+        for (const value of values) {
+          const violations = findArbitraryTokenViolations(value);
+          for (const v of violations) {
+            context.report({ node, messageId: "preferBare", data: { full: v.full } });
+          }
+        }
+      },
+    };
+  },
+};
+
+// Focus-ring accessibility floor (BUG-20260714). Every :focus-visible indicator
+// must be ≥2px thick and ≥3:1 non-text contrast (GhostFocus is a critical a11y
+// failure). The low-contrast hairline colors (`ring-line-strong` / `ring-ring`)
+// and the sub-2px width (`ring-1`) are therefore forbidden inside ANY focus
+// variant. Callers use the shared focus tokens `shadow-focus-ring` (outset) /
+// `shadow-focus-inset` (inset), which flip per theme (50% white on dark, 50% ink on
+// light); brand focus rings stay on `ring-2 ring-brand`. A white or black ring ink
+// only reads on one theme, so it is banned inside focus variants too.
+const FOCUS_RING_COLOR_UTILITIES = new Set(["ring-line-strong", "ring-ring"]);
+
+const FOCUS_RING_WIDTH_UTILITIES = new Set(["ring-1"]);
+
+// Opaque or numeric-opacity `ring-white` / `ring-black` (and `outline-*`); arbitrary
+// translucent forms and hand-rolled `shadow-[…rgba(255,255,255,…)]` rings are caught by
+// the shared theme-blind ink matchers.
+const FOCUS_RING_THEME_INK_RE = /^(?:ring|outline)-(?:white|black)$/;
+
+function focusRingUtilityViolation(token) {
+  // Strip an optional Tailwind opacity modifier (e.g. `ring-ring/50`).
+  const bare = token.replace(/\/\d+$/, "");
+  // The utility is the final colon-separated segment; everything before it is
+  // the variant chain. A token with no variant is a resting utility, not focus.
+  const lastColon = bare.lastIndexOf(":");
+  if (lastColon === -1) return null;
+  const variants = bare.slice(0, lastColon);
+  const utility = bare.slice(lastColon + 1);
+  if (!variants.includes("focus")) return null;
+  if (FOCUS_RING_COLOR_UTILITIES.has(utility)) return "focusRingColor";
+  if (FOCUS_RING_WIDTH_UTILITIES.has(utility)) return "focusRingWidth";
+  if (
+    FOCUS_RING_THEME_INK_RE.test(utility) ||
+    THEME_BLIND_INK_RE.test(token) ||
+    (utility.startsWith("shadow-[") && THEME_BLIND_INK_LITERAL_RE.test(utility))
+  ) {
+    return "focusRingThemeInk";
+  }
+  return null;
+}
+
+function findFocusRingViolations(value) {
+  const out = [];
+  for (const token of splitClassTokens(value)) {
+    const messageId = focusRingUtilityViolation(token);
+    if (messageId) out.push(messageId);
+  }
+  return out;
+}
+
+const noLowContrastFocusRing = {
+  meta: {
+    type: "problem",
+    docs: {
+      description:
+        "Forbid low-contrast (ring-line-strong / ring-ring) or sub-2px (ring-1) focus rings in :focus-visible className. Use the shared focus tokens shadow-focus-ring / shadow-focus-inset.",
+      recommended: false,
+    },
+    messages: {
+      focusRingColor:
+        "Low-contrast focus ring in className. :focus-visible indicators need ≥3:1 contrast (GhostFocus is a critical a11y failure). Use focus-visible:shadow-focus-ring (outset) or focus-visible:shadow-focus-inset (inset); for brand focus use focus-visible:ring-2 focus-visible:ring-brand. ring-line-strong / ring-ring are banned in :focus-visible. See BUG-20260714 and DESIGN.md §10.",
+      focusRingThemeInk:
+        "Theme-blind focus ring ink in className. A white or black ring only reads on one theme. Use focus-visible:shadow-focus-ring / focus-visible:shadow-focus-inset, which flip per theme (or focus-visible:ring-2 focus-visible:ring-brand). See BUG-20260714 and DESIGN.md §10.",
+      focusRingWidth:
+        "Sub-2px focus ring in className. :focus-visible indicators must be ≥2px thick. Use focus-visible:shadow-focus-ring / focus-visible:shadow-focus-inset, or focus-visible:ring-2 for brand rings. ring-1 is banned in :focus-visible. See BUG-20260714 and DESIGN.md §10.",
+    },
+    schema: [],
+  },
+  create(context) {
+    const filename = normalizeFilename(context.filename || "");
+    // The focus-ring floor (BUG-20260714) applies to every frontend surface —
+    // the web app, the `@compozy/ui` primitives, and `packages/site`.
+    if (!isFrontendSourcePath(filename) || isTestOrStoryPath(filename)) {
+      return {};
+    }
+    return {
+      JSXAttribute(node) {
+        if (!node.name || node.name.name !== "className") return;
+        const seen = new Set();
+        for (const value of extractStringValues(node.value)) {
+          for (const messageId of findFocusRingViolations(value)) {
+            if (seen.has(messageId)) continue;
+            seen.add(messageId);
+            context.report({ node, messageId });
+          }
+        }
+      },
+    };
+  },
+};
+
+const plugin = {
+  meta: {
+    name: "compozy-design-system",
+  },
+  rules: {
+    "no-inline-eyebrow": noInlineEyebrow,
+    "no-design-glaze-rgba": noDesignGlazeRgba,
+    "no-banned-imports": noBannedImports,
+    "no-inline-design-tuples": noInlineDesignTuples,
+    "prefer-bare-token-utility": preferBareTokenUtility,
+    "no-low-contrast-focus-ring": noLowContrastFocusRing,
+  },
+};
+
+export default plugin;

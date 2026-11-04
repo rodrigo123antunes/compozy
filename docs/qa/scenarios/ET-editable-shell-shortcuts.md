@@ -1,0 +1,33 @@
+---
+id: ET-editable-shell-shortcuts
+area: ET
+title: Keep palette and session creation available inside inputs
+persona: Bruno
+journey: J-operate-desktop-shell
+expected: The live bindings for Command palette and New session still open their actions while an input is focused, question mark types normally, and Command slash opens the shortcut reference.
+entry_points: web desktop keyboard; session composer; Settings inputs
+qa_status: pass
+bug_ids:
+fix_status:
+retest_status:
+fix_commits:
+evidence: docs/qa/reports/2026-08-16-herdr-parity.md; .compozy/tasks/herdr-parity/evidence/visual/task_05
+last_report: docs/qa/reports/2026-08-16-herdr-parity.md
+overlaps: ET-web-command-palette-shortcuts
+---
+
+Flagged 2026-08-16 for the Herdr parity QA tail after the shell-chord registry migration.
+
+QA 2026-08-16 Herdr parity: The full Web E2E, daemon settings contract suites, and inspected visual bundles covered editable shortcuts, array/range persistence, blocked and shadowed diagnostics, Terminal preset preview/apply/revert, live cheatsheet freshness, and editable-context routing.
+
+## Palette selection continuity
+
+Open the palette from a focused composer while its command catalog is still loading. Open the
+action panel with the palette chord again. When recent or pinned commands reorder the results,
+the selected command and its action panel must remain available. Removing the selected command
+may select its nearest remaining neighbor. The existing Herdr E2E-016 journey owns the real
+keyboard flow; the palette hook suite covers asynchronous catalog and ranking arrival.
+
+QA impact 2026-10-18: the same continuity must hold when opening the action panel and refreshing
+ranking share one update. Select the row at the operator's action, before the new ordering can
+move the automatic highlight; retain normal automatic selection when no action was taken.

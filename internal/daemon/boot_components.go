@@ -1,0 +1,59 @@
+package daemon
+
+import (
+	"context"
+	"fmt"
+)
+
+func (d *Daemon) bootComponents(ctx context.Context, state *bootState, cleanup *bootCleanup) error {
+	steps := []func() error{
+		func() error { return d.bootConfig(state, cleanup) },
+		func() error { return d.bootPromptProviders(ctx, state) },
+		func() error { return d.bootRuntimeFoundation(ctx, state, cleanup) },
+		func() error { return d.bootSessionAttachments(ctx, state, cleanup) },
+		func() error { return d.bootRuntime(ctx, state, cleanup) },
+		func() error { return d.bootSessionRepair(ctx, state) },
+		func() error { return d.bootGoalSessionOutboxRelay(ctx, state, cleanup) },
+		func() error { return d.bootTasks(ctx, state, cleanup) },
+		func() error { return d.bootSpawnReaper(ctx, state, cleanup) },
+		func() error { return d.bootHooks(ctx, state, cleanup) },
+		func() error { return d.bootWorktrees(ctx, state, cleanup) },
+		func() error { return recoverBootProfileMoves(ctx, state) },
+		func() error { return d.bootSubagents(ctx, state) },
+		func() error { return d.bootReplyWatches(ctx, state) },
+		func() error { return d.bootToolRegistry(ctx, state, cleanup) },
+		func() error { return d.bootCmdPalette(ctx, state, cleanup) },
+		func() error { return d.bootLoopEffectRelay(ctx, state, cleanup) },
+		func() error { return d.bootCoordinator(ctx, state, cleanup) },
+		func() error { return d.bootAutomation(ctx, state, cleanup) },
+		func() error { return d.bootResourceReconcile(ctx, state, cleanup) },
+		func() error { return d.bootExtensions(ctx, state, cleanup) },
+		func() error { return d.bootResourceWatchers(ctx, state, cleanup) },
+		func() error { return d.bootSettings(ctx, state) },
+		func() error { return d.bootManagedDeliveries(ctx, state, cleanup) },
+		func() error { return d.bootSupportBundles(state, cleanup) },
+		func() error { return d.bootAgentInstances(ctx, state) },
+		func() error { return d.bootProactiveChecks(ctx, state, cleanup) },
+		func() error { return d.prepareServerDependencies(ctx, state) },
+		func() error { return d.bootGateway(ctx, state, cleanup) },
+		func() error { return d.bootServers(ctx, state, cleanup) },
+		func() error { return recoverBootDelegatedSessions(ctx, state) },
+		func() error { return resumeBootInterruptedSessions(ctx, state.sessions) },
+		func() error { return recoverBootMonitors(ctx, state) },
+		func() error { return d.bootFinalize(ctx, state) },
+		func() error { return d.bootTaskRoles(ctx, state) },
+		func() error { return startBootLoopCoordinators(ctx, state) },
+		func() error { return d.bootScheduler(ctx, state, cleanup) },
+		func() error { return d.bootSessionSupervision(ctx, state, cleanup) },
+		func() error { return d.bootSessionLaterReturns(ctx, state, cleanup) },
+	}
+	for _, step := range steps {
+		if err := ctx.Err(); err != nil {
+			return fmt.Errorf("daemon: boot canceled: %w", err)
+		}
+		if err := step(); err != nil {
+			return err
+		}
+	}
+	return nil
+}

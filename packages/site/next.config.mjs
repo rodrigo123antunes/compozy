@@ -1,0 +1,90 @@
+import { dirname, resolve } from "node:path";
+import { fileURLToPath } from "node:url";
+import { createMDX } from "fumadocs-mdx/next";
+import extensionsFeed from "../../catalog/v3/extensions.json" with { type: "json" };
+
+const withMDX = createMDX();
+const repoRoot = resolve(dirname(fileURLToPath(import.meta.url)), "..", "..");
+
+/** @type {import('next').NextConfig} */
+const config = {
+  // React Compiler (Next 16 stable): auto-memoization so the react-doctor
+  // react-compiler-no-manual-memoization rule holds across web + ui + site.
+  reactCompiler: true,
+  reactStrictMode: true,
+  trailingSlash: true,
+  redirects() {
+    return [
+      {
+        source: "/blog/crewai-alternatives/",
+        destination: "/blog/git-repository-briefing-python/",
+        permanent: true,
+      },
+      {
+        source: "/blog/langchain-alternatives-production-ai-agents/",
+        destination: "/blog/agent-framework-architecture/",
+        permanent: true,
+      },
+      {
+        source: "/blog/langgraph-alternatives/",
+        destination: "/blog/ai-agent-retries-idempotency/",
+        permanent: true,
+      },
+      {
+        source: "/blog/what-is-an-os-for-ai-agents/",
+        destination: "/blog/defining-agent-sessions-compozyos/",
+        permanent: true,
+      },
+      {
+        source: "/blog/orca-vs-openhands/",
+        destination: "/blog/cursor-vs-claude-code/",
+        permanent: true,
+      },
+      {
+        source: "/docs/examples/implement-tasks-loop/",
+        destination: "/docs/examples/deliver-a-spec/",
+        permanent: true,
+      },
+      {
+        source: "/docs/examples/review-and-fix-loop/",
+        destination: "/docs/examples/deliver-a-spec/",
+        permanent: true,
+      },
+      {
+        source: "/docs/automation/jobs/",
+        destination: "/docs/automation/schedules/",
+        permanent: true,
+      },
+      {
+        source: "/docs/automation/triggers/",
+        destination: "/docs/automation/events/",
+        permanent: true,
+      },
+    ];
+  },
+  turbopack: {
+    root: repoRoot,
+  },
+  outputFileTracingRoot: repoRoot,
+  outputFileTracingIncludes: {
+    "/api/search": [
+      "../../extensions/spec-cycle/extension.json",
+      "../../extensions/spec-cycle/agents/*/AGENT.md",
+      "../../extensions/spec-cycle/skills/*/SKILL.md",
+      "../../extensions/open-design/extension.json",
+      "../../extensions/open-design/loops/*/loop.yaml",
+      "../../extensions/open-design/agents/*/AGENT.md",
+      "../../extensions/open-design/skills/*/SKILL.md",
+      "../../skills/**/SKILL.md",
+    ],
+  },
+  images: {
+    remotePatterns: extensionsFeed.entries.flatMap(entry =>
+      entry.icon?.startsWith("https://") ? [new URL(entry.icon)] : []
+    ),
+    formats: ["image/avif", "image/webp"],
+    qualities: [75, 90],
+  },
+};
+
+export default withMDX(config);

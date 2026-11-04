@@ -1,0 +1,236 @@
+package cli
+
+import (
+	"encoding/json"
+	"fmt"
+	"io"
+	"net/http"
+	"testing"
+
+	"github.com/compozy/compozy/internal/api/contract"
+)
+
+func TestUnixSocketClientMCPAuthRoutesCarryExactWorkspaceIdentity(t *testing.T) {
+	t.Parallel()
+	// Invariant: all OAuth UDS requests preserve an explicit definition owner.
+	// Owner: daemon CLI client; canonical suite: client_mcp_test.go.
+	t.Run("Should retain the extension owner through every OAuth request", func(t *testing.T) {
+		t.Parallel()
+		calls := 0
+		client := &daemonClient{target: LocalClientTarget("/tmp/compozy.sock"),
+			httpClient: &http.Client{Transport: roundTripperFunc(func(req *http.Request) (*http.Response, error) {
+				calls++
+				if req.URL.Query().Get("owner") != "extension:linear" || req.URL.Query().Get("scope") != "user" {
+					return nil, fmt.Errorf("OAuth request lost its definition owner: %s", req.URL)
+				}
+				return newHTTPResponse(http.StatusOK, confirmedClientMCPAuthStatusJSON), nil
+			})}}
+		target := SettingsMCPAuthTarget{
+			Name:  "linear",
+			Owner: " extension:linear ",
+			Scope: contract.SettingsLayeredScopeUser,
+		}
+		if _, err := client.GetSettingsMCPAuthStatus(t.Context(), target); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := client.BeginSettingsMCPAuth(t.Context(), target, SettingsMCPAuthBeginRequest{}); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := client.ExchangeSettingsMCPAuth(t.Context(), target, SettingsMCPAuthExchangeRequest{}); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := client.LogoutSettingsMCPAuth(t.Context(), target); err != nil {
+			t.Fatal(err)
+		}
+		if calls != 4 {
+			t.Fatalf("OAuth calls = %d, want 4", calls)
+		}
+	})
+
+	t.Run("Should carry exact workspace identity through the MCP auth lifecycle", func(t *testing.T) {
+		t.Parallel()
+
+		requestIndex := 0
+		client := &daemonClient{
+			target: LocalClientTarget("/tmp/compozy.sock"),
+			httpClient: &http.Client{Transport: roundTripperFunc(func(req *http.Request) (*http.Response, error) {
+				requestIndex++
+				if got, want := req.URL.Query().Get("scope"), "workspace"; got != want {
+					return nil, fmt.Errorf("request %d scope = %q, want %q", requestIndex, got, want)
+				}
+				if got, want := req.URL.Query().Get("workspace_id"), "workspace-a"; got != want {
+					return nil, fmt.Errorf("request %d workspace_id = %q, want %q", requestIndex, got, want)
+				}
+				switch requestIndex {
+				case 1:
+					if req.Method != http.MethodGet || req.URL.Path != "/api/settings/mcp-servers" {
+						return nil, fmt.Errorf("list request = %s %s", req.Method, req.URL.Path)
+					}
+					return newHTTPResponse(http.StatusOK, `{"mcp_servers":[]}`), nil
+				case 2:
+					if req.Method != http.MethodGet ||
+						req.URL.Path != "/api/settings/mcp-servers/linear/auth/status" {
+						return nil, fmt.Errorf("status request = %s %s", req.Method, req.URL.Path)
+					}
+					return newHTTPResponse(http.StatusOK, confirmedClientMCPAuthStatusJSON), nil
+				case 3:
+					if req.Method != http.MethodPost ||
+						req.URL.Path != "/api/settings/mcp-servers/linear/auth/begin" {
+						return nil, fmt.Errorf("begin request = %s %s", req.Method, req.URL.Path)
+					}
+					body, err := io.ReadAll(req.Body)
+					if err != nil {
+						return nil, fmt.Errorf("read begin body: %w", err)
+					}
+					var begin SettingsMCPAuthBeginRequest
+					if err := json.Unmarshal(body, &begin); err != nil {
+						return nil, fmt.Errorf("decode begin body: %w", err)
+					}
+					if begin.Mode != contract.SettingsMCPAuthBeginModeAutomatic {
+						return nil, fmt.Errorf("begin mode = %q, want automatic", begin.Mode)
+					}
+					return newHTTPResponse(http.StatusOK, `{
+                  "authorization_url":"https://auth.example/authorize?state=public",
+                  "state":"public",
+                  "expires_at":"2026-07-13T16:05:00Z",
+                  "callback_url":"http://127.0.0.1:2123/api/mcp/oauth/callback",
+                  "manual_supported":true
+                }`), nil
+				case 4:
+					if req.Method != http.MethodPost ||
+						req.URL.Path != "/api/settings/mcp-servers/linear/auth/exchange" {
+						return nil, fmt.Errorf("exchange request = %s %s", req.Method, req.URL.Path)
+					}
+					body, err := io.ReadAll(req.Body)
+					if err != nil {
+						return nil, fmt.Errorf("read exchange body: %w", err)
+					}
+					var exchange SettingsMCPAuthExchangeRequest
+					if err := json.Unmarshal(body, &exchange); err != nil {
+						return nil, fmt.Errorf("decode exchange body: %w", err)
+					}
+					if exchange.RedirectURL != "http://127.0.0.1:2123/api/mcp/oauth/callback?code=sensitive-code&state=public" {
+						return nil, fmt.Errorf("exchange input classification is incorrect")
+					}
+					return newHTTPResponse(http.StatusOK, confirmedClientMCPAuthStatusJSON), nil
+				case 5:
+					if req.Method != http.MethodPost ||
+						req.URL.Path != "/api/settings/mcp-servers/linear/auth/logout" {
+						return nil, fmt.Errorf("logout request = %s %s", req.Method, req.URL.Path)
+					}
+					return newHTTPResponse(http.StatusOK, loggedOutClientMCPAuthStatusJSON), nil
+				default:
+					return nil, fmt.Errorf(
+						"unexpected MCP auth request %d: %s %s",
+						requestIndex,
+						req.Method,
+						req.URL.Path,
+					)
+				}
+			})},
+		}
+		ctx := t.Context()
+		scope := contract.SettingsLayeredScopeWorkspace
+		target := SettingsMCPAuthTarget{Name: "linear", Scope: scope, WorkspaceID: "workspace-a"}
+		if _, err := client.ListSettingsMCPServers(ctx, scope, "workspace-a", ""); err != nil {
+			t.Fatalf("ListSettingsMCPServers() error = %v", err)
+		}
+		readStatus, err := client.GetSettingsMCPAuthStatus(ctx, target)
+		if err != nil {
+			t.Fatalf("GetSettingsMCPAuthStatus() error = %v", err)
+		}
+		if !readStatus.TokenPresent || readStatus.WorkspaceID != "workspace-a" {
+			t.Fatalf("GetSettingsMCPAuthStatus() = %#v", readStatus)
+		}
+		begin, err := client.BeginSettingsMCPAuth(ctx, target, SettingsMCPAuthBeginRequest{
+			Mode: contract.SettingsMCPAuthBeginModeAutomatic,
+		})
+		if err != nil {
+			t.Fatalf("BeginSettingsMCPAuth() error = %v", err)
+		}
+		if begin.State != "public" || !begin.ManualSupported {
+			t.Fatalf("BeginSettingsMCPAuth() = %#v", begin)
+		}
+		status, err := client.ExchangeSettingsMCPAuth(
+			ctx,
+			target,
+			SettingsMCPAuthExchangeRequest{
+				RedirectURL: "http://127.0.0.1:2123/api/mcp/oauth/callback" +
+					"?code=sensitive-code&state=public",
+			},
+		)
+		if err != nil {
+			t.Fatalf("ExchangeSettingsMCPAuth() error = %v", err)
+		}
+		if !status.TokenPresent || status.WorkspaceID != "workspace-a" {
+			t.Fatalf("ExchangeSettingsMCPAuth() = %#v", status)
+		}
+		loggedOut, err := client.LogoutSettingsMCPAuth(ctx, target)
+		if err != nil {
+			t.Fatalf("LogoutSettingsMCPAuth() error = %v", err)
+		}
+		if loggedOut.TokenPresent || loggedOut.Status != "needs_login" {
+			t.Fatalf("LogoutSettingsMCPAuth() = %#v", loggedOut)
+		}
+		if requestIndex != 5 {
+			t.Fatalf("request count = %d, want 5", requestIndex)
+		}
+	})
+
+	t.Run("Should carry exact profile identity through MCP reads", func(t *testing.T) {
+		t.Parallel()
+
+		requestIndex := 0
+		client := &daemonClient{
+			target: LocalClientTarget("/tmp/compozy.sock"),
+			httpClient: &http.Client{Transport: roundTripperFunc(func(req *http.Request) (*http.Response, error) {
+				requestIndex++
+				if got := req.URL.Query().Get("scope"); got != "profile" {
+					return nil, fmt.Errorf("profile request scope = %q", got)
+				}
+				if got := req.URL.Query().Get("profile"); got != "marketing" {
+					return nil, fmt.Errorf("profile request profile = %q", got)
+				}
+				if got := req.URL.Query().Get("workspace_id"); got != "" {
+					return nil, fmt.Errorf("profile request workspace_id = %q", got)
+				}
+				switch requestIndex {
+				case 1:
+					return newHTTPResponse(http.StatusOK, `{"mcp_servers":[]}`), nil
+				case 2:
+					return newHTTPResponse(http.StatusOK, confirmedClientMCPAuthStatusJSON), nil
+				default:
+					return nil, fmt.Errorf("unexpected profile request %d", requestIndex)
+				}
+			})},
+		}
+		if _, err := client.ListSettingsMCPServers(
+			t.Context(), contract.SettingsLayeredScopeProfile, "", "marketing",
+		); err != nil {
+			t.Fatalf("ListSettingsMCPServers(profile) error = %v", err)
+		}
+		if _, err := client.GetSettingsMCPAuthStatus(t.Context(), SettingsMCPAuthTarget{
+			Name: "linear", Scope: contract.SettingsLayeredScopeProfile, Profile: "marketing",
+		}); err != nil {
+			t.Fatalf("GetSettingsMCPAuthStatus(profile) error = %v", err)
+		}
+	})
+}
+
+const confirmedClientMCPAuthStatusJSON = `{
+  "server_name":"linear",
+  "scope":"workspace",
+  "workspace_id":"workspace-a",
+  "status":"authenticated",
+  "refreshable":true,
+  "token_present":true
+}`
+
+const loggedOutClientMCPAuthStatusJSON = `{
+  "server_name":"linear",
+  "scope":"workspace",
+  "workspace_id":"workspace-a",
+  "status":"needs_login",
+  "refreshable":false,
+  "token_present":false
+}`

@@ -1,12 +1,10 @@
 name: Release
 
 on:
-  # Trigger on push to main for Release PR creation/update
   push:
     branches:
       - main
 
-  # Trigger on PR events for dry-run checks
   pull_request:
     types:
       - opened
@@ -15,57 +13,90 @@ on:
       - main
       - "release/v*"
 
-  # Manual trigger for emergency releases
   workflow_dispatch:
     inputs:
-      force_release:
-        description: "Force a release even if no changes"
-        required: false
-        type: boolean
-        default: true
+      release_ref:
+        description: Source ref; an explicit run may add one deterministic web-assets pin commit
+        required: true
+        type: string
       release_version:
-        description: "Force an exact release version (e.g. v0.2.7). Runs Production Release directly and bypasses git-cliff. Leave empty for normal Release PR behavior."
+        description: Strict unprefixed SemVer, for example 0.3.0-beta.1
+        required: true
+        type: string
+      release_channel:
+        description: Publication policy
+        required: true
+        type: choice
+        options:
+          - beta
+          - stable
+      desktop_feed:
+        description: Update feed the desktop app reads; stable only for the bridge beta that moves beta installs onto channel-stable
+        required: false
+        default: release
+        type: choice
+        options:
+          - release
+          - stable
+      desktop_artifacts_run_id:
+        description: Optional prior release run for the same source commit; reuse completed desktop artifacts
         required: false
         type: string
-        default: ""
 
+# Release merges ("build: release "/"build: prepare release ", plus legacy
+# "release:"/"ci(release):" subjects) land in their
+# own non-cancellable "-publish" group so a routine push to main can never
+# cancel an in-flight publication. Actions cannot interpolate YAML aliases inside
+# expressions, and workflow concurrency/job if cannot read env. Keep the inline
+# subject predicates aligned through the release workflow contract test.
 concurrency:
-  group: release-${{ github.workflow }}-${{ github.ref }}-${{ github.event_name }}
-  cancel-in-progress: true
+  group: >-
+    release-${{ github.workflow }}-${{ github.ref }}-${{ github.event_name }}${{ (github.event_name == 'push' && (startsWith(github.event.head_commit.message, 'release:') || startsWith(github.event.head_commit.message, 'ci(release):') || startsWith(github.event.head_commit.message, 'build: release ') || startsWith(github.event.head_commit.message, 'build: prepare release '))) && '-publish' || '' }}
+  cancel-in-progress: >-
+    ${{ !(github.event_name == 'push' && (startsWith(github.event.head_commit.message, 'release:') || startsWith(github.event.head_commit.message, 'ci(release):') || startsWith(github.event.head_commit.message, 'build: release ') || startsWith(github.event.head_commit.message, 'build: prepare release '))) }}
 
 env:
-  GO_VERSION: "1.26.3"
-  INITIAL_VERSION: "v0.1.0"
+  CGO_ENABLED: 0
+  GO_VERSION: "1.27.3"
   NODE_VERSION: "22"
-  NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
-  NPM_TOKEN: ${{ secrets.NPM_TOKEN }}
-  PR_RELEASE_MODULE: github.com/compozy/releasepr@v0.0.21
+  NPM_VERSION: "11.9.0"
+  COSIGN_VERSION: "v3.1.3"
+  INITIAL_VERSION: "v0.0.2"
+  PR_RELEASE_MODULE: github.com/compozy/releasepr@v0.0.35
 
 permissions:
+  actions: read
   contents: write
   packages: write
   pull-requests: write
+  issues: write
   id-token: write
   attestations: write
 
 jobs:
-  # Job 1: Create or update Release PR
+  # Create or update the release PR.
   release-pr:
     name: Create/Update Release PR
     if: |
       (github.event_name == 'push' &&
        github.ref == 'refs/heads/main' &&
-       !contains(github.event.head_commit.message, 'release:') &&
+       !startsWith(github.event.head_commit.message, 'release:') &&
        !startsWith(github.event.head_commit.message, 'ci(release):') &&
+       !(startsWith(github.event.head_commit.message, 'build: release ') ||
+         startsWith(github.event.head_commit.message, 'build: prepare release ')) &&
        !startsWith(github.event.head_commit.message, 'Merge pull request') &&
-       github.event.head_commit.author.name != 'github-actions[bot]') ||
-      (github.event_name == 'workflow_dispatch' && inputs.release_version == '')
+       github.event.head_commit.author.name != 'github-actions[bot]')
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
         with:
           fetch-depth: 0
           fetch-tags: true
+          # Persist the PAT in git credentials so pr-release branch updates
+          # push as the token owner, not github-actions[bot] — bot-triggered
+          # PR runs sit in "action_required" and never gate the release PR.
+          token: ${{ secrets.RELEASE_TOKEN }}
 
       - name: Prepare Go temporary directory
         env:
@@ -75,14 +106,22 @@ jobs:
       - uses: ./.github/actions/setup-go
         with:
           go-version: ${{ env.GO_VERSION }}
-          install-tools: "false"
 
       - uses: ./.github/actions/setup-node
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+
+      - uses: ./.github/actions/setup-bun
+        with:
+          install-playwright: "false"
+
       - uses: ./.github/actions/setup-git-cliff
 
       - name: Run PR Release Orchestrator
         env:
           GITHUB_TOKEN: ${{ secrets.RELEASE_TOKEN }}
+          RELEASE_TOKEN: ${{ secrets.RELEASE_TOKEN }}
+          COMPOZY_WEB_ASSETS_TOKEN: ${{ secrets.COMPOZY_WEB_ASSETS_TOKEN }}
           GITHUB_REPOSITORY: ${{ github.repository }}
           GITHUB_REPOSITORY_OWNER: ${{ github.repository_owner }}
           INITIAL_VERSION: ${{ env.INITIAL_VERSION }}
@@ -90,17 +129,462 @@ jobs:
         run: |
           go run "${{ env.PR_RELEASE_MODULE }}" pr-release --force --enable-rollback --ci-output
 
-  # Job 2: Dry-run checks on Release PR
-  dry-run:
-    name: Dry-Run Release Check
+  # Resolve one prospective release identity for every release-PR validation lane.
+  dry-run-identity:
+    name: Resolve Dry-Run Release Identity
     if: |
       github.event_name == 'pull_request' &&
-      (startsWith(github.event.pull_request.title, 'ci(release): Release ') ||
-       startsWith(github.event.pull_request.title, 'release: Release ') ||
+      (startsWith(github.event.pull_request.title, 'build: release ') ||
        startsWith(github.base_ref, 'release/v'))
     runs-on: ubuntu-latest
+    timeout-minutes: 10
+    outputs:
+      release_version: ${{ steps.identity.outputs.release_version }}
+      release_channel: ${{ steps.identity.outputs.release_channel }}
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+          fetch-tags: true
+
+      - uses: ./.github/actions/setup-node
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+
+      - name: Resolve prospective release identity
+        id: identity
+        env:
+          RELEASE_AUTO_CHANNEL: ${{ vars.RELEASE_AUTO_CHANNEL }}
+        run: scripts/resolve-auto-release-identity.sh "${RELEASE_AUTO_CHANNEL}" >>"${GITHUB_OUTPUT}"
+
+  # Run the GoReleaser dry-run on every release PR.
+  dry-run:
+    name: Dry-Run Build Validation
+    needs: dry-run-identity
+    if: |
+      github.event_name == 'pull_request' &&
+      (startsWith(github.event.pull_request.title, 'build: release ') ||
+       startsWith(github.base_ref, 'release/v'))
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+          fetch-tags: true
+
+      # Stage the workflow-version release tools outside the checkout. The
+      # production job reuses this exact step, including for older release refs.
+      - &load-release-workflow-tools
+        name: Load release workflow tools
+        env:
+          GH_TOKEN: ${{ secrets.RELEASE_TOKEN }}
+          WORKFLOW_COMMIT: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          workflow_tools=(
+            render-and-validate-release-body.sh
+            release-publication-state.sh
+            release-preflight.sh
+            prepare-desktop-smoke-artifact.sh
+            smoke-desktop-release-artifact.sh
+            smoke-public-cli-package.sh
+            validate-release-body.sh
+            verify-process-start.py
+          )
+          for workflow_tool in "${workflow_tools[@]}"; do
+            target="${RUNNER_TEMP}/${workflow_tool}"
+            gh api \
+              -H "Accept: application/vnd.github.raw+json" \
+              "repos/${GITHUB_REPOSITORY}/contents/scripts/${workflow_tool}?ref=${WORKFLOW_COMMIT}" \
+              >"${target}"
+            case "${workflow_tool}" in
+              *.sh) bash -n "${target}" ;;
+              *.py) python3 -m py_compile "${target}" ;;
+              *)
+                echo "Unsupported release workflow tool: ${workflow_tool}" >&2
+                exit 1
+                ;;
+            esac
+          done
+          gh api \
+            -H "Accept: application/vnd.github.raw+json" \
+            "repos/${GITHUB_REPOSITORY}/contents/.goreleaser.yml?ref=${WORKFLOW_COMMIT}" \
+            >"${RUNNER_TEMP}/.goreleaser.yml"
+          if [[ "$(grep -c '^version: 2$' "${RUNNER_TEMP}/.goreleaser.yml")" != "1" ]] ||
+            grep -q '^dist:' "${RUNNER_TEMP}/.goreleaser.yml"; then
+            echo "::error::Canonical GoReleaser config must contain one version and no dist override"
+            exit 1
+          fi
+          render_goreleaser_config() {
+            local release_dist="$1"
+            local target="$2"
+            awk -v release_dist="${release_dist}" '
+              $0 == "version: 2" {
+                print
+                print "dist: " release_dist
+                next
+              }
+              { print }
+            ' "${RUNNER_TEMP}/.goreleaser.yml" >"${target}"
+            grep -Fxq "dist: ${release_dist}" "${target}"
+          }
+          render_goreleaser_config ".release-dist/npm" "${RUNNER_TEMP}/.goreleaser-npm.yml"
+          render_goreleaser_config ".release-dist/github" "${RUNNER_TEMP}/.goreleaser-github.yml"
+          git_exclude="$(git rev-parse --git-path info/exclude)"
+          grep -Fxq '/.release-dist/' "${git_exclude}" || printf '/.release-dist/\n' >>"${git_exclude}"
+
+      - name: Validate isolated release directories
+        run: |
+          set -euo pipefail
+          git_exclude="$(git rev-parse --git-path info/exclude)"
+          grep -Fxq '/.release-dist/' "${git_exclude}"
+          git check-ignore -q .release-dist/npm/artifact
+          git check-ignore -q .release-dist/github/artifact
+
+      - name: Prepare Go temporary directory
+        env:
+          GOTMPDIR: ${{ runner.temp }}/go-tmp
+        run: mkdir -p "$GOTMPDIR"
+
+      - uses: ./.github/actions/setup-go
+        with:
+          go-version: ${{ env.GO_VERSION }}
+
+      - &validate-release-workflow-contract
+        name: Validate release workflow contract
+        env:
+          CGO_ENABLED: "1"
+        run: |
+          go test -race ./internal/config \
+            -run '^TestDesktopReleaseWorkflowFailsClosedAndPublishesDraftLast$' \
+            -count=1
+
+      - uses: ./.github/actions/setup-node
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          npm-version: ${{ env.NPM_VERSION }}
+
+      - uses: ./.github/actions/setup-bun
+        with:
+          install-playwright: "false"
+
+      - name: Setup Release Tools
+        uses: ./.github/actions/setup-release
+        with:
+          goreleaser-distribution: goreleaser-pro
+          goreleaser-version: v2.17.1
+          setup-docker: false
+          setup-docker-login: false
+          setup-qemu: false
+          cosign-version: ${{ env.COSIGN_VERSION }}
+
+      - name: Validate production GoReleaser commands
+        run: |
+          set -euo pipefail
+          goreleaser release --clean --prepare \
+            --config="${RUNNER_TEMP}/.goreleaser-npm.yml" \
+            --release-notes="${RUNNER_TEMP}/RELEASE_BODY.md" \
+            --release-header-tmpl=.goreleaser.release-header.md.tmpl \
+            --release-footer-tmpl=.goreleaser.release-footer.md.tmpl \
+            --help >/dev/null
+          goreleaser release --clean --prepare \
+            --config="${RUNNER_TEMP}/.goreleaser-github.yml" \
+            --release-notes="${RUNNER_TEMP}/RELEASE_BODY.md" \
+            --release-header-tmpl=.goreleaser.release-header.md.tmpl \
+            --release-footer-tmpl=.goreleaser.release-footer.md.tmpl \
+            --help >/dev/null
+          goreleaser publish --dist=.release-dist/github --help >/dev/null
+
+      - name: Verify explicit release plan contract
+        run: scripts/release-plan-contract.sh "${{ env.PR_RELEASE_MODULE }}"
+
+      - name: Verify npm trusted publishing prerequisites
+        run: |
+          set -euo pipefail
+          if [[ -n "${NPM_TOKEN:-}" ]]; then
+            echo "::error::npm publication must use GitHub Actions OIDC, not a long-lived token"
+            exit 1
+          fi
+          if [[ -n "${NODE_AUTH_TOKEN:-}" && "${NODE_AUTH_TOKEN:-}" != "XXXXX-XXXXX-XXXXX-XXXXX" ]]; then
+            echo "::error::npm publication must use GitHub Actions OIDC, not a long-lived token"
+            exit 1
+          fi
+          node -e '
+            const actual = process.argv[1].split(".").map(Number)
+            const minimum = [11, 5, 1]
+            const comparison = actual.reduce(
+              (result, part, index) => result || Math.sign(part - minimum[index]),
+              0,
+            )
+            if (comparison < 0) {
+              console.error("npm " + process.argv[1] + " does not support trusted publishing; require >=11.5.1")
+              process.exit(1)
+            }
+          ' "$(npm --version)"
+          npm ping --registry=https://registry.npmjs.org --userconfig=/dev/null
+
+      - name: Validate TypeScript SDK packages
+        run: |
+          scripts/publish-sdk-package.sh --dry-run sdk/typescript 0.0.0-beta.0 beta
+          scripts/publish-sdk-package.sh --dry-run sdk/client 0.0.0-beta.0 beta
+
+      - name: Validate prospective release body
+        id: prospective
+        env:
+          DRY_RUN_VERSION: ${{ needs.dry-run-identity.outputs.release_version }}
+          DRY_RUN_CHANNEL: ${{ needs.dry-run-identity.outputs.release_channel }}
+          PR_RELEASE_LOG_LEVEL: error
+        run: |
+          set -euo pipefail
+          plan_output="${RUNNER_TEMP}/prospective-release-plan"
+          go run "${PR_RELEASE_MODULE}" plan \
+            --ref HEAD \
+            --version "${DRY_RUN_VERSION}" \
+            --channel "${DRY_RUN_CHANNEL}" \
+            --format github >"${plan_output}"
+
+          expected_keys=(
+            release_ref release_commit release_version release_tag release_previous_tag
+            release_git_range release_initial release_channel
+            github_prerelease github_make_latest npm_tag homebrew_skip_upload
+          )
+          for key in "${expected_keys[@]}"; do
+            if [[ "$(grep -c "^${key}=" "${plan_output}")" != "1" ]]; then
+              echo "::error::Prospective planner output must contain exactly one ${key} entry"
+              exit 1
+            fi
+          done
+          if [[ "$(wc -l <"${plan_output}" | tr -d ' ')" != "12" ]]; then
+            echo "::error::Prospective planner output must contain exactly twelve authoritative entries"
+            exit 1
+          fi
+
+          release_tag="$(sed -n 's/^release_tag=//p' "${plan_output}")"
+          release_git_range="$(sed -n 's/^release_git_range=//p' "${plan_output}")"
+          release_initial="$(sed -n 's/^release_initial=//p' "${plan_output}")"
+          bash "${RUNNER_TEMP}/render-and-validate-release-body.sh" \
+            "${PR_RELEASE_MODULE}" \
+            "${release_tag}" \
+            "${release_git_range}" \
+            "${release_initial}" \
+            "${RUNNER_TEMP}/PROSPECTIVE_RELEASE_BODY.md"
+          head -1 "${RUNNER_TEMP}/PROSPECTIVE_RELEASE_BODY.md"
+          grep -E '^(github_prerelease|github_make_latest|npm_tag|homebrew_skip_upload)=' \
+            "${plan_output}" >>"${GITHUB_OUTPUT}"
+
+      - &run-release-preflight
+        name: Run release preflight
+        run: bash "${RUNNER_TEMP}/release-preflight.sh"
+
+      - name: Stage dry-run desktop compatibility catalog
+        env:
+          DRY_RUN_VERSION: ${{ needs.dry-run-identity.outputs.release_version }}
+        run: |
+          set -euo pipefail
+          mkdir -p .artifacts/desktop
+          jq -cn \
+            --arg runtime_version "${DRY_RUN_VERSION}" \
+            --arg min_app_version "${DRY_RUN_VERSION}" \
+            '{runtime_version: $runtime_version, min_app_version: $min_app_version}' \
+            >.artifacts/desktop/compat.json
+
+      - name: Run pr-release Dry-Run (goreleaser build validation)
+        env:
+          GITHUB_TOKEN: ${{ secrets.RELEASE_TOKEN }}
+          RELEASE_TOKEN: ${{ secrets.RELEASE_TOKEN }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
+          GITHUB_REPOSITORY_OWNER: ${{ github.repository_owner }}
+          GITHUB_PRERELEASE: ${{ steps.prospective.outputs.github_prerelease }}
+          GITHUB_MAKE_LATEST: ${{ steps.prospective.outputs.github_make_latest }}
+          NPM_TAG: ${{ steps.prospective.outputs.npm_tag }}
+          HOMEBREW_SKIP_UPLOAD: ${{ steps.prospective.outputs.homebrew_skip_upload }}
+          GORELEASER_KEY: ${{ secrets.GORELEASER_KEY }}
+          GOTMPDIR: ${{ runner.temp }}/go-tmp
+        run: go run "${{ env.PR_RELEASE_MODULE }}" dry-run --ci-output
+
+  # Validate Electron bundles on every shipping architecture without publication.
+  desktop-dry-run:
+    name: Dry-Run Desktop ${{ matrix.name }}
+    needs: dry-run-identity
+    if: |
+      github.event_name == 'pull_request' &&
+      (startsWith(github.event.pull_request.title, 'build: release ') ||
+       startsWith(github.base_ref, 'release/v'))
+    strategy:
+      fail-fast: false
+      matrix: &desktop-release-matrix
+        include:
+          - name: macOS arm64
+            id: macos-arm64
+            runner: macos-15
+            platform: mac
+            arch: arm64
+          - name: macOS x64
+            id: macos-x64
+            runner: macos-15-intel
+            platform: mac
+            arch: x64
+          - name: Linux x86_64
+            id: linux
+            runner: ubuntu-22.04
+            platform: linux
+            arch: x64
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 180
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+          fetch-tags: true
+
+      - uses: ./.github/actions/setup-go
+        with:
+          go-version: ${{ env.GO_VERSION }}
+
+      - uses: ./.github/actions/setup-bun
+        with:
+          install-playwright: "false"
+
+      - name: Install Linux desktop dependencies
+        if: matrix.platform == 'linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libasound2 \
+            libgtk-3-0 \
+            libnss3 \
+            patchelf \
+            xdg-utils
+
+      - name: Generate the unsigned dry-run builder configuration
+        run: |
+          bun run --cwd desktop release:config -- \
+            --version ${{ needs.dry-run-identity.outputs.release_version }} \
+            --channel ${{ needs.dry-run-identity.outputs.release_channel }} \
+            --platform "${{ matrix.platform }}" \
+            --arch "${{ matrix.arch }}" \
+            --notarize false \
+            --output .artifacts/release-config.json
+
+      - name: Build desktop bundle without publishing
+        env:
+          COMPOZY_RELEASE_VERSION: ${{ needs.dry-run-identity.outputs.release_version }}
+          COMPOZY_RELEASE_CHANNEL: ${{ needs.dry-run-identity.outputs.release_channel }}
+        run: |
+          bun run --cwd desktop build:runtime
+          bun run --cwd desktop build:main
+          bun run --cwd desktop electron-builder \
+            --config .artifacts/release-config.json \
+            --${{ matrix.platform }} \
+            --${{ matrix.arch }} \
+            --publish never
+
+      - name: Upload dry-run desktop artifacts
+        uses: actions/upload-artifact@v7
+        with:
+          name: desktop-dry-run-${{ matrix.id }}
+          path: |
+            desktop/.artifacts/builder/*.dmg
+            desktop/.artifacts/builder/*.zip
+            desktop/.artifacts/builder/*.AppImage
+            desktop/.artifacts/builder/*.deb
+            desktop/.artifacts/builder/latest*.yml
+          if-no-files-found: error
+          retention-days: 7
+
+  desktop-dry-run-smoke:
+    name: Dry-Run Smoke ${{ matrix.name }}
+    needs: [dry-run-identity, desktop-dry-run]
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: macOS arm64 DMG
+            id: macos-arm64
+            runner: macos-15
+            platform: macos
+            artifact: CompozyOS-${{ needs.dry-run-identity.outputs.release_version }}-mac-arm64.dmg
+          - name: macOS x64 DMG
+            id: macos-x64
+            runner: macos-15-intel
+            platform: macos
+            artifact: CompozyOS-${{ needs.dry-run-identity.outputs.release_version }}-mac-x64.dmg
+          - name: Linux AppImage
+            id: linux
+            runner: ubuntu-22.04
+            platform: linux
+            artifact: CompozyOS-${{ needs.dry-run-identity.outputs.release_version }}-linux-x64.AppImage
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: ./.github/actions/setup-go
+        with:
+          go-version: ${{ env.GO_VERSION }}
+
+      - name: Install Linux desktop smoke dependencies
+        if: matrix.platform == 'linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get remove --yes libfuse2
+          sudo apt-get install -y \
+            fuse3 \
+            libasound2 \
+            libgtk-3-0 \
+            libnss3 \
+            patchelf \
+            xdg-utils \
+            xvfb
+
+      - uses: actions/download-artifact@v8
+        with:
+          name: desktop-dry-run-${{ matrix.id }}
+          path: .artifacts/desktop
+
+      - name: Provision from the transferred package
+        env:
+          RELEASE_CHANNEL: ${{ needs.dry-run-identity.outputs.release_channel }}
+        run: |
+          bash scripts/smoke-desktop-release-artifact.sh \
+            "${{ matrix.platform }}" \
+            ".artifacts/desktop/${{ matrix.artifact }}" \
+            "${{ needs.dry-run-identity.outputs.release_version }}" \
+            "${{ needs.dry-run-identity.outputs.release_version }}"
+
+      - name: Verify Linux AppImage extraction fallback
+        if: matrix.platform == 'linux'
+        env:
+          RELEASE_CHANNEL: ${{ needs.dry-run-identity.outputs.release_channel }}
+        run: |
+          bash scripts/smoke-desktop-release-artifact.sh \
+            "${{ matrix.platform }}" \
+            ".artifacts/desktop/${{ matrix.artifact }}" \
+            "${{ needs.dry-run-identity.outputs.release_version }}" \
+            "${{ needs.dry-run-identity.outputs.release_version }}" \
+            extract
+
+      - name: Upload smoke diagnostics on failure
+        if: failure()
+        uses: actions/upload-artifact@v7
+        with:
+          name: desktop-dry-run-smoke-${{ matrix.id }}-diagnostics
+          path: ${{ runner.temp }}/compozyds.*/
+          if-no-files-found: ignore
+          retention-days: 14
+
+  # Run the credentialed nightly E2E gate on a fresh runner.
+  e2e-nightly:
+    name: E2E Nightly Lane
+    if: |
+      github.event_name == 'pull_request' &&
+      (startsWith(github.event.pull_request.title, 'build: release ') ||
+       startsWith(github.base_ref, 'release/v'))
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v7
         with:
           fetch-depth: 0
           fetch-tags: true
@@ -113,48 +597,406 @@ jobs:
       - uses: ./.github/actions/setup-go
         with:
           go-version: ${{ env.GO_VERSION }}
-          install-tools: false
-
-      - uses: ./.github/actions/setup-node
+          install-gotestsum: "true"
 
       - uses: ./.github/actions/setup-bun
-
-      - name: Setup Release Tools
-        uses: ./.github/actions/setup-release
         with:
-          goreleaser-distribution: goreleaser-pro
-          setup-docker: false
-          setup-docker-login: false
+          install-playwright: "true"
 
-      - name: Run Dry-Run Orchestrator
+      - name: Install zsh for terminal contracts
+        run: |
+          test -f /etc/apt/sources.list.d/ubuntu.sources
+          apt_sources=(-o Dir::Etc::sourcelist=sources.list.d/ubuntu.sources -o Dir::Etc::sourceparts=-)
+          sudo apt-get "${apt_sources[@]}" update
+          sudo apt-get "${apt_sources[@]}" install --no-install-recommends --yes zsh
+          # Runner-provided completion directories can be group/world writable.
+          # Repair their permissions so global compinit can pass its security audit.
+          mapfile -t insecure_paths < <(zsh -fc 'autoload -Uz compaudit; compaudit' 2>/dev/null)
+          if (( ${#insecure_paths[@]} > 0 )); then
+            sudo chmod go-w -- "${insecure_paths[@]}"
+          fi
+          zsh -fc 'autoload -Uz compaudit; compaudit'
+          zsh --version
+
+      - name: Run E2E nightly lane (credentialed)
         env:
-          GITHUB_TOKEN: ${{ secrets.RELEASE_TOKEN }}
-          GITHUB_REPOSITORY: ${{ github.repository }}
-          GITHUB_REPOSITORY_OWNER: ${{ github.repository_owner }}
-          GITHUB_HEAD_REF: ${{ github.head_ref }}
-          GITHUB_ISSUE_NUMBER: ${{ github.event.pull_request.number }}
-          GORELEASER_KEY: ${{ secrets.GORELEASER_KEY }}
+          CI: "true"
+          CGO_ENABLED: 0
           GOTMPDIR: ${{ runner.temp }}/go-tmp
-        run: go run "${{ env.PR_RELEASE_MODULE }}" dry-run --ci-output
+        run: make test-e2e-nightly
 
-  # Job 3: Production release on merge
-  release:
-    name: Production Release
-    if: |
-      (github.event_name == 'push' &&
-       github.ref == 'refs/heads/main' &&
-       (contains(github.event.head_commit.message, 'ci(release):') ||
-        startsWith(github.event.head_commit.message, 'release:'))) ||
-      (github.event_name == 'workflow_dispatch' && inputs.release_version != '')
+      - name: Upload E2E artifacts on failure
+        if: failure()
+        uses: actions/upload-artifact@v7
+        with:
+          name: e2e-nightly-artifacts
+          path: |
+            .tmp/playwright
+            /tmp/compozy-e2e-*
+          if-no-files-found: ignore
+          retention-days: 14
+
+  e2e-desktop-nightly:
+    name: E2E Desktop Nightly Lane
     runs-on: ubuntu-latest
     timeout-minutes: 120
-    env:
-      DOCKER_CLI_EXPERIMENTAL: enabled
+    if: |
+      github.event_name == 'pull_request' &&
+      (startsWith(github.event.pull_request.title, 'build: release ') ||
+       startsWith(github.base_ref, 'release/v'))
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
+
+      - name: Set up Go
+        uses: ./.github/actions/setup-go
+        with:
+          go-version: ${{ env.GO_VERSION }}
+
+      - name: Preserve Go caches across isolated desktop homes
+        run: |
+          echo "GOCACHE=$(go env GOCACHE)" >> "$GITHUB_ENV"
+          echo "GOMODCACHE=$(go env GOMODCACHE)" >> "$GITHUB_ENV"
+
+      - name: Set up Bun (desktop deps + Playwright)
+        uses: ./.github/actions/setup-bun
+        with:
+          install-playwright: "true"
+
+      - name: Allow the Chromium user namespace sandbox
+        run: |
+          sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+          sudo apt-get update
+          sudo apt-get install --no-install-recommends --yes openbox
+
+      - name: Restore Turbo cache
+        uses: actions/cache/restore@v6
+        with:
+          path: .turbo
+          key: ${{ runner.os }}-turbo-${{ hashFiles('bun.lock', 'turbo.json') }}-${{ github.job }}-${{ github.run_id }}
+          restore-keys: |
+            ${{ runner.os }}-turbo-${{ hashFiles('bun.lock', 'turbo.json') }}-${{ github.job }}-
+            ${{ runner.os }}-turbo-${{ hashFiles('bun.lock', 'turbo.json') }}-
+            ${{ runner.os }}-turbo-
+
+      - name: Set up Turborepo remote cache (OIDC)
+        if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.fork == false
+        continue-on-error: true
+        uses: vercel/setup-turborepo-remote-cache-action@135046f5efcadb17337d9b29b8d5b4035ae64b10 # v1.0.0
+        with:
+          team: ${{ vars.TURBO_TEAM }}
+
+      - name: Run desktop E2E lane
+        run: make test-e2e-desktop-nightly
+        env:
+          CGO_ENABLED: 0
+          CI: "true"
+
+      - name: Upload desktop E2E artifacts
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: e2e-desktop-nightly-artifacts
+          path: |
+            .tmp/playwright
+            /tmp/compozy-e2e-*
+          if-no-files-found: ignore
+          retention-days: 7
+
+  # Run the full integration suite on a fresh runner: on release PRs, and on
+  # every routine push to main so integration regressions surface when they
+  # merge instead of at release time. Release-merge pushes are skipped (their
+  # release PR already ran it); superseded main pushes cancel via concurrency.
+  integration:
+    name: Full Integration Suite (${{ matrix.shard_index }})
+    if: |
+      (github.event_name == 'pull_request' &&
+       (startsWith(github.event.pull_request.title, 'build: release ') ||
+        startsWith(github.base_ref, 'release/v'))) ||
+      (github.event_name == 'push' && github.ref == 'refs/heads/main' &&
+       !startsWith(github.event.head_commit.message, 'release:') &&
+       !startsWith(github.event.head_commit.message, 'ci(release):') &&
+       !(startsWith(github.event.head_commit.message, 'build: release ') ||
+         startsWith(github.event.head_commit.message, 'build: prepare release ')))
+    runs-on: ubuntu-latest
+    timeout-minutes: 150
+    strategy:
+      fail-fast: false
+      matrix:
+        shard_index: [0, 1, 2, 3, 4, 5, 6, 7]
+    env:
+      COMPOZY_GO_TEST_P: "1"
+      COMPOZY_GO_TEST_SHARD_INDEX: ${{ matrix.shard_index }}
+      COMPOZY_GO_TEST_SHARD_TOTAL: "8"
+      COMPOZY_GO_TEST_JSONFILE_DIR: /tmp/integration-results
+    steps:
+      - uses: actions/checkout@v7
         with:
           fetch-depth: 0
           fetch-tags: true
+
+      - name: Install ripgrep
+        run: |
+          # Only Ubuntu supplies this dependency; unrelated runner repositories
+          # must not block preflight when their indexes are inconsistent.
+          test -f /etc/apt/sources.list.d/ubuntu.sources
+          apt_sources=(-o Dir::Etc::sourcelist=sources.list.d/ubuntu.sources -o Dir::Etc::sourceparts=-)
+          sudo apt-get "${apt_sources[@]}" update
+          sudo apt-get "${apt_sources[@]}" install --yes ripgrep
+          rg --version
+
+      - name: Prepare Go temporary directory
+        env:
+          GOTMPDIR: ${{ runner.temp }}/go-tmp
+        run: mkdir -p "$GOTMPDIR"
+
+      - uses: ./.github/actions/setup-go
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          install-gotestsum: "true"
+
+      - uses: ./.github/actions/setup-bun
+        with:
+          install-playwright: "false"
+
+      - name: Build integration fixture dependencies
+        run: bun run turbo run build --filter=@compozy/extension-react --filter=@compozy/client
+
+      - name: Run full integration suite
+        env:
+          CI: "true"
+          CGO_ENABLED: 0
+          GOTMPDIR: ${{ runner.temp }}/go-tmp
+        run: make test-integration
+
+      - name: Upload integration artifacts on failure
+        if: failure()
+        uses: actions/upload-artifact@v7
+        with:
+          name: integration-artifacts-${{ matrix.shard_index }}
+          path: |
+            /tmp/integration-results
+            coverage.out
+            test-results.xml
+            /tmp/compozy-e2e-*
+          if-no-files-found: ignore
+          retention-days: 14
+
+  # Resolve the explicit release identity exactly once.
+  release-plan:
+    name: Explicit Release Plan
+    # Auto-beta triggers ONLY on release PR merge subjects. Two real-world
+    # shapes exist: the PR title ("build: release vX.Y.Z") and the branch
+    # commit subject GitHub uses for single-commit squashes ("build:
+    # prepare release vX.Y.Z"). Other bot-generated subjects must stay inert
+    # or publishing loops.
+    if: |
+      github.event_name == 'workflow_dispatch' ||
+      (github.event_name == 'push' &&
+       github.ref == 'refs/heads/main' &&
+       (startsWith(github.event.head_commit.message, 'build: release ') ||
+        startsWith(github.event.head_commit.message, 'build: prepare release ')) &&
+       (vars.RELEASE_AUTO_CHANNEL == 'stable' || vars.RELEASE_AUTO_CHANNEL == 'beta'))
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    outputs:
+      release_ref: ${{ steps.plan.outputs.release_ref }}
+      release_commit: ${{ steps.plan.outputs.release_commit }}
+      release_version: ${{ steps.plan.outputs.release_version }}
+      release_tag: ${{ steps.plan.outputs.release_tag }}
+      release_previous_tag: ${{ steps.plan.outputs.release_previous_tag }}
+      release_git_range: ${{ steps.plan.outputs.release_git_range }}
+      release_initial: ${{ steps.plan.outputs.release_initial }}
+      release_channel: ${{ steps.plan.outputs.release_channel }}
+      github_prerelease: ${{ steps.plan.outputs.github_prerelease }}
+      github_make_latest: ${{ steps.plan.outputs.github_make_latest }}
+      npm_tag: ${{ steps.plan.outputs.npm_tag }}
+      homebrew_skip_upload: ${{ steps.plan.outputs.homebrew_skip_upload }}
+      desktop_channel: ${{ steps.desktop-feed.outputs.desktop_channel }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ inputs.release_ref || github.sha }}
+          fetch-depth: 0
+          fetch-tags: true
+          token: ${{ secrets.RELEASE_TOKEN }}
+
+      - uses: ./.github/actions/setup-go
+        with:
+          go-version: ${{ env.GO_VERSION }}
+
+      - *validate-release-workflow-contract
+
+      - uses: ./.github/actions/setup-node
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+
+      - uses: ./.github/actions/setup-bun
+        with:
+          install-playwright: "false"
+
+      - name: Synchronize explicit release web assets
+        if: github.event_name == 'workflow_dispatch'
+        env:
+          COMPOZY_WEB_ASSETS_TOKEN: ${{ secrets.COMPOZY_WEB_ASSETS_TOKEN }}
+          RELEASE_TOKEN: ${{ secrets.RELEASE_TOKEN }}
+          RELEASE_REF_INPUT: ${{ inputs.release_ref }}
+        run: |
+          set -euo pipefail
+          mage_module="github.com/magefile/mage@v1.17.2"
+          go run "${mage_module}" webBuild
+          if go run "${mage_module}" webAssetsCheck; then
+            echo "Pinned web assets already match the deterministic Web build"
+            exit 0
+          fi
+
+          target_branch="${RELEASE_REF_INPUT#refs/heads/}"
+          target_remote_ref="refs/remotes/origin/${target_branch}"
+          if [[ "${target_branch}" == "main" ]] ||
+            ! git check-ref-format --branch "${target_branch}" >/dev/null 2>&1 ||
+            ! git show-ref --verify --quiet "${target_remote_ref}" ||
+            [[ "$(git rev-parse HEAD)" != "$(git rev-parse "${target_remote_ref}")" ]]; then
+            echo "::error::Stale explicit-release web assets require a non-main branch ref"
+            exit 1
+          fi
+
+          go run "${mage_module}" releaseWebAssetsSync
+          changed_paths="$(
+            git diff --name-only
+            git ls-files --others --exclude-standard
+          )"
+          while IFS= read -r path; do
+            [[ -z "${path}" ]] && continue
+            case "${path}" in
+              go.mod|go.sum) ;;
+              *)
+                echo "::error::Web-assets sync changed an unexpected path: ${path}"
+                exit 1
+                ;;
+            esac
+          done <<<"${changed_paths}"
+          if git diff --quiet -- go.mod go.sum; then
+            echo "::error::Web-assets sync completed without updating the stale module pin"
+            exit 1
+          fi
+
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add go.mod go.sum
+          git commit -m "build: sync web assets for explicit release"
+          git push origin "HEAD:refs/heads/${target_branch}"
+
+      - name: Resolve release identity
+        id: identity
+        env:
+          RELEASE_REF_INPUT: ${{ inputs.release_ref }}
+          RELEASE_VERSION_INPUT: ${{ inputs.release_version }}
+          RELEASE_CHANNEL_INPUT: ${{ inputs.release_channel }}
+          RELEASE_AUTO_CHANNEL: ${{ vars.RELEASE_AUTO_CHANNEL }}
+        run: |
+          set -euo pipefail
+          if [[ "${GITHUB_EVENT_NAME}" == "workflow_dispatch" ]]; then
+            {
+              echo "ref=$(git rev-parse HEAD)"
+              echo "version=${RELEASE_VERSION_INPUT}"
+              echo "channel=${RELEASE_CHANNEL_INPUT}"
+            } >>"${GITHUB_OUTPUT}"
+            exit 0
+          fi
+          identity="$(scripts/resolve-auto-release-identity.sh "${RELEASE_AUTO_CHANNEL}")"
+          {
+            echo "ref=${GITHUB_SHA}"
+            echo "version=$(sed -n 's/^release_version=//p' <<<"${identity}")"
+            echo "channel=$(sed -n 's/^release_channel=//p' <<<"${identity}")"
+          } >>"${GITHUB_OUTPUT}"
+
+      - name: Plan explicit release
+        id: plan
+        env:
+          RELEASE_REF_INPUT: ${{ steps.identity.outputs.ref }}
+          RELEASE_VERSION_INPUT: ${{ steps.identity.outputs.version }}
+          RELEASE_CHANNEL_INPUT: ${{ steps.identity.outputs.channel }}
+          PR_RELEASE_LOG_LEVEL: error
+        run: |
+          set -euo pipefail
+          plan_output="${RUNNER_TEMP}/release-plan-output"
+          allow_existing_tag_args=()
+          if [[ "${GITHUB_EVENT_NAME}" == "workflow_dispatch" ]]; then
+            allow_existing_tag_args+=(--allow-existing-tag)
+          fi
+          go run "${PR_RELEASE_MODULE}" plan \
+            --ref "${RELEASE_REF_INPUT}" \
+            --version "${RELEASE_VERSION_INPUT}" \
+            --channel "${RELEASE_CHANNEL_INPUT}" \
+            "${allow_existing_tag_args[@]}" \
+            --format github >"${plan_output}"
+
+          expected_keys=(
+            release_ref release_commit release_version release_tag release_previous_tag
+            release_git_range release_initial release_channel
+            github_prerelease github_make_latest npm_tag homebrew_skip_upload
+          )
+          for key in "${expected_keys[@]}"; do
+            if [[ "$(grep -c "^${key}=" "${plan_output}")" != "1" ]]; then
+              echo "::error::Planner output must contain exactly one ${key} entry"
+              exit 1
+            fi
+          done
+          if [[ "$(wc -l <"${plan_output}" | tr -d ' ')" != "12" ]]; then
+            echo "::error::Planner output must contain exactly twelve authoritative entries"
+            exit 1
+          fi
+          cat "${plan_output}" >>"${GITHUB_OUTPUT}"
+
+      # The desktop app reads its own release channel's feed. The bridge beta reads the stable feed so
+      # installed betas reach stable releases while channel-beta stays frozen on that bridge.
+      - name: Resolve desktop update feed
+        id: desktop-feed
+        env:
+          DESKTOP_FEED_INPUT: ${{ inputs.desktop_feed }}
+          RELEASE_CHANNEL: ${{ steps.plan.outputs.release_channel }}
+        run: |
+          set -euo pipefail
+          case "${DESKTOP_FEED_INPUT:-release}" in
+            release) desktop_channel="${RELEASE_CHANNEL}" ;;
+            stable) desktop_channel="stable" ;;
+            *)
+              echo "::error::desktop_feed must be release or stable"
+              exit 1
+              ;;
+          esac
+          printf 'desktop_channel=%s\n' "${desktop_channel}" >>"${GITHUB_OUTPUT}"
+
+  # Publish only from an explicit, validated plan.
+  release:
+    name: Stage Production Release
+    needs: [release-plan, desktop-compatibility, desktop-build, desktop-smoke]
+    if: |
+      needs.release-plan.result == 'success' &&
+      needs.desktop-build.result == 'success' &&
+      needs.desktop-smoke.result == 'success'
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    outputs:
+      publication_state: ${{ steps.publication.outputs.publication_state }}
+      release_state: ${{ steps.publication.outputs.release_state }}
+      cli_state: ${{ steps.publication.outputs.cli_state }}
+      extension_sdk_state: ${{ steps.publication.outputs.extension_sdk_state }}
+      client_sdk_state: ${{ steps.publication.outputs.client_sdk_state }}
+      stage_release: ${{ steps.publication.outputs.stage_release }}
+      desktop_required: ${{ steps.publication.outputs.desktop_required }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ needs.release-plan.outputs.release_ref }}
+          fetch-depth: 0
+          fetch-tags: true
+          # PAT so the site-changelog receipt push bypasses the main branch
+          # PR-only rule; its bot author and non-release subject stay inert.
+          token: ${{ secrets.RELEASE_TOKEN }}
+
+      # A release may target an older ref whose recovery logic predates the
+      # current workflow. Reuse the exact staging step defined by dry-run.
+      - *load-release-workflow-tools
 
       - name: Prepare Go temporary directory
         env:
@@ -165,82 +1007,902 @@ jobs:
         uses: ./.github/actions/setup-go
         with:
           go-version: ${{ env.GO_VERSION }}
-          install-tools: "true"
 
       - uses: ./.github/actions/setup-node
+        with:
+          node-version: ${{ env.NODE_VERSION }}
 
       - uses: ./.github/actions/setup-bun
+        with:
+          install-playwright: "false"
+
+      - uses: ./.github/actions/setup-git-cliff
+
+      - name: Resolve publication state
+        id: publication
+        env:
+          GH_TOKEN: ${{ secrets.RELEASE_TOKEN }}
+          RELEASE_COMMIT: ${{ needs.release-plan.outputs.release_commit }}
+          RELEASE_TAG: ${{ needs.release-plan.outputs.release_tag }}
+          RELEASE_VERSION: ${{ needs.release-plan.outputs.release_version }}
+        run: bash "${RUNNER_TEMP}/release-publication-state.sh"
+
+      - name: Download exact desktop release inventory
+        uses: actions/download-artifact@v8
+        with:
+          pattern: desktop-release-*
+          path: .artifacts/desktop-build
+          merge-multiple: true
+
+      - name: Produce and validate desktop compatibility assets
+        env:
+          RELEASE_VERSION: ${{ needs.release-plan.outputs.release_version }}
+          MIN_APP_VERSION: ${{ needs.desktop-compatibility.outputs.min_app_version }}
+        run: |
+          set -euo pipefail
+          mkdir -p .artifacts/desktop
+          for artifact in \
+            "CompozyOS-${RELEASE_VERSION}-mac-arm64.dmg" \
+            "CompozyOS-${RELEASE_VERSION}-mac-arm64.zip" \
+            "CompozyOS-${RELEASE_VERSION}-mac-x64.dmg" \
+            "CompozyOS-${RELEASE_VERSION}-mac-x64.zip" \
+            "CompozyOS-${RELEASE_VERSION}-linux-x64.AppImage" \
+            "CompozyOS-${RELEASE_VERSION}-linux-x64.deb"; do
+            cp ".artifacts/desktop-build/${artifact}" ".artifacts/desktop/${artifact}"
+          done
+          go run ./cmd/compozy-desktop-release assert-inventory \
+            --version "${RELEASE_VERSION}" \
+            --dir .artifacts/desktop
+          jq -cn \
+            --arg runtime_version "${RELEASE_VERSION}" \
+            --arg min_app_version "${MIN_APP_VERSION}" \
+            '{runtime_version: $runtime_version, min_app_version: $min_app_version}' \
+            >.artifacts/desktop/compat.json
 
       - name: Setup Release Tools
+        if: |
+          steps.publication.outputs.stage_release == 'true' ||
+          steps.publication.outputs.cli_state == 'missing'
         uses: ./.github/actions/setup-release
         with:
           goreleaser-distribution: goreleaser-pro
-          setup-docker: true
-          setup-docker-login: true
-          setup-qemu: true
-          docker-registry: ghcr.io
-          docker-username: ${{ github.actor }}
-          docker-token: ${{ secrets.GITHUB_TOKEN }}
-          cosign-version: "v2.2.4"
+          goreleaser-version: v2.17.1
+          setup-docker: false
+          setup-docker-login: false
+          setup-qemu: false
+          cosign-version: ${{ env.COSIGN_VERSION }}
 
-      - name: Create Git Tag
+      - *run-release-preflight
+
+      - name: Render canonical release body
+        if: steps.publication.outputs.stage_release == 'true'
         env:
-          GITHUB_TOKEN: ${{ secrets.RELEASE_TOKEN }}
-          FORCED_VERSION: ${{ inputs.release_version }}
+          RELEASE_TAG: ${{ needs.release-plan.outputs.release_tag }}
+          RELEASE_GIT_RANGE: ${{ needs.release-plan.outputs.release_git_range }}
+          RELEASE_INITIAL: ${{ needs.release-plan.outputs.release_initial }}
+          PR_RELEASE_LOG_LEVEL: error
         run: |
-          # A forced version (workflow_dispatch input) bypasses git-cliff and
-          # pins the release to an exact version. Empty input keeps the normal
-          # git-cliff-driven behavior unchanged.
-          if [[ -n "$FORCED_VERSION" ]]; then
-            VERSION="${FORCED_VERSION#v}"
-            echo "Using forced version from workflow input: v$VERSION"
-          else
-            # Use git-cliff to get the bumped version
-            VERSION=$(git cliff --bumped-version 2>/dev/null | sed 's/^v//')
+          bash "${RUNNER_TEMP}/render-and-validate-release-body.sh" \
+            "${PR_RELEASE_MODULE}" \
+            "${RELEASE_TAG}" \
+            "${RELEASE_GIT_RANGE}" \
+            "${RELEASE_INITIAL}" \
+            "${RUNNER_TEMP}/RELEASE_BODY.md"
+          head -1 "${RUNNER_TEMP}/RELEASE_BODY.md"
+
+      - name: Reuse existing release body for package-only recovery
+        if: |
+          steps.publication.outputs.stage_release != 'true' &&
+          steps.publication.outputs.cli_state == 'missing'
+        env:
+          GH_TOKEN: ${{ secrets.RELEASE_TOKEN }}
+          RELEASE_ID: ${{ steps.publication.outputs.release_id }}
+        run: |
+          gh api "repos/${GITHUB_REPOSITORY}/releases/${RELEASE_ID}" \
+            --jq '.body' >"${RUNNER_TEMP}/RELEASE_BODY.md"
+          test -s "${RUNNER_TEMP}/RELEASE_BODY.md"
+
+      - name: Validate extension SDK release assets
+        if: steps.publication.outputs.extension_sdk_state == 'missing'
+        run: |
+          if ! grep -q '"name": "@compozy/extension-sdk"' sdk/typescript/package.json; then
+            echo "::error::Missing @compozy/extension-sdk package metadata"
+            exit 1
           fi
-          if [[ "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
-            git config user.name "github-actions[bot]"
-            git config user.email "github-actions[bot]@users.noreply.github.com"
-            git tag -a "v$VERSION" -m "Release v$VERSION"
-            git push origin "v$VERSION"
-            echo "Created and pushed tag v$VERSION"
-          else
-            echo "Could not get version from git-cliff. Got: $VERSION"
-            echo "Fallback: Extract from commit message"
-            VERSION=$(git log -1 --pretty=format:"%s" | sed -E 's/.*Release v([0-9]+\.[0-9]+\.[0-9]+).*/\1/')
-            if [[ "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
-              git config user.name "github-actions[bot]"
-              git config user.email "github-actions[bot]@users.noreply.github.com"
-              git tag -a "v$VERSION" -m "Release v$VERSION"
-              git push origin "v$VERSION"
-              echo "Created and pushed tag v$VERSION"
-            else
-              echo "Could not extract version from any source. Got: $VERSION"
+          if ! grep -q '"license": "MIT"' sdk/typescript/package.json; then
+            echo "::error::@compozy/extension-sdk must ship under the MIT license"
+            exit 1
+          fi
+          go run ./cmd/compozy-manifest-check --version "${{ needs.release-plan.outputs.release_version }}"
+          scripts/publish-sdk-package.sh --dry-run sdk/typescript "${{ needs.release-plan.outputs.release_version }}" "${{ needs.release-plan.outputs.npm_tag }}"
+
+      - name: Validate app SDK release assets
+        if: steps.publication.outputs.client_sdk_state == 'missing'
+        run: scripts/publish-sdk-package.sh --dry-run sdk/client "${{ needs.release-plan.outputs.release_version }}" "${{ needs.release-plan.outputs.npm_tag }}"
+
+      - name: Create and push annotated release tag
+        if: steps.publication.outputs.stage_release == 'true'
+        env:
+          RELEASE_COMMIT: ${{ needs.release-plan.outputs.release_commit }}
+          RELEASE_TAG: ${{ needs.release-plan.outputs.release_tag }}
+        run: |
+          set -euo pipefail
+          if [[ "$(git rev-parse HEAD)" != "${RELEASE_COMMIT}" ]]; then
+            echo "::error::Authoritative release ref moved after planning"
+            exit 1
+          fi
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          ensure_annotated_tag() {
+            local tag="$1"
+            local existing_commit
+            existing_commit="$(git rev-list -n 1 "${tag}" 2>/dev/null || true)"
+            if [[ -z "${existing_commit}" ]]; then
+              git tag -a "${tag}" -m "Release ${tag}"
+              return
+            fi
+            if [[ "$(git cat-file -t "${tag}")" != "tag" ]]; then
+              echo "::error::Release tag ${tag} is not annotated"
               exit 1
             fi
-          fi
+            if [[ "${existing_commit}" != "${RELEASE_COMMIT}" ]]; then
+              echo "::error::Release tag ${tag} points to ${existing_commit}, want ${RELEASE_COMMIT}"
+              exit 1
+            fi
+            echo "reusing annotated release tag ${tag} at ${RELEASE_COMMIT}"
+          }
+          sdk_go_tag="sdk/go/${RELEASE_TAG}"
+          git check-ref-format "refs/tags/${sdk_go_tag}" >/dev/null
+          ensure_annotated_tag "${RELEASE_TAG}"
+          ensure_annotated_tag "${sdk_go_tag}"
+          git push origin "refs/tags/${RELEASE_TAG}" "refs/tags/${sdk_go_tag}"
 
-      - name: Ensure release notes file exists
-        run: |
-          if [ ! -f RELEASE_BODY.md ]; then
-            echo "No release body found, creating empty file"
-            touch RELEASE_BODY.md
-          fi
-
-      - uses: goreleaser/goreleaser-action@v6
+      - uses: goreleaser/goreleaser-action@v7
+        name: Prepare npm CLI package without publication
+        if: steps.publication.outputs.cli_state == 'missing'
         with:
           distribution: goreleaser-pro
-          version: ~> v2
+          version: v2.17.1
           args: >-
-            release --clean
-            --release-notes=RELEASE_BODY.md
+            release --clean --prepare
+            --config=${{ runner.temp }}/.goreleaser-npm.yml
+            --release-notes=${{ runner.temp }}/RELEASE_BODY.md
             --release-header-tmpl=.goreleaser.release-header.md.tmpl
             --release-footer-tmpl=.goreleaser.release-footer.md.tmpl
         env:
           GITHUB_TOKEN: ${{ secrets.RELEASE_TOKEN }}
           RELEASE_TOKEN: ${{ secrets.RELEASE_TOKEN }}
-          # Re-enable after uncommenting the AUR block in `.goreleaser.yml`.
-          # AUR_KEY: ${{ secrets.AUR_KEY }}
-          COSIGN_EXPERIMENTAL: 1
           GORELEASER_KEY: ${{ secrets.GORELEASER_KEY }}
           GOTMPDIR: ${{ runner.temp }}/go-tmp
+          GORELEASER_CURRENT_TAG: ${{ needs.release-plan.outputs.release_tag }}
+          RELEASE_VERSION: ${{ needs.release-plan.outputs.release_version }}
+          RELEASE_CHANNEL: ${{ needs.release-plan.outputs.release_channel }}
+          GITHUB_MAKE_LATEST: ${{ needs.release-plan.outputs.github_make_latest }}
+          NPM_TAG: ${{ needs.release-plan.outputs.npm_tag }}
+          HOMEBREW_SKIP_UPLOAD: ${{ needs.release-plan.outputs.homebrew_skip_upload }}
+
+      - uses: goreleaser/goreleaser-action@v7
+        name: Prepare GitHub artifacts without npm publisher
+        if: steps.publication.outputs.stage_release == 'true'
+        with:
+          distribution: goreleaser-pro
+          version: v2.17.1
+          args: >-
+            release --clean --prepare
+            --config=${{ runner.temp }}/.goreleaser-github.yml
+            --release-notes=${{ runner.temp }}/RELEASE_BODY.md
+            --release-header-tmpl=.goreleaser.release-header.md.tmpl
+            --release-footer-tmpl=.goreleaser.release-footer.md.tmpl
+        env:
+          GITHUB_TOKEN: ${{ secrets.RELEASE_TOKEN }}
+          RELEASE_TOKEN: ${{ secrets.RELEASE_TOKEN }}
+          GORELEASER_KEY: ${{ secrets.GORELEASER_KEY }}
+          GOTMPDIR: ${{ runner.temp }}/go-tmp
+          GORELEASER_CURRENT_TAG: ${{ needs.release-plan.outputs.release_tag }}
+          RELEASE_VERSION: ${{ needs.release-plan.outputs.release_version }}
+          RELEASE_CHANNEL: ${{ needs.release-plan.outputs.release_channel }}
+          GITHUB_MAKE_LATEST: ${{ needs.release-plan.outputs.github_make_latest }}
+          NPM_TAG: ${{ needs.release-plan.outputs.npm_tag }}
+          HOMEBREW_SKIP_UPLOAD: ${{ needs.release-plan.outputs.homebrew_skip_upload }}
+          GORELEASER_PUBLISH_NPM: "false"
+
+      - uses: goreleaser/goreleaser-action@v7
+        name: Stage GitHub draft without publishing npm
+        if: steps.publication.outputs.stage_release == 'true'
+        with:
+          distribution: goreleaser-pro
+          version: v2.17.1
+          args: publish --dist=.release-dist/github
+        env:
+          GITHUB_TOKEN: ${{ secrets.RELEASE_TOKEN }}
+          RELEASE_TOKEN: ${{ secrets.RELEASE_TOKEN }}
+          GORELEASER_KEY: ${{ secrets.GORELEASER_KEY }}
+          GORELEASER_CURRENT_TAG: ${{ needs.release-plan.outputs.release_tag }}
+          RELEASE_VERSION: ${{ needs.release-plan.outputs.release_version }}
+          RELEASE_CHANNEL: ${{ needs.release-plan.outputs.release_channel }}
+          GITHUB_MAKE_LATEST: ${{ needs.release-plan.outputs.github_make_latest }}
+          NPM_TAG: ${{ needs.release-plan.outputs.npm_tag }}
+          HOMEBREW_SKIP_UPLOAD: ${{ needs.release-plan.outputs.homebrew_skip_upload }}
+
+      - name: Upload prepared npm CLI package
+        if: steps.publication.outputs.cli_state == 'missing'
+        uses: actions/upload-artifact@v7
+        with:
+          name: npm-cli-${{ needs.release-plan.outputs.release_version }}
+          path: .release-dist/npm/npm/@compozy/cli/*
+          if-no-files-found: error
+          retention-days: 14
+
+  desktop-compatibility:
+    name: Resolve Desktop Compatibility
+    needs: release-plan
+    if: needs.release-plan.result == 'success'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    outputs:
+      min_app_version: ${{ steps.compatibility.outputs.min_app_version }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ needs.release-plan.outputs.release_ref }}
+
+      - uses: ./.github/actions/setup-go
+        with:
+          go-version: ${{ env.GO_VERSION }}
+
+      # The runtime must keep serving the oldest app live on any channel this release serves.
+      - name: Resolve the oldest live app across the compatibility channels
+        id: compatibility
+        env:
+          RELEASE_CHANNEL: ${{ needs.release-plan.outputs.release_channel }}
+          RELEASE_VERSION: ${{ needs.release-plan.outputs.release_version }}
+        run: |
+          set -euo pipefail
+          live_args=()
+          channels="$(
+            go run ./cmd/compozy-desktop-release compatibility-channels --channel "${RELEASE_CHANNEL}" |
+              jq -er '.channels[]'
+          )"
+          while IFS= read -r channel; do
+            generation_file="${RUNNER_TEMP}/desktop-generation-${channel}.json"
+            generation_url="https://raw.githubusercontent.com/${GITHUB_REPOSITORY}/channel-${channel}/desktop/generation.json"
+            status="$(curl --silent --show-error --output "${generation_file}" --write-out '%{http_code}' "${generation_url}")"
+            case "${status}" in
+              200) live_args+=(--live "$(jq -er '.version' "${generation_file}")") ;;
+              404) live_args+=(--live "") ;;
+              *)
+                echo "::error::Could not read the ${channel} channel generation (HTTP ${status})"
+                exit 1
+                ;;
+            esac
+          done <<<"${channels}"
+          min_app_version="$(
+            go run ./cmd/compozy-desktop-release min-app-version \
+              --version "${RELEASE_VERSION}" \
+              "${live_args[@]}" | jq -er '.min_app_version'
+          )"
+          printf 'min_app_version=%s\n' "${min_app_version}" >>"${GITHUB_OUTPUT}"
+
+  desktop-build:
+    name: Desktop ${{ matrix.name }}
+    needs: [release-plan, desktop-compatibility]
+    if: |
+      needs.release-plan.result == 'success' &&
+      needs.desktop-compatibility.result == 'success'
+    strategy:
+      fail-fast: false
+      matrix: *desktop-release-matrix
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 180
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ needs.release-plan.outputs.release_ref }}
+          fetch-depth: 0
+          fetch-tags: true
+
+      - name: Resolve reusable desktop artifact
+        id: reuse
+        if: inputs.desktop_artifacts_run_id != ''
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SOURCE_RUN_ID: ${{ inputs.desktop_artifacts_run_id }}
+          RELEASE_COMMIT: ${{ needs.release-plan.outputs.release_commit }}
+          # The name carries the baked update feed, so reuse never crosses feeds.
+          ARTIFACT_NAME: desktop-release-${{ matrix.id }}-${{ needs.release-plan.outputs.desktop_channel }}
+        run: |
+          set -euo pipefail
+          [[ "${SOURCE_RUN_ID}" =~ ^[0-9]+$ ]] || exit 1
+          source_run="$(gh api "repos/${GITHUB_REPOSITORY}/actions/runs/${SOURCE_RUN_ID}")"
+          jq -e --arg commit "${RELEASE_COMMIT}" '
+            .head_sha == $commit and .path == ".github/workflows/release.yml" and
+            .status == "completed" and (.event == "push" or .event == "workflow_dispatch")
+          ' <<<"${source_run}" >/dev/null
+          artifacts="$(gh api --paginate --slurp "repos/${GITHUB_REPOSITORY}/actions/runs/${SOURCE_RUN_ID}/artifacts?per_page=100")"
+          count="$(jq --arg name "${ARTIFACT_NAME}" '[.[].artifacts[] | select(.name == $name and .expired == false)] | length' <<<"${artifacts}")"
+          case "${count}" in
+            0) echo "available=false" >>"${GITHUB_OUTPUT}" ;;
+            1) echo "available=true" >>"${GITHUB_OUTPUT}" ;;
+            *) echo "::error::Ambiguous reusable desktop artifact"; exit 1 ;;
+          esac
+
+      - name: Download completed desktop artifact
+        if: steps.reuse.outputs.available == 'true'
+        uses: actions/download-artifact@v8
+        with:
+          github-token: ${{ github.token }}
+          run-id: ${{ inputs.desktop_artifacts_run_id }}
+          name: desktop-release-${{ matrix.id }}-${{ needs.release-plan.outputs.desktop_channel }}
+          path: desktop/.artifacts/release/${{ matrix.id }}
+
+      - uses: ./.github/actions/setup-go
+        if: steps.reuse.outputs.available != 'true'
+        with:
+          go-version: ${{ env.GO_VERSION }}
+
+      - uses: ./.github/actions/setup-bun
+        if: steps.reuse.outputs.available != 'true'
+        with:
+          install-playwright: "false"
+
+      - name: Install Linux desktop dependencies
+        if: matrix.platform == 'linux' && steps.reuse.outputs.available != 'true'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libasound2 \
+            libgtk-3-0 \
+            libnss3 \
+            patchelf \
+            xdg-utils
+
+      - name: Assert and stage macOS signing material
+        if: matrix.platform == 'mac' && steps.reuse.outputs.available != 'true'
+        shell: bash
+        env:
+          CSC_LINK_VALUE: ${{ secrets.APPLE_CERTIFICATE }}
+          CSC_KEY_PASSWORD_VALUE: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+          APPLE_ID_VALUE: ${{ secrets.APPLE_ID }}
+          APPLE_APP_SPECIFIC_PASSWORD_VALUE: ${{ secrets.APPLE_PASSWORD }}
+          APPLE_TEAM_ID_VALUE: ${{ secrets.APPLE_TEAM_ID }}
+        run: |
+          set -euo pipefail
+          for name in CSC_LINK_VALUE CSC_KEY_PASSWORD_VALUE APPLE_ID_VALUE \
+            APPLE_APP_SPECIFIC_PASSWORD_VALUE APPLE_TEAM_ID_VALUE; do
+            if [[ -z "${!name:-}" ]]; then
+              echo "desktop release: required signing value ${name} is missing" >&2
+              exit 1
+            fi
+          done
+          {
+            printf 'CSC_LINK=%s\n' "${CSC_LINK_VALUE}"
+            printf 'CSC_KEY_PASSWORD=%s\n' "${CSC_KEY_PASSWORD_VALUE}"
+            printf 'APPLE_ID=%s\n' "${APPLE_ID_VALUE}"
+            printf 'APPLE_APP_SPECIFIC_PASSWORD=%s\n' "${APPLE_APP_SPECIFIC_PASSWORD_VALUE}"
+            printf 'APPLE_TEAM_ID=%s\n' "${APPLE_TEAM_ID_VALUE}"
+          } >>"${GITHUB_ENV}"
+
+      - name: Generate release builder configuration
+        if: steps.reuse.outputs.available != 'true'
+        run: |
+          bun run --cwd desktop release:config -- \
+            --version "${{ needs.release-plan.outputs.release_version }}" \
+            --channel "${{ needs.release-plan.outputs.desktop_channel }}" \
+            --platform "${{ matrix.platform }}" \
+            --arch "${{ matrix.arch }}" \
+            --notarize ${{ matrix.platform == 'mac' }} \
+            --output .artifacts/release-config.json
+
+      # Remove when actions/runner-images#14924 is resolved. This ephemeral
+      # Intel runner drops HTTP/3 CloudKit requests; HTTPS over TCP works.
+      - name: Use TCP for Apple notarization on Intel runners
+        if: matrix.platform == 'mac' && matrix.arch == 'x64' && steps.reuse.outputs.available != 'true'
+        run: |
+          set -euo pipefail
+          echo 'block return out quick proto udp from any to any port 443' | sudo pfctl -f -
+          sudo pfctl -E
+
+      - name: Build signed desktop bundle
+        if: steps.reuse.outputs.available != 'true'
+        env:
+          COMPOZY_RELEASE_VERSION: ${{ needs.release-plan.outputs.release_version }}
+          COMPOZY_MIN_APP_VERSION: ${{ needs.desktop-compatibility.outputs.min_app_version }}
+          COMPOZY_RELEASE_CHANNEL: ${{ needs.release-plan.outputs.desktop_channel }}
+        run: |
+          bun run --cwd desktop build:runtime
+          bun run --cwd desktop build:main
+          bun run --cwd desktop electron-builder \
+            --config .artifacts/release-config.json \
+            --${{ matrix.platform }} \
+            --${{ matrix.arch }} \
+            --publish never
+
+      - name: Verify macOS provenance and updater archive
+        if: matrix.platform == 'mac' && steps.reuse.outputs.available != 'true'
+        run: |
+          set -euo pipefail
+          version="${{ needs.release-plan.outputs.release_version }}"
+          app_path="$(find desktop/.artifacts/builder -type d -name '*.app' -print -quit)"
+          test -d "${app_path}"
+          codesign --verify --deep --strict --verbose=4 "${app_path}"
+          spctl --assess --type execute --verbose=4 "${app_path}"
+          bun run --cwd desktop release:finalize-mac -- \
+            ".artifacts/builder/CompozyOS-${version}-mac-${{ matrix.arch }}.dmg" \
+            ".artifacts/builder/latest-mac.yml"
+          bun run --cwd desktop release:verify-mac-zip -- \
+            ".artifacts/builder/CompozyOS-${version}-mac-${{ matrix.arch }}.zip"
+
+      - name: Collect exact desktop artifacts
+        if: steps.reuse.outputs.available != 'true'
+        run: |
+          bun run --cwd desktop release:collect -- \
+            --platform "${{ matrix.platform }}" \
+            --arch "${{ matrix.arch }}" \
+            --channel "${{ needs.release-plan.outputs.desktop_channel }}" \
+            --version "${{ needs.release-plan.outputs.release_version }}" \
+            --source .artifacts/builder \
+            --output ".artifacts/release/${{ matrix.id }}"
+
+      - name: Verify reused artifact version
+        if: steps.reuse.outputs.available == 'true'
+        env:
+          RELEASE_VERSION: ${{ needs.release-plan.outputs.release_version }}
+          PLATFORM: ${{ matrix.platform }}
+          ARCH: ${{ matrix.arch }}
+          ARTIFACT_DIR: desktop/.artifacts/release/${{ matrix.id }}
+        run: |
+          set -euo pipefail
+          if [[ "${PLATFORM}" == "mac" ]]; then
+            test -s "${ARTIFACT_DIR}/CompozyOS-${RELEASE_VERSION}-mac-${ARCH}.dmg"
+            test -s "${ARTIFACT_DIR}/CompozyOS-${RELEASE_VERSION}-mac-${ARCH}.zip"
+            test -s "${ARTIFACT_DIR}/latest-mac-${ARCH}.yml"
+          else
+            test -s "${ARTIFACT_DIR}/CompozyOS-${RELEASE_VERSION}-linux-x64.AppImage"
+            test -s "${ARTIFACT_DIR}/CompozyOS-${RELEASE_VERSION}-linux-x64.deb"
+            test -s "${ARTIFACT_DIR}/latest-linux.yml"
+          fi
+
+      - name: Upload exact desktop artifacts
+        uses: actions/upload-artifact@v7
+        with:
+          name: desktop-release-${{ matrix.id }}-${{ needs.release-plan.outputs.desktop_channel }}
+          path: desktop/.artifacts/release/${{ matrix.id }}/*
+          if-no-files-found: error
+          retention-days: 14
+
+  desktop-publish:
+    name: Publish Desktop Channel
+    needs: [release-plan, release, desktop-build, desktop-finalize]
+    if: |
+      always() &&
+      needs.release.result == 'success' &&
+      needs.release.outputs.desktop_required == 'true' &&
+      needs.desktop-build.result == 'success' &&
+      needs.desktop-finalize.result == 'success'
+    concurrency:
+      group: desktop-channel-${{ needs.release-plan.outputs.release_channel }}
+      cancel-in-progress: false
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ needs.release-plan.outputs.release_ref }}
+          fetch-depth: 0
+          fetch-tags: true
+
+      - uses: ./.github/actions/setup-go
+        with:
+          go-version: ${{ env.GO_VERSION }}
+
+      - uses: ./.github/actions/setup-bun
+        with:
+          install-playwright: "false"
+
+      - name: Download exact desktop artifacts and manifests
+        uses: actions/download-artifact@v8
+        with:
+          pattern: desktop-release-*
+          path: .artifacts/desktop
+          merge-multiple: true
+
+      - name: Download signed compatibility catalog
+        env:
+          GH_TOKEN: ${{ secrets.RELEASE_TOKEN }}
+          RELEASE_TAG: ${{ needs.release-plan.outputs.release_tag }}
+        run: |
+          set -euo pipefail
+          mkdir -p .artifacts/authority
+          gh release download "${RELEASE_TAG}" \
+            --repo "${GITHUB_REPOSITORY}" \
+            --dir .artifacts/authority \
+            --pattern checksums.txt \
+            --pattern compat.json
+
+      - name: Assemble authority input and merge macOS manifests
+        run: |
+          set -euo pipefail
+          version="${{ needs.release-plan.outputs.release_version }}"
+          for artifact in \
+            "CompozyOS-${version}-mac-arm64.dmg" \
+            "CompozyOS-${version}-mac-arm64.zip" \
+            "CompozyOS-${version}-mac-x64.dmg" \
+            "CompozyOS-${version}-mac-x64.zip" \
+            "CompozyOS-${version}-linux-x64.AppImage" \
+            "CompozyOS-${version}-linux-x64.deb"; do
+            cp ".artifacts/desktop/${artifact}" ".artifacts/authority/${artifact}"
+          done
+          bun run --cwd desktop release:prepare-channel -- \
+            ../.artifacts/desktop/latest-mac-arm64.yml \
+            ../.artifacts/desktop/latest-mac-x64.yml \
+            ../.artifacts/desktop/latest-linux.yml \
+            ../.artifacts/channel \
+            "https://github.com/${GITHUB_REPOSITORY}/releases/download/v${version}"
+
+      - name: Verify payloads then advance the channel ref
+        env:
+          GITHUB_TOKEN: ${{ secrets.RELEASE_TOKEN }}
+          RELEASE_CHANNEL: ${{ needs.release-plan.outputs.release_channel }}
+          RELEASE_VERSION: ${{ needs.release-plan.outputs.release_version }}
+        run: |
+          set -euo pipefail
+          go run ./cmd/compozy-desktop-release publish \
+            --operation-id "desktop-release-${RELEASE_VERSION}-publish" \
+            --channel "${RELEASE_CHANNEL}" \
+            --version "${RELEASE_VERSION}" \
+            --repository "${GITHUB_REPOSITORY}" \
+            --asset-dir .artifacts/authority \
+            --channel-dir .artifacts/channel \
+            -o json \
+            | tee .artifacts/channel-publish-result.json
+          jq -e '
+            .operation == "publish" and
+            (.channel_ref_after | length > 0) and
+            (.audit_commit == .channel_ref_after) and
+            (.verified_inventory | length == 7) and
+            (.outcome == "published" or .outcome == "already_completed")
+          ' .artifacts/channel-publish-result.json >/dev/null
+
+  desktop-smoke:
+    name: Smoke Packaged Desktop ${{ matrix.name }}
+    needs: [release-plan, desktop-build]
+    if: |
+      needs.release-plan.result == 'success' &&
+      needs.desktop-build.result == 'success'
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: macOS arm64 DMG
+            id: macos-arm64
+            runner: macos-15
+            platform: macos
+            artifact: CompozyOS-${{ needs.release-plan.outputs.release_version }}-mac-arm64.dmg
+          - name: macOS x64 DMG
+            id: macos-x64
+            runner: macos-15-intel
+            platform: macos
+            artifact: CompozyOS-${{ needs.release-plan.outputs.release_version }}-mac-x64.dmg
+          - name: Linux AppImage
+            id: linux
+            runner: ubuntu-22.04
+            platform: linux
+            artifact: CompozyOS-${{ needs.release-plan.outputs.release_version }}-linux-x64.AppImage
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ needs.release-plan.outputs.release_ref }}
+
+      - *load-release-workflow-tools
+
+      - uses: ./.github/actions/setup-go
+        with:
+          go-version: ${{ env.GO_VERSION }}
+
+      - name: Install Linux desktop smoke dependencies
+        if: matrix.platform == 'linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get remove --yes libfuse2
+          sudo apt-get install -y \
+            fuse3 \
+            xdg-utils \
+            xvfb
+
+      - name: Download packaged desktop artifact
+        uses: actions/download-artifact@v8
+        with:
+          name: desktop-release-${{ matrix.id }}-${{ needs.release-plan.outputs.desktop_channel }}
+          path: .artifacts/desktop
+
+      - name: Provision from an empty isolated home
+        env:
+          RELEASE_CHANNEL: ${{ needs.release-plan.outputs.desktop_channel }}
+          RELEASE_VERSION: ${{ needs.release-plan.outputs.release_version }}
+        run: |
+          bash "${RUNNER_TEMP}/smoke-desktop-release-artifact.sh" \
+            "${{ matrix.platform }}" \
+            ".artifacts/desktop/${{ matrix.artifact }}" \
+            "${RELEASE_VERSION}" \
+            "${RELEASE_VERSION}"
+
+      - name: Verify Linux AppImage extraction fallback
+        if: matrix.platform == 'linux'
+        env:
+          RELEASE_CHANNEL: ${{ needs.release-plan.outputs.desktop_channel }}
+          RELEASE_VERSION: ${{ needs.release-plan.outputs.release_version }}
+        run: |
+          bash "${RUNNER_TEMP}/smoke-desktop-release-artifact.sh" \
+            "${{ matrix.platform }}" \
+            ".artifacts/desktop/${{ matrix.artifact }}" \
+            "${RELEASE_VERSION}" \
+            "${RELEASE_VERSION}" \
+            extract
+
+      - name: Upload smoke diagnostics on failure
+        if: failure()
+        uses: actions/upload-artifact@v7
+        with:
+          name: desktop-release-smoke-${{ matrix.id }}-diagnostics
+          path: ${{ runner.temp }}/compozyds.*/
+          if-no-files-found: ignore
+          retention-days: 14
+
+  desktop-finalize:
+    name: Publish GitHub Release
+    needs: [release-plan, release]
+    if: |
+      always() &&
+      needs.release.result == 'success'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ needs.release-plan.outputs.release_ref }}
+
+      - uses: ./.github/actions/setup-node
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+
+      - name: Publish GitHub release before downstream package managers
+        env:
+          GH_TOKEN: ${{ secrets.RELEASE_TOKEN }}
+          RELEASE_TAG: ${{ needs.release-plan.outputs.release_tag }}
+          GITHUB_PRERELEASE: ${{ needs.release-plan.outputs.github_prerelease }}
+          GITHUB_MAKE_LATEST: ${{ needs.release-plan.outputs.github_make_latest }}
+        run: |
+          set -euo pipefail
+          release_pages="$(
+            gh api --paginate --slurp "repos/${GITHUB_REPOSITORY}/releases?per_page=100"
+          )"
+          matching_releases="$(
+            jq -c --arg tag "$RELEASE_TAG" '[.[][] | select(.tag_name == $tag)]' <<<"$release_pages"
+          )"
+          matching_count="$(jq -r 'length' <<<"$matching_releases")"
+          if [[ "${matching_count}" != "1" ]]; then
+            echo "::error::Expected exactly one GitHub Release for ${RELEASE_TAG}, found ${matching_count}"
+            exit 1
+          fi
+
+          release_id="$(jq -r '.[0].id' <<<"$matching_releases")"
+          release_draft="$(jq -r '.[0].draft' <<<"$matching_releases")"
+          if [[ "${release_draft}" == "true" ]]; then
+            gh api --method PATCH "repos/${GITHUB_REPOSITORY}/releases/${release_id}" \
+              -F draft=false \
+              -F prerelease="${GITHUB_PRERELEASE}" \
+              -f make_latest="${GITHUB_MAKE_LATEST}" >/dev/null
+          elif [[ "${release_draft}" == "false" ]]; then
+            echo "GitHub Release ${RELEASE_TAG} is already published"
+          else
+            echo "::error::GitHub Release ${RELEASE_TAG} returned an invalid draft state: ${release_draft}"
+            exit 1
+          fi
+
+      - name: Verify published channel policy
+        env:
+          GH_TOKEN: ${{ secrets.RELEASE_TOKEN }}
+          RELEASE_COMMIT: ${{ needs.release-plan.outputs.release_commit }}
+          RELEASE_TAG: ${{ needs.release-plan.outputs.release_tag }}
+          RELEASE_VERSION: ${{ needs.release-plan.outputs.release_version }}
+          RELEASE_CHANNEL: ${{ needs.release-plan.outputs.release_channel }}
+          GITHUB_PRERELEASE: ${{ needs.release-plan.outputs.github_prerelease }}
+          GITHUB_MAKE_LATEST: ${{ needs.release-plan.outputs.github_make_latest }}
+          NPM_TAG: ${{ needs.release-plan.outputs.npm_tag }}
+        run: |
+          set -euo pipefail
+          release_json="$(gh api "repos/${GITHUB_REPOSITORY}/releases/tags/${RELEASE_TAG}")"
+          if [[ "$(jq -r '.draft' <<<"${release_json}")" != "false" ]]; then
+            echo "::error::GitHub Release is still a draft"
+            exit 1
+          fi
+          if [[ "$(jq -r '.tag_name' <<<"${release_json}")" != "${RELEASE_TAG}" ]]; then
+            echo "::error::GitHub Release tag does not match the release plan"
+            exit 1
+          fi
+          if [[ "$(jq -r '.target_commitish' <<<"${release_json}")" != "${RELEASE_COMMIT}" ]]; then
+            echo "::error::GitHub Release target does not match the release plan"
+            exit 1
+          fi
+          if [[ "$(jq -r '.prerelease' <<<"${release_json}")" != "${GITHUB_PRERELEASE}" ]]; then
+            echo "::error::GitHub prerelease state does not match the release plan"
+            exit 1
+          fi
+          latest_tag="$(gh api "repos/${GITHUB_REPOSITORY}/releases/latest" --jq '.tag_name')"
+          if [[ "${GITHUB_MAKE_LATEST}" == "true" && "${latest_tag}" != "${RELEASE_TAG}" ]]; then
+            echo "::error::GitHub latest release does not match the release plan"
+            exit 1
+          fi
+          if [[ "${GITHUB_MAKE_LATEST}" == "false" && "${latest_tag}" == "${RELEASE_TAG}" ]]; then
+            echo "::error::Prerelease unexpectedly became the latest GitHub release"
+            exit 1
+          fi
+
+  cli-public-install-smoke:
+    name: Install Public CLI Assets ${{ matrix.name }}
+    needs: [release-plan, release, desktop-finalize, desktop-publish]
+    if: |
+      always() &&
+      needs.release-plan.result == 'success' &&
+      needs.release.result == 'success' &&
+      needs.desktop-finalize.result == 'success' &&
+      (needs.release.outputs.desktop_required != 'true' ||
+       needs.desktop-publish.result == 'success')
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: macOS arm64
+            runner: macos-15
+          - name: Linux x86_64
+            runner: ubuntu-22.04
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ needs.release-plan.outputs.release_ref }}
+
+      - *load-release-workflow-tools
+
+      - uses: ./.github/actions/setup-node
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+
+      - name: Download unpublished CLI package
+        if: needs.release.outputs.cli_state == 'missing'
+        uses: actions/download-artifact@v8
+        with:
+          name: npm-cli-${{ needs.release-plan.outputs.release_version }}
+          path: .artifacts/npm-cli
+
+      - name: Install package against the public GitHub release
+        env:
+          CLI_STATE: ${{ needs.release.outputs.cli_state }}
+          RELEASE_VERSION: ${{ needs.release-plan.outputs.release_version }}
+        run: |
+          set -euo pipefail
+          package_spec=".artifacts/npm-cli"
+          if [[ "${CLI_STATE}" == "published" ]]; then
+            package_spec="@compozy/cli@${RELEASE_VERSION}"
+          fi
+          bash "${RUNNER_TEMP}/smoke-public-cli-package.sh" \
+            "${package_spec}" \
+            "${RELEASE_VERSION}"
+
+  npm-publish:
+    name: Publish Package Manager Artifacts
+    needs: [release-plan, release, cli-public-install-smoke]
+    if: |
+      always() &&
+      needs.release-plan.result == 'success' &&
+      needs.release.result == 'success' &&
+      needs.cli-public-install-smoke.result == 'success'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ needs.release-plan.outputs.release_ref }}
+          fetch-depth: 0
+          fetch-tags: true
+          token: ${{ secrets.RELEASE_TOKEN }}
+
+      - uses: ./.github/actions/setup-node
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          npm-version: ${{ env.NPM_VERSION }}
+
+      - uses: ./.github/actions/setup-bun
+        with:
+          install-playwright: "false"
+
+      - name: Download verified CLI package
+        if: needs.release.outputs.cli_state == 'missing'
+        uses: actions/download-artifact@v8
+        with:
+          name: npm-cli-${{ needs.release-plan.outputs.release_version }}
+          path: .artifacts/npm-cli
+
+      - name: Publish verified CLI package
+        if: needs.release.outputs.cli_state == 'missing'
+        env:
+          NPM_TAG: ${{ needs.release-plan.outputs.npm_tag }}
+        run: npm publish .artifacts/npm-cli --tag "${NPM_TAG}" --access public --provenance
+
+      - name: Publish TypeScript extension SDK
+        if: needs.release.outputs.extension_sdk_state == 'missing'
+        env:
+          RELEASE_VERSION: ${{ needs.release-plan.outputs.release_version }}
+          NPM_TAG: ${{ needs.release-plan.outputs.npm_tag }}
+        run: scripts/publish-sdk-package.sh sdk/typescript "${RELEASE_VERSION}" "${NPM_TAG}"
+
+      - name: Publish TypeScript app SDK
+        if: needs.release.outputs.client_sdk_state == 'missing'
+        env:
+          RELEASE_VERSION: ${{ needs.release-plan.outputs.release_version }}
+          NPM_TAG: ${{ needs.release-plan.outputs.npm_tag }}
+        run: scripts/publish-sdk-package.sh sdk/client "${RELEASE_VERSION}" "${NPM_TAG}"
+
+      - name: Checkout canonical formula renderer
+        if: needs.release-plan.outputs.homebrew_skip_upload == 'false'
+        uses: actions/checkout@v7
+        with:
+          ref: main
+          path: .release-tools
+          sparse-checkout: scripts/render-homebrew-formula.sh
+          sparse-checkout-cone-mode: false
+          persist-credentials: false
+
+      - name: Checkout Homebrew tap
+        if: needs.release-plan.outputs.homebrew_skip_upload == 'false'
+        uses: actions/checkout@v7
+        with:
+          repository: compozy/homebrew-compozy
+          ref: main
+          token: ${{ secrets.RELEASE_TOKEN }}
+          path: .release-homebrew
+
+      - name: Publish Homebrew formula after the GitHub release
+        if: needs.release-plan.outputs.homebrew_skip_upload == 'false'
+        env:
+          GH_TOKEN: ${{ secrets.RELEASE_TOKEN }}
+          RELEASE_TAG: ${{ needs.release-plan.outputs.release_tag }}
+          RELEASE_VERSION: ${{ needs.release-plan.outputs.release_version }}
+        run: |
+          set -euo pipefail
+          checksum_dir="${RUNNER_TEMP}/homebrew-release"
+          mkdir -p "${checksum_dir}"
+          gh release download "${RELEASE_TAG}" \
+            --repo "${GITHUB_REPOSITORY}" \
+            --pattern checksums.txt \
+            --dir "${checksum_dir}"
+          .release-tools/scripts/render-homebrew-formula.sh \
+            --release-repo "${GITHUB_REPOSITORY}" \
+            --release-version "${RELEASE_VERSION}" \
+            --release-tag "${RELEASE_TAG}" \
+            --checksums "${checksum_dir}/checksums.txt" \
+            --output .release-homebrew/Formula/compozy.rb
+          git -C .release-homebrew config user.name "github-actions[bot]"
+          git -C .release-homebrew config user.email "github-actions[bot]@users.noreply.github.com"
+          git -C .release-homebrew add Formula/compozy.rb
+          if git -C .release-homebrew diff --cached --quiet; then
+            echo "Homebrew formula already matches ${RELEASE_TAG}"
+            exit 0
+          fi
+          git -C .release-homebrew commit -m "compozy ${RELEASE_TAG}"
+          git -C .release-homebrew push origin HEAD:main
+
+      - name: Verify npm publication and channel tags
+        env:
+          RELEASE_VERSION: ${{ needs.release-plan.outputs.release_version }}
+          NPM_TAG: ${{ needs.release-plan.outputs.npm_tag }}
+        run: |
+          scripts/release-npm-readiness.sh \
+            "${RELEASE_VERSION}" \
+            "${NPM_TAG}" \
+            @compozy/cli \
+            @compozy/extension-sdk \
+            @compozy/client

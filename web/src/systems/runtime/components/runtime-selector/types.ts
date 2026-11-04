@@ -1,0 +1,230 @@
+import { type ReasoningEffort } from "@/lib/api-contract";
+
+/**
+ * Canonical reasoning vocabulary for the frontend, single-sourced here. The
+ * duplicated leaf-selector effort constants are deleted. Order drives the
+ * intensity meter position; the label map drives every human-facing effort
+ * label. Empty string is deliberately outside this set and means "use provider
+ * default".
+ */
+export const REASONING_EFFORT_ORDER = [
+  "none",
+  "minimal",
+  "low",
+  "medium",
+  "high",
+  "xhigh",
+  "max",
+  "ultra",
+] as const satisfies readonly ReasoningEffort[];
+
+export const REASONING_EFFORT_LABELS: Record<ReasoningEffort, string> = {
+  none: "None",
+  minimal: "Minimal",
+  low: "Low",
+  medium: "Medium",
+  high: "High",
+  xhigh: "Extra high",
+  max: "Max",
+  ultra: "Ultra",
+};
+
+/** 1-based canonical position used to fill the intensity meter. */
+export function reasoningEffortPosition(effort: string): number {
+  const index = (REASONING_EFFORT_ORDER as readonly string[]).indexOf(effort);
+  return index < 0 ? 0 : index + 1;
+}
+
+export function reasoningEffortLabel(effort: string): string {
+  return (REASONING_EFFORT_LABELS as Record<string, string>)[effort] ?? effort;
+}
+
+/**
+ * Emitted wire value. Empty `model`/`reasoning_effort` mean "use provider
+ * default" and are omitted from POST bodies by each surface's submit mapper
+ * (existing convention, `_spec.md` §7.9). `reasoning_effort` preserves the provider identifier; the selector only emits
+ * values advertised by the selected model. Known levels receive friendly labels.
+ */
+export interface RuntimeSelectorValue {
+  provider: string;
+  model: string;
+  reasoning_effort: ReasoningEffort | "";
+  /** Explicit ACP option overrides, excluding dedicated model/reasoning/speed fields. */
+  acp_options?: RuntimeACPOptionSelection[];
+}
+
+/** `composer` removes trigger chrome while preserving runtime identity. */
+export type RuntimeSelectorVariant = "default" | "small" | "compact" | "composer";
+
+export type RuntimeAvailability = "live" | "stale" | "unavailable";
+export type RuntimeReasoningSource = "acp" | "catalog";
+export type RuntimeProviderStrategy = "session_config" | "launch_arg" | "provider_managed";
+
+/** When a selection change reaches a live session: the agent's next step or its next turn. */
+export type RuntimeProviderLiveApply = "next_step" | "next_turn";
+
+/** One ACP select value as advertised by the active session. */
+export interface RuntimeACPOptionValue {
+  value: string;
+  label?: string;
+  description?: string;
+  group_id?: string;
+  group_label?: string;
+}
+
+/**
+ * Public ACP configuration metadata. Transport-specific model aliases never
+ * cross this boundary; only controls the ACP advertised are rendered.
+ */
+export interface RuntimeACPOption {
+  id: string;
+  label?: string;
+  description?: string;
+  category?: string;
+  kind: string;
+  current_value_id?: string;
+  current_bool?: boolean | null;
+  values?: RuntimeACPOptionValue[];
+}
+
+/** A typed ACP option override; exactly one of value_id or bool_value is set. */
+export type RuntimeACPOptionSelection =
+  | { id: string; value_id: string; bool_value?: never }
+  | { id: string; value_id?: never; bool_value: boolean };
+
+/** Public model capability combinations, independent of provider transport IDs. */
+export interface RuntimeModelConfiguration {
+  reasoning_effort?: ReasoningEffort | null;
+  fast?: boolean | null;
+  thinking?: boolean | null;
+}
+
+/** Whether the public model matrix contains a configuration for this effort. */
+export function modelSupportsReasoningEffort(
+  model: RuntimeModelOption | undefined,
+  effort: ReasoningEffort
+): boolean {
+  if (!model) return false;
+  if (!model.configurations || model.configurations.length === 0) {
+    return model.efforts.includes(effort);
+  }
+  return model.configurations.some(configuration => configuration.reasoning_effort === effort);
+}
+
+/**
+ * An observed configuration matrix is authoritative for Fast support. Rows
+ * without a matrix stay permissive because they represent provider-default or
+ * not-yet-observed capability data; the daemon still validates the request at
+ * dispatch time.
+ */
+export function modelSupportsFast(model: RuntimeModelOption | undefined): boolean {
+  if (!model?.configurations || model.configurations.length === 0) return true;
+  return model.configurations.some(configuration => configuration.fast === true);
+}
+
+/** Provider rail option. Auth state drives dimming + disabled model rows. */
+export interface RuntimeProviderOption {
+  id: string;
+  name: string;
+  harness?: string;
+  runtime_provider?: string;
+  needs_auth?: boolean;
+  /** How this provider applies model/config controls at runtime. */
+  runtime_strategy?: RuntimeProviderStrategy;
+  /** Omitted when a change waits for the next message's process binding. */
+  runtime_live_apply?: RuntimeProviderLiveApply;
+}
+
+/**
+ * Presentation-only model option. Surfaces map the daemon `ProviderModelPayload`
+ * onto this shape (see `model-catalog/lib/to-runtime-selector-options`) so the
+ * selector stays decoupled from `systems/model-catalog`.
+ */
+export interface RuntimeModelOption {
+  id: string;
+  provider: string;
+  name: string;
+  context_window?: number | null;
+  cost_input?: number | null;
+  cost_output?: number | null;
+  cost_cache_read?: number | null;
+  cost_cache_write?: number | null;
+  cost_reasoning?: number | null;
+  supports_tools?: boolean | null;
+  supports_reasoning?: boolean | null;
+  /** Whether effort capability has an authoritative source beyond enrichment. */
+  reasoning_known?: boolean;
+  /** Provider negotiation policy; absent only for older catalog payloads. */
+  reasoning_apply?: string;
+  /** Selectable effort subset the runtime can honor; empty = not selectable. */
+  efforts: ReasoningEffort[];
+  /** Canonical default within `efforts` ("" = provider default). Sanitized by the mapper. */
+  default_effort?: ReasoningEffort | "";
+  reasoning_source?: RuntimeReasoningSource;
+  /** Public valid combinations for the model; aliases stay server-side. */
+  configurations?: RuntimeModelConfiguration[];
+  /** Provider/model option descriptors available before a session is active. */
+  acp_options?: RuntimeACPOption[];
+  availability: RuntimeAvailability;
+  curated?: boolean;
+  featured?: boolean;
+  release_date?: string;
+  disabled?: boolean;
+  disabled_reason?: string;
+}
+
+export type RuntimeReasoningMode =
+  | "levels"
+  | "supported-nolevels"
+  | "none"
+  | "no-model"
+  | "unknown";
+
+export interface RuntimeReasoningState {
+  mode: RuntimeReasoningMode;
+  levels: ReasoningEffort[];
+  /** Canonical default within the level set ("" = provider default). */
+  defaultEffort: ReasoningEffort | "";
+  source: RuntimeReasoningSource;
+}
+
+/**
+ * Resolve the reasoning footer/trigger mode for a model (mirrors the design's
+ * `reasoningStateFor`): no selected model renders the "pick a model" prompt; a
+ * non-empty effort subset renders selectable levels; `supports_reasoning`
+ * without levels renders the "provider decides" note; a selected model with
+ * neither renders the "no reasoning" note. `no-model` and `none` are kept
+ * distinct so the footer never claims "this model…" when nothing is selected.
+ *
+ * `none` is not a selectable stop: turning reasoning off is not something the
+ * selector offers, so the slider starts at the lowest real level. A model
+ * advertising only `none` therefore has no selectable levels at all, and a
+ * `default_effort` outside the filtered set collapses to "" (provider default).
+ */
+export function resolveReasoningState(
+  model: RuntimeModelOption | undefined
+): RuntimeReasoningState {
+  if (!model) {
+    return { mode: "no-model", levels: [], defaultEffort: "", source: "catalog" };
+  }
+  const levels: ReasoningEffort[] = model.efforts.filter(effort => effort !== "none");
+  if (levels.length > 0) {
+    const fallback = model.default_effort ?? "";
+    return {
+      mode: "levels",
+      levels,
+      defaultEffort: fallback !== "" && levels.includes(fallback) ? fallback : "",
+      source: model.reasoning_source ?? "catalog",
+    };
+  }
+  if (
+    model.supports_reasoning !== false &&
+    (model.reasoning_known === false || model.supports_reasoning == null)
+  ) {
+    return { mode: "unknown", levels: [], defaultEffort: "", source: "catalog" };
+  }
+  if (model.supports_reasoning) {
+    return { mode: "supported-nolevels", levels: [], defaultEffort: "", source: "catalog" };
+  }
+  return { mode: "none", levels: [], defaultEffort: "", source: "catalog" };
+}

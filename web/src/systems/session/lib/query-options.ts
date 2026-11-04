@@ -1,0 +1,478 @@
+import { infiniteQueryOptions, keepPreviousData, queryOptions } from "@tanstack/react-query";
+
+import {
+  fetchSession,
+  fetchSessionClarifications,
+  fetchSessionEvents,
+  fetchSessionHistory,
+  fetchSessionInputs,
+  fetchSessionInteractions,
+  fetchSessionGoal,
+  fetchSessionRecap,
+  fetchSessionUsage,
+  fetchSessionUsageTurns,
+  fetchSessions,
+} from "../adapters/session-api";
+import { isSessionUnavailable, isTerminalInputReadError } from "../adapters/session-api-errors";
+import { fetchSessionAttentionSummary } from "../adapters/session-attention-api";
+import { fetchSessionCommands } from "../adapters/session-command-api";
+import {
+  fetchSessionTranscriptOutline,
+  searchSessionTranscript,
+  SESSION_TRANSCRIPT_SEARCH_LIMIT,
+} from "../adapters/session-navigation-api";
+import { listSessionDescendants } from "../adapters/session-archive-api";
+import { fetchSessionOwner } from "../adapters/session-owner-api";
+import { fetchToolArtifactPage } from "../adapters/tool-artifact-api";
+import type { FetchSessionEventsParams } from "../adapters/session-api";
+import type { SessionListFilters, SessionPayload, SessionState } from "../types";
+import { catalogStreamCoveredRefetchInterval } from "./session-catalog-stream-coverage";
+import { withPullRequestReread } from "./session-pull-request";
+import { sessionKeys } from "./query-keys";
+import { normalizeSessionListFilters, sessionListRequest } from "./session-list-query";
+import { normalizeTranscriptSearchQuery } from "./session-navigation";
+import {
+  isLiveSessionState,
+  SESSION_LIVE_REFETCH_INTERVAL_MS,
+  SESSION_STARTING_REFETCH_INTERVAL_MS,
+  sessionStreamBackedRefetchInterval,
+} from "./session-stream-liveness";
+import { expiredInteractionsByRequest } from "./session-pending-interactions";
+import {
+  queryKeyHasScope,
+  SESSION_TRANSCRIPT_STALE_TIME_MS,
+  SESSION_WARM_CACHE_POLICY,
+} from "./session-query-policy";
+import { PROFILE_AGGREGATE, profileViewKey, type ProfileScopeParams } from "@/systems/profiles";
+
+import { fetchSessionAcrossProfiles, fetchSessionById } from "../adapters/session-owner-api";
+
+const SESSION_DETAIL_STALE_TIME_MS = 2_000;
+export const SESSION_OWNER_STALE_TIME_MS = 30_000;
+const TOOL_ARTIFACT_PAGE_BYTES = 64 * 1_024;
+
+/**
+ * The only workspace-agnostic session key. Owner projections select a workspace but never carry
+ * rendered session data, so they remain separate from the workspace-prefixed `sessionKeys`.
+ */
+export const sessionOwnerKeys = {
+  all: ["session-owner"] as const,
+  detail: (sessionId: string) => [...sessionOwnerKeys.all, sessionId] as const,
+};
+
+export interface SessionOwnerDialogState {
+  sessionId: string;
+  workspaceId: string;
+  workspaceName: string;
+}
+
+export function sessionOwnerOptions(sessionId: string) {
+  return queryOptions({
+    queryKey: sessionOwnerKeys.detail(sessionId),
+    queryFn: ({ signal }) => fetchSessionOwner(sessionId, signal),
+    staleTime: SESSION_OWNER_STALE_TIME_MS,
+    retry: (count, error) => !isSessionUnavailable(error) && count < 1,
+    enabled: !!sessionId,
+  });
+}
+
+export { isLiveSessionState };
+
+function sessionDetailRefetchInterval(
+  sessionId: string,
+  session: SessionPayload | undefined
+): number | false {
+  const state = session?.state;
+  const interval =
+    state === "starting"
+      ? SESSION_STARTING_REFETCH_INTERVAL_MS
+      : sessionStreamBackedRefetchInterval(sessionId, state);
+  return withPullRequestReread(interval, session);
+}
+
+export function sessionsListOptions(filters: SessionListFilters = {}) {
+  const normalizedFilters = normalizeSessionListFilters(filters);
+  return infiniteQueryOptions({
+    queryKey: sessionKeys.list(normalizedFilters),
+    queryFn: ({ pageParam, signal }) =>
+      fetchSessions(sessionListRequest(normalizedFilters, pageParam), signal),
+    initialPageParam: undefined as string | undefined,
+    getNextPageParam: lastPage => (lastPage.page.has_more ? lastPage.page.next_cursor : undefined),
+    staleTime: 5_000,
+    refetchOnWindowFocus: false,
+    retry: false,
+  });
+}
+
+export function sessionAttentionSummaryOptions() {
+  return queryOptions({
+    queryKey: sessionKeys.attentionSummary(),
+    queryFn: ({ signal }) => fetchSessionAttentionSummary(signal),
+    staleTime: 5_000,
+    refetchOnWindowFocus: false,
+    retry: false,
+  });
+}
+
+export function sessionDetailOptions(workspace: string, id: string) {
+  return queryOptions({
+    queryKey: sessionKeys.detail(workspace, id),
+    queryFn: ({ signal }) => fetchSession(workspace, id, signal),
+    refetchInterval: query =>
+      isSessionUnavailable(query.state.error)
+        ? false
+        : sessionDetailRefetchInterval(id, query.state.data),
+    retry: (count, error) => !isSessionUnavailable(error) && count < 1,
+    staleTime: SESSION_DETAIL_STALE_TIME_MS,
+    ...SESSION_WARM_CACHE_POLICY,
+    enabled: !!workspace && !!id,
+  });
+}
+
+export function sessionEventsOptions(
+  workspace: string,
+  id: string,
+  params?: FetchSessionEventsParams
+) {
+  return queryOptions({
+    queryKey: sessionKeys.eventsList(workspace, id, params),
+    queryFn: ({ signal }) => fetchSessionEvents(workspace, id, params, signal),
+    staleTime: 5_000,
+    enabled: !!workspace && !!id,
+  });
+}
+
+export function sessionHistoryOptions(workspace: string, id: string) {
+  return queryOptions({
+    queryKey: sessionKeys.history(workspace, id),
+    queryFn: ({ signal }) => fetchSessionHistory(workspace, id, signal),
+    staleTime: 10_000,
+    enabled: !!workspace && !!id,
+  });
+}
+
+/**
+ * Canonical command projection for the current session. SSE frames invalidate this exact key and
+ * the composer refetches it whenever the native trigger popover opens.
+ */
+export function sessionCommandsOptions(workspace: string, id: string, enabled = true) {
+  const workspaceId = workspace.trim();
+  const sessionId = id.trim();
+  return queryOptions({
+    queryKey: sessionKeys.commands(workspaceId, sessionId),
+    queryFn: ({ signal }) => fetchSessionCommands(workspaceId, sessionId, signal),
+    staleTime: 30_000,
+    enabled: enabled && workspaceId.length > 0 && sessionId.length > 0,
+  });
+}
+
+export function sessionGoalOptions(workspace: string, id: string) {
+  return queryOptions({
+    queryKey: sessionKeys.goal(workspace, id),
+    queryFn: ({ signal }) => fetchSessionGoal(workspace, id, signal),
+    staleTime: Number.POSITIVE_INFINITY,
+    enabled: !!workspace && !!id,
+  });
+}
+
+/**
+ * Live pending clarification for one session — the exact authority for pending truth. Never polls:
+ * the transcript `clarify` SSE event wakes it via explicit invalidation (see `use-session-live-tail`),
+ * and a successful answer reconciles the exact key. A short stale window lets focus/remount self-heal
+ * a dropped wake.
+ */
+export function sessionClarificationsOptions(workspace: string, id: string, enabled = true) {
+  return queryOptions({
+    queryKey: sessionKeys.clarifications(workspace, id),
+    queryFn: ({ signal }) => fetchSessionClarifications(workspace, id, signal),
+    staleTime: 5_000,
+    enabled: !!workspace && !!id && enabled,
+  });
+}
+
+/**
+ * Decisions the daemon settled without the transcript recording an answer — today the
+ * pre-crash permission/clarification asks a daemon restart expires (`canceled`,
+ * resolution `failed-by-restart`). Read while the transcript shows an undecided ask; the
+ * live control cadence re-reads only while some undecided ask is still unknown to the
+ * settled map, so a transcript whose every open ask has a settled row keeps its cached
+ * receipts without polling, and a session with nothing undecided never asks. A restart
+ * expiry changes the session's pending counts, which upserts it on the catalog stream, and
+ * the reconnect after the restart wakes every open read; so while that stream is live for
+ * the read's scope its wakes replace the fast poll, leaving the safety cadence.
+ */
+export function sessionExpiredInteractionsOptions(
+  workspace: string,
+  id: string,
+  options: {
+    enabled?: boolean;
+    undecidedRequestIds?: ReadonlySet<string>;
+    /** The catalog stream is live for this read's scope; its wakes replace the fast poll. */
+    streamCovered?: boolean;
+  } = {}
+) {
+  const undecided = options.undecidedRequestIds ?? new Set<string>();
+  return queryOptions({
+    queryKey: sessionKeys.interactions(workspace, id, "canceled"),
+    queryFn: ({ signal }) =>
+      fetchSessionInteractions(workspace, id, { status: "canceled", signal }),
+    refetchInterval: query => {
+      const cadence = catalogStreamCoveredRefetchInterval(
+        options.streamCovered ?? false,
+        SESSION_LIVE_REFETCH_INTERVAL_MS
+      );
+      const rows = query.state.data;
+      if (!rows) return cadence;
+      const settled = expiredInteractionsByRequest(rows);
+      for (const requestId of undecided) {
+        if (!settled.has(requestId)) return cadence;
+      }
+      return false;
+    },
+    staleTime: 5_000,
+    enabled: !!workspace && !!id && (options.enabled ?? true),
+  });
+}
+
+/**
+ * Decisions the daemon applied, read for who made them: the transcript's permission
+ * part records the decision but not the actor, and only the `resolved` interaction
+ * row carries `resolved_by`. The daemon settles the row before it writes the transcript
+ * part, so one read per newly decided ask is enough: the decided request ids fence the
+ * key, a new decision re-reads once, and the previous rows stay as placeholder while
+ * the re-read is in flight. A decision without a row (pre-attention history) reads
+ * neutral rather than polling for evidence that will never arrive.
+ */
+export function sessionResolvedInteractionsOptions(
+  workspace: string,
+  id: string,
+  options: { enabled?: boolean; decidedRequestIds?: ReadonlySet<string> } = {}
+) {
+  const fence = [...(options.decidedRequestIds ?? new Set<string>())].sort();
+  const scope = sessionKeys.interactions(workspace, id, "resolved");
+  return queryOptions({
+    queryKey: [...scope, fence] as const,
+    queryFn: ({ signal }) =>
+      fetchSessionInteractions(workspace, id, { status: "resolved", signal }),
+    // Previous rows bridge only a fence change inside the same workspace/session
+    // scope. Across scopes a reused provider request id would otherwise present
+    // the previous session's actor while the new read is still in flight.
+    placeholderData: (previousData, previousQuery) =>
+      previousQuery && queryKeyHasScope(previousQuery.queryKey, scope) ? previousData : undefined,
+    staleTime: SESSION_LIVE_REFETCH_INTERVAL_MS,
+    enabled: !!workspace && !!id && (options.enabled ?? true),
+  });
+}
+
+/** The queue list's fallback cadence while a session is watched; a prompt POST tightens it to 1s. */
+export const SESSION_INPUTS_REFETCH_INTERVAL_MS = SESSION_LIVE_REFETCH_INTERVAL_MS;
+
+/** Exact current-generation pending operator input, owned by the daemon. */
+export function sessionInputsOptions(
+  workspace: string,
+  id: string,
+  options: { enabled?: boolean; sessionState?: SessionState; refetchInterval?: number } = {}
+) {
+  return queryOptions({
+    queryKey: sessionKeys.inputQueue(workspace, id),
+    queryFn: ({ signal }) => fetchSessionInputs(workspace, id, signal),
+    refetchInterval: query => {
+      if (isTerminalInputReadError(query.state.error)) return false;
+      const cadence = sessionStreamBackedRefetchInterval(id, options.sessionState);
+      if (cadence === false) return false;
+      return Math.min(options.refetchInterval ?? cadence, cadence);
+    },
+    retry: (failureCount, error) => !isTerminalInputReadError(error) && failureCount < 1,
+    staleTime: 1_000,
+    enabled: !!workspace && !!id && (options.enabled ?? true),
+  });
+}
+
+export { sessionRelayedInteractionsOptions } from "./session-relayed-query-options";
+export {
+  catalogStreamCoveredRefetchInterval,
+  sessionCatalogStreamStatusOptions,
+} from "./session-catalog-stream-coverage";
+
+export { sessionTranscriptOptions } from "./session-transcript-options";
+
+// Navigation reads (S8/S9) sit under the detail key: mutation invalidation
+// rereads them; the live-tail surface refresh (`exact` on detail) does not, so
+// the hooks refresh on the host's coalesced key instead.
+const SESSION_NAVIGATION_STALE_TIME_MS = 5_000;
+
+/**
+ * Full-history literal search. Each query string is its own cache entry, so a
+ * stale response for an earlier query can never overwrite the current one;
+ * `keepPreviousData` keeps the last list on screen while the next one loads.
+ */
+export function sessionTranscriptSearchOptions(
+  workspace: string,
+  id: string,
+  query: string,
+  limit = SESSION_TRANSCRIPT_SEARCH_LIMIT
+) {
+  const q = normalizeTranscriptSearchQuery(query);
+  return queryOptions({
+    queryKey: sessionKeys.transcriptSearch(workspace, id, q, limit),
+    queryFn: ({ signal }) => searchSessionTranscript(workspace, id, { limit, q }, signal),
+    enabled: !!id && q.length > 0,
+    placeholderData: keepPreviousData,
+    staleTime: SESSION_NAVIGATION_STALE_TIME_MS,
+    retry: false,
+  });
+}
+
+/** The operator-message outline over full retained history — one row per sent message. */
+export function sessionTranscriptOutlineOptions(workspace: string, id: string, enabled = true) {
+  return queryOptions({
+    queryKey: sessionKeys.transcriptOutline(workspace, id),
+    queryFn: ({ signal }) => fetchSessionTranscriptOutline(workspace, id, signal),
+    enabled: !!id && enabled,
+    placeholderData: keepPreviousData,
+    staleTime: SESSION_NAVIGATION_STALE_TIME_MS,
+    retry: (count, error) => !isSessionUnavailable(error) && count < 1,
+  });
+}
+
+export function sessionToolArtifactOptions(
+  workspace: string,
+  artifactURI: string,
+  enabled: boolean
+) {
+  return infiniteQueryOptions({
+    queryKey: sessionKeys.toolArtifact(workspace, artifactURI),
+    queryFn: ({ pageParam, signal }) =>
+      fetchToolArtifactPage(workspace, artifactURI, pageParam, TOOL_ARTIFACT_PAGE_BYTES, signal),
+    initialPageParam: 0,
+    getNextPageParam: lastPage => (lastPage.eof ? undefined : lastPage.next_offset),
+    staleTime: Number.POSITIVE_INFINITY,
+    ...SESSION_WARM_CACHE_POLICY,
+    enabled: enabled && !!workspace && !!artifactURI,
+    retry: false,
+  });
+}
+
+export function sessionRecapOptions(workspace: string, id: string, limit?: number) {
+  return queryOptions({
+    queryKey: sessionKeys.recap(workspace, id, limit),
+    queryFn: ({ signal }) => fetchSessionRecap(workspace, id, limit, signal),
+    staleTime: 10_000,
+    enabled: !!workspace && !!id,
+  });
+}
+
+/**
+ * Session token-usage aggregate. Usage accrues live as the agent reports it; the
+ * stream's `session_usage_changed` re-reads it, and the stream-backed cadence covers a
+ * session without a live stream. A stopped session is terminal and never refetches.
+ */
+export function sessionUsageOptions(
+  workspace: string,
+  id: string,
+  sessionState?: SessionState | null
+) {
+  return queryOptions({
+    queryKey: sessionKeys.usage(workspace, id),
+    queryFn: ({ signal }) => fetchSessionUsage(workspace, id, signal),
+    refetchInterval: isLiveSessionState(sessionState)
+      ? () => sessionStreamBackedRefetchInterval(id, sessionState)
+      : false,
+    staleTime: SESSION_TRANSCRIPT_STALE_TIME_MS,
+    ...SESSION_WARM_CACHE_POLICY,
+    enabled: !!workspace && !!id,
+  });
+}
+
+/**
+ * The profile-enforced detail read.
+ *
+ * The workspace-scoped route answers 200 for a session in any profile, so it
+ * cannot be the read a profile boundary rests on. This one is `getSessionByID`
+ * with an explicit selector: the daemon compares the session's owner against the
+ * scope and answers 404 when they differ, which is what makes the deep-link
+ * fallback reachable at all. `retry: false` keeps that 404 a decision rather
+ * than three seconds of retries.
+ */
+export function sessionScopedDetailOptions(
+  sessionId: string,
+  scope: ProfileScopeParams,
+  options: { enabled?: boolean; liveTail?: boolean } = {}
+) {
+  const id = sessionId.trim();
+  const normalizedScope: ProfileScopeParams =
+    "all_profiles" in scope ? scope : { profile: scope.profile.trim() };
+  const profileKey =
+    "all_profiles" in normalizedScope
+      ? PROFILE_AGGREGATE
+      : profileViewKey({ kind: "profile", profile: normalizedScope.profile });
+  const { enabled = true, liveTail = true } = options;
+  return queryOptions({
+    queryKey: sessionKeys.byId(id, profileKey),
+    queryFn: ({ signal }) => fetchSessionById(id, normalizedScope, signal),
+    refetchInterval: query => {
+      if (!liveTail || isSessionUnavailable(query.state.error)) return false;
+      return sessionDetailRefetchInterval(id, query.state.data);
+    },
+    staleTime: SESSION_DETAIL_STALE_TIME_MS,
+    ...SESSION_WARM_CACHE_POLICY,
+    retry: false,
+    enabled:
+      enabled && id !== "" && ("all_profiles" in normalizedScope || normalizedScope.profile !== ""),
+  });
+}
+
+/**
+ * The labeled aggregate-by-id read behind the deep-link owner banner.
+ *
+ * Same family as the scoped read, one lens over: the aggregate is a way of
+ * looking, so it is a sibling entry rather than a separate concept.
+ */
+export function sessionAcrossProfilesOptions(sessionId: string, enabled = true) {
+  const id = sessionId.trim();
+  return queryOptions({
+    queryKey: sessionKeys.byId(id, PROFILE_AGGREGATE),
+    queryFn: ({ signal }) => fetchSessionAcrossProfiles(id, signal),
+    enabled: enabled && id !== "",
+    retry: false,
+    staleTime: 30_000,
+  });
+}
+
+export function sessionUsageTurnsOptions(
+  workspace: string,
+  id: string,
+  sessionState?: SessionState | null
+) {
+  return queryOptions({
+    queryKey: sessionKeys.usageTurns(workspace, id),
+    queryFn: ({ signal }) => fetchSessionUsageTurns(workspace, id, signal),
+    refetchInterval: isLiveSessionState(sessionState)
+      ? () => sessionStreamBackedRefetchInterval(id, sessionState)
+      : false,
+    staleTime: SESSION_TRANSCRIPT_STALE_TIME_MS,
+    ...SESSION_WARM_CACHE_POLICY,
+    enabled: !!workspace && !!id,
+  });
+}
+
+/** The target's whole subtree from the daemon: a loaded catalog page cannot count it. */
+export function sessionDescendantsOptions(
+  session: Pick<SessionPayload, "id" | "workspace_id" | "profile_name">
+) {
+  return queryOptions({
+    queryKey: sessionKeys.descendants(session.id, session.profile_name),
+    queryFn: ({ signal }) =>
+      listSessionDescendants(session.workspace_id ?? "", session.id, session.profile_name, signal),
+    staleTime: 0,
+  });
+}
+
+/** The shared reset generation is client-owned and only changed by transcript fence resets. */
+export function sessionContextResetOptions(workspaceId: string, sessionId: string) {
+  return queryOptions({
+    queryKey: sessionKeys.contextReset(workspaceId, sessionId),
+    queryFn: () => 0,
+    enabled: false,
+  });
+}

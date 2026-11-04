@@ -1,0 +1,485 @@
+package globaldb
+
+import (
+	"errors"
+	"path/filepath"
+	"testing"
+	"time"
+
+	"github.com/compozy/compozy/internal/store"
+	"github.com/compozy/compozy/internal/testutil"
+	toolspkg "github.com/compozy/compozy/internal/tools"
+)
+
+func TestGlobalDBToolApprovalGrants(t *testing.T) {
+	t.Parallel()
+
+	t.Run("Should upsert exact grants and touch the most-specific match", func(t *testing.T) {
+		t.Parallel()
+
+		ctx := testutil.Context(t)
+		globalDB := openTestGlobalDB(t)
+		workspaceID := registerWorkspaceForGlobalTests(t, globalDB, "approval-upsert", t.TempDir())
+		current := approvalGrantTestTime()
+		globalDB.now = func() time.Time { return current }
+		key := approvalGrantTestKey(workspaceID, "codex", approvalGrantDigest("exact"))
+
+		created, err := globalDB.PutApprovalGrant(ctx, toolspkg.ApprovalGrant{
+			ApprovalGrantKey: key,
+			Decision:         toolspkg.ApprovalGrantAllow,
+		})
+		if err != nil {
+			t.Fatalf("PutApprovalGrant() error = %v", err)
+		}
+		if created.ID == "" || !created.CreatedAt.Equal(current) || !created.LastUsedAt.Equal(current) ||
+			created.ProfileName != "default" || created.ProfileColor == "" || created.ProfileIcon == "" {
+			t.Fatalf("PutApprovalGrant() = %#v, want materialized identity, owner, and timestamps", created)
+		}
+
+		current = current.Add(time.Minute)
+		found, ok, err := globalDB.LookupApprovalGrant(ctx, key)
+		if err != nil {
+			t.Fatalf("LookupApprovalGrant() error = %v", err)
+		}
+		if !ok || found.ID != created.ID || !found.LastUsedAt.Equal(current) {
+			t.Fatalf("LookupApprovalGrant() = %#v, %t, want touched exact grant", found, ok)
+		}
+
+		current = current.Add(time.Minute)
+		replaced, err := globalDB.PutApprovalGrant(ctx, toolspkg.ApprovalGrant{
+			ApprovalGrantKey: key,
+			Decision:         toolspkg.ApprovalGrantReject,
+		})
+		if err != nil {
+			t.Fatalf("PutApprovalGrant(replace) error = %v", err)
+		}
+		if replaced.ID != created.ID || replaced.Decision != toolspkg.ApprovalGrantReject {
+			t.Fatalf("PutApprovalGrant(replace) = %#v, want stable id and reject decision", replaced)
+		}
+		listed, err := globalDB.ListApprovalGrants(
+			ctx, store.ReadScope{ProfileID: store.DefaultProfileID}, workspaceID,
+		)
+		if err != nil {
+			t.Fatalf("ListApprovalGrants() error = %v", err)
+		}
+		if len(listed) != 1 || listed[0].ID != created.ID {
+			t.Fatalf("ListApprovalGrants() = %#v, want one upserted row", listed)
+		}
+
+		foreignProfileID := "gggggggggggggggggggggggggg"
+		if _, err := globalDB.db.ExecContext(ctx, `
+			INSERT INTO profiles (id, name, color, icon, state, created_at)
+			VALUES (?, 'approvals-foreign', '#E0635A', 'shield', 'active', ?)`,
+			foreignProfileID, store.FormatTimestamp(current),
+		); err != nil {
+			t.Fatalf("insert foreign profile error = %v", err)
+		}
+		foreignKey := key
+		foreignKey.ProfileID = foreignProfileID
+		if _, err := globalDB.PutApprovalGrant(ctx, toolspkg.ApprovalGrant{
+			ApprovalGrantKey: foreignKey,
+			Decision:         toolspkg.ApprovalGrantAllow,
+		}); err != nil {
+			t.Fatalf("PutApprovalGrant(foreign profile) error = %v", err)
+		}
+		if _, err := globalDB.db.ExecContext(ctx, `UPDATE profiles
+			SET state = 'archived', archived_at = ? WHERE id = ?`,
+			store.FormatTimestamp(current.Add(time.Minute)), foreignProfileID,
+		); err != nil {
+			t.Fatalf("archive foreign profile error = %v", err)
+		}
+		scoped, err := globalDB.ListApprovalGrants(
+			ctx, store.ReadScope{ProfileID: store.DefaultProfileID}, workspaceID,
+		)
+		if err != nil || len(scoped) != 1 || scoped[0].ProfileID != store.DefaultProfileID {
+			t.Fatalf("ListApprovalGrants(scoped) = %#v, %v, want default only", scoped, err)
+		}
+		aggregate, err := globalDB.ListApprovalGrants(
+			ctx, store.ReadScope{AllProfiles: true}, workspaceID,
+		)
+		if err != nil {
+			t.Fatalf("ListApprovalGrants(aggregate) error = %v", err)
+		}
+		if len(aggregate) != 2 || !hasApprovalGrantOwner(aggregate, foreignProfileID, true) {
+			t.Fatalf("ListApprovalGrants(aggregate) = %#v, want same-key archived owner-labeled row", aggregate)
+		}
+	})
+
+	t.Run("Should resolve exact agent digest then agent digest and tool width", func(t *testing.T) {
+		t.Parallel()
+
+		ctx := testutil.Context(t)
+		globalDB := openTestGlobalDB(t)
+		workspaceID := registerWorkspaceForGlobalTests(t, globalDB, "approval-specificity", t.TempDir())
+		current := approvalGrantTestTime()
+		globalDB.now = func() time.Time { return current }
+		exactDigest := approvalGrantDigest("exact")
+		otherDigest := approvalGrantDigest("other")
+		grants := []toolspkg.ApprovalGrant{
+			{
+				ApprovalGrantKey: approvalGrantTestKey(workspaceID, "", ""),
+				Decision:         toolspkg.ApprovalGrantReject,
+			},
+			{
+				ApprovalGrantKey: approvalGrantTestKey(workspaceID, "", exactDigest),
+				Decision:         toolspkg.ApprovalGrantAllow,
+			},
+			{
+				ApprovalGrantKey: approvalGrantTestKey(workspaceID, "codex", ""),
+				Decision:         toolspkg.ApprovalGrantReject,
+			},
+			{
+				ApprovalGrantKey: approvalGrantTestKey(workspaceID, "codex", exactDigest),
+				Decision:         toolspkg.ApprovalGrantAllow,
+			},
+		}
+		for i, grant := range grants {
+			current = current.Add(time.Second)
+			if _, err := globalDB.PutApprovalGrant(ctx, grant); err != nil {
+				t.Fatalf("PutApprovalGrant(%d) error = %v", i, err)
+			}
+		}
+
+		assertApprovalGrantLookup(
+			t,
+			globalDB,
+			approvalGrantTestKey(workspaceID, "codex", exactDigest),
+			"codex",
+			exactDigest,
+		)
+		assertApprovalGrantLookup(t, globalDB, approvalGrantTestKey(workspaceID, "codex", otherDigest), "codex", "")
+		assertApprovalGrantLookup(
+			t,
+			globalDB,
+			approvalGrantTestKey(workspaceID, "claude", exactDigest),
+			"",
+			exactDigest,
+		)
+		assertApprovalGrantLookup(t, globalDB, approvalGrantTestKey(workspaceID, "claude", otherDigest), "", "")
+	})
+
+	t.Run("Should reject scope changes on a conflicting digest without altering the decision", func(t *testing.T) {
+		t.Parallel()
+		for _, accessScope := range []string{"", "read:workspace:ws-target@default"} {
+			db := openTestGlobalDB(t)
+			workspaceID := registerWorkspaceForGlobalTests(t, db, "approval-collision", t.TempDir())
+			key := approvalGrantTestKey(workspaceID, "codex", approvalGrantDigest("collision"))
+			key.AccessScope = accessScope
+			created := putApprovalGrantForTest(t, db, toolspkg.ApprovalGrant{
+				ApprovalGrantKey: key, Decision: toolspkg.ApprovalGrantReject,
+			})
+			otherKey := key
+			otherKey.AccessScope = "read:workspace:ws-other@default"
+			_, err := db.PutApprovalGrant(t.Context(), toolspkg.ApprovalGrant{
+				ApprovalGrantKey: otherKey, Decision: toolspkg.ApprovalGrantAllow,
+			})
+			if !errors.Is(err, toolspkg.ErrApprovalGrantInvalid) {
+				t.Fatalf("PutApprovalGrant(scope change) = %v, want invalid key", err)
+			}
+			found, ok, err := db.LookupApprovalGrant(t.Context(), key)
+			if err != nil || !ok || found.ID != created.ID || found.Decision != toolspkg.ApprovalGrantReject {
+				t.Fatalf("original grant = %#v, %t, %v, want the unchanged reject", found, ok, err)
+			}
+		}
+	})
+
+	t.Run("Should match access scope grants exactly and keep them out of tool approval", func(t *testing.T) {
+		t.Parallel()
+
+		ctx := testutil.Context(t)
+		globalDB := openTestGlobalDB(t)
+		workspaceID := registerWorkspaceForGlobalTests(t, globalDB, "approval-access-scope", t.TempDir())
+		globalDB.now = approvalGrantTestTime
+		scopeKey := approvalGrantTestKey(workspaceID, "codex", approvalGrantDigest("scope-a"))
+		scopeKey.AccessScope = "read:workspace:ws_target_a@default"
+		created := putApprovalGrantForTest(t, globalDB, toolspkg.ApprovalGrant{
+			ApprovalGrantKey: scopeKey,
+			Decision:         toolspkg.ApprovalGrantAllow,
+		})
+		if created.AccessScope != scopeKey.AccessScope {
+			t.Fatalf("PutApprovalGrant() access scope = %q, want %q", created.AccessScope, scopeKey.AccessScope)
+		}
+		found, ok, err := globalDB.LookupApprovalGrant(ctx, scopeKey)
+		if err != nil || !ok || found.ID != created.ID || found.AccessScope != scopeKey.AccessScope {
+			t.Fatalf("LookupApprovalGrant(scope) = %#v, %t, %v, want the stored scope grant", found, ok, err)
+		}
+
+		// A tool-wide grant for the same agent never stands in for a scope grant.
+		putApprovalGrantForTest(t, globalDB, toolspkg.ApprovalGrant{
+			ApprovalGrantKey: approvalGrantTestKey(workspaceID, "codex", ""),
+			Decision:         toolspkg.ApprovalGrantAllow,
+		})
+		otherScope := approvalGrantTestKey(workspaceID, "codex", approvalGrantDigest("scope-b"))
+		otherScope.AccessScope = "read:workspace:ws_target_b@default"
+		if _, ok, err := globalDB.LookupApprovalGrant(ctx, otherScope); err != nil || ok {
+			t.Fatalf("LookupApprovalGrant(other scope) = %t, %v, want miss", ok, err)
+		}
+		sameDigestOtherScope := scopeKey
+		sameDigestOtherScope.AccessScope = otherScope.AccessScope
+		if _, ok, err := globalDB.LookupApprovalGrant(ctx, sameDigestOtherScope); err != nil || ok {
+			t.Fatalf("LookupApprovalGrant(same digest, other scope) = %t, %v, want miss", ok, err)
+		}
+		// And a scope grant never answers the tool approval gate for the same digest.
+		toolKey := scopeKey
+		toolKey.AccessScope = ""
+		toolMatch, ok, err := globalDB.LookupApprovalGrant(ctx, toolKey)
+		if err != nil || !ok || toolMatch.ID == created.ID || toolMatch.InputDigest != "" {
+			t.Fatalf("LookupApprovalGrant(tool) = %#v, %t, %v, want the tool-wide grant", toolMatch, ok, err)
+		}
+
+		listed, err := globalDB.ListApprovalGrants(
+			ctx, store.ReadScope{ProfileID: store.DefaultProfileID}, workspaceID,
+		)
+		if err != nil {
+			t.Fatalf("ListApprovalGrants() error = %v", err)
+		}
+		var listedScope string
+		for _, grant := range listed {
+			if grant.ID == created.ID {
+				listedScope = grant.AccessScope
+			}
+		}
+		if len(listed) != 2 || listedScope != scopeKey.AccessScope {
+			t.Fatalf("ListApprovalGrants() = %#v, want the scope grant visible with its scope", listed)
+		}
+		if err := globalDB.RevokeApprovalGrant(ctx, store.DefaultProfileID, workspaceID, created.ID); err != nil {
+			t.Fatalf("RevokeApprovalGrant() error = %v", err)
+		}
+		if _, ok, err := globalDB.LookupApprovalGrant(ctx, scopeKey); err != nil || ok {
+			t.Fatalf("LookupApprovalGrant(revoked) = %t, %v, want miss", ok, err)
+		}
+	})
+
+	t.Run("Should persist and revoke User read grants without listing project grants", func(t *testing.T) {
+		t.Parallel()
+		ctx := t.Context()
+		db := openTestGlobalDB(t)
+		workspaceID := registerWorkspaceForGlobalTests(t, db, "approval-user-isolation", t.TempDir())
+		projectKey := approvalGrantTestKey(workspaceID, "codex", approvalGrantDigest("project"))
+		putApprovalGrantForTest(t, db, toolspkg.ApprovalGrant{
+			ApprovalGrantKey: projectKey, Decision: toolspkg.ApprovalGrantAllow,
+		})
+		key := approvalGrantTestKey("", "codex", approvalGrantDigest("user-read"))
+		key.AccessScope = "read:workspace:" + workspaceID + "@default"
+		created := putApprovalGrantForTest(t, db, toolspkg.ApprovalGrant{
+			ApprovalGrantKey: key, Decision: toolspkg.ApprovalGrantAllow,
+		})
+		if found, ok, err := db.LookupApprovalGrant(ctx, key); err != nil || !ok || found.ID != created.ID {
+			t.Fatalf("User grant lookup = %#v, %t, %v", found, ok, err)
+		}
+		listed, err := db.ListApprovalGrants(ctx, store.ReadScope{ProfileID: store.DefaultProfileID}, "")
+		if err != nil || len(listed) != 1 || listed[0].ID != created.ID {
+			t.Fatalf("User grants = %#v, %v, want only the User-owned grant", listed, err)
+		}
+		if err := db.RevokeApprovalGrant(ctx, store.DefaultProfileID, "", created.ID); err != nil {
+			t.Fatal(err)
+		}
+		if _, ok, err := db.LookupApprovalGrant(ctx, key); err != nil || ok {
+			t.Fatalf("revoked User grant lookup = %t, %v", ok, err)
+		}
+	})
+
+	t.Run("Should isolate list and revoke by workspace and cascade on workspace deletion", func(t *testing.T) {
+		t.Parallel()
+
+		ctx := testutil.Context(t)
+		globalDB := openTestGlobalDB(t)
+		workspaceA := registerWorkspaceForGlobalTests(t, globalDB, "approval-a", t.TempDir())
+		workspaceB := registerWorkspaceForGlobalTests(t, globalDB, "approval-b", t.TempDir())
+		grantA := putApprovalGrantForTest(t, globalDB, toolspkg.ApprovalGrant{
+			ApprovalGrantKey: approvalGrantTestKey(workspaceA, "codex", approvalGrantDigest("a")),
+			Decision:         toolspkg.ApprovalGrantAllow,
+		})
+		putApprovalGrantForTest(t, globalDB, toolspkg.ApprovalGrant{
+			ApprovalGrantKey: approvalGrantTestKey(workspaceB, "codex", approvalGrantDigest("b")),
+			Decision:         toolspkg.ApprovalGrantReject,
+		})
+
+		listedA, err := globalDB.ListApprovalGrants(
+			ctx, store.ReadScope{ProfileID: store.DefaultProfileID}, workspaceA,
+		)
+		if err != nil {
+			t.Fatalf("ListApprovalGrants(workspace A) error = %v", err)
+		}
+		listedB, err := globalDB.ListApprovalGrants(
+			ctx, store.ReadScope{ProfileID: store.DefaultProfileID}, workspaceB,
+		)
+		if err != nil {
+			t.Fatalf("ListApprovalGrants(workspace B) error = %v", err)
+		}
+		if len(listedA) != 1 || len(listedB) != 1 || listedA[0].WorkspaceID == listedB[0].WorkspaceID {
+			t.Fatalf("workspace lists = %#v / %#v, want isolated rows", listedA, listedB)
+		}
+		if err := globalDB.RevokeApprovalGrant(ctx, store.DefaultProfileID, workspaceB, grantA.ID); !errors.Is(
+			err,
+			toolspkg.ErrApprovalGrantNotFound,
+		) {
+			t.Fatalf("RevokeApprovalGrant(cross-workspace) error = %v, want not found", err)
+		}
+		if err := globalDB.RevokeApprovalGrant(ctx, store.DefaultProfileID, workspaceA, grantA.ID); err != nil {
+			t.Fatalf("RevokeApprovalGrant() error = %v", err)
+		}
+		if err := globalDB.RevokeApprovalGrant(ctx, store.DefaultProfileID, workspaceA, grantA.ID); !errors.Is(
+			err,
+			toolspkg.ErrApprovalGrantNotFound,
+		) {
+			t.Fatalf("RevokeApprovalGrant(missing) error = %v, want not found", err)
+		}
+
+		putApprovalGrantForTest(t, globalDB, toolspkg.ApprovalGrant{
+			ApprovalGrantKey: approvalGrantTestKey(workspaceA, "codex", approvalGrantDigest("cascade")),
+			Decision:         toolspkg.ApprovalGrantAllow,
+		})
+		if err := globalDB.DeleteWorkspace(ctx, workspaceA); err != nil {
+			t.Fatalf("DeleteWorkspace() error = %v", err)
+		}
+		var count int
+		if err := globalDB.db.QueryRowContext(
+			ctx,
+			`SELECT COUNT(*) FROM tool_approval_grants WHERE workspace_id = ?`,
+			workspaceA,
+		).Scan(&count); err != nil {
+			t.Fatalf("query approval grant cascade count error = %v", err)
+		}
+		if count != 0 {
+			t.Fatalf("approval grant cascade count = %d, want 0", count)
+		}
+	})
+}
+
+func hasApprovalGrantOwner(grants []toolspkg.ApprovalGrant, profileID string, archived bool) bool {
+	for _, grant := range grants {
+		if grant.ProfileID == profileID && grant.ProfileArchived == archived {
+			return true
+		}
+	}
+	return false
+}
+
+func TestGlobalDBToolApprovalGrantMigration(t *testing.T) {
+	t.Parallel()
+	t.Run("Should preserve durable grants through the head upgrade", func(t *testing.T) {
+		t.Parallel()
+
+		path := filepath.Join(t.TempDir(), GlobalDatabaseName)
+		prefixDB, err := openGlobalMigrationPrefixDatabase(t, path, previousApprovalGrantMigrationStream(t))
+		if err != nil {
+			t.Fatalf("OpenSQLiteDatabase(v16 prefix) error = %v", err)
+		}
+		workspaceID := registerPrefixWorkspace(t, prefixDB, "approval-upgrade", t.TempDir())
+		if err := prefixDB.Close(); err != nil {
+			t.Fatalf("prefixDB.Close() error = %v", err)
+		}
+
+		globalDB, err := openGlobalMigrationUpgrade(t, path)
+		if err != nil {
+			t.Fatalf("OpenGlobalDB(v17 upgrade) error = %v", err)
+		}
+		ctx := testutil.Context(t)
+		created := putApprovalGrantForTest(t, globalDB, toolspkg.ApprovalGrant{
+			ApprovalGrantKey: approvalGrantTestKey(workspaceID, "codex", approvalGrantDigest("upgrade")),
+			Decision:         toolspkg.ApprovalGrantAllow,
+		})
+		if err := globalDB.Close(ctx); err != nil {
+			t.Fatalf("GlobalDB.Close(upgrade) error = %v", err)
+		}
+
+		reopened, err := OpenGlobalDB(testutil.Context(t), path)
+		if err != nil {
+			t.Fatalf("OpenGlobalDB(reopen) error = %v", err)
+		}
+		ctx = testutil.Context(t)
+		t.Cleanup(func() {
+			if err := reopened.Close(testutil.Context(t)); err != nil {
+				t.Errorf("reopened.Close() error = %v", err)
+			}
+		})
+		listed, err := reopened.ListApprovalGrants(
+			ctx, store.ReadScope{ProfileID: store.DefaultProfileID}, workspaceID,
+		)
+		if err != nil {
+			t.Fatalf("ListApprovalGrants(reopen) error = %v", err)
+		}
+		if len(listed) != 1 || listed[0].ID != created.ID {
+			t.Fatalf("ListApprovalGrants(reopen) = %#v, want durable grant", listed)
+		}
+		status, err := store.Status(ctx, reopened.db, MigrationStream())
+		if err != nil {
+			t.Fatalf("Status(latest) error = %v", err)
+		}
+		assertCompleteMigrationStream(t, status, MigrationStream())
+	})
+}
+
+func previousApprovalGrantMigrationStream(t *testing.T) store.MigrationStream {
+	t.Helper()
+
+	return globalMigrationPrefix(t,
+		"00001_baseline.sql",
+		"00002_schema.sql",
+		"00003_schema.sql",
+		"00004_schema.sql",
+		"00005_schema.sql",
+		"00006_schema.sql",
+		"00007_schema.sql",
+		"00008_network_participation.sql",
+		"00009_automation_network_participation.sql",
+		"00010_network_participation_hardening.sql",
+		"00011_schema.sql",
+		"00012_schema.sql",
+		"00013_network_subscription_hard_cut.sql",
+		"00014_network_task_status_projections.sql",
+		"00015_schema.sql",
+		"00016_schema.sql",
+	)
+}
+
+func putApprovalGrantForTest(
+	t *testing.T,
+	globalDB *GlobalDB,
+	grant toolspkg.ApprovalGrant,
+) toolspkg.ApprovalGrant {
+	t.Helper()
+
+	created, err := globalDB.PutApprovalGrant(testutil.Context(t), grant)
+	if err != nil {
+		t.Fatalf("PutApprovalGrant() error = %v", err)
+	}
+	return created
+}
+
+func assertApprovalGrantLookup(
+	t *testing.T,
+	globalDB *GlobalDB,
+	key toolspkg.ApprovalGrantKey,
+	wantAgent string,
+	wantDigest string,
+) {
+	t.Helper()
+
+	grant, found, err := globalDB.LookupApprovalGrant(testutil.Context(t), key)
+	if err != nil {
+		t.Fatalf("LookupApprovalGrant() error = %v", err)
+	}
+	if !found || grant.AgentName != wantAgent || grant.InputDigest != wantDigest {
+		t.Fatalf("LookupApprovalGrant() = %#v, %t, want agent=%q digest=%q", grant, found, wantAgent, wantDigest)
+	}
+}
+
+func approvalGrantTestKey(workspaceID, agentName, digest string) toolspkg.ApprovalGrantKey {
+	return toolspkg.ApprovalGrantKey{
+		ProfileID:   store.DefaultProfileID,
+		WorkspaceID: workspaceID,
+		AgentName:   agentName,
+		ToolID:      toolspkg.ToolIDWorkspaceList,
+		InputDigest: digest,
+	}
+}
+
+func approvalGrantDigest(seed string) string {
+	return "sha256:" + seed
+}
+
+func approvalGrantTestTime() time.Time {
+	return time.Date(2026, 7, 15, 18, 0, 0, 0, time.UTC)
+}

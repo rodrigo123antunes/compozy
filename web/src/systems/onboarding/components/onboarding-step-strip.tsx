@@ -1,0 +1,88 @@
+import { Check } from "@compozy/ui/icons";
+
+import { cn } from "@compozy/ui";
+
+const STEPS: { step: number; label: string }[] = [
+  { step: 1, label: "Model" },
+  { step: 2, label: "Project" },
+];
+
+export interface OnboardingStepStripProps {
+  step: number;
+  maxStep: number;
+  busy: boolean;
+  onSelect: (step: number) => void;
+}
+
+type StepState = "done" | "current" | "upcoming";
+
+function stateFor(entry: number, step: number): StepState {
+  if (entry < step) return "done";
+  return entry === step ? "current" : "upcoming";
+}
+
+/**
+ * Progress lives in the slot an OS window gives its context strip: two segments,
+ * each carrying a 2px rule that fills with the foreground ink as the step is
+ * reached. A segment beyond `maxStep` is disabled — you cannot skip a question.
+ */
+export function OnboardingStepStrip({ step, maxStep, busy, onSelect }: OnboardingStepStripProps) {
+  return (
+    <nav
+      aria-label="Setup progress"
+      data-slot="onboarding-step-strip"
+      className="grid h-setup-steps flex-none grid-cols-2 border-b border-line"
+    >
+      {STEPS.map(entry => {
+        const state = stateFor(entry.step, step);
+        const reached = state !== "upcoming";
+        return (
+          <button
+            key={entry.step}
+            type="button"
+            data-testid={`onboarding-step-${entry.step}`}
+            data-state={state}
+            aria-current={state === "current" ? "step" : undefined}
+            disabled={busy || entry.step > maxStep}
+            onClick={() => onSelect(entry.step)}
+            className={cn(
+              "relative flex items-center gap-2.5 px-4 text-left text-small-body font-medium",
+              "transition-colors duration-base focus-visible:shadow-focus-inset focus-visible:outline-none",
+              "after:absolute after:inset-x-0 after:-bottom-px after:h-0.5 after:transition-colors after:duration-shell-slow",
+              reached ? "after:bg-fg" : "after:bg-line",
+              state === "current" && "text-fg",
+              state === "done" && "text-muted-foreground",
+              state === "upcoming" && "text-subtle",
+              "hover:text-fg disabled:pointer-events-none disabled:opacity-70"
+            )}
+          >
+            <span
+              aria-hidden="true"
+              className={cn(
+                "grid size-setup-step-marker flex-none place-items-center rounded-full border",
+                "font-mono text-pill-group-badge font-semibold tabular-nums",
+                "transition-colors duration-base",
+                state === "done"
+                  ? "border-transparent bg-primary text-primary-foreground"
+                  : state === "current"
+                    ? "border-fg text-fg"
+                    : "border-line-strong text-subtle"
+              )}
+            >
+              {state === "done" ? (
+                <Check className="size-2.5" />
+              ) : (
+                // The figure's box is trimmed to its cap height, so the badge centres
+                // the glyph itself; the inherited line-height would sit it low.
+                <span className="block leading-none [text-box:trim-both_cap_alphabetic]">
+                  {entry.step}
+                </span>
+              )}
+            </span>
+            {entry.label}
+          </button>
+        );
+      })}
+    </nav>
+  );
+}

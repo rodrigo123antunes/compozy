@@ -1,0 +1,68 @@
+import { History, WifiOff } from "@compozy/ui/icons";
+
+import { Button, Marker } from "@compozy/ui";
+
+import { useSessionTransportState } from "../hooks/use-session-transcript-thread-messages";
+import { formatMessageTimestamp } from "../lib/format-timestamp";
+import { describeSessionHistoryReset } from "../lib/session-transport";
+
+/**
+ * Loaded, then lost (US-018.AC-2): retries ran out while the conversation was
+ * on screen. What is shown is saved up to the last applied frame; the danger
+ * glyph is earned — this is a real failure of the live view — and Try again
+ * is the same recovery the sync-failed pane offers.
+ */
+export function SessionTransportFailureNotice() {
+  const transport = useSessionTransportState();
+  if (transport.phase !== "failed" || transport.failure === null) return null;
+  const lostAt = transport.lastLiveAt === null ? "" : formatMessageTimestamp(transport.lastLiveAt);
+  return (
+    <Marker
+      role="alert"
+      data-testid="session-transport-failure"
+      tone="destructive"
+      icon={<WifiOff />}
+    >
+      <b>{lostAt ? `Live updates stopped at ${lostAt}` : "Live updates stopped"}</b> — couldn&apos;t
+      reconnect after {transport.failure.attempts} tries. What you see is saved up to then.{" "}
+      <Button
+        type="button"
+        variant="link"
+        size="xs"
+        // Inline in the sentence: no pill geometry, and the underline is the
+        // non-color cue against the notice's own muted ink.
+        className="h-auto px-0 underline underline-offset-2"
+        onClick={transport.retry}
+        data-testid="session-transport-failure-retry"
+      >
+        Try again
+      </Button>
+    </Marker>
+  );
+}
+
+/**
+ * The daemon reset the view (US-017.AC-3 / EC-1): another generation while
+ * the stream was down, a sequence reset, or retention retiring the cursor the
+ * view held. Stated in one info line with the daemon's reason and generation
+ * as meta, never a modal.
+ */
+export function SessionTransportHistoryResetNotice() {
+  const transport = useSessionTransportState();
+  const reset = transport.historyReset;
+  if (reset === null) return null;
+  const sentence = describeSessionHistoryReset(reset);
+  return (
+    <Marker
+      role="status"
+      data-testid="session-transport-history-reset"
+      data-reset-reason={reset.reason ?? undefined}
+      data-reset-generation={reset.generation}
+      tone="info"
+      icon={<History />}
+    >
+      <b>{sentence.lead}</b>
+      {sentence.rest}
+    </Marker>
+  );
+}

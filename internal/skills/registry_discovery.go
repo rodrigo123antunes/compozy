@@ -1,0 +1,433 @@
+package skills
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"maps"
+
+	"slices"
+	"strings"
+
+	"github.com/compozy/compozy/internal/filesnap"
+	"github.com/compozy/compozy/internal/resources"
+	"github.com/compozy/compozy/internal/store"
+
+	workspacepkg "github.com/compozy/compozy/internal/workspace"
+)
+
+type resourceSkillProjection struct {
+	globalSkills                      map[string]*Skill
+	bundledRuntimeSkills              map[string]*Skill
+	profileSkills                     map[string]map[string]*Skill
+	workspaceSkills                   map[string]map[string]*Skill
+	workspaceProfileSkills            map[string]map[string]*Skill
+	globalCommandCandidates           []*Skill
+	profileCommandCandidates          map[string][]*Skill
+	workspaceCommandCandidates        map[string][]*Skill
+	workspaceProfileCommandCandidates map[string][]*Skill
+	seenCommandCandidates             map[string]struct{}
+}
+
+func newResourceSkillProjection() resourceSkillProjection {
+	return resourceSkillProjection{
+		globalSkills:                      make(map[string]*Skill),
+		profileSkills:                     make(map[string]map[string]*Skill),
+		workspaceSkills:                   make(map[string]map[string]*Skill),
+		workspaceProfileSkills:            make(map[string]map[string]*Skill),
+		profileCommandCandidates:          make(map[string][]*Skill),
+		workspaceCommandCandidates:        make(map[string][]*Skill),
+		workspaceProfileCommandCandidates: make(map[string][]*Skill),
+		seenCommandCandidates:             make(map[string]struct{}),
+	}
+}
+
+// DiscoverGlobal discovers publication candidates without changing the authoritative registry.
+func (r *Registry) DiscoverGlobal(ctx context.Context) ([]*Skill, map[string]filesnap.Snapshot, error) {
+	if err := checkRegistryContext(ctx); err != nil {
+		return nil, nil, err
+	}
+	cfg, generation := r.registryConfigSnapshotWithGeneration(ctx)
+	scans, snapshots, err := r.scanConfiguredGlobalRoots(ctx, cfg.GlobalSkillRoots)
+	if err != nil {
+		return nil, nil, err
+	}
+	key := discoveryCacheEntry{
+		generation: generation,
+		roots:      cfg.GlobalSkillRoots,
+		disabled:   cfg.DisabledSkills,
+		snapshots:  snapshots,
+	}
+	candidates, diagnostics, ok := r.cachedDiscovery(registryGlobalKey, key)
+	if !ok {
+		disabledSkills := append([]string(nil), cfg.DisabledSkills...)
+		_, diagnostics, candidates, err = r.parseGlobalSkills(ctx, disabledSkills, cfg, scans)
+		if err != nil {
+			return nil, nil, err
+		}
+		r.storeDiscovery(registryGlobalKey, key, candidates, diagnostics)
+	}
+	r.recordDiscoveredGlobalDiagnostics(ctx, diagnostics)
+	return cloneCommandSkillSlice(candidates), filesnap.Clone(snapshots), nil
+}
+
+// DiscoverWorkspace reuses parsed publication candidates while workspace inputs are unchanged.
+func (r *Registry) DiscoverWorkspace(
+	ctx context.Context,
+	resolved *workspacepkg.ResolvedWorkspace,
+) ([]*Skill, map[string]filesnap.Snapshot, error) {
+	if err := checkRegistryContext(ctx); err != nil {
+		return nil, nil, err
+	}
+	cfg, generation := r.registryConfigSnapshotWithGeneration(ctx)
+	load, err := r.workspaceLoadFromResolved(ctx, resolved)
+	if err != nil {
+		return nil, nil, err
+	}
+	if len(load.paths) == 0 {
+		r.recordDiscoveredWorkspaceDiagnostics(ctx, resolved, nil)
+		return nil, load.snapshots, nil
+	}
+	cacheKey := workspaceCacheKey(resolved)
+	workspaceDisabled := r.workspaceDisabledSkillsSnapshot(
+		cacheKey,
+		resolved.Config.Skills.DisabledSkills,
+	)
+	key := discoveryCacheEntry{
+		generation: generation,
+		roots:      cfg.GlobalSkillRoots,
+		paths:      load.paths,
+		disabled:   workspaceDisabled,
+		snapshots:  load.snapshots,
+	}
+	candidates, diagnostics, ok := r.cachedDiscovery(cacheKey, key)
+	if !ok {
+		_, diagnostics, candidates, err = r.loadWorkspaceSkills(ctx, load.paths, workspaceDisabled)
+		if err != nil {
+			return nil, nil, err
+		}
+		if cacheKey != "" {
+			r.storeDiscovery(cacheKey, key, candidates, diagnostics)
+		}
+	}
+	r.recordDiscoveredWorkspaceDiagnostics(ctx, resolved, diagnostics)
+	return cloneCommandSkillSlice(candidates), load.snapshots, nil
+}
+
+func (r *Registry) recordDiscoveredGlobalDiagnostics(ctx context.Context, diagnostics []SkillDiagnostic) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if generation := ConfigGenerationFromContext(ctx); generation > 0 && generation == r.pendingGeneration {
+		r.pendingGlobalDiagnostics = cloneDiagnostics(diagnostics)
+		return
+	}
+	r.globalDiagnostics = cloneDiagnostics(diagnostics)
+}
+
+func (r *Registry) recordDiscoveredWorkspaceDiagnostics(
+	ctx context.Context,
+	resolved *workspacepkg.ResolvedWorkspace,
+	diagnostics []SkillDiagnostic,
+) {
+	key := workspaceCacheKey(resolved)
+	if key == "" {
+		return
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if generation := ConfigGenerationFromContext(ctx); generation > 0 && generation == r.pendingGeneration {
+		if r.pendingWorkspaceDiagnostics == nil {
+			r.pendingWorkspaceDiagnostics = make(map[string][]SkillDiagnostic)
+		}
+		r.pendingWorkspaceDiagnostics[key] = cloneDiagnostics(diagnostics)
+		return
+	}
+	r.resourceWorkspaceDiagnostics[key] = cloneDiagnostics(diagnostics)
+}
+
+// ApplyResourceRecords atomically replaces the runtime skill catalog with the
+// canonical resource projection.
+func (r *Registry) ApplyResourceRecords(
+	ctx context.Context,
+	revision int64,
+	records []resources.Record[SkillResourceSpec],
+) error {
+	if r == nil {
+		return errors.New("skills: registry is required")
+	}
+	if err := checkRegistryContext(ctx); err != nil {
+		return err
+	}
+	projection, err := r.projectResourceSkillRecords(records)
+	if err != nil {
+		return err
+	}
+	r.mu.Lock()
+	generation := ConfigGenerationFromContext(ctx)
+	activeGeneration := r.configGeneration.Load()
+	if generation == 0 && r.pendingGeneration > 0 {
+		winningGeneration := r.pendingGeneration
+		r.mu.Unlock()
+		return r.supersededGenerationError(ctx, generation, winningGeneration)
+	}
+	if generation > 0 && generation < activeGeneration {
+		r.mu.Unlock()
+		return r.supersededGenerationError(ctx, generation, activeGeneration)
+	}
+	if generation > 0 && r.pendingGeneration > 0 && generation != r.pendingGeneration {
+		winningGeneration := r.pendingGeneration
+		r.mu.Unlock()
+		return r.supersededGenerationError(ctx, generation, winningGeneration)
+	}
+	if r.pendingConfig != nil && r.pendingGeneration == generation {
+		r.pendingProjection = &projection
+		r.pendingRevision = revision
+		r.mu.Unlock()
+		return nil
+	}
+	r.applyResourceProjectionLocked(revision, projection)
+	r.mu.Unlock()
+
+	r.emitResourceProjectionSummaries(ctx, projection)
+	return nil
+}
+
+func (r *Registry) applyResourceProjectionLocked(revision int64, projection resourceSkillProjection) {
+	r.resourceAuthority = true
+	r.resourceRevision = revision
+	r.resourceWorkspaces = projection.workspaceSkills
+	r.resourceProfiles = projection.profileSkills
+	r.resourceWorkspaceProfiles = projection.workspaceProfileSkills
+	r.resourceGlobalCommandCandidates = projection.globalCommandCandidates
+	r.resourceProfileCommandCandidates = projection.profileCommandCandidates
+	r.resourceWorkspaceCommandCandidates = projection.workspaceCommandCandidates
+	r.resourceWorkspaceProfileCommandCandidates = projection.workspaceProfileCommandCandidates
+	r.globalSkills = projection.globalSkills
+	r.bundledRuntimeSkills = cloneSkillMap(projection.bundledRuntimeSkills)
+	r.wsCache = make(map[string]*wsCache)
+	r.globalLoaded = true
+	r.globalVersion.Add(1)
+}
+
+func (r *Registry) emitResourceProjectionSummaries(ctx context.Context, projection resourceSkillProjection) {
+	r.emitResourceGlobalSkillSummaries(ctx, projection)
+	r.emitResourceWorkspaceSkillSummaries(ctx, projection)
+	r.emitResourceProfileSkillSummaries(ctx, projection)
+	r.emitResourceWorkspaceProfileSkillSummaries(ctx, projection)
+}
+
+func (r *Registry) emitResourceGlobalSkillSummaries(ctx context.Context, projection resourceSkillProjection) {
+	r.emitEventSummaries(ctx, r.buildSkillShadowSummariesFromResolved(
+		mergedSkillList(projection.globalSkills, nil), registryGlobalKey, store.DefaultProfileID, "", "",
+	))
+}
+
+func (r *Registry) emitResourceWorkspaceSkillSummaries(ctx context.Context, projection resourceSkillProjection) {
+	workspaceIDs := slices.Sorted(maps.Keys(projection.workspaceSkills))
+	for _, workspaceID := range workspaceIDs {
+		r.logWorkspaceSkillOverrides(
+			projection.globalSkills,
+			projection.workspaceSkills[workspaceID],
+			workspaceID,
+		)
+		r.emitEventSummaries(
+			ctx,
+			r.buildSkillShadowSummaries(
+				projection.globalSkills,
+				projection.workspaceSkills[workspaceID],
+				skillSourceWorkspaceName,
+				store.DefaultProfileID,
+				workspaceID,
+				"",
+			),
+		)
+	}
+}
+
+func (r *Registry) emitResourceProfileSkillSummaries(ctx context.Context, projection resourceSkillProjection) {
+	profileIDs := slices.Sorted(maps.Keys(projection.profileSkills))
+	for _, profileID := range profileIDs {
+		r.emitEventSummaries(
+			ctx,
+			r.buildSkillShadowSummaries(
+				projection.globalSkills,
+				projection.profileSkills[profileID],
+				skillSourceProfileName,
+				profileID,
+				"",
+				"",
+			),
+		)
+	}
+}
+
+func (r *Registry) emitResourceWorkspaceProfileSkillSummaries(
+	ctx context.Context,
+	projection resourceSkillProjection,
+) {
+	workspaceProfileKeys := slices.Sorted(maps.Keys(projection.workspaceProfileSkills))
+	for _, key := range workspaceProfileKeys {
+		workspaceID, profileID, ok := strings.Cut(key, "@pf:")
+		if !ok || strings.TrimSpace(workspaceID) == "" || strings.TrimSpace(profileID) == "" {
+			continue
+		}
+		base := cloneSkillMapFromList(mergedSkillLayers(
+			projection.globalSkills,
+			projection.profileSkills[profileID],
+			projection.workspaceSkills[workspaceID],
+		))
+		r.emitEventSummaries(
+			ctx,
+			r.buildSkillShadowSummaries(
+				base,
+				projection.workspaceProfileSkills[key],
+				skillSourceWorkspaceProfileName,
+				profileID,
+				workspaceID,
+				"",
+			),
+		)
+	}
+}
+
+func (r *Registry) projectResourceSkillRecords(
+	records []resources.Record[SkillResourceSpec],
+) (resourceSkillProjection, error) {
+	projection := newResourceSkillProjection()
+	ordered := append([]resources.Record[SkillResourceSpec](nil), records...)
+	slices.SortFunc(ordered, func(left, right resources.Record[SkillResourceSpec]) int {
+		return strings.Compare(skillRecordSortKey(left), skillRecordSortKey(right))
+	})
+	for _, record := range ordered {
+		if err := r.projectResourceSkillRecord(&projection, record); err != nil {
+			return resourceSkillProjection{}, err
+		}
+	}
+	projection.bundledRuntimeSkills = bundledRuntimeSkillsFromCandidates(
+		projection.globalCommandCandidates,
+	)
+	protectBundledRuntimeSkillMap(projection.globalSkills, projection.bundledRuntimeSkills)
+	for _, skillsByName := range projection.profileSkills {
+		removeBundledRuntimeOverrides(skillsByName, projection.bundledRuntimeSkills)
+	}
+	for _, skillsByName := range projection.workspaceSkills {
+		removeBundledRuntimeOverrides(skillsByName, projection.bundledRuntimeSkills)
+	}
+	for _, skillsByName := range projection.workspaceProfileSkills {
+		removeBundledRuntimeOverrides(skillsByName, projection.bundledRuntimeSkills)
+	}
+	return projection, nil
+}
+
+func (r *Registry) projectResourceSkillRecord(
+	projection *resourceSkillProjection,
+	record resources.Record[SkillResourceSpec],
+) error {
+	skill, err := SkillFromResourceSpec(record.Spec)
+	if err != nil {
+		return fmt.Errorf("skills: convert resource %q: %w", record.ID, err)
+	}
+	skill.ResourceScope = record.Scope.Normalize()
+	applySkillExtensionOrigin(record, skill)
+	if strings.TrimSpace(skill.Meta.Name) == "" {
+		return nil
+	}
+	switch record.Scope.Kind.Normalize() {
+	case resources.ResourceScopeKindUser:
+		skill.CommandScope = registryGlobalKey
+		if err := appendCommandResourceCandidate(
+			projection.seenCommandCandidates,
+			registryGlobalKey,
+			skill,
+		); err != nil {
+			return err
+		}
+		projection.globalCommandCandidates = append(
+			projection.globalCommandCandidates,
+			cloneSkill(skill),
+		)
+		r.overlaySkill(projection.globalSkills, skill)
+	case resources.ResourceScopeKindWorkspace:
+		return r.projectWorkspaceResourceSkill(projection, record, skill)
+	case resources.ResourceScopeKindProfile:
+		profileID := strings.TrimSpace(record.Scope.ID)
+		if profileID == "" {
+			return nil
+		}
+		if projection.profileSkills[profileID] == nil {
+			projection.profileSkills[profileID] = make(map[string]*Skill)
+		}
+		skill.CommandScope = registryGlobalKey
+		if err := appendCommandResourceCandidate(
+			projection.seenCommandCandidates,
+			"profile:"+profileID,
+			skill,
+		); err != nil {
+			return err
+		}
+		r.overlaySkill(projection.profileSkills[profileID], skill)
+		projection.profileCommandCandidates[profileID] = append(
+			projection.profileCommandCandidates[profileID],
+			cloneSkill(skill),
+		)
+	case resources.ResourceScopeKindWorkspaceProfile:
+		return r.projectWorkspaceProfileResourceSkill(projection, record, skill)
+	}
+	return nil
+}
+
+func (r *Registry) projectWorkspaceProfileResourceSkill(
+	projection *resourceSkillProjection,
+	record resources.Record[SkillResourceSpec],
+	skill *Skill,
+) error {
+	key := strings.TrimSpace(record.Scope.ID)
+	if key == "" {
+		return nil
+	}
+	if projection.workspaceProfileSkills[key] == nil {
+		projection.workspaceProfileSkills[key] = make(map[string]*Skill)
+	}
+	skill.CommandScope = skillSourceWorkspaceName
+	if err := appendCommandResourceCandidate(
+		projection.seenCommandCandidates,
+		"workspace_profile:"+key,
+		skill,
+	); err != nil {
+		return err
+	}
+	r.overlaySkill(projection.workspaceProfileSkills[key], skill)
+	projection.workspaceProfileCommandCandidates[key] = append(
+		projection.workspaceProfileCommandCandidates[key],
+		cloneSkill(skill),
+	)
+	return nil
+}
+
+func (r *Registry) projectWorkspaceResourceSkill(
+	projection *resourceSkillProjection,
+	record resources.Record[SkillResourceSpec],
+	skill *Skill,
+) error {
+	workspaceID := strings.TrimSpace(record.Scope.ID)
+	if workspaceID == "" {
+		return nil
+	}
+	if projection.workspaceSkills[workspaceID] == nil {
+		projection.workspaceSkills[workspaceID] = make(map[string]*Skill)
+	}
+	skill.CommandScope = skillSourceWorkspaceName
+	if err := appendCommandResourceCandidate(
+		projection.seenCommandCandidates,
+		skillSourceWorkspaceName+":"+workspaceID,
+		skill,
+	); err != nil {
+		return err
+	}
+	projection.workspaceCommandCandidates[workspaceID] = append(
+		projection.workspaceCommandCandidates[workspaceID],
+		cloneSkill(skill),
+	)
+	r.overlaySkill(projection.workspaceSkills[workspaceID], skill)
+	return nil
+}

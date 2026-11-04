@@ -1,0 +1,2013 @@
+package loop_test
+
+import (
+	"bytes"
+	"context"
+	"encoding/json"
+	"errors"
+	"maps"
+	"reflect"
+	"slices"
+	"strings"
+	"sync"
+	"sync/atomic"
+	"testing"
+	"time"
+
+	"github.com/compozy/compozy/internal/api/contract"
+	"github.com/compozy/compozy/internal/loop"
+	"github.com/compozy/compozy/internal/loop/dsl"
+	speedpkg "github.com/compozy/compozy/internal/speed"
+	"github.com/compozy/compozy/internal/task"
+	"github.com/compozy/compozy/internal/tools"
+)
+
+func TestActionRegistryShouldResolveReservedKindsBeforeRuntimeAndRejectUnknownKinds(t *testing.T) {
+	t.Parallel()
+
+	t.Run("Should resolve reserved kinds without consulting RuntimeRegistry", func(t *testing.T) {
+		t.Parallel()
+
+		registry := &fakeActionToolRegistry{getErr: errors.New("registry should not be called")}
+		actions := newActionRegistryForTest(t, registry)
+
+		for _, kind := range []string{
+			string(dsl.ActionRunAgent),
+			string(dsl.ActionRunLoop),
+			string(dsl.ActionTransform),
+		} {
+			executor, err := actions.Resolve(t.Context(), tools.Scope{}, kind)
+			if err != nil {
+				t.Fatalf("Resolve(%q) error = %v", kind, err)
+			}
+			if executor == nil {
+				t.Fatalf("Resolve(%q) executor = nil", kind)
+			}
+		}
+		if registry.getCount() != 0 {
+			t.Fatalf("RuntimeRegistry.Get calls = %d, want 0", registry.getCount())
+		}
+	})
+
+	t.Run("Should reject an oversized reserved action result with node-aware guidance", func(t *testing.T) {
+		t.Parallel()
+
+		const maxResultBytes int64 = 64
+		registry := &fakeActionToolRegistry{getErr: errors.New("registry should not be called")}
+		actions := newActionRegistryForTest(
+			t,
+			registry,
+			loop.WithActionDefaultMaxResultBytes(maxResultBytes),
+		)
+		executor, err := actions.Resolve(t.Context(), tools.Scope{}, string(dsl.ActionTransform))
+		if err != nil {
+			t.Fatalf("Resolve(transform) error = %v", err)
+		}
+		node := dsl.Node{
+			ID: "summarize", Class: dsl.NodeClassAction, Kind: string(dsl.ActionTransform),
+			Params: dsl.NodeParams{"map": map[string]any{
+				"summary": map[string]any{"value": strings.Repeat("x", 128)},
+			}},
+		}
+		raw, err := executor.Execute(t.Context(), node, loop.ActionExecutionInput{})
+		if err != nil {
+			t.Fatalf("Execute(transform) error = %v", err)
+		}
+		_, err = actions.Harvest(t.Context(), executor, node, raw)
+		if !errors.Is(err, loop.ErrActionResultTooLarge) {
+			t.Fatalf("Harvest(transform) error = %v, want ErrActionResultTooLarge", err)
+		}
+		provider, ok := errors.AsType[loop.SafeActionFailureProvider](err)
+		if !ok {
+			t.Fatalf("Harvest(transform) error = %T, want SafeActionFailureProvider", err)
+		}
+		failure := provider.SafeActionFailure()
+		if failure.Code != string(loop.ReasonCodeActionResultTooLarge) ||
+			failure.Target != "summarize" ||
+			!strings.Contains(failure.Cause, `kind "transform"`) ||
+			!strings.Contains(failure.Cause, "64-byte result limit") {
+			t.Fatalf("failure = %#v, want bounded transform guidance", failure)
+		}
+		if registry.getCount() != 0 {
+			t.Fatalf("RuntimeRegistry.Get calls = %d, want 0", registry.getCount())
+		}
+	})
+
+	t.Run("Should resolve non reserved ToolID through RuntimeRegistry", func(t *testing.T) {
+		t.Parallel()
+
+		toolID := tools.ToolID("compozy__task_read")
+		registry := &fakeActionToolRegistry{views: map[tools.ToolID]tools.ToolView{
+			toolID: {},
+		}}
+		actions := newActionRegistryForTest(t, registry)
+
+		executor, err := actions.Resolve(t.Context(), tools.Scope{WorkspaceID: "ws-1"}, toolID.String())
+		if err != nil {
+			t.Fatalf("Resolve(%q) error = %v", toolID, err)
+		}
+		if _, ok := executor.(*loop.ToolCallActionExecutor); !ok {
+			t.Fatalf("Resolve(%q) executor = %T, want ToolCallActionExecutor", toolID, executor)
+		}
+		if registry.getCount() != 1 {
+			t.Fatalf("RuntimeRegistry.Get calls = %d, want 1", registry.getCount())
+		}
+	})
+
+	t.Run("Should resolve an open action whose runtime schema matches the Run snapshot", func(t *testing.T) {
+		t.Parallel()
+
+		toolID := tools.ToolID("compozy__task_read")
+		registry := &fakeActionToolRegistry{views: map[tools.ToolID]tools.ToolView{
+			toolID: {Descriptor: tools.Descriptor{
+				ID:                 toolID,
+				InputSchemaDigest:  "input-v1",
+				OutputSchemaDigest: "output-v1",
+			}},
+		}}
+		actions := newActionRegistryForTest(t, registry)
+		expected := &loop.ToolSchemaSnapshot{
+			ToolID:             toolID.String(),
+			InputSchemaDigest:  "input-v1",
+			OutputSchemaDigest: "output-v1",
+		}
+
+		executor, err := actions.ResolvePinned(
+			t.Context(),
+			tools.Scope{WorkspaceID: "ws-1"},
+			toolID.String(),
+			expected,
+		)
+		if err != nil {
+			t.Fatalf("ResolvePinned() error = %v", err)
+		}
+		if _, ok := executor.(*loop.ToolCallActionExecutor); !ok {
+			t.Fatalf("ResolvePinned() executor = %T, want ToolCallActionExecutor", executor)
+		}
+	})
+
+	t.Run("Should reject an open action whose runtime schema drifted after Start", func(t *testing.T) {
+		t.Parallel()
+
+		toolID := tools.ToolID("compozy__task_read")
+		registry := &fakeActionToolRegistry{views: map[tools.ToolID]tools.ToolView{
+			toolID: {Descriptor: tools.Descriptor{
+				ID:                 toolID,
+				InputSchemaDigest:  "input-v2",
+				OutputSchemaDigest: "output-v1",
+			}},
+		}}
+		actions := newActionRegistryForTest(t, registry)
+		expected := &loop.ToolSchemaSnapshot{
+			ToolID:             toolID.String(),
+			InputSchemaDigest:  "input-v1",
+			OutputSchemaDigest: "output-v1",
+		}
+
+		_, err := actions.ResolvePinned(
+			t.Context(),
+			tools.Scope{WorkspaceID: "ws-1"},
+			toolID.String(),
+			expected,
+		)
+		if !errors.Is(err, loop.ErrActionInvalidOutput) {
+			t.Fatalf("ResolvePinned() error = %v, want ErrActionInvalidOutput", err)
+		}
+		reason, reasonMatched := errors.AsType[*loop.ReasonError](err)
+		if !reasonMatched || reason.Code != loop.ReasonCodeActionContractStale {
+			t.Fatalf("ResolvePinned() reason = %#v, want %q", reason, loop.ReasonCodeActionContractStale)
+		}
+		if reason.Meta["expected_input_schema_digest"] != "input-v1" ||
+			reason.Meta["current_input_schema_digest"] != "input-v2" {
+			t.Fatalf("ResolvePinned() metadata = %#v, want pinned/current digests", reason.Meta)
+		}
+	})
+
+	t.Run("Should reject misses deterministically", func(t *testing.T) {
+		t.Parallel()
+
+		actions := newActionRegistryForTest(t, &fakeActionToolRegistry{})
+
+		_, err := actions.Resolve(t.Context(), tools.Scope{}, "compozy__missing")
+		if !errors.Is(err, loop.ErrActionUnknownKind) {
+			t.Fatalf("Resolve() error = %v, want ErrActionUnknownKind", err)
+		}
+
+		reason, reasonMatched := errors.AsType[*loop.ReasonError](err)
+		if !reasonMatched {
+			t.Fatalf("Resolve() error = %T, want ReasonError", err)
+		}
+		if reason.Code != loop.ReasonCodeUnknownActionKind {
+			t.Fatalf("ReasonError.Code = %q, want %q", reason.Code, loop.ReasonCodeUnknownActionKind)
+		}
+	})
+}
+
+func TestToolCallActionExecutorShouldExecuteAndHarvestToolResults(t *testing.T) {
+	t.Parallel()
+
+	t.Run("Should propagate the selected worktree as the trusted workspace root", func(t *testing.T) {
+		t.Parallel()
+
+		toolID := tools.ToolID("ext__spec_cycle__import_tasks")
+		resolver := &fakeActionToolWorkspaceRootResolver{root: "/worktrees/feature-512"}
+		registry := &fakeActionToolRegistry{
+			views:      map[tools.ToolID]tools.ToolView{toolID: {}},
+			callResult: tools.ToolResult{Structured: json.RawMessage(`{"ok":true}`)},
+			onCall: func() {
+				if !resolver.leaseHeld.Load() {
+					t.Error("workspace usage lease was released before RuntimeRegistry.Call")
+				}
+			},
+		}
+		actions := newActionRegistryForTest(
+			t,
+			registry,
+			loop.WithActionToolWorkspaceRootResolver(resolver),
+		)
+		executor, err := actions.Resolve(t.Context(), tools.Scope{}, toolID.String())
+		if err != nil {
+			t.Fatalf("Resolve() error = %v", err)
+		}
+
+		_, err = executor.Execute(t.Context(), dsl.Node{
+			ID: "load_tasks", Class: dsl.NodeClassAction, Kind: toolID.String(),
+		}, loop.ActionExecutionInput{
+			WorkspaceID: "ws-1",
+			Environment: &dsl.EnvironmentSpec{
+				Mode:        dsl.EnvironmentWorktree,
+				WorktreeRef: "feature-512",
+			},
+			Actor: new(mustDaemonActor(t)),
+		})
+		if err != nil {
+			t.Fatalf("Execute() error = %v", err)
+		}
+		call := registry.mustSingleCall(t)
+		if got, want := call.TrustedWorkspaceRoot, "/worktrees/feature-512"; got != want {
+			t.Fatalf("TrustedWorkspaceRoot = %q, want %q", got, want)
+		}
+		request := resolver.mustSingleRequest(t)
+		if request.WorkspaceID != "ws-1" || request.Environment.WorktreeRef != "feature-512" {
+			t.Fatalf("workspace root request = %#v, want workspace and worktree propagated", request)
+		}
+		if resolver.leaseHeld.Load() || resolver.releaseCount.Load() != 1 {
+			t.Fatalf(
+				"workspace usage lease after Execute = held:%t releases:%d, want released once",
+				resolver.leaseHeld.Load(),
+				resolver.releaseCount.Load(),
+			)
+		}
+	})
+
+	t.Run("Should release the worktree usage lease when tool dispatch fails", func(t *testing.T) {
+		t.Parallel()
+
+		toolID := tools.ToolID("ext__spec_cycle__import_tasks")
+		callErr := errors.New("extension call failed")
+		resolver := &fakeActionToolWorkspaceRootResolver{root: "/worktrees/feature-512"}
+		registry := &fakeActionToolRegistry{
+			views:   map[tools.ToolID]tools.ToolView{toolID: {}},
+			callErr: callErr,
+		}
+		actions := newActionRegistryForTest(
+			t,
+			registry,
+			loop.WithActionToolWorkspaceRootResolver(resolver),
+		)
+		executor, err := actions.Resolve(t.Context(), tools.Scope{}, toolID.String())
+		if err != nil {
+			t.Fatalf("Resolve() error = %v", err)
+		}
+
+		_, err = executor.Execute(t.Context(), dsl.Node{
+			ID: "load_tasks", Class: dsl.NodeClassAction, Kind: toolID.String(),
+		}, loop.ActionExecutionInput{
+			WorkspaceID: "ws-1",
+			Environment: &dsl.EnvironmentSpec{
+				Mode:        dsl.EnvironmentWorktree,
+				WorktreeRef: "feature-512",
+			},
+			Actor: new(mustDaemonActor(t)),
+		})
+		if !errors.Is(err, callErr) {
+			t.Fatalf("Execute() error = %v, want %v", err, callErr)
+		}
+		if resolver.leaseHeld.Load() || resolver.releaseCount.Load() != 1 {
+			t.Fatalf(
+				"workspace usage lease after failure = held:%t releases:%d, want released once",
+				resolver.leaseHeld.Load(),
+				resolver.releaseCount.Load(),
+			)
+		}
+	})
+
+	t.Run("Should stop before tool dispatch when worktree resolution fails", func(t *testing.T) {
+		t.Parallel()
+
+		toolID := tools.ToolID("ext__spec_cycle__import_tasks")
+		resolveErr := errors.New("worktree is not ready")
+		registry := &fakeActionToolRegistry{views: map[tools.ToolID]tools.ToolView{toolID: {}}}
+		actions := newActionRegistryForTest(
+			t,
+			registry,
+			loop.WithActionToolWorkspaceRootResolver(&fakeActionToolWorkspaceRootResolver{err: resolveErr}),
+		)
+		executor, err := actions.Resolve(t.Context(), tools.Scope{}, toolID.String())
+		if err != nil {
+			t.Fatalf("Resolve() error = %v", err)
+		}
+
+		_, err = executor.Execute(t.Context(), dsl.Node{
+			ID: "load_tasks", Class: dsl.NodeClassAction, Kind: toolID.String(),
+		}, loop.ActionExecutionInput{
+			WorkspaceID: "ws-1",
+			Environment: &dsl.EnvironmentSpec{Mode: dsl.EnvironmentWorktree, WorktreeRef: "pending"},
+			Actor:       new(mustDaemonActor(t)),
+		})
+		if !errors.Is(err, resolveErr) {
+			t.Fatalf("Execute() error = %v, want resolver error", err)
+		}
+		if got := registry.callCount(); got != 0 {
+			t.Fatalf("RuntimeRegistry.Call calls = %d, want 0", got)
+		}
+	})
+
+	t.Run("Should fail closed when a worktree action has no root resolver", func(t *testing.T) {
+		t.Parallel()
+
+		toolID := tools.ToolID("ext__spec_cycle__import_tasks")
+		registry := &fakeActionToolRegistry{views: map[tools.ToolID]tools.ToolView{toolID: {}}}
+		actions := newActionRegistryForTest(t, registry)
+		executor, err := actions.Resolve(t.Context(), tools.Scope{}, toolID.String())
+		if err != nil {
+			t.Fatalf("Resolve() error = %v", err)
+		}
+
+		_, err = executor.Execute(t.Context(), dsl.Node{
+			ID: "load_tasks", Class: dsl.NodeClassAction, Kind: toolID.String(),
+		}, loop.ActionExecutionInput{
+			WorkspaceID: "ws-1",
+			Environment: &dsl.EnvironmentSpec{Mode: dsl.EnvironmentWorktree, WorktreeRef: "feature-512"},
+			Actor:       new(mustDaemonActor(t)),
+		})
+		if !errors.Is(err, loop.ErrActionDependencyMissing) {
+			t.Fatalf("Execute() error = %v, want ErrActionDependencyMissing", err)
+		}
+		if got := registry.callCount(); got != 0 {
+			t.Fatalf("RuntimeRegistry.Call calls = %d, want 0", got)
+		}
+	})
+
+	t.Run("Should execute RuntimeRegistry call and sync harvest structured output", func(t *testing.T) {
+		t.Parallel()
+
+		toolID := tools.ToolID("compozy__task_read")
+		registry := &fakeActionToolRegistry{
+			views: map[tools.ToolID]tools.ToolView{toolID: {}},
+			callResult: tools.ToolResult{
+				Structured: json.RawMessage(`{"ok":true}`),
+			},
+		}
+		actions := newActionRegistryForTest(t, registry)
+		executor, err := actions.Resolve(t.Context(), tools.Scope{}, toolID.String())
+		if err != nil {
+			t.Fatalf("Resolve() error = %v", err)
+		}
+
+		node := dsl.Node{
+			ID:    "read",
+			Class: dsl.NodeClassAction,
+			Kind:  toolID.String(),
+			Params: dsl.NodeParams{
+				"id": "{{ .inputs.task_id }}",
+			},
+		}
+		raw, err := executor.Execute(t.Context(), node, loop.ActionExecutionInput{
+			WorkspaceID: "ws-1",
+			Namespace: map[string]any{
+				"inputs": map[string]any{"task_id": "task-1"},
+			},
+			ToolScope: tools.Scope{SessionID: "sess-1", AgentName: "agent-a"},
+			Actor:     new(mustDaemonActor(t)),
+		})
+		if err != nil {
+			t.Fatalf("Execute() error = %v", err)
+		}
+		call := registry.mustSingleCall(t)
+		if call.WorkspaceID != "ws-1" || call.SessionID != "sess-1" || call.AgentName != "agent-a" {
+			t.Fatalf("CallRequest scope = %#v, want workspace/session/agent propagated", call)
+		}
+		var input map[string]any
+		if err := json.Unmarshal(call.Input, &input); err != nil {
+			t.Fatalf("unmarshal call input error = %v", err)
+		}
+		if input["id"] != "task-1" {
+			t.Fatalf("call input id = %#v, want task-1", input["id"])
+		}
+
+		output, err := executor.Harvest(t.Context(), raw, node)
+		if err != nil {
+			t.Fatalf("Harvest() error = %v", err)
+		}
+		got, ok := output.Value.(map[string]any)
+		if !ok || got["ok"] != true {
+			t.Fatalf("Harvest().Value = %#v, want ok=true", output.Value)
+		}
+	})
+
+	t.Run("Should execute exactly the admitted review params without rendering them again", func(t *testing.T) {
+		t.Parallel()
+
+		toolID := tools.ToolID("compozy__task_read")
+		registry := &fakeActionToolRegistry{
+			views:      map[tools.ToolID]tools.ToolView{toolID: {}},
+			callResult: tools.ToolResult{Structured: json.RawMessage(`{"ok":true}`)},
+		}
+		actions := newActionRegistryForTest(t, registry)
+		executor, err := actions.Resolve(t.Context(), tools.Scope{}, toolID.String())
+		if err != nil {
+			t.Fatalf("Resolve() error = %v", err)
+		}
+		node := dsl.Node{
+			ID: "read", Class: dsl.NodeClassAction, Kind: toolID.String(),
+			Params: dsl.NodeParams{"id": "{{ .inputs.task_id }}"},
+		}
+		_, err = executor.Execute(t.Context(), node, loop.ActionExecutionInput{
+			WorkspaceID: "ws-1",
+			Namespace:   map[string]any{"inputs": map[string]any{"task_id": "task-1"}},
+			AdmittedParams: dsl.NodeParams{
+				"id": "{{ .inputs.must_not_render }}",
+			},
+			Actor: new(mustDaemonActor(t)),
+		})
+		if err != nil {
+			t.Fatalf("Execute() error = %v", err)
+		}
+		var input map[string]any
+		if err := json.Unmarshal(registry.mustSingleCall(t).Input, &input); err != nil {
+			t.Fatalf("unmarshal call input error = %v", err)
+		}
+		if input["id"] != "{{ .inputs.must_not_render }}" {
+			t.Fatalf("reviewed call input = %#v, want admitted literal", input)
+		}
+	})
+
+	t.Run("Should reject a truncated tool result with node-aware budget guidance", func(t *testing.T) {
+		t.Parallel()
+
+		const maxResultBytes int64 = 262144
+		toolID := tools.ToolID("compozy__task_list")
+		registry := &fakeActionToolRegistry{
+			views: map[tools.ToolID]tools.ToolView{toolID: {
+				Descriptor: tools.Descriptor{
+					ID:                    toolID,
+					ToolExecutionMetadata: tools.NewToolExecutionMetadata(false, "", maxResultBytes),
+				},
+			}},
+			callResult: tools.ToolResult{
+				Truncated: true,
+				Bytes:     512,
+				Metadata: map[string]json.RawMessage{
+					"truncated_from_bytes": json.RawMessage(`310124`),
+				},
+			},
+		}
+		actions := newActionRegistryForTest(
+			t,
+			registry,
+			loop.WithActionDefaultMaxResultBytes(maxResultBytes),
+		)
+		executor, err := actions.Resolve(t.Context(), tools.Scope{}, toolID.String())
+		if err != nil {
+			t.Fatalf("Resolve() error = %v", err)
+		}
+
+		_, err = executor.Execute(t.Context(), dsl.Node{
+			ID: "load_tasks", Class: dsl.NodeClassAction, Kind: toolID.String(),
+		}, loop.ActionExecutionInput{WorkspaceID: "ws-1", Actor: new(mustDaemonActor(t))})
+		if !errors.Is(err, loop.ErrActionResultTooLarge) {
+			t.Fatalf("Execute() error = %v, want ErrActionResultTooLarge", err)
+		}
+		provider, ok := errors.AsType[loop.SafeActionFailureProvider](err)
+		if !ok {
+			t.Fatalf("Execute() error = %T, want SafeActionFailureProvider", err)
+		}
+		failure := provider.SafeActionFailure()
+		if failure.Code != string(loop.ReasonCodeActionResultTooLarge) || failure.Target != "load_tasks" {
+			t.Fatalf("failure = %#v, want action_result_too_large for load_tasks", failure)
+		}
+		if !strings.Contains(failure.Cause, toolID.String()) ||
+			!strings.Contains(failure.Cause, "310124 bytes") ||
+			!strings.Contains(failure.Cause, "262144-byte result limit") ||
+			!strings.Contains(failure.Recovery, "tools.default_max_result_bytes") {
+			t.Fatalf("failure = %#v, want bounded source, bytes, limit, and remediation", failure)
+		}
+		if got := len(registry.calls); got != 1 {
+			t.Fatalf("RuntimeRegistry.Call count = %d, want 1", got)
+		}
+	})
+
+	t.Run("Should async harvest through stable event range", func(t *testing.T) {
+		t.Parallel()
+
+		toolID := tools.ToolID("compozy__agent_prompt")
+		reader := &fakeActionEventReader{
+			result: loop.ActionEventRangeResult{
+				Structured: json.RawMessage(`{"events":2}`),
+			},
+		}
+		registry := &fakeActionToolRegistry{
+			views: map[tools.ToolID]tools.ToolView{toolID: {}},
+			callResult: tools.ToolResult{Metadata: map[string]json.RawMessage{
+				"session_id":      json.RawMessage(`"sess-async"`),
+				"event_start_seq": json.RawMessage(`3`),
+				"event_end_seq":   json.RawMessage(`7`),
+			}},
+		}
+		actions := newActionRegistryForTest(t, registry, loop.WithActionEventRangeReader(reader))
+		executor, err := actions.Resolve(t.Context(), tools.Scope{}, toolID.String())
+		if err != nil {
+			t.Fatalf("Resolve() error = %v", err)
+		}
+		node := dsl.Node{
+			ID:      "prompt",
+			Class:   dsl.NodeClassAction,
+			Kind:    toolID.String(),
+			Harvest: &dsl.HarvestSpec{Kind: "event_range"},
+		}
+
+		raw, err := executor.Execute(t.Context(), node, loop.ActionExecutionInput{})
+		if err != nil {
+			t.Fatalf("Execute() error = %v", err)
+		}
+		output, err := executor.Harvest(t.Context(), raw, node)
+		if err != nil {
+			t.Fatalf("Harvest() error = %v", err)
+		}
+		if reader.last.SessionID != "sess-async" || reader.last.EventStartSeq != 3 || reader.last.EventEndSeq != 7 {
+			t.Fatalf("event range request = %#v, want sess-async 3..7", reader.last)
+		}
+		if !strings.Contains(string(output.Structured), `"events":2`) {
+			t.Fatalf("Harvest().Structured = %s, want event count", output.Structured)
+		}
+	})
+}
+
+func TestReservedActionExecutorsShouldRunAgentLoopAndTransform(t *testing.T) {
+	t.Parallel()
+
+	t.Run("Should not render an admitted Goal snapshot again", func(t *testing.T) {
+		t.Parallel()
+
+		outputSchema := dsl.Schema{"status": "string"}
+		admitted := dsl.NodeParams{
+			"agent": "codex", "objective": "Ship the release", "max_turns": 2,
+			"output_schema": outputSchema,
+			"judge": []any{map[string]any{
+				"id": "quality", "type": "agent-judge", "agent": "reviewer",
+				"prompt": "{{ .inputs.must_not_render }}", "rubric": "Check quality",
+			}},
+		}
+		params, err := loop.MaterializeGoalParams(dsl.Node{
+			ID: "goal", Class: dsl.NodeClassAction, Kind: string(dsl.ActionGoal),
+		}, map[string]any{}, admitted)
+		if err != nil {
+			t.Fatalf("MaterializeGoalParams(admitted) error = %v", err)
+		}
+		if len(params.Judge) != 1 || params.Judge[0].Prompt != "{{ .inputs.must_not_render }}" {
+			t.Fatalf("admitted Goal judge = %#v, want unchanged snapshot", params.Judge)
+		}
+	})
+
+	t.Run("Should resolve node environment before Loop default and workspace root", func(t *testing.T) {
+		t.Parallel()
+
+		loopDefault := dsl.EnvironmentSpec{
+			Mode:        dsl.EnvironmentWorktree,
+			WorktreeRef: "loop-feature",
+		}
+		resolved, err := loop.ResolveActionEnvironment(
+			dsl.EnvironmentSpec{Mode: dsl.EnvironmentRoot},
+			loopDefault,
+		)
+		if err != nil {
+			t.Fatalf("ResolveActionEnvironment(node root) error = %v", err)
+		}
+		if resolved != (dsl.EnvironmentSpec{Mode: dsl.EnvironmentRoot}) {
+			t.Fatalf("node environment = %#v, want root override", resolved)
+		}
+
+		resolved, err = loop.ResolveActionEnvironment(dsl.EnvironmentSpec{}, loopDefault)
+		if err != nil {
+			t.Fatalf("ResolveActionEnvironment(Loop default) error = %v", err)
+		}
+		if resolved != loopDefault {
+			t.Fatalf("Loop default environment = %#v, want %#v", resolved, loopDefault)
+		}
+
+		resolved, err = loop.ResolveActionEnvironment(dsl.EnvironmentSpec{}, dsl.EnvironmentSpec{})
+		if err != nil {
+			t.Fatalf("ResolveActionEnvironment(workspace root) error = %v", err)
+		}
+		if resolved != (dsl.EnvironmentSpec{Mode: dsl.EnvironmentRoot}) {
+			t.Fatalf("implicit environment = %#v, want workspace root", resolved)
+		}
+
+		_, err = loop.ResolveActionEnvironment(
+			dsl.EnvironmentSpec{Directory: "packages/delivery"},
+			loopDefault,
+		)
+		if !errors.Is(err, loop.ErrValidation) {
+			t.Fatalf("ResolveActionEnvironment(node directory without mode) error = %v, want ErrValidation", err)
+		}
+	})
+
+	t.Run("Should reject unsupported harvest kinds before sync output", func(t *testing.T) {
+		t.Parallel()
+
+		actions := newActionRegistryForTest(t, &fakeActionToolRegistry{})
+		for _, kind := range []string{
+			string(dsl.ActionRunAgent),
+			string(dsl.ActionRunLoop),
+			string(dsl.ActionTransform),
+		} {
+			executor, err := actions.Resolve(t.Context(), tools.Scope{}, kind)
+			if err != nil {
+				t.Fatalf("Resolve(%q) error = %v", kind, err)
+			}
+			node := dsl.Node{
+				ID:      dsl.NodeID(strings.ReplaceAll(kind, "-", "_")),
+				Class:   dsl.NodeClassAction,
+				Kind:    kind,
+				Harvest: &dsl.HarvestSpec{Kind: "unsupported"},
+			}
+			_, err = executor.Harvest(t.Context(), loop.ActionRawResult{}, node)
+			if !errors.Is(err, loop.ErrValidation) {
+				t.Fatalf("Harvest(%q) error = %v, want ErrValidation", kind, err)
+			}
+		}
+	})
+
+	t.Run("Should bind shared run agent session render contract and retry invalid schema once", func(t *testing.T) {
+		t.Parallel()
+
+		binder := &fakeActionSessionBinder{
+			binding: loop.ActionSessionBinding{
+				SessionID:      "sess-shared",
+				Handle:         "main",
+				AppliedRuntime: loop.RuntimeSpec{Model: "gpt-5.4"},
+			},
+			promptResults: []loop.ActionPromptResult{
+				{Text: "not json", EventStartSeq: 1, EventEndSeq: 2, TokensUsed: 11},
+				{Text: "```json\n{\"summary\":\"done\"}\n```", EventStartSeq: 3, EventEndSeq: 4, TokensUsed: 13},
+			},
+		}
+		actions := newActionRegistryForTest(t, &fakeActionToolRegistry{}, loop.WithActionSessionBinder(binder))
+		executor, err := actions.Resolve(t.Context(), tools.Scope{}, string(dsl.ActionRunAgent))
+		if err != nil {
+			t.Fatalf("Resolve(run-agent) error = %v", err)
+		}
+		reportedTokens := []int64{}
+		ctx := loop.ContextWithActionUsageReporter(
+			t.Context(),
+			loop.ActionUsageReporterFunc(func(tokensUsed int64) {
+				reportedTokens = append(reportedTokens, tokensUsed)
+			}),
+		)
+		node := dsl.Node{
+			ID:    "agent",
+			Class: dsl.NodeClassAction,
+			Kind:  string(dsl.ActionRunAgent),
+			Params: dsl.NodeParams{
+				"agent":         "planner",
+				"prompt":        "Summarize {{ .inputs.topic }}",
+				"environment":   map[string]any{"mode": "directory", "directory": "packages/{{ .inputs.topic }}"},
+				"runtime":       map[string]any{"model": "gpt-5.4"},
+				"allowed_tools": []string{"compozy__task_read"},
+				"max_turns":     3,
+				"output_schema": map[string]any{"summary": "string"},
+			},
+		}
+		raw, err := executor.Execute(ctx, node, loop.ActionExecutionInput{
+			WorkspaceID:               "ws-1",
+			LoopRunID:                 "looprun-managed",
+			Generation:                1,
+			NodeID:                    "agent",
+			ItemIndex:                 2,
+			CellEpoch:                 4,
+			SessionSharedKey:          "action:persisted-cell",
+			CorrelationID:             "taskrun-managed-5",
+			OriginSessionID:           "sess-origin",
+			ProvenanceParentSessionID: "sess-provenance-parent",
+			Namespace: map[string]any{
+				"inputs": map[string]any{"topic": "delivery"},
+			},
+			Contract: &dsl.Contract{
+				Goal:             "Ship the loop",
+				DefinitionOfDone: "The action registry works",
+				Constraints:      []string{"Do not create a second registry"},
+				Boundaries:       []string{"Keep source and control closed"},
+				StopWhen:         dsl.StopWhenSpec{Expr: "generation > 2"},
+			},
+			RuntimeSelection: &loop.ActionRuntimeSelection{Catalog: actionTestRuntimeCatalog{}},
+			Environment:      &dsl.EnvironmentSpec{Mode: dsl.EnvironmentRoot},
+		})
+		if err != nil {
+			t.Fatalf("Execute() error = %v", err)
+		}
+		output, err := executor.Harvest(t.Context(), raw, node)
+		if err != nil {
+			t.Fatalf("Harvest() error = %v", err)
+		}
+		if raw.TokensUsed != 24 || output.TokensUsed != 24 {
+			t.Fatalf("tokens_used raw/output = %d/%d, want 24", raw.TokensUsed, output.TokensUsed)
+		}
+		if !slices.Equal(reportedTokens, []int64{11, 24}) {
+			t.Fatalf("reported tokens = %#v, want [11 24]", reportedTokens)
+		}
+		got, ok := output.Value.(map[string]any)
+		if !ok || got["summary"] != "done" {
+			t.Fatalf("run-agent output = %#v, want summary done", output.Value)
+		}
+		bind := binder.mustSingleBind(t)
+		if bind.Agent != "planner" || bind.Handle != "main" || bind.Isolated {
+			t.Fatalf("bind request = %#v, want shared main planner", bind)
+		}
+		if bind.SharedKey != "action:persisted-cell" {
+			t.Fatalf("bind shared key = %q, want persisted cell identity", bind.SharedKey)
+		}
+		if bind.ItemIndex != 2 {
+			t.Fatalf("bind item index = %d, want 2", bind.ItemIndex)
+		}
+		if bind.TargetBindingEpoch != 5 || bind.ExpectedControlEpoch != 0 || bind.CellFence == nil ||
+			bind.CellFence.Epoch != 4 || bind.CellFence.TaskRunID != "taskrun-managed-5" {
+			t.Fatalf("managed bind fence = %#v, want binding epoch 5 + exact cell owner", bind)
+		}
+		if bind.OriginSessionID != "" || bind.ProvenanceParentSessionID != "sess-provenance-parent" {
+			t.Fatalf("managed bind provenance = %#v, want a new child of the nearest parent", bind)
+		}
+		if bind.Runtime.Model != "gpt-5.4" || bind.MaxTurns != 3 || len(bind.AllowedTools) != 1 {
+			t.Fatalf("bind overrides = %#v, want model/tool/max_turns", bind)
+		}
+		if bind.EnvironmentValue().Mode != dsl.EnvironmentDirectory ||
+			bind.EnvironmentValue().Directory != "packages/delivery" {
+			t.Fatalf("bind environment = %#v, want rendered node directory", bind.Environment)
+		}
+		if raw.ResolvedRuntime.Runtime.Model != "gpt-5.4" ||
+			raw.ResolvedRuntime.Source.Model != loop.RuntimeSourceNode {
+			t.Fatalf("resolved runtime = %#v, want applied node model", raw.ResolvedRuntime)
+		}
+		for _, fragment := range []string{
+			"Goal:\nShip the loop",
+			"Definition of done:\nThe action registry works",
+			"- Do not create a second registry",
+			"- Keep source and control closed",
+			"Stop when:\ngeneration > 2",
+		} {
+			if !strings.Contains(bind.ContractBlock, fragment) {
+				t.Fatalf("contract block missing %q in:\n%s", fragment, bind.ContractBlock)
+			}
+		}
+		prompts := binder.promptMessages()
+		if len(prompts) != 2 {
+			t.Fatalf("prompt calls = %d, want schema retry", len(prompts))
+		}
+		if !strings.HasPrefix(prompts[0], "Summarize delivery") {
+			t.Fatalf("first prompt = %q, want rendered prompt first", prompts[0])
+		}
+		if !strings.Contains(prompts[0], "Output contract:") ||
+			!strings.Contains(prompts[0], `"required":["summary"]`) {
+			t.Fatalf("first prompt = %q, want authored output schema in the contract", prompts[0])
+		}
+		if !strings.Contains(prompts[1], "did not satisfy output_schema") {
+			t.Fatalf("retry prompt = %q, want schema validation feedback", prompts[1])
+		}
+	})
+
+	t.Run("Should bind a direct typed runtime input with input provenance", func(t *testing.T) {
+		t.Parallel()
+
+		inputRuntime := loop.RuntimeSpec{
+			Provider: "cursor", Model: "grok-4.6", Reasoning: "high", Speed: speedpkg.SpeedFast,
+		}
+		binder := &fakeActionSessionBinder{
+			binding: loop.ActionSessionBinding{
+				SessionID: "sess-input-runtime", Handle: "main", AppliedRuntime: inputRuntime,
+				SpeedResolution: &speedpkg.Resolution{
+					Requested: speedpkg.SpeedFast, Status: speedpkg.ResolutionUnsupported,
+					Reason: speedpkg.ReasonCapabilityAbsent,
+				},
+			},
+			promptResults: []loop.ActionPromptResult{{Text: "done"}},
+		}
+		actions := newActionRegistryForTest(t, &fakeActionToolRegistry{}, loop.WithActionSessionBinder(binder))
+		executor, err := actions.Resolve(t.Context(), tools.Scope{}, string(dsl.ActionRunAgent))
+		if err != nil {
+			t.Fatalf("Resolve(run-agent) error = %v", err)
+		}
+		node := dsl.Node{
+			ID: "agent", Class: dsl.NodeClassAction, Kind: string(dsl.ActionRunAgent),
+			Params: dsl.NodeParams{
+				"agent": "planner", "prompt": "Work",
+				"runtime": "{{ .inputs.worker_runtime }}",
+			},
+		}
+		raw, err := executor.Execute(t.Context(), node, loop.ActionExecutionInput{
+			WorkspaceID: "ws-1",
+			Namespace: map[string]any{"inputs": map[string]any{
+				"worker_runtime": map[string]any{
+					"provider":  inputRuntime.Provider,
+					"model":     inputRuntime.Model,
+					"reasoning": inputRuntime.Reasoning,
+					"speed":     string(inputRuntime.Speed),
+				},
+			}},
+			RuntimeSelection: &loop.ActionRuntimeSelection{
+				Defaults: loop.RuntimeDefaults{Worker: loop.RuntimeSpec{Model: "default-model"}},
+				Catalog:  actionTestRuntimeCatalog{},
+			},
+		})
+		if err != nil {
+			t.Fatalf("Execute() error = %v", err)
+		}
+		if got := binder.mustSingleBind(t).Runtime; got.Provider != inputRuntime.Provider ||
+			got.Model != inputRuntime.Model || got.Reasoning != inputRuntime.Reasoning ||
+			got.Speed != inputRuntime.Speed {
+			t.Fatalf("bound runtime = %#v, want %#v", got, inputRuntime)
+		}
+		if raw.ResolvedRuntime.Source.Provider != loop.RuntimeSourceInput ||
+			raw.ResolvedRuntime.Source.Model != loop.RuntimeSourceInput ||
+			raw.ResolvedRuntime.Source.Reasoning != loop.RuntimeSourceInput ||
+			raw.ResolvedRuntime.Source.Speed != loop.RuntimeSourceInput {
+			t.Fatalf("resolved runtime = %#v, want input provenance", raw.ResolvedRuntime)
+		}
+		if raw.ResolvedRuntime.SpeedResolution == nil ||
+			raw.ResolvedRuntime.SpeedResolution.Status != speedpkg.ResolutionUnsupported {
+			t.Fatalf("resolved runtime = %#v, want unsupported speed outcome", raw.ResolvedRuntime)
+		}
+	})
+
+	t.Run("Should reject an unresolved environment directory before session binding", func(t *testing.T) {
+		t.Parallel()
+
+		binder := &fakeActionSessionBinder{}
+		actions := newActionRegistryForTest(
+			t,
+			&fakeActionToolRegistry{},
+			loop.WithActionSessionBinder(binder),
+		)
+		executor, err := actions.Resolve(t.Context(), tools.Scope{}, string(dsl.ActionRunAgent))
+		if err != nil {
+			t.Fatalf("Resolve(run-agent) error = %v", err)
+		}
+		node := dsl.Node{
+			ID: "agent", Class: dsl.NodeClassAction, Kind: string(dsl.ActionRunAgent),
+			Params: dsl.NodeParams{
+				"agent":  "planner",
+				"prompt": "Plan the work",
+				"environment": map[string]any{
+					"mode": "directory", "directory": "packages/{{ .inputs.missing }}",
+				},
+			},
+		}
+		_, err = executor.Execute(t.Context(), node, loop.ActionExecutionInput{
+			Namespace: map[string]any{"inputs": map[string]any{"topic": "delivery"}},
+		})
+		if err == nil || !strings.Contains(err.Error(), ".inputs.missing") {
+			t.Fatalf("Execute() error = %v, want unresolved .inputs.missing expression", err)
+		}
+		if got := binder.bindCount(); got != 0 {
+			t.Fatalf("BindActionSession() calls = %d, want none", got)
+		}
+	})
+
+	t.Run("Should pass the prior classified failure to an authored agent retry", func(t *testing.T) {
+		t.Parallel()
+
+		binder := &fakeActionSessionBinder{
+			binding:       loop.ActionSessionBinding{SessionID: "sess-retry-feedback", Handle: "main"},
+			promptResults: []loop.ActionPromptResult{{Text: "done"}},
+		}
+		actions := newActionRegistryForTest(t, &fakeActionToolRegistry{}, loop.WithActionSessionBinder(binder))
+		executor, err := actions.Resolve(t.Context(), tools.Scope{}, string(dsl.ActionRunAgent))
+		if err != nil {
+			t.Fatalf("Resolve(run-agent) error = %v", err)
+		}
+		failure := loop.ClassifiedFailure{
+			Class: loop.FailureAttemptTimeout, Code: string(loop.ReasonCodeActionTimeout),
+			Cause:         "The action exceeded its configured attempt timeout.",
+			Hint:          "Review the action timeout and target health before retrying.",
+			RetryEligible: true,
+		}
+		_, err = executor.Execute(t.Context(), dsl.Node{
+			ID: "agent", Class: dsl.NodeClassAction, Kind: string(dsl.ActionRunAgent),
+			Params: dsl.NodeParams{"agent": "planner", "prompt": "Resume the work"},
+		}, loop.ActionExecutionInput{
+			WorkspaceID: "ws-1", Attempt: 2, RetryFailure: &failure,
+		})
+		if err != nil {
+			t.Fatalf("Execute() error = %v", err)
+		}
+		prompts := binder.promptMessages()
+		if len(prompts) != 1 || !strings.Contains(prompts[0], "Automatic retry context:") ||
+			!strings.Contains(prompts[0], `"attempt":2`) ||
+			!strings.Contains(prompts[0], `"code":"action_timeout"`) ||
+			!strings.Contains(prompts[0], "Review the action timeout") {
+			t.Fatalf("retry prompt = %#v, want prior classified cause and hint", prompts)
+		}
+	})
+
+	t.Run("Should carry confirmed-death progress without labeling the continuation as a retry", func(t *testing.T) {
+		t.Parallel()
+
+		binder := &fakeActionSessionBinder{
+			binding:       loop.ActionSessionBinding{SessionID: "sess-death-successor", Handle: "main"},
+			promptResults: []loop.ActionPromptResult{{Text: "done"}},
+		}
+		actions := newActionRegistryForTest(t, &fakeActionToolRegistry{}, loop.WithActionSessionBinder(binder))
+		executor, err := actions.Resolve(t.Context(), tools.Scope{}, string(dsl.ActionRunAgent))
+		if err != nil {
+			t.Fatalf("Resolve(run-agent) error = %v", err)
+		}
+		_, err = executor.Execute(t.Context(), dsl.Node{
+			ID: "agent", Class: dsl.NodeClassAction, Kind: string(dsl.ActionRunAgent),
+			Params: dsl.NodeParams{"agent": "planner", "prompt": "Continue the delivery"},
+		}, loop.ActionExecutionInput{
+			WorkspaceID: "ws-1", Attempt: 2,
+			DeathResume: &loop.DeathResumeContext{
+				SourceTaskRunID: "taskrun-dead",
+				SourceSessionID: "sess-dead",
+				Checkpoint: &loop.DeathResumeCheckpoint{
+					SessionID: "sess-dead", EventStartSeq: 41, EventEndSeq: 44,
+					Partials: []loop.DeathResumePartial{{
+						Sequence: 44, Type: "agent_message", Text: "completed database migration",
+					}},
+				},
+			},
+		})
+		if err != nil {
+			t.Fatalf("Execute() error = %v", err)
+		}
+		prompts := binder.promptMessages()
+		if len(prompts) != 1 || !strings.Contains(prompts[0], "Confirmed-death continuation context:") ||
+			!strings.Contains(prompts[0], `"event_end_seq":44`) ||
+			!strings.Contains(prompts[0], "completed database migration") ||
+			strings.Contains(prompts[0], "Automatic retry context:") {
+			t.Fatalf("death-resume prompt = %#v, want checkpointed continuation distinct from retry", prompts)
+		}
+	})
+
+	t.Run("Should pass only escalated classified failures to a repair generation", func(t *testing.T) {
+		t.Parallel()
+
+		binder := &fakeActionSessionBinder{
+			binding:       loop.ActionSessionBinding{SessionID: "sess-repair-feedback", Handle: "main"},
+			promptResults: []loop.ActionPromptResult{{Text: "done"}},
+		}
+		actions := newActionRegistryForTest(t, &fakeActionToolRegistry{}, loop.WithActionSessionBinder(binder))
+		executor, err := actions.Resolve(t.Context(), tools.Scope{}, string(dsl.ActionRunAgent))
+		if err != nil {
+			t.Fatalf("Resolve(run-agent) error = %v", err)
+		}
+		_, err = executor.Execute(t.Context(), dsl.Node{
+			ID: "agent", Class: dsl.NodeClassAction, Kind: string(dsl.ActionRunAgent),
+			Params: dsl.NodeParams{"agent": "planner", "prompt": "Repair the generation"},
+		}, loop.ActionExecutionInput{
+			WorkspaceID: "ws-1",
+			Generation:  2,
+			RepairFailures: []loop.ActionRepairFailure{
+				{
+					NodeID: "primary", Disposition: loop.AttemptEscalated,
+					Failure: loop.ClassifiedFailure{
+						Class: loop.FailurePayloadDeclared, Code: "payload_declared",
+						Cause: "semantic escalation", Hint: "repair the payload",
+					},
+				},
+				{
+					NodeID: "absorbed", Disposition: loop.AttemptAbsorbed,
+					Failure: loop.ClassifiedFailure{
+						Class: loop.FailureTransport, Code: "absorbed_transport",
+						Cause: "unique absorbed failure must stay out of repair context",
+					},
+				},
+			},
+		})
+		if err != nil {
+			t.Fatalf("Execute() error = %v", err)
+		}
+		prompts := binder.promptMessages()
+		if len(prompts) != 1 || !strings.Contains(prompts[0], "Automatic generation repair context:") ||
+			!strings.Contains(prompts[0], `"generation":2`) ||
+			!strings.Contains(prompts[0], `"disposition":"escalated"`) ||
+			!strings.Contains(prompts[0], "semantic escalation") ||
+			!strings.Contains(prompts[0], "repair the payload") ||
+			strings.Contains(prompts[0], "unique absorbed failure") {
+			t.Fatalf("repair prompt = %#v, want classified escalated context", prompts)
+		}
+	})
+
+	t.Run("Should mark runtime fields completed by the agent definition", func(t *testing.T) {
+		t.Parallel()
+
+		binder := &fakeActionSessionBinder{
+			binding: loop.ActionSessionBinding{
+				SessionID: "sess-agent-runtime", Handle: "main",
+				AppliedRuntime: loop.RuntimeSpec{Provider: "mock", Model: "agent-model"},
+			},
+			promptResults: []loop.ActionPromptResult{{Text: "done"}},
+		}
+		actions := newActionRegistryForTest(t, &fakeActionToolRegistry{}, loop.WithActionSessionBinder(binder))
+		executor, err := actions.Resolve(t.Context(), tools.Scope{}, string(dsl.ActionRunAgent))
+		if err != nil {
+			t.Fatalf("Resolve(run-agent) error = %v", err)
+		}
+		raw, err := executor.Execute(t.Context(), dsl.Node{
+			ID: "agent", Class: dsl.NodeClassAction, Kind: string(dsl.ActionRunAgent),
+			Params: dsl.NodeParams{"agent": "planner", "prompt": "Work"},
+		}, loop.ActionExecutionInput{WorkspaceID: "ws-1"})
+		if err != nil {
+			t.Fatalf("Execute() error = %v", err)
+		}
+		if raw.ResolvedRuntime.Runtime.Provider != "mock" || raw.ResolvedRuntime.Runtime.Model != "agent-model" ||
+			raw.ResolvedRuntime.Source.Provider != loop.RuntimeSourceAgent ||
+			raw.ResolvedRuntime.Source.Model != loop.RuntimeSourceAgent {
+			t.Fatalf("ResolvedRuntime = %#v, want agent-completed provider/model", raw.ResolvedRuntime)
+		}
+	})
+
+	t.Run("Should bind isolated run agent session and cancel in flight turn on timeout", func(t *testing.T) {
+		t.Parallel()
+
+		binder := &fakeActionSessionBinder{
+			binding:     loop.ActionSessionBinding{SessionID: "sess-isolated", Handle: "branch", Isolated: true},
+			blockPrompt: true,
+		}
+		actions := newActionRegistryForTest(t, &fakeActionToolRegistry{}, loop.WithActionSessionBinder(binder))
+		executor, err := actions.Resolve(t.Context(), tools.Scope{}, string(dsl.ActionRunAgent))
+		if err != nil {
+			t.Fatalf("Resolve(run-agent) error = %v", err)
+		}
+		node := dsl.Node{
+			ID:      "agent",
+			Class:   dsl.NodeClassAction,
+			Kind:    string(dsl.ActionRunAgent),
+			Session: &dsl.SessionSpec{Handle: "branch", Isolated: true},
+			Timeout: "1ms",
+			Params: dsl.NodeParams{
+				"agent":  "planner",
+				"prompt": "wait",
+			},
+		}
+
+		_, err = executor.Execute(t.Context(), node, loop.ActionExecutionInput{WorkspaceID: "ws-1"})
+		if !errors.Is(err, loop.ErrActionTimeout) {
+			t.Fatalf("Execute() error = %v, want ErrActionTimeout", err)
+		}
+		bind := binder.mustSingleBind(t)
+		if bind.Handle != "branch" || !bind.Isolated {
+			t.Fatalf("bind request = %#v, want isolated branch", bind)
+		}
+		if binder.cancelCount() != 1 {
+			t.Fatalf("CancelActionSession calls = %d, want 1", binder.cancelCount())
+		}
+		if !binder.cancelHadDeadline() {
+			t.Fatal("CancelActionSession context has no deadline")
+		}
+	})
+
+	t.Run("Should use effective worker model when run agent params omit model", func(t *testing.T) {
+		t.Parallel()
+
+		binder := &fakeActionSessionBinder{
+			binding:       loop.ActionSessionBinding{SessionID: "sess-default-model", Handle: "main"},
+			promptResults: []loop.ActionPromptResult{{Text: "done"}},
+		}
+		actions := newActionRegistryForTest(t, &fakeActionToolRegistry{}, loop.WithActionSessionBinder(binder))
+		executor, err := actions.Resolve(t.Context(), tools.Scope{}, string(dsl.ActionRunAgent))
+		if err != nil {
+			t.Fatalf("Resolve(run-agent) error = %v", err)
+		}
+		node := dsl.Node{
+			ID:    "agent",
+			Class: dsl.NodeClassAction,
+			Kind:  string(dsl.ActionRunAgent),
+			Params: dsl.NodeParams{
+				"agent":  "planner",
+				"prompt": "Summarize",
+			},
+		}
+
+		_, err = executor.Execute(t.Context(), node, loop.ActionExecutionInput{
+			WorkspaceID: "ws-1",
+			RuntimeSelection: &loop.ActionRuntimeSelection{
+				Defaults: loop.RuntimeDefaults{
+					Worker: loop.RuntimeSpec{Model: "default-worker-model"},
+				},
+				Catalog: actionTestRuntimeCatalog{},
+			},
+		})
+		if err != nil {
+			t.Fatalf("Execute() error = %v", err)
+		}
+		bind := binder.mustSingleBind(t)
+		if bind.Runtime.Model != "default-worker-model" {
+			t.Fatalf("bind model = %q, want default-worker-model", bind.Runtime.Model)
+		}
+		if bind.Environment.Mode != dsl.EnvironmentRoot {
+			t.Fatalf("bind environment = %#v, want root default", bind.Environment)
+		}
+	})
+
+	t.Run("Should start child loop in await and detach modes", func(t *testing.T) {
+		t.Parallel()
+
+		proof := `{"worktree_id":"wt-reviewed","include_paths":["src/change.go"],"fingerprint":"` + strings.Repeat(
+			"a",
+			64,
+		) + `"}`
+		starter := &fakeActionLoopStarter{returnRun: &loop.Run{ID: "child-1"}}
+		actions := newActionRegistryForTest(t, &fakeActionToolRegistry{}, loop.WithActionLoopStarter(starter))
+		executor, err := actions.Resolve(t.Context(), tools.Scope{}, string(dsl.ActionRunLoop))
+		if err != nil {
+			t.Fatalf("Resolve(run-loop) error = %v", err)
+		}
+		awaitNode := dsl.Node{
+			ID:    "child",
+			Class: dsl.NodeClassAction,
+			Kind:  string(dsl.ActionRunLoop),
+			Params: dsl.NodeParams{
+				"loop": "qa-child",
+				"inputs": map[string]any{
+					"ticket":                  "{{ .inputs.ticket }}",
+					dsl.ReviewedWorktreeInput: "{{ .inputs.reviewed_worktree }}",
+				},
+			},
+		}
+		raw, err := executor.Execute(t.Context(), awaitNode, loop.ActionExecutionInput{
+			WorkspaceID: "ws-1",
+			LoopRunID:   "parent-1",
+			ToolScope:   tools.Scope{ProfileID: "profile-marketing"},
+			Namespace:   map[string]any{"inputs": map[string]any{"ticket": "T-1", dsl.ReviewedWorktreeInput: proof}},
+			Environment: &dsl.EnvironmentSpec{Mode: dsl.EnvironmentWorktree, WorktreeRef: "parent-feature"},
+			RuntimeSelection: &loop.ActionRuntimeSelection{
+				RunRules: []loop.RuntimeRule{{
+					Match:   loop.RuntimeMatch{Type: "frontend"},
+					Runtime: loop.RuntimeSpec{Model: "parent-only-model"},
+				}},
+			},
+		})
+		if err != nil {
+			t.Fatalf("Execute(await) error = %v", err)
+		}
+		if raw.ChildLoopRunID != "child-1" || raw.Status != "awaiting_child" {
+			t.Fatalf("await raw = %#v, want child awaiting status", raw)
+		}
+		start := starter.mustLastStart(t)
+		if !reflect.DeepEqual(start.inputs.Values[dsl.ReviewedWorktreeInput], proof) {
+			t.Fatalf("original proof lost: %#v", start.inputs.Values)
+		}
+		if start.inputs.ProfileID != "profile-marketing" ||
+			start.inputs.ParentLoopRunID != "parent-1" || start.inputs.Values["ticket"] != "T-1" {
+			t.Fatalf("start inputs = %#v, want parent + rendered inputs", start.inputs)
+		}
+		if !reflect.DeepEqual(start.inputs.ConfigOverrides, loop.LoopConfig{}) {
+			t.Fatalf("child config overrides = %#v, want zero value", start.inputs.ConfigOverrides)
+		}
+		if start.inputs.InheritedEnvironment == nil ||
+			*start.inputs.InheritedEnvironment != (dsl.EnvironmentSpec{
+				Mode: dsl.EnvironmentWorktree, WorktreeRef: "parent-feature",
+			}) {
+			t.Fatalf("child environment = %#v, want forwarded parent environment", start.inputs.InheritedEnvironment)
+		}
+
+		detachNode := awaitNode
+		detachNode.Params["mode"] = string(dsl.RunLoopDetach)
+		raw, err = executor.Execute(t.Context(), detachNode, loop.ActionExecutionInput{
+			WorkspaceID: "ws-1",
+			LoopRunID:   "parent-1",
+			ToolScope:   tools.Scope{ProfileID: "profile-marketing"},
+			Namespace:   map[string]any{"inputs": map[string]any{"ticket": "T-2", dsl.ReviewedWorktreeInput: proof}},
+		})
+		if err != nil {
+			t.Fatalf("Execute(detach) error = %v", err)
+		}
+		if raw.Status != "" || raw.ChildLoopRunID != "child-1" {
+			t.Fatalf("detach raw = %#v, want child id without awaiting status", raw)
+		}
+		if start := starter.mustLastStart(
+			t,
+		); start.inputs.ProfileID != "profile-marketing" ||
+			start.inputs.Values["ticket"] != "T-2" {
+			t.Fatalf("detach start inputs = %#v, want profile and rendered ticket", start.inputs)
+		}
+	})
+
+	t.Run("Should pass materialized config overrides to child loop", func(t *testing.T) {
+		t.Parallel()
+
+		starter := &fakeActionLoopStarter{returnRun: &loop.Run{ID: "child-config"}}
+		actions := newActionRegistryForTest(t, &fakeActionToolRegistry{}, loop.WithActionLoopStarter(starter))
+		executor, err := actions.Resolve(t.Context(), tools.Scope{}, string(dsl.ActionRunLoop))
+		if err != nil {
+			t.Fatalf("Resolve(run-loop) error = %v", err)
+		}
+		node := dsl.Node{
+			ID:    "child",
+			Class: dsl.NodeClassAction,
+			Kind:  string(dsl.ActionRunLoop),
+			Params: dsl.NodeParams{
+				"loop": "implement-tasks",
+				"config_overrides": map[string]any{
+					"iteration_cap":       4,
+					"budget_tokens":       "{{ .nodes.routing.output.remaining_tokens }}",
+					"budget_wall_sec":     7200,
+					"budget_on_exceeded":  "halt",
+					"reattempt_strategy":  "halt",
+					"enabled_checks_json": map[string]any{"quality": map[string]any{"enabled": true}},
+					"environment": map[string]any{
+						"mode":         "worktree",
+						"worktree_ref": "delivery-feature",
+					},
+					"runtime_rules": "{{ .nodes.routing.output.runtime_rules }}",
+				},
+			},
+		}
+		namespace := map[string]any{
+			"nodes": map[string]any{
+				"routing": map[string]any{
+					"output": map[string]any{
+						"remaining_tokens": 250000,
+						"runtime_rules": []any{map[string]any{
+							"match": map[string]any{"id": "frontend-shell"},
+							"runtime": map[string]any{
+								"provider":  "cursor",
+								"model":     "grok-4.6",
+								"reasoning": "high",
+							},
+						}},
+					},
+				},
+			},
+		}
+
+		tests := []struct {
+			name string
+			mode dsl.RunLoopMode
+		}{
+			{name: "Should pass overrides to awaited child", mode: dsl.RunLoopAwait},
+			{name: "Should pass overrides to detached child", mode: dsl.RunLoopDetach},
+		}
+		for _, test := range tests {
+			t.Run(test.name, func(t *testing.T) {
+				node.Params["mode"] = string(test.mode)
+				if _, err := executor.Execute(t.Context(), node, loop.ActionExecutionInput{
+					WorkspaceID: "ws-1",
+					LoopRunID:   "parent-1",
+					Namespace:   namespace,
+					Environment: &dsl.EnvironmentSpec{Mode: dsl.EnvironmentWorktree, WorktreeRef: "parent-feature"},
+				}); err != nil {
+					t.Fatalf("Execute(%s) error = %v", test.mode, err)
+				}
+
+				config := starter.mustLastStart(t).inputs.ConfigOverrides
+				if config.IterationCap == nil || *config.IterationCap != 4 {
+					t.Fatalf("iteration cap = %#v, want 4", config.IterationCap)
+				}
+				if config.BudgetTokens == nil || *config.BudgetTokens != 250000 {
+					t.Fatalf("budget tokens = %#v, want 250000", config.BudgetTokens)
+				}
+				if config.BudgetWallSec == nil || *config.BudgetWallSec != 7200 {
+					t.Fatalf("budget wall seconds = %#v, want 7200", config.BudgetWallSec)
+				}
+				if config.BudgetOnExceeded == nil || *config.BudgetOnExceeded != dsl.BudgetExceededHalt {
+					t.Fatalf("budget outcome = %#v, want halt", config.BudgetOnExceeded)
+				}
+				if config.ReattemptStrategy == nil || *config.ReattemptStrategy != loop.ReattemptHalt {
+					t.Fatalf("reattempt strategy = %#v, want halt", config.ReattemptStrategy)
+				}
+				if config.Environment == nil || *config.Environment != (dsl.EnvironmentSpec{
+					Mode: dsl.EnvironmentWorktree, WorktreeRef: "delivery-feature",
+				}) {
+					t.Fatalf("config environment = %#v, want delivery worktree", config.Environment)
+				}
+				if len(config.RuntimeRules) != 1 || config.RuntimeRules[0].Match.ID != "frontend-shell" ||
+					config.RuntimeRules[0].Runtime.Provider != "cursor" ||
+					config.RuntimeRules[0].Runtime.Model != "grok-4.6" ||
+					config.RuntimeRules[0].Runtime.Reasoning != "high" {
+					t.Fatalf("runtime rules = %#v, want materialized cursor rule", config.RuntimeRules)
+				}
+				var checks map[string]map[string]bool
+				if err := json.Unmarshal(config.EnabledChecks, &checks); err != nil {
+					t.Fatalf("enabled checks JSON error = %v", err)
+				}
+				if !checks["quality"]["enabled"] {
+					t.Fatalf("enabled checks = %#v, want quality enabled", checks)
+				}
+			})
+		}
+	})
+
+	t.Run("Should reject invalid child config overrides before start", func(t *testing.T) {
+		t.Parallel()
+
+		tests := []struct {
+			name      string
+			overrides map[string]any
+			namespace map[string]any
+			wantError string
+		}{
+			{name: "Should reject unknown fields", overrides: map[string]any{"iteration_caps": 4}},
+			{
+				name:      "Should reject operator-owned lifecycle policy",
+				overrides: map[string]any{"lifecycle": map[string]any{}},
+				wantError: `unknown field "lifecycle"`,
+			},
+			{
+				name:      "Should reject operator-owned request expiry",
+				overrides: map[string]any{"request_expire_after": "30m"},
+				wantError: `unknown field "request_expire_after"`,
+			},
+			{
+				name: "Should reject unknown nested runtime fields",
+				overrides: map[string]any{
+					"runtime_rules": []any{map[string]any{
+						"match":   map[string]any{"id": "frontend-shell"},
+						"runtime": map[string]any{"provider": "cursor", "models": "grok-4.6"},
+					}},
+				},
+				wantError: `unknown field "models"`,
+			},
+			{
+				name: "Should reject wrong materialized field types",
+				overrides: map[string]any{
+					"iteration_cap": "{{ .nodes.routing.output.iteration_cap }}",
+				},
+				namespace: map[string]any{
+					"nodes": map[string]any{
+						"routing": map[string]any{
+							"output": map[string]any{"iteration_cap": "four"},
+						},
+					},
+				},
+			},
+		}
+		for _, test := range tests {
+			t.Run(test.name, func(t *testing.T) {
+				t.Parallel()
+
+				starter := &fakeActionLoopStarter{returnRun: &loop.Run{ID: "must-not-start"}}
+				actions := newActionRegistryForTest(
+					t,
+					&fakeActionToolRegistry{},
+					loop.WithActionLoopStarter(starter),
+				)
+				executor, err := actions.Resolve(t.Context(), tools.Scope{}, string(dsl.ActionRunLoop))
+				if err != nil {
+					t.Fatalf("Resolve(run-loop) error = %v", err)
+				}
+				_, err = executor.Execute(t.Context(), dsl.Node{
+					ID:    "child",
+					Class: dsl.NodeClassAction,
+					Kind:  string(dsl.ActionRunLoop),
+					Params: dsl.NodeParams{
+						"loop":             "implement-tasks",
+						"config_overrides": test.overrides,
+					},
+				}, loop.ActionExecutionInput{WorkspaceID: "ws-1", Namespace: test.namespace})
+				if err == nil {
+					t.Fatal("Execute() error = nil, want invalid config_overrides")
+				}
+				if !strings.Contains(err.Error(), "run-loop config_overrides") {
+					t.Fatalf("Execute() error = %v, want run-loop config_overrides", err)
+				}
+				if test.wantError != "" && !strings.Contains(err.Error(), test.wantError) {
+					t.Fatalf("Execute() error = %v, want %q", err, test.wantError)
+				}
+				if got := starter.startCount(); got != 0 {
+					t.Fatalf("Start() calls = %d, want 0", got)
+				}
+			})
+		}
+	})
+
+	t.Run("Should evaluate transform map without side effects", func(t *testing.T) {
+		t.Parallel()
+
+		actions := newActionRegistryForTest(t, &fakeActionToolRegistry{})
+		executor, err := actions.Resolve(t.Context(), tools.Scope{}, string(dsl.ActionTransform))
+		if err != nil {
+			t.Fatalf("Resolve(transform) error = %v", err)
+		}
+		node := dsl.Node{
+			ID:    "map",
+			Class: dsl.NodeClassAction,
+			Kind:  string(dsl.ActionTransform),
+			Params: dsl.NodeParams{
+				"map": map[string]any{
+					"summary": map[string]any{"from": "nodes.agent.output.summary"},
+					"label":   map[string]any{"template": "Ticket {{ .inputs.ticket }}"},
+					"count":   map[string]any{"value": 2},
+					"literal": map[string]any{"value": "Keep {{ .inputs.ticket }} literal"},
+				},
+			},
+		}
+		raw, err := executor.Execute(t.Context(), node, loop.ActionExecutionInput{
+			Namespace: map[string]any{
+				"inputs": map[string]any{"ticket": "T-1"},
+				"nodes": map[string]any{
+					"agent": map[string]any{
+						"output": map[string]any{"summary": "done"},
+					},
+				},
+			},
+		})
+		if err != nil {
+			t.Fatalf("Execute(transform) error = %v", err)
+		}
+		output, err := executor.Harvest(t.Context(), raw, node)
+		if err != nil {
+			t.Fatalf("Harvest(transform) error = %v", err)
+		}
+		got, ok := output.Value.(map[string]any)
+		if !ok {
+			t.Fatalf("transform value = %T, want map", output.Value)
+		}
+		if got["summary"] != "done" || got["label"] != "Ticket T-1" || got["count"] != 2 {
+			t.Fatalf("transform value = %#v, want mapped fields", got)
+		}
+		if got["literal"] != "Keep {{ .inputs.ticket }} literal" {
+			t.Fatalf("transform literal = %#v, want unrendered literal", got["literal"])
+		}
+	})
+}
+
+func TestRunLoopActionShouldMatchPublicConfigOverrideFields(t *testing.T) {
+	t.Parallel()
+
+	jsonFields := func(valueType reflect.Type) map[string]struct{} {
+		fields := make(map[string]struct{}, valueType.NumField())
+		for field := range valueType.Fields() {
+			name, _, _ := strings.Cut(field.Tag.Get("json"), ",")
+			if name != "" && name != "-" {
+				fields[name] = struct{}{}
+			}
+		}
+		return fields
+	}
+
+	publicFields := jsonFields(reflect.TypeFor[contract.LoopConfig]())
+	publicSamples := map[string]any{
+		"human_gate_enabled": true,
+		"reattempt_strategy": "halt",
+		"enabled_checks_json": map[string]any{
+			"quality": map[string]any{"enabled": true},
+		},
+		"iteration_cap":      4,
+		"budget_tokens":      250000,
+		"budget_wall_sec":    7200,
+		"budget_on_exceeded": "halt",
+		"no_progress_window": 3,
+		"fan_out_width":      4,
+		"gate_max_revisions": 2,
+		"runtime_defaults": map[string]any{
+			"worker": map[string]any{"provider": "codex", "model": "gpt-5.6-sol"},
+		},
+		"runtime_rules": []any{map[string]any{
+			"match":   map[string]any{"id": "frontend-shell"},
+			"runtime": map[string]any{"provider": "cursor", "model": "grok-4.6"},
+		}},
+		"environment": map[string]any{"mode": "root"},
+	}
+	candidates := jsonFields(reflect.TypeFor[loop.LoopConfig]())
+	for name := range publicFields {
+		candidates[name] = struct{}{}
+	}
+	for name := range publicSamples {
+		candidates[name] = struct{}{}
+	}
+	candidateNames := slices.Collect(maps.Keys(candidates))
+	slices.Sort(candidateNames)
+
+	for _, name := range candidateNames {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+
+			_, wantAllowed := publicFields[name]
+			sample, hasSample := publicSamples[name]
+			if hasSample != wantAllowed {
+				t.Fatalf(
+					"config override %q sample present = %t, want %t from public LoopConfig",
+					name,
+					hasSample,
+					wantAllowed,
+				)
+			}
+			if !wantAllowed {
+				sample = nil
+			}
+			payload := map[string]any{name: sample}
+			if wantAllowed {
+				data, err := json.Marshal(payload)
+				if err != nil {
+					t.Fatalf("json.Marshal(%q sample) error = %v", name, err)
+				}
+				decoder := json.NewDecoder(bytes.NewReader(data))
+				decoder.DisallowUnknownFields()
+				if err := decoder.Decode(&contract.LoopConfig{}); err != nil {
+					t.Fatalf("public LoopConfig rejected %q sample: %v", name, err)
+				}
+			}
+
+			starter := &fakeActionLoopStarter{returnRun: &loop.Run{ID: "child-1"}}
+			actions := newActionRegistryForTest(
+				t,
+				&fakeActionToolRegistry{},
+				loop.WithActionLoopStarter(starter),
+			)
+			executor, err := actions.Resolve(t.Context(), tools.Scope{}, string(dsl.ActionRunLoop))
+			if err != nil {
+				t.Fatalf("Resolve(run-loop) error = %v", err)
+			}
+			_, err = executor.Execute(t.Context(), dsl.Node{
+				ID:    "child",
+				Class: dsl.NodeClassAction,
+				Kind:  string(dsl.ActionRunLoop),
+				Params: dsl.NodeParams{
+					"loop":             "implement-tasks",
+					"config_overrides": payload,
+				},
+			}, loop.ActionExecutionInput{WorkspaceID: "ws-1"})
+
+			gotAllowed := err == nil
+			if gotAllowed != wantAllowed {
+				t.Fatalf(
+					"config override %q allowed = %t, want %t from public LoopConfig (error = %v)",
+					name,
+					gotAllowed,
+					wantAllowed,
+					err,
+				)
+			}
+		})
+	}
+}
+
+type actionTestRuntimeCatalog struct{}
+
+func (actionTestRuntimeCatalog) CanonicalProvider(provider string) string {
+	return strings.TrimSpace(provider)
+}
+
+func (actionTestRuntimeCatalog) ValidateRuntime(context.Context, loop.RuntimeSpec) error {
+	return nil
+}
+
+func newActionRegistryForTest(
+	t *testing.T,
+	registry *fakeActionToolRegistry,
+	opts ...loop.ActionRegistryOption,
+) *loop.ActionRegistry {
+	t.Helper()
+
+	actions, err := loop.NewActionRegistry(registry, opts...)
+	if err != nil {
+		t.Fatalf("NewActionRegistry() error = %v", err)
+	}
+	return actions
+}
+
+func mustDaemonActor(t *testing.T) task.ActorContext {
+	t.Helper()
+
+	actor, err := task.DeriveDaemonActorContext("loop", "")
+	if err != nil {
+		t.Fatalf("DeriveDaemonActorContext() error = %v", err)
+	}
+	return actor
+}
+
+type fakeActionToolRegistry struct {
+	mu         sync.Mutex
+	views      map[tools.ToolID]tools.ToolView
+	getErr     error
+	callResult tools.ToolResult
+	callErr    error
+	onCall     func()
+	gets       []tools.ToolID
+	calls      []tools.CallRequest
+}
+
+func (r *fakeActionToolRegistry) List(context.Context, tools.Scope) ([]tools.ToolView, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	views := make([]tools.ToolView, 0, len(r.views))
+	for id := range r.views {
+		views = append(views, r.views[id])
+	}
+	return views, nil
+}
+
+func (r *fakeActionToolRegistry) Search(context.Context, tools.Scope, tools.SearchQuery) ([]tools.ToolView, error) {
+	return r.List(context.Background(), tools.Scope{})
+}
+
+func (r *fakeActionToolRegistry) Get(_ context.Context, _ tools.Scope, id tools.ToolID) (tools.ToolView, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	r.gets = append(r.gets, id)
+	if r.getErr != nil {
+		return tools.ToolView{}, r.getErr
+	}
+	view, ok := r.views[id]
+	if !ok {
+		return tools.ToolView{}, tools.NewToolError(
+			tools.ErrorCodeNotFound,
+			id,
+			"missing",
+			tools.ErrToolNotFound,
+			tools.ReasonToolUnknown,
+		)
+	}
+	return view, nil
+}
+
+func (r *fakeActionToolRegistry) Call(
+	_ context.Context,
+	_ tools.Scope,
+	req tools.CallRequest,
+) (tools.ToolResult, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	r.calls = append(r.calls, req)
+	if r.onCall != nil {
+		r.onCall()
+	}
+	if r.callErr != nil {
+		return tools.ToolResult{}, r.callErr
+	}
+	return r.callResult, nil
+}
+
+func (r *fakeActionToolRegistry) getCount() int {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	return len(r.gets)
+}
+
+func (r *fakeActionToolRegistry) callCount() int {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	return len(r.calls)
+}
+
+func (r *fakeActionToolRegistry) mustSingleCall(t *testing.T) tools.CallRequest {
+	t.Helper()
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	if len(r.calls) != 1 {
+		t.Fatalf("Call count = %d, want 1", len(r.calls))
+	}
+	return r.calls[0]
+}
+
+type fakeActionEventReader struct {
+	mu     sync.Mutex
+	last   loop.ActionEventRangeRequest
+	result loop.ActionEventRangeResult
+	err    error
+}
+
+type fakeActionToolWorkspaceRootResolver struct {
+	mu           sync.Mutex
+	root         string
+	err          error
+	requests     []loop.ActionToolWorkspaceRootRequest
+	leaseHeld    atomic.Bool
+	releaseCount atomic.Int64
+}
+
+func (r *fakeActionToolWorkspaceRootResolver) AcquireActionToolWorkspaceRoot(
+	_ context.Context,
+	req loop.ActionToolWorkspaceRootRequest,
+) (string, func(), error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	r.requests = append(r.requests, req)
+	if r.err != nil {
+		return "", nil, r.err
+	}
+	r.leaseHeld.Store(true)
+	release := sync.OnceFunc(func() {
+		r.leaseHeld.Store(false)
+		r.releaseCount.Add(1)
+	})
+	return r.root, release, nil
+}
+
+func (r *fakeActionToolWorkspaceRootResolver) mustSingleRequest(
+	t *testing.T,
+) loop.ActionToolWorkspaceRootRequest {
+	t.Helper()
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	if len(r.requests) != 1 {
+		t.Fatalf("AcquireActionToolWorkspaceRoot calls = %d, want 1", len(r.requests))
+	}
+	return r.requests[0]
+}
+
+func (r *fakeActionEventReader) ReadActionEventRange(
+	_ context.Context,
+	//nolint:gocritic // The fake implements the production interface under test.
+	req loop.ActionEventRangeRequest,
+) (loop.ActionEventRangeResult, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	r.last = req
+	if r.err != nil {
+		return loop.ActionEventRangeResult{}, r.err
+	}
+	return r.result, nil
+}
+
+type fakeActionSessionBinder struct {
+	mu             sync.Mutex
+	binding        loop.ActionSessionBinding
+	binds          []loop.ActionSessionBindRequest
+	prompts        []loop.ActionPromptRequest
+	promptResults  []loop.ActionPromptResult
+	promptErr      error
+	blockPrompt    bool
+	cancels        []loop.ActionSessionBinding
+	cancelDeadline bool
+}
+
+func (b *fakeActionSessionBinder) BindActionSession(
+	_ context.Context,
+	req loop.ActionSessionBindRequest,
+) (loop.ActionSessionBinding, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+
+	b.binds = append(b.binds, req)
+	return b.binding, nil
+}
+
+func (b *fakeActionSessionBinder) PromptActionSession(
+	ctx context.Context,
+	_ loop.ActionSessionBinding,
+	req loop.ActionPromptRequest,
+) (loop.ActionPromptResult, error) {
+	b.mu.Lock()
+	b.prompts = append(b.prompts, req)
+	block := b.blockPrompt
+	if !block {
+		if b.promptErr != nil {
+			err := b.promptErr
+			b.mu.Unlock()
+			return loop.ActionPromptResult{}, err
+		}
+		if len(b.promptResults) == 0 {
+			b.mu.Unlock()
+			return loop.ActionPromptResult{}, errors.New("missing prompt result")
+		}
+		result := b.promptResults[0]
+		b.promptResults = b.promptResults[1:]
+		if req.UsageReporter != nil && result.TokensUsed > 0 {
+			req.UsageReporter.ReportActionTokensUsed(result.TokensUsed)
+		}
+		b.mu.Unlock()
+		return result, nil
+	}
+	b.mu.Unlock()
+
+	<-ctx.Done()
+	return loop.ActionPromptResult{}, ctx.Err()
+}
+
+func (b *fakeActionSessionBinder) CancelActionSession(
+	ctx context.Context,
+	binding loop.ActionSessionBinding,
+) error {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+
+	_, b.cancelDeadline = ctx.Deadline()
+	b.cancels = append(b.cancels, binding)
+	return nil
+}
+
+func (b *fakeActionSessionBinder) mustSingleBind(t *testing.T) loop.ActionSessionBindRequest {
+	t.Helper()
+	b.mu.Lock()
+	defer b.mu.Unlock()
+
+	if len(b.binds) != 1 {
+		t.Fatalf("bind count = %d, want 1", len(b.binds))
+	}
+	return b.binds[0]
+}
+
+func (b *fakeActionSessionBinder) bindCount() int {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return len(b.binds)
+}
+
+func (b *fakeActionSessionBinder) promptMessages() []string {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+
+	messages := make([]string, 0, len(b.prompts))
+	for _, req := range b.prompts {
+		messages = append(messages, req.Message)
+	}
+	return messages
+}
+
+func (b *fakeActionSessionBinder) cancelCount() int {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+
+	return len(b.cancels)
+}
+
+func (b *fakeActionSessionBinder) cancelHadDeadline() bool {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+
+	return b.cancelDeadline
+}
+
+type fakeActionLoopStarter struct {
+	mu                    sync.Mutex
+	starts                []fakeLoopStart
+	returnRun             *loop.Run
+	err                   error
+	blockUntilContextDone bool
+}
+
+type fakeLoopStart struct {
+	ws          loop.WorkspaceID
+	name        string
+	inputs      loop.Inputs
+	actor       task.ActorContext
+	hadDeadline bool
+}
+
+func (s *fakeActionLoopStarter) Start(
+	ctx context.Context,
+	ws loop.WorkspaceID,
+	name string,
+	inputs loop.Inputs,
+	actor task.ActorContext,
+) (*loop.Run, error) {
+	_, hadDeadline := ctx.Deadline()
+	if s.blockUntilContextDone {
+		<-ctx.Done()
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	s.starts = append(s.starts, fakeLoopStart{
+		ws:          ws,
+		name:        name,
+		inputs:      inputs,
+		actor:       actor,
+		hadDeadline: hadDeadline,
+	})
+	if s.err != nil {
+		return nil, s.err
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	return s.returnRun, nil
+}
+
+func (s *fakeActionLoopStarter) mustLastStart(t *testing.T) fakeLoopStart {
+	t.Helper()
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if len(s.starts) == 0 {
+		t.Fatal("Start calls = 0, want at least 1")
+	}
+	return s.starts[len(s.starts)-1]
+}
+
+func (s *fakeActionLoopStarter) startCount() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	return len(s.starts)
+}
+
+func TestActionTimeoutShouldCompleteQuickly(t *testing.T) {
+	t.Parallel()
+
+	t.Run("Should return timeout within parent deadline", func(t *testing.T) {
+		t.Parallel()
+
+		ctx, cancel := context.WithTimeout(t.Context(), 2*time.Second)
+		defer cancel()
+
+		binder := &fakeActionSessionBinder{
+			binding:     loop.ActionSessionBinding{SessionID: "sess-timeout"},
+			blockPrompt: true,
+		}
+		actions := newActionRegistryForTest(t, &fakeActionToolRegistry{}, loop.WithActionSessionBinder(binder))
+		executor, err := actions.Resolve(ctx, tools.Scope{}, string(dsl.ActionRunAgent))
+		if err != nil {
+			t.Fatalf("Resolve(run-agent) error = %v", err)
+		}
+		_, err = executor.Execute(ctx, dsl.Node{
+			ID:      "agent",
+			Class:   dsl.NodeClassAction,
+			Kind:    string(dsl.ActionRunAgent),
+			Timeout: "1ms",
+			Params: dsl.NodeParams{
+				"agent":  "planner",
+				"prompt": "wait",
+			},
+		}, loop.ActionExecutionInput{})
+		if !errors.Is(err, loop.ErrActionTimeout) {
+			t.Fatalf("Execute() error = %v, want ErrActionTimeout", err)
+		}
+	})
+
+	t.Run("Should cancel the bound session when the runtime supplies the deadline", func(t *testing.T) {
+		t.Parallel()
+
+		ctx, cancel := context.WithTimeout(t.Context(), 10*time.Millisecond)
+		defer cancel()
+
+		binder := &fakeActionSessionBinder{
+			binding:     loop.ActionSessionBinding{SessionID: "sess-runtime-timeout"},
+			blockPrompt: true,
+		}
+		actions := newActionRegistryForTest(t, &fakeActionToolRegistry{}, loop.WithActionSessionBinder(binder))
+		executor, err := actions.Resolve(ctx, tools.Scope{}, string(dsl.ActionRunAgent))
+		if err != nil {
+			t.Fatalf("Resolve(run-agent) error = %v", err)
+		}
+		_, err = executor.Execute(ctx, dsl.Node{
+			ID:    "agent",
+			Class: dsl.NodeClassAction,
+			Kind:  string(dsl.ActionRunAgent),
+			Params: dsl.NodeParams{
+				"agent":  "planner",
+				"prompt": "wait",
+			},
+		}, loop.ActionExecutionInput{})
+		if !errors.Is(err, loop.ErrActionTimeout) {
+			t.Fatalf("Execute() error = %v, want ErrActionTimeout", err)
+		}
+		if got, want := binder.cancelCount(), 1; got != want {
+			t.Fatalf("CancelActionSession() calls = %d, want %d", got, want)
+		}
+		if !binder.cancelHadDeadline() {
+			t.Fatal("CancelActionSession() context had no bounded deadline")
+		}
+	})
+
+	t.Run("Should bound run-loop start by node timeout", func(t *testing.T) {
+		t.Parallel()
+
+		ctx, cancel := context.WithTimeout(t.Context(), 2*time.Second)
+		defer cancel()
+
+		starter := &fakeActionLoopStarter{blockUntilContextDone: true}
+		actions := newActionRegistryForTest(t, &fakeActionToolRegistry{}, loop.WithActionLoopStarter(starter))
+		executor, err := actions.Resolve(ctx, tools.Scope{}, string(dsl.ActionRunLoop))
+		if err != nil {
+			t.Fatalf("Resolve(run-loop) error = %v", err)
+		}
+
+		_, err = executor.Execute(ctx, dsl.Node{
+			ID:      "child",
+			Class:   dsl.NodeClassAction,
+			Kind:    string(dsl.ActionRunLoop),
+			Timeout: "1ms",
+			Params: dsl.NodeParams{
+				"loop": "qa-child",
+			},
+		}, loop.ActionExecutionInput{WorkspaceID: "ws-1"})
+		if !errors.Is(err, context.DeadlineExceeded) {
+			t.Fatalf("Execute(run-loop timeout) error = %v, want context deadline exceeded", err)
+		}
+		if !starter.mustLastStart(t).hadDeadline {
+			t.Fatal("Start context had no deadline, want node timeout deadline")
+		}
+	})
+}

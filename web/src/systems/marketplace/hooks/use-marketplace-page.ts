@@ -1,0 +1,99 @@
+import { useRef } from "react";
+import { toast } from "@compozy/ui";
+import { installedDisplayName } from "../lib/marketplace-installed-view";
+import { useExtensionInventory } from "@/systems/extensions";
+
+import { useMarketplaceCatalog } from "./use-marketplace";
+import { useRefreshMarketplaceCatalog } from "./use-marketplace-actions";
+
+/** The API owns catalog filtering/paging; the complete installed inventory owns its shelf and updates. */
+export function useMarketplacePage(query = "", liveDataEnabled = true) {
+  const inventory = useExtensionInventory(liveDataEnabled);
+  const catalog = useMarketplaceCatalog(
+    {
+      q: query,
+      limit: 100,
+      workspaceId: inventory.workspaceId,
+      profileName: inventory.profileName,
+    },
+    liveDataEnabled
+  );
+  const refresh = useRefreshMarketplaceCatalog();
+  const lastFailureToast = useRef(Number.NEGATIVE_INFINITY);
+  const reportRefreshFailure = (error: unknown) => {
+    const now = Date.now();
+    if (now - lastFailureToast.current >= 5_000) {
+      lastFailureToast.current = now;
+      toast.error(error instanceof Error ? error.message : "Failed to refresh the marketplace");
+    }
+  };
+  const refreshCatalog = () =>
+    refresh.mutateAsync().then(response => {
+      const failed = response.sources.filter(result => result.error_class);
+      if (failed.length > 0) {
+        reportRefreshFailure(
+          new Error(
+            `Could not refresh ${failed.map(result => `${result.source} (${result.error_class})`).join(", ")}`
+          )
+        );
+      }
+    }, reportRefreshFailure);
+  const pages = catalog.data?.pages ?? [];
+  const first = pages[0];
+  const catalogItems = pages.flatMap(page => page.items);
+  const unavailable =
+    first?.error_class && catalogItems.length === 0
+      ? new Error(first.error || `Catalog unavailable (${first.error_class})`)
+      : null;
+  const catalogSections = (first?.sources ?? []).map(source => ({
+    ...source,
+    items: catalogItems.filter(item => item.source === source.name),
+  }));
+  const updates = inventory.data.filter(item => item.updateAvailable);
+  return {
+    catalogItems,
+    catalogSections,
+    installedItems: inventory.data,
+    installedCount: inventory.data.length,
+    updates,
+    total: first?.total ?? 0,
+    sources: first?.sources ?? [],
+    revision: first?.revision,
+    stale: pages.some(page => page.stale),
+    diagnostic: first?.error,
+    catalogError: catalog.error ?? unavailable,
+    installedError: inventory.error,
+    // An edited search keeps the previous results on screen; a placeholder with none is no answer.
+    isLoading:
+      catalog.isPending ||
+      (catalog.isPlaceholderData && catalogItems.length === 0) ||
+      Boolean(first?.refreshing && first.total === 0),
+    isInstalledLoading: inventory.isPending,
+    isRefreshing: refresh.isPending || (catalog.isRefetching && !catalog.isPlaceholderData),
+    refresh: refreshCatalog,
+    profileName: inventory.profileName,
+    workspaceId: inventory.workspaceId,
+  };
+}
+
+/** Installed search never depends on fetching every catalog page. */
+export function useMarketplaceInstalledPage(query = "", liveDataEnabled = true) {
+  const inventory = useExtensionInventory(liveDataEnabled);
+  const needle = query.trim().normalize("NFC").toLocaleLowerCase();
+  const items = inventory.data
+    .filter(item =>
+      [
+        item.extension.name,
+        item.extension.description,
+        item.listing?.name,
+        item.listing?.description,
+      ].some(value => value?.normalize("NFC").toLocaleLowerCase().includes(needle))
+    )
+    .sort((left, right) => installedDisplayName(left).localeCompare(installedDisplayName(right)));
+  return {
+    ...inventory,
+    items,
+    installedCount: inventory.data.length,
+    updates: inventory.data.filter(item => item.updateAvailable),
+  };
+}

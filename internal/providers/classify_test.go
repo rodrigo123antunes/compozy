@@ -1,0 +1,583 @@
+package providers
+
+import (
+	"encoding/json"
+	"errors"
+	"os"
+	"os/exec"
+	"path/filepath"
+	"runtime"
+	"strings"
+	"testing"
+
+	compozyconfig "github.com/compozy/compozy/internal/config"
+	diagcontract "github.com/compozy/compozy/internal/diagnosticcontract"
+	"github.com/compozy/compozy/internal/providerauth"
+	"github.com/compozy/compozy/internal/testutil"
+)
+
+func TestClassifyProviderAuth(t *testing.T) {
+	t.Parallel()
+
+	t.Run("Should return authenticated when status probe succeeds", func(t *testing.T) {
+		t.Parallel()
+
+		got := ClassifyProbeResult(nativeProvider(), ProbeOutcome{ExitCode: 0, Stdout: "logged in"}, presentEnv())
+		if got.State != ProviderAuthStateAuthenticated {
+			t.Fatalf("State = %q, want %q", got.State, ProviderAuthStateAuthenticated)
+		}
+		if got.Code != "" {
+			t.Fatalf("Code = %q, want empty", got.Code)
+		}
+	})
+
+	t.Run("Should classify structured login verdicts without trusting identity text", func(t *testing.T) {
+		t.Parallel()
+		cases := []struct {
+			name     string
+			stdout   string
+			stderr   string
+			exitCode int
+			state    ProviderAuthState
+		}{
+			{
+				name:   "Should accept a true boolean",
+				stdout: `{"loggedIn":true,"email":"private@example.test","orgId":"org-429","orgName":"Unauthorized Labs"}`,
+				state:  ProviderAuthStateAuthenticated,
+			},
+			{
+				name:   "Should reject a false boolean on success",
+				stdout: `{"loggedIn":false,"orgName":"Authenticated Labs"}`,
+				state:  ProviderAuthStateNeedsLogin,
+			},
+			{
+				name:     "Should reject a false boolean on failure",
+				stdout:   `{"loggedIn":false}`,
+				exitCode: 1,
+				state:    ProviderAuthStateNeedsLogin,
+			},
+			{
+				name:   "Should reject a missing boolean",
+				stdout: `{"orgName":"Authenticated Labs"}`,
+				state:  ProviderAuthStateUnknown,
+			},
+			{
+				name:   "Should reject a string boolean",
+				stdout: `{"loggedIn":"true","orgName":"Authenticated Labs"}`,
+				state:  ProviderAuthStateUnknown,
+			},
+			{name: "Should reject a null boolean", stdout: `{"loggedIn":null}`, state: ProviderAuthStateUnknown},
+			{name: "Should reject a numeric boolean", stdout: `{"loggedIn":1}`, state: ProviderAuthStateUnknown},
+			{
+				name:   "Should reject malformed JSON",
+				stdout: `{"loggedIn":true,"email":"private@example.test"`,
+				state:  ProviderAuthStateUnknown,
+			},
+			{
+				name:   "Should reject trailing content",
+				stdout: `{"loggedIn":true} authenticated`,
+				state:  ProviderAuthStateUnknown,
+			},
+			{
+				name:   "Should reject duplicate verdicts",
+				stdout: `{"loggedIn":false,"loggedIn":true}`,
+				state:  ProviderAuthStateUnknown,
+			},
+			{
+				name:   "Should reject nested verdicts",
+				stdout: `{"status":{"loggedIn":true}}`,
+				state:  ProviderAuthStateUnknown,
+			},
+			{name: "Should reject array verdicts", stdout: `[{"loggedIn":true}]`, state: ProviderAuthStateUnknown},
+			{
+				name:   "Should reject a verdict accompanied by a structured error",
+				stdout: `{"loggedIn":true,"error":"private provider failure"}`,
+				state:  ProviderAuthStateUnknown,
+			},
+			{
+				name:     "Should keep nonzero true verdict unknown",
+				stdout:   `{"loggedIn":true}`,
+				exitCode: 1,
+				state:    ProviderAuthStateUnknown,
+			},
+			{
+				name:   "Should prioritize permission errors",
+				stdout: `{"loggedIn":true}`,
+				stderr: "HTTP 403 forbidden",
+				state:  ProviderAuthStatePermissionDenied,
+			},
+			{
+				name:   "Should prioritize rate limits",
+				stdout: `{"loggedIn":true}`,
+				stderr: "HTTP 429 rate limit",
+				state:  ProviderAuthStateRateLimited,
+			},
+			{
+				name:   "Should prioritize transport errors",
+				stdout: `{"loggedIn":true}`,
+				stderr: "connection refused",
+				state:  ProviderAuthStateTransient,
+			},
+			{
+				name:   "Should prioritize login errors",
+				stdout: `{"loggedIn":true}`,
+				stderr: "not authenticated",
+				state:  ProviderAuthStateNeedsLogin,
+			},
+			{
+				name:   "Should reject conflicting stream verdicts",
+				stdout: `{"loggedIn":true}`,
+				stderr: `{"loggedIn":false}`,
+				state:  ProviderAuthStateNeedsLogin,
+			},
+			{
+				name:   "Should not let success text override invalid JSON",
+				stdout: `{"loggedIn":"true"}`,
+				stderr: "authenticated",
+				state:  ProviderAuthStateUnknown,
+			},
+			{
+				name:   "Should prioritize negative text even on success",
+				stdout: "not logged in",
+				state:  ProviderAuthStateNeedsLogin,
+			},
+			{
+				name:   "Should retain successful text with brace-delimited metadata",
+				stdout: "logged in {region=us-east}",
+				state:  ProviderAuthStateAuthenticated,
+			},
+			{
+				name:   "Should not let brace metadata hide a later JSON verdict",
+				stdout: "[INFO] {region=us-east}\n" + `{"loggedIn":false,"email":"private@example.test"}`,
+				state:  ProviderAuthStateNeedsLogin,
+			},
+			{
+				name:   "Should retain bracket-prefixed text probes",
+				stdout: "[INFO] logged in",
+				state:  ProviderAuthStateAuthenticated,
+			},
+			{
+				name: "Should parse a warning-prefixed false verdict without exposing identity",
+				stdout: "warning\n" +
+					`{"loggedIn":false,"orgName":"Authenticated Labs","email":"private@example.test"}`,
+				state: ProviderAuthStateNeedsLogin,
+			},
+			{
+				name:   "Should parse a warning-prefixed true verdict",
+				stdout: "[INFO] account status\n" + `{"loggedIn":true}`,
+				state:  ProviderAuthStateAuthenticated,
+			},
+			{
+				name:   "Should suppress malformed warning-prefixed identity",
+				stdout: "warning\n" + `{"loggedIn":true,"email":"private@example.test"`,
+				state:  ProviderAuthStateUnknown,
+			},
+			{
+				name:   "Should preserve a classified error before JSON",
+				stdout: "HTTP 403 forbidden\n" + `{"loggedIn":true,"email":"private@example.test"}`,
+				state:  ProviderAuthStatePermissionDenied,
+			},
+		}
+		for _, tt := range cases {
+			t.Run(tt.name, func(t *testing.T) {
+				t.Parallel()
+				got := ClassifyProbeResult(
+					nativeProvider(),
+					ProbeOutcome{ExitCode: tt.exitCode, Stdout: tt.stdout, Stderr: tt.stderr},
+					presentEnv(),
+				)
+				if got.State != tt.state {
+					t.Fatalf("State = %q, want %q", got.State, tt.state)
+				}
+				encoded, err := json.Marshal(DiagnosticItem("native", got))
+				if err != nil {
+					t.Fatal(err)
+				}
+				for _, identity := range []string{"private@example.test", "org-429", "Unauthorized Labs", "Authenticated Labs"} {
+					if strings.Contains(string(encoded), identity) {
+						t.Fatalf("diagnostic leaked %q: %s", identity, encoded)
+					}
+				}
+			})
+		}
+	})
+
+	t.Run("Should return needs login when probe reports unauthorized", func(t *testing.T) {
+		t.Parallel()
+
+		got := ClassifyProbeResult(
+			nativeProvider(),
+			ProbeOutcome{ExitCode: 1, Stderr: "HTTP 401 unauthorized"},
+			presentEnv(),
+		)
+		if got.State != ProviderAuthStateNeedsLogin {
+			t.Fatalf("State = %q, want %q", got.State, ProviderAuthStateNeedsLogin)
+		}
+		if got.Code != diagcontract.CodeProviderNotAuthenticated {
+			t.Fatalf("Code = %q, want %q", got.Code, diagcontract.CodeProviderNotAuthenticated)
+		}
+	})
+
+	t.Run("Should return missing CLI when lookup fails", func(t *testing.T) {
+		t.Parallel()
+
+		env := presentEnv()
+		resolveCalls := 0
+		env.LookPath = func(string) (string, error) {
+			resolveCalls++
+			if resolveCalls == 1 {
+				return "", exec.ErrNotFound
+			}
+			return "/later/bin/provider-cli", nil
+		}
+		declared, err := ClassifyDeclared(testutil.Context(t), nativeProvider(), env)
+		if err != nil {
+			t.Fatalf("ClassifyDeclared() error = %v", err)
+		}
+		if declared.State != ProviderAuthStateMissingCLI {
+			t.Fatalf("declared State = %q, want %q", declared.State, ProviderAuthStateMissingCLI)
+		}
+		got := ClassifyProbeResult(
+			nativeProvider(),
+			ProbeOutcome{ExitCode: 0, Stdout: "logged in"},
+			env,
+		)
+		if got.State != ProviderAuthStateMissingCLI {
+			t.Fatalf("State = %q, want %q", got.State, ProviderAuthStateMissingCLI)
+		}
+		if got.Code != diagcontract.CodeProviderCLIMissing {
+			t.Fatalf("Code = %q, want %q", got.Code, diagcontract.CodeProviderCLIMissing)
+		}
+		if got.Action != ProviderFailureActionInstallCLI {
+			t.Fatalf("Action = %q, want %q", got.Action, ProviderFailureActionInstallCLI)
+		}
+		if resolveCalls != 1 {
+			t.Fatalf("status resolver calls = %d, want 1", resolveCalls)
+		}
+	})
+
+	t.Run("Should keep an operational lookup failure unknown through final classification", func(t *testing.T) {
+		t.Parallel()
+
+		resolverErr := errors.New("resolver failed token=classification-secret")
+		env := presentEnv()
+		resolveCalls := 0
+		env.LookPath = func(string) (string, error) {
+			resolveCalls++
+			if resolveCalls == 1 {
+				return "", resolverErr
+			}
+			return "/later/bin/provider-cli", nil
+		}
+		declared, err := ClassifyDeclared(testutil.Context(t), nativeProvider(), env)
+		if err != nil {
+			t.Fatalf("ClassifyDeclared() error = %v", err)
+		}
+		got := ClassifyProbeResult(
+			nativeProvider(),
+			ProbeOutcome{ExitCode: 0, Stdout: "logged in"},
+			env,
+		)
+		for name, classification := range map[string]Classification{
+			"declared": declared,
+			"final":    got,
+		} {
+			if classification.State != ProviderAuthStateUnknown {
+				t.Fatalf("%s State = %q, want %q", name, classification.State, ProviderAuthStateUnknown)
+			}
+			if classification.Code != diagcontract.CodeProviderClassificationUnknown {
+				t.Fatalf(
+					"%s Code = %q, want %q",
+					name,
+					classification.Code,
+					diagcontract.CodeProviderClassificationUnknown,
+				)
+			}
+			if classification.Action != ProviderFailureActionInspect {
+				t.Fatalf("%s Action = %q, want %q", name, classification.Action, ProviderFailureActionInspect)
+			}
+			if strings.Contains(classification.Message, "classification-secret") {
+				t.Fatalf("%s Message = %q, leaked resolver secret", name, classification.Message)
+			}
+		}
+		if resolveCalls != 1 {
+			t.Fatalf("status resolver calls = %d, want 1", resolveCalls)
+		}
+	})
+
+	t.Run("Should return missing credential when required bound secret is absent", func(t *testing.T) {
+		t.Parallel()
+
+		provider := compozyconfig.ProviderConfig{
+			AuthMode: compozyconfig.ProviderAuthModeBoundSecret,
+			CredentialSlots: []compozyconfig.ProviderCredentialSlot{
+				{Name: "api_key", TargetEnv: "TEST_API_KEY", SecretRef: "env:TEST_API_KEY", Required: true},
+			},
+		}
+		got, err := ClassifyDeclared(testutil.Context(t), provider, &ProbeEnv{
+			LookupEnv: func(string) (string, bool) { return "", false },
+		})
+		if err != nil {
+			t.Fatalf("ClassifyDeclared() error = %v", err)
+		}
+		if got.State != ProviderAuthStateMissingCredential {
+			t.Fatalf("State = %q, want %q", got.State, ProviderAuthStateMissingCredential)
+		}
+		if got.Code != diagcontract.CodeProviderCredentialUnresolved {
+			t.Fatalf("Code = %q, want %q", got.Code, diagcontract.CodeProviderCredentialUnresolved)
+		}
+	})
+
+	t.Run("Should return explicit none when auth mode is none", func(t *testing.T) {
+		t.Parallel()
+
+		got, err := ClassifyDeclared(t.Context(), compozyconfig.ProviderConfig{
+			AuthMode: compozyconfig.ProviderAuthModeNone,
+		}, nil)
+		if err != nil {
+			t.Fatalf("ClassifyDeclared(none) error = %v", err)
+		}
+		if got.State != ProviderAuthStateNone {
+			t.Fatalf("State = %q, want %q", got.State, ProviderAuthStateNone)
+		}
+		if got.Message != "No auth required." {
+			t.Fatalf("Message = %q, want no-auth wording", got.Message)
+		}
+	})
+
+	t.Run("Should return rate limited before generic auth failures", func(t *testing.T) {
+		t.Parallel()
+
+		got := ClassifyProbeResult(nativeProvider(), ProbeOutcome{
+			ExitCode: 1,
+			Stderr:   "HTTP 429 unauthorized quota exhausted",
+		}, presentEnv())
+		if got.State != ProviderAuthStateRateLimited {
+			t.Fatalf("State = %q, want %q", got.State, ProviderAuthStateRateLimited)
+		}
+		if got.Code != diagcontract.CodeProviderRateLimited {
+			t.Fatalf("Code = %q, want %q", got.Code, diagcontract.CodeProviderRateLimited)
+		}
+	})
+
+	t.Run("Should return permission denied for forbidden probe output", func(t *testing.T) {
+		t.Parallel()
+
+		got := ClassifyProbeResult(
+			nativeProvider(),
+			ProbeOutcome{ExitCode: 1, Stderr: "HTTP 403 forbidden"},
+			presentEnv(),
+		)
+		if got.State != ProviderAuthStatePermissionDenied {
+			t.Fatalf("State = %q, want %q", got.State, ProviderAuthStatePermissionDenied)
+		}
+	})
+
+	t.Run("Should return transient for timeout output", func(t *testing.T) {
+		t.Parallel()
+
+		got := ClassifyProbeResult(
+			nativeProvider(),
+			ProbeOutcome{ExitCode: 1, Stderr: "connection refused"},
+			presentEnv(),
+		)
+		if got.State != ProviderAuthStateTransient {
+			t.Fatalf("State = %q, want %q", got.State, ProviderAuthStateTransient)
+		}
+	})
+
+	t.Run("Should return unknown for unrecognized probe output", func(t *testing.T) {
+		t.Parallel()
+
+		got := ClassifyProbeResult(
+			nativeProvider(),
+			ProbeOutcome{ExitCode: 1, Stderr: "unexpected provider text"},
+			presentEnv(),
+		)
+		if got.State != ProviderAuthStateUnknown {
+			t.Fatalf("State = %q, want %q", got.State, ProviderAuthStateUnknown)
+		}
+		if got.Code != diagcontract.CodeProviderClassificationUnknown {
+			t.Fatalf("Code = %q, want %q", got.Code, diagcontract.CodeProviderClassificationUnknown)
+		}
+	})
+
+	t.Run("Should include bounded redacted stderr for unknown preflight failures", func(t *testing.T) {
+		t.Parallel()
+
+		got := ClassifyProbeResult(
+			nativeProvider(),
+			ProbeOutcome{ExitCode: 1, Stderr: "MCP setup failed Authorization: Bearer preflight-secret"},
+			presentEnv(),
+		)
+		if !strings.Contains(got.Message, "MCP setup failed") {
+			t.Fatalf("Message = %q, want provider stderr detail", got.Message)
+		}
+		if strings.Contains(got.Message, "preflight-secret") || !strings.Contains(got.Message, "[REDACTED]") {
+			t.Fatalf("Message = %q, want redacted provider stderr", got.Message)
+		}
+	})
+
+	t.Run("Should describe login readiness without retaining command details", func(t *testing.T) {
+		t.Parallel()
+
+		provider := nativeProvider()
+		provider.AuthLoginCmd = `QA_LOGIN_TOKEN=raw-env-secret "/opt/provider bin/provider-cli" login --token raw-login-secret`
+		nativeCLI, err := providerauth.NativeCLIStatusForCommand(
+			provider.AuthLoginCmd,
+			providerauth.NativeCLISourceAuthLogin,
+			func(command string) (string, error) {
+				if got, want := command, "/opt/provider bin/provider-cli"; got != want {
+					t.Fatalf("lookPath command = %q, want %q", got, want)
+				}
+				return `C:\Provider Bin\provider-cli.exe`, nil
+			},
+		)
+		if err != nil {
+			t.Fatalf("NativeCLIStatusForCommand() error = %v", err)
+		}
+		descriptor := DescribeProviderLogin(provider, nativeCLI, Classification{
+			State:  ProviderAuthStateNeedsLogin,
+			Action: ProviderFailureActionLogin,
+		})
+		if !descriptor.Configured || descriptor.Source != providerauth.NativeCLISourceAuthLogin {
+			t.Fatalf("DescribeProviderLogin() = %#v, want configured auth_login source", descriptor)
+		}
+		if got, want := descriptor.Executable, "provider-cli"; got != want {
+			t.Fatalf("Executable = %q, want %q", got, want)
+		}
+		if got, want := descriptor.Presence, ProviderLoginPresencePresent; got != want {
+			t.Fatalf("Presence = %q, want %q", got, want)
+		}
+		if got, want := descriptor.RecommendedAction, ProviderFailureActionLogin; got != want {
+			t.Fatalf("RecommendedAction = %q, want %q", got, want)
+		}
+		encoded, err := json.Marshal(descriptor)
+		if err != nil {
+			t.Fatalf("json.Marshal(descriptor) error = %v", err)
+		}
+		for _, forbidden := range []string{
+			"QA_LOGIN_TOKEN",
+			"raw-env-secret",
+			"raw-login-secret",
+			"/opt/provider",
+			`C:\Provider Bin`,
+			" login ",
+		} {
+			if strings.Contains(string(encoded), forbidden) {
+				t.Fatalf("descriptor leaked %q: %s", forbidden, encoded)
+			}
+		}
+	})
+}
+
+func TestClassifyDeclaredOpenCodeLaunchIdentity(t *testing.T) {
+	t.Parallel()
+
+	writeExecutableFixture := func(t *testing.T, name string, executable bool) string {
+		t.Helper()
+		dir := t.TempDir()
+		writeExecutableFixtureIn(t, dir, name, executable)
+		return dir
+	}
+
+	t.Run("Should keep npm-only OpenCode readiness unknown instead of missing", func(t *testing.T) {
+		t.Parallel()
+
+		dir := writeExecutableFixture(t, "npx", true)
+		provider := compozyconfig.BuiltinProviders()["opencode"]
+		env := &ProbeEnv{ProviderName: "opencode", CommandEnv: []string{"PATH=" + dir}}
+		status, err := NativeCLIStatus(testutil.Context(t), provider, env)
+		if err != nil {
+			t.Fatalf("NativeCLIStatus() error = %v", err)
+		}
+		if status.Source != providerauth.NativeCLISourceCommand {
+			t.Fatalf("Source = %q, want %q", status.Source, providerauth.NativeCLISourceCommand)
+		}
+		if !status.Present {
+			t.Fatalf("NativeCLIStatus() = %#v, want npm runner presence", status)
+		}
+		classification, err := ClassifyDeclared(testutil.Context(t), provider, env)
+		if err != nil {
+			t.Fatalf("ClassifyDeclared() error = %v", err)
+		}
+		if classification.State != ProviderAuthStateUnknown {
+			t.Fatalf("State = %q, want unknown (not missing CLI)", classification.State)
+		}
+	})
+
+	t.Run("Should keep a non-runnable OpenCode candidate unknown instead of missing", func(t *testing.T) {
+		t.Parallel()
+
+		dir := writeExecutableFixture(t, "opencode", false)
+		writeExecutableFixtureIn(t, dir, "npx", true)
+		provider := compozyconfig.BuiltinProviders()["opencode"]
+		env := &ProbeEnv{ProviderName: "opencode", CommandEnv: []string{"PATH=" + dir}}
+		status, err := NativeCLIStatus(testutil.Context(t), provider, env)
+		if err != nil {
+			t.Fatalf("NativeCLIStatus() error = %v, want retained unknown status", err)
+		}
+		if status.Present || strings.TrimSpace(status.Error) == "" {
+			t.Fatalf("NativeCLIStatus() = %#v, want retained resolution error", status)
+		}
+		classification, err := ClassifyDeclared(testutil.Context(t), provider, env)
+		if err != nil {
+			t.Fatalf("ClassifyDeclared() error = %v", err)
+		}
+		if classification.State != ProviderAuthStateUnknown {
+			t.Fatalf("State = %q, want unknown (not missing CLI)", classification.State)
+		}
+	})
+	t.Run("Should not project the npm launch fallback as login presence", func(t *testing.T) {
+		t.Parallel()
+
+		dir := writeExecutableFixture(t, "npx", true)
+		provider := compozyconfig.BuiltinProviders()["opencode"]
+		env := &ProbeEnv{ProviderName: "opencode", CommandEnv: []string{"PATH=" + dir}}
+		status, err := NativeCLIStatus(testutil.Context(t), provider, env)
+		if err != nil {
+			t.Fatalf("NativeCLIStatus() error = %v", err)
+		}
+		descriptor := DescribeProviderLogin(provider, status, Classification{State: ProviderAuthStateUnknown})
+		if got, want := descriptor.Presence, ProviderLoginPresenceUnknown; got != want {
+			t.Fatalf("Presence = %q, want %q for the npm runner", got, want)
+		}
+		if got, want := descriptor.Executable, "opencode"; got != want {
+			t.Fatalf("Executable = %q, want %q", got, want)
+		}
+	})
+}
+
+func writeExecutableFixtureIn(t *testing.T, dir string, name string, executable bool) string {
+	t.Helper()
+	if runtime.GOOS == "windows" && !strings.HasSuffix(name, ".exe") {
+		name += ".exe"
+	}
+	perm := os.FileMode(0o755)
+	if !executable {
+		perm = os.FileMode(0o644)
+	}
+	path := filepath.Join(dir, name)
+	if err := os.WriteFile(path, []byte("#!/bin/sh\nexit 0\n"), perm); err != nil {
+		t.Fatalf("WriteFile() error = %v", err)
+	}
+	return path
+}
+
+func nativeProvider() compozyconfig.ProviderConfig {
+	return compozyconfig.ProviderConfig{
+		Command:       "provider-cli acp",
+		AuthMode:      compozyconfig.ProviderAuthModeNativeCLI,
+		AuthStatusCmd: "provider-cli auth status",
+		AuthLoginCmd:  "provider-cli login",
+	}
+}
+
+func presentEnv() *ProbeEnv {
+	return &ProbeEnv{
+		ProviderName: "test",
+		LookPath: func(name string) (string, error) {
+			return "/bin/" + name, nil
+		},
+	}
+}

@@ -1,0 +1,464 @@
+package session
+
+import (
+	"context"
+	"errors"
+	"fmt"
+
+	"github.com/compozy/compozy/internal/store"
+	"github.com/compozy/compozy/internal/transcript"
+)
+
+func (m *Manager) submitAdmittedSteerCommand(
+	ctx context.Context,
+	session *Session,
+	req promptRequest,
+) (SendPromptResult, error) {
+	workspaceID, err := sessionPromptWorkspaceID(session)
+	if err != nil {
+		return SendPromptResult{}, err
+	}
+	admissionReq, err := m.newPromptAdmissionRequest(
+		workspaceID,
+		req,
+		store.SessionPromptOperationSteer,
+		BusyInputModeSteer,
+	)
+	if err != nil {
+		return SendPromptResult{}, err
+	}
+	unlock := m.lockPromptAdmission(workspaceID, session.ID, admissionReq.IdempotencyKey)
+	defer unlock()
+	replayed, found, err := m.replayPromptAdmission(ctx, admissionReq)
+	if err != nil {
+		return SendPromptResult{}, err
+	}
+	if replayed != nil {
+		return *replayed, nil
+	}
+	if !found {
+		if err := m.canonicalizeAdmissionPromptAttachments(
+			ctx,
+			workspaceID,
+			session.ID,
+			&req,
+			&admissionReq,
+		); err != nil {
+			return SendPromptResult{}, err
+		}
+	}
+	if !session.IsPrompting() {
+		return SendPromptResult{}, fmt.Errorf("%w: %s", ErrPromptNotInProgress, session.ID)
+	}
+	return m.stageAdmittedSteerPrompt(ctx, session, req, admissionReq)
+}
+
+func (m *Manager) submitAdmittedGoalByTarget(
+	ctx context.Context,
+	preparation sendPromptPreparation,
+	opts SendPromptOpts,
+) (SendPromptResult, error) {
+	target, err := m.resolvePromptAdmissionTarget(ctx, preparation.request.target, preparation.request.runtime)
+	if err != nil {
+		return SendPromptResult{}, err
+	}
+	preparation.request.runtime = target.runtime
+	admissionReq, err := m.newPromptAdmissionRequest(
+		target.workspaceID,
+		preparation.request,
+		store.SessionPromptOperationPrompt,
+		preparation.mode,
+	)
+	if err != nil {
+		return SendPromptResult{}, err
+	}
+	unlock := m.lockPromptAdmission(target.workspaceID, preparation.request.target, admissionReq.IdempotencyKey)
+	defer unlock()
+	replayed, found, err := m.replayPromptAdmission(ctx, admissionReq)
+	if err != nil {
+		return SendPromptResult{}, err
+	}
+	if replayed != nil {
+		return *replayed, nil
+	}
+	if !found {
+		if err := m.canonicalizeAdmissionPromptAttachments(
+			ctx,
+			target.workspaceID,
+			preparation.request.target,
+			&preparation.request,
+			&admissionReq,
+		); err != nil {
+			return SendPromptResult{}, err
+		}
+	}
+	if err := m.validateRuntimeModelAtAdmission(ctx, target.session, *target.runtime, &target.meta); err != nil {
+		return SendPromptResult{}, err
+	}
+	return m.submitAdmittedGoalPrompt(ctx, target.session, preparation, opts, admissionReq)
+}
+
+func (m *Manager) submitAdmittedPromptByTarget(
+	ctx context.Context,
+	preparation sendPromptPreparation,
+) (SendPromptResult, error) {
+	target, err := m.resolvePromptAdmissionTarget(ctx, preparation.request.target, preparation.request.runtime)
+	if err != nil {
+		return SendPromptResult{}, err
+	}
+	preparation.request.runtime = target.runtime
+	parked, err := m.agentMessageToLater(ctx, &target, &preparation.request)
+	if err != nil {
+		return SendPromptResult{}, err
+	}
+	admissionReq, err := m.newPromptAdmissionRequest(
+		target.workspaceID,
+		preparation.request,
+		store.SessionPromptOperationPrompt,
+		preparation.mode,
+	)
+	if err != nil {
+		return SendPromptResult{}, err
+	}
+	queuedInstance, err := m.queueInstancePrompt(ctx, preparation.request)
+	if err != nil {
+		return SendPromptResult{}, err
+	}
+	if parked || queuedInstance {
+		// The fingerprint keeps the requested mode so a retry matches across a
+		// park or a return; only delivery becomes a queued input.
+		admissionReq.Mode = string(BusyInputModeQueue)
+	}
+	admissionReq.DirectDispatch = !parked && !queuedInstance && (target.session == nil || !target.session.IsPrompting())
+	unlock := m.lockPromptAdmission(target.workspaceID, preparation.request.target, admissionReq.IdempotencyKey)
+	defer unlock()
+	replayed, found, err := m.replayPromptAdmission(ctx, admissionReq)
+	if err != nil {
+		return SendPromptResult{}, err
+	}
+	if replayed != nil {
+		replayed.TargetInLater = parked && replayed.Status == store.SessionPromptResultStatusQueued
+		return *replayed, nil
+	}
+	if err := m.checkPromptAdmissionSuperseded(ctx, preparation.request.target); err != nil {
+		return SendPromptResult{}, err
+	}
+
+	if !found {
+		if err := m.canonicalizeAdmissionPromptAttachments(
+			ctx,
+			target.workspaceID,
+			preparation.request.target,
+			&preparation.request,
+			&admissionReq,
+		); err != nil {
+			return SendPromptResult{}, err
+		}
+	}
+	if err := m.validateRuntimeModelAtAdmission(ctx, target.session, *target.runtime, &target.meta); err != nil {
+		return SendPromptResult{}, err
+	}
+	if parked {
+		return m.enqueueAdmittedOfflinePrompt(
+			ctx,
+			preparation.request.target,
+			admissionReq,
+			true,
+			preparation.request.supersede,
+		)
+	}
+	return m.dispatchAdmittedPrompt(ctx, &target, preparation, admissionReq, queuedInstance)
+}
+
+func (m *Manager) dispatchAdmittedPrompt(
+	ctx context.Context,
+	target *promptAdmissionTarget,
+	preparation sendPromptPreparation,
+	admissionReq store.SessionPromptAdmissionRequest,
+	queuedInstance bool,
+) (SendPromptResult, error) {
+	if queuedInstance && target.session == nil {
+		return m.enqueueAdmittedOfflinePrompt(
+			ctx,
+			preparation.request.target,
+			admissionReq,
+			false,
+			preparation.request.supersede,
+		)
+	}
+	var err error
+	session := target.session
+	if session == nil {
+		session, err = m.lookupPromptRequestSession(ctx, preparation.request)
+		if err != nil {
+			return SendPromptResult{}, err
+		}
+	}
+
+	session.worktreeBindingAdmissionMu.RLock()
+	defer session.worktreeBindingAdmissionMu.RUnlock()
+	if preparation.request.expectedTurnID != "" {
+		if _, err := requireExpectedActiveTurn(session, preparation.request.expectedTurnID); err != nil {
+			return SendPromptResult{}, err
+		}
+	}
+
+	if queuedInstance {
+		return m.enqueueAdmittedBusyPrompt(ctx, session, preparation.request.supersede, admissionReq)
+	}
+	if session.IsPrompting() {
+		return m.submitAdmittedBusyPrompt(ctx, session, preparation.request, preparation.mode, admissionReq)
+	}
+	return m.submitAdmittedDirectPrompt(ctx, session, preparation.request, preparation.mode, admissionReq)
+}
+
+func (m *Manager) replayPromptAdmission(
+	ctx context.Context,
+	req store.SessionPromptAdmissionRequest,
+) (*SendPromptResult, bool, error) {
+	admission, found, err := m.promptAdmissionStore.ReplaySessionPromptAdmission(ctx, req)
+	if err != nil || !found || admission.State != store.SessionPromptAdmissionCompleted {
+		return nil, found, err
+	}
+	result, err := sendPromptResultFromAdmission(admission)
+	if err != nil {
+		return nil, true, err
+	}
+	result.Replayed = true
+	return &result, true, nil
+}
+
+func (m *Manager) submitAdmittedDirectPrompt(
+	ctx context.Context,
+	session *Session,
+	req promptRequest,
+	mode BusyInputMode,
+	admissionReq store.SessionPromptAdmissionRequest,
+) (resultOut SendPromptResult, sendErr error) {
+	admission, replayed, err := m.claimPromptAdmission(ctx, admissionReq)
+	if err != nil {
+		return SendPromptResult{}, err
+	}
+	if replayed != nil {
+		return *replayed, nil
+	}
+	committed := false
+	defer func() {
+		if sendErr != nil && !committed {
+			sendErr = errors.Join(sendErr, m.releaseUndispatchedReports(ctx, admission))
+		}
+		m.replyWatchSendResult(ctx, admission, sendErr)
+	}()
+	req, err = bindPromptAdmissionRequest(req, admission)
+	if err != nil {
+		return SendPromptResult{}, err
+	}
+	req.commitDispatch = func(dispatchCtx context.Context) error {
+		if err := m.commitPromptAdmissionDispatch(dispatchCtx, admission); err != nil {
+			return err
+		}
+		committed = true
+		return nil
+	}
+	events, err := m.submitPromptRequest(ctx, req)
+	if err != nil {
+		if errors.Is(err, ErrPromptInProgress) && !committed {
+			if req.meta.Synthetic != nil && req.meta.Synthetic.Kind == restartContinuationKind {
+				return SendPromptResult{}, err
+			}
+			return m.submitAdmittedBusyPrompt(ctx, session, req, mode, admissionReq)
+		}
+		if committed {
+			return SendPromptResult{}, m.promptDispatchIndeterminate(ctx, admission, err)
+		}
+		return SendPromptResult{}, err
+	}
+	result := SendPromptResult{
+		Status: store.SessionPromptResultStatusAccepted,
+		Mode:   mode, Delivery: store.SessionInputDeliveryDirect, Events: events,
+		MessageID: admission.MessageID, IdempotencyKey: admission.IdempotencyKey,
+		NewTurnID: admission.TurnID,
+	}
+	return m.completePromptAdmission(ctx, admission, result)
+}
+
+func (m *Manager) submitAdmittedBusyPrompt(
+	ctx context.Context,
+	session *Session,
+	req promptRequest,
+	mode BusyInputMode,
+	admissionReq store.SessionPromptAdmissionRequest,
+) (SendPromptResult, error) {
+	switch mode {
+	case BusyInputModeQueue:
+		return m.enqueueAdmittedBusyPrompt(ctx, session, req.supersede, admissionReq)
+	case BusyInputModeSteer:
+		result, err := m.stageAdmittedSteerPrompt(ctx, session, req, admissionReq)
+		// The completed turn can disappear between the busy snapshot and staging.
+		// No admission was claimed by this failure; ordinary unfenced sends are now direct.
+		if errors.Is(err, ErrPromptNotInProgress) && req.expectedTurnID == "" &&
+			admissionReq.Operation == store.SessionPromptOperationPrompt && !session.IsPrompting() {
+			return m.submitAdmittedDirectPrompt(ctx, session, req, mode, admissionReq)
+		}
+		return result, err
+	case BusyInputModeInterrupt:
+		return m.interruptAdmittedPrompt(ctx, session, req, admissionReq)
+	default:
+		return SendPromptResult{}, fmt.Errorf("session: invalid busy input mode %q", mode)
+	}
+}
+
+func (m *Manager) enqueueAdmittedBusyPrompt(
+	ctx context.Context,
+	session *Session,
+	supersede bool,
+	admissionReq store.SessionPromptAdmissionRequest,
+) (SendPromptResult, error) {
+	if m.inputQueue == nil {
+		return SendPromptResult{}, ErrPromptInProgress
+	}
+	generation, err := m.currentInputGeneration(ctx, session.ID)
+	if err != nil {
+		return SendPromptResult{}, err
+	}
+	admission, entry, position, created, err := m.inputQueue.EnqueueAdmitted(
+		ctx, admissionReq, generation, session.CurrentTurnID(), supersede,
+	)
+	if err != nil {
+		if errors.Is(err, store.ErrSessionInputQueueFull) {
+			m.emitTranscriptMarker(
+				ctx, session, session.CurrentTurnID(), transcript.MarkerPromptDropped,
+				"Queued input rejected because the session input queue is full.",
+				map[string]any{promptEvidenceQueueGenerationKey: generation, "queue_cap": m.busyInput.QueueCap},
+			)
+		}
+		return SendPromptResult{}, err
+	}
+	if created {
+		m.settleSupersededQueuedInputs(ctx, session, &entry)
+		m.emitTranscriptMarker(
+			ctx, session, session.CurrentTurnID(), transcript.MarkerPromptQueued,
+			"Input queued while the session is busy.",
+			queueEntryEvidence(entry.ID, entry.SessionGeneration, entry.Status, entry.Mode, position),
+		)
+	}
+	result, err := sendPromptResultFromAdmission(admission)
+	if err != nil {
+		return SendPromptResult{}, err
+	}
+	// Pair the durable enqueue with the turn-end selector kick. Whichever side
+	// observes the session idle after the enqueue owns dispatch.
+	m.startNextQueuedInputPrompt(session.ID)
+	if created && entry.OriginClass == store.SessionInputOriginClassAgent {
+		m.schedulePromoteLongTurnQueuedInputs(session)
+	}
+	result.Replayed = !created
+	m.replyWatchSendResult(ctx, admission, nil)
+	return result, nil
+}
+
+func (m *Manager) stageAdmittedSteerPrompt(
+	ctx context.Context,
+	session *Session,
+	req promptRequest,
+	admissionReq store.SessionPromptAdmissionRequest,
+) (SendPromptResult, error) {
+	if m.inputQueue == nil {
+		return SendPromptResult{}, ErrPromptInProgress
+	}
+	targetTurnID, err := requireExpectedActiveTurn(session, req.expectedTurnID)
+	if err != nil {
+		return SendPromptResult{}, err
+	}
+	if err := validatePromptAttachmentCaps(req.attachments, session.processHandle().CapsSnapshot()); err != nil {
+		return SendPromptResult{}, err
+	}
+	generation, err := m.currentInputGeneration(ctx, session.ID)
+	if err != nil {
+		return SendPromptResult{}, err
+	}
+	admission, entry, created, err := m.inputQueue.StageAdmittedSteer(
+		ctx,
+		admissionReq,
+		targetTurnID,
+		generation,
+		req.supersede,
+	)
+	if err != nil {
+		return SendPromptResult{}, err
+	}
+	if err := m.activateSteeringInput(ctx, session, &entry); err != nil {
+		activationErr := m.cleanupInterruptingInputActivationFailure(ctx, &entry, err)
+		indeterminate := m.promptDispatchIndeterminate(ctx, admission, activationErr)
+		m.replyWatchSendResult(ctx, admission, indeterminate)
+		return SendPromptResult{}, indeterminate
+	}
+	result, err := sendPromptResultFromAdmission(admission)
+	if err != nil {
+		return SendPromptResult{}, err
+	}
+	result.SteerDelivery = entry.SteerDelivery
+	result.Delivery = entry.Delivery
+	result.PreviousTurnID = entry.TargetTurnID
+	result.Replayed = !created
+	m.replyWatchSendResult(ctx, admission, nil)
+	return result, nil
+}
+
+func (m *Manager) interruptAdmittedPrompt(
+	ctx context.Context,
+	session *Session,
+	req promptRequest,
+	admissionReq store.SessionPromptAdmissionRequest,
+) (SendPromptResult, error) {
+	if m.inputQueue == nil {
+		return SendPromptResult{}, ErrPromptInProgress
+	}
+	previousTurnID, err := requireExpectedActiveTurn(session, req.expectedTurnID)
+	if err != nil {
+		return SendPromptResult{}, err
+	}
+	admission, entry, created, err := m.inputQueue.EnqueueAdmittedInterrupt(
+		ctx,
+		admissionReq,
+		previousTurnID,
+	)
+	if err != nil {
+		return SendPromptResult{}, err
+	}
+	if err := m.ensureInterruptingInputActivated(ctx, session, &entry); err != nil {
+		activationErr := m.cleanupInterruptingInputActivationFailure(ctx, &entry, err)
+		indeterminate := m.promptDispatchIndeterminate(ctx, admission, activationErr)
+		m.replyWatchSendResult(ctx, admission, indeterminate)
+		return SendPromptResult{}, indeterminate
+	}
+	if created {
+		m.emitTranscriptMarker(
+			ctx,
+			session,
+			previousTurnID,
+			transcript.MarkerPromptInterrupted,
+			"Replacement input accepted and the active turn was interrupted.",
+			map[string]any{
+				promptEvidenceQueueGenerationKey: entry.SessionGeneration,
+				promptEvidenceQueueEntryIDKey:    entry.ID,
+			},
+		)
+	}
+	result, err := sendPromptResultFromAdmission(admission)
+	if err != nil {
+		return SendPromptResult{}, err
+	}
+	result.Replayed = !created
+	m.replyWatchSendResult(ctx, admission, nil)
+	return result, nil
+}
+
+func (m *Manager) checkPromptAdmissionSuperseded(ctx context.Context, sessionID string) error {
+	if reader, ok := m.promptAdmissionStore.(interface {
+		CheckSessionSuperseded(context.Context, string) error
+	}); ok {
+		return reader.CheckSessionSuperseded(ctx, sessionID)
+	}
+	return nil
+}

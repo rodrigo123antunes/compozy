@@ -1,0 +1,1097 @@
+package loop
+
+import (
+	"context"
+	"encoding/json"
+	"io"
+	"log/slog"
+	"strings"
+	"testing"
+	"time"
+
+	"github.com/compozy/compozy/internal/loop/dsl"
+	"github.com/compozy/compozy/internal/task"
+	"github.com/compozy/compozy/internal/tools"
+)
+
+func TestCoordinatorRunnerShouldApplyNodeFailurePrecedence(t *testing.T) {
+	t.Parallel()
+
+	t.Run("Should record failed Goal attempt evidence", func(t *testing.T) {
+		t.Parallel()
+
+		now := time.Date(2026, time.August, 26, 15, 0, 0, 0, time.UTC)
+		plan := runLifecycleFailurePlan(
+			t,
+			"goal-attempt-evidence",
+			now,
+			lifecycleDefinition(lifecycleGoalNode("work")),
+		)
+		payload := coordinatorSnapshotPayloadForTest(t, plan)
+		if len(payload.Attempts) != 1 {
+			t.Fatalf("Goal attempt intents = %#v, want one durable attempt", payload.Attempts)
+		}
+		attempt := payload.Attempts[0]
+		if attempt.NodeID != "work" || attempt.Attempt != 1 || attempt.Disposition != AttemptEscalated ||
+			attempt.FailureClass == nil {
+			t.Fatalf("Goal attempt = %#v, want classified escalated failure evidence", attempt)
+		}
+	})
+
+	t.Run("Should apply only the first matching autopause rule with durable provenance", func(t *testing.T) {
+		t.Parallel()
+
+		now := time.Date(2026, time.August, 2, 18, 30, 0, 0, time.UTC)
+		firstRule := "node_id == 'work' && class == 'transport' && attempt == 1"
+		secondRule := "class == 'transport'"
+		lifecycle := DefaultLifecycleConfig()
+		lifecycle.Autopause = []LifecycleAutopauseRule{
+			{Match: firstRule, Action: "pause"},
+			{Match: secondRule, Action: "pause"},
+		}
+		plan := runLifecycleFailurePlanWithConfig(
+			t,
+			"autopause",
+			now,
+			lifecycleDefinition(lifecycleNode("work")),
+			lifecycle,
+		)
+		payload := coordinatorSnapshotPayloadForTest(t, plan)
+
+		if got, want := len(payload.Controls), 1; got != want {
+			t.Fatalf("control mutations = %d, want %d", got, want)
+		}
+		control := payload.Controls[0]
+		wantRuleID := autopauseRuleID(0, firstRule)
+		if control.Kind != NodeControlMutationPause || control.NodeID != "work" ||
+			control.PauseActorKind != autopauseActorKind || control.PauseActorID != autopauseActorID ||
+			control.PauseRuleID != wantRuleID || !strings.Contains(control.PauseReason, "transport failure") {
+			t.Fatalf("autopause control = %#v, want first-rule provenance", control)
+		}
+		if got, want := len(payload.Events), 1; got != want {
+			t.Fatalf("lifecycle events = %d, want %d", got, want)
+		}
+		event := payload.Events[0]
+		if event.Kind != GenerationLifecycleEventNodePaused || event.RuleID != wantRuleID ||
+			event.ActorKind != autopauseActorKind || event.ActorID != autopauseActorID || event.Attempt != 1 {
+			t.Fatalf("autopause event = %#v, want matching rule provenance", event)
+		}
+		output := payload.Outputs[0]
+		if output.Status != generationOutputPaused || output.Attempt != 2 || output.Epoch != 1 ||
+			!plan.GenerationInFlight || !plan.Yield || len(plan.NodeRuns) != 0 {
+			t.Fatalf("autopause output = %#v plan = %#v", output, plan)
+		}
+	})
+
+	t.Run("Should not refire autopause while the node remains paused", func(t *testing.T) {
+		t.Parallel()
+
+		now := time.Date(2026, time.August, 2, 18, 45, 0, 0, time.UTC)
+		lifecycle := DefaultLifecycleConfig()
+		lifecycle.Autopause = []LifecycleAutopauseRule{{Match: "class == 'transport'", Action: "pause"}}
+		control := NodeControl{
+			LoopRunID: "looprun-lifecycle-autopause-held", NodeID: "work", Paused: true,
+			PauseProvenance: &ControlProvenance{
+				ActorKind: autopauseActorKind, ActorID: autopauseActorID,
+				RuleID: autopauseRuleID(0, lifecycle.Autopause[0].Match), RequestedAt: now.Add(-time.Minute),
+			},
+			Revision: 1,
+		}
+		plan := runLifecycleFailurePlanWithConfigAndControls(
+			t,
+			"autopause-held",
+			now,
+			lifecycleDefinition(lifecycleNode("work")),
+			lifecycle,
+			[]NodeControl{control},
+		)
+		payload := coordinatorSnapshotPayloadForTest(t, plan)
+
+		if len(payload.Controls) != 0 {
+			t.Fatalf("control mutations = %#v, want no repeated autopause", payload.Controls)
+		}
+		for _, event := range payload.Events {
+			if event.Kind == GenerationLifecycleEventNodePaused {
+				t.Fatalf("events = %#v, want no repeated node_paused event", payload.Events)
+			}
+		}
+	})
+
+	t.Run("Should evaluate autopause against the resolved target identity", func(t *testing.T) {
+		t.Parallel()
+
+		lifecycle := DefaultLifecycleConfig()
+		lifecycle.Autopause = []LifecycleAutopauseRule{{
+			Match:  "family == 'run-agent' && target == 'rendered-agent'",
+			Action: "pause",
+		}}
+		decision, err := evaluateAutopause(
+			dsl.Node{ID: "agent", Class: dsl.NodeClassAction, Kind: string(dsl.ActionRunAgent)},
+			ClassifiedFailure{Class: FailureTransport, Target: "rendered-agent"},
+			1,
+			EffectiveConfig{Lifecycle: lifecycle},
+		)
+		if err != nil {
+			t.Fatalf("evaluateAutopause() error = %v", err)
+		}
+		if !decision.matched {
+			t.Fatalf("evaluateAutopause() = %#v, want resolved run-agent target match", decision)
+		}
+	})
+
+	t.Run("Should schedule and release a durable retry", func(t *testing.T) {
+		t.Parallel()
+
+		now := time.Date(2026, time.August, 2, 19, 0, 0, 0, time.UTC)
+		loopRun := controlLoopRun("looprun-lifecycle-retry", nil)
+		coordinatorRun := controlCoordinatorRun(loopRun, 1)
+		workerRun := lifecycleWorkerRun(loopRun, "work", task.TaskRunStatusFailed, now)
+		failureRef := lifecycleFailureRef(t, string(toolsUnavailableCodeForTest), "provider unavailable")
+		firstScheduledAt := now.Add(-time.Second)
+		outputs := &lifecycleCoordinatorStore{
+			outputs: map[int][]GenerationOutput{1: {{
+				Generation:       1,
+				NodeID:           "work",
+				Status:           generationOutputFailed,
+				OutputRef:        failureRef,
+				TaskRunID:        workerRun.ID,
+				Attempt:          1,
+				FirstScheduledAt: &firstScheduledAt,
+				Epoch:            3,
+			}},
+			}}
+		runner := newCoordinatorRunnerForTestWithDefinition(
+			t,
+			loopRun,
+			coordinatorRun,
+			map[string]task.Run{coordinatorRun.ID: coordinatorRun, workerRun.ID: workerRun},
+			outputs,
+			lifecycleDefinition(lifecycleNode("work")),
+			WithCoordinatorNodeAttemptReader(outputs),
+			WithCoordinatorRetryRand(func() float64 { return 0 }),
+		)
+		runner.now = func() time.Time { return now }
+
+		plan, err := runner.Run(t.Context(), task.RunID(coordinatorRun.ID))
+		if err != nil {
+			t.Fatalf("Run() error = %v", err)
+		}
+		payload := coordinatorSnapshotPayloadForTest(t, plan)
+		if got, want := len(payload.Attempts), 1; got != want {
+			t.Fatalf("attempt intents = %d, want %d", got, want)
+		}
+		attempt := payload.Attempts[0]
+		if attempt.Disposition != AttemptRetried || attempt.FailureClass == nil ||
+			*attempt.FailureClass != FailureTransport || attempt.NextAttemptAt == nil {
+			t.Fatalf("retry attempt = %#v, want classified retried disposition", attempt)
+		}
+		output := payload.Outputs[0]
+		if output.Status != generationOutputRetrying || output.NextAttemptAt == nil || output.Epoch != 4 {
+			t.Fatalf("retry output = %#v, want retrying epoch 4", output)
+		}
+		if !plan.GenerationInFlight || !plan.Yield || len(plan.NodeRuns) != 0 {
+			t.Fatalf("retry plan = %#v, want yielded in-flight generation", plan)
+		}
+		if len(plan.PostCommitTimers) != 1 || plan.PostCommitTimers[0].IssuedEpoch != 4 ||
+			plan.PostCommitTimers[0].IdempotencyKey != RetryWakeIdempotencyKey(RetryDueCell{
+				LoopRunID: loopRun.ID, Generation: 1, NodeID: "work", Attempt: 1,
+				Epoch: 4, NextAttemptAt: *output.NextAttemptAt,
+			}) {
+			t.Fatalf("retry timers = %#v, want shared epoch-fenced identity", plan.PostCommitTimers)
+		}
+		if len(payload.Events) != 1 || payload.Events[0].Kind != GenerationLifecycleEventNodeRetryScheduled ||
+			payload.Events[0].Attempt != 2 || payload.Events[0].IssuedEpoch != 4 {
+			t.Fatalf("retry events = %#v, want node_retry_scheduled", payload.Events)
+		}
+
+		dueOutput := output
+		dueOutput.ExpectedEpoch = nil
+		outputs.outputs[1] = []GenerationOutput{dueOutput}
+		outputs.attempts = []NodeAttempt{attempt}
+		dueCoordinatorRun := coordinatorRun
+		dueCoordinatorRun.ID += "-due"
+		dueRunner := newCoordinatorRunnerForTestWithDefinition(
+			t,
+			loopRun,
+			dueCoordinatorRun,
+			map[string]task.Run{dueCoordinatorRun.ID: dueCoordinatorRun, workerRun.ID: workerRun},
+			outputs,
+			lifecycleDefinition(lifecycleNode("work")),
+			WithCoordinatorNodeAttemptReader(outputs),
+		)
+		dueRunner.now = func() time.Time { return output.NextAttemptAt.Add(time.Millisecond) }
+
+		duePlan, err := dueRunner.Run(t.Context(), task.RunID(dueCoordinatorRun.ID))
+		if err != nil {
+			t.Fatalf("Run(due) error = %v", err)
+		}
+		if got, want := len(duePlan.NodeRuns), 1; got != want {
+			t.Fatalf("due node runs = %d, want %d", got, want)
+		}
+		wantRetryRunID := NodeCellAttemptRunID(loopRun.ID, 1, "work", 0, 2)
+		if got, want := duePlan.NodeRuns[0].RunID, wantRetryRunID; got != want {
+			t.Fatalf("retry run id = %q, want %q", got, want)
+		}
+		var metadata coordinatorActionRunMetadata
+		if err := json.Unmarshal(duePlan.NodeRuns[0].Metadata, &metadata); err != nil {
+			t.Fatalf("decode retry metadata: %v", err)
+		}
+		if metadata.Attempt != 2 || metadata.Epoch != 4 {
+			t.Fatalf("retry metadata = %#v, want attempt 2 epoch 4", metadata)
+		}
+	})
+
+	t.Run("Should route failure and skip the success path", func(t *testing.T) {
+		t.Parallel()
+
+		now := time.Date(2026, time.August, 2, 20, 0, 0, 0, time.UTC)
+		node := lifecycleNode("work")
+		node.Retry = &dsl.RetrySpec{MaxAttempts: 0}
+		node.NodeLifecycleState = &dsl.NodeLifecycleState{
+			OnError: &dsl.ErrorPolicy{Route: "fallback"},
+		}
+		def := lifecycleDefinition(
+			node,
+			lifecycleNode("fallback"),
+			lifecycleNode("success"),
+		)
+		def.Graph.Edges = []dsl.Edge{{From: "work", To: "fallback"}, {From: "work", To: "success"}}
+		plan := runLifecycleFailurePlan(t, "route", now, def)
+		payload := coordinatorSnapshotPayloadForTest(t, plan)
+		outputs := outputsByNodeAndItemForTest(payload.Outputs)
+		if got := outputs["work/0"]; got.Status != generationOutputSucceeded ||
+			got.OutputRef != errorRoutedOutputRefPrefix+"fallback" {
+			t.Fatalf("routed source = %#v", got)
+		}
+		if got := outputs["success/0"]; got.OutputRef != branchSkippedOutputRef {
+			t.Fatalf("success path = %#v, want skipped", got)
+		}
+		if got, want := len(plan.NodeRuns), 1; got != want || plan.NodeRuns[0].TaskID !=
+			coordinatorNodeTaskID("looprun-lifecycle-route", 1, "fallback", 0) {
+			t.Fatalf("route node runs = %#v, want fallback only", plan.NodeRuns)
+		}
+		if payload.Attempts[0].Disposition != AttemptRouted {
+			t.Fatalf("route attempt = %#v, want routed", payload.Attempts[0])
+		}
+
+		preterminalPlan := runLifecyclePayloadFailurePlan(t, now, def)
+		preterminalPayload := coordinatorSnapshotPayloadForTest(t, preterminalPlan)
+		preterminalOutputs := outputsByNodeAndItemForTest(preterminalPayload.Outputs)
+		if got := preterminalOutputs["work/0"]; got.Status != generationOutputSucceeded ||
+			got.OutputRef != errorRoutedOutputRefPrefix+"fallback" {
+			t.Fatalf("preterminal routed source = %#v", got)
+		}
+		if got := preterminalOutputs["success/0"]; got.OutputRef != branchSkippedOutputRef {
+			t.Fatalf("preterminal success path = %#v, want skipped", got)
+		}
+		if got, want := len(preterminalPlan.NodeRuns), 1; got != want ||
+			preterminalPlan.NodeRuns[0].TaskID != coordinatorNodeTaskID(
+				"looprun-lifecycle-route-preterminal",
+				1,
+				"fallback",
+				0,
+			) {
+			t.Fatalf("preterminal route node runs = %#v, want fallback only", preterminalPlan.NodeRuns)
+		}
+	})
+
+	t.Run("Should absorb only an explicitly allowed failure", func(t *testing.T) {
+		t.Parallel()
+
+		now := time.Date(2026, time.August, 2, 21, 0, 0, 0, time.UTC)
+		node := lifecycleNode("work")
+		node.Retry = &dsl.RetrySpec{MaxAttempts: 0}
+		node.NodeLifecycleState = &dsl.NodeLifecycleState{
+			OnError: &dsl.ErrorPolicy{AllowFail: true},
+		}
+		def := lifecycleDefinition(node, lifecycleNode("next"))
+		def.Graph.Edges = []dsl.Edge{{From: "work", To: "next"}}
+		plan := runLifecycleFailurePlan(t, "absorb", now, def)
+		payload := coordinatorSnapshotPayloadForTest(t, plan)
+		outputs := outputsByNodeAndItemForTest(payload.Outputs)
+		if got := outputs["work/0"]; got.Status != generationOutputSucceeded ||
+			got.OutputRef != failureAbsorbedOutputRef || outputValue(got.OutputRef) != nil {
+			t.Fatalf("absorbed source = %#v, want successful absent value", got)
+		}
+		if payload.Attempts[0].Disposition != AttemptAbsorbed {
+			t.Fatalf("absorbed attempt = %#v", payload.Attempts[0])
+		}
+		if got, want := len(plan.NodeRuns), 1; got != want {
+			t.Fatalf("node runs = %d, want downstream continuation", got)
+		}
+	})
+
+	t.Run("Should escalate an unhandled failure to generation succession", func(t *testing.T) {
+		t.Parallel()
+
+		now := time.Date(2026, time.August, 2, 22, 0, 0, 0, time.UTC)
+		node := lifecycleNode("work")
+		node.Retry = &dsl.RetrySpec{MaxAttempts: 0}
+		plan := runLifecycleFailurePlan(t, "escalate", now, lifecycleDefinition(node))
+		payload := coordinatorSnapshotPayloadForTest(t, plan)
+		if payload.Attempts[0].Disposition != AttemptEscalated ||
+			payload.Attempts[0].FailureClass == nil {
+			t.Fatalf("escalated attempt = %#v", payload.Attempts[0])
+		}
+		if plan.NextCoordinator == nil || plan.PostReserveSnapshot == nil ||
+			plan.PostReserveSnapshot.Generation != 2 {
+			t.Fatalf("succession plan = %#v, want generation 2", plan)
+		}
+	})
+	t.Run("Should classify a raw output reference with a stable payload-declared code", func(t *testing.T) {
+		t.Parallel()
+
+		failure := classifyGenerationOutputFailure(
+			GenerationOutput{Status: generationOutputFailed, OutputRef: strings.Repeat("raw-reference-", 300)},
+			task.Run{Error: "worker failed"},
+		)
+		if failure.Class != FailurePayloadDeclared || failure.Code != string(FailurePayloadDeclared) ||
+			!strings.Contains(failure.Cause, "raw-reference-") || len(failure.Cause) > actionFailureTextLimit {
+			t.Fatalf("classified raw output = %#v, want bounded payload-declared failure", failure)
+		}
+	})
+
+	t.Run("Should not skip a fan-out collect before all route dependencies are skipped", func(t *testing.T) {
+		t.Parallel()
+
+		graph := dsl.Graph{
+			Nodes: []dsl.Node{
+				{ID: "fan", Class: dsl.NodeClassControl, Kind: string(dsl.ControlFanOut)},
+				{ID: "work", Class: dsl.NodeClassAction, Kind: string(dsl.ActionTransform)},
+				{ID: "independent", Class: dsl.NodeClassAction, Kind: string(dsl.ActionTransform)},
+				{ID: "collect", Class: dsl.NodeClassControl, Kind: string(dsl.ControlCollect)},
+			},
+			Edges: []dsl.Edge{
+				{From: "fan", To: "work"},
+				{From: "work", To: "collect"},
+				{From: "independent", To: "collect"},
+			},
+		}
+		outputs := []GenerationOutput{
+			{NodeID: "fan", Status: generationOutputPending},
+			{NodeID: "work", Status: generationOutputPending},
+			{NodeID: "independent", Status: generationOutputPending},
+			{NodeID: "collect", Status: generationOutputPending},
+		}
+		skipRouteNodes(
+			graph,
+			newControlTopology(graph),
+			GenerationOutput{NodeID: "source"},
+			[]dsl.NodeID{"fan"},
+			&outputs,
+		)
+		byNode := outputsByNodeAndItemForTest(outputs)
+		if byNode["fan/0"].OutputRef != branchSkippedOutputRef ||
+			byNode["work/0"].OutputRef != branchSkippedOutputRef ||
+			byNode["collect/0"].Status != generationOutputPending {
+			t.Fatalf("route outputs = %#v, want collect pending behind live dependency", byNode)
+		}
+	})
+
+	t.Run("Should discard a target probe when terminal task lookup fails", func(t *testing.T) {
+		t.Parallel()
+
+		const taskRunID = "taskrun-terminal-read-failure"
+		firstScheduledAt := time.Now().UTC()
+		runner := &CoordinatorRunner{
+			taskRuns:     &coordinatorRunnerTaskRunReader{runs: map[string]task.Run{}},
+			targetHealth: newRecordingTargetHealth(),
+		}
+		runner.targetProbes.Store(taskRunID, targetProbeObservation{})
+		graph := dsl.Graph{Nodes: []dsl.Node{{
+			ID: "work", Class: dsl.NodeClassAction, Kind: string(dsl.ActionTransform),
+		}}}
+		_, err := runner.applyTerminalNodeLifecycle(
+			t.Context(),
+			Run{ID: "run-terminal-read-failure", WorkspaceID: "ws-1"},
+			1,
+			EffectiveConfig{},
+			graph,
+			newControlTopology(graph),
+			[]GenerationOutput{{
+				Generation: 1, NodeID: "work", Status: generationOutputFailed,
+				TaskRunID: taskRunID, Attempt: 1, FirstScheduledAt: &firstScheduledAt,
+			}},
+			0,
+			nil,
+			GenerationHistory{},
+			nil,
+		)
+		if err == nil {
+			t.Fatal("applyTerminalNodeLifecycle() error = nil, want task lookup failure")
+		}
+		if _, found := runner.takeTargetProbe(taskRunID); found {
+			t.Fatal("terminal task lookup failure retained target probe")
+		}
+	})
+
+	t.Run("Should not require generation history when target health is disabled", func(t *testing.T) {
+		t.Parallel()
+
+		const taskRunID = "taskrun-no-target-health"
+		firstScheduledAt := time.Date(2026, time.August, 3, 20, 30, 0, 0, time.UTC)
+		runner := &CoordinatorRunner{taskRuns: &coordinatorRunnerTaskRunReader{runs: map[string]task.Run{
+			taskRunID: {ID: taskRunID, Status: task.TaskRunStatusCompleted},
+		}}}
+		runner.now = func() time.Time { return firstScheduledAt }
+		graph := dsl.Graph{Nodes: []dsl.Node{{
+			ID: "work", Class: dsl.NodeClassAction, Kind: string(dsl.ActionTransform),
+		}}}
+		result, err := runner.applyTerminalNodeLifecycle(
+			t.Context(),
+			Run{ID: "run-no-target-health", WorkspaceID: "ws-1"},
+			2,
+			EffectiveConfig{},
+			graph,
+			newControlTopology(graph),
+			[]GenerationOutput{{
+				Generation: 2, NodeID: "work", Status: generationOutputSucceeded,
+				TaskRunID: taskRunID, Attempt: 1, FirstScheduledAt: &firstScheduledAt,
+			}},
+			0,
+			nil,
+			GenerationHistory{},
+			nil,
+		)
+		if err != nil {
+			t.Fatalf("applyTerminalNodeLifecycle() error = %v", err)
+		}
+		if !result.handled || result.attempt.Disposition != AttemptSucceeded {
+			t.Fatalf("lifecycle result = %#v, want handled success without history", result)
+		}
+	})
+}
+
+const toolsUnavailableCodeForTest = "tool_unavailable"
+
+type lifecycleCoordinatorStore struct {
+	coordinatorRunnerOutputs
+	attempts []NodeAttempt
+}
+
+func (s *lifecycleCoordinatorStore) ListNodeAttempts(
+	context.Context,
+	WorkspaceID,
+	RunID,
+) ([]NodeAttempt, error) {
+	return append([]NodeAttempt(nil), s.attempts...), nil
+}
+
+func lifecycleNode(id dsl.NodeID) dsl.Node {
+	return dsl.Node{
+		ID:    id,
+		Class: dsl.NodeClassAction,
+		Kind:  string(dsl.ActionTransform),
+		Params: dsl.NodeParams{"map": map[string]any{
+			"value": map[string]any{"value": string(id)},
+		}},
+	}
+}
+
+func lifecycleGoalNode(id dsl.NodeID) dsl.Node {
+	return dsl.Node{
+		ID: id, Class: dsl.NodeClassAction, Kind: string(dsl.ActionGoal),
+		Params: dsl.NodeParams{
+			"agent": "codex", "objective": "Make verification pass", "max_turns": 3,
+			"judge": []any{map[string]any{"id": "verify", "type": "command", "check": "make verify"}},
+			"output_schema": map[string]any{
+				"status": map[string]any{"type": "string", "enum": []any{"complete", "blocked"}},
+			},
+		},
+	}
+}
+
+func lifecycleDefinition(nodes ...dsl.Node) dsl.Definition {
+	return dsl.Definition{Graph: dsl.Graph{Nodes: nodes, Edges: []dsl.Edge{}}}
+}
+
+func lifecycleWorkerRun(loopRun Run, nodeID dsl.NodeID, status task.RunStatus, now time.Time) task.Run {
+	run := controlWorkerRun(loopRun, nodeID, 0, status)
+	run.QueuedAt = now.Add(-2 * time.Second)
+	run.StartedAt = now.Add(-time.Second)
+	run.EndedAt = now
+	run.Error = "provider unavailable"
+	return run
+}
+
+func lifecycleFailureRef(t *testing.T, code string, cause string) string {
+	t.Helper()
+	ref, ok := ActionFailureOutputRef(NewActionFailure(code, cause, "retry later"))
+	if !ok {
+		t.Fatal("ActionFailureOutputRef() = false")
+	}
+	return ref
+}
+
+func runLifecycleFailurePlan(
+	t *testing.T,
+	slug string,
+	now time.Time,
+	def dsl.Definition,
+) task.CoordinatorCompletionPlan {
+	t.Helper()
+	return runLifecycleFailurePlanWithConfigAndControls(t, slug, now, def, LifecycleConfig{}, nil)
+}
+
+func runLifecycleFailurePlanWithConfig(
+	t *testing.T,
+	slug string,
+	now time.Time,
+	def dsl.Definition,
+	lifecycle LifecycleConfig,
+) task.CoordinatorCompletionPlan {
+	t.Helper()
+	return runLifecycleFailurePlanWithConfigAndControls(t, slug, now, def, lifecycle, nil)
+}
+
+func runLifecycleFailurePlanWithConfigAndControls(
+	t *testing.T,
+	slug string,
+	now time.Time,
+	def dsl.Definition,
+	lifecycle LifecycleConfig,
+	controls []NodeControl,
+) task.CoordinatorCompletionPlan {
+	t.Helper()
+	loopRun := controlLoopRun("looprun-lifecycle-"+slug, nil)
+	coordinatorRun := controlCoordinatorRun(loopRun, 1)
+	workerRun := lifecycleWorkerRun(loopRun, "work", task.TaskRunStatusFailed, now)
+	firstScheduledAt := now.Add(-time.Second)
+	outputRows := make([]GenerationOutput, 0, len(def.Graph.Nodes))
+	for _, node := range def.Graph.Nodes {
+		output := GenerationOutput{
+			Generation: 1,
+			NodeID:     string(node.ID),
+			Status:     generationOutputPending,
+			Attempt:    1,
+		}
+		if node.ID == "work" {
+			output.Status = generationOutputFailed
+			output.OutputRef = lifecycleFailureRef(t, string(toolsUnavailableCodeForTest), "provider unavailable")
+			output.TaskRunID = workerRun.ID
+			output.FirstScheduledAt = &firstScheduledAt
+		}
+		outputRows = append(outputRows, output)
+	}
+	outputs := &lifecycleCoordinatorStore{
+		outputs: map[int][]GenerationOutput{1: outputRows}}
+	options := []CoordinatorRunnerOption{WithCoordinatorNodeAttemptReader(outputs)}
+	if controls != nil {
+		options = append(
+			options,
+			WithCoordinatorNodeControlReader(coordinatorNodeControlReaderStub{controls: controls}),
+		)
+	}
+	runner := newCoordinatorRunnerForLifecycleTest(
+		t, loopRun, coordinatorRun, workerRun, outputs, def, lifecycle, options...,
+	)
+	runner.now = func() time.Time { return now }
+	plan, err := runner.Run(t.Context(), task.RunID(coordinatorRun.ID))
+	if err != nil {
+		t.Fatalf("Run() error = %v", err)
+	}
+	return plan
+}
+
+func newCoordinatorRunnerForLifecycleTest(
+	t *testing.T,
+	loopRun Run,
+	coordinatorRun task.Run,
+	workerRun task.Run,
+	outputs GenerationOutputReader,
+	def dsl.Definition,
+	lifecycle LifecycleConfig,
+	opts ...CoordinatorRunnerOption,
+) *CoordinatorRunner {
+	t.Helper()
+	resolved := resolvedCoordinatorDefinitionForTest(t, def)
+	defaults := LoopDefaults{
+		Delivery: definitionConfigLayer(def),
+		Watch:    definitionConfigLayer(def),
+	}
+	if lifecycle.Autopause != nil {
+		defaults.Delivery.Lifecycle = &lifecycle
+		defaults.Watch.Lifecycle = &lifecycle
+	}
+	effective, err := ResolveEffectiveConfig(resolved, defaults, nil, LoopConfig{})
+	if err != nil {
+		t.Fatalf("ResolveEffectiveConfig() error = %v", err)
+	}
+	loopRun, snapshot := pinCoordinatorResolvedForTest(t, loopRun, resolved, effective)
+	runner, err := NewCoordinatorRunner(
+		&coordinatorRunnerTaskRunReader{runs: map[string]task.Run{
+			coordinatorRun.ID: coordinatorRun,
+			workerRun.ID:      workerRun,
+		}},
+		&coordinatorRunnerLoopStore{run: loopRun, snapshot: snapshot},
+		outputs,
+		slog.New(slog.NewTextHandler(io.Discard, nil)),
+		opts...,
+	)
+	if err != nil {
+		t.Fatalf("NewCoordinatorRunner() error = %v", err)
+	}
+	return runner
+}
+
+func runLifecyclePayloadFailurePlan(
+	t *testing.T,
+	now time.Time,
+	def dsl.Definition,
+) task.CoordinatorCompletionPlan {
+	t.Helper()
+	loopRun := controlLoopRun("looprun-lifecycle-route-preterminal", nil)
+	coordinatorRun := controlCoordinatorRun(loopRun, 1)
+	workerRun := lifecycleWorkerRun(loopRun, "work", task.TaskRunStatusCompleted, now)
+	workerRun.SetResult(json.RawMessage(`{"summary":"failed","error":"provider unavailable"}`))
+	firstScheduledAt := now.Add(-time.Second)
+	outputRows := make([]GenerationOutput, 0, len(def.Graph.Nodes))
+	for _, node := range def.Graph.Nodes {
+		output := GenerationOutput{
+			Generation: 1,
+			NodeID:     string(node.ID),
+			Status:     generationOutputPending,
+			Attempt:    1,
+		}
+		if node.ID == "work" {
+			output.Status = generationOutputSucceeded
+			output.OutputRef = string(workerRun.ResultValue())
+			output.TaskRunID = workerRun.ID
+			output.FirstScheduledAt = &firstScheduledAt
+		}
+		outputRows = append(outputRows, output)
+	}
+	outputs := &lifecycleCoordinatorStore{
+		outputs: map[int][]GenerationOutput{1: outputRows}}
+	runner := newCoordinatorRunnerForTestWithDefinition(
+		t,
+		loopRun,
+		coordinatorRun,
+		map[string]task.Run{coordinatorRun.ID: coordinatorRun, workerRun.ID: workerRun},
+		outputs,
+		def,
+		WithCoordinatorNodeAttemptReader(outputs),
+	)
+	runner.now = func() time.Time { return now }
+	plan, err := runner.Run(t.Context(), task.RunID(coordinatorRun.ID))
+	if err != nil {
+		t.Fatalf("Run() error = %v", err)
+	}
+	return plan
+}
+
+func TestCoordinatorQuarantineShouldPreserveDiagnosableSanitizedHistory(t *testing.T) {
+	t.Parallel()
+
+	t.Run("Should append sanitized diagnosable history", testCoordinatorQuarantineSanitizedHistory)
+	t.Run("Should bound oversized encoded history", testCoordinatorQuarantineBoundedHistory)
+}
+
+func testCoordinatorQuarantineSanitizedHistory(t *testing.T) {
+	t.Parallel()
+
+	now := time.Date(2026, time.August, 2, 23, 0, 0, 0, time.UTC)
+	failureClass := FailureTransport
+	oldEntry, err := encodeQuarantineEntry(QuarantineEntry{
+		NodeID:   "fetch",
+		InputRef: "loop-run:looprun-quarantine-history:node:fetch:input",
+		Target:   "compozy__fetch",
+		Episodes: []QuarantineEpisode{{
+			Generation: 2, QuarantinedAt: now.Add(-time.Hour),
+			Attempts: []NodeAttempt{{
+				LoopRunID: "looprun-quarantine-history", Generation: 2, NodeID: "fetch",
+				Attempt: 1, FailureClass: &failureClass, FailureCode: "backend_failed",
+				Cause: "old failure", Disposition: AttemptQuarantined, StartedAt: now.Add(-2 * time.Hour),
+			}},
+		}},
+		Requeues: []QuarantineProvenance{{
+			ActorKind: "human", ActorID: "operator:alice", Reason: "target repaired",
+			RequestedAt: now.Add(-30 * time.Minute), Generation: 3,
+		}},
+	})
+	if err != nil {
+		t.Fatalf("encodeQuarantineEntry(old) error = %v", err)
+	}
+	endedAt := now.Add(-time.Second)
+	attempts := []NodeAttempt{
+		{
+			LoopRunID: "looprun-quarantine-history", Generation: 3, NodeID: "fetch",
+			Attempt: 1, FailureClass: &failureClass, FailureCode: "backend_failed",
+			Cause: "api_key=planted-secret", Hint: "rotate token=planted-secret",
+			Target: "compozy__fetch", Disposition: AttemptEscalated,
+			StartedAt: now.Add(-2 * time.Minute), EndedAt: &endedAt,
+		},
+		{
+			LoopRunID: "looprun-quarantine-history", Generation: 4, NodeID: "fetch",
+			Attempt: 2, FailureClass: &failureClass, FailureCode: "backend_failed",
+			Cause: "api_key=planted-secret", Hint: "check the upstream",
+			Target: "compozy__fetch", Disposition: AttemptQuarantined,
+			StartedAt: now.Add(-time.Minute), EndedAt: &endedAt,
+		},
+	}
+	runner := &CoordinatorRunner{now: func() time.Time { return now }}
+	raw, mutation, event, err := runner.buildNodeQuarantine(
+		Run{ID: "looprun-quarantine-history", WorkspaceID: "ws-1"},
+		4,
+		dsl.Graph{Nodes: []dsl.Node{{ID: "fetch", Class: dsl.NodeClassAction, Kind: "compozy__fetch"}}},
+		"fetch",
+		attempts,
+		NodeControl{LoopRunID: "looprun-quarantine-history", NodeID: "fetch", Revision: 7,
+			QuarantineEntry: oldEntry},
+	)
+	if err != nil {
+		t.Fatalf("buildNodeQuarantine() error = %v", err)
+	}
+	if strings.Contains(string(raw), "planted-secret") || !strings.Contains(string(raw), "[REDACTED]") {
+		t.Fatalf("quarantine entry = %s, want planted secret redacted", raw)
+	}
+	for _, key := range []string{
+		`"loop_run_id"`, `"node_id"`, `"item_index"`, `"failure_class"`,
+		`"failure_code"`, `"started_at"`, `"ended_at"`,
+	} {
+		if !strings.Contains(string(raw), key) {
+			t.Fatalf("quarantine entry = %s, want canonical key %s", raw, key)
+		}
+	}
+	for _, legacyKey := range []string{`"LoopRunID"`, `"FailureClass"`, `"StartedAt"`} {
+		if strings.Contains(string(raw), legacyKey) {
+			t.Fatalf("quarantine entry = %s, want no Go field key %s", raw, legacyKey)
+		}
+	}
+	var entry QuarantineEntry
+	if err := json.Unmarshal(raw, &entry); err != nil {
+		t.Fatalf("json.Unmarshal(quarantine entry) error = %v", err)
+	}
+	if entry.NodeID != "fetch" || entry.Target != "compozy__fetch" ||
+		entry.InputRef != "loop-run:looprun-quarantine-history:node:fetch:input" ||
+		len(entry.Episodes) != 2 || len(entry.Episodes[1].Attempts) != 2 || len(entry.Requeues) != 1 {
+		t.Fatalf("quarantine entry = %#v, want complete appended history", entry)
+	}
+	latest := entry.Episodes[1].Attempts[1]
+	if latest.StartedAt.IsZero() || latest.EndedAt == nil || latest.Hint != "check the upstream" {
+		t.Fatalf("latest attempt = %#v, want timestamps and remediation hint", latest)
+	}
+	if mutation.Kind != NodeControlMutationQuarantine || mutation.ExpectedRevision != 7 ||
+		event.Kind != GenerationLifecycleEventNodeQuarantined || event.Disposition != AttemptQuarantined {
+		t.Fatalf("mutation/event = %#v / %#v, want atomic quarantine intents", mutation, event)
+	}
+}
+
+func testCoordinatorQuarantineBoundedHistory(t *testing.T) {
+	t.Parallel()
+
+	now := time.Date(2026, time.August, 2, 23, 0, 0, 0, time.UTC)
+
+	oversized := QuarantineEntry{NodeID: "fetch", InputRef: quarantineInputRef(
+		Run{ID: "looprun-quarantine-history"}, "fetch",
+	)}
+	const latestGeneration = maxQuarantineEpisodes + 1
+	for generation := 1; generation <= latestGeneration; generation++ {
+		attempt := NodeAttempt{
+			LoopRunID: "looprun-quarantine-history", Generation: generation, NodeID: "fetch",
+			Attempt: 1, FailureClass: new(FailureTransport), FailureCode: "backend_failed",
+			Cause: "upstream transport failure", Hint: "repair upstream then requeue",
+			Disposition: AttemptQuarantined, StartedAt: now,
+		}
+		episode := QuarantineEpisode{Generation: generation, QuarantinedAt: now}
+		if generation == latestGeneration {
+			attempt.Cause = strings.Repeat("upstream transport failure ", 80)
+			attempt.Hint = strings.Repeat("repair upstream then requeue ", 80)
+			episode.Attempts = append(episode.Attempts, attempt)
+			attempt.Attempt = 2
+		}
+		episode.Attempts = append(episode.Attempts, attempt)
+		oversized.Episodes = append(oversized.Episodes, episode)
+	}
+	// After count capping, the 31 short reasons alone retain 8,897 bytes
+	// after whitespace normalization, exceeding the 8 KiB envelope. Trimming
+	// must reach requeues after old episodes and attempts without large repeats.
+	for generation := 1; generation <= maxQuarantineRequeues+1; generation++ {
+		reason := strings.Repeat("repair note ", 24)
+		if generation == maxQuarantineRequeues+1 {
+			reason = strings.Repeat("repair note ", 96)
+		}
+		oversized.Requeues = append(oversized.Requeues, QuarantineProvenance{
+			ActorKind: "human", ActorID: "operator:alice", Reason: reason,
+			RequestedAt: now, Generation: generation,
+		})
+	}
+	bounded, err := encodeQuarantineEntry(oversized)
+	if err != nil {
+		t.Fatalf("encodeQuarantineEntry(oversized) error = %v", err)
+	}
+	if len(bounded) > maxQuarantineEntryBytes {
+		t.Fatalf("bounded quarantine bytes = %d, want <= %d", len(bounded), maxQuarantineEntryBytes)
+	}
+	var boundedEntry QuarantineEntry
+	if err := json.Unmarshal(bounded, &boundedEntry); err != nil {
+		t.Fatalf("json.Unmarshal(bounded quarantine) error = %v", err)
+	}
+	if !boundedEntry.Truncated || len(boundedEntry.Episodes) == 0 ||
+		boundedEntry.Episodes[len(boundedEntry.Episodes)-1].Generation != latestGeneration ||
+		len(boundedEntry.Requeues) == 0 ||
+		boundedEntry.Requeues[len(boundedEntry.Requeues)-1].Generation != maxQuarantineRequeues+1 {
+		t.Fatalf("bounded quarantine entry = %#v, want latest evidence with truncation marker", boundedEntry)
+	}
+}
+
+func TestCoordinatorPausedNodeControlsShouldPreserveSettledPlan(t *testing.T) {
+	t.Parallel()
+
+	run := Run{ID: "looprun-paused-settled", WorkspaceID: "ws-1"}
+	runner := &CoordinatorRunner{controls: coordinatorNodeControlReaderStub{controls: []NodeControl{{
+		LoopRunID: run.ID, NodeID: "work", Paused: true,
+	}}}}
+	plan := task.CoordinatorCompletionPlan{
+		Snapshot: task.GenerationSnapshot{Payload: GenerationSnapshotPayload{Outputs: []GenerationOutput{{
+			Generation: 1, NodeID: "work", Status: generationOutputSucceeded,
+		}}}},
+		Terminal: &task.CoordinatorTerminal{Status: string(StatusDone)},
+	}
+
+	updated, err := runner.applyPausedNodeControls(t.Context(), run, plan)
+	if err != nil {
+		t.Fatalf("applyPausedNodeControls() error = %v", err)
+	}
+	payload := coordinatorSnapshotPayloadForTest(t, updated)
+	if updated.Terminal == nil || updated.Yield || updated.GenerationInFlight ||
+		payload.Outputs[0].Status != generationOutputSucceeded {
+		t.Fatalf("settled paused-node plan = %#v payload=%#v, want unchanged terminal truth", updated, payload)
+	}
+}
+
+func TestCoordinatorParkedDependencyShouldSurfaceNeedsAttention(t *testing.T) {
+	t.Parallel()
+
+	graph := dsl.Graph{
+		Nodes: []dsl.Node{
+			{ID: "producer", Class: dsl.NodeClassAction, Kind: "compozy__fetch"},
+			{ID: "consumer", Class: dsl.NodeClassAction, Kind: string(dsl.ActionTransform)},
+		},
+		Edges: []dsl.Edge{{From: "producer", To: "consumer"}},
+	}
+	for _, parkedStatus := range []string{generationOutputQuarantined, generationOutputPaused} {
+		t.Run("Should name a "+parkedStatus+" required producer", func(t *testing.T) {
+			t.Parallel()
+
+			now := time.Date(2026, time.August, 2, 23, 30, 0, 0, time.UTC)
+			runner := &CoordinatorRunner{now: func() time.Time { return now }}
+			outputs := []GenerationOutput{
+				{Generation: 2, NodeID: "producer", Status: parkedStatus},
+				{Generation: 2, NodeID: "consumer", Status: generationOutputPending},
+				{Generation: 2, NodeID: "consumer", ItemIndex: 1, Status: generationOutputPending},
+			}
+			plan := coordinatorFinisherPlan(
+				Run{ID: "looprun-parked-dependency", WorkspaceID: "ws-1"}, 2, outputs, nil,
+			)
+			updated, blocked, err := runner.applyParkedDependencyAttention(
+				t.Context(),
+				Run{ID: "looprun-parked-dependency", WorkspaceID: "ws-1"},
+				graph,
+				newControlTopology(graph),
+				outputs,
+				plan,
+			)
+			if err != nil {
+				t.Fatalf("applyParkedDependencyAttention() error = %v", err)
+			}
+			payload := coordinatorSnapshotPayloadForTest(t, updated)
+			if !blocked || !updated.Yield || len(payload.Controls) != 1 ||
+				payload.Controls[0].AttentionFlag != "dependency_quarantined" ||
+				!strings.Contains(payload.Controls[0].AttentionReason, "producer") {
+				t.Fatalf("plan = %#v payload = %#v, want named dependency attention", updated, payload)
+			}
+			materialized := coordinatorFinisherPlan(
+				Run{ID: "looprun-parked-dependency", WorkspaceID: "ws-1"}, 2, outputs, nil,
+			)
+			if err := appendCoordinatorTasksForOutputs(
+				&materialized,
+				Run{ID: "looprun-parked-dependency", WorkspaceID: "ws-1", LoopName: "delivery"},
+				2,
+				graph,
+				newControlTopology(graph),
+				false,
+				outputs,
+			); err != nil {
+				t.Fatalf("appendCoordinatorTasksForOutputs() error = %v", err)
+			}
+			if len(materialized.NodeTasks) != 0 {
+				t.Fatalf("node tasks = %#v, want parked producer and dependents excluded", materialized.NodeTasks)
+			}
+		})
+	}
+
+	t.Run("Should keep an all-paused generation live without stall work", func(t *testing.T) {
+		t.Parallel()
+
+		now := time.Date(2026, time.August, 3, 0, 15, 0, 0, time.UTC)
+		runner := &CoordinatorRunner{now: func() time.Time { return now }}
+		outputs := []GenerationOutput{
+			{Generation: 2, NodeID: "producer", Status: generationOutputPaused},
+			{Generation: 2, NodeID: "consumer", Status: generationOutputPaused},
+		}
+		plan := coordinatorFinisherPlan(
+			Run{ID: "looprun-all-paused", WorkspaceID: "ws-1"}, 2, outputs, nil,
+		)
+		updated, parked, err := runner.applyParkedDependencyAttention(
+			t.Context(),
+			Run{ID: "looprun-all-paused", WorkspaceID: "ws-1"},
+			graph,
+			newControlTopology(graph),
+			outputs,
+			plan,
+		)
+		if err != nil {
+			t.Fatalf("applyParkedDependencyAttention() error = %v", err)
+		}
+		if !parked || !updated.Yield || !updated.GenerationInFlight || updated.Terminal != nil ||
+			len(updated.NodeRuns) != 0 {
+			t.Fatalf("all-paused plan = %#v, want live paused-dominant yield without work", updated)
+		}
+	})
+}
+
+func TestCoordinatorInvalidInputFailure(t *testing.T) {
+	t.Parallel()
+	// Invariant: invalid authored tool input requires correction; explicit error routes still run.
+	// Owning layer and canonical suite: Loop coordinator node lifecycle and generation succession.
+	for _, tc := range []struct {
+		name     string
+		policy   *dsl.ErrorPolicy
+		terminal bool
+	}{
+		{"Should fail invalid input under the default retry policy", nil, true},
+		{"Should preserve an authored correction route", &dsl.ErrorPolicy{Route: "next"}, false},
+		{"Should preserve an explicit allow-fail policy", &dsl.ErrorPolicy{AllowFail: true}, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			now := time.Date(2026, time.September, 29, 12, 0, 0, 0, time.UTC)
+			parent := controlLoopRun("looprun-invalid-input", nil)
+			coordinator := controlCoordinatorRun(parent, 1)
+			worker := lifecycleWorkerRun(parent, "work", task.TaskRunStatusFailed, now)
+			node := lifecycleNode("work")
+			node.NodeLifecycleState = &dsl.NodeLifecycleState{OnError: tc.policy}
+			node.Retry = &dsl.RetrySpec{MaxAttempts: 0}
+			def := lifecycleDefinition(node, lifecycleNode("next"))
+			def.Graph.Edges = []dsl.Edge{{From: "work", To: "next"}}
+			firstScheduledAt := now.Add(-time.Second)
+			output := GenerationOutput{
+				FirstScheduledAt: &firstScheduledAt,
+				Generation:       1,
+				NodeID:           "work",
+				Status:           generationOutputFailed,
+				TaskRunID:        worker.ID,
+				Attempt:          1,
+				OutputRef: lifecycleFailureRef(
+					t,
+					string(tools.ErrorCodeInvalidInput),
+					"Correct the task manifest.",
+				),
+			}
+			outputs := &lifecycleCoordinatorStore{
+				outputs: map[int][]GenerationOutput{
+					1: {output, {Generation: 1, NodeID: "next", Status: generationOutputPending, Attempt: 1}},
+				},
+			}
+			runner := newCoordinatorRunnerForLifecycleTest(
+				t,
+				parent,
+				coordinator,
+				worker,
+				outputs,
+				def,
+				LifecycleConfig{},
+				WithCoordinatorNodeAttemptReader(outputs),
+			)
+			runner.now = func() time.Time { return now }
+			plan, err := runner.Run(t.Context(), task.RunID(coordinator.ID))
+			if err != nil {
+				t.Fatalf("run invalid input: %v", err)
+			}
+			if tc.terminal {
+				if plan.Terminal == nil || plan.Terminal.Status != string(StatusFailed) ||
+					plan.Terminal.ReasonCode != "node_failed" ||
+					plan.NextCoordinator != nil {
+					t.Fatalf("invalid input plan = %#v", plan)
+				}
+			} else if plan.Terminal != nil || len(plan.NodeRuns) != 1 || plan.NextCoordinator != nil {
+				t.Fatalf("authored correction plan = %#v", plan)
+			}
+		})
+	}
+}
+
+func TestCoordinatorParallelInvalidInputFailure(t *testing.T) {
+	t.Parallel()
+	// Invariant: parallel transient failure cannot hide unhandled invalid input from the run boundary.
+	// Owning layer and canonical suite: Loop coordinator lifecycle failure precedence.
+	for _, order := range []struct {
+		name         string
+		invalidFirst bool
+	}{
+		{"Should fail when invalid input sorts after a transient failure", false},
+		{"Should fail when invalid input sorts before a transient failure", true},
+	} {
+		t.Run(order.name, func(t *testing.T) {
+			t.Parallel()
+			parent := controlLoopRun("parallel-invalid-input", nil)
+			coordinator := controlCoordinatorRun(parent, 1)
+			graph := dsl.Graph{Nodes: []dsl.Node{lifecycleNode("a_failed"), lifecycleNode("z_failed")}}
+			codes := []tools.ErrorCode{tools.ErrorCodeUnavailable, tools.ErrorCodeInvalidInput}
+			if order.invalidFirst {
+				codes[0], codes[1] = codes[1], codes[0]
+			}
+			outputs := []GenerationOutput{
+				{
+					Generation: 1,
+					NodeID:     "a_failed",
+					Status:     generationOutputFailed,
+					Attempt:    1,
+					OutputRef:  lifecycleFailureRef(t, string(codes[0]), "failed input or transport"),
+				},
+				{
+					Generation: 1,
+					NodeID:     "z_failed",
+					Status:     generationOutputFailed,
+					Attempt:    1,
+					OutputRef:  lifecycleFailureRef(t, string(codes[1]), "failed input or transport"),
+				},
+			}
+			runner := newCoordinatorRunnerForTestWithGraph(
+				t,
+				parent,
+				coordinator,
+				map[string]task.Run{coordinator.ID: coordinator},
+				coordinatorRunnerOutputs{outputs: map[int][]GenerationOutput{1: outputs}},
+				graph,
+			)
+			plan, err := runner.Run(t.Context(), task.RunID(coordinator.ID))
+			if err != nil {
+				t.Fatalf("parallel failure: %v", err)
+			}
+			if plan.Terminal == nil || plan.Terminal.Status != string(StatusFailed) || plan.NextCoordinator != nil {
+				t.Fatalf("invalid input hidden: terminal=%#v next=%#v", plan.Terminal, plan.NextCoordinator)
+			}
+		})
+	}
+	t.Run("Should preserve target-unavailable ownership over invalid input", func(t *testing.T) {
+		t.Parallel()
+		outputs := []GenerationOutput{
+			{
+				NodeID:    "a_invalid",
+				Status:    generationOutputFailed,
+				OutputRef: lifecycleFailureRef(t, string(tools.ErrorCodeInvalidInput), "correct input"),
+			},
+			{
+				NodeID:    "z_unavailable",
+				Status:    generationOutputFailed,
+				OutputRef: lifecycleFailureRef(t, targetUnavailableReasonCode, "target breaker open"),
+			},
+		}
+		selected := selectFailedOutput(outputs)
+		if selected == nil || selected.NodeID != "z_unavailable" {
+			t.Fatalf("selected failure = %#v, want target owner", selected)
+		}
+	})
+}

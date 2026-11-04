@@ -1,0 +1,265 @@
+import type { LucideIcon } from "@compozy/ui/icons";
+
+import type { OperationQuery, OperationRequestBody, OperationResponse } from "@/lib/api-contract";
+
+export type SettingsMarketplaceSection = OperationResponse<"getSettingsMarketplace", 200>;
+export type SettingsUpdateMarketplaceRequest = OperationRequestBody<"updateSettingsMarketplace">;
+export type SettingsGeneralSection = OperationResponse<"getSettingsGeneral", 200>;
+export type SettingsProviderUsageSection = OperationResponse<"getSettingsProviderUsage", 200>;
+export type SettingsUpdateProviderUsageRequest =
+  OperationRequestBody<"updateSettingsProviderUsage">;
+export type SettingsPersonaSection = OperationResponse<"getSettingsPersona", 200>;
+export type SettingsPersonaFilter = NonNullable<OperationQuery<"getSettingsPersona">>;
+export type SettingsLayeredScope = SettingsPersonaFilter["scope"];
+export type SettingsUpdatePersonaRequest = OperationRequestBody<"updateSettingsPersona">;
+export type SettingsSkillsSection = OperationResponse<"getSettingsSkills", 200>;
+export type SettingsAutomationSection = OperationResponse<"getSettingsAutomation", 200>;
+export type SettingsAttentionSection = OperationResponse<"getSettingsAttention", 200>;
+export type SettingsAttentionFilter = NonNullable<OperationQuery<"getSettingsAttention">>;
+export type SettingsUpdateAttentionFilter = NonNullable<OperationQuery<"updateSettingsAttention">>;
+/** Operator shell preferences (session list sort + scope) — persisted by the daemon. */
+export type SettingsShellSection = OperationResponse<"getSettingsShell", 200>;
+export type SettingsObservabilitySection = OperationResponse<"getSettingsObservability", 200>;
+export type SettingsHooksExtensionsSection = OperationResponse<"getSettingsHooksExtensions", 200>;
+export type SettingsWindowManagerSection = OperationResponse<"getSettingsWindowManager", 200>;
+export type SettingsCmdPaletteSection = OperationResponse<"getSettingsCmdPalette", 200>;
+export type SettingsHooksExtensionsHook = NonNullable<
+  SettingsHooksExtensionsSection["hooks"]
+>[number];
+export type SettingsHooksExtensionsInstalled = NonNullable<
+  SettingsHooksExtensionsSection["installed"]
+>[number];
+
+// Roles: editable settings section (getSettingsRoles) + read-only effective
+// projection (listRoles). All derived from generated operations — never hand-rolled.
+export type SettingsRolesSection = OperationResponse<"getSettingsRoles", 200>;
+export type SettingsRolesConfig = SettingsRolesSection["config"];
+export type RoleName = keyof SettingsRolesConfig;
+export type RoleFallbackEntry = SettingsRolesConfig["coordinator"]["fallback_chain"][number];
+
+export type RolesStatusResponse = OperationResponse<"listRoles", 200>;
+export type RoleStatus = RolesStatusResponse["roles"][number];
+export type RoleResolutionMode = RoleStatus["resolution_mode"];
+export type RoleDiagnostic = RoleStatus["diagnostics"][number];
+export type RoleFallbackStatus = RoleStatus["fallback_chain"][number];
+
+export type SettingsProviderCollection = OperationResponse<"listSettingsProviders", 200>;
+export type SettingsProviderEntry = SettingsProviderCollection["providers"][number];
+export type SettingsProviderLoginDescriptor = NonNullable<
+  SettingsProviderEntry["auth_status"]
+>["login"];
+export type SettingsProviderDetail = OperationResponse<"getSettingsProvider", 200>["provider"];
+export type SettingsProviderRequest = OperationRequestBody<"putSettingsProvider">;
+export type SettingsProviderCredentialSlotRequest = NonNullable<
+  NonNullable<SettingsProviderRequest["settings"]>["credential_slots"]
+>[number];
+export type SettingsProviderModelsRequest = NonNullable<
+  NonNullable<SettingsProviderRequest["settings"]>["models"]
+>;
+export type SettingsProviderModelRequest = NonNullable<
+  SettingsProviderModelsRequest["curated"]
+>[number];
+
+/** Who owns launch-time provider authentication (`internal/config/provider.go`). */
+export type ProviderAuthMode = "native_cli" | "bound_secret" | "none";
+
+export type ProviderCredentialSlotDraft = SettingsProviderCredentialSlotRequest & {
+  /**
+   * Stable row identity for the editor. Slot names are user-editable and may
+   * repeat mid-typing, so they cannot key a list whose rows carry rotation
+   * state. Never sent to the daemon.
+   */
+  key: string;
+};
+
+export type ProviderDraft = {
+  name: string;
+  command: string;
+  /**
+   * True while `command` is the inherited builtin default rather than an
+   * operator-authored override. An untouched inherited command is never
+   * resubmitted, so a round-trip save cannot author the builtin text.
+   */
+  command_inherited: boolean;
+  /** True once the operator edited the command field in this dialog session. */
+  command_dirty: boolean;
+  display_name: string;
+  model_default: string;
+  curated_models: string;
+  harness: string;
+  runtime_provider: string;
+  transport: string;
+  base_url: string;
+  auth_mode: ProviderAuthMode;
+  env_policy: string;
+  home_policy: string;
+  auth_status_command: string;
+  /**
+   * Protocol-owned ACP sign-in method (`auth_acp_method`). Native ACP providers
+   * only; the daemon rejects it under any other harness or auth mode.
+   */
+  auth_acp_method: string;
+  /**
+   * Declared credential bindings. Only `auth_mode = bound_secret` may carry
+   * them — the daemon rejects slots under any other mode.
+   */
+  credential_slots: ProviderCredentialSlotDraft[];
+  /** Write-only plaintext per slot, parallel to `credential_slots`. Never read back. */
+  credential_secret_values: string[];
+};
+
+export type SettingsHookCollection = OperationResponse<"listSettingsHooks", 200>;
+export type SettingsHookEntry = SettingsHookCollection["hooks"][number];
+export type SettingsHookRequest = OperationRequestBody<"putSettingsHook">;
+export type SettingsHookListFilter = NonNullable<OperationQuery<"listSettingsHooks">>;
+export type SettingsHookPutFilter = NonNullable<OperationQuery<"putSettingsHook">>;
+export type SettingsHookDeleteFilter = NonNullable<OperationQuery<"deleteSettingsHook">>;
+
+export type SettingsMCPServerDetail = OperationResponse<"getSettingsMCPServer", 200>;
+export type SettingsMCPServerGetFilter = NonNullable<OperationQuery<"getSettingsMCPServer">>;
+export type SettingsMCPServerCollection = OperationResponse<"listSettingsMCPServers", 200>;
+export type SettingsMCPServerEntry = SettingsMCPServerCollection["mcp_servers"][number];
+export type SettingsMCPServerRequest = OperationRequestBody<"putSettingsMCPServer">;
+export type SettingsMCPServerListFilter = NonNullable<OperationQuery<"listSettingsMCPServers">>;
+export type SettingsMCPServerPutFilter = NonNullable<OperationQuery<"putSettingsMCPServer">>;
+export type SettingsMCPServerDeleteFilter = NonNullable<OperationQuery<"deleteSettingsMCPServer">>;
+
+// Daemon-mediated OAuth (ADR-016). The begin response returns the ONLY live PKCE
+// authorization URL; the exchange/logout responses return the fresh auth-status shape.
+export type SettingsMCPAuthFilter = NonNullable<OperationQuery<"beginSettingsMCPAuth">>;
+export type SettingsMCPAuthBeginRequest = OperationRequestBody<"beginSettingsMCPAuth">;
+export type SettingsMCPAuthBeginMode = SettingsMCPAuthBeginRequest["mode"];
+export type SettingsMCPAuthBeginResponse = OperationResponse<"beginSettingsMCPAuth", 200>;
+export type SettingsMCPAuthExchangeRequest = OperationRequestBody<"exchangeSettingsMCPAuth">;
+export type SettingsMCPAuthStatusResponse = OperationResponse<"exchangeSettingsMCPAuth", 200>;
+
+export type SettingsUpdateGeneralRequest = OperationRequestBody<"updateSettingsGeneral">;
+export type SettingsUpdateRolesRequest = OperationRequestBody<"updateSettingsRoles">;
+export type SettingsUpdateSkillsRequest = OperationRequestBody<"updateSettingsSkills">;
+export type SettingsSkillsFilter = NonNullable<OperationQuery<"getSettingsSkills">>;
+export type SettingsUpdateSkillsFilter = NonNullable<OperationQuery<"updateSettingsSkills">>;
+/** Daemon-measured source read model; every rendered path, count, and state comes from here. */
+export type SettingsSkillSource = SettingsSkillsSection["sources"][number];
+export type SettingsSkillSourceRoot = SettingsSkillSource["roots"][number];
+export type SettingsSkillSourceInherits = NonNullable<SettingsSkillsSection["inherits"]>;
+/** Presence-aware workspace override body: absent = untouched, null = inherit, array = set. */
+export type SettingsSkillSourcesOverride = NonNullable<SettingsUpdateSkillsRequest["override"]>;
+export type SettingsUpdateAutomationRequest = OperationRequestBody<"updateSettingsAutomation">;
+export type SettingsUpdateAttentionRequest = OperationRequestBody<"updateSettingsAttention">;
+export type SettingsUpdateShellRequest = OperationRequestBody<"updateSettingsShell">;
+export type SettingsUpdateObservabilityRequest =
+  OperationRequestBody<"updateSettingsObservability">;
+export type SettingsUpdateHooksExtensionsRequest =
+  OperationRequestBody<"updateSettingsHooksExtensions">;
+export type SettingsUpdateWindowManagerRequest =
+  OperationRequestBody<"updateSettingsWindowManager">;
+export type SettingsUpdateCmdPaletteRequest = OperationRequestBody<"updateSettingsCmdPalette">;
+/** `[cmd_palette]` reads and writes user, profile, or workspace preferences. */
+export type SettingsCmdPaletteFilter = NonNullable<OperationQuery<"getSettingsCmdPalette">>;
+export type SettingsUpdateCmdPaletteFilter = NonNullable<
+  OperationQuery<"updateSettingsCmdPalette">
+>;
+
+export type SettingsRestartResponse = OperationResponse<"triggerSettingsRestart", 202>;
+export type SettingsRestartStatus = OperationResponse<"getSettingsRestartStatus", 200>;
+// Update surface (ADR-006/ADR-009). `getSettingsUpdate` is the live MultiState
+// projection: an always-present runtime track, an app track that exists exactly
+// when a desktop app is installed on this host, and an operation view that is
+// non-null exactly while an Update Operation is live on this home.
+export type SettingsUpdateStatus = OperationResponse<"getSettingsUpdate", 200>;
+export type SettingsUpdateRuntimeTrack = SettingsUpdateStatus["runtime"];
+export type SettingsUpdateAppTrack = NonNullable<SettingsUpdateStatus["app"]>;
+export type SettingsUpdateOperation = NonNullable<SettingsUpdateStatus["operation"]>;
+export type SettingsUpdateHolder = NonNullable<SettingsUpdateOperation["holder"]>;
+export type SettingsUpdateStatusKind = SettingsUpdateRuntimeTrack["status"];
+export type SettingsUpdateApplyRequest = OperationRequestBody<"applySettingsUpdate">;
+export type SettingsUpdateTargetSet = SettingsUpdateApplyRequest["targets"];
+export type SettingsUpdateApplyResult = OperationResponse<"applySettingsUpdate", 200>;
+export type SettingsUpdateCancelResult = OperationResponse<"cancelSettingsUpdate", 200>;
+/** The two update tracks the daemon models. Mirrors `compozyupdate.Target`. */
+export type SettingsUpdateTarget = "runtime" | "app";
+export type SettingsApplyResponse = OperationResponse<"reloadSettings", 200>;
+export type ConfigApplyRecordsResponse = OperationResponse<"listSettingsApplyRecords", 200>;
+export type ConfigApplyRecord = ConfigApplyRecordsResponse["entries"][number];
+export type ConfigApplyRecordStatus = ConfigApplyRecord["status"];
+export type ConfigApplyLifecycle = ConfigApplyRecord["lifecycle"];
+export type SettingsApplyNextAction = ConfigApplyRecord["next_action"];
+export type SettingsApplyRecordsFilter = NonNullable<OperationQuery<"listSettingsApplyRecords">>;
+
+/**
+ * Sections whose PATCH answers with an apply record. `window-manager` and
+ * `cmd-palette` are deliberately absent: they echo the section they just wrote
+ * so the caller sees the daemon's own resolution — conflicts included — instead
+ * of a write receipt.
+ */
+export type SettingsMutationResult =
+  | OperationResponse<"updateSettingsPersona", 200>
+  | OperationResponse<"updateSettingsGeneral", 200>
+  | OperationResponse<"updateSettingsSkills", 200>
+  | OperationResponse<"updateSettingsMarketplace", 200>
+  | OperationResponse<"updateSettingsAutomation", 200>
+  | OperationResponse<"updateSettingsProviderUsage", 200>
+  | OperationResponse<"updateSettingsAttention", 200>
+  | OperationResponse<"updateSettingsShell", 200>
+  | OperationResponse<"updateSettingsObservability", 200>
+  | OperationResponse<"updateSettingsHooksExtensions", 200>
+  | OperationResponse<"updateSettingsRoles", 200>
+  | OperationResponse<"putSettingsProvider", 200>
+  | OperationResponse<"deleteSettingsProvider", 200>
+  | OperationResponse<"putSettingsMCPServer", 200>
+  | OperationResponse<"deleteSettingsMCPServer", 200>
+  | OperationResponse<"putSettingsHook", 200>
+  | OperationResponse<"deleteSettingsHook", 200>;
+export type SettingsScope = SettingsMutationResult["scope"];
+export type SettingsWriteTarget = NonNullable<SettingsMutationResult["write_target"]>;
+export type SettingsSectionName =
+  | SettingsGeneralSection["section"]
+  | SettingsPersonaSection["section"]
+  | SettingsRolesSection["section"]
+  | SettingsSkillsSection["section"]
+  | SettingsMarketplaceSection["section"]
+  | SettingsAutomationSection["section"]
+  | SettingsProviderUsageSection["section"]
+  | SettingsAttentionSection["section"]
+  | SettingsShellSection["section"]
+  | SettingsObservabilitySection["section"]
+  | SettingsHooksExtensionsSection["section"]
+  | SettingsWindowManagerSection["section"];
+export type SettingsRestartStatusName = SettingsRestartResponse["status"];
+export type SettingsSource = SettingsProviderEntry["source_metadata"]["effective_source"];
+export type SettingsSourceKind = SettingsSource["kind"];
+export type SettingsMCPServerTarget = NonNullable<SettingsMCPServerPutFilter["target"]>;
+
+export type SettingsCollectionName = "providers" | "mcp-servers" | "hooks";
+
+export type SettingsSectionGroup = "workspace" | "runtime" | "operator" | "system";
+
+export interface SettingsSectionDescriptor {
+  slug: SettingsSectionSlug;
+  label: string;
+  icon: LucideIcon;
+  /** Nav group (design system §03). */
+  group: SettingsSectionGroup;
+  /** Space-separated search keywords for the sidebar filter. */
+  keywords: string;
+}
+
+export type SettingsSectionSlug =
+  | "general"
+  | "terminal"
+  | "appearance"
+  | "layouts"
+  | "palette"
+  | "profiles"
+  | "providers"
+  | "provider-usage"
+  | "roles"
+  | "skills"
+  | "mcp"
+  | "automation"
+  | "gateway"
+  | "attention"
+  | "observability"
+  | "hooks"
+  | "extensions"
+  | "marketplace";

@@ -1,0 +1,250 @@
+import {
+  apiClient,
+  apiRequestFailed,
+  defaultApiErrorMessage,
+  requireResponseData,
+} from "@/lib/api-client";
+
+import type {
+  SettingsHookCollection,
+  SettingsHookDeleteFilter,
+  SettingsHookListFilter,
+  SettingsHookPutFilter,
+  SettingsHookRequest,
+  SettingsMCPServerCollection,
+  SettingsMCPServerDetail,
+  SettingsMCPServerGetFilter,
+  SettingsMCPServerDeleteFilter,
+  SettingsMCPServerListFilter,
+  SettingsMCPServerPutFilter,
+  SettingsMCPServerRequest,
+  SettingsMutationResult,
+  SettingsProviderCollection,
+  SettingsProviderDetail,
+  SettingsProviderRequest,
+} from "../types";
+import { SettingsApiError } from "./settings-api-error";
+import { normalizeSettingsLayerFilter } from "./settings-layer-filter";
+
+function normalizeMCPListFilter(filter: SettingsMCPServerListFilter = {}) {
+  return normalizeSettingsLayerFilter(filter);
+}
+
+function normalizeMCPMutationFilter(
+  filter: SettingsMCPServerPutFilter | SettingsMCPServerDeleteFilter = {}
+) {
+  return {
+    ...normalizeSettingsLayerFilter(filter),
+    target: filter.target,
+    owner: filter.owner?.trim() || undefined,
+  };
+}
+
+function normalizeHookFilter(
+  filter: SettingsHookListFilter | SettingsHookPutFilter | SettingsHookDeleteFilter = {}
+) {
+  return normalizeSettingsLayerFilter(filter);
+}
+
+export async function listSettingsProviders(
+  signal?: AbortSignal
+): Promise<SettingsProviderCollection> {
+  const { data, error, response } = await apiClient.GET("/api/settings/providers", { signal });
+  if (apiRequestFailed(response, error)) {
+    throw new SettingsApiError(
+      defaultApiErrorMessage("Failed to list settings providers", response, error),
+      response.status
+    );
+  }
+  return requireResponseData(data, response, "Failed to list settings providers");
+}
+
+export async function getSettingsProvider(
+  name: string,
+  signal?: AbortSignal
+): Promise<SettingsProviderDetail> {
+  const { data, error, response } = await apiClient.GET("/api/settings/providers/{name}", {
+    params: { path: { name } },
+    signal,
+  });
+  if (apiRequestFailed(response, error)) {
+    if (response.status === 404) throw new SettingsApiError(`Provider not found: ${name}`, 404);
+    throw new SettingsApiError(
+      defaultApiErrorMessage(`Failed to load provider "${name}"`, response, error),
+      response.status
+    );
+  }
+  return requireResponseData(data, response, `Failed to load provider "${name}"`).provider;
+}
+
+export async function putSettingsProvider(
+  name: string,
+  body: SettingsProviderRequest,
+  signal?: AbortSignal
+): Promise<SettingsMutationResult> {
+  const { data, error, response } = await apiClient.PUT("/api/settings/providers/{name}", {
+    params: { path: { name } },
+    body,
+    signal,
+  });
+  if (apiRequestFailed(response, error)) {
+    throw new SettingsApiError(
+      defaultApiErrorMessage(`Failed to save provider "${name}"`, response, error),
+      response.status
+    );
+  }
+  return requireResponseData(data, response, `Failed to save provider "${name}"`);
+}
+
+export async function deleteSettingsProvider(
+  name: string,
+  signal?: AbortSignal
+): Promise<SettingsMutationResult> {
+  const { data, error, response } = await apiClient.DELETE("/api/settings/providers/{name}", {
+    params: { path: { name } },
+    signal,
+  });
+  if (apiRequestFailed(response, error)) {
+    if (response.status === 404) throw new SettingsApiError(`Provider not found: ${name}`, 404);
+    throw new SettingsApiError(
+      defaultApiErrorMessage(`Failed to delete provider "${name}"`, response, error),
+      response.status
+    );
+  }
+  return requireResponseData(data, response, `Failed to delete provider "${name}"`);
+}
+
+export async function listSettingsHooks(
+  filter: SettingsHookListFilter = {},
+  signal?: AbortSignal
+): Promise<SettingsHookCollection> {
+  const { data, error, response } = await apiClient.GET("/api/settings/hooks", {
+    params: { query: normalizeHookFilter(filter) },
+    signal,
+  });
+  if (apiRequestFailed(response, error)) {
+    throw new SettingsApiError(
+      defaultApiErrorMessage("Failed to list settings hooks", response, error),
+      response.status
+    );
+  }
+  return requireResponseData(data, response, "Failed to list settings hooks");
+}
+
+export async function putSettingsHook(
+  name: string,
+  body: SettingsHookRequest,
+  filter: SettingsHookPutFilter = {},
+  signal?: AbortSignal
+): Promise<SettingsMutationResult> {
+  const { data, error, response } = await apiClient.PUT("/api/settings/hooks/{name}", {
+    params: { path: { name }, query: normalizeHookFilter(filter) },
+    body,
+    signal,
+  });
+  if (apiRequestFailed(response, error)) {
+    throw new SettingsApiError(
+      defaultApiErrorMessage(`Failed to save hook "${name}"`, response, error),
+      response.status
+    );
+  }
+  return requireResponseData(data, response, `Failed to save hook "${name}"`);
+}
+
+export async function deleteSettingsHook(
+  name: string,
+  filter: SettingsHookDeleteFilter = {},
+  signal?: AbortSignal
+): Promise<SettingsMutationResult> {
+  const { data, error, response } = await apiClient.DELETE("/api/settings/hooks/{name}", {
+    params: { path: { name }, query: normalizeHookFilter(filter) },
+    signal,
+  });
+  if (apiRequestFailed(response, error)) {
+    if (response.status === 404) throw new SettingsApiError(`Hook not found: ${name}`, 404);
+    throw new SettingsApiError(
+      defaultApiErrorMessage(`Failed to delete hook "${name}"`, response, error),
+      response.status
+    );
+  }
+  return requireResponseData(data, response, `Failed to delete hook "${name}"`);
+}
+
+export async function getSettingsMCPServer(
+  name: string,
+  filter: SettingsMCPServerGetFilter = {},
+  signal?: AbortSignal
+): Promise<SettingsMCPServerDetail> {
+  const { data, error, response } = await apiClient.GET("/api/settings/mcp-servers/{name}", {
+    params: {
+      path: { name },
+      query: { ...normalizeSettingsLayerFilter(filter), owner: filter.owner?.trim() || undefined },
+    },
+    signal,
+  });
+  if (apiRequestFailed(response, error)) {
+    throw new SettingsApiError(
+      defaultApiErrorMessage(`Failed to get MCP server "${name}"`, response, error),
+      response.status
+    );
+  }
+  return requireResponseData(data, response, `Failed to get MCP server "${name}"`);
+}
+
+export async function listSettingsMCPServers(
+  filter: SettingsMCPServerListFilter = {},
+  signal?: AbortSignal
+): Promise<SettingsMCPServerCollection> {
+  const { data, error, response } = await apiClient.GET("/api/settings/mcp-servers", {
+    params: { query: normalizeMCPListFilter(filter) },
+    signal,
+  });
+  if (apiRequestFailed(response, error)) {
+    throw new SettingsApiError(
+      defaultApiErrorMessage("Failed to list MCP servers", response, error),
+      response.status
+    );
+  }
+  return requireResponseData(data, response, "Failed to list MCP servers");
+}
+
+export async function putSettingsMCPServer(
+  name: string,
+  body: SettingsMCPServerRequest,
+  filter: SettingsMCPServerPutFilter = {},
+  signal?: AbortSignal
+): Promise<SettingsMutationResult> {
+  const { data, error, response } = await apiClient.PUT("/api/settings/mcp-servers/{name}", {
+    params: { path: { name }, query: normalizeMCPMutationFilter(filter) },
+    body,
+    signal,
+  });
+  if (apiRequestFailed(response, error)) {
+    throw new SettingsApiError(
+      defaultApiErrorMessage(`Failed to save MCP server "${name}"`, response, error),
+      response.status,
+      undefined,
+      error?.code
+    );
+  }
+  return requireResponseData(data, response, `Failed to save MCP server "${name}"`);
+}
+
+export async function deleteSettingsMCPServer(
+  name: string,
+  filter: SettingsMCPServerDeleteFilter = {},
+  signal?: AbortSignal
+): Promise<SettingsMutationResult> {
+  const { data, error, response } = await apiClient.DELETE("/api/settings/mcp-servers/{name}", {
+    params: { path: { name }, query: normalizeMCPMutationFilter(filter) },
+    signal,
+  });
+  if (apiRequestFailed(response, error)) {
+    if (response.status === 404) throw new SettingsApiError(`MCP server not found: ${name}`, 404);
+    throw new SettingsApiError(
+      defaultApiErrorMessage(`Failed to delete MCP server "${name}"`, response, error),
+      response.status
+    );
+  }
+  return requireResponseData(data, response, `Failed to delete MCP server "${name}"`);
+}

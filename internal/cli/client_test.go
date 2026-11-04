@@ -1,0 +1,5660 @@
+package cli
+
+import (
+	"bytes"
+	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"io"
+	"net/http"
+	"net/http/httptest"
+	"net/url"
+	"os"
+	"path/filepath"
+	"reflect"
+	"slices"
+	"strings"
+	"sync/atomic"
+	"testing"
+	"testing/iotest"
+	"time"
+
+	"github.com/compozy/compozy/internal/session"
+	"github.com/compozy/compozy/internal/transcript"
+
+	"github.com/compozy/compozy/internal/agentidentity"
+	"github.com/compozy/compozy/internal/api/contract"
+	automationpkg "github.com/compozy/compozy/internal/automation"
+
+	diagnosticcontract "github.com/compozy/compozy/internal/diagnosticcontract"
+	diagnosticspkg "github.com/compozy/compozy/internal/diagnostics"
+	mcppkg "github.com/compozy/compozy/internal/mcp"
+	taskpkg "github.com/compozy/compozy/internal/task"
+	toolspkg "github.com/compozy/compozy/internal/tools"
+	"github.com/compozy/compozy/internal/windowmanager"
+)
+
+type roundTripperFunc func(*http.Request) (*http.Response, error)
+
+func (f roundTripperFunc) RoundTrip(req *http.Request) (*http.Response, error) {
+	return f(req)
+}
+
+type responseBodyProbe struct {
+	reader     io.Reader
+	closeErr   error
+	closeCalls atomic.Int32
+}
+
+func (b *responseBodyProbe) Read(buffer []byte) (int, error) {
+	return b.reader.Read(buffer)
+}
+
+func (b *responseBodyProbe) Close() error {
+	b.closeCalls.Add(1)
+	return b.closeErr
+}
+
+type contextBoundReader struct {
+	ctx         context.Context
+	readStarted chan struct{}
+}
+
+func (r *contextBoundReader) Read(_ []byte) (int, error) {
+	close(r.readStarted)
+	<-r.ctx.Done()
+	return 0, r.ctx.Err()
+}
+
+type stagedResponseReader struct {
+	chunks      [][]byte
+	terminalErr error
+}
+
+func TestUnixSocketClientCmdPaletteMethods(t *testing.T) {
+	t.Parallel()
+
+	newClient := func(handler roundTripperFunc) *daemonClient {
+		client := &daemonClient{
+			target:     LocalClientTarget("/tmp/compozy.sock"),
+			httpClient: &http.Client{Transport: handler},
+		}
+		client.streamClient = client.httpClient
+		return client
+	}
+
+	t.Run("Should encode catalog filters", func(t *testing.T) {
+		t.Parallel()
+		client := newClient(func(request *http.Request) (*http.Response, error) {
+			if request.Method != http.MethodGet || request.URL.Path != "/api/cmd-palette/commands" {
+				t.Fatalf("request = %s %s", request.Method, request.URL.Path)
+			}
+			if request.URL.Query().Get("workspace") != "workspace-1" ||
+				request.URL.Query().Get("client") != "client-1" {
+				t.Fatalf("query = %s", request.URL.RawQuery)
+			}
+			return newHTTPResponse(http.StatusOK, `{"commands":[],"sources":[],"catalog_revision":"revision-1"}`), nil
+		})
+		response, err := client.ListCmdPaletteCommands(t.Context(), "workspace-1", "client-1")
+		if err != nil {
+			t.Fatalf("ListCmdPaletteCommands() error = %v", err)
+		}
+		if response.CatalogRevision != "revision-1" {
+			t.Fatalf("catalog revision = %q, want revision-1", response.CatalogRevision)
+		}
+	})
+
+	t.Run("Should encode invocation path and body", func(t *testing.T) {
+		t.Parallel()
+		client := newClient(func(request *http.Request) (*http.Response, error) {
+			if request.Method != http.MethodPost ||
+				request.URL.EscapedPath() != "/api/cmd-palette/commands/core.sessions%2Fnew/invoke" {
+				t.Fatalf("request = %s %s", request.Method, request.URL.EscapedPath())
+			}
+			var body contract.CmdPaletteInvokeRequest
+			if err := json.NewDecoder(request.Body).Decode(&body); err != nil {
+				t.Fatalf("decode invocation body error = %v", err)
+			}
+			if err := request.Body.Close(); err != nil {
+				t.Fatalf("close invocation body error = %v", err)
+			}
+			if body.Workspace != "workspace-1" || body.Client != "client-1" || body.Args["name"] != "demo" {
+				t.Fatalf("invocation body = %#v", body)
+			}
+			return newHTTPResponse(http.StatusOK, `{"status":"completed","result":{"ok":true}}`), nil
+		})
+		response, err := client.InvokeCmdPaletteCommand(
+			t.Context(),
+			"core.sessions/new",
+			contract.CmdPaletteInvokeRequest{
+				Workspace: "workspace-1", Client: "client-1", Args: map[string]any{"name": "demo"},
+			},
+		)
+		if err != nil {
+			t.Fatalf("InvokeCmdPaletteCommand() error = %v", err)
+		}
+		if response.Status != "completed" {
+			t.Fatalf("invocation status = %q, want completed", response.Status)
+		}
+	})
+
+	t.Run("Should preserve structured invocation validation errors", func(t *testing.T) {
+		t.Parallel()
+		client := newClient(func(*http.Request) (*http.Response, error) {
+			return newHTTPResponse(
+				http.StatusUnprocessableEntity,
+				`{"error":"invalid_arguments","fields":{"title":"required"}}`,
+			), nil
+		})
+		_, err := client.InvokeCmdPaletteCommand(
+			t.Context(),
+			"ext.notes.capture",
+			contract.CmdPaletteInvokeRequest{Workspace: "workspace-1", Args: map[string]any{}},
+		)
+		_, paletteErrOK := errors.AsType[*cmdPaletteAPIError](err)
+		if !paletteErrOK || err.Error() != `invalid arguments — missing required "title"` {
+			t.Fatalf("InvokeCmdPaletteCommand() error = %#v", err)
+		}
+	})
+
+	t.Run("Should use scoped settings for bindings and preserve mutation conflicts", func(t *testing.T) {
+		t.Parallel()
+		var calls int
+		client := newClient(func(request *http.Request) (*http.Response, error) {
+			calls++
+			if request.URL.Path != "/api/settings/window-manager" ||
+				request.URL.Query().Get("scope") != "workspace" ||
+				request.URL.Query().Get("workspace_id") != "workspace-1" {
+				t.Fatalf("request = %s %s?%s", request.Method, request.URL.Path, request.URL.RawQuery)
+			}
+			if calls == 1 {
+				return newHTTPResponse(
+					http.StatusOK,
+					`{"config":{"shortcuts":{}},"effective_shortcuts":{},"aliases":{},"commands":[],"extension_defaults":[]}`,
+				), nil
+			}
+			return newHTTPResponse(
+				http.StatusConflict,
+				`{"error":"shortcut_conflict","owner":"session.new","chord":"meta+KeyN"}`,
+			), nil
+		})
+		if _, err := client.GetCmdPaletteBindings(t.Context(), "workspace-1"); err != nil {
+			t.Fatalf("GetCmdPaletteBindings() error = %v", err)
+		}
+		shortcuts := map[string]windowmanager.ShortcutBinding{"ext.notes.capture": {"meta+KeyN"}}
+		_, err := client.UpdateCmdPaletteBindings(
+			t.Context(),
+			"workspace-1",
+			contract.UpdateSettingsWindowManagerRequest{Shortcuts: &shortcuts},
+		)
+		_, mutationErrOK := errors.AsType[*cmdPaletteMutationAPIError](err)
+		if !mutationErrOK || err.Error() !=
+			`shortcut conflict — meta+KeyN is used by "session.new". Re-run with --overwrite to take it.` {
+			t.Fatalf("UpdateCmdPaletteBindings() error = %#v", err)
+		}
+	})
+
+	t.Run("Should use idempotent pin paths", func(t *testing.T) {
+		t.Parallel()
+		var calls int
+		client := newClient(func(request *http.Request) (*http.Response, error) {
+			calls++
+			wantMethod := http.MethodPut
+			if calls == 2 {
+				wantMethod = http.MethodDelete
+			}
+			if request.Method != wantMethod ||
+				request.URL.EscapedPath() != "/api/cmd-palette/pins/ext.notes%2Fcapture" ||
+				request.URL.Query().Get("workspace") != "workspace-1" {
+				t.Fatalf(
+					"request %d = %s %s?%s",
+					calls,
+					request.Method,
+					request.URL.EscapedPath(),
+					request.URL.RawQuery,
+				)
+			}
+			return newHTTPResponse(http.StatusOK, fmt.Sprintf(`{"pinned":%t}`, calls == 1)), nil
+		})
+		response, err := client.SetCmdPalettePin(t.Context(), "workspace-1", "ext.notes/capture", true)
+		if err != nil || !response.Pinned {
+			t.Fatalf("SetCmdPalettePin(true) = %#v, %v", response, err)
+		}
+		response, err = client.SetCmdPalettePin(t.Context(), "workspace-1", "ext.notes/capture", false)
+		if err != nil || response.Pinned {
+			t.Fatalf("SetCmdPalettePin(false) = %#v, %v", response, err)
+		}
+	})
+
+	t.Run("Should use approval lifecycle paths", func(t *testing.T) {
+		t.Parallel()
+		var calls int
+		client := newClient(func(request *http.Request) (*http.Response, error) {
+			calls++
+			wantMethod := http.MethodGet
+			wantPath := "/api/tools/approvals/approval-1"
+			if calls == 2 {
+				wantMethod = http.MethodPost
+				wantPath += "/cancel"
+			}
+			if calls == 3 {
+				wantMethod = http.MethodPost
+				wantPath += "/resolve"
+				var body contract.ResolveToolApprovalRequest
+				if err := json.NewDecoder(request.Body).Decode(&body); err != nil {
+					t.Fatalf("decode resolution request: %v", err)
+				}
+				if body.Decision != "approved" {
+					t.Fatalf("approval decision = %q, want approved", body.Decision)
+				}
+			}
+			if request.Method != wantMethod || request.URL.Path != wantPath {
+				t.Fatalf(
+					"request %d = %s %s, want %s %s",
+					calls,
+					request.Method,
+					request.URL.Path,
+					wantMethod,
+					wantPath,
+				)
+			}
+			return newHTTPResponse(
+				http.StatusOK,
+				`{"approval_status":"denied","execution_status":"canceled","expires_at":"2026-08-19T12:00:00Z"}`,
+			), nil
+		})
+		if _, err := client.GetPendingToolApproval(t.Context(), "approval-1"); err != nil {
+			t.Fatalf("GetPendingToolApproval() error = %v", err)
+		}
+		if _, err := client.CancelPendingToolApproval(t.Context(), "approval-1"); err != nil {
+			t.Fatalf("CancelPendingToolApproval() error = %v", err)
+		}
+		if _, err := client.ResolvePendingToolApproval(t.Context(), "approval-1",
+			contract.ResolveToolApprovalRequest{Decision: "approved"}); err != nil {
+			t.Fatalf("ResolvePendingToolApproval() error = %v", err)
+		}
+	})
+}
+
+func TestUnixSocketClientToolApprovalGrantMethods(t *testing.T) {
+	t.Parallel()
+
+	profileContext := context.WithValue(
+		t.Context(),
+		profileReadSelectionContextKey{},
+		profileReadSelection{Profile: "marketing"},
+	)
+	client := &daemonClient{
+		target: LocalClientTarget("/tmp/compozy.sock"),
+		httpClient: &http.Client{Transport: roundTripperFunc(func(request *http.Request) (*http.Response, error) {
+			if request.URL.Query().Get("profile") != "marketing" {
+				t.Fatalf("profile query = %q, want marketing", request.URL.Query().Get("profile"))
+			}
+			switch {
+			case request.Method == http.MethodPut && request.URL.Path == "/api/tool-approval-grants":
+				return newHTTPResponse(
+					http.StatusOK,
+					`{"grant":{"id":"grant-1","profile_id":"profile-marketing","workspace_id":"ws-1","tool_id":"compozy__probe","decision":"allow","created_at":"2026-08-19T12:00:00Z","last_used_at":"2026-08-19T12:00:00Z"}}`,
+				), nil
+			case request.Method == http.MethodGet && request.URL.Path == "/api/tool-approval-grants":
+				return newHTTPResponse(http.StatusOK, `{"grants":[],"total":0}`), nil
+			case request.Method == http.MethodDelete && request.URL.Path == "/api/tool-approval-grants/grant-1":
+				return newHTTPResponse(http.StatusOK, `{}`), nil
+			default:
+				return newHTTPResponse(http.StatusNotFound, `{"error":"unexpected grant route"}`), nil
+			}
+		})},
+	}
+	client.streamClient = client.httpClient
+
+	t.Run("Should stamp selected profile on set", func(t *testing.T) {
+		t.Parallel()
+		request := ToolApprovalGrantSetRequest{
+			ToolID:   toolspkg.ToolID("compozy__probe"),
+			Decision: toolspkg.ApprovalGrantAllow,
+			Scope:    toolspkg.ApprovalGrantScopeTool,
+		}
+		if _, err := client.SetToolApprovalGrant(profileContext, "ws-1", request); err != nil {
+			t.Fatalf("SetToolApprovalGrant() error = %v", err)
+		}
+	})
+	t.Run("Should stamp selected profile on list", func(t *testing.T) {
+		t.Parallel()
+		if _, err := client.ListToolApprovalGrants(profileContext, "ws-1"); err != nil {
+			t.Fatalf("ListToolApprovalGrants() error = %v", err)
+		}
+	})
+	t.Run("Should stamp selected profile on revoke", func(t *testing.T) {
+		t.Parallel()
+		if err := client.RevokeToolApprovalGrant(profileContext, "ws-1", "grant-1"); err != nil {
+			t.Fatalf("RevokeToolApprovalGrant() error = %v", err)
+		}
+	})
+}
+
+func (r *stagedResponseReader) Read(buffer []byte) (int, error) {
+	if len(r.chunks) == 0 {
+		if r.terminalErr != nil {
+			return 0, r.terminalErr
+		}
+		return 0, io.EOF
+	}
+	n := copy(buffer, r.chunks[0])
+	r.chunks[0] = r.chunks[0][n:]
+	if len(r.chunks[0]) == 0 {
+		r.chunks = r.chunks[1:]
+	}
+	return n, nil
+}
+
+func TestUnixSocketClientSessionPromptShouldDecodeStructuredGoalJSON(t *testing.T) {
+	t.Parallel()
+
+	newClient := func(
+		t *testing.T,
+		status int,
+		body string,
+		observePromptRequest func(*http.Request),
+	) *daemonClient {
+		t.Helper()
+		transport := roundTripperFunc(func(req *http.Request) (*http.Response, error) {
+			switch {
+			case req.Method == http.MethodGet && req.URL.Path == "/api/sessions/sess-1":
+				return newHTTPResponse(
+					http.StatusOK,
+					`{"session":{"id":"sess-1","workspace_id":"ws-1","state":"active","available_commands":[],"created_at":"2026-07-10T20:00:00Z","updated_at":"2026-07-10T20:00:00Z"}}`,
+				), nil
+			case req.Method == http.MethodPost &&
+				req.URL.Path == "/api/workspaces/ws-1/sessions/sess-1/prompt":
+				if observePromptRequest != nil {
+					observePromptRequest(req)
+				}
+				response := newHTTPResponse(status, body)
+				response.Header.Set("Content-Type", "application/json")
+				return response, nil
+			default:
+				t.Fatalf("unexpected request = %s %s", req.Method, req.URL.Path)
+				return nil, errors.New("unexpected request")
+			}
+		})
+		client := &daemonClient{
+			target:     LocalClientTarget("/tmp/compozy.sock"),
+			httpClient: &http.Client{Transport: transport},
+		}
+		client.streamClient = client.httpClient
+		return client
+	}
+
+	t.Run("Should decode a successful direct Goal result", func(t *testing.T) {
+		t.Parallel()
+
+		client := newClient(
+			t,
+			http.StatusOK,
+			`{"prompt":{"status":"accepted","message_id":"msg-goal-status","idempotency_key":"idem-goal-status","replayed":false,"goal":{"outcome":"status","reason_code":null,"snapshot":null,"replaced_run_id":null}}}`,
+			nil,
+		)
+		record, err := client.SendSessionPrompt(t.Context(), "sess-1", SessionPromptRequest{
+			Message:        "/goal status",
+			MessageID:      "msg-goal-status",
+			IdempotencyKey: "idem-goal-status",
+		})
+		if err != nil {
+			t.Fatalf("SendSessionPrompt(Goal status) error = %v", err)
+		}
+		if record.Goal == nil || record.Goal.Outcome != contract.GoalOutcomeStatus {
+			t.Fatalf("SendSessionPrompt(Goal status) = %#v", record)
+		}
+		if record.Prompt.MessageID != "msg-goal-status" || record.Prompt.IdempotencyKey != "idem-goal-status" {
+			t.Fatalf(
+				"SendSessionPrompt(Goal status) identity = %q/%q, want msg-goal-status/idem-goal-status",
+				record.Prompt.MessageID,
+				record.Prompt.IdempotencyKey,
+			)
+		}
+	})
+
+	t.Run("Should surface one direct Goal result through the streaming JSONL seam", func(t *testing.T) {
+		t.Parallel()
+
+		var requestBody contract.SendPromptRequest
+		client := newClient(
+			t,
+			http.StatusAccepted,
+			`{"prompt":{"status":"accepted","message_id":"msg-goal-start","idempotency_key":"idem-goal-start","replayed":false,"goal":{"outcome":"started","reason_code":null,"snapshot":null,"replaced_run_id":null}}}`,
+			func(req *http.Request) {
+				body, err := io.ReadAll(req.Body)
+				if err != nil {
+					t.Fatalf("read streamed prompt request body error = %v", err)
+				}
+				if err := req.Body.Close(); err != nil {
+					t.Fatalf("close streamed prompt request body error = %v", err)
+				}
+				if err := json.Unmarshal(body, &requestBody); err != nil {
+					t.Fatalf("decode streamed prompt request body error = %v", err)
+				}
+			},
+		)
+		var events []SSEEvent
+		err := client.StreamPromptSession(
+			t.Context(),
+			"sess-1",
+			SessionPromptRequest{
+				Message:        "/goal ship",
+				MessageID:      "msg-goal-start",
+				IdempotencyKey: "idem-goal-start",
+				Runtime: &contract.PromptRuntimeSelectionPayload{
+					Provider:        "codex",
+					Model:           "gpt-5.6-sol",
+					ReasoningEffort: contract.ReasoningEffort("high"),
+					Speed:           contract.SpeedFast,
+				},
+			},
+			func(event SSEEvent) error {
+				events = append(events, event)
+				return nil
+			},
+		)
+		if err != nil {
+			t.Fatalf("StreamPromptSession(Goal start) error = %v", err)
+		}
+		if len(events) != 1 || events[0].Event != promptResultEventName {
+			t.Fatalf("StreamPromptSession(Goal start) events = %#v", events)
+		}
+		var result contract.SendPromptResultResponse
+		if err := json.Unmarshal(events[0].Data, &result); err != nil {
+			t.Fatalf("decode streamed prompt result error = %v", err)
+		}
+		if result.Prompt.Goal == nil || result.Prompt.Goal.Outcome != contract.GoalOutcomeStarted ||
+			result.Prompt.MessageID != "msg-goal-start" || result.Prompt.IdempotencyKey != "idem-goal-start" {
+			t.Fatalf("streamed Goal result = %#v", result)
+		}
+		if requestBody.MessageID != "msg-goal-start" || requestBody.IdempotencyKey != "idem-goal-start" {
+			t.Fatalf("streamed prompt request identity = %q/%q", requestBody.MessageID, requestBody.IdempotencyKey)
+		}
+		if requestBody.Runtime == nil || requestBody.Runtime.Provider != "codex" ||
+			requestBody.Runtime.Model != "gpt-5.6-sol" ||
+			requestBody.Runtime.ReasoningEffort != contract.ReasoningEffort("high") ||
+			requestBody.Runtime.Speed != contract.SpeedFast {
+			t.Fatalf("streamed prompt request runtime = %#v", requestBody.Runtime)
+		}
+	})
+
+	t.Run("Should preserve a structured Goal error body", func(t *testing.T) {
+		t.Parallel()
+
+		client := newClient(
+			t,
+			http.StatusConflict,
+			`{"prompt":{"status":"rejected","message_id":"msg-goal-conflict","idempotency_key":"idem-goal-conflict","replayed":false,"goal":{"outcome":"error","reason_code":"goal_replace_required","snapshot":null,"replaced_run_id":null}}}`,
+			nil,
+		)
+		_, err := client.SendSessionPrompt(
+			t.Context(),
+			"sess-1",
+			SessionPromptRequest{
+				Message: "/goal ship", MessageID: "msg-goal-conflict", IdempotencyKey: "idem-goal-conflict",
+			},
+		)
+
+		goalErr, goalErrMatched := errors.AsType[*goalCommandAPIError](err)
+		if !goalErrMatched {
+			t.Fatalf("SendSessionPrompt(Goal conflict) error = %T %[1]v", err)
+		}
+		if goalErr.statusCode != http.StatusConflict ||
+			goalErr.result.ReasonCode == nil ||
+			*goalErr.result.ReasonCode != contract.GoalReasonReplaceRequired {
+			t.Fatalf("Goal command error = %#v", goalErr)
+		}
+	})
+}
+
+func TestUnixSocketClientSessionPromptTerminalContract(t *testing.T) {
+	t.Parallel()
+
+	t.Run("Should return the raw terminal error with all preceding events", func(t *testing.T) {
+		t.Parallel()
+
+		body := strings.Join([]string{
+			"event: agent_message",
+			`data: {"type":"agent_message","timestamp":"2026-08-05T12:00:00Z","text":"partial before disconnect"}`,
+			"",
+			"event: error",
+			`data: {"type":"error","timestamp":"2026-08-05T12:00:01Z","error":"peer disconnected before response","failure":{"kind":"process_exit","summary":"ACP subprocess exited unexpectedly"}}`,
+			"",
+		}, "\n")
+		client := &daemonClient{
+			target: LocalClientTarget("/tmp/compozy.sock"),
+			httpClient: &http.Client{Transport: roundTripperFunc(func(req *http.Request) (*http.Response, error) {
+				response := newHTTPResponse(http.StatusOK, body)
+				response.Header.Set("Content-Type", "text/event-stream")
+				response.Request = req
+				return response, nil
+			})},
+		}
+
+		record, err := client.doSessionPrompt(
+			t.Context(),
+			http.MethodPost,
+			"/api/workspaces/ws-1/sessions/sess-1/prompt",
+			nil,
+			SessionPromptRequest{Message: "hello"},
+		)
+		assertErrorContains(t, err, "peer disconnected before response")
+		if got, want := len(record.Events), 2; got != want {
+			t.Fatalf("doSessionPrompt() events = %d, want %d", got, want)
+		}
+		if record.Events[0].Text != "partial before disconnect" || record.Events[1].Type != "error" {
+			t.Fatalf("doSessionPrompt() events = %#v, want partial chunk then terminal error", record.Events)
+		}
+	})
+
+	t.Run("Should forward streamed frames before returning the terminal error", func(t *testing.T) {
+		t.Parallel()
+
+		body := strings.Join([]string{
+			`data: {"type":"text-delta","id":"turn-1-text","delta":"partial before disconnect"}`,
+			"",
+			`data: {"type":"error","errorText":"peer disconnected before response"}`,
+			"",
+			`data: {"type":"finish","finishReason":"error"}`,
+			"",
+			"data: [DONE]",
+			"",
+		}, "\n")
+		transport := roundTripperFunc(func(req *http.Request) (*http.Response, error) {
+			switch {
+			case req.Method == http.MethodGet && req.URL.Path == "/api/sessions/sess-1":
+				return newHTTPResponse(
+					http.StatusOK,
+					`{"session":{"id":"sess-1","workspace_id":"ws-1","state":"active","created_at":"2026-08-05T12:00:00Z","updated_at":"2026-08-05T12:00:00Z"}}`,
+				), nil
+			case req.Method == http.MethodPost &&
+				req.URL.Path == "/api/workspaces/ws-1/sessions/sess-1/prompt":
+				response := newHTTPResponse(http.StatusOK, body)
+				response.Header.Set("Content-Type", "text/event-stream")
+				response.Request = req
+				return response, nil
+			default:
+				t.Fatalf("unexpected request = %s %s", req.Method, req.URL.Path)
+				return nil, errors.New("unexpected request")
+			}
+		})
+		client := &daemonClient{
+			target:     LocalClientTarget("/tmp/compozy.sock"),
+			httpClient: &http.Client{Transport: transport},
+		}
+		client.streamClient = client.httpClient
+
+		var events []SSEEvent
+		err := client.StreamPromptSession(
+			t.Context(),
+			"sess-1",
+			SessionPromptRequest{Message: "hello"},
+			func(event SSEEvent) error {
+				events = append(events, event)
+				return nil
+			},
+		)
+		assertErrorContains(t, err, "peer disconnected before response")
+		if got, want := len(events), 4; got != want {
+			t.Fatalf("StreamPromptSession() forwarded events = %d, want %d", got, want)
+		}
+		if !strings.Contains(string(events[0].Data), "partial before disconnect") {
+			t.Fatalf("StreamPromptSession() first event = %s, want partial chunk", events[0].Data)
+		}
+	})
+
+	t.Run("Should reject a clean EOF without a terminal event", func(t *testing.T) {
+		t.Parallel()
+
+		client := &daemonClient{
+			target: LocalClientTarget("/tmp/compozy.sock"),
+			httpClient: &http.Client{Transport: roundTripperFunc(func(req *http.Request) (*http.Response, error) {
+				response := newHTTPResponse(
+					http.StatusOK,
+					"event: agent_message\ndata: {\"type\":\"agent_message\",\"timestamp\":\"2026-08-05T12:00:00Z\",\"text\":\"partial\"}\n\n",
+				)
+				response.Header.Set("Content-Type", "text/event-stream")
+				response.Request = req
+				return response, nil
+			})},
+		}
+
+		_, err := client.doSessionPrompt(
+			t.Context(),
+			http.MethodPost,
+			"/api/workspaces/ws-1/sessions/sess-1/prompt",
+			nil,
+			SessionPromptRequest{Message: "hello"},
+		)
+		assertErrorContains(t, err, "ended before a terminal event")
+	})
+
+	t.Run("Should preserve malformed streamed JSON as the terminal decode failure", func(t *testing.T) {
+		t.Parallel()
+
+		transport := roundTripperFunc(func(req *http.Request) (*http.Response, error) {
+			switch {
+			case req.Method == http.MethodGet && req.URL.Path == "/api/sessions/sess-1":
+				return newHTTPResponse(
+					http.StatusOK,
+					`{"session":{"id":"sess-1","workspace_id":"ws-1","state":"active","created_at":"2026-08-05T12:00:00Z","updated_at":"2026-08-05T12:00:00Z"}}`,
+				), nil
+			case req.Method == http.MethodPost &&
+				req.URL.Path == "/api/workspaces/ws-1/sessions/sess-1/prompt":
+				response := newHTTPResponse(http.StatusOK, "data: {\"type\":\n\n")
+				response.Header.Set("Content-Type", "text/event-stream")
+				response.Request = req
+				return response, nil
+			default:
+				t.Fatalf("unexpected request = %s %s", req.Method, req.URL.Path)
+				return nil, errors.New("unexpected request")
+			}
+		})
+		client := &daemonClient{
+			target:     LocalClientTarget("/tmp/compozy.sock"),
+			httpClient: &http.Client{Transport: transport},
+		}
+		client.streamClient = client.httpClient
+
+		err := client.StreamPromptSession(
+			t.Context(),
+			"sess-1",
+			SessionPromptRequest{Message: "hello"},
+			func(SSEEvent) error { return nil },
+		)
+		assertErrorContains(t, err, "decode prompt stream event")
+		if _, ok := errors.AsType[*json.SyntaxError](err); !ok {
+			t.Fatalf("StreamPromptSession() error = %T %[1]v, want *json.SyntaxError", err)
+		}
+	})
+}
+
+func TestUnixSocketClientSessionInputMethods(t *testing.T) {
+	t.Parallel()
+
+	client := &daemonClient{
+		target: LocalClientTarget("/tmp/compozy.sock"),
+		httpClient: &http.Client{Transport: roundTripperFunc(func(req *http.Request) (*http.Response, error) {
+			switch {
+			case req.Method == http.MethodGet && req.URL.Path == "/api/sessions/sess-1":
+				return newHTTPResponse(
+					http.StatusOK,
+					`{"session":{"id":"sess-1","workspace_id":"ws-1","state":"active","available_commands":[],"created_at":"2026-07-10T20:00:00Z","updated_at":"2026-07-10T20:00:00Z"}}`,
+				), nil
+			case req.Method == http.MethodGet && req.URL.Path == "/api/workspaces/ws-1/sessions/sess-1/prompt/queue":
+				return newHTTPResponse(
+					http.StatusOK,
+					`{"inputs":[{"id":"queue-1","session_id":"sess-1","status":"queued","mode":"queue","delivery":"after_turn","text":"Run the test.","queue_generation":2,"enqueued_at":"2026-07-10T20:00:00Z"}]}`,
+				), nil
+			case req.Method == http.MethodPut && req.URL.Path == "/api/workspaces/ws-1/sessions/sess-1/prompt/queue/queue-1":
+				var body contract.ReplaceSessionInputRequest
+				if err := json.NewDecoder(req.Body).Decode(&body); err != nil {
+					return nil, fmt.Errorf("decode replace input request: %w", err)
+				}
+				if err := req.Body.Close(); err != nil {
+					return nil, fmt.Errorf("close replace input request: %w", err)
+				}
+				if body.Text != "Run the focused test." || body.MessageID != "msg-1" ||
+					body.IdempotencyKey != "idem-1" {
+					return nil, fmt.Errorf("replace input request = %#v", body)
+				}
+				return newHTTPResponse(
+					http.StatusOK,
+					`{"input":{"id":"queue-1","session_id":"sess-1","message_id":"msg-1","idempotency_key":"idem-1","status":"queued","mode":"queue","delivery":"after_turn","text":"Run the focused test.","queue_generation":3,"enqueued_at":"2026-07-10T20:00:00Z"}}`,
+				), nil
+			case req.Method == http.MethodPost && req.URL.Path == "/api/workspaces/ws-1/sessions/sess-1/steer":
+				var body contract.SteerPromptRequest
+				if err := json.NewDecoder(req.Body).Decode(&body); err != nil {
+					return nil, fmt.Errorf("decode steer prompt request: %w", err)
+				}
+				if err := req.Body.Close(); err != nil {
+					return nil, fmt.Errorf("close steer prompt request: %w", err)
+				}
+				if body.Text != "Prefer the smaller patch." || body.MessageID != "msg-2" ||
+					body.IdempotencyKey != "idem-2" || body.ExpectedTurnID != "turn-1" {
+					return nil, fmt.Errorf("steer prompt request = %#v", body)
+				}
+				return newHTTPResponse(
+					http.StatusAccepted,
+					`{"prompt":{"status":"steering","mode":"steer","delivery":"interrupt_then_prompt","message_id":"msg-2","idempotency_key":"idem-2","replayed":false,"queue_entry_id":"queue-1"}}`,
+				), nil
+			case req.Method == http.MethodPost && req.URL.Path == "/api/workspaces/ws-1/sessions/sess-1/prompt/queue/queue-1/steer":
+				var body contract.PromoteSessionInputRequest
+				if err := json.NewDecoder(req.Body).Decode(&body); err != nil {
+					return nil, fmt.Errorf("decode promote input request: %w", err)
+				}
+				if err := req.Body.Close(); err != nil {
+					return nil, fmt.Errorf("close promote input request: %w", err)
+				}
+				if body.Text != "Prefer the smaller patch." || body.MessageID != "msg-2" ||
+					body.IdempotencyKey != "idem-2" || body.ExpectedTurnID != "turn-1" {
+					return nil, fmt.Errorf("promote input request = %#v", body)
+				}
+				return newHTTPResponse(
+					http.StatusAccepted,
+					`{"prompt":{"status":"steering","mode":"steer","delivery":"interrupt_then_prompt","message_id":"msg-2","idempotency_key":"idem-2","replayed":false,"queue_entry_id":"queue-1"}}`,
+				), nil
+			case req.Method == http.MethodDelete && req.URL.Path == "/api/workspaces/ws-1/sessions/sess-1/prompt/queue/queue-1":
+				return newHTTPResponse(
+					http.StatusAccepted,
+					`{"prompt":{"status":"canceled","delivery":"none","message_id":"msg-2","idempotency_key":"idem-2","replayed":false,"queue_entry_id":"queue-1"}}`,
+				), nil
+			case req.Method == http.MethodDelete && req.URL.Path == "/api/workspaces/ws-1/sessions/sess-1/prompt/queue":
+				return newHTTPResponse(http.StatusOK,
+					`{"inputs":[{"id":"queue-1","status":"canceled"}],"cleared_count":1,"queue_generation":3}`), nil
+			default:
+				return nil, fmt.Errorf("unexpected request = %s %s", req.Method, req.URL.Path)
+			}
+		})},
+	}
+	client.streamClient = client.httpClient
+
+	t.Run("Should list pending input in workspace session scope", func(t *testing.T) {
+		t.Parallel()
+
+		inputs, err := client.ListSessionInputs(t.Context(), "sess-1")
+		if err != nil {
+			t.Fatalf("ListSessionInputs() error = %v", err)
+		}
+		if len(inputs.Inputs) != 1 || inputs.Inputs[0].ID != "queue-1" || inputs.Inputs[0].QueueGeneration != 2 {
+			t.Fatalf("ListSessionInputs() = %#v", inputs)
+		}
+	})
+	t.Run("Should clear pending input in workspace session scope", func(t *testing.T) {
+		t.Parallel()
+		result, err := client.ClearSessionInputs(t.Context(), "sess-1")
+		if err != nil || result.ClearedCount != 1 || result.QueueGeneration != 3 ||
+			len(result.Inputs) != 1 || result.Inputs[0].Status != contract.SessionInputCanceled {
+			t.Fatalf("ClearSessionInputs() = %#v, %v", result, err)
+		}
+	})
+
+	t.Run("Should replace queued input in workspace session scope", func(t *testing.T) {
+		t.Parallel()
+
+		input, err := client.ReplaceSessionInput(t.Context(), "sess-1", "queue-1", ReplaceSessionInputRequest{
+			Text: "Run the focused test.", MessageID: "msg-1", IdempotencyKey: "idem-1",
+		})
+		if err != nil {
+			t.Fatalf("ReplaceSessionInput() error = %v", err)
+		}
+		if input.ID != "queue-1" || input.Text != "Run the focused test." || input.QueueGeneration != 3 {
+			t.Fatalf("ReplaceSessionInput() = %#v", input)
+		}
+	})
+
+	t.Run("Should send direct steering with its active turn fence", func(t *testing.T) {
+		t.Parallel()
+
+		record, err := client.SteerSessionPrompt(t.Context(), "sess-1", contract.SteerPromptRequest{
+			Text: "Prefer the smaller patch.", MessageID: "msg-2", IdempotencyKey: "idem-2", ExpectedTurnID: "turn-1",
+		})
+		if err != nil {
+			t.Fatalf("SteerSessionPrompt() error = %v", err)
+		}
+		if record.Prompt.Status != "steering" ||
+			record.Prompt.Delivery != contract.PromptDeliveryInterruptThenPrompt ||
+			record.Prompt.QueueEntryID != "queue-1" {
+			t.Fatalf("SteerSessionPrompt() = %#v", record)
+		}
+	})
+
+	t.Run("Should promote queued input with its active turn fence", func(t *testing.T) {
+		t.Parallel()
+
+		record, err := client.PromoteSessionInput(t.Context(), "sess-1", "queue-1", PromoteSessionInputRequest{
+			Text: "Prefer the smaller patch.", MessageID: "msg-2", IdempotencyKey: "idem-2", ExpectedTurnID: "turn-1",
+		})
+		if err != nil {
+			t.Fatalf("PromoteSessionInput() error = %v", err)
+		}
+		if record.Prompt.Status != "steering" ||
+			record.Prompt.Delivery != contract.PromptDeliveryInterruptThenPrompt ||
+			record.Prompt.QueueEntryID != "queue-1" {
+			t.Fatalf("PromoteSessionInput() = %#v", record)
+		}
+	})
+
+	t.Run("Should cancel queued input in workspace session scope", func(t *testing.T) {
+		t.Parallel()
+
+		record, err := client.CancelSessionInput(t.Context(), "sess-1", "queue-1")
+		if err != nil {
+			t.Fatalf("CancelSessionInput() error = %v", err)
+		}
+		if record.Prompt.Status != "canceled" || record.Prompt.QueueEntryID != "queue-1" {
+			t.Fatalf("CancelSessionInput() = %#v", record)
+		}
+	})
+}
+
+func TestUnixSocketClientAgentDefinitionMethods(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name       string
+		wantMethod string
+		wantPath   string
+		wantQuery  string
+		wantBody   any
+		response   string
+		run        func(t *testing.T, client *daemonClient)
+	}{
+		{
+			name:       "Should create an agent through the daemon",
+			wantMethod: http.MethodPost,
+			wantPath:   "/api/agents",
+			wantBody: contract.CreateAgentRequest{
+				Scope:     contract.AgentCreateScopeWorkspace,
+				Workspace: "ws-1",
+				Agent: contract.CreateAgentPayload{
+					Name: "coder", Provider: "fake", Prompt: "Code.",
+				},
+			},
+			response: `{"agent":{"name":"coder","provider":"fake","origin":"global","definition_digest":"digest-1","prompt":"Code."}}`,
+			run: func(t *testing.T, client *daemonClient) {
+				t.Helper()
+				agent, err := client.CreateAgent(t.Context(), contract.CreateAgentRequest{
+					Scope:     contract.AgentCreateScopeWorkspace,
+					Workspace: "ws-1",
+					Agent:     contract.CreateAgentPayload{Name: "coder", Provider: "fake", Prompt: "Code."},
+				})
+				if err != nil || agent.DefinitionDigest != "digest-1" {
+					t.Fatalf("CreateAgent() = %#v, %v", agent, err)
+				}
+			},
+		},
+		{
+			name:       "Should update an agent with a digest request",
+			wantMethod: http.MethodPut,
+			wantPath:   "/api/agents/coder",
+			wantBody: contract.UpdateAgentRequest{
+				Workspace:      "ws-1",
+				ExpectedDigest: "digest-1",
+				Agent: contract.CreateAgentPayload{
+					Name: "coder", Provider: "fake", Prompt: "Review.",
+				},
+			},
+			response: `{"agent":{"name":"coder","provider":"fake","origin":"global","definition_digest":"digest-2","prompt":"Review."}}`,
+			run: func(t *testing.T, client *daemonClient) {
+				t.Helper()
+				agent, err := client.UpdateAgent(t.Context(), "coder", contract.UpdateAgentRequest{
+					Workspace:      "ws-1",
+					ExpectedDigest: "digest-1",
+					Agent:          contract.CreateAgentPayload{Name: "coder", Provider: "fake", Prompt: "Review."},
+				})
+				if err != nil || agent.DefinitionDigest != "digest-2" {
+					t.Fatalf("UpdateAgent() = %#v, %v", agent, err)
+				}
+			},
+		},
+		{
+			name:       "Should delete an agent in workspace scope",
+			wantMethod: http.MethodDelete,
+			wantPath:   "/api/agents/coder",
+			wantQuery:  "workspace=ws-1",
+			response:   `{"name":"coder","origin":"workspace","unshadowed_origin":"global"}`,
+			run: func(t *testing.T, client *daemonClient) {
+				t.Helper()
+				result, err := client.DeleteAgent(t.Context(), "coder", "ws-1")
+				if err != nil || result.UnshadowedOrigin != contract.AgentOriginGlobal {
+					t.Fatalf("DeleteAgent() = %#v, %v", result, err)
+				}
+			},
+		},
+		{
+			name:       "Should duplicate an agent server side",
+			wantMethod: http.MethodPost,
+			wantPath:   "/api/agents/coder/duplicate",
+			wantBody: contract.DuplicateAgentRequest{
+				Name:      "reviewer",
+				Scope:     contract.AgentCreateScopeWorkspace,
+				Workspace: "ws-1",
+				Overrides: &contract.DuplicateAgentOverrides{
+					Model:  "gpt-5",
+					Prompt: "Review.",
+				},
+			},
+			response: `{"agent":{"name":"reviewer","provider":"fake","origin":"global","definition_digest":"digest-copy","prompt":"Review."}}`,
+			run: func(t *testing.T, client *daemonClient) {
+				t.Helper()
+				agent, err := client.DuplicateAgent(t.Context(), "coder", contract.DuplicateAgentRequest{
+					Name:      "reviewer",
+					Scope:     contract.AgentCreateScopeWorkspace,
+					Workspace: "ws-1",
+					Overrides: &contract.DuplicateAgentOverrides{Model: "gpt-5", Prompt: "Review."},
+				})
+				if err != nil || agent.Name != "reviewer" {
+					t.Fatalf("DuplicateAgent() = %#v, %v", agent, err)
+				}
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			client := &daemonClient{
+				target: LocalClientTarget("/tmp/compozy.sock"),
+				httpClient: &http.Client{Transport: roundTripperFunc(func(req *http.Request) (*http.Response, error) {
+					if req.Method != tt.wantMethod || req.URL.Path != tt.wantPath || req.URL.RawQuery != tt.wantQuery {
+						t.Fatalf(
+							"request = %s %s?%s, want %s %s?%s",
+							req.Method,
+							req.URL.Path,
+							req.URL.RawQuery,
+							tt.wantMethod,
+							tt.wantPath,
+							tt.wantQuery,
+						)
+					}
+					if tt.wantBody != nil {
+						var gotBody any
+						if err := json.NewDecoder(req.Body).Decode(&gotBody); err != nil {
+							t.Fatalf("decode request body: %v", err)
+						}
+						wantJSON, err := json.Marshal(tt.wantBody)
+						if err != nil {
+							t.Fatalf("marshal expected request body: %v", err)
+						}
+						var wantBody any
+						if err := json.Unmarshal(wantJSON, &wantBody); err != nil {
+							t.Fatalf("decode expected request body: %v", err)
+						}
+						if !reflect.DeepEqual(gotBody, wantBody) {
+							t.Fatalf("request body = %#v, want %#v", gotBody, wantBody)
+						}
+					}
+					return newHTTPResponse(http.StatusOK, tt.response), nil
+				})},
+			}
+			tt.run(t, client)
+		})
+	}
+}
+
+func TestUnixSocketClientAgentMeSendsIdentityHeaders(t *testing.T) {
+	t.Parallel()
+
+	t.Run("Should send identity headers", func(t *testing.T) {
+		t.Parallel()
+
+		client := &daemonClient{
+			target: LocalClientTarget("/tmp/compozy.sock"),
+			httpClient: &http.Client{
+				Transport: roundTripperFunc(func(req *http.Request) (*http.Response, error) {
+					if req.Method != http.MethodGet || req.URL.Path != "/api/agent/me" {
+						t.Fatalf("request = %s %s, want GET /api/agent/me", req.Method, req.URL.Path)
+					}
+					if got := req.Header.Get(agentidentity.HeaderSessionID); got != "sess-1" {
+						t.Fatalf("%s = %q, want sess-1", agentidentity.HeaderSessionID, got)
+					}
+					if got := req.Header.Get(agentidentity.HeaderAgent); got != "coder" {
+						t.Fatalf("%s = %q, want coder", agentidentity.HeaderAgent, got)
+					}
+					return newHTTPResponse(
+						http.StatusOK,
+						`{"me":{"self":{"session_id":"sess-1","agent_name":"coder","provider":"test"},"workspace":{"id":"ws-1"},"session":{"id":"sess-1","agent_name":"coder","state":"active","created_at":"2026-04-03T12:00:00Z","updated_at":"2026-04-03T12:00:00Z"},"capabilities":[],"channels":[],"active_task_leases":[]}}`,
+					), nil
+				}),
+			},
+		}
+
+		me, err := client.AgentMe(t.Context(), agentidentity.Credentials{
+			SessionID: "sess-1",
+			AgentName: "coder",
+		})
+		if err != nil {
+			t.Fatalf("AgentMe() error = %v", err)
+		}
+		if me.Self.SessionID != "sess-1" || me.Self.AgentName != "coder" {
+			t.Fatalf("AgentMe() = %#v, want validated response", me.Self)
+		}
+	})
+}
+
+func TestUnixSocketClientAgentNotifySendsIdentityAndDecodesOutcome(t *testing.T) {
+	t.Parallel()
+
+	credentials := agentidentity.Credentials{SessionID: "sess-1", AgentName: "coder"}
+	client := &daemonClient{
+		target: LocalClientTarget("/tmp/compozy.sock"),
+		httpClient: &http.Client{Transport: roundTripperFunc(func(req *http.Request) (*http.Response, error) {
+			assertAgentRequestHeaders(t, req, credentials)
+			if req.Method != http.MethodPost || req.URL.Path != "/api/agent/notify" {
+				t.Fatalf("request = %s %s, want POST /api/agent/notify", req.Method, req.URL.Path)
+			}
+			var request AgentNotifyRequest
+			if err := json.NewDecoder(req.Body).Decode(&request); err != nil {
+				t.Fatalf("decode notify body: %v", err)
+			}
+			if request.Title != "Done" || request.Body != "No blockers" {
+				t.Fatalf("notify request = %#v, want title and body", request)
+			}
+			return newHTTPResponse(http.StatusOK, `{"outcome":"rate-limited","retry_after_ms":875}`), nil
+		})},
+	}
+
+	result, err := client.AgentNotify(t.Context(), AgentNotifyRequest{
+		Title: "Done", Body: "No blockers",
+	}, credentials)
+	if err != nil {
+		t.Fatalf("AgentNotify() error = %v", err)
+	}
+	if result.Outcome != "rate-limited" || result.RetryAfterMS != 875 {
+		t.Fatalf("AgentNotify() = %#v, want rate-limited/875ms", result)
+	}
+}
+
+func TestUnixSocketClientUpdateSettingsAttentionRoundTripsContract(t *testing.T) {
+	t.Parallel()
+
+	mutedWorkspaces := []string{"ws_0123456789abcdef"}
+	want := UpdateSettingsAttentionRequest{Config: contract.UpdateSettingsAttentionPayload{
+		Toasts: false, Sound: false, System: true,
+		MutedWorkspaces: &mutedWorkspaces,
+	}}
+	client := &daemonClient{
+		target: LocalClientTarget("/tmp/compozy.sock"),
+		httpClient: &http.Client{Transport: roundTripperFunc(func(req *http.Request) (*http.Response, error) {
+			if req.Method != http.MethodPatch || req.URL.Path != "/api/settings/attention" {
+				t.Fatalf("request = %s %s, want PATCH /api/settings/attention", req.Method, req.URL.Path)
+			}
+			var got UpdateSettingsAttentionRequest
+			if err := json.NewDecoder(req.Body).Decode(&got); err != nil {
+				t.Fatalf("decode attention body: %v", err)
+			}
+			if !reflect.DeepEqual(got, want) {
+				t.Fatalf("attention request = %#v, want %#v", got, want)
+			}
+			return newHTTPResponse(
+				http.StatusOK,
+				`{"section":"attention","scope":"global","applied":true,"lifecycle":"live","next_action":"none"}`,
+			), nil
+		})},
+	}
+
+	result, err := client.UpdateSettingsAttention(t.Context(), want)
+	if err != nil {
+		t.Fatalf("UpdateSettingsAttention() error = %v", err)
+	}
+	if string(result.Section) != string(contract.SettingsSectionAttention) || !result.Applied {
+		t.Fatalf("UpdateSettingsAttention() = %#v, want applied attention", result)
+	}
+}
+
+func TestUnixSocketClientUpdateSettingsProviderUsageSendsCollectionProfile(t *testing.T) {
+	t.Parallel()
+
+	want := UpdateSettingsProviderUsageRequest{Config: contract.SettingsProviderUsagePayload{
+		Enabled: true, RefreshInterval: "5m0s",
+		Providers: map[string]contract.SettingsProviderUsageProviderPayload{
+			"claude": {KeychainAccess: new(true)},
+		},
+	}}
+	for _, tc := range []struct {
+		profile string
+		query   string
+	}{
+		{profile: "work", query: "collection_profile=work"},
+		{profile: "", query: ""},
+	} {
+		client := &daemonClient{
+			target: LocalClientTarget("/tmp/compozy.sock"),
+			httpClient: &http.Client{Transport: roundTripperFunc(func(req *http.Request) (*http.Response, error) {
+				if req.Method != http.MethodPatch || req.URL.Path != "/api/settings/provider-usage" {
+					t.Fatalf("request = %s %s, want PATCH /api/settings/provider-usage", req.Method, req.URL.Path)
+				}
+				if req.URL.RawQuery != tc.query {
+					t.Fatalf("query = %q, want %q", req.URL.RawQuery, tc.query)
+				}
+				var got UpdateSettingsProviderUsageRequest
+				if err := json.NewDecoder(req.Body).Decode(&got); err != nil {
+					t.Fatalf("decode provider usage body: %v", err)
+				}
+				if !reflect.DeepEqual(got, want) {
+					t.Fatalf("provider usage request = %#v, want %#v", got, want)
+				}
+				return newHTTPResponse(
+					http.StatusOK,
+					`{"section":"provider-usage","scope":"user","applied":true,"lifecycle":"live","next_action":"none"}`,
+				), nil
+			})},
+		}
+		if _, err := client.UpdateSettingsProviderUsage(t.Context(), want, tc.profile); err != nil {
+			t.Fatalf("UpdateSettingsProviderUsage(%q) error = %v", tc.profile, err)
+		}
+	}
+}
+
+func TestUnixSocketClientUpdateSettingsShellRoundTripsContract(t *testing.T) {
+	t.Parallel()
+
+	want := UpdateSettingsShellRequest{Config: contract.SettingsShellPayload{
+		Sessions: contract.SettingsShellSessionsPayload{Sort: "attention", Scope: "all-workspaces"},
+	}}
+	client := &daemonClient{
+		target: LocalClientTarget("/tmp/compozy.sock"),
+		httpClient: &http.Client{Transport: roundTripperFunc(func(req *http.Request) (*http.Response, error) {
+			if req.Method != http.MethodPatch || req.URL.Path != "/api/settings/shell" {
+				t.Fatalf("request = %s %s, want PATCH /api/settings/shell", req.Method, req.URL.Path)
+			}
+			var got UpdateSettingsShellRequest
+			if err := json.NewDecoder(req.Body).Decode(&got); err != nil {
+				t.Fatalf("decode shell body: %v", err)
+			}
+			if !reflect.DeepEqual(got, want) {
+				t.Fatalf("shell request = %#v, want %#v", got, want)
+			}
+			return newHTTPResponse(
+				http.StatusOK,
+				`{"section":"shell","scope":"global","applied":true,"lifecycle":"live","next_action":"none"}`,
+			), nil
+		})},
+	}
+
+	result, err := client.UpdateSettingsShell(t.Context(), want)
+	if err != nil {
+		t.Fatalf("UpdateSettingsShell() error = %v", err)
+	}
+	if string(result.Section) != string(contract.SettingsSectionShell) || !result.Applied {
+		t.Fatalf("UpdateSettingsShell() = %#v, want applied shell", result)
+	}
+}
+
+func TestUnixSocketClientSessionAttentionReadsUseCanonicalRoutes(t *testing.T) {
+	t.Parallel()
+
+	client := &daemonClient{
+		target: LocalClientTarget("/tmp/compozy.sock"),
+		httpClient: &http.Client{Transport: roundTripperFunc(func(req *http.Request) (*http.Response, error) {
+			switch {
+			case req.Method == http.MethodGet && req.URL.Path == "/api/sessions/attention-summary":
+				return newHTTPResponse(http.StatusOK, `{"needs_you":2,"finished":1,"by_workspace":[]}`), nil
+			case req.Method == http.MethodGet && req.URL.Path == "/api/sessions/sess-1":
+				return newHTTPResponse(
+					http.StatusOK,
+					`{"session":{"id":"sess-1","workspace_id":"ws-1","state":"active","created_at":"2026-08-16T12:00:00Z","updated_at":"2026-08-16T12:00:00Z"}}`,
+				), nil
+			case req.Method == http.MethodGet &&
+				req.URL.Path == "/api/workspaces/ws-1/sessions/sess-1/interactions":
+				got := req.URL.Query()["status"]
+				want := []string{"pending", "orphaned"}
+				if !reflect.DeepEqual(got, want) {
+					t.Fatalf("interaction statuses = %#v, want %#v", got, want)
+				}
+				return newHTTPResponse(http.StatusOK, `{"interactions":[]}`), nil
+			default:
+				t.Fatalf("unexpected request = %s %s?%s", req.Method, req.URL.Path, req.URL.RawQuery)
+				return nil, errors.New("unexpected request")
+			}
+		})},
+	}
+
+	summary, err := client.GetSessionAttentionSummary(t.Context())
+	if err != nil {
+		t.Fatalf("GetSessionAttentionSummary() error = %v", err)
+	}
+	if summary.NeedsYou != 2 || summary.Finished != 1 {
+		t.Fatalf("GetSessionAttentionSummary() = %#v, want 2/1", summary)
+	}
+	interactions, err := client.ListSessionInteractions(
+		t.Context(), "sess-1", []string{" pending ", "", "orphaned"},
+	)
+	if err != nil {
+		t.Fatalf("ListSessionInteractions() error = %v", err)
+	}
+	if len(interactions.Interactions) != 0 {
+		t.Fatalf("ListSessionInteractions() = %#v, want empty list", interactions)
+	}
+}
+
+func TestUnixSocketClientLoopCatalog(t *testing.T) {
+	t.Parallel()
+
+	t.Run("Should serialize every bounded catalog query field", func(t *testing.T) {
+		t.Parallel()
+
+		client := &daemonClient{
+			target: LocalClientTarget("/tmp/compozy.sock"),
+			httpClient: &http.Client{
+				Transport: roundTripperFunc(func(req *http.Request) (*http.Response, error) {
+					if req.Method != http.MethodGet || req.URL.Path != "/api/workspaces/ws-1/loops" {
+						t.Fatalf("request = %s %s, want GET Loop catalog", req.Method, req.URL.Path)
+					}
+					want := map[string]string{
+						"q":        "release plan",
+						"kind":     "workspace",
+						"category": "delivery",
+						"status":   "running",
+						"sort":     "name",
+						"cursor":   "next/+=?",
+						"limit":    "17",
+					}
+					for name, value := range want {
+						if got := req.URL.Query().Get(name); got != value {
+							t.Fatalf("query %s = %q, want %q", name, got, value)
+						}
+					}
+					return newHTTPResponse(
+						http.StatusOK,
+						`{"loops":[],"facets":{"kinds":{},"categories":{},"statuses":{}},"page":{"has_more":false,"total":0,"limit":17}}`,
+					), nil
+				}),
+			},
+		}
+
+		response, err := client.ListLoops(t.Context(), "ws-1", LoopListQuery{
+			Search:   "release plan",
+			Kind:     "workspace",
+			Category: "delivery",
+			Status:   "running",
+			Sort:     "name",
+			Cursor:   "next/+=?",
+			Limit:    17,
+		})
+		if err != nil {
+			t.Fatalf("ListLoops() error = %v", err)
+		}
+		if response.Page.Total != 0 || response.Page.Limit != 17 || response.Loops == nil {
+			t.Fatalf("ListLoops() = %#v, want explicit empty counted page", response)
+		}
+	})
+}
+
+func TestUnixSocketClientLoopMutationsSendIdentityHeaders(t *testing.T) {
+	t.Parallel()
+
+	credentials := agentidentity.Credentials{
+		SessionID: "sess-author",
+		AgentName: "coder",
+	}
+	client := &daemonClient{
+		target: LocalClientTarget("/tmp/compozy.sock"),
+		httpClient: &http.Client{
+			Transport: roundTripperFunc(func(req *http.Request) (*http.Response, error) {
+				assertAgentRequestHeaders(t, req, credentials)
+				switch {
+				case req.Method == http.MethodPost && req.URL.Path == "/api/workspaces/ws-1/loops/release/run":
+					if got := req.URL.Query().Get("dry"); got != "true" {
+						t.Fatalf("run dry query = %q, want true", got)
+					}
+					return newHTTPResponse(
+						http.StatusOK,
+						`{"dry_run":{"loop_name":"release","resolved_inputs":{},"generation":1,"nodes":[],"contract":{},"effective_config":{}}}`,
+					), nil
+				case req.Method == http.MethodPost && req.URL.Path == "/api/workspaces/ws-1/loop-runs/run-1/approve":
+					var payload contract.ApproveLoopRunRequest
+					if err := json.NewDecoder(req.Body).Decode(&payload); err != nil {
+						t.Fatalf("json.Decode(approve body) error = %v", err)
+					}
+					if payload.GateID != "human" || payload.Decision != contract.LoopGateDecisionApprove {
+						t.Fatalf("approve body = %#v, want human/approve", payload)
+					}
+					return newHTTPResponse(http.StatusOK, `{"ok":true}`), nil
+				default:
+					t.Fatalf("unexpected request = %s %s", req.Method, req.URL.Path)
+					return nil, nil
+				}
+			}),
+		},
+	}
+
+	t.Run("Should send identity when starting a Loop run", func(t *testing.T) {
+		t.Parallel()
+
+		response, err := client.RunLoop(
+			t.Context(),
+			"ws-1",
+			"release",
+			contract.RunLoopRequest{Inputs: map[string]any{"target": "prod"}},
+			true,
+			credentials,
+		)
+		if err != nil {
+			t.Fatalf("RunLoop() error = %v", err)
+		}
+		if response.DryRun == nil || response.DryRun.LoopName != "release" {
+			t.Fatalf("RunLoop() = %#v, want release dry run", response)
+		}
+	})
+
+	t.Run("Should send identity when approving a Loop gate", func(t *testing.T) {
+		t.Parallel()
+
+		err := client.ApproveLoopRun(
+			t.Context(),
+			"ws-1",
+			"run-1",
+			contract.ApproveLoopRunRequest{GateID: "human", Decision: contract.LoopGateDecisionApprove},
+			credentials,
+		)
+		if err != nil {
+			t.Fatalf("ApproveLoopRun() error = %v", err)
+		}
+	})
+}
+
+func TestUnixSocketClientTaskMethodsRejectNilPointerRequests(t *testing.T) {
+	t.Parallel()
+
+	client := &daemonClient{
+		target: LocalClientTarget("/tmp/compozy.sock"),
+		httpClient: &http.Client{
+			Transport: roundTripperFunc(func(*http.Request) (*http.Response, error) {
+				t.Fatal("HTTP transport should not be called for nil pointer requests")
+				return nil, nil
+			}),
+		},
+	}
+
+	tests := []struct {
+		name string
+		run  func() error
+		want string
+	}{
+		{
+			name: "Should reject nil task execution profile request",
+			run: func() error {
+				_, err := client.SetTaskExecutionProfile(t.Context(), "task-1", nil)
+				return err
+			},
+			want: "cli: task execution profile request is required",
+		},
+		{
+			name: "Should reject nil task worktree policy request",
+			run: func() error {
+				_, err := client.SetTaskWorktreePolicy(t.Context(), "task-1", nil)
+				return err
+			},
+			want: "cli: task worktree policy request is required",
+		},
+		{
+			name: "Should reject nil task run review request",
+			run: func() error {
+				_, err := client.RequestTaskRunReview(t.Context(), "run-1", nil)
+				return err
+			},
+			want: "cli: task run review request is required",
+		},
+		{
+			name: "Should reject nil task run review verdict request",
+			run: func() error {
+				_, err := client.SubmitTaskRunReviewVerdict(t.Context(), "review-1", nil)
+				return err
+			},
+			want: "cli: task run review verdict request is required",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			err := tt.run()
+			if err == nil || err.Error() != tt.want {
+				t.Fatalf("error = %v, want %q", err, tt.want)
+			}
+		})
+	}
+}
+
+func TestUnixSocketClientAgentTaskMethods(t *testing.T) {
+	t.Parallel()
+
+	credentials := agentidentity.Credentials{
+		SessionID: "sess-1",
+		AgentName: "coder",
+	}
+	var sawClaim bool
+	var sawNoWork bool
+	var sawHeartbeat bool
+	var sawComplete bool
+	var sawFail bool
+	var sawRelease bool
+
+	client := &daemonClient{
+		target: LocalClientTarget("/tmp/compozy.sock"),
+		httpClient: &http.Client{
+			Transport: roundTripperFunc(func(req *http.Request) (*http.Response, error) {
+				assertAgentRequestHeaders(t, req, credentials)
+				switch {
+				case req.Method == http.MethodPost && req.URL.Path == "/api/agent/tasks/claim-next":
+					var payload contract.AgentTaskClaimNextRequest
+					if err := json.NewDecoder(req.Body).Decode(&payload); err != nil {
+						t.Fatalf("json.Decode(claim-next body) error = %v", err)
+					}
+					if payload.WorkspaceID == "empty" {
+						sawNoWork = true
+						return newHTTPResponse(http.StatusNoContent, ""), nil
+					}
+					sawClaim = true
+					if payload.WorkspaceID != "ws-1" ||
+						payload.PriorityMin != 2 ||
+						payload.LeaseSeconds != 120 ||
+						!payload.Wait ||
+						len(payload.RequiredCapabilities) != 1 ||
+						payload.RequiredCapabilities[0] != "go" {
+						t.Fatalf("claim-next body = %#v, want parsed request", payload)
+					}
+
+					body := mustJSON(t, contract.AgentTaskClaimResponse{Claim: contract.AgentTaskClaimPayload{
+						Task: contract.TaskReferencePayload{
+							ID: "task-1", Title: "Run task", Status: taskpkg.TaskStatusInProgress,
+							Scope: taskpkg.ScopeWorkspace, WorkspaceID: "ws-1",
+						},
+						Run: contract.TaskRunPayload{
+							ID: "run-1", TaskID: "task-1", Status: taskpkg.TaskRunStatusClaimed,
+							Attempt: 1, SessionID: "sess-1", QueuedAt: fixedTestNow,
+						},
+						Lease: contract.TaskRunLeaseSummaryPayload{
+							TaskID: "task-1", RunID: "run-1", Status: taskpkg.TaskRunStatusClaimed,
+							SessionID:      "sess-1",
+							ClaimTokenHash: "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+						},
+					}})
+					return newHTTPResponse(http.StatusOK, string(body)), nil
+				case req.Method == http.MethodPost && req.URL.Path == "/api/agent/tasks/run-1/heartbeat":
+					sawHeartbeat = true
+					var payload contract.AgentTaskHeartbeatRequest
+					if err := json.NewDecoder(req.Body).Decode(&payload); err != nil {
+						t.Fatalf("json.Decode(heartbeat body) error = %v", err)
+					}
+					if payload.LeaseSeconds != 60 {
+						t.Fatalf("heartbeat body = %#v, want lease duration only", payload)
+					}
+					return agentTaskLeaseHTTPResponse(t, taskpkg.TaskRunStatusClaimed), nil
+				case req.Method == http.MethodPost && req.URL.Path == "/api/agent/tasks/run-1/complete":
+					sawComplete = true
+					var payload contract.AgentTaskCompleteRequest
+					if err := json.NewDecoder(req.Body).Decode(&payload); err != nil {
+						t.Fatalf("json.Decode(complete body) error = %v", err)
+					}
+					if string(payload.Result) != `{"ok":true}` {
+						t.Fatalf("complete body = %#v, want result only", payload)
+					}
+					return agentTaskLeaseHTTPResponse(t, taskpkg.TaskRunStatusCompleted), nil
+				case req.Method == http.MethodPost && req.URL.Path == "/api/agent/tasks/run-1/fail":
+					sawFail = true
+					var payload contract.AgentTaskFailRequest
+					if err := json.NewDecoder(req.Body).Decode(&payload); err != nil {
+						t.Fatalf("json.Decode(fail body) error = %v", err)
+					}
+					if payload.Error != "boom" ||
+						string(payload.Metadata) != `{"code":"E_TASK"}` {
+						t.Fatalf("fail body = %#v, want error metadata only", payload)
+					}
+					return agentTaskLeaseHTTPResponse(t, taskpkg.TaskRunStatusFailed), nil
+				case req.Method == http.MethodPost && req.URL.Path == "/api/agent/tasks/run-1/release":
+					sawRelease = true
+					var payload contract.AgentTaskReleaseRequest
+					if err := json.NewDecoder(req.Body).Decode(&payload); err != nil {
+						t.Fatalf("json.Decode(release body) error = %v", err)
+					}
+					if payload.Reason != "handoff" {
+						t.Fatalf("release body = %#v, want reason only", payload)
+					}
+					return agentTaskLeaseHTTPResponse(t, taskpkg.TaskRunStatusQueued), nil
+				default:
+					t.Fatalf("unexpected request = %s %s", req.Method, req.URL.Path)
+					return nil, nil
+				}
+			}),
+		},
+	}
+
+	t.Run("Should claim next task", func(t *testing.T) {
+		claim, err := client.AgentTaskClaimNext(t.Context(), AgentTaskClaimNextRequest{
+			WorkspaceID:          "ws-1",
+			RequiredCapabilities: []string{"go"},
+			PriorityMin:          2,
+			LeaseSeconds:         120,
+			Wait:                 true,
+		}, credentials)
+		if err != nil {
+			t.Fatalf("AgentTaskClaimNext() error = %v", err)
+		}
+		if !claim.Claimed || claim.Claim == nil || claim.Claim.Lease.ClaimTokenHash == "" {
+			t.Fatalf("AgentTaskClaimNext() = %#v, want claimed session-bound lease response", claim)
+		}
+	})
+	t.Run("Should return no work", func(t *testing.T) {
+		noWork, err := client.AgentTaskClaimNext(
+			t.Context(),
+			AgentTaskClaimNextRequest{WorkspaceID: "empty"},
+			credentials,
+		)
+		if err != nil {
+			t.Fatalf("AgentTaskClaimNext(no work) error = %v", err)
+		}
+		if noWork.Claimed || noWork.Claim != nil {
+			t.Fatalf("AgentTaskClaimNext(no work) = %#v, want claimed false", noWork)
+		}
+	})
+	t.Run("Should heartbeat claimed task", func(t *testing.T) {
+		lease, err := client.AgentTaskHeartbeat(
+			t.Context(),
+			"run-1",
+			AgentTaskHeartbeatRequest{LeaseSeconds: 60},
+			credentials,
+		)
+		if err != nil || lease.Status != taskpkg.TaskRunStatusClaimed {
+			t.Fatalf("AgentTaskHeartbeat() = %#v, %v", lease, err)
+		}
+	})
+	t.Run("Should complete claimed task", func(t *testing.T) {
+		lease, err := client.AgentTaskComplete(
+			t.Context(),
+			"run-1",
+			AgentTaskCompleteRequest{Result: json.RawMessage(`{"ok":true}`)},
+			credentials,
+		)
+		if err != nil || lease.Status != taskpkg.TaskRunStatusCompleted {
+			t.Fatalf("AgentTaskComplete() = %#v, %v", lease, err)
+		}
+	})
+	t.Run("Should fail claimed task", func(t *testing.T) {
+		lease, err := client.AgentTaskFail(
+			t.Context(),
+			"run-1",
+			AgentTaskFailRequest{
+				Error:    "boom",
+				Metadata: json.RawMessage(`{"code":"E_TASK"}`),
+			},
+			credentials,
+		)
+		if err != nil || lease.Status != taskpkg.TaskRunStatusFailed {
+			t.Fatalf("AgentTaskFail() = %#v, %v", lease, err)
+		}
+	})
+	t.Run("Should release claimed task", func(t *testing.T) {
+		lease, err := client.AgentTaskRelease(
+			t.Context(),
+			"run-1",
+			AgentTaskReleaseRequest{Reason: "handoff"},
+			credentials,
+		)
+		if err != nil || lease.Status != taskpkg.TaskRunStatusQueued {
+			t.Fatalf("AgentTaskRelease() = %#v, %v", lease, err)
+		}
+	})
+	if !sawClaim || !sawNoWork || !sawHeartbeat || !sawComplete || !sawFail || !sawRelease {
+		t.Fatalf(
+			"method coverage claim=%t no_work=%t heartbeat=%t complete=%t fail=%t release=%t, want all true",
+			sawClaim,
+			sawNoWork,
+			sawHeartbeat,
+			sawComplete,
+			sawFail,
+			sawRelease,
+		)
+	}
+}
+
+func TestUnixSocketClientAgentTaskErrorsRedactClaimTokens(t *testing.T) {
+	t.Parallel()
+
+	t.Run("Should redact claim tokens from task errors", func(t *testing.T) {
+		t.Parallel()
+
+		rawToken := "compozy_claim_CLIENTERRORTOKEN123"
+		client := &daemonClient{
+			target: LocalClientTarget("/tmp/compozy.sock"),
+			httpClient: &http.Client{
+				Transport: roundTripperFunc(func(*http.Request) (*http.Response, error) {
+					return newHTTPResponse(
+						http.StatusConflict,
+						`{"error":"task: invalid claim token: `+rawToken+`"}`,
+					), nil
+				}),
+			},
+		}
+		_, err := client.AgentTaskRelease(
+			t.Context(),
+			"run-1",
+			AgentTaskReleaseRequest{},
+			agentidentity.Credentials{SessionID: "sess-1", AgentName: "coder"},
+		)
+		if err == nil {
+			t.Fatal("AgentTaskRelease() error = nil, want redacted API error")
+		}
+		if strings.Contains(err.Error(), rawToken) || !strings.Contains(err.Error(), "compozy_claim_[REDACTED]") {
+			t.Fatalf("error = %q, want redacted claim token", err.Error())
+		}
+	})
+
+	t.Run("Should redact MCP OAuth and secret binding material from API errors", func(t *testing.T) {
+		t.Parallel()
+
+		err := readAPIErrorBody(
+			http.StatusInternalServerError,
+			"500 Internal Server Error",
+			[]byte(
+				`{"error":"mcp_auth_token=raw-mcp access_token=raw-access authorization_code=raw-code code_verifier=raw-verifier secret_binding=raw-binding compozy_claim_CLIENTERRORTOKEN456"}`,
+			),
+		)
+		if err == nil {
+			t.Fatal("readAPIErrorBody() error = nil, want redacted API error")
+		}
+		for _, leaked := range []string{
+			"raw-mcp",
+			"raw-access",
+			"raw-code",
+			"raw-verifier",
+			"raw-binding",
+			"compozy_claim_CLIENTERRORTOKEN456",
+		} {
+			if strings.Contains(err.Error(), leaked) {
+				t.Fatalf("readAPIErrorBody() error = %q leaked %q", err.Error(), leaked)
+			}
+		}
+		if !strings.Contains(err.Error(), "[REDACTED]") {
+			t.Fatalf("readAPIErrorBody() error = %q, want redacted markers", err.Error())
+		}
+	})
+
+	t.Run("Should redact structured tool API errors", func(t *testing.T) {
+		t.Parallel()
+
+		err := readAPIErrorBody(
+			http.StatusBadGateway,
+			"502 Bad Gateway",
+			[]byte(`{"error":{"code":"backend_failed","message":"pkce_verifier=raw-pkce refresh_token=raw-refresh"}}`),
+		)
+		if err == nil {
+			t.Fatal("readAPIErrorBody(tool error) error = nil, want redacted tool API error")
+		}
+		if strings.Contains(err.Error(), "raw-pkce") || strings.Contains(err.Error(), "raw-refresh") {
+			t.Fatalf("readAPIErrorBody(tool error) error = %q, want sensitive values redacted", err.Error())
+		}
+	})
+
+	t.Run("Should preserve actionable diagnostics from shared API errors", func(t *testing.T) {
+		t.Parallel()
+
+		err := readAPIErrorBody(
+			http.StatusUnprocessableEntity,
+			"422 Unprocessable Entity",
+			[]byte(
+				`{"error":"provider model not found","diagnostic":{"id":"provider.models.model_not_found","code":"model_not_found","category":"provider","title":"Provider model not found","message":"Choose a current model.","severity":"error","freshness":"live"}}`,
+			),
+		)
+		if err == nil {
+			t.Fatal("readAPIErrorBody(diagnostic) error = nil")
+		}
+		item, ok := diagnosticspkg.ItemFromError(err)
+		if !ok || item.Code != contract.CodeModelNotFound {
+			t.Fatalf("diagnostic = %#v, %v; want model_not_found", item, ok)
+		}
+	})
+
+	t.Run("Should preserve the extension operation error envelope", func(t *testing.T) {
+		t.Parallel()
+
+		err := readAPIErrorBody(
+			http.StatusConflict,
+			"409 Conflict",
+			[]byte(
+				`{"error":"confirmation required","code":"extension_gateway_confirmation_required","current_digest":"digest-current","agents":["writer"],"diagnostic":{"id":"extension.gateway_confirmation_required","code":"extension_gateway_confirmation_required","category":"extension","title":"Gateway confirmation is required","message":"Confirm the current digest.","severity":"error","freshness":"live","suggested_command":"compozy extension enable alpha --confirm-gateway-requirement digest-current"}}`,
+			),
+		)
+
+		operationErr, operationErrMatched := errors.AsType[*extensionOperationAPIError](err)
+		if !operationErrMatched {
+			t.Fatalf("readAPIErrorBody() error = %T %v, want extensionOperationAPIError", err, err)
+		}
+		payload := operationErr.extensionOperationErrorPayload()
+		if payload.Code != diagnosticcontract.CodeExtensionGatewayConfirmRequired ||
+			payload.CurrentDigest != "digest-current" || !reflect.DeepEqual(payload.Agents, []string{"writer"}) {
+			t.Fatalf("extension operation payload = %#v", payload)
+		}
+		item, ok := diagnosticspkg.ItemFromError(err)
+		if !ok || item.SuggestedCommand !=
+			"compozy extension enable alpha --confirm-gateway-requirement digest-current" {
+			t.Fatalf("diagnostic = %#v, %v", item, ok)
+		}
+	})
+}
+
+func agentTaskLeaseHTTPResponse(t *testing.T, status taskpkg.RunStatus) *http.Response {
+	t.Helper()
+	body := mustJSON(t, contract.AgentTaskLeaseResponse{Lease: contract.TaskRunLeaseSummaryPayload{
+		TaskID:    "task-1",
+		RunID:     "run-1",
+		Status:    status,
+		SessionID: "sess-1",
+	}})
+	return newHTTPResponse(http.StatusOK, string(body))
+}
+
+func TestUnixSocketClientToolMethods(t *testing.T) {
+	t.Parallel()
+
+	client := &daemonClient{
+		target: LocalClientTarget("/tmp/compozy.sock"),
+		httpClient: &http.Client{
+			Transport: roundTripperFunc(func(req *http.Request) (*http.Response, error) {
+				switch {
+				case req.Method == http.MethodGet && req.URL.Path == "/api/tools":
+					if req.URL.Query().Get("workspace_id") != "ws-1" ||
+						req.URL.Query().Get("session_id") != "sess-1" ||
+						req.URL.Query().Get("agent_name") != "coder" {
+						t.Fatalf("tool list query = %s, want scoped query", req.URL.RawQuery)
+					}
+					return newHTTPResponse(http.StatusOK, string(mustJSON(t, sampleToolsResponse()))), nil
+				case req.Method == http.MethodPost && req.URL.Path == "/api/tools/search":
+					var request ToolSearchRequest
+					if err := json.NewDecoder(req.Body).Decode(&request); err != nil {
+						t.Fatalf("decode search body: %v", err)
+					}
+					if request.Query != "skill" || request.Limit != 2 || request.WorkspaceID != "ws-1" {
+						t.Fatalf("tool search request = %#v, want scoped search", request)
+					}
+					return newHTTPResponse(http.StatusOK, string(mustJSON(t, sampleToolsResponse()))), nil
+				case req.Method == http.MethodGet && req.URL.Path == "/api/tools/compozy__skill_view":
+					if req.URL.Query().Get("workspace_id") != "ws-1" {
+						t.Fatalf("tool info query = %s, want workspace_id=ws-1", req.URL.RawQuery)
+					}
+					return newHTTPResponse(
+						http.StatusOK,
+						string(mustJSON(t, ToolResponseRecord{Tool: sampleToolsResponse().Tools[0]})),
+					), nil
+				case req.Method == http.MethodPost && req.URL.Path == "/api/tools/compozy__tool_info/invoke":
+					var request ToolInvokeRequest
+					if err := json.NewDecoder(req.Body).Decode(&request); err != nil {
+						t.Fatalf("decode invoke body: %v", err)
+					}
+					if string(request.Input) != `{"tool_id":"compozy__skill_view"}` ||
+						request.SessionID != "sess-1" ||
+						len(request.SensitiveInputFields) != 1 ||
+						request.SensitiveInputFields[0] != "token" {
+						t.Fatalf("invoke request = %#v, want scoped tool input", request)
+					}
+					response := sampleInvokeResponse()
+					response.Result.Preview = "token=compozy_claim_secret"
+					response.Result.Structured = json.RawMessage(
+						`{"access_token":"super-secret","completion_tokens":9}`,
+					)
+					return newHTTPResponse(http.StatusOK, string(mustJSON(t, response))), nil
+				case req.Method == http.MethodGet && req.URL.Path == "/api/toolsets":
+					if req.URL.Query().Get("agent_name") != "coder" {
+						t.Fatalf("toolsets query = %s, want agent_name=coder", req.URL.RawQuery)
+					}
+					return newHTTPResponse(http.StatusOK, string(mustJSON(t, sampleToolsetsResponse()))), nil
+				case req.Method == http.MethodGet && req.URL.Path == "/api/toolsets/compozy__catalog":
+					if req.URL.Query().Get("session_id") != "sess-1" {
+						t.Fatalf("toolset info query = %s, want session_id=sess-1", req.URL.RawQuery)
+					}
+					return newHTTPResponse(
+						http.StatusOK,
+						string(mustJSON(t, ToolsetResponseRecord{Toolset: sampleToolsetsResponse().Toolsets[0]})),
+					), nil
+				default:
+					t.Fatalf("unexpected request = %s %s", req.Method, req.URL.Path)
+					return nil, nil
+				}
+			}),
+		},
+	}
+
+	t.Run("Should list tools", func(t *testing.T) {
+		t.Parallel()
+
+		response, err := client.ListTools(t.Context(), ToolQuery{
+			WorkspaceID: "ws-1",
+			SessionID:   "sess-1",
+			AgentName:   "coder",
+		})
+		if err != nil {
+			t.Fatalf("ListTools() error = %v", err)
+		}
+		if len(response.Tools) != 2 {
+			t.Fatalf("ListTools() count = %d, want 2", len(response.Tools))
+		}
+	})
+
+	t.Run("Should search tools", func(t *testing.T) {
+		t.Parallel()
+
+		response, err := client.SearchTools(t.Context(), ToolSearchRequest{
+			Query:       " skill ",
+			Limit:       2,
+			WorkspaceID: " ws-1 ",
+		})
+		if err != nil {
+			t.Fatalf("SearchTools() error = %v", err)
+		}
+		if len(response.Tools) != 2 {
+			t.Fatalf("SearchTools() count = %d, want 2", len(response.Tools))
+		}
+	})
+
+	t.Run("Should get tool info", func(t *testing.T) {
+		t.Parallel()
+
+		response, err := client.GetTool(t.Context(), toolspkg.ToolIDSkillView.String(), ToolQuery{
+			WorkspaceID: "ws-1",
+		})
+		if err != nil {
+			t.Fatalf("GetTool() error = %v", err)
+		}
+		if response.Tool.Descriptor.ToolID != toolspkg.ToolIDSkillView {
+			t.Fatalf("GetTool() id = %q, want %q", response.Tool.Descriptor.ToolID, toolspkg.ToolIDSkillView)
+		}
+	})
+
+	t.Run("Should invoke tool", func(t *testing.T) {
+		t.Parallel()
+
+		response, err := client.InvokeTool(t.Context(), toolspkg.ToolIDToolInfo.String(), ToolInvokeRequest{
+			SessionID:            " sess-1 ",
+			Input:                json.RawMessage(`{"tool_id":"compozy__skill_view"}`),
+			SensitiveInputFields: []string{" token "},
+		})
+		if err != nil {
+			t.Fatalf("InvokeTool() error = %v", err)
+		}
+		if response.ToolID != toolspkg.ToolIDToolInfo {
+			t.Fatalf("InvokeTool() id = %q, want %q", response.ToolID, toolspkg.ToolIDToolInfo)
+		}
+		encoded := string(mustJSON(t, response))
+		if strings.Contains(encoded, "compozy_claim_secret") || strings.Contains(encoded, "super-secret") {
+			t.Fatalf("InvokeTool() leaked sensitive result fields: %s", encoded)
+		}
+		if !strings.Contains(encoded, "completion_tokens") {
+			t.Fatalf("InvokeTool() response = %s, want benign token metrics preserved", encoded)
+		}
+	})
+
+	t.Run("Should decode approval-required invoke response as an error", func(t *testing.T) {
+		t.Parallel()
+
+		approvalClient := &daemonClient{
+			target: LocalClientTarget("/tmp/compozy.sock"),
+			httpClient: &http.Client{Transport: roundTripperFunc(func(req *http.Request) (*http.Response, error) {
+				if req.Method != http.MethodPost || req.URL.Path != "/api/tools/compozy__workspace_info/invoke" {
+					t.Fatalf("unexpected request = %s %s", req.Method, req.URL.Path)
+				}
+				return newHTTPResponse(
+					http.StatusAccepted,
+					`{"error":{"code":"tool_approval_required","message":"tool approval required","tool_id":"compozy__workspace_info","reason_codes":["approval_token_missing","approval_required"],"layer":"approval"}}`,
+				), nil
+			})},
+		}
+
+		_, err := approvalClient.InvokeTool(
+			t.Context(),
+			toolspkg.ToolIDWorkspaceInfo.String(),
+			ToolInvokeRequest{SessionID: "sess-deny", Input: json.RawMessage(`{"workspace":"qa-secondary"}`)},
+		)
+		if err == nil {
+			t.Fatal("InvokeTool() error = nil, want approval-required error")
+		}
+		apiErr, ok := errors.AsType[*toolAPIError](err)
+		if !ok {
+			t.Fatalf("InvokeTool() error = %T, want *toolAPIError", err)
+		}
+		response := apiErr.Response()
+		if response.Error.Code != toolspkg.ErrorCodeApprovalRequired ||
+			response.Error.ToolID != toolspkg.ToolIDWorkspaceInfo ||
+			!slices.Contains(response.Error.ReasonCodes, toolspkg.ReasonApprovalTokenMissing) {
+			t.Fatalf("InvokeTool() error response = %#v, want preserved approval payload", response)
+		}
+	})
+
+	t.Run("Should list toolsets", func(t *testing.T) {
+		t.Parallel()
+
+		response, err := client.ListToolsets(t.Context(), ToolQuery{AgentName: "coder"})
+		if err != nil {
+			t.Fatalf("ListToolsets() error = %v", err)
+		}
+		if len(response.Toolsets) != 2 {
+			t.Fatalf("ListToolsets() count = %d, want 2", len(response.Toolsets))
+		}
+	})
+
+	t.Run("Should get toolset", func(t *testing.T) {
+		t.Parallel()
+
+		response, err := client.GetToolset(t.Context(), toolspkg.ToolsetIDCatalog.String(), ToolQuery{
+			SessionID: "sess-1",
+		})
+		if err != nil {
+			t.Fatalf("GetToolset() error = %v", err)
+		}
+		if response.Toolset.ID != toolspkg.ToolsetIDCatalog {
+			t.Fatalf("GetToolset() id = %q, want %q", response.Toolset.ID, toolspkg.ToolsetIDCatalog)
+		}
+	})
+}
+
+func TestNearestCLIWorkspaceRoute(t *testing.T) {
+	t.Parallel()
+
+	t.Run("Should choose the nearest registered enclosing root", func(t *testing.T) {
+		t.Parallel()
+
+		root := t.TempDir()
+		parent := filepath.Join(root, "alpha")
+		nested := filepath.Join(parent, "nested")
+		target := filepath.Join(nested, "src")
+		for _, path := range []string{target, filepath.Join(root, "alpha-2")} {
+			if err := os.MkdirAll(path, 0o755); err != nil {
+				t.Fatalf("MkdirAll(%q) error = %v", path, err)
+			}
+		}
+		ref, err := nearestCLIWorkspaceRoute(
+			target,
+			[]WorkspaceRecord{
+				{ID: "ws-parent", RootDir: parent},
+				{ID: "ws-nested", RootDir: nested},
+				{ID: "ws-prefix", RootDir: filepath.Join(root, "alpha-2")},
+			},
+		)
+		if err != nil {
+			t.Fatalf("nearestCLIWorkspaceRoute() error = %v", err)
+		}
+		if ref != "ws-nested" {
+			t.Fatalf("nearestCLIWorkspaceRoute() = %q, want %q", ref, "ws-nested")
+		}
+	})
+
+	t.Run("Should reject path prefix collisions", func(t *testing.T) {
+		t.Parallel()
+
+		root := t.TempDir()
+		registered := filepath.Join(root, "alpha")
+		target := filepath.Join(root, "alpha-2", "src")
+		for _, path := range []string{registered, target} {
+			if err := os.MkdirAll(path, 0o755); err != nil {
+				t.Fatalf("MkdirAll(%q) error = %v", path, err)
+			}
+		}
+		_, err := nearestCLIWorkspaceRoute(
+			target,
+			[]WorkspaceRecord{{ID: "ws-alpha", RootDir: registered}},
+		)
+		canonicalTarget, canonicalErr := canonicalCLIWorkspacePath(target)
+		if canonicalErr != nil {
+			t.Fatalf("canonicalCLIWorkspacePath(%q) error = %v", target, canonicalErr)
+		}
+		pathErr, pathErrMatched := errors.AsType[*workspacePathNotRegisteredError](err)
+		if !pathErrMatched || pathErr.path != canonicalTarget {
+			t.Fatalf("nearestCLIWorkspaceRoute() error = %v, want unregistered path error for %q", err, target)
+		}
+	})
+
+	t.Run("Should reject a nonexistent nested path", func(t *testing.T) {
+		t.Parallel()
+
+		root := t.TempDir()
+		target := filepath.Join(root, "missing")
+		_, err := nearestCLIWorkspaceRoute(
+			target,
+			[]WorkspaceRecord{{ID: "ws-alpha", RootDir: root}},
+		)
+		if err == nil || !errors.Is(err, os.ErrNotExist) {
+			t.Fatalf("nearestCLIWorkspaceRoute() error = %v, want os.ErrNotExist", err)
+		}
+	})
+}
+
+func TestUnixSocketClientToolMethodsReturnStructuredErrors(t *testing.T) {
+	t.Parallel()
+
+	client := &daemonClient{
+		target: LocalClientTarget("/tmp/compozy.sock"),
+		httpClient: &http.Client{
+			Transport: roundTripperFunc(func(req *http.Request) (*http.Response, error) {
+				switch {
+				case strings.HasPrefix(req.URL.Path, "/api/tools"),
+					strings.HasPrefix(req.URL.Path, "/api/toolsets"):
+					return newHTTPResponse(
+						http.StatusUnprocessableEntity,
+						`{"error":{"code":"tool_unavailable","message":"tool token=super-secret unavailable","tool_id":"compozy__skill_view","reason_codes":["backend_unhealthy"],"layer":"registry","details":{"secret":"super-secret"}}}`,
+					), nil
+				default:
+					t.Fatalf("unexpected request = %s %s", req.Method, req.URL.Path)
+					return nil, nil
+				}
+			}),
+		},
+	}
+
+	testCases := []struct {
+		name string
+		run  func(context.Context) error
+	}{
+		{
+			name: "Should return list tools error",
+			run: func(ctx context.Context) error {
+				_, err := client.ListTools(ctx, ToolQuery{})
+				return err
+			},
+		},
+		{
+			name: "Should return search tools error",
+			run: func(ctx context.Context) error {
+				_, err := client.SearchTools(ctx, ToolSearchRequest{Query: "skill"})
+				return err
+			},
+		},
+		{
+			name: "Should return get tool error",
+			run: func(ctx context.Context) error {
+				_, err := client.GetTool(ctx, toolspkg.ToolIDSkillView.String(), ToolQuery{})
+				return err
+			},
+		},
+		{
+			name: "Should return invoke tool error",
+			run: func(ctx context.Context) error {
+				_, err := client.InvokeTool(ctx, toolspkg.ToolIDToolInfo.String(), ToolInvokeRequest{})
+				return err
+			},
+		},
+		{
+			name: "Should return list toolsets error",
+			run: func(ctx context.Context) error {
+				_, err := client.ListToolsets(ctx, ToolQuery{})
+				return err
+			},
+		},
+		{
+			name: "Should return get toolset error",
+			run: func(ctx context.Context) error {
+				_, err := client.GetToolset(ctx, toolspkg.ToolsetIDCatalog.String(), ToolQuery{})
+				return err
+			},
+		},
+	}
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			err := tc.run(t.Context())
+
+			toolErr, toolErrMatched := errors.AsType[*toolAPIError](err)
+			if !toolErrMatched {
+				t.Fatalf("tool client error = %T %[1]v, want toolAPIError", err)
+			}
+			if strings.Contains(toolErr.Error(), "super-secret") {
+				t.Fatalf("tool client error leaked secret: %v", toolErr)
+			}
+			response := toolErr.Response()
+			if response.Error.Code != toolspkg.ErrorCodeUnavailable ||
+				len(response.Error.Details) > 0 ||
+				response.Error.ReasonCodes[0] != toolspkg.ReasonBackendUnhealthy {
+				t.Fatalf("tool client error response = %#v, want sanitized unavailable error", response.Error)
+			}
+		})
+	}
+}
+
+func TestUnixSocketClientHostedMCPMethods(t *testing.T) {
+	t.Parallel()
+
+	t.Run("Should exercise hosted MCP client methods", func(t *testing.T) {
+		t.Parallel()
+
+		client := &daemonClient{
+			target: LocalClientTarget("/tmp/compozy.sock"),
+			httpClient: &http.Client{
+				Transport: roundTripperFunc(func(req *http.Request) (*http.Response, error) {
+					switch {
+					case req.Method == http.MethodPost && req.URL.Path == "/api/internal/hosted-mcp/bind":
+						var request mcppkg.HostedBindRequest
+						if err := json.NewDecoder(req.Body).Decode(&request); err != nil {
+							t.Fatalf("decode bind body: %v", err)
+						}
+						if request.SessionID != "sess-1" || request.Nonce != "nonce-test" {
+							t.Fatalf("bind request = %#v, want session and nonce", request)
+						}
+						return newHTTPResponse(
+							http.StatusOK,
+							`{"bind_id":"bind-1","scope":{"session_id":"sess-1","workspace_id":"ws-1","agent_name":"coder"},"tools":[],"digest":"digest-1"}`,
+						), nil
+					case req.Method == http.MethodGet && req.URL.Path == "/api/internal/hosted-mcp/projection":
+						if req.URL.Query().Get("bind_id") != "bind-1" {
+							t.Fatalf("projection query = %s, want bind_id", req.URL.RawQuery)
+						}
+						return newHTTPResponse(http.StatusOK, `{"tools":[],"digest":"digest-2"}`), nil
+					case req.Method == http.MethodGet && req.URL.Path == "/api/internal/hosted-mcp/projection/stream":
+						if req.URL.Query().Get("bind_id") != "bind-1" ||
+							req.URL.Query().Get("last_digest") != "digest-1" {
+							t.Fatalf("projection stream query = %s, want bind_id and last_digest", req.URL.RawQuery)
+						}
+						return newHTTPResponse(
+							http.StatusOK,
+							"event: ignored\n"+
+								"data: {}\n\n"+
+								"event: projection\n"+
+								"data: {\"tools\":[],\"digest\":\"digest-3\"}\n\n",
+						), nil
+					case req.Method == http.MethodPost && req.URL.Path == "/api/internal/hosted-mcp/tools/call":
+						var request mcppkg.HostedCallRequest
+						if err := json.NewDecoder(req.Body).Decode(&request); err != nil {
+							t.Fatalf("decode hosted call body: %v", err)
+						}
+						if request.BindID != "bind-1" ||
+							request.ToolName != "skill_view" ||
+							string(request.Input) != `{"ok":true}` {
+							t.Fatalf("hosted call request = %#v, want bound tool call", request)
+						}
+						return newHTTPResponse(
+							http.StatusOK,
+							`{"result":{"structured":{"ok":true},"preview":"ok","bytes":2,"duration_ms":1}}`,
+						), nil
+					case req.Method == http.MethodPost && req.URL.Path == "/api/internal/hosted-mcp/release":
+						var request mcppkg.HostedReleaseRequest
+						if err := json.NewDecoder(req.Body).Decode(&request); err != nil {
+							t.Fatalf("decode release body: %v", err)
+						}
+						if request.BindID != "bind-1" {
+							t.Fatalf("release request = %#v, want bind-1", request)
+						}
+						return newHTTPResponse(http.StatusNoContent, ""), nil
+					default:
+						t.Fatalf("unexpected request = %s %s", req.Method, req.URL.Path)
+						return nil, nil
+					}
+				}),
+			},
+		}
+
+		bind, err := client.BindHostedMCP(t.Context(), mcppkg.HostedBindRequest{
+			SessionID: "sess-1",
+			Nonce:     "nonce-test",
+		})
+		if err != nil {
+			t.Fatalf("BindHostedMCP() error = %v", err)
+		}
+		if bind.BindID != "bind-1" || bind.Scope.SessionID != "sess-1" || bind.Digest != "digest-1" {
+			t.Fatalf("BindHostedMCP() = %#v, want bind response", bind)
+		}
+
+		projection, err := client.HostedMCPProjection(t.Context(), " bind-1 ")
+		if err != nil {
+			t.Fatalf("HostedMCPProjection() error = %v", err)
+		}
+		if projection.Digest != "digest-2" {
+			t.Fatalf("HostedMCPProjection() digest = %q, want digest-2", projection.Digest)
+		}
+
+		var streamedDigest string
+		err = client.StreamHostedMCPProjection(
+			t.Context(),
+			" bind-1 ",
+			" digest-1 ",
+			func(snapshot mcppkg.HostedProjectionResponse) error {
+				streamedDigest = snapshot.Digest
+				return nil
+			},
+		)
+		if err != nil {
+			t.Fatalf("StreamHostedMCPProjection() error = %v", err)
+		}
+		if streamedDigest != "digest-3" {
+			t.Fatalf("streamed digest = %q, want digest-3", streamedDigest)
+		}
+
+		call, err := client.CallHostedMCP(t.Context(), mcppkg.HostedCallRequest{
+			BindID:   "bind-1",
+			ToolName: "skill_view",
+			Input:    json.RawMessage(`{"ok":true}`),
+		})
+		if err != nil {
+			t.Fatalf("CallHostedMCP() error = %v", err)
+		}
+		if compactJSON(call.Result.Structured) != `{"ok":true}` {
+			t.Fatalf("CallHostedMCP() structured = %s, want ok", call.Result.Structured)
+		}
+
+		if err := client.ReleaseHostedMCP(
+			t.Context(),
+			mcppkg.HostedReleaseRequest{BindID: "bind-1"},
+		); err != nil {
+			t.Fatalf("ReleaseHostedMCP() error = %v", err)
+		}
+	})
+
+	t.Run("Should keep hosted tool calls on the long-lived client", func(t *testing.T) {
+		t.Parallel()
+
+		client := &daemonClient{
+			target: LocalClientTarget("/tmp/compozy.sock"),
+			httpClient: &http.Client{Transport: roundTripperFunc(func(*http.Request) (*http.Response, error) {
+				t.Fatal("CallHostedMCP() used the bounded JSON client")
+				return nil, nil
+			})},
+			streamClient: &http.Client{Transport: roundTripperFunc(func(req *http.Request) (*http.Response, error) {
+				if req.Method != http.MethodPost || req.URL.Path != "/api/internal/hosted-mcp/tools/call" {
+					t.Fatalf("hosted call request = %s %s", req.Method, req.URL.Path)
+				}
+				return newHTTPResponse(
+					http.StatusOK,
+					`{"result":{"structured":{"ok":true},"preview":"ok","bytes":2,"duration_ms":1}}`,
+				), nil
+			})},
+		}
+
+		call, err := client.CallHostedMCP(t.Context(), mcppkg.HostedCallRequest{
+			BindID: "bind-1", ToolName: "skill_view", Input: json.RawMessage(`{"ok":true}`),
+		})
+		if err != nil {
+			t.Fatalf("CallHostedMCP() error = %v", err)
+		}
+		if compactJSON(call.Result.Structured) != `{"ok":true}` {
+			t.Fatalf("CallHostedMCP() structured = %s, want ok", call.Result.Structured)
+		}
+	})
+
+	t.Run("Should redact hosted MCP stream errors", func(t *testing.T) {
+		t.Parallel()
+
+		client := &daemonClient{
+			target: LocalClientTarget("/tmp/compozy.sock"),
+			httpClient: &http.Client{
+				Transport: roundTripperFunc(func(req *http.Request) (*http.Response, error) {
+					if req.Method != http.MethodGet || req.URL.Path != "/api/internal/hosted-mcp/projection/stream" {
+						t.Fatalf("request = %s %s, want hosted MCP stream", req.Method, req.URL.Path)
+					}
+					return newHTTPResponse(
+						http.StatusOK,
+						"event: error\n"+
+							"data: {\"error\":\"bind failed for compozy_claim_secret\"}\n\n",
+					), nil
+				}),
+			},
+		}
+		err := client.StreamHostedMCPProjection(t.Context(), "bind-1", "", nil)
+		if err == nil {
+			t.Fatal("StreamHostedMCPProjection(error event) error = nil, want redacted error")
+		}
+		if strings.Contains(err.Error(), "compozy_claim_secret") || !strings.Contains(err.Error(), "[REDACTED]") {
+			t.Fatalf("StreamHostedMCPProjection(error event) error = %q, want redacted claim token", err.Error())
+		}
+	})
+}
+
+func TestUnixSocketClientStreamsSessionEvents(t *testing.T) {
+	t.Parallel()
+
+	t.Run("Should stream session events", func(t *testing.T) {
+		t.Parallel()
+
+		client := &daemonClient{
+			target: LocalClientTarget("/tmp/compozy.sock"),
+			httpClient: &http.Client{
+				Transport: roundTripperFunc(func(req *http.Request) (*http.Response, error) {
+					if req.Method == http.MethodGet && req.URL.Path == "/api/sessions/sess-1" {
+						return newHTTPResponse(
+							http.StatusOK,
+							`{"session":{"id":"sess-1","agent_name":"coder","workspace_id":"ws-1","workspace_path":"/tmp","state":"active","created_at":"2026-04-03T12:00:00Z","updated_at":"2026-04-03T12:00:00Z"}}`,
+						), nil
+					}
+					if req.Method != http.MethodGet || req.URL.Path != "/api/workspaces/ws-1/sessions/sess-1/stream" {
+						t.Fatalf("request = %s %s, want GET session stream", req.Method, req.URL.Path)
+					}
+					if req.Header.Get("Last-Event-ID") != "evt-0" {
+						t.Fatalf("Last-Event-ID = %q, want evt-0", req.Header.Get("Last-Event-ID"))
+					}
+					if req.URL.Query().Get("type") != "tool_call" ||
+						req.URL.Query().Get("agent_name") != "coder" ||
+						req.URL.Query().Get("limit") != "2" ||
+						req.URL.Query().Get("frames") != contract.SessionStreamFrameRaw {
+						t.Fatalf("stream query = %s, want filters", req.URL.RawQuery)
+					}
+					return newHTTPResponse(
+						http.StatusOK,
+						"id: evt-1\n"+
+							"event: tool_call\n"+
+							`data: {"id":"evt-1","session_id":"sess-1","sequence":1,"type":"tool_call","agent_name":"coder","timestamp":"2026-04-03T12:00:00Z"}`+
+							"\n\n",
+					), nil
+				}),
+			},
+		}
+
+		var events []SSEEvent
+		err := client.StreamSessionEvents(
+			t.Context(),
+			" sess-1 ",
+			SessionEventQuery{Type: "tool_call", AgentName: "coder", Last: 2},
+			"evt-0",
+			func(event SSEEvent) error {
+				events = append(events, event)
+				return nil
+			},
+		)
+		if err != nil {
+			t.Fatalf("StreamSessionEvents() error = %v", err)
+		}
+		if len(events) != 1 || events[0].ID != "evt-1" || events[0].Event != "tool_call" {
+			t.Fatalf("events = %#v, want one tool_call event", events)
+		}
+	})
+}
+
+func TestUnixSocketClientTaskExecutionMethods(t *testing.T) {
+	t.Parallel()
+
+	t.Run("Should execute task mutation methods", func(t *testing.T) {
+		t.Parallel()
+
+		client := &daemonClient{
+			target: LocalClientTarget("/tmp/compozy.sock"),
+			httpClient: &http.Client{
+				Transport: roundTripperFunc(func(req *http.Request) (*http.Response, error) {
+					if req.Method != http.MethodPost {
+						t.Fatalf("request method = %s, want POST", req.Method)
+					}
+					switch req.URL.Path {
+					case "/api/tasks/task-1/publish", "/api/tasks/task-1/start", "/api/tasks/task-1/approve":
+						var request TaskExecutionRequest
+						if err := json.NewDecoder(req.Body).Decode(&request); err != nil {
+							t.Fatalf("decode task execution body: %v", err)
+						}
+
+						if request.IdempotencyKey != "idem-1" {
+							t.Fatalf("task execution request = %#v, want idempotency", request)
+						}
+						return newHTTPResponse(http.StatusOK, string(mustJSON(t, sampleTaskExecutionRecord()))), nil
+					default:
+						t.Fatalf("unexpected request path = %s", req.URL.Path)
+						return nil, nil
+					}
+				}),
+			},
+		}
+		request := TaskExecutionRequest{
+			IdempotencyKey: "idem-1",
+
+			Metadata: json.RawMessage(`{"source":"cli-test"}`),
+		}
+
+		published, err := client.PublishTask(t.Context(), " task-1 ", request)
+		if err != nil {
+			t.Fatalf("PublishTask() error = %v", err)
+		}
+		if published.Task.ID == "" || published.Run.ID == "" {
+			t.Fatalf("PublishTask() = %#v, want task and run", published)
+		}
+		started, err := client.StartTask(t.Context(), " task-1 ", request)
+		if err != nil {
+			t.Fatalf("StartTask() error = %v", err)
+		}
+		if started.Task.ID != published.Task.ID {
+			t.Fatalf("StartTask() task id = %q, want %q", started.Task.ID, published.Task.ID)
+		}
+		approved, err := client.ApproveTask(t.Context(), " task-1 ", request)
+		if err != nil {
+			t.Fatalf("ApproveTask() error = %v", err)
+		}
+		if approved.Run.ID != published.Run.ID {
+			t.Fatalf("ApproveTask() run id = %q, want %q", approved.Run.ID, published.Run.ID)
+		}
+	})
+}
+
+func TestUnixSocketClientAgentContextAndSpawnMethods(t *testing.T) {
+	t.Parallel()
+
+	t.Run("Should get agent context and spawn child sessions", func(t *testing.T) {
+		t.Parallel()
+
+		credentials := agentidentity.Credentials{
+			SessionID: "sess-1",
+			AgentName: "coder",
+		}
+		client := &daemonClient{
+			target: LocalClientTarget("/tmp/compozy.sock"),
+			httpClient: &http.Client{
+				Transport: roundTripperFunc(func(req *http.Request) (*http.Response, error) {
+					assertAgentRequestHeaders(t, req, credentials)
+					switch {
+					case req.Method == http.MethodGet && req.URL.Path == "/api/agent/context":
+						return newHTTPResponse(
+							http.StatusOK,
+							`{"context":{"self":{"session_id":"sess-1","agent_name":"coder","provider":"test"},"workspace":{"id":"ws-1"},"session":{"id":"sess-1","agent_name":"coder","workspace_id":"ws-1","workspace_path":"/tmp","state":"active","created_at":"2026-04-03T12:00:00Z","updated_at":"2026-04-03T12:00:00Z"}}}`,
+						), nil
+					case req.Method == http.MethodPost && req.URL.Path == "/api/agent/spawn":
+						var request AgentSpawnRequest
+						if err := json.NewDecoder(req.Body).Decode(&request); err != nil {
+							t.Fatalf("decode spawn body: %v", err)
+						}
+						if request.AgentName != "worker" || request.SpawnRole != "reviewer" {
+							t.Fatalf("spawn request = %#v, want worker reviewer", request)
+						}
+						return newHTTPResponse(
+							http.StatusCreated,
+							`{"spawn":{"session":{"id":"sess-child","agent_name":"worker","workspace_id":"ws-1","workspace_path":"/tmp","state":"active","created_at":"2026-04-03T12:00:00Z","updated_at":"2026-04-03T12:00:00Z"},"lineage":{"parent_session_id":"sess-1","root_session_id":"sess-1","depth":1},"permissions":{}}}`,
+						), nil
+					default:
+						t.Fatalf("unexpected request = %s %s", req.Method, req.URL.Path)
+						return nil, nil
+					}
+				}),
+			},
+		}
+
+		contextRecord, err := client.AgentContext(t.Context(), credentials)
+		if err != nil {
+			t.Fatalf("AgentContext() error = %v", err)
+		}
+		if contextRecord.Self.SessionID != "sess-1" || contextRecord.Workspace.ID != "ws-1" {
+			t.Fatalf("AgentContext() = %#v, want caller context", contextRecord)
+		}
+
+		spawn, err := client.AgentSpawn(t.Context(), AgentSpawnRequest{
+			AgentName: "worker",
+			SpawnRole: "reviewer",
+		}, credentials)
+		if err != nil {
+			t.Fatalf("AgentSpawn() error = %v", err)
+		}
+		if spawn.Session.ID != "sess-child" || spawn.Session.AgentName != "worker" {
+			t.Fatalf("AgentSpawn() = %#v, want child session", spawn.Session)
+		}
+	})
+}
+
+func assertAgentRequestHeaders(t *testing.T, req *http.Request, credentials agentidentity.Credentials) {
+	t.Helper()
+
+	if got := req.Header.Get(agentidentity.HeaderSessionID); got != credentials.SessionID {
+		t.Fatalf("%s = %q, want %q", agentidentity.HeaderSessionID, got, credentials.SessionID)
+	}
+	if got := req.Header.Get(agentidentity.HeaderAgent); got != credentials.AgentName {
+		t.Fatalf("%s = %q, want %q", agentidentity.HeaderAgent, got, credentials.AgentName)
+	}
+}
+
+func TestUnixSocketClientSessionAttachmentUpload(t *testing.T) {
+	t.Parallel()
+
+	t.Run("Should upload the file as a real session multipart attachment", func(t *testing.T) {
+		t.Parallel()
+
+		filePath := filepath.Join(t.TempDir(), "frame.png")
+		fileBytes := []byte("exact attachment bytes")
+		if err := os.WriteFile(filePath, fileBytes, 0o600); err != nil {
+			t.Fatalf("os.WriteFile() error = %v", err)
+		}
+
+		var preflightCalls int
+		var uploadCalls int
+		client := &daemonClient{
+			target: LocalClientTarget("/tmp/compozy.sock"),
+			httpClient: &http.Client{
+				Transport: roundTripperFunc(func(req *http.Request) (*http.Response, error) {
+					switch {
+					case req.Method == http.MethodGet && req.URL.Path == "/api/sessions/sess-1":
+						preflightCalls++
+						return newHTTPResponse(
+							http.StatusOK,
+							`{"session":{"id":"sess-1","workspace_id":"ws-1","state":"active","created_at":"2026-04-03T12:00:00Z","updated_at":"2026-04-03T12:00:00Z"}}`,
+						), nil
+					case req.Method == http.MethodPost && req.URL.Path == "/api/workspaces/ws-1/sessions/sess-1/attachments":
+						uploadCalls++
+						rawBody, err := io.ReadAll(req.Body)
+						if err != nil {
+							t.Fatalf("io.ReadAll(upload body) error = %v", err)
+						}
+						if req.ContentLength != int64(len(rawBody)) {
+							t.Fatalf("ContentLength = %d, want %d", req.ContentLength, len(rawBody))
+						}
+						if got := req.Header.Get("Expect"); got != "100-continue" {
+							t.Fatalf("Expect = %q, want 100-continue", got)
+						}
+						req.Body = io.NopCloser(bytes.NewReader(rawBody))
+						reader, err := req.MultipartReader()
+						if err != nil {
+							t.Fatalf("Request.MultipartReader() error = %v", err)
+						}
+						part, err := reader.NextPart()
+						if err != nil {
+							t.Fatalf("multipart NextPart() error = %v", err)
+						}
+						if got := part.FormName(); got != "file" {
+							t.Fatalf("multipart field = %q, want file", got)
+						}
+						if got := part.FileName(); got != "frame.png" {
+							t.Fatalf("multipart filename = %q, want frame.png", got)
+						}
+						gotBytes, err := io.ReadAll(part)
+						if err != nil {
+							t.Fatalf("io.ReadAll(multipart file) error = %v", err)
+						}
+						if !bytes.Equal(gotBytes, fileBytes) {
+							t.Fatalf("multipart bytes = %q, want %q", gotBytes, fileBytes)
+						}
+						if _, err := reader.NextPart(); !errors.Is(err, io.EOF) {
+							t.Fatalf("multipart trailing part error = %v, want io.EOF", err)
+						}
+						return newHTTPResponse(
+							http.StatusCreated,
+							`{"attachment":{"id":"att-1","name":"frame.png","mime_type":"image/png","bytes":22,"sha256":"sha256:abc","kind":"image","width":4,"height":3,"created_at":"2026-04-03T12:00:00Z"}}`,
+						), nil
+					default:
+						t.Fatalf("unexpected request = %s %s", req.Method, req.URL.Path)
+						return nil, nil
+					}
+				}),
+			},
+		}
+
+		record, err := client.UploadSessionAttachment(t.Context(), "sess-1", filePath)
+		if err != nil {
+			t.Fatalf("UploadSessionAttachment() error = %v", err)
+		}
+		if preflightCalls != 1 || uploadCalls != 1 {
+			t.Fatalf("request counts = preflight:%d upload:%d, want 1 each", preflightCalls, uploadCalls)
+		}
+		if record.ID != "att-1" || record.Name != "frame.png" || record.MIMEType != "image/png" ||
+			record.SHA256 != "sha256:abc" || record.Kind != contract.PromptAttachmentKindImage {
+			t.Fatalf("attachment record = %#v, want uploaded attachment metadata", record)
+		}
+		if got := fmt.Sprint(record.Bytes); got != "22" {
+			t.Fatalf("attachment bytes = %s, want 22", got)
+		}
+	})
+
+	t.Run("Should stop the multipart producer when transport fails before reading", func(t *testing.T) {
+		t.Parallel()
+
+		filePath := filepath.Join(t.TempDir(), "large-frame.png")
+		if err := os.WriteFile(filePath, bytes.Repeat([]byte("x"), 1<<20), 0o600); err != nil {
+			t.Fatalf("os.WriteFile() error = %v", err)
+		}
+		transportErr := errors.New("injected upload transport failure")
+		var multipartBody *sessionAttachmentMultipartBody
+		client := &daemonClient{
+			target: LocalClientTarget("/tmp/compozy.sock"),
+			httpClient: &http.Client{Transport: roundTripperFunc(func(req *http.Request) (*http.Response, error) {
+				if req.Method == http.MethodGet {
+					return newHTTPResponse(
+						http.StatusOK,
+						`{"session":{"id":"sess-1","workspace_id":"ws-1","state":"active","created_at":"2026-04-03T12:00:00Z","updated_at":"2026-04-03T12:00:00Z"}}`,
+					), nil
+				}
+				var ok bool
+				multipartBody, ok = req.Body.(*sessionAttachmentMultipartBody)
+				if !ok {
+					t.Fatalf("upload request body = %T, want *sessionAttachmentMultipartBody", req.Body)
+				}
+				return nil, transportErr
+			})},
+		}
+
+		ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
+		defer cancel()
+		_, err := client.UploadSessionAttachment(ctx, "sess-1", filePath)
+		if !errors.Is(err, transportErr) {
+			t.Fatalf("UploadSessionAttachment() error = %v, want transport failure", err)
+		}
+		if multipartBody == nil {
+			t.Fatal("upload transport did not receive the multipart body")
+		}
+		select {
+		case _, open := <-multipartBody.done:
+			if open {
+				t.Fatal("multipart producer completion was not joined")
+			}
+		case <-time.After(time.Second):
+			t.Fatal("timed out waiting for multipart producer completion")
+		}
+	})
+
+	t.Run("Should preserve the daemon rejection when it stops reading the upload early", func(t *testing.T) {
+		t.Parallel()
+
+		filePath := filepath.Join(t.TempDir(), "oversize-frame.png")
+		if err := os.WriteFile(filePath, bytes.Repeat([]byte("x"), 1<<20), 0o600); err != nil {
+			t.Fatalf("os.WriteFile() error = %v", err)
+		}
+		client := &daemonClient{
+			target: LocalClientTarget("/tmp/compozy.sock"),
+			httpClient: &http.Client{Transport: roundTripperFunc(func(req *http.Request) (*http.Response, error) {
+				if req.Method == http.MethodGet {
+					return newHTTPResponse(
+						http.StatusOK,
+						`{"session":{"id":"sess-1","workspace_id":"ws-1","state":"active","created_at":"2026-04-03T12:00:00Z","updated_at":"2026-04-03T12:00:00Z"}}`,
+					), nil
+				}
+				if err := req.Body.Close(); err != nil && !errors.Is(err, io.ErrClosedPipe) {
+					t.Fatalf("request body Close() error = %v", err)
+				}
+				return newHTTPResponse(
+					http.StatusRequestEntityTooLarge,
+					`{"error":"session attachment exceeds maximum file size of 10485760 bytes"}`,
+				), nil
+			})},
+		}
+
+		_, err := client.UploadSessionAttachment(t.Context(), "sess-1", filePath)
+		if err == nil || !strings.Contains(err.Error(), "exceeds maximum file size") {
+			t.Fatalf("UploadSessionAttachment() error = %v, want daemon size rejection", err)
+		}
+		if strings.Contains(err.Error(), "closed pipe") {
+			t.Fatalf("UploadSessionAttachment() error = %v, want no expected pipe interruption", err)
+		}
+	})
+
+	t.Run("Should drain an upload response when multipart cleanup fails", func(t *testing.T) {
+		t.Parallel()
+
+		requestErr := errors.New("upload request failed")
+		bodyErr := errors.New("multipart cleanup failed")
+		reader := &stagedResponseReader{chunks: [][]byte{[]byte("cleanup response")}}
+		responseBody := &responseBodyProbe{reader: reader}
+		response := newHTTPResponse(http.StatusCreated, "")
+		response.Body = responseBody
+
+		err := cleanupSessionAttachmentUpload("unread-frame.png", requestErr, bodyErr, response)
+		if !errors.Is(err, requestErr) || !errors.Is(err, bodyErr) {
+			t.Fatalf("cleanupSessionAttachmentUpload() error = %v, want request and cleanup errors", err)
+		}
+		if got := len(reader.chunks); got != 0 {
+			t.Fatalf("cleanup response chunks = %d, want 0", got)
+		}
+		if got, want := responseBody.closeCalls.Load(), int32(1); got != want {
+			t.Fatalf("cleanup response Close() calls = %d, want %d", got, want)
+		}
+	})
+
+	t.Run("Should reject a missing file without sending an upload", func(t *testing.T) {
+		t.Parallel()
+
+		client := &daemonClient{
+			target: LocalClientTarget("/tmp/compozy.sock"),
+			httpClient: &http.Client{
+				Transport: roundTripperFunc(func(req *http.Request) (*http.Response, error) {
+					if req.Method != http.MethodGet || req.URL.Path != "/api/sessions/sess-1" {
+						t.Fatalf("unexpected upload request = %s %s", req.Method, req.URL.Path)
+					}
+					return newHTTPResponse(
+						http.StatusOK,
+						`{"session":{"id":"sess-1","workspace_id":"ws-1","state":"active","created_at":"2026-04-03T12:00:00Z","updated_at":"2026-04-03T12:00:00Z"}}`,
+					), nil
+				}),
+			},
+		}
+
+		_, err := client.UploadSessionAttachment(
+			t.Context(),
+			"sess-1",
+			filepath.Join(t.TempDir(), "missing.png"),
+		)
+		if err == nil || !errors.Is(err, os.ErrNotExist) {
+			t.Fatalf("UploadSessionAttachment() error = %v, want os.ErrNotExist", err)
+		}
+	})
+}
+
+func TestSessionPullRequestClient(t *testing.T) {
+	t.Parallel()
+	t.Run("Should refresh through the canonical by-id HTTP route", func(t *testing.T) {
+		t.Parallel()
+		mux := http.NewServeMux()
+		mux.HandleFunc("POST /api/sessions/{id}/pull-request/refresh", func(w http.ResponseWriter, r *http.Request) {
+			if r.PathValue("id") != "sess-1" {
+				t.Errorf("session id = %q", r.PathValue("id"))
+			}
+			w.Header().Set("Content-Type", "application/json")
+			if _, err := io.WriteString(
+				w,
+				`{"session_id":"sess-1","branch":"topic","pull_request":{"number":43}}`,
+			); err != nil {
+				t.Error(err)
+			}
+		})
+		server := httptest.NewServer(mux)
+		t.Cleanup(server.Close)
+		client := &daemonClient{
+			target: LocalClientTarget("/tmp/compozy.sock"),
+			httpClient: &http.Client{Transport: roundTripperFunc(func(r *http.Request) (*http.Response, error) {
+				target, err := url.Parse(server.URL)
+				if err != nil {
+					return nil, err
+				}
+				r.URL.Scheme, r.URL.Host = target.Scheme, target.Host
+				return server.Client().Transport.RoundTrip(r)
+			})},
+		}
+		result, err := client.RefreshSessionPullRequest(t.Context(), "sess-1")
+		if err != nil || result.Branch != "topic" || result.PullRequest == nil || result.PullRequest.Number != 43 {
+			t.Fatalf("refresh = %#v, %v", result, err)
+		}
+	})
+}
+
+func TestUnixSocketClientMethods(t *testing.T) {
+	t.Parallel()
+
+	workspacePathRoot := t.TempDir()
+	client := &daemonClient{
+		target: LocalClientTarget("/tmp/compozy.sock"),
+		httpClient: &http.Client{
+			Transport: roundTripperFunc(func(req *http.Request) (*http.Response, error) {
+				switch {
+				case req.Method == http.MethodGet && req.URL.Path == "/api/sessions/sess-1":
+					return newHTTPResponse(
+						http.StatusOK,
+						`{"session":{"id":"sess-1","agent_name":"coder","workspace_id":"ws-1","workspace_path":"/tmp","state":"active","created_at":"2026-04-03T12:00:00Z","updated_at":"2026-04-03T12:00:00Z"}}`,
+					), nil
+				case req.Method == http.MethodGet && req.URL.Path == "/api/sessions":
+					if got := req.URL.Query().Get("workspace"); got != "" && got != "ws-1" {
+						t.Fatalf("session workspace query = %q, want empty or ws-1", got)
+					}
+					return newHTTPResponse(
+						http.StatusOK,
+						`{"sessions":[{"id":"sess-1","agent_name":"coder","workspace_id":"ws-1","workspace_path":"/tmp","state":"active","created_at":"2026-04-03T12:00:00Z","updated_at":"2026-04-03T12:00:00Z"}],"page":{"next_cursor":"cursor-next","has_more":true,"total":3,"limit":1}}`,
+					), nil
+				case req.Method == http.MethodPost && req.URL.Path == "/api/sessions":
+					body, err := io.ReadAll(req.Body)
+					if err != nil {
+						t.Fatalf("io.ReadAll(session create body) error = %v", err)
+					}
+					if !strings.Contains(string(body), `"agent_name":"coder"`) {
+						t.Fatalf("session create body = %s, want agent_name", body)
+					}
+					return newHTTPResponse(
+						http.StatusCreated,
+						`{"session":{"id":"sess-new","agent_name":"coder","workspace_id":"ws-1","workspace_path":"/tmp","state":"active","created_at":"2026-04-03T12:00:00Z","updated_at":"2026-04-03T12:00:00Z"}}`,
+					), nil
+				case req.Method == http.MethodGet && req.URL.Path == "/api/workspaces/ws-1/sessions/sess-1":
+					return newHTTPResponse(
+						http.StatusOK,
+						`{"session":{"id":"sess-1","agent_name":"coder","workspace_id":"ws-1","workspace_path":"/tmp","state":"active","created_at":"2026-04-03T12:00:00Z","updated_at":"2026-04-03T12:00:00Z"}}`,
+					), nil
+				case req.Method == http.MethodGet && req.URL.Path == "/api/workspaces/ws-1/sessions/sess-1/commands":
+					return newHTTPResponse(
+						http.StatusOK,
+						`{"commands":[{"id":"builtin:goal","canonical_token":"/goal","display_name":"/goal","description":"Goal","lane":"builtin","source":{"kind":"builtin","scope":"session"},"placements":["standalone"]}],"revision":"rev-commands"}`,
+					), nil
+				case req.Method == http.MethodPost && req.URL.Path == "/api/workspaces/ws-1/sessions/sess-1/stop":
+					var input contract.StopSessionRequest
+					if err := json.NewDecoder(req.Body).Decode(&input); err != nil || input.Wait == nil || *input.Wait {
+						t.Fatalf("stop request = %#v, %v", input, err)
+					}
+					return newHTTPResponse(
+						http.StatusAccepted,
+						`{"session_id":"sess-1","status":"stopping","state":"stopping","verified":false,"escalated":false}`,
+					), nil
+				case req.Method == http.MethodPost && req.URL.Path == "/api/workspaces/ws-1/sessions/sess-1/archive":
+					// The default archive sends no stop query; only the opt-in does.
+					if stop, present := req.URL.Query()["stop"]; present && (len(stop) != 1 || stop[0] != "true") {
+						t.Fatalf("archive stop query = %#v, want absent or true", stop)
+					}
+					return newHTTPResponse(
+						http.StatusOK,
+						`{"session":{"id":"sess-1","agent_name":"coder","workspace_id":"ws-1","state":"stopped","archived_at":"2026-04-03T12:01:00Z","created_at":"2026-04-03T12:00:00Z","updated_at":"2026-04-03T12:01:00Z"}}`,
+					), nil
+				case req.Method == http.MethodPost && req.URL.Path == "/api/workspaces/ws-1/sessions/sess-1/unarchive":
+					return newHTTPResponse(
+						http.StatusOK,
+						`{"session":{"id":"sess-1","agent_name":"coder","workspace_id":"ws-1","state":"stopped","archived_at":null,"created_at":"2026-04-03T12:00:00Z","updated_at":"2026-04-03T12:02:00Z"}}`,
+					), nil
+				case req.Method == http.MethodPatch && req.URL.Path == "/api/workspaces/ws-1/sessions/sess-1":
+					var body RenameSessionRequest
+					if err := json.NewDecoder(req.Body).Decode(&body); err != nil {
+						t.Fatalf("decode session rename request error = %v", err)
+					}
+					if body.Name != "Checkout retries" {
+						t.Fatalf("session rename name = %q", body.Name)
+					}
+					return newHTTPResponse(
+						http.StatusOK,
+						`{"session":{"id":"sess-1","name":"Checkout retries","agent_name":"coder","workspace_id":"ws-1","state":"stopped","archived_at":null,"created_at":"2026-04-03T12:00:00Z","updated_at":"2026-04-03T12:03:00Z"}}`,
+					), nil
+				case req.Method == http.MethodPut && req.URL.Path == "/api/workspaces/ws-1/sessions/sess-1/parent":
+					var body SetSessionParentRequest
+					if err := json.NewDecoder(req.Body).Decode(&body); err != nil {
+						t.Fatalf("decode session parent request error = %v", err)
+					}
+					if body.ParentSessionID != "sess-parent" {
+						t.Fatalf("session parent id = %q", body.ParentSessionID)
+					}
+					return newHTTPResponse(
+						http.StatusOK,
+						`{"session":{"id":"sess-1","agent_name":"coder","workspace_id":"ws-1","state":"stopped","lineage":{"parent_session_id":"sess-parent","root_session_id":"sess-parent","spawn_depth":1,"kind":"provenance"},"created_at":"2026-04-03T12:00:00Z","updated_at":"2026-04-03T12:04:00Z"}}`,
+					), nil
+				case req.Method == http.MethodDelete && req.URL.Path == "/api/workspaces/ws-1/sessions/sess-1/parent":
+					return newHTTPResponse(
+						http.StatusOK,
+						`{"session":{"id":"sess-1","agent_name":"coder","workspace_id":"ws-1","state":"stopped","lineage":{"root_session_id":"sess-1","spawn_depth":0},"created_at":"2026-04-03T12:00:00Z","updated_at":"2026-04-03T12:05:00Z"}}`,
+					), nil
+				case req.Method == http.MethodPost && req.URL.Path == "/api/workspaces/ws-1/sessions/sess-1/attach":
+					return newHTTPResponse(
+						http.StatusOK,
+						`{"session":{"id":"sess-1","agent_name":"coder","workspace_id":"ws-1","workspace_path":"/tmp","state":"active","created_at":"2026-04-03T12:00:00Z","updated_at":"2026-04-03T12:00:00Z"}}`,
+					), nil
+				case req.Method == http.MethodPost && req.URL.Path == "/api/workspaces/ws-1/sessions/sess-1/repair":
+					if got := req.URL.Query().Get("dry_run"); got != "true" {
+						t.Fatalf("repair dry_run query = %q, want true", got)
+					}
+					if got := req.URL.Query().Get("force"); got != "true" {
+						t.Fatalf("repair force query = %q, want true", got)
+					}
+					return newHTTPResponse(
+						http.StatusOK,
+						`{"repair":{"session_id":"sess-1","persisted":false,"issues":[],"actions":[{"code":"append_terminal_error","turn_id":"turn-1","persisted":false}]}}`,
+					), nil
+				case req.Method == http.MethodPost && req.URL.Path == "/api/workspaces/ws-1/sessions/sess-1/prompt":
+					body, err := io.ReadAll(req.Body)
+					if err != nil {
+						t.Fatalf("io.ReadAll(prompt body) error = %v", err)
+					}
+					if got := req.URL.Query().Get("format"); got != "raw" {
+						t.Fatalf("prompt format query = %q, want raw", got)
+					}
+					if !strings.Contains(string(body), `"message":"hello"`) {
+						t.Fatalf("prompt body = %s, want message", body)
+					}
+					resp := newHTTPResponse(http.StatusOK, strings.Join([]string{
+						"id: 1",
+						"event: agent_message",
+						`data: {"session_id":"sess-1","turn_id":"turn-1","type":"agent_message","timestamp":"2026-04-03T12:00:00Z","text":"hello back"}`,
+						"",
+						"id: 2",
+						"event: done",
+						`data: {"session_id":"sess-1","turn_id":"turn-1","type":"done","timestamp":"2026-04-03T12:00:01Z"}`,
+						"",
+					}, "\n"))
+					resp.Header.Set("Content-Type", "text/event-stream")
+					return resp, nil
+				case req.Method == http.MethodGet && req.URL.Path == "/api/workspaces/ws-1/sessions/sess-1/events":
+					if got := req.URL.Query().Get("type"); got != "tool_call" {
+						t.Fatalf("session events type query = %q, want %q", got, "tool_call")
+					}
+					return newHTTPResponse(
+						http.StatusOK,
+						`{"events":[{"id":"evt-1","session_id":"sess-1","sequence":1,"turn_id":"turn-1","type":"tool_call","agent_name":"coder","timestamp":"2026-04-03T12:00:00Z"}]}`,
+					), nil
+				case req.Method == http.MethodGet && req.URL.Path == "/api/workspaces/ws-1/sessions/sess-1/history":
+					if got := req.URL.Query().Get("limit"); got != "2" {
+						t.Fatalf("history limit query = %q, want %q", got, "2")
+					}
+					return newHTTPResponse(
+						http.StatusOK,
+						`{"history":[{"turn_id":"turn-1","events":[{"id":"evt-1","session_id":"sess-1","sequence":1,"turn_id":"turn-1","type":"agent_message","agent_name":"coder","content":{"text":"hi"},"timestamp":"2026-04-03T12:00:00Z"}]}]}`,
+					), nil
+				case req.Method == http.MethodPost && req.URL.Path == "/api/workspaces":
+					body, err := io.ReadAll(req.Body)
+					if err != nil {
+						t.Fatalf("io.ReadAll(workspace create body) error = %v", err)
+					}
+					if !strings.Contains(string(body), `"root_dir":"/workspace/project"`) {
+						t.Fatalf("workspace create body = %s, want root_dir", body)
+					}
+					return newHTTPResponse(
+						http.StatusCreated,
+						`{"workspace":{"id":"ws-1","root_dir":"/workspace/project","name":"alpha","created_at":"2026-04-03T12:00:00Z","updated_at":"2026-04-03T12:00:00Z"}}`,
+					), nil
+				case req.Method == http.MethodGet && req.URL.Path == "/api/workspaces":
+					return newHTTPResponse(
+						http.StatusOK,
+						fmt.Sprintf(
+							`{"workspaces":[{"id":"ws-1","root_dir":%q,"name":"alpha","created_at":"2026-04-03T12:00:00Z","updated_at":"2026-04-03T12:00:00Z"}]}`,
+							workspacePathRoot,
+						),
+					), nil
+				case req.Method == http.MethodGet && req.URL.Path == "/api/workspaces/alpha":
+					return newHTTPResponse(
+						http.StatusOK,
+						`{"workspace":{"id":"ws-1","root_dir":"/workspace/project","name":"alpha","created_at":"2026-04-03T12:00:00Z","updated_at":"2026-04-03T12:00:00Z"},"sessions":[{"id":"sess-1","agent_name":"coder","workspace_id":"ws-1","workspace_path":"/workspace/project","state":"active","created_at":"2026-04-03T12:00:00Z","updated_at":"2026-04-03T12:00:00Z"}],"agents":[{"name":"coder","provider":"fake","prompt":"hi"}],"skills":[{"name":"review","dir":"/workspace/project/.compozy/skills/review","source":"workspace"}]}`,
+					), nil
+				case req.Method == http.MethodGet && req.URL.Path == "/api/workspaces/ws-1":
+					return newHTTPResponse(
+						http.StatusOK,
+						`{"workspace":{"id":"ws-1","root_dir":"/workspace/project","name":"alpha","created_at":"2026-04-03T12:00:00Z","updated_at":"2026-04-03T12:00:00Z"},"sessions":[{"id":"sess-1","agent_name":"coder","workspace_id":"ws-1","workspace_path":"/workspace/project","state":"active","created_at":"2026-04-03T12:00:00Z","updated_at":"2026-04-03T12:00:00Z"}],"agents":[{"name":"coder","provider":"fake","prompt":"hi"}],"skills":[{"name":"review","dir":"/workspace/project/.compozy/skills/review","source":"workspace"}]}`,
+					), nil
+				case req.Method == http.MethodPatch && req.URL.Path == "/api/workspaces/ws-1":
+					body, err := io.ReadAll(req.Body)
+					if err != nil {
+						t.Fatalf("io.ReadAll(workspace update body) error = %v", err)
+					}
+					if !strings.Contains(string(body), `"name":"beta"`) {
+						t.Fatalf("workspace update body = %s, want name", body)
+					}
+					return newHTTPResponse(
+						http.StatusOK,
+						`{"workspace":{"id":"ws-1","root_dir":"/workspace/project","name":"beta","created_at":"2026-04-03T12:00:00Z","updated_at":"2026-04-03T12:05:00Z"}}`,
+					), nil
+				case req.Method == http.MethodDelete && req.URL.Path == "/api/workspaces/ws-1":
+					return newHTTPResponse(http.StatusNoContent, ``), nil
+				case req.Method == http.MethodGet && req.URL.Path == "/api/agents":
+					if got := req.URL.Query().Get("workspace"); got != "alpha" {
+						t.Fatalf("agent list workspace query = %q, want %q", got, "alpha")
+					}
+					return newHTTPResponse(
+						http.StatusOK,
+						`{"agents":[{"name":"coder","provider":"fake","prompt":"You are coder."}]}`,
+					), nil
+				case req.Method == http.MethodGet && req.URL.Path == "/api/agents/coder":
+					if got := req.URL.Query().Get("workspace"); got != "alpha" {
+						t.Fatalf("agent info workspace query = %q, want %q", got, "alpha")
+					}
+					return newHTTPResponse(
+						http.StatusOK,
+						`{"agent":{"name":"coder","provider":"fake","prompt":"You are coder."}}`,
+					), nil
+				case req.Method == http.MethodGet && req.URL.Path == "/api/skills":
+					if got := req.URL.Query().Get("workspace"); got != "alpha" {
+						t.Fatalf("skill list workspace query = %q, want %q", got, "alpha")
+					}
+					return newHTTPResponse(
+						http.StatusOK,
+						`{"skills":[{"name":"review","description":"Review helper","source":"workspace","enabled":true,"dir":"/workspace/project/.compozy/skills/review"}]}`,
+					), nil
+				case req.Method == http.MethodGet && req.URL.Path == "/api/skills/review":
+					if got := req.URL.Query().Get("workspace_id"); got != "alpha" {
+						t.Fatalf("skill info workspace_id query = %q, want %q", got, "alpha")
+					}
+					return newHTTPResponse(
+						http.StatusOK,
+						`{"skill":{"name":"review","description":"Review helper","version":"1.0.0","source":"workspace","enabled":true,"dir":"/workspace/project/.compozy/skills/review","metadata":{"area":"qa"}}}`,
+					), nil
+				case req.Method == http.MethodGet && req.URL.Path == "/api/skills/review/content":
+					if got := req.URL.Query().Get("workspace"); got != "alpha" {
+						t.Fatalf("skill content workspace query = %q, want %q", got, "alpha")
+					}
+					return newHTTPResponse(http.StatusOK, `{"content":"# Review\n\nUse this skill."}`), nil
+				case req.Method == http.MethodGet && req.URL.Path == "/api/skills/review/shadows":
+					if got := req.URL.Query().Get("workspace"); got != "alpha" {
+						t.Fatalf("skill shadows workspace query = %q, want %q", got, "alpha")
+					}
+					return newHTTPResponse(
+						http.StatusOK,
+						`{"name":"review","winner":{"path":"/workspace/project/.compozy/skills/review/SKILL.md","tier":"workspace","resolved_to_winner":true,"detected_at":"2026-04-03T12:00:00Z"},"shadows":[{"path":"/workspace/project/.compozy/skills/review/SKILL.md","tier":"workspace","resolved_to_winner":true,"detected_at":"2026-04-03T12:00:00Z"}]}`,
+					), nil
+				case req.Method == http.MethodGet && req.URL.Path == "/api/hooks/catalog":
+					if got := req.URL.Query().Get("workspace"); got != "alpha" {
+						t.Fatalf("hook catalog workspace query = %q, want %q", got, "alpha")
+					}
+					if got := req.URL.Query().Get("agent"); got != "coder" {
+						t.Fatalf("hook catalog agent query = %q, want %q", got, "coder")
+					}
+					if got := req.URL.Query().Get("event"); got != "tool.pre_call" {
+						t.Fatalf("hook catalog event query = %q, want %q", got, "tool.pre_call")
+					}
+					if got := req.URL.Query().Get("source"); got != "config" {
+						t.Fatalf("hook catalog source query = %q, want %q", got, "config")
+					}
+					if got := req.URL.Query().Get("mode"); got != "sync" {
+						t.Fatalf("hook catalog mode query = %q, want %q", got, "sync")
+					}
+					return newHTTPResponse(
+						http.StatusOK,
+						`{"hooks":[{"order":1,"name":"permission-guard","event":"tool.pre_call","source":"config","mode":"sync","priority":10,"executor_kind":"subprocess"}]}`,
+					), nil
+				case req.Method == http.MethodGet && req.URL.Path == "/api/workspaces/ws-1/hooks/runs":
+					if got := req.URL.Query().Get("session"); got != "sess-1" {
+						t.Fatalf("hook runs session query = %q, want %q", got, "sess-1")
+					}
+					if got := req.URL.Query().Get("event"); got != "permission.request" {
+						t.Fatalf("hook runs event query = %q, want %q", got, "permission.request")
+					}
+					if got := req.URL.Query().Get("outcome"); got != "failed" {
+						t.Fatalf("hook runs outcome query = %q, want %q", got, "failed")
+					}
+					if got := req.URL.Query().Get("since"); got != "2026-04-03T11:00:00Z" {
+						t.Fatalf("hook runs since query = %q, want %q", got, "2026-04-03T11:00:00Z")
+					}
+					if got := req.URL.Query().Get("last"); got != "2" {
+						t.Fatalf("hook runs last query = %q, want %q", got, "2")
+					}
+					return newHTTPResponse(
+						http.StatusOK,
+						`{"runs":[{"hook_name":"permission-guard","event":"permission.request","source":"config","mode":"sync","duration_ms":12,"outcome":"failed","error":"boom","recorded_at":"2026-04-03T12:00:00Z"}]}`,
+					), nil
+				case req.Method == http.MethodGet && req.URL.Path == "/api/hooks/events":
+					if got := req.URL.Query().Get("family"); got != "tool" {
+						t.Fatalf("hook events family query = %q, want %q", got, "tool")
+					}
+					if got := req.URL.Query().Get("sync_only"); got != "true" {
+						t.Fatalf("hook events sync_only query = %q, want %q", got, "true")
+					}
+					return newHTTPResponse(
+						http.StatusOK,
+						`{"events":[{"event":"tool.pre_call","family":"tool","sync_eligible":true,"payload_schema":"ToolPreCallPayload","patch_schema":"ToolCallPatch"}]}`,
+					), nil
+				case req.Method == http.MethodGet && req.URL.Path == "/api/logs":
+					if got := req.URL.Query().Get("workspace_id"); got != "ws-1" {
+						t.Fatalf("logs workspace_id query = %q, want %q", got, "ws-1")
+					}
+					if got := req.URL.Query().Get("session_id"); got != "sess-1" {
+						t.Fatalf("logs session_id query = %q, want %q", got, "sess-1")
+					}
+					return newHTTPResponse(
+						http.StatusOK,
+						`{"events":[{"id":"sum-1","session_id":"sess-1","type":"agent_message","agent_name":"coder","timestamp":"2026-04-03T12:00:00Z"}]}`,
+					), nil
+				case req.Method == http.MethodGet && req.URL.Path == "/api/logs/stream":
+					if got := req.URL.Query().Get("workspace_id"); got != "ws-1" {
+						t.Fatalf("logs stream workspace_id query = %q, want %q", got, "ws-1")
+					}
+					if got := req.Header.Get("Last-Event-ID"); got != "cursor-1" {
+						t.Fatalf("Last-Event-ID = %q, want %q", got, "cursor-1")
+					}
+					return newHTTPResponse(http.StatusOK, strings.Join([]string{
+						"id: 2026-04-03T12:00:00Z|sum-1",
+						"event: agent_message",
+						`data: {"id":"sum-1","session_id":"sess-1","type":"agent_message","agent_name":"coder","timestamp":"2026-04-03T12:00:00Z"}`,
+						"",
+					}, "\n")), nil
+				case req.Method == http.MethodGet && req.URL.Path == "/api/status":
+					return newHTTPResponse(
+						http.StatusOK,
+						`{"schema_version":"2026-10-07","generated_at":"2026-04-03T12:00:00Z","daemon":{"status":"running","pid":10,"started_at":"2026-04-03T12:00:00Z","socket":"/tmp/compozy.sock","http_host":"localhost","http_port":2123,"active_sessions":1,"total_sessions":1,"version":"dev"},"health":{"status":"ok","uptime_seconds":10,"active_sessions":1,"active_agents":1,"global_db_size_bytes":100,"session_db_size_bytes":200,"version":"dev"}}`,
+					), nil
+				case req.Method == http.MethodPost && req.URL.Path == "/api/drain":
+					return newHTTPResponse(http.StatusOK, `{"state":"draining"}`), nil
+				case req.Method == http.MethodPost && req.URL.Path == "/api/undrain":
+					return newHTTPResponse(http.StatusOK, `{"state":"active"}`), nil
+				case req.Method == http.MethodGet && req.URL.Path == "/api/doctor":
+					if got := req.URL.Query()["only"]; len(got) != 1 || got[0] != "provider" {
+						t.Fatalf("doctor only query = %#v, want provider", got)
+					}
+					if got := req.URL.Query()["exclude"]; len(got) != 1 || got[0] != "terminal" {
+						t.Fatalf("doctor exclude query = %#v, want terminal", got)
+					}
+					if got := req.URL.Query().Get("quiet"); got != "true" {
+						t.Fatalf("doctor quiet query = %q, want true", got)
+					}
+					return newHTTPResponse(
+						http.StatusOK,
+						`{"schema_version":"2026-10-07","generated_at":"2026-04-03T12:00:00Z","duration_ms":1,"status":"ok","summary":{"total":0,"counts_by_severity":{}},"items":[]}`,
+					), nil
+				default:
+					return newHTTPResponse(http.StatusNotFound, `{"error":"missing"}`), nil
+				}
+			}),
+		},
+	}
+
+	ctx := t.Context()
+
+	status, err := client.DaemonStatus(ctx)
+	if err != nil || status.Status != "running" {
+		t.Fatalf("DaemonStatus() = %#v, %v", status, err)
+	}
+	drainStatus, err := client.Drain(ctx)
+	if err != nil || drainStatus.State != contract.DrainStateDraining {
+		t.Fatalf("Drain() = %#v, %v", drainStatus, err)
+	}
+	activeStatus, err := client.Undrain(ctx)
+	if err != nil || activeStatus.State != contract.DrainStateActive {
+		t.Fatalf("Undrain() = %#v, %v", activeStatus, err)
+	}
+
+	sessions, err := client.ListSessions(ctx, SessionListQuery{Workspace: "ws-1"})
+	if err != nil || len(sessions.Sessions) != 1 {
+		t.Fatalf("ListSessions() = %#v, %v", sessions, err)
+	}
+	if sessions.Page.NextCursor != "cursor-next" || !sessions.Page.HasMore ||
+		sessions.Page.Total != 3 || sessions.Page.Limit != 1 {
+		t.Fatalf("ListSessions().Page = %#v, want decoded continuation metadata", sessions.Page)
+	}
+
+	createdSession, err := client.CreateSession(ctx, CreateSessionRequest{
+		AgentName: "coder",
+		Workspace: "ws-1",
+	})
+	if err != nil || createdSession.ID != "sess-new" {
+		t.Fatalf("CreateSession() = %#v, %v", createdSession, err)
+	}
+
+	sessionInfo, err := client.GetSession(ctx, "sess-1")
+	if err != nil || sessionInfo.ID != "sess-1" {
+		t.Fatalf("GetSession() = %#v, %v", sessionInfo, err)
+	}
+
+	commands, err := client.ListSessionCommands(ctx, "sess-1")
+	if err != nil || commands.Revision != "rev-commands" || len(commands.Commands) != 1 ||
+		commands.Commands[0].CanonicalToken != "/goal" {
+		t.Fatalf("ListSessionCommands() = %#v, %v", commands, err)
+	}
+
+	if result, err := client.StopSession(
+		ctx,
+		"sess-1",
+		false,
+		"",
+	); err != nil ||
+		result.State != session.StateStopping {
+		t.Fatalf("StopSession() = %#v, %v", result, err)
+	}
+	t.Run("Should rename a session through the workspace route", func(t *testing.T) {
+		t.Parallel()
+
+		renamed, renameErr := client.RenameSession(
+			ctx,
+			"sess-1",
+			RenameSessionRequest{Name: "Checkout retries"},
+		)
+		if renameErr != nil || renamed.Name != "Checkout retries" {
+			t.Fatalf("RenameSession() = %#v, %v", renamed, renameErr)
+		}
+	})
+	t.Run("Should set and clear a session parent through the workspace route", func(t *testing.T) {
+		t.Parallel()
+
+		adopted, adoptErr := client.SetSessionParent(
+			ctx, "sess-1", SetSessionParentRequest{ParentSessionID: "sess-parent"},
+		)
+		if adoptErr != nil || adopted.Lineage == nil || adopted.Lineage.ParentSessionID != "sess-parent" {
+			t.Fatalf("SetSessionParent() = %#v, %v", adopted, adoptErr)
+		}
+		detached, detachErr := client.ClearSessionParent(ctx, "sess-1")
+		if detachErr != nil || detached.Lineage == nil || detached.Lineage.ParentSessionID != "" {
+			t.Fatalf("ClearSessionParent() = %#v, %v", detached, detachErr)
+		}
+	})
+	t.Run("Should archive and unarchive a session through the workspace routes", func(t *testing.T) {
+		t.Parallel()
+
+		archived, archiveErr := client.ArchiveSession(ctx, "sess-1", false, false, "")
+		if archiveErr != nil || archived.ArchivedAt == nil {
+			t.Fatalf("ArchiveSession() = %#v, %v, want archived session", archived, archiveErr)
+		}
+		stopped, stopArchiveErr := client.ArchiveSession(ctx, "sess-1", true, false, "")
+		if stopArchiveErr != nil || stopped.ArchivedAt == nil {
+			t.Fatalf("ArchiveSession(stop) = %#v, %v, want archived session", stopped, stopArchiveErr)
+		}
+		restored, unarchiveErr := client.UnarchiveSession(ctx, "sess-1")
+		if unarchiveErr != nil || restored.ArchivedAt != nil {
+			t.Fatalf("UnarchiveSession() = %#v, %v, want restored session", restored, unarchiveErr)
+		}
+	})
+
+	resumed, err := client.ResumeSession(ctx, "sess-1")
+	if err != nil || resumed.ID != "sess-1" {
+		t.Fatalf("ResumeSession() = %#v, %v", resumed, err)
+	}
+
+	promptEvents, err := client.PromptSession(ctx, "sess-1", "hello")
+	if err != nil || len(promptEvents) != 2 || promptEvents[0].Text != "hello back" ||
+		promptEvents[1].Type != "done" {
+		t.Fatalf("PromptSession() = %#v, %v", promptEvents, err)
+	}
+
+	sessionEvents, err := client.SessionEvents(ctx, "sess-1", SessionEventQuery{Type: "tool_call"})
+	if err != nil || len(sessionEvents) != 1 || sessionEvents[0].Type != "tool_call" {
+		t.Fatalf("SessionEvents() = %#v, %v", sessionEvents, err)
+	}
+
+	history, err := client.SessionHistory(ctx, "sess-1", SessionEventQuery{Last: 2})
+	if err != nil || len(history) != 1 {
+		t.Fatalf("SessionHistory() = %#v, %v", history, err)
+	}
+
+	agents, err := client.ListAgents(ctx, AgentQuery{Workspace: "alpha"})
+	if err != nil || len(agents) != 1 {
+		t.Fatalf("ListAgents() = %#v, %v", agents, err)
+	}
+
+	agent, err := client.GetAgent(ctx, "coder", AgentQuery{Workspace: "alpha"})
+	if err != nil || agent.Name != "coder" {
+		t.Fatalf("GetAgent() = %#v, %v", agent, err)
+	}
+
+	skills, err := client.ListSkills(ctx, SkillQuery{Workspace: "alpha"})
+	if err != nil || len(skills) != 1 {
+		t.Fatalf("ListSkills() = %#v, %v", skills, err)
+	}
+
+	skill, err := client.GetSkill(ctx, "review", SkillQuery{Workspace: "alpha"})
+	if err != nil || skill.Name != "review" {
+		t.Fatalf("GetSkill() = %#v, %v", skill, err)
+	}
+
+	content, err := client.GetSkillContent(ctx, "review", SkillQuery{Workspace: "alpha"})
+	if err != nil || !strings.Contains(content, "Use this skill.") {
+		t.Fatalf("GetSkillContent() = %q, %v", content, err)
+	}
+
+	shadows, err := client.GetSkillShadows(ctx, "review", SkillQuery{Workspace: "alpha"})
+	if err != nil || shadows.Winner.Tier != "workspace" {
+		t.Fatalf("GetSkillShadows() = %#v, %v", shadows, err)
+	}
+
+	hookCatalog, err := client.HookCatalog(ctx, HookCatalogQuery{
+		Workspace: "alpha",
+		Agent:     "coder",
+		Event:     "tool.pre_call",
+		Source:    "config",
+		Mode:      "sync",
+	})
+	if err != nil || len(hookCatalog) != 1 || hookCatalog[0].ExecutorKind != "subprocess" {
+		t.Fatalf("HookCatalog() = %#v, %v", hookCatalog, err)
+	}
+
+	hookRuns, err := client.HookRuns(ctx, "ws-1", HookRunsQuery{
+		Session: "sess-1",
+		Event:   "permission.request",
+		Outcome: "failed",
+		Since:   "2026-04-03T11:00:00Z",
+		Last:    2,
+	})
+	if err != nil || len(hookRuns) != 1 || hookRuns[0].Outcome != "failed" {
+		t.Fatalf("HookRuns() = %#v, %v", hookRuns, err)
+	}
+
+	hookEvents, err := client.HookEvents(ctx, HookEventsQuery{
+		Family:   "tool",
+		SyncOnly: true,
+	})
+	if err != nil || len(hookEvents) != 1 || hookEvents[0].Family != "tool" {
+		t.Fatalf("HookEvents() = %#v, %v", hookEvents, err)
+	}
+
+	createdWorkspace, err := client.CreateWorkspace(ctx, WorkspaceCreateRequest{RootDir: "/workspace/project"})
+	if err != nil || createdWorkspace.ID != "ws-1" {
+		t.Fatalf("CreateWorkspace() = %#v, %v", createdWorkspace, err)
+	}
+
+	workspaces, err := client.ListWorkspaces(ctx)
+	if err != nil || len(workspaces) != 1 {
+		t.Fatalf("ListWorkspaces() = %#v, %v", workspaces, err)
+	}
+
+	workspaceDetail, err := client.GetWorkspace(ctx, "alpha")
+	if err != nil || workspaceDetail.Workspace.ID != "ws-1" || len(workspaceDetail.Skills) != 1 {
+		t.Fatalf("GetWorkspace() = %#v, %v", workspaceDetail, err)
+	}
+
+	workspaceDetailByPath, err := client.GetWorkspace(ctx, workspacePathRoot)
+	if err != nil || workspaceDetailByPath.Workspace.ID != "ws-1" || len(workspaceDetailByPath.Skills) != 1 {
+		t.Fatalf("GetWorkspace(path) = %#v, %v", workspaceDetailByPath, err)
+	}
+
+	updatedWorkspace, err := client.UpdateWorkspace(ctx, "ws-1", WorkspaceUpdateRequest{Name: new("beta")})
+	if err != nil || updatedWorkspace.Name != "beta" {
+		t.Fatalf("UpdateWorkspace() = %#v, %v", updatedWorkspace, err)
+	}
+
+	if err := client.DeleteWorkspace(ctx, "ws-1"); err != nil {
+		t.Fatalf("DeleteWorkspace() error = %v", err)
+	}
+
+	events, err := client.ListLogs(ctx, LogsListQuery{WorkspaceRef: "ws-1", SessionID: "sess-1"})
+	if err != nil || len(events) != 1 {
+		t.Fatalf("ListLogs() = %#v, %v", events, err)
+	}
+
+	var streamed []SSEEvent
+	if err := client.StreamLogs(
+		ctx,
+		LogsListQuery{WorkspaceRef: "ws-1"},
+		"cursor-1",
+		func(event SSEEvent) error {
+			streamed = append(streamed, event)
+			return nil
+		},
+	); err != nil {
+		t.Fatalf("StreamLogs() error = %v", err)
+	}
+	if len(streamed) != 1 || streamed[0].Event != "agent_message" {
+		t.Fatalf("streamed = %#v, want one event", streamed)
+	}
+
+	runtimeStatus, err := client.Status(ctx)
+	if err != nil || runtimeStatus.Health.Status != "ok" {
+		t.Fatalf("Status() = %#v, %v", runtimeStatus, err)
+	}
+
+	doctor, err := client.Doctor(ctx, DoctorQuery{
+		Only:    []string{"provider"},
+		Exclude: []string{"terminal"},
+		Quiet:   true,
+	})
+	if err != nil || doctor.Status != "ok" {
+		t.Fatalf("Doctor() = %#v, %v", doctor, err)
+	}
+}
+
+func TestSessionWorkspaceRefUsesDirectLookup(t *testing.T) {
+	t.Parallel()
+
+	for _, workspaceID := range []string{"ws-target", ""} {
+		t.Run("Should read retained history for owner "+workspaceID, func(t *testing.T) {
+			t.Parallel()
+			for _, method := range []string{
+				"transcript", "transcript/search", "transcript/outline", "status", "events", "history", "stream",
+			} {
+				t.Run("Should load "+method, func(t *testing.T) {
+					t.Parallel()
+					base := "/api/sessions/sess-target"
+					if workspaceID != "" {
+						base = "/api/workspaces/" + workspaceID + "/sessions/sess-target"
+					}
+					var paths []string
+					client := &daemonClient{
+						target: LocalClientTarget("/tmp/compozy.sock"),
+						httpClient: &http.Client{
+							Transport: roundTripperFunc(func(req *http.Request) (*http.Response, error) {
+								paths = append(paths, req.URL.Path)
+								if req.Method != http.MethodGet {
+									t.Fatalf("history request method = %s, want GET", req.Method)
+								}
+								if req.URL.Path == "/api/sessions/sess-target" {
+									return newHTTPResponse(http.StatusOK, fmt.Sprintf(
+										`{"session":{"id":"sess-target","workspace_id":%q,"state":"stopped"}}`,
+										workspaceID,
+									)), nil
+								}
+								if req.URL.Path != base+"/"+method {
+									t.Fatalf("history path = %s, want %s/%s", req.URL.Path, base, method)
+								}
+								if method == "transcript/search" {
+									if req.URL.Query().Get("q") != "retained" || req.URL.Query().Get("limit") != "50" {
+										t.Fatalf("search query = %s", req.URL.RawQuery)
+									}
+								}
+								return newHTTPResponse(
+									http.StatusOK,
+									`{"entries":[],"matches":[],"truncated":false}`,
+								), nil
+							}),
+						},
+					}
+					var err error
+					switch method {
+					case "transcript":
+						_, err = client.GetSessionTranscript(t.Context(), "sess-target")
+					case "transcript/search":
+						_, err = client.SearchSessionTranscript(
+							t.Context(),
+							"sess-target",
+							transcript.SearchQuery{Query: "retained", Limit: 50},
+						)
+					case "transcript/outline":
+						_, err = client.GetSessionOutline(t.Context(), "sess-target")
+					case "status":
+						_, err = client.GetSessionStatus(t.Context(), "sess-target")
+					case "events":
+						_, err = client.SessionEvents(t.Context(), "sess-target", SessionEventQuery{})
+					case "history":
+						_, err = client.SessionHistory(t.Context(), "sess-target", SessionEventQuery{})
+					case "stream":
+						err = client.StreamSessionEvents(
+							t.Context(),
+							"sess-target",
+							SessionEventQuery{},
+							"",
+							func(SSEEvent) error {
+								return nil
+							},
+						)
+					}
+					if err != nil || len(paths) != 2 {
+						t.Fatalf("read %s: paths=%v error=%v", method, paths, err)
+					}
+				})
+			}
+		})
+	}
+
+	t.Run("Should never scan the paged session catalog", func(t *testing.T) {
+		t.Parallel()
+
+		var paths []string
+		client := &daemonClient{
+			target: LocalClientTarget("/tmp/compozy.sock"),
+			httpClient: &http.Client{Transport: roundTripperFunc(func(req *http.Request) (*http.Response, error) {
+				paths = append(paths, req.URL.Path)
+				if req.URL.Path != "/api/sessions/sess-target" {
+					t.Fatalf("request path = %q, want direct session lookup", req.URL.Path)
+				}
+				return newHTTPResponse(
+					http.StatusOK,
+					`{"session":{"id":"sess-target","workspace_id":"ws-target","state":"active","created_at":"2026-04-03T12:00:00Z","updated_at":"2026-04-03T12:00:00Z"}}`,
+				), nil
+			})},
+		}
+		workspaceID, err := client.sessionWorkspaceRef(t.Context(), "sess-target")
+		if err != nil {
+			t.Fatalf("sessionWorkspaceRef() error = %v", err)
+		}
+		if workspaceID != "ws-target" {
+			t.Fatalf("sessionWorkspaceRef() = %q, want ws-target", workspaceID)
+		}
+		if len(paths) != 1 || paths[0] == "/api/sessions" {
+			t.Fatalf("sessionWorkspaceRef() paths = %#v, want one by-id request and no catalog scan", paths)
+		}
+	})
+
+	t.Run("Should address a session without a project through the User reference", func(t *testing.T) {
+		t.Parallel()
+
+		client := &daemonClient{
+			target: LocalClientTarget("/tmp/compozy.sock"),
+			httpClient: &http.Client{Transport: roundTripperFunc(func(*http.Request) (*http.Response, error) {
+				return newHTTPResponse(
+					http.StatusOK,
+					`{"session":{"id":"sess-user","scope":"user","state":"active","created_at":"2026-04-03T12:00:00Z","updated_at":"2026-04-03T12:00:00Z"}}`,
+				), nil
+			})},
+		}
+		path, err := client.sessionScopedPath(t.Context(), "sess-user", "/prompt")
+		if err != nil {
+			t.Fatalf("sessionScopedPath() error = %v", err)
+		}
+		if path != "/api/workspaces/@user/sessions/sess-user/prompt" {
+			t.Fatalf("sessionScopedPath() = %q, want the @user workspace route", path)
+		}
+	})
+}
+
+func TestUnixSocketClientRepairSession(t *testing.T) {
+	t.Parallel()
+
+	t.Run("Should repair session with dry run and force", func(t *testing.T) {
+		t.Parallel()
+
+		client := &daemonClient{
+			target: LocalClientTarget("/tmp/compozy.sock"),
+			httpClient: &http.Client{
+				Transport: roundTripperFunc(func(req *http.Request) (*http.Response, error) {
+					if req.Method == http.MethodGet && req.URL.Path == "/api/sessions/sess-1" {
+						return newHTTPResponse(
+							http.StatusOK,
+							`{"session":{"id":"sess-1","agent_name":"coder","workspace_id":"ws-1","workspace_path":"/tmp","state":"stopped","created_at":"2026-04-03T12:00:00Z","updated_at":"2026-04-03T12:00:00Z"}}`,
+						), nil
+					}
+					if req.Method != http.MethodPost || req.URL.Path != "/api/workspaces/ws-1/sessions/sess-1/repair" {
+						return newHTTPResponse(http.StatusNotFound, `{"error":"missing"}`), nil
+					}
+					if got := req.URL.Query().Get("dry_run"); got != "true" {
+						t.Fatalf("repair dry_run query = %q, want true", got)
+					}
+					if got := req.URL.Query().Get("force"); got != "true" {
+						t.Fatalf("repair force query = %q, want true", got)
+					}
+					return newHTTPResponse(
+						http.StatusOK,
+						`{"repair":{"session_id":"sess-1","persisted":false,"issues":[],"actions":[{"code":"append_terminal_error","turn_id":"turn-1","persisted":false}]}}`,
+					), nil
+				}),
+			},
+		}
+
+		repaired, err := client.RepairSession(
+			t.Context(),
+			"sess-1",
+			SessionRepairQuery{DryRun: true, Force: true},
+		)
+		if err != nil || repaired.SessionID != "sess-1" || len(repaired.Actions) != 1 {
+			t.Fatalf("RepairSession() = %#v, %v", repaired, err)
+		}
+	})
+}
+
+// Invariant: worktree cleanup sends delete_branch only on opt-in and decodes the
+// branch outcome; plain cleanup keeps the 204 shape. Owning layer: CLI client.
+func TestUnixSocketClientWorktreeCleanup(t *testing.T) {
+	t.Parallel()
+
+	newClient := func(t *testing.T, wantPath string, wantQuery url.Values, status int, body string) *daemonClient {
+		t.Helper()
+		return &daemonClient{
+			target: LocalClientTarget("/tmp/compozy.sock"),
+			httpClient: &http.Client{
+				Transport: roundTripperFunc(func(req *http.Request) (*http.Response, error) {
+					if req.URL.Path != wantPath {
+						t.Fatalf("cleanup path = %q, want %q", req.URL.Path, wantPath)
+					}
+					if got := req.URL.Query(); !reflect.DeepEqual(got, wantQuery) {
+						t.Fatalf("cleanup query = %#v, want %#v", got, wantQuery)
+					}
+					return newHTTPResponse(status, body), nil
+				}),
+			},
+		}
+	}
+
+	t.Run("Should keep plain removal on the no-content contract", func(t *testing.T) {
+		t.Parallel()
+		client := newClient(t, "/api/workspaces/ws-1/worktrees/wt-1", url.Values{}, http.StatusNoContent, "")
+		branch, err := client.RemoveWorktree(t.Context(), "ws-1", "wt-1", WorktreeCleanupOptions{})
+		if err != nil || branch != nil {
+			t.Fatalf("RemoveWorktree() = %#v, %v, want no branch outcome", branch, err)
+		}
+	})
+
+	t.Run("Should send the dismissal opt-in and decode the branch outcome", func(t *testing.T) {
+		t.Parallel()
+		client := newClient(t, "/api/workspaces/ws-1/worktrees/wt-1/dismiss",
+			url.Values{"delete_branch": {"true"}, "force": {"true"}}, http.StatusOK,
+			`{"branch":{"name":"fix/a","deleted":true}}`)
+		branch, err := client.DismissWorktree(
+			t.Context(), "ws-1", "wt-1", WorktreeCleanupOptions{Force: true, DeleteBranch: true},
+		)
+		if err != nil || branch == nil || branch.Name != "fix/a" || !branch.Deleted {
+			t.Fatalf("DismissWorktree() = %#v, %v, want deleted fix/a", branch, err)
+		}
+	})
+}
+
+func TestUnixSocketClientExtensionMethods(t *testing.T) {
+	t.Parallel()
+
+	newClient := func(t *testing.T) *daemonClient {
+		t.Helper()
+
+		return &daemonClient{
+			target: LocalClientTarget("/tmp/compozy.sock"),
+			httpClient: &http.Client{
+				Transport: roundTripperFunc(func(req *http.Request) (*http.Response, error) {
+					switch {
+					case req.Method == http.MethodGet && req.URL.Path == "/api/extensions" &&
+						req.URL.Query().Get(extensionWorkspaceQueryKey) == "ws-alpha":
+						return newHTTPResponse(
+							http.StatusOK,
+							`{"extensions":[{"name":"ext-dev","workspace_id":"ws-alpha","version":"0.1.0","type":"resource","source":"workspace","enabled":true,"state":"active","dev":true,"daemon_running":true}]}`,
+						), nil
+					case req.Method == http.MethodGet && req.URL.Path == "/api/extensions":
+						return newHTTPResponse(
+							http.StatusOK,
+							`{"extensions":[{"name":"ext-a","version":"0.1.0","type":"resource","source":"user","enabled":true,"state":"active","daemon_running":true}]}`,
+						), nil
+					case req.Method == http.MethodPost && req.URL.Path == "/api/extensions":
+						body, err := io.ReadAll(req.Body)
+						if err != nil {
+							t.Fatalf("io.ReadAll(extension install body) error = %v", err)
+						}
+						var input contract.InstallExtensionRequest
+						if err := json.Unmarshal(body, &input); err != nil {
+							t.Fatalf("json.Unmarshal(extension install body) error = %v", err)
+						}
+						if input.Source != contract.InstallExtensionSourceLocalPath || input.Ref != "/tmp/ext-a" {
+							t.Fatalf("extension install body = %#v, want local_path ref", input)
+						}
+						return newHTTPResponse(
+							http.StatusCreated,
+							`{"extension":{"name":"ext-a","version":"0.1.0","type":"resource","source":"user","enabled":true,"state":"active","daemon_running":true}}`,
+						), nil
+					case req.Method == http.MethodPost && req.URL.Path == "/api/extensions/preview-install":
+						var input contract.InstallExtensionRequest
+						if err := json.NewDecoder(req.Body).Decode(&input); err != nil {
+							t.Fatalf("decode extension install preview request error = %v", err)
+						}
+						if input.Source != contract.InstallExtensionSourceLocalPath || input.Ref != "/tmp/ext-preview" {
+							t.Fatalf("extension install preview body = %#v, want local_path ref", input)
+						}
+						return newHTTPResponse(
+							http.StatusOK,
+							`{"name":"ext-preview","declared_profiles":[{"name":"default","create":false}],"placements":[],"gateway_requirement_digest":"sha256:preview"}`,
+						), nil
+					case req.Method == http.MethodPost && req.URL.Path == "/api/extensions/ext-a/enable":
+						body, err := io.ReadAll(req.Body)
+						if err != nil {
+							t.Fatalf("io.ReadAll(extension enable body) error = %v", err)
+						}
+						var input contract.EnableExtensionRequest
+						if err := json.Unmarshal(body, &input); err != nil {
+							t.Fatalf("json.Unmarshal(extension enable body) error = %v", err)
+						}
+						if input.ConfirmGatewayDigest != "gateway-digest" {
+							t.Fatalf("extension enable body = %#v, want gateway digest", input)
+						}
+						return newHTTPResponse(
+							http.StatusOK,
+							`{"extension":{"name":"ext-a","version":"0.1.0","type":"resource","source":"user","enabled":true,"state":"active","daemon_running":true},"automation_started":["ext-a/daily"]}`,
+						), nil
+					case req.Method == http.MethodPost && req.URL.Path == "/api/extensions/ext-a/disable":
+						return newHTTPResponse(
+							http.StatusOK,
+							`{"extension":{"name":"ext-a","version":"0.1.0","type":"resource","source":"user","enabled":false,"state":"disabled","daemon_running":true}}`,
+						), nil
+					case req.Method == http.MethodPut && req.URL.Path == "/api/extensions/ext-a/enablement":
+						var input contract.SetExtensionEnablementRequest
+						if err := json.NewDecoder(req.Body).Decode(&input); err != nil {
+							t.Fatalf("decode extension enablement request error = %v", err)
+						}
+						if input.Profile != "work" || !input.Enabled {
+							t.Fatalf("extension enablement body = %#v, want work enabled", input)
+						}
+						return newHTTPResponse(http.StatusOK, `{"profile":"work","enabled":true}`), nil
+					case req.Method == http.MethodGet && req.URL.Path == "/api/extensions/ext-a/inventory":
+						return newHTTPResponse(
+							http.StatusOK,
+							`{"extension":"ext-a","enabled":true,"items":[{"kind":"agent","id":"agent/ext-a/writer","name":"writer","live":true}]}`,
+						), nil
+					case req.Method == http.MethodGet && req.URL.Path == "/api/extensions/ext-a/preview":
+						return newHTTPResponse(
+							http.StatusOK,
+							`{"extension":"ext-a","changes":[],"agent_conflicts":[],"missing_env":["API_KEY"],"automation_starting":["ext-a/daily"],"gateway_requirement_digest":"digest","gateway_confirmation_required":true}`,
+						), nil
+					case req.Method == http.MethodGet && req.URL.Path == "/api/extensions/ext-a/secrets" &&
+						req.URL.Query().Get(workspaceFlagName) == "ws-alpha":
+						return newHTTPResponse(
+							http.StatusOK,
+							`{"declared_env":["API_KEY"],"bound_env_keys":["OLD_KEY"],"bindings":[{"env_name":"OLD_KEY","stale":true}]}`,
+						), nil
+					case req.Method == http.MethodPut && req.URL.Path == "/api/extensions/ext-a/secrets" &&
+						req.URL.Query().Get(workspaceFlagName) == "ws-alpha":
+						var input contract.SetExtensionSecretsRequest
+						if err := json.NewDecoder(req.Body).Decode(&input); err != nil {
+							t.Fatalf("decode extension secrets request error = %v", err)
+						}
+						if len(input.Bindings) != 1 || input.Bindings[0].EnvName != "API_KEY" ||
+							input.Bindings[0].Value == nil || *input.Bindings[0].Value != "planted-value" ||
+							input.Bindings[0].MCPServer != "deployment-api" ||
+							input.Bindings[0].HeaderName != "X-Deployment-Key" {
+							t.Fatalf("extension secrets input = %#v, want API_KEY value", input)
+						}
+						return newHTTPResponse(
+							http.StatusOK,
+							`{"declared_env":["API_KEY"],"bound_env_keys":["API_KEY"],"bindings":[{"env_name":"API_KEY","stale":false}]}`,
+						), nil
+					case req.Method == http.MethodDelete && req.URL.Path == "/api/extensions/ext-a/secrets/API_KEY" &&
+						req.URL.Query().Get(workspaceFlagName) == "ws-alpha":
+						return newHTTPResponse(http.StatusNoContent, ""), nil
+					case req.Method == http.MethodGet && req.URL.Path == "/api/extensions/ext-a":
+						if got := req.URL.Query().Get(extensionWorkspaceQueryKey); got != "" {
+							t.Fatalf("global extension status workspace query = %q, want empty", got)
+						}
+						return newHTTPResponse(
+							http.StatusOK,
+							`{"extension":{"name":"ext-a","version":"0.1.0","type":"resource","source":"user","enabled":true,"state":"active","daemon_running":true}}`,
+						), nil
+					case req.Method == http.MethodGet && req.URL.Path == "/api/extensions/ext-dev" &&
+						req.URL.Query().Get(extensionWorkspaceQueryKey) == "ws-alpha":
+						return newHTTPResponse(
+							http.StatusOK,
+							`{"extension":{"name":"ext-dev","workspace_id":"ws-alpha","version":"0.1.0","type":"resource","source":"workspace","enabled":true,"state":"active","dev":true,"daemon_running":true}}`,
+						), nil
+					default:
+						return newHTTPResponse(http.StatusNotFound, `{"error":"missing"}`), nil
+					}
+				}),
+			},
+		}
+	}
+
+	t.Run("Should list global extensions", func(t *testing.T) {
+		t.Parallel()
+
+		listed, err := newClient(t).ListExtensions(t.Context())
+		if err != nil || len(listed) != 1 || listed[0].Name != "ext-a" {
+			t.Fatalf("ListExtensions() = %#v, %v", listed, err)
+		}
+	})
+
+	t.Run("Should list workspace-scoped extensions", func(t *testing.T) {
+		t.Parallel()
+
+		listed, err := newClient(t).ListExtensionsScoped(t.Context(), " ws-alpha ")
+		if err != nil || len(listed) != 1 || listed[0].Name != "ext-dev" || !listed[0].Dev {
+			t.Fatalf("ListExtensionsScoped() = %#v, %v", listed, err)
+		}
+	})
+
+	t.Run("Should install an extension", func(t *testing.T) {
+		t.Parallel()
+
+		installed, err := newClient(t).InstallExtension(t.Context(), InstallExtensionRequest{
+			Source: contract.InstallExtensionSourceLocalPath,
+			Ref:    "/tmp/ext-a",
+		})
+		if err != nil || installed.Name != "ext-a" {
+			t.Fatalf("InstallExtension() = %#v, %v", installed, err)
+		}
+	})
+
+	t.Run("Should preview extension installation", func(t *testing.T) {
+		t.Parallel()
+
+		preview, err := newClient(t).PreviewExtensionInstall(t.Context(), InstallExtensionRequest{
+			Source: contract.InstallExtensionSourceLocalPath,
+			Ref:    "/tmp/ext-preview",
+		})
+		if err != nil || preview.Name != "ext-preview" || preview.GatewayRequirementDigest != "sha256:preview" {
+			t.Fatalf("PreviewExtensionInstall() = %#v, %v", preview, err)
+		}
+	})
+
+	t.Run("Should enable an extension", func(t *testing.T) {
+		t.Parallel()
+
+		enabled, err := newClient(t).EnableExtension(
+			t.Context(),
+			" ext-a ",
+			EnableExtensionRequest{ConfirmGatewayDigest: "gateway-digest"},
+		)
+		if err != nil || !enabled.Extension.Enabled || len(enabled.AutomationStarted) != 1 ||
+			enabled.AutomationStarted[0] != "ext-a/daily" {
+			t.Fatalf("EnableExtension() = %#v, %v", enabled, err)
+		}
+	})
+
+	t.Run("Should disable an extension", func(t *testing.T) {
+		t.Parallel()
+
+		disabled, err := newClient(t).DisableExtension(t.Context(), " ext-a ")
+		if err != nil || disabled.Enabled {
+			t.Fatalf("DisableExtension() = %#v, %v", disabled, err)
+		}
+	})
+
+	t.Run("Should set extension profile enablement", func(t *testing.T) {
+		t.Parallel()
+
+		enablement, err := newClient(t).SetExtensionEnablement(t.Context(), " ext-a ", " work ", true)
+		if err != nil || enablement.Profile != "work" || !enablement.Enabled {
+			t.Fatalf("SetExtensionEnablement() = %#v, %v", enablement, err)
+		}
+	})
+
+	t.Run("Should read the extension inventory payload", func(t *testing.T) {
+		t.Parallel()
+
+		inventory, err := newClient(t).ExtensionInventory(t.Context(), " ext-a ")
+		if err != nil || len(inventory.Items) != 1 || inventory.Items[0].Name != "writer" || !inventory.Items[0].Live {
+			t.Fatalf("ExtensionInventory() = %#v, %v", inventory, err)
+		}
+	})
+
+	t.Run("Should read the extension enable preview payload", func(t *testing.T) {
+		t.Parallel()
+
+		preview, err := newClient(t).PreviewExtensionEnable(t.Context(), " ext-a ")
+		if err != nil || preview.GatewayRequirementDigest != "digest" ||
+			!preview.GatewayConfirmationRequired || !reflect.DeepEqual(preview.AutomationStarting, []string{"ext-a/daily"}) {
+			t.Fatalf("PreviewExtensionEnable() = %#v, %v", preview, err)
+		}
+	})
+
+	t.Run("Should manage workspace-scoped secret bindings without exposing values", func(t *testing.T) {
+		t.Parallel()
+
+		client := newClient(t)
+		listed, err := client.ListExtensionSecrets(t.Context(), " ext-a ", " ws-alpha ")
+		if err != nil || len(listed.Bindings) != 1 || !listed.Bindings[0].Stale ||
+			listed.Bindings[0].EnvName != "OLD_KEY" {
+			t.Fatalf("ListExtensionSecrets() = %#v, %v", listed, err)
+		}
+		value := "planted-value"
+		updated, err := client.SetExtensionSecrets(
+			t.Context(),
+			" ext-a ",
+			" ws-alpha ",
+			SetExtensionSecretsRequest{Bindings: []contract.ExtensionSecretBindingInput{
+				{
+					EnvName: "API_KEY", Value: &value,
+					MCPServer: "deployment-api", HeaderName: "X-Deployment-Key",
+				},
+			}},
+		)
+		if err != nil || !reflect.DeepEqual(updated.BoundEnvKeys, []string{"API_KEY"}) {
+			t.Fatalf("SetExtensionSecrets() = %#v, %v", updated, err)
+		}
+		encoded, err := json.Marshal(updated)
+		if err != nil {
+			t.Fatalf("json.Marshal(updated) error = %v", err)
+		}
+		if strings.Contains(string(encoded), value) {
+			t.Fatalf("secret response leaked value: %s", encoded)
+		}
+		if err := client.DeleteExtensionSecret(t.Context(), " ext-a ", " ws-alpha ", " API_KEY "); err != nil {
+			t.Fatalf("DeleteExtensionSecret() error = %v", err)
+		}
+	})
+
+	t.Run("Should read global extension status", func(t *testing.T) {
+		t.Parallel()
+
+		status, err := newClient(t).ExtensionStatus(t.Context(), "ext-a")
+		if err != nil || status.State != "active" {
+			t.Fatalf("ExtensionStatus() = %#v, %v", status, err)
+		}
+	})
+
+	t.Run("Should read workspace-scoped extension status", func(t *testing.T) {
+		t.Parallel()
+
+		status, err := newClient(t).ExtensionStatusScoped(t.Context(), " ws-alpha ", " ext-dev ")
+		if err != nil || status.Name != "ext-dev" || !status.Dev {
+			t.Fatalf("ExtensionStatusScoped() = %#v, %v", status, err)
+		}
+	})
+}
+
+func TestUnixSocketClientAutomationMethods(t *testing.T) {
+	t.Parallel()
+
+	startedAt := time.Date(2026, 4, 11, 12, 0, 0, 0, time.UTC)
+	endedAt := startedAt.Add(2 * time.Minute)
+
+	client := &daemonClient{
+		target: LocalClientTarget("/tmp/compozy.sock"),
+		httpClient: &http.Client{
+			Transport: roundTripperFunc(func(req *http.Request) (*http.Response, error) {
+				switch {
+				case req.Method == http.MethodGet &&
+					req.URL.Path == "/api/workspaces/ws-alpha/automation/suggestions":
+					if got := req.URL.Query().Get("status"); got != "pending" {
+						t.Fatalf("suggestion status query = %q, want pending", got)
+					}
+					body := mustJSON(t, contract.AutomationSuggestionsResponse{
+						Suggestions: []contract.AutomationSuggestionPayload{sampleAutomationSuggestionRecord()},
+					})
+					return newHTTPResponse(http.StatusOK, string(body)), nil
+				case req.Method == http.MethodPost &&
+					req.URL.Path == "/api/workspaces/ws-alpha/automation/suggestions/suggestion-1/accept":
+					accepted := sampleAutomationSuggestionRecord()
+					accepted.Status = automationpkg.SuggestionStatusAccepted
+					body := mustJSON(t, contract.AutomationSuggestionAcceptanceResponse{
+						Suggestion: accepted,
+						Job:        accepted.Payload,
+					})
+					return newHTTPResponse(http.StatusOK, string(body)), nil
+				case req.Method == http.MethodPost &&
+					req.URL.Path == "/api/workspaces/ws-alpha/automation/suggestions/suggestion-1/dismiss":
+					dismissed := sampleAutomationSuggestionRecord()
+					dismissed.Status = automationpkg.SuggestionStatusDismissed
+					body := mustJSON(t, contract.AutomationSuggestionResponse{Suggestion: dismissed})
+					return newHTTPResponse(http.StatusOK, string(body)), nil
+				case req.Method == http.MethodGet && req.URL.Path == "/api/automation/jobs":
+					if got := req.URL.Query().Get("scope"); got != "workspace" {
+						t.Fatalf("job scope query = %q, want %q", got, "workspace")
+					}
+					if got := req.URL.Query().Get("workspace_id"); got != "ws-alpha" {
+						t.Fatalf("job workspace_id query = %q, want %q", got, "ws-alpha")
+					}
+					if got := req.URL.Query().Get("source"); got != "package" {
+						t.Fatalf("job source query = %q, want %q", got, "package")
+					}
+					if got := req.URL.Query().Get("enabled"); got != "false" {
+						t.Fatalf("job enabled query = %q, want %q", got, "false")
+					}
+					if got := req.URL.Query().Get("target"); got != "loop" {
+						t.Fatalf("target query = %q, want loop", got)
+					}
+					if got := req.URL.Query().Get("loop"); got != "triage" {
+						t.Fatalf("job loop query = %q, want %q", got, "triage")
+					}
+					if got := req.URL.Query().Get("q"); got != "digest" {
+						t.Fatalf("job q query = %q, want %q", got, "digest")
+					}
+					if got := req.URL.Query().Get("cursor"); got != "job-cursor" {
+						t.Fatalf("job cursor query = %q, want %q", got, "job-cursor")
+					}
+					if got := req.URL.Query().Get("limit"); got != "3" {
+						t.Fatalf("job limit query = %q, want %q", got, "3")
+					}
+					return newHTTPResponse(
+						http.StatusOK,
+						`{"jobs":[{"id":"job-1","scope":"workspace","workspace_id":"ws-alpha","name":"nightly","agent_name":"coder","prompt":"review repo","schedule":{"mode":"every","interval":"1h"},"enabled":true,"retry":{"strategy":"none"},"fire_limit":{"max":12,"window":"1h"},"source":"dynamic","created_at":"2026-04-11T12:00:00Z","updated_at":"2026-04-11T12:00:00Z"}],"page":{"next_cursor":"job-next","has_more":true,"total":4,"limit":3}}`,
+					), nil
+				case req.Method == http.MethodPost && req.URL.Path == "/api/automation/jobs":
+					body, err := io.ReadAll(req.Body)
+					if err != nil {
+						t.Fatalf("io.ReadAll(job create body) error = %v", err)
+					}
+					if !strings.Contains(string(body), `"workspace_id":"ws-alpha"`) ||
+						!strings.Contains(string(body), `"mode":"every"`) {
+						t.Fatalf("job create body = %s, want workspace_id and schedule", body)
+					}
+					return newHTTPResponse(
+						http.StatusCreated,
+						`{"job":{"id":"job-created","scope":"workspace","workspace_id":"ws-alpha","name":"nightly","agent_name":"coder","prompt":"review repo","schedule":{"mode":"every","interval":"1h"},"enabled":true,"retry":{"strategy":"none"},"fire_limit":{"max":12,"window":"1h"},"source":"dynamic","created_at":"2026-04-11T12:00:00Z","updated_at":"2026-04-11T12:00:00Z"}}`,
+					), nil
+				case req.Method == http.MethodGet && req.URL.Path == "/api/automation/jobs/job-created":
+					return newHTTPResponse(
+						http.StatusOK,
+						`{"job":{"id":"job-created","scope":"workspace","workspace_id":"ws-alpha","name":"nightly","agent_name":"coder","prompt":"review repo","schedule":{"mode":"every","interval":"1h"},"enabled":true,"retry":{"strategy":"none"},"fire_limit":{"max":12,"window":"1h"},"source":"dynamic","created_at":"2026-04-11T12:00:00Z","updated_at":"2026-04-11T12:00:00Z","next_run":"2026-04-11T13:00:00Z"}}`,
+					), nil
+				case req.Method == http.MethodPatch && req.URL.Path == "/api/automation/jobs/job-created":
+					body, err := io.ReadAll(req.Body)
+					if err != nil {
+						t.Fatalf("io.ReadAll(job update body) error = %v", err)
+					}
+					if !strings.Contains(string(body), `"enabled":false`) ||
+						!strings.Contains(string(body), `"prompt":"review now"`) {
+						t.Fatalf("job update body = %s, want enabled and prompt", body)
+					}
+					return newHTTPResponse(
+						http.StatusOK,
+						`{"job":{"id":"job-created","scope":"workspace","workspace_id":"ws-alpha","name":"nightly","agent_name":"coder","prompt":"review now","schedule":{"mode":"every","interval":"1h"},"enabled":false,"retry":{"strategy":"none"},"fire_limit":{"max":12,"window":"1h"},"source":"dynamic","created_at":"2026-04-11T12:00:00Z","updated_at":"2026-04-11T12:05:00Z"}}`,
+					), nil
+				case req.Method == http.MethodDelete && req.URL.Path == "/api/automation/jobs/job-created":
+					return newHTTPResponse(http.StatusNoContent, ``), nil
+				case req.Method == http.MethodPost && req.URL.Path == "/api/automation/jobs/job-created/trigger":
+					return newHTTPResponse(
+						http.StatusOK,
+						`{"run":{"id":"run-job","job_id":"job-created","session_id":"sess-job","status":"completed","attempt":1,"started_at":"2026-04-11T12:00:00Z","ended_at":"2026-04-11T12:02:00Z"}}`,
+					), nil
+				case req.Method == http.MethodGet && req.URL.Path == "/api/automation/jobs/job-created/runs":
+					if got := req.URL.Query().Get("status"); got != "completed" {
+						t.Fatalf("job runs status query = %q, want %q", got, "completed")
+					}
+					if got := req.URL.Query().Get("since"); got != "2026-04-11T11:00:00Z" {
+						t.Fatalf("job runs since query = %q, want %q", got, "2026-04-11T11:00:00Z")
+					}
+					if got := req.URL.Query().Get("until"); got != "2026-04-11T13:00:00Z" {
+						t.Fatalf("job runs until query = %q, want %q", got, "2026-04-11T13:00:00Z")
+					}
+					if got := req.URL.Query().Get("limit"); got != "2" {
+						t.Fatalf("job runs limit query = %q, want %q", got, "2")
+					}
+					return newHTTPResponse(
+						http.StatusOK,
+						`{"runs":[{"id":"run-job","job_id":"job-created","session_id":"sess-job","status":"completed","attempt":1,"started_at":"2026-04-11T12:00:00Z","ended_at":"2026-04-11T12:02:00Z"}]}`,
+					), nil
+				case req.Method == http.MethodGet && req.URL.Path == "/api/automation/triggers":
+					if got := req.URL.Query().Get("scope"); got != "workspace" {
+						t.Fatalf("trigger scope query = %q, want %q", got, "workspace")
+					}
+					if got := req.URL.Query().Get("workspace_id"); got != "ws-alpha" {
+						t.Fatalf("trigger workspace_id query = %q, want %q", got, "ws-alpha")
+					}
+					if got := req.URL.Query().Get("event"); got != "webhook" {
+						t.Fatalf("trigger event query = %q, want %q", got, "webhook")
+					}
+					if got := req.URL.Query().Get("source"); got != "package" {
+						t.Fatalf("trigger source query = %q, want %q", got, "package")
+					}
+					if got := req.URL.Query().Get("enabled"); got != "true" {
+						t.Fatalf("trigger enabled query = %q, want %q", got, "true")
+					}
+					if got := req.URL.Query().Get("target"); got != "loop" {
+						t.Fatalf("target query = %q, want loop", got)
+					}
+					if got := req.URL.Query().Get("loop"); got != "triage" {
+						t.Fatalf("trigger loop query = %q, want %q", got, "triage")
+					}
+					if got := req.URL.Query().Get("q"); got != "review" {
+						t.Fatalf("trigger q query = %q, want %q", got, "review")
+					}
+					if got := req.URL.Query().Get("cursor"); got != "trigger-cursor" {
+						t.Fatalf("trigger cursor query = %q, want %q", got, "trigger-cursor")
+					}
+					if got := req.URL.Query().Get("limit"); got != "2" {
+						t.Fatalf("trigger limit query = %q, want %q", got, "2")
+					}
+					return newHTTPResponse(
+						http.StatusOK,
+						`{"triggers":[{"id":"trg-1","scope":"workspace","workspace_id":"ws-alpha","name":"deploy-review","agent_name":"coder","prompt":"review {{ index .Data \"payload\" }}","event":"webhook","filter":{"data.branch":"main"},"enabled":true,"retry":{"strategy":"none"},"fire_limit":{"max":12,"window":"1h"},"source":"dynamic","webhook_id":"wbh_123","endpoint_slug":"deploy-review","created_at":"2026-04-11T12:00:00Z","updated_at":"2026-04-11T12:00:00Z"}],"page":{"next_cursor":"trigger-next","has_more":true,"total":3,"limit":2}}`,
+					), nil
+				case req.Method == http.MethodPost && req.URL.Path == "/api/automation/triggers":
+					body, err := io.ReadAll(req.Body)
+					if err != nil {
+						t.Fatalf("io.ReadAll(trigger create body) error = %v", err)
+					}
+					if !strings.Contains(string(body), `"event":"webhook"`) ||
+						!strings.Contains(string(body), `"data.branch":"main"`) {
+						t.Fatalf("trigger create body = %s, want event and filter", body)
+					}
+					return newHTTPResponse(
+						http.StatusCreated,
+						`{"trigger":{"id":"trg-created","scope":"workspace","workspace_id":"ws-alpha","name":"deploy-review","agent_name":"coder","prompt":"review {{ index .Data \"payload\" }}","event":"webhook","filter":{"data.branch":"main"},"enabled":true,"retry":{"strategy":"none"},"fire_limit":{"max":12,"window":"1h"},"source":"dynamic","webhook_id":"wbh_123","endpoint_slug":"deploy-review","created_at":"2026-04-11T12:00:00Z","updated_at":"2026-04-11T12:00:00Z"}}`,
+					), nil
+				case req.Method == http.MethodGet && req.URL.Path == "/api/automation/triggers/trg-created":
+					return newHTTPResponse(
+						http.StatusOK,
+						`{"trigger":{"id":"trg-created","scope":"workspace","workspace_id":"ws-alpha","name":"deploy-review","agent_name":"coder","prompt":"review {{ index .Data \"payload\" }}","event":"webhook","filter":{"data.branch":"main"},"enabled":true,"retry":{"strategy":"none"},"fire_limit":{"max":12,"window":"1h"},"source":"dynamic","webhook_id":"wbh_123","endpoint_slug":"deploy-review","created_at":"2026-04-11T12:00:00Z","updated_at":"2026-04-11T12:00:00Z"}}`,
+					), nil
+				case req.Method == http.MethodPatch && req.URL.Path == "/api/automation/triggers/trg-created":
+					body, err := io.ReadAll(req.Body)
+					if err != nil {
+						t.Fatalf("io.ReadAll(trigger update body) error = %v", err)
+					}
+					if !strings.Contains(string(body), `"prompt":"inspect {{ index .Data \"payload\" }}"`) ||
+						!strings.Contains(string(body), `"enabled":false`) {
+						t.Fatalf("trigger update body = %s, want prompt and enabled", body)
+					}
+					return newHTTPResponse(
+						http.StatusOK,
+						`{"trigger":{"id":"trg-created","scope":"workspace","workspace_id":"ws-alpha","name":"deploy-review","agent_name":"coder","prompt":"inspect {{ index .Data \"payload\" }}","event":"webhook","filter":{"data.branch":"main"},"enabled":false,"retry":{"strategy":"none"},"fire_limit":{"max":12,"window":"1h"},"source":"dynamic","webhook_id":"wbh_123","endpoint_slug":"deploy-review","created_at":"2026-04-11T12:00:00Z","updated_at":"2026-04-11T12:05:00Z"}}`,
+					), nil
+				case req.Method == http.MethodDelete && req.URL.Path == "/api/automation/triggers/trg-created":
+					return newHTTPResponse(http.StatusNoContent, ``), nil
+				case req.Method == http.MethodGet && req.URL.Path == "/api/automation/triggers/trg-created/runs":
+					if got := req.URL.Query().Get("status"); got != "completed" {
+						t.Fatalf("trigger runs status query = %q, want %q", got, "completed")
+					}
+					if got := req.URL.Query().Get("limit"); got != "1" {
+						t.Fatalf("trigger runs limit query = %q, want %q", got, "1")
+					}
+					return newHTTPResponse(
+						http.StatusOK,
+						`{"runs":[{"id":"run-trigger","trigger_id":"trg-created","session_id":"sess-trigger","status":"completed","attempt":1,"started_at":"2026-04-11T12:00:00Z","ended_at":"2026-04-11T12:02:00Z"}]}`,
+					), nil
+				case req.Method == http.MethodGet && req.URL.Path == "/api/automation/runs":
+					if got := req.URL.Query().Get("job_id"); got != "job-created" {
+						t.Fatalf("runs job_id query = %q, want %q", got, "job-created")
+					}
+					if got := req.URL.Query().Get("trigger_id"); got != "trg-created" {
+						t.Fatalf("runs trigger_id query = %q, want %q", got, "trg-created")
+					}
+					if got := req.URL.Query().Get("status"); got != "completed" {
+						t.Fatalf("runs status query = %q, want %q", got, "completed")
+					}
+					if got := req.URL.Query().Get("since"); got != "2026-04-11T12:00:00Z" {
+						t.Fatalf("runs since query = %q, want %q", got, "2026-04-11T12:00:00Z")
+					}
+					if got := req.URL.Query().Get("until"); got != "2026-04-11T13:00:00Z" {
+						t.Fatalf("runs until query = %q, want %q", got, "2026-04-11T13:00:00Z")
+					}
+					if got := req.URL.Query().Get("limit"); got != "5" {
+						t.Fatalf("runs limit query = %q, want %q", got, "5")
+					}
+					return newHTTPResponse(
+						http.StatusOK,
+						`{"runs":[{"id":"run-shared","job_id":"job-created","trigger_id":"trg-created","session_id":"sess-shared","status":"completed","attempt":1,"started_at":"2026-04-11T12:00:00Z","ended_at":"2026-04-11T12:02:00Z"}]}`,
+					), nil
+				case req.Method == http.MethodGet && req.URL.Path == "/api/automation/runs/run-shared":
+					return newHTTPResponse(
+						http.StatusOK,
+						`{"run":{"id":"run-shared","job_id":"job-created","trigger_id":"trg-created","session_id":"sess-shared","status":"completed","attempt":1,"started_at":"2026-04-11T12:00:00Z","ended_at":"2026-04-11T12:02:00Z"}}`,
+					), nil
+				default:
+					return newHTTPResponse(http.StatusNotFound, `{"error":"missing"}`), nil
+				}
+			}),
+		},
+	}
+
+	ctx := t.Context()
+
+	t.Run("Should preserve workspace suggestion routes", func(t *testing.T) {
+		suggestions, err := client.ListAutomationSuggestions(
+			ctx,
+			"ws-alpha",
+			automationpkg.SuggestionStatusPending,
+		)
+		if err != nil || len(suggestions.Suggestions) != 1 || suggestions.Suggestions[0].ID != "suggestion-1" {
+			t.Fatalf("ListAutomationSuggestions() = %#v, %v", suggestions, err)
+		}
+
+		accepted, err := client.AcceptAutomationSuggestion(ctx, "ws-alpha", "suggestion-1")
+		if err != nil || accepted.Suggestion.Status != automationpkg.SuggestionStatusAccepted ||
+			accepted.Job.ID != "job-1" {
+			t.Fatalf("AcceptAutomationSuggestion() = %#v, %v", accepted, err)
+		}
+
+		dismissed, err := client.DismissAutomationSuggestion(ctx, "ws-alpha", "suggestion-1")
+		if err != nil || dismissed.Suggestion.Status != automationpkg.SuggestionStatusDismissed {
+			t.Fatalf("DismissAutomationSuggestion() = %#v, %v", dismissed, err)
+		}
+	})
+
+	t.Run("Should list automation jobs", func(t *testing.T) {
+		jobs, err := client.ListAutomationJobs(ctx, AutomationJobQuery{
+			Scope:       automationpkg.AutomationScopeWorkspace,
+			WorkspaceID: "ws-alpha",
+			Source:      automationpkg.JobSourcePackage,
+			Enabled:     new(false),
+			LoopName:    "triage",
+			Target:      "loop",
+			Search:      "digest",
+			Cursor:      "job-cursor",
+			Limit:       3,
+		})
+		if err != nil || len(jobs.Jobs) != 1 || jobs.Jobs[0].ID != "job-1" || jobs.Page.Total != 4 {
+			t.Fatalf("ListAutomationJobs() = %#v, %v", jobs, err)
+		}
+	})
+
+	t.Run("Should create automation jobs", func(t *testing.T) {
+		createdJob, err := client.CreateAutomationJob(ctx, AutomationJobCreateRequest{
+			Scope:       automationpkg.AutomationScopeWorkspace,
+			WorkspaceID: "ws-alpha",
+			Name:        "nightly",
+			AgentName:   "coder",
+			Prompt:      "review repo",
+			Schedule: automationpkg.ScheduleSpec{
+				Mode:     automationpkg.ScheduleModeEvery,
+				Interval: "1h",
+			},
+		})
+		if err != nil || createdJob.ID != "job-created" {
+			t.Fatalf("CreateAutomationJob() = %#v, %v", createdJob, err)
+		}
+	})
+
+	t.Run("Should get automation jobs", func(t *testing.T) {
+		job, err := client.GetAutomationJob(ctx, "job-created")
+		if err != nil || job.NextRun == nil {
+			t.Fatalf("GetAutomationJob() = %#v, %v", job, err)
+		}
+	})
+
+	t.Run("Should update automation jobs", func(t *testing.T) {
+		updatedJob, err := client.UpdateAutomationJob(ctx, "job-created", AutomationJobUpdateRequest{
+			Prompt:  new("review now"),
+			Enabled: new(false),
+		})
+		if err != nil || updatedJob.Enabled {
+			t.Fatalf("UpdateAutomationJob() = %#v, %v", updatedJob, err)
+		}
+	})
+
+	t.Run("Should trigger automation jobs", func(t *testing.T) {
+		triggeredRun, err := client.TriggerAutomationJob(ctx, "job-created")
+		if err != nil || triggeredRun.ID != "run-job" {
+			t.Fatalf("TriggerAutomationJob() = %#v, %v", triggeredRun, err)
+		}
+	})
+
+	t.Run("Should list automation job runs", func(t *testing.T) {
+		jobRuns, err := client.AutomationJobRuns(ctx, "job-created", AutomationRunQuery{
+			Status: automationpkg.RunCompleted,
+			Since:  startedAt.Add(-time.Hour),
+			Until:  startedAt.Add(time.Hour),
+			Limit:  2,
+		})
+		if err != nil || len(jobRuns) != 1 || jobRuns[0].JobID != "job-created" {
+			t.Fatalf("AutomationJobRuns() = %#v, %v", jobRuns, err)
+		}
+	})
+
+	t.Run("Should delete automation jobs", func(t *testing.T) {
+		if err := client.DeleteAutomationJob(ctx, "job-created"); err != nil {
+			t.Fatalf("DeleteAutomationJob() error = %v", err)
+		}
+	})
+
+	t.Run("Should list automation triggers", func(t *testing.T) {
+		triggers, err := client.ListAutomationTriggers(ctx, AutomationTriggerQuery{
+			Scope:       automationpkg.AutomationScopeWorkspace,
+			WorkspaceID: "ws-alpha",
+			Event:       "webhook",
+			Source:      automationpkg.JobSourcePackage,
+			Enabled:     new(true),
+			LoopName:    "triage",
+			Target:      "loop",
+			Search:      "review",
+			Cursor:      "trigger-cursor",
+			Limit:       2,
+		})
+		if err != nil || len(triggers.Triggers) != 1 || triggers.Triggers[0].ID != "trg-1" || triggers.Page.Total != 3 {
+			t.Fatalf("ListAutomationTriggers() = %#v, %v", triggers, err)
+		}
+	})
+
+	t.Run("Should create automation triggers", func(t *testing.T) {
+		createdTrigger, err := client.CreateAutomationTrigger(ctx, AutomationTriggerCreateRequest{
+			Scope:              automationpkg.AutomationScopeWorkspace,
+			WorkspaceID:        "ws-alpha",
+			Name:               "deploy-review",
+			AgentName:          "coder",
+			Prompt:             `review {{ index .Data "payload" }}`,
+			Event:              "webhook",
+			Filter:             map[string]string{"data.branch": "main"},
+			EndpointSlug:       "deploy-review",
+			WebhookSecretValue: "shared-secret",
+		})
+		if err != nil || createdTrigger.ID != "trg-created" {
+			t.Fatalf("CreateAutomationTrigger() = %#v, %v", createdTrigger, err)
+		}
+	})
+
+	t.Run("Should get automation triggers", func(t *testing.T) {
+		trigger, err := client.GetAutomationTrigger(ctx, "trg-created")
+		if err != nil || trigger.WebhookID != "wbh_123" {
+			t.Fatalf("GetAutomationTrigger() = %#v, %v", trigger, err)
+		}
+	})
+
+	t.Run("Should update automation triggers", func(t *testing.T) {
+		updatedTrigger, err := client.UpdateAutomationTrigger(ctx, "trg-created", AutomationTriggerUpdateRequest{
+			Prompt:  new(`inspect {{ index .Data "payload" }}`),
+			Enabled: new(false),
+		})
+		if err != nil || updatedTrigger.Enabled {
+			t.Fatalf("UpdateAutomationTrigger() = %#v, %v", updatedTrigger, err)
+		}
+	})
+
+	t.Run("Should list automation trigger runs", func(t *testing.T) {
+		triggerRuns, err := client.AutomationTriggerRuns(ctx, "trg-created", AutomationRunQuery{
+			Status: automationpkg.RunCompleted,
+			Limit:  1,
+		})
+		if err != nil || len(triggerRuns) != 1 || triggerRuns[0].TriggerID != "trg-created" {
+			t.Fatalf("AutomationTriggerRuns() = %#v, %v", triggerRuns, err)
+		}
+	})
+
+	t.Run("Should delete automation triggers", func(t *testing.T) {
+		if err := client.DeleteAutomationTrigger(ctx, "trg-created"); err != nil {
+			t.Fatalf("DeleteAutomationTrigger() error = %v", err)
+		}
+	})
+
+	t.Run("Should list automation runs", func(t *testing.T) {
+		runs, err := client.ListAutomationRuns(ctx, AutomationRunQuery{
+			JobID:     "job-created",
+			TriggerID: "trg-created",
+			Status:    automationpkg.RunCompleted,
+			Since:     startedAt,
+			Until:     startedAt.Add(time.Hour),
+			Limit:     5,
+		})
+		if err != nil || len(runs) != 1 || runs[0].ID != "run-shared" {
+			t.Fatalf("ListAutomationRuns() = %#v, %v", runs, err)
+		}
+	})
+
+	t.Run("Should get automation runs", func(t *testing.T) {
+		run, err := client.GetAutomationRun(ctx, "run-shared")
+		if err != nil || run.EndedAt == nil || !run.EndedAt.Equal(endedAt) {
+			t.Fatalf("GetAutomationRun() = %#v, %v", run, err)
+		}
+	})
+}
+
+func TestUnixSocketClientTaskMethods(t *testing.T) {
+	t.Parallel()
+
+	client := &daemonClient{
+		target: LocalClientTarget("/tmp/compozy.sock"),
+		httpClient: &http.Client{
+			Transport: roundTripperFunc(func(req *http.Request) (*http.Response, error) {
+				switch {
+				case req.Method == http.MethodGet && req.URL.Path == "/api/tasks":
+					if got := req.URL.Query().Get("scope"); got != "workspace" {
+						t.Fatalf("task scope query = %q, want %q", got, "workspace")
+					}
+					if got := req.URL.Query().Get("workspace"); got != "alpha" {
+						t.Fatalf("task workspace query = %q, want %q", got, "alpha")
+					}
+					if got := req.URL.Query().Get("status"); got != "ready" {
+						t.Fatalf("task status query = %q, want %q", got, "ready")
+					}
+					if got := req.URL.Query().Get("owner_kind"); got != "pool" {
+						t.Fatalf("task owner_kind query = %q, want %q", got, "pool")
+					}
+					if got := req.URL.Query().Get("owner_ref"); got != "triage" {
+						t.Fatalf("task owner_ref query = %q, want %q", got, "triage")
+					}
+					if got := req.URL.Query().Get("parent_task_id"); got != "task-root" {
+						t.Fatalf("task parent_task_id query = %q, want %q", got, "task-root")
+					}
+					if got := req.URL.Query().Get("worktree"); got != "wt-alpha" {
+						t.Fatalf("task worktree query = %q, want %q", got, "wt-alpha")
+					}
+					if got := req.URL.Query().Get("limit"); got != "3" {
+						t.Fatalf("task limit query = %q, want %q", got, "3")
+					}
+					body := mustJSON(
+						t,
+						contract.TasksResponse{Tasks: []contract.TaskCatalogItemPayload{sampleTaskCatalogItemRecord()}},
+					)
+					return newHTTPResponse(http.StatusOK, string(body)), nil
+				case req.Method == http.MethodPost && req.URL.Path == "/api/tasks":
+					var payload contract.CreateTaskRequest
+					if err := json.NewDecoder(req.Body).Decode(&payload); err != nil {
+						t.Fatalf("json.Decode(create task body) error = %v", err)
+					}
+
+					if payload.Scope != taskpkg.ScopeWorkspace ||
+						payload.Workspace != "alpha" ||
+						payload.Title != "Investigate flaky task runs" ||
+						payload.Owner == nil ||
+						payload.Owner.Kind != taskpkg.OwnerKindPool ||
+						payload.Owner.Ref != "triage" {
+						t.Fatalf("create task payload = %#v", payload)
+					}
+					body := mustJSON(t, contract.TaskResponse{Task: sampleTaskRecord()})
+					return newHTTPResponse(http.StatusCreated, string(body)), nil
+				case req.Method == http.MethodGet && req.URL.Path == "/api/tasks/task-1":
+					body := mustJSON(t, contract.TaskDetailResponse{Task: sampleTaskDetailRecord()})
+					return newHTTPResponse(http.StatusOK, string(body)), nil
+				case req.Method == http.MethodPatch && req.URL.Path == "/api/tasks/task-1":
+					var payload contract.UpdateTaskRequest
+					if err := json.NewDecoder(req.Body).Decode(&payload); err != nil {
+						t.Fatalf("json.Decode(update task body) error = %v", err)
+					}
+
+					if payload.Title == nil || *payload.Title != "Investigate resolved" {
+						t.Fatalf("update task payload = %#v", payload)
+					}
+					updated := sampleTaskRecord()
+					updated.Title = "Investigate resolved"
+
+					body := mustJSON(t, contract.TaskResponse{Task: updated})
+					return newHTTPResponse(http.StatusOK, string(body)), nil
+				case req.Method == http.MethodPost && req.URL.Path == "/api/tasks/task-1/cancel":
+					var payload contract.CancelTaskRequest
+					if err := json.NewDecoder(req.Body).Decode(&payload); err != nil {
+						t.Fatalf("json.Decode(cancel task body) error = %v", err)
+					}
+					if payload.Reason != "operator-request" {
+						t.Fatalf("cancel task payload = %#v, want reason", payload)
+					}
+					canceled := sampleTaskRecord()
+					canceled.Status = taskpkg.TaskStatusCanceled
+					body := mustJSON(t, contract.TaskResponse{Task: canceled})
+					return newHTTPResponse(http.StatusOK, string(body)), nil
+				case req.Method == http.MethodPost && req.URL.Path == "/api/tasks/task-1/children":
+					var payload contract.CreateTaskChildRequest
+					if err := json.NewDecoder(req.Body).Decode(&payload); err != nil {
+						t.Fatalf("json.Decode(create child body) error = %v", err)
+					}
+					if payload.Scope != taskpkg.ScopeWorkspace || payload.Workspace != "alpha" ||
+						payload.Title != "Check runtime logs" {
+						t.Fatalf("create child payload = %#v", payload)
+					}
+					child := sampleTaskRecord()
+					child.ID = "task-child"
+					child.Title = "Check runtime logs"
+					body := mustJSON(t, contract.TaskResponse{Task: child})
+					return newHTTPResponse(http.StatusCreated, string(body)), nil
+				case req.Method == http.MethodPost && req.URL.Path == "/api/tasks/task-1/dependencies":
+					var payload contract.AddTaskDependencyRequest
+					if err := json.NewDecoder(req.Body).Decode(&payload); err != nil {
+						t.Fatalf("json.Decode(add dependency body) error = %v", err)
+					}
+					if payload.DependsOnTaskID != "task-blocker" || payload.Kind != taskpkg.DependencyKindBlocks {
+						t.Fatalf("add dependency payload = %#v", payload)
+					}
+					body := mustJSON(t, contract.TaskDetailResponse{Task: sampleTaskDetailRecord()})
+					return newHTTPResponse(http.StatusOK, string(body)), nil
+				case req.Method == http.MethodDelete && req.URL.Path == "/api/tasks/task-1/dependencies/task-blocker":
+					body := mustJSON(t, contract.TaskDetailResponse{Task: sampleTaskDetailRecord()})
+					return newHTTPResponse(http.StatusOK, string(body)), nil
+				case req.Method == http.MethodPost && req.URL.Path == "/api/tasks/task-1/runs":
+					var payload contract.EnqueueTaskRunRequest
+					if err := json.NewDecoder(req.Body).Decode(&payload); err != nil {
+						t.Fatalf("json.Decode(enqueue run body) error = %v", err)
+					}
+
+					if payload.IdempotencyKey != "idem-1" {
+						t.Fatalf("enqueue run payload = %#v", payload)
+					}
+					if got, want := string(payload.Metadata), `{"schema":"compozy.harness.detached.v1"}`; got != want {
+						t.Fatalf("enqueue run metadata = %q, want %q", got, want)
+					}
+					body := mustJSON(t, contract.TaskRunResponse{Run: sampleTaskRunRecord(taskpkg.TaskRunStatusQueued)})
+					return newHTTPResponse(http.StatusCreated, string(body)), nil
+				case req.Method == http.MethodGet && req.URL.Path == "/api/tasks/task-1/runs":
+					if got := req.URL.Query().Get("status"); got != "running" {
+						t.Fatalf("task runs status query = %q, want %q", got, "running")
+					}
+					if got := req.URL.Query().Get("session_id"); got != "sess-1" {
+						t.Fatalf("task runs session_id query = %q, want %q", got, "sess-1")
+					}
+					if got := req.URL.Query().Get("limit"); got != "2" {
+						t.Fatalf("task runs limit query = %q, want %q", got, "2")
+					}
+					body := mustJSON(
+						t,
+						contract.TaskRunsResponse{
+							Runs: []contract.TaskRunPayload{sampleTaskRunRecord(taskpkg.TaskRunStatusRunning)},
+						},
+					)
+					return newHTTPResponse(http.StatusOK, string(body)), nil
+				case req.Method == http.MethodGet && req.URL.Path == "/api/task-runs/run-1":
+					body := mustJSON(t, contract.TaskRunDetailResponse{
+						Run: sampleTaskRunDetailRecord(taskpkg.TaskRunStatusQueued),
+					})
+					return newHTTPResponse(http.StatusOK, string(body)), nil
+				case req.Method == http.MethodPost && req.URL.Path == "/api/task-runs/run-1/start":
+					var payload contract.StartTaskRunRequest
+					if err := json.NewDecoder(req.Body).Decode(&payload); err != nil {
+						t.Fatalf("json.Decode(start run body) error = %v", err)
+					}
+					if payload.IdempotencyKey != "idem-start" {
+						t.Fatalf("start run payload = %#v", payload)
+					}
+					body := mustJSON(
+						t,
+						contract.TaskRunResponse{Run: sampleTaskRunRecord(taskpkg.TaskRunStatusRunning)},
+					)
+					return newHTTPResponse(http.StatusOK, string(body)), nil
+				case req.Method == http.MethodPost && req.URL.Path == "/api/task-runs/run-1/attach-session":
+					var payload contract.AttachTaskRunSessionRequest
+					if err := json.NewDecoder(req.Body).Decode(&payload); err != nil {
+						t.Fatalf("json.Decode(attach session body) error = %v", err)
+					}
+					if payload.SessionID != "sess-attach" {
+						t.Fatalf("attach session payload = %#v", payload)
+					}
+					body := mustJSON(
+						t,
+						contract.TaskRunResponse{Run: sampleTaskRunRecord(taskpkg.TaskRunStatusStarting)},
+					)
+					return newHTTPResponse(http.StatusOK, string(body)), nil
+				case req.Method == http.MethodPost && req.URL.Path == "/api/task-runs/run-1/complete":
+					var payload contract.CompleteTaskRunRequest
+					if err := json.NewDecoder(req.Body).Decode(&payload); err != nil {
+						t.Fatalf("json.Decode(complete run body) error = %v", err)
+					}
+					if string(payload.Result) != `{"ok":true}` {
+						t.Fatalf("complete run payload = %#v", payload)
+					}
+					body := mustJSON(
+						t,
+						contract.TaskRunResponse{Run: sampleTaskRunRecord(taskpkg.TaskRunStatusCompleted)},
+					)
+					return newHTTPResponse(http.StatusOK, string(body)), nil
+				case req.Method == http.MethodPost && req.URL.Path == "/api/task-runs/run-1/fail":
+					var payload contract.FailTaskRunRequest
+					if err := json.NewDecoder(req.Body).Decode(&payload); err != nil {
+						t.Fatalf("json.Decode(fail run body) error = %v", err)
+					}
+					if payload.Error != "boom" || string(payload.Metadata) != `{"code":"E_TASK"}` {
+						t.Fatalf("fail run payload = %#v", payload)
+					}
+					body := mustJSON(t, contract.TaskRunResponse{Run: sampleTaskRunRecord(taskpkg.TaskRunStatusFailed)})
+					return newHTTPResponse(http.StatusOK, string(body)), nil
+				case req.Method == http.MethodPost && req.URL.Path == "/api/task-runs/run-1/cancel":
+					var payload contract.CancelTaskRunRequest
+					if err := json.NewDecoder(req.Body).Decode(&payload); err != nil {
+						t.Fatalf("json.Decode(cancel run body) error = %v", err)
+					}
+					if payload.Reason != "operator-request" || string(payload.Metadata) != `{"source":"cli"}` {
+						t.Fatalf("cancel run payload = %#v", payload)
+					}
+					body := mustJSON(
+						t,
+						contract.TaskRunResponse{Run: sampleTaskRunRecord(taskpkg.TaskRunStatusCanceled)},
+					)
+					return newHTTPResponse(http.StatusOK, string(body)), nil
+				default:
+					return newHTTPResponse(http.StatusNotFound, `{"error":"missing"}`), nil
+				}
+			}),
+		},
+	}
+
+	ctx := t.Context()
+
+	t.Run("Should list tasks", func(t *testing.T) {
+		tasks, err := client.ListTasks(ctx, TaskListQuery{
+			Scope:        taskpkg.CatalogScopeWorkspace,
+			Workspace:    "alpha",
+			Status:       taskpkg.TaskStatusReady,
+			OwnerKind:    taskpkg.OwnerKindPool,
+			OwnerRef:     "triage",
+			ParentTaskID: "task-root",
+			Worktree:     "wt-alpha",
+
+			Limit: 3,
+		})
+		if err != nil || len(tasks.Tasks) != 1 || tasks.Tasks[0].ID != "task-1" {
+			t.Fatalf("ListTasks() = %#v, %v", tasks, err)
+		}
+	})
+
+	t.Run("Should create get update and cancel tasks", func(t *testing.T) {
+		created, err := client.CreateTask(ctx, CreateTaskRequest{
+			Scope:     taskpkg.ScopeWorkspace,
+			Workspace: "alpha",
+
+			Title: "Investigate flaky task runs",
+			Owner: &taskpkg.Ownership{Kind: taskpkg.OwnerKindPool, Ref: "triage"},
+		})
+		if err != nil || created.ID != "task-1" {
+			t.Fatalf("CreateTask() = %#v, %v", created, err)
+		}
+
+		detail, err := client.GetTask(ctx, "task-1")
+		if err != nil || detail.Task.ID != "task-1" || len(detail.Dependencies) != 1 {
+			t.Fatalf("GetTask() = %#v, %v", detail, err)
+		}
+
+		updated, err := client.UpdateTask(ctx, "task-1", UpdateTaskRequest{
+			Title: new("Investigate resolved"),
+		})
+		if err != nil || updated.Title != "Investigate resolved" {
+			t.Fatalf("UpdateTask() = %#v, %v", updated, err)
+		}
+
+		canceled, err := client.CancelTask(ctx, "task-1", CancelTaskRequest{Reason: "operator-request"})
+		if err != nil || canceled.Status != taskpkg.TaskStatusCanceled {
+			t.Fatalf("CancelTask() = %#v, %v", canceled, err)
+		}
+	})
+
+	t.Run("Should manage child tasks dependencies and runs", func(t *testing.T) {
+		child, err := client.CreateChildTask(ctx, "task-1", CreateTaskChildRequest{
+			Scope:     taskpkg.ScopeWorkspace,
+			Workspace: "alpha",
+			Title:     "Check runtime logs",
+		})
+		if err != nil || child.ID != "task-child" {
+			t.Fatalf("CreateChildTask() = %#v, %v", child, err)
+		}
+
+		detail, err := client.AddTaskDependency(ctx, "task-1", AddTaskDependencyRequest{
+			DependsOnTaskID: "task-blocker",
+			Kind:            taskpkg.DependencyKindBlocks,
+		})
+		if err != nil || len(detail.Dependencies) != 1 {
+			t.Fatalf("AddTaskDependency() = %#v, %v", detail, err)
+		}
+
+		detail, err = client.RemoveTaskDependency(ctx, "task-1", "task-blocker")
+		if err != nil || len(detail.Runs) != 1 {
+			t.Fatalf("RemoveTaskDependency() = %#v, %v", detail, err)
+		}
+
+		enqueued, err := client.EnqueueTaskRun(ctx, "task-1", EnqueueTaskRunRequest{
+			IdempotencyKey: "idem-1",
+
+			Metadata: json.RawMessage(`{"schema":"compozy.harness.detached.v1"}`),
+		})
+		if err != nil || enqueued.Status != taskpkg.TaskRunStatusQueued {
+			t.Fatalf("EnqueueTaskRun() = %#v, %v", enqueued, err)
+		}
+
+		runs, err := client.ListTaskRuns(ctx, "task-1", TaskRunListQuery{
+			Status:    taskpkg.TaskRunStatusRunning,
+			SessionID: "sess-1",
+
+			Limit: 2,
+		})
+		if err != nil || len(runs) != 1 || runs[0].Status != taskpkg.TaskRunStatusRunning {
+			t.Fatalf("ListTaskRuns() = %#v, %v", runs, err)
+		}
+
+		shown, err := client.GetTaskRun(ctx, "run-1")
+		if err != nil ||
+			shown.Run.ID != "run-1" ||
+			shown.Run.Status != taskpkg.TaskRunStatusQueued ||
+			shown.Task.ID != "task-1" {
+			t.Fatalf("GetTaskRun() = %#v, %v", shown, err)
+		}
+
+		started, err := client.StartTaskRun(ctx, "run-1", StartTaskRunRequest{IdempotencyKey: "idem-start"})
+		if err != nil || started.Status != taskpkg.TaskRunStatusRunning {
+			t.Fatalf("StartTaskRun() = %#v, %v", started, err)
+		}
+
+		attached, err := client.AttachTaskRunSession(
+			ctx,
+			"run-1",
+			AttachTaskRunSessionRequest{SessionID: "sess-attach"},
+		)
+		if err != nil || attached.Status != taskpkg.TaskRunStatusStarting {
+			t.Fatalf("AttachTaskRunSession() = %#v, %v", attached, err)
+		}
+
+		completed, err := client.CompleteTaskRun(
+			ctx,
+			"run-1",
+			CompleteTaskRunRequest{Result: mustJSON(t, map[string]bool{"ok": true})},
+		)
+		if err != nil || completed.Status != taskpkg.TaskRunStatusCompleted {
+			t.Fatalf("CompleteTaskRun() = %#v, %v", completed, err)
+		}
+
+		failed, err := client.FailTaskRun(
+			ctx,
+			"run-1",
+			FailTaskRunRequest{Error: "boom", Metadata: mustJSON(t, map[string]string{"code": "E_TASK"})},
+		)
+		if err != nil || failed.Status != taskpkg.TaskRunStatusFailed {
+			t.Fatalf("FailTaskRun() = %#v, %v", failed, err)
+		}
+
+		canceled, err := client.CancelTaskRun(
+			ctx,
+			"run-1",
+			CancelTaskRunRequest{Reason: "operator-request", Metadata: mustJSON(t, map[string]string{"source": "cli"})},
+		)
+		if err != nil || canceled.Status != taskpkg.TaskRunStatusCanceled {
+			t.Fatalf("CancelTaskRun() = %#v, %v", canceled, err)
+		}
+	})
+}
+
+func TestReadAPIErrorAndHelpers(t *testing.T) {
+	t.Parallel()
+
+	resp := newHTTPResponse(http.StatusBadRequest, `{"error":"boom"}`)
+	defer func() {
+		if closeErr := resp.Body.Close(); closeErr != nil {
+			t.Errorf("response body Close() error = %v", closeErr)
+		}
+	}()
+	err := readAPIError(resp)
+	if err == nil || !strings.Contains(err.Error(), "boom") {
+		t.Fatalf("readAPIError() = %v, want boom", err)
+	}
+
+	toolResp := newHTTPResponse(
+		http.StatusAccepted,
+		`{"error":{"code":"tool_approval_required","message":"tool approval token=super-secret is required","tool_id":"compozy__skill_view","reason_codes":["approval_token_missing"],"layer":"approval","details":{"approval_token":"approval-token-secret"}}}`,
+	)
+	defer func() {
+		if closeErr := toolResp.Body.Close(); closeErr != nil {
+			t.Errorf("tool response body Close() error = %v", closeErr)
+		}
+	}()
+	err = readAPIError(toolResp)
+
+	toolErr, toolErrMatched := errors.AsType[*toolAPIError](err)
+	if !toolErrMatched {
+		t.Fatalf("readAPIError(tool) = %T %[1]v, want toolAPIError", err)
+	}
+	toolPayload := toolErr.Response()
+	if toolPayload.Error.Code != toolspkg.ErrorCodeApprovalRequired ||
+		len(toolPayload.Error.ReasonCodes) != 1 ||
+		toolPayload.Error.ReasonCodes[0] != toolspkg.ReasonApprovalTokenMissing {
+		t.Fatalf("tool error payload = %#v, want approval required", toolPayload.Error)
+	}
+	if strings.Contains(toolErr.Error(), "super-secret") ||
+		strings.Contains(string(mustJSON(t, toolPayload)), "approval-token-secret") {
+		t.Fatalf("tool error leaked sensitive material: error=%q payload=%s", toolErr.Error(), mustJSON(t, toolPayload))
+	}
+
+	if got := sessionEventValues(SessionEventQuery{
+		Type:          "agent_message",
+		AgentName:     "coder",
+		TurnID:        "turn-1",
+		Since:         fixedTestNow,
+		Last:          3,
+		AfterSequence: 9,
+	}); got.Get("after_sequence") != "9" || got.Get("limit") != "3" {
+		t.Fatalf("sessionEventValues() = %v, want limit/after_sequence", got)
+	}
+
+	t.Run("Should serialize every session list page filter", func(t *testing.T) {
+		t.Parallel()
+
+		if got := sessionListValues(SessionListQuery{
+			Workspace:     "ws-1",
+			State:         "active",
+			Type:          "user",
+			Agent:         "coder",
+			Parent:        "sess-parent",
+			Root:          "sess-root",
+			Query:         "needle",
+			Resumable:     true,
+			Archive:       "only",
+			IncludeHealth: true,
+			Sort:          "last_activity",
+			Cursor:        "cursor-1",
+			Limit:         2,
+		}); got.Get("workspace_id") != "ws-1" || got.Get("state") != "active" || got.Get("type") != "user" ||
+			got.Get("all_workspaces") != "" ||
+			got.Get("agent") != "coder" ||
+			got.Get("parent") != "sess-parent" || got.Get("root") != "sess-root" ||
+			got.Get("q") != "needle" || got.Get("resumable") != "true" || got.Get("archive") != "only" ||
+			got.Get("sort") != "last_activity" ||
+			got.Get("include_health") != "true" || got.Get("cursor") != "cursor-1" || got.Get("limit") != "2" {
+			t.Fatalf("sessionListValues() = %v, want all page filters", got)
+		}
+	})
+
+	t.Run("Should request all workspaces when no workspace filter is selected", func(t *testing.T) {
+		t.Parallel()
+
+		got := sessionListValues(SessionListQuery{})
+		if got.Get("all_workspaces") != "true" || got.Get("workspace_id") != "" {
+			t.Fatalf("sessionListValues() = %v, want all_workspaces=true", got)
+		}
+	})
+
+	if got := logsListValues(LogsListQuery{
+		SessionID: "sess-1",
+		AgentName: "coder",
+		Type:      "done",
+		Since:     fixedTestNow,
+		Last:      2,
+	}); got.Get("session_id") != "sess-1" || got.Get("limit") != "2" {
+		t.Fatalf("logsListValues() = %v, want session_id/limit", got)
+	}
+
+	if got := hookCatalogValues(HookCatalogQuery{
+		Workspace: "alpha",
+		Agent:     "coder",
+		Event:     "tool.pre_call",
+		Source:    "config",
+		Mode:      "sync",
+	}); got.Get("workspace") != "alpha" || got.Get("source") != "config" || got.Get("mode") != "sync" {
+		t.Fatalf("hookCatalogValues() = %v, want all hook catalog filters", got)
+	}
+
+	if got := hookRunsValues(HookRunsQuery{
+		Session: "sess-1",
+		Event:   "permission.request",
+		Outcome: "failed",
+		Since:   "2026-04-03T11:00:00Z",
+		Last:    2,
+	}); got.Get("outcome") != "failed" || got.Get("last") != "2" || got.Get("since") != "2026-04-03T11:00:00Z" {
+		t.Fatalf("hookRunsValues() = %v, want all hook runs filters", got)
+	}
+
+	if got := hookEventsValues(
+		HookEventsQuery{Family: "tool", SyncOnly: true},
+	); got.Get("family") != "tool" ||
+		got.Get("sync_only") != "true" {
+		t.Fatalf("hookEventsValues() = %v, want family/sync_only", got)
+	}
+
+	if got := automationJobValues(AutomationJobQuery{
+		Scope:       automationpkg.AutomationScopeWorkspace,
+		WorkspaceID: "ws-alpha",
+		Source:      automationpkg.JobSourceDynamic,
+		Search:      "digest",
+		Cursor:      "job-cursor",
+		Limit:       3,
+	}); got.Get("scope") != "workspace" || got.Get("workspace_id") != "ws-alpha" || got.Get("source") != "dynamic" || got.Get("q") != "digest" || got.Get("cursor") != "job-cursor" || got.Get("limit") != "3" {
+		t.Fatalf("automationJobValues() = %v, want all job filters", got)
+	}
+
+	if got := automationTriggerValues(AutomationTriggerQuery{
+		Scope:       automationpkg.AutomationScopeWorkspace,
+		WorkspaceID: "ws-alpha",
+		Event:       "webhook",
+		Source:      automationpkg.JobSourceDynamic,
+		Search:      "review",
+		Cursor:      "trigger-cursor",
+		Limit:       2,
+	}); got.Get("scope") != "workspace" || got.Get("workspace_id") != "ws-alpha" || got.Get("event") != "webhook" || got.Get("source") != "dynamic" || got.Get("q") != "review" || got.Get("cursor") != "trigger-cursor" || got.Get("limit") != "2" {
+		t.Fatalf("automationTriggerValues() = %v, want all trigger filters", got)
+	}
+
+	if got := automationRunValues(AutomationRunQuery{
+		JobID:     "job-1",
+		TriggerID: "trg-1",
+		Status:    automationpkg.RunCompleted,
+		Since:     fixedTestNow,
+		Until:     fixedTestNow.Add(time.Hour),
+		Limit:     4,
+	}); got.Get("job_id") != "job-1" || got.Get("trigger_id") != "trg-1" || got.Get("status") != "completed" || got.Get("limit") != "4" {
+		t.Fatalf("automationRunValues() = %v, want all run filters", got)
+	}
+
+	if got := taskValues(TaskListQuery{
+		Scope:        taskpkg.CatalogScopeWorkspace,
+		Workspace:    "alpha",
+		Status:       taskpkg.TaskStatusReady,
+		OwnerKind:    taskpkg.OwnerKindPool,
+		OwnerRef:     "triage",
+		ParentTaskID: "task-root",
+		Worktree:     "wt-alpha",
+		IncludeLoop:  true,
+		LoopRunID:    "looprun-alpha",
+
+		Limit: 3,
+	}); got.Get("scope") != "workspace" || got.Get("workspace") != "alpha" || got.Get("status") != "ready" || got.Get("owner_kind") != "pool" || got.Get("owner_ref") != "triage" || got.Get("parent_task_id") != "task-root" || got.Get("worktree") != "wt-alpha" || got.Get("include_loop") != "true" || got.Get("loop_run_id") != "looprun-alpha" || got.Get("limit") != "3" {
+		t.Fatalf("taskValues() = %v, want all task filters", got)
+	}
+
+	if got := taskRunValues(TaskRunListQuery{
+		Status:    taskpkg.TaskRunStatusRunning,
+		SessionID: "sess-1",
+
+		Limit: 2,
+	}); got.Get("status") != "running" || got.Get("session_id") != "sess-1" ||
+		got.Get("limit") != "2" {
+		t.Fatalf("taskRunValues() = %v, want all task run filters", got)
+	}
+
+	plain := newHTTPResponse(http.StatusInternalServerError, "plain failure")
+	defer func() {
+		if closeErr := plain.Body.Close(); closeErr != nil {
+			t.Errorf("plain response body Close() error = %v", closeErr)
+		}
+	}()
+	if err := readAPIError(plain); err == nil || !strings.Contains(err.Error(), "plain failure") {
+		t.Fatalf("readAPIError(plain) = %v, want plain failure", err)
+	}
+
+	large := newHTTPResponse(http.StatusInternalServerError, strings.Repeat("x", 2<<20))
+	defer func() {
+		if closeErr := large.Body.Close(); closeErr != nil {
+			t.Errorf("large response body Close() error = %v", closeErr)
+		}
+	}()
+	if err := readAPIError(large); err == nil {
+		t.Fatal("readAPIError(large) error = nil, want non-nil")
+	} else if len(err.Error()) > (1<<20)+128 {
+		t.Fatalf("readAPIError(large) len = %d, want capped body size", len(err.Error()))
+	}
+}
+
+func TestDecodeSSEContract(t *testing.T) {
+	t.Parallel()
+
+	t.Run("Should stop after ErrStop", func(t *testing.T) {
+		t.Parallel()
+
+		body := strings.Join([]string{
+			"id: 1",
+			"event: done",
+			`data: {"ok":true}`,
+			"",
+			"id: 2",
+			"event: later",
+			`data: {"ok":false}`,
+			"",
+		}, "\n")
+
+		count := 0
+		err := decodeSSE(t.Context(), strings.NewReader(body), func(event SSEEvent) error {
+			count++
+			if event.Event == "done" {
+				return errStopSSE
+			}
+			return nil
+		})
+		if err != nil {
+			t.Fatalf("decodeSSE() error = %v", err)
+		}
+		if count != 1 {
+			t.Fatalf("decodeSSE() count = %d, want 1", count)
+		}
+	})
+
+	t.Run("Should reject nil arguments", func(t *testing.T) {
+		t.Parallel()
+
+		testCases := []struct {
+			name    string
+			ctx     context.Context
+			body    io.Reader
+			handler SSEHandler
+			wantErr string
+		}{
+			{
+				name:    "Should reject a nil context",
+				ctx:     nil,
+				body:    strings.NewReader("event: ping\n\n"),
+				handler: func(SSEEvent) error { return nil },
+				wantErr: "sse: context is required",
+			},
+			{
+				name:    "Should reject a nil reader",
+				ctx:     t.Context(),
+				body:    nil,
+				handler: func(SSEEvent) error { return nil },
+				wantErr: "sse: body is required",
+			},
+			{
+				name:    "Should reject a nil handler",
+				ctx:     t.Context(),
+				body:    strings.NewReader("event: ping\n\n"),
+				handler: nil,
+				wantErr: "sse: handler is required",
+			},
+		}
+
+		for _, tt := range testCases {
+			t.Run(tt.name, func(t *testing.T) {
+				t.Parallel()
+
+				err := decodeSSE(tt.ctx, tt.body, tt.handler)
+				if err == nil || err.Error() != tt.wantErr {
+					t.Fatalf("decodeSSE() error = %v, want %q", err, tt.wantErr)
+				}
+			})
+		}
+	})
+
+	t.Run("Should preserve handler error identity", func(t *testing.T) {
+		t.Parallel()
+
+		wantErr := errors.New("boom")
+		body := strings.Join([]string{
+			"id: 1",
+			"event: done",
+			`data: {"ok":true}`,
+			"",
+		}, "\n")
+
+		err := decodeSSE(t.Context(), strings.NewReader(body), func(SSEEvent) error {
+			return wantErr
+		})
+		if !errors.Is(err, wantErr) {
+			t.Fatalf("decodeSSE() error = %v, want %v", err, wantErr)
+		}
+	})
+
+	t.Run("Should preserve multiline data", func(t *testing.T) {
+		t.Parallel()
+
+		body := strings.Join([]string{
+			"id: 1",
+			"event: message",
+			`data: {"first":true}`,
+			`data: {"second":true}`,
+			"",
+		}, "\n")
+
+		var seen SSEEvent
+		err := decodeSSE(t.Context(), strings.NewReader(body), func(event SSEEvent) error {
+			seen = event
+			return nil
+		})
+		if err != nil {
+			t.Fatalf("decodeSSE() error = %v", err)
+		}
+		if got, want := string(seen.Data), "{\"first\":true}\n{\"second\":true}"; got != want {
+			t.Fatalf("decodeSSE() data = %q, want %q", got, want)
+		}
+	})
+}
+
+func newHTTPResponse(status int, body string) *http.Response {
+	return &http.Response{
+		StatusCode: status,
+		Status:     http.StatusText(status),
+		Header:     make(http.Header),
+		Body:       io.NopCloser(strings.NewReader(body)),
+		Request:    &http.Request{Method: http.MethodGet},
+	}
+}
+
+func nilContext() context.Context {
+	return nil
+}
+
+func TestNewClientRequiresSocket(t *testing.T) {
+	t.Parallel()
+
+	if _, err := NewClient(LocalClientTarget("")); err == nil {
+		t.Fatal("NewClient(\"\") error = nil, want non-nil")
+	}
+}
+
+func TestNewClientConfiguresTimeouts(t *testing.T) {
+	t.Parallel()
+
+	client, err := NewClient(LocalClientTarget("/tmp/compozy.sock"))
+	if err != nil {
+		t.Fatalf("NewClient() error = %v", err)
+	}
+	udsClient, ok := client.(*daemonClient)
+	if !ok {
+		t.Fatalf("NewClient() = %T, want *daemonClient", client)
+	}
+	if udsClient.httpClient == nil {
+		t.Fatal("httpClient = nil, want timeout-bound client")
+	}
+	if udsClient.httpClient.Timeout != defaultUnixSocketClientTimeout {
+		t.Fatalf("httpClient timeout = %v, want %v", udsClient.httpClient.Timeout, defaultUnixSocketClientTimeout)
+	}
+	if udsClient.streamClient == nil {
+		t.Fatal("streamClient = nil, want dedicated streaming client")
+	}
+	if udsClient.streamClient.Timeout != 0 {
+		t.Fatalf("streamClient timeout = %v, want no client-level timeout", udsClient.streamClient.Timeout)
+	}
+}
+
+// TestUnixSocketClientSessionWaitLifetime verifies requested session waits outlive the ordinary transport deadline.
+func TestUnixSocketClientSessionWaitLifetime(t *testing.T) {
+	t.Parallel()
+
+	t.Run("Should preserve a server wait beyond the ordinary request timeout", func(t *testing.T) {
+		t.Parallel()
+
+		transport := roundTripperFunc(func(req *http.Request) (*http.Response, error) {
+			if req.Method != http.MethodPost || req.URL.Path != "/api/workspaces/ws-1/sessions/sess-1/wait" {
+				t.Fatalf("request = %s %s, want scoped session wait", req.Method, req.URL.Path)
+			}
+			var request SessionWaitRequest
+			if err := json.NewDecoder(req.Body).Decode(&request); err != nil {
+				t.Fatalf("decode wait: %v", err)
+			}
+			if request.TimeoutMS != 50 {
+				t.Fatalf("timeout = %d, want 50", request.TimeoutMS)
+			}
+			timer := time.NewTimer(50 * time.Millisecond)
+			defer timer.Stop()
+			select {
+			case <-req.Context().Done():
+				return nil, req.Context().Err()
+			case <-timer.C:
+				return newHTTPResponse(
+					http.StatusOK,
+					`{"session_id":"sess-1","outcome":"timeout","state":"running","waited_ms":50,"resume_id":"wait-1"}`,
+				), nil
+			}
+		})
+		client := &daemonClient{
+			target:       LocalClientTarget("/tmp/compozy.sock"),
+			httpClient:   &http.Client{Transport: transport, Timeout: time.Millisecond},
+			streamClient: &http.Client{Transport: transport},
+		}
+		result, err := client.WaitSession(t.Context(), "ws-1", "sess-1", SessionWaitRequest{TimeoutMS: 50})
+		if err != nil {
+			t.Fatalf("WaitSession() error = %v, want server timeout outcome", err)
+		}
+		if result.Outcome != "timeout" || result.WaitedMS != 50 || result.ResumeID != "wait-1" {
+			t.Fatalf("WaitSession() = %#v, want resumable server timeout", result)
+		}
+	})
+
+	t.Run("Should release the wait when its caller cancels", func(t *testing.T) {
+		t.Parallel()
+
+		ctx, cancel := context.WithCancel(t.Context())
+		defer cancel()
+		transport := roundTripperFunc(func(req *http.Request) (*http.Response, error) {
+			cancel()
+			<-req.Context().Done()
+			return nil, req.Context().Err()
+		})
+		client := &daemonClient{
+			target:       LocalClientTarget("/tmp/compozy.sock"),
+			httpClient:   &http.Client{Transport: transport},
+			streamClient: &http.Client{Transport: transport},
+		}
+		_, err := client.WaitSession(ctx, "ws-1", "sess-1", SessionWaitRequest{TimeoutMS: 50})
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("WaitSession() error = %v, want caller cancellation", err)
+		}
+	})
+}
+
+func TestDoRequestSetsHeaders(t *testing.T) {
+	t.Parallel()
+
+	client := &daemonClient{
+		target: LocalClientTarget("/tmp/compozy.sock"),
+		httpClient: &http.Client{
+			Transport: roundTripperFunc(func(req *http.Request) (*http.Response, error) {
+				if got := req.Header.Get("User-Agent"); got != defaultUserAgentName {
+					t.Fatalf("User-Agent = %q, want %q", got, defaultUserAgentName)
+				}
+				if got := req.Header.Get("Last-Event-ID"); got != "cursor-9" {
+					t.Fatalf("Last-Event-ID = %q, want %q", got, "cursor-9")
+				}
+				if got := req.URL.Query().Get("since"); got == "" {
+					t.Fatal("expected encoded query string")
+				}
+				return newHTTPResponse(http.StatusOK, `{"events":[]}`), nil
+			}),
+		},
+	}
+
+	err := client.doSSE(
+		t.Context(),
+		"/api/logs/stream",
+		logsListValues(LogsListQuery{Since: time.Now().UTC()}),
+		"cursor-9",
+		func(SSEEvent) error {
+			return nil
+		},
+	)
+	if err != nil {
+		t.Fatalf("doSSE() error = %v", err)
+	}
+}
+
+func TestClientCallersShouldOwnResponseBodies(t *testing.T) {
+	t.Parallel()
+
+	t.Run("Should drain bounded trailing JSON bytes before closing the response", func(t *testing.T) {
+		t.Parallel()
+
+		reader := &stagedResponseReader{chunks: [][]byte{
+			[]byte(`{"status":"ok"}`),
+			[]byte(" \n\t"),
+		}}
+		body := &responseBodyProbe{reader: reader}
+		client := &daemonClient{
+			target: LocalClientTarget("/tmp/compozy.sock"),
+			httpClient: &http.Client{
+				Transport: roundTripperFunc(func(req *http.Request) (*http.Response, error) {
+					response := newHTTPResponse(http.StatusOK, "")
+					response.Body = body
+					response.Request = req
+					return response, nil
+				}),
+			},
+		}
+
+		var decoded map[string]string
+		if err := client.doJSON(t.Context(), http.MethodGet, "/api/test", nil, nil, &decoded); err != nil {
+			t.Fatalf("doJSON() error = %v", err)
+		}
+		if got, want := decoded["status"], "ok"; got != want {
+			t.Fatalf("doJSON() status = %q, want %q", got, want)
+		}
+		if got := len(reader.chunks); got != 0 {
+			t.Fatalf("trailing response chunks = %d, want 0", got)
+		}
+		if got, want := body.closeCalls.Load(), int32(1); got != want {
+			t.Fatalf("response body Close() calls = %d, want %d", got, want)
+		}
+	})
+
+	t.Run("Should stop best-effort drain at the response cleanup limit", func(t *testing.T) {
+		t.Parallel()
+
+		body := strings.NewReader(strings.Repeat("x", int(responseBodyDrainLimit*2)))
+		if err := drainResponseBody(http.MethodGet, "/api/test", body); err != nil {
+			t.Fatalf("drainResponseBody() error = %v", err)
+		}
+		if got, want := body.Len(), int(responseBodyDrainLimit); got != want {
+			t.Fatalf("drainResponseBody() remaining bytes = %d, want %d", got, want)
+		}
+	})
+
+	t.Run("Should preserve a trailing drain error after successful JSON decoding", func(t *testing.T) {
+		t.Parallel()
+
+		drainErr := errors.New("drain trailing response bytes")
+		body := &responseBodyProbe{reader: &stagedResponseReader{
+			chunks:      [][]byte{[]byte(`{"status":"ok"}`)},
+			terminalErr: drainErr,
+		}}
+		client := &daemonClient{
+			target: LocalClientTarget("/tmp/compozy.sock"),
+			httpClient: &http.Client{
+				Transport: roundTripperFunc(func(req *http.Request) (*http.Response, error) {
+					response := newHTTPResponse(http.StatusOK, "")
+					response.Body = body
+					response.Request = req
+					return response, nil
+				}),
+			},
+		}
+
+		var decoded map[string]string
+		err := client.doJSON(t.Context(), http.MethodGet, "/api/test", nil, nil, &decoded)
+		if !errors.Is(err, drainErr) {
+			t.Fatalf("doJSON() error = %v, want drain error %v", err, drainErr)
+		}
+		if got, want := decoded["status"], "ok"; got != want {
+			t.Fatalf("doJSON() status = %q, want %q", got, want)
+		}
+		if got, want := body.closeCalls.Load(), int32(1); got != want {
+			t.Fatalf("response body Close() calls = %d, want %d", got, want)
+		}
+	})
+
+	t.Run("Should reject an oversized session prompt body after a bounded drain", func(t *testing.T) {
+		t.Parallel()
+
+		body := strings.NewReader(strings.Repeat(
+			"x",
+			sessionPromptBodyLimit+1+int(responseBodyDrainLimit)+1,
+		))
+		_, err := readSessionPromptBody(body)
+		if !errors.Is(err, errSessionPromptBodyTooLarge) {
+			t.Fatalf("readSessionPromptBody() error = %v, want size limit error", err)
+		}
+		if got, want := body.Len(), 1; got != want {
+			t.Fatalf("readSessionPromptBody() remaining bytes = %d, want %d", got, want)
+		}
+	})
+
+	t.Run("Should preserve ValidateLoop read and response close errors", func(t *testing.T) {
+		t.Parallel()
+
+		readErr := errors.New("read loop validation response")
+		closeErr := errors.New("close loop validation response")
+		body := &responseBodyProbe{
+			reader:   iotest.ErrReader(readErr),
+			closeErr: closeErr,
+		}
+		client := &daemonClient{
+			target: LocalClientTarget("/tmp/compozy.sock"),
+			httpClient: &http.Client{
+				Transport: roundTripperFunc(func(req *http.Request) (*http.Response, error) {
+					response := newHTTPResponse(http.StatusOK, "")
+					response.Body = body
+					response.Request = req
+					return response, nil
+				}),
+			},
+		}
+
+		_, err := client.ValidateLoop(
+			t.Context(),
+			"workspace-1",
+			"loop-1",
+			contract.ValidateLoopRequest{},
+		)
+		if !errors.Is(err, readErr) {
+			t.Fatalf("ValidateLoop() error = %v, want read error %v", err, readErr)
+		}
+		if !errors.Is(err, closeErr) {
+			t.Fatalf("ValidateLoop() error = %v, want close error %v", err, closeErr)
+		}
+		if got, want := body.closeCalls.Load(), int32(1); got != want {
+			t.Fatalf("response body Close() calls = %d, want %d", got, want)
+		}
+	})
+
+	t.Run("Should close doSSE response once after context cancellation and preserve close error", func(t *testing.T) {
+		t.Parallel()
+
+		ctx, cancel := context.WithCancel(t.Context())
+		readStarted := make(chan struct{})
+		closeErr := errors.New("close doSSE response")
+		var body *responseBodyProbe
+		client := &daemonClient{
+			target: LocalClientTarget("/tmp/compozy.sock"),
+			httpClient: &http.Client{
+				Transport: roundTripperFunc(func(req *http.Request) (*http.Response, error) {
+					body = &responseBodyProbe{
+						reader: &contextBoundReader{
+							ctx:         req.Context(),
+							readStarted: readStarted,
+						},
+						closeErr: closeErr,
+					}
+					response := newHTTPResponse(http.StatusOK, "")
+					response.Header.Set("Content-Type", "text/event-stream")
+					response.Body = body
+					response.Request = req
+					return response, nil
+				}),
+			},
+		}
+
+		errCh := make(chan error, 1)
+		go func() {
+			errCh <- client.doSSE(ctx, "/api/logs/stream", nil, "", func(SSEEvent) error {
+				return nil
+			})
+		}()
+
+		<-readStarted
+		cancel()
+		err := <-errCh
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("doSSE() error = %v, want context.Canceled", err)
+		}
+		if !errors.Is(err, closeErr) {
+			t.Fatalf("doSSE() error = %v, want close error %v", err, closeErr)
+		}
+		if got, want := body.closeCalls.Load(), int32(1); got != want {
+			t.Fatalf("response body Close() calls = %d, want %d", got, want)
+		}
+	})
+
+	t.Run("Should close doSessionPrompt SSE response once and preserve close error", func(t *testing.T) {
+		t.Parallel()
+
+		closeErr := errors.New("close prompt response")
+		body := &responseBodyProbe{
+			reader:   strings.NewReader("event: prompt_result\ndata: {}\n\n"),
+			closeErr: closeErr,
+		}
+		client := &daemonClient{
+			target: LocalClientTarget("/tmp/compozy.sock"),
+			httpClient: &http.Client{
+				Transport: roundTripperFunc(func(req *http.Request) (*http.Response, error) {
+					response := newHTTPResponse(http.StatusOK, "")
+					response.Header.Set("Content-Type", "text/event-stream")
+					response.Body = body
+					response.Request = req
+					return response, nil
+				}),
+			},
+		}
+
+		_, err := client.doSessionPrompt(
+			t.Context(),
+			http.MethodPost,
+			"/api/workspaces/ws-1/sessions/sess-1/prompt",
+			nil,
+			SessionPromptRequest{Message: "hello"},
+		)
+		if !errors.Is(err, closeErr) {
+			t.Fatalf("doSessionPrompt() error = %v, want close error %v", err, closeErr)
+		}
+		if got, want := body.closeCalls.Load(), int32(1); got != want {
+			t.Fatalf("response body Close() calls = %d, want %d", got, want)
+		}
+	})
+
+	t.Run("Should close StreamPromptSession SSE response once and preserve close error", func(t *testing.T) {
+		t.Parallel()
+
+		closeErr := errors.New("close streamed prompt response")
+		body := &responseBodyProbe{
+			reader:   strings.NewReader("event: agent_message\ndata: {}\n\n"),
+			closeErr: closeErr,
+		}
+		transport := roundTripperFunc(func(req *http.Request) (*http.Response, error) {
+			switch {
+			case req.Method == http.MethodGet && req.URL.Path == "/api/sessions/sess-1":
+				return newHTTPResponse(
+					http.StatusOK,
+					`{"session":{"id":"sess-1","workspace_id":"ws-1","state":"active","available_commands":[],"created_at":"2026-07-10T20:00:00Z","updated_at":"2026-07-10T20:00:00Z"}}`,
+				), nil
+			case req.Method == http.MethodPost &&
+				req.URL.Path == "/api/workspaces/ws-1/sessions/sess-1/prompt":
+				response := newHTTPResponse(http.StatusOK, "")
+				response.Header.Set("Content-Type", "text/event-stream")
+				response.Body = body
+				response.Request = req
+				return response, nil
+			default:
+				t.Fatalf("unexpected request = %s %s", req.Method, req.URL.Path)
+				return nil, errors.New("unexpected request")
+			}
+		})
+		client := &daemonClient{
+			target:     LocalClientTarget("/tmp/compozy.sock"),
+			httpClient: &http.Client{Transport: transport},
+		}
+		client.streamClient = client.httpClient
+
+		err := client.StreamPromptSession(
+			t.Context(),
+			"sess-1",
+			SessionPromptRequest{Message: "hello"},
+			func(SSEEvent) error { return nil },
+		)
+		if !errors.Is(err, closeErr) {
+			t.Fatalf("StreamPromptSession() error = %v, want close error %v", err, closeErr)
+		}
+		if got, want := body.closeCalls.Load(), int32(1); got != want {
+			t.Fatalf("response body Close() calls = %d, want %d", got, want)
+		}
+	})
+}
+
+func TestDoRequestRejectsNilContext(t *testing.T) {
+	t.Parallel()
+
+	client := &daemonClient{
+		target:     LocalClientTarget("/tmp/compozy.sock"),
+		httpClient: &http.Client{},
+	}
+
+	response, err := client.doRequest(nilContext(), http.MethodGet, "/api/status", nil)
+	if response != nil {
+		defer func() {
+			if closeErr := response.Body.Close(); closeErr != nil {
+				t.Errorf("response body Close() error = %v", closeErr)
+			}
+		}()
+	}
+	if err == nil {
+		t.Fatal("doRequest(nil) error = nil, want non-nil")
+	}
+}
+
+func TestSharedContractJSONParity(t *testing.T) {
+	t.Parallel()
+
+	t.Run("Should decode shared session capabilities", func(t *testing.T) {
+		t.Parallel()
+
+		sessionResponse := `{"sessions":[{"id":"sess-1","name":"demo","agent_name":"coder","workspace_id":"ws-1","workspace_path":"/workspace/project","state":"active","runtime":{"acp_caps":{"supports_load_session":true,"supported_modes":["chat"]}},"created_at":"2026-04-03T12:00:00Z","updated_at":"2026-04-03T12:00:00Z"}]}`
+		var cliSessions struct {
+			Sessions []SessionRecord `json:"sessions"`
+		}
+		if err := json.Unmarshal([]byte(sessionResponse), &cliSessions); err != nil {
+			t.Fatalf("json.Unmarshal(cli session response) error = %v", err)
+		}
+		if len(cliSessions.Sessions) != 1 || cliSessions.Sessions[0].Runtime.ACPCaps == nil ||
+			!cliSessions.Sessions[0].Runtime.ACPCaps.SupportsLoadSession {
+			t.Fatalf("cli session decode = %#v, want decoded shared contract payload", cliSessions)
+		}
+	})
+}
+
+// UT-047: daemon errors retain the documented subagent codes at the CLI boundary.
+func TestSubagentClientRequests(t *testing.T) {
+	t.Parallel()
+	t.Run("Should resolve a subagent ID without a workspace or registered cwd", func(t *testing.T) {
+		t.Parallel()
+		client := &daemonClient{
+			target: LocalClientTarget("/tmp/compozy.sock"),
+			httpClient: &http.Client{Transport: roundTripperFunc(func(request *http.Request) (*http.Response, error) {
+				switch request.URL.Path {
+				case "/api/workspaces":
+					return newHTTPResponse(200, `{"workspaces":[{"id":"other"},{"id":"owner"}]}`), nil
+				case "/api/workspaces/other/subagents/sub-1":
+					return newHTTPResponse(404, `{"code":"subagent_not_found"}`), nil
+				case "/api/workspaces/owner/subagents/sub-1":
+					return newHTTPResponse(200, `{"subagent_id":"sub-1","workspace_id":"owner"}`), nil
+				default:
+					t.Fatalf("unexpected request: %s", request.URL)
+					return nil, nil
+				}
+			})},
+		}
+		row, err := client.GetSubagent(t.Context(), "", "sub-1")
+		if err != nil || row.WorkspaceID != "owner" {
+			t.Fatalf("row=%#v error=%v", row, err)
+		}
+	})
+	t.Run("Should encode list filters and preserve the page envelope", func(t *testing.T) {
+		t.Parallel()
+		client := &daemonClient{
+			target: LocalClientTarget("/tmp/compozy.sock"),
+			httpClient: &http.Client{Transport: roundTripperFunc(func(request *http.Request) (*http.Response, error) {
+				if request.URL.Path == "/api/sessions/parent" {
+					return newHTTPResponse(200, `{"session":{"id":"parent","workspace_id":"ws"}}`), nil
+				}
+				if request.URL.Path != "/api/workspaces/ws/sessions/parent/subagents" ||
+					request.URL.Query().Get("origin") != "delegated" ||
+					request.URL.Query().Get("status") != "running,completed" ||
+					request.URL.Query().Get("limit") != "20" ||
+					request.URL.Query().Get("cursor") != "opaque" {
+					t.Fatalf("request=%s", request.URL)
+				}
+				return newHTTPResponse(200, `{"subagents":[],"next_cursor":"next"}`), nil
+			})},
+		}
+		page, err := client.ListSessionSubagents(
+			t.Context(),
+			"parent",
+			SubagentListQuery{Origin: "delegated", Status: "running,completed", Limit: 20, Cursor: "opaque"},
+		)
+		if err != nil || page.NextCursor == nil || *page.NextCursor != "next" || page.Subagents == nil {
+			t.Fatalf("page=%+v error=%v", page, err)
+		}
+	})
+	t.Run("Should preserve cancellation reason and accepted status", func(t *testing.T) {
+		t.Parallel()
+		client := &daemonClient{
+			target: LocalClientTarget("/tmp/compozy.sock"),
+			httpClient: &http.Client{Transport: roundTripperFunc(func(request *http.Request) (*http.Response, error) {
+				if request.Method != "POST" || request.URL.Path != "/api/workspaces/ws/subagents/sub-1/cancel" {
+					t.Fatalf("request=%s %s", request.Method, request.URL)
+				}
+				var body contract.SubagentCancelRequest
+				if err := json.NewDecoder(request.Body).Decode(&body); err != nil {
+					t.Fatal(err)
+				}
+				if body.Reason != "Direction abandoned." {
+					t.Fatalf("reason=%q", body.Reason)
+				}
+				return newHTTPResponse(202, `{"subagent_id":"sub-1","status":"cancel_requested"}`), nil
+			})},
+		}
+		result, err := client.CancelSubagent(t.Context(), "ws", "sub-1", "Direction abandoned.")
+		if err != nil || result.Status != "cancel_requested" {
+			t.Fatalf("result=%+v error=%v", result, err)
+		}
+	})
+	for _, kind := range []string{"session", "subagent"} {
+		t.Run("Should map unknown "+kind+" to the documented code", func(t *testing.T) {
+			t.Parallel()
+			client := &daemonClient{
+				target: LocalClientTarget("/tmp/compozy.sock"),
+				httpClient: &http.Client{Transport: roundTripperFunc(func(*http.Request) (*http.Response, error) {
+					return newHTTPResponse(404, `{"error":"not found"}`), nil
+				})},
+			}
+			var err error
+			if kind == "session" {
+				_, err = client.ListSessionSubagents(t.Context(), "missing", SubagentListQuery{})
+			} else {
+				_, err = client.GetSubagent(t.Context(), "ws", "missing")
+			}
+			if err == nil || !strings.HasPrefix(err.Error(), kind+"_not_found:") {
+				t.Fatalf("error=%v", err)
+			}
+		})
+	}
+}
+
+// Invariant: lifecycle process choices preserve omission and reach the owning wire field.
+// Owning layer/canonical suite: UnixSocketClient methods; mutation behavior belongs to the API suite.
+func TestUnixSocketClientSessionProcessPolicy(t *testing.T) {
+	t.Parallel()
+	for _, policy := range []contract.SessionProcessPolicy{"", "keep", "terminate"} {
+		for _, choice := range []struct {
+			operation string
+			flag      bool
+		}{
+			{"stop", false}, {"stop", true}, {"archive", false}, {"archive", true}, {"delete", false},
+		} {
+			operation := choice.operation
+			t.Run("Should encode "+operation+" with process policy "+string(policy), func(t *testing.T) {
+				t.Parallel()
+				mutated := false
+				client := &daemonClient{target: LocalClientTarget("/tmp/compozy.sock")}
+				client.httpClient = &http.Client{
+					Transport: roundTripperFunc(func(req *http.Request) (*http.Response, error) {
+						if req.Method == http.MethodGet {
+							return newHTTPResponse(
+								http.StatusOK,
+								`{"session":{"id":"sess-1","workspace_id":"ws-1"}}`,
+							), nil
+						}
+						mutated = true
+						path, method := "/api/workspaces/ws-1/sessions/sess-1/"+operation, http.MethodPost
+						if operation == "delete" {
+							path, method = "/api/workspaces/ws-1/sessions/sess-1", http.MethodDelete
+						}
+						if req.URL.Path != path || req.Method != method {
+							t.Fatalf("unexpected mutation: %s %s", req.Method, req.URL)
+						}
+						if operation == "stop" {
+							var body map[string]any
+							if err := json.NewDecoder(req.Body).Decode(&body); err != nil {
+								t.Fatal(err)
+							}
+							actual, present := body["processes"]
+							if present != (policy != "") || (present && actual != string(policy)) {
+								t.Fatalf("stop process policy: %#v", body)
+							}
+							if body["wait"] != choice.flag || req.URL.Query().Has("processes") {
+								t.Fatalf("stop request: %#v %s", body, req.URL)
+							}
+						} else {
+							query := req.URL.Query()
+							if query.Has("processes") != (policy != "") || query.Get("processes") != string(policy) {
+								t.Fatalf("policy query: %s", req.URL)
+							}
+							if operation == "archive" && (query.Get("stop") == "true") != choice.flag {
+								t.Fatalf("archive stop query: %s", req.URL)
+							}
+							wantChildren := choice.flag
+							if operation == "archive" {
+								wantChildren = !choice.flag
+							}
+							if operation != "stop" && (query.Get("with_children") == "true") != wantChildren {
+								t.Fatalf("with_children query: %s", req.URL)
+							}
+							if operation != "stop" && !wantChildren && query.Has("with_children") {
+								t.Fatalf("with_children query without the opt-in: %s", req.URL)
+							}
+						}
+						if operation == "delete" {
+							return newHTTPResponse(http.StatusNoContent, ""), nil
+						}
+						return newHTTPResponse(http.StatusOK, `{"session":{"id":"sess-1"}}`), nil
+					}),
+				}
+				var err error
+				switch operation {
+				case "stop":
+					_, err = client.StopSession(t.Context(), "sess-1", choice.flag, policy)
+				case "archive":
+					_, err = client.ArchiveSession(t.Context(), "sess-1", choice.flag, !choice.flag, policy)
+				case "delete":
+					err = client.DeleteSession(t.Context(), "sess-1", choice.flag, policy)
+				}
+				if err != nil || !mutated {
+					t.Fatalf("mutation: performed=%t error=%v", mutated, err)
+				}
+			})
+		}
+	}
+}
+
+func TestPermissionRollupClient(t *testing.T) {
+	t.Parallel()
+	t.Run("Should send canonical rollup filters and decode totals", func(t *testing.T) {
+		t.Parallel()
+		client := &daemonClient{
+			target: LocalClientTarget("/tmp/compozy.sock"),
+			httpClient: &http.Client{Transport: roundTripperFunc(func(req *http.Request) (*http.Response, error) {
+				if req.Method != http.MethodGet || req.URL.Path != "/api/permissions/rollup" ||
+					req.URL.Query().Get("days") != "7" ||
+					req.URL.Query().Get("agent") != "coder" ||
+					req.URL.Query().Get("unattended") != "true" {
+					t.Fatalf("request = %s %s", req.Method, req.URL)
+				}
+				return newHTTPResponse(
+					http.StatusOK,
+					`{"since":"2026-01-01T00:00:00Z","until":"2026-01-07T12:00:00Z","rollups":[{"day":"2026-01-01","agent_name":"coder","decision":"deny","count":3}]}`,
+				), nil
+			})},
+		}
+		response, err := client.PermissionRollup(
+			t.Context(),
+			PermissionRollupQuery{Days: 7, Agent: " coder ", Unattended: true},
+		)
+		if err != nil || len(response.Rollups) != 1 || response.Rollups[0].Count != 3 {
+			t.Fatalf("response = %#v, %v", response, err)
+		}
+	})
+}
+
+func TestDaemonProfileClient(t *testing.T) {
+	t.Parallel()
+	t.Run("Should stream profile bytes with the bounded duration and preserve API errors", func(t *testing.T) {
+		t.Parallel()
+		client := &daemonClient{target: LocalClientTarget("/tmp/compozy.sock"), httpClient: &http.Client{
+			Transport: roundTripperFunc(func(req *http.Request) (*http.Response, error) {
+				if req.URL.Path != "/api/daemon/profile/cpu" || req.URL.Query().Get("seconds") != "120" {
+					t.Errorf("request=%s", req.URL)
+				}
+				return newHTTPResponse(http.StatusOK, "profile"), nil
+			}),
+		}}
+		var data bytes.Buffer
+		if err := client.CaptureDaemonProfile(t.Context(), "cpu", 120, &data); err != nil {
+			t.Fatal(err)
+		}
+		if data.String() != "profile" {
+			t.Fatalf("payload=%q", data.String())
+		}
+		client.httpClient.Transport = roundTripperFunc(func(_ *http.Request) (*http.Response, error) {
+			return newHTTPResponse(http.StatusConflict, `{"error":"capture already active","code":"profile_busy"}`), nil
+		})
+		if err := client.CaptureDaemonProfile(
+			t.Context(),
+			"cpu",
+			1,
+			&data,
+		); err == nil ||
+			!strings.Contains(err.Error(), "capture already active") {
+			t.Fatalf("error=%v", err)
+		}
+	})
+	t.Run("Should refuse gateway profiles before making a network request", func(t *testing.T) {
+		t.Parallel()
+		client := &daemonClient{target: ClientTarget{kind: clientTargetGateway}}
+		if err := client.CaptureDaemonProfile(
+			t.Context(),
+			"heap",
+			30,
+			io.Discard,
+		); err == nil ||
+			!strings.Contains(err.Error(), "local Unix socket") {
+			t.Fatalf("error=%v", err)
+		}
+	})
+}

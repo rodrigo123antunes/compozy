@@ -1,0 +1,5676 @@
+package cli
+
+import (
+	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"net/http"
+	"os"
+	"path/filepath"
+	"reflect"
+	"slices"
+	"strings"
+	"testing"
+	"time"
+
+	"github.com/compozy/compozy/internal/workspaceaccess"
+
+	"github.com/compozy/compozy/internal/acp"
+	"github.com/compozy/compozy/internal/agentidentity"
+	"github.com/compozy/compozy/internal/api/contract"
+	"github.com/compozy/compozy/internal/session"
+	"github.com/compozy/compozy/internal/store"
+	"github.com/compozy/compozy/internal/transcript"
+)
+
+func TestParseSinceFlagRFC3339(t *testing.T) {
+	t.Parallel()
+
+	got, err := parseSinceFlag("2026-04-03T11:55:00Z", func() time.Time { return fixedTestNow })
+	if err != nil {
+		t.Fatalf("parseSinceFlag(RFC3339) error = %v", err)
+	}
+	if want := time.Date(2026, 4, 3, 11, 55, 0, 0, time.UTC); !got.Equal(want) {
+		t.Fatalf("parseSinceFlag(RFC3339) = %s, want %s", got, want)
+	}
+}
+
+func TestParseSinceFlagRelativeDuration(t *testing.T) {
+	t.Parallel()
+
+	got, err := parseSinceFlag("5m", func() time.Time { return fixedTestNow })
+	if err != nil {
+		t.Fatalf("parseSinceFlag(5m) error = %v", err)
+	}
+	if want := fixedTestNow.Add(-5 * time.Minute); !got.Equal(want) {
+		t.Fatalf("parseSinceFlag(5m) = %s, want %s", got, want)
+	}
+}
+
+func TestSessionPromptPassesRuntimeSelection(t *testing.T) {
+	t.Parallel()
+
+	t.Run("Should serialize the runtime with the prompt", func(t *testing.T) {
+		t.Parallel()
+
+		var gotRequest SessionPromptRequest
+		deps := newWorkspaceTestDeps(t, &stubClient{
+			sendSessionPromptFn: func(_ context.Context, id string, request SessionPromptRequest) (SessionPromptRecord, error) {
+				if id != "sess-1" {
+					t.Fatalf("SendSessionPrompt() id = %q, want sess-1", id)
+				}
+				gotRequest = request
+				return SessionPromptRecord{
+					Prompt: SessionPromptResultRecord{Status: "accepted", NewTurnID: "turn-1"},
+				}, nil
+			},
+		})
+
+		stdout, _, err := executeRootCommand(
+			t,
+			deps,
+			"session",
+			"prompt",
+			"sess-1",
+			"Investigate the failing build",
+			"--provider",
+			"codex",
+			"--model",
+			"gpt-5.6-sol",
+			"--reasoning-effort",
+			"high",
+			"--speed",
+			"fast",
+			"--acp-option",
+			"context=1m",
+			"--acp-toggle",
+			"thinking=true",
+			"-o",
+			"json",
+		)
+		if err != nil {
+			t.Fatalf("executeRootCommand(session prompt) error = %v", err)
+		}
+		if gotRequest.Message != "Investigate the failing build" || gotRequest.Runtime == nil {
+			t.Fatalf("SendSessionPrompt() request = %#v", gotRequest)
+		}
+		if gotRequest.MessageID == "" || gotRequest.IdempotencyKey == "" {
+			t.Fatalf(
+				"SendSessionPrompt() identity = %q/%q, want generated non-empty values",
+				gotRequest.MessageID,
+				gotRequest.IdempotencyKey,
+			)
+		}
+		if gotRequest.Runtime.Provider != "codex" || gotRequest.Runtime.Model != "gpt-5.6-sol" ||
+			gotRequest.Runtime.ReasoningEffort != "high" || gotRequest.Runtime.Speed != contract.SpeedFast ||
+			len(gotRequest.Runtime.ACPOptions) != 2 {
+			t.Fatalf("SendSessionPrompt() Runtime = %#v", gotRequest.Runtime)
+		}
+		assertACPOptions(t, gotRequest.Runtime.ACPOptions, "context", "1m", "thinking", true)
+		var decoded SessionPromptRecord
+		if err := json.Unmarshal([]byte(stdout), &decoded); err != nil {
+			t.Fatalf("json.Unmarshal(session prompt) error = %v", err)
+		}
+		if decoded.Prompt.NewTurnID != "turn-1" {
+			t.Fatalf("decoded prompt = %#v", decoded)
+		}
+	})
+}
+
+// Invariant: a prompt resolves and mutates its session inside the profile
+// selected by the operator. The canonical CLI session command suite owns this
+// command-context boundary.
+func TestSessionPromptPreservesProfileScope(t *testing.T) {
+	t.Parallel()
+
+	t.Run("Should send the prompt in the selected profile", func(t *testing.T) {
+		t.Parallel()
+
+		client := &profileTestDaemonClient{
+			DaemonClient: withWorkspaceResolution(&stubClient{
+				sendSessionPromptFn: func(
+					ctx context.Context,
+					_ string,
+					_ SessionPromptRequest,
+				) (SessionPromptRecord, error) {
+					if got := profileQueryValues(ctx, nil).Get(profileFlagName); got != "research" {
+						t.Fatalf("SendSessionPrompt() profile query = %q, want research", got)
+					}
+					return SessionPromptRecord{
+						Prompt: SessionPromptResultRecord{Status: "accepted", NewTurnID: "turn-1"},
+					}, nil
+				},
+			}),
+			profileClientAPI: &profileClientStub{profiles: []contract.Profile{
+				{Name: "default", State: "active"},
+				{Name: "research", State: "active"},
+			}},
+		}
+		deps := newWorkspaceTestDeps(t, client)
+
+		_, _, err := executeRootCommand(
+			t,
+			deps,
+			"--profile",
+			"research",
+			"session",
+			"prompt",
+			"sess-1",
+			"Investigate the failing build",
+			"-o",
+			"json",
+		)
+		if err != nil {
+			t.Fatalf("executeRootCommand(session prompt --profile research) error = %v", err)
+		}
+	})
+}
+
+// Invariant: the session Goal CLI forwards the typed operation, target, and
+// caller-selected runtime through the direct mutation API and preserves its
+// structured result output. The canonical CLI session command suite owns this
+// transport boundary.
+func TestSessionGoalCommandForwardsTypedMutation(t *testing.T) {
+	t.Parallel()
+
+	t.Run("Should stop the Goal through its typed mutation", func(t *testing.T) {
+		t.Parallel()
+		deps := newWorkspaceTestDeps(t, &stubClient{
+			mutateSessionGoalFn: func(_ context.Context, id string,
+				request contract.SessionGoalCommandRequest) (contract.GoalCommandResult, error) {
+				if id != "sess-1" || request.Operation != contract.SessionGoalOperationStop {
+					t.Fatalf("stop mutation = %q %#v", id, request)
+				}
+				return contract.GoalCommandResult{
+					Outcome:  contract.GoalOutcomeStopped,
+					Snapshot: &contract.GoalSnapshot{RunID: "run-stopped"},
+				}, nil
+			},
+		})
+		stdout, _, err := executeRootCommand(t, deps, "session", "goal", "stop", "sess-1", "-o", "json")
+		if err != nil {
+			t.Fatal(err)
+		}
+		var result contract.GoalCommandResult
+		if err := json.Unmarshal(
+			[]byte(stdout),
+			&result,
+		); err != nil || result.Outcome != contract.GoalOutcomeStopped ||
+			result.Snapshot == nil ||
+			result.Snapshot.RunID != "run-stopped" {
+			t.Fatalf("stop result = %#v, %v", result, err)
+		}
+	})
+
+	t.Run("Should forward a typed Goal replacement mutation", func(t *testing.T) {
+		t.Parallel()
+
+		var gotID string
+		var gotRequest contract.SessionGoalCommandRequest
+		deps := newWorkspaceTestDeps(t, &stubClient{
+			mutateSessionGoalFn: func(
+				_ context.Context,
+				id string,
+				request contract.SessionGoalCommandRequest,
+			) (contract.GoalCommandResult, error) {
+				gotID = id
+				gotRequest = request
+				return contract.GoalCommandResult{Outcome: contract.GoalOutcomeReplaced}, nil
+			},
+		})
+
+		stdout, _, err := executeRootCommand(
+			t,
+			deps,
+			"session", "goal", "replace", "sess-1", "Ship the replacement",
+			"--expected-run-id", "run-1",
+			"--provider", "cursor",
+			"--model", "grok-4.5",
+			"--reasoning-effort", "high",
+			"--speed", "fast",
+			"--acp-option", "context=1m",
+			"--acp-toggle", "thinking=true",
+			"-o", "json",
+		)
+		if err != nil {
+			t.Fatalf("executeRootCommand(session goal replace) error = %v", err)
+		}
+		if gotID != "sess-1" || gotRequest.Operation != contract.SessionGoalOperationReplace ||
+			gotRequest.Objective != "Ship the replacement" || gotRequest.ExpectedRunID != "run-1" ||
+			gotRequest.Runtime == nil {
+			t.Fatalf("MutateSessionGoal() = %q/%#v", gotID, gotRequest)
+		}
+		if gotRequest.Runtime.Provider != "cursor" || gotRequest.Runtime.Model != "grok-4.5" ||
+			gotRequest.Runtime.ReasoningEffort != contract.ReasoningEffort("high") ||
+			gotRequest.Runtime.Speed != contract.SpeedFast || len(gotRequest.Runtime.ACPOptions) != 2 {
+			t.Fatalf("MutateSessionGoal() runtime = %#v", gotRequest.Runtime)
+		}
+		assertACPOptions(t, gotRequest.Runtime.ACPOptions, "context", "1m", "thinking", true)
+		var decoded contract.GoalCommandResult
+		if err := json.Unmarshal([]byte(stdout), &decoded); err != nil {
+			t.Fatalf("json.Unmarshal(session goal result) error = %v", err)
+		}
+		if decoded.Outcome != contract.GoalOutcomeReplaced {
+			t.Fatalf("session goal output = %#v", decoded)
+		}
+	})
+}
+
+func TestSessionRewindForwardsTranscriptFences(t *testing.T) {
+	t.Parallel()
+
+	t.Run("Should forward the selected message identity and render the rewind result", func(t *testing.T) {
+		t.Parallel()
+
+		deps := newWorkspaceTestDeps(t, &stubClient{
+			rewindSessionFn: func(
+				_ context.Context,
+				id string,
+				request SessionRewindRequest,
+			) (SessionRewindRecord, error) {
+				if id != "sess-1" || request.MessageID != "msg-user-2" ||
+					request.IdempotencyKey != "idem-rewind-1" || request.ExpectedEpoch == nil ||
+					*request.ExpectedEpoch != 3 || request.ExpectedGeneration == nil ||
+					*request.ExpectedGeneration != 8 || request.ExpectedMaxSequence == nil ||
+					*request.ExpectedMaxSequence != 42 {
+					t.Fatalf("RewindSession() id = %q request = %#v", id, request)
+				}
+				return SessionRewindRecord{
+					Session: contract.SessionPayload{ID: id},
+					Rewind: contract.SessionConversationRewindPayload{
+						TranscriptEpoch: 4,
+						TargetMessageID: "msg-user-2",
+						ArchivedEvents:  7,
+						Generation:      9,
+						MaxSequence:     18,
+						DraftText:       "Try a different direction",
+					},
+				}, nil
+			},
+		})
+
+		stdout, _, err := executeRootCommand(
+			t,
+			deps,
+			"session", "rewind", "sess-1",
+			"--message-id", "msg-user-2",
+			"--idempotency-key", "idem-rewind-1",
+			"--expected-epoch", "3",
+			"--expected-generation", "8",
+			"--expected-max-sequence", "42",
+			"-o", "json",
+		)
+		if err != nil {
+			t.Fatalf("executeRootCommand(session rewind) error = %v", err)
+		}
+		var decoded SessionRewindRecord
+		if err := json.Unmarshal([]byte(stdout), &decoded); err != nil {
+			t.Fatalf("json.Unmarshal(session rewind) error = %v", err)
+		}
+		if decoded.Rewind.TargetMessageID != "msg-user-2" || decoded.Rewind.DraftText != "Try a different direction" {
+			t.Fatalf("session rewind output = %#v", decoded)
+		}
+	})
+
+	t.Run("Should read current transcript fences when no overrides are provided", func(t *testing.T) {
+		t.Parallel()
+
+		deps := newWorkspaceTestDeps(t, &stubClient{
+			getSessionTranscriptFn: func(_ context.Context, id string) (SessionTranscriptRecord, error) {
+				if id != "sess-1" {
+					t.Fatalf("GetSessionTranscript() id = %q, want sess-1", id)
+				}
+				return SessionTranscriptRecord{Epoch: 5, Generation: 9, MaxSequence: 44}, nil
+			},
+			rewindSessionFn: func(
+				_ context.Context,
+				_ string,
+				request SessionRewindRequest,
+			) (SessionRewindRecord, error) {
+				if request.ExpectedEpoch == nil || *request.ExpectedEpoch != 5 ||
+					request.ExpectedGeneration == nil || *request.ExpectedGeneration != 9 ||
+					request.ExpectedMaxSequence == nil || *request.ExpectedMaxSequence != 44 {
+					t.Fatalf("RewindSession() request = %#v", request)
+				}
+				return SessionRewindRecord{
+					Session: contract.SessionPayload{ID: "sess-1"},
+					Rewind:  contract.SessionConversationRewindPayload{TargetMessageID: "msg-user-2"},
+				}, nil
+			},
+		})
+
+		_, _, err := executeRootCommand(
+			t,
+			deps,
+			"session", "rewind", "sess-1",
+			"--message-id", "msg-user-2",
+			"--idempotency-key", "idem-auto-fence",
+			"-o", "json",
+		)
+		if err != nil {
+			t.Fatalf("executeRootCommand(session rewind auto fence) error = %v", err)
+		}
+	})
+}
+
+func TestSessionRuntimeCommandsPersistSelection(t *testing.T) {
+	t.Parallel()
+
+	t.Run("Should fetch the current revision before setting runtime", func(t *testing.T) {
+		t.Parallel()
+
+		deps := newWorkspaceTestDeps(t, &stubClient{
+			getSessionFn: func(_ context.Context, id string) (SessionRecord, error) {
+				return SessionRecord{ID: id, Runtime: contract.SessionRuntimePayload{SelectionRevision: 5}}, nil
+			},
+			setSessionRuntimeFn: func(
+				_ context.Context,
+				id string,
+				request SetSessionRuntimeRequest,
+			) (SessionRecord, error) {
+				if id != "sess-1" || request.ExpectedRevision == nil || *request.ExpectedRevision != 5 ||
+					request.Runtime.Provider != "claude" || request.Runtime.Model != "claude-fable-5" ||
+					request.Runtime.ReasoningEffort != "max" || request.Runtime.Speed != contract.SpeedNormal ||
+					len(request.Runtime.ACPOptions) != 2 {
+					t.Fatalf("SetSessionRuntime() id = %q request = %#v", id, request)
+				}
+				assertACPOptions(t, request.Runtime.ACPOptions, "context", "1m", "thinking", false)
+				return SessionRecord{
+					ID: id,
+					Runtime: contract.SessionRuntimePayload{
+						Selected:          &request.Runtime,
+						SelectionRevision: 6,
+					},
+				}, nil
+			},
+		})
+
+		stdout, _, err := executeRootCommand(
+			t,
+			deps,
+			"session", "runtime", "set", "sess-1",
+			"--provider", "claude", "--model", "claude-fable-5", "--reasoning-effort", "max",
+			"--acp-option", "context=1m", "--acp-toggle", "thinking=false",
+			"-o", "json",
+		)
+		if err != nil {
+			t.Fatalf("executeRootCommand(session runtime set) error = %v", err)
+		}
+		var decoded SessionRecord
+		if err := json.Unmarshal([]byte(stdout), &decoded); err != nil {
+			t.Fatalf("json.Unmarshal() error = %v", err)
+		}
+		if decoded.Runtime.Selected == nil || decoded.Runtime.Selected.Model != "claude-fable-5" ||
+			decoded.Runtime.SelectionRevision != 6 {
+			t.Fatalf("decoded runtime = %#v, want selected Claude runtime at revision 6", decoded.Runtime)
+		}
+	})
+
+	t.Run("Should pass an explicit revision when clearing runtime", func(t *testing.T) {
+		t.Parallel()
+
+		deps := newWorkspaceTestDeps(t, &stubClient{
+			clearSessionRuntimeFn: func(_ context.Context, id string, revision int64) (SessionRecord, error) {
+				if id != "sess-1" || revision != 8 {
+					t.Fatalf("ClearSessionRuntime() id = %q revision = %d", id, revision)
+				}
+				return SessionRecord{ID: id, Runtime: contract.SessionRuntimePayload{SelectionRevision: 9}}, nil
+			},
+		})
+		if _, _, err := executeRootCommand(
+			t,
+			deps,
+			"session", "runtime", "clear", "sess-1", "--expected-revision", "8", "-o", "json",
+		); err != nil {
+			t.Fatalf("executeRootCommand(session runtime clear) error = %v", err)
+		}
+	})
+}
+
+func TestSessionPromptIdentity(t *testing.T) {
+	t.Parallel()
+
+	t.Run("Should forward an explicit durable identity pair", func(t *testing.T) {
+		t.Parallel()
+
+		var received SessionPromptRequest
+		deps := newWorkspaceTestDeps(t, &stubClient{
+			uploadSessionAttachmentFn: func(context.Context, string, string) (SessionAttachmentRecord, error) {
+				return SessionAttachmentRecord{ID: "att-image"}, nil
+			},
+			sendSessionPromptFn: func(_ context.Context, _ string, request SessionPromptRequest) (SessionPromptRecord, error) {
+				received = request
+				return SessionPromptRecord{Prompt: SessionPromptResultRecord{
+					Status: "accepted", MessageID: request.MessageID, IdempotencyKey: request.IdempotencyKey,
+				}}, nil
+			},
+		})
+
+		stdout, _, err := executeRootCommand(t, deps,
+			"session", "prompt", "sess-1", "retry safely",
+			"--message-id", "msg-explicit", "--idempotency-key", "idem-explicit", "-o", "json",
+			"--attachment", "screen.png",
+		)
+		if err != nil {
+			t.Fatalf("executeRootCommand(session prompt explicit identity) error = %v", err)
+		}
+		if received.MessageID != "msg-explicit" || received.IdempotencyKey != "idem-explicit" ||
+			len(received.Attachments) != 1 || received.Attachments[0].ID != "att-image" {
+			t.Fatalf(
+				"SendSessionPrompt() identity = %q/%q, want msg-explicit/idem-explicit",
+				received.MessageID,
+				received.IdempotencyKey,
+			)
+		}
+		var decoded SessionPromptRecord
+		if err := json.Unmarshal([]byte(stdout), &decoded); err != nil {
+			t.Fatalf("json.Unmarshal(explicit prompt response) error = %v", err)
+		}
+		if decoded.Prompt.MessageID != "msg-explicit" || decoded.Prompt.IdempotencyKey != "idem-explicit" {
+			t.Fatalf(
+				"prompt response identity = %q/%q, want msg-explicit/idem-explicit",
+				decoded.Prompt.MessageID,
+				decoded.Prompt.IdempotencyKey,
+			)
+		}
+	})
+
+	t.Run("Should reject incomplete or blank explicit identity pairs before submission", func(t *testing.T) {
+		t.Parallel()
+
+		tests := []struct {
+			name string
+			args []string
+			want error
+		}{
+			{
+				name: "Should reject only a message id",
+				args: []string{"session", "prompt", "sess-1", "hello", "--message-id", "msg-only"},
+				want: errPromptIdentityPairRequired,
+			},
+			{
+				name: "Should reject only an idempotency key",
+				args: []string{"session", "prompt", "sess-1", "hello", "--idempotency-key", "idem-only"},
+				want: errPromptIdentityPairRequired,
+			},
+			{
+				name: "Should reject blank identity values",
+				args: []string{
+					"session", "prompt", "sess-1", "hello",
+					"--message-id", " ", "--idempotency-key", "idem",
+				},
+				want: errPromptIdentityBlank,
+			},
+		}
+		for _, tt := range tests {
+			t.Run(tt.name, func(t *testing.T) {
+				t.Parallel()
+
+				uploads := 0
+				deps := newWorkspaceTestDeps(t, &stubClient{
+					uploadSessionAttachmentFn: func(context.Context, string, string) (SessionAttachmentRecord, error) {
+						uploads++
+						return SessionAttachmentRecord{ID: "att-image"}, nil
+					},
+					sendSessionPromptFn: func(context.Context, string, SessionPromptRequest) (SessionPromptRecord, error) {
+						t.Fatal("SendSessionPrompt() called for invalid identity flags")
+						return SessionPromptRecord{}, nil
+					},
+				})
+				if _, _, err := executeRootCommand(
+					t,
+					deps,
+					append(tt.args, "--attachment", "screen.png")...); !errors.Is(err, tt.want) {
+					t.Fatalf("executeRootCommand(%#v) error = %v, want identity validation error", tt.args, err)
+				}
+				if uploads != 0 {
+					t.Fatalf("invalid identity uploaded %d attachments", uploads)
+				}
+			})
+		}
+	})
+
+	t.Run("Should preserve a replay admission envelope", func(t *testing.T) {
+		t.Parallel()
+
+		deps := newWorkspaceTestDeps(t, &stubClient{
+			sendSessionPromptFn: func(_ context.Context, _ string, request SessionPromptRequest) (SessionPromptRecord, error) {
+				return SessionPromptRecord{Prompt: SessionPromptResultRecord{
+					Status: "queued", MessageID: request.MessageID, IdempotencyKey: request.IdempotencyKey,
+					Replayed: true, Delivery: contract.PromptDeliveryAfterTurn, QueueEntryID: "queue-replayed",
+				}}, nil
+			},
+		})
+
+		stdout, _, err := executeRootCommand(t, deps,
+			"session", "prompt", "sess-1", "retry safely",
+			"--message-id", "msg-replay", "--idempotency-key", "idem-replay", "-o", "json",
+		)
+		if err != nil {
+			t.Fatalf("executeRootCommand(session prompt replay) error = %v", err)
+		}
+		var decoded SessionPromptRecord
+		if err := json.Unmarshal([]byte(stdout), &decoded); err != nil {
+			t.Fatalf("json.Unmarshal(replay prompt response) error = %v", err)
+		}
+		if !decoded.Prompt.Replayed || decoded.Prompt.QueueEntryID != "queue-replayed" ||
+			decoded.Prompt.MessageID != "msg-replay" || decoded.Prompt.IdempotencyKey != "idem-replay" {
+			t.Fatalf("replay prompt response = %#v", decoded.Prompt)
+		}
+	})
+}
+
+func TestSessionPromptRejectsInvalidSpeed(t *testing.T) {
+	t.Parallel()
+
+	t.Run("Should reject invalid speed before sending a prompt", func(t *testing.T) {
+		t.Parallel()
+
+		deps := newTestDeps(t, &stubClient{
+			sendSessionPromptFn: func(context.Context, string, SessionPromptRequest) (SessionPromptRecord, error) {
+				t.Fatal("SendSessionPrompt() called with invalid speed")
+				return SessionPromptRecord{}, nil
+			},
+		})
+		if _, _, err := executeRootCommand(
+			t,
+			deps,
+			"session",
+			"prompt",
+			"sess-1",
+			"hello",
+			"--speed",
+			"turbo",
+		); err == nil {
+			t.Fatal("executeRootCommand(session prompt --speed turbo) error = nil")
+		}
+	})
+}
+
+func TestSessionNewWorkspaceOptions(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name    string
+		args    []string
+		request CreateSessionRequest
+	}{
+		{
+			name:    "Should select User with the shorthand",
+			args:    []string{"session", "new", "--user", "-o", "json"},
+			request: CreateSessionRequest{Workspace: workspaceaccess.UserSelector},
+		},
+		{
+			name:    "Should forward the User reference",
+			args:    []string{"session", "new", "--workspace", workspaceaccess.UserSelector, "-o", "json"},
+			request: CreateSessionRequest{Workspace: workspaceaccess.UserSelector},
+		},
+
+		{
+			name: "Should use a registered workspace",
+			args: []string{"session", "new", "--workspace", "ws_abc", "-o", "json"},
+			request: CreateSessionRequest{
+				Workspace: "ws_abc",
+			},
+		},
+		{
+			name: "Should use an explicit cwd",
+			args: []string{"session", "new", "--cwd", "/tmp/proj", "-o", "json"},
+			request: CreateSessionRequest{
+				WorkspacePath: "/tmp/proj",
+			},
+		},
+		{
+			name: "Should infer a registered cwd and leave agent defaulting to the daemon",
+			args: []string{"session", "new", "-o", "json"},
+			request: CreateSessionRequest{
+				Workspace: "/workspace/project",
+			},
+		},
+		{
+			name: "Should start in an existing worktree",
+			args: []string{"session", "new", "--workspace", "ws_abc", "--worktree", "wt-ready", "-o", "json"},
+			request: CreateSessionRequest{
+				Workspace: "ws_abc",
+				Worktree:  "wt-ready",
+			},
+		},
+		{
+			name: "Should create a named worktree before starting",
+			args: []string{"session", "new", "--workspace", "ws_abc", "--new-worktree=feature-session", "-o", "json"},
+			request: CreateSessionRequest{
+				Workspace:   "ws_abc",
+				NewWorktree: &contract.NewSessionWorktreeRequest{Name: "feature-session"},
+			},
+		},
+		{
+			name: "Should request an automatically named worktree",
+			args: []string{"session", "new", "--workspace", "ws_abc", "--new-worktree", "-o", "json"},
+			request: CreateSessionRequest{
+				Workspace:   "ws_abc",
+				NewWorktree: &contract.NewSessionWorktreeRequest{},
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			client := &stubClient{
+				getSessionFn: func(context.Context, string) (SessionRecord, error) {
+					t.Fatal("GetSession() called after logical session acceptance")
+					return SessionRecord{}, nil
+				},
+				createSessionFn: func(_ context.Context, request CreateSessionRequest) (SessionRecord, error) {
+					if request.AgentName != tt.request.AgentName ||
+						request.Workspace != tt.request.Workspace ||
+						request.WorkspacePath != tt.request.WorkspacePath ||
+						request.Worktree != tt.request.Worktree ||
+						!reflect.DeepEqual(request.NewWorktree, tt.request.NewWorktree) {
+						t.Fatalf("CreateSession() request = %#v, want %#v", request, tt.request)
+					}
+					return SessionRecord{
+						ID:            "sess-1",
+						AgentName:     "general",
+						WorkspaceID:   "ws-1",
+						WorkspacePath: request.WorkspacePath,
+						State:         session.StateActive,
+						CreatedAt:     fixedTestNow,
+						UpdatedAt:     fixedTestNow,
+					}, nil
+				},
+			}
+			if tt.name == "Should use an explicit cwd" {
+				client.getWorkspaceFn = func(_ context.Context, ref string) (WorkspaceDetailRecord, error) {
+					return WorkspaceDetailRecord{}, &workspacePathNotRegisteredError{path: ref}
+				}
+			}
+			deps := newWorkspaceTestDeps(t, client)
+
+			stdout, _, err := executeRootCommand(t, deps, tt.args...)
+			if err != nil {
+				t.Fatalf("executeRootCommand(%v) error = %v", tt.args, err)
+			}
+
+			var decoded SessionRecord
+			if err := json.Unmarshal([]byte(stdout), &decoded); err != nil {
+				t.Fatalf("json.Unmarshal(session new) error = %v", err)
+			}
+			if decoded.ID != "sess-1" || decoded.AgentName != "general" {
+				t.Fatalf("decoded = %#v, want sess-1 with the daemon-selected general agent", decoded)
+			}
+			if tt.name == "Should use an explicit cwd" &&
+				!strings.Contains(stdout, `"resolution_source": "cwd"`) {
+				t.Fatalf("session new output = %s, want cwd resolution provenance", stdout)
+			}
+		})
+	}
+
+	t.Run("Should propagate non-fallback cwd resolution failures", func(t *testing.T) {
+		t.Parallel()
+
+		resolveErr := errors.New("workspace resolver unavailable")
+		createCalls := 0
+		deps := newWorkspaceTestDeps(t, &stubClient{
+			getWorkspaceFn: func(context.Context, string) (WorkspaceDetailRecord, error) {
+				return WorkspaceDetailRecord{}, resolveErr
+			},
+			createSessionFn: func(context.Context, CreateSessionRequest) (SessionRecord, error) {
+				createCalls++
+				return SessionRecord{ID: "unexpected"}, nil
+			},
+		})
+
+		_, _, err := executeRootCommand(
+			t,
+			deps,
+			"session",
+			"new",
+			"--cwd",
+			"/workspace/project",
+			"-o",
+			"json",
+		)
+		if !errors.Is(err, resolveErr) {
+			t.Fatalf("executeRootCommand(session new --cwd) error = %v, want resolver failure", err)
+		}
+		if createCalls != 0 {
+			t.Fatalf("CreateSession() calls = %d, want 0 after resolver failure", createCalls)
+		}
+	})
+
+	t.Run("Should reject mutually exclusive worktree selectors", func(t *testing.T) {
+		t.Parallel()
+
+		tests := [][]string{
+			{"session", "new", "--cwd", "/tmp/proj", "--worktree", "wt-ready"},
+			{"session", "new", "--cwd", "/tmp/proj", "--new-worktree"},
+			{"session", "new", "--worktree", "wt-ready", "--new-worktree"},
+		}
+		for _, args := range tests {
+			t.Run("Should reject "+strings.Join(args[2:], " "), func(t *testing.T) {
+				t.Parallel()
+				createCalls := 0
+				deps := newWorkspaceTestDeps(t, &stubClient{
+					createSessionFn: func(context.Context, CreateSessionRequest) (SessionRecord, error) {
+						createCalls++
+						return SessionRecord{}, nil
+					},
+				})
+				_, _, err := executeRootCommand(t, deps, args...)
+				if err == nil || !strings.Contains(err.Error(), "if any flags in the group") {
+					t.Fatalf("executeRootCommand(%v) error = %v, want flag conflict", args, err)
+				}
+				if createCalls != 0 {
+					t.Fatalf("CreateSession() calls = %d, want 0 for %v", createCalls, args)
+				}
+			})
+		}
+	})
+
+	t.Run("Should forward the lineage kind with its parent", func(t *testing.T) {
+		t.Parallel()
+
+		var got CreateSessionRequest
+		deps := newWorkspaceTestDeps(t, &stubClient{
+			createSessionFn: func(_ context.Context, request CreateSessionRequest) (SessionRecord, error) {
+				got = request
+				return SessionRecord{ID: "sess-recovery", State: session.StateActive}, nil
+			},
+		})
+		_, _, err := executeRootCommand(
+			t, deps, "session", "new", "--workspace", "ws_abc",
+			"--parent", "sess-parent", "--lineage-kind", "recovery", "-o", "json",
+		)
+		if err != nil {
+			t.Fatalf("executeRootCommand(session new --lineage-kind) error = %v", err)
+		}
+		if got.ParentSessionID != "sess-parent" || got.LineageKind != "recovery" {
+			t.Fatalf("CreateSession() request = %#v, want parent sess-parent with recovery kind", got)
+		}
+	})
+
+	t.Run("Should forward the target session folder", func(t *testing.T) {
+		t.Parallel()
+
+		var got CreateSessionRequest
+		deps := newWorkspaceTestDeps(t, &stubClient{
+			createSessionFn: func(_ context.Context, request CreateSessionRequest) (SessionRecord, error) {
+				got = request
+				return SessionRecord{ID: "sess-foldered", State: session.StateActive}, nil
+			},
+		})
+		_, _, err := executeRootCommand(
+			t, deps, "session", "new", "--workspace", "ws_abc", "--folder", "sfold-1", "-o", "json",
+		)
+		if err != nil {
+			t.Fatalf("executeRootCommand(session new --folder) error = %v", err)
+		}
+		if got.FolderID != "sfold-1" {
+			t.Fatalf("CreateSession() request = %#v, want folder sfold-1", got)
+		}
+	})
+
+	t.Run("Should reject a lineage kind without a parent", func(t *testing.T) {
+		t.Parallel()
+
+		createCalls := 0
+		deps := newWorkspaceTestDeps(t, &stubClient{
+			createSessionFn: func(context.Context, CreateSessionRequest) (SessionRecord, error) {
+				createCalls++
+				return SessionRecord{}, nil
+			},
+		})
+		_, _, err := executeRootCommand(t, deps, "session", "new", "--lineage-kind", "recovery")
+		if err == nil || !strings.Contains(err.Error(), "--lineage-kind requires --parent") {
+			t.Fatalf("executeRootCommand(session new --lineage-kind) error = %v, want usage error", err)
+		}
+		if createCalls != 0 {
+			t.Fatalf("CreateSession() calls = %d, want 0", createCalls)
+		}
+	})
+
+	t.Run("Should defer a registered cross workspace cwd decision to the daemon", func(t *testing.T) {
+		t.Parallel()
+
+		client := &stubClient{
+			createSessionFn: func(_ context.Context, request CreateSessionRequest) (SessionRecord, error) {
+				if request.Workspace != "ws-foreign" {
+					t.Fatalf("CreateSession() workspace = %q, want ws-foreign", request.Workspace)
+				}
+				return SessionRecord{
+					ID:          "sess-foreign",
+					AgentName:   "coder",
+					WorkspaceID: request.Workspace,
+					State:       session.StateActive,
+				}, nil
+			},
+			getSessionFn: func(_ context.Context, id string) (SessionRecord, error) {
+				return SessionRecord{
+					ID:          id,
+					ProfileID:   store.DefaultProfileID,
+					AgentName:   "coder",
+					WorkspaceID: "ws-session",
+					State:       session.StateActive,
+				}, nil
+			},
+			getWorkspaceFn: func(_ context.Context, ref string) (WorkspaceDetailRecord, error) {
+				return WorkspaceDetailRecord{
+					Workspace: WorkspaceRecord{ID: "ws-foreign", RootDir: ref},
+				}, nil
+			},
+		}
+		deps := newWorkspaceTestDeps(t, client)
+		deps.getenv = func(key string) string {
+			switch key {
+			case agentidentity.EnvSessionID:
+				return "sess-agent"
+			case agentidentity.EnvAgent:
+				return "coder"
+			default:
+				return ""
+			}
+		}
+
+		stdout, _, err := executeRootCommand(
+			t,
+			deps,
+			"session",
+			"new",
+			"--cwd",
+			"/workspace/foreign",
+			"-o",
+			"json",
+		)
+		if err != nil {
+			t.Fatalf("executeRootCommand(session new --cwd foreign) error = %v", err)
+		}
+		var output struct {
+			ResolutionSource string `json:"resolution_source"`
+		}
+		if err := json.Unmarshal([]byte(stdout), &output); err != nil {
+			t.Fatalf("json.Unmarshal(session new output) error = %v; output=%s", err, stdout)
+		}
+		if output.ResolutionSource != "cross_workspace_attempt" {
+			t.Fatalf("session new resolution source = %q, want cross_workspace_attempt", output.ResolutionSource)
+		}
+	})
+}
+
+func TestSessionNewRejectsRemovedFlags(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		flag  string
+		value string
+	}{
+		{flag: "--provider", value: "fake-alt"},
+		{flag: "--model", value: "gpt-5.6-sol"},
+		{flag: "--prompt", value: "legacy prompt"},
+		{flag: "--speed", value: "fast"},
+		{flag: "--reasoning-effort", value: "high"},
+		{flag: "--no-wait"},
+	}
+	for _, tt := range tests {
+		t.Run("Should reject "+tt.flag, func(t *testing.T) {
+			t.Parallel()
+
+			deps := newWorkspaceTestDeps(t, &stubClient{
+				createSessionFn: func(context.Context, CreateSessionRequest) (SessionRecord, error) {
+					t.Fatal("CreateSession() called with a removed flag")
+					return SessionRecord{}, nil
+				},
+			})
+			args := []string{"session", "new", tt.flag}
+			if tt.value != "" {
+				args = append(args, tt.value)
+			}
+			_, _, err := executeRootCommand(t, deps, args...)
+			if err == nil || !strings.Contains(err.Error(), "unknown flag") {
+				t.Fatalf("executeRootCommand(%s) error = %v, want unknown flag", tt.flag, err)
+			}
+		})
+	}
+}
+
+func TestSessionNewRejectsInvalidWorkspaceFlags(t *testing.T) {
+	t.Parallel()
+
+	code, _, stderr := executeRootCommandWithExit(t, newWorkspaceTestDeps(t, &stubClient{}),
+		"session", "new", "--workspace", "ws_abc", "--cwd", "/tmp/proj",
+	)
+	if code != 1 {
+		t.Fatalf("executeRootCommandWithExit() code = %d, want 1", code)
+	}
+	if !strings.Contains(stderr, "--workspace and --cwd are mutually exclusive") {
+		t.Fatalf("stderr = %q, want workspace flag validation message", stderr)
+	}
+}
+
+func TestSessionNewRejectsRelativeCWD(t *testing.T) {
+	t.Parallel()
+
+	tests := []string{".", "../project"}
+	for _, cwd := range tests {
+		t.Run(cwd, func(t *testing.T) {
+			t.Parallel()
+
+			code, _, stderr := executeRootCommandWithExit(t, newWorkspaceTestDeps(t, &stubClient{}),
+				"session", "new", "--cwd", cwd,
+			)
+			if code != 1 {
+				t.Fatalf("executeRootCommandWithExit(%q) code = %d, want 1", cwd, code)
+			}
+			if !strings.Contains(stderr, "--cwd must be an absolute path") {
+				t.Fatalf("stderr = %q, want absolute path validation message", stderr)
+			}
+		})
+	}
+}
+
+func TestSessionListPassesServerOwnedPageFilters(t *testing.T) {
+	t.Run("Should pass every server-owned session page filter", func(t *testing.T) {
+		t.Parallel()
+
+		var seenQuery SessionListQuery
+
+		deps := newWorkspaceTestDeps(t, &stubClient{
+			listSessionPageFn: func(_ context.Context, query SessionListQuery) (SessionListPage, error) {
+				seenQuery = query
+				return SessionListPage{Sessions: []SessionRecord{{
+					ID:            "sess-1",
+					AgentName:     "general",
+					WorkspaceID:   "ws-filtered",
+					WorkspacePath: "/workspace/project",
+					State:         session.StateActive,
+					Health: &contract.SessionHealthPayload{
+						State:  contract.SessionHealthStateIdle,
+						Health: contract.SessionHealthHealthy,
+					},
+					CreatedAt: fixedTestNow,
+					UpdatedAt: fixedTestNow,
+				}}, Page: contract.CountedCursorPagePayload{
+					NextCursor: "cursor-next",
+					HasMore:    true,
+					Total:      7,
+					Limit:      2,
+				}}, nil
+			},
+		})
+
+		stdout, _, err := executeRootCommand(
+			t,
+			deps,
+			"session",
+			"list",
+			"--workspace",
+			"ws-filtered",
+			"--worktree",
+			"wt-filtered",
+			"--all",
+			"--state",
+			"stopped",
+			"--type",
+			"user",
+			"--agent",
+			"general",
+			"--query",
+			"demo",
+			"--sort",
+			"last_activity",
+			"--cursor",
+			"cursor-prev",
+			"--limit",
+			"2",
+			"--include-health",
+			"--archived",
+			"-o",
+			"json",
+		)
+		if err != nil {
+			t.Fatalf("executeRootCommand(session list) error = %v", err)
+		}
+		if seenQuery.Workspace != "ws-filtered" || seenQuery.Worktree != "wt-filtered" ||
+			seenQuery.State != "stopped" || seenQuery.Type != "user" ||
+			seenQuery.Agent != "general" || seenQuery.Query != "demo" ||
+			seenQuery.Archive != string(session.ArchiveOnly) ||
+			!seenQuery.IncludeHealth ||
+			seenQuery.Sort != "last_activity" || seenQuery.Cursor != "cursor-prev" || seenQuery.Limit != 2 {
+			t.Fatalf("seenQuery = %#v, want all server-owned page filters", seenQuery)
+		}
+
+		var decoded SessionListPage
+		if err := json.Unmarshal([]byte(stdout), &decoded); err != nil {
+			t.Fatalf("json.Unmarshal(session list) error = %v", err)
+		}
+		if len(decoded.Sessions) != 1 || decoded.Sessions[0].WorkspaceID != "ws-filtered" ||
+			decoded.Sessions[0].Health == nil || decoded.Sessions[0].Health.Health != contract.SessionHealthHealthy ||
+			decoded.Page.NextCursor != "cursor-next" || decoded.Page.Total != 7 || !decoded.Page.HasMore {
+			t.Fatalf("decoded = %#v, want filtered session", decoded)
+		}
+	})
+}
+
+func TestSessionArchiveCommandsReturnUpdatedSession(t *testing.T) {
+	t.Run("Should return the updated session from archive commands", func(t *testing.T) {
+		t.Parallel()
+
+		archivedAt := fixedTestNow.Add(time.Minute)
+		var stopRequests []bool
+		deps := newWorkspaceTestDeps(t, &stubClient{
+			archiveSessionFn: func(
+				_ context.Context, id string, stop bool, _ bool, _ contract.SessionProcessPolicy,
+			) (SessionRecord, error) {
+				stopRequests = append(stopRequests, stop)
+				return SessionRecord{
+					ID: id, AgentName: "coder", WorkspaceID: "ws-1", State: session.StateStopped,
+					ArchivedAt: &archivedAt, CreatedAt: fixedTestNow, UpdatedAt: archivedAt,
+				}, nil
+			},
+			unarchiveSessionFn: func(_ context.Context, id string) (SessionRecord, error) {
+				return SessionRecord{
+					ID: id, AgentName: "coder", WorkspaceID: "ws-1", State: session.StateStopped,
+					CreatedAt: fixedTestNow, UpdatedAt: archivedAt,
+				}, nil
+			},
+		})
+
+		archiveOutput, _, err := executeRootCommand(t, deps, "session", "archive", "sess-1", "-o", "json")
+		if err != nil {
+			t.Fatalf("executeRootCommand(session archive) error = %v", err)
+		}
+		var archived SessionRecord
+		if err := json.Unmarshal([]byte(archiveOutput), &archived); err != nil {
+			t.Fatalf("json.Unmarshal(session archive) error = %v", err)
+		}
+		if archived.ArchivedAt == nil || archived.ID != "sess-1" {
+			t.Fatalf("session archive output = %#v, want archive marker", archived)
+		}
+		if _, _, err := executeRootCommand(
+			t,
+			deps,
+			"session",
+			"archive",
+			"sess-1",
+			"--stop",
+			"-o",
+			"json",
+		); err != nil {
+			t.Fatalf("executeRootCommand(session archive --stop) error = %v", err)
+		}
+		if len(stopRequests) != 2 || stopRequests[0] || !stopRequests[1] {
+			t.Fatalf("archive stop requests = %v, want [false true]", stopRequests)
+		}
+
+		unarchiveOutput, _, err := executeRootCommand(t, deps, "session", "unarchive", "sess-1", "-o", "json")
+		if err != nil {
+			t.Fatalf("executeRootCommand(session unarchive) error = %v", err)
+		}
+		var restored SessionRecord
+		if err := json.Unmarshal([]byte(unarchiveOutput), &restored); err != nil {
+			t.Fatalf("json.Unmarshal(session unarchive) error = %v", err)
+		}
+		if restored.ArchivedAt != nil || restored.ID != "sess-1" {
+			t.Fatalf("session unarchive output = %#v, want restored session", restored)
+		}
+	})
+}
+
+func TestSessionMarkSeenCommandForwardsTheSession(t *testing.T) {
+	t.Run("Should mark the session as seen and surface a refusal", func(t *testing.T) {
+		t.Parallel()
+
+		var marked []string
+		refuse := false
+		deps := newWorkspaceTestDeps(t, &stubClient{
+			markSessionSeenFn: func(_ context.Context, id string) (SessionRecord, error) {
+				if refuse {
+					return SessionRecord{}, errors.New("session sess-1 needs you to answer its question")
+				}
+				marked = append(marked, id)
+				return SessionRecord{
+					ID: id, AgentName: "coder", WorkspaceID: "ws-1", State: session.StateActive,
+					Badge: session.BadgeIdle, CreatedAt: fixedTestNow, UpdatedAt: fixedTestNow,
+				}, nil
+			},
+		})
+
+		output, _, err := executeRootCommand(t, deps, "session", "mark-seen", "sess-1", "-o", "json")
+		if err != nil {
+			t.Fatalf("executeRootCommand(session mark-seen) error = %v", err)
+		}
+		var record SessionRecord
+		if err := json.Unmarshal([]byte(output), &record); err != nil {
+			t.Fatalf("json.Unmarshal(session mark-seen) error = %v", err)
+		}
+		if !slices.Equal(marked, []string{"sess-1"}) || record.Badge != session.BadgeIdle {
+			t.Fatalf("session mark-seen = %#v marked=%v, want sess-1 out of Needs you", record, marked)
+		}
+		refuse = true
+		_, _, err = executeRootCommand(t, deps, "session", "mark-seen", "sess-1")
+		if err == nil || !strings.Contains(err.Error(), "answer its question") {
+			t.Fatalf("executeRootCommand(session mark-seen refused) error = %v, want the blocker", err)
+		}
+	})
+}
+
+func TestSessionLaterCommandsForwardTheParkRequest(t *testing.T) {
+	t.Run("Should forward reason and return time and bring the session back", func(t *testing.T) {
+		t.Parallel()
+
+		var requests []contract.MoveSessionToLaterRequest
+		var withChildren []bool
+		deps := newWorkspaceTestDeps(t, &stubClient{
+			moveSessionToLaterFn: func(
+				_ context.Context, id string, req contract.MoveSessionToLaterRequest,
+			) (SessionRecord, error) {
+				requests = append(requests, req)
+				return SessionRecord{
+					ID:          id,
+					AgentName:   "coder",
+					WorkspaceID: "ws-1",
+					State:       session.StateStopped,
+					Later: &contract.SessionLaterPayload{
+						ParkedAt: fixedTestNow,
+						Reason:   req.Reason,
+						ReturnAt: req.ReturnAt,
+					},
+					CreatedAt: fixedTestNow,
+					UpdatedAt: fixedTestNow,
+				}, nil
+			},
+			resumeSessionFromLaterFn: func(_ context.Context, id string, children bool) (SessionRecord, error) {
+				withChildren = append(withChildren, children)
+				return SessionRecord{
+					ID: id, AgentName: "coder", WorkspaceID: "ws-1", State: session.StateStopped,
+					CreatedAt: fixedTestNow, UpdatedAt: fixedTestNow,
+				}, nil
+			},
+		})
+
+		output, _, err := executeRootCommand(t, deps, "session", "later", "sess-1",
+			"--reason", "after billing", "--return-at", "2026-11-03T09:00:00Z", "-o", "json")
+		if err != nil {
+			t.Fatalf("executeRootCommand(session later) error = %v", err)
+		}
+		var parked SessionRecord
+		if err := json.Unmarshal([]byte(output), &parked); err != nil {
+			t.Fatalf("json.Unmarshal(session later) error = %v", err)
+		}
+		want := time.Date(2026, 11, 3, 9, 0, 0, 0, time.UTC)
+		if parked.Later == nil || len(requests) != 1 || requests[0].Reason != "after billing" ||
+			requests[0].ReturnAt == nil || !requests[0].ReturnAt.Equal(want) {
+			t.Fatalf("session later = %#v requests=%#v, want reason and return time", parked.Later, requests)
+		}
+		if _, _, err := executeRootCommand(
+			t,
+			deps,
+			"session",
+			"later",
+			"sess-1",
+			"--return-at",
+			"72h",
+			"-o",
+			"json",
+		); err != nil {
+			t.Fatalf("executeRootCommand(session later --return-at 72h) error = %v", err)
+		}
+		if got := requests[1].ReturnAt; got == nil || !got.Equal(fixedTestNow.Add(72*time.Hour)) {
+			t.Fatalf("duration return time = %v, want now+72h", got)
+		}
+		_, _, err = executeRootCommand(t, deps, "session", "later", "sess-1", "--return-at", "soon")
+		if err == nil || !strings.Contains(err.Error(), "invalid --return-at") {
+			t.Fatalf("executeRootCommand(session later --return-at soon) error = %v, want invalid --return-at", err)
+		}
+		if _, _, err := executeRootCommand(
+			t, deps, "session", "resume-later", "sess-1", "--with-children", "-o", "json",
+		); err != nil {
+			t.Fatalf("executeRootCommand(session resume-later) error = %v", err)
+		}
+		if !slices.Equal(withChildren, []bool{true}) {
+			t.Fatalf("resume-later with_children = %v, want [true]", withChildren)
+		}
+	})
+}
+
+func TestSessionRenameCommandReturnsUpdatedSession(t *testing.T) {
+	t.Parallel()
+
+	t.Run("Should rename a session and return the updated record", func(t *testing.T) {
+		t.Parallel()
+
+		deps := newWorkspaceTestDeps(t, &stubClient{
+			renameSessionFn: func(
+				_ context.Context,
+				id string,
+				request RenameSessionRequest,
+			) (SessionRecord, error) {
+				if id != "sess-1" || request.Name != "Checkout retries" {
+					t.Fatalf("RenameSession() = id %q request %#v", id, request)
+				}
+				return SessionRecord{
+					ID:          id,
+					Name:        request.Name,
+					AgentName:   "coder",
+					WorkspaceID: "ws-1",
+					State:       session.StateStopped,
+					CreatedAt:   fixedTestNow,
+					UpdatedAt:   fixedTestNow.Add(time.Minute),
+				}, nil
+			},
+		})
+
+		stdout, _, err := executeRootCommand(
+			t,
+			deps,
+			"session",
+			"rename",
+			"sess-1",
+			"Checkout retries",
+			"-o",
+			"json",
+		)
+		if err != nil {
+			t.Fatalf("executeRootCommand(session rename) error = %v", err)
+		}
+		var renamed SessionRecord
+		if err := json.Unmarshal([]byte(stdout), &renamed); err != nil {
+			t.Fatalf("json.Unmarshal(session rename) error = %v", err)
+		}
+		if renamed.ID != "sess-1" || renamed.Name != "Checkout retries" {
+			t.Fatalf("session rename output = %#v", renamed)
+		}
+	})
+}
+
+func TestSessionReparentCommand(t *testing.T) {
+	t.Parallel()
+
+	record := func(id string, parent string) SessionRecord {
+		return SessionRecord{
+			ID: id, AgentName: "coder", WorkspaceID: "ws-1", State: session.StateStopped,
+			Lineage:   &contract.SessionLineagePayload{ParentSessionID: parent},
+			CreatedAt: fixedTestNow, UpdatedAt: fixedTestNow,
+		}
+	}
+	newDeps := func(t *testing.T) commandDeps {
+		t.Helper()
+		return newWorkspaceTestDeps(t, &stubClient{
+			setSessionParentFn: func(_ context.Context, id string, request SetSessionParentRequest) (SessionRecord, error) {
+				if id != "sess-child" || request.ParentSessionID != "sess-parent" {
+					t.Fatalf("SetSessionParent() = id %q request %#v", id, request)
+				}
+				return record(id, request.ParentSessionID), nil
+			},
+			clearSessionParentFn: func(_ context.Context, id string) (SessionRecord, error) {
+				if id != "sess-child" {
+					t.Fatalf("ClearSessionParent() id = %q", id)
+				}
+				return record(id, ""), nil
+			},
+		})
+	}
+
+	t.Run("Should adopt a session under --parent", func(t *testing.T) {
+		t.Parallel()
+		stdout, _, err := executeRootCommand(
+			t, newDeps(t), "session", "reparent", "sess-child", "--parent", "sess-parent", "-o", "json",
+		)
+		if err != nil {
+			t.Fatalf("executeRootCommand(session reparent --parent) error = %v", err)
+		}
+		var adopted SessionRecord
+		if err := json.Unmarshal([]byte(stdout), &adopted); err != nil {
+			t.Fatalf("json.Unmarshal(session reparent) error = %v", err)
+		}
+		if adopted.Lineage == nil || adopted.Lineage.ParentSessionID != "sess-parent" {
+			t.Fatalf("session reparent output = %#v", adopted)
+		}
+	})
+
+	t.Run("Should detach a session with --top-level", func(t *testing.T) {
+		t.Parallel()
+		stdout, _, err := executeRootCommand(
+			t, newDeps(t), "session", "reparent", "sess-child", "--top-level", "-o", "json",
+		)
+		if err != nil {
+			t.Fatalf("executeRootCommand(session reparent --top-level) error = %v", err)
+		}
+		var detached SessionRecord
+		if err := json.Unmarshal([]byte(stdout), &detached); err != nil {
+			t.Fatalf("json.Unmarshal(session reparent) error = %v", err)
+		}
+		if detached.Lineage == nil || detached.Lineage.ParentSessionID != "" {
+			t.Fatalf("session reparent output = %#v", detached)
+		}
+	})
+
+	t.Run("Should require exactly one of --parent or --top-level", func(t *testing.T) {
+		t.Parallel()
+		for _, args := range [][]string{
+			{"session", "reparent", "sess-child"},
+			{"session", "reparent", "sess-child", "--parent", "sess-parent", "--top-level"},
+		} {
+			if _, _, err := executeRootCommand(t, newDeps(t), args...); err == nil {
+				t.Fatalf("executeRootCommand(%v) error = nil, want flag refusal", args)
+			}
+		}
+	})
+}
+
+func TestSessionMoveToProfileCommand(t *testing.T) {
+	t.Parallel()
+
+	deps := newWorkspaceTestDeps(t, &stubClient{
+		moveSessionToProfileFn: func(
+			_ context.Context, id string, request MoveSessionToProfileRequest,
+		) (MoveSessionToProfileResponse, error) {
+			if id != "sess-src" || request.TargetProfile != "work" {
+				t.Fatalf("MoveSessionToProfile() = id %q request %#v", id, request)
+			}
+			return MoveSessionToProfileResponse{
+				Session: SessionRecord{
+					ID: "sess-copy", AgentName: "coder", WorkspaceID: "ws-1", State: session.StateStopped,
+					CreatedAt: fixedTestNow, UpdatedAt: fixedTestNow,
+				},
+				Original: SessionRecord{
+					ID: id, AgentName: "coder", WorkspaceID: "ws-1", State: session.StateStopped,
+					CreatedAt: fixedTestNow, UpdatedAt: fixedTestNow,
+				},
+				WorktreeID: "wt-new", Branch: "feat/move",
+			}, nil
+		},
+	})
+
+	t.Run("Should print the copy, the archived original, and the new worktree", func(t *testing.T) {
+		t.Parallel()
+		stdout, _, err := executeRootCommand(t, deps, "session", "move-to-profile", "sess-src", "work", "-o", "json")
+		if err != nil {
+			t.Fatalf("executeRootCommand(session move-to-profile) error = %v", err)
+		}
+		var moved MoveSessionToProfileResponse
+		if err := json.Unmarshal([]byte(stdout), &moved); err != nil {
+			t.Fatalf("json.Unmarshal(session move-to-profile) error = %v", err)
+		}
+		if moved.Session.ID != "sess-copy" || moved.Original.ID != "sess-src" || moved.WorktreeID != "wt-new" {
+			t.Fatalf("session move-to-profile output = %#v", moved)
+		}
+		toon, _, err := executeRootCommand(t, deps, "session", "move-to-profile", "sess-src", "work", "-o", "toon")
+		const movedToon = "moved{original_id,worktree_id,branch}:\n  sess-src,wt-new,feat/move"
+		if err != nil || !strings.Contains(toon, movedToon) {
+			t.Fatalf("session move-to-profile toon output = %q, %v", toon, err)
+		}
+		human, _, err := executeRootCommand(t, deps, "session", "move-to-profile", "sess-src", "work")
+		if err != nil || !strings.Contains(human, "sess-src (archived)") || !strings.Contains(human, "feat/move") {
+			t.Fatalf("session move-to-profile human output = %q, %v", human, err)
+		}
+	})
+
+	t.Run("Should require the session and the target profile", func(t *testing.T) {
+		t.Parallel()
+		if _, _, err := executeRootCommand(t, deps, "session", "move-to-profile", "sess-src"); err == nil {
+			t.Fatal("executeRootCommand(session move-to-profile without profile) error = nil")
+		}
+	})
+}
+
+func TestSessionListRejectsConflictingArchiveFilters(t *testing.T) {
+	t.Run("Should reject conflicting archive filters", func(t *testing.T) {
+		t.Parallel()
+
+		_, _, err := executeRootCommand(
+			t,
+			newWorkspaceTestDeps(t, &stubClient{}),
+			"session",
+			"list",
+			"--archived",
+			"--include-archived",
+		)
+		if err == nil || !strings.Contains(err.Error(), "mutually exclusive") {
+			t.Fatalf("session list conflicting archive filters error = %v, want mutually exclusive", err)
+		}
+	})
+}
+
+func TestSessionListDefaultsToExactActiveState(t *testing.T) {
+	t.Parallel()
+
+	var seenQuery SessionListQuery
+	deps := newWorkspaceTestDeps(t, &stubClient{
+		listSessionPageFn: func(_ context.Context, query SessionListQuery) (SessionListPage, error) {
+			seenQuery = query
+			return SessionListPage{Page: contract.CountedCursorPagePayload{Limit: session.DefaultListLimit}}, nil
+		},
+	})
+	if _, _, err := executeRootCommand(t, deps, "session", "list", "-o", "json"); err != nil {
+		t.Fatalf("executeRootCommand(session list) error = %v", err)
+	}
+	if seenQuery.State != string(session.StateActive) {
+		t.Fatalf("seenQuery.State = %q, want exact active hard cut", seenQuery.State)
+	}
+}
+
+func TestSessionListAttentionFiltersAndSummary(t *testing.T) {
+	t.Parallel()
+	t.Run("Should forward board filters without implicit active state and reject invalid columns", func(t *testing.T) {
+		t.Parallel()
+		var seen SessionListQuery
+		deps := newWorkspaceTestDeps(
+			t,
+			&stubClient{listSessionPageFn: func(_ context.Context, query SessionListQuery) (SessionListPage, error) {
+				seen = query
+				return SessionListPage{Page: contract.CountedCursorPagePayload{Limit: 50}}, nil
+			}},
+		)
+		if _, _, err := executeRootCommand(
+			t,
+			deps,
+			"session",
+			"list",
+			"--column",
+			"waiting,in_review,done",
+			"--hide-children",
+			"-o",
+			"json",
+		); err != nil {
+			t.Fatal(err)
+		}
+		if seen.State != "" || !seen.HideChildren ||
+			!slices.Equal(seen.Columns, []string{"waiting", "in_review", "done"}) {
+			t.Fatalf("query = %#v", seen)
+		}
+		values := sessionListValues(seen)
+		if !slices.Equal(values["board_column"], seen.Columns) || values.Get("children") != "exclude" {
+			t.Fatalf("wire query = %#v", values)
+		}
+		_, _, err := executeRootCommand(t, deps, "session", "list", "--column", "blocked")
+		if err == nil || cliExitCodeForError(err) != 2 ||
+			err.Error() != `invalid --column "blocked" (allowed: needs_you, working, waiting, in_review, done)` {
+			t.Fatalf("invalid column = %v", err)
+		}
+	})
+
+	t.Run("Should pass needs-you filtering with attention-first ordering", func(t *testing.T) {
+		t.Parallel()
+
+		var seenQuery SessionListQuery
+		deps := newWorkspaceTestDeps(t, &stubClient{
+			listSessionPageFn: func(_ context.Context, query SessionListQuery) (SessionListPage, error) {
+				seenQuery = query
+				return SessionListPage{Page: contract.CountedCursorPagePayload{Limit: session.DefaultListLimit}}, nil
+			},
+		})
+		if _, _, err := executeRootCommand(t, deps, "session", "list", "--attention", "-o", "json"); err != nil {
+			t.Fatalf("executeRootCommand(session list --attention) error = %v", err)
+		}
+		if !seenQuery.Attention || seenQuery.Sort != session.ListSortAttention || seenQuery.State != "" {
+			t.Fatalf("ListSessions() query = %#v, want attention filter without implicit state", seenQuery)
+		}
+	})
+
+	t.Run("Should pass exact badges across every workspace", func(t *testing.T) {
+		t.Parallel()
+
+		var seenQuery SessionListQuery
+		deps := newWorkspaceTestDeps(t, &stubClient{
+			listSessionPageFn: func(_ context.Context, query SessionListQuery) (SessionListPage, error) {
+				seenQuery = query
+				return SessionListPage{Page: contract.CountedCursorPagePayload{Limit: session.DefaultListLimit}}, nil
+			},
+			getWorkspaceFn: func(context.Context, string) (WorkspaceDetailRecord, error) {
+				t.Fatal("GetWorkspace() called for --all-workspaces")
+				return WorkspaceDetailRecord{}, nil
+			},
+		})
+		deps.getenv = func(key string) string {
+			if key == workspaceEnvName {
+				return "workspace-from-environment"
+			}
+			return ""
+		}
+		if _, _, err := executeRootCommand(
+			t,
+			deps,
+			"session", "list", "--badge", "done", "--all-workspaces", "-o", "json",
+		); err != nil {
+			t.Fatalf("executeRootCommand(session list --badge done) error = %v", err)
+		}
+		if seenQuery.Workspace != "" || seenQuery.Sort != session.ListSortAttention ||
+			!slices.Equal(seenQuery.Badges, []session.Badge{session.BadgeDone}) {
+			t.Fatalf("ListSessions() query = %#v, want exact cross-workspace done filter", seenQuery)
+		}
+	})
+
+	t.Run("Should reject an unknown badge with usage exit code", func(t *testing.T) {
+		t.Parallel()
+
+		_, _, err := executeRootCommand(
+			t,
+			newWorkspaceTestDeps(t, &stubClient{}),
+			"session", "list", "--badge", "sleeping",
+		)
+		if err == nil || cliExitCodeForError(err) != 65 {
+			t.Fatalf("session list invalid badge error = %v, exit = %d, want exit 65", err, cliExitCodeForError(err))
+		}
+		if !strings.Contains(err.Error(), string(session.BadgeWaitingForInput)) ||
+			!strings.Contains(err.Error(), string(session.BadgeDone)) {
+			t.Fatalf("session list invalid badge error = %q, want canonical vocabulary", err)
+		}
+	})
+
+	t.Run("Should render the exact operator-wide summary", func(t *testing.T) {
+		t.Parallel()
+
+		want := SessionAttentionSummaryRecord{
+			NeedsYou: 7,
+			Finished: 3,
+			ByWorkspace: []contract.WorkspaceAttentionSummaryPayload{
+				{WorkspaceID: "ws-a", NeedsYou: 4, Finished: 1},
+				{WorkspaceID: "ws-b", NeedsYou: 3, Finished: 2},
+			},
+		}
+		deps := newWorkspaceTestDeps(t, &stubClient{
+			getSessionAttentionSummaryFn: func(context.Context) (SessionAttentionSummaryRecord, error) {
+				return want, nil
+			},
+		})
+		stdout, _, err := executeRootCommand(t, deps, "session", "list", "--summary", "-o", "json")
+		if err != nil {
+			t.Fatalf("executeRootCommand(session list --summary) error = %v", err)
+		}
+		var got SessionAttentionSummaryRecord
+		if err := json.Unmarshal([]byte(stdout), &got); err != nil {
+			t.Fatalf("json.Unmarshal(session attention summary) error = %v", err)
+		}
+		if !reflect.DeepEqual(got, want) {
+			t.Fatalf("session attention summary = %#v, want %#v", got, want)
+		}
+	})
+}
+
+func TestSessionInteractionsRendersSanitizedProjection(t *testing.T) {
+	t.Parallel()
+
+	t.Run("Should request and render the canonical pending interactions", func(t *testing.T) {
+		t.Parallel()
+
+		createdAt := fixedTestNow.Add(-time.Minute)
+		want := SessionInteractionsRecord{Interactions: []contract.PendingInteractionPayload{
+			{
+				InteractionID: "interaction-1", Kind: "clarify", ProviderRequestID: "request-1",
+				Status: "pending", Title: "Choose a deployment", CreatedAt: createdAt,
+			},
+		}}
+		deps := newWorkspaceTestDeps(t, &stubClient{
+			listSessionInteractionsFn: func(_ context.Context, id string, statuses []string) (SessionInteractionsRecord, error) {
+				if id != "sess-1" || len(statuses) != 0 {
+					t.Fatalf("ListSessionInteractions() id = %q statuses = %#v", id, statuses)
+				}
+				return want, nil
+			},
+		})
+		stdout, _, err := executeRootCommand(t, deps, "session", "interactions", "sess-1", "-o", "json")
+		if err != nil {
+			t.Fatalf("executeRootCommand(session interactions) error = %v", err)
+		}
+		var got SessionInteractionsRecord
+		if err := json.Unmarshal([]byte(stdout), &got); err != nil {
+			t.Fatalf("json.Unmarshal(session interactions) error = %v", err)
+		}
+		if !reflect.DeepEqual(got, want) {
+			t.Fatalf("session interactions = %#v, want %#v", got, want)
+		}
+
+		bundle := sessionInteractionsBundle(want)
+		human, humanErr := bundle.human()
+		if humanErr != nil || !strings.Contains(human, "interaction-1") ||
+			!strings.Contains(human, "Choose a deployment") {
+			t.Fatalf("session interactions human = %q, error = %v", human, humanErr)
+		}
+		toon, toonErr := bundle.toon()
+		if toonErr != nil || !strings.Contains(toon, "interaction-1") ||
+			!strings.Contains(toon, "request-1") {
+			t.Fatalf("session interactions toon = %q, error = %v", toon, toonErr)
+		}
+	})
+}
+
+func TestSessionListResolvesOptionalWorkspaceOverride(t *testing.T) {
+	t.Parallel()
+
+	t.Run("Should resolve COMPOZY_WORKSPACE before listing sessions", func(t *testing.T) {
+		t.Parallel()
+
+		var seenQuery SessionListQuery
+		deps := newWorkspaceTestDeps(t, &stubClient{
+			getWorkspaceFn: func(_ context.Context, ref string) (WorkspaceDetailRecord, error) {
+				if ref != "project-alias" {
+					t.Fatalf("GetWorkspace() ref = %q, want project-alias", ref)
+				}
+				return WorkspaceDetailRecord{
+					Workspace: WorkspaceRecord{ID: "ws-project", RootDir: "/workspace/project"},
+				}, nil
+			},
+			listSessionPageFn: func(_ context.Context, query SessionListQuery) (SessionListPage, error) {
+				seenQuery = query
+				return SessionListPage{}, nil
+			},
+		})
+		deps.getenv = func(key string) string {
+			if key == workspaceEnvName {
+				return "project-alias"
+			}
+			return ""
+		}
+
+		if _, _, err := executeRootCommand(t, deps, "session", "list", "-o", "json"); err != nil {
+			t.Fatalf("executeRootCommand(session list) error = %v", err)
+		}
+		if seenQuery.Workspace != "ws-project" {
+			t.Fatalf("seenQuery.Workspace = %q, want ws-project", seenQuery.Workspace)
+		}
+	})
+}
+
+func TestSessionListJSONLIncludesContinuationRecord(t *testing.T) {
+	t.Parallel()
+
+	t.Run("Should retain session health and continuation after profile resolution", func(t *testing.T) {
+		t.Parallel()
+
+		deps := newWorkspaceTestDeps(t, &stubClient{
+			listSessionPageFn: func(_ context.Context, _ SessionListQuery) (SessionListPage, error) {
+				return SessionListPage{
+					Sessions: []SessionRecord{{
+						ID:    "sess-1",
+						State: session.StateActive,
+						Health: &contract.SessionHealthPayload{
+							State:  contract.SessionHealthStateIdle,
+							Health: contract.SessionHealthHealthy,
+						},
+					}},
+					Page: contract.CountedCursorPagePayload{
+						NextCursor: "cursor-next",
+						HasMore:    true,
+						Total:      3,
+						Limit:      1,
+					},
+				}, nil
+			},
+		})
+		stdout, _, err := executeRootCommand(t, deps, "session", "list", "-o", "jsonl")
+		if err != nil {
+			t.Fatalf("executeRootCommand(session list jsonl) error = %v", err)
+		}
+		lines := strings.Split(strings.TrimSpace(stdout), "\n")
+		if len(lines) != 3 {
+			t.Fatalf("session list jsonl lines = %d, want resolution + session + page; output=%q", len(lines), stdout)
+		}
+		var item SessionRecord
+		if err := json.Unmarshal([]byte(lines[1]), &item); err != nil {
+			t.Fatalf("json.Unmarshal(session jsonl item) error = %v", err)
+		}
+		if item.Health == nil || item.Health.State != contract.SessionHealthStateIdle ||
+			item.Health.Health != contract.SessionHealthHealthy {
+			t.Fatalf("session jsonl item = %#v, want nested health", item)
+		}
+		var continuation struct {
+			Type string                            `json:"type"`
+			Page contract.CountedCursorPagePayload `json:"page"`
+		}
+		if err := json.Unmarshal([]byte(lines[2]), &continuation); err != nil {
+			t.Fatalf("json.Unmarshal(page continuation) error = %v", err)
+		}
+		if continuation.Type != "page" || continuation.Page.NextCursor != "cursor-next" ||
+			!continuation.Page.HasMore || continuation.Page.Total != 3 || continuation.Page.Limit != 1 {
+			t.Fatalf("continuation = %#v, want usable page metadata", continuation)
+		}
+	})
+}
+
+func TestSessionListProfileReadScope(t *testing.T) {
+	t.Parallel()
+
+	for _, testCase := range []struct {
+		name     string
+		sessions []SessionRecord
+	}{
+		{name: "Should emit the selected profile before an empty page"},
+		{
+			name: "Should emit the selected profile before session rows and pagination",
+			sessions: []SessionRecord{{
+				ID: "sess-marketing", ProfileName: "marketing", State: session.StateActive,
+			}},
+		},
+	} {
+		t.Run(testCase.name, func(t *testing.T) {
+			t.Parallel()
+
+			page := SessionListPage{
+				Sessions: testCase.sessions,
+				Page:     contract.CountedCursorPagePayload{Total: len(testCase.sessions), Limit: 50},
+			}
+			client := &profileTestDaemonClient{
+				DaemonClient: &stubClient{
+					listSessionPageFn: func(context.Context, SessionListQuery) (SessionListPage, error) {
+						return page, nil
+					},
+				},
+				profileClientAPI: &profileClientStub{profiles: []contract.Profile{{
+					Name: "marketing", State: "active",
+				}}},
+			}
+			deps := newTestDeps(t, client)
+			deps.getenv = func(string) string { return "" }
+			stdout, _, err := executeRootCommand(
+				t, deps, "session", "list", "--profile", "marketing", "--all-workspaces", "-o", "jsonl",
+			)
+			if err != nil {
+				t.Fatalf("executeRootCommand(session list) error = %v", err)
+			}
+			lines := strings.Split(strings.TrimSpace(stdout), "\n")
+			if len(lines) != len(testCase.sessions)+2 {
+				t.Fatalf("JSONL records = %d, want resolution, sessions, and page; output=%q", len(lines), stdout)
+			}
+			var resolution profileResolutionFrame
+			decodeJSONOutput(t, lines[0], &resolution)
+			if resolution != (profileResolutionFrame{
+				Kind: "profile_resolution", Profile: "marketing", Source: profileResolutionFlag,
+			}) {
+				t.Fatalf("resolution = %#v, want the explicit marketing profile", resolution)
+			}
+			var continuation struct {
+				Type string                            `json:"type"`
+				Page contract.CountedCursorPagePayload `json:"page"`
+			}
+			decodeJSONOutput(t, lines[len(lines)-1], &continuation)
+			if continuation.Type != listPageRecordType || continuation.Page != page.Page {
+				t.Fatalf("continuation = %#v, want page %#v", continuation, page.Page)
+			}
+		})
+	}
+
+	t.Run("Should emit aggregate resolution before owner-labeled rows [UT-077]", func(t *testing.T) {
+		t.Parallel()
+		workspaceClient := &stubClient{
+			getWorkspaceFn: func(context.Context, string) (WorkspaceDetailRecord, error) {
+				return WorkspaceDetailRecord{Workspace: WorkspaceRecord{
+					ID: "ws-1", Name: "my-saas", RootDir: "/workspace",
+				}}, nil
+			},
+			listSessionPageFn: func(context.Context, SessionListQuery) (SessionListPage, error) {
+				return SessionListPage{Sessions: []SessionRecord{{
+					ID: "sess-marketing", ProfileName: "marketing", State: session.StateActive,
+				}}}, nil
+			},
+		}
+		client := &profileTestDaemonClient{
+			DaemonClient: workspaceClient,
+			profileClientAPI: &profileClientStub{profiles: []contract.Profile{{
+				Name: "default", State: "active",
+			}}},
+		}
+		deps := newTestDeps(t, client)
+		deps.getwd = func() (string, error) { return "/workspace", nil }
+		deps.getenv = func(string) string { return "" }
+
+		stdout, _, err := executeRootCommand(
+			t, deps, "session", "list", "--workspace", "my-saas", "--all-profiles", "-o", "jsonl",
+		)
+		if err != nil {
+			t.Fatalf("executeRootCommand(session list --all-profiles) error = %v", err)
+		}
+		lines := strings.Split(strings.TrimSpace(stdout), "\n")
+		if len(lines) != 3 {
+			t.Fatalf("aggregate JSONL lines = %d, want frame + row + page; output=%q", len(lines), stdout)
+		}
+		if lines[0] != `{"kind":"workspace_resolution","workspace":"my-saas","source":"flag"}` {
+			t.Fatalf("aggregate resolution frame = %s", lines[0])
+		}
+		var row map[string]any
+		if err := json.Unmarshal([]byte(lines[1]), &row); err != nil {
+			t.Fatalf("json.Unmarshal(aggregate row) error = %v", err)
+		}
+		if row["profile_name"] != "marketing" {
+			t.Fatalf("aggregate row profile_name = %#v, want marketing", row["profile_name"])
+		}
+	})
+
+	t.Run("Should reject profile and aggregate selection together [UT-024]", func(t *testing.T) {
+		t.Parallel()
+		deps := profileTestDeps(t)
+		_, _, err := executeRootCommand(
+			t, deps, "session", "list", "--profile", "marketing", "--all-profiles", "-o", "json",
+		)
+		profileErr, profileErrOK := errors.AsType[*profileCommandError](err)
+		if !profileErrOK || profileErr.payload.Error.Code != "profile_selection_conflict" {
+			t.Fatalf("aggregate conflict error = %v, want profile_selection_conflict", err)
+		}
+	})
+}
+
+func TestSessionRepairPassesFlagsAndRendersJSON(t *testing.T) {
+	t.Run("Should pass flags and render JSON", func(t *testing.T) {
+		t.Parallel()
+
+		var seenQuery SessionRepairQuery
+		var seenID string
+		deps := newWorkspaceTestDeps(t, &stubClient{
+			repairSessionFn: func(_ context.Context, id string, query SessionRepairQuery) (SessionRepairRecord, error) {
+				seenID = id
+				seenQuery = query
+				return SessionRepairRecord{
+					SessionID: id,
+					Issues: []SessionRepairIssueRecord{{
+						Code:     session.RepairIssueStopReasonRequiresForce,
+						Severity: session.RepairSeverityError,
+						TurnID:   "turn-1",
+					}},
+					Actions: []SessionRepairActionRecord{{
+						Code:      session.RepairActionAppendTerminalError,
+						TurnID:    "turn-1",
+						Persisted: false,
+					}},
+				}, nil
+			},
+		})
+
+		stdout, _, err := executeRootCommand(
+			t,
+			deps,
+			"session",
+			"repair",
+			"sess-1",
+			"--dry-run",
+			"--force",
+			"-o",
+			"json",
+		)
+		if err != nil {
+			t.Fatalf("executeRootCommand(session repair) error = %v", err)
+		}
+		if seenID != "sess-1" || !seenQuery.DryRun || !seenQuery.Force {
+			t.Fatalf("repair call = id %q query %#v, want dry-run force for sess-1", seenID, seenQuery)
+		}
+
+		var decoded SessionRepairRecord
+		if err := json.Unmarshal([]byte(stdout), &decoded); err != nil {
+			t.Fatalf("json.Unmarshal(session repair) error = %v", err)
+		}
+		if decoded.SessionID != "sess-1" || len(decoded.Issues) != 1 || len(decoded.Actions) != 1 {
+			t.Fatalf("decoded repair = %#v, want one issue and one action for sess-1", decoded)
+		}
+	})
+}
+
+func TestSessionClarifyPendingUsesLiveDaemonProjection(t *testing.T) {
+	t.Parallel()
+
+	want := ClarificationsRecord{Clarifications: []ClarificationPendingRecord{{
+		RequestID: "req-1",
+		SessionID: "sess-1",
+		AgentName: "reviewer",
+		Question:  "Which workspace should I use?",
+		Choices:   []string{"staging", "production"},
+		AskedAt:   fixedTestNow,
+		Deadline:  new(fixedTestNow.Add(5 * time.Minute)),
+	}}}
+	deps := newWorkspaceTestDeps(t, &stubClient{
+		listSessionClarificationsFn: func(_ context.Context, sessionID string) (ClarificationsRecord, error) {
+			if sessionID != "sess-1" {
+				t.Fatalf("session id = %q, want sess-1", sessionID)
+			}
+			return want, nil
+		},
+	})
+
+	stdout, _, err := executeRootCommand(
+		t,
+		deps,
+		"session",
+		sessionClarifyCommandUse,
+		"pending",
+		"sess-1",
+		"-o",
+		"json",
+	)
+	if err != nil {
+		t.Fatalf("executeRootCommand(session clarify pending) error = %v", err)
+	}
+	var got ClarificationsRecord
+	if err := json.Unmarshal([]byte(stdout), &got); err != nil {
+		t.Fatalf("json.Unmarshal(session clarify pending) error = %v", err)
+	}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("pending clarifications = %#v, want %#v", got, want)
+	}
+}
+
+func TestSessionClarifyPendingRendersUnboundedDeadline(t *testing.T) {
+	t.Parallel()
+
+	t.Run("Should render the absent marker for an unbounded deadline", func(t *testing.T) {
+		t.Parallel()
+
+		want := ClarificationsRecord{Clarifications: []ClarificationPendingRecord{{
+			RequestID: "req-1",
+			SessionID: "sess-1",
+			AgentName: "reviewer",
+			Question:  "Which workspace should I use?",
+			Choices:   []string{"staging", "production"},
+			AskedAt:   fixedTestNow,
+			Deadline:  nil,
+		}}}
+		deps := newWorkspaceTestDeps(t, &stubClient{
+			listSessionClarificationsFn: func(_ context.Context, _ string) (ClarificationsRecord, error) {
+				return want, nil
+			},
+		})
+
+		human, _, err := executeRootCommand(
+			t,
+			deps,
+			"session",
+			sessionClarifyCommandUse,
+			"pending",
+			"sess-1",
+		)
+		if err != nil {
+			t.Fatalf("executeRootCommand(session clarify pending) error = %v", err)
+		}
+		if !strings.Contains(human, "REQUEST ID") {
+			t.Fatalf("human pending clarifications = %q, want the deadline table headers", human)
+		}
+		humanRow := pendingClarificationDataRow(t, human)
+		humanFields := strings.Fields(humanRow)
+		if len(humanFields) < 5 || humanFields[0] != "req-1" || humanFields[len(humanFields)-1] != "--" {
+			t.Fatalf("human deadline row = %q, want req-1 with the exact -- unbounded deadline cell", humanRow)
+		}
+
+		tonesque, _, err := executeRootCommand(
+			t,
+			deps,
+			"session",
+			sessionClarifyCommandUse,
+			"pending",
+			"sess-1",
+			"-o",
+			"toon",
+		)
+		if err != nil {
+			t.Fatalf("executeRootCommand(session clarify pending -o toon) error = %v", err)
+		}
+		if !strings.Contains(tonesque, "{request_id,agent_name,question,choices,deadline}") {
+			t.Fatalf("toon pending clarifications = %q, want the deadline field in the TOON header", tonesque)
+		}
+		toonRow := strings.TrimPrefix(pendingClarificationDataRow(t, tonesque), "  ")
+		toonFields := strings.Split(toonRow, ",")
+		if len(toonFields) != 5 || toonFields[0] != "req-1" || toonFields[len(toonFields)-1] != `""` {
+			t.Fatalf("toon deadline row = %q, want req-1 with an empty unbounded deadline field", toonRow)
+		}
+	})
+}
+
+func pendingClarificationDataRow(t *testing.T, output string) string {
+	t.Helper()
+	for line := range strings.SplitSeq(output, "\n") {
+		if strings.HasPrefix(strings.TrimSpace(line), "req-1") {
+			return line
+		}
+	}
+	t.Fatalf("output = %q, want a data row for req-1", output)
+	return ""
+}
+
+func TestSessionClarifyAnswerTranslatesOneBasedChoiceAtCLIBoundary(t *testing.T) {
+	t.Parallel()
+
+	wireChoice := 1
+	deps := newWorkspaceTestDeps(t, &stubClient{
+		answerSessionClarificationFn: func(
+			_ context.Context,
+			sessionID string,
+			requestID string,
+			request ClarificationAnswerRequest,
+		) (ClarificationAnswerRecord, error) {
+			if sessionID != "sess-1" || requestID != "req-1" {
+				t.Fatalf("answer target = %q/%q, want sess-1/req-1", sessionID, requestID)
+			}
+			if request.ChoiceIndex == nil || *request.ChoiceIndex != wireChoice || request.Text != "" {
+				t.Fatalf("answer request = %#v, want zero-based choice %d", request, wireChoice)
+			}
+			return ClarificationAnswerRecord{
+				Choice:    &wireChoice,
+				Outcome:   "answered",
+				RequestID: requestID,
+			}, nil
+		},
+	})
+
+	stdout, _, err := executeRootCommand(
+		t,
+		deps,
+		"session",
+		sessionClarifyCommandUse,
+		"answer",
+		"sess-1",
+		"req-1",
+		"--choice",
+		"2",
+		"-o",
+		"json",
+	)
+	if err != nil {
+		t.Fatalf("executeRootCommand(session clarify answer) error = %v", err)
+	}
+	var got ClarificationAnswerRecord
+	if err := json.Unmarshal([]byte(stdout), &got); err != nil {
+		t.Fatalf("json.Unmarshal(session clarify answer) error = %v", err)
+	}
+	if got.Choice == nil || *got.Choice != wireChoice || got.Text != "" || got.Fallback ||
+		got.Outcome != "answered" || got.RequestID != "req-1" {
+		t.Fatalf("clarification answer = %#v, want exact wire result", got)
+	}
+}
+
+func TestSessionClarifyAnswerRequiresExactlyOneAnswerFlag(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name    string
+		args    []string
+		wantErr string
+	}{
+		{
+			name:    "Should reject a missing answer",
+			wantErr: "exactly one of --choice or --text is required",
+		},
+		{
+			name:    "Should reject both answer forms",
+			args:    []string{"--choice", "1", "--text", "staging"},
+			wantErr: "exactly one of --choice or --text is required",
+		},
+		{
+			name:    "Should reject a zero choice",
+			args:    []string{"--choice", "0"},
+			wantErr: "--choice must be at least 1",
+		},
+		{
+			name:    "Should reject blank text",
+			args:    []string{"--text", "   "},
+			wantErr: "--text cannot be blank",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			args := []string{"session", sessionClarifyCommandUse, "answer", "sess-1", "req-1"}
+			args = append(args, tt.args...)
+			_, _, err := executeRootCommand(t, newWorkspaceTestDeps(t, &stubClient{}), args...)
+			if err == nil || !strings.Contains(err.Error(), tt.wantErr) {
+				t.Fatalf(
+					"executeRootCommand(session clarify answer) error = %v, want %q",
+					err,
+					tt.wantErr,
+				)
+			}
+		})
+	}
+}
+
+func TestSessionEventsFollowUsesSSE(t *testing.T) {
+	t.Parallel()
+
+	var (
+		streamCalled bool
+		querySeen    SessionEventQuery
+	)
+
+	deps := newWorkspaceTestDeps(t, &stubClient{
+		streamSessionFn: func(_ context.Context, id string, query SessionEventQuery, _ string, handler SSEHandler) error {
+			streamCalled = true
+			querySeen = query
+			return handler(SSEEvent{
+				ID:    "5",
+				Event: session.EventTypeSessionStopped,
+				Data: mustJSON(t, SessionEventRecord{
+					ID:        "evt-5",
+					SessionID: id,
+					Sequence:  5,
+					TurnID:    "turn-1",
+					Type:      session.EventTypeSessionStopped,
+					AgentName: "coder",
+					Timestamp: fixedTestNow,
+				}),
+			})
+		},
+		sessionEventsFn: func(context.Context, string, SessionEventQuery) ([]SessionEventRecord, error) {
+			t.Fatal("SessionEvents should not be called when --follow is set")
+			return nil, nil
+		},
+	})
+
+	stdout, _, err := executeRootCommand(
+		t,
+		deps,
+		"session",
+		"events",
+		"sess-1",
+		"--type",
+		"tool_call",
+		"--follow",
+		"-o",
+		"json",
+	)
+	if err != nil {
+		t.Fatalf("executeRootCommand() error = %v", err)
+	}
+	if !streamCalled {
+		t.Fatal("StreamSessionEvents was not called")
+	}
+	if querySeen.Type != "tool_call" {
+		t.Fatalf("querySeen.Type = %q, want %q", querySeen.Type, "tool_call")
+	}
+
+	lines := strings.Split(strings.TrimSpace(stdout), "\n")
+	if len(lines) != 1 {
+		t.Fatalf("follow stdout lines = %d, want 1", len(lines))
+	}
+	var decoded SessionEventRecord
+	if err := json.Unmarshal([]byte(lines[0]), &decoded); err != nil {
+		t.Fatalf("json.Unmarshal(stream line) error = %v", err)
+	}
+	if decoded.Type != session.EventTypeSessionStopped {
+		t.Fatalf("decoded.Type = %q, want %q", decoded.Type, session.EventTypeSessionStopped)
+	}
+}
+
+func TestSessionEventsJSONLOutput(t *testing.T) {
+	t.Run("Should render one persisted session event per JSONL line", func(t *testing.T) {
+		t.Parallel()
+
+		deps := newWorkspaceTestDeps(t, &stubClient{
+			sessionEventsFn: func(_ context.Context, id string, query SessionEventQuery) ([]SessionEventRecord, error) {
+				if id != "sess-1" {
+					t.Fatalf("SessionEvents() id = %q, want sess-1", id)
+				}
+				if query.Type != "agent_message" {
+					t.Fatalf("SessionEvents() query.Type = %q, want agent_message", query.Type)
+				}
+				if query.Last != 2 || query.AfterSequence != 7 {
+					t.Fatalf("SessionEvents() query = %#v, want last 2 after 7", query)
+				}
+				return []SessionEventRecord{
+					{
+						ID:        "evt-1",
+						SessionID: id,
+						Sequence:  1,
+						Type:      "agent_message",
+						Timestamp: fixedTestNow,
+					},
+					{
+						ID:        "evt-2",
+						SessionID: id,
+						Sequence:  2,
+						Type:      "done",
+						Timestamp: fixedTestNow,
+					},
+				}, nil
+			},
+		})
+
+		stdout, _, err := executeRootCommand(
+			t,
+			deps,
+			"session",
+			"events",
+			"sess-1",
+			"--type",
+			"agent_message",
+			"--last",
+			"2",
+			"--after",
+			"7",
+			"-o",
+			"jsonl",
+		)
+		if err != nil {
+			t.Fatalf("executeRootCommand(session events jsonl) error = %v", err)
+		}
+
+		lines := strings.Split(strings.TrimSpace(stdout), "\n")
+		if len(lines) != 2 {
+			t.Fatalf("jsonl line count = %d, want 2; output=%q", len(lines), stdout)
+		}
+		var decoded SessionEventRecord
+		if err := json.Unmarshal([]byte(lines[0]), &decoded); err != nil {
+			t.Fatalf("json.Unmarshal(first session event line) error = %v", err)
+		}
+		if decoded.ID != "evt-1" || decoded.Sequence != 1 {
+			t.Fatalf("decoded first event = %#v, want evt-1 sequence 1", decoded)
+		}
+	})
+}
+
+func TestSessionHistoryUsesCursorFlags(t *testing.T) {
+	t.Run("Should use cursor flags for session history", func(t *testing.T) {
+		t.Parallel()
+
+		deps := newWorkspaceTestDeps(t, &stubClient{
+			sessionHistoryFn: func(_ context.Context, id string, query SessionEventQuery) ([]TurnHistoryRecord, error) {
+				if id != "sess-1" {
+					t.Fatalf("SessionHistory() id = %q, want sess-1", id)
+				}
+				if query.Last != 3 || query.AfterSequence != 11 {
+					t.Fatalf("SessionHistory() query = %#v, want last 3 after 11", query)
+				}
+				return []TurnHistoryRecord{
+					{
+						TurnID: "turn-1",
+						Events: []SessionEventRecord{
+							{
+								ID:        "evt-12",
+								SessionID: id,
+								Sequence:  12,
+								TurnID:    "turn-1",
+								Type:      "agent_message",
+								Timestamp: fixedTestNow,
+							},
+						},
+					},
+				}, nil
+			},
+		})
+
+		stdout, _, err := executeRootCommand(
+			t,
+			deps,
+			"session",
+			"history",
+			"sess-1",
+			"--last",
+			"3",
+			"--after",
+			"11",
+			"-o",
+			"json",
+		)
+		if err != nil {
+			t.Fatalf("executeRootCommand(session history) error = %v", err)
+		}
+		var decoded []TurnHistoryRecord
+		if err := json.Unmarshal([]byte(stdout), &decoded); err != nil {
+			t.Fatalf("json.Unmarshal(session history) error = %v", err)
+		}
+		if len(decoded) != 1 || decoded[0].TurnID != "turn-1" {
+			t.Fatalf("decoded history = %#v, want one turn", decoded)
+		}
+	})
+}
+
+func TestSessionCommandsRendersUnifiedCatalog(t *testing.T) {
+	t.Parallel()
+	t.Run("Should render the unified command catalog", func(t *testing.T) {
+		t.Parallel()
+
+		deps := newWorkspaceTestDeps(t, &stubClient{
+			listSessionCommandsFn: func(_ context.Context, id string) (SessionCommandsRecord, error) {
+				if id != "sess-1" {
+					t.Fatalf("ListSessionCommands() id = %q, want sess-1", id)
+				}
+				return SessionCommandsRecord{
+					Revision: "revision-1",
+					Commands: []contract.SessionCommandPayload{{
+						ID: "skill:extension:ops:review", CanonicalToken: "/ops:review",
+						DisplayName: "/review", Description: "Review carefully", Lane: "skill",
+						Source: contract.SessionCommandSource{
+							Kind: "extension", ID: "ops", Key: "ops", Scope: "workspace",
+						},
+						Placements: []string{"standalone", "inline"},
+					}},
+				}, nil
+			},
+		})
+		stdout, _, err := executeRootCommand(t, deps, "session", "commands", "sess-1", "-o", "json")
+		if err != nil {
+			t.Fatalf("executeRootCommand(session commands) error = %v", err)
+		}
+		var decoded SessionCommandsRecord
+		if err := json.Unmarshal([]byte(stdout), &decoded); err != nil {
+			t.Fatalf("json.Unmarshal(session commands) error = %v", err)
+		}
+		if decoded.Revision != "revision-1" || len(decoded.Commands) != 1 ||
+			decoded.Commands[0].CanonicalToken != "/ops:review" ||
+			decoded.Commands[0].Source.Key != "ops" {
+			t.Fatalf("decoded commands = %#v", decoded)
+		}
+	})
+}
+
+func TestSessionWaitReturnsMatchingState(t *testing.T) {
+	t.Parallel()
+	t.Run("Should pass normalized predicates and render the reached state", func(t *testing.T) {
+		t.Parallel()
+
+		var captured SessionWaitRequest
+		deps := newWorkspaceTestDeps(t, &stubClient{
+			getSessionFn: func(context.Context, string) (SessionRecord, error) {
+				return SessionRecord{
+					ID:              "sess-1",
+					AgentName:       "coder",
+					WorkspaceID:     "ws-1",
+					WorkspacePath:   "/workspace/project",
+					State:           session.StateActive,
+					TranscriptEpoch: 8,
+					CreatedAt:       fixedTestNow,
+					UpdatedAt:       fixedTestNow,
+				}, nil
+			},
+			waitSessionFn: func(
+				_ context.Context,
+				workspaceID string,
+				sessionID string,
+				request SessionWaitRequest,
+			) (SessionWaitRecord, error) {
+				if workspaceID != "ws-1" || sessionID != "sess-1" {
+					t.Fatalf("WaitSession() scope = %q/%q, want ws-1/sess-1", workspaceID, sessionID)
+				}
+				captured = request
+				return SessionWaitRecord{
+					SessionID: sessionID,
+					Outcome:   "state-reached",
+					State:     "idle",
+					WaitedMS:  38_000,
+					Until:     []string{"waiting-for-input", "idle"},
+					Revision:  11,
+				}, nil
+			},
+		})
+
+		stdout, _, err := executeRootCommand(
+			t,
+			deps,
+			"session",
+			"wait",
+			"sess-1",
+			"--until",
+			"waiting-for-input,idle,idle",
+			"--timeout",
+			"120s",
+			"-o",
+			"json",
+		)
+		if err != nil {
+			t.Fatalf("executeRootCommand() error = %v", err)
+		}
+		if captured.TimeoutMS != 120_000 || captured.Epoch != 8 || len(captured.Until) != 2 ||
+			captured.Until[0] != "waiting-for-input" || captured.Until[1] != "idle" {
+			t.Fatalf("WaitSession() request = %#v, want normalized flags and epoch pin", captured)
+		}
+		var decoded SessionWaitRecord
+		if err := json.Unmarshal([]byte(stdout), &decoded); err != nil {
+			t.Fatalf("json.Unmarshal() error = %v", err)
+		}
+		if decoded.Outcome != "state-reached" || decoded.State != "idle" || decoded.WaitedMS != 38_000 ||
+			decoded.Revision != 11 {
+			t.Fatalf("decoded wait = %#v, want reached idle with revision fence", decoded)
+		}
+	})
+}
+
+func TestSessionWaitReturnsTimeoutExitAndPayload(t *testing.T) {
+	t.Parallel()
+	t.Run("Should return exit 75 with a structured timeout outcome", func(t *testing.T) {
+		t.Parallel()
+
+		deps := newWorkspaceTestDeps(t, &stubClient{
+			getSessionFn: func(context.Context, string) (SessionRecord, error) {
+				return SessionRecord{
+					ID:            "sess-1",
+					AgentName:     "coder",
+					WorkspaceID:   "ws-1",
+					WorkspacePath: "/workspace/project",
+					State:         session.StateActive,
+					CreatedAt:     fixedTestNow,
+					UpdatedAt:     fixedTestNow,
+				}, nil
+			},
+			waitSessionFn: func(
+				_ context.Context,
+				_ string,
+				sessionID string,
+				request SessionWaitRequest,
+			) (SessionWaitRecord, error) {
+				return SessionWaitRecord{
+					SessionID: sessionID,
+					Outcome:   "timeout",
+					WaitedMS:  request.TimeoutMS,
+					Until:     request.Until,
+					ResumeID:  "wait-1",
+				}, nil
+			},
+		})
+
+		stdout, _, err := executeRootCommand(
+			t,
+			deps,
+			"session",
+			"wait",
+			"sess-1",
+			"--until",
+			"idle",
+			"--timeout",
+			"5s",
+			"-o",
+			"json",
+		)
+		if err == nil || cliExitCodeForError(err) != 75 {
+			t.Fatalf("session wait timeout error = %v, exit = %d, want 75", err, cliExitCodeForError(err))
+		}
+		var decoded SessionWaitRecord
+		if err := json.Unmarshal([]byte(stdout), &decoded); err != nil {
+			t.Fatalf("json.Unmarshal() error = %v", err)
+		}
+		if decoded.Outcome != "timeout" || decoded.WaitedMS != 5_000 || decoded.ResumeID != "wait-1" ||
+			len(decoded.Until) != 1 || decoded.Until[0] != "idle" {
+			t.Fatalf("decoded wait timeout = %#v, want explicit timeout outcome", decoded)
+		}
+	})
+}
+
+func TestSessionWaitUnboundedResumesGaplesslyAndRecoversExpiredRegistration(t *testing.T) {
+	t.Parallel()
+	t.Run("Should resume gaplessly and replace an expired registration", func(t *testing.T) {
+		t.Parallel()
+
+		calls := 0
+		deps := newWorkspaceTestDeps(t, &stubClient{
+			getSessionFn: func(context.Context, string) (SessionRecord, error) {
+				return SessionRecord{ID: "sess-1", WorkspaceID: "ws-1", TranscriptEpoch: 4}, nil
+			},
+			waitSessionFn: func(
+				_ context.Context,
+				_ string,
+				sessionID string,
+				request SessionWaitRequest,
+			) (SessionWaitRecord, error) {
+				calls++
+				switch calls {
+				case 1:
+					if request.ResumeID != "" || request.TimeoutMS != 300_000 {
+						t.Fatalf("first wait request = %#v, want fresh bounded wait", request)
+					}
+					return SessionWaitRecord{
+						SessionID: sessionID, Outcome: "timeout", WaitedMS: 300_000, ResumeID: "wait-1",
+					}, nil
+				case 2:
+					if request.ResumeID != "wait-1" {
+						t.Fatalf("second wait resume_id = %q, want wait-1", request.ResumeID)
+					}
+					return SessionWaitRecord{}, &daemonAPIError{
+						statusCode: http.StatusGone,
+						status:     http.StatusText(http.StatusGone),
+						payload:    contract.ErrorPayload{Error: "wait expired", Code: "wait_expired"},
+					}
+				case 3:
+					if request.ResumeID != "" {
+						t.Fatalf("third wait resume_id = %q, want fresh registration", request.ResumeID)
+					}
+					return SessionWaitRecord{
+						SessionID: sessionID, Outcome: "state-reached", State: "idle", WaitedMS: 1_000,
+					}, nil
+				default:
+					t.Fatalf("WaitSession() calls = %d, want 3", calls)
+					return SessionWaitRecord{}, nil
+				}
+			},
+		})
+
+		stdout, _, err := executeRootCommand(
+			t,
+			deps,
+			"session",
+			"wait",
+			"sess-1",
+			"--unbounded",
+			"-o",
+			"json",
+		)
+		if err != nil {
+			t.Fatalf("executeRootCommand() error = %v", err)
+		}
+		if calls != 3 {
+			t.Fatalf("WaitSession() calls = %d, want 3", calls)
+		}
+		var decoded SessionWaitRecord
+		if err := json.Unmarshal([]byte(stdout), &decoded); err != nil {
+			t.Fatalf("json.Unmarshal() error = %v", err)
+		}
+		if decoded.Outcome != "state-reached" || decoded.State != "idle" || decoded.WaitedMS != 301_000 {
+			t.Fatalf("decoded unbounded wait = %#v, want accumulated state outcome", decoded)
+		}
+	})
+}
+
+func TestSessionWaitRejectsUnknownStateBeforeCallingDaemon(t *testing.T) {
+	t.Parallel()
+	t.Run("Should reject an unknown state before contacting the daemon", func(t *testing.T) {
+		t.Parallel()
+
+		deps := newWorkspaceTestDeps(t, &stubClient{
+			getSessionFn: func(context.Context, string) (SessionRecord, error) {
+				t.Fatal("GetSession() called for invalid wait state")
+				return SessionRecord{}, nil
+			},
+			waitSessionFn: func(context.Context, string, string, SessionWaitRequest) (SessionWaitRecord, error) {
+				t.Fatal("WaitSession() called for invalid wait state")
+				return SessionWaitRecord{}, nil
+			},
+		})
+
+		_, _, err := executeRootCommand(t, deps, "session", "wait", "sess-1", "--until", "sleeping")
+		if err == nil || cliExitCodeForError(err) != 65 || !strings.Contains(err.Error(), "unknown session state") {
+			t.Fatalf("invalid wait error = %v, exit = %d, want vocabulary error/65", err, cliExitCodeForError(err))
+		}
+	})
+}
+
+// Invariant: stopping a session preserves the selected profile through the
+// mutation and follow-up read. The canonical CLI session command suite owns
+// this lifecycle boundary.
+func TestSessionStopFetchesUpdatedSession(t *testing.T) {
+	t.Parallel()
+
+	t.Run("Should fetch the updated session through the selected profile", func(t *testing.T) {
+		t.Parallel()
+
+		var stoppedID string
+
+		client := &profileTestDaemonClient{
+			DaemonClient: withWorkspaceResolution(&stubClient{
+				stopSessionFn: func(ctx context.Context, id string, wait bool, _ contract.SessionProcessPolicy) (SessionStopRecord, error) {
+					if got := profileQueryValues(ctx, nil).Get(profileFlagName); got != "research" {
+						t.Fatalf("StopSession() profile query = %q, want research", got)
+					}
+					if wait {
+						t.Fatal("default stop must accept asynchronously")
+					}
+					stoppedID = id
+					return SessionStopRecord{SessionID: id, State: session.StateStopping, Status: "stopping"}, nil
+				},
+				getSessionFn: func(ctx context.Context, id string) (SessionRecord, error) {
+					if got := profileQueryValues(ctx, nil).Get(profileFlagName); got != "research" {
+						t.Fatalf("GetSession() profile query = %q, want research", got)
+					}
+					return SessionRecord{
+						ID:            id,
+						AgentName:     "coder",
+						WorkspaceID:   "ws-1",
+						WorkspacePath: "/workspace/project",
+						State:         session.StateStopped,
+						CreatedAt:     fixedTestNow,
+						UpdatedAt:     fixedTestNow,
+					}, nil
+				},
+			}),
+			profileClientAPI: &profileClientStub{profiles: []contract.Profile{
+				{Name: "default", State: "active"},
+				{Name: "research", State: "active"},
+			}},
+		}
+		deps := newWorkspaceTestDeps(t, client)
+
+		stdout, _, err := executeRootCommand(
+			t,
+			deps,
+			"--profile",
+			"research",
+			"session",
+			"stop",
+			"sess-1",
+			"-o",
+			"json",
+		)
+		if err != nil {
+			t.Fatalf("executeRootCommand() error = %v", err)
+		}
+		if stoppedID != "sess-1" {
+			t.Fatalf("StopSession() id = %q, want %q", stoppedID, "sess-1")
+		}
+
+		var decoded SessionRecord
+		if err := json.Unmarshal([]byte(stdout), &decoded); err != nil {
+			t.Fatalf("json.Unmarshal() error = %v", err)
+		}
+		if decoded.State != session.StateStopped {
+			t.Fatalf("decoded.State = %q, want %q", decoded.State, session.StateStopped)
+		}
+	})
+	t.Run("Should return the waited stop outcome without replacing it with a later session read", func(t *testing.T) {
+		t.Parallel()
+		for _, verified := range []bool{false, true} {
+			t.Run(fmt.Sprintf("Should preserve verified %t", verified), func(t *testing.T) {
+				t.Parallel()
+				want := SessionStopRecord{SessionID: "sess-1", Status: "stopping", State: session.StateStopping,
+					Escalated: true, Phase: session.StopPhaseKilled, StopCause: "user_requested", StoppedAfter: "4.2s",
+					Attention: "stop_verification_failed"}
+				if verified {
+					want.Verified, want.State, want.Status, want.Attention = true, session.StateStopped, "stopped", ""
+				}
+				client := withWorkspaceResolution(&stubClient{
+					stopSessionFn: func(_ context.Context, id string, wait bool, _ contract.SessionProcessPolicy) (SessionStopRecord, error) {
+						if id != "sess-1" || !wait {
+							t.Fatalf("stop request = %s, wait=%t", id, wait)
+						}
+						return want, nil
+					},
+				})
+				stdout, _, err := executeRootCommand(
+					t,
+					newWorkspaceTestDeps(t, client),
+					"session",
+					"stop",
+					"sess-1",
+					"--wait",
+					"-o",
+					"json",
+				)
+				if err != nil {
+					t.Fatal(err)
+				}
+				var got SessionStopRecord
+				if err := json.Unmarshal([]byte(stdout), &got); err != nil {
+					t.Fatal(err)
+				}
+				if got != want {
+					t.Fatalf("stop result = %#v, want %#v", got, want)
+				}
+			})
+		}
+	})
+}
+
+func TestSessionRemoveDeletesSession(t *testing.T) {
+	t.Parallel()
+
+	t.Run("Should delete session and return session record", func(t *testing.T) {
+		t.Parallel()
+
+		var deletedID string
+
+		deps := newWorkspaceTestDeps(t, &stubClient{
+			getSessionFn: func(_ context.Context, id string) (SessionRecord, error) {
+				return SessionRecord{
+					ID:            id,
+					AgentName:     "coder",
+					WorkspaceID:   "ws-1",
+					WorkspacePath: "/workspace/project",
+					State:         session.StateStopped,
+					CreatedAt:     fixedTestNow,
+					UpdatedAt:     fixedTestNow,
+				}, nil
+			},
+			deleteSessionFn: func(_ context.Context, id string, _ bool, _ contract.SessionProcessPolicy) error {
+				deletedID = id
+				return nil
+			},
+		})
+
+		stdout, _, err := executeRootCommand(t, deps, "session", "remove", "sess-1", "-o", "json")
+		if err != nil {
+			t.Fatalf("executeRootCommand() error = %v", err)
+		}
+		if deletedID != "sess-1" {
+			t.Fatalf("DeleteSession() id = %q, want %q", deletedID, "sess-1")
+		}
+
+		var decoded SessionRecord
+		if err := json.Unmarshal([]byte(stdout), &decoded); err != nil {
+			t.Fatalf("json.Unmarshal() error = %v", err)
+		}
+		if decoded.ID != "sess-1" {
+			t.Fatalf("decoded.ID = %q, want %q", decoded.ID, "sess-1")
+		}
+	})
+}
+
+func TestSessionStatusReturnsHealthStatus(t *testing.T) {
+	t.Parallel()
+
+	t.Run("Should expose unverified stop attention in every output format", func(t *testing.T) {
+		t.Parallel()
+		deps := newWorkspaceTestDeps(t, &stubClient{
+			getSessionStatusFn: func(context.Context, string) (SessionStatusRecord, error) {
+				return SessionStatusRecord{
+					SessionID: "sess-1", Badge: session.BadgeNeedsAttention,
+					Verified: new(false), Escalated: new(true), Attention: session.StopVerificationFailedCode,
+				}, nil
+			},
+		})
+		for _, format := range []string{"json", "human", "toon"} {
+			output, _, err := executeRootCommand(t, deps, "session", "status", "sess-1", "-o", format)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !strings.Contains(output, session.StopVerificationFailedCode) {
+				t.Fatalf("%s omitted stop attention: %s", format, output)
+			}
+			if format == "json" {
+				var result SessionStatusRecord
+				if err := json.Unmarshal([]byte(output), &result); err != nil {
+					t.Fatal(err)
+				}
+				if result.Verified == nil || *result.Verified || result.Escalated == nil || !*result.Escalated {
+					t.Fatalf("unverified status = %#v", result)
+				}
+			}
+		}
+	})
+
+	deps := newWorkspaceTestDeps(t, &stubClient{
+		getSessionStatusFn: func(_ context.Context, id string) (SessionStatusRecord, error) {
+			if id != "sess-1" {
+				t.Fatalf("GetSessionStatus() id = %q, want sess-1", id)
+			}
+			return SessionStatusRecord{
+				SessionID:       id,
+				AgentName:       "coder",
+				WorkspaceID:     "ws-1",
+				State:           "idle",
+				Badge:           session.BadgeWaitingForInput,
+				Health:          "healthy",
+				Attachable:      true,
+				EligibleForWake: true,
+				UpdatedAt:       fixedTestNow,
+			}, nil
+		},
+	})
+
+	stdout, _, err := executeRootCommand(t, deps, "session", "status", "sess-1", "-o", "json")
+	if err != nil {
+		t.Fatalf("executeRootCommand() error = %v", err)
+	}
+
+	var decoded SessionStatusRecord
+	if err := json.Unmarshal([]byte(stdout), &decoded); err != nil {
+		t.Fatalf("json.Unmarshal() error = %v", err)
+	}
+	if decoded.SessionID != "sess-1" || decoded.State != "idle" ||
+		decoded.Badge != session.BadgeWaitingForInput || !decoded.EligibleForWake {
+		t.Fatalf("decoded = %#v, want sess-1 eligible idle health", decoded)
+	}
+
+	human, _, err := executeRootCommand(t, deps, "session", "status", "sess-1")
+	if err != nil {
+		t.Fatalf("executeRootCommand(human) error = %v", err)
+	}
+	if !strings.Contains(human, string(session.BadgeWaitingForInput)) {
+		t.Fatalf("human status = %q, want badge %q", human, session.BadgeWaitingForInput)
+	}
+}
+
+func TestSessionUsageCommandPreservesCostProvenance(t *testing.T) {
+	t.Parallel()
+	t.Run("Should render reported context cache totals and byte-only attribution", func(t *testing.T) {
+		t.Parallel()
+		at := time.Date(2026, 9, 11, 10, 0, 0, 0, time.UTC)
+		value := SessionUsageRecord{
+			CacheReadTokens:  new(int64(4)),
+			CacheWriteTokens: new(int64(5)),
+			Context: contract.SessionContextPayload{
+				State:          contract.SessionContextStateReported,
+				Used:           new(int64(80)),
+				Size:           new(int64(100)),
+				Ratio:          new(0.8),
+				SizeSource:     "agent",
+				Sequence:       new(int64(10)),
+				ReportedTurnID: "A",
+				ReportedAt:     &at,
+				Stale:          new(false),
+				Injected: &contract.SessionContextInjectedPayload{
+					Estimate: "bytes_div_4",
+					Tokens:   20,
+					Rows: []contract.SessionContextRowPayload{
+						{
+							Key:             "skills",
+							Label:           "Skills catalog",
+							OwnerKind:       "full",
+							Kind:            "text",
+							Tokens:          new(int64(20)),
+							DeliveredTurnID: "A",
+							LastSeenTurnID:  "B",
+							Unchanged:       true,
+						},
+						{Key: "attachment", Kind: "binary", Name: "screenshot.png", Bytes: 1024, DeliveredTurnID: "A"},
+						{Key: "memory", OwnerKind: "startup_opaque", DeliveredTurnID: "A"},
+					},
+				},
+			},
+		}
+		deps := newWorkspaceTestDeps(
+			t,
+			&stubClient{
+				getSessionUsageFn: func(context.Context, string) (SessionUsageRecord, error) { return value, nil },
+			},
+		)
+		stdout, _, err := executeRootCommand(t, deps, "session", "usage", "sess-1")
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, want := range []string{"Cache Read", "Cache Write", "Context", "Skills catalog", "80 / 100 (80%)", "≈ 20", "unchanged since A (last seen B)", "1024 B", "screenshot.png", "binary, no estimate", "included in the startup prompt"} {
+			if !strings.Contains(stdout, want) {
+				t.Fatalf("missing %q in %s", want, stdout)
+			}
+		}
+		stdout, _, err = executeRootCommand(t, deps, "session", "usage", "sess-1", "-o", "toon")
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, want := range []string{"cache_read_tokens", "cache_write_tokens", "context_state", "context_sequence", "context_reported_turn_id", "injected_tokens", "injected_stale", "context_reported_at", "2026-09-11T10:00:00Z", "context_rows[3]", "Skills catalog", "screenshot.png", "startup_opaque", "bytes_div_4"} {
+			if !strings.Contains(stdout, want) {
+				t.Fatalf("missing TOON field %q in %s", want, stdout)
+			}
+		}
+	})
+	t.Run("Should omit unknown context and expose unavailable reads", func(t *testing.T) {
+		t.Parallel()
+		for _, state := range []contract.SessionContextState{contract.SessionContextStateUnknown, contract.SessionContextStateUnavailable} {
+			value := SessionUsageRecord{Context: contract.SessionContextPayload{State: state}}
+			text, err := sessionUsageBundle(value).human()
+			if err != nil {
+				t.Fatal(err)
+			}
+			if state == contract.SessionContextStateUnknown && strings.Contains(text, "Context") {
+				t.Fatalf("unknown context fabricated a section: %s", text)
+			}
+			if state == contract.SessionContextStateUnavailable &&
+				(!strings.Contains(text, "Context") || !strings.Contains(text, "unavailable")) {
+				t.Fatalf("missing unavailable state: %s", text)
+			}
+		}
+	})
+	t.Run("Should expose the compaction cause of unknown context without inventing occupancy", func(t *testing.T) {
+		t.Parallel()
+		value := SessionUsageRecord{Context: contract.SessionContextPayload{
+			State:     contract.SessionContextStateUnknown,
+			ClearedBy: &contract.SessionContextClearedByPayload{CompactionID: "c1", Sequence: 40},
+		}}
+		deps := newWorkspaceTestDeps(t, &stubClient{
+			getSessionUsageFn: func(context.Context, string) (SessionUsageRecord, error) { return value, nil },
+		})
+		for _, format := range []string{"human", "toon", "json"} {
+			output, _, err := executeRootCommand(t, deps, "session", "usage", "sess-1", "-o", format)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !strings.Contains(output, "c1") || !strings.Contains(output, "40") ||
+				!strings.Contains(output, "unknown") {
+				t.Fatalf("%s omitted the compaction boundary: %s", format, output)
+			}
+			if format == "human" && strings.Contains(output, "Used") {
+				t.Fatalf("unknown context invented occupancy: %s", output)
+			}
+			if format == "json" {
+				var got SessionUsageRecord
+				if err := json.Unmarshal([]byte(output), &got); err != nil {
+					t.Fatal(err)
+				}
+				if !reflect.DeepEqual(got, value) {
+					t.Fatalf("unknown context JSON = %s", output)
+				}
+			}
+		}
+	})
+	t.Run("Should route turns and preserve the JSON union with ordered compaction markers", func(t *testing.T) {
+		t.Parallel()
+		at := time.Date(2026, 9, 11, 10, 0, 0, 0, time.UTC)
+		value := contract.SessionUsageTurnsResponse{Turns: []contract.SessionUsageTurnPayload{
+			{
+				TurnID:   "A",
+				Sequence: 9,
+				Usage: &contract.TokenUsagePayload{
+					ContextUsed: new(int64(80)),
+					ContextSize: new(int64(100)),
+					Timestamp:   at,
+				},
+			},
+			{
+				TurnID:   "C",
+				Sequence: 58,
+				Injected: &contract.SessionTurnInjectedPayload{
+					Tokens: 8,
+					SentAt: at,
+					Spans:  []contract.SessionContextSpanPayload{{Key: "skills", Unchanged: true}},
+				},
+			},
+			{TurnID: "D", Sequence: 77, Usage: &contract.TokenUsagePayload{InputTokens: new(int64(10)), Timestamp: at}},
+		}, Compactions: []contract.SessionCompactionPayload{{TurnID: "B", Sequence: 40, At: at, CompactionID: "c1", Trigger: "agent", Status: "completed", ContextUsed: new(int64(85)), ContextSize: new(int64(100))}}}
+		deps := newWorkspaceTestDeps(
+			t,
+			&stubClient{
+				getSessionUsageTurnsFn: func(_ context.Context, id string) (contract.SessionUsageTurnsResponse, error) {
+					if id != "sess-1" {
+						t.Fatalf("turns id=%s", id)
+					}
+					return value, nil
+				},
+			},
+		)
+		stdout, _, err := executeRootCommand(t, deps, "session", "usage", "sess-1", "--turns", "-o", "json")
+		if err != nil {
+			t.Fatal(err)
+		}
+		var got contract.SessionUsageTurnsResponse
+		if err := json.Unmarshal([]byte(stdout), &got); err != nil {
+			t.Fatal(err)
+		}
+		if !reflect.DeepEqual(got, value) {
+			t.Fatalf("turns JSON=%s", stdout)
+		}
+		stdout, _, err = executeRootCommand(t, deps, "session", "usage", "sess-1", "--turns")
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, want := range []string{"80 / 100", "Agent compaction · c1 · agent · completed · 85 / 100", "≈ 8 (unchanged)", "CACHE R", "CACHE W"} {
+			if !strings.Contains(stdout, want) {
+				t.Fatalf("missing turns %q in %s", want, stdout)
+			}
+		}
+		stdout, _, err = executeRootCommand(t, deps, "session", "usage", "sess-1", "--turns", "-o", "toon")
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, want := range []string{
+			"session_usage_turns[3]{turn_id,sequence}", "usage[2]", "deliveries[1]", "spans[1]",
+			"compactions[1]{turn_id,sequence,at,compaction_id,trigger,status,context_used,context_size,context_after_used,context_after_size,context_after_sequence}",
+			"B,40,2026-09-11T10:00:00Z,c1,agent,completed,85,100",
+		} {
+			if !strings.Contains(stdout, want) {
+				t.Fatalf("missing structured TOON %q in %s", want, stdout)
+			}
+		}
+		rows := sessionUsageTurnRows(value)
+		if len(rows) != 4 || rows[0][0] != "A" || rows[1][0] != "B" || rows[2][0] != "C" || rows[3][0] != "D" {
+			t.Fatalf("turn/marker order=%#v", rows)
+		}
+		if strings.Contains(rows[1][3], "→") {
+			t.Fatalf("marker without after observation invented a transition: %s", rows[1][3])
+		}
+		for _, size := range []*int64{nil, new(int64(100))} {
+			value.Compactions[0].ContextAfter = &contract.SessionCompactionContextAfterPayload{
+				Used: 0, Size: size, Sequence: 41,
+			}
+			rows = sessionUsageTurnRows(value)
+			want := "85 / 100 → 0"
+			if size != nil {
+				want += " / 100"
+			}
+			if !strings.Contains(rows[1][3], want) {
+				t.Fatalf("known after occupancy = %s, want %s", rows[1][3], want)
+			}
+			output, _, err := executeRootCommand(t, deps, "session", "usage", "sess-1", "--turns", "-o", "json")
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := json.Unmarshal([]byte(output), &got); err != nil {
+				t.Fatal(err)
+			}
+			if !reflect.DeepEqual(got, value) {
+				t.Fatalf("marker after JSON = %s", output)
+			}
+			toon, err := sessionUsageTurnsToon(value)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !strings.Contains(toon, ",85,100,0,"+toonValue(formatInt64Ptr(size))+",41") {
+				t.Fatalf("missing explicit after occupancy in TOON: %s", toon)
+			}
+		}
+	})
+
+	t.Run("Should return the exact estimated usage contract as JSON", func(t *testing.T) {
+		t.Parallel()
+
+		input := int64(128_400)
+		output := int64(24_900)
+		total := input + output
+		amount := 0.7587
+		deps := newWorkspaceTestDeps(t, &stubClient{
+			getSessionUsageFn: func(_ context.Context, id string) (SessionUsageRecord, error) {
+				if id != "sess-1" {
+					t.Fatalf("GetSessionUsage() id = %q, want sess-1", id)
+				}
+				return SessionUsageRecord{
+					InputTokens:  &input,
+					OutputTokens: &output,
+					TotalTokens:  &total,
+					TotalCost:    &amount,
+					CostCurrency: "USD",
+					CostStatus:   "estimated",
+					CostSource:   "catalog_config",
+					TurnCount:    1,
+				}, nil
+			},
+		})
+
+		stdout, _, err := executeRootCommand(t, deps, "session", "usage", "sess-1", "-o", "json")
+		if err != nil {
+			t.Fatalf("executeRootCommand() error = %v", err)
+		}
+		var decoded SessionUsageRecord
+		if err := json.Unmarshal([]byte(stdout), &decoded); err != nil {
+			t.Fatalf("json.Unmarshal() error = %v", err)
+		}
+		if decoded.TotalCost == nil || *decoded.TotalCost != amount || decoded.CostCurrency != "USD" ||
+			decoded.CostStatus != "estimated" || decoded.CostSource != "catalog_config" {
+			t.Fatalf("decoded usage = %#v, want estimated/catalog_config USD %.4f", decoded, amount)
+		}
+	})
+
+	t.Run("Should render included usage without a monetary amount", func(t *testing.T) {
+		t.Parallel()
+
+		total := int64(42)
+		contradictoryAmount := 99.0
+		deps := newWorkspaceTestDeps(t, &stubClient{
+			getSessionUsageFn: func(context.Context, string) (SessionUsageRecord, error) {
+				return SessionUsageRecord{
+					TotalTokens:  &total,
+					TotalCost:    &contradictoryAmount,
+					CostCurrency: "USD",
+					CostStatus:   "included",
+					CostSource:   "none",
+					TurnCount:    1,
+				}, nil
+			},
+		})
+
+		stdout, _, err := executeRootCommand(t, deps, "session", "usage", "sess-1")
+		if err != nil {
+			t.Fatalf("executeRootCommand() error = %v", err)
+		}
+		if !strings.Contains(stdout, "Included") || strings.Contains(stdout, "USD 99") {
+			t.Fatalf("session usage output = %q, want Included without monetary amount", stdout)
+		}
+	})
+
+	t.Run("Should suppress an amount without authoritative status", func(t *testing.T) {
+		t.Parallel()
+
+		amount := 18.42
+		deps := newWorkspaceTestDeps(t, &stubClient{
+			getSessionUsageFn: func(context.Context, string) (SessionUsageRecord, error) {
+				return SessionUsageRecord{TotalCost: &amount, CostCurrency: "USD"}, nil
+			},
+		})
+
+		stdout, _, err := executeRootCommand(t, deps, "session", "usage", "sess-1")
+		if err != nil {
+			t.Fatalf("executeRootCommand() error = %v", err)
+		}
+		if strings.Contains(stdout, "USD 18.42") {
+			t.Fatalf("session usage output = %q, want no amount without cost status", stdout)
+		}
+	})
+}
+
+func TestSessionResumeReturnsSessionRecord(t *testing.T) {
+	t.Parallel()
+
+	deps := newWorkspaceTestDeps(t, &stubClient{
+		resumeSessionFn: func(_ context.Context, id string) (SessionRecord, error) {
+			return SessionRecord{
+				ID:            id,
+				AgentName:     "coder",
+				WorkspaceID:   "ws-1",
+				WorkspacePath: "/workspace/project",
+				State:         session.StateActive,
+				CreatedAt:     fixedTestNow,
+				UpdatedAt:     fixedTestNow,
+			}, nil
+		},
+	})
+
+	stdout, _, err := executeRootCommand(t, deps, "session", "resume", "sess-1", "-o", "json")
+	if err != nil {
+		t.Fatalf("executeRootCommand() error = %v", err)
+	}
+
+	var decoded SessionRecord
+	if err := json.Unmarshal([]byte(stdout), &decoded); err != nil {
+		t.Fatalf("json.Unmarshal() error = %v", err)
+	}
+	if decoded.ID != "sess-1" || decoded.State != session.StateActive {
+		t.Fatalf("decoded = %#v, want sess-1 active", decoded)
+	}
+}
+
+func TestSessionAttachmentsUploadRendersAttachmentPayload(t *testing.T) {
+	t.Parallel()
+
+	t.Run("Should print the direct attachment payload and forward arguments", func(t *testing.T) {
+		t.Parallel()
+
+		filePath := filepath.Join(t.TempDir(), "frame.png")
+		if err := os.WriteFile(filePath, []byte("attachment"), 0o600); err != nil {
+			t.Fatalf("os.WriteFile() error = %v", err)
+		}
+		var (
+			gotSessionID string
+			gotFilePath  string
+		)
+		deps := newWorkspaceTestDeps(t, &stubClient{
+			uploadSessionAttachmentFn: func(_ context.Context, sessionID string, path string) (SessionAttachmentRecord, error) {
+				gotSessionID = sessionID
+				gotFilePath = path
+				return SessionAttachmentRecord{
+					ID:        "att-1",
+					Name:      "frame.png",
+					MIMEType:  "image/png",
+					Bytes:     10,
+					SHA256:    "sha256:abc",
+					Kind:      contract.PromptAttachmentKindImage,
+					Width:     4,
+					Height:    3,
+					CreatedAt: fixedTestNow,
+				}, nil
+			},
+		})
+
+		stdout, _, err := executeRootCommand(
+			t,
+			deps,
+			"session", "attachments", "upload", "sess-1", filePath, "-o", "json",
+		)
+		if err != nil {
+			t.Fatalf("executeRootCommand(session attachments upload) error = %v", err)
+		}
+		if gotSessionID != "sess-1" || gotFilePath != filePath {
+			t.Fatalf(
+				"UploadSessionAttachment() = (%q, %q), want (%q, %q)",
+				gotSessionID,
+				gotFilePath,
+				"sess-1",
+				filePath,
+			)
+		}
+
+		var decoded SessionAttachmentRecord
+		if err := json.Unmarshal([]byte(stdout), &decoded); err != nil {
+			t.Fatalf("json.Unmarshal(session attachment) error = %v", err)
+		}
+		if decoded.ID != "att-1" || decoded.Name != "frame.png" || decoded.MIMEType != "image/png" {
+			t.Fatalf("decoded = %#v, want direct attachment payload", decoded)
+		}
+	})
+}
+
+func TestSessionResumeLatestUsesBoundedPage(t *testing.T) {
+	t.Parallel()
+
+	var seenQuery SessionListQuery
+	deps := newWorkspaceTestDeps(t, &stubClient{
+		listSessionPageFn: func(_ context.Context, query SessionListQuery) (SessionListPage, error) {
+			seenQuery = query
+			return SessionListPage{
+				Sessions: []SessionRecord{{ID: "sess-latest", State: session.StateActive}},
+				Page:     contract.CountedCursorPagePayload{Total: 4, Limit: 1},
+			}, nil
+		},
+		resumeSessionFn: func(_ context.Context, id string) (SessionRecord, error) {
+			if id != "sess-latest" {
+				t.Fatalf("ResumeSession() id = %q, want sess-latest", id)
+			}
+			return SessionRecord{ID: id, State: session.StateActive}, nil
+		},
+	})
+	if _, _, err := executeRootCommand(
+		t,
+		deps,
+		"session",
+		"resume",
+		"--latest",
+		"--workspace",
+		"ws-alpha",
+		"-o",
+		"json",
+	); err != nil {
+		t.Fatalf("executeRootCommand(session resume --latest) error = %v", err)
+	}
+	if seenQuery.Workspace != "ws-alpha" || !seenQuery.Resumable ||
+		seenQuery.Sort != session.ListSortLastActivity || seenQuery.Limit != 1 {
+		t.Fatalf("latest query = %#v, want one resumable last-activity page", seenQuery)
+	}
+}
+
+func TestSessionPromptRendersReturnedEvents(t *testing.T) {
+	t.Parallel()
+
+	var (
+		promptID  string
+		promptMsg string
+	)
+
+	deps := newWorkspaceTestDeps(t, &stubClient{
+		sendSessionPromptFn: func(_ context.Context, id string, request SessionPromptRequest) (SessionPromptRecord, error) {
+			promptID = id
+			promptMsg = request.Message
+			return SessionPromptRecord{Events: []AgentEventRecord{{
+				SessionID: id,
+				TurnID:    "turn-1",
+				Type:      acp.EventTypeAgentMessage,
+				Timestamp: fixedTestNow,
+				Text:      "hello back",
+			}}}, nil
+		},
+	})
+
+	stdout, _, err := executeRootCommand(t, deps, "session", "prompt", "sess-1", "hello", "-o", "json")
+	if err != nil {
+		t.Fatalf("executeRootCommand() error = %v", err)
+	}
+	if promptID != "sess-1" || promptMsg != "hello" {
+		t.Fatalf("PromptSession() = (%q, %q), want (%q, %q)", promptID, promptMsg, "sess-1", "hello")
+	}
+
+	var decoded []AgentEventRecord
+	if err := json.Unmarshal([]byte(stdout), &decoded); err != nil {
+		t.Fatalf("json.Unmarshal() error = %v", err)
+	}
+	if len(decoded) != 1 || decoded[0].Text != "hello back" {
+		t.Fatalf("decoded = %#v, want one agent event", decoded)
+	}
+}
+
+func TestSessionPromptRendersStructuredGoalResult(t *testing.T) {
+	t.Parallel()
+
+	result := contract.GoalCommandResult{
+		Outcome: contract.GoalOutcomeStatus,
+		Snapshot: &contract.GoalSnapshot{
+			RunID: "run-goal", NodeID: "goal", Objective: "ship safely",
+			OriginSessionID: "sess-1", BoundSessionID: "sess-1",
+			Status: "active", RunStatus: contract.LoopRunStatusRunning,
+			TurnsUsed: 1, TurnLimit: 4, Live: true, ContractSummary: "objective satisfied",
+			Context: contract.GoalContextSnapshot{State: contract.GoalContextUnknown, NudgeRatio: 0.8},
+		},
+	}
+
+	t.Run("Should render a flat structured Goal status result", func(t *testing.T) {
+		t.Parallel()
+
+		deps := newWorkspaceTestDeps(t, &stubClient{
+			sendSessionPromptFn: func(
+				_ context.Context,
+				id string,
+				request SessionPromptRequest,
+			) (SessionPromptRecord, error) {
+				if id != "sess-1" || request.Message != "/goal status" {
+					t.Fatalf("SendSessionPrompt() = %q/%q", id, request.Message)
+				}
+				return SessionPromptRecord{
+					Prompt: SessionPromptResultRecord{
+						MessageID: "msg-goal-status", IdempotencyKey: "idem-goal-status",
+					},
+					Goal: &result,
+				}, nil
+			},
+		})
+
+		stdout, _, err := executeRootCommand(
+			t,
+			deps,
+			"session", "prompt", "sess-1", "/goal status", "-o", "json",
+		)
+		if err != nil {
+			t.Fatalf("executeRootCommand(session prompt Goal json) error = %v", err)
+		}
+		var decoded contract.GoalCommandResult
+		if err := json.Unmarshal([]byte(stdout), &decoded); err != nil {
+			t.Fatalf("json.Unmarshal(Goal command result) error = %v", err)
+		}
+		if decoded.Outcome != contract.GoalOutcomeStatus || decoded.Snapshot == nil ||
+			decoded.Snapshot.RunID != "run-goal" {
+			t.Fatalf("Goal command result = %#v", decoded)
+		}
+		var wrapped map[string]json.RawMessage
+		if err := json.Unmarshal([]byte(stdout), &wrapped); err != nil {
+			t.Fatalf("json.Unmarshal(Goal command object) error = %v", err)
+		}
+		if _, nested := wrapped["goal"]; nested {
+			t.Fatalf("Goal command JSON was nested: %s", stdout)
+		}
+		if string(wrapped["message_id"]) != `"msg-goal-status"` ||
+			string(wrapped["idempotency_key"]) != `"idem-goal-status"` {
+			t.Fatalf("Goal command JSON identity = %s", stdout)
+		}
+	})
+
+	t.Run("Should render durable Goal identities in human and TOON formats", func(t *testing.T) {
+		t.Parallel()
+
+		for _, tt := range []struct {
+			name     string
+			format   string
+			wantKeys []string
+		}{
+			{
+				name:     "Should render identities in human output",
+				format:   "human",
+				wantKeys: []string{"Message ID", "Idempotency Key", "msg-goal-status", "idem-goal-status"},
+			},
+			{
+				name:     "Should render identities in TOON output",
+				format:   "toon",
+				wantKeys: []string{"message_id", "idempotency_key", "msg-goal-status", "idem-goal-status"},
+			},
+		} {
+			t.Run(tt.name, func(t *testing.T) {
+				t.Parallel()
+
+				deps := newWorkspaceTestDeps(t, &stubClient{
+					sendSessionPromptFn: func(
+						context.Context,
+						string,
+						SessionPromptRequest,
+					) (SessionPromptRecord, error) {
+						return SessionPromptRecord{
+							Prompt: SessionPromptResultRecord{
+								MessageID: "msg-goal-status", IdempotencyKey: "idem-goal-status",
+							},
+							Goal: &result,
+						}, nil
+					},
+				})
+				stdout, _, err := executeRootCommand(
+					t,
+					deps,
+					"session", "prompt", "sess-1", "/goal status", "-o", tt.format,
+				)
+				if err != nil {
+					t.Fatalf("executeRootCommand(session prompt Goal %s) error = %v", tt.format, err)
+				}
+				for _, want := range tt.wantKeys {
+					if !strings.Contains(stdout, want) {
+						t.Fatalf("Goal command %s = %q, want %q", tt.format, stdout, want)
+					}
+				}
+			})
+		}
+	})
+
+	t.Run("Should surface Goal conflicts in structured formats", func(t *testing.T) {
+		t.Parallel()
+
+		for _, format := range []string{"json", "jsonl"} {
+			t.Run("Should render the conflict as "+format, func(t *testing.T) {
+				t.Parallel()
+
+				reason := contract.GoalReasonReplaceRequired
+				goalConflict := func() error {
+					return &goalCommandAPIError{
+						statusCode: 409,
+						status:     "Conflict",
+						result: contract.GoalCommandResult{
+							Outcome: contract.GoalOutcomeError, ReasonCode: &reason,
+						},
+					}
+				}
+				errorDeps := newWorkspaceTestDeps(t, &stubClient{
+					sendSessionPromptFn: func(
+						context.Context,
+						string,
+						SessionPromptRequest,
+					) (SessionPromptRecord, error) {
+						return SessionPromptRecord{}, goalConflict()
+					},
+					streamPromptSessionFn: func(
+						context.Context,
+						string,
+						SessionPromptRequest,
+						SSEHandler,
+					) error {
+						return goalConflict()
+					},
+				})
+				exitCode, _, stderr := executeRootCommandWithExit(
+					t,
+					errorDeps,
+					"session", "prompt", "sess-1", "/goal ship", "-o", format,
+				)
+				if exitCode == 0 {
+					t.Fatalf("Goal conflict %s exit code = 0", format)
+				}
+				var errorResult contract.GoalCommandResult
+				if err := json.Unmarshal([]byte(strings.TrimSpace(stderr)), &errorResult); err != nil {
+					t.Fatalf("json.Unmarshal(Goal conflict %s) error = %v; output=%q", format, err, stderr)
+				}
+				if errorResult.Outcome != contract.GoalOutcomeError || errorResult.ReasonCode == nil ||
+					*errorResult.ReasonCode != contract.GoalReasonReplaceRequired {
+					t.Fatalf("Goal conflict %s = %#v", format, errorResult)
+				}
+			})
+		}
+	})
+}
+
+func TestSessionPromptBusyInputActions(t *testing.T) {
+	t.Run("Should send explicit queue mode", func(t *testing.T) {
+		t.Parallel()
+
+		var gotRequest SessionPromptRequest
+		deps := newWorkspaceTestDeps(t, &stubClient{
+			sendSessionPromptFn: func(_ context.Context, id string, request SessionPromptRequest) (SessionPromptRecord, error) {
+				if id != "sess-1" {
+					t.Fatalf("SendSessionPrompt() id = %q, want sess-1", id)
+				}
+				gotRequest = request
+				return SessionPromptRecord{Prompt: SessionPromptResultRecord{
+					Status:          "queued",
+					Mode:            contract.PromptModeQueue,
+					Delivery:        contract.PromptDeliveryAfterTurn,
+					QueueEntryID:    "queue-1",
+					QueuePosition:   1,
+					QueueGeneration: 7,
+				}}, nil
+			},
+		})
+
+		stdout, _, err := executeRootCommand(t, deps, "session", "prompt", "sess-1", "hello", "--queue", "-o", "json")
+		if err != nil {
+			t.Fatalf("executeRootCommand(session prompt --queue) error = %v", err)
+		}
+		if gotRequest.Message != "hello" || gotRequest.Mode != contract.PromptModeQueue ||
+			gotRequest.MessageID == "" || gotRequest.IdempotencyKey == "" {
+			t.Fatalf("SendSessionPrompt() request = %#v, want queue hello", gotRequest)
+		}
+		var decoded SessionPromptRecord
+		if err := json.Unmarshal([]byte(stdout), &decoded); err != nil {
+			t.Fatalf("json.Unmarshal(queue prompt) error = %v", err)
+		}
+		if decoded.Prompt.QueueEntryID != "queue-1" ||
+			decoded.Prompt.Delivery != contract.PromptDeliveryAfterTurn {
+			t.Fatalf("decoded = %#v, want queued prompt result", decoded)
+		}
+	})
+
+	t.Run("Should send explicit interrupt mode", func(t *testing.T) {
+		t.Parallel()
+
+		var gotRequest SessionPromptRequest
+		deps := newWorkspaceTestDeps(t, &stubClient{
+			sendSessionPromptFn: func(_ context.Context, id string, request SessionPromptRequest) (SessionPromptRecord, error) {
+				if id != "sess-1" {
+					t.Fatalf("SendSessionPrompt() id = %q, want sess-1", id)
+				}
+				gotRequest = request
+				return SessionPromptRecord{Prompt: SessionPromptResultRecord{
+					Status:    "interrupting",
+					Mode:      contract.PromptModeInterrupt,
+					Delivery:  contract.PromptDeliveryInterruptThenPrompt,
+					NewTurnID: "turn-2",
+				}}, nil
+			},
+		})
+
+		_, _, err := executeRootCommand(
+			t,
+			deps,
+			"session",
+			"prompt",
+			"sess-1",
+			"replace",
+			"--interrupt",
+			"--expected-turn",
+			"turn-1",
+		)
+		if err != nil {
+			t.Fatalf("executeRootCommand(session prompt --interrupt) error = %v", err)
+		}
+		if gotRequest.Message != "replace" || gotRequest.Mode != contract.PromptModeInterrupt ||
+			gotRequest.ExpectedTurnID != "turn-1" ||
+			gotRequest.MessageID == "" || gotRequest.IdempotencyKey == "" {
+			t.Fatalf("SendSessionPrompt() request = %#v, want interrupt replace", gotRequest)
+		}
+	})
+
+	t.Run("Should delegate an omitted interrupt fence to the daemon", func(t *testing.T) {
+		t.Parallel()
+		called := false
+		deps := newWorkspaceTestDeps(t, &stubClient{
+			sendSessionPromptFn: func(_ context.Context, _ string, request SessionPromptRequest) (SessionPromptRecord, error) {
+				called = true
+				if request.ExpectedTurnID != "" {
+					t.Fatalf("fence = %q, want automatic daemon resolution", request.ExpectedTurnID)
+				}
+				return SessionPromptRecord{}, nil
+			},
+		})
+		_, _, err := executeRootCommand(t, deps, "session", "prompt", "sess-1", "change direction", "--interrupt")
+		if err != nil || !called {
+			t.Fatalf("automatic interrupt fence: called=%t, error=%v", called, err)
+		}
+	})
+
+	for _, tc := range []struct {
+		name, wantError string
+		args            []string
+	}{
+		{
+			name: "Should reject an empty attachment path", wantError: "--attachment path must not be blank",
+			args: []string{"--attachment", ""},
+		},
+		{
+			name:      "Should reject a blank later attachment before uploading any file",
+			wantError: "--attachment path must not be blank",
+			args:      []string{"--attachment", "screen.png", "--attachment", "  "},
+		},
+		{
+			name:      "Should reject JSONL steer before uploading files",
+			wantError: "busy-input prompt actions do not support jsonl output",
+			args:      []string{"--steer", "-o", "jsonl", "--attachment", "screen.png"},
+		},
+		{
+			name:      "Should reject JSONL queue before uploading files",
+			wantError: "busy-input prompt actions do not support jsonl output",
+			args:      []string{"--queue", "-o", "jsonl", "--attachment", "screen.png"},
+		},
+		{
+			name:      "Should reject JSONL interrupt before uploading files",
+			wantError: "busy-input prompt actions do not support jsonl output",
+			args:      []string{"--interrupt", "-o", "jsonl", "--attachment", "screen.png"},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			uploads := 0
+			deps := newWorkspaceTestDeps(t, &stubClient{
+				uploadSessionAttachmentFn: func(context.Context, string, string) (SessionAttachmentRecord, error) {
+					uploads++
+					return SessionAttachmentRecord{ID: "att-image"}, nil
+				},
+			})
+			args := append([]string{"session", "prompt", "sess-1", "hello"}, tc.args...)
+			_, _, err := executeRootCommand(t, deps, args...)
+			if err == nil || !strings.Contains(err.Error(), tc.wantError) {
+				t.Fatalf("prompt error = %v, want %q", err, tc.wantError)
+			}
+			if uploads != 0 {
+				t.Fatalf("invalid prompt uploaded %d files", uploads)
+			}
+		})
+	}
+
+	t.Run("Should use steer endpoint", func(t *testing.T) {
+		t.Parallel()
+
+		var (
+			gotID             string
+			gotText           string
+			gotMessageID      string
+			gotIdempotencyKey string
+			gotExpectedTurnID string
+		)
+		deps := newWorkspaceTestDeps(t, &stubClient{
+			uploadSessionAttachmentFn: func(_ context.Context, id, path string) (SessionAttachmentRecord, error) {
+				if id != "sess-1" || path != "screen.png" {
+					t.Fatalf("unexpected upload %q/%q", id, path)
+				}
+				return SessionAttachmentRecord{
+					ID:       "att-image",
+					Name:     "screen.png",
+					MIMEType: "image/png",
+					Kind:     "image",
+					Bytes:    42,
+				}, nil
+			},
+			steerSessionPromptFn: func(
+				_ context.Context,
+				id string,
+				request contract.SteerPromptRequest,
+			) (SessionPromptRecord, error) {
+				if len(request.Attachments) != 1 || request.Attachments[0].ID != "att-image" ||
+					request.Attachments[0].Bytes != 42 {
+					t.Fatalf("steer attachments = %#v", request.Attachments)
+				}
+				gotID = id
+				gotText = request.Text
+				gotMessageID = request.MessageID
+				gotIdempotencyKey = request.IdempotencyKey
+				gotExpectedTurnID = request.ExpectedTurnID
+				return SessionPromptRecord{Prompt: SessionPromptResultRecord{
+					Status:          "steering",
+					Mode:            contract.PromptModeSteer,
+					Delivery:        contract.PromptDeliveryInterruptThenPrompt,
+					QueueEntryID:    "steer-1",
+					QueueGeneration: 3,
+				}}, nil
+			},
+		})
+
+		_, _, err := executeRootCommand(
+			t,
+			deps,
+			"session",
+			"prompt",
+			"sess-1",
+			"prefer small patch",
+			"--steer", "--attachment", " screen.png ",
+			"--expected-turn-id",
+			"turn-1",
+		)
+		if err != nil {
+			t.Fatalf("executeRootCommand(session prompt --steer) error = %v", err)
+		}
+		if gotID != "sess-1" || gotText != "prefer small patch" || gotMessageID == "" || gotIdempotencyKey == "" {
+			t.Fatalf("SteerSessionPrompt() = (%q, %q), want (sess-1, prefer small patch)", gotID, gotText)
+		}
+		if gotExpectedTurnID != "turn-1" {
+			t.Fatalf("SteerSessionPrompt() expected turn = %q, want turn-1", gotExpectedTurnID)
+		}
+	})
+
+	t.Run("Should delegate an omitted steer fence to the daemon", func(t *testing.T) {
+		t.Parallel()
+		called := false
+		deps := newWorkspaceTestDeps(t, &stubClient{
+			steerSessionPromptFn: func(_ context.Context, _ string, request contract.SteerPromptRequest) (SessionPromptRecord, error) {
+				called = true
+				if request.ExpectedTurnID != "" {
+					t.Fatalf("fence = %q, want automatic daemon resolution", request.ExpectedTurnID)
+				}
+				return SessionPromptRecord{}, nil
+			},
+		})
+		_, _, err := executeRootCommand(t, deps, "session", "prompt", "sess-1", "change direction", "--steer")
+		if err != nil || !called {
+			t.Fatalf("automatic steer fence: called=%t, error=%v", called, err)
+		}
+	})
+
+	t.Run("Should reject mutually exclusive busy actions", func(t *testing.T) {
+		t.Parallel()
+
+		deps := newWorkspaceTestDeps(t, &stubClient{})
+		_, _, err := executeRootCommand(t, deps, "session", "prompt", "sess-1", "hello", "--queue", "--steer")
+		if err == nil || !strings.Contains(err.Error(), "choose only one") {
+			t.Fatalf("executeRootCommand(mutually exclusive) error = %v, want choose only one", err)
+		}
+	})
+
+	for _, tt := range []struct {
+		name string
+		args []string
+	}{
+		{
+			name: "Should reject runtime selection with steer",
+			args: []string{
+				"session", "prompt", "sess-1", "hello", "--steer", "--expected-turn-id", "turn-1", "--provider", "codex",
+			},
+		},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			deps := newWorkspaceTestDeps(t, &stubClient{})
+			_, _, err := executeRootCommand(t, deps, tt.args...)
+			if err == nil || !strings.Contains(err.Error(), "runtime selection applies only to submitted prompts") {
+				t.Fatalf("executeRootCommand(%#v) error = %v, want runtime selection rejection", tt.args, err)
+			}
+		})
+	}
+}
+
+func TestSessionInputCommands(t *testing.T) {
+	t.Parallel()
+	t.Run("Should show operator and session authors in the input list", func(t *testing.T) {
+		t.Parallel()
+		client := &stubClient{listSessionInputsFn: func(context.Context, string) (SessionInputListRecord, error) {
+			return SessionInputListRecord{Inputs: []SessionInputRecord{
+				{ID: "operator", Text: "operator text"},
+				{
+					ID:   "agent",
+					Text: "agent text",
+					Origin: &contract.PromptOriginMeta{
+						Kind:        "session",
+						SessionID:   "sender",
+						TitleAtSend: "Refactor billing",
+					},
+				},
+			}}, nil
+		}}
+		stdout, _, err := executeRootCommand(t, newWorkspaceTestDeps(t, client), "session", "input", "list", "sess-1")
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, want := range []string{"FROM", "you", "Refactor billing (sender)"} {
+			if !strings.Contains(stdout, want) {
+				t.Fatalf("missing %q in %s", want, stdout)
+			}
+		}
+	})
+	t.Run("Should clear input and print complete per-entry JSON outcomes", func(t *testing.T) {
+		t.Parallel()
+		client := &stubClient{
+			clearSessionInputsFn: func(_ context.Context, id string) (contract.SessionInputClearResponse, error) {
+				if id != "sess-1" {
+					t.Fatalf("clear target = %q", id)
+				}
+				return contract.SessionInputClearResponse{
+					ClearedCount: 1, QueueGeneration: 4,
+					Inputs: []contract.SessionInputPayload{{ID: "entry-1", Status: contract.SessionInputCanceled}},
+				}, nil
+			},
+		}
+		stdout, _, err := executeRootCommand(t, newWorkspaceTestDeps(t, client),
+			"session", "input", "clear", "sess-1", "-o", "json")
+		if err != nil {
+			t.Fatal(err)
+		}
+		var result contract.SessionInputClearResponse
+		if err := json.Unmarshal([]byte(stdout), &result); err != nil {
+			t.Fatal(err)
+		}
+		if result.ClearedCount != 1 || result.QueueGeneration != 4 || len(result.Inputs) != 1 ||
+			result.Inputs[0].ID != "entry-1" {
+			t.Fatalf("clear JSON = %#v", result)
+		}
+	})
+
+	t.Run("Should list pending input with structured output", func(t *testing.T) {
+		t.Parallel()
+
+		client := &profileTestDaemonClient{
+			DaemonClient: withWorkspaceResolution(&stubClient{
+				listSessionInputsFn: func(ctx context.Context, sessionID string) (SessionInputListRecord, error) {
+					if sessionID != "sess-1" {
+						t.Fatalf("ListSessionInputs() session = %q, want sess-1", sessionID)
+					}
+					if got := profileQueryValues(ctx, nil).Get(profileFlagName); got != "marketing" {
+						t.Fatalf("ListSessionInputs() profile query = %q, want marketing", got)
+					}
+					return SessionInputListRecord{Inputs: []SessionInputRecord{{
+						ID: "queue-1", SessionID: "sess-1", Status: "queued", Mode: contract.PromptModeQueue,
+						Delivery: contract.PromptDeliveryAfterTurn, Text: "Run the focused test first.",
+					}}}, nil
+				},
+			}),
+			profileClientAPI: &profileClientStub{profiles: []contract.Profile{
+				{Name: "default", State: "active"},
+				{Name: "marketing", State: "active"},
+			}},
+		}
+		deps := newWorkspaceTestDeps(t, client)
+
+		stdout, _, err := executeRootCommand(
+			t,
+			deps,
+			"--profile",
+			"marketing",
+			"session",
+			"input",
+			"list",
+			"sess-1",
+			"-o",
+			"json",
+		)
+		if err != nil {
+			t.Fatalf("executeRootCommand(session input list) error = %v", err)
+		}
+		var decoded SessionInputListRecord
+		if err := json.Unmarshal([]byte(stdout), &decoded); err != nil {
+			t.Fatalf("json.Unmarshal(session input list) error = %v", err)
+		}
+		if len(decoded.Inputs) != 1 || decoded.Inputs[0].ID != "queue-1" {
+			t.Fatalf("session input list = %#v, want queue-1", decoded)
+		}
+	})
+
+	t.Run("Should replace queued input with a durable identity", func(t *testing.T) {
+		t.Parallel()
+
+		var received ReplaceSessionInputRequest
+		deps := newDefaultProfileWorkspaceTestDeps(t, &stubClient{
+			replaceSessionInputFn: func(
+				ctx context.Context,
+				sessionID string,
+				inputID string,
+				request ReplaceSessionInputRequest,
+			) (SessionInputRecord, error) {
+				if sessionID != "sess-1" || inputID != "queue-1" {
+					t.Fatalf("ReplaceSessionInput() target = %q/%q, want sess-1/queue-1", sessionID, inputID)
+				}
+				if got := profileQueryValues(ctx, nil).Get(profileFlagName); got != "default" {
+					t.Fatalf("ReplaceSessionInput() profile query = %q, want default", got)
+				}
+				received = request
+				return SessionInputRecord{
+					ID:             inputID,
+					SessionID:      sessionID,
+					MessageID:      request.MessageID,
+					IdempotencyKey: request.IdempotencyKey,
+					Status:         "queued",
+					Mode:           contract.PromptModeQueue,
+					Delivery:       contract.PromptDeliveryAfterTurn,
+					Text:           request.Text,
+				}, nil
+			},
+		})
+
+		stdout, _, err := executeRootCommand(
+			t,
+			deps,
+			"session",
+			"input",
+			"edit",
+			"sess-1",
+			"queue-1",
+			"Run the focused test first.",
+			"-o",
+			"json",
+		)
+		if err != nil {
+			t.Fatalf("executeRootCommand(session input edit) error = %v", err)
+		}
+		if received.MessageID == "" || received.IdempotencyKey == "" || received.Text != "Run the focused test first." {
+			t.Fatalf("ReplaceSessionInput() request = %#v", received)
+		}
+		var decoded struct {
+			Input SessionInputRecord `json:"input"`
+		}
+		if err := json.Unmarshal([]byte(stdout), &decoded); err != nil {
+			t.Fatalf("json.Unmarshal(session input edit) error = %v", err)
+		}
+		if decoded.Input.ID != "queue-1" || decoded.Input.Text != received.Text {
+			t.Fatalf("session input edit = %#v", decoded)
+		}
+	})
+
+	t.Run("Should promote queued input with an active turn fence", func(t *testing.T) {
+		t.Parallel()
+
+		var received PromoteSessionInputRequest
+		deps := newDefaultProfileWorkspaceTestDeps(t, &stubClient{
+			promoteSessionInputFn: func(
+				_ context.Context,
+				sessionID string,
+				inputID string,
+				request PromoteSessionInputRequest,
+			) (SessionPromptRecord, error) {
+				if sessionID != "sess-1" || inputID != "queue-1" {
+					t.Fatalf("PromoteSessionInput() target = %q/%q, want sess-1/queue-1", sessionID, inputID)
+				}
+				received = request
+				return SessionPromptRecord{Prompt: SessionPromptResultRecord{
+					Status: "steering", Mode: contract.PromptModeSteer,
+					Delivery:     contract.PromptDeliveryInterruptThenPrompt,
+					QueueEntryID: inputID,
+				}}, nil
+			},
+		})
+
+		stdout, _, err := executeRootCommand(
+			t,
+			deps,
+			"session",
+			"input",
+			"steer",
+			"sess-1",
+			"queue-1",
+			"Prefer the smaller patch.",
+			"--expected-turn-id",
+			"turn-1",
+			"-o",
+			"json",
+		)
+		if err != nil {
+			t.Fatalf("executeRootCommand(session input steer) error = %v", err)
+		}
+		if received.ExpectedTurnID != "turn-1" || received.MessageID == "" || received.IdempotencyKey == "" {
+			t.Fatalf("PromoteSessionInput() request = %#v", received)
+		}
+		var decoded SessionPromptRecord
+		if err := json.Unmarshal([]byte(stdout), &decoded); err != nil {
+			t.Fatalf("json.Unmarshal(session input steer) error = %v", err)
+		}
+		if decoded.Prompt.Delivery != contract.PromptDeliveryInterruptThenPrompt {
+			t.Fatalf(
+				"session input steer delivery = %q, want %q",
+				decoded.Prompt.Delivery,
+				contract.PromptDeliveryInterruptThenPrompt,
+			)
+		}
+	})
+
+	t.Run("Should resolve an omitted active turn fence when promoting input", func(t *testing.T) {
+		t.Parallel()
+
+		called := false
+		deps := newDefaultProfileWorkspaceTestDeps(t, &stubClient{
+			promoteSessionInputFn: func(
+				_ context.Context,
+				_ string,
+				_ string,
+				request PromoteSessionInputRequest,
+			) (SessionPromptRecord, error) {
+				called = true
+				if request.ExpectedTurnID != "" {
+					t.Fatalf("expected fence = %q, want automatic resolution", request.ExpectedTurnID)
+				}
+				return SessionPromptRecord{}, nil
+			},
+		})
+
+		_, _, err := executeRootCommand(
+			t,
+			deps,
+			"session",
+			"input",
+			"steer",
+			"sess-1",
+			"queue-1",
+			"Prefer the smaller patch.",
+		)
+		if err != nil || !called {
+			t.Fatalf("automatic promotion called=%v, error=%v", called, err)
+		}
+	})
+
+	t.Run("Should cancel queued input through the input surface", func(t *testing.T) {
+		t.Parallel()
+
+		deps := newDefaultProfileWorkspaceTestDeps(t, &stubClient{
+			cancelSessionInputFn: func(_ context.Context, sessionID string, inputID string) (SessionPromptRecord, error) {
+				if sessionID != "sess-1" || inputID != "queue-1" {
+					t.Fatalf("CancelSessionInput() target = %q/%q, want sess-1/queue-1", sessionID, inputID)
+				}
+				return SessionPromptRecord{Prompt: SessionPromptResultRecord{
+					Status: "canceled", QueueEntryID: inputID,
+				}}, nil
+			},
+		})
+
+		_, _, err := executeRootCommand(t, deps, "session", "input", "cancel", "sess-1", "queue-1")
+		if err != nil {
+			t.Fatalf("executeRootCommand(session input cancel) error = %v", err)
+		}
+	})
+
+	t.Run("Should cancel the active prompt through the direct verb", func(t *testing.T) {
+		t.Parallel()
+
+		deps := newWorkspaceTestDeps(t, &stubClient{
+			getSessionFn: func(context.Context, string) (SessionRecord, error) {
+				return SessionRecord{ID: "sess-1", WorkspaceID: "ws-1"}, nil
+			},
+			cancelSessionPromptFn: func(
+				_ context.Context,
+				sessionID string,
+			) (SessionPromptCancelRecord, error) {
+				if sessionID != "sess-1" {
+					t.Fatalf("CancelSessionPrompt() id = %q, want sess-1", sessionID)
+				}
+				return SessionPromptCancelRecord{
+					SessionID: sessionID, Outcome: "canceled", TurnID: "turn-1",
+				}, nil
+			},
+		})
+		stdout, _, err := executeRootCommand(
+			t,
+			deps,
+			"session",
+			"prompt-cancel",
+			"sess-1",
+			"-o",
+			"json",
+		)
+		if err != nil {
+			t.Fatalf("executeRootCommand(session prompt-cancel) error = %v", err)
+		}
+		var decoded SessionPromptCancelRecord
+		if err := json.Unmarshal([]byte(stdout), &decoded); err != nil {
+			t.Fatalf("json.Unmarshal(prompt cancel) error = %v", err)
+		}
+		if decoded.Outcome != "canceled" || decoded.TurnID != "turn-1" {
+			t.Fatalf("prompt cancel payload = %#v, want canceled turn", decoded)
+		}
+	})
+
+	t.Run("Should return exit 66 when no prompt is active", func(t *testing.T) {
+		t.Parallel()
+
+		deps := newWorkspaceTestDeps(t, &stubClient{
+			getSessionFn: func(context.Context, string) (SessionRecord, error) {
+				return SessionRecord{ID: "sess-1", WorkspaceID: "ws-1"}, nil
+			},
+			cancelSessionPromptFn: func(
+				_ context.Context,
+				sessionID string,
+			) (SessionPromptCancelRecord, error) {
+				return SessionPromptCancelRecord{
+					SessionID: sessionID, Outcome: "nothing-in-flight",
+				}, nil
+			},
+		})
+		stdout, _, err := executeRootCommand(
+			t,
+			deps,
+			"session",
+			"prompt-cancel",
+			"sess-1",
+			"-o",
+			"json",
+		)
+		if err == nil || cliExitCodeForError(err) != 66 {
+			t.Fatalf("prompt cancel error = %v, exit = %d, want 66", err, cliExitCodeForError(err))
+		}
+		var decoded SessionPromptCancelRecord
+		if err := json.Unmarshal([]byte(stdout), &decoded); err != nil {
+			t.Fatalf("json.Unmarshal(prompt cancel) error = %v", err)
+		}
+		if decoded.Outcome != "nothing-in-flight" {
+			t.Fatalf("prompt cancel payload = %#v, want nothing-in-flight", decoded)
+		}
+	})
+}
+
+func TestSessionPromptJSONLOutput(t *testing.T) {
+	t.Run("Should stream prompt events as JSONL without buffering the completed turn", func(t *testing.T) {
+		t.Parallel()
+
+		var streamCalled bool
+		deps := newWorkspaceTestDeps(t, &stubClient{
+			promptSessionFn: func(context.Context, string, string) ([]AgentEventRecord, error) {
+				t.Fatal("PromptSession should not be called for prompt -o jsonl")
+				return nil, nil
+			},
+			streamPromptSessionFn: func(
+				_ context.Context,
+				id string,
+				request SessionPromptRequest,
+				handler SSEHandler,
+			) error {
+				streamCalled = true
+				if id != "sess-1" || request.Message != "hello" {
+					t.Fatalf("StreamPromptSession() = (%q, %#v), want sess-1/hello", id, request)
+				}
+				if request.MessageID == "" || request.IdempotencyKey == "" {
+					t.Fatalf(
+						"StreamPromptSession() identity = %q/%q, want generated non-empty values",
+						request.MessageID,
+						request.IdempotencyKey,
+					)
+				}
+				if request.Runtime == nil || request.Runtime.Provider != "codex" ||
+					request.Runtime.Model != "gpt-5.6-sol" {
+					t.Fatalf("StreamPromptSession() runtime = %#v, want codex/gpt-5.6-sol", request.Runtime)
+				}
+				events := []SSEEvent{
+					{
+						Data: mustJSON(t, map[string]any{
+							"type":      "start",
+							"messageId": "turn-1",
+						}),
+					},
+					{
+						Data: mustJSON(t, map[string]any{
+							"type": "text-start",
+							"id":   "turn-1-text",
+						}),
+					},
+					{
+						Data: mustJSON(t, map[string]any{
+							"type":  "text-delta",
+							"id":    "turn-1-text",
+							"delta": "hello back",
+						}),
+					},
+					{
+						Data: mustJSON(t, map[string]any{
+							"type": "text-end",
+							"id":   "turn-1-text",
+						}),
+					},
+					{
+						Data: mustJSON(t, map[string]any{
+							"type":         "finish",
+							"finishReason": "stop",
+						}),
+					},
+					{
+						Data: []byte("[DONE]"),
+					},
+				}
+				for _, event := range events {
+					if err := handler(event); err != nil {
+						return err
+					}
+				}
+				return nil
+			},
+		})
+
+		stdout, _, err := executeRootCommand(
+			t,
+			deps,
+			"session", "prompt", "sess-1", "hello",
+			"--provider", "codex", "--model", "gpt-5.6-sol",
+			"-o", "jsonl",
+		)
+		if err != nil {
+			t.Fatalf("executeRootCommand(session prompt jsonl) error = %v", err)
+		}
+		if !streamCalled {
+			t.Fatal("StreamPromptSession was not called")
+		}
+
+		lines := strings.Split(strings.TrimSpace(stdout), "\n")
+		if len(lines) != 5 {
+			t.Fatalf("jsonl line count = %d, want 5; output=%q", len(lines), stdout)
+		}
+		partTypes := make([]string, 0, len(lines))
+		for _, line := range lines {
+			var payload map[string]any
+			if err := json.Unmarshal([]byte(line), &payload); err != nil {
+				t.Fatalf("json.Unmarshal(prompt jsonl line) error = %v; line=%s", err, line)
+			}
+			partType, ok := payload["type"].(string)
+			if !ok {
+				t.Fatalf("prompt jsonl line missing type: %#v", payload)
+			}
+			partTypes = append(partTypes, partType)
+		}
+		wantTypes := []string{"start", "text-start", "text-delta", "text-end", "finish"}
+		if !reflect.DeepEqual(partTypes, wantTypes) {
+			t.Fatalf("prompt jsonl part types = %#v, want %#v", partTypes, wantTypes)
+		}
+	})
+
+	t.Run("Should keep emitted JSONL frames and return a nonzero command error", func(t *testing.T) {
+		t.Parallel()
+
+		streamErr := errors.New("peer disconnected before response")
+		deps := newWorkspaceTestDeps(t, &stubClient{
+			streamPromptSessionFn: func(
+				_ context.Context,
+				_ string,
+				_ SessionPromptRequest,
+				handler SSEHandler,
+			) error {
+				for _, event := range []SSEEvent{
+					{Data: mustJSON(t, map[string]any{
+						"type":  "text-delta",
+						"id":    "turn-1-text",
+						"delta": "partial before disconnect",
+					})},
+					{Data: mustJSON(t, map[string]any{
+						"type":      "error",
+						"errorText": streamErr.Error(),
+					})},
+				} {
+					if err := handler(event); err != nil {
+						return err
+					}
+				}
+				return streamErr
+			},
+		})
+
+		stdout, _, err := executeRootCommand(
+			t,
+			deps,
+			"session", "prompt", "sess-1", "hello", "-o", "jsonl",
+		)
+		if !errors.Is(err, streamErr) {
+			t.Fatalf("executeRootCommand(session prompt jsonl) error = %v, want %v", err, streamErr)
+		}
+		lines := strings.Split(strings.TrimSpace(stdout), "\n")
+		if got, want := len(lines), 2; got != want {
+			t.Fatalf("session prompt jsonl lines = %d, want %d; output=%q", got, want, stdout)
+		}
+		if !strings.Contains(lines[0], "partial before disconnect") ||
+			!strings.Contains(lines[1], "peer disconnected before response") {
+			t.Fatalf("session prompt jsonl output = %q, want partial chunk and terminal error", stdout)
+		}
+	})
+
+	t.Run("Should emit one direct line for a structured Goal result", func(t *testing.T) {
+		t.Parallel()
+
+		result := contract.SendPromptResultResponse{Prompt: contract.SendPromptResultPayload{
+			Status: "accepted", MessageID: "msg-goal-clear", IdempotencyKey: "idem-goal-clear",
+			Goal: &contract.GoalCommandResult{Outcome: contract.GoalOutcomeCleared},
+		}}
+		deps := newWorkspaceTestDeps(t, &stubClient{
+			streamPromptSessionFn: func(
+				_ context.Context,
+				id string,
+				request SessionPromptRequest,
+				handler SSEHandler,
+			) error {
+				if id != "sess-1" || request.Message != "/goal clear" {
+					t.Fatalf("StreamPromptSession() = %q/%#v", id, request)
+				}
+				return handler(SSEEvent{Event: promptResultEventName, Data: mustJSON(t, result)})
+			},
+		})
+
+		stdout, _, err := executeRootCommand(
+			t,
+			deps,
+			"session", "prompt", "sess-1", "/goal clear", "-o", "jsonl",
+		)
+		if err != nil {
+			t.Fatalf("executeRootCommand(session prompt Goal jsonl) error = %v", err)
+		}
+		lines := strings.Split(strings.TrimSpace(stdout), "\n")
+		if len(lines) != 1 {
+			t.Fatalf("Goal prompt jsonl lines = %d, output=%q", len(lines), stdout)
+		}
+		var decoded contract.SendPromptResultResponse
+		if err := json.Unmarshal([]byte(lines[0]), &decoded); err != nil {
+			t.Fatalf("json.Unmarshal(Goal prompt jsonl) error = %v", err)
+		}
+		if decoded.Prompt.Goal == nil || decoded.Prompt.Goal.Outcome != contract.GoalOutcomeCleared ||
+			decoded.Prompt.MessageID != "msg-goal-clear" || decoded.Prompt.IdempotencyKey != "idem-goal-clear" {
+			t.Fatalf("Goal prompt jsonl = %#v", decoded)
+		}
+	})
+}
+
+func TestSessionListBundleRendersHumanAndToon(t *testing.T) {
+	t.Parallel()
+
+	items := []SessionRecord{{
+		ID:          "sess-1",
+		ProfileName: "default",
+		Name:        "demo",
+		AgentName:   "coder",
+		Runtime: contract.SessionRuntimePayload{Effective: &contract.RuntimeSelectionPayload{
+			Provider: "fake",
+		}},
+		WorkspaceID:   "ws-1",
+		WorkspacePath: "/workspace/project",
+
+		State: session.StateActive,
+		Health: &contract.SessionHealthPayload{
+			State:  contract.SessionHealthStateIdle,
+			Health: contract.SessionHealthHealthy,
+		},
+		UpdatedAt: fixedTestNow,
+	}}
+
+	bundle := sessionListBundle(SessionListPage{
+		Sessions: items,
+		Page: contract.CountedCursorPagePayload{
+			NextCursor: "cursor-next",
+			HasMore:    true,
+			Total:      4,
+			Limit:      len(items),
+		},
+	}, func() time.Time {
+		return fixedTestNow.Add(time.Hour)
+	})
+
+	human, err := bundle.human()
+	if err != nil {
+		t.Fatalf("sessionListBundle().human() error = %v", err)
+	}
+	if !strings.Contains(human, "sess-1") ||
+		!strings.Contains(human, "default") ||
+		!strings.Contains(strings.ToLower(human), "provider") ||
+		!strings.Contains(human, "fake") ||
+		!strings.Contains(human, "/workspace/project") ||
+		!strings.Contains(human, "idle") ||
+		!strings.Contains(human, "healthy") || !strings.Contains(human, "cursor-next") {
+		t.Fatalf("sessionListBundle().human() = %q, want session, workspace, provider, and health output", human)
+	}
+
+	toon, err := bundle.toon()
+	if err != nil {
+		t.Fatalf("sessionListBundle().toon() error = %v", err)
+	}
+	if !strings.Contains(toon, "sessions") ||
+		!strings.Contains(toon, "sess-1") ||
+		!strings.Contains(toon, "default") ||
+		!strings.Contains(strings.ToLower(toon), "provider") ||
+		!strings.Contains(toon, "fake") ||
+		!strings.Contains(toon, "idle") ||
+		!strings.Contains(toon, "healthy") || !strings.Contains(toon, "cursor-next") ||
+		!strings.Contains(toon, "has_more") {
+		t.Fatalf("sessionListBundle().toon() = %q, want sessions array output with provider and health", toon)
+	}
+}
+
+func TestSessionBundleRendersProviderInHumanAndToon(t *testing.T) {
+	t.Parallel()
+
+	bundle := sessionBundle(&SessionRecord{
+		ID:        "sess-1",
+		Name:      "demo",
+		AgentName: "coder",
+		Runtime: contract.SessionRuntimePayload{Effective: &contract.RuntimeSelectionPayload{
+			Provider: "fake",
+			Speed:    contract.SpeedFast,
+			SpeedResolution: &contract.SpeedResolution{
+				Requested: contract.SpeedFast,
+				Status:    contract.SpeedResolutionUnsupported,
+				Reason:    contract.SpeedResolutionReasonCapabilityAbsent,
+			},
+		}},
+		WorkspaceID:   "ws-1",
+		WorkspacePath: "/workspace/project",
+		State:         session.StateActive,
+		CreatedAt:     fixedTestNow,
+		UpdatedAt:     fixedTestNow,
+	}, func() time.Time {
+		return fixedTestNow.Add(time.Minute)
+	})
+
+	human, err := bundle.human()
+	if err != nil {
+		t.Fatalf("sessionBundle().human() error = %v", err)
+	}
+	if !strings.Contains(strings.ToLower(human), "provider") ||
+		!strings.Contains(human, "fake") ||
+		!strings.Contains(human, "fast") ||
+		!strings.Contains(human, "unsupported:capability_absent") {
+		t.Fatalf("sessionBundle().human() = %q, want provider and speed output", human)
+	}
+
+	toon, err := bundle.toon()
+	if err != nil {
+		t.Fatalf("sessionBundle().toon() error = %v", err)
+	}
+	if !strings.Contains(strings.ToLower(toon), "provider") ||
+		!strings.Contains(toon, "fake") ||
+		!strings.Contains(toon, "fast") ||
+		!strings.Contains(toon, "unsupported:capability_absent") {
+		t.Fatalf("sessionBundle().toon() = %q, want provider and speed output", toon)
+	}
+}
+
+// Invariant IT-040: CLI navigation preserves query bounds and shared JSON envelopes.
+// Owner: CLI session commands; canonical session_test.go suite.
+func TestSessionNavigationCommands(t *testing.T) {
+	t.Parallel()
+	t.Run("Should forward literal search and preserve truncation in JSON", func(t *testing.T) {
+		t.Parallel()
+		deps := newWorkspaceTestDeps(
+			t,
+			&stubClient{
+				searchSessionTranscriptFn: func(_ context.Context, id string, q transcript.SearchQuery) (contract.SessionTranscriptSearchResponse, error) {
+					if id != "sess-1" || q.Query != "Café 100%" || q.Limit != 2 {
+						t.Fatalf("search = %q %#v", id, q)
+					}
+					return contract.SessionTranscriptSearchResponse{
+						Matches: []transcript.SearchMatch{
+							{Sequence: 7, TurnID: "turn-1", Role: "assistant", Snippet: "Café 100%"},
+						},
+						Truncated: true,
+					}, nil
+				},
+			},
+		)
+		stdout, _, err := executeRootCommand(
+			t,
+			deps,
+			"session",
+			"search",
+			"sess-1",
+			"Café 100%",
+			"--limit",
+			"2",
+			"-o",
+			"json",
+		)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var result contract.SessionTranscriptSearchResponse
+		if err := json.Unmarshal([]byte(stdout), &result); err != nil {
+			t.Fatal(err)
+		}
+		if !result.Truncated || len(result.Matches) != 1 || result.Matches[0].Sequence != 7 {
+			t.Fatalf("search JSON = %s", stdout)
+		}
+	})
+	t.Run("Should return the complete outline envelope", func(t *testing.T) {
+		t.Parallel()
+		deps := newWorkspaceTestDeps(
+			t,
+			&stubClient{
+				getSessionOutlineFn: func(_ context.Context, id string) (contract.SessionTranscriptOutlineResponse, error) {
+					if id != "sess-1" {
+						t.Fatalf("outline id = %q", id)
+					}
+					return contract.SessionTranscriptOutlineResponse{
+						Entries: []transcript.OutlineEntry{
+							{
+								Sequence:     1,
+								TurnID:       "turn-1",
+								Preview:      "question",
+								ReplyPreview: "reply",
+								At:           fixedTestNow,
+							},
+						},
+					}, nil
+				},
+			},
+		)
+		stdout, _, err := executeRootCommand(t, deps, "session", "outline", "sess-1", "-o", "json")
+		if err != nil {
+			t.Fatal(err)
+		}
+		var result contract.SessionTranscriptOutlineResponse
+		if err := json.Unmarshal([]byte(stdout), &result); err != nil {
+			t.Fatal(err)
+		}
+		if len(result.Entries) != 1 || result.Entries[0].ReplyPreview != "reply" ||
+			!result.Entries[0].At.Equal(fixedTestNow) {
+			t.Fatalf("outline JSON = %s", stdout)
+		}
+	})
+	t.Run("Should refuse invalid search bounds before calling the daemon", func(t *testing.T) {
+		t.Parallel()
+		for _, args := range [][]string{{"session", "search", "sess-1", " "}, {"session", "search", "sess-1", "x", "--limit", "1001"}, {"session", "search", "sess-1", "x", "--limit", "-1"}} {
+			if _, _, err := executeRootCommand(t, newWorkspaceTestDeps(t, &stubClient{}), args...); err == nil {
+				t.Fatalf("invalid arguments accepted: %v", args)
+			}
+		}
+	})
+}
+
+func continuedRecord(replayed bool) SessionDeriveRecord {
+	count, size := 42, 62771
+	return SessionDeriveRecord{
+		Session: &contract.SessionPayload{ID: "sess-child", AgentName: "claude-code"},
+		Derived: contract.SessionDerivedPayload{
+			Kind: "continue", SourceSessionID: "sess-src", OriginAgentName: "codex",
+			ThroughTurnID: "turn-9", Seed: "replay", ReplayMessageCount: &count, ReplayBytes: &size,
+			FirstPrompt: "admitted", Replayed: replayed, ChildSessionID: "sess-child",
+		},
+	}
+}
+
+func deriveSourceSession(_ context.Context, id string) (SessionRecord, error) {
+	return SessionRecord{ID: id, WorkspaceID: "ws-src"}, nil
+}
+
+func deriveSourceOwner(_ context.Context, id string) (contract.SessionOwner, error) {
+	return contract.SessionOwner{SessionID: id, WorkspaceID: "ws-src"}, nil
+}
+
+// deriveSourcePreview answers the derive preview of sess-src in ws-src with its fences.
+func deriveSourcePreview(t *testing.T) func(context.Context, SessionDeriveTarget) (SessionDerivePreviewRecord, error) {
+	t.Helper()
+	return func(_ context.Context, target SessionDeriveTarget) (SessionDerivePreviewRecord, error) {
+		if target != (SessionDeriveTarget{SessionID: "sess-src", WorkspaceRef: "ws-src"}) {
+			t.Errorf("PreviewSessionDerive() target = %#v, want sess-src in ws-src", target)
+		}
+		return SessionDerivePreviewRecord{
+			Transcript: contract.SessionTranscriptFences{Epoch: 3, Generation: 12, MaxSequence: 418},
+		}, nil
+	}
+}
+
+// repairingSourceReads fail the test when a derive reads its source through the
+// session detail or transcript routes, which repair an inactive source's metadata.
+func repairingSourceReads(t *testing.T, client *stubClient) *stubClient {
+	t.Helper()
+	client.getSessionFn = func(context.Context, string) (SessionRecord, error) {
+		t.Error("GetSession() called: a derive must not read its source through the repairing detail route")
+		return SessionRecord{}, errors.New("repairing read")
+	}
+	client.getSessionTranscriptFn = func(context.Context, string) (SessionTranscriptRecord, error) {
+		t.Error(
+			"GetSessionTranscript() called: a derive must not read its source through the repairing transcript route",
+		)
+		return SessionTranscriptRecord{}, errors.New("repairing read")
+	}
+	return client
+}
+
+func TestSessionContinueCommand(t *testing.T) {
+	t.Parallel()
+
+	t.Run("Should send the _dx request body and read fences from the transcript", func(t *testing.T) {
+		t.Parallel()
+
+		var captured SessionContinueRequest
+		deps := newWorkspaceTestDeps(t, repairingSourceReads(t, &stubClient{
+			getSessionOwnerFn:      deriveSourceOwner,
+			previewSessionDeriveFn: deriveSourcePreview(t),
+			continueSessionFn: func(_ context.Context, target SessionDeriveTarget, request SessionContinueRequest) (SessionDeriveRecord, error) {
+				if target != (SessionDeriveTarget{SessionID: "sess-src", WorkspaceRef: "ws-src"}) {
+					t.Fatalf("ContinueSession() target = %#v, want sess-src in ws-src", target)
+				}
+				captured = request
+				return continuedRecord(false), nil
+			},
+		}))
+		stdout, _, err := executeRootCommand(t, deps,
+			"session", "continue", "sess-src", "--agent", "b", "--message", "go", "-o", "json")
+		if err != nil {
+			t.Fatalf("session continue error = %v", err)
+		}
+		if captured.AgentName != "b" || captured.Message != "go" || captured.Runtime != nil || captured.Route != 0 ||
+			!strings.HasPrefix(captured.IdempotencyKey, "idem") || captured.ExpectedEpoch == nil ||
+			*captured.ExpectedEpoch != 3 || *captured.ExpectedGeneration != 12 || *captured.ExpectedMaxSequence != 418 {
+			t.Fatalf("ContinueSession() request = %#v", captured)
+		}
+		var decoded SessionDeriveRecord
+		if err := json.Unmarshal([]byte(stdout), &decoded); err != nil {
+			t.Fatalf("json.Unmarshal(session continue) error = %v", err)
+		}
+		if decoded.Derived.FirstPrompt != "admitted" || decoded.Session == nil || decoded.Session.ID != "sess-child" {
+			t.Fatalf("session continue output = %#v", decoded)
+		}
+	})
+
+	t.Run("Should send a route without a runtime", func(t *testing.T) {
+		t.Parallel()
+
+		var captured SessionContinueRequest
+		deps := newWorkspaceTestDeps(t, &stubClient{
+			getSessionOwnerFn: deriveSourceOwner,
+			continueSessionFn: func(_ context.Context, _ SessionDeriveTarget, request SessionContinueRequest) (SessionDeriveRecord, error) {
+				captured = request
+				return continuedRecord(false), nil
+			},
+		})
+		_, _, err := executeRootCommand(t, deps, "session", "continue", "sess-src", "--agent", "b", "--route", "2",
+			"--expected-epoch", "1", "--expected-generation", "2", "--expected-max-sequence", "3", "-o", "json")
+		if err != nil || captured.Route != 2 || captured.Runtime != nil || *captured.ExpectedMaxSequence != 3 {
+			t.Fatalf("session continue --route error = %v request = %#v", err, captured)
+		}
+	})
+
+	for _, tc := range []struct {
+		name string
+		args []string
+		want string
+	}{
+		{"Should require --agent", []string{}, "cli: --agent is required"},
+		{
+			"Should reject --route with a runtime flag", []string{"--agent", "b", "--route", "2", "--speed", "fast"},
+			"cli: --route cannot be combined with runtime flags " +
+				"(--provider, --model, --reasoning-effort, --speed, --acp-option)",
+		},
+		{
+			"Should reject partial fences", []string{"--agent", "b", "--expected-epoch", "3"},
+			"cli: set all transcript fence flags together or omit all three",
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			deps := newWorkspaceTestDeps(t, &stubClient{})
+			args := append([]string{"session", "continue", "sess-src"}, tc.args...)
+			_, _, err := executeRootCommand(t, deps, args...)
+			if err == nil || err.Error() != tc.want || cliExitCodeForError(err) != 2 {
+				t.Fatalf("session continue error = %v (exit %d), want %q with exit 2",
+					err, cliExitCodeForError(err), tc.want)
+			}
+		})
+	}
+
+	t.Run("Should print the golden path block and Replayed yes on a replay", func(t *testing.T) {
+		t.Parallel()
+
+		deps := newWorkspaceTestDeps(t, &stubClient{
+			getSessionOwnerFn: deriveSourceOwner,
+			continueSessionFn: func(context.Context, SessionDeriveTarget, SessionContinueRequest) (SessionDeriveRecord, error) {
+				return continuedRecord(true), nil
+			},
+		})
+		stdout, _, err := executeRootCommand(t, deps, "session", "continue", "sess-src", "--agent", "b",
+			"--idempotency-key", "idem-1", "--expected-epoch", "1", "--expected-generation", "2",
+			"--expected-max-sequence", "3")
+		if err != nil {
+			t.Fatalf("session continue error = %v", err)
+		}
+		for _, want := range []string{
+			"Continued sess-src (codex) into sess-child (claude-code)",
+			"Origin        continue · from sess-src · codex · through turn turn-9",
+			"Context       42 messages · 61.3 KiB · nothing omitted",
+			"Seed          replay",
+			"First prompt  admitted",
+			"Replayed      yes",
+		} {
+			if !strings.Contains(stdout, want) {
+				t.Fatalf("session continue output missing %q:\n%s", want, stdout)
+			}
+		}
+	})
+
+	t.Run("Should print Origin and Derivation lines in session status", func(t *testing.T) {
+		t.Parallel()
+
+		record := &SessionRecord{
+			ID: "sess-child", AgentName: "claude-code",
+			Lineage: &contract.SessionLineagePayload{
+				ParentSessionID: "sess-src", Kind: "continue", OriginAgentName: "codex",
+			},
+			Derivation: &contract.SessionDerivationPayload{
+				Kind: "continue", SourceSessionID: "sess-src", Seed: "replay", FirstPrompt: "admitted",
+			},
+		}
+		rendered, err := renderSessionHuman(record, time.Now)
+		if err != nil {
+			t.Fatalf("renderSessionHuman() error = %v", err)
+		}
+		for _, want := range []string{"continue · from sess-src · codex", "seed replay · first prompt admitted"} {
+			if !strings.Contains(rendered, want) {
+				t.Fatalf("session status output missing %q:\n%s", want, rendered)
+			}
+		}
+	})
+}
+
+func forkedRecord() SessionDeriveRecord {
+	count, size := 17, 23347
+	return SessionDeriveRecord{
+		Session: &contract.SessionPayload{ID: "sess-fork", AgentName: "codex"},
+		Derived: contract.SessionDerivedPayload{
+			Kind: "fork", SourceSessionID: "sess-src", OriginAgentName: "codex", OriginMessageID: "msg_3",
+			ThroughTurnID: "turn-3", Seed: "replay", ReplayMessageCount: &count, ReplayBytes: &size,
+			FirstPrompt: "staged", ChildSessionID: "sess-fork",
+		},
+	}
+}
+
+func TestSessionForkCommand(t *testing.T) {
+	t.Parallel()
+
+	t.Run("Should send the _dx fork body with transcript fences and print the fork block", func(t *testing.T) {
+		t.Parallel()
+
+		var captured SessionForkRequest
+		deps := newWorkspaceTestDeps(t, repairingSourceReads(t, &stubClient{
+			getSessionOwnerFn:      deriveSourceOwner,
+			previewSessionDeriveFn: deriveSourcePreview(t),
+			forkSessionFn: func(_ context.Context, target SessionDeriveTarget, request SessionForkRequest) (SessionDeriveRecord, error) {
+				if target != (SessionDeriveTarget{SessionID: "sess-src", WorkspaceRef: "ws-src"}) {
+					t.Fatalf("ForkSession() target = %#v, want sess-src in ws-src", target)
+				}
+				captured = request
+				return forkedRecord(), nil
+			},
+		}))
+		stdout, _, err := executeRootCommand(t, deps, "session", "fork", "sess-src", "--message-id", "msg_3")
+		if err != nil {
+			t.Fatalf("session fork error = %v", err)
+		}
+		if captured.MessageID != "msg_3" || !strings.HasPrefix(captured.IdempotencyKey, "idem") ||
+			captured.ExpectedEpoch == nil || *captured.ExpectedEpoch != 3 || *captured.ExpectedMaxSequence != 418 {
+			t.Fatalf("ForkSession() request = %#v", captured)
+		}
+		for _, want := range []string{
+			"Forked sess-src into sess-fork (codex)",
+			"Origin        fork · from sess-src · through msg_3 (turn turn-3)",
+			"Context       17 messages · 22.8 KiB · nothing omitted",
+			"Seed          replay",
+			"First prompt  staged",
+		} {
+			if !strings.Contains(stdout, want) {
+				t.Fatalf("session fork output missing %q:\n%s", want, stdout)
+			}
+		}
+	})
+
+	t.Run("Should print the JSON outcome of a whole-session fork", func(t *testing.T) {
+		t.Parallel()
+
+		var captured SessionForkRequest
+		deps := newWorkspaceTestDeps(t, &stubClient{
+			getSessionOwnerFn: deriveSourceOwner,
+			forkSessionFn: func(_ context.Context, _ SessionDeriveTarget, request SessionForkRequest) (SessionDeriveRecord, error) {
+				captured = request
+				record := forkedRecord()
+				record.Derived.OriginMessageID = ""
+				return record, nil
+			},
+		})
+		stdout, _, err := executeRootCommand(t, deps, "session", "fork", "sess-src", "--idempotency-key", "idem-f",
+			"--expected-epoch", "1", "--expected-generation", "2", "--expected-max-sequence", "3", "-o", "json")
+		if err != nil || captured.MessageID != "" || captured.IdempotencyKey != "idem-f" ||
+			*captured.ExpectedGeneration != 2 {
+			t.Fatalf("session fork error = %v request = %#v", err, captured)
+		}
+		var decoded SessionDeriveRecord
+		if err := json.Unmarshal([]byte(stdout), &decoded); err != nil || decoded.Derived.Kind != "fork" {
+			t.Fatalf("session fork -o json = %s (%v), want the fork outcome", stdout, err)
+		}
+	})
+
+	t.Run("Should reject partial fences with exit 2", func(t *testing.T) {
+		t.Parallel()
+
+		deps := newWorkspaceTestDeps(t, &stubClient{})
+		_, _, err := executeRootCommand(t, deps, "session", "fork", "sess-src", "--expected-epoch", "3")
+		if err == nil || err.Error() != "cli: set all transcript fence flags together or omit all three" ||
+			cliExitCodeForError(err) != 2 {
+			t.Fatalf("session fork error = %v (exit %d), want the fence rule with exit 2",
+				err, cliExitCodeForError(err))
+		}
+	})
+
+	t.Run("Should print the Origin and native Derivation lines in session status", func(t *testing.T) {
+		t.Parallel()
+
+		for _, tc := range []struct {
+			derivation contract.SessionDerivationPayload
+			want       string
+		}{
+			{
+				derivation: contract.SessionDerivationPayload{
+					Kind: "fork", SourceSessionID: "sess-src", Seed: "native_fork", NativeState: "loaded",
+				},
+				want: "seed native_fork · loaded",
+			},
+			{
+				derivation: contract.SessionDerivationPayload{
+					Kind: "fork", SourceSessionID: "sess-src", Seed: "native_fork", NativeState: "failed",
+					NativeForkError: "session/load: resource not found",
+				},
+				want: "seed native_fork · failed: session/load: resource not found (replayed the carried context)",
+			},
+		} {
+			derivation := tc.derivation
+			deps := newWorkspaceTestDeps(t, &stubClient{
+				getSessionFn: deriveSourceSession,
+				getSessionStatusFn: func(context.Context, string) (SessionStatusRecord, error) {
+					return SessionStatusRecord{
+						SessionID: "sess-fork", AgentName: "codex", Derivation: &derivation,
+						Lineage: &contract.SessionLineagePayload{
+							ParentSessionID: "sess-src", Kind: "fork", OriginAgentName: "codex",
+						},
+					}, nil
+				},
+			})
+			stdout, _, err := executeRootCommand(t, deps, "session", "status", "sess-fork")
+			if err != nil || !strings.Contains(stdout, "fork · from sess-src · codex") ||
+				!strings.Contains(stdout, tc.want) {
+				t.Fatalf("session status output = %q (%v), want Origin and %q", stdout, err, tc.want)
+			}
+		}
+	})
+}
+
+func TestSessionDeriveCommandDaemonFailures(t *testing.T) {
+	t.Parallel()
+
+	t.Run("Should print code: message with exit 1 for a daemon derive error", func(t *testing.T) {
+		t.Parallel()
+
+		deps := newWorkspaceTestDeps(t, &stubClient{
+			getSessionOwnerFn: deriveSourceOwner,
+			continueSessionFn: func(context.Context, SessionDeriveTarget, SessionContinueRequest) (SessionDeriveRecord, error) {
+				return SessionDeriveRecord{}, &daemonAPIError{
+					statusCode: http.StatusNotFound, status: "404 Not Found",
+					payload: contract.ErrorPayload{Error: `no agent named "nope"`, Code: "agent_not_found"},
+				}
+			},
+		})
+		_, _, err := executeRootCommand(t, deps, "session", "continue", "sess-src", "--agent", "nope",
+			"--expected-epoch", "1", "--expected-generation", "2", "--expected-max-sequence", "3")
+		if err == nil || err.Error() != `agent_not_found: no agent named "nope"` || cliExitCodeForError(err) != 1 {
+			t.Fatalf("session continue error = %v (exit %d), want agent_not_found with exit 1",
+				err, cliExitCodeForError(err))
+		}
+	})
+
+	t.Run("Should name the committed child when the fork failed after creating it", func(t *testing.T) {
+		t.Parallel()
+
+		deps := newWorkspaceTestDeps(t, &stubClient{
+			getSessionOwnerFn: deriveSourceOwner,
+			forkSessionFn: func(context.Context, SessionDeriveTarget, SessionForkRequest) (SessionDeriveRecord, error) {
+				_, err := parseSessionDeriveAPIError(http.StatusUnprocessableEntity, "422 Unprocessable Entity",
+					[]byte(`{"error":"provider not authenticated","child_session_id":"sess-child"}`))
+				return SessionDeriveRecord{}, err
+			},
+		})
+		_, _, err := executeRootCommand(t, deps, "session", "fork", "sess-src", "--idempotency-key", "idem-f",
+			"--expected-epoch", "1", "--expected-generation", "2", "--expected-max-sequence", "3")
+		if err == nil || !strings.Contains(err.Error(), "provider not authenticated") ||
+			!strings.Contains(err.Error(), "session sess-child was already created") ||
+			!strings.Contains(err.Error(), "--idempotency-key idem-f") || cliExitCodeForError(err) != 1 {
+			t.Fatalf("session fork error = %v (exit %d), want the committed child and retry key",
+				err, cliExitCodeForError(err))
+		}
+		payload, ok := marshalStructuredExecutionError([]string{"session", "fork", "-o", "json"}, err)
+		if !ok || !strings.Contains(string(payload), `"child_session_id":"sess-child"`) {
+			t.Fatalf("structured error = %s (%t), want child_session_id", payload, ok)
+		}
+	})
+
+	t.Run("Should reach the daemon for a replay after the source was deleted", func(t *testing.T) {
+		t.Parallel()
+
+		var captured SessionForkRequest
+		var target SessionDeriveTarget
+		deps := newWorkspaceTestDeps(t, repairingSourceReads(t, &stubClient{
+			getSessionOwnerFn: func(context.Context, string) (contract.SessionOwner, error) {
+				return contract.SessionOwner{}, &daemonAPIError{
+					statusCode: http.StatusNotFound, status: "404 Not Found",
+					payload: contract.ErrorPayload{Error: "session sess-gone not found"},
+				}
+			},
+			previewSessionDeriveFn: func(context.Context, SessionDeriveTarget) (SessionDerivePreviewRecord, error) {
+				t.Error("PreviewSessionDerive() called for a deleted source")
+				return SessionDerivePreviewRecord{}, errors.New("unexpected preview")
+			},
+			forkSessionFn: func(_ context.Context, got SessionDeriveTarget, request SessionForkRequest) (SessionDeriveRecord, error) {
+				target, captured = got, request
+				record := forkedRecord()
+				record.Session = nil
+				record.Derived.Replayed, record.Derived.ChildDeleted = true, true
+				return record, nil
+			},
+		}))
+		stdout, _, err := executeRootCommand(t, deps, "session", "fork", "sess-gone",
+			"--idempotency-key", "idem-f", "-o", "json")
+		if err != nil {
+			t.Fatalf("session fork replay error = %v", err)
+		}
+		if target.SessionID != "sess-gone" || target.WorkspaceRef != "/workspace/project" ||
+			captured.ExpectedEpoch != nil || captured.IdempotencyKey != "idem-f" {
+			t.Fatalf("ForkSession() target = %#v request = %#v, want cwd workspace without fences", target, captured)
+		}
+		if !strings.Contains(stdout, `"child_deleted": true`) {
+			t.Fatalf("session fork replay output = %s, want child_deleted", stdout)
+		}
+	})
+
+	t.Run("Should reach the daemon receipt lookup for a same-key retry when the source reads fail", func(t *testing.T) {
+		t.Parallel()
+
+		ownerFailure := &daemonAPIError{
+			statusCode: http.StatusInternalServerError, status: "500 Internal Server Error",
+			payload: contract.ErrorPayload{Error: "session: recover source: catalog unavailable"},
+		}
+		for _, tc := range []struct {
+			name          string
+			owner         func(context.Context, string) (contract.SessionOwner, error)
+			wantWorkspace string
+		}{
+			{
+				name: "owner read fails",
+				owner: func(context.Context, string) (contract.SessionOwner, error) {
+					return contract.SessionOwner{}, ownerFailure
+				},
+				wantWorkspace: "/workspace/project",
+			},
+			{name: "preview read fails", owner: deriveSourceOwner, wantWorkspace: "ws-src"},
+		} {
+			var target SessionDeriveTarget
+			var captured SessionContinueRequest
+			deps := newWorkspaceTestDeps(t, repairingSourceReads(t, &stubClient{
+				getSessionOwnerFn: tc.owner,
+				previewSessionDeriveFn: func(context.Context, SessionDeriveTarget) (SessionDerivePreviewRecord, error) {
+					return SessionDerivePreviewRecord{}, ownerFailure
+				},
+				continueSessionFn: func(
+					_ context.Context, got SessionDeriveTarget, request SessionContinueRequest,
+				) (SessionDeriveRecord, error) {
+					target, captured = got, request
+					return continuedRecord(true), nil
+				},
+			}))
+			stdout, _, err := executeRootCommand(t, deps, "session", "continue", "sess-src", "--agent", "b",
+				"--idempotency-key", "idem-retry", "-o", "json")
+			if err != nil {
+				t.Fatalf("%s: session continue retry error = %v", tc.name, err)
+			}
+			if target != (SessionDeriveTarget{SessionID: "sess-src", WorkspaceRef: tc.wantWorkspace}) ||
+				captured.IdempotencyKey != "idem-retry" || captured.ExpectedEpoch != nil {
+				t.Fatalf("%s: ContinueSession() target = %#v request = %#v, want %s without fences",
+					tc.name, target, captured, tc.wantWorkspace)
+			}
+			if !strings.Contains(stdout, `"replayed": true`) {
+				t.Fatalf("%s: session continue retry output = %s, want the replayed outcome", tc.name, stdout)
+			}
+		}
+	})
+
+	t.Run("Should report a failing source owner read when no retry key was given", func(t *testing.T) {
+		t.Parallel()
+
+		deps := newWorkspaceTestDeps(t, repairingSourceReads(t, &stubClient{
+			getSessionOwnerFn: func(context.Context, string) (contract.SessionOwner, error) {
+				return contract.SessionOwner{}, errors.New("catalog unavailable")
+			},
+		}))
+		_, _, err := executeRootCommand(t, deps, "session", "continue", "sess-src", "--agent", "b")
+		if err == nil || !strings.Contains(err.Error(), "catalog unavailable") {
+			t.Fatalf("session continue error = %v, want the owner read failure", err)
+		}
+	})
+
+	t.Run("Should print the promoted model code with the committed child", func(t *testing.T) {
+		t.Parallel()
+
+		deps := newWorkspaceTestDeps(t, &stubClient{
+			getSessionOwnerFn: deriveSourceOwner,
+			continueSessionFn: func(context.Context, SessionDeriveTarget, SessionContinueRequest) (SessionDeriveRecord, error) {
+				_, err := parseSessionDeriveAPIError(http.StatusUnprocessableEntity, "422 Unprocessable Entity",
+					[]byte(`{"error":"Provider configuration is unavailable: acp: model \"gone\" is unavailable",`+
+						`"code":"model_unavailable",`+
+						`"diagnostic":{"code":"model_unavailable"},"child_session_id":"sess-child"}`))
+				return SessionDeriveRecord{}, err
+			},
+		})
+		_, _, err := executeRootCommand(t, deps, "session", "continue", "sess-src", "--agent", "b",
+			"--message", "go", "--idempotency-key", "idem-m",
+			"--expected-epoch", "1", "--expected-generation", "2", "--expected-max-sequence", "3")
+		if err == nil || !strings.HasPrefix(err.Error(),
+			`model_unavailable: Provider configuration is unavailable: acp: model "gone" is unavailable`) ||
+			!strings.Contains(err.Error(), "session sess-child was already created") || cliExitCodeForError(err) != 1 {
+			t.Fatalf("session continue error = %v (exit %d), want model_unavailable with the committed child",
+				err, cliExitCodeForError(err))
+		}
+	})
+}
+
+type compactEventStreamClient struct {
+	stream func(context.Context, string, SessionEventQuery, string, SSEHandler) error
+}
+
+func (c compactEventStreamClient) StreamSessionEvents(
+	ctx context.Context,
+	id string,
+	query SessionEventQuery,
+	lastID string,
+	handler SSEHandler,
+) error {
+	return c.stream(ctx, id, query, lastID, handler)
+}
+
+// The CLI waits for its own turn's terminal event even after observing compaction completion.
+func TestWaitSessionCompaction(t *testing.T) {
+	t.Parallel()
+	for _, test := range []struct{ status, correction, terminal, outcome string }{
+		{"completed", "", acp.EventTypeDone, "completed"},
+		{"failed", "", acp.EventTypeDone, "failed"},
+		{"cancelled", "", acp.EventTypeDone, "cancelled"}, //nolint:misspell // ACP wire spelling.
+		{"", "", acp.EventTypeDone, "turn_completed"},
+		{"", "", acp.EventTypeError, "turn_failed"},
+		{"completed", "failed", acp.EventTypeDone, "failed"},
+		{"failed", "completed", acp.EventTypeDone, "completed"},
+	} {
+		t.Run("Should report "+test.outcome+" after "+test.status+" then "+test.correction, func(t *testing.T) {
+			t.Parallel()
+			terminalSeen := false
+			client := compactEventStreamClient{
+				stream: func(_ context.Context, id string, query SessionEventQuery, _ string, handler SSEHandler) error {
+					if id != "sess-1" || query.TurnID != "turn-1" || !query.Forward {
+						t.Fatalf("stream scope: %s %#v", id, query)
+					}
+					send := func(turnID, kind, status string) error {
+						event := acp.AgentEvent{Type: kind}
+						if status != "" {
+							event.Compaction = &acp.CompactionObservation{
+								CompactionID: "c1",
+								Status:       status,
+								Terminal:     status == test.status,
+							}
+						}
+						content, err := transcript.MarshalAgentEvent(event)
+						if err != nil {
+							t.Fatal(err)
+						}
+						frame, err := json.Marshal(
+							SessionEventRecord{TurnID: turnID, Type: kind, Content: json.RawMessage(content)},
+						)
+						if err != nil {
+							t.Fatal(err)
+						}
+						return handler(SSEEvent{Data: frame})
+					}
+					if err := send("other-turn", acp.EventTypeError, ""); err != nil {
+						t.Fatalf("unrelated turn ended wait: %v", err)
+					}
+					if test.status != "" {
+						if err := send("turn-1", acp.EventTypeCompaction, test.status); err != nil {
+							t.Fatalf("compaction frame ended turn wait: %v", err)
+						}
+					}
+					if test.correction != "" {
+						if err := send("turn-1", acp.EventTypeCompaction, test.correction); err != nil {
+							t.Fatalf("corrective snapshot ended turn wait: %v", err)
+						}
+					}
+					terminalSeen = true
+					return send("turn-1", test.terminal, "")
+				},
+			}
+			outcome, err := waitSessionCompaction(
+				t.Context(),
+				client,
+				contract.SessionCompactResponse{SessionID: "sess-1", PromptID: "turn-1"},
+			)
+			if err != nil || outcome != test.outcome || !terminalSeen {
+				t.Fatalf("wait = %q, %v, terminal=%v", outcome, err, terminalSeen)
+			}
+		})
+	}
+}
+
+// UT-046/UT-047: session subagent commands preserve documented output and errors.
+func TestSubagentCommands(t *testing.T) {
+	t.Parallel()
+	t.Run("Should render isolated checkout facts and unknown pull request UT-036", func(t *testing.T) {
+		t.Parallel()
+		row := subagentCLIRecord()
+		row.Isolation = "worktree"
+		row.Worktree = &contract.SubagentWorktreePayload{
+			ID:                "wt",
+			Name:              "test",
+			Branch:            "run/test",
+			BaseRef:           "main",
+			BaseSHA:           "base",
+			Path:              "/checkout",
+			CommitsAhead:      new(2),
+			DirtyFiles:        new(0),
+			PullRequestStatus: "unknown",
+		}
+		got := subagentDetails(row, fixedTestNow)
+		for _, text := range []string{"Isolation     worktree", "Branch        run/test ← base · 2 ahead · clean", "Pull request  status unknown"} {
+			if !strings.Contains(got, text) {
+				t.Fatalf("missing %q in %s", text, got)
+			}
+		}
+		row.Worktree.BaseSHA = ""
+		row.Worktree.CommitsAhead = nil
+		row.Worktree.DirtyFiles = nil
+		got = subagentDetails(row, fixedTestNow)
+		if !strings.Contains(got, "Branch        run/test\n") || strings.Contains(got, "Base          ") ||
+			strings.Contains(got, "ahead") ||
+			strings.Contains(got, "clean") {
+			t.Fatal(got)
+		}
+		row.Worktree.PullRequest = &contract.SubagentPullRequestPayload{
+			Number: 731,
+			State:  "open",
+			URL:    "https://example.test/pull/731",
+		}
+		row.Worktree.ObservedAt = new(fixedTestNow)
+		got = subagentDetails(row, fixedTestNow)
+		if !strings.Contains(got, "Pull request  #731 open · https://example.test/pull/731") ||
+			!strings.Contains(got, "Observed      "+fixedTestNow.Format("2006-01-02 15:04:05")) {
+			t.Fatal(got)
+		}
+	})
+	t.Run("Should render the child session activity beside the child id", func(t *testing.T) {
+		t.Parallel()
+		row := subagentCLIRecord()
+		row.ChildSessionID = new("child-1")
+		row.ChildActivity = "working"
+		if got := subagentDetails(row, fixedTestNow); !strings.Contains(got, "Child         child-1 (working)\n") {
+			t.Fatal(got)
+		}
+		row.ChildActivity = ""
+		if got := subagentDetails(row, fixedTestNow); !strings.Contains(got, "Child         child-1\n") {
+			t.Fatal(got)
+		}
+	})
+	t.Run("Should show a subagent without resolving the current directory", func(t *testing.T) {
+		t.Parallel()
+		client := &subagentCommandStub{DaemonClient: newDefaultProfileTestClient(&stubClient{})}
+		deps := newTestDeps(t, client)
+		deps.getenv = func(string) string { return "" }
+		code, stdout, stderr := executeRootCommandWithExit(t, deps, "session", "subagents", "show", "sub-1")
+		if code != 0 || !strings.Contains(stdout, "Recommendation") {
+			t.Fatalf("exit=%d stdout=%q stderr=%q", code, stdout, stderr)
+		}
+	})
+	t.Run("Should format hours and omit missing runtime separators", func(t *testing.T) {
+		t.Parallel()
+		row := subagentCLIRecord()
+		row.StartedAt = new(fixedTestNow.Add(-63 * time.Minute))
+		if got := subagentElapsed(row, fixedTestNow); got != "1h 03m" {
+			t.Fatal(got)
+		}
+		if got := subagentDetails(row, fixedTestNow); !strings.Contains(got, "Runtime       codex · gpt-6.1-sol\n") {
+			t.Fatal(got)
+		}
+	})
+	for _, tc := range []struct {
+		name    string
+		args    []string
+		want    string
+		failure bool
+	}{
+		{"list table", []string{"parent"}, "ID", false},
+		{"list JSON", []string{"parent", "--json"}, `"next_cursor":null`, false},
+		{"show workspace help", []string{"show", "--help"}, "fast path for show/cancel that avoids searching across workspaces", false},
+		{"cancel workspace help", []string{"cancel", "--help"}, "fast path for show/cancel that avoids searching across workspaces", false},
+		{"show result", []string{"show", "sub-1"}, "Result\nRecommendation", false},
+		{"show JSON", []string{"show", "sub-1", "--json"}, `"subagent_id":"sub-1"`, false},
+		{"cancel", []string{"cancel", "sub-1", "--reason", "done"}, "Cancel requested for sub-1 (Review).", false},
+		{"cancel JSON", []string{"cancel", "sub-1", "--json"}, `"status":"cancel_requested"`, false},
+		{"invalid limit", []string{"parent", "--limit", "0"}, "--limit must be between 1 and 200", true},
+		{"missing session", []string{"missing"}, "session_not_found", true},
+		{"missing subagent", []string{"show", "missing"}, "subagent_not_found: subagent missing not found", true},
+	} {
+		t.Run("Should render "+tc.name, func(t *testing.T) {
+			t.Parallel()
+			base := &stubClient{}
+			withWorkspaceResolution(base)
+			client := &subagentCommandStub{DaemonClient: newDefaultProfileTestClient(base)}
+			deps := newTestDeps(t, client)
+			exitCode, stdout, stderr := executeRootCommandWithExit(
+				t,
+				deps,
+				append([]string{"session", "subagents"}, tc.args...)...)
+			if tc.failure {
+				if exitCode != 1 || !strings.Contains(stderr, tc.want) {
+					t.Fatalf("exit=%d stderr=%q, want exit 1 and %q", exitCode, stderr, tc.want)
+				}
+				return
+			}
+			if exitCode != 0 || !strings.Contains(stdout, tc.want) {
+				t.Fatalf("output=%s exit=%d stderr=%s, want %q", stdout, exitCode, stderr, tc.want)
+			}
+			if tc.name == "list table" {
+				for _, column := range []string{"TITLE", "RUNTIME", "STATUS", "ELAPSED", "codex/gpt-6.1-sol", "7s"} {
+					if !strings.Contains(stdout, column) {
+						t.Fatalf("missing %s in %s", column, stdout)
+					}
+				}
+			}
+			if strings.Contains(tc.name, "JSON") && strings.Contains(stdout, "workspace_resolution") {
+				t.Fatalf("unexpected JSON envelope: %s", stdout)
+			}
+		})
+	}
+	t.Run("Should forward session list visibility", func(t *testing.T) {
+		t.Parallel()
+		flags := sessionListFlags{subagents: "exclude"}
+		query := buildSessionListQuery(flags, nil, "ws")
+		if sessionListValues(query).Get("subagents") != "exclude" {
+			t.Fatalf("query=%+v", query)
+		}
+	})
+}
+
+type subagentCommandStub struct{ DaemonClient }
+
+var _ sessionSubagentsClient = (*subagentCommandStub)(nil)
+
+func (s *subagentCommandStub) ListSessionSubagents(
+	_ context.Context,
+	id string,
+	_ SubagentListQuery,
+) (contract.SubagentListPayload, error) {
+	if id == "missing" {
+		return contract.SubagentListPayload{}, &session.SubagentError{
+			Code: "session_not_found", Message: "session_not_found: Session missing not found.",
+		}
+	}
+	return contract.SubagentListPayload{Subagents: []contract.SubagentPayload{subagentCLIRecord()}}, nil
+}
+func (s *subagentCommandStub) GetSubagent(_ context.Context, _ string, id string) (contract.SubagentPayload, error) {
+	if id == "missing" {
+		return contract.SubagentPayload{}, errors.New("subagent_not_found: subagent missing not found")
+	}
+	return subagentCLIRecord(), nil
+}
+
+func (s *subagentCommandStub) CancelSubagent(
+	_ context.Context,
+	_ string,
+	id, _ string,
+) (contract.SubagentCancelPayload, error) {
+	return contract.SubagentCancelPayload{SubagentID: id, Status: "cancel_requested"}, nil
+}
+func subagentCLIRecord() contract.SubagentPayload {
+	return contract.SubagentPayload{
+		SubagentID: "sub-1",
+		Title:      "Review",
+		Status:     "running",
+		Runtime:    contract.SubagentRuntimePayload{Provider: "codex", Model: "gpt-6.1-sol"},
+		StartedAt:  new(fixedTestNow.Add(-7 * time.Second)),
+		Result:     new("Recommendation"),
+	}
+}
+
+func TestSessionReplyWatchOutput(t *testing.T) {
+	t.Run("Should expose waiting replies in every status format UT-047", func(t *testing.T) {
+		t.Parallel()
+		deps := newWorkspaceTestDeps(
+			t,
+			&stubClient{getSessionStatusFn: func(context.Context, string) (SessionStatusRecord, error) {
+				return SessionStatusRecord{
+					SessionID: "sender",
+					ReplyWatches: []contract.ReplyWatchPayload{
+						{
+							ID:              "rw-123",
+							TargetSessionID: "target",
+							MessageID:       "message",
+							State:           "armed",
+							CreatedAt:       time.Date(2026, 10, 9, 12, 0, 0, 0, time.UTC),
+						},
+					},
+				}, nil
+			}},
+		)
+		for _, format := range []string{"human", "json", "toon"} {
+			output, _, err := executeRootCommand(t, deps, "session", "status", "sender", "-o", format)
+			if err != nil {
+				t.Fatal(err)
+			}
+			for _, value := range []string{"rw-123", "target", "message", "armed"} {
+				if !strings.Contains(output, value) {
+					t.Fatalf("%s omits %s: %s", format, value, output)
+				}
+			}
+			if format == "human" && !strings.Contains(output, "Waiting for replies") {
+				t.Fatal(output)
+			}
+		}
+	})
+}
+
+type sessionLayoutStubClient struct {
+	*stubClient
+	calls []string
+}
+
+func (s *sessionLayoutStubClient) record(call string) contract.SessionFoldersResponse {
+	s.calls = append(s.calls, call)
+	return contract.SessionFoldersResponse{Folders: []contract.SessionFolderPayload{
+		{ID: "sfold-1", Name: "Release", SessionCount: 1},
+	}}
+}
+
+func (s *sessionLayoutStubClient) ListSessionFolders(
+	_ context.Context,
+	workspace string,
+) (contract.SessionFoldersResponse, error) {
+	return s.record("list " + workspace), nil
+}
+
+func (s *sessionLayoutStubClient) CreateSessionFolder(
+	_ context.Context,
+	workspace string,
+	name string,
+) (contract.SessionFolderResponse, error) {
+	s.record("create " + workspace + " " + name)
+	return contract.SessionFolderResponse{Folder: contract.SessionFolderPayload{ID: "sfold-1", Name: name}}, nil
+}
+
+func (s *sessionLayoutStubClient) RenameSessionFolder(
+	_ context.Context,
+	workspace string,
+	folderID string,
+	name string,
+) (contract.SessionFolderResponse, error) {
+	s.record("rename " + workspace + " " + folderID + " " + name)
+	return contract.SessionFolderResponse{Folder: contract.SessionFolderPayload{ID: folderID, Name: name}}, nil
+}
+
+func (s *sessionLayoutStubClient) DeleteSessionFolder(
+	_ context.Context,
+	workspace string,
+	folderID string,
+) (contract.SessionFoldersResponse, error) {
+	return s.record("delete " + workspace + " " + folderID), nil
+}
+
+func (s *sessionLayoutStubClient) ReorderSessionFolders(
+	_ context.Context,
+	workspace string,
+	folderIDs []string,
+) (contract.SessionFoldersResponse, error) {
+	return s.record("reorder-folders " + workspace + " " + strings.Join(folderIDs, ",")), nil
+}
+
+func (s *sessionLayoutStubClient) MoveSession(
+	_ context.Context,
+	sessionID string,
+	folderID string,
+) (contract.SessionFoldersResponse, error) {
+	return s.record("move " + sessionID + " " + folderID), nil
+}
+
+func (s *sessionLayoutStubClient) ReorderSessions(
+	_ context.Context,
+	workspace string,
+	request contract.ReorderSessionsRequest,
+) (contract.SessionFoldersResponse, error) {
+	return s.record(
+		"reorder-sessions " + workspace + " " + request.FolderID + " " + strings.Join(request.SessionIDs, ","),
+	), nil
+}
+
+func TestSessionLayoutCommands(t *testing.T) {
+	t.Parallel()
+
+	t.Run("Should route folder, move, and reorder commands to the workspace layout API", func(t *testing.T) {
+		t.Parallel()
+		stub := &stubClient{}
+		withWorkspaceResolution(stub)
+		client := &sessionLayoutStubClient{stubClient: stub}
+		deps := newTestDeps(t, client)
+		commands := [][]string{
+			{"session", "folder", "create", "Release", "--workspace", "ws-1"},
+			{"session", "folder", "rename", "sfold-1", "Shipped", "--workspace", "ws-1"},
+			{"session", "folder", "reorder", "sfold-2", "sfold-1", "--workspace", "ws-1"},
+			{"session", "move", "sess-1", "--folder", "sfold-1"},
+			{"session", "move", "sess-1"},
+			{"session", "reorder", "sess-2", "sess-1", "--folder", "sfold-1", "--workspace", "ws-1"},
+			{"session", "folder", "delete", "sfold-1", "--workspace", "ws-1"},
+			{"session", "folder", "list", "--workspace", "ws-1", "-o", "json"},
+		}
+		var stdout string
+		for _, args := range commands {
+			out, _, err := executeRootCommand(t, deps, args...)
+			if err != nil {
+				t.Fatalf("%v error = %v", args, err)
+			}
+			stdout = out
+		}
+		want := []string{
+			"create ws-1 Release",
+			"rename ws-1 sfold-1 Shipped",
+			"reorder-folders ws-1 sfold-2,sfold-1",
+			"move sess-1 sfold-1",
+			"move sess-1 ",
+			"reorder-sessions ws-1 sfold-1 sess-2,sess-1",
+			"delete ws-1 sfold-1",
+			"list ws-1",
+		}
+		if !slices.Equal(client.calls, want) {
+			t.Fatalf("layout calls = %#v, want %#v", client.calls, want)
+		}
+		var listed contract.SessionFoldersResponse
+		if err := json.Unmarshal([]byte(stdout), &listed); err != nil {
+			t.Fatalf("json.Unmarshal(folder list) error = %v; stdout=%s", err, stdout)
+		}
+		if len(listed.Folders) != 1 || listed.Folders[0].SessionCount != 1 {
+			t.Fatalf("folder list output = %#v", listed)
+		}
+	})
+}
+
+func TestSessionListAllProjectsColumn(t *testing.T) {
+	t.Parallel()
+	t.Run("Should retain session columns and name project and User rows", func(t *testing.T) {
+		t.Parallel()
+		page := SessionListPage{Sessions: []SessionRecord{
+			{ID: "sess-user", WorkspaceID: ""},
+			{ID: "sess-project", WorkspaceID: "ws-1", WorkspacePath: "/project"},
+		}}
+		bundle := sessionListBundle(
+			page,
+			func() time.Time { return fixedTestNow },
+			map[string]string{"": "User", "ws-1": "Example"},
+		)
+		human, err := bundle.human()
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, want := range []string{"PROJECT", "User", "Example", "sess-user", "sess-project", "/project", "Workspace"} {
+			if !strings.Contains(human, want) {
+				t.Fatalf("output %q lacks %q", human, want)
+			}
+		}
+	})
+}
+
+// Invariant: PR reads use the cached session projection and refresh explicitly invokes the forge route.
+// Owner: CLI session commands; canonical session suite.
+func TestSessionPullRequestCommand(t *testing.T) {
+	t.Parallel()
+	for _, format := range []string{"human", "json"} {
+		t.Run("Should reject a branchless cached read in "+format, func(t *testing.T) {
+			t.Parallel()
+			client := &stubClient{
+				getSessionFn: func(_ context.Context, id string) (SessionRecord, error) { return SessionRecord{ID: id}, nil },
+			}
+			withWorkspaceResolution(client)
+			args := []string{"session", "pr", "sess-1"}
+			if format == "json" {
+				args = append(args, "-o", "json")
+			}
+			stdout, _, err := executeRootCommand(t, newWorkspaceTestDeps(t, client), args...)
+			if err == nil || !strings.Contains(err.Error(), "session_branch_unavailable") ||
+				cliExitCodeForError(err) != 1 ||
+				stdout != "" {
+				t.Fatalf("branchless output=%q error=%v exit=%d", stdout, err, cliExitCodeForError(err))
+			}
+		})
+	}
+
+	t.Run("Should distinguish cached and explicit refresh output", func(t *testing.T) {
+		t.Parallel()
+		client := &pullRequestCLIStub{
+			stubClient: &stubClient{getSessionFn: func(_ context.Context, id string) (SessionRecord, error) {
+				return SessionRecord{
+					ID:          id,
+					Branch:      "topic",
+					PullRequest: &contract.SessionPullRequestPayload{Number: 42, State: session.PullRequestOpen},
+				}, nil
+			}},
+		}
+		withWorkspaceResolution(client.stubClient)
+		deps := newWorkspaceTestDeps(t, client)
+		stdout, _, err := executeRootCommand(t, deps, "session", "pr", "sess-1", "-o", "json")
+		if err != nil {
+			t.Fatal(err)
+		}
+		var result contract.SessionPullRequestResponse
+		if err = json.Unmarshal([]byte(stdout), &result); err != nil {
+			t.Fatal(err)
+		}
+		if result.Branch != "topic" || result.PullRequest == nil || result.PullRequest.Number != 42 ||
+			client.refreshed {
+			t.Fatalf("cached=%#v refreshed=%t", result, client.refreshed)
+		}
+		stdout, _, err = executeRootCommand(t, deps, "session", "pr", "sess-1", "--refresh", "-o", "json")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err = json.Unmarshal([]byte(stdout), &result); err != nil {
+			t.Fatal(err)
+		}
+		if !client.refreshed || result.PullRequest.Number != 43 {
+			t.Fatalf("refresh=%#v", result)
+		}
+	})
+}
+
+type pullRequestCLIStub struct {
+	*stubClient
+	refreshed bool
+}
+
+func (c *pullRequestCLIStub) RefreshSessionPullRequest(
+	_ context.Context,
+	id string,
+) (contract.SessionPullRequestResponse, error) {
+	c.refreshed = true
+	return contract.SessionPullRequestResponse{
+		SessionID:   id,
+		Branch:      "topic",
+		PullRequest: &contract.SessionPullRequestPayload{Number: 43},
+	}, nil
+}
+
+// Invariant: session worktree commands preserve identity and forward an explicit
+// or observed binding fence. Owner: CLI boundary; canonical session command suite.
+func TestSessionWorktreeCommands(t *testing.T) {
+	t.Parallel()
+	for _, tc := range []struct {
+		name             string
+		args             []string
+		target, expected string
+		reads            int
+	}{
+		{name: "bind with observed fence", args: []string{"bind", "sess-1", "wt-next"}, target: "wt-next", expected: "wt-current", reads: 1},
+		{name: "unbind with observed fence", args: []string{"unbind", "sess-1"}, expected: "wt-current", reads: 1},
+		{name: "bind with explicit root fence", args: []string{"bind", "sess-1", "wt-next", "--expected-worktree="}, target: "wt-next"},
+	} {
+		t.Run("Should "+tc.name, func(t *testing.T) {
+			t.Parallel()
+			reads, calls := 0, 0
+			deps := newWorkspaceTestDeps(t, &stubClient{
+				getSessionFn: func(_ context.Context, id string) (SessionRecord, error) {
+					reads++
+					return SessionRecord{ID: id, WorktreeID: "wt-current"}, nil
+				},
+				changeSessionWorktreeFn: func(_ context.Context, id, ref, expected string) (SessionRecord, error) {
+					calls++
+					if id != "sess-1" || ref != tc.target || expected != tc.expected {
+						t.Fatalf("mutation=%q,%q,%q", id, ref, expected)
+					}
+					return SessionRecord{ID: id, WorktreeID: ref}, nil
+				},
+			})
+			args := append([]string{"session", "worktree"}, tc.args...)
+			args = append(args, "-o", "json")
+			output, _, err := executeRootCommand(t, deps, args...)
+			if err != nil {
+				t.Fatal(err)
+			}
+			var result SessionRecord
+			if err := json.Unmarshal([]byte(output), &result); err != nil {
+				t.Fatal(err)
+			}
+			if result.ID != "sess-1" || result.WorktreeID != tc.target || reads != tc.reads || calls != 1 {
+				t.Fatalf("result=%#v reads=%d calls=%d", result, reads, calls)
+			}
+		})
+	}
+}
+
+// Invariant: lifecycle CLI choices reach the daemon without changing the default keep policy.
+// Owning layer/canonical suite: CLI session commands; transport encoding has separate client coverage.
+func TestSessionLifecycleProcessPolicy(t *testing.T) {
+	t.Parallel()
+	for _, operation := range []string{"stop", "archive", "remove"} {
+		for _, policy := range []contract.SessionProcessPolicy{"", "keep", "terminate"} {
+			t.Run("Should forward "+operation+" process policy "+string(policy), func(t *testing.T) {
+				t.Parallel()
+				var got contract.SessionProcessPolicy
+				called := false
+				record := SessionRecord{ID: "sess-1", State: session.StateStopped}
+				client := &stubClient{
+					getSessionFn: func(context.Context, string) (SessionRecord, error) { return record, nil },
+					stopSessionFn: func(_ context.Context, _ string, _ bool, p contract.SessionProcessPolicy) (SessionStopRecord, error) {
+						got, called = p, true
+						return SessionStopRecord{Verified: true, State: session.StateStopped}, nil
+					},
+					archiveSessionFn: func(
+						_ context.Context, _ string, _ bool, _ bool, p contract.SessionProcessPolicy,
+					) (SessionRecord, error) {
+						got, called = p, true
+						return record, nil
+					},
+					deleteSessionFn: func(_ context.Context, _ string, _ bool, p contract.SessionProcessPolicy) error {
+						got, called = p, true
+						return nil
+					},
+				}
+				args := []string{"session", operation, "sess-1", "-o", "json"}
+				if policy != "" {
+					args = append(args, "--"+string(policy)+"-processes")
+				}
+				_, _, err := executeRootCommand(t, newWorkspaceTestDeps(t, client), args...)
+				if err != nil || !called || got != policy {
+					t.Fatalf("policy=%q called=%t error=%v, want %q", got, called, err, policy)
+				}
+			})
+		}
+	}
+}
+
+// Invariant: an unsupported host cannot report successful CLI termination.
+// Owning layer/canonical suite: CLI session command exit status.
+func TestSessionProcessStopUnsupported(t *testing.T) {
+	t.Parallel()
+	t.Run("Should report unsupported termination with a failing exit status", func(t *testing.T) {
+		t.Parallel()
+		client := &unsupportedProcessClient{DaemonClient: withWorkspaceResolution(&stubClient{})}
+		output, _, err := executeRootCommand(
+			t,
+			newWorkspaceTestDeps(t, client),
+			"session",
+			"processes",
+			"stop",
+			"sess-1",
+			"--all",
+			"-o",
+			"json",
+		)
+		if err == nil || !strings.Contains(err.Error(), "unsupported") ||
+			!strings.Contains(output, `"supported": false`) {
+			t.Fatalf("output=%s error=%v", output, err)
+		}
+	})
+}
+
+type unsupportedProcessClient struct {
+	DaemonClient
+	sessionProcessesClient
+}
+
+func (*unsupportedProcessClient) TerminateSessionProcesses(
+	context.Context,
+	string,
+	contract.TerminateSessionProcessesRequest,
+) (contract.TerminateSessionProcessesResponse, error) {
+	return contract.TerminateSessionProcessesResponse{Supported: false, Results: []contract.SessionProcessResult{}}, nil
+}
+
+func TestSessionPendingDescendants(t *testing.T) {
+	t.Parallel()
+	t.Run("Should forward descendants and preserve the original session identity", func(t *testing.T) {
+		t.Parallel()
+		expiresAt := fixedTestNow.Add(12 * time.Hour)
+		want := SessionInteractionsRecord{
+			Interactions: []contract.PendingInteractionPayload{
+				{SessionID: "child", InteractionID: "interaction", ProviderRequestID: "request", ExpiresAt: &expiresAt},
+			},
+		}
+		deps := newWorkspaceTestDeps(
+			t,
+			&stubClient{
+				listSessionPendingInteractionsFn: func(_ context.Context, id string, descendants bool) (SessionInteractionsRecord, error) {
+					if id != "parent" || !descendants {
+						t.Fatalf("query = %q/%v", id, descendants)
+					}
+					return want, nil
+				},
+			},
+		)
+		stdout, _, err := executeRootCommand(t, deps, "session", "pending", "parent", "--descendants", "-o", "json")
+		if err != nil {
+			t.Fatal(err)
+		}
+		var got SessionInteractionsRecord
+		if err := json.Unmarshal([]byte(stdout), &got); err != nil {
+			t.Fatal(err)
+		}
+		if !reflect.DeepEqual(got, want) {
+			t.Fatalf("pending = %#v", got)
+		}
+		bundle := sessionInteractionsBundle(want)
+		human, err := bundle.human()
+		if err != nil || !strings.Contains(human, "child") ||
+			!strings.Contains(human, expiresAt.UTC().Format(time.RFC3339)) {
+			t.Fatalf("pending human = %q, %v", human, err)
+		}
+		toon, err := bundle.toon()
+		if err != nil || !strings.Contains(toon, "child") ||
+			!strings.Contains(toon, expiresAt.UTC().Format(time.RFC3339)) {
+			t.Fatalf("pending toon = %q, %v", toon, err)
+		}
+	})
+}

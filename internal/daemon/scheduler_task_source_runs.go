@@ -1,0 +1,106 @@
+package daemon
+
+import (
+	"context"
+	"fmt"
+	"strings"
+
+	schedulerpkg "github.com/compozy/compozy/internal/scheduler"
+	taskpkg "github.com/compozy/compozy/internal/task"
+)
+
+func (s schedulerTaskSource) PendingRuns(ctx context.Context) ([]schedulerpkg.RunSnapshot, error) {
+	runs, err := s.store.ListTaskRunsByStatus(ctx, []taskpkg.RunStatus{taskpkg.TaskRunStatusQueued})
+	if err != nil {
+		return nil, err
+	}
+	workerRuns := make([]taskpkg.Run, 0, len(runs))
+	for _, run := range runs {
+		if strings.TrimSpace(run.TaskID) == "" {
+			continue
+		}
+		if run.RunKind.Normalize() == taskpkg.RunKindCoordinator {
+			continue
+		}
+		if isQueuedLoopActionRun(run) {
+			continue
+		}
+		workerRuns = append(workerRuns, run)
+	}
+	snapshots, err := s.joinRunsWithTasks(ctx, workerRuns)
+	if err != nil {
+		return nil, err
+	}
+	return s.filterPausedRuns(ctx, snapshots)
+}
+
+func (s schedulerTaskSource) ActiveRuns(ctx context.Context) ([]taskpkg.Run, error) {
+	runs, err := s.store.ListTaskRunsByStatus(ctx, []taskpkg.RunStatus{
+		taskpkg.TaskRunStatusClaimed,
+		taskpkg.TaskRunStatusStarting,
+		taskpkg.TaskRunStatusRunning,
+	})
+	if err != nil {
+		return nil, err
+	}
+	active := make([]taskpkg.Run, 0, len(runs))
+	for _, run := range runs {
+		if strings.TrimSpace(run.TaskID) != "" {
+			active = append(active, run)
+		}
+	}
+	return active, nil
+}
+
+func (s schedulerTaskSource) joinRunsWithTasks(
+	ctx context.Context,
+	runs []taskpkg.Run,
+) ([]schedulerpkg.RunSnapshot, error) {
+	work := make([]schedulerpkg.RunSnapshot, 0, len(runs))
+	tasks := make(map[string]taskpkg.Task)
+	for _, run := range runs {
+		taskRecord, found := tasks[run.TaskID]
+		if !found {
+			var err error
+			taskRecord, err = s.store.GetTask(ctx, run.TaskID)
+			if err != nil {
+				return nil, fmt.Errorf("daemon: scheduler load task %q for run %q: %w", run.TaskID, run.ID, err)
+			}
+			tasks[run.TaskID] = taskRecord
+		}
+		if taskRecord.Paused {
+			continue
+		}
+		work = append(work, schedulerpkg.RunSnapshot{Task: taskRecord, Run: run})
+	}
+	return work, nil
+}
+
+func (s schedulerTaskSource) filterPausedRuns(
+	ctx context.Context,
+	snapshots []schedulerpkg.RunSnapshot,
+) ([]schedulerpkg.RunSnapshot, error) {
+	pauseStore, ok := s.store.(effectiveTaskPauseStore)
+	if !ok {
+		return snapshots, nil
+	}
+	filtered := make([]schedulerpkg.RunSnapshot, 0, len(snapshots))
+	pauses := make(map[string]bool)
+	for idx := range snapshots {
+		snapshot := &snapshots[idx]
+		paused, found := pauses[snapshot.Task.ID]
+		if !found {
+			var err error
+			paused, _, err = pauseStore.IsTaskEffectivelyPaused(ctx, snapshot.Task.ID)
+			if err != nil {
+				return nil, fmt.Errorf("daemon: scheduler check task %q pause: %w", snapshot.Task.ID, err)
+			}
+			pauses[snapshot.Task.ID] = paused
+		}
+		if paused {
+			continue
+		}
+		filtered = append(filtered, *snapshot)
+	}
+	return filtered, nil
+}

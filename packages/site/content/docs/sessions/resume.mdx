@@ -1,0 +1,281 @@
+---
+title: Resume Attach and Replay
+description: How CompozyOS attaches operators to resumable sessions, reconstructs transcripts from events, and returns deterministic recaps.
+---
+
+Resume attach and replay are related, but they are not the same thing in CompozyOS.
+
+- **Resume attach** acquires a short-lived holder lease on an existing live session.
+- **Replay** reconstructs durable history from the stored event log.
+- **Recap** returns a bounded, deterministic snapshot for reorientation.
+
+<OperatorNote>
+  `compozy session resume` is an attach command. It does not start another provider subprocess, call
+  ACP `session/load`, or create a second session authority. CLI, HTTP, UDS, and web attach to the
+  same daemon-owned session record.
+</OperatorNote>
+
+## Continue work after a daemon restart
+
+CompozyOS automatically continues eligible in-flight sessions after an update, requested restart,
+or unexpected daemon exit. The session keeps its ID and partial assistant output. Boot reconciles
+stored sessions and stops surviving provider processes before reopening new-work admission.
+It reloads the native provider session with ACP `session/load` (or `session/resume` when only that
+capability is available), with the existing bounded transcript replay as a fallback.
+
+The interrupted turn receives one durable continuation asking the agent to verify current state
+before repeating actions. A tool call without a recorded result is aborted with an unknown outcome;
+the action may already have happened. Recovery does not promise exactly-once external effects.
+Queued inputs remain ordered behind the continuation. Restart notices appear in the session timeline
+and in `compozy session events`; interrupted sessions retain `stop_reason: "shutdown"` without a
+fabricated provider failure. Confirmed provider crashes retain their failure classification.
+
+Automatic continuation pauses for pending permission or clarification requests, changed runtime
+selection, provider binding, permissions or worktree, maintenance commands, archived sessions, or
+an exhausted retry budget. A completed turn is never continued again. The default limit is three
+recovery attempts in five minutes; inspect the session before sending a fresh prompt after a pause.
+Subagents and Loops retain their existing recovery owners and apply the same restart safety checks.
+
+`compozy daemon stop` and explicit session stops cancel work and never schedule automatic
+continuation. Use `compozy daemon restart` to preserve restart intent. You can opt out in `config.toml`:
+
+```toml
+[session.restart]
+auto_continue = false
+```
+
+Existing configuration and stored histories upgrade without being rewritten or discarded.
+
+## When resume attach is the right tool
+
+Use resume attach when an operator or agent needs to re-enter a session that is still live and
+eligible for an explicit holder:
+
+- after a browser refresh
+- after the CLI process exits while the daemon keeps running
+- after handing an active session from one control surface to another
+- after listing resumable sessions and choosing the same CompozyOS session ID
+
+Use a new session when you want a clean slate. Use history, repair, and recap when the session is
+stopped and you need to understand what happened before either sending a normal prompt to continue
+an eligible session or creating new work. A terminal `process_exit` is not eligible for a normal
+prompt; keep its durable history and create a child with `compozy session new --parent <session-id>`.
+
+## Finding an attachable session
+
+The daemon computes attach eligibility from runtime truth and persists the result in the session
+payload. List only sessions that can be attached:
+
+```bash
+compozy session list --resumable
+compozy session list --resumable --workspace checkout-api
+```
+
+Session payloads include a canonical `badge` plus attach metadata:
+
+```json
+{
+  "id": "sess-1234",
+  "state": "active",
+  "badge": "idle",
+  "attachable": true,
+  "attached_to": "cli:pane-7",
+  "attach_expires_at": "2026-05-20T14:03:00Z"
+}
+```
+
+Badges are product contract, not UI decoration. Clients should render the daemon-provided badge
+instead of inferring status from local timers or transcript text.
+
+## Attaching from CLI and HTTP
+
+Attach by ID:
+
+```bash
+compozy session resume sess-1234
+```
+
+Attach the latest eligible session in a workspace:
+
+```bash
+compozy session resume --latest --workspace checkout-api
+```
+
+Attach over HTTP:
+
+```bash
+curl -X POST \
+  -H 'Content-Type: application/json' \
+  -d '{"attached_to":"cli:pane-7","ttl_seconds":900}' \
+  http://localhost:2123/api/workspaces/ws_alpha/sessions/sess-1234/attach
+```
+
+The request body is optional. `attached_to` identifies the holder. `ttl_seconds` controls the lease
+duration: omitted, zero, and negative values use the 900-second default; positive values cannot
+exceed 86,400 seconds (24 hours). The response returns the session and the attach lease:
+
+```json
+{
+  "session": {
+    "id": "sess-1234",
+    "state": "active",
+    "badge": "idle",
+    "attachable": false,
+    "attached_to": "cli:pane-7",
+    "attach_expires_at": "2026-05-20T14:03:00Z"
+  },
+  "attach": {
+    "session_id": "sess-1234",
+    "attached_to": "cli:pane-7",
+    "attached_at": "2026-05-20T13:58:00Z",
+    "attach_expires_at": "2026-05-20T14:03:00Z"
+  }
+}
+```
+
+The daemon returns `400` when the JSON body is invalid or a positive TTL exceeds 24 hours. It returns
+`409` when the session is not attachable or another holder owns a live lease. A client should then
+show the recap or history instead of trying to restart the session locally.
+
+## Deterministic recap
+
+Recap is the bounded read path for reorientation. It is deterministic for the same stored event
+set, applies the transcript redaction rules, and reports what was omitted by the limit.
+
+```bash
+compozy session recap sess-1234 --limit 20
+```
+
+HTTP clients use the same daemon operation:
+
+```bash
+curl 'http://localhost:2123/api/workspaces/ws_alpha/sessions/sess-1234/recap?limit=20'
+```
+
+Example response shape:
+
+```json
+{
+  "recap": {
+    "session": { "id": "sess-1234", "badge": "idle", "state": "active" },
+    "recent_markers": [
+      {
+        "kind": "prompt_timeout",
+        "summary": "Prompt exceeded the configured timeout",
+        "occurred_at": "2026-05-20T13:56:00Z"
+      }
+    ],
+    "recent_messages": [],
+    "pending_markers": 0,
+    "pending_inputs": 0,
+    "snapshot": {
+      "generated_at": "2026-05-20T13:58:00Z",
+      "event_cursor": 42,
+      "transcript_cursor": 42,
+      "queue_generation": 7,
+      "consistency": "persisted_reads"
+    }
+  }
+}
+```
+
+Recap is useful before attaching, after an interrupted turn, and when agents need a compact state
+summary without parsing raw event rows.
+
+`snapshot.consistency` is a closed string. v1 returns `"persisted_reads"`, which means the recap
+was assembled from persisted event, marker, and input-queue read models with stable cursors. CompozyOS does
+not currently return `"read_snapshot"`.
+
+## Transcript markers
+
+CompozyOS emits `transcript_marker.created` and `transcript_marker.redacted` events for operator-relevant
+session facts such as interrupts, prompt timeouts, unhealthy state, and MCP auth prompts. Markers
+are durable event rows and appear in recap output, logs, and web activity notices.
+
+Markers have a stable kind, severity, summary, timestamp, and optional diagnostic payload. The
+diagnostic payload is redacted before it leaves the daemon when it contains sensitive context.
+
+## Replay surfaces
+
+CompozyOS exposes these read paths for old work:
+
+| Surface                                                             | Use it for                               |
+| ------------------------------------------------------------------- | ---------------------------------------- |
+| `compozy session events`                                            | Raw persisted event rows.                |
+| `compozy session history`                                           | Turn-grouped operator history.           |
+| `GET /api/workspaces/:workspace_id/sessions/:session_id/transcript` | Canonical chat transcript entries.       |
+| `GET /api/workspaces/:workspace_id/sessions/:session_id/stream`     | Live transcript snapshots and deltas.    |
+| `compozy session recap` / `GET .../recap`                           | Bounded redacted reorientation snapshot. |
+
+Transcript assembly is deterministic and event-driven:
+
+- events are sorted by sequence, timestamp, and ID
+- `agent_message` chunks are concatenated into assistant `content`
+- `thought` chunks are concatenated into assistant `thinking`
+- `tool_call` and `tool_result` are stitched together by `tool_call_id`
+- marker events are kept as marker records instead of being guessed from message text
+- empty text chunks are dropped
+- non-chat events such as `plan`, `system`, `done`, and `error` only flush in-progress assistant buffers
+
+The transcript API returns `entries`, not a bare `messages` array. Each entry carries the folded AI
+SDK UI message, a stable `start_sequence` for backward paging, and the latest `sequence` that shaped
+it. Use `next_before_sequence` as `before_sequence` while `has_older` is true; `limit` bounds every
+page. Forward changes come from the session stream, not from the page endpoint.
+
+Live clients should cache `epoch`, `generation`, and the applied stream cursor together. Reconnect
+with all three values. Matching fences produce bounded `transcript_delta` batches; a missing or stale
+fence produces an explicit reset snapshot. The stream rejects the old `replay` query.
+
+## Common cases and gotchas
+
+### Attach after a CLI exits
+
+This is the normal path. The daemon still owns the session, and the new surface obtains a holder
+lease on the same CompozyOS session ID.
+
+### Attach after a terminal stop
+
+Attach is intentionally refused. Inspect recap, history, status, and repair output. A normal prompt
+can restore an eligible stopped session. For a terminal `process_exit`, CompozyOS keeps the original
+session read-only and rejects another prompt before it can try ACP `session/load`. Create a child
+session with `compozy session new --parent <session-id>` when you need to continue separately.
+
+### Resume does not rewrite history
+
+The per-session store is append-only for the CompozyOS session ID. Attach records and transcript markers
+are additional evidence, not replacements for earlier events.
+
+### Restoring a stopped session rebuilds a bounded context
+
+A normal prompt on an eligible stopped session first tries ACP `session/load`. When the agent cannot
+load its own conversation, CompozyOS starts a fresh agent session and sends the stored transcript as one
+bounded replay. The same bound applies when a runtime or model replacement, an account fallback, a
+prompt recovery, or a conversation rewind starts a new agent session. The bound is
+`[session.derive] max_replay_bytes` (default 131072): the newest messages and the original request are
+kept, older ones are replaced by an omission note, and the agent is told where to read them. See
+[Context compaction](/docs/sessions/compaction#rebuilt-sessions-and-bounded-replay) for the exact block
+and rules.
+
+The replay is only the agent's working context. The stored event log is unchanged, and
+`compozy session events`, `compozy session history`, and the transcript API still return the full
+history. That includes history that an earlier release archived as compacted: the upgrade restores
+those events together with their transcript entries and tool routes, so they appear in the transcript,
+search, outline, and fork and rewind anchors as well as in `history` and `events`.
+
+If the first turn after a rebuild is only a [Compact now](/docs/sessions/compaction#compact-now-experimental)
+request, the replay is not spent on it. CompozyOS stores the pending replay with the session (the
+`pending_resume_replay` metadata), so it survives that turn, a stop, a daemon restart, and a native
+`session/load` resume, and it is sent exactly once with the next ordinary prompt. Clearing or
+rewinding the conversation discards a pending replay.
+
+### The command name is historical
+
+`compozy session resume` remains the operator command name, but its contract is attach. Scripts should
+key off the HTTP operation and response payload, not the English verb in the CLI command.
+
+## Next steps
+
+- Use [Event Streaming](/docs/sessions/events) to inspect the stored event log and live SSE stream.
+- Use [Session Lifecycle](/docs/sessions/lifecycle) to understand stopped-session continuation and repair.
+- Use [Context compaction](/docs/sessions/compaction) to understand bounded rebuilds and how CompozyOS observes the agent's own compaction.
+- Use [Permissions](/docs/sessions/permissions) to understand what requires approval before and after attach.

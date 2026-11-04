@@ -1,0 +1,3523 @@
+package config
+
+import (
+	"bytes"
+	"errors"
+	"fmt"
+	"log/slog"
+	"os"
+	"path/filepath"
+	"slices"
+	"strings"
+	"testing"
+	"time"
+
+	hookspkg "github.com/compozy/compozy/internal/hooks"
+	"github.com/compozy/compozy/internal/resources"
+	"github.com/compozy/compozy/internal/vault"
+)
+
+type forbiddenVaultKeyring struct{ t *testing.T }
+
+var _ vault.Keyring = forbiddenVaultKeyring{}
+
+func (r forbiddenVaultKeyring) Get(string, string) (string, error) {
+	r.t.Error("OS keyring Get called without explicit migration")
+	return "", errors.New("keyring must remain untouched")
+}
+
+func (r forbiddenVaultKeyring) Set(string, string, string) error {
+	r.t.Error("OS keyring Set called without explicit migration")
+	return errors.New("keyring must remain untouched")
+}
+
+func (r forbiddenVaultKeyring) Delete(string, string) error {
+	r.t.Error("OS keyring Delete called without explicit migration")
+	return errors.New("keyring must remain untouched")
+}
+
+func TestVaultKeyProviderSelection(t *testing.T) {
+	t.Parallel()
+	t.Run("Should never access the OS keyring on the default file path", func(t *testing.T) {
+		t.Parallel()
+		home := t.TempDir()
+		provider := NewVaultKeyProvider(home, func(string) (string, bool) { return "", false }).(*configuredVaultKeyProvider)
+		provider.ring = vault.NewOSKeyProvider(home, forbiddenVaultKeyring{t: t})
+		original, err := provider.Key()
+		if err != nil {
+			t.Fatal(err)
+		}
+		writeFile(t, filepath.Join(home, ConfigName), "[vault]\nkey_provider = 'file'\n")
+		for range 3 {
+			current, err := provider.Key()
+			if err != nil || !bytes.Equal(original, current) {
+				t.Fatal("file provider changed its key", err)
+			}
+		}
+		writeFile(t, filepath.Join(home, ConfigName), "[vault]\nkey_provider = 'os-keyring'\n")
+		if _, err := provider.Key(); !errors.Is(err, vault.ErrKeyringMigrationRequired) {
+			t.Fatalf("Key() error = %v, want the explicit migration guard", err)
+		}
+	})
+}
+
+func TestLoadValidTOMLConfigWithAllSections(t *testing.T) {
+	workspaceRoot := t.TempDir()
+	homeRoot := filepath.Join(t.TempDir(), "home")
+	t.Setenv("COMPOZY_HOME", homeRoot)
+
+	homePaths, err := ResolveHomePaths()
+	if err != nil {
+		t.Fatalf("ResolveHomePaths() error = %v", err)
+	}
+	if err := EnsureHomeLayout(homePaths); err != nil {
+		t.Fatalf("EnsureHomeLayout() error = %v", err)
+	}
+
+	writeFile(t, homePaths.ConfigFile, `
+[daemon]
+socket = "~/.compozy/custom.sock"
+
+[http]
+host = "127.0.0.1"
+port = 3030
+
+[defaults]
+agent = "researcher"
+provider = "claude"
+
+[agents.soul]
+enabled = false
+max_body_bytes = 16384
+context_projection_bytes = 1024
+
+[agents.heartbeat]
+max_interval = "12h"
+max_concurrent_triage = 3
+enabled = true
+max_body_bytes = 24576
+context_projection_bytes = 2048
+min_interval = "10m"
+default_interval = "45m"
+wake_cooldown = "2m"
+max_wakes_per_cycle = 8
+active_session_only = false
+allow_active_hours_preferences = false
+wake_event_retention = "72h"
+session_health_stale_after = "3m"
+session_health_hook_min_interval = "90s"
+
+[limits]
+max_concurrent_agents = 22
+
+[session.limits]
+timeout = "30m"
+
+[session.stop]
+cooperative_grace = "7s"
+
+[permissions]
+mode = "approve-all"
+
+[[mcp_servers]]
+name = "linear"
+command = "linear-mcp"
+
+[tools]
+enabled = true
+hosted_mcp_enabled = false
+default_max_result_bytes = 131072
+
+[tools.hosted_mcp]
+bind_nonce_ttl_seconds = 45
+
+[tools.policy]
+external_default = "ask"
+approval_timeout_seconds = 90
+trusted_sources = ["mcp:linear", "extension:linear"]
+
+	[providers.claude]
+	auth_mode = "bound_secret"
+	[providers.claude.models]
+	default = "claude-opus"
+	[[providers.claude.credential_slots]]
+	name = "api_key"
+	target_env = "ANTHROPIC_KEY"
+	secret_ref = "env:ANTHROPIC_KEY"
+	kind = "api_key"
+	required = true
+	[[providers.claude.mcp_servers]]
+	name = "github"
+command = "npx"
+args = ["-y", "@modelcontextprotocol/server-github"]
+secret_env = { GITHUB_TOKEN = "env:GITHUB_TOKEN" }
+
+[observability]
+enabled = true
+retention_days = 14
+max_global_bytes = 2048
+agent_probe_timeout = "9s"
+
+[observability.transcripts]
+enabled = true
+segment_bytes = 512
+max_bytes_per_session = 4096
+
+[log]
+level = "debug"
+max_size_mb = 20
+max_backups = 4
+max_age_days = 14
+compress_backups = true
+
+[skills]
+enabled = false
+disabled_skills = ["code-review", "compozy"]
+poll_interval = "5s"
+allowed_marketplace_mcp = ["@registry/skill-a", "@registry/skill-b"]
+allowed_marketplace_hooks = ["@registry/hook-a", "@registry/hook-b"]
+
+[skills.marketplace]
+registry = "clawhub"
+base_url = "https://registry.example.test/api/v1"
+
+[extensions.trust]
+allow_unverified = false
+
+[extensions.sources.github]
+enabled = true
+base_url = "https://api.github.example.test"
+
+[extensions.sources.git]
+enabled = false
+
+[extensions.dev]
+watch_interval = "3s"
+
+[roles.auto_title]
+agent = "claude"
+
+`)
+
+	cfg, err := Load(WithWorkspaceRoot(workspaceRoot))
+	if err != nil {
+		t.Fatalf("Load() error = %v", err)
+	}
+
+	if cfg.Daemon.Socket == "~/.compozy/custom.sock" {
+		t.Fatalf("Load() did not normalize daemon socket path: %q", cfg.Daemon.Socket)
+	}
+	if cfg.HTTP.Host != "127.0.0.1" || cfg.HTTP.Port != 3030 {
+		t.Fatalf("Load() HTTP = %#v", cfg.HTTP)
+	}
+	if cfg.Defaults.Agent != "researcher" {
+		t.Fatalf("Load() Defaults.Agent = %q, want %q", cfg.Defaults.Agent, "researcher")
+	}
+	if cfg.Defaults.Provider != "claude" {
+		t.Fatalf("Load() Defaults.Provider = %q, want %q", cfg.Defaults.Provider, "claude")
+	}
+	if cfg.Session.Stop.CooperativeGrace != 7*time.Second {
+		t.Fatalf("loaded cooperative grace = %s, want 7s", cfg.Session.Stop.CooperativeGrace)
+	}
+	if cfg.Agents.Soul.Enabled {
+		t.Fatal("Load() Agents.Soul.Enabled = true, want false")
+	}
+	if got, want := cfg.Agents.Soul.MaxBodyBytes, int64(16384); got != want {
+		t.Fatalf("Load() Agents.Soul.MaxBodyBytes = %d, want %d", got, want)
+	}
+	if got, want := cfg.Agents.Soul.ContextProjectionBytes, int64(1024); got != want {
+		t.Fatalf("Load() Agents.Soul.ContextProjectionBytes = %d, want %d", got, want)
+	}
+	if !cfg.Agents.Heartbeat.Enabled {
+		t.Fatal("Load() Agents.Heartbeat.Enabled = false, want true")
+	}
+	if got, want := cfg.Agents.Heartbeat.MaxBodyBytes, int64(24576); got != want {
+		t.Fatalf("Load() Agents.Heartbeat.MaxBodyBytes = %d, want %d", got, want)
+	}
+	if got, want := cfg.Agents.Heartbeat.ContextProjectionBytes, int64(2048); got != want {
+		t.Fatalf("Load() Agents.Heartbeat.ContextProjectionBytes = %d, want %d", got, want)
+	}
+	if got, want := cfg.Agents.Heartbeat.MinInterval, 10*time.Minute; got != want {
+		t.Fatalf("Load() Agents.Heartbeat.MinInterval = %s, want %s", got, want)
+	}
+	if cfg.Agents.Heartbeat.MaxInterval != 12*time.Hour || cfg.Agents.Heartbeat.MaxConcurrentTriage != 3 {
+		t.Fatalf("loaded proactive limits: %+v", cfg.Agents.Heartbeat)
+	}
+	if got, want := cfg.Agents.Heartbeat.DefaultInterval, 45*time.Minute; got != want {
+		t.Fatalf("Load() Agents.Heartbeat.DefaultInterval = %s, want %s", got, want)
+	}
+	if got, want := cfg.Agents.Heartbeat.WakeCooldown, 2*time.Minute; got != want {
+		t.Fatalf("Load() Agents.Heartbeat.WakeCooldown = %s, want %s", got, want)
+	}
+	if got, want := cfg.Agents.Heartbeat.MaxWakesPerCycle, 8; got != want {
+		t.Fatalf("Load() Agents.Heartbeat.MaxWakesPerCycle = %d, want %d", got, want)
+	}
+	if cfg.Agents.Heartbeat.ActiveSessionOnly {
+		t.Fatal("Load() Agents.Heartbeat.ActiveSessionOnly = true, want false")
+	}
+	if cfg.Agents.Heartbeat.AllowActiveHoursPreferences {
+		t.Fatal("Load() Agents.Heartbeat.AllowActiveHoursPreferences = true, want false")
+	}
+	if got, want := cfg.Agents.Heartbeat.WakeEventRetention, 72*time.Hour; got != want {
+		t.Fatalf("Load() Agents.Heartbeat.WakeEventRetention = %s, want %s", got, want)
+	}
+	if got, want := cfg.Agents.Heartbeat.SessionHealthStaleAfter, 3*time.Minute; got != want {
+		t.Fatalf("Load() Agents.Heartbeat.SessionHealthStaleAfter = %s, want %s", got, want)
+	}
+	if got, want := cfg.Agents.Heartbeat.SessionHealthHookMinInterval, 90*time.Second; got != want {
+		t.Fatalf("Load() Agents.Heartbeat.SessionHealthHookMinInterval = %s, want %s", got, want)
+	}
+	if cfg.Limits.MaxConcurrentAgents != 22 {
+		t.Fatalf("Load() Limits = %#v", cfg.Limits)
+	}
+	if got, want := cfg.Session.Limits.Timeout, 30*time.Minute; got != want {
+		t.Fatalf("Load() Session.Limits.Timeout = %s, want %s", got, want)
+	}
+	if cfg.Permissions.Mode != PermissionModeApproveAll {
+		t.Fatalf("Load() Permissions.Mode = %q, want %q", cfg.Permissions.Mode, PermissionModeApproveAll)
+	}
+	if cfg.Tools.HostedMCPEnabled {
+		t.Fatal("Load() Tools.HostedMCPEnabled = true, want false")
+	}
+	if got, want := cfg.Tools.DefaultMaxResultBytes, int64(131072); got != want {
+		t.Fatalf("Load() Tools.DefaultMaxResultBytes = %d, want %d", got, want)
+	}
+	if got, want := cfg.Tools.HostedMCP.BindNonceTTLSeconds, 45; got != want {
+		t.Fatalf("Load() Tools.HostedMCP.BindNonceTTLSeconds = %d, want %d", got, want)
+	}
+	if got, want := cfg.Tools.Policy.ExternalDefault, ToolsExternalDefaultAsk; got != want {
+		t.Fatalf("Load() Tools.Policy.ExternalDefault = %q, want %q", got, want)
+	}
+	if got, want := cfg.Tools.Policy.ApprovalTimeoutSeconds, 90; got != want {
+		t.Fatalf("Load() Tools.Policy.ApprovalTimeoutSeconds = %d, want %d", got, want)
+	}
+	if got, want := cfg.Tools.Policy.TrustedSources, []string{
+		"mcp:linear",
+		"extension:linear",
+	}; !slices.Equal(
+		got,
+		want,
+	) {
+		t.Fatalf("Load() Tools.Policy.TrustedSources = %#v, want %#v", got, want)
+	}
+	if cfg.Observability.RetentionDays != 14 || cfg.Observability.MaxGlobalBytes != 2048 ||
+		cfg.Observability.AgentProbeTimeout != 9*time.Second {
+		t.Fatalf("Load() Observability = %#v", cfg.Observability)
+	}
+	if cfg.Observability.Transcripts.SegmentBytes != 512 || cfg.Observability.Transcripts.MaxBytesPerSession != 4096 {
+		t.Fatalf("Load() Transcript config = %#v", cfg.Observability.Transcripts)
+	}
+	if cfg.Log.Level != "debug" {
+		t.Fatalf("Load() Log.Level = %q, want %q", cfg.Log.Level, "debug")
+	}
+	if cfg.Log.MaxSizeMB != 20 || cfg.Log.MaxBackups != 4 ||
+		cfg.Log.MaxAgeDays != 14 || !cfg.Log.CompressBackups {
+		t.Fatalf("Load() Log rotation = %#v", cfg.Log)
+	}
+	if cfg.Skills.Enabled {
+		t.Fatal("Load() Skills.Enabled = true, want false")
+	}
+	if got, want := cfg.Skills.PollInterval, 5*time.Second; got != want {
+		t.Fatalf("Load() Skills.PollInterval = %s, want %s", got, want)
+	}
+	if got, want := cfg.Skills.DisabledSkills, []string{"code-review", "compozy"}; !slices.Equal(got, want) {
+		t.Fatalf("Load() Skills.DisabledSkills = %#v, want %#v", got, want)
+	}
+	if got, want := cfg.Skills.AllowedMarketplaceHooks, []string{
+		"@registry/hook-a",
+		"@registry/hook-b",
+	}; !slices.Equal(
+		got,
+		want,
+	) {
+		t.Fatalf("Load() Skills.AllowedMarketplaceHooks = %#v, want %#v", got, want)
+	}
+
+	if cfg.Extensions.Trust.AllowUnverified {
+		t.Fatal("Load() Extensions.Trust.AllowUnverified = true, want false")
+	}
+	if !cfg.Extensions.Sources.GitHub.Enabled {
+		t.Fatal("Load() Extensions.Sources.GitHub.Enabled = false, want true")
+	}
+	if got, want := cfg.Extensions.Sources.GitHub.BaseURL, "https://api.github.example.test"; got != want {
+		t.Fatalf("Load() Extensions.Sources.GitHub.BaseURL = %q, want %q", got, want)
+	}
+	if cfg.Extensions.Sources.Git.Enabled {
+		t.Fatal("Load() Extensions.Sources.Git.Enabled = true, want false")
+	}
+	if got, want := cfg.Extensions.Dev.WatchInterval, 3*time.Second; got != want {
+		t.Fatalf("Load() Extensions.Dev.WatchInterval = %s, want %s", got, want)
+	}
+
+	if got := cfg.Roles.AutoTitle.Agent; got != "claude" {
+		t.Fatalf("Load() Roles.AutoTitle.Agent = %q, want claude", got)
+	}
+
+	claude, err := cfg.ResolveProvider("claude")
+	if err != nil {
+		t.Fatalf("ResolveProvider() error = %v", err)
+	}
+	if claude.Command == "" || claude.Models.Default != "claude-opus" {
+		t.Fatalf("ResolveProvider() = %#v", claude)
+	}
+	if slots := claude.EffectiveCredentialSlots(); len(slots) != 1 ||
+		slots[0].TargetEnv != "ANTHROPIC_KEY" ||
+		slots[0].SecretRef != "env:ANTHROPIC_KEY" {
+		t.Fatalf("ResolveProvider() CredentialSlots = %#v, want ANTHROPIC_KEY slot", slots)
+	}
+	if len(claude.MCPServers) != 1 || claude.MCPServers[0].Name != "github" {
+		t.Fatalf("ResolveProvider() MCPServers = %#v", claude.MCPServers)
+	}
+}
+
+func TestLogConfigDefaultsAndValidation(t *testing.T) {
+	t.Parallel()
+
+	t.Run("ShouldExposeRotationDefaults", func(t *testing.T) {
+		t.Parallel()
+
+		homePaths, err := ResolveHomePathsFrom(filepath.Join(t.TempDir(), "home"))
+		if err != nil {
+			t.Fatalf("ResolveHomePathsFrom() error = %v", err)
+		}
+		cfg := DefaultWithHome(homePaths)
+		if cfg.Log.MaxSizeMB != 10 || cfg.Log.MaxBackups != 5 || cfg.Log.MaxAgeDays != 30 {
+			t.Fatalf("DefaultWithHome() Log = %#v, want rotation defaults", cfg.Log)
+		}
+		if cfg.Log.CompressBackups {
+			t.Fatal("DefaultWithHome() Log.CompressBackups = true, want false")
+		}
+	})
+
+	tests := []struct {
+		name    string
+		config  LogConfig
+		wantErr string
+	}{
+		{
+			name:   "ShouldAcceptValidRotationConfig",
+			config: LogConfig{Level: "info", MaxSizeMB: 1, MaxBackups: 0, MaxAgeDays: 0},
+		},
+		{
+			name:    "ShouldRejectNonPositiveMaxSize",
+			config:  LogConfig{Level: "info", MaxSizeMB: 0, MaxBackups: 1, MaxAgeDays: 1},
+			wantErr: "log.max_size_mb",
+		},
+		{
+			name:    "ShouldRejectNegativeMaxBackups",
+			config:  LogConfig{Level: "info", MaxSizeMB: 1, MaxBackups: -1, MaxAgeDays: 1},
+			wantErr: "log.max_backups",
+		},
+		{
+			name:    "ShouldRejectNegativeMaxAge",
+			config:  LogConfig{Level: "info", MaxSizeMB: 1, MaxBackups: 1, MaxAgeDays: -1},
+			wantErr: "log.max_age_days",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			err := tt.config.Validate()
+			if tt.wantErr == "" {
+				if err != nil {
+					t.Fatalf("Validate() error = %v, want nil", err)
+				}
+				return
+			}
+			if err == nil {
+				t.Fatal("Validate() error = nil, want non-nil")
+			}
+			if !strings.Contains(err.Error(), tt.wantErr) {
+				t.Fatalf("Validate() error = %v, want %q", err, tt.wantErr)
+			}
+		})
+	}
+}
+
+func TestDaemonMemoryReportIntervalDefaultsAndValidation(t *testing.T) {
+	t.Parallel()
+
+	t.Run("Should expose the five minute default", func(t *testing.T) {
+		t.Parallel()
+
+		homePaths, err := ResolveHomePathsFrom(filepath.Join(t.TempDir(), "home"))
+		if err != nil {
+			t.Fatalf("ResolveHomePathsFrom() error = %v", err)
+		}
+		cfg := DefaultWithHome(homePaths)
+		if got, want := cfg.Daemon.MemoryReportInterval, 5*time.Minute; got != want {
+			t.Fatalf("DefaultWithHome() Daemon.MemoryReportInterval = %s, want %s", got, want)
+		}
+	})
+
+	t.Run("Should expose the subprocess health escalation default", func(t *testing.T) {
+		t.Parallel()
+
+		homePaths, err := ResolveHomePathsFrom(filepath.Join(t.TempDir(), "home"))
+		if err != nil {
+			t.Fatalf("ResolveHomePathsFrom() error = %v", err)
+		}
+		cfg := DefaultWithHome(homePaths)
+		if got, want := cfg.Daemon.SubprocessHealthEscalationThreshold, 3; got != want {
+			t.Fatalf("DefaultWithHome() threshold = %d, want %d", got, want)
+		}
+	})
+
+	t.Run("Should allow zero to disable reports and subprocess health escalation", func(t *testing.T) {
+		t.Parallel()
+
+		cfg := DaemonConfig{
+			Socket:         "/tmp/compozy.sock",
+			ReloadTimeouts: DefaultDaemonReloadTimeoutsConfig(),
+		}
+		if err := cfg.Validate(); err != nil {
+			t.Fatalf("Validate() error = %v, want nil", err)
+		}
+	})
+
+	t.Run("Should reject a negative interval", func(t *testing.T) {
+		t.Parallel()
+
+		cfg := DaemonConfig{
+			Socket:               "/tmp/compozy.sock",
+			MemoryReportInterval: -time.Second,
+			ReloadTimeouts:       DefaultDaemonReloadTimeoutsConfig(),
+		}
+		err := cfg.Validate()
+		if err == nil {
+			t.Fatal("Validate() error = nil, want negative interval rejection")
+		}
+		if !strings.Contains(err.Error(), daemonMemoryReportIntervalPath) {
+			t.Fatalf("Validate() error = %v, want %q", err, daemonMemoryReportIntervalPath)
+		}
+	})
+
+	t.Run("Should reject a negative subprocess health escalation threshold", func(t *testing.T) {
+		t.Parallel()
+
+		cfg := DaemonConfig{
+			Socket:                              "/tmp/compozy.sock",
+			SubprocessHealthEscalationThreshold: -1,
+			ReloadTimeouts:                      DefaultDaemonReloadTimeoutsConfig(),
+		}
+		err := cfg.Validate()
+		if err == nil {
+			t.Fatal("Validate() error = nil, want negative threshold rejection")
+		}
+		if !strings.Contains(err.Error(), daemonSubprocessHealthEscalationThresholdPath) {
+			t.Fatalf("Validate() error = %v, want %q", err, daemonSubprocessHealthEscalationThresholdPath)
+		}
+	})
+}
+
+func TestDefaultWithHomeIncludesSoulDefaults(t *testing.T) {
+	t.Parallel()
+
+	homePaths, err := ResolveHomePathsFrom(filepath.Join(t.TempDir(), "home"))
+	if err != nil {
+		t.Fatalf("ResolveHomePathsFrom() error = %v", err)
+	}
+
+	cfg := DefaultWithHome(homePaths)
+	if !cfg.Agents.Soul.Enabled {
+		t.Fatal("DefaultWithHome() Agents.Soul.Enabled = false, want true")
+	}
+	if got, want := cfg.Agents.Soul.MaxBodyBytes, int64(32768); got != want {
+		t.Fatalf("DefaultWithHome() Agents.Soul.MaxBodyBytes = %d, want %d", got, want)
+	}
+	if got, want := cfg.Agents.Soul.ContextProjectionBytes, int64(2048); got != want {
+		t.Fatalf("DefaultWithHome() Agents.Soul.ContextProjectionBytes = %d, want %d", got, want)
+	}
+}
+
+func TestDefaultWithHomeIncludesMCPOAuthDefaults(t *testing.T) {
+	t.Parallel()
+
+	cfg := DefaultWithHome(HomePaths{})
+	t.Run("Should populate the default MCP OAuth client metadata URL", func(t *testing.T) {
+		t.Parallel()
+		if got, want := cfg.MCP.OAuth.ClientMetadataURL, DefaultMCPClientMetadataURL; got != want {
+			t.Fatalf("DefaultWithHome() MCP.OAuth.ClientMetadataURL = %q, want %q", got, want)
+		}
+	})
+	t.Run("Should populate the default MCP OAuth redirect URI", func(t *testing.T) {
+		t.Parallel()
+		if got, want := cfg.MCP.OAuth.RedirectURI, "http://127.0.0.1:2123/api/mcp/oauth/callback"; got != want {
+			t.Fatalf("DefaultWithHome() MCP.OAuth.RedirectURI = %q, want %q", got, want)
+		}
+	})
+}
+
+func TestSoulConfigValidation(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name    string
+		config  SoulConfig
+		wantErr string
+	}{
+		{
+			name:    "Should reject zero max body bytes",
+			config:  SoulConfig{Enabled: true, MaxBodyBytes: 0, ContextProjectionBytes: 1},
+			wantErr: "agents.soul.max_body_bytes",
+		},
+		{
+			name:    "Should reject zero context projection bytes",
+			config:  SoulConfig{Enabled: true, MaxBodyBytes: 1, ContextProjectionBytes: 0},
+			wantErr: "agents.soul.context_projection_bytes",
+		},
+		{
+			name:    "Should reject context projection above max body bytes",
+			config:  SoulConfig{Enabled: true, MaxBodyBytes: 10, ContextProjectionBytes: 11},
+			wantErr: "agents.soul.context_projection_bytes must be <=",
+		},
+		{
+			name:   "Should accept disabled soul with valid limits",
+			config: SoulConfig{Enabled: false, MaxBodyBytes: 10, ContextProjectionBytes: 5},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			err := tt.config.Validate()
+			if tt.wantErr == "" {
+				if err != nil {
+					t.Fatalf("Validate() error = %v, want nil", err)
+				}
+				return
+			}
+			if err == nil {
+				t.Fatal("Validate() error = nil, want non-nil")
+			}
+			if !strings.Contains(err.Error(), tt.wantErr) {
+				t.Fatalf("Validate() error = %v, want %q", err, tt.wantErr)
+			}
+		})
+	}
+}
+
+func TestHeartbeatConfigDefaultsAndValidation(t *testing.T) {
+	t.Run("Should replace triage model overrides and reject blank models", func(t *testing.T) {
+		t.Parallel()
+		cfg := DefaultHeartbeatConfig()
+		if len(cfg.TriageModels) != 0 {
+			t.Fatal("default model override")
+		}
+		models := map[string]string{"claude": "haiku"}
+		heartbeatOverlay{TriageModels: models}.Apply(&cfg)
+		models["claude"] = "changed"
+		if cfg.TriageModels["claude"] != "haiku" {
+			t.Fatal("overlay map aliased")
+		}
+		if err := cfg.Validate(); err != nil {
+			t.Fatal(err)
+		}
+		cfg.TriageModels["claude"] = " "
+		if cfg.Validate() == nil {
+			t.Fatal("blank model accepted")
+		}
+		heartbeatOverlay{TriageModels: map[string]string{}}.Apply(&cfg)
+		if len(cfg.TriageModels) != 0 {
+			t.Fatal("empty overlay did not clear models")
+		}
+	})
+	t.Run("Should apply proactive interval and concurrency bounds under heartbeat", func(t *testing.T) {
+		t.Parallel()
+		cfg := DefaultHeartbeatConfig()
+		interval, concurrency := 8*time.Hour, 3
+		heartbeatOverlay{MaxInterval: &interval, MaxConcurrentTriage: &concurrency}.Apply(&cfg)
+		if cfg.MaxInterval != interval || cfg.MaxConcurrentTriage != concurrency {
+			t.Fatalf("overlay=%+v", cfg)
+		}
+		if err := cfg.Validate(); err != nil {
+			t.Fatal(err)
+		}
+		cfg.MaxConcurrentTriage = 0
+		if cfg.Validate() == nil {
+			t.Fatal("accepted zero concurrency")
+		}
+		cfg.MaxConcurrentTriage = concurrency
+		cfg.MaxInterval = cfg.QuietBackoffCap - time.Second
+		if cfg.Validate() == nil {
+			t.Fatal("accepted maximum below quiet backoff cap")
+		}
+	})
+	t.Run("Should default merge and validate the fatigue limit", func(t *testing.T) {
+		t.Parallel()
+		cfg := DefaultHeartbeatConfig()
+		if cfg.FatigueLimit != 10 {
+			t.Fatalf("default fatigue limit=%d", cfg.FatigueLimit)
+		}
+		limit := 3
+		heartbeatOverlay{FatigueLimit: &limit}.Apply(&cfg)
+		if cfg.FatigueLimit != 3 {
+			t.Fatalf("merged fatigue limit=%d", cfg.FatigueLimit)
+		}
+		if err := cfg.Validate(); err != nil {
+			t.Fatal(err)
+		}
+		limit = 0
+		heartbeatOverlay{FatigueLimit: &limit}.Apply(&cfg)
+		if err := cfg.Validate(); err == nil {
+			t.Fatal("accepted zero fatigue limit")
+		}
+	})
+
+	t.Parallel()
+
+	t.Run("Should include built in heartbeat defaults", func(t *testing.T) {
+		t.Parallel()
+
+		homePaths, err := ResolveHomePathsFrom(filepath.Join(t.TempDir(), "home"))
+		if err != nil {
+			t.Fatalf("ResolveHomePathsFrom() error = %v", err)
+		}
+
+		cfg := DefaultWithHome(homePaths)
+		if !cfg.Agents.Heartbeat.Enabled {
+			t.Fatal("DefaultWithHome() Agents.Heartbeat.Enabled = false, want true")
+		}
+		if got, want := cfg.Agents.Heartbeat.MaxBodyBytes, int64(32768); got != want {
+			t.Fatalf("DefaultWithHome() Agents.Heartbeat.MaxBodyBytes = %d, want %d", got, want)
+		}
+		if got, want := cfg.Agents.Heartbeat.ContextProjectionBytes, int64(4096); got != want {
+			t.Fatalf("DefaultWithHome() Agents.Heartbeat.ContextProjectionBytes = %d, want %d", got, want)
+		}
+		if got, want := cfg.Agents.Heartbeat.MinInterval, 5*time.Minute; got != want {
+			t.Fatalf("DefaultWithHome() Agents.Heartbeat.MinInterval = %s, want %s", got, want)
+		}
+		if got, want := cfg.Agents.Heartbeat.DefaultInterval, 30*time.Minute; got != want {
+			t.Fatalf("DefaultWithHome() Agents.Heartbeat.DefaultInterval = %s, want %s", got, want)
+		}
+		if got, want := cfg.Agents.Heartbeat.WakeCooldown, time.Minute; got != want {
+			t.Fatalf("DefaultWithHome() Agents.Heartbeat.WakeCooldown = %s, want %s", got, want)
+		}
+		if got, want := cfg.Agents.Heartbeat.MaxWakesPerCycle, 25; got != want {
+			t.Fatalf("DefaultWithHome() Agents.Heartbeat.MaxWakesPerCycle = %d, want %d", got, want)
+		}
+		if !cfg.Agents.Heartbeat.ActiveSessionOnly {
+			t.Fatal("DefaultWithHome() Agents.Heartbeat.ActiveSessionOnly = false, want true")
+		}
+		if !cfg.Agents.Heartbeat.AllowActiveHoursPreferences {
+			t.Fatal("DefaultWithHome() Agents.Heartbeat.AllowActiveHoursPreferences = false, want true")
+		}
+		if got, want := cfg.Agents.Heartbeat.WakeEventRetention, 168*time.Hour; got != want {
+			t.Fatalf("DefaultWithHome() Agents.Heartbeat.WakeEventRetention = %s, want %s", got, want)
+		}
+		if got, want := cfg.Agents.Heartbeat.SessionHealthStaleAfter, 2*time.Minute; got != want {
+			t.Fatalf("DefaultWithHome() Agents.Heartbeat.SessionHealthStaleAfter = %s, want %s", got, want)
+		}
+		if got, want := cfg.Agents.Heartbeat.SessionHealthHookMinInterval, time.Minute; got != want {
+			t.Fatalf("DefaultWithHome() Agents.Heartbeat.SessionHealthHookMinInterval = %s, want %s", got, want)
+		}
+	})
+
+	base := DefaultHeartbeatConfig()
+	tests := []struct {
+		name    string
+		mutate  func(*HeartbeatConfig)
+		wantErr string
+	}{
+		{
+			name:    "Should reject zero max body bytes",
+			mutate:  func(cfg *HeartbeatConfig) { cfg.MaxBodyBytes = 0 },
+			wantErr: "agents.heartbeat.max_body_bytes",
+		},
+		{
+			name:    "Should reject unbounded max body bytes",
+			mutate:  func(cfg *HeartbeatConfig) { cfg.MaxBodyBytes = 2 << 20 },
+			wantErr: "agents.heartbeat.max_body_bytes must be <=",
+		},
+		{
+			name:    "Should reject zero context projection bytes",
+			mutate:  func(cfg *HeartbeatConfig) { cfg.ContextProjectionBytes = 0 },
+			wantErr: "agents.heartbeat.context_projection_bytes",
+		},
+		{
+			name: "Should reject context projection above max body bytes",
+			mutate: func(cfg *HeartbeatConfig) {
+				cfg.MaxBodyBytes = 128
+				cfg.ContextProjectionBytes = 256
+			},
+			wantErr: "agents.heartbeat.context_projection_bytes must be <=",
+		},
+		{
+			name:    "Should reject zero min interval",
+			mutate:  func(cfg *HeartbeatConfig) { cfg.MinInterval = 0 },
+			wantErr: "agents.heartbeat.min_interval",
+		},
+		{
+			name: "Should reject min interval above default interval",
+			mutate: func(cfg *HeartbeatConfig) {
+				cfg.MinInterval = time.Hour
+				cfg.DefaultInterval = time.Minute
+			},
+			wantErr: "agents.heartbeat.min_interval must be <=",
+		},
+		{
+			name:    "Should reject zero wake cooldown",
+			mutate:  func(cfg *HeartbeatConfig) { cfg.WakeCooldown = 0 },
+			wantErr: "agents.heartbeat.wake_cooldown",
+		},
+		{
+			name:    "Should reject zero max wakes per cycle",
+			mutate:  func(cfg *HeartbeatConfig) { cfg.MaxWakesPerCycle = 0 },
+			wantErr: "agents.heartbeat.max_wakes_per_cycle",
+		},
+		{
+			name:    "Should reject wake event retention below one hour",
+			mutate:  func(cfg *HeartbeatConfig) { cfg.WakeEventRetention = 59 * time.Minute },
+			wantErr: "agents.heartbeat.wake_event_retention",
+		},
+		{
+			name:    "Should reject zero session health stale interval",
+			mutate:  func(cfg *HeartbeatConfig) { cfg.SessionHealthStaleAfter = 0 },
+			wantErr: "agents.heartbeat.session_health_stale_after",
+		},
+		{
+			name:    "Should reject zero session health hook interval",
+			mutate:  func(cfg *HeartbeatConfig) { cfg.SessionHealthHookMinInterval = 0 },
+			wantErr: "agents.heartbeat.session_health_hook_min_interval",
+		},
+		{
+			name:   "Should accept disabled heartbeat with valid limits",
+			mutate: func(cfg *HeartbeatConfig) { cfg.Enabled = false },
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			cfg := base
+			tt.mutate(&cfg)
+			err := cfg.Validate()
+			if tt.wantErr == "" {
+				if err != nil {
+					t.Fatalf("Validate() error = %v, want nil", err)
+				}
+				return
+			}
+			if err == nil {
+				t.Fatal("Validate() error = nil, want non-nil")
+			}
+			if !strings.Contains(err.Error(), tt.wantErr) {
+				t.Fatalf("Validate() error = %v, want %q", err, tt.wantErr)
+			}
+		})
+	}
+}
+
+func TestLoadWorkspaceOverridesGlobalValues(t *testing.T) {
+	workspaceRoot := t.TempDir()
+	homeRoot := filepath.Join(t.TempDir(), "home")
+	t.Setenv("COMPOZY_HOME", homeRoot)
+
+	homePaths, err := ResolveHomePaths()
+	if err != nil {
+		t.Fatalf("ResolveHomePaths() error = %v", err)
+	}
+	if err := EnsureHomeLayout(homePaths); err != nil {
+		t.Fatalf("EnsureHomeLayout() error = %v", err)
+	}
+
+	writeFile(t, homePaths.ConfigFile, `
+[http]
+host = "localhost"
+port = 2123
+
+	[providers.claude]
+	auth_mode = "bound_secret"
+	[providers.claude.models]
+	default = "global-model"
+	[[providers.claude.models.curated]]
+	id = "global-model"
+	display_name = "Global Model"
+	[[providers.claude.credential_slots]]
+	name = "api_key"
+	target_env = "GLOBAL_KEY"
+	secret_ref = "env:GLOBAL_KEY"
+	kind = "api_key"
+	required = true
+
+[roles.auto_title]
+enabled = false
+
+[session.limits]
+timeout = "20m"
+
+[skills]
+enabled = true
+disabled_skills = ["global-skill"]
+poll_interval = "3s"
+allowed_marketplace_mcp = ["@global/skill"]
+allowed_marketplace_hooks = ["@global/hook"]
+
+[skills.marketplace]
+registry = "clawhub"
+base_url = "https://global.example.test/api/v1"
+`)
+	writeFile(t, filepath.Join(workspaceRoot, DirName, ConfigName), `
+[http]
+port = 4242
+
+[providers.claude]
+[providers.claude.models]
+default = "workspace-model"
+[[providers.claude.models.curated]]
+id = "workspace-model"
+display_name = "Workspace Model"
+reasoning_efforts = ["low", "high"]
+default_reasoning_effort = "high"
+
+[roles.auto_title]
+enabled = true
+
+[session.limits]
+timeout = "45m"
+
+[skills]
+enabled = false
+disabled_skills = ["workspace-skill"]
+poll_interval = "9s"
+allowed_marketplace_mcp = ["@workspace/skill"]
+allowed_marketplace_hooks = ["@workspace/hook"]
+
+[skills.marketplace]
+registry = "clawhub"
+base_url = "https://workspace.example.test/api/v1"
+`)
+
+	cfg, err := Load(WithWorkspaceRoot(workspaceRoot))
+	if err != nil {
+		t.Fatalf("Load() error = %v", err)
+	}
+
+	if cfg.HTTP.Host != "localhost" || cfg.HTTP.Port != 4242 {
+		t.Fatalf("Load() HTTP = %#v", cfg.HTTP)
+	}
+	if got, want := cfg.Session.Limits.Timeout, 45*time.Minute; got != want {
+		t.Fatalf("Load() Session.Limits.Timeout = %s, want %s", got, want)
+	}
+	if !cfg.Roles.AutoTitle.Enabled {
+		t.Fatal("Load() Roles.AutoTitle.Enabled = false, want workspace override true")
+	}
+
+	claude, err := cfg.ResolveProvider("claude")
+	if err != nil {
+		t.Fatalf("ResolveProvider() error = %v", err)
+	}
+	if claude.Models.Default != "workspace-model" {
+		t.Fatalf("ResolveProvider() Models.Default = %q, want %q", claude.Models.Default, "workspace-model")
+	}
+	if len(claude.Models.Curated) != 1 {
+		t.Fatalf("ResolveProvider() Models.Curated = %#v, want one workspace model", claude.Models.Curated)
+	}
+	if got, want := claude.Models.Curated[0].ID, "workspace-model"; got != want {
+		t.Fatalf("ResolveProvider() Models.Curated[0].ID = %q, want %q", got, want)
+	}
+	if got, want := claude.Models.Curated[0].DisplayName, "Workspace Model"; got != want {
+		t.Fatalf("ResolveProvider() Models.Curated[0].DisplayName = %q, want %q", got, want)
+	}
+	if got, want := claude.Models.Curated[0].DefaultReasoningEffort, "high"; got != want {
+		t.Fatalf("ResolveProvider() Models.Curated[0].DefaultReasoningEffort = %q, want %q", got, want)
+	}
+	if slots := claude.EffectiveCredentialSlots(); len(slots) != 1 ||
+		slots[0].TargetEnv != "GLOBAL_KEY" ||
+		slots[0].SecretRef != "env:GLOBAL_KEY" {
+		t.Fatalf("ResolveProvider() CredentialSlots = %#v, want GLOBAL_KEY slot", slots)
+	}
+	if cfg.Skills.Enabled {
+		t.Fatal("Load() Skills.Enabled = true, want false")
+	}
+	if got, want := cfg.Skills.AllowedMarketplaceHooks, []string{"@workspace/hook"}; !slices.Equal(got, want) {
+		t.Fatalf("Load() Skills.AllowedMarketplaceHooks = %#v, want %#v", got, want)
+	}
+
+	if got, want := cfg.Skills.PollInterval, 9*time.Second; got != want {
+		t.Fatalf("Load() Skills.PollInterval = %s, want %s", got, want)
+	}
+	if got, want := cfg.Skills.DisabledSkills, []string{"workspace-skill"}; !slices.Equal(got, want) {
+		t.Fatalf("Load() Skills.DisabledSkills = %#v, want %#v", got, want)
+	}
+}
+
+func TestLoadWorkspaceOverridesAgentsSoulConfig(t *testing.T) {
+	t.Parallel()
+
+	workspaceRoot := t.TempDir()
+	homePaths, err := ResolveHomePathsFrom(filepath.Join(t.TempDir(), "home"))
+	if err != nil {
+		t.Fatalf("ResolveHomePathsFrom() error = %v", err)
+	}
+	if err := EnsureHomeLayout(homePaths); err != nil {
+		t.Fatalf("EnsureHomeLayout() error = %v", err)
+	}
+
+	writeFile(t, homePaths.ConfigFile, `
+[agents.soul]
+enabled = false
+max_body_bytes = 40000
+context_projection_bytes = 2000
+`)
+	writeFile(t, filepath.Join(workspaceRoot, DirName, ConfigName), `
+[agents.soul]
+context_projection_bytes = 4096
+`)
+
+	cfg, err := LoadForHome(homePaths, WithWorkspaceRoot(workspaceRoot))
+	if err != nil {
+		t.Fatalf("LoadForHome() error = %v", err)
+	}
+
+	if cfg.Agents.Soul.Enabled {
+		t.Fatal("LoadForHome() Agents.Soul.Enabled = true, want global false")
+	}
+	if got, want := cfg.Agents.Soul.MaxBodyBytes, int64(40000); got != want {
+		t.Fatalf("LoadForHome() Agents.Soul.MaxBodyBytes = %d, want %d", got, want)
+	}
+	if got, want := cfg.Agents.Soul.ContextProjectionBytes, int64(4096); got != want {
+		t.Fatalf("LoadForHome() Agents.Soul.ContextProjectionBytes = %d, want %d", got, want)
+	}
+}
+
+func TestLoadWorkspaceOverridesAgentsHeartbeatConfig(t *testing.T) {
+	t.Parallel()
+
+	t.Run("Should merge global and workspace heartbeat overlays", func(t *testing.T) {
+		t.Parallel()
+
+		workspaceRoot := t.TempDir()
+		homePaths, err := ResolveHomePathsFrom(filepath.Join(t.TempDir(), "home"))
+		if err != nil {
+			t.Fatalf("ResolveHomePathsFrom() error = %v", err)
+		}
+		if err := EnsureHomeLayout(homePaths); err != nil {
+			t.Fatalf("EnsureHomeLayout() error = %v", err)
+		}
+
+		writeFile(t, homePaths.ConfigFile, `
+[agents.heartbeat]
+enabled = false
+max_body_bytes = 60000
+context_projection_bytes = 3000
+min_interval = "15m"
+default_interval = "45m"
+wake_cooldown = "3m"
+max_wakes_per_cycle = 4
+active_session_only = true
+allow_active_hours_preferences = true
+wake_event_retention = "48h"
+session_health_stale_after = "4m"
+session_health_hook_min_interval = "2m"
+`)
+		writeFile(t, filepath.Join(workspaceRoot, DirName, ConfigName), `
+[agents.heartbeat]
+context_projection_bytes = 4096
+default_interval = "1h"
+allow_active_hours_preferences = false
+`)
+
+		cfg, err := LoadForHome(homePaths, WithWorkspaceRoot(workspaceRoot))
+		if err != nil {
+			t.Fatalf("LoadForHome() error = %v", err)
+		}
+
+		if cfg.Agents.Heartbeat.Enabled {
+			t.Fatal("LoadForHome() Agents.Heartbeat.Enabled = true, want global false")
+		}
+		if got, want := cfg.Agents.Heartbeat.MaxBodyBytes, int64(60000); got != want {
+			t.Fatalf("LoadForHome() Agents.Heartbeat.MaxBodyBytes = %d, want %d", got, want)
+		}
+		if got, want := cfg.Agents.Heartbeat.ContextProjectionBytes, int64(4096); got != want {
+			t.Fatalf("LoadForHome() Agents.Heartbeat.ContextProjectionBytes = %d, want %d", got, want)
+		}
+		if got, want := cfg.Agents.Heartbeat.MinInterval, 15*time.Minute; got != want {
+			t.Fatalf("LoadForHome() Agents.Heartbeat.MinInterval = %s, want %s", got, want)
+		}
+		if got, want := cfg.Agents.Heartbeat.DefaultInterval, time.Hour; got != want {
+			t.Fatalf("LoadForHome() Agents.Heartbeat.DefaultInterval = %s, want %s", got, want)
+		}
+		if got, want := cfg.Agents.Heartbeat.WakeCooldown, 3*time.Minute; got != want {
+			t.Fatalf("LoadForHome() Agents.Heartbeat.WakeCooldown = %s, want %s", got, want)
+		}
+		if got, want := cfg.Agents.Heartbeat.MaxWakesPerCycle, 4; got != want {
+			t.Fatalf("LoadForHome() Agents.Heartbeat.MaxWakesPerCycle = %d, want %d", got, want)
+		}
+		if !cfg.Agents.Heartbeat.ActiveSessionOnly {
+			t.Fatal("LoadForHome() Agents.Heartbeat.ActiveSessionOnly = false, want true")
+		}
+		if cfg.Agents.Heartbeat.AllowActiveHoursPreferences {
+			t.Fatal("LoadForHome() Agents.Heartbeat.AllowActiveHoursPreferences = true, want workspace false")
+		}
+		if got, want := cfg.Agents.Heartbeat.WakeEventRetention, 48*time.Hour; got != want {
+			t.Fatalf("LoadForHome() Agents.Heartbeat.WakeEventRetention = %s, want %s", got, want)
+		}
+		if got, want := cfg.Agents.Heartbeat.SessionHealthStaleAfter, 4*time.Minute; got != want {
+			t.Fatalf("LoadForHome() Agents.Heartbeat.SessionHealthStaleAfter = %s, want %s", got, want)
+		}
+		if got, want := cfg.Agents.Heartbeat.SessionHealthHookMinInterval, 2*time.Minute; got != want {
+			t.Fatalf("LoadForHome() Agents.Heartbeat.SessionHealthHookMinInterval = %s, want %s", got, want)
+		}
+	})
+}
+
+func TestLoadMergesTopLevelMCPServersAcrossConfigAndJSONSidecars(t *testing.T) {
+	workspaceRoot := t.TempDir()
+	homeRoot := filepath.Join(t.TempDir(), "home")
+	t.Setenv("COMPOZY_HOME", homeRoot)
+
+	homePaths, err := ResolveHomePaths()
+	if err != nil {
+		t.Fatalf("ResolveHomePaths() error = %v", err)
+	}
+	if err := EnsureHomeLayout(homePaths); err != nil {
+		t.Fatalf("EnsureHomeLayout() error = %v", err)
+	}
+
+	writeFile(t, homePaths.ConfigFile, `
+[[mcp_servers]]
+name = "partial"
+command = "global-command"
+
+[[mcp_servers]]
+name = "sidecar"
+command = "global-inline"
+args = ["--inline"]
+`)
+	writeFile(t, filepath.Join(homePaths.HomeDir, MCPJSONName), `{
+  "mcpServers": {
+    "sidecar": {
+      "command": "global-sidecar"
+    }
+  }
+}`)
+	writeFile(t, filepath.Join(workspaceRoot, DirName, ConfigName), `
+[[mcp_servers]]
+name = "partial"
+args = ["--workspace"]
+env = { WORKSPACE = "1" }
+
+[[mcp_servers]]
+name = "workspace-only"
+command = "workspace-command"
+
+[[mcp_servers]]
+name = "replace-me"
+command = "workspace-inline"
+`)
+	writeFile(t, filepath.Join(workspaceRoot, DirName, MCPJSONName), `{
+  "mcp_servers": {
+    "replace-me": {
+      "command": "workspace-sidecar"
+    },
+    "workspace-json": {
+      "command": "workspace-json-command"
+    }
+  }
+}`)
+
+	cfg, err := Load(WithWorkspaceRoot(workspaceRoot))
+	if err != nil {
+		t.Fatalf("Load() error = %v", err)
+	}
+
+	if got, want := len(cfg.MCPServers), 5; got != want {
+		t.Fatalf("Load() MCPServers len = %d, want %d (%#v)", got, want, cfg.MCPServers)
+	}
+	if got, want := cfg.MCPServers[0].Name, "partial"; got != want {
+		t.Fatalf("Load() MCPServers[0].Name = %q, want %q", got, want)
+	}
+	if got, want := cfg.MCPServers[0].Command, "global-command"; got != want {
+		t.Fatalf("Load() partial.Command = %q, want %q", got, want)
+	}
+	if got, want := cfg.MCPServers[0].Args[0], "--workspace"; got != want {
+		t.Fatalf("Load() partial.Args = %#v, want workspace field merge", cfg.MCPServers[0].Args)
+	}
+	if got, want := cfg.MCPServers[0].Env["WORKSPACE"], "1"; got != want {
+		t.Fatalf("Load() partial.Env[WORKSPACE] = %q, want %q", got, want)
+	}
+	if got, want := cfg.MCPServers[1].Command, "global-sidecar"; got != want {
+		t.Fatalf("Load() sidecar.Command = %q, want %q", got, want)
+	}
+	if got := len(cfg.MCPServers[1].Args); got != 0 {
+		t.Fatalf("Load() sidecar.Args = %#v, want same-scope sidecar replacement", cfg.MCPServers[1].Args)
+	}
+	if got, want := cfg.MCPServers[2].Command, "workspace-command"; got != want {
+		t.Fatalf("Load() workspace-only.Command = %q, want %q", got, want)
+	}
+	if got, want := cfg.MCPServers[3].Command, "workspace-sidecar"; got != want {
+		t.Fatalf("Load() replace-me.Command = %q, want %q", got, want)
+	}
+	if got, want := cfg.MCPServers[4].Command, "workspace-json-command"; got != want {
+		t.Fatalf("Load() workspace-json.Command = %q, want %q", got, want)
+	}
+}
+
+func TestLoadSupportsRemoteMCPAuthFieldsInTOML(t *testing.T) {
+	workspaceRoot := t.TempDir()
+	homeRoot := filepath.Join(t.TempDir(), "home")
+	t.Setenv("COMPOZY_HOME", homeRoot)
+
+	homePaths, err := ResolveHomePaths()
+	if err != nil {
+		t.Fatalf("ResolveHomePaths() error = %v", err)
+	}
+	if err := EnsureHomeLayout(homePaths); err != nil {
+		t.Fatalf("EnsureHomeLayout() error = %v", err)
+	}
+
+	writeFile(t, homePaths.ConfigFile, `
+[[mcp_servers]]
+name = "linear"
+transport = "http"
+url = "https://mcp.example/mcp"
+
+[mcp_servers.auth]
+registration = "pre_registered"
+issuer_url = "https://auth.example"
+client_id = "client-id"
+client_secret_ref = "env:LINEAR_CLIENT_SECRET"
+scopes = ["read"]
+
+[[providers.codex.mcp_servers]]
+name = "remote-provider"
+transport = "http"
+url = "https://provider.example/mcp"
+
+[providers.codex.mcp_servers.auth]
+registration = "pre_registered"
+issuer_url = "https://issuer.example"
+client_id = "provider-client"
+scopes = ["tools"]
+`)
+
+	cfg, err := Load(WithWorkspaceRoot(workspaceRoot))
+	if err != nil {
+		t.Fatalf("Load(remote MCP TOML) error = %v", err)
+	}
+
+	if got, want := len(cfg.MCPServers), 1; got != want {
+		t.Fatalf("Load() MCPServers len = %d, want %d (%#v)", got, want, cfg.MCPServers)
+	}
+	linear := cfg.MCPServers[0]
+	if got, want := linear.Transport, MCPServerTransportHTTP; got != want {
+		t.Fatalf("Load() linear.Transport = %q, want %q", got, want)
+	}
+	if got, want := linear.URL, "https://mcp.example/mcp"; got != want {
+		t.Fatalf("Load() linear.URL = %q, want %q", got, want)
+	}
+	if got, want := linear.Auth.Registration, MCPAuthRegistrationPreRegistered; got != want {
+		t.Fatalf("Load() linear.Auth.Registration = %q, want %q", got, want)
+	}
+	if got, want := linear.Auth.IssuerURL, "https://auth.example"; got != want {
+		t.Fatalf("Load() linear.Auth.IssuerURL = %q, want %q", got, want)
+	}
+	if got, want := linear.Auth.ClientID, "client-id"; got != want {
+		t.Fatalf("Load() linear.Auth.ClientID = %q, want %q", got, want)
+	}
+	if got, want := linear.Auth.ClientSecretRef, "env:LINEAR_CLIENT_SECRET"; got != want {
+		t.Fatalf("Load() linear.Auth.ClientSecretRef = %q, want %q", got, want)
+	}
+	if got, want := linear.Auth.Scopes, []string{"read"}; !slices.Equal(got, want) {
+		t.Fatalf("Load() linear.Auth.Scopes = %#v, want %#v", got, want)
+	}
+
+	codex, err := cfg.ResolveProvider("codex")
+	if err != nil {
+		t.Fatalf("ResolveProvider(codex) error = %v", err)
+	}
+	if got, want := len(codex.MCPServers), 1; got != want {
+		t.Fatalf("ResolveProvider(codex) MCPServers len = %d, want %d (%#v)", got, want, codex.MCPServers)
+	}
+	providerRemote := codex.MCPServers[0]
+	if got, want := providerRemote.Transport, MCPServerTransportHTTP; got != want {
+		t.Fatalf("provider remote Transport = %q, want %q", got, want)
+	}
+	if got, want := providerRemote.Auth.IssuerURL, "https://issuer.example"; got != want {
+		t.Fatalf("provider remote IssuerURL = %q, want %q", got, want)
+	}
+	if got, want := providerRemote.Auth.ClientID, "provider-client"; got != want {
+		t.Fatalf("provider remote ClientID = %q, want %q", got, want)
+	}
+}
+
+func TestSessionLimitsConfigValidateRejectsNegativeTimeout(t *testing.T) {
+	t.Run("Should reject negative timeout", func(t *testing.T) {
+		t.Parallel()
+
+		cfg := SessionLimitsConfig{Timeout: -time.Second}
+		err := cfg.Validate()
+		if err == nil {
+			t.Fatal("SessionLimitsConfig.Validate() error = nil, want non-nil")
+		}
+		if !strings.Contains(err.Error(), "session.limits.timeout") {
+			t.Fatalf("SessionLimitsConfig.Validate() error = %v, want session.limits.timeout context", err)
+		}
+	})
+}
+
+func TestSessionDeriveConfigDefaultsAndValidation(t *testing.T) {
+	t.Parallel()
+
+	t.Run("Should default the carried-context bounds", func(t *testing.T) {
+		t.Parallel()
+
+		cfg := DefaultWithHome(HomePaths{}).Session.Derive
+		if cfg.MaxReplayBytes != 131072 || cfg.MaxMessageBytes != 16384 {
+			t.Fatalf("default Session.Derive = %#v, want 131072/16384", cfg)
+		}
+		if err := cfg.Validate(); err != nil {
+			t.Fatalf("default Session.Derive.Validate() error = %v", err)
+		}
+	})
+
+	for _, tc := range []struct {
+		name    string
+		replay  int
+		message int
+		wantErr string
+	}{
+		{name: "Should accept the minimum replay budget", replay: 4096, message: 1024},
+		{
+			name: "Should reject a replay budget below 4096", replay: 4095, message: 1024,
+			wantErr: "session.derive.max_replay_bytes must be at least 4096",
+		},
+		{
+			name: "Should reject a message cap below 1024", replay: 131072, message: 1023,
+			wantErr: "session.derive.max_message_bytes must be between 1024 and session.derive.max_replay_bytes",
+		},
+		{
+			name: "Should reject a message cap above the replay budget", replay: 8192, message: 8193,
+			wantErr: "session.derive.max_message_bytes must be between 1024 and session.derive.max_replay_bytes",
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			err := SessionDeriveConfig{MaxReplayBytes: tc.replay, MaxMessageBytes: tc.message}.Validate()
+			if tc.wantErr == "" {
+				if err != nil {
+					t.Fatalf("Validate() error = %v, want nil", err)
+				}
+				return
+			}
+			if err == nil || err.Error() != tc.wantErr {
+				t.Fatalf("Validate() error = %v, want %q", err, tc.wantErr)
+			}
+		})
+	}
+}
+
+// Invariant: agent messaging guards never stop long-running work by default: an unanswered reply watch is
+// released after 24h (explicit 0 keeps it forever), promotion only injects, and the rate budget can be switched off. Owner: canonical config suite (#760).
+func TestSessionMessagingConfigDefaultsAndValidation(t *testing.T) {
+	t.Parallel()
+
+	t.Run("Should default to a 24h watch TTL, a 30/10m budget, and 2m promotion", func(t *testing.T) {
+		t.Parallel()
+		cfg := DefaultWithHome(HomePaths{}).Session.Messaging
+		if cfg.ReplyWatchTTL != 24*time.Hour || cfg.RateLimitMessages != 30 || cfg.RateLimitWindow != 10*time.Minute ||
+			cfg.QueuePromoteAfter != 2*time.Minute {
+			t.Fatalf("default Session.Messaging = %#v", cfg)
+		}
+		cfg.ReplyWatchTTL = 0
+		if got := cfg.Normalize(); got.ReplyWatchTTL != 0 {
+			t.Fatalf("Normalize() ReplyWatchTTL = %s, want an explicit 0 (never expire) kept", got.ReplyWatchTTL)
+		}
+		if err := cfg.Validate(); err != nil {
+			t.Fatalf("default Session.Messaging.Validate() error = %v", err)
+		}
+	})
+
+	for _, tc := range []struct {
+		name    string
+		cfg     SessionMessagingConfig
+		wantErr string
+	}{
+		{name: "Should accept a disabled rate budget", cfg: SessionMessagingConfig{RateLimitMessages: -1}},
+		{name: "Should accept a custom reply watch TTL", cfg: SessionMessagingConfig{ReplyWatchTTL: time.Hour}},
+		{
+			name: "Should reject a reply watch TTL below one minute", cfg: SessionMessagingConfig{ReplyWatchTTL: time.Second},
+			wantErr: "session.messaging.reply_watch_ttl must be 0 (never expire) or between 1m0s and 720h0m0s: 1s",
+		},
+		{
+			name: "Should reject a negative budget other than -1", cfg: SessionMessagingConfig{RateLimitMessages: -2},
+			wantErr: "session.messaging.rate_limit_messages must be -1 (disabled) or between 1 and 10000: -2",
+		},
+		{
+			name:    "Should reject a promotion threshold below ten seconds",
+			cfg:     SessionMessagingConfig{QueuePromoteAfter: time.Second},
+			wantErr: "session.messaging.queue_promote_after must be 0 or between 10s and 24h0m0s: 1s",
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			err := tc.cfg.Validate()
+			if tc.wantErr == "" {
+				if err != nil {
+					t.Fatalf("Validate() error = %v, want nil", err)
+				}
+				return
+			}
+			if err == nil || err.Error() != tc.wantErr {
+				t.Fatalf("Validate() error = %v, want %q", err, tc.wantErr)
+			}
+		})
+	}
+}
+
+func TestLoadSessionDeriveConfig(t *testing.T) {
+	load := func(t *testing.T, workspaceTOML string) (Config, error) {
+		t.Helper()
+		workspaceRoot := t.TempDir()
+		t.Setenv("COMPOZY_HOME", filepath.Join(t.TempDir(), "home"))
+		homePaths, err := ResolveHomePaths()
+		if err != nil {
+			t.Fatalf("ResolveHomePaths() error = %v", err)
+		}
+		if err := EnsureHomeLayout(homePaths); err != nil {
+			t.Fatalf("EnsureHomeLayout() error = %v", err)
+		}
+		writeFile(t, filepath.Join(workspaceRoot, DirName, ConfigName), workspaceTOML)
+		return Load(WithWorkspaceRoot(workspaceRoot))
+	}
+
+	t.Run("Should apply the workspace overlay for session.derive", func(t *testing.T) {
+		cfg, err := load(t, "[session.derive]\nmax_replay_bytes = 8192\nmax_message_bytes = 2048\n")
+		if err != nil {
+			t.Fatalf("Load() error = %v", err)
+		}
+		if cfg.Session.Derive.MaxReplayBytes != 8192 || cfg.Session.Derive.MaxMessageBytes != 2048 {
+			t.Fatalf("Load() Session.Derive = %#v, want 8192/2048", cfg.Session.Derive)
+		}
+	})
+
+	t.Run("Should reject a replay budget below the minimum at load", func(t *testing.T) {
+		_, err := load(t, "[session.derive]\nmax_replay_bytes = 4095\n")
+		if err == nil || !strings.Contains(err.Error(), "session.derive.max_replay_bytes must be at least 4096") {
+			t.Fatalf("Load() error = %v, want max_replay_bytes validation", err)
+		}
+	})
+}
+
+// Invariant: released config files retain their content while restart defaults are added in memory;
+// explicit false and zero overrides survive decoding. Owner: config loader; canonical config suite.
+func TestLoadSessionRestartConfig(t *testing.T) {
+	t.Run("Should preserve old user config and apply explicit restart opt-out", func(t *testing.T) {
+		home := filepath.Join(t.TempDir(), "home")
+		t.Setenv("COMPOZY_HOME", home)
+		homePaths, err := ResolveHomePaths()
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := EnsureHomeLayout(homePaths); err != nil {
+			t.Fatal(err)
+		}
+		old := "[session.stop]\ncooperative_grace = '7s'\n"
+		writeFile(t, homePaths.ConfigFile, old)
+		cfg, err := Load()
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !cfg.Session.Restart.AutoContinue || cfg.Session.Restart.MaxAttempts != 3 ||
+			cfg.Session.Restart.Window != 5*time.Minute || cfg.Session.Stop.CooperativeGrace != 7*time.Second {
+			t.Fatalf("old config defaults = %#v", cfg.Session)
+		}
+		retained, err := os.ReadFile(homePaths.ConfigFile)
+		if err != nil || string(retained) != old {
+			t.Fatalf("old config changed: %q, %v", retained, err)
+		}
+		writeFile(
+			t,
+			homePaths.ConfigFile,
+			old+"\n[session.restart]\nauto_continue = false\nmax_attempts = 2\nwindow = '1m'\n[daemon]\nshutdown_grace = '0s'\n",
+		)
+		cfg, err = Load()
+		if err != nil {
+			t.Fatal(err)
+		}
+		if cfg.Session.Restart.AutoContinue || cfg.Session.Restart.MaxAttempts != 2 ||
+			cfg.Session.Restart.Window != time.Minute || cfg.Daemon.ShutdownGrace != 0 {
+			t.Fatalf("explicit restart override = %#v, grace=%s", cfg.Session.Restart, cfg.Daemon.ShutdownGrace)
+		}
+	})
+}
+
+// Invariant: quiet, grace, and idle release are independent nonnegative durations.
+// Owner: config decoder/validator; canonical config suite.
+func TestSessionSupervisionConfigValidateQuietAndGrace(t *testing.T) {
+	t.Parallel()
+
+	t.Run("Should default idle release to 30 minutes", func(t *testing.T) {
+		t.Parallel()
+		if got := DefaultSessionSupervisionConfig().IdleReleaseAfter; got != 30*time.Minute {
+			t.Fatalf("default idle_release_after = %s, want 30m", got)
+		}
+	})
+
+	for _, value := range []time.Duration{0, time.Second, 2 * time.Minute} {
+		t.Run("Should accept grace and idle release of "+value.String(), func(t *testing.T) {
+			t.Parallel()
+			cfg := DefaultSessionSupervisionConfig()
+			cfg.QuietAfter, cfg.StopGrace, cfg.IdleReleaseAfter = 2*time.Minute, value, value
+			if err := cfg.Validate(); err != nil {
+				t.Fatalf("Validate(stop_grace=idle_release_after=%s) error = %v", value, err)
+			}
+		})
+	}
+
+	for _, field := range []string{"quiet_after", "stop_grace", "idle_release_after"} {
+		t.Run("Should reject a negative "+field, func(t *testing.T) {
+			t.Parallel()
+			cfg := DefaultSessionSupervisionConfig()
+			switch field {
+			case "quiet_after":
+				cfg.QuietAfter = -time.Second
+			case "stop_grace":
+				cfg.StopGrace = -time.Second
+			default:
+				cfg.IdleReleaseAfter = -time.Second
+			}
+			if err := cfg.Validate(); err == nil || !strings.Contains(err.Error(), field) {
+				t.Fatalf("Validate() error = %v, want %s validation", err, field)
+			}
+		})
+	}
+}
+
+func TestSessionSupervisionConfigValidateRejectsNegativePromptDeadline(t *testing.T) {
+	t.Run("Should reject negative prompt deadline", func(t *testing.T) {
+		t.Parallel()
+
+		cfg := DefaultSessionSupervisionConfig()
+		cfg.PromptDeadline = -time.Second
+
+		err := cfg.Validate()
+		if err == nil {
+			t.Fatal("SessionSupervisionConfig.Validate() error = nil, want non-nil")
+		}
+		if !strings.Contains(err.Error(), "session.supervision.prompt_deadline") {
+			t.Fatalf("SessionSupervisionConfig.Validate() error = %v, want prompt deadline context", err)
+		}
+	})
+}
+
+func TestObservabilityConfigValidateRetentionDays(t *testing.T) {
+	t.Run("Should allow zero as keep history", func(t *testing.T) {
+		t.Parallel()
+
+		cfg := validObservabilityConfigForTest()
+		cfg.RetentionDays = 0
+
+		if err := cfg.Validate(); err != nil {
+			t.Fatalf("ObservabilityConfig.Validate() error = %v, want nil for keep-history retention", err)
+		}
+	})
+
+	t.Run("Should reject negative retention days", func(t *testing.T) {
+		t.Parallel()
+
+		cfg := validObservabilityConfigForTest()
+		cfg.RetentionDays = -1
+
+		err := cfg.Validate()
+		if err == nil {
+			t.Fatal("ObservabilityConfig.Validate() error = nil, want non-nil")
+		}
+		if !strings.Contains(err.Error(), "observability.retention_days must be zero or positive") {
+			t.Fatalf("ObservabilityConfig.Validate() error = %v, want retention_days context", err)
+		}
+	})
+
+	t.Run("Should reject negative agent probe timeout", func(t *testing.T) {
+		t.Parallel()
+
+		cfg := validObservabilityConfigForTest()
+		cfg.AgentProbeTimeout = -time.Second
+
+		err := cfg.Validate()
+		if err == nil {
+			t.Fatal("ObservabilityConfig.Validate() error = nil, want non-nil")
+		}
+		if !strings.Contains(err.Error(), "observability.agent_probe_timeout must be zero or positive") {
+			t.Fatalf("ObservabilityConfig.Validate() error = %v, want agent_probe_timeout context", err)
+		}
+	})
+}
+
+func validObservabilityConfigForTest() ObservabilityConfig {
+	return ObservabilityConfig{
+		Enabled:        true,
+		MaxGlobalBytes: 1,
+		Transcripts: ObservabilityTranscriptConfig{
+			Enabled:            true,
+			SegmentBytes:       1,
+			MaxBytesPerSession: 1,
+		},
+	}
+}
+
+func TestLoadWorkspaceAddsValuesWithoutClobberingGlobal(t *testing.T) {
+	workspaceRoot := t.TempDir()
+	homeRoot := filepath.Join(t.TempDir(), "home")
+	t.Setenv("COMPOZY_HOME", homeRoot)
+
+	homePaths, err := ResolveHomePaths()
+	if err != nil {
+		t.Fatalf("ResolveHomePaths() error = %v", err)
+	}
+	if err := EnsureHomeLayout(homePaths); err != nil {
+		t.Fatalf("EnsureHomeLayout() error = %v", err)
+	}
+
+	writeFile(t, homePaths.ConfigFile, `
+[observability]
+enabled = true
+retention_days = 7
+max_global_bytes = 1000
+
+[observability.transcripts]
+enabled = true
+segment_bytes = 128
+max_bytes_per_session = 2048
+
+[providers.claude]
+auth_mode = "bound_secret"
+[providers.claude.models]
+default = "global-model"
+`)
+	writeFile(t, filepath.Join(workspaceRoot, DirName, ConfigName), `
+[observability.transcripts]
+segment_bytes = 256
+
+	[providers.claude]
+	auth_mode = "bound_secret"
+	[[providers.claude.credential_slots]]
+	name = "api_key"
+	target_env = "WORKSPACE_KEY"
+	secret_ref = "env:WORKSPACE_KEY"
+	kind = "api_key"
+	required = true
+	`)
+
+	cfg, err := Load(WithWorkspaceRoot(workspaceRoot))
+	if err != nil {
+		t.Fatalf("Load() error = %v", err)
+	}
+
+	if cfg.Observability.Enabled != true || cfg.Observability.RetentionDays != 7 ||
+		cfg.Observability.MaxGlobalBytes != 1000 {
+		t.Fatalf("Load() Observability = %#v", cfg.Observability)
+	}
+	if cfg.Observability.Transcripts.SegmentBytes != 256 || cfg.Observability.Transcripts.MaxBytesPerSession != 2048 {
+		t.Fatalf("Load() Transcripts = %#v", cfg.Observability.Transcripts)
+	}
+
+	claude, err := cfg.ResolveProvider("claude")
+	if err != nil {
+		t.Fatalf("ResolveProvider() error = %v", err)
+	}
+	if claude.Models.Default != "global-model" {
+		t.Fatalf("ResolveProvider() = %#v", claude)
+	}
+	if slots := claude.EffectiveCredentialSlots(); len(slots) != 1 ||
+		slots[0].TargetEnv != "WORKSPACE_KEY" ||
+		slots[0].SecretRef != "env:WORKSPACE_KEY" {
+		t.Fatalf("ResolveProvider() CredentialSlots = %#v, want WORKSPACE_KEY slot", slots)
+	}
+}
+
+func TestLoadWithoutWorkspaceRootIgnoresCurrentDirectoryWorkspaceFiles(t *testing.T) {
+	// Intentionally not parallel: this test mutates process-global cwd via os.Chdir.
+	homeRoot := filepath.Join(t.TempDir(), "home")
+	dotenvHome := filepath.Join(t.TempDir(), "dotenv-home")
+	cwd := t.TempDir()
+
+	t.Setenv("COMPOZY_HOME", homeRoot)
+
+	homePaths, err := ResolveHomePaths()
+	if err != nil {
+		t.Fatalf("ResolveHomePaths() error = %v", err)
+	}
+	if err := EnsureHomeLayout(homePaths); err != nil {
+		t.Fatalf("EnsureHomeLayout() error = %v", err)
+	}
+	writeFile(t, homePaths.ConfigFile, `
+[http]
+port = 3030
+`)
+
+	dotenvPaths, err := ResolveHomePathsFrom(dotenvHome)
+	if err != nil {
+		t.Fatalf("ResolveHomePathsFrom() error = %v", err)
+	}
+	if err := EnsureHomeLayout(dotenvPaths); err != nil {
+		t.Fatalf("EnsureHomeLayout(dotenv) error = %v", err)
+	}
+	writeFile(t, dotenvPaths.ConfigFile, `
+[http]
+port = 9090
+`)
+
+	writeFile(t, filepath.Join(cwd, ".env"), "COMPOZY_HOME="+dotenvHome+"\n")
+	writeFile(t, filepath.Join(cwd, DirName, ConfigName), `
+[http]
+port = 4242
+`)
+
+	previousWD, err := os.Getwd()
+	if err != nil {
+		t.Fatalf("Getwd() error = %v", err)
+	}
+	if err := os.Chdir(cwd); err != nil {
+		t.Fatalf("Chdir(%q) error = %v", cwd, err)
+	}
+	t.Cleanup(func() {
+		if err := os.Chdir(previousWD); err != nil {
+			t.Fatalf("restore working directory: %v", err)
+		}
+	})
+
+	cfg, err := Load()
+	if err != nil {
+		t.Fatalf("Load() error = %v", err)
+	}
+
+	if got, want := cfg.HTTP.Port, 3030; got != want {
+		t.Fatalf("Load() HTTP.Port = %d, want %d", got, want)
+	}
+	if got, want := cfg.Daemon.Socket, homePaths.DaemonSocket; got != want {
+		t.Fatalf("Load() Daemon.Socket = %q, want %q", got, want)
+	}
+}
+
+func TestLoadWithWorkspaceRootUsesExplicitRootOnly(t *testing.T) {
+	workspaceRoot := t.TempDir()
+	otherWorkspace := t.TempDir()
+	homeRoot := filepath.Join(t.TempDir(), "home")
+
+	t.Setenv("COMPOZY_HOME", homeRoot)
+
+	homePaths, err := ResolveHomePaths()
+	if err != nil {
+		t.Fatalf("ResolveHomePaths() error = %v", err)
+	}
+	if err := EnsureHomeLayout(homePaths); err != nil {
+		t.Fatalf("EnsureHomeLayout() error = %v", err)
+	}
+	writeFile(t, homePaths.ConfigFile, `
+[http]
+host = "localhost"
+port = 2123
+`)
+	writeFile(t, filepath.Join(workspaceRoot, DirName, ConfigName), `
+[http]
+port = 4242
+`)
+	writeFile(t, filepath.Join(otherWorkspace, DirName, ConfigName), `
+[http]
+port = 9999
+`)
+
+	previousWD, err := os.Getwd()
+	if err != nil {
+		t.Fatalf("Getwd() error = %v", err)
+	}
+	if err := os.Chdir(otherWorkspace); err != nil {
+		t.Fatalf("Chdir(%q) error = %v", otherWorkspace, err)
+	}
+	t.Cleanup(func() {
+		if err := os.Chdir(previousWD); err != nil {
+			t.Fatalf("restore working directory: %v", err)
+		}
+	})
+
+	cfg, err := Load(WithWorkspaceRoot(workspaceRoot))
+	if err != nil {
+		t.Fatalf("Load() error = %v", err)
+	}
+
+	if got, want := cfg.HTTP.Port, 4242; got != want {
+		t.Fatalf("Load() HTTP.Port = %d, want %d", got, want)
+	}
+
+	writeFile(t, filepath.Join(workspaceRoot, DirName, ConfigName), `
+[marketplace.catalog]
+ttl = "30m"
+`)
+	_, err = Load(WithWorkspaceRoot(workspaceRoot))
+	if err == nil || !strings.Contains(err.Error(), "marketplace catalog settings are global-only") {
+		t.Fatalf("Load(workspace Marketplace config) error = %v, want global-only rejection", err)
+	}
+
+	writeFile(t, filepath.Join(workspaceRoot, DirName, ConfigName), `
+[shell.sessions]
+sort = "attention"
+`)
+	_, err = Load(WithWorkspaceRoot(workspaceRoot))
+	if err == nil || !strings.Contains(err.Error(), "shell settings are global-only") {
+		t.Fatalf("Load(workspace shell config) error = %v, want global-only rejection", err)
+	}
+
+	writeFile(t, filepath.Join(workspaceRoot, DirName, ConfigName), `
+[desktop]
+editor_command = "x {path}"
+`)
+	_, err = Load(WithWorkspaceRoot(workspaceRoot))
+	if err == nil || !strings.Contains(err.Error(), "desktop settings are global-only") {
+		t.Fatalf("Load(workspace desktop config) error = %v, want global-only rejection", err)
+	}
+
+	for _, tc := range []struct{ name, contents string }{
+		{name: "Should reject a workspace mcp.stdio idle timeout", contents: "[mcp.stdio]\nidle_timeout = \"1m\"\n"},
+		{name: "Should reject a workspace mcp status probe timeout", contents: "[mcp]\nstatus_probe_timeout = \"1m\"\n"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			writeFile(t, filepath.Join(workspaceRoot, DirName, ConfigName), tc.contents)
+			_, err := Load(WithWorkspaceRoot(workspaceRoot))
+			if err == nil || !strings.Contains(err.Error(), "mcp.stdio settings are global-only") {
+				t.Fatalf("Load(workspace %q) error = %v, want global-only rejection", tc.contents, err)
+			}
+		})
+	}
+}
+
+func TestDesktopSettingsAreMachineOnly(t *testing.T) {
+	t.Parallel()
+	const path = "desktop.editor_command"
+	t.Run("Should deny the desktop editor command in profile overlays", func(t *testing.T) {
+		t.Parallel()
+		_, err := loadProfileConfigOverlayBytes([]byte("[desktop]\neditor_command = \"x {path}\"\n"), "profile.toml")
+		validationErr, ok := errors.AsType[ValidationError](err)
+		if !ok || validationErr.Code != profileConfigKeyDeniedCode || validationErr.Path != "desktop" {
+			t.Fatalf("profile overlay error = %#v, want machine-only denial for the desktop table", err)
+		}
+	})
+	t.Run("Should restrict desktop editor command writes to user scope", func(t *testing.T) {
+		t.Parallel()
+		parts := strings.Split(path, ".")
+		if err := ValidateConfigWriteScope(WriteScopeUser, parts); err != nil {
+			t.Fatalf("user write error = %v", err)
+		}
+		if err := ValidateConfigWriteScope(WriteScopeWorkspace, parts); err == nil ||
+			!strings.Contains(err.Error(), "global-only") {
+			t.Fatalf("workspace write error = %v, want global-only denial", err)
+		}
+		err := ValidateConfigWriteScope(WriteScopeProfile, parts)
+		validationErr, ok := errors.AsType[ValidationError](err)
+		if !ok || validationErr.Code != profileConfigKeyDeniedCode || validationErr.Path != path {
+			t.Fatalf("profile write error = %#v, want machine-only denial", err)
+		}
+	})
+}
+
+func TestLoadForHomeSkipsDuplicateWorkspaceOverlay(t *testing.T) {
+	t.Parallel()
+
+	t.Run("Should apply the global config once when the workspace root contains Compozy home", func(t *testing.T) {
+		t.Parallel()
+
+		operatorHome := t.TempDir()
+		homePaths, err := ResolveHomePathsFrom(filepath.Join(operatorHome, DirName))
+		if err != nil {
+			t.Fatalf("ResolveHomePathsFrom() error = %v", err)
+		}
+		if err := EnsureHomeLayout(homePaths); err != nil {
+			t.Fatalf("EnsureHomeLayout() error = %v", err)
+		}
+		writeFile(t, homePaths.ConfigFile, "[gateway]\nenabled = true\nprivate_port = 4242\n")
+
+		cfg, err := LoadForHome(homePaths, WithWorkspaceRoot(operatorHome))
+		if err != nil {
+			t.Fatalf("LoadForHome() error = %v", err)
+		}
+		if !cfg.Gateway.Enabled {
+			t.Fatal("LoadForHome() Gateway.Enabled = false, want true")
+		}
+		if got, want := cfg.Gateway.PrivatePort, 4242; got != want {
+			t.Fatalf("LoadForHome() Gateway.PrivatePort = %d, want %d", got, want)
+		}
+	})
+}
+
+func TestLoadRejectsUnknownConfigKeys(t *testing.T) {
+	workspaceRoot := t.TempDir()
+	homeRoot := filepath.Join(t.TempDir(), "home")
+	t.Setenv("COMPOZY_HOME", homeRoot)
+
+	homePaths, err := ResolveHomePaths()
+	if err != nil {
+		t.Fatalf("ResolveHomePaths() error = %v", err)
+	}
+	if err := EnsureHomeLayout(homePaths); err != nil {
+		t.Fatalf("EnsureHomeLayout() error = %v", err)
+	}
+
+	writeFile(t, homePaths.ConfigFile, `
+[http]
+port = 2123
+unknown = true
+`)
+
+	if _, err := Load(WithWorkspaceRoot(workspaceRoot)); err == nil {
+		t.Fatal("Load() error = nil, want non-nil")
+	}
+}
+
+func TestLoadRejectsRemovedExtensionMarketplaceConfig(t *testing.T) {
+	t.Run("Should reject the removed extension marketplace configuration", func(t *testing.T) {
+		t.Parallel()
+
+		_, err := loadConfigOverlayBytes([]byte(`[extensions.marketplace]
+allow_unverified = true
+`), "legacy-extension-config.toml")
+		if err == nil {
+			t.Fatal("loadConfigOverlayBytes() error = nil, want removed-key rejection")
+		}
+		for _, fragment := range []string{
+			"extensions.marketplace.allow_unverified",
+			"extensions.trust.allow_unverified",
+		} {
+			if !strings.Contains(err.Error(), fragment) {
+				t.Fatalf("loadConfigOverlayBytes() error = %v, want fragment %q", err, fragment)
+			}
+		}
+	})
+}
+
+func TestLoadRejectsTimeoutOnSessionBackedRoles(t *testing.T) {
+	t.Parallel()
+
+	for _, role := range []RoleName{
+		RoleCoordinator,
+		RoleAutoTitle,
+	} {
+		t.Run("Should reject timeout on "+string(role), func(t *testing.T) {
+			t.Parallel()
+
+			contents := []byte("[roles." + string(role) + "]\ntimeout = \"1s\"\n")
+			_, err := loadConfigOverlayBytes(contents, "roles.toml")
+			if err == nil {
+				t.Fatal("loadConfigOverlayBytes() error = nil, want unknown-key rejection")
+			}
+			path := "roles." + string(role) + ".timeout"
+			if !strings.Contains(err.Error(), path) {
+				t.Fatalf("loadConfigOverlayBytes() error = %v, want %s", err, path)
+			}
+		})
+	}
+}
+
+func TestLoadRejectsRemovedConfigKeys(t *testing.T) {
+	t.Parallel()
+
+	for _, tc := range []struct {
+		name    string
+		config  string
+		wantKey string
+	}{
+		{
+			name:    "Should reject the autonomy coordinator table",
+			config:  "[autonomy.coordinator]\nenabled = true\n",
+			wantKey: "autonomy.coordinator",
+		},
+
+		{
+			name:    "Should reject the session auto title flag",
+			config:  "[session]\nauto_title_enabled = false\n",
+			wantKey: "session.auto_title_enabled",
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			_, err := loadConfigOverlayBytes([]byte(tc.config), "removed-role-key.toml")
+			if err == nil || !strings.Contains(err.Error(), tc.wantKey) {
+				t.Fatalf("loadConfigOverlayBytes() error = %v, want removed key %s", err, tc.wantKey)
+			}
+		})
+	}
+}
+
+func TestLoadRejectsUnknownSkillsConfigKeys(t *testing.T) {
+	workspaceRoot := t.TempDir()
+	homeRoot := filepath.Join(t.TempDir(), "home")
+	t.Setenv("COMPOZY_HOME", homeRoot)
+
+	homePaths, err := ResolveHomePaths()
+	if err != nil {
+		t.Fatalf("ResolveHomePaths() error = %v", err)
+	}
+	if err := EnsureHomeLayout(homePaths); err != nil {
+		t.Fatalf("EnsureHomeLayout() error = %v", err)
+	}
+
+	writeFile(t, homePaths.ConfigFile, `
+[skills]
+poll_interval = "3s"
+unknown = true
+`)
+
+	_, err = Load(WithWorkspaceRoot(workspaceRoot))
+	if err == nil {
+		t.Fatal("Load() error = nil, want non-nil")
+	}
+	if !strings.Contains(err.Error(), "skills.unknown") {
+		t.Fatalf("Load() error = %v, want skills.unknown in message", err)
+	}
+}
+
+func TestDefaultWithHomeSetsExtensionConfigDefaults(t *testing.T) {
+	homePaths, err := ResolveHomePathsFrom(filepath.Join(t.TempDir(), "home"))
+	if err != nil {
+		t.Fatalf("ResolveHomePathsFrom() error = %v", err)
+	}
+
+	cfg := DefaultWithHome(homePaths)
+	if cfg.Skills.AllowedMarketplaceHooks != nil {
+		t.Fatalf(
+			"DefaultWithHome() Skills.AllowedMarketplaceHooks = %#v, want nil/empty",
+			cfg.Skills.AllowedMarketplaceHooks,
+		)
+	}
+
+	if !cfg.Extensions.Trust.AllowUnverified {
+		t.Fatal("DefaultWithHome() Extensions.Trust.AllowUnverified = false, want true")
+	}
+	if !cfg.Extensions.Sources.GitHub.Enabled || cfg.Extensions.Sources.GitHub.BaseURL != "https://api.github.com" {
+		t.Fatalf("DefaultWithHome() Extensions.Sources.GitHub = %#v", cfg.Extensions.Sources.GitHub)
+	}
+	if !cfg.Extensions.Sources.Git.Enabled {
+		t.Fatal("DefaultWithHome() Extensions.Sources.Git.Enabled = false, want true")
+	}
+	if cfg.Extensions.Dev.WatchInterval != 2*time.Second {
+		t.Fatalf("DefaultWithHome() Extensions.Dev.WatchInterval = %s, want 2s", cfg.Extensions.Dev.WatchInterval)
+	}
+	if len(cfg.Extensions.Resources.AllowedKinds) != 0 ||
+		cfg.Extensions.Resources.MaxScope != "" ||
+		cfg.Extensions.Resources.SnapshotRateLimit != (ExtensionsResourceRateLimitConfig{}) ||
+		cfg.Extensions.Resources.OperatorWriteRateLimit != (ExtensionsResourceRateLimitConfig{}) {
+		t.Fatalf("DefaultWithHome() Extensions.Resources = %#v, want zero value", cfg.Extensions.Resources)
+	}
+}
+
+func TestExtensionsConfigValidateSourcesAndDevelopment(t *testing.T) {
+	tests := []struct {
+		name        string
+		cfg         ExtensionsConfig
+		wantErrPath string
+	}{
+		{
+			name: "ShouldAcceptValidSourceAndDevelopmentConfig",
+			cfg: ExtensionsConfig{
+				Sources: ExtensionsSourcesConfig{
+					GitHub: ExtensionsGitHubSourceConfig{Enabled: true, BaseURL: "https://api.github.example.test"},
+				},
+				Dev: ExtensionsDevConfig{WatchInterval: time.Second},
+			},
+		},
+		{
+			name: "ShouldAcceptEmptyConfig",
+			cfg:  ExtensionsConfig{},
+		},
+		{
+			name: "ShouldRejectGitHubBaseURLWithoutHost",
+			cfg: ExtensionsConfig{
+				Sources: ExtensionsSourcesConfig{
+					GitHub: ExtensionsGitHubSourceConfig{Enabled: true, BaseURL: "https://"},
+				},
+			},
+			wantErrPath: "extensions.sources.github.base_url",
+		},
+		{
+			name: "ShouldRejectNonPositiveWatchInterval",
+			cfg: ExtensionsConfig{
+				Dev: ExtensionsDevConfig{WatchInterval: -time.Second},
+			},
+			wantErrPath: "extensions.dev.watch_interval",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			err := tt.cfg.Validate()
+			if tt.wantErrPath == "" {
+				if err != nil {
+					t.Fatalf("ExtensionsConfig.Validate() error = %v", err)
+				}
+				return
+			}
+			if err == nil {
+				t.Fatal("ExtensionsConfig.Validate() error = nil, want extension config validation failure")
+			}
+			if !strings.Contains(err.Error(), tt.wantErrPath) {
+				t.Fatalf("ExtensionsConfig.Validate() error = %v, want %s context", err, tt.wantErrPath)
+			}
+		})
+	}
+
+	t.Run("ShouldWarnForHTTPBaseURL", func(t *testing.T) {
+		// This subtest swaps slog.Default(), so the parent test must remain
+		// non-parallel to avoid cross-test interference.
+		var logs bytes.Buffer
+		original := slog.Default()
+		slog.SetDefault(slog.New(slog.NewTextHandler(&logs, &slog.HandlerOptions{Level: slog.LevelWarn})))
+		defer slog.SetDefault(original)
+
+		cfg := ExtensionsConfig{
+			Sources: ExtensionsSourcesConfig{
+				GitHub: ExtensionsGitHubSourceConfig{Enabled: true, BaseURL: "http://api.github.example.test"},
+			},
+		}
+
+		if err := cfg.Validate(); err != nil {
+			t.Fatalf("ExtensionsConfig.Validate(http) error = %v", err)
+		}
+		if !strings.Contains(logs.String(), "insecure http scheme") {
+			t.Fatalf("ExtensionsConfig.Validate(http) logs = %q, want insecure http scheme warning", logs.String())
+		}
+
+		logs.Reset()
+		cfg.Sources.GitHub.BaseURL = "http://127.0.0.1:2123"
+		if err := cfg.Validate(); err != nil {
+			t.Fatalf("ExtensionsConfig.Validate(loopback HTTP) error = %v", err)
+		}
+		if logs.Len() != 0 {
+			t.Fatalf("ExtensionsConfig.Validate(loopback HTTP) logs = %q, want none", logs.String())
+		}
+	})
+}
+
+func TestExtensionsConfigValidateResourcesConfig(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name        string
+		cfg         ExtensionsConfig
+		wantErrPath string
+	}{
+		{
+			name: "ShouldAcceptValidResourcePolicy",
+			cfg: ExtensionsConfig{
+				Resources: ExtensionsResourcesConfig{
+					AllowedKinds: []resources.ResourceKind{
+						resources.ResourceKind("tool"),
+						resources.ResourceKind("mcp_server"),
+					},
+					MaxScope: resources.ResourceScopeKindWorkspace,
+					SnapshotRateLimit: ExtensionsResourceRateLimitConfig{
+						Requests: 2,
+						Window:   5 * time.Second,
+						Queue:    1,
+					},
+					OperatorWriteRateLimit: ExtensionsResourceRateLimitConfig{
+						Requests: 10,
+						Window:   time.Minute,
+						Queue:    0,
+					},
+				},
+			},
+		},
+		{
+			name: "ShouldRejectDaemonOnlyAllowedKind",
+			cfg: ExtensionsConfig{
+				Resources: ExtensionsResourcesConfig{
+					AllowedKinds: []resources.ResourceKind{resources.ResourceKind("unsupported.kind")},
+				},
+			},
+			wantErrPath: "extensions.resources.allowed_kinds",
+		},
+		{
+			name: "ShouldRejectInvalidResourceMaxScope",
+			cfg: ExtensionsConfig{
+				Resources: ExtensionsResourcesConfig{
+					MaxScope: resources.ResourceScopeKind("session"),
+				},
+			},
+			wantErrPath: "extensions.resources.max_scope",
+		},
+		{
+			name: "ShouldRejectInvalidSnapshotRateLimit",
+			cfg: ExtensionsConfig{
+				Resources: ExtensionsResourcesConfig{
+					SnapshotRateLimit: ExtensionsResourceRateLimitConfig{
+						Requests: 0,
+						Window:   time.Second,
+					},
+				},
+			},
+			wantErrPath: "extensions.resources.snapshot_rate_limit",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			err := tt.cfg.Validate()
+			if tt.wantErrPath == "" {
+				if err != nil {
+					t.Fatalf("ExtensionsConfig.Validate() error = %v", err)
+				}
+				return
+			}
+			if err == nil {
+				t.Fatal("ExtensionsConfig.Validate() error = nil, want validation failure")
+			}
+			if !strings.Contains(err.Error(), tt.wantErrPath) {
+				t.Fatalf("ExtensionsConfig.Validate() error = %v, want %s context", err, tt.wantErrPath)
+			}
+		})
+	}
+}
+
+func TestLoadRoundTripsExtensionsResourcePolicy(t *testing.T) {
+	workspaceRoot := t.TempDir()
+	homeRoot := filepath.Join(t.TempDir(), "home")
+	t.Setenv("COMPOZY_HOME", homeRoot)
+
+	homePaths, err := ResolveHomePaths()
+	if err != nil {
+		t.Fatalf("ResolveHomePaths() error = %v", err)
+	}
+	if err := EnsureHomeLayout(homePaths); err != nil {
+		t.Fatalf("EnsureHomeLayout() error = %v", err)
+	}
+
+	writeFile(t, homePaths.ConfigFile, `
+[extensions.resources]
+allowed_kinds = ["tool", "mcp_server"]
+max_scope = "global"
+
+[extensions.resources.snapshot_rate_limit]
+requests = 3
+window = "15s"
+queue = 1
+
+[extensions.resources.operator_write_rate_limit]
+requests = 12
+window = "1m"
+queue = 0
+`)
+
+	writeFile(t, filepath.Join(workspaceRoot, DirName, ConfigName), `
+[extensions.resources]
+allowed_kinds = ["tool"]
+max_scope = "workspace"
+
+[extensions.resources.snapshot_rate_limit]
+requests = 1
+window = "5s"
+queue = 1
+`)
+
+	cfg, err := Load(WithWorkspaceRoot(workspaceRoot))
+	if err != nil {
+		t.Fatalf("Load() error = %v", err)
+	}
+	if got, want := cfg.Extensions.Resources.AllowedKinds, []resources.ResourceKind{
+		resources.ResourceKind("tool"),
+	}; !slices.Equal(
+		got,
+		want,
+	) {
+		t.Fatalf("Load() AllowedKinds = %#v, want %#v", got, want)
+	}
+	if got, want := cfg.Extensions.Resources.MaxScope, resources.ResourceScopeKindWorkspace; got != want {
+		t.Fatalf("Load() MaxScope = %q, want %q", got, want)
+	}
+	if got, want := cfg.Extensions.Resources.SnapshotRateLimit.Requests, 1; got != want {
+		t.Fatalf("Load() SnapshotRateLimit.Requests = %d, want %d", got, want)
+	}
+	if got, want := cfg.Extensions.Resources.SnapshotRateLimit.Window, 5*time.Second; got != want {
+		t.Fatalf("Load() SnapshotRateLimit.Window = %s, want %s", got, want)
+	}
+	if got, want := cfg.Extensions.Resources.OperatorWriteRateLimit.Requests, 12; got != want {
+		t.Fatalf("Load() OperatorWriteRateLimit.Requests = %d, want %d", got, want)
+	}
+	if got, want := cfg.Extensions.Resources.OperatorWriteRateLimit.Window, time.Minute; got != want {
+		t.Fatalf("Load() OperatorWriteRateLimit.Window = %s, want %s", got, want)
+	}
+}
+
+func TestValidateRejectsInvalidPorts(t *testing.T) {
+	homePaths, err := ResolveHomePathsFrom(filepath.Join(t.TempDir(), "home"))
+	if err != nil {
+		t.Fatalf("ResolveHomePathsFrom() error = %v", err)
+	}
+
+	tests := []struct {
+		name string
+		port int
+	}{
+		{name: "zero", port: 0},
+		{name: "too high", port: 65536},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			cfg := DefaultWithHome(homePaths)
+			cfg.HTTP.Port = tt.port
+
+			if err := cfg.Validate(); err == nil {
+				t.Fatalf("Validate() error = nil for port %d", tt.port)
+			}
+		})
+	}
+}
+
+func TestValidateRejectsUnknownPermissionMode(t *testing.T) {
+	homePaths, err := ResolveHomePathsFrom(filepath.Join(t.TempDir(), "home"))
+	if err != nil {
+		t.Fatalf("ResolveHomePathsFrom() error = %v", err)
+	}
+
+	cfg := DefaultWithHome(homePaths)
+	cfg.Permissions.Mode = PermissionMode("maybe")
+	if err := cfg.Validate(); err == nil {
+		t.Fatal("Validate() error = nil, want non-nil")
+	}
+}
+
+func TestValidateWrapsHooksConfigErrors(t *testing.T) {
+	t.Parallel()
+
+	homePaths, err := ResolveHomePathsFrom(filepath.Join(t.TempDir(), "home"))
+	if err != nil {
+		t.Fatalf("ResolveHomePathsFrom() error = %v", err)
+	}
+
+	cfg := DefaultWithHome(homePaths)
+	cfg.Hooks.Declarations = []hookspkg.HookDecl{{
+		Name:   "broken-hook",
+		Event:  "bad.event",
+		Source: hookspkg.HookSourceConfig,
+	}}
+
+	err = cfg.Validate()
+	if err == nil {
+		t.Fatal("Validate() error = nil, want non-nil")
+	}
+	if !strings.Contains(err.Error(), "validate hooks config") {
+		t.Fatalf("Validate() error = %q, want hooks config context", err)
+	}
+}
+
+func TestLoadRejectsNonPositiveSkillsPollInterval(t *testing.T) {
+	workspaceRoot := t.TempDir()
+	homeRoot := filepath.Join(t.TempDir(), "home")
+	t.Setenv("COMPOZY_HOME", homeRoot)
+
+	homePaths, err := ResolveHomePaths()
+	if err != nil {
+		t.Fatalf("ResolveHomePaths() error = %v", err)
+	}
+	if err := EnsureHomeLayout(homePaths); err != nil {
+		t.Fatalf("EnsureHomeLayout() error = %v", err)
+	}
+
+	writeFile(t, homePaths.ConfigFile, `
+[skills]
+poll_interval = "0s"
+`)
+
+	_, err = Load(WithWorkspaceRoot(workspaceRoot))
+	if err == nil {
+		t.Fatal("Load() error = nil, want non-nil")
+	}
+	if !strings.Contains(err.Error(), "skills.poll_interval") {
+		t.Fatalf("Load() error = %v, want skills.poll_interval in message", err)
+	}
+}
+
+func TestLoadUsesDotEnvForCompozyHomeWithoutMutatingProcessEnv(t *testing.T) {
+	workspaceRoot := t.TempDir()
+	homeRoot := filepath.Join(t.TempDir(), "dotenv-home")
+
+	unsetEnvForTest(t, "COMPOZY_HOME")
+	writeFile(t, filepath.Join(workspaceRoot, ".env"), "COMPOZY_HOME="+homeRoot+"\n")
+
+	homePaths, err := ResolveHomePathsFrom(homeRoot)
+	if err != nil {
+		t.Fatalf("ResolveHomePathsFrom() error = %v", err)
+	}
+	if err := EnsureHomeLayout(homePaths); err != nil {
+		t.Fatalf("EnsureHomeLayout() error = %v", err)
+	}
+	writeFile(t, homePaths.ConfigFile, `
+[defaults]
+agent = "dotenv-agent"
+`)
+
+	cfg, err := Load(WithWorkspaceRoot(workspaceRoot))
+	if err != nil {
+		t.Fatalf("Load() error = %v", err)
+	}
+	if cfg.Defaults.Agent != "dotenv-agent" {
+		t.Fatalf("Load() Defaults.Agent = %q, want %q", cfg.Defaults.Agent, "dotenv-agent")
+	}
+	if _, ok := os.LookupEnv("COMPOZY_HOME"); ok {
+		t.Fatal("Load() mutated process COMPOZY_HOME, want workspace dotenv scoped to the current load only")
+	}
+}
+
+func TestLoadForHomeKeepsWebhookSecretRefsUnresolvedAcrossWorkspaceLoads(t *testing.T) {
+	const secretEnv = "COMPOZY_CONFIG_TASK09_WEBHOOK_SECRET"
+
+	unsetEnvForTest(t, secretEnv)
+
+	homePaths, err := ResolveHomePathsFrom(filepath.Join(t.TempDir(), "home"))
+	if err != nil {
+		t.Fatalf("ResolveHomePathsFrom() error = %v", err)
+	}
+	if err := EnsureHomeLayout(homePaths); err != nil {
+		t.Fatalf("EnsureHomeLayout() error = %v", err)
+	}
+
+	writeFile(t, homePaths.ConfigFile, `
+[automation]
+timezone = "UTC"
+max_concurrent_jobs = 1
+default_fire_limit = { max = 1, window = "5m" }
+
+[[automation.triggers]]
+scope = "global"
+name = "deploy"
+event = "webhook"
+endpoint_slug = "deploy-review"
+agent = "summarizer"
+prompt = "Review {{ index .Data \"payload\" }}"
+	webhook_secret_ref = "env:`+secretEnv+`"
+	`)
+
+	workspaceWithEnv := t.TempDir()
+	writeFile(t, filepath.Join(workspaceWithEnv, ".env"), secretEnv+"=workspace-only-secret\n")
+
+	cfg, err := LoadForHome(homePaths, WithWorkspaceRoot(workspaceWithEnv))
+	if err != nil {
+		t.Fatalf("LoadForHome(workspaceWithEnv) error = %v", err)
+	}
+	if got, want := cfg.Automation.Triggers[0].WebhookSecretRef, "env:"+secretEnv; got != want {
+		t.Fatalf("LoadForHome(workspaceWithEnv) WebhookSecretRef = %q, want %q", got, want)
+	}
+
+	workspaceWithoutEnv := t.TempDir()
+	cfg, err = LoadForHome(homePaths, WithWorkspaceRoot(workspaceWithoutEnv))
+	if err != nil {
+		t.Fatalf("LoadForHome(workspaceWithoutEnv) error = %v", err)
+	}
+	if got, want := cfg.Automation.Triggers[0].WebhookSecretRef, "env:"+secretEnv; got != want {
+		t.Fatalf("LoadForHome(workspaceWithoutEnv) WebhookSecretRef = %q, want %q", got, want)
+	}
+}
+
+// not parallel: subtests mutate the process catalog-source environment.
+func TestMarketplaceCatalogEnvironmentLifecycle(t *testing.T) {
+	const localCatalog = "file:///tmp/compozy-checkout/catalog"
+
+	t.Run("Should use the process catalog source without persisting it", func(t *testing.T) {
+		homePaths, err := ResolveHomePathsFrom(filepath.Join(t.TempDir(), "home"))
+		if err != nil {
+			t.Fatalf("ResolveHomePathsFrom() error = %v", err)
+		}
+		if err := EnsureHomeLayout(homePaths); err != nil {
+			t.Fatalf("EnsureHomeLayout() error = %v", err)
+		}
+		writeFile(t, homePaths.ConfigFile, `[marketplace.catalog]
+base_url = "https://catalog.example.test"
+`)
+
+		t.Setenv("COMPOZY_MARKETPLACE_CATALOG_BASE_URL", localCatalog)
+		cfg, err := LoadForHome(homePaths)
+		if err != nil {
+			t.Fatalf("LoadForHome() error = %v", err)
+		}
+		if got := cfg.Marketplace.Catalog.EffectiveBaseURL(); got != localCatalog {
+			t.Fatalf("Marketplace base URL = %q, want environment override %q", got, localCatalog)
+		}
+		persisted, err := os.ReadFile(homePaths.ConfigFile)
+		if err != nil {
+			t.Fatalf("ReadFile(config.toml) error = %v", err)
+		}
+		if strings.Contains(string(persisted), localCatalog) {
+			t.Fatalf("config.toml = %q, want process override to remain ephemeral", persisted)
+		}
+	})
+
+	t.Run("Should preserve the process catalog source across config writes", func(t *testing.T) {
+		homePaths, err := ResolveHomePathsFrom(filepath.Join(t.TempDir(), "home"))
+		if err != nil {
+			t.Fatalf("ResolveHomePathsFrom() error = %v", err)
+		}
+		target, err := ResolveConfigWriteTarget(homePaths, "", WriteScopeUser, "")
+		if err != nil {
+			t.Fatalf("ResolveConfigWriteTarget() error = %v", err)
+		}
+		t.Setenv("COMPOZY_MARKETPLACE_CATALOG_BASE_URL", localCatalog)
+
+		cfg, err := EditConfigOverlay(homePaths, "", target, func(editor *OverlayEditor) error {
+			return editor.SetValue([]string{"defaults", "agent"}, "general")
+		})
+		if err != nil {
+			t.Fatalf("EditConfigOverlay() error = %v", err)
+		}
+		if got := cfg.Marketplace.Catalog.EffectiveBaseURL(); got != localCatalog {
+			t.Fatalf("Marketplace base URL after write = %q, want runtime override %q", got, localCatalog)
+		}
+		persisted, err := os.ReadFile(homePaths.ConfigFile)
+		if err != nil {
+			t.Fatalf("ReadFile(config.toml) error = %v", err)
+		}
+		if strings.Contains(string(persisted), localCatalog) {
+			t.Fatalf("config.toml = %q, want runtime override to remain ephemeral", persisted)
+		}
+	})
+}
+
+func TestLoadWithoutDotEnvOptionIgnoresDotEnv(t *testing.T) {
+	workspaceRoot := t.TempDir()
+	envHome := filepath.Join(t.TempDir(), "dotenv-home")
+	overrideHome := filepath.Join(t.TempDir(), "override-home")
+
+	t.Setenv("COMPOZY_HOME", overrideHome)
+	writeFile(t, filepath.Join(workspaceRoot, ".env"), "COMPOZY_HOME="+envHome+"\n")
+
+	overridePaths, err := ResolveHomePathsFrom(overrideHome)
+	if err != nil {
+		t.Fatalf("ResolveHomePathsFrom() error = %v", err)
+	}
+
+	cfg, err := Load(WithWorkspaceRoot(workspaceRoot), withoutDotEnv())
+	if err != nil {
+		t.Fatalf("Load() error = %v", err)
+	}
+	if cfg.Daemon.Socket != overridePaths.DaemonSocket {
+		t.Fatalf("Load() Daemon.Socket = %q, want %q", cfg.Daemon.Socket, overridePaths.DaemonSocket)
+	}
+}
+
+func TestLoadWithoutValidationReturnsMergedConfig(t *testing.T) {
+	workspaceRoot := t.TempDir()
+	homeRoot := filepath.Join(t.TempDir(), "home")
+	t.Setenv("COMPOZY_HOME", homeRoot)
+
+	homePaths, err := ResolveHomePaths()
+	if err != nil {
+		t.Fatalf("ResolveHomePaths() error = %v", err)
+	}
+	if err := EnsureHomeLayout(homePaths); err != nil {
+		t.Fatalf("EnsureHomeLayout() error = %v", err)
+	}
+
+	writeFile(t, homePaths.ConfigFile, `
+[http]
+host = "localhost"
+port = 0
+`)
+
+	cfg, err := Load(WithWorkspaceRoot(workspaceRoot), withoutValidation())
+	if err != nil {
+		t.Fatalf("Load() error = %v", err)
+	}
+	if cfg.HTTP.Port != 0 {
+		t.Fatalf("Load() HTTP.Port = %d, want 0", cfg.HTTP.Port)
+	}
+}
+
+func TestLoadMissingConfigReturnsDefaults(t *testing.T) {
+	workspaceRoot := t.TempDir()
+	homeRoot := filepath.Join(t.TempDir(), "home")
+	t.Setenv("COMPOZY_HOME", homeRoot)
+
+	homePaths, err := ResolveHomePaths()
+	if err != nil {
+		t.Fatalf("ResolveHomePaths() error = %v", err)
+	}
+	want := DefaultWithHome(homePaths)
+
+	cfg, err := Load(WithWorkspaceRoot(workspaceRoot))
+	if err != nil {
+		t.Fatalf("Load() error = %v", err)
+	}
+
+	if cfg.HTTP != want.HTTP || cfg.Defaults != want.Defaults || cfg.Limits != want.Limits ||
+		cfg.Permissions != want.Permissions {
+		t.Fatalf("Load() = %#v, want defaults %#v", cfg, want)
+	}
+	if cfg.Daemon.Socket != want.Daemon.Socket {
+		t.Fatalf("Load() Daemon.Socket = %q, want %q", cfg.Daemon.Socket, want.Daemon.Socket)
+	}
+	if cfg.Skills.Enabled != want.Skills.Enabled || cfg.Skills.PollInterval != want.Skills.PollInterval ||
+		!slices.Equal(cfg.Skills.DisabledSkills, want.Skills.DisabledSkills) {
+		t.Fatalf("Load() Skills = %#v, want %#v", cfg.Skills, want.Skills)
+	}
+	if !cfg.Roles.AutoTitle.Enabled {
+		t.Fatal("Load() Roles.AutoTitle.Enabled = false, want true by default")
+	}
+}
+
+func TestDefaultConfigUsesResolvedHomePaths(t *testing.T) {
+	t.Run("Should resolve factory defaults from the operator home", func(t *testing.T) {
+		t.Setenv("COMPOZY_HOME", "")
+
+		cfg, err := defaultConfig()
+		if err != nil {
+			t.Fatalf("defaultConfig() error = %v", err)
+		}
+		if cfg.HTTP.Port != 2123 || cfg.Defaults.Agent != DefaultAgentName {
+			t.Fatalf("defaultConfig() = %#v", cfg)
+		}
+		if cfg.Permissions.Mode != PermissionModeApproveAll {
+			t.Fatalf("defaultConfig() Permissions.Mode = %q, want %q", cfg.Permissions.Mode, PermissionModeApproveAll)
+		}
+		if !cfg.Skills.Enabled {
+			t.Fatal("defaultConfig() Skills.Enabled = false, want true")
+		}
+		if got, want := cfg.Skills.PollInterval, 3*time.Second; got != want {
+			t.Fatalf("defaultConfig() Skills.PollInterval = %s, want %s", got, want)
+		}
+	})
+}
+
+func TestProfileConfigLayersComposeInSpecificityOrder(t *testing.T) {
+	t.Parallel()
+
+	homePaths, err := ResolveHomePathsFrom(filepath.Join(t.TempDir(), "home"))
+	if err != nil {
+		t.Fatalf("ResolveHomePathsFrom() error = %v", err)
+	}
+	workspaceRoot := t.TempDir()
+	profileName := "marketing"
+	layers := []struct {
+		path  string
+		value int
+	}{
+		{path: homePaths.ConfigFile, value: 2},
+		{path: profileConfigFile(homePaths, profileName), value: 3},
+		{path: workspaceConfigFile(workspaceRoot), value: 4},
+		{path: workspaceProfileConfigFile(workspaceRoot, profileName), value: 5},
+	}
+	for _, layer := range layers {
+		writeFile(t, layer.path, fmt.Sprintf("[limits]\nmax_concurrent_agents = %d\n", layer.value))
+	}
+	writeFile(t, profileMCPJSONFile(homePaths, profileName), `{
+  "mcpServers": {"layered": {"command": "profile-sidecar"}}
+}`)
+	writeFile(t, workspaceProfileMCPJSONFile(workspaceRoot, profileName), `{
+  "mcpServers": {"layered": {"command": "workspace-profile-sidecar"}}
+}`)
+
+	cfg, err := LoadForHome(
+		homePaths,
+		WithWorkspaceRoot(workspaceRoot),
+		WithProfile(profileName),
+	)
+	if err != nil {
+		t.Fatalf("LoadForHome(profile layers) error = %v", err)
+	}
+	if got, want := cfg.Limits.MaxConcurrentAgents, 5; got != want {
+		t.Fatalf("MaxConcurrentAgents = %d, want workspace-profile winner %d", got, want)
+	}
+	if len(cfg.MCPServers) != 1 || cfg.MCPServers[0].Command != "workspace-profile-sidecar" {
+		t.Fatalf("MCPServers = %#v, want workspace-profile sidecar winner", cfg.MCPServers)
+	}
+
+	if err := os.Remove(workspaceProfileConfigFile(workspaceRoot, profileName)); err != nil {
+		t.Fatalf("Remove(workspace profile config) error = %v", err)
+	}
+	if err := os.Remove(workspaceProfileMCPJSONFile(workspaceRoot, profileName)); err != nil {
+		t.Fatalf("Remove(workspace profile MCP) error = %v", err)
+	}
+	cfg, err = LoadForHome(homePaths, WithWorkspaceRoot(workspaceRoot), WithProfile(profileName))
+	if err != nil {
+		t.Fatalf("LoadForHome(profile fallback) error = %v", err)
+	}
+	if got, want := cfg.Limits.MaxConcurrentAgents, 4; got != want {
+		t.Fatalf("MaxConcurrentAgents fallback = %d, want workspace winner %d", got, want)
+	}
+	if len(cfg.MCPServers) != 1 || cfg.MCPServers[0].Command != "profile-sidecar" {
+		t.Fatalf("MCPServers fallback = %#v, want personal profile sidecar", cfg.MCPServers)
+	}
+}
+
+func TestWriteOverrideLayers(t *testing.T) {
+	t.Parallel()
+
+	homePaths, err := ResolveHomePathsFrom(filepath.Join(t.TempDir(), "home"))
+	if err != nil {
+		t.Fatalf("ResolveHomePathsFrom() error = %v", err)
+	}
+	workspaceRoot := t.TempDir()
+
+	tests := []struct {
+		name       string
+		target     WriteTarget
+		wantLayers []configLayerPath
+	}{
+		{
+			name: "Should return no layers for a user target without workspace or profile",
+			target: WriteTarget{
+				scope: WriteScopeUser,
+			},
+		},
+		{
+			name: "Should include profile workspace and workspace profile layers for a user target",
+			target: WriteTarget{
+				scope:         WriteScopeUser,
+				workspaceRoot: workspaceRoot,
+				profileName:   "marketing",
+			},
+			wantLayers: []configLayerPath{
+				{name: RoleFieldSourceProfile, path: profileConfigFile(homePaths, "marketing")},
+				{name: RoleFieldSourceWorkspace, path: workspaceConfigFile(workspaceRoot)},
+				{name: RoleFieldSourceWorkspaceProfile, path: workspaceProfileConfigFile(workspaceRoot, "marketing")},
+			},
+		},
+		{
+			name: "Should include workspace and workspace profile layers for a profile target",
+			target: WriteTarget{
+				scope:         WriteScopeProfile,
+				workspaceRoot: workspaceRoot,
+				profileName:   "marketing",
+			},
+			wantLayers: []configLayerPath{
+				{name: RoleFieldSourceWorkspace, path: workspaceConfigFile(workspaceRoot)},
+				{name: RoleFieldSourceWorkspaceProfile, path: workspaceProfileConfigFile(workspaceRoot, "marketing")},
+			},
+		},
+		{
+			name: "Should include only workspace profile for a workspace target",
+			target: WriteTarget{
+				scope:         WriteScopeWorkspace,
+				workspaceRoot: workspaceRoot,
+				profileName:   "marketing",
+			},
+			wantLayers: []configLayerPath{
+				{name: RoleFieldSourceWorkspaceProfile, path: workspaceProfileConfigFile(workspaceRoot, "marketing")},
+			},
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			if got := higherPrecedenceConfigLayers(
+				homePaths,
+				tc.target.workspaceRoot,
+				tc.target,
+			); !slices.Equal(
+				got,
+				tc.wantLayers,
+			) {
+				t.Fatalf("higherPrecedenceConfigLayers() = %#v, want %#v", got, tc.wantLayers)
+			}
+		})
+	}
+}
+
+func TestProfileConfigOverlayRejectsMachineOnlyKeys(t *testing.T) {
+	t.Parallel()
+
+	t.Run("Should allow palette personalization", func(t *testing.T) {
+		t.Parallel()
+
+		if _, err := loadProfileConfigOverlayBytes(
+			[]byte("[cmd_palette]\npersonalization = false\n"),
+			"profile.toml",
+		); err != nil {
+			t.Fatalf("loadProfileConfigOverlayBytes(cmd_palette) error = %v", err)
+		}
+	})
+
+	t.Run("Should reject every machine-only root and global shortcut binding", func(t *testing.T) {
+		t.Parallel()
+
+		inputs := []string{
+			"[http]\nport = 9999\n",
+			"[observability]\nenabled = false\n",
+			"[window_manager.global_shortcuts]\nsummon = \"meta+KeyK\"\n",
+			"[tools.clarify]\ntimeout = \"5m\"\n",
+		}
+		for _, input := range inputs {
+			_, err := loadProfileConfigOverlayBytes([]byte(input), "profile.toml")
+			validation, validationOK := errors.AsType[ValidationError](err)
+			if !validationOK || validation.Code != "profile_config_key_denied" {
+				t.Fatalf("loadProfileConfigOverlayBytes(%q) error = %#v, want profile_config_key_denied", input, err)
+			}
+			if !strings.Contains(err.Error(), "--scope user") {
+				t.Fatalf("denied profile overlay error = %q, want user-scope guidance", err)
+			}
+		}
+	})
+}
+
+func TestProfileWriteTargetsUsePersonalProfileDirectory(t *testing.T) {
+	t.Parallel()
+
+	homePaths, err := ResolveHomePathsFrom(filepath.Join(t.TempDir(), "home"))
+	if err != nil {
+		t.Fatalf("ResolveHomePathsFrom() error = %v", err)
+	}
+	configTarget, err := ResolveConfigWriteTarget(homePaths, "", WriteScopeProfile, "marketing")
+	if err != nil {
+		t.Fatalf("ResolveConfigWriteTarget(profile) error = %v", err)
+	}
+	mcpTarget, err := ResolveMCPSidecarWriteTarget(homePaths, "", WriteScopeProfile, "marketing")
+	if err != nil {
+		t.Fatalf("ResolveMCPSidecarWriteTarget(profile) error = %v", err)
+	}
+	if got, want := configTarget.Path(), filepath.Join(homePaths.ProfilesDir, "marketing", ConfigName); got != want {
+		t.Fatalf("profile config target = %q, want %q", got, want)
+	}
+	if got, want := mcpTarget.Path(), filepath.Join(homePaths.ProfilesDir, "marketing", MCPJSONName); got != want {
+		t.Fatalf("profile MCP target = %q, want %q", got, want)
+	}
+	if _, err := ResolveConfigWriteTarget(homePaths, "", WriteScopeProfile, "Marketing"); err == nil {
+		t.Fatal("ResolveConfigWriteTarget(invalid profile) error = nil, want name rejection")
+	} else if !strings.Contains(err.Error(), "resource profile name") {
+		t.Fatalf("ResolveConfigWriteTarget(invalid profile) error = %v, want resource profile validation", err)
+	}
+}
+
+func TestInspectProfileLayerFilesReportsOrphansWithoutApplyingThem(t *testing.T) {
+	t.Parallel()
+
+	homePaths, err := ResolveHomePathsFrom(filepath.Join(t.TempDir(), "home"))
+	if err != nil {
+		t.Fatalf("ResolveHomePathsFrom() error = %v", err)
+	}
+	workspaceRoot := t.TempDir()
+	writeFile(
+		t,
+		filepath.Join(homePaths.ProfilesDir, "ghost", ConfigName),
+		"[defaults]\nprovider = \"orphan-provider\"\n",
+	)
+	writeFile(
+		t,
+		filepath.Join(workspaceRoot, DirName, ProfilesDirName, "ghost", MCPJSONName),
+		`{"mcpServers":{"orphan-server":{"command":"orphan"}}}`,
+	)
+
+	diagnostics, err := InspectProfileLayerFiles(homePaths, workspaceRoot, []string{"marketing"})
+	if err != nil {
+		t.Fatalf("InspectProfileLayerFiles() error = %v", err)
+	}
+	if got, want := len(diagnostics), 2; got != want {
+		t.Fatalf("InspectProfileLayerFiles() diagnostics = %#v, want %d", diagnostics, want)
+	}
+	for _, diagnostic := range diagnostics {
+		if diagnostic.Code != ProfileLayerOrphanedCode || diagnostic.Profile != "ghost" {
+			t.Fatalf("profile layer diagnostic = %#v, want ghost orphan", diagnostic)
+		}
+	}
+	loaded, err := LoadForHome(homePaths, WithWorkspaceRoot(workspaceRoot), withoutDotEnv())
+	if err != nil {
+		t.Fatalf("LoadForHome() error = %v", err)
+	}
+	if loaded.Defaults.Provider == "orphan-provider" {
+		t.Fatal("LoadForHome() applied an orphan profile config")
+	}
+	if slices.ContainsFunc(loaded.MCPServers, func(server MCPServer) bool { return server.Name == "orphan-server" }) {
+		t.Fatal("LoadForHome() applied an orphan profile MCP sidecar")
+	}
+}
+
+func TestLoadSessionRuntimeDefaultsStayWithTheirProvider(t *testing.T) {
+	t.Parallel()
+
+	const userDefaults = `
+[defaults]
+agent = "general"
+provider = "codex"
+model = "gpt-5.6-terra"
+reasoning_effort = "high"
+`
+	for _, testCase := range []struct {
+		name          string
+		profile       string
+		workspace     string
+		wantProvider  string
+		wantModel     string
+		wantReasoning string
+	}{
+		{
+			name:          "Should load the saved session runtime from the user layer",
+			wantProvider:  "codex",
+			wantModel:     "gpt-5.6-terra",
+			wantReasoning: "high",
+		},
+		{
+			name:          "Should inherit the saved model when a layer repeats the provider",
+			workspace:     "[defaults]\nprovider = \"codex\"\n",
+			wantProvider:  "codex",
+			wantModel:     "gpt-5.6-terra",
+			wantReasoning: "high",
+		},
+		{
+			name:         "Should drop the inherited model when a profile switches provider",
+			profile:      "[defaults]\nprovider = \"claude\"\n",
+			wantProvider: "claude",
+		},
+		{
+			name:          "Should apply the profile's own model for its provider",
+			profile:       "[defaults]\nprovider = \"claude\"\nmodel = \"claude-opus-5\"\nreasoning_effort = \"max\"\n",
+			workspace:     "[defaults]\nprovider = \"claude\"\n",
+			wantProvider:  "claude",
+			wantModel:     "claude-opus-5",
+			wantReasoning: "max",
+		},
+		{
+			name:          "Should refine only the model when a layer leaves the provider alone",
+			workspace:     "[defaults]\nmodel = \"gpt-5.6-luna\"\n",
+			wantProvider:  "codex",
+			wantModel:     "gpt-5.6-luna",
+			wantReasoning: "high",
+		},
+	} {
+		t.Run(testCase.name, func(t *testing.T) {
+			t.Parallel()
+
+			homePaths, err := ResolveHomePathsFrom(filepath.Join(t.TempDir(), "home"))
+			if err != nil {
+				t.Fatalf("ResolveHomePathsFrom() error = %v", err)
+			}
+			workspaceRoot := t.TempDir()
+			writeFile(t, homePaths.ConfigFile, userDefaults)
+			options := []LoadOption{WithWorkspaceRoot(workspaceRoot), withoutDotEnv()}
+			if testCase.profile != "" {
+				writeFile(t, profileConfigFile(homePaths, "work"), testCase.profile)
+				options = append(options, WithProfile("work"))
+			}
+			if testCase.workspace != "" {
+				writeFile(t, filepath.Join(workspaceRoot, DirName, ConfigName), testCase.workspace)
+			}
+
+			cfg, err := LoadForHome(homePaths, options...)
+			if err != nil {
+				t.Fatalf("LoadForHome() error = %v", err)
+			}
+			got := cfg.Defaults
+			if got.Provider != testCase.wantProvider || got.Model != testCase.wantModel ||
+				got.ReasoningEffort != testCase.wantReasoning {
+				t.Fatalf("Defaults = %s/%s/%s, want %s/%s/%s",
+					got.Provider, got.Model, got.ReasoningEffort,
+					testCase.wantProvider, testCase.wantModel, testCase.wantReasoning)
+			}
+		})
+	}
+}
+
+func TestDefaultsConfigValidateSessionRuntime(t *testing.T) {
+	t.Parallel()
+
+	for _, testCase := range []struct {
+		name     string
+		defaults DefaultsConfig
+		wantPath string
+	}{
+		{
+			name:     "Should require a provider for the saved model",
+			defaults: DefaultsConfig{Agent: "general", Model: "gpt-5.6-terra"},
+			wantPath: configDefaultsModelPath,
+		},
+		{
+			name:     "Should require a provider for the saved reasoning",
+			defaults: DefaultsConfig{Agent: "general", ReasoningEffort: "high"},
+			wantPath: configDefaultsReasoningEffortPath,
+		},
+		{
+			name:     "Should reject a malformed reasoning effort",
+			defaults: DefaultsConfig{Agent: "general", Provider: "codex", ReasoningEffort: "very high"},
+			wantPath: configDefaultsReasoningEffortPath,
+		},
+		{
+			name:     "Should accept a provider-bound model and reasoning",
+			defaults: DefaultsConfig{Agent: "general", Provider: "codex", Model: "gpt-5.6-terra", ReasoningEffort: "high"},
+		},
+	} {
+		t.Run(testCase.name, func(t *testing.T) {
+			t.Parallel()
+
+			err := testCase.defaults.Validate()
+			if testCase.wantPath == "" {
+				if err != nil {
+					t.Fatalf("Validate() error = %v, want nil", err)
+				}
+				return
+			}
+			if err == nil || !strings.Contains(err.Error(), testCase.wantPath) {
+				t.Fatalf("Validate() error = %v, want %s", err, testCase.wantPath)
+			}
+		})
+	}
+}
+
+func writeFile(t *testing.T, path string, contents string) {
+	t.Helper()
+
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		t.Fatalf("MkdirAll(%q) error = %v", path, err)
+	}
+	if err := os.WriteFile(path, []byte(strings.TrimLeft(contents, "\n")), 0o644); err != nil {
+		t.Fatalf("WriteFile(%q) error = %v", path, err)
+	}
+}
+
+func unsetEnvForTest(t *testing.T, key string) {
+	t.Helper()
+
+	value, hadValue := os.LookupEnv(key)
+	if err := os.Unsetenv(key); err != nil {
+		t.Fatalf("Unsetenv(%q) error = %v", key, err)
+	}
+
+	t.Cleanup(func() {
+		var err error
+		if hadValue {
+			err = os.Setenv(key, value)
+		} else {
+			err = os.Unsetenv(key)
+		}
+		if err != nil {
+			t.Fatalf("restore env %q error = %v", key, err)
+		}
+	})
+}
+
+func TestSessionStopConfig(t *testing.T) {
+	t.Parallel()
+	t.Run("Should default to ten seconds and preserve an omitted override", func(t *testing.T) {
+		t.Parallel()
+		cfg := defaultSessionConfig()
+		sessionOverlay{}.Apply(&cfg)
+		if cfg.Stop.CooperativeGrace != 10*time.Second {
+			t.Fatalf("default grace=%s", cfg.Stop.CooperativeGrace)
+		}
+		grace := 7 * time.Second
+		sessionOverlay{Stop: sessionStopOverlay{CooperativeGrace: &grace}}.Apply(&cfg)
+		if cfg.Stop.CooperativeGrace != grace {
+			t.Fatalf("override grace=%s", cfg.Stop.CooperativeGrace)
+		}
+	})
+	t.Run("Should reject nonpositive cooperative grace", func(t *testing.T) {
+		t.Parallel()
+		for _, grace := range []time.Duration{0, -time.Second} {
+			cfg := defaultSessionConfig()
+			cfg.Stop.CooperativeGrace = grace
+			if err := cfg.Validate(); err == nil || !strings.Contains(err.Error(), "session.stop.cooperative_grace") {
+				t.Fatalf("Validate(%s)=%v", grace, err)
+			}
+		}
+	})
+}
+
+func TestSessionAuthRecoveryConfig(t *testing.T) {
+	t.Run("Should reject auth recovery settings in workspace files", func(t *testing.T) {
+		t.Parallel()
+		for _, setting := range []string{`enabled = false`, `window = "2m"`, `initial_delay = "1s"`, `max_delay = "1m"`} {
+			_, err := loadWorkspaceConfigOverlayBytes(
+				[]byte("[session.auth_recovery]\n"+setting+"\n"),
+				"workspace.toml",
+			)
+			if err == nil || !strings.Contains(err.Error(), "session.auth_recovery settings are global-only") {
+				t.Fatalf("workspace setting %s: %v, want global-only rejection", setting, err)
+			}
+		}
+	})
+	t.Parallel()
+	t.Run("Should back off from fifteen seconds to a one minute cap inside a ten minute window", func(t *testing.T) {
+		t.Parallel()
+		cfg := defaultSessionConfig()
+		sessionOverlay{}.Apply(&cfg)
+		want := []time.Duration{15 * time.Second, 30 * time.Second}
+		for range 9 {
+			want = append(want, time.Minute)
+		}
+		if got := cfg.AuthRecovery.Delays(); !slices.Equal(got, want) {
+			t.Fatalf("default delays = %v, want %v", got, want)
+		}
+	})
+	t.Run("Should apply overrides and schedule nothing when disabled", func(t *testing.T) {
+		t.Parallel()
+		cfg := defaultSessionConfig()
+		window, initial, maxDelay := 40*time.Second, 5*time.Second, 10*time.Second
+		sessionOverlay{AuthRecovery: sessionAuthRecoveryOverlay{
+			Window: &window, InitialDelay: &initial, MaxDelay: &maxDelay,
+		}}.Apply(&cfg)
+		want := []time.Duration{5 * time.Second, 10 * time.Second, 10 * time.Second, 10 * time.Second}
+		if got := cfg.AuthRecovery.Delays(); !slices.Equal(got, want) {
+			t.Fatalf("override delays = %v, want %v", got, want)
+		}
+		disabled := false
+		sessionOverlay{AuthRecovery: sessionAuthRecoveryOverlay{Enabled: &disabled}}.Apply(&cfg)
+		if got := cfg.AuthRecovery.Delays(); len(got) != 0 {
+			t.Fatalf("disabled delays = %v, want none", got)
+		}
+	})
+	t.Run("Should reject schedules that cannot fit one bounded attempt", func(t *testing.T) {
+		t.Parallel()
+		for _, mutate := range []func(*SessionAuthRecoveryConfig){
+			func(c *SessionAuthRecoveryConfig) { c.InitialDelay = 0 },
+			func(c *SessionAuthRecoveryConfig) { c.MaxDelay = c.InitialDelay - time.Second },
+			func(c *SessionAuthRecoveryConfig) { c.MaxDelay = time.Hour },
+			func(c *SessionAuthRecoveryConfig) { c.Window = c.InitialDelay - time.Second },
+			func(c *SessionAuthRecoveryConfig) { c.Window = 2 * time.Hour },
+		} {
+			cfg := defaultSessionConfig()
+			mutate(&cfg.AuthRecovery)
+			if err := cfg.Validate(); err == nil || !strings.Contains(err.Error(), "session.auth_recovery.") {
+				t.Fatalf("Validate(%#v) = %v, want auth recovery bound error", cfg.AuthRecovery, err)
+			}
+		}
+	})
+	t.Run("Should restrict auth recovery writes to global scope", func(t *testing.T) {
+		t.Parallel()
+		for _, path := range []string{"session.auth_recovery.enabled", "session.auth_recovery.window"} {
+			parts := strings.Split(path, ".")
+			if err := ValidateConfigWriteScope(WriteScopeUser, parts); err != nil {
+				t.Fatal(err)
+			}
+			if err := ValidateConfigWriteScope(WriteScopeWorkspace, parts); err == nil ||
+				!strings.Contains(err.Error(), "global-only") {
+				t.Fatalf("workspace write error = %v, want global-only denial for %s", err, path)
+			}
+		}
+	})
+}
+
+func TestSessionBusyInputConfigDefaultsAndValidation(t *testing.T) {
+	t.Parallel()
+	for _, tc := range []struct {
+		name    string
+		value   string
+		want    string
+		invalid bool
+	}{
+		{name: "Should default omitted mode to steer", want: "steer"},
+		{name: "Should accept steer", value: "steer", want: "steer"},
+		{name: "Should accept queue", value: "queue", want: "queue"},
+		{name: "Should trim an explicit mode", value: " queue ", want: "queue"},
+		{name: "Should preserve legacy interrupt during its compatibility window", value: "interrupt", want: "interrupt"},
+		{name: "Should reject an unknown default mode", value: "automatic", invalid: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			cfg := SessionBusyInputConfig{DefaultMode: tc.value}
+			err := cfg.Validate()
+			if tc.invalid {
+				if err == nil || !strings.Contains(err.Error(), "session.busy_input.default_mode") ||
+					!strings.Contains(err.Error(), tc.value) {
+					t.Fatalf("Validate(%q) = %v, want field and rejected value", tc.value, err)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatal(err)
+			}
+			if got := cfg.Normalize().DefaultMode; got != tc.want {
+				t.Fatalf("normalized mode = %q, want %q", got, tc.want)
+			}
+		})
+	}
+}
+
+// Invariant: a fresh home creates only retained runtime directories. Owner: config home layout (UT-001).
+func TestEnsureHomeLayoutCreatesRetainedDirectories(t *testing.T) {
+	t.Parallel()
+	t.Run("Should create the retained home layout", func(t *testing.T) {
+		t.Parallel()
+		paths, err := ResolveHomePathsFrom(t.TempDir())
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := EnsureHomeLayout(paths); err != nil {
+			t.Fatal(err)
+		}
+		for _, path := range []string{paths.AgentsDir, paths.SkillsDir, paths.ExtensionDataRoot} {
+			if info, err := os.Stat(path); err != nil || !info.IsDir() {
+				t.Fatalf("retained directory %q: %v", path, err)
+			}
+		}
+		if _, err := os.Stat(
+			filepath.Join(paths.HomeDir, ProfilesDirName, DefaultProfileDirName, "memory"),
+		); !errors.Is(
+			err,
+			os.ErrNotExist,
+		) {
+			t.Fatalf("fresh memory directory: %v", err)
+		}
+	})
+}
+
+// UT-050, UT-051: merged configuration owns defaults, workspace isolation, and bounds.
+func TestSubagentsConfig(t *testing.T) {
+	t.Run("Should load defaults and isolate workspace overrides", func(t *testing.T) {
+		t.Setenv("COMPOZY_HOME", t.TempDir())
+		cfg, err := Load()
+		if err != nil {
+			t.Fatal(err)
+		}
+		if cfg.SubagentResultMaxChars() != 60000 {
+			t.Fatalf("default = %d", cfg.SubagentResultMaxChars())
+		}
+		paths, err := ResolveHomePaths()
+		if err != nil {
+			t.Fatal(err)
+		}
+		writeFile(t, paths.ConfigFile, "[subagents]\nresult_max_chars = 70000\n")
+		workspace := t.TempDir()
+		writeFile(t, filepath.Join(workspace, DirName, ConfigName), "[subagents]\nresult_max_chars = 30000\n")
+		local, err := Load(WithWorkspaceRoot(workspace))
+		if err != nil {
+			t.Fatal(err)
+		}
+		global, err := Load()
+		if err != nil {
+			t.Fatal(err)
+		}
+		if local.SubagentResultMaxChars() != 30000 || global.SubagentResultMaxChars() != 70000 {
+			t.Fatalf("local/global = %d/%d", local.SubagentResultMaxChars(), global.SubagentResultMaxChars())
+		}
+		writeFile(t, filepath.Join(workspace, DirName, ConfigName), "[subagents]\nresult_max_chars = 999\n")
+		_, err = Load(WithWorkspaceRoot(workspace))
+		if err == nil ||
+			!strings.Contains(err.Error(), "subagents.result_max_chars must be between 1000 and 1000000: 999") {
+			t.Fatalf("invalid overlay = %v", err)
+		}
+	})
+	t.Run("Should reject values outside inclusive bounds", func(t *testing.T) {
+		t.Parallel()
+		for _, value := range []int{0, 999, 1000001} {
+			err := (SubagentsConfig{ResultMaxChars: value}).Validate()
+			want := fmt.Sprintf("subagents.result_max_chars must be between 1000 and 1000000: %d", value)
+			if err == nil || err.Error() != want {
+				t.Fatalf("value %d: %v", value, err)
+			}
+		}
+		for _, value := range []int{1000, 60000, 1000000} {
+			if err := (SubagentsConfig{ResultMaxChars: value}).Validate(); err != nil {
+				t.Fatal(err)
+			}
+		}
+	})
+}
+
+func TestDaemonLoadConfigDefaultsAndValidation(t *testing.T) {
+	t.Parallel()
+
+	t.Run("Should expose background niceness and load admission defaults", func(t *testing.T) {
+		t.Parallel()
+
+		homePaths, err := ResolveHomePathsFrom(filepath.Join(t.TempDir(), "home"))
+		if err != nil {
+			t.Fatalf("ResolveHomePathsFrom() error = %v", err)
+		}
+		want := DaemonLoadConfig{AgentNiceness: 10, AdmissionThreshold: 1.5, AdmissionMaxWait: 2 * time.Minute}
+		if got := DefaultWithHome(homePaths).Daemon.Load; got != want {
+			t.Fatalf("DefaultWithHome() Daemon.Load = %#v, want %#v", got, want)
+		}
+	})
+
+	testCases := []struct {
+		name     string
+		cfg      DaemonLoadConfig
+		wantPath string
+	}{
+		{name: "Should allow zero to disable niceness and load admission", cfg: DaemonLoadConfig{}},
+		{
+			name:     "Should reject a negative niceness that would need privileges",
+			cfg:      DaemonLoadConfig{AgentNiceness: -1},
+			wantPath: daemonLoadAgentNicenessPath,
+		},
+		{
+			name:     "Should reject a niceness above the Unix maximum",
+			cfg:      DaemonLoadConfig{AgentNiceness: 20},
+			wantPath: daemonLoadAgentNicenessPath,
+		},
+		{
+			name:     "Should reject a negative admission threshold",
+			cfg:      DaemonLoadConfig{AdmissionThreshold: -0.5, AdmissionMaxWait: time.Minute},
+			wantPath: daemonLoadAdmissionThreshold,
+		},
+		{
+			name:     "Should reject an enabled threshold without a bounded wait",
+			cfg:      DaemonLoadConfig{AdmissionThreshold: 1.5},
+			wantPath: daemonLoadAdmissionMaxWaitPath,
+		},
+		{
+			name:     "Should reject a wait beyond the maximum bound",
+			cfg:      DaemonLoadConfig{AdmissionThreshold: 1.5, AdmissionMaxWait: time.Hour},
+			wantPath: daemonLoadAdmissionMaxWaitPath,
+		},
+	}
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			err := tc.cfg.Validate()
+			if tc.wantPath == "" {
+				if err != nil {
+					t.Fatalf("Validate() error = %v, want nil", err)
+				}
+				return
+			}
+			if err == nil || !strings.Contains(err.Error(), tc.wantPath) {
+				t.Fatalf("Validate() error = %v, want %q", err, tc.wantPath)
+			}
+		})
+	}
+}
+
+func TestProviderUsageConfig(t *testing.T) {
+	t.Parallel()
+	t.Run("Should preserve provider usage defaults and explicit overrides UT-040", func(t *testing.T) {
+		t.Parallel()
+		cfg := DefaultWithHome(HomePaths{})
+		usage := cfg.ProviderUsage
+		if !usage.Enabled || usage.RefreshInterval != 5*time.Minute || len(usage.Providers) != 0 ||
+			!usage.ProviderEnabled("claude") || usage.ClaudeKeychainAccess() {
+			t.Fatalf("defaults = %#v", usage)
+		}
+		overlay, err := loadConfigOverlayBytes([]byte(`[provider_usage]
+refresh_interval = "10m"
+[provider_usage.providers.claude]
+keychain_access = true
+[provider_usage.providers.cursor]
+enabled = false
+`), "test.toml")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := overlay.Apply(&cfg); err != nil {
+			t.Fatal(err)
+		}
+		if err := cfg.ProviderUsage.Validate(cfg.Providers); err != nil {
+			t.Fatal(err)
+		}
+		if !cfg.ProviderUsage.ProviderEnabled("claude") || cfg.ProviderUsage.ProviderEnabled("cursor") ||
+			!cfg.ProviderUsage.ClaudeKeychainAccess() || cfg.ProviderUsage.RefreshInterval != 10*time.Minute {
+			t.Fatalf("merged = %#v", cfg.ProviderUsage)
+		}
+		cfg.ProviderUsage.Enabled = false
+		if cfg.ProviderUsage.ProviderEnabled("claude") {
+			t.Fatal("disabled feature admits provider")
+		}
+	})
+	for _, tc := range []struct{ name, content, want string }{
+		{"Should reject short refresh interval UT-041", "[provider_usage]\nrefresh_interval = '10s'", "provider_usage.refresh_interval must be between 1m and 1h"},
+		{"Should reject long refresh interval UT-041", "[provider_usage]\nrefresh_interval = '2h'", "provider_usage.refresh_interval must be between 1m and 1h"},
+		{"Should reject zero refresh interval", "[provider_usage]\nrefresh_interval = '0s'", "provider_usage.refresh_interval must be between 1m and 1h"},
+		{"Should reject unknown provider UT-041", "[provider_usage.providers.nonexistent]\nenabled = false", "provider_usage.providers.nonexistent"},
+		{"Should reject alias provider", "[provider_usage.providers.claude-code]\nenabled = false", "provider_usage.providers.claude-code"},
+		{"Should reject non Claude Keychain even when false", "[provider_usage.providers.codex]\nkeychain_access = false", "provider_usage.providers.codex.keychain_access"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			cfg := DefaultWithHome(HomePaths{})
+			overlay, err := loadConfigOverlayBytes([]byte(tc.content), "test.toml")
+			if err == nil {
+				err = overlay.Apply(&cfg)
+			}
+			if err == nil {
+				err = cfg.ProviderUsage.Validate(cfg.Providers)
+			}
+			if err == nil || !strings.Contains(err.Error(), tc.want) {
+				t.Fatalf("error = %v, want %q", err, tc.want)
+			}
+		})
+	}
+	t.Run("Should accept interval boundaries and configured custom providers", func(t *testing.T) {
+		t.Parallel()
+		cfg := DefaultProviderUsageConfig()
+		cfg.Providers = map[string]ProviderUsageProviderConfig{"custom": {Enabled: false}}
+		for _, interval := range []time.Duration{time.Minute, time.Hour} {
+			cfg.RefreshInterval = interval
+			if err := cfg.Validate(map[string]ProviderConfig{"custom": {}}); err != nil {
+				t.Fatal(err)
+			}
+		}
+	})
+	t.Run("Should reject provider usage in workspace and profile overlays UT-042", func(t *testing.T) {
+		t.Parallel()
+		for _, contents := range []string{"[provider_usage]", "[provider_usage]\nenabled = false", "[provider_usage.providers.claude]\nkeychain_access = true"} {
+			for _, load := range []func([]byte, string) (configOverlay, error){loadWorkspaceConfigOverlayBytes, loadProfileConfigOverlayBytes} {
+				if _, err := load(
+					[]byte(contents),
+					"overlay.toml",
+				); err == nil ||
+					!strings.Contains(err.Error(), "provider_usage") {
+					t.Fatalf("overlay error = %v", err)
+				}
+			}
+		}
+	})
+	t.Run("Should restrict provider usage writes to user scope", func(t *testing.T) {
+		t.Parallel()
+		for _, path := range []string{"provider_usage.enabled", "provider_usage.refresh_interval", "provider_usage.providers.codex.enabled", "provider_usage.providers.claude.keychain_access"} {
+			parts := strings.Split(path, ".")
+			if err := ValidateConfigWriteScope(WriteScopeUser, parts); err != nil {
+				t.Fatal(err)
+			}
+
+			if err := ValidateConfigWriteScope(WriteScopeWorkspace, parts); err == nil ||
+				!strings.Contains(err.Error(), "global-only") || !strings.Contains(err.Error(), path) {
+				t.Fatalf("workspace write error = %v, want global-only denial for %s", err, path)
+			}
+			err := ValidateConfigWriteScope(WriteScopeProfile, parts)
+			validationErr, ok := errors.AsType[ValidationError](err)
+			if !ok || validationErr.Code != profileConfigKeyDeniedCode || validationErr.Path != path {
+				t.Fatalf("profile write error = %#v, want typed denial for %s", err, path)
+			}
+		}
+	})
+}
+
+func TestAlwaysOnApprovalTimeout(t *testing.T) {
+	t.Parallel()
+	t.Run("Should default to twelve hours and validate inclusive bounds", func(t *testing.T) {
+		t.Parallel()
+		cfg := DefaultWithHome(HomePaths{})
+		if cfg.Agents.AlwaysOn.ApprovalTimeout != 12*time.Hour {
+			t.Fatal("unexpected approval timeout default")
+		}
+		for _, wait := range []time.Duration{time.Minute, 12 * time.Hour, 72 * time.Hour} {
+			cfg.Agents.AlwaysOn.ApprovalTimeout = wait
+			if err := cfg.Agents.Validate(); err != nil {
+				t.Fatalf("valid wait %v: %v", wait, err)
+			}
+		}
+		for _, wait := range []time.Duration{0, 30 * time.Second, time.Minute - time.Nanosecond, 72*time.Hour + time.Nanosecond, 73 * time.Hour} {
+			cfg.Agents.AlwaysOn.ApprovalTimeout = wait
+			if err := cfg.Agents.Validate(); err == nil {
+				t.Fatalf("accepted invalid wait %v", wait)
+			}
+		}
+	})
+}
+
+func TestAlwaysOnTriageConfiguration(t *testing.T) {
+	t.Run("Should default the unattended brake and preserve an explicit disabled overlay", func(t *testing.T) {
+		t.Parallel()
+		cfg := DefaultWithHome(HomePaths{})
+		if cfg.Agents.AlwaysOn.UnattendedTurnLimit != 300 {
+			t.Fatalf("default limit=%d", cfg.Agents.AlwaysOn.UnattendedTurnLimit)
+		}
+		for _, limit := range []int64{0, 12, 300} {
+			alwaysOnOverlay{UnattendedTurnLimit: &limit}.Apply(&cfg.Agents.AlwaysOn)
+			if cfg.Agents.AlwaysOn.UnattendedTurnLimit != limit {
+				t.Fatalf("overlay limit=%d want=%d", cfg.Agents.AlwaysOn.UnattendedTurnLimit, limit)
+			}
+			if err := cfg.Agents.Validate(); err != nil {
+				t.Fatal(err)
+			}
+		}
+		cfg.Agents.AlwaysOn.UnattendedTurnLimit = -1
+		if cfg.Agents.Validate() == nil {
+			t.Fatal("negative unattended limit accepted")
+		}
+	})
+
+	t.Run("Should default to two proposals and accept every documented proposal limit", func(t *testing.T) {
+		t.Parallel()
+		cfg := DefaultWithHome(HomePaths{})
+		if cfg.Agents.AlwaysOn.MaxProposals != 2 {
+			t.Fatalf("default proposals = %d", cfg.Agents.AlwaysOn.MaxProposals)
+		}
+		for limit := 1; limit <= 20; limit++ {
+			cfg.Agents.AlwaysOn.MaxProposals = limit
+			if err := cfg.Agents.Validate(); err != nil {
+				t.Fatalf("limit %d: %v", limit, err)
+			}
+		}
+	})
+
+	t.Run("Should reject unsafe triage limits while accepting defaults", func(t *testing.T) {
+		t.Parallel()
+		cfg := DefaultWithHome(HomePaths{})
+		if cfg.Agents.AlwaysOn.TriageTimeout != 10*time.Minute {
+			t.Fatalf("triage timeout=%v", cfg.Agents.AlwaysOn.TriageTimeout)
+		}
+		if err := cfg.Agents.Validate(); err != nil {
+			t.Fatal(err)
+		}
+		for _, mutate := range []func(*AlwaysOnConfig){
+			func(c *AlwaysOnConfig) { c.RotationThreshold = 0 },
+			func(c *AlwaysOnConfig) { c.RotationThreshold = 1.1 },
+			func(c *AlwaysOnConfig) { c.MaxProposals = 21 },
+			func(c *AlwaysOnConfig) { c.TriageTimeout = 0 },
+		} {
+			candidate := cfg.Agents
+			mutate(&candidate.AlwaysOn)
+			if candidate.Validate() == nil {
+				t.Fatalf("invalid limits accepted: %+v", candidate.AlwaysOn)
+			}
+		}
+	})
+}
+
+func TestPermissionLevelOrdering(t *testing.T) {
+	t.Parallel()
+	t.Run("Should validate and strictly order all five levels", func(t *testing.T) {
+		t.Parallel()
+		modes := []PermissionMode{PermissionModeDenyAll, PermissionModeApproveReads,
+			PermissionModeApproveEdits, PermissionModeAuto, PermissionModeApproveAll}
+		for i, mode := range modes {
+			if err := mode.Validate("permissions.mode"); err != nil {
+				t.Fatal(err)
+			}
+			if mode.Rank() != i {
+				t.Fatalf("rank(%s)=%d, want %d", mode, mode.Rank(), i)
+			}
+		}
+	})
+}
+
+func TestHeartbeatSourceConfig(t *testing.T) {
+	for _, scope := range []string{RoleFieldSourceWorkspace, RoleFieldSourceProfile} {
+		t.Run("Should ignore source overlays in "+scope+" [UT-062]", func(t *testing.T) {
+			t.Parallel()
+			cfg := Config{Agents: AgentsConfig{Heartbeat: DefaultHeartbeatConfig()}}
+			overlay, err := loadConfigOverlayBytes(
+				[]byte("[agents.heartbeat.sources]\nmax_items=99\nscripts_enabled=false\n"),
+				"overlay",
+			)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := applyConfigOverlay(&cfg, &overlay, scope); err != nil {
+				t.Fatal(err)
+			}
+			if cfg.Agents.Heartbeat.Sources.MaxItems != 20 || !cfg.Agents.Heartbeat.Sources.ScriptsEnabled {
+				t.Fatalf("config=%+v", cfg.Agents.Heartbeat.Sources)
+			}
+		})
+	}
+	t.Run("Should reject reserved runtime environment names", func(t *testing.T) {
+		t.Parallel()
+		cfg := DefaultHeartbeatSourcesConfig()
+		cfg.EnvAllow = []string{"COMPOZY_SESSION_ID"}
+		if err := cfg.Validate(); err == nil {
+			t.Fatal("accepted runtime identity variable")
+		}
+	})
+	t.Run("Should reject out of bounds source limits", func(t *testing.T) {
+		t.Parallel()
+		if err := (HeartbeatSourcesConfig{}).Validate(); err == nil {
+			t.Fatal("accepted all zero source limits")
+		}
+		cfg := DefaultHeartbeatSourcesConfig()
+		cfg.MaxItems = 101
+		if err := cfg.Validate(); err == nil {
+			t.Fatal("accepted 101 items")
+		}
+		cfg = DefaultHeartbeatSourcesConfig()
+		cfg.Timeout = 0
+		cfg.MaxPerAgent = 0
+		if err := cfg.Validate(); err == nil {
+			t.Fatal("accepted invalid zero limits")
+		}
+	})
+}

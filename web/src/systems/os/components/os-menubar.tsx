@@ -1,0 +1,377 @@
+import { Bell, ChevronDown, Command, LayoutGrid } from "@compozy/ui/icons";
+
+import {
+  Icon,
+  Kbd,
+  Logo,
+  Menubar,
+  MenubarTrigger,
+  PillCount,
+  StatusDot,
+  Tooltip,
+  TooltipContent,
+  TooltipTrigger,
+} from "@compozy/ui";
+
+import { cn } from "@/lib/utils";
+
+/**
+ * The desktop topbar: CompozyOS mark, All projects globe toggle, destination chip, app
+ * menus, then the tray — desktop pager dots, All desktops, Provider usage, the
+ * approvals bell, and the ⌘K palette button. Flat chrome on the rail surface across the full
+ * window width with no bottom hairline: topbar and rail read as one surface
+ * around the inset desk panel, which draws the only edge.
+ *
+ * The mark and the workspace chip are separate `role="menubar"`s so the globe
+ * toggle can sit between them without becoming a menu item. App menus follow
+ * in a third menubar. Compact chrome can hide Session/Go/Window/Help without
+ * losing mark + toggle + chip. The pager, All desktops, the bell, and the palette
+ * button stay outside all three: they are controls, not menus.
+ *
+ * The shell owns the menus themselves; a control renders as a real trigger only
+ * when a menu owner is supplied, otherwise as truthful presentation.
+ */
+export interface OsMenuBarProps extends React.ComponentProps<"header"> {
+  /**
+   * Active scope identity. `worktree` is present only while a worktree can
+   * actually receive work — a missing one reverts the chip to the workspace so
+   * the bar never advertises a scope that cannot run anything.
+   */
+  workspace: {
+    name: string;
+    worktree?: string | null;
+    /** Scope problem (e.g. the worktree fell back); a warning dot marks the chip. */
+    warning?: string | null;
+  };
+  /** Functional notice rendered outside `role="menu"` (e.g. scope fell back). */
+  scopeNotice?: React.ReactNode;
+  /** Composed `<MenubarMenu>` children rendered after the workspace chip. */
+  menus?: React.ReactNode;
+  notifications?: number;
+  /** Non-interactive system status rendered in the trailing cluster, before the bell. */
+  status?: React.ReactNode;
+  /**
+   * Interactive update offer, rendered before the approvals bell.
+   * Separate from `status` because that slot is non-interactive by contract.
+   */
+  updateIndicator?: React.ReactNode;
+  onCommandClick?: () => void;
+  /** Opens the desktops overview; omitted, the All desktops button is inert chrome. */
+  onDesktopsClick?: () => void;
+  /** The desktops overview is open (the All desktops button reads expanded). */
+  desktopsOpen?: boolean;
+  /**
+   * The frameless macOS Electron window draws its traffic lights over the bar's
+   * leading edge. `env(titlebar-area-*)` places the bar beside them; this only
+   * supplies the fixed fallback reservation when those variables are missing.
+   */
+  trafficLights?: boolean;
+  /** Live daemon binding for the command-palette chip. */
+  commandShortcutLabel?: string;
+  /** The same binding in `aria-keyshortcuts` syntax; absent until the keymap is known. */
+  commandKeyShortcuts?: string;
+  /** Renders the CompozyOS mark inside its system-menu owner (shell wiring). */
+  logoMenu?: (trigger: React.ReactNode) => React.ReactNode;
+  /** Renders the workspace chip inside its menu owner (shell wiring). */
+  workspaceMenu?: (trigger: React.ReactNode) => React.ReactNode;
+  /**
+   * All projects globe toggle. Lives between the mark and the destination chip,
+   * outside `role="menubar"`, so compact chrome can hide app menus without
+   * losing mark + toggle + chip.
+   */
+  scopeControl?: React.ReactNode;
+  /** Desktop pager, the first control of the trailing tray (shell wiring). */
+  pager?: React.ReactNode;
+  /**
+   * Provider usage control, right before the bell (shell wiring). Absent — not
+   * disabled — while the feature is off or the profile has no target; while the
+   * first usage read is pending the shell passes it in its loading shape so the
+   * slot is held and the answer moves nothing.
+   * Receives the tray icon-button footprint so the control matches its
+   * neighbours without restating it.
+   */
+  usageControl?: (trayButtonClassName: string) => React.ReactNode;
+  /** Wraps the bell in its popover owner (shell wiring). */
+  wrapBellTrigger?: (trigger: React.ReactElement) => React.ReactNode;
+}
+
+const WINDOW_DRAG = "[app-region:drag]";
+const WINDOW_NO_DRAG = "[app-region:no-drag]";
+const INTERACTIVE = [
+  WINDOW_NO_DRAG,
+  "transition-colors duration-base hover:bg-rail-hover hover:text-fg",
+  "data-popup-open:bg-rail-selected data-popup-open:text-fg",
+  "focus-visible:shadow-focus-ring focus-visible:outline-none",
+].join(" ");
+/** Tray icon button (shell-rail v2 `.ib`): 34px pill, muted 16px glyph. */
+const ICON_BUTTON = "relative grid size-8.5 place-items-center rounded-pill text-muted-foreground";
+
+interface ControlProps extends Omit<React.ComponentProps<"button">, "onClick" | "children"> {
+  onClick?: () => void;
+  children: React.ReactNode;
+  /** Hands the button to an overlay owner (popover trigger `render`). */
+  wrap?: (trigger: React.ReactElement) => React.ReactNode;
+}
+
+/**
+ * Renders a <button> when a callback or overlay owner exists, else a
+ * non-interactive span (truthful chrome, no dead buttons).
+ */
+function Control({ onClick, wrap, className, children, ...props }: ControlProps) {
+  if (wrap) {
+    return wrap(
+      <button type="button" className={cn(INTERACTIVE, className)} {...props}>
+        {children}
+      </button>
+    );
+  }
+  if (!onClick) {
+    return (
+      <span className={className} {...(props as React.ComponentProps<"span">)}>
+        {children}
+      </span>
+    );
+  }
+  return (
+    <button type="button" className={cn(INTERACTIVE, className)} onClick={onClick} {...props}>
+      {children}
+    </button>
+  );
+}
+
+interface MenuControlProps extends Omit<React.ComponentProps<"button">, "children"> {
+  children: React.ReactNode;
+  /** Renders the trigger inside its `MenubarMenu` owner (shell wiring). */
+  menu?: (trigger: React.ReactNode) => React.ReactNode;
+}
+
+/**
+ * A menubar item: a real `MenubarTrigger` when a menu owns it, else inert
+ * chrome. Chrome classes ride on the trigger itself so `MenubarTrigger`'s own
+ * defaults are merged away instead of stacking.
+ */
+function MenuControl({ menu, className, children, ...props }: MenuControlProps) {
+  if (!menu) {
+    return (
+      <span className={className} {...(props as React.ComponentProps<"span">)}>
+        {children}
+      </span>
+    );
+  }
+  return menu(
+    <MenubarTrigger className={cn(INTERACTIVE, className)} {...props}>
+      {children}
+    </MenubarTrigger>
+  );
+}
+
+/** Styled, keyboard-reachable hint for an icon-only control (never native `title`). */
+function ControlTooltip({
+  label,
+  children,
+}: {
+  label: React.ReactNode;
+  children: React.ReactElement;
+}) {
+  return (
+    <Tooltip>
+      <TooltipTrigger render={children} />
+      <TooltipContent side="bottom" className="flex items-center gap-2">
+        {label}
+      </TooltipContent>
+    </Tooltip>
+  );
+}
+
+function WorkspaceChip({ workspace }: { workspace: OsMenuBarProps["workspace"] }) {
+  return (
+    <>
+      <span className="text-item-title font-medium text-fg">{workspace.name}</span>
+      {workspace.worktree ? (
+        <span
+          data-slot="os-menubar-worktree"
+          className="max-w-42.5 truncate text-body text-muted-foreground"
+        >
+          / {workspace.worktree}
+        </span>
+      ) : null}
+      {workspace.warning ? (
+        <StatusDot
+          tone="warning"
+          size="sm"
+          label={workspace.warning}
+          data-slot="os-menubar-warning"
+        />
+      ) : null}
+      <Icon as={ChevronDown} className="size-3.75 text-muted-foreground" />
+    </>
+  );
+}
+
+export function OsMenuBar({
+  workspace,
+  scopeNotice,
+  menus,
+  notifications,
+  status,
+  updateIndicator,
+  onCommandClick,
+  onDesktopsClick,
+  desktopsOpen = false,
+  trafficLights = false,
+  commandShortcutLabel,
+  commandKeyShortcuts,
+  logoMenu,
+  workspaceMenu,
+  scopeControl,
+  wrapBellTrigger,
+  pager,
+  usageControl,
+  className,
+  ...props
+}: OsMenuBarProps) {
+  // Compact (<960px, `OS_COMPACT_BREAKPOINT`): the shell stops passing `menus`;
+  // mark, globe toggle, and chip stay leading. Hidden actions stay in the palette.
+  const wrapMenus = Boolean(logoMenu || workspaceMenu);
+  const logoControl = (
+    <MenuControl
+      data-slot="os-menubar-logo"
+      aria-label="CompozyOS"
+      className="grid size-8.5 place-items-center rounded-md p-0 text-fg"
+      menu={logoMenu}
+    >
+      <Logo variant="symbol" decorative className="size-5" />
+    </MenuControl>
+  );
+  const workspaceControl = (
+    <MenuControl
+      data-slot="os-menubar-workspace"
+      className="flex h-8.5 min-w-0 items-center gap-2.25 rounded-pill pr-3 pl-3 text-fg"
+      menu={workspaceMenu}
+    >
+      <WorkspaceChip workspace={workspace} />
+    </MenuControl>
+  );
+
+  return (
+    <header
+      data-slot="os-menubar"
+      aria-label="System bar"
+      className={cn(
+        "flex h-menubar shrink-0 items-center bg-rail select-none",
+        WINDOW_DRAG,
+        className
+      )}
+      {...props}
+    >
+      <div
+        data-slot="os-menubar-safe-area"
+        className={cn(
+          "flex h-full min-w-0 items-center gap-4 pr-3.5",
+          WINDOW_DRAG,
+          // Beside the macOS traffic lights the mark follows them after the bar
+          // gap; in the browser it centres over the rail column.
+          trafficLights
+            ? "ml-[env(titlebar-area-x,var(--width-traffic-lights))] w-[env(titlebar-area-width,calc(100%-var(--width-traffic-lights)))] pl-4"
+            : "ml-[env(titlebar-area-x,0px)] w-[env(titlebar-area-width,100%)] pl-3.25"
+        )}
+      >
+        <div className={cn("flex min-w-0 items-center gap-0.5", WINDOW_NO_DRAG)}>
+          <div data-slot="os-menubar-identity" className="flex min-w-0 items-center gap-0.5">
+            {wrapMenus ? (
+              <Menubar aria-label="System menu" className={cn("gap-0.5", WINDOW_NO_DRAG)}>
+                {logoControl}
+              </Menubar>
+            ) : (
+              logoControl
+            )}
+            {scopeControl}
+            {wrapMenus ? (
+              <Menubar aria-label="Project" className={cn("min-w-0 gap-0.5", WINDOW_NO_DRAG)}>
+                {workspaceControl}
+              </Menubar>
+            ) : (
+              workspaceControl
+            )}
+          </div>
+          {menus ? (
+            <>
+              <span aria-hidden="true" className="mx-1.5 h-4.5 w-px shrink-0 bg-line" />
+              <Menubar
+                data-slot="os-menubar-menus"
+                aria-label="App menus"
+                className={cn("gap-0.5", WINDOW_NO_DRAG)}
+              >
+                {menus}
+              </Menubar>
+            </>
+          ) : null}
+        </div>
+
+        <span aria-hidden="true" className="min-w-3 flex-1 self-stretch" />
+
+        <div
+          data-slot="os-menubar-tray"
+          className={cn("flex min-w-0 items-center gap-0.5", WINDOW_NO_DRAG)}
+        >
+          {pager}
+          <ControlTooltip label="All desktops">
+            <Control
+              data-slot="os-menubar-desktops"
+              aria-label="All desktops"
+              aria-haspopup={onDesktopsClick ? "dialog" : undefined}
+              aria-expanded={onDesktopsClick ? desktopsOpen : undefined}
+              className={cn(ICON_BUTTON, desktopsOpen && "bg-rail-selected text-fg")}
+              onClick={onDesktopsClick}
+            >
+              <Icon as={LayoutGrid} className="size-4" />
+            </Control>
+          </ControlTooltip>
+          {/* Outside the menubar's `role="menu"` subtree on purpose: a notice is
+              not a menu item, and nesting it there breaks the menu's semantics. */}
+          {scopeNotice}
+          {status}
+          {updateIndicator}
+          {usageControl ? (
+            <div data-slot="os-menubar-usage" className="contents">
+              {usageControl(cn(INTERACTIVE, ICON_BUTTON))}
+            </div>
+          ) : null}
+          <Control
+            data-slot="os-menubar-bell"
+            aria-label={notifications ? `Attention, ${notifications} waiting` : "Attention"}
+            aria-haspopup={wrapBellTrigger ? "true" : undefined}
+            className={ICON_BUTTON}
+            wrap={wrapBellTrigger}
+          >
+            <Icon as={Bell} className="size-4" />
+            {notifications ? (
+              <PillCount
+                count={notifications}
+                className="absolute top-0.75 right-0.5 ring-2 ring-rail"
+              />
+            ) : null}
+          </Control>
+          <ControlTooltip
+            label={
+              <>
+                Command palette
+                {commandShortcutLabel ? <Kbd>{commandShortcutLabel}</Kbd> : null}
+              </>
+            }
+          >
+            <Control
+              data-slot="os-menubar-command"
+              aria-label="Command palette"
+              aria-keyshortcuts={commandKeyShortcuts || undefined}
+              className={ICON_BUTTON}
+              onClick={onCommandClick}
+            >
+              <Icon as={Command} className="size-4" />
+            </Control>
+          </ControlTooltip>
+        </div>
+      </div>
+    </header>
+  );
+}

@@ -1,0 +1,592 @@
+// Suite: OS sessions modal
+// Invariant: the modal filters catalog truth, retains group state, and dismisses via Dialog.
+// Boundary IN: OsSessionsModal, OS controller, and routing coordinator.
+// Boundary OUT: session catalog transport and full browser window journeys.
+import { act, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
+import userEvent from "@testing-library/user-event";
+import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
+import { useState, type ReactNode } from "react";
+import { afterEach, describe, expect, it, vi } from "vitest";
+
+import {
+  SessionDeriveContext,
+  SessionForkContext,
+  type SessionLifecycleActionHandlers,
+  type SessionListGroupSpec,
+  type SessionListViewModel,
+  type SessionPayload,
+} from "@/systems/session";
+import { sessionListViewFixture } from "@/systems/session/mocks";
+import { workspaceBadgeIdentity } from "@/systems/workspace";
+
+import { OsShellContext, type OsShellHandle } from "../../contexts/os-shell-context";
+import { WindowManagerRuntime } from "../../runtime/window-manager-runtime";
+import { RoutingCoordinator, type OsRouterPort } from "../../lib/routing-coordinator";
+import { OsSessionsModal } from "../sessions-modal";
+import { sessionPermissionDefaults } from "@/systems/session/mocks/fixtures";
+
+const jumpToSession = vi.hoisted(() => vi.fn());
+vi.mock("../../hooks/use-attention-jump", () => ({
+  useAttentionJump: () => jumpToSession,
+}));
+
+function session(overrides: Partial<SessionPayload> = {}): SessionPayload {
+  return {
+    board_column: "done",
+    pull_request: null,
+    pull_request_lookup: null,
+    supervision: null,
+    scope: "workspace",
+    ...sessionPermissionDefaults,
+    effective_workspace_access: "",
+    profile_name: "default",
+    profile_id: "00000000000000000000000000",
+    id: "session-1",
+    name: "Web shell polish",
+    agent_name: "codex",
+    runtime: {
+      status: "ready",
+      transition: "initial_bind",
+      effective: { provider: "codex" },
+      selection_revision: 0,
+    },
+    workspace_id: "workspace-1",
+    workspace_path: "/workspace/compozy",
+    state: "active",
+    badge: "running",
+    attachable: true,
+    archived_at: null,
+    available_commands: [],
+    created_at: "2026-07-20T12:00:00Z",
+    updated_at: "2026-07-20T12:01:00Z",
+    ...overrides,
+    pending_interactions: overrides.pending_interactions ?? [],
+  };
+}
+
+const SESSIONS: SessionPayload[] = [
+  session(),
+  session({ id: "session-2", name: "Runtime audit", agent_name: "webgen", badge: "idle" }),
+  session({ id: "session-3", name: "Release notes", agent_name: "codex", badge: "stopped" }),
+];
+
+const SESSION_ACTIONS: SessionLifecycleActionHandlers = {
+  pendingAction: null,
+  pendingSessionId: null,
+  onArchive: () => {},
+  onDelete: () => {},
+  onRename: () => {},
+  onStop: () => {},
+  onUnarchive: () => {},
+};
+
+function listView(overrides: Partial<SessionListViewModel> = {}): SessionListViewModel {
+  return sessionListViewFixture({
+    sort: "last_activity",
+    setSort: vi.fn(),
+    setShelf: vi.fn(),
+    ownerOf: () => ({ id: "00000000000000000000000000", name: "default", archived: false }),
+    ...overrides,
+  });
+}
+
+/** The app root provides a QueryClient to every SessionList host; the test host does too. */
+function TestShell({ value, children }: { value: OsShellHandle; children: ReactNode }) {
+  const [client] = useState(
+    () => new QueryClient({ defaultOptions: { queries: { retry: false } } })
+  );
+  return (
+    <QueryClientProvider client={client}>
+      <OsShellContext.Provider value={value}>{children}</OsShellContext.Provider>
+    </QueryClientProvider>
+  );
+}
+
+const managers: WindowManagerRuntime[] = [];
+
+function createShell(): OsShellHandle {
+  const manager = new WindowManagerRuntime(new QueryClient());
+  managers.push(manager);
+  const port: OsRouterPort = { navigate: () => {}, replace: () => {} };
+  const coordinator = new RoutingCoordinator(manager, port);
+  coordinator.completeHydration();
+  return { projection: manager.projectionAtom, manager, coordinator };
+}
+
+function renderModal(
+  shell: OsShellHandle,
+  open = true,
+  view: SessionListViewModel = listView(),
+  onNewSession: () => void = vi.fn(),
+  sessions: readonly SessionPayload[] = SESSIONS
+) {
+  return render(
+    <TestShell value={shell}>
+      <OsSessionsModal
+        open={open}
+        onOpenChange={() => {}}
+        sessions={sessions}
+        disconnected={false}
+        view={view}
+        onNewSession={onNewSession}
+        sessionActions={SESSION_ACTIONS}
+      />
+    </TestShell>
+  );
+}
+
+describe("OsSessionsModal", () => {
+  afterEach(() => {
+    jumpToSession.mockClear();
+    for (const manager of managers.splice(0)) manager.destroy();
+  });
+
+  it.each([
+    ["", "Sessions 3"],
+    ["no-match", "Sessions"],
+  ])("Should show a grouped total only without a search (%s)", (search, expected) => {
+    const group = (key: string, total: number, workspaceId: string): SessionListGroupSpec => ({
+      key,
+      kind: "project",
+      badge: workspaceBadgeIdentity(workspaceId, new Map([["ws-a", "Alpha"]])),
+      total,
+      working: 0,
+      needsYou: 0,
+      instancesNeedingAttention: 0,
+      scope: workspaceId ? { kind: "project", workspaceId } : { kind: "user" },
+      lens: { profile: "default" },
+      pair: null,
+    });
+    const groups = [group("project:ws-a", 2, "ws-a"), group("user", 1, "")];
+    const view = listView({
+      search,
+      groupBy: "project",
+      groupByOptions: ["none", "project"],
+      groups,
+      collapsedGroupKeys: new Set(groups.map(entry => entry.key)),
+    });
+    renderModal(createShell(), true, view, vi.fn(), []);
+    const close = screen.getByRole("button", { name: "Close sessions" });
+    expect(close.parentElement?.textContent?.trim()).toBe(expected);
+  });
+
+  it("Should keep the modal open when selecting and use Escape to finish selection first", async () => {
+    const user = userEvent.setup();
+    const onOpenChange = vi.fn();
+    const onDeleteMany = vi.fn();
+    render(
+      <TestShell value={createShell()}>
+        <OsSessionsModal
+          open
+          onOpenChange={onOpenChange}
+          sessions={SESSIONS}
+          disconnected={false}
+          view={listView()}
+          onNewSession={vi.fn()}
+          sessionActions={{ ...SESSION_ACTIONS, onDeleteMany }}
+        />
+      </TestShell>
+    );
+    const row = screen.getByTestId("os-sessions-modal-session-session-1");
+    fireEvent.click(row, { metaKey: true });
+    expect(screen.getByTestId("os-sessions-modal-selection-bar")).toBeInTheDocument();
+    expect(jumpToSession).not.toHaveBeenCalled();
+    await user.click(screen.getByTestId("os-sessions-modal-selection-delete"));
+    expect(onDeleteMany).toHaveBeenCalledWith([SESSIONS[0]], expect.any(Function));
+    act(() => row.focus());
+    await user.keyboard("{Escape}");
+    expect(screen.queryByTestId("os-sessions-modal-selection-bar")).not.toBeInTheDocument();
+    expect(onOpenChange).not.toHaveBeenCalledWith(false);
+  });
+
+  it("Should coordinate a foreign project row through the jump and name its project", async () => {
+    const user = userEvent.setup();
+    const foreign = session({
+      id: "session-foreign",
+      agent_name: "claude",
+      workspace_id: "workspace-2",
+      workspace_path: "/workspace/other",
+    });
+    renderModal(
+      createShell(),
+      true,
+      listView({
+        badgeOf: row =>
+          workspaceBadgeIdentity(row.workspace_id, new Map([["workspace-2", "Other"]])),
+      }),
+      vi.fn(),
+      [foreign]
+    );
+
+    await user.click(screen.getByTestId("os-sessions-modal-session-session-foreign"));
+
+    expect(jumpToSession).toHaveBeenCalledExactlyOnceWith({
+      sessionId: "session-foreign",
+      agentName: "claude",
+      workspaceId: "workspace-2",
+    });
+    expect(screen.getByTestId("session-row-project-session-foreign")).toHaveTextContent("Other");
+  });
+
+  it("Should nest provenance children under their parent thread and fold them behind the toggle", async () => {
+    const user = userEvent.setup();
+    const shell = createShell();
+    const child = session({
+      id: "session-child",
+      name: "Digest references",
+      agent_name: "webgen",
+      badge: "failed",
+      lineage: {
+        parent_session_id: "session-1",
+        root_session_id: "session-1",
+        spawn_depth: 1,
+        auto_stop_on_parent: false,
+        notify_creator: true,
+        spawn_budget: { max_children: 0, max_depth: 0, ttl_seconds: 0 },
+        permission_policy: {
+          tools: [],
+          skills: [],
+          mcp_servers: [],
+          workspace_paths: [],
+        },
+      },
+    });
+    render(
+      <TestShell value={shell}>
+        <OsSessionsModal
+          open
+          onOpenChange={() => {}}
+          sessions={[...SESSIONS, child]}
+          disconnected={false}
+          view={listView()}
+          onNewSession={vi.fn()}
+          sessionActions={SESSION_ACTIONS}
+        />
+      </TestShell>
+    );
+
+    const [thread] = screen.getAllByTestId("os-sessions-modal-thread-session-1");
+    expect(thread).toBeDefined();
+    expect(
+      within(thread!).getByTestId("os-sessions-modal-session-session-child")
+    ).toBeInTheDocument();
+
+    const [toggle] = screen.getAllByTestId("os-sessions-modal-thread-toggle-session-1");
+    expect(toggle).toBeDefined();
+    expect(toggle).toHaveAttribute("aria-expanded", "true");
+    await user.click(toggle!);
+    expect(toggle).toHaveAttribute("aria-expanded", "false");
+    expect(
+      within(thread!).getByTestId("os-sessions-modal-session-session-child").closest("[inert]")
+    ).not.toBeNull();
+    await user.click(toggle!);
+    expect(toggle).toHaveAttribute("aria-expanded", "true");
+    expect(
+      within(thread!).getByTestId("os-sessions-modal-session-session-child").closest("[inert]")
+    ).toBeNull();
+  });
+
+  it("Should keep a thread's full ancestor path when only a descendant matches", async () => {
+    const user = userEvent.setup();
+    const shell = createShell();
+    const parent = session({
+      id: "session-child",
+      name: "Digest references",
+      agent_name: "webgen",
+      lineage: {
+        parent_session_id: "session-1",
+        root_session_id: "session-1",
+        spawn_depth: 1,
+        auto_stop_on_parent: false,
+        notify_creator: true,
+        spawn_budget: { max_children: 0, max_depth: 0, ttl_seconds: 0 },
+        permission_policy: {
+          tools: [],
+          skills: [],
+          mcp_servers: [],
+          workspace_paths: [],
+        },
+      },
+    });
+    const grandchild = session({
+      id: "session-grandchild",
+      name: "Scrape pricing pages",
+      agent_name: "webgen",
+      lineage: {
+        parent_session_id: parent.id,
+        root_session_id: "session-1",
+        spawn_depth: 2,
+        auto_stop_on_parent: false,
+        notify_creator: true,
+        spawn_budget: { max_children: 0, max_depth: 0, ttl_seconds: 0 },
+        permission_policy: {
+          tools: [],
+          skills: [],
+          mcp_servers: [],
+          workspace_paths: [],
+        },
+      },
+    });
+    render(
+      <TestShell value={shell}>
+        <OsSessionsModal
+          open
+          onOpenChange={() => {}}
+          sessions={[...SESSIONS, parent, grandchild]}
+          disconnected={false}
+          view={listView()}
+          onNewSession={vi.fn()}
+          sessionActions={SESSION_ACTIONS}
+        />
+      </TestShell>
+    );
+
+    const filter = screen.getByRole("searchbox", { name: "Filter sessions" });
+    await user.type(filter, "scrape");
+    expect(screen.getAllByTestId("os-sessions-modal-session-session-1")).not.toHaveLength(0);
+    expect(screen.getAllByTestId("os-sessions-modal-session-session-child")).not.toHaveLength(0);
+    expect(screen.getAllByTestId("os-sessions-modal-session-session-grandchild")).not.toHaveLength(
+      0
+    );
+    expect(screen.queryByTestId("os-sessions-modal-session-session-2")).toBeNull();
+  });
+
+  it("Should filter live by title or agent and restore the full catalog when cleared (UT-067)", async () => {
+    const user = userEvent.setup();
+    const shell = createShell();
+    renderModal(shell);
+
+    const filter = screen.getByRole("searchbox", { name: "Filter sessions" });
+    await user.type(filter, "web");
+    expect(screen.getAllByTestId("os-sessions-modal-session-session-1")).not.toHaveLength(0);
+    expect(screen.getAllByTestId("os-sessions-modal-session-session-2")).not.toHaveLength(0);
+    expect(screen.queryByTestId("os-sessions-modal-session-session-3")).toBeNull();
+
+    await user.clear(filter);
+    expect(screen.getAllByTestId("os-sessions-modal-session-session-3")).not.toHaveLength(0);
+  });
+
+  it("Should name the active profile in filtered and archived empty states", async () => {
+    const shell = createShell();
+    renderModal(shell, true, listView({ scopeLabel: "marketing" }));
+
+    fireEvent.change(screen.getByLabelText("Filter sessions"), {
+      target: { value: "does-not-exist" },
+    });
+    expect(screen.getByText("No matching sessions in marketing yet.")).toBeInTheDocument();
+
+    renderModal(
+      createShell(),
+      true,
+      listView({ shelf: "archive", scopeLabel: "marketing" }),
+      vi.fn(),
+      []
+    );
+    expect(screen.getByText("No archived sessions in marketing yet.")).toBeInTheDocument();
+  });
+
+  it("Should dismiss the Dialog and restore focus to the opener (UT-084)", async () => {
+    const user = userEvent.setup();
+    const shell = createShell();
+
+    function Harness() {
+      const [open, setOpen] = useState(false);
+      return (
+        <TestShell value={shell}>
+          <button type="button" onClick={() => setOpen(true)}>
+            Open sessions
+          </button>
+          <OsSessionsModal
+            open={open}
+            onOpenChange={setOpen}
+            sessions={SESSIONS}
+            disconnected={false}
+            view={listView()}
+            onNewSession={vi.fn()}
+            sessionActions={SESSION_ACTIONS}
+          />
+        </TestShell>
+      );
+    }
+
+    render(<Harness />);
+
+    const trigger = screen.getByRole("button", { name: "Open sessions" });
+    await user.click(trigger);
+    expect(screen.getByTestId("os-sessions-modal")).toBeInTheDocument();
+    await user.click(screen.getByRole("button", { name: "Close sessions" }));
+
+    await waitFor(() => expect(screen.queryByTestId("os-sessions-modal")).toBeNull());
+    expect(trigger).toHaveFocus();
+  });
+
+  it("Should switch the list to the archive and keep unarchive reachable", async () => {
+    const user = userEvent.setup();
+    const shell = createShell();
+    const active = listView();
+    const first = renderModal(shell, true, active);
+
+    const archivedToggle = screen.getByTestId("os-sessions-modal-archived");
+    expect(archivedToggle).toHaveAccessibleName("Archived");
+    expect(archivedToggle).toHaveAttribute("aria-pressed", "false");
+    await user.click(archivedToggle);
+    expect(active.setShelf).toHaveBeenCalledWith("archive");
+
+    first.unmount();
+    const archivedSession = session({
+      id: "session-archived",
+      name: "Archived audit",
+      state: "stopped",
+      badge: "stopped",
+      archived_at: "2026-08-04T12:00:00Z",
+    });
+    render(
+      <TestShell value={shell}>
+        <OsSessionsModal
+          open
+          onOpenChange={() => {}}
+          sessions={[archivedSession]}
+          disconnected={false}
+          view={listView({ shelf: "archive" })}
+          onNewSession={vi.fn()}
+          sessionActions={SESSION_ACTIONS}
+        />
+      </TestShell>
+    );
+
+    expect(screen.getByTestId("os-sessions-modal-archived")).toHaveAttribute(
+      "aria-pressed",
+      "true"
+    );
+    expect(screen.getByTestId("os-sessions-modal-session-session-archived")).toHaveTextContent(
+      "Archived"
+    );
+    fireEvent.click(screen.getByTestId("session-row-actions-session-archived"));
+    expect(screen.getByTestId("session-row-unarchive-session-archived")).toBeInTheDocument();
+    expect(screen.queryByTestId("session-row-archive-session-archived")).toBeNull();
+  });
+
+  // UT-074 with US-001.EC-1/EC-2: Continue and Fork are offered on user rows only
+  // (never spawned or archived) and hand the row to the dialog host; Fork from a
+  // row is the whole session (no fork point).
+  it("Should offer Continue and Fork on user rows only and hand the row to the dialog host", () => {
+    const shell = createShell();
+    const requestContinue = vi.fn();
+    const requestFork = vi.fn();
+    const rows = [
+      session({ id: "session-user", name: "User row" }),
+      session({ id: "session-spawned", name: "Spawned row", type: "spawned" }),
+      session({
+        id: "session-archived",
+        name: "Archived row",
+        state: "stopped",
+        badge: "stopped",
+        archived_at: "2026-08-04T12:00:00Z",
+      }),
+    ];
+    render(
+      <TestShell value={shell}>
+        <SessionDeriveContext value={requestContinue}>
+          <SessionForkContext value={requestFork}>
+            <OsSessionsModal
+              open
+              onOpenChange={() => {}}
+              sessions={rows}
+              disconnected={false}
+              view={listView({ shelf: "archive" })}
+              onNewSession={vi.fn()}
+              sessionActions={SESSION_ACTIONS}
+            />
+          </SessionForkContext>
+        </SessionDeriveContext>
+      </TestShell>
+    );
+
+    fireEvent.click(screen.getByTestId("session-row-actions-session-spawned"));
+    expect(screen.queryByTestId("session-row-continue-session-spawned")).toBeNull();
+    expect(screen.queryByTestId("session-row-fork-session-spawned")).toBeNull();
+    fireEvent.keyDown(document.activeElement ?? document.body, { key: "Escape" });
+
+    fireEvent.click(screen.getByTestId("session-row-actions-session-archived"));
+    expect(screen.queryByTestId("session-row-continue-session-archived")).toBeNull();
+    expect(screen.queryByTestId("session-row-fork-session-archived")).toBeNull();
+    fireEvent.keyDown(document.activeElement ?? document.body, { key: "Escape" });
+
+    fireEvent.click(screen.getByTestId("session-row-actions-session-user"));
+    const item = screen.getByTestId("session-row-continue-session-user");
+    expect(item).toHaveTextContent("Continue with another agent…");
+    const labels = screen.getAllByRole("menuitem").map(entry => entry.textContent);
+    expect(labels.indexOf("Fork session…")).toBe(
+      labels.indexOf("Continue with another agent…") + 1
+    );
+    fireEvent.click(item);
+    expect(requestContinue).toHaveBeenCalledExactlyOnceWith(rows[0]);
+
+    fireEvent.click(screen.getByTestId("session-row-actions-session-user"));
+    fireEvent.click(screen.getByTestId("session-row-fork-session-user"));
+    expect(requestFork).toHaveBeenCalledExactlyOnceWith(rows[0]);
+  });
+
+  it("Should start a session from the toolbar instead of a footer action", async () => {
+    const user = userEvent.setup();
+    const onNewSession = vi.fn();
+    renderModal(createShell(), true, listView(), onNewSession);
+
+    await user.click(screen.getByTestId("os-sessions-modal-new"));
+    await user.click(await screen.findByTestId("os-sessions-modal-new-session"));
+
+    expect(onNewSession).toHaveBeenCalledOnce();
+  });
+
+  it("Should keep the catalog open when a row requests delete confirmation", async () => {
+    const shell = createShell();
+    const onDelete = vi.fn();
+    const onOpenChange = vi.fn();
+
+    render(
+      <TestShell value={shell}>
+        <OsSessionsModal
+          open
+          onOpenChange={onOpenChange}
+          sessions={SESSIONS}
+          disconnected={false}
+          view={listView()}
+          onNewSession={vi.fn()}
+          sessionActions={{ ...SESSION_ACTIONS, onDelete }}
+        />
+      </TestShell>
+    );
+
+    fireEvent.click(screen.getAllByTestId("session-row-actions-session-1")[0]!);
+    fireEvent.click(screen.getByTestId("session-row-delete-session-1"));
+
+    expect(onDelete).toHaveBeenCalledWith(SESSIONS[0]);
+    expect(onOpenChange).not.toHaveBeenCalled();
+  });
+
+  it("Should reject dismissal while a nested confirmation blocks it", async () => {
+    const user = userEvent.setup();
+    const shell = createShell();
+    const onOpenChange = vi.fn();
+
+    render(
+      <TestShell value={shell}>
+        <OsSessionsModal
+          open
+          onOpenChange={onOpenChange}
+          dismissalBlocked
+          sessions={SESSIONS}
+          disconnected={false}
+          view={listView()}
+          onNewSession={vi.fn()}
+          sessionActions={SESSION_ACTIONS}
+        />
+      </TestShell>
+    );
+
+    await user.keyboard("{Escape}");
+
+    expect(onOpenChange).not.toHaveBeenCalled();
+    expect(screen.getByTestId("os-sessions-modal")).toBeInTheDocument();
+  });
+});

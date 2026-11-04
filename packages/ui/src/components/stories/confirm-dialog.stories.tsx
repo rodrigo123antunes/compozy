@@ -1,0 +1,224 @@
+import type { Meta, StoryObj } from "@storybook/react-vite";
+
+import { AlertTriangle, Ban, GitFork, Hourglass, Info, Pause, Trash2, Zap } from "../../icons";
+import { Button } from "../button";
+import { ConfirmDialog } from "../custom/confirm-dialog";
+import { RadioCard } from "../custom/radio-card";
+import { DialogTrigger } from "../dialog";
+
+const meta: Meta<typeof ConfirmDialog> = {
+  title: "components/custom/ConfirmDialog",
+  component: ConfirmDialog,
+  parameters: {
+    layout: "centered",
+  },
+};
+
+export default meta;
+type Story = StoryObj<typeof meta>;
+
+/** Danger well + eyebrow. Body copy stays muted; confirm uses tinted destructive. */
+export const Danger: Story = {
+  args: {},
+  render: () => (
+    <ConfirmDialog
+      cancelLabel="Cancel"
+      confirmIcon={Trash2}
+      confirmLabel="Delete"
+      defaultOpen
+      description={
+        <>
+          This removes <span className="font-mono">operator-style.md</span> from global notes.
+        </>
+      }
+      eyebrow="Notes"
+      icon={Trash2}
+      iconTone="destructive"
+      onConfirm={() => undefined}
+      title="Delete note?"
+      tone="destructive"
+    />
+  ),
+};
+
+/** Warning paints the eyebrow; the well stays neutral; confirm maps to tinted destructive. */
+export const Warning: Story = {
+  args: {},
+  render: () => (
+    <ConfirmDialog
+      cancelLabel="Keep draft"
+      confirmIcon={AlertTriangle}
+      confirmLabel="Discard"
+      defaultOpen
+      description="This draft has unsaved changes."
+      eyebrow="Draft"
+      icon={AlertTriangle}
+      onConfirm={() => undefined}
+      title="Discard draft?"
+      tone="warning"
+    />
+  ),
+};
+
+/** `iconTone="neutral"` is the mint identity well — the thing being acted on, not a risk. */
+export const IdentityWell: Story = {
+  args: {},
+  render: () => (
+    <ConfirmDialog
+      cancelLabel="Cancel"
+      confirmLabel="Fork run"
+      defaultOpen
+      description="The fork starts from this node with the same inputs."
+      eyebrow="Run"
+      icon={GitFork}
+      iconTone="neutral"
+      onConfirm={() => undefined}
+      title="Fork this run?"
+      tone="neutral"
+    />
+  ),
+};
+
+export const WithNote: Story = {
+  args: {},
+  render: () => (
+    <ConfirmDialog
+      cancelLabel="Cancel"
+      confirmIcon={Trash2}
+      confirmLabel="Remove override"
+      defaultOpen
+      description="This removes the workspace override."
+      note="The builtin provider remains available after the override is removed."
+      onConfirm={() => undefined}
+      title="Remove provider override?"
+      tone="destructive"
+    />
+  ),
+};
+
+export const TypingRequired: Story = {
+  args: {},
+  render: () => (
+    <ConfirmDialog
+      cancelLabel="Cancel"
+      confirmIcon={Trash2}
+      confirmLabel="Delete"
+      confirmTyping="operator-style.md"
+      defaultOpen
+      description="Confirm the filename before removing this entry."
+      onConfirm={() => undefined}
+      title="Delete note?"
+      tone="destructive"
+    />
+  ),
+};
+
+/**
+ * Accent well + 28px RadioCard wells. Machine trail lives in `footNote`,
+ * not the body. (`children` is the Dialog trigger, not body content.)
+ */
+export const WithBody: Story = {
+  args: {},
+  render: () => (
+    <ConfirmDialog
+      body={
+        <>
+          <RadioCard
+            description="Nothing is interrupted. The lane parks once the attempt in flight settles."
+            icon={Hourglass}
+            iconWellSize="lg"
+            onSelect={() => undefined}
+            selected
+            title="Let the current attempt finish"
+          />
+          <RadioCard
+            description="The in-flight attempt is asked to cancel, then the lane parks."
+            icon={Ban}
+            iconWellSize="lg"
+            onSelect={() => undefined}
+            selected={false}
+            title="Ask the current attempt to stop"
+          />
+        </>
+      }
+      cancelLabel="Keep running"
+      confirmLabel="Pause lane"
+      defaultOpen
+      description="The lane stops being scheduled. The rest of the run keeps working."
+      eyebrow="Node"
+      footNote={
+        <>
+          <Info />
+          mode: drain
+        </>
+      }
+      icon={Pause}
+      iconTone="brand"
+      note="task_03 is running · attempt 2"
+      noteTone="info"
+      onConfirm={() => undefined}
+      title="Pause task_03?"
+      tone="brand"
+    />
+  ),
+};
+
+/** Kill uses the solid danger fill; cancel stays on the tinted destructive. */
+export const DestructiveSolidConfirm: Story = {
+  args: {},
+  render: () => (
+    <ConfirmDialog
+      cancelLabel="Keep running"
+      confirmButtonProps={{ variant: "destructive-solid" }}
+      confirmIcon={Zap}
+      confirmLabel="Kill run"
+      defaultOpen
+      description="No on_* reactions fire. The run ends immediately."
+      eyebrow="Run"
+      footNote={
+        <>
+          <Info />
+          node_killed · no on_* reactions
+        </>
+      }
+      icon={Zap}
+      iconTone="destructive"
+      onConfirm={() => undefined}
+      title="Kill this run?"
+      tone="destructive"
+    />
+  ),
+};
+
+/** Three ways out: cancel, the outline alternate, and the tinted destructive confirm. */
+export const AlternateAction: Story = {
+  args: {},
+  render: () => (
+    <ConfirmDialog
+      alternateAction={{ label: "Keep processes running", onSelect: () => undefined }}
+      cancelLabel="Cancel"
+      confirmLabel="Stop session and 2 processes"
+      defaultOpen
+      description="The current work will be interrupted."
+      icon={Ban}
+      onConfirm={() => undefined}
+      title="Stop this session?"
+      tone="warning"
+    />
+  ),
+};
+
+export const Triggered: Story = {
+  args: {},
+  render: () => (
+    <ConfirmDialog
+      cancelLabel="Cancel"
+      confirmLabel="Delete"
+      description="Open from a trigger to verify focus handoff."
+      onConfirm={() => undefined}
+      title="Delete entry?"
+    >
+      <DialogTrigger render={<Button variant="outline">Open confirm</Button>} />
+    </ConfirmDialog>
+  ),
+};

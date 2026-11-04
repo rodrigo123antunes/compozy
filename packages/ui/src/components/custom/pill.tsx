@@ -1,0 +1,188 @@
+"use client";
+
+import { mergeProps } from "@base-ui/react/merge-props";
+import { useRender } from "@base-ui/react/use-render";
+import type { VariantProps } from "class-variance-authority";
+import { useReducedMotionConfig } from "motion/react";
+import * as React from "react";
+
+import { toneBg } from "../../lib/tone";
+import { cn } from "../../lib/utils";
+import { pillVariants } from "./pill-variants";
+import type { PillForm, PillSize, PillTone } from "./pill-types";
+
+const PillSizeContext = React.createContext<PillSize | null>(null);
+const PillToneContext = React.createContext<PillTone | null>(null);
+const PillPulseContext = React.createContext<boolean | null>(null);
+
+type PillVariantOptions = VariantProps<typeof pillVariants>;
+
+export interface PillProps
+  extends
+    Omit<useRender.ComponentProps<"span">, "color">,
+    Pick<PillVariantOptions, "tone" | "size" | "mono" | "solid" | "form"> {
+  /** Toggle state. Only meaningful when the Pill is rendered as a control (e.g. `render={<button />}`). */
+  active?: boolean;
+  /** Propagate a pulsing state to the inner `Pill.Dot` when the dot does not set `pulse` itself. */
+  pulse?: boolean;
+}
+
+export type PillLinkProps = Omit<PillProps, "active" | "render" | "solid"> &
+  Omit<React.ComponentProps<"a">, keyof PillProps | "color"> & {
+    render?: PillProps["render"];
+    solid?: PillProps["solid"];
+  };
+
+function Pill({
+  tone: toneProp,
+  size: sizeProp,
+  mono: monoProp,
+  solid: solidProp,
+  form: formProp,
+  active,
+  pulse,
+  className,
+  render,
+  ...props
+}: PillProps) {
+  const tone: PillTone = toneProp ?? "neutral";
+  const size: PillSize = sizeProp ?? "sm";
+  const mono = Boolean(monoProp);
+  const solid = Boolean(solidProp);
+  const form: PillForm = formProp ?? "tint";
+  const pulseEnabled = Boolean(pulse);
+  const element = useRender({
+    defaultTagName: "span",
+    props: mergeProps<"span">(
+      {
+        className: cn(pillVariants({ tone, size, mono, solid, form, active }), className),
+      } as Record<string, unknown>,
+      {
+        "data-slot": "pill",
+        "data-tone": tone,
+        "data-size": size,
+        "data-mono": mono ? "true" : undefined,
+        "data-solid": solid ? "true" : undefined,
+        "data-form": form,
+        "data-active": active === true ? "true" : active === false ? "false" : undefined,
+        "data-pulse": pulse ? "true" : undefined,
+        "aria-pressed": active === true || active === false ? active : undefined,
+      } as Record<string, unknown>,
+      props
+    ),
+    render,
+    state: { slot: "pill", tone, size, mono, solid, form, active },
+  });
+  return (
+    <PillSizeContext value={size}>
+      <PillToneContext value={tone}>
+        <PillPulseContext value={pulseEnabled}>{element}</PillPulseContext>
+      </PillToneContext>
+    </PillSizeContext>
+  );
+}
+
+export interface PillDotProps extends Omit<React.ComponentProps<"span">, "color"> {
+  tone?: PillTone;
+  /** CSS color or `var(...)` reference. Overrides `tone`-derived color. */
+  color?: string;
+  pulse?: boolean;
+  size?: "sm" | "md";
+}
+
+function PillDot({
+  tone,
+  color,
+  pulse,
+  size: explicitSize,
+  className,
+  style,
+  ...props
+}: PillDotProps) {
+  const contextSize = React.use(PillSizeContext);
+  const contextTone = React.use(PillToneContext);
+  const contextPulse = React.use(PillPulseContext);
+  const reduced = useReducedMotionConfig();
+  const effectivePulse = pulse ?? contextPulse ?? false;
+  const shouldAnimate = effectivePulse && !reduced;
+  const effectiveSize: "sm" | "md" =
+    explicitSize ?? (contextSize ? (contextSize === "md" ? "md" : "sm") : "md");
+  const effectiveTone: PillTone = tone ?? contextTone ?? "neutral";
+  return (
+    <span
+      aria-hidden="true"
+      data-slot="pill-dot"
+      data-tone={effectiveTone}
+      data-size={effectiveSize}
+      data-pulse={shouldAnimate ? "true" : undefined}
+      className={cn(
+        "inline-block shrink-0 rounded-full",
+        effectiveSize === "sm" ? "size-1.5" : "size-2",
+        color === undefined && toneBg(effectiveTone),
+        shouldAnimate && "animate-pulse",
+        className
+      )}
+      style={color === undefined ? style : { backgroundColor: color, ...style }}
+      {...props}
+    />
+  );
+}
+
+function PillLink({
+  tone = "brand",
+  size = "sm",
+  mono = false,
+  className,
+  href,
+  render,
+  children,
+  ...props
+}: PillLinkProps) {
+  return (
+    <Pill
+      tone={tone}
+      size={size}
+      mono={mono}
+      className={cn("hover:text-fg", className)}
+      render={
+        render ?? (
+          <a href={href ?? "#"} aria-label={typeof children === "string" ? children : undefined} />
+        )
+      }
+      {...props}
+    >
+      {children}
+    </Pill>
+  );
+}
+
+export interface PillCountProps extends Omit<PillProps, "size" | "children" | "mono"> {
+  count: number;
+  /** Counts above `max` render as `{max}+`. */
+  max?: number;
+}
+
+/**
+ * Numeric badge (unread, needs-you). Solid accent by default; renders nothing
+ * at zero so callers never paint a "0" badge.
+ */
+function PillCount({ count, max = 9, tone = "brand", solid = true, ...props }: PillCountProps) {
+  if (count <= 0) return null;
+  return (
+    <Pill size="count" tone={tone} solid={solid} data-count={count} {...props}>
+      {count > max ? `${max}+` : count}
+    </Pill>
+  );
+}
+
+const PillRoot = Pill as typeof Pill & {
+  Dot: typeof PillDot;
+  Link: typeof PillLink;
+  Count: typeof PillCount;
+};
+PillRoot.Dot = PillDot;
+PillRoot.Link = PillLink;
+PillRoot.Count = PillCount;
+
+export { PillRoot as Pill, PillCount, PillDot, PillLink };
+export type { PillForm, PillSize, PillTone };

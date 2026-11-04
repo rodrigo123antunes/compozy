@@ -1,0 +1,107 @@
+package session
+
+import (
+	"time"
+
+	speedpkg "github.com/compozy/compozy/internal/speed"
+	"github.com/compozy/compozy/internal/store"
+)
+
+// Meta returns the current metadata snapshot for persistence.
+func (s *Session) Meta() store.SessionMeta {
+	if s == nil {
+		return store.SessionMeta{}
+	}
+
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.metaLocked()
+}
+
+func (s *Session) metaLocked() store.SessionMeta {
+	profile := cloneCreationProfile(s.creationProfile)
+	creationOptions := cloneCreationOptions(s.creationOptions)
+	identity := cloneCreationIdentity(s.creationIdentity)
+	meta := store.SessionMeta{
+		ID:                     s.ID,
+		WorktreeTransition:     store.CloneSessionWorktreeTransition(s.worktreeTransition),
+		ProfileID:              s.ProfileID,
+		Name:                   s.Name,
+		AgentName:              s.AgentName,
+		Provider:               s.Provider,
+		Model:                  s.Model,
+		ReasoningEffort:        s.ReasoningEffort,
+		Speed:                  s.Speed,
+		SpeedResolution:        speedpkg.CloneResolution(s.SpeedResolution),
+		RuntimeStatus:          s.RuntimeStatus,
+		RuntimeTransition:      s.RuntimeTransition,
+		RuntimeGeneration:      s.RuntimeGeneration,
+		WorkspaceID:            s.WorkspaceID,
+		SessionType:            string(normalizeSessionType(s.Type)),
+		Lineage:                store.NormalizeSessionLineage(s.ID, s.Lineage),
+		State:                  string(s.State),
+		StopReason:             stopReasonPointer(s.stopReason),
+		StopDetail:             s.stopDetail,
+		StopEscalated:          s.stopEscalated,
+		StopVerificationFailed: s.stopVerificationFailed,
+		Failure:                store.CloneSessionFailure(s.failure),
+		ACPSessionID:           stringPointer(s.ACPSessionID),
+		AcceptedRoute:          store.CloneSessionAcceptedRoute(s.acceptedRoute),
+		Liveness:               store.CloneSessionLivenessMeta(s.Liveness),
+		RestartBoundary:        store.CloneSessionRestartCheckpoint(s.restartBoundary),
+		Derivation:             store.CloneSessionDerivation(s.derivation),
+		ImportedContext:        store.CloneSessionImportedContext(s.importedContext),
+		CreationProfile:        profile,
+		CreationOptions:        creationOptions,
+		SoulSnapshotID:         s.SoulSnapshotID,
+		SoulDigest:             s.SoulDigest,
+		ParentSoulDigest:       s.ParentSoulDigest,
+		CreatedAt:              s.CreatedAt,
+		UpdatedAt:              s.UpdatedAt,
+	}
+	// Stop intent is durable before termination; the catalog's terminal classification
+	// is still published only after verified process exit.
+	if s.stopCause != CauseNone && s.stopReason == "" {
+		reason, detail := classifyStopReason(s.stopCause, nil, s.stopDetail)
+		meta.StopReason, meta.StopDetail = stopReasonPointer(reason), detail
+	}
+	if s.process != nil {
+		meta.SpeedResolution = s.speedResolutionForCapsLocked(s.process.CapsSnapshot())
+	}
+	meta.SetPendingResumeReplay(s.pendingResumeReplay)
+	meta.SetRuntimeFailure(s.RuntimeFailure)
+	meta.SetRuntimeSelection(store.NewSessionRuntimeSelectionState(
+		storeSessionRuntimeSelection(s.SelectedRuntime),
+		s.RuntimeSelectionRevision,
+	))
+	meta.SetACPOptions(storeOptionSelectionsFromACP(s.ACPOptions))
+	meta.SetRuntimeRecovery(s.RuntimeRecovery)
+	meta.EffectiveWorkspaceAccess = s.EffectiveWorkspaceAccess
+	meta.EffectiveSessionApproval = s.EffectiveSessionApproval
+	meta.PermissionRules = append([]store.SessionPermissionRule(nil), s.PermissionRules...)
+	meta.InitiatorKind, meta.InitiatorID = s.InitiatorKind, s.InitiatorID
+	meta.SetEffectivePermissions(s.EffectivePermissions)
+	caps, _ := s.capabilitiesSnapshotLocked()
+	meta.PermissionModeDegraded = caps.PermissionModeDegraded
+	meta.SetEffectiveProviderAuthMode(string(s.effectiveProviderAuthMode))
+	meta.SetWorktreeID(s.WorktreeID)
+	meta.SetCWD(s.CWD)
+	meta.SetAdvertisedCommands(s.AdvertisedCommands)
+	if identity != nil {
+		meta.CreationProfileRef = identity.CreationProfileRef
+		meta.PolicySpecDigest = identity.PolicySpecDigest
+		meta.CreationDigest = identity.CreationDigest
+	}
+	return meta
+}
+
+func (s *Session) meta() store.SessionMeta {
+	return s.Meta()
+}
+
+func cloneTimePointer(value *time.Time) *time.Time {
+	if value == nil {
+		return nil
+	}
+	return new(*value)
+}

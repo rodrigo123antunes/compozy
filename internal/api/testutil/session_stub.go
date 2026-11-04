@@ -1,0 +1,496 @@
+package testutil
+
+import (
+	"context"
+
+	"github.com/compozy/compozy/internal/acp"
+	core "github.com/compozy/compozy/internal/api/core"
+	compozyconfig "github.com/compozy/compozy/internal/config"
+	"github.com/compozy/compozy/internal/session"
+	"github.com/compozy/compozy/internal/store"
+	"github.com/compozy/compozy/internal/transcript"
+)
+
+type StubSessionManager struct {
+	RequestCompactionFn func(
+		context.Context, string,
+	) (session.CompactionRequestResult, <-chan acp.AgentEvent, error)
+	ContextEventsFn              func(context.Context, string) (session.ContextEvents, error)
+	UsageEventsFn                func(context.Context, string) ([]session.UsageEventEnvelope, error)
+	DeliveriesFn                 func(context.Context, string) ([]session.DeliveryEventEnvelope, error)
+	CompactionsFn                func(context.Context, string) ([]session.CompactionEnvelope, error)
+	LatestSettledTurnFn          func(context.Context, string) (session.SettledTurn, error)
+	Attention                    StubSessionAttention
+	CreateFn                     func(context.Context, *session.CreateOpts) (*session.Session, error)
+	CreateAcceptedFn             func(context.Context, *session.CreateAcceptedOpts) (*session.Info, error)
+	CreateWorktreeForkAcceptedFn func(context.Context, string, *session.CreateAcceptedOpts) (*session.Info, error)
+	ListFn                       func() []*session.Info
+	ListAllFn                    func(context.Context) ([]*session.Info, error)
+	ListForWorkspaceFn           func(context.Context, string) ([]*session.Info, error)
+	ListPageFn                   func(context.Context, session.ListQuery) (session.ListPage, error)
+	CatalogFacetsFn              func(context.Context, session.ListQuery) (store.SessionCatalogFacetResult, error)
+	SubscribeCatalogFn           func(context.Context, session.CatalogScope) (<-chan session.CatalogEvent, func(), error)
+	MetricsByAgentFn             func(
+		context.Context, store.ReadScope, string,
+	) (map[string]session.AgentSessionMetrics, error)
+	ListSessionsFn          func(context.Context, store.SessionListQuery) ([]store.SessionInfo, error)
+	StatusFn                func(context.Context, string) (*session.Info, error)
+	SessionOwnerFn          func(context.Context, string) (store.SessionOwner, error)
+	ActivePromptRunFn       func(context.Context, string) (session.PromptRunIdentity, error)
+	EventsFn                func(context.Context, string, store.EventQuery) ([]store.SessionEvent, error)
+	EventMetadataFn         func(context.Context, string, store.EventQuery) ([]store.EventMetadata, error)
+	LatestEventFn           func(context.Context, string, string) (*store.SessionEvent, error)
+	HistoryFn               func(context.Context, string, store.EventQuery) ([]store.TurnHistory, error)
+	TranscriptPageFn        func(context.Context, string, transcript.PageQuery) (transcript.Page, error)
+	TranscriptChangesFn     func(context.Context, string, transcript.ChangeQuery) (transcript.ChangePage, error)
+	RepairFn                func(context.Context, session.RepairOpts) (*session.RepairResult, error)
+	DeleteFn                func(context.Context, string) error
+	StopFn                  func(context.Context, string) error
+	ArchiveFn               func(context.Context, string, string) (*session.Info, error)
+	ArchiveWithStopFn       func(context.Context, string, string) (*session.Info, error)
+	UnarchiveFn             func(context.Context, string, string) (*session.Info, error)
+	RenameFn                func(context.Context, string, string, string) (*session.Info, error)
+	AdoptSessionFn          func(context.Context, string, string, string) (*session.Info, error)
+	MoveToProfileFn         func(context.Context, session.MoveToProfileOpts) (session.MoveToProfileResult, error)
+	DetachSessionFn         func(context.Context, string, string) (*session.Info, error)
+	StopWithCauseFn         func(context.Context, string, session.StopCause, string) error
+	ResumeFn                func(context.Context, string) (*session.Session, error)
+	AttachSessionFn         func(context.Context, store.SessionAttachRequest) (store.SessionAttach, error)
+	SetRuntimeSelectionFn   func(context.Context, string, session.RuntimeSelection, int64) (*session.Info, error)
+	ClearRuntimeSelectionFn func(context.Context, string, int64) (*session.Info, error)
+	ClearFn                 func(context.Context, string) (*session.Session, error)
+	ContinueFn              func(context.Context, session.ContinueSessionOpts) (session.DeriveResult, error)
+	ForkFn                  func(context.Context, session.ForkSessionOpts) (session.DeriveResult, error)
+	DerivePreviewFn         func(context.Context, string, string, string) (session.DerivePreview, error)
+	RewindFn                func(
+		context.Context,
+		string,
+		session.ConversationRewindOptions,
+	) (session.ConversationRewindResult, error)
+	PromptFn          func(context.Context, string, string) (<-chan acp.AgentEvent, error)
+	PromptWithOptsFn  func(context.Context, string, session.PromptOpts) (<-chan acp.AgentEvent, error)
+	PromptSyntheticFn func(
+		context.Context,
+		string,
+		session.SyntheticPromptOpts,
+	) (<-chan acp.AgentEvent, error)
+	SendPromptFn          func(context.Context, string, session.SendPromptOpts) (session.SendPromptResult, error)
+	SteerFn               func(context.Context, string, session.SteerPromptOpts) (session.SendPromptResult, error)
+	ListPendingInputsFn   func(context.Context, string) ([]session.PendingInput, error)
+	ClearPendingInputsFn  func(context.Context, string, session.PromptCaller) (session.ClearPendingInputsResult, error)
+	ReplacePendingInputFn func(
+		context.Context, string, string, session.ReplacePendingInputOpts,
+	) (session.PendingInput, error)
+	PromotePendingInputFn func(
+		context.Context, string, string, session.PromotePendingInputOpts,
+	) (session.SendPromptResult, error)
+	CancelQueuedFn func(context.Context, string, string) (session.SendPromptResult, error)
+	CancelPromptFn func(context.Context, string) (session.PromptCancelResult, error)
+	ApproveFn      func(context.Context, string, acp.ApproveRequest) (session.ApprovalResult, error)
+	InputQueueFn   func(context.Context, string) (session.InputQueueSummary, error)
+	WorkingDirFn   func(context.Context, string) (string, error)
+}
+
+func (s *StubSessionManager) Create(ctx context.Context, optsInput *session.CreateOpts) (*session.Session, error) {
+	opts := *optsInput
+
+	if s.CreateFn != nil {
+		return s.CreateFn(ctx, &(opts))
+	}
+	return nil, session.ErrSessionNotFound
+}
+
+func (s *StubSessionManager) CreateAccepted(
+	ctx context.Context,
+	optsInput *session.CreateAcceptedOpts,
+) (*session.Info, error) {
+	opts := *optsInput
+
+	if s.CreateAcceptedFn != nil {
+		return s.CreateAcceptedFn(ctx, &(opts))
+	}
+	created, err := s.Create(ctx, &(opts.Session))
+	if created == nil || err != nil {
+		return nil, err
+	}
+	return created.Info(), nil
+}
+
+func (s *StubSessionManager) CreateWorktreeForkAccepted(
+	ctx context.Context,
+	originSessionID string,
+	optsInput *session.CreateAcceptedOpts,
+) (*session.Info, error) {
+	opts := *optsInput
+
+	if s.CreateWorktreeForkAcceptedFn != nil {
+		return s.CreateWorktreeForkAcceptedFn(ctx, originSessionID, &(opts))
+	}
+	return s.CreateAccepted(ctx, &(opts))
+}
+
+func (s *StubSessionManager) List() []*session.Info {
+	if s.ListFn != nil {
+		return s.ListFn()
+	}
+	if s.ListAllFn != nil {
+		infos, err := s.ListAllFn(context.Background())
+		if err != nil {
+			return []*session.Info{}
+		}
+		return infos
+	}
+	return nil
+}
+
+func (s *StubSessionManager) ListAll(ctx context.Context) ([]*session.Info, error) {
+	if s.ListAllFn != nil {
+		return s.ListAllFn(ctx)
+	}
+	return nil, nil
+}
+
+func (s *StubSessionManager) ListPage(ctx context.Context, query session.ListQuery) (session.ListPage, error) {
+	if s.ListPageFn != nil {
+		return s.ListPageFn(ctx, query)
+	}
+	infos, err := s.ListAll(ctx)
+	if err != nil {
+		return session.ListPage{}, err
+	}
+	return stubSessionListPage(infos, query), nil
+}
+
+func (s *StubSessionManager) SubscribeSessionCatalogEvents(
+	ctx context.Context,
+	scope session.CatalogScope,
+) (<-chan session.CatalogEvent, func(), error) {
+	if s.SubscribeCatalogFn != nil {
+		return s.SubscribeCatalogFn(ctx, scope)
+	}
+	events := make(chan session.CatalogEvent)
+	close(events)
+	return events, func() {}, nil
+}
+
+func (s *StubSessionManager) AggregateSessionsByAgent(
+	ctx context.Context,
+	readScope store.ReadScope,
+	workspaceID string,
+) (map[string]session.AgentSessionMetrics, error) {
+	if s.MetricsByAgentFn != nil {
+		return s.MetricsByAgentFn(ctx, readScope, workspaceID)
+	}
+	infos, err := s.ListAll(ctx)
+	if err != nil {
+		return nil, err
+	}
+	metrics := make(map[string]session.AgentSessionMetrics)
+	for _, info := range infos {
+		if info == nil || info.WorkspaceID != workspaceID ||
+			!readScope.Matches(info.ProfileID) {
+			continue
+		}
+		if info.Lineage != nil && session.IsInternalSpawnRole(info.Lineage.SpawnRole) {
+			continue
+		}
+		agentName := compozyconfig.NormalizeAgentName(info.AgentName)
+		if agentName == "" {
+			continue
+		}
+		metric := metrics[agentName]
+		metric.Total++
+		if info.State == session.StateActive {
+			metric.Active++
+		}
+		if info.State == session.StateStopped &&
+			(info.Failure != nil || info.StopReason == store.StopAgentCrashed ||
+				info.StopReason == store.StopError) {
+			metric.Failed++
+		}
+		if !info.CreatedAt.IsZero() && info.UpdatedAt.After(info.CreatedAt) {
+			metric.RuntimeSeconds += int64(info.UpdatedAt.Sub(info.CreatedAt).Seconds())
+		}
+		if info.UpdatedAt.After(metric.LastActivityAt) {
+			metric.LastActivityAt = info.UpdatedAt
+		}
+		metrics[agentName] = metric
+	}
+	return metrics, nil
+}
+
+func (s *StubSessionManager) ListSessions(
+	ctx context.Context,
+	query store.SessionListQuery,
+) ([]store.SessionInfo, error) {
+	if s.ListSessionsFn != nil {
+		return s.ListSessionsFn(ctx, query)
+	}
+	if s.ListAllFn == nil {
+		return nil, nil
+	}
+	infos, err := s.ListAllFn(ctx)
+	if err != nil {
+		return nil, err
+	}
+	storeInfos := make([]store.SessionInfo, 0, len(infos))
+	for _, info := range infos {
+		if info == nil {
+			continue
+		}
+		if query.WorkspaceID != "" && info.WorkspaceID != query.WorkspaceID {
+			continue
+		}
+		if query.State != "" && string(info.State) != query.State {
+			continue
+		}
+		storeInfos = append(storeInfos, storeSessionInfoFromRuntime(info))
+	}
+	return storeInfos, nil
+}
+
+func (s *StubSessionManager) Status(ctx context.Context, id string) (*session.Info, error) {
+	if s.StatusFn != nil {
+		return s.StatusFn(ctx, id)
+	}
+	return nil, session.ErrSessionNotFound
+}
+
+// SessionOwner delegates to SessionOwnerFn, else derives the owner from Status.
+func (s *StubSessionManager) SessionOwner(ctx context.Context, id string) (store.SessionOwner, error) {
+	if s.SessionOwnerFn != nil {
+		return s.SessionOwnerFn(ctx, id)
+	}
+	info, err := s.Status(ctx, id)
+	if err != nil {
+		return store.SessionOwner{}, err
+	}
+	return store.SessionOwner{SessionID: info.ID, ProfileID: info.ProfileID, WorkspaceID: info.WorkspaceID}, nil
+}
+
+func (s *StubSessionManager) ActivePromptRun(
+	ctx context.Context,
+	id string,
+) (session.PromptRunIdentity, error) {
+	if s.ActivePromptRunFn != nil {
+		return s.ActivePromptRunFn(ctx, id)
+	}
+	return session.PromptRunIdentity{}, session.ErrPromptNotActive
+}
+
+func (s *StubSessionManager) Events(
+	ctx context.Context,
+	id string,
+	query store.EventQuery,
+) ([]store.SessionEvent, error) {
+	if s.EventsFn != nil {
+		return s.EventsFn(ctx, id, query)
+	}
+	return nil, nil
+}
+
+func (s *StubSessionManager) LatestSessionEventByType(
+	ctx context.Context,
+	id string,
+	eventType string,
+) (*store.SessionEvent, error) {
+	if s.LatestEventFn != nil {
+		return s.LatestEventFn(ctx, id, eventType)
+	}
+	return nil, nil
+}
+
+func (s *StubSessionManager) History(
+	ctx context.Context,
+	id string,
+	query store.EventQuery,
+) ([]store.TurnHistory, error) {
+	if s.HistoryFn != nil {
+		return s.HistoryFn(ctx, id, query)
+	}
+	return nil, nil
+}
+
+func (s *StubSessionManager) TranscriptPage(
+	ctx context.Context,
+	id string,
+	query transcript.PageQuery,
+) (transcript.Page, error) {
+	if s.TranscriptPageFn != nil {
+		return s.TranscriptPageFn(ctx, id, query)
+	}
+	return transcript.Page{}, nil
+}
+
+func (s *StubSessionManager) TranscriptChanges(
+	ctx context.Context,
+	id string,
+	query transcript.ChangeQuery,
+) (transcript.ChangePage, error) {
+	if s.TranscriptChangesFn != nil {
+		return s.TranscriptChangesFn(ctx, id, query)
+	}
+	return transcript.ChangePage{}, nil
+}
+
+func (s *StubSessionManager) RepairSession(
+	ctx context.Context,
+	opts session.RepairOpts,
+) (*session.RepairResult, error) {
+	if s.RepairFn != nil {
+		return s.RepairFn(ctx, opts)
+	}
+	return &session.RepairResult{SessionID: opts.SessionID}, nil
+}
+
+func (s *StubSessionManager) Delete(ctx context.Context, id string) error {
+	if s.DeleteFn != nil {
+		return s.DeleteFn(ctx, id)
+	}
+	return nil
+}
+
+func (s *StubSessionManager) Stop(ctx context.Context, id string) error {
+	if s.StopFn != nil {
+		return s.StopFn(ctx, id)
+	}
+	return nil
+}
+
+func (s *StubSessionManager) StopWithCause(
+	ctx context.Context,
+	id string,
+	cause session.StopCause,
+	detail string,
+) error {
+	if s.StopWithCauseFn != nil {
+		return s.StopWithCauseFn(ctx, id, cause, detail)
+	}
+	if s.StopFn != nil {
+		return s.StopFn(ctx, id)
+	}
+	return nil
+}
+
+func (s *StubSessionManager) Resume(ctx context.Context, id string) (*session.Session, error) {
+	if s.ResumeFn != nil {
+		return s.ResumeFn(ctx, id)
+	}
+	return nil, session.ErrSessionNotFound
+}
+
+func (s *StubSessionManager) AttachSession(
+	ctx context.Context,
+	req store.SessionAttachRequest,
+) (store.SessionAttach, error) {
+	if s.AttachSessionFn != nil {
+		return s.AttachSessionFn(ctx, req)
+	}
+	return store.SessionAttach{}, store.ErrSessionNotFound
+}
+
+func (s *StubSessionManager) Rename(
+	ctx context.Context,
+	workspaceID string,
+	sessionID string,
+	name string,
+) (*session.Info, error) {
+	if s.RenameFn != nil {
+		return s.RenameFn(ctx, workspaceID, sessionID, name)
+	}
+	return nil, session.ErrSessionNotFound
+}
+
+func (s *StubSessionManager) ClearConversation(
+	ctx context.Context,
+	id string,
+) (*session.Session, error) {
+	if s.ClearFn != nil {
+		return s.ClearFn(ctx, id)
+	}
+	return nil, session.ErrSessionNotFound
+}
+
+func (s *StubSessionManager) RewindConversation(
+	ctx context.Context,
+	id string,
+	opts session.ConversationRewindOptions,
+) (session.ConversationRewindResult, error) {
+	if s.RewindFn != nil {
+		return s.RewindFn(ctx, id, opts)
+	}
+	return session.ConversationRewindResult{}, session.ErrSessionNotFound
+}
+
+// ContinueSession delegates to ContinueFn.
+func (s *StubSessionManager) ContinueSession(
+	ctx context.Context,
+	opts session.ContinueSessionOpts,
+) (session.DeriveResult, error) {
+	if s.ContinueFn != nil {
+		return s.ContinueFn(ctx, opts)
+	}
+	return session.DeriveResult{}, session.ErrSessionNotFound
+}
+
+// ForkSession delegates to ForkFn.
+func (s *StubSessionManager) ForkSession(
+	ctx context.Context,
+	opts session.ForkSessionOpts,
+) (session.DeriveResult, error) {
+	if s.ForkFn != nil {
+		return s.ForkFn(ctx, opts)
+	}
+	return session.DeriveResult{}, session.ErrSessionNotFound
+}
+
+// DerivePreview delegates to DerivePreviewFn.
+func (s *StubSessionManager) DerivePreview(
+	ctx context.Context,
+	workspaceID string,
+	sourceSessionID string,
+	messageID string,
+) (session.DerivePreview, error) {
+	if s.DerivePreviewFn != nil {
+		return s.DerivePreviewFn(ctx, workspaceID, sourceSessionID, messageID)
+	}
+	return session.DerivePreview{}, session.ErrSessionNotFound
+}
+
+var _ core.SessionManager = (*StubSessionManager)(nil)
+var _ core.SessionDeriveManager = (*StubSessionManager)(nil)
+var _ core.SessionOwnerReader = (*StubSessionManager)(nil)
+var _ core.SessionCatalog = (*StubSessionManager)(nil)
+var _ core.SessionCatalogEventSubscriber = (*StubSessionManager)(nil)
+var _ core.AgentSessionMetricsReader = (*StubSessionManager)(nil)
+
+func (s *StubSessionManager) UsageEvents(ctx context.Context, id string) ([]session.UsageEventEnvelope, error) {
+	if s.UsageEventsFn != nil {
+		return s.UsageEventsFn(ctx, id)
+	}
+	return nil, nil
+}
+
+func (s *StubSessionManager) Deliveries(ctx context.Context, id string) ([]session.DeliveryEventEnvelope, error) {
+	if s.DeliveriesFn != nil {
+		return s.DeliveriesFn(ctx, id)
+	}
+	return nil, nil
+}
+
+func (s *StubSessionManager) Compactions(ctx context.Context, id string) ([]session.CompactionEnvelope, error) {
+	if s.CompactionsFn != nil {
+		return s.CompactionsFn(ctx, id)
+	}
+	return nil, nil
+}
+
+func (s *StubSessionManager) CatalogFacets(
+	ctx context.Context,
+	query session.ListQuery,
+) (store.SessionCatalogFacetResult, error) {
+	if s.CatalogFacetsFn != nil {
+		return s.CatalogFacetsFn(ctx, query)
+	}
+	return store.SessionCatalogFacetResult{ByWorkspace: []store.WorkspaceSessionCatalogFacets{}}, nil
+}

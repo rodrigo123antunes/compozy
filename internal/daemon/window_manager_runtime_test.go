@@ -1,0 +1,1028 @@
+package daemon
+
+import (
+	"bytes"
+	"context"
+	"encoding/json"
+	"errors"
+	"os"
+	"path/filepath"
+	"sync"
+	"testing"
+	"time"
+
+	"github.com/compozy/compozy/internal/workspaceaccess"
+
+	"github.com/compozy/compozy/internal/clientstate"
+	compozyconfig "github.com/compozy/compozy/internal/config"
+	"github.com/compozy/compozy/internal/deadentity"
+	hookspkg "github.com/compozy/compozy/internal/hooks"
+	"github.com/compozy/compozy/internal/store"
+	terminalpkg "github.com/compozy/compozy/internal/terminal"
+	"github.com/compozy/compozy/internal/testutil"
+	"github.com/compozy/compozy/internal/windowmanager"
+	workspacepkg "github.com/compozy/compozy/internal/workspace"
+)
+
+func TestWindowManagerHookBridge(t *testing.T) {
+	t.Parallel()
+
+	t.Run("Should map committed events into detached async hook payloads", func(t *testing.T) {
+		t.Parallel()
+		events := []struct {
+			command windowmanager.CommandID
+			hook    hookspkg.HookEvent
+		}{
+			{command: windowmanager.CommandLayoutArrange, hook: hookspkg.HookWindowManagerLayoutApplied},
+			{command: windowmanager.CommandDesktopCreate, hook: hookspkg.HookWindowManagerDesktopCreated},
+			{command: windowmanager.CommandDesktopDelete, hook: hookspkg.HookWindowManagerDesktopDeleted},
+			{command: windowmanager.CommandWindowMove, hook: hookspkg.HookWindowManagerWindowMoved},
+			{command: windowmanager.CommandWindowOpen, hook: hookspkg.HookWindowManagerWindowOpened},
+			{command: windowmanager.CommandWindowClose, hook: hookspkg.HookWindowManagerWindowClosed},
+			{command: windowmanager.CommandWindowStackSetActive, hook: hookspkg.HookWindowManagerStackActivated},
+		}
+		seen := make(chan hookspkg.WindowManagerPayload, len(events))
+		declarations := make([]hookspkg.HookDecl, 0, len(events))
+		executors := make(map[string]hookspkg.Executor, len(events))
+		for _, item := range events {
+			name := item.hook.String()
+			declarations = append(declarations, hookspkg.HookDecl{
+				Name:         name,
+				Event:        item.hook,
+				Mode:         hookspkg.HookModeAsync,
+				Matcher:      hookspkg.HookMatcher{WorkspaceID: "workspace-a"},
+				ExecutorKind: hookspkg.HookExecutorNative,
+			})
+			executors[name] = hookspkg.NewTypedNativeExecutor(
+				func(
+					_ context.Context,
+					_ hookspkg.RegisteredHook,
+					payload hookspkg.WindowManagerPayload,
+				) (hookspkg.WindowManagerObservationPatch, error) {
+					seen <- payload
+					return hookspkg.WindowManagerObservationPatch{}, nil
+				},
+			)
+		}
+		dispatcher := hookspkg.NewHooks(
+			hookspkg.WithLogger(discardLogger()),
+			hookspkg.WithNativeDeclarations(declarations),
+			hookspkg.WithExecutorResolver(func(declaration hookspkg.HookDecl) (hookspkg.Executor, error) {
+				return executors[declaration.Name], nil
+			}),
+			hookspkg.WithAsyncWorkerCount(1),
+			hookspkg.WithAsyncQueueCapacity(len(events)),
+		)
+		t.Cleanup(dispatcher.Close)
+		if err := dispatcher.Rebuild(t.Context()); err != nil {
+			t.Fatalf("Rebuild() error = %v", err)
+		}
+		state := &bootState{logger: discardLogger(), hookDispatcher: dispatcher}
+		observer := newWindowManagerHookObserver(state)
+		canceled, cancel := context.WithCancel(t.Context())
+		cancel()
+
+		for _, item := range events {
+			observer(canceled, windowmanager.Event{
+				WorkspaceID: "workspace-a",
+				Revision:    7,
+				CommandID:   item.command,
+				Changes: windowmanager.ChangeSet{
+					DesktopIDs: []windowmanager.DesktopID{"desktop-a"},
+					WindowIDs:  []windowmanager.WindowID{"window-a"},
+					GroupIDs:   []windowmanager.GroupID{"group-a"},
+					NodeIDs:    []windowmanager.NodeID{"node-a"},
+					ClientIDs:  []windowmanager.ClientID{"client-a"},
+				},
+				Actor:      windowmanager.Actor{Kind: "agent", ID: "agent-a"},
+				Origin:     "native:compozy__window_manager",
+				OccurredAt: time.Date(2026, time.July, 23, 12, 0, 0, 0, time.UTC),
+			})
+			select {
+			case payload := <-seen:
+				if payload.Event != item.hook ||
+					payload.WorkspaceID != "workspace-a" ||
+					payload.Revision != 7 ||
+					payload.CommandID != string(item.command) ||
+					payload.Changes.DesktopIDs[0] != "desktop-a" ||
+					payload.Changes.WindowIDs[0] != "window-a" ||
+					payload.Changes.GroupIDs[0] != "group-a" ||
+					payload.Changes.NodeIDs[0] != "node-a" ||
+					payload.Changes.ClientIDs[0] != "client-a" ||
+					payload.Actor.Kind != "agent" ||
+					payload.Actor.ID != "agent-a" ||
+					payload.Origin != "native:compozy__window_manager" ||
+					!payload.Timestamp.Equal(time.Date(2026, time.July, 23, 12, 0, 0, 0, time.UTC)) {
+					t.Fatalf("hook payload = %#v", payload)
+				}
+			case <-time.After(time.Second):
+				t.Fatalf("timed out waiting for %q", item.hook)
+			}
+		}
+
+		observer(t.Context(), windowmanager.Event{
+			WorkspaceID: "workspace-a",
+			CommandID:   windowmanager.CommandWindowFocus,
+		})
+		select {
+		case payload := <-seen:
+			t.Fatalf("presentation command produced hook payload %#v", payload)
+		case <-time.After(20 * time.Millisecond):
+		}
+	})
+
+	t.Run("Should map tab outcomes once and preserve complete affected ids", func(t *testing.T) {
+		t.Parallel()
+
+		cases := []struct {
+			name  string
+			event windowmanager.Event
+			want  []hookspkg.HookEvent
+		}{
+			{
+				name:  "open",
+				event: windowmanager.Event{CommandID: windowmanager.CommandWindowOpen},
+				want:  []hookspkg.HookEvent{hookspkg.HookWindowManagerWindowOpened},
+			},
+			{
+				name:  "reopen",
+				event: windowmanager.Event{CommandID: windowmanager.CommandWindowReopen},
+				want:  []hookspkg.HookEvent{hookspkg.HookWindowManagerWindowOpened},
+			},
+			{
+				name: "frame close",
+				event: windowmanager.Event{
+					CommandID: windowmanager.CommandWindowClose,
+					Changes: windowmanager.ChangeSet{
+						WindowIDs:      []windowmanager.WindowID{"window-a", "window-b"},
+						StackUngrouped: []windowmanager.NodeID{"stack-a"},
+					},
+				},
+				want: []hookspkg.HookEvent{
+					hookspkg.HookWindowManagerWindowClosed,
+					hookspkg.HookWindowManagerStackUngrouped,
+				},
+			},
+			{
+				name: "merge all",
+				event: windowmanager.Event{
+					CommandID: windowmanager.CommandWindowStackGroup,
+					Changes: windowmanager.ChangeSet{
+						StackGrouped:   []windowmanager.NodeID{"stack-target"},
+						StackUngrouped: []windowmanager.NodeID{"stack-source"},
+					},
+				},
+				want: []hookspkg.HookEvent{
+					hookspkg.HookWindowManagerStackGrouped,
+					hookspkg.HookWindowManagerStackUngrouped,
+				},
+			},
+			{
+				name:  "durable activation",
+				event: windowmanager.Event{CommandID: windowmanager.CommandWindowStackSetActive},
+				want:  []hookspkg.HookEvent{hookspkg.HookWindowManagerStackActivated},
+			},
+			{
+				name:  "presentation focus",
+				event: windowmanager.Event{CommandID: windowmanager.CommandWindowFocus},
+				want:  nil,
+			},
+		}
+		for _, testCase := range cases {
+			t.Run("Should map "+testCase.name, func(t *testing.T) {
+				t.Parallel()
+				dispatches := windowManagerHookPayloads(testCase.event)
+				if len(dispatches) != len(testCase.want) {
+					t.Fatalf("dispatch count = %d, want %d: %+v", len(dispatches), len(testCase.want), dispatches)
+				}
+				for index, want := range testCase.want {
+					if dispatches[index].event != want || dispatches[index].payload.Event != want {
+						t.Fatalf("dispatch[%d] = %+v, want event %q", index, dispatches[index], want)
+					}
+				}
+				if testCase.name == "frame close" {
+					if got := dispatches[0].payload.Changes.WindowIDs; len(got) != 2 ||
+						got[0] != "window-a" || got[1] != "window-b" {
+						t.Fatalf("closed window ids = %+v", got)
+					}
+				}
+			})
+		}
+	})
+
+	t.Run("Should tolerate an unavailable late-bound dispatcher", func(t *testing.T) {
+		t.Parallel()
+		observer := newWindowManagerHookObserver(&bootState{logger: discardLogger()})
+		observer(t.Context(), windowmanager.Event{
+			WorkspaceID: "workspace-a",
+			CommandID:   windowmanager.CommandDesktopCreate,
+		})
+	})
+}
+
+func TestWindowManagerWorkspaceDeletionGate(t *testing.T) {
+	t.Parallel()
+
+	t.Run("Should resume a durable deletion intent after installing runtime owners", func(t *testing.T) {
+		t.Parallel()
+
+		fixture := newDaemonWindowManagerFixture(t)
+		ctx := testutil.Context(t)
+		if err := fixture.database.StageWorkspaceDeletion(ctx, fixture.workspace.ID); err != nil {
+			t.Fatalf("StageWorkspaceDeletion() error = %v", err)
+		}
+		sessionPreparation := &windowManagerSessionRemovalPreparation{}
+		sessions := &windowManagerRemovalSessionManager{
+			fakeSessionManager: &fakeSessionManager{},
+			workspaceID:        fixture.workspace.ID,
+			preparation:        sessionPreparation,
+		}
+		terminals, err := terminalpkg.NewManager(terminalpkg.WithJournal(nativeTerminalJournalStub{}))
+		if err != nil {
+			t.Fatalf("terminal.NewManager() error = %v", err)
+		}
+		if err := terminals.Start(ctx); err != nil {
+			t.Fatalf("terminal manager Start() error = %v", err)
+		}
+		t.Cleanup(func() {
+			shutdownCtx, cancel := context.WithTimeout(context.WithoutCancel(t.Context()), 3*time.Second)
+			defer cancel()
+			if err := terminals.Shutdown(shutdownCtx); err != nil {
+				t.Errorf("terminal manager Shutdown() error = %v", err)
+			}
+		})
+		state := &bootState{
+			windowManagerStoreResolver: fixture.storeResolver,
+			windowManagerStore:         fixture.engine,
+			windowManagers:             fixture.registry,
+			workspaceResolver:          fixture.resolver,
+			terminals:                  terminals,
+		}
+		cleanup := &bootCleanup{}
+		if err := configureWorkspaceDeletionLifecycle(ctx, state, sessions, cleanup); err != nil {
+			t.Fatalf("configureWorkspaceDeletionLifecycle() error = %v", err)
+		}
+		if _, err := fixture.database.GetWorkspaceDeletionIntent(
+			ctx, fixture.workspace.ID,
+		); !errors.Is(err, workspacepkg.ErrWorkspaceDeletionIntentNotFound) {
+			t.Fatalf("GetWorkspaceDeletionIntent() error = %v, want finalized intent", err)
+		}
+		if sessionPreparation.commits != 1 {
+			t.Fatalf("session preparation commits = %d, want 1", sessionPreparation.commits)
+		}
+		if err := fixture.resolver.DrainUnregisters(ctx); err != nil {
+			t.Fatalf("DrainUnregisters() error = %v", err)
+		}
+	})
+
+	t.Run("Should drain terminal runtime before workspace deletion commits", func(t *testing.T) {
+		t.Parallel()
+		terminal := &recordingTerminalWorkspaceRemovalPreparation{}
+		preparation := workspaceRemovalPreparation{
+			windowManager: &windowManagerSessionRemovalPreparation{},
+			session:       &windowManagerSessionRemovalPreparation{},
+			terminal:      terminal,
+			workspaceID:   "workspace-a",
+		}
+		if err := preparation.BeforeDelete(t.Context()); err != nil {
+			t.Fatalf("BeforeDelete() error = %v", err)
+		}
+		if terminal.beforeDeletes != 1 || len(terminal.workspaceIDs) != 0 {
+			t.Fatalf("terminal preparation after BeforeDelete = %#v, want staged without archive", terminal)
+		}
+		if err := preparation.Commit(t.Context()); err != nil {
+			t.Fatalf("Commit() error = %v", err)
+		}
+		if terminal.commits != 1 || len(terminal.workspaceIDs) != 1 || terminal.workspaceIDs[0] != "workspace-a" {
+			t.Fatalf("terminal preparation after Commit = %#v, want one archive", terminal)
+		}
+	})
+
+	t.Run("Should retry only the external owner whose commit failed", func(t *testing.T) {
+		t.Parallel()
+
+		terminal := &recordingTerminalWorkspaceRemovalPreparation{}
+		window := &windowManagerSessionRemovalPreparation{}
+		commitErr := errors.New("session cleanup failed")
+		session := &windowManagerSessionRemovalPreparation{commitErr: commitErr}
+		preparation := &workspaceRemovalPreparation{
+			windowManager: window,
+			session:       session,
+			terminal:      terminal,
+			workspaceID:   "workspace-a",
+		}
+		if err := preparation.BeforeDelete(t.Context()); err != nil {
+			t.Fatalf("BeforeDelete() error = %v", err)
+		}
+		if err := preparation.Commit(t.Context()); !errors.Is(err, commitErr) {
+			t.Fatalf("Commit(first) error = %v, want %v", err, commitErr)
+		}
+		session.commitErr = nil
+		if err := preparation.Commit(t.Context()); err != nil {
+			t.Fatalf("Commit(retry) error = %v", err)
+		}
+		if terminal.commits != 1 || window.commits != 1 || session.commits != 2 {
+			t.Fatalf(
+				"commit calls = terminal %d, window %d, session %d; want 1, 1, 2",
+				terminal.commits,
+				window.commits,
+				session.commits,
+			)
+		}
+	})
+
+	t.Run("Should purge topology clients and subscriptions before same-id recreation", func(t *testing.T) {
+		t.Parallel()
+		fixture := newDaemonWindowManagerFixture(t)
+		ctx := testutil.Context(t)
+		deadEntities := deadentity.New(fixture.database, deadentity.WithPermanentFailureThreshold(1))
+		mcpRetirer := &windowManagerMCPStateRetirer{}
+		deadKey := store.DeadEntityKey{
+			ProfileID:   store.DefaultProfileID,
+			WorkspaceID: fixture.workspace.ID,
+			Kind:        store.DeadEntityKindMCPSidecar,
+			EntityID:    "github",
+		}
+		if err := deadEntities.RecordFailure(ctx, deadKey, deadentity.FailurePermanent, "invalid config"); err != nil {
+			t.Fatalf("RecordFailure() error = %v", err)
+		}
+		sessionPreparation := &windowManagerSessionRemovalPreparation{}
+		sessions := &windowManagerRemovalSessionManager{
+			fakeSessionManager: &fakeSessionManager{},
+			workspaceID:        fixture.workspace.ID,
+			preparation:        sessionPreparation,
+		}
+		terminals, err := terminalpkg.NewManager(terminalpkg.WithJournal(nativeTerminalJournalStub{}))
+		if err != nil {
+			t.Fatalf("terminal.NewManager() error = %v", err)
+		}
+		if err := terminals.Start(ctx); err != nil {
+			t.Fatalf("terminal manager Start() error = %v", err)
+		}
+		t.Cleanup(func() {
+			shutdownCtx, cancel := context.WithTimeout(context.WithoutCancel(t.Context()), 3*time.Second)
+			defer cancel()
+			if err := terminals.Shutdown(shutdownCtx); err != nil {
+				t.Errorf("terminal manager Shutdown() error = %v", err)
+			}
+		})
+		terminalHandle, err := terminals.OpenPipe(ctx, terminalpkg.PipeRequest{
+			WS: fixture.workspace.ID, Argv: []string{"sh", "-c", "sleep 30"}, Cwd: t.TempDir(),
+			Actor: terminalpkg.Actor{
+				Kind: terminalpkg.ActorKindHuman, ID: terminalpkg.OperatorActorID,
+				ProfileID: store.DefaultProfileID,
+			},
+		})
+		if err != nil {
+			t.Fatalf("terminal OpenPipe() error = %v", err)
+		}
+		state := &bootState{
+			windowManagerStoreResolver: fixture.storeResolver,
+			windowManagerStore:         fixture.engine,
+			windowManagers:             fixture.registry,
+			workspaceResolver:          fixture.resolver,
+			deadEntities:               deadEntities,
+			mcpToolProvider:            mcpRetirer,
+			terminals:                  terminals,
+		}
+		if err := installWorkspaceRemovalPreparer(state, sessions); err != nil {
+			t.Fatalf("installWorkspaceRemovalPreparer() error = %v", err)
+		}
+
+		workspaceID := windowmanager.WorkspaceID(fixture.workspace.ID)
+		clientID := windowmanager.ClientID("browser-a")
+		if _, err := fixture.manager.RegisterClient(ctx, windowmanager.ClientRegistration{
+			WorkspaceID: workspaceID, ClientID: clientID,
+		}); err != nil {
+			t.Fatalf("RegisterClient() error = %v", err)
+		}
+		if _, err := fixture.manager.Execute(ctx, windowmanager.CommandRequest{
+			WorkspaceID: workspaceID, ExpectedRevision: 0, ClientID: &clientID,
+			Payload: windowmanager.OpenWindowCommand{Window: windowmanager.WindowSpec{
+				ID: "window-a", App: "terminal", DesktopID: "desktop-default",
+				Route: windowmanager.RouteIntent{
+					Pathname: "/terminal", Search: windowmanager.RouteSearch{},
+				},
+				FloatingRect: windowmanager.NormalizedRect{X: 0.1, Y: 0.1, Width: 0.5, Height: 0.5},
+			}},
+		}); err != nil {
+			t.Fatalf("Execute(window.open) error = %v", err)
+		}
+		subscription, err := fixture.manager.Subscribe(
+			ctx,
+			windowmanager.SubscriptionRequest{WorkspaceID: workspaceID, AfterRevision: 1},
+		)
+		if err != nil {
+			t.Fatalf("Subscribe() error = %v", err)
+		}
+		t.Cleanup(func() {
+			if err := subscription.Close(); err != nil {
+				t.Errorf("Subscription.Close() error = %v", err)
+			}
+		})
+
+		if err := fixture.resolver.Unregister(ctx, fixture.workspace.ID); err != nil {
+			t.Fatalf("Unregister() error = %v", err)
+		}
+		if _, err := terminals.Handle(
+			ctx, fixture.workspace.ID, store.DefaultProfileID, terminalHandle.Info().ID,
+		); !errors.Is(err, terminalpkg.ErrExpired) {
+			t.Fatalf("terminal Handle() after unregister error = %v, want ErrExpired", err)
+		}
+		if sessionPreparation.commits != 1 || sessionPreparation.rollbacks != 0 {
+			t.Fatalf(
+				"session preparation = (commits=%d rollbacks=%d), want (1 0)",
+				sessionPreparation.commits,
+				sessionPreparation.rollbacks,
+			)
+		}
+		select {
+		case _, open := <-subscription.Updates():
+			if open {
+				t.Fatal("subscription remained open after workspace purge")
+			}
+		case <-time.After(time.Second):
+			t.Fatal("workspace purge did not close the subscription")
+		}
+		if !errors.Is(subscription.Err(), windowmanager.ErrWorkspaceNotFound) {
+			t.Fatalf("Subscription.Err() = %v, want ErrWorkspaceNotFound", subscription.Err())
+		}
+
+		if err := fixture.database.InsertWorkspace(ctx, fixture.workspace); err != nil {
+			t.Fatalf("InsertWorkspace(same id) error = %v", err)
+		}
+		fixture.resolver.Invalidate(fixture.workspace.ID)
+		deadStatus, err := deadEntities.Status(ctx, deadKey)
+		if err != nil {
+			t.Fatalf("deadEntities.Status(recreated) error = %v", err)
+		}
+		if deadStatus.Dead {
+			t.Fatalf("deadEntities.Status(recreated) = %#v, want no retired workspace cache", deadStatus)
+		}
+		if got := mcpRetirer.WorkspaceIDs(); len(got) != 1 || got[0] != fixture.workspace.ID {
+			t.Fatalf("MCP workspace retirements = %#v, want %q", got, fixture.workspace.ID)
+		}
+		snapshot, err := fixture.manager.Snapshot(ctx, workspaceID)
+		if err != nil {
+			t.Fatalf("Snapshot(recreated) error = %v", err)
+		}
+		if snapshot.Revision != 0 || len(snapshot.Windows) != 0 {
+			t.Fatalf("Snapshot(recreated) = %#v, want fresh revision zero", snapshot)
+		}
+		clients, err := fixture.manager.Clients(ctx, workspaceID)
+		if err != nil {
+			t.Fatalf("Clients(recreated) error = %v", err)
+		}
+		if len(clients) != 0 {
+			t.Fatalf("Clients(recreated) = %#v, want no stale client views", clients)
+		}
+	})
+
+	t.Run("Should restore topology and transient clients when deletion rolls back", func(t *testing.T) {
+		t.Parallel()
+		fixture := newDaemonWindowManagerFixture(t)
+		ctx := testutil.Context(t)
+		workspaceID := windowmanager.WorkspaceID(fixture.workspace.ID)
+		clientID := windowmanager.ClientID("browser-a")
+		if _, err := fixture.manager.RegisterClient(ctx, windowmanager.ClientRegistration{
+			WorkspaceID: workspaceID, ClientID: clientID,
+		}); err != nil {
+			t.Fatalf("RegisterClient() error = %v", err)
+		}
+		want := daemonWindowManagerSnapshot(workspaceID, 1, "Before rollback")
+		if err := fixture.repository.Commit(ctx, daemonWindowManagerCommit(want, 0)); err != nil {
+			t.Fatalf("Commit() error = %v", err)
+		}
+		preparation, err := fixture.storeResolver.prepareRemoval(
+			fixture.workspace,
+			fixture.engine,
+			fixture.registry,
+		)
+		if err != nil {
+			t.Fatalf("prepareRemoval() error = %v", err)
+		}
+		if err := preparation.BeforeDelete(ctx); err != nil {
+			t.Fatalf("BeforeDelete() error = %v", err)
+		}
+		if _, err := fixture.manager.Snapshot(ctx, workspaceID); !errors.Is(err, windowmanager.ErrWorkspaceNotFound) {
+			t.Fatalf("Snapshot(deleting) error = %v, want ErrWorkspaceNotFound", err)
+		}
+		if err := preparation.Rollback(ctx); err != nil {
+			t.Fatalf("Rollback() error = %v", err)
+		}
+		got, err := fixture.manager.Snapshot(ctx, workspaceID)
+		if err != nil {
+			t.Fatalf("Snapshot(after rollback) error = %v", err)
+		}
+		if got.Revision != want.Revision || got.Desktops[0].Name != want.Desktops[0].Name {
+			t.Fatalf("Snapshot(after rollback) = %#v, want preserved revision and desktop", got)
+		}
+		clients, err := fixture.manager.Clients(ctx, workspaceID)
+		if err != nil {
+			t.Fatalf("Clients(after rollback) error = %v", err)
+		}
+		if len(clients) != 1 || clients[0].ClientID != clientID {
+			t.Fatalf("Clients(after rollback) = %#v, want browser-a", clients)
+		}
+	})
+}
+
+func TestWindowManagerGlobalDesktopWorkspace(t *testing.T) {
+	t.Parallel()
+
+	t.Run("Should persist profile desktop state without a project workspace", func(t *testing.T) {
+		t.Parallel()
+		fixture := newDaemonWindowManagerFixture(t)
+		ctx := testutil.Context(t)
+		workspaceID := windowmanager.GlobalDesktopWorkspaceID
+
+		executeDaemonDesktopCreate(t, fixture.manager, workspaceID, "desktop-global", "Global")
+		snapshot, err := fixture.manager.Snapshot(ctx, workspaceID)
+		if err != nil {
+			t.Fatalf("Snapshot(global desktop) error = %v", err)
+		}
+		if snapshot.WorkspaceID != workspaceID || snapshot.Revision != 1 ||
+			len(snapshot.Desktops) != 2 || snapshot.Desktops[1].Name != "Global" {
+			t.Fatalf("Snapshot(global desktop) = %#v, want isolated persisted layout", snapshot)
+		}
+	})
+	t.Run("Should persist User desktop state without a project workspace", func(t *testing.T) {
+		t.Parallel()
+		fixture := newDaemonWindowManagerFixture(t)
+		ctx := testutil.Context(t)
+		workspaceID := windowmanager.UserDesktopWorkspaceID
+
+		executeDaemonDesktopCreate(t, fixture.manager, workspaceID, "desktop-user", "User")
+		snapshot, err := fixture.manager.Snapshot(ctx, workspaceID)
+		if err != nil {
+			t.Fatalf("Snapshot(global desktop) error = %v", err)
+		}
+		if snapshot.WorkspaceID != workspaceID || snapshot.Revision != 1 ||
+			len(snapshot.Desktops) != 2 || snapshot.Desktops[1].Name != "User" {
+			t.Fatalf("Snapshot(global desktop) = %#v, want isolated persisted layout", snapshot)
+		}
+	})
+}
+
+func TestWindowManagerWorkspaceResolverErrorClassification(t *testing.T) {
+	t.Parallel()
+	transientErr := errors.New("workspace store temporarily unavailable")
+	store := &windowManagerWorkspaceStoreStub{err: transientErr}
+	resolver, err := workspacepkg.NewResolver(store, workspacepkg.WithLogger(discardLogger()))
+	if err != nil {
+		t.Fatalf("workspace.NewResolver() error = %v", err)
+	}
+	windowResolver, err := newWindowManagerStoreWorkspaceResolver(resolver, discardLogger())
+	if err != nil {
+		t.Fatalf("newWindowManagerStoreWorkspaceResolver() error = %v", err)
+	}
+
+	t.Run("Should preserve transient resolver errors for retry", func(t *testing.T) {
+		_, err := windowResolver.ResolveWorkspace(t.Context(), "ws-transient")
+		if !errors.Is(err, transientErr) {
+			t.Fatalf("ResolveWorkspace() error = %v, want transient store error", err)
+		}
+		if errors.Is(err, clientstate.ErrWorkspaceNotFound) {
+			t.Fatalf("ResolveWorkspace() error = %v, must not classify transient failure as absence", err)
+		}
+	})
+
+	t.Run("Should classify confirmed absence as terminal", func(t *testing.T) {
+		store.err = workspacepkg.ErrWorkspaceNotFound
+		_, err := windowResolver.ResolveWorkspace(t.Context(), "ws-missing")
+		if !errors.Is(err, clientstate.ErrWorkspaceNotFound) {
+			t.Fatalf("ResolveWorkspace() error = %v, want clientstate absence", err)
+		}
+	})
+}
+
+func TestWindowManagerWorkspaceConfigRuntime(t *testing.T) {
+	t.Parallel()
+
+	t.Run("Should isolate workspace behavior and follow active hot apply", func(t *testing.T) {
+		t.Parallel()
+		fixture := newDaemonWindowManagerFixture(t)
+		ctx := testutil.Context(t)
+		workspaceARoot := fixture.workspace.RootDir
+		workspaceBRoot := filepath.Join(t.TempDir(), "workspace-b")
+		if err := os.MkdirAll(workspaceBRoot, 0o755); err != nil {
+			t.Fatalf("os.MkdirAll(%q) error = %v", workspaceBRoot, err)
+		}
+		workspaceB, err := fixture.resolver.Register(ctx, workspacepkg.RegisterOptions{
+			RootDir: workspaceBRoot,
+			Name:    "window-manager-b",
+		})
+		if err != nil {
+			t.Fatalf("workspace.Register(B) error = %v", err)
+		}
+		writeDaemonWindowManagerConfig(
+			t,
+			filepath.Join(workspaceARoot, compozyconfig.DirName, compozyconfig.ConfigName),
+			"[window_manager]\nnew_window_policy = \"beside_focus\"\n",
+		)
+		writeDaemonWindowManagerConfig(
+			t,
+			fixture.homePaths.ConfigFile,
+			"[window_manager]\nnew_window_policy = \"beside_focus\"\n",
+		)
+		fixture.resolver.Invalidate(fixture.workspace.ID)
+		fixture.resolver.Invalidate(workspaceB.ID)
+		// The active global policy starts as floating so workspace A's own
+		// beside_focus is observably isolated from it; the shipped default is
+		// tab, so the premise has to be explicit.
+		floating := windowmanager.DefaultConfig()
+		floating.NewWindowPolicy = windowmanager.NewWindowFloating
+		if err := fixture.manager.UpdateDefaults(floating); err != nil {
+			t.Fatalf("UpdateDefaults(floating) error = %v", err)
+		}
+
+		open := func(workspaceID string, windowID windowmanager.WindowID) windowmanager.Result {
+			t.Helper()
+			before, snapshotErr := fixture.manager.Snapshot(ctx, windowmanager.WorkspaceID(workspaceID))
+			if snapshotErr != nil {
+				t.Fatalf("Snapshot(%s) error = %v", workspaceID, snapshotErr)
+			}
+			result, executeErr := fixture.manager.Execute(ctx, windowmanager.CommandRequest{
+				WorkspaceID:      windowmanager.WorkspaceID(workspaceID),
+				ExpectedRevision: before.Revision,
+				Payload: windowmanager.OpenWindowCommand{Window: windowmanager.WindowSpec{
+					ID: windowID, App: "terminal", DesktopID: "desktop-default",
+					Route:        windowmanager.RouteIntent{Pathname: "/terminal", Search: windowmanager.RouteSearch{}},
+					FloatingRect: windowmanager.NormalizedRect{X: 0.1, Y: 0.1, Width: 0.5, Height: 0.5},
+				}},
+			})
+			if executeErr != nil {
+				t.Fatalf("Execute(window.open %s) error = %v", windowID, executeErr)
+			}
+			return result
+		}
+
+		workspaceAResult := open(fixture.workspace.ID, "window-a")
+		if got := workspaceAResult.Snapshot.Windows["window-a"].Placement; got != windowmanager.WindowPlacementTiled {
+			t.Fatalf("workspace A placement = %q, want workspace-configured tiled", got)
+		}
+		workspaceBResult := open(workspaceB.ID, "window-b")
+		if got := workspaceBResult.Snapshot.Windows["window-b"].Placement; got != windowmanager.WindowPlacementFloating {
+			t.Fatalf("workspace B placement = %q, want active-global floating", got)
+		}
+
+		active := windowmanager.DefaultConfig()
+		active.NewWindowPolicy = windowmanager.NewWindowInsert
+		if err := fixture.manager.UpdateDefaults(active); err != nil {
+			t.Fatalf("UpdateDefaults() error = %v", err)
+		}
+		workspaceBResult = open(workspaceB.ID, "window-b-hot-applied")
+		if got := workspaceBResult.Snapshot.Windows["window-b-hot-applied"].Placement; got != windowmanager.WindowPlacementTiled {
+			t.Fatalf("workspace B hot-applied placement = %q, want tiled", got)
+		}
+	})
+}
+
+type windowManagerRemovalSessionManager struct {
+	*fakeSessionManager
+	workspaceID string
+	preparation workspacepkg.UnregisterPreparation
+}
+
+func (m *windowManagerRemovalSessionManager) PrepareWorkspaceRemoval(
+	_ context.Context,
+	workspaceID string,
+) (workspacepkg.UnregisterPreparation, error) {
+	if workspaceID != m.workspaceID {
+		return nil, errors.New("unexpected workspace removal id")
+	}
+	return m.preparation, nil
+}
+
+type windowManagerSessionRemovalPreparation struct {
+	commits   int
+	rollbacks int
+	commitErr error
+}
+
+type recordingTerminalWorkspaceRemovalPreparation struct {
+	workspaceIDs  []string
+	beforeDeletes int
+	commits       int
+	rollbacks     int
+}
+
+func (r *recordingTerminalWorkspaceRemovalPreparation) BeforeDelete(context.Context) error {
+	r.beforeDeletes++
+	return nil
+}
+
+func (r *recordingTerminalWorkspaceRemovalPreparation) Commit(_ context.Context) error {
+	r.commits++
+	r.workspaceIDs = append(r.workspaceIDs, "workspace-a")
+	return nil
+}
+
+func (r *recordingTerminalWorkspaceRemovalPreparation) Rollback(context.Context) error {
+	r.rollbacks++
+	return nil
+}
+
+type windowManagerMCPStateRetirer struct {
+	mu           sync.Mutex
+	workspaceIDs []string
+}
+
+func (*windowManagerMCPStateRetirer) ForgetMCPServer(string, string) {}
+
+func (r *windowManagerMCPStateRetirer) ForgetWorkspace(workspaceID string) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.workspaceIDs = append(r.workspaceIDs, workspaceID)
+}
+
+func (r *windowManagerMCPStateRetirer) WorkspaceIDs() []string {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return append([]string(nil), r.workspaceIDs...)
+}
+
+func (*windowManagerSessionRemovalPreparation) BeforeDelete(context.Context) error {
+	return nil
+}
+
+func (p *windowManagerSessionRemovalPreparation) Commit(context.Context) error {
+	p.commits++
+	return p.commitErr
+}
+
+func (p *windowManagerSessionRemovalPreparation) Rollback(context.Context) error {
+	p.rollbacks++
+	return nil
+}
+
+func TestWindowManagerUserSessionDeletion(t *testing.T) {
+	t.Run("Should retire a User session in both reserved partitions", func(t *testing.T) {
+		t.Parallel()
+		fixture := newDaemonWindowManagerFixture(t)
+		ctx := testutil.Context(t)
+		sessionID := "session-user-delete"
+		partitions := []windowmanager.WorkspaceID{
+			windowmanager.UserDesktopWorkspaceID,
+			windowmanager.GlobalDesktopWorkspaceID,
+		}
+		for _, partition := range partitions {
+			snapshot, err := fixture.manager.Snapshot(ctx, partition)
+			if err != nil {
+				t.Fatal(err)
+			}
+			_, err = fixture.manager.Execute(ctx, windowmanager.CommandRequest{
+				WorkspaceID: partition, ExpectedRevision: snapshot.Revision,
+				Payload: windowmanager.OpenWindowCommand{Window: windowmanager.WindowSpec{
+					ID:          "user-window",
+					App:         "session",
+					InstanceKey: &sessionID,
+					Route: windowmanager.RouteIntent{
+						Pathname: "/session/session-user-delete",
+						Search:   windowmanager.RouteSearch{},
+					},
+					DesktopID: snapshot.Desktops[0].ID,
+				}},
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+		}
+		reconciler := &windowManagerSessionReconciler{registry: fixture.registry}
+		reconciler.SetReady()
+		if err := reconciler.ReconcileDeletedSession(ctx, testWindowManagerProfileID, "", sessionID); err != nil {
+			t.Fatal(err)
+		}
+		for _, partition := range partitions {
+			snapshot, err := fixture.manager.Snapshot(ctx, partition)
+			if err != nil {
+				t.Fatal(err)
+			}
+			for _, window := range snapshot.Windows {
+				if window.InstanceKey != nil && *window.InstanceKey == sessionID {
+					t.Fatalf("session still open in %s", partition)
+				}
+			}
+		}
+	})
+}
+
+func TestWindowManagerCrossPartitionRetirement(t *testing.T) {
+	for _, retirement := range []string{"session", "workspace"} {
+		t.Run("Should reconcile every persisted profile partition after "+retirement+" retirement", func(t *testing.T) {
+			t.Parallel()
+			fixture := newDaemonWindowManagerFixture(t)
+			ctx := t.Context()
+			partitions := []windowmanager.WorkspaceID{
+				windowmanager.GlobalDesktopWorkspaceID,
+				windowmanager.UserDesktopWorkspaceID,
+				windowmanager.WorkspaceID(fixture.workspace.ID),
+			}
+			for _, profile := range []string{testWindowManagerProfileID, "profile-inactive"} {
+				manager, err := fixture.registry.For(profile)
+				if err != nil {
+					t.Fatal(err)
+				}
+				for _, partition := range partitions {
+					bindingTarget := fixture.workspace.ID
+					if retirement == "session" {
+						bindingTarget = workspaceaccess.UserSelector
+					}
+					binding, err := json.Marshal(bindingTarget)
+					if err != nil {
+						t.Fatal(err)
+					}
+					_, err = manager.Execute(
+						ctx,
+						windowmanager.CommandRequest{
+							WorkspaceID: partition,
+							Payload: windowmanager.OpenWindowCommand{
+								Window: windowmanager.WindowSpec{
+									ID:          "bound",
+									App:         "session",
+									InstanceKey: new("deleted-session"),
+									DesktopID:   "desktop-default",
+									Route: windowmanager.RouteIntent{
+										Pathname: "/sessions/deleted-session",
+										Search:   windowmanager.RouteSearch{"workspace": binding},
+									},
+								},
+							},
+						},
+					)
+					if err != nil {
+						t.Fatal(err)
+					}
+				}
+			}
+			reloaded, err := newWindowManagerRegistry(
+				fixture.engine,
+				windowManagerWorkspaceAuthorizer{resolver: fixture.storeResolver},
+				nil,
+				fixture.resolver,
+				windowmanager.DefaultConfig(),
+				discardLogger(),
+			)
+			if err != nil {
+				t.Fatal(err)
+			}
+			t.Cleanup(func() {
+				if err := reloaded.Close(); err != nil {
+					t.Error(err)
+				}
+			})
+			reconciler := &windowManagerSessionReconciler{registry: reloaded}
+			reconciler.SetReady()
+			if retirement == "session" {
+				if err := reconciler.ReconcileDeletedSession(
+					ctx,
+					"unrelated-profile",
+					"",
+					"deleted-session",
+				); err != nil {
+					t.Fatal(err)
+				}
+			} else if err := reloaded.ReconcileUnregisteredWorkspace(ctx, fixture.workspace.ID); err != nil {
+				t.Fatal(err)
+			}
+			for _, profile := range []string{testWindowManagerProfileID, "profile-inactive"} {
+				manager, err := reloaded.For(profile)
+				if err != nil {
+					t.Fatal(err)
+				}
+				for _, partition := range partitions {
+					snapshot, err := manager.Snapshot(ctx, partition)
+					if err != nil {
+						t.Fatal(err)
+					}
+					if snapshot.Windows["bound"].InstanceKey != nil ||
+						snapshot.Windows["bound"].Route.Pathname != "/sessions" ||
+						len(snapshot.History.Undo) != 0 ||
+						len(snapshot.Windows["bound"].Route.Search) != 0 {
+						t.Fatalf("unretired %s/%s: %#v", profile, partition, snapshot)
+					}
+				}
+			}
+		})
+	}
+}
+
+func TestUserScopeLayoutMigration(t *testing.T) {
+	t.Run("Should keep booting and retain the registration when a legacy journal is defective", func(t *testing.T) {
+		t.Parallel()
+		fixture := newDaemonWindowManagerFixture(t)
+		ctx := t.Context()
+		source := fixture.workspace.ID
+		journalRoot := filepath.Join(fixture.homePaths.HomeDir, "workspaces", source)
+		for _, dir := range []string{journalRoot, journalRoot + ".migrated"} {
+			if err := os.MkdirAll(dir, 0o700); err != nil {
+				t.Fatal(err)
+			}
+		}
+		if _, err := fixture.database.DB().ExecContext(ctx,
+			`INSERT INTO user_scope_migrations(source_workspace_id,source_root,disposition,profile_ids,sql_done_at)
+			VALUES (?,?,'migrate','[]',datetime('now'))`, source, fixture.workspace.RootDir); err != nil {
+			t.Fatal(err)
+		}
+		if err := reconcileUserScopeMigrations(ctx, fixture.database, fixture.engine,
+			fixture.homePaths.HomeDir, discardLogger()); err != nil {
+			t.Fatalf(
+				"reconcileUserScopeMigrations() error = %v, want a logged retention instead of a boot failure",
+				err,
+			)
+		}
+		var registered int
+		var journalState string
+		if err := fixture.database.DB().QueryRowContext(ctx,
+			`SELECT (SELECT count(*) FROM workspaces WHERE id=?), journal_state FROM user_scope_migrations
+			WHERE source_workspace_id=?`, source, source).Scan(&registered, &journalState); err != nil {
+			t.Fatal(err)
+		}
+		if registered != 1 || journalState != "pending" {
+			t.Fatalf(
+				"registration=%d journal_state=%q, want the registration kept and the journal pending",
+				registered,
+				journalState,
+			)
+		}
+	})
+
+	t.Run("Should copy a profile layout once and retain both source and existing destination", func(t *testing.T) {
+		t.Parallel()
+		fixture := newDaemonWindowManagerFixture(t)
+		ctx := t.Context()
+		source := windowmanager.WorkspaceID(fixture.workspace.ID)
+		executeDaemonDesktopCreate(t, fixture.manager, source, "legacy-desktop", "Legacy")
+		if err := migrateUserScopeLayouts(ctx, fixture.engine, string(source), discardLogger()); err != nil {
+			t.Fatal(err)
+		}
+		key := windowManagerSnapshotKey(testWindowManagerProfileID)
+		first, err := fixture.engine.Get(
+			ctx,
+			clientstate.WorkspaceID(windowmanager.UserDesktopWorkspaceID),
+			windowManagerStateDomain,
+			key,
+		)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := migrateUserScopeLayouts(ctx, fixture.engine, string(source), discardLogger()); err != nil {
+			t.Fatal(err)
+		}
+		second, err := fixture.engine.Get(
+			ctx,
+			clientstate.WorkspaceID(windowmanager.UserDesktopWorkspaceID),
+			windowManagerStateDomain,
+			key,
+		)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if first.Rev != second.Rev || !bytes.Equal(first.Value, second.Value) {
+			t.Fatal("migration overwrote existing destination")
+		}
+		if _, err := fixture.engine.Get(
+			ctx,
+			clientstate.WorkspaceID(source),
+			windowManagerStateDomain,
+			key,
+		); err != nil {
+			t.Fatal("source layout was removed", err)
+		}
+		var snapshot windowmanager.Snapshot
+		if err := json.Unmarshal(first.Value, &snapshot); err != nil {
+			t.Fatal(err)
+		}
+		if snapshot.WorkspaceID != windowmanager.UserDesktopWorkspaceID || len(snapshot.Desktops) != 2 {
+			t.Fatalf("snapshot=%#v", snapshot)
+		}
+		if _, err := fixture.database.DB().ExecContext(ctx,
+			`INSERT INTO user_scope_migrations(source_workspace_id,source_root,disposition,profile_ids,sql_done_at)
+			VALUES (?,?,'migrate','[]',datetime('now'))`, string(source), fixture.workspace.RootDir); err != nil {
+			t.Fatal(err)
+		}
+		for range 2 {
+			if err := reconcileUserScopeMigrations(ctx, fixture.database, fixture.engine,
+				fixture.homePaths.HomeDir, discardLogger()); err != nil {
+				t.Fatal(err)
+			}
+		}
+		var remaining int
+		if err := fixture.database.DB().QueryRowContext(ctx,
+			"SELECT count(*) FROM workspaces WHERE id=?", string(source)).
+			Scan(&remaining); err != nil || remaining != 0 {
+			t.Fatalf("registration remaining=%d err=%v", remaining, err)
+		}
+		var completed int
+		if err := fixture.database.DB().QueryRowContext(ctx,
+			`SELECT count(*) FROM user_scope_migrations WHERE source_workspace_id=? AND journal_state='verified'
+			AND layout_state='verified' AND registration_removed_at IS NOT NULL`, string(source)).Scan(&completed); err != nil || completed != 1 {
+			t.Fatalf("completed migrations=%d err=%v", completed, err)
+		}
+		retained, err := fixture.engine.Get(ctx, clientstate.WorkspaceID(windowmanager.UserDesktopWorkspaceID),
+			windowManagerStateDomain, key)
+		if err != nil || retained.Rev != first.Rev || !bytes.Equal(retained.Value, first.Value) {
+			t.Fatalf("reconciliation changed User layout: %v", err)
+		}
+	})
+}

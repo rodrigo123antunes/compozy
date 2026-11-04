@@ -1,0 +1,103 @@
+package daemon
+
+import (
+	"context"
+
+	"github.com/compozy/compozy/internal/api/core"
+)
+
+func (d *Daemon) runtimeDeps(
+	ctx context.Context,
+	state *bootState,
+	sessions SessionManager,
+) RuntimeDeps {
+	if state.agentProbeConfig == nil {
+		state.agentProbeConfig = newAgentProbeConfigState(&state.cfg)
+	}
+	authoredContext := authoredContextRuntimeDeps(ctx, state, sessions)
+	state.runtimeWorkers.authoredHeartbeatWake = authoredContext.wakePrompter
+	var worktrees core.WorktreeService
+	if state.worktrees != nil {
+		worktrees = state.worktrees
+	}
+	roles := roleResolverForState(state)
+	agentCatalog := agentCatalogDependency(state.agentCatalog, agentSidecarCatalogs{
+		soul:      state.soulCatalog,
+		heartbeat: state.heartbeatCatalog,
+	})
+	return RuntimeDeps{
+		AgentInstances:     state.agentInstances,
+		Config:             state.cfg,
+		AgentProbeConfig:   state.agentProbeConfig,
+		HomePaths:          d.homePaths,
+		Logger:             state.logger,
+		Sessions:           sessions,
+		Subagents:          state.subagents,
+		SessionMonitors:    sessionMonitorService(state),
+		SessionProcesses:   sessionProcessService(state),
+		SessionAttachments: state.sessionAttachments,
+		SessionFiles:       newSessionFileIndex(state.logger),
+		DrainController:    d,
+
+		Registry:              state.registry,
+		Profiles:              state.profiles,
+		SchemaStreams:         newDaemonSchemaStreamStatusReader(state.registry),
+		RuntimeMemory:         state.runtimeWorkers.runtimeMemory,
+		HostLoad:              hostLoadSnapshotSource(state.runtimeWorkers.hostLoad),
+		DeadEntities:          state.deadEntities,
+		WorkspaceResolver:     state.workspaceResolver,
+		WorkspaceService:      state.workspaceResolver,
+		Worktrees:             worktrees,
+		WorkspaceAccess:       state.accessPolicy,
+		WindowManagers:        state.windowManagers,
+		Terminals:             state.terminals,
+		ModelCatalog:          state.modelCatalog,
+		ProviderUsage:         state.providerUsage,
+		MarketplaceCatalog:    state.marketplace,
+		AgentCatalog:          agentCatalog,
+		AgentResolver:         agentCatalog,
+		AgentContext:          state.situationContext,
+		AgentDefinitionSync:   state.agentSkillResources,
+		SoulAuthoring:         authoredContext.SoulAuthoring,
+		AgentMemory:           state.agentMemory,
+		SoulHistoryPurger:     authoredContext.SoulHistoryPurger,
+		SoulRefresher:         authoredContext.SoulRefresher,
+		HeartbeatAuthor:       authoredContext.HeartbeatAuthoring,
+		HeartbeatPurger:       authoredContext.HeartbeatPurger,
+		HeartbeatStatus:       authoredContext.HeartbeatStatus,
+		HeartbeatWake:         authoredContext.HeartbeatWake,
+		SessionHealth:         authoredContext.SessionHealth,
+		WakeEvents:            authoredContext.WakeEvents,
+		CoordinatorRole:       coordinatorRoleResolverFor(roles),
+		Roles:                 roles,
+		SkillsRegistry:        skillsRegistryAPI(state.skillsRegistry),
+		ToolRegistry:          state.toolRegistry,
+		Toolsets:              state.toolsets,
+		ToolApprovals:         state.toolApprovals,
+		ApprovalCoordinator:   state.approvalCoordinator,
+		CmdPalette:            state.cmdPalette,
+		ApprovalGrants:        state.deps.ApprovalGrants,
+		Clarify:               state.clarify,
+		HostedMCP:             state.hostedMCP,
+		MCPHostAPI:            newMCPHostAPIRuntimeInvoker(state.currentExtensionRuntime),
+		Vault:                 state.providerVault,
+		StartedAt:             state.startedAt,
+		OnProviderAuthSuccess: d.providerPreStarter.Clear,
+		ProviderAuthVerdicts:  d.providerAuthVerdicts,
+	}
+}
+
+// sessionMonitorService keeps a missing monitor service a nil interface.
+func sessionMonitorService(state *bootState) core.SessionMonitorService {
+	if state.sessionMonitors == nil {
+		return nil
+	}
+	return state.sessionMonitors
+}
+
+func sessionProcessService(state *bootState) core.SessionProcessService {
+	if state.sessionProcesses == nil {
+		return nil
+	}
+	return state.sessionProcesses
+}

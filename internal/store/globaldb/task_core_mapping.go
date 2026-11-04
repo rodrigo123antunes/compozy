@@ -1,0 +1,364 @@
+package globaldb
+
+import (
+	"database/sql"
+	"encoding/json"
+	"fmt"
+	"math"
+	"strings"
+	"time"
+
+	"github.com/compozy/compozy/internal/store"
+	"github.com/compozy/compozy/internal/store/globaldb/sqlcgen"
+	taskpkg "github.com/compozy/compozy/internal/task"
+)
+
+func taskFromGenerated(row *sqlcgen.GetTaskRow) (taskpkg.Task, error) {
+	record := taskpkg.Task{
+		ID:           row.ID,
+		GrantCeiling: row.GrantCeiling,
+		ProfileID:    row.ProfileID,
+		Title:        row.Title,
+		CreatedBy: taskpkg.ActorIdentity{
+			Ref: row.CreatedByRef,
+		},
+		Origin: taskpkg.Origin{
+			Ref: row.OriginRef,
+		},
+	}
+	fields := taskScanFields{
+		identifier:           row.Identifier,
+		scope:                row.Scope,
+		workspaceID:          row.WorkspaceID,
+		parentTaskID:         row.ParentTaskID,
+		description:          row.Description,
+		priority:             row.Priority,
+		maxAttempts:          int(row.MaxAttempts),
+		autoEnqueueOnReady:   int(row.AutoEnqueueOnReady),
+		status:               row.Status,
+		approvalPolicy:       row.ApprovalPolicy,
+		approvalState:        row.ApprovalState,
+		ownerKind:            row.OwnerKind,
+		ownerRef:             row.OwnerRef,
+		createdByKind:        row.CreatedByKind,
+		originKind:           row.OriginKind,
+		createdAtRaw:         row.CreatedAt,
+		updatedAtRaw:         row.UpdatedAt,
+		closedAtRaw:          row.ClosedAt,
+		currentRunID:         row.CurrentRunID,
+		latestEventSeq:       row.LatestEventSeq,
+		paused:               int(row.Paused),
+		pausedBy:             row.PausedBy,
+		pausedAtRaw:          row.PausedAt,
+		pausedReason:         row.PausedReason,
+		needsAttentionReason: row.NeedsAttentionReason,
+		needsAttentionAtRaw:  row.NeedsAttentionAt,
+		needsAttentionByKind: row.NeedsAttentionByKind,
+		needsAttentionByRef:  row.NeedsAttentionByRef,
+		wakeCreator:          int(row.WakeCreator),
+		metadataJSON:         row.MetadataJson,
+	}
+	return taskRecordFromFields(record, &fields)
+}
+
+func taskRunFromGenerated(row *sqlcgen.GetTaskRunRow) (taskpkg.Run, error) {
+	attempt, err := taskAttemptFromInt64(row.Attempt)
+	if err != nil {
+		return taskpkg.Run{}, err
+	}
+	recoveryCount, err := taskAttemptFromInt64(row.RecoveryCount)
+	if err != nil {
+		return taskpkg.Run{}, err
+	}
+	run := taskpkg.Run{
+		ID:            row.ID,
+		TaskID:        row.TaskID,
+		WorkspaceID:   taskNullStringValue(row.WorkspaceID),
+		Attempt:       attempt,
+		RecoveryCount: recoveryCount,
+		Origin: taskpkg.Origin{
+			Ref: row.OriginRef,
+		},
+	}
+	run.SetWorktreeID(taskNullStringValue(row.WorktreeID))
+	fields := taskRunScanFields{
+		status:         row.Status,
+		runKind:        row.RunKind,
+		loopRunID:      row.LoopRunID,
+		previousRunID:  row.PreviousRunID,
+		failureKind:    row.FailureKind,
+		claimedByKind:  row.ClaimedByKind,
+		claimedByRef:   row.ClaimedByRef,
+		sessionID:      row.SessionID,
+		originKind:     row.OriginKind,
+		idempotencyKey: row.IdempotencyKey,
+
+		designationGroupID:   row.DesignationGroupID,
+		resolvedWorktreeMode: row.ResolvedWorktreeMode,
+		resolvedWorktreeRef:  row.ResolvedWorktreeRef,
+		claimToken:           nullableTaskString(row.ClaimToken),
+		claimTokenHash:       row.ClaimTokenHash,
+		leaseUntilRaw:        row.LeaseUntil,
+		heartbeatAtRaw:       row.HeartbeatAt,
+		queuedAtRaw:          row.QueuedAt,
+		claimedAtRaw:         row.ClaimedAt,
+		startedAtRaw:         row.StartedAt,
+		endedAtRaw:           row.EndedAt,
+		tokensUsed:           row.TokensUsed,
+		runErr:               row.Error,
+		metadataJSON:         row.MetadataJson,
+		resultJSON:           row.ResultJson,
+		reviewRequired:       row.ReviewRequired,
+		reviewRequestRound:   int(row.ReviewRequestRound),
+		reviewPolicySnapshot: row.ReviewPolicySnapshot,
+		reviewRequestID:      row.ReviewRequestID,
+		parentRunID:          row.ParentRunID,
+		reviewID:             row.ReviewID,
+		reviewRound:          int(row.ReviewRound),
+		continuationReason:   row.ContinuationReason,
+		missingWorkJSON:      row.MissingWorkJson,
+		nextRoundGuidance:    row.NextRoundGuidance,
+	}
+	return fields.record(run)
+}
+
+func taskRunFromStatusGenerated(row *sqlcgen.ListTaskRunsByStatusRow) (taskpkg.Run, error) {
+	attempt, err := taskAttemptFromInt64(row.Attempt)
+	if err != nil {
+		return taskpkg.Run{}, err
+	}
+	recoveryCount, err := taskAttemptFromInt64(row.RecoveryCount)
+	if err != nil {
+		return taskpkg.Run{}, err
+	}
+	run := taskpkg.Run{
+		ID:            row.ID,
+		TaskID:        row.TaskID,
+		WorkspaceID:   taskNullStringValue(row.WorkspaceID),
+		Attempt:       attempt,
+		RecoveryCount: recoveryCount,
+		Origin:        taskpkg.Origin{Ref: row.OriginRef},
+	}
+	run.SetWorktreeID(taskNullStringValue(row.WorktreeID))
+	fields := taskRunScanFields{
+		status:         row.Status,
+		runKind:        row.RunKind,
+		loopRunID:      row.LoopRunID,
+		previousRunID:  row.PreviousRunID,
+		failureKind:    row.FailureKind,
+		claimedByKind:  row.ClaimedByKind,
+		claimedByRef:   row.ClaimedByRef,
+		sessionID:      row.SessionID,
+		originKind:     row.OriginKind,
+		idempotencyKey: row.IdempotencyKey,
+
+		designationGroupID:   row.DesignationGroupID,
+		resolvedWorktreeMode: row.ResolvedWorktreeMode,
+		resolvedWorktreeRef:  row.ResolvedWorktreeRef,
+		claimToken:           nullableTaskString(row.ClaimToken),
+		claimTokenHash:       row.ClaimTokenHash,
+		leaseUntilRaw:        row.LeaseUntil,
+		heartbeatAtRaw:       row.HeartbeatAt,
+		queuedAtRaw:          row.QueuedAt,
+		claimedAtRaw:         row.ClaimedAt,
+		startedAtRaw:         row.StartedAt,
+		endedAtRaw:           row.EndedAt,
+		tokensUsed:           row.TokensUsed,
+		runErr:               row.Error,
+		metadataJSON:         row.MetadataJson,
+		resultJSON:           row.ResultJson,
+		reviewRequired:       row.ReviewRequired,
+		reviewRequestRound:   int(row.ReviewRequestRound),
+		reviewPolicySnapshot: row.ReviewPolicySnapshot,
+		reviewRequestID:      row.ReviewRequestID,
+		parentRunID:          row.ParentRunID,
+		reviewID:             row.ReviewID,
+		reviewRound:          int(row.ReviewRound),
+		continuationReason:   row.ContinuationReason,
+		missingWorkJSON:      row.MissingWorkJson,
+		nextRoundGuidance:    row.NextRoundGuidance,
+	}
+	return fields.record(run)
+}
+
+func taskAttemptFromInt64(value int64) (int32, error) {
+	if value < math.MinInt32 || value > math.MaxInt32 {
+		return 0, fmt.Errorf("store: task run attempt %d exceeds int32 range", value)
+	}
+	return int32(value), nil
+}
+
+func insertTaskParams(record taskpkg.Task) sqlcgen.InsertTaskParams {
+	return sqlcgen.InsertTaskParams{
+		GrantCeiling:       record.GrantCeiling,
+		ProfileID:          record.ProfileID,
+		ID:                 record.ID,
+		Identifier:         nullableTaskString(record.Identifier),
+		Scope:              string(record.Scope),
+		WorkspaceID:        nullableTaskString(record.WorkspaceID),
+		ParentTaskID:       nullableTaskString(record.ParentTaskID),
+		Title:              record.Title,
+		Description:        nullableTaskString(record.Description),
+		Priority:           string(record.Priority),
+		MaxAttempts:        int64(record.MaxAttempts),
+		AutoEnqueueOnReady: boolInt64(record.AutoEnqueueOnReady),
+		Status:             string(record.Status),
+		ApprovalPolicy:     string(record.ApprovalPolicy),
+		ApprovalState:      string(record.ApprovalState),
+		OwnerKind:          nullableTaskOwnerKind(record.Owner),
+		OwnerRef:           nullableTaskOwnerRef(record.Owner),
+		CreatedByKind:      string(record.CreatedBy.Kind),
+		CreatedByRef:       record.CreatedBy.Ref,
+		OriginKind:         string(record.Origin.Kind),
+		OriginRef:          record.Origin.Ref,
+		CreatedAt:          store.FormatTimestamp(record.CreatedAt),
+		UpdatedAt:          store.FormatTimestamp(record.UpdatedAt),
+		ClosedAt:           nullableTaskTime(record.ClosedAt),
+		Paused:             boolInt64(record.Paused),
+		PausedBy:           record.PausedBy,
+		PausedAt:           nullableTaskTime(record.PausedAt),
+		PausedReason:       record.PausedReason,
+		WakeCreator:        boolInt64(record.WakeCreator),
+		MetadataJson:       nullableTaskRawJSON(record.Metadata),
+	}
+}
+
+func updateTaskParams(record taskpkg.Task) sqlcgen.UpdateTaskParams {
+	params := sqlcgen.UpdateTaskParams{
+		GrantCeiling:         record.GrantCeiling,
+		Identifier:           nullableTaskString(record.Identifier),
+		Scope:                string(record.Scope),
+		WorkspaceID:          nullableTaskString(record.WorkspaceID),
+		ParentTaskID:         nullableTaskString(record.ParentTaskID),
+		Title:                record.Title,
+		Description:          nullableTaskString(record.Description),
+		Priority:             string(record.Priority),
+		MaxAttempts:          int64(record.MaxAttempts),
+		AutoEnqueueOnReady:   boolInt64(record.AutoEnqueueOnReady),
+		ApprovalPolicy:       string(record.ApprovalPolicy),
+		ApprovalState:        string(record.ApprovalState),
+		OwnerKind:            nullableTaskOwnerKind(record.Owner),
+		OwnerRef:             nullableTaskOwnerRef(record.Owner),
+		CreatedByKind:        string(record.CreatedBy.Kind),
+		CreatedByRef:         record.CreatedBy.Ref,
+		OriginKind:           string(record.Origin.Kind),
+		OriginRef:            record.Origin.Ref,
+		CreatedAt:            store.FormatTimestamp(record.CreatedAt),
+		UpdatedAt:            store.FormatTimestamp(record.UpdatedAt),
+		ClosedAt:             nullableTaskTime(record.ClosedAt),
+		Paused:               boolInt64(record.Paused),
+		PausedBy:             record.PausedBy,
+		PausedAt:             nullableTaskTime(record.PausedAt),
+		PausedReason:         record.PausedReason,
+		NeedsAttentionReason: nullableTaskString(taskNeedsAttentionReason(record.NeedsAttention)),
+		NeedsAttentionAt:     nullableTaskTime(taskNeedsAttentionAt(record.NeedsAttention)),
+		NeedsAttentionByKind: nullableTaskActorKind(taskNeedsAttentionActor(record.NeedsAttention)),
+		NeedsAttentionByRef:  nullableTaskActorRef(taskNeedsAttentionActor(record.NeedsAttention)),
+		WakeCreator:          boolInt64(record.WakeCreator),
+		MetadataJson:         nullableTaskRawJSON(record.Metadata),
+		ID:                   record.ID,
+	}
+	return params
+}
+
+func taskRunParams(run taskpkg.Run) sqlcgen.InsertTaskRunParams {
+	lineage := taskRunReviewLineage(run)
+	return sqlcgen.InsertTaskRunParams{
+		ID:             run.ID,
+		TaskID:         nullableTaskString(run.TaskID),
+		WorkspaceID:    nullableTaskString(run.WorkspaceID),
+		WorktreeID:     nullableTaskString(run.WorktreeIDValue()),
+		RunKind:        run.RunKind.String(),
+		LoopRunID:      nullableTaskString(run.LoopRunID),
+		Status:         run.Status.String(),
+		Attempt:        int64(run.Attempt),
+		RecoveryCount:  int64(run.RecoveryCount),
+		PreviousRunID:  nullableTaskString(run.PreviousRunID),
+		FailureKind:    strings.TrimSpace(run.FailureKind),
+		ClaimedByKind:  nullableTaskActorKind(run.ClaimedBy),
+		ClaimedByRef:   nullableTaskActorRef(run.ClaimedBy),
+		SessionID:      nullableTaskString(run.SessionID),
+		OriginKind:     string(run.Origin.Kind),
+		OriginRef:      run.Origin.Ref,
+		IdempotencyKey: nullableTaskString(run.IdempotencyKey),
+
+		DesignationGroupID:   strings.TrimSpace(run.DesignationGroupID),
+		ResolvedWorktreeMode: string(run.ResolvedWorktreeModeValue()),
+		ResolvedWorktreeRef:  strings.TrimSpace(run.ResolvedWorktreeRefValue()),
+		ClaimTokenHash:       nullableTaskString(run.ClaimTokenHash),
+		LeaseUntil:           nullableTaskTime(run.LeaseUntil),
+		HeartbeatAt:          nullableTaskTime(run.HeartbeatAt),
+		QueuedAt:             store.FormatTimestamp(run.QueuedAt),
+		ClaimedAt:            nullableTaskTime(run.ClaimedAt),
+		StartedAt:            nullableTaskTime(run.StartedAt),
+		EndedAt:              nullableTaskTime(run.EndedAt),
+		TokensUsed:           run.TokensUsed,
+		Error:                nullableTaskString(run.Error),
+		MetadataJson:         nullableTaskRawJSON(run.Metadata),
+		ResultJson:           nullableTaskRawJSON(run.ResultValue()),
+		ReviewRequired:       lineage.Required,
+		ReviewRequestRound:   int64(lineage.RequestRound),
+		ReviewPolicySnapshot: string(lineage.PolicySnapshot),
+		ReviewRequestID:      nullableTaskString(lineage.RequestID),
+		ParentRunID:          nullableTaskString(lineage.ParentRunID),
+		ReviewID:             nullableTaskString(lineage.ReviewID),
+		ReviewRound:          int64(lineage.ReviewRound),
+		ContinuationReason:   lineage.ContinuationReason,
+		MissingWorkJson:      string(lineage.MissingWork),
+		NextRoundGuidance:    lineage.NextRoundGuidance,
+	}
+}
+
+func nullableTaskString(value string) sql.NullString {
+	value = strings.TrimSpace(value)
+	return sql.NullString{String: value, Valid: value != ""}
+}
+
+func nullableTaskTime(value time.Time) sql.NullString {
+	if value.IsZero() {
+		return sql.NullString{}
+	}
+	return sql.NullString{String: store.FormatTimestamp(value), Valid: true}
+}
+
+func nullableTaskRawJSON(value json.RawMessage) sql.NullString {
+	if len(value) == 0 {
+		return sql.NullString{}
+	}
+	return sql.NullString{String: string(value), Valid: true}
+}
+
+func nullableTaskOwnerKind(owner *taskpkg.Ownership) sql.NullString {
+	if owner == nil {
+		return sql.NullString{}
+	}
+	return nullableTaskString(string(owner.Kind))
+}
+
+func nullableTaskOwnerRef(owner *taskpkg.Ownership) sql.NullString {
+	if owner == nil {
+		return sql.NullString{}
+	}
+	return nullableTaskString(owner.Ref)
+}
+
+func nullableTaskActorKind(actor *taskpkg.ActorIdentity) sql.NullString {
+	if actor == nil {
+		return sql.NullString{}
+	}
+	return nullableTaskString(string(actor.Kind))
+}
+
+func nullableTaskActorRef(actor *taskpkg.ActorIdentity) sql.NullString {
+	if actor == nil {
+		return sql.NullString{}
+	}
+	return nullableTaskString(actor.Ref)
+}
+
+func boolInt64(value bool) int64 {
+	if value {
+		return 1
+	}
+	return 0
+}

@@ -1,0 +1,90 @@
+---
+title: Workspaces
+description: How CompozyOS resolves workspace roots, layers config overlays, and attaches additional roots for monorepos and cross-project agent sharing.
+---
+
+A workspace is a registered project root. CompozyOS uses it as the source of truth for workspace-scoped
+agents, skills, and config overlays. Sessions inherit the workspace context, and resolution
+is deterministic — the registered root wins over global defaults.
+
+Use this section when the same machine runs more than one project, when an agent needs project-local
+instructions, or when a monorepo needs extra directories attached without copying files into the
+primary root. The important rule is that CompozyOS treats the registered workspace as an identity, not just
+as the current shell directory. That identity is what sessions, overlays, and additional
+roots attach to.
+
+That identity is also a boundary. An agent session works inside the workspace it started in, and
+asking for another one is a decision the runtime makes from the session's permission mode — not a
+setting of its own. You are not bound by it: your own commands, reads, and deep links still reach
+every registered workspace. See
+[Isolation and cross-workspace access](/docs/workspaces/resolver#isolation-and-cross-workspace-access).
+
+<OperatorNote>
+  Start with the resolver page when CompozyOS opens the wrong project or misses workspace-local
+  resources. Move to overlays when the workspace needs its own providers or MCP servers. Use
+  multi-root only when the workspace genuinely spans multiple directories; it is not a replacement
+  for registering the correct root.
+</OperatorNote>
+
+## Archive or remove a project
+
+Archive a project when you want it out of navigation without losing its state. Use the project's
+context menu in the picker, or **Settings → General → Projects**. The **Archived** section in Settings
+lets you unarchive it. Archiving preserves its ID, stopped session history, desktops and layouts,
+worktrees, configuration and files. Archived projects are excluded from the picker, project cycling,
+sidebar and default All projects aggregates. Explicit history reads remain available.
+
+```bash
+compozy workspace archive my-project
+compozy workspace list --archived
+compozy workspace unarchive my-project
+```
+
+Archiving returns `workspace_busy` with a `blockers` list while there are non-stopped sessions,
+nonterminal Loops (including paused or waiting Loops), or enabled automations owned by or targeting
+that project. Stop the listed sessions and Loops and disable the automations before retrying.
+New sessions, resumed sessions, live Loop runs and enabled automations in an archived project are
+refused; unarchive it first. Unarchive has no preconditions. If the folder is unavailable, the picker and Settings keep the project visible with “Folder not found”. You can select it to read history, Archive it, or Remove it. New sessions are refused with `workspace_root_missing` until the folder returns. Restoring the folder clears the note without changing its ID or history. Only explicit removal deletes retained data.
+
+HTTP and UDS expose `POST /api/workspaces/{id}/archive`, `POST /api/workspaces/{id}/unarchive`, and
+`GET /api/workspaces?archived=true` (archived projects only). Native tools are
+`compozy__workspace_archive`, `compozy__workspace_unarchive`, and
+`compozy__workspace_list` with `archived: true`.
+
+**Remove project** deletes registration and stopped session history and clears window bindings.
+Adding the same folder again creates a new ID. Files on disk are untouched. The confirmation offers
+**Archive instead** when the project is active. Removing remains subject to the existing active-session
+refusal. The archive database migration adds a nullable timestamp and preserves existing registrations.
+
+## In this section
+
+<RouteList>
+  <RouteRow
+    href="/docs/workspaces/resolver"
+    label="Resolver"
+    title="Workspace resolver"
+    description="Use this page for how CompozyOS registers workspace roots and resolves an active workspace at session start."
+    meta="Resolution"
+  />
+  <RouteRow
+    href="/docs/workspaces/config-overlays"
+    label="Overlays"
+    title="Workspace config overlays"
+    description="Use this page for how `<workspace>/.compozy/config.toml` and `mcp.json` layer over global config."
+    meta="Layering"
+  />
+  <RouteRow
+    href="/docs/workspaces/multi-root"
+    label="Multi-root"
+    title="Multi-root workspaces"
+    description="Use this page when one session must see additional directories for monorepos or shared agent libraries."
+    meta="Topology"
+  />
+  <RouteRow
+    href="/docs/worktrees"
+    label="Worktrees"
+    title="Nested Git checkouts"
+    description="Run sessions, Tasks, and Loops in linked checkouts owned by this workspace."
+    meta="Execution"
+  />
+</RouteList>

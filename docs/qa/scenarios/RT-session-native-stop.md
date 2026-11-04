@@ -1,0 +1,275 @@
+---
+id: RT-session-native-stop
+area: RT
+title: Stop another session through the governed native tool
+persona: Ada
+journey: J-15
+expected: compozy__session_stop stops one live same-workspace target through the canonical session stop path, returns the terminal winner once, applies destructive approval policy, denies self or foreign-workspace targets, and leaves repeated or raced callers with deterministic structured outcomes.
+entry_points: compozy__session_stop; compozy session stop; POST /api/workspaces/{workspace_id}/sessions/{session_id}/stop over HTTP and UDS; compozy session status <session-id>
+qa_status: untested
+bug_ids: BUG-20260906-stop-receipt-outcome-race
+fix_status:
+retest_status:
+fix_commits:
+evidence: docs/qa/reports/2026-08-16-herdr-parity.md; /Users/pedronauck/dev/qa-labs/compozy-northstar-pay-20260816-141901-835450-lab/qa-artifacts/qa/bootstrap-manifest.json;docs/qa/reports/2026-09-05-sessions-stability-task01-02.md;/Users/pedronauck/dev/qa-labs/compozy-sessions-stability-task01-02-20260905-154017-502928-lab/qa-artifacts/qa/evidence/walkA2-stop-wait.json;/Users/pedronauck/dev/qa-labs/compozy-sessions-stability-task01-02-20260905-154017-502928-lab/qa-artifacts/qa/evidence/walkA2-events.json;/Users/pedronauck/dev/qa-labs/compozy-sessions-stability-task01-02-20260905-154017-502928-lab/qa-artifacts/qa/evidence/walkE-status-after-restart.json;/Users/pedronauck/dev/qa-labs/compozy-sessions-stability-task01-02-20260905-154017-502928-lab/qa-artifacts/qa/evidence/screenshots/f2-02-stopping-4s.png;/Users/pedronauck/dev/qa-labs/compozy-sessions-stability-task01-02-20260905-154017-502928-lab/qa-artifacts/qa/evidence/screenshots/f2-03-stopped-confirmed.png
+last_report: docs/qa/reports/2026-10-02-untested.md
+overlaps: RT-session-wait-state; RT-session-prompt-cancel
+---
+
+Start two managed sessions in one workspace and one in a neighboring workspace. From Ada's session,
+stop the live sibling, race a second stop over another public surface, then compare fresh status and
+the terminal event over CLI, HTTP, and UDS. Confirm destructive approval policy, target ownership,
+self-action denial, cross-workspace denial, and that prompt cancellation remains the non-terminal
+choice when only the current turn should end.
+
+QA impact 2026-08-16: Task 04 added `compozy__session_stop` as one of the seven Herdr parity native
+tools. The earlier QA flags covered the other six tools but no scenario owned native stop, so this
+content-addressed row closes that journey-derived gap for Task 08.
+
+QA 2026-08-16 Herdr parity: The full runtime E2E exercised the public HTTP, UDS, CLI, and native-tool paths, including matching persisted projections, restart recovery, scoped denials, bounded wait/notify/cancel/stop races, and stable negative outcomes (65/66/69/75/78, agent_scope_denied, and queue-full).
+
+QA impact 2026-09-05 sessions-stability: verify explicit wait:false accepts without waiting and
+wait:true returns verified/escalated/phase/cause/elapsed truth across native, CLI, HTTP and UDS.
+An exhausted unverified kill must return stopping + stop_verification_failed, never stopped.
+Confirm a repeated completed stop does not restart a ladder, self/foreign targets remain denied,
+and the default CLI session resource retains its established fields. Exercise the v0.4 compatibility
+requests without wait (HTTP204/native legacy shape plus warning). Final real walk remains pending.
+
+Stop a session, delete its history, then repeat the stop request twice. Both requests must report
+the missing session instead of replaying the old successful stop. A failed deletion that retains
+history must retain the existing stop outcome; pending waiters still receive their original result.
+
+Reconnect after an exhausted stop and confirm the session resource, attention list/summary and
+catalog stream retain needs-attention + stop_verification_failed. Compare compact status
+lifecycle_state/verified/escalated/attention across HTTP, UDS and CLI formats. Retry from Web:
+duplicate activation stays guarded, request failure remains retryable, a second failed ladder
+restores the action, and verified death clears attention without losing the draft or scroll position.
+
+Stop while a launcher ignores cancellation and has not returned a process handle. After the
+configured cooperative grace plus the forced/kill budgets, require a settled unverified stop
+result and durable stop-verification attention, with no stopped notification. Release the
+launcher later and verify that its returned process is terminated through the shared ladder,
+or that a canceled launch with no process completes normally; retry stop remains available.
+
+After verified stop, deliver delayed message chunks and process errors from the old turn. Confirm
+that they neither appear as agent output nor change the stopped reason/attention, and that the
+transcript records a post-stop discard marker. Include the finalization overlap and reconnect replay
+in the final runtime walk; focused manager tests alone do not verify that concurrent journey.
+With the Web transcript already open on that session, the discard marker must appear in place
+without navigating, remounting, reconnecting the stream, or polling: the catalog wake re-reads the
+session detail and re-reads the transcript only once that read is no longer live, so a wake that
+lands while the page still shows active/stopping never fakes a stopped state. Another open session
+in the same or another workspace must not re-read its transcript.
+
+Restart with an unresolved stop, reconnect, and retry the catalog-only session. Verify the persisted attention and metadata survive another unverified attempt. A missing or reused PID must not trigger process-group signals. Exercise verified orphan recovery and concurrent retry/resume before accepting the journey.
+
+For recovered local stops, exercise a temporary terminal metadata/catalog failure after process
+exit. Retry the same session after restoring persistence: confirm the original cause/phase remain,
+no additional escalation occurs, one terminal event/notification is delivered, and resume cannot
+bypass pending terminal persistence. Clear, delete and workspace removal must also refuse pending settlement;
+for a recovered unverified process, both preserve its history until exit is proven. Keep this distinct from a ledger cleanup error after a
+completed terminal write, whose original diagnostic remains available through AwaitStopped.
+
+For an active session, reject the catalog write of the stop classification after verified exit.
+The session must remain `stopping`, with no terminal event or stopped notification. Restore the
+catalog and retry: preserve the original termination phase, emit the terminal result once, and
+do not repeat process signals or `session.post_stop` hooks. Existing waiters must still await
+the hook even when classification persistence fails. The full finalization/restart walk must
+also cover failures after classification, in terminal-event and final-state persistence.
+
+After terminal-event persistence, reject the final stopped-state metadata write and catalog
+update separately. Require `stopping`, no stopped notification, and refusal of resume/delete
+while persistence is pending. Restore storage and retry: preserve the original verified phase,
+commit stopped metadata/catalog, and observe one terminal event, one cleanup and one notification.
+
+Reject terminal-event writes through both the prompt recorder and the stored-session writer.
+Retry after restoring storage and confirm one terminal event and notification. Repeat with a
+write that commits but loses its acknowledgment: the retry must reuse the same event identity.
+If only the prompt recorder fails, the stored-session writer may complete the durable event;
+the final stop remains verified and retains the original recorder diagnostic.
+
+Restart an active-session stop after its terminal recovery receipt is durable, covering an
+unwritten terminal event, a committed event with lost acknowledgment, and a failed final catalog
+write. Boot must retain the original cause, phase and elapsed time and leave exactly one terminal
+row. Refusing the receipt write must prevent terminal publication; restoring storage permits retry.
+Verify that successful settlement removes the receipt. A crash before this receipt is written
+uses interrupted-stop classification and fresh process-identity verification; it need not retain
+an outcome that had not yet been journaled. Include that branch in the final boot journey.
+
+Restart the daemon after a recovered process exits but terminal metadata/catalog persistence
+fails. Boot must recover the original verified outcome and complete the terminal event before
+admitting new work; a direct resume against a fresh manager must respect the same pending fence.
+Repeat boot after successful settlement and confirm no extra terminal event or notification.
+Malformed, incompatible or wrong-owner settlement receipts must remain intact and block recovery.
+
+During boot, an orphan with matching PID/start identity must use the same stop ladder as an
+operator request, retaining agent_crashed attribution and canonical escalation/terminal events.
+There is no second daemon-owned TERM/KILL attempt after the manager settles or exhausts a stop.
+An unverified process keeps stopping/attention and permits boot only after its diagnostic
+is durable; failure to persist recovered metadata, catalog state or stop events aborts recovery.
+
+Exercise delayed pre-record and post-record hooks during stop for both individual messages and
+chunk batches. Release the hook after stop settles: a closed recorder must not produce a new
+prompt transport failure, and delayed output must not reach attach/notifier consumers. Output
+committed before stop remains in history before the terminal event; the discarded delivery gets
+a post-stop marker. Also verify ordinary active-session persistence failures still surface.
+
+Inject a ledger cleanup timeout after verified exit. Confirm stopped metadata and notification settle, then inspect the redacted runtime_warning for the failed step. The ledger error remains available from the stop result. Diagnostic persistence failure must be returned; no cleanup error may turn the session active again.
+
+Repeat boot recovery with a process that died before inventory, while metadata still says active
+or stopping. Verify recorded PID/start exit proof, one new terminal event/notification, crash
+attribution and no new escalation. Restart between writing the verified settlement receipt and
+updating metadata; the still-active metadata must not bypass receipt recovery. A second completed
+boot must not repeat settlement. Missing process identity is a separate unverified case.
+
+Recover active, stopping and starting metadata with no liveness object, empty identity, or PID
+without start time. Each must retain stopping and verification-failed attention without signaling
+an unproven process or discarding history. Separately, after verified crash recovery, resume must
+first attempt the saved ACP session ID and use the existing missing-session fallback only when
+the provider rejects loading it. A verified incomplete start still gets a fresh ACP session.
+
+For an interrupted start whose process is verifiably gone, require failed/startup attribution,
+a cleared incomplete ACP ID and exactly one new terminal event/notification. Repeat with a
+restart after receipt persistence but before starting metadata is updated. Neither path may
+skip cleanup or start another termination ladder; repeated completed boot remains idempotent.
+
+Repeat interrupted-start recovery with a matching live process. Persist the intermediate
+stopping inventory, restart again, and verify failed/startup attribution survives while the
+shared ladder terminates and verifies the process. Clear the incomplete ACP ID only after exit;
+retain any provider-auth diagnostic without relabeling it as a generic process error. Repeat
+completed recovery and confirm no additional event, notification or escalation.
+
+With a known process handle and an unfinished exit observer, repeat Stop after a failed attempt.
+Concurrent callers must share one new bounded attempt, rather than reuse the exhausted attempt
+forever or run parallel termination sequences. Completed outcomes and failures without a pending
+process retain their existing result.
+
+Supervision branch (introduced by sessions-stability task_05 on 2026-09-06; narrowed to in-flight
+turns by #782 on 2026-10-17): configure short `quiet_after`/`stop_grace` intervals in the isolated
+lab. Hold a turn in flight that stops producing work (for example a provider that hangs inside a
+prompt). Exercise fresh progress, verified tool, active child, recent Loop reconciliation, task
+lease, and scheduled wait independently; each must suppress the warning. Provider waiting and an
+open subscriber must not. Observe one quiet warning: no window banner, and the working status line
+under the transcript reads `Working for … · quiet for …`, also for a turn that hangs before its
+first token (it must not stay on `Thinking`); CLI/HTTP/UDS/resource/native describe
+fields match. Then observe the verified inactivity stop (`session.supervision_stopped`,
+`stop_reason: "timeout"`, `stop_detail: "inactivity"`). Resume real work during grace and confirm
+warning cancellation; end the turn during grace and confirm the warning clears and no stop follows.
+A turn blocked on a pending permission or clarify request must not accrue silence. Let a session
+finish its turn and sit idle past `quiet_after + stop_grace`: no quiet warning, no stop, the badge
+stays `idle`. Check zero quiet, zero grace, source-error unknown/attention, stale-source attention,
+and warning append retry without duplication. Existing waits without expiry must use their
+original creation time for admission-horizon expiry.
+
+Idle-release branch (#782): set `session.supervision.idle_release_after` to a short value (for
+example `2m`) with `compozy config set` in the isolated lab and use an agent that advertises ACP
+`session/load` (`runtime.acp_caps.supports_load_session: true`). Let a session finish its turn and
+sit idle past the release period. Confirm `compozy session status <id> -o json` reports
+`state: "active"`, `runtime.status: "unbound"`, the same ACP session ID, and the `idle` badge; the
+agent subprocess is gone; the session window shows no banner and no Stopped presentation; the event
+log has no `session.supervision_warning`, `session.supervision_stopped`, or `session_stopped`; no
+`session.post_stop` hook ran while the `agent.stopped` hook did. Send the next prompt from the
+composer and again (after another release) from `compozy session prompt`: each continues the same
+conversation without a Resume step, and the agent recalls an earlier fact from the transcript. A
+session with a pending permission/clarify request or a work signal is not released. Repeat with an
+agent that does not advertise `session/load`: its runtime is never released. With a runtime
+released, kill the daemon uncleanly and restart: the session is `stopped` with
+`stop_reason: "shutdown"` and detail `daemon exited while the idle session runtime was released`,
+and the next prompt resumes it. Setting `idle_release_after = "0"` disables the release.
+Stop a session while its release is still stopping the agent: the stop completes only after the
+released subprocess exits. If the release cannot stop the subprocess, the next prompt fails rather
+than loading the ACP session into a second process while the old one runs. A daemon killed before a
+release verified the subprocess exit keeps that subprocess identity in `meta.json`; on restart the
+session reads `shutdown` only if the recorded subprocess is gone, otherwise it stays under stop
+verification.
+
+QA impact 2026-10-17 (#787 follow-up): the quiet span now also covers a turn hung before its first
+token, and the idle-release branch gained the stop-during-release, failed-release, and
+interrupted-release steps above. Both branches need the re-walk already pending.
+
+QA 2026-09-06 — sessions-stability selected scope: PASS for the selected local native/supervision branch: governed same-workspace Stop returned verified=true with forced escalation, replay returned already-stopped, self/foreign-workspace requests were denied, and quiet warning/progress cancellation/inactivity terminal facts agreed. Unverifiable-death constraints remain the previously documented external branch; exhaustive owning integration evidence is reused. Evidence: docs/qa/reports/2026-09-06-sessions-stability.md.
+
+QA re-walk 2026-09-06: Stop settlement preserves the same cause, phase, escalation and elapsed time through acknowledgement-write failure and manager restart. One-core canonical recovery, full session race and actual subprocess stop/crash/resume checks pass. Previously documented external branches retain their limits. See BUG-20260906-stop-receipt-outcome-race and the integrated report.
+
+
+2026-09-27 scope update: current coverage follows the surviving product surfaces; a fresh walk is required.
+
+2026-10-05: Deferred from this QA cycle by the user's explicit scope reduction.
+Coverage remains outstanding; this skip is not a passing result. Resume from the dated
+report's session matrix in a future QA cycle.
+
+QA impact 2026-10-17 (#782): silence supervision is now a hung-turn watchdog and idle sessions
+release their runtime silently instead of being warned and stopped. The supervision branch above
+was rewritten and the idle-release branch added; both need a re-walk against a real daemon. Stale
+verdict reset to untested; historical evidence preserved.
+
+QA walk 2026-10-17 (#782, idle-release branch, CLI/HTTP only): PASS for the walked steps. An isolated
+lab daemon built from the branch ran the real `claude` provider (`claude-agent-acp`, which advertises
+`session/load`) with `idle_release_after = "1m"`. After the first turn the session stayed `active`
+with `runtime.status: "ready"`. About a minute later it read `active`/`unbound` with the same badge
+and no quiet warning, the agent subprocess had exited, the daemon logged
+`session.runtime.idle_released`, and the 28 recorded events had no supervision or stop event. The
+next `compozy session prompt` rebound the runtime under the same ACP session ID and the agent
+recalled a code word from the first turn. After a second release the daemon was killed with
+`kill -9` and restarted: the session read `stopped`, `stop_reason: "shutdown"`, with the
+released-runtime detail and no failure. The next prompt resumed it and the agent still recalled the
+code word. Lab teardown was clean.
+
+Not walked: the composer/Web steps, the hook checks, the agent without `session/load`, and the
+pending-interaction guard. The supervision branch was also not walked. These are covered only by the
+owning `internal/session` suites (`TestSupervisionReleasesIdleRuntime`,
+`TestSupervisionIgnoresSessionWaitingForOperator`) and the daemon integration test
+`TestReplyWatchLongWaitIntegration`, so `qa_status` stays `untested` until a full re-walk.
+
+QA impact 2026-10-18: delay escalation-history persistence beyond the initial one-second
+observation wait while keeping it within the existing termination phase. The process must still
+receive its stop signal promptly, the durable escalation receipt must settle before Stop returns,
+and a repeated stop or subsequent deletion must preserve the same terminal winner. An actual
+write failure or phase deadline remains an error; blocked persistence must not block termination.
+The canonical shared-stop suite uses deterministic time, with the existing real ACP subprocess
+and SQLite integration journeys retaining process-exit, recovery, and stop-reason coverage.
+
+QA impact 2026-10-18, WAL maintenance: hold a database family guard when idle checkpointing
+starts, then stop the session. Background maintenance must yield within its existing maintenance
+budget so the foreground stop receipt can persist through the already-open writer. After the
+guard leaves, maintenance retries normally. Real write and drain failures remain visible, and
+Stop/Delete retain their current deadlines. The canonical passive-checkpoint regression owns
+this I/O ordering; the Windows lifecycle job verifies the reported platform path.
+
+QA 2026-10-19 (#834), focused storage recovery: PASS in the existing manager integration suite
+with a real ACP subprocess and temporary SQLite state. Reproduce a checkpoint paused after main
+page one with committed schema pages still in WAL. Restore stopped-process metadata to `stopping`
+and independently exercise stop, boot recovery, and removal. Stop/boot reach `stopped` and retain
+all previous event IDs; removal succeeds only after settlement. Command:
+`CGO_ENABLED=1 go test -race -tags=integration ./internal/session -run '^TestManagerIntegrationFullStopResumeStopPersistsStopReasons$' -count=1 -timeout=120s`.
+
+For unavailable event storage, the shared-stop contract suite separately verifies a proven exit
+is reported as `stopped`/`error` with a storage summary while its durable history receipt remains
+pending. Restore storage and exercise stop, resume, deletion, and manager restart: each settles the
+same terminal event once. Include ENOSPC in the temporary snapshot filesystem. Confirm retry and
+restart restore the original user-cancel or agent-crash classification, and resume does not initiate
+another parent-stop cascade. Metadata/catalog failures and unverified exits retain their existing
+recovery obligations. These focused runs do not claim a fresh Web, CLI/HTTP/UDS, or real-provider
+persona walk; the broader scenario status above remains unchanged. No live user data was accessed.
+
+QA impact and focused verification 2026-10-23 (harness dogfood): idle release and runtime
+replacement grant the driver its complete bounded stop/drain budget. A stop lasting beyond the
+generic five-second lifecycle cleanup period must finish normally when still inside that driver
+budget. Retain process identity until exit verification, preserve actual stop failures, and load
+the same ACP session on the next prompt. The process-stopped hook has a separate bounded context.
+Existing idle-release regressions, the real ACP subprocess suite and the daemon late-reply
+integration pass. This is not a fresh live-Codex timing or browser walk; see
+[focused verification](../reports/2026-10-23-harness-dogfood.md).
+
+QA impact 2026-11-03 (#1243): an agent subprocess that dies from the same signal that stops the
+daemon (OS logout or shutdown, desktop app quit) is a daemon-stop interruption, not a crash. Start a
+long turn, then send the daemon SIGTERM together with its agent (for example by ending the desktop
+app scope or killing the process group). After restart the session reads `stopped` with
+`stop_reason: "user_canceled"` and detail `daemon stopped by user`, the same as when the daemon
+stops it first; a daemon restart reads `stop_reason: "shutdown"`. There is no `process_exit`
+failure, crash bundle, `agent.crashed` hook, automatic runtime recovery, or `reason: failed` wake to
+a spawn creator, and the session resumes normally. An agent that dies while the daemon keeps running
+is still `agent_crashed` with a process failure and crash bundle. Focused verification:
+`TestAgentExitClassification` and the daemon-shutdown branch of
+`TestPromptFatalProcessFailureStopsSessionAndPreservesReadOnlyHistory` in `internal/session`.
+A live logout/shutdown walk on Linux has not been repeated.

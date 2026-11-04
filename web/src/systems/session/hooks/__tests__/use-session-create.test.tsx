@@ -1,0 +1,559 @@
+// Suite: session-create workspace binding
+// Invariant: opening a session uses the daemon runtime workspace, including the hidden home row
+// while Global scope is active, seeds the environment from a resolved worktree selection, and keeps
+// any composer prompt outside the launch draft.
+// Owning layer: the session-create hook that translates shell scope into store commands.
+import { act, renderHook, waitFor } from "@testing-library/react";
+import type { ReactNode } from "react";
+import { beforeEach, describe, expect, it, vi } from "vitest";
+
+import {
+  buildTerminalQuote,
+  holdPendingTerminalQuote,
+  peekPendingTerminalQuote,
+  takePendingTerminalQuote,
+} from "@/systems/terminal/parts";
+
+import { SessionCreateProvider } from "../../contexts/session-create-context";
+import { createSessionCreateStore } from "../../stores/session-create-store";
+import { sessionStore } from "../../stores/session-store";
+import { useSessionCreateActions, useSessionCreateHasActiveWorkspace } from "../use-session-create";
+import { useSessionPromptFallback } from "../use-session-prompt-fallback";
+
+const workspace = vi.hoisted(() => ({
+  runtimeWorkspaceId: "ws_home" as string | null,
+  runtimeWorkspace: { default_agent: "general" } as { default_agent?: string } | undefined,
+  registeredWorkspaces: [
+    { id: "ws_home", default_agent: "general" },
+    { id: "ws_other", default_agent: "operator" },
+  ],
+  scope: "global" as "global" | "workspace",
+  dataScope: { kind: "all" } as { kind: "all" } | null,
+}));
+const agents = vi.hoisted(() => ({
+  data: [{ name: "general" }] as Array<{ name: string }>,
+  isSuccess: true,
+}));
+const createSessionAsync = vi.hoisted(() => vi.fn());
+const notifyUser = vi.hoisted(() => vi.fn());
+const scopedWorktree = vi.hoisted(() => ({
+  id: undefined as string | undefined,
+  resolved: true,
+}));
+const toastError = vi.hoisted(() => vi.fn());
+const setActiveWorkspaceId = vi.hoisted(() => vi.fn());
+
+vi.mock("@/systems/workspace/hooks/use-active-workspace", () => ({
+  useActiveWorkspace: () => ({ activeWorkspaceId: null, ...workspace, setActiveWorkspaceId }),
+}));
+
+vi.mock("@/systems/workspace/hooks/use-active-worktree", async importOriginal => ({
+  ...(await importOriginal<object>()),
+  useScopedWorktreeFilter: () => ({
+    worktreeId: scopedWorktree.id,
+    resolved: scopedWorktree.resolved,
+  }),
+}));
+
+vi.mock("sonner", () => ({ toast: { error: toastError } }));
+vi.mock("@/systems/agent", () => ({ useAgents: () => agents }));
+vi.mock("@/lib/user-feedback", () => ({ notifyUser }));
+vi.mock("../use-session-actions", () => ({
+  useCreateSession: () => ({ mutateAsync: createSessionAsync }),
+}));
+
+describe("session create workspace binding", () => {
+  beforeEach(() => {
+    workspace.runtimeWorkspaceId = "ws_home";
+    workspace.runtimeWorkspace = { default_agent: "general" };
+    workspace.registeredWorkspaces = [
+      { id: "ws_home", default_agent: "general" },
+      { id: "ws_other", default_agent: "operator" },
+    ];
+    workspace.scope = "global";
+    workspace.dataScope = { kind: "all" };
+    agents.data = [{ name: "general" }];
+    agents.isSuccess = true;
+    scopedWorktree.id = undefined;
+    scopedWorktree.resolved = true;
+    toastError.mockReset();
+    setActiveWorkspaceId.mockReset();
+    createSessionAsync.mockReset();
+    notifyUser.mockReset();
+    takePendingTerminalQuote();
+  });
+
+  it("Should open against the hidden home workspace while Global scope is active", () => {
+    workspace.runtimeWorkspace = { default_agent: "operator" };
+    const store = createSessionCreateStore();
+    const wrapper = ({ children }: { children: ReactNode }) => (
+      <SessionCreateProvider store={store}>{children}</SessionCreateProvider>
+    );
+    const actions = renderHook(() => useSessionCreateActions(), { wrapper });
+    const availability = renderHook(() => useSessionCreateHasActiveWorkspace());
+
+    act(() => actions.result.current.openForAgent("general"));
+
+    expect(availability.result.current).toBe(true);
+    expect(store.getSnapshot().context).toMatchObject({
+      open: true,
+      draft: { agentName: "general", workspaceId: "ws_home" },
+    });
+    expect(toastError).not.toHaveBeenCalled();
+  });
+
+  it("Should keep the existing fallback when no workspace default is configured", () => {
+    workspace.runtimeWorkspace = { default_agent: "" };
+    const store = createSessionCreateStore();
+    const wrapper = ({ children }: { children: ReactNode }) => (
+      <SessionCreateProvider store={store}>{children}</SessionCreateProvider>
+    );
+    const actions = renderHook(() => useSessionCreateActions(), { wrapper });
+
+    act(() => actions.result.current.openWithPrompt("Inspect the repository"));
+
+    expect(store.getSnapshot().context.draft.agentName).toBe("general");
+  });
+
+  it("Should preselect the active workspace default for an unspecified Start session", () => {
+    workspace.runtimeWorkspace = { default_agent: "operator" };
+    const store = createSessionCreateStore();
+    const wrapper = ({ children }: { children: ReactNode }) => (
+      <SessionCreateProvider store={store}>{children}</SessionCreateProvider>
+    );
+    const actions = renderHook(() => useSessionCreateActions(), { wrapper });
+
+    act(() => actions.result.current.openWithPrompt("Investigate the failure"));
+
+    expect(store.getSnapshot().context).toMatchObject({
+      open: true,
+      draft: { agentName: "operator", workspaceId: "ws_home" },
+      pendingPrompt: "Investigate the failure",
+    });
+    expect(store.getSnapshot().context.draft).not.toHaveProperty("firstMessage");
+  });
+
+  it("Should preselect the workspace default from a generic New session action", () => {
+    workspace.runtimeWorkspace = { default_agent: "operator" };
+    const store = createSessionCreateStore();
+    const wrapper = ({ children }: { children: ReactNode }) => (
+      <SessionCreateProvider store={store}>{children}</SessionCreateProvider>
+    );
+    const actions = renderHook(() => useSessionCreateActions(), { wrapper });
+
+    act(() => actions.result.current.openForAgent(""));
+
+    expect(store.getSnapshot().context.draft).toMatchObject({
+      agentName: "operator",
+      workspaceId: "ws_home",
+    });
+  });
+
+  it("Should preselect the target workspace default for a worktree launch", () => {
+    const store = createSessionCreateStore();
+    const wrapper = ({ children }: { children: ReactNode }) => (
+      <SessionCreateProvider store={store}>{children}</SessionCreateProvider>
+    );
+    const actions = renderHook(() => useSessionCreateActions(), { wrapper });
+
+    act(() => actions.result.current.openForWorktree("ws_other", "wt_other"));
+
+    expect(store.getSnapshot().context).toMatchObject({
+      open: true,
+      draft: {
+        agentName: "operator",
+        workspaceId: "ws_other",
+        environment: { kind: "worktree", worktreeId: "wt_other" },
+      },
+    });
+    expect(setActiveWorkspaceId).toHaveBeenCalledExactlyOnceWith("ws_other");
+  });
+
+  it("Should switch from another workspace for a worktree launch, but preserve its own selection", () => {
+    workspace.scope = "workspace";
+    const store = createSessionCreateStore();
+    const wrapper = ({ children }: { children: ReactNode }) => (
+      <SessionCreateProvider store={store}>{children}</SessionCreateProvider>
+    );
+    const actions = renderHook(() => useSessionCreateActions(), { wrapper });
+
+    act(() => actions.result.current.openForWorktree("ws_other", "wt_other"));
+    expect(setActiveWorkspaceId).toHaveBeenCalledExactlyOnceWith("ws_other");
+
+    setActiveWorkspaceId.mockClear();
+    workspace.runtimeWorkspaceId = "ws_other";
+    actions.rerender();
+    act(() => actions.result.current.openForWorktree("ws_other", "wt_other"));
+    expect(setActiveWorkspaceId).not.toHaveBeenCalled();
+  });
+
+  it("Should seed the environment from the acting scope's ready worktree", () => {
+    workspace.runtimeWorkspaceId = "ws_git";
+    workspace.scope = "workspace";
+    scopedWorktree.id = "wt_payments_retry";
+    const store = createSessionCreateStore();
+    const wrapper = ({ children }: { children: ReactNode }) => (
+      <SessionCreateProvider store={store}>{children}</SessionCreateProvider>
+    );
+    const actions = renderHook(() => useSessionCreateActions(), { wrapper });
+
+    act(() => actions.result.current.openForAgent("general"));
+
+    expect(store.getSnapshot().context).toMatchObject({
+      open: true,
+      mode: "advanced",
+      draft: {
+        agentName: "general",
+        workspaceId: "ws_git",
+        environment: { kind: "worktree", worktreeId: "wt_payments_retry" },
+      },
+    });
+  });
+
+  it("Should open at the workspace root when the acting scope has no worktree", () => {
+    workspace.runtimeWorkspaceId = "ws_git";
+    workspace.scope = "workspace";
+    const store = createSessionCreateStore();
+    const wrapper = ({ children }: { children: ReactNode }) => (
+      <SessionCreateProvider store={store}>{children}</SessionCreateProvider>
+    );
+    const actions = renderHook(() => useSessionCreateActions(), { wrapper });
+
+    act(() => actions.result.current.openForAgent("general"));
+
+    expect(store.getSnapshot().context).toMatchObject({
+      open: true,
+      mode: "simple",
+      draft: { agentName: "general", workspaceId: "ws_git", environment: { kind: "root" } },
+    });
+  });
+
+  it("Should wait for a stored worktree selection before opening", () => {
+    workspace.runtimeWorkspaceId = "ws_git";
+    workspace.scope = "workspace";
+    scopedWorktree.resolved = false;
+    const store = createSessionCreateStore();
+    const wrapper = ({ children }: { children: ReactNode }) => (
+      <SessionCreateProvider store={store}>{children}</SessionCreateProvider>
+    );
+    const actions = renderHook(() => useSessionCreateActions(), { wrapper });
+
+    act(() => actions.result.current.openForAgent("general"));
+
+    expect(store.getSnapshot().context.open).toBe(false);
+    expect(toastError).toHaveBeenCalledWith("Worktrees are not available yet. Try again.");
+  });
+
+  it("Should reject opening only while the destination is unsettled", () => {
+    workspace.runtimeWorkspaceId = null;
+    workspace.dataScope = null;
+    const store = createSessionCreateStore();
+    const wrapper = ({ children }: { children: ReactNode }) => (
+      <SessionCreateProvider store={store}>{children}</SessionCreateProvider>
+    );
+    const actions = renderHook(() => useSessionCreateActions(), { wrapper });
+    const availability = renderHook(() => useSessionCreateHasActiveWorkspace());
+
+    act(() => actions.result.current.openForAgent("general"));
+
+    expect(availability.result.current).toBe(false);
+    expect(store.getSnapshot().context.open).toBe(false);
+    expect(toastError).toHaveBeenCalledWith(
+      "Select an active workspace before starting a session."
+    );
+  });
+
+  function renderFallback(store = createSessionCreateStore()) {
+    const wrapper = ({ children }: { children: ReactNode }) => (
+      <SessionCreateProvider store={store}>{children}</SessionCreateProvider>
+    );
+    return { store, wrapper };
+  }
+
+  it("Should send nothing before selection and queue the query only after session creation [UT-141]", async () => {
+    const { store, wrapper } = renderFallback();
+    const onCreated = vi.fn();
+    createSessionAsync.mockResolvedValue({
+      id: "session-fallback-141",
+      workspace_id: "ws_home",
+      agent_name: "general",
+    });
+    const fallback = renderHook(
+      () => useSessionPromptFallback({ onCreated, onPickerOpened: vi.fn() }),
+      { wrapper }
+    );
+
+    expect(createSessionAsync).not.toHaveBeenCalled();
+    expect(sessionStore.getSnapshot().context.firstPrompts["session-fallback-141"]).toBeUndefined();
+
+    await act(async () => fallback.result.current.run("Investigate flaky tests"));
+
+    expect(createSessionAsync).toHaveBeenCalledWith({
+      agent_name: "general",
+      workspace: "ws_home",
+    });
+    expect(sessionStore.getSnapshot().context.firstPrompts["session-fallback-141"]).toEqual({
+      text: "Investigate flaky tests",
+      claimed: false,
+    });
+    expect(onCreated).toHaveBeenCalledWith(expect.objectContaining({ id: "session-fallback-141" }));
+    expect(store.getSnapshot().context).toMatchObject({
+      open: false,
+      operation: { status: "idle" },
+    });
+  });
+
+  it("Should open the agent picker with the query when the default cannot resolve [UT-142]", async () => {
+    agents.data = [];
+    const store = createSessionCreateStore();
+    const onPickerOpened = vi.fn();
+    const { wrapper } = renderFallback(store);
+    const fallback = renderHook(
+      () => useSessionPromptFallback({ onCreated: vi.fn(), onPickerOpened }),
+      { wrapper }
+    );
+
+    await act(async () => fallback.result.current.run("Find the missing route"));
+
+    expect(createSessionAsync).not.toHaveBeenCalled();
+    expect(store.getSnapshot().context).toMatchObject({
+      open: true,
+      pendingPrompt: "Find the missing route",
+      draft: {
+        agentName: "general",
+        workspaceId: "ws_home",
+      },
+    });
+    expect(store.getSnapshot().context.draft).not.toHaveProperty("firstMessage");
+    expect(onPickerOpened).toHaveBeenCalledTimes(1);
+  });
+
+  it("Should open the agent picker while the agent list is still loading [RD0071]", async () => {
+    agents.isSuccess = false;
+    const store = createSessionCreateStore();
+    const onPickerOpened = vi.fn();
+    const { wrapper } = renderFallback(store);
+    const fallback = renderHook(
+      () => useSessionPromptFallback({ onCreated: vi.fn(), onPickerOpened }),
+      { wrapper }
+    );
+
+    await act(async () => fallback.result.current.run("Wait for agents"));
+
+    expect(createSessionAsync).not.toHaveBeenCalled();
+    expect(onPickerOpened).toHaveBeenCalledTimes(1);
+    expect(store.getSnapshot().context.open).toBe(true);
+  });
+
+  it("Should report a spawn failure and allow retrying the preserved query [UT-143]", async () => {
+    const { wrapper } = renderFallback();
+    createSessionAsync
+      .mockRejectedValueOnce(new Error("agent executable is unavailable"))
+      .mockResolvedValueOnce({
+        id: "session-fallback-retry",
+        workspace_id: "ws_home",
+        agent_name: "general",
+      });
+    const fallback = renderHook(
+      () => useSessionPromptFallback({ onCreated: vi.fn(), onPickerOpened: vi.fn() }),
+      { wrapper }
+    );
+
+    await act(async () => fallback.result.current.run("Repair the build"));
+    expect(notifyUser).toHaveBeenCalledWith({
+      message: "Could not ask the agent: agent executable is unavailable",
+      tone: "error",
+    });
+
+    await act(async () => fallback.result.current.run("Repair the build"));
+    expect(createSessionAsync).toHaveBeenNthCalledWith(2, {
+      agent_name: "general",
+      workspace: "ws_home",
+    });
+    expect(sessionStore.getSnapshot().context.firstPrompts["session-fallback-retry"]?.text).toBe(
+      "Repair the build"
+    );
+  });
+
+  it("Should guard concurrent Enter and allow a deliberate repeat after completion [UT-144]", async () => {
+    let resolveFirst: ((value: unknown) => void) | undefined;
+    createSessionAsync
+      .mockImplementationOnce(
+        () =>
+          new Promise(resolve => {
+            resolveFirst = resolve;
+          })
+      )
+      .mockResolvedValueOnce({
+        id: "session-fallback-second",
+        workspace_id: "ws_home",
+        agent_name: "general",
+      });
+    const { store, wrapper } = renderFallback();
+    const fallback = renderHook(
+      () => useSessionPromptFallback({ onCreated: vi.fn(), onPickerOpened: vi.fn() }),
+      { wrapper }
+    );
+
+    let first: Promise<unknown> | undefined;
+    act(() => {
+      first = fallback.result.current.run("Plan the release");
+      void fallback.result.current.run("Plan the release");
+    });
+    expect(createSessionAsync).toHaveBeenCalledTimes(1);
+    expect(store.getSnapshot().context.operation.status).toBe("submitting");
+    expect(fallback.result.current.pending).toBe(true);
+
+    await act(async () => {
+      resolveFirst?.({
+        id: "session-fallback-first",
+        workspace_id: "ws_home",
+        agent_name: "general",
+      });
+      await first;
+    });
+    await waitFor(() => expect(fallback.result.current.pending).toBe(false));
+
+    await act(async () => fallback.result.current.run("Plan the release"));
+    expect(createSessionAsync).toHaveBeenCalledTimes(2);
+  });
+
+  it("Should start with the chosen agent in the scoped worktree and report where the query went", async () => {
+    agents.data = [{ name: "general" }, { name: "reviewer" }];
+    createSessionAsync
+      .mockResolvedValueOnce({
+        id: "session-chosen",
+        workspace_id: "ws_home",
+        agent_name: "reviewer",
+      })
+      .mockRejectedValueOnce(new Error("agent executable is unavailable"));
+    const { store, wrapper } = renderFallback();
+    const onCreated = vi.fn();
+    const fallback = renderHook(
+      () => useSessionPromptFallback({ onCreated, onPickerOpened: vi.fn() }),
+      { wrapper }
+    );
+    const run = (options: { agentName?: string; worktreeId?: string }) =>
+      act(async () => fallback.result.current.run("Review the diff", options));
+
+    await expect(run({ agentName: "reviewer", worktreeId: "wt-feature" })).resolves.toBe("created");
+    expect(createSessionAsync).toHaveBeenLastCalledWith({
+      agent_name: "reviewer",
+      workspace: "ws_home",
+      worktree: "wt-feature",
+    });
+    expect(sessionStore.getSnapshot().context.firstPrompts["session-chosen"]?.text).toBe(
+      "Review the diff"
+    );
+    expect(onCreated).toHaveBeenCalledWith(expect.objectContaining({ id: "session-chosen" }));
+
+    await expect(run({ agentName: "reviewer" })).resolves.toBe("failed");
+    expect(store.getSnapshot().context.operation).toEqual({ status: "idle" });
+
+    await expect(run({ agentName: "retired", worktreeId: "wt-feature" })).resolves.toBe("picker");
+    expect(createSessionAsync).toHaveBeenCalledTimes(2);
+    expect(store.getSnapshot().context).toMatchObject({
+      open: true,
+      pendingPrompt: "Review the diff",
+      draft: { environment: { kind: "worktree", worktreeId: "wt-feature" } },
+    });
+
+    await expect(act(async () => fallback.result.current.run("   "))).resolves.toBe("ignored");
+  });
+
+  it("Should hold a sourced quote and keep the create dialog free of the envelope", () => {
+    const quote = buildTerminalQuote({
+      terminalId: "term-4f21c9a03b7e",
+      fromLine: 12,
+      lines: ["FAIL src/api/users.test.ts"],
+    });
+    const store = createSessionCreateStore();
+    const wrapper = ({ children }: { children: ReactNode }) => (
+      <SessionCreateProvider store={store}>{children}</SessionCreateProvider>
+    );
+    const actions = renderHook(() => useSessionCreateActions(), { wrapper });
+
+    act(() => actions.result.current.openWithPrompt(quote.text));
+
+    expect(peekPendingTerminalQuote()?.text).toBe(quote.text);
+    expect(store.getSnapshot().context).toMatchObject({
+      open: true,
+      pendingPrompt: null,
+    });
+    expect(store.getSnapshot().context.draft).not.toHaveProperty("firstMessage");
+  });
+
+  it("Should hold a quote object without putting it in the first-message field", () => {
+    const quote = buildTerminalQuote({
+      terminalId: "term-9cd7e14b2a66",
+      fromLine: 40,
+      lines: ["make gate"],
+    });
+    const store = createSessionCreateStore();
+    const wrapper = ({ children }: { children: ReactNode }) => (
+      <SessionCreateProvider store={store}>{children}</SessionCreateProvider>
+    );
+    const actions = renderHook(() => useSessionCreateActions(), { wrapper });
+
+    act(() => actions.result.current.openWithTerminalQuote(quote));
+
+    expect(peekPendingTerminalQuote()?.text).toBe(quote.text);
+    expect(store.getSnapshot().context.pendingPrompt).toBeNull();
+    expect(store.getSnapshot().context.draft).not.toHaveProperty("firstMessage");
+  });
+
+  it("Should ignore Start gestures that would clear or hold quote while create is submitting", () => {
+    const held = buildTerminalQuote({
+      terminalId: "term-4f21c9a03b7e",
+      fromLine: 12,
+      lines: ["first"],
+    });
+    const later = buildTerminalQuote({
+      terminalId: "term-9cd7e14b2a66",
+      fromLine: 40,
+      lines: ["second"],
+    });
+    const store = createSessionCreateStore();
+    const wrapper = ({ children }: { children: ReactNode }) => (
+      <SessionCreateProvider store={store}>{children}</SessionCreateProvider>
+    );
+    const actions = renderHook(() => useSessionCreateActions(), { wrapper });
+
+    act(() => {
+      store.trigger.fallbackRequested({ agentName: "general", workspaceId: "ws_home" });
+    });
+    expect(store.getSnapshot().context.operation.status).toBe("submitting");
+    holdPendingTerminalQuote(held);
+
+    act(() => {
+      actions.result.current.openForAgent("codex-agent");
+      actions.result.current.openForWorktree("ws_home", "wt_other");
+      actions.result.current.openWithPrompt(later.text);
+      actions.result.current.openWithTerminalQuote(later);
+    });
+
+    expect(peekPendingTerminalQuote()?.text).toBe(held.text);
+    expect(store.getSnapshot().context).toMatchObject({
+      open: false,
+      operation: { status: "submitting", agentName: "general" },
+    });
+  });
+
+  it("Should drop a leftover held quote when opening create for an agent", () => {
+    const quote = buildTerminalQuote({
+      terminalId: "term-4f21c9a03b7e",
+      fromLine: 1,
+      lines: ["leftover"],
+    });
+    const store = createSessionCreateStore();
+    const wrapper = ({ children }: { children: ReactNode }) => (
+      <SessionCreateProvider store={store}>{children}</SessionCreateProvider>
+    );
+    const actions = renderHook(() => useSessionCreateActions(), { wrapper });
+
+    act(() => actions.result.current.openWithTerminalQuote(quote));
+    act(() => actions.result.current.openForAgent("general"));
+
+    expect(peekPendingTerminalQuote()).toBeNull();
+  });
+});

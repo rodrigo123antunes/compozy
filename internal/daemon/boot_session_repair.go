@@ -1,0 +1,420 @@
+package daemon
+
+import (
+	"context"
+	"errors"
+	"fmt"
+
+	"strings"
+
+	compozyconfig "github.com/compozy/compozy/internal/config"
+
+	"github.com/compozy/compozy/internal/session"
+
+	"github.com/compozy/compozy/internal/skills"
+
+	"github.com/compozy/compozy/internal/store"
+	"github.com/compozy/compozy/internal/store/sessiondb"
+
+	"github.com/compozy/compozy/internal/toolruntime"
+
+	"github.com/compozy/compozy/internal/vault"
+)
+
+// bootSessionRepair installs lifecycle handlers before replaying pending stops and repairing history.
+func (d *Daemon) bootSessionRepair(ctx context.Context, state *bootState) error {
+	if state == nil {
+		return errors.New("daemon: boot session repair state is required")
+	}
+	if state.sessions == nil {
+		return errors.New("daemon: boot session repair requires session manager")
+	}
+	// Stop receipts may still own Goal cancellation. Install its handler before
+	// recovery; server preparation refreshes late-bound runtime dependencies later.
+	if err := d.prepareServerDependencies(ctx, state); err != nil {
+		return err
+	}
+	if err := d.installBootSupervisedWorkRecovery(state); err != nil {
+		return err
+	}
+	if err := recoverBootPendingStops(ctx, state.sessions); err != nil {
+		return err
+	}
+	infos, err := state.sessions.ListAll(ctx)
+	if err != nil {
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return fmt.Errorf("daemon: boot session repair canceled: %w", ctxErr)
+		}
+		return fmt.Errorf("daemon: boot session inventory recovery failed: %w", err)
+	}
+	infos, err = upgradeBootSessionDatabases(ctx, state, infos)
+	if err != nil {
+		return err
+	}
+	if err := captureBootRestartInterruptions(ctx, state.sessions, infos); err != nil {
+		return err
+	}
+	recoverBootStaleInputDispatches(ctx, state)
+	if err := recoverBootPendingInteractions(ctx, state, infos); err != nil {
+		return err
+	}
+	if err := reconcileBootDerivedSessionEvents(ctx, state, infos); err != nil {
+		return err
+	}
+
+	for _, info := range infos {
+		if err := ctx.Err(); err != nil {
+			return fmt.Errorf("daemon: boot session repair canceled: %w", err)
+		}
+		needed, err := bootSessionNeedsRepair(ctx, state.sessions, info)
+		if err != nil {
+			if ctxErr := ctx.Err(); ctxErr != nil {
+				return fmt.Errorf("daemon: boot session repair canceled: %w", ctxErr)
+			}
+			state.logger.Warn("daemon: inspect restart repair failed", "session_id", info.ID, "error", err)
+			continue
+		}
+		if !needed {
+			continue
+		}
+
+		result, repairErr := state.sessions.RepairSession(
+			ctx,
+			session.RepairOpts{SessionID: info.ID},
+		)
+		if repairErr != nil {
+			if ctxErr := ctx.Err(); ctxErr != nil {
+				return fmt.Errorf("daemon: boot session repair canceled: %w", ctxErr)
+			}
+			state.logger.Warn(
+				"daemon: boot session repair failed",
+				"session_id", info.ID,
+				"error", repairErr,
+			)
+			continue
+		}
+		logBootSessionRepair(state, result)
+	}
+	return recoverBootSessionHealth(ctx, state)
+}
+
+func logBootSessionRepair(state *bootState, result *session.RepairResult) {
+	if result == nil {
+		return
+	}
+	errorIssues := repairIssueCount(result, session.RepairSeverityError)
+	if len(result.Actions) == 0 && errorIssues == 0 {
+		return
+	}
+	state.logger.Info(
+		"daemon: boot session repair complete",
+		"session_id", result.SessionID,
+		"persisted", result.Persisted,
+		"actions", len(result.Actions),
+		"issues", len(result.Issues),
+		"error_issues", errorIssues,
+	)
+}
+
+type sessionDatabaseUpgrader interface {
+	UpgradeSessionDatabase(context.Context, string) error
+}
+
+func upgradeBootSessionDatabases(
+	ctx context.Context,
+	state *bootState,
+	infos []*session.Info,
+) ([]*session.Info, error) {
+	upgrader, ok := state.sessions.(sessionDatabaseUpgrader)
+	if !ok {
+		return infos, nil
+	}
+	ready := make([]*session.Info, 0, len(infos))
+	for _, info := range infos {
+		if err := ctx.Err(); err != nil {
+			return nil, fmt.Errorf("daemon: retained session database upgrade canceled: %w", err)
+		}
+		if info == nil || strings.TrimSpace(info.ID) == "" {
+			continue
+		}
+		if err := upgrader.UpgradeSessionDatabase(ctx, info.ID); err != nil {
+			if ctxErr := ctx.Err(); ctxErr != nil {
+				return nil, fmt.Errorf("daemon: retained session database upgrade canceled: %w", ctxErr)
+			}
+			identityRefused := errors.Is(err, sessiondb.ErrSessionDBOwnerMismatch) ||
+				errors.Is(err, sessiondb.ErrSessionDBOwnerMissing) ||
+				errors.Is(err, sessiondb.ErrSessionDBFamilyChanged)
+			if identityRefused &&
+				!errors.Is(err, context.Canceled) && !errors.Is(err, context.DeadlineExceeded) {
+				state.logger.WarnContext(ctx, "daemon: retained session database refused",
+					"session_id", info.ID,
+					"workspace_id", info.WorkspaceID,
+					"error", err,
+				)
+				continue
+			}
+			return nil, fmt.Errorf("daemon: upgrade retained session database %q: %w", info.ID, err)
+		}
+		ready = append(ready, info)
+	}
+	return ready, nil
+}
+
+func recoverBootPendingInteractions(ctx context.Context, state *bootState, infos []*session.Info) error {
+	recoverer, ok := state.sessions.(sessionRestartInteractionExpirer)
+	if !ok {
+		return nil
+	}
+	for _, info := range infos {
+		if info == nil || strings.TrimSpace(info.ID) == "" {
+			continue
+		}
+		recovered, err := recoverer.ExpireRestartInteractions(ctx, info.ID)
+		if err != nil {
+			if ctxErr := ctx.Err(); ctxErr != nil {
+				return fmt.Errorf("daemon: pending interaction recovery canceled: %w", ctxErr)
+			}
+			return fmt.Errorf("daemon: expire pending interactions for %s: %w", info.ID, err)
+		}
+		if recovered > 0 {
+			state.logger.Info(
+				"daemon: pending interaction recovery complete",
+				"session_id", info.ID,
+				"expired", recovered,
+			)
+		}
+	}
+	return nil
+}
+
+// reconcileBootDerivedSessionEvents re-emits session.derived lost to a crash between a
+// derived child's commit and its ledger write (ADR-007). Ledger failures are logged.
+func reconcileBootDerivedSessionEvents(ctx context.Context, state *bootState, infos []*session.Info) error {
+	reconciler, ok := state.sessions.(sessionDerivedEventReconciler)
+	if !ok {
+		return nil
+	}
+	emitted, err := reconciler.ReconcileDerivedSessionEvents(ctx, infos)
+	if err != nil {
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return fmt.Errorf("daemon: derived session event reconciliation canceled: %w", ctxErr)
+		}
+		state.logger.Warn("daemon: derived session event reconciliation failed", "error", err)
+	}
+	if emitted > 0 {
+		state.logger.Info("daemon: re-emitted derived session events", "count", emitted)
+	}
+	return nil
+}
+
+// recoverBootStaleInputDispatches settles queue leases from the previous
+// process before any session claims input. A row that cannot settle stays
+// visible as dispatching; it must not block boot.
+func recoverBootStaleInputDispatches(ctx context.Context, state *bootState) {
+	recoverer, ok := state.sessions.(sessionStaleInputDispatchRecoverer)
+	if !ok {
+		return
+	}
+	if _, err := recoverer.RecoverStaleInputDispatches(ctx); err != nil {
+		state.logger.Warn("daemon: stale input dispatch recovery incomplete", "error", err)
+	}
+}
+
+func recoverBootSessionHealth(ctx context.Context, state *bootState) error {
+	recoverer, ok := state.sessions.(sessionHealthRecoverer)
+	if !ok {
+		return nil
+	}
+	result, err := recoverer.RecoverSessionHealth(ctx)
+	if err != nil {
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return fmt.Errorf("daemon: session health recovery canceled: %w", ctxErr)
+		}
+		state.logger.Warn("daemon: session health recovery failed", "error", err)
+		return nil
+	}
+	if result.RefreshedActive > 0 || result.Recomputed > 0 || result.MarkedStale > 0 {
+		state.logger.Info(
+			"daemon: session health recovery complete",
+			"refreshed_active", result.RefreshedActive,
+			"recomputed", result.Recomputed,
+			"marked_stale", result.MarkedStale,
+		)
+	}
+	return nil
+}
+
+type sessionHealthRecoverer interface {
+	RecoverSessionHealth(ctx context.Context) (session.HealthRecoveryResult, error)
+}
+
+type sessionDerivedEventReconciler interface {
+	ReconcileDerivedSessionEvents(ctx context.Context, infos []*session.Info) (int, error)
+}
+
+var _ sessionDerivedEventReconciler = (*session.Manager)(nil)
+
+type sessionPendingStopRecoverer interface {
+	RecoverPendingStops(context.Context) error
+}
+
+type sessionStaleInputDispatchRecoverer interface {
+	RecoverStaleInputDispatches(context.Context) (int, error)
+}
+
+var _ sessionStaleInputDispatchRecoverer = (*session.Manager)(nil)
+
+type sessionRestartInteractionExpirer interface {
+	ExpireRestartInteractions(ctx context.Context, sessionID string) (int, error)
+}
+
+func bootShouldRepairSession(info *session.Info) bool {
+	if info == nil || strings.TrimSpace(info.ID) == "" {
+		return false
+	}
+	if info.State != session.StateStopped {
+		return false
+	}
+	switch info.StopReason {
+	case store.StopAgentCrashed, store.StopError, store.StopShutdown:
+		return true
+	default:
+		return false
+	}
+}
+
+func repairIssueCount(result *session.RepairResult, severity string) int {
+	if result == nil {
+		return 0
+	}
+	count := 0
+	for _, issue := range result.Issues {
+		if strings.TrimSpace(issue.Severity) == severity {
+			count++
+		}
+	}
+	return count
+}
+
+func sessionInputQueueStoreDependency(registry Registry) store.SessionInputQueueStore {
+	queueStore, ok := registry.(store.SessionInputQueueStore)
+	if !ok {
+		return nil
+	}
+	return queueStore
+}
+
+func sessionPromptAdmissionStoreDependency(registry Registry) store.SessionPromptAdmissionStore {
+	admissionStore, ok := registry.(store.SessionPromptAdmissionStore)
+	if !ok {
+		return nil
+	}
+	return admissionStore
+}
+
+func (d *Daemon) buildProviderVault(state *bootState) (*vault.Service, error) {
+	if state == nil || state.registry == nil {
+		return nil, errors.New("daemon: provider vault registry is required")
+	}
+	vaultStore, ok := state.registry.(vault.Store)
+	if !ok {
+		if state.logger != nil {
+			state.logger.Warn(
+				"daemon.provider_vault.disabled",
+				"reason",
+				"registry_missing_vault_store",
+				"registry_type",
+				fmt.Sprintf("%T", state.registry),
+			)
+		}
+		return nil, nil
+	}
+	lookupEnv := func(key string) (string, bool) {
+		value := d.getenv(key)
+		return value, strings.TrimSpace(value) != ""
+	}
+	service, err := vault.NewService(
+		vaultStore,
+		compozyconfig.NewVaultKeyProvider(d.homePaths.HomeDir, lookupEnv),
+		vault.WithLookupEnv(lookupEnv),
+		vault.WithNow(d.now),
+	)
+	if err != nil {
+		return nil, fmt.Errorf("daemon: create provider vault: %w", err)
+	}
+	return service, nil
+}
+
+func sessionProviderVaultDependency(service *vault.Service) session.ProviderSecretResolver {
+	if service == nil {
+		return nil
+	}
+	return service
+}
+
+func (d *Daemon) bootProcessRegistry(ctx context.Context, state *bootState) error {
+	if state == nil {
+		return errors.New("daemon: process registry state is required")
+	}
+	var store toolruntime.Store
+	if processStore, ok := state.registry.(toolruntime.Store); ok {
+		store = processStore
+	}
+	state.processRegistry = toolruntime.NewRegistry(
+		store,
+		toolruntime.WithLogger(state.logger),
+		toolruntime.WithDaemonPID(d.pid()),
+		toolruntime.WithNow(d.now),
+	)
+	report, err := state.processRegistry.ReconcileBoot(ctx)
+	if err != nil {
+		return fmt.Errorf("daemon: reconcile tool process registry: %w", err)
+	}
+	if report.Checked > 0 && state.logger != nil {
+		state.logger.Info(
+			"daemon: reconciled tool process registry",
+			"checked", report.Checked,
+			"interrupted", report.Interrupted,
+			"stale", report.Stale,
+		)
+	}
+	return nil
+}
+
+func (d *Daemon) sessionNotifier(state *bootState) session.Notifier {
+	if state == nil {
+		return nil
+	}
+
+	return state.notifier
+}
+
+func skillRegistryDependency(registry *skills.Registry) session.SkillRegistry {
+	if registry == nil {
+		return nil
+	}
+	return registry
+}
+
+func mcpResolverDependency(resolver *skills.MCPResolver) session.MCPResolver {
+	if resolver == nil {
+		return nil
+	}
+	return resolver
+}
+
+func bootSessionNeedsRepair(ctx context.Context, sessions SessionManager, info *session.Info) (bool, error) {
+	if !bootShouldRepairSession(info) {
+		return false, nil
+	}
+	if info.StopReason != store.StopShutdown {
+		return true, nil
+	}
+	reader, ok := sessions.(interface {
+		HasPendingRestart(context.Context, string) (bool, error)
+	})
+	if !ok {
+		return false, nil
+	}
+	return reader.HasPendingRestart(ctx, info.ID)
+}

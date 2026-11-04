@@ -1,0 +1,314 @@
+import { BrowserWindow, clipboard, dialog, Menu, screen } from "electron";
+
+import { productDeepLink, productNavigationURL, type DeepLinkQueue } from "../deep-links/deep-link";
+import { writeWindowState, readWindowState, type StoredWindowState } from "./window-state-store";
+import { CrashRecoveryBudget } from "./crash-recovery-policy";
+import { guardWindowNavigation } from "./security";
+import { productWindowChrome } from "./product-window-chrome";
+import { presentWindow, type WindowPresentation } from "./window-presentation";
+import type { WindowTheme } from "./window-theme";
+import { MINIMUM_WINDOW_SIZE, restoreWindowBounds } from "./window-state-policy";
+import { nextZoomLevel } from "./zoom-policy";
+
+import { productContextMenu, type SpellcheckSettings } from "./context-menu";
+
+const REVEAL_DEADLINE_MS = 10_000;
+const SAVE_DEBOUNCE_MS = 250;
+// The runtime serves the shell. A cached copy from before a runtime update would boot the
+// previous release's bundle, so every shell load skips the HTTP cache (#742).
+const SHELL_LOAD_OPTIONS = { extraHeaders: "pragma: no-cache\n" };
+
+async function showCrashLoopDialog(window: BrowserWindow): Promise<void> {
+  const observer = Reflect.get(globalThis, "__compozyCrashDialogObserver");
+  if (process.env.COMPOZY_DESKTOP_E2E === "1" && typeof observer === "function") {
+    observer();
+    return;
+  }
+  await dialog.showMessageBox(window, {
+    type: "error",
+    title: "CompozyOS",
+    message: "CompozyOS keeps closing unexpectedly.",
+    detail: "Quit and reopen the app. Your sessions remain in the runtime.",
+  });
+}
+
+export class ProductWindow {
+  readonly #origin: string;
+  readonly #windowStatePath: string;
+  readonly #preloadPath: string;
+  readonly #presentation: WindowPresentation;
+  readonly #links: DeepLinkQueue;
+  readonly #theme: Pick<WindowTheme, "backgroundColor" | "dark" | "track">;
+  readonly #onReady: () => Promise<void>;
+  readonly #onLoadFailure: (error: Error) => Promise<void>;
+  readonly #onError: (error: Error) => void;
+  readonly #crashes = new CrashRecoveryBudget();
+  #window: BrowserWindow | null = null;
+  #ready = false;
+  #navigating = false;
+  #zoomLevel = 0;
+  #spellcheck: SpellcheckSettings | undefined;
+  #saveTimer: NodeJS.Timeout | null = null;
+
+  constructor(options: {
+    origin: string;
+    windowStatePath: string;
+    preloadPath: string;
+    presentation: WindowPresentation;
+    links: DeepLinkQueue;
+    theme: Pick<WindowTheme, "backgroundColor" | "dark" | "track">;
+    onReady: () => Promise<void>;
+    onLoadFailure: (error: Error) => Promise<void>;
+    onError: (error: Error) => void;
+  }) {
+    this.#origin = options.origin;
+    this.#windowStatePath = options.windowStatePath;
+    this.#preloadPath = options.preloadPath;
+    this.#presentation = options.presentation;
+    this.#theme = options.theme;
+    this.#links = options.links;
+    this.#onReady = options.onReady;
+    this.#onLoadFailure = options.onLoadFailure;
+    this.#onError = options.onError;
+  }
+
+  async create(initialURL = this.#origin): Promise<BrowserWindow> {
+    if (this.#window && !this.#window.isDestroyed()) return this.#window;
+    const saved = await readWindowState(this.#windowStatePath);
+    const displays = screen.getAllDisplays().map(display => display.workArea);
+    const bounds = restoreWindowBounds(saved, displays);
+    this.#ready = false;
+    this.#zoomLevel = saved?.zoom_level ?? 0;
+    this.#spellcheck = saved?.spellcheck;
+    const window = new BrowserWindow({
+      ...bounds,
+      ...productWindowChrome(process.platform, this.#theme.dark),
+      minWidth: MINIMUM_WINDOW_SIZE.width,
+      minHeight: MINIMUM_WINDOW_SIZE.height,
+      show: false,
+      title: "CompozyOS",
+      backgroundColor: this.#theme.backgroundColor("chrome"),
+      autoHideMenuBar: true,
+      webPreferences: {
+        preload: this.#preloadPath,
+        contextIsolation: true,
+        sandbox: true,
+        nodeIntegration: false,
+        webviewTag: false,
+        devTools: true,
+        // A hidden or occluded window must not burn renderer CPU. Nothing in the
+        // renderer needs full-rate timers in the background: live session streams
+        // close while the document is hidden, SSE delivery is not timer-driven,
+        // and the bell's hidden 30s poll tolerates throttled wake-ups.
+        backgroundThrottling: true,
+      },
+    });
+    this.#window = window;
+    if (this.#spellcheck) {
+      const session = window.webContents.session;
+      if (process.platform !== "darwin") {
+        const languages = this.#spellcheck.languages.filter(language =>
+          session.availableSpellCheckerLanguages.includes(language)
+        );
+        if (languages.length) session.setSpellCheckerLanguages(languages);
+      }
+      // Setting languages enables spellchecking on Windows and Linux.
+      session.setSpellCheckerEnabled(this.#spellcheck.enabled);
+    }
+    this.#theme.track(window, "chrome");
+    if (saved?.maximized) window.maximize();
+    if (!saved) window.center();
+    guardWindowNavigation(window, this.#origin, this.#onError);
+    this.#wireLifecycle(window);
+    const deadline = setTimeout(() => {
+      if (!window.isDestroyed() && !window.isVisible()) {
+        window.destroy();
+        void this.#onLoadFailure(new Error("The product window did not load before its deadline."));
+      }
+    }, REVEAL_DEADLINE_MS);
+    deadline.unref();
+    window.webContents.once("did-finish-load", () => clearTimeout(deadline));
+    await window.loadURL(initialURL, SHELL_LOAD_OPTIONS);
+    return window;
+  }
+
+  /** The live product window and the origin it serves, or `null` before creation or after close. */
+  current(): { window: BrowserWindow; origin: string } | null {
+    const window = this.#window;
+    if (!window || window.isDestroyed()) return null;
+    return { window, origin: this.#origin };
+  }
+
+  focus(): void {
+    const window = this.#window;
+    if (!window || window.isDestroyed()) return;
+    if (window.isMinimized()) {
+      window.once("restore", () => presentWindow(window, this.#presentation));
+      window.restore();
+    } else {
+      presentWindow(window, this.#presentation);
+    }
+    this.#navigatePending();
+  }
+
+  send(event: "shell:summon", payload: { command_id: string }): void {
+    const window = this.#window;
+    if (!window || window.isDestroyed()) return;
+    window.webContents.send(event, payload);
+  }
+
+  navigate(path: string): void {
+    this.#links.push(productDeepLink(path));
+    this.focus();
+  }
+
+  adjustZoom(direction: "in" | "out" | "reset"): void {
+    const window = this.#window;
+    if (!window || window.isDestroyed()) return;
+    this.#zoomLevel = nextZoomLevel(this.#zoomLevel, direction);
+    window.webContents.setZoomLevel(this.#zoomLevel);
+    this.#scheduleSave();
+  }
+
+  toggleDevTools(): void {
+    const window = this.#window;
+    if (!window || window.isDestroyed()) return;
+    if (window.webContents.isDevToolsOpened()) {
+      window.webContents.closeDevTools();
+      return;
+    }
+    window.webContents.openDevTools({ mode: "detach" });
+  }
+
+  async flushState(): Promise<void> {
+    if (this.#saveTimer) clearTimeout(this.#saveTimer);
+    this.#saveTimer = null;
+    await this.#save();
+  }
+
+  async close(): Promise<void> {
+    await this.flushState();
+    const window = this.#window;
+    if (window && !window.isDestroyed()) window.destroy();
+    this.#window = null;
+  }
+
+  #wireLifecycle(window: BrowserWindow): void {
+    window.webContents.on("context-menu", (_event, params) => {
+      const template = productContextMenu(
+        params,
+        window.webContents,
+        url => clipboard.writeText(url),
+        settings => {
+          this.#spellcheck = settings;
+          this.#scheduleSave();
+        },
+        process.platform
+      );
+      if (template.length) Menu.buildFromTemplate(template).popup({ window });
+    });
+    window.webContents.on("did-finish-load", () => {
+      window.webContents.setZoomLevel(this.#zoomLevel);
+      this.#scheduleSave();
+      if (!this.#ready) {
+        this.#ready = true;
+        presentWindow(window, this.#presentation);
+        void this.#onReady().catch(this.#onError);
+      }
+      this.#navigatePending();
+    });
+    window.webContents.on("before-input-event", (event, input) => {
+      if (
+        input.type === "keyDown" &&
+        input.alt &&
+        (input.control || input.meta) &&
+        input.key.toLowerCase() === "i"
+      ) {
+        event.preventDefault();
+        this.toggleDevTools();
+        return;
+      }
+      if (!input.control && !input.meta) return;
+      const direction =
+        input.key === "0"
+          ? "reset"
+          : input.key === "+" || input.key === "="
+            ? "in"
+            : input.key === "-"
+              ? "out"
+              : null;
+      if (!direction) return;
+      event.preventDefault();
+      this.adjustZoom(direction);
+    });
+    window.on("move", () => this.#scheduleSave());
+    window.on("resize", () => this.#scheduleSave());
+    window.on("maximize", () => this.#scheduleSave());
+    window.on("unmaximize", () => this.#scheduleSave());
+    window.webContents.on("render-process-gone", (_event, details) => {
+      this.#onError(new Error(`Product renderer exited: ${details.reason}.`));
+      const decision = this.#crashes.record(Date.now());
+      const observer = Reflect.get(globalThis, "__compozyCrashDecisionObserver");
+      if (process.env.COMPOZY_DESKTOP_E2E === "1" && typeof observer === "function") {
+        observer(decision);
+      }
+      if (decision === "reload") void this.#recoverRenderer(window).catch(this.#onError);
+      else void showCrashLoopDialog(window).catch(this.#onError);
+    });
+    window.on("unresponsive", () =>
+      this.#onError(new Error("Product renderer became unresponsive."))
+    );
+    window.on("closed", () => {
+      if (this.#window !== window) return;
+      this.#links.reset();
+      this.#window = null;
+    });
+  }
+
+  async #recoverRenderer(window: BrowserWindow): Promise<void> {
+    if (this.#window !== window || window.isDestroyed()) return;
+    const recoveryURL = window.webContents.getURL() || this.#origin;
+    this.#window = null;
+    await this.create(recoveryURL);
+    if (!window.isDestroyed()) window.destroy();
+  }
+
+  #navigatePending(): void {
+    const window = this.#window;
+    if (!window || window.isDestroyed() || !this.#ready || this.#navigating) return;
+    const path = this.#links.setReady();
+    if (!path) return;
+    const target = productNavigationURL(this.#origin, path);
+    if (window.webContents.getURL() === target) return;
+    this.#navigating = true;
+    void window
+      .loadURL(target, SHELL_LOAD_OPTIONS)
+      .catch(this.#onError)
+      .finally(() => {
+        this.#navigating = false;
+        this.#navigatePending();
+      });
+  }
+
+  #scheduleSave(): void {
+    if (this.#saveTimer) clearTimeout(this.#saveTimer);
+    this.#saveTimer = setTimeout(() => {
+      this.#saveTimer = null;
+      void this.#save().catch(this.#onError);
+    }, SAVE_DEBOUNCE_MS);
+    this.#saveTimer.unref();
+  }
+
+  async #save(): Promise<void> {
+    const window = this.#window;
+    if (!window || window.isDestroyed()) return;
+    const bounds = window.getNormalBounds();
+    const state: StoredWindowState = {
+      ...bounds,
+      maximized: window.isMaximized(),
+      zoom_level: this.#zoomLevel,
+      ...(this.#spellcheck ? { spellcheck: this.#spellcheck } : {}),
+    };
+    await writeWindowState(this.#windowStatePath, state);
+  }
+}

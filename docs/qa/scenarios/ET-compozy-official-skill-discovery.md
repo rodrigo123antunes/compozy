@@ -1,0 +1,85 @@
+---
+id: ET-compozy-official-skill-discovery
+area: ET
+title: Discover the official CompozyOS runtime skill
+persona: Ada
+journey: J-validate-compozy-hard-cut
+expected: A fresh runtime discovers the bundled skill only as `compozy`; every read plane agrees, the router serves the desktop reference and teaches app commands, ownership, updates, diagnostics, and recovery without a duplicate catalog entry.
+entry_points: bundled skills/compozy/SKILL.md; GET /api/skills; compozy skill list|inspect|view -o json; compozy__skill_list|view; Web /skills
+qa_status: untested
+bug_ids: BUG-20260825-skill-source-agent-write-doc-mismatch
+fix_status: fixed
+retest_status:
+fix_commits: 2643f4aba
+evidence: /Users/pedronauck/dev/qa-labs/compozy-terminal-shared-control-20260904-204013-041114-lab/qa-artifacts/qa/live-evidence.md; docs/qa/reports/2026-09-04-terminal-shared-control.md
+last_report: docs/qa/reports/2026-10-02-untested.md
+overlaps: ET-001; ET-002; ET-003; ET-skill-activation-gates; SITE-terminal-docs-truth
+---
+
+QA impact 2026-09-04: the official terminal reference removed claim/yield and the special typing grant,
+and now teaches shared control. Reset to confirm every skill read plane serves the same nine-tool contract.
+
+Skipped in the 2026-07-30 MCP 2026/catalog-v2 closeout: the bundled skill was read through CLI only; the scenario requires agreement across all listed surfaces.
+
+QA impact 2026-07-26: the official bundled skill, loader namespace, and every structured
+management surface received one hard cut. Planning flag only; the next QA cycle owns execution.
+
+QA impact 2026-07-29 (ext-improvs Phase G): the bundled skill gained
+`references/extension-authoring.md` and a new router row for writing extension code. Resource
+discovery, the reference inventory, and router coverage changed; reset to untested for the next
+cycle.
+
+QA impact 2026-08-02: the official skill removed Bundle product teaching and gained kit resources,
+secrets, inventory, preview, and digest confirmation guidance. Reset for a real agent read.
+
+QA impact 2026-08-04: the official skill was cut to agent-facing usage only. Removed
+`references/contributing-to-compozy.md`, `references/docs-design-and-copy.md`, and
+`references/qa-and-verification.md`; renamed `references/capabilities.md` to
+`references/extensions.md`; added `references/configuration.md`; rewrote the SKILL.md
+description, router, and index. Verify no retired reference or router row survives on any read
+plane and that the new references resolve.
+
+QA walk 2026-08-04 (fresh isolated lab, home `compozy-skill-slim-20260804-111531-lab/home`,
+port 42137): `compozy skill list -o json` reports exactly one bundled skill `compozy`; the served
+router body contains 32 reference mentions and zero retired names; global-context
+`skill view --file` serves `references/extensions.md` and `references/configuration.md` and
+rejects `references/qa-and-verification.md` and `references/capabilities.md` with
+"file does not exist"; `skill inspect -o json` lists exactly the twelve current references;
+`GET /api/skills` carries the new description (native-tool and Web planes read the same registry
+projection). Note: workspace-scoped `skill view` rejects `--file` by contract, so file reads were
+verified from a global (non-workspace) cwd. Daemon teardown clean on both runs.
+
+QA impact 2026-08-06: the official skill now routes connectivity-provider authoring and runtime
+operations. Flag only; Tasks 08–09 own the re-walk.
+
+QA walk 2026-08-07: a fresh isolated runtime served the new authoring and runtime-operation
+references through `skill view`; both provider templates, the provider contract, and Gateway native
+operations were present. Existing cross-plane discovery evidence remains valid for the unchanged registry.
+
+QA impact 2026-08-10: the official skill gained `references/desktop.md` and desktop routing while
+its public prose moved to CompozyOS. Reset to `untested`; Task 07 owns the cross-plane re-walk.
+
+QA impact 2026-08-25 (skill sources): already `untested`, and this cycle adds a reason to walk it. Task_07 rewrote two of the bundled skill's references — `references/configuration.md` (the two source keys, their scopes, and the agent-write claim) and `references/tools-and-skills.md` (origins, precedence, suppression, exposure). The scenario's promise is that every read plane agrees on one `compozy` entry; this cycle's specific risk is that the served body now describes behavior the runtime does not implement. Read the configuration reference against the shipped tool surface, not just against itself — see `ET-skill-source-agent-parity` for the agent-write discrepancy this cycle found. Rides along in `CH-skill-sources-agent-plane`.
+
+QA impact 2026-08-26 (integrated-terminal): the official skill gained `references/terminal.md` with a
+terminal dispatch row and reference-inventory entry, and task 08 changed the platform fact it teaches
+(local Windows now reports interactive capability). The
+re-walk must confirm the router resolves that reference on every read plane and that its tool ids,
+platform facts, and safety rules agree with both the daemon and the public terminal pages. The current
+pass verdict predates the terminal reference, so this change resets the scenario to `untested`.
+`CH-terminal-docs-first-success` walks it alongside `SITE-terminal-docs-truth`, which owns the public
+pages so this file is not duplicated for them.
+
+QA walk 2026-09-04: passed. A fresh isolated runtime returned exactly one bundled `compozy` skill through
+CLI and `GET /api/skills`. `skill view compozy --file references/terminal.md` served the nine-tool
+terminal contract, concurrent same-workspace/profile interaction, and no claim/yield tool IDs or special
+typing grant. The public docs and live runtime catalogs agreed with that reference.
+
+
+2026-09-27 scope update: current coverage follows the surviving product surfaces; a fresh walk is required.
+
+2026-10-05: Deferred from this QA cycle by the user's explicit scope reduction.
+Coverage remains outstanding; this skip is not a passing result. Resume from the dated
+report's session matrix in a future QA cycle.
+
+QA impact 2026-10-07 (memory removal): the official skill dropped `references/memory.md` and its memory routing and gained Compact now guidance in its native-tools and runtime-operations references. `skill inspect -o json` no longer lists a memory reference, `skill view compozy --file references/memory.md` is rejected with "file does not exist", and the router carries no memory command or tool row. Stale skipped verdict reset to untested; the earlier "twelve current references" count describes an older reference set; no QA session ran.

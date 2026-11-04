@@ -1,0 +1,290 @@
+import { infiniteQueryOptions, queryOptions, type Query } from "@tanstack/react-query";
+
+import {
+  getAgentContext,
+  getTask,
+  getTaskDashboard,
+  getTaskExecutionProfile,
+  getTaskInbox,
+  getTaskRun,
+  readTaskRunResult,
+  getTaskRunReview,
+  getTaskTimeline,
+  getTaskTree,
+  inspectRun,
+  inspectTask,
+  listTaskReviews,
+  listTaskRunReviews,
+  listTaskRuns,
+  listTasks,
+} from "../adapters/tasks-api";
+import { tasksKeys } from "./query-keys";
+import {
+  taskInboxPageRequest,
+  taskInboxPopulation,
+  taskInboxStableFilter,
+} from "./task-inbox-query";
+import { taskListPageRequest, taskListPopulation, taskListStableFilter } from "./task-list-query";
+import type {
+  AgentContextIdentity,
+  TaskDashboardFilter,
+  TaskDetailView,
+  TaskRunDetailView,
+  TaskInboxFilter,
+  TaskListFilter,
+  TaskReviewsFilter,
+  TaskRunReviewsFilter,
+  TaskRunsFilter,
+  TaskTimelineFilter,
+} from "../types";
+import type { ProfileScopeParams } from "@/systems/profiles";
+
+const DEFAULT_STALE_TIME = 15_000;
+const DEFAULT_REFETCH_INTERVAL = 30_000;
+const LIVE_STALE_TIME = 5_000;
+const LIVE_REFETCH_INTERVAL = 15_000;
+const INITIAL_CURSOR: string | undefined = undefined;
+
+type TaskProfileFilter = { profile?: string | null; all_profiles?: boolean | null };
+
+export function withTaskProfileScope<T extends TaskProfileFilter>(
+  filters: T,
+  scope: ProfileScopeParams
+): Omit<T, "profile" | "all_profiles"> & ProfileScopeParams {
+  const unscoped = Object.fromEntries(
+    Object.entries(filters).filter(([key]) => key !== "profile" && key !== "all_profiles")
+  ) as Omit<T, "profile" | "all_profiles">;
+  return { ...unscoped, ...scope };
+}
+
+function taskDetailRefetchInterval(detail: TaskDetailView | undefined): number | false {
+  if (!detail) return DEFAULT_REFETCH_INTERVAL;
+  const status = detail.summary.active_run?.status;
+  return status === "queued" ||
+    status === "claimed" ||
+    status === "starting" ||
+    status === "running"
+    ? DEFAULT_REFETCH_INTERVAL
+    : false;
+}
+
+function taskRunDetailRefetchInterval(detail: TaskRunDetailView | undefined): number | false {
+  if (!detail) return LIVE_REFETCH_INTERVAL;
+  const status = detail.run.status;
+  return status === "queued" ||
+    status === "claimed" ||
+    status === "starting" ||
+    status === "running"
+    ? LIVE_REFETCH_INTERVAL
+    : false;
+}
+
+/**
+ * Keeps the last real rows on screen while a refined read loads, so a filter, search or lane
+ * change swaps content in place instead of flashing a skeleton. The rows bridge only inside the
+ * population they were read for (`meta.population`): another workspace, worktree, profile or
+ * reveal reads from nothing, so one scope's tasks never stand in for another's.
+ */
+function keepWithinPopulation(population: string) {
+  return <TData>(
+    previousData: TData | undefined,
+    previousQuery: Pick<Query, "meta"> | undefined
+  ) => (previousQuery?.meta?.population === population ? previousData : undefined);
+}
+
+export function tasksListOptions(filters: TaskListFilter = {}, enabled = true) {
+  const stableFilters = taskListStableFilter(filters);
+  const population = taskListPopulation(stableFilters);
+  return infiniteQueryOptions({
+    queryKey: tasksKeys.list(stableFilters),
+    queryFn: ({ pageParam, signal }) =>
+      listTasks(taskListPageRequest(stableFilters, pageParam), signal),
+    initialPageParam: INITIAL_CURSOR,
+    getNextPageParam: lastPage => (lastPage.page.has_more ? lastPage.page.next_cursor : undefined),
+    meta: { population },
+    placeholderData: keepWithinPopulation(population),
+    staleTime: DEFAULT_STALE_TIME,
+    enabled,
+  });
+}
+
+export function taskDetailOptions(id: string, scope: ProfileScopeParams, enabled = true) {
+  return queryOptions({
+    queryKey: tasksKeys.detail(id, scope),
+    queryFn: ({ signal }) => getTask(id, scope, signal),
+    staleTime: DEFAULT_STALE_TIME,
+    refetchInterval: query => taskDetailRefetchInterval(query.state.data),
+    enabled: Boolean(id) && enabled,
+  });
+}
+
+export function taskInspectOptions(id: string, scope: ProfileScopeParams, enabled = true) {
+  return queryOptions({
+    queryKey: tasksKeys.inspectTask(id, scope),
+    queryFn: ({ signal }) => inspectTask(id, scope, signal),
+    staleTime: LIVE_STALE_TIME,
+    refetchInterval: LIVE_REFETCH_INTERVAL,
+    enabled: Boolean(id) && enabled,
+  });
+}
+
+export function taskRunsOptions(id: string, filters: TaskRunsFilter = {}, enabled = true) {
+  return queryOptions({
+    queryKey: tasksKeys.runs(id, filters),
+    queryFn: ({ signal }) => listTaskRuns(id, filters, signal),
+    staleTime: DEFAULT_STALE_TIME,
+    refetchInterval: LIVE_REFETCH_INTERVAL,
+    enabled: Boolean(id) && enabled,
+  });
+}
+
+export function taskTimelineOptions(id: string, filters: TaskTimelineFilter = {}, enabled = true) {
+  return queryOptions({
+    queryKey: tasksKeys.timeline(id, filters),
+    queryFn: ({ signal }) => getTaskTimeline(id, filters, signal),
+    staleTime: LIVE_STALE_TIME,
+    refetchInterval: LIVE_REFETCH_INTERVAL,
+    enabled: Boolean(id) && enabled,
+  });
+}
+
+export function taskTreeOptions(id: string, scope: ProfileScopeParams, enabled = true) {
+  return queryOptions({
+    queryKey: tasksKeys.tree(id, scope),
+    queryFn: ({ signal }) => getTaskTree(id, scope, signal),
+    staleTime: LIVE_STALE_TIME,
+    refetchInterval: LIVE_REFETCH_INTERVAL,
+    enabled: Boolean(id) && enabled,
+  });
+}
+
+export function taskRunDetailOptions(runId: string, scope: ProfileScopeParams, enabled = true) {
+  return queryOptions({
+    queryKey: tasksKeys.runDetail(runId, scope),
+    queryFn: ({ signal }) => getTaskRun(runId, scope, signal),
+    staleTime: LIVE_STALE_TIME,
+    refetchInterval: query => taskRunDetailRefetchInterval(query.state.data),
+    enabled: Boolean(runId) && enabled,
+  });
+}
+
+export function taskRunResultPageOptions(
+  workspaceId: string,
+  runId: string,
+  resultRef: string,
+  offset: number,
+  limit: number,
+  scope: ProfileScopeParams,
+  enabled = true
+) {
+  return queryOptions({
+    queryKey: tasksKeys.runResult(workspaceId, runId, resultRef, offset, limit, scope),
+    queryFn: ({ signal }) => readTaskRunResult(runId, offset, limit, scope, signal),
+    staleTime: Infinity,
+    gcTime: 2 * 60 * 1000,
+    enabled: Boolean(workspaceId && runId && resultRef) && enabled,
+  });
+}
+
+export function taskRunInspectOptions(runId: string, scope: ProfileScopeParams, enabled = true) {
+  return queryOptions({
+    queryKey: tasksKeys.inspectRun(runId, scope),
+    queryFn: ({ signal }) => inspectRun(runId, scope, signal),
+    staleTime: LIVE_STALE_TIME,
+    refetchInterval: LIVE_REFETCH_INTERVAL,
+    enabled: Boolean(runId) && enabled,
+  });
+}
+
+export function taskDashboardOptions(filters: TaskDashboardFilter = {}, enabled = true) {
+  return queryOptions({
+    queryKey: tasksKeys.dashboard(filters),
+    queryFn: ({ signal }) => getTaskDashboard(filters, signal),
+    staleTime: DEFAULT_STALE_TIME,
+    refetchInterval: DEFAULT_REFETCH_INTERVAL,
+    enabled,
+  });
+}
+
+function taskInboxQueryOptions(filters: TaskInboxFilter, enabled: boolean, staleTime: number) {
+  const stableFilters = taskInboxStableFilter(filters);
+  const population = taskInboxPopulation(stableFilters);
+  return infiniteQueryOptions({
+    queryKey: tasksKeys.inbox(stableFilters),
+    queryFn: ({ pageParam, signal }) =>
+      getTaskInbox(taskInboxPageRequest(stableFilters, pageParam), signal),
+    initialPageParam: INITIAL_CURSOR,
+    getNextPageParam: lastPage => (lastPage.page.has_more ? lastPage.page.next_cursor : undefined),
+    meta: { population },
+    placeholderData: keepWithinPopulation(population),
+    staleTime,
+    enabled,
+  });
+}
+
+export function taskInboxOptions(filters: TaskInboxFilter = {}, enabled = true) {
+  return taskInboxQueryOptions(filters, enabled, 0);
+}
+
+/** Minimal unread/count projection preloaded for the always-visible Tasks badge. */
+export function taskInboxBadgeOptions(filters: TaskInboxFilter = {}, enabled = true) {
+  return taskInboxQueryOptions(filters, enabled, DEFAULT_STALE_TIME);
+}
+
+export function taskExecutionProfileOptions(taskId: string, enabled = true) {
+  return queryOptions({
+    queryKey: tasksKeys.profile(taskId),
+    queryFn: ({ signal }) => getTaskExecutionProfile(taskId, signal),
+    staleTime: DEFAULT_STALE_TIME,
+    refetchInterval: DEFAULT_REFETCH_INTERVAL,
+    enabled: Boolean(taskId) && enabled,
+  });
+}
+
+export function taskRunReviewsOptions(
+  runId: string,
+  filters: TaskRunReviewsFilter = {},
+  enabled = true
+) {
+  return queryOptions({
+    queryKey: tasksKeys.reviewsByRun(runId, filters),
+    queryFn: ({ signal }) => listTaskRunReviews(runId, filters, signal),
+    staleTime: LIVE_STALE_TIME,
+    refetchInterval: LIVE_REFETCH_INTERVAL,
+    enabled: Boolean(runId) && enabled,
+  });
+}
+
+export function taskReviewsOptions(
+  taskId: string,
+  filters: TaskReviewsFilter = {},
+  enabled = true
+) {
+  return queryOptions({
+    queryKey: tasksKeys.reviewsByTask(taskId, filters),
+    queryFn: ({ signal }) => listTaskReviews(taskId, filters, signal),
+    staleTime: LIVE_STALE_TIME,
+    refetchInterval: LIVE_REFETCH_INTERVAL,
+    enabled: Boolean(taskId) && enabled,
+  });
+}
+
+export function taskRunReviewDetailOptions(reviewId: string, enabled = true) {
+  return queryOptions({
+    queryKey: tasksKeys.reviewDetail(reviewId),
+    queryFn: ({ signal }) => getTaskRunReview(reviewId, signal),
+    staleTime: LIVE_STALE_TIME,
+    refetchInterval: LIVE_REFETCH_INTERVAL,
+    enabled: Boolean(reviewId) && enabled,
+  });
+}
+
+export function agentContextOptions(identity: AgentContextIdentity, enabled = true) {
+  return queryOptions({
+    queryKey: tasksKeys.agentContext(identity),
+    queryFn: ({ signal }) => getAgentContext(identity, signal),
+    staleTime: LIVE_STALE_TIME,
+    refetchInterval: LIVE_REFETCH_INTERVAL,
+    enabled,
+  });
+}

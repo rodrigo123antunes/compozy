@@ -1,0 +1,240 @@
+---
+title: Reference grammar
+description: How Loop definitions reference data — value templates, CEL conditions, effect context, and the snake_case ID rule.
+---
+
+A Loop definition wires nodes together by _referencing_ values — a prior node's output, a declared
+input, the fanned item. There are two reference surfaces over **one** namespace, and the surface is
+chosen by the field, never by the author.
+
+## Two surfaces, one namespace
+
+| Surface        | Syntax                     | Where it is used                                                                                                                          |
+| -------------- | -------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------- |
+| **Values**     | Go `text/template` `{{ }}` | String-valued fields: `params.*`, effect payloads, gate rubrics, `run-loop.inputs` and `config_overrides`, transforms, and start mappings |
+| **Conditions** | CEL, returning `bool`      | `branch.condition`, `fan-out.filter`, `contract.stop_when`, `watch-events` `events[].filter`                                              |
+
+Values interpolate; conditions evaluate. A `branch` never uses `{{ }}`, and a prompt never uses raw
+CEL — the field's type decides.
+
+```yaml
+# value field — {{ }}
+prompt: "Fix the failures in {{ .inputs.slug }}; the reviewer said {{ .nodes.review.output.summary }}."
+
+# condition field — CEL
+condition: "nodes.review.output.decision == 'ship'"
+```
+
+## The namespace
+
+Both surfaces resolve the same roots. Every dotted path is validated at lint and publish time
+against the declared input and output schemas — there is no silent empty-string resolution.
+
+| Root                                  | Resolves to                                                                     | Available where                       |
+| ------------------------------------- | ------------------------------------------------------------------------------- | ------------------------------------- |
+| `inputs.<name>`                       | A declared typed input                                                          | everywhere                            |
+| `nodes.<id>.output.<path>`            | A current-generation node's harvested, typed output                             | everywhere (after the node)           |
+| `nodes.<id>.status`                   | A current-generation node's terminal status                                     | everywhere                            |
+| `previous.generation`                 | The immediately preceding generation number, or `0` before one exists           | every generation                      |
+| `previous.nodes.<id>.status`          | A previous-generation node's terminal status, or an empty string                | every generation                      |
+| `previous.nodes.<id>.output.<path>`   | A previous-generation node's typed output, using schema-shaped zero values      | every generation                      |
+| `previous.verdicts.<gate_id>.<field>` | One prior machine verdict: `outcome`, `score`, `blocking_issues`, or `criteria` | every generation                      |
+| `previous.route_causes`               | Ordered gate IDs whose prior verdicts caused succession                         | every generation                      |
+| `best.generation` / `best.score`      | The accepted metric baseline, or `0` before one exists                          | every generation                      |
+| `best.nodes.<id>.output.<path>`       | Output from that best generation; status and verdicts are not projected         | every generation                      |
+| `item`                                | The fanned unit (element, or array slice when `batch_size > 1`)                 | inside a `fan-out` branch only        |
+| `index`                               | The fanned index                                                                | inside a `fan-out` branch only        |
+| `trigger.<path>`                      | The activation payload                                                          | `trigger` and `webhook` starts only   |
+| `event.<path>`                        | The matched internal event (correlation fields + `payload`)                     | `watch-events` `events[].filter` only |
+| `generation`                          | The current generation number                                                   | everywhere                            |
+
+`nodes.<id>.output.*` only validates against a schema the referenced node declares — set
+`produces` (or a `run-agent` `output_schema`) on the source node so its output paths are known.
+For an awaited `run-loop`, `produces` must declare exactly `loop_run_id: string` and
+`status: string` to expose its terminal child result as an object. Without it, the existing
+terminal output is a scalar and child-result field paths are rejected during validation.
+These fields accept an unconstrained string type only; enum, pattern, and other restrictions
+cannot be guaranteed for every child run.
+
+In `{{ }}`, roots take a leading dot (`{{ .inputs.slug }}`, `{{ .item.title }}`); in CEL they do
+not (`inputs.slug`, `item.title`). Node IDs are identical in both.
+
+## One materialization pass
+
+Contract narrative fields — `goal`, `definition_of_done`, `constraints[]`, and `boundaries[]` —
+accept only declared `inputs` references. CompozyOS resolves those fields once, after effective inputs
+are known and before a Goal agent or judge receives the contract. Missing references fail before
+the Goal performs work.
+
+Goal `params` values are resolved recursively at the same execution boundary. A direct reference
+keeps its JSON type instead of becoming text, while `output_schema` remains the authored schema and
+is never treated as a template. Nested gate inputs follow the same rule.
+
+### Typed direct references
+
+An exact reference occupying the whole value preserves its value. This is required for
+`run-loop.params.config_overrides`: numeric budgets stay numbers, objects stay objects, and runtime
+rule lists stay arrays when the child receives its per-run configuration.
+
+```yaml
+params:
+  loop: build-feature
+  config_overrides:
+    budget_tokens: "{{ .nodes.routing.output.remaining_tokens }}"
+    runtime_rules: "{{ .nodes.routing.output.runtime_rules }}"
+```
+
+Text surrounding a reference produces a string instead. Use exact references for non-string fields;
+the closed child configuration schema rejects a coerced number or array before starting the child.
+
+There is no second template pass inside the agent or judge. If an input value itself contains
+`{{ ... }}`, those braces remain literal data; they cannot introduce a new reference. Run details
+therefore expose both `executed_definition`, the raw authored snapshot, and
+`materialized_contract`, the input-resolved contract that governed the run.
+
+## Effect templates
+
+Effect `with` and `emit.payload` values use a deliberately smaller namespace: declared `inputs`
+plus the immutable `effect` context captured with the lifecycle transition. In `{{ }}` templates,
+use the leading dot.
+
+| Root                | Contents                                                                                                       |
+| ------------------- | -------------------------------------------------------------------------------------------------------------- |
+| `effect.identity`   | `scope`, `workspace_id`, `loop_name`, `loop_run_id`, `generation`, optional `node_id`, `item_index`, `trigger` |
+| `effect.failure`    | Classified `class`, `code`, `cause`, `hint`, `target`, `retry_after`, and `retry_eligible` when present        |
+| `effect.quarantine` | The sanitized quarantine record when present                                                                   |
+| `effect.attempt`    | `number`, optional `next_attempt_at`, and optional `disposition`                                               |
+| `effect.links`      | `run`, plus node-scoped `resume` and `approval` decision links                                                 |
+
+```yaml
+on_retry:
+  - emit:
+      kind: release.retry_scheduled
+      payload:
+        run_id: "{{ .effect.identity.loop_run_id }}"
+        node_id: "{{ .effect.identity.node_id }}"
+        attempt: "{{ .effect.attempt.number }}"
+        retry_at: "{{ .effect.attempt.next_attempt_at }}"
+```
+
+Effect context is recorded before dispatch, secret-redacted, and bounded. It cannot read mutable
+node outputs or change the transition it observes. See
+[Failure handling](/docs/loops/failure-handling#effects-observe-committed-truth) for delivery rules.
+
+## Cross-generation repair context
+
+`previous` and `best` are read-only, total projections: every authored node and gate has a stable
+shape in every generation. `previous` always means generation `N-1`, even when generation `N` was
+restored from an older best candidate. `best` names that accepted metric baseline. Before either
+projection exists, its `generation` is `0`, node outputs use zero values from their declared schema,
+and verdict lists are empty. Sparse repair generations keep the same shape.
+
+Use `if` with the generation number when prose should appear only after history exists. Structural
+guards such as `with .previous` are valid, but the total projection itself is always present:
+
+```yaml
+prompt: |
+  Improve the current candidate.
+  {{ if .previous.generation }}
+  The prior quality gate returned {{ .previous.verdicts.quality.outcome }}.
+  Blocking issues: {{ .previous.verdicts.quality.blocking_issues }}
+  {{ end }}
+  {{ if .best.generation }}
+  Preserve the useful parts of generation {{ .best.generation }}, scored {{ .best.score }}.
+  {{ end }}
+```
+
+For several rejecting gates, `previous.verdicts` remains lossless because it is keyed by gate ID.
+`previous.route_causes` gives the persisted causal order; there is no singular
+`previous.verdict`. Prefer field-level references over interpolating a whole history object, which
+adds prompt payload without sharpening the repair.
+
+Conditions use the same roots without the leading dot. For example, a metric Loop can stop after
+an accepted best update:
+
+```yaml
+stop_when: "best.score >= 0.9"
+```
+
+## Resolution errors
+
+The linter reports precise codes, not runtime surprises:
+
+| Code                  | Cause                                                  |
+| --------------------- | ------------------------------------------------------ |
+| `unknown_reference`   | An unknown root, or a `nodes.<id>` that does not exist |
+| `unresolvable_path`   | A known symbol with a missing child path               |
+| `item_outside_fanout` | `item` or `index` used outside a `fan-out` branch      |
+| `condition_not_bool`  | A CEL condition that does not return `bool`            |
+| `node_id_invalid`     | A node ID that is not snake_case                       |
+
+Value templates run with `missingkey=error` and a curated function set (`json`, `toJson`, `join`,
+`default`, `shellQuote`) plus the side-effect-free builtins `len`, `eq`, `ne`, `lt`, `le`, `gt`, `ge`,
+`not`, `and`, and `or` — no arbitrary helpers. Use the comparisons to route prompt text on a value,
+for example `{{ if eq .previous.nodes.deep_qa.output.verdict "fail" }}…{{ end }}`. Comparisons
+order numbers by value whatever their source, so `{{ if lt .nodes.scan.output.count 3 }}` works for
+integer and decimal outputs alike. Use unquoted numeric literals for numeric comparisons. When
+a number is compared with a quoted string, rendering returns an incompatible-types error.
+JSON numbers compare exactly; decimal exponents must be between -4096 and 4096.
+Builtins that invoke values or format and escape output (`call`, `print`, `printf`, `println`,
+`html`, `js`, `urlquery`) are rejected at validation. Dynamic lookup builtins (`index`, `slice`) are also rejected because they bypass
+reference-path validation. CEL conditions are compiled and cost-limited at publish time.
+
+## snake_case node IDs
+
+Node IDs match `^[a-z][a-z0-9_]*$` — lowercase, snake_case, starting with a letter. This is
+enforced (`node_id_invalid`) and is deliberate: the same ID is valid verbatim in a `{{ }}` template
+and a CEL condition, so there is never a preprocessing or escaping step between the two surfaces.
+
+```yaml
+graph:
+  nodes:
+    - { id: load_tasks, class: action, kind: ext__notes__list, params: { pattern: "tasks/*.md" } }
+    - {
+        id: run_task,
+        class: action,
+        kind: run-agent,
+        params: { agent: "{{ .inputs.implementer }}", prompt: "Do {{ .item.title }}" },
+      }
+  edges:
+    - { from: load_tasks, to: run_task }
+```
+
+## Watch-events `events:`
+
+A [`watch-events`](/docs/loops/dsl-reference#watch-events-source) source declares a typed
+`events` list — the subscriptions the Loop parks on. Each entry is `{ kind, filter }`: `kind` is a
+supported hook-event name, and `filter` is a CEL condition (returning `bool`) over `event`, `inputs`,
+and `nodes`. An omitted `filter` matches every event of that kind in the Loop's workspace.
+
+```yaml
+- id: on_task_done
+  class: source
+  kind: watch-events
+  events:
+    - kind: task.status_changed
+      filter: "event.payload.to_status == 'completed' && event.task_id == inputs.task_id"
+    - kind: loop.terminal # no filter → every loop terminal in this workspace
+```
+
+The `event` root exposes the promoted correlation fields — `event.kind`, `event.seq`, `event.at`,
+`event.workspace_id`, `event.task_id`, `event.run_id`, `event.loop_run_id`, `event.loop_name`,
+`event.session_id` — plus `event.payload`, a per-kind map (e.g. `event.payload.to_status` for
+`task.status_changed`). `event.seq` is the durable, monotonic replay position within its watch
+stream. For loop events, it is shared across runs and is separate from the per-run SSE sequence on
+`GET /loop-runs/:run_id/events`. Filters over `event` and `inputs` are exact; a filter that references
+`nodes.*` is intentionally over-inclusive at the doorbell and re-checked exactly at wake, so prefer
+`inputs`-only filters when you want a precise wake.
+
+## Start binding mappings
+
+Start bindings map an activation payload into inputs with the same grammar, restricted in v1 to a
+flat `{{ .trigger.payload.<field> }}` per input. Scheduled starts are static-inputs-only — a
+mapping is rejected — because a clock fire has no payload. See
+[automation](/docs/automation/events) for how triggers carry the payload.
+
+`run-loop.params.inputs.reviewed_worktree` is an optional reserved JSON string input containing
+`{worktree_id: string, include_paths: string[], fingerprint: string}`. It carries the original
+scoped worktree exit-plan proof; `fingerprint` is a SHA-256 hex digest and the include set contains
+1–4096 exact relative files. The child declares `reviewed_worktree: {type: string, required: false}`.
+Without the original proof, recovery reruns the review instead of adopting its previous result.

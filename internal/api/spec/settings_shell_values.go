@@ -1,0 +1,20 @@
+package spec
+
+import "github.com/compozy/compozy/internal/api/contract"
+
+func settingsShellSessionSortValues() []string {
+	return []string{
+		string(contract.SettingsShellSessionSortCreated),
+		string(contract.SettingsShellSessionSortName),
+		string(contract.SettingsShellSessionSortLastActivity),
+		string(contract.SettingsShellSessionSortAttention),
+		string(contract.SettingsShellSessionSortManual),
+	}
+}
+
+func settingsShellSessionScopeValues() []string {
+	return []string{
+		string(contract.SettingsShellSessionScopeWorkspace),
+		string(contract.SettingsShellSessionScopeAllWorkspaces),
+	}
+}

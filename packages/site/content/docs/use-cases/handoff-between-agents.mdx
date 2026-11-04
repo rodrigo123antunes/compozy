@@ -1,0 +1,33 @@
+---
+title: Handoff Between Agents
+description: Use durable task state and managed sessions to hand work from one agent to another.
+---
+
+Use a task when a handoff needs an owner, a run history, review, or retry visibility. Put the
+requested outcome, relevant files, completed work, and remaining checks in the task description.
+The next agent reads that persisted context rather than depending on a conversation window.
+
+## Start the work
+
+```bash
+compozy task create --scope workspace --workspace project --title "Review the release change"
+compozy task start <task-id> -o json
+compozy task run list <task-id> -o json
+```
+
+Choose worker and reviewer agents in [Task setup](/docs/autonomy/execution-profiles). A workspace
+[coordinator](/docs/autonomy/coordinator) can decompose work and create follow-up tasks when enabled.
+Claim tokens, leases, and the task service remain authoritative for ownership and completion.
+
+## Preserve the handoff evidence
+
+Record the task ID, run ID, session ID, inspected files, produced artifacts, and validation results.
+Use the task's **Runs** and **Activity** views to inspect progress. Read the session's history for
+the work itself. For a single interactive follow-up, prompt or steer the managed session through
+[session orchestration](/docs/sessions/orchestration).
+
+## Review and continue
+
+When a task requires review, submit evidence through the [review gate](/docs/autonomy/review-gate).
+A rejected run can produce a continuation run with persisted guidance. A passing review records the
+accepted result. Neither an agent message nor a finished subprocess replaces that task transition.

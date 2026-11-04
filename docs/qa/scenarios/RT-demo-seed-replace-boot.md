@@ -1,0 +1,32 @@
+---
+id: RT-demo-seed-replace-boot
+area: RT
+title: Recreate a populated demo seed without changing history
+persona: Dora
+journey: J-prepare-demo-recording
+expected: Replacing the seed keeps counts stable, removes obsolete seed-owned state, and daemon boot preserves every imported Loop outcome as read-only history
+entry_points: go run ./scripts/demo-seed; compozy daemon start; GET /api/workspaces
+qa_status: pass
+bug_ids:
+fix_status:
+retest_status:
+fix_commits:
+evidence: /Users/pedronauck/dev/qa-labs/compozy-demo-seed-history-20260822-181255-352261-lab/qa-artifacts/qa/seed-replace.json; /Users/pedronauck/dev/qa-labs/compozy-demo-seed-history-20260822-181255-352261-lab/qa-artifacts/qa/loop-runs-api-after-replace-boot.json; /Users/pedronauck/dev/qa-labs/compozy-demo-seed-history-20260822-181255-352261-lab/qa-artifacts/qa/historical-run-detail.png; /Users/pedronauck/dev/qa-labs/compozy-demo-seed-history-20260822-181255-352261-lab/qa-artifacts/qa/historical-runs-list.png; /Users/pedronauck/dev/qa-labs/compozy-demo-seed-history-20260822-181255-352261-lab/qa-artifacts/qa/unowned-replace-refusal.txt
+last_report: docs/qa/reports/2026-08-22-demo-seed-history.md
+overlaps:
+---
+
+This scenario owns the cross-surface seed contract. It covers repeatable fixture creation, safe ownership boundaries, live-daemon reconciliation, and truthful read-only presentation of imported Loop runs.
+
+The 2026-08-22 targeted walk confirmed stable IDs and counts across replace, zero live Loop aggregates after daemon boot, read-only historical controls, preserved unowned files, and the populated Goal, worktree, memory, notification, automation, task, and transcript surfaces.
+
+QA impact 2026-10-07 (memory removal): the demo seed no longer seeds memory, so the "memory" surface in the 2026-08-22 walk above is historical; every other seeded surface is unchanged. No verdict change.
+
+Telemetry isolation follow-up (2026-11-04): replacing a seeded workspace reuses its identity.
+Re-registration must purge telemetry from the deleted registration before removing its tombstone,
+so new summaries remain writable and visible without reviving deleted summaries. The real SQLite
+`TestSeed/Should_persist_one_coherent_scenario_and_replace_it_without_duplication` suite verifies
+successive replacements. The live-daemon walk remains owned by CI under the host-load restriction.
+Historical migration-prefix repositories have no telemetry store: workspace registration must still
+work before the telemetry schema exists. `TestGlobalDBSessionPromptAdmissionMigration` owns that
+upgrade fixture path; current-schema replacement retains the telemetry ownership checks above.

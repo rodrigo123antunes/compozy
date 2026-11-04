@@ -1,0 +1,565 @@
+package globaldb
+
+import (
+	"context"
+	"database/sql"
+	"errors"
+	"path/filepath"
+	"strings"
+	"testing"
+
+	"github.com/compozy/compozy/internal/store"
+	"github.com/compozy/compozy/internal/testutil"
+)
+
+func TestGlobalDBInstanceTriggerRebuild(t *testing.T) {
+	t.Run("Should preserve triggers and cascading catalog rows across rebuild and reopen", func(t *testing.T) {
+		t.Parallel()
+		path := filepath.Join(t.TempDir(), GlobalDatabaseName)
+		prefix, err := openGlobalMigrationPrefixDatabase(t, path, globalMigrationPrefixBefore(t, "00180_schema.sql"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		ctx := t.Context()
+		_, seedErr := prefix.ExecContext(ctx, `INSERT INTO automation_triggers
+ (id,profile_id,scope,name,agent_name,prompt,event,enabled,retry,fire_limit,source,target_kind,webhook_id,created_at,updated_at)
+ VALUES ('preserve-trigger',?,'global','Preserved trigger','coder','Review event','webhook',1,'{}','{}','dynamic','agent','preserved-webhook','2026-11-03T00:00:00Z','2026-11-03T00:00:00Z')`, store.DefaultProfileID)
+		if seedErr == nil {
+			_, seedErr = prefix.ExecContext(ctx, `INSERT INTO automation_trigger_catalog_entries
+ (trigger_id,scope,event,source,source_rank,name,enabled,search_name,search_agent_name,search_prompt,search_scope,search_source,search_event,search_endpoint_slug,search_webhook_id)
+ VALUES ('preserve-trigger','global','webhook','dynamic',2,'Preserved trigger',1,'preserved trigger','coder','review event','global','dynamic','webhook','','preserved-webhook')`)
+		}
+		if seedErr == nil {
+			_, seedErr = prefix.ExecContext(
+				ctx,
+				"INSERT INTO automation_trigger_catalog_filter_terms (trigger_id,value) VALUES ('preserve-trigger','preserved-term')",
+			)
+		}
+		if err := errors.Join(seedErr, prefix.Close()); err != nil {
+			t.Fatal(err)
+		}
+		upgraded, err := openGlobalMigrationUpgrade(t, path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := upgraded.Close(ctx); err != nil {
+			t.Fatal(err)
+		}
+		reopened, err := OpenGlobalDB(ctx, path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() {
+			if err := reopened.Close(context.Background()); err != nil {
+				t.Error(err)
+			}
+		})
+		var name, scope, term string
+		if err := reopened.DB().
+			QueryRowContext(ctx, `SELECT t.name,t.target_instance_scope,f.value FROM automation_triggers t JOIN automation_trigger_catalog_entries c ON c.trigger_id=t.id JOIN automation_trigger_catalog_filter_terms f ON f.trigger_id=t.id WHERE t.id='preserve-trigger'`).
+			Scan(&name, &scope, &term); err != nil {
+			t.Fatal(err)
+		}
+		if name != "Preserved trigger" || scope != "" || term != "preserved-term" {
+			t.Fatalf("preserved row: name=%q scope=%q term=%q", name, scope, term)
+		}
+		if _, err := reopened.DB().
+			ExecContext(ctx, "UPDATE automation_triggers SET target_kind='agent_instance',target_instance_scope='global' WHERE id='preserve-trigger'"); err != nil {
+			t.Fatal(err)
+		}
+		loaded, err := reopened.GetTrigger(ctx, "preserve-trigger")
+		if err != nil || loaded.TargetInstanceScope != "global" {
+			t.Fatalf("target scope read: %+v %v", loaded, err)
+		}
+		_, duplicateErr := reopened.DB().ExecContext(ctx, `INSERT INTO automation_triggers
+ (id,profile_id,scope,name,agent_name,prompt,event,enabled,retry,fire_limit,source,target_kind,created_at,updated_at)
+ VALUES ('duplicate-trigger',?,'global','Preserved trigger','coder','Review event','webhook',1,'{}','{}','dynamic','agent','2026-11-03T00:00:00Z','2026-11-03T00:00:00Z')`, store.DefaultProfileID)
+		if duplicateErr == nil {
+			t.Fatal("partial unique index did not reject a duplicate global name")
+		}
+		status, err := store.Status(ctx, reopened.DB(), MigrationStream())
+		if err != nil {
+			t.Fatal(err)
+		}
+		assertCompleteMigrationStream(t, status, MigrationStream())
+	})
+}
+
+// Suite: global automation trigger event hard cut
+// Invariant: upgrading removes only trigger definitions no runtime producer can activate.
+// Boundary IN: a v59 global database containing producer-backed and impossible trigger events.
+// Boundary OUT: runtime registration, which consumes the migrated definitions.
+func TestGlobalDBTriggerEventHardCutMigration(t *testing.T) {
+	t.Parallel()
+	t.Run(
+		"Should delete impossible triggers and their overlays while preserving supported definitions and run history",
+		func(t *testing.T) {
+			t.Parallel()
+
+			path := filepath.Join(t.TempDir(), GlobalDatabaseName)
+			prefixDB, err := openGlobalMigrationPrefixDatabase(
+				t,
+				path,
+				globalMigrationPrefixBefore(t, "00060_trigger_event_hard_cut.sql"),
+			)
+			if err != nil {
+				t.Fatalf("OpenSQLiteDatabase(v59 prefix) error = %v", err)
+			}
+			ctx := globalMigrationTestContext(t)
+			seedTriggerEventHardCutFixture(ctx, t, prefixDB)
+			if err := applyGlobalMigrationPrefix(
+				t,
+				prefixDB,
+				globalMigrationPrefixBefore(t, "00061_schema.sql"),
+			); err != nil {
+				t.Fatal(err)
+			}
+			assertTriggerEventHardCutState(ctx, t, prefixDB, false)
+			if err := prefixDB.Close(); err != nil {
+				t.Fatalf("prefixDB.Close() error = %v", err)
+			}
+
+			upgraded, err := openGlobalMigrationUpgrade(t, path)
+			if err != nil {
+				t.Fatalf("OpenGlobalDB(v60 upgrade) error = %v", err)
+			}
+			assertTriggerEventHardCutState(ctx, t, upgraded.db, true)
+			status, err := store.Status(ctx, upgraded.db, MigrationStream())
+			if err != nil {
+				t.Fatalf("Status(upgraded) error = %v", err)
+			}
+			assertCompleteMigrationStream(t, status, MigrationStream())
+			if err := upgraded.Close(ctx); err != nil {
+				t.Fatalf("Close(upgraded) error = %v", err)
+			}
+
+			reopened, err := OpenGlobalDB(testutil.Context(t), path)
+			if err != nil {
+				t.Fatalf("OpenGlobalDB(reopen) error = %v", err)
+			}
+			t.Cleanup(func() {
+				if closeErr := reopened.Close(testutil.Context(t)); closeErr != nil {
+					t.Errorf("Close(reopened) error = %v", closeErr)
+				}
+			})
+			assertTriggerEventHardCutState(testutil.Context(t), t, reopened.db, true)
+		},
+	)
+}
+
+func seedTriggerEventHardCutFixture(ctx context.Context, t *testing.T, db *sql.DB) {
+	t.Helper()
+
+	events := []struct {
+		id    string
+		event string
+	}{
+		{id: "trg-session", event: "session.stopped"},
+		{id: "trg-memory", event: "memory.consolidated"},
+		{id: "trg-hook-internal", event: "hook.release review.v2.completed"},
+		{id: "trg-extension-free-form", event: "ext. release"},
+		{id: "trg-unknown", event: "loop.terminal"},
+		{id: "trg-hook-prefix-padding", event: "hook. release.completed"},
+		{id: "trg-hook-suffix-padding", event: "hook.release .completed"},
+		{id: "trg-surrounding-padding", event: " session.stopped"},
+		{id: "trg-empty-extension", event: "ext.\u2003"},
+	}
+	for _, fixture := range events {
+		if _, err := db.ExecContext(ctx, `INSERT INTO automation_triggers (
+			id, scope, name, agent_name, prompt, event, enabled, retry, fire_limit,
+			source, created_at, updated_at
+		) VALUES (?, 'global', ?, 'reviewer', 'Review the event.', ?, 1,
+			'{"strategy":"none","max_retries":0,"base_delay":""}',
+			'{"max":12,"window":"1h"}', 'dynamic',
+			'2026-08-12T12:00:00Z', '2026-08-12T12:00:00Z')`, fixture.id, fixture.id, fixture.event); err != nil {
+			t.Fatalf("seed trigger %q error = %v", fixture.id, err)
+		}
+		if _, err := db.ExecContext(ctx, `INSERT INTO automation_trigger_overlays (
+			trigger_id, enabled_override, updated_at
+		) VALUES (?, 0, '2026-08-12T12:01:00Z')`, fixture.id); err != nil {
+			t.Fatalf("seed trigger overlay %q error = %v", fixture.id, err)
+		}
+	}
+	for _, triggerID := range []string{"trg-session", "trg-unknown"} {
+		if _, err := db.ExecContext(ctx, `INSERT INTO automation_trigger_catalog_entries (
+			trigger_id, scope, event, source, source_rank, name, enabled,
+			search_name, search_agent_name, search_prompt, search_scope,
+			search_source, search_event, search_endpoint_slug, search_webhook_id
+		) VALUES (?, 'global', 'session.stopped', 'dynamic', 1, ?, 1,
+			?, 'reviewer', 'review the event', 'global', 'dynamic',
+			'session.stopped', '', '')`, triggerID, triggerID, triggerID); err != nil {
+			t.Fatalf("seed trigger catalog entry %q error = %v", triggerID, err)
+		}
+		if _, err := db.ExecContext(ctx, `INSERT INTO automation_trigger_catalog_filter_terms (
+			trigger_id, value
+		) VALUES (?, 'reviewer')`, triggerID); err != nil {
+			t.Fatalf("seed trigger catalog filter term %q error = %v", triggerID, err)
+		}
+	}
+	if _, err := db.ExecContext(ctx, `INSERT INTO automation_runs (
+		id, trigger_id, status, attempt, started_at, ended_at, metadata_json
+	) VALUES (
+		'run-invalid-history', 'trg-unknown', 'completed', 1,
+		'2026-08-12T12:02:00Z', '2026-08-12T12:03:00Z', '{}'
+	)`); err != nil {
+		t.Fatalf("seed invalid trigger run history error = %v", err)
+	}
+	seedTriggerEventHardCutResource(ctx, t, db, "trg-resource-valid", "ext. release")
+	seedTriggerEventHardCutResource(ctx, t, db, "trg-resource-invalid", "loop.terminal")
+	seedTriggerEventHardCutMalformedResource(ctx, t, db)
+	if _, err := db.ExecContext(ctx, `INSERT INTO automation_trigger_overlays (
+		trigger_id, enabled_override, updated_at
+	) VALUES
+		('trg-resource-valid', 0, '2026-08-12T12:01:00Z'),
+		('trg-resource-invalid', 0, '2026-08-12T12:01:00Z'),
+		('trg-resource-malformed', 0, '2026-08-12T12:01:00Z')`); err != nil {
+		t.Fatalf("seed trigger resource overlays error = %v", err)
+	}
+	for _, triggerID := range []string{"trg-unknown", "trg-resource-invalid"} {
+		if _, err := db.ExecContext(ctx, `INSERT INTO gateway_ingress_bindings (
+			subject_kind, subject_id, scope_kind, endpoint_generation, confirmed_at
+		) VALUES (
+			'webhook_trigger', ?, 'global', 1, '2026-08-12T12:04:00Z'
+		)`, triggerID); err != nil {
+			t.Fatalf("seed invalid trigger ingress binding %q error = %v", triggerID, err)
+		}
+		ref := "vault:automation/triggers/" + triggerID + "/webhook-secret"
+		if _, err := db.ExecContext(ctx, `INSERT INTO vault_secrets (
+			ref, kind, encrypted_value, created_at, updated_at
+		) VALUES (?, 'webhook_secret', 'encrypted',
+			'2026-08-12T12:04:00Z', '2026-08-12T12:04:00Z')`, ref); err != nil {
+			t.Fatalf("seed invalid trigger secret %q error = %v", triggerID, err)
+		}
+	}
+	if _, err := db.ExecContext(ctx, `UPDATE automation_triggers
+		SET webhook_secret_ref = 'vault:automation/triggers/trg-unknown/webhook-secret'
+		WHERE id = 'trg-unknown'`); err != nil {
+		t.Fatalf("bind invalid legacy trigger secret error = %v", err)
+	}
+}
+
+func seedTriggerEventHardCutMalformedResource(ctx context.Context, t *testing.T, db *sql.DB) {
+	t.Helper()
+
+	if _, err := db.ExecContext(ctx, `INSERT INTO resource_records (
+		kind, id, version, scope_kind, owner_kind, owner_id, source_kind, source_id,
+		spec_json, created_at, updated_at
+	) VALUES (
+		'automation.trigger', 'trg-resource-malformed', 1, 'global',
+		'operator', 'operator', 'dynamic', 'trg-resource-malformed', '{',
+		'2026-08-12T12:00:00Z', '2026-08-12T12:00:00Z'
+	)`); err != nil {
+		t.Fatalf("seed malformed trigger resource error = %v", err)
+	}
+}
+
+func seedTriggerEventHardCutResource(
+	ctx context.Context,
+	t *testing.T,
+	db *sql.DB,
+	triggerID string,
+	event string,
+) {
+	t.Helper()
+
+	secretRef := "vault:automation/triggers/" + triggerID + "/webhook-secret"
+	if _, err := db.ExecContext(ctx, `INSERT INTO resource_records (
+		kind, id, version, scope_kind, owner_kind, owner_id, source_kind, source_id,
+		spec_json, created_at, updated_at
+	) VALUES (
+		'automation.trigger', ?, 1, 'global', 'operator', 'operator', 'dynamic', ?,
+		json_object(
+			'id', ?, 'scope', 'global', 'name', ?, 'agent_name', 'reviewer',
+			'prompt', 'Review the event.', 'event', ?, 'enabled', 1,
+			'source', 'dynamic', 'webhook_secret_ref', ?
+		), '2026-08-12T12:00:00Z', '2026-08-12T12:00:00Z'
+	)`, triggerID, triggerID, triggerID, triggerID, event, secretRef); err != nil {
+		t.Fatalf("seed trigger resource %q error = %v", triggerID, err)
+	}
+}
+
+func assertTriggerEventHardCutState(ctx context.Context, t *testing.T, db *sql.DB, memoryRetired bool) {
+	t.Helper()
+
+	wantTriggerIDs := []string{
+		"trg-extension-free-form",
+		"trg-hook-internal",
+		"trg-memory",
+		"trg-session",
+	}
+	if memoryRetired {
+		wantTriggerIDs = []string{"trg-extension-free-form", "trg-hook-internal", "trg-session"}
+	}
+	if got := triggerEventHardCutIDs(
+		ctx,
+		t,
+		db,
+		"automation_triggers",
+		"id",
+	); !testutil.EqualStringSlices(got, wantTriggerIDs) {
+		t.Fatalf("automation trigger ids = %#v, want %#v", got, wantTriggerIDs)
+	}
+	wantOverlayIDs := []string{
+		"trg-extension-free-form",
+		"trg-hook-internal",
+		"trg-memory",
+		"trg-resource-valid",
+		"trg-session",
+	}
+	if memoryRetired {
+		wantOverlayIDs = []string{"trg-extension-free-form", "trg-hook-internal", "trg-resource-valid", "trg-session"}
+	}
+	if got := triggerEventHardCutIDs(
+		ctx,
+		t,
+		db,
+		"automation_trigger_overlays",
+		"trigger_id",
+	); !testutil.EqualStringSlices(got, wantOverlayIDs) {
+		t.Fatalf("automation trigger overlay ids = %#v, want %#v", got, wantOverlayIDs)
+	}
+	if got := triggerEventHardCutIDs(
+		ctx,
+		t,
+		db,
+		"automation_runs",
+		"trigger_id",
+	); !testutil.EqualStringSlices(got, []string{"trg-unknown"}) {
+		t.Fatalf("automation run trigger ids = %#v, want preserved invalid history", got)
+	}
+	if got := triggerEventHardCutIDs(
+		ctx,
+		t,
+		db,
+		"automation_trigger_catalog_entries",
+		"trigger_id",
+	); !testutil.EqualStringSlices(got, []string{"trg-session"}) {
+		t.Fatalf("automation trigger catalog ids = %#v, want supported trigger only", got)
+	}
+	if got := triggerEventHardCutIDs(
+		ctx,
+		t,
+		db,
+		"automation_trigger_catalog_filter_terms",
+		"trigger_id",
+	); !testutil.EqualStringSlices(got, []string{"trg-session"}) {
+		t.Fatalf("automation trigger catalog filter ids = %#v, want supported trigger only", got)
+	}
+	if got := triggerEventHardCutIDsWhere(
+		ctx,
+		t,
+		db,
+		"resource_records",
+		"id",
+		"kind = 'automation.trigger'",
+	); !testutil.EqualStringSlices(got, []string{"trg-resource-valid"}) {
+		t.Fatalf("automation trigger resource ids = %#v, want supported resource", got)
+	}
+	if got := triggerEventHardCutIDsWhere(
+		ctx,
+		t,
+		db,
+		"gateway_ingress_bindings",
+		"subject_id",
+		"subject_kind = 'webhook_trigger'",
+	); len(got) != 0 {
+		t.Fatalf("invalid trigger ingress bindings = %#v, want none", got)
+	}
+	if got := triggerEventHardCutIDsWhere(
+		ctx,
+		t,
+		db,
+		"vault_secrets",
+		"ref",
+		"kind = 'webhook_secret'",
+	); len(got) != 0 {
+		t.Fatalf("invalid trigger secrets = %#v, want none", got)
+	}
+}
+
+func triggerEventHardCutIDs(ctx context.Context, t *testing.T, db *sql.DB, table string, column string) []string {
+	t.Helper()
+	return triggerEventHardCutIDsWhere(ctx, t, db, table, column, "1 = 1")
+}
+
+func triggerEventHardCutIDsWhere(
+	ctx context.Context,
+	t *testing.T,
+	db *sql.DB,
+	table string,
+	column string,
+	predicate string,
+) []string {
+	t.Helper()
+
+	query := "SELECT " + column + " FROM " + table + " WHERE " + predicate + " ORDER BY " + column
+	rows, err := db.QueryContext(ctx, query)
+	if err != nil {
+		t.Fatalf("query %s.%s error = %v", table, column, err)
+	}
+	defer func() {
+		if closeErr := rows.Close(); closeErr != nil {
+			t.Errorf("close %s.%s rows error = %v", table, column, closeErr)
+		}
+	}()
+
+	var ids []string
+	for rows.Next() {
+		var id string
+		if err := rows.Scan(&id); err != nil {
+			t.Fatalf("scan %s.%s error = %v", table, column, err)
+		}
+		ids = append(ids, id)
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatalf("iterate %s.%s error = %v", table, column, err)
+	}
+	return ids
+}
+
+// IT-006 invariant: retirement deletes dead trigger ownership while preserving run
+// history and other entries in shared overlays. Owner: global SQLite migration.
+func TestGlobalDBMemoryTriggerRetirementMigration(t *testing.T) {
+	t.Parallel()
+	t.Run(
+		"Should retire memory triggers and owned resources while preserving supported triggers and history",
+		func(t *testing.T) {
+			t.Parallel()
+			ctx := globalMigrationTestContext(t)
+			path := filepath.Join(t.TempDir(), GlobalDatabaseName)
+			prior, err := openGlobalMigrationPrefixDatabase(
+				t,
+				path,
+				globalMigrationPrefixBefore(t, "00130_retire_memory.sql"),
+			)
+			if err != nil {
+				t.Fatal(err)
+			}
+			for _, id := range []string{"retired-trigger", "kept-trigger"} {
+				event := "memory.consolidated"
+				if id == "kept-trigger" {
+					event = "session.stopped"
+				}
+				if _, err := prior.ExecContext(ctx, `INSERT INTO automation_triggers (
+				id,profile_id,scope,name,agent_name,prompt,event,retry,fire_limit,webhook_secret_ref,created_at,updated_at
+			) VALUES (?,'00000000000000000000000000','global',?,'coder','Prompt',?,'{}','{}',?,'2026-10-07','2026-10-07')`, id, id, event, "vault:automation/triggers/"+id+"/webhook-secret"); err != nil {
+					t.Fatal(err)
+				}
+				if _, err := prior.ExecContext(ctx, `INSERT INTO resource_records (
+                kind,id,version,scope_kind,owner_kind,owner_id,source_kind,source_id,spec_json,created_at,updated_at
+            ) VALUES ('automation.trigger',?,1,'user','user','operator','user','operator',
+                json_object('id',?,'scope','global','name',?,'event',?,'webhook_secret_ref',?),
+                '2026-10-07','2026-10-07')`, id+"-resource", id+"-resource", id+"-resource", event,
+					"vault:automation/triggers/"+id+"-resource/webhook-secret"); err != nil {
+					t.Fatal(err)
+				}
+				for _, subject := range []string{id, id + "-resource"} {
+					for _, statement := range []string{
+						`INSERT INTO automation_trigger_overlays (trigger_id,enabled_override,updated_at) VALUES (?,0,'2026-10-07')`,
+						`INSERT INTO gateway_ingress_bindings (subject_kind,subject_id,scope_kind,endpoint_generation,confirmed_at) VALUES ('webhook_trigger',?,'global',1,'2026-10-07')`,
+						`INSERT INTO vault_secrets (ref,kind,encrypted_value,created_at,updated_at) VALUES ('vault:automation/triggers/' || ? || '/webhook-secret','webhook_secret','cipher','2026-10-07','2026-10-07')`,
+					} {
+						if _, err := prior.ExecContext(ctx, statement, subject); err != nil {
+							t.Fatal(err)
+						}
+					}
+				}
+				if _, err := prior.ExecContext(
+					ctx,
+					`INSERT INTO automation_runs (id,profile_id,trigger_id,status,attempt,metadata_json) VALUES (?,'00000000000000000000000000',?,'completed',1,'{}')`,
+					id,
+					id,
+				); err != nil {
+					t.Fatal(err)
+				}
+				if _, err := prior.ExecContext(ctx, `INSERT INTO automation_trigger_catalog_entries (
+				trigger_id,scope,workspace_id,event,source,source_rank,name,enabled,search_name,search_agent_name,search_prompt,search_scope,search_source,search_event,search_endpoint_slug,search_webhook_id
+			) VALUES (?,'global','',?,'dynamic',1,?,1,?,'coder','prompt','global','dynamic',?,'','')`, id, event, id, id, event); err != nil {
+					t.Fatal(err)
+				}
+				if _, err := prior.ExecContext(
+					ctx,
+					`INSERT INTO automation_trigger_catalog_filter_terms (trigger_id,value) VALUES (?,'fixture')`,
+					id,
+				); err != nil {
+					t.Fatal(err)
+				}
+			}
+			keptQueries := []string{
+				`SELECT * FROM automation_triggers WHERE id='kept-trigger'`,
+				`SELECT * FROM automation_trigger_overlays WHERE trigger_id LIKE 'kept-%' ORDER BY trigger_id`,
+				`SELECT * FROM automation_runs ORDER BY id`,
+				`SELECT * FROM automation_trigger_catalog_entries WHERE trigger_id='kept-trigger'`,
+				`SELECT * FROM automation_trigger_catalog_filter_terms WHERE trigger_id='kept-trigger'`,
+				`SELECT * FROM resource_records WHERE id='kept-trigger-resource'`,
+				`SELECT * FROM gateway_ingress_bindings WHERE subject_id LIKE 'kept-%' ORDER BY subject_id`,
+				`SELECT * FROM vault_secrets WHERE ref LIKE '%/kept-%' ORDER BY ref`,
+			}
+			before := make([]string, len(keptQueries))
+			for i, query := range keptQueries {
+				rows, err := prior.QueryContext(ctx, query)
+				if err != nil {
+					t.Fatal(err)
+				}
+				columns, err := rows.Columns()
+				closeErr := rows.Close()
+				if err != nil {
+					t.Fatal(err)
+				}
+				if closeErr != nil {
+					t.Fatal(closeErr)
+				}
+				query = strings.Replace(query, "SELECT *", "SELECT "+strings.Join(columns, ","), 1)
+				keptQueries[i] = query
+				before[i] = memoryRetirementRows(t, prior, query)
+			}
+			if err := prior.Close(); err != nil {
+				t.Fatal(err)
+			}
+			upgraded, err := openGlobalMigrationUpgrade(t, path)
+			if err != nil {
+				t.Fatal(err)
+			}
+			t.Cleanup(func() {
+				if err := upgraded.Close(testutil.Context(t)); err != nil {
+					t.Error(err)
+				}
+			})
+			for i, query := range keptQueries {
+				if got := memoryRetirementRows(t, upgraded.db, query); got != before[i] {
+					t.Fatalf("kept trigger state changed for %s: got %s want %s", query, got, before[i])
+				}
+			}
+			for _, fixture := range []struct{ table, column string }{
+				{"automation_triggers", "id"}, {"automation_trigger_overlays", "trigger_id"},
+				{"automation_trigger_catalog_entries", "trigger_id"}, {"automation_trigger_catalog_filter_terms", "trigger_id"},
+				{"resource_records", "id"}, {"gateway_ingress_bindings", "subject_id"},
+			} {
+				if got := triggerEventHardCutIDsWhere(
+					ctx,
+					t,
+					upgraded.db,
+					fixture.table,
+					fixture.column,
+					fixture.column+" LIKE 'retired-%'",
+				); len(
+					got,
+				) != 0 {
+					t.Fatalf("retired %s = %v", fixture.table, got)
+				}
+			}
+			var secrets, violations int
+			if err := upgraded.db.QueryRowContext(ctx, `SELECT count(*) FROM vault_secrets WHERE ref LIKE '%/retired-%'`).
+				Scan(&secrets); err != nil {
+				t.Fatal(err)
+			}
+			if err := upgraded.db.QueryRowContext(ctx, `SELECT count(*) FROM pragma_foreign_key_check`).
+				Scan(&violations); err != nil {
+				t.Fatal(err)
+			}
+			if secrets != 0 || violations != 0 {
+				t.Fatalf("retired secrets/FK violations = %d/%d", secrets, violations)
+			}
+		},
+	)
+}

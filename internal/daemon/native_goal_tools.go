@@ -1,0 +1,392 @@
+package daemon
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"strings"
+	"time"
+
+	"github.com/compozy/compozy/internal/api/contract"
+	core "github.com/compozy/compozy/internal/api/core"
+	looppkg "github.com/compozy/compozy/internal/loop"
+	goalpkg "github.com/compozy/compozy/internal/loop/goal"
+	"github.com/compozy/compozy/internal/session"
+	toolspkg "github.com/compozy/compozy/internal/tools"
+)
+
+type nativeGoalRuntime interface {
+	findGoalReportTarget(
+		context.Context,
+		looppkg.WorkspaceID,
+		string,
+	) (goalpkg.ToolReportTarget, bool, error)
+	resolveActiveGoalOriginAlias(context.Context, looppkg.WorkspaceID, string) (string, bool, error)
+	recordGoalReport(context.Context, goalpkg.RecordToolReportRequest) (goalpkg.ReportIntent, error)
+}
+
+func (n *daemonNativeTools) goalControl(
+	ctx context.Context,
+	scope toolspkg.Scope,
+	req toolspkg.CallRequest,
+) (toolspkg.ToolResult, error) {
+	var input nativeGoalControlInput
+	if err := decodeNativeInput(req, &input); err != nil {
+		return toolspkg.ToolResult{}, err
+	}
+	commandRequest := contract.SessionGoalCommandRequest{
+		Operation: contract.SessionGoalOperation(strings.TrimSpace(input.Operation)),
+		Objective: strings.TrimSpace(input.Objective), ExpectedRunID: strings.TrimSpace(input.ExpectedRunID),
+		Runtime: input.Runtime,
+	}
+	if err := commandRequest.Validate(); err != nil {
+		return toolspkg.ToolResult{}, toolspkg.NewToolError(
+			toolspkg.ErrorCodeInvalidInput, req.ToolID, err.Error(),
+			fmt.Errorf("%w: %w", toolspkg.ErrToolInvalidInput, err), toolspkg.ReasonSchemaInvalid,
+		)
+	}
+	workspaceID, err := n.nativeLoopWorkspaceID(ctx, req.ToolID, input.WorkspaceID, scope)
+	if err != nil {
+		return toolspkg.ToolResult{}, err
+	}
+	if explicit := strings.TrimSpace(input.WorkspaceID); explicit != "" &&
+		strings.TrimSpace(scope.WorkspaceID) != "" && explicit != strings.TrimSpace(scope.WorkspaceID) {
+		return toolspkg.ToolResult{}, nativeScopeMismatchError(req.ToolID, "workspace")
+	}
+	callerSessionID := strings.TrimSpace(scope.SessionID)
+	if callerSessionID == "" {
+		_, callerErr := nativeGoalSessionID(req.ToolID, scope)
+		return toolspkg.ToolResult{}, callerErr
+	}
+	targetSessionID, err := requiredNativeString(req.ToolID, "session_id", input.SessionID)
+	if err != nil {
+		return toolspkg.ToolResult{}, err
+	}
+	service := n.loopService()
+	goalService, ok := service.(core.GoalCommandService)
+	if !ok || goalService == nil {
+		return toolspkg.ToolResult{}, nativeGoalToolError(
+			req.ToolID,
+			errors.New("daemon: Goal control service is unavailable"),
+		)
+	}
+	actor, err := actorContextFromScope(scope)
+	if err != nil {
+		return toolspkg.ToolResult{}, nativeGoalToolError(req.ToolID, err)
+	}
+	caller := session.PromptCaller{
+		Kind:   string(actor.Actor.Kind.Normalize()),
+		ID:     strings.TrimSpace(actor.Actor.Ref),
+		Source: string(actor.Origin.Kind),
+	}
+	if caller.ID == "" {
+		caller.ID = callerSessionID
+	}
+	if err := caller.Validate(); err != nil {
+		return toolspkg.ToolResult{}, nativeGoalToolError(req.ToolID, err)
+	}
+	decision, err := goalService.Handle(ctx, workspaceID, targetSessionID, caller, session.GoalCommand{
+		Verb:          string(commandRequest.Operation),
+		Objective:     commandRequest.Objective,
+		ExpectedRunID: commandRequest.ExpectedRunID,
+		Runtime:       contract.PromptRuntimeSelectionFromPayload(commandRequest.Runtime),
+	})
+	if err != nil {
+		return toolspkg.ToolResult{}, nativeGoalToolError(req.ToolID, err)
+	}
+	if decision.Kind != session.GoalDispatchRespond || decision.Result == nil {
+		return toolspkg.ToolResult{}, nativeGoalToolError(
+			req.ToolID,
+			errors.New("daemon: Goal control returned no structured result"),
+		)
+	}
+	payload, err := core.GoalCommandResultPayloadFromSession(decision.Result)
+	if err != nil {
+		return toolspkg.ToolResult{}, nativeGoalToolError(req.ToolID, err)
+	}
+	return structuredResult(payload, fmt.Sprintf("Goal %s", payload.Outcome))
+}
+
+func (n *daemonNativeTools) goalControlAvailability(
+	_ context.Context,
+	scope toolspkg.Scope,
+) toolspkg.Availability {
+	if n.loopService() == nil {
+		return toolspkg.Unavailable(toolspkg.ReasonDependencyMissing)
+	}
+	if _, _, ok := nativeGoalScope(scope); !ok {
+		return toolspkg.Unavailable(toolspkg.ReasonSessionDenied)
+	}
+	if _, ok := n.loopService().(core.GoalCommandService); !ok {
+		return toolspkg.Unavailable(toolspkg.ReasonDependencyMissing)
+	}
+	return toolspkg.Available()
+}
+
+type nativeGoalReportResult struct {
+	Status      string    `json:"status"`
+	EvidenceRef *string   `json:"evidence_ref"`
+	PromptID    string    `json:"prompt_id"`
+	RecordedAt  time.Time `json:"recorded_at"`
+}
+
+func (n *daemonNativeTools) goalGet(
+	ctx context.Context,
+	scope toolspkg.Scope,
+	req toolspkg.CallRequest,
+) (toolspkg.ToolResult, error) {
+	var input nativeLoopWorkspaceInput
+	if err := decodeNativeInput(req, &input); err != nil {
+		return toolspkg.ToolResult{}, err
+	}
+	workspaceID, err := n.nativeLoopWorkspaceID(ctx, req.ToolID, input.WorkspaceID, scope)
+	if err != nil {
+		return toolspkg.ToolResult{}, err
+	}
+	sessionID, err := nativeGoalSessionID(req.ToolID, scope)
+	if err != nil {
+		return toolspkg.ToolResult{}, err
+	}
+	snapshot, err := n.visibleGoalSnapshot(ctx, workspaceID, sessionID)
+	if err != nil {
+		return toolspkg.ToolResult{}, nativeGoalToolError(req.ToolID, err)
+	}
+	if snapshot == nil {
+		return toolspkg.ToolResult{}, nativeGoalToolError(
+			req.ToolID,
+			nativeGoalNotActiveError("caller session has no visible Goal"),
+		)
+	}
+	payload, err := core.GoalSnapshotPayloadFromSession(snapshot)
+	if err != nil {
+		return toolspkg.ToolResult{}, nativeGoalToolError(req.ToolID, err)
+	}
+	return structuredResult(
+		contract.SessionGoalResponse{Goal: payload},
+		fmt.Sprintf("Goal %s is %s", snapshot.RunID, snapshot.Status),
+	)
+}
+
+func (n *daemonNativeTools) goalReport(
+	ctx context.Context,
+	scope toolspkg.Scope,
+	req toolspkg.CallRequest,
+) (toolspkg.ToolResult, error) {
+	var input nativeGoalReportInput
+	if err := decodeNativeInput(req, &input); err != nil {
+		return toolspkg.ToolResult{}, err
+	}
+	workspaceID, err := n.nativeLoopWorkspaceID(ctx, req.ToolID, input.WorkspaceID, scope)
+	if err != nil {
+		return toolspkg.ToolResult{}, err
+	}
+	sessionID, err := nativeGoalSessionID(req.ToolID, scope)
+	if err != nil {
+		return toolspkg.ToolResult{}, err
+	}
+	runtime := n.goalRuntime()
+	if runtime == nil {
+		return toolspkg.ToolResult{}, nativeGoalToolError(
+			req.ToolID,
+			errors.New("daemon: Goal tool runtime is unavailable"),
+		)
+	}
+	target, found, err := runtime.findGoalReportTarget(
+		ctx,
+		looppkg.WorkspaceID(workspaceID),
+		sessionID,
+	)
+	if err != nil {
+		return toolspkg.ToolResult{}, nativeGoalToolError(req.ToolID, err)
+	}
+	if !found {
+		return toolspkg.ToolResult{}, nativeGoalToolError(
+			req.ToolID,
+			nativeGoalNotActiveError("caller session is not the current Goal prompt binding"),
+		)
+	}
+	actor, err := actorContextFromScope(scope)
+	if err != nil {
+		return toolspkg.ToolResult{}, nativeGoalToolError(req.ToolID, err)
+	}
+	intent, err := runtime.recordGoalReport(ctx, goalpkg.RecordToolReportRequest{
+		Target: target, Status: input.Status, Evidence: input.Evidence,
+		ActorKind: string(actor.Actor.Kind), ActorID: actor.Actor.Ref,
+	})
+	if err != nil {
+		return toolspkg.ToolResult{}, nativeGoalToolError(req.ToolID, err)
+	}
+	var evidenceRef *string
+	if intent.EvidenceRef != "" {
+		value := intent.EvidenceRef
+		evidenceRef = &value
+	}
+	return structuredResult(nativeGoalReportResult{
+		Status: intent.Status, EvidenceRef: evidenceRef,
+		PromptID: intent.PromptID, RecordedAt: intent.RecordedAt,
+	}, fmt.Sprintf("Goal report %s recorded", intent.Status))
+}
+
+func (n *daemonNativeTools) loopTurns(
+	ctx context.Context,
+	scope toolspkg.Scope,
+	req toolspkg.CallRequest,
+) (toolspkg.ToolResult, error) {
+	var input nativeLoopTurnsInput
+	if err := decodeNativeInput(req, &input); err != nil {
+		return toolspkg.ToolResult{}, err
+	}
+	workspaceID, runID, err := n.nativeLoopWorkspaceAndRunID(
+		ctx,
+		req.ToolID,
+		input.WorkspaceID,
+		input.RunID,
+		scope,
+	)
+	if err != nil {
+		return toolspkg.ToolResult{}, err
+	}
+	if input.NodeID != "" && strings.TrimSpace(input.NodeID) == "" {
+		return toolspkg.ToolResult{}, nativeGoalToolError(
+			req.ToolID,
+			fmt.Errorf("%w: Goal turn node must be nonempty when present", looppkg.ErrValidation),
+		)
+	}
+	page, err := n.loopService().ListGoalTurns(ctx, workspaceID, runID, core.GoalTurnListQuery{
+		NodeID: strings.TrimSpace(input.NodeID), ItemIndex: input.ItemIndex,
+		AfterSeq: input.AfterSeq, Limit: input.Limit,
+	})
+	if err != nil {
+		return toolspkg.ToolResult{}, nativeGoalToolError(req.ToolID, err)
+	}
+	payload, err := core.GoalTurnPagePayloadFromSession(page)
+	if err != nil {
+		return toolspkg.ToolResult{}, nativeGoalToolError(req.ToolID, err)
+	}
+	return structuredResult(payload, fmt.Sprintf("%d Goal turns", len(payload.Turns)))
+}
+
+func (n *daemonNativeTools) visibleGoalSnapshot(
+	ctx context.Context,
+	workspaceID string,
+	sessionID string,
+) (*session.GoalSnapshot, error) {
+	service := n.loopService()
+	if service == nil {
+		return nil, errors.New("daemon: Loop service is unavailable")
+	}
+	snapshot, err := service.GetSessionGoal(ctx, workspaceID, sessionID)
+	if err != nil || snapshot != nil {
+		return snapshot, err
+	}
+	runtime := n.goalRuntime()
+	if runtime == nil {
+		return nil, nil
+	}
+	originSessionID, found, err := runtime.resolveActiveGoalOriginAlias(
+		ctx,
+		looppkg.WorkspaceID(workspaceID),
+		sessionID,
+	)
+	if err != nil || !found {
+		return nil, err
+	}
+	return service.GetSessionGoal(ctx, workspaceID, originSessionID)
+}
+
+func (n *daemonNativeTools) goalRuntime() nativeGoalRuntime {
+	service := n.loopService()
+	if service == nil {
+		return nil
+	}
+	runtime, ok := service.(nativeGoalRuntime)
+	if !ok {
+		return nil
+	}
+	return runtime
+}
+
+func nativeGoalScope(scope toolspkg.Scope) (string, string, bool) {
+	workspaceID := strings.TrimSpace(scope.WorkspaceID)
+	sessionID := strings.TrimSpace(scope.SessionID)
+	return workspaceID, sessionID, workspaceID != "" && sessionID != ""
+}
+
+func nativeGoalSessionID(id toolspkg.ToolID, scope toolspkg.Scope) (string, error) {
+	sessionID := strings.TrimSpace(scope.SessionID)
+	if sessionID != "" {
+		return sessionID, nil
+	}
+	return "", toolspkg.NewToolError(
+		toolspkg.ErrorCodeDenied,
+		id,
+		fmt.Sprintf("tool %q requires a caller session", id),
+		toolspkg.ErrToolDenied,
+		toolspkg.ReasonSessionDenied,
+	)
+}
+
+func nativeGoalToolError(id toolspkg.ToolID, err error) error {
+	if err == nil {
+		return nil
+	}
+	if reasonErr, ok := errors.AsType[*looppkg.ReasonError](err); ok {
+		switch reasonErr.Code {
+		case looppkg.ReasonCodeGoalNotActive:
+			return toolspkg.NewToolError(
+				toolspkg.ErrorCodeUnavailable, id, err.Error(),
+				fmt.Errorf("%w: %w", toolspkg.ErrToolUnavailable, err),
+				toolspkg.ReasonGoalNotActive,
+			)
+		case looppkg.ReasonCodeGoalReportConflict:
+			return toolspkg.NewToolError(
+				toolspkg.ErrorCodeConflict, id, err.Error(),
+				fmt.Errorf("%w: %w", toolspkg.ErrToolConflict, err),
+				toolspkg.ReasonGoalReportConflict,
+			)
+		case looppkg.ReasonCodeGoalEvidenceTooLarge:
+			return toolspkg.NewToolError(
+				toolspkg.ErrorCodeInvalidInput, id, err.Error(),
+				fmt.Errorf("%w: %w", toolspkg.ErrToolInvalidInput, err),
+				toolspkg.ReasonGoalEvidenceTooLarge,
+			)
+		}
+	}
+	return nativeLoopToolError(id, err)
+}
+
+func nativeGoalNotActive(err error) bool {
+	reasonErr, ok := errors.AsType[*looppkg.ReasonError](err)
+	return ok && reasonErr.Code == looppkg.ReasonCodeGoalNotActive
+}
+
+func nativeGoalNotActiveError(detail string) error {
+	return &looppkg.ReasonError{
+		Code: looppkg.ReasonCodeGoalNotActive,
+		Err:  fmt.Errorf("%w: %s", looppkg.ErrTransitionConflict, strings.TrimSpace(detail)),
+	}
+}
+
+type nativeGoalReportInput struct {
+	WorkspaceID string `json:"workspace,omitempty"`
+	Status      string `json:"status"`
+	Evidence    string `json:"evidence,omitempty"`
+}
+
+type nativeGoalControlInput struct {
+	WorkspaceID   string                                  `json:"workspace,omitempty"`
+	SessionID     string                                  `json:"session_id"`
+	Operation     string                                  `json:"operation"`
+	Objective     string                                  `json:"objective,omitempty"`
+	ExpectedRunID string                                  `json:"expected_run_id,omitempty"`
+	Runtime       *contract.PromptRuntimeSelectionPayload `json:"runtime,omitzero"`
+}
+
+type nativeLoopTurnsInput struct {
+	WorkspaceID string `json:"workspace,omitempty"`
+	RunID       string `json:"run_id"`
+	NodeID      string `json:"node,omitempty"`
+	ItemIndex   *int   `json:"item,omitzero"`
+	AfterSeq    int64  `json:"after_seq,omitzero"`
+	Limit       int    `json:"limit,omitzero"`
+}

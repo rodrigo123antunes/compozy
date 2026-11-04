@@ -1,0 +1,29 @@
+package loop
+
+import (
+	"context"
+	"time"
+)
+
+type CatalogRunQuery struct {
+	WorkspaceID    WorkspaceID
+	ProfileID      string
+	LoopNames      []string
+	AggregateAfter time.Time
+}
+
+type CatalogRunHead struct {
+	ID             RunID
+	LoopName       string
+	Status         Status
+	BestGeneration *int64
+	BestScore      *float64
+	CreatedAt      time.Time
+}
+
+type CatalogRunReader interface {
+	ListLoopCatalogRunSummaries(
+		ctx context.Context,
+		query CatalogRunQuery,
+	) (map[string]CatalogRunSummary, error)
+}

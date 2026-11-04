@@ -1,0 +1,360 @@
+package extensionpkg
+
+import (
+	"bytes"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"log/slog"
+	"os"
+	"path/filepath"
+	"strings"
+	"time"
+
+	"github.com/BurntSushi/toml"
+
+	compozyconfig "github.com/compozy/compozy/internal/config"
+	"github.com/compozy/compozy/internal/extension/agentplugin"
+	extensionprotocol "github.com/compozy/compozy/internal/extensionprotocol"
+	"github.com/compozy/compozy/internal/modelcatalog"
+)
+
+// LoadManifest reads one extension manifest from dir, preferring native
+// manifests over a supported Agent Plugins root.
+func LoadManifest(dir string) (*Manifest, error) {
+	return loadManifest(dir, "")
+}
+
+// LoadManifestWithAgentPluginDataDir loads a manifest with an explicit
+// instance-owned PLUGIN_DATA path for portable stdio server synthesis.
+func LoadManifestWithAgentPluginDataDir(dir string, dataDir string) (*Manifest, error) {
+	return loadManifest(dir, strings.TrimSpace(dataDir))
+}
+
+func loadManifest(dir string, dataDir string) (*Manifest, error) {
+	manifestDir := strings.TrimSpace(dir)
+	if manifestDir == "" {
+		return nil, &ManifestValidationError{
+			Field:   "dir",
+			Message: "directory is required",
+		}
+	}
+
+	tomlPath := filepath.Join(manifestDir, manifestTOMLFileName)
+	if exists, err := fileExists(tomlPath); err != nil {
+		return nil, fmt.Errorf("extension: stat %q: %w", tomlPath, err)
+	} else if exists {
+		return loadManifestTOML(tomlPath)
+	}
+
+	jsonPath := filepath.Join(manifestDir, manifestJSONFileName)
+	if exists, err := fileExists(jsonPath); err != nil {
+		return nil, fmt.Errorf("extension: stat %q: %w", jsonPath, err)
+	} else if exists {
+		return loadManifestJSON(jsonPath)
+	}
+
+	manifest, err := loadAgentPluginManifest(manifestDir, dataDir)
+	if missing, ok := errors.AsType[*agentplugin.NotManifestError](err); ok {
+		return nil, &ManifestNotFoundError{
+			Dir:   manifestDir,
+			Paths: append([]string{tomlPath, jsonPath}, missing.Checked...),
+		}
+	}
+	return manifest, err
+}
+
+func defaultAgentPluginDataDir(manifestDir string, name string) (string, error) {
+	root := filepath.Clean(manifestDir)
+	homePaths, err := compozyconfig.ResolveHomePathsFrom(filepath.Dir(filepath.Dir(root)))
+	if err != nil {
+		return "", fmt.Errorf("extension: resolve Agent Plugins data home: %w", err)
+	}
+	dataDir, err := homePaths.ExtensionDataPath(name, "", "")
+	if err != nil {
+		return "", fmt.Errorf("extension: resolve Agent Plugins data path: %w", err)
+	}
+	return dataDir, nil
+}
+
+// Validate checks the manifest schema and daemon compatibility.
+func (m *Manifest) Validate() error {
+	if err := validateManifestIdentity(m); err != nil {
+		return err
+	}
+	if err := validateManifestRuntime(m); err != nil {
+		return err
+	}
+	if err := validateManifestResources(m); err != nil {
+		return err
+	}
+	if err := validateManifestCapabilities(m); err != nil {
+		return err
+	}
+	if err := validateManifestPermissions(m); err != nil {
+		return err
+	}
+	return validateManifestPublication(m)
+}
+
+func (m *Manifest) validateModelSourceCapability() error {
+	if !providesCapability(m.Capabilities.Provides, extensionprotocol.CapabilityProvideModelSource) {
+		return nil
+	}
+	if _, err := modelcatalog.SourceKindExtensionID(m.Name); err != nil {
+		return &ManifestValidationError{
+			Field:   manifestNameKey,
+			Value:   m.Name,
+			Message: err.Error(),
+		}
+	}
+	return nil
+}
+
+// IsZero reports whether the duration is unset.
+func (d Duration) IsZero() bool {
+	return time.Duration(d) == 0
+}
+
+// String returns the canonical duration string.
+func (d Duration) String() string {
+	return time.Duration(d).String()
+}
+
+// MarshalJSON emits the duration as a quoted duration string.
+func (d Duration) MarshalJSON() ([]byte, error) {
+	return json.Marshal(d.String())
+}
+
+// MarshalText emits the duration as text.
+func (d Duration) MarshalText() ([]byte, error) {
+	return []byte(d.String()), nil
+}
+
+// UnmarshalJSON accepts duration strings and integer nanoseconds.
+func (d *Duration) UnmarshalJSON(data []byte) error {
+	if string(data) == manifestNullKey {
+		*d = 0
+		return nil
+	}
+
+	var text string
+	if err := json.Unmarshal(data, &text); err == nil {
+		return d.UnmarshalText([]byte(text))
+	}
+
+	var nanos int64
+	if err := json.Unmarshal(data, &nanos); err == nil {
+		*d = Duration(time.Duration(nanos))
+		return nil
+	}
+
+	return fmt.Errorf("extension: invalid duration %s", string(data))
+}
+
+// UnmarshalText parses duration strings like "30s".
+func (d *Duration) UnmarshalText(text []byte) error {
+	trimmed := strings.TrimSpace(string(text))
+	if trimmed == "" {
+		*d = 0
+		return nil
+	}
+
+	parsed, err := time.ParseDuration(trimmed)
+	if err != nil {
+		return fmt.Errorf("extension: parse duration %q: %w", trimmed, err)
+	}
+	*d = Duration(parsed)
+	return nil
+}
+
+func fileExists(path string) (bool, error) {
+	info, err := os.Stat(path)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return false, nil
+		}
+		return false, err
+	}
+	if info.IsDir() {
+		return false, fmt.Errorf("%q is a directory", path)
+	}
+	return true, nil
+}
+
+func loadManifestTOML(path string) (*Manifest, error) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return nil, fmt.Errorf("extension: read manifest %q: %w", path, err)
+	}
+	return loadManifestTOMLContent(path, data)
+}
+
+func loadManifestTOMLContent(path string, data []byte) (*Manifest, error) {
+	var doc manifestDocument
+	meta, err := toml.Decode(string(data), &doc)
+	if err != nil {
+		if parseErr, ok := errors.AsType[toml.ParseError](err); ok &&
+			strings.HasPrefix(parseErr.LastKey, manifestResourcesKey+".") {
+			if field, found := jsonUnknownFieldMessage(parseErr.Message); found {
+				return nil, unknownManifestFieldError(parseErr.LastKey + "." + field)
+			}
+		}
+		return nil, fmt.Errorf("extension: decode manifest %q: %w", path, err)
+	}
+	if err := rejectUnsupportedManifestTOML(meta.Undecoded()); err != nil {
+		return nil, err
+	}
+
+	manifest, err := doc.toManifest()
+	if err != nil {
+		return nil, err
+	}
+	manifest.Format = FormatCompozy
+	if dropped := dropRetiredMemoryManifestEntries(&manifest); len(dropped) > 0 {
+		slog.Warn("extension.retired_entries_ignored", "extension", manifest.Name, "entries", dropped)
+	}
+	if err := manifest.Validate(); err != nil {
+		return nil, err
+	}
+	return &manifest, nil
+}
+
+func loadManifestJSON(path string) (*Manifest, error) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return nil, fmt.Errorf("extension: read manifest %q: %w", path, err)
+	}
+	return loadManifestJSONContent(path, data)
+}
+
+func loadManifestJSONContent(path string, data []byte) (*Manifest, error) {
+	var doc manifestDocument
+	if err := rejectLegacyManifestJSON(data); err != nil {
+		return nil, err
+	}
+	if err := rejectUnknownManifestResourcesJSON(data); err != nil {
+		return nil, err
+	}
+	if err := json.Unmarshal(data, &doc); err != nil {
+		return nil, fmt.Errorf("extension: decode manifest %q: %w", path, err)
+	}
+
+	manifest, err := doc.toManifest()
+	if err != nil {
+		return nil, err
+	}
+	manifest.Format = FormatCompozy
+	if dropped := dropRetiredMemoryManifestEntries(&manifest); len(dropped) > 0 {
+		slog.Warn("extension.retired_entries_ignored", "extension", manifest.Name, "entries", dropped)
+	}
+	if err := manifest.Validate(); err != nil {
+		return nil, err
+	}
+	return &manifest, nil
+}
+
+func loadManifestContentAtPath(path string, data []byte) (*Manifest, error) {
+	switch strings.ToLower(filepath.Ext(strings.TrimSpace(path))) {
+	case manifestFileExtTOML:
+		return loadManifestTOMLContent(path, data)
+	case manifestFileExtJSON:
+		return loadManifestJSONContent(path, data)
+	default:
+		return nil, fmt.Errorf("extension: unsupported manifest path %q", path)
+	}
+}
+
+func rejectUnsupportedManifestTOML(keys []toml.Key) error {
+	for _, key := range keys {
+		if len(key) == 0 {
+			continue
+		}
+		if key[0] == legacyManifestActionsKey || key[0] == legacyManifestSecurityKey ||
+			key[0] == legacyManifestNetworkParticipationKey {
+			return legacyManifestSectionError(key[0])
+		}
+		if key[0] == manifestResourcesKey {
+			return unknownManifestFieldError(key.String())
+		}
+	}
+	return nil
+}
+
+func rejectUnknownManifestResourcesJSON(data []byte) error {
+	var root map[string]json.RawMessage
+	if err := json.Unmarshal(data, &root); err != nil {
+		return nil
+	}
+	resourcesData, ok := root[manifestResourcesKey]
+	if !ok {
+		return nil
+	}
+	decoder := json.NewDecoder(bytes.NewReader(resourcesData))
+	decoder.DisallowUnknownFields()
+	var resources ResourcesConfig
+	if err := decoder.Decode(&resources); err != nil {
+		field, found := jsonUnknownField(err)
+		if found {
+			return unknownManifestFieldError(manifestResourcesKey + "." + field)
+		}
+	}
+	return nil
+}
+
+func jsonUnknownField(err error) (string, bool) {
+	return jsonUnknownFieldMessage(err.Error())
+}
+
+func jsonUnknownFieldMessage(message string) (string, bool) {
+	const prefix = `json: unknown field "`
+	field, found := strings.CutPrefix(message, prefix)
+	if !found {
+		return "", false
+	}
+	field, found = strings.CutSuffix(field, `"`)
+	return field, found && field != ""
+}
+
+func unknownManifestFieldError(field string) error {
+	return &ManifestValidationError{
+		Field:   field,
+		Message: fmt.Sprintf("unknown manifest field %q", field),
+	}
+}
+
+func rejectLegacyManifestJSON(data []byte) error {
+	var root map[string]json.RawMessage
+	if err := json.Unmarshal(data, &root); err != nil {
+		return nil
+	}
+	for _, section := range []string{
+		legacyManifestActionsKey,
+		legacyManifestSecurityKey,
+		legacyManifestNetworkParticipationKey,
+	} {
+		if _, ok := root[section]; ok {
+			return legacyManifestSectionError(section)
+		}
+	}
+	return nil
+}
+
+const (
+	legacyManifestActionsKey              = "actions"
+	legacyManifestSecurityKey             = "security"
+	legacyManifestNetworkParticipationKey = "network_participation"
+)
+
+func legacyManifestSectionError(section string) error {
+	if section == legacyManifestNetworkParticipationKey {
+		return &ManifestValidationError{
+			Field:   section,
+			Message: "[network_participation] was removed; rebuild with [gateway] and confirm its requirement digest",
+		}
+	}
+	return &ManifestValidationError{
+		Field:   section,
+		Message: fmt.Sprintf("[%s] was removed; use [permissions]", section),
+	}
+}

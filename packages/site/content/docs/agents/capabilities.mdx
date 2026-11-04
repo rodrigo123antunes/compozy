@@ -1,0 +1,259 @@
+---
+title: Agent Capabilities
+description: Author capability catalogs, validate supported layouts, and understand how CompozyOS projects each capability into agent inspection and task selection.
+---
+
+CompozyOS loads capability catalogs from each agent directory, validates and normalizes them,
+and exposes them to local task selection and agent inspection.
+
+<OperatorNote>
+  Capability catalogs are optional. An agent without one still loads and runs.
+</OperatorNote>
+
+## Why capabilities
+
+`AGENT.md` covers identity, the startup prompt, and runtime configuration. It does not describe
+what the agent is useful for when selecting an agent for a task. The capability catalog
+closes that gap without leaking how the agent works.
+
+A capability is an **outcome**, not a tool, MCP server, or prompt fragment. The model is
+intentionally soft:
+
+- the `summary` is a one-line hook that appears in agent inspection
+- the `outcome` explains what success looks like to the caller
+- optional fields (`version`, `context_needed`, `artifacts_expected`, `execution_outline`,
+  `constraints`, `examples`, `requirements`) fill in the rest only when the caller needs more detail
+
+This shape separates two concerns: callers see what they can delegate, while the agent's
+implementation details stay private.
+
+## Supported layouts
+
+Use exactly one of these layouts per agent directory. CompozyOS never merges layouts or formats.
+
+| Layout      | Path                                                   | Best for                               |
+| ----------- | ------------------------------------------------------ | -------------------------------------- |
+| Single-file | `<agent-dir>/capabilities.toml` or `capabilities.json` | Small catalogs reviewed in one place.  |
+| Directory   | `<agent-dir>/capabilities/<id>.toml` or `<id>.json`    | One file per capability, easy to grep. |
+
+The loader rejects these combinations as hard errors:
+
+- both `capabilities.toml` and `capabilities.json` in the same agent directory
+- a single-file catalog alongside a `capabilities/` directory
+- mixed `.toml` and `.json` files inside the same `capabilities/` directory
+
+## Capability schema
+
+Each capability is a record with three required fields, seven optional lists or strings, and one
+runtime-derived field. Field names are identical in TOML and JSON.
+
+| Field                | Type         | Authored | Notes                                                                             |
+| -------------------- | ------------ | -------- | --------------------------------------------------------------------------------- |
+| `id`                 | string       | required | Unique within the agent. Use a slug such as `build-site`. Whitespace is trimmed.  |
+| `summary`            | string       | required | One short sentence used in brief discovery. Target `<= 160` UTF-8 characters.     |
+| `outcome`            | string       | required | What a successful delegation looks like to the caller.                            |
+| `version`            | string       | optional | Free-form version tag, for example `1.2.0`. Must not normalize to blank when set. |
+| `context_needed`     | string array | optional | Inputs the caller should provide.                                                 |
+| `artifacts_expected` | string array | optional | Artifacts the capability is likely to produce.                                    |
+| `execution_outline`  | string array | optional | Coarse steps or phases the caller can expect.                                     |
+| `constraints`        | string array | optional | Hard limits (for example, `"No mocks"` or `"Read-only workspace"`).               |
+| `examples`           | string array | optional | Concrete cases where this capability fits.                                        |
+| `requirements`       | string array | optional | Other `capability.id` values this capability depends on. Entries must be unique.  |
+| `digest`             | string       | derived  | Runtime-computed canonical digest. Must not appear in authored files.             |
+
+Authoring and normalization rules:
+
+- `id` should use a stable slug. Capability IDs only need to be unique inside one agent directory.
+- CompozyOS trims surrounding whitespace in scalar strings and list entries before validation.
+- `version` is optional, but if authored it must not normalize to blank.
+- `requirements` targets other `capability.id` values. CompozyOS validates the list syntactically but
+  does not require every referenced ID to exist in the same local catalog, because references can name capabilities outside the current catalog.
+- `requirements` entries must be non-empty and unique after normalization. CompozyOS canonicalizes them
+  before computing the runtime digest.
+- `digest` is runtime-owned. Authors do not write it in TOML or JSON files, and strict parsing
+  rejects unknown fields such as `digest`.
+- JSON and TOML use the same field names. Unknown fields are errors, and JSON input must end
+  cleanly with no trailing data.
+
+## Single-file catalog
+
+Single-file mode groups every capability for an agent under one top-level `capabilities` array.
+
+```toml title="capabilities.toml"
+[[capabilities]]
+id = "collect-failing-tests"
+summary = "Collect the exact failing package path and test output."
+outcome = "A normalized incident bundle for a debugging follow-up."
+context_needed = ["repo", "failing command"]
+artifacts_expected = ["incident bundle"]
+
+[[capabilities]]
+id = "fix-go-migration-tests"
+summary = "Repair failing Go migration tests and explain the change."
+outcome = "A validated patch summary with the corrected assertions."
+version = "1.2.0"
+context_needed = ["repo", "incident bundle"]
+artifacts_expected = ["patch summary", "verification notes"]
+execution_outline = ["inspect failure", "patch assertions", "rerun targeted tests"]
+constraints = ["Keep fixes scoped to the reported failure"]
+examples = ["sessiondb migration regressions"]
+requirements = ["collect-failing-tests"]
+```
+
+```json title="capabilities.json"
+{
+  "capabilities": [
+    {
+      "id": "collect-failing-tests",
+      "summary": "Collect the exact failing package path and test output.",
+      "outcome": "A normalized incident bundle for a debugging follow-up.",
+      "context_needed": ["repo", "failing command"],
+      "artifacts_expected": ["incident bundle"]
+    },
+    {
+      "id": "fix-go-migration-tests",
+      "summary": "Repair failing Go migration tests and explain the change.",
+      "outcome": "A validated patch summary with the corrected assertions.",
+      "version": "1.2.0",
+      "context_needed": ["repo", "incident bundle"],
+      "requirements": ["collect-failing-tests"]
+    }
+  ]
+}
+```
+
+## Directory catalog
+
+Directory mode keeps one capability per file. The top-level shape of each file is a single
+capability record, not a catalog wrapper.
+
+```text
+~/.compozy/agents/release-curator/
+  AGENT.md
+  capabilities/
+    collect-failing-tests.json
+    fix-go-migration-tests.json
+```
+
+```json title="capabilities/fix-go-migration-tests.json"
+{
+  "id": "fix-go-migration-tests",
+  "summary": "Repair failing Go migration tests and explain the change.",
+  "outcome": "A validated patch summary with the corrected assertions.",
+  "version": "1.2.0",
+  "context_needed": ["repo", "incident bundle"],
+  "artifacts_expected": ["patch summary", "verification notes"],
+  "execution_outline": ["inspect failure", "patch assertions", "rerun targeted tests"],
+  "constraints": ["Keep fixes scoped to the reported failure"],
+  "examples": ["sessiondb migration regressions"],
+  "requirements": ["collect-failing-tests"]
+}
+```
+
+Directory-mode rules:
+
+- The filename basename (the name without `.toml` or `.json`) must match the normalized `id`.
+- Every file in the directory must use the same format. Mixing `.toml` and `.json` is rejected.
+- Dotfiles, nested directories, and files with other extensions are ignored.
+- No manifest file is needed; the directory listing itself is the catalog.
+
+## Validation rules
+
+CompozyOS normalizes surrounding whitespace in every string field and list entry before checking the
+rules. After normalization:
+
+| Rule                             | Violation                                                                          |
+| -------------------------------- | ---------------------------------------------------------------------------------- |
+| Required fields present          | Missing `id`, `summary`, or `outcome` fails with `… is required`.                  |
+| Unique `id`                      | Duplicate IDs across entries fail with `duplicate capability id`.                  |
+| Directory basename matches `id`  | `capabilities/review-pr.json` with `id = "review-copy"` fails.                     |
+| Single layout per agent          | `capabilities.toml` plus `capabilities/` fails with `mixed capability layouts`.    |
+| Single single-file format        | `capabilities.toml` plus `capabilities.json` fails with `multiple catalog files`.  |
+| Single directory format          | Mixing `.toml` and `.json` inside `capabilities/` fails with `mixed file formats`. |
+| Unknown fields                   | Any unknown TOML or JSON key fails parsing, including authored `digest`.           |
+| Clean JSON                       | Trailing JSON values after the document fail parsing.                              |
+| `version` not blank when present | A `version` value that normalizes to empty fails validation.                       |
+| `requirements` entries valid     | Blank entries or duplicates after normalization fail validation.                   |
+
+Local validation does not resolve `requirements` targets. A capability can declare a requirement
+outside this agent catalog; unresolved local targets remain references. Every other
+validation error is a hard failure at load time. There is no warning mode.
+
+## Runtime digest
+
+CompozyOS computes the `digest` field itself after normalization. The runtime canonicalizes the structured
+capability document — trimmed scalars, canonicalized `requirements`, stable field ordering — and
+hashes it into a content-addressed identifier. Two capability files with the same normalized content
+produce the same `digest`; any meaningful change produces a new one.
+
+Operators do not write or edit the `digest`. Agent inspection exposes it for detecting catalog changes.
+
+## No-catalog behavior
+
+An agent without a catalog still loads and runs. Its capability list is empty.
+
+## Authoring patterns
+
+### Declare a single capability
+
+Use single-file TOML when the catalog is short and easy to read in one place.
+
+```toml title="capabilities.toml"
+[[capabilities]]
+id = "build-site"
+summary = "Build the landing page."
+outcome = "A finished landing page."
+```
+
+### Split capabilities across one file each
+
+Use directory mode when each capability deserves its own context and examples.
+
+```text
+~/.compozy/agents/designer/
+  AGENT.md
+  capabilities/
+    build-site.json
+    review-copy.json
+    audit-accessibility.json
+```
+
+```json title="capabilities/audit-accessibility.json"
+{
+  "id": "audit-accessibility",
+  "summary": "Audit a page for accessibility regressions.",
+  "outcome": "A prioritized accessibility report with quick wins and blockers.",
+  "context_needed": ["page URL or screenshot", "target WCAG level"],
+  "artifacts_expected": ["Markdown report"],
+  "constraints": ["No DOM mutation"]
+}
+```
+
+### Declare a capability with version and requirements
+
+Version the capability when callers need to pin to a specific evolution, and reference other
+capabilities the agent composes.
+
+```toml title="capabilities.toml"
+[[capabilities]]
+id = "collect-failing-tests"
+summary = "Collect the exact failing package path and test output."
+outcome = "A normalized incident bundle for a debugging follow-up."
+
+[[capabilities]]
+id = "fix-go-migration-tests"
+summary = "Repair failing Go migration tests and explain the change."
+outcome = "A validated patch summary with the corrected assertions."
+version = "1.2.0"
+requirements = ["collect-failing-tests"]
+```
+
+CompozyOS loads the catalog, trims and validates the fields, canonicalizes `requirements`, and computes
+a runtime `digest` for `fix-go-migration-tests`.
+
+## Related pages
+
+- [Agent Definitions](/docs/agents/definitions) covers the `AGENT.md` sibling of a
+  capability catalog.
+- [AGENT.md](/docs/configuration/agent-md) lists the sidecars CompozyOS recognizes
+  alongside an agent directory.

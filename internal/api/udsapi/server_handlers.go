@@ -1,0 +1,126 @@
+package udsapi
+
+import (
+	core "github.com/compozy/compozy/internal/api/core"
+	"github.com/compozy/compozy/internal/gateway"
+)
+
+func newHandlers(cfg *handlerConfig) *Handlers {
+	if cfg == nil {
+		cfg = &handlerConfig{}
+	}
+
+	if cfg.pollInterval <= 0 {
+		cfg.pollInterval = defaultPollInterval
+	}
+
+	return &Handlers{
+		BaseHandlers: core.NewBaseHandlers(udsCoreHandlerConfig(cfg)),
+		Extensions:   cfg.extensions,
+		HostedMCP:    cfg.hostedMCP,
+		MCPHostAPI:   cfg.mcpHostAPI,
+	}
+}
+
+func udsCoreHandlerConfig(cfg *handlerConfig) *core.BaseHandlerConfig {
+	return withProviderAuth(cfg, &core.BaseHandlerConfig{
+		TransportName:                "udsapi",
+		IncludeSessionWorkspaceInSSE: true,
+		Sessions:                     cfg.sessions,
+		SessionAcceptance:            sessionAcceptanceManager(cfg.sessions),
+		DrainController:              cfg.drainController,
+		Subagents:                    cfg.subagents,
+		SessionMonitors:              cfg.sessionMonitors,
+		SessionProcesses:             cfg.sessionProcesses,
+		SessionCatalog:               cfg.sessionCatalog,
+		TaskDesignations:             cfg.taskDesignations,
+		Tasks:                        cfg.tasks,
+		Observer:                     cfg.observer,
+		SchemaStreams:                cfg.schemaStreams,
+		Resources:                    cfg.resources,
+		WindowManager:                cfg.windowManager,
+		Terminal:                     cfg.terminal,
+		Extensions:                   cfg.extensions,
+		Automation:                   cfg.automation,
+		Loops:                        cfg.loops,
+		Profiles:                     cfg.profiles,
+		SupportBundles:               cfg.supportBundles,
+		Tools:                        cfg.tools,
+		ToolArtifacts:                cfg.toolArtifacts,
+		SessionAttachments:           cfg.sessionAttachments,
+		SessionFiles:                 cfg.sessionFiles,
+		Toolsets:                     cfg.toolsets,
+		ToolApprovals:                cfg.toolApprovals,
+		ApprovalGrants:               cfg.approvalGrants,
+		ApprovalCoordinator:          cfg.approvalCoordinator,
+		CmdPalette:                   cfg.cmdPalette,
+		Clarify:                      cfg.clarify,
+		Settings:                     cfg.settings,
+		SettingsRestart:              cfg.settingsRestart,
+		SettingsUpdate:               cfg.settingsUpdate,
+		Vault:                        cfg.vault,
+		Workspaces:                   cfg.workspaces,
+		Worktrees:                    cfg.worktrees,
+		WorkspaceAccess:              cfg.workspaceAccess,
+		Onboarding:                   cfg.onboarding,
+		AgentCatalog:                 cfg.agentCatalog,
+		AgentDefinitionSync:          cfg.agentSync,
+		ContextWindowResolver:        cfg.contextWindowResolver,
+		ModelCatalog:                 cfg.modelCatalog,
+		ProviderUsage:                cfg.providerUsage,
+		MarketplaceCatalog:           cfg.marketplaceCatalog,
+		AgentContextService:          cfg.agentContext,
+		SoulAuthoring:                cfg.soulAuthoring,
+		AgentMemory:                  cfg.agentMemory,
+		SoulHistoryPurger:            cfg.soulHistoryPurger,
+		SoulRefresher:                cfg.soulRefresher,
+		HeartbeatAuthoring:           cfg.heartbeatAuthor,
+		HeartbeatHistoryPurger:       cfg.heartbeatPurger,
+		HeartbeatStatus:              cfg.heartbeatStatus,
+		AgentInstances:               cfg.agentInstances,
+		HeartbeatWake:                cfg.heartbeatWake,
+		SessionHealth:                cfg.sessionHealth,
+		HeartbeatWakeEvents:          cfg.wakeEvents,
+		CoordinatorRole:              cfg.coordinatorRole,
+		Roles:                        cfg.roles,
+		SkillsRegistry:               cfg.skillsRegistry,
+		SkillResources:               cfg.skillResources,
+		SkillExposures:               cfg.skillExposureStore,
+		SkillExposureEvents:          cfg.skillExposureEvents,
+		RuntimeMemory:                cfg.runtimeMemory,
+		HostLoad:                     cfg.hostLoad,
+		DeadEntities:                 cfg.deadEntities,
+		AppTokens:                    cfg.appTokens,
+		OpenAPI:                      cfg.openAPI,
+		Gateway:                      cfg.gateway,
+		GatewayPairingSource:         string(gateway.PairingSourceLocal),
+		HomePaths:                    cfg.homePaths,
+		Config:                       cfg.config,
+		Logger:                       cfg.logger,
+		StartedAt:                    cfg.startedAt,
+		Now:                          cfg.now,
+		PollInterval:                 cfg.pollInterval,
+		AgentLoader:                  cfg.agentLoader,
+	})
+}
+
+// withProviderAuth wires live provider sign-in observation: verdicts and cache invalidation.
+func withProviderAuth(cfg *handlerConfig, base *core.BaseHandlerConfig) *core.BaseHandlerConfig {
+	base.OnProviderAuthSuccess = cfg.onProviderAuthSuccess
+	base.ProviderAuthVerdicts = cfg.providerAuthVerdicts
+	return base
+}
+
+func sessionAcceptanceManager(manager core.SessionManager) core.SessionAcceptanceManager {
+	accepted, ok := manager.(core.SessionAcceptanceManager)
+	if !ok {
+		return nil
+	}
+	return accepted
+}
+
+func (h *Handlers) setStreamDone(done <-chan struct{}) {
+	if h != nil && h.BaseHandlers != nil {
+		h.SetStreamDone(done)
+	}
+}

@@ -1,0 +1,1502 @@
+package daemon
+
+import (
+	"context"
+	"database/sql"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"log/slog"
+	"math"
+	"net/http"
+	"os"
+	"path/filepath"
+	"strings"
+	"sync"
+	"testing"
+	"time"
+
+	"github.com/compozy/compozy/internal/api/core"
+
+	"github.com/compozy/compozy/internal/config"
+	extensionpkg "github.com/compozy/compozy/internal/extension"
+	extensioncontract "github.com/compozy/compozy/internal/extension/contract"
+	"github.com/compozy/compozy/internal/session"
+	"github.com/compozy/compozy/internal/store"
+	"github.com/compozy/compozy/internal/store/globaldb"
+	terminalpkg "github.com/compozy/compozy/internal/terminal"
+	"github.com/compozy/compozy/internal/testutil"
+	toolspkg "github.com/compozy/compozy/internal/tools"
+	workspacepkg "github.com/compozy/compozy/internal/workspace"
+	"github.com/compozy/compozy/internal/worktree"
+)
+
+// Canonical suite: daemon translation from resolved workspaces into the worktree domain.
+func TestDaemonWorktreeWorkspaceResolver(t *testing.T) {
+	t.Parallel()
+
+	homePaths, err := config.ResolveHomePathsFrom(filepath.Join(t.TempDir(), "home"))
+	if err != nil {
+		t.Fatalf("ResolveHomePathsFrom() error = %v", err)
+	}
+	workspaceRoot := t.TempDir()
+	worktreesRoot := filepath.Join(t.TempDir(), "workspace-worktrees")
+	resolvedConfig := config.DefaultWithHome(homePaths)
+	resolvedConfig.Worktrees.Root = worktreesRoot
+	resolvedConfig.Worktrees.SetupCommand = "bun install"
+	resolvedConfig.Worktrees.TeardownCommand = "global-cleanup"
+	resolved := workspacepkg.ResolvedWorkspace{
+		ID: "ws-resolved", Name: "Resolved", RootDir: workspaceRoot,
+		Config: resolvedConfig,
+	}
+	stub := &daemonWorktreeResolverStub{
+		resolved: resolved,
+		listed: []workspacepkg.Workspace{
+			resolved.Workspace,
+			{ID: "ws-other", Name: "Other", RootDir: t.TempDir()},
+		},
+	}
+	resolver := daemonWorktreeWorkspaceResolver{resolver: stub, homePaths: homePaths}
+
+	got, err := resolver.ResolveWorktreeWorkspace(t.Context(), resolved.ID, "")
+	if err != nil {
+		t.Fatalf("ResolveWorktreeWorkspace() error = %v", err)
+	}
+	if got.ID != resolved.ID || got.Root != workspaceRoot || got.WorktreesRoot != worktreesRoot ||
+		got.Worktrees.SetupCommand != "bun install" {
+		t.Fatalf("ResolveWorktreeWorkspace() = %#v, want resolved workspace overlay", got)
+	}
+	listed, err := resolver.ListWorktreeWorkspaces(t.Context())
+	if err != nil {
+		t.Fatalf("ListWorktreeWorkspaces() error = %v", err)
+	}
+	if len(listed) != 2 || listed[0].ID != "ws-resolved" || listed[1].ID != "ws-other" {
+		t.Fatalf("ListWorktreeWorkspaces() = %#v, want both registered roots", listed)
+	}
+
+	for _, command := range []string{"profile-cleanup", ""} {
+		t.Run("Should resolve owner profile teardown including explicit empty command "+command, func(t *testing.T) {
+			profileConfig := config.DefaultWithHome(homePaths)
+			profileConfig.Worktrees.TeardownCommand = command
+			profileConfig.Worktrees.TeardownTimeout = 3 * time.Second
+			profileStub := &daemonWorktreeResolverStub{resolved: resolved, profiled: workspacepkg.ResolvedWorkspace{
+				ID: resolved.ID, Name: resolved.Name, RootDir: workspaceRoot, Config: profileConfig,
+			}}
+			profileResolver := daemonWorktreeWorkspaceResolver{resolver: profileStub, homePaths: homePaths,
+				profileNames: loopProfileNameResolverStub{"profile-owner": "owner"}}
+			got, err := profileResolver.ResolveWorktreeWorkspace(t.Context(), resolved.ID, "profile-owner")
+			if err != nil || profileStub.profileName != "owner" || got.Root != workspaceRoot ||
+				got.Worktrees.TeardownCommand != command || got.Worktrees.TeardownTimeout != 3*time.Second {
+				t.Fatalf("owner profile workspace = %#v, profile = %q, error = %v", got, profileStub.profileName, err)
+			}
+		})
+	}
+
+	empty := daemonWorktreeWorkspaceResolver{homePaths: homePaths}
+	if _, err := empty.ResolveWorktreeWorkspace(t.Context(), "missing", ""); !errors.Is(
+		err, worktree.ErrNotFound,
+	) {
+		t.Fatalf("ResolveWorktreeWorkspace(nil) error = %v, want ErrNotFound", err)
+	}
+}
+
+func TestDaemonExecutionWorktreesResolveServiceAfterConsumerBoot(t *testing.T) {
+	t.Parallel()
+
+	var current executionWorktreeService
+	resolver := daemonExecutionWorktrees{lookup: func() executionWorktreeService { return current }}
+	if _, err := resolver.MaterializeForRun(
+		t.Context(),
+		"ws-late",
+		worktree.RunWorktreeRequest{TaskSlug: "late", RunID: "run-late"},
+	); !errors.Is(err, worktree.ErrPerRunMaterialization) {
+		t.Fatalf("MaterializeForRun(before boot) error = %v, want %v", err, worktree.ErrPerRunMaterialization)
+	}
+
+	backing := &recordingTaskBridgeWorktrees{materialized: &worktree.Worktree{
+		ID: "wt-late", WorkspaceID: "ws-late", RunID: "run-late",
+	}}
+	current = backing
+	item, err := resolver.MaterializeForRun(
+		t.Context(),
+		"ws-late",
+		worktree.RunWorktreeRequest{TaskSlug: "late", RunID: "run-late"},
+	)
+	if err != nil {
+		t.Fatalf("MaterializeForRun(after boot) error = %v", err)
+	}
+	if item == nil || item.ID != "wt-late" || len(backing.materializeCalls) != 1 {
+		t.Fatalf(
+			"MaterializeForRun(after boot) = %#v calls=%#v, want late-bound service",
+			item,
+			backing.materializeCalls,
+		)
+	}
+}
+
+func TestDaemonForgeRuntimeErrorTranslation(t *testing.T) {
+	t.Parallel()
+
+	t.Run("Should preserve the disabled provider cause from runtime selection", func(t *testing.T) {
+		t.Parallel()
+		manager := extensionpkg.NewManager(nil)
+		_, err := manager.ForgeStatus(
+			t.Context(),
+			extensioncontract.ForgeStatusRequest{RemoteURLs: []string{"https://github.com/acme/repo"}, Branch: "topic"},
+		)
+		mapped := mapForgeRuntimeError(err)
+		if !errors.Is(mapped, worktree.ErrForgeUnavailable) ||
+			worktree.ForgeFailureCause(mapped) != "provider_disabled" {
+			t.Fatalf("disabled provider=%v", mapped)
+		}
+	})
+
+	t.Run("Should preserve unavailable extension errors as forge unavailable", func(t *testing.T) {
+		t.Parallel()
+
+		err := mapForgeRuntimeError(fmt.Errorf("provider absent: %w", toolspkg.ErrToolUnavailable))
+		if !errors.Is(err, worktree.ErrForgeUnavailable) || errors.Is(err, worktree.ErrForge) {
+			t.Fatalf("mapForgeRuntimeError(unavailable) = %v, want only ErrForgeUnavailable", err)
+		}
+	})
+
+	t.Run("Should classify other extension failures as forge errors", func(t *testing.T) {
+		t.Parallel()
+
+		err := mapForgeRuntimeError(errors.New("provider protocol failed"))
+		if !errors.Is(err, worktree.ErrForge) || errors.Is(err, worktree.ErrForgeUnavailable) {
+			t.Fatalf("mapForgeRuntimeError(protocol) = %v, want only ErrForge", err)
+		}
+	})
+
+	t.Run("Should classify transient provider causes as forge errors", func(t *testing.T) {
+		t.Parallel()
+		for _, cause := range []string{"rate_limited", "credential_expired"} {
+			t.Run("Should classify "+cause, func(t *testing.T) {
+				t.Parallel()
+				if got := forgeFailureKind(cause); !errors.Is(got, worktree.ErrForge) {
+					t.Fatalf("forgeFailureKind(%q) = %v, want ErrForge", cause, got)
+				}
+			})
+		}
+	})
+}
+
+func TestDaemonSessionWorktreeResolver(t *testing.T) {
+	t.Parallel()
+
+	t.Run("Should resolve only ready attached worktrees", func(t *testing.T) {
+		t.Parallel()
+
+		root := t.TempDir()
+		var gotWorkspace, gotRef string
+		resolver := daemonSessionWorktreeResolver{lookup: func() sessionWorktreeLookup {
+			return sessionWorktreeLookupFunc(
+				func(_ context.Context, workspaceID, ref string) (*worktree.Worktree, error) {
+					gotWorkspace, gotRef = workspaceID, ref
+					return &worktree.Worktree{
+						ID:          "wt-ready",
+						WorkspaceID: workspaceID,
+						Path:        root,
+						State:       worktree.StateReady,
+					}, nil
+				},
+			)
+		}}
+
+		id, gotRoot, err := resolver.ResolveSessionWorktree(t.Context(), " ws-1 ", " wt-ref ")
+		if err != nil {
+			t.Fatalf("ResolveSessionWorktree(ready) error = %v", err)
+		}
+		if id != "wt-ready" || gotRoot != root || gotWorkspace != "ws-1" || gotRef != "wt-ref" {
+			t.Fatalf(
+				"ResolveSessionWorktree(ready) = (%q, %q), lookup (%q, %q)",
+				id,
+				gotRoot,
+				gotWorkspace,
+				gotRef,
+			)
+		}
+	})
+
+	for _, test := range []struct {
+		name        string
+		state       worktree.State
+		getErr      error
+		path        string
+		createError string
+		wantErr     error
+		wantDetail  string
+	}{
+		{name: "unknown", getErr: worktree.ErrNotFound, wantErr: worktree.ErrNotFound},
+		{name: "pending", state: worktree.StatePending, wantErr: worktree.ErrNotReady},
+		{
+			name: "failed", state: worktree.StateFailed, createError: "checkout phase failed: timed out",
+			wantErr: worktree.ErrNotReady, wantDetail: "creation failed (checkout phase failed: timed out)",
+		},
+		{name: "removing", state: worktree.StateRemoving, wantErr: worktree.ErrNotReady},
+		{name: "missing", state: worktree.StateMissing, wantErr: worktree.ErrMissing},
+		{name: "removed", state: worktree.StateRemoved, wantErr: worktree.ErrMissing},
+		{name: "ready with vanished path", state: worktree.StateReady, path: filepath.Join(t.TempDir(), "gone"), wantErr: worktree.ErrMissing},
+	} {
+		t.Run("Should classify "+test.name+" deterministically", func(t *testing.T) {
+			t.Parallel()
+
+			resolver := daemonSessionWorktreeResolver{lookup: func() sessionWorktreeLookup {
+				return sessionWorktreeLookupFunc(func(context.Context, string, string) (*worktree.Worktree, error) {
+					if test.getErr != nil {
+						return nil, test.getErr
+					}
+					return &worktree.Worktree{
+						ID: "wt-target", Path: test.path, State: test.state, CreateError: test.createError,
+					}, nil
+				})
+			}}
+			_, _, err := resolver.ResolveSessionWorktree(t.Context(), "ws-1", "target")
+			if !errors.Is(err, test.wantErr) {
+				t.Fatalf("ResolveSessionWorktree(%s) error = %v, want %v", test.name, err, test.wantErr)
+			}
+			if test.wantDetail != "" && !strings.Contains(err.Error(), test.wantDetail) {
+				t.Fatalf("ResolveSessionWorktree(%s) error = %v, want detail %q", test.name, err, test.wantDetail)
+			}
+		})
+	}
+}
+
+func TestWorktreeTurnRefreshNotifier(t *testing.T) {
+	t.Parallel()
+
+	refresher := &recordingTurnWorktreeRefresher{}
+	notify := worktreeTurnRefreshNotifier(
+		turnWorktreeSessionReader{info: &session.Info{
+			ID: "sess-bound", WorkspaceID: "ws-bound", WorktreeID: "wt-bound",
+		}},
+		refresher,
+		nil,
+	)
+	notify(t.Context(), session.PromptRunIdentity{SessionID: "sess-bound"})
+	if refresher.workspaceID != "ws-bound" || refresher.worktreeID != "wt-bound" || !refresher.refresh {
+		t.Fatalf(
+			"Status() = workspace %q worktree %q refresh %v, want exact bound worktree refresh",
+			refresher.workspaceID,
+			refresher.worktreeID,
+			refresher.refresh,
+		)
+	}
+}
+
+type turnWorktreeSessionReader struct {
+	info *session.Info
+}
+
+func (r turnWorktreeSessionReader) Status(context.Context, string) (*session.Info, error) {
+	return r.info, nil
+}
+
+type recordingTurnWorktreeRefresher struct {
+	workspaceID string
+	worktreeID  string
+	refresh     bool
+}
+
+func (r *recordingTurnWorktreeRefresher) Status(
+	_ context.Context,
+	workspaceID string,
+	worktreeID string,
+	refresh bool,
+) (*worktree.Status, error) {
+	r.workspaceID = workspaceID
+	r.worktreeID = worktreeID
+	r.refresh = refresh
+	return &worktree.Status{WorktreeID: worktreeID}, nil
+}
+
+// profileMoveWorktreeStub records the worktree calls a session move makes and fails
+// the ones a case scripts.
+type profileMoveWorktreeStub struct {
+	item       worktree.Worktree
+	getErr     error
+	status     worktree.Status
+	refreshes  []bool
+	removeErrs []error
+	removes    int
+	createErrs []error
+	creates    []worktree.CreateOptions
+}
+
+func (s *profileMoveWorktreeStub) Get(context.Context, string, string) (*worktree.Worktree, error) {
+	if s.getErr != nil {
+		return nil, s.getErr
+	}
+	item := s.item
+	return &item, nil
+}
+
+func (s *profileMoveWorktreeStub) Status(_ context.Context, _, _ string, refresh bool) (*worktree.Status, error) {
+	s.refreshes = append(s.refreshes, refresh)
+	status := s.status
+	return &status, nil
+}
+
+func (s *profileMoveWorktreeStub) RemoveKeepingBranch(
+	context.Context, string, string,
+) (*worktree.RemovalRefusal, error) {
+	s.removes++
+	if len(s.removeErrs) == 0 {
+		return nil, nil
+	}
+	err := s.removeErrs[0]
+	s.removeErrs = s.removeErrs[1:]
+	return nil, err
+}
+
+func (s *profileMoveWorktreeStub) Create(
+	_ context.Context, workspaceID string, options worktree.CreateOptions,
+) (*worktree.Worktree, error) {
+	s.creates = append(s.creates, options)
+	if len(s.createErrs) > 0 {
+		err := s.createErrs[0]
+		s.createErrs = s.createErrs[1:]
+		if err != nil {
+			return nil, err
+		}
+	}
+	return &worktree.Worktree{
+		ID: "wt-new", WorkspaceID: workspaceID, ProfileID: options.ProfileID, Path: "/worktrees/new",
+		State: worktree.StateReady,
+	}, nil
+}
+
+func TestDaemonProfileMoveWorktrees(t *testing.T) {
+	t.Parallel()
+
+	resolverFor := func(stub *profileMoveWorktreeStub) daemonSessionWorktreeResolver {
+		return daemonSessionWorktreeResolver{lookup: func() sessionWorktreeLookup { return stub }}
+	}
+
+	t.Run("Should read the branch, head, and uncommitted files from a fresh status", func(t *testing.T) {
+		t.Parallel()
+		stub := &profileMoveWorktreeStub{
+			item: worktree.Worktree{ID: "wt-src", Branch: "feat/old", State: worktree.StateReady},
+			status: worktree.Status{
+				Branch: new("feat/move"), HeadSHA: new("abc123"), Detached: new(false), DirtyFiles: new(3),
+			},
+		}
+		checkout, err := resolverFor(stub).InspectProfileMoveWorktree(t.Context(), "ws", "wt-src")
+		if err != nil {
+			t.Fatalf("InspectProfileMoveWorktree() error = %v", err)
+		}
+		if checkout.Branch != "feat/move" || checkout.HeadSHA != "abc123" || checkout.DirtyFiles != 3 ||
+			!checkout.Ready || len(stub.refreshes) != 1 || !stub.refreshes[0] {
+			t.Fatalf("checkout = %#v refreshes = %v, want a refreshed status", checkout, stub.refreshes)
+		}
+	})
+
+	t.Run("Should refuse to remove a checkout with uncommitted changes", func(t *testing.T) {
+		t.Parallel()
+		stub := &profileMoveWorktreeStub{removeErrs: []error{worktree.ErrDirtyRequiresForce}}
+		err := resolverFor(stub).ReleaseProfileMoveWorktree(t.Context(), "ws", "wt-src")
+		refusal, ok := errors.AsType[*session.ProfileMoveError](err)
+		if !ok || refusal.Reason != session.ProfileMoveRefusalWorktreeDirty || stub.removes != 1 {
+			t.Fatalf("release error = %v removals = %d, want one worktree_dirty refusal", err, stub.removes)
+		}
+	})
+
+	t.Run("Should check the branch out again and recreate it at the head when it is gone", func(t *testing.T) {
+		t.Parallel()
+		stub := &profileMoveWorktreeStub{createErrs: []error{worktree.ErrBaseRefNotFound}}
+		checkout := session.ProfileMoveCheckout{Branch: "feat/move", HeadSHA: "abc123"}
+		id, root, err := resolverFor(stub).CreateProfileMoveWorktree(
+			t.Context(), "ws", "profile-work", "wt_chosen", checkout,
+		)
+		if err != nil || id != "wt-new" || root != "/worktrees/new" {
+			t.Fatalf("CreateProfileMoveWorktree() = %q %q %v", id, root, err)
+		}
+		if len(stub.creates) != 2 || stub.creates[0].ExistingBranch != "feat/move" ||
+			stub.creates[1].Branch != "feat/move" || stub.creates[1].BaseRef != "abc123" ||
+			stub.creates[1].ProfileID != "profile-work" ||
+			stub.creates[0].ID != "wt_chosen" || stub.creates[1].ID != "wt_chosen" {
+			t.Fatalf("creates = %#v, want the existing branch, then the branch recreated at abc123, both "+
+				"under the move's chosen id", stub.creates)
+		}
+	})
+
+	t.Run("Should tell a never-created worktree from one whose checkout is gone", func(t *testing.T) {
+		t.Parallel()
+		_, err := resolverFor(&profileMoveWorktreeStub{getErr: worktree.ErrNotFound}).
+			InspectProfileMoveWorktree(t.Context(), "ws", "wt_never")
+		if !errors.Is(err, session.ErrProfileMoveWorktreeNotFound) {
+			t.Fatalf("InspectProfileMoveWorktree(never created) error = %v, want ErrProfileMoveWorktreeNotFound", err)
+		}
+		tests := []struct {
+			name string
+			item worktree.Worktree
+			gone bool
+		}{
+			{name: "removed", item: worktree.Worktree{State: worktree.StateRemoved}, gone: true},
+			{name: "missing its path", item: worktree.Worktree{State: worktree.StateMissing}, gone: true},
+			{name: "failed and rolled back", item: worktree.Worktree{State: worktree.StateFailed}, gone: true},
+			{
+				name: "failed with its rollback incomplete",
+				item: worktree.Worktree{State: worktree.StateFailed, CreateRollbackError: "checkout left in place"},
+			},
+			{name: "dismissed after a removal", item: worktree.Worktree{State: worktree.StateDismissed}, gone: true},
+			{
+				name: "dismissed with its creation rollback incomplete",
+				item: worktree.Worktree{State: worktree.StateDismissed, CreateRollbackError: "checkout left in place"},
+			},
+			{name: "pending", item: worktree.Worktree{State: worktree.StatePending}},
+		}
+		for _, tt := range tests {
+			checkout, err := resolverFor(&profileMoveWorktreeStub{item: tt.item}).
+				InspectProfileMoveWorktree(t.Context(), "ws", "wt_move")
+			if err != nil || checkout.Gone != tt.gone || checkout.Ready {
+				t.Fatalf("InspectProfileMoveWorktree(%s) = %#v, %v; want gone=%t", tt.name, checkout, err, tt.gone)
+			}
+		}
+	})
+}
+
+type sessionWorktreeLookupFunc func(context.Context, string, string) (*worktree.Worktree, error)
+
+func (f sessionWorktreeLookupFunc) Get(
+	ctx context.Context,
+	workspaceID string,
+	ref string,
+) (*worktree.Worktree, error) {
+	return f(ctx, workspaceID, ref)
+}
+
+type daemonWorktreeResolverStub struct {
+	resolved    workspacepkg.ResolvedWorkspace
+	profiled    workspacepkg.ResolvedWorkspace
+	profileName string
+	listed      []workspacepkg.Workspace
+}
+
+func (r *daemonWorktreeResolverStub) Resolve(
+	context.Context,
+	string,
+) (workspacepkg.ResolvedWorkspace, error) {
+	return r.resolved, nil
+}
+
+func (r *daemonWorktreeResolverStub) ResolveForProfile(
+	_ context.Context, _ string, profileName string,
+) (workspacepkg.ResolvedWorkspace, error) {
+	r.profileName = profileName
+	return r.profiled, nil
+}
+
+func (r *daemonWorktreeResolverStub) ResolveOrRegister(
+	context.Context,
+	string,
+) (workspacepkg.ResolvedWorkspace, error) {
+	return r.resolved, nil
+}
+
+func (r *daemonWorktreeResolverStub) List(context.Context) ([]workspacepkg.Workspace, error) {
+	return append([]workspacepkg.Workspace(nil), r.listed...), nil
+}
+
+// Terminal root authority belongs to the daemon's active session/worktree binding.
+func TestDaemonTerminalExecutionRoot(t *testing.T) {
+	t.Parallel()
+	for _, name := range []string{"bound", "unbound", "foreign workspace", "foreign profile", "foreign run", "stale generation", "missing worktree", "mismatched worktree", "foreign worktree profile", "inactive run", "missing session", "pending worktree", "backend unavailable"} {
+		t.Run("Should resolve or reject "+name, func(t *testing.T) {
+			t.Parallel()
+			root := t.TempDir()
+			info := &session.Info{
+				ID:                "sess-a",
+				WorkspaceID:       "ws-a",
+				ProfileID:         "profile-a",
+				WorktreeID:        "wt-a",
+				RuntimeGeneration: 2,
+			}
+			active := session.PromptRunIdentity{
+				SessionID:   info.ID,
+				WorkspaceID: info.WorkspaceID,
+				ProfileID:   info.ProfileID,
+				RunID:       "run-a",
+				Generation:  2,
+			}
+			actor := terminalpkg.Actor{
+				Kind:       terminalpkg.ActorKindAgent,
+				ID:         "agent-a",
+				SessionID:  info.ID,
+				ProfileID:  info.ProfileID,
+				RunID:      active.RunID,
+				Generation: 2,
+			}
+			switch name {
+			case "unbound":
+				info.WorktreeID = ""
+			case "foreign workspace":
+				active.WorkspaceID = "ws-b"
+			case "foreign profile":
+				actor.ProfileID = "profile-b"
+			case "foreign run":
+				actor.RunID = "run-b"
+			case "stale generation":
+				actor.Generation = 1
+			}
+			sessions := &fakeSessionManager{
+				infos: []*session.Info{info},
+				activePromptRunHook: func(context.Context, string) (session.PromptRunIdentity, error) {
+					if name == "inactive run" {
+						return session.PromptRunIdentity{}, session.ErrPromptNotActive
+					}
+					return active, nil
+				},
+			}
+			if name == "missing session" {
+				sessions.infos = nil
+			}
+			resolver := daemonSessionWorktreeResolver{lookup: func() sessionWorktreeLookup {
+				return sessionWorktreeLookupFunc(func(_ context.Context, ws, ref string) (*worktree.Worktree, error) {
+					if ws != "ws-a" || ref != "wt-a" {
+						t.Fatalf("lookup = %q, %q", ws, ref)
+					}
+					if name == "missing worktree" {
+						return nil, worktree.ErrMissing
+					}
+					id := ref
+					if name == "mismatched worktree" {
+						id = "wt-b"
+					}
+					profileID, state := "profile-a", worktree.StateReady
+					if name == "foreign worktree profile" {
+						profileID = "profile-b"
+					}
+					if name == "pending worktree" {
+						state = worktree.StatePending
+					}
+					if name == "backend unavailable" {
+						return nil, errors.New("private backend detail")
+					}
+					return &worktree.Worktree{
+						ID:          id,
+						WorkspaceID: ws,
+						ProfileID:   profileID,
+						Path:        root,
+						State:       state,
+					}, nil
+				})
+			}}
+			got, err := resolveTerminalExecutionRoot(t.Context(), sessions, resolver, "ws-a", actor)
+			switch name {
+			case "bound":
+				if err != nil || got != root {
+					t.Fatalf("bound root = %q, %v", got, err)
+				}
+			case "unbound":
+				if err != nil || got != "" {
+					t.Fatalf("unbound root = %q, %v", got, err)
+				}
+			default:
+				wantErr, wantCode := terminalpkg.ErrNotFound, terminalpkg.ErrorCodeNotFound
+				switch name {
+				case "stale generation", "inactive run":
+					wantErr, wantCode = terminalpkg.ErrGenerationFenced, terminalpkg.ErrorCodeGenerationFenced
+				case "missing worktree":
+					wantErr, wantCode = worktree.ErrMissing, terminalpkg.ErrorCodeInvalidCwd
+				case "pending worktree":
+					wantErr, wantCode = worktree.ErrNotReady, terminalpkg.ErrorCodeInvalidCwd
+				case "backend unavailable":
+					wantErr, wantCode = terminalpkg.ErrServiceUnavailable, ""
+				}
+				if !errors.Is(err, wantErr) || got != "" {
+					t.Fatalf("invalid binding root=%q error=%v, want %v", got, err, wantErr)
+				}
+				wantStatus := http.StatusNotFound
+				switch wantCode {
+				case terminalpkg.ErrorCodeGenerationFenced:
+					wantStatus = http.StatusConflict
+				case terminalpkg.ErrorCodeInvalidCwd:
+					wantStatus = http.StatusUnprocessableEntity
+				case "":
+					wantStatus = http.StatusServiceUnavailable
+				}
+				status, _, _ := core.TerminalErrorStatus(err)
+				if status != wantStatus {
+					t.Fatalf("HTTP status = %d, want %d", status, wantStatus)
+				}
+				nativeErr := terminalToolError(toolspkg.ToolIDTerminalExec, err)
+				toolErr, ok := errors.AsType[*toolspkg.ToolError](nativeErr)
+				wantNativeCode := toolspkg.ErrorCode(wantCode)
+				if wantCode == "" {
+					wantNativeCode = toolspkg.ErrorCodeUnavailable
+				}
+				if !ok || toolErr.Code != wantNativeCode {
+					t.Fatalf("native error = %v, want %s", nativeErr, wantNativeCode)
+				}
+				if wantCode != "" {
+					typed, ok := errors.AsType[*terminalpkg.Error](err)
+					if !ok || typed.Code != wantCode {
+						t.Fatalf("error=%v, want code %s", err, wantCode)
+					}
+				}
+			}
+		})
+	}
+}
+
+// Canonical boot-worktree suite owns deferred journal recovery and cancellation with real SQLite/filesystem.
+func TestDaemonManagedDeliveryRecovery(t *testing.T) {
+	t.Parallel()
+	// Invariant: restored inventory survives SQLite contention without duplicate receipts; shutdown joins retry.
+	// Owner: daemon managed-delivery boot lifecycle; existing boot-worktree suite.
+	for _, mode := range []string{"restore", "sqlite-busy", "initial-sqlite-busy", "shutdown", "boot-failure"} {
+		t.Run("Should own deferred inventory recovery through "+mode, func(t *testing.T) {
+			t.Parallel()
+			ctx := t.Context()
+			db, err := openDaemonTestGlobalDBAtPath(ctx, filepath.Join(t.TempDir(), "compozy.db"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			t.Cleanup(func() {
+				if err := db.Close(testutil.Context(t)); err != nil {
+					t.Errorf("close recovery fixture: %v", err)
+				}
+			})
+			now := time.Date(2026, 9, 30, 12, 0, 0, 0, time.UTC)
+			const workspaceID = "ws-inventory-retry"
+			if err := db.InsertWorkspace(ctx, workspacepkg.Workspace{
+				ID: workspaceID, Name: "Inventory retry", RootDir: t.TempDir(), CreatedAt: now, UpdatedAt: now,
+			}); err != nil {
+				t.Fatal(err)
+			}
+			item := worktree.Worktree{ID: "wt-inventory-retry", ProfileID: store.DefaultProfileID,
+				WorkspaceID: workspaceID, Name: "inventory-retry", Path: t.TempDir(), State: worktree.StateReady,
+				Origin: worktree.OriginManual, SetupState: worktree.SetupNone, CreatedAt: now, UpdatedAt: now}
+			if err := db.Worktrees.Insert(ctx, item); err != nil {
+				t.Fatal(err)
+			}
+			operation := worktree.ExitOperation{ID: "op-inventory-retry", ProfileID: item.ProfileID,
+				WorkspaceID: workspaceID, WorktreeID: item.ID, Action: string(worktree.ExitActionDeliver),
+				State: "running", StartedAt: now}
+			if err := db.Worktrees.InsertExitOperation(ctx, operation); err != nil {
+				t.Fatal(err)
+			}
+			root := t.TempDir()
+			directory := filepath.Join(root, ".delivery")
+			if err := os.WriteFile(directory, []byte("not a directory"), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			restoreInventory := func() {
+				if err := os.Remove(directory); err != nil {
+					t.Fatal(err)
+				}
+				if err := os.MkdirAll(directory, 0o700); err != nil {
+					t.Fatal(err)
+				}
+				data, err := json.Marshal(struct {
+					Version     int               `json:"version"`
+					OperationID string            `json:"operation_id"`
+					Item        worktree.Worktree `json:"worktree"`
+					Phase       string            `json:"phase"`
+				}{Version: 1, OperationID: operation.ID, Item: item, Phase: "completed"})
+				if err != nil {
+					t.Fatal(err)
+				}
+				if err := os.WriteFile(filepath.Join(directory, "restored.json"), data, 0o600); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if mode == "initial-sqlite-busy" {
+				restoreInventory()
+			}
+			var events worktree.EventSink = db
+			var busy *managedDeliveryBusyEvents
+			var unlock func()
+			if mode == "sqlite-busy" || mode == "initial-sqlite-busy" {
+				busy, unlock = newManagedDeliveryBusyEvents(t, db)
+				events = busy
+			}
+			service := worktree.NewService(db.Worktrees, nil,
+				worktree.WithConfig(config.WorktreesConfig{}, root), worktree.WithEvents(events))
+			state := &bootState{worktrees: service, logger: slog.Default()}
+			cleanup := &bootCleanup{}
+			if err := new(Daemon).bootManagedDeliveries(ctx, state, cleanup); err != nil {
+				t.Fatalf("transient recovery failure must not abort boot: %v", err)
+			}
+			worker := state.runtimeWorkers.managedDeliveries
+			if worker == nil {
+				t.Fatal("deferred recovery lacks boot/shutdown ownership")
+			}
+			t.Cleanup(func() {
+				stopCtx, cancel := context.WithTimeout(context.WithoutCancel(t.Context()), 5*time.Second)
+				defer cancel()
+				if err := stopManagedDeliveryRecovery(stopCtx, worker); err != nil {
+					t.Errorf("stop recovery fixture: %v", err)
+				}
+			})
+			if running, err := db.Worktrees.ListRunningExitOperations(ctx); err != nil || len(running) != 1 ||
+				running[0].ID != operation.ID {
+				t.Fatalf("transient recovery altered original receipt: %#v error=%v", running, err)
+			}
+			switch mode {
+			case "shutdown":
+				stopCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+				defer cancel()
+				var errs []error
+				state.runtimeWorkers.shutdown(stopCtx, &errs)
+				if err := errors.Join(errs...); err != nil {
+					t.Fatal(err)
+				}
+			case "boot-failure":
+				bootErr := errors.New("later boot step failed")
+				cleanup.run(ctx, &bootErr)
+			}
+			if mode != "initial-sqlite-busy" {
+				restoreInventory()
+			}
+			if busy != nil {
+				select {
+				case err := <-busy.contended:
+					if contention, ok := errors.AsType[*store.WriteContentionError](
+						err,
+					); !ok || !store.IsSQLiteBusy(err) ||
+						contention.Attempts < 1 {
+						t.Fatalf("expected bounded real receipt SQLite contention: %v", err)
+					}
+				case <-time.After(10 * time.Second):
+					t.Fatal("recovery never attempted the contended receipt")
+				}
+				if running, err := db.Worktrees.ListRunningExitOperations(
+					ctx,
+				); err != nil || len(running) != 1 ||
+					running[0].ID != operation.ID {
+					t.Fatalf("contention changed receipt: %#v error=%v", running, err)
+				}
+				unlock()
+			}
+			if mode != "restore" && mode != "sqlite-busy" && mode != "initial-sqlite-busy" {
+				select {
+				case <-worker.Stop():
+				default:
+					t.Fatal("shutdown returned before retry worker joined")
+				}
+				if running, err := db.Worktrees.ListRunningExitOperations(ctx); err != nil || len(running) != 1 {
+					t.Fatalf("stopped worker recovered after cancellation: %#v error=%v", running, err)
+				}
+				return
+			}
+			waitForConditionWithin(t, "same receipt recovery after restored inventory", 5*time.Second, func() bool {
+				running, err := db.Worktrees.ListRunningExitOperations(ctx)
+				if err != nil {
+					t.Error(err)
+					return false
+				}
+				return len(running) == 0
+			})
+			summaries, err := db.ListEventSummaries(ctx, store.EventSummaryQuery{
+				ReadScope: store.ReadScope{AllProfiles: true}, WorkspaceID: workspaceID,
+				WorktreeID: item.ID, Type: worktree.EventExitActionCompleted,
+			})
+			if err != nil || len(summaries) != 1 {
+				t.Fatalf("restored receipt terminal event=%#v error=%v", summaries, err)
+			}
+			var payload worktree.ExitEventPayload
+			if err := json.Unmarshal(summaries[0].Content, &payload); err != nil {
+				t.Fatal(err)
+			}
+			if payload.OperationID != operation.ID || payload.State != "completed" {
+				t.Fatalf("recovery changed receipt identity: %#v", payload)
+			}
+		})
+	}
+}
+
+// The real SQLite lock supplies the persistence-boundary failure without replacing recovery.
+type managedDeliveryBusyEvents struct {
+	*globaldb.GlobalDB
+	contended chan error
+	attempted bool
+}
+
+func (s *managedDeliveryBusyEvents) FinishExitOperationWithEvent(
+	ctx context.Context, workspaceID, worktreeID, operationID, state string,
+	finishedAt time.Time, event worktree.LifecycleEvent,
+) (bool, error) {
+	finished, err := s.GlobalDB.FinishExitOperationWithEvent(
+		ctx, workspaceID, worktreeID, operationID, state, finishedAt, event,
+	)
+	if !s.attempted {
+		s.attempted = true
+		s.contended <- err
+	}
+	return finished, err
+}
+
+func newManagedDeliveryBusyEvents(t *testing.T, db *globaldb.GlobalDB) (*managedDeliveryBusyEvents, func()) {
+	t.Helper()
+	// Keep the real receipt connection deterministic while bounding only SQLite's per-attempt wait.
+	db.DB().SetMaxOpenConns(1)
+	db.DB().SetMaxIdleConns(1)
+	if _, err := db.DB().ExecContext(t.Context(), "PRAGMA busy_timeout = 1"); err != nil {
+		t.Fatal(err)
+	}
+	locker, err := sql.Open("sqlite", db.Path()+"?_pragma=busy_timeout(1)")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		if err := locker.Close(); err != nil {
+			t.Error(err)
+		}
+	})
+	conn, err := locker.Conn(t.Context())
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		if err := conn.Close(); err != nil {
+			t.Error(err)
+		}
+	})
+	if _, err := conn.ExecContext(t.Context(), "BEGIN IMMEDIATE"); err != nil {
+		t.Fatal(err)
+	}
+	unlock := sync.OnceFunc(func() {
+		if _, err := conn.ExecContext(context.WithoutCancel(t.Context()), "ROLLBACK"); err != nil {
+			t.Error(err)
+		}
+	})
+	t.Cleanup(unlock)
+	return &managedDeliveryBusyEvents{GlobalDB: db, contended: make(chan error, 1)}, unlock
+}
+
+// Invariant: the daemon adapter translates provisioning failures and only removes safe, unadmitted work.
+// Owner: daemon worktree adapter; canonical worktree wiring suite (UT-038, UT-039).
+func TestSubagentWorktreeAdapter(t *testing.T) {
+	t.Parallel()
+	for _, nested := range []bool{false, true} {
+		name := "Should resolve omitted base from caller HEAD UT-020"
+		if nested {
+			name = "Should resolve nested caller HEAD UT-026"
+		}
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+			svc := &subagentWorktreeServiceStub{item: worktree.Worktree{Path: "/nested"}}
+			req := session.SubagentWorktreeRequest{CallerPath: "/caller"}
+			want := "/caller"
+			if nested {
+				req.CallerWorktreeID = "parent-wt"
+				want = "/nested"
+			}
+			base, err := subagentWorktreeBase(t.Context(), svc, req)
+			if err != nil || base != "caller-head" || svc.resolvedPath != want || svc.resolvedRef != "HEAD" {
+				t.Fatal(base, err, svc.resolvedPath, svc.resolvedRef)
+			}
+		})
+	}
+	for _, state := range []worktree.State{worktree.StatePending, worktree.StateReady, worktree.StateRemoved, worktree.StateMissing, worktree.StateDismissed} {
+		t.Run("Should find only live run materializations "+string(state), func(t *testing.T) {
+			t.Parallel()
+			svc := &subagentWorktreeServiceStub{
+				items: []worktree.Worktree{{ID: "wt", RunID: "sub", Origin: worktree.OriginPerRun, State: state}},
+			}
+			adapter := daemonSubagentWorktrees{lookup: func() subagentWorktreeService { return svc }}
+			got, err := adapter.FindByRun(t.Context(), "ws", "sub")
+			want := state == worktree.StatePending || state == worktree.StateReady
+			if err != nil || (got != nil) != want {
+				t.Fatal(got, err)
+			}
+		})
+	}
+	t.Run("Should rollback failed setup and preserve hook denial identity", func(t *testing.T) {
+		t.Parallel()
+		service := &subagentWorktreeServiceStub{
+			item:   worktree.Worktree{ID: "wt", SetupState: worktree.SetupFailed},
+			status: worktree.Status{DirtyFiles: new(1)},
+		}
+		adapter := daemonSubagentWorktrees{lookup: func() subagentWorktreeService { return service }}
+		req := session.SubagentWorktreeRequest{WorkspaceID: "ws", SubagentID: "sub", BaseRef: "main"}
+		_, err := adapter.Provision(t.Context(), req)
+		failure, ok := errors.AsType[*session.ErrSubagentIsolationFailed](err)
+		if !ok || failure.Cause != "setup_failed" || service.rollbacks != 1 {
+			t.Fatal(err, service.rollbacks)
+		}
+		service.provisionErr = worktree.ErrDeniedByHook
+		_, err = adapter.Provision(t.Context(), req)
+		if !errors.Is(err, worktree.ErrDeniedByHook) || !errors.Is(err, session.ErrSubagentCapabilityDenied) {
+			t.Fatal(err)
+		}
+	})
+	for _, tc := range []struct {
+		name                string
+		dirty, ahead        int
+		readError           string
+		retained, wantError bool
+	}{
+		{name: "Should remove a clean checkout with zero commits"},
+		{name: "Should retain dirty work", dirty: 1, retained: true},
+		{name: "Should retain committed work", ahead: 1, retained: true},
+		{name: "Should fail closed when Git cannot be read", readError: "unreadable", wantError: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			svc := &subagentWorktreeServiceStub{
+				status: worktree.Status{DirtyFiles: new(tc.dirty), ReadError: tc.readError},
+				ahead:  tc.ahead,
+			}
+			adapter := daemonSubagentWorktrees{lookup: func() subagentWorktreeService { return svc }}
+			retained, err := adapter.SafeRollback(t.Context(), "ws", "wt", "sub", "creation-sha")
+			if retained != tc.retained || (err != nil) != tc.wantError {
+				t.Fatal(retained, err)
+			}
+			if (retained || err != nil) && svc.rollbacks != 0 {
+				t.Fatal("unsafe rollback", svc.rollbacks)
+			}
+			if !retained && err == nil && svc.rollbacks != 1 {
+				t.Fatal("missing rollback")
+			}
+		})
+	}
+	t.Run("Should observe against creation SHA and distinguish unknown from no PR", func(t *testing.T) {
+		t.Parallel()
+		svc := &subagentWorktreeServiceStub{
+			status: worktree.Status{
+				HeadSHA:     new("head"),
+				DirtyFiles:  new(0),
+				RefreshedAt: new(time.Date(2026, 10, 9, 0, 0, 0, 0, time.UTC)),
+			},
+			ahead:    2,
+			forgeErr: worktree.ErrForgeUnavailable,
+		}
+		adapter := daemonSubagentWorktrees{lookup: func() subagentWorktreeService { return svc }}
+		facts := adapter.Observe(t.Context(), "ws", "wt", "creation-sha")
+		if svc.base != "creation-sha" || facts.PRStatus != "unknown" || facts.CommitsAhead == nil ||
+			*facts.CommitsAhead != 2 {
+			t.Fatal(facts, svc.base)
+		}
+		svc.forgeErr = nil
+		svc.forge = &worktree.ForgeStatus{}
+		if facts := adapter.Observe(
+			t.Context(),
+			"ws",
+			"wt",
+			"creation-sha",
+		); facts.PRStatus != "none" ||
+			facts.PRNumber != nil {
+			t.Fatal(facts)
+		}
+		svc.forge = &worktree.ForgeStatus{
+			PRNumber: new(7),
+			PRState:  new(" OPEN "),
+			PRURL:    "https://example.test/pull/7",
+			Draft:    new(true),
+		}
+		if facts := adapter.Observe(
+			t.Context(),
+			"ws",
+			"wt",
+			"creation-sha",
+		); facts.PRStatus != "draft" || facts.PRNumber == nil ||
+			*facts.PRNumber != 7 {
+			t.Fatal(facts)
+		}
+		svc.status.ReadError = "failed"
+		if facts := adapter.Observe(
+			t.Context(),
+			"ws",
+			"wt",
+			"creation-sha",
+		); facts.HeadSHA != "" || facts.CommitsAhead != nil ||
+			!facts.ObservedAt.IsZero() {
+			t.Fatal(facts)
+		}
+	})
+}
+
+type subagentWorktreeServiceStub struct {
+	subagentWorktreeService
+	item                      worktree.Worktree
+	status                    worktree.Status
+	forge                     *worktree.ForgeStatus
+	provisionErr, forgeErr    error
+	ahead, rollbacks          int
+	base                      string
+	items                     []worktree.Worktree
+	resolvedPath, resolvedRef string
+}
+
+var _ subagentWorktreeService = (*subagentWorktreeServiceStub)(nil)
+
+func (s *subagentWorktreeServiceStub) ResolveCommit(_ context.Context, path, ref string) (string, error) {
+	s.resolvedPath, s.resolvedRef = path, ref
+	return "caller-head", nil
+}
+
+func (s *subagentWorktreeServiceStub) Get(context.Context, string, string) (*worktree.Worktree, error) {
+	return &s.item, nil
+}
+
+func (s *subagentWorktreeServiceStub) List(context.Context, string, bool) (*worktree.Listing, error) {
+	return &worktree.Listing{Worktrees: s.items}, nil
+}
+
+func (s *subagentWorktreeServiceStub) MaterializeForRun(
+	context.Context,
+	string,
+	worktree.RunWorktreeRequest,
+) (*worktree.Worktree, error) {
+	return &s.item, s.provisionErr
+}
+func (s *subagentWorktreeServiceStub) RollbackRunMaterialization(context.Context, string, string, string) error {
+	s.rollbacks++
+	return nil
+}
+func (s *subagentWorktreeServiceStub) Status(context.Context, string, string, bool) (*worktree.Status, error) {
+	return &s.status, nil
+}
+func (s *subagentWorktreeServiceStub) CommitsAheadOf(_ context.Context, _, _, base string) (int, error) {
+	s.base = base
+	return s.ahead, nil
+}
+
+func (s *subagentWorktreeServiceStub) ObserveForgeStatus(
+	context.Context, string, string,
+) (*worktree.ForgeStatus, error) {
+	return s.forge, s.forgeErr
+}
+
+// Invariant: only a named non-default branch is snapshotted, and readiness fails closed.
+// Owner: daemon Git and forge adapters; canonical worktree composition suite.
+func TestSessionPullRequestAdapters(t *testing.T) {
+	t.Parallel()
+	// Invariant: local repository identity and substring paging cross branch slashes without forge access.
+	t.Run("Should search local branches across path separators", func(t *testing.T) {
+		t.Parallel()
+		runner, err := worktree.NewRealGitRunner(0)
+		if err != nil {
+			t.Fatal(err)
+		}
+		root := t.TempDir()
+		for _, args := range [][]string{{"init", "--initial-branch=main"}, {"-c", "user.name=Test", "-c", "user.email=test@example.com", "commit", "--allow-empty", "-m", "init"}, {"branch", "feat/find-one"}, {"branch", "fix/find-two"}} {
+			if _, _, err := runner.Run(t.Context(), root, args...); err != nil {
+				t.Fatal(err)
+			}
+		}
+		paths := testHomePaths(t)
+		resolver := daemonWorktreeWorkspaceResolver{
+			homePaths: paths,
+			resolver: &daemonWorktreeResolverStub{
+				resolved: workspacepkg.ResolvedWorkspace{
+					ID:      "ws",
+					RootDir: root,
+					Config:  config.DefaultWithHome(paths),
+				},
+			},
+		}
+		service := worktree.NewPullRequestService(t.Context(), nil, nil, runner, nil)
+		t.Cleanup(service.Close)
+		adapter := sessionPullRequestAdapter{service: service, resolver: resolver, runner: runner}
+		for page := 1; page <= 2; page++ {
+			got, err := adapter.WorkCandidates(t.Context(), "ws", "find", "branches", page, 1)
+			if err != nil || len(got.Items) != 1 || got.Items[0].Repository != "local:ws" ||
+				got.HasMore != (page == 1) {
+				t.Fatalf("page=%d got=%+v err=%v", page, got, err)
+			}
+		}
+		beyond, err := adapter.WorkCandidates(t.Context(), "ws", "find", "branches", math.MaxInt, 100)
+		if err != nil || len(beyond.Items) != 0 || beyond.HasMore {
+			t.Fatalf("page past the end got=%+v err=%v", beyond, err)
+		}
+	})
+
+	// Invariant: exact PR identities resolve independently of text search in this repository.
+	for _, tc := range []struct {
+		name, query string
+		search      []extensioncontract.ForgePRCandidate
+		readErr     error
+		want        []int
+		foreign     bool
+		page        int
+		searchErr   error
+	}{
+		{name: "Should resolve a bare number missed by search", query: "42", want: []int{42}},
+		{name: "Should resolve a hash number missed by search", query: "#42", want: []int{42}},
+		{name: "Should resolve a pull link", query: "https://forge.test/acme/repo/pull/42", want: []int{42}},
+		{name: "Should resolve a merge request link", query: "https://forge.test/acme/repo/-/merge_requests/42?view=diff#note", want: []int{42}},
+		{name: "Should resolve a pull request link", query: "https://forge.test/acme/repo/pull-requests/42/title", want: []int{42}},
+		{name: "Should prepend and deduplicate the resolved PR", query: "42", search: []extensioncontract.ForgePRCandidate{{Number: 7}, {Number: 42}}, want: []int{42, 7}},
+		{name: "Should retain normal text search", query: "review", search: []extensioncontract.ForgePRCandidate{{Number: 7}}, want: []int{7}},
+		{name: "Should keep a missing number absent", query: "404", readErr: errors.New("not found")},
+		{name: "Should retain search matches after a failed read", query: "42", readErr: errors.New("read unavailable"), search: []extensioncontract.ForgePRCandidate{{Number: 7}, {Number: 42}}, want: []int{7, 42}},
+		{name: "Should preserve direct resolution when search fails", query: "42", searchErr: errors.New("search unavailable"), want: []int{42}},
+		{name: "Should remove the resolved number from later pages", query: "42", page: 2, search: []extensioncontract.ForgePRCandidate{{Number: 42}, {Number: 7}}, want: []int{7}},
+		{name: "Should preserve later search pages", query: "42", page: 2, search: []extensioncontract.ForgePRCandidate{{Number: 7}}, want: []int{7}},
+		{name: "Should refuse another repository before discovery", query: "https://forge.test/acme/other/pull/42", foreign: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			runner, err := worktree.NewRealGitRunner(0)
+			if err != nil {
+				t.Fatal(err)
+			}
+			root := t.TempDir()
+			if _, _, err := runner.Run(t.Context(), root, "init", "--initial-branch=main"); err != nil {
+				t.Fatal(err)
+			}
+			if _, _, err := runner.Run(
+				t.Context(),
+				root,
+				"remote",
+				"add",
+				"origin",
+				"https://forge.test/acme/repo.git",
+			); err != nil {
+				t.Fatal(err)
+			}
+			paths := testHomePaths(t)
+			resolver := daemonWorktreeWorkspaceResolver{homePaths: paths, resolver: &daemonWorktreeResolverStub{
+				resolved: workspacepkg.ResolvedWorkspace{
+					ID:      "ws",
+					RootDir: root,
+					Config:  config.DefaultWithHome(paths),
+				},
+			}}
+			service := worktree.NewPullRequestService(t.Context(), nil, nil, runner, nil)
+			t.Cleanup(service.Close)
+			runtime := &candidateDiscoveryStub{items: tc.search, readErr: tc.readErr, searchErr: tc.searchErr}
+			adapter := sessionPullRequestAdapter{
+				service:  service,
+				resolver: resolver,
+				runner:   runner,
+				runtime:  func() extensionRuntime { return runtime },
+			}
+			got, err := adapter.WorkCandidates(t.Context(), "ws", tc.query, "pull_requests", max(1, tc.page), 2)
+			if tc.foreign {
+				if !errors.Is(err, session.ErrLinkedWorkRepository) || runtime.reads != 0 || runtime.searches != 0 {
+					t.Fatalf("foreign=%#v err=%v runtime=%#v", got, err, runtime)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatal(err)
+			}
+			if len(got.Items) != len(tc.want) {
+				t.Fatalf("candidates=%#v want numbers=%v", got, tc.want)
+			}
+			for i, number := range tc.want {
+				if got.Items[i].PRNumber != number || got.Items[i].Repository != "forge.test/acme/repo" {
+					t.Fatalf("candidate=%#v want number=%d", got.Items[i], number)
+				}
+			}
+			if tc.page > 1 && runtime.reads != 0 {
+				t.Fatalf("later page direct reads=%d", runtime.reads)
+			}
+			if runtime.searches != 1 {
+				t.Fatalf("search calls=%d", runtime.searches)
+			}
+			if len(tc.want) > 0 && tc.want[0] == 42 &&
+				(runtime.reads != 1 || got.Items[0].Branch != "topic" || got.Items[0].Title != "Resolved PR") {
+				t.Fatalf("direct candidate=%#v reads=%d", got, runtime.reads)
+			}
+		})
+	}
+	t.Run("Should deliver a workspace wake from an actual PR cache change", func(t *testing.T) {
+		t.Parallel()
+		db := openDaemonTestGlobalDB(t)
+		now := time.Unix(1800000000, 0).UTC()
+		const workspaceID = "ws-pr-cache"
+		if err := db.InsertWorkspace(
+			t.Context(),
+			workspacepkg.Workspace{
+				ID:        workspaceID,
+				Name:      "PR cache",
+				RootDir:   t.TempDir(),
+				CreatedAt: now,
+				UpdatedAt: now,
+			},
+		); err != nil {
+			t.Fatal(err)
+		}
+		manager, err := session.NewManager(session.WithHomePaths(testHomePaths(t)))
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() {
+			if err := manager.Shutdown(context.Background()); err != nil {
+				t.Error(err)
+			}
+		})
+		events, cancel, err := manager.SubscribeSessionCatalogEvents(
+			t.Context(),
+			session.CatalogScope{
+				ReadScope:   store.ReadScope{ProfileID: store.DefaultProfileID},
+				WorkspaceID: workspaceID,
+			},
+		)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer cancel()
+		pulls := worktree.NewPullRequestService(t.Context(), db.Worktrees, nil, nil, func(workspace string) {
+			manager.PublishWorkspaceCatalogChanged(workspace, []string{store.DefaultProfileID})
+		})
+		t.Cleanup(pulls.Close)
+		entry, err := pulls.Refresh(
+			t.Context(),
+			worktree.PullRequestKey{WorkspaceID: workspaceID, RepoKey: "github.com/acme/repo", Branch: "topic"},
+		)
+		if err == nil || entry.LookupCause != "provider_disabled" {
+			t.Fatalf("refresh=%#v %v", entry, err)
+		}
+		select {
+		case event := <-events:
+			if event.Name != session.CatalogEventNameChanged || event.Kind != session.CatalogEventLayout ||
+				event.WorkspaceID != workspaceID ||
+				event.ProfileID != store.DefaultProfileID ||
+				event.SessionID != "" {
+				t.Fatalf("cache event=%#v", event)
+			}
+		default:
+			t.Fatal("PR cache change did not emit its workspace wake")
+		}
+	})
+
+	t.Run("Should resolve branches using real Git without reading the forge", func(t *testing.T) {
+		t.Parallel()
+		runner, err := worktree.NewRealGitRunner(0)
+		if err != nil {
+			t.Fatal(err)
+		}
+		root := t.TempDir()
+		if _, _, err = runner.Run(t.Context(), root, "init", "--initial-branch=main"); err != nil {
+			t.Fatal(err)
+		}
+		reader := sessionBranchAdapter{runner: runner}
+		if branch, err := reader.CurrentBranch(t.Context(), root); err != nil || branch != "" {
+			t.Fatalf("default=%q %v", branch, err)
+		}
+		if _, _, err = runner.Run(t.Context(), root, "symbolic-ref", "HEAD", "refs/heads/topic"); err != nil {
+			t.Fatal(err)
+		}
+		if branch, err := reader.CurrentBranch(t.Context(), root); err != nil || branch != "topic" {
+			t.Fatalf("topic=%q %v", branch, err)
+		}
+		if _, _, err = runner.Run(
+			t.Context(),
+			root,
+			"symbolic-ref",
+			"refs/remotes/origin/HEAD",
+			"refs/remotes/origin/topic",
+		); err != nil {
+			t.Fatal(err)
+		}
+		if branch, err := reader.CurrentBranch(t.Context(), root); err != nil || branch != "" {
+			t.Fatalf("origin default=%q %v", branch, err)
+		}
+		if branch, err := reader.CurrentBranch(t.Context(), t.TempDir()); err != nil || branch != "" {
+			t.Fatalf("nonrepo=%q %v", branch, err)
+		}
+	})
+	t.Run("Should require every known fact before declaring a PR ready", func(t *testing.T) {
+		t.Parallel()
+		entry := worktree.PullRequestEntry{
+			LookupState: "ok",
+			Facts: &worktree.ForgeStatus{
+				PRNumber:       new(1),
+				PRState:        new("open"),
+				Draft:          new(false),
+				Checks:         &worktree.ForgeChecks{State: "passing"},
+				ReviewDecision: "approved",
+				Mergeable:      "mergeable",
+			},
+		}
+		if !sessionPullRequestView(entry).PullRequest.ReadyToMerge {
+			t.Fatal("complete facts not ready")
+		}
+		entry.Stale = true
+		if sessionPullRequestView(entry).PullRequest.ReadyToMerge {
+			t.Fatal("stale facts ready")
+		}
+		entry.Stale = false
+		entry.LookupState = "error"
+		if sessionPullRequestView(entry).PullRequest.ReadyToMerge {
+			t.Fatal("failed lookup ready")
+		}
+		reset := time.Date(2026, 11, 4, 16, 5, 0, 0, time.UTC)
+		entry.RetryAfter = &reset
+		if view := sessionPullRequestView(entry); view.Lookup.RetryAfter != nil {
+			t.Fatalf("non-rate-limit failure exposed retry time %v", view.Lookup.RetryAfter)
+		}
+		entry.LookupCause = "rate_limited"
+		if view := sessionPullRequestView(entry); view.Lookup.RetryAfter == nil ||
+			!view.Lookup.RetryAfter.Equal(reset) || view.PullRequest == nil {
+			t.Fatalf("rate-limited lookup = %+v, want cached PR and retry %s", view, reset)
+		}
+		entry.LookupCause, entry.RetryAfter = "", nil
+		entry.LookupState = "ok"
+		entry.Facts.Draft = nil
+		if sessionPullRequestView(entry).PullRequest.ReadyToMerge {
+			t.Fatal("unknown draft ready")
+		}
+	})
+}
+
+func TestDaemonTerminalWorktreeRoot(t *testing.T) {
+	t.Parallel()
+	root := t.TempDir()
+	cases := []struct {
+		name       string
+		workspace  string
+		profile    string
+		state      worktree.State
+		path       string
+		usageErr   error
+		wantCode   terminalpkg.ErrorCode
+		wantErr    error
+		wantStatus int
+	}{
+		{name: "ready", workspace: "ws-a", profile: "profile-a", state: worktree.StateReady, path: root},
+		{
+			name:       "foreign workspace",
+			workspace:  "ws-b",
+			profile:    "profile-a",
+			state:      worktree.StateReady,
+			path:       root,
+			wantCode:   terminalpkg.ErrorCodeWorktreeNotFound,
+			wantErr:    terminalpkg.ErrWorktreeNotFound,
+			wantStatus: http.StatusNotFound,
+		},
+		{
+			name:       "foreign profile",
+			workspace:  "ws-a",
+			profile:    "profile-b",
+			state:      worktree.StateReady,
+			path:       root,
+			wantCode:   terminalpkg.ErrorCodeWorktreeNotFound,
+			wantErr:    terminalpkg.ErrWorktreeNotFound,
+			wantStatus: http.StatusNotFound,
+		},
+		{
+			name:       "pending",
+			workspace:  "ws-a",
+			profile:    "profile-a",
+			state:      worktree.StatePending,
+			path:       root,
+			wantCode:   terminalpkg.ErrorCodeWorktreeNotReady,
+			wantErr:    terminalpkg.ErrWorktreeNotReady,
+			wantStatus: http.StatusConflict,
+		},
+		{
+			name:       "removed",
+			workspace:  "ws-a",
+			profile:    "profile-a",
+			state:      worktree.StateRemoved,
+			path:       root,
+			wantCode:   terminalpkg.ErrorCodeWorktreeMissing,
+			wantErr:    terminalpkg.ErrWorktreeMissing,
+			wantStatus: http.StatusConflict,
+		},
+		{name: "vanished folder", workspace: "ws-a", profile: "profile-a", state: worktree.StateReady,
+			path: filepath.Join(root, "gone"), wantCode: terminalpkg.ErrorCodeWorktreeMissing,
+			wantErr: terminalpkg.ErrWorktreeMissing, wantStatus: http.StatusConflict},
+		{name: "concurrently removed", workspace: "ws-a", profile: "profile-a", state: worktree.StateReady,
+			path: root, usageErr: worktree.ErrNotReady, wantCode: terminalpkg.ErrorCodeWorktreeNotReady,
+			wantErr: terminalpkg.ErrWorktreeNotReady, wantStatus: http.StatusConflict},
+	}
+	for _, tc := range cases {
+		t.Run("Should resolve or reject a "+tc.name+" worktree", func(t *testing.T) {
+			t.Parallel()
+			resolver := daemonSessionWorktreeResolver{lookup: func() sessionWorktreeLookup {
+				return sessionWorktreeLookupFunc(func(_ context.Context, ws, ref string) (*worktree.Worktree, error) {
+					if ws != "ws-a" || ref != "wt-a" {
+						return nil, worktree.ErrNotFound
+					}
+					return &worktree.Worktree{
+						ID: ref, WorkspaceID: ws, ProfileID: "profile-a", Path: tc.path, State: tc.state,
+					}, nil
+				})
+			}}
+			usage := &fakeTerminalWorktreeUsage{err: tc.usageErr, item: &worktree.Worktree{
+				ID: "wt-a", WorkspaceID: "ws-a", ProfileID: "profile-a", Path: tc.path, State: tc.state,
+			}}
+			got, release, err := resolveTerminalWorktreeRoot(
+				t.Context(), resolver, usage, tc.workspace, tc.profile, "wt-a",
+			)
+			if tc.wantCode == "" {
+				if err != nil || got != root || release == nil {
+					t.Fatalf("ready root = %q, %v", got, err)
+				}
+				if usage.held != 1 {
+					t.Fatalf("usage leases held = %d, want 1 while the terminal runs", usage.held)
+				}
+				release()
+				if usage.held != 0 {
+					t.Fatalf("usage leases held after release = %d, want 0", usage.held)
+				}
+				return
+			}
+			if release != nil || usage.held != 0 {
+				t.Fatalf("refused worktree kept a usage lease (held=%d)", usage.held)
+			}
+			typed, ok := errors.AsType[*terminalpkg.Error](err)
+			if got != "" || !ok || typed.Code != tc.wantCode || !errors.Is(err, tc.wantErr) {
+				t.Fatalf("root=%q error=%#v, want %s", got, err, tc.wantCode)
+			}
+			if status, _, _ := core.TerminalErrorStatus(err); status != tc.wantStatus {
+				t.Fatalf("HTTP status = %d, want %d", status, tc.wantStatus)
+			}
+			nativeErr := terminalToolError(toolspkg.ToolIDTerminalOpen, err)
+			if toolErr, ok := errors.AsType[*toolspkg.ToolError](nativeErr); !ok ||
+				toolErr.Code != toolspkg.ErrorCode(tc.wantCode) {
+				t.Fatalf("native error = %v, want %s", nativeErr, tc.wantCode)
+			}
+		})
+	}
+}
+
+type fakeTerminalWorktreeUsage struct {
+	item *worktree.Worktree
+	err  error
+	held int
+}
+
+func (f *fakeTerminalWorktreeUsage) AcquireUsage(context.Context, string, string) (*worktree.Worktree, func(), error) {
+	if f.err != nil {
+		return nil, nil, f.err
+	}
+	f.held++
+	return f.item, func() { f.held-- }, nil
+}
+
+type candidateDiscoveryStub struct {
+	extensionRuntime
+	items           []extensioncontract.ForgePRCandidate
+	readErr         error
+	searchErr       error
+	reads, searches int
+}
+
+func (*candidateDiscoveryStub) ForgeCapabilities(
+	context.Context,
+	[]string,
+) (extensioncontract.ForgeCapabilitiesResponse, error) {
+	return extensioncontract.ForgeCapabilitiesResponse{Available: true, SupportsPRDiscovery: true}, nil
+}
+
+func (s *candidateDiscoveryStub) ForgeReadPR(
+	_ context.Context,
+	request extensioncontract.ForgePRReadRequest,
+) (extensioncontract.ForgePRCandidate, error) {
+	s.reads++
+	return extensioncontract.ForgePRCandidate{
+		Number: request.Number,
+		Branch: "topic",
+		Title:  "Resolved PR",
+		State:  "open",
+	}, s.readErr
+}
+
+func (s *candidateDiscoveryStub) ForgeSearchPRs(
+	context.Context,
+	extensioncontract.ForgePRSearchRequest,
+) (extensioncontract.ForgePRSearchResponse, error) {
+	s.searches++
+	return extensioncontract.ForgePRSearchResponse{Items: s.items}, s.searchErr
+}

@@ -1,0 +1,192 @@
+package e2elane
+
+import (
+	"reflect"
+	"regexp"
+	"testing"
+)
+
+func TestPlanForLaneMapsRuntimeWebCombinedAndNightlySlices(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name        string
+		lane        Lane
+		wantGo      []GoSuite
+		wantScripts []ScriptSuite
+		wantDaemon  bool
+		wantNightly bool
+	}{
+		{
+			name:        "Should keep daemon and transport parity in the runtime lane",
+			lane:        LaneRuntime,
+			wantGo:      expectedRuntimeGoSuites(),
+			wantScripts: nil,
+		},
+		{
+			name:        "Should run daemon-served Playwright only in the web lane",
+			lane:        LaneWeb,
+			wantGo:      nil,
+			wantScripts: expectedDaemonServedWebSuites(),
+			wantDaemon:  true,
+		},
+		{
+			name:        "Should join runtime and browser suites in the combined lane",
+			lane:        LaneCombined,
+			wantGo:      expectedRuntimeGoSuites(),
+			wantScripts: expectedDaemonServedWebSuites(),
+			wantDaemon:  true,
+		},
+		{
+			name:        "Should add credentialed runtime and browser suites in the nightly lane",
+			lane:        LaneNightly,
+			wantGo:      append(expectedRuntimeGoSuites(), expectedNightlyGoSuites()...),
+			wantScripts: append(expectedDaemonServedWebSuites(), expectedNightlyWebSuites()...),
+			wantDaemon:  true,
+			wantNightly: true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			plan, err := PlanForLane(tt.lane)
+			if err != nil {
+				t.Fatalf("PlanForLane(%q) error = %v", tt.lane, err)
+			}
+
+			if plan.Lane != tt.lane {
+				t.Fatalf("plan.Lane = %q, want %q", plan.Lane, tt.lane)
+			}
+			if !reflect.DeepEqual(plan.GoSuites, tt.wantGo) {
+				t.Fatalf("plan.GoSuites = %#v, want %#v", plan.GoSuites, tt.wantGo)
+			}
+			if !reflect.DeepEqual(plan.ScriptSuites, tt.wantScripts) {
+				t.Fatalf("plan.ScriptSuites = %#v, want %#v", plan.ScriptSuites, tt.wantScripts)
+			}
+			if plan.RequiresDaemonServedBrowser != tt.wantDaemon {
+				t.Fatalf(
+					"plan.RequiresDaemonServedBrowser = %v, want %v",
+					plan.RequiresDaemonServedBrowser,
+					tt.wantDaemon,
+				)
+			}
+			if plan.IncludesCredentialedNightly != tt.wantNightly {
+				t.Fatalf(
+					"plan.IncludesCredentialedNightly = %v, want %v",
+					plan.IncludesCredentialedNightly,
+					tt.wantNightly,
+				)
+			}
+		})
+	}
+}
+
+func TestLaneRunPatternsCompileAndMatchRepresentativeTests(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name    string
+		pattern string
+		matches []string
+		rejects []string
+	}{
+		{
+			name:    "Should match default daemon e2e tests only with the runtime daemon pattern",
+			pattern: RuntimeE2EPattern,
+			matches: []string{"TestDaemonE2EAutomationTaskBackedJobDelegatesTaskRun"},
+			rejects: []string{"TestDaemonNightlyE2EProviderExecution"},
+		},
+		{
+			name:    "Should match nightly daemon tests only with the nightly daemon pattern",
+			pattern: NightlyRuntimeE2EPattern,
+			matches: []string{"TestDaemonNightlyE2EProviderExecution"},
+			rejects: []string{"TestDaemonE2EAutomationTaskBackedJobDelegatesTaskRun"},
+		},
+		{
+			name:    "Should match HTTP transport e2e tests with the HTTP transport pattern",
+			pattern: HTTPTransportE2EPattern,
+			matches: []string{"TestHTTPTransportPromptStream"},
+			rejects: []string{"TestUDSTransportPromptStream"},
+		},
+		{
+			name:    "Should match UDS transport e2e tests with the UDS transport pattern",
+			pattern: UDSTransportE2EPattern,
+			matches: []string{"TestUDSTransportPromptStream"},
+			rejects: []string{"TestHTTPTransportPromptStream"},
+		},
+		{
+			name:    "Should match runtime harness tests with the harness pattern",
+			pattern: HarnessRuntimeE2EPattern,
+			matches: []string{"TestStartRuntimeHarnessWithDaemonBinary"},
+			rejects: []string{"TestDaemonE2EAutomationTaskBackedJobDelegatesTaskRun"},
+		},
+		{
+			name:    "Should match remote gateway CLI e2e tests with the gateway pattern",
+			pattern: RemoteGatewayE2EPattern,
+			matches: []string{
+				"TestRemoteGatewayE2EProfileWorkSurvivesDisconnectAndReconnect",
+				"TestRemoteGatewayE2ESSHConnectLeavesNoReachableSurface",
+			},
+			rejects: []string{"TestRemoteCLIProfilesIntegrationIT060ThroughIT066"},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			compiled, err := regexp.Compile(tt.pattern)
+			if err != nil {
+				t.Fatalf("regexp.Compile(%q) error = %v", tt.pattern, err)
+			}
+			for _, name := range tt.matches {
+				if !compiled.MatchString(name) {
+					t.Fatalf("pattern %q did not match representative test %q", tt.pattern, name)
+				}
+			}
+			for _, name := range tt.rejects {
+				if compiled.MatchString(name) {
+					t.Fatalf("pattern %q matched excluded test %q", tt.pattern, name)
+				}
+			}
+		})
+	}
+}
+
+func TestPlanForLaneRejectsUnknownLane(t *testing.T) {
+	t.Parallel()
+
+	t.Run("Should reject unknown lanes", func(t *testing.T) {
+		t.Parallel()
+
+		if _, err := PlanForLane("mystery"); err == nil {
+			t.Fatal("PlanForLane() error = nil, want non-nil")
+		}
+	})
+}
+
+func expectedRuntimeGoSuites() []GoSuite {
+	return []GoSuite{
+		{Packages: []string{"./internal/daemon"}, Run: "^TestDaemonE2E"},
+		{Packages: []string{"./internal/api/httpapi"}, Run: "^TestHTTPTransport"},
+		{Packages: []string{"./internal/api/udsapi"}, Run: "^TestUDSTransport"},
+		{Packages: []string{"./internal/testutil/e2e"}, Run: "^TestStartRuntimeHarness"},
+		{Packages: []string{"./internal/cli"}, Run: "^TestRemoteGatewayE2E"},
+	}
+}
+
+func expectedNightlyGoSuites() []GoSuite {
+	return []GoSuite{
+		{Packages: []string{"./internal/daemon"}, Run: "^TestDaemonNightlyE2E"},
+	}
+}
+
+func expectedDaemonServedWebSuites() []ScriptSuite {
+	return []ScriptSuite{{Dir: "web", Script: "test:e2e:daemon-served"}}
+}
+
+func expectedNightlyWebSuites() []ScriptSuite {
+	return []ScriptSuite{{Dir: "web", Script: "test:e2e:nightly"}}
+}

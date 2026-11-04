@@ -1,0 +1,598 @@
+// Suite: Session prompt runtime availability
+// Invariants: Keep requested intent across provider observations; enable only workspace models with authenticated providers.
+// Boundary IN: Session runtime hook plus its real TanStack Query projections and model-catalog mapper.
+// Boundary OUT: HTTP adapters and rendered selector behavior, owned by adapter and RuntimeSelector suites.
+
+import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
+import { act, renderHook, waitFor } from "@testing-library/react";
+import { createElement, type ReactNode } from "react";
+import type { SessionPayload } from "../../types";
+import { SessionPromptRuntimeProvider } from "../../contexts/session-prompt-runtime-context";
+import { useSessionPromptRuntimeContext } from "../use-session-prompt-runtime-context";
+import { getSessionPromptRuntimeSnapshot } from "../use-session-prompt-runtime";
+import { beforeEach, describe, expect, it, vi } from "vitest";
+
+const runtimeSelectionMutation = vi.hoisted(() => ({
+  isPending: false,
+  mutate: vi.fn(),
+}));
+
+vi.mock("../use-session-runtime-selection", () => ({
+  useSetSessionRuntime: () => runtimeSelectionMutation,
+}));
+
+import { agentKeys, type AgentPayload } from "@/systems/agent";
+import {
+  modelCatalogKeys,
+  type AllModelsListResponse,
+  type ProviderModelPayload,
+} from "@/systems/model-catalog";
+import {
+  providerKeys,
+  type ProviderAuthStatus,
+  type ProviderListResponse,
+  type ProviderSummary,
+} from "@/systems/providers";
+import { primarySessionFixture } from "@/systems/session/mocks";
+import { type WorkspaceDetailPayload, workspaceKeys } from "@/systems/workspace";
+import { workspaceDetailFixture } from "@/systems/workspace/mocks";
+
+import {
+  sessionPromptRuntimeInput,
+  sessionPromptRuntimeStoreLogic,
+} from "../../stores/session-prompt-runtime-store";
+import { useSessionPromptRuntime } from "../use-session-prompt-runtime";
+
+function model(providerId: string, modelId: string): ProviderModelPayload {
+  return {
+    availability_state: "available_live",
+    available: true,
+    curated: true,
+    deprecated: false,
+    featured: false,
+    hidden: false,
+    model_id: modelId,
+    provider_id: providerId,
+    sources: [],
+    stale: false,
+  } as ProviderModelPayload;
+}
+
+function provider(
+  name: string,
+  authState: NonNullable<ProviderAuthStatus>["state"]
+): ProviderSummary {
+  return {
+    auth_status: {
+      env_policy: "inherit",
+      home_policy: "operator",
+      login: {
+        configured: false,
+        presence: "unknown",
+      },
+      mode: "native_cli",
+      state: authState,
+    },
+    default: name === "codex",
+    display_name: name,
+    name,
+    reviewer_mode: "",
+  };
+}
+
+function createHarness() {
+  const queryClient = new QueryClient({
+    defaultOptions: { queries: { retry: false } },
+  });
+  const wrapper = ({ children }: { children: ReactNode }) =>
+    createElement(QueryClientProvider, { client: queryClient }, children);
+  return { queryClient, wrapper };
+}
+
+describe("useSessionPromptRuntime", () => {
+  beforeEach(() => {
+    runtimeSelectionMutation.isPending = false;
+    runtimeSelectionMutation.mutate.mockReset();
+  });
+
+  it("Should retain binding intent after provider revocation and refetch without a selected runtime", async () => {
+    const { queryClient } = createHarness();
+    const requested = {
+      provider: "claude",
+      model: "claude-opus-5-5",
+      reasoning_effort: "max" as const,
+      speed: "fast" as const,
+    };
+    let session: SessionPayload = {
+      ...primarySessionFixture,
+      runtime: {
+        ...primarySessionFixture.runtime,
+        selected: undefined,
+        requested,
+        effective: requested,
+        selection_revision: 0,
+      },
+    };
+    const wrapper = ({ children }: { children: ReactNode }) => (
+      <QueryClientProvider client={queryClient}>
+        <SessionPromptRuntimeProvider session={session} canPrompt={false}>
+          {children}
+        </SessionPromptRuntimeProvider>
+      </QueryClientProvider>
+    );
+    const { result, rerender } = renderHook(
+      () => {
+        const store = useSessionPromptRuntimeContext();
+        return { runtime: useSessionPromptRuntime(store), store };
+      },
+      { wrapper }
+    );
+    expect(result.current.runtime.getRuntimeSnapshot()).toEqual(requested);
+    session = {
+      ...session,
+      runtime: {
+        ...session.runtime,
+        effective: { ...requested, reasoning_effort: "high", speed: "normal" },
+      },
+    };
+    rerender();
+    await waitFor(() => expect(result.current.runtime.value.reasoning_effort).toBe("max"));
+    expect(result.current.runtime.speed).toBe("fast");
+    expect(getSessionPromptRuntimeSnapshot(result.current.store)).toEqual(requested);
+    expect(session.runtime.effective?.speed).toBe("normal");
+    expect(runtimeSelectionMutation.mutate).not.toHaveBeenCalled();
+  });
+
+  it("Should combine workspace scope with global provider authentication", async () => {
+    const workspaceId = workspaceDetailFixture.workspace.id;
+    const workspace: WorkspaceDetailPayload = {
+      ...workspaceDetailFixture,
+      agents: [],
+      providers: [
+        {
+          display_name: "Codex",
+          harness: "acp",
+          name: "codex",
+          runtime_provider: "codex",
+        },
+        {
+          display_name: "OpenRouter",
+          harness: "pi_acp",
+          name: "openrouter",
+          runtime_provider: "openrouter",
+        },
+      ],
+    };
+    const globalProviders: ProviderListResponse = {
+      providers: [
+        provider("codex", "authenticated"),
+        provider("openrouter", "missing_credential"),
+        provider("claude", "authenticated"),
+      ],
+    };
+    const catalog: AllModelsListResponse = {
+      models: [
+        model("codex", "gpt-5.6-sol"),
+        model("openrouter", "llama-4"),
+        model("claude", "claude-fable-5"),
+      ],
+    };
+    const session = {
+      ...primarySessionFixture,
+      agent_name: "general",
+      runtime: {
+        status: "ready" as const,
+        transition: "initial_bind" as const,
+        effective: { provider: "codex" },
+        selected: undefined,
+        selection_revision: 0,
+      },
+      workspace_id: workspaceId,
+    };
+    const { queryClient, wrapper } = createHarness();
+    queryClient.setQueryData(workspaceKeys.detail(workspaceId), workspace);
+    queryClient.setQueryData<AgentPayload[]>(agentKeys.list(workspaceId), []);
+    queryClient.setQueryData(providerKeys.lists(), globalProviders);
+    queryClient.setQueryData(
+      modelCatalogKeys.allModels("all", undefined, undefined, true),
+      catalog
+    );
+    const store = sessionPromptRuntimeStoreLogic.createStore(
+      sessionPromptRuntimeInput({
+        agentName: session.agent_name,
+        canPrompt: true,
+        effectiveRuntime: session.runtime.effective,
+        selectedRuntime: session.runtime.selected,
+        selectionRevision: session.runtime.selection_revision,
+        sessionId: session.id,
+        workspaceId: session.workspace_id,
+      })
+    );
+
+    const { result, unmount } = renderHook(() => useSessionPromptRuntime(store), { wrapper });
+
+    await waitFor(() => expect(result.current.canSelectRuntime).toBe(true));
+    expect(result.current.catalog.providers.map(entry => entry.id)).toEqual([
+      "codex",
+      "openrouter",
+    ]);
+    expect(
+      result.current.catalog.providers.find(entry => entry.id === "openrouter")?.needs_auth
+    ).toBe(true);
+    expect(result.current.catalog.models.find(entry => entry.provider === "codex")?.disabled).toBe(
+      false
+    );
+    expect(
+      result.current.catalog.models.find(entry => entry.provider === "openrouter")
+    ).toMatchObject({
+      disabled: true,
+      disabled_reason: "Sign in",
+    });
+    expect(result.current.catalog.models.some(entry => entry.provider === "claude")).toBe(false);
+
+    act(() => {
+      result.current.onRuntimeChange({
+        provider: "claude",
+        model: "claude-fable-5",
+        reasoning_effort: "max",
+      });
+    });
+    expect(runtimeSelectionMutation.mutate).toHaveBeenCalledWith(
+      {
+        id: session.id,
+        request: {
+          expected_revision: 0,
+          runtime: {
+            provider: "claude",
+            model: "claude-fable-5",
+            reasoning_effort: "max",
+          },
+        },
+        signal: expect.any(AbortSignal),
+      },
+      expect.objectContaining({
+        onError: expect.any(Function),
+        onSettled: expect.any(Function),
+        onSuccess: expect.any(Function),
+      })
+    );
+    const signal = runtimeSelectionMutation.mutate.mock.calls[0]?.[0].signal as AbortSignal;
+    expect(signal.aborted).toBe(false);
+    act(() => {
+      result.current.onRuntimeChange({
+        provider: "codex",
+        model: "gpt-6-astra",
+        reasoning_effort: "ultra",
+      });
+    });
+    expect(runtimeSelectionMutation.mutate).toHaveBeenCalledTimes(1);
+    expect(signal.aborted).toBe(false);
+    const callbacks = runtimeSelectionMutation.mutate.mock.calls[0]![1];
+    act(() => {
+      callbacks.onSuccess({
+        runtime: {
+          selection_revision: 1,
+          selected: { provider: "claude", model: "claude-fable-5", reasoning_effort: "max" },
+        },
+      });
+      callbacks.onSettled();
+    });
+    expect(runtimeSelectionMutation.mutate).toHaveBeenCalledTimes(2);
+    expect(runtimeSelectionMutation.mutate.mock.calls[1]![0].request).toMatchObject({
+      expected_revision: 1,
+      runtime: { provider: "codex", model: "gpt-6-astra", reasoning_effort: "ultra" },
+    });
+    expect(result.current.value.reasoning_effort).toBe("ultra");
+    const pendingSignal = runtimeSelectionMutation.mutate.mock.calls[1]![0].signal as AbortSignal;
+    unmount();
+    expect(pendingSignal.aborted).toBe(true);
+  });
+
+  it("Should report when a saved change reaches the running agent from the provider capability", async () => {
+    const workspaceId = workspaceDetailFixture.workspace.id;
+    const workspace: WorkspaceDetailPayload = {
+      ...workspaceDetailFixture,
+      agents: [],
+      providers: [
+        { name: "claude", runtime_provider: "claude", runtime_live_apply: "next_step" },
+        { name: "codex", runtime_provider: "codex", runtime_live_apply: "next_turn" },
+      ],
+    };
+    const { queryClient, wrapper } = createHarness();
+    queryClient.setQueryData(workspaceKeys.detail(workspaceId), workspace);
+    queryClient.setQueryData<AgentPayload[]>(agentKeys.list(workspaceId), []);
+    queryClient.setQueryData(providerKeys.lists(), {
+      providers: [provider("claude", "authenticated"), provider("codex", "authenticated")],
+    } satisfies ProviderListResponse);
+    queryClient.setQueryData(modelCatalogKeys.allModels("all", undefined, undefined, true), {
+      models: [model("claude", "claude-opus-5-5"), model("codex", "gpt-6-astra")],
+    } satisfies AllModelsListResponse);
+    const store = sessionPromptRuntimeStoreLogic.createStore(
+      sessionPromptRuntimeInput({
+        agentName: "general",
+        canPrompt: true,
+        effectiveRuntime: {
+          provider: "claude",
+          model: "claude-opus-5-5",
+          reasoning_effort: "xhigh",
+        },
+        selectedRuntime: undefined,
+        selectionRevision: 0,
+        sessionId: primarySessionFixture.id,
+        workspaceId,
+      })
+    );
+    const { result } = renderHook(() => useSessionPromptRuntime(store), { wrapper });
+    await waitFor(() => expect(result.current.canSelectRuntime).toBe(true));
+
+    const persist = (
+      selection: { provider: string; model: string; reasoning_effort: "medium" },
+      badge: SessionPayload["badge"]
+    ) => {
+      act(() => result.current.onRuntimeChange(selection));
+      const callbacks = runtimeSelectionMutation.mutate.mock.lastCall![1];
+      act(() => {
+        callbacks.onSuccess({
+          badge,
+          runtime: {
+            selection_revision: runtimeSelectionMutation.mutate.mock.calls.length,
+            selected: selection,
+            effective: selection,
+          },
+        });
+        callbacks.onSettled();
+      });
+    };
+
+    persist(
+      { provider: "claude", model: "claude-opus-5-5", reasoning_effort: "medium" },
+      "running"
+    );
+    expect(result.current.applyNotice).toEqual({
+      text: "Applies at the agent's next step.",
+      tone: "neutral",
+    });
+    persist({ provider: "codex", model: "gpt-6-astra", reasoning_effort: "medium" }, "running");
+    expect(result.current.applyNotice?.text).toBe("Applies from the next message.");
+    persist({ provider: "claude", model: "claude-opus-5-5", reasoning_effort: "medium" }, "idle");
+    expect(result.current.applyNotice).toBeNull();
+  });
+
+  it("Should inherit the agent speed before the first runtime bind", async () => {
+    const workspaceId = workspaceDetailFixture.workspace.id;
+    const workspace: WorkspaceDetailPayload = {
+      ...workspaceDetailFixture,
+      providers: [
+        {
+          display_name: "Cursor",
+          harness: "acp",
+          name: "cursor",
+          runtime_provider: "cursor",
+        },
+      ],
+    };
+    const session = {
+      ...primarySessionFixture,
+      agent_name: "qa-runtime-agent",
+      runtime: {
+        status: "unbound" as const,
+        selection_revision: 0,
+      },
+      workspace_id: workspaceId,
+    };
+    const agent = {
+      name: session.agent_name,
+      provider: "cursor",
+      model: "grok-4.5",
+      reasoning_effort: "high",
+      speed: "fast",
+    } as AgentPayload;
+    const { queryClient, wrapper } = createHarness();
+    queryClient.setQueryData(workspaceKeys.detail(workspaceId), workspace);
+    queryClient.setQueryData<AgentPayload[]>(agentKeys.list(workspaceId), [agent]);
+    queryClient.setQueryData(providerKeys.lists(), {
+      providers: [provider("cursor", "authenticated")],
+    } satisfies ProviderListResponse);
+    queryClient.setQueryData(modelCatalogKeys.allModels("all", undefined, undefined, true), {
+      models: [model("cursor", "grok-4.5")],
+    } satisfies AllModelsListResponse);
+    const store = sessionPromptRuntimeStoreLogic.createStore(
+      sessionPromptRuntimeInput({
+        agentName: session.agent_name,
+        canPrompt: true,
+        effectiveRuntime: undefined,
+        selectedRuntime: undefined,
+        selectionRevision: session.runtime.selection_revision,
+        sessionId: session.id,
+        workspaceId: session.workspace_id,
+      })
+    );
+
+    const { result } = renderHook(() => useSessionPromptRuntime(store), { wrapper });
+
+    await waitFor(() => expect(result.current.speed).toBe("fast"));
+    expect(result.current.getRuntimeSnapshot()).toEqual({
+      provider: "cursor",
+      model: "grok-4.5",
+      reasoning_effort: "high",
+      speed: "fast",
+    });
+  });
+
+  // A continued or forked session is unbound with the runtime its dialog chose as its
+  // selection; the composer and its first prompt must use it, not the agent default.
+  it("Should prefer an unbound session's selected runtime over the agent default", async () => {
+    const workspaceId = workspaceDetailFixture.workspace.id;
+    const { queryClient, wrapper } = createHarness();
+    queryClient.setQueryData(workspaceKeys.detail(workspaceId), {
+      ...workspaceDetailFixture,
+      providers: [
+        { display_name: "Codex", harness: "acp", name: "codex", runtime_provider: "codex" },
+        { display_name: "Claude", harness: "acp", name: "claude", runtime_provider: "claude" },
+      ],
+    } satisfies WorkspaceDetailPayload);
+    queryClient.setQueryData<AgentPayload[]>(agentKeys.list(workspaceId), [
+      { name: "general", provider: "codex", model: "gpt-6.1-sol" } as AgentPayload,
+    ]);
+    queryClient.setQueryData(providerKeys.lists(), {
+      providers: [provider("codex", "authenticated"), provider("claude", "authenticated")],
+    } satisfies ProviderListResponse);
+    queryClient.setQueryData(modelCatalogKeys.allModels("all", undefined, undefined, true), {
+      models: [model("codex", "gpt-6.1-sol"), model("claude", "claude-fable-5")],
+    } satisfies AllModelsListResponse);
+    const store = sessionPromptRuntimeStoreLogic.createStore(
+      sessionPromptRuntimeInput({
+        agentName: "general",
+        canPrompt: true,
+        effectiveRuntime: undefined,
+        selectedRuntime: { provider: "claude", model: "claude-fable-5", speed: "normal" },
+        selectionRevision: 1,
+        sessionId: primarySessionFixture.id,
+        workspaceId,
+      })
+    );
+
+    const { result } = renderHook(() => useSessionPromptRuntime(store), { wrapper });
+
+    await waitFor(() => expect(result.current.catalog.loaded).toBe(true));
+    expect(result.current.value).toMatchObject({ provider: "claude", model: "claude-fable-5" });
+    expect(getSessionPromptRuntimeSnapshot(store)).toEqual({
+      provider: "claude",
+      model: "claude-fable-5",
+    });
+  });
+});
+
+describe("SessionPromptRuntimeProvider hydration", () => {
+  // Invariant: config_option_update changes only the effective model's capabilities,
+  // while pending and queued prompt intent remains owned by the interaction store.
+  it.each(["acp_option", "none"])(
+    "Should follow model-specific thought levels under %s without replacing pending intent",
+    async reasoningApply => {
+      const workspaceId = workspaceDetailFixture.workspace.id;
+      const { queryClient } = createHarness();
+      queryClient.setQueryData(workspaceKeys.detail(workspaceId), {
+        ...workspaceDetailFixture,
+        agents: [],
+        providers: [
+          { name: "claude", display_name: "Claude", harness: "acp", runtime_provider: "claude" },
+        ],
+      } satisfies WorkspaceDetailPayload);
+      queryClient.setQueryData<AgentPayload[]>(agentKeys.list(workspaceId), []);
+      queryClient.setQueryData(providerKeys.lists(), {
+        providers: [provider("claude", "authenticated")],
+      });
+      queryClient.setQueryData(modelCatalogKeys.allModels("all", undefined, undefined, true), {
+        models: ["claude-fable-5-1", "claude-fable-5"].map(id => ({
+          ...model("claude", id),
+          supports_reasoning: true,
+          reasoning_apply: reasoningApply,
+          reasoning_efforts: id === "claude-fable-5-1" ? [] : ["low", "high"],
+        })),
+      } satisfies AllModelsListResponse);
+      let session: SessionPayload = {
+        ...primarySessionFixture,
+        workspace_id: workspaceId,
+        runtime: {
+          ...primarySessionFixture.runtime,
+          effective: { provider: "claude", model: "claude-fable-5-1", reasoning_effort: "high" },
+          selected: { provider: "claude", model: "claude-fable-5", reasoning_effort: "low" },
+          acp_caps: {
+            prompt_audio: false,
+            prompt_image: false,
+            prompt_embedded_context: false,
+            supports_fork_session: false,
+            supports_load_session: true,
+            supports_resume_session: false,
+            config_options: [
+              {
+                id: "deliberation",
+                category: "thought_level",
+                kind: "select",
+                current_value_id: "high",
+                values: [{ value: "default" }, { value: "high" }, { value: "future-effort" }],
+              },
+            ],
+          },
+        },
+      };
+      const wrapper = ({ children }: { children: ReactNode }) => (
+        <QueryClientProvider client={queryClient}>
+          <SessionPromptRuntimeProvider session={session} canPrompt>
+            {children}
+          </SessionPromptRuntimeProvider>
+        </QueryClientProvider>
+      );
+      const { result, rerender } = renderHook(
+        () => useSessionPromptRuntime(useSessionPromptRuntimeContext()),
+        { wrapper }
+      );
+      await waitFor(() => expect(result.current.catalog.models).toHaveLength(2));
+      expect(
+        result.current.catalog.models.find(row => row.id === "claude-fable-5-1")?.efforts
+      ).toEqual(reasoningApply === "acp_option" ? ["high", "future-effort"] : []);
+      expect(
+        result.current.catalog.models.find(row => row.id === "claude-fable-5")?.efforts
+      ).toEqual(["low", "high"]);
+      expect(result.current.getRuntimeSnapshot()).toEqual({
+        provider: "claude",
+        model: "claude-fable-5",
+        reasoning_effort: "low",
+      });
+      session = {
+        ...session,
+        runtime: {
+          ...session.runtime,
+          acp_caps: {
+            ...session.runtime.acp_caps!,
+            config_options: [
+              { id: "mode", category: "mode", kind: "select", values: [{ value: "default" }] },
+            ],
+          },
+        },
+      };
+      rerender();
+      expect(
+        result.current.catalog.models.find(row => row.id === "claude-fable-5-1")?.efforts
+      ).toEqual([]);
+      expect(result.current.getRuntimeSnapshot()).toEqual({
+        provider: "claude",
+        model: "claude-fable-5",
+        reasoning_effort: "low",
+      });
+    }
+  );
+
+  it("Should preserve selected ACP options when mounting and refetching a session", () => {
+    const selected = {
+      provider: "cursor",
+      model: "grok-4.6",
+      acp_options: [{ id: "thinking", bool_value: true }],
+    };
+    let session = {
+      ...primarySessionFixture,
+      runtime: { ...primarySessionFixture.runtime, selected, selection_revision: 1 },
+    };
+    const wrapper = ({ children }: { children: ReactNode }) => (
+      <SessionPromptRuntimeProvider session={session} canPrompt>
+        {children}
+      </SessionPromptRuntimeProvider>
+    );
+    const { result, rerender } = renderHook(() => useSessionPromptRuntimeContext(), { wrapper });
+    expect(getSessionPromptRuntimeSnapshot(result.current)?.acp_options).toEqual(
+      selected.acp_options
+    );
+    session = {
+      ...session,
+      runtime: {
+        ...session.runtime,
+        selection_revision: 2,
+        selected: { ...selected, acp_options: [{ id: "thinking", bool_value: false }] },
+      },
+    };
+    rerender();
+    expect(getSessionPromptRuntimeSnapshot(result.current)?.acp_options).toEqual([
+      { id: "thinking", bool_value: false },
+    ]);
+  });
+});

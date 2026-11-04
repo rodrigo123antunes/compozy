@@ -1,0 +1,278 @@
+package acp
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"io"
+	"strings"
+
+	"github.com/compozy/compozy/internal/procutil"
+
+	acpsdk "github.com/coder/acp-go-sdk"
+	compozyconfig "github.com/compozy/compozy/internal/config"
+	"github.com/compozy/compozy/internal/store"
+	"github.com/compozy/compozy/internal/toolruntime"
+)
+
+func (d *Driver) launchAgentProcess(ctx context.Context, normalized StartOpts) (*AgentProcess, error) {
+	normalized, command, args, err := d.resolvedAgentLaunch(ctx, normalized)
+	if err != nil {
+		return nil, err
+	}
+
+	policy, err := newPermissionPolicy(normalized.Permissions, normalized.Cwd, normalized.AdditionalDirs...)
+	if err != nil {
+		return nil, err
+	}
+
+	policy.rules = append([]compozyconfig.PermissionRule(nil), normalized.PermissionRulesValue()...)
+	launcher := d.launcherForStart(normalized)
+	identity := startOptsPreparedLaunchIdentity(normalized)
+
+	handle, err := launcher.Launch(ctx, LaunchSpec{
+		Command:            normalized.Command,
+		ResolvedExecutable: identity.spec.ResolvedExecutable,
+		Args:               append([]string(nil), identity.spec.Args...),
+		Cwd:                normalized.Cwd,
+		AdditionalDirs:     append([]string(nil), normalized.AdditionalDirs...),
+		Env:                append([]string(nil), normalized.Env...),
+	})
+	if err != nil {
+		return nil, fmt.Errorf(
+			"acp: start agent %q subprocess %s in %q: %w",
+			normalized.AgentName,
+			launchCommandIdentity(normalized.Command),
+			normalized.Cwd,
+			err,
+		)
+	}
+	procCtx, cancelProcess := context.WithCancel(context.WithoutCancel(ctx))
+	terminalScope := LocalTerminalScope{
+		WorkspaceID:  normalized.WorkspaceID,
+		ProfileID:    normalized.ProfileID,
+		SessionID:    normalized.CompozySessionID,
+		Generation:   normalized.RuntimeGeneration,
+		ActorID:      normalized.AgentName,
+		AllowedRoots: append([]string{normalized.Cwd}, normalized.AdditionalDirs...),
+	}
+
+	toolHost := normalized.ToolHost
+	if toolHost == nil {
+		toolHost = d.toolHost
+	}
+	if toolHost == nil {
+		toolHost = newLocalToolHostFromPolicy(
+			procCtx,
+			normalized.Cwd,
+			policy,
+			d.logger,
+			WithLocalTerminalManager(d.terminals, terminalScope),
+		)
+	}
+
+	process := d.newAgentProcess(
+		procCtx,
+		cancelProcess,
+		normalized,
+		command,
+		args,
+		handle,
+		toolHost,
+		policy,
+		terminalScope,
+	)
+	d.configureAgentConnection(process, handle, toolHost)
+
+	if err := d.registerLaunchedAgent(ctx, process, handle); err != nil {
+		return nil, err
+	}
+
+	go process.waitForExit(ctx, d.processRecordTimeout)
+
+	return process, nil
+}
+
+func (d *Driver) registerLaunchedAgent(ctx context.Context, process *AgentProcess, handle Handle) error {
+	if err := d.registerAgentProcess(ctx, process); err != nil {
+		process.cancelProcess()
+		stopCtx, cancelStop := context.WithTimeout(context.Background(), d.stopTimeout)
+		defer cancelStop()
+		if stopErr := handle.Stop(stopCtx); stopErr != nil {
+			return errors.Join(err, fmt.Errorf("acp: cleanup unregistered agent process: %w", stopErr))
+		}
+		return err
+	}
+	return nil
+}
+
+func (d *Driver) configureAgentConnection(process *AgentProcess, handle Handle, toolHost ToolHost) {
+	if localHost, ok := toolHost.(*localToolHost); ok {
+		process.terminals = localHost.terminals
+	}
+	if localHandle, ok := handle.(*localProcessHandle); ok {
+		process.managed = localHandle.process
+	}
+	ready := make(chan struct{})
+	process.conn = acpsdk.NewConnectionWithOptions(
+		process.handleInbound,
+		handle.Stdin(),
+		&connectionStartupReader{reader: handle.Stdout(), ready: ready},
+		acpsdk.ConnectionOptions{NotificationQueueOverflow: acpsdk.NotificationQueueOverflowBlock},
+	)
+	process.conn.SetLogger(d.logger)
+	close(ready)
+}
+
+// The SDK starts receiving in its constructor, before SetLogger is safe to call.
+type connectionStartupReader struct {
+	reader io.Reader
+	ready  <-chan struct{}
+}
+
+func (r *connectionStartupReader) Read(p []byte) (int, error) {
+	<-r.ready
+	return r.reader.Read(p)
+}
+
+func (d *Driver) newAgentProcess(
+	procCtx context.Context,
+	cancelProcess context.CancelFunc,
+	normalized StartOpts,
+	command string,
+	args []string,
+	handle Handle,
+	toolHost ToolHost,
+	policy permissionPolicy,
+	terminalScope LocalTerminalScope,
+) *AgentProcess {
+	denials := &PermissionDenials{}
+	if normalized.PermissionPolicy != nil && normalized.PermissionPolicy.Denials != nil {
+		denials = normalized.PermissionPolicy.Denials
+	}
+	reviewerMode := ""
+	modeProvider := normalized.ProviderName
+	providerAuthMode := compozyconfig.ProviderAuthModeNativeCLI
+	if normalized.ProviderConfig != nil {
+		providerAuthMode = normalized.ProviderConfig.EffectiveAuthMode()
+		reviewerMode = strings.TrimSpace(normalized.ProviderConfig.ReviewerMode)
+		modeProvider = normalized.ProviderConfig.RuntimeProviderName(normalized.ProviderName)
+	}
+	return &AgentProcess{
+		logger:                 d.logger,
+		caps:                   Caps{SteerCapability: steerCapabilityForStart(normalized)},
+		PID:                    handle.PID(),
+		AgentName:              normalized.AgentName,
+		providerName:           normalized.ProviderName,
+		reviewerMode:           reviewerMode,
+		modeProviderName:       modeProvider,
+		permissionDenials:      denials,
+		providerAuthMode:       providerAuthMode,
+		Command:                command,
+		Args:                   append([]string(nil), args...),
+		Cwd:                    normalized.Cwd,
+		StartedAt:              timeNowUTC(),
+		KernelToken:            procutil.CreationProcessToken(handle.PID()),
+		handle:                 handle,
+		toolHost:               toolHost,
+		toolGateway:            normalized.ToolGateway,
+		processCtx:             procCtx,
+		cancelProcess:          cancelProcess,
+		permissions:            policy,
+		terminalCore:           d.terminals,
+		terminalScope:          terminalScope,
+		done:                   make(chan struct{}),
+		pendingPermissions:     make(map[string]*pendingPermission),
+		permissionTimeout:      d.permissionWait,
+		permissionWaitResolver: d.permissionWaitResolver,
+		compozySessionID:       normalized.CompozySessionID,
+		controlTimeout:         d.controlTimeout,
+		systemPrompt:           normalized.SystemPrompt,
+		startupManifest:        CloneStartupManifest(normalized.StartupManifest),
+		systemPromptDelivery:   normalized.SystemPromptDelivery,
+		promptCacheControl:     promptCacheControlForStartOpts(normalized),
+		executionPolicy:        normalized.ExecutionPolicyValue(),
+	}
+}
+
+func (d *Driver) registerAgentProcess(ctx context.Context, process *AgentProcess) error {
+	if d == nil || process == nil {
+		return nil
+	}
+	registry := d.processRegistry
+	if registry == nil {
+		if provider, ok := process.toolHost.(processRegistryProvider); ok {
+			registry = provider.ProcessRegistry()
+		}
+	}
+	process.processRegistry = registry
+	if registry == nil || process.PID <= 0 {
+		return nil
+	}
+	handle, err := registry.Register(ctx, toolruntime.RegisterConfig{
+		Source: toolruntime.ProcessSourceACPAgent,
+		Owner: toolruntime.ProcessOwner{
+			SessionID: process.SessionID,
+		},
+		PID:            process.PID,
+		ProcessGroupID: process.PID,
+		Command:        process.Command,
+		Args:           process.Args,
+		Cwd:            process.Cwd,
+		Interrupt: func(interruptCtx context.Context, _ toolruntime.ProcessRecord) error {
+			return d.Stop(interruptCtx, process)
+		},
+	})
+	if err != nil {
+		return fmt.Errorf("acp: register agent process: %w", err)
+	}
+	process.processRecord = handle
+	return nil
+}
+
+type processRegistryProvider interface {
+	ProcessRegistry() *toolruntime.Registry
+}
+
+func (d *Driver) initializeConnection(ctx context.Context, process *AgentProcess, agentName string) error {
+	initRequest := acpsdk.InitializeRequest{
+		ProtocolVersion: acpsdk.ProtocolVersionNumber,
+		ClientCapabilities: acpsdk.ClientCapabilities{
+			Fs: acpsdk.FileSystemCapabilities{
+				ReadTextFile:  true,
+				WriteTextFile: true,
+			},
+			Terminal: true,
+			Session: &acpsdk.ClientSessionCapabilities{
+				Compaction: &acpsdk.CompactionCapabilities{},
+			},
+		},
+		ClientInfo: &acpsdk.Implementation{
+			Name:    defaultClientName,
+			Version: defaultClientVersion,
+		},
+	}
+	initializeResponse, err := process.sendControlRequest[acpsdk.InitializeResponse](ctx,
+		acpsdk.AgentMethodInitialize,
+		initRequest,
+	)
+	if err != nil {
+		return WrapFailure(
+			store.FailureHandshake,
+			"ACP initialize handshake failed",
+			fmt.Errorf("acp: initialize session for %q: %w", agentName, err),
+		)
+	}
+
+	process.setCaps(captureCaps(Caps{
+		SteerCapability:       captureSteerCapability(initializeResponse.Meta, process.CapsSnapshot().SteerCapability),
+		SupportsLoadSession:   initializeResponse.AgentCapabilities.LoadSession,
+		SupportsCloseSession:  initializeResponse.AgentCapabilities.SessionCapabilities.Close != nil,
+		SupportsForkSession:   initializeResponse.AgentCapabilities.SessionCapabilities.Fork != nil,
+		SupportsResumeSession: initializeResponse.AgentCapabilities.SessionCapabilities.Resume != nil,
+		PromptImage:           initializeResponse.AgentCapabilities.PromptCapabilities.Image,
+		PromptAudio:           initializeResponse.AgentCapabilities.PromptCapabilities.Audio,
+		PromptEmbeddedContext: initializeResponse.AgentCapabilities.PromptCapabilities.EmbeddedContext,
+	}, nil, nil))
+	return nil
+}

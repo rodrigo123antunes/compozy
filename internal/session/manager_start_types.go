@@ -1,0 +1,127 @@
+package session
+
+import (
+	"fmt"
+	"strings"
+	"time"
+
+	"github.com/compozy/compozy/internal/acp"
+	compozyconfig "github.com/compozy/compozy/internal/config"
+	hookspkg "github.com/compozy/compozy/internal/hooks"
+	"github.com/compozy/compozy/internal/soul"
+	speedpkg "github.com/compozy/compozy/internal/speed"
+	"github.com/compozy/compozy/internal/store"
+	workspacepkg "github.com/compozy/compozy/internal/workspace"
+	"github.com/compozy/compozy/internal/workspaceaccess"
+)
+
+type sessionStartSpec struct {
+	initiatorKind             string
+	initiatorID               string
+	instancePermissionCeiling *store.SessionPermissionPolicy
+	instanceID                string
+	origin                    workspaceaccess.Origin
+	effectiveWorkspaceAccess  string
+	effectiveSessionApproval  string
+	permissionRules           []store.SessionPermissionRule
+	sessionID                 string
+	profileID                 string
+	sessionName               string
+	agentName                 string
+	provider                  string
+	commandFingerprint        string
+	// command is the attempt's explicit launch command (RuntimeOverrides.Command).
+	command    string
+	sessionEnv compozyconfig.SessionEnv
+	chainOwner ChainOwner
+	// fallbackAttempt is the chain index this launch attempts (0 = primary route).
+	fallbackAttempt int
+	// acceptedRoute is the persisted accepted binding a resume must match (resume affinity).
+	acceptedRoute   *store.SessionAcceptedRoute
+	restartBoundary *store.SessionRestartCheckpoint
+	// derivation, importedContext, and deriveReceipt are set only for continued or
+	// forked children; deriveReceipt selects RegisterDerivedSession at the commit.
+	derivation               *store.SessionDerivation
+	importedContext          *store.SessionImportedContext
+	deriveReceipt            *store.SessionDerivationReceipt
+	model                    string
+	transportModel           string
+	reasoningEffort          string
+	speed                    speedpkg.Speed
+	acpOptions               []acp.SessionConfigOptionSelection
+	selectedRuntime          *RuntimeSelection
+	runtimeSelectionRevision int64
+	permissions              compozyconfig.PermissionMode
+	workspace                workspacepkg.ResolvedWorkspace
+	worktreeTransition       *store.SessionWorktreeTransition
+	worktreeID               string
+	worktreeRoot             string
+	cwd                      string
+	promptOverlay            string
+	contractOverlay          string
+	runtimeMode              string
+	sessionType              Type
+	lineage                  *store.SessionLineage
+	preserveDelegationPolicy bool
+	allowedToolsOverride     []string
+	deniedToolsOverride      []string
+	creationProfile          *store.SessionCreationProfile
+	creationOptions          *store.SessionCreationOptions
+	creationIdentity         *store.SessionCreationIdentity
+	creationIdentityPinned   bool
+	creationIdentityEnabled  bool
+	deferRuntimeValidation   bool
+	discardStartFailure      bool
+	advertisedCommands       []store.SessionAdvertisedCommand
+	postEvent                hookspkg.HookEvent
+	startAction              string
+	cleanupSessionDir        bool
+	includePromptUpdatedAt   bool
+	preserveStopReason       bool
+	resumeReplay             bool
+	resumeReplayBlock        string
+	resumeReplayMessageCount int
+	resumeReplayReason       string
+	clearEventStoreOnOpen    bool
+	createdAt                time.Time
+	acpSessionID             string
+	stopReason               store.StopReason
+	stopDetail               string
+	failure                  *store.SessionFailure
+	soulSnapshotID           string
+	soulDigest               string
+	parentSoulDigest         string
+	soulSnapshot             *soul.Snapshot
+}
+
+func normalizeRequestedSpeed(requested speedpkg.Speed) (speedpkg.Speed, error) {
+	return normalizeRuntimeSpeed(requested, speedpkg.SpeedNormal)
+}
+
+func normalizeRuntimeSpeed(
+	requested speedpkg.Speed,
+	defaultValue speedpkg.Speed,
+) (speedpkg.Speed, error) {
+	requested = speedpkg.Speed(strings.TrimSpace(string(requested)))
+	if requested == "" {
+		requested = defaultValue
+	}
+	if requested == "" {
+		return "", nil
+	}
+	return speedpkg.Parse(string(requested))
+}
+
+func normalizeCreateRuntimeOptions(
+	opts *CreateOpts,
+) (speedpkg.Speed, []acp.SessionConfigOptionSelection, error) {
+	requestedSpeed, err := normalizeRuntimeSpeed(opts.Speed, "")
+	if err != nil {
+		return "", nil, fmt.Errorf("%w: %w", ErrInvalidRuntimeOverride, err)
+	}
+	acpOptions, err := acp.NormalizeSessionConfigOptionSelections(opts.ACPOptions)
+	if err != nil {
+		return "", nil, fmt.Errorf("%w: %w", ErrInvalidRuntimeOverride, err)
+	}
+	return requestedSpeed, acpOptions, nil
+}

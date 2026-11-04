@@ -1,0 +1,193 @@
+import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
+import { act, renderHook, waitFor } from "@testing-library/react";
+import { createElement, type ReactNode } from "react";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+
+import { runtimeIdentityFixture, statusFixture } from "../../mocks/fixtures";
+import { statusKeys } from "../../lib/query-keys";
+import { deriveDaemonConnectionStatus, useDaemonHealth } from "../use-daemon-health";
+import { useDaemonStatus } from "../use-daemon-status";
+import { useStatus } from "../use-status";
+import { useDaemonConnectionStatus } from "../use-daemon-connection-status";
+import { useRuntimeIdentity } from "../use-runtime-identity";
+
+vi.mock("../../adapters/daemon-api", () => ({
+  fetchStatus: vi.fn(),
+  fetchRuntimeIdentity: vi.fn(),
+}));
+
+import { fetchRuntimeIdentity, fetchStatus } from "../../adapters/daemon-api";
+
+function createWrapper(queryClient?: QueryClient) {
+  const client =
+    queryClient ??
+    new QueryClient({
+      defaultOptions: {
+        queries: { retry: false },
+      },
+    });
+  return ({ children }: { children: ReactNode }) =>
+    createElement(QueryClientProvider, { client }, children);
+}
+
+describe("deriveDaemonConnectionStatus", () => {
+  it("Should map the shared status query lifecycle to a connection status", () => {
+    expect(
+      deriveDaemonConnectionStatus({
+        isPending: true,
+        isFetching: true,
+        isSuccess: false,
+        isError: false,
+      })
+    ).toBe("connecting");
+    expect(
+      deriveDaemonConnectionStatus({
+        data: statusFixture.health,
+        isPending: false,
+        isFetching: false,
+        isSuccess: true,
+        isError: false,
+      })
+    ).toBe("connected");
+    expect(
+      deriveDaemonConnectionStatus({
+        isPending: false,
+        isFetching: false,
+        isSuccess: false,
+        isError: true,
+      })
+    ).toBe("error");
+    expect(
+      deriveDaemonConnectionStatus({
+        isPending: false,
+        isFetching: false,
+        isSuccess: false,
+        isError: false,
+      })
+    ).toBe("disconnected");
+  });
+});
+
+describe("daemon status query projections", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+  });
+
+  afterEach(() => {
+    vi.restoreAllMocks();
+  });
+
+  it("Should share one status request across envelope, daemon, and health consumers", async () => {
+    vi.mocked(fetchStatus).mockResolvedValue(statusFixture);
+
+    const { result } = renderHook(
+      () => ({
+        envelope: useStatus(),
+        daemon: useDaemonStatus(),
+        health: useDaemonHealth(),
+      }),
+      { wrapper: createWrapper() }
+    );
+
+    await waitFor(() => {
+      expect(result.current.health.connectionStatus).toBe("connected");
+    });
+
+    expect(result.current.envelope.data).toEqual(statusFixture);
+    expect(result.current.daemon.data).toEqual(statusFixture.daemon);
+    expect(result.current.health.health).toEqual(statusFixture.health);
+    expect(fetchStatus).toHaveBeenCalledTimes(1);
+  });
+
+  it("Should keep cached daemon data visible without fetching while disabled", () => {
+    const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    queryClient.setQueryData(statusKeys.current(), statusFixture);
+
+    const { result } = renderHook(() => useDaemonStatus({ enabled: false }), {
+      wrapper: createWrapper(queryClient),
+    });
+
+    expect(result.current.data).toEqual(statusFixture.daemon);
+    expect(fetchStatus).not.toHaveBeenCalled();
+  });
+
+  it("Should share bounded identity reads and retain refresh and failure behavior", async () => {
+    vi.useFakeTimers();
+    const restartedIdentity = {
+      ...runtimeIdentityFixture,
+      daemon: {
+        ...runtimeIdentityFixture.daemon,
+        pid: 5252,
+        started_at: "2026-04-18T18:00:00Z",
+        user_home_dir: "/workspace/new-home",
+      },
+    };
+    vi.mocked(fetchRuntimeIdentity)
+      .mockResolvedValueOnce(runtimeIdentityFixture)
+      .mockResolvedValueOnce(restartedIdentity)
+      .mockRejectedValue(new Error("Connection closed"));
+
+    const { result, unmount } = renderHook(
+      () => ({
+        firstConnection: useDaemonConnectionStatus(),
+        secondConnection: useDaemonConnectionStatus(),
+        identity: useRuntimeIdentity(),
+        diagnostics: useStatus({ enabled: false }),
+      }),
+      { wrapper: createWrapper() }
+    );
+
+    try {
+      expect(result.current.firstConnection).toBe("connecting");
+      await act(() => vi.advanceTimersByTimeAsync(1));
+      expect(result.current.firstConnection).toBe("connected");
+      expect(result.current.secondConnection).toBe("connected");
+      expect(result.current.identity.data).toEqual(runtimeIdentityFixture);
+      expect(fetchRuntimeIdentity).toHaveBeenCalledTimes(1);
+
+      await act(() => vi.advanceTimersByTimeAsync(10_000));
+      expect(result.current.identity.data).toEqual(restartedIdentity);
+      expect(fetchRuntimeIdentity).toHaveBeenCalledTimes(2);
+
+      await act(() => vi.advanceTimersByTimeAsync(11_100));
+      expect(result.current.firstConnection).toBe("error");
+      expect(result.current.secondConnection).toBe("error");
+      expect(result.current.identity.data).toEqual(restartedIdentity);
+      expect(fetchStatus).not.toHaveBeenCalled();
+    } finally {
+      unmount();
+      vi.useRealTimers();
+    }
+  });
+
+  it("Should report connecting while the first shared status request is pending", () => {
+    vi.mocked(fetchStatus).mockReturnValue(new Promise(() => undefined));
+
+    const { result } = renderHook(() => useDaemonHealth(), {
+      wrapper: createWrapper(),
+    });
+
+    expect(result.current.connectionStatus).toBe("connecting");
+    expect(result.current.isInitialLoading).toBe(true);
+  });
+
+  it("Should report an error after the shared status request fails", async () => {
+    // The status projection owns the failed retry outcome, not wall-clock waiting.
+    vi.useFakeTimers();
+    vi.mocked(fetchStatus).mockRejectedValue(new Error("Network error"));
+
+    const { result, unmount } = renderHook(() => useDaemonHealth(), {
+      wrapper: createWrapper(),
+    });
+
+    try {
+      await act(() => vi.advanceTimersByTimeAsync(1_100));
+      expect(result.current.connectionStatus).toBe("error");
+      expect(result.current.health).toBeUndefined();
+      expect(fetchStatus).toHaveBeenCalledTimes(2);
+    } finally {
+      unmount();
+      vi.useRealTimers();
+    }
+  });
+});

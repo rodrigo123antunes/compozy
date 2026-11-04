@@ -1,0 +1,42 @@
+package daemon
+
+import (
+	"context"
+	"fmt"
+)
+
+func (d *Daemon) shutdownPersistentResources(ctx context.Context, targets *shutdownTargets, errs *[]error) {
+	if targets.viewPatches != nil {
+		targets.viewPatches.CloseViewPatches()
+	}
+	if targets.windowManagers != nil {
+		appendWrappedError(errs, "daemon: close window managers", targets.windowManagers.Close())
+	}
+	if targets.windowManagerStore != nil {
+		appendWrappedError(errs, "daemon: close window-manager store", targets.windowManagerStore.Close())
+	}
+	if targets.marketplace != nil {
+		appendWrappedError(errs, "daemon: shutdown marketplace", targets.marketplace.Shutdown(ctx))
+	}
+	if err := RemoveInfo(targets.infoPath); err != nil {
+		*errs = append(*errs, err)
+	}
+	if targets.registry != nil {
+		appendWrappedError(errs, "daemon: close global database", targets.registry.Close(ctx))
+	}
+	if targets.lock != nil {
+		if err := targets.lock.Release(); err != nil {
+			*errs = append(*errs, err)
+		}
+	}
+	if targets.closeLogger != nil {
+		appendWrappedError(errs, "daemon: close logger", targets.closeLogger())
+	}
+}
+
+func appendWrappedError(errs *[]error, prefix string, err error) {
+	if errs == nil || err == nil {
+		return
+	}
+	*errs = append(*errs, fmt.Errorf("%s: %w", prefix, err))
+}

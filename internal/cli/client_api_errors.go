@@ -1,0 +1,460 @@
+package cli
+
+import (
+	"cmp"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"io"
+	"net/http"
+	"strings"
+
+	"github.com/compozy/compozy/internal/agentidentity"
+	"github.com/compozy/compozy/internal/api/contract"
+	"github.com/compozy/compozy/internal/diagnosticcontract"
+	diagnosticspkg "github.com/compozy/compozy/internal/diagnostics"
+)
+
+const (
+	apiErrorBodyLimit       int64 = 1 << 20
+	responseBodyDrainLimit  int64 = 64 << 10
+	skillExposureFailedCode       = "expose_failed"
+)
+
+type daemonAPIError struct {
+	statusCode int
+	status     string
+	payload    contract.ErrorPayload
+}
+
+type extensionOperationAPIError struct {
+	statusCode int
+	status     string
+	payload    contract.ExtensionOperationErrorPayload
+}
+
+type extensionValidationAPIError struct {
+	statusCode int
+	status     string
+	payload    contract.ExtensionValidationErrorPayload
+}
+
+type windowManagerAPIError struct {
+	statusCode int
+	status     string
+	payload    contract.WindowManagerErrorPayload
+}
+
+type worktreeRemovalAPIError struct {
+	statusCode int
+	status     string
+	payload    contract.WorktreeRemovalRefusalPayload
+}
+
+type skillSourceAPIError struct {
+	statusCode int
+	status     string
+	payload    contract.SkillSourceValidationErrorResponse
+}
+
+type skillExposureAPIError struct {
+	statusCode int
+	status     string
+	payload    contract.SkillExposureFailureResponse
+}
+
+func (e *skillExposureAPIError) Error() string {
+	if e == nil {
+		return nilToolErrorString
+	}
+	return apiErrorMessage(e.payload.Error.Message, e.status)
+}
+
+func (e *skillExposureAPIError) cliExitCode() int { return 1 }
+
+func (e *skillExposureAPIError) skillExposureErrorPayload() contract.SkillExposureFailureResponse {
+	if e == nil {
+		return contract.SkillExposureFailureResponse{}
+	}
+	return e.payload
+}
+
+func (e *skillSourceAPIError) Error() string {
+	if e == nil {
+		return nilToolErrorString
+	}
+	return apiErrorMessage(e.payload.Error.Message, e.status)
+}
+
+func (e *skillSourceAPIError) cliExitCode() int {
+	return 1
+}
+
+func (e *skillSourceAPIError) skillSourceErrorPayload() contract.SkillSourceValidationErrorResponse {
+	if e == nil {
+		return contract.SkillSourceValidationErrorResponse{}
+	}
+	return e.payload
+}
+
+func (e *worktreeRemovalAPIError) Error() string {
+	if e == nil {
+		return nilToolErrorString
+	}
+	if message := strings.TrimSpace(e.payload.Error); message != "" {
+		return fmt.Sprintf("%s: %s", e.payload.Code, message)
+	}
+	return apiErrorMessage(e.payload.Code, e.status)
+}
+
+func (e *worktreeRemovalAPIError) cliExitCode() int {
+	if e == nil {
+		return 1
+	}
+	return apiStatusExitCode(e.statusCode)
+}
+
+func (e *worktreeRemovalAPIError) worktreeRemovalErrorPayload() contract.WorktreeRemovalRefusalPayload {
+	if e == nil {
+		return contract.WorktreeRemovalRefusalPayload{}
+	}
+	return e.payload
+}
+
+func (e *windowManagerAPIError) Error() string {
+	if e == nil {
+		return nilToolErrorString
+	}
+	return apiErrorMessage(e.payload.Error, e.status)
+}
+
+func (e *extensionOperationAPIError) Error() string {
+	if e == nil {
+		return nilToolErrorString
+	}
+	if e.payload.Code == diagnosticcontract.CodeExtensionInputsRequired {
+		return fmt.Sprintf("extension inputs required: %s. Pass --input id=value or --input-file inputs.json. (%s)",
+			strings.Join(e.payload.Inputs, ", "), e.payload.Code)
+	}
+	return apiErrorMessage(e.payload.Error, e.status)
+}
+
+func (e *extensionOperationAPIError) cliExitCode() int {
+	if e == nil {
+		return 1
+	}
+	if e.payload.Code == diagnosticcontract.CodeExtensionInputsRequired ||
+		e.payload.Code == diagnosticcontract.CodeExtensionInputInvalid {
+		return 2
+	}
+	if strings.HasPrefix(strings.TrimSpace(e.payload.Code), extensionAgentPluginDiagnosticPrefix) {
+		return 1
+	}
+	return apiStatusExitCode(e.statusCode)
+}
+
+func (e *extensionOperationAPIError) extensionOperationErrorPayload() contract.ExtensionOperationErrorPayload {
+	if e == nil {
+		return contract.ExtensionOperationErrorPayload{}
+	}
+	return e.payload
+}
+
+func (e *extensionOperationAPIError) DiagnosticItem() contract.DiagnosticItem {
+	if e == nil || e.payload.Diagnostic == nil {
+		var item contract.DiagnosticItem
+		return item
+	}
+	return diagnosticspkg.RedactItem(*e.payload.Diagnostic)
+}
+
+func (e *extensionValidationAPIError) Error() string {
+	if e == nil {
+		return nilToolErrorString
+	}
+	return apiErrorMessage(e.payload.Error, e.status)
+}
+
+func (e *extensionValidationAPIError) cliExitCode() int {
+	if e == nil {
+		return 1
+	}
+	if e.payload.Diagnostic != nil &&
+		e.payload.Diagnostic.Code == "extension_agent_plugin_manifest_invalid" {
+		return 1
+	}
+	return apiStatusExitCode(e.statusCode)
+}
+
+func (e *extensionValidationAPIError) extensionValidationErrorPayload() contract.ExtensionValidationErrorPayload {
+	if e == nil {
+		return contract.ExtensionValidationErrorPayload{}
+	}
+	return e.payload
+}
+
+func (e *extensionValidationAPIError) DiagnosticItem() contract.DiagnosticItem {
+	if e == nil || e.payload.Diagnostic == nil {
+		return diagnosticspkg.EmptyItem()
+	}
+	return diagnosticspkg.RedactItem(*e.payload.Diagnostic)
+}
+
+func (e *windowManagerAPIError) cliExitCode() int {
+	if e == nil {
+		return 1
+	}
+	return apiStatusExitCode(e.statusCode)
+}
+
+func (e *windowManagerAPIError) windowManagerErrorPayload() contract.WindowManagerErrorPayload {
+	if e == nil {
+		return contract.WindowManagerErrorPayload{}
+	}
+	return e.payload
+}
+
+func (e *daemonAPIError) Error() string {
+	if e == nil {
+		return nilToolErrorString
+	}
+	return apiErrorMessage(e.payload.Error, e.status)
+}
+
+func (e *daemonAPIError) cliExitCode() int {
+	if e == nil {
+		return 1
+	}
+	return apiStatusExitCode(e.statusCode)
+}
+
+func apiErrorMessage(payloadMessage string, status string) string {
+	if message := strings.TrimSpace(payloadMessage); message != "" {
+		return message
+	}
+	return strings.TrimSpace(status)
+}
+
+func apiStatusExitCode(statusCode int) int {
+	switch statusCode {
+	case http.StatusBadRequest, http.StatusConflict:
+		return agentidentity.ExitIdentityInvalid
+	case http.StatusUnauthorized, http.StatusForbidden:
+		return agentidentity.ExitUnauthorized
+	case http.StatusUnprocessableEntity:
+		return agentidentity.ExitConfigInvalid
+	case http.StatusNotFound, http.StatusGone, http.StatusRequestTimeout,
+		http.StatusTooManyRequests, http.StatusInternalServerError,
+		http.StatusBadGateway, http.StatusServiceUnavailable, http.StatusGatewayTimeout:
+		return agentidentity.ExitUnavailable
+	default:
+		return 1
+	}
+}
+
+func (e *daemonAPIError) errorPayload() contract.ErrorPayload {
+	if e == nil {
+		return contract.ErrorPayload{}
+	}
+	return e.payload
+}
+
+func readAPIError(response *http.Response) error {
+	body, readErr := io.ReadAll(io.LimitReader(response.Body, apiErrorBodyLimit))
+	drainErr := discardResponseBodyBounded(response.Body)
+	if drainErr != nil {
+		drainErr = fmt.Errorf("cli: drain api error response: %w", drainErr)
+	}
+	if readErr != nil {
+		return errors.Join(fmt.Errorf("cli: read api error response: %w", readErr), drainErr)
+	}
+	return errors.Join(readAPIErrorBody(response.StatusCode, response.Status, body), drainErr)
+}
+
+func readAPIErrorBody(statusCode int, status string, body []byte) error {
+	if len(body) > 0 {
+		for _, parse := range []func(int, string, []byte) (bool, error){
+			parseProfileAPIError,
+			parseSkillExposureAPIError,
+			parseSkillSourceAPIError,
+			parseMarketplaceSourceAPIError,
+			parseCmdPaletteMutationAPIError,
+			parseCmdPaletteAPIError,
+			parseExtensionValidationAPIError,
+			parseExtensionOperationAPIError,
+			parseWindowManagerAPIError,
+			parseWorktreeRemovalAPIError,
+			parseGoalCommandAPIError,
+			parseTerminalAPIError,
+			parseSessionDeriveAPIError,
+			parseProviderModelRefreshAPIError,
+			parseDaemonAPIError,
+			parseToolAPIError,
+		} {
+			if ok, err := parse(statusCode, status, body); ok {
+				return err
+			}
+		}
+	}
+
+	message := cmp.Or(strings.TrimSpace(string(body)), status)
+	message = redactToolDiagnostic(message)
+	if strings.TrimSpace(status) != "" {
+		message = fmt.Sprintf("daemon api %s: %s", status, message)
+	}
+	return &daemonAPIError{
+		statusCode: statusCode,
+		status:     status,
+		payload:    contract.ErrorPayload{Error: message},
+	}
+}
+
+func parseSkillExposureAPIError(statusCode int, status string, body []byte) (bool, error) {
+	var payload contract.SkillExposureFailureResponse
+	if json.Unmarshal(body, &payload) != nil || payload.Error.Code != skillExposureFailedCode {
+		return false, nil
+	}
+	payload.Error.Message = redactToolDiagnostic(payload.Error.Message)
+	for index := range payload.Results {
+		if payload.Results[index].Error != nil {
+			payload.Results[index].Error.Message = redactToolDiagnostic(payload.Results[index].Error.Message)
+		}
+		if payload.Results[index].CleanupError != nil {
+			payload.Results[index].CleanupError.Message = redactToolDiagnostic(
+				payload.Results[index].CleanupError.Message,
+			)
+		}
+	}
+	return true, &skillExposureAPIError{statusCode: statusCode, status: status, payload: payload}
+}
+
+func parseSkillSourceAPIError(statusCode int, status string, body []byte) (bool, error) {
+	var payload contract.SkillSourceValidationErrorResponse
+	if json.Unmarshal(body, &payload) != nil || !isSkillSourceValidationCode(payload.Error.Code) {
+		return false, nil
+	}
+	payload.Error.Message = redactToolDiagnostic(payload.Error.Message)
+	return true, &skillSourceAPIError{
+		statusCode: statusCode,
+		status:     status,
+		payload:    payload,
+	}
+}
+
+func isSkillSourceValidationCode(code string) bool {
+	switch strings.TrimSpace(code) {
+	case skillSourceUnknownCode, skillSourceDuplicateCode, skillSourceInvalidPathCode,
+		skillSourceWorkspaceFieldCode:
+		return true
+	default:
+		return false
+	}
+}
+
+func parseExtensionValidationAPIError(statusCode int, status string, body []byte) (bool, error) {
+	var payload contract.ExtensionValidationErrorPayload
+	if json.Unmarshal(body, &payload) != nil || payload.Diagnostic == nil || len(payload.Issues) == 0 {
+		return false, nil
+	}
+	payload.Error = redactToolDiagnostic(payload.Error)
+	payload.Diagnostic = new(diagnosticspkg.RedactItem(*payload.Diagnostic))
+	for index := range payload.Issues {
+		payload.Issues[index].Path = redactToolDiagnostic(payload.Issues[index].Path)
+		payload.Issues[index].Scope = redactToolDiagnostic(payload.Issues[index].Scope)
+		payload.Issues[index].Field = redactToolDiagnostic(payload.Issues[index].Field)
+		payload.Issues[index].Message = redactToolDiagnostic(payload.Issues[index].Message)
+	}
+	return true, &extensionValidationAPIError{
+		statusCode: statusCode,
+		status:     status,
+		payload:    payload,
+	}
+}
+
+func parseWorktreeRemovalAPIError(statusCode int, status string, body []byte) (bool, error) {
+	var payload contract.WorktreeRemovalRefusalPayload
+	if json.Unmarshal(body, &payload) != nil ||
+		(payload.Code != "worktree_dirty_requires_force" &&
+			payload.Code != "worktree_unpushed_requires_force" &&
+			payload.Code != "worktree_checkout_orphaned") {
+		return false, nil
+	}
+	return true, &worktreeRemovalAPIError{statusCode: statusCode, status: status, payload: payload}
+}
+
+func parseExtensionOperationAPIError(statusCode int, status string, body []byte) (bool, error) {
+	var extensionPayload contract.ExtensionOperationErrorPayload
+	if json.Unmarshal(body, &extensionPayload) != nil ||
+		!strings.HasPrefix(strings.TrimSpace(extensionPayload.Code), "extension_") {
+		return false, nil
+	}
+	extensionPayload.Error = redactToolDiagnostic(extensionPayload.Error)
+	if extensionPayload.Diagnostic != nil {
+		extensionPayload.Diagnostic = new(diagnosticspkg.RedactItem(*extensionPayload.Diagnostic))
+	}
+	return true, &extensionOperationAPIError{
+		statusCode: statusCode,
+		status:     status,
+		payload:    extensionPayload,
+	}
+}
+
+func parseWindowManagerAPIError(statusCode int, status string, body []byte) (bool, error) {
+	var windowManagerPayload contract.WindowManagerErrorPayload
+	if json.Unmarshal(body, &windowManagerPayload) != nil ||
+		!strings.HasPrefix(string(windowManagerPayload.Code), "window_manager_") {
+		return false, nil
+	}
+	windowManagerPayload.Error = redactToolDiagnostic(windowManagerPayload.Error)
+	return true, &windowManagerAPIError{
+		statusCode: statusCode,
+		status:     status,
+		payload:    windowManagerPayload,
+	}
+}
+
+func parseDaemonAPIError(statusCode int, status string, body []byte) (bool, error) {
+	var payload contract.ErrorPayload
+	if json.Unmarshal(body, &payload) != nil || strings.TrimSpace(payload.Error) == "" {
+		return false, nil
+	}
+	payload.Error = redactToolDiagnostic(payload.Error)
+	cause := errors.New(payload.Error)
+	if payload.Diagnostic != nil {
+		return true, diagnosticspkg.NewStructuredError(*payload.Diagnostic, cause)
+	}
+	return true, &daemonAPIError{statusCode: statusCode, status: status, payload: payload}
+}
+
+func parseToolAPIError(statusCode int, status string, body []byte) (bool, error) {
+	var toolPayload contract.ToolErrorResponse
+	if json.Unmarshal(body, &toolPayload) != nil || toolPayload.Error.Code == "" {
+		return false, nil
+	}
+	return true, newToolAPIError(statusCode, status, toolPayload)
+}
+
+func drainResponseBody(method string, path string, body io.Reader) error {
+	if err := discardResponseBodyBounded(body); err != nil {
+		return fmt.Errorf("cli: drain %s %s response: %w", method, path, err)
+	}
+	return nil
+}
+
+func decodeJSONResponseBody(method string, path string, body io.Reader, target any) error {
+	decoder := json.NewDecoder(body)
+	decodeErr := decoder.Decode(target)
+	drainErr := drainResponseBody(method, path, io.MultiReader(decoder.Buffered(), body))
+	if decodeErr != nil {
+		decodeErr = fmt.Errorf("cli: decode %s %s response: %w", method, path, decodeErr)
+	}
+	return errors.Join(decodeErr, drainErr)
+}
+
+func discardResponseBodyBounded(body io.Reader) error {
+	if body == nil {
+		return nil
+	}
+	_, err := io.Copy(io.Discard, io.LimitReader(body, responseBodyDrainLimit))
+	return err
+}

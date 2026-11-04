@@ -1,0 +1,189 @@
+#!/usr/bin/env bash
+# Machine-capacity, fingerprint, and classification output support for gate.sh.
+# Sourced after gate.sh defines log, die, and GATE_SLOT.
+
+gate_slot_root() {
+  if [ -n "${COMPOZY_GATE_SLOT_DIR:-}" ]; then
+    printf '%s\n' "$COMPOZY_GATE_SLOT_DIR"
+  elif [ "$(uname -s)" = "Darwin" ]; then
+    printf '%s/Library/Caches/compozy-dev/gate-slots\n' "$HOME"
+  else
+    printf '%s/compozy-dev/gate-slots\n' "${XDG_CACHE_HOME:-$HOME/.cache}"
+  fi
+}
+
+release_gate_slot() {
+  [ -n "$GATE_SLOT" ] || return 0
+  if [ "$(sed -n '1p' "$GATE_SLOT/pid" 2>/dev/null || true)" = "$$" ]; then
+    rm -f "$GATE_SLOT/pid"
+    rmdir "$GATE_SLOT" 2>/dev/null || true
+  fi
+  GATE_SLOT=""
+}
+
+acquire_gate_slot() {
+  local maximum="${COMPOZY_GATE_MAX_CONCURRENT:-2}" root slot owner waited=0
+  case "$maximum" in
+    '' | *[!0-9]* | 0) die "COMPOZY_GATE_MAX_CONCURRENT must be a positive integer" ;;
+  esac
+  root="$(gate_slot_root)"
+  mkdir -p "$root"
+  while :; do
+    slot=1
+    while [ "$slot" -le "$maximum" ]; do
+      GATE_SLOT="$root/slot-$slot"
+      if mkdir "$GATE_SLOT" 2>/dev/null; then
+        printf '%s\n' "$$" >"$GATE_SLOT/pid"
+        printf '%s\n' "$(pwd)" >"$GATE_SLOT/worktree"
+        trap release_gate_slot EXIT
+        trap 'exit 129' HUP
+        trap 'exit 130' INT
+        trap 'exit 143' TERM
+        log "capacity slot $slot/$maximum acquired"
+        return 0
+      fi
+      owner="$(sed -n '1p' "$GATE_SLOT/pid" 2>/dev/null || true)"
+      if [ -z "$owner" ] || ! kill -0 "$owner" 2>/dev/null; then
+        rm -f "$GATE_SLOT/pid" "$GATE_SLOT/worktree"
+        rmdir "$GATE_SLOT" 2>/dev/null || true
+      fi
+      slot=$((slot + 1))
+    done
+    GATE_SLOT=""
+    if [ $((waited % 10)) -eq 0 ]; then
+      log "affected lanes are waiting for one of $maximum machine capacity slots"
+    fi
+    sleep 1
+    waited=$((waited + 1))
+  done
+}
+
+tree_fingerprint() (
+  local temp_index temp_paths
+  temp_index="$(mktemp "${TMPDIR:-/tmp}/compozy-gate-index.XXXXXX")"
+  temp_paths="$(mktemp "${TMPDIR:-/tmp}/compozy-gate-paths.XXXXXX")"
+  trap 'rm -f "$temp_index" "$temp_paths"' EXIT
+  rm -f "$temp_index"
+  if git rev-parse --verify --quiet HEAD >/dev/null 2>&1; then
+    GIT_INDEX_FILE="$temp_index" git read-tree HEAD
+    git diff --name-only -z HEAD -- >"$temp_paths"
+  else
+    GIT_INDEX_FILE="$temp_index" git read-tree --empty
+    : >"$temp_paths"
+  fi
+  git ls-files -o -z --exclude-standard >>"$temp_paths"
+  if [ -s "$temp_paths" ]; then
+    GIT_INDEX_FILE="$temp_index" git add -A \
+      --pathspec-from-file="$temp_paths" --pathspec-file-nul
+  fi
+  GIT_INDEX_FILE="$temp_index" git write-tree
+)
+
+lane_fingerprint() (
+  local lane="$1" tree="$2"
+  case "$lane" in
+    codegen | codegen-check) ;;
+    *) printf '%s\n' "$tree"; return ;;
+  esac
+  {
+    printf 'codegen-context-v1\ntree=%s\n' "$tree"
+    printf 'mage=%s\nmage-version=%s\n' "${MAGE:-}" "${MAGE_VERSION:-}"
+    if [ -f go.mod ]; then
+      command -v go
+      go env -json GOVERSION GOOS GOARCH GOFLAGS GOEXPERIMENT CGO_ENABLED GOTOOLCHAIN GOWORK \
+        GOMODCACHE GOAMD64 GOARM GOARM64 GOMIPS GOMIPS64 GORISCV64 GOWASM \
+        CC CXX CGO_CFLAGS CGO_CPPFLAGS CGO_CXXFLAGS CGO_LDFLAGS PKG_CONFIG
+    fi
+    if [ -f package.json ]; then
+      command -v bun
+      bun --version
+    fi
+  } | git hash-object --stdin
+)
+
+print_classification() {
+  log "changed files: $CHANGED_COUNT (base: $(resolve_base))"
+	if [ -n "$CI_FULL_REASONS" ]; then
+		log "changes requiring the full PR CI gate:"
+		printf '%s' "$CI_FULL_REASONS" | sort -u | sed 's/^/[gate]   /'
+  fi
+	if [ -n "$GO_SCOPES" ]; then
+		log "go scopes: $(normalized_go_scopes | tr '\n' ' ')"
+  fi
+  if [ -n "$GO_MODULES" ]; then
+    log "go modules: $(printf '%s' "$GO_MODULES" | sort -u | tr '\n' ' ')"
+  fi
+  if [ "$MAGE_LINT" -eq 1 ]; then log "mage lint: build tag mage"; fi
+	if [ -n "$JS_FILTERS" ]; then
+		log "js filters: $(printf '%s' "$JS_FILTERS" | sort -u | tr '\n' ' ')"
+	fi
+	if [ "$JS_ALL" -eq 1 ]; then
+		log "js lane: all workspaces"
+	fi
+	if [ "$CODEGEN_CHECK" -eq 1 ]; then
+		log "codegen lane: make codegen-check"
+	fi
+	if [ "$TOOLING_TEST" -eq 1 ]; then
+		log "tooling lanes: gate integration + mage tests"
+	fi
+  if [ "$CATALOG_CHECK" -eq 1 ]; then log "catalog lanes: production installer + bridge runtime tests"; fi
+  if [ "$NO_LANE_COUNT" -gt 0 ]; then
+    log "no-lane (docs/instructions/CI): $NO_LANE_COUNT files"
+  fi
+}
+
+root_lint_covers_modules() {
+  normalized_go_scopes | grep -Fx './...' >/dev/null
+}
+
+# The tree fingerprint alone does not prove the cached command checked every module.
+root_lint_record_covers_modules() {
+  local rec="$1" scopes
+  record_current "$rec" || return 1
+  scopes="$(record_field "$rec" command | sed -n 's/^env COMPOZY_GO_LINT_SCOPES=\(.*\) make go-lint$/\1/p')"
+  printf '%s\n' "$scopes" | tr '[:space:]' '\n' | grep -Fx './...' >/dev/null
+}
+
+run_module_lint() {
+  local id="$1" module="$2" root_record
+  root_record="$(record_path go-lint)"
+  if root_lint_covers_modules && root_lint_record_covers_modules "$root_record"; then
+    write_record "$id" pass "covered by go-lint (./...)" "$(record_field "$root_record" log)" 0
+    log "SKIP $id — covered by current go-lint evidence"
+  else
+    run_lane "$id" env "COMPOZY_GO_LINT_SCOPES=./$module/..." make go-lint
+  fi
+}
+
+run_module_lanes() {
+  local module id
+  for module in $(printf '%s' "$GO_MODULES" | sort -u); do
+    id="$(printf '%s' "$module" | tr '/' '-')"
+    run_module_lint "$id-lint" "$module"
+    case "$module" in
+      internal/extension/testdata/*) run_lane "$id-build-vet" make go-fixture-check "GO_FIXTURE_MODULE=$module" ;;
+      *) run_lane "$id-test" env CGO_ENABLED=1 go -C "$module" test -race -p "$(go_test_p)" -parallel=4 ./... ;;
+    esac
+  done
+  if [ "$MAGE_LINT" -eq 1 ]; then
+    run_module_lint mage-lint magefiles
+  fi
+}
+
+plan_module_lanes() {
+  local module
+  for module in $(printf '%s' "$GO_MODULES" | sort -u); do
+    if root_lint_covers_modules; then
+      log "module lint covered by root go-lint: $module"
+    else
+      log "would run: env COMPOZY_GO_LINT_SCOPES='./$module/...' make go-lint"
+    fi
+    case "$module" in
+      internal/extension/testdata/*) log "would run: make go-fixture-check GO_FIXTURE_MODULE=$module (build + vet)" ;;
+      *) log "would run: CGO_ENABLED=1 go -C $module test -race -p $(go_test_p) -parallel=4 ./..." ;;
+    esac
+  done
+  if [ "$MAGE_LINT" -eq 1 ] && ! root_lint_covers_modules; then
+    log "would run: env COMPOZY_GO_LINT_SCOPES='./magefiles/...' make go-lint"
+  fi
+}

@@ -1,0 +1,6239 @@
+package globaldb
+
+import (
+	"context"
+	"database/sql"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"path/filepath"
+	"reflect"
+	"slices"
+	"strings"
+	"sync"
+	"testing"
+	"time"
+
+	"github.com/compozy/compozy/internal/workspaceaccess"
+
+	eventspkg "github.com/compozy/compozy/internal/events"
+	hookspkg "github.com/compozy/compozy/internal/hooks"
+	looppkg "github.com/compozy/compozy/internal/loop"
+	"github.com/compozy/compozy/internal/store"
+	taskpkg "github.com/compozy/compozy/internal/task"
+	"github.com/compozy/compozy/internal/testutil"
+	compozyworkspace "github.com/compozy/compozy/internal/workspace"
+	worktreepkg "github.com/compozy/compozy/internal/worktree"
+)
+
+func TestOpenGlobalDBCreatesTaskSchemaAndIndexes(t *testing.T) {
+	t.Parallel()
+
+	globalDB := openTestGlobalDB(t)
+
+	assertTablesPresent(
+		t,
+		globalDB.db,
+		"tasks",
+		"task_blocks",
+		"task_block_recurrences",
+		"task_triage_state",
+		"task_runs",
+		"task_run_reviews",
+		"task_run_required_capabilities",
+		"task_run_preferred_capabilities",
+		"task_dependencies",
+		"task_events",
+		"task_run_idempotency",
+	)
+	assertTableColumns(t, globalDB.db, "tasks", []string{
+		"id",
+		"profile_id",
+		"identifier",
+		"scope",
+		"workspace_id",
+		"parent_task_id",
+		"title",
+		"description",
+		"priority",
+		"max_attempts",
+		"status",
+		"approval_policy",
+		"approval_state",
+		"owner_kind",
+		"owner_ref",
+		"created_by_kind",
+		"created_by_ref",
+		"origin_kind",
+		"origin_ref",
+		"created_at",
+		"updated_at",
+		"closed_at",
+		"metadata_json",
+		"current_run_id",
+		"paused",
+		"paused_by",
+		"paused_at",
+		"paused_reason",
+		"max_runtime_seconds",
+		"spawn_failure_count",
+		"last_spawn_error",
+		"review_policy",
+		"review_max_rounds",
+		"review_round",
+		"last_review_id",
+		"last_review_outcome",
+		"review_circuit_opened_at",
+		"review_circuit_reason",
+		"auto_enqueue_on_ready",
+		"needs_attention_reason",
+		"needs_attention_at",
+		"needs_attention_by_kind",
+		"needs_attention_by_ref",
+		"wake_creator",
+		"grant_ceiling",
+	})
+	assertTableColumns(t, globalDB.db, "task_blocks", []string{
+		"id",
+		"workspace_id",
+		"task_id",
+		"kind",
+		"reason",
+		"details_json",
+		"created_by_kind",
+		"created_by_ref",
+		"created_at",
+		"expires_at",
+		"cleared_at",
+		"cleared_by_kind",
+		"cleared_by_ref",
+		"clear_note",
+	})
+	assertTableColumns(t, globalDB.db, "task_block_recurrences", []string{
+		"task_id",
+		"kind",
+		"count",
+		"updated_at",
+	})
+	assertTableColumns(t, globalDB.db, "task_triage_state", []string{
+		"task_id",
+		"actor_kind",
+		"actor_id",
+		"is_read",
+		"archived",
+		"dismissed",
+		"last_seen_activity_at",
+		"updated_at",
+	})
+	assertTableColumns(t, globalDB.db, "task_runs", []string{
+		"id",
+		"task_id",
+		"workspace_id",
+		"worktree_id",
+		"status",
+		"attempt",
+		"recovery_count",
+		"previous_run_id",
+		"failure_kind",
+		"claimed_by_kind",
+		"claimed_by_ref",
+		"session_id",
+		"origin_kind",
+		"origin_ref",
+		"idempotency_key",
+		"designation_group_id",
+		"resolved_worktree_mode",
+		"resolved_worktree_ref",
+		"queued_at",
+		"claimed_at",
+		"started_at",
+		"ended_at",
+		"error",
+		"metadata_json",
+		"result_json",
+		"summary",
+		"claimed_agent_name",
+		"terminalized_by_session_id",
+		"terminalized_by_agent_name",
+		"terminalized_by_actor_kind",
+		"terminalized_by_actor_ref",
+		"review_required",
+		"review_request_round",
+		"review_policy_snapshot",
+		"review_request_id",
+		"parent_run_id",
+		"review_id",
+		"review_round",
+		"continuation_reason",
+		"missing_work_json",
+		"next_round_guidance",
+		"claim_token",
+		"claim_token_hash",
+		"lease_until",
+		"heartbeat_at",
+		"run_kind",
+		"loop_run_id",
+		"tokens_used",
+	})
+	assertTableColumns(t, globalDB.db, "task_run_required_capabilities", []string{
+		"run_id",
+		"capability_id",
+	})
+	assertTableColumns(t, globalDB.db, "task_run_preferred_capabilities", []string{
+		"run_id",
+		"capability_id",
+	})
+	assertTableColumns(t, globalDB.db, "task_dependencies", []string{
+		"task_id",
+		"depends_on_task_id",
+		"kind",
+		"created_at",
+	})
+	assertTableColumns(t, globalDB.db, "task_events", []string{
+		"id",
+		"event_seq",
+		"task_id",
+		"run_id",
+		"event_type",
+		"actor_kind",
+		"actor_id",
+		"origin_kind",
+		"origin_ref",
+		"payload_json",
+		"timestamp",
+	})
+	assertTableColumns(t, globalDB.db, "task_run_idempotency", []string{
+		"idempotency_key",
+		"origin_kind",
+		"origin_ref",
+		"run_id",
+		"created_at",
+	})
+	assertIndexesPresent(t, globalDB.db, "tasks",
+		"idx_tasks_scope",
+		"idx_tasks_workspace",
+		"idx_tasks_status",
+		"idx_tasks_priority",
+		"idx_tasks_approval_state",
+		"idx_tasks_parent",
+		"idx_tasks_owner",
+		"idx_tasks_current_run",
+		"idx_tasks_paused",
+		"idx_tasks_review_policy",
+		"idx_tasks_review_round",
+		"idx_tasks_created_by",
+	)
+	assertIndexesPresent(t, globalDB.db, "task_blocks",
+		"idx_task_blocks_open",
+		"idx_task_blocks_expiry",
+	)
+	assertIndexesPresent(t, globalDB.db, "task_triage_state",
+		"idx_task_triage_task",
+		"idx_task_triage_actor",
+	)
+	assertIndexesPresent(t, globalDB.db, "task_runs",
+		"idx_task_runs_task",
+		"idx_task_runs_task_status",
+		"idx_task_runs_status",
+		"idx_task_runs_previous",
+		"idx_task_runs_session",
+		"idx_task_runs_pending_claim",
+		"idx_task_runs_active_lease_recovery",
+		"idx_task_runs_session_status",
+		"idx_task_runs_worktree",
+		"idx_task_runs_parent_run",
+		"idx_task_runs_review_request",
+		"uq_task_runs_review_id",
+		"idx_task_runs_task_review_round",
+		"idx_task_runs_designation_group",
+		"uq_task_runs_active_loop_coordinator",
+	)
+	assertIndexesPresent(t, globalDB.db, "task_run_required_capabilities",
+		"idx_task_run_required_capabilities_capability",
+	)
+	assertIndexesPresent(t, globalDB.db, "task_run_preferred_capabilities",
+		"idx_task_run_preferred_capabilities_capability",
+	)
+	assertIndexesPresent(t, globalDB.db, "task_dependencies",
+		"idx_task_dependencies_task",
+		"idx_task_dependencies_depends_on",
+	)
+	assertIndexesPresent(t, globalDB.db, "task_events",
+		"idx_task_events_task",
+		"idx_task_events_run",
+		"idx_task_events_type",
+		"uq_task_events_event_seq",
+		"idx_task_events_task_seq",
+		"idx_task_events_type_seq",
+	)
+	assertIndexesPresent(t, globalDB.db, "task_run_idempotency",
+		"idx_task_run_idempotency_run",
+	)
+	assertIndexSQLContains(t, globalDB.db, "idx_task_blocks_open", "WHERE cleared_at IS NULL")
+	assertIndexSQLContains(t, globalDB.db, "idx_task_blocks_expiry", "expires_at IS NOT NULL")
+	assertIndexSQLContains(t, globalDB.db, "uq_task_runs_active_loop_coordinator", "run_kind = 'coordinator'")
+	assertIndexSQLContains(
+		t,
+		globalDB.db,
+		"uq_task_runs_active_loop_coordinator",
+		"status IN ('queued', 'claimed', 'starting', 'running')",
+	)
+	assertTableSQLContains(t, globalDB.db, "task_blocks", "CHECK (kind IN ('needs_input','capability','transient'))")
+	assertTableSQLContains(t, globalDB.db, "task_blocks", "CHECK (length(reason) > 0)")
+	assertTasksStatusAcceptsNeedsAttention(t, globalDB, "task-schema-needs-attention")
+	assertTaskRunTokensUsedRejectsNegativeValues(t, globalDB)
+}
+
+func assertTaskRunTokensUsedRejectsNegativeValues(t *testing.T, globalDB *GlobalDB) {
+	t.Helper()
+
+	ctx := testutil.Context(t)
+	taskRecord := taskRecordForTest("task-schema-tokens-used")
+	if err := globalDB.CreateTask(ctx, taskRecord); err != nil {
+		t.Fatalf("CreateTask(tokens constraint) error = %v", err)
+	}
+	run := taskRunForTest("run-schema-tokens-used", taskRecord.ID)
+	if err := globalDB.CreateTaskRun(ctx, run); err != nil {
+		t.Fatalf("CreateTaskRun(tokens constraint) error = %v", err)
+	}
+	if _, err := globalDB.db.ExecContext(
+		ctx,
+		`UPDATE task_runs SET tokens_used = -1 WHERE id = ?`,
+		run.ID,
+	); err == nil || !strings.Contains(err.Error(), "CHECK constraint failed") {
+		t.Fatalf("negative tokens_used update error = %v, want check constraint failure", err)
+	}
+}
+
+func TestGlobalDBTaskRunsCoordinatorExclusivityIndex(t *testing.T) {
+	t.Parallel()
+
+	t.Run("Should reject concurrent active coordinators for one loop run", func(t *testing.T) {
+		t.Parallel()
+
+		globalDB := openTestGlobalDB(t)
+		ctx := testutil.Context(t)
+		taskRecord := taskRecordForTest("task-loop-coordinator-index")
+		taskRecord.Status = taskpkg.TaskStatusReady
+		if err := globalDB.CreateTask(ctx, taskRecord); err != nil {
+			t.Fatalf("CreateTask() error = %v", err)
+		}
+		insertLoopRunForCoordinatorIndexTest(ctx, t, globalDB.db, "loop-run-coordinator-index")
+
+		errs := make(chan error, 2)
+		start := make(chan struct{})
+		for _, runID := range []string{"run-loop-coordinator-a", "run-loop-coordinator-b"} {
+			go func(runID string) {
+				<-start
+				errs <- insertTaskRunForCoordinatorIndexTest(
+					ctx,
+					globalDB.db,
+					runID,
+					taskRecord.ID,
+					"loop-run-coordinator-index",
+					"coordinator",
+					"queued",
+				)
+			}(runID)
+		}
+		close(start)
+
+		successes := 0
+		uniqueFailures := 0
+		for range 2 {
+			err := <-errs
+			if err == nil {
+				successes++
+				continue
+			}
+			if strings.Contains(err.Error(), "UNIQUE constraint failed: task_runs.loop_run_id") {
+				uniqueFailures++
+				continue
+			}
+			t.Fatalf("insert active coordinator error = %v, want unique constraint failure or success", err)
+		}
+		if successes != 1 || uniqueFailures != 1 {
+			t.Fatalf("active coordinator inserts: successes=%d uniqueFailures=%d, want 1/1", successes, uniqueFailures)
+		}
+
+		if err := insertTaskRunForCoordinatorIndexTest(
+			ctx,
+			globalDB.db,
+			"run-loop-worker-same-loop",
+			taskRecord.ID,
+			"loop-run-coordinator-index",
+			"worker",
+			"queued",
+		); err != nil {
+			t.Fatalf("insert worker with same loop_run_id error = %v, want partial index to ignore workers", err)
+		}
+		if err := insertTaskRunForCoordinatorIndexTest(
+			ctx,
+			globalDB.db,
+			"run-loop-coordinator-terminal",
+			taskRecord.ID,
+			"loop-run-coordinator-index",
+			"coordinator",
+			"completed",
+		); err != nil {
+			t.Fatalf("insert terminal coordinator error = %v, want partial index to ignore terminal runs", err)
+		}
+	})
+}
+
+func TestOpenGlobalDBTaskBlockSchemaSurvivesRestart(t *testing.T) {
+	t.Parallel()
+
+	t.Run("Should preserve task block schema across double boot", func(t *testing.T) {
+		t.Parallel()
+
+		ctx := testutil.Context(t)
+		dbPath := filepath.Join(t.TempDir(), GlobalDatabaseName)
+		first, err := OpenGlobalDB(ctx, dbPath)
+		if err != nil {
+			t.Fatalf("OpenGlobalDB(first) error = %v", err)
+		}
+		t.Cleanup(func() {
+			if closeErr := first.Close(testutil.Context(t)); closeErr != nil {
+				t.Errorf("Close(first cleanup) error = %v", closeErr)
+			}
+		})
+		assertTaskBlockingSchema(t, first.db)
+		assertTasksStatusAcceptsNeedsAttention(t, first, "task-block-first-boot")
+		if err := first.Close(ctx); err != nil {
+			t.Fatalf("Close(first) error = %v", err)
+		}
+
+		second, err := OpenGlobalDB(ctx, dbPath)
+		if err != nil {
+			t.Fatalf("OpenGlobalDB(second) error = %v", err)
+		}
+		t.Cleanup(func() {
+			if closeErr := second.Close(testutil.Context(t)); closeErr != nil {
+				t.Errorf("Close(second) error = %v", closeErr)
+			}
+		})
+		assertTaskBlockingSchema(t, second.db)
+		assertTasksStatusAcceptsNeedsAttention(t, second, "task-block-second-boot")
+	})
+}
+
+func TestOpenGlobalDBTaskRunClaimIndexesSupportPlannedScans(t *testing.T) {
+	t.Parallel()
+
+	globalDB := openTestGlobalDB(t)
+
+	assertQueryPlanUsesIndex(
+		t,
+		globalDB.db,
+		`SELECT id
+		 FROM task_runs
+		 WHERE status = ? AND (lease_until IS NULL OR lease_until <= ?)
+		 ORDER BY queued_at ASC, id ASC`,
+		"idx_task_runs_pending_claim",
+		taskpkg.TaskRunStatusQueued.String(),
+		"2026-04-26T12:00:00Z",
+	)
+	assertQueryPlanUsesIndex(
+		t,
+		globalDB.db,
+		`SELECT id
+		 FROM task_runs
+		 WHERE status = ? AND lease_until <= ? AND heartbeat_at <= ?`,
+		"idx_task_runs_active_lease_recovery",
+		taskpkg.TaskRunStatusClaimed.String(),
+		"2026-04-26T12:00:00Z",
+		"2026-04-26T11:59:00Z",
+	)
+	assertQueryPlanUsesIndex(
+		t,
+		globalDB.db,
+		`SELECT run_id
+		 FROM task_run_required_capabilities
+		 WHERE capability_id = ?`,
+		"idx_task_run_required_capabilities_capability",
+		"golang",
+	)
+	assertQueryPlanUsesIndex(
+		t,
+		globalDB.db,
+		`SELECT run_id
+		 FROM task_run_preferred_capabilities
+		 WHERE capability_id = ?`,
+		"idx_task_run_preferred_capabilities_capability",
+		"codex",
+	)
+}
+
+func TestGlobalDBTaskRoundTripPreservesNullableFields(t *testing.T) {
+	t.Parallel()
+
+	globalDB := openTestGlobalDB(t)
+	workspaceID := registerWorkspaceForGlobalTests(
+		t,
+		globalDB,
+		"task-roundtrip-workspace",
+		filepath.Join(t.TempDir(), "workspace"),
+	)
+
+	parent := taskRecordForTest("task-parent")
+	parent.Metadata = json.RawMessage(`{"kind":"global"}`)
+	if err := globalDB.CreateTask(testutil.Context(t), parent); err != nil {
+		t.Fatalf("CreateTask(parent) error = %v", err)
+	}
+
+	child := taskRecordForTest("task-child")
+	child.Scope = taskpkg.ScopeWorkspace
+	child.WorkspaceID = workspaceID
+	child.ParentTaskID = parent.ID
+	child.Priority = taskpkg.PriorityUrgent
+	child.MaxAttempts = 5
+	child.AutoEnqueueOnReady = true
+	child.ApprovalPolicy = taskpkg.ApprovalPolicyManual
+	child.ApprovalState = taskpkg.ApprovalStateApproved
+	child.Owner = ownershipForTest(taskpkg.OwnerKindHuman, "alice")
+	child.Metadata = json.RawMessage(`{"kind":"workspace"}`)
+	if err := globalDB.CreateTask(testutil.Context(t), child); err != nil {
+		t.Fatalf("CreateTask(child) error = %v", err)
+	}
+
+	gotParent, err := globalDB.GetTask(testutil.Context(t), parent.ID)
+	if err != nil {
+		t.Fatalf("GetTask(parent) error = %v", err)
+	}
+	assertTaskEqual(t, gotParent, parent)
+	if gotParent.WorkspaceID != "" {
+		t.Fatalf("GetTask(parent).WorkspaceID = %q, want empty", gotParent.WorkspaceID)
+	}
+	if gotParent.ParentTaskID != "" {
+		t.Fatalf("GetTask(parent).ParentTaskID = %q, want empty", gotParent.ParentTaskID)
+	}
+	if gotParent.Owner != nil {
+		t.Fatalf("GetTask(parent).Owner = %#v, want nil", gotParent.Owner)
+	}
+
+	gotChild, err := globalDB.GetTask(testutil.Context(t), child.ID)
+	if err != nil {
+		t.Fatalf("GetTask(child) error = %v", err)
+	}
+	assertTaskEqual(t, gotChild, child)
+
+	child.Title = "Updated child"
+	child.Description = "Updated description"
+	child.Priority = taskpkg.PriorityHigh
+	child.MaxAttempts = 4
+	child.Status = taskpkg.TaskStatusInProgress
+	child.ApprovalPolicy = taskpkg.ApprovalPolicyNone
+	child.ApprovalState = taskpkg.ApprovalStateNotRequired
+	child.Owner = ownershipForTest(taskpkg.OwnerKindAgentSession, "sess-1")
+	child.Metadata = json.RawMessage(`{"kind":"updated"}`)
+	child.UpdatedAt = child.UpdatedAt.Add(2 * time.Minute)
+	if err := globalDB.UpdateTask(testutil.Context(t), child, coordinatorActorContextForTest()); err != nil {
+		t.Fatalf("UpdateTask(child) error = %v", err)
+	}
+	gotChild, err = globalDB.GetTask(testutil.Context(t), child.ID)
+	if err != nil {
+		t.Fatalf("GetTask(updated child) error = %v", err)
+	}
+	assertTaskEqual(t, gotChild, child)
+
+	summaries, err := globalDB.ListTasks(testutil.Context(t), taskpkg.Query{ParentTaskID: parent.ID})
+	if err != nil {
+		t.Fatalf("ListTasks(parent filter) error = %v", err)
+	}
+	if got, want := len(summaries), 1; got != want {
+		t.Fatalf("len(ListTasks(parent filter)) = %d, want %d", got, want)
+	}
+	assertTaskSummaryMatchesTask(t, &summaries[0], child)
+
+	children, err := globalDB.CountDirectChildren(testutil.Context(t), parent.ID)
+	if err != nil {
+		t.Fatalf("CountDirectChildren() error = %v", err)
+	}
+	if got, want := children, 1; got != want {
+		t.Fatalf("CountDirectChildren() = %d, want %d", got, want)
+	}
+
+	t.Run("Should enforce explicit profile scope for task detail reads", func(t *testing.T) {
+		t.Parallel()
+
+		ctx := testutil.Context(t)
+		foreignProfileID := strings.Repeat("f", 26)
+		if _, err := globalDB.DB().ExecContext(ctx, `
+			INSERT INTO profiles (id, name, color, icon, state, created_at)
+			VALUES (?, 'task-foreign', '#8E8EB5', 'circle', 'active', ?)`,
+			foreignProfileID,
+			store.FormatTimestamp(time.Date(2026, 4, 14, 13, 0, 0, 0, time.UTC)),
+		); err != nil {
+			t.Fatalf("insert foreign profile error = %v", err)
+		}
+		foreign := taskRecordForTest("task-foreign-profile")
+		foreign.ProfileID = foreignProfileID
+		if err := globalDB.CreateTask(ctx, foreign); err != nil {
+			t.Fatalf("CreateTask(foreign) error = %v", err)
+		}
+
+		if _, err := globalDB.GetTaskInReadScope(ctx, foreign.ID, store.ReadScope{
+			ProfileID: store.DefaultProfileID,
+		}); !errors.Is(err, taskpkg.ErrTaskNotFound) {
+			t.Fatalf("GetTaskInReadScope(foreign) error = %v, want %v", err, taskpkg.ErrTaskNotFound)
+		}
+		if _, err := globalDB.GetTaskInReadScope(ctx, foreign.ID, store.ReadScope{}); !errors.Is(
+			err,
+			store.ErrReadScopeInvalid,
+		) {
+			t.Fatalf("GetTaskInReadScope(invalid) error = %v, want %v", err, store.ErrReadScopeInvalid)
+		}
+		aggregate, err := globalDB.GetTaskInReadScope(ctx, foreign.ID, store.ReadScope{AllProfiles: true})
+		if err != nil {
+			t.Fatalf("GetTaskInReadScope(aggregate) error = %v", err)
+		}
+		if got, want := aggregate.ProfileID, foreignProfileID; got != want {
+			t.Fatalf("GetTaskInReadScope(aggregate).ProfileID = %q, want %q", got, want)
+		}
+	})
+}
+
+func TestGlobalDBDeleteTaskMapsChildConstraintToValidationError(t *testing.T) {
+	t.Parallel()
+
+	t.Run("Should map child constraint failures to task validation errors", func(t *testing.T) {
+		t.Parallel()
+
+		globalDB := openTestGlobalDB(t)
+
+		parent := taskRecordForTest("task-parent-delete")
+		if err := globalDB.CreateTask(testutil.Context(t), parent); err != nil {
+			t.Fatalf("CreateTask(parent) error = %v", err)
+		}
+
+		child := taskRecordForTest("task-child-delete")
+		child.ParentTaskID = parent.ID
+		if err := globalDB.CreateTask(testutil.Context(t), child); err != nil {
+			t.Fatalf("CreateTask(child) error = %v", err)
+		}
+
+		err := globalDB.DeleteTask(testutil.Context(t), parent.ID)
+		if !errors.Is(err, taskpkg.ErrValidation) {
+			t.Fatalf("DeleteTask(parent) error = %v, want %v", err, taskpkg.ErrValidation)
+		}
+		if strings.Contains(strings.ToLower(err.Error()), "foreign key constraint failed") {
+			t.Fatalf("DeleteTask(parent) error = %q, want mapped task validation error", err.Error())
+		}
+	})
+}
+
+func TestDeleteTaskTransactionStoreDelegatesTaskStateReadsAndMutations(t *testing.T) {
+	t.Parallel()
+
+	globalDB := openTestGlobalDB(t)
+	ctx := testutil.Context(t)
+
+	parent := taskRecordForTest("task-tx-parent")
+	if err := globalDB.CreateTask(ctx, parent); err != nil {
+		t.Fatalf("CreateTask(parent) error = %v", err)
+	}
+	child := taskRecordForTest("task-tx-child")
+	child.ParentTaskID = parent.ID
+	if err := globalDB.CreateTask(ctx, child); err != nil {
+		t.Fatalf("CreateTask(child) error = %v", err)
+	}
+	dependency := taskpkg.Dependency{
+		TaskID:          child.ID,
+		DependsOnTaskID: parent.ID,
+		Kind:            taskpkg.DependencyKindBlocks,
+		CreatedAt:       child.CreatedAt.Add(time.Minute),
+	}
+	if err := globalDB.CreateDependency(ctx, dependency); err != nil {
+		t.Fatalf("CreateDependency() error = %v", err)
+	}
+	run := taskRunForTest("run-tx-child", child.ID)
+	if err := globalDB.CreateTaskRun(ctx, run); err != nil {
+		t.Fatalf("CreateTaskRun() error = %v", err)
+	}
+
+	txStore := &deleteTaskTxStore{tasks: globalDB.TaskRepo, exec: globalDB.db}
+	gotChild, err := txStore.GetTask(ctx, child.ID)
+	if err != nil {
+		t.Fatalf("txStore.GetTask() error = %v", err)
+	}
+	assertTaskEqual(t, gotChild, child)
+
+	child.Title = "Updated by transaction store"
+	child.UpdatedAt = child.UpdatedAt.Add(2 * time.Minute)
+	if err := txStore.UpdateTask(ctx, child, coordinatorActorContextForTest()); err != nil {
+		t.Fatalf("txStore.UpdateTask() error = %v", err)
+	}
+	updatedChild, err := globalDB.GetTask(ctx, child.ID)
+	if err != nil {
+		t.Fatalf("GetTask(updated child) error = %v", err)
+	}
+	assertTaskEqual(t, updatedChild, child)
+
+	children, err := txStore.CountDirectChildren(ctx, parent.ID)
+	if err != nil {
+		t.Fatalf("txStore.CountDirectChildren() error = %v", err)
+	}
+	if got, want := children, 1; got != want {
+		t.Fatalf("txStore.CountDirectChildren() = %d, want %d", got, want)
+	}
+	dependencies, err := txStore.ListDependencies(ctx, child.ID)
+	if err != nil {
+		t.Fatalf("txStore.ListDependencies() error = %v", err)
+	}
+	if got, want := len(dependencies), 1; got != want {
+		t.Fatalf("len(txStore.ListDependencies()) = %d, want %d", got, want)
+	}
+	dependents, err := txStore.ListDependents(ctx, parent.ID)
+	if err != nil {
+		t.Fatalf("txStore.ListDependents() error = %v", err)
+	}
+	if got, want := len(dependents), 1; got != want {
+		t.Fatalf("len(txStore.ListDependents()) = %d, want %d", got, want)
+	}
+	runs, err := txStore.ListTaskRuns(ctx, taskpkg.RunQuery{TaskID: child.ID})
+	if err != nil {
+		t.Fatalf("txStore.ListTaskRuns() error = %v", err)
+	}
+	if got, want := len(runs), 1; got != want {
+		t.Fatalf("len(txStore.ListTaskRuns()) = %d, want %d", got, want)
+	}
+	assertTaskRunEqual(t, runs[0], run)
+
+	if err := txStore.DeleteTask(ctx, child.ID); err != nil {
+		t.Fatalf("txStore.DeleteTask() error = %v", err)
+	}
+	if _, err := globalDB.GetTask(ctx, child.ID); !errors.Is(err, taskpkg.ErrTaskNotFound) {
+		t.Fatalf("GetTask(deleted child) error = %v, want ErrTaskNotFound", err)
+	}
+}
+
+func TestGlobalDBCreateAndUpdateTaskRejectInvalidScopeBindings(t *testing.T) {
+	t.Parallel()
+
+	globalDB := openTestGlobalDB(t)
+	workspaceID := registerWorkspaceForGlobalTests(
+		t,
+		globalDB,
+		"invalid-scope-workspace",
+		filepath.Join(t.TempDir(), "workspace"),
+	)
+
+	t.Run("Should reject creating global task with workspace", func(t *testing.T) {
+		t.Parallel()
+
+		record := taskRecordForTest("task-invalid-create-global")
+		record.WorkspaceID = workspaceID
+
+		err := globalDB.CreateTask(testutil.Context(t), record)
+		if !errors.Is(err, taskpkg.ErrInvalidScopeBinding) {
+			t.Fatalf("CreateTask(global with workspace) error = %v, want ErrInvalidScopeBinding", err)
+		}
+	})
+
+	t.Run("Should reject creating workspace task without workspace", func(t *testing.T) {
+		t.Parallel()
+
+		record := taskRecordForTest("task-invalid-create-workspace")
+		record.Scope = taskpkg.ScopeWorkspace
+
+		err := globalDB.CreateTask(testutil.Context(t), record)
+		if !errors.Is(err, taskpkg.ErrInvalidScopeBinding) {
+			t.Fatalf("CreateTask(workspace without workspace_id) error = %v, want ErrInvalidScopeBinding", err)
+		}
+	})
+
+	t.Run("Should reject updating global task with workspace", func(t *testing.T) {
+		t.Parallel()
+
+		record := taskRecordForTest("task-invalid-update-global")
+		if err := globalDB.CreateTask(testutil.Context(t), record); err != nil {
+			t.Fatalf("CreateTask() error = %v", err)
+		}
+
+		record.WorkspaceID = workspaceID
+		record.UpdatedAt = record.UpdatedAt.Add(time.Minute)
+		err := globalDB.UpdateTask(testutil.Context(t), record, coordinatorActorContextForTest())
+		if !errors.Is(err, taskpkg.ErrInvalidScopeBinding) {
+			t.Fatalf("UpdateTask(global with workspace) error = %v, want ErrInvalidScopeBinding", err)
+		}
+	})
+
+	t.Run("Should reject updating workspace task without workspace", func(t *testing.T) {
+		t.Parallel()
+
+		record := taskRecordForTest("task-invalid-update-workspace")
+		record.Scope = taskpkg.ScopeWorkspace
+		record.WorkspaceID = workspaceID
+		if err := globalDB.CreateTask(testutil.Context(t), record); err != nil {
+			t.Fatalf("CreateTask() error = %v", err)
+		}
+
+		record.WorkspaceID = ""
+		record.UpdatedAt = record.UpdatedAt.Add(time.Minute)
+		err := globalDB.UpdateTask(testutil.Context(t), record, coordinatorActorContextForTest())
+		if !errors.Is(err, taskpkg.ErrInvalidScopeBinding) {
+			t.Fatalf("UpdateTask(workspace without workspace_id) error = %v, want ErrInvalidScopeBinding", err)
+		}
+	})
+}
+
+func TestGlobalDBListTasksFilters(t *testing.T) {
+	t.Parallel()
+
+	globalDB := openTestGlobalDB(t)
+	workspaceA := registerWorkspaceForGlobalTests(
+		t,
+		globalDB,
+		"task-filter-a",
+		filepath.Join(t.TempDir(), "workspace-a"),
+	)
+	workspaceB := registerWorkspaceForGlobalTests(
+		t,
+		globalDB,
+		"task-filter-b",
+		filepath.Join(t.TempDir(), "workspace-b"),
+	)
+
+	globalTask := taskRecordForTest("task-filter-global")
+	globalTask.Status = taskpkg.TaskStatusPending
+
+	readyTask := taskRecordForTest("task-filter-ready")
+	readyTask.CreatedAt = readyTask.CreatedAt.Add(time.Minute)
+	readyTask.UpdatedAt = readyTask.UpdatedAt.Add(time.Minute)
+	readyTask.Scope = taskpkg.ScopeWorkspace
+	readyTask.WorkspaceID = workspaceA
+	readyTask.Status = taskpkg.TaskStatusReady
+	readyTask.Priority = taskpkg.PriorityHigh
+	readyTask.ApprovalPolicy = taskpkg.ApprovalPolicyManual
+	readyTask.ApprovalState = taskpkg.ApprovalStateApproved
+	readyTask.Owner = ownershipForTest(taskpkg.OwnerKindHuman, "alice")
+
+	childTask := taskRecordForTest("task-filter-child")
+	childTask.CreatedAt = childTask.CreatedAt.Add(2 * time.Minute)
+	childTask.UpdatedAt = childTask.UpdatedAt.Add(2 * time.Minute)
+	childTask.Scope = taskpkg.ScopeWorkspace
+	childTask.WorkspaceID = workspaceB
+	childTask.ParentTaskID = globalTask.ID
+	childTask.Status = taskpkg.TaskStatusBlocked
+	childTask.Priority = taskpkg.PriorityUrgent
+	childTask.ApprovalPolicy = taskpkg.ApprovalPolicyManual
+	childTask.ApprovalState = taskpkg.ApprovalStatePending
+	childTask.Owner = ownershipForTest(taskpkg.OwnerKindPool, "backlog")
+
+	for _, record := range []taskpkg.Task{globalTask, readyTask, childTask} {
+		if err := globalDB.CreateTask(testutil.Context(t), record); err != nil {
+			t.Fatalf("CreateTask(%q) error = %v", record.ID, err)
+		}
+	}
+
+	for _, tc := range []struct {
+		name  string
+		query taskpkg.Query
+		want  []string
+	}{
+		{
+			name:  "scope",
+			query: taskpkg.Query{Scope: taskpkg.ScopeGlobal},
+			want:  []string{globalTask.ID},
+		},
+		{
+			name:  "workspace",
+			query: taskpkg.Query{WorkspaceID: workspaceA},
+			want:  []string{readyTask.ID},
+		},
+		{
+			name:  "status",
+			query: taskpkg.Query{Status: taskpkg.TaskStatusReady},
+			want:  []string{readyTask.ID},
+		},
+		{
+			name:  "priority",
+			query: taskpkg.Query{Priority: taskpkg.PriorityUrgent},
+			want:  []string{childTask.ID},
+		},
+		{
+			name:  "approval state",
+			query: taskpkg.Query{ApprovalState: taskpkg.ApprovalStatePending},
+			want:  []string{childTask.ID},
+		},
+		{
+			name:  "parent",
+			query: taskpkg.Query{ParentTaskID: globalTask.ID},
+			want:  []string{childTask.ID},
+		},
+		{
+			name:  "owner kind",
+			query: taskpkg.Query{OwnerKind: taskpkg.OwnerKindHuman},
+			want:  []string{readyTask.ID},
+		},
+		{
+			name:  "owner ref",
+			query: taskpkg.Query{OwnerRef: "alice"},
+			want:  []string{readyTask.ID},
+		},
+		{
+			name:  "limit",
+			query: taskpkg.Query{Limit: 2},
+			want:  []string{childTask.ID, readyTask.ID},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			summaries, err := globalDB.ListTasks(testutil.Context(t), tc.query)
+			if err != nil {
+				t.Fatalf("ListTasks(%s) error = %v", tc.name, err)
+			}
+			gotIDs := taskSummaryIDs(summaries)
+			if !testutil.EqualStringSlices(gotIDs, tc.want) {
+				t.Fatalf("ListTasks(%s) ids = %#v, want %#v", tc.name, gotIDs, tc.want)
+			}
+		})
+	}
+}
+
+func TestGlobalDBListTasksFiltersByCreatedBy(t *testing.T) {
+	t.Parallel()
+
+	t.Run("Should return only workspace scoped tasks matching created by filters", func(t *testing.T) {
+		t.Parallel()
+
+		globalDB := openTestGlobalDB(t)
+		ctx := testutil.Context(t)
+		workspaceA := registerWorkspaceForGlobalTests(t, globalDB, "created-by-a", filepath.Join(t.TempDir(), "a"))
+		workspaceB := registerWorkspaceForGlobalTests(t, globalDB, "created-by-b", filepath.Join(t.TempDir(), "b"))
+
+		agentA := workspaceTaskRecordForTest("task-created-by-agent-a", workspaceA)
+		agentA.CreatedBy = taskpkg.ActorIdentity{Kind: taskpkg.ActorKindAgentSession, Ref: "sess-created-by"}
+		agentB := workspaceTaskRecordForTest("task-created-by-agent-b", workspaceB)
+		agentB.CreatedBy = taskpkg.ActorIdentity{Kind: taskpkg.ActorKindAgentSession, Ref: "sess-created-by"}
+		humanA := workspaceTaskRecordForTest("task-created-by-human-a", workspaceA)
+		humanA.CreatedBy = taskpkg.ActorIdentity{Kind: taskpkg.ActorKindHuman, Ref: "user:created-by"}
+
+		for _, record := range []taskpkg.Task{agentA, agentB, humanA} {
+			if err := globalDB.CreateTask(ctx, record); err != nil {
+				t.Fatalf("CreateTask(%q) error = %v", record.ID, err)
+			}
+		}
+
+		for _, tc := range []struct {
+			name  string
+			query taskpkg.Query
+			want  []string
+		}{
+			{
+				name: "Should filter by created by kind inside one workspace",
+				query: taskpkg.Query{
+					WorkspaceID:   workspaceA,
+					CreatedByKind: taskpkg.ActorKindAgentSession,
+				},
+				want: []string{agentA.ID},
+			},
+			{
+				name: "Should filter by created by ref inside one workspace",
+				query: taskpkg.Query{
+					WorkspaceID:  workspaceB,
+					CreatedByRef: "sess-created-by",
+				},
+				want: []string{agentB.ID},
+			},
+			{
+				name: "Should combine created by kind and ref",
+				query: taskpkg.Query{
+					WorkspaceID:   workspaceA,
+					CreatedByKind: taskpkg.ActorKindHuman,
+					CreatedByRef:  "user:created-by",
+				},
+				want: []string{humanA.ID},
+			},
+			{
+				name: "Should return empty when no created by filter matches",
+				query: taskpkg.Query{
+					WorkspaceID:   workspaceA,
+					CreatedByKind: taskpkg.ActorKindDaemon,
+					CreatedByRef:  "daemon",
+				},
+				want: nil,
+			},
+		} {
+			t.Run(tc.name, func(t *testing.T) {
+				t.Parallel()
+
+				summaries, err := globalDB.ListTasks(testutil.Context(t), tc.query)
+				if err != nil {
+					t.Fatalf("ListTasks(%#v) error = %v", tc.query, err)
+				}
+				gotIDs := taskSummaryIDs(summaries)
+				if !testutil.EqualStringSlices(gotIDs, tc.want) {
+					t.Fatalf("ListTasks(%#v) ids = %#v, want %#v", tc.query, gotIDs, tc.want)
+				}
+			})
+		}
+	})
+}
+
+func TestGlobalDBTaskBlocksCRUD(t *testing.T) {
+	t.Parallel()
+
+	t.Run("Should create clear and list task blocks with workspace isolation", func(t *testing.T) {
+		t.Parallel()
+
+		globalDB := openTestGlobalDB(t)
+		ctx := testutil.Context(t)
+		now := time.Date(2026, 7, 3, 10, 0, 0, 0, time.UTC)
+		globalDB.now = func() time.Time { return now }
+
+		workspaceA := registerWorkspaceForGlobalTests(t, globalDB, "task-blocks-a", filepath.Join(t.TempDir(), "a"))
+		workspaceB := registerWorkspaceForGlobalTests(t, globalDB, "task-blocks-b", filepath.Join(t.TempDir(), "b"))
+		taskRecord := workspaceTaskRecordForTest("task-blocks-crud", workspaceA)
+		if err := globalDB.CreateTask(ctx, taskRecord); err != nil {
+			t.Fatalf("CreateTask() error = %v", err)
+		}
+
+		openBlock := taskBlockRecordForTest("block-open", taskRecord.ID, taskpkg.BlockKindNeedsInput, now)
+		openBlock.WorkspaceID = "caller-supplied-workspace-is-ignored"
+		createdOpenResult, err := globalDB.CreateTaskBlock(ctx, taskpkg.CreateTaskBlockMutation{
+			Actor:           coordinatorActorContextForTest(),
+			Block:           openBlock,
+			RecurrenceLimit: 2,
+		})
+		if err != nil {
+			t.Fatalf("CreateTaskBlock(open) error = %v", err)
+		}
+		createdOpen := createdOpenResult.Block
+		if got, want := createdOpen.WorkspaceID, workspaceA; got != want {
+			t.Fatalf("created open workspace_id = %q, want %q", got, want)
+		}
+		if got, want := string(createdOpen.Details), string(openBlock.Details); got != want {
+			t.Fatalf("created open details = %s, want %s", got, want)
+		}
+
+		blockToClear := taskBlockRecordForTest(
+			"block-clear",
+			taskRecord.ID,
+			taskpkg.BlockKindTransient,
+			now.Add(time.Minute),
+		)
+		createdClearResult, err := globalDB.CreateTaskBlock(ctx, taskpkg.CreateTaskBlockMutation{
+			Actor:           coordinatorActorContextForTest(),
+			Block:           blockToClear,
+			RecurrenceLimit: 2,
+		})
+		if err != nil {
+			t.Fatalf("CreateTaskBlock(clear) error = %v", err)
+		}
+		createdClear := createdClearResult.Block
+		clearAt := now.Add(2 * time.Minute)
+		cleared, err := globalDB.ClearTaskBlock(ctx, taskpkg.ClearTaskBlockMutation{
+			TaskID:    taskRecord.ID,
+			BlockID:   createdClear.ID,
+			ClearedBy: taskpkg.ActorIdentity{Kind: taskpkg.ActorKindHuman, Ref: "user:resolver"},
+			ClearedAt: clearAt,
+			ClearNote: "resolved by operator",
+			Actor:     operatorActorContextForTest("user:resolver"),
+		})
+		if err != nil {
+			t.Fatalf("ClearTaskBlock(first) error = %v", err)
+		}
+		if got, want := cleared.ClearedBy, (taskpkg.ActorIdentity{Kind: taskpkg.ActorKindHuman, Ref: "user:resolver"}); got != want {
+			t.Fatalf("cleared_by = %#v, want %#v", got, want)
+		}
+		if !cleared.ClearedAt.Equal(clearAt) {
+			t.Fatalf("cleared_at = %v, want %v", cleared.ClearedAt, clearAt)
+		}
+		if got, want := cleared.ClearNote, "resolved by operator"; got != want {
+			t.Fatalf("clear_note = %q, want %q", got, want)
+		}
+
+		if _, err := globalDB.ClearTaskBlock(ctx, taskpkg.ClearTaskBlockMutation{
+			TaskID:    taskRecord.ID,
+			BlockID:   createdClear.ID,
+			ClearedBy: taskpkg.ActorIdentity{Kind: taskpkg.ActorKindHuman, Ref: "user:resolver"},
+			ClearedAt: clearAt.Add(time.Minute),
+			Actor:     operatorActorContextForTest("user:resolver"),
+		}); !errors.Is(err, taskpkg.ErrConflict) {
+			t.Fatalf("ClearTaskBlock(second) error = %v, want %v", err, taskpkg.ErrConflict)
+		}
+
+		if _, err := globalDB.db.ExecContext(
+			ctx,
+			`INSERT INTO task_blocks (
+			id, workspace_id, task_id, kind, reason, details_json, created_by_kind, created_by_ref,
+			created_at, expires_at, cleared_at, cleared_by_kind, cleared_by_ref, clear_note
+		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL, NULL, NULL, NULL)`,
+			"block-wrong-workspace",
+			workspaceB,
+			taskRecord.ID,
+			string(taskpkg.BlockKindNeedsInput),
+			"wrong workspace row",
+			nil,
+			string(taskpkg.ActorKindHuman),
+			"user:wrong-workspace",
+			store.FormatTimestamp(now.Add(3*time.Minute)),
+		); err != nil {
+			t.Fatalf("seed wrong workspace task block error = %v", err)
+		}
+
+		openOnly, err := globalDB.ListTaskBlocks(ctx, taskRecord.ID, false)
+		if err != nil {
+			t.Fatalf("ListTaskBlocks(open-only) error = %v", err)
+		}
+		assertTaskBlockIDs(t, openOnly, []string{createdOpen.ID})
+
+		withCleared, err := globalDB.ListTaskBlocks(ctx, taskRecord.ID, true)
+		if err != nil {
+			t.Fatalf("ListTaskBlocks(include cleared) error = %v", err)
+		}
+		assertTaskBlockIDs(t, withCleared, []string{createdOpen.ID, createdClear.ID})
+	})
+}
+
+func TestGlobalDBTaskBlockRecurrences(t *testing.T) {
+	t.Parallel()
+
+	t.Run("Should upsert increment read and reset task block recurrence counters", func(t *testing.T) {
+		t.Parallel()
+
+		globalDB := openTestGlobalDB(t)
+		ctx := testutil.Context(t)
+		workspaceID := registerWorkspaceForGlobalTests(
+			t,
+			globalDB,
+			"task-block-recurrences",
+			filepath.Join(t.TempDir(), "workspace"),
+		)
+		taskRecord := workspaceTaskRecordForTest("task-block-recurrences", workspaceID)
+		if err := globalDB.CreateTask(ctx, taskRecord); err != nil {
+			t.Fatalf("CreateTask() error = %v", err)
+		}
+
+		absent, err := globalDB.GetTaskBlockRecurrence(ctx, taskRecord.ID, taskpkg.BlockKindNeedsInput)
+		if err != nil {
+			t.Fatalf("GetTaskBlockRecurrence(absent) error = %v", err)
+		}
+		if absent.Count != 0 || absent.TaskID != taskRecord.ID || absent.Kind != taskpkg.BlockKindNeedsInput {
+			t.Fatalf("absent recurrence = %#v, want zero counter for task/kind", absent)
+		}
+
+		firstAt := time.Date(2026, 7, 3, 11, 0, 0, 0, time.UTC)
+		stored, err := globalDB.UpsertTaskBlockRecurrence(ctx, taskpkg.BlockRecurrence{
+			TaskID:    taskRecord.ID,
+			Kind:      taskpkg.BlockKindNeedsInput,
+			Count:     2,
+			UpdatedAt: firstAt,
+		})
+		if err != nil {
+			t.Fatalf("UpsertTaskBlockRecurrence(first) error = %v", err)
+		}
+		assertTaskBlockRecurrence(t, stored, taskRecord.ID, taskpkg.BlockKindNeedsInput, 2, firstAt)
+
+		secondAt := firstAt.Add(time.Minute)
+		stored, err = globalDB.UpsertTaskBlockRecurrence(ctx, taskpkg.BlockRecurrence{
+			TaskID:    taskRecord.ID,
+			Kind:      taskpkg.BlockKindNeedsInput,
+			Count:     5,
+			UpdatedAt: secondAt,
+		})
+		if err != nil {
+			t.Fatalf("UpsertTaskBlockRecurrence(second) error = %v", err)
+		}
+		assertTaskBlockRecurrence(t, stored, taskRecord.ID, taskpkg.BlockKindNeedsInput, 5, secondAt)
+
+		incremented, err := globalDB.IncrementTaskBlockRecurrence(
+			ctx,
+			taskRecord.ID,
+			taskpkg.BlockKindCapability,
+			secondAt.Add(time.Minute),
+		)
+		if err != nil {
+			t.Fatalf("IncrementTaskBlockRecurrence(first capability) error = %v", err)
+		}
+		assertTaskBlockRecurrence(
+			t,
+			incremented,
+			taskRecord.ID,
+			taskpkg.BlockKindCapability,
+			1,
+			secondAt.Add(time.Minute),
+		)
+		incremented, err = globalDB.IncrementTaskBlockRecurrence(
+			ctx,
+			taskRecord.ID,
+			taskpkg.BlockKindCapability,
+			secondAt.Add(2*time.Minute),
+		)
+		if err != nil {
+			t.Fatalf("IncrementTaskBlockRecurrence(second capability) error = %v", err)
+		}
+		assertTaskBlockRecurrence(
+			t,
+			incremented,
+			taskRecord.ID,
+			taskpkg.BlockKindCapability,
+			2,
+			secondAt.Add(2*time.Minute),
+		)
+
+		if err := globalDB.ResetTaskBlockRecurrences(ctx, taskRecord.ID); err != nil {
+			t.Fatalf("ResetTaskBlockRecurrences() error = %v", err)
+		}
+		for _, kind := range []taskpkg.BlockKind{taskpkg.BlockKindNeedsInput, taskpkg.BlockKindCapability} {
+			reset, err := globalDB.GetTaskBlockRecurrence(ctx, taskRecord.ID, kind)
+			if err != nil {
+				t.Fatalf("GetTaskBlockRecurrence(%s after reset) error = %v", kind, err)
+			}
+			if reset.Count != 0 {
+				t.Fatalf("recurrence count for %s after reset = %d, want 0", kind, reset.Count)
+			}
+		}
+		if _, err := globalDB.GetTaskBlockRecurrence(
+			ctx,
+			"task-block-recurrences-missing",
+			taskpkg.BlockKindNeedsInput,
+		); !errors.Is(err, taskpkg.ErrTaskNotFound) {
+			t.Fatalf("GetTaskBlockRecurrence(missing task) error = %v, want %v", err, taskpkg.ErrTaskNotFound)
+		}
+		if err := globalDB.ResetTaskBlockRecurrences(
+			ctx,
+			"task-block-recurrences-missing",
+		); !errors.Is(err, taskpkg.ErrTaskNotFound) {
+			t.Fatalf("ResetTaskBlockRecurrences(missing task) error = %v, want %v", err, taskpkg.ErrTaskNotFound)
+		}
+	})
+}
+
+func TestGlobalDBTaskNeedsAttentionAndWakeCreator(t *testing.T) {
+	t.Parallel()
+
+	t.Run("Should write clear attention metadata and preserve wake creator state", func(t *testing.T) {
+		t.Parallel()
+
+		globalDB := openTestGlobalDB(t)
+		ctx := testutil.Context(t)
+		workspaceID := registerWorkspaceForGlobalTests(
+			t,
+			globalDB,
+			"task-attention",
+			filepath.Join(t.TempDir(), "workspace"),
+		)
+		taskRecord := workspaceTaskRecordForTest("task-attention", workspaceID)
+		if err := globalDB.CreateTask(ctx, taskRecord); err != nil {
+			t.Fatalf("CreateTask() error = %v", err)
+		}
+
+		markedAt := time.Date(2026, 7, 3, 12, 0, 0, 0, time.UTC)
+		marked, err := globalDB.MarkTaskNeedsAttention(ctx, taskpkg.NeedsAttentionMutation{
+			Origin:   coordinatorActorContextForTest().Origin,
+			TaskID:   taskRecord.ID,
+			Reason:   "creator input required",
+			Actor:    taskpkg.ActorIdentity{Kind: taskpkg.ActorKindDaemon, Ref: "scheduler"},
+			MarkedAt: markedAt,
+		})
+		if err != nil {
+			t.Fatalf("MarkTaskNeedsAttention() error = %v", err)
+		}
+		if marked.NeedsAttention == nil {
+			t.Fatal("NeedsAttention = nil, want escalation metadata")
+		}
+		if got, want := marked.NeedsAttention.Reason, "creator input required"; got != want {
+			t.Fatalf("NeedsAttention.Reason = %q, want %q", got, want)
+		}
+		if !marked.NeedsAttention.At.Equal(markedAt) {
+			t.Fatalf("NeedsAttention.At = %v, want %v", marked.NeedsAttention.At, markedAt)
+		}
+		if got, want := marked.NeedsAttention.By, (taskpkg.ActorIdentity{Kind: taskpkg.ActorKindDaemon, Ref: "scheduler"}); got != want {
+			t.Fatalf("NeedsAttention.By = %#v, want %#v", got, want)
+		}
+		if !marked.WakeCreator {
+			t.Fatal("WakeCreator = false after create, want default true")
+		}
+
+		wakeDisabledAt := markedAt.Add(time.Minute)
+		wakeDisabled, err := globalDB.SetTaskWakeCreator(ctx, taskpkg.WakeCreatorMutation{
+			TaskID:      taskRecord.ID,
+			WakeCreator: false,
+			UpdatedAt:   wakeDisabledAt,
+		})
+		if err != nil {
+			t.Fatalf("SetTaskWakeCreator(false) error = %v", err)
+		}
+		if wakeDisabled.WakeCreator {
+			t.Fatal("WakeCreator = true, want false")
+		}
+		if !wakeDisabled.UpdatedAt.Equal(wakeDisabledAt) {
+			t.Fatalf("UpdatedAt after wake update = %v, want %v", wakeDisabled.UpdatedAt, wakeDisabledAt)
+		}
+
+		clearedAt := markedAt.Add(2 * time.Minute)
+		cleared, err := globalDB.ClearTaskNeedsAttention(ctx, taskpkg.NeedsAttentionClearMutation{
+			TaskID:    taskRecord.ID,
+			Actor:     operatorActorContextForTest("operator"),
+			ClearedAt: clearedAt,
+		})
+		if err != nil {
+			t.Fatalf("ClearTaskNeedsAttention() error = %v", err)
+		}
+		if cleared.Task.NeedsAttention != nil {
+			t.Fatalf("cleared NeedsAttention = %#v, want nil", cleared.Task.NeedsAttention)
+		}
+		if cleared.Task.WakeCreator {
+			t.Fatal("WakeCreator = true after attention clear, want unchanged false")
+		}
+		if !cleared.Task.UpdatedAt.Equal(clearedAt) {
+			t.Fatalf("UpdatedAt after attention clear = %v, want %v", cleared.Task.UpdatedAt, clearedAt)
+		}
+		if got, want := cleared.Event.Event.EventType, string(hookspkg.HookTaskRecovered); got != want {
+			t.Fatalf("recovered event type = %q, want %q", got, want)
+		}
+		persistedEvent, err := globalDB.GetTaskEventRecord(ctx, cleared.Event.Event.ID)
+		if err != nil {
+			t.Fatalf("GetTaskEventRecord(recovered) error = %v", err)
+		}
+		if !reflect.DeepEqual(persistedEvent, cleared.Event) {
+			t.Fatalf("persisted recovered event = %#v, want %#v", persistedEvent, cleared.Event)
+		}
+		_, err = globalDB.ClearTaskNeedsAttention(ctx, taskpkg.NeedsAttentionClearMutation{
+			TaskID:    taskRecord.ID,
+			Actor:     operatorActorContextForTest("operator"),
+			ClearedAt: clearedAt.Add(time.Minute),
+		})
+		if !errors.Is(err, taskpkg.ErrInvalidStatusTransition) {
+			t.Fatalf("ClearTaskNeedsAttention(second) error = %v, want ErrInvalidStatusTransition", err)
+		}
+	})
+}
+
+func TestGlobalDBBlockTaskAndReleaseRun(t *testing.T) {
+	t.Parallel()
+
+	t.Run("Should insert first block without recurrence and release run in one transaction", func(t *testing.T) {
+		t.Parallel()
+
+		globalDB := openTestGlobalDB(t)
+		ctx := testutil.Context(t)
+		now := time.Date(2026, 7, 3, 13, 0, 0, 0, time.UTC)
+		workspaceID := registerWorkspaceForGlobalTests(
+			t,
+			globalDB,
+			"block-release-success",
+			filepath.Join(t.TempDir(), "workspace"),
+		)
+		taskRecord := workspaceTaskRecordForTest("task-block-release-success", workspaceID)
+		taskRecord.Status = taskpkg.TaskStatusReady
+		if err := globalDB.CreateTask(ctx, taskRecord); err != nil {
+			t.Fatalf("CreateTask() error = %v", err)
+		}
+		rawToken := "compozy_claim_block_release_success"
+		leased := storeLeasedTaskRunForBlockTest(
+			ctx,
+			t,
+			globalDB,
+			taskRecord.ID,
+			"run-block-release-success",
+			"sess-block-release-success",
+			rawToken,
+			now.Add(10*time.Minute),
+		)
+
+		result, err := globalDB.BlockTaskAndReleaseRun(ctx, taskpkg.BlockTaskAndReleaseRunMutation{
+			Actor: coordinatorActorContextForTest(),
+			Block: taskpkg.TaskBlock{
+				ID:      "block-release-success",
+				TaskID:  taskRecord.ID,
+				Kind:    taskpkg.BlockKindCapability,
+				Reason:  "missing gpu capability",
+				Details: json.RawMessage(`{"capability_id":"gpu"}`),
+				CreatedBy: taskpkg.ActorIdentity{
+					Kind: taskpkg.ActorKindAgentSession,
+					Ref:  "sess-block-release-success",
+				},
+				CreatedAt: now,
+			},
+			RunID:      leased.ID,
+			ClaimToken: rawToken,
+			Now:        now,
+		})
+		if err != nil {
+			t.Fatalf("BlockTaskAndReleaseRun() error = %v", err)
+		}
+		if got, want := result.ReleaseReason, "blocked"; got != want {
+			t.Fatalf("ReleaseReason = %q, want %q", got, want)
+		}
+		if got, want := result.Block.WorkspaceID, workspaceID; got != want {
+			t.Fatalf("Block.WorkspaceID = %q, want %q", got, want)
+		}
+		if got, want := result.Recurrence.Count, 0; got != want {
+			t.Fatalf("Recurrence.Count = %d, want %d", got, want)
+		}
+		if got, want := result.Run.Status, taskpkg.TaskRunStatusQueued; got != want {
+			t.Fatalf("Run.Status = %q, want %q", got, want)
+		}
+		if got, want := result.Run.Attempt, leased.Attempt; got != want {
+			t.Fatalf("Run.Attempt = %d, want unchanged %d", got, want)
+		}
+		if result.Run.SessionID != "" || result.Run.ClaimedBy != nil ||
+			result.Run.ClaimTokenHash != "" || !result.Run.LeaseUntil.IsZero() {
+			t.Fatalf("released run retained lease fields: %#v", result.Run)
+		}
+		if got, want := result.PreviousRun.ID, leased.ID; got != want {
+			t.Fatalf("PreviousRun.ID = %q, want %q", got, want)
+		}
+		if got, want := result.ClaimTokenHash, leased.ClaimTokenHash; got != want {
+			t.Fatalf("ClaimTokenHash = %q, want %q", got, want)
+		}
+
+		storedTask, err := globalDB.GetTask(ctx, taskRecord.ID)
+		if err != nil {
+			t.Fatalf("GetTask() error = %v", err)
+		}
+		if storedTask.CurrentRunID != "" {
+			t.Fatalf("CurrentRunID = %q, want cleared", storedTask.CurrentRunID)
+		}
+		blocks, err := globalDB.ListTaskBlocks(ctx, taskRecord.ID, false)
+		if err != nil {
+			t.Fatalf("ListTaskBlocks() error = %v", err)
+		}
+		assertTaskBlockIDs(t, blocks, []string{result.Block.ID})
+	})
+
+	t.Run("Should block and release global task runs", func(t *testing.T) {
+		t.Parallel()
+
+		globalDB := openTestGlobalDB(t)
+		ctx := testutil.Context(t)
+		now := time.Date(2026, 7, 3, 14, 0, 0, 0, time.UTC)
+		taskRecord := taskRecordForTest("task-global-block-release")
+		taskRecord.Status = taskpkg.TaskStatusReady
+		if err := globalDB.CreateTask(ctx, taskRecord); err != nil {
+			t.Fatalf("CreateTask() error = %v", err)
+		}
+		rawToken := "compozy_claim_global_block_release"
+		leased := storeLeasedTaskRunForBlockTest(
+			ctx,
+			t,
+			globalDB,
+			taskRecord.ID,
+			"run-global-block-release",
+			"sess-global-block-release",
+			rawToken,
+			now.Add(10*time.Minute),
+		)
+
+		result, err := globalDB.BlockTaskAndReleaseRun(ctx, taskpkg.BlockTaskAndReleaseRunMutation{
+			Actor: coordinatorActorContextForTest(),
+			Block: taskpkg.TaskBlock{
+				ID:     "block-global-release",
+				TaskID: taskRecord.ID,
+				Kind:   taskpkg.BlockKindNeedsInput,
+				Reason: "global task needs input",
+				CreatedBy: taskpkg.ActorIdentity{
+					Kind: taskpkg.ActorKindAgentSession,
+					Ref:  "sess-global-block-release",
+				},
+				CreatedAt: now,
+			},
+			RunID:      leased.ID,
+			ClaimToken: rawToken,
+			Now:        now,
+		})
+		if err != nil {
+			t.Fatalf("BlockTaskAndReleaseRun(global) error = %v", err)
+		}
+		if got, want := result.Block.WorkspaceID, ""; got != want {
+			t.Fatalf("Block.WorkspaceID = %q, want global empty workspace", got)
+		}
+		if got, want := result.Run.Status, taskpkg.TaskRunStatusQueued; got != want {
+			t.Fatalf("Run.Status = %q, want %q", got, want)
+		}
+		if got, want := result.Run.Attempt, leased.Attempt; got != want {
+			t.Fatalf("Run.Attempt = %d, want unchanged %d", got, want)
+		}
+		open, err := globalDB.HasOpenTaskBlocks(ctx, taskRecord.ID)
+		if err != nil {
+			t.Fatalf("HasOpenTaskBlocks(open global) error = %v", err)
+		}
+		if !open {
+			t.Fatal("HasOpenTaskBlocks(open global) = false, want true")
+		}
+		blocks, err := globalDB.ListTaskBlocks(ctx, taskRecord.ID, false)
+		if err != nil {
+			t.Fatalf("ListTaskBlocks(global open) error = %v", err)
+		}
+		assertTaskBlockIDs(t, blocks, []string{result.Block.ID})
+
+		cleared, err := globalDB.ClearTaskBlock(ctx, taskpkg.ClearTaskBlockMutation{
+			TaskID:    taskRecord.ID,
+			BlockID:   result.Block.ID,
+			ClearedBy: taskpkg.ActorIdentity{Kind: taskpkg.ActorKindHuman, Ref: "user:operator"},
+			ClearedAt: now.Add(time.Minute),
+			Actor:     operatorActorContextForTest("user:operator"),
+		})
+		if err != nil {
+			t.Fatalf("ClearTaskBlock(global) error = %v", err)
+		}
+		if cleared.WorkspaceID != "" || cleared.ClearedAt.IsZero() {
+			t.Fatalf("cleared global block = %#v, want empty workspace and clear stamp", cleared)
+		}
+		open, err = globalDB.HasOpenTaskBlocks(ctx, taskRecord.ID)
+		if err != nil {
+			t.Fatalf("HasOpenTaskBlocks(cleared global) error = %v", err)
+		}
+		if open {
+			t.Fatal("HasOpenTaskBlocks(cleared global) = true, want false")
+		}
+	})
+
+	t.Run("Should serialize expired lease recovery against block release", func(t *testing.T) {
+		t.Parallel()
+
+		globalDB := openTestGlobalDB(t)
+		ctx := testutil.Context(t)
+		now := time.Date(2026, 7, 3, 15, 0, 0, 0, time.UTC)
+		workspaceID := registerWorkspaceForGlobalTests(
+			t,
+			globalDB,
+			"block-release-recovery-race",
+			filepath.Join(t.TempDir(), "workspace"),
+		)
+
+		for attempt := range 20 {
+			taskID := fmt.Sprintf("task-block-release-recovery-race-%02d", attempt)
+			runID := fmt.Sprintf("run-block-release-recovery-race-%02d", attempt)
+			blockID := fmt.Sprintf("block-release-recovery-race-%02d", attempt)
+			sessionID := fmt.Sprintf("sess-block-release-recovery-race-%02d", attempt)
+			rawToken := fmt.Sprintf("compozy_claim_block_release_recovery_race_%02d", attempt)
+
+			taskRecord := workspaceTaskRecordForTest(taskID, workspaceID)
+			taskRecord.Status = taskpkg.TaskStatusReady
+			if err := globalDB.CreateTask(ctx, taskRecord); err != nil {
+				t.Fatalf("CreateTask(%q) error = %v", taskID, err)
+			}
+			leased := storeLeasedTaskRunForBlockTest(
+				ctx,
+				t,
+				globalDB,
+				taskRecord.ID,
+				runID,
+				sessionID,
+				rawToken,
+				now.Add(time.Minute),
+			)
+
+			start := make(chan struct{})
+			var wg sync.WaitGroup
+			var blockResult taskpkg.BlockTaskAndReleaseRunResult
+			var blockErr error
+			var recovered []taskpkg.ExpiredLeaseRecoveryResult
+			var recoverErr error
+			wg.Add(2)
+			go func() {
+				defer wg.Done()
+				<-start
+				blockResult, blockErr = globalDB.BlockTaskAndReleaseRun(ctx, taskpkg.BlockTaskAndReleaseRunMutation{
+					Actor: coordinatorActorContextForTest(),
+					Block: taskpkg.TaskBlock{
+						ID:      blockID,
+						TaskID:  taskRecord.ID,
+						Kind:    taskpkg.BlockKindNeedsInput,
+						Reason:  "creator input required during recovery race",
+						Details: json.RawMessage(`{"race":"recovery"}`),
+						CreatedBy: taskpkg.ActorIdentity{
+							Kind: taskpkg.ActorKindAgentSession,
+							Ref:  sessionID,
+						},
+						CreatedAt: now,
+					},
+					RunID:      leased.ID,
+					ClaimToken: rawToken,
+					Now:        now,
+				})
+			}()
+			go func() {
+				defer wg.Done()
+				<-start
+				recovered, recoverErr = globalDB.RecoverExpiredRunLeases(ctx, taskpkg.ExpiredLeaseRecovery{
+					Now:    now.Add(2 * time.Minute),
+					Reason: string(taskpkg.AutonomyLeaseExpired),
+					Limit:  10,
+				})
+			}()
+			close(start)
+			wg.Wait()
+
+			if recoverErr != nil {
+				t.Fatalf("RecoverExpiredRunLeases(%d) error = %v", attempt, recoverErr)
+			}
+			if blockErr != nil &&
+				!errors.Is(blockErr, taskpkg.ErrInvalidClaimToken) &&
+				!errors.Is(blockErr, taskpkg.ErrInvalidStatusTransition) &&
+				!errors.Is(blockErr, taskpkg.ErrLeaseExpired) {
+				t.Fatalf("BlockTaskAndReleaseRun(%d) error = %v, want nil or lease race conflict", attempt, blockErr)
+			}
+			blockSucceeded := blockErr == nil
+			recoverSucceeded := len(recovered) > 0
+			if blockSucceeded && recoverSucceeded {
+				t.Fatalf(
+					"attempt %d double-released run: block=%#v recovered=%#v",
+					attempt,
+					blockResult.Run,
+					recovered,
+				)
+			}
+			if !blockSucceeded && !recoverSucceeded {
+				t.Fatalf("attempt %d neither block-release nor recovery won: blockErr=%v", attempt, blockErr)
+			}
+
+			blocks, err := globalDB.ListTaskBlocks(ctx, taskRecord.ID, true)
+			if err != nil {
+				t.Fatalf("ListTaskBlocks(%d) error = %v", attempt, err)
+			}
+			switch {
+			case blockSucceeded:
+				assertTaskBlockIDs(t, blocks, []string{blockResult.Block.ID})
+			case len(blocks) != 0:
+				t.Fatalf("attempt %d blocks = %#v, want none when recovery won", attempt, blocks)
+			}
+			storedRun, err := globalDB.GetTaskRun(ctx, leased.ID)
+			if err != nil {
+				t.Fatalf("GetTaskRun(%d) error = %v", attempt, err)
+			}
+			if storedRun.Status != taskpkg.TaskRunStatusQueued ||
+				storedRun.SessionID != "" ||
+				storedRun.ClaimTokenHash != "" ||
+				!storedRun.LeaseUntil.IsZero() {
+				t.Fatalf("attempt %d stored run = %#v, want queued with cleared lease", attempt, storedRun)
+			}
+		}
+	})
+
+	t.Run("Should reject claim token mismatch without changing run block or recurrence rows", func(t *testing.T) {
+		t.Parallel()
+
+		globalDB := openTestGlobalDB(t)
+		ctx := testutil.Context(t)
+		now := time.Date(2026, 7, 3, 14, 0, 0, 0, time.UTC)
+		workspaceID := registerWorkspaceForGlobalTests(
+			t,
+			globalDB,
+			"block-release-token-mismatch",
+			filepath.Join(t.TempDir(), "workspace"),
+		)
+		taskRecord := workspaceTaskRecordForTest("task-block-release-token-mismatch", workspaceID)
+		taskRecord.Status = taskpkg.TaskStatusReady
+		if err := globalDB.CreateTask(ctx, taskRecord); err != nil {
+			t.Fatalf("CreateTask() error = %v", err)
+		}
+		leased := storeLeasedTaskRunForBlockTest(
+			ctx,
+			t,
+			globalDB,
+			taskRecord.ID,
+			"run-block-release-token-mismatch",
+			"sess-block-release-token-mismatch",
+			"compozy_claim_block_release_token_mismatch",
+			now.Add(10*time.Minute),
+		)
+
+		_, err := globalDB.BlockTaskAndReleaseRun(ctx, taskpkg.BlockTaskAndReleaseRunMutation{
+			Actor: coordinatorActorContextForTest(),
+			Block: taskpkg.TaskBlock{
+				ID:     "block-token-mismatch",
+				TaskID: taskRecord.ID,
+				Kind:   taskpkg.BlockKindNeedsInput,
+				Reason: "needs creator input",
+				CreatedBy: taskpkg.ActorIdentity{
+					Kind: taskpkg.ActorKindAgentSession,
+					Ref:  "sess-block-release-token-mismatch",
+				},
+				CreatedAt: now,
+			},
+			RunID:      leased.ID,
+			ClaimToken: "compozy_claim_wrong_token",
+			Now:        now,
+		})
+		if !errors.Is(err, taskpkg.ErrInvalidClaimToken) {
+			t.Fatalf("BlockTaskAndReleaseRun(wrong token) error = %v, want %v", err, taskpkg.ErrInvalidClaimToken)
+		}
+
+		blocks, listErr := globalDB.ListTaskBlocks(ctx, taskRecord.ID, true)
+		if listErr != nil {
+			t.Fatalf("ListTaskBlocks(after rejection) error = %v", listErr)
+		}
+		if len(blocks) != 0 {
+			t.Fatalf("ListTaskBlocks(after rejection) = %#v, want empty", blocks)
+		}
+		recurrence, recurrenceErr := globalDB.GetTaskBlockRecurrence(ctx, taskRecord.ID, taskpkg.BlockKindNeedsInput)
+		if recurrenceErr != nil {
+			t.Fatalf("GetTaskBlockRecurrence(after rejection) error = %v", recurrenceErr)
+		}
+		if recurrence.Count != 0 {
+			t.Fatalf("recurrence count after rejection = %d, want 0", recurrence.Count)
+		}
+		storedRun, getRunErr := globalDB.GetTaskRun(ctx, leased.ID)
+		if getRunErr != nil {
+			t.Fatalf("GetTaskRun(after rejection) error = %v", getRunErr)
+		}
+		if got, want := storedRun.Status, taskpkg.TaskRunStatusClaimed; got != want {
+			t.Fatalf("stored run status = %q, want %q", got, want)
+		}
+		if got, want := storedRun.SessionID, leased.SessionID; got != want {
+			t.Fatalf("stored run session = %q, want %q", got, want)
+		}
+		if got, want := storedRun.ClaimTokenHash, leased.ClaimTokenHash; got != want {
+			t.Fatalf("stored run claim hash = %q, want %q", got, want)
+		}
+		storedTask, getTaskErr := globalDB.GetTask(ctx, taskRecord.ID)
+		if getTaskErr != nil {
+			t.Fatalf("GetTask(after rejection) error = %v", getTaskErr)
+		}
+		if got, want := storedTask.CurrentRunID, leased.ID; got != want {
+			t.Fatalf("CurrentRunID after rejection = %q, want %q", got, want)
+		}
+	})
+}
+
+func TestGlobalDBListTasksSearchAndActivityOrdering(t *testing.T) {
+	t.Parallel()
+
+	globalDB := openTestGlobalDB(t)
+
+	alpha := taskRecordForTest("task-search-alpha")
+	alpha.Title = "Alpha planning"
+	alpha.Identifier = "OPS-100"
+	alpha.UpdatedAt = alpha.UpdatedAt.Add(time.Minute)
+
+	beta := taskRecordForTest("task-search-beta")
+	beta.Title = "Beta rollout"
+	beta.Identifier = "OPS-200"
+	beta.CreatedAt = beta.CreatedAt.Add(2 * time.Minute)
+	beta.UpdatedAt = beta.UpdatedAt.Add(2 * time.Minute)
+
+	for _, record := range []taskpkg.Task{alpha, beta} {
+		if err := globalDB.CreateTask(testutil.Context(t), record); err != nil {
+			t.Fatalf("CreateTask(%q) error = %v", record.ID, err)
+		}
+	}
+	if err := globalDB.CreateTaskRun(testutil.Context(t), taskpkg.Run{
+		ID:        "run-search-beta",
+		TaskID:    beta.ID,
+		Status:    taskpkg.TaskRunStatusRunning,
+		Attempt:   1,
+		Origin:    taskpkg.Origin{Kind: taskpkg.OriginKindDaemon, Ref: "scheduler"},
+		QueuedAt:  time.Date(2026, 4, 17, 12, 0, 0, 0, time.UTC),
+		ProfileID: store.DefaultProfileID,
+		StartedAt: time.Date(2026, 4, 17, 12, 5, 0, 0, time.UTC),
+	}); err != nil {
+		t.Fatalf("CreateTaskRun() error = %v", err)
+	}
+
+	byTitle, err := globalDB.ListTasks(testutil.Context(t), taskpkg.Query{Search: "alpha"})
+	if err != nil {
+		t.Fatalf("ListTasks(search title) error = %v", err)
+	}
+	if got, want := orderedTaskSummaryIDs(byTitle), []string{alpha.ID}; !testutil.EqualStringSlices(got, want) {
+		t.Fatalf("ListTasks(search title) ids = %#v, want %#v", got, want)
+	}
+
+	byIdentifier, err := globalDB.ListTasks(testutil.Context(t), taskpkg.Query{Search: "ops-200"})
+	if err != nil {
+		t.Fatalf("ListTasks(search identifier) error = %v", err)
+	}
+	if got, want := orderedTaskSummaryIDs(byIdentifier), []string{beta.ID}; !testutil.EqualStringSlices(got, want) {
+		t.Fatalf("ListTasks(search identifier) ids = %#v, want %#v", got, want)
+	}
+
+	all, err := globalDB.ListTasks(testutil.Context(t), taskpkg.Query{})
+	if err != nil {
+		t.Fatalf("ListTasks(all) error = %v", err)
+	}
+	if got, want := orderedTaskSummaryIDs(all), []string{beta.ID, alpha.ID}; !testutil.EqualStringSlices(got, want) {
+		t.Fatalf("ListTasks(all) order = %#v, want %#v", got, want)
+	}
+}
+
+// Invariant: the catalog SQL derivation mirrors taskStatusFromPolicySnapshot —
+// completed and canceled coordinator pulses keep the umbrella task in_progress, and an
+// explicitly closed task keeps its persisted terminal status.
+func TestGlobalDBTaskCatalogCoordinatorPulseStaysInProgress(t *testing.T) {
+	t.Parallel()
+
+	insertCatalogRun := func(
+		ctx context.Context,
+		t *testing.T,
+		globalDB *GlobalDB,
+		id string,
+		taskID string,
+		runKind string,
+		status string,
+		attempt int,
+		queuedAt time.Time,
+	) {
+		t.Helper()
+		loopRunID := ""
+		if runKind == "coordinator" {
+			loopRunID = "looprun-catalog-test"
+		}
+		if _, err := globalDB.db.ExecContext(
+			ctx,
+			`INSERT INTO task_runs (id, task_id, status, run_kind, attempt, origin_kind, origin_ref, queued_at, loop_run_id)
+			 VALUES (?, ?, ?, ?, ?, 'daemon', 'test', ?, NULLIF(?, ''))`,
+			id,
+			taskID,
+			status,
+			runKind,
+			attempt,
+			store.FormatTimestamp(queuedAt),
+			loopRunID,
+		); err != nil {
+			t.Fatalf("insert run %q error = %v", id, err)
+		}
+	}
+
+	t.Run("Should keep the umbrella task in progress after coordinator pulses", func(t *testing.T) {
+		t.Parallel()
+
+		globalDB := openTestGlobalDB(t)
+		ctx := testutil.Context(t)
+		now := time.Date(2026, 8, 6, 10, 0, 0, 0, time.UTC)
+
+		umbrella := taskRecordForTest("task-catalog-coordinator")
+		umbrella.Status = taskpkg.TaskStatusInProgress
+		if err := globalDB.CreateTask(ctx, umbrella); err != nil {
+			t.Fatalf("CreateTask(umbrella) error = %v", err)
+		}
+		insertCatalogRun(ctx, t, globalDB, "run-pulse-1", umbrella.ID, "coordinator", "completed", 1, now)
+		insertCatalogRun(
+			ctx, t, globalDB, "run-pulse-2", umbrella.ID, "coordinator", "completed", 2, now.Add(time.Minute),
+		)
+
+		canceledUmbrella := taskRecordForTest("task-catalog-coordinator-canceled")
+		canceledUmbrella.Status = taskpkg.TaskStatusInProgress
+		if err := globalDB.CreateTask(ctx, canceledUmbrella); err != nil {
+			t.Fatalf("CreateTask(canceled umbrella) error = %v", err)
+		}
+		insertCatalogRun(
+			ctx,
+			t,
+			globalDB,
+			"run-pulse-canceled",
+			canceledUmbrella.ID,
+			"coordinator",
+			"canceled",
+			3,
+			now.Add(2*time.Minute),
+		)
+
+		worker := taskRecordForTest("task-catalog-worker")
+		worker.Status = taskpkg.TaskStatusInProgress
+		if err := globalDB.CreateTask(ctx, worker); err != nil {
+			t.Fatalf("CreateTask(worker) error = %v", err)
+		}
+		insertCatalogRun(ctx, t, globalDB, "run-worker-1", worker.ID, "worker", "completed", 1, now)
+
+		canceledWorker := taskRecordForTest("task-catalog-worker-canceled")
+		canceledWorker.Status = taskpkg.TaskStatusInProgress
+		if err := globalDB.CreateTask(ctx, canceledWorker); err != nil {
+			t.Fatalf("CreateTask(canceled worker) error = %v", err)
+		}
+		insertCatalogRun(
+			ctx, t, globalDB, "run-worker-canceled", canceledWorker.ID, "worker", "canceled", 1, now,
+		)
+
+		closed := taskRecordForTest("task-catalog-closed")
+		closed.Status = taskpkg.TaskStatusCompleted
+		if err := globalDB.CreateTask(ctx, closed); err != nil {
+			t.Fatalf("CreateTask(closed) error = %v", err)
+		}
+		insertCatalogRun(ctx, t, globalDB, "run-closed-1", closed.ID, "coordinator", "completed", 6, now)
+
+		page, err := globalDB.ListTaskCatalog(
+			ctx,
+			taskpkg.CatalogQuery{ReadScope: store.ReadScope{ProfileID: store.DefaultProfileID},
+				Scope: taskpkg.CatalogScopeGlobal,
+				Limit: 10,
+			},
+		)
+		if err != nil {
+			t.Fatalf("ListTaskCatalog() error = %v", err)
+		}
+		statusByID := make(map[string]taskpkg.Status, len(page.Tasks))
+		for _, summary := range page.Tasks {
+			statusByID[summary.ID] = summary.Status
+		}
+		if got := statusByID[umbrella.ID]; got != taskpkg.TaskStatusInProgress {
+			t.Fatalf("coordinator umbrella status = %q, want in_progress from a completed pulse", got)
+		}
+		if got := statusByID[canceledUmbrella.ID]; got != taskpkg.TaskStatusInProgress {
+			t.Fatalf("canceled coordinator umbrella status = %q, want in_progress from a canceled pulse", got)
+		}
+		if got := statusByID[worker.ID]; got != taskpkg.TaskStatusCompleted {
+			t.Fatalf("worker status = %q, want completed from its terminal run", got)
+		}
+		if got := statusByID[canceledWorker.ID]; got != taskpkg.TaskStatusCanceled {
+			t.Fatalf("canceled worker status = %q, want canceled from its terminal run", got)
+		}
+		if got := statusByID[closed.ID]; got != taskpkg.TaskStatusCompleted {
+			t.Fatalf("closed umbrella status = %q, want persisted completed", got)
+		}
+
+		// Equivalence gate: the catalog's SQL projection must agree with the Go
+		// canonical derivation for every task, or the list view silently forks
+		// from detail and stream reads.
+		manager, err := taskpkg.NewManager(
+			taskpkg.WithStore(globalDB),
+			taskpkg.WithManagerNow(func() time.Time { return now.Add(time.Hour) }),
+		)
+		if err != nil {
+			t.Fatalf("task.NewManager() error = %v", err)
+		}
+		actor, err := taskpkg.DeriveDaemonActorContext("catalog-test", "daemon.catalog-test")
+		if err != nil {
+			t.Fatalf("DeriveDaemonActorContext() error = %v", err)
+		}
+		canonical, err := manager.ListTasks(ctx, taskpkg.Query{}, actor)
+		if err != nil {
+			t.Fatalf("ListTasks() error = %v", err)
+		}
+		for _, summary := range canonical {
+			catalogStatus, found := statusByID[summary.ID]
+			if !found {
+				continue
+			}
+			if catalogStatus != summary.Status {
+				t.Fatalf(
+					"catalog/canonical divergence for %q: catalog=%q canonical=%q",
+					summary.ID, catalogStatus, summary.Status,
+				)
+			}
+		}
+	})
+}
+
+func TestGlobalDBTaskCatalogPaginationAndFacets(t *testing.T) {
+	t.Parallel()
+
+	t.Run("Should preserve activity across nullable run timestamps and stable page boundaries", func(t *testing.T) {
+		t.Parallel()
+
+		db := openTestGlobalDB(t)
+		ctx := testutil.Context(t)
+		base := time.Date(2026, 10, 17, 12, 0, 0, 0, time.UTC)
+		cases := []struct {
+			id       string
+			status   taskpkg.RunStatus
+			times    [4]int
+			updated  int
+			activity int
+			want     taskpkg.Status
+		}{
+			{id: "no-runs", times: [4]int{-1, -1, -1, -1}, want: taskpkg.TaskStatusReady},
+			{id: "queued", status: taskpkg.TaskRunStatusQueued, times: [4]int{1, -1, -1, -1}, activity: 1,
+				want: taskpkg.TaskStatusReady},
+			{id: "claimed", status: taskpkg.TaskRunStatusClaimed, times: [4]int{1, 3, -1, -1}, activity: 3,
+				want: taskpkg.TaskStatusReady},
+			{id: "started", status: taskpkg.TaskRunStatusRunning, times: [4]int{1, 3, 5, -1}, activity: 5,
+				want: taskpkg.TaskStatusInProgress},
+			{id: "completed", status: taskpkg.TaskRunStatusCompleted, times: [4]int{1, 3, 5, 7}, activity: 7,
+				want: taskpkg.TaskStatusCompleted},
+			{id: "canceled", status: taskpkg.TaskRunStatusCanceled, times: [4]int{1, -1, -1, 9}, activity: 9,
+				want: taskpkg.TaskStatusCanceled},
+			{id: "historical", status: taskpkg.TaskRunStatusFailed, times: [4]int{1, 3, 5, 11}, activity: 11,
+				want: taskpkg.TaskStatusReady},
+			{id: "task-update", status: taskpkg.TaskRunStatusCompleted, times: [4]int{1, 3, 5, 7},
+				updated: 13, activity: 13, want: taskpkg.TaskStatusCompleted},
+		}
+		for _, item := range cases {
+			record := taskRecordForTest(item.id)
+			record.Status = taskpkg.TaskStatusReady
+			record.CreatedAt = base
+			record.UpdatedAt = base.Add(time.Duration(item.updated) * time.Minute)
+			if err := db.CreateTask(ctx, record); err != nil {
+				t.Fatalf("CreateTask(%s): %v", item.id, err)
+			}
+			if item.status == taskpkg.TaskRunStatusUnknown {
+				continue
+			}
+			run := taskRunForTest("run-"+item.id, item.id)
+			run.Status = item.status
+			for index, target := range []*time.Time{&run.QueuedAt, &run.ClaimedAt, &run.StartedAt, &run.EndedAt} {
+				if item.times[index] >= 0 {
+					*target = base.Add(time.Duration(item.times[index]) * time.Minute)
+				}
+			}
+			if err := db.CreateTaskRun(ctx, run); err != nil {
+				t.Fatalf("CreateTaskRun(%s): %v", item.id, err)
+			}
+		}
+		retry := taskRunForTest("run-historical-retry", "historical")
+		retry.Attempt = 2
+		retry.QueuedAt = base.Add(2 * time.Minute)
+		if err := db.CreateTaskRun(ctx, retry); err != nil {
+			t.Fatalf("CreateTaskRun(retry): %v", err)
+		}
+
+		query := taskpkg.CatalogQuery{ReadScope: store.ReadScope{ProfileID: store.DefaultProfileID}, Limit: 2}
+		seen := 0
+		for {
+			page, err := db.ListTaskCatalog(ctx, query)
+			if err != nil {
+				t.Fatalf("ListTaskCatalog(): %v", err)
+			}
+			if page.Total != len(cases) || len(page.Tasks) != 2 {
+				t.Fatalf("page totals = %d, %d, want %d, 2", page.Total, len(page.Tasks), len(cases))
+			}
+			for _, item := range page.Tasks {
+				want := cases[len(cases)-1-seen]
+				if item.ID != want.id || item.Status != want.want ||
+					!item.LastActivityAt.Equal(base.Add(time.Duration(want.activity)*time.Minute)) {
+					t.Fatalf(
+						"catalog item = %#v, want id=%s status=%s activity=%d",
+						item,
+						want.id,
+						want.want,
+						want.activity,
+					)
+				}
+				seen++
+			}
+			if !page.HasMore {
+				break
+			}
+			query.Cursor = page.NextCursor
+		}
+		if seen != len(cases) {
+			t.Fatalf("read %d tasks, want %d", seen, len(cases))
+		}
+	})
+
+	t.Run("Should normalize an empty migrated resolved worktree mode to workspace root", func(t *testing.T) {
+		t.Parallel()
+
+		globalDB := openTestGlobalDB(t)
+		ctx := testutil.Context(t)
+		record := taskRecordForTest("task-catalog-migrated-root")
+		if err := globalDB.CreateTask(ctx, record); err != nil {
+			t.Fatalf("CreateTask() error = %v", err)
+		}
+		run := taskRunForTest("run-catalog-migrated-root", record.ID)
+		if err := globalDB.CreateTaskRun(ctx, run); err != nil {
+			t.Fatalf("CreateTaskRun() error = %v", err)
+		}
+		if _, err := globalDB.db.ExecContext(
+			ctx,
+			`UPDATE task_runs SET resolved_worktree_mode = '' WHERE id = ?`,
+			run.ID,
+		); err != nil {
+			t.Fatalf("seed migrated run mode: %v", err)
+		}
+
+		page, err := globalDB.ListTaskCatalog(
+			ctx,
+			taskpkg.CatalogQuery{ReadScope: store.ReadScope{ProfileID: store.DefaultProfileID}, IncludeDrafts: true},
+		)
+		if err != nil {
+			t.Fatalf("ListTaskCatalog() error = %v", err)
+		}
+		if len(page.Tasks) != 1 || page.Tasks[0].ActiveRun == nil {
+			t.Fatalf("ListTaskCatalog() = %#v, want one active run", page.Tasks)
+		}
+		if got, want := page.Tasks[0].ActiveRun.ResolvedWorktreeMode, taskpkg.WorktreeModeNone; got != want {
+			t.Fatalf("ResolvedWorktreeMode = %q, want %q", got, want)
+		}
+	})
+
+	t.Run("Should filter active run worktrees before counts and page cuts", func(t *testing.T) {
+		t.Parallel()
+
+		globalDB := openTestGlobalDB(t)
+		ctx := testutil.Context(t)
+		workspaceID := registerWorkspaceForGlobalTests(t, globalDB, "catalog-worktrees", t.TempDir())
+		now := time.Date(2026, 8, 12, 18, 0, 0, 0, time.UTC)
+		worktrees := []worktreepkg.Worktree{
+			{
+				ID: "wt-catalog-alpha", ProfileID: store.DefaultProfileID,
+				WorkspaceID: workspaceID, Name: "alpha", Branch: "feature/alpha",
+				Path: filepath.Join(t.TempDir(), "alpha"), State: worktreepkg.StateReady,
+				Origin: worktreepkg.OriginManual, SetupState: worktreepkg.SetupNone,
+				CreatedAt: now, UpdatedAt: now,
+			},
+			{
+				ID: "wt-catalog-beta", ProfileID: store.DefaultProfileID,
+				WorkspaceID: workspaceID, Name: "beta", Branch: "feature/beta",
+				Path: filepath.Join(t.TempDir(), "beta"), State: worktreepkg.StateReady,
+				Origin: worktreepkg.OriginManual, SetupState: worktreepkg.SetupNone,
+				CreatedAt: now, UpdatedAt: now,
+			},
+		}
+		for _, item := range worktrees {
+			if err := globalDB.Worktrees.Insert(ctx, item); err != nil {
+				t.Fatalf("Insert(%q) error = %v", item.ID, err)
+			}
+		}
+
+		bindings := []struct {
+			taskID      string
+			worktreeID  string
+			worktreeRef string
+		}{
+			{taskID: "task-worktree-alpha-1", worktreeID: worktrees[0].ID, worktreeRef: worktrees[0].Name},
+			{taskID: "task-worktree-alpha-2", worktreeID: worktrees[0].ID, worktreeRef: worktrees[0].Name},
+			{taskID: "task-worktree-beta", worktreeID: worktrees[1].ID, worktreeRef: worktrees[1].Name},
+		}
+		for index, binding := range bindings {
+			record := taskRecordForTest(binding.taskID)
+			record.Scope = taskpkg.ScopeWorkspace
+			record.WorkspaceID = workspaceID
+			record.Owner = &taskpkg.Ownership{Kind: taskpkg.OwnerKindHuman, Ref: "user:alice"}
+			record.UpdatedAt = now.Add(time.Duration(index) * time.Minute)
+			if err := globalDB.CreateTask(ctx, record); err != nil {
+				t.Fatalf("CreateTask(%q) error = %v", record.ID, err)
+			}
+			run := taskRunForTest("run-"+binding.taskID, binding.taskID)
+			run.WorkspaceID = workspaceID
+			run.SetWorktreeState(binding.worktreeID, taskpkg.WorktreeModeRef, binding.worktreeRef)
+			if err := globalDB.CreateTaskRun(ctx, run); err != nil {
+				t.Fatalf("CreateTaskRun(%q) error = %v", run.ID, err)
+			}
+		}
+		fanout := taskRunForTest("run-task-worktree-alpha-1-beta", "task-worktree-alpha-1")
+		fanout.WorkspaceID = workspaceID
+		fanout.Attempt = 2
+		fanout.QueuedAt = now.Add(time.Hour)
+		fanout.SetWorktreeState(worktrees[1].ID, taskpkg.WorktreeModeRef, worktrees[1].Name)
+		if err := globalDB.CreateTaskRun(ctx, fanout); err != nil {
+			t.Fatalf("CreateTaskRun(fanout) error = %v", err)
+		}
+
+		query := taskpkg.CatalogQuery{ReadScope: store.ReadScope{ProfileID: store.DefaultProfileID},
+			Scope:         taskpkg.CatalogScopeWorkspace,
+			WorkspaceID:   workspaceID,
+			WorktreeID:    worktrees[0].ID,
+			IncludeDrafts: true,
+			Limit:         1,
+		}
+		first, err := globalDB.ListTaskCatalog(ctx, query)
+		if err != nil {
+			t.Fatalf("ListTaskCatalog(first) error = %v", err)
+		}
+		if first.Total != 2 || !first.HasMore || first.NextCursor == "" || len(first.Tasks) != 1 {
+			t.Fatalf("ListTaskCatalog(first) = %#v, want one of two filtered tasks with continuation", first)
+		}
+		if first.Tasks[0].ActiveRun == nil {
+			t.Fatalf("ListTaskCatalog(first).ActiveRun = nil")
+		}
+		facetTotal := 0
+		for _, facet := range first.StatusFacets {
+			facetTotal += facet.Count
+		}
+		if facetTotal != 2 {
+			t.Fatalf("ListTaskCatalog(first).StatusFacets total = %d, want 2", facetTotal)
+		}
+
+		query.Cursor = first.NextCursor
+		second, err := globalDB.ListTaskCatalog(ctx, query)
+		if err != nil {
+			t.Fatalf("ListTaskCatalog(second) error = %v", err)
+		}
+		if second.Total != 2 || second.HasMore || second.NextCursor != "" || len(second.Tasks) != 1 {
+			t.Fatalf("ListTaskCatalog(second) = %#v, want final filtered task", second)
+		}
+		if second.Tasks[0].ActiveRun == nil {
+			t.Fatalf("ListTaskCatalog(second).ActiveRun = nil")
+		}
+		seenTaskIDs := map[string]bool{first.Tasks[0].ID: true, second.Tasks[0].ID: true}
+		if !seenTaskIDs["task-worktree-alpha-1"] || !seenTaskIDs["task-worktree-alpha-2"] {
+			t.Fatalf("worktree-filtered task ids = %#v, want both alpha tasks including fan-out", seenTaskIDs)
+		}
+
+		mismatch := query
+		mismatch.Cursor = first.NextCursor
+		mismatch.WorktreeID = worktrees[1].ID
+		if _, err := globalDB.ListTaskCatalog(ctx, mismatch); !errors.Is(err, taskpkg.ErrCatalogCursorInvalid) {
+			t.Fatalf("ListTaskCatalog(cross-worktree cursor) error = %v, want %v", err, taskpkg.ErrCatalogCursorInvalid)
+		}
+
+		inbox, err := globalDB.ListTaskInbox(ctx, taskpkg.InboxQuery{
+			ReadScope:   store.ReadScope{ProfileID: store.DefaultProfileID},
+			Scope:       taskpkg.CatalogScopeWorkspace,
+			WorkspaceID: workspaceID,
+			WorktreeID:  worktrees[0].ID,
+		}, taskpkg.ActorIdentity{Kind: taskpkg.ActorKindHuman, Ref: "user:alice"})
+		if err != nil {
+			t.Fatalf("ListTaskInbox(worktree) error = %v", err)
+		}
+		if got, want := inbox.Total, 2; got != want {
+			t.Fatalf("ListTaskInbox(worktree).Total = %d, want %d", got, want)
+		}
+	})
+
+	t.Run("Should filter and count the complete catalog before the page cut", func(t *testing.T) {
+		t.Parallel()
+
+		globalDB := openTestGlobalDB(t)
+		ctx := testutil.Context(t)
+		base := time.Date(2026, 7, 10, 12, 0, 0, 0, time.UTC)
+		for index := range 125 {
+			record := taskRecordForTest(fmt.Sprintf("task-catalog-%03d", index))
+			record.UpdatedAt = base.Add(time.Duration(index) * time.Second)
+			record.Priority = taskpkg.PriorityLow
+			if index%2 == 0 {
+				record.Owner = &taskpkg.Ownership{Kind: taskpkg.OwnerKindHuman, Ref: "user:alice"}
+			} else {
+				record.Owner = &taskpkg.Ownership{Kind: taskpkg.OwnerKindHuman, Ref: "user:bob"}
+			}
+			if index == 3 {
+				record.Status = taskpkg.TaskStatusDraft
+			}
+			if index == 7 {
+				record.Status = taskpkg.TaskStatusBlocked
+				record.Priority = taskpkg.PriorityUrgent
+			}
+			if index == 121 {
+				record.Title = "Needle beyond the former prefix"
+				record.Priority = taskpkg.PriorityHigh
+			}
+			if err := globalDB.CreateTask(ctx, record); err != nil {
+				t.Fatalf("CreateTask(%q) error = %v", record.ID, err)
+			}
+		}
+
+		page, err := globalDB.ListTaskCatalog(
+			ctx,
+			taskpkg.CatalogQuery{ReadScope: store.ReadScope{ProfileID: store.DefaultProfileID},
+				Scope:         taskpkg.CatalogScopeGlobal,
+				Search:        "needle",
+				IncludeDrafts: true,
+				Limit:         5,
+			},
+		)
+		if err != nil {
+			t.Fatalf("ListTaskCatalog(search) error = %v", err)
+		}
+		if got, want := page.Total, 1; got != want {
+			t.Fatalf("ListTaskCatalog(search).Total = %d, want %d", got, want)
+		}
+		if got, want := orderedTaskSummaryIDs(page.Tasks), []string{"task-catalog-121"}; !testutil.EqualStringSlices(
+			got,
+			want,
+		) {
+			t.Fatalf("ListTaskCatalog(search) ids = %#v, want %#v", got, want)
+		}
+		if got, want := page.StatusFacets, []taskpkg.CatalogStatusFacet{{
+			Status: taskpkg.TaskStatusReady,
+			Count:  1,
+		}}; !equalTaskCatalogStatusFacets(got, want) {
+			t.Fatalf("ListTaskCatalog(search).StatusFacets = %#v, want %#v", got, want)
+		}
+
+		counting := &countingTaskCatalogExecutor{taskSQLExecutor: globalDB.db}
+		normalized, err := taskpkg.NormalizeCatalogQuery(
+			taskpkg.CatalogQuery{ReadScope: store.ReadScope{ProfileID: store.DefaultProfileID},
+				Scope:         taskpkg.CatalogScopeGlobal,
+				IncludeDrafts: true,
+				Limit:         10,
+			},
+		)
+		if err != nil {
+			t.Fatalf("NormalizeCatalogQuery() error = %v", err)
+		}
+		countedPage, err := listTaskCatalogWithExecutor(ctx, counting, normalized)
+		if err != nil {
+			t.Fatalf("listTaskCatalogWithExecutor() error = %v", err)
+		}
+		if got, want := counting.reads, 2; got != want {
+			t.Fatalf("task catalog read statements = %d, want constant %d", got, want)
+		}
+		if got, want := countedPage.Total, 125; got != want {
+			t.Fatalf("listTaskCatalogWithExecutor().Total = %d, want %d", got, want)
+		}
+	})
+
+	t.Run("Should page without gaps after the captured anchor changes", func(t *testing.T) {
+		t.Parallel()
+
+		globalDB := openTestGlobalDB(t)
+		ctx := testutil.Context(t)
+		base := time.Date(2026, 7, 10, 13, 0, 0, 0, time.UTC)
+		for index := range 17 {
+			record := taskRecordForTest(fmt.Sprintf("task-cursor-%02d", index))
+			record.UpdatedAt = base.Add(time.Duration(index) * time.Second)
+			record.Priority = []taskpkg.Priority{
+				taskpkg.PriorityLow,
+				taskpkg.PriorityMedium,
+				taskpkg.PriorityHigh,
+				taskpkg.PriorityUrgent,
+			}[index%4]
+			if err := globalDB.CreateTask(ctx, record); err != nil {
+				t.Fatalf("CreateTask(%q) error = %v", record.ID, err)
+			}
+		}
+
+		query := taskpkg.CatalogQuery{ReadScope: store.ReadScope{ProfileID: store.DefaultProfileID},
+			Scope:         taskpkg.CatalogScopeGlobal,
+			IncludeDrafts: true,
+			Sort:          taskpkg.CatalogSortPriority,
+			Limit:         4,
+		}
+		first, err := globalDB.ListTaskCatalog(ctx, query)
+		if err != nil {
+			t.Fatalf("ListTaskCatalog(first) error = %v", err)
+		}
+		if !first.HasMore || first.NextCursor == "" {
+			t.Fatalf("ListTaskCatalog(first) page = %#v, want continuation", first)
+		}
+		anchorID := first.Tasks[len(first.Tasks)-1].ID
+		if _, err := globalDB.db.ExecContext(
+			ctx,
+			`UPDATE tasks SET updated_at = ? WHERE id = ?`,
+			store.FormatTimestamp(base.Add(24*time.Hour)),
+			anchorID,
+		); err != nil {
+			t.Fatalf("move catalog anchor error = %v", err)
+		}
+
+		seen := make(map[string]struct{}, 17)
+		for _, item := range first.Tasks {
+			seen[item.ID] = struct{}{}
+		}
+		query.Cursor = first.NextCursor
+		for query.Cursor != "" {
+			page, pageErr := globalDB.ListTaskCatalog(ctx, query)
+			if pageErr != nil {
+				t.Fatalf("ListTaskCatalog(next) error = %v", pageErr)
+			}
+			for _, item := range page.Tasks {
+				if _, duplicate := seen[item.ID]; duplicate {
+					t.Fatalf("ListTaskCatalog() duplicated task %q", item.ID)
+				}
+				seen[item.ID] = struct{}{}
+			}
+			query.Cursor = page.NextCursor
+		}
+		if got, want := len(seen), 17; got != want {
+			t.Fatalf("unique paged tasks = %d, want %d", got, want)
+		}
+
+		mismatch := query
+		mismatch.Cursor = first.NextCursor
+		mismatch.Search = "different"
+		if _, err := globalDB.ListTaskCatalog(ctx, mismatch); !errors.Is(err, taskpkg.ErrCatalogCursorInvalid) {
+			t.Fatalf("ListTaskCatalog(mismatched cursor) error = %v, want %v", err, taskpkg.ErrCatalogCursorInvalid)
+		}
+	})
+
+	t.Run("Should derive canonical status before filters and self-filtered facets", func(t *testing.T) {
+		t.Parallel()
+
+		globalDB := openTestGlobalDB(t)
+		ctx := testutil.Context(t)
+		base := time.Date(2026, 7, 10, 14, 0, 0, 0, time.UTC)
+
+		running := taskRecordForTest("task-canonical-running")
+		running.Status = taskpkg.TaskStatusReady
+		running.Owner = &taskpkg.Ownership{Kind: taskpkg.OwnerKindHuman, Ref: "user:alice"}
+		running.UpdatedAt = base
+		if err := globalDB.CreateTask(ctx, running); err != nil {
+			t.Fatalf("CreateTask(running) error = %v", err)
+		}
+		run := taskRunForTest("run-canonical-running", running.ID)
+		run.QueuedAt = base.Add(time.Minute)
+		if err := globalDB.CreateTaskRun(ctx, run); err != nil {
+			t.Fatalf("CreateTaskRun(running) error = %v", err)
+		}
+		if _, err := globalDB.db.ExecContext(
+			ctx,
+			`UPDATE task_runs
+			 SET status = 'running', claimed_by_kind = 'daemon', claimed_by_ref = 'scheduler',
+			     session_id = 'sess-canonical-running', claimed_at = ?, started_at = ?
+			 WHERE id = ?`,
+			store.FormatTimestamp(base.Add(2*time.Minute)),
+			store.FormatTimestamp(base.Add(3*time.Minute)),
+			run.ID,
+		); err != nil {
+			t.Fatalf("promote canonical running run error = %v", err)
+		}
+
+		paused := taskRecordForTest("task-canonical-paused")
+		paused.Status = taskpkg.TaskStatusReady
+		paused.Owner = &taskpkg.Ownership{Kind: taskpkg.OwnerKindHuman, Ref: "user:alice"}
+		paused.Paused = true
+		paused.PausedBy = "user:alice"
+		paused.PausedAt = base.Add(4 * time.Minute)
+		paused.PausedReason = "operator pause"
+		paused.UpdatedAt = base.Add(4 * time.Minute)
+		if err := globalDB.CreateTask(ctx, paused); err != nil {
+			t.Fatalf("CreateTask(paused) error = %v", err)
+		}
+
+		dependency := taskRecordForTest("task-canonical-dependency")
+		dependency.Status = taskpkg.TaskStatusPending
+		dependency.Owner = &taskpkg.Ownership{Kind: taskpkg.OwnerKindHuman, Ref: "user:bob"}
+		dependency.UpdatedAt = base.Add(5 * time.Minute)
+		if err := globalDB.CreateTask(ctx, dependency); err != nil {
+			t.Fatalf("CreateTask(dependency) error = %v", err)
+		}
+		dependent := taskRecordForTest("task-canonical-dependent")
+		dependent.Status = taskpkg.TaskStatusReady
+		dependent.Owner = &taskpkg.Ownership{Kind: taskpkg.OwnerKindHuman, Ref: "user:bob"}
+		dependent.UpdatedAt = base.Add(6 * time.Minute)
+		if err := globalDB.CreateTask(ctx, dependent); err != nil {
+			t.Fatalf("CreateTask(dependent) error = %v", err)
+		}
+		if err := globalDB.CreateDependency(ctx, taskpkg.Dependency{
+			TaskID:          dependent.ID,
+			DependsOnTaskID: dependency.ID,
+			Kind:            taskpkg.DependencyKindBlocks,
+			CreatedAt:       base.Add(7 * time.Minute),
+		}); err != nil {
+			t.Fatalf("CreateDependency() error = %v", err)
+		}
+		completedDependency := taskRecordForTest("task-canonical-completed-dependency")
+		completedDependency.Status = taskpkg.TaskStatusReady
+		completedDependency.Owner = &taskpkg.Ownership{Kind: taskpkg.OwnerKindHuman, Ref: "user:bob"}
+		completedDependency.UpdatedAt = base.Add(8 * time.Minute)
+		if err := globalDB.CreateTask(ctx, completedDependency); err != nil {
+			t.Fatalf("CreateTask(completed dependency) error = %v", err)
+		}
+		completedRun := taskRunForTest("run-canonical-completed-dependency", completedDependency.ID)
+		completedRun.Status = taskpkg.TaskRunStatusCompleted
+		completedRun.StartedAt = base.Add(9 * time.Minute)
+		completedRun.EndedAt = base.Add(10 * time.Minute)
+		if err := globalDB.CreateTaskRun(ctx, completedRun); err != nil {
+			t.Fatalf("CreateTaskRun(completed dependency) error = %v", err)
+		}
+		released := taskRecordForTest("task-canonical-released-dependent")
+		released.Title = "Released by canonical dependency completion"
+		released.Status = taskpkg.TaskStatusReady
+		released.Owner = &taskpkg.Ownership{Kind: taskpkg.OwnerKindHuman, Ref: "user:bob"}
+		released.UpdatedAt = base.Add(11 * time.Minute)
+		if err := globalDB.CreateTask(ctx, released); err != nil {
+			t.Fatalf("CreateTask(released dependent) error = %v", err)
+		}
+		if err := globalDB.CreateDependency(ctx, taskpkg.Dependency{
+			TaskID:          released.ID,
+			DependsOnTaskID: completedDependency.ID,
+			Kind:            taskpkg.DependencyKindBlocks,
+			CreatedAt:       base.Add(12 * time.Minute),
+		}); err != nil {
+			t.Fatalf("CreateDependency(released) error = %v", err)
+		}
+
+		inProgress, err := globalDB.ListTaskCatalog(
+			ctx,
+			taskpkg.CatalogQuery{ReadScope: store.ReadScope{ProfileID: store.DefaultProfileID},
+				Scope:         taskpkg.CatalogScopeGlobal,
+				Status:        taskpkg.TaskStatusInProgress,
+				IncludeDrafts: true,
+			},
+		)
+		if err != nil {
+			t.Fatalf("ListTaskCatalog(in_progress) error = %v", err)
+		}
+		if got, want := orderedTaskSummaryIDs(inProgress.Tasks), []string{running.ID}; !testutil.EqualStringSlices(
+			got,
+			want,
+		) {
+			t.Fatalf("in-progress ids = %#v, want %#v", got, want)
+		}
+		if got, want := inProgress.StatusFacets, []taskpkg.CatalogStatusFacet{{
+			Status: taskpkg.TaskStatusInProgress,
+			Count:  1,
+		}}; !equalTaskCatalogStatusFacets(got, want) {
+			t.Fatalf("in-progress status facets = %#v, want %#v", got, want)
+		}
+
+		blocked, err := globalDB.ListTaskCatalog(
+			ctx,
+			taskpkg.CatalogQuery{ReadScope: store.ReadScope{ProfileID: store.DefaultProfileID},
+				Scope:         taskpkg.CatalogScopeGlobal,
+				Status:        taskpkg.TaskStatusBlocked,
+				IncludeDrafts: true,
+			},
+		)
+		if err != nil {
+			t.Fatalf("ListTaskCatalog(blocked) error = %v", err)
+		}
+		if got, want := blocked.Total, 2; got != want {
+			t.Fatalf("blocked total = %d, want %d", got, want)
+		}
+		if got, want := blocked.StatusFacets, []taskpkg.CatalogStatusFacet{{
+			Status: taskpkg.TaskStatusBlocked,
+			Count:  2,
+		}}; !equalTaskCatalogStatusFacets(got, want) {
+			t.Fatalf("blocked status facets = %#v, want %#v", got, want)
+		}
+
+		alice, err := globalDB.ListTaskCatalog(
+			ctx,
+			taskpkg.CatalogQuery{ReadScope: store.ReadScope{ProfileID: store.DefaultProfileID},
+				Scope:         taskpkg.CatalogScopeGlobal,
+				OwnerKind:     taskpkg.OwnerKindHuman,
+				OwnerRef:      "user:alice",
+				IncludeDrafts: true,
+			},
+		)
+		if err != nil {
+			t.Fatalf("ListTaskCatalog(owner) error = %v", err)
+		}
+		if got, want := alice.Total, 2; got != want {
+			t.Fatalf("alice total = %d, want %d", got, want)
+		}
+		if got, want := alice.OwnerFacets, []taskpkg.CatalogOwnerFacet{{
+			Owner: taskpkg.Ownership{Kind: taskpkg.OwnerKindHuman, Ref: "user:alice"},
+			Count: 2,
+		}}; len(got) != len(want) || got[0] != want[0] {
+			t.Fatalf("alice owner facets = %#v, want %#v", got, want)
+		}
+
+		releasedPage, err := globalDB.ListTaskCatalog(
+			ctx,
+			taskpkg.CatalogQuery{ReadScope: store.ReadScope{ProfileID: store.DefaultProfileID},
+				Scope:         taskpkg.CatalogScopeGlobal,
+				Search:        "released by canonical dependency completion",
+				IncludeDrafts: true,
+			},
+		)
+		if err != nil {
+			t.Fatalf("ListTaskCatalog(released dependency) error = %v", err)
+		}
+		if got, want := releasedPage.Total, 1; got != want {
+			t.Fatalf("released dependent total = %d, want %d", got, want)
+		}
+		if got, want := releasedPage.Tasks[0].Status, taskpkg.TaskStatusReady; got != want {
+			t.Fatalf("released dependent status = %q, want %q", got, want)
+		}
+		manager, err := taskpkg.NewManager(taskpkg.WithStore(globalDB))
+		if err != nil {
+			t.Fatalf("task.NewManager() error = %v", err)
+		}
+		actor, err := taskpkg.DeriveHumanActorContext("user:alice", taskpkg.OriginKindCLI, "catalog parity")
+		if err != nil {
+			t.Fatalf("DeriveHumanActorContext() error = %v", err)
+		}
+		enriched, err := manager.ListTasks(ctx, taskpkg.Query{Search: released.Title}, actor)
+		if err != nil {
+			t.Fatalf("ListTasks(enriched parity) error = %v", err)
+		}
+		if len(enriched) != 1 || enriched[0].Status != releasedPage.Tasks[0].Status {
+			t.Fatalf(
+				"catalog/enriched parity = %#v / %#v, want matching canonical status",
+				releasedPage.Tasks,
+				enriched,
+			)
+		}
+	})
+
+	t.Run("Should seek scoped history rows through task indexes", func(t *testing.T) {
+		t.Parallel()
+
+		globalDB := openTestGlobalDB(t)
+		ctx := testutil.Context(t)
+		workspaceID := registerWorkspaceForGlobalTests(t, globalDB, "catalog-plan", t.TempDir())
+		normalized, err := taskpkg.NormalizeCatalogQuery(
+			taskpkg.CatalogQuery{ReadScope: store.ReadScope{ProfileID: store.DefaultProfileID},
+				Scope:         taskpkg.CatalogScopeWorkspace,
+				WorkspaceID:   workspaceID,
+				IncludeDrafts: true,
+				Limit:         10,
+			},
+		)
+		if err != nil {
+			t.Fatalf("NormalizeCatalogQuery() error = %v", err)
+		}
+		baseWhere, baseArgs := taskCatalogBaseFilter(normalized)
+		where, filterArgs := taskCatalogFilter(normalized)
+		statement := taskCatalogStatement(
+			"SELECT "+taskCatalogSelectColumns+" FROM catalog",
+			baseWhere,
+			where,
+		) + taskCatalogOrderBy(normalized.Sort) + taskCatalogLimitClause(normalized.Limit+1)
+		args := append(append([]any(nil), baseArgs...), filterArgs...)
+		rows, err := globalDB.db.QueryContext(ctx, "EXPLAIN QUERY PLAN "+statement, args...)
+		if err != nil {
+			t.Fatalf("EXPLAIN QUERY PLAN task catalog error = %v", err)
+		}
+		defer func() {
+			if closeErr := rows.Close(); closeErr != nil {
+				t.Fatalf("close task catalog query plan rows error = %v", closeErr)
+			}
+		}()
+
+		details := make([]string, 0)
+		for rows.Next() {
+			var id int
+			var parent int
+			var unused int
+			var detail string
+			if scanErr := rows.Scan(&id, &parent, &unused, &detail); scanErr != nil {
+				t.Fatalf("scan task catalog query plan error = %v", scanErr)
+			}
+			details = append(details, detail)
+		}
+		if err := rows.Err(); err != nil {
+			t.Fatalf("iterate task catalog query plan error = %v", err)
+		}
+		plan := strings.Join(details, "\n")
+		for _, indexedSeek := range []string{
+			"SEARCH tr USING INDEX idx_task_runs_task",
+			"SEARCH te USING INDEX idx_task_events_task",
+			"idx_task_dependencies_task",
+		} {
+			if !strings.Contains(plan, indexedSeek) {
+				t.Fatalf("task catalog query plan missing %q:\n%s", indexedSeek, plan)
+			}
+		}
+		for _, globalScan := range []string{"SCAN task_runs", "SCAN task_events", "SCAN task_dependencies"} {
+			if strings.Contains(plan, globalScan) {
+				t.Fatalf("task catalog query plan contains global history scan %q:\n%s", globalScan, plan)
+			}
+		}
+	})
+
+	t.Run("Should treat percent and underscore as literal search text", func(t *testing.T) {
+		t.Parallel()
+
+		globalDB := openTestGlobalDB(t)
+		ctx := testutil.Context(t)
+		for _, record := range []taskpkg.Task{
+			func() taskpkg.Task {
+				record := taskRecordForTest("task-search-literal")
+				record.Title = "Investigate literal %_ marker"
+				record.Status = taskpkg.TaskStatusReady
+				record.Owner = &taskpkg.Ownership{Kind: taskpkg.OwnerKindHuman, Ref: "user:alice"}
+				return record
+			}(),
+			func() taskpkg.Task {
+				record := taskRecordForTest("task-search-wildcard-decoy")
+				record.Title = "Investigate ordinary marker"
+				record.Status = taskpkg.TaskStatusReady
+				record.Owner = &taskpkg.Ownership{Kind: taskpkg.OwnerKindHuman, Ref: "user:alice"}
+				return record
+			}(),
+		} {
+			if err := globalDB.CreateTask(ctx, record); err != nil {
+				t.Fatalf("CreateTask(%q) error = %v", record.ID, err)
+			}
+		}
+		catalog, err := globalDB.ListTaskCatalog(
+			ctx,
+			taskpkg.CatalogQuery{ReadScope: store.ReadScope{ProfileID: store.DefaultProfileID},
+				Scope:         taskpkg.CatalogScopeGlobal,
+				Search:        "%_",
+				IncludeDrafts: true,
+			},
+		)
+		if err != nil {
+			t.Fatalf("ListTaskCatalog(literal search) error = %v", err)
+		}
+		got := orderedTaskSummaryIDs(catalog.Tasks)
+		want := []string{"task-search-literal"}
+		if !testutil.EqualStringSlices(got, want) {
+			t.Fatalf("literal catalog search ids = %#v, want %#v", got, want)
+		}
+		inbox, err := globalDB.ListTaskInbox(ctx, taskpkg.InboxQuery{
+			ReadScope: store.ReadScope{ProfileID: store.DefaultProfileID},
+			Scope:     taskpkg.CatalogScopeGlobal,
+			Search:    "%_",
+		}, taskpkg.ActorIdentity{Kind: taskpkg.ActorKindHuman, Ref: "user:alice"})
+		if err != nil {
+			t.Fatalf("ListTaskInbox(literal search) error = %v", err)
+		}
+		if got, want := inbox.Total, 1; got != want {
+			t.Fatalf("literal inbox search total = %d, want %d", got, want)
+		}
+	})
+
+	t.Run("Should bind cursors to the resolved workspace boundary", func(t *testing.T) {
+		t.Parallel()
+
+		globalDB := openTestGlobalDB(t)
+		ctx := testutil.Context(t)
+		workspaceA := registerWorkspaceForGlobalTests(t, globalDB, "catalog-a", t.TempDir())
+		workspaceB := registerWorkspaceForGlobalTests(t, globalDB, "catalog-b", t.TempDir())
+		for index, workspaceID := range []string{workspaceA, workspaceA, workspaceB, workspaceB} {
+			record := workspaceTaskRecordForTest(fmt.Sprintf("task-workspace-%d", index), workspaceID)
+			record.UpdatedAt = record.UpdatedAt.Add(time.Duration(index) * time.Minute)
+			if err := globalDB.CreateTask(ctx, record); err != nil {
+				t.Fatalf("CreateTask(%q) error = %v", record.ID, err)
+			}
+		}
+
+		first, err := globalDB.ListTaskCatalog(
+			ctx,
+			taskpkg.CatalogQuery{ReadScope: store.ReadScope{ProfileID: store.DefaultProfileID},
+				Scope:         taskpkg.CatalogScopeWorkspace,
+				WorkspaceID:   workspaceA,
+				IncludeDrafts: true,
+				Limit:         1,
+			},
+		)
+		if err != nil {
+			t.Fatalf("ListTaskCatalog(workspace A) error = %v", err)
+		}
+		if first.NextCursor == "" {
+			t.Fatal("ListTaskCatalog(workspace A).NextCursor = empty, want continuation")
+		}
+		_, err = globalDB.ListTaskCatalog(
+			ctx,
+			taskpkg.CatalogQuery{ReadScope: store.ReadScope{ProfileID: store.DefaultProfileID},
+				Scope:         taskpkg.CatalogScopeWorkspace,
+				WorkspaceID:   workspaceB,
+				IncludeDrafts: true,
+				Cursor:        first.NextCursor,
+				Limit:         1,
+			},
+		)
+		if !errors.Is(err, taskpkg.ErrCatalogCursorInvalid) {
+			t.Fatalf(
+				"ListTaskCatalog(cross-workspace cursor) error = %v, want %v",
+				err,
+				taskpkg.ErrCatalogCursorInvalid,
+			)
+		}
+
+		foreignLoopTask := workspaceTaskRecordForTest("task-workspace-foreign-loop", workspaceB)
+		foreignLoopTask.CreatedBy = taskpkg.ActorIdentity{Kind: taskpkg.ActorKindDaemon, Ref: "loop-coordinator"}
+		if err := globalDB.CreateTask(ctx, foreignLoopTask); err != nil {
+			t.Fatalf("CreateTask(foreign Loop task) error = %v", err)
+		}
+		foreignRun := taskRunForTest("run-workspace-foreign-loop", foreignLoopTask.ID)
+		foreignRun.LoopRunID = "looprun-workspace-foreign"
+		foreignRun.RunKind = taskpkg.RunKindCoordinator
+		if err := globalDB.CreateTaskRun(ctx, foreignRun); err != nil {
+			t.Fatalf("CreateTaskRun(foreign Loop run) error = %v", err)
+		}
+		isolated, err := globalDB.ListTaskCatalog(ctx, taskpkg.CatalogQuery{
+			ReadScope: store.ReadScope{ProfileID: store.DefaultProfileID},
+			Scope:     taskpkg.CatalogScopeWorkspace, WorkspaceID: workspaceA,
+			LoopRunID: foreignRun.LoopRunID, IncludeDrafts: true, Limit: 10,
+		})
+		if err != nil {
+			t.Fatalf("ListTaskCatalog(cross-workspace Loop run IT-016) error = %v", err)
+		}
+		if isolated.Total != 0 || len(isolated.Tasks) != 0 {
+			t.Fatalf("cross-workspace Loop catalog = %#v, want true empty IT-016", isolated)
+		}
+	})
+
+	const loopCatalogCase = "Should classify Loop records by provenance before counts and pagination UT-021 UT-022 UT-023 UT-024 UT-025 UT-026 IT-011 IT-012 IT-013 IT-014 IT-026"
+	t.Run(loopCatalogCase, func(t *testing.T) {
+		t.Parallel()
+
+		globalDB := openTestGlobalDB(t)
+		ctx := testutil.Context(t)
+		loopActor := taskpkg.ActorIdentity{Kind: taskpkg.ActorKindDaemon, Ref: "loop-coordinator"}
+		excluded := []taskpkg.ActorRef{{Kind: loopActor.Kind, Ref: loopActor.Ref}}
+		base := time.Date(2026, 8, 20, 12, 0, 0, 0, time.UTC)
+
+		operatorTask := taskRecordForTest("task-loop-title-decoy")
+		operatorTask.Title = "loop.deploy coordinator"
+		operatorTask.Owner = &taskpkg.Ownership{Kind: taskpkg.OwnerKindHuman, Ref: "user:alice"}
+		operatorTask.UpdatedAt = base
+		daemonTask := taskRecordForTest("task-daemon-maintenance")
+		daemonTask.CreatedBy = taskpkg.ActorIdentity{Kind: taskpkg.ActorKindDaemon, Ref: "maintenance"}
+		daemonTask.Owner = &taskpkg.Ownership{Kind: taskpkg.OwnerKindHuman, Ref: "user:alice"}
+		daemonTask.UpdatedAt = base.Add(time.Minute)
+		coordinator := taskRecordForTest("task-loop-coordinator")
+		coordinator.CreatedBy = loopActor
+		coordinator.Owner = &taskpkg.Ownership{Kind: taskpkg.OwnerKindHuman, Ref: "user:alice"}
+		coordinator.Metadata = json.RawMessage(
+			`{"loop_run_id":"looprun-alpha","loop_name":"alpha"}`,
+		)
+		coordinator.UpdatedAt = base.Add(2 * time.Minute)
+		cell := taskRecordForTest("task-loop-cell")
+		cell.ParentTaskID = coordinator.ID
+		cell.CreatedBy = loopActor
+		cell.Owner = &taskpkg.Ownership{Kind: taskpkg.OwnerKindHuman, Ref: "user:alice"}
+		cell.Metadata = json.RawMessage(
+			`{"loop_run_id":"looprun-alpha","loop_name":"alpha","generation":2,"node_id":"review","item_index":0}`,
+		)
+		cell.UpdatedAt = base.Add(3 * time.Minute)
+		otherCell := taskRecordForTest("task-loop-other-cell")
+		otherCell.CreatedBy = loopActor
+		otherCell.Owner = &taskpkg.Ownership{Kind: taskpkg.OwnerKindHuman, Ref: "user:alice"}
+		otherCell.Metadata = json.RawMessage(
+			`{"loop_run_id":"looprun-beta","loop_name":"beta","generation":1,"node_id":"build","item_index":1}`,
+		)
+		otherCell.UpdatedAt = base.Add(4 * time.Minute)
+
+		for _, record := range []taskpkg.Task{operatorTask, daemonTask, coordinator, cell, otherCell} {
+			if err := globalDB.CreateTask(ctx, record); err != nil {
+				t.Fatalf("CreateTask(%q) error = %v", record.ID, err)
+			}
+		}
+		createLoopRun := func(id string, taskID string, loopRunID string, kind taskpkg.RunKind, attempt int32) {
+			t.Helper()
+			run := taskRunForTest(id, taskID)
+			run.LoopRunID = loopRunID
+			run.RunKind = kind
+			run.Attempt = attempt
+			run.QueuedAt = base.Add(time.Duration(attempt) * time.Second)
+			if err := globalDB.CreateTaskRun(ctx, run); err != nil {
+				t.Fatalf("CreateTaskRun(%q) error = %v", id, err)
+			}
+		}
+		createLoopRun("run-loop-alpha-coordinator", coordinator.ID, "looprun-alpha", taskpkg.RunKindCoordinator, 1)
+		createLoopRun("run-loop-alpha-cell-1", cell.ID, "looprun-alpha", taskpkg.RunKindWorker, 1)
+		createLoopRun("run-loop-alpha-cell-2", cell.ID, "looprun-alpha", taskpkg.RunKindWorker, 2)
+		createLoopRun("run-loop-alpha-cell-3", cell.ID, "looprun-alpha", taskpkg.RunKindWorker, 3)
+		createLoopRun("run-loop-beta-cell-1", otherCell.ID, "looprun-beta", taskpkg.RunKindWorker, 1)
+		createLoopRun("run-loop-beta-cell-2", otherCell.ID, "looprun-beta", taskpkg.RunKindWorker, 2)
+		createLoopRun("run-loop-beta-cell-3", otherCell.ID, "looprun-beta", taskpkg.RunKindWorker, 3)
+
+		t.Run("Should keep default visibility counts pagination and inbox coherent", func(t *testing.T) {
+			t.Parallel()
+			ctx := testutil.Context(t)
+
+			defaultPage, err := globalDB.ListTaskCatalog(ctx, taskpkg.CatalogQuery{
+				ReadScope:        store.ReadScope{ProfileID: store.DefaultProfileID},
+				Scope:            taskpkg.CatalogScopeGlobal,
+				ExcludeCreatedBy: excluded,
+				IncludeDrafts:    true,
+				Limit:            10,
+			})
+			if err != nil {
+				t.Fatalf("ListTaskCatalog(default) error = %v", err)
+			}
+			if got, want := orderedTaskSummaryIDs(defaultPage.Tasks), []string{
+				daemonTask.ID,
+				operatorTask.ID,
+			}; !testutil.EqualStringSlices(got, want) {
+				t.Fatalf("default ids = %#v, want %#v", got, want)
+			}
+			facetTotal := 0
+			for _, facet := range defaultPage.StatusFacets {
+				facetTotal += facet.Count
+			}
+			if defaultPage.Total != 2 || facetTotal != 2 {
+				t.Fatalf("default total/facets = %d/%d, want 2/2", defaultPage.Total, facetTotal)
+			}
+			var pagedDefaultIDs []string
+			cursor := ""
+			for {
+				page, err := globalDB.ListTaskCatalog(ctx, taskpkg.CatalogQuery{
+					ReadScope: store.ReadScope{ProfileID: store.DefaultProfileID},
+					Scope:     taskpkg.CatalogScopeGlobal, ExcludeCreatedBy: excluded,
+					IncludeDrafts: true, Cursor: cursor, Limit: 1,
+				})
+				if err != nil {
+					t.Fatalf("ListTaskCatalog(default page cursor=%q) error = %v", cursor, err)
+				}
+				if page.Total != 2 {
+					t.Fatalf("default page total = %d, want 2", page.Total)
+				}
+				pagedDefaultIDs = append(pagedDefaultIDs, orderedTaskSummaryIDs(page.Tasks)...)
+				if !page.HasMore {
+					break
+				}
+				if page.NextCursor == "" || page.NextCursor == cursor {
+					t.Fatalf("default page cursor = %q after %q, want progress", page.NextCursor, cursor)
+				}
+				cursor = page.NextCursor
+			}
+			got := pagedDefaultIDs
+			want := []string{daemonTask.ID, operatorTask.ID}
+			if !testutil.EqualStringSlices(got, want) {
+				t.Fatalf("default ids across pages = %#v, want %#v without recent Loop cells", got, want)
+			}
+			inbox, err := globalDB.ListTaskInbox(ctx, taskpkg.InboxQuery{
+				ReadScope: store.ReadScope{ProfileID: store.DefaultProfileID},
+				Scope:     taskpkg.CatalogScopeGlobal, ExcludeCreatedBy: excluded, Limit: 10,
+			}, taskpkg.ActorIdentity{Kind: taskpkg.ActorKindHuman, Ref: "user:alice"})
+			if err != nil {
+				t.Fatalf("ListTaskInbox(default) error = %v", err)
+			}
+			if inbox.Total != 2 {
+				t.Fatalf("ListTaskInbox(default).Total = %d, want 2", inbox.Total)
+			}
+			// The All projects Project filter narrows the inbox like the catalog (AP BR-12).
+			for _, tc := range []struct {
+				ids  []string
+				want int
+			}{{ids: []string{workspaceaccess.UserSelector}, want: 2}, {ids: []string{"ws-unrelated"}, want: 0}} {
+				narrowed, err := globalDB.ListTaskInbox(ctx, taskpkg.InboxQuery{
+					ReadScope:    store.ReadScope{ProfileID: store.DefaultProfileID},
+					WorkspaceIDs: tc.ids, ExcludeCreatedBy: excluded, Limit: 10,
+				}, taskpkg.ActorIdentity{Kind: taskpkg.ActorKindHuman, Ref: "user:alice"})
+				if err != nil {
+					t.Fatalf("ListTaskInbox(workspace_ids=%v) error = %v", tc.ids, err)
+				}
+				if narrowed.Total != tc.want {
+					t.Fatalf("ListTaskInbox(workspace_ids=%v).Total = %d, want %d", tc.ids, narrowed.Total, tc.want)
+				}
+			}
+		})
+
+		t.Run("Should project provenance and page one Loop run without duplicates", func(t *testing.T) {
+			t.Parallel()
+			ctx := testutil.Context(t)
+
+			included, err := globalDB.ListTaskCatalog(ctx, taskpkg.CatalogQuery{
+				ReadScope:     store.ReadScope{ProfileID: store.DefaultProfileID},
+				Scope:         taskpkg.CatalogScopeGlobal,
+				IncludeDrafts: true,
+				Limit:         10,
+			})
+			if err != nil {
+				t.Fatalf("ListTaskCatalog(include) error = %v", err)
+			}
+			provenanceByID := make(map[string]*taskpkg.RunProvenance, len(included.Tasks))
+			for index := range included.Tasks {
+				provenanceByID[included.Tasks[index].ID] = included.Tasks[index].RunProvenance
+			}
+			if got := provenanceByID[coordinator.ID]; got == nil ||
+				got.LoopRunID != "looprun-alpha" || got.RunKind != taskpkg.RunKindCoordinator {
+				t.Fatalf("coordinator provenance = %#v", got)
+			}
+			if got := provenanceByID[cell.ID]; got == nil ||
+				got.LoopRunID != "looprun-alpha" || got.RunKind != taskpkg.RunKindWorker ||
+				!json.Valid(got.Metadata) {
+				t.Fatalf("cell provenance = %#v", got)
+			}
+
+			var runIDs []string
+			runCursor := ""
+			for {
+				runPage, err := globalDB.ListTaskCatalog(ctx, taskpkg.CatalogQuery{
+					ReadScope:     store.ReadScope{ProfileID: store.DefaultProfileID},
+					Scope:         taskpkg.CatalogScopeGlobal,
+					LoopRunID:     "looprun-alpha",
+					IncludeDrafts: true,
+					Cursor:        runCursor,
+					Limit:         1,
+				})
+				if err != nil {
+					t.Fatalf("ListTaskCatalog(loop run cursor=%q) error = %v", runCursor, err)
+				}
+				facetTotal := 0
+				for _, facet := range runPage.StatusFacets {
+					facetTotal += facet.Count
+				}
+				if runPage.Total != 2 || facetTotal != 2 || len(runPage.Tasks) != 1 {
+					t.Fatalf("loop-run page = %#v, want one row with total/facets 2", runPage)
+				}
+				runIDs = append(runIDs, runPage.Tasks[0].ID)
+				if !runPage.HasMore {
+					if runPage.NextCursor != "" {
+						t.Fatalf("final loop-run cursor = %q, want empty", runPage.NextCursor)
+					}
+					break
+				}
+				if runPage.NextCursor == "" || runPage.NextCursor == runCursor {
+					t.Fatalf("loop-run cursor = %q after %q, want progress", runPage.NextCursor, runCursor)
+				}
+				runCursor = runPage.NextCursor
+			}
+			got := runIDs
+			want := []string{cell.ID, coordinator.ID}
+			if !testutil.EqualStringSlices(got, want) {
+				t.Fatalf("loop-run ids = %#v, want %#v without gaps or duplicates", got, want)
+			}
+
+			children, err := globalDB.ListTaskCatalog(ctx, taskpkg.CatalogQuery{
+				ReadScope:        store.ReadScope{ProfileID: store.DefaultProfileID},
+				Scope:            taskpkg.CatalogScopeGlobal,
+				ParentTaskID:     coordinator.ID,
+				ExcludeCreatedBy: excluded,
+				IncludeDrafts:    true,
+				Limit:            10,
+			})
+			if err != nil {
+				t.Fatalf("ListTaskCatalog(parent) error = %v", err)
+			}
+			got = orderedTaskSummaryIDs(children.Tasks)
+			want = []string{cell.ID}
+			if !testutil.EqualStringSlices(got, want) {
+				t.Fatalf("parent ids = %#v, want %#v", got, want)
+			}
+		})
+
+		t.Run("Should return empty filtered pages and bind cursors to filters", func(t *testing.T) {
+			t.Parallel()
+			ctx := testutil.Context(t)
+
+			unknown, err := globalDB.ListTaskCatalog(ctx, taskpkg.CatalogQuery{
+				ReadScope: store.ReadScope{ProfileID: store.DefaultProfileID},
+				Scope:     taskpkg.CatalogScopeGlobal, LoopRunID: "looprun-missing", Limit: 10,
+			})
+			if err != nil {
+				t.Fatalf("ListTaskCatalog(unknown loop run) error = %v", err)
+			}
+			if unknown.Total != 0 || len(unknown.Tasks) != 0 ||
+				len(unknown.StatusFacets) != 0 || len(unknown.OwnerFacets) != 0 {
+				t.Fatalf("unknown loop run page = %#v, want true empty", unknown)
+			}
+
+			first, err := globalDB.ListTaskCatalog(ctx, taskpkg.CatalogQuery{
+				ReadScope:        store.ReadScope{ProfileID: store.DefaultProfileID},
+				Scope:            taskpkg.CatalogScopeGlobal,
+				ExcludeCreatedBy: excluded,
+				IncludeDrafts:    true,
+				Limit:            1,
+			})
+			if err != nil {
+				t.Fatalf("ListTaskCatalog(cursor source) error = %v", err)
+			}
+			if first.NextCursor == "" {
+				t.Fatal("ListTaskCatalog(cursor source) next cursor = empty")
+			}
+			_, err = globalDB.ListTaskCatalog(ctx, taskpkg.CatalogQuery{
+				ReadScope:     store.ReadScope{ProfileID: store.DefaultProfileID},
+				Scope:         taskpkg.CatalogScopeGlobal,
+				IncludeDrafts: true,
+				Cursor:        first.NextCursor,
+				Limit:         1,
+			})
+			if !errors.Is(err, taskpkg.ErrCatalogCursorInvalid) {
+				t.Fatalf("ListTaskCatalog(cursor filter mismatch) error = %v", err)
+			}
+		})
+
+		t.Run("Should use the created-by index for default exclusion", func(t *testing.T) {
+			t.Parallel()
+			ctx := testutil.Context(t)
+
+			normalized, err := taskpkg.NormalizeCatalogQuery(taskpkg.CatalogQuery{
+				ReadScope: store.ReadScope{ProfileID: store.DefaultProfileID},
+				Scope:     taskpkg.CatalogScopeGlobal, ExcludeCreatedBy: excluded, Limit: 10,
+			})
+			if err != nil {
+				t.Fatalf("NormalizeCatalogQuery(plan) error = %v", err)
+			}
+			baseWhere, args := taskCatalogBaseFilter(normalized)
+			statement := taskCatalogStatement("SELECT COUNT(*) FROM catalog", baseWhere, nil)
+			rows, err := globalDB.db.QueryContext(ctx, "EXPLAIN QUERY PLAN "+statement, args...)
+			if err != nil {
+				t.Fatalf("EXPLAIN QUERY PLAN exclusion error = %v", err)
+			}
+			defer func() {
+				if closeErr := rows.Close(); closeErr != nil {
+					t.Fatalf("close exclusion query plan rows error = %v", closeErr)
+				}
+			}()
+			var plan strings.Builder
+			for rows.Next() {
+				var id int
+				var parent int
+				var unused int
+				var detail string
+				if scanErr := rows.Scan(&id, &parent, &unused, &detail); scanErr != nil {
+					t.Fatalf("scan exclusion query plan error = %v", scanErr)
+				}
+				plan.WriteString(detail)
+				plan.WriteByte('\n')
+			}
+			if err := rows.Err(); err != nil {
+				t.Fatalf("iterate exclusion query plan error = %v", err)
+			}
+			if !strings.Contains(plan.String(), "idx_tasks_created_by") {
+				t.Fatalf("exclusion query plan does not use idx_tasks_created_by:\n%s", plan.String())
+			}
+		})
+	})
+
+	t.Run("Should return a true empty page for a Loop-only workspace", func(t *testing.T) {
+		t.Parallel()
+
+		globalDB := openTestGlobalDB(t)
+		ctx := testutil.Context(t)
+		workspaceID := registerWorkspaceForGlobalTests(t, globalDB, "loop-only", t.TempDir())
+		record := workspaceTaskRecordForTest("task-loop-only", workspaceID)
+		record.CreatedBy = taskpkg.ActorIdentity{Kind: taskpkg.ActorKindDaemon, Ref: "loop-coordinator"}
+		if err := globalDB.CreateTask(ctx, record); err != nil {
+			t.Fatalf("CreateTask() error = %v", err)
+		}
+		page, err := globalDB.ListTaskCatalog(ctx, taskpkg.CatalogQuery{
+			ReadScope: store.ReadScope{ProfileID: store.DefaultProfileID},
+			Scope:     taskpkg.CatalogScopeWorkspace, WorkspaceID: workspaceID,
+			ExcludeCreatedBy: []taskpkg.ActorRef{{
+				Kind: taskpkg.ActorKindDaemon, Ref: "loop-coordinator",
+			}},
+			Limit: 10,
+		})
+		if err != nil {
+			t.Fatalf("ListTaskCatalog() error = %v", err)
+		}
+		if page.Total != 0 || len(page.Tasks) != 0 || len(page.StatusFacets) != 0 || len(page.OwnerFacets) != 0 {
+			t.Fatalf("loop-only page = %#v, want true empty", page)
+		}
+	})
+}
+
+func TestGlobalDBTaskInboxUsesTwoStatementPaging(t *testing.T) {
+	t.Parallel()
+
+	t.Run("Should compute exact metadata and one page with two reads", func(t *testing.T) {
+		t.Parallel()
+
+		globalDB := openTestGlobalDB(t)
+		ctx := testutil.Context(t)
+		record := taskRecordForTest("task-inbox-two-reads")
+		record.Status = taskpkg.TaskStatusReady
+		record.Owner = &taskpkg.Ownership{Kind: taskpkg.OwnerKindHuman, Ref: "user:alice"}
+		if err := globalDB.CreateTask(ctx, record); err != nil {
+			t.Fatalf("CreateTask() error = %v", err)
+		}
+		record.ID = "task-inbox-two-reads-second"
+		if err := globalDB.CreateTask(ctx, record); err != nil {
+			t.Fatal(err)
+		}
+		actor := taskpkg.ActorIdentity{Kind: taskpkg.ActorKindHuman, Ref: "user:alice"}
+		query, normalizedActor, err := taskpkg.NormalizeInboxQuery(taskpkg.InboxQuery{
+			ReadScope: store.ReadScope{ProfileID: store.DefaultProfileID},
+			Scope:     taskpkg.CatalogScopeGlobal,
+			Limit:     1,
+		}, actor)
+		if err != nil {
+			t.Fatalf("NormalizeInboxQuery() error = %v", err)
+		}
+		counting := &countingTaskCatalogExecutor{taskSQLExecutor: globalDB.db}
+		page, err := listTaskInboxWithExecutor(ctx, counting, query, normalizedActor)
+		if err != nil {
+			t.Fatalf("listTaskInboxWithExecutor() error = %v", err)
+		}
+		if got, want := counting.reads, 2; got != want {
+			t.Fatalf("task inbox read statements = %d, want constant %d", got, want)
+		}
+		if got, want := page.Total, 2; got != want {
+			t.Fatalf("task inbox total = %d, want %d", got, want)
+		}
+		if !page.HasMore || page.NextCursor == "" {
+			t.Fatal("expected a continuation cursor")
+		}
+		query.SkipFacets = true
+		counting.reads = 0
+		itemsOnly, err := listTaskInboxWithExecutor(ctx, counting, query, normalizedActor)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if counting.reads != 1 {
+			t.Fatalf("items-only reads = %d, want 1", counting.reads)
+		}
+		if itemsOnly.Total != 0 || itemsOnly.UnreadTotal != 0 || itemsOnly.ArchivedTotal != 0 ||
+			len(itemsOnly.StatusFacets) != 0 || len(itemsOnly.PriorityFacets) != 0 {
+			t.Fatalf("items-only metadata = %#v", itemsOnly)
+		}
+		for i := range page.Groups {
+			page.Groups[i].Count = 0
+			page.Groups[i].UnreadCount = 0
+		}
+		if !reflect.DeepEqual(itemsOnly.Groups, page.Groups) || itemsOnly.HasMore != page.HasMore ||
+			itemsOnly.NextCursor != page.NextCursor {
+			t.Fatalf("items-only page differs: %#v, want groups %#v", itemsOnly, page.Groups)
+		}
+
+		query.Cursor = page.NextCursor
+		next, err := globalDB.ListTaskInbox(ctx, query, actor)
+		if err != nil {
+			t.Fatal(err)
+		}
+		query.SkipFacets = false
+		fullNext, err := globalDB.ListTaskInbox(ctx, query, actor)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if next.HasMore || next.NextCursor != "" {
+			t.Fatal("last page has a continuation")
+		}
+		for i := range fullNext.Groups {
+			fullNext.Groups[i].Count = 0
+			fullNext.Groups[i].UnreadCount = 0
+		}
+		if !reflect.DeepEqual(next.Groups, fullNext.Groups) {
+			t.Fatal("metadata mode changed continuation items")
+		}
+	})
+}
+
+func TestGlobalDBTaskRunRoundTripAndFilters(t *testing.T) {
+	t.Parallel()
+
+	// Invariant: detached-harness finalization may compare-and-set metadata but
+	// cannot rewrite any lifecycle or ownership field. Owning layer: GlobalDB
+	// task-run persistence. Canonical suite: TestGlobalDBTaskRunRoundTripAndFilters.
+	t.Run("Should update only metadata with an exact compare-and-set", func(t *testing.T) {
+		t.Parallel()
+
+		ctx := testutil.Context(t)
+		globalDB := openTestGlobalDB(t)
+		taskRecord := taskRecordForTest("task-run-metadata-cas")
+		if err := globalDB.CreateTask(ctx, taskRecord); err != nil {
+			t.Fatalf("CreateTask() error = %v", err)
+		}
+		run := taskRunForTest("run-metadata-cas", taskRecord.ID)
+		run.Metadata = json.RawMessage(`{"state":"pending"}`)
+		if err := globalDB.CreateTaskRun(ctx, run); err != nil {
+			t.Fatalf("CreateTaskRun() error = %v", err)
+		}
+		before, err := globalDB.GetTaskRun(ctx, run.ID)
+		if err != nil {
+			t.Fatalf("GetTaskRun(before metadata CAS) error = %v", err)
+		}
+		nextMetadata := json.RawMessage(`{"state":"processed","outcome":"emitted"}`)
+
+		updated, err := globalDB.UpdateTaskRunMetadata(ctx, taskpkg.RunMetadataMutation{
+			RunID:            run.ID,
+			ExpectedMetadata: before.Metadata,
+			Metadata:         nextMetadata,
+		})
+		if err != nil {
+			t.Fatalf("UpdateTaskRunMetadata() error = %v", err)
+		}
+		expected := before
+		expected.Metadata = nextMetadata
+		assertTaskRunEqual(t, updated, expected)
+
+		_, err = globalDB.UpdateTaskRunMetadata(ctx, taskpkg.RunMetadataMutation{
+			RunID:            run.ID,
+			ExpectedMetadata: before.Metadata,
+			Metadata:         json.RawMessage(`{"state":"stale"}`),
+		})
+		if !errors.Is(err, taskpkg.ErrInvalidStatusTransition) {
+			t.Fatalf("UpdateTaskRunMetadata(stale) error = %v, want %v", err, taskpkg.ErrInvalidStatusTransition)
+		}
+		stored, err := globalDB.GetTaskRun(ctx, run.ID)
+		if err != nil {
+			t.Fatalf("GetTaskRun(after stale metadata CAS) error = %v", err)
+		}
+		assertTaskRunEqual(t, stored, expected)
+	})
+
+	t.Run("Should join task-run scan and rows-close errors", func(t *testing.T) {
+		t.Parallel()
+
+		globalDB := openQueryRowsCloseErrorGlobalDB(t)
+		_, err := globalDB.ListTaskRuns(
+			testutil.Context(t),
+			taskpkg.RunQuery{TaskID: "task-close-error"},
+		)
+		if !errors.Is(err, errQueryRowsClose) || !strings.Contains(err.Error(), "scan task run") {
+			t.Fatalf("ListTaskRuns() error = %v, want joined scan and rows-close errors", err)
+		}
+	})
+
+	globalDB := openTestGlobalDB(t)
+	workspaceID := registerWorkspaceForGlobalTests(
+		t,
+		globalDB,
+		"task-run-roundtrip",
+		filepath.Join(t.TempDir(), "task-run-roundtrip"),
+	)
+	taskRecord := taskRecordForTest("task-run-roundtrip")
+	if err := globalDB.CreateTask(testutil.Context(t), taskRecord); err != nil {
+		t.Fatalf("CreateTask() error = %v", err)
+	}
+
+	queuedRun := taskRunForTest("run-queued", taskRecord.ID)
+	queuedRun.WorkspaceID = workspaceID
+	queuedRun.Metadata = json.RawMessage(`{"schema":"compozy.harness.detached.v1","owner_session_id":"sess-owner"}`)
+	if err := globalDB.CreateTaskRun(testutil.Context(t), queuedRun); err != nil {
+		t.Fatalf("CreateTaskRun() error = %v", err)
+	}
+
+	storedQueued, err := globalDB.GetTaskRun(testutil.Context(t), queuedRun.ID)
+	if err != nil {
+		t.Fatalf("GetTaskRun(queued) error = %v", err)
+	}
+	if storedQueued.SessionID != "" {
+		t.Fatalf("GetTaskRun(queued).SessionID = %q, want empty", storedQueued.SessionID)
+	}
+	if storedQueued.ClaimedBy != nil {
+		t.Fatalf("GetTaskRun(queued).ClaimedBy = %#v, want nil", storedQueued.ClaimedBy)
+	}
+
+	runningRun := queuedRun
+	runningRun.Status = taskpkg.TaskRunStatusRunning
+	runningRun.ClaimedBy = actorForTest(taskpkg.ActorKindDaemon, "scheduler")
+	runningRun.SessionID = "sess-task-run"
+	runningRun.ClaimedAt = queuedRun.QueuedAt.Add(30 * time.Second)
+	runningRun.StartedAt = queuedRun.QueuedAt.Add(time.Minute)
+	runningRun.ClaimTokenHash = "sha256:" + strings.Repeat("a", 64)
+	runningRun.LeaseUntil = runningRun.ClaimedAt.Add(10 * time.Minute)
+	runningRun.HeartbeatAt = runningRun.ClaimedAt.Add(15 * time.Second)
+	runningRun.RequiredCapabilities = []string{"golang", "sqlite"}
+	runningRun.PreferredCapabilities = []string{"claude", "codex"}
+	if err := globalDB.UpdateNonTerminalTaskRun(testutil.Context(t), runningRun); err != nil {
+		t.Fatalf("UpdateTaskRun(running) error = %v", err)
+	}
+
+	runsByTask, err := globalDB.ListTaskRuns(testutil.Context(t), taskpkg.RunQuery{TaskID: taskRecord.ID})
+	if err != nil {
+		t.Fatalf("ListTaskRuns(task) error = %v", err)
+	}
+	if got, want := len(runsByTask), 1; got != want {
+		t.Fatalf("len(ListTaskRuns(task)) = %d, want %d", got, want)
+	}
+	assertTaskRunEqual(t, runsByTask[0], runningRun)
+
+	runsBySession, err := globalDB.ListTaskRuns(testutil.Context(t), taskpkg.RunQuery{SessionID: "sess-task-run"})
+	if err != nil {
+		t.Fatalf("ListTaskRuns(session) error = %v", err)
+	}
+	if got, want := len(runsBySession), 1; got != want {
+		t.Fatalf("len(ListTaskRuns(session)) = %d, want %d", got, want)
+	}
+
+	emptyRuns, err := globalDB.ListTaskRunsByStatus(testutil.Context(t), nil)
+	if err != nil {
+		t.Fatalf("ListTaskRunsByStatus(nil) error = %v", err)
+	}
+	if got := len(emptyRuns); got != 0 {
+		t.Fatalf("len(ListTaskRunsByStatus(nil)) = %d, want 0", got)
+	}
+
+	runsByStatus, err := globalDB.ListTaskRunsByStatus(
+		testutil.Context(t),
+		[]taskpkg.RunStatus{taskpkg.TaskRunStatusRunning},
+	)
+	if err != nil {
+		t.Fatalf("ListTaskRunsByStatus() error = %v", err)
+	}
+	if got, want := len(runsByStatus), 1; got != want {
+		t.Fatalf("len(ListTaskRunsByStatus()) = %d, want %d", got, want)
+	}
+
+	activeBindings, err := globalDB.CountActiveSessionBindings(testutil.Context(t), "sess-task-run")
+	if err != nil {
+		t.Fatalf("CountActiveSessionBindings(running) error = %v", err)
+	}
+	if got, want := activeBindings, 1; got != want {
+		t.Fatalf("CountActiveSessionBindings(running) = %d, want %d", got, want)
+	}
+
+	completedRun := runningRun
+	completedRun.Status = taskpkg.TaskRunStatusCompleted
+	completedRun.EndedAt = runningRun.StartedAt.Add(5 * time.Minute)
+	completedRun.SetResult(json.RawMessage(`{"ok":true}`))
+	completedRun.LeaseUntil = time.Time{}
+	completedRun.HeartbeatAt = time.Time{}
+	if err := globalDB.withTaskMutationTransactionForTest(
+		testutil.Context(t),
+		"complete round-trip run",
+		func(store *taskMutationTxStore) error {
+			_, transitionErr := store.TransitionTerminalRun(
+				testutil.Context(t),
+				taskpkg.NewTerminalRunMutation(runningRun, completedRun),
+			)
+			return transitionErr
+		},
+	); err != nil {
+		t.Fatalf("TransitionTerminalRun(completed) error = %v", err)
+	}
+
+	storedCompleted, err := globalDB.GetTaskRun(testutil.Context(t), completedRun.ID)
+	if err != nil {
+		t.Fatalf("GetTaskRun(completed) error = %v", err)
+	}
+	assertTaskRunEqual(t, storedCompleted, completedRun)
+
+	activeBindings, err = globalDB.CountActiveSessionBindings(testutil.Context(t), "sess-task-run")
+	if err != nil {
+		t.Fatalf("CountActiveSessionBindings(completed) error = %v", err)
+	}
+	if got, want := activeBindings, 0; got != want {
+		t.Fatalf("CountActiveSessionBindings(completed) = %d, want %d", got, want)
+	}
+}
+
+func TestGlobalDBTaskRunForceOperations(t *testing.T) {
+	t.Parallel()
+
+	t.Run("Should force release claimed run with snapshot fencing", func(t *testing.T) {
+		t.Parallel()
+
+		globalDB := openTestGlobalDB(t)
+		ctx := testutil.Context(t)
+		taskRecord := taskRecordForTest("task-force-release")
+		if err := globalDB.CreateTask(ctx, taskRecord); err != nil {
+			t.Fatalf("CreateTask() error = %v", err)
+		}
+		run := taskRunForTest("run-force-release", taskRecord.ID)
+		if err := globalDB.CreateTaskRun(ctx, run); err != nil {
+			t.Fatalf("CreateTaskRun() error = %v", err)
+		}
+		claimed := run
+		claimed.Status = taskpkg.TaskRunStatusClaimed
+		claimed.ClaimedBy = actorForTest(taskpkg.ActorKindAgentSession, "sess-worker")
+		claimed.SessionID = "sess-worker"
+		claimed.ClaimTokenHash = "sha256:" + strings.Repeat("a", 64)
+		claimed.LeaseUntil = claimed.QueuedAt.Add(10 * time.Minute)
+		claimed.HeartbeatAt = claimed.QueuedAt.Add(time.Minute)
+		claimed.ClaimedAt = claimed.QueuedAt.Add(time.Second)
+		if err := globalDB.UpdateNonTerminalTaskRun(ctx, claimed); err != nil {
+			t.Fatalf("UpdateTaskRun(claimed) error = %v", err)
+		}
+
+		result, err := forceReleaseTaskRunForTest(
+			ctx,
+			globalDB,
+			taskpkg.NewForceReleaseRunMutation(claimed, claimed.QueuedAt.Add(2*time.Minute)),
+		)
+		if err != nil {
+			t.Fatalf("ForceReleaseTaskRun() error = %v", err)
+		}
+		if got, want := result.Previous.Status, taskpkg.TaskRunStatusClaimed; got != want {
+			t.Fatalf("Previous.Status = %q, want %q", got, want)
+		}
+		if got, want := result.Run.Status, taskpkg.TaskRunStatusQueued; got != want {
+			t.Fatalf("Run.Status = %q, want %q", got, want)
+		}
+		if result.Run.SessionID != "" || result.Run.ClaimedBy != nil ||
+			result.Run.ClaimTokenHash != "" || !result.Run.LeaseUntil.IsZero() {
+			t.Fatalf("ForceReleaseTaskRun() retained lease fields: %#v", result.Run)
+		}
+	})
+
+	t.Run("Should force fail queued run with operator failure kind", func(t *testing.T) {
+		t.Parallel()
+
+		const rawToken = "compozy_claim_force-store-secret"
+		globalDB := openTestGlobalDB(t)
+		ctx := testutil.Context(t)
+		taskRecord := taskRecordForTest("task-force-fail")
+		if err := globalDB.CreateTask(ctx, taskRecord); err != nil {
+			t.Fatalf("CreateTask() error = %v", err)
+		}
+		run := taskRunForTest("run-force-fail", taskRecord.ID)
+		if err := globalDB.CreateTaskRun(ctx, run); err != nil {
+			t.Fatalf("CreateTaskRun() error = %v", err)
+		}
+		if _, err := forceFailTaskRunForTest(
+			ctx,
+			globalDB,
+			taskpkg.NewForceFailRunMutation(run, " ", time.Time{}),
+		); !errors.Is(err, taskpkg.ErrValidation) {
+			t.Fatalf("ForceFailTaskRun(empty reason) error = %v, want %v", err, taskpkg.ErrValidation)
+		}
+
+		result, err := forceFailTaskRunForTest(
+			ctx,
+			globalDB,
+			taskpkg.NewForceFailRunMutation(
+				run,
+				"operator recovery "+rawToken,
+				run.QueuedAt.Add(3*time.Minute),
+			),
+		)
+		if err != nil {
+			t.Fatalf("ForceFailTaskRun() error = %v", err)
+		}
+		if got, want := result.Run.Status, taskpkg.TaskRunStatusFailed; got != want {
+			t.Fatalf("Run.Status = %q, want %q", got, want)
+		}
+		if got, want := result.Run.FailureKind, taskpkg.FailureKindOperatorForced; got != want {
+			t.Fatalf("Run.FailureKind = %q, want %q", got, want)
+		}
+		if strings.Contains(result.Run.Error, rawToken) {
+			t.Fatalf("Run.Error = %q, want raw bearer redacted", result.Run.Error)
+		}
+		if got, want := result.Run.Error, "operator recovery compozy_claim_[REDACTED]"; got != want {
+			t.Fatalf("Run.Error = %q, want %q", got, want)
+		}
+	})
+
+	t.Run("Should reject public force commands when the authorized claim is replaced", func(t *testing.T) {
+		t.Parallel()
+
+		for _, operation := range []string{"release", "fail"} {
+			t.Run("Should reject stale authorized snapshot for "+operation, func(t *testing.T) {
+				t.Parallel()
+
+				ctx := testutil.Context(t)
+				globalDB := openTestGlobalDB(t)
+				taskRecord := taskRecordForTest("task-public-stale-force-" + operation)
+				if err := globalDB.CreateTask(ctx, taskRecord); err != nil {
+					t.Fatalf("CreateTask() error = %v", err)
+				}
+				run := taskRunForTest("run-public-stale-force-"+operation, taskRecord.ID)
+				if err := globalDB.CreateTaskRun(ctx, run); err != nil {
+					t.Fatalf("CreateTaskRun() error = %v", err)
+				}
+				if operation == "release" {
+					run.Status = taskpkg.TaskRunStatusClaimed
+					run.ClaimedBy = actorForTest(taskpkg.ActorKindAgentSession, "sess-claim-a")
+					run.SessionID = "sess-claim-a"
+					run.ClaimTokenHash = "sha256:" + strings.Repeat("a", 64)
+					run.ClaimedAt = run.QueuedAt.Add(time.Second)
+					run.HeartbeatAt = run.ClaimedAt
+					run.LeaseUntil = run.ClaimedAt.Add(5 * time.Minute)
+					if err := globalDB.UpdateNonTerminalTaskRun(ctx, run); err != nil {
+						t.Fatalf("UpdateNonTerminalTaskRun(claim A) error = %v", err)
+					}
+				}
+
+				claimBLease := run.QueuedAt.Add(20 * time.Minute)
+				storeWithInterleaving := &taskMutationInterleavingStore{
+					Store: globalDB,
+					before: func(ctx context.Context) error {
+						_, err := globalDB.db.ExecContext(
+							ctx,
+							`UPDATE task_runs
+							    SET status = 'claimed',
+							        claimed_by_kind = 'agent_session',
+							        claimed_by_ref = 'sess-claim-b',
+							        session_id = 'sess-claim-b',
+							        claim_token_hash = ?,
+							        claimed_at = ?,
+							        heartbeat_at = ?,
+							        lease_until = ?
+							  WHERE id = ?`,
+							"sha256:"+strings.Repeat("b", 64),
+							store.FormatTimestamp(run.QueuedAt.Add(10*time.Minute)),
+							store.FormatTimestamp(run.QueuedAt.Add(10*time.Minute)),
+							store.FormatTimestamp(claimBLease),
+							run.ID,
+						)
+						return err
+					},
+				}
+				manager, err := taskpkg.NewManager(taskpkg.WithStore(storeWithInterleaving))
+				if err != nil {
+					t.Fatalf("NewManager() error = %v", err)
+				}
+				actor := operatorActorContextForTest("operator:stale-force-" + operation)
+				if operation == "release" {
+					_, err = manager.ForceReleaseRun(
+						ctx,
+						run.ID,
+						taskpkg.ForceReleaseRun{Reason: "operator handoff"},
+						actor,
+					)
+				} else {
+					_, err = manager.ForceFailRun(
+						ctx,
+						run.ID,
+						taskpkg.ForceFailRun{Reason: "operator recovery"},
+						actor,
+					)
+				}
+				if !errors.Is(err, taskpkg.ErrInvalidStatusTransition) {
+					t.Fatalf("public force %s error = %v, want %v", operation, err, taskpkg.ErrInvalidStatusTransition)
+				}
+				persisted, getErr := globalDB.GetTaskRun(ctx, run.ID)
+				if getErr != nil {
+					t.Fatalf("GetTaskRun() error = %v", getErr)
+				}
+				if persisted.Status.Normalize() != taskpkg.TaskRunStatusClaimed ||
+					persisted.SessionID != "sess-claim-b" ||
+					persisted.ClaimTokenHash != "sha256:"+strings.Repeat("b", 64) ||
+					!persisted.LeaseUntil.Equal(claimBLease) {
+					t.Fatalf("persisted replacement claim = %#v, want claim B unchanged", persisted)
+				}
+			})
+		}
+	})
+
+	t.Run("Should recover a session-bound source and invalidate its pending input atomically", func(t *testing.T) {
+		t.Parallel()
+
+		ctx := testutil.Context(t)
+		globalDB := openTestGlobalDB(t)
+		taskRecord := taskRecordForTest("task-recover-session-input")
+		if err := globalDB.CreateTask(ctx, taskRecord); err != nil {
+			t.Fatalf("CreateTask() error = %v", err)
+		}
+		run := taskRunForTest("run-recover-session-input", taskRecord.ID)
+		if err := globalDB.CreateTaskRun(ctx, run); err != nil {
+			t.Fatalf("CreateTaskRun() error = %v", err)
+		}
+		sessionID := registerInputQueueSession(t, globalDB)
+		claimed := run
+		claimed.Status = taskpkg.TaskRunStatusClaimed
+		claimed.ClaimedBy = actorForTest(taskpkg.ActorKindAgentSession, sessionID)
+		claimed.SessionID = sessionID
+		claimed.ClaimTokenHash = "sha256:" + strings.Repeat("c", 64)
+		claimed.ClaimedAt = run.QueuedAt.Add(time.Second)
+		claimed.HeartbeatAt = claimed.ClaimedAt
+		claimed.LeaseUntil = claimed.ClaimedAt.Add(5 * time.Minute)
+		if err := globalDB.UpdateNonTerminalTaskRun(ctx, claimed); err != nil {
+			t.Fatalf("UpdateNonTerminalTaskRun(claimed) error = %v", err)
+		}
+		input, _, err := globalDB.EnqueueSessionInput(ctx, store.SessionInputQueueInsert{
+			ID:                "inq-recover-session-input",
+			SessionID:         sessionID,
+			Mode:              store.SessionInputQueueModeQueue,
+			Text:              "prompt for stale attention session",
+			SessionGeneration: 0,
+			QueueCap:          10,
+			Now:               claimed.ClaimedAt,
+		})
+		if err != nil {
+			t.Fatalf("EnqueueSessionInput() error = %v", err)
+		}
+		manager, err := taskpkg.NewManager(taskpkg.WithStore(globalDB))
+		if err != nil {
+			t.Fatalf("NewManager() error = %v", err)
+		}
+		actor := operatorActorContextForTest("operator:recover-session-input")
+		if _, err := manager.MarkRunNeedsAttention(ctx, run.ID, "operator review", actor); err != nil {
+			t.Fatalf("MarkRunNeedsAttention() error = %v", err)
+		}
+
+		recovered, err := manager.RecoverRun(
+			ctx,
+			run.ID,
+			taskpkg.RecoverRunRequest{Reason: "resume work"},
+			actor,
+		)
+		if err != nil {
+			t.Fatalf("RecoverRun() error = %v", err)
+		}
+		if recovered.PreviousRun.Status.Normalize() != taskpkg.TaskRunStatusFailed ||
+			recovered.PreviousRun.SessionID != sessionID ||
+			recovered.Run.Status.Normalize() != taskpkg.TaskRunStatusQueued {
+			t.Fatalf("RecoverRun() = %#v, want session source failed and child queued", recovered)
+		}
+		generation, err := globalDB.CurrentSessionInputGeneration(ctx, sessionID)
+		if err != nil {
+			t.Fatalf("CurrentSessionInputGeneration() error = %v", err)
+		}
+		if generation != 1 {
+			t.Fatalf("session generation = %d, want 1", generation)
+		}
+		storedInput, err := getSessionInputQueueEntry(ctx, globalDB.db, sessionID, input.ID)
+		if err != nil {
+			t.Fatalf("getSessionInputQueueEntry() error = %v", err)
+		}
+		if got, want := storedInput.Status, store.SessionInputQueueStatusCanceled; got != want {
+			t.Fatalf("input status = %q, want %q", got, want)
+		}
+		events, err := globalDB.ListTaskEvents(ctx, taskpkg.EventQuery{
+			TaskID:    taskRecord.ID,
+			RunID:     recovered.Run.ID,
+			EventType: eventspkg.TaskRunRecoveredFromAttention,
+		})
+		if err != nil {
+			t.Fatalf("ListTaskEvents(recovery) error = %v", err)
+		}
+		if got, want := len(events), 1; got != want {
+			t.Fatalf("recovery event count = %d, want %d", got, want)
+		}
+		var payload struct {
+			SessionID            string `json:"session_id"`
+			QueueGeneration      int64  `json:"queue_generation"`
+			CanceledQueuedInputs int    `json:"canceled_queued_inputs"`
+		}
+		if err := json.Unmarshal(events[0].Payload, &payload); err != nil {
+			t.Fatalf("json.Unmarshal(recovery payload) error = %v", err)
+		}
+		if payload.SessionID != sessionID ||
+			payload.QueueGeneration != 1 ||
+			payload.CanceledQueuedInputs != 1 {
+			t.Fatalf("recovery payload = %#v, want session invalidation evidence", payload)
+		}
+	})
+
+	t.Run("Should recover a session-bound source after its session was deleted", func(t *testing.T) {
+		t.Parallel()
+
+		ctx := testutil.Context(t)
+		globalDB := openTestGlobalDB(t)
+		taskRecord := taskRecordForTest("task-recover-deleted-session")
+		if err := globalDB.CreateTask(ctx, taskRecord); err != nil {
+			t.Fatalf("CreateTask() error = %v", err)
+		}
+		run := taskRunForTest("run-recover-deleted-session", taskRecord.ID)
+		if err := globalDB.CreateTaskRun(ctx, run); err != nil {
+			t.Fatalf("CreateTaskRun() error = %v", err)
+		}
+		sessionID := registerInputQueueSession(t, globalDB)
+		claimed := run
+		claimed.Status = taskpkg.TaskRunStatusClaimed
+		claimed.ClaimedBy = actorForTest(taskpkg.ActorKindAgentSession, sessionID)
+		claimed.SessionID = sessionID
+		claimed.ClaimTokenHash = "sha256:" + strings.Repeat("d", 64)
+		claimed.ClaimedAt = run.QueuedAt.Add(time.Second)
+		claimed.HeartbeatAt = claimed.ClaimedAt
+		claimed.LeaseUntil = claimed.ClaimedAt.Add(5 * time.Minute)
+		if err := globalDB.UpdateNonTerminalTaskRun(ctx, claimed); err != nil {
+			t.Fatalf("UpdateNonTerminalTaskRun(claimed) error = %v", err)
+		}
+		manager, err := taskpkg.NewManager(taskpkg.WithStore(globalDB))
+		if err != nil {
+			t.Fatalf("NewManager() error = %v", err)
+		}
+		actor := operatorActorContextForTest("operator:recover-deleted-session")
+		if _, err := manager.MarkRunNeedsAttention(ctx, run.ID, "operator review", actor); err != nil {
+			t.Fatalf("MarkRunNeedsAttention() error = %v", err)
+		}
+		if _, err := globalDB.db.ExecContext(ctx, `DELETE FROM sessions WHERE id = ?`, sessionID); err != nil {
+			t.Fatalf("delete session error = %v", err)
+		}
+
+		recovered, err := manager.RecoverRun(
+			ctx,
+			run.ID,
+			taskpkg.RecoverRunRequest{Reason: "resume work"},
+			actor,
+		)
+		if err != nil {
+			t.Fatalf("RecoverRun() error = %v", err)
+		}
+		if recovered.PreviousRun.Status.Normalize() != taskpkg.TaskRunStatusFailed ||
+			recovered.Run.Status.Normalize() != taskpkg.TaskRunStatusQueued {
+			t.Fatalf("RecoverRun() = %#v, want source failed and child queued", recovered)
+		}
+	})
+
+	t.Run("Should reject every stale lifecycle fence in purpose-specific force writers", func(t *testing.T) {
+		t.Parallel()
+
+		type purposeSpecificMutation struct {
+			name         string
+			sourceStatus taskpkg.RunStatus
+			staleStatus  taskpkg.RunStatus
+			apply        func(context.Context, taskSQLExecutor, taskpkg.Run) error
+		}
+		commandAt := time.Date(2026, 8, 2, 16, 0, 0, 0, time.UTC)
+		operations := []purposeSpecificMutation{
+			{
+				name:         "force release",
+				sourceStatus: taskpkg.TaskRunStatusClaimed,
+				staleStatus:  taskpkg.TaskRunStatusRunning,
+				apply: func(ctx context.Context, exec taskSQLExecutor, previous taskpkg.Run) error {
+					_, err := forceReleaseClaimedTaskRunWithExecutor(
+						ctx,
+						exec,
+						previous,
+						taskpkg.NewRunMutationFence(previous),
+					)
+					return err
+				},
+			},
+			{
+				name:         "force fail",
+				sourceStatus: taskpkg.TaskRunStatusClaimed,
+				staleStatus:  taskpkg.TaskRunStatusRunning,
+				apply: func(ctx context.Context, exec taskSQLExecutor, previous taskpkg.Run) error {
+					_, err := forceFailEligibleTaskRunWithExecutor(
+						ctx,
+						exec,
+						previous,
+						taskpkg.NewRunMutationFence(previous),
+						"operator recovery",
+						commandAt,
+					)
+					return err
+				},
+			},
+			{
+				name:         "recover attention",
+				sourceStatus: taskpkg.TaskRunStatusNeedsAttention,
+				staleStatus:  taskpkg.TaskRunStatusRunning,
+				apply: func(ctx context.Context, exec taskSQLExecutor, previous taskpkg.Run) error {
+					_, err := failNeedsAttentionTaskRunForRecoveryWithExecutor(
+						ctx,
+						exec,
+						previous,
+						taskpkg.NewRunMutationFence(previous),
+						"resume work",
+						commandAt,
+					)
+					return err
+				},
+			},
+			{
+				name:         "complete parent rollup",
+				sourceStatus: taskpkg.TaskRunStatusNeedsAttention,
+				staleStatus:  taskpkg.TaskRunStatusRunning,
+				apply: func(ctx context.Context, exec taskSQLExecutor, previous taskpkg.Run) error {
+					_, err := completeParentRollupTaskRunWithExecutor(ctx, exec, previous, commandAt)
+					return err
+				},
+			},
+		}
+		for _, operation := range operations {
+			t.Run("Should reject stale fences for "+operation.name, func(t *testing.T) {
+				t.Parallel()
+				for _, staleField := range []string{"status", "session_id", "claim_token_hash", "lease_until"} {
+					t.Run("Should reject stale "+staleField, func(t *testing.T) {
+						t.Parallel()
+						assertPurposeSpecificTaskRunMutationRejectsStaleFence(
+							t,
+							operation.name+"-"+staleField,
+							operation.sourceStatus,
+							operation.staleStatus,
+							staleField,
+							operation.apply,
+						)
+					})
+				}
+			})
+		}
+	})
+
+	t.Run("Should retry failed run once and preserve source row", func(t *testing.T) {
+		t.Parallel()
+
+		const rawToken = "compozy_claim_retry-store-secret"
+		globalDB := openTestGlobalDB(t)
+		ctx := testutil.Context(t)
+		taskRecord := taskRecordForTest("task-force-retry")
+		if err := globalDB.CreateTask(ctx, taskRecord); err != nil {
+			t.Fatalf("CreateTask() error = %v", err)
+		}
+		source := taskRunForTest("run-force-retry-source", taskRecord.ID)
+		source.Status = taskpkg.TaskRunStatusFailed
+		source.Error = "failed before retry"
+		source.EndedAt = source.QueuedAt.Add(time.Minute)
+		if err := globalDB.CreateTaskRun(ctx, source); err != nil {
+			t.Fatalf("CreateTaskRun(source) error = %v", err)
+		}
+
+		result, err := retryTaskRunForTest(
+			ctx,
+			globalDB,
+			taskpkg.NewRetryRunMutation(
+				source,
+				"run-force-retry-child",
+				taskpkg.Origin{Kind: taskpkg.OriginKindCLI, Ref: "task.retry"},
+				json.RawMessage(
+					`{"source":"operator","agent_name":"`+rawToken+`"}`,
+				),
+				source.QueuedAt.Add(2*time.Minute),
+			),
+		)
+		if err != nil {
+			t.Fatalf("RetryTaskRun() error = %v", err)
+		}
+		if result.PreviousRun.ID != source.ID || result.PreviousRun.Status != taskpkg.TaskRunStatusFailed {
+			t.Fatalf("PreviousRun = %#v, want unchanged failed source", result.PreviousRun)
+		}
+		if result.Run.PreviousRunID != source.ID || result.Run.Status != taskpkg.TaskRunStatusQueued {
+			t.Fatalf("Run = %#v, want queued retry linked to source", result.Run)
+		}
+		if strings.Contains(string(result.Run.Metadata), rawToken) ||
+			strings.Contains(string(result.Run.Metadata), `"claim_token"`) {
+			t.Fatalf("Run.Metadata leaked raw bearer: %s", result.Run.Metadata)
+		}
+		if !strings.Contains(string(result.Run.Metadata), `"source":"operator"`) {
+			t.Fatalf("Run.Metadata = %s, want safe metadata preserved", result.Run.Metadata)
+		}
+		storedSource, err := globalDB.GetTaskRun(ctx, source.ID)
+		if err != nil {
+			t.Fatalf("GetTaskRun(source) error = %v", err)
+		}
+		if storedSource.Status != taskpkg.TaskRunStatusFailed || storedSource.PreviousRunID != "" {
+			t.Fatalf("stored source = %#v, want failed source unchanged", storedSource)
+		}
+		if _, err := retryTaskRunForTest(
+			ctx,
+			globalDB,
+			taskpkg.NewRetryRunMutation(
+				source,
+				"run-force-retry-duplicate",
+				taskpkg.Origin{Kind: taskpkg.OriginKindCLI, Ref: "task.retry"},
+				nil,
+				source.QueuedAt.Add(3*time.Minute),
+			),
+		); !errors.Is(err, taskpkg.ErrInvalidStatusTransition) {
+			t.Fatalf("RetryTaskRun(duplicate) error = %v, want %v", err, taskpkg.ErrInvalidStatusTransition)
+		}
+	})
+
+	t.Run("Should reject retry metadata that exceeds the limit after redaction", func(t *testing.T) {
+		t.Parallel()
+
+		globalDB := openTestGlobalDB(t)
+		ctx := testutil.Context(t)
+		taskRecord := taskRecordForTest("task-force-retry-size")
+		if err := globalDB.CreateTask(ctx, taskRecord); err != nil {
+			t.Fatalf("CreateTask() error = %v", err)
+		}
+		source := taskRunForTest("run-force-retry-size-source", taskRecord.ID)
+		source.Status = taskpkg.TaskRunStatusFailed
+		source.Error = "failed before retry"
+		source.EndedAt = source.QueuedAt.Add(time.Minute)
+		if err := globalDB.CreateTaskRun(ctx, source); err != nil {
+			t.Fatalf("CreateTaskRun(source) error = %v", err)
+		}
+		expandingMetadata := json.RawMessage(
+			`{"note":"` + strings.Repeat("<", taskpkg.MaxMetadataBytes/4) +
+				`","secret":"compozy_claim_retry-size-secret"}`,
+		)
+		if len(expandingMetadata) >= taskpkg.MaxMetadataBytes {
+			t.Fatalf(
+				"expanding metadata input = %d bytes, want below %d",
+				len(expandingMetadata),
+				taskpkg.MaxMetadataBytes,
+			)
+		}
+
+		_, err := retryTaskRunForTest(
+			ctx,
+			globalDB,
+			taskpkg.NewRetryRunMutation(
+				source,
+				"run-force-retry-size-child",
+				taskpkg.Origin{Kind: taskpkg.OriginKindCLI, Ref: "task.retry"},
+				expandingMetadata,
+				source.QueuedAt.Add(2*time.Minute),
+			),
+		)
+		if !errors.Is(err, taskpkg.ErrPayloadTooLarge) {
+			t.Fatalf("RetryTaskRun(expanding metadata) error = %v, want %v", err, taskpkg.ErrPayloadTooLarge)
+		}
+		runs, listErr := globalDB.ListTaskRuns(ctx, taskpkg.RunQuery{TaskID: taskRecord.ID})
+		if listErr != nil {
+			t.Fatalf("ListTaskRuns() error = %v", listErr)
+		}
+		if got, want := len(runs), 1; got != want {
+			t.Fatalf("len(ListTaskRuns()) = %d, want %d after rejected retry", got, want)
+		}
+		if got, want := runs[0].Status.Normalize(), taskpkg.TaskRunStatusFailed; got != want {
+			t.Fatalf("source status = %q, want %q after rejected retry", got, want)
+		}
+	})
+}
+
+type taskMutationInterleavingStore struct {
+	taskpkg.Store
+	once   sync.Once
+	before func(context.Context) error
+	err    error
+}
+
+func (s *taskMutationInterleavingStore) WithTaskMutationTransaction(
+	ctx context.Context,
+	action string,
+	mutation taskpkg.RunMutation,
+) error {
+	s.once.Do(func() {
+		if s.before != nil {
+			s.err = s.before(ctx)
+		}
+	})
+	if s.err != nil {
+		return s.err
+	}
+	return s.Store.WithTaskMutationTransaction(ctx, action, mutation)
+}
+
+func TestGlobalDBReserveQueuedRunDeduplicatesConcurrentIdempotentRequests(t *testing.T) {
+	t.Parallel()
+
+	globalDB := openTestGlobalDB(t)
+	ctx := testutil.Context(t)
+	taskRecord := taskRecordForTest("task-run-reserve-idempotent")
+	if err := globalDB.CreateTask(ctx, taskRecord); err != nil {
+		t.Fatalf("CreateTask() error = %v", err)
+	}
+
+	origin := taskpkg.Origin{Kind: taskpkg.OriginKindDaemon, Ref: "scheduler"}
+	queuedAt := time.Date(2026, 4, 17, 12, 0, 0, 0, time.UTC)
+	metadata := json.RawMessage(`{"schema":"compozy.harness.detached.v1","wake_target":{"session_id":"sess-wake"}}`)
+	type reserveResult struct {
+		task     taskpkg.Task
+		run      taskpkg.Run
+		existing bool
+		err      error
+	}
+
+	results := make([]reserveResult, 2)
+	runIDs := []string{"run-reserved-a", "run-reserved-b"}
+	var wg sync.WaitGroup
+	wg.Add(len(results))
+	for idx := range results {
+		go func(i int) {
+			defer wg.Done()
+			taskCopy, runCopy, existing, err := globalDB.ReserveQueuedRun(
+				ctx,
+				queuedRunReservationForTest(
+					taskRecord.ID,
+					runIDs[i],
+					"dup-key",
+					origin,
+					metadata,
+					queuedAt,
+				),
+			)
+			results[i] = reserveResult{
+				task:     taskCopy,
+				run:      runCopy,
+				existing: existing,
+				err:      err,
+			}
+		}(idx)
+	}
+	wg.Wait()
+
+	for idx, result := range results {
+		if result.err != nil {
+			t.Fatalf("ReserveQueuedRun(%d) error = %v", idx, result.err)
+		}
+		if got, want := result.task.ID, taskRecord.ID; got != want {
+			t.Fatalf("ReserveQueuedRun(%d) task id = %q, want %q", idx, got, want)
+		}
+		if got, want := result.run.TaskID, taskRecord.ID; got != want {
+			t.Fatalf("ReserveQueuedRun(%d) run task id = %q, want %q", idx, got, want)
+		}
+		if got, want := result.run.IdempotencyKey, "dup-key"; got != want {
+			t.Fatalf("ReserveQueuedRun(%d) idempotency key = %q, want %q", idx, got, want)
+		}
+		if got, want := result.run.Attempt, int32(1); got != want {
+			t.Fatalf("ReserveQueuedRun(%d) attempt = %d, want %d", idx, got, want)
+		}
+		if got, want := string(result.run.Metadata), string(metadata); got != want {
+			t.Fatalf("ReserveQueuedRun(%d) metadata = %s, want %s", idx, got, want)
+		}
+	}
+
+	if results[0].run.ID != results[1].run.ID {
+		t.Fatalf("ReserveQueuedRun() run ids = [%q %q], want same run", results[0].run.ID, results[1].run.ID)
+	}
+
+	existingCount := 0
+	for _, result := range results {
+		if result.existing {
+			existingCount++
+		}
+	}
+	if got, want := existingCount, 1; got != want {
+		t.Fatalf("existing result count = %d, want %d", got, want)
+	}
+
+	runs, err := globalDB.ListTaskRuns(ctx, taskpkg.RunQuery{TaskID: taskRecord.ID})
+	if err != nil {
+		t.Fatalf("ListTaskRuns() error = %v", err)
+	}
+	if got, want := len(runs), 1; got != want {
+		t.Fatalf("len(ListTaskRuns()) = %d, want %d", got, want)
+	}
+	if got, want := runs[0].ID, results[0].run.ID; got != want {
+		t.Fatalf("stored run id = %q, want %q", got, want)
+	}
+
+	storedRun, err := globalDB.GetTaskRunByIdempotencyKey(ctx, "dup-key", origin)
+	if err != nil {
+		t.Fatalf("GetTaskRunByIdempotencyKey() error = %v", err)
+	}
+	if got, want := storedRun.ID, results[0].run.ID; got != want {
+		t.Fatalf("GetTaskRunByIdempotencyKey() id = %q, want %q", got, want)
+	}
+	if got, want := string(storedRun.Metadata), string(metadata); got != want {
+		t.Fatalf("GetTaskRunByIdempotencyKey() metadata = %s, want %s", got, want)
+	}
+}
+
+func TestGlobalDBReserveQueuedRunPersistsResolvedWorktreeSnapshot(t *testing.T) {
+	t.Parallel()
+
+	t.Run("Should persist the resolved worktree policy with a queued reservation", func(t *testing.T) {
+		t.Parallel()
+
+		globalDB := openTestGlobalDB(t)
+		ctx := testutil.Context(t)
+		taskRecord := taskRecordForTest("task-run-reserve-worktree-snapshot")
+		if err := globalDB.CreateTask(ctx, taskRecord); err != nil {
+			t.Fatalf("CreateTask() error = %v", err)
+		}
+		reservation := queuedRunReservationForTest(
+			taskRecord.ID,
+			"run-reserve-worktree-snapshot",
+			"worktree-snapshot-key",
+			taskpkg.Origin{Kind: taskpkg.OriginKindDaemon, Ref: "scheduler"},
+			nil,
+			time.Date(2026, 7, 13, 13, 0, 0, 0, time.UTC),
+		)
+		reservation.ResolvedWorktreeMode = taskpkg.WorktreeModeRef
+		reservation.ResolvedWorktreeRef = "feature-one"
+
+		_, run, existing, err := globalDB.ReserveQueuedRun(ctx, reservation)
+		if err != nil {
+			t.Fatalf("ReserveQueuedRun() error = %v", err)
+		}
+		if existing {
+			t.Fatal("ReserveQueuedRun() existing = true, want false")
+		}
+		if got, want := run.ResolvedWorktreeMode, taskpkg.WorktreeModeRef; got != want {
+			t.Fatalf("ResolvedWorktreeMode = %q, want %q", got, want)
+		}
+		if got, want := run.ResolvedWorktreeRef, "feature-one"; got != want {
+			t.Fatalf("ResolvedWorktreeRef = %q, want %q", got, want)
+		}
+		stored, err := globalDB.GetTaskRun(ctx, run.ID)
+		if err != nil {
+			t.Fatalf("GetTaskRun() error = %v", err)
+		}
+		if got, want := stored.ResolvedWorktreeMode, taskpkg.WorktreeModeRef; got != want {
+			t.Fatalf("stored ResolvedWorktreeMode = %q, want %q", got, want)
+		}
+		if got, want := stored.ResolvedWorktreeRef, "feature-one"; got != want {
+			t.Fatalf("stored ResolvedWorktreeRef = %q, want %q", got, want)
+		}
+	})
+}
+
+func TestGlobalDBReserveQueuedRunRejectsConcurrentOpenRun(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name      string
+		status    taskpkg.RunStatus
+		configure func(taskpkg.Run) taskpkg.Run
+	}{
+		{
+			name:   "Should reject another queued reservation while a queued run exists",
+			status: taskpkg.TaskRunStatusQueued,
+			configure: func(run taskpkg.Run) taskpkg.Run {
+				return run
+			},
+		},
+		{
+			name:   "Should reject another queued reservation while a claimed run exists",
+			status: taskpkg.TaskRunStatusClaimed,
+			configure: func(run taskpkg.Run) taskpkg.Run {
+				run.ClaimedBy = actorForTest(taskpkg.ActorKindDaemon, "scheduler")
+				run.ClaimedAt = run.QueuedAt.Add(30 * time.Second)
+				return run
+			},
+		},
+		{
+			name:   "Should reject another queued reservation while a starting run exists",
+			status: taskpkg.TaskRunStatusStarting,
+			configure: func(run taskpkg.Run) taskpkg.Run {
+				run.ClaimedBy = actorForTest(taskpkg.ActorKindDaemon, "scheduler")
+				run.ClaimedAt = run.QueuedAt.Add(30 * time.Second)
+				run.SessionID = "sess-open-starting"
+				run.StartedAt = run.QueuedAt.Add(time.Minute)
+				return run
+			},
+		},
+		{
+			name:   "Should reject another queued reservation while a running run exists",
+			status: taskpkg.TaskRunStatusRunning,
+			configure: func(run taskpkg.Run) taskpkg.Run {
+				run.ClaimedBy = actorForTest(taskpkg.ActorKindDaemon, "scheduler")
+				run.ClaimedAt = run.QueuedAt.Add(30 * time.Second)
+				run.SessionID = "sess-open-running"
+				run.StartedAt = run.QueuedAt.Add(time.Minute)
+				return run
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			globalDB := openTestGlobalDB(t)
+			ctx := testutil.Context(t)
+			taskRecord := taskRecordForTest("task-run-reserve-open-guard")
+			if err := globalDB.CreateTask(ctx, taskRecord); err != nil {
+				t.Fatalf("CreateTask() error = %v", err)
+			}
+
+			origin := taskpkg.Origin{Kind: taskpkg.OriginKindDaemon, Ref: "scheduler"}
+			queuedAt := time.Date(2026, 4, 17, 12, 0, 0, 0, time.UTC)
+			_, firstRun, existing, err := globalDB.ReserveQueuedRun(
+				ctx,
+				queuedRunReservationForTest(
+					taskRecord.ID,
+					"run-reserved-open-a",
+					"open-key",
+					origin,
+					nil,
+					queuedAt,
+				),
+			)
+			if err != nil {
+				t.Fatalf("ReserveQueuedRun(first) error = %v", err)
+			}
+			if existing {
+				t.Fatal("ReserveQueuedRun(first) existing = true, want false")
+			}
+
+			storedFirstRun, err := globalDB.GetTaskRun(ctx, firstRun.ID)
+			if err != nil {
+				t.Fatalf("GetTaskRun(first) error = %v", err)
+			}
+			storedFirstRun.Status = tt.status
+			storedFirstRun = tt.configure(storedFirstRun)
+			if err := globalDB.UpdateNonTerminalTaskRun(ctx, storedFirstRun); err != nil {
+				t.Fatalf("UpdateTaskRun(%s) error = %v", tt.status, err)
+			}
+
+			_, duplicateRun, duplicateExisting, err := globalDB.ReserveQueuedRun(
+				ctx,
+				queuedRunReservationForTest(
+					taskRecord.ID,
+					"run-reserved-open-duplicate",
+					"open-key",
+					origin,
+					nil,
+					queuedAt.Add(time.Second),
+				),
+			)
+			if err != nil {
+				t.Fatalf("ReserveQueuedRun(idempotent duplicate) error = %v", err)
+			}
+			if !duplicateExisting {
+				t.Fatal("ReserveQueuedRun(idempotent duplicate) existing = false, want true")
+			}
+			if got, want := duplicateRun.ID, firstRun.ID; got != want {
+				t.Fatalf("ReserveQueuedRun(idempotent duplicate).ID = %q, want %q", got, want)
+			}
+
+			_, secondRun, secondExisting, err := globalDB.ReserveQueuedRun(
+				ctx,
+				queuedRunReservationForTest(
+					taskRecord.ID,
+					"run-reserved-open-b",
+					"new-open-key",
+					origin,
+					nil,
+					queuedAt.Add(2*time.Second),
+				),
+			)
+			if secondExisting {
+				t.Fatal("ReserveQueuedRun(second) existing = true, want false")
+			}
+			if secondRun.ID != "" {
+				t.Fatalf("ReserveQueuedRun(second) run = %#v, want zero value", secondRun)
+			}
+			if !errors.Is(err, taskpkg.ErrInvalidStatusTransition) {
+				t.Fatalf("ReserveQueuedRun(second) error = %v, want %v", err, taskpkg.ErrInvalidStatusTransition)
+			}
+
+			runs, err := globalDB.ListTaskRuns(ctx, taskpkg.RunQuery{TaskID: taskRecord.ID})
+			if err != nil {
+				t.Fatalf("ListTaskRuns() error = %v", err)
+			}
+			if got, want := len(runs), 1; got != want {
+				t.Fatalf("len(ListTaskRuns()) = %d, want %d", got, want)
+			}
+			if got, want := runs[0].ID, firstRun.ID; got != want {
+				t.Fatalf("stored run id = %q, want %q", got, want)
+			}
+		})
+	}
+}
+
+func TestGlobalDBReserveQueuedRunAllowsDesignatedSiblingRuns(t *testing.T) {
+	t.Parallel()
+
+	t.Run("Should allow designated sibling runs and reject conflicting reservations", func(t *testing.T) {
+		t.Parallel()
+
+		globalDB := openTestGlobalDB(t)
+		ctx := testutil.Context(t)
+		taskRecord := taskRecordForTest("task-run-designated-siblings")
+		taskRecord.MaxAttempts = 5
+		if err := globalDB.CreateTask(ctx, taskRecord); err != nil {
+			t.Fatalf("CreateTask() error = %v", err)
+		}
+
+		origin := taskpkg.Origin{Kind: taskpkg.OriginKindDaemon, Ref: "fanout"}
+		queuedAt := time.Date(2026, 7, 1, 16, 0, 0, 0, time.UTC)
+		_, firstRun, firstExisting, err := globalDB.ReserveQueuedRun(
+			ctx,
+			queuedRunReservationForTest(
+				taskRecord.ID,
+				"run-designated-sibling-a",
+				"designated-key-a",
+				origin,
+				nil,
+				queuedAt,
+				"designation-group-a",
+			),
+		)
+		if err != nil {
+			t.Fatalf("ReserveQueuedRun(first) error = %v", err)
+		}
+		if firstExisting {
+			t.Fatal("ReserveQueuedRun(first) existing = true, want false")
+		}
+		_, secondRun, secondExisting, err := globalDB.ReserveQueuedRun(
+			ctx,
+			queuedRunReservationForTest(
+				taskRecord.ID,
+				"run-designated-sibling-b",
+				"designated-key-b",
+				origin,
+				nil,
+				queuedAt.Add(time.Second),
+				"designation-group-a",
+			),
+		)
+		if err != nil {
+			t.Fatalf("ReserveQueuedRun(second same group) error = %v", err)
+		}
+		if secondExisting {
+			t.Fatal("ReserveQueuedRun(second same group) existing = true, want false")
+		}
+		if firstRun.ID == secondRun.ID {
+			t.Fatalf("designated sibling run IDs are equal: %q", firstRun.ID)
+		}
+		for _, run := range []taskpkg.Run{firstRun, secondRun} {
+			if got, want := run.DesignationGroupID, "designation-group-a"; got != want {
+				t.Fatalf("DesignationGroupID(%s) = %q, want %q", run.ID, got, want)
+			}
+		}
+
+		_, undesignatedRun, undesignatedExisting, err := globalDB.ReserveQueuedRun(
+			ctx,
+			queuedRunReservationForTest(
+				taskRecord.ID,
+				"run-designated-sibling-undesignated",
+				"designated-key-undesignated",
+				origin,
+				nil,
+				queuedAt.Add(2*time.Second),
+			),
+		)
+		if undesignatedExisting {
+			t.Fatal("ReserveQueuedRun(undesignated) existing = true, want false")
+		}
+		if undesignatedRun.ID != "" {
+			t.Fatalf("ReserveQueuedRun(undesignated) run = %#v, want zero value", undesignatedRun)
+		}
+		if !errors.Is(err, taskpkg.ErrInvalidStatusTransition) {
+			t.Fatalf("ReserveQueuedRun(undesignated) error = %v, want %v", err, taskpkg.ErrInvalidStatusTransition)
+		}
+
+		_, otherGroupRun, otherGroupExisting, err := globalDB.ReserveQueuedRun(
+			ctx,
+			queuedRunReservationForTest(
+				taskRecord.ID,
+				"run-designated-sibling-other-group",
+				"designated-key-other-group",
+				origin,
+				nil,
+				queuedAt.Add(3*time.Second),
+				"designation-group-b",
+			),
+		)
+		if otherGroupExisting {
+			t.Fatal("ReserveQueuedRun(other group) existing = true, want false")
+		}
+		if otherGroupRun.ID != "" {
+			t.Fatalf("ReserveQueuedRun(other group) run = %#v, want zero value", otherGroupRun)
+		}
+		if !errors.Is(err, taskpkg.ErrInvalidStatusTransition) {
+			t.Fatalf("ReserveQueuedRun(other group) error = %v, want %v", err, taskpkg.ErrInvalidStatusTransition)
+		}
+
+		runs, err := globalDB.ListTaskRuns(ctx, taskpkg.RunQuery{
+			TaskID:             taskRecord.ID,
+			DesignationGroupID: "designation-group-a",
+		})
+		if err != nil {
+			t.Fatalf("ListTaskRuns(designation group) error = %v", err)
+		}
+		if got, want := len(runs), 2; got != want {
+			t.Fatalf("len(ListTaskRuns(designation group)) = %d, want %d", got, want)
+		}
+	})
+}
+
+func TestGlobalDBTaskAndRunReferenceErrors(t *testing.T) {
+	t.Parallel()
+
+	globalDB := openTestGlobalDB(t)
+
+	_, err := globalDB.GetTask(testutil.Context(t), "missing-task")
+	if !errors.Is(err, taskpkg.ErrTaskNotFound) {
+		t.Fatalf("GetTask(missing) error = %v, want ErrTaskNotFound", err)
+	}
+
+	_, err = globalDB.GetTaskRun(testutil.Context(t), "missing-run")
+	if !errors.Is(err, taskpkg.ErrTaskRunNotFound) {
+		t.Fatalf("GetTaskRun(missing) error = %v, want ErrTaskRunNotFound", err)
+	}
+
+	workspaceTask := taskRecordForTest("task-missing-workspace")
+	workspaceTask.Scope = taskpkg.ScopeWorkspace
+	workspaceTask.WorkspaceID = "ws-missing"
+	err = globalDB.CreateTask(testutil.Context(t), workspaceTask)
+	if !errors.Is(err, compozyworkspace.ErrWorkspaceNotFound) {
+		t.Fatalf("CreateTask(missing workspace) error = %v, want ErrWorkspaceNotFound", err)
+	}
+
+	childTask := taskRecordForTest("task-missing-parent")
+	childTask.ParentTaskID = "missing-parent"
+	err = globalDB.CreateTask(testutil.Context(t), childTask)
+	if !errors.Is(err, taskpkg.ErrTaskNotFound) {
+		t.Fatalf("CreateTask(missing parent) error = %v, want ErrTaskNotFound", err)
+	}
+
+	run := taskRunForTest("run-missing-task", "missing-task")
+	err = globalDB.CreateTaskRun(testutil.Context(t), run)
+	if !errors.Is(err, taskpkg.ErrTaskNotFound) {
+		t.Fatalf("CreateTaskRun(missing task) error = %v, want ErrTaskNotFound", err)
+	}
+}
+
+func TestTaskNormalizationDefaultsAndHelpers(t *testing.T) {
+	t.Parallel()
+
+	globalDB := &TaskRepo{repoBase: &repoBase{now: func() time.Time {
+		return time.Date(2026, 4, 14, 15, 0, 0, 0, time.UTC)
+	}}}
+
+	record := taskRecordForTest("task-defaults")
+	record.CreatedAt = time.Time{}
+	record.UpdatedAt = time.Time{}
+	record.Owner = ownershipForTest(taskpkg.OwnerKindHuman, " alice ")
+	normalizedTask, err := globalDB.normalizeTaskForCreate(record)
+	if err != nil {
+		t.Fatalf("normalizeTaskForCreate() error = %v", err)
+	}
+	if !normalizedTask.CreatedAt.Equal(globalDB.now()) {
+		t.Fatalf("normalizeTaskForCreate().CreatedAt = %v, want %v", normalizedTask.CreatedAt, globalDB.now())
+	}
+	if !normalizedTask.UpdatedAt.Equal(globalDB.now()) {
+		t.Fatalf("normalizeTaskForCreate().UpdatedAt = %v, want %v", normalizedTask.UpdatedAt, globalDB.now())
+	}
+	if normalizedTask.Owner == nil || normalizedTask.Owner.Ref != "alice" {
+		t.Fatalf("normalizeTaskForCreate().Owner = %#v, want trimmed owner", normalizedTask.Owner)
+	}
+
+	updateRecord := taskRecordForTest("task-update-default")
+	updateRecord.UpdatedAt = time.Time{}
+	normalizedUpdate, err := globalDB.normalizeTaskForUpdate(updateRecord)
+	if err != nil {
+		t.Fatalf("normalizeTaskForUpdate() error = %v", err)
+	}
+	if !normalizedUpdate.UpdatedAt.Equal(globalDB.now()) {
+		t.Fatalf("normalizeTaskForUpdate().UpdatedAt = %v, want %v", normalizedUpdate.UpdatedAt, globalDB.now())
+	}
+
+	run := taskRunForTest("run-defaults", "task-defaults")
+	run.Attempt = 0
+	run.QueuedAt = time.Time{}
+	normalizedRun, err := globalDB.normalizeTaskRunForCreate(run)
+	if err != nil {
+		t.Fatalf("normalizeTaskRunForCreate() error = %v", err)
+	}
+	if got, want := normalizedRun.Attempt, int32(1); got != want {
+		t.Fatalf("normalizeTaskRunForCreate().Attempt = %d, want %d", got, want)
+	}
+	if !normalizedRun.QueuedAt.Equal(globalDB.now()) {
+		t.Fatalf("normalizeTaskRunForCreate().QueuedAt = %v, want %v", normalizedRun.QueuedAt, globalDB.now())
+	}
+
+	if _, err := requireTaskValue("", "task id"); err == nil {
+		t.Fatal("requireTaskValue(empty) error = nil, want non-nil")
+	}
+
+	decoded, err := decodeTaskJSON(sqlNullStringForTest(`{"ok":true}`), "test")
+	if err != nil {
+		t.Fatalf("decodeTaskJSON(valid) error = %v", err)
+	}
+	if got, want := string(decoded), `{"ok":true}`; got != want {
+		t.Fatalf("decodeTaskJSON(valid) = %q, want %q", got, want)
+	}
+	if _, err := decodeTaskJSON(sqlNullStringForTest(`{"ok":`), "test"); err == nil {
+		t.Fatal("decodeTaskJSON(invalid) error = nil, want non-nil")
+	}
+}
+
+func TestGlobalDBTaskTriageStateRoundTripAndActorIsolation(t *testing.T) {
+	t.Parallel()
+
+	globalDB := openTestGlobalDB(t)
+	taskRecord := taskRecordForTest("task-triage-roundtrip")
+	if err := globalDB.CreateTask(testutil.Context(t), taskRecord); err != nil {
+		t.Fatalf("CreateTask() error = %v", err)
+	}
+
+	aliceState := taskpkg.TriageState{
+		TaskID:             taskRecord.ID,
+		Actor:              taskpkg.ActorIdentity{Kind: taskpkg.ActorKindHuman, Ref: "user:alice"},
+		Read:               true,
+		Archived:           true,
+		Dismissed:          false,
+		LastSeenActivityAt: taskRecord.UpdatedAt.Add(5 * time.Minute),
+		UpdatedAt:          taskRecord.UpdatedAt.Add(6 * time.Minute),
+	}
+	if err := globalDB.UpsertTaskTriageState(testutil.Context(t), aliceState); err != nil {
+		t.Fatalf("UpsertTaskTriageState(alice) error = %v", err)
+	}
+
+	bobState := taskpkg.TriageState{
+		TaskID:    taskRecord.ID,
+		Actor:     taskpkg.ActorIdentity{Kind: taskpkg.ActorKindHuman, Ref: "user:bob"},
+		Read:      false,
+		Archived:  false,
+		Dismissed: true,
+		UpdatedAt: taskRecord.UpdatedAt.Add(7 * time.Minute),
+	}
+	if err := globalDB.UpsertTaskTriageState(testutil.Context(t), bobState); err != nil {
+		t.Fatalf("UpsertTaskTriageState(bob) error = %v", err)
+	}
+
+	storedAlice, err := globalDB.GetTaskTriageState(testutil.Context(t), taskRecord.ID, aliceState.Actor)
+	if err != nil {
+		t.Fatalf("GetTaskTriageState(alice) error = %v", err)
+	}
+	if storedAlice != aliceState {
+		t.Fatalf("storedAlice = %#v, want %#v", storedAlice, aliceState)
+	}
+
+	storedBob, err := globalDB.GetTaskTriageState(testutil.Context(t), taskRecord.ID, bobState.Actor)
+	if err != nil {
+		t.Fatalf("GetTaskTriageState(bob) error = %v", err)
+	}
+	if storedBob != bobState {
+		t.Fatalf("storedBob = %#v, want %#v", storedBob, bobState)
+	}
+
+	aliceState.Archived = false
+	aliceState.Dismissed = true
+	aliceState.UpdatedAt = aliceState.UpdatedAt.Add(time.Minute)
+	if err := globalDB.UpsertTaskTriageState(testutil.Context(t), aliceState); err != nil {
+		t.Fatalf("UpsertTaskTriageState(alice update) error = %v", err)
+	}
+
+	updatedAlice, err := globalDB.GetTaskTriageState(testutil.Context(t), taskRecord.ID, aliceState.Actor)
+	if err != nil {
+		t.Fatalf("GetTaskTriageState(updated alice) error = %v", err)
+	}
+	if updatedAlice != aliceState {
+		t.Fatalf("updatedAlice = %#v, want %#v", updatedAlice, aliceState)
+	}
+
+	if _, err := globalDB.GetTaskTriageState(
+		testutil.Context(t),
+		taskRecord.ID,
+		taskpkg.ActorIdentity{Kind: taskpkg.ActorKindHuman, Ref: "user:charlie"},
+	); !errors.Is(err, taskpkg.ErrTaskTriageStateNotFound) {
+		t.Fatalf("GetTaskTriageState(missing) error = %v, want %v", err, taskpkg.ErrTaskTriageStateNotFound)
+	}
+}
+
+func TestGlobalDBListTaskTriageStatesFiltersByActorAndOrdersByUpdate(t *testing.T) {
+	t.Parallel()
+
+	globalDB := openTestGlobalDB(t)
+	firstTask := taskRecordForTest("task-triage-list-first")
+	secondTask := taskRecordForTest("task-triage-list-second")
+	secondTask.UpdatedAt = secondTask.UpdatedAt.Add(2 * time.Minute)
+	if err := globalDB.CreateTask(testutil.Context(t), firstTask); err != nil {
+		t.Fatalf("CreateTask(firstTask) error = %v", err)
+	}
+	if err := globalDB.CreateTask(testutil.Context(t), secondTask); err != nil {
+		t.Fatalf("CreateTask(secondTask) error = %v", err)
+	}
+
+	alice := taskpkg.ActorIdentity{Kind: taskpkg.ActorKindHuman, Ref: "user:alice"}
+	aliceFirst := taskpkg.TriageState{
+		TaskID:             firstTask.ID,
+		Actor:              alice,
+		Read:               true,
+		LastSeenActivityAt: firstTask.UpdatedAt,
+		UpdatedAt:          firstTask.UpdatedAt.Add(5 * time.Minute),
+	}
+	aliceSecond := taskpkg.TriageState{
+		TaskID:             secondTask.ID,
+		Actor:              alice,
+		Archived:           true,
+		LastSeenActivityAt: secondTask.UpdatedAt,
+		UpdatedAt:          secondTask.UpdatedAt.Add(8 * time.Minute),
+	}
+	bob := taskpkg.TriageState{
+		TaskID:    secondTask.ID,
+		Actor:     taskpkg.ActorIdentity{Kind: taskpkg.ActorKindHuman, Ref: "user:bob"},
+		Dismissed: true,
+		UpdatedAt: secondTask.UpdatedAt.Add(9 * time.Minute),
+	}
+	for _, state := range []taskpkg.TriageState{aliceFirst, aliceSecond, bob} {
+		if err := globalDB.UpsertTaskTriageState(testutil.Context(t), state); err != nil {
+			t.Fatalf("UpsertTaskTriageState(%q/%q) error = %v", state.Actor.Kind, state.Actor.Ref, err)
+		}
+	}
+
+	aliceStates, err := globalDB.ListTaskTriageStates(testutil.Context(t), alice)
+	if err != nil {
+		t.Fatalf("ListTaskTriageStates(alice) error = %v", err)
+	}
+	if got, want := len(aliceStates), 2; got != want {
+		t.Fatalf("len(ListTaskTriageStates(alice)) = %d, want %d", got, want)
+	}
+	if got, want := []string{
+		aliceStates[0].TaskID,
+		aliceStates[1].TaskID,
+	}, []string{
+		secondTask.ID,
+		firstTask.ID,
+	}; !testutil.EqualStringSlices(
+		got,
+		want,
+	) {
+		t.Fatalf("alice task ids = %#v, want %#v", got, want)
+	}
+	if aliceStates[0] != aliceSecond {
+		t.Fatalf("aliceStates[0] = %#v, want %#v", aliceStates[0], aliceSecond)
+	}
+	if aliceStates[1] != aliceFirst {
+		t.Fatalf("aliceStates[1] = %#v, want %#v", aliceStates[1], aliceFirst)
+	}
+
+	bobStates, err := globalDB.ListTaskTriageStates(
+		testutil.Context(t),
+		taskpkg.ActorIdentity{Kind: taskpkg.ActorKindHuman, Ref: "user:bob"},
+	)
+	if err != nil {
+		t.Fatalf("ListTaskTriageStates(bob) error = %v", err)
+	}
+	if got, want := len(bobStates), 1; got != want {
+		t.Fatalf("len(ListTaskTriageStates(bob)) = %d, want %d", got, want)
+	}
+	if bobStates[0] != bob {
+		t.Fatalf("bobStates[0] = %#v, want %#v", bobStates[0], bob)
+	}
+}
+
+func TestGlobalDBRecoverTaskRun(t *testing.T) {
+	t.Parallel()
+
+	t.Run("Should preserve and rebind a Loop-owned run to the same node cell", func(t *testing.T) {
+		t.Parallel()
+
+		globalDB := openLoopTestGlobalDB(t)
+		ctx := testutil.Context(t)
+		now := time.Date(2026, time.August, 20, 12, 0, 0, 0, time.UTC)
+		loopRun, sourceID := seedLiveLoopLivenessCellForTest(t, globalDB, now)
+		source, err := globalDB.GetTaskRun(ctx, sourceID)
+		if err != nil {
+			t.Fatalf("GetTaskRun(source) error = %v", err)
+		}
+		diagnostic := "provider requires operator recovery"
+		var attention taskpkg.RunNeedsAttentionMutation
+		err = globalDB.withTaskMutationTransactionForTest(
+			ctx,
+			"test mark Loop task run needs attention",
+			func(store *taskMutationTxStore) error {
+				var mutationErr error
+				attention, mutationErr = store.MarkRunNeedsAttentionMutation(
+					ctx,
+					taskpkg.NewRunNeedsAttentionCommand(source, diagnostic, now.Add(time.Minute)),
+				)
+				return mutationErr
+			},
+		)
+		if err != nil {
+			t.Fatalf("MarkRunNeedsAttentionMutation() error = %v", err)
+		}
+		if !attention.Applied || attention.Run.Status != taskpkg.TaskRunStatusNeedsAttention {
+			t.Fatalf("MarkRunNeedsAttentionMutation() = %#v, want applied attention", attention)
+		}
+		var attentionFlag, attentionReason string
+		if err := globalDB.db.QueryRowContext(ctx, `SELECT attention_flag, attention_reason
+			FROM loop_node_controls WHERE loop_run_id = ? AND node_id = 'work'`, loopRun.ID).
+			Scan(&attentionFlag, &attentionReason); err != nil {
+			t.Fatalf("read Loop attention control error = %v", err)
+		}
+		if attentionFlag != looppkg.AttentionWaitIntervention || attentionReason != diagnostic {
+			t.Fatalf(
+				"Loop attention = %q/%q, want %q/%q",
+				attentionFlag,
+				attentionReason,
+				looppkg.AttentionWaitIntervention,
+				diagnostic,
+			)
+		}
+
+		result, err := recoverTaskRunForTest(
+			ctx,
+			globalDB,
+			taskpkg.NewRecoverRunMutation(
+				attention.Run,
+				"run-loop-operator-recovery",
+				taskpkg.Origin{Kind: taskpkg.OriginKindCLI, Ref: "operator"},
+				"operator restored provider access",
+				json.RawMessage(`{"operator_note":"credentials refreshed"}`),
+				now.Add(2*time.Minute),
+			),
+		)
+		if err != nil {
+			t.Fatalf("RecoverTaskRun(Loop) error = %v", err)
+		}
+		if result.PreviousRun.Status != taskpkg.TaskRunStatusFailed ||
+			result.Run.Status != taskpkg.TaskRunStatusQueued ||
+			result.Run.PreviousRunID != source.ID {
+			t.Fatalf("RecoverTaskRun(Loop) = %#v, want failed source and linked queued child", result)
+		}
+		if result.Run.RunKind != source.RunKind || result.Run.LoopRunID != source.LoopRunID ||
+			result.Run.WorkspaceID != source.WorkspaceID ||
+			result.Run.DesignationGroupID != source.DesignationGroupID {
+			t.Fatalf("recovered Loop identity = %#v, want source identity %#v", result.Run, source)
+		}
+		if result.Run.RunWorktreeState == nil || source.RunWorktreeState == nil ||
+			*result.Run.RunWorktreeState != *source.RunWorktreeState ||
+			!testutil.EqualStringSlices(result.Run.RequiredCapabilities, source.RequiredCapabilities) ||
+			!testutil.EqualStringSlices(result.Run.PreferredCapabilities, source.PreferredCapabilities) {
+			t.Fatalf("recovered Loop runtime binding = %#v, want source binding %#v", result.Run, source)
+		}
+		var recoveredMetadata struct {
+			Generation       int    `json:"generation"`
+			NodeID           string `json:"node_id"`
+			ItemIndex        int    `json:"item_index"`
+			Attempt          int    `json:"attempt"`
+			Epoch            int64  `json:"epoch"`
+			SessionHandle    string `json:"session_handle"`
+			OperatorNote     string `json:"operator_note"`
+			ContinuationKind string `json:"continuation_kind"`
+		}
+		if err := json.Unmarshal(result.Run.Metadata, &recoveredMetadata); err != nil {
+			t.Fatalf("json.Unmarshal(recovered metadata) error = %v", err)
+		}
+		if recoveredMetadata.Generation != 1 || recoveredMetadata.NodeID != "work" ||
+			recoveredMetadata.ItemIndex != 0 || recoveredMetadata.Attempt != 2 ||
+			recoveredMetadata.Epoch != 5 || recoveredMetadata.SessionHandle != "main" ||
+			recoveredMetadata.OperatorNote != "credentials refreshed" ||
+			recoveredMetadata.ContinuationKind != "" {
+			t.Fatalf("recovered metadata = %#v, want same cell at attempt 2 epoch 5", recoveredMetadata)
+		}
+		var status, boundRunID string
+		var attempt int
+		var epoch int64
+		if err := globalDB.db.QueryRowContext(ctx, `SELECT status, task_run_id, attempt, epoch
+			FROM loop_generation_outputs WHERE loop_run_id = ? AND generation = 1
+			AND node_id = 'work' AND item_index = 0`, loopRun.ID).
+			Scan(&status, &boundRunID, &attempt, &epoch); err != nil {
+			t.Fatalf("read recovered Loop cell error = %v", err)
+		}
+		if status != "enqueued" || boundRunID != result.Run.ID || attempt != 2 || epoch != 5 {
+			t.Fatalf(
+				"recovered Loop cell = %s/%s/a%d/e%d, want enqueued/%s/a2/e5",
+				status,
+				boundRunID,
+				attempt,
+				epoch,
+				result.Run.ID,
+			)
+		}
+		if err := globalDB.db.QueryRowContext(ctx, `SELECT attention_flag, attention_reason
+			FROM loop_node_controls WHERE loop_run_id = ? AND node_id = 'work'`, loopRun.ID).
+			Scan(&attentionFlag, &attentionReason); err != nil {
+			t.Fatalf("read cleared Loop attention error = %v", err)
+		}
+		if attentionFlag != "" || attentionReason != "" {
+			t.Fatalf("cleared Loop attention = %q/%q, want empty", attentionFlag, attentionReason)
+		}
+		events, err := globalDB.ListLoopRunEvents(ctx, looppkg.RunEventQuery{
+			ReadScope:   store.ReadScope{AllProfiles: true},
+			WorkspaceID: loopRun.WorkspaceID,
+			RunID:       loopRun.ID,
+			Limit:       100,
+		})
+		if err != nil {
+			t.Fatalf("ListLoopRunEvents() error = %v", err)
+		}
+		if countLoopEventKindForTest(events, loopRunEventNodeAttentionFlagged) != 1 ||
+			countLoopEventKindForTest(events, loopRunEventNodeAttentionCleared) != 1 ||
+			countLoopEventKindForTest(events, loopRunEventNodeResumed) != 1 {
+			t.Fatalf("Loop recovery events = %#v, want one flagged, cleared, and resumed", events)
+		}
+	})
+
+	t.Run("Should terminalize a needs_attention run and queue a linked child", func(t *testing.T) {
+		t.Parallel()
+
+		const rawToken = "compozy_claim_recover-store-secret"
+		globalDB := openTestGlobalDB(t)
+		ctx := testutil.Context(t)
+		now := time.Date(2026, 5, 28, 12, 0, 0, 0, time.UTC)
+		taskRecord := taskRecordForTest("task-recover")
+		taskRecord.Status = taskpkg.TaskStatusReady
+		if err := globalDB.CreateTask(ctx, taskRecord); err != nil {
+			t.Fatalf("CreateTask() error = %v", err)
+		}
+		source := taskRunForTest("run-recover-source", taskRecord.ID)
+		if err := globalDB.CreateTaskRun(ctx, source); err != nil {
+			t.Fatalf("CreateTaskRun() error = %v", err)
+		}
+		if _, err := globalDB.db.ExecContext(
+			ctx,
+			`UPDATE task_runs SET status = 'needs_attention' WHERE id = ?`,
+			source.ID,
+		); err != nil {
+			t.Fatalf("escalate to needs_attention error = %v", err)
+		}
+		source.Status = taskpkg.TaskRunStatusNeedsAttention
+
+		result, err := recoverTaskRunForTest(
+			ctx,
+			globalDB,
+			taskpkg.NewRecoverRunMutation(
+				source,
+				"run-recover-child",
+				taskpkg.Origin{Kind: taskpkg.OriginKindDaemon, Ref: "scheduler"},
+				"operator unblocked "+rawToken,
+				json.RawMessage(
+					`{"source":"operator","workflow_id":"`+rawToken+`"}`,
+				),
+				now,
+			),
+		)
+		if err != nil {
+			t.Fatalf("RecoverTaskRun() error = %v", err)
+		}
+		if result.PreviousRun.Status.Normalize() != taskpkg.TaskRunStatusFailed {
+			t.Fatalf("PreviousRun.Status = %q, want failed", result.PreviousRun.Status)
+		}
+		if strings.Contains(result.PreviousRun.Error, rawToken) {
+			t.Fatalf("PreviousRun.Error leaked raw bearer: %q", result.PreviousRun.Error)
+		}
+		if got, want := result.PreviousRun.Error, "operator unblocked compozy_claim_[REDACTED]"; got != want {
+			t.Fatalf("PreviousRun.Error = %q, want %q", got, want)
+		}
+		if result.Run.Status.Normalize() != taskpkg.TaskRunStatusQueued {
+			t.Fatalf("Run.Status = %q, want queued", result.Run.Status)
+		}
+		if result.Run.PreviousRunID != source.ID {
+			t.Fatalf("Run.PreviousRunID = %q, want %q", result.Run.PreviousRunID, source.ID)
+		}
+		if result.Run.Attempt != source.Attempt+1 {
+			t.Fatalf("Run.Attempt = %d, want %d", result.Run.Attempt, source.Attempt+1)
+		}
+		if !result.Run.LeaseUntil.IsZero() {
+			t.Fatalf("child carries lease state: lease=%v", result.Run.LeaseUntil)
+		}
+		if strings.Contains(string(result.Run.Metadata), rawToken) ||
+			strings.Contains(string(result.Run.Metadata), `"claim_token"`) {
+			t.Fatalf("Run.Metadata leaked raw bearer: %s", result.Run.Metadata)
+		}
+		if !strings.Contains(string(result.Run.Metadata), `"source":"operator"`) {
+			t.Fatalf("Run.Metadata = %s, want safe metadata preserved", result.Run.Metadata)
+		}
+		stored, err := globalDB.GetTaskRun(ctx, source.ID)
+		if err != nil {
+			t.Fatalf("GetTaskRun(source) error = %v", err)
+		}
+		if stored.Status.Normalize() != taskpkg.TaskRunStatusFailed {
+			t.Fatalf("source status = %q, want failed (terminalized in the same tx)", stored.Status)
+		}
+		if strings.Contains(stored.Error, rawToken) {
+			t.Fatalf("stored source Error leaked raw bearer: %q", stored.Error)
+		}
+	})
+
+	t.Run("Should reject recovering a non-needs_attention run", func(t *testing.T) {
+		t.Parallel()
+
+		globalDB := openTestGlobalDB(t)
+		ctx := testutil.Context(t)
+		taskRecord := taskRecordForTest("task-recover-reject")
+		taskRecord.Status = taskpkg.TaskStatusReady
+		if err := globalDB.CreateTask(ctx, taskRecord); err != nil {
+			t.Fatalf("CreateTask() error = %v", err)
+		}
+		source := taskRunForTest("run-recover-reject", taskRecord.ID)
+		if err := globalDB.CreateTaskRun(ctx, source); err != nil {
+			t.Fatalf("CreateTaskRun() error = %v", err)
+		}
+		if _, err := recoverTaskRunForTest(
+			ctx,
+			globalDB,
+			taskpkg.NewRecoverRunMutation(
+				source,
+				"run-recover-reject-child",
+				taskpkg.Origin{Kind: taskpkg.OriginKindDaemon, Ref: "scheduler"},
+				"",
+				nil,
+				time.Date(2026, 5, 28, 12, 0, 0, 0, time.UTC),
+			),
+		); !errors.Is(err, taskpkg.ErrInvalidStatusTransition) {
+			t.Fatalf("RecoverTaskRun(queued) error = %v, want %v", err, taskpkg.ErrInvalidStatusTransition)
+		}
+	})
+
+	t.Run("Should reject recovery metadata that exceeds the limit after redaction", func(t *testing.T) {
+		t.Parallel()
+
+		globalDB := openTestGlobalDB(t)
+		ctx := testutil.Context(t)
+		taskRecord := taskRecordForTest("task-recover-size")
+		taskRecord.Status = taskpkg.TaskStatusReady
+		if err := globalDB.CreateTask(ctx, taskRecord); err != nil {
+			t.Fatalf("CreateTask() error = %v", err)
+		}
+		source := taskRunForTest("run-recover-size-source", taskRecord.ID)
+		if err := globalDB.CreateTaskRun(ctx, source); err != nil {
+			t.Fatalf("CreateTaskRun() error = %v", err)
+		}
+		if _, err := globalDB.db.ExecContext(
+			ctx,
+			`UPDATE task_runs SET status = 'needs_attention' WHERE id = ?`,
+			source.ID,
+		); err != nil {
+			t.Fatalf("escalate to needs_attention error = %v", err)
+		}
+		source.Status = taskpkg.TaskRunStatusNeedsAttention
+		expandingMetadata := json.RawMessage(
+			`{"note":"` + strings.Repeat("<", taskpkg.MaxMetadataBytes/4) +
+				`","secret":"compozy_claim_recover-size-secret"}`,
+		)
+		if len(expandingMetadata) >= taskpkg.MaxMetadataBytes {
+			t.Fatalf(
+				"expanding metadata input = %d bytes, want below %d",
+				len(expandingMetadata),
+				taskpkg.MaxMetadataBytes,
+			)
+		}
+
+		_, err := recoverTaskRunForTest(
+			ctx,
+			globalDB,
+			taskpkg.NewRecoverRunMutation(
+				source,
+				"run-recover-size-child",
+				taskpkg.Origin{Kind: taskpkg.OriginKindDaemon, Ref: "scheduler"},
+				"operator recovery",
+				expandingMetadata,
+				source.QueuedAt.Add(time.Minute),
+			),
+		)
+		if !errors.Is(err, taskpkg.ErrPayloadTooLarge) {
+			t.Fatalf("RecoverTaskRun(expanding metadata) error = %v, want %v", err, taskpkg.ErrPayloadTooLarge)
+		}
+		runs, listErr := globalDB.ListTaskRuns(ctx, taskpkg.RunQuery{TaskID: taskRecord.ID})
+		if listErr != nil {
+			t.Fatalf("ListTaskRuns() error = %v", listErr)
+		}
+		if got, want := len(runs), 1; got != want {
+			t.Fatalf("len(ListTaskRuns()) = %d, want %d after rejected recovery", got, want)
+		}
+		if got, want := runs[0].Status.Normalize(), taskpkg.TaskRunStatusNeedsAttention; got != want {
+			t.Fatalf("source status = %q, want %q after rejected recovery", got, want)
+		}
+	})
+}
+
+func TestGlobalDBSupervisedRecovery(t *testing.T) {
+	t.Parallel()
+	t.Run("Should preserve a shared designation and account for every linked attempt", func(t *testing.T) {
+		t.Parallel()
+		db := openLoopTestGlobalDB(t)
+		ctx := t.Context()
+		record := taskRecordForTest("task-supervised-designation")
+		record.MaxAttempts = 4
+		if err := db.CreateTask(ctx, record); err != nil {
+			t.Fatal(err)
+		}
+		for attempt := range int32(2) {
+			source := taskRunForTest(fmt.Sprintf("run-supervised-%d", attempt), record.ID)
+			source.Attempt, source.Status, source.SessionID = attempt+1, taskpkg.TaskRunStatusRunning, "sess-supervised"
+			source.DesignationGroupID = "designation-supervised"
+			if err := db.CreateTaskRun(ctx, source); err != nil {
+				t.Fatal(err)
+			}
+		}
+		manager, err := taskpkg.NewManager(taskpkg.WithStore(db))
+		if err != nil {
+			t.Fatal(err)
+		}
+		for range 2 {
+			if err := manager.RecoverSupervisedWork(ctx, taskpkg.SupervisedStop{
+				SessionID: "sess-supervised", WorkspaceID: "ws-1", ProfileID: store.DefaultProfileID,
+				EventID: "session-stop:turn-designation",
+			}); err != nil {
+				t.Fatal(err)
+			}
+		}
+		runs, err := db.ListTaskRuns(ctx, taskpkg.RunQuery{TaskID: record.ID})
+		if err != nil || len(runs) != 4 {
+			t.Fatalf("runs = %#v, %v", runs, err)
+		}
+		children := make(map[string]int32)
+		for _, run := range runs {
+			if run.PreviousRunID == "" {
+				continue
+			}
+			if run.Status != taskpkg.TaskRunStatusQueued || run.DesignationGroupID != "designation-supervised" ||
+				run.Attempt < 3 || run.Attempt > 4 {
+				t.Fatalf("successor = %#v", run)
+			}
+			children[run.PreviousRunID] = run.Attempt
+		}
+		if len(children) != 2 || children["run-supervised-0"]+children["run-supervised-1"] != 7 {
+			t.Fatalf("linked attempts = %#v, want two distinct successors at attempts 3 and 4", children)
+		}
+	})
+	t.Run("Should recover remaining owned runs after one candidate fails", func(t *testing.T) {
+		t.Parallel()
+		db := openLoopTestGlobalDB(t)
+		ctx := t.Context()
+		for _, suffix := range []string{"a", "b"} {
+			record := taskRecordForTest("task-supervised-" + suffix)
+			if err := db.CreateTask(ctx, record); err != nil {
+				t.Fatal(err)
+			}
+			source := taskRunForTest("run-supervised-"+suffix, record.ID)
+			source.Status, source.SessionID = taskpkg.TaskRunStatusRunning, "sess-supervised"
+			if err := db.CreateTaskRun(ctx, source); err != nil {
+				t.Fatal(err)
+			}
+		}
+		if _, err := db.db.ExecContext(ctx, `CREATE TRIGGER reject_supervised_b BEFORE UPDATE OF status ON task_runs
+			WHEN OLD.id = 'run-supervised-b' AND NEW.status = 'failed'
+			BEGIN SELECT RAISE(ABORT, 'recovery temporarily unavailable'); END`); err != nil {
+			t.Fatal(err)
+		}
+		manager, err := taskpkg.NewManager(taskpkg.WithStore(db))
+		if err != nil {
+			t.Fatal(err)
+		}
+		stop := taskpkg.SupervisedStop{SessionID: "sess-supervised", WorkspaceID: "ws-1",
+			ProfileID: store.DefaultProfileID, EventID: "session-stop:turn-multiple"}
+		if err := manager.RecoverSupervisedWork(ctx, stop); err == nil {
+			t.Fatal("partial failure must retain the stop receipt")
+		}
+		recovered, err := db.GetTaskRun(ctx, "run-supervised-a")
+		if err != nil || recovered.Status != taskpkg.TaskRunStatusFailed {
+			t.Fatalf("independent candidate did not settle: %#v, %v", recovered, err)
+		}
+		if _, err := db.db.ExecContext(ctx, "DROP TRIGGER reject_supervised_b"); err != nil {
+			t.Fatal(err)
+		}
+		for range 2 {
+			if err := manager.RecoverSupervisedWork(ctx, stop); err != nil {
+				t.Fatal(err)
+			}
+		}
+		for _, suffix := range []string{"a", "b"} {
+			runs, err := db.ListTaskRuns(ctx, taskpkg.RunQuery{TaskID: "task-supervised-" + suffix})
+			if err != nil || len(runs) != 2 {
+				t.Fatalf("runs = %#v, %v", runs, err)
+			}
+			for _, run := range runs {
+				if run.ID != "run-supervised-"+suffix &&
+					(run.PreviousRunID != "run-supervised-"+suffix || run.Status != taskpkg.TaskRunStatusQueued || run.Attempt != 2) {
+					t.Fatalf("unexpected successor: %#v", run)
+				}
+			}
+			events, err := db.ListTaskEvents(ctx, taskpkg.EventQuery{
+				TaskID: "task-supervised-" + suffix, EventType: "task.run_recovered",
+			})
+			if err != nil || len(events) != 1 {
+				t.Fatalf("recovery history duplicated: %#v, %v", events, err)
+			}
+		}
+	})
+	for _, tc := range []struct {
+		name        string
+		sessionID   string
+		workspaceID string
+		profileID   string
+	}{
+		{"Should ignore a session without owned task work", "sess-unbound", "ws-1", store.DefaultProfileID},
+		{"Should preserve another workspace's work", "sess-supervised", "ws-other", store.DefaultProfileID},
+		{"Should preserve another profile's work", "sess-supervised", "ws-1", "profile-other"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			db := openLoopTestGlobalDB(t)
+			ctx := t.Context()
+			record := taskRecordForTest("task-supervised-scope")
+			record.Scope, record.WorkspaceID = taskpkg.ScopeWorkspace, "ws-1"
+			if err := db.CreateTask(ctx, record); err != nil {
+				t.Fatal(err)
+			}
+			source := taskRunForTest("run-supervised-scope", record.ID)
+			source.Status, source.SessionID = taskpkg.TaskRunStatusRunning, "sess-supervised"
+			if err := db.CreateTaskRun(ctx, source); err != nil {
+				t.Fatal(err)
+			}
+			manager, err := taskpkg.NewManager(taskpkg.WithStore(db))
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := manager.RecoverSupervisedWork(ctx, taskpkg.SupervisedStop{
+				SessionID:   tc.sessionID,
+				WorkspaceID: tc.workspaceID,
+				ProfileID:   tc.profileID,
+				EventID:     "session-stop:turn-scope",
+			}); err != nil {
+				t.Fatal(err)
+			}
+			runs, err := db.ListTaskRuns(ctx, taskpkg.RunQuery{TaskID: record.ID})
+			if err != nil || len(runs) != 1 || runs[0].Status != taskpkg.TaskRunStatusRunning {
+				t.Fatalf("foreign recovery changed work: %#v, %v", runs, err)
+			}
+		})
+	}
+	for _, tc := range []struct {
+		name   string
+		change string
+	}{
+		{"Should preserve a winning success", "UPDATE task_runs SET status = 'completed' WHERE id = ?"},
+		{"Should preserve a winning cancellation", "UPDATE task_runs SET status = 'canceled' WHERE id = ?"},
+		{"Should reject ownership transferred to another session", "UPDATE task_runs SET session_id = 'sess-new-owner' WHERE id = ?"},
+		{"Should preserve completed task intent", "UPDATE tasks SET status = 'completed' WHERE id = (SELECT task_id FROM task_runs WHERE id = ?)"},
+		{"Should preserve canceled task intent", "UPDATE tasks SET status = 'canceled' WHERE id = (SELECT task_id FROM task_runs WHERE id = ?)"},
+		{"Should ignore a deleted run", "DELETE FROM task_runs WHERE id = ?"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			db := openLoopTestGlobalDB(t)
+			ctx := t.Context()
+			record := taskRecordForTest("task-supervised-fence")
+			if err := db.CreateTask(ctx, record); err != nil {
+				t.Fatal(err)
+			}
+			source := taskRunForTest("run-supervised-fence", record.ID)
+			source.Status, source.SessionID = taskpkg.TaskRunStatusRunning, "sess-supervised"
+			if err := db.CreateTaskRun(ctx, source); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := db.db.ExecContext(ctx, tc.change, source.ID); err != nil {
+				t.Fatal(err)
+			}
+			err := db.withTaskMutationTransactionForTest(
+				ctx,
+				"test supervised race",
+				func(tx *taskMutationTxStore) error {
+					result, err := tx.RecoverSupervisedRun(ctx, &taskpkg.SupervisedRunRecoveryMutation{
+						Source: source, NewRunID: "run-unwanted", At: time.Now().UTC(),
+						Stop: taskpkg.SupervisedStop{SessionID: source.SessionID, WorkspaceID: "ws-loop-test",
+							ProfileID: source.ProfileID, EventID: "session-stop:turn-fence"},
+					})
+					if result.Applied || result.Requeued {
+						t.Errorf("stale recovery applied: %#v", result)
+					}
+					return err
+				},
+			)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, err := db.GetTaskRun(ctx, "run-unwanted"); !errors.Is(err, taskpkg.ErrTaskRunNotFound) {
+				t.Fatalf("unexpected successor: %v", err)
+			}
+		})
+	}
+	t.Run("Should atomically advance the owned Loop cell and close its old binding", func(t *testing.T) {
+		t.Parallel()
+		db := openLoopTestGlobalDB(t)
+		ctx := t.Context()
+		at := time.Date(2026, 9, 11, 12, 0, 0, 0, time.UTC)
+		loopRun, sourceID := seedLiveLoopLivenessCellForTest(t, db, at)
+		seedLoopCancellationBindingForTest(
+			t,
+			db,
+			string(loopRun.ID),
+			string(loopRun.WorkspaceID),
+			"main",
+			5,
+			"sess-supervised",
+			at,
+		)
+		if _, err := db.db.ExecContext(ctx, `UPDATE task_runs SET status = 'running', session_id = ?,
+			metadata_json = json_set(metadata_json, '$.node_kind', 'run-agent') WHERE id = ?`, "sess-supervised", sourceID); err != nil {
+			t.Fatal(err)
+		}
+		source, err := db.GetTaskRun(ctx, sourceID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		manager, err := taskpkg.NewManager(taskpkg.WithStore(db))
+		if err != nil {
+			t.Fatal(err)
+		}
+		stop := taskpkg.SupervisedStop{SessionID: source.SessionID, WorkspaceID: source.WorkspaceID,
+			ProfileID: store.DefaultProfileID, EventID: "session-stop:turn-loop"}
+		for range 2 {
+			if err := manager.RecoverSupervisedWork(ctx, stop); err != nil {
+				t.Fatal(err)
+			}
+		}
+		runs, err := db.ListTaskRuns(ctx, taskpkg.RunQuery{TaskID: source.TaskID})
+		if err != nil || len(runs) != 2 {
+			t.Fatalf("runs = %#v, %v", runs, err)
+		}
+		var child taskpkg.Run
+		for _, run := range runs {
+			if run.ID != source.ID {
+				child = run
+			}
+		}
+		if child.PreviousRunID != source.ID || child.LoopRunID != source.LoopRunID ||
+			child.DesignationGroupID != source.DesignationGroupID || !reflect.DeepEqual(child.RunWorktreeState, source.RunWorktreeState) ||
+			!reflect.DeepEqual(child.RequiredCapabilities, source.RequiredCapabilities) {
+			t.Fatalf("child = %#v", child)
+		}
+		var cellRun, bindingState, failureCode string
+		var epoch, attempt int
+		if err := db.db.QueryRowContext(ctx, `SELECT task_run_id, epoch, attempt FROM loop_generation_outputs
+			WHERE loop_run_id = ? AND node_id = 'work'`, loopRun.ID).Scan(&cellRun, &epoch, &attempt); err != nil {
+			t.Fatal(err)
+		}
+		if err := db.db.QueryRowContext(ctx, `SELECT state FROM loop_session_bindings WHERE loop_run_id = ? AND handle = 'main'`, loopRun.ID).
+			Scan(&bindingState); err != nil {
+			t.Fatal(err)
+		}
+		if err := db.db.QueryRowContext(ctx, `SELECT failure_code FROM loop_node_attempts WHERE loop_run_id = ? AND node_id = 'work'`, loopRun.ID).
+			Scan(&failureCode); err != nil {
+			t.Fatal(err)
+		}
+		if cellRun != child.ID || epoch != 5 || attempt != 2 || bindingState != "closed" ||
+			failureCode != taskpkg.SupervisedSilenceReason {
+			t.Fatalf("cell=%s/%d/%d binding=%s cause=%s", cellRun, epoch, attempt, bindingState, failureCode)
+		}
+	})
+	for _, tc := range []struct {
+		name        string
+		status      taskpkg.RunStatus
+		maxAttempts int
+		recoveries  int32
+		wantRetry   bool
+	}{
+		{"Should retry running work with a linked attempt", taskpkg.TaskRunStatusRunning, 3, 0, true},
+		{"Should retry claimed work with a linked attempt", taskpkg.TaskRunStatusClaimed, 3, 0, true},
+		{"Should disable retry with one allowed attempt", taskpkg.TaskRunStatusRunning, 1, 0, false},
+		{"Should count previous lease recoveries against the budget", taskpkg.TaskRunStatusClaimed, 2, 1, false},
+		{"Should retain consumed lease recoveries in the successor", taskpkg.TaskRunStatusRunning, 3, 1, true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			db := openLoopTestGlobalDB(t)
+			ctx := t.Context()
+			record := taskRecordForTest("task-supervised")
+			record.MaxAttempts = tc.maxAttempts
+			if err := db.CreateTask(ctx, record); err != nil {
+				t.Fatal(err)
+			}
+			source := taskRunForTest("run-supervised", record.ID)
+			source.Status, source.SessionID, source.RecoveryCount = tc.status, "sess-supervised", tc.recoveries
+			source.ClaimedBy = &taskpkg.ActorIdentity{Kind: taskpkg.ActorKindAgentSession, Ref: source.SessionID}
+			source.ClaimedAt = source.QueuedAt
+			source.Metadata = json.RawMessage(`{"checkpoint":"committed-part-4"}`)
+			if err := db.CreateTaskRun(ctx, source); err != nil {
+				t.Fatal(err)
+			}
+			manager, err := taskpkg.NewManager(taskpkg.WithStore(db))
+			if err != nil {
+				t.Fatal(err)
+			}
+			stop := taskpkg.SupervisedStop{SessionID: source.SessionID, WorkspaceID: "ws-loop-test",
+				ProfileID: store.DefaultProfileID, EventID: "session-stop:turn-supervised"}
+			var recoveryWG sync.WaitGroup
+			for range 2 {
+				recoveryWG.Go(func() {
+					if err := manager.RecoverSupervisedWork(ctx, stop); err != nil {
+						t.Error(err)
+					}
+				})
+			}
+			recoveryWG.Wait()
+			runs, err := db.ListTaskRuns(ctx, taskpkg.RunQuery{TaskID: record.ID})
+			if err != nil {
+				t.Fatal(err)
+			}
+			previous, err := db.GetTaskRun(ctx, source.ID)
+			if err != nil {
+				t.Fatal(err)
+			}
+			persistedTask, err := db.GetTask(ctx, record.ID)
+			if err != nil || persistedTask.ProfileID != record.ProfileID {
+				t.Fatalf("task profile changed: %q, %v", persistedTask.ProfileID, err)
+			}
+			if !tc.wantRetry {
+				if len(runs) != 1 || previous.Status != taskpkg.TaskRunStatusNeedsAttention ||
+					previous.Error != taskpkg.SupervisedSilenceExhaustedReason {
+					t.Fatalf("exhausted recovery: runs=%#v previous=%#v", runs, previous)
+				}
+				return
+			}
+			if len(runs) != 2 || previous.Status != taskpkg.TaskRunStatusFailed ||
+				previous.Error != taskpkg.SupervisedSilenceReason {
+				t.Fatalf("recovery: runs=%#v previous=%#v", runs, previous)
+			}
+			for _, run := range runs {
+				if run.ID == source.ID {
+					continue
+				}
+				if run.PreviousRunID != source.ID || run.Attempt != 2 || run.RecoveryCount != tc.recoveries ||
+					run.Status != taskpkg.TaskRunStatusQueued || run.SessionID != "" || run.TaskID != source.TaskID ||
+					string(run.Metadata) != string(source.Metadata) {
+					t.Fatalf("successor = %#v", run)
+				}
+			}
+			events, err := db.ListTaskEvents(
+				ctx,
+				taskpkg.EventQuery{TaskID: record.ID, EventType: "task.run_recovered"},
+			)
+			if err != nil || len(events) != 1 {
+				t.Fatalf("recovery events = %#v, %v", events, err)
+			}
+		})
+	}
+}
+
+func forceReleaseTaskRunForTest(
+	ctx context.Context,
+	globalDB *GlobalDB,
+	mutation taskpkg.ForceReleaseRunMutation,
+) (taskpkg.ForceRunMutationResult, error) {
+	result := taskpkg.ForceRunMutationResult{}
+	err := globalDB.withTaskMutationTransactionForTest(
+		ctx,
+		"test force release task run",
+		func(store *taskMutationTxStore) error {
+			var err error
+			result, err = store.ForceReleaseTaskRun(ctx, mutation)
+			return err
+		},
+	)
+	return result, err
+}
+
+func retryTaskRunForTest(
+	ctx context.Context,
+	globalDB *GlobalDB,
+	mutation taskpkg.RetryRunMutation,
+) (taskpkg.RetryRunResult, error) {
+	result := taskpkg.RetryRunResult{}
+	err := globalDB.withTaskMutationTransactionForTest(
+		ctx,
+		"test retry task run",
+		func(store *taskMutationTxStore) error {
+			var err error
+			result, err = store.RetryTaskRun(ctx, mutation)
+			return err
+		},
+	)
+	return result, err
+}
+
+func forceFailTaskRunForTest(
+	ctx context.Context,
+	globalDB *GlobalDB,
+	mutation taskpkg.ForceFailRunMutation,
+) (taskpkg.ForceRunMutationResult, error) {
+	result := taskpkg.ForceRunMutationResult{}
+	err := globalDB.withTaskMutationTransactionForTest(
+		ctx,
+		"test force fail task run",
+		func(store *taskMutationTxStore) error {
+			var err error
+			result, err = store.ForceFailTaskRun(ctx, mutation)
+			return err
+		},
+	)
+	return result, err
+}
+
+func recoverTaskRunForTest(
+	ctx context.Context,
+	globalDB *GlobalDB,
+	mutation taskpkg.RecoverRunMutation,
+) (taskpkg.RetryRunResult, error) {
+	result := taskpkg.RetryRunResult{}
+	err := globalDB.withTaskMutationTransactionForTest(
+		ctx,
+		"test recover task run",
+		func(store *taskMutationTxStore) error {
+			var err error
+			result, err = store.RecoverTaskRun(ctx, mutation)
+			return err
+		},
+	)
+	return result, err
+}
+
+func assertPurposeSpecificTaskRunMutationRejectsStaleFence(
+	t *testing.T,
+	suffix string,
+	sourceStatus taskpkg.RunStatus,
+	staleStatus taskpkg.RunStatus,
+	staleField string,
+	apply func(context.Context, taskSQLExecutor, taskpkg.Run) error,
+) {
+	t.Helper()
+
+	ctx := testutil.Context(t)
+	globalDB := openTestGlobalDB(t)
+	idSuffix := strings.NewReplacer(" ", "-", "_", "-").Replace(suffix)
+	taskRecord := taskRecordForTest("task-purpose-fence-" + idSuffix)
+	if err := globalDB.CreateTask(ctx, taskRecord); err != nil {
+		t.Fatalf("CreateTask() error = %v", err)
+	}
+	run := taskRunForTest("run-purpose-fence-"+idSuffix, taskRecord.ID)
+	if err := globalDB.CreateTaskRun(ctx, run); err != nil {
+		t.Fatalf("CreateTaskRun() error = %v", err)
+	}
+	claimed := run
+	claimed.Status = taskpkg.TaskRunStatusClaimed
+	claimed.ClaimedBy = actorForTest(taskpkg.ActorKindAgentSession, "sess-purpose-fence")
+	claimed.SessionID = "sess-purpose-fence"
+	claimed.ClaimTokenHash = "sha256:" + strings.Repeat("a", 64)
+	claimed.ClaimedAt = run.QueuedAt.Add(time.Second)
+	claimed.HeartbeatAt = run.QueuedAt.Add(time.Second)
+	claimed.LeaseUntil = run.QueuedAt.Add(5 * time.Minute)
+	if err := globalDB.UpdateNonTerminalTaskRun(ctx, claimed); err != nil {
+		t.Fatalf("UpdateNonTerminalTaskRun(claimed) error = %v", err)
+	}
+	if sourceStatus.Normalize() == taskpkg.TaskRunStatusNeedsAttention {
+		if _, err := globalDB.db.ExecContext(
+			ctx,
+			`UPDATE task_runs SET status = 'needs_attention' WHERE id = ?`,
+			claimed.ID,
+		); err != nil {
+			t.Fatalf("set needs_attention source error = %v", err)
+		}
+	}
+	previous, err := globalDB.GetTaskRun(ctx, claimed.ID)
+	if err != nil {
+		t.Fatalf("GetTaskRun(previous) error = %v", err)
+	}
+
+	switch staleField {
+	case "status":
+		_, err = globalDB.db.ExecContext(
+			ctx,
+			`UPDATE task_runs SET status = ? WHERE id = ?`,
+			staleStatus.String(),
+			claimed.ID,
+		)
+	case "session_id":
+		_, err = globalDB.db.ExecContext(
+			ctx,
+			`UPDATE task_runs SET session_id = ? WHERE id = ?`,
+			"sess-stale",
+			claimed.ID,
+		)
+	case "claim_token_hash":
+		_, err = globalDB.db.ExecContext(
+			ctx,
+			`UPDATE task_runs SET claim_token_hash = ? WHERE id = ?`,
+			"sha256:"+strings.Repeat("b", 64),
+			claimed.ID,
+		)
+	case "lease_until":
+		_, err = globalDB.db.ExecContext(
+			ctx,
+			`UPDATE task_runs SET lease_until = ? WHERE id = ?`,
+			store.FormatTimestamp(previous.LeaseUntil.Add(time.Minute)),
+			claimed.ID,
+		)
+	default:
+		t.Fatalf("unsupported stale field %q", staleField)
+	}
+	if err != nil {
+		t.Fatalf("mutate stale fence %q error = %v", staleField, err)
+	}
+	stale, err := globalDB.GetTaskRun(ctx, claimed.ID)
+	if err != nil {
+		t.Fatalf("GetTaskRun(stale) error = %v", err)
+	}
+	if err := apply(ctx, globalDB.db, previous); !errors.Is(err, taskpkg.ErrInvalidStatusTransition) {
+		t.Fatalf("purpose-specific mutation error = %v, want %v", err, taskpkg.ErrInvalidStatusTransition)
+	}
+	after, err := globalDB.GetTaskRun(ctx, claimed.ID)
+	if err != nil {
+		t.Fatalf("GetTaskRun(after) error = %v", err)
+	}
+	if !reflect.DeepEqual(after, stale) {
+		t.Fatalf("run after rejected mutation = %#v, want stale snapshot %#v", after, stale)
+	}
+}
+
+func taskRecordForTest(id string) taskpkg.Task {
+	now := time.Date(2026, 4, 14, 12, 0, 0, 0, time.UTC)
+	return taskpkg.Task{
+		ID:             id,
+		ProfileID:      store.DefaultProfileID,
+		Identifier:     "identifier-" + id,
+		Scope:          taskpkg.ScopeGlobal,
+		Title:          "Task " + id,
+		Description:    "Description for " + id,
+		Priority:       taskpkg.DefaultPriority,
+		MaxAttempts:    taskpkg.DefaultTaskMaxAttempts,
+		Status:         taskpkg.TaskStatusPending,
+		ApprovalPolicy: taskpkg.ApprovalPolicyNone,
+		ApprovalState:  taskpkg.ApprovalStateNotRequired,
+		CreatedBy: taskpkg.ActorIdentity{
+			Kind: taskpkg.ActorKindHuman,
+			Ref:  "user:alice",
+		},
+		Origin: taskpkg.Origin{
+			Kind: taskpkg.OriginKindCLI,
+			Ref:  "cli",
+		},
+		CreatedAt:   now,
+		UpdatedAt:   now,
+		WakeCreator: true,
+	}
+}
+
+func workspaceTaskRecordForTest(id string, workspaceID string) taskpkg.Task {
+	taskRecord := taskRecordForTest(id)
+	taskRecord.Scope = taskpkg.ScopeWorkspace
+	taskRecord.WorkspaceID = workspaceID
+	return taskRecord
+}
+
+type countingTaskCatalogExecutor struct {
+	taskSQLExecutor
+	reads int
+}
+
+func (e *countingTaskCatalogExecutor) QueryContext(
+	ctx context.Context,
+	query string,
+	args ...any,
+) (*sql.Rows, error) {
+	e.reads++
+	return e.taskSQLExecutor.QueryContext(ctx, query, args...)
+}
+
+func (e *countingTaskCatalogExecutor) QueryRowContext(
+	ctx context.Context,
+	query string,
+	args ...any,
+) *sql.Row {
+	e.reads++
+	return e.taskSQLExecutor.QueryRowContext(ctx, query, args...)
+}
+
+func equalTaskCatalogStatusFacets(
+	left []taskpkg.CatalogStatusFacet,
+	right []taskpkg.CatalogStatusFacet,
+) bool {
+	if len(left) != len(right) {
+		return false
+	}
+	for index := range left {
+		if left[index] != right[index] {
+			return false
+		}
+	}
+	return true
+}
+
+func taskBlockRecordForTest(
+	id string,
+	taskID string,
+	kind taskpkg.BlockKind,
+	createdAt time.Time,
+) taskpkg.TaskBlock {
+	return taskpkg.TaskBlock{
+		ID:        id,
+		TaskID:    taskID,
+		Kind:      kind,
+		Reason:    "blocked because " + id,
+		Details:   json.RawMessage(fmt.Sprintf(`{"block_id":%q}`, id)),
+		CreatedBy: taskpkg.ActorIdentity{Kind: taskpkg.ActorKindAgentSession, Ref: "sess-blocker"},
+		CreatedAt: createdAt,
+	}
+}
+
+func storeLeasedTaskRunForBlockTest(
+	ctx context.Context,
+	t *testing.T,
+	globalDB *GlobalDB,
+	taskID string,
+	runID string,
+	sessionID string,
+	rawToken string,
+	leaseUntil time.Time,
+) taskpkg.Run {
+	t.Helper()
+
+	queued := taskRunForTest(runID, taskID)
+	if err := globalDB.CreateTaskRun(ctx, queued); err != nil {
+		t.Fatalf("CreateTaskRun(%q) error = %v", runID, err)
+	}
+	storedQueued, err := globalDB.GetTaskRun(ctx, runID)
+	if err != nil {
+		t.Fatalf("GetTaskRun(%q) error = %v", runID, err)
+	}
+	leased := leasedRunForGlobalTest(t, runID, taskID, sessionID, rawToken, leaseUntil)
+	leased.QueuedAt = queued.QueuedAt
+	leased.WorkspaceID = storedQueued.WorkspaceID
+	if err := globalDB.UpdateNonTerminalTaskRun(ctx, leased); err != nil {
+		t.Fatalf("UpdateTaskRun(%q claimed) error = %v", runID, err)
+	}
+	return leased
+}
+
+func taskRunForTest(id string, taskID string) taskpkg.Run {
+	queuedAt := time.Date(2026, 4, 14, 13, 0, 0, 0, time.UTC)
+	return taskpkg.Run{
+		ID:        id,
+		TaskID:    taskID,
+		Status:    taskpkg.TaskRunStatusQueued,
+		Attempt:   1,
+		Origin:    taskpkg.Origin{Kind: taskpkg.OriginKindDaemon, Ref: "scheduler"},
+		ProfileID: store.DefaultProfileID,
+		QueuedAt:  queuedAt,
+	}
+}
+
+func insertLoopRunForCoordinatorIndexTest(ctx context.Context, t *testing.T, db *sql.DB, id string) {
+	t.Helper()
+
+	now := store.FormatTimestamp(time.Date(2026, 7, 4, 12, 0, 0, 0, time.UTC))
+	if _, err := db.ExecContext(
+		ctx,
+		`INSERT INTO loop_runs (
+			id, profile_id, workspace_id, loop_name, status, last_progress_at, inputs_json
+		) VALUES (?, ?, ?, ?, ?, ?, ?)`,
+		id,
+		store.DefaultProfileID,
+		"ws-loop-index",
+		"software-delivery",
+		"running",
+		now,
+		`{}`,
+	); err != nil {
+		t.Fatalf("insert loop_run %q error = %v", id, err)
+	}
+}
+
+func insertTaskRunForCoordinatorIndexTest(
+	ctx context.Context,
+	db *sql.DB,
+	runID string,
+	taskID string,
+	loopRunID string,
+	runKind string,
+	status string,
+) error {
+	_, err := db.ExecContext(
+		ctx,
+		`INSERT INTO task_runs (
+			id, task_id, status, attempt, origin_kind, origin_ref, queued_at,
+			run_kind, loop_run_id
+		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		runID,
+		taskID,
+		status,
+		1,
+		string(taskpkg.OriginKindDaemon),
+		"loop-coordinator-index-test",
+		store.FormatTimestamp(time.Date(2026, 7, 4, 12, 5, 0, 0, time.UTC)),
+		runKind,
+		loopRunID,
+	)
+	return err
+}
+
+func ownershipForTest(kind taskpkg.OwnerKind, ref string) *taskpkg.Ownership {
+	return &taskpkg.Ownership{Kind: kind, Ref: ref}
+}
+
+func actorForTest(kind taskpkg.ActorKind, ref string) *taskpkg.ActorIdentity {
+	return &taskpkg.ActorIdentity{Kind: kind, Ref: ref}
+}
+
+func assertTaskBlockIDs(t *testing.T, blocks []taskpkg.TaskBlock, want []string) {
+	t.Helper()
+
+	got := make([]string, 0, len(blocks))
+	for _, block := range blocks {
+		got = append(got, block.ID)
+	}
+	if !testutil.EqualStringSlices(got, want) {
+		t.Fatalf("task block ids = %#v, want %#v", got, want)
+	}
+}
+
+func assertTaskBlockRecurrence(
+	t *testing.T,
+	got taskpkg.BlockRecurrence,
+	taskID string,
+	kind taskpkg.BlockKind,
+	count int,
+	updatedAt time.Time,
+) {
+	t.Helper()
+
+	if got.TaskID != taskID ||
+		got.Kind != kind ||
+		got.Count != count ||
+		!got.UpdatedAt.Equal(updatedAt) {
+		t.Fatalf(
+			"task block recurrence = %#v, want task=%q kind=%q count=%d updated_at=%v",
+			got,
+			taskID,
+			kind,
+			count,
+			updatedAt,
+		)
+	}
+}
+
+func assertTaskEqual(t *testing.T, got taskpkg.Task, want taskpkg.Task) {
+	t.Helper()
+
+	if got.ID != want.ID ||
+		got.Identifier != want.Identifier ||
+		got.Scope != want.Scope ||
+		got.WorkspaceID != want.WorkspaceID ||
+		got.ParentTaskID != want.ParentTaskID ||
+		got.Title != want.Title ||
+		got.Description != want.Description ||
+		got.Priority != want.Priority ||
+		got.MaxAttempts != want.MaxAttempts ||
+		got.AutoEnqueueOnReady != want.AutoEnqueueOnReady ||
+		got.Status != want.Status ||
+		got.ApprovalPolicy != want.ApprovalPolicy ||
+		got.ApprovalState != want.ApprovalState ||
+		got.CurrentRunID != want.CurrentRunID ||
+		got.WakeCreator != want.WakeCreator ||
+		got.CreatedBy != want.CreatedBy ||
+		got.Origin != want.Origin ||
+		!got.CreatedAt.Equal(want.CreatedAt) ||
+		!got.UpdatedAt.Equal(want.UpdatedAt) ||
+		!got.ClosedAt.Equal(want.ClosedAt) ||
+		string(got.Metadata) != string(want.Metadata) {
+		t.Fatalf("task = %#v, want %#v", got, want)
+	}
+	assertOwnershipEqual(t, got.Owner, want.Owner)
+	assertNeedsAttentionEqual(t, got.NeedsAttention, want.NeedsAttention)
+}
+
+func assertTaskSummaryMatchesTask(t *testing.T, got *taskpkg.Summary, want taskpkg.Task) {
+	t.Helper()
+
+	if got.ID != want.ID ||
+		got.Identifier != want.Identifier ||
+		got.Scope != want.Scope ||
+		got.WorkspaceID != want.WorkspaceID ||
+		got.ParentTaskID != want.ParentTaskID ||
+		got.Title != want.Title ||
+		got.Priority != want.Priority ||
+		got.MaxAttempts != want.MaxAttempts ||
+		got.AutoEnqueueOnReady != want.AutoEnqueueOnReady ||
+		got.Status != want.Status ||
+		got.ApprovalPolicy != want.ApprovalPolicy ||
+		got.ApprovalState != want.ApprovalState ||
+		got.CurrentRunID != want.CurrentRunID ||
+		got.Draft != (want.Status == taskpkg.TaskStatusDraft) ||
+		got.CreatedBy != want.CreatedBy ||
+		got.Origin != want.Origin ||
+		!got.CreatedAt.Equal(want.CreatedAt) ||
+		!got.UpdatedAt.Equal(want.UpdatedAt) ||
+		!got.ClosedAt.Equal(want.ClosedAt) {
+		t.Fatalf("task summary = %#v, want task %#v", got, want)
+	}
+	assertOwnershipEqual(t, got.Owner, want.Owner)
+}
+
+func assertTaskBlockingSchema(t *testing.T, db *sql.DB) {
+	t.Helper()
+
+	for _, column := range []string{
+		"needs_attention_reason",
+		"needs_attention_at",
+		"needs_attention_by_kind",
+		"needs_attention_by_ref",
+		"wake_creator",
+	} {
+		assertTableHasColumn(t, db, "tasks", column)
+	}
+	assertIndexesPresent(t, db, "tasks",
+		"idx_tasks_scope",
+		"idx_tasks_workspace",
+		"idx_tasks_status",
+		"idx_tasks_priority",
+		"idx_tasks_approval_state",
+		"idx_tasks_parent",
+		"idx_tasks_owner",
+		"idx_tasks_current_run",
+		"idx_tasks_paused",
+		"idx_tasks_review_policy",
+		"idx_tasks_review_round",
+		"idx_tasks_created_by",
+	)
+	assertTablesPresent(t, db, "task_blocks", "task_block_recurrences")
+	assertTableHasColumn(t, db, "task_blocks", "workspace_id")
+	assertIndexesPresent(t, db, "task_blocks", "idx_task_blocks_open", "idx_task_blocks_expiry")
+	assertIndexSQLContains(t, db, "idx_task_blocks_open", "WHERE cleared_at IS NULL")
+	assertIndexSQLContains(t, db, "idx_task_blocks_expiry", "WHERE cleared_at IS NULL AND expires_at IS NOT NULL")
+	assertTableSQLContains(t, db, "task_blocks", "CHECK (kind IN ('needs_input','capability','transient'))")
+	assertTableSQLContains(t, db, "task_blocks", "CHECK (length(reason) > 0)")
+	assertTableSQLContains(t, db, "task_block_recurrences", "PRIMARY KEY (task_id, kind)")
+	assertTableHasColumn(t, db, "task_runs", "metadata_json")
+	assertTableHasColumn(t, db, "task_events", "event_seq")
+	assertIndexesPresent(
+		t,
+		db,
+		"task_events",
+		"uq_task_events_event_seq",
+		"idx_task_events_task_seq",
+		"idx_task_events_type_seq",
+	)
+}
+
+func assertTasksStatusAcceptsNeedsAttention(t *testing.T, globalDB *GlobalDB, taskID string) {
+	t.Helper()
+
+	ctx := testutil.Context(t)
+	record := taskRecordForTest(taskID)
+	if err := globalDB.CreateTask(ctx, record); err != nil {
+		t.Fatalf("CreateTask(%s) error = %v", taskID, err)
+	}
+	if _, err := globalDB.db.ExecContext(
+		ctx,
+		`UPDATE tasks SET status = 'needs_attention' WHERE id = ?`,
+		taskID,
+	); err != nil {
+		t.Fatalf("UPDATE tasks.status to needs_attention error = %v, want nil", err)
+	}
+}
+
+func assertTableHasColumn(t *testing.T, db *sql.DB, table string, column string) {
+	t.Helper()
+
+	columns, err := tableColumns(testutil.Context(t), db, table)
+	if err != nil {
+		t.Fatalf("tableColumns(%s) error = %v", table, err)
+	}
+	if _, ok := columns[column]; !ok {
+		t.Fatalf("tableColumns(%s) missing %q in %#v", table, column, columns)
+	}
+}
+
+func assertTableSQLContains(t *testing.T, db *sql.DB, table string, want string) {
+	t.Helper()
+
+	sqlText := schemaObjectSQL(t, db, "table", table)
+	if !strings.Contains(sqlText, want) {
+		t.Fatalf("sqlite schema for table %s = %q, want substring %q", table, sqlText, want)
+	}
+}
+
+func assertIndexSQLContains(t *testing.T, db *sql.DB, index string, want string) {
+	t.Helper()
+
+	sqlText := schemaObjectSQL(t, db, "index", index)
+	if !strings.Contains(sqlText, want) {
+		t.Fatalf("sqlite schema for index %s = %q, want substring %q", index, sqlText, want)
+	}
+}
+
+func schemaObjectSQL(t *testing.T, db *sql.DB, objectType string, name string) string {
+	t.Helper()
+
+	var sqlText sql.NullString
+	if err := db.QueryRowContext(
+		testutil.Context(t),
+		`SELECT sql FROM sqlite_master WHERE type = ? AND name = ?`,
+		objectType,
+		name,
+	).Scan(&sqlText); err != nil {
+		t.Fatalf("query sqlite_master %s %s error = %v", objectType, name, err)
+	}
+	if !sqlText.Valid {
+		return ""
+	}
+	return strings.TrimSpace(sqlText.String)
+}
+
+func assertTaskRunEqual(t *testing.T, got taskpkg.Run, want taskpkg.Run) {
+	t.Helper()
+
+	if got.ID != want.ID ||
+		got.TaskID != want.TaskID ||
+		got.Status != want.Status ||
+		got.Attempt != want.Attempt ||
+		got.PreviousRunID != want.PreviousRunID ||
+		got.FailureKind != want.FailureKind ||
+		got.SessionID != want.SessionID ||
+		got.Origin != want.Origin ||
+		got.IdempotencyKey != want.IdempotencyKey ||
+		got.ClaimTokenHash != want.ClaimTokenHash ||
+		!got.QueuedAt.Equal(want.QueuedAt) ||
+		!got.ClaimedAt.Equal(want.ClaimedAt) ||
+		!got.StartedAt.Equal(want.StartedAt) ||
+		!got.EndedAt.Equal(want.EndedAt) ||
+		!got.LeaseUntil.Equal(want.LeaseUntil) ||
+		!got.HeartbeatAt.Equal(want.HeartbeatAt) ||
+		got.Error != want.Error ||
+		string(got.Metadata) != string(want.Metadata) ||
+		string(got.ResultValue()) != string(want.ResultValue()) ||
+		!testutil.EqualStringSlices(got.RequiredCapabilities, want.RequiredCapabilities) ||
+		!testutil.EqualStringSlices(got.PreferredCapabilities, want.PreferredCapabilities) {
+		t.Fatalf("task run = %#v, want %#v", got, want)
+	}
+	assertActorEqual(t, got.ClaimedBy, want.ClaimedBy)
+}
+
+func assertQueryPlanUsesIndex(t *testing.T, db *sql.DB, query string, indexName string, args ...any) {
+	t.Helper()
+
+	rows, err := db.QueryContext(testutil.Context(t), "EXPLAIN QUERY PLAN "+query, args...)
+	if err != nil {
+		t.Fatalf("EXPLAIN QUERY PLAN error = %v", err)
+	}
+	defer func() {
+		if closeErr := rows.Close(); closeErr != nil {
+			t.Errorf("close query plan rows: %v", closeErr)
+		}
+	}()
+
+	details := make([]string, 0)
+	for rows.Next() {
+		var (
+			id      int
+			parent  int
+			notUsed int
+			detail  string
+		)
+		if err := rows.Scan(&id, &parent, &notUsed, &detail); err != nil {
+			t.Fatalf("scan query plan error = %v", err)
+		}
+		details = append(details, detail)
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatalf("iterate query plan error = %v", err)
+	}
+	joined := strings.Join(details, "\n")
+	if !strings.Contains(joined, indexName) {
+		t.Fatalf("query plan = %q, want index %q", joined, indexName)
+	}
+}
+
+func assertOwnershipEqual(t *testing.T, got *taskpkg.Ownership, want *taskpkg.Ownership) {
+	t.Helper()
+
+	switch {
+	case got == nil && want == nil:
+		return
+	case got == nil || want == nil:
+		t.Fatalf("ownership = %#v, want %#v", got, want)
+	case *got != *want:
+		t.Fatalf("ownership = %#v, want %#v", *got, *want)
+	}
+}
+
+func assertNeedsAttentionEqual(t *testing.T, got *taskpkg.NeedsAttention, want *taskpkg.NeedsAttention) {
+	t.Helper()
+
+	switch {
+	case got == nil && want == nil:
+		return
+	case got == nil || want == nil:
+		t.Fatalf("needs attention = %#v, want %#v", got, want)
+	case got.Reason != want.Reason || !got.At.Equal(want.At) || got.By != want.By:
+		t.Fatalf("needs attention = %#v, want %#v", *got, *want)
+	}
+}
+
+func assertActorEqual(t *testing.T, got *taskpkg.ActorIdentity, want *taskpkg.ActorIdentity) {
+	t.Helper()
+
+	switch {
+	case got == nil && want == nil:
+		return
+	case got == nil || want == nil:
+		t.Fatalf("actor = %#v, want %#v", got, want)
+	case *got != *want:
+		t.Fatalf("actor = %#v, want %#v", *got, *want)
+	}
+}
+
+func taskSummaryIDs(summaries []taskpkg.Summary) []string {
+	ids := make([]string, 0, len(summaries))
+	for idx := range summaries {
+		ids = append(ids, summaries[idx].ID)
+	}
+	slices.Sort(ids)
+	return ids
+}
+
+func orderedTaskSummaryIDs(summaries []taskpkg.Summary) []string {
+	ids := make([]string, 0, len(summaries))
+	for idx := range summaries {
+		ids = append(ids, summaries[idx].ID)
+	}
+	return ids
+}
+
+func queuedRunReservationForTest(
+	taskID string,
+	runID string,
+	idempotencyKey string,
+	origin taskpkg.Origin,
+	metadata json.RawMessage,
+	queuedAt time.Time,
+	designationGroupID ...string,
+) taskpkg.QueueRunReservation {
+	reservation := taskpkg.QueueRunReservation{
+		TaskID:         taskID,
+		RunID:          runID,
+		IdempotencyKey: idempotencyKey,
+		Origin:         origin,
+		Metadata:       metadata,
+		QueuedAt:       queuedAt,
+	}
+	for _, value := range designationGroupID {
+		if trimmed := strings.TrimSpace(value); trimmed != "" {
+			reservation.DesignationGroupID = trimmed
+			break
+		}
+	}
+	return reservation
+}
+
+func sqlNullStringForTest(value string) sql.NullString {
+	if value == "" {
+		return sql.NullString{}
+	}
+	return sql.NullString{String: value, Valid: true}
+}
+
+func BenchmarkGlobalDBTaskCatalogHistory(b *testing.B) {
+	for _, inbox := range []bool{false, true} {
+		name := "catalog"
+		if inbox {
+			name = "inbox"
+		}
+		b.Run(name, func(b *testing.B) {
+			db := benchmarkTaskCatalogHistoryDB(b)
+			ctx := b.Context()
+			catalogQuery := taskpkg.CatalogQuery{
+				ReadScope: store.ReadScope{ProfileID: store.DefaultProfileID},
+				Scope:     taskpkg.CatalogScopeGlobal,
+				Limit:     50,
+			}
+			inboxQuery := taskpkg.InboxQuery{
+				ReadScope: store.ReadScope{ProfileID: store.DefaultProfileID},
+				Scope:     taskpkg.CatalogScopeGlobal,
+				Limit:     50,
+			}
+			actor := taskpkg.ActorIdentity{Kind: taskpkg.ActorKindHuman, Ref: "benchmark"}
+			b.ReportAllocs()
+			for b.Loop() {
+				if inbox {
+					page, err := db.ListTaskInbox(ctx, inboxQuery, actor)
+					if err != nil || page.Total != 500 {
+						b.Fatalf("ListTaskInbox() total=%d error=%v", page.Total, err)
+					}
+				} else {
+					page, err := db.ListTaskCatalog(ctx, catalogQuery)
+					if err != nil || page.Total != 500 || len(page.Tasks) != 50 {
+						b.Fatalf("ListTaskCatalog() total=%d rows=%d error=%v", page.Total, len(page.Tasks), err)
+					}
+				}
+			}
+		})
+	}
+}
+
+func benchmarkTaskCatalogHistoryDB(b *testing.B) *GlobalDB {
+	b.Helper()
+	ctx := b.Context()
+	db, err := OpenGlobalDB(ctx, filepath.Join(b.TempDir(), GlobalDatabaseName))
+	if err != nil {
+		b.Fatal(err)
+	}
+	b.Cleanup(func() {
+		if err := db.Close(context.WithoutCancel(ctx)); err != nil {
+			b.Error(err)
+		}
+	})
+	const tasks = `WITH RECURSIVE n(value) AS (VALUES(0) UNION ALL SELECT value + 1 FROM n WHERE value < 499)
+ INSERT INTO tasks(id, profile_id, scope, title, status, created_by_kind, created_by_ref,
+ origin_kind, origin_ref, owner_kind, owner_ref, created_at, updated_at)
+ SELECT 'task-' || value, ?, 'global', 'Task ' || value, 'ready', 'human', 'benchmark',
+ 'web', '', 'human', 'benchmark', ?, ? FROM n`
+	at := store.FormatTimestamp(time.Date(2026, 10, 17, 12, 0, 0, 0, time.UTC))
+	if _, err := db.db.ExecContext(ctx, tasks, store.DefaultProfileID, at, at); err != nil {
+		b.Fatal(err)
+	}
+	const runs = `WITH RECURSIVE n(value) AS (VALUES(0) UNION ALL SELECT value + 1 FROM n WHERE value < 14999)
+ INSERT INTO task_runs(id, task_id, status, attempt, origin_kind, origin_ref,
+ queued_at, claimed_at, started_at, ended_at, error)
+ SELECT 'run-' || value, 'task-' || (value % 500), 'failed', value / 500 + 1, 'web', '',
+ ?, ?, ?, ?, printf('%0300d', 0) FROM n`
+	if _, err := db.db.ExecContext(ctx, runs, at, at, at, at); err != nil {
+		b.Fatal(err)
+	}
+	return db
+}
+
+func TestGlobalDBTaskCatalogWorkspaceBreadth(t *testing.T) {
+	t.Parallel()
+	t.Run("Should exclude archived rows from implicit aggregates and retain explicit history", func(t *testing.T) {
+		t.Parallel()
+		db := openTestGlobalDB(t)
+		ctx := t.Context()
+		active := registerWorkspaceForGlobalTests(t, db, "active-project", t.TempDir())
+		archived := registerWorkspaceForGlobalTests(t, db, "archived-project", t.TempDir())
+		for i, id := range []string{"", active, archived} {
+			record := taskRecordForTest(fmt.Sprintf("archive-catalog-%d", i))
+			record.Status = taskpkg.TaskStatusReady
+			if id != "" {
+				record.Scope = taskpkg.ScopeWorkspace
+				record.WorkspaceID = id
+			}
+			if err := db.CreateTask(ctx, record); err != nil {
+				t.Fatal(err)
+			}
+		}
+		if _, err := db.SetWorkspaceArchived(ctx, archived, true); err != nil {
+			t.Fatal(err)
+		}
+		query := taskpkg.CatalogQuery{ReadScope: store.ReadScope{ProfileID: store.DefaultProfileID}, Limit: 1}
+		page, err := db.ListTaskCatalog(ctx, query)
+		if err != nil || page.Total != 2 || len(page.Tasks) != 1 || !page.HasMore {
+			t.Fatalf("default page=%+v err=%v", page, err)
+		}
+		firstID := page.Tasks[0].ID
+		query.Cursor = page.NextCursor
+		page, err = db.ListTaskCatalog(ctx, query)
+		if err != nil || len(page.Tasks) != 1 || page.HasMore {
+			t.Fatalf("second default page=%+v err=%v", page, err)
+		}
+		ids := []string{firstID, page.Tasks[0].ID}
+		slices.Sort(ids)
+		if !slices.Equal(ids, []string{"archive-catalog-0", "archive-catalog-1"}) {
+			t.Fatalf("default task identities = %v", ids)
+		}
+		query.Cursor = ""
+		query.Scope, query.WorkspaceID = taskpkg.CatalogScopeWorkspace, archived
+		page, err = db.ListTaskCatalog(ctx, query)
+		if err != nil || page.Total != 1 || len(page.Tasks) != 1 || page.Tasks[0].WorkspaceID != archived {
+			t.Fatalf("explicit history=%+v err=%v", page, err)
+		}
+	})
+
+	t.Run("Should narrow rows totals and cursors before paging", func(t *testing.T) {
+		t.Parallel()
+		db := openTestGlobalDB(t)
+		ctx := t.Context()
+		a := registerWorkspaceForGlobalTests(t, db, "breadth-a", t.TempDir())
+		b := registerWorkspaceForGlobalTests(t, db, "breadth-b", t.TempDir())
+		for i, ws := range []string{"", a, b} {
+			record := taskRecordForTest(fmt.Sprintf("breadth-%d", i))
+			record.Status = taskpkg.TaskStatusReady
+			if ws != "" {
+				record.Scope = taskpkg.ScopeWorkspace
+				record.WorkspaceID = ws
+			}
+			if err := db.CreateTask(ctx, record); err != nil {
+				t.Fatal(err)
+			}
+		}
+		query := taskpkg.CatalogQuery{
+			ReadScope:     store.ReadScope{ProfileID: store.DefaultProfileID},
+			AllWorkspaces: true,
+			WorkspaceIDs:  []string{a, workspaceaccess.UserSelector},
+			Limit:         1,
+		}
+		page, err := db.ListTaskCatalog(ctx, query)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if page.Total != 2 || len(page.Tasks) != 1 || !page.HasMore {
+			t.Fatalf("page = %#v", page)
+		}
+		query.Cursor = page.NextCursor
+		query.WorkspaceIDs = []string{workspaceaccess.UserSelector, a, a}
+		next, err := db.ListTaskCatalog(ctx, query)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if next.Total != 2 || len(next.Tasks) != 1 || next.HasMore || next.Tasks[0].ID == page.Tasks[0].ID {
+			t.Fatalf("next = %#v", next)
+		}
+		query.WorkspaceIDs = []string{b}
+		if _, err := db.ListTaskCatalog(ctx, query); !errors.Is(err, taskpkg.ErrCatalogCursorInvalid) {
+			t.Fatalf("changed filter error = %v", err)
+		}
+		query.WorkspaceIDs = []string{a, workspaceaccess.UserSelector}
+		query.ReadScope = store.ReadScope{AllProfiles: true}
+		if _, err := db.ListTaskCatalog(ctx, query); !errors.Is(err, taskpkg.ErrCatalogCursorInvalid) {
+			t.Fatalf("changed profile error = %v", err)
+		}
+		user, err := db.ListTaskCatalog(
+			ctx,
+			taskpkg.CatalogQuery{
+				ReadScope:     store.ReadScope{AllProfiles: true},
+				AllWorkspaces: true,
+				WorkspaceIDs:  []string{workspaceaccess.UserSelector},
+			},
+		)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if user.Total != 1 || user.Tasks[0].WorkspaceID != "" {
+			t.Fatalf("User page = %#v", user)
+		}
+		summaries, err := db.ListTasks(
+			ctx,
+			taskpkg.Query{
+				ReadScope:    store.ReadScope{AllProfiles: true},
+				WorkspaceIDs: []string{workspaceaccess.UserSelector, a},
+			},
+		)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(summaries) != 2 {
+			t.Fatalf("dashboard population = %d, want 2", len(summaries))
+		}
+	})
+}
+
+func TestGlobalDBTaskCatalogBreadthQueryPlan(t *testing.T) {
+	t.Parallel()
+	for _, allProfiles := range []bool{false, true} {
+		name := "Should explain one profile recent sort"
+		if allProfiles {
+			name = "Should explain all profiles recent sort"
+		}
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+			db := openTestGlobalDB(t)
+			scope := store.ReadScope{ProfileID: store.DefaultProfileID}
+			if allProfiles {
+				scope = store.ReadScope{AllProfiles: true}
+			}
+			query, err := taskpkg.NormalizeCatalogQuery(
+				taskpkg.CatalogQuery{ReadScope: scope, AllWorkspaces: true, Limit: 10},
+			)
+			if err != nil {
+				t.Fatal(err)
+			}
+			baseWhere, args := taskCatalogBaseFilter(query)
+			where, filterArgs := taskCatalogFilter(query)
+			statement := taskCatalogStatement(
+				"SELECT "+taskCatalogSelectColumns+" FROM catalog",
+				baseWhere,
+				where,
+			) + taskCatalogOrderBy(
+				query.Sort,
+			) + taskCatalogLimitClause(
+				query.Limit+1,
+			)
+			rows, err := db.db.QueryContext(
+				t.Context(),
+				"EXPLAIN QUERY PLAN "+statement,
+				append(args, filterArgs...)...)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer func() {
+				if err := rows.Close(); err != nil {
+					t.Error(err)
+				}
+			}()
+			profileSeek := false
+			for rows.Next() {
+				var id, parent, unused int
+				var detail string
+				if err := rows.Scan(&id, &parent, &unused, &detail); err != nil {
+					t.Fatal(err)
+				}
+				t.Log(detail)
+				if strings.Contains(detail, "SEARCH tasks USING INDEX idx_tasks_profile") {
+					profileSeek = true
+				}
+			}
+			if !allProfiles && !profileSeek {
+				t.Error("one-profile aggregate did not seek idx_tasks_profile")
+			}
+			if err := rows.Err(); err != nil {
+				t.Fatal(err)
+			}
+		})
+	}
+}

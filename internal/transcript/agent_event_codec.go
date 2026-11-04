@@ -1,0 +1,266 @@
+package transcript
+
+import (
+	"encoding/json"
+	"fmt"
+	"strings"
+
+	"github.com/compozy/compozy/internal/acp"
+	"github.com/compozy/compozy/internal/events"
+	"github.com/compozy/compozy/internal/store"
+)
+
+const legacyEventContentKey = "content"
+
+// MarshalAgentEvent converts a runtime ACP event into the canonical stored payload.
+func MarshalAgentEvent(event acp.AgentEvent) (string, error) {
+	return marshalAgentEvent(event, "")
+}
+
+// MarshalPromptInputEvent preserves the exact authored text alongside the
+// effective input sent through prompt hooks.
+func MarshalPromptInputEvent(event acp.AgentEvent, authoredText string) (string, error) {
+	return marshalAgentEvent(event, authoredText)
+}
+
+func marshalAgentEvent(event acp.AgentEvent, authoredText string) (string, error) {
+	typedToolPayload := event.HasToolPayload()
+	event = RedactAgentEvent(event)
+	payload := canonicalPayloadFromAgentEvent(event, authoredText)
+	if event.Compaction != nil {
+		payload.CompactionID = event.Compaction.CompactionID
+		payload.Status = event.Compaction.Status
+		payload.Summary = event.Compaction.Summary
+		payload.Error = event.Compaction.Error
+		payload.CompactionTerminal = event.Compaction.Terminal
+	}
+	payload.NativeTask = nativeTaskPayloadFromObservation(event.NativeTask())
+
+	if len(event.Raw) > 0 {
+		var rawPayload map[string]any
+		if err := json.Unmarshal(event.Raw, &rawPayload); err == nil {
+			applyLegacyRawPayload(&payload, event, rawPayload, typedToolPayload)
+		}
+	}
+	if detail := strings.TrimSpace(event.ToolErrorDetail()); detail != "" {
+		if payload.ToolResult == nil {
+			payload.ToolResult = &ToolResult{}
+		}
+		payload.ToolResult.Error = detail
+	}
+
+	payload.ToolName = firstNonEmpty(payload.ToolName, event.Title)
+	redactCanonicalPayload(&payload)
+
+	data, err := json.Marshal(payload)
+	if err != nil {
+		return "", fmt.Errorf("transcript: marshal agent event: %w", err)
+	}
+	return string(data), nil
+}
+
+func canonicalPayloadFromAgentEvent(event acp.AgentEvent, authoredText string) canonicalEventPayload {
+	return canonicalEventPayload{
+		Schema:            CanonicalSchema,
+		ParentToolCallID:  event.ParentToolCallID(),
+		ProviderToolName:  event.ProviderToolName(),
+		ProviderToolAsync: event.ProviderToolAsync(),
+		Status:            event.ToolStatus(),
+		Type:              event.Type,
+		SessionID:         event.SessionID,
+		TurnID:            event.TurnID,
+		MessageID:         event.MessageIDValue(),
+		RequestID:         event.RequestIDValue(),
+		EventCorrelation:  event.Normalize(),
+		Timestamp:         event.Timestamp,
+		Text:              event.Text,
+		AuthoredText:      authoredText,
+		Title:             event.Title,
+		ToolName:          event.ToolName(),
+		ToolKind:          strings.TrimSpace(event.ToolKind()),
+		ToolCallID:        event.ToolCallID,
+		ToolInput:         event.ToolInput(),
+		ToolError:         event.ToolError(),
+		StopReason:        event.StopReason,
+		PromptStopReason:  event.PromptStopReason,
+		Action:            event.Action,
+		Resource:          event.Resource,
+		Decision:          event.Decision,
+		ResolvedBy:        event.ResolvedByValue(),
+		Error:             event.Error,
+		Failure:           store.CloneSessionFailure(event.Failure),
+		ProviderError:     acp.CloneProviderErrorDiagnostic(event.ProviderError),
+		Synthetic:         clonePromptSyntheticMeta(event.Synthetic),
+		Goal:              event.GoalPromptMeta(),
+		Origin:            event.PromptOrigin(),
+		AvailableCommands: event.AvailableCommandSet().Values(),
+		SkillInvocations:  event.SkillInvocations(),
+		Mentions:          event.Mentions(),
+		Attachments:       event.Attachments(),
+		Delivery:          event.DeliveryManifest(),
+		Usage:             event.Usage,
+		Runtime:           cloneRuntimeActivity(event.Runtime),
+		PromptRuntime:     event.PromptRuntimeSnapshot(),
+	}
+}
+
+func applyLegacyRawPayload(
+	payload *canonicalEventPayload,
+	event acp.AgentEvent,
+	rawPayload map[string]any,
+	typedToolPayload bool,
+) {
+	if retainsRawPayload(event.Type) {
+		payload.Raw = acp.CloneRawMessage(event.Raw)
+	}
+	payload.ToolName = firstNonEmpty(payload.ToolName, legacyToolName(rawPayload))
+	payload.ToolKind = firstNonEmpty(payload.ToolKind, nestedString(rawPayload, "kind"))
+	payload.ToolInput = acp.CloneRawMessage(firstNonEmptyRaw(
+		payload.ToolInput,
+		rawMessageFromValue(rawPayload["rawInput"]),
+	))
+	if event.Type == acp.EventTypeToolResult {
+		rawToolError := strings.EqualFold(nestedString(rawPayload, "status"), "failed")
+		effectiveToolError := rawToolError
+		if typedToolPayload {
+			effectiveToolError = payload.ToolError
+		}
+		payload.ToolResult = buildToolResult(
+			payload.ToolName,
+			effectiveToolError,
+			extractLegacyContentText(rawPayload[legacyEventContentKey]),
+			rawPayload["rawOutput"],
+		)
+		payload.ToolError = effectiveToolError
+	}
+}
+
+func retainsRawPayload(eventType string) bool {
+	switch eventType {
+	case acp.EventTypeSystem, acp.EventTypeCompaction, acp.EventTypeUsage,
+		acp.EventTypePermission, acp.EventTypeClarify,
+		events.SessionCompactionFired, "session.compaction.requested",
+		events.SessionSupervisionWarning, events.SessionSupervisionStopped, events.SessionSupervisionSourceError,
+		events.SessionTurnQuiesced, events.SessionStopEscalated, events.SessionStopVerificationFailed,
+		events.SessionQueueCleared, events.SessionQueueClearFailed,
+		events.TranscriptMarkerCreated, events.TranscriptMarkerRedacted,
+		events.SessionRestartInterrupted, events.SessionRestartAttempt,
+		events.SessionRestartResumed, events.SessionRestartSkipped:
+		return true
+	default:
+		return false
+	}
+}
+
+// UnmarshalAgentEvent converts a canonical stored payload back into an ACP event.
+func UnmarshalAgentEvent(payload string) (acp.AgentEvent, error) {
+	trimmed := strings.TrimSpace(payload)
+	if trimmed == "" {
+		return acp.AgentEvent{}, nil
+	}
+
+	var decoded canonicalEventPayload
+	if err := json.Unmarshal([]byte(trimmed), &decoded); err != nil {
+		return acp.AgentEvent{}, fmt.Errorf("transcript: unmarshal agent event: %w", err)
+	}
+
+	event := acp.AgentEvent{
+		Type:             strings.TrimSpace(decoded.Type),
+		SessionID:        strings.TrimSpace(decoded.SessionID),
+		TurnID:           strings.TrimSpace(decoded.TurnID),
+		EventCorrelation: decoded.Normalize(),
+		Timestamp:        decoded.Timestamp,
+		Text:             decoded.Text,
+		Title:            firstNonEmpty(decoded.Title, decoded.ToolName),
+		ToolCallID:       strings.TrimSpace(decoded.ToolCallID),
+		StopReason:       strings.TrimSpace(decoded.StopReason),
+		PromptStopReason: acp.PromptStopReason(strings.TrimSpace(string(decoded.PromptStopReason))),
+		Action:           strings.TrimSpace(decoded.Action),
+		Resource:         strings.TrimSpace(decoded.Resource),
+		Decision:         strings.TrimSpace(decoded.Decision),
+		Error:            strings.TrimSpace(decoded.Error),
+		Failure:          store.CloneSessionFailure(decoded.Failure),
+		ProviderError:    acp.CloneProviderErrorDiagnostic(decoded.ProviderError),
+		Synthetic:        clonePromptSyntheticMeta(decoded.Synthetic),
+		Usage:            decoded.Usage,
+		Runtime:          cloneRuntimeActivity(decoded.Runtime),
+		Raw:              acp.CloneRawMessage(decoded.Raw),
+	}.WithProviderToolMetadata(decoded.ParentToolCallID, decoded.ProviderToolName, decoded.Status).
+		WithGoalPromptMeta(decoded.Goal).
+		WithPromptOrigin(decoded.Origin).
+		WithRequestID(decoded.RequestID).
+		WithResolvedBy(decoded.ResolvedBy).
+		WithDelivery(decoded.Delivery)
+	if decoded.ProviderToolAsync {
+		event = event.WithProviderToolAsync()
+	}
+	if event.Type == acp.EventTypeCompaction {
+		event.Compaction = &acp.CompactionObservation{
+			CompactionID: decoded.CompactionID,
+			Status:       decoded.Status,
+			Summary:      decoded.Summary,
+			Error:        decoded.Error,
+			Terminal:     decoded.CompactionTerminal,
+		}
+	}
+	if event.Type == acp.EventTypeNativeTask {
+		event = event.WithNativeTask(nativeTaskObservationFromPayload(decoded.NativeTask, event.ToolCallID))
+	}
+	event = event.WithAttachments(decoded.Attachments)
+	event = event.WithSkillInvocations(decoded.SkillInvocations)
+	event = event.WithMentions(decoded.Mentions)
+	event = event.WithPromptRuntime(decoded.PromptRuntime)
+	if messageID := strings.TrimSpace(decoded.MessageID); messageID != "" {
+		event = event.WithMessageID(messageID)
+	}
+	toolErrorDetail := ""
+	if event.Type == acp.EventTypeToolResult && decoded.ToolResult != nil {
+		toolErrorDetail = strings.TrimSpace(decoded.ToolResult.Error)
+	}
+	event = event.WithToolDetail(
+		strings.TrimSpace(decoded.ToolName),
+		decoded.ToolInput,
+		decoded.ToolError,
+		toolErrorDetail,
+	).WithToolKind(decoded.ToolKind)
+	if decoded.AvailableCommands != nil || event.Type == acp.EventTypeAvailableCommands {
+		event = event.WithAvailableCommands(decoded.AvailableCommands)
+	}
+	return RedactAgentEvent(event), nil
+}
+
+func cloneRuntimeActivity(activity *acp.RuntimeActivity) *acp.RuntimeActivity {
+	if activity == nil {
+		return nil
+	}
+	cloned := *activity
+	if activity.TurnStartedAt != nil {
+		turnStartedAt := activity.TurnStartedAt.UTC()
+		cloned.TurnStartedAt = &turnStartedAt
+	}
+	if activity.DeadlineAt != nil {
+		deadlineAt := activity.DeadlineAt.UTC()
+		cloned.DeadlineAt = &deadlineAt
+	}
+	if activity.LastActivityAt != nil {
+		lastActivityAt := activity.LastActivityAt.UTC()
+		cloned.LastActivityAt = &lastActivityAt
+	}
+	if activity.LastProgressAt != nil {
+		lastProgressAt := activity.LastProgressAt.UTC()
+		cloned.LastProgressAt = &lastProgressAt
+	}
+	return &cloned
+}
+
+func clonePromptSyntheticMeta(meta *acp.PromptSyntheticMeta) *acp.PromptSyntheticMeta {
+	if meta == nil {
+		return nil
+	}
+
+	cloned := meta.Normalize()
+	if cloned.IsZero() {
+		return nil
+	}
+	return &cloned
+}

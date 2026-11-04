@@ -1,0 +1,313 @@
+import {
+  Field,
+  FieldGroup,
+  FieldHeader,
+  FieldLabel,
+  HelpTip,
+  Input,
+  NativeSelect,
+  NativeSelectOption,
+  Textarea,
+} from "@compozy/ui";
+
+import type { TaskExecutionProfileSetRequest } from "../types";
+import {
+  normalizeRuntimeACPSelections,
+  type RuntimeModelOption,
+  type RuntimeProviderOption,
+  RuntimeSelector,
+  REASONING_EFFORT_ORDER,
+  type RuntimeSelectorValue,
+} from "@/systems/runtime";
+
+import { TaskWorktreePolicyFields } from "./task-worktree-policy-fields";
+
+export interface TaskSetupFormProps {
+  value: TaskExecutionProfileSetRequest;
+  onChange: (value: TaskExecutionProfileSetRequest) => void;
+  runtime: {
+    providers: RuntimeProviderOption[];
+    models: RuntimeModelOption[];
+    providersLoading: boolean;
+    catalogLoading: boolean;
+    catalogRefreshing: boolean;
+    errorMessage?: string | null;
+    onRefreshCatalog: () => void;
+  };
+  /**
+   * The worktree policy is patched through its own route, so it is passed in
+   * whole rather than shared with this form's replace draft. Absent when the
+   * workspace is not git-backed.
+   */
+  worktreePolicy?: React.ComponentProps<typeof TaskWorktreePolicyFields>;
+  /** Locked while a run is active — every control is visible and inert. */
+  disabled?: boolean;
+}
+
+function listValue(values?: string[]): string {
+  return values?.join(", ") ?? "";
+}
+
+function parseList(value: string): string[] | undefined {
+  const items = value
+    .split(",")
+    .map(item => item.trim())
+    .filter(Boolean);
+  return items.length > 0 ? items : undefined;
+}
+
+function runtimeValue(
+  profile: TaskExecutionProfileSetRequest["worker"] | TaskExecutionProfileSetRequest["review"]
+): RuntimeSelectorValue {
+  const reasoningEffort = profile.reasoning_effort ?? "";
+  return {
+    provider: profile.provider ?? "",
+    model: profile.model ?? "",
+    reasoning_effort: REASONING_EFFORT_ORDER.includes(
+      reasoningEffort as (typeof REASONING_EFFORT_ORDER)[number]
+    )
+      ? (reasoningEffort as RuntimeSelectorValue["reasoning_effort"])
+      : "",
+    acp_options: normalizeRuntimeACPSelections(profile.acp_options),
+  };
+}
+
+export function TaskSetupForm({
+  value,
+  onChange,
+  runtime,
+  worktreePolicy,
+  disabled = false,
+}: TaskSetupFormProps) {
+  const update = <Key extends keyof TaskExecutionProfileSetRequest>(
+    key: Key,
+    next: TaskExecutionProfileSetRequest[Key]
+  ) => onChange({ ...value, [key]: next });
+
+  return (
+    <FieldGroup
+      className="gap-5"
+      data-locked={disabled ? "" : undefined}
+      data-testid="tasks-setup-form"
+    >
+      <fieldset className="flex flex-col gap-3" disabled={disabled}>
+        <legend className="eyebrow mb-1 text-subtle">Worker</legend>
+        <div className="grid gap-3 sm:grid-cols-2">
+          <Field>
+            <FieldLabel htmlFor="tasks-setup-worker-mode">Selection mode</FieldLabel>
+            <NativeSelect
+              id="tasks-setup-worker-mode"
+              onChange={event =>
+                update("worker", {
+                  ...value.worker,
+                  mode: event.target.value as TaskExecutionProfileSetRequest["worker"]["mode"],
+                })
+              }
+              value={value.worker.mode}
+            >
+              <NativeSelectOption value="inherit">Inherit workspace</NativeSelectOption>
+              <NativeSelectOption value="select">Select by policy</NativeSelectOption>
+            </NativeSelect>
+          </Field>
+          <Field>
+            <FieldLabel htmlFor="tasks-setup-worker-agent">Preferred agent</FieldLabel>
+            <Input
+              id="tasks-setup-worker-agent"
+              onChange={event =>
+                update("worker", {
+                  ...value.worker,
+                  agent_name: event.target.value.trim() || undefined,
+                })
+              }
+              value={value.worker.agent_name ?? ""}
+            />
+          </Field>
+        </div>
+        <Field>
+          <FieldLabel id="tasks-setup-worker-runtime-label">Runtime</FieldLabel>
+          <RuntimeSelector
+            ariaLabelledby="tasks-setup-worker-runtime-label"
+            disabled={disabled}
+            loading={runtime.catalogLoading}
+            models={runtime.models}
+            onChange={(next, normalizedSpeed) =>
+              update("worker", {
+                ...value.worker,
+                provider: next.provider || undefined,
+                model: next.model || undefined,
+                reasoning_effort: next.reasoning_effort || undefined,
+                speed: normalizedSpeed ?? value.worker.speed,
+                acp_options: next.acp_options?.length ? next.acp_options : undefined,
+              })
+            }
+            onSpeedChange={speed => update("worker", { ...value.worker, speed })}
+            onRefreshCatalog={runtime.onRefreshCatalog}
+            providers={runtime.providers}
+            refreshing={runtime.catalogRefreshing}
+            triggerId="tasks-setup-worker-runtime"
+            triggerTestId="tasks-setup-worker-runtime"
+            speed={value.worker.speed ?? "normal"}
+            value={runtimeValue(value.worker)}
+          />
+          {runtime.errorMessage ? (
+            <p className="text-form-hint text-warning">{runtime.errorMessage}</p>
+          ) : null}
+        </Field>
+        <Field>
+          <FieldHeader>
+            <FieldLabel htmlFor="tasks-setup-worker-allowed">Allowed agents</FieldLabel>
+            <HelpTip label="About allowed agents">Comma-separated agent names.</HelpTip>
+          </FieldHeader>
+          <Input
+            defaultValue={listValue(value.worker.allowed_agent_names)}
+            id="tasks-setup-worker-allowed"
+            onBlur={event =>
+              update("worker", {
+                ...value.worker,
+                allowed_agent_names: parseList(event.target.value),
+              })
+            }
+          />
+        </Field>
+      </fieldset>
+
+      <fieldset className="flex flex-col gap-3 border-t border-line-soft pt-5" disabled={disabled}>
+        <legend className="eyebrow mb-1 text-subtle">Coordinator</legend>
+        <div className="grid gap-3 sm:grid-cols-2">
+          <Field>
+            <FieldLabel htmlFor="tasks-setup-coordinator-mode">Mode</FieldLabel>
+            <NativeSelect
+              id="tasks-setup-coordinator-mode"
+              onChange={event =>
+                update("coordinator", {
+                  ...value.coordinator,
+                  mode: event.target.value as TaskExecutionProfileSetRequest["coordinator"]["mode"],
+                })
+              }
+              value={value.coordinator.mode}
+            >
+              <NativeSelectOption value="inherit">Inherit workspace</NativeSelectOption>
+              <NativeSelectOption value="guided">Guided</NativeSelectOption>
+            </NativeSelect>
+          </Field>
+          <Field>
+            <FieldLabel htmlFor="tasks-setup-coordinator-agent">Agent</FieldLabel>
+            <Input
+              id="tasks-setup-coordinator-agent"
+              onChange={event =>
+                update("coordinator", {
+                  ...value.coordinator,
+                  agent_name: event.target.value.trim() || undefined,
+                })
+              }
+              value={value.coordinator.agent_name ?? ""}
+            />
+          </Field>
+        </div>
+        <Field>
+          <FieldLabel htmlFor="tasks-setup-coordinator-guidance">Guidance</FieldLabel>
+          <Textarea
+            id="tasks-setup-coordinator-guidance"
+            onChange={event =>
+              update("coordinator", {
+                ...value.coordinator,
+                guidance: event.target.value.trim() || undefined,
+              })
+            }
+            rows={3}
+            value={value.coordinator.guidance ?? ""}
+          />
+        </Field>
+      </fieldset>
+
+      <fieldset className="flex flex-col gap-3 border-t border-line-soft pt-5" disabled={disabled}>
+        <legend className="eyebrow mb-1 text-subtle">Review</legend>
+        <Field>
+          <FieldLabel id="tasks-setup-review-runtime-label">Reviewer runtime</FieldLabel>
+          <RuntimeSelector
+            ariaLabelledby="tasks-setup-review-runtime-label"
+            disabled={disabled}
+            loading={runtime.catalogLoading}
+            models={runtime.models}
+            onChange={(next, normalizedSpeed) =>
+              update("review", {
+                ...value.review,
+                provider: next.provider || undefined,
+                model: next.model || undefined,
+                reasoning_effort: next.reasoning_effort || undefined,
+                speed: normalizedSpeed ?? value.review.speed,
+                acp_options: next.acp_options?.length ? next.acp_options : undefined,
+              })
+            }
+            onSpeedChange={speed => update("review", { ...value.review, speed })}
+            onRefreshCatalog={runtime.onRefreshCatalog}
+            providers={runtime.providers}
+            refreshing={runtime.catalogRefreshing}
+            triggerId="tasks-setup-review-runtime"
+            triggerTestId="tasks-setup-review-runtime"
+            speed={value.review.speed ?? "normal"}
+            value={runtimeValue(value.review)}
+          />
+        </Field>
+        <Field>
+          <FieldHeader>
+            <FieldLabel htmlFor="tasks-setup-review-agents">Allowed reviewers</FieldLabel>
+            <HelpTip label="About allowed reviewers">Comma-separated agent names.</HelpTip>
+          </FieldHeader>
+          <Input
+            defaultValue={listValue(value.review.allowed_agent_names)}
+            id="tasks-setup-review-agents"
+            onBlur={event =>
+              update("review", {
+                ...value.review,
+                allowed_agent_names: parseList(event.target.value),
+              })
+            }
+          />
+        </Field>
+      </fieldset>
+
+      <fieldset
+        className="grid gap-3 border-t border-line-soft pt-5 sm:grid-cols-2"
+        disabled={disabled}
+      >
+        <legend className="eyebrow mb-1 text-subtle">Environment</legend>
+
+        <Field>
+          <FieldLabel htmlFor="tasks-setup-participants">Participant agents</FieldLabel>
+          <Input
+            defaultValue={listValue(value.participants.allowed_agent_names)}
+            id="tasks-setup-participants"
+            onBlur={event =>
+              update("participants", {
+                ...value.participants,
+                allowed_agent_names: parseList(event.target.value),
+              })
+            }
+          />
+        </Field>
+        <Field>
+          <FieldLabel htmlFor="tasks-setup-capabilities">Required capabilities</FieldLabel>
+          <Input
+            defaultValue={listValue(value.participants.required_capabilities)}
+            id="tasks-setup-capabilities"
+            onBlur={event =>
+              update("participants", {
+                ...value.participants,
+                required_capabilities: parseList(event.target.value),
+              })
+            }
+          />
+        </Field>
+        {worktreePolicy ? (
+          <div className="sm:col-span-2">
+            <TaskWorktreePolicyFields
+              {...worktreePolicy}
+              locked={disabled || worktreePolicy.locked}
+            />
+          </div>
+        ) : null}
+      </fieldset>
+    </FieldGroup>
+  );
+}

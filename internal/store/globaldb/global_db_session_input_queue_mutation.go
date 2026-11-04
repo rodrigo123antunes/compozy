@@ -1,0 +1,314 @@
+package globaldb
+
+import (
+	"context"
+	"database/sql"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"log/slog"
+	"slices"
+	"strings"
+	"time"
+
+	"github.com/compozy/compozy/internal/store"
+	"github.com/compozy/compozy/internal/store/globaldb/sqlcgen"
+)
+
+// EnqueueInterruptSessionInput persists replacement input without removing parked work.
+func (g *SessionRepo) EnqueueInterruptSessionInput(
+	ctx context.Context,
+	req store.SessionInputQueueInsert,
+) (entry store.SessionInputQueueEntry, canceled int, err error) {
+	if err := g.checkReady(ctx, "enqueue interrupt session input"); err != nil {
+		return store.SessionInputQueueEntry{}, 0, err
+	}
+	req.Mode = store.SessionInputQueueModeInterrupt
+	req.Delivery = store.SessionInputDeliveryInterruptThenPrompt
+	req = req.Normalize()
+	if err := req.Validate(); err != nil {
+		return store.SessionInputQueueEntry{}, 0, err
+	}
+	err = g.withImmediateTransaction(ctx, "enqueue interrupt session input", func(exec globalSQLExecutor) error {
+		prepared, prepareErr := prepareInterruptSessionInput(ctx, exec, req)
+		if prepareErr != nil {
+			return prepareErr
+		}
+		inserted, insertErr := insertSessionInputQueueEntry(ctx, exec, prepared)
+		if insertErr != nil {
+			return insertErr
+		}
+		entry = inserted
+		return nil
+	})
+	if err != nil {
+		return store.SessionInputQueueEntry{}, 0, err
+	}
+	return entry, canceled, nil
+}
+
+func prepareInterruptSessionInput(
+	ctx context.Context,
+	exec globalSQLExecutor,
+	req store.SessionInputQueueInsert,
+) (store.SessionInputQueueInsert, error) {
+	generation, err := sqlcgen.New(exec).GetSessionInputGeneration(ctx, req.SessionID)
+	if errors.Is(err, sql.ErrNoRows) {
+		return store.SessionInputQueueInsert{}, fmt.Errorf("%w: %s", store.ErrSessionNotFound, req.SessionID)
+	}
+	if err != nil {
+		return store.SessionInputQueueInsert{}, fmt.Errorf("store: read interrupt generation: %w", err)
+	}
+	req.SessionGeneration = generation
+	return req, nil
+}
+
+// ListPendingSessionInputs returns current-generation operator inputs in dispatch order.
+func (g *SessionRepo) ListPendingSessionInputs(
+	ctx context.Context,
+	sessionID string,
+) ([]store.SessionInputQueueEntry, error) {
+	if err := g.checkReady(ctx, "list pending session inputs"); err != nil {
+		return nil, err
+	}
+	target := strings.TrimSpace(sessionID)
+	if target == "" {
+		return nil, errors.New("store: session id is required")
+	}
+	rows, err := g.readQueries.ListPendingSessionInputs(ctx, sqlcgen.ListPendingSessionInputsParams{
+		SessionID:         target,
+		QueuedStatus:      store.SessionInputQueueStatusQueued,
+		DispatchingStatus: store.SessionInputQueueStatusDispatching,
+	})
+	if err != nil {
+		return nil, fmt.Errorf("store: list pending session inputs: %w", err)
+	}
+	entries := make([]store.SessionInputQueueEntry, 0, len(rows))
+	for index := range rows {
+		entry, mapErr := sessionInputQueueFromGenerated(&rows[index])
+		if mapErr != nil {
+			return nil, mapErr
+		}
+		entries = append(entries, entry)
+	}
+	if len(entries) > 0 {
+		caller, err := g.readQueries.GetInstanceCaller(ctx, target)
+		if err != nil {
+			return nil, err
+		}
+		if id, ok := caller.OriginatingInstanceID.(string); ok && id != "" {
+			instance, err := g.readQueries.GetAgentInstance(ctx, id)
+			if err != nil {
+				return nil, err
+			}
+			for i := range entries {
+				entries[i].Held = instance.State == goalStatusPaused &&
+					entries[i].Status == store.SessionInputQueueStatusQueued &&
+					!store.IsHumanSessionInputOriginClass(entries[i].OriginClass)
+			}
+		}
+	}
+	return entries, nil
+}
+
+// ReplaceSessionInput atomically cancels one queued entry and inserts its replacement.
+func (g *SessionRepo) ReplaceSessionInput(
+	ctx context.Context,
+	sessionID string,
+	entryID string,
+	replacement store.SessionInputQueueInsert,
+) (store.SessionInputQueueEntry, bool, error) {
+	replacement.Mode = store.SessionInputQueueModeQueue
+	replacement.Delivery = store.SessionInputDeliveryAfterTurn
+	return g.replacePendingSessionInput(ctx, "replace session input", sessionID, entryID, replacement, false)
+}
+
+// PromoteSessionInputToSteer atomically replaces one queued entry with priority steering input.
+func (g *SessionRepo) PromoteSessionInputToSteer(
+	ctx context.Context,
+	sessionID string,
+	entryID string,
+	replacement store.SessionInputQueueInsert,
+) (store.SessionInputQueueEntry, bool, error) {
+	replacement.Mode = store.SessionInputQueueModeSteer
+	replacement.Delivery = store.SessionInputDeliveryInterruptThenPrompt
+	return g.replacePendingSessionInput(ctx, "promote session input to steer", sessionID, entryID, replacement, true)
+}
+
+func (g *SessionRepo) replacePendingSessionInput(
+	ctx context.Context,
+	action string,
+	sessionID string,
+	entryID string,
+	replacement store.SessionInputQueueInsert,
+	promote bool,
+) (entry store.SessionInputQueueEntry, created bool, err error) {
+	if err := g.checkReady(ctx, action); err != nil {
+		return store.SessionInputQueueEntry{}, false, err
+	}
+	target := strings.TrimSpace(sessionID)
+	entryID = strings.TrimSpace(entryID)
+	replacement = replacement.Normalize()
+	replacement.SessionID = target
+	if target == "" || entryID == "" {
+		return store.SessionInputQueueEntry{}, false, errors.New("store: session id and queue entry id are required")
+	}
+	if replacement.ID == entryID {
+		return store.SessionInputQueueEntry{}, false, errors.New("store: replacement queue entry id must be new")
+	}
+	if err := replacement.Validate(); err != nil {
+		return store.SessionInputQueueEntry{}, false, err
+	}
+
+	err = g.withImmediateTransaction(ctx, action, func(exec globalSQLExecutor) error {
+		existing, getErr := getSessionInputQueueEntry(ctx, exec, target, entryID)
+		replayed, replayErr := getSessionInputQueueEntry(ctx, exec, target, replacement.ID)
+		if replayErr == nil && (len(existing.Origin) == 0 || promote) {
+			if !sameSessionInputMutation(&replayed, replacement) {
+				return fmt.Errorf("%w: %s", store.ErrSessionInputMutationConflict, replacement.ID)
+			}
+			entry = replayed
+			return nil
+		}
+		if replayErr != nil && !errors.Is(replayErr, store.ErrSessionInputQueueEntryNotFound) {
+			return replayErr
+		}
+		if getErr != nil {
+			return getErr
+		}
+		if err := validateSessionInputMutation(ctx, &existing, replacement.Text, promote); err != nil {
+			return err
+		}
+
+		replacement = inheritReplacedSessionInput(&existing, replacement)
+		var superseded []string
+		if promote {
+			var cancelErr error
+			superseded, cancelErr = cancelPriorPendingSessionSteers(
+				ctx, exec, target, replacement.OriginSessionID, replacement.Now,
+			)
+			if cancelErr != nil {
+				return cancelErr
+			}
+		}
+		queries := sqlcgen.New(exec)
+		if err := cancelReplacedSessionInput(ctx, queries, &existing, replacement.Now); err != nil {
+			return err
+		}
+		inserted, insertErr := insertSessionInputQueueEntry(ctx, exec, replacement)
+		if insertErr != nil {
+			return insertErr
+		}
+		inserted.SupersededIDs = superseded
+		entry = inserted
+		created = true
+		return nil
+	})
+	if err != nil {
+		return store.SessionInputQueueEntry{}, false, err
+	}
+	return entry, created, nil
+}
+
+// inheritReplacedSessionInput carries the replaced row's generation and sender
+// attribution. A promoted agent row keeps its origin, message id, and input event
+// id, so the sender's reply watch follows the steer into the turn that consumes
+// it. The operator initiated the steer, so it ranks and supersedes as human input.
+func inheritReplacedSessionInput(
+	existing *store.SessionInputQueueEntry,
+	replacement store.SessionInputQueueInsert,
+) store.SessionInputQueueInsert {
+	replacement.SessionGeneration = existing.SessionGeneration
+	if len(existing.Origin) == 0 {
+		return replacement
+	}
+	replacement.Origin = append(json.RawMessage(nil), existing.Origin...)
+	replacement.OriginClass = store.SessionInputOriginClassHuman
+	replacement.MessageID = existing.MessageID
+	replacement.EventID = existing.EventID
+	return replacement.Normalize()
+}
+
+func sameSessionInputMutation(
+	entry *store.SessionInputQueueEntry,
+	replacement store.SessionInputQueueInsert,
+) bool {
+	// A promoted agent row answers with the sender's message id, not the operator's.
+	// Mentions are excluded: they derive from the compared text plus filesystem state at
+	// admission, so a replay may re-resolve differently while the stored row keeps its mentions.
+	return entry.SessionID == replacement.SessionID &&
+		(entry.MessageID == replacement.MessageID || len(entry.Origin) > 0) &&
+		entry.IdempotencyKey == replacement.IdempotencyKey &&
+		entry.TargetTurnID == replacement.TargetTurnID &&
+		entry.Mode == replacement.Mode &&
+		entry.Delivery == replacement.Delivery &&
+		entry.Text == replacement.Text &&
+		slices.Equal(entry.SkillInvocations, replacement.SkillInvocations) &&
+		slices.Equal(entry.Attachments, replacement.Attachments)
+}
+
+func cancelPriorPendingSessionSteers(
+	ctx context.Context,
+	exec globalSQLExecutor,
+	sessionID string,
+	originSessionID string,
+	now time.Time,
+) ([]string, error) {
+	nowRaw := store.FormatTimestamp(now)
+	ids, err := sqlcgen.New(exec).CancelPriorSessionSteers(ctx, sqlcgen.CancelPriorSessionSteersParams{
+		CanceledStatus:  store.SessionInputQueueStatusCanceled,
+		CanceledAt:      nullableSessionTime(now),
+		UpdatedAt:       nowRaw,
+		SessionID:       sessionID,
+		SteerMode:       store.SessionInputQueueModeSteer,
+		QueuedStatus:    store.SessionInputQueueStatusQueued,
+		OriginSessionID: originSessionID,
+	})
+	if err != nil {
+		return nil, fmt.Errorf("store: cancel prior session steer input: %w", err)
+	}
+	return ids, nil
+}
+
+// validateSessionInputMutation refuses edits of agent-authored rows. Promotion
+// changes only priority, so it may target an agent row when the text is unchanged.
+func validateSessionInputMutation(
+	ctx context.Context,
+	existing *store.SessionInputQueueEntry,
+	text string,
+	promote bool,
+) error {
+	if len(existing.Origin) > 0 && (!promote || strings.TrimSpace(text) != existing.Text) {
+		slog.WarnContext(ctx, "session.input.mutation_refused", "entry_id", existing.ID, "reason", "agent_authored")
+		return store.ErrSessionInputAgentAuthored
+	}
+	if existing.OwnerKind != "" {
+		return fmt.Errorf("%w: %s", store.ErrSessionInputQueueEntryNotFound, existing.ID)
+	}
+	if existing.Status != store.SessionInputQueueStatusQueued {
+		return &store.SessionInputNotQueuedError{EntryID: existing.ID, Status: existing.Status, Text: text}
+	}
+	return nil
+}
+
+func cancelReplacedSessionInput(
+	ctx context.Context,
+	queries *sqlcgen.Queries,
+	existing *store.SessionInputQueueEntry,
+	now time.Time,
+) error {
+	nowRaw := store.FormatTimestamp(now)
+	if cancelErr := queries.CancelSessionInput(ctx, sqlcgen.CancelSessionInputParams{
+		CanceledStatus: store.SessionInputQueueStatusCanceled,
+		Now:            nullableSessionTime(now),
+		UpdatedAt:      nowRaw,
+		ID:             existing.ID,
+		SessionID:      existing.SessionID,
+	}); cancelErr != nil {
+		return fmt.Errorf("store: cancel replaced session input: %w", cancelErr)
+	}
+	if err := queries.ReleasePromptReports(ctx, existing.PromptAdmissionID); err != nil {
+		return err
+	}
+	return nil
+}

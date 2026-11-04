@@ -1,0 +1,278 @@
+import { describe, expect, it } from "vitest";
+
+import { buildDetailFixture, buildTaskRunDetailFixture } from "../../mocks/fixtures";
+
+import {
+  agentContextOptions,
+  taskDashboardOptions,
+  taskDetailOptions,
+  taskExecutionProfileOptions,
+  taskInboxBadgeOptions,
+  taskInboxOptions,
+  taskReviewsOptions,
+  taskRunDetailOptions,
+  taskRunReviewDetailOptions,
+  taskRunReviewsOptions,
+  taskRunsOptions,
+  taskTimelineOptions,
+  taskTreeOptions,
+  tasksListOptions,
+  withTaskProfileScope,
+} from "../query-options";
+
+describe("tasks list options", () => {
+  it("Should replace caller-owned profile selectors with the active profile scope", () => {
+    expect(
+      withTaskProfileScope(
+        { all_profiles: true, profile: "stale", status: "ready" },
+        { profile: "marketing" }
+      )
+    ).toEqual({ profile: "marketing", status: "ready" });
+    expect(
+      withTaskProfileScope({ profile: "stale", status: "ready" }, { all_profiles: true })
+    ).toEqual({ all_profiles: true, status: "ready" });
+  });
+
+  it("uses infinite cursor pages without automatic catalog polling", () => {
+    const options = tasksListOptions();
+
+    expect(options.staleTime).toBe(15_000);
+    expect(options.refetchInterval).toBeUndefined();
+    expect(options.initialPageParam).toBeUndefined();
+    const page = {
+      facets: { owners: [], statuses: [] },
+      page: { has_more: true, limit: 1, next_cursor: "tasks-next", total: 2 },
+      tasks: [],
+    };
+    expect(options.getNextPageParam?.(page, [page], undefined, [undefined])).toBe("tasks-next");
+    expect(options.enabled).toBe(true);
+  });
+
+  it("carries filters into the query key", () => {
+    const options = tasksListOptions({
+      scope: "workspace",
+      workspace: "ws_alpha",
+      status: "ready",
+      limit: 20,
+    });
+
+    expect(options.queryKey).toContain("workspace");
+    expect(options.queryKey).toContain("ws_alpha");
+    expect(options.queryKey).toContain("ready");
+    expect(options.queryKey).toContain("20");
+  });
+
+  it("supports an explicit disabled state for the list query", () => {
+    expect(tasksListOptions({}, false).enabled).toBe(false);
+  });
+});
+
+type Bridge = (previous: unknown, previousQuery: { meta?: unknown } | undefined) => unknown;
+
+/** What the observer asks a read: may the last real rows stand in for this one's own? */
+function bridged(next: { placeholderData?: unknown }, previous: { meta?: unknown }) {
+  return (next.placeholderData as Bridge)("rows", { meta: previous.meta });
+}
+
+describe("list and inbox placeholder rows", () => {
+  const scope = { scope: "workspace", workspace: "ws_alpha", worktree: "wt_main" } as const;
+
+  it.each([
+    ["status", { status: "failed" }],
+    ["priority", { priority: "high" }],
+    ["owner", { owner_kind: "human", owner_ref: "pedro" }],
+    ["search text", { query: "review" }],
+    ["sort", { sort: "priority" }],
+  ] as const)(
+    "Should bridge a list refined by %s with the rows already on screen",
+    (_, refinement) => {
+      expect(bridged(tasksListOptions({ ...scope, ...refinement }), tasksListOptions(scope))).toBe(
+        "rows"
+      );
+    }
+  );
+
+  it.each([
+    ["project", { scope: "workspace", workspace: "ws_beta", worktree: "wt_main" }],
+    ["worktree", { ...scope, worktree: "wt_feature" }],
+    ["profile", { ...scope, profile: "marketing" }],
+    ["every profile", { ...scope, all_profiles: true }],
+    ["breadth", { all_workspaces: true }],
+    ["Loop reveal", { ...scope, include_loop: true }],
+  ] as const)("Should not carry rows across a different %s", (_, other) => {
+    expect(bridged(tasksListOptions(other), tasksListOptions(scope))).toBeUndefined();
+  });
+
+  it("Should not bridge from a read that never had rows to offer", () => {
+    // The observer asks with nothing at all before its first real read lands.
+    const bridge = tasksListOptions(scope).placeholderData as Bridge;
+    expect(bridge(undefined, undefined)).toBeUndefined();
+    expect(bridged(tasksListOptions(scope), {})).toBeUndefined();
+  });
+
+  it.each([
+    ["lane", { lane: "approvals" }],
+    ["status", { status: "failed" }],
+    ["priority", { priority: "high" }],
+    ["unread", { unread: true }],
+    ["search text", { query: "rotate" }],
+  ] as const)(
+    "Should bridge an inbox refined by %s with the rows already on screen",
+    (_, refinement) => {
+      expect(bridged(taskInboxOptions({ ...scope, ...refinement }), taskInboxOptions(scope))).toBe(
+        "rows"
+      );
+    }
+  );
+
+  it.each([
+    ["project", { scope: "workspace", workspace: "ws_beta", worktree: "wt_main" }],
+    ["worktree", { ...scope, worktree: "wt_feature" }],
+    ["profile", { ...scope, profile: "marketing" }],
+    ["breadth", { all_workspaces: true }],
+  ] as const)("Should not carry inbox rows across a different %s", (_, other) => {
+    expect(bridged(taskInboxOptions(other), taskInboxOptions(scope))).toBeUndefined();
+  });
+});
+
+describe("tasks detail and run options", () => {
+  it("stops detail polling after the active run becomes terminal", () => {
+    const options = taskDetailOptions("task_1", { profile: "default" });
+    const refetchInterval = options.refetchInterval;
+    expect(typeof refetchInterval).toBe("function");
+    if (typeof refetchInterval !== "function") return;
+
+    const live = buildDetailFixture({
+      summary: {
+        active_run: { ...buildDetailFixture().summary.active_run!, status: "running" },
+      } as never,
+    });
+    const terminal = buildDetailFixture({
+      summary: {
+        active_run: { ...buildDetailFixture().summary.active_run!, status: "completed" },
+      } as never,
+    });
+
+    expect(refetchInterval({ state: { data: live } } as never)).toBe(30_000);
+    expect(refetchInterval({ state: { data: terminal } } as never)).toBe(false);
+  });
+
+  it("disables detail queries for empty ids", () => {
+    expect(taskDetailOptions("", { profile: "default" }).enabled).toBe(false);
+    expect(taskDetailOptions("task_1", { profile: "default" }, false).enabled).toBe(false);
+    expect(taskDetailOptions("task_1", { profile: "default" }).enabled).toBe(true);
+  });
+
+  it("uses the live cadence for runs, timeline, tree, and run detail", () => {
+    expect(taskRunsOptions("task_1").refetchInterval).toBe(15_000);
+    expect(taskTimelineOptions("task_1").refetchInterval).toBe(15_000);
+    expect(taskTimelineOptions("task_1").staleTime).toBe(5_000);
+    expect(taskTreeOptions("task_1", { profile: "default" }).refetchInterval).toBe(15_000);
+    const runInterval = taskRunDetailOptions("run_1", { profile: "default" }).refetchInterval;
+    expect(typeof runInterval).toBe("function");
+    if (typeof runInterval === "function") {
+      expect(
+        runInterval({
+          state: { data: buildTaskRunDetailFixture({ run: { status: "running" } as never }) },
+        } as never)
+      ).toBe(15_000);
+      expect(
+        runInterval({
+          state: { data: buildTaskRunDetailFixture({ run: { status: "completed" } as never }) },
+        } as never)
+      ).toBe(false);
+    }
+  });
+
+  it("disables live queries when ids are missing", () => {
+    expect(taskRunsOptions("").enabled).toBe(false);
+    expect(taskTimelineOptions("").enabled).toBe(false);
+    expect(taskTreeOptions("", { profile: "default" }).enabled).toBe(false);
+    expect(taskRunDetailOptions("", { profile: "default" }).enabled).toBe(false);
+  });
+
+  it("carries timeline filters into the query key", () => {
+    const options = taskTimelineOptions("task_1", { after_sequence: 12, limit: 30 });
+
+    expect(options.queryKey).toEqual(["tasks", "timeline", "task_1", "12", "30", ""]);
+  });
+});
+
+describe("tasks dashboard and inbox options", () => {
+  it("keeps dashboard polling separate from infinite inbox pages", () => {
+    const dashboardOptions = taskDashboardOptions({ scope: "workspace" });
+    const inboxOptions = taskInboxOptions({ lane: "approvals" });
+    const inboxBadgeOptions = taskInboxBadgeOptions({ limit: 1 });
+
+    expect(dashboardOptions.staleTime).toBe(15_000);
+    expect(dashboardOptions.refetchInterval).toBe(30_000);
+    expect(inboxOptions.staleTime).toBe(0);
+    expect(inboxOptions.refetchInterval).toBeUndefined();
+    expect(inboxBadgeOptions.staleTime).toBe(15_000);
+    expect(inboxOptions.initialPageParam).toBeUndefined();
+    const page = {
+      archived_total: 0,
+      facets: { priorities: [], statuses: [] },
+      groups: [],
+      page: { has_more: true, limit: 1, next_cursor: "inbox-next", total: 2 },
+      unread_total: 0,
+    };
+    expect(inboxOptions.getNextPageParam?.(page, [page], undefined, [undefined])).toBe(
+      "inbox-next"
+    );
+    expect(dashboardOptions.queryKey).toContain("workspace");
+    expect(inboxOptions.queryKey).toContain("approvals");
+  });
+
+  it("supports explicit disabled state for aggregate reads", () => {
+    expect(taskDashboardOptions({}, false).enabled).toBe(false);
+    expect(taskInboxOptions({}, false).enabled).toBe(false);
+  });
+});
+
+describe("orchestration options", () => {
+  it("Should disable profile and review queries for empty ids", () => {
+    expect(taskExecutionProfileOptions("").enabled).toBe(false);
+    expect(taskRunReviewsOptions("").enabled).toBe(false);
+    expect(taskReviewsOptions("").enabled).toBe(false);
+    expect(taskRunReviewDetailOptions("").enabled).toBe(false);
+  });
+
+  it("Should use the default cadence for execution profile reads", () => {
+    const options = taskExecutionProfileOptions("task_1");
+    expect(options.staleTime).toBe(15_000);
+    expect(options.refetchInterval).toBe(30_000);
+  });
+
+  it("Should use the live cadence for review reads", () => {
+    expect(taskRunReviewsOptions("run_1").refetchInterval).toBe(15_000);
+    expect(taskRunReviewsOptions("run_1").staleTime).toBe(5_000);
+    expect(taskReviewsOptions("task_1").refetchInterval).toBe(15_000);
+    expect(taskRunReviewDetailOptions("review_1").refetchInterval).toBe(15_000);
+  });
+
+  it("Should carry review filters into the query key", () => {
+    const options = taskRunReviewsOptions("run_1", {
+      status: "in_review",
+      reviewer_session_id: "sess_a",
+      limit: 25,
+    });
+    expect(options.queryKey).toEqual([
+      "tasks",
+      "reviews",
+      "run",
+      "run_1",
+      "in_review",
+      "sess_a",
+      "25",
+      "",
+    ]);
+  });
+
+  it("Should expose enabled toggle for context queries", () => {
+    const identity = { agentName: "worker", sessionId: "session_1" };
+
+    expect(agentContextOptions(identity, false).enabled).toBe(false);
+    expect(agentContextOptions(identity).enabled).toBe(true);
+  });
+});

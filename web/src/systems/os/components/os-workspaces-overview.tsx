@@ -1,0 +1,492 @@
+import type { WorktreeRemovalBatch } from "@/systems/workspace";
+import { useEffect, useRef } from "react";
+import { Plus } from "@compozy/ui/icons";
+
+import { Button, Dialog, DialogContent, DialogDescription, DialogTitle, cn } from "@compozy/ui";
+
+import {
+  useWorkspacesSwitcher,
+  WORKSPACES_ADD_TILE_KEY,
+  type WorkspacesSwitcherEntry,
+} from "../hooks/use-workspaces-switcher";
+import { useWorkspacesStripScroll } from "../hooks/use-workspaces-strip-scroll";
+import { openContextMenuFromKeyboard } from "../lib/context-menu-keyboard";
+import { OsWorkspaceAddTile, OsWorkspaceTile } from "./os-workspace-tile";
+import { OsWorkspacesCaption, type OsWorkspacesCaptionModel } from "./os-workspaces-caption";
+import { OsWorkspacesHints } from "./os-workspaces-hints";
+import { OsWorkspacesStrip } from "./os-workspaces-strip";
+import {
+  buildWorkspacesWorktreeMenuModel,
+  focusedWorkspacesMenu,
+  type WorkspacesMenuNavRow,
+} from "../lib/workspaces-overview-model";
+import { OsWorkspacesWorktreeMenu } from "./os-workspaces-worktree-menu";
+import {
+  WorkspaceProjectActions,
+  contractHomePath,
+  DESTINATION_COPY,
+  groupWorkspaceTree,
+  workspaceMonogram,
+  type WorkspacePayload,
+  type WorkspaceTreeNode,
+  type WorktreeListingByWorkspace,
+  type WorktreeNestEntry,
+} from "@/systems/workspace";
+
+export interface OsWorkspacesOverviewProps {
+  open: boolean;
+  onOpenChange: (open: boolean) => void;
+  workspaces: WorkspacePayload[];
+  activeWorkspaceId: string | null;
+  onSelectWorkspace: (workspaceId: string) => void;
+  onNewWorkspace: () => void;
+  reducedMotion: boolean;
+  /** Same projection as the switcher and the menubar menu. */
+  worktreesByWorkspace?: WorktreeListingByWorkspace;
+  /** Working-session counts by workspace id; drives each tile's corner dot. */
+  workingSessionsByWorkspace?: Readonly<Record<string, number>>;
+  userHomeDir?: string;
+  selectedWorktreeId?: string | null;
+  onSelectWorktree?: (workspaceId: string, entry: WorktreeNestEntry) => void;
+  onResolveMissingWorktree?: (workspaceId: string, entry: WorktreeNestEntry) => void;
+  onCreateWorktree?: (workspaceId: string) => void;
+  onRemoveWorktrees?: (batch: WorktreeRemovalBatch) => void;
+  onRemoveWorktree?: (workspaceId: string, entry: WorktreeNestEntry) => void;
+  shortcutLabels?: {
+    picker: string | null;
+    globalScope: string | null;
+  };
+}
+
+/**
+ * Workspace identity switching as a macOS Command-Tab overlay: a centered
+ * glass strip of compact tiles over the live (inert) shell, with the focused
+ * workspace's worktrees as a subordinate vertical menu. Window arrangements
+ * stay with the dedicated Desktops Overview.
+ */
+export function OsWorkspacesOverview({ open, onOpenChange, ...stage }: OsWorkspacesOverviewProps) {
+  const contentRef = useRef<HTMLDivElement | null>(null);
+  const restoreTriggerFocus = useRef(true);
+  useEffect(() => {
+    if (open) restoreTriggerFocus.current = true;
+  }, [open]);
+  // Escape steps one layer at a time: popover → menu → overlay. The stage
+  // registers its layer guard here so the dialog's own escape close can be
+  // vetoed while the worktree menu owns focus.
+  const escapeGuardRef = useRef<() => boolean>(() => false);
+
+  return (
+    <Dialog
+      open={open}
+      onOpenChange={(next, details) => {
+        if (!next && details?.reason === "escape-key" && escapeGuardRef.current()) return;
+        onOpenChange(next);
+      }}
+    >
+      <DialogContent
+        ref={contentRef}
+        finalFocus={() =>
+          restoreTriggerFocus.current
+            ? document.querySelector<HTMLElement>('[data-slot="os-menubar-workspace"]')
+            : false
+        }
+        unframed
+        showCloseButton={false}
+        data-testid="os-workspaces-overview"
+        className={cn(
+          "top-0 left-0 h-full w-full max-w-none translate-x-0 translate-y-0 overflow-hidden",
+          // The dialog base caps content at sm:max-w-sm; beat it in its own
+          // variant bucket — the overlay owns the whole viewport.
+          "sm:max-w-none",
+          "flex flex-col items-center justify-center rounded-none px-4 pt-6 pb-20",
+          "bg-transparent shadow-none"
+        )}
+        onClick={event => {
+          // Backdrop click closes; the popup is full-bleed, so "backdrop" is
+          // the content root and the reserved band below the stage.
+          const target = event.target as HTMLElement;
+          if (target === event.currentTarget || target.dataset.osWsovDismiss !== undefined) {
+            onOpenChange(false);
+          }
+        }}
+      >
+        <OsWorkspacesStage
+          {...stage}
+          onNewWorkspace={() => {
+            restoreTriggerFocus.current = false;
+            stage.onNewWorkspace();
+          }}
+          onCreateWorktree={
+            stage.onCreateWorktree
+              ? workspaceId => {
+                  restoreTriggerFocus.current = false;
+                  stage.onCreateWorktree?.(workspaceId);
+                }
+              : undefined
+          }
+          overlayRef={contentRef}
+          escapeGuardRef={escapeGuardRef}
+          onOpenChange={onOpenChange}
+        />
+      </DialogContent>
+    </Dialog>
+  );
+}
+
+interface OsWorkspacesStageProps extends Omit<OsWorkspacesOverviewProps, "open"> {
+  overlayRef: React.RefObject<HTMLDivElement | null>;
+  escapeGuardRef: React.RefObject<() => boolean>;
+}
+
+const ADD_ENTRY: WorkspacesSwitcherEntry = {
+  key: WORKSPACES_ADD_TILE_KEY,
+  kind: "add",
+  node: null,
+};
+
+function flatNode(workspace: WorkspacePayload): WorkspaceTreeNode<WorkspacePayload> {
+  return { workspace, gitBacked: false, worktrees: [], adoptedCount: 0, runningAgents: 0 };
+}
+
+function subtitleFor(workspaceCount: number): string {
+  // Worktree counts stay on each tile's nest; the headline counts projects only.
+  return `${workspaceCount} project${workspaceCount === 1 ? "" : "s"}`;
+}
+
+function captionFor(
+  entry: WorkspacesSwitcherEntry | undefined,
+  userHomeDir: string | undefined
+): OsWorkspacesCaptionModel {
+  if (!entry || entry.kind === "add") {
+    return {
+      key: WORKSPACES_ADD_TILE_KEY,
+      title: "New project",
+      meta: "Pick a project folder",
+    };
+  }
+  const rootDir = entry.node.workspace.root_dir;
+  return {
+    key: entry.key,
+    title: entry.node.workspace.name,
+    meta: entry.node.workspace.root_missing ? "Folder not found" : undefined,
+    path: rootDir ? contractHomePath(rootDir, userHomeDir) : rootDir,
+  };
+}
+
+const USER_CAPTION: OsWorkspacesCaptionModel = {
+  key: "user",
+  title: DESTINATION_COPY.user,
+  meta: "work outside any project",
+  path: "~",
+};
+
+/** Coordinates workspace navigation while keeping selection and cleanup inside the owning menu. */
+function OsWorkspacesStage({
+  workspaces,
+  activeWorkspaceId,
+  onSelectWorkspace,
+  onNewWorkspace,
+  reducedMotion,
+  worktreesByWorkspace,
+  workingSessionsByWorkspace,
+  userHomeDir,
+  selectedWorktreeId,
+  onSelectWorktree,
+  onCreateWorktree,
+  onResolveMissingWorktree,
+  onRemoveWorktree,
+  onRemoveWorktrees,
+  onOpenChange,
+  overlayRef,
+  escapeGuardRef,
+  shortcutLabels,
+}: OsWorkspacesStageProps) {
+  const { tree, empty, entries, readySelectedWorktreeKey, canCreate, menuModelByKey } =
+    projectWorkspacesStage({
+      workspaces,
+      worktreesByWorkspace,
+      selectedWorktreeId,
+      activeWorkspaceId,
+      onCreateWorktree,
+    });
+
+  const activateEntry = (entry: WorkspacesSwitcherEntry) => {
+    if (entry.kind === "add") {
+      onOpenChange(false);
+      onNewWorkspace();
+      return;
+    }
+    // Enter on a tile always lands on the workspace root; under All projects
+    // or User the store focuses the project in the same gesture (workspaceSelected).
+    onSelectWorkspace(entry.key);
+    onOpenChange(false);
+  };
+
+  const activateMenuRow = (entry: WorkspacesSwitcherEntry, row: WorkspacesMenuNavRow) => {
+    if (row.kind === "create") {
+      onOpenChange(false);
+      onCreateWorktree?.(entry.key);
+      return;
+    }
+    // A discovered row is the adoption gesture; anything else scopes — both
+    // decisions live with the shell handler.
+    onSelectWorktree?.(entry.key, row.entry);
+    onOpenChange(false);
+  };
+
+  // Settle-snapping and the escape guard resolve through refs: the scroll
+  // hook and the dialog need them before/outside the switcher's creation.
+  const settleRef = useRef<(index: number) => void>(() => {});
+  const scroll = useWorkspacesStripScroll({
+    overlayRef,
+    reducedMotion,
+    itemCount: entries.length,
+    onSettleFocus: index => settleRef.current(index),
+  });
+
+  const switcher = useWorkspacesSwitcher({
+    entries,
+    menuNavRowsForKey: key => menuModelByKey.get(key)?.navRows ?? [],
+    initialFocusKey: activeWorkspaceId,
+    scopedRowKeyForKey: key =>
+      activeWorkspaceId !== null && key === activeWorkspaceId ? readySelectedWorktreeKey : null,
+    reducedMotion,
+    onActivateEntry: activateEntry,
+    onActivateMenuRow: activateMenuRow,
+    keepInView: scroll.keepInView,
+    consumeDragClick: scroll.consumeDragClick,
+    isTrackDragging: scroll.isTrackDragging,
+  });
+
+  useEffect(() => {
+    settleRef.current = switcher.focusNearest;
+    escapeGuardRef.current = switcher.guardEscape;
+  });
+
+  const { focusedEntry, menuModel, scopedRowKey, focusedRowKey } = focusedWorkspacesMenu(
+    switcher,
+    menuModelByKey,
+    activeWorkspaceId,
+    readySelectedWorktreeKey
+  );
+
+  return (
+    <>
+      <div
+        data-slot="os-workspaces-stage"
+        className={cn(
+          // Above the reserved dismiss band below: a tall worktree menu hangs
+          // into that band and must stay clickable.
+          "relative z-1 flex w-workspaces-stage flex-col items-center",
+          !reducedMotion && "os-wsov-in"
+        )}
+        onKeyDown={switcher.onStageKeyDown}
+      >
+        <DialogTitle className="sr-only">Projects</DialogTitle>
+        <DialogDescription
+          className="mb-3.5 text-center text-form-label text-muted-foreground"
+          data-testid="os-workspaces-subtitle"
+        >
+          {subtitleFor(tree.length)}
+        </DialogDescription>
+        {empty ? (
+          <div
+            data-slot="os-workspaces-strip"
+            data-testid="os-workspaces-strip"
+            className={cn(
+              "flex flex-col items-center gap-2.5 rounded-xl px-6 py-5",
+              "bg-popover text-center shadow-pop"
+            )}
+          >
+            <p className="max-w-workspaces-empty-copy text-small-body text-muted-foreground">
+              No project folders yet. Sessions run in User until you add one.
+            </p>
+            {/* The one primary on this surface — there is nothing to switch to. */}
+            <Button
+              data-testid="os-workspaces-new"
+              size="sm"
+              type="button"
+              onClick={() => activateEntry(ADD_ENTRY)}
+            >
+              <Plus aria-hidden="true" data-icon="inline-start" />
+              New project
+            </Button>
+          </div>
+        ) : (
+          <OsWorkspacesStrip
+            overflow={scroll.overflow}
+            dragging={scroll.dragging}
+            reducedMotion={reducedMotion}
+            trackRef={scroll.trackRef}
+            trackProps={scroll.trackProps}
+          >
+            <WorkspaceTiles
+              entries={entries}
+              switcher={switcher}
+              activeWorkspaceId={activeWorkspaceId}
+              readySelectedWorktreeKey={readySelectedWorktreeKey}
+              workingSessionsByWorkspace={workingSessionsByWorkspace}
+            />
+          </OsWorkspacesStrip>
+        )}
+        {focusedEntry?.kind === "workspace" ? (
+          <WorkspaceProjectActions key={focusedEntry.key} workspace={focusedEntry.node.workspace} />
+        ) : null}
+        <OsWorkspacesCaption
+          model={empty ? USER_CAPTION : captionFor(focusedEntry, userHomeDir)}
+          reducedMotion={reducedMotion}
+        />
+        {/* Zero-height slot: the menu hangs under the caption without ever
+            shifting the centered strip as its height changes. */}
+        <div
+          data-slot="os-workspaces-below"
+          className="flex h-0 w-full items-start justify-center overflow-visible"
+        >
+          {menuModel ? (
+            <OsWorkspacesWorktreeMenu
+              key={menuModel.node.workspace.id}
+              model={menuModel}
+              onRemoveWorktrees={onRemoveWorktrees}
+              onResolveMissing={entry => {
+                onResolveMissingWorktree?.(menuModel.node.workspace.id, entry);
+              }}
+              userHomeDir={userHomeDir}
+              focusedRowKey={focusedRowKey}
+              scopedRowKey={scopedRowKey}
+              reducedMotion={reducedMotion}
+              registerRow={switcher.registerRow}
+              rowHandlers={switcher.menuRowHandlers}
+              canCreate={canCreate}
+              onDeleteRow={entry => {
+                onRemoveWorktree?.(menuModel.node.workspace.id, entry);
+              }}
+            />
+          ) : null}
+        </div>
+      </div>
+      {/* Reserved band below the stage: keeps the strip above dead center so
+          the tallest worktree menu never shifts it. Part of the backdrop. */}
+      <span
+        aria-hidden="true"
+        data-os-wsov-dismiss=""
+        className="w-full flex-none basis-workspaces-reserved"
+      />
+      <OsWorkspacesHints
+        layer={switcher.layer === "menu" ? "menu" : "strip"}
+        empty={empty}
+        pickerShortcutLabel={shortcutLabels?.picker ?? null}
+        globalScopeShortcutLabel={shortcutLabels?.globalScope ?? null}
+      />
+    </>
+  );
+}
+
+/** Keeps the active menu anchored to its workspace tile while keyboard focus moves into rows. */
+function WorkspaceTiles({
+  entries,
+  switcher,
+  activeWorkspaceId,
+  readySelectedWorktreeKey,
+  workingSessionsByWorkspace,
+}: {
+  entries: WorkspacesSwitcherEntry[];
+  switcher: ReturnType<typeof useWorkspacesSwitcher>;
+  activeWorkspaceId: string | null;
+  readySelectedWorktreeKey: string | null;
+  workingSessionsByWorkspace: OsWorkspacesOverviewProps["workingSessionsByWorkspace"];
+}) {
+  return (
+    <>
+      {entries.map((entry, index) => {
+        const focused = switcher.layer !== "menu" && index === switcher.focusIndex;
+        const anchorsMenu = index === switcher.focusIndex;
+        if (entry.kind === "add") {
+          return (
+            <OsWorkspaceAddTile
+              key={entry.key}
+              data-testid="os-workspace-tile-add"
+              focused={anchorsMenu}
+              tabIndex={focused ? 0 : -1}
+              ref={switcher.registerTile(entry.key)}
+              {...switcher.tileHandlers(index)}
+            />
+          );
+        }
+        const name = entry.node.workspace.name;
+        return (
+          <WorkspaceProjectActions key={entry.key} workspace={entry.node.workspace}>
+            <OsWorkspaceTile
+              data-testid={`os-workspace-tile-${entry.key}`}
+              name={name}
+              rootMissing={entry.node.workspace.root_missing}
+              monogram={workspaceMonogram(name)}
+              workingSessions={workingSessionsByWorkspace?.[entry.key] ?? 0}
+              // The plate stays on the focused tile while the menu owns
+              // key focus — it anchors which workspace the menu belongs to.
+              focused={anchorsMenu}
+              tabIndex={focused ? 0 : -1}
+              current={
+                activeWorkspaceId !== null && entry.key === activeWorkspaceId
+                  ? readySelectedWorktreeKey
+                    ? "wt"
+                    : "root"
+                  : null
+              }
+              ref={switcher.registerTile(entry.key)}
+              {...switcher.tileHandlers(index)}
+              onKeyDown={openContextMenuFromKeyboard}
+            />
+          </WorkspaceProjectActions>
+        );
+      })}
+    </>
+  );
+}
+
+/** Derives represented navigation and counts, treating only ready selected worktrees as current. */
+function projectWorkspacesStage({
+  workspaces,
+  worktreesByWorkspace,
+  selectedWorktreeId,
+  activeWorkspaceId,
+  onCreateWorktree,
+}: Pick<
+  OsWorkspacesStageProps,
+  | "workspaces"
+  | "worktreesByWorkspace"
+  | "selectedWorktreeId"
+  | "activeWorkspaceId"
+  | "onCreateWorktree"
+>) {
+  const tree = worktreesByWorkspace
+    ? groupWorkspaceTree(workspaces, worktreesByWorkspace)
+    : workspaces.map(flatNode);
+  const empty = tree.length === 0;
+  const entries: WorkspacesSwitcherEntry[] = empty
+    ? []
+    : [
+        ...tree.map(node => ({ key: node.workspace.id, kind: "workspace" as const, node })),
+        ADD_ENTRY,
+      ];
+  const readySelectedWorktreeKey =
+    activeWorkspaceId !== null && selectedWorktreeId
+      ? (tree
+          .find(node => node.workspace.id === activeWorkspaceId)
+          ?.worktrees.find(
+            entry => entry.displayState === "ready" && entry.worktree?.id === selectedWorktreeId
+          )?.key ?? null)
+      : null;
+  const canCreate = Boolean(onCreateWorktree);
+  const menuModelByKey = new Map(
+    tree.map(node => [node.workspace.id, buildWorkspacesWorktreeMenuModel(node, canCreate)])
+  );
+
+  return {
+    tree,
+    empty,
+    entries,
+    readySelectedWorktreeKey,
+    canCreate,
+    menuModelByKey,
+  };
+}

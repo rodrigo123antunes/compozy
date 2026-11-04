@@ -1,0 +1,85 @@
+---
+id: RT-new-session-fast-feedback
+area: RT
+title: Start a new session with immediate truthful feedback
+persona: Bruno
+journey: J-17
+expected: Clicking New session opens launch details without a first-message composer; Create gives visible feedback within 100 ms, creates one durable session and activates its owner workspace before navigation within 250 ms, then the destination composer accepts the separate first prompt and its runtime selection without duplicate creation.
+entry_points: web agent detail New session; web Agents Start session
+qa_status: skipped
+bug_ids: BUG-20260713-cursor-model-startup-contract; BUG-20260713-new-session-modal-lingers; BUG-20260713-first-prompt-optimistic-stuck; BUG-20260713-stop-generation-local-stuck; BUG-20260729-accepted-start-stop-identity-race; BUG-20260730-session-create-window-intent; BUG-20260827-session-create-first-message-regression; BUG-20260827-unbound-session-fast-inheritance; BUG-20260828-unbound-session-start-latency
+fix_status: fixed-pending-commit
+retest_status: untested
+fix_commits: 8eeb8a38
+evidence: /Users/pedronauck/dev/qa-labs/compozy-issue-389-cursor-model-final-20260813-222525-271707-lab/qa-artifacts/qa/cursor-live-create.json;/Users/pedronauck/dev/qa-labs/compozy-issue-389-cursor-model-final-20260813-222525-271707-lab/qa-artifacts/qa/cursor-native-default-unset.json;/Users/pedronauck/dev/qa-labs/compozy-issue-389-cursor-model-final-20260813-222525-271707-lab/qa-artifacts/qa/cursor-native-create.json;docs/qa/reports/2026-08-13-issue-389-cursor-model.md;/Users/pedronauck/dev/qa-labs/compozy-acp-runtime-catalog-20260828-004625-083662-lab/qa-artifacts/qa/evidence/web-session-first-prompt-grok45-fast-pass.png;/Users/pedronauck/dev/qa-labs/compozy-acp-runtime-catalog-20260828-004625-083662-lab/qa-artifacts/qa/evidence/web-session-create-fast-feedback.json;/Users/pedronauck/dev/qa-labs/compozy-acp-runtime-catalog-20260828-004625-083662-lab/qa-artifacts/qa/evidence/web-session-create-fast-feedback-pass.png
+last_report: docs/qa/reports/2026-10-02-untested.md
+overlaps: RT-010
+---
+
+Capture click-to-feedback, click-to-navigation, and click-to-composer-ready
+durations separately with Cursor/Grok 4.5 selected.
+
+The fixed replay kept truthful pending feedback until live ACP confirmation,
+then released the modal before destination navigation without a post-success
+focus-trap delay. Session admission validates the provider and preserves the
+exact model ID; the ACP/provider boundary owns any later model rejection.
+
+Post-fix Goal acceptance on 2026-07-13 reopened the scenario: session
+`sess-e74df4386f8d5a77` became visually usable after a 14.764-second create,
+but its first prompt remained optimistic for more than 64 seconds without a
+daemon prompt request or durable transcript entry.
+
+A second fresh modal-to-session replay reproduced the zero-POST failure 37.190
+seconds after Start. Its Stop action also left assistant-ui submitted; that
+coupled local-cancellation defect is source-fixed but pending Browser retest.
+The catalog-stream remediation removed the live handoff failure: fresh session
+`sess-2a768148b6106dc3` held one global catalog stream and submitted its first
+`/goal` exactly once, four milliseconds after the click. Stop generation also
+recovered the local composer after one successful daemon cancel. The scenario
+remains failed only because its separate session-start latency budget was not
+retested or changed in this batch; both first-prompt and Stop bug rows are
+verified.
+
+QA impact 2026-07-22: session admission is now durable and asynchronous, the Web polls `starting`
+at 500 ms, and startup failure has an explicit recovery pane. Reset to untested for a fresh timing
+and failure-path replay.
+
+QA impact 2026-07-25: first-message creation is now atomic: the `201 starting` session already owns the queued prompt, navigation remains immediate, and resume delivers a prompt retained across startup failure. Reset to untested; flag only.
+
+QA impact 2026-07-29: stopping immediately after durable acceptance now waits for the event recorder
+and serializes the terminal transition with the immutable launch-identity commit. Reset remains
+`untested`; a fresh browser timing/failure-path replay owns the final verdict.
+
+QA impact 2026-08-13: an explicit Cursor model now has to match a fresh ACP-advertised catalog value
+before creation; an omitted Cursor model must still use Cursor's native default. Reset for a fresh
+create walk.
+
+QA impact 2026-08-27: targeted QA found that the launch dialog had regained prompt submission.
+The prompt field is removed; reset remains `untested` for launch feedback, navigation, and separate
+composer submission timing.
+
+QA 2026-08-27: the functional launch-to-composer path and separate first prompt passed with inherited
+Grok 4.5 High/Fast. The scenario remains `untested` because the replay did not capture its 100 ms
+feedback and 250 ms navigation budgets.
+
+QA 2026-08-28: pass. A click-listener capture measured feedback at 14.8 ms, navigation at 207.4 ms,
+and the separate composer ready at 392 ms. Exactly one `POST /api/sessions` returned 201; the
+destination retained Cursor Grok 4.5, High, and Fast before its first bind.
+
+QA impact 2026-09-29: each non-prompt ACP control request has a 30-second default
+budget. A timed-out `session/new` gets at most one fresh-process retry after the
+previous owned process tree has exited. Caller cancellation and other startup
+failures do not retry. Exhaustion reports the ACP method and provider and settles
+the session in `stopped`; stopping during startup also reaps the wrapper and child.
+Prompt execution and interactive clarification retain their existing lifetimes.
+
+Verification: the existing `internal/session/manager_stop_integration_test.go`
+subprocess suite verifies two silent attempts, first-attempt stall followed by
+successful recovery, and explicit stop during a silent `session/new`, including
+persisted terminal state and OS process exit. Live Cursor timing and Web recovery
+presentation require a fresh provider/browser walk; this evidence covers the
+runtime boundary only.
+
+2026-10-05: Deferred from this QA cycle by the user's explicit scope reduction.
+Coverage remains outstanding; this skip is not a passing result. Resume from the dated
+report's session matrix in a future QA cycle.

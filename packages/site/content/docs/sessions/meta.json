@@ -1,0 +1,21 @@
+{
+    "title": "Sessions",
+    "icon": "Activity",
+    "pages": [
+        "lifecycle",
+        "board",
+        "linked-work",
+        "mentions",
+        "control-plane",
+        "orchestration",
+        "subagents",
+        "monitors",
+        "processes",
+        "isolated-subagents",
+        "health",
+        "resume",
+        "compaction",
+        "events",
+        "permissions"
+    ]
+}

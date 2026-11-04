@@ -1,0 +1,711 @@
+//go:build !windows
+
+// Suite: Development process readiness integration.
+// Invariant: Dev uses project-local Air and starts daemon-backed config resolution and Vite only after readiness.
+// Boundary IN: Bash supervision, FIFO events, Air lifecycle, daemon replacement, and Vite launch ordering.
+// Boundary OUT: Daemon HTTP health and browser behavior, which are covered by isolated QA.
+package devreadiness
+
+import (
+	"bytes"
+	"context"
+	"errors"
+	"fmt"
+	"os"
+	"os/exec"
+	"path/filepath"
+	"strconv"
+	"strings"
+	"syscall"
+	"testing"
+	"time"
+
+	"golang.org/x/sys/unix"
+)
+
+func TestDevDaemonReadiness(t *testing.T) {
+	t.Run("Should rebuild changed inputs and preserve the runnable binary after a build failure", func(t *testing.T) {
+		t.Parallel()
+
+		root := t.TempDir()
+		write := func(name, content string) {
+			t.Helper()
+			path := filepath.Join(root, name)
+			if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+				t.Fatalf("create fixture directory: %v", err)
+			}
+			if err := os.WriteFile(path, []byte(content), 0o644); err != nil {
+				t.Fatalf("write fixture: %v", err)
+			}
+		}
+		script, err := os.ReadFile(filepath.Join(repositoryRoot(t), "scripts", "build-air.sh"))
+		if err != nil {
+			t.Fatalf("read Air build script: %v", err)
+		}
+		write("scripts/build-air.sh", string(script))
+		write("go.mod", "module github.com/compozy/compozy\n\ngo 1.26.0\n")
+		write(".gitignore", "/build/\n")
+		write("package.json", `{"version":"0.3.0"}`)
+		write("internal/version/version.go", "package version\nvar Version = \"dev\"\n")
+		const mainSource = `package main
+import (
+  _ "embed"
+  "fmt"
+  "os"
+  "github.com/compozy/compozy/internal/version"
+)
+//go:embed message.txt
+var message string
+func main() {
+  if len(os.Args) > 1 && os.Args[1] == "--version" {
+    fmt.Print(version.Version)
+    return
+  }
+  fmt.Print(message)
+}
+`
+		write("cmd/compozy/main.go", mainSource)
+		write("cmd/compozy/message.txt", "original")
+		for _, args := range [][]string{
+			{"init", "--quiet"},
+			{"add", "."},
+			{"-c", "user.name=Dev Test", "-c", "user.email=dev@example.com", "commit", "--quiet", "--no-gpg-sign", "-m", "fixture"},
+			{"tag", "v0.1.1"},
+		} {
+			command := exec.CommandContext(t.Context(), "git", args...)
+			command.Dir = root
+			if output, err := command.CombinedOutput(); err != nil {
+				t.Fatalf("prepare old release tag: %v; output=%s", err, output)
+			}
+		}
+		buildDir := filepath.Join(root, "build")
+		binary := filepath.Join(buildDir, "compozy")
+		build := func(wantSuccess bool) {
+			t.Helper()
+			command := exec.CommandContext(t.Context(), "bash", filepath.Join(root, "scripts", "build-air.sh"))
+			command.Dir = root
+			command.Env = append(os.Environ(), "GOWORK=off", "GOPROXY=off", "COMPOZY_AIR_BUILD_DIR="+buildDir)
+			output, buildErr := command.CombinedOutput()
+			if (buildErr == nil) != wantSuccess {
+				t.Fatalf("build success = %t, want %t: %v; output=%s", buildErr == nil, wantSuccess, buildErr, output)
+			}
+		}
+		assertOutput := func(want string) {
+			t.Helper()
+			output, runErr := exec.CommandContext(t.Context(), binary).CombinedOutput()
+			if runErr != nil || string(output) != want {
+				t.Fatalf("binary output = %q, want %q: %v", output, want, runErr)
+			}
+		}
+
+		build(true)
+		assertOutput("original")
+		buildVersion, err := exec.CommandContext(t.Context(), binary, "--version").CombinedOutput()
+		if err != nil || !strings.HasPrefix(string(buildVersion), "v0.3.0+dev.") {
+			t.Fatalf("build version = %q, want checkout version with development metadata: %v", buildVersion, err)
+		}
+		original, err := os.ReadFile(binary)
+		if err != nil {
+			t.Fatalf("read original binary: %v", err)
+		}
+		build(true)
+		repeated, err := os.ReadFile(binary)
+		if err != nil {
+			t.Fatalf("read repeated binary: %v", err)
+		}
+		if !bytes.Equal(original, repeated) {
+			t.Fatal("unchanged inputs produced different executable bytes")
+		}
+		write("cmd/compozy/message.txt", "changed embed")
+		build(true)
+		assertOutput("changed embed")
+		write(
+			"cmd/compozy/main.go",
+			strings.Replace(mainSource, "fmt.Print(message)", `fmt.Print("changed source: ", message)`, 1),
+		)
+		build(true)
+		assertOutput("changed source: changed embed")
+		write("package.json", `{"version":"0.3.1-beta.2"}`)
+		build(true)
+		buildVersion, err = exec.CommandContext(t.Context(), binary, "--version").CombinedOutput()
+		if err != nil || !strings.HasPrefix(string(buildVersion), "v0.3.1-beta.2+dev.") ||
+			!strings.HasSuffix(string(buildVersion), "-dirty") {
+			t.Fatalf("build version = %q, want changed prerelease version with dirty metadata: %v", buildVersion, err)
+		}
+		write("cmd/compozy/main.go", "package main\nthis is invalid Go\n")
+		build(false)
+		assertOutput("changed source: changed embed")
+	})
+
+	t.Run("Should publish the started binary identity exactly once for the current run", func(t *testing.T) {
+		t.Parallel()
+
+		repoRoot := repositoryRoot(t)
+		tempDir := t.TempDir()
+		fifoPath := createFIFO(t, tempDir, "daemon-ready.fifo")
+		markerPath := filepath.Join(tempDir, "ready-sent")
+		stateDir := filepath.Join(tempDir, "state")
+		startLog := filepath.Join(tempDir, "daemon-started")
+		binaryPath := writeExecutable(t, tempDir, "compozy", `#!/usr/bin/env bash
+set -euo pipefail
+case "${1:-} ${2:-}" in
+  "daemon stop")
+    printf '%s\n' 'cli: daemon is not running' >&2
+    exit 1
+    ;;
+  "daemon start")
+    printf '%s\n' 'started' > "$FAKE_DAEMON_START_LOG"
+    ;;
+  *)
+    printf 'unexpected daemon command: %s %s\n' "${1:-}" "${2:-}" >&2
+    exit 2
+    ;;
+esac
+`)
+
+		const runID = "run-current"
+		awaitContext, cancelAwait := context.WithTimeout(t.Context(), 2*time.Second)
+		defer cancelAwait()
+		awaitCommand := exec.CommandContext(
+			awaitContext,
+			"bash",
+			filepath.Join(repoRoot, "scripts", "dev-readiness.sh"),
+			"await",
+			fifoPath,
+			runID,
+		)
+		var readyOutput bytes.Buffer
+		var awaitErrorOutput bytes.Buffer
+		awaitCommand.Stdout = &readyOutput
+		awaitCommand.Stderr = &awaitErrorOutput
+		if err := awaitCommand.Start(); err != nil {
+			t.Fatalf("start readiness waiter: %v", err)
+		}
+
+		runDevDaemon(t, repoRoot, binaryPath, stateDir, fifoPath, markerPath, startLog, runID)
+		if err := awaitCommand.Wait(); err != nil {
+			t.Fatalf("wait for daemon readiness: %v; stderr=%s", err, awaitErrorOutput.String())
+		}
+
+		wantBinaryID := checksumIdentity(t, binaryPath)
+		if got := strings.TrimSpace(readyOutput.String()); got != wantBinaryID {
+			t.Fatalf("ready binary identity = %q, want %q", got, wantBinaryID)
+		}
+		started, err := os.ReadFile(startLog)
+		if err != nil {
+			t.Fatalf("read daemon start log: %v", err)
+		}
+		if got := strings.TrimSpace(string(started)); got != "started" {
+			t.Fatalf("daemon start log = %q, want started", got)
+		}
+
+		secondContext, cancelSecond := context.WithTimeout(t.Context(), 500*time.Millisecond)
+		defer cancelSecond()
+		secondCommand := devDaemonCommand(
+			secondContext,
+			repoRoot,
+			binaryPath,
+			stateDir,
+			fifoPath,
+			markerPath,
+			startLog,
+			runID,
+		)
+		if output, err := secondCommand.CombinedOutput(); err != nil {
+			t.Fatalf("repeat dev-daemon run: %v; output=%s", err, output)
+		}
+	})
+
+	t.Run("Should ignore stale readiness and propagate current Air failure", func(t *testing.T) {
+		t.Parallel()
+
+		repoRoot := repositoryRoot(t)
+		tempDir := t.TempDir()
+		fifoPath := createFIFO(t, tempDir, "stale-ready.fifo")
+		channelKeeper, err := os.OpenFile(fifoPath, os.O_RDWR, 0)
+		if err != nil {
+			t.Fatalf("open readiness FIFO: %v", err)
+		}
+		t.Cleanup(func() {
+			if err := channelKeeper.Close(); err != nil && !errors.Is(err, os.ErrClosed) {
+				t.Errorf("close readiness FIFO: %v", err)
+			}
+		})
+		readinessScript := filepath.Join(repoRoot, "scripts", "dev-readiness.sh")
+
+		awaitContext, cancelAwait := context.WithTimeout(t.Context(), 2*time.Second)
+		defer cancelAwait()
+		awaitCommand := exec.CommandContext(awaitContext, "bash", readinessScript, "await", fifoPath, "run-current")
+		var awaitErrorOutput bytes.Buffer
+		awaitCommand.Stderr = &awaitErrorOutput
+		if err := awaitCommand.Start(); err != nil {
+			t.Fatalf("start readiness waiter: %v", err)
+		}
+
+		staleContext, cancelStale := context.WithTimeout(t.Context(), 2*time.Second)
+		defer cancelStale()
+		staleCommand := exec.CommandContext(
+			staleContext,
+			"bash",
+			readinessScript,
+			"ready",
+			fifoPath,
+			"run-stale",
+			filepath.Join(tempDir, "stale-sent"),
+			"stale-binary",
+		)
+		if output, err := staleCommand.CombinedOutput(); err != nil {
+			t.Fatalf("publish stale readiness: %v; output=%s", err, output)
+		}
+
+		exitContext, cancelExit := context.WithTimeout(t.Context(), 2*time.Second)
+		defer cancelExit()
+		exitCommand := exec.CommandContext(
+			exitContext,
+			"bash",
+			readinessScript,
+			"air-exit",
+			fifoPath,
+			"run-current",
+			"37",
+		)
+		if output, err := exitCommand.CombinedOutput(); err != nil {
+			t.Fatalf("publish Air exit: %v; output=%s", err, output)
+		}
+
+		err = awaitCommand.Wait()
+		exitError, exitErrorMatched := errors.AsType[*exec.ExitError](err)
+		if !exitErrorMatched || exitError.ExitCode() != 37 {
+			t.Fatalf("readiness waiter error = %v, want exit status 37; stderr=%s", err, awaitErrorOutput.String())
+		}
+	})
+}
+
+func TestDevSupervisorReadiness(t *testing.T) {
+	t.Run("Should start Vite only after the current Air run reports daemon readiness", func(t *testing.T) {
+		t.Parallel()
+
+		repoRoot := repositoryRoot(t)
+		tempDir := t.TempDir()
+		fakeBinDir := filepath.Join(tempDir, "bin")
+		if err := os.MkdirAll(fakeBinDir, 0o755); err != nil {
+			t.Fatalf("create fake bin directory: %v", err)
+		}
+		stateDir := filepath.Join(tempDir, "state")
+		airCacheDir := filepath.Join(tempDir, "air-cache")
+		airInstallDir := filepath.Join(airCacheDir, "test-version")
+		if err := os.MkdirAll(airInstallDir, 0o755); err != nil {
+			t.Fatalf("create fake Air install directory: %v", err)
+		}
+
+		lifecycleFIFO := createFIFO(t, tempDir, "lifecycle.fifo")
+		viteStartedFIFO := createFIFO(t, tempDir, "vite-started.fifo")
+		readyGateFIFO := createFIFO(t, tempDir, "ready-gate.fifo")
+		daemonReadyFile := filepath.Join(tempDir, "daemon-ready")
+		holdFIFO := createFIFO(t, tempDir, "hold.fifo")
+		holdFile, err := os.OpenFile(holdFIFO, os.O_RDWR, 0)
+		if err != nil {
+			t.Fatalf("open process hold FIFO: %v", err)
+		}
+		t.Cleanup(func() {
+			if err := holdFile.Close(); err != nil && !errors.Is(err, os.ErrClosed) {
+				t.Errorf("close process hold FIFO: %v", err)
+			}
+		})
+
+		writeExecutable(t, fakeBinDir, "go", `#!/usr/bin/env bash
+set -euo pipefail
+if [[ "${1:-}" == "run" && "${2:-}" == "./scripts/air-state-dir" ]]; then
+  printf '%s\n' "$COMPOZY_TEST_AIR_STATE_DIR"
+  exit 0
+fi
+if [[ "${1:-}" == "run" && "${2:-}" == "./scripts/air-state-lock" ]]; then
+  while (($# > 0)) && [[ "$1" != "--" ]]; do shift; done
+  if (($# == 0)); then
+    printf '%s\n' 'missing serialized command' >&2
+    exit 2
+  fi
+  shift
+  exec "$@"
+fi
+printf 'unexpected go command: %s\n' "$*" >&2
+exit 2
+`)
+		writeExecutable(t, fakeBinDir, "compozy", `#!/usr/bin/env bash
+set -euo pipefail
+if [[ "${1:-}" == "config" && "${2:-}" == "show" ]]; then
+  if [[ -f "$COMPOZY_TEST_DAEMON_READY_FILE" ]]; then
+    printf '%s\n' 'config-after-ready' > "$COMPOZY_TEST_LIFECYCLE_FIFO"
+  else
+    printf '%s\n' 'config-before-ready' > "$COMPOZY_TEST_LIFECYCLE_FIFO"
+  fi
+  printf '%s\n' '{"config":{"http":{"host":"127.0.0.1","port":2123}}}'
+  exit 0
+fi
+printf 'unexpected daemon command: %s\n' "$*" >&2
+exit 2
+`)
+		writeExecutable(t, fakeBinDir, "bun", `#!/usr/bin/env bash
+set -euo pipefail
+if [[ "${1:-}" == "scripts/find-dev-port.mjs" ]]; then
+  printf '%s\n' '3000'
+  exit 0
+fi
+if [[ "${1:-}" == "-e" ]]; then
+  cat >/dev/null
+  printf '%s' 'http://127.0.0.1:2123'
+  exit 0
+fi
+if [[ "${1:-}" == "run" ]]; then
+  printf '%s\n' 'vite-started' > "$COMPOZY_TEST_VITE_STARTED_FIFO"
+  trap 'exit 143' INT TERM
+  read -r _ < "$COMPOZY_TEST_HOLD_FIFO"
+  exit 0
+fi
+printf 'unexpected bun command: %s\n' "$*" >&2
+exit 2
+`)
+		writeExecutable(t, airInstallDir, "air", `#!/usr/bin/env bash
+set -euo pipefail
+printf '%s\n' 'air-started' > "$COMPOZY_TEST_LIFECYCLE_FIFO"
+read -r _ < "$COMPOZY_TEST_READY_GATE_FIFO"
+printf '%s\n' 'ready' > "$COMPOZY_TEST_DAEMON_READY_FILE"
+bash "$COMPOZY_TEST_REPO_ROOT/scripts/dev-readiness.sh" ready \
+  "$COMPOZY_AIR_READY_FIFO" "$COMPOZY_AIR_DEV_RUN_ID" "$COMPOZY_AIR_READY_MARKER" "fake-binary"
+trap 'exit 143' INT TERM
+read -r _ < "$COMPOZY_TEST_HOLD_FIFO"
+`)
+
+		firstLifecycleEvent := readFIFOEvent(lifecycleFIFO)
+		viteStarted := readFIFOEvent(viteStartedFIFO)
+		commandContext, cancelCommand := context.WithTimeout(t.Context(), 5*time.Second)
+		defer cancelCommand()
+		command := exec.CommandContext(commandContext, "bash", filepath.Join(repoRoot, "scripts", "dev.sh"))
+		command.Dir = repoRoot
+		command.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+		command.Env = append(os.Environ(),
+			"PATH="+fakeBinDir+string(os.PathListSeparator)+os.Getenv("PATH"),
+			"AIR_VERSION=test-version",
+			"COMPOZY_WEB_API_PROXY_TARGET=",
+			"COMPOZY_AIR_CACHE_DIR="+airCacheDir,
+			"COMPOZY_AIR_BUILD_DIR="+fakeBinDir,
+			"COMPOZY_TEST_AIR_STATE_DIR="+stateDir,
+			"COMPOZY_TEST_LIFECYCLE_FIFO="+lifecycleFIFO,
+			"COMPOZY_TEST_VITE_STARTED_FIFO="+viteStartedFIFO,
+			"COMPOZY_TEST_READY_GATE_FIFO="+readyGateFIFO,
+			"COMPOZY_TEST_DAEMON_READY_FILE="+daemonReadyFile,
+			"COMPOZY_TEST_HOLD_FIFO="+holdFIFO,
+			"COMPOZY_TEST_REPO_ROOT="+repoRoot,
+		)
+		var commandOutput bytes.Buffer
+		command.Stdout = &commandOutput
+		command.Stderr = &commandOutput
+		if err := command.Start(); err != nil {
+			t.Fatalf("start dev supervisor: %v", err)
+		}
+		commandDone := make(chan error, 1)
+		go func() {
+			commandDone <- command.Wait()
+		}()
+		commandWaited := false
+		t.Cleanup(func() {
+			if commandWaited {
+				return
+			}
+			if err := signalProcessGroup(command.Process.Pid, syscall.SIGTERM); err != nil {
+				t.Errorf("signal dev supervisor during cleanup: %v", err)
+			}
+			err := awaitProcessExit(commandDone, 2*time.Second)
+			if errors.Is(err, context.DeadlineExceeded) {
+				if killErr := signalProcessGroup(command.Process.Pid, syscall.SIGKILL); killErr != nil {
+					t.Errorf("kill dev supervisor process group during cleanup: %v", killErr)
+				}
+				err = awaitProcessExit(commandDone, 2*time.Second)
+			}
+			if err != nil {
+				exitError, exitErrorMatched := errors.AsType[*exec.ExitError](err)
+				if !exitErrorMatched || exitError.ExitCode() != 143 {
+					t.Errorf("wait for dev supervisor during cleanup: %v; output=%s", err, commandOutput.String())
+				}
+			}
+		})
+
+		if event := awaitFIFOEvent(t, firstLifecycleEvent, 2*time.Second, "first lifecycle"); event != "air-started" {
+			t.Fatalf("first lifecycle event = %q, want air-started", event)
+		}
+		absenceTimer := time.NewTimer(150 * time.Millisecond)
+		select {
+		case result := <-viteStarted:
+			absenceTimer.Stop()
+			if result.err != nil {
+				t.Fatalf("read early Vite event: %v", result.err)
+			}
+			t.Fatalf("Vite started before daemon readiness: %q", result.value)
+		case <-absenceTimer.C:
+		}
+
+		configResolved := readFIFOEvent(lifecycleFIFO)
+		if err := writeFIFOEvent(readyGateFIFO, "release"); err != nil {
+			t.Fatalf("release daemon readiness gate: %v", err)
+		}
+		if event := awaitFIFOEvent(
+			t,
+			configResolved,
+			2*time.Second,
+			"config resolution",
+		); event != "config-after-ready" {
+			t.Fatalf("config resolution event = %q, want config-after-ready", event)
+		}
+		if event := awaitFIFOEvent(t, viteStarted, 2*time.Second, "Vite start"); event != "vite-started" {
+			t.Fatalf("Vite event = %q, want vite-started", event)
+		}
+
+		if err := signalProcessGroup(command.Process.Pid, syscall.SIGTERM); err != nil {
+			t.Fatalf("signal dev supervisor: %v", err)
+		}
+		err = awaitProcessExit(commandDone, 2*time.Second)
+		commandWaited = true
+		exitError, exitErrorMatched := errors.AsType[*exec.ExitError](err)
+		if !exitErrorMatched || exitError.ExitCode() != 143 {
+			t.Fatalf("dev supervisor exit = %v, want status 143; output=%s", err, commandOutput.String())
+		}
+	})
+}
+
+func TestRunAir(t *testing.T) {
+	t.Run("Should install with the selected toolchain when the PATH Go shim rewrites GOBIN", func(t *testing.T) {
+		t.Parallel()
+
+		repoRoot := repositoryRoot(t)
+		tempDir := t.TempDir()
+		fakeBinDir := filepath.Join(tempDir, "bin")
+		fakeGoRoot := filepath.Join(tempDir, "go-root")
+		fakeGoBinDir := filepath.Join(fakeGoRoot, "bin")
+		if err := os.MkdirAll(fakeBinDir, 0o755); err != nil {
+			t.Fatalf("create fake bin directory: %v", err)
+		}
+		if err := os.MkdirAll(fakeGoBinDir, 0o755); err != nil {
+			t.Fatalf("create fake Go bin directory: %v", err)
+		}
+
+		writeExecutable(t, fakeBinDir, "go", `#!/usr/bin/env bash
+set -euo pipefail
+if [[ "${1:-}" == "env" && "${2:-}" == "GOROOT" ]]; then
+  printf '%s\n' "$COMPOZY_TEST_GO_ROOT"
+  exit 0
+fi
+if [[ "${1:-}" == "install" ]]; then
+  GOBIN="$COMPOZY_TEST_GLOBAL_GOBIN" exec "$COMPOZY_TEST_GO_ROOT/bin/go" "$@"
+fi
+printf 'unexpected Go shim command: %s\n' "$*" >&2
+exit 2
+`)
+		writeExecutable(t, fakeGoBinDir, "go", `#!/usr/bin/env bash
+set -euo pipefail
+if [[ "${1:-}" != "install" ]]; then
+  printf 'unexpected selected Go command: %s\n' "$*" >&2
+  exit 2
+fi
+: "${GOBIN:?GOBIN must select the project-local Air install directory}"
+mkdir -p "$GOBIN"
+cat > "$GOBIN/air" <<'AIR'
+#!/usr/bin/env bash
+set -euo pipefail
+printf '%s\n' "$*" > "$COMPOZY_TEST_AIR_OUTPUT"
+AIR
+chmod 0700 "$GOBIN/air"
+`)
+
+		airOutput := filepath.Join(tempDir, "air-output")
+		command := exec.CommandContext(
+			t.Context(),
+			"bash",
+			filepath.Join(repoRoot, "scripts", "run-air.sh"),
+			"test-version",
+			"--probe",
+		)
+		command.Dir = repoRoot
+		command.Env = append(os.Environ(),
+			"PATH="+fakeBinDir+string(os.PathListSeparator)+os.Getenv("PATH"),
+			"COMPOZY_AIR_CACHE_DIR="+filepath.Join(tempDir, "air-cache"),
+			"COMPOZY_TEST_GO_ROOT="+fakeGoRoot,
+			"COMPOZY_TEST_GLOBAL_GOBIN="+filepath.Join(tempDir, "global-bin"),
+			"COMPOZY_TEST_AIR_OUTPUT="+airOutput,
+		)
+		if output, err := command.CombinedOutput(); err != nil {
+			t.Fatalf("run Air launcher: %v; output=%s", err, output)
+		}
+
+		output, err := os.ReadFile(airOutput)
+		if err != nil {
+			t.Fatalf("read Air invocation: %v", err)
+		}
+		if got := strings.TrimSpace(string(output)); got != "--probe" {
+			t.Fatalf("Air arguments = %q, want --probe", got)
+		}
+	})
+}
+
+type fifoResult struct {
+	value string
+	err   error
+}
+
+func repositoryRoot(t *testing.T) string {
+	t.Helper()
+
+	workingDirectory, err := os.Getwd()
+	if err != nil {
+		t.Fatalf("get working directory: %v", err)
+	}
+	root, err := filepath.Abs(filepath.Join(workingDirectory, "..", ".."))
+	if err != nil {
+		t.Fatalf("resolve repository root: %v", err)
+	}
+	return root
+}
+
+func createFIFO(t *testing.T, directory, name string) string {
+	t.Helper()
+
+	path := filepath.Join(directory, name)
+	if err := unix.Mkfifo(path, 0o600); err != nil {
+		t.Fatalf("create FIFO %q: %v", path, err)
+	}
+	return path
+}
+
+func writeExecutable(t *testing.T, directory, name, content string) string {
+	t.Helper()
+
+	path := filepath.Join(directory, name)
+	if err := os.WriteFile(path, []byte(content), 0o700); err != nil {
+		t.Fatalf("write executable %q: %v", path, err)
+	}
+	return path
+}
+
+func runDevDaemon(
+	t *testing.T,
+	repoRoot, binaryPath, stateDir, fifoPath, markerPath, startLog, runID string,
+) {
+	t.Helper()
+
+	command := devDaemonCommand(
+		t.Context(),
+		repoRoot,
+		binaryPath,
+		stateDir,
+		fifoPath,
+		markerPath,
+		startLog,
+		runID,
+	)
+	if output, err := command.CombinedOutput(); err != nil {
+		t.Fatalf("run dev-daemon: %v; output=%s", err, output)
+	}
+}
+
+func devDaemonCommand(
+	ctx context.Context,
+	repoRoot, binaryPath, stateDir, fifoPath, markerPath, startLog, runID string,
+) *exec.Cmd {
+	command := exec.CommandContext(ctx, "bash", filepath.Join(repoRoot, "scripts", "dev-daemon.sh"), binaryPath)
+	command.Dir = repoRoot
+	command.Env = append(os.Environ(),
+		"COMPOZY_AIR_STATE_LOCK_HELD=1",
+		"COMPOZY_AIR_STATE_DIR="+stateDir,
+		"COMPOZY_AIR_DEV_RUN_ID="+runID,
+		"COMPOZY_AIR_READY_FIFO="+fifoPath,
+		"COMPOZY_AIR_READY_MARKER="+markerPath,
+		"FAKE_DAEMON_START_LOG="+startLog,
+	)
+	return command
+}
+
+func checksumIdentity(t *testing.T, path string) string {
+	t.Helper()
+
+	command := exec.CommandContext(t.Context(), "cksum", path)
+	output, err := command.Output()
+	if err != nil {
+		t.Fatalf("identify test daemon binary: %v", err)
+	}
+	fields := strings.Fields(string(output))
+	if len(fields) < 2 {
+		t.Fatalf("cksum output = %q, want checksum and byte count", output)
+	}
+	if _, err := strconv.ParseUint(fields[0], 10, 64); err != nil {
+		t.Fatalf("parse checksum %q: %v", fields[0], err)
+	}
+	if _, err := strconv.ParseUint(fields[1], 10, 64); err != nil {
+		t.Fatalf("parse byte count %q: %v", fields[1], err)
+	}
+	return fmt.Sprintf("%s:%s", fields[0], fields[1])
+}
+
+func readFIFOEvent(path string) <-chan fifoResult {
+	result := make(chan fifoResult, 1)
+	go func() {
+		file, err := os.Open(path)
+		if err != nil {
+			result <- fifoResult{err: err}
+			return
+		}
+		buffer := make([]byte, 128)
+		count, readErr := file.Read(buffer)
+		closeErr := file.Close()
+		if err := errors.Join(readErr, closeErr); err != nil {
+			result <- fifoResult{err: err}
+			return
+		}
+		result <- fifoResult{value: strings.TrimSpace(string(buffer[:count]))}
+	}()
+	return result
+}
+
+func awaitFIFOEvent(t *testing.T, result <-chan fifoResult, timeout time.Duration, name string) string {
+	t.Helper()
+
+	timer := time.NewTimer(timeout)
+	defer timer.Stop()
+	select {
+	case event := <-result:
+		if event.err != nil {
+			t.Fatalf("read %s event: %v", name, event.err)
+		}
+		return event.value
+	case <-timer.C:
+		t.Fatalf("timed out waiting for %s event", name)
+		return ""
+	}
+}
+
+func writeFIFOEvent(path, value string) error {
+	file, err := os.OpenFile(path, os.O_WRONLY, 0)
+	if err != nil {
+		return fmt.Errorf("open FIFO: %w", err)
+	}
+	_, writeErr := fmt.Fprintln(file, value)
+	closeErr := file.Close()
+	return errors.Join(writeErr, closeErr)
+}
+
+func signalProcessGroup(pid int, signal syscall.Signal) error {
+	err := unix.Kill(-pid, signal)
+	if errors.Is(err, syscall.ESRCH) {
+		return nil
+	}
+	return err
+}
+
+func awaitProcessExit(done <-chan error, timeout time.Duration) error {
+	timer := time.NewTimer(timeout)
+	defer timer.Stop()
+	select {
+	case err := <-done:
+		return err
+	case <-timer.C:
+		return context.DeadlineExceeded
+	}
+}

@@ -1,0 +1,192 @@
+package daemon
+
+import (
+	"context"
+
+	hookspkg "github.com/compozy/compozy/internal/hooks"
+	"github.com/compozy/compozy/internal/session"
+	terminalpkg "github.com/compozy/compozy/internal/terminal"
+)
+
+// OnSessionCreated forwards the full runtime session to the downstream
+// observer after hook dispatch has already run. The native hook payload keeps
+// lifecycle ordering, while this pass preserves catalog fields that are not
+// exposed on public hook payloads.
+func (n *hooksNotifier) OnSessionCreated(ctx context.Context, sess *session.Session) {
+	if sess == nil {
+		return
+	}
+	_, agentEventNotify := n.runtime()
+	if agentEventNotify != nil {
+		agentEventNotify.OnSessionCreated(ctx, sess)
+	}
+}
+
+// OnSessionStopped forwards the full runtime session to the downstream
+// observer after hook dispatch has already run.
+func (n *hooksNotifier) OnSessionStopped(ctx context.Context, sess *session.Session) {
+	if sess == nil {
+		return
+	}
+	_, agentEventNotify := n.runtime()
+	if agentEventNotify != nil {
+		agentEventNotify.OnSessionStopped(ctx, sess)
+	}
+	if runtime := n.subprocessHealthNotifier(); runtime != nil {
+		runtime.OnSessionStopped(ctx, sess)
+	}
+}
+
+// OnSessionFinalizing forwards the recorder-open lifecycle phase to observers that must append
+// terminal evidence before the session ledger is materialized.
+func (n *hooksNotifier) OnSessionFinalizing(ctx context.Context, sess *session.Session) {
+	if sess == nil {
+		return
+	}
+	_, agentEventNotify := n.runtime()
+	if finalizer, ok := agentEventNotify.(sessionFinalizationObserver); ok {
+		finalizer.OnSessionFinalizing(ctx, sess)
+	}
+}
+
+func (n *hooksNotifier) DispatchSessionPreCreate(
+	ctx context.Context,
+	payload hookspkg.SessionPreCreatePayload,
+) (hookspkg.SessionPreCreatePayload, error) {
+	return n.dispatchRuntime(ctx,
+		hookspkg.HookSessionPreCreate,
+		payload,
+		hookRuntime.DispatchSessionPreCreate,
+	)
+}
+
+func (n *hooksNotifier) DispatchSessionPostCreate(
+	ctx context.Context,
+	payload hookspkg.SessionPostCreatePayload,
+) (hookspkg.SessionPostCreatePayload, error) {
+	return n.dispatchRuntime(ctx,
+		hookspkg.HookSessionPostCreate,
+		payload,
+		hookRuntime.DispatchSessionPostCreate,
+	)
+}
+
+func (n *hooksNotifier) DispatchSessionPreResume(
+	ctx context.Context,
+	payload hookspkg.SessionPreResumePayload,
+) (hookspkg.SessionPreResumePayload, error) {
+	return n.dispatchRuntime(ctx,
+		hookspkg.HookSessionPreResume,
+		payload,
+		hookRuntime.DispatchSessionPreResume,
+	)
+}
+
+func (n *hooksNotifier) DispatchSessionPostResume(
+	ctx context.Context,
+	payload hookspkg.SessionPostResumePayload,
+) (hookspkg.SessionPostResumePayload, error) {
+	return n.dispatchRuntime(ctx,
+		hookspkg.HookSessionPostResume,
+		payload,
+		hookRuntime.DispatchSessionPostResume,
+	)
+}
+
+func (n *hooksNotifier) DispatchSessionPreStop(
+	ctx context.Context,
+	payload hookspkg.SessionPreStopPayload,
+) (hookspkg.SessionPreStopPayload, error) {
+	return n.dispatchRuntime(ctx,
+		hookspkg.HookSessionPreStop,
+		payload,
+		hookRuntime.DispatchSessionPreStop,
+	)
+}
+
+func (n *hooksNotifier) DispatchSessionPostStop(
+	ctx context.Context,
+	payload hookspkg.SessionPostStopPayload,
+) (hookspkg.SessionPostStopPayload, error) {
+	return n.dispatchRuntime(ctx,
+		hookspkg.HookSessionPostStop,
+		payload,
+		hookRuntime.DispatchSessionPostStop,
+	)
+}
+
+func (n *hooksNotifier) DispatchSessionRuntimeRecoveryStarted(
+	ctx context.Context,
+	payload hookspkg.SessionRuntimeRecoveryStartedPayload,
+) (hookspkg.SessionRuntimeRecoveryStartedPayload, error) {
+	if terminals := n.terminalRuntime(); terminals != nil && payload.Generation > 1 {
+		previous := terminalpkg.Actor{
+			Kind: terminalpkg.ActorKindAgent, ID: payload.AgentName, ProfileID: payload.ProfileID,
+			SessionID: payload.SessionID, RunID: payload.RunID, Generation: payload.Generation - 1,
+		}
+		current := previous
+		current.Generation = payload.Generation
+		terminals.RuntimeRecovered(ctx, payload.WorkspaceID, previous, current)
+	}
+	return n.dispatchRuntime(ctx, hookspkg.HookSessionRuntimeRecoveryStarted, payload,
+		hookRuntime.DispatchSessionRuntimeRecoveryStarted,
+	)
+}
+
+func (n *hooksNotifier) DispatchSessionRuntimeRecoverySucceeded(
+	ctx context.Context,
+	payload hookspkg.SessionRuntimeRecoverySucceededPayload,
+) (hookspkg.SessionRuntimeRecoverySucceededPayload, error) {
+	return n.dispatchRuntime(ctx, hookspkg.HookSessionRuntimeRecoverySucceeded, payload,
+		hookRuntime.DispatchSessionRuntimeRecoverySucceeded,
+	)
+}
+
+func (n *hooksNotifier) DispatchSessionRuntimeRecoveryExhausted(
+	ctx context.Context,
+	payload hookspkg.SessionRuntimeRecoveryExhaustedPayload,
+) (hookspkg.SessionRuntimeRecoveryExhaustedPayload, error) {
+	return n.dispatchRuntime(ctx, hookspkg.HookSessionRuntimeRecoveryExhausted, payload,
+		hookRuntime.DispatchSessionRuntimeRecoveryExhausted,
+	)
+}
+
+func (n *hooksNotifier) DispatchInputPreSubmit(
+	ctx context.Context,
+	payload hookspkg.InputPreSubmitPayload,
+) (hookspkg.InputPreSubmitPayload, error) {
+	return n.dispatchRuntime(ctx,
+		hookspkg.HookInputPreSubmit,
+		payload,
+		hookRuntime.DispatchInputPreSubmit,
+	)
+}
+
+func (n *hooksNotifier) DispatchPromptPostAssemble(
+	ctx context.Context,
+	payload hookspkg.PromptPayload,
+) (hookspkg.PromptPayload, error) {
+	return n.dispatchRuntime(ctx,
+		hookspkg.HookPromptPostAssemble,
+		payload,
+		hookRuntime.DispatchPromptPostAssemble,
+	)
+}
+
+func (n *hooksNotifier) DispatchEventPreRecord(
+	ctx context.Context,
+	payload hookspkg.EventPreRecordPayload,
+) (hookspkg.EventPreRecordPayload, error) {
+	return n.dispatchRuntime(ctx,
+		hookspkg.HookEventPreRecord,
+		payload,
+		hookRuntime.DispatchEventPreRecord,
+	)
+}
+
+func (n *hooksNotifier) DispatchEventPostRecord(
+	ctx context.Context,
+	payload hookspkg.EventPostRecordPayload,
+) (hookspkg.EventPostRecordPayload, error) {
+	return dispatchEventPostRecordWithWatchObservers(ctx, n, payload)
+}

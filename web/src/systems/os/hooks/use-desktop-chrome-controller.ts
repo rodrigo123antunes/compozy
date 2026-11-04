@@ -1,0 +1,40 @@
+import { useAtom } from "@xstate/store-react";
+
+import { useDesktopChrome } from "./use-desktop-chrome";
+import { useDesktopShellModel } from "./use-desktop-shell-model";
+import { useWorkspaceSetupDefaults } from "./use-workspace-setup-defaults";
+import { useWorktreeDialogTargets } from "./use-worktree-dialog-targets";
+import { continuityStreamsWithinConnectionBudget } from "../lib/background-stream-budget";
+import {
+  useActiveWorkspace,
+  USER_DESKTOP_WORKSPACE_ID,
+  USER_SCOPE_SELECTOR,
+} from "@/systems/workspace";
+
+/** Owns the state and supporting models required to mount the desktop chrome. */
+export function useDesktopChromeController() {
+  const activeWorkspace = useActiveWorkspace();
+  const chrome = useDesktopChrome(
+    activeWorkspace.desktopWorkspaceId,
+    // Fallback for unbound terminal windows; explicit window bindings take precedence.
+    activeWorkspace.desktopWorkspaceId === USER_DESKTOP_WORKSPACE_ID
+      ? USER_SCOPE_SELECTOR
+      : (activeWorkspace.desktopWorkspace?.id ?? null)
+  );
+  const continuityStreamsEnabled = useAtom(
+    chrome.shell.projection,
+    continuityStreamsWithinConnectionBudget
+  );
+  const model = useDesktopShellModel(activeWorkspace, {
+    continuityStreamsEnabled,
+  });
+  const workspaceSetupDefaults = useWorkspaceSetupDefaults(model.isWorkspaceSetupOpen);
+  const worktreeDialogs = useWorktreeDialogTargets();
+
+  return {
+    chrome,
+    model,
+    workspaceSetupDefaults,
+    worktreeDialogs,
+  };
+}

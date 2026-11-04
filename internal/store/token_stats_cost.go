@@ -1,0 +1,115 @@
+package store
+
+import (
+	"math"
+	"strings"
+)
+
+const (
+	TokenCostStatusActual    = "actual"
+	TokenCostStatusEstimated = "estimated"
+	TokenCostStatusIncluded  = "included"
+	TokenCostStatusUnknown   = "unknown"
+
+	TokenCostSourceAgentReported = "agent_reported"
+	TokenCostSourceCatalogConfig = "catalog_config"
+	TokenCostSourceModelsDev     = "models_dev"
+	TokenCostSourceBuiltin       = "builtin"
+	TokenCostSourceNone          = "none"
+)
+
+// TokenStatsCostSummary is the compatible cost projection across token-stat rows.
+type TokenStatsCostSummary struct {
+	TotalCost *float64
+	Currency  *string
+	Status    string
+	Source    string
+}
+
+// AggregateTokenStatsCost sums only rows with identical truthful provenance and currency.
+func AggregateTokenStatsCost(stats []TokenStats) TokenStatsCostSummary {
+	if len(stats) == 0 {
+		return TokenStatsCostSummary{}
+	}
+
+	summary := TokenStatsCostSummary{}
+	initialized := false
+	for index := range stats {
+		row, ok := tokenStatsRowCost(stats[index])
+		if !ok {
+			return unknownTokenStatsCost()
+		}
+		if !initialized {
+			summary = row
+			initialized = true
+			continue
+		}
+		if summary.Status != row.Status || summary.Source != row.Source ||
+			normalizedCostCurrency(summary.Currency) != normalizedCostCurrency(row.Currency) {
+			return unknownTokenStatsCost()
+		}
+		if row.TotalCost != nil {
+			if summary.TotalCost == nil {
+				return unknownTokenStatsCost()
+			}
+			total := *summary.TotalCost + *row.TotalCost
+			if !validAggregatedCostAmount(total) {
+				return unknownTokenStatsCost()
+			}
+			summary.TotalCost = &total
+		}
+	}
+	return summary
+}
+
+func tokenStatsRowCost(stat TokenStats) (TokenStatsCostSummary, bool) {
+	status := strings.TrimSpace(stat.CostStatus)
+	source := strings.TrimSpace(stat.CostSource)
+	switch status {
+	case TokenCostStatusActual:
+		if source != TokenCostSourceAgentReported || stat.TotalCost == nil ||
+			!validAggregatedCostAmount(*stat.TotalCost) ||
+			normalizedCostCurrency(stat.CostCurrency) == "" {
+			return TokenStatsCostSummary{}, false
+		}
+	case TokenCostStatusEstimated:
+		if source != TokenCostSourceCatalogConfig &&
+			source != TokenCostSourceModelsDev && source != TokenCostSourceBuiltin {
+			return TokenStatsCostSummary{}, false
+		}
+		if stat.TotalCost == nil || !validAggregatedCostAmount(*stat.TotalCost) ||
+			normalizedCostCurrency(stat.CostCurrency) == "" {
+			return TokenStatsCostSummary{}, false
+		}
+	case TokenCostStatusIncluded, TokenCostStatusUnknown:
+		if source != TokenCostSourceNone || stat.TotalCost != nil || stat.CostCurrency != nil {
+			return TokenStatsCostSummary{}, false
+		}
+	default:
+		return TokenStatsCostSummary{}, false
+	}
+
+	result := TokenStatsCostSummary{Status: status, Source: source}
+	if stat.TotalCost != nil {
+		result.TotalCost = new(*stat.TotalCost)
+	}
+	if currency := normalizedCostCurrency(stat.CostCurrency); currency != "" {
+		result.Currency = &currency
+	}
+	return result, true
+}
+
+func validAggregatedCostAmount(amount float64) bool {
+	return amount >= 0 && !math.IsNaN(amount) && !math.IsInf(amount, 0)
+}
+
+func normalizedCostCurrency(currency *string) string {
+	if currency == nil {
+		return ""
+	}
+	return strings.TrimSpace(*currency)
+}
+
+func unknownTokenStatsCost() TokenStatsCostSummary {
+	return TokenStatsCostSummary{Status: TokenCostStatusUnknown, Source: TokenCostSourceNone}
+}

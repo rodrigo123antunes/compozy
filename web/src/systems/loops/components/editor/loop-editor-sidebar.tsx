@@ -1,0 +1,109 @@
+import { LaneTabs, TabsContent } from "@compozy/ui";
+
+import type { WorktreePayload } from "@/systems/workspace";
+
+import type { LoopEditorSidebarTab } from "../../hooks/use-loop-editor-state";
+import type { EditorEdge, EditorNode } from "../../lib/codec";
+import type { EditableLoopContractField } from "../../lib/loop-editor-definition";
+import type { NodeFieldEdit } from "../../lib/loop-editor-draft";
+import type { FieldPath, FieldSpec } from "../../lib/loop-node-schema";
+import type {
+  LoopContract,
+  LoopDefinition,
+  LoopEnvironmentSpec,
+  LoopValidationIssue,
+} from "../../types";
+import {
+  SIDEBAR_CLASS,
+  SIDEBAR_TABS,
+  SIDEBAR_TABS_CLASS,
+  SIDEBAR_TABS_LIST_CLASS,
+} from "./loop-editor-chrome-parts";
+import { LoopEditorContract } from "./loop-editor-contract";
+import { LoopEditorInspector } from "./loop-editor-inspector";
+
+interface LoopEditorSidebarProps {
+  contract: LoopContract;
+  contractDisabled: boolean;
+  onChangeContract: (field: EditableLoopContractField, value: string) => void;
+  onChangeContractPath: (path: FieldPath, value: unknown) => void;
+  node: EditorNode | null;
+  fields: FieldSpec[];
+  nodes: EditorNode[];
+  edges: EditorEdge[];
+  selectionKey: number;
+  definition: Pick<LoopDefinition, "inputs" | "start">;
+  inspectorDisabled: boolean;
+  onChangeField: (path: FieldPath, value: unknown) => void;
+  onChangeFields: (edits: NodeFieldEdit[]) => void;
+  sidebarTab: LoopEditorSidebarTab;
+  onSidebarTabChange: (tab: LoopEditorSidebarTab) => void;
+  worktrees?: readonly WorktreePayload[];
+  gitBacked?: boolean;
+  loopDefaultEnvironment?: LoopEnvironmentSpec;
+  lintByNode?: ReadonlyMap<string, LoopValidationIssue[]>;
+}
+
+/** Right-rail inspector: Contract outcome vs selected-node fields, one lane at a time. */
+export function LoopEditorSidebar({
+  contract,
+  contractDisabled,
+  onChangeContract,
+  onChangeContractPath,
+  node,
+  fields,
+  nodes,
+  edges,
+  selectionKey,
+  definition,
+  inspectorDisabled,
+  onChangeField,
+  onChangeFields,
+  sidebarTab,
+  onSidebarTabChange,
+  worktrees,
+  gitBacked,
+  loopDefaultEnvironment,
+  lintByNode,
+}: LoopEditorSidebarProps) {
+  return (
+    <aside className={SIDEBAR_CLASS} data-testid="loop-editor-sidebar">
+      <LaneTabs<LoopEditorSidebarTab>
+        ariaLabel="Loop editor inspector"
+        className={SIDEBAR_TABS_CLASS}
+        items={SIDEBAR_TABS}
+        listClassName={SIDEBAR_TABS_LIST_CLASS}
+        onChange={onSidebarTabChange}
+        value={sidebarTab}
+      >
+        <div className="min-h-0 flex-1 overflow-y-auto">
+          <TabsContent value="contract" className="mt-0">
+            <LoopEditorContract
+              contract={contract}
+              disabled={contractDisabled}
+              onChange={onChangeContract}
+              onChangePath={onChangeContractPath}
+            />
+          </TabsContent>
+          <TabsContent value="node" className="mt-0 h-full">
+            <LoopEditorInspector
+              definition={definition}
+              disabled={inspectorDisabled}
+              edges={edges}
+              fields={fields}
+              gitBacked={gitBacked}
+              lintIssues={node ? (lintByNode?.get(node.id) ?? []) : []}
+              loopDefaultEnvironment={loopDefaultEnvironment}
+              node={node}
+              nodes={nodes}
+              onChange={onChangeField}
+              onChangeFields={onChangeFields}
+              selectionKey={selectionKey}
+              worktrees={worktrees}
+            />
+          </TabsContent>
+        </div>
+      </LaneTabs>
+    </aside>
+  );
+}

@@ -1,0 +1,860 @@
+package daemon
+
+import (
+	"bytes"
+	"context"
+	"log/slog"
+	"maps"
+	"path/filepath"
+	"slices"
+	"strings"
+	"testing"
+
+	"github.com/compozy/compozy/internal/acp"
+	compozyconfig "github.com/compozy/compozy/internal/config"
+	"github.com/compozy/compozy/internal/session"
+	skillspkg "github.com/compozy/compozy/internal/skills"
+	workspacepkg "github.com/compozy/compozy/internal/workspace"
+)
+
+func TestResolveSessionNativeSkillRoots(t *testing.T) {
+	t.Parallel()
+	t.Run("Should resolve roots from the effective provider home", func(t *testing.T) {
+		t.Parallel()
+
+		operatorHome := t.TempDir()
+		managedHome := t.TempDir()
+		workspace := t.TempDir()
+		homePaths := compozyconfig.HomePaths{HomeDir: managedHome, OperatorHomeDir: operatorHome}
+
+		t.Run("Should resolve canonical providers aliases overrides and isolation", func(t *testing.T) {
+			t.Parallel()
+			env := map[string]string{
+				"CLAUDE_CONFIG_DIR": filepath.Join(operatorHome, "claude-override"),
+			}
+			lookup := func(key string) (string, bool) { value, ok := env[key]; return value, ok }
+
+			claude := resolveSessionNativeSkillRoots(&nativeSkillRootResolution{
+				Provider: "claude-code", Workspace: workspace, HomePaths: homePaths, LookupEnv: lookup,
+			})
+			assertNativeRootSet(t, claude,
+				filepath.Join(workspace, ".claude", "skills"),
+				filepath.Join(env["CLAUDE_CONFIG_DIR"], "skills"),
+			)
+
+			isolated := resolveSessionNativeSkillRoots(&nativeSkillRootResolution{
+				Provider: "claude", ProviderHomePolicy: compozyconfig.ProviderHomePolicyIsolated,
+				Workspace: workspace, HomePaths: homePaths, LookupEnv: func(string) (string, bool) { return "", false },
+			})
+			assertNativeRootSet(t, isolated,
+				filepath.Join(workspace, ".claude", "skills"),
+				filepath.Join(managedHome, "providers", "claude", "claude", "skills"),
+			)
+			for _, root := range isolated {
+				if strings.HasPrefix(root, canonicalNativeSkillRoot(operatorHome)) {
+					t.Fatalf("isolated native root %q uses operator home %q", root, operatorHome)
+				}
+			}
+		})
+
+		t.Run("Should fail open for unknown provider identities", func(t *testing.T) {
+			t.Parallel()
+			for _, provider := range []string{"", "custom", "claude --dangerously-skip-permissions", "hermes", "openclaw"} {
+				if roots := resolveSessionNativeSkillRoots(&nativeSkillRootResolution{
+					Provider: provider, Workspace: workspace, HomePaths: homePaths,
+				}); len(roots) != 0 {
+					t.Fatalf("provider %q roots = %#v, want empty", provider, roots)
+				}
+			}
+		})
+	})
+}
+
+func TestHarnessContextResolverScopesInputOnlyContext(t *testing.T) {
+	t.Parallel()
+	for _, role := range []string{session.SpawnRoleAutoTitle, "custom", ""} {
+		t.Run("Should scope startup and live context for role "+role, func(t *testing.T) {
+			t.Parallel()
+			resolver := NewHarnessContextResolver(HarnessRuntimeSignals{
+				RuntimeIdentityPromptSectionEnabled: true, SituationPromptSectionEnabled: true,
+				SkillsPromptSectionEnabled: true, ToolsPromptSectionEnabled: true,
+				SkillsAugmenter: true, SituationAugmenter: true,
+			})
+			wantContext := role == "" || role == "custom"
+			for _, surface := range []ResolutionSurface{ResolutionSurfaceStartup, ResolutionSurfaceTurn} {
+				resolved, err := resolver.Resolve(HarnessResolutionInput{
+					Surface: surface, Session: HarnessSessionInput{Type: session.SessionTypeSpawned, SpawnRole: role},
+					Turn: HarnessTurnRequest{Source: session.TurnSourceUser},
+				})
+				if err != nil {
+					t.Fatal(err)
+				}
+				for _, section := range []HarnessPromptSection{HarnessPromptSectionSituation, HarnessPromptSectionSkills, HarnessPromptSectionTools} {
+					if slices.Contains(resolved.Policy.IncludeSections, section) != wantContext {
+						t.Fatalf("%s sections = %v", surface, resolved.Policy.IncludeSections)
+					}
+				}
+				if !slices.Contains(resolved.Policy.IncludeSections, HarnessPromptSectionRuntimeIdentity) {
+					t.Fatal("runtime identity was removed")
+				}
+				for _, augmenter := range []HarnessAugmenter{HarnessAugmenterSkills, HarnessAugmenterSituation} {
+					if slices.Contains(
+						resolved.Policy.EnableAugmenters,
+						augmenter,
+					) != (wantContext && surface == ResolutionSurfaceTurn) {
+						t.Fatalf("%s augmenters = %v", surface, resolved.Policy.EnableAugmenters)
+					}
+				}
+			}
+		})
+	}
+}
+
+func TestHarnessSkillInjectionFilterSuppressesOnlyWinningNativePresetRoots(t *testing.T) {
+	t.Parallel()
+	t.Run("Should suppress only winning native preset roots", func(t *testing.T) {
+		t.Parallel()
+
+		operatorHome := t.TempDir()
+		workspace := t.TempDir()
+		var logs bytes.Buffer
+		resolver := NewHarnessContextResolver(
+			HarnessRuntimeSignals{SkillsPromptSectionEnabled: true, SkillsAugmenter: true},
+			WithHarnessSkillInjectionHome(compozyconfig.HomePaths{OperatorHomeDir: operatorHome}),
+			WithHarnessSkillInjectionLogger(slog.New(slog.NewTextHandler(&logs, nil))),
+			WithHarnessSkillInjectionEnvLookup(func(string) (string, bool) { return "", false }),
+		)
+		resolved, err := resolver.Resolve(HarnessResolutionInput{
+			Surface: ResolutionSurfaceTurn,
+			Session: HarnessSessionInput{
+				SessionID: "sess-native", Type: session.SessionTypeUser, Provider: "claude",
+				Workspace: workspace,
+			},
+			Turn: HarnessTurnRequest{Source: session.TurnSourceUser},
+		})
+		if err != nil {
+			t.Fatalf("Resolve() error = %v", err)
+		}
+		filter := resolved.Policy.SkillInjectionFilter
+		workspaceClaude := &skillspkg.Skill{
+			Meta: skillspkg.SkillMeta{Name: "workspace-native"}, Origin: compozyconfig.SkillSourceClaude,
+			RootDir: filepath.Join(workspace, ".claude", "skills"), Enabled: true,
+		}
+		workspaceAgents := &skillspkg.Skill{
+			Meta: skillspkg.SkillMeta{Name: "agents-not-native"}, Origin: compozyconfig.SkillSourceAgents,
+			RootDir: filepath.Join(workspace, ".agents", "skills"), Enabled: true,
+		}
+		custom := &skillspkg.Skill{
+			Meta: skillspkg.SkillMeta{Name: "custom"}, Origin: "team-skills",
+			RootDir: workspaceClaude.RootDir, Enabled: true,
+		}
+		if filter(workspaceClaude) {
+			t.Fatal("workspace claude winner retained, want suppressed for Claude")
+		}
+		if !filter(workspaceAgents) {
+			t.Fatal("agents winner suppressed, want retained because no provider reads .agents/skills natively")
+		}
+		if !filter(custom) {
+			t.Fatal("custom-origin winner suppressed, want fail-open retention")
+		}
+		for _, fragment := range []string{
+			"skills.injection.suppressed", "session_id=sess-native", "skill=workspace-native",
+			"source=claude", "provider=claude",
+		} {
+			if !strings.Contains(logs.String(), fragment) {
+				t.Fatalf("suppression log = %q, want %q", logs.String(), fragment)
+			}
+		}
+
+		tests := []struct {
+			name     string
+			provider string
+			origin   string
+			root     string
+			wantKeep bool
+		}{
+			{
+				name: "Should suppress the Claude workspace preset", provider: "claude", origin: "claude",
+				root: filepath.Join(workspace, ".claude", "skills"),
+			},
+			{
+				name: "Should suppress the Claude operator preset", provider: "claude", origin: "claude",
+				root: filepath.Join(operatorHome, ".claude", "skills"),
+			},
+			{
+				name:     "Should retain the Agents workspace preset for every provider",
+				provider: "openclaw", origin: "agents",
+				root: filepath.Join(workspace, ".agents", "skills"), wantKeep: true,
+			},
+			{
+				name: "Should retain preset skills for an unknown provider", provider: "custom", origin: "claude",
+				root: filepath.Join(workspace, ".claude", "skills"), wantKeep: true,
+			},
+			{
+				name: "Should retain custom origins even at a native path", provider: "claude", origin: "team-skills",
+				root: filepath.Join(workspace, ".claude", "skills"), wantKeep: true,
+			},
+			{
+				name:     "Should retain a Compozy winner that shadows a native-root homonym",
+				provider: "claude",
+				origin:   "",
+				root:     filepath.Join(workspace, ".compozy", "skills"),
+				wantKeep: true,
+			},
+		}
+		for _, test := range tests {
+			t.Run(test.name, func(t *testing.T) {
+				t.Parallel()
+
+				matrixResolver := NewHarnessContextResolver(
+					HarnessRuntimeSignals{SkillsPromptSectionEnabled: true, SkillsAugmenter: true},
+					WithHarnessSkillInjectionHome(compozyconfig.HomePaths{OperatorHomeDir: operatorHome}),
+					WithHarnessSkillInjectionEnvLookup(func(string) (string, bool) { return "", false }),
+				)
+				matrix, err := matrixResolver.Resolve(HarnessResolutionInput{
+					Surface: ResolutionSurfaceTurn,
+					Session: HarnessSessionInput{
+						SessionID: "sess-matrix", Type: session.SessionTypeUser,
+						Provider: test.provider, Workspace: workspace,
+					},
+					Turn: HarnessTurnRequest{Source: session.TurnSourceUser},
+				})
+				if err != nil {
+					t.Fatalf("Resolve() error = %v", err)
+				}
+				candidate := &skillspkg.Skill{
+					Meta: skillspkg.SkillMeta{Name: "matrix-skill"}, Origin: test.origin,
+					RootDir: test.root, Enabled: true,
+				}
+				got := true
+				if filter := matrix.Policy.SkillInjectionFilter; filter != nil {
+					got = filter(candidate)
+				}
+				if got != test.wantKeep {
+					t.Fatalf("filter(%s, %s) = %t, want keep %t", test.provider, test.root, got, test.wantKeep)
+				}
+			})
+		}
+	})
+}
+
+func assertNativeRootSet(t *testing.T, got []string, want ...string) {
+	t.Helper()
+	canonicalWant := canonicalNativeSkillRoots(want)
+	slices.Sort(got)
+	slices.Sort(canonicalWant)
+	if !slices.Equal(got, canonicalWant) {
+		t.Fatalf("native roots = %#v, want %#v", got, canonicalWant)
+	}
+}
+
+func TestHarnessContextResolverMatrix(t *testing.T) {
+	t.Parallel()
+
+	resolver := NewHarnessContextResolver(HarnessRuntimeSignals{
+		SkillsPromptSectionEnabled: true,
+		SkillsAugmenter:            true,
+		SyntheticTurnsEnabled:      true,
+		DetachedTaskRuntimeEnabled: true,
+	})
+
+	testCases := []struct {
+		name           string
+		input          HarnessResolutionInput
+		wantSections   []HarnessPromptSection
+		wantAugmenters []HarnessAugmenter
+		wantReentry    ReentryMode
+		wantDetached   DetachedRunMode
+		wantLabel      string
+		wantTags       map[string]string
+	}{
+		{
+			name: "Should resolve baseline policy for a user session plus user turn",
+			input: HarnessResolutionInput{
+				Surface: ResolutionSurfaceTurn,
+				Session: HarnessSessionInput{
+					Type: session.SessionTypeUser,
+				},
+				Turn: HarnessTurnRequest{
+					Source: session.TurnSourceUser,
+				},
+			},
+			wantSections: []HarnessPromptSection{HarnessPromptSectionSkills},
+			wantAugmenters: []HarnessAugmenter{
+				HarnessAugmenterSkills,
+			},
+			wantReentry:  ReentryModeNone,
+			wantDetached: DetachedRunModeNone,
+			wantLabel:    "interactive.user",
+			wantTags: map[string]string{
+				"harness.surface":          "turn",
+				"harness.session_type":     "user",
+				"harness.session_class":    "interactive",
+				"harness.turn_origin":      "user",
+				"harness.diagnostic_label": "interactive.user",
+			},
+		},
+		{
+			name: "Should resolve coordinator policy for coordinator startup session",
+			input: HarnessResolutionInput{
+				Surface: ResolutionSurfaceStartup,
+				Session: HarnessSessionInput{
+					Type: session.SessionTypeCoordinator,
+				},
+				Turn: HarnessTurnRequest{
+					Source: session.TurnSourceUser,
+				},
+			},
+			wantSections: []HarnessPromptSection{
+				HarnessPromptSectionSkills,
+			},
+			wantAugmenters: nil,
+			wantReentry:    ReentryModeNone,
+			wantDetached:   DetachedRunModeNone,
+			wantLabel:      "coordinator.user",
+			wantTags: map[string]string{
+				"harness.surface":          "startup",
+				"harness.session_type":     "coordinator",
+				"harness.session_class":    "coordinator",
+				"harness.turn_origin":      "user",
+				"harness.diagnostic_label": "coordinator.user",
+			},
+		},
+		{
+			name: "Should require metadata and resolve reentry policy for a system session plus synthetic turn",
+			input: HarnessResolutionInput{
+				Surface: ResolutionSurfaceTurn,
+				Session: HarnessSessionInput{
+					Type: session.SessionTypeSystem,
+				},
+				Turn: HarnessTurnRequest{
+					Source: session.TurnSourceSynthetic,
+					Synthetic: &SyntheticTurnMetadata{
+						Reason:  "task_complete",
+						Trigger: "task.run.completed",
+					},
+					Detached: &DetachedRunMetadata{
+						TaskRunID: "run-123",
+					},
+				},
+			},
+			wantSections: []HarnessPromptSection{HarnessPromptSectionSkills},
+			wantAugmenters: []HarnessAugmenter{
+				HarnessAugmenterSkills,
+			},
+			wantReentry:  ReentryModeSynthetic,
+			wantDetached: DetachedRunModeTaskRuntime,
+			wantLabel:    "system.synthetic.reentry",
+			wantTags: map[string]string{
+				"harness.surface":           "turn",
+				"harness.session_type":      "system",
+				"harness.session_class":     "system",
+				"harness.turn_origin":       "synthetic",
+				"harness.diagnostic_label":  "system.synthetic.reentry",
+				"harness.synthetic_reason":  "task_complete",
+				"harness.synthetic_trigger": "task.run.completed",
+				"harness.task_run_id":       "run-123",
+			},
+		},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			got, err := resolver.Resolve(tc.input)
+			if err != nil {
+				t.Fatalf("Resolve() error = %v", err)
+			}
+
+			if !slices.Equal(got.Policy.IncludeSections, tc.wantSections) {
+				t.Fatalf("IncludeSections = %#v, want %#v", got.Policy.IncludeSections, tc.wantSections)
+			}
+			if !slices.Equal(got.Policy.EnableAugmenters, tc.wantAugmenters) {
+				t.Fatalf("EnableAugmenters = %#v, want %#v", got.Policy.EnableAugmenters, tc.wantAugmenters)
+			}
+			if got.Policy.ReentryMode != tc.wantReentry {
+				t.Fatalf("ReentryMode = %q, want %q", got.Policy.ReentryMode, tc.wantReentry)
+			}
+			if got.Policy.DetachedRunMode != tc.wantDetached {
+				t.Fatalf("DetachedRunMode = %q, want %q", got.Policy.DetachedRunMode, tc.wantDetached)
+			}
+			if got.Policy.DiagnosticLabel != tc.wantLabel {
+				t.Fatalf("DiagnosticLabel = %q, want %q", got.Policy.DiagnosticLabel, tc.wantLabel)
+			}
+			if !maps.Equal(got.Policy.ObservabilityTags, tc.wantTags) {
+				t.Fatalf("ObservabilityTags = %#v, want %#v", got.Policy.ObservabilityTags, tc.wantTags)
+			}
+		})
+	}
+}
+
+func TestHarnessContextResolverIncludesToolsSectionWhenEnabled(t *testing.T) {
+	t.Parallel()
+
+	t.Run("Should include tools section after skills", func(t *testing.T) {
+		t.Parallel()
+
+		resolver := NewHarnessContextResolver(HarnessRuntimeSignals{
+			SkillsPromptSectionEnabled: true,
+			ToolsPromptSectionEnabled:  true,
+		})
+
+		got, err := resolver.Resolve(HarnessResolutionInput{
+			Surface: ResolutionSurfaceStartup,
+			Session: HarnessSessionInput{
+				Type: session.SessionTypeUser,
+			},
+			Turn: HarnessTurnRequest{
+				Source: session.TurnSourceUser,
+			},
+		})
+		if err != nil {
+			t.Fatalf("Resolve() error = %v", err)
+		}
+
+		wantSections := []HarnessPromptSection{
+			HarnessPromptSectionSkills,
+			HarnessPromptSectionTools,
+		}
+		if !slices.Equal(got.Policy.IncludeSections, wantSections) {
+			t.Fatalf("IncludeSections = %#v, want %#v", got.Policy.IncludeSections, wantSections)
+		}
+	})
+
+	t.Run("Should include runtime identity section when enabled", func(t *testing.T) {
+		t.Parallel()
+
+		resolver := NewHarnessContextResolver(HarnessRuntimeSignals{
+			RuntimeIdentityPromptSectionEnabled: true,
+			SkillsPromptSectionEnabled:          true,
+		})
+
+		got, err := resolver.Resolve(HarnessResolutionInput{
+			Surface: ResolutionSurfaceStartup,
+			Session: HarnessSessionInput{
+				Type: session.SessionTypeUser,
+			},
+			Turn: HarnessTurnRequest{
+				Source: session.TurnSourceUser,
+			},
+		})
+		if err != nil {
+			t.Fatalf("Resolve() error = %v", err)
+		}
+
+		wantSections := []HarnessPromptSection{
+			HarnessPromptSectionRuntimeIdentity,
+
+			HarnessPromptSectionSkills,
+		}
+		if !slices.Equal(got.Policy.IncludeSections, wantSections) {
+			t.Fatalf("IncludeSections = %#v, want %#v", got.Policy.IncludeSections, wantSections)
+		}
+	})
+}
+
+func TestHarnessContextResolverAcceptsTriageSession(t *testing.T) {
+	t.Parallel()
+	t.Run("Should treat a daemon-owned triage session as a system session", func(t *testing.T) {
+		t.Parallel()
+		sessionCtx, err := normalizeHarnessSessionContext(HarnessSessionInput{Type: session.SessionTypeTriage})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if sessionCtx.SessionClass != SessionClassSystem {
+			t.Fatalf("class = %q", sessionCtx.SessionClass)
+		}
+	})
+}
+
+func TestHarnessContextResolverValidation(t *testing.T) {
+	t.Parallel()
+
+	resolver := NewHarnessContextResolver(HarnessRuntimeSignals{
+		SkillsPromptSectionEnabled: true,
+		SkillsAugmenter:            true,
+		SyntheticTurnsEnabled:      true,
+		DetachedTaskRuntimeEnabled: true,
+	})
+
+	testCases := []struct {
+		name    string
+		input   HarnessResolutionInput
+		wantErr string
+	}{
+		{
+			name: "unknown turn origin fails validation",
+			input: HarnessResolutionInput{
+				Surface: ResolutionSurfaceTurn,
+				Session: HarnessSessionInput{Type: session.SessionTypeUser},
+				Turn: HarnessTurnRequest{
+					Source: session.TurnSource("mystery"),
+				},
+			},
+			wantErr: `invalid harness turn origin "mystery"`,
+		},
+		{
+			name: "mismatched prompt metadata fails validation",
+			input: HarnessResolutionInput{
+				Surface: ResolutionSurfaceTurn,
+				Session: HarnessSessionInput{Type: session.SessionTypeUser},
+				Turn: HarnessTurnRequest{
+					Source: session.TurnSourceUser,
+					PromptMeta: acp.PromptMeta{
+						TurnSource: acp.PromptTurnSourceSynthetic,
+					},
+				},
+			},
+			wantErr: `does not match prompt metadata turn_source "synthetic"`,
+		},
+		{
+			name: "synthetic turn without metadata fails validation",
+			input: HarnessResolutionInput{
+				Surface: ResolutionSurfaceTurn,
+				Session: HarnessSessionInput{Type: session.SessionTypeSystem},
+				Turn: HarnessTurnRequest{
+					Source: session.TurnSourceSynthetic,
+				},
+			},
+			wantErr: "synthetic harness turns require runtime metadata",
+		},
+		{
+			name: "Should reject a detached synthetic turn on a non-system session",
+			input: HarnessResolutionInput{
+				Surface: ResolutionSurfaceTurn,
+				Session: HarnessSessionInput{Type: session.SessionTypeUser},
+				Turn: HarnessTurnRequest{
+					Source: session.TurnSourceSynthetic,
+					Synthetic: &SyntheticTurnMetadata{
+						Reason:  "task_complete",
+						Trigger: "task.run.completed",
+					},
+					Detached: &DetachedRunMetadata{TaskRunID: "run-123"},
+				},
+			},
+			wantErr: `detached synthetic harness turns require a system session`,
+		},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			_, err := resolver.Resolve(tc.input)
+			if err == nil {
+				t.Fatal("Resolve() error = nil, want validation failure")
+			}
+			if !strings.Contains(err.Error(), tc.wantErr) {
+				t.Fatalf("Resolve() error = %v, want substring %q", err, tc.wantErr)
+			}
+		})
+	}
+}
+
+func TestHarnessContextResolverDiagnosticLabelsAreStable(t *testing.T) {
+	t.Run(
+		"Should keep diagnostic labels stable for identical inputs",
+		testHarnessContextResolverDiagnosticLabelsAreStable,
+	)
+}
+
+func testHarnessContextResolverDiagnosticLabelsAreStable(t *testing.T) {
+	t.Parallel()
+
+	resolver := NewHarnessContextResolver(HarnessRuntimeSignals{
+		SkillsPromptSectionEnabled: true,
+		SkillsAugmenter:            true,
+		SyntheticTurnsEnabled:      true,
+		DetachedTaskRuntimeEnabled: true,
+	})
+
+	input := HarnessResolutionInput{
+		Surface: ResolutionSurfaceTurn,
+		Session: HarnessSessionInput{
+			Type: session.SessionTypeUser,
+		},
+		Turn: HarnessTurnRequest{
+			Source: session.TurnSourceUser,
+		},
+	}
+
+	first, err := resolver.Resolve(input)
+	if err != nil {
+		t.Fatalf("Resolve(first) error = %v", err)
+	}
+	second, err := resolver.Resolve(input)
+	if err != nil {
+		t.Fatalf("Resolve(second) error = %v", err)
+	}
+
+	if first.Policy.DiagnosticLabel != second.Policy.DiagnosticLabel {
+		t.Fatalf(
+			"DiagnosticLabel mismatch: first=%q second=%q",
+			first.Policy.DiagnosticLabel,
+			second.Policy.DiagnosticLabel,
+		)
+	}
+}
+
+func TestSectionSelectorSelectsEligibleStartupSectionsWithoutDuplicates(t *testing.T) {
+	t.Run(
+		"Should select eligible startup sections without duplicates",
+		testSectionSelectorSelectsEligibleStartupSectionsWithoutDuplicates,
+	)
+}
+
+func testSectionSelectorSelectsEligibleStartupSectionsWithoutDuplicates(t *testing.T) {
+	t.Parallel()
+
+	resolver := NewHarnessContextResolver(HarnessRuntimeSignals{
+		SkillsPromptSectionEnabled: true,
+	})
+	selector := NewSectionSelector(resolver, nil)
+	descriptors := defaultStartupPromptSectionDescriptors(
+		promptSectionProviderFunc(
+			func(context.Context, *workspacepkg.ResolvedWorkspace) (string, error) { return "skills", nil },
+		),
+		nil,
+	)
+	descriptors = append(descriptors, descriptors[0])
+
+	selected, _, err := selector.Select(session.StartupPromptContext{
+		SessionType: session.SessionTypeUser,
+	}, descriptors)
+	if err != nil {
+		t.Fatalf("Select(channel-bound) error = %v", err)
+	}
+
+	wantNames := []string{
+		string(HarnessPromptSectionSkills),
+	}
+	gotNames := make([]string, 0, len(selected))
+	for _, descriptor := range selected {
+		gotNames = append(gotNames, descriptor.Name)
+	}
+	if !slices.Equal(gotNames, wantNames) {
+		t.Fatalf("selected section names = %#v, want %#v", gotNames, wantNames)
+	}
+}
+
+func TestSectionSelectorAcceptsCoordinatorStartupSession(t *testing.T) {
+	t.Parallel()
+
+	t.Run("Should select coordinator startup sections", func(t *testing.T) {
+		t.Parallel()
+
+		resolver := NewHarnessContextResolver(HarnessRuntimeSignals{
+			SkillsPromptSectionEnabled: true,
+		})
+		selector := NewSectionSelector(resolver, nil)
+		descriptors := defaultStartupPromptSectionDescriptors(
+			promptSectionProviderFunc(
+				func(context.Context, *workspacepkg.ResolvedWorkspace) (string, error) { return "skills", nil },
+			),
+			nil,
+		)
+
+		selected, resolved, err := selector.Select(session.StartupPromptContext{
+			SessionType: session.SessionTypeCoordinator,
+		}, descriptors)
+		if err != nil {
+			t.Fatalf("Select(coordinator) error = %v", err)
+		}
+
+		if resolved.Session.SessionClass != SessionClassCoordinator {
+			t.Fatalf("SessionClass = %q, want %q", resolved.Session.SessionClass, SessionClassCoordinator)
+		}
+		wantNames := []string{
+			string(HarnessPromptSectionSkills),
+		}
+		gotNames := make([]string, 0, len(selected))
+		for _, descriptor := range selected {
+			gotNames = append(gotNames, descriptor.Name)
+		}
+		if !slices.Equal(gotNames, wantNames) {
+			t.Fatalf("selected section names = %#v, want %#v", gotNames, wantNames)
+		}
+	})
+}
+
+func TestHarnessContextResolverResolvePromptUsesSessionInfo(t *testing.T) {
+	t.Run(
+		"Should resolve prompt policy from session information",
+		testHarnessContextResolverResolvePromptUsesSessionInfo,
+	)
+}
+
+func testHarnessContextResolverResolvePromptUsesSessionInfo(t *testing.T) {
+	t.Parallel()
+
+	resolver := NewHarnessContextResolver(HarnessRuntimeSignals{
+		SkillsAugmenter: true,
+	})
+
+	resolved, err := resolver.ResolvePrompt(&session.Info{
+		ID:       "sess-provider-plumbing",
+		Provider: "claude-code",
+		Type:     session.SessionTypeUser,
+	}, session.TurnSourceUser, acp.PromptMeta{})
+	if err != nil {
+		t.Fatalf("ResolvePrompt() error = %v", err)
+	}
+
+	if resolved.Policy.TurnOrigin != TurnOriginUser {
+		t.Fatalf("TurnOrigin = %q, want %q", resolved.Policy.TurnOrigin, TurnOriginUser)
+	}
+	if resolved.Session.Provider != "claude" || resolved.Policy.SkillInjectionFilter == nil {
+		t.Fatalf(
+			"resolved provider/filter = %q/%v, want canonical claude filter",
+			resolved.Session.Provider,
+			resolved.Policy.SkillInjectionFilter,
+		)
+	}
+	if !slices.Equal(
+		resolved.Policy.EnableAugmenters,
+		[]HarnessAugmenter{HarnessAugmenterSkills},
+	) {
+		t.Fatalf("EnableAugmenters = %#v, want skills", resolved.Policy.EnableAugmenters)
+	}
+}
+
+func TestHarnessContextResolverResolvePromptMapsSyntheticMetadata(t *testing.T) {
+	t.Run("Should resolve a user-session synthetic turn from ACP metadata", func(t *testing.T) {
+		t.Parallel()
+
+		resolver := NewHarnessContextResolver(HarnessRuntimeSignals{
+			SkillsAugmenter:       true,
+			SyntheticTurnsEnabled: true,
+		})
+		resolved, err := resolver.ResolvePrompt(
+			&session.Info{Type: session.SessionTypeUser},
+			session.TurnSourceSynthetic,
+			acp.PromptMeta{
+				TurnSource: acp.PromptTurnSourceSynthetic,
+				Synthetic: &acp.PromptSyntheticMeta{
+					TaskID:    "task-123",
+					TaskRunID: "run-123",
+					Reason:    "task_run_progress",
+				},
+			},
+		)
+		if err != nil {
+			t.Fatalf("ResolvePrompt() error = %v", err)
+		}
+
+		if resolved.Policy.TurnOrigin != TurnOriginSynthetic {
+			t.Fatalf("TurnOrigin = %q, want %q", resolved.Policy.TurnOrigin, TurnOriginSynthetic)
+		}
+		if !slices.Equal(resolved.Policy.EnableAugmenters, []HarnessAugmenter{
+			HarnessAugmenterSkills,
+		}) {
+			t.Fatalf("EnableAugmenters = %#v, want skills", resolved.Policy.EnableAugmenters)
+		}
+		if resolved.Policy.ReentryMode != ReentryModeSynthetic {
+			t.Fatalf("ReentryMode = %q, want %q", resolved.Policy.ReentryMode, ReentryModeSynthetic)
+		}
+		if resolved.Policy.DetachedRunMode != DetachedRunModeNone {
+			t.Fatalf("DetachedRunMode = %q, want %q", resolved.Policy.DetachedRunMode, DetachedRunModeNone)
+		}
+		if resolved.Turn.Synthetic == nil {
+			t.Fatal("Synthetic metadata = nil, want ACP projection")
+		}
+		if got, want := resolved.Turn.Synthetic.SourceTask, "task-123"; got != want {
+			t.Fatalf("Synthetic.SourceTask = %q, want %q", got, want)
+		}
+		if got, want := resolved.Turn.Synthetic.SourceRunID, "run-123"; got != want {
+			t.Fatalf("Synthetic.SourceRunID = %q, want %q", got, want)
+		}
+	})
+}
+
+func TestHarnessPromptInputAugmenterAppliesResolvedAugmenters(t *testing.T) {
+	t.Run(
+		"Should apply only the augmenters selected by policy",
+		testHarnessPromptInputAugmenterAppliesResolvedAugmenters,
+	)
+}
+
+func testHarnessPromptInputAugmenterAppliesResolvedAugmenters(t *testing.T) {
+	t.Parallel()
+
+	resolver := NewHarnessContextResolver(HarnessRuntimeSignals{
+		SkillsAugmenter:    true,
+		SituationAugmenter: true,
+	})
+
+	situationCalls := 0
+	skillsCalls := 0
+	augmenter, err := newPromptInputCompositeAugmenter(
+		discardLogger(),
+		resolver,
+		nil,
+		defaultPromptInputAugmenterDescriptors(
+			func(_ context.Context, _ *session.Session, message string) (string, error) {
+				skillsCalls++
+				return "<current-available-skills>\n" +
+					"  <skill name=\"qa-marker-skill\">Marker.</skill>\n" +
+					"</current-available-skills>\n\n" + message, nil
+			},
+			func(_ context.Context, _ *session.Session, message string) (string, error) {
+				situationCalls++
+				return message + "\n\n<current-situation>Situation block.</current-situation>", nil
+			},
+		)...,
+	)
+	if err != nil {
+		t.Fatalf("newPromptInputCompositeAugmenter() error = %v", err)
+	}
+
+	got, err := augmenter(
+		t.Context(),
+		&session.Session{Type: session.SessionTypeUser},
+		"Base prompt.",
+	)
+	if err != nil {
+		t.Fatalf("Augment() error = %v", err)
+	}
+	if situationCalls != 1 {
+		t.Fatalf("situation calls = %d, want 1", situationCalls)
+	}
+	if skillsCalls != 1 {
+		t.Fatalf("skills augmenter calls = %d, want 1", skillsCalls)
+	}
+	if !strings.Contains(got, "<current-situation>Situation block.</current-situation>") {
+		t.Fatalf("Augment() = %q, want situation content", got)
+	}
+	if !strings.Contains(got, "<current-available-skills>") {
+		t.Fatalf("Augment() = %q, want current skills content", got)
+	}
+}
+
+func TestSectionSelectorValidationHelpers(t *testing.T) {
+	t.Run(
+		"Should reject invalid section selector inputs",
+		testSectionSelectorValidationHelpers,
+	)
+}
+
+func testSectionSelectorValidationHelpers(t *testing.T) {
+	t.Parallel()
+
+	if got := NewSectionSelector(nil, nil); got != nil {
+		t.Fatalf("NewSectionSelector(nil) = %#v, want nil", got)
+	}
+
+	err := validatePromptSectionDescriptors([]PromptSectionDescriptor{{
+		Position: PromptSectionPositionPrepend,
+	}})
+	if err == nil || !strings.Contains(err.Error(), "name is required") {
+		t.Fatalf("validatePromptSectionDescriptors(missing name) error = %v, want missing-name error", err)
+	}
+
+	err = validatePromptSectionDescriptors([]PromptSectionDescriptor{{
+		Name:     "invalid",
+		Position: PromptSectionPosition("sideways"),
+	}})
+	if err == nil || !strings.Contains(err.Error(), `invalid startup prompt section position "sideways"`) {
+		t.Fatalf("validatePromptSectionDescriptors(invalid position) error = %v, want invalid-position error", err)
+	}
+}

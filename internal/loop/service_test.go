@@ -1,0 +1,4315 @@
+package loop_test
+
+import (
+	"bytes"
+	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"log/slog"
+	"maps"
+	"math"
+	"reflect"
+	"slices"
+	"strconv"
+	"strings"
+	"sync"
+	"testing"
+	"time"
+
+	hookspkg "github.com/compozy/compozy/internal/hooks"
+	"github.com/compozy/compozy/internal/loop"
+	"github.com/compozy/compozy/internal/loop/dsl"
+	"github.com/compozy/compozy/internal/loop/gate"
+	speedpkg "github.com/compozy/compozy/internal/speed"
+	storepkg "github.com/compozy/compozy/internal/store"
+	"github.com/compozy/compozy/internal/task"
+)
+
+func TestNodeLifecycleConfigShouldResolveAndPinAdmissionValues(t *testing.T) {
+	t.Parallel()
+
+	t.Run("Should resolve node then loop config then shipped defaults", func(t *testing.T) {
+		t.Parallel()
+
+		loopAttempts := 5
+		loopBase := 2 * time.Second
+		loopConfig := loop.LifecycleConfig{
+			RetryMaxAttempts: new(loopAttempts),
+			RetryBackoffBase: new(loopBase),
+		}
+		node := dsl.Node{
+			NodeLifecycleState: &dsl.NodeLifecycleState{Deadline: "5m"},
+			Retry: &dsl.RetrySpec{
+				MaxAttempts: 7,
+				Backoff:     &dsl.BackoffSpec{Max: "12s"},
+				NonRetryable: []string{
+					string(loop.FailurePayloadDeclared),
+				},
+			},
+		}
+
+		resolved, err := loop.ResolveNodeLifecycleConfig(node, &loopConfig, loop.DefaultLifecycleConfig())
+		if err != nil {
+			t.Fatalf("ResolveNodeLifecycleConfig() error = %v", err)
+		}
+		if resolved.RetryMaxAttempts != 7 || resolved.RetryBackoffBase != 2*time.Second ||
+			resolved.RetryBackoffMax != 12*time.Second || resolved.LivenessSilenceWindow != 30*time.Minute {
+			t.Fatalf("resolved lifecycle = %#v, want node > loop config > defaults", resolved)
+		}
+		if resolved.Deadline == nil || *resolved.Deadline != 5*time.Minute {
+			t.Fatalf("resolved deadline = %v, want 5m", resolved.Deadline)
+		}
+		if resolved.Sources["retry.max_attempts"] != loop.LifecycleSourceNode ||
+			resolved.Sources["retry.backoff_base"] != loop.LifecycleSourceLoopConfig ||
+			resolved.Sources["liveness.silence_window"] != loop.LifecycleSourceDefault {
+			t.Fatalf("resolved sources = %#v, want node/loop/default provenance", resolved.Sources)
+		}
+
+		loopConfig.RetryMaxAttempts = new(1)
+		loopConfig.RetryBackoffBase = new(9 * time.Second)
+		node.Retry.MaxAttempts = 2
+		node.Retry.NonRetryable[0] = string(loop.FailureTransport)
+		if resolved.RetryMaxAttempts != 7 || resolved.RetryBackoffBase != 2*time.Second ||
+			resolved.RetryNonRetryable[0] != string(loop.FailurePayloadDeclared) {
+			t.Fatalf("pinned lifecycle changed after source mutation: %#v", resolved)
+		}
+	})
+
+	t.Run("Should resolve removed overrides to shipped defaults and breaker globally", func(t *testing.T) {
+		t.Parallel()
+
+		resolved, err := loop.ResolveNodeLifecycleConfig(dsl.Node{}, nil, loop.DefaultLifecycleConfig())
+		if err != nil {
+			t.Fatalf("ResolveNodeLifecycleConfig() error = %v", err)
+		}
+		if resolved.RetryMaxAttempts != 3 || resolved.WaitAdmissionAttempts != 3 ||
+			resolved.AdmissionHorizon != 168*time.Hour {
+			t.Fatalf("resolved lifecycle = %#v, want shipped non-empty defaults", resolved)
+		}
+		breaker, err := loop.ResolveGlobalBreakerPolicy(5, time.Minute)
+		if err != nil {
+			t.Fatalf("ResolveGlobalBreakerPolicy() error = %v", err)
+		}
+		if breaker.Source != loop.BreakerGlobalSource || breaker.Threshold != 5 ||
+			breaker.ProbeInterval != time.Minute {
+			t.Fatalf("breaker = %#v, want reload-scoped global policy", breaker)
+		}
+	})
+}
+
+func TestServiceShouldPreserveOwnershipAndLifecycleContext(t *testing.T) {
+	t.Parallel()
+
+	t.Run("Should preserve the explicit profile owner when starting copied definitions", func(t *testing.T) {
+		t.Parallel()
+
+		definition := validDefinition()
+		copied := definition
+		store := newFakeLoopStore()
+		svc := newLifecycleTestService(
+			t,
+			store,
+			copied,
+		)
+		_, err := svc.DryRun(
+			t.Context(),
+			"ws-1",
+			"valid-loop",
+			loop.Inputs{ProfileID: storepkg.DefaultProfileID,
+				Values: map[string]any{"tasks": "task-ref"},
+			},
+		)
+		if err != nil {
+			t.Fatalf("DryRun() error = %v", err)
+		}
+		run, err := svc.Start(t.Context(), "ws-1", "valid-loop", loop.Inputs{ProfileID: "profile-marketing",
+			Values: map[string]any{"tasks": "task-ref"},
+		}, humanActor(t))
+		if err != nil {
+			t.Fatalf("Start() error = %v", err)
+		}
+		if got, want := run.ProfileID, "profile-marketing"; got != want {
+			t.Fatalf("Start().ProfileID = %q, want %q", got, want)
+		}
+	})
+
+	t.Run("Should reject a Loop start without an explicit profile owner", func(t *testing.T) {
+		t.Parallel()
+
+		store := newFakeLoopStore()
+		svc := newLifecycleTestService(
+			t,
+			store,
+			validDefinition(),
+		)
+		_, err := svc.Start(t.Context(), "ws-1", "valid-loop", loop.Inputs{
+			Values: map[string]any{"tasks": "task-ref"},
+		}, humanActor(t))
+		if !errors.Is(err, loop.ErrValidation) || !strings.Contains(err.Error(), "profile id is required") {
+			t.Fatalf("Start() error = %v, want missing profile validation", err)
+		}
+	})
+
+	t.Run("Should keep started and terminal hooks active with a bounded context", func(t *testing.T) {
+		t.Parallel()
+
+		store := newFakeLoopStore()
+		hooks := &lifecycleHookDispatcher{}
+		svc := newLifecycleTestService(
+			t,
+			store,
+			validDefinition(),
+			loop.WithHookDispatcher(hooks),
+		)
+		startCtx, cancelStart := context.WithCancel(t.Context())
+		hooks.cancelStarted = cancelStart
+		defer cancelStart()
+		run, err := svc.Start(startCtx, "ws-1", "valid-loop", loop.Inputs{ProfileID: storepkg.DefaultProfileID,
+			Values: map[string]any{"tasks": "task-ref"},
+		}, humanActor(t))
+		if err != nil {
+			t.Fatalf("Start() error = %v", err)
+		}
+		if !hooks.startedActive || !hooks.startedDeadline {
+			t.Fatalf(
+				"loop.started context active/deadline = %v/%v, want true/true",
+				hooks.startedActive,
+				hooks.startedDeadline,
+			)
+		}
+		transitionCtx, cancelTransition := context.WithCancel(t.Context())
+		hooks.cancelTerminal = cancelTransition
+		defer cancelTransition()
+		if err := svc.Transition(
+			transitionCtx,
+			run.ID,
+			loop.StatusDone,
+			loop.TransitionCauseContract,
+		); err != nil {
+			t.Fatalf("Transition(done) error = %v", err)
+		}
+		if !hooks.terminalActive || !hooks.terminalDeadline {
+			t.Fatalf(
+				"loop.terminal context active/deadline = %v/%v, want true/true",
+				hooks.terminalActive,
+				hooks.terminalDeadline,
+			)
+		}
+	})
+}
+
+func TestServiceTransitionShouldEnforceTruthyStatusFSM(t *testing.T) {
+	t.Parallel()
+
+	t.Run("Should reject false done and failed coercions from truthful statuses", func(t *testing.T) {
+		t.Parallel()
+
+		cases := []struct {
+			name string
+			from loop.Status
+			to   loop.Status
+		}{
+			{name: "Should reject exhausted to done", from: loop.StatusExhausted, to: loop.StatusDone},
+			{name: "Should reject stalled to done", from: loop.StatusStalled, to: loop.StatusDone},
+			{
+				name: "Should reject needs approval to done",
+				from: loop.StatusNeedsApproval,
+				to:   loop.StatusDone,
+			},
+			{
+				name: "Should reject needs approval to failed without operator stop",
+				from: loop.StatusNeedsApproval,
+				to:   loop.StatusFailed,
+			},
+			{name: "Should reject paused to done", from: loop.StatusPaused, to: loop.StatusDone},
+			{
+				name: "Should reject paused to failed without operator stop",
+				from: loop.StatusPaused,
+				to:   loop.StatusFailed,
+			},
+		}
+		for _, tt := range cases {
+			t.Run(tt.name, func(t *testing.T) {
+				t.Parallel()
+
+				store := newFakeLoopStore()
+				run := seedFakeRun(store, tt.from)
+				svc := newTestService(t, store, validDefinition())
+
+				err := svc.Transition(t.Context(), run.ID, tt.to, loop.TransitionCauseContract)
+				if !errors.Is(err, loop.ErrInvalidTransition) {
+					t.Fatalf("Transition(%s -> %s) error = %v, want ErrInvalidTransition", tt.from, tt.to, err)
+				}
+				stored := store.mustRun(t, run.ID)
+				if stored.Status != tt.from {
+					t.Fatalf("stored status = %q, want original %q", stored.Status, tt.from)
+				}
+			})
+		}
+	})
+
+	t.Run("Should allow running paused edges and reject illegal paused edges", func(t *testing.T) {
+		t.Parallel()
+
+		store := newFakeLoopStore()
+		run := seedFakeRun(store, loop.StatusRunning)
+		svc := newTestService(t, store, validDefinition())
+
+		err := svc.Transition(
+			t.Context(),
+			run.ID,
+			loop.StatusPaused,
+			loop.TransitionCausePauseBoundary,
+		)
+		if err != nil {
+			t.Fatalf("Transition(running -> paused) error = %v", err)
+		}
+		err = svc.Transition(
+			t.Context(),
+			run.ID,
+			loop.StatusRunning,
+			loop.TransitionCauseOperatorResume,
+		)
+		if err != nil {
+			t.Fatalf("Transition(paused -> running) error = %v", err)
+		}
+
+		done := seedFakeRun(store, loop.StatusDone)
+		err = svc.Transition(
+			t.Context(),
+			done.ID,
+			loop.StatusPaused,
+			loop.TransitionCausePauseBoundary,
+		)
+		if !errors.Is(err, loop.ErrInvalidTransition) {
+			t.Fatalf("Transition(done -> paused) error = %v, want ErrInvalidTransition", err)
+		}
+		watching := seedFakeRun(store, loop.StatusWatching)
+		err = svc.Transition(
+			t.Context(),
+			watching.ID,
+			loop.StatusPaused,
+			loop.TransitionCausePauseBoundary,
+		)
+		if !errors.Is(err, loop.ErrInvalidTransition) {
+			t.Fatalf("Transition(watching -> paused) error = %v, want ErrInvalidTransition", err)
+		}
+	})
+
+	t.Run("Should require an operator cancellation cause for live statuses", func(t *testing.T) {
+		t.Parallel()
+
+		for _, from := range []loop.Status{loop.StatusRunning, loop.StatusWatching} {
+			t.Run("Should gate "+string(from)+" to canceled", func(t *testing.T) {
+				t.Parallel()
+
+				store := newFakeLoopStore()
+				run := seedFakeRun(store, from)
+				svc := newTestService(t, store, validDefinition())
+				if err := svc.Transition(
+					t.Context(), run.ID, loop.StatusCanceled, loop.TransitionCauseContract,
+				); !errors.Is(err, loop.ErrInvalidTransition) {
+					t.Fatalf("Transition(%s -> canceled, contract) error = %v, want ErrInvalidTransition", from, err)
+				}
+				if err := svc.Transition(
+					t.Context(), run.ID, loop.StatusCanceled, loop.TransitionCauseOperatorCancel,
+				); err != nil {
+					t.Fatalf("Transition(%s -> canceled, operator) error = %v", from, err)
+				}
+			})
+		}
+	})
+}
+
+func TestEffectiveConfigShouldMergeLayersAndClampCeilings(t *testing.T) {
+	t.Parallel()
+
+	t.Run("Should accept halt without changing the failed-only default", func(t *testing.T) {
+		t.Parallel()
+
+		resolved := compileDefinition(t, validDefinition())
+		defaulted, err := loop.ResolveEffectiveConfig(
+			resolved, loop.LoopDefaults{}, nil, loop.LoopConfig{},
+		)
+		if err != nil {
+			t.Fatalf("ResolveEffectiveConfig(default) error = %v", err)
+		}
+		halt := loop.ReattemptHalt
+		halted, err := loop.ResolveEffectiveConfig(
+			resolved, loop.LoopDefaults{}, nil, loop.LoopConfig{ReattemptStrategy: &halt},
+		)
+		if err != nil {
+			t.Fatalf("ResolveEffectiveConfig(halt) error = %v", err)
+		}
+		if defaulted.ReattemptStrategy != loop.ReattemptFailedOnly ||
+			halted.ReattemptStrategy != loop.ReattemptHalt {
+			t.Fatalf(
+				"reattempt strategies = default:%q halt:%q",
+				defaulted.ReattemptStrategy,
+				halted.ReattemptStrategy,
+			)
+		}
+		if defaulted.Sources["/reattempt_strategy"] != loop.EffectiveConfigSourceBuiltin ||
+			halted.Sources["/reattempt_strategy"] != loop.EffectiveConfigSourcePerRun {
+			t.Fatalf(
+				"reattempt sources = default:%q halt:%q",
+				defaulted.Sources["/reattempt_strategy"],
+				halted.Sources["/reattempt_strategy"],
+			)
+		}
+	})
+
+	t.Run("Should merge definition defaults loop config and per run overrides", func(t *testing.T) {
+		t.Parallel()
+
+		def := validDefinition()
+		def.Contract.IterationCap = 3
+		def.Contract.NoProgress.Window = 2
+		def.Contract.Budget.Tokens = 100
+		def.Contract.Budget.WallClockSec = 10
+		def.Contract.RuntimeDefaults = &dsl.RuntimeDefaults{
+			Worker: dsl.RuntimeSpec{Model: "definition-worker"},
+			Judge:  dsl.RuntimeSpec{Model: "definition-judge"},
+		}
+		def.Contract.RuntimeRules = []dsl.RuntimeRule{{
+			Match:   dsl.RuntimeMatch{Complexity: "high"},
+			Runtime: dsl.RuntimeSpec{Provider: "definition-provider"},
+		}}
+		requireNode(t, &def, "fan").MaxParallel = 2
+		appendGate(&def, dsl.Node{
+			ID:           "review_gate",
+			Class:        dsl.NodeClassControl,
+			Kind:         string(dsl.ControlGate),
+			MaxRevisions: 2,
+		})
+		resolved := compileDefinition(t, def)
+		defaults := loop.LoopDefaults{
+			Delivery: loop.LoopConfig{
+				IterationCap:     new(6),
+				NoProgressWindow: new(99),
+				FanOutWidth:      new(99),
+				GateMaxRevisions: new(99),
+				RuntimeDefaults: &loop.RuntimeDefaults{
+					Worker: loop.RuntimeSpec{Model: "default-worker"},
+					Judge:  loop.RuntimeSpec{Model: "default-judge"},
+				},
+				RuntimeRules: []loop.RuntimeRule{{
+					Match:   loop.RuntimeMatch{Type: "frontend"},
+					Runtime: loop.RuntimeSpec{Provider: "default-provider"},
+				}},
+			},
+		}
+		stored := loop.LoopConfig{
+			IterationCap:     new(7),
+			NoProgressWindow: new(8),
+			FanOutWidth:      new(12),
+			RuntimeDefaults: &loop.RuntimeDefaults{
+				Worker: loop.RuntimeSpec{Model: "stored-worker"},
+			},
+			RuntimeRules: []loop.RuntimeRule{{
+				Match:   loop.RuntimeMatch{Type: "frontend"},
+				Runtime: loop.RuntimeSpec{Model: "stored-model"},
+			}},
+		}
+		escalate := dsl.BudgetExceededEscalate
+		perRun := loop.LoopConfig{
+			IterationCap:     new(8),
+			BudgetOnExceeded: &escalate,
+			FanOutWidth:      new(99),
+			GateMaxRevisions: new(99),
+			RuntimeDefaults: &loop.RuntimeDefaults{
+				Judge: loop.RuntimeSpec{Model: "per-run-judge"},
+			},
+			RuntimeRules: []loop.RuntimeRule{{
+				Match:   loop.RuntimeMatch{ID: "task_01"},
+				Runtime: loop.RuntimeSpec{Reasoning: "max"},
+			}},
+		}
+
+		effective, err := loop.ResolveEffectiveConfig(resolved, defaults, &stored, perRun)
+		if err != nil {
+			t.Fatalf("ResolveEffectiveConfig() error = %v", err)
+		}
+		if effective.IterationCap != 8 {
+			t.Fatalf("IterationCap = %d, want per-run override 8", effective.IterationCap)
+		}
+		if effective.NoProgressWindow != 8 {
+			t.Fatalf("NoProgressWindow = %d, want stored override 8", effective.NoProgressWindow)
+		}
+		if effective.FanOutWidth != 99 {
+			t.Fatalf("FanOutWidth = %d, want per-run override 99", effective.FanOutWidth)
+		}
+		if effective.GateMaxRevisions != loop.LoopMaxGateRevisions {
+			t.Fatalf(
+				"GateMaxRevisions = %d, want clamped ceiling %d",
+				effective.GateMaxRevisions,
+				loop.LoopMaxGateRevisions,
+			)
+		}
+		if effective.BudgetOnExceeded != dsl.BudgetExceededEscalate {
+			t.Fatalf("BudgetOnExceeded = %q, want escalate", effective.BudgetOnExceeded)
+		}
+		if effective.RuntimeDefaults.Worker.Model != "stored-worker" {
+			t.Fatalf(
+				"RuntimeDefaults.Worker.Model = %q, want stored-worker",
+				effective.RuntimeDefaults.Worker.Model,
+			)
+		}
+		if effective.RuntimeDefaults.Judge.Model != "per-run-judge" {
+			t.Fatalf(
+				"RuntimeDefaults.Judge.Model = %q, want per-run-judge",
+				effective.RuntimeDefaults.Judge.Model,
+			)
+		}
+		if len(effective.RuntimeRules) != 3 {
+			t.Fatalf("RuntimeRules = %#v, want definition/default/stored order", effective.RuntimeRules)
+		}
+		if effective.RuntimeRules[0].Match.Complexity != "high" ||
+			effective.RuntimeRules[1].Runtime.Provider != "default-provider" ||
+			effective.RuntimeRules[2].Runtime.Model != "stored-model" {
+			t.Fatalf("RuntimeRules = %#v, want ordered config layers", effective.RuntimeRules)
+		}
+		if len(effective.RunRuntimeRules) != 1 ||
+			effective.RunRuntimeRules[0].Match.ID != "task_01" ||
+			effective.RunRuntimeRules[0].Runtime.Reasoning != "max" {
+			t.Fatalf("RunRuntimeRules = %#v, want separated per-run rule", effective.RunRuntimeRules)
+		}
+		wantSources := map[string]string{
+			"/iteration_cap":                 loop.EffectiveConfigSourcePerRun,
+			"/no_progress_window":            loop.EffectiveConfigSourceLoopConfig,
+			"/fan_out_width":                 loop.EffectiveConfigSourcePerRun,
+			"/gate_max_revisions":            loop.EffectiveConfigSourcePerRun,
+			"/budget_on_exceeded":            loop.EffectiveConfigSourcePerRun,
+			"/runtime_defaults/worker/model": loop.EffectiveConfigSourceLoopConfig,
+			"/runtime_defaults/judge/model":  loop.EffectiveConfigSourcePerRun,
+			"/runtime_rules/0":               loop.EffectiveConfigSourceDefinition,
+			"/runtime_rules/1":               loop.EffectiveConfigSourceDeliveryDefaults,
+			"/runtime_rules/2":               loop.EffectiveConfigSourceLoopConfig,
+			"/run_runtime_rules/0":           loop.EffectiveConfigSourcePerRun,
+		}
+		for path, want := range wantSources {
+			if got := effective.Sources[path]; got != want {
+				t.Fatalf("Sources[%q] = %q, want %q", path, got, want)
+			}
+		}
+	})
+
+	t.Run("Should preserve explicit zero and false override sources", func(t *testing.T) {
+		t.Parallel()
+
+		resolved := compileDefinition(t, validDefinition())
+		effective, err := loop.ResolveEffectiveConfig(
+			resolved,
+			loop.LoopDefaults{Delivery: loop.LoopConfig{IterationCap: new(0)}},
+			&loop.LoopConfig{HumanGateEnabled: new(false)},
+			loop.LoopConfig{},
+		)
+		if err != nil {
+			t.Fatalf("ResolveEffectiveConfig() error = %v", err)
+		}
+		if effective.IterationCap != 0 || effective.HumanGateEnabled {
+			t.Fatalf("effective zero/false = iteration:%d gate:%t", effective.IterationCap, effective.HumanGateEnabled)
+		}
+		if got := effective.Sources["/iteration_cap"]; got != loop.EffectiveConfigSourceDeliveryDefaults {
+			t.Fatalf("iteration source = %q, want delivery defaults", got)
+		}
+		if got := effective.Sources["/human_gate_enabled"]; got != loop.EffectiveConfigSourceLoopConfig {
+			t.Fatalf("human gate source = %q, want loop config", got)
+		}
+	})
+
+	t.Run("Should select watch runtime defaults only for watch definitions", func(t *testing.T) {
+		t.Parallel()
+
+		defaults := loop.LoopDefaults{
+			Delivery: loop.LoopConfig{RuntimeDefaults: &loop.RuntimeDefaults{
+				Worker: loop.RuntimeSpec{Model: "delivery-model"},
+			}},
+			Watch: loop.LoopConfig{RuntimeDefaults: &loop.RuntimeDefaults{
+				Worker: loop.RuntimeSpec{Model: "watch-model"},
+			}},
+		}
+		delivery, err := loop.ResolveEffectiveConfig(
+			&loop.ResolvedDefinition{Definition: dsl.Definition{}}, defaults, nil, loop.LoopConfig{},
+		)
+		if err != nil {
+			t.Fatalf("ResolveEffectiveConfig(delivery) error = %v", err)
+		}
+		watch, err := loop.ResolveEffectiveConfig(&loop.ResolvedDefinition{Definition: dsl.Definition{
+			Graph: dsl.Graph{Nodes: []dsl.Node{{
+				ID: "watch", Class: dsl.NodeClassSource, Kind: string(dsl.SourceWatchSource),
+			}}},
+		}}, defaults, nil, loop.LoopConfig{})
+		if err != nil {
+			t.Fatalf("ResolveEffectiveConfig(watch) error = %v", err)
+		}
+		if delivery.RuntimeDefaults.Worker.Model != "delivery-model" ||
+			watch.RuntimeDefaults.Worker.Model != "watch-model" {
+			t.Fatalf(
+				"runtime defaults delivery/watch = %q/%q, want delivery-model/watch-model",
+				delivery.RuntimeDefaults.Worker.Model,
+				watch.RuntimeDefaults.Worker.Model,
+			)
+		}
+		if delivery.Sources["/runtime_defaults/worker/model"] != loop.EffectiveConfigSourceDeliveryDefaults ||
+			watch.Sources["/runtime_defaults/worker/model"] != loop.EffectiveConfigSourceWatchDefaults {
+			t.Fatalf(
+				"runtime default sources delivery/watch = %q/%q",
+				delivery.Sources["/runtime_defaults/worker/model"],
+				watch.Sources["/runtime_defaults/worker/model"],
+			)
+		}
+	})
+
+	t.Run("Should clamp bounded fields while preserving a large fan-out window", func(t *testing.T) {
+		t.Parallel()
+
+		resolved := compileDefinition(t, validDefinition())
+		perRun := loop.LoopConfig{
+			NoProgressWindow: new(loop.LoopMaxNoProgressWindow + 10),
+			FanOutWidth:      new(500),
+			GateMaxRevisions: new(loop.LoopMaxGateRevisions + 10),
+		}
+
+		effective, err := loop.ResolveEffectiveConfig(
+			resolved,
+			loop.LoopDefaults{},
+			nil,
+			perRun,
+		)
+		if err != nil {
+			t.Fatalf("ResolveEffectiveConfig() error = %v", err)
+		}
+		if effective.NoProgressWindow != loop.LoopMaxNoProgressWindow {
+			t.Fatalf(
+				"NoProgressWindow = %d, want %d",
+				effective.NoProgressWindow,
+				loop.LoopMaxNoProgressWindow,
+			)
+		}
+		if effective.FanOutWidth != 500 {
+			t.Fatalf("FanOutWidth = %d, want 500", effective.FanOutWidth)
+		}
+		if effective.GateMaxRevisions != loop.LoopMaxGateRevisions {
+			t.Fatalf("GateMaxRevisions = %d, want %d", effective.GateMaxRevisions, loop.LoopMaxGateRevisions)
+		}
+	})
+}
+
+func TestServiceStartShouldUseDefaultsResolver(t *testing.T) {
+	t.Parallel()
+
+	t.Run("Should seed effective config from workspace defaults resolver", func(t *testing.T) {
+		t.Parallel()
+
+		store := newFakeLoopStore()
+		iterationCap := 12
+		var resolvedWorkspace loop.WorkspaceID
+		svc := newTestServiceWithOptions(
+			t,
+			store,
+			validDefinition(),
+			loop.WithDefaultsResolver(func(
+				_ context.Context,
+				ws loop.WorkspaceID,
+				_ string,
+			) (loop.LoopDefaults, error) {
+				resolvedWorkspace = ws
+				return loop.LoopDefaults{
+					Delivery: loop.LoopConfig{
+						IterationCap:     new(iterationCap),
+						NoProgressWindow: new(5),
+						BudgetTokens:     new(0),
+						BudgetWallSec:    new(0),
+						BudgetOnExceeded: new(dsl.BudgetExceededHalt),
+						FanOutWidth:      new(1),
+					},
+				}, nil
+			}),
+		)
+
+		run, err := svc.Start(
+			t.Context(),
+			"ws-config",
+			"valid-loop",
+			loop.Inputs{ProfileID: storepkg.DefaultProfileID,
+				Values: map[string]any{"tasks": "task-ref"},
+			},
+			humanActor(t),
+		)
+		if err != nil {
+			t.Fatalf("Start() error = %v", err)
+		}
+		if resolvedWorkspace != "ws-config" {
+			t.Fatalf("defaults resolver workspace = %q, want ws-config", resolvedWorkspace)
+		}
+		if run.IterationCap != 12 {
+			t.Fatalf("IterationCap = %d, want resolver default 12", run.IterationCap)
+		}
+		if run.DefinitionDigest == "" || len(run.DefinitionSnapshot) == 0 {
+			t.Fatalf(
+				"definition pinning = digest:%q snapshot:%d, want populated",
+				run.DefinitionDigest,
+				len(run.DefinitionSnapshot),
+			)
+		}
+		iterationCap = 99
+		snapshot, err := store.GetLoopDefinitionSnapshot(t.Context(), "ws-config", "", run.DefinitionDigest)
+		if err != nil {
+			t.Fatalf("GetLoopDefinitionSnapshot() error = %v", err)
+		}
+		if snapshot.Digest != run.DefinitionDigest || snapshot.Version != run.DefinitionVersion {
+			t.Fatalf("snapshot = %#v, want digest/version from run %#v", snapshot, run)
+		}
+		hydrated, err := loop.LoadExecutedDefinitionSnapshot(snapshot.Definition, snapshot.Digest)
+		if err != nil {
+			t.Fatalf("LoadExecutedDefinitionSnapshot() error = %v", err)
+		}
+		if got, want := hydrated.EffectiveConfig.IterationCap, 12; got != want {
+			t.Fatalf("pinned iteration cap = %d, want %d after defaults mutation", got, want)
+		}
+	})
+
+	t.Run("Should resolve configured inputs at the shared dry run and persisted start seam", func(t *testing.T) {
+		t.Parallel()
+
+		definition := validDefinition()
+		definition.Inputs["auto_commit"] = dsl.Input{Type: dsl.InputTypeBoolean, Default: false}
+		store := newFakeLoopStore()
+		svc := newTestServiceWithOptions(
+			t,
+			store,
+			definition,
+			loop.WithInputDefaultsResolver(func(
+				_ context.Context,
+				ws loop.WorkspaceID,
+				_ string,
+				name string,
+			) (loop.InputDefaultLayers, error) {
+				if ws != "ws-inputs" || name != "valid-loop" {
+					t.Fatalf("input defaults target = %s/%s, want ws-inputs/valid-loop", ws, name)
+				}
+				return loop.InputDefaultLayers{
+					Global:    map[string]any{"tasks": "configured-task"},
+					Workspace: map[string]any{"auto_commit": true},
+				}, nil
+			}),
+		)
+
+		preview, err := svc.DryRun(
+			t.Context(),
+			"ws-inputs",
+			"valid-loop",
+			loop.Inputs{ProfileID: storepkg.DefaultProfileID},
+		)
+		if err != nil {
+			t.Fatalf("DryRun() error = %v", err)
+		}
+		if got, want := preview.ResolvedInputs["tasks"], "configured-task"; got != want {
+			t.Fatalf("DryRun tasks = %#v, want %#v", got, want)
+		}
+		if got, want := preview.InputOrigins["tasks"], loop.InputOriginGlobal; got != want {
+			t.Fatalf("DryRun tasks origin = %q, want %q", got, want)
+		}
+		if got, want := preview.InputOrigins["auto_commit"], loop.InputOriginWorkspace; got != want {
+			t.Fatalf("DryRun auto_commit origin = %q, want %q", got, want)
+		}
+		if store.createCount() != 0 {
+			t.Fatalf("DryRun create count = %d, want 0", store.createCount())
+		}
+
+		run, err := svc.Start(
+			t.Context(),
+			"ws-inputs",
+			"valid-loop",
+			loop.Inputs{ProfileID: storepkg.DefaultProfileID, Values: map[string]any{"tasks": "explicit-task"}},
+			humanActor(t),
+		)
+		if err != nil {
+			t.Fatalf("Start() error = %v", err)
+		}
+		if got, want := run.Inputs["tasks"], "explicit-task"; got != want {
+			t.Fatalf("Start tasks = %#v, want %#v", got, want)
+		}
+		if store.createCount() != 1 {
+			t.Fatalf("Start create count = %d, want 1", store.createCount())
+		}
+	})
+
+	t.Run("Should reject configured type mismatches before creating a run", func(t *testing.T) {
+		t.Parallel()
+
+		definition := validDefinition()
+		definition.Inputs["auto_commit"] = dsl.Input{Type: dsl.InputTypeBoolean, Default: false}
+		store := newFakeLoopStore()
+		svc := newTestServiceWithOptions(
+			t,
+			store,
+			definition,
+			loop.WithInputDefaultsResolver(func(
+				context.Context,
+				loop.WorkspaceID,
+				string,
+				string,
+			) (loop.InputDefaultLayers, error) {
+				return loop.InputDefaultLayers{
+					Workspace: map[string]any{"auto_commit": "true"},
+				}, nil
+			}),
+		)
+
+		_, err := svc.Start(
+			t.Context(),
+			"ws-inputs",
+			"valid-loop",
+			loop.Inputs{ProfileID: storepkg.DefaultProfileID, Values: map[string]any{"tasks": "task-ref"}},
+			humanActor(t),
+		)
+		validation, ok := loop.AsInputValidationError(err)
+		if !ok || validation.Field != "auto_commit" ||
+			validation.Origin != loop.InputOriginWorkspace ||
+			validation.Reason != loop.InputValidationReasonTypeMismatch {
+			t.Fatalf("Start() error = %#v, want typed auto_commit type mismatch", err)
+		}
+		if store.createCount() != 0 {
+			t.Fatalf("Start create count = %d, want 0", store.createCount())
+		}
+	})
+}
+
+func TestServiceInlineGoalStartAndReplaceShouldSharePinnedStartPath(t *testing.T) {
+	t.Parallel()
+
+	t.Run("Should start a snapshot-only session Goal with pinned origin and policy", func(t *testing.T) {
+		t.Parallel()
+
+		store := newFakeLoopStore()
+		definition := validDefinition()
+		definition.Contract.Goal = "Complete {{ .inputs.tasks }}"
+		definition.Contract.DefinitionOfDone = "{{ .inputs.tasks }} is complete"
+		svc := newTestService(t, store, definition)
+		run, err := svc.StartInline(
+			t.Context(),
+			"ws-1",
+			inlineGoalDefinition("ship the release", "judge-v1"),
+			loop.Inputs{ProfileID: storepkg.DefaultProfileID},
+			inlineGoalOrigin("session-origin"),
+			humanActor(t),
+		)
+		if err != nil {
+			t.Fatalf("StartInline() error = %v", err)
+		}
+		if run.LoopName != loop.InlineGoalLoopName || run.Origin.Kind != loop.RunOriginSession ||
+			run.Origin.SessionID != "session-origin" || run.GoalContextNudgeRatio != 0.8 {
+			t.Fatalf("StartInline() run = %#v", run)
+		}
+		if len(run.DefinitionSnapshot) == 0 || store.createCount() != 1 {
+			t.Fatalf("StartInline() snapshot bytes = %d creates = %d", len(run.DefinitionSnapshot), store.createCount())
+		}
+	})
+
+	t.Run("Should reject a missing resolved judge before any write", func(t *testing.T) {
+		t.Parallel()
+
+		store := newFakeLoopStore()
+		svc := newTestService(t, store, validDefinition())
+		_, err := svc.StartInline(
+			t.Context(),
+			"ws-1",
+			inlineGoalDefinition("ship the release", ""),
+			loop.Inputs{ProfileID: storepkg.DefaultProfileID},
+			inlineGoalOrigin("session-origin"),
+			humanActor(t),
+		)
+		reason, reasonMatched := errors.AsType[*loop.ReasonError](err)
+		if !reasonMatched || reason.Code != loop.ReasonCodeGoalJudgeUnavailable {
+			t.Fatalf("StartInline() error = %v, want %q", err, loop.ReasonCodeGoalJudgeUnavailable)
+		}
+		if store.createCount() != 0 {
+			t.Fatalf("StartInline() creates = %d, want 0", store.createCount())
+		}
+	})
+
+	t.Run("Should prepare replacement before atomically revoking the expected Run", func(t *testing.T) {
+		t.Parallel()
+
+		store := newFakeLoopStore()
+		old := seedFakeRun(store, loop.StatusRunning)
+		old.LoopName = loop.InlineGoalLoopName
+		origin := inlineGoalOrigin("session-origin")
+		old.Origin = &origin
+		store.seed(old)
+		svc := newTestService(t, store, validDefinition())
+		result, err := svc.ReplaceInline(
+			t.Context(),
+			old.ID,
+			"ws-1",
+			inlineGoalDefinition("ship the safer release", "judge-v1"),
+			loop.Inputs{ProfileID: storepkg.DefaultProfileID},
+			inlineGoalOrigin("session-origin"),
+			humanActor(t),
+		)
+		if err != nil {
+			t.Fatalf("ReplaceInline() error = %v", err)
+		}
+		if result.ReplacedRunID != old.ID || result.Run == nil || result.Run.ID == old.ID {
+			t.Fatalf("ReplaceInline() result = %#v", result)
+		}
+		if got := store.mustRun(t, old.ID); got.Status != loop.StatusFailed {
+			t.Fatalf("replaced Run status = %q, want failed", got.Status)
+		}
+	})
+
+	t.Run("Should report cleanup failure without denying a committed replacement", func(t *testing.T) {
+		t.Parallel()
+
+		store := newFakeLoopStore()
+		old := seedFakeRun(store, loop.StatusRunning)
+		old.LoopName = loop.InlineGoalLoopName
+		origin := inlineGoalOrigin("session-origin")
+		old.Origin = &origin
+		store.seed(old)
+		store.inlineReplaceRevokedPromptLeases = []loop.GoalPromptLease{{
+			LoopRunID: string(old.ID), TaskRunID: "task-run-cleanup", JudgeAttemptID: "judge-cleanup",
+		}}
+		cleanupErr := errors.New("stop judge session")
+		var logs bytes.Buffer
+		svc := newTestServiceWithOptions(
+			t,
+			store,
+			validDefinition(),
+			loop.WithLogger(slog.New(slog.NewTextHandler(&logs, nil))),
+			loop.WithGoalPromptLeaseRevoker(loop.GoalPromptLeaseRevokerFunc(func(
+				context.Context,
+				loop.GoalPromptLease,
+				string,
+			) error {
+				return cleanupErr
+			})),
+		)
+
+		result, err := svc.ReplaceInline(
+			t.Context(),
+			old.ID,
+			"ws-1",
+			inlineGoalDefinition("ship the safer release", "judge-v1"),
+			loop.Inputs{ProfileID: storepkg.DefaultProfileID},
+			inlineGoalOrigin("session-origin"),
+			humanActor(t),
+		)
+		if err != nil {
+			t.Fatalf("ReplaceInline() error = %v, want committed success", err)
+		}
+		if result.ReplacedRunID != old.ID || result.Run == nil {
+			t.Fatalf("ReplaceInline() result = %#v, want committed replacement", result)
+		}
+		if got := logs.String(); !strings.Contains(got, cleanupErr.Error()) ||
+			!strings.Contains(got, "judge-cleanup") {
+			t.Fatalf("cleanup log = %q, want error and judge attempt identity", got)
+		}
+	})
+
+	t.Run("Should leave the old Run live when replacement compilation fails", func(t *testing.T) {
+		t.Parallel()
+
+		store := newFakeLoopStore()
+		old := seedFakeRun(store, loop.StatusRunning)
+		old.LoopName = loop.InlineGoalLoopName
+		origin := inlineGoalOrigin("session-origin")
+		old.Origin = &origin
+		store.seed(old)
+		svc := newTestService(t, store, validDefinition())
+		invalid := inlineGoalDefinition("ship the release", "judge-v1")
+		invalid.Graph.Nodes[0].Params["objective"] = ""
+		if _, err := svc.ReplaceInline(
+			t.Context(), old.ID, "ws-1", invalid, loop.Inputs{ProfileID: storepkg.DefaultProfileID},
+			inlineGoalOrigin("session-origin"), humanActor(t),
+		); err == nil {
+			t.Fatal("ReplaceInline(invalid) error = nil")
+		}
+		if got := store.mustRun(t, old.ID); got.Status != loop.StatusRunning {
+			t.Fatalf("old Run status = %q, want running", got.Status)
+		}
+	})
+
+	t.Run("Should clear the newest inline Goal through the atomic store boundary", func(t *testing.T) {
+		t.Parallel()
+
+		store := newFakeLoopStore()
+		active := seedFakeRun(store, loop.StatusRunning)
+		active.LoopName = loop.InlineGoalLoopName
+		origin := inlineGoalOrigin("session-origin")
+		active.Origin = &origin
+		store.seed(active)
+		svc := newTestService(t, store, validDefinition())
+		if err := svc.ClearInlineGoal(
+			t.Context(),
+			"ws-1",
+			"session-origin",
+			humanActor(t),
+		); err != nil {
+			t.Fatalf("ClearInlineGoal() error = %v", err)
+		}
+		if got := store.mustRun(t, active.ID); got.Status != loop.StatusFailed {
+			t.Fatalf("cleared Run status = %q, want failed", got.Status)
+		}
+	})
+}
+
+func TestServiceStartShouldPinGoalRunPolicy(t *testing.T) {
+	t.Parallel()
+
+	t.Run("Should resolve and persist the workspace Goal context policy", func(t *testing.T) {
+		t.Parallel()
+
+		store := newFakeLoopStore()
+		resolved := compileDefinition(t, validDefinition())
+		var resolvedWorkspace loop.WorkspaceID
+		svc, err := loop.NewService(
+			store,
+			loop.DefinitionResolverFunc(func(
+				context.Context,
+				loop.WorkspaceID,
+				string,
+				string,
+			) (*loop.ResolvedDefinition, error) {
+				return resolved, nil
+			}),
+			loop.GoalRunPolicyResolverFunc(func(
+				_ context.Context,
+				ws loop.WorkspaceID,
+			) (*loop.GoalRunPolicy, error) {
+				resolvedWorkspace = ws
+				return &loop.GoalRunPolicy{ContextNudgeRatio: 0}, nil
+			}),
+			loop.WithClock(func() time.Time {
+				return time.Date(2026, 7, 10, 12, 0, 0, 0, time.UTC)
+			}),
+			loop.WithRunIDFactory(func() (loop.RunID, error) { return "looprun-goal-policy", nil }),
+		)
+		if err != nil {
+			t.Fatalf("NewService() error = %v", err)
+		}
+
+		run, err := svc.Start(
+			t.Context(),
+			"ws-goal-policy",
+			"valid-loop",
+			loop.Inputs{ProfileID: storepkg.DefaultProfileID,
+				Values: map[string]any{"tasks": "task-ref"},
+			},
+			humanActor(t),
+		)
+		if err != nil {
+			t.Fatalf("Start() error = %v", err)
+		}
+		if resolvedWorkspace != "ws-goal-policy" {
+			t.Fatalf("Goal policy resolver workspace = %q, want ws-goal-policy", resolvedWorkspace)
+		}
+		if run.GoalContextNudgeRatio != 0 {
+			t.Fatalf("GoalContextNudgeRatio = %v, want explicit zero", run.GoalContextNudgeRatio)
+		}
+		if stored := store.mustRun(t, run.ID); stored.GoalContextNudgeRatio != 0 {
+			t.Fatalf("stored GoalContextNudgeRatio = %v, want explicit zero", stored.GoalContextNudgeRatio)
+		}
+	})
+
+	t.Run("Should fail before creating a Run when Goal policy resolution fails", func(t *testing.T) {
+		t.Parallel()
+
+		store := newFakeLoopStore()
+		resolved := compileDefinition(t, validDefinition())
+		wantErr := errors.New("workspace Goal config unavailable")
+		svc, err := loop.NewService(
+			store,
+			loop.DefinitionResolverFunc(func(
+				context.Context,
+				loop.WorkspaceID,
+				string,
+				string,
+			) (*loop.ResolvedDefinition, error) {
+				return resolved, nil
+			}),
+			loop.GoalRunPolicyResolverFunc(func(
+				context.Context,
+				loop.WorkspaceID,
+			) (*loop.GoalRunPolicy, error) {
+				return nil, wantErr
+			}),
+		)
+		if err != nil {
+			t.Fatalf("NewService() error = %v", err)
+		}
+
+		_, err = svc.Start(
+			t.Context(),
+			"ws-goal-policy",
+			"valid-loop",
+			loop.Inputs{ProfileID: storepkg.DefaultProfileID,
+				Values: map[string]any{"tasks": "task-ref"},
+			},
+			humanActor(t),
+		)
+		if !errors.Is(err, wantErr) {
+			t.Fatalf("Start() error = %v, want %v", err, wantErr)
+		}
+		if store.createCount() != 0 {
+			t.Fatalf("CreateLoopRun calls = %d, want 0", store.createCount())
+		}
+	})
+}
+
+func TestServiceStartShouldEnforceConcurrencyAndAncestry(t *testing.T) {
+	t.Parallel()
+
+	t.Run("Should reject forbid concurrency when an active run exists", func(t *testing.T) {
+		t.Parallel()
+
+		store := newFakeLoopStore()
+		seedFakeRun(store, loop.StatusRunning)
+		svc := newTestService(t, store, validDefinition())
+
+		_, err := svc.Start(
+			t.Context(),
+			"ws-1",
+			"valid-loop",
+			loop.Inputs{ProfileID: storepkg.DefaultProfileID,
+				Values: map[string]any{"tasks": "task-ref"},
+			},
+			humanActor(t),
+		)
+		if !errors.Is(err, loop.ErrConcurrencyConflict) {
+			t.Fatalf("Start() error = %v, want ErrConcurrencyConflict", err)
+		}
+		reason, reasonMatched := errors.AsType[*loop.ReasonError](err)
+		if !reasonMatched || reason.Code != loop.ReasonCodeActiveRunExists {
+			t.Fatalf("Start() reason = %#v, want active run reason code", reason)
+		}
+	})
+
+	t.Run("Should create a queued run when queue concurrency sees an active run", func(t *testing.T) {
+		t.Parallel()
+
+		store := newFakeLoopStore()
+		seedFakeRun(store, loop.StatusRunning)
+		def := validDefinition()
+		def.Concurrency = dsl.ConcurrencyQueue
+		svc := newTestService(t, store, def)
+
+		run, err := svc.Start(
+			t.Context(),
+			"ws-1",
+			"valid-loop",
+			loop.Inputs{ProfileID: storepkg.DefaultProfileID,
+				Values: map[string]any{"tasks": "task-ref"},
+			},
+			humanActor(t),
+		)
+		if err != nil {
+			t.Fatalf("Start() error = %v", err)
+		}
+		if run.Status != loop.StatusQueued {
+			t.Fatalf("run.Status = %q, want queued", run.Status)
+		}
+	})
+
+	t.Run("Should reject a run loop target already present in the parent chain", func(t *testing.T) {
+		t.Parallel()
+
+		store := newFakeLoopStore()
+		parent := seedFakeRun(store, loop.StatusRunning)
+		svc := newTestService(t, store, validDefinition())
+
+		_, err := svc.Start(
+			t.Context(),
+			"ws-1",
+			"valid-loop",
+			loop.Inputs{ProfileID: storepkg.DefaultProfileID,
+				Values:          map[string]any{"tasks": "task-ref"},
+				ParentLoopRunID: parent.ID,
+			},
+			humanActor(t),
+		)
+		if !errors.Is(err, loop.ErrAncestryRejected) {
+			t.Fatalf("Start() error = %v, want ErrAncestryRejected", err)
+		}
+		reason, reasonMatched := errors.AsType[*loop.ReasonError](err)
+		if !reasonMatched || reason.Code != loop.ReasonCodeAncestryCycle {
+			t.Fatalf("Start() reason = %#v, want ancestry cycle reason code", reason)
+		}
+	})
+
+	t.Run("Should reject a parent run from another workspace", func(t *testing.T) {
+		t.Parallel()
+
+		store := newFakeLoopStore()
+		parent := seedFakeRun(store, loop.StatusRunning)
+		parent.WorkspaceID = "ws-foreign"
+		parent.LoopName = "other-loop"
+		store.seed(parent)
+		svc := newTestService(t, store, validDefinition())
+
+		_, err := svc.Start(
+			t.Context(),
+			"ws-1",
+			"valid-loop",
+			loop.Inputs{ProfileID: storepkg.DefaultProfileID,
+				Values:          map[string]any{"tasks": "task-ref"},
+				ParentLoopRunID: parent.ID,
+			},
+			humanActor(t),
+		)
+		if !errors.Is(err, loop.ErrAncestryRejected) {
+			t.Fatalf("Start() error = %v, want ErrAncestryRejected", err)
+		}
+		if !strings.Contains(err.Error(), "target workspace") {
+			t.Fatalf("Start() error = %v, want workspace rejection", err)
+		}
+	})
+
+	t.Run("Should reject a parent row with a mismatched identity", func(t *testing.T) {
+		t.Parallel()
+
+		store := newFakeLoopStore()
+		parent := seedFakeRun(store, loop.StatusRunning)
+		store.getRunByID = func(loop.RunID) (loop.Run, error) {
+			returned := parent
+			returned.ID = "looprun-other"
+			return returned, nil
+		}
+		svc := newTestService(t, store, validDefinition())
+
+		_, err := svc.Start(
+			t.Context(),
+			"ws-1",
+			"valid-loop",
+			loop.Inputs{ProfileID: storepkg.DefaultProfileID,
+				Values:          map[string]any{"tasks": "task-ref"},
+				ParentLoopRunID: parent.ID,
+			},
+			humanActor(t),
+		)
+		if !errors.Is(err, loop.ErrAncestryRejected) || !strings.Contains(err.Error(), "identity") {
+			t.Fatalf("Start() error = %v, want identity rejection", err)
+		}
+	})
+}
+
+func TestServiceControlMethodsShouldPreserveStatusContracts(t *testing.T) {
+	t.Parallel()
+
+	t.Run("Should reject run and node mutations against imported history", func(t *testing.T) {
+		t.Parallel()
+
+		store := newFakeLoopStore()
+		run := seedFakeRun(store, loop.StatusRunning)
+		run.Historical = true
+		store.seed(run)
+		svc := newTestService(t, store, validDefinition())
+		actor := humanActor(t)
+
+		if err := svc.Pause(t.Context(), "ws-1", run.ID, actor); !errors.Is(err, loop.ErrInvalidTransition) {
+			t.Fatalf("Pause(historical) error = %v, want ErrInvalidTransition", err)
+		}
+		nodes := svc.(loop.NodeLifecycleService)
+		if _, err := nodes.PauseNode(
+			t.Context(), "ws-1", run.ID, "worker", nil, loop.NodePauseCancel, "repair", actor,
+		); !errors.Is(err, loop.ErrInvalidTransition) {
+			t.Fatalf("PauseNode(historical) error = %v, want ErrInvalidTransition", err)
+		}
+	})
+
+	t.Run("Should pause by setting intent without changing status", func(t *testing.T) {
+		t.Parallel()
+
+		store := newFakeLoopStore()
+		run := seedFakeRun(store, loop.StatusRunning)
+		svc := newTestService(t, store, validDefinition())
+
+		if err := svc.Pause(t.Context(), "ws-1", run.ID, humanActor(t)); err != nil {
+			t.Fatalf("Pause() error = %v", err)
+		}
+		stored := store.mustRun(t, run.ID)
+		if stored.Status != loop.StatusRunning || !stored.PauseRequested {
+			t.Fatalf("stored run = %#v, want running with pause_requested", stored)
+		}
+		if err := svc.Pause(t.Context(), "ws-1", run.ID, humanActor(t)); err != nil {
+			t.Fatalf("Pause() second call error = %v, want idempotent nil", err)
+		}
+	})
+
+	// A session Goal's interrupted turn must retain its pause actor until the boundary settles.
+	t.Run("Should reject Resume while a session Goal pause is still settling", func(t *testing.T) {
+		t.Parallel()
+
+		store := newFakeLoopStore()
+		run := seedFakeRun(store, loop.StatusRunning)
+		run.Origin = new(inlineGoalOrigin("session-pausing"))
+		run.StartedBy = humanActor(t).Actor
+		store.seed(run)
+		svc := newTestService(t, store, validDefinition())
+		pauseActor, err := task.DeriveHumanActorContext("pause-operator", task.OriginKindHTTP, "http")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := svc.Pause(t.Context(), run.WorkspaceID, run.ID, pauseActor); err != nil {
+			t.Fatalf("Pause(session Goal) error = %v", err)
+		}
+		paused := store.mustRun(t, run.ID)
+		if !paused.PauseRequested || paused.ControlActor != pauseActor.Actor ||
+			paused.ControlActor == run.StartedBy || paused.ControlRequestedAt.IsZero() {
+			t.Fatalf("Pause did not retain its authenticated actor: %#v", paused)
+		}
+
+		err = svc.Resume(t.Context(), run.WorkspaceID, run.ID, humanActor(t))
+		reason, ok := errors.AsType[*loop.ReasonError](err)
+		if !errors.Is(err, loop.ErrTransitionConflict) || !ok || reason.Code != loop.ReasonCodeGoalControlStale {
+			t.Fatalf("Resume(pausing session Goal) error = %v, want stale control conflict", err)
+		}
+		stored := store.mustRun(t, run.ID)
+		if stored.Status != loop.StatusRunning || !stored.PauseRequested ||
+			stored.ControlActor != paused.ControlActor || !stored.ControlRequestedAt.Equal(paused.ControlRequestedAt) {
+			t.Fatalf("early Resume changed pending pause ownership: %#v", stored)
+		}
+	})
+
+	t.Run("Should resume by clearing intent or transitioning paused to running", func(t *testing.T) {
+		t.Parallel()
+
+		store := newFakeLoopStore()
+		running := seedFakeRun(store, loop.StatusRunning)
+		running.PauseRequested = true
+		store.seed(running)
+		paused := seedFakeRun(store, loop.StatusPaused)
+		paused.ID = "run-paused-resume"
+		paused.PauseRequested = true
+		store.seed(paused)
+		svc := newTestService(t, store, validDefinition())
+
+		if err := svc.Resume(t.Context(), "ws-1", running.ID, humanActor(t)); err != nil {
+			t.Fatalf("Resume(running) error = %v", err)
+		}
+		if got := store.mustRun(t, running.ID); got.PauseRequested {
+			t.Fatalf("running PauseRequested = true, want false")
+		}
+		if err := svc.Resume(t.Context(), "ws-1", paused.ID, humanActor(t)); err != nil {
+			t.Fatalf("Resume(paused) error = %v", err)
+		}
+		if got := store.mustRun(t, paused.ID); got.Status != loop.StatusRunning || got.PauseRequested {
+			t.Fatalf("paused after resume = %#v, want running and not requested", got)
+		}
+	})
+
+	t.Run("Should resume a wait with the pinned admission policy", func(t *testing.T) {
+		t.Parallel()
+
+		store := newFakeLoopStore()
+		resolved := compileDefinition(t, validDefinition())
+		pinnedAttempts := 7
+		effective, err := loop.ResolveEffectiveConfig(
+			resolved,
+			loop.DefaultLoopDefaults(),
+			nil,
+			loop.LoopConfig{Lifecycle: &loop.LifecycleConfig{WaitAdmissionAttempts: &pinnedAttempts}},
+		)
+		if err != nil {
+			t.Fatalf("ResolveEffectiveConfig() error = %v", err)
+		}
+		definition, digest, err := loop.BuildExecutedDefinitionSnapshot(resolved, effective)
+		if err != nil {
+			t.Fatalf("BuildExecutedDefinitionSnapshot() error = %v", err)
+		}
+		run := seedFakeRun(store, loop.StatusRunning)
+		run.Generation = 1
+		run.DefinitionVersion = resolved.DefinitionVersion
+		run.DefinitionDigest = digest
+		store.seed(run)
+		store.snapshots[string(run.WorkspaceID)+"/"+digest] = loop.DefinitionSnapshot{
+			WorkspaceID: run.WorkspaceID,
+			Digest:      digest,
+			Version:     run.DefinitionVersion,
+			Definition:  definition,
+		}
+		currentAttempts := 9
+		if err := store.UpsertLoopConfig(
+			t.Context(),
+			run.WorkspaceID, "", run.LoopName,
+			loop.LoopConfig{Lifecycle: &loop.LifecycleConfig{WaitAdmissionAttempts: &currentAttempts}},
+		); err != nil {
+			t.Fatalf("UpsertLoopConfig() error = %v", err)
+		}
+		svc := newTestService(t, store, validDefinition())
+		lifecycle, ok := svc.(loop.NodeLifecycleService)
+		if !ok {
+			t.Fatal("Service does not implement NodeLifecycleService")
+		}
+
+		if _, err := lifecycle.ResumeNodeWait(
+			t.Context(),
+			run.WorkspaceID,
+			run.ID,
+			"release",
+			0,
+			json.RawMessage(`{}`),
+			humanActor(t),
+		); err != nil {
+			t.Fatalf("ResumeNodeWait() error = %v", err)
+		}
+		if got := store.lastWaitResumeMutation(t).AdmissionAttempts; got != pinnedAttempts {
+			t.Fatalf(
+				"AdmissionAttempts = %d, want pinned %d instead of current %d",
+				got,
+				pinnedAttempts,
+				currentAttempts,
+			)
+		}
+	})
+
+	t.Run("Should approve or reject only needs approval runs", func(t *testing.T) {
+		t.Parallel()
+
+		store := newFakeLoopStore()
+		approvable := seedFakeRun(store, loop.StatusNeedsApproval)
+		approvable.ID = "run-approve"
+		approvable.ActiveGateID = "review_gate"
+		approvable.SetActiveHumanCriteria(
+			json.RawMessage(`[{"id":"human","type":"human","outcome":"awaiting_approval"}]`),
+		)
+		store.seed(approvable)
+		rejectable := seedFakeRun(store, loop.StatusNeedsApproval)
+		rejectable.ID = "run-reject"
+		rejectable.ActiveGateID = "review_gate"
+		rejectable.SetActiveHumanCriteria(
+			json.RawMessage(`[{"id":"human","type":"human","outcome":"awaiting_approval"}]`),
+		)
+		store.seed(rejectable)
+		running := seedFakeRun(store, loop.StatusRunning)
+		running.ID = "run-running-approve"
+		store.seed(running)
+		svc := newTestService(t, store, validDefinition())
+		actor := humanActor(t)
+
+		err := svc.Approve(
+			t.Context(),
+			"ws-1",
+			approvable.ID,
+			"review_gate",
+			loop.GateDecisionApprove,
+			actor,
+		)
+		if err != nil {
+			t.Fatalf("Approve(approve) error = %v", err)
+		}
+		if got := store.mustRun(t, approvable.ID); got.Status != loop.StatusRunning {
+			t.Fatalf("approved status = %q, want running", got.Status)
+		}
+		decisions, err := store.ListLoopGateDecisions(t.Context(), "ws-1", approvable.ID, 0, "review_gate")
+		if err != nil {
+			t.Fatalf("ListLoopGateDecisions(approve) error = %v", err)
+		}
+		if decisions["human"].Decision != gate.HumanDecisionApprove {
+			t.Fatalf("decision[human] = %#v, want approve", decisions["human"])
+		}
+		err = svc.Approve(
+			t.Context(),
+			"ws-1",
+			rejectable.ID,
+			"review_gate",
+			loop.GateDecisionReject,
+			actor,
+		)
+		if err != nil {
+			t.Fatalf("Approve(reject) error = %v", err)
+		}
+		if got := store.mustRun(t, rejectable.ID); got.Status != loop.StatusBlocked {
+			t.Fatalf("rejected status = %q, want blocked", got.Status)
+		}
+		err = svc.Approve(
+			t.Context(),
+			"ws-1",
+			running.ID,
+			"review_gate",
+			loop.GateDecisionApprove,
+			actor,
+		)
+		if !errors.Is(err, loop.ErrInvalidTransition) {
+			t.Fatalf("Approve(running) error = %v, want ErrInvalidTransition", err)
+		}
+	})
+
+	t.Run("Should reject approvals for a stale gate id", func(t *testing.T) {
+		t.Parallel()
+
+		store := newFakeLoopStore()
+		run := seedFakeRun(store, loop.StatusNeedsApproval)
+		run.ID = "run-stale-gate"
+		run.ActiveGateID = "current_gate"
+		run.SetActiveHumanCriteria(
+			json.RawMessage(`[{"id":"human","type":"human","outcome":"awaiting_approval"}]`),
+		)
+		store.seed(run)
+		svc := newTestService(t, store, validDefinition())
+
+		err := svc.Approve(
+			t.Context(),
+			"ws-1",
+			run.ID,
+			"old_gate",
+			loop.GateDecisionApprove,
+			humanActor(t),
+		)
+		if !errors.Is(err, loop.ErrInvalidTransition) {
+			t.Fatalf("Approve(stale gate) error = %v, want ErrInvalidTransition", err)
+		}
+	})
+
+	t.Run("Should reject request changes for synthetic budget gate", func(t *testing.T) {
+		t.Parallel()
+
+		store := newFakeLoopStore()
+		run := seedFakeRun(store, loop.StatusNeedsApproval)
+		run.ID = "run-budget-request-changes"
+		run.ActiveGateID = loop.BudgetGateID
+		store.seed(run)
+		svc := newTestService(t, store, validDefinition())
+
+		err := svc.Approve(
+			t.Context(),
+			"ws-1",
+			run.ID,
+			loop.BudgetGateID,
+			loop.GateDecisionRequestChanges,
+			humanActor(t),
+		)
+		if !errors.Is(err, loop.ErrValidation) {
+			t.Fatalf("Approve(budget request_changes) error = %v, want ErrValidation", err)
+		}
+		if got := store.mustRun(t, run.ID); got.Status != loop.StatusNeedsApproval {
+			t.Fatalf("budget run status = %q, want needs-approval", got.Status)
+		}
+	})
+}
+
+func TestServiceShouldAllocateTypedGoalGrantsFromDurableControl(t *testing.T) {
+	t.Run("Should extend the effective turn limit by the pinned node limit exactly once", func(t *testing.T) {
+		t.Parallel()
+
+		store := newFakeLoopStore()
+		run := seedFakeRun(store, loop.StatusNeedsApproval)
+		run.ID = "run-goal-turn-extension"
+		run.ActiveGateID = loop.SyntheticGoalGateID(
+			"converge",
+			1,
+			0,
+			loop.ReasonCodeGoalTurnsExhausted,
+		)
+		definition := singleNodeDefinition(validGoalNode("converge", ""))
+		definition.Graph.Nodes[0].Params["max_turns"] = 4
+		resolved, err := loop.NewCompiler().Compile(definition)
+		if err != nil {
+			t.Fatalf("Compile(Goal definition) error = %v", err)
+		}
+		effective, err := loop.ResolveEffectiveConfig(
+			resolved,
+			loop.DefaultLoopDefaults(),
+			nil,
+			loop.LoopConfig{},
+		)
+		if err != nil {
+			t.Fatalf("ResolveEffectiveConfig() error = %v", err)
+		}
+		encoded, digest, err := loop.BuildExecutedDefinitionSnapshot(resolved, effective)
+		if err != nil {
+			t.Fatalf("BuildExecutedDefinitionSnapshot() error = %v", err)
+		}
+		run.DefinitionVersion = resolved.DefinitionVersion
+		run.DefinitionDigest = digest
+		store.seed(run)
+		store.snapshots[string(run.WorkspaceID)+"/"+run.DefinitionDigest] = loop.DefinitionSnapshot{
+			WorkspaceID: run.WorkspaceID,
+			Digest:      run.DefinitionDigest,
+			Version:     run.DefinitionVersion,
+			Definition:  encoded,
+		}
+		store.goalControl = &loop.GoalControlState{
+			WorkspaceID:  run.WorkspaceID,
+			LoopRunID:    run.ID,
+			Generation:   1,
+			NodeID:       "converge",
+			ControlEpoch: 1,
+			GoalStatus:   "budget-limited",
+			TurnsUsed:    4,
+			TurnLimit:    4,
+			TaskRunID:    "goal-segment-1",
+			GateID:       run.ActiveGateID,
+			Cause:        loop.ReasonCodeGoalTurnsExhausted,
+			RunStatus:    loop.StatusNeedsApproval,
+		}
+		var activated task.Run
+		var cancelApprove context.CancelFunc
+		var activationActive bool
+		var activationDeadline bool
+		svc := newTestServiceWithOptions(
+			t,
+			store,
+			validDefinition(),
+			loop.WithGoalRunActivator(loop.GoalRunActivatorFunc(func(ctx context.Context, run task.Run) {
+				cancelApprove()
+				_, activationDeadline = ctx.Deadline()
+				activationActive = ctx.Err() == nil
+				activated = run
+			})),
+		)
+		approveCtx, cancel := context.WithCancel(t.Context())
+		cancelApprove = cancel
+		defer cancel()
+		if err := svc.Approve(
+			approveCtx,
+			run.WorkspaceID,
+			run.ID,
+			run.ActiveGateID,
+			loop.GateDecisionApprove,
+			humanActor(t),
+		); err != nil {
+			t.Fatalf("Approve(turn extension) error = %v", err)
+		}
+		grant := store.lastGoalReactivation(t)
+		if grant.Kind != loop.GoalGrantTurnExtension || grant.Scope != loop.GoalGrantScopeTurnLimit ||
+			grant.TurnIncrement != 4 {
+			t.Fatalf("turn-extension grant = %#v", grant)
+		}
+		if len(grant.Decisions) != 1 || grant.Decisions[0].GateID != run.ActiveGateID {
+			t.Fatalf("turn-extension decisions = %#v", grant.Decisions)
+		}
+		if activated.ID != "goal-successor" {
+			t.Fatalf("activated Goal successor = %#v, want goal-successor", activated)
+		}
+		if !activationActive || !activationDeadline {
+			t.Fatalf(
+				"Goal activation context active/deadline = %v/%v, want true/true",
+				activationActive,
+				activationDeadline,
+			)
+		}
+	})
+
+	t.Run("Should map approval causes to exact budget and reseed grant scopes", func(t *testing.T) {
+		t.Parallel()
+
+		cases := []struct {
+			name      string
+			cause     loop.ReasonCode
+			openTurn  bool
+			wantKind  loop.GoalGrantKind
+			wantScope loop.GoalGrantScope
+		}{
+			{
+				name: "session-origin reseed", cause: loop.ReasonCodeGoalReseedConfirmationRequired,
+				wantKind: loop.GoalGrantReseed, wantScope: loop.GoalGrantScopeRotateBinding,
+			},
+			{
+				name: "pre-submit budget", cause: loop.ReasonCodeGoalBudgetFenced,
+				wantKind: loop.GoalGrantBudget, wantScope: loop.GoalGrantScopeWorkAndSettle,
+			},
+			{
+				name: "open-turn budget", cause: loop.ReasonCodeGoalBudgetFenced, openTurn: true,
+				wantKind: loop.GoalGrantBudget, wantScope: loop.GoalGrantScopeSettleCurrent,
+			},
+		}
+		for _, tc := range cases {
+			t.Run("Should allocate "+tc.name, func(t *testing.T) {
+				t.Parallel()
+
+				store := newFakeLoopStore()
+				run := seedFakeRun(store, loop.StatusNeedsApproval)
+				run.ID = loop.RunID("run-goal-grant-" + strings.ReplaceAll(tc.name, " ", "-"))
+				run.ActiveGateID = loop.SyntheticGoalGateID("converge", 1, 0, tc.cause)
+				store.seed(run)
+				store.goalControl = &loop.GoalControlState{
+					WorkspaceID: run.WorkspaceID, LoopRunID: run.ID, Generation: 1,
+					NodeID: "converge", ControlEpoch: 1, GoalStatus: "awaiting-control",
+					TurnsUsed: 1, TurnLimit: 3, TaskRunID: "goal-segment-1",
+					GateID: run.ActiveGateID, Cause: tc.cause, OpenTurn: tc.openTurn,
+					RunStatus: loop.StatusNeedsApproval,
+				}
+				svc := newTestService(t, store, validDefinition())
+				if err := svc.Approve(
+					t.Context(), run.WorkspaceID, run.ID, run.ActiveGateID,
+					loop.GateDecisionApprove, humanActor(t),
+				); err != nil {
+					t.Fatalf("Approve(%s) error = %v", tc.name, err)
+				}
+				grant := store.lastGoalReactivation(t)
+				if grant.Kind != tc.wantKind || grant.Scope != tc.wantScope || grant.TurnIncrement != 0 {
+					t.Fatalf("%s grant = %#v", tc.name, grant)
+				}
+			})
+		}
+	})
+
+	t.Run("Should consume a plain Resume grant at successor reactivation", func(t *testing.T) {
+		t.Parallel()
+
+		store := newFakeLoopStore()
+		run := seedFakeRun(store, loop.StatusPaused)
+		run.ID = "run-goal-plain-resume"
+		store.seed(run)
+		store.goalControl = &loop.GoalControlState{
+			WorkspaceID: run.WorkspaceID, LoopRunID: run.ID, Generation: 1,
+			NodeID: "converge", ControlEpoch: 1, GoalStatus: "paused",
+			TurnsUsed: 1, TurnLimit: 3, TaskRunID: "goal-segment-1",
+			Cause: loop.ReasonCode(loop.TransitionCausePauseBoundary), RunStatus: loop.StatusPaused,
+		}
+		svc := newTestService(t, store, validDefinition())
+		if err := svc.Resume(t.Context(), run.WorkspaceID, run.ID, humanActor(t)); err != nil {
+			t.Fatalf("Resume(plain Goal control) error = %v", err)
+		}
+		grant := store.lastGoalReactivation(t)
+		if grant.Kind != loop.GoalGrantPlainResume || grant.Scope != loop.GoalGrantScopeReactivate ||
+			grant.TurnIncrement != 0 {
+			t.Fatalf("plain-resume grant = %#v", grant)
+		}
+	})
+}
+
+func TestServiceConfigMethodsShouldReadWriteRawOverrides(t *testing.T) {
+	t.Parallel()
+
+	t.Run("Should configure clamp and read loop config", func(t *testing.T) {
+		t.Parallel()
+
+		store := newFakeLoopStore()
+		svc := newTestService(t, store, validDefinition())
+
+		if err := svc.Configure(t.Context(), "ws-1", storepkg.DefaultProfileID, "valid-loop", loop.LoopConfig{
+			EnabledChecks: []byte(`{"human":true}`),
+			FanOutWidth:   new(500),
+		}); err != nil {
+			t.Fatalf("Configure() error = %v", err)
+		}
+		cfg, err := svc.GetConfig(t.Context(), "ws-1", "valid-loop")
+		if err != nil {
+			t.Fatalf("GetConfig() error = %v", err)
+		}
+		if cfg.FanOutWidth == nil || *cfg.FanOutWidth != 500 {
+			t.Fatalf("FanOutWidth = %#v, want 500", cfg.FanOutWidth)
+		}
+		if string(cfg.EnabledChecks) != `{"human":true}` {
+			t.Fatalf("EnabledChecks = %s, want persisted JSON", cfg.EnabledChecks)
+		}
+		snapshot, err := svc.GetConfigSnapshot(
+			t.Context(), "ws-1", storepkg.DefaultProfileID, "valid-loop",
+		)
+		if err != nil {
+			t.Fatalf("GetConfigSnapshot() error = %v", err)
+		}
+		if snapshot.Stored == nil || snapshot.Stored.FanOutWidth == nil ||
+			*snapshot.Stored.FanOutWidth != 500 {
+			t.Fatalf("stored config = %#v, want preserved override", snapshot.Stored)
+		}
+		if snapshot.Effective.FanOutWidth != 500 ||
+			snapshot.Effective.GateMaxRevisions != 10 {
+			t.Fatalf("effective config = %#v, want stored fan-out and delivery gate default", snapshot.Effective)
+		}
+	})
+
+	t.Run("Should let child config override an inherited parent environment", func(t *testing.T) {
+		t.Parallel()
+
+		store := newFakeLoopStore()
+		svc := newTestService(t, store, validDefinition())
+		childEnvironment := dsl.EnvironmentSpec{
+			Mode:        dsl.EnvironmentWorktree,
+			WorktreeRef: "child-feature",
+		}
+		if err := svc.Configure(t.Context(), "ws-1", storepkg.DefaultProfileID, "valid-loop", loop.LoopConfig{
+			Environment: &childEnvironment,
+		}); err != nil {
+			t.Fatalf("Configure(child environment) error = %v", err)
+		}
+		parentEnvironment := dsl.EnvironmentSpec{Mode: dsl.EnvironmentPerRun}
+		preview, err := svc.DryRun(
+			t.Context(),
+			"ws-1",
+			"valid-loop",
+			loop.Inputs{ProfileID: storepkg.DefaultProfileID,
+				Values:               map[string]any{"tasks": "task-ref"},
+				InheritedEnvironment: &parentEnvironment,
+			},
+		)
+		if err != nil {
+			t.Fatalf("DryRun(inherited environment) error = %v", err)
+		}
+		if preview.EffectiveConfig.Environment != childEnvironment {
+			t.Fatalf(
+				"effective child environment = %#v, want %#v",
+				preview.EffectiveConfig.Environment,
+				childEnvironment,
+			)
+		}
+		if got := preview.EffectiveConfig.Sources["/environment"]; got != loop.EffectiveConfigSourceLoopConfig {
+			t.Fatalf("child environment source = %q, want loop config", got)
+		}
+		explicitRunEnvironment := dsl.EnvironmentSpec{Mode: dsl.EnvironmentRoot}
+		preview, err = svc.DryRun(
+			t.Context(),
+			"ws-1",
+			"valid-loop",
+			loop.Inputs{ProfileID: storepkg.DefaultProfileID,
+				Values:               map[string]any{"tasks": "task-ref"},
+				InheritedEnvironment: &parentEnvironment,
+				ConfigOverrides:      loop.LoopConfig{Environment: &explicitRunEnvironment},
+			},
+		)
+		if err != nil {
+			t.Fatalf("DryRun(explicit environment) error = %v", err)
+		}
+		if preview.EffectiveConfig.Environment != explicitRunEnvironment {
+			t.Fatalf(
+				"effective run environment = %#v, want %#v",
+				preview.EffectiveConfig.Environment,
+				explicitRunEnvironment,
+			)
+		}
+		if got := preview.EffectiveConfig.Sources["/environment"]; got != loop.EffectiveConfigSourcePerRun {
+			t.Fatalf("run environment source = %q, want per run", got)
+		}
+	})
+
+	t.Run("Should report an inherited environment when no later layer overrides it", func(t *testing.T) {
+		t.Parallel()
+
+		svc := newTestService(t, newFakeLoopStore(), validDefinition())
+		inherited := dsl.EnvironmentSpec{Mode: dsl.EnvironmentPerRun}
+		preview, err := svc.DryRun(
+			t.Context(),
+			"ws-inherited-environment",
+			"valid-loop",
+			loop.Inputs{
+				ProfileID:            storepkg.DefaultProfileID,
+				Values:               map[string]any{"tasks": "task-ref"},
+				InheritedEnvironment: &inherited,
+			},
+		)
+		if err != nil {
+			t.Fatalf("DryRun(inherited environment) error = %v", err)
+		}
+		if preview.EffectiveConfig.Environment != inherited ||
+			preview.EffectiveConfig.Sources["/environment"] != loop.EffectiveConfigSourceInheritedEnvironment {
+			t.Fatalf("inherited environment config = %#v", preview.EffectiveConfig)
+		}
+	})
+
+	t.Run("Should reject invalid config JSON", func(t *testing.T) {
+		t.Parallel()
+
+		svc := newTestService(t, newFakeLoopStore(), validDefinition())
+		err := svc.Configure(t.Context(), "ws-1", storepkg.DefaultProfileID, "valid-loop", loop.LoopConfig{
+			EnabledChecks: []byte(`{`),
+		})
+		if !errors.Is(err, loop.ErrValidation) {
+			t.Fatalf("Configure(invalid JSON) error = %v, want ErrValidation", err)
+		}
+	})
+
+	t.Run("Should reject config for a missing definition without persisting it", func(t *testing.T) {
+		t.Parallel()
+
+		store := newFakeLoopStore()
+		svc, err := loop.NewService(
+			store,
+			loop.DefinitionResolverFunc(func(
+				context.Context,
+				loop.WorkspaceID,
+				string,
+				string,
+			) (*loop.ResolvedDefinition, error) {
+				return nil, nil
+			}),
+			testGoalRunPolicyResolver(0.8),
+		)
+		if err != nil {
+			t.Fatalf("NewService() error = %v", err)
+		}
+
+		err = svc.Configure(t.Context(), "ws-1", storepkg.DefaultProfileID, "missing-loop", loop.LoopConfig{
+			IterationCap: new(3),
+		})
+		if !errors.Is(err, loop.ErrDefinitionNotFound) {
+			t.Fatalf("Configure(missing definition) error = %v, want ErrDefinitionNotFound", err)
+		}
+		if _, err := store.GetLoopConfig(
+			t.Context(),
+			"ws-1", "", "missing-loop",
+		); !errors.Is(err, loop.ErrConfigNotFound) {
+			t.Fatalf("GetLoopConfig(after rejected configure) error = %v, want ErrConfigNotFound", err)
+		}
+	})
+}
+
+func TestServiceGetAndDefaultsShouldExposeRunState(t *testing.T) {
+	t.Parallel()
+
+	t.Run("Should return a workspace scoped run", func(t *testing.T) {
+		t.Parallel()
+
+		store := newFakeLoopStore()
+		run := seedFakeRun(store, loop.StatusRunning)
+		svc := newTestService(t, store, validDefinition())
+
+		got, err := svc.Get(t.Context(), "ws-1", run.ID)
+		if err != nil {
+			t.Fatalf("Get() error = %v", err)
+		}
+		if got.ID != run.ID {
+			t.Fatalf("Get().ID = %q, want %q", got.ID, run.ID)
+		}
+	})
+
+	t.Run("Should use injected defaults in start effective config", func(t *testing.T) {
+		t.Parallel()
+
+		store := newFakeLoopStore()
+		svc := newTestServiceWithOptions(t, store, validDefinition(), loop.WithDefaults(loop.LoopDefaults{
+			Delivery: loop.LoopConfig{BudgetTokens: new(4444)},
+		}))
+
+		run, err := svc.Start(
+			t.Context(),
+			"ws-1",
+			"valid-loop",
+			loop.Inputs{ProfileID: storepkg.DefaultProfileID,
+				Values: map[string]any{"tasks": "task-ref"},
+			},
+			humanActor(t),
+		)
+		if err != nil {
+			t.Fatalf("Start() error = %v", err)
+		}
+		if run.BudgetTokens != 4444 {
+			t.Fatalf("BudgetTokens = %d, want injected default 4444", run.BudgetTokens)
+		}
+	})
+}
+
+func TestResolveInputsShouldApplyDefaultsAndValidateTypes(t *testing.T) {
+	t.Parallel()
+
+	t.Run("Should apply defaults and clone nested values", func(t *testing.T) {
+		t.Parallel()
+
+		def := validDefinition()
+		def.Inputs = map[string]dsl.Input{
+			"name": {Type: dsl.InputTypeString, Required: true},
+			"flag": {Type: dsl.InputTypeBoolean, Default: true},
+		}
+		resolved, err := loop.ResolveInputs(def, loop.Inputs{Values: map[string]any{"name": "loop"}})
+		if err != nil {
+			t.Fatalf("ResolveInputs() error = %v", err)
+		}
+		if resolved["flag"] != true {
+			t.Fatalf("resolved flag = %#v, want true", resolved["flag"])
+		}
+	})
+
+	t.Run("Should reject invalid declared input types", func(t *testing.T) {
+		t.Parallel()
+
+		def := validDefinition()
+		def.Inputs = map[string]dsl.Input{"count": {Type: dsl.InputTypeNumber, Required: true}}
+		_, err := loop.ResolveInputs(def, loop.Inputs{Values: map[string]any{"count": "not-a-number"}})
+		if !errors.Is(err, loop.ErrValidation) {
+			t.Fatalf("ResolveInputs() error = %v, want ErrValidation", err)
+		}
+	})
+
+	t.Run("Should normalize runtime objects and accept enum members", func(t *testing.T) {
+		t.Parallel()
+
+		def := validDefinition()
+		def.Inputs = map[string]dsl.Input{
+			"environment": {
+				Type: dsl.InputTypeString, Enum: []string{"dev", "prod"}, Required: true,
+			},
+			"runtime": {Type: dsl.InputTypeRuntime, Required: true},
+		}
+		resolved, err := loop.ResolveInputs(def, loop.Inputs{Values: map[string]any{
+			"environment": "prod",
+			"runtime":     map[string]any{"model": " gpt-5 ", "reasoning": "high"},
+		}})
+		if err != nil {
+			t.Fatalf("ResolveInputs() error = %v", err)
+		}
+		wantRuntime := map[string]any{"model": "gpt-5", "reasoning": "high"}
+		if !reflect.DeepEqual(resolved["runtime"], wantRuntime) {
+			t.Fatalf("resolved runtime = %#v, want %#v", resolved["runtime"], wantRuntime)
+		}
+	})
+
+	t.Run("Should preserve an empty partial runtime object", func(t *testing.T) {
+		t.Parallel()
+
+		def := validDefinition()
+		def.Inputs = map[string]dsl.Input{
+			"runtime": {Type: dsl.InputTypeRuntime, Required: true},
+		}
+		resolved, err := loop.ResolveInputs(def, loop.Inputs{Values: map[string]any{
+			"runtime": map[string]any{},
+		}})
+		if err != nil {
+			t.Fatalf("ResolveInputs() error = %v", err)
+		}
+		if runtime, ok := resolved["runtime"].(map[string]any); !ok || len(runtime) != 0 {
+			t.Fatalf("resolved runtime = %#v, want empty object", resolved["runtime"])
+		}
+	})
+
+	t.Run("Should reject unsupported speed in a direct runtime spec", func(t *testing.T) {
+		t.Parallel()
+
+		def := validDefinition()
+		def.Inputs = map[string]dsl.Input{
+			"runtime": {Type: dsl.InputTypeRuntime, Required: true},
+		}
+		_, err := loop.ResolveInputs(def, loop.Inputs{Values: map[string]any{
+			"runtime": dsl.RuntimeSpec{Speed: speedpkg.Speed("turbo")},
+		}})
+		validation, ok := loop.AsInputValidationError(err)
+		if !ok || validation.Field != "runtime" ||
+			validation.Reason != loop.InputValidationReasonInvalidKindPayload {
+			t.Fatalf("ResolveInputs() error = %#v, want runtime validation error", err)
+		}
+	})
+
+	t.Run("Should reject values outside a declared enum", func(t *testing.T) {
+		t.Parallel()
+
+		def := validDefinition()
+		def.Inputs = map[string]dsl.Input{
+			"environment": {Type: dsl.InputTypeString, Enum: []string{"dev", "prod"}},
+		}
+		_, err := loop.ResolveInputs(def, loop.Inputs{Values: map[string]any{"environment": "staging"}})
+		validation, ok := loop.AsInputValidationError(err)
+		if !ok || validation.Field != "environment" ||
+			validation.Reason != loop.InputValidationReasonEnumMismatch {
+			t.Fatalf("ResolveInputs() error = %#v, want environment enum mismatch", err)
+		}
+	})
+
+	t.Run("Should resolve run workspace global and definition values by presence", func(t *testing.T) {
+		t.Parallel()
+
+		def := validDefinition()
+		def.Inputs = map[string]dsl.Input{
+			"task_name":   {Type: dsl.InputTypeString, Required: true},
+			"auto_commit": {Type: dsl.InputTypeBoolean, Default: false},
+			"retries":     {Type: dsl.InputTypeNumber, Default: 5},
+			"reviewer":    {Type: dsl.InputTypeString, Default: "reviewer"},
+		}
+		resolved, err := loop.ResolveInputDefaults(
+			def,
+			"valid-loop",
+			map[string]any{"task_name": "run-task", "auto_commit": false},
+			loop.InputDefaultLayers{
+				Global: map[string]any{"auto_commit": true, "retries": int64(0)},
+				Workspace: map[string]any{
+					"auto_commit": true,
+					"reviewer":    "",
+				},
+			},
+		)
+		if err != nil {
+			t.Fatalf("ResolveInputDefaults() error = %v", err)
+		}
+		wantValues := map[string]any{
+			"task_name": "run-task", "auto_commit": false, "retries": int64(0), "reviewer": "",
+		}
+		if !reflect.DeepEqual(resolved.Values, wantValues) {
+			t.Fatalf("resolved values = %#v, want %#v", resolved.Values, wantValues)
+		}
+		wantOrigins := map[string]loop.InputOrigin{
+			"task_name":   loop.InputOriginRun,
+			"auto_commit": loop.InputOriginRun,
+			"retries":     loop.InputOriginGlobal,
+			"reviewer":    loop.InputOriginWorkspace,
+		}
+		if !reflect.DeepEqual(resolved.Origins, wantOrigins) {
+			t.Fatalf("resolved origins = %#v, want %#v", resolved.Origins, wantOrigins)
+		}
+	})
+
+	t.Run("Should return typed errors for unknown and mismatched inputs", func(t *testing.T) {
+		t.Parallel()
+
+		def := validDefinition()
+		def.Inputs = map[string]dsl.Input{
+			"task_name":   {Type: dsl.InputTypeString, Required: true},
+			"auto_commit": {Type: dsl.InputTypeBoolean, Default: false},
+		}
+		cases := []struct {
+			name   string
+			run    map[string]any
+			layers loop.InputDefaultLayers
+			key    string
+			reason loop.InputValidationReason
+			origin loop.InputOrigin
+		}{
+			{
+				name: "Should reject an unknown configured key",
+				run:  map[string]any{"task_name": "task-09"},
+				layers: loop.InputDefaultLayers{
+					Workspace: map[string]any{"legacy_provider": "coderabbit"},
+				},
+				key: "legacy_provider", reason: loop.InputValidationReasonUnknownInput,
+				origin: loop.InputOriginWorkspace,
+			},
+			{
+				name: "Should reject an unknown run key",
+				run:  map[string]any{"task_name": "task-09", "legacy_provider": "coderabbit"},
+				key:  "legacy_provider", reason: loop.InputValidationReasonUnknownInput,
+				origin: loop.InputOriginRun,
+			},
+			{
+				name: "Should reject a configured type mismatch",
+				run:  map[string]any{"task_name": "task-09"},
+				layers: loop.InputDefaultLayers{
+					Global: map[string]any{"auto_commit": "true"},
+				},
+				key: "auto_commit", reason: loop.InputValidationReasonTypeMismatch,
+				origin: loop.InputOriginGlobal,
+			},
+		}
+		for _, tt := range cases {
+			t.Run(tt.name, func(t *testing.T) {
+				t.Parallel()
+				_, err := loop.ResolveInputDefaults(def, "valid-loop", tt.run, tt.layers)
+				validation, ok := loop.AsInputValidationError(err)
+				if !ok || validation.Loop != "valid-loop" || validation.Field != tt.key ||
+					validation.Reason != tt.reason || validation.Origin != tt.origin {
+					t.Fatalf("ResolveInputDefaults() error = %#v, want valid-loop/%s/%s", err, tt.key, tt.reason)
+				}
+			})
+		}
+	})
+
+	t.Run("Should validate definition defaults without consulting configured layers", func(t *testing.T) {
+		t.Parallel()
+
+		def := validDefinition()
+		def.Inputs = map[string]dsl.Input{
+			"auto_commit": {Type: dsl.InputTypeBoolean, Default: "true"},
+		}
+		_, err := loop.NewCompiler().Compile(def)
+		lintFailure, ok := errors.AsType[*loop.LintFailedError](err)
+		if !ok || !slices.ContainsFunc(lintFailure.Errors, func(item loop.LintError) bool {
+			return item.Path == "inputs.auto_commit.default" && item.Code == loop.CodeInputDefaultInvalid
+		}) {
+			t.Fatalf("Compile() error = %#v, want input default lint finding", err)
+		}
+	})
+}
+
+func TestServiceDryRunShouldReturnPlanPreviewWithoutState(t *testing.T) {
+	t.Parallel()
+
+	t.Run("Should return plan preview without creating loop run state", func(t *testing.T) {
+		t.Parallel()
+
+		store := newFakeLoopStore()
+		definition := validDefinition()
+		definition.Contract.Goal = "Complete {{ .inputs.tasks }}"
+		definition.Contract.DefinitionOfDone = "{{ .inputs.tasks }} is complete"
+		svc := newTestService(t, store, definition)
+
+		preview, err := svc.DryRun(
+			t.Context(),
+			"ws-1",
+			"valid-loop",
+			loop.Inputs{ProfileID: storepkg.DefaultProfileID,
+				Values: map[string]any{"tasks": "task-ref"},
+			},
+		)
+		if err != nil {
+			t.Fatalf("DryRun() error = %v", err)
+		}
+		if preview.Generation != 1 {
+			t.Fatalf("Generation = %d, want 1", preview.Generation)
+		}
+		if got, want := preview.ResolvedInputs["tasks"], "task-ref"; got != want {
+			t.Fatalf("ResolvedInputs[tasks] = %#v, want %q", got, want)
+		}
+		if got, want := preview.InputOrigins["tasks"], loop.InputOriginRun; got != want {
+			t.Fatalf("InputOrigins[tasks] = %q, want %q", got, want)
+		}
+		if len(preview.Nodes) == 0 {
+			t.Fatal("Nodes length = 0, want materialized gen-1 nodes")
+		}
+		if got, want := preview.Contract.Goal, "Complete {{ .inputs.tasks }}"; got != want {
+			t.Fatalf("Contract.Goal = %q, want raw authored contract %q", got, want)
+		}
+		if got, want := preview.MaterializedContract.Goal, "Complete task-ref"; got != want {
+			t.Fatalf("MaterializedContract.Goal = %q, want %q", got, want)
+		}
+		if got, want := preview.MaterializedContract.DefinitionOfDone, "task-ref is complete"; got != want {
+			t.Fatalf("MaterializedContract.DefinitionOfDone = %q, want %q", got, want)
+		}
+		if store.createCount() != 0 {
+			t.Fatalf("CreateLoopRun calls = %d, want 0", store.createCount())
+		}
+	})
+
+	t.Run("Should reject invalid effective runtime before creating loop run state", func(t *testing.T) {
+		t.Parallel()
+
+		definition := validDefinition()
+		definition.Contract.RuntimeDefaults = &dsl.RuntimeDefaults{
+			Worker: dsl.RuntimeSpec{Provider: "flarp"},
+		}
+		store := newFakeLoopStore()
+		svc := newTestServiceWithOptions(
+			t,
+			store,
+			definition,
+			loop.WithRuntimeCatalog(rejectingServiceRuntimeCatalogFactory{}),
+		)
+		inputs := loop.Inputs{ProfileID: storepkg.DefaultProfileID, Values: map[string]any{"tasks": "task-ref"}}
+
+		if _, err := svc.DryRun(t.Context(), "ws-1", "valid-loop", inputs); err == nil {
+			t.Fatal("DryRun() error = nil, want runtime validation")
+		} else if validation, ok := loop.AsRuntimeValidationError(err); !ok ||
+			len(validation.Items) != 1 || validation.Items[0].Reason != "unknown_provider" {
+			t.Fatalf("DryRun() error = %v, want unknown_provider runtime validation", err)
+		}
+		if _, err := svc.Start(
+			t.Context(),
+			"ws-1",
+			"valid-loop",
+			inputs,
+			humanActor(t),
+		); err == nil {
+			t.Fatal("Start() error = nil, want runtime validation")
+		} else if validation, ok := loop.AsRuntimeValidationError(err); !ok ||
+			len(validation.Items) != 1 || validation.Items[0].Reason != "unknown_provider" {
+			t.Fatalf("Start() error = %v, want unknown_provider runtime validation", err)
+		}
+		if store.createCount() != 0 {
+			t.Fatalf("CreateLoopRun calls = %d, want 0 after runtime validation", store.createCount())
+		}
+	})
+
+	t.Run("Should reject stale entity defaults with their winning origin", func(t *testing.T) {
+		t.Parallel()
+
+		definition := validDefinition()
+		definition.Inputs["reviewer"] = dsl.Input{
+			Type: dsl.InputTypeAgent, Required: true,
+		}
+		store := newFakeLoopStore()
+		svc := newTestServiceWithOptions(
+			t,
+			store,
+			definition,
+			loop.WithInputDefaultsResolver(func(
+				context.Context,
+				loop.WorkspaceID,
+				string,
+				string,
+			) (loop.InputDefaultLayers, error) {
+				return loop.InputDefaultLayers{
+					Workspace: map[string]any{"reviewer": "deleted-agent"},
+				}, nil
+			}),
+			loop.WithInputEntityCatalog(inputEntityCatalogStub{
+				missingKind: dsl.EntityKindAgent, missingValue: "deleted-agent",
+			}),
+		)
+
+		_, err := svc.DryRun(
+			t.Context(),
+			"ws-1",
+			"valid-loop",
+			loop.Inputs{ProfileID: storepkg.DefaultProfileID,
+				Values: map[string]any{"tasks": "task-ref"},
+			},
+		)
+		validation, ok := loop.AsInputValidationError(err)
+		if !ok || validation.Field != "reviewer" || validation.Kind != "agent" ||
+			validation.Value != "deleted-agent" || validation.Origin != loop.InputOriginWorkspace ||
+			validation.Reason != loop.InputValidationReasonUnknownReference {
+			t.Fatalf("DryRun() error = %#v, want stale workspace agent diagnostic", err)
+		}
+		if store.createCount() != 0 {
+			t.Fatalf("CreateLoopRun calls = %d, want 0 after entity validation", store.createCount())
+		}
+	})
+
+	t.Run("Should validate typed entities in the acting profile for start and dry-run", func(t *testing.T) {
+		t.Parallel()
+
+		definition := validDefinition()
+		definition.Inputs["implementer"] = dsl.Input{Type: dsl.InputTypeAgent, Required: true}
+		store := newFakeLoopStore()
+		profileIDs := make([]string, 0, 2)
+		svc := newTestServiceWithOptions(
+			t,
+			store,
+			definition,
+			loop.WithInputEntityCatalog(inputEntityCatalogStub{profileIDs: &profileIDs}),
+		)
+		inputs := loop.Inputs{ProfileID: "profile-engineering", Values: map[string]any{
+			"tasks": "task-ref", "implementer": "engineer",
+		}}
+
+		if _, err := svc.DryRun(t.Context(), "ws-1", "valid-loop", inputs); err != nil {
+			t.Fatalf("DryRun() error = %v", err)
+		}
+		if _, err := svc.Start(t.Context(), "ws-1", "valid-loop", inputs, humanActor(t)); err != nil {
+			t.Fatalf("Start() error = %v", err)
+		}
+		if got, want := len(profileIDs), 4; got != want {
+			t.Fatalf("entity validation calls = %d, want %d: %v", got, want, profileIDs)
+		}
+		for _, profileID := range profileIDs {
+			if profileID != "profile-engineering" {
+				t.Fatalf("entity validation profile = %q, want profile-engineering", profileID)
+			}
+		}
+	})
+
+	t.Run("Should reject an invalid runtime input before start and dry-run", func(t *testing.T) {
+		t.Parallel()
+
+		definition := validDefinition()
+		definition.Inputs["runtime"] = dsl.Input{Type: dsl.InputTypeRuntime, Required: true}
+		store := newFakeLoopStore()
+		svc := newTestServiceWithOptions(
+			t,
+			store,
+			definition,
+			loop.WithRuntimeCatalog(rejectingServiceRuntimeCatalogFactory{}),
+		)
+		inputs := loop.Inputs{ProfileID: storepkg.DefaultProfileID, Values: map[string]any{
+			"tasks": "task-ref", "runtime": map[string]any{
+				"provider": "flarp",
+				"acp_options": []any{
+					map[string]any{"id": "thinking", "bool_value": true},
+					map[string]any{"id": "context", "value_id": "secret-value"},
+				},
+			},
+		}}
+		for _, invoke := range []struct {
+			name string
+			call func() error
+		}{
+			{name: "Should reject dry-run", call: func() error {
+				_, err := svc.DryRun(t.Context(), "ws-1", "valid-loop", inputs)
+				return err
+			}},
+			{name: "Should reject start", call: func() error {
+				_, err := svc.Start(t.Context(), "ws-1", "valid-loop", inputs, humanActor(t))
+				return err
+			}},
+		} {
+			t.Run(invoke.name, func(t *testing.T) {
+				err := invoke.call()
+				validation, ok := loop.AsInputValidationError(err)
+				if !ok || validation.Field != "runtime" ||
+					validation.Reason != loop.InputValidationReasonInvalidRuntime ||
+					validation.Value != "flarp/-:acp_options=context,thinking" {
+					t.Fatalf("service error = %#v, want runtime input diagnostic", err)
+				}
+				if strings.Contains(validation.Value, "secret-value") {
+					t.Fatalf("diagnostic value = %q, want ACP option IDs without values", validation.Value)
+				}
+			})
+		}
+		if store.createCount() != 0 {
+			t.Fatalf("CreateLoopRun calls = %d, want 0 after runtime input validation", store.createCount())
+		}
+	})
+
+	t.Run("Should reject a definition snapshot that cannot round trip", func(t *testing.T) {
+		t.Parallel()
+
+		resolved := compileDefinition(t, validDefinition())
+		delete(resolved.Templates, "nodes.agent.params.prompt")
+		store := newFakeLoopStore()
+		svc, err := loop.NewService(
+			store,
+			loop.DefinitionResolverFunc(func(
+				context.Context,
+				loop.WorkspaceID,
+				string,
+				string,
+			) (*loop.ResolvedDefinition, error) {
+				return resolved, nil
+			}),
+			testGoalRunPolicyResolver(0.8),
+			loop.WithClock(func() time.Time {
+				return time.Date(2026, 7, 4, 12, 0, 0, 0, time.UTC)
+			}),
+			loop.WithRunIDFactory(func() (loop.RunID, error) {
+				return "looprun-preview", nil
+			}),
+		)
+		if err != nil {
+			t.Fatalf("NewService() error = %v", err)
+		}
+
+		_, err = svc.DryRun(
+			t.Context(),
+			"ws-1",
+			"valid-loop",
+			loop.Inputs{ProfileID: storepkg.DefaultProfileID,
+				Values: map[string]any{"tasks": "task-ref"},
+			},
+		)
+		if !errors.Is(err, loop.ErrValidation) || !strings.Contains(
+			err.Error(),
+			`template manifest key "nodes.agent.params.prompt" added during hydration`,
+		) {
+			t.Fatalf("DryRun() error = %v, want template key diagnostic", err)
+		}
+		if store.createCount() != 0 {
+			t.Fatalf("CreateLoopRun calls = %d, want 0 after snapshot validation", store.createCount())
+		}
+	})
+}
+
+func TestCostShouldBeDisplayOnly(t *testing.T) {
+	t.Parallel()
+
+	t.Run("Should derive cost as tokens multiplied by price", func(t *testing.T) {
+		t.Parallel()
+
+		cost := loop.DeriveDisplayCost(1500, 0.000002)
+		if math.Abs(cost.USD-0.003) > 0.0000001 {
+			t.Fatalf("USD = %.9f, want 0.003", cost.USD)
+		}
+	})
+}
+
+func inlineGoalDefinition(objective string, judgeModel string) dsl.Definition {
+	definition := validDefinition()
+	definition.Meta.Name = loop.InlineGoalLoopName
+	definition.Meta.Version = 1
+	definition.Concurrency = dsl.ConcurrencyAllow
+	definition.Inputs = map[string]dsl.Input{}
+	definition.Contract.Goal = objective
+	definition.Contract.DefinitionOfDone = "The objective is satisfied according to the Goal judge."
+	definition.Contract.RuntimeDefaults = nil
+	if strings.TrimSpace(judgeModel) != "" {
+		definition.Contract.RuntimeDefaults = &dsl.RuntimeDefaults{
+			Judge: dsl.RuntimeSpec{Model: judgeModel},
+		}
+	}
+	definition.Graph = dsl.Graph{Nodes: []dsl.Node{{
+		ID:    "goal",
+		Class: dsl.NodeClassAction,
+		Kind:  string(dsl.ActionGoal),
+		Session: &dsl.SessionSpec{
+			Mode: dsl.SessionModeContinuous,
+		},
+		Params: dsl.NodeParams{
+			"agent":     "operator-agent",
+			"objective": objective,
+			"judge": []dsl.GateCriterion{{
+				ID: "objective_satisfied", Type: dsl.CriterionAgentJudge, Rubric: objective,
+			}},
+			"max_turns": 3,
+			"output_schema": map[string]any{
+				"type": "object",
+				"properties": map[string]any{
+					"status": map[string]any{
+						"type": "string", "enum": []string{"complete", "blocked"},
+					},
+				},
+			},
+		},
+	}}, Edges: []dsl.Edge{}}
+	return definition
+}
+
+func inlineGoalOrigin(sessionID string) loop.RunOrigin {
+	return loop.RunOrigin{
+		Kind:               loop.RunOriginSession,
+		SessionID:          sessionID,
+		CreationProfileRef: "profile:sha256:origin",
+		PolicySpecDigest:   "policy:sha256:origin",
+		CreationDigest:     "creation:sha256:origin",
+	}
+}
+
+func TestServiceConstructorAndReasonErrorsShouldBeStable(t *testing.T) {
+	t.Parallel()
+
+	t.Run("Should reject missing service dependencies", func(t *testing.T) {
+		t.Parallel()
+
+		resolver := loop.DefinitionResolverFunc(func(
+			context.Context,
+			loop.WorkspaceID,
+			string,
+			string,
+		) (*loop.ResolvedDefinition, error) {
+			return nil, nil
+		})
+		goalPolicy := testGoalRunPolicyResolver(0.8)
+		if _, err := loop.NewService(nil, resolver, goalPolicy); !errors.Is(err, loop.ErrValidation) {
+			t.Fatalf("NewService(nil store) error = %v, want ErrValidation", err)
+		}
+		if _, err := loop.NewService(newFakeLoopStore(), nil, goalPolicy); !errors.Is(err, loop.ErrValidation) {
+			t.Fatalf("NewService(nil resolver) error = %v, want ErrValidation", err)
+		}
+		if _, err := loop.NewService(newFakeLoopStore(), resolver, nil); !errors.Is(err, loop.ErrValidation) {
+			t.Fatalf("NewService(nil Goal policy resolver) error = %v, want ErrValidation", err)
+		}
+	})
+
+	t.Run("Should render reason errors with deterministic metadata", func(t *testing.T) {
+		t.Parallel()
+
+		err := &loop.ReasonError{
+			Code: loop.ReasonCodeActiveRunExists,
+			Err:  loop.ErrConcurrencyConflict,
+			Meta: map[string]string{
+				"status":        "running",
+				"active_run_id": "run-1",
+			},
+		}
+		want := "active_loop_run_exists: loop: concurrency conflict " +
+			"(active_run_id=run-1, status=running)"
+		if got := err.Error(); got != want {
+			t.Fatalf("ReasonError.Error() = %q, want %q", got, want)
+		}
+		if !errors.Is(err, loop.ErrConcurrencyConflict) {
+			t.Fatalf("ReasonError does not unwrap ErrConcurrencyConflict")
+		}
+	})
+
+	t.Run("Should reject amendments without a declared output shape before store mutation", func(t *testing.T) {
+		t.Parallel()
+
+		definition := validDefinition()
+		delete(definition.Graph.Nodes[2].Params, "output_schema")
+		store := &amendmentFakeStore{fakeLoopStore: newFakeLoopStore()}
+		svc := newTestServiceWithOptions(t, store, definition)
+		run, err := svc.Start(
+			t.Context(),
+			"ws-1",
+			"valid-loop",
+			loop.Inputs{ProfileID: storepkg.DefaultProfileID,
+				Values: map[string]any{"tasks": "task-ref"},
+			},
+			humanActor(t),
+		)
+		if err != nil {
+			t.Fatalf("Start() error = %v", err)
+		}
+		_, err = svc.AmendNodeOutput(t.Context(), loop.AmendInput{
+			WorkspaceID: run.WorkspaceID, RunID: run.ID, Generation: 1, NodeID: "agent",
+			Payload: json.RawMessage(`{"summary":"repair"}`), Actor: humanActor(t),
+		})
+		if !errors.Is(err, loop.ErrAmendSchemaMissing) || store.amendCalled {
+			t.Fatalf("AmendNodeOutput(no schema) error = %v called=%v", err, store.amendCalled)
+		}
+	})
+}
+
+func TestServiceTimeTravelShouldPreserveHistoryContracts(t *testing.T) {
+	t.Parallel()
+
+	t.Run("Should produce complete generation and run diffs UT-083 through UT-089", func(t *testing.T) {
+		t.Parallel()
+
+		store := newTimeTravelFakeStore()
+		base := loop.Run{ID: "run-base", WorkspaceID: "ws-1", LoopName: "delivery", Status: loop.StatusDone,
+			Generation: 2, DefinitionDigest: "definition-a", Inputs: map[string]any{"service": "billing"}}
+		against := loop.Run{ID: "run-against", WorkspaceID: "ws-1", LoopName: "delivery", Status: loop.StatusRunning,
+			Generation: 2, DefinitionDigest: "definition-a", Inputs: map[string]any{"service": "payments"}}
+		store.seed(base)
+		store.seed(against)
+		large := json.RawMessage(`{"payload":"` + strings.Repeat("x", 17*1024) + `"}`)
+		store.payloads["base-change"] = json.RawMessage(`{"risk":"high"}`)
+		store.payloads["against-change"] = json.RawMessage(`{"risk":"medium"}`)
+		store.payloads["large-output"] = large
+		store.generationOutputs[base.ID] = []loop.GenerationOutput{
+			{Generation: 1, NodeID: "classify", Status: "succeeded", OutputRef: "base-change"},
+			{Generation: 1, NodeID: "carry", Status: "succeeded", OutputRef: "stable"},
+			{Generation: 1, NodeID: "large", Status: "succeeded", OutputRef: "large-output"},
+			{Generation: 2, NodeID: "in-flight", Status: "running"},
+		}
+		store.generationOutputs[against.ID] = []loop.GenerationOutput{
+			{Generation: 1, NodeID: "classify", Status: "succeeded", OutputRef: "against-change"},
+			{Generation: 1, NodeID: "carry", Status: "succeeded", OutputRef: "stable"},
+			{Generation: 1, NodeID: "new-node", Status: "succeeded"},
+			{Generation: 2, NodeID: "in-flight", Status: "running"},
+		}
+		store.verdicts[timeTravelHistoryKey(base.ID, 1)] = []gate.VerdictRecord{{
+			GateID: "quality", Outcome: gate.VerdictOutcomeRejected,
+			BlockingIssues: json.RawMessage(`[{"code":"risk"}]`), Criteria: json.RawMessage(`[]`),
+		}}
+		store.verdicts[timeTravelHistoryKey(against.ID, 1)] = []gate.VerdictRecord{{
+			GateID: "quality", Outcome: gate.VerdictOutcomeApproved,
+			BlockingIssues: json.RawMessage(`[]`), Criteria: json.RawMessage(`[]`),
+		}}
+		store.routes[timeTravelHistoryKey(base.ID, 1)] = []loop.RouteCause{{
+			NodeID: "triage", Route: "deep", Cause: "route_matched", MatchedWhen: `risk == "high"`,
+		}}
+		store.routes[timeTravelHistoryKey(against.ID, 1)] = []loop.RouteCause{{
+			NodeID: "triage", Route: "standard", Cause: "route_matched", MatchedWhen: `risk == "medium"`,
+		}}
+		svc := newTestServiceWithOptions(t, store, validDefinition()).(loop.TimeTravelService)
+
+		result, err := svc.DiffRun(t.Context(), "ws-1", loop.DiffQuery{
+			RunID: base.ID, AgainstRunID: against.ID,
+		})
+		if err != nil {
+			t.Fatalf("DiffRun() error = %v", err)
+		}
+		if result.Base.Generation != 1 || result.Against.Generation != 1 || !result.Against.AsOf {
+			t.Fatalf(
+				"diff endpoints = %#v/%#v, want latest settled generation and live as-of",
+				result.Base,
+				result.Against,
+			)
+		}
+		if result.Terminal == nil || result.Terminal.Base != loop.StatusDone ||
+			result.Terminal.Against != loop.StatusRunning {
+			t.Fatalf("terminal diff = %#v", result.Terminal)
+		}
+		if len(result.Inputs) != 1 || result.Inputs[0].Key != "service" {
+			t.Fatalf("input diff = %#v, want service row", result.Inputs)
+		}
+		changes := make(map[string]loop.DiffNodeRow, len(result.Nodes))
+		for _, row := range result.Nodes {
+			changes[row.NodeID+"/"+row.Change] = row
+		}
+		for _, key := range []string{"classify/changed", "carry/carried", "large/skipped", "new-node/rerun", "quality/verdict", "triage/changed"} {
+			if _, ok := changes[key]; !ok {
+				t.Fatalf("diff nodes = %#v, missing %s", result.Nodes, key)
+			}
+		}
+		if row := changes["large/skipped"]; row.Base.Size != len(large) ||
+			!strings.HasPrefix(row.Base.Hash, "sha256:") ||
+			row.Base.Inline != nil {
+			t.Fatalf("large diff row = %#v, want bounded size/hash summary", row)
+		}
+
+		same, err := svc.DiffRun(t.Context(), "ws-1", loop.DiffQuery{
+			RunID: base.ID, Generation: 1, AgainstGeneration: 1,
+		})
+		if err != nil || len(same.Nodes) != 0 {
+			t.Fatalf("self diff = %#v error=%v, want empty", same, err)
+		}
+
+		against.DefinitionDigest = "definition-b"
+		store.seed(against)
+		diverged, err := svc.DiffRun(t.Context(), "ws-1", loop.DiffQuery{
+			RunID: base.ID, Generation: 1, AgainstRunID: against.ID, AgainstGeneration: 1,
+		})
+		if err != nil || !diverged.DefinitionDivergence {
+			t.Fatalf("definition divergence = %#v error=%v", diverged, err)
+		}
+		for _, row := range diverged.Nodes {
+			if row.NodeID == "large" || row.NodeID == "new-node" {
+				t.Fatalf("divergent diff compared non-shared node: %#v", row)
+			}
+		}
+
+		foreign := against
+		foreign.ID, foreign.LoopName = "run-foreign", "other-loop"
+		store.seed(foreign)
+		_, err = svc.DiffRun(t.Context(), "ws-1", loop.DiffQuery{RunID: base.ID, AgainstRunID: foreign.ID})
+		if !errors.Is(err, loop.ErrDiffCrossLoop) {
+			t.Fatalf("cross-loop DiffRun() error = %v, want ErrDiffCrossLoop", err)
+		}
+	})
+
+	// Invariant: terminal runs may rerun past untouched pending dependents, while live runs and
+	// generations with active cells remain busy. The service time-travel suite owns this policy.
+	t.Run("Should record rerun intent provenance and guard live runs UT-070 through UT-077", func(t *testing.T) {
+		t.Parallel()
+
+		store := newTimeTravelFakeStore()
+		definition := validDefinition()
+		definition.Graph.Nodes = append(
+			definition.Graph.Nodes,
+			dsl.Node{
+				ID: "bridge", Class: dsl.NodeClassAction, Kind: string(dsl.ActionRunAgent),
+				Params: dsl.NodeParams{"agent": "codex", "prompt": "Bridge {{ .item.title }}"},
+			},
+			dsl.Node{
+				ID: "publish", Class: dsl.NodeClassAction, Kind: string(dsl.ActionRunAgent),
+				Params: dsl.NodeParams{"agent": "codex", "prompt": "Publish {{ .item.title }}"},
+			},
+		)
+		definition.Graph.Edges = append(
+			definition.Graph.Edges,
+			dsl.Edge{From: "agent", To: "bridge"},
+			dsl.Edge{From: "bridge", To: "publish"},
+		)
+		service := newTestServiceWithOptions(t, store, definition)
+		svc := service.(loop.TimeTravelService)
+		run, err := service.Start(
+			t.Context(),
+			"ws-1",
+			"valid-loop",
+			loop.Inputs{ProfileID: storepkg.DefaultProfileID,
+				Values: map[string]any{"tasks": "task-ref"},
+			},
+			humanActor(t),
+		)
+		if err != nil {
+			t.Fatalf("Start() error = %v", err)
+		}
+		store.mu.Lock()
+		terminal := store.runs[run.ID]
+		terminal.Status, terminal.Generation = loop.StatusDone, 1
+		store.runs[run.ID] = terminal
+		store.generationOutputs[run.ID] = []loop.GenerationOutput{
+			{Generation: 1, NodeID: "load", Status: "succeeded", OutputRef: "load"},
+			{Generation: 1, NodeID: "fan", Status: "succeeded", OutputRef: "fan"},
+			{Generation: 1, NodeID: "agent", Status: "failed", OutputRef: "agent"},
+			{Generation: 1, NodeID: "publish", Status: "pending"},
+		}
+		store.mu.Unlock()
+		actor := humanActor(t)
+		result, err := svc.RerunFromNode(t.Context(), loop.RerunInput{
+			WorkspaceID: run.WorkspaceID, RunID: run.ID, FromNode: "agent", Reason: "retry flaky provider",
+			RequestID: "rerun-1", Actor: actor,
+		})
+		if err != nil {
+			t.Fatalf("RerunFromNode() error = %v", err)
+		}
+		if result.Generation != 2 || result.ParentGeneration != 1 ||
+			!reflect.DeepEqual(result.RerunNodes, []string{"agent[0]", "publish[0]"}) {
+			t.Fatalf("rerun result = %#v", result)
+		}
+		if store.rerunRequest == nil || store.rerunRequest.Intent.Origin != loop.OriginOperatorRerun ||
+			store.rerunRequest.Operation.Actor.Actor != actor.Actor || store.rerunRequest.Operation.Reason != "retry flaky provider" {
+			t.Fatalf("rerun request = %#v, want operator_rerun provenance", store.rerunRequest)
+		}
+		var publish *loop.GenerationOutput
+		for index := range store.rerunRequest.NextOutputs {
+			if store.rerunRequest.NextOutputs[index].NodeID == "publish" {
+				publish = &store.rerunRequest.NextOutputs[index]
+				break
+			}
+		}
+		if publish == nil || publish.Status != "pending" {
+			t.Fatalf("publish rerun output = %#v, want pending across an unmaterialized bridge", publish)
+		}
+		store.rerunReplay = new(result)
+		store.replayDigest = store.rerunRequest.RequestDigest
+		terminal.Status = loop.StatusRunning
+		store.seed(terminal)
+		replay, err := svc.RerunFromNode(t.Context(), loop.RerunInput{
+			WorkspaceID: run.WorkspaceID, RunID: run.ID, FromNode: "agent", Reason: "retry flaky provider",
+			RequestID: "rerun-1", Actor: actor,
+		})
+		if err != nil || !replay.Replayed || replay.Generation != result.Generation ||
+			!reflect.DeepEqual(replay.RerunNodes, result.RerunNodes) {
+			t.Fatalf("RerunFromNode(replay) = %#v error=%v, want prior result", replay, err)
+		}
+		_, err = svc.RerunFromNode(t.Context(), loop.RerunInput{
+			WorkspaceID: run.WorkspaceID, RunID: run.ID, FromNode: "agent", Actor: actor,
+		})
+		if !errors.Is(err, loop.ErrRerunBusy) {
+			t.Fatalf("live RerunFromNode() error = %v, want ErrRerunBusy", err)
+		}
+		terminal.Status = loop.StatusDone
+		store.seed(terminal)
+		store.mu.Lock()
+		store.rerunReplay = nil
+		store.replayDigest = ""
+		store.generationOutputs[run.ID][0].Status = "pending"
+		store.mu.Unlock()
+		_, err = svc.RerunFromNode(t.Context(), loop.RerunInput{
+			WorkspaceID: run.WorkspaceID, RunID: run.ID, FromNode: "agent", RequestID: "rerun-unrelated-pending",
+			Actor: actor,
+		})
+		if !errors.Is(err, loop.ErrRerunBusy) {
+			t.Fatalf("unrelated pending RerunFromNode() error = %v, want ErrRerunBusy", err)
+		}
+		store.mu.Lock()
+		store.generationOutputs[run.ID][0].Status = "succeeded"
+		store.generationOutputs[run.ID][3].Status = "running"
+		store.mu.Unlock()
+		_, err = svc.RerunFromNode(t.Context(), loop.RerunInput{
+			WorkspaceID: run.WorkspaceID, RunID: run.ID, FromNode: "agent", RequestID: "rerun-busy-output",
+			Actor: actor,
+		})
+		if !errors.Is(err, loop.ErrRerunBusy) {
+			t.Fatalf("active output RerunFromNode() error = %v, want ErrRerunBusy", err)
+		}
+	})
+
+	t.Run("Should rerun the latest persisted generation when cancellation precedes its boundary", func(t *testing.T) {
+		t.Parallel()
+		store := newTimeTravelFakeStore()
+		service := newTestServiceWithOptions(t, store, validDefinition())
+		run, err := service.Start(t.Context(), "ws-1", "valid-loop", loop.Inputs{
+			ProfileID: storepkg.DefaultProfileID, Values: map[string]any{"tasks": "task-ref"},
+		}, humanActor(t))
+		if err != nil {
+			t.Fatalf("Start() error = %v", err)
+		}
+		run.Status, run.Generation = loop.StatusCanceled, 1
+		store.seed(*run)
+		store.generationOutputs[run.ID] = []loop.GenerationOutput{
+			{Generation: 1, NodeID: "load", Status: "succeeded", OutputRef: "old-load"},
+			{Generation: 1, NodeID: "agent", Status: "failed"},
+			{Generation: 2, NodeID: "load", Status: "succeeded", OutputRef: "latest-load"},
+			{Generation: 2, NodeID: "agent", Status: "canceled"},
+		}
+		svc := service.(loop.TimeTravelService)
+		input := loop.RerunInput{
+			WorkspaceID: run.WorkspaceID,
+			RunID:       run.ID,
+			FromNode:    "agent",
+			RequestID:   "rerun-latest",
+			Actor:       humanActor(t),
+		}
+		result, err := svc.RerunFromNode(t.Context(), input)
+		if err != nil {
+			t.Fatalf("RerunFromNode() error = %v", err)
+		}
+		if result.Generation != 3 || result.ParentGeneration != 2 {
+			t.Fatalf("rerun = %#v, want generation 3 from 2", result)
+		}
+		request := store.rerunRequest
+		if request.Source.Generation != 1 || *request.Operation.SourceGeneration != 2 {
+			t.Fatalf("rerun request = %#v, want original CAS and latest provenance", request)
+		}
+		for _, output := range request.NextOutputs {
+			if output.Generation != 3 {
+				t.Fatalf("output = %#v, want generation 3", output)
+			}
+			if output.NodeID == "load" && output.OutputRef != "latest-load" {
+				t.Fatalf("carried output = %#v, want latest result", output)
+			}
+		}
+		store.rerunReplay, store.replayDigest = &result, request.RequestDigest
+		replay, err := svc.RerunFromNode(t.Context(), input)
+		if err != nil || !replay.Replayed || replay.Generation != 3 {
+			t.Fatalf("replay = %#v, error = %v", replay, err)
+		}
+	})
+
+	t.Run("Should create an immutable seeded linked fork UT-078 through UT-082b", func(t *testing.T) {
+		t.Parallel()
+
+		store := newTimeTravelFakeStore()
+		definition := validDefinition()
+		definition.Inputs["tasks"] = dsl.Input{Type: dsl.InputTypeAgent, Required: true}
+		entityCatalog := inputEntityCatalogStub{
+			missingKind: dsl.EntityKindAgent, missingValue: "removed-reviewer",
+		}
+		svc := newTestServiceWithOptions(
+			t,
+			store,
+			definition,
+			loop.WithRunIDFactory(func() (loop.RunID, error) { return "fork-child", nil }),
+			loop.WithInputEntityCatalog(entityCatalog),
+		).(loop.TimeTravelService)
+		starter := newTestServiceWithOptions(
+			t,
+			store,
+			definition,
+			loop.WithRunIDFactory(func() (loop.RunID, error) {
+				return "fork-source", nil
+			}),
+			loop.WithInputEntityCatalog(entityCatalog),
+		)
+		source, err := starter.Start(
+			t.Context(),
+			"ws-1",
+			"valid-loop",
+			loop.Inputs{ProfileID: storepkg.DefaultProfileID,
+				Values: map[string]any{"tasks": "source-ref"},
+			},
+			humanActor(t),
+		)
+		if err != nil {
+			t.Fatalf("Start() error = %v", err)
+		}
+		store.mu.Lock()
+		source.Generation = 1
+		source.Status = loop.StatusDone
+		source.BestGeneration, source.BestScore = new(int64), new(0.91)
+		*source.BestGeneration = 1
+		store.runs[source.ID] = *source
+		store.generationOutputs[source.ID] = []loop.GenerationOutput{{
+			Generation: 1, NodeID: "agent", Status: "running", OutputRef: "source-output",
+		}}
+		store.mu.Unlock()
+		_, err = svc.ForkRun(t.Context(), loop.ForkInput{
+			WorkspaceID: source.WorkspaceID, RunID: source.ID, Generation: 1, Actor: humanActor(t),
+		})
+		if !errors.Is(err, loop.ErrForkGenerationUnknown) {
+			t.Fatalf("ForkRun(unsettled generation) error = %v, want ErrForkGenerationUnknown", err)
+		}
+		store.mu.Lock()
+		store.generationOutputs[source.ID][0].Status = "succeeded"
+		store.mu.Unlock()
+		before := store.mustRun(t, source.ID)
+		_, err = svc.ForkRun(t.Context(), loop.ForkInput{
+			WorkspaceID: source.WorkspaceID, RunID: source.ID, Generation: 1,
+			Inputs: map[string]any{"tasks": "removed-reviewer"}, Actor: humanActor(t),
+		})
+		validation, ok := loop.AsInputValidationError(err)
+		if !ok || validation.Field != "tasks" || validation.Value != "removed-reviewer" ||
+			validation.Origin != loop.InputOriginRun {
+			t.Fatalf("ForkRun(stale input) error = %#v, want typed input validation", err)
+		}
+		result, err := svc.ForkRun(t.Context(), loop.ForkInput{
+			WorkspaceID: source.WorkspaceID, RunID: source.ID, Generation: 1,
+			Inputs: map[string]any{"tasks": "reviewer"}, Reason: "try a safer path",
+			RequestID: "fork-1", Actor: humanActor(t),
+		})
+		if err != nil {
+			t.Fatalf("ForkRun() error = %v", err)
+		}
+		forkedFrom := result.Run.ForkedFromSnapshot()
+		if result.Run.ID != "fork-child" || result.Run.Generation != 1 || forkedFrom == nil ||
+			forkedFrom.RunID != source.ID || forkedFrom.Generation != 1 {
+			t.Fatalf("fork result = %#v", result)
+		}
+		if result.Run.DefinitionDigest != source.DefinitionDigest || result.Run.Inputs["tasks"] != "reviewer" {
+			t.Fatalf("fork snapshot/inputs = digest %q inputs %#v", result.Run.DefinitionDigest, result.Run.Inputs)
+		}
+		if store.forkRequest == nil || store.forkRequest.Operation.SourceGeneration == nil ||
+			*store.forkRequest.Operation.SourceGeneration != 1 || len(store.forkRequest.SeedOutputs) != 1 ||
+			store.forkRequest.SeedOutputs[0].Generation != 1 {
+			t.Fatalf("fork request = %#v, want generation-1 seed and ledger operation", store.forkRequest)
+		}
+		if after := store.mustRun(t, source.ID); !reflect.DeepEqual(before, after) {
+			t.Fatalf("source mutated by fork:\nbefore=%#v\nafter=%#v", before, after)
+		}
+	})
+}
+
+// Invariant: cancellation commits terminal truth before process-side cleanup, keeps
+// delivery failures retryable through the durable outbox, and never touches abandoned children.
+// The canonical Loop service suite owns orchestration around the storage transaction.
+func TestServiceCancellationShouldRecordCanceledTerminalTruth(t *testing.T) {
+	t.Parallel()
+
+	t.Run("Should commit terminal cancellation before stopping owned sessions", func(t *testing.T) {
+		t.Parallel()
+
+		store := newFakeLoopStore()
+		store.cancellationSessionIDs = []string{"session-work"}
+		run := seedFakeRun(store, loop.StatusRunning)
+		var observedStatus loop.Status
+		var stoppedSessionID string
+		svc := newTestServiceWithOptions(
+			t,
+			store,
+			validDefinition(),
+			loop.WithCancellationSessionController(loop.CancellationSessionControllerFuncs{
+				Stop: func(_ context.Context, sessionID, _ string) error {
+					store.mu.Lock()
+					observedStatus = store.runs[run.ID].Status
+					store.mu.Unlock()
+					stoppedSessionID = sessionID
+					return nil
+				},
+			}),
+		)
+
+		if err := svc.CancelRun(t.Context(), run.WorkspaceID, run.ID, "operator request", humanActor(t)); err != nil {
+			t.Fatalf("CancelRun() error = %v", err)
+		}
+		if got := store.mustRun(t, run.ID).Status; got != loop.StatusCanceled {
+			t.Fatalf("stored status = %q, want canceled", got)
+		}
+		if observedStatus != loop.StatusCanceled {
+			t.Fatalf("status observed during Stop = %q, want canceled", observedStatus)
+		}
+		if stoppedSessionID != "session-work" {
+			t.Fatalf("stopped session = %q, want session-work", stoppedSessionID)
+		}
+		if got := store.lastTransition(t).cause; got != loop.TransitionCauseOperatorCancel {
+			t.Fatalf("transition cause = %q, want operator_cancel", got)
+		}
+	})
+
+	t.Run("Should force one node and retain on cancel effects", func(t *testing.T) {
+		t.Parallel()
+
+		store := newFakeLoopStore()
+		store.cancellationSessionIDs = []string{"session-cell-3"}
+		definition := validDefinition()
+		definition.Graph.Nodes[2].Normalize()
+		definition.Graph.Nodes[2].OnCancel = []dsl.EffectSpec{{Emit: &dsl.EmitSpec{Kind: "cell_canceled"}}}
+		var stopped []string
+		var activated task.Run
+		svc := newTestServiceWithOptions(
+			t,
+			store,
+			definition,
+			loop.WithCancellationSessionController(loop.CancellationSessionControllerFuncs{
+				Stop: func(_ context.Context, sessionID, _ string) error {
+					stopped = append(stopped, sessionID)
+					return nil
+				},
+			}),
+			loop.WithCoordinatorRunActivator(loop.CoordinatorRunActivatorFunc(func(_ context.Context, run task.Run) {
+				activated = run
+			})),
+		)
+		run, err := svc.Start(
+			t.Context(),
+			"ws-1",
+			"valid-loop",
+			loop.Inputs{ProfileID: storepkg.DefaultProfileID, Values: map[string]any{"tasks": "task-ref"}},
+			humanActor(t),
+		)
+		if err != nil {
+			t.Fatalf("Start() error = %v", err)
+		}
+		itemIndex := 3
+		if err := svc.CancelNode(
+			t.Context(), run.WorkspaceID, run.ID, "agent", &itemIndex, "operator request", humanActor(t),
+		); err != nil {
+			t.Fatalf("CancelNode() error = %v", err)
+		}
+		request := store.lastCancellationRequest(t)
+		if request.ItemIndex == nil || *request.ItemIndex != itemIndex || len(request.Effects) != 1 {
+			t.Fatalf("node cancellation request = %#v", request)
+		}
+		if !reflect.DeepEqual(stopped, []string{"session-cell-3"}) {
+			t.Fatalf("stopped sessions = %#v", stopped)
+		}
+		if activated.LoopRunID != string(run.ID) {
+			t.Fatalf("coordinator activation = %#v", activated)
+		}
+		if got := store.mustRun(t, run.ID).Status; got != loop.StatusRunning {
+			t.Fatalf("node cancellation changed run status to %q", got)
+		}
+	})
+
+	t.Run("Should accept committed cancellation when immediate Stop fails", func(t *testing.T) {
+		t.Parallel()
+
+		store := newFakeLoopStore()
+		store.cancellationSessionIDs = []string{"session-work"}
+		run := seedFakeRun(store, loop.StatusRunning)
+		svc := newTestServiceWithOptions(
+			t,
+			store,
+			validDefinition(),
+			loop.WithCancellationSessionController(loop.CancellationSessionControllerFuncs{
+				Stop: func(context.Context, string, string) error {
+					return errors.New("provider stop unavailable")
+				},
+			}),
+		)
+		if err := svc.CancelRun(t.Context(), run.WorkspaceID, run.ID, "operator request", humanActor(t)); err != nil {
+			t.Fatalf("CancelRun() error = %v, want committed cancellation", err)
+		}
+		if got := store.mustRun(t, run.ID).Status; got != loop.StatusCanceled {
+			t.Fatalf("stored status = %q, want canceled", got)
+		}
+	})
+
+	t.Run("Should make repeated cancellation idempotent", func(t *testing.T) {
+		t.Parallel()
+
+		store := newFakeLoopStore()
+		store.cancellationSessionIDs = []string{"session-work"}
+		run := seedFakeRun(store, loop.StatusRunning)
+		stops := 0
+		svc := newTestServiceWithOptions(
+			t,
+			store,
+			validDefinition(),
+			loop.WithCancellationSessionController(loop.CancellationSessionControllerFuncs{
+				Stop: func(context.Context, string, string) error {
+					stops++
+					return nil
+				},
+			}),
+		)
+		for range 2 {
+			if err := svc.CancelRun(
+				t.Context(),
+				run.WorkspaceID,
+				run.ID,
+				"operator request",
+				humanActor(t),
+			); err != nil {
+				t.Fatalf("CancelRun() error = %v", err)
+			}
+		}
+		if stops != 1 {
+			t.Fatalf("Stop() calls = %d, want 1", stops)
+		}
+	})
+
+	t.Run("Should force terminate children and leave abandoned children running", func(t *testing.T) {
+		t.Parallel()
+
+		definition := validDefinition()
+		definition.Graph.Nodes[2] = dsl.Node{
+			ID: "agent", Class: dsl.NodeClassAction, Kind: string(dsl.ActionRunLoop),
+			Params: dsl.NodeParams{"loop": "child-loop", "mode": string(dsl.RunLoopAwait)},
+		}
+		definition.Graph.Nodes = append(definition.Graph.Nodes, dsl.Node{
+			ID: "abandon_child", Class: dsl.NodeClassAction, Kind: string(dsl.ActionRunLoop),
+			Params:             dsl.NodeParams{"loop": "child-loop", "mode": string(dsl.RunLoopAwait)},
+			NodeLifecycleState: &dsl.NodeLifecycleState{OnParentClose: dsl.ParentCloseAbandon},
+		})
+		definition.Graph.Edges = append(definition.Graph.Edges, dsl.Edge{From: "fan", To: "abandon_child"})
+		store := newFakeLoopStore()
+		svc := newTestService(t, store, definition)
+		parent, err := svc.Start(
+			t.Context(),
+			"ws-1",
+			"valid-loop",
+			loop.Inputs{ProfileID: storepkg.DefaultProfileID, Values: map[string]any{"tasks": "task-ref"}},
+			humanActor(t),
+		)
+		if err != nil {
+			t.Fatalf("Start() error = %v", err)
+		}
+		terminateChild := loop.Run{
+			ID: "child-terminate", WorkspaceID: parent.WorkspaceID, Status: loop.StatusRunning,
+			ParentLoopRunID: parent.ID,
+		}
+		abandonChild := loop.Run{
+			ID: "child-abandon", WorkspaceID: parent.WorkspaceID, Status: loop.StatusRunning,
+			ParentLoopRunID: parent.ID,
+		}
+		store.mu.Lock()
+		storedParent := store.runs[parent.ID]
+		storedParent.Generation = 1
+		store.runs[parent.ID] = storedParent
+		store.runs[terminateChild.ID] = terminateChild
+		store.runs[abandonChild.ID] = abandonChild
+		store.generationOutputs[parent.ID] = []loop.GenerationOutput{
+			{Generation: 1, NodeID: "agent", Status: "awaiting_child", ChildLoopRunID: string(terminateChild.ID)},
+			{Generation: 1, NodeID: "abandon_child", Status: "awaiting_child", ChildLoopRunID: string(abandonChild.ID)},
+		}
+		store.mu.Unlock()
+
+		if err := svc.CancelRun(
+			t.Context(),
+			parent.WorkspaceID,
+			parent.ID,
+			"operator request",
+			humanActor(t),
+		); err != nil {
+			t.Fatalf("CancelRun(parent) error = %v", err)
+		}
+		if got := store.mustRun(t, terminateChild.ID).Status; got != loop.StatusCanceled {
+			t.Fatalf("terminate child status = %q, want canceled", got)
+		}
+		if got := store.mustRun(t, abandonChild.ID).Status; got != loop.StatusRunning {
+			t.Fatalf("abandoned child status = %q, want running", got)
+		}
+	})
+
+	t.Run("Should revoke Goal prompt leases only after commit", func(t *testing.T) {
+		t.Parallel()
+
+		store := newFakeLoopStore()
+		run := seedFakeRun(store, loop.StatusRunning)
+		lease := loop.GoalPromptLease{QueueEntryID: "queue-1", SessionID: "session-goal", LoopRunID: string(run.ID)}
+		store.cancellationLeases = []loop.GoalPromptLease{lease}
+		var revoked []loop.GoalPromptLease
+		svc := newTestServiceWithOptions(
+			t,
+			store,
+			validDefinition(),
+			loop.WithGoalPromptLeaseRevoker(loop.GoalPromptLeaseRevokerFunc(func(
+				_ context.Context,
+				got loop.GoalPromptLease,
+				reason string,
+			) error {
+				if reason != string(loop.TransitionCauseOperatorCancel) {
+					t.Fatalf("revocation reason = %q", reason)
+				}
+				revoked = append(revoked, got)
+				return nil
+			})),
+		)
+		if err := svc.CancelRun(t.Context(), run.WorkspaceID, run.ID, "operator request", humanActor(t)); err != nil {
+			t.Fatalf("CancelRun() error = %v", err)
+		}
+		if !reflect.DeepEqual(revoked, []loop.GoalPromptLease{lease}) {
+			t.Fatalf("revoked leases = %#v", revoked)
+		}
+	})
+}
+
+func TestServiceNodePauseShouldRetryCancellationDelivery(t *testing.T) {
+	t.Parallel()
+
+	base := newFakeLoopStore()
+	base.seed(loop.Run{ID: "run-1", WorkspaceID: "ws-1", Status: loop.StatusRunning})
+	store := &nodePauseRetryStore{Store: base}
+	deliveries := 0
+	svc := newTestServiceWithOptions(
+		t,
+		store,
+		validDefinition(),
+		loop.WithCancellationSessionController(loop.CancellationSessionControllerFuncs{
+			Stop: func(context.Context, string, string) error {
+				deliveries++
+				if deliveries == 1 {
+					return errors.New("temporary cancellation delivery failure")
+				}
+				return nil
+			},
+		}),
+	)
+	nodes := svc.(loop.NodeLifecycleService)
+	actor := humanActor(t)
+	if _, err := nodes.PauseNode(
+		t.Context(), "ws-1", "run-1", "worker", nil, loop.NodePauseCancel, "repair", actor,
+	); err == nil {
+		t.Fatal("PauseNode(first) error = nil, want delivery failure")
+	}
+	result, err := nodes.PauseNode(
+		t.Context(), "ws-1", "run-1", "worker", nil, loop.NodePauseCancel, "repair", actor,
+	)
+	if err != nil {
+		t.Fatalf("PauseNode(retry) error = %v", err)
+	}
+	if result.Applied || deliveries != 2 {
+		t.Fatalf("PauseNode(retry) = %#v deliveries=%d, want replayed control and redelivery", result, deliveries)
+	}
+}
+
+func newTestService(t *testing.T, store *fakeLoopStore, def dsl.Definition) loop.Service {
+	t.Helper()
+
+	return newTestServiceWithOptions(t, store, def)
+}
+
+type inputEntityCatalogStub struct {
+	missingKind  dsl.EntityKind
+	missingValue string
+	profileIDs   *[]string
+}
+
+func (s inputEntityCatalogStub) HasInputEntity(
+	_ context.Context,
+	_ loop.WorkspaceID,
+	profileID string,
+	kind dsl.EntityKind,
+	value string,
+) (bool, error) {
+	if s.profileIDs != nil {
+		*s.profileIDs = append(*s.profileIDs, profileID)
+	}
+	return kind != s.missingKind || value != s.missingValue, nil
+}
+
+type nodePauseRetryStore struct {
+	loop.Store
+	calls int
+}
+
+func (s *nodePauseRetryStore) PauseNode(
+	context.Context,
+	loop.NodePauseMutation,
+) (loop.NodePauseResult, error) {
+	s.calls++
+	return loop.NodePauseResult{
+		Control:    loop.NodeControl{LoopRunID: "run-1", NodeID: "worker", Paused: true},
+		SessionIDs: []string{"session-worker"},
+		Applied:    s.calls == 1,
+	}, nil
+}
+
+func (s *nodePauseRetryStore) ResumeNode(
+	context.Context,
+	loop.NodeResumeMutation,
+) (loop.NodeResumeResult, error) {
+	return loop.NodeResumeResult{}, errors.New("unexpected ResumeNode call")
+}
+
+func TestServiceRespondShouldValidateAnnotatedEntityReferences(t *testing.T) {
+	t.Parallel()
+	t.Run("Should reject a stale nested response entity before admitting the request", func(t *testing.T) {
+		t.Parallel()
+
+		definition := validDefinition()
+		definition.Graph = dsl.Graph{Nodes: []dsl.Node{{
+			ID: "assign", Class: dsl.NodeClassControl, Kind: string(dsl.ControlAsk),
+			Params: dsl.NodeParams{
+				"prompt": "Choose a reviewer",
+				"expect": map[string]any{
+					"allOf": []any{
+						map[string]any{
+							"type": "object",
+							"properties": map[string]any{
+								"assignment": map[string]any{
+									"type": "object",
+									"properties": map[string]any{
+										"reviewers": map[string]any{
+											"type": "array",
+											"items": map[string]any{
+												"oneOf": []any{map[string]any{
+													"type": "string", "x-compozy-kind": "agent",
+												}},
+											},
+										},
+									},
+								},
+							},
+						},
+					},
+				},
+			},
+		}}}
+		expect := json.RawMessage(
+			`{"allOf":[{"type":"object","properties":{"assignment":{"type":"object","properties":{"reviewers":{"type":"array","items":{"oneOf":[{"type":"string","x-compozy-kind":"agent"}]}}}}}}]}`,
+		)
+		store := &requestValidationStore{
+			fakeLoopStore: newFakeLoopStore(),
+			request: loop.Request{
+				Kind:   loop.RequestKindAsk,
+				Expect: expect,
+			},
+		}
+		profileIDs := make([]string, 0, 3)
+		svc := newTestServiceWithOptions(
+			t,
+			store,
+			definition,
+			loop.WithInputEntityCatalog(inputEntityCatalogStub{
+				missingKind: dsl.EntityKindAgent, missingValue: "removed-reviewer",
+				profileIDs: &profileIDs,
+			}),
+		)
+		run, err := svc.Start(
+			t.Context(),
+			"ws-response",
+			definition.Meta.Name,
+			loop.Inputs{ProfileID: "profile-engineering",
+				Values: map[string]any{"tasks": "task-ref"},
+			},
+			humanActor(t),
+		)
+		if err != nil {
+			t.Fatalf("Start() error = %v", err)
+		}
+		respond := func(reviewer string) error {
+			_, respondErr := svc.Respond(t.Context(), loop.RespondInput{
+				WorkspaceID: run.WorkspaceID,
+				RunID:       run.ID,
+				Generation:  run.Generation,
+				NodeID:      "assign",
+				Decision:    loop.RequestDecisionRespond,
+				Payload: json.RawMessage(
+					fmt.Sprintf(`{"assignment":{"reviewers":[%q]}}`, reviewer),
+				),
+				Actor: humanActor(t),
+			})
+			return respondErr
+		}
+
+		err = respond("removed-reviewer")
+		validation, ok := loop.AsInputValidationError(err)
+		if !ok || validation.Field != "assignment.reviewers.0" || validation.Kind != "agent" ||
+			validation.Value != "removed-reviewer" || validation.Origin != loop.InputOriginResponse ||
+			validation.Reason != loop.InputValidationReasonUnknownReference {
+			t.Fatalf("Respond() error = %#v, want recursive stale agent diagnostic", err)
+		}
+		if store.respondCalls != 0 {
+			t.Fatalf("RespondRequest calls = %d, want 0 after entity rejection", store.respondCalls)
+		}
+
+		if err := respond("reviewer"); err != nil {
+			t.Fatalf("Respond(valid reviewer) error = %v", err)
+		}
+		if store.respondCalls != 1 {
+			t.Fatalf("RespondRequest calls = %d, want 1 after valid response", store.respondCalls)
+		}
+		for _, profileID := range profileIDs {
+			if profileID != "profile-engineering" {
+				t.Fatalf("response entity validation profile = %q, want persisted run profile", profileID)
+			}
+		}
+	})
+}
+
+func newTestServiceWithOptions(
+	t *testing.T,
+	store loop.Store,
+	def dsl.Definition,
+	opts ...loop.Option,
+) loop.Service {
+	t.Helper()
+
+	resolved := compileDefinition(t, def)
+	options := []loop.Option{
+		loop.WithClock(func() time.Time {
+			return time.Date(2026, 7, 4, 12, 0, 0, 0, time.UTC)
+		}),
+		loop.WithRunIDFactory(func() (loop.RunID, error) {
+			return loop.RunID("looprun-test"), nil
+		}),
+	}
+	options = append(options, opts...)
+	svc, err := loop.NewService(
+		store,
+		loop.DefinitionResolverFunc(func(
+			context.Context,
+			loop.WorkspaceID,
+			string,
+			string,
+		) (*loop.ResolvedDefinition, error) {
+			return resolved, nil
+		}),
+		testGoalRunPolicyResolver(0.8),
+		options...,
+	)
+	if err != nil {
+		t.Fatalf("NewService() error = %v", err)
+	}
+	return svc
+}
+
+func testGoalRunPolicyResolver(ratio float64) loop.GoalRunPolicyResolver {
+	return loop.GoalRunPolicyResolverFunc(func(
+		context.Context,
+		loop.WorkspaceID,
+	) (*loop.GoalRunPolicy, error) {
+		return &loop.GoalRunPolicy{ContextNudgeRatio: ratio}, nil
+	})
+}
+
+func newLifecycleTestService(
+	t *testing.T,
+	store loop.Store,
+	definition dsl.Definition,
+	opts ...loop.Option,
+) loop.Service {
+	t.Helper()
+	resolved := compileDefinition(t, validDefinition())
+	resolved.Definition = definition
+	options := []loop.Option{
+		loop.WithClock(func() time.Time {
+			return time.Date(2026, 7, 4, 12, 0, 0, 0, time.UTC)
+		}),
+		loop.WithRunIDFactory(func() (loop.RunID, error) { return "looprun-test", nil }),
+	}
+	options = append(options, opts...)
+	svc, err := loop.NewService(
+		store,
+		loop.DefinitionResolverFunc(func(
+			context.Context,
+			loop.WorkspaceID,
+			string,
+			string,
+		) (*loop.ResolvedDefinition, error) {
+			return resolved, nil
+		}),
+		testGoalRunPolicyResolver(0.8),
+		options...,
+	)
+	if err != nil {
+		t.Fatalf("NewService() error = %v", err)
+	}
+	return svc
+}
+
+type lifecycleHookDispatcher struct {
+	loop.HookDispatcher
+	started          hookspkg.LoopStartedPayload
+	terminal         hookspkg.LoopTerminalPayload
+	cancelStarted    context.CancelFunc
+	cancelTerminal   context.CancelFunc
+	startedActive    bool
+	startedDeadline  bool
+	terminalActive   bool
+	terminalDeadline bool
+}
+
+func (d *lifecycleHookDispatcher) DispatchLoopStarted(
+	ctx context.Context,
+	payload hookspkg.LoopStartedPayload,
+) (hookspkg.LoopStartedPayload, error) {
+	d.cancelStarted()
+	_, d.startedDeadline = ctx.Deadline()
+	d.startedActive = ctx.Err() == nil
+	d.started = payload
+	return payload, nil
+}
+
+func (d *lifecycleHookDispatcher) DispatchLoopTerminal(
+	ctx context.Context,
+	payload hookspkg.LoopTerminalPayload,
+) (hookspkg.LoopTerminalPayload, error) {
+	d.cancelTerminal()
+	_, d.terminalDeadline = ctx.Deadline()
+	d.terminalActive = ctx.Err() == nil
+	d.terminal = payload
+	return payload, nil
+}
+
+func compileDefinition(t *testing.T, def dsl.Definition) *loop.ResolvedDefinition {
+	t.Helper()
+
+	resolved, err := loop.NewCompiler(
+		loop.WithCompilerToolSchemaSource(fakeToolSchemas{}),
+	).Compile(def)
+	if err != nil {
+		t.Fatalf("Compile() error = %v", err)
+	}
+	return resolved
+}
+
+func seedFakeRun(store *fakeLoopStore, status loop.Status) loop.Run {
+	run := loop.Run{
+		ID:                loop.RunID("run-" + string(status)),
+		WorkspaceID:       "ws-1",
+		LoopName:          "valid-loop",
+		Status:            status,
+		ReattemptStrategy: loop.ReattemptFailedOnly,
+		CreatedAt:         time.Date(2026, 7, 4, 12, 0, 0, 0, time.UTC),
+		LastProgressAt:    time.Date(2026, 7, 4, 12, 0, 0, 0, time.UTC),
+		BudgetOnExceeded:  dsl.BudgetExceededHalt,
+		Inputs:            map[string]any{"tasks": "task-ref"},
+	}
+	store.seed(run)
+	return run
+}
+
+type fakeTransition struct {
+	runID loop.RunID
+	from  loop.Status
+	to    loop.Status
+	cause loop.TransitionCause
+}
+
+type rejectingServiceRuntimeCatalogFactory struct{}
+
+func (rejectingServiceRuntimeCatalogFactory) ForWorkspace(
+	context.Context,
+	loop.WorkspaceID,
+	string,
+) (loop.RuntimeCatalog, error) {
+	return rejectingServiceRuntimeCatalog{}, nil
+}
+
+type rejectingServiceRuntimeCatalog struct{}
+
+func (rejectingServiceRuntimeCatalog) CanonicalProvider(provider string) string {
+	return strings.TrimSpace(provider)
+}
+
+func (rejectingServiceRuntimeCatalog) ValidateRuntime(_ context.Context, runtime loop.RuntimeSpec) error {
+	if runtime.Provider != "flarp" {
+		return nil
+	}
+	return loop.NewRuntimeValidationError(loop.RuntimeValidationItem{
+		Field: "provider", Value: runtime.Provider, Reason: "unknown_provider",
+	})
+}
+
+type fakeLoopStore struct {
+	mu                               sync.Mutex
+	runs                             map[loop.RunID]loop.Run
+	configs                          map[string]loop.LoopConfig
+	snapshots                        map[string]loop.DefinitionSnapshot
+	decisions                        map[string]map[string]gate.HumanDecision
+	transitions                      []fakeTransition
+	goalControl                      *loop.GoalControlState
+	goalReactivations                []loop.GoalReactivationRequest
+	inlineReplaceRevokedPromptLeases []loop.GoalPromptLease
+	cancellationRequests             []loop.CancellationMutation
+	cancellationSessionIDs           []string
+	cancellationLeases               []loop.GoalPromptLease
+	cancellationErr                  error
+	cancellationErrByRun             map[loop.RunID]error
+	generationOutputs                map[loop.RunID][]loop.GenerationOutput
+	waitResumeMutation               *loop.WaitResumeMutation
+	creates                          int
+	getRunByID                       func(loop.RunID) (loop.Run, error)
+}
+
+type requestValidationStore struct {
+	*fakeLoopStore
+	request      loop.Request
+	respondCalls int
+}
+
+func (s *requestValidationStore) ListRequests(
+	context.Context,
+	loop.WorkspaceID,
+	loop.RequestQuery,
+) (loop.RequestPage, error) {
+	return loop.RequestPage{Items: []loop.Request{}}, nil
+}
+
+func (s *requestValidationStore) GetRequest(
+	context.Context,
+	loop.WorkspaceID,
+	loop.RequestRef,
+	bool,
+) (loop.Request, error) {
+	return s.request, nil
+}
+
+func (s *requestValidationStore) RespondRequest(
+	_ context.Context,
+	_ loop.RespondInput,
+) (loop.RespondResult, error) {
+	s.respondCalls++
+	return loop.RespondResult{Request: s.request, Won: true}, nil
+}
+
+type amendmentFakeStore struct {
+	*fakeLoopStore
+	amendCalled bool
+}
+
+type timeTravelFakeStore struct {
+	*fakeLoopStore
+	payloads     map[string]json.RawMessage
+	verdicts     map[string][]gate.VerdictRecord
+	routes       map[string][]loop.RouteCause
+	rerunRequest *loop.RerunStoreRequest
+	forkRequest  *loop.ForkStoreRequest
+	rerunReplay  *loop.RerunResult
+	replayDigest string
+}
+
+func newTimeTravelFakeStore() *timeTravelFakeStore {
+	return &timeTravelFakeStore{
+		fakeLoopStore: newFakeLoopStore(),
+		payloads:      map[string]json.RawMessage{},
+		verdicts:      map[string][]gate.VerdictRecord{},
+		routes:        map[string][]loop.RouteCause{},
+	}
+}
+
+func (s *timeTravelFakeStore) GetGenerationOutputPayload(
+	_ context.Context,
+	key loop.GenerationOutputPayloadKey,
+) (json.RawMessage, error) {
+	payload, ok := s.payloads[key.OutputRef]
+	if !ok {
+		return nil, loop.ErrOutputRefNotFound
+	}
+	return append(json.RawMessage(nil), payload...), nil
+}
+
+func (s *timeTravelFakeStore) ListGateVerdicts(
+	_ context.Context,
+	_ string,
+	runID string,
+	generation int64,
+) ([]gate.VerdictRecord, error) {
+	return append([]gate.VerdictRecord(nil), s.verdicts[timeTravelHistoryKey(loop.RunID(runID), generation)]...), nil
+}
+
+func (s *timeTravelFakeStore) ListRouteCausingVerdicts(
+	context.Context,
+	string,
+	string,
+	int64,
+) ([]gate.VerdictRecord, error) {
+	return nil, nil
+}
+
+func (s *timeTravelFakeStore) ListRouteCauses(
+	_ context.Context,
+	_ loop.WorkspaceID,
+	runID loop.RunID,
+	generation int64,
+) ([]loop.RouteCause, error) {
+	return append([]loop.RouteCause(nil), s.routes[timeTravelHistoryKey(runID, generation)]...), nil
+}
+
+func (s *timeTravelFakeStore) ListGenerations(
+	_ context.Context,
+	workspaceID, runID string,
+) ([]loop.LoopGeneration, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	run, ok := s.runs[loop.RunID(runID)]
+	if !ok || string(run.WorkspaceID) != workspaceID {
+		return nil, loop.ErrRunNotFound
+	}
+	seen := map[int]bool{run.Generation: true}
+	for _, output := range s.generationOutputs[run.ID] {
+		seen[output.Generation] = true
+	}
+	var result []loop.LoopGeneration
+	for generation := range seen {
+		result = append(result, loop.LoopGeneration{RunID: runID, Generation: int64(generation)})
+	}
+	return result, nil
+}
+
+func (s *timeTravelFakeStore) CreateRerun(
+	_ context.Context,
+	request loop.RerunStoreRequest,
+) (loop.RerunResult, bool, error) {
+	s.rerunRequest = new(request)
+	return loop.RerunResult{
+		RunID: request.Source.ID, Generation: request.Intent.Generation,
+		ParentGeneration: request.Intent.ParentGeneration,
+	}, false, nil
+}
+
+func (s *timeTravelFakeStore) LookupRerunReplay(
+	_ context.Context,
+	_ loop.WorkspaceID,
+	key string,
+	digest string,
+) (loop.RerunResult, bool, error) {
+	if strings.TrimSpace(key) == "" || s.rerunReplay == nil {
+		return loop.RerunResult{}, false, nil
+	}
+	if digest != s.replayDigest {
+		return loop.RerunResult{}, false, loop.ErrTimeTravelKeyReuse
+	}
+	return *s.rerunReplay, true, nil
+}
+
+func (s *timeTravelFakeStore) CreateFork(
+	_ context.Context,
+	request loop.ForkStoreRequest,
+) (loop.Run, bool, error) {
+	s.forkRequest = new(request)
+	s.seed(*request.Child)
+	return *request.Child, false, nil
+}
+
+func (s *timeTravelFakeStore) ListForks(
+	context.Context,
+	loop.WorkspaceID,
+	loop.RunID,
+) ([]loop.ForkRef, error) {
+	return nil, nil
+}
+
+func timeTravelHistoryKey(runID loop.RunID, generation int64) string {
+	return string(runID) + "/" + strconv.FormatInt(generation, 10)
+}
+
+func (s *amendmentFakeStore) AmendNodeOutput(
+	context.Context,
+	loop.AmendInput,
+) (loop.NodeAmendment, error) {
+	s.amendCalled = true
+	return loop.NodeAmendment{}, nil
+}
+
+func (s *amendmentFakeStore) ListNodeAmendments(
+	context.Context,
+	loop.WorkspaceID,
+	loop.RunID,
+) ([]loop.NodeAmendment, error) {
+	return nil, nil
+}
+
+func newFakeLoopStore() *fakeLoopStore {
+	return &fakeLoopStore{
+		runs:              map[loop.RunID]loop.Run{},
+		configs:           map[string]loop.LoopConfig{},
+		snapshots:         map[string]loop.DefinitionSnapshot{},
+		decisions:         map[string]map[string]gate.HumanDecision{},
+		generationOutputs: map[loop.RunID][]loop.GenerationOutput{},
+	}
+}
+
+func (s *fakeLoopStore) ListGenerationOutputs(
+	_ context.Context,
+	workspaceID loop.WorkspaceID,
+	runID loop.RunID,
+	generation int,
+) ([]loop.GenerationOutput, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	run, ok := s.runs[runID]
+	if !ok || run.WorkspaceID != workspaceID {
+		return nil, loop.ErrRunNotFound
+	}
+	outputs := s.generationOutputs[runID]
+	result := make([]loop.GenerationOutput, 0, len(outputs))
+	for _, output := range outputs {
+		if output.Generation == generation {
+			result = append(result, output)
+		}
+	}
+	return result, nil
+}
+
+func (s *fakeLoopStore) seed(run loop.Run) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.runs[run.ID] = run
+}
+
+func (s *fakeLoopStore) mustRun(t *testing.T, id loop.RunID) loop.Run {
+	t.Helper()
+	run, err := s.GetLoopRunByID(t.Context(), id)
+	if err != nil {
+		t.Fatalf("GetLoopRunByID(%q) error = %v", id, err)
+	}
+	return run
+}
+
+func (s *fakeLoopStore) lastTransition(t *testing.T) fakeTransition {
+	t.Helper()
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if len(s.transitions) == 0 {
+		t.Fatal("transition count = 0, want at least one")
+	}
+	return s.transitions[len(s.transitions)-1]
+}
+
+func (s *fakeLoopStore) lastGoalReactivation(t *testing.T) loop.GoalReactivationRequest {
+	t.Helper()
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if len(s.goalReactivations) == 0 {
+		t.Fatal("Goal reactivation count = 0, want at least one")
+	}
+	return s.goalReactivations[len(s.goalReactivations)-1]
+}
+
+func (s *fakeLoopStore) lastCancellationRequest(t *testing.T) loop.CancellationMutation {
+	t.Helper()
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if len(s.cancellationRequests) == 0 {
+		t.Fatal("cancellation request count = 0, want at least one")
+	}
+	return s.cancellationRequests[len(s.cancellationRequests)-1]
+}
+
+func (s *fakeLoopStore) lastWaitResumeMutation(t *testing.T) loop.WaitResumeMutation {
+	t.Helper()
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.waitResumeMutation == nil {
+		t.Fatal("wait resume mutation = nil")
+	}
+	return *s.waitResumeMutation
+}
+
+func (s *fakeLoopStore) createCount() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.creates
+}
+
+func (s *fakeLoopStore) CreateLoopRunForStart(
+	_ context.Context,
+	run loop.Run,
+	policy dsl.ConcurrencyPolicy,
+) (loop.Run, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if policy == "" {
+		policy = dsl.ConcurrencyForbid
+	}
+	active := s.activeLoopRunLocked(run.WorkspaceID, run.LoopName)
+	switch policy {
+	case dsl.ConcurrencyForbid:
+		if active != nil {
+			return loop.Run{}, &loop.ReasonError{
+				Code: loop.ReasonCodeActiveRunExists,
+				Err:  loop.ErrConcurrencyConflict,
+				Meta: map[string]string{
+					"active_run_id": string(active.ID),
+					"loop_name":     active.LoopName,
+					"status":        string(active.Status),
+				},
+			}
+		}
+		run.Status = loop.StatusRunning
+	case dsl.ConcurrencyQueue:
+		if active != nil {
+			run.Status = loop.StatusQueued
+		} else {
+			run.Status = loop.StatusRunning
+		}
+	case dsl.ConcurrencyAllow:
+		run.Status = loop.StatusRunning
+	default:
+		return loop.Run{}, loop.ErrValidation
+	}
+	s.creates++
+	s.runs[run.ID] = run
+	s.snapshots[string(run.WorkspaceID)+"/"+run.DefinitionDigest] = loop.DefinitionSnapshot{
+		WorkspaceID: run.WorkspaceID,
+		Digest:      run.DefinitionDigest,
+		Version:     run.DefinitionVersion,
+		Definition:  run.DefinitionSnapshot,
+		ByteSize:    len(run.DefinitionSnapshot),
+		CreatedAt:   run.StartedAt,
+		LastUsedAt:  run.StartedAt,
+	}
+	return run, nil
+}
+
+func (s *fakeLoopStore) CreateInlineLoopRunForStart(
+	ctx context.Context,
+	run loop.Run,
+) (loop.Run, error) {
+	return s.CreateLoopRunForStart(ctx, run, dsl.ConcurrencyAllow)
+}
+
+func (s *fakeLoopStore) ReplaceInlineLoopRun(
+	_ context.Context,
+	request loop.InlineReplaceStoreRequest,
+) (loop.InlineReplaceStoreResult, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if request.Run == nil {
+		return loop.InlineReplaceStoreResult{}, loop.ErrValidation
+	}
+	old, ok := s.runs[request.ExpectedRunID]
+	if !ok || old.WorkspaceID != request.Run.WorkspaceID || !old.Status.Live() ||
+		old.Origin.Kind != loop.RunOriginSession || old.Origin.SessionID != request.Run.Origin.SessionID {
+		return loop.InlineReplaceStoreResult{}, &loop.ReasonError{
+			Code: loop.ReasonCodeGoalReplaceStale,
+			Err:  loop.ErrTransitionConflict,
+		}
+	}
+	old.Status = loop.StatusFailed
+	s.runs[old.ID] = old
+	created := *request.Run
+	created.Status = loop.StatusRunning
+	s.runs[created.ID] = created
+	s.creates++
+	s.snapshots[string(created.WorkspaceID)+"/"+created.DefinitionDigest] = loop.DefinitionSnapshot{
+		WorkspaceID: created.WorkspaceID,
+		Digest:      created.DefinitionDigest,
+		Version:     created.DefinitionVersion,
+		Definition:  created.DefinitionSnapshot,
+		ByteSize:    len(created.DefinitionSnapshot),
+		CreatedAt:   created.StartedAt,
+		LastUsedAt:  created.StartedAt,
+	}
+	return loop.InlineReplaceStoreResult{
+		ReplacedRunID: old.ID,
+		ReplacedRun:   old,
+		Run:           created,
+		RevokedPromptLeases: append(
+			[]loop.GoalPromptLease(nil),
+			s.inlineReplaceRevokedPromptLeases...,
+		),
+	}, nil
+}
+
+func (s *fakeLoopStore) ClearInlineGoal(
+	_ context.Context,
+	request loop.InlineGoalClearStoreRequest,
+) (loop.InlineGoalClearStoreResult, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	var newest *loop.Run
+	for _, candidate := range s.runs {
+		if candidate.WorkspaceID != request.WorkspaceID || candidate.Origin == nil ||
+			candidate.Origin.Kind != loop.RunOriginSession ||
+			candidate.Origin.SessionID != request.OriginSessionID {
+			continue
+		}
+		current := candidate
+		if newest == nil || current.CreatedAt.After(newest.CreatedAt) {
+			newest = &current
+		}
+	}
+	if newest == nil {
+		return loop.InlineGoalClearStoreResult{}, &loop.ReasonError{
+			Code: loop.ReasonCodeGoalNotActive,
+			Err:  loop.ErrTransitionConflict,
+		}
+	}
+	result := loop.InlineGoalClearStoreResult{Run: *newest}
+	if newest.Status.Live() {
+		newest.Status = loop.StatusFailed
+		s.runs[newest.ID] = *newest
+		result.Run = *newest
+		result.Terminalized = true
+	}
+	return result, nil
+}
+
+func (s *fakeLoopStore) GetLoopRun(
+	_ context.Context,
+	ws loop.WorkspaceID,
+	runID loop.RunID,
+) (loop.Run, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	run, ok := s.runs[runID]
+	if !ok || run.WorkspaceID != ws {
+		return loop.Run{}, loop.ErrRunNotFound
+	}
+	return run, nil
+}
+
+func (s *fakeLoopStore) GetLoopRunByID(_ context.Context, runID loop.RunID) (loop.Run, error) {
+	if s.getRunByID != nil {
+		return s.getRunByID(runID)
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	run, ok := s.runs[runID]
+	if !ok {
+		return loop.Run{}, loop.ErrRunNotFound
+	}
+	return run, nil
+}
+
+func (s *fakeLoopStore) ResumeWait(
+	_ context.Context,
+	mutation loop.WaitResumeMutation,
+) (loop.WaitResumeResult, error) {
+	if err := mutation.Validate(); err != nil {
+		return loop.WaitResumeResult{}, err
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.waitResumeMutation = new(mutation)
+	return loop.WaitResumeResult{Won: true}, nil
+}
+
+func (s *fakeLoopStore) RequestRunCancellation(
+	_ context.Context,
+	mutation loop.CancellationMutation,
+) (loop.CancellationResult, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.cancellationRequests = append(s.cancellationRequests, mutation)
+	if err := s.cancellationErrByRun[mutation.RunID]; err != nil {
+		return loop.CancellationResult{}, err
+	}
+	if s.cancellationErr != nil {
+		return loop.CancellationResult{}, s.cancellationErr
+	}
+	run, ok := s.runs[mutation.RunID]
+	if !ok || run.WorkspaceID != mutation.WorkspaceID {
+		return loop.CancellationResult{}, loop.ErrRunNotFound
+	}
+	if run.Status.Terminal() {
+		return loop.CancellationResult{Run: run, Terminal: true}, nil
+	}
+	result := loop.CancellationResult{
+		Run:                 run,
+		Applied:             true,
+		SessionIDs:          append([]string(nil), s.cancellationSessionIDs...),
+		RevokedPromptLeases: append([]loop.GoalPromptLease(nil), s.cancellationLeases...),
+	}
+	s.terminalizeCancellationLocked(run, &result)
+	return result, nil
+}
+
+func (s *fakeLoopStore) RequestNodeCancellation(
+	_ context.Context,
+	mutation loop.CancellationMutation,
+) (loop.CancellationResult, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.cancellationRequests = append(s.cancellationRequests, mutation)
+	if err := s.cancellationErrByRun[mutation.RunID]; err != nil {
+		return loop.CancellationResult{}, err
+	}
+	if s.cancellationErr != nil {
+		return loop.CancellationResult{}, s.cancellationErr
+	}
+	run, ok := s.runs[mutation.RunID]
+	if !ok || run.WorkspaceID != mutation.WorkspaceID {
+		return loop.CancellationResult{}, loop.ErrRunNotFound
+	}
+	if run.Status.Terminal() {
+		return loop.CancellationResult{Run: run, Terminal: true}, nil
+	}
+	result := loop.CancellationResult{
+		Run: run, Applied: true, SessionIDs: append([]string(nil), s.cancellationSessionIDs...),
+	}
+	coordinator := task.Run{
+		ID:          "run-node-cancel-wake-" + string(mutation.RunID),
+		WorkspaceID: string(mutation.WorkspaceID),
+		LoopRunID:   string(mutation.RunID),
+		RunKind:     task.RunKindCoordinator,
+	}
+	result.Coordinator = &coordinator
+	return result, nil
+}
+
+func (s *fakeLoopStore) terminalizeCancellationLocked(
+	run loop.Run,
+	result *loop.CancellationResult,
+) {
+	from := run.Status
+	run.Status = loop.StatusCanceled
+	s.runs[run.ID] = run
+	s.transitions = append(s.transitions, fakeTransition{
+		runID: run.ID, from: from, to: run.Status, cause: loop.TransitionCauseOperatorCancel,
+	})
+	result.Run = run
+	result.Terminal = true
+	result.RevokedPromptLeases = append([]loop.GoalPromptLease(nil), s.cancellationLeases...)
+}
+
+func (s *fakeLoopStore) LoadAwaitingGoalControl(
+	_ context.Context,
+	workspaceID loop.WorkspaceID,
+	runID loop.RunID,
+) (loop.GoalControlState, bool, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.goalControl == nil || s.goalControl.WorkspaceID != workspaceID || s.goalControl.LoopRunID != runID {
+		return loop.GoalControlState{}, false, nil
+	}
+	return *s.goalControl, true, nil
+}
+
+func (s *fakeLoopStore) ReactivateGoalRun(
+	_ context.Context,
+	req loop.GoalReactivationRequest,
+) (loop.GoalReactivationResult, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.goalControl == nil || s.goalControl.ControlEpoch != req.State.ControlEpoch {
+		return loop.GoalReactivationResult{}, loop.ErrTransitionConflict
+	}
+	s.goalReactivations = append(s.goalReactivations, req)
+	run, ok := s.runs[req.State.LoopRunID]
+	if !ok {
+		return loop.GoalReactivationResult{}, loop.ErrRunNotFound
+	}
+	run.Status = loop.StatusRunning
+	run.ActiveGateID = ""
+	run.SetActiveHumanCriteria(json.RawMessage(`[]`))
+	s.runs[run.ID] = run
+	s.goalControl = nil
+	return loop.GoalReactivationResult{
+		Run:          task.Run{ID: "goal-successor"},
+		ControlEpoch: req.State.ControlEpoch + 1,
+		GrantID:      int64(len(s.goalReactivations)),
+	}, nil
+}
+
+func (s *fakeLoopStore) ReactivateLoopCoordinator(
+	_ context.Context,
+	req *loop.CoordinatorReactivationRequest,
+) (loop.CoordinatorReactivationResult, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if req == nil {
+		return loop.CoordinatorReactivationResult{}, loop.ErrValidation
+	}
+	run, ok := s.runs[req.Run.ID]
+	if !ok || run.WorkspaceID != req.Run.WorkspaceID {
+		return loop.CoordinatorReactivationResult{}, loop.ErrRunNotFound
+	}
+	if run.Status != req.Run.Status || run.ActiveGateID != req.Run.ActiveGateID {
+		return loop.CoordinatorReactivationResult{}, loop.ErrTransitionConflict
+	}
+	for _, record := range req.Decisions {
+		key := gateDecisionKey(record.WorkspaceID, record.RunID, record.Generation, record.GateID)
+		if s.decisions[key] == nil {
+			s.decisions[key] = map[string]gate.HumanDecision{}
+		}
+		s.decisions[key][record.CriterionID] = gate.HumanDecision{
+			Decision: gate.HumanDecisionKind(record.Decision),
+			Actor:    record.Actor,
+			Note:     record.Note,
+		}
+	}
+	run.Status = loop.StatusRunning
+	run.PauseRequested = false
+	run.ActiveGateID = ""
+	run.SetActiveHumanCriteria(json.RawMessage(`[]`))
+	s.runs[run.ID] = run
+	s.transitions = append(s.transitions, fakeTransition{
+		runID: run.ID,
+		from:  req.Run.Status,
+		to:    loop.StatusRunning,
+		cause: req.Cause,
+	})
+	return loop.CoordinatorReactivationResult{
+		Run: task.Run{ID: "coordinator-successor", LoopRunID: string(run.ID)},
+	}, nil
+}
+
+func (s *fakeLoopStore) GetLoopDefinitionSnapshot(
+	_ context.Context,
+	ws loop.WorkspaceID, _ string,
+	digest string,
+) (loop.DefinitionSnapshot, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	snapshot, ok := s.snapshots[string(ws)+"/"+digest]
+	if !ok {
+		return loop.DefinitionSnapshot{}, loop.ErrRunNotFound
+	}
+	return snapshot, nil
+}
+
+func (s *fakeLoopStore) FindActiveLoopRun(
+	_ context.Context,
+	ws loop.WorkspaceID, _ string,
+	loopName string,
+) (*loop.Run, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.activeLoopRunLocked(ws, loopName), nil
+}
+
+func (s *fakeLoopStore) activeLoopRunLocked(ws loop.WorkspaceID, loopName string) *loop.Run {
+	var oldest *loop.Run
+	for _, run := range s.runs {
+		if run.WorkspaceID != ws || run.LoopName != loopName || !run.Status.Live() {
+			continue
+		}
+		candidate := run
+		if oldest == nil || candidate.CreatedAt.Before(oldest.CreatedAt) {
+			oldest = &candidate
+		}
+	}
+	return oldest
+}
+
+func (s *fakeLoopStore) CompareAndSwapLoopRunStatus(
+	_ context.Context,
+	runID loop.RunID,
+	from loop.Status,
+	to loop.Status,
+	cause loop.TransitionCause,
+	_ time.Time,
+) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	run, ok := s.runs[runID]
+	if !ok {
+		return loop.ErrRunNotFound
+	}
+	if run.Status != from {
+		return loop.ErrTransitionConflict
+	}
+	run.Status = to
+	if to == loop.StatusRunning || to == loop.StatusPaused || to.Terminal() {
+		run.PauseRequested = false
+		run.ActiveGateID = ""
+		run.SetActiveHumanCriteria(json.RawMessage(`[]`))
+	}
+	s.runs[runID] = run
+	s.transitions = append(
+		s.transitions,
+		fakeTransition{runID: runID, from: from, to: to, cause: cause},
+	)
+	return nil
+}
+
+func (s *fakeLoopStore) RecordLoopGateDecisions(
+	_ context.Context,
+	records []loop.GateDecisionRecord,
+) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for _, record := range records {
+		key := gateDecisionKey(record.WorkspaceID, record.RunID, record.Generation, record.GateID)
+		if s.decisions[key] == nil {
+			s.decisions[key] = map[string]gate.HumanDecision{}
+		}
+		s.decisions[key][record.CriterionID] = gate.HumanDecision{
+			Decision: gate.HumanDecisionKind(record.Decision),
+			Actor:    record.Actor,
+			Note:     record.Note,
+		}
+	}
+	return nil
+}
+
+func (s *fakeLoopStore) ListLoopGateDecisions(
+	_ context.Context,
+	ws loop.WorkspaceID,
+	runID loop.RunID,
+	generation int,
+	gateID loop.NodeID,
+) (map[string]gate.HumanDecision, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	stored := s.decisions[gateDecisionKey(ws, runID, generation, gateID)]
+	out := map[string]gate.HumanDecision{}
+	maps.Copy(out, stored)
+	return out, nil
+}
+
+func gateDecisionKey(ws loop.WorkspaceID, runID loop.RunID, generation int, gateID loop.NodeID) string {
+	return string(ws) + "/" + string(runID) + "/" + strconv.Itoa(generation) + "/" + string(gateID)
+}
+
+func (s *fakeLoopStore) RequestGoalPause(ctx context.Context, ws loop.WorkspaceID,
+	runID loop.RunID, actor task.ActorContext) ([]loop.GoalPromptLease, error) {
+	return nil, s.SetLoopRunPauseRequested(ctx, ws, runID, true, actor)
+}
+
+func (s *fakeLoopStore) SetLoopRunPauseRequested(
+	_ context.Context,
+	ws loop.WorkspaceID,
+	runID loop.RunID,
+	requested bool,
+	actor task.ActorContext,
+) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	run, ok := s.runs[runID]
+	if !ok || run.WorkspaceID != ws {
+		return loop.ErrRunNotFound
+	}
+	run.PauseRequested = requested
+	if requested {
+		run.ControlActor = actor.Actor
+		run.ControlRequestedAt = time.Now().UTC()
+	} else {
+		run.ControlActor = task.ActorIdentity{}
+		run.ControlRequestedAt = time.Time{}
+	}
+	s.runs[runID] = run
+	return nil
+}
+
+func (s *fakeLoopStore) UpsertLoopConfig(
+	_ context.Context,
+	ws loop.WorkspaceID, _ string,
+	loopName string,
+	cfg loop.LoopConfig,
+) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.configs[string(ws)+"/"+loopName] = cfg
+	return nil
+}
+
+func (s *fakeLoopStore) GetLoopConfig(
+	_ context.Context,
+	ws loop.WorkspaceID, _ string,
+	loopName string,
+) (*loop.LoopConfig, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	cfg, ok := s.configs[string(ws)+"/"+loopName]
+	if !ok {
+		return nil, loop.ErrConfigNotFound
+	}
+	return &cfg, nil
+}
+
+func humanActor(t *testing.T) task.ActorContext {
+	t.Helper()
+	actor, err := task.DeriveHumanActorContext("operator", task.OriginKindCLI, "cli")
+	if err != nil {
+		t.Fatalf("DeriveHumanActorContext() error = %v", err)
+	}
+	return actor
+}

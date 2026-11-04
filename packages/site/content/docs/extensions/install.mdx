@@ -1,0 +1,661 @@
+---
+title: Install Extensions
+description: Install extensions from curated, GitHub, git, or local sources; understand trust and consent; update, enable, disable, remove, and inspect provenance.
+---
+
+Extensions are installable packages that add static resources or runtime behavior to CompozyOS. An
+extension can ship skills, agent definitions with authored-context sidecars, automation, layouts,
+hooks, loops, MCP servers, model sources, and subprocess tools.
+
+CompozyOS stores installed extensions in the global registry and copies managed installs into
+`<COMPOZY_HOME>/extensions/<name>`.
+
+<OperatorNote>
+  Installing **your own** code is not an install. Use [`compozy extension
+  dev`](/docs/extensions/develop#dev-reload-logs): it links your source directory to the current
+  workspace with no trust policy and no consent prompt. This page is about code that came from
+  somewhere else.
+</OperatorNote>
+
+## Install sources
+
+`compozy extension install <source>` takes one closed source union. The CLI infers the source from
+the argument:
+
+| Argument form                       | Source       | Notes                                                                        |
+| ----------------------------------- | ------------ | ---------------------------------------------------------------------------- |
+| `./dir`, `../dir`, `/abs/dir`       | `local_path` | A directory containing `extension.toml`, `extension.json`, or `plugin.json`. |
+| `github:owner/repo[@ref]`           | `github`     | GitHub release asset.                                                        |
+| `git:https://host/owner/repo[@ref]` | `git`        | Shallow clone at the ref. Needs the `git` executable on the daemon host.     |
+| `owner/repo[@ref]`                  | `curated`    | Tries the curated catalog first, falling back to `github` only on a `404`.   |
+
+```bash
+compozy extension install ./hello
+compozy extension install github:acme/hello@v0.1.0
+compozy extension install git:https://github.com/acme/hello@v0.1.0
+compozy extension install acme/review-tools
+```
+
+A path that does not exist fails naming that path instead of degrading into a slug lookup, and a git
+URL carrying embedded credentials is rejected before any request. HTTP, UDS, and native-tool callers
+submit the structured union directly; the shorthand is a CLI convenience.
+
+`--version` and `--asset` select a specific registry version or archive for published sources.
+
+## Choose an installation scope
+
+Use `--scope global` for a global installation or `--scope workspace --workspace <name|path|id>`
+for one registered workspace. `--workspace` alone selects workspace scope. Add `--profile <name>`
+to attach the package to one profile; `COMPOZY_PROFILE` is used when the flag is absent.
+Without a profile selector, a local operator installs for all profiles. Scoped installation requires
+a running daemon.
+
+```bash
+compozy extension install compozy/context7 --scope workspace --workspace my-project --profile engineering
+```
+
+HTTP, UDS, and `compozy__extensions_install` accept `scope`, `workspace_id`, and `profile`.
+Use a registered ID for `workspace_id` and a profile name for `profile`. A workspace-bound agent
+uses its trusted workspace and profile when selectors are omitted; it cannot select another
+workspace or profile. Preview and installation use the same selectors. Inputs and secret bindings
+belong to the selected profile/workspace cell.
+
+An installation attached to an explicit workspace profile starts in that workspace's profile
+runtime after a daemon restart. It does not start a global instance or become visible in another
+workspace. Archived profile attachments retain their state without starting a process.
+
+Without an explicit profile, a workspace installation starts its base runtime in that workspace;
+named profiles use isolated subprocesses with permissions restricted to the workspace profile.
+A development overlay takes precedence on restart. Removing it resumes the published workspace
+runtime from the existing attachment.
+Overlay transitions also replace the workspace's running profile instances. If activation or
+published-runtime restoration fails, the previous link and running definitions are restored.
+
+When both `scope` and `workspace_id` are omitted, a local operator uses the package's MCP server
+`default_scope` (an undeclared server default means `global`). A workspace default requires a
+workspace-bound caller; otherwise pass `--workspace` or choose `--scope global` explicitly.
+If servers declare different defaults, select a scope explicitly. Existing installations keep their
+attachments during updates.
+
+## Supply package inputs
+
+The package declares its input IDs, types, prompts, defaults, and required values. Pass repeatable
+`--input id=value` flags; the CLI reads the manifest type, so a boolean becomes a JSON boolean while
+a string such as `true` stays a string.
+
+```bash
+compozy extension install compozy/supabase --input project_ref=my-project
+compozy extension install compozy/context7
+compozy extension install compozy/grafana --input-file inputs.json
+```
+
+Context7's API key is optional. For Grafana, `inputs.json` can provide both the URL and an existing
+secret reference:
+
+```json
+{
+  "grafana_url": { "value": "https://grafana.example.com" },
+  "grafana_service_account_token": {
+    "vault_ref": "vault:extensions/global/grafana/profiles/default/env/GRAFANA_TOKEN"
+  }
+}
+```
+
+Each entry accepts exactly one `value` or `vault_ref`. Secret values go to the vault; other values
+stay with the extension instance. Vault references must already exist in the same extension, profile, and workspace namespace.
+A manual MCP server reference cannot be imported as an extension input. Flags override matching IDs from the file. Inputs are limited to
+8 KiB each; the JSON file is limited to 1 MiB. Installing a package with inputs requires a running
+daemon, including local-path packages.
+
+Updates retain the recorded acquisition source: a direct GitHub package uses its GitHub release,
+even when the Marketplace catalog is unavailable.
+
+Required inputs are checked before installed files or stored values change. Updates reuse saved
+values and ask for newly required inputs. Removed declarations retain their values as inactive;
+reintroducing an ID reactivates its saved value. URL parameters use saved values or manifest
+defaults, without reading the daemon environment. An unconfigured package remains inspectable,
+but cannot be enabled until its required inputs are available in the selected profile. MCP publication
+checks each profile independently: an unconfigured profile publishes no packaged MCP servers and
+does not prevent a configured profile from installing or restarting. Values are never copied between profiles.
+
+HTTP and UDS callers send the same envelopes in `inputs` on `POST /api/extensions`,
+`PUT /api/extensions/{name}`, or `POST /api/extensions/update` for a single named extension.
+The native `compozy__extensions_install` and `compozy__extensions_update` tools accept the same inputs.
+
+Install preview returns `digest_sha256` for the bytes it validated, including a direct source requested
+without a digest. The source install dialog sends that digest when you confirm the reviewed package.
+
+The CLI reads the current catalog acquisition digest and sends it as `expected_digest`. To use a
+digest reviewed earlier, pass `--expected-digest <sha256>`. A changed listing or mismatched acquired
+archive returns `409 extension_source_changed` with `listed_digest` and `fetched_digest`; review the
+current entry before retrying. In the Marketplace, a changed source reloads the listing and opens a
+new confirmation; it does not install the refreshed artifact automatically. A newly unverified publisher
+requires fresh consent. `422 extension_inputs_required` includes missing input IDs in `inputs` and their candidate-manifest
+field declarations in `input_definitions` (type, prompt, required, binding and non-secret default).
+Clients can collect these fields and retry the same scoped update without another preview download.
+Stored values and secret references are excluded. Native batch-update partial results retain this
+metadata in `operation_error` alongside completed updates.
+`422 extension_input_invalid` identifies `input_id`. Missing or invalid inputs exit with code `2`
+when reported by the daemon.
+
+Installing an already installed published extension reuses its update transaction. The same acquisition
+and inputs return the installed result without rewriting its package, input rows, or secret bindings.
+Changed package bytes or inputs preserve all existing attachments and restore the previous package,
+inputs, and credentials if publication fails. Choose an existing attachment with the same scope selectors.
+
+A classified extension name belongs to its `(source_ref, entry_id)` pair. Another origin receives
+`409 extension_name_conflict` with `installed_origin`; renaming a catalog's local display name does
+not change this identity. An operator can explicitly associate an unclassified managed installation
+with a catalog entry by installing that entry. Agent callers cannot make that association.
+
+## MCP runtime names
+
+CompozyOS allocates a name during publication, adding the extension name and a numeric suffix when
+needed to avoid collisions. That name stays stable while the instance exists, including while disabled.
+Failed installations release newly created reservations after package rollback; existing reservations
+and workspace instances are preserved.
+
+## Review declared profiles before install
+
+A [profile](/docs/profiles) is a named working context that decides which extensions are on for it.
+Install preview acquires and validates the package without changing state. It names every profile the
+manifest will create or bind, its credential requirements, resource placements, and the exact Live
+Gateway digest when one needs confirmation. The web install flow shows this summary before the final
+action. HTTP and UDS use `POST /api/extensions/preview-install` with the same install-source request.
+
+When the install succeeds, declared profiles are created without becoming active. Existing names are
+bound without changing their identity or defaults. The extension is enabled by default within its installation scope. Omitting a profile selector
+keeps all-profile availability; use `compozy --profile <name> extension disable <extension>` for a profile-specific exception.
+
+Extension detail reports `created_by_extension: true` only when saved provenance confirms that
+this extension created the current profile. `false` includes binding to an existing profile and
+older installations whose creation origin was not recorded. Upgrades preserve those profiles and
+their declarations; they do not guess authorship or reapply defaults.
+
+## Detected package layouts
+
+CompozyOS detects the package layout after acquiring the source. You do not select a format flag.
+
+| Root files                           | Detected format | Result                                                                                       |
+| ------------------------------------ | --------------- | -------------------------------------------------------------------------------------------- |
+| `extension.toml` or `extension.json` | `compozy`       | The native manifest owns identity, resources, permissions, and runtime behavior.             |
+| `plugin.json` only                   | `agent-plugin`  | CompozyOS reads Agent Plugins schema `1.0.0` and synthesizes a resource-only manifest.       |
+| Native manifest and `plugin.json`    | `compozy`       | The native manifest wins. Install records an informational diagnostic about the unused file. |
+
+An Agent Plugins package may provide immediate child directories under `skills/` and MCP servers in
+`mcp.json`. CompozyOS maps `stdio` and `streamable-http` servers, records unsupported components as
+skipped diagnostics, and keeps the rest of the package usable. Client layouts use the [client grammar adapter](/docs/extensions/agent-plugins#client-plugin-layouts),
+which reports unsupported client components without rewriting the package.
+
+```bash
+compozy extension install ./acme-tools --allow-unverified --yes
+compozy extension install git:https://github.com/acme/acme-tools@v1.2.0 \
+  --allow-unverified --yes
+```
+
+Both managed and dev instances receive absolute `PLUGIN_ROOT` and `PLUGIN_DATA` paths. Managed data
+is stable across updates at `<COMPOZY_HOME>/extension-data/<name>/`; a dev instance is isolated at
+`<COMPOZY_HOME>/extension-data/<name>@ws-<workspace-id>/`. See
+[Agent Plugins interoperability](/docs/extensions/agent-plugins) for the full mapping.
+
+## Trust and consent
+
+Two things gate a published install: an operator **policy** and a per-request **consent**.
+
+| Install                                                  | Policy needed                                        | Consent needed       |
+| -------------------------------------------------------- | ---------------------------------------------------- | -------------------- |
+| Curated entry with an `official` or `community` tier     | none                                                 | none                 |
+| Curated `unverified` tier, `github`, `git`, `local_path` | `extensions.trust.allow_unverified` (default `true`) | `--allow-unverified` |
+| Any of the above in machine-readable output              | same                                                 | plus `--yes`         |
+
+Human output prompts on `--allow-unverified` unless you pass `--yes`. Structured output requires
+`--yes`, so an agent cannot hide an interactive trust decision.
+
+Deterministic failures:
+
+| Reason code                                 | Meaning                                                   | Fix                                                                                  |
+| ------------------------------------------- | --------------------------------------------------------- | ------------------------------------------------------------------------------------ |
+| `extension_unverified_policy_blocked`       | Live policy is off. Evidence path `/settings/extensions`. | Review the source, then `compozy config set extensions.trust.allow_unverified true`. |
+| `extension_checksum_unverified`             | Policy is on but the request carried no consent.          | Add `--allow-unverified` (and `--yes` for structured output).                        |
+| `extension_archive_digest_mismatch`         | A curated archive differs from the catalog-pinned bytes.  | Stop. No `--allow-unverified` bypass exists for this.                                |
+| `extension_git_unavailable`                 | No `git` executable on the daemon host.                   | Install `git` or use another source.                                                 |
+| `extension_git_version_unsupported`         | The daemon host has Git older than 2.37.                  | Install Git 2.37 or newer, then retry.                                               |
+| `extension_agent_plugin_schema_unsupported` | `plugin.json` declares a schema other than `1.0.0`.       | Publish an Agent Plugins `1.0.0` package.                                            |
+| `extension_agent_plugin_not_manifest`       | `plugin.json` is not a valid Agent Plugins manifest.      | Replace the file with a valid object containing the required identity.               |
+| `extension_agent_plugin_manifest_invalid`   | The portable manifest failed semantic validation.         | Fix the named field and validate the package again.                                  |
+
+Both consent failures are `422`.
+
+Curated installs download the feed-owned artifact, verify the catalog-pinned SHA-256 **before**
+extraction, and persist the catalog entry, archive digest, and extracted-tree checksum separately.
+Any digest failure aborts before the registry write, so no partial install survives.
+
+A GitHub release may carry an `<asset>.sha256` sidecar. When one exists the daemon verifies the
+archive against it and records `digest_matched`. That is an integrity fact only: it never raises
+`registry_tier` above `unverified`, never sets `checksum_verified`, and never removes the consent
+requirement.
+
+Registry tier and digest verification are provenance signals, not safety guarantees.
+
+## Permission ceilings
+
+Published installs (`curated`, `github`, `git`) run under the marketplace tier, whose Host API grants
+are limited to `logs.read`, `observe.read`, `session.read`, `skills.read`, and `tool.read`. A published extension may declare more; anything outside the ceiling is dropped at grant
+time with a recorded diagnostic instead of silently succeeding.
+
+Local-path installs and dev links carry no ceiling. Full detail:
+[Extension Permissions](/docs/extensions/permissions).
+
+Managed installs do not allow runtime dependency symlinks to escape the extracted extension root. If
+a packaged `node_modules` or runtime dependency symlink resolves outside that root, installation
+fails instead of copying content from the host filesystem.
+
+## Configure sources and trust policy
+
+```toml
+[extensions.trust]
+# Operator policy for non-curated installs. Per-install consent still applies.
+allow_unverified = true
+
+[extensions.sources.github]
+enabled = true
+base_url = "https://api.github.com"
+
+[extensions.sources.git]
+enabled = true
+
+[marketplace.catalog]
+base_url = "https://raw.githubusercontent.com/compozy/compozy/main/catalog"
+ttl = "1h"
+timeout = "10s"
+```
+
+`base_url` accepts `https` or `http`; `http` logs an insecure-scheme warning. The GitHub client reads
+`GITHUB_TOKEN` from the daemon environment for authenticated release access and higher rate limits.
+
+After changing policy, reconcile and inspect the daemon's apply record:
+
+```bash
+compozy config reload -o json
+compozy config apply-history --limit 5 -o json
+```
+
+Full key reference: [`config.toml`](/docs/configuration/config-toml#extensionstrust).
+
+## Search across sources
+
+```bash
+compozy extension search notes --sources curated,github --limit 20
+compozy extension search notes --cursor <cursor>
+```
+
+Search fans out across the curated catalog and GitHub. A rate-limited or unreachable source degrades
+to cached-or-omitted results with a `sources_degraded` marker rather than failing the whole query.
+`compozy marketplace search <query> -o json` returns the same catalog projection
+with installed state and trust fields.
+
+## List, inspect, and update
+
+```bash
+compozy extension list
+compozy extension status hello
+compozy extension provenance hello
+```
+
+`list` uses the daemon when it is running and falls back to the local registry when it is offline. It
+carries an `Update` column driven by the `update_available` projection, so a pending update is
+visible without asking for it. `status` and `provenance` require the daemon.
+
+Both read the global installed set. A workspace-scoped dev instance is not part of it — read those
+through `GET /api/extensions?workspace=<id>`, through an agent caller whose session binds the
+workspace, or through `compozy extension logs <name>`. See
+[Develop Extensions](/docs/extensions/develop#instances).
+
+`status` returns registry and runtime truth together:
+
+| Field                                                                          | Meaning                                                                                                  |
+| ------------------------------------------------------------------------------ | -------------------------------------------------------------------------------------------------------- |
+| `name`, `version`, `source`, `format`                                          | Registry identity, install source, and detected `compozy` or `agent-plugin` format.                      |
+| `type`                                                                         | `resource` when no subprocess is required; `subprocess` otherwise.                                       |
+| `enabled`                                                                      | Registry flag. Disabled extensions are skipped by the manager.                                           |
+| `state`                                                                        | `disabled`, `enabled`, `registered`, `active`, or `error`.                                               |
+| `health`                                                                       | `unknown`, `healthy`, or `unhealthy`.                                                                    |
+| `capabilities`, `permissions`                                                  | Manifest-declared provide surfaces and Host API methods.                                                 |
+| `consecutive_failures`, `restart_backoff_ms`                                   | Crash-loop honesty: a looping extension is distinguishable from a stably-failed one.                     |
+| `dev`, `overrides_published`, `origin_path`, `generation_hash`, `workspace_id` | Dev-overlay identity when one is active.                                                                 |
+| `update_available`, `remote_version`                                           | Passive update projection.                                                                               |
+| `requires_env`, `missing_env`, `bound_env_keys`                                | Declared names, currently missing names, and names bound through Vault.                                  |
+| `gateway_requirement_digest`, `gateway_confirmation_required`                  | The exact gateway permission digest and whether lifecycle consent is pending.                            |
+| `provenance`, `trust`                                                          | Install source, checksums, registry tier, `allow_unverified`, installer identity, decision, diagnostics. |
+| `diagnostics`                                                                  | Deterministically ordered ingest and runtime issues; portable component skips remain visible here.       |
+
+Apply updates:
+
+```bash
+compozy extension update hello
+compozy extension update --all
+```
+
+Update targets extensions installed from a source with remote version metadata; local installs and
+dev links are not update targets. A successful update replaces the managed directory, updates the
+registry row and provenance, reloads runtime resources, and writes an `extension.updated` event.
+
+Use `--workspace <name|path|id>` and `--profile <name>` to select the existing installation. The explicit
+profile flag wins over `COMPOZY_PROFILE`; `--all` includes only installations in the selected scope
+and profile. HTTP/UDS and native update requests use `scope`, `workspace_id`, and `profile`.
+
+```bash
+compozy extension update hello --workspace my-project --profile engineering
+compozy extension update --all --scope workspace --workspace my-project --profile engineering
+```
+
+Selectors choose the input cell and existing attachment; updates do not create attachments or apply
+new manifest scope defaults. The package version is shared by its attachments. Each attachment and
+its creation time survives the update, while values and credentials in other cells remain unchanged.
+
+A batch update stops at the first failing target **without discarding earlier progress**: the
+response is `200` and carries every completed item plus the failed one, whose `status` is `failed`
+with `extension_update_failed`. Targets after the failure are not attempted.
+
+The runtime activation is the commit point. If the new version is active but CompozyOS cannot remove a
+staging directory or backup, the result is still `status: "updated"` with an
+`extension_update_cleanup_failed` warning naming the residual path.
+
+## Inspect the kit
+
+Use inventory to compare every resource shipped by the installed extension with the selected live
+instance projection:
+
+```bash
+compozy extension inventory hello --workspace <workspace-id> --profile default -o json
+```
+
+Portable inventory preserves the detected `format` and ingest diagnostics even when every MCP
+component was skipped. An empty live resource set is therefore distinguishable from a native empty
+extension.
+
+## Enable, disable, remove
+
+```bash
+compozy --profile marketing extension disable hello
+compozy --profile marketing extension enable hello
+compozy extension remove hello
+compozy extension remove hello --global
+```
+
+Enable and disable require the daemon and change only the selected profile. An absent exception row
+means enabled. Disable stores one exception and removes extension resources from that profile;
+enable deletes the exception and republishes resources whose placement matches the profile. Each
+change writes `extension.enablement_changed`.
+
+When the manifest declares gateway permissions, install or update returns
+`extension_gateway_confirmation_required` before changing package state. Review the exact digest,
+then retry with `--confirm-gateway-requirement <digest>`.
+
+Inside a workspace, `remove` unlinks a dev overlay and lets the published installation resume;
+`--global` removes the published installation. Removal deletes the managed install directory and
+registry row with rollback handling. Post-commit cleanup failure leaves `status: "removed"` with an
+`extension_remove_cleanup_failed` warning and a residual path — treat that path as cleanup debt, not
+as a live extension.
+
+A committed global removal releases the installation's MCP runtime names and overrides across
+its profile projections. Workspace-owned allocations remain separate. If retiring the allocations
+fails, CompozyOS restores the managed files, registry entry, per-profile enablement, profile
+creation records, and secret bindings before reloading the extension. Its allocated names and
+overrides remain unchanged.
+
+Workspace dev unlink releases that instance's MCP names and overrides across its profiles in the
+same transaction as its completion event. If either write fails, the dev link and its secret
+bindings are restored; the published installation and other workspaces retain their allocations.
+
+Failed updates release names introduced by the candidate across every workspace and profile only
+after the previous package, registry, and inputs have been restored. Package updates and published
+reinstalls wait for active operations on that package and retain exclusive access through rollback.
+Existing names and overrides remain reserved, including for temporarily removed server declarations;
+other packages keep their allocations. A failure restoring the package preserves reservations and
+prevents reloading a partially restored installation.
+
+For an Agent Plugins installation, removal also deletes `PLUGIN_DATA`. CompozyOS first moves the
+data into quarantine so it can restore the directory if the durable removal fails. After the
+removal commits, deletion of quarantined data is cleanup: a failure reports the retained path as a
+warning. If the initial quarantine move fails, removal fails and the extension remains installed.
+
+## Validate an Agent Plugins package
+
+Validation detects the same format and component mapping as install without writing registry state or
+starting code:
+
+```bash
+compozy extension validate ./acme-tools -o json
+```
+
+The result includes `format: "agent-plugin"`, `would_ingest`, and positioned `issues`. Use it before a
+local or git install to catch an unsupported schema or malformed client manifest. Unsupported portable
+components appear as skipped issues rather than hiding the resources that can still be ingested.
+
+For a valid package with two skills, two usable servers, and three skipped components, the shipped
+CLI reports:
+
+```console
+Extension bundle validation
+===========================
+Status:   valid
+Format:   agent plugin
+Package:  acme.tools 1.2.0
+Issues:   3
+
+Would ingest
+============
+Kind        Name     Transport
+----        ----     ---------
+skill       release
+skill       review
+mcp_server  local    stdio
+mcp_server  remote   streamable-http
+
+WARN mcp:legacy-events:  sse transport is not supported
+WARN mcp:malformed:  invalid mcp server entry
+WARN skill:skipped:  name must match the directory "skipped"
+```
+
+## Declare required environment
+
+Extensions declare the environment variable **names** they need:
+
+```toml
+[extension]
+name = "deployment-tools"
+version = "1.2.3"
+min_compozy_version = "0.3.0-beta.1"
+requires_env = ["DEPLOY_API_KEY", "DEPLOY_ORGANIZATION_ID"]
+```
+
+CompozyOS validates `requires_env` at install and status load. Diagnostics report names, never values.
+An unset or empty variable surfaces through `missing_env` in `list`, `status`, the API, and the
+settings page.
+
+Bind required values through the instance-scoped Vault flow described in
+[Extension secret bindings](/docs/extensions/secrets). Bindings survive an update of the same managed
+instance, while stale bindings remain visible but are never injected when the new manifest stops
+declaring that name.
+
+## Declare packaged server inputs
+
+Use `[[inputs]]` for values requested during installation. Input ids and bindings must be unique.
+Types are `string`, `identifier`, `boolean`, and `secret`; each declaration includes a prompt,
+required flag, and an `env` or `url_query` binding. For example, an optional Context7 credential:
+
+```toml
+[[inputs]]
+id = "context7_api_key"
+prompt = "Context7 API key (optional)"
+type = "secret"
+required = false
+binding = { type = "env", name = "CONTEXT7_API_KEY" }
+
+[resources.mcp_servers.context7]
+transport = "stdio"
+command = "npx"
+args = ["-y", "@upstash/context7-mcp@3.2.3"]
+secret_env = { CONTEXT7_API_KEY = "context7_api_key" }
+default_scope = "global"
+```
+
+Environment maps retain their map shape: the value is the declared input id. Non-secret environment
+inputs use `env`; secrets use `secret_env`. URL inputs must name a parameter already declared in the
+remote server URL. Secret inputs cannot have defaults or bind URL parameters. Boolean defaults are
+booleans; string and identifier defaults are strings. Values must be NUL-free and at most 8 KiB.
+
+A hosted server may declare `[resources.mcp_servers.<name>.auth]` with `method = "oauth"`,
+`registration = "dynamic"`, and scopes. An optional `issuer_url` restricts the authorization server
+to an advertised issuer. `default_scope` is an installation default, not permission to broaden the
+installed instance's scope. Validate the package with `compozy extension validate <directory>`.
+
+The publisher derives v3 feed inputs from the package and checks their equality. Editing a generated
+feed cannot change what a package requests; change its manifest and republish.
+
+## Install one package in several scopes
+
+Installing the same source in another workspace adds an installation for that workspace. Each
+scope retains its own input values. Updating the package preserves every installation and profile
+enablement; restarting the daemon restores the same scopes.
+
+Removing a workspace installation leaves the package and other installations in place. The last
+installation's removal retires the package. An active development link in the selected workspace
+is unlinked through the development lifecycle. MCP runtime names remain reserved while their
+installation exists, including while it is disabled.
+
+## Inspect extension MCP servers
+
+Before installation, catalog detail downloads the listed artifact, verifies its SHA-256 digest,
+and reads its declared contents, MCP servers, and inputs. Inspection does not install the package,
+start a server, or grant permission to run community code. Uninstalled servers have no observed
+status or allocated runtime name. If the downloaded bytes differ from the listing, the detail route
+returns `409 extension_source_changed`; refresh the listing before retrying.
+
+For an installed entry with the same source and entry identity, detail uses the selected profile's
+installed inventory and published server state without fetching the artifact again.
+
+Extension responses include `mcp_servers` with the manifest server name, extension owner, scope,
+profile, workspace, transport, and a launch summary. Published definitions include their allocated
+`runtime_name`; disabling the extension preserves that name. Auth metadata contains only the method,
+registration mode, issuer URL, and scopes. Launch summaries omit arguments and URL credentials,
+paths, and query values.
+
+For a published server, CompozyOS uses the same bounded MCP status probe as Settings. `running`
+means the server initialized and listed tools; `needs_authorization` means its own OAuth state needs
+attention. Unreachable or unpublished enabled servers report `stopped`. A disabled extension reports
+`disabled` without probing. Before the runtime status provider is available, status remains `unknown`.
+
+## Authorize extension MCP servers
+
+In the web app, open **Marketplace → Installed**, then choose **Authorize** on the extension's
+server row. You can also open its detail and expand **Server**, or open **Settings → MCP servers**.
+Settings shows manual and extension-provided definitions separately, including their owner and
+allocated runtime name. Select the definition in the intended profile or workspace before authorizing.
+The dialog reports success only after the selected definition has authenticated status and a token.
+
+An extension's MCP server uses its own OAuth credentials. A manually configured server with the same
+name keeps a separate token and client registration. Select the extension explicitly with `--owner`:
+
+```bash
+compozy mcp auth login linear --scope user --owner extension:linear
+compozy mcp auth status linear --scope user --owner extension:linear
+compozy mcp auth logout linear --scope user --owner extension:linear
+```
+
+One login is enough: the server's tools become callable for sessions in that scope, including
+sessions already running, even with `tools.policy.external_default = "disabled"`. Logging out
+withdraws that access.
+
+Use the manifest server name as the positional argument and `extension:<extension-name>` as the owner.
+An allocated runtime name is not a management or authorization alias, even with an explicit owner.
+For a named profile, pass `--profile <name> --scope profile`; for a workspace definition, pass
+`--scope workspace --workspace <id>`. Logging out removes only the selected definition's credentials.
+
+HTTP and UDS OAuth routes accept the same selector. For example,
+`GET /api/settings/mcp-servers/linear/auth/status?scope=user&owner=extension%3Alinear` returns redacted
+status with `owner: "extension:linear"`. The `begin`, `exchange`, and `logout` routes carry that owner
+through the complete authorization session. An explicit `owner=manual` selects the manual definition.
+
+When a token expires, tool discovery or execution renews it with that owner's saved client
+registration. This does not open another login flow or register another client. If the registration
+has changed or its client secret has expired, authorize the server again. Refreshing or logging out
+the extension's server leaves the manual server's credentials unchanged.
+
+## Edit extension MCP configuration
+
+Choose **Edit configuration** in the detail's **Server** section, **Edit server configuration**
+from the Installed row's menu, or the edit action on its Settings row. The editor keeps the
+server name, owner, launch command and authorization declaration read-only. It accepts environment
+variables for a local server, or headers and an optional endpoint for a remote server.
+
+Saved values override the extension's declaration in the selected definition's scope. A blank endpoint
+uses the package URL. **Reset override** removes the stored override and restores the package values;
+it does not uninstall the extension. Manual servers use their own editor and removal action in Settings.
+
+## Agent surfaces
+
+Extension lifecycle is agent-manageable. The `compozy__extensions` toolset reaches the same services
+as the CLI. Named operations accept optional `owner: "extension:<name>"` and reject an owner that
+does not match `name` before reading or mutating the instance. This applies to info, inventory,
+provenance, update, remove, enable, disable, reload, and logs. `extensions_list` accepts the same
+owner as a filter. List, info, and provenance retain the caller's selected profile even when no
+workspace is selected. Owner selection does not change the caller's workspace or profile authority.
+
+| Action             | Tool                                    | CLI                                |
+| ------------------ | --------------------------------------- | ---------------------------------- |
+| Scaffold           | `compozy__extensions_init`              | `compozy extension init`           |
+| Build              | `compozy__extensions_build`             | `compozy extension build`          |
+| Validate           | `compozy__extensions_validate`          | `compozy extension validate`       |
+| Dev-link / reload  | `compozy__extensions_dev`/`_reload`     | `compozy extension dev`/`reload`   |
+| Read logs          | `compozy__extensions_logs`              | `compozy extension logs`           |
+| Search             | `compozy__extensions_search`            | `compozy extension search`         |
+| List installed     | `compozy__extensions_list`              | `compozy extension list`           |
+| Inspect one        | `compozy__extensions_info`              | `compozy extension status`         |
+| Inspect provenance | `compozy__extensions_provenance`        | `compozy extension provenance`     |
+| Inspect kit        | `compozy__extensions_inventory`         | `compozy extension inventory`      |
+| Install            | `compozy__extensions_install`           | `compozy extension install`        |
+| Update             | `compozy__extensions_update`            | `compozy extension update`         |
+| Remove             | `compozy__extensions_remove`            | `compozy extension remove`         |
+| Enable / disable   | `compozy__extensions_enable`/`_disable` | `compozy extension enable/disable` |
+| Publish            | `compozy__extensions_publish`           | `compozy extension publish`        |
+
+Tools that execute author or extension code (`build`, `dev`, `reload`) are interaction-gated;
+`publish` is additionally `open_world`; `validate` is read-only. Deterministic denials include
+`EXTENSION_SOURCE_FORBIDDEN`, `EXTENSION_APPROVAL_REQUIRED`, `EXTENSION_NOT_INSTALLED`, and
+`EXTENSION_VALIDATION_FAILED`. Credentials never appear in tool inputs: the publish token is resolved
+server-side and registered for redaction.
+
+Native `dev` and `reload` never build. Call `compozy__extensions_build` first and pass its
+`generation_hash`.
+
+Extension-owned desired-state records are inspectable through `compozy__resources_list`,
+`compozy__resources_info`, and `compozy__resources_snapshot`. An extension declares the corresponding
+Host API methods in `permissions.requires`, such as `resources/list`, `resources/get`, and
+`resources/snapshot`.
+
+## Troubleshooting
+
+| Symptom                                         | Cause                                                                             | Fix                                                                         |
+| ----------------------------------------------- | --------------------------------------------------------------------------------- | --------------------------------------------------------------------------- |
+| `extension_unverified_policy_blocked`           | Live policy is off.                                                               | Review the source, then set `extensions.trust.allow_unverified` and reload. |
+| `extension_checksum_unverified`                 | Consent missing on the request.                                                   | Add `--allow-unverified` (`--yes` for structured output).                   |
+| `extension_archive_digest_mismatch`             | Curated archive differs from the pinned bytes.                                    | Stop; refresh the catalog or wait for the entry to be corrected.            |
+| `extension_git_unavailable`                     | No `git` binary on the daemon host.                                               | Install `git` or install from another source.                               |
+| `extension_git_version_unsupported`             | The daemon host has Git older than 2.37.                                          | Install Git 2.37 or newer, then retry.                                      |
+| `extension_agent_plugin_schema_unsupported`     | The package declares an unsupported Agent Plugins schema.                         | Publish a package using schema `1.0.0`.                                     |
+| Extension is `enabled` but not `active`         | Daemon offline, disabled, or activation failed.                                   | `compozy extension status <name>` and `compozy extension logs <name>`.      |
+| Install or update asks for Gateway confirmation | The candidate declares an unconfirmed or changed gateway requirement digest.      | Review the exact digest, then retry with `--confirm-gateway-requirement`.   |
+| Daemon-required error on a marketplace verb     | Search, install, update, remove, enable, status, and provenance are daemon-owned. | Start the daemon and retry.                                                 |
+
+Related references:
+
+- [Develop Extensions](/docs/extensions/develop)
+- [Publish an Extension](/docs/extensions/publish)
+- [Extension Permissions](/docs/extensions/permissions)
+- [Extension Secret Bindings](/docs/extensions/secrets)
+- [Agent Plugins Interoperability](/docs/extensions/agent-plugins)
+- [Extension CLI Reference](/docs/cli/extension)
+- [Hook Declaration Format](/docs/hooks/declaration)
+- [Unified Marketplace](/docs/marketplace)

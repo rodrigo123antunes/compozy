@@ -1,0 +1,400 @@
+package globaldb
+
+import (
+	"context"
+	"database/sql"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"strings"
+	"time"
+
+	looppkg "github.com/compozy/compozy/internal/loop"
+	"github.com/compozy/compozy/internal/loop/dsl"
+	"github.com/compozy/compozy/internal/store"
+	"github.com/compozy/compozy/internal/store/globaldb/sqlcgen"
+)
+
+var _ looppkg.Store = (*LoopRepo)(nil)
+
+const loopRunSelectColumnsSQL = `grant_ceiling,
+	id, profile_id, workspace_id, loop_name, status, historical, generation, reattempt_strategy, created_at, started_at,
+	last_progress_at, completed_at, definition_version, definition_digest, active_gate_id,
+	active_human_criteria_json, budget_approval_seq, start_metadata_json,
+	budget_tokens, budget_wall_sec,
+	budget_on_exceeded, tokens_used, parent_loop_run_id, pause_requested,
+	control_actor_kind, control_actor_id, control_requested_at, inputs_json, iteration_cap,
+	started_by_kind, started_by_ref, started_origin_kind, started_origin_ref,
+	goal_context_nudge_ratio, origin_kind, origin_session_id,
+	origin_creation_profile_ref, origin_policy_spec_digest, origin_creation_digest,
+	best_generation, best_score,
+	completion_state, forked_from_run_id, forked_from_generation`
+
+// CreateLoopRunForStart atomically applies the loop concurrency policy and persists a new run.
+func (g *LoopRepo) CreateLoopRunForStart(
+	ctx context.Context,
+	run looppkg.Run,
+	policy dsl.ConcurrencyPolicy,
+) (looppkg.Run, error) {
+	if err := g.checkReady(ctx, "create loop run for start"); err != nil {
+		return looppkg.Run{}, err
+	}
+	normalized, err := normalizeLoopRunForCreate(run)
+	if err != nil {
+		return looppkg.Run{}, err
+	}
+	if normalized.Origin.Kind != looppkg.RunOriginCatalog {
+		return looppkg.Run{}, fmt.Errorf("%w: catalog start requires catalog Run origin", looppkg.ErrValidation)
+	}
+	inputsJSON, startMetadataJSON, err := marshalLoopRunCreatePayload(normalized)
+	if err != nil {
+		return looppkg.Run{}, err
+	}
+	if policy == "" {
+		policy = dsl.ConcurrencyForbid
+	}
+	created := normalized
+	err = g.withTaskImmediateTransaction(ctx, "create loop run for start", func(exec taskSQLExecutor) error {
+		if normalized.RunStartState != nil && normalized.Admission != nil {
+			suppressed, winner, claim, claimErr := claimLoopAdmission(ctx, exec, normalized, g.now())
+			if claimErr != nil {
+				return claimErr
+			}
+			if suppressed {
+				created = winner
+				created.Admission = &looppkg.RunAdmission{
+					Identity:   normalized.Admission.Identity,
+					Suppressed: true,
+					Claim:      &claim,
+				}
+				return nil
+			}
+		}
+		var decisionErr error
+		created, decisionErr = applyLoopStartConcurrencyPolicy(ctx, exec, normalized, policy)
+		if decisionErr != nil {
+			return decisionErr
+		}
+		return g.persistStartedLoopRunWithExecutor(ctx, exec, created, inputsJSON, startMetadataJSON)
+	})
+	if err != nil {
+		return looppkg.Run{}, err
+	}
+	return created, nil
+}
+
+func (g *LoopRepo) persistStartedLoopRunWithExecutor(
+	ctx context.Context,
+	exec taskSQLExecutor,
+	run looppkg.Run,
+	inputsJSON []byte,
+	startMetadataJSON []byte,
+) error {
+	if err := upsertLoopDefinitionSnapshot(ctx, exec, run, g.now()); err != nil {
+		return err
+	}
+	if err := insertLoopRun(ctx, exec, run, inputsJSON, startMetadataJSON); err != nil {
+		return err
+	}
+	// Creation reserves generation 1 while run.Generation remains 0 until that generation advances.
+	if err := insertLoopGenerationWithExecutor(
+		ctx,
+		exec,
+		run.ID,
+		looppkg.GenerationIntent{Generation: 1, Origin: looppkg.OriginInitial},
+		run.CreatedAt,
+	); err != nil {
+		return err
+	}
+	if run.Status != looppkg.StatusRunning {
+		return nil
+	}
+	_, _, err := g.reserveLoopCoordinatorRunWithExecutor(
+		ctx,
+		exec,
+		run,
+		loopCoordinatorStartOrigin(),
+		run.CreatedAt,
+		loopCoordinatorRunID(run.ID, 1),
+		loopCoordinatorIdempotencyKey(run.ID, 1),
+	)
+	return err
+}
+
+func applyLoopStartConcurrencyPolicy(
+	ctx context.Context,
+	exec taskSQLExecutor,
+	run looppkg.Run,
+	policy dsl.ConcurrencyPolicy,
+) (looppkg.Run, error) {
+	active, err := findActiveLoopRunWithExecutor(ctx, exec, run.WorkspaceID, run.ProfileID, run.LoopName)
+	if err != nil {
+		return looppkg.Run{}, err
+	}
+	created := run
+	switch policy {
+	case dsl.ConcurrencyForbid:
+		if active != nil {
+			return looppkg.Run{}, loopConcurrencyConflict(active)
+		}
+		created.Status = looppkg.StatusRunning
+	case dsl.ConcurrencyQueue:
+		if active != nil {
+			created.Status = looppkg.StatusQueued
+		} else {
+			created.Status = looppkg.StatusRunning
+		}
+	case dsl.ConcurrencyAllow:
+		created.Status = looppkg.StatusRunning
+	default:
+		return looppkg.Run{}, fmt.Errorf("%w: concurrency policy is invalid: %q", looppkg.ErrValidation, policy)
+	}
+	return created, nil
+}
+
+func insertLoopRun(
+	ctx context.Context,
+	exec taskSQLExecutor,
+	run looppkg.Run,
+	inputsJSON []byte,
+	startMetadataJSON []byte,
+) error {
+	if !run.Status.Terminal() {
+		if err := store.RequireWorkspaceActive(ctx, exec, string(run.WorkspaceID)); err != nil {
+			return err
+		}
+	}
+	params := loopRunInsertParams(run, inputsJSON, startMetadataJSON)
+	err := sqlcgen.New(exec).InsertLoopRun(ctx, params)
+	if err != nil {
+		return fmt.Errorf("store: insert loop run %q: %w", run.ID, err)
+	}
+	if forkedFrom := run.ForkedFromSnapshot(); forkedFrom != nil {
+		if _, err := exec.ExecContext(ctx, `UPDATE loop_runs
+			SET forked_from_run_id = ?, forked_from_generation = ? WHERE id = ?`,
+			forkedFrom.RunID, forkedFrom.Generation, run.ID); err != nil {
+			return fmt.Errorf("store: persist fork lineage for run %q: %w", run.ID, err)
+		}
+	}
+	return appendLoopRunStatusEvent(
+		ctx,
+		exec,
+		run.ID,
+		run.WorkspaceID,
+		"",
+		run.Status,
+		looppkg.TransitionCauseStart,
+		run.CreatedAt,
+	)
+}
+
+func marshalLoopRunCreatePayload(run looppkg.Run) ([]byte, []byte, error) {
+	inputsJSON, err := json.Marshal(run.Inputs)
+	if err != nil {
+		return nil, nil, fmt.Errorf("store: marshal loop run inputs: %w", err)
+	}
+	startMetadataJSON, err := json.Marshal(run.StartMetadata)
+	if err != nil {
+		return nil, nil, fmt.Errorf("store: marshal loop run start metadata: %w", err)
+	}
+	return inputsJSON, startMetadataJSON, nil
+}
+
+// GetLoopRun loads one workspace-scoped loop_run.
+func (g *LoopRepo) GetLoopRun(
+	ctx context.Context,
+	ws looppkg.WorkspaceID,
+	runID looppkg.RunID,
+) (looppkg.Run, error) {
+	if err := g.checkReady(ctx, "get loop run"); err != nil {
+		return looppkg.Run{}, err
+	}
+	row, err := g.readQueries.GetLoopRun(ctx, sqlcgen.GetLoopRunParams{WorkspaceID: string(ws), ID: string(runID)})
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return looppkg.Run{}, looppkg.ErrRunNotFound
+		}
+		return looppkg.Run{}, fmt.Errorf("store: get loop run: %w", err)
+	}
+	return loopRunFromGenerated(&row)
+}
+
+// GetLoopRunByID loads one loop_run without a workspace filter for ancestry/transition internals.
+func (g *LoopRepo) GetLoopRunByID(ctx context.Context, runID looppkg.RunID) (looppkg.Run, error) {
+	if err := g.checkReady(ctx, "get loop run by id"); err != nil {
+		return looppkg.Run{}, err
+	}
+	row, err := g.readQueries.GetLoopRunByID(ctx, string(runID))
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return looppkg.Run{}, looppkg.ErrRunNotFound
+		}
+		return looppkg.Run{}, fmt.Errorf("store: get loop run by id: %w", err)
+	}
+	return loopRunFromGenerated(&row)
+}
+
+// FindActiveLoopRun returns the oldest live run for a workspace loop.
+func (g *LoopRepo) FindActiveLoopRun(
+	ctx context.Context,
+	ws looppkg.WorkspaceID, profileID string,
+	loopName string,
+) (*looppkg.Run, error) {
+	if err := validateLoopStateScope(ws, profileID); err != nil {
+		return nil, err
+	}
+	if err := g.checkReady(ctx, "find active loop run"); err != nil {
+		return nil, err
+	}
+	return findActiveLoopRunWithExecutor(ctx, g.readDB, ws, profileID, loopName)
+}
+
+func findActiveLoopRunWithExecutor(
+	ctx context.Context,
+	exec taskSQLExecutor,
+	ws looppkg.WorkspaceID,
+	profileID string,
+	loopName string,
+) (*looppkg.Run, error) {
+	row, err := sqlcgen.New(exec).FindActiveLoopRun(ctx, sqlcgen.FindActiveLoopRunParams{
+		ProfileID:   profileID,
+		WorkspaceID: string(ws), LoopName: strings.TrimSpace(loopName),
+	})
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return nil, nil
+		}
+		return nil, fmt.Errorf("store: find active loop run: %w", err)
+	}
+	run, err := loopRunFromGenerated(&row)
+	if err != nil {
+		return nil, err
+	}
+	return &run, nil
+}
+
+func loopConcurrencyConflict(active *looppkg.Run) error {
+	if active == nil {
+		return looppkg.ErrConcurrencyConflict
+	}
+	return &looppkg.ReasonError{
+		Code: looppkg.ReasonCodeActiveRunExists,
+		Err:  looppkg.ErrConcurrencyConflict,
+		Meta: map[string]string{
+			"active_run_id":            string(active.ID),
+			columnLoopName:             active.LoopName,
+			globalDBTaskClaimStatusKey: string(active.Status),
+		},
+	}
+}
+
+// CompareAndSwapLoopRunStatus updates status only from the expected durable value.
+func (g *LoopRepo) CompareAndSwapLoopRunStatus(
+	ctx context.Context,
+	runID looppkg.RunID,
+	from looppkg.Status,
+	to looppkg.Status,
+	cause looppkg.TransitionCause,
+	at time.Time,
+) error {
+	if err := g.checkReady(ctx, "transition loop run status"); err != nil {
+		return err
+	}
+	if strings.TrimSpace(string(runID)) == "" {
+		return fmt.Errorf("%w: run id is required", looppkg.ErrValidation)
+	}
+	if !from.Valid() || !to.Valid() {
+		return fmt.Errorf("%w: loop status is invalid", looppkg.ErrValidation)
+	}
+	if strings.TrimSpace(string(cause)) == "" {
+		return fmt.Errorf("%w: transition cause is required", looppkg.ErrValidation)
+	}
+	if from == to {
+		return nil
+	}
+	if at.IsZero() {
+		at = g.now()
+	}
+	return g.withTaskImmediateTransaction(
+		ctx,
+		"transition loop run status",
+		func(exec taskSQLExecutor) error {
+			return compareAndSwapLoopRunStatusWithExecutor(ctx, exec, runID, from, to, cause, at)
+		},
+	)
+}
+
+// UpsertLoopConfig persists a no-fork per-loop config override.
+func (g *LoopRepo) UpsertLoopConfig(
+	ctx context.Context,
+	ws looppkg.WorkspaceID, profileID string,
+	loopName string,
+	cfg looppkg.LoopConfig,
+) error {
+	if err := validateLoopStateScope(ws, profileID); err != nil {
+		return err
+	}
+	if err := g.checkReady(ctx, "upsert loop config"); err != nil {
+		return err
+	}
+	workspaceID := strings.TrimSpace(string(ws))
+	trimmedLoopName := strings.TrimSpace(loopName)
+	if trimmedLoopName == "" {
+		return fmt.Errorf("%w: loop_name is required", looppkg.ErrValidation)
+	}
+	normalized, err := normalizeLoopConfigForStore(cfg)
+	if err != nil {
+		return err
+	}
+	err = g.withImmediateTransaction(ctx, "upsert loop config", func(exec globalSQLExecutor) error {
+		return upsertLoopConfigWithExecutor(ctx, exec, workspaceID, profileID, trimmedLoopName, cfg, normalized)
+	})
+	if err != nil {
+		return fmt.Errorf("store: upsert loop config %q/%q: %w", workspaceID, trimmedLoopName, err)
+	}
+	return nil
+}
+
+// GetLoopConfig loads a no-fork per-loop config override.
+func (g *LoopRepo) GetLoopConfig(
+	ctx context.Context,
+	ws looppkg.WorkspaceID, profileID string,
+	loopName string,
+) (*looppkg.LoopConfig, error) {
+	if err := validateLoopStateScope(ws, profileID); err != nil {
+		return nil, err
+	}
+	if err := g.checkReady(ctx, "get loop config"); err != nil {
+		return nil, err
+	}
+	row, err := g.readQueries.GetLoopConfig(ctx, sqlcgen.GetLoopConfigParams{
+		ProfileID:   loopStateProfileID(ws, profileID),
+		WorkspaceID: string(ws), LoopName: strings.TrimSpace(loopName),
+	})
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return nil, looppkg.ErrConfigNotFound
+		}
+		return nil, err
+	}
+	cfg, err := loopConfigFromGenerated(row)
+	if err != nil {
+		return nil, err
+	}
+	return &cfg, nil
+}
+
+func getLoopRunByIDWithExecutor(
+	ctx context.Context,
+	exec taskSQLExecutor,
+	runID looppkg.RunID,
+) (looppkg.Run, error) {
+	row, err := sqlcgen.New(exec).GetLoopRunByID(ctx, string(runID))
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return looppkg.Run{}, looppkg.ErrRunNotFound
+		}
+		return looppkg.Run{}, fmt.Errorf("store: get loop run by id: %w", err)
+	}
+	return loopRunFromGenerated(&row)
+}

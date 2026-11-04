@@ -1,0 +1,247 @@
+import { ChevronDown, type LucideIcon } from "@compozy/ui/icons";
+import type { ReactNode } from "react";
+
+import {
+  cn,
+  Collapsible,
+  CollapsibleContent,
+  CollapsibleTrigger,
+  Eyebrow,
+  Panel,
+  PropertyRow,
+  PropertyRowSkeleton,
+  SkeletonText,
+} from "@compozy/ui";
+
+/**
+ * Marketplace detail anatomy (OpenDesign marketplace contract): the kind-specific
+ * content is the body — collapsible sections over a shared panelbox — and the
+ * 320px rail holds short collapsible property cards.
+ */
+
+interface MarketplaceDetailColumnsProps {
+  main: ReactNode;
+  rail: ReactNode;
+}
+
+function MarketplaceDetailColumns({ main, rail }: MarketplaceDetailColumnsProps) {
+  return (
+    <div className="grid grid-cols-1 items-start gap-8 lg:grid-cols-[minmax(0,1fr)_var(--width-detail-inspector-inline)]">
+      <main className="flex min-w-0 flex-col gap-5.5">{main}</main>
+      <aside className="flex min-w-0 flex-col gap-3">{rail}</aside>
+    </div>
+  );
+}
+
+interface MarketplaceDetailSectionProps {
+  icon: LucideIcon;
+  title: string;
+  summary?: ReactNode;
+  defaultOpen?: boolean;
+  children: ReactNode;
+  "data-testid"?: string;
+}
+
+/** Main-column collapsible section: quiet summary row above a framed panel. */
+function MarketplaceDetailSection({
+  icon: Icon,
+  title,
+  summary,
+  defaultOpen = true,
+  children,
+  "data-testid": testId,
+}: MarketplaceDetailSectionProps) {
+  return (
+    <Collapsible
+      className="flex min-w-0 flex-col"
+      data-testid={testId}
+      defaultOpen={defaultOpen}
+      render={<section aria-label={title} />}
+    >
+      <CollapsibleTrigger
+        className={cn(
+          "group/detail-section flex w-full items-center gap-2 pb-2.5 text-left",
+          "rounded-sm focus-visible:shadow-focus-ring focus-visible:outline-none"
+        )}
+        type="button"
+      >
+        <Icon aria-hidden="true" className="size-3.5 shrink-0 text-subtle" />
+        <Eyebrow className="text-subtle">{title}</Eyebrow>
+        {summary !== undefined && summary !== null ? (
+          <span className="min-w-0 truncate text-eyebrow text-faint">{summary}</span>
+        ) : null}
+        <span aria-hidden="true" className="flex-1" />
+        <ChevronDown
+          aria-hidden="true"
+          className={cn(
+            "size-3.5 shrink-0 -rotate-90 text-faint",
+            "transition-transform duration-base group-data-panel-open/detail-section:rotate-0"
+          )}
+        />
+      </CollapsibleTrigger>
+      <CollapsibleContent>
+        <Panel bodyClassName="p-0" className="overflow-hidden">
+          {children}
+        </Panel>
+      </CollapsibleContent>
+    </Collapsible>
+  );
+}
+
+interface MarketplaceDetailRailCardProps {
+  icon: LucideIcon;
+  title: string;
+  summary?: ReactNode;
+  defaultOpen?: boolean;
+  children: ReactNode;
+  "data-testid"?: string;
+}
+
+/** Rail collapsible property card: a flat panel with a hover-lit summary over a short body. */
+function MarketplaceDetailRailCard({
+  icon: Icon,
+  title,
+  summary,
+  defaultOpen = true,
+  children,
+  "data-testid": testId,
+}: MarketplaceDetailRailCardProps) {
+  return (
+    <Collapsible
+      data-testid={testId}
+      defaultOpen={defaultOpen}
+      render={<Panel aria-label={title} bodyClassName="p-0" className="overflow-hidden" />}
+    >
+      <CollapsibleTrigger
+        className={cn(
+          "group/detail-rail flex w-full items-center gap-2 px-3.5 py-2.5 text-left",
+          "transition-colors duration-base hover:bg-surface-2",
+          "focus-visible:shadow-focus-inset focus-visible:outline-none"
+        )}
+        type="button"
+      >
+        <Icon aria-hidden="true" className="size-3.5 shrink-0 text-subtle" />
+        <span className="shrink-0 text-item-title font-medium text-fg">{title}</span>
+        <span className="min-w-0 flex-1 truncate text-right text-eyebrow text-faint">
+          {summary}
+        </span>
+        <ChevronDown
+          aria-hidden="true"
+          className={cn(
+            "size-3 shrink-0 -rotate-90 text-faint",
+            "transition-transform duration-base group-data-panel-open/detail-rail:rotate-0"
+          )}
+        />
+      </CollapsibleTrigger>
+      <CollapsibleContent>
+        <div className="border-t border-line-soft pt-1 pb-2">{children}</div>
+      </CollapsibleContent>
+    </Collapsible>
+  );
+}
+
+interface MarketplaceDetailSectionSkeletonProps {
+  icon: LucideIcon;
+  /** The placeholder rows inside the panel. */
+  children: ReactNode;
+}
+
+/**
+ * A main-column section while the entry loads: the real head layout (icon, title, chevron) on a
+ * non-interactive row, over the framed panel. The title is a placeholder because the section a
+ * given entry shows is only known once it arrives.
+ */
+function MarketplaceDetailSectionSkeleton({
+  icon: Icon,
+  children,
+}: MarketplaceDetailSectionSkeletonProps) {
+  return (
+    <section aria-hidden="true" className="flex min-w-0 flex-col">
+      <div className="flex w-full items-center gap-2 pb-2.5">
+        <Icon aria-hidden="true" className="size-3.5 shrink-0 text-subtle" />
+        <Eyebrow className="text-subtle">
+          <SkeletonText className="w-24" />
+        </Eyebrow>
+        <span aria-hidden="true" className="flex-1" />
+        <ChevronDown aria-hidden="true" className="size-3.5 shrink-0 -rotate-90 text-faint" />
+      </div>
+      <Panel bodyClassName="p-0" className="overflow-hidden">
+        {children}
+      </Panel>
+    </section>
+  );
+}
+
+/**
+ * A rail card while the entry loads: the real icon and title on the card's head, over property
+ * row placeholders.
+ */
+function MarketplaceDetailRailCardSkeleton({
+  icon: Icon,
+  title,
+  rows = 4,
+}: {
+  icon: LucideIcon;
+  title: string;
+  rows?: number;
+}) {
+  return (
+    <Panel aria-hidden="true" bodyClassName="p-0" className="overflow-hidden">
+      <div className="flex w-full items-center gap-2 px-3.5 py-2.5">
+        <Icon aria-hidden="true" className="size-3.5 shrink-0 text-subtle" />
+        <span className="shrink-0 text-item-title font-medium text-fg">{title}</span>
+        <span className="min-w-0 flex-1" />
+        <ChevronDown aria-hidden="true" className="size-3 shrink-0 -rotate-90 text-faint" />
+      </div>
+      <div className="border-t border-line-soft pt-1 pb-2">
+        <div className="px-3.5">
+          <PropertyRowSkeleton count={rows} />
+        </div>
+      </div>
+    </Panel>
+  );
+}
+
+/** Quiet explanatory note inside a rail card body. */
+function MarketplaceDetailRailNote({ children }: { children: ReactNode }) {
+  return <p className="px-3.5 pt-1.5 pb-1 text-eyebrow leading-relaxed text-faint">{children}</p>;
+}
+
+/** Rail property row linking to the entry's repository as an owner/repo slug. */
+function MarketplaceRepositoryRow({ repository }: { repository: string | undefined }) {
+  const url = repository?.trim();
+  if (!url) return null;
+  return (
+    <PropertyRow label="Repository" valueTitle={url}>
+      <a
+        className="min-w-0 truncate font-mono text-eyebrow text-muted-foreground transition-colors duration-base hover:text-fg"
+        href={url}
+        rel="noreferrer"
+        target="_blank"
+      >
+        {formatRepositorySlug(url)} ↗
+      </a>
+    </PropertyRow>
+  );
+}
+
+function formatRepositorySlug(url: string): string {
+  try {
+    const parsed = new URL(url);
+    const path = parsed.pathname.replace(/^\/+|\/+$/g, "");
+    return path || parsed.host;
+  } catch {
+    return url;
+  }
+}
+
+export {
+  MarketplaceDetailColumns,
+  MarketplaceDetailRailCard,
+  MarketplaceDetailRailCardSkeleton,
+  MarketplaceDetailRailNote,
+  MarketplaceDetailSection,
+  MarketplaceDetailSectionSkeleton,
+  MarketplaceRepositoryRow,
+};
+export type { MarketplaceDetailRailCardProps, MarketplaceDetailSectionProps };

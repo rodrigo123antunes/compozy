@@ -1,0 +1,306 @@
+/* Nerd Font symbols — shell prompts and agent output lean on Private Use Area
+   icons (powerline separators, devicons, octicons), and browsers resolve no
+   system fallback for PUA codepoints, so an installed Nerd Font on the machine
+   never reaches this document. The bundled Geist Mono ships none of them;
+   the mono stack carries this symbols-only face instead, scoped by
+   unicode-range to exactly the codepoints the font ships so ordinary text
+   never downloads it. `local()` first: an installed copy costs no bytes. */
+@font-face {
+  font-family: "Symbols Nerd Font Mono";
+  font-style: normal;
+  font-weight: 400;
+  font-display: swap;
+  src:
+    local("Symbols Nerd Font Mono"),
+    local("SymbolsNFM"),
+    url("./assets/fonts/symbols-nerd-font-mono.woff2") format("woff2");
+  unicode-range:
+    U+23FB-23FE, U+2630, U+2665, U+26A1, U+276C-2771, U+2B58, U+E000-F533, U+F0001-F1AF0;
+}
+
+[data-theme="dark"],
+.dark {
+  color-scheme: dark;
+}
+
+@layer base {
+  * {
+    @apply border-border outline-ring/50;
+  }
+
+  html,
+  body,
+  #app {
+    min-height: 100%;
+  }
+
+  body {
+    @apply bg-background font-sans text-foreground antialiased;
+    /* Body baseline / DESIGN.md §9: Inter 425 at 13.5px, −0.01em, and
+       Inter's cv11 (single-storey a), as the brand reference sets it. */
+    font-size: var(--text-body);
+    font-weight: var(--font-weight-normal);
+    line-height: 1.5;
+    letter-spacing: var(--tracking-body);
+    font-feature-settings: "cv11";
+    text-rendering: optimizeLegibility;
+  }
+
+  ::selection {
+    background: var(--color-brand-tint);
+    color: var(--color-fg-strong);
+  }
+}
+
+/* Skeleton motion is compositor-only: the sweep is a gradient pseudo-element
+   translated across a clipped box (transform) and the reveal fades the box in
+   (opacity). Neither relayouts or repaints, unlike the background-position
+   shimmer they replaced, which repainted every frame on the main thread. */
+@keyframes skeleton-sweep {
+  from {
+    transform: translateX(-100%);
+  }
+  to {
+    transform: translateX(100%);
+  }
+}
+
+@keyframes skeleton-reveal {
+  from {
+    opacity: 0;
+  }
+}
+
+/* The highlight band that sweeps a skeleton block. The host must clip it
+   (`relative overflow-hidden`); `Skeleton` supplies both. An endless loop at the
+   reduced-motion collapse duration would spin, so reduced motion drops the
+   sweep outright and leaves a still block. */
+@utility skeleton-shimmer {
+  &::after {
+    content: "";
+    position: absolute;
+    inset: 0;
+    pointer-events: none;
+    background-image: linear-gradient(
+      90deg,
+      transparent 0%,
+      color-mix(in srgb, var(--color-fg) 6%, transparent) 50%,
+      transparent 100%
+    );
+    transform: translateX(-100%);
+    animation: skeleton-sweep 2s var(--ease-in-out) infinite;
+
+    @media (prefers-reduced-motion: reduce) {
+      animation: none;
+    }
+  }
+
+  html[data-reduce-motion="true"] &::after {
+    animation: none;
+  }
+}
+
+/* Delayed reveal. The box is laid out at once, so a skeleton that mirrors real
+   geometry reserves its space and the delay costs no layout shift, but it stays
+   transparent for one `base` beat and then fades in over `fast`: a load that
+   settles inside the beat never flashes a placeholder. `backwards` holds the
+   transparent first frame through the delay and leaves no fill behind. A reveal
+   nested inside another rides its ancestor's instead of stacking a second one.
+   Reduced motion cuts the fade (the blanket collapse below zeroes the duration)
+   but keeps the delay: the collapse also zeroes `animation-delay` with
+   !important, and only a layered !important beats an unlayered one. */
+@utility animate-skeleton-reveal {
+  animation: skeleton-reveal var(--duration-fast) var(--ease-out) var(--duration-base) backwards;
+
+  & & {
+    animation: none;
+  }
+
+  @media (prefers-reduced-motion: reduce) {
+    animation-delay: var(--duration-base) !important;
+  }
+
+  html[data-reduce-motion="true"] & {
+    animation-delay: var(--duration-base) !important;
+  }
+}
+
+/* Eyebrow contract / DESIGN.md §3, lesson L-022. One primitive, two fixed
+   renditions: sentence case by default; the uppercase kicker is opt-in via
+   <Eyebrow variant="caps"> and steps down a size with positive tracking
+   (uppercase reads optically larger and never takes negative tracking). */
+@utility eyebrow {
+  @apply font-sans text-(length:--text-eyebrow) font-medium;
+  letter-spacing: var(--tracking-eyebrow);
+}
+
+@utility eyebrow-caps {
+  @apply font-sans text-(length:--text-eyebrow-caps) font-semibold uppercase;
+  letter-spacing: var(--tracking-eyebrow-caps);
+}
+
+@keyframes typing-bounce {
+  0%,
+  60%,
+  100% {
+    opacity: 0.3;
+    transform: translateY(0);
+  }
+  30% {
+    opacity: 1;
+    transform: translateY(-2px);
+  }
+}
+
+/* In-window view transitions (runViewTransition). Only the focused window body
+   carries a transition name; the desktop root never cross-fades. */
+:root {
+  view-transition-name: none;
+}
+
+::view-transition {
+  pointer-events: none;
+}
+
+::view-transition-group(*) {
+  animation-duration: var(--duration-base);
+  animation-timing-function: var(--ease-out);
+}
+
+/* The focused body is named only while a drill runs. A permanent name made every
+   in-window React <ViewTransition> also snapshot the whole body and lay the UA
+   cross-fade over the boundary's own animation. A window whose content declares
+   `data-owns-view-transition` (sibling navigation such as Settings sections)
+   animates through its own boundary instead, so its body is never drilled. */
+html:active-view-transition-type(drill-in, drill-out)
+  [data-view-transition-body="os-window-body"]:not(:has([data-owns-view-transition])) {
+  view-transition-name: os-window-body;
+}
+
+html:active-view-transition-type(drill-in)::view-transition-new(os-window-body) {
+  animation-name: vt-slide-in-from-end;
+}
+
+html:active-view-transition-type(drill-in)::view-transition-old(os-window-body),
+html:active-view-transition-type(drill-out)::view-transition-old(os-window-body) {
+  animation-name: vt-fade-out;
+}
+
+html:active-view-transition-type(drill-out)::view-transition-new(os-window-body) {
+  animation-name: vt-slide-in-from-start;
+}
+
+@keyframes vt-slide-in-from-end {
+  from {
+    opacity: 0;
+    transform: translateX(8px);
+  }
+}
+
+@keyframes vt-slide-in-from-start {
+  from {
+    opacity: 0;
+    transform: translateX(-8px);
+  }
+}
+
+@keyframes vt-fade-out {
+  to {
+    opacity: 0;
+  }
+}
+
+/* React <ViewTransition> vocabulary: the classes `VIEW_TRANSITION_CLASS` names
+   (lib/view-transition.ts). React stamps the matching class on the boundary's
+   `view-transition-class`; each class here styles both snapshots, so it serves
+   enter, exit, update and share alike. Opacity and transform only, from the
+   motion tokens. Group morphs (a boundary that moves or resizes) keep the
+   duration and easing set on ::view-transition-group(*) above. The reduced-motion
+   block at the end of this file cuts every one of these. */
+
+/* Cross-fade for content swaps: segment and tab panels, Suspense reveals. */
+::view-transition-old(.vt-fade) {
+  animation: vt-fade-out var(--duration-fast) var(--ease-out) both;
+}
+
+::view-transition-new(.vt-fade) {
+  animation: vt-fade-in var(--duration-base) var(--ease-out) both;
+}
+
+/* Drill: the arriving view slides in from the end (deeper) or the start (back)
+   while the departing one fades; the same travel as the window-body drill. */
+::view-transition-old(.vt-drill-in),
+::view-transition-old(.vt-drill-out) {
+  animation: vt-fade-out var(--duration-fast) var(--ease-out) both;
+}
+
+::view-transition-new(.vt-drill-in) {
+  animation: vt-slide-in-from-end var(--duration-base) var(--ease-out) both;
+}
+
+::view-transition-new(.vt-drill-out) {
+  animation: vt-slide-in-from-start var(--duration-base) var(--ease-out) both;
+}
+
+/* Collection items: a short rise on the way in, a quicker sink on the way out. */
+::view-transition-new(.vt-item-enter) {
+  animation: vt-item-in var(--duration-base) var(--ease-out) both;
+}
+
+::view-transition-old(.vt-item-exit) {
+  animation: vt-item-out var(--duration-fast) var(--ease-out) both;
+}
+
+@keyframes vt-fade-in {
+  from {
+    opacity: 0;
+  }
+}
+
+@keyframes vt-item-in {
+  from {
+    opacity: 0;
+    transform: translateY(var(--distance-item-enter));
+  }
+}
+
+@keyframes vt-item-out {
+  to {
+    opacity: 0;
+    transform: translateY(var(--distance-item-enter));
+  }
+}
+
+/* The host may request reduced motion even when the system preference is off.
+   View-transition snapshots belong to the document, outside app containers. */
+html[data-reduce-motion="true"],
+html[data-reduce-motion="true"] *,
+html[data-reduce-motion="true"] *::before,
+html[data-reduce-motion="true"] *::after {
+  animation-duration: 0.001ms !important;
+  animation-delay: 0.001ms !important;
+  transition-duration: 0.001ms !important;
+}
+
+html[data-reduce-motion="true"]::view-transition-group(*),
+html[data-reduce-motion="true"]::view-transition-old(*),
+html[data-reduce-motion="true"]::view-transition-new(*) {
+  animation: none !important;
+}
+
+/* `0.001ms` preserves animation-end callbacks while removing visible motion. */
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.001ms !important;
+    animation-delay: 0.001ms !important;
+    transition-duration: 0.001ms !important;
+  }
+
+  ::view-transition-group(*),
+  ::view-transition-old(*),
+  ::view-transition-new(*) {
+    animation: none !important;
+  }
+}

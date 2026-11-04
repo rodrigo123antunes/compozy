@@ -1,0 +1,3358 @@
+package acp
+
+import (
+	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"io"
+	"log/slog"
+	"os"
+	"path/filepath"
+	"slices"
+	"strings"
+	"sync"
+	"testing"
+	"testing/synctest"
+	"time"
+
+	acpsdk "github.com/coder/acp-go-sdk"
+	compozyconfig "github.com/compozy/compozy/internal/config"
+	"github.com/compozy/compozy/internal/store"
+	"github.com/compozy/compozy/internal/toolruntime"
+	toolspkg "github.com/compozy/compozy/internal/tools"
+)
+
+func TestDriverOptionsAndNormalization(t *testing.T) {
+	t.Parallel()
+
+	logger := slog.New(slog.NewTextHandler(os.Stderr, nil))
+	driver := New(
+		WithLogger(logger),
+		WithStopTimeout(2*time.Second),
+		WithPromptBufferSize(9),
+		WithPromptDrainWait(15*time.Millisecond),
+	)
+	if driver.logger != logger {
+		t.Fatal("WithLogger() did not apply")
+	}
+	if driver.stopTimeout != 2*time.Second {
+		t.Fatalf("WithStopTimeout() = %v, want %v", driver.stopTimeout, 2*time.Second)
+	}
+	if driver.promptBufferCap != 9 {
+		t.Fatalf("WithPromptBufferSize() = %d, want 9", driver.promptBufferCap)
+	}
+	if driver.promptDrainWait != 15*time.Millisecond {
+		t.Fatalf("WithPromptDrainWait() = %v, want %v", driver.promptDrainWait, 15*time.Millisecond)
+	}
+
+	root := t.TempDir()
+	normalized, err := normalizeStartOpts(StartOpts{
+		AgentName:   "helper",
+		Command:     "sh -c 'echo ok'",
+		Cwd:         root,
+		Permissions: "",
+	})
+	if err != nil {
+		t.Fatalf("normalizeStartOpts() error = %v", err)
+	}
+	if normalized.Permissions != compozyconfig.PermissionModeApproveReads {
+		t.Fatalf(
+			"normalizeStartOpts() permissions = %q, want %q",
+			normalized.Permissions,
+			compozyconfig.PermissionModeApproveReads,
+		)
+	}
+
+	rootReal := t.TempDir()
+	rootLink := filepath.Join(t.TempDir(), "root-link")
+	if err := os.Symlink(rootReal, rootLink); err != nil {
+		t.Fatalf("os.Symlink(root) error = %v", err)
+	}
+	additionalReal := t.TempDir()
+	additionalLink := filepath.Join(t.TempDir(), "additional-link")
+	if err := os.Symlink(additionalReal, additionalLink); err != nil {
+		t.Fatalf("os.Symlink(additional) error = %v", err)
+	}
+
+	normalizedWithDirs, err := normalizeStartOpts(StartOpts{
+		AgentName:      "helper",
+		Command:        "sh -c 'echo ok'",
+		Cwd:            rootLink,
+		AdditionalDirs: []string{additionalLink, rootReal, additionalLink, "   "},
+	})
+	if err != nil {
+		t.Fatalf("normalizeStartOpts(with additional dirs) error = %v", err)
+	}
+	if got, want := normalizedWithDirs.Cwd, mustCanonicalDir(t, rootReal); got != want {
+		t.Fatalf("normalizeStartOpts() cwd = %q, want %q", got, want)
+	}
+	if got, want := normalizedWithDirs.AdditionalDirs, []string{
+		mustCanonicalDir(t, additionalReal),
+	}; !slices.Equal(
+		got,
+		want,
+	) {
+		t.Fatalf("normalizeStartOpts() additional dirs = %#v, want %#v", got, want)
+	}
+}
+
+func TestFallbackPermissionEventRaw(t *testing.T) {
+	t.Parallel()
+
+	raw := fallbackPermissionEventRaw("request-1", decisionRejectOnce)
+	var decoded map[string]any
+	if err := json.Unmarshal(raw, &decoded); err != nil {
+		t.Fatalf("json.Unmarshal(fallbackPermissionEventRaw()) error = %v", err)
+	}
+	if got := decoded["request_id"]; got != "request-1" {
+		t.Fatalf("request_id = %v, want request-1", got)
+	}
+	if got := decoded["decision"]; got != string(decisionRejectOnce) {
+		t.Fatalf("decision = %v, want %q", got, decisionRejectOnce)
+	}
+
+	pending := fallbackPermissionEventRaw("request-2", decisionPending)
+	decoded = nil
+	if err := json.Unmarshal(pending, &decoded); err != nil {
+		t.Fatalf("json.Unmarshal(pending fallbackPermissionEventRaw()) error = %v", err)
+	}
+	if _, ok := decoded["decision"]; ok {
+		t.Fatalf("pending fallback included decision field: %#v", decoded)
+	}
+}
+
+func TestNormalizeStartOptsRejectsInvalidAdditionalDirs(t *testing.T) {
+	t.Parallel()
+
+	root := t.TempDir()
+	missing := filepath.Join(root, "missing")
+
+	if err := (StartOpts{
+		AgentName:      "helper",
+		Command:        "sh -c 'echo ok'",
+		Cwd:            root,
+		AdditionalDirs: []string{"relative/path"},
+	}).Validate(); err == nil {
+		t.Fatal("StartOpts.Validate(relative additional dir) error = nil, want non-nil")
+	}
+
+	if _, err := normalizeStartOpts(StartOpts{
+		AgentName:      "helper",
+		Command:        "sh -c 'echo ok'",
+		Cwd:            root,
+		AdditionalDirs: []string{missing},
+	}); err == nil {
+		t.Fatal("normalizeStartOpts(missing additional dir) error = nil, want non-nil")
+	}
+}
+
+func TestHandleInboundReadWriteFile(t *testing.T) {
+	t.Parallel()
+
+	proc := newDirectProcess(t, compozyconfig.PermissionModeApproveAll)
+	target := filepath.Join(proc.Cwd, "notes.txt")
+
+	if _, reqErr := proc.handleInbound(
+		t.Context(),
+		acpsdk.ClientMethodFsWriteTextFile,
+		mustMarshalJSON(acpsdk.WriteTextFileRequest{
+			SessionId: "sess-direct",
+			Path:      target,
+			Content:   "line1\nline2\nline3",
+		}),
+	); reqErr != nil {
+		t.Fatalf("handleInbound(write) error = %v", reqErr)
+	}
+
+	response, reqErr := proc.handleInbound(
+		t.Context(),
+		acpsdk.ClientMethodFsReadTextFile,
+		mustMarshalJSON(acpsdk.ReadTextFileRequest{
+			SessionId: "sess-direct",
+			Path:      target,
+			Line:      new(2),
+			Limit:     new(1),
+		}),
+	)
+	if reqErr != nil {
+		t.Fatalf("handleInbound(read) error = %v", reqErr)
+	}
+	readResponse, ok := response.(acpsdk.ReadTextFileResponse)
+	if !ok {
+		t.Fatalf("handleInbound(read) type = %T, want ReadTextFileResponse", response)
+	}
+	if readResponse.Content != "line2" {
+		t.Fatalf("handleInbound(read) content = %q, want %q", readResponse.Content, "line2")
+	}
+}
+
+func TestHandleInboundWriteDenied(t *testing.T) {
+	t.Parallel()
+
+	proc := newDirectProcess(t, compozyconfig.PermissionModeApproveReads)
+	target := filepath.Join(proc.Cwd, "notes.txt")
+
+	if _, reqErr := proc.handleInbound(
+		t.Context(),
+		acpsdk.ClientMethodFsWriteTextFile,
+		mustMarshalJSON(acpsdk.WriteTextFileRequest{
+			SessionId: "sess-direct",
+			Path:      target,
+			Content:   "nope",
+		}),
+	); reqErr == nil {
+		t.Fatal("handleInbound(write denied) error = nil, want non-nil")
+	}
+}
+
+func TestHandleWriteTextFileDeniedByToolGatewayPreventsSideEffect(t *testing.T) {
+	t.Parallel()
+
+	proc := newDirectProcess(t, compozyconfig.PermissionModeApproveAll)
+	proc.toolGateway = toolExecutionGatewayFunc(
+		func(context.Context, ToolExecutionRequest) (ToolExecutionRequest, error) {
+			return ToolExecutionRequest{}, ErrPermissionDenied
+		},
+	)
+
+	target := filepath.Join(proc.Cwd, "denied.txt")
+	if _, err := proc.handleWriteTextFile(t.Context(), acpsdk.WriteTextFileRequest{
+		SessionId: "sess-direct",
+		Path:      target,
+		Content:   "blocked",
+	}); !errors.Is(err, ErrPermissionDenied) {
+		t.Fatalf("handleWriteTextFile() error = %v, want ErrPermissionDenied", err)
+	}
+	if _, err := os.Stat(target); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("Stat(%q) error = %v, want os.ErrNotExist", target, err)
+	}
+}
+
+func TestHandleWriteTextFileAppliesToolGatewayPatch(t *testing.T) {
+	t.Parallel()
+
+	proc := newDirectProcess(t, compozyconfig.PermissionModeApproveAll)
+	patchedPath := filepath.Join(proc.Cwd, "patched.txt")
+	proc.toolGateway = toolExecutionGatewayFunc(
+		func(_ context.Context, req ToolExecutionRequest) (ToolExecutionRequest, error) {
+			req.Input = mustMarshalJSON(writeTextFileToolInput{
+				Path:    patchedPath,
+				Content: "patched",
+			})
+			return req, nil
+		},
+	)
+
+	originalPath := filepath.Join(proc.Cwd, "original.txt")
+	if _, err := proc.handleWriteTextFile(t.Context(), acpsdk.WriteTextFileRequest{
+		SessionId: "sess-direct",
+		Path:      originalPath,
+		Content:   "original",
+	}); err != nil {
+		t.Fatalf("handleWriteTextFile() error = %v", err)
+	}
+
+	if _, err := os.Stat(originalPath); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("Stat(%q) error = %v, want os.ErrNotExist", originalPath, err)
+	}
+	got, err := os.ReadFile(patchedPath)
+	if err != nil {
+		t.Fatalf("ReadFile(%q) error = %v", patchedPath, err)
+	}
+	if string(got) != "patched" {
+		t.Fatalf("patched file content = %q, want %q", string(got), "patched")
+	}
+}
+
+func TestHandleInboundPermissionRequest(t *testing.T) {
+	t.Parallel()
+
+	proc := newDirectProcess(t, compozyconfig.PermissionModeApproveReads)
+	proc.permissionTimeout = time.Second
+	active, err := proc.beginPrompt("turn-permission", 8)
+	if err != nil {
+		t.Fatalf("beginPrompt() error = %v", err)
+	}
+	defer proc.endPrompt(active)
+
+	title := "permission request"
+	path := filepath.Join(proc.Cwd, "secret.txt")
+	kind := acpsdk.ToolKindEdit
+	request := acpsdk.RequestPermissionRequest{
+		SessionId: "sess-direct",
+		Meta:      map[string]any{PermissionToolIDMetaKey: "compozy__terminal_exec"},
+		Options: []acpsdk.PermissionOption{
+			{OptionId: "allow-once", Name: "allow once", Kind: acpsdk.PermissionOptionKindAllowOnce},
+			{OptionId: "allow-always", Name: "allow always", Kind: acpsdk.PermissionOptionKindAllowAlways},
+			{OptionId: "reject-once", Name: "reject once", Kind: acpsdk.PermissionOptionKindRejectOnce},
+			{OptionId: "reject-always", Name: "reject always", Kind: acpsdk.PermissionOptionKindRejectAlways},
+		},
+		ToolCall: acpsdk.ToolCallUpdate{
+			ToolCallId: "tool-1",
+			Title:      &title,
+			Kind:       &kind,
+			RawInput: map[string]any{
+				"command": "rm -rf /tmp/demo",
+			},
+			Locations: []acpsdk.ToolCallLocation{{Path: path}},
+		},
+	}
+	resultCh := make(chan acpsdk.RequestPermissionResponse, 1)
+	errCh := make(chan *acpsdk.RequestError, 1)
+	go func() {
+		response, reqErr := proc.handleInbound(
+			t.Context(),
+			acpsdk.ClientMethodSessionRequestPermission,
+			mustMarshalJSON(request),
+		)
+		if reqErr != nil {
+			errCh <- reqErr
+			return
+		}
+		permissionResponse, ok := response.(acpsdk.RequestPermissionResponse)
+		if !ok {
+			errCh <- requestError(errors.New("unexpected permission response type"))
+			return
+		}
+		resultCh <- permissionResponse
+	}()
+
+	initialEvents := collectEventsUntilCount(t, active.events, 1)
+	if len(initialEvents) != 1 || initialEvents[0].Type != EventTypePermission {
+		t.Fatalf("initial permission events = %#v, want one permission event", initialEvents)
+	}
+	if initialEvents[0].Decision != "" {
+		t.Fatalf("initial permission decision = %q, want empty", initialEvents[0].Decision)
+	}
+	requestID := initialEvents[0].RequestIDValue()
+	if requestID == "" {
+		t.Fatal("initial permission request_id = empty, want non-empty")
+	}
+	if !proc.HasPendingPermission() {
+		t.Fatal("HasPendingPermission() = false while an interactive permission is waiting")
+	}
+
+	raw := decodePermissionEventRaw(t, initialEvents[0].Raw)
+	if raw.RequestID != requestID {
+		t.Fatalf("raw.request_id = %q, want %q", raw.RequestID, requestID)
+	}
+	if len(raw.Options) != 4 {
+		t.Fatalf("raw.options = %#v, want 4 permission options", raw.Options)
+	}
+	if got := raw.ToolInput["command"]; got != "rm -rf /tmp/demo" {
+		t.Fatalf("raw.tool_input.command = %#v, want %q", got, "rm -rf /tmp/demo")
+	}
+	if raw.ToolID != "compozy__terminal_exec" {
+		t.Fatalf("raw.tool_id = %q, want compozy__terminal_exec", raw.ToolID)
+	}
+
+	if err := proc.ResolvePermission(ApproveRequest{
+		RequestID:  requestID,
+		Decision:   string(decisionAllowAlways),
+		ResolvedBy: "agent_session:sess-creator",
+	}); err != nil {
+		t.Fatalf("ResolvePermission() error = %v", err)
+	}
+	if proc.HasPendingPermission() {
+		t.Fatal("HasPendingPermission() = true after resolving the interactive permission")
+	}
+
+	select {
+	case reqErr := <-errCh:
+		t.Fatalf("handleInbound(permission) error = %v", reqErr)
+	case permissionResponse := <-resultCh:
+		if permissionResponse.Outcome.Selected == nil ||
+			permissionResponse.Outcome.Selected.OptionId != "allow-always" {
+			t.Fatalf("permission outcome = %#v, want allow-always option", permissionResponse.Outcome)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for permission response")
+	}
+
+	finalEvents := collectEventsUntilCount(t, active.events, 1)
+	if len(finalEvents) != 1 || finalEvents[0].Decision != string(decisionAllowAlways) {
+		t.Fatalf("final permission events = %#v, want allow-always decision", finalEvents)
+	}
+	if finalEvents[0].ResolvedByValue() != "agent_session:sess-creator" {
+		t.Fatalf("final permission resolved_by = %q, want acting session", finalEvents[0].ResolvedByValue())
+	}
+}
+
+func TestResolvePermissionUnknownRequest(t *testing.T) {
+	t.Parallel()
+
+	proc := newDirectProcess(t, compozyconfig.PermissionModeDenyAll)
+	err := proc.ResolvePermission(ApproveRequest{
+		RequestID: "missing",
+		Decision:  string(decisionAllowOnce),
+	})
+	if !errors.Is(err, ErrPendingPermissionNotFound) {
+		t.Fatalf("ResolvePermission(missing) error = %v, want ErrPendingPermissionNotFound", err)
+	}
+}
+
+func TestResolvePermissionRejectsUnsupportedPersistentDecision(t *testing.T) {
+	t.Parallel()
+
+	t.Run("Should reject unsupported persistent decision and keep pending request", func(t *testing.T) {
+		t.Parallel()
+
+		proc := newDirectProcess(t, compozyconfig.PermissionModeDenyAll)
+		requestID, pending, registerErr := proc.registerPendingPermission(
+			"turn-unsupported",
+			acpsdk.RequestPermissionRequest{
+				Options: []acpsdk.PermissionOption{
+					{OptionId: "reject-once", Name: "reject once", Kind: acpsdk.PermissionOptionKindRejectOnce},
+				},
+				ToolCall: acpsdk.ToolCallUpdate{ToolCallId: "tool-unsupported"},
+			},
+		)
+		if registerErr != nil {
+			t.Fatal(registerErr)
+		}
+		t.Cleanup(func() {
+			proc.clearPendingPermission(requestID)
+		})
+
+		err := proc.ResolvePermission(ApproveRequest{
+			RequestID: requestID,
+			Decision:  string(decisionRejectAlways),
+		})
+		if !errors.Is(err, ErrPermissionDecisionUnsupported) {
+			t.Fatalf("ResolvePermission() error = %v, want ErrPermissionDecisionUnsupported", err)
+		}
+		select {
+		case decision := <-pending.response:
+			t.Fatalf("pending response = %q, want none", decision)
+		default:
+		}
+		if _, ok := proc.pendingPermissions[requestID]; !ok {
+			t.Fatal("pending permission was removed after unsupported decision")
+		}
+	})
+}
+
+func TestPermissionBoundsAndConnectionDeath(t *testing.T) {
+	t.Parallel()
+	request := acpsdk.RequestPermissionRequest{
+		SessionId: "sess-direct",
+		Meta:      map[string]any{PermissionToolIDMetaKey: "compozy__terminal_exec"},
+		Options: []acpsdk.PermissionOption{
+			{OptionId: "reject", Name: "reject", Kind: acpsdk.PermissionOptionKindRejectOnce},
+		},
+		ToolCall: acpsdk.ToolCallUpdate{
+			ToolCallId: "write",
+			Kind:       new(acpsdk.ToolKindEdit),
+			RawInput:   map[string]any{"command": "write file"},
+		},
+	}
+	t.Run("Should refuse another inbound request when the pending map is full", func(t *testing.T) {
+		t.Parallel()
+		proc := newDirectProcess(t, compozyconfig.PermissionModeApproveReads)
+		for range maxPendingPermissions {
+			if _, _, err := proc.registerPendingPermission("turn", request); err != nil {
+				t.Fatal(err)
+			}
+		}
+		if _, err := proc.handleRequestPermission(t.Context(), request); !errors.Is(err, ErrPermissionQueueFull) {
+			t.Fatalf("permission at cap = %v", err)
+		}
+		if len(proc.pendingPermissions) != maxPendingPermissions {
+			t.Fatalf("pending permissions = %d", len(proc.pendingPermissions))
+		}
+	})
+	t.Run("Should cancel every pending permission when the connection closes", func(t *testing.T) {
+		t.Parallel()
+		proc := newDirectProcess(t, compozyconfig.PermissionModeApproveReads)
+		reader, writer := io.Pipe()
+		defer func() {
+			if err := reader.Close(); err != nil {
+				t.Error(err)
+			}
+		}()
+		proc.conn = acpsdk.NewConnection(proc.handleInbound, io.Discard, reader)
+		active, err := proc.beginPrompt("turn-permissions", 16)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer proc.endPrompt(active)
+		results := make(chan error, 8)
+		for range 8 {
+			go func() {
+				response, err := proc.handleRequestPermission(t.Context(), request)
+				if err == nil &&
+					response.Outcome.Cancelled == nil { //nolint:misspell // ACP SDK field uses British spelling.
+					err = errors.New("permission did not resolve canceled after connection death")
+				}
+				results <- err
+			}()
+		}
+		for range 8 {
+			if event := <-active.events; event.Type != EventTypePermission {
+				t.Fatalf("pending event = %#v", event)
+			}
+		}
+		if err := writer.Close(); err != nil {
+			t.Fatal(err)
+		}
+		for range 8 {
+			if err := <-results; err != nil {
+				t.Fatal(err)
+			}
+		}
+		if proc.HasPendingPermission() {
+			t.Fatal("connection death left pending permissions")
+		}
+		for _, event := range collectEventsUntilCount(t, active.events, 8) {
+			if event.Type != EventTypePermission || event.Decision != "canceled" ||
+				event.ResolvedByValue() != "provider" || event.RequestIDValue() == "" {
+				t.Fatalf("connection death event = %#v, want attributed terminal cancellation", event)
+			}
+		}
+	})
+	for _, test := range []struct {
+		name   string
+		cause  error
+		native bool
+		actor  string
+	}{
+		{name: "Should close the permission event when the caller cancels", cause: context.Canceled, actor: "provider"},
+		{name: "Should close the permission event when the caller deadline expires", cause: context.DeadlineExceeded, actor: "provider"},
+		{name: "Should attribute native approval deadlines to timeout", cause: context.DeadlineExceeded, native: true, actor: "timeout"},
+		{name: "Should preserve system attribution for a canceled native approval", cause: context.Canceled, native: true, actor: "system"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+			proc := newDirectProcess(t, compozyconfig.PermissionModeApproveReads)
+			active, err := proc.beginPrompt("turn-canceled", 2)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer proc.endPrompt(active)
+			ctx, cancel := context.WithCancelCause(t.Context())
+			defer cancel(context.Canceled)
+			result := make(chan error, 1)
+			go func() {
+				var response acpsdk.RequestPermissionResponse
+				var err error
+				if test.native {
+					response, err = proc.RequestPermission(ctx, request)
+				} else {
+					response, err = proc.handleRequestPermission(ctx, request)
+				}
+				if err == nil &&
+					response.Outcome.Cancelled == nil { //nolint:misspell // ACP SDK field uses British spelling.
+					err = errors.New("permission did not return a canceled outcome")
+				}
+				result <- err
+			}()
+			pending := collectEventsUntilCount(t, active.events, 1)[0]
+			if pending.Decision != "" {
+				t.Fatalf("initial permission = %#v, want pending", pending)
+			}
+			cancel(test.cause)
+			if err := <-result; err != nil {
+				t.Fatal(err)
+			}
+			terminal := collectEventsUntilCount(t, active.events, 1)[0]
+			if terminal.Decision != "canceled" || terminal.ResolvedByValue() != test.actor ||
+				terminal.RequestIDValue() != pending.RequestIDValue() {
+				t.Fatalf("terminal permission = %#v, want cancellation of %q", terminal, pending.RequestIDValue())
+			}
+			if proc.HasPendingPermission() {
+				t.Fatal("caller cancellation left an actionable permission")
+			}
+		})
+	}
+}
+
+func TestPermissionExpiryOwnership(t *testing.T) {
+	for _, operatorFirst := range []bool{false, true} {
+		name := "Should reject answers after expiry wins"
+		if operatorFirst {
+			name = "Should preserve an operator answer that wins before expiry"
+		}
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+			proc := newDirectProcess(t, compozyconfig.PermissionModeApproveReads)
+			id, pending, err := proc.registerPendingPermission("turn", acpsdk.RequestPermissionRequest{})
+			if err != nil {
+				t.Fatal(err)
+			}
+			answer := ApproveRequest{RequestID: id, Decision: string(decisionAllowOnce)}
+			if operatorFirst {
+				if err := proc.ResolvePermission(answer); err != nil {
+					t.Fatal(err)
+				}
+			}
+			decision, actor := proc.expirePendingPermission(pending, decisionRejectOnce, "timeout")
+			if operatorFirst {
+				if decision != decisionAllowOnce || actor != "operator" {
+					t.Fatalf("winner = %s/%s", decision, actor)
+				}
+			} else if decision != decisionRejectOnce || actor != "timeout" {
+				t.Fatalf("winner = %s/%s", decision, actor)
+			}
+			if err := proc.ResolvePermission(answer); !errors.Is(err, ErrPendingPermissionNotFound) {
+				t.Fatalf("late answer = %v", err)
+			}
+		})
+	}
+}
+
+func TestHandleInboundPermissionRequestTimeout(t *testing.T) {
+	t.Parallel()
+	t.Run("Should close expiry without a provider rejection option", func(t *testing.T) {
+		t.Parallel()
+		proc := newDirectProcess(t, compozyconfig.PermissionModeApproveReads)
+		proc.permissionTimeout = time.Nanosecond
+		active, err := proc.beginPrompt("turn-no-reject", 2)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer proc.endPrompt(active)
+		response, err := proc.handleRequestPermission(t.Context(), acpsdk.RequestPermissionRequest{
+			SessionId: "sess-direct",
+			ToolCall:  acpsdk.ToolCallUpdate{ToolCallId: "write", Kind: new(acpsdk.ToolKindEdit)},
+			Options:   []acpsdk.PermissionOption{{OptionId: "allow", Kind: acpsdk.PermissionOptionKindAllowOnce}},
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if response.Outcome.Selected != nil {
+			t.Fatal("expired request was allowed")
+		}
+		events := collectEventsUntilCount(t, active.events, 2)
+		terminal := events[1]
+		if terminal.Decision != "canceled" || terminal.ResolvedByValue() != "timeout" {
+			t.Fatalf("terminal = %#v", terminal)
+		}
+		if err := proc.ResolvePermission(
+			ApproveRequest{RequestID: terminal.RequestIDValue(), Decision: string(decisionAllowOnce)},
+		); !errors.Is(
+			err,
+			ErrPendingPermissionNotFound,
+		) {
+			t.Fatalf("late answer = %v", err)
+		}
+	})
+	t.Run("Should attribute automatic rejection to timeout", func(t *testing.T) {
+		t.Parallel()
+
+		proc := newDirectProcess(t, compozyconfig.PermissionModeApproveReads)
+		proc.permissionTimeout = 25 * time.Millisecond
+		active, err := proc.beginPrompt("turn-timeout", 8)
+		if err != nil {
+			t.Fatalf("beginPrompt() error = %v", err)
+		}
+		defer proc.endPrompt(active)
+
+		title := "permission request"
+		kind := acpsdk.ToolKindEdit
+		response, reqErr := proc.handleInbound(
+			t.Context(),
+			acpsdk.ClientMethodSessionRequestPermission,
+			mustMarshalJSON(acpsdk.RequestPermissionRequest{
+				SessionId: "sess-direct",
+				Options: []acpsdk.PermissionOption{
+					{OptionId: "allow-once", Name: "allow once", Kind: acpsdk.PermissionOptionKindAllowOnce},
+					{OptionId: "reject-once", Name: "reject once", Kind: acpsdk.PermissionOptionKindRejectOnce},
+				},
+				ToolCall: acpsdk.ToolCallUpdate{
+					ToolCallId: "tool-timeout",
+					Title:      &title,
+					Kind:       &kind,
+				},
+			}),
+		)
+		if reqErr != nil {
+			t.Fatalf("handleInbound(permission timeout) error = %v", reqErr)
+		}
+
+		permissionResponse, ok := response.(acpsdk.RequestPermissionResponse)
+		if !ok {
+			t.Fatalf("handleInbound(permission timeout) type = %T, want RequestPermissionResponse", response)
+		}
+		if permissionResponse.Outcome.Selected == nil || permissionResponse.Outcome.Selected.OptionId != "reject-once" {
+			t.Fatalf("permission timeout outcome = %#v, want reject-once option", permissionResponse.Outcome)
+		}
+
+		events := collectEventsUntilCount(t, active.events, 2)
+		if events[0].Decision != "" {
+			t.Fatalf("initial timeout decision = %q, want empty", events[0].Decision)
+		}
+		if events[1].Decision != string(decisionRejectOnce) {
+			t.Fatalf("final timeout decision = %q, want %q", events[1].Decision, decisionRejectOnce)
+		}
+		if got := events[1].ResolvedByValue(); got != "timeout" {
+			t.Fatalf("final timeout resolved_by = %q, want timeout", got)
+		}
+	})
+}
+
+func TestHandleInboundPermissionRequestHonorsDenyAllWithToolGateway(t *testing.T) {
+	t.Parallel()
+
+	proc := newDirectProcess(t, compozyconfig.PermissionModeDenyAll)
+	proc.toolGateway = toolExecutionGatewayFunc(
+		func(_ context.Context, req ToolExecutionRequest) (ToolExecutionRequest, error) {
+			return req, nil
+		},
+	)
+	active, err := proc.beginPrompt("turn-deny-all", 8)
+	if err != nil {
+		t.Fatalf("beginPrompt() error = %v", err)
+	}
+	defer proc.endPrompt(active)
+
+	title := "Write"
+	kind := acpsdk.ToolKindEdit
+	response, reqErr := proc.handleInbound(
+		t.Context(),
+		acpsdk.ClientMethodSessionRequestPermission,
+		mustMarshalJSON(acpsdk.RequestPermissionRequest{
+			SessionId: "sess-direct",
+			Options: []acpsdk.PermissionOption{
+				{OptionId: "allow-once", Name: "allow once", Kind: acpsdk.PermissionOptionKindAllowOnce},
+				{OptionId: "reject-once", Name: "reject once", Kind: acpsdk.PermissionOptionKindRejectOnce},
+			},
+			ToolCall: acpsdk.ToolCallUpdate{
+				ToolCallId: "tool-deny-all",
+				Title:      &title,
+				Kind:       &kind,
+				RawInput: map[string]any{
+					"path":    filepath.Join(proc.Cwd, "deny-all.txt"),
+					"content": "blocked",
+				},
+				Locations: []acpsdk.ToolCallLocation{{Path: filepath.Join(proc.Cwd, "deny-all.txt")}},
+			},
+		}),
+	)
+	if reqErr != nil {
+		t.Fatalf("handleInbound(permission deny-all) error = %v", reqErr)
+	}
+
+	permissionResponse, ok := response.(acpsdk.RequestPermissionResponse)
+	if !ok {
+		t.Fatalf("handleInbound(permission deny-all) type = %T, want RequestPermissionResponse", response)
+	}
+	if permissionResponse.Outcome.Selected == nil || permissionResponse.Outcome.Selected.OptionId != "reject-once" {
+		t.Fatalf("permission deny-all outcome = %#v, want reject-once option", permissionResponse.Outcome)
+	}
+
+	events := collectEventsUntilCount(t, active.events, 1)
+	if len(events) != 1 || events[0].Decision != string(decisionRejectOnce) {
+		t.Fatalf("permission deny-all events = %#v, want one reject-once event", events)
+	}
+}
+
+func TestHandleInboundPermissionRequestHonorsApproveAllWithToolGateway(t *testing.T) {
+	t.Parallel()
+
+	proc := newDirectProcess(t, compozyconfig.PermissionModeApproveAll)
+	proc.toolGateway = toolExecutionGatewayFunc(
+		func(_ context.Context, req ToolExecutionRequest) (ToolExecutionRequest, error) {
+			return req, nil
+		},
+	)
+	active, err := proc.beginPrompt("turn-approve-all", 8)
+	if err != nil {
+		t.Fatalf("beginPrompt() error = %v", err)
+	}
+	defer proc.endPrompt(active)
+
+	title := "Write"
+	kind := acpsdk.ToolKindEdit
+	response, reqErr := proc.handleInbound(
+		t.Context(),
+		acpsdk.ClientMethodSessionRequestPermission,
+		mustMarshalJSON(acpsdk.RequestPermissionRequest{
+			SessionId: "sess-direct",
+			Options: []acpsdk.PermissionOption{
+				{OptionId: "allow-once", Name: "allow once", Kind: acpsdk.PermissionOptionKindAllowOnce},
+				{OptionId: "reject-once", Name: "reject once", Kind: acpsdk.PermissionOptionKindRejectOnce},
+			},
+			ToolCall: acpsdk.ToolCallUpdate{
+				ToolCallId: "tool-approve-all",
+				Title:      &title,
+				Kind:       &kind,
+				RawInput: map[string]any{
+					"path":    filepath.Join(proc.Cwd, "approve-all.txt"),
+					"content": "allowed",
+				},
+				Locations: []acpsdk.ToolCallLocation{{Path: filepath.Join(proc.Cwd, "approve-all.txt")}},
+			},
+		}),
+	)
+	if reqErr != nil {
+		t.Fatalf("handleInbound(permission approve-all) error = %v", reqErr)
+	}
+
+	permissionResponse, ok := response.(acpsdk.RequestPermissionResponse)
+	if !ok {
+		t.Fatalf("handleInbound(permission approve-all) type = %T, want RequestPermissionResponse", response)
+	}
+	if permissionResponse.Outcome.Selected == nil || permissionResponse.Outcome.Selected.OptionId != "allow-once" {
+		t.Fatalf("permission approve-all outcome = %#v, want allow-once option", permissionResponse.Outcome)
+	}
+
+	events := collectEventsUntilCount(t, active.events, 1)
+	if len(events) != 1 || events[0].Decision != string(decisionAllowOnce) {
+		t.Fatalf("permission approve-all events = %#v, want one allow-once event", events)
+	}
+}
+
+func TestEmitPermissionEvent(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name     string
+		decision permissionDecision
+	}{
+		{name: "ShouldHandleInteractivePending", decision: ""},
+		{name: "ShouldAllowOnceAutomatically", decision: decisionAllowOnce},
+		{name: "ShouldRejectOnceOnTimeout", decision: decisionRejectOnce},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			proc := newDirectProcess(t, compozyconfig.PermissionModeDenyAll)
+			active, err := proc.beginPrompt("turn-permission-event", 4)
+			if err != nil {
+				t.Fatalf("beginPrompt() error = %v", err)
+			}
+			defer proc.endPrompt(active)
+
+			raw := mustMarshalJSON(map[string]any{"decision": string(tt.decision), "value": "original"})
+			wantRaw := append(json.RawMessage(nil), raw...)
+
+			proc.emitPermissionEvent(
+				"sess-emit",
+				"turn-permission-event",
+				"req-1",
+				"permission request",
+				"tool-1",
+				"/tmp/demo.txt",
+				tt.decision,
+				"provider",
+				raw,
+			)
+			event := collectEventsUntilCount(t, active.events, 1)[0]
+
+			raw[0] = '['
+
+			if event.Type != EventTypePermission {
+				t.Fatalf("event.Type = %q, want %q", event.Type, EventTypePermission)
+			}
+			if event.SessionID != "sess-emit" || event.TurnID != "turn-permission-event" ||
+				event.RequestIDValue() != "req-1" {
+				t.Fatalf("event ids = %#v, want session/turn/request populated", event)
+			}
+			if event.Title != "permission request" || event.ToolCallID != "tool-1" {
+				t.Fatalf("event title/tool = %#v, want copied fields", event)
+			}
+			if event.Action != string(permissionRequestToolGrant) || event.Resource != "/tmp/demo.txt" {
+				t.Fatalf("event action/resource = %#v, want permission action/resource", event)
+			}
+			if event.Decision != string(tt.decision) {
+				t.Fatalf("event.Decision = %q, want %q", event.Decision, tt.decision)
+			}
+			if event.Timestamp.IsZero() {
+				t.Fatal("event.Timestamp = zero, want populated")
+			}
+			if string(event.Raw) != string(wantRaw) {
+				t.Fatalf("event.Raw = %s, want %s", string(event.Raw), string(wantRaw))
+			}
+		})
+	}
+}
+
+func TestResolvePermissionByTurnIDConflictsWhenMultipleRequestsPending(t *testing.T) {
+	t.Parallel()
+
+	proc := newDirectProcess(t, compozyconfig.PermissionModeDenyAll)
+	turnID := "turn-conflict"
+	_, first, registerErr := proc.registerPendingPermission(turnID, acpsdk.RequestPermissionRequest{
+		ToolCall: acpsdk.ToolCallUpdate{ToolCallId: "tool-1"},
+	})
+	if registerErr != nil {
+		t.Fatal(registerErr)
+	}
+	_, second, registerErr := proc.registerPendingPermission(turnID, acpsdk.RequestPermissionRequest{
+		ToolCall: acpsdk.ToolCallUpdate{ToolCallId: "tool-2"},
+	})
+	if registerErr != nil {
+		t.Fatal(registerErr)
+	}
+	t.Cleanup(func() {
+		proc.clearPendingPermission(first.requestID)
+		proc.clearPendingPermission(second.requestID)
+	})
+
+	err := proc.ResolvePermission(ApproveRequest{
+		TurnID:   turnID,
+		Decision: string(decisionRejectOnce),
+	})
+	if !errors.Is(err, ErrPendingPermissionConflict) {
+		t.Fatalf("ResolvePermission(turn conflict) error = %v, want ErrPendingPermissionConflict", err)
+	}
+}
+
+func TestResolvePermissionConcurrentSafety(t *testing.T) {
+	t.Parallel()
+
+	proc := newDirectProcess(t, compozyconfig.PermissionModeDenyAll)
+
+	const total = 8
+	type registered struct {
+		requestID string
+		response  chan permissionDecision
+	}
+
+	registeredPending := make([]registered, 0, total)
+	for i := range total {
+		requestID, pending, registerErr := proc.registerPendingPermission(
+			fmt.Sprintf("turn-%d", i),
+			acpsdk.RequestPermissionRequest{
+				ToolCall: acpsdk.ToolCallUpdate{ToolCallId: acpsdk.ToolCallId(fmt.Sprintf("tool-%d", i))},
+			},
+		)
+		if registerErr != nil {
+			t.Fatal(registerErr)
+		}
+		registeredPending = append(registeredPending, registered{
+			requestID: requestID,
+			response:  pending.response,
+		})
+	}
+
+	var wg sync.WaitGroup
+	for _, pending := range registeredPending {
+		wg.Go(func() {
+			if err := proc.ResolvePermission(ApproveRequest{
+				RequestID: pending.requestID,
+				Decision:  string(decisionAllowOnce),
+			}); err != nil {
+				t.Errorf("ResolvePermission(%q) error = %v", pending.requestID, err)
+			}
+		})
+	}
+	wg.Wait()
+
+	for _, pending := range registeredPending {
+		select {
+		case decision := <-pending.response:
+			if decision != decisionAllowOnce {
+				t.Fatalf("pending response = %q, want %q", decision, decisionAllowOnce)
+			}
+		case <-time.After(2 * time.Second):
+			t.Fatalf("timed out waiting for pending response %q", pending.requestID)
+		}
+	}
+	if len(proc.pendingPermissions) != 0 {
+		t.Fatalf("pendingPermissions = %#v, want empty", proc.pendingPermissions)
+	}
+}
+
+func TestHandleInboundPermissionRequestAutoApprovesReadRequests(t *testing.T) {
+	t.Parallel()
+
+	proc := newDirectProcess(t, compozyconfig.PermissionModeApproveReads)
+	active, err := proc.beginPrompt("turn-read", 8)
+	if err != nil {
+		t.Fatalf("beginPrompt() error = %v", err)
+	}
+	defer proc.endPrompt(active)
+
+	title := "read file"
+	kind := acpsdk.ToolKindRead
+	response, reqErr := proc.handleInbound(
+		t.Context(),
+		acpsdk.ClientMethodSessionRequestPermission,
+		mustMarshalJSON(acpsdk.RequestPermissionRequest{
+			SessionId: "sess-direct",
+			Options: []acpsdk.PermissionOption{
+				{OptionId: "allow-once", Name: "allow once", Kind: acpsdk.PermissionOptionKindAllowOnce},
+				{OptionId: "reject-once", Name: "reject once", Kind: acpsdk.PermissionOptionKindRejectOnce},
+			},
+			ToolCall: acpsdk.ToolCallUpdate{
+				ToolCallId: "tool-read",
+				Title:      &title,
+				Kind:       &kind,
+				Locations:  []acpsdk.ToolCallLocation{{Path: filepath.Join(proc.Cwd, "notes.txt")}},
+			},
+		}),
+	)
+	if reqErr != nil {
+		t.Fatalf("handleInbound(read permission) error = %v", reqErr)
+	}
+
+	permissionResponse, ok := response.(acpsdk.RequestPermissionResponse)
+	if !ok {
+		t.Fatalf("handleInbound(read permission) type = %T, want RequestPermissionResponse", response)
+	}
+	if permissionResponse.Outcome.Selected == nil || permissionResponse.Outcome.Selected.OptionId != "allow-once" {
+		t.Fatalf("permission outcome = %#v, want reject option", permissionResponse.Outcome)
+	}
+
+	events := collectEventsUntilCount(t, active.events, 1)
+	if len(events) != 1 || events[0].Decision != string(decisionAllowOnce) {
+		t.Fatalf("permission events = %#v, want allow-once permission event", events)
+	}
+}
+
+// assertTerminalLifecycleHandlers exercises terminal creation, polling, release, and validation through ACP handlers.
+func assertTerminalLifecycleHandlers(t *testing.T) {
+	t.Parallel()
+
+	proc := newDirectProcess(t, compozyconfig.PermissionModeApproveAll)
+	proc.terminals.scope.SessionID = "compozy-session"
+	active, err := proc.beginPromptForRun("turn-terminal-lifecycle", "run-terminal-lifecycle", 17, 8)
+	if err != nil {
+		t.Fatalf("beginPromptForRun() error = %v", err)
+	}
+	t.Cleanup(func() { proc.endPrompt(active) })
+
+	createResult, reqErr := proc.handleInbound(
+		t.Context(),
+		acpsdk.ClientMethodTerminalCreate,
+		mustMarshalJSON(acpsdk.CreateTerminalRequest{
+			SessionId: "sess-direct",
+			Command:   "sh",
+			Args:      []string{"-c", `printf '%s' "$COMPOZY_SESSION_ID"`},
+			Env:       []acpsdk.EnvVariable{{Name: "COMPOZY_SESSION_ID", Value: "spoofed-session"}},
+			Cwd:       new(proc.Cwd),
+		}),
+	)
+	if reqErr != nil {
+		t.Fatalf("handleInbound(create terminal) error = %v", reqErr)
+	}
+	createResponse, ok := createResult.(acpsdk.CreateTerminalResponse)
+	if !ok {
+		t.Fatalf("handleInbound(create terminal) type = %T, want CreateTerminalResponse", createResult)
+	}
+	managed, err := proc.terminals.lookup(createResponse.TerminalId)
+	if err != nil {
+		t.Fatalf("terminal lookup error = %v", err)
+	}
+	if managed.actor.RunID != "run-terminal-lifecycle" || managed.actor.Generation != 17 ||
+		managed.actor.RunID == "turn-terminal-lifecycle" {
+		t.Fatalf("terminal actor identity = %#v, want distinct run id and generation 17", managed.actor)
+	}
+
+	waitResult, reqErr := proc.handleInbound(
+		t.Context(),
+		acpsdk.ClientMethodTerminalWaitForExit,
+		mustMarshalJSON(acpsdk.WaitForTerminalExitRequest{
+			SessionId:  "sess-direct",
+			TerminalId: createResponse.TerminalId,
+		}),
+	)
+	if reqErr != nil {
+		t.Fatalf("handleInbound(wait terminal) error = %v", reqErr)
+	}
+	waitResponse, ok := waitResult.(acpsdk.WaitForTerminalExitResponse)
+	if !ok {
+		t.Fatalf("handleInbound(wait terminal) type = %T, want WaitForTerminalExitResponse", waitResult)
+	}
+	if waitResponse.ExitCode == nil || *waitResponse.ExitCode != 0 {
+		t.Fatalf("handleInbound(wait terminal) exit code = %#v, want 0", waitResponse.ExitCode)
+	}
+
+	outputResult, reqErr := proc.handleInbound(
+		t.Context(),
+		acpsdk.ClientMethodTerminalOutput,
+		mustMarshalJSON(acpsdk.TerminalOutputRequest{
+			SessionId:  "sess-direct",
+			TerminalId: createResponse.TerminalId,
+		}),
+	)
+	if reqErr != nil {
+		t.Fatalf("handleInbound(output terminal) error = %v", reqErr)
+	}
+	outputResponse, ok := outputResult.(acpsdk.TerminalOutputResponse)
+	if !ok {
+		t.Fatalf("handleInbound(output terminal) type = %T, want TerminalOutputResponse", outputResult)
+	}
+	if outputResponse.Output != "compozy-session" {
+		t.Fatalf("handleInbound(output terminal) output = %q, want %q", outputResponse.Output, "compozy-session")
+	}
+
+	if _, reqErr := proc.handleInbound(
+		t.Context(),
+		acpsdk.ClientMethodTerminalKill,
+		mustMarshalJSON(acpsdk.KillTerminalRequest{
+			SessionId:  "sess-direct",
+			TerminalId: createResponse.TerminalId,
+		}),
+	); reqErr != nil {
+		t.Fatalf("handleInbound(kill terminal) error = %v", reqErr)
+	}
+
+	if _, reqErr := proc.handleInbound(
+		t.Context(),
+		acpsdk.ClientMethodTerminalRelease,
+		mustMarshalJSON(acpsdk.ReleaseTerminalRequest{
+			SessionId:  "sess-direct",
+			TerminalId: createResponse.TerminalId,
+		}),
+	); reqErr != nil {
+		t.Fatalf("handleInbound(release terminal) error = %v", reqErr)
+	}
+
+	if _, _, _, err := proc.terminals.output(t.Context(), createResponse.TerminalId); err == nil {
+		t.Fatal("output(released terminal) error = nil, want terminal not found")
+	}
+}
+
+func TestHelperUtilities(t *testing.T) {
+	t.Parallel()
+
+	if got := attachStderr(errors.New("boom"), " stderr "); got == nil || got.Error() == "boom" {
+		t.Fatalf("attachStderr() = %v, want wrapped stderr", got)
+	}
+	if got := attachStderr(errors.New("boom"), ""); got == nil || got.Error() != "boom" {
+		t.Fatalf("attachStderr(empty) = %v, want original error", got)
+	}
+
+	servers := toSDKMCPServers([]compozyconfig.MCPServer{{
+		Name:    "github",
+		Command: "npx",
+		Args:    []string{"-y", "mcp-server"},
+		Env: map[string]string{
+			"Z_VAR": "z",
+			"A_VAR": "a",
+		},
+	}})
+	if len(servers) != 1 || servers[0].Stdio == nil || len(servers[0].Stdio.Env) != 2 {
+		t.Fatalf("toSDKMCPServers() = %#v, want one stdio server with env", servers)
+	}
+	if servers[0].Stdio.Env[0].Name != "A_VAR" {
+		t.Fatalf("toSDKMCPServers() env order = %#v, want sorted env keys", servers[0].Stdio.Env)
+	}
+
+	if got := extractContentText(
+		acpsdk.ResourceLinkBlock("doc", "file:///tmp/demo.txt"),
+	); got != "file:///tmp/demo.txt" {
+		t.Fatalf("extractContentText(resource_link) = %q", got)
+	}
+
+	if sliceLines("a\nb\nc", new(2), new(2)) != "b\nc" {
+		t.Fatalf("sliceLines() returned unexpected content")
+	}
+
+	raw := mustMarshalJSON(map[string]string{"hello": "world"})
+	if string(CloneRawMessage(raw)) != string(raw) {
+		t.Fatalf("CloneRawMessage() = %q, want %q", string(CloneRawMessage(raw)), string(raw))
+	}
+
+	if requestError(ErrPermissionDenied) == nil {
+		t.Fatal("requestError(permission) = nil, want request error")
+	}
+	if requestError(errors.New("boom")) == nil {
+		t.Fatal("requestError(internal) = nil, want request error")
+	}
+	t.Run("Should preserve MCP auth reason codes in request error data", func(t *testing.T) {
+		t.Parallel()
+
+		toolReqErr := requestError(toolspkg.NewToolError(
+			toolspkg.ErrorCodeUnavailable,
+			toolspkg.ToolID("mcp/github/search"),
+			"MCP login required",
+			errors.New("auth unavailable"),
+			toolspkg.ReasonMCPAuthRequired,
+		))
+		var reasonData struct {
+			ReasonCodes []string `json:"reason_codes"`
+		}
+		encoded, err := json.Marshal(toolReqErr.Data)
+		if err != nil {
+			t.Fatalf("json.Marshal(tool request error data) error = %v", err)
+		}
+		if err := json.Unmarshal(encoded, &reasonData); err != nil {
+			t.Fatalf("json.Unmarshal(tool request error data) error = %v", err)
+		}
+		if !slices.Contains(reasonData.ReasonCodes, string(toolspkg.ReasonMCPAuthRequired)) {
+			t.Fatalf(
+				"tool request error reason codes = %#v, want %q",
+				reasonData.ReasonCodes,
+				toolspkg.ReasonMCPAuthRequired,
+			)
+		}
+	})
+
+	buffer := &lockedBuffer{}
+	if _, err := buffer.Write([]byte("stderr")); err != nil {
+		t.Fatalf("lockedBuffer.Write() error = %v", err)
+	}
+	if buffer.String() != "stderr" {
+		t.Fatalf("lockedBuffer.String() = %q, want %q", buffer.String(), "stderr")
+	}
+
+	if chooseFloat64(nil, new(1.2)) == nil {
+		t.Fatal("chooseFloat64(nil, fallback) = nil, want fallback")
+	}
+	if chooseString(nil, new("usd")) == nil {
+		t.Fatal("chooseString(nil, fallback) = nil, want fallback")
+	}
+}
+
+func TestHandleCreateTerminalStopsTerminalOnRegistrationFailure(t *testing.T) {
+	t.Parallel()
+	t.Run("Should stop the terminal when process registration fails", func(t *testing.T) {
+		t.Parallel()
+
+		proc := newDirectProcess(t, compozyconfig.PermissionModeApproveAll)
+		proc.processRegistry = toolruntime.NewRegistry(failingProcessStore{upsertErr: errors.New("boom")})
+
+		var killedTerminalID string
+		proc.toolHost = contextAwareToolHost{
+			createTerminalFn: func(context.Context, acpsdk.CreateTerminalRequest) (acpsdk.CreateTerminalResponse, error) {
+				return acpsdk.CreateTerminalResponse{TerminalId: "term-external"}, nil
+			},
+			killTerminalFn: func(id string) error {
+				killedTerminalID = id
+				return nil
+			},
+		}
+
+		active, err := proc.beginPromptForRun("turn-terminal-create-failure", "run-terminal-create-failure", 1, 4)
+		if err != nil {
+			t.Fatalf("beginPrompt() error = %v", err)
+		}
+		defer proc.endPrompt(active)
+
+		if _, err := proc.handleCreateTerminal(t.Context(), acpsdk.CreateTerminalRequest{
+			SessionId: "sess-direct",
+			Command:   "printf",
+			Args:      []string{"ready"},
+		}); err == nil {
+			t.Fatal("handleCreateTerminal() error = nil, want registration failure")
+		}
+
+		if killedTerminalID != "term-external" {
+			t.Fatalf("cleanup killed terminal = %q, want %q", killedTerminalID, "term-external")
+		}
+	})
+}
+
+func TestHandleReleaseTerminalReleasesExternalTerminal(t *testing.T) {
+	t.Parallel()
+	t.Run("Should release the external terminal through its tool host", func(t *testing.T) {
+		t.Parallel()
+
+		proc := newDirectProcess(t, compozyconfig.PermissionModeApproveAll)
+
+		var releasedTerminalID string
+		proc.toolHost = contextAwareToolHost{
+			releaseTerminalFn: func(id string) error {
+				releasedTerminalID = id
+				return nil
+			},
+		}
+
+		active, err := proc.beginPrompt("turn-terminal-release", 4)
+		if err != nil {
+			t.Fatalf("beginPrompt() error = %v", err)
+		}
+		defer proc.endPrompt(active)
+
+		if _, err := proc.handleReleaseTerminal(t.Context(), acpsdk.ReleaseTerminalRequest{
+			SessionId:  "sess-direct",
+			TerminalId: "term-external",
+		}); err != nil {
+			t.Fatalf("handleReleaseTerminal() error = %v", err)
+		}
+
+		if releasedTerminalID != "term-external" {
+			t.Fatalf("released terminal = %q, want %q", releasedTerminalID, "term-external")
+		}
+	})
+}
+
+func TestHandleSessionUpdateVariants(t *testing.T) {
+	t.Run("Should preserve late startup diagnostics without completing the tool twice", func(t *testing.T) {
+		t.Parallel()
+		proc := newDirectProcess(t, compozyconfig.PermissionModeApproveAll)
+		active, err := proc.beginPrompt("turn-startup-late", 8)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer proc.endPrompt(active)
+		for _, raw := range []string{
+			`{"sessionUpdate":"tool_call","toolCallId":"startup","title":"Compozy hosted tools","kind":"other","status":"failed"}`,
+			`{"sessionUpdate":"tool_call_update","toolCallId":"startup","status":"failed","rawOutput":{"error":"late startup diagnostic"}}`,
+			`{"sessionUpdate":"tool_call_update","toolCallId":"startup","status":"failed","rawOutput":{"error":"late startup diagnostic"}}`,
+			`{"sessionUpdate":"tool_call_update","toolCallId":"startup","status":"failed"}`,
+			`{"sessionUpdate":"tool_call_update","toolCallId":"startup","status":"failed","rawOutput":null,"content":[]}`,
+		} {
+			if err := proc.handleSessionUpdate(mustMarshalJSON(wireSessionNotification{
+				SessionID: "sess-direct", Update: json.RawMessage(raw),
+			})); err != nil {
+				t.Fatal(err)
+			}
+		}
+		proc.emitPromptEvent(AgentEvent{Type: EventTypeDone, TurnID: "turn-startup-late"})
+		events := collectEventsUntilCount(t, active.events, 5)
+		if events[0].Type != EventTypeToolCall || events[1].Type != EventTypeToolResult ||
+			events[1].ToolResultUpdate() {
+			t.Fatalf("initial startup events = %#v, want call and first completion", events[:2])
+		}
+		for _, event := range events[2:4] {
+			if event.Type != EventTypeToolResult || !event.ToolResultUpdate() || !event.ToolError() ||
+				!strings.Contains(string(event.Raw), "late startup diagnostic") {
+				t.Fatalf("late diagnostic = %#v, want output update without a repeated completion", event)
+			}
+		}
+		if events[4].Type != EventTypeDone {
+			t.Fatalf("last event = %#v, want done without empty output update", events[4])
+		}
+	})
+
+	t.Run("Should preserve terminal output and avoid repeated startup results", func(t *testing.T) {
+		t.Parallel()
+		for _, resultFirst := range []bool{true, false} {
+			name := "Should synthesize only one result for repeated terminal calls"
+			if resultFirst {
+				name = "Should retain a result received before its terminal call"
+			}
+			t.Run(name, func(t *testing.T) {
+				t.Parallel()
+				proc := newDirectProcess(t, compozyconfig.PermissionModeApproveAll)
+				active, err := proc.beginPrompt("turn-startup", 8)
+				if err != nil {
+					t.Fatal(err)
+				}
+				defer proc.endPrompt(active)
+				if resultFirst {
+					if err := proc.handleSessionUpdate(mustMarshalJSON(wireSessionNotification{
+						SessionID: "sess-direct",
+						Update: json.RawMessage(
+							`{"sessionUpdate":"tool_call_update","toolCallId":"startup","status":"failed","rawOutput":{"error":"original startup diagnostic"}}`,
+						),
+					})); err != nil {
+						t.Fatal(err)
+					}
+				}
+				call := mustMarshalJSON(wireSessionNotification{
+					SessionID: "sess-direct",
+					Update: json.RawMessage(
+						`{"sessionUpdate":"tool_call","toolCallId":"startup","title":"Compozy hosted tools","kind":"other","status":"failed"}`,
+					),
+				})
+				for range 2 {
+					if err := proc.handleSessionUpdate(call); err != nil {
+						t.Fatal(err)
+					}
+				}
+				proc.emitPromptEvent(AgentEvent{Type: EventTypeDone, TurnID: "turn-startup"})
+				events := collectEventsUntilCount(t, active.events, 3)
+				if events[0].Type != EventTypeToolCall || events[1].Type != EventTypeToolResult ||
+					events[2].Type != EventTypeDone || !events[1].ToolError() {
+					t.Fatalf("startup events = %#v, want one call and one terminal result before done", events)
+				}
+				if resultFirst && !strings.Contains(string(events[1].Raw), "original startup diagnostic") {
+					t.Fatalf("startup result lost earlier output: %s", events[1].Raw)
+				}
+			})
+		}
+	})
+
+	t.Run("Should settle startup calls received with an initial terminal status", func(t *testing.T) {
+		t.Parallel()
+		for _, status := range []string{"failed", "completed"} {
+			t.Run("Should emit a result for initial "+status+" status", func(t *testing.T) {
+				t.Parallel()
+				proc := newDirectProcess(t, compozyconfig.PermissionModeApproveAll)
+				active, err := proc.beginPrompt("turn-startup", 2)
+				if err != nil {
+					t.Fatal(err)
+				}
+				defer proc.endPrompt(active)
+				update := mustMarshalJSON(wireSessionNotification{
+					SessionID: "sess-direct",
+					Update: mustMarshalJSON(map[string]any{
+						"sessionUpdate": "tool_call", "toolCallId": "startup", "kind": "other",
+						"title": "Compozy hosted tools", "status": status,
+						"rawOutput": map[string]any{"error": "Windows AF_UNIX peer identity unavailable"},
+					}),
+				})
+				if err := proc.handleSessionUpdate(update); err != nil {
+					t.Fatal(err)
+				}
+				events := collectEventsUntilCount(t, active.events, 2)
+				if events[0].Type != EventTypeToolCall || events[0].ToolCallID != "startup" {
+					t.Fatalf("startup event = %#v, want tool call before its result", events[0])
+				}
+				got := events[1]
+				if got.Type != EventTypeToolResult || got.ToolCallID != "startup" ||
+					got.ToolStatus() != status || got.ToolError() != (status == "failed") {
+					t.Fatalf("startup event = %#v, want terminal result with status %s", got, status)
+				}
+				if !strings.Contains(string(got.Raw), "Windows AF_UNIX peer identity unavailable") {
+					t.Fatalf("startup event dropped actionable provider error: %s", got.Raw)
+				}
+			})
+		}
+	})
+
+	t.Run("Should discard invalid observations and emit sanitized Claude metadata", func(t *testing.T) {
+		t.Parallel()
+		proc := newDirectProcess(t, compozyconfig.PermissionModeApproveAll)
+		active, err := proc.beginPrompt("turn-usage", 8)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer proc.endPrompt(active)
+		for _, update := range []string{
+			`{"sessionUpdate":"usage_update","used":-5,"size":0}`,
+			`{"sessionUpdate":"usage_update","used":80,"size":100,"_meta":{"_claude/origin":"result","nested":{"claim_token":"secret","note":"compozy_claim_secret"}}}`,
+		} {
+			payload, err := json.Marshal(
+				wireSessionNotification{SessionID: "sess-direct", Update: json.RawMessage(update)},
+			)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := proc.handleSessionUpdate(payload); err != nil {
+				t.Fatal(err)
+			}
+		}
+		events := collectEventsUntilCount(t, active.events, 1)
+		got := events[0]
+		if got.Usage == nil || got.Usage.ContextUsed == nil || *got.Usage.ContextUsed != 80 ||
+			got.Usage.Meta["_claude/origin"] != "result" {
+			t.Fatalf("event = %#v", got)
+		}
+		nested, ok := got.Usage.Meta["nested"].(map[string]any)
+		if !ok || nested["note"] != "compozy_claim_[REDACTED]" {
+			t.Fatalf("meta = %#v", got.Usage.Meta)
+		}
+		if _, ok := nested["claim_token"]; ok {
+			t.Fatal("raw claim key survived")
+		}
+		if strings.Contains(string(got.Raw), "claim_token") ||
+			strings.Contains(string(got.Raw), "compozy_claim_secret") {
+			t.Fatalf("unsafe raw = %s", got.Raw)
+		}
+		select {
+		case extra := <-active.events:
+			t.Fatalf("unexpected invalid observation: %#v", extra)
+		default:
+		}
+	})
+
+	t.Run("Should translate updates and retain the current ACP mode", func(t *testing.T) {
+		t.Parallel()
+
+		proc := newDirectProcess(t, compozyconfig.PermissionModeApproveAll)
+		proc.setCaps(Caps{ConfigOptions: []SessionConfigOption{{
+			ID:             "mode",
+			Kind:           SessionConfigOptionKindSelect,
+			CurrentValueID: "ask",
+			Values: []SessionConfigOptionValue{
+				{Value: "agent"},
+				{Value: "plan"},
+				{Value: "ask"},
+			},
+		}}})
+		active, err := proc.beginPrompt("turn-update", 16)
+		if err != nil {
+			t.Fatalf("beginPrompt() error = %v", err)
+		}
+		defer proc.endPrompt(active)
+
+		title := "permission"
+		userEcho := mustMarshalJSON(wireSessionNotification{
+			SessionID: "sess-direct",
+			Update: mustMarshalJSON(map[string]any{
+				"sessionUpdate": "user_message_chunk",
+				"content":       map[string]any{"type": "text", "text": "authored prompt echo"},
+			}),
+		})
+		if err := proc.handleSessionUpdate(userEcho); err != nil {
+			t.Fatalf("handleSessionUpdate(user_message_chunk) error = %v", err)
+		}
+		agentMessage := mustMarshalJSON(wireSessionNotification{
+			SessionID: "sess-direct",
+			Update: mustMarshalJSON(map[string]any{
+				"sessionUpdate": "agent_message_chunk",
+				"content":       map[string]any{"type": "text", "text": "hello"},
+			}),
+		})
+		if err := proc.handleSessionUpdate(agentMessage); err != nil {
+			t.Fatalf("handleSessionUpdate(agent_message_chunk) error = %v", err)
+		}
+
+		usageUpdate := mustMarshalJSON(wireSessionNotification{
+			SessionID: "sess-direct",
+			Update: mustMarshalJSON(map[string]any{
+				"sessionUpdate": "usage_update",
+				"used":          10,
+				"size":          20,
+				"cost": map[string]any{
+					"amount":   1.5,
+					"currency": "USD",
+				},
+			}),
+		})
+		if err := proc.handleSessionUpdate(usageUpdate); err != nil {
+			t.Fatalf("handleSessionUpdate(usage_update) error = %v", err)
+		}
+
+		toolCall := mustMarshalJSON(wireSessionNotification{
+			SessionID: "sess-direct",
+			Update: mustMarshalJSON(map[string]any{
+				"sessionUpdate": "tool_call",
+				"toolCallId":    "tool-1",
+				"title":         title,
+				"kind":          "edit",
+				"rawInput":      map[string]any{"path": "retry.go"},
+				"status":        "in_progress",
+			}),
+		})
+		if err := proc.handleSessionUpdate(toolCall); err != nil {
+			t.Fatalf("handleSessionUpdate(tool_call) error = %v", err)
+		}
+
+		modeUpdate := mustMarshalJSON(wireSessionNotification{
+			SessionID: "sess-direct",
+			Update: mustMarshalJSON(map[string]any{
+				"sessionUpdate": "current_mode_update",
+				"currentModeId": "code",
+			}),
+		})
+		if err := proc.handleSessionUpdate(modeUpdate); err != nil {
+			t.Fatalf("handleSessionUpdate(current_mode_update) error = %v", err)
+		}
+		failedToolResult := mustMarshalJSON(acpsdk.SessionNotification{
+			SessionId: "sess-direct",
+			Update: acpsdk.UpdateToolCall(
+				"tool-1",
+				acpsdk.WithUpdateStatus(acpsdk.ToolCallStatusFailed),
+			),
+		})
+		if err := proc.handleSessionUpdate(failedToolResult); err != nil {
+			t.Fatalf("handleSessionUpdate(failed tool result) error = %v", err)
+		}
+
+		events := collectEventsUntilCount(t, active.events, 5)
+		if events[0].Type != EventTypeAgentMessage {
+			t.Fatalf("agent message event = %#v, want agent message", events[0])
+		}
+		if events[1].Type != EventTypeUsage || events[1].Usage == nil || events[1].Usage.ContextUsed == nil ||
+			*events[1].Usage.ContextUsed != 10 {
+			t.Fatalf("usage event = %#v, want usage metadata", events[1])
+		}
+		if events[2].Type != EventTypeToolCall || events[2].ToolKind() != "edit" ||
+			string(events[2].ToolInput()) != `{"path":"retry.go"}` {
+			t.Fatalf("tool call event = %#v, want tool call", events[2])
+		}
+		if events[3].Type != EventTypeSystem {
+			t.Fatalf("system event = %#v, want system", events[3])
+		}
+		if events[4].Type != EventTypeToolResult || !events[4].ToolError() {
+			t.Fatalf("failed tool result event = %#v, want typed failure", events[4])
+		}
+		select {
+		case extra := <-active.events:
+			t.Fatalf("provider user-message echo emitted an extra event: %#v", extra)
+		default:
+		}
+		assertConfigOption(t, proc.CapsSnapshot().ConfigOptions, "mode", "code", "agent", "plan", "ask")
+	})
+
+	t.Run("Should preserve meaningful tool call enrichments and terminal results", func(t *testing.T) {
+		t.Parallel()
+
+		proc := newDirectProcess(t, compozyconfig.PermissionModeApproveAll)
+		active, err := proc.beginPrompt("turn-tool-updates", 8)
+		if err != nil {
+			t.Fatalf("beginPrompt() error = %v", err)
+		}
+		defer proc.endPrompt(active)
+
+		updates := []acpsdk.SessionUpdate{
+			acpsdk.UpdateToolCall("tool-1"),
+			acpsdk.UpdateToolCall("tool-1", acpsdk.WithUpdateTitle("Read file")),
+			acpsdk.UpdateToolCall("tool-1", acpsdk.WithUpdateKind(acpsdk.ToolKindRead)),
+			acpsdk.UpdateToolCall("tool-1", acpsdk.WithUpdateRawInput(map[string]any{"path": "README.md"})),
+			acpsdk.UpdateToolCall("tool-1", acpsdk.WithUpdateStatus(acpsdk.ToolCallStatusCompleted)),
+			acpsdk.UpdateToolCall("tool-2"),
+			acpsdk.UpdateToolCall("tool-2", acpsdk.WithUpdateStatus(acpsdk.ToolCallStatusFailed)),
+		}
+		for _, update := range updates {
+			notification := mustMarshalJSON(acpsdk.SessionNotification{
+				SessionId: "sess-direct",
+				Update:    update,
+			})
+			if err := proc.handleSessionUpdate(notification); err != nil {
+				t.Fatalf("handleSessionUpdate(tool update) error = %v", err)
+			}
+		}
+
+		events := collectEventsUntilCount(t, active.events, len(updates))
+		wantTypes := []string{
+			EventTypeToolCall,
+			EventTypeToolCall,
+			EventTypeToolCall,
+			EventTypeToolCall,
+			EventTypeToolResult,
+			EventTypeToolCall,
+			EventTypeToolResult,
+		}
+		for index, want := range wantTypes {
+			if got := events[index].Type; got != want {
+				t.Fatalf("event %d type = %q, want %q", index, got, want)
+			}
+		}
+		if got, want := events[1].Title, "Read file"; got != want {
+			t.Fatalf("title enrichment = %q, want %q", got, want)
+		}
+		if got, want := events[2].ToolKind(), "read"; got != want {
+			t.Fatalf("kind enrichment = %q, want %q", got, want)
+		}
+		if got, want := string(events[3].ToolInput()), `{"path":"README.md"}`; got != want {
+			t.Fatalf("input enrichment = %s, want %s", got, want)
+		}
+		if !events[6].ToolError() {
+			t.Fatalf("failed tool result = %#v, want typed failure", events[6])
+		}
+	})
+}
+
+func TestHandleSessionUpdateAvailableCommands(t *testing.T) {
+	t.Run("Should retain the complete typed ACP command replacement set", func(t *testing.T) {
+		t.Parallel()
+
+		proc := newDirectProcess(t, compozyconfig.PermissionModeApproveAll)
+		active, err := proc.beginPrompt("turn-commands", 4)
+		if err != nil {
+			t.Fatalf("beginPrompt() error = %v", err)
+		}
+		defer proc.endPrompt(active)
+
+		update := mustMarshalJSON(wireSessionNotification{
+			SessionID: "sess-direct",
+			Update: mustMarshalJSON(map[string]any{
+				"sessionUpdate": "available_commands_update",
+				"availableCommands": []map[string]any{
+					{
+						"name":        " compact ",
+						"description": " Compact context ",
+						"input":       map[string]any{"hint": " optional focus "},
+					},
+					{"name": "", "description": "Ignored"},
+				},
+			}),
+		})
+		if err := proc.handleSessionUpdate(update); err != nil {
+			t.Fatalf("handleSessionUpdate(available_commands_update) error = %v", err)
+		}
+
+		events := collectEventsUntilCount(t, active.events, 1)
+		if got, want := events[0].Type, EventTypeAvailableCommands; got != want {
+			t.Fatalf("event type = %q, want %q", got, want)
+		}
+		if got, want := events[0].Title, SystemEventTitleAvailableCommandsUpdate; got != want {
+			t.Fatalf("event title = %q, want %q", got, want)
+		}
+		if got, want := events[0].AvailableCommandSet().Values(), []store.SessionAdvertisedCommand{{
+			Name:        "compact",
+			Description: "Compact context",
+			Input:       &store.SessionAdvertisedCommandInput{Hint: "optional focus"},
+		}}; !slices.EqualFunc(got, want, store.SessionAdvertisedCommandsEqual) {
+			t.Fatalf("available commands = %#v, want %#v", got, want)
+		}
+	})
+}
+
+func TestHandleSessionUpdateMarksToolCallAsPrecheckedAfterGatewayIntercept(t *testing.T) {
+	t.Parallel()
+
+	proc := newDirectProcess(t, compozyconfig.PermissionModeApproveAll)
+	active, err := proc.beginPrompt("turn-prechecked", 4)
+	if err != nil {
+		t.Fatalf("beginPrompt() error = %v", err)
+	}
+	defer proc.endPrompt(active)
+
+	rawInput := mustMarshalJSON(writeTextFileToolInput{
+		Path:    filepath.Join(proc.Cwd, "prechecked.txt"),
+		Content: "patched",
+	})
+	proc.recordProviderNativeToolPrecheck(providerNativeToolIDWrite, rawInput)
+
+	toolCall := mustMarshalJSON(wireSessionNotification{
+		SessionID: "sess-direct",
+		Update: mustMarshalJSON(map[string]any{
+			"sessionUpdate": "tool_call",
+			"title":         providerNativeToolIDWrite,
+			"rawInput": map[string]any{
+				"path":    filepath.Join(proc.Cwd, "prechecked.txt"),
+				"content": "patched",
+			},
+		}),
+	})
+	if err := proc.handleSessionUpdate(toolCall); err != nil {
+		t.Fatalf("handleSessionUpdate(tool_call) error = %v", err)
+	}
+
+	events := collectEventsUntilCount(t, active.events, 1)
+	if len(events) != 1 || events[0].Type != EventTypeToolCall {
+		t.Fatalf("events = %#v, want one tool_call", events)
+	}
+	if !events[0].ToolPrechecked() {
+		t.Fatalf("tool call event = %#v, want ToolPrechecked true", events[0])
+	}
+}
+
+func TestAccessorsAndValidationHelpers(t *testing.T) {
+	t.Parallel()
+
+	if err := (StartOpts{}).Validate(); err == nil {
+		t.Fatal("StartOpts.Validate() error = nil, want validation error")
+	}
+	if err := (PromptRequest{}).Validate(); err == nil {
+		t.Fatal("PromptRequest.Validate() error = nil, want validation error")
+	}
+	t.Run("ShouldRejectNegativeHeartbeatInterval", func(t *testing.T) {
+		t.Parallel()
+
+		err := (PromptRequest{
+			TurnID:                    "turn-negative-heartbeat",
+			Message:                   "hello",
+			ActivityHeartbeatInterval: -time.Second,
+		}).Validate()
+		if err == nil {
+			t.Fatal("PromptRequest.Validate(negative heartbeat) error = nil, want validation error")
+		}
+		if !strings.Contains(err.Error(), "heartbeat") {
+			t.Fatalf("PromptRequest.Validate(negative heartbeat) error = %v, want heartbeat context", err)
+		}
+	})
+
+	t.Run("Should preserve interaction expiry across event copies without sharing mutable values", func(t *testing.T) {
+		t.Parallel()
+		expiry := time.Date(2026, 11, 1, 12, 0, 0, 0, time.UTC)
+		original := (AgentEvent{}).WithExpiresAt(expiry)
+		copied := original.WithResolvedBy("owner").WithRequestID("request")
+		got := copied.ExpiresAtValue()
+		if got == nil || !got.Equal(expiry) {
+			t.Fatalf("copied expiry = %v", got)
+		}
+		*got = expiry.Add(time.Hour)
+		retained := original.ExpiresAtValue()
+		if retained == nil || !retained.Equal(expiry) {
+			t.Fatalf("original expiry = %v", retained)
+		}
+		replaced := copied.WithExpiresAt(expiry.Add(2 * time.Hour))
+		if !replaced.ExpiresAtValue().Equal(expiry.Add(2*time.Hour)) || !copied.ExpiresAtValue().Equal(expiry) {
+			t.Fatal("replacing expiry mutated another event")
+		}
+		if (AgentEvent{}).ExpiresAtValue() != nil {
+			t.Fatal("empty event has an expiry")
+		}
+	})
+
+	t.Run("Should isolate Goal metadata across event copies and preserve unrelated payloads", func(t *testing.T) {
+		t.Parallel()
+		source := &GoalPromptMeta{Kind: GoalPromptKindWork, RunID: "run-goal", NodeID: "node-goal",
+			Generation: 1, Turn: new(2), PromptID: "prompt-goal"}
+		original := (AgentEvent{}).WithGoalPromptMeta(source)
+		source.RunID = "changed"
+		*source.Turn = 3
+		copied := original.WithResolvedBy("owner")
+		goal := copied.GoalPromptMeta()
+		if goal == nil || goal.RunID != "run-goal" || *goal.Turn != 2 {
+			t.Fatalf("copied Goal metadata = %#v", goal)
+		}
+		goal.RunID = "reader-change"
+		*goal.Turn = 4
+		if retained := original.GoalPromptMeta(); retained.RunID != "run-goal" || *retained.Turn != 2 {
+			t.Fatalf("original Goal metadata = %#v", retained)
+		}
+		cleared := copied.WithGoalPromptMeta(nil)
+		if cleared.GoalPromptMeta() != nil || cleared.ResolvedByValue() != "owner" || original.GoalPromptMeta() == nil {
+			t.Fatal("clearing one event changed its unrelated payload or the original Goal")
+		}
+	})
+
+	proc := &AgentProcess{stderr: &lockedBuffer{}}
+	if _, err := proc.stderr.Write([]byte("boom")); err != nil {
+		t.Fatalf("stderr.Write() error = %v", err)
+	}
+	if proc.Stderr() != "boom" {
+		t.Fatalf("Stderr() = %q, want %q", proc.Stderr(), "boom")
+	}
+}
+
+func TestPermissionHelperBranches(t *testing.T) {
+	t.Parallel()
+
+	root := t.TempDir()
+	policy, err := newPermissionPolicy(compozyconfig.PermissionModeApproveAll, root)
+	if err != nil {
+		t.Fatalf("newPermissionPolicy() error = %v", err)
+	}
+
+	resolved, err := policy.resolvePathList([]acpsdk.ToolCallLocation{{Path: filepath.Join(root, "inside.txt")}})
+	if err != nil {
+		t.Fatalf("resolvePathList() error = %v", err)
+	}
+	if len(resolved) != 1 {
+		t.Fatalf("resolvePathList() = %#v, want one path", resolved)
+	}
+
+	allowOutcome, allowDecision := selectPermissionOutcome([]acpsdk.PermissionOption{
+		{OptionId: "allow-once", Name: "allow once", Kind: acpsdk.PermissionOptionKindAllowOnce},
+		{OptionId: "allow-always", Name: "allow", Kind: acpsdk.PermissionOptionKindAllowAlways},
+	}, decisionAllowOnce)
+	if allowOutcome.Selected == nil || allowOutcome.Selected.OptionId != "allow-once" ||
+		allowDecision != decisionAllowOnce {
+		t.Fatalf("selectPermissionOutcome(allow-once) = %#v, %q", allowOutcome, allowDecision)
+	}
+
+	rejectOutcome, rejectDecision := selectPermissionOutcome([]acpsdk.PermissionOption{
+		{OptionId: "reject-once", Name: "reject once", Kind: acpsdk.PermissionOptionKindRejectOnce},
+		{OptionId: "reject-always", Name: "reject always", Kind: acpsdk.PermissionOptionKindRejectAlways},
+	}, decisionRejectAlways)
+	if rejectOutcome.Selected == nil || rejectOutcome.Selected.OptionId != "reject-always" ||
+		rejectDecision != decisionRejectAlways {
+		t.Fatalf("selectPermissionOutcome(reject-always) = %#v, %q", rejectOutcome, rejectDecision)
+	}
+
+	cancelOutcome, cancelDecision := selectPermissionOutcome(nil, decisionRejectOnce)
+	if err := cancelOutcome.Validate(); err != nil {
+		t.Fatalf("selectPermissionOutcome(cancel).Validate() error = %v", err)
+	}
+	if cancelOutcome.Selected != nil {
+		t.Fatalf("selectPermissionOutcome(cancel) = %#v, want no selected option", cancelOutcome)
+	}
+	if cancelDecision != "" {
+		t.Fatalf("selectPermissionOutcome(cancel) decision = %q, want empty", cancelDecision)
+	}
+
+	if _, err := parsePermissionDecision("maybe"); err == nil {
+		t.Fatal("parsePermissionDecision(invalid) error = nil, want non-nil")
+	}
+	if err := (ApproveRequest{Decision: string(decisionAllowOnce)}).Validate(); err == nil {
+		t.Fatal("ApproveRequest.Validate(missing request id and turn id) error = nil, want non-nil")
+	}
+
+	readKind := acpsdk.ToolKindRead
+	readDecision, interactive := policy.permissionDecision(acpsdk.RequestPermissionRequest{
+		ToolCall: acpsdk.ToolCallUpdate{
+			Kind:      &readKind,
+			Locations: []acpsdk.ToolCallLocation{{Path: filepath.Join(root, "inside.txt")}},
+		},
+	})
+	if readDecision != decisionAllowOnce || interactive {
+		t.Fatalf("permissionDecision(read) = %q, %v, want %q, false", readDecision, interactive, decisionAllowOnce)
+	}
+
+	approveReadsPolicy, err := newPermissionPolicy(compozyconfig.PermissionModeApproveReads, root)
+	if err != nil {
+		t.Fatalf("newPermissionPolicy(approve-reads) error = %v", err)
+	}
+	editKind := acpsdk.ToolKindEdit
+	editDecision, interactive := approveReadsPolicy.permissionDecision(acpsdk.RequestPermissionRequest{
+		ToolCall: acpsdk.ToolCallUpdate{Kind: &editKind},
+	})
+	if editDecision != decisionPending || !interactive {
+		t.Fatalf("permissionDecision(edit) = %q, %v, want %q, true", editDecision, interactive, decisionPending)
+	}
+
+	denyAllPolicy, err := newPermissionPolicy(compozyconfig.PermissionModeDenyAll, root)
+	if err != nil {
+		t.Fatalf("newPermissionPolicy(deny-all) error = %v", err)
+	}
+	denyDecision, interactive := denyAllPolicy.permissionDecision(acpsdk.RequestPermissionRequest{
+		ToolCall: acpsdk.ToolCallUpdate{Kind: &editKind},
+	})
+	if denyDecision != decisionRejectOnce || interactive {
+		t.Fatalf("permissionDecision(deny-all) = %q, %v, want %q, false", denyDecision, interactive, decisionRejectOnce)
+	}
+
+	if got := permissionRequestIDFromMeta(map[string]any{"request_id": "req-meta"}); got != "req-meta" {
+		t.Fatalf("permissionRequestIDFromMeta() = %q, want %q", got, "req-meta")
+	}
+	title := "Write file"
+	if got := permissionRequestName("turn-1", acpsdk.RequestPermissionRequest{
+		ToolCall: acpsdk.ToolCallUpdate{
+			Title: &title,
+			Kind:  &editKind,
+		},
+	}); got != "turn-1:Write file" {
+		t.Fatalf("permissionRequestName() = %q, want %q", got, "turn-1:Write file")
+	}
+
+	proc := newDirectProcess(t, compozyconfig.PermissionModeDenyAll)
+	if got := proc.nextPermissionRequestID("turn-1", acpsdk.RequestPermissionRequest{
+		Meta: map[string]any{"request_id": "req-from-meta"},
+	}); got != "req-from-meta" {
+		t.Fatalf("nextPermissionRequestID(meta) = %q, want %q", got, "req-from-meta")
+	}
+	if got := (&AgentProcess{}).permissionTimeoutOrDefault(); got != 5*time.Minute {
+		t.Fatalf("permissionTimeoutOrDefault() = %v, want %v", got, 5*time.Minute)
+	}
+}
+
+func TestHandleInboundCreateTerminalUsesRequestContext(t *testing.T) {
+	t.Parallel()
+
+	proc := newDirectProcess(t, compozyconfig.PermissionModeApproveAll)
+	type contextKey string
+	const ctxKey contextKey = "terminal-create"
+	proc.toolHost = contextAwareToolHost{
+		createTerminalFn: func(ctx context.Context, _ acpsdk.CreateTerminalRequest) (acpsdk.CreateTerminalResponse, error) {
+			if got, want := ctx.Value(ctxKey), "present"; got != want {
+				return acpsdk.CreateTerminalResponse{}, fmt.Errorf("ctx value = %v, want %q", got, want)
+			}
+			return acpsdk.CreateTerminalResponse{TerminalId: "term-ctx"}, nil
+		},
+	}
+
+	ctx := context.WithValue(t.Context(), ctxKey, "present")
+	result, reqErr := proc.handleInbound(
+		ctx,
+		acpsdk.ClientMethodTerminalCreate,
+		mustMarshalJSON(acpsdk.CreateTerminalRequest{
+			SessionId: "sess-direct",
+			Command:   "sh",
+			Args:      []string{"-c", "printf ready"},
+			Cwd:       new(proc.Cwd),
+		}),
+	)
+	if reqErr != nil {
+		t.Fatalf("handleInbound(create terminal) error = %v", reqErr)
+	}
+	response, ok := result.(acpsdk.CreateTerminalResponse)
+	if !ok {
+		t.Fatalf("handleInbound(create terminal) type = %T, want CreateTerminalResponse", result)
+	}
+	if response.TerminalId != "term-ctx" {
+		t.Fatalf("terminal id = %q, want %q", response.TerminalId, "term-ctx")
+	}
+}
+
+func TestToolHostOrDefaultUsesInjectedTerminalHost(t *testing.T) {
+	t.Parallel()
+
+	if _, err := (&AgentProcess{}).toolHostOrDefault(); !errors.Is(err, errProcessLifecycleUninitialized) {
+		t.Fatalf("toolHostOrDefault(uninitialized) error = %v, want %v", err, errProcessLifecycleUninitialized)
+	}
+
+	root := t.TempDir()
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+
+	policy, err := newPermissionPolicy(compozyconfig.PermissionModeApproveAll, root)
+	if err != nil {
+		t.Fatalf("newPermissionPolicy() error = %v", err)
+	}
+
+	terminalCore := newACPTestTerminalCore(t, nil)
+	proc := &AgentProcess{
+		Cwd:           root,
+		processCtx:    ctx,
+		cancelProcess: cancel,
+		permissions:   policy,
+		stderr:        &lockedBuffer{},
+		done:          make(chan struct{}),
+		StartedAt:     timeNowUTC(),
+		SessionID:     "sess-direct",
+		AgentName:     "direct",
+		terminalCore:  terminalCore,
+		terminalScope: LocalTerminalScope{
+			WorkspaceID: "acp-test", ProfileID: "acp-test", SessionID: "sess-direct", ActorID: "direct",
+			Generation: 1,
+		},
+	}
+
+	toolHost, err := proc.toolHostOrDefault()
+	if err != nil {
+		t.Fatalf("toolHostOrDefault() error = %v", err)
+	}
+	host, ok := toolHost.(*localToolHost)
+	if !ok {
+		t.Fatalf("toolHostOrDefault() type = %T, want *localToolHost", toolHost)
+	}
+	if host.terminals == nil || host.terminals.core != terminalCore {
+		t.Fatal("toolHostOrDefault() did not use the injected terminal core")
+	}
+}
+
+func newDirectProcess(t *testing.T, mode compozyconfig.PermissionMode) *AgentProcess {
+	t.Helper()
+
+	root := t.TempDir()
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+
+	policy, err := newPermissionPolicy(mode, root)
+	if err != nil {
+		t.Fatalf("newPermissionPolicy() error = %v", err)
+	}
+
+	proc := &AgentProcess{
+		AgentName:   "direct",
+		Cwd:         root,
+		SessionID:   "sess-direct",
+		StartedAt:   timeNowUTC(),
+		processCtx:  ctx,
+		permissions: policy,
+		terminals: newTerminalManager(
+			ctx, slog.Default(), newACPTestTerminalCore(t, nil),
+			LocalTerminalScope{
+				WorkspaceID: "acp-test", ProfileID: "acp-test", SessionID: "sess-direct", ActorID: "direct",
+				Generation: 1,
+			},
+		),
+		done:              make(chan struct{}),
+		cancelProcess:     cancel,
+		stderr:            &lockedBuffer{},
+		permissionTimeout: time.Second,
+	}
+	t.Cleanup(proc.terminals.closeAll)
+	return proc
+}
+
+type contextAwareToolHost struct {
+	createTerminalFn  func(context.Context, acpsdk.CreateTerminalRequest) (acpsdk.CreateTerminalResponse, error)
+	killTerminalFn    func(string) error
+	releaseTerminalFn func(string) error
+}
+
+type toolExecutionGatewayFunc func(context.Context, ToolExecutionRequest) (ToolExecutionRequest, error)
+
+func (fn toolExecutionGatewayFunc) Intercept(
+	ctx context.Context,
+	req ToolExecutionRequest,
+) (ToolExecutionRequest, error) {
+	return fn(ctx, req)
+}
+
+func (h contextAwareToolHost) ReadTextFile(context.Context, string) (string, error) {
+	return "", nil
+}
+
+func (h contextAwareToolHost) WriteTextFile(context.Context, string, string) error {
+	return nil
+}
+
+func (h contextAwareToolHost) ResolvePath(path string) (string, error) {
+	return path, nil
+}
+
+func (h contextAwareToolHost) Authorize(permissionOperation) error {
+	return nil
+}
+
+func (h contextAwareToolHost) PermissionDecision(acpsdk.RequestPermissionRequest) (permissionDecision, bool) {
+	return decisionAllowOnce, false
+}
+
+func (h contextAwareToolHost) CreateTerminal(
+	ctx context.Context,
+	req acpsdk.CreateTerminalRequest,
+) (acpsdk.CreateTerminalResponse, error) {
+	if h.createTerminalFn == nil {
+		return acpsdk.CreateTerminalResponse{}, nil
+	}
+	return h.createTerminalFn(ctx, req)
+}
+
+func (h contextAwareToolHost) KillTerminal(id string) error {
+	if h.killTerminalFn != nil {
+		return h.killTerminalFn(id)
+	}
+	return nil
+}
+
+func (h contextAwareToolHost) TerminalOutput(string) (string, error) {
+	return "", nil
+}
+
+func (h contextAwareToolHost) WaitForTerminalExit(context.Context, string) (int, error) {
+	return 0, nil
+}
+
+func (h contextAwareToolHost) ReleaseTerminal(id string) error {
+	if h.releaseTerminalFn != nil {
+		return h.releaseTerminalFn(id)
+	}
+	return nil
+}
+
+type failingProcessStore struct {
+	upsertErr error
+}
+
+func (s failingProcessStore) UpsertProcessRecord(context.Context, toolruntime.ProcessRecord) error {
+	return s.upsertErr
+}
+
+func (failingProcessStore) UpdateProcessRecordState(context.Context, toolruntime.ProcessStateUpdate) error {
+	return nil
+}
+
+func (failingProcessStore) ListProcessRecords(
+	context.Context,
+	toolruntime.ProcessQuery,
+) ([]toolruntime.ProcessRecord, error) {
+	return nil, nil
+}
+
+func decodePermissionEventRaw(t *testing.T, raw json.RawMessage) struct {
+	RequestID string                  `json:"request_id"`
+	ToolID    string                  `json:"tool_id"`
+	ToolInput map[string]any          `json:"tool_input"`
+	Options   []permissionEventOption `json:"options"`
+} {
+	t.Helper()
+
+	var payload struct {
+		RequestID string                  `json:"request_id"`
+		ToolID    string                  `json:"tool_id"`
+		ToolInput map[string]any          `json:"tool_input"`
+		Options   []permissionEventOption `json:"options"`
+	}
+	if err := json.Unmarshal(raw, &payload); err != nil {
+		t.Fatalf("json.Unmarshal(permission raw) error = %v; raw=%s", err, string(raw))
+	}
+	return payload
+}
+
+func collectEventsUntilCount(t *testing.T, eventsCh <-chan AgentEvent, want int) []AgentEvent {
+	t.Helper()
+
+	events := make([]AgentEvent, 0, want)
+	timeout := time.NewTimer(2 * time.Second)
+	defer timeout.Stop()
+
+	for len(events) < want {
+		select {
+		case event := <-eventsCh:
+			events = append(events, event)
+		case <-timeout.C:
+			t.Fatalf("timeout collecting %d events; got %#v", want, events)
+		}
+	}
+	return events
+}
+
+func TestInitializeCompactionCapability(t *testing.T) {
+	t.Run("Should advertise compaction alongside filesystem and terminal capabilities", func(t *testing.T) {
+		t.Parallel()
+		driver := New()
+		capture := filepath.Join(t.TempDir(), "initialize.jsonl")
+		proc := startHelperProcess(t, driver, "initialize_contract", "", StartOpts{
+			Env: helperEnvWithCapture("initialize_contract", "", capture),
+		})
+		defer stopProcess(t, driver, proc)
+		params := captureRequestParams(t, capture, acpsdk.AgentMethodInitialize)
+		var caps struct {
+			Fs struct {
+				Read  bool `json:"readTextFile"`
+				Write bool `json:"writeTextFile"`
+			} `json:"fs"`
+			Terminal bool `json:"terminal"`
+			Session  struct {
+				Compaction json.RawMessage `json:"compaction"`
+			} `json:"session"`
+		}
+		if err := json.Unmarshal(params["clientCapabilities"], &caps); err != nil {
+			t.Fatal(err)
+		}
+		if string(caps.Session.Compaction) != "{}" || !caps.Terminal || !caps.Fs.Read || !caps.Fs.Write {
+			t.Fatalf("initialize capabilities = %s", params["clientCapabilities"])
+		}
+	})
+}
+
+func TestCompactionAdapterFixtures(t *testing.T) {
+	for _, tc := range []struct{ name, fixture, summary string }{
+		{"Should materialize Claude cleaned summary", "claude-compaction.json", "Clean user-visible summary"},
+		{"Should retain Codex lifecycle without summary", "codex-compaction.json", ""},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			data, err := os.ReadFile(filepath.Join("testdata", tc.fixture))
+			if err != nil {
+				t.Fatal(err)
+			}
+			var frames []json.RawMessage
+			if err := json.Unmarshal(data, &frames); err != nil {
+				t.Fatal(err)
+			}
+			proc := newDirectProcess(t, compozyconfig.PermissionModeApproveAll)
+			active, err := proc.beginPrompt("turn-fixture", 16)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer proc.endPrompt(active)
+			for _, frame := range frames {
+				if err := proc.handleSessionUpdate(frame); err != nil {
+					t.Fatal(err)
+				}
+			}
+			events := drainCompactionTestEvents(t, proc, active)
+			if len(events) != 2 {
+				t.Fatalf("snapshots = %#v, want exactly two", events)
+			}
+			for _, event := range events {
+				if event.Type != EventTypeCompaction || event.Compaction == nil {
+					t.Fatalf("event = %#v", event)
+				}
+			}
+			final := events[1].Compaction
+			if final.Status != "completed" || final.Summary != tc.summary || !final.Terminal {
+				t.Fatalf("final snapshot = %#v", final)
+			}
+		})
+	}
+}
+
+//nolint:misspell // ACP fixes the spelling of terminal status values.
+func TestCompactionAssembler(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		updates []string
+		want    []CompactionObservation
+	}{
+		{"Should use buffered chunks on terminal omission", []string{
+			`{"status":"in_progress"}`, `{"chunk":"A"}`, `{"chunk":"B"}`, `{"status":"completed"}`,
+		}, []CompactionObservation{{CompactionID: "c1", Status: "in_progress"}, {CompactionID: "c1", Status: "completed", Summary: "AB", Terminal: true}}},
+		{"Should replace chunks with a terminal summary", []string{
+			`{"status":"in_progress"}`, `{"chunk":"A"}`, `{"chunk":"B"}`, `{"status":"completed","summary":[{"type":"text","text":"clean"}]}`,
+		}, []CompactionObservation{{CompactionID: "c1", Status: "in_progress"}, {CompactionID: "c1", Status: "completed", Summary: "clean", Terminal: true}}},
+		{"Should clear chunks with an empty terminal summary", []string{
+			`{"status":"in_progress"}`, `{"chunk":"A"}`, `{"status":"completed","summary":[]}`,
+		}, []CompactionObservation{{CompactionID: "c1", Status: "in_progress"}, {CompactionID: "c1", Status: "completed", Terminal: true}}},
+		{"Should drop late chunks and identical terminal repeats", []string{
+			`{"status":"in_progress"}`, `{"chunk":"A"}`, `{"status":"completed"}`, `{"chunk":"late"}`, `{"status":"completed"}`,
+		}, []CompactionObservation{{CompactionID: "c1", Status: "in_progress"}, {CompactionID: "c1", Status: "completed", Summary: "A", Terminal: true}}},
+		{"Should carry failure and preserve omitted error until explicit clear", []string{
+			`{"status":"in_progress"}`, `{"status":"failed","error":"x"}`, `{"status":"failed","summary":[{"type":"text","text":"correction"}]}`, `{"status":"failed","summary":null,"error":null}`,
+		}, []CompactionObservation{{CompactionID: "c1", Status: "in_progress"}, {CompactionID: "c1", Status: "failed", Error: "x", Terminal: true}, {CompactionID: "c1", Status: "failed", Summary: "correction", Error: "x"}, {CompactionID: "c1", Status: "failed"}}},
+		{"Should emit corrections without another terminal transition", []string{
+			`{"status":"completed"}`, `{"status":"completed","summary":[{"type":"text","text":"new"}]}`, `{"status":"failed","error":"failure"}`,
+		}, []CompactionObservation{{CompactionID: "c1", Status: "completed", Terminal: true}, {CompactionID: "c1", Status: "completed", Summary: "new"}, {CompactionID: "c1", Status: "failed", Summary: "new", Error: "failure"}}},
+		{"Should retain intermediate vendor status without treating it as terminal", []string{
+			`{"status":"in_progress"}`, `{"status":"_paused"}`, `{"status":"in_progress"}`, `{"status":"completed"}`,
+		}, []CompactionObservation{{CompactionID: "c1", Status: "in_progress"}, {CompactionID: "c1", Status: "_paused"}, {CompactionID: "c1", Status: "in_progress"}, {CompactionID: "c1", Status: "completed", Terminal: true}}},
+		{"Should apply canceled terminal first", []string{`{"status":"cancelled"}`}, []CompactionObservation{{CompactionID: "c1", Status: "cancelled", Terminal: true}}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			proc := newDirectProcess(t, compozyconfig.PermissionModeApproveAll)
+			active, err := proc.beginPrompt("turn-assembly", 32)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer proc.endPrompt(active)
+			for _, update := range tc.updates {
+				sendCompactionTestUpdate(t, proc, "c1", update)
+			}
+			events := drainCompactionTestEvents(t, proc, active)
+			if len(events) != len(tc.want) {
+				t.Fatalf("events = %#v, want %d snapshots", events, len(tc.want))
+			}
+			for i, want := range tc.want {
+				if events[i].Type != EventTypeCompaction || events[i].Compaction == nil ||
+					*events[i].Compaction != want {
+					t.Fatalf("snapshot %d = %#v, want %#v", i, events[i].Compaction, want)
+				}
+			}
+		})
+	}
+	t.Run("Should release terminal buffers and retire the oldest terminal compactions", func(t *testing.T) {
+		t.Parallel()
+		proc := newDirectProcess(t, compozyconfig.PermissionModeApproveAll)
+		total := compactionRetainedTerminalLimit + 1
+		active, err := proc.beginPrompt("turn-retention", 2*total+4)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer proc.endPrompt(active)
+		for i := range total {
+			id := fmt.Sprintf("c%d", i)
+			sendCompactionTestUpdate(t, proc, id, `{"chunk":"summary text"}`)
+			sendCompactionTestUpdate(t, proc, id, `{"status":"completed"}`)
+		}
+		proc.compactionMu.Lock()
+		retained := len(proc.compactions)
+		buffered := 0
+		for _, state := range proc.compactions {
+			buffered += len(state.buffer)
+		}
+		proc.compactionMu.Unlock()
+		if retained != compactionRetainedTerminalLimit || buffered != 0 {
+			t.Fatalf("retained = %d, buffered bytes = %d", retained, buffered)
+		}
+		sendCompactionTestUpdate(t, proc, "c0", `{"status":"failed","error":"late"}`)
+		sendCompactionTestUpdate(t, proc, fmt.Sprintf("c%d", total-1), `{"status":"failed","error":"correction"}`)
+		events := drainCompactionTestEvents(t, proc, active)
+		if len(events) != 2*total+1 {
+			t.Fatalf("snapshots = %d, want %d", len(events), 2*total+1)
+		}
+		last := events[len(events)-1].Compaction
+		if last.CompactionID != fmt.Sprintf("c%d", total-1) || last.Status != "failed" || last.Terminal ||
+			last.Summary != "summary text" {
+			t.Fatalf("retained correction = %#v", last)
+		}
+	})
+	t.Run("Should cap assembled summaries and scrub split claim tokens before emission", func(t *testing.T) {
+		t.Parallel()
+		proc := newDirectProcess(t, compozyconfig.PermissionModeApproveAll)
+		active, err := proc.beginPrompt("turn-scrub", 16)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer proc.endPrompt(active)
+		sendCompactionTestUpdate(t, proc, "c1", `{"status":"in_progress"}`)
+		sendCompactionTestUpdate(t, proc, "c1", `{"chunk":"COMPOZY_CLAIM_sec"}`)
+		sendCompactionTestUpdate(t, proc, "c1", `{"chunk":"ret-value"}`)
+		sendCompactionTestUpdate(t, proc, "c1", `{"status":"failed","error":"COMPOZY_CLAIM_secret-value"}`)
+		large := mustMarshalJSON(
+			map[string]any{
+				"status":  "completed",
+				"summary": []map[string]any{{"type": "text", "text": strings.Repeat("x", 20*1024)}},
+			},
+		)
+		sendCompactionTestUpdate(t, proc, "c2", string(large))
+		events := drainCompactionTestEvents(t, proc, active)
+		if len(events) != 3 {
+			t.Fatalf("snapshots = %d, want 3", len(events))
+		}
+		if got := events[1].Compaction; got.Summary != "compozy_claim_[REDACTED]" ||
+			got.Error != "compozy_claim_[REDACTED]" {
+			t.Fatalf("scrubbed snapshot = %#v", got)
+		}
+		if got := events[2].Compaction.Summary; len(got) > 16*1024 || !strings.HasSuffix(got, " [summary truncated]") {
+			t.Fatalf(
+				"capped summary length = %d, suffix missing = %v",
+				len(got),
+				!strings.HasSuffix(got, " [summary truncated]"),
+			)
+		}
+	})
+}
+
+func TestSessionUpdateDefensiveDiscriminator(t *testing.T) {
+	t.Run("Should classify chunk first as compaction and preserve unknown updates as system", func(t *testing.T) {
+		t.Parallel()
+		proc := newDirectProcess(t, compozyconfig.PermissionModeApproveAll)
+		active, err := proc.beginPrompt("turn-discriminator", 16)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer proc.endPrompt(active)
+		sendCompactionTestUpdate(t, proc, "c1", `{"chunk":"x"}`)
+		unknown := json.RawMessage(`{"sessionUpdate":"_vendor_thing","content":{"type":"text","text":"y"},"vendor":42}`)
+		err = proc.handleSessionUpdate(
+			mustMarshalJSON(wireSessionNotification{SessionID: "sess-direct", Update: unknown}),
+		)
+		if err != nil {
+			t.Fatal(err)
+		}
+		events := drainCompactionTestEvents(t, proc, active)
+		if len(events) != 2 || events[0].Type != EventTypeCompaction || events[1].Type != EventTypeSystem {
+			t.Fatalf("discriminator events = %#v", events)
+		}
+		var got, want map[string]any
+		err = json.Unmarshal(events[1].Raw, &got)
+		if err != nil {
+			t.Fatal(err)
+		}
+		err = json.Unmarshal(unknown, &want)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if fmt.Sprint(got) != fmt.Sprint(want) {
+			t.Fatalf("unknown raw = %s, want %s", events[1].Raw, unknown)
+		}
+	})
+
+	t.Run("Should log each unknown kind once per process while retaining every event", func(t *testing.T) {
+		t.Parallel()
+		proc := newDirectProcess(t, compozyconfig.PermissionModeApproveAll)
+		var logs lockedBuffer
+		proc.logger = slog.New(slog.NewTextHandler(&logs, nil))
+		active, err := proc.beginPrompt("turn-unknown", 8)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer proc.endPrompt(active)
+		for _, kind := range []string{"_vendor_one", "_vendor_one", "_vendor_two"} {
+			update := mustMarshalJSON(
+				map[string]any{"sessionUpdate": kind, "content": map[string]any{"type": "text", "text": "payload"}},
+			)
+			err = proc.handleSessionUpdate(
+				mustMarshalJSON(wireSessionNotification{SessionID: "sess-direct", Update: update}),
+			)
+			if err != nil {
+				t.Fatal(err)
+			}
+		}
+		events := drainCompactionTestEvents(t, proc, active)
+		if len(events) != 3 {
+			t.Fatalf("unknown events = %d, want 3", len(events))
+		}
+		for _, event := range events {
+			if event.Type != EventTypeSystem {
+				t.Fatalf("event = %#v, want system", event)
+			}
+		}
+		if got := strings.Count(logs.String(), "acp.session_update.unknown"); got != 2 {
+			t.Fatalf("unknown warnings = %d, want 2; logs=%s", got, logs.String())
+		}
+	})
+	t.Run("Should tolerate vendor fields and malformed optional scalar fields", func(t *testing.T) {
+		t.Parallel()
+		proc := newDirectProcess(t, compozyconfig.PermissionModeApproveAll)
+		active, err := proc.beginPrompt("turn-tolerant", 8)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer proc.endPrompt(active)
+		sendCompactionTestUpdate(t, proc, "c1", `{"status":"_paused","vendor":{"data":1},"_meta":{"source":"vendor"}}`)
+		sendCompactionTestUpdate(t, proc, "c1", `{"status":42,"error":{"unexpected":true}}`)
+		sendCompactionTestUpdate(t, proc, "c1", `{"status":"completed","summary":"vendor summary"}`)
+		events := drainCompactionTestEvents(t, proc, active)
+		if len(events) != 2 || events[0].Compaction.Status != "_paused" || events[0].Compaction.Terminal ||
+			events[1].Compaction.Summary != "vendor summary" ||
+			!events[1].Compaction.Terminal {
+			t.Fatalf("tolerant snapshots = %#v", events)
+		}
+	})
+
+	t.Run("Should retain legacy Compact conversation as an ordinary tool event", func(t *testing.T) {
+		t.Parallel()
+		data, err := os.ReadFile(filepath.Join("testdata", "legacy-compaction-tool.json"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		proc := newDirectProcess(t, compozyconfig.PermissionModeApproveAll)
+		active, err := proc.beginPrompt("turn-legacy", 4)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer proc.endPrompt(active)
+		err = proc.handleSessionUpdate(data)
+		if err != nil {
+			t.Fatal(err)
+		}
+		events := drainCompactionTestEvents(t, proc, active)
+		if len(events) != 1 || events[0].Type != EventTypeToolCall || events[0].Title != "Compact conversation" ||
+			events[0].Compaction != nil {
+			t.Fatalf("legacy event = %#v", events)
+		}
+	})
+}
+
+func sendCompactionTestUpdate(t *testing.T, proc *AgentProcess, id, fields string) {
+	t.Helper()
+	var update map[string]any
+	err := json.Unmarshal([]byte(fields), &update)
+	if err != nil {
+		t.Fatal(err)
+	}
+	update["sessionUpdate"] = "compaction_update"
+	update["compactionId"] = id
+	if chunk, ok := update["chunk"]; ok {
+		delete(update, "chunk")
+		update["sessionUpdate"] = "compaction_summary_chunk"
+		update["content"] = map[string]any{"type": "text", "text": chunk}
+	}
+	err = proc.handleSessionUpdate(
+		mustMarshalJSON(wireSessionNotification{SessionID: "sess-direct", Update: mustMarshalJSON(update)}),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+}
+
+func drainCompactionTestEvents(t *testing.T, proc *AgentProcess, active *activePromptState) []AgentEvent {
+	t.Helper()
+	proc.endPrompt(active)
+	var result []AgentEvent
+	timeout := time.NewTimer(2 * time.Second)
+	defer timeout.Stop()
+	for {
+		select {
+		case event, ok := <-active.events:
+			if !ok {
+				return result
+			}
+			result = append(result, event)
+		case <-timeout.C:
+			t.Fatalf("timeout draining compaction events: %#v", result)
+		}
+	}
+}
+
+func TestClaudeAgentSubagentContract(t *testing.T) {
+	// UT-040; IT-020 ingest side: replay adapter-produced frames through the prompt pipeline.
+	t.Run("Should preserve native metadata on every adapter fixture frame", func(t *testing.T) {
+		t.Parallel()
+		data, err := os.ReadFile("testdata/claude_agent_subagent.jsonl")
+		if err != nil {
+			t.Fatal(err)
+		}
+		proc := &AgentProcess{}
+		active, err := proc.beginPrompt("turn-native", 16)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer proc.endPrompt(active)
+		wants := []struct{ parent, tool, kind, status string }{
+			{"", "Agent", EventTypeToolCall, "pending"},
+			{"toolu_agent", "", EventTypeAgentMessage, ""},
+			{"toolu_agent", "Read", EventTypeToolCall, "pending"},
+			{"toolu_agent", "Read", EventTypeToolResult, "completed"},
+			{"", "Agent", EventTypeToolResult, "completed"},
+		}
+		lines := strings.Split(strings.TrimSpace(string(data)), "\n")
+		if len(lines) != len(wants) {
+			t.Fatalf("frames = %d, want %d", len(lines), len(wants))
+		}
+		for i, line := range lines {
+			var frame struct {
+				Params json.RawMessage `json:"params"`
+			}
+			if err := json.Unmarshal([]byte(line), &frame); err != nil {
+				t.Fatal(err)
+			}
+			if err := proc.handleSessionUpdate(frame.Params); err != nil {
+				t.Fatal(err)
+			}
+			got := collectEventsUntilCount(t, active.events, 1)[0]
+			want := wants[i]
+			if got.ParentToolCallID() != want.parent || got.ProviderToolName() != want.tool || got.Type != want.kind ||
+				got.ToolStatus() != want.status {
+				t.Fatalf("frame %d = %#v, want %#v", i, got, want)
+			}
+		}
+	})
+	// Issue #766: a background launch result is the provider's receipt, not the subagent's outcome.
+	t.Run("Should mark a background launch result as an async receipt", func(t *testing.T) {
+		t.Parallel()
+		data, err := os.ReadFile("testdata/claude_agent_background_subagent.jsonl")
+		if err != nil {
+			t.Fatal(err)
+		}
+		proc := &AgentProcess{}
+		active, err := proc.beginPrompt("turn-native", 16)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer proc.endPrompt(active)
+		for line := range strings.SplitSeq(strings.TrimSpace(string(data)), "\n") {
+			var frame struct {
+				Params json.RawMessage `json:"params"`
+			}
+			if err := json.Unmarshal([]byte(line), &frame); err != nil {
+				t.Fatal(err)
+			}
+			if err := proc.handleSessionUpdate(frame.Params); err != nil {
+				t.Fatal(err)
+			}
+		}
+		// The PostToolUse marker refines nothing visible, so it rides on the result.
+		got := collectEventsUntilCount(t, active.events, 5)
+		wants := []struct {
+			parent, tool, kind string
+			async              bool
+		}{
+			{"", "Agent", EventTypeToolCall, false},
+			{"", "Agent", EventTypeToolCall, false},
+			{"", "Agent", EventTypeToolResult, true},
+			{"toolu_background", "Bash", EventTypeToolCall, false},
+			{"toolu_background", "Bash", EventTypeToolResult, false},
+		}
+		for i, want := range wants {
+			if got[i].ParentToolCallID() != want.parent || got[i].ProviderToolName() != want.tool ||
+				got[i].Type != want.kind || got[i].ProviderToolAsync() != want.async {
+				t.Fatalf("event %d = %#v, want %#v", i, got[i], want)
+			}
+		}
+	})
+	// Invariant: only Agent/Task task frames of the bound session become typed observations; stale runs never settle newer ones.
+	t.Run("Should decode adapter 0.98.0 task frames into native task observations", func(t *testing.T) {
+		t.Parallel()
+		data, err := os.ReadFile("testdata/claude_agent_acp_0.98.0_task_lifecycle.jsonl")
+		if err != nil {
+			t.Fatal(err)
+		}
+		proc := &AgentProcess{}
+		proc.claudeTasks.enabled.Store(true)
+		proc.bindSessionRoute("sess-claude")
+		active, err := proc.beginPrompt("turn-native", 32)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer proc.endPrompt(active)
+		for line := range strings.SplitSeq(strings.TrimSpace(string(data)), "\n") {
+			var frame struct {
+				Method string          `json:"method"`
+				Params json.RawMessage `json:"params"`
+			}
+			if err := json.Unmarshal([]byte(line), &frame); err != nil {
+				t.Fatal(err)
+			}
+			if _, reqErr := proc.handleInbound(t.Context(), frame.Method, frame.Params); reqErr != nil {
+				t.Fatal(reqErr)
+			}
+		}
+		wants := []struct {
+			kind                 NativeTaskKind
+			call, run, status    string
+			summary              string
+			hasSummary, terminal bool
+		}{
+			{kind: NativeTaskKindSpawn, call: "toolu_background", run: "0001"},
+			{
+				kind:       NativeTaskKindProgress,
+				call:       "toolu_background",
+				run:        "0001",
+				summary:    "Reading internal/session",
+				hasSummary: true,
+			},
+			{kind: NativeTaskKindState, call: "toolu_background", run: "0001", status: "paused"},
+			{kind: NativeTaskKindState, call: "toolu_background", run: "0001", status: "completed", terminal: true},
+			{
+				kind:       NativeTaskKindState,
+				call:       "toolu_background",
+				run:        "0001",
+				status:     "completed",
+				summary:    "Found 3 session owners",
+				hasSummary: true,
+				terminal:   true,
+			},
+			{kind: NativeTaskKindSpawn, call: "toolu_resume", run: "0002"},
+			{kind: NativeTaskKindState, call: "toolu_resume", run: "0002", status: "killed", terminal: true},
+		}
+		got := collectEventsUntilCount(t, active.events, len(wants))
+		for i, want := range wants {
+			task := got[i].NativeTask()
+			if got[i].Type != EventTypeNativeTask || got[i].TurnID != "turn-native" || task == nil ||
+				got[i].ToolCallID != want.call || task.ToolCallID != want.call || task.TaskID != "agent-a" ||
+				task.Kind != want.kind || task.RunID != want.run || task.Status != want.status ||
+				task.Source != NativeTaskSourceClaudeSDK || (task.Summary != nil) != want.hasSummary ||
+				want.hasSummary && *task.Summary != want.summary || task.Terminal() != want.terminal {
+				t.Fatalf("observation %d = %#v %#v, want %#v", i, got[i], task, want)
+			}
+		}
+		if spawn := got[0].NativeTask(); spawn.Background == nil || !*spawn.Background {
+			t.Fatalf("spawn background = %#v", spawn.Background)
+		}
+		if usage := got[1].NativeTask().Usage; usage == nil || usage.TotalTokens != 1200 || usage.ToolUses != 3 ||
+			got[1].NativeTask().LastToolName != "Grep" {
+			t.Fatalf("progress = %#v", got[1].NativeTask())
+		}
+		select {
+		case extra := <-active.events:
+			t.Fatalf("shell, stale, or uncorrelated frame produced %#v", extra)
+		default:
+		}
+	})
+	// Invariant: without run ids, a late frame of an earlier call never rebinds the resumed task, and a
+	// call-less patch after reuse is refused instead of guessed.
+	t.Run(
+		"Should keep a resumed task bound when a late runless notification names the earlier call",
+		func(t *testing.T) {
+			t.Parallel()
+			proc := &AgentProcess{}
+			proc.claudeTasks.enabled.Store(true)
+			proc.bindSessionRoute("sess-claude")
+			active, err := proc.beginPrompt("turn-native", 16)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer proc.endPrompt(active)
+			for _, message := range []string{
+				`{"type":"system","subtype":"task_started","task_id":"agent-r","tool_use_id":"toolu_a","subagent_type":"Explore","uuid":"r-1"}`,
+				`{"type":"system","subtype":"task_started","task_id":"agent-r","tool_use_id":"toolu_b","subagent_type":"Explore","uuid":"r-2"}`,
+				`{"type":"system","subtype":"task_notification","task_id":"agent-r","tool_use_id":"toolu_a","status":"completed","summary":"late a","uuid":"r-3"}`,
+				`{"type":"system","subtype":"task_updated","task_id":"agent-r","patch":{"status":"failed","error":"b broke"},"uuid":"r-4"}`,
+				`{"type":"system","subtype":"task_notification","task_id":"agent-r","tool_use_id":"toolu_b","status":"failed","summary":"b failed","uuid":"r-5"}`,
+			} {
+				params := json.RawMessage(`{"sessionId":"sess-claude","message":` + message + `}`)
+				if _, reqErr := proc.handleInbound(t.Context(), claudeSDKMessageMethod, params); reqErr != nil {
+					t.Fatal(reqErr)
+				}
+			}
+			wants := []struct {
+				call, status, uuid string
+				kind               NativeTaskKind
+			}{
+				{call: "toolu_a", uuid: "r-1", kind: NativeTaskKindSpawn},
+				{call: "toolu_b", uuid: "r-2", kind: NativeTaskKindSpawn},
+				{call: "toolu_a", status: NativeTaskStatusCompleted, uuid: "r-3", kind: NativeTaskKindState},
+				{call: "toolu_b", status: NativeTaskStatusFailed, uuid: "r-5", kind: NativeTaskKindState},
+			}
+			got := collectEventsUntilCount(t, active.events, len(wants))
+			for i, want := range wants {
+				task := got[i].NativeTask()
+				if task == nil || got[i].ToolCallID != want.call || task.ToolCallID != want.call ||
+					task.Kind != want.kind || task.Status != want.status || task.EventUUID != want.uuid {
+					t.Fatalf("observation %d = %#v %#v, want %#v", i, got[i], task, want)
+				}
+			}
+			select {
+			case extra := <-active.events:
+				t.Fatalf("ambiguous runless patch produced %#v", extra)
+			default:
+			}
+		},
+	)
+	t.Run("Should refuse task frames from other sessions or without the opt-in", func(t *testing.T) {
+		t.Parallel()
+		frame := json.RawMessage(
+			`{"sessionId":"sess-foreign","message":{"type":"system","subtype":"task_started","task_id":"t","tool_use_id":"toolu_x","subagent_type":"Explore","description":"x","uuid":"u","session_id":"s"}}`,
+		)
+		proc := &AgentProcess{}
+		proc.claudeTasks.enabled.Store(true)
+		proc.bindSessionRoute("sess-claude")
+		active, err := proc.beginPrompt("turn-native", 4)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer proc.endPrompt(active)
+		if _, reqErr := proc.handleInbound(t.Context(), claudeSDKMessageMethod, frame); reqErr == nil {
+			t.Fatal("foreign session task frame was accepted")
+		}
+		optedOut := &AgentProcess{}
+		optedOut.bindSessionRoute("sess-foreign")
+		idle, err := optedOut.beginPrompt("turn-native", 4)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer optedOut.endPrompt(idle)
+		if _, reqErr := optedOut.handleInbound(t.Context(), claudeSDKMessageMethod, frame); reqErr != nil {
+			t.Fatal(reqErr)
+		}
+		for _, ch := range []<-chan AgentEvent{active.events, idle.events} {
+			select {
+			case event := <-ch:
+				t.Fatalf("refused frame produced %#v", event)
+			default:
+			}
+		}
+	})
+	t.Run("Should keep attribution when a tool response is not a marker object", func(t *testing.T) {
+		t.Parallel()
+		proc := &AgentProcess{}
+		active, err := proc.beginPrompt("turn-native", 4)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer proc.endPrompt(active)
+		raw := json.RawMessage(
+			`{"sessionId":"session-native","update":{"sessionUpdate":"tool_call","toolCallId":"inner","title":"ls","status":"pending","_meta":{"claudeCode":{"parentToolUseId":"toolu_agent","toolName":"Bash","toolResponse":"plain stdout"}}}}`,
+		)
+		if err := proc.handleSessionUpdate(raw); err != nil {
+			t.Fatal(err)
+		}
+		got := collectEventsUntilCount(t, active.events, 1)[0]
+		if got.ParentToolCallID() != "toolu_agent" || got.ProviderToolName() != "Bash" || got.ProviderToolAsync() {
+			t.Fatalf("event = %#v", got)
+		}
+	})
+	t.Run("Should fall back to ordinary rendering for an unknown metadata shape", func(t *testing.T) {
+		t.Parallel()
+		proc := &AgentProcess{}
+		active, err := proc.beginPrompt("turn-native", 4)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer proc.endPrompt(active)
+		raw := json.RawMessage(
+			`{"sessionId":"session-native","update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"hello"},"_meta":{"claudeCode":{"parentToolUseId":{"changed":true},"toolName":"Agent"}}}}`,
+		)
+		if err := proc.handleSessionUpdate(raw); err != nil {
+			t.Fatal(err)
+		}
+		got := collectEventsUntilCount(t, active.events, 1)[0]
+		if got.Text != "hello" || got.ParentToolCallID() != "" || got.ProviderToolName() != "" {
+			t.Fatalf("fallback = %#v", got)
+		}
+	})
+	t.Run("Should retain attribution-only tool refinements", func(t *testing.T) {
+		t.Parallel()
+		proc := &AgentProcess{}
+		active, err := proc.beginPrompt("turn-native", 4)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer proc.endPrompt(active)
+		event := AgentEvent{Type: EventTypeToolCall, ToolCallID: "inner", Title: "Read"}
+		proc.emitPromptEvent(event)
+		proc.emitPromptEvent(event.WithProviderToolMetadata("toolu_agent", "Read", "in_progress"))
+		got := collectEventsUntilCount(t, active.events, 2)
+		if got[1].ParentToolCallID() != "toolu_agent" || got[1].ProviderToolName() != "Read" ||
+			got[1].ToolStatus() != "in_progress" {
+			t.Fatalf("refinement = %#v", got[1])
+		}
+	})
+}
+
+func TestPermissionSameRequestFirstWinner(t *testing.T) {
+	t.Parallel()
+	t.Run("Should accept exactly one of two clients answering the same request", func(t *testing.T) {
+		t.Parallel()
+		proc := newDirectProcess(t, compozyconfig.PermissionModeApproveReads)
+		id, pending, err := proc.registerPendingPermission(
+			"turn-race",
+			acpsdk.RequestPermissionRequest{ToolCall: acpsdk.ToolCallUpdate{ToolCallId: "tool-race"}},
+		)
+		if err != nil {
+			t.Fatal(err)
+		}
+		type result struct {
+			decision string
+			err      error
+		}
+		start := make(chan struct{})
+		results := make(chan result, 2)
+		for _, decision := range []string{string(decisionAllowOnce), string(decisionRejectOnce)} {
+			go func() {
+				<-start
+				results <- result{decision, proc.ResolvePermission(ApproveRequest{RequestID: id, Decision: decision})}
+			}()
+		}
+		close(start)
+		var winner string
+		rejected := 0
+		for range 2 {
+			result := <-results
+			if result.err == nil {
+				if winner != "" {
+					t.Fatal("both clients won")
+				}
+				winner = result.decision
+			} else {
+				if !errors.Is(result.err, ErrPendingPermissionNotFound) {
+					t.Fatalf("losing answer = %v", result.err)
+				}
+				rejected++
+			}
+		}
+		if winner == "" || rejected != 1 {
+			t.Fatalf("winner = %q, rejected = %d", winner, rejected)
+		}
+		if decision := <-pending.response; string(decision) != winner {
+			t.Fatalf("delivered = %q, winner = %q", decision, winner)
+		}
+		if proc.HasPendingPermission() {
+			t.Fatal("winning request remained pending")
+		}
+		if err := proc.ResolvePermission(
+			ApproveRequest{RequestID: id, Decision: string(decisionAllowOnce)},
+		); err == nil {
+			t.Fatal("late answer accepted")
+		}
+	})
+}
+
+// IT-018 timing invariant: instance provider approvals remain answerable beyond 600 seconds.
+// Owner: ACP permission lifecycle; canonical suite: handlers_test.go.
+func TestInstancePermissionBeyondDefaultTimeout(t *testing.T) {
+	t.Run("Should accept an instance approval after eleven minutes", func(t *testing.T) {
+		t.Parallel()
+		synctest.Test(t, func(t *testing.T) {
+			proc := newDirectProcess(t, compozyconfig.PermissionModeApproveReads)
+			proc.permissionWaitResolver = func(string) time.Duration { return 12 * time.Hour }
+			active, err := proc.beginPrompt("instance-turn", 8)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer proc.endPrompt(active)
+			done := make(chan acpsdk.RequestPermissionResponse, 1)
+			errs := make(chan error, 1)
+			go func() {
+				response, err := proc.handleRequestPermission(t.Context(), acpsdk.RequestPermissionRequest{
+					SessionId: "sess-direct",
+					Options: []acpsdk.PermissionOption{
+						{OptionId: "allow-once", Name: "allow", Kind: acpsdk.PermissionOptionKindAllowOnce},
+						{OptionId: "reject-once", Name: "reject", Kind: acpsdk.PermissionOptionKindRejectOnce},
+					},
+					ToolCall: acpsdk.ToolCallUpdate{ToolCallId: "instance-edit", Kind: new(acpsdk.ToolKindEdit)},
+				})
+				errs <- err
+				done <- response
+			}()
+			<-active.events
+			time.Sleep(11 * time.Minute)
+			synctest.Wait()
+			select {
+			case response := <-done:
+				t.Fatalf("approval expired before instance deadline: %#v", response)
+			default:
+			}
+			if err := proc.ResolvePermission(
+				ApproveRequest{TurnID: "instance-turn", Decision: "allow-once"},
+			); err != nil {
+				t.Fatal(err)
+			}
+			if err := <-errs; err != nil {
+				t.Fatal(err)
+			}
+			response := <-done
+			if response.Outcome.Selected == nil || response.Outcome.Selected.OptionId != "allow-once" {
+				t.Fatalf("response = %#v", response)
+			}
+		})
+	})
+}
+
+func TestPermissionRuleDecisionAttribution(t *testing.T) {
+	t.Parallel()
+	t.Run("Should not widen a once rule to an always-only provider option", func(t *testing.T) {
+		proc := newDirectProcess(t, compozyconfig.PermissionModeApproveReads)
+		proc.permissions.rules = []compozyconfig.PermissionRule{{Kind: "edit", Decision: "allow"}}
+		active, err := proc.beginPrompt("rule-once", 8)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer proc.endPrompt(active)
+		response, err := proc.handleRequestPermission(t.Context(), acpsdk.RequestPermissionRequest{
+			SessionId: "sess-direct",
+			ToolCall:  acpsdk.ToolCallUpdate{Kind: new(acpsdk.ToolKindEdit)},
+			Options: []acpsdk.PermissionOption{
+				{OptionId: "allow-always", Kind: acpsdk.PermissionOptionKindAllowAlways},
+			},
+		})
+		if err != nil || response.Outcome.Selected != nil {
+			t.Fatalf("widened rule: %+v %v", response, err)
+		}
+		event := collectEventsUntilCount(t, active.events, 1)[0]
+		if event.ResolvedByValue() != "rule" || !strings.Contains(string(event.Raw), `"permission_rule"`) {
+			t.Fatalf("rule evidence: %+v", event)
+		}
+	})
+	for _, decision := range []string{"allow", "deny"} {
+		t.Run("Should record rule as the source of "+decision, func(t *testing.T) {
+			t.Parallel()
+			proc := newDirectProcess(t, compozyconfig.PermissionModeApproveReads)
+			proc.permissions.rules = []compozyconfig.PermissionRule{{Kind: "edit", Decision: decision}}
+			active, err := proc.beginPrompt("rule-turn", 8)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer proc.endPrompt(active)
+			response, err := proc.handleRequestPermission(t.Context(), acpsdk.RequestPermissionRequest{
+				SessionId: "sess-direct",
+				ToolCall:  acpsdk.ToolCallUpdate{Kind: new(acpsdk.ToolKindEdit), Title: new("Edit docs")},
+				Options: []acpsdk.PermissionOption{
+					{OptionId: "allow-once", Kind: acpsdk.PermissionOptionKindAllowOnce},
+					{OptionId: "reject-once", Kind: acpsdk.PermissionOptionKindRejectOnce},
+				},
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			want := "allow-once"
+			if decision == "deny" {
+				want = "reject-once"
+			}
+			if response.Outcome.Selected == nil || string(response.Outcome.Selected.OptionId) != want {
+				t.Fatalf("outcome=%+v, want %s", response.Outcome, want)
+			}
+			event := collectEventsUntilCount(t, active.events, 1)[0]
+			if event.ResolvedByValue() != "rule" {
+				t.Fatalf("resolved_by=%q, want rule", event.ResolvedByValue())
+			}
+			if proc.HasPendingPermission() {
+				t.Fatal("rule decision left a pending approval")
+			}
+		})
+	}
+}
+
+func TestExpiredPermissionRepeatSuppression(t *testing.T) {
+	t.Parallel()
+	t.Run("Should reject repeats across process replacement until a human clears the state", func(t *testing.T) {
+		t.Parallel()
+		shared := &PermissionDenials{}
+		first := newDirectProcess(t, compozyconfig.PermissionModeApproveReads)
+		first.permissionDenials = shared
+		active, err := first.beginPrompt("first", 8)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer first.endPrompt(active)
+		request := acpsdk.RequestPermissionRequest{
+			SessionId: "sess-direct",
+			ToolCall: acpsdk.ToolCallUpdate{
+				Kind:     new(acpsdk.ToolKindEdit),
+				Title:    new("Edit docs"),
+				RawInput: map[string]any{"path": "docs.md"},
+			},
+			Options: []acpsdk.PermissionOption{
+				{OptionId: "allow-once", Kind: acpsdk.PermissionOptionKindAllowOnce},
+				{OptionId: "reject-once", Kind: acpsdk.PermissionOptionKindRejectOnce},
+			},
+		}
+		ctx, cancel := context.WithCancelCause(t.Context())
+		cancel(context.DeadlineExceeded)
+		if _, err := first.resolvePermissionRequest(ctx, request, "system"); err != nil {
+			t.Fatal(err)
+		}
+		events := collectEventsUntilCount(t, active.events, 2)
+		if events[1].ResolvedByValue() != "timeout" {
+			t.Fatalf("expiry actor=%q", events[1].ResolvedByValue())
+		}
+
+		replacement := newDirectProcess(t, compozyconfig.PermissionModeApproveReads)
+		replacement.permissionDenials = shared
+		next, err := replacement.beginPrompt("next", 8)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer replacement.endPrompt(next)
+		response, err := replacement.handleRequestPermission(t.Context(), request)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if response.Outcome.Selected == nil || response.Outcome.Selected.OptionId != "reject-once" {
+			t.Fatalf("repeat outcome=%+v", response.Outcome)
+		}
+		event := collectEventsUntilCount(t, next.events, 1)[0]
+		if event.ResolvedByValue() != "repeat_denied" || replacement.HasPendingPermission() {
+			t.Fatalf("repeat event=%+v pending=%v", event, replacement.HasPendingPermission())
+		}
+		shared.Clear()
+		if shared.Contains(permissionRequestDigest(request)) {
+			t.Fatal("human reset retained an expired request")
+		}
+	})
+
+	t.Run("Should not suppress a request canceled because the connection dropped", func(t *testing.T) {
+		t.Parallel()
+		shared := &PermissionDenials{}
+		proc := newDirectProcess(t, compozyconfig.PermissionModeApproveReads)
+		proc.permissionDenials = shared
+		active, err := proc.beginPrompt("disconnect", 8)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer proc.endPrompt(active)
+		request := acpsdk.RequestPermissionRequest{
+			SessionId: "sess-direct",
+			ToolCall: acpsdk.ToolCallUpdate{
+				Kind:     new(acpsdk.ToolKindEdit),
+				Title:    new("Edit docs"),
+				RawInput: map[string]any{"path": "docs.md"},
+			},
+			Options: []acpsdk.PermissionOption{
+				{OptionId: "allow-once", Kind: acpsdk.PermissionOptionKindAllowOnce},
+				{OptionId: "reject-once", Kind: acpsdk.PermissionOptionKindRejectOnce},
+			},
+		}
+		result := make(chan error, 1)
+		go func() {
+			_, err := proc.handleRequestPermission(t.Context(), request)
+			result <- err
+		}()
+		collectEventsUntilCount(t, active.events, 1)
+		close(proc.done)
+		if err := <-result; err != nil {
+			t.Fatal(err)
+		}
+		event := collectEventsUntilCount(t, active.events, 1)[0]
+		if event.Decision != string(decisionCanceled) {
+			t.Fatalf("disconnect decision=%q, want %q", event.Decision, decisionCanceled)
+		}
+		if shared.Contains(permissionRequestDigest(request)) {
+			t.Fatal("connection loss recorded a repeat denial")
+		}
+	})
+}
+
+// Invariant (#1200): at approve-edits and auto the provider gate hands calls to
+// Compozy's hosted MCP server to the native tool policy, identified only by the
+// provider's structured server identity, and one operator approval answers both
+// gates for the same call. Owner: ACP permission resolution; canonical suite: handlers_test.go.
+func TestHostedToolPermissionGates(t *testing.T) {
+	t.Parallel()
+	options := []acpsdk.PermissionOption{
+		{OptionId: "allow-once", Kind: acpsdk.PermissionOptionKindAllowOnce},
+		{OptionId: "reject-once", Kind: acpsdk.PermissionOptionKindRejectOnce},
+	}
+	input := map[string]any{"name": "fix-1200", "workspace": "compozy"}
+	claudeRequest := func(server, source, toolName string) acpsdk.RequestPermissionRequest {
+		return acpsdk.RequestPermissionRequest{
+			SessionId: "sess-direct",
+			Options:   options,
+			ToolCall: acpsdk.ToolCallUpdate{
+				ToolCallId: "toolu_1200",
+				Title:      new(toolName),
+				Kind:       new(acpsdk.ToolKindOther),
+				RawInput:   input,
+				Meta: map[string]any{"claudeCode": map[string]any{
+					"toolName":  toolName,
+					"mcpServer": map[string]any{"name": server, "source": source},
+				}},
+			},
+		}
+	}
+	hostedName := "mcp__compozy-hosted-tools__compozy__worktree_create"
+	codexRequest := func(server string) acpsdk.RequestPermissionRequest {
+		return acpsdk.RequestPermissionRequest{
+			SessionId: "sess-direct",
+			Options:   options,
+			ToolCall: acpsdk.ToolCallUpdate{
+				ToolCallId: "exec-1200",
+				Title:      new("mcp." + server + ".compozy__worktree_create"),
+				Kind:       new(acpsdk.ToolKindExecute),
+				RawInput: map[string]any{
+					"server": server, "tool": "compozy__worktree_create", "arguments": input,
+				},
+			},
+		}
+	}
+	codexAnnounced := func(t *testing.T, proc *AgentProcess, active *activePromptState) acpsdk.RequestPermissionRequest {
+		t.Helper()
+		// The announcement travels the real session/update path.
+		if err := proc.handleSessionUpdate(mustMarshalJSON(map[string]any{
+			"sessionId": "sess-direct",
+			"update": map[string]any{
+				"sessionUpdate": "tool_call", "toolCallId": "exec-announced", "status": "in_progress",
+				"title": "mcp.compozy-hosted-tools.compozy__worktree_create", "kind": "execute",
+				"rawInput": map[string]any{
+					"server": "compozy-hosted-tools", "tool": "compozy__worktree_create", "arguments": input,
+				},
+			},
+		})); err != nil {
+			t.Fatal(err)
+		}
+		collectEventsUntilCount(t, active.events, 1)
+		return acpsdk.RequestPermissionRequest{
+			SessionId: "sess-direct",
+			Options:   options,
+			ToolCall:  acpsdk.ToolCallUpdate{ToolCallId: "exec-announced", Kind: new(acpsdk.ToolKindExecute)},
+		}
+	}
+	claudeWithCodexInput := claudeRequest("github", "dynamic", "mcp__github__create_issue")
+	claudeWithCodexInput.ToolCall.RawInput = map[string]any{
+		"server": "compozy-hosted-tools", "tool": "compozy__worktree_create", "arguments": input,
+	}
+	titleOnly := claudeRequest("", "", hostedName)
+	titleOnly.ToolCall.Meta = nil
+	bridges := map[string]string{
+		"claude": "npx -y @agentclientprotocol/claude-agent-acp",
+		"codex":  "npx -y @agentclientprotocol/codex-acp@latest",
+	}
+	// launch is "minted" for the daemon's hosted launch, "name" for a server that
+	// only reuses its name, and "" for no hosted server.
+	newProcess := func(
+		t *testing.T, mode compozyconfig.PermissionMode, bridge string, launch string,
+	) (*AgentProcess, *activePromptState) {
+		t.Helper()
+		proc := newDirectProcess(t, mode)
+		proc.permissionTimeout = 50 * time.Millisecond
+		opts := StartOpts{Command: bridges[bridge]}
+		switch launch {
+		case "minted":
+			opts.MCPServers = []compozyconfig.MCPServer{{Name: "compozy-hosted-tools", Command: "compozy",
+				Args: []string{"tool", "mcp", "--session", "sess-direct", "--bind-nonce", "nonce"}}}
+		case "name":
+			opts.MCPServers = []compozyconfig.MCPServer{{Name: "compozy-hosted-tools", Command: "my-server"}}
+		}
+		proc.setHostedToolIdentity(opts)
+		active, err := proc.beginPrompt("turn-hosted", 8)
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { proc.endPrompt(active) })
+		return proc, active
+	}
+	assertOutcome := func(t *testing.T, response acpsdk.RequestPermissionResponse, want string) {
+		t.Helper()
+		if response.Outcome.Selected == nil || string(response.Outcome.Selected.OptionId) != want {
+			t.Fatalf("outcome = %+v, want %s", response.Outcome, want)
+		}
+	}
+
+	for _, mode := range []compozyconfig.PermissionMode{
+		compozyconfig.PermissionModeApproveEdits, compozyconfig.PermissionModeAuto,
+	} {
+		for _, tc := range []struct {
+			name    string
+			bridge  string
+			request acpsdk.RequestPermissionRequest
+		}{
+			{"Claude hosted server", "claude", claudeRequest("compozy-hosted-tools", "dynamic", hostedName)},
+			{"Codex hosted server", "codex", codexRequest("compozy-hosted-tools")},
+		} {
+			t.Run("Should not prompt for a "+tc.name+" call at "+string(mode), func(t *testing.T) {
+				t.Parallel()
+				proc, active := newProcess(t, mode, tc.bridge, "minted")
+				response, err := proc.handleRequestPermission(t.Context(), tc.request)
+				if err != nil {
+					t.Fatal(err)
+				}
+				assertOutcome(t, response, "allow-once")
+				if pending := proc.HasPendingPermission(); pending || len(active.events) != 0 {
+					t.Fatalf("hosted call prompted: pending=%v events=%d", pending, len(active.events))
+				}
+			})
+		}
+	}
+
+	for _, tc := range []struct {
+		name    string
+		request acpsdk.RequestPermissionRequest
+		bridge  string
+		launch  string
+	}{
+		{
+			"a configured server reusing the hosted name",
+			claudeRequest("compozy-hosted-tools", "project", hostedName), "claude", "minted",
+		},
+		{"a non-Compozy MCP server", claudeRequest("github", "dynamic", "mcp__github__create_issue"), "claude", "minted"},
+		{"a non-Compozy Codex MCP execute", codexRequest("github"), "codex", "minted"},
+		{"a title naming the hosted tool", titleOnly, "claude", "minted"},
+		{"a Claude call whose input names the hosted server", claudeWithCodexInput, "claude", "minted"},
+		{"a Codex-shaped request from a non-Codex provider", codexRequest("compozy-hosted-tools"), "claude", "minted"},
+		{
+			"a session server that only reuses the hosted name",
+			claudeRequest("compozy-hosted-tools", "dynamic", hostedName), "claude", "name",
+		},
+		{
+			"a session that never received the hosted server",
+			claudeRequest("compozy-hosted-tools", "dynamic", hostedName), "claude", "",
+		},
+	} {
+		t.Run("Should still ask at approve-edits for "+tc.name, func(t *testing.T) {
+			t.Parallel()
+			proc, active := newProcess(t, compozyconfig.PermissionModeApproveEdits, tc.bridge, tc.launch)
+			response, err := proc.handleRequestPermission(t.Context(), tc.request)
+			if err != nil {
+				t.Fatal(err)
+			}
+			assertOutcome(t, response, "reject-once")
+			events := collectEventsUntilCount(t, active.events, 2)
+			if events[0].Decision != "" || events[1].ResolvedByValue() != "timeout" {
+				t.Fatalf("events = %+v, want one expired prompt", events)
+			}
+		})
+	}
+
+	// The daemon bridge offers allow-always unless it forces a once-only prompt.
+	daemonOptions := []acpsdk.PermissionOption{
+		{OptionId: "allow-once", Kind: acpsdk.PermissionOptionKindAllowOnce},
+		{OptionId: "allow-always", Kind: acpsdk.PermissionOptionKindAllowAlways},
+		{OptionId: "reject-once", Kind: acpsdk.PermissionOptionKindRejectOnce},
+	}
+	daemonRequest := func(toolID string, kind acpsdk.ToolKind) acpsdk.RequestPermissionRequest {
+		return acpsdk.RequestPermissionRequest{
+			SessionId: "sess-direct",
+			Options:   daemonOptions,
+			Meta:      map[string]any{PermissionToolIDMetaKey: toolID},
+			ToolCall: acpsdk.ToolCallUpdate{
+				ToolCallId: "call-1200",
+				Title:      new(toolID),
+				Kind:       new(kind),
+				RawInput:   map[string]any{"workspace": "compozy", "name": "fix-1200"},
+			},
+		}
+	}
+	answerPrompt := func(t *testing.T, proc *AgentProcess, active *activePromptState,
+		request acpsdk.RequestPermissionRequest, actor string,
+	) acpsdk.RequestPermissionResponse {
+		t.Helper()
+		result := make(chan acpsdk.RequestPermissionResponse, 1)
+		go func() {
+			response, err := proc.resolvePermissionRequest(t.Context(), request, actor)
+			if err != nil {
+				t.Error(err)
+			}
+			result <- response
+		}()
+		if pending := collectEventsUntilCount(t, active.events, 1)[0]; pending.Decision != "" {
+			t.Fatalf("first event = %+v, want a prompt", pending)
+		}
+		if err := proc.ResolvePermission(ApproveRequest{
+			TurnID: "turn-hosted", Decision: string(decisionAllowOnce), ResolvedBy: "operator",
+		}); err != nil {
+			t.Fatal(err)
+		}
+		collectEventsUntilCount(t, active.events, 1)
+		return <-result
+	}
+
+	t.Run("Should not prompt for a Codex call identified by its announced tool call", func(t *testing.T) {
+		t.Parallel()
+		proc, active := newProcess(t, compozyconfig.PermissionModeApproveEdits, "codex", "minted")
+		response, err := proc.handleRequestPermission(t.Context(), codexAnnounced(t, proc, active))
+		if err != nil {
+			t.Fatal(err)
+		}
+		assertOutcome(t, response, "allow-once")
+		if len(active.events) != 0 {
+			t.Fatalf("announced hosted call prompted: events=%d", len(active.events))
+		}
+	})
+
+	t.Run("Should ask once for a destructive hosted call at approve-edits", func(t *testing.T) {
+		t.Parallel()
+		proc, active := newProcess(t, compozyconfig.PermissionModeApproveEdits, "claude", "minted")
+		gate1 := claudeRequest("compozy-hosted-tools", "dynamic", "mcp__compozy-hosted-tools__compozy__worktree_remove")
+		response, err := proc.handleRequestPermission(t.Context(), gate1)
+		if err != nil {
+			t.Fatal(err)
+		}
+		assertOutcome(t, response, "allow-once")
+		assertOutcome(t, answerPrompt(t, proc, active,
+			daemonRequest("compozy__worktree_remove", acpsdk.ToolKindDelete), permissionActorSystem), "allow-once")
+		if len(active.events) != 0 {
+			t.Fatalf("extra permission events = %d", len(active.events))
+		}
+	})
+
+	t.Run("Should let one provider-gate approval answer the daemon gate once", func(t *testing.T) {
+		t.Parallel()
+		proc, active := newProcess(t, compozyconfig.PermissionModeApproveReads, "claude", "minted")
+		gate1 := claudeRequest("compozy-hosted-tools", "dynamic", hostedName)
+		// The provider omitted workspace; the daemon binds it before its own gate.
+		gate1.ToolCall.RawInput = map[string]any{"name": "fix-1200"}
+		assertOutcome(t, answerPrompt(t, proc, active, gate1, permissionActorProvider), "allow-once")
+		gate2 := daemonRequest("compozy__worktree_create", acpsdk.ToolKindExecute)
+		response, err := proc.resolvePermissionRequest(t.Context(), gate2, permissionActorSystem)
+		if err != nil {
+			t.Fatal(err)
+		}
+		assertOutcome(t, response, "allow-once")
+		if proc.HasPendingPermission() || len(active.events) != 0 {
+			t.Fatal("the daemon gate asked again for an approved call")
+		}
+		changed := daemonRequest("compozy__worktree_create", acpsdk.ToolKindExecute)
+		changed.ToolCall.RawInput = map[string]any{"workspace": "compozy", "name": "other"}
+		otherWorkspace := daemonRequest("compozy__worktree_create", acpsdk.ToolKindExecute)
+		otherWorkspace.ToolCall.RawInput = map[string]any{"workspace": "other", "name": "fix-1200"}
+		forced := daemonRequest("compozy__worktree_create", acpsdk.ToolKindExecute)
+		forced.Options = options
+		for index, request := range []acpsdk.RequestPermissionRequest{gate2, changed, otherWorkspace, forced} {
+			if index >= 2 {
+				// An explicit workspace the provider sent is never ignored, and a forced
+				// once-only daemon prompt is never answered by a provider approval.
+				proc.hostedApprovals.record(hostedToolCall{
+					toolID: "compozy__worktree_create", arguments: []byte(`{"name":"fix-1200","workspace":"compozy"}`),
+				}, timeNowUTC())
+			}
+			response, err := proc.resolvePermissionRequest(t.Context(), request, permissionActorSystem)
+			if err != nil {
+				t.Fatal(err)
+			}
+			assertOutcome(t, response, "reject-once")
+			collectEventsUntilCount(t, active.events, 2)
+		}
+	})
+}

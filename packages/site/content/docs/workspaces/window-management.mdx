@@ -1,0 +1,247 @@
+---
+title: Window Management
+description: Persistent virtual desktops, semantic window placement, revision-safe layouts, connected clients, and recovery.
+---
+
+CompozyOS stores one authoritative window topology per workspace. Persistent virtual desktops own tiled
+groups and floating windows; clients project that same normalized topology into their own viewport.
+The daemon, not the browser, validates membership, layout trees, weights, history, and revisions.
+
+<OperatorNote>
+  Window management is workspace state. Deleting a workspace removes its topology. A browser stores
+  only its stable client identifier locally.
+</OperatorNote>
+
+## Topology and presentation
+
+Every window belongs to exactly one desktop. A tiled group is a tree of leaves, weighted splits,
+and stacks; floating windows retain normalized geometry. This lets two browsers with different
+viewport sizes render one shared arrangement without persisting pixels.
+
+Active desktop and focused window are client-local. Commands that change presentation — desktop
+switch and window focus — require an explicit connected `client_id`, so one operator cannot silently
+redirect another operator's screen. Each client view has an independent,
+monotonic presentation revision: these commands do not advance topology revision, change layout
+history, or emit extension hooks.
+
+## Revision-safe operations
+
+Read the current topology before changing it:
+
+```bash
+compozy layout get --workspace <workspace-id> -o json
+```
+
+Every durable CLI mutation requires `--revision`. A successful command advances the workspace
+revision once and atomically records the normalized snapshot and event. Layout/topology commands add
+one history entry; route navigation does not enter or clear layout history. Preview, validation,
+rejection, and no-op paths write nothing.
+
+```bash
+compozy desktop create --workspace <workspace-id> --revision <revision> --name Build
+compozy window open --workspace <workspace-id> --revision <revision> --app tasks \
+  --pathname /tasks --search-json '{}'
+compozy window navigate --workspace <workspace-id> --revision <revision> --id <window-id> \
+  --pathname /tasks/<task-id> --search-json '{"tab":"runs"}'
+compozy window move --workspace <workspace-id> --revision <revision> --id <window-id> \
+  --desktop <desktop-id> --target <window-id> --placement right
+compozy window move --workspace <workspace-id> --revision <revision> --id <window-id> \
+  --desktop <desktop-id> --group
+```
+
+The app ids `jobs` and `triggers` are deprecated: one `automations` app replaced them in v0.4.0
+(`--app automations --pathname /automations/jobs/<job-id>`). Until v0.5.0, `--app jobs|triggers`,
+window commands, and `window_layout` resources that name them open Automations on the matching path
+and warn; v0.5.0 rejects them like any unknown app id. Saved layouts that named them migrate
+permanently. See [Upgrading from v0.3](/docs/automation#upgrading-from-v03).
+
+On `window_manager_revision_conflict`, read the topology again and recompute the semantic action.
+Do not replay stale geometry blindly.
+
+Window `placement` is structural (`tiled`, `stacked`, or `floating`). Its separate durable `route`
+contains an internal absolute pathname and canonical JSON-object search state, so detail/filter state
+resumes after reload or daemon restart and converges in peer clients. Add `--client` to
+`compozy window navigate` only when the same operation should also activate and focus that explicit client.
+
+## Tiling behavior
+
+New windows open as a new tab in the focused window by default (`new_window_policy = "tab"`). On an
+empty desktop, or when the focused window sits on another desktop or is minimized, the first window
+fills the whole desktop instead. Set `beside_focus` to tile new windows beside the focused one, or
+`floating` to open them as floating windows. An open without a connected client (for example an
+agent's `compozy__window_open` call without `client_id`) never joins a tab you are looking at. When
+another client's open turns a window you are showing into a tab group, you keep seeing that window;
+pass `--id` (`window_id`) with the open for this to hold, because a window whose ID the daemon
+generates becomes the group's active tab for every other connected client. An explicit placement
+always wins over the policy: `--stack-target` joins that window's tabs, `--tiled` splits beside the
+client's focus, and `--floating` opens a free floating window. Structural drops
+use `before`, `after`, `left`, `right`, `top`, `bottom`, or `center`; dropping onto an occupied target
+reflows the tree instead of overlapping it. Shared-boundary resize updates all descendants on each
+side. When a viewport cannot satisfy minimum window sizes, that client projects the affected split
+as a stack without corrupting the stored topology. Group relocation moves the source window's tiled
+group and is exclusive with `--target`, `--placement`, and `--rect`.
+
+`compozy layout arrange --arrangement` accepts `horizontal`, `vertical`, `grid`, `stack`, or
+`main_stack`. Main and stack gives the first listed window a 60% main column and splits the rest
+vertically in the column beside it. Each `--window` is its own participant, so naming two tabs of one
+deck splits them apart. Add `--keep-frames` to arrange each named window's whole tab frame instead:
+the deck moves as one participant and keeps its tabs, active tab, and identity.
+
+In the app, **Window › Arrange** applies the same arrangements to the focused window and the other
+visible windows on its desktop, keeping every tab deck whole: **Main and stack** (the focused
+window takes the main column), **Columns** (every visible window side by side), **Grid**, and
+**Balance sizes** (equal splits).
+**Window › Move window to** sends the focused window to another desktop by name. The panes between
+tiled windows share a single hairline; drag it, or focus it and use the arrow keys (hold Shift for
+10% steps), to resize the panes on either side. Each pane keeps at least 220 px.
+
+In the app, clicking an icon in the left rail goes to that app's open window, or opens it as a new
+tab when it has none (Sessions goes to your latest session). Hold a modifier to open another window of
+the app instead:
+
+| Gesture            | Opens                                               |
+| ------------------ | --------------------------------------------------- |
+| Click              | The open window, or a new tab in the focused window |
+| Option (⌥) + click | A new window split beside the focused one           |
+| Shift (⇧) + click  | A new desktop, with the new window filling it       |
+
+Right-click an icon (or focus it and press Shift+F10) for every destination: **Open in new tab**,
+**Open in split**, **Open in new window** (a floating window), **Open in new desktop**, and **Go to
+tab** when the app already has a window. For Sessions, these open the session list window, where you
+pick a session or start a new one. Enter and Space on a focused icon act like a plain click.
+
+Repeated side snapping cycles through one-half, two-thirds, and one-third by default. Top-center
+targets zoom the window: the unit holding it (the window or its whole tab frame) becomes the only
+full-size island of a desktop. When nothing else is showing on the window's desktop it zooms right
+there; when another window is visible, it moves to a new desktop placed right after the current one so
+no window gets covered. That desktop works like any other, so you can still add tabs and tiles to it.
+Unzooming brings the unit back to where it came from and removes the desktop the zoom created once it
+is empty; closing the zoomed window does the same. Grouping a window into the zoomed frame keeps the
+zoom; tiling another window to a screen edge gives the zoomed window the remaining space and ends the
+zoom, and arranging, moving, swapping, resizing, or floating ends it in place. A minimized window that
+was zoomed comes back zoomed. Bottom-center also zooms by default; set it to `reserved` or `none` to
+disable it. Both behavior and thresholds are validated under `[window_manager]` in `config.toml`.
+
+To restore an internal maximized window, click its **Restore window** control (the zoom button
+changes its icon and label while maximized). This returns the saved size and placement. You can
+also drag any border or corner to resize it directly: resizing ends zoom and saves the new tiled
+size on its current desktop. The same internal window controls serve Web and Electron; they are
+separate from native browser or operating-system fullscreen.
+
+## Persistent desktops
+
+```bash
+compozy desktop list --workspace <workspace-id> -o json
+compozy desktop clients register --workspace <workspace-id> --client <stable-client-id>
+compozy desktop switch --workspace <workspace-id> --revision <revision> \
+  --client <stable-client-id> --id <desktop-id>
+compozy desktop delete --workspace <workspace-id> --revision <revision> --id <desktop-id> \
+  --destination <desktop-id>
+```
+
+Deleting the final desktop is rejected. A non-empty desktop requires a distinct destination so the
+window transfer and deletion happen in one transaction. The Web shell exposes the same desktops as
+a minimal dot pager in the top bar, next to an **All desktops** button that opens full management on
+demand.
+
+## Declarative layouts and recovery
+
+Settings → Layouts accepts zero for the gap between tiles and for each outer inset independently.
+A failed Save keeps your draft and offers retry or discard. The save result distinguishes applied
+settings from saved settings that still need an action, and displays application warnings. If a save
+reaches disk but application fails, retry applies the pending layout; discard keeps the configuration
+already saved on disk.
+
+`PATCH /api/settings/window-manager` retains the section fields and adds an `apply` receipt with
+`applied`, `next_action`, `warnings`, and `partial_failures`. A successful HTTP response does not by
+itself mean the configuration became active. Send `preserve_shortcuts: true` with a behavior-only
+`config` to preserve the current shortcut and global-hotkey maps atomically. Explicit top-level
+`shortcuts` or `global_shortcuts` still replace those maps; omitting the flag retains full-config
+replacement behavior. Settings uses preservation so an open spacing draft cannot overwrite a
+separately edited shortcut.
+
+Semantic commands are the normal control surface. A validated layout document is the raw recovery
+escape hatch:
+
+```bash
+compozy layout export --workspace <workspace-id> -o json > layout.json
+compozy layout validate --workspace <workspace-id> --file layout.json -o json
+compozy layout apply --workspace <workspace-id> --revision <revision> --file layout.json -o json
+```
+
+Export omits history. Validate never writes. Apply validates the complete document, binds it to the
+requested workspace, preserves current routes for surviving window IDs, and replaces the topology
+atomically. Extensions can contribute declarative `window_layout` resources; discover them through
+`compozy__resources_list`, then arrange by
+`resource_id`. The Settings layout editor lists and saves profiles through
+`/api/workspaces/{workspace_id}/window-manager/layout-profiles`. That projection contains global
+profiles plus profiles scoped to the selected workspace, and rejects cross-workspace writes.
+Resources cannot execute code or receive pointer events.
+
+A tiled return anchor in an exported document carries `return_anchor.source_group`, the daemon's
+validated deep capture of its source group. Restoring a minimized window reinstalls the exact group and
+node identities, order, weights, and placement while the source residue is unchanged. If the source
+changed in the meantime, CompozyOS preserves those edits and falls back to the structural anchor, then
+the client's focused window on the same desktop, then a floating placement. A zoomed window's
+`return_anchor` is the slot unzoom takes it back to. Preserve `source_group` and `return_anchor.zoomed`
+during raw document round trips instead of constructing or editing this recovery state.
+
+### Retired apps in saved layouts
+
+A saved layout can name an app that CompozyOS no longer ships. When the daemon loads a workspace's
+saved window topology, it removes every window whose app is no longer registered, including the same
+windows inside undo and redo history and recently closed entries. It then renormalizes the affected
+desktops, rewrites a Settings window's saved `/settings/memory` route to `/settings`, and persists the
+result once. After the write succeeds it logs `windowmanager.snapshot_reconciled` with the
+`workspace_id`, the `profile_id`, the sorted `dropped_apps` (the IDs of the removed apps), the number
+of `rewritten_routes`, and the new `revision`. The app IDs and the route count cover the current
+windows, the undo and redo history, and the recently closed entries. The next load changes nothing.
+
+Declarative `window_layout` resources follow the same rule. The daemon rewrites stored ones once at
+boot, drops the removed windows from their participant slots, and logs
+`window_manager.layout_reconciled` with the `resource_id`; layout listings always show the reconciled
+form. A layout document passed to `compozy layout apply` must carry the current snapshot `version`,
+which is `4`.
+
+## All projects and User desktops
+
+Besides one topology per project, each profile has two reserved desktops:
+
+| Partition | Shown when                                                  | Address it with                                                               | Who may change it                                                |
+| --------- | ----------------------------------------------------------- | ----------------------------------------------------------------------------- | ---------------------------------------------------------------- |
+| `global`  | The topbar globe is on ([All projects](/docs/all-projects)) | `/api/workspaces/global/window-manager`, `workspace: "global"` (native tools) | You only. Every agent is refused, including unrestricted ones.   |
+| `user`    | **User** is focused ([User scope](/docs/user-scope))        | `--workspace @user`, `workspace: "@user"`                                     | You, and agents with the unrestricted grant of the same profile. |
+
+A window remembers which data it shows through `route.search.workspace`: a project ID, `@user`, or
+nothing. A remembered value always wins. Without one, a window on `global` shows every project, a
+window on a project desktop shows that project, and a window on `user` shows User. On `global`, open,
+navigate, reopen, and layout apply refuse a value that is neither `@user` nor a registered project
+with `window_binding_invalid`. Saved layouts always load, even when a remembered project is gone.
+
+When a session is deleted, every desktop of every profile drops it: its windows move to the empty
+sessions view and it leaves closed-window, navigation, and undo history. When a project is removed,
+windows bound to it fall back to their app's list, and nothing can bring the binding back.
+
+## Agent and transport access
+
+The lazy `compozy__window_manager` toolset exposes 26 desktop, window, and layout tools with structured
+revisions, diagnostics, capability gates, and risk classifications. Resolve `compozy__tool_info` before
+calling a tool. CLI fallbacks are grouped under [`compozy desktop`](/docs/cli/desktop),
+[`compozy window`](/docs/cli/window), and [`compozy layout`](/docs/cli/layout).
+
+HTTP and UDS expose identical routes below
+`/api/workspaces/{workspace_id}/window-manager`; see the
+[Workspaces API](/docs/api/workspaces) for request and response schemas. The WebSocket
+stream accepts an optional registered `client_id`. A bound stream fences that client's view in its
+initial snapshot and then sends only strictly newer presentation frames for that ID alongside
+workspace-revision topology events; an unbound stream receives topology only. After slow-consumer
+eviction, reconnect and replace local state from the next fence. After a daemon restart, register the
+same stable client ID again before reconnecting.
+
+Use `compozy layout watch --workspace <workspace-id> --client <stable-client-id> -o jsonl` for the bound
+CLI stream. Omit `--client` when only topology revisions are needed.
+
+Committed operations emit exactly `window_manager.layout.applied`,
+`window_manager.desktop.created`, `window_manager.desktop.deleted`, and
+`window_manager.window.moved` as async hooks. Pointer previews, navigation, focus changes, and
+desktop switching do not emit extension hooks.

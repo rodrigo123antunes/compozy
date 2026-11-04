@@ -1,0 +1,592 @@
+import { createHash } from "node:crypto";
+import { createServer, type Server } from "node:http";
+import { access, copyFile, mkdir, readFile, rename, rm, writeFile } from "node:fs/promises";
+import { basename, dirname, join } from "node:path";
+import { homedir } from "node:os";
+import { fileURLToPath } from "node:url";
+
+import { expect, test, type DesktopInstance, type PackagedCopy } from "../fixtures";
+import { completeOnboarding, readDiagnosticFile } from "../helpers";
+import { runCommand } from "../process";
+import {
+  prepareUpdateWork,
+  startUpdateWork,
+  expectUpdateWorkRecovered,
+  restartUpdatedRuntime,
+} from "../update-sessions";
+
+interface UpdateFixture {
+  readonly asset: string;
+  readonly baseline_app_image?: string;
+  readonly baseline_executable?: string;
+  readonly current_version: string;
+  readonly directory: string;
+  readonly manifest: string;
+  readonly next_version: string;
+}
+
+interface MockFeed {
+  readonly url: string;
+  close(): Promise<void>;
+  releaseAsset(): void;
+}
+
+type RestoreEnvironment = () => Promise<void>;
+
+const testDirectory = fileURLToPath(new URL(".", import.meta.url));
+const repositoryRoot = join(testDirectory, "../../../..");
+
+async function updateFixture(): Promise<UpdateFixture> {
+  const value: unknown = JSON.parse(
+    await readFile(join(testDirectory, "../../../.artifacts/e2e-update-fixture.json"), "utf8")
+  );
+  if (!value || typeof value !== "object") throw new Error("The update fixture is invalid.");
+  for (const field of [
+    "asset",
+    "current_version",
+    "directory",
+    "manifest",
+    "next_version",
+  ] as const) {
+    if (typeof Reflect.get(value, field) !== "string") {
+      throw new Error(`The update fixture field ${field} is invalid.`);
+    }
+  }
+  return value as UpdateFixture;
+}
+
+async function listen(server: Server): Promise<number> {
+  return await new Promise((resolveListen, reject) => {
+    server.once("error", reject);
+    server.listen(0, "127.0.0.1", () => {
+      server.off("error", reject);
+      const address = server.address();
+      if (!address || typeof address === "string") {
+        reject(new Error("The mock update feed did not bind a TCP port."));
+        return;
+      }
+      resolveListen(address.port);
+    });
+  });
+}
+
+async function closeServer(server: Server): Promise<void> {
+  await new Promise<void>((resolveClose, reject) => {
+    server.close(error => (error ? reject(error) : resolveClose()));
+  });
+}
+
+async function configureRelaunchHome(home: string): Promise<RestoreEnvironment> {
+  if (process.platform !== "darwin") return () => Promise.resolve();
+  const previous = await runCommand("launchctl", ["getenv", "COMPOZY_HOME"]);
+  if (previous.exitCode !== 0) {
+    throw new Error(previous.stderr.trim() || "Could not read the launch-session COMPOZY_HOME.");
+  }
+  const configured = await runCommand("launchctl", ["setenv", "COMPOZY_HOME", home]);
+  if (configured.exitCode !== 0) {
+    throw new Error(
+      configured.stderr.trim() || "Could not isolate the native updater relaunch home."
+    );
+  }
+  return async () => {
+    const value = previous.stdout.trim();
+    const restored = await runCommand(
+      "launchctl",
+      value ? ["setenv", "COMPOZY_HOME", value] : ["unsetenv", "COMPOZY_HOME"]
+    );
+    if (restored.exitCode !== 0) {
+      throw new Error(
+        restored.stderr.trim() || "Could not restore the launch-session COMPOZY_HOME."
+      );
+    }
+  };
+}
+
+async function closeFixture(feed: MockFeed, restoreEnvironment: RestoreEnvironment): Promise<void> {
+  const results = await Promise.allSettled([feed.close(), restoreEnvironment()]);
+  const errors = results.flatMap(result => (result.status === "rejected" ? [result.reason] : []));
+  if (errors.length === 1) throw errors[0];
+  if (errors.length > 1) throw new AggregateError(errors, "The update fixture cleanup failed.");
+}
+
+async function startMockFeed(
+  fixture: UpdateFixture,
+  options: { readonly holdAsset?: boolean } = {}
+): Promise<MockFeed> {
+  const allowed = new Set([fixture.asset, fixture.manifest]);
+  let releaseAsset = () => {};
+  const assetReady = options.holdAsset
+    ? new Promise<void>(resolveAsset => {
+        releaseAsset = resolveAsset;
+      })
+    : Promise.resolve();
+  const server = createServer((request, response) => {
+    const requested = basename(new URL(request.url ?? "/", "http://127.0.0.1").pathname);
+    if (!allowed.has(requested)) {
+      response.writeHead(404).end();
+      return;
+    }
+    void (requested === fixture.asset ? assetReady : Promise.resolve())
+      .then(async () => await readFile(join(fixture.directory, requested)))
+      .then(
+        payload => {
+          response.writeHead(200, {
+            "content-length": payload.byteLength,
+            "content-type": requested.endsWith(".yml") ? "text/yaml" : "application/octet-stream",
+          });
+          response.end(payload);
+        },
+        error => {
+          response.writeHead(500).end(error instanceof Error ? error.message : "Feed read failed.");
+        }
+      );
+  });
+  const port = await listen(server);
+  return {
+    url: `http://127.0.0.1:${port}/`,
+    async close() {
+      releaseAsset();
+      await closeServer(server);
+    },
+    releaseAsset,
+  };
+}
+
+async function configureFeed(
+  packaged: PackagedCopy,
+  feedURL: string
+): Promise<() => Promise<void>> {
+  const cacheName = `compozyos-e2e-${createHash("sha256").update(packaged.executablePath).digest("hex")}`;
+  await writeFile(
+    join(packaged.resourcesPath, "app-update.yml"),
+    `provider: generic\nurl: ${feedURL}\nupdaterCacheDirName: ${cacheName}\n`,
+    { mode: 0o600 }
+  );
+  return async () => {
+    // Linux fixtures already own an isolated HOME; macOS uses the login cache root.
+    if (process.platform === "darwin") {
+      await rm(join(homedir(), "Library", "Caches", cacheName), { recursive: true, force: true });
+    }
+  };
+}
+
+async function artifactDigest(fixture: UpdateFixture): Promise<string> {
+  return `sha256:${createHash("sha256")
+    .update(await readFile(join(fixture.directory, fixture.asset)))
+    .digest("hex")}`;
+}
+
+async function stageAppOperation(
+  desktop: Pick<DesktopInstance, "environment" | "home">,
+  fixture: UpdateFixture,
+  digest: string
+): Promise<void> {
+  const stageResult = await runCommand(
+    "go",
+    [
+      "run",
+      "-tags",
+      "e2e",
+      "./desktop/e2e/fixtures/appstage",
+      "--home",
+      desktop.home,
+      "--from-version",
+      fixture.current_version,
+      "--to-version",
+      fixture.next_version,
+      "--asset",
+      fixture.asset,
+      "--digest",
+      digest,
+    ],
+    { cwd: repositoryRoot, env: desktop.environment }
+  );
+  if (stageResult.exitCode !== 0) {
+    throw new Error(stageResult.stderr.trim() || "The app stage fixture failed.");
+  }
+}
+
+async function seedUpdateCache(home: string, fixture: UpdateFixture): Promise<void> {
+  const cache = join(home, "cache");
+  await mkdir(cache, { recursive: true, mode: 0o700 });
+  const now = new Date().toISOString();
+  await writeFile(
+    join(cache, "update-state-stable.json"),
+    `${JSON.stringify(
+      {
+        latest_version: fixture.next_version,
+        release_url: `https://example.test/releases/v${fixture.next_version}`,
+        published_at: now,
+        checked_at: now,
+        assets: [{ Name: fixture.asset, DownloadURL: `https://example.test/${fixture.asset}` }],
+      },
+      null,
+      2
+    )}\n`,
+    { mode: 0o600 }
+  );
+}
+
+function operation(
+  fixture: UpdateFixture,
+  digest: string,
+  options: { readonly expiredHandoff?: boolean; readonly failures?: number } = {}
+): Record<string, unknown> {
+  const now = new Date();
+  const expiredHandoff = options.expiredHandoff === true;
+  return {
+    schema_version: 1,
+    operation_id: `e2e-app-${crypto.randomUUID()}`,
+    requested_by: "web",
+    revision: 3,
+    targets: ["app"],
+    ...(expiredHandoff ? { active_target: "app" } : {}),
+    percent: expiredHandoff ? 100 : -1,
+    app: {
+      from_version: fixture.current_version,
+      to_version: fixture.next_version,
+      release_tag: `v${fixture.next_version}`,
+      asset: fixture.asset,
+      digest,
+      attempt_id: crypto.randomUUID(),
+      phase: expiredHandoff ? "installer-handoff" : "staged",
+      consecutive_failures: options.failures ?? 0,
+      ...(expiredHandoff
+        ? { watchdog_deadline: new Date(now.getTime() - 1_000).toISOString() }
+        : {}),
+    },
+    holder: null,
+    waiting: expiredHandoff ? "" : "waiting-for-app",
+    deadline: new Date(now.getTime() + 30 * 60_000).toISOString(),
+    started_at: now.toISOString(),
+    updated_at: now.toISOString(),
+  };
+}
+
+async function seedOperation(home: string, value: Record<string, unknown>): Promise<void> {
+  const path = join(home, "update-operation.json");
+  const temporary = `${path}.e2e-${crypto.randomUUID()}`;
+  await writeFile(temporary, `${JSON.stringify(value, null, 2)}\n`, { mode: 0o600 });
+  await rename(temporary, path);
+}
+
+async function readAppRecord(home: string): Promise<Record<string, unknown>> {
+  return JSON.parse(await readFile(join(home, "app.json"), "utf8")) as Record<string, unknown>;
+}
+
+async function expectUpdatedRuntime(desktop: DesktopInstance, version: string): Promise<void> {
+  // Owner: packaged desktop update journey. The relaunched bundle must update its
+  // owned daemon too; an app-version marker alone cannot prove product readiness.
+  await expect
+    .poll(async () => await readAppRecord(desktop.home), { timeout: 60_000 })
+    .toMatchObject({
+      state: "product",
+      diagnostic_report: { runtime_version: version, runtime_owned: true, current_error: null },
+    });
+  await expect
+    .poll(
+      async () => {
+        const result = await desktop.cli(["status", "-o", "json"]);
+        return JSON.parse(result.stdout) as Record<string, unknown>;
+      },
+      { timeout: 60_000 }
+    )
+    .toMatchObject({ daemon: { status: "running", version } });
+}
+
+async function history(home: string): Promise<readonly Record<string, unknown>[]> {
+  let contents: string;
+  try {
+    contents = await readFile(join(home, "logs", "update-history.jsonl"), "utf8");
+  } catch (error) {
+    if (error instanceof Error && "code" in error && error.code === "ENOENT") return [];
+    throw error;
+  }
+  return contents
+    .split("\n")
+    .filter(Boolean)
+    .map(line => JSON.parse(line) as Record<string, unknown>);
+}
+
+async function waitForShellExit(desktop: DesktopInstance): Promise<void> {
+  const deadline = Date.now() + 60_000;
+  while (Date.now() < deadline) {
+    if (desktop.shellProcess.exitCode !== null) return;
+    await new Promise(resolveDelay => setTimeout(resolveDelay, 100));
+  }
+  const [operationState, desktopLog, bootstrapLog] = await Promise.all([
+    readDiagnosticFile(join(desktop.home, "update-operation.json")),
+    readDiagnosticFile(join(desktop.home, "logs", "desktop.log")),
+    readDiagnosticFile(join(desktop.home, "logs", "desktop-bootstrap.jsonl")),
+  ]);
+  throw new Error(
+    `The updater did not restart the shell.\nOperation:\n${operationState}\nDesktop log:\n${desktopLog}\nBootstrap log:\n${bootstrapLog}`
+  );
+}
+
+async function updaterEnvironment(
+  fixture: UpdateFixture,
+  packaged: PackagedCopy
+): Promise<NodeJS.ProcessEnv> {
+  if (process.platform !== "linux") return {};
+  if (!fixture.baseline_app_image) throw new Error("The baseline AppImage is missing.");
+  const appImage = join(dirname(packaged.executablePath), basename(fixture.baseline_app_image));
+  await copyFile(fixture.baseline_app_image, appImage);
+  return { APPIMAGE: appImage, APPIMAGE_EXTRACT_AND_RUN: "1" };
+}
+
+test("E2E-016: the real Settings API projects a staged app asset through verified restart", async ({
+  copyPackagedExecutable,
+  launchDesktop,
+}) => {
+  const fixture = await updateFixture();
+  const packaged = await copyPackagedExecutable(fixture.baseline_executable);
+  const feed = await startMockFeed(fixture, { holdAsset: true });
+  let restoreEnvironment: RestoreEnvironment = () => Promise.resolve();
+  let cleanupCache = () => Promise.resolve();
+  try {
+    cleanupCache = await configureFeed(packaged, feed.url);
+    const digest = await artifactDigest(fixture);
+    const desktop = await launchDesktop({
+      executablePath: packaged.executablePath,
+      environment: await updaterEnvironment(fixture, packaged),
+      prepare: async context => {
+        restoreEnvironment = await configureRelaunchHome(context.home);
+        await seedUpdateCache(context.home, fixture);
+        await prepareUpdateWork(context.home);
+      },
+    });
+    const product = await desktop.product();
+    await completeOnboarding(product);
+    const work = await startUpdateWork(desktop.home, new URL(product.url()).origin);
+    await expect
+      .poll(async () => {
+        return await product.evaluate(async () => {
+          const response = await fetch("/api/settings/update");
+          if (!response.ok) throw new Error(`Update status failed with ${response.status}.`);
+          const status = (await response.json()) as { app?: Record<string, unknown> };
+          return status.app;
+        });
+      })
+      .toMatchObject({
+        status: "available",
+        current_version: fixture.current_version,
+        latest_version: fixture.next_version,
+      });
+    // The menubar offers the one-click update; the stage fixture stands in for the
+    // daemon's verified plan so the real shell consumer drives the install.
+    const indicator = product.getByTestId("os-menubar-update");
+    await expect(indicator).toHaveAttribute("data-state", "available");
+    await stageAppOperation(desktop, fixture, digest);
+    await product.reload({ waitUntil: "domcontentloaded" });
+    await expect(indicator).toHaveAttribute("data-state", "updating");
+    await desktop.cli(["app", "open", "/settings/general"]);
+    await expect(product.getByTestId("settings-page-general-update-progress")).toHaveAttribute(
+      "data-phase",
+      "download"
+    );
+    await product.screenshot({ path: test.info().outputPath("app-update-downloading.png") });
+    feed.releaseAsset();
+    await waitForShellExit(desktop);
+    await expect
+      .poll(async () => (await readAppRecord(desktop.home)).app_version, { timeout: 60_000 })
+      .toBe(fixture.next_version);
+    await expect
+      .poll(async () => (await history(desktop.home)).at(-1)?.outcome, { timeout: 30_000 })
+      .toBe("updated");
+    await expectUpdatedRuntime(desktop, fixture.next_version);
+    await expectUpdateWorkRecovered(work);
+    await restartUpdatedRuntime(work);
+    await expectUpdateWorkRecovered(work);
+  } finally {
+    try {
+      await closeFixture(feed, restoreEnvironment);
+    } finally {
+      await cleanupCache();
+    }
+  }
+});
+
+test("E2E-017: expired installer handoff records old-version truth and a fresh retry succeeds", async ({
+  copyPackagedExecutable,
+  launchDesktop,
+}) => {
+  const fixture = await updateFixture();
+  const packaged = await copyPackagedExecutable(fixture.baseline_executable);
+  const feed = await startMockFeed(fixture);
+  let restoreEnvironment: RestoreEnvironment = () => Promise.resolve();
+  let cleanupCache = () => Promise.resolve();
+  try {
+    cleanupCache = await configureFeed(packaged, feed.url);
+    const digest = await artifactDigest(fixture);
+    const desktop = await launchDesktop({
+      executablePath: packaged.executablePath,
+      environment: await updaterEnvironment(fixture, packaged),
+      prepare: async ({ home }) => {
+        restoreEnvironment = await configureRelaunchHome(home);
+        await seedUpdateCache(home, fixture);
+        await seedOperation(home, operation(fixture, digest, { expiredHandoff: true }));
+      },
+    });
+    const product = await desktop.product();
+    await expect
+      .poll(async () => (await history(desktop.home)).at(-1)?.outcome, { timeout: 30_000 })
+      .toBe("failed");
+    expect((await readAppRecord(desktop.home)).app_version).toBe(fixture.current_version);
+    const failedApp = (await history(desktop.home)).at(-1)?.app as Record<string, unknown>;
+    expect(failedApp.consecutive_failures).toBe(1);
+    const background = await product.evaluate(async () => {
+      const response = await fetch("/api/settings/update");
+      if (!response.ok) throw new Error(`Update status failed with ${response.status}.`);
+      return (await response.json()) as Record<string, unknown>;
+    });
+    expect(background.app).toMatchObject({ status: "failed" });
+    expect((background.app as Record<string, unknown>).message).toMatch(/paused.*Retry manually/u);
+
+    await completeOnboarding(product);
+    await product.reload({ waitUntil: "domcontentloaded" });
+    await expect(product.getByRole("button", { name: "Retry update", exact: true })).toBeVisible();
+    await product.screenshot({ path: test.info().outputPath("app-update-retry.png") });
+
+    await seedOperation(desktop.home, operation(fixture, digest, { failures: 1 }));
+    await waitForShellExit(desktop);
+    await expect
+      .poll(async () => (await readAppRecord(desktop.home)).app_version, { timeout: 60_000 })
+      .toBe(fixture.next_version);
+    await expect
+      .poll(async () => (await history(desktop.home)).at(-1)?.outcome, { timeout: 30_000 })
+      .toBe("updated");
+    await expectUpdatedRuntime(desktop, fixture.next_version);
+  } finally {
+    try {
+      await closeFixture(feed, restoreEnvironment);
+    } finally {
+      await cleanupCache();
+    }
+  }
+});
+
+test("E2E-017: a failed installer cleanup exits after archiving the failure", async ({
+  copyPackagedExecutable,
+  launchDesktop,
+}) => {
+  const fixture = await updateFixture();
+  const packaged = await copyPackagedExecutable(fixture.baseline_executable);
+  const feed = await startMockFeed(fixture);
+  let restoreEnvironment: RestoreEnvironment = () => Promise.resolve();
+  let cleanupCache = () => Promise.resolve();
+  try {
+    cleanupCache = await configureFeed(packaged, feed.url);
+    const digest = await artifactDigest(fixture);
+    const desktop = await launchDesktop({
+      executablePath: packaged.executablePath,
+      environment: await updaterEnvironment(fixture, packaged),
+      prepare: async ({ home }) => {
+        restoreEnvironment = await configureRelaunchHome(home);
+        await seedUpdateCache(home, fixture);
+      },
+    });
+    const product = await desktop.product();
+    // A real filesystem failure exercises cleanup after native preparation, without mocking quit.
+    const tokenPath = join(desktop.home, "app.token");
+    await rename(tokenPath, `${tokenPath}.saved`);
+    await mkdir(tokenPath);
+    await stageAppOperation(desktop, fixture, digest);
+    await expect
+      .poll(async () => (await history(desktop.home)).at(-1)?.outcome, { timeout: 60_000 })
+      .toBe("failed");
+    expect(product.isClosed()).toBe(true);
+    expect((await readAppRecord(desktop.home)).app_version).toBe(fixture.current_version);
+    await expect.poll(() => desktop.shellProcess.exitCode, { timeout: 10_000 }).toBe(0);
+  } finally {
+    try {
+      await closeFixture(feed, restoreEnvironment);
+    } finally {
+      await cleanupCache();
+    }
+  }
+});
+
+test("A staged app update starts while runtime bootstrap is failing", async ({
+  copyPackagedExecutable,
+  launchDesktop,
+}) => {
+  const fixture = await updateFixture();
+  const packaged = await copyPackagedExecutable(fixture.baseline_executable);
+  const feed = await startMockFeed(fixture, { holdAsset: true });
+  let desktop: DesktopInstance | undefined;
+  let cleanupCache = () => Promise.resolve();
+  try {
+    cleanupCache = await configureFeed(packaged, feed.url);
+    const digest = await artifactDigest(fixture);
+    desktop = await launchDesktop({
+      executablePath: packaged.executablePath,
+      environment: await updaterEnvironment(fixture, packaged),
+      prepare: async ({ home }) => {
+        await mkdir(join(home, "compozy.db"));
+        await seedOperation(home, operation(fixture, digest));
+      },
+    });
+    const home = desktop.home;
+    await expect(async () => {
+      expect((await readAppRecord(home)).state).toBe("error");
+    }).toPass({ timeout: 30_000 });
+    await expect
+      .poll(
+        async () => {
+          const active = JSON.parse(
+            await readFile(join(home, "update-operation.json"), "utf8")
+          ) as {
+            app: { phase: string };
+          };
+          return active.app.phase;
+        },
+        { timeout: 30_000 }
+      )
+      .toBe("applying");
+    await desktop.boot.screenshot({
+      path: test.info().outputPath("update-during-bootstrap-failure.png"),
+    });
+  } finally {
+    try {
+      await desktop?.closeShell();
+    } finally {
+      try {
+        await feed.close();
+      } finally {
+        await cleanupCache();
+      }
+    }
+  }
+});
+
+test("A staged app update never executes an unverified runtime bundle", async ({
+  copyPackagedExecutable,
+  launchDesktop,
+}) => {
+  const fixture = await updateFixture();
+  const packaged = await copyPackagedExecutable(fixture.baseline_executable);
+  const digest = await artifactDigest(fixture);
+  const desktop = await launchDesktop({
+    executablePath: packaged.executablePath,
+    prepare: async ({ home, bundleRuntimePath }) => {
+      await writeFile(
+        bundleRuntimePath,
+        '#!/bin/sh\nprintf executed > "$COMPOZY_HOME/unverified-runtime-executed"\nexit 1\n',
+        { mode: 0o700 }
+      );
+      await seedOperation(home, operation(fixture, digest));
+    },
+  });
+  await expect(async () => {
+    const record = await readAppRecord(desktop.home);
+    expect(record.state).toBe("error");
+    expect(record.error).toMatchObject({
+      safe_message: expect.stringContaining("integrity check"),
+    });
+  }).toPass({ timeout: 30_000 });
+  await desktop.closeShell();
+  await expect(access(join(desktop.home, "unverified-runtime-executed"))).rejects.toMatchObject({
+    code: "ENOENT",
+  });
+});

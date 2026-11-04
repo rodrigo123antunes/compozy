@@ -1,0 +1,116 @@
+# L-022 — Eyebrow typography needs one canonical source
+
+**Class:** Frontend / Design system
+**Date discovered:** 2026-05-10 (DashboardCard inline-eyebrow audit while landing the redesign branch)
+**Evidence sources:** Audit run ahead of the dashboard polish; the final consolidation collapsed
+the prop matrix and the multi-utility CSS layer into a single Inter UC contract. Touched files:
+`packages/ui/src/components/custom/eyebrow.tsx`, `packages/ui/src/tokens.css`, `DESIGN.md` §3 / §11,
+`.agents/skills/eng/eng-design/SKILL.md`, `packages/ui/src/lib/utils.ts`,
+`lint-plugins/compozy-design-system.mjs`, plus the cross-monorepo callsite sweep.
+
+## Context
+
+While reviewing why the `DashboardCard` "ACTIVE SESSIONS / DAEMON UPTIME / QUEUE DEPTH" labels
+felt drifty, an audit surfaced **124 callsites** across the monorepo applying the JetBrains-Mono
+uppercase eyebrow style. ~62 used the `<Eyebrow>` primitive and ~62 inlined the same idea by
+hand. At least **five different tuples** were in active use:
+
+- `text-[10.5px]` + `tracking-wider` (the original `<Eyebrow>` body)
+- `text-eyebrow` (11 px) + `tracking-mono` (0.06em) (the token-aligned majority)
+- `text-badge` (10 px) + `tracking-badge` (0.08em) (legacy chip tracking applied to eyebrows)
+- `text-[11px]` + `tracking-mono` hard-coded inside chat/metric/wire-card primitives
+- `text-[10px]` + `tracking-[0.08em]` arbitrary tuples in dialog labels
+
+The drift was **triplicated in the spec layer too**: `DESIGN.md` table §3 line 147 said
+`Inter | 10.5 px | 0.05em UC`, `tokens.css` declared `--tracking-mono: 0.06em`, and the
+`eng-design` skill brief said `letter-spacing: 0.06em`. The visible eyebrow in the UI was
+JetBrains Mono, not Inter — so the spec, the token, and the implementation all disagreed at
+once.
+
+`twMerge` made it worse: with the default class group config, `text-eyebrow` and `text-(--muted)`
+collapsed into the same "text-color" group, so `cn("text-eyebrow", "text-(--muted)")` silently
+dropped the size. Any consumer that relied on token-aligned size + token-aligned color saw the
+size erased without warning.
+
+The first fix added size + tone variants to `<Eyebrow>` and rewrote `<extendTailwindMerge>`. But
+that fix preserved a multi-tier API (`case`, `family`, `tone`, `size`, `weight`) plus three CSS
+utilities (`eyebrow`, `eyebrow-badge`, `eyebrow-micro`). With multiple variants live, callsites
+still picked the "wrong" tier and the JetBrains-Mono contract leaked into surfaces that must use
+the Inter UC contract. The design-system consolidation superseded the variant matrix with a single contract.
+
+## Root cause
+
+The eyebrow style had **no single source of truth**, and even after the first fix it still had
+**too many variants**. Three artifacts held overlapping authority (spec table / CSS token /
+component implementation), each authored at a different time, and the `<Eyebrow>` API was
+expressive enough (case + family + tone + size + weight) that the wrong combination of props
+still produced drift. Tier proliferation invited the same callsite-by-callsite re-authoring that
+the primitive was supposed to prevent.
+
+## Rule
+
+> One eyebrow primitive and utility own the current style: Geist sentence case, 12 px, weight 510, tracking -0.005em. Use `Eyebrow` or the `eyebrow` utility; `variant="caps"` opts into uppercase. Color comes through `className`. Earlier Inter/uppercase defaults below are historical.
+
+## Operationalization
+
+- `packages/ui/src/components/custom/eyebrow.tsx` owns the primitive; `packages/ui/src/tokens-runtime.css` owns the utility and `tokens.css` owns its size/tracking tokens.
+- `DESIGN.md` is the generated type contract. Use `lint-plugins/compozy-design-system-core-rules.mjs` and existing merge/story/render checks for changed behavior.
+- Preserve the `tailwind-merge` size/color distinction when adding typography tokens. Do not duplicate the contract in broad CSS-literal suites or rebuild a variant matrix to mimic a prototype.
+
+## Anti-pattern
+
+- Inlining `font-mono text-[10.5px] uppercase tracking-wider text-(--muted)` "just for one
+  span" — every callsite that did this turned into a permanent drift point.
+- Adding a new visual variant back into `<Eyebrow>` (a new `case`, a new `size`, a new `tone`).
+  The primitive is intentionally prop-less now; size/tone variations live in the className the
+  consumer passes (text-color utilities) or in a different primitive entirely.
+- Adding `.eyebrow-foo` utilities to `tokens.css` to "carve out" a special size. The deleted
+  `.eyebrow-badge` and `.eyebrow-micro` are the warning shot — re-introducing tier utilities
+  reopens the drift surface that took two passes to close.
+- Changing `--tracking-eyebrow` to "match the component" instead of fixing the component to
+  match the token.
+- Adding a new `--text-*` token to `tokens.css` without registering it in the
+  `extendTailwindMerge` config — it will silently collide with `text-color`.
+- Treating `DESIGN.md` and `tokens.css` as independent specs. They are two views of one
+  contract; if they disagree, both are wrong until reconciled.
+
+## Source
+
+- `packages/ui/src/components/custom/eyebrow.tsx` — the single prop-less primitive
+  (`children` + `className` only).
+- `packages/ui/src/tokens.css` — `--text-eyebrow`, `--tracking-eyebrow`, and the single
+  `@utility eyebrow` declaration.
+- `packages/ui/src/lib/utils.ts` — `extendTailwindMerge` registration of project font-size
+  tokens (kept around so future size tokens don't collide with text-color).
+- `lint-plugins/compozy-design-system.mjs` — `no-inline-eyebrow` rule covering the inline tuple
+  AND the deleted `eyebrow-badge` / `eyebrow-micro` utility-class literals.
+- `DESIGN.md` §3 ("Type Ladder") and §11 ("Anti-patterns") — authoritative type ladder + Eyebrow
+  rule + misuse register.
+- `.agents/skills/eng/eng-design/SKILL.md` — brand brief reaffirming the single Inter UC contract.
+- `web/CLAUDE.md` ("Critical Rules") and `packages/site/CLAUDE.md` ("Critical Rules") — surface
+  guards for the rule.
+
+## Addendum — 2026-08-09
+
+The type stack migrated from Inter to Geist. The canonical contract is now **Geist UC 11 px /
+weight 600 / -0.005em**; `--text-eyebrow` and `--tracking-eyebrow` are unchanged. Geist exposes a
+`wght` axis only, so the body baseline no longer sets `font-optical-sizing` or a character-variant
+feature block. The rule this lesson establishes — one primitive, one utility, one uppercase
+contract — is unchanged; only the typeface name moved. The evidence and analysis above are the
+2026-05-10 record and are intentionally left as written.
+
+## Addendum — 2026-08-20
+
+Uppercase stopped being the default. The canonical contract is now **Geist sentence case
+12 px / weight 510 (medium) / -0.005em**: `--text-eyebrow` moved to `0.75rem` and the
+`@utility eyebrow` declaration dropped `uppercase` and `font-semibold`. Uppercase is opt-in
+through `<Eyebrow variant="caps">`, which adds the case and nothing else — same utility, same
+size and tracking tokens — so **one primitive, one utility, one canonical style** still holds.
+`caps` is the single sanctioned variant; the anti-pattern against re-growing a variant matrix
+(`case` / `family` / `tone` / `size` / `weight`) stands.
+
+Two pointers in the record above are stale and are corrected here rather than rewritten in
+place: the `@utility eyebrow` declaration lives in `packages/ui/src/tokens-runtime.css`, not
+`tokens.css` (the `--text-eyebrow` / `--tracking-eyebrow` tokens are still in `tokens.css`),
+and the lint rule ships from `lint-plugins/compozy-design-system-core-rules.mjs`. The
+2026-05-10 and 2026-08-09 records are intentionally left as written.

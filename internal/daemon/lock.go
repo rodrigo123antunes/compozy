@@ -8,10 +8,14 @@ import (
 	"strconv"
 	"strings"
 
+	"github.com/compozy/compozy/internal/procutil"
 	"github.com/gofrs/flock"
 )
 
-var ErrAlreadyRunning = errors.New("daemon: already running")
+var (
+	// ErrAlreadyRunning reports that another daemon process currently owns the singleton lock.
+	ErrAlreadyRunning = errors.New("daemon: already running")
+)
 
 type errAlreadyRunning struct {
 	pid int
@@ -35,17 +39,18 @@ type lockDeps struct {
 
 // Lock owns the singleton daemon file lock.
 type Lock struct {
-	flock    *flock.Flock
-	path     string
-	pid      int
-	stalePID int
+	flock     *flock.Flock
+	path      string
+	pid       int
+	stalePID  int
+	releaseFn func() error
 }
 
 // AcquireLock acquires the singleton daemon lock and records the current PID in the lock file.
 func AcquireLock(path string, pid int) (*Lock, error) {
 	return acquireLock(path, pid, lockDeps{
-		newFlock:     func(lockPath string) *flock.Flock { return flock.New(lockPath) },
-		processAlive: ProcessAlive,
+		newFlock:     func(path string) *flock.Flock { return flock.New(path) },
+		processAlive: procutil.Alive,
 	})
 }
 
@@ -58,12 +63,12 @@ func acquireLock(path string, pid int, deps lockDeps) (*Lock, error) {
 		return nil, fmt.Errorf("daemon: invalid daemon pid %d", pid)
 	}
 	if deps.newFlock == nil {
-		deps.newFlock = func(lockPath string) *flock.Flock { return flock.New(lockPath) }
+		return nil, errors.New("daemon: lock constructor is required")
 	}
 	if deps.processAlive == nil {
-		deps.processAlive = ProcessAlive
+		deps.processAlive = procutil.Alive
 	}
-	if err := os.MkdirAll(filepath.Dir(cleanPath), 0o700); err != nil {
+	if err := os.MkdirAll(filepath.Dir(cleanPath), 0o755); err != nil {
 		return nil, fmt.Errorf("daemon: create lock directory for %q: %w", cleanPath, err)
 	}
 
@@ -100,7 +105,7 @@ func acquireLock(path string, pid int, deps lockDeps) (*Lock, error) {
 	}, nil
 }
 
-// Path reports the on-disk daemon lock path.
+// Path reports the on-disk daemon lock file path.
 func (l *Lock) Path() string {
 	if l == nil {
 		return ""
@@ -121,6 +126,9 @@ func (l *Lock) Release() error {
 	if l == nil {
 		return nil
 	}
+	if l.releaseFn != nil {
+		return l.releaseFn()
+	}
 
 	var errs []error
 	if err := writeLockPID(lockPIDPath(l.path), 0); err != nil {
@@ -138,6 +146,45 @@ func (l *Lock) Release() error {
 	l.flock = nil
 	l.stalePID = 0
 	return errors.Join(errs...)
+}
+
+// LockOwner describes the observed holder of the singleton daemon lock.
+type LockOwner struct {
+	// PID is the PID recorded by the current or last holder; it is meaningful only when Held is true.
+	PID int
+	// Held reports whether some process currently holds the advisory lock.
+	Held bool
+}
+
+// InspectLockOwner reports whether the daemon lock is held and which PID its holder recorded.
+// The contention probe takes and immediately releases the lock when it is free, and never
+// rewrites the recorded PID, so a stale file left by a dead daemon reports Held=false.
+// The PID is read after the probe, but a holder that has not yet recorded its own PID still
+// reports the previous value; callers that wait on the holder must re-inspect.
+func InspectLockOwner(path string) (LockOwner, error) {
+	cleanPath := strings.TrimSpace(path)
+	if cleanPath == "" {
+		return LockOwner{}, errors.New("daemon: lock path is required")
+	}
+	if _, err := os.Stat(cleanPath); errors.Is(err, os.ErrNotExist) {
+		return LockOwner{}, nil
+	}
+	probe := flock.New(cleanPath)
+	locked, err := probe.TryLock()
+	if err != nil {
+		return LockOwner{}, fmt.Errorf("daemon: probe daemon lock %q: %w", cleanPath, err)
+	}
+	held := !locked
+	if locked {
+		if err := errors.Join(probe.Unlock(), probe.Close()); err != nil {
+			return LockOwner{}, fmt.Errorf("daemon: release daemon lock probe %q: %w", cleanPath, err)
+		}
+	}
+	pid, err := readLockPID(lockPIDPath(cleanPath))
+	if err != nil {
+		return LockOwner{}, err
+	}
+	return LockOwner{PID: pid, Held: held}, nil
 }
 
 func readLockPID(path string) (int, error) {
@@ -164,19 +211,19 @@ func readLockPID(path string) (int, error) {
 	return pid, nil
 }
 
-func writeLockPID(path string, pid int) error {
-	file, err := os.OpenFile(path, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0o600)
+func writeLockPID(path string, pid int) (returnErr error) {
+	file, err := os.OpenFile(path, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0o644)
 	if err != nil {
 		return fmt.Errorf("daemon: open daemon lock %q for write: %w", path, err)
 	}
 	defer func() {
-		_ = file.Close()
+		if err := file.Close(); err != nil {
+			returnErr = errors.Join(returnErr, fmt.Errorf("daemon: close daemon lock %q after write: %w", path, err))
+		}
 	}()
 
-	if pid > 0 {
-		if _, err := fmt.Fprintf(file, "%d\n", pid); err != nil {
-			return fmt.Errorf("daemon: write daemon lock %q: %w", path, err)
-		}
+	if _, err := fmt.Fprintf(file, "%d\n", pid); err != nil {
+		return fmt.Errorf("daemon: write daemon lock %q: %w", path, err)
 	}
 	if err := file.Sync(); err != nil {
 		return fmt.Errorf("daemon: sync daemon lock %q: %w", path, err)

@@ -1,0 +1,101 @@
+package contract
+
+import (
+	"encoding/json"
+	"time"
+
+	taskpkg "github.com/compozy/compozy/internal/task"
+)
+
+// ResolvedWorktreeMode is the immutable runtime choice after inheritance has
+// been resolved. Unlike a profile mode, it can never be "inherit".
+type ResolvedWorktreeMode string
+
+const (
+	ResolvedWorktreeModeNone   ResolvedWorktreeMode = "none"
+	ResolvedWorktreeModeRef    ResolvedWorktreeMode = "ref"
+	ResolvedWorktreeModePerRun ResolvedWorktreeMode = "per_run"
+)
+
+func ResolvedWorktreeModeValues() []string {
+	return []string{
+		string(ResolvedWorktreeModeNone),
+		string(ResolvedWorktreeModeRef),
+		string(ResolvedWorktreeModePerRun),
+	}
+}
+
+// TaskRunPayload is the shared task-run response payload.
+type TaskRunPayload struct {
+	ID                   string                         `json:"id"`
+	ProfileID            string                         `json:"profile_id,omitempty"`
+	ProfileName          string                         `json:"profile_name,omitempty"`
+	ProfileColor         string                         `json:"profile_color,omitempty"`
+	ProfileIcon          string                         `json:"profile_icon,omitempty"`
+	TaskID               string                         `json:"task_id"`
+	Status               taskpkg.RunStatus              `json:"status"`
+	Attempt              int                            `json:"attempt"`
+	RecoveryCount        int                            `json:"recovery_count"`
+	PreviousRunID        string                         `json:"previous_run_id,omitempty"`
+	FailureKind          string                         `json:"failure_kind,omitempty"`
+	ClaimedBy            *taskpkg.ActorIdentity         `json:"claimed_by,omitempty"`
+	SessionID            string                         `json:"session_id,omitempty"`
+	WorktreeID           string                         `json:"worktree_id,omitempty"`
+	ResolvedWorktreeMode ResolvedWorktreeMode           `json:"resolved_worktree_mode"`
+	ResolvedWorktreeRef  string                         `json:"resolved_worktree_ref,omitempty"`
+	Origin               taskpkg.Origin                 `json:"origin"`
+	IdempotencyKey       string                         `json:"idempotency_key,omitempty"`
+	DesignationGroupID   string                         `json:"designation_group_id,omitempty"`
+	ClaimTokenHash       string                         `json:"claim_token_hash,omitempty"`
+	LeaseUntil           *time.Time                     `json:"lease_until,omitempty"`
+	HeartbeatAt          *time.Time                     `json:"heartbeat_at,omitempty"`
+	Designation          *taskpkg.RunDesignationSummary `json:"designation,omitempty"`
+	QueuedAt             time.Time                      `json:"queued_at"`
+	ClaimedAt            *time.Time                     `json:"claimed_at,omitempty"`
+	StartedAt            *time.Time                     `json:"started_at,omitempty"`
+	EndedAt              *time.Time                     `json:"ended_at,omitempty"`
+	Error                string                         `json:"error,omitempty"`
+	Metadata             json.RawMessage                `json:"metadata,omitempty"`
+	Result               json.RawMessage                `json:"result,omitempty"`
+	ResultRef            string                         `json:"result_ref,omitempty"`
+	ResultBytes          int64                          `json:"result_bytes,omitempty"`
+}
+
+// TaskRunResultPageResponse is one exact bounded byte page from a task-run result.
+type TaskRunResultPageResponse struct {
+	RunID      string `json:"run_id"`
+	ResultRef  string `json:"result_ref,omitempty"`
+	Offset     int64  `json:"offset"`
+	Bytes      int64  `json:"bytes"`
+	TotalBytes int64  `json:"total_bytes"`
+	DataBase64 string `json:"data_base64"`
+	NextOffset *int64 `json:"next_offset,omitempty"`
+	EOF        bool   `json:"eof"`
+}
+
+// TaskRunSummaryPayload is the shared run-chip payload reused by enriched task reads.
+type TaskRunSummaryPayload struct {
+	ID                   string                         `json:"id"`
+	TaskID               string                         `json:"task_id"`
+	Status               taskpkg.RunStatus              `json:"status"`
+	Attempt              int                            `json:"attempt"`
+	RecoveryCount        int                            `json:"recovery_count"`
+	PreviousRunID        string                         `json:"previous_run_id,omitempty"`
+	FailureKind          string                         `json:"failure_kind,omitempty"`
+	MaxAttempts          int                            `json:"max_attempts"`
+	SessionID            string                         `json:"session_id,omitempty"`
+	WorktreeID           string                         `json:"worktree_id,omitempty"`
+	ResolvedWorktreeMode ResolvedWorktreeMode           `json:"resolved_worktree_mode"`
+	ResolvedWorktreeRef  string                         `json:"resolved_worktree_ref,omitempty"`
+	ClaimedBy            *taskpkg.ActorIdentity         `json:"claimed_by,omitempty"`
+	ClaimTokenHash       string                         `json:"claim_token_hash,omitempty"`
+	LeaseUntil           *time.Time                     `json:"lease_until,omitempty"`
+	HeartbeatAt          *time.Time                     `json:"heartbeat_at,omitempty"`
+	DesignationGroupID   string                         `json:"designation_group_id,omitempty"`
+	Designation          *taskpkg.RunDesignationSummary `json:"designation,omitempty"`
+	QueuedAt             time.Time                      `json:"queued_at"`
+	ClaimedAt            *time.Time                     `json:"claimed_at,omitempty"`
+	StartedAt            *time.Time                     `json:"started_at,omitempty"`
+	EndedAt              *time.Time                     `json:"ended_at,omitempty"`
+	Error                string                         `json:"error,omitempty"`
+}

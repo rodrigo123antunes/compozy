@@ -1,0 +1,325 @@
+package spec
+
+import (
+	"reflect"
+
+	"github.com/compozy/compozy/internal/config"
+
+	"github.com/compozy/compozy/internal/api/contract"
+	automationpkg "github.com/compozy/compozy/internal/automation"
+	extensionprotocol "github.com/compozy/compozy/internal/extensionprotocol"
+	"github.com/compozy/compozy/internal/hooks"
+	"github.com/compozy/compozy/internal/loop/dsl"
+	"github.com/compozy/compozy/internal/modelcatalog"
+
+	"github.com/compozy/compozy/internal/resources"
+	"github.com/compozy/compozy/internal/session"
+	speedpkg "github.com/compozy/compozy/internal/speed"
+	"github.com/compozy/compozy/internal/store"
+	taskpkg "github.com/compozy/compozy/internal/task"
+	"github.com/compozy/compozy/internal/tools"
+	"github.com/compozy/compozy/internal/windowmanager"
+)
+
+const (
+	specStoppedKey = "stopped"
+	specNoneKey    = "none"
+	specPendingKey = "pending"
+	specUnknownKey = "unknown"
+)
+
+var schemaEnumValues = withSettingsWindowManagerSchemaEnumValues(
+	withGoalSchemaEnumValues(map[reflect.Type][]string{
+		reflect.TypeFor[contract.SessionProcessAttribution](): {"env", "lineage"},
+		reflect.TypeFor[contract.SessionProcessPolicy]():      {"keep", "terminate"},
+		reflect.TypeFor[contract.SessionProcessKind]():        {"background", "tool", "terminal"},
+		reflect.TypeFor[contract.SessionProcessOutcome](): {
+			"terminated", "already_exited", "identity_mismatch", "failed", "unproven",
+		},
+		reflect.TypeFor[session.Badge](): {
+			"running",
+			"idle",
+			"unhealthy",
+			"hung",
+			"waiting-for-auth",
+			"waiting-for-input",
+			"done",
+			specStoppedKey,
+			"failed",
+			specUnknownKey,
+			"needs-attention",
+			"waiting",
+		},
+		reflect.TypeFor[contract.SubagentChildActivity](): store.SubagentChildActivityValues(),
+		reflect.TypeFor[session.BoardColumn]():            {"needs_you", "working", "waiting", "in_review", "done"},
+		reflect.TypeFor[session.WaitingOn]():              {"sessions", "monitor"},
+		reflect.TypeFor[session.PullRequestState]():       {"open", "closed", "merged"},
+		reflect.TypeFor[session.ChecksState](): {
+			"passing",
+			"failing",
+			specPendingKey,
+			specNoneKey,
+			specUnknownKey,
+		},
+		reflect.TypeFor[session.ReviewDecision](): {
+			"approved", "changes_requested", "review_required", specNoneKey, specUnknownKey,
+		},
+		reflect.TypeFor[session.Mergeable]():                       {"mergeable", "conflicting", specUnknownKey},
+		reflect.TypeFor[session.LookupState]():                     {"ok", specPendingKey, "error", "incomplete"},
+		reflect.TypeFor[session.WorkSignalKind]():                  session.WorkSignalKindValues(),
+		reflect.TypeFor[contract.SessionInputStatus]():             contract.SessionInputStatusValues(),
+		reflect.TypeFor[contract.SessionFileKind]():                contract.SessionFileKindValues(),
+		reflect.TypeFor[contract.SessionMentionKind]():             contract.SessionMentionKindValues(),
+		reflect.TypeFor[config.SteerCapability]():                  config.SteerCapabilityValues(),
+		reflect.TypeFor[session.Disposition]():                     session.DispositionValues(),
+		reflect.TypeFor[store.SteerDeliveryMode]():                 store.SteerDeliveryModeValues(),
+		reflect.TypeFor[store.LineageKind]():                       store.LineageKindValues(),
+		reflect.TypeFor[store.SessionRuntimeRecoveryReason]():      store.SessionRuntimeRecoveryReasonValues(),
+		reflect.TypeFor[contract.TerminalMode]():                   contract.TerminalModeValues(),
+		reflect.TypeFor[contract.TerminalActorKind]():              contract.TerminalActorKindValues(),
+		reflect.TypeFor[contract.TerminalSignal]():                 contract.TerminalSignalValues(),
+		reflect.TypeFor[contract.TerminalState]():                  contract.TerminalStateValues(),
+		reflect.TypeFor[contract.TerminalExitCause]():              contract.TerminalExitCauseValues(),
+		reflect.TypeFor[contract.TerminalCommandDetection]():       contract.TerminalCommandDetectionValues(),
+		reflect.TypeFor[contract.TerminalCommandApproval]():        contract.TerminalCommandApprovalValues(),
+		reflect.TypeFor[contract.TerminalAttachMode]():             contract.TerminalAttachModeValues(),
+		reflect.TypeFor[contract.TerminalRecordingAction]():        contract.TerminalRecordingActionValues(),
+		reflect.TypeFor[contract.TerminalRecordingState]():         contract.TerminalRecordingStateValues(),
+		reflect.TypeFor[contract.TerminalInputRejectOutcome]():     contract.TerminalInputRejectOutcomeValues(),
+		reflect.TypeFor[contract.TerminalInputResolutionOutcome](): contract.TerminalInputResolutionOutcomeValues(),
+		reflect.TypeFor[contract.TerminalErrorCode]():              contract.TerminalErrorCodeValues(),
+		reflect.TypeFor[contract.IssueSeverity]():                  contract.IssueSeverityValues(),
+		reflect.TypeFor[contract.DrainState]():                     drainStateValues(),
+		reflect.TypeFor[contract.SettingsShellSessionSort]():       settingsShellSessionSortValues(),
+		reflect.TypeFor[contract.SettingsShellSessionGroupBy]():    {specNoneKey, "project", "profile"},
+		reflect.TypeFor[contract.SettingsShellSessionScope]():      settingsShellSessionScopeValues(),
+		reflect.TypeFor[automationpkg.Scope]():                     automationScopeValues(),
+		reflect.TypeFor[automationpkg.JobSource]():                 automationSourceValues(),
+		reflect.TypeFor[automationpkg.ScheduleMode]():              automationScheduleModeValues(),
+		reflect.TypeFor[automationpkg.SchedulerCatchUpPolicy]():    automationSchedulerCatchUpPolicyValues(),
+		reflect.TypeFor[automationpkg.RetryStrategy]():             automationRetryStrategyValues(),
+		reflect.TypeFor[automationpkg.RunStatus]():                 automationRunStatusValues(),
+		reflect.TypeFor[taskpkg.Scope]():                           taskScopeValues(),
+		reflect.TypeFor[taskpkg.Status]():                          taskStatusValues(),
+		reflect.TypeFor[taskpkg.Priority]():                        taskPriorityValues(),
+		reflect.TypeFor[taskpkg.ApprovalPolicy]():                  taskApprovalPolicyValues(),
+		reflect.TypeFor[taskpkg.ApprovalState]():                   taskApprovalStateValues(),
+		reflect.TypeFor[taskpkg.RunStatus]():                       taskRunStatusValues(),
+		reflect.TypeFor[taskpkg.ActorKind]():                       taskActorKindValues(),
+		reflect.TypeFor[taskpkg.OwnerKind]():                       taskOwnerKindValues(),
+		reflect.TypeFor[taskpkg.OriginKind]():                      taskOriginKindValues(),
+		reflect.TypeFor[taskpkg.DependencyKind]():                  taskDependencyKindValues(),
+		reflect.TypeFor[taskpkg.BlockKind]():                       taskBlockKindValues(),
+		reflect.TypeFor[taskpkg.BlockedSource]():                   taskBlockedSourceValues(),
+		reflect.TypeFor[taskpkg.CoordinatorMode]():                 taskCoordinatorModeValues(),
+		reflect.TypeFor[taskpkg.WorkerMode]():                      taskWorkerModeValues(),
+		reflect.TypeFor[taskpkg.WorktreeMode]():                    taskWorktreeModeValues(),
+		reflect.TypeFor[contract.ResolvedWorktreeMode]():           contract.ResolvedWorktreeModeValues(),
+		reflect.TypeFor[taskpkg.RuntimeMode]():                     taskRuntimeModeValues(),
+		reflect.TypeFor[taskpkg.ReviewPolicy]():                    taskReviewPolicyValues(),
+		reflect.TypeFor[taskpkg.RunReviewStatus]():                 taskRunReviewStatusValues(),
+		reflect.TypeFor[taskpkg.RunReviewOutcome]():                taskRunReviewOutcomeValues(),
+		reflect.TypeFor[contract.TaskInboxLane]():                  taskInboxLaneValues(),
+		reflect.TypeFor[contract.LoopProvenanceRole]():             contract.LoopProvenanceRoleValues(),
+		reflect.TypeFor[contract.AgentCreateScope]():               agentCreateScopeValues(),
+		reflect.TypeFor[contract.AgentOrigin]():                    agentOriginValues(),
+		reflect.TypeFor[contract.CoordinatorConfigSource]():        coordinatorConfigSourceValues(),
+		reflect.TypeFor[contract.RoleResolutionMode]():             roleResolutionModeValues(),
+		reflect.TypeFor[contract.LoopSource]():                     loopSourceValues(),
+		reflect.TypeFor[contract.LoopRunStatus]():                  loopRunStatusValues(),
+		reflect.TypeFor[contract.LoopCompletionState]():            contract.LoopCompletionStateValues(),
+		reflect.TypeFor[contract.LoopRunTransitionCause]():         contract.LoopRunTransitionCauseValues(),
+		reflect.TypeFor[contract.LoopRunEventKind]():               loopRunEventKindValues(),
+		reflect.TypeFor[contract.LoopNodeInventoryState]():         contract.LoopNodeInventoryStateValues(),
+		reflect.TypeFor[contract.LoopGenerationOrigin]():           contract.LoopGenerationOriginValues(),
+		reflect.TypeFor[contract.LoopGateVerdictOutcome]():         contract.LoopGateVerdictOutcomeValues(),
+		reflect.TypeFor[contract.LoopMetricDirection]():            contract.LoopMetricDirectionValues(),
+		reflect.TypeFor[contract.LoopWatchEventKind]():             contract.LoopWatchEventKindValues(),
+		reflect.TypeFor[contract.LoopNodeClass]():                  loopNodeClassValues(),
+		reflect.TypeFor[contract.LoopReattemptStrategy]():          loopReattemptStrategyValues(),
+		reflect.TypeFor[contract.LoopBudgetExceeded]():             loopBudgetExceededValues(),
+		reflect.TypeFor[dsl.BudgetExceeded]():                      loopBudgetExceededValues(),
+		reflect.TypeFor[dsl.MetricDirection](): {
+			string(dsl.MetricMaximize),
+			string(dsl.MetricMinimize),
+		},
+		reflect.TypeFor[contract.LoopEnvironmentMode]():              loopEnvironmentModeValues(),
+		reflect.TypeFor[contract.LoopGateDecision]():                 loopGateDecisionValues(),
+		reflect.TypeFor[contract.LoopLintSeverity]():                 loopLintSeverityValues(),
+		reflect.TypeFor[dsl.InputType]():                             contract.LoopInputTypeValues(),
+		reflect.TypeFor[dsl.InputRefKind]():                          contract.LoopInputRefKindValues(),
+		reflect.TypeFor[dsl.EntityKind]():                            contract.LoopEntityKindValues(),
+		reflect.TypeFor[contract.AuthoredValidationStatus]():         contract.AuthoredValidationStatusValues(),
+		reflect.TypeFor[contract.AuthoredDiagnosticSeverity]():       contract.AuthoredDiagnosticSeverityValues(),
+		reflect.TypeFor[contract.AgentSoulRevisionAction]():          contract.AgentSoulRevisionActionValues(),
+		reflect.TypeFor[contract.HeartbeatRevisionOperation]():       contract.HeartbeatRevisionOperationValues(),
+		reflect.TypeFor[contract.HeartbeatActorKind]():               contract.HeartbeatActorKindValues(),
+		reflect.TypeFor[contract.SessionHealthState]():               contract.SessionHealthStateValues(),
+		reflect.TypeFor[contract.SessionHealthStatus]():              contract.SessionHealthStatusValues(),
+		reflect.TypeFor[contract.SessionHealthIneligibilityReason](): contract.SessionHealthIneligibilityReasonValues(),
+		reflect.TypeFor[contract.HeartbeatWakeSource]():              contract.HeartbeatWakeSourceValues(),
+		reflect.TypeFor[contract.HeartbeatWakeResult]():              contract.HeartbeatWakeResultValues(),
+		reflect.TypeFor[contract.HeartbeatWakeReason]():              contract.HeartbeatWakeReasonValues(),
+		reflect.TypeFor[contract.WindowManagerErrorCode]():           contract.WindowManagerErrorCodeValues(),
+		reflect.TypeFor[contract.WindowManagerCommandID]():           contract.WindowManagerCommandIDValues(),
+		reflect.TypeFor[windowmanager.NodeKind](): {
+			string(windowmanager.NodeKindLeaf),
+			string(windowmanager.NodeKindSplit),
+			string(windowmanager.NodeKindStack),
+		},
+		reflect.TypeFor[windowmanager.Axis](): {
+			string(windowmanager.AxisHorizontal),
+			string(windowmanager.AxisVertical),
+		},
+		reflect.TypeFor[windowmanager.WindowPlacement](): {
+			string(windowmanager.WindowPlacementTiled),
+			string(windowmanager.WindowPlacementStacked),
+			string(windowmanager.WindowPlacementFloating),
+		},
+		reflect.TypeFor[windowmanager.NavigateMode](): {
+			"replace",
+			string(windowmanager.NavigatePush),
+			string(windowmanager.NavigatePop),
+		},
+		reflect.TypeFor[windowmanager.CloseScope](): {
+			"tab",
+			string(windowmanager.CloseScopeGroup),
+			string(windowmanager.CloseScopeOthers),
+			string(windowmanager.CloseScopeRight),
+		},
+		reflect.TypeFor[windowmanager.FocusDirection](): {
+			string(windowmanager.FocusLeft),
+			string(windowmanager.FocusRight),
+			string(windowmanager.FocusUp),
+			string(windowmanager.FocusDown),
+		},
+		reflect.TypeFor[windowmanager.DropPlacement](): {
+			string(windowmanager.DropFloating),
+			string(windowmanager.DropBefore),
+			string(windowmanager.DropAfter),
+			string(windowmanager.DropLeft),
+			string(windowmanager.DropRight),
+			string(windowmanager.DropTop),
+			string(windowmanager.DropBottom),
+			string(windowmanager.DropCenter),
+		},
+		reflect.TypeFor[windowmanager.Arrangement](): {
+			string(windowmanager.ArrangementHorizontal),
+			string(windowmanager.ArrangementVertical),
+			string(windowmanager.ArrangementGrid),
+			string(windowmanager.ArrangementStack),
+			string(windowmanager.ArrangementMainStack),
+		},
+		reflect.TypeFor[contract.SkillDiagnosticState]():        skillDiagnosticStateValues(),
+		reflect.TypeFor[contract.SkillActivationReasonCode]():   skillActivationReasonCodeValues(),
+		reflect.TypeFor[contract.SkillVerificationStatus]():     skillVerificationStatusValues(),
+		reflect.TypeFor[contract.SkillExposureStatus]():         skillExposureStatusValues(),
+		reflect.TypeFor[hooks.HookEvent]():                      hookEventValues(),
+		reflect.TypeFor[hooks.HookEventFamily]():                hookEventFamilyValues(),
+		reflect.TypeFor[hooks.HookMode]():                       hookModeValues(),
+		reflect.TypeFor[hooks.HookRunOutcome]():                 hookOutcomeValues(),
+		reflect.TypeFor[hooks.HookSkillSource]():                hookSkillSourceValues(),
+		reflect.TypeFor[hooks.HookExecutorKind]():               hookExecutorKindValues(),
+		reflect.TypeFor[hooks.HookSource]():                     hookSourceValues(),
+		reflect.TypeFor[contract.SettingsScopeKind]():           settingsScopeValues(),
+		reflect.TypeFor[contract.SettingsUserScopeKind]():       settingsUserScopeValues(),
+		reflect.TypeFor[contract.SettingsAgentScopeKind]():      settingsAgentScopeValues(),
+		reflect.TypeFor[contract.SettingsLayeredScopeKind]():    settingsLayeredScopeValues(),
+		reflect.TypeFor[contract.SettingsWorkspaceScopeKind]():  settingsUserWorkspaceScopeValues(),
+		reflect.TypeFor[contract.SettingsSectionName]():         settingsSectionValues(),
+		reflect.TypeFor[contract.SettingsApplyTargetName]():     settingsApplyTargetValues(),
+		reflect.TypeFor[contract.SettingsCollectionName]():      settingsCollectionValues(),
+		reflect.TypeFor[contract.SettingsWriteTargetKind]():     settingsWriteTargetValues(),
+		reflect.TypeFor[contract.SettingsTargetSelector]():      settingsTargetSelectorValues(),
+		reflect.TypeFor[contract.SettingsMutationBehavior]():    settingsMutationBehaviorValues(),
+		reflect.TypeFor[contract.SettingsApplyLifecycle]():      settingsApplyLifecycleValues(),
+		reflect.TypeFor[contract.ConfigApplyStatus]():           configApplyStatusValues(),
+		reflect.TypeFor[contract.SettingsApplyNextAction]():     settingsApplyNextActionValues(),
+		reflect.TypeFor[contract.SettingsPermissionMode]():      settingsPermissionModeValues(),
+		reflect.TypeFor[contract.SettingsSourceKind]():          settingsSourceKindValues(),
+		reflect.TypeFor[contract.RestartOperationStatus]():      restartOperationStatusValues(),
+		reflect.TypeFor[contract.RestartProgressPhase]():        {string(contract.RestartProgressMigrating)},
+		reflect.TypeFor[contract.SettingsStreamTransport]():     settingsStreamTransportValues(),
+		reflect.TypeFor[contract.SettingsUpdateStatusKind]():    settingsUpdateStatusValues(),
+		reflect.TypeFor[contract.SettingsUpdateTarget]():        settingsUpdateTargetValues(),
+		reflect.TypeFor[contract.SettingsUpdateApplyStatus]():   settingsUpdateApplyStatusValues(),
+		reflect.TypeFor[contract.SettingsUpdatePhase]():         settingsUpdatePhaseValues(),
+		reflect.TypeFor[contract.SettingsUpdateWaitingState]():  settingsUpdateWaitingValues(),
+		reflect.TypeFor[contract.SettingsUpdateActor]():         settingsUpdateActorValues(),
+		reflect.TypeFor[contract.SettingsUpdateInstallMethod](): settingsUpdateInstallMethodValues(),
+		reflect.TypeFor[contract.ProviderLoginSource](): {
+			string(contract.ProviderLoginSourceAuthLoginCommand),
+			string(contract.ProviderLoginSourceAuthACPMethod),
+		},
+		reflect.TypeFor[contract.ProviderLoginPresence](): {
+			string(contract.ProviderLoginPresencePresent),
+			string(contract.ProviderLoginPresenceMissing),
+			string(contract.ProviderLoginPresenceUnknown),
+		},
+		reflect.TypeFor[contract.ProviderRecommendedAction](): {
+			string(contract.ProviderRecommendedActionInstallCLI),
+			string(contract.ProviderRecommendedActionLogin),
+			string(contract.ProviderRecommendedActionBindSecret),
+			string(contract.ProviderRecommendedActionRetry),
+			string(contract.ProviderRecommendedActionInspect),
+			string(contract.ProviderRecommendedActionNoRetry),
+		},
+		reflect.TypeFor[contract.ProviderRuntimeStrategy](): {
+			string(contract.ProviderRuntimeStrategySessionConfig),
+			string(contract.ProviderRuntimeStrategyLaunchArg),
+			string(contract.ProviderRuntimeStrategyProviderManaged),
+		},
+		reflect.TypeFor[contract.ProviderRuntimeLiveApply](): {
+			string(contract.ProviderRuntimeLiveApplyNextStep),
+			string(contract.ProviderRuntimeLiveApplyNextTurn),
+		},
+		reflect.TypeFor[contract.SettingsMCPAuthBeginMode](): {
+			string(contract.SettingsMCPAuthBeginModeAutomatic),
+			string(contract.SettingsMCPAuthBeginModeManual),
+		},
+		reflect.TypeFor[resources.ResourceScopeKind]():  resourceScopeKindValues(),
+		reflect.TypeFor[modelcatalog.ReasoningSource](): modelcatalog.ReasoningSourceValues(),
+		reflect.TypeFor[speedpkg.Speed]():               speedpkg.Values(),
+		reflect.TypeFor[speedpkg.ResolutionStatus]():    speedpkg.ResolutionStatusValues(),
+		reflect.TypeFor[speedpkg.ResolutionReason]():    speedpkg.ResolutionReasonValues(),
+		reflect.TypeFor[contract.SessionContextState](): {
+			string(contract.SessionContextStateReported), string(contract.SessionContextStateEstimatedSize),
+			string(contract.SessionContextStateUnknown), string(contract.SessionContextStateUnavailable),
+		},
+		reflect.TypeFor[modelcatalog.CostStatus]():            modelcatalog.CostStatusValues(),
+		reflect.TypeFor[modelcatalog.CostSource]():            modelcatalog.CostSourceValues(),
+		reflect.TypeFor[session.Type]():                       sessionTypeValues(),
+		reflect.TypeFor[session.State]():                      sessionStateValues(),
+		reflect.TypeFor[store.StopReason]():                   stopReasonValues(),
+		reflect.TypeFor[tools.ToolSource]():                   toolSourceValues(),
+		reflect.TypeFor[tools.BackendKind]():                  toolBackendKindValues(),
+		reflect.TypeFor[tools.Visibility]():                   toolVisibilityValues(),
+		reflect.TypeFor[tools.RiskClass]():                    toolRiskClassValues(),
+		reflect.TypeFor[tools.ReasonCode]():                   toolReasonCodeValues(),
+		reflect.TypeFor[tools.ErrorCode]():                    toolErrorCodeValues(),
+		reflect.TypeFor[tools.ToolCallEventKind]():            toolCallEventKindValues(),
+		reflect.TypeFor[tools.ApprovalGrantDecision]():        toolApprovalGrantDecisionValues(),
+		reflect.TypeFor[tools.ApprovalGrantManagementScope](): toolApprovalGrantManagementScopeValues(),
+		reflect.TypeFor[extensionprotocol.HostAPIMethod]():    hostAPIMethodValues(),
+	}),
+)
+
+func roleResolutionModeValues() []string {
+	return []string{
+		string(contract.RoleResolutionModeBuiltin),
+		string(contract.RoleResolutionModeCatalog),
+		string(contract.RoleResolutionModeInherit),
+	}
+}
+
+func drainStateValues() []string {
+	return []string{string(contract.DrainStateActive), string(contract.DrainStateDraining)}
+}
+
+func toolApprovalGrantDecisionValues() []string {
+	return []string{string(tools.ApprovalGrantAllow), string(tools.ApprovalGrantReject)}
+}
+
+func toolApprovalGrantManagementScopeValues() []string {
+	return []string{string(tools.ApprovalGrantScopeAgent), string(tools.ApprovalGrantScopeTool)}
+}

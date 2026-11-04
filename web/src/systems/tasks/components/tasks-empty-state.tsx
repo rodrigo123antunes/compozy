@@ -1,0 +1,155 @@
+import { ListChecks, RefreshCcw, UserCheck, Zap } from "@compozy/ui/icons";
+import type { ReactNode } from "react";
+
+import { CatalogEmptyPanel, CatalogEmptyState } from "@/components/catalog-empty-state";
+import { Button, CatalogEmptyDisclosureRow, type CatalogEmptyTone, Pill } from "@compozy/ui";
+
+import { getTaskTemplate, type TaskTemplate, type TaskTemplateId } from "../lib/task-templates";
+import { emptyForScope } from "@/systems/profiles";
+
+interface TemplateSlot {
+  id: TaskTemplateId;
+  tone: CatalogEmptyTone;
+  icon: ReactNode;
+}
+
+/**
+ * Curated zero-inventory templates. Tones stay neutral — the icons carry the
+ * distinction. Five template definitions remain available to the editor.
+ */
+const TEMPLATE_SLOTS: TemplateSlot[] = [
+  { id: "one_shot", tone: "neutral", icon: <Zap className="size-3.5" /> },
+  { id: "recurring", tone: "neutral", icon: <RefreshCcw className="size-3.5" /> },
+  { id: "human_in_loop", tone: "neutral", icon: <UserCheck className="size-3.5" /> },
+];
+
+export interface TasksEmptyStateProps {
+  workspaceName?: string | null;
+  /**
+   * The profile the list is bounded by. `null` means the aggregate and
+   * `undefined` means no profile context. Never the create target.
+   */
+  profileScopeLabel?: string | null;
+  onSelectTemplate: (templateId: TaskTemplateId) => void;
+}
+
+function templateFacts(template: TaskTemplate): string {
+  const parts: string[] = [];
+  if (template.defaults.priority) {
+    const priority = template.defaults.priority;
+    parts.push(`${priority.charAt(0).toUpperCase()}${priority.slice(1)} priority`);
+  }
+  if (template.defaults.max_attempts != null) {
+    const attempts = template.defaults.max_attempts;
+    parts.push(`${attempts} attempt${attempts === 1 ? "" : "s"}`);
+  }
+  if (template.defaults.approval_policy === "manual") {
+    parts.push("Needs your approval");
+  }
+  if (template.defaults.draft) {
+    parts.push("Saved as a draft");
+  }
+  parts.push(...(template.preview.facts ?? []));
+  if (template.preview.enqueueOnSubmit) {
+    parts.push("Starts when created");
+  }
+  return parts.join(" · ");
+}
+
+function templateDescription(template: TaskTemplate): string {
+  return template.simpleDescription !== "" ? template.simpleDescription : template.description;
+}
+
+export function TasksEmptyState({
+  workspaceName,
+  profileScopeLabel,
+  onSelectTemplate,
+}: TasksEmptyStateProps) {
+  // The profile axis is the narrower question, so it wins when it is known: an
+  // operator in Marketing is being told this project is empty for Marketing, and
+  // one looking at every profile is told the machine is empty — never that it is
+  // empty in `default`, which is only where a new task would land.
+  const headline =
+    profileScopeLabel !== undefined
+      ? emptyForScope("tasks", profileScopeLabel)
+      : workspaceName
+        ? `No tasks yet in ${workspaceName}`
+        : "No tasks yet";
+
+  return (
+    <CatalogEmptyState
+      action={
+        <Button
+          data-testid="tasks-empty-cta-new"
+          onClick={() => onSelectTemplate("blank")}
+          size="sm"
+          type="button"
+          variant="neutral"
+        >
+          Start from scratch
+        </Button>
+      }
+      data-testid="tasks-empty-state"
+      icon={ListChecks}
+      panel={
+        <CatalogEmptyPanel
+          aria-label="Task templates"
+          count={TEMPLATE_SLOTS.length}
+          data-testid="tasks-empty-templates"
+          label="Start from a template"
+          note="You can change everything later."
+        >
+          <ul>
+            {TEMPLATE_SLOTS.map(slot => {
+              const template = getTaskTemplate(slot.id);
+              const badge = template.badges[0];
+              return (
+                <CatalogEmptyDisclosureRow
+                  actions={
+                    <Button
+                      data-testid={`tasks-empty-template-${template.id}-use`}
+                      onClick={() => onSelectTemplate(slot.id)}
+                      size="sm"
+                      type="button"
+                      variant="neutral"
+                    >
+                      Use template
+                    </Button>
+                  }
+                  description={templateDescription(template)}
+                  detail={
+                    <>
+                      <div className="rounded-lg bg-sunken px-3 py-2.5">
+                        <p className="text-form-label leading-relaxed text-fg">
+                          {template.description}
+                          {template.preview.notice ? ` ${template.preview.notice}` : ""}
+                        </p>
+                      </div>
+                      <p className="text-form-hint text-subtle tabular-nums">
+                        {templateFacts(template)}
+                      </p>
+                    </>
+                  }
+                  icon={slot.icon}
+                  data-testid={`tasks-empty-template-${template.id}`}
+                  key={slot.id}
+                  pill={
+                    badge ? (
+                      <Pill mono={false} size="sm" tone={badge.tone}>
+                        {badge.label}
+                      </Pill>
+                    ) : null
+                  }
+                  title={template.label}
+                  tone={slot.tone}
+                />
+              );
+            })}
+          </ul>
+        </CatalogEmptyPanel>
+      }
+      support="A task is a piece of work you hand to an agent. Pick a starting point below."
+      title={headline}
+    />
+  );
+}

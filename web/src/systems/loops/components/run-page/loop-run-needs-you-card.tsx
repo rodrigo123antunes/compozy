@@ -1,0 +1,276 @@
+import type { ComponentProps } from "react";
+import { Bell, Check, PenLine, ShieldAlert, X } from "@compozy/ui/icons";
+
+import { Button, cn, Eyebrow, formatRelativeTime, StateGlyph } from "@compozy/ui";
+
+import type {
+  LoopApprovalFact,
+  LoopApprovalRequest,
+  LoopGateDecision,
+} from "../../lib/loop-events";
+import { isTerminalLoopStatus } from "../../lib/loop-formatters";
+import type { LoopNodeLifecycle } from "../../lib/loop-node-lifecycle";
+import { humanizeLoopNodeId } from "../../lib/loop-node-labels";
+import type { LoopRequestView } from "../../lib/loop-request-model";
+import type { LoopRunRecord } from "../../types";
+import { LoopSection } from "../loop-section";
+import {
+  LoopRequestQuestionnaire,
+  type LoopRequestFocusTarget,
+  type LoopRunRequestState,
+} from "./requests/loop-request-questionnaire";
+
+interface LoopRunNeedsYouCardProps {
+  run: LoopRunRecord;
+  /** Current approval context from durable detail or a matching live frame. */
+  request: LoopApprovalRequest | null;
+
+  fallbackFacts: LoopApprovalFact[];
+  isPending?: boolean;
+  /** When true, the approval decision block renders. */
+  showApproval?: boolean;
+  /** Quarantined lanes that need an entry point above the fold. */
+  quarantinedNodes?: readonly LoopNodeLifecycle[];
+
+  requests?: readonly LoopRequestView[];
+  requestFocus?: LoopRequestFocusTarget;
+  requestState?: LoopRunRequestState;
+  workspaceId?: string;
+  onOpenQuarantine?: (nodeId: string) => void;
+  onDecision: (decision: LoopGateDecision, gateId: string) => void;
+}
+
+const GATE_DECISIONS = [
+  {
+    decision: "approve",
+    testId: "loop-approval-approve",
+    variant: "primary",
+    className: undefined,
+    icon: Check,
+    label: "Approve & resume",
+  },
+  {
+    decision: "request_changes",
+    testId: "loop-approval-request-changes",
+    variant: "secondary",
+    className: undefined,
+    icon: PenLine,
+    label: "Request changes",
+  },
+  {
+    decision: "reject",
+    testId: "loop-approval-reject",
+    variant: "ghost",
+    className: undefined,
+    icon: X,
+    label: "Reject & halt",
+  },
+] as const;
+
+function nodeRowKey(node: LoopNodeLifecycle): string {
+  return `${node.nodeId}${node.itemIndex === null ? "" : `-${node.itemIndex}`}-g${node.generation}`;
+}
+
+const NO_QUARANTINED_NODES: readonly LoopNodeLifecycle[] = [];
+const NO_REQUEST_VIEWS: readonly LoopRequestView[] = [];
+
+/**
+ * Requeue is a live verb: the daemon rejects it once the run has ended, so a
+ * terminal row keeps the reason and the entry but stops asking for one.
+ */
+function quarantineDetail(attempts: number, runEnded: boolean): string {
+  const setAside = attempts > 0 ? `Set aside after ${attempts} tries.` : "Set aside.";
+  return runEnded
+    ? `${setAside} This run has ended.`
+    : `${setAside} Retry it once the problem is fixed.`;
+}
+
+/**
+ * The "Needs you" region: a neutral panelbox whose only colour is the state
+ * glyph (attention for a decision, failed for a quarantined step). Requests present as a one-at-a-time questionnaire; approval decisions
+ * and quarantine entries share the same shell.
+ */
+export function LoopRunNeedsYouCard({
+  run,
+  request,
+  fallbackFacts,
+  isPending,
+  showApproval = true,
+  quarantinedNodes = NO_QUARANTINED_NODES,
+  requests = NO_REQUEST_VIEWS,
+  requestFocus,
+  requestState,
+  workspaceId = "",
+  onOpenQuarantine,
+  onDecision,
+}: LoopRunNeedsYouCardProps) {
+  if (!showApproval && quarantinedNodes.length === 0 && requests.length === 0) return null;
+  const gistCount = (showApproval ? 1 : 0) + quarantinedNodes.length + requests.length;
+  const runEnded = isTerminalLoopStatus(run.status);
+  return (
+    <LoopSection
+      data-testid="loop-run-needs-you"
+      gist={`${gistCount} ${gistCount === 1 ? "item" : "items"}`}
+      icon={<Bell aria-hidden="true" />}
+      title="Needs you"
+    >
+      <div className="overflow-hidden rounded-lg bg-card shadow-card">
+        {requests.length > 0 ? (
+          <LoopRequestQuestionnaire
+            requestFocus={requestFocus}
+            requests={requests}
+            requestState={requestState}
+            workspaceId={workspaceId}
+          />
+        ) : null}
+        {showApproval ? (
+          <LoopRunApprovalDecision
+            run={run}
+            request={request}
+            fallbackFacts={fallbackFacts}
+            isPending={isPending}
+            onDecision={onDecision}
+            followsRequests={requests.length > 0}
+          />
+        ) : null}
+        {quarantinedNodes.map((node, index) => {
+          const attempts = node.quarantineEntry?.attemptCount ?? 0;
+          const rowKey = nodeRowKey(node);
+          return (
+            <div
+              className={`flex items-start gap-3 px-4 py-3.5 ${
+                showApproval || requests.length > 0 || index > 0 ? "border-t border-line-soft" : ""
+              }`}
+              data-testid={`loop-run-needs-quarantine-${rowKey}`}
+              key={rowKey}
+            >
+              <StateGlyph className="mt-1" state="failed" />
+              <div className="min-w-0 flex-1">
+                <div className="text-ws-name font-medium text-fg-strong">
+                  {node.label} was set aside
+                </div>
+                <p
+                  className="mt-1 max-w-[62ch] text-small-body leading-relaxed text-muted-foreground"
+                  data-testid={`loop-run-needs-quarantine-detail-${rowKey}`}
+                >
+                  {quarantineDetail(attempts, runEnded)}
+                </p>
+              </div>
+              <span className="flex shrink-0 items-center gap-2 pt-0.5">
+                {node.quarantinedAt ? (
+                  <span className="font-mono text-mono-id whitespace-nowrap text-subtle">
+                    {formatRelativeTime(node.quarantinedAt)}
+                  </span>
+                ) : null}
+                {onOpenQuarantine ? (
+                  <Button
+                    className="shrink-0"
+                    data-testid={`loop-run-needs-open-quarantine-${rowKey}`}
+                    onClick={() => onOpenQuarantine(node.nodeId)}
+                    size="sm"
+                    type="button"
+                    variant="secondary"
+                  >
+                    <ShieldAlert aria-hidden="true" className="size-3.5" />
+                    View details
+                  </Button>
+                ) : null}
+              </span>
+            </div>
+          );
+        })}
+      </div>
+    </LoopSection>
+  );
+}
+
+/** Renders approval context and its decisions independently of requests and quarantine rows. */
+function LoopRunApprovalDecision({
+  run,
+  request,
+  fallbackFacts,
+  isPending,
+  onDecision,
+  followsRequests,
+  className,
+  ...props
+}: ComponentProps<"div"> &
+  Pick<
+    LoopRunNeedsYouCardProps,
+    "run" | "request" | "fallbackFacts" | "isPending" | "onDecision"
+  > & { followsRequests: boolean }) {
+  const gateId = request?.gateId ?? run.active_gate_id ?? "approve";
+  const facts = request?.facts && request.facts.length > 0 ? request.facts : fallbackFacts;
+  // Who is asking, and from which round — the "who asks" half of the card's
+  // stated anatomy. This line used to read `needs_approval · <gate id>`, and
+  // `needs_approval · budget · on_exceeded: <enum>` on the budget gate: two wire
+  // enums and a machine id, printed in the default register that task_05
+  // requirement 1 forbids them from. The budget policy is not restated either —
+  // the usage rail already says it in a sentence (`loop-run-usage.ts:146`).
+  const gateName = request?.gateId ?? run.active_gate_id ?? "";
+  const micro = [
+    gateName === "" ? null : humanizeLoopNodeId(gateName),
+    run.generation > 0 ? `round ${run.generation}` : null,
+  ]
+    .filter((part): part is string => part !== null)
+    .join(" · ");
+  return (
+    <div
+      className={cn(
+        "flex items-start gap-3 px-4 py-3.5",
+        followsRequests && "border-t border-line-soft",
+        className
+      )}
+      data-testid="loop-run-needs-approval"
+      {...props}
+    >
+      <StateGlyph className="mt-1" state="attention" />
+      <div className="min-w-0 flex-1">
+        <div className="text-ws-name font-medium text-fg-strong">
+          {request?.title ?? "Approve to continue this run?"}
+        </div>
+        <p className="mt-1 max-w-[62ch] text-small-body leading-relaxed text-muted-foreground">
+          {request?.prompt ??
+            "This run is waiting for your approval. Approving lets it continue; rejecting ends the run."}
+        </p>
+        {facts.length > 0 ? (
+          <div className="mt-3 flex flex-wrap gap-x-6 gap-y-2">
+            {facts.map(fact => (
+              <div key={fact.label} className="flex flex-col gap-0.5" data-testid="loop-run-fact">
+                <Eyebrow className="text-faint">{fact.label}</Eyebrow>
+                <span className="font-mono text-mono-id tabular-nums text-fg">{fact.value}</span>
+              </div>
+            ))}
+          </div>
+        ) : null}
+        <div className="mt-4 flex flex-wrap gap-2">
+          {GATE_DECISIONS.map(({ decision, testId, variant, className, icon: Icon, label }) => (
+            <Button
+              key={decision}
+              className={className}
+              data-testid={testId}
+              disabled={isPending}
+              onClick={() => onDecision(decision, gateId)}
+              size="sm"
+              type="button"
+              variant={variant}
+            >
+              <Icon aria-hidden="true" className="size-3.5" />
+              {label}
+            </Button>
+          ))}
+        </div>
+        {micro === "" ? null : (
+          // Plain language, so not the mono face the ids and fixed
+          // operational values wear.
+          <div
+            className="mt-3 text-form-hint text-faint"
+            data-testid="loop-run-needs-approval-origin"
+          >
+            {micro}
+          </div>
+        )}
+      </div>
+    </div>
+  );
+}

@@ -1,0 +1,319 @@
+package cli
+
+import (
+	"context"
+
+	"errors"
+
+	"net/http"
+	"net/url"
+
+	"strings"
+
+	"github.com/compozy/compozy/internal/agentidentity"
+	"github.com/compozy/compozy/internal/api/contract"
+)
+
+func (c *daemonClient) ListTasks(ctx context.Context, query TaskListQuery) (TaskListRecord, error) {
+	var response contract.TasksResponse
+	if err := c.doJSON(ctx, http.MethodGet, "/api/tasks", taskValues(query), nil, &response); err != nil {
+		return TaskListRecord{}, err
+	}
+	return response, nil
+}
+
+func (c *daemonClient) CreateTask(ctx context.Context, request CreateTaskRequest) (TaskRecord, error) {
+	var response contract.TaskResponse
+	if err := c.doJSON(ctx, http.MethodPost, "/api/tasks", nil, request, &response); err != nil {
+		return TaskRecord{}, err
+	}
+	return response.Task, nil
+}
+
+func (c *daemonClient) CreateTaskAsAgent(
+	ctx context.Context,
+	request CreateTaskRequest,
+	credentials agentidentity.Credentials,
+) (TaskRecord, error) {
+	var response contract.TaskResponse
+	if err := c.doAgentJSON(ctx, http.MethodPost, "/api/tasks", nil, request, credentials, &response); err != nil {
+		return TaskRecord{}, err
+	}
+	return response.Task, nil
+}
+
+func (c *daemonClient) GetTask(ctx context.Context, id string) (TaskDetailRecord, error) {
+	var response contract.TaskDetailResponse
+	path := "/api/tasks/" + url.PathEscape(strings.TrimSpace(id))
+	if err := c.doJSON(ctx, http.MethodGet, path, nil, nil, &response); err != nil {
+		return TaskDetailRecord{}, err
+	}
+	return response.Task, nil
+}
+
+func (c *daemonClient) InspectTask(ctx context.Context, id string) (TaskInspectRecord, error) {
+	var response contract.TaskInspectResponse
+	path := "/api/tasks/" + url.PathEscape(strings.TrimSpace(id)) + "/inspect"
+	if err := c.doJSON(ctx, http.MethodGet, path, nil, nil, &response); err != nil {
+		return TaskInspectRecord{}, err
+	}
+	return response.Inspect, nil
+}
+
+func (c *daemonClient) InspectRun(ctx context.Context, id string) (TaskInspectRecord, error) {
+	var response contract.TaskInspectResponse
+	path := "/api/runs/" + url.PathEscape(strings.TrimSpace(id)) + "/inspect"
+	if err := c.doJSON(ctx, http.MethodGet, path, nil, nil, &response); err != nil {
+		return TaskInspectRecord{}, err
+	}
+	return response.Inspect, nil
+}
+
+func (c *daemonClient) UpdateTask(ctx context.Context, id string, request UpdateTaskRequest) (TaskRecord, error) {
+	var response contract.TaskResponse
+	path := "/api/tasks/" + url.PathEscape(strings.TrimSpace(id))
+	if err := c.doJSON(ctx, http.MethodPatch, path, nil, request, &response); err != nil {
+		return TaskRecord{}, err
+	}
+	return response.Task, nil
+}
+
+func (c *daemonClient) BlockTask(
+	ctx context.Context,
+	id string,
+	request CreateTaskBlockRequest,
+) (TaskBlockRecord, error) {
+	var response contract.TaskBlockResponse
+	if err := c.doJSON(ctx, http.MethodPost, taskBlocksPath(id), nil, request, &response); err != nil {
+		return TaskBlockRecord{}, err
+	}
+	return response.Block, nil
+}
+
+func (c *daemonClient) BlockTaskAsAgent(
+	ctx context.Context,
+	id string,
+	request CreateTaskBlockRequest,
+	credentials agentidentity.Credentials,
+) (TaskBlockRecord, error) {
+	var response contract.TaskBlockResponse
+	if err := c.doAgentJSON(
+		ctx,
+		http.MethodPost,
+		taskBlocksPath(id),
+		nil,
+		request,
+		credentials,
+		&response,
+	); err != nil {
+		return TaskBlockRecord{}, err
+	}
+	return response.Block, nil
+}
+
+func (c *daemonClient) ListTaskBlocks(
+	ctx context.Context,
+	id string,
+	includeCleared bool,
+) ([]TaskBlockRecord, error) {
+	var response contract.TaskBlocksResponse
+	values := url.Values{}
+	if includeCleared {
+		values.Set("include_cleared", "true")
+	}
+	if err := c.doJSON(ctx, http.MethodGet, taskBlocksPath(id), values, nil, &response); err != nil {
+		return nil, err
+	}
+	return response.Blocks, nil
+}
+
+func (c *daemonClient) ClearTaskBlock(
+	ctx context.Context,
+	id string,
+	blockID string,
+	request ClearTaskBlockRequest,
+) (TaskBlockRecord, error) {
+	var response contract.TaskBlockResponse
+	path := taskBlocksPath(id) + "/" + url.PathEscape(strings.TrimSpace(blockID)) + "/clear"
+	if err := c.doJSON(ctx, http.MethodPost, path, nil, request, &response); err != nil {
+		return TaskBlockRecord{}, err
+	}
+	return response.Block, nil
+}
+
+func (c *daemonClient) ClearTaskBlockAsAgent(
+	ctx context.Context,
+	id string,
+	blockID string,
+	request ClearTaskBlockRequest,
+	credentials agentidentity.Credentials,
+) (TaskBlockRecord, error) {
+	var response contract.TaskBlockResponse
+	path := taskBlocksPath(id) + "/" + url.PathEscape(strings.TrimSpace(blockID)) + "/clear"
+	if err := c.doAgentJSON(ctx, http.MethodPost, path, nil, request, credentials, &response); err != nil {
+		return TaskBlockRecord{}, err
+	}
+	return response.Block, nil
+}
+
+func (c *daemonClient) RecoverTask(
+	ctx context.Context,
+	id string,
+	request RecoverTaskRequest,
+) (TaskRecord, error) {
+	var response contract.TaskResponse
+	path := "/api/tasks/" + url.PathEscape(strings.TrimSpace(id)) + "/recover"
+	if err := c.doJSON(ctx, http.MethodPost, path, nil, request, &response); err != nil {
+		return TaskRecord{}, err
+	}
+	return response.Task, nil
+}
+
+func taskBlocksPath(id string) string {
+	return "/api/tasks/" + url.PathEscape(strings.TrimSpace(id)) + "/blocks"
+}
+
+func (c *daemonClient) GetTaskExecutionProfile(
+	ctx context.Context,
+	id string,
+) (TaskExecutionProfileRecord, error) {
+	var response contract.TaskExecutionProfileResponse
+	path := taskExecutionProfilePath(id)
+	if err := c.doJSON(ctx, http.MethodGet, path, nil, nil, &response); err != nil {
+		return TaskExecutionProfileRecord{}, err
+	}
+	return response.Profile, nil
+}
+
+func (c *daemonClient) SetTaskExecutionProfile(
+	ctx context.Context,
+	id string,
+	request *TaskExecutionProfileRequest,
+) (TaskExecutionProfileRecord, error) {
+	if request == nil {
+		return TaskExecutionProfileRecord{}, errors.New("cli: task execution profile request is required")
+	}
+	var response contract.TaskExecutionProfileResponse
+	path := taskExecutionProfilePath(id)
+	if err := c.doJSON(ctx, http.MethodPut, path, nil, request, &response); err != nil {
+		return TaskExecutionProfileRecord{}, err
+	}
+	return response.Profile, nil
+}
+
+func (c *daemonClient) SetTaskWorktreePolicy(
+	ctx context.Context,
+	id string,
+	request *TaskWorktreePolicyRequest,
+) (TaskExecutionProfileRecord, error) {
+	if request == nil {
+		return TaskExecutionProfileRecord{}, errors.New("cli: task worktree policy request is required")
+	}
+	var response contract.TaskExecutionProfileResponse
+	path := taskExecutionProfilePath(id) + "/worktree"
+	if err := c.doJSON(ctx, http.MethodPatch, path, nil, request, &response); err != nil {
+		return TaskExecutionProfileRecord{}, err
+	}
+	return response.Profile, nil
+}
+
+func (c *daemonClient) DeleteTaskExecutionProfile(ctx context.Context, id string) error {
+	return c.doJSON(ctx, http.MethodDelete, taskExecutionProfilePath(id), nil, nil, nil)
+}
+
+func taskExecutionProfilePath(id string) string {
+	return "/api/tasks/" + url.PathEscape(strings.TrimSpace(id)) + "/execution-profile"
+}
+
+func (c *daemonClient) RequestTaskRunReview(
+	ctx context.Context,
+	runID string,
+	request *TaskRunReviewRequest,
+) (TaskRunReviewRequestRecord, error) {
+	if request == nil {
+		return TaskRunReviewRequestRecord{}, errors.New("cli: task run review request is required")
+	}
+	var response contract.TaskRunReviewRequestResponse
+	path := "/api/task-runs/" + url.PathEscape(strings.TrimSpace(runID)) + "/reviews"
+	if err := c.doJSON(ctx, http.MethodPost, path, nil, request, &response); err != nil {
+		return TaskRunReviewRequestRecord{}, err
+	}
+	return response, nil
+}
+
+func (c *daemonClient) RequestTaskRunReviewAsAgent(
+	ctx context.Context,
+	runID string,
+	request *TaskRunReviewRequest,
+	credentials agentidentity.Credentials,
+) (TaskRunReviewRequestRecord, error) {
+	if request == nil {
+		return TaskRunReviewRequestRecord{}, errors.New("cli: task run review request is required")
+	}
+	var response contract.TaskRunReviewRequestResponse
+	path := "/api/task-runs/" + url.PathEscape(strings.TrimSpace(runID)) + "/reviews"
+	if err := c.doAgentJSON(ctx, http.MethodPost, path, nil, request, credentials, &response); err != nil {
+		return TaskRunReviewRequestRecord{}, err
+	}
+	return response, nil
+}
+
+func (c *daemonClient) ListTaskRunReviews(
+	ctx context.Context,
+	query TaskRunReviewListQuery,
+) ([]TaskRunReviewRecord, error) {
+	var response contract.TaskRunReviewsResponse
+	path, values, err := taskRunReviewListPathAndValues(query)
+	if err != nil {
+		return nil, err
+	}
+	if err := c.doJSON(ctx, http.MethodGet, path, values, nil, &response); err != nil {
+		return nil, err
+	}
+	return response.Reviews, nil
+}
+
+func (c *daemonClient) GetTaskRunReview(
+	ctx context.Context,
+	reviewID string,
+) (TaskRunReviewRecord, error) {
+	var response contract.TaskRunReviewResponse
+	path := "/api/task-reviews/" + url.PathEscape(strings.TrimSpace(reviewID))
+	if err := c.doJSON(ctx, http.MethodGet, path, nil, nil, &response); err != nil {
+		return TaskRunReviewRecord{}, err
+	}
+	return response.Review, nil
+}
+
+func (c *daemonClient) SubmitTaskRunReviewVerdict(
+	ctx context.Context,
+	reviewID string,
+	request *TaskRunReviewVerdictRequest,
+) (TaskRunReviewVerdictRecord, error) {
+	if request == nil {
+		return TaskRunReviewVerdictRecord{}, errors.New("cli: task run review verdict request is required")
+	}
+	var response contract.TaskRunReviewVerdictResponse
+	path := "/api/task-reviews/" + url.PathEscape(strings.TrimSpace(reviewID)) + "/verdict"
+	if err := c.doJSON(ctx, http.MethodPost, path, nil, request, &response); err != nil {
+		return TaskRunReviewVerdictRecord{}, err
+	}
+	return response, nil
+}
+
+func (c *daemonClient) SubmitTaskRunReviewVerdictAsAgent(
+	ctx context.Context,
+	reviewID string,
+	request *TaskRunReviewVerdictRequest,
+	credentials agentidentity.Credentials,
+) (TaskRunReviewVerdictRecord, error) {
+	if request == nil {
+		return TaskRunReviewVerdictRecord{}, errors.New("cli: task run review verdict request is required")
+	}
+	var response contract.TaskRunReviewVerdictResponse
+	path := "/api/task-reviews/" + url.PathEscape(strings.TrimSpace(reviewID)) + "/verdict"
+	if err := c.doAgentJSON(ctx, http.MethodPost, path, nil, request, credentials, &response); err != nil {
+		return TaskRunReviewVerdictRecord{}, err
+	}
+	return response, nil
+}

@@ -1,0 +1,71 @@
+{
+    "version": 2,
+    "agents": [
+        {
+            "name": "role-agent",
+            "provider": "acpmock",
+            "permissions": "approve-all",
+            "prompt": "Exercise configurable Compozy background roles.",
+            "config_options": [
+                {
+                    "id": "model",
+                    "name": "Model",
+                    "current": "routed-auto-title-model",
+                    "values": [
+                        {
+                            "value": "routed-auto-title-model",
+                            "label": "Routed auto-title model"
+                        },
+                        {
+                            "value": "auto-title-model-v1",
+                            "label": "Auto-title model v1"
+                        },
+                        {
+                            "value": "auto-title-model-v2",
+                            "label": "Auto-title model v2"
+                        }
+                    ]
+                }
+            ],
+            "turns": [
+                {
+                    "name": "role-prompt",
+                    "match": {
+                        "turn_source": "user"
+                    },
+                    "steps": [
+                        {
+                            "kind": "assistant",
+                            "text": "role prompt acknowledged"
+                        }
+                    ]
+                },
+                {
+                    "name": "auto-title-live-apply-parent",
+                    "match": {
+                        "turn_source": "user",
+                        "user_text": "Record the auto-title routing decision"
+                    },
+                    "steps": [
+                        {
+                            "kind": "assistant",
+                            "text": "Recorded the auto-title routing decision."
+                        }
+                    ]
+                },
+                {
+                    "name": "auto-title-live-apply-child",
+                    "match": {
+                        "turn_source": "synthetic"
+                    },
+                    "steps": [
+                        {
+                            "kind": "assistant",
+                            "text": "Auto-title routing decision"
+                        }
+                    ]
+                }
+            ]
+        }
+    ]
+}

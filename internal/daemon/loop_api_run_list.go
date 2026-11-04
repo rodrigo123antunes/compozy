@@ -1,0 +1,276 @@
+package daemon
+
+import (
+	"cmp"
+	"context"
+	"encoding/base64"
+	"encoding/json"
+	"fmt"
+	"maps"
+	"slices"
+	"strings"
+	"time"
+
+	"github.com/compozy/compozy/internal/workspaceaccess"
+
+	"github.com/compozy/compozy/internal/api/contract"
+	core "github.com/compozy/compozy/internal/api/core"
+	looppkg "github.com/compozy/compozy/internal/loop"
+	"github.com/compozy/compozy/internal/store"
+)
+
+type loopRunListCursor struct {
+	AllWorkspaces bool            `json:"all_workspaces,omitempty"`
+	WorkspaceIDs  []string        `json:"workspace_ids,omitempty"`
+	ReadScope     store.ReadScope `json:"profile_scope"`
+	Order         string          `json:"order,omitempty"`
+	WorkspaceID   string          `json:"workspace_id"`
+	LoopName      string          `json:"loop_name,omitempty"`
+	Status        string          `json:"status,omitempty"`
+	Origin        string          `json:"origin,omitempty"`
+	OriginSession string          `json:"origin_session,omitempty"`
+	Live          *bool           `json:"live,omitzero"`
+	Rank          int             `json:"rank"`
+	CreatedAt     time.Time       `json:"created_at"`
+	ID            string          `json:"id"`
+}
+
+type loopRunListRequest struct {
+	workspaceID looppkg.WorkspaceID
+	storeQuery  looppkg.RunListQuery
+	limit       int
+}
+
+func (s *daemonLoopAPIService) ListLoopRuns(
+	ctx context.Context,
+	workspaceID string,
+	query core.LoopRunListQuery,
+) (contract.LoopRunsResponse, error) {
+	request, err := prepareLoopRunListRequest(workspaceID, query)
+	if err != nil {
+		return contract.LoopRunsResponse{}, err
+	}
+	runs, err := s.persistence.ListLoopRuns(ctx, request.storeQuery)
+	if err != nil {
+		return contract.LoopRunsResponse{}, err
+	}
+	summaries, err := s.loopRunListSummaries(ctx, request.workspaceID, runs)
+	if err != nil {
+		return contract.LoopRunsResponse{}, err
+	}
+	payloads := make([]contract.LoopRunPayload, 0, len(runs))
+	for _, run := range runs {
+		if summary, ok := summaries[run.ID]; ok {
+			run.SetForks(summary.Forks)
+		}
+		payload, payloadErr := loopRunPayload(run)
+		if payloadErr != nil {
+			return contract.LoopRunsResponse{}, payloadErr
+		}
+		applyLoopRunListSummary(&payload, summaries[run.ID])
+		payloads = append(payloads, payload)
+	}
+	if request.storeQuery.OperationalOrder {
+		sortLoopRunList(payloads)
+	}
+	response := contract.LoopRunsResponse{}
+	if len(payloads) > request.limit {
+		response.Runs = payloads[:request.limit]
+		response.NextCursor, err = encodeLoopRunListCursor(
+			&response.Runs[len(response.Runs)-1],
+			string(request.workspaceID),
+			query,
+		)
+		if err != nil {
+			return contract.LoopRunsResponse{}, err
+		}
+	} else {
+		response.Runs = payloads
+	}
+	response.Aggregates = loopRunsAggregate(runs[:len(response.Runs)])
+	return response, nil
+}
+
+func prepareLoopRunListRequest(workspaceID string, query core.LoopRunListQuery) (loopRunListRequest, error) {
+	if query.AllWorkspaces {
+		workspaceID = workspaceaccess.UserSelector
+	}
+	ws, err := normalizeLoopWorkspaceID(workspaceID)
+	if err != nil {
+		return loopRunListRequest{}, err
+	}
+	cursor, err := decodeLoopRunListCursor(query.Cursor)
+	if err != nil {
+		return loopRunListRequest{}, err
+	}
+	if query.Limit < 0 || query.Limit > 500 {
+		return loopRunListRequest{}, fmt.Errorf(
+			"%w: limit must be 0 or between 1 and 500",
+			looppkg.ErrValidation,
+		)
+	}
+	limit := query.Limit
+	if limit == 0 {
+		limit = 100
+	}
+	if cursor != nil && !cursor.matches(string(ws), query) {
+		return loopRunListRequest{}, fmt.Errorf(
+			"%w: Loop run list cursor scope changed",
+			looppkg.ErrInvalidRunListCursor,
+		)
+	}
+	storeQuery := looppkg.RunListQuery{
+		ReadScope:        query.ReadScope,
+		WorkspaceID:      ws,
+		LoopName:         strings.TrimSpace(query.LoopName),
+		Status:           looppkg.Status(strings.TrimSpace(query.Status)),
+		OriginKind:       strings.TrimSpace(query.Origin),
+		OriginSessionID:  strings.TrimSpace(query.OriginSession),
+		Live:             query.Live,
+		Limit:            limit + 1,
+		OperationalOrder: !query.AllWorkspaces && query.Order != "recency",
+		AllWorkspaces:    query.AllWorkspaces, WorkspaceIDs: query.WorkspaceIDs,
+	}
+	if cursor != nil {
+		storeQuery.After = &looppkg.RunListPosition{
+			Rank:      cursor.Rank,
+			CreatedAt: cursor.CreatedAt,
+			ID:        looppkg.RunID(cursor.ID),
+		}
+	}
+	return loopRunListRequest{workspaceID: ws, storeQuery: storeQuery, limit: limit}, nil
+}
+
+func (s *daemonLoopAPIService) loopRunListSummaries(
+	ctx context.Context,
+	workspaceID looppkg.WorkspaceID,
+	runs []looppkg.Run,
+) (map[looppkg.RunID]looppkg.RunListSummary, error) {
+	reader, ok := s.persistence.(looppkg.RunListSummaryReader)
+	if !ok {
+		return map[looppkg.RunID]looppkg.RunListSummary{}, nil
+	}
+	groups := make(map[looppkg.WorkspaceID][]looppkg.RunID)
+	for _, run := range runs {
+		groups[run.WorkspaceID] = append(groups[run.WorkspaceID], run.ID)
+	}
+	if len(groups) > 1 || len(runs) > 0 && runs[0].WorkspaceID != workspaceID {
+		all := make(map[looppkg.RunID]looppkg.RunListSummary)
+		for ws, ids := range groups {
+			summaries, err := reader.ListLoopRunSummaries(ctx, ws, ids)
+			if err != nil {
+				return nil, err
+			}
+			maps.Copy(all, summaries)
+		}
+		return all, nil
+	}
+	runIDs := make([]looppkg.RunID, len(runs))
+	for index := range runs {
+		runIDs[index] = runs[index].ID
+	}
+	summaries, err := reader.ListLoopRunSummaries(ctx, workspaceID, runIDs)
+	if err != nil {
+		return nil, fmt.Errorf("read Loop run list summaries: %w", err)
+	}
+	return summaries, nil
+}
+
+func applyLoopRunListSummary(payload *contract.LoopRunPayload, summary looppkg.RunListSummary) {
+	payload.Progress = contract.LoopRunProgress{
+		Round:      summary.Progress.Round,
+		StepsDone:  summary.Progress.StepsDone,
+		StepsTotal: summary.Progress.StepsTotal,
+	}
+	if summary.Attention != nil {
+		payload.Attention = &contract.LoopRunAttention{
+			Kind:  summary.Attention.Kind,
+			Count: summary.Attention.Count,
+			Since: summary.Attention.Since,
+		}
+	}
+}
+
+func sortLoopRunList(runs []contract.LoopRunPayload) {
+	slices.SortStableFunc(runs, func(a, b contract.LoopRunPayload) int {
+		return cmp.Or(
+			cmp.Compare(loopRunListRank(&a), loopRunListRank(&b)),
+			b.CreatedAt.Compare(a.CreatedAt),
+			strings.Compare(b.ID, a.ID),
+		)
+	})
+}
+
+func loopRunListRank(run *contract.LoopRunPayload) int {
+	if run.Attention != nil {
+		return 0
+	}
+	switch run.Status {
+	case contract.LoopRunStatusQueued, contract.LoopRunStatusRunning, contract.LoopRunStatusWatching,
+		contract.LoopRunStatusNeedsApproval, contract.LoopRunStatusPaused:
+		return 1
+	default:
+		return 2
+	}
+}
+
+func encodeLoopRunListCursor(
+	run *contract.LoopRunPayload,
+	workspaceID string,
+	query core.LoopRunListQuery,
+) (string, error) {
+	raw, err := json.Marshal(loopRunListCursor{
+		WorkspaceID:   strings.TrimSpace(workspaceID),
+		AllWorkspaces: query.AllWorkspaces,
+		WorkspaceIDs:  query.WorkspaceIDs,
+		ReadScope:     query.ReadScope,
+		Order:         query.Order,
+		LoopName:      strings.TrimSpace(query.LoopName),
+		Status:        strings.TrimSpace(query.Status),
+		Origin:        strings.TrimSpace(query.Origin),
+		OriginSession: strings.TrimSpace(query.OriginSession),
+		Live:          query.Live,
+		Rank:          loopRunListRank(run),
+		CreatedAt:     run.CreatedAt,
+		ID:            run.ID,
+	})
+	if err != nil {
+		return "", fmt.Errorf("encode Loop run list cursor: %w", err)
+	}
+	return base64.RawURLEncoding.EncodeToString(raw), nil
+}
+
+func decodeLoopRunListCursor(value string) (*loopRunListCursor, error) {
+	if strings.TrimSpace(value) == "" {
+		return nil, nil
+	}
+	raw, err := base64.RawURLEncoding.DecodeString(value)
+	if err != nil {
+		return nil, fmt.Errorf("%w: malformed Loop run list cursor", looppkg.ErrInvalidRunListCursor)
+	}
+	var cursor loopRunListCursor
+	if err := json.Unmarshal(raw, &cursor); err != nil || cursor.Rank < 0 || cursor.Rank > 2 ||
+		cursor.CreatedAt.IsZero() || strings.TrimSpace(cursor.ID) == "" {
+		return nil, fmt.Errorf("%w: malformed Loop run list cursor", looppkg.ErrInvalidRunListCursor)
+	}
+	return &cursor, nil
+}
+
+func (c loopRunListCursor) matches(workspaceID string, query core.LoopRunListQuery) bool {
+	return c.AllWorkspaces == query.AllWorkspaces && slices.Equal(c.WorkspaceIDs, query.WorkspaceIDs) &&
+		c.ReadScope == query.ReadScope &&
+		c.Order == query.Order &&
+		c.WorkspaceID == strings.TrimSpace(workspaceID) &&
+		c.LoopName == strings.TrimSpace(query.LoopName) &&
+		c.Status == strings.TrimSpace(query.Status) &&
+		c.Origin == strings.TrimSpace(query.Origin) &&
+		c.OriginSession == strings.TrimSpace(query.OriginSession) &&
+		equalOptionalBool(c.Live, query.Live)
+}
+
+func equalOptionalBool(left, right *bool) bool {
+	if left == nil || right == nil {
+		return left == nil && right == nil
+	}
+	return *left == *right
+}

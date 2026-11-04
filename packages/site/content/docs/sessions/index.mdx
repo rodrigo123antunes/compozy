@@ -1,0 +1,530 @@
+---
+title: Sessions
+description: The durable runtime unit CompozyOS creates, attaches, audits, and governs.
+---
+
+A session is the durable logical unit CompozyOS manages. Creation returns it `active` and unbound:
+it has a project or User scope, permission policy, event store, and attach record under one stable CompozyOS
+session ID, but no ACP process. The first prompt binds a provider runtime snapshot and starts ACP.
+
+Live session events are written to `events.db` while the session runs, and that store stays the
+durable record after the session stops. Read it with
+[`compozy session events`](/docs/cli/session/events) and
+[`compozy session history`](/docs/cli/session/history). The agent owns its own context window:
+CompozyOS never summarizes a session's history, and only a conversation rewind that you request
+archives events. [Context compaction](/docs/sessions/compaction) describes what it does observe and bound.
+
+Session-scoped Vault refs use `vault:sessions/<session_id>/<name>`. They are ordinary encrypted
+Vault records filtered by the session prefix, and the session inspector shows only redacted metadata
+for those refs.
+
+## Start without a project
+
+Run `compozy session new --user --agent general` to start in your profile's User scope.
+`--workspace @user` selects the same scope, including on native session tools. User sessions
+run in `[user_scope] work_dir` (your home directory by default) without registering a project.
+They support prompts, resume, fork, and child sessions. Worktrees are not available in User.
+
+HTTP and UDS clients can send `scope: "user"` to `POST /api/sessions`; omit workspace,
+path, CWD, and worktree fields. Session responses identify this scope with `scope: "user"`
+and an empty `workspace_id`. Read only User sessions with `workspace_id=@user`, using the
+selected profile; authorized operator reads may add `all_profiles=true` to include every profile.
+An omitted workspace filter does not select User.
+
+User sessions load user and profile configuration without project configuration. Access to
+registered projects follows the session's permission policy. The provider's own filesystem
+tools may reach beyond the work directory; the directory is not a filesystem sandbox.
+See [User scope](/docs/user-scope) for the full walkthrough.
+
+## Read diagrams in chat
+
+Completed Markdown fences labeled `mermaid` render as diagrams in session chat, using the current
+light or dark theme. **View source** opens the original Mermaid code, and the copy action copies
+that source. While the message streams, or if the diagram cannot be rendered, the source remains
+a readable, copyable code block. Text after the closing fence remains ordinary Markdown.
+
+Diagrams render with strict security and HTML labels disabled. They are isolated images rather
+than interactive SVG: diagram links and callbacks are not active. The renderer loads only when a
+completed Mermaid fence needs it; ordinary messages and streaming fences do not load Mermaid.
+
+## Attach files to prompts
+
+Upload a file with [`compozy session attachments upload <session-id> <file>`](/docs/cli/session/attachments/upload)
+`-o json`. The response returns an opaque `att_...` ID and attachment metadata. HTTP and UDS prompt
+requests send that returned metadata as a `PromptAttachmentRef` in `attachments`; the native
+`compozy__session_prompt` tool accepts the `att_...` ID or a file path under the resolved workspace
+root or configured `additional_dirs`. Attachment bytes remain in the workspace/session-scoped store
+and are opened only when the bound ACP agent advertises the negotiated capability for that attachment
+kind.
+
+The v1 store accepts PNG, JPEG, WebP, PDF, Markdown, and plain text. Each file is limited to 10 MiB
+and each prompt to 10 files by default. CompozyOS ignores client-supplied `Content-Type` and detects
+MIME from file bytes. For valid UTF-8 text, a `.md`, `.markdown`, or `.mdown` name selects Markdown;
+otherwise CompozyOS uses plain text. Image bytes are preserved as received, including EXIF metadata.
+Images require ACP image input and PDFs require embedded context. Markdown and plain text fall back to
+text blocks when embedded context is unavailable.
+
+Attachment metadata is durable in user-message events, so transcript and event reads can render the
+reference without embedding file contents. Archive and conversation clear keep files for the same
+session. [`compozy session remove`](/docs/cli/session/remove) removes that session's attachments, and
+[`compozy workspace remove`](/docs/cli/workspace/remove) removes the complete workspace attachment tree.
+Support bundles never include attachment bytes or paths.
+
+Use this section when a live run needs supervision or forensic detail: why it started, what state it
+entered, which events were persisted, whether it can be attached, and which permission checks apply while
+the agent works. If the problem is choosing an agent definition, use Agents first. If the problem is
+the daemon or database itself, use Operations after you identify the affected session.
+
+<OperatorNote>
+  Reach for this section when you need the operational contract around one live session: how it
+  starts, how a prompt binds its runtime, what gets stored, how replay works, and how approvals are
+  enforced while the agent runs.
+</OperatorNote>
+
+## Browse the session catalog
+
+`compozy session list -o json` returns a counted page owned by the daemon. Filter by workspace, exact
+agent, state, or session type; filter by resumability or a text query; choose `recent`,
+`last_activity`, or `manual` ordering; and add `--include-health` only when the caller needs the metadata-only
+health projection. For example, `--type user --state active --sort last_activity` returns active
+operator-created sessions ordered by their latest runtime activity. The response keeps rows under
+`sessions` and reports exact `total`, applied `limit`, `has_more`, and `next_cursor` values under
+`page`.
+
+Archived sessions are omitted by default. Use `--archived` to return only archived sessions, or
+`--include-archived` to return archived and unarchived sessions together. Archiving changes catalog
+visibility, not the runtime state, and preserves the complete session record.
+
+Sessions in Later are omitted by default too. Use `--later` to return only sessions in Later, or
+`--include-later` to include them.
+
+## Later
+
+Move a session to Later when you want to come back to it without archiving it. Later stops
+everything under the session: its active turn and runtime, its monitors, timers, and pending wakes,
+the processes and terminals it started, and its child sessions, which move to Later with it.
+History, transcript, attachments, and the worktree binding stay. Nothing is deleted.
+
+```bash
+compozy session later sess-123 --reason "revisit after the billing spec" --return-at 2026-11-03
+compozy session resume-later sess-123            # Back from Later, without starting it
+compozy session resume-later sess-123 --with-children
+compozy session list --later                     # what is in Later
+```
+
+- `--reason` is an optional note shown on the Later card. It is Markdown (bold, italic,
+  strikethrough, inline code, lists, and links) and may span several lines, up to 1,000
+  characters of Markdown source. Plain text is valid Markdown, so older one-line reasons read
+  unchanged. List rows and notifications show it as one plain line. In the web app, the Move to
+  Later dialog writes it with a formatting editor (Cmd/Ctrl+Enter confirms) and picks the return
+  date from a calendar with suggestions such as Tomorrow and Next Monday.
+- `--return-at` is optional. It takes an RFC 3339 time, a `YYYY-MM-DD` date (local midnight), or
+  a duration such as `72h`. At that time the session leaves Later, lands in **Needs you** as
+  "Back from Later", and you get a notification. The daemon checks return times when it starts, so
+  a return time that passes while it is down fires on the next start. A return time in the past
+  fires at once.
+- Sessions in Later leave the Kanban columns and the main list. In the web app they appear in the
+  Later view of the session list (the bookmark toggle next to Archive) and in the Later bar at the
+  bottom of the board, per project and in All projects.
+- Sending a prompt from the web app or the CLI to a session in Later brings it back and resumes it.
+  A message from another session is queued instead: the session stays in Later, its card shows the
+  pending messages, and the sender gets the `later` disposition. Queued messages are delivered
+  when you resume the session.
+- Back from Later returns the session to the normal flow, stopped. Its children stay in Later
+  unless you bring them back with `--with-children`.
+- Archiving a session in Later works and takes it out of Later.
+
+Agents use `compozy__session_later` and `compozy__session_resume_later`; HTTP clients use
+`POST /api/workspaces/{workspace_id}/sessions/{session_id}/later` and `.../resume-later`.
+
+## Mark as seen
+
+When you have looked at a session in **Needs you** and nothing more is needed, mark it as seen. In
+the web app, choose **Mark as seen** from the session row or Kanban card menu, or use the button in
+the session header.
+
+```bash
+compozy session mark-seen sess-123
+```
+
+- It clears a turn that ended early ("Stopped before delivering"), a return from Later, and the
+  failure of a stopped session. The session leaves Needs you, and that stays true after a reload
+  or a daemon restart.
+- It acknowledges one occurrence; it does not mute the session. The next early stop, the next
+  return from Later, or the next failure brings Needs you back.
+- A session waiting on a permission answer, a question, a sign-in, or a stop cannot be marked as
+  seen; answer or resolve it instead. Those sessions do not show the control, and the CLI, API,
+  and agents get the `attention_requires_action` error.
+- If a newer occurrence arrives while you mark the session, it stays in Needs you and the request
+  fails with `attention_changed` (agents get `tool_conflict`). Look at it and mark it again.
+- Marking a session as seen does not wake the session that created it.
+
+Agents use `compozy__session_mark_seen`; HTTP clients use
+`POST /api/workspaces/{workspace_id}/sessions/{session_id}/mark-seen`. Session payloads carry
+`attention_dismissible: true` while the current Needs you can be marked as seen.
+
+Use `--cursor` to continue with the same filters and sort. A cursor from another workspace or query
+is rejected instead of crossing catalog boundaries. See the generated
+[`compozy session list`](/docs/cli/session/list) reference for every flag.
+
+## Where a new session opens
+
+In the web shell, a new session reuses a Session window you already have instead of opening another
+one. This applies to every way of starting a session: the dock, **Session > New session**, the
+command palette and its shortcut, the **+** in a sessions list or folder, a Session window's sidebar,
+an agent page, the empty-desktop composer, and a prompt sent from the command palette.
+
+1. If the focused window is a Session window, the new session replaces the conversation in that
+   window and the window keeps focus.
+2. Otherwise CompozyOS picks a Session window on the current desktop: one showing the empty session
+   list first, then the one you used most recently. A minimized window is restored. The window keeps
+   its tab, split, and position.
+3. If the current desktop has no Session window, a new one opens.
+
+Pinned Session windows and windows on other desktops are never reused. The conversation that was on
+screen keeps running and keeps its unsent draft; pick it again from the window's sessions sidebar.
+A session that already has its own window focuses that window. When you fork or continue a session,
+choose **New window** to keep both conversations on screen side by side.
+
+## Resize the sessions sidebar
+
+Drag the edge between the sessions sidebar and the conversation to give long session titles more
+room. The sidebar stays between 200 and 480 pixels and never takes more than half of the window.
+From the keyboard, focus the edge with **Tab** and press **Left** or **Right**. Double-click the edge
+to return to the default width; dragging it past the narrowest width closes the sidebar. Each
+Session window remembers its own width across reloads.
+
+## Organize sessions into folders
+
+Group sessions into named folders and keep them in your own order. Folders and order belong to your
+profile inside one workspace, persist in the daemon, and appear in every open window and client.
+
+1. In the sessions sidebar, open the **+** menu and choose **New folder**, then name it.
+2. Right-click a session and choose **Move to folder**, or drag the session onto the folder header.
+3. Open **View options** (the sliders icon) and choose **Manual** under **Sort by**, then drag sessions to reorder them. From the keyboard,
+   open the row menu with **Shift+F10** and use **Move up** or **Move down**.
+
+Right-click a folder header to start a **New session in folder**, rename the folder, move it, or
+delete it. Deleting a folder moves its sessions back to the list; no session is deleted.
+
+To file several sessions at once, select them (checkbox, or **⌘**/**Ctrl**-click), then either drag
+any selected row onto a folder or back onto the list, or open **…** in the selection bar and choose
+**Move to folder**. The submenu lists your folders, **No folder** when a selected session is filed,
+and **New folder…**, which names a new folder and moves the selection into it. The move is one
+change: either every selected session moves or none does, and a refused move keeps the selection so
+you can retry. Sessions already in the target stay where they are, and the moved sessions keep their
+on-screen order at the top of the target in **Manual** sort. Child sessions follow their parent, so
+a selected child moves only with its selected parent. A folder belongs to one project and profile,
+so a selection that spans both can't move until you narrow it to one.
+
+### Folders under All projects and All profiles
+
+Folders and Manual order live inside one project and profile. When the list shows several, use
+**Group by** in **View options**: every group that is one project and profile keeps its folders,
+Manual order, and drag. A project group under All profiles splits into one group per profile, and
+a profile group under All projects splits into one group per project. Each group header has its own
+**+** after the session count: **New session** or **New folder** in that group's project and
+profile. If the group spans profiles (or projects), **New folder** asks which one. You can select
+sessions across groups; Stop, Archive, and Delete act on each session in its own profile.
+
+The flat list under All projects or All profiles has no single owner for folders, so **New folder**
+stays disabled there with the reason, and **Manual** sort shows a note until you group the list.
+
+### Group projects into folders
+
+Under **All projects** with **Group by → Project**, folders can also hold whole projects. Choose
+**New folder** in the toolbar to add a root folder, then drag a project header onto it, or right-click
+the project header and choose **Move to folder**. Drag a project header between projects to reorder
+them, or onto the list below the folders (or choose **Move out of folder**) to take it out. Drag a
+folder header to reorder folders. A project folder holds projects only and is one level deep; a
+project's own **+** still starts sessions in that project, and a folder can never go inside a
+project. Deleting a project folder moves its projects back to the list; no project or session is
+touched. Project folders and project order belong to your profile, so under **All profiles**
+**New folder** stays disabled with the reason. Projects you never moved keep their name order after
+the ones you placed.
+
+Grouped by project, the list shows only projects with sessions in the current view, and a folder
+whose projects are all empty stays hidden with them. To see every registered project, open
+**Group by** and check **Show empty projects**; each window remembers the choice. An empty project
+reads `No sessions in <project> yet.` inside its group.
+
+```bash
+compozy workspace folder create "Clients" -o json
+# {"id":"wfold-…","name":"Clients","position":0,"workspace_count":0,…}
+compozy workspace move checkout-api --folder wfold-…
+compozy workspace reorder web-app checkout-api   # pin the root order
+compozy workspace folder list -o json             # {"folders":[…],"placements":[…]}
+```
+
+Agents with the `workspace_access: unrestricted` grant use `compozy__workspace_folder_list`,
+`compozy__workspace_folder_create`, `compozy__workspace_folder_rename`,
+`compozy__workspace_folder_delete`, `compozy__workspace_folder_reorder`, `compozy__workspace_move`, and
+`compozy__workspace_reorder`; `@user` names the User group.
+
+### Session totals
+
+A quiet line under the sessions list counts the sessions in the current scope (one project, All
+projects, or All profiles) that need you, are working, or are idle, for example
+`1 needs you · 3 working · 8 idle`. Only states with sessions appear. The counts cover the whole scope,
+not just the loaded rows, and update live; archived sessions are not counted.
+
+Which folders and threads are expanded is a view choice, not shared data. Each session window keeps
+its own sessions sidebar: whether it is open and which folders and threads are collapsed. A new
+window starts from the sidebar you used last, each window's sidebar survives a reload, and **⌘B**
+toggles the sidebar of the focused window.
+
+The same operations are available to agents and scripts:
+
+```bash
+compozy session folder create "Release" -o json
+# {"id":"sfold-…","name":"Release","position":0,"session_count":0,…}
+compozy session move sess_1234 --folder sfold-…
+compozy session reorder sess_b sess_a          # pin the root order
+compozy session list --sort manual -o json      # folders first, each row has folder_id
+```
+
+Native tools mirror the CLI: `compozy__session_folder_list`, `compozy__session_folder_create`,
+`compozy__session_folder_rename`, `compozy__session_folder_delete`, `compozy__session_folder_reorder`,
+`compozy__session_move`, and `compozy__session_reorder`. Subagent sessions always stay under their
+parent and cannot be moved on their own. Archived sessions keep their folder when unarchived.
+
+## Nest a session under another session
+
+A session started without a parent can become another session's child, so work an agent started
+on its own sits under the session it belongs to. In the sessions sidebar, drag a top-level session
+onto the middle of another session's row (anywhere on the row outside **Manual** sort); the row
+highlights when the drop is allowed. The confirmation offers **Undo**, and **Make top-level** in a
+nested session's row menu returns it later.
+
+The daemon checks every request. Both sessions must be user sessions in the same project and
+profile, neither can be archived, and the new parent can't be the session itself or one of its
+descendants. Subagents, spawned workers, and continued or forked sessions keep their lineage. Only
+the parent link changes: the session's children move with it, and its runtime, permissions, and
+spawn limits stay as they were.
+
+```bash
+compozy session reparent sess_child --parent sess_parent   # nest
+compozy session reparent sess_child --top-level            # undo
+```
+
+Agents use `compozy__session_reparent` with `parent_session_id` or `top_level: true`. A refused
+request returns HTTP 409 with a `session_reparent_*` error code naming the rule.
+
+## Take over a spawned session
+
+A session another agent spawned is a governed worker: it has a time limit, stops when its parent
+stops, and keeps the narrowed permissions its parent gave it. Its row menu offers fewer actions
+than your own sessions. When you want to keep working in it yourself, stop it if it is running, then
+choose **Take over session** in its row menu. It becomes a normal top-level session with
+**Rename**, **Continue with another agent**, **Fork**, folders, and the rest of the menu; its time
+limit, parent auto-stop, and permission narrowing end. Subagent sessions stay with their parent.
+
+```bash
+compozy session reparent sess_worker --top-level   # take over a stopped spawned worker
+```
+
+A spawned worker stopped because its parent stopped can also be resumed directly: send it a
+prompt, and it keeps running even though the parent is gone.
+
+## Move a session to another profile
+
+A session belongs to the profile it was created in, and that never changes. When a session was
+started in the wrong profile, **Move to profile** in its row menu copies it into another profile
+and archives the original. Pick the profile from the submenu, then confirm. The copy is a fork with
+the same agent, title, and conversation, owned by the target profile, so it runs with that
+profile's agents, credentials, and settings. The original stays archived in its own profile with
+its history, and its past token usage stays counted there.
+
+If the session has a worktree, the worktree moves too: the daemon removes the original's
+checkout, keeps the branch and every commit, and checks the branch out again in a new worktree
+owned by the target profile. The copy runs in that new worktree.
+
+The move is refused, with the reason in the dialog, when the session:
+
+- is running (stop it first)
+- has child sessions (make them top-level first)
+- is archived, nested under another session (make it top-level first), or is a subagent or spawned worker
+- has a worktree with uncommitted changes, a worktree another unarchived session still uses, a
+  detached checkout, or a worktree that belongs to a task run
+- changed worktrees while the move was starting (try again)
+
+If a step fails after the original was archived, the daemon undoes the move: it releases the new
+checkout, checks the branch out again for the original profile, unarchives the original, and
+binds it to that worktree. If that recovery cannot finish, the error says what is left; the
+session and the branch are never deleted, and the rollback is retried the next time you move the
+session or the daemon starts. If the daemon stops in the middle of a move, it settles the move when
+it starts again: a move whose copy was already created is completed, and any other is undone, so the
+original ends up unarchived and bound to a checkout of its branch.
+
+Archived sessions that shared the moved worktree keep their history but lose that checkout; bind
+them to another worktree after unarchiving them.
+
+```bash
+compozy session move-to-profile sess_1234 work -o json
+# {"session":{"id":"sess-…","profile_name":"work",…},"original":{"id":"sess_1234",…},
+#  "worktree_id":"wt_…","branch":"feat/…"}
+```
+
+Agents use `compozy__session_move_to_profile` with `session_id` and `target_profile`. An agent
+cannot move its own session, and writing to the target profile follows the same permission rules
+as any other cross-profile write. A refused request returns HTTP 409 with a
+`session_move_to_profile_*` error code naming the rule. `compozy session move` is a different
+command: it only places a session in a folder.
+
+## Copy a session's ID or title
+
+Open a row's **…** menu or right-click it and choose **Copy session ID** (the `sess-…` ID that
+the CLI and native tools take) or **Copy title**.
+
+## Find sessions that need attention
+
+Session badges come from one daemon-owned precedence order. `waiting-for-auth`,
+`waiting-for-input`, `failed`, and `needs-attention` mean the session needs you. A stop verification failure remains nonterminal with `attention: "stop_verification_failed"` until a verified retry succeeds. `done` means a turn settled while no
+operator client was visibly focused on the session, and the result has not been seen yet. Starting a
+new turn or entering a terminal lifecycle state outranks `done`; reading a session through the CLI or
+API never clears it.
+`waiting` means the turn is over but the session still waits on work it started: child sessions,
+an awaited reply, a Loop run, or a task lease (`waiting_on: "sessions"`), otherwise a
+[monitor](/docs/sessions/monitors) (`waiting_on: "monitor"`). It never raises a finished toast;
+`done` follows once the last of that work closes. The [sessions board](/docs/sessions/board) groups
+every badge into Needs you, Working, In review, and Done.
+
+A child session (one created with a parent) that ends a turn on its own with no linked pull
+request and nothing left running to resume it (no monitor, child session, awaited reply, Loop run,
+task lease, or pending question) is not `done`: it reads `needs-attention` with
+`attention: "ended_early"`, and the web app says "Stopped before delivering". Its parent receives
+one wake with the child's final answer, even when the parent opted out of completion wakes. The mark
+survives runtime release and daemon restarts, and the child's next prompt clears it. Subagents and
+top-level sessions are never marked. A pull request opened during the turn, including on a branch
+the turn just created, counts as delivery. When the pull request lookup fails for a transient
+reason, such as a forge timeout, the turn is not marked; a repository without a supported remote is
+treated as having no pull request.
+
+Use `compozy session list --attention` for sessions that need you, or `--badge done` for finished
+sessions with unseen results. `--all-workspaces` removes the workspace filter, while `--summary`
+returns exact needs-you and finished totals for every workspace. Attention results use
+`attention_changed_at` for stable newest-first ordering. The generated
+[`compozy session list`](/docs/cli/session/list) and [Sessions API](/docs/api/sessions) references own
+the exact flags, paths, and response schemas.
+
+Questions and permission requests are durable interaction records. List the actionable projection
+with [`compozy session interactions <session-id>`](/docs/cli/session/interactions) or
+`GET /api/workspaces/{workspace_id}/sessions/{session_id}/interactions`. Titles, choices, and
+resolutions are redacted and bounded before they reach a response. Pending records survive daemon
+restart; a request whose provider turn no longer exists is returned as orphaned and keeps the same
+interaction ID for explicit resolution.
+
+Resolution outcomes distinguish the live and restart paths. A live permission decision reports
+`applied`, and a live clarification answer reports `answered`. Resolving an orphaned request reports
+`resolved-after-restart`; a repeat returns `already-resolved` with the original winning decision or
+answer. `queue-full` leaves the interaction pending and is safe to retry. Structured session status
+returns the canonical badge and the same bounded interaction projection.
+
+Visible operator clients keep a per-client lease through
+`POST /api/workspaces/{workspace_id}/sessions/{session_id}/presence`. A live lease makes a settling
+turn seen, so it remains `idle` instead of becoming `done`. Each client renews and releases only its
+own opaque `lease_id`; abandoned leases expire after 15 seconds. Presence and attention summaries are
+operator surfaces and reject agent identity with `403 agent_scope_denied`. Cross-workspace catalog
+reads follow the agent's [permission mode](/docs/sessions/permissions#cross-workspace-access) or
+unrestricted grant, and are otherwise refused with `403 agent_scope_denied`. Interaction discovery accepts a validated agent identity only for that
+agent's workspace.
+
+Browser clients can subscribe once to
+`GET /api/sessions/catalog-stream?all_workspaces=true`, or use `workspace_id=<id>` for one
+workspace. Exactly one scope is required. The server applies the same scope to replayed and live
+events, so a workspace subscriber cannot receive another workspace's session. Each
+`session_catalog_changed` event identifies an `upserted` or `deleted` session and includes its
+authoritative `workspace_id`. The event is a wake signal, not a row delta: reconcile the counted
+catalog page after every event. `Last-Event-ID` resumes from a non-negative stream sequence within
+the selected scope.
+
+The catalog route also accepts a WebSocket upgrade. Each text message contains one complete SSE
+frame with the same event name, JSON data, and event id. Browser clients use this transport for the
+session catalog, `/api/worktrees/catalog-stream`, `/api/logs/stream`, `/api/provider-usage/stream`,
+`/api/terminals/catalog-stream`, and `/api/workspaces/{workspace_id}/terminals/stream` so multiple
+tabs leave HTTP/1.1 connections available for navigation and commands. The original SSE routes
+remain available.
+Use `last_event_id=<id>` on an upgrade to resume; `Last-Event-ID` takes precedence when present.
+Session catalog ids are sequences; log and terminal catalog ids are the complete values from their
+frames.
+Keep the same filters and profile/workspace scope when reconnecting, and obtain a fresh single-use
+stream ticket for every upgrade through a remote gateway. Worktree catalog reconnects require a
+catalog refetch because those wake events have no retained cursor.
+
+The same stream emits `session_attention_changed` after a committed badge edge. Its payload carries
+the old and new badge, the new attention class, `workspace_id`, and the canonical transition time.
+Extensions can observe the matching async-only `session.attention.changed` hook; observer failure
+does not roll back session state.
+
+The reading order follows the lifecycle. Start with lifecycle for state names and stop
+classification, move to events when you need the durable record, then use resume attach and
+permissions for the two most common operator questions: "can I re-enter this live session?" and
+"why did CompozyOS ask before acting?"
+
+## In this section
+
+<RouteList>
+  <RouteRow
+    href="/docs/sessions/lifecycle"
+    label="Lifecycle"
+    title="Create, activate, stop, and classify sessions"
+    description="Use this page for the state machine, stop behavior, timeout boundaries, and what CompozyOS persists across the session lifetime."
+    meta="State model"
+  />
+  <RouteRow
+    href="/docs/sessions/mentions"
+    label="Mentions"
+    title="Mention files, folders, and sessions"
+    description="Use this page to type @ in the composer, pick a file, folder, or session, send the same tokens from the CLI or another agent, and check what the agent received."
+    meta="Prompting"
+  />
+  <RouteRow
+    href="/docs/sessions/subagents"
+    label="Subagents"
+    title="Delegate one task to another agent, provider, or model"
+    description="Use this page to let an agent hand off a task, watch the subagent card, read its answer, and inspect or cancel subagents from the terminal."
+    meta="Delegation"
+  />
+  <RouteRow
+    href="/docs/sessions/health"
+    label="Health"
+    title="Session presence, attachability, and wake eligibility"
+    description="Use this page for metadata-only health, the authority boundary against task-run leases and HEARTBEAT.md, and the session health/status/inspect CLI/API surfaces."
+    meta="Liveness"
+  />
+  <RouteRow
+    href="/docs/sessions/resume"
+    label="Resume"
+    title="Attach to live sessions and replay stored work"
+    description="Use this page to understand explicit resume attach, deterministic recap, transcript markers, and replay reconstruction."
+    meta="Recovery"
+  />
+  <RouteRow
+    href="/docs/sessions/compaction"
+    label="Compaction"
+    title="Bounded rebuilds and the agent's own context compaction"
+    description="Use this page to understand how rebuilt sessions replay a bounded transcript, how CompozyOS observes native agent compaction, and how to request Compact now."
+    meta="Context"
+  />
+  <RouteRow
+    href="/docs/sessions/events"
+    label="Events"
+    title="Query, stream, and persist session events"
+    description="Use this page for the event catalog, SSE behavior, SQLite storage, and the difference between persisted streams and prompt streams."
+    meta="Observability"
+  />
+  <RouteRow
+    href="/docs/sessions/permissions"
+    label="Permissions"
+    title="Static modes, workspace boundaries, and approval flow"
+    description="Use this page to understand what `deny-all`, `approve-reads`, and `approve-all` actually permit and how interactive approvals work."
+    meta="Governance"
+  />
+  <RouteRow
+    href="/docs/configuration/vault"
+    label="Vault"
+    title="Session-scoped secret metadata"
+    description="Use this page when a session needs write-only encrypted refs such as `vault:sessions/<session_id>/<name>`."
+    meta="Secrets"
+  />
+</RouteList>

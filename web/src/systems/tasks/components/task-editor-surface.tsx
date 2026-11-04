@@ -1,0 +1,234 @@
+"use client";
+
+import { Check } from "@compozy/ui/icons";
+import { useState, type ReactNode } from "react";
+
+import {
+  EntityDialogBody,
+  EntityDialogFooter,
+  EntityModeToolbar,
+  FormSection,
+  type EntityMode,
+} from "@compozy/ui";
+
+import type { TaskEditorDraft } from "../lib/task-editor";
+import { SIMPLE_TASK_TEMPLATE_IDS, type TaskTemplateId } from "../lib/task-templates";
+import { ContractSection } from "./task-form/contract-section";
+import { ExecutionCollapsible } from "./task-form/execution-collapsible";
+import { IngressIdentitySection } from "./task-form/ingress-identity-section";
+import { PlacementSection } from "./task-form/placement-section";
+import { PrioritySection } from "./task-form/priority-section";
+import { QueueOwnershipSection } from "./task-form/queue-ownership-section";
+import { TemplateCards } from "./task-form/template-cards";
+import { useTasksCreateModalForm } from "./use-tasks-create-modal-form";
+import {
+  CreateDestinationStatement,
+  destinationLabel,
+  type WorkspaceCommandSelectOption,
+} from "@/systems/workspace";
+
+export type TaskEditorSurfaceMode = "new" | "edit";
+
+export interface TaskEditorSurfaceProps {
+  /** The profile a creation lands in while the aggregate is on (ADR-005). */
+  profileDestination?: string | null;
+  mode: TaskEditorSurfaceMode;
+  /**
+   * Dialog chrome supplied by the modal host. `EntityDialogHeader` renders
+   * `DialogTitle`, so it can only be mounted inside a `Dialog`; the host owns it
+   * and hands it down as a slot.
+   */
+  header: ReactNode;
+  draft: TaskEditorDraft;
+  onDraftChange: (next: TaskEditorDraft | ((current: TaskEditorDraft) => TaskEditorDraft)) => void;
+  onSubmit: (draft: TaskEditorDraft, asDraft: boolean) => Promise<unknown> | void;
+  onCancel: () => void;
+  canSubmit?: boolean;
+  isSubmitting?: boolean;
+  workspaces?: ReadonlyArray<WorkspaceCommandSelectOption>;
+  templateId?: TaskTemplateId;
+  onTemplateChange?: (templateId: TaskTemplateId) => void;
+}
+
+function resolveSubmitLabel(mode: TaskEditorSurfaceMode, saveAsDraft: boolean): string {
+  if (mode === "edit") return "Save changes";
+  return saveAsDraft ? "Save draft" : "Enqueue task";
+}
+
+export function TaskEditorSurface({
+  profileDestination,
+  mode,
+  header,
+  draft,
+  onDraftChange,
+  onSubmit,
+  onCancel,
+  canSubmit = true,
+  isSubmitting = false,
+  workspaces,
+  templateId,
+  onTemplateChange,
+}: TaskEditorSurfaceProps) {
+  const form = useTasksCreateModalForm({ draft, onDraftChange, onSubmit });
+  const isNewMode = mode === "new";
+  const [formMode, setFormMode] = useState<EntityMode>(() =>
+    isNewMode && templateId && !SIMPLE_TASK_TEMPLATE_IDS.includes(templateId)
+      ? "advanced"
+      : "simple"
+  );
+
+  const setField = (field: keyof TaskEditorDraft) => (value: string) =>
+    onDraftChange(current => ({ ...current, [field]: value }));
+
+  const handleModeChange = (nextMode: EntityMode) => {
+    setFormMode(nextMode);
+    if (
+      nextMode === "simple" &&
+      templateId &&
+      !SIMPLE_TASK_TEMPLATE_IDS.includes(templateId) &&
+      onTemplateChange
+    ) {
+      onTemplateChange("one_shot");
+    }
+  };
+
+  const advanced = isNewMode && formMode === "advanced";
+  const submitLabel = resolveSubmitLabel(mode, draft.saveAsDraft);
+
+  const destinationKind = draft.scope === "workspace" ? "project" : "user";
+  const destination = destinationLabel(
+    destinationKind,
+    workspaces?.find(workspace => workspace.id === draft.workspaceId)?.name
+  );
+  const scopeStatement = (
+    <CreateDestinationStatement
+      profileDestination={profileDestination}
+      destination={destination}
+      kind={isNewMode ? "create" : "edit"}
+      scope={destinationKind}
+      variant="note"
+    />
+  );
+
+  return (
+    <section
+      className="flex min-h-0 flex-1 flex-col text-fg"
+      data-mode={mode}
+      data-testid="task-editor-surface"
+    >
+      {header}
+      <form
+        className="flex min-h-0 flex-1 flex-col"
+        data-testid="task-editor-modal-form"
+        onSubmit={form.submitForm}
+      >
+        {isNewMode ? (
+          <EntityModeToolbar mode={formMode} onModeChange={handleModeChange} testIdPrefix="task" />
+        ) : null}
+
+        <EntityDialogBody data-testid="task-editor-modal-body">
+          <FormSection help="The title and details the agent will read." title="What needs doing">
+            <ContractSection
+              description={draft.description}
+              onDescription={setField("description")}
+              onTitle={setField("title")}
+              title={draft.title}
+            />
+          </FormSection>
+
+          {isNewMode && templateId && onTemplateChange ? (
+            <FormSection
+              help={
+                advanced
+                  ? "Fills in the fields below — tweak any of them."
+                  : "Pick the closest fit — you can change details after."
+              }
+              title={advanced ? "Template" : "How should it run?"}
+            >
+              <TemplateCards mode={formMode} onSelect={onTemplateChange} templateId={templateId} />
+            </FormSection>
+          ) : null}
+
+          <FormSection help="Higher priority starts sooner." title="Priority">
+            <PrioritySection onPriority={form.updatePriority} priority={draft.priority} />
+          </FormSection>
+
+          {advanced ? (
+            <>
+              <FormSection help="Where it sits in the task hierarchy." title="Placement">
+                <PlacementSection
+                  onParentTaskId={setField("parentTaskId")}
+                  parentTaskId={draft.parentTaskId}
+                />
+              </FormSection>
+              <FormSection help="Who works on it, and how retries behave." title="Who works on it">
+                <QueueOwnershipSection
+                  approvalPolicy={draft.approvalPolicy}
+                  maxAttempts={draft.maxAttempts}
+                  onApprovalPolicy={form.updateApprovalPolicy}
+                  onMaxAttempts={form.updateMaxAttempts}
+                  onOwnerKind={form.updateOwnerKind}
+                  onOwnerRef={setField("ownerRef")}
+                  ownerKind={draft.ownerKind}
+                  ownerRef={draft.ownerRef}
+                />
+              </FormSection>
+              <FormSection
+                help="Leave it empty and CompozyOS picks one."
+                title="Custom ID (optional)"
+              >
+                <IngressIdentitySection
+                  identifier={draft.identifier}
+                  onIdentifier={setField("identifier")}
+                />
+              </FormSection>
+              <ExecutionCollapsible
+                autoEnqueueOnReady={draft.autoEnqueueOnReady}
+                onAutoEnqueue={form.updateAutoEnqueue}
+                onSaveAsDraft={form.updateSaveAsDraft}
+                saveAsDraft={draft.saveAsDraft}
+              />
+            </>
+          ) : null}
+
+          {!isNewMode ? (
+            <FormSection help="Who works on it, and how retries behave." title="Who works on it">
+              <QueueOwnershipSection
+                approvalPolicy={draft.approvalPolicy}
+                maxAttempts={draft.maxAttempts}
+                onApprovalPolicy={form.updateApprovalPolicy}
+                onMaxAttempts={form.updateMaxAttempts}
+                onOwnerKind={form.updateOwnerKind}
+                onOwnerRef={setField("ownerRef")}
+                ownerKind={draft.ownerKind}
+                ownerRef={draft.ownerRef}
+              />
+            </FormSection>
+          ) : null}
+        </EntityDialogBody>
+
+        <EntityDialogFooter
+          cancelTestId="task-editor-modal-cancel"
+          hint={
+            draft.saveAsDraft ? (
+              <>
+                Saved as a <b className="font-medium text-muted-foreground">draft</b>. Nothing runs
+                until you start it. {scopeStatement}
+              </>
+            ) : (
+              scopeStatement
+            )
+          }
+          hintTestId="task-editor-modal-hint"
+          isSaving={isSubmitting}
+          onCancel={onCancel}
+          primaryDisabled={!canSubmit}
+          primaryIcon={mode === "new" ? Check : undefined}
+          primaryLabel={submitLabel}
+          primaryTestId="task-editor-modal-submit"
+          primaryType="submit"
+        />
+      </form>
+    </section>
+  );
+}

@@ -1,0 +1,158 @@
+package session
+
+import (
+	"context"
+
+	"errors"
+	"fmt"
+
+	"strings"
+
+	"github.com/compozy/compozy/internal/acp"
+	"github.com/compozy/compozy/internal/store"
+)
+
+type promptSubmissionPath string
+
+const (
+	promptSubmissionPathUserFacing promptSubmissionPath = "user_facing"
+	promptSubmissionPathSynthetic  promptSubmissionPath = "synthetic"
+	jsonReasonFieldReason                               = "reason"
+	maxMCPAuthReasonJSONDepth                           = 16
+)
+
+type promptPumpLoopState struct {
+	source              <-chan acp.AgentEvent
+	runtime             <-chan acp.AgentEvent
+	activity            *promptActivitySupervisor
+	turnEnded           bool
+	sourceProbeRequired bool
+	fileMutations       fileMutationVerifier
+	fileMutationMarked  bool
+}
+
+func (s *promptPumpLoopState) active() bool {
+	return s != nil && (s.source != nil || s.runtime != nil)
+}
+
+func (s *promptPumpLoopState) sourceClosedShouldReturn() bool {
+	if s == nil {
+		return true
+	}
+	s.source = nil
+	s.sourceProbeRequired = false
+	s.stopRuntime()
+	return s.runtime == nil || s.turnEnded
+}
+
+func (s *promptPumpLoopState) runtimeClosedShouldReturn() bool {
+	if s == nil {
+		return true
+	}
+	s.runtime = nil
+	s.sourceProbeRequired = false
+	return s.turnEnded || s.source == nil
+}
+
+func (s *promptPumpLoopState) turnEndedShouldReturn() bool {
+	if s == nil {
+		return true
+	}
+	s.turnEnded = true
+	s.sourceProbeRequired = false
+	s.stopRuntime()
+	return s.runtime == nil
+}
+
+func (s *promptPumpLoopState) stopRuntime() {
+	if s == nil || s.activity == nil || s.runtime == nil {
+		return
+	}
+	s.activity.stop()
+}
+
+func isPromptTerminalEvent(eventType string) bool {
+	return eventType == acp.EventTypeDone || eventType == acp.EventTypeError
+}
+
+func isFatalPromptFailureEvent(event acp.AgentEvent) bool {
+	if event.Type != acp.EventTypeError || event.Failure == nil {
+		return false
+	}
+	switch event.Failure.Kind {
+	case store.FailureProcess, store.FailureTransport:
+		return true
+	default:
+		return false
+	}
+}
+
+// Prompt sends one prompt turn to an active session and mirrors the runtime stream into storage and observers.
+func (m *Manager) Prompt(ctx context.Context, id string, msg string) (<-chan acp.AgentEvent, error) {
+	return m.PromptWithOpts(ctx, id, PromptOpts{
+		Message:    msg,
+		TurnSource: TurnSourceUser,
+	})
+}
+
+// PromptWithOpts sends one prompt turn with daemon-local provenance metadata.
+func (m *Manager) PromptWithOpts(ctx context.Context, id string, opts PromptOpts) (<-chan acp.AgentEvent, error) {
+	req, err := m.parsePromptRequest(ctx, id, opts)
+	if err != nil {
+		return nil, err
+	}
+	if err := m.checkNewWorkAdmission(ctx); err != nil {
+		return nil, err
+	}
+	if err := m.admitManagedInstancePrompt(ctx, req.target); err != nil {
+		return nil, err
+	}
+	if runID, ok := ctx.Value(instanceManagedRunKey{}).(string); ok && runID != "" {
+		req.commitDispatch = func(commitCtx context.Context) error {
+			return m.admitManagedInstancePrompt(WithManagedRun(commitCtx, runID), req.target)
+		}
+	}
+	// Daemon-local callers (automations, wakes, judges, extensions) are never human ingress, but their
+	// mentions still resolve against the target session like every other admission path.
+	if req.delivery != PromptDeliveryMaintenance {
+		m.prepareMentions(ctx, &req)
+	}
+
+	return m.submitPromptRequest(ctx, req)
+}
+
+// RequestPermission asks an active session's permission path for a tool-call decision.
+func (m *Manager) RequestPermission(
+	ctx context.Context,
+	id string,
+	req acp.RequestPermissionRequest,
+) (acp.RequestPermissionResponse, error) {
+	if ctx == nil {
+		return acp.RequestPermissionResponse{}, errors.New("session: permission context is required")
+	}
+
+	target := strings.TrimSpace(id)
+	if target == "" {
+		return acp.RequestPermissionResponse{}, errors.New("session: session id is required")
+	}
+
+	session, ok := m.Get(target)
+	if !ok {
+		meta, err := m.readMetaWithContext(ctx, target)
+		if err != nil {
+			return acp.RequestPermissionResponse{}, err
+		}
+		return acp.RequestPermissionResponse{}, fmt.Errorf("%w: %s (%s)", ErrSessionNotActive, target, meta.State)
+	}
+
+	response, err := session.RequestPermission(ctx, req)
+	if err != nil {
+		switch {
+		case errors.Is(err, ErrSessionNotActive):
+			return acp.RequestPermissionResponse{}, err
+		default:
+			return acp.RequestPermissionResponse{}, fmt.Errorf("session: request permission for %q: %w", target, err)
+		}
+	}
+	return response, nil
+}

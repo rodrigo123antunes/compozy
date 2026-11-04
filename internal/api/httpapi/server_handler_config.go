@@ -1,0 +1,107 @@
+package httpapi
+
+import (
+	"io/fs"
+
+	"github.com/gin-gonic/gin"
+)
+
+func (s *Server) handlerConfig(staticFS fs.FS) *handlerConfig {
+	config := s.handlerDependencies()
+	config.staticFS = staticFS
+	config.boundHost = s.host
+	config.httpPort = s.port
+	config.resourceAuth = append([]gin.HandlerFunc(nil), s.resourceAuth...)
+	return &config
+}
+
+func (s *Server) handlerDependencies() handlerConfig {
+	config := handlerConfig{
+		taskDesignations:      s.taskDesignations,
+		skillExposureStore:    s.skillExposureStore,
+		skillExposureEvents:   s.skillExposureEvents,
+		tasks:                 s.tasks,
+		observer:              s.observer,
+		schemaStreams:         s.schemaStreams,
+		resources:             s.resources,
+		windowManager:         s.windowManager,
+		terminal:              s.terminal,
+		automation:            s.automation,
+		loops:                 s.loops,
+		profiles:              s.profiles,
+		supportBundles:        s.supportBundles,
+		tools:                 s.tools,
+		toolArtifacts:         s.toolArtifacts,
+		sessionAttachments:    s.sessionAttachments,
+		sessionFiles:          s.sessionFiles,
+		toolsets:              s.toolsets,
+		toolApprovals:         s.toolApprovals,
+		approvalGrants:        s.approvalGrants,
+		approvalCoordinator:   s.approvalCoordinator,
+		cmdPalette:            s.cmdPalette,
+		clarify:               s.clarify,
+		settings:              s.settings,
+		settingsRestart:       s.settingsRestart,
+		settingsUpdate:        s.settingsUpdate,
+		vault:                 s.vault,
+		workspaces:            s.workspaces,
+		worktrees:             s.worktrees,
+		workspaceAccess:       s.workspaceAccess,
+		onboarding:            s.onboarding,
+		agentCatalog:          s.agentCatalog,
+		agentSync:             s.agentSync,
+		contextWindowResolver: s.contextWindowResolver,
+		modelCatalog:          s.modelCatalog,
+		providerUsage:         s.providerUsage,
+		marketplaceCatalog:    s.marketplaceCatalog,
+		agentContext:          s.agentContext,
+		coordinatorRole:       s.coordinatorRole,
+		roles:                 s.roles,
+		soulAuthoring:         s.soulAuthoring,
+		agentMemory:           s.agentMemory,
+		soulHistoryPurger:     s.soulHistoryPurger,
+		soulRefresher:         s.soulRefresher,
+		heartbeatAuthor:       s.heartbeatAuthor,
+		heartbeatPurger:       s.heartbeatPurger,
+		heartbeatStatus:       s.heartbeatStatus,
+		heartbeatWake:         s.heartbeatWake,
+		agentInstances:        s.agentInstances,
+		sessionHealth:         s.sessionHealth,
+		wakeEvents:            s.wakeEvents,
+		skillsRegistry:        s.skillsRegistry,
+		skillResources:        s.skillResources,
+		runtimeMemory:         s.runtimeMemory,
+		hostLoad:              s.hostLoad,
+		deadEntities:          s.deadEntities,
+		appTokens:             s.appTokens,
+		openAPI:               s.openAPI,
+		gateway:               s.gateway,
+		gatewayAdmission:      s.gatewayAdmission,
+		deviceAuth:            s.deviceAuth,
+		authLimiter:           s.authLimiter,
+		ingressLimiter:        s.ingressLimiter,
+		surfaceSet:            s.surfaceSet,
+		homePaths:             s.homePaths,
+		config:                s.config,
+		logger:                s.logger,
+		startedAt:             s.startedAt,
+		now:                   s.now,
+		pollInterval:          s.pollInterval,
+		agentLoader:           s.agentLoader,
+		extensions:            s.extensions,
+
+		onProviderAuthSuccess: s.onProviderAuthSuccess,
+		providerAuthVerdicts:  s.providerAuthVerdicts,
+	}
+	s.applySessionHandlerDependencies(&config)
+	return config
+}
+
+func (s *Server) applySessionHandlerDependencies(config *handlerConfig) {
+	config.sessions = s.sessions
+	config.drainController = s.drainController
+	config.subagents = s.subagents
+	config.sessionMonitors = s.sessionMonitors
+	config.sessionProcesses = s.sessionProcesses
+	config.sessionCatalog = s.sessionCatalog
+}

@@ -1,0 +1,93 @@
+import type { TaskDetailLocationController } from "./use-task-detail-location";
+import {
+  TaskDeleteAction,
+  TaskFanOutDialog,
+  TaskInspectDrawer,
+  TaskPauseDialog,
+  TaskSetupSheet,
+  useTaskWorktreePolicyControl,
+} from "@/systems/tasks";
+
+/** Window-scoped overlays for the task-detail location (dialogs, sheets, drawer). */
+export function TaskDetailOverlays({ controller }: { controller: TaskDetailLocationController }) {
+  const { page, operator, detail, record } = controller;
+  const worktreePolicy = useTaskWorktreePolicyControl({
+    taskId: record?.id ?? "",
+    workspaceId: detail?.task.workspace_id ?? undefined,
+    profile: page.profile,
+    hasActiveRun: Boolean(page.activeRun),
+    enabled: controller.setupOpen || controller.fanOutOpen,
+  });
+  if (!detail || !record) return null;
+
+  return (
+    <>
+      <TaskPauseDialog dialog={controller.pauseDialog} isPending={page.isPausePending} />
+      <TaskDeleteAction
+        cancelTestId="tasks-detail-delete-cancel"
+        confirmTestId="tasks-detail-delete-confirm"
+        dialogTestId="tasks-detail-delete-dialog"
+        hideTrigger
+        isPending={controller.deleteMutation.isPending}
+        onDelete={controller.handleDeleteTask}
+        onOpenChange={controller.setDeleteOpen}
+        open={controller.deleteOpen}
+        taskId={record.id}
+        taskTitle={record.title}
+        triggerTestId="tasks-detail-delete-trigger"
+      />
+      <TaskFanOutDialog
+        gitBacked={Boolean(worktreePolicy)}
+        isPending={page.isFanOutPending}
+        onFanOut={page.handleFanOutRuns}
+        onOpenChange={controller.setFanOutOpen}
+        open={controller.fanOutOpen}
+        taskId={record.id}
+        worktrees={worktreePolicy?.worktrees}
+      />
+      <TaskSetupSheet
+        activeRunId={page.activeRun?.id}
+        clearOpen={controller.setupClearOpen}
+        editor={controller.setupEditor}
+        hasActiveRun={Boolean(page.activeRun)}
+        isDeletePending={operator.isDeleteProfilePending}
+        isSetPending={operator.isSetProfilePending}
+        onClearOpenChange={controller.setSetupClearOpen}
+        onClearProfile={controller.handleClearSetup}
+        onOpenChange={controller.setSetupOpen}
+        open={controller.setupOpen}
+        profile={page.profile}
+        profileErrorMessage={page.profileError?.message ?? null}
+        profileLoading={page.profileLoading}
+        runtime={{
+          providers: controller.setupRuntime.providers,
+          models: controller.setupRuntime.models,
+          providersLoading: controller.setupRuntime.providersLoading,
+          catalogLoading: controller.setupRuntime.catalogLoading,
+          catalogRefreshing: controller.setupRuntime.catalogRefreshing,
+          errorMessage:
+            controller.setupRuntime.providersError ?? controller.setupRuntime.catalogError,
+          onRefreshCatalog: controller.setupRuntime.onRefreshCatalog,
+        }}
+        worktreePolicy={worktreePolicy}
+        worktreePolicyValid={worktreePolicy?.valid}
+      />
+      <TaskInspectDrawer
+        activeTab={controller.search.inspect ?? "diagnostics"}
+        detail={detail}
+        inspect={page.inspect}
+        inspectErrorMessage={page.inspectError?.message ?? null}
+        inspectLoading={page.inspectLoading}
+        onOpenChange={controller.setInspectOpen}
+        onTabChange={controller.setInspectTarget}
+        open={controller.inspectOpen}
+        stream={{
+          state: operator.streamState,
+          errorMessage: operator.streamErrorMessage,
+          seedSequence: operator.streamSeedSequence,
+          latestEventSeq: controller.latestEventSeq,
+        }}
+      />
+    </>
+  );
+}

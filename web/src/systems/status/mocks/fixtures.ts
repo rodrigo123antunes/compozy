@@ -1,0 +1,142 @@
+import type {
+  DaemonStatusPayload,
+  HealthPayload,
+  RuntimeIdentityPayload,
+  StatusPayload,
+} from "../types";
+
+export const daemonHealthFixture: HealthPayload = {
+  status: "ok",
+  uptime_seconds: 7_200,
+  active_sessions: 3,
+  active_agents: 5,
+  global_db_size_bytes: 1_048_576,
+  session_db_size_bytes: 786_432,
+  persistence: {
+    status: "ok",
+    global_db_size_bytes: 1_048_576,
+    session_db_size_bytes: 786_432,
+  },
+  retention: {
+    enabled: true,
+    retention_days: 7,
+    sweep_interval_seconds: 86_400,
+    last_sweep_status: "ok",
+    last_sweep_at: "2026-04-17T18:00:00Z",
+    last_cutoff_at: "2026-04-10T18:00:00Z",
+    deleted_event_summaries: 0,
+    deleted_token_stats: 0,
+    deleted_token_usage_daily: 0,
+    deleted_permission_log_rows: 0,
+  },
+  failures: {
+    status: "ok",
+    total: 0,
+  },
+  agent_probes: [
+    {
+      agent_name: "coder",
+      provider: "claude",
+      command: "claude --acp",
+      executable: "/usr/local/bin/claude",
+      status: "ok",
+      checked_at: "2026-04-17T18:00:00Z",
+      duration_ms: 12,
+    },
+  ],
+  version: "0.1.0-storybook",
+};
+
+export const daemonStatusFixture: DaemonStatusPayload = {
+  status: "running",
+  pid: 4242,
+  started_at: "2026-04-17T18:00:00Z",
+  socket: "/tmp/compozy.sock",
+  http_host: "127.0.0.1",
+  http_port: 2123,
+  user_home_dir: "/Users/pedro",
+  active_sessions: 3,
+  total_sessions: 11,
+  version: "0.1.0-storybook",
+  min_app_version: "0.1.0",
+  schema_streams: [
+    {
+      stream: "global",
+      version: 1,
+      applied_count: 1,
+      sum_digest: "sha256:global-schema",
+    },
+  ],
+};
+
+export const statusFixture: StatusPayload = {
+  schema_version: "2026-05-20",
+  generated_at: "2026-04-17T18:00:00Z",
+  daemon: daemonStatusFixture,
+  sessions: {
+    active: 3,
+    total: 11,
+    by_status: {
+      active: 3,
+      stopped: 8,
+    },
+  },
+  health: daemonHealthFixture,
+  automation: {
+    enabled: true,
+    jobs: {
+      total: 2,
+      enabled: 2,
+    },
+    triggers: {
+      total: 1,
+      enabled: 1,
+    },
+    scheduler_running: true,
+  },
+  tasks: {
+    status: "ok",
+    queue_depth_total: 0,
+    oldest_queue_age_ms: 0,
+    active_orphan_runs: 0,
+    forced_stops_since_start: 0,
+    recovery_since_start: {
+      requeued: 0,
+      marked_running: 0,
+      failed: 0,
+    },
+  },
+  subprocess_health: {
+    status: "ok",
+    monitored: 0,
+    healthy: 0,
+    unhealthy: 0,
+  },
+  skills: {
+    runtime_available: true,
+    discovered_count: 8,
+    disabled_count: 0,
+  },
+  config: {
+    status: "ok",
+    validated: true,
+    restart_required: false,
+    apply_state: "current",
+  },
+  log_tail: {
+    available: true,
+    status: "available",
+  },
+};
+
+export const runtimeIdentityFixture: RuntimeIdentityPayload = {
+  schema_version: statusFixture.schema_version,
+  daemon: {
+    pid: daemonStatusFixture.pid,
+    started_at: daemonStatusFixture.started_at,
+    http_host: daemonStatusFixture.http_host,
+    http_port: daemonStatusFixture.http_port,
+    user_home_dir: daemonStatusFixture.user_home_dir,
+    version: daemonStatusFixture.version ?? "",
+  },
+};

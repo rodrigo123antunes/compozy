@@ -1,0 +1,193 @@
+---
+title: Debug a failed or stuck session
+description: Diagnose CompozyOS sessions by checking daemon health, session status, event history, repair output, and stored runtime files.
+---
+
+This guide gets you from "the session is not behaving" to evidence you can act on. It starts with
+runtime health, then narrows to one session and its durable event trail.
+
+<OperatorNote label="Do not guess from one symptom">
+  A failed prompt, a stopped subprocess, an unhealthy daemon, and a stale resume target look similar
+  from the outside. Check the daemon, the session status, and the event history before changing
+  configuration or deleting anything.
+</OperatorNote>
+
+## 1. Confirm the daemon is reachable
+
+```bash
+compozy status
+```
+
+For machine-readable output:
+
+```bash
+compozy status -o json
+```
+
+What happened: CompozyOS checked the background daemon through the local runtime control path. If this
+fails, debug the daemon before debugging the session.
+
+Useful follow-up pages:
+
+- [Daemon Operations](/docs/operations/daemon)
+- [Troubleshooting](/docs/operations/troubleshooting)
+- [File Locations](/docs/configuration/file-locations)
+
+## 2. Preserve a support bundle before mutation
+
+When the daemon is reachable, create its bounded, redacted incident artifact before changing
+configuration, repairing a transcript, or removing a session:
+
+```bash
+compozy support bundle --yes --output /tmp/compozy-support-bundle.tar.gz
+```
+
+The bundle contains status, doctor diagnostics, provider metadata, redacted config, event summaries,
+and a bounded log tail. It excludes transcripts and per-session event databases. Keep the archive
+private; redaction does not replace secure handling.
+
+## 3. Check global runtime health
+
+```bash
+compozy doctor -o json
+```
+
+Look for unhealthy subsystems before focusing on the agent process. Event storage or daemon
+connectivity problems can make a session look broken even when the provider process is
+not the root cause.
+
+## 4. Inspect the session status
+
+```bash
+compozy session status sess_1234 -o json
+```
+
+Check:
+
+- session state
+- agent name and workspace
+- stop reason
+- attachability
+- failure kind and bounded summary
+- current prompt state
+- created and updated timestamps
+
+What happened: the daemon returned the current session record, not a reconstructed transcript. Use
+this to learn what CompozyOS thinks the session is doing right now.
+
+### When the provider is silent during startup
+
+ACP control requests, including `initialize`, `session/new`, `session/load`, and session option
+changes, have a 30-second deadline per request. If `session/new` times out, CompozyOS stops the owned
+process tree and makes one fresh-process attempt after confirming exit. Other startup failures and
+operator cancellation do not trigger that retry. Both attempts can take their full deadline, plus
+process cleanup time.
+
+If creation still fails, the session becomes `stopped` and the startup error identifies the ACP
+method and provider. `compozy session stop <id>` also cancels a pending startup and reaps its provider
+process tree. Prompt execution and interactive clarification use their existing lifetimes; the
+control deadline does not limit an agent's working turn.
+
+## 5. Read the durable event stream
+
+```bash
+compozy session events sess_1234
+```
+
+Follow live events when the session is still active:
+
+```bash
+compozy session events sess_1234 --follow
+```
+
+What happened: CompozyOS read the append-only session event database. This is the best evidence for
+prompt submission, permission requests, provider messages, tool calls, errors, and stop behavior.
+The CLI follow mode reads raw persisted events; browser live-tail clients use transcript SSE frames
+when they need assembled UI messages.
+
+## 6. Reconstruct the conversation history
+
+```bash
+compozy session history sess_1234
+```
+
+Use history when you need to understand the user-visible turn sequence. Use events when you need
+operational detail.
+
+## 7. Dry-run repair when the transcript is interrupted
+
+```bash
+compozy session repair sess_1234 --dry-run -o json
+```
+
+Repair can append events only when the session is `stopped`. Without `--force`, mutation is limited
+to stop reasons `agent_crashed` and `error`. If the dry run reports safe actions for an eligible
+session, apply them explicitly:
+
+```bash
+compozy session repair sess_1234 -o json
+```
+
+`--force` broadens mutation to other stopped-session reasons; it does not make an active session
+eligible and does not restart a terminal session. Repair is append-only transcript terminalization,
+not a substitute for daemon health checks.
+
+## 8. Attach or continue only after the state is understood
+
+```bash
+compozy session recap sess_1234
+```
+
+If status reports `active` and `attachable: true`, attach to that live session:
+
+```bash
+compozy session resume sess_1234
+```
+
+If a user session stopped after `process_exit`, use recap, history, events, and the crash bundle to
+decide what already happened. The original session remains readable, but a new prompt is rejected so
+CompozyOS does not retry ACP `session/load`. Create a child session with the original as provenance:
+
+```bash
+compozy session new --parent sess_1234 --agent <agent-name> --workspace <workspace>
+```
+
+CompozyOS does not automatically replay the interrupted prompt because its external effects may be
+indeterminate. The child leaves the original transcript and diagnostics intact; use recap to carry
+the relevant context forward.
+Read [Resume Attach and Replay](/docs/sessions/resume) before treating attach refusal as a
+data-loss problem.
+
+## Common symptoms
+
+| Symptom                                    | First check                                                     | Then read                                         |
+| ------------------------------------------ | --------------------------------------------------------------- | ------------------------------------------------- |
+| `compozy session prompt` hangs             | `compozy session events sess_1234 --follow`                     | [Event Streaming](/docs/sessions/events)          |
+| Prompt prints a partial answer, then fails | `compozy session status sess_1234 -o json` and the crash bundle | [Session Lifecycle](/docs/sessions/lifecycle)     |
+| Session is stopped unexpectedly            | `compozy session status sess_1234 -o json`                      | [Session Lifecycle](/docs/sessions/lifecycle)     |
+| Web UI is stale                            | `compozy status` and `compozy doctor`                           | [Web UI](/docs/getting-started/web-ui)            |
+| Attach is refused                          | `compozy session list --resumable` and `compozy session recap`  | [Resume Attach and Replay](/docs/sessions/resume) |
+| Agent cannot see project context           | `compozy workspace info <name>`                                 | [Workspace Resolver](/docs/workspaces/resolver)   |
+
+## Evidence to collect before filing a bug
+
+Create a support bundle first, then retain the exact session commands you used:
+
+```bash
+compozy support bundle --yes --output /tmp/compozy-support-bundle.tar.gz
+compozy session status sess_1234 -o json
+compozy session repair sess_1234 --dry-run -o json
+```
+
+Do not include raw secrets, provider API keys, OAuth tokens, or claim tokens in bug reports. CompozyOS
+redacts sensitive runtime fields in the bundle, but copied terminal context and session transcripts
+may still contain private project or prompt content.
+
+## Next steps
+
+- Use [Choose a control surface](/docs/guides/choose-an-operator-surface) when you need
+  the best surface for scripts, agents, or browser integrations.
+- Use [Database Operations](/docs/operations/database) when event or catalog storage is the
+  likely problem.
+- Use [Troubleshooting](/docs/operations/troubleshooting) for daemon, socket, agent, and
+  database failure paths.

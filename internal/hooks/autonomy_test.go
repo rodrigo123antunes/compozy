@@ -1,0 +1,656 @@
+package hooks
+
+import (
+	"context"
+	"errors"
+	"reflect"
+	"strings"
+	"testing"
+	"time"
+)
+
+func TestTaskRunPreClaimDenyAndNarrowCriteriaOnly(t *testing.T) {
+	t.Parallel()
+
+	t.Run("Should denies claim", func(t *testing.T) {
+		t.Parallel()
+
+		hooks := newTestHooks(
+			t,
+			WithNativeDeclarations([]HookDecl{{
+				Name:         "deny-claim",
+				Event:        HookTaskRunPreClaim,
+				Mode:         HookModeSync,
+				ExecutorKind: HookExecutorNative,
+			}}),
+			WithExecutorResolver(testExecutorResolver(map[string]Executor{
+				"deny-claim": NewTypedNativeExecutor(
+					func(
+						_ context.Context,
+						_ RegisteredHook,
+						_ TaskRunPreClaimPayload,
+					) (TaskRunPreClaimPatch, error) {
+						return TaskRunPreClaimPatch{
+							Deny:       true,
+							DenyReason: "capacity gate",
+						}, nil
+					},
+				),
+			})),
+		)
+		if err := hooks.Rebuild(t.Context()); err != nil {
+			t.Fatalf("Rebuild() error = %v", err)
+		}
+
+		result, err := hooks.DispatchTaskRunPreClaim(t.Context(), baseTaskRunPreClaimPayload())
+		if err == nil || !strings.Contains(err.Error(), string(HookTaskRunPreClaim)) {
+			t.Fatalf("DispatchTaskRunPreClaim() error = %v, want denial error", err)
+		}
+		if !result.Denied || result.DenyReason != "capacity gate" {
+			t.Fatalf("result denial = denied:%v reason:%q, want hook denial", result.Denied, result.DenyReason)
+		}
+	})
+
+	t.Run("Should narrows claim criteria", func(t *testing.T) {
+		t.Parallel()
+
+		priorityMin := 30
+		hooks := newTestHooks(
+			t,
+			WithNativeDeclarations([]HookDecl{{
+				Name:         "narrow-claim",
+				Event:        HookTaskRunPreClaim,
+				Mode:         HookModeSync,
+				ExecutorKind: HookExecutorNative,
+			}}),
+			WithExecutorResolver(testExecutorResolver(map[string]Executor{
+				"narrow-claim": NewTypedNativeExecutor(
+					func(
+						_ context.Context,
+						_ RegisteredHook,
+						_ TaskRunPreClaimPayload,
+					) (TaskRunPreClaimPatch, error) {
+						return TaskRunPreClaimPatch{
+							AddRequiredCapabilities: []string{"review", "gpu"},
+							PriorityMin:             &priorityMin,
+						}, nil
+					},
+				),
+			})),
+		)
+		if err := hooks.Rebuild(t.Context()); err != nil {
+			t.Fatalf("Rebuild() error = %v", err)
+		}
+
+		result, err := hooks.DispatchTaskRunPreClaim(t.Context(), baseTaskRunPreClaimPayload())
+		if err != nil {
+			t.Fatalf("DispatchTaskRunPreClaim() error = %v", err)
+		}
+		if got, want := result.Criteria.PriorityMin, priorityMin; got != want {
+			t.Fatalf("PriorityMin = %d, want %d", got, want)
+		}
+		wantCaps := []string{"code", "review", "gpu"}
+		if !reflect.DeepEqual(result.Criteria.RequiredCapabilities, wantCaps) {
+			t.Fatalf("RequiredCapabilities = %#v, want %#v", result.Criteria.RequiredCapabilities, wantCaps)
+		}
+	})
+
+	t.Run("Should rejects broadening criteria patch", func(t *testing.T) {
+		t.Parallel()
+
+		priorityMin := 10
+		hooks := newTestHooks(
+			t,
+			WithNativeDeclarations([]HookDecl{{
+				Name:         "broaden-claim",
+				Event:        HookTaskRunPreClaim,
+				Mode:         HookModeSync,
+				ExecutorKind: HookExecutorNative,
+			}}),
+			WithExecutorResolver(testExecutorResolver(map[string]Executor{
+				"broaden-claim": NewTypedNativeExecutor(
+					func(
+						_ context.Context,
+						_ RegisteredHook,
+						_ TaskRunPreClaimPayload,
+					) (TaskRunPreClaimPatch, error) {
+						return TaskRunPreClaimPatch{
+							AddRequiredCapabilities: []string{" "},
+							PriorityMin:             &priorityMin,
+						}, nil
+					},
+				),
+			})),
+		)
+		if err := hooks.Rebuild(t.Context()); err != nil {
+			t.Fatalf("Rebuild() error = %v", err)
+		}
+
+		original := baseTaskRunPreClaimPayload()
+		result, err := hooks.DispatchTaskRunPreClaim(t.Context(), original)
+		if err != nil {
+			t.Fatalf("DispatchTaskRunPreClaim() error = %v", err)
+		}
+		if !reflect.DeepEqual(result.Criteria, original.Criteria) {
+			t.Fatalf("result.Criteria = %#v, want unchanged %#v", result.Criteria, original.Criteria)
+		}
+	})
+}
+
+func TestLoopControlHooksDenyAndFailOpen(t *testing.T) {
+	t.Parallel()
+
+	t.Run("Should deny generation pre as failed", func(t *testing.T) {
+		t.Parallel()
+
+		hooks := newTestHooks(
+			t,
+			WithNativeDeclarations([]HookDecl{{
+				Name:         "deny-generation",
+				Event:        HookLoopGenerationPre,
+				Mode:         HookModeSync,
+				ExecutorKind: HookExecutorNative,
+			}}),
+			WithExecutorResolver(testExecutorResolver(map[string]Executor{
+				"deny-generation": NewTypedNativeExecutor(
+					func(
+						_ context.Context,
+						_ RegisteredHook,
+						_ LoopGenerationPrePayload,
+					) (LoopGenerationPrePatch, error) {
+						return LoopGenerationPrePatch{
+							Deny:       true,
+							DenyReason: "capacity gate",
+						}, nil
+					},
+				),
+			})),
+		)
+		if err := hooks.Rebuild(t.Context()); err != nil {
+			t.Fatalf("Rebuild() error = %v", err)
+		}
+
+		result, err := hooks.DispatchLoopGenerationPre(t.Context(), baseLoopGenerationPayload())
+		if err == nil || !strings.Contains(err.Error(), string(HookLoopGenerationPre)) {
+			t.Fatalf("DispatchLoopGenerationPre() error = %v, want denial error", err)
+		}
+		if !result.Denied || result.DenyReason != "capacity gate" {
+			t.Fatalf("result denial = denied:%v reason:%q, want generation denial", result.Denied, result.DenyReason)
+		}
+	})
+
+	t.Run("Should deny gate pre as blocked", func(t *testing.T) {
+		t.Parallel()
+
+		hooks := newTestHooks(
+			t,
+			WithNativeDeclarations([]HookDecl{{
+				Name:         "deny-gate",
+				Event:        HookLoopGatePre,
+				Mode:         HookModeSync,
+				ExecutorKind: HookExecutorNative,
+			}}),
+			WithExecutorResolver(testExecutorResolver(map[string]Executor{
+				"deny-gate": NewTypedNativeExecutor(
+					func(
+						_ context.Context,
+						_ RegisteredHook,
+						_ LoopGatePrePayload,
+					) (LoopGatePrePatch, error) {
+						return LoopGatePrePatch{
+							Deny:       true,
+							DenyReason: "policy",
+						}, nil
+					},
+				),
+			})),
+		)
+		if err := hooks.Rebuild(t.Context()); err != nil {
+			t.Fatalf("Rebuild() error = %v", err)
+		}
+
+		result, err := hooks.DispatchLoopGatePre(t.Context(), baseLoopGatePayload())
+		if err == nil || !strings.Contains(err.Error(), string(HookLoopGatePre)) {
+			t.Fatalf("DispatchLoopGatePre() error = %v, want denial error", err)
+		}
+		if !result.Denied || result.DenyReason != "policy" {
+			t.Fatalf("result denial = denied:%v reason:%q, want gate denial", result.Denied, result.DenyReason)
+		}
+	})
+
+	t.Run("Should fail open for non-required broken loop hook", func(t *testing.T) {
+		t.Parallel()
+
+		ran := false
+		hooks := newTestHooks(
+			t,
+			WithNativeDeclarations([]HookDecl{
+				{
+					Name:         "broken",
+					Event:        HookLoopGenerationPre,
+					Mode:         HookModeSync,
+					ExecutorKind: HookExecutorNative,
+					Priority:     10,
+					PrioritySet:  true,
+				},
+				{
+					Name:         "recorder",
+					Event:        HookLoopGenerationPre,
+					Mode:         HookModeSync,
+					ExecutorKind: HookExecutorNative,
+					Priority:     20,
+					PrioritySet:  true,
+				},
+			}),
+			WithExecutorResolver(testExecutorResolver(map[string]Executor{
+				"broken": NewTypedNativeExecutor(
+					func(
+						_ context.Context,
+						_ RegisteredHook,
+						_ LoopGenerationPrePayload,
+					) (LoopGenerationPrePatch, error) {
+						return LoopGenerationPrePatch{}, errors.New("hook failed")
+					},
+				),
+				"recorder": NewTypedNativeExecutor(
+					func(
+						_ context.Context,
+						_ RegisteredHook,
+						payload LoopGenerationPrePayload,
+					) (LoopGenerationPrePatch, error) {
+						if payload.LoopRunID == "loop-run-1" {
+							ran = true
+						}
+						return LoopGenerationPrePatch{}, nil
+					},
+				),
+			})),
+		)
+		if err := hooks.Rebuild(t.Context()); err != nil {
+			t.Fatalf("Rebuild() error = %v", err)
+		}
+
+		if _, err := hooks.DispatchLoopGenerationPre(t.Context(), baseLoopGenerationPayload()); err != nil {
+			t.Fatalf("DispatchLoopGenerationPre() error = %v, want fail-open nil", err)
+		}
+		if !ran {
+			t.Fatal("recorder hook did not run after broken non-required hook")
+		}
+	})
+}
+
+func TestLoopHooksExposeReadOnlyEvaluationFields(t *testing.T) {
+	t.Parallel()
+
+	t.Run("Should dispatch generation provenance and gate score fields", func(t *testing.T) {
+		t.Parallel()
+
+		bestGeneration := int64(2)
+		score := 0.91
+		var generationSeen LoopGenerationPrePayload
+		gateSeenCh := make(chan LoopGatePostPayload, 1)
+		hooks := newTestHooks(
+			t,
+			WithNativeDeclarations([]HookDecl{
+				{
+					Name:         "generation-observer",
+					Event:        HookLoopGenerationPre,
+					Mode:         HookModeSync,
+					ExecutorKind: HookExecutorNative,
+				},
+				{Name: "gate-observer", Event: HookLoopGatePost, Mode: HookModeAsync, ExecutorKind: HookExecutorNative},
+			}),
+			WithExecutorResolver(testExecutorResolver(map[string]Executor{
+				"generation-observer": NewTypedNativeExecutor(
+					func(
+						_ context.Context,
+						_ RegisteredHook,
+						payload LoopGenerationPrePayload,
+					) (LoopGenerationPrePatch, error) {
+						generationSeen = payload
+						return LoopGenerationPrePatch{}, nil
+					},
+				),
+				"gate-observer": NewTypedNativeExecutor(
+					func(
+						_ context.Context,
+						_ RegisteredHook,
+						payload LoopGatePostPayload,
+					) (LoopObservationPatch, error) {
+						gateSeenCh <- payload
+						return LoopObservationPatch{}, nil
+					},
+				),
+			})),
+		)
+		if err := hooks.Rebuild(t.Context()); err != nil {
+			t.Fatalf("Rebuild() error = %v", err)
+		}
+
+		generation := baseLoopGenerationPayload()
+		generation.Origin = "ratchet_restore"
+		generation.ParentGeneration = 2
+		if _, err := hooks.DispatchLoopGenerationPre(t.Context(), generation); err != nil {
+			t.Fatalf("DispatchLoopGenerationPre() error = %v", err)
+		}
+		gate := baseLoopGatePayload()
+		gate.Event = HookLoopGatePost
+		gate.Outcome = "rejected"
+		gate.Score = &score
+		gate.BestGeneration = &bestGeneration
+		if _, err := hooks.DispatchLoopGatePost(t.Context(), gate); err != nil {
+			t.Fatalf("DispatchLoopGatePost() error = %v", err)
+		}
+		var gateSeen LoopGatePostPayload
+		select {
+		case gateSeen = <-gateSeenCh:
+		case <-time.After(time.Second):
+			t.Fatal("timed out waiting for loop.gate.post observer")
+		}
+
+		if generationSeen.Origin != "ratchet_restore" || generationSeen.ParentGeneration != 2 {
+			t.Fatalf("generation hook payload = %#v, want ratchet provenance", generationSeen)
+		}
+		if gateSeen.Outcome != "rejected" || gateSeen.Score == nil || *gateSeen.Score != score ||
+			gateSeen.BestGeneration == nil || *gateSeen.BestGeneration != bestGeneration {
+			t.Fatalf("gate hook payload = %#v, want outcome/score/best", gateSeen)
+		}
+	})
+
+	t.Run("Should reject unknown verdict mutation fields in a pre-hook patch", func(t *testing.T) {
+		t.Parallel()
+
+		hooks := newTestHooks(
+			t,
+			WithNativeDeclarations([]HookDecl{{
+				Name:         "mutate-verdict",
+				Event:        HookLoopGenerationPre,
+				Mode:         HookModeSync,
+				Required:     true,
+				ExecutorKind: HookExecutorNative,
+			}}),
+			WithExecutorResolver(testExecutorResolver(map[string]Executor{
+				"mutate-verdict": NewNativeExecutor(
+					func(context.Context, RegisteredHook, []byte) ([]byte, error) {
+						return []byte(`{"outcome":"approved","score":1}`), nil
+					},
+				),
+			})),
+		)
+		if err := hooks.Rebuild(t.Context()); err != nil {
+			t.Fatalf("Rebuild() error = %v", err)
+		}
+
+		_, err := hooks.DispatchLoopGenerationPre(t.Context(), baseLoopGenerationPayload())
+		if err == nil || !strings.Contains(err.Error(), `unknown field "outcome"`) {
+			t.Fatalf("DispatchLoopGenerationPre(unknown verdict field) error = %v", err)
+		}
+	})
+}
+
+func TestSpawnPreCreatePatchRejectsPermissionWidening(t *testing.T) {
+	t.Parallel()
+
+	hooks := newTestHooks(
+		t,
+		WithNativeDeclarations([]HookDecl{{
+			Name:         "widen-spawn",
+			Event:        HookSpawnPreCreate,
+			Mode:         HookModeSync,
+			ExecutorKind: HookExecutorNative,
+		}}),
+		WithExecutorResolver(testExecutorResolver(map[string]Executor{
+			"widen-spawn": NewTypedNativeExecutor(
+				func(
+					_ context.Context,
+					_ RegisteredHook,
+					_ SpawnPreCreatePayload,
+				) (SpawnCreatePatch, error) {
+					return SpawnCreatePatch{
+						ChildPermissions: &PermissionSet{
+							Tools: []string{"read", "write"},
+						},
+					}, nil
+				},
+			),
+		})),
+	)
+	if err := hooks.Rebuild(t.Context()); err != nil {
+		t.Fatalf("Rebuild() error = %v", err)
+	}
+
+	original := baseSpawnPreCreatePayload()
+	result, err := hooks.DispatchSpawnPreCreate(t.Context(), original)
+	if err != nil {
+		t.Fatalf("DispatchSpawnPreCreate() error = %v", err)
+	}
+	if !reflect.DeepEqual(result.ChildPermissions, original.ChildPermissions) {
+		t.Fatalf("ChildPermissions = %#v, want unchanged %#v", result.ChildPermissions, original.ChildPermissions)
+	}
+}
+
+func TestSpawnPreCreateAllowsPermissionNarrowing(t *testing.T) {
+	t.Parallel()
+
+	ttlSeconds := int64(1800)
+	role := "reviewer"
+	hooks := newTestHooks(
+		t,
+		WithNativeDeclarations([]HookDecl{{
+			Name:         "narrow-spawn",
+			Event:        HookSpawnPreCreate,
+			Mode:         HookModeSync,
+			ExecutorKind: HookExecutorNative,
+		}}),
+		WithExecutorResolver(testExecutorResolver(map[string]Executor{
+			"narrow-spawn": NewTypedNativeExecutor(
+				func(
+					_ context.Context,
+					_ RegisteredHook,
+					_ SpawnPreCreatePayload,
+				) (SpawnCreatePatch, error) {
+					return SpawnCreatePatch{
+						SpawnRole:  &role,
+						TTLSeconds: &ttlSeconds,
+						ChildPermissions: &PermissionSet{
+							Tools: []string{"read"},
+						},
+					}, nil
+				},
+			),
+		})),
+	)
+	if err := hooks.Rebuild(t.Context()); err != nil {
+		t.Fatalf("Rebuild() error = %v", err)
+	}
+
+	result, err := hooks.DispatchSpawnPreCreate(t.Context(), baseSpawnPreCreatePayload())
+	if err != nil {
+		t.Fatalf("DispatchSpawnPreCreate() error = %v", err)
+	}
+	if got, want := result.SpawnRole, role; got != want {
+		t.Fatalf("SpawnRole = %q, want %q", got, want)
+	}
+	if got, want := result.TTLSeconds, ttlSeconds; got != want {
+		t.Fatalf("TTLSeconds = %d, want %d", got, want)
+	}
+	wantPermissions := PermissionSet{
+		Tools: []string{"read"},
+	}
+	if result.ChildPermissions == nil || !reflect.DeepEqual(*result.ChildPermissions, wantPermissions) {
+		t.Fatalf("ChildPermissions = %#v, want %#v", result.ChildPermissions, wantPermissions)
+	}
+}
+
+func TestAutonomyObservationDispatchMethodsNoop(t *testing.T) {
+	t.Parallel()
+
+	hooks := newTestHooks(t)
+	now := time.Now().UTC()
+	coordinator := CoordinatorLifecyclePayload{
+		Timestamp:            now,
+		WorkspaceID:          "ws-1",
+		CoordinatorSessionID: "coord-sess-1",
+	}
+	taskRunLease := TaskRunLeasePayload{
+		Timestamp:   now,
+		TaskID:      "task-1",
+		RunID:       "run-1",
+		WorkspaceID: "ws-1",
+	}
+	spawn := SpawnLifecyclePayload{
+		Timestamp:       now,
+		ParentSessionID: "parent-1",
+		ChildSessionID:  "child-1",
+		WorkspaceID:     "ws-1",
+	}
+
+	if _, err := hooks.DispatchCoordinatorSpawned(
+		t.Context(),
+		withCoordinatorEvent(coordinator, HookCoordinatorSpawned),
+	); err != nil {
+		t.Fatalf("DispatchCoordinatorSpawned() error = %v", err)
+	}
+	if _, err := hooks.DispatchCoordinatorDecision(
+		t.Context(),
+		withCoordinatorEvent(coordinator, HookCoordinatorDecision),
+	); err != nil {
+		t.Fatalf("DispatchCoordinatorDecision() error = %v", err)
+	}
+	if _, err := hooks.DispatchCoordinatorStopped(
+		t.Context(),
+		withCoordinatorEvent(coordinator, HookCoordinatorStopped),
+	); err != nil {
+		t.Fatalf("DispatchCoordinatorStopped() error = %v", err)
+	}
+	if _, err := hooks.DispatchCoordinatorFailed(
+		t.Context(),
+		withCoordinatorEvent(coordinator, HookCoordinatorFailed),
+	); err != nil {
+		t.Fatalf("DispatchCoordinatorFailed() error = %v", err)
+	}
+
+	if _, err := hooks.DispatchTaskRunPostClaim(t.Context(), TaskRunPostClaimPayload{
+		Event: HookTaskRunPostClaim, Timestamp: now,
+		TaskRunContext: taskRunLease.TaskRunContext,
+		ClaimedAt:      now,
+	}); err != nil {
+		t.Fatalf("DispatchTaskRunPostClaim() error = %v", err)
+	}
+	if _, err := hooks.DispatchTaskRunLeaseExtended(
+		t.Context(),
+		withTaskRunLeaseEvent(taskRunLease, HookTaskRunLeaseExtended),
+	); err != nil {
+		t.Fatalf("DispatchTaskRunLeaseExtended() error = %v", err)
+	}
+	if _, err := hooks.DispatchTaskRunLeaseExpired(
+		t.Context(),
+		withTaskRunLeaseEvent(taskRunLease, HookTaskRunLeaseExpired),
+	); err != nil {
+		t.Fatalf("DispatchTaskRunLeaseExpired() error = %v", err)
+	}
+	if _, err := hooks.DispatchTaskRunLeaseRecovered(
+		t.Context(),
+		withTaskRunLeaseEvent(taskRunLease, HookTaskRunLeaseRecovered),
+	); err != nil {
+		t.Fatalf("DispatchTaskRunLeaseRecovered() error = %v", err)
+	}
+	if _, err := hooks.DispatchTaskRunReleased(
+		t.Context(),
+		withTaskRunLeaseEvent(taskRunLease, HookTaskRunReleased),
+	); err != nil {
+		t.Fatalf("DispatchTaskRunReleased() error = %v", err)
+	}
+
+	if _, err := hooks.DispatchSpawnCreated(t.Context(), withSpawnEvent(spawn, HookSpawnCreated)); err != nil {
+		t.Fatalf("DispatchSpawnCreated() error = %v", err)
+	}
+	if _, err := hooks.DispatchSpawnParentStopped(
+		t.Context(),
+		withSpawnEvent(spawn, HookSpawnParentStopped),
+	); err != nil {
+		t.Fatalf("DispatchSpawnParentStopped() error = %v", err)
+	}
+	if _, err := hooks.DispatchSpawnTTLExpired(t.Context(), withSpawnEvent(spawn, HookSpawnTTLExpired)); err != nil {
+		t.Fatalf("DispatchSpawnTTLExpired() error = %v", err)
+	}
+	if _, err := hooks.DispatchSpawnReaped(t.Context(), withSpawnEvent(spawn, HookSpawnReaped)); err != nil {
+		t.Fatalf("DispatchSpawnReaped() error = %v", err)
+	}
+}
+
+func baseTaskRunPreClaimPayload() TaskRunPreClaimPayload {
+	return TaskRunPreClaimPayload{
+		Event: HookTaskRunPreClaim, Timestamp: time.Now().UTC(),
+		TaskRunContext: &TaskRunContext{
+			TaskID:      "task-1",
+			RunID:       "run-1",
+			WorkspaceID: "ws-1",
+		},
+		Criteria: TaskRunClaimCriteria{
+			WorkspaceID:          "ws-1",
+			RequiredCapabilities: []string{"code"},
+			PriorityMin:          20,
+		},
+	}
+}
+
+func baseLoopGenerationPayload() LoopGenerationPrePayload {
+	return LoopGenerationPrePayload{
+		Event: HookLoopGenerationPre, Timestamp: time.Now().UTC(),
+		LoopRunID:   "loop-run-1",
+		WorkspaceID: "ws-1",
+		LoopName:    "daily-review",
+		Generation:  1,
+		TaskID:      "task-1",
+		RunID:       "run-1",
+		Status:      "running",
+	}
+}
+
+func baseLoopGatePayload() LoopGatePrePayload {
+	return LoopGatePrePayload{
+		Event: HookLoopGatePre, Timestamp: time.Now().UTC(),
+		LoopRunID:   "loop-run-1",
+		WorkspaceID: "ws-1",
+		LoopName:    "daily-review",
+		Generation:  1,
+		TaskID:      "task-1",
+		RunID:       "run-1",
+		GateID:      "contract",
+		Status:      "done",
+	}
+}
+
+func baseSpawnPreCreatePayload() SpawnPreCreatePayload {
+	parentPermissions := PermissionSet{
+		Tools: []string{"read", "write"},
+	}
+	childPermissions := parentPermissions
+	return SpawnPreCreatePayload{
+		Event: HookSpawnPreCreate, Timestamp: time.Now().UTC(),
+		ParentSessionID:   "parent-1",
+		RootSessionID:     "root-1",
+		WorkspaceID:       "ws-1",
+		AgentName:         "worker",
+		SpawnRole:         "coder",
+		TTLSeconds:        3600,
+		ParentPermissions: &parentPermissions,
+		ChildPermissions:  &childPermissions,
+	}
+}
+
+func withCoordinatorEvent(payload CoordinatorLifecyclePayload, event HookEvent) CoordinatorLifecyclePayload {
+	payload.Event = event
+	return payload
+}
+
+func withTaskRunLeaseEvent(payload TaskRunLeasePayload, event HookEvent) TaskRunLeasePayload {
+	payload.Event = event
+	return payload
+}
+
+func withSpawnEvent(payload SpawnLifecyclePayload, event HookEvent) SpawnLifecyclePayload {
+	payload.Event = event
+	return payload
+}

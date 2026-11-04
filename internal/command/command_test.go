@@ -1,0 +1,421 @@
+package command_test
+
+import (
+	"errors"
+	"fmt"
+	"slices"
+	"strings"
+	"testing"
+	"unicode/utf16"
+
+	commandpkg "github.com/compozy/compozy/internal/command"
+)
+
+// Suite: session slash command domain
+// Invariant: one deterministic catalog controls discovery, parsing, and explicit skill bounds.
+// Boundary IN: pure command projection and authored-text grammar.
+// Boundary OUT: skill registry state, session persistence, transports, and UI rendering.
+
+func TestBuildCatalog(t *testing.T) {
+	t.Parallel()
+
+	t.Run("Should preserve exact agent tokens and daemon precedence", func(t *testing.T) {
+		t.Parallel()
+		catalog, err := commandpkg.BuildCatalog(commandpkg.DefaultBuiltins(), []commandpkg.AgentSpec{
+			{Name: "plugin:review"}, {Name: "plugin-review"}, {Name: "Review"}, {Name: "review"}, {Name: "goal"},
+		}, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var tokens []string
+		ids := make(map[string]bool)
+		for _, command := range catalog.Commands {
+			if ids[command.ID] {
+				t.Fatalf("duplicate id: %q", command.ID)
+			}
+			ids[command.ID] = true
+			if command.Lane == commandpkg.LaneAgent {
+				tokens = append(tokens, command.CanonicalToken)
+			}
+		}
+		if !slices.Equal(tokens, []string{"/Review", "/plugin-review", "/plugin:review", "/review"}) {
+			t.Fatalf("agent tokens = %#v", tokens)
+		}
+	})
+
+	t.Run("Should order available commands and reserve daemon names", func(t *testing.T) {
+		t.Parallel()
+		catalog, err := commandpkg.BuildCatalog(
+			commandpkg.DefaultBuiltins(),
+			[]commandpkg.AgentSpec{
+				{Name: "review", Description: "Agent review", SourceID: "codex"},
+				{Name: "goal", Description: "Must lose to the daemon"},
+				{Name: "run", Description: "Reserved and hidden"},
+			},
+			[]commandpkg.SkillSpec{
+				{
+					Name: "deploy", Description: "Deploy safely", Available: true,
+					Source: commandpkg.Source{Kind: "workspace", Scope: "workspace"},
+				},
+				{
+					Name: "inspect", Description: "Inspect extension", Available: true, Qualified: true,
+					Source: commandpkg.Source{Kind: "extension", ID: "ops", Scope: "workspace"},
+				},
+			},
+		)
+		if err != nil {
+			t.Fatalf("BuildCatalog() error = %v", err)
+		}
+		got := make([]string, 0, len(catalog.Commands))
+		for _, descriptor := range catalog.Commands {
+			got = append(got, descriptor.CanonicalToken)
+		}
+		want := []string{"/goal", "/worktree", "/review", "/deploy", "/ops:inspect"}
+		if strings.Join(got, ",") != strings.Join(want, ",") {
+			t.Fatalf("BuildCatalog() tokens = %#v, want %#v", got, want)
+		}
+		if catalog.Revision == "" {
+			t.Fatal("BuildCatalog() revision is empty")
+		}
+	})
+
+	t.Run("Should reject external sources that collapse to one token", func(t *testing.T) {
+		t.Parallel()
+		_, err := commandpkg.BuildCatalog(nil, nil, []commandpkg.SkillSpec{
+			{
+				Name: "review", Available: true, Qualified: true,
+				Source: commandpkg.Source{Kind: "extension", ID: "shared", Scope: "global"},
+			},
+			{
+				Name: "review", Available: true, Qualified: true,
+				Source: commandpkg.Source{Kind: "marketplace", ID: "shared", Scope: "global"},
+			},
+		})
+		if err == nil || !strings.Contains(err.Error(), "duplicate skill token") {
+			t.Fatalf("BuildCatalog() error = %v, want duplicate token", err)
+		}
+	})
+
+	t.Run("Should retain qualified fallbacks when bare names collide", func(t *testing.T) {
+		t.Parallel()
+		catalog, err := commandpkg.BuildCatalog(commandpkg.DefaultBuiltins(), nil, []commandpkg.SkillSpec{
+			{
+				Name: "goal", Available: true,
+				Source: commandpkg.Source{Kind: "user", ID: "agents", Key: "root_agents", Scope: "global"},
+			},
+			{
+				Name: "goal", Available: true, Qualified: true,
+				Source: commandpkg.Source{Kind: "user", ID: "agents", Key: "root_agents", Scope: "global"},
+			},
+			{
+				Name: "review", Available: true,
+				Source: commandpkg.Source{Kind: "workspace", ID: "claude", Key: "root_claude", Scope: "workspace"},
+			},
+			{
+				Name: "review", Available: true, Qualified: true,
+				Source: commandpkg.Source{Kind: "user", ID: "agents", Key: "root_agents", Scope: "global"},
+			},
+			{
+				Name: "review", Available: true, Qualified: true,
+				Source: commandpkg.Source{Kind: "workspace", ID: "claude", Key: "root_claude", Scope: "workspace"},
+			},
+		})
+		if err != nil {
+			t.Fatalf("BuildCatalog() error = %v", err)
+		}
+		tokens := make([]string, 0, len(catalog.Commands))
+		for _, descriptor := range catalog.Commands {
+			tokens = append(tokens, descriptor.CanonicalToken)
+		}
+		for _, want := range []string{"/goal", "/agents:goal", "/review", "/agents:review", "/claude:review"} {
+			if !slices.Contains(tokens, want) {
+				t.Fatalf("BuildCatalog() tokens = %#v, want qualified fallback %q", tokens, want)
+			}
+		}
+	})
+
+	t.Run("Should keep marketplace package identity outside the visible qualifier", func(t *testing.T) {
+		t.Parallel()
+		catalog, err := commandpkg.BuildCatalog(nil, nil, []commandpkg.SkillSpec{{
+			Name: "review", Available: true, Qualified: true,
+			Source: commandpkg.Source{
+				Kind: "marketplace", ID: "official", Key: "official:@compozy/review", Scope: "global",
+			},
+		}})
+		if err != nil {
+			t.Fatalf("BuildCatalog() error = %v", err)
+		}
+		if len(catalog.Commands) != 1 || catalog.Commands[0].CanonicalToken != "/official:review" {
+			t.Fatalf("BuildCatalog() commands = %#v, want one /official:review", catalog.Commands)
+		}
+		if !strings.Contains(catalog.Commands[0].ID, "skill:marketplace:official-") {
+			t.Fatalf("BuildCatalog() ID = %q, want package-qualified identity", catalog.Commands[0].ID)
+		}
+	})
+
+	t.Run("Should keep a disabled builtin visible with its refusal reason", func(t *testing.T) {
+		t.Parallel()
+		catalog, err := commandpkg.BuildCatalog(commandpkg.DefaultBuiltins(), nil, nil)
+		if err != nil {
+			t.Fatalf("BuildCatalog() error = %v", err)
+		}
+		originalRevision := catalog.Revision
+		catalog = commandpkg.SetBuiltinAvailability(
+			catalog,
+			"worktree",
+			false,
+			"Wait for the current turn to finish.",
+		)
+		var descriptor *commandpkg.Descriptor
+		for index := range catalog.Commands {
+			if catalog.Commands[index].CanonicalToken == "/worktree" {
+				descriptor = &catalog.Commands[index]
+				break
+			}
+		}
+		if descriptor == nil || descriptor.Available ||
+			descriptor.UnavailableReason != "Wait for the current turn to finish." {
+			t.Fatalf("disabled worktree descriptor = %#v", descriptor)
+		}
+		if catalog.Revision == originalRevision {
+			t.Fatal("disabled worktree catalog revision did not change")
+		}
+		if _, err := commandpkg.ParseSkillInvocations(
+			"/worktree",
+			catalog,
+		); !errors.Is(
+			err,
+			commandpkg.ErrUnavailable,
+		) {
+			t.Fatalf("ParseSkillInvocations(/worktree) error = %v, want ErrUnavailable", err)
+		}
+		catalog = commandpkg.SetBuiltinAvailability(catalog, "worktree", true, "stale reason")
+		for _, command := range catalog.Commands {
+			if command.CanonicalToken == "/worktree" && (!command.Available || command.UnavailableReason != "") {
+				t.Fatalf("re-enabled worktree descriptor = %#v, want available without refusal reason", command)
+			}
+		}
+	})
+}
+
+func TestParseSkillInvocations(t *testing.T) {
+	t.Parallel()
+	catalog, err := commandpkg.BuildCatalog(commandpkg.DefaultBuiltins(), nil, []commandpkg.SkillSpec{
+		{
+			Name: "review", Available: true,
+			Source: commandpkg.Source{Kind: "workspace", Scope: "workspace"},
+		},
+		{
+			Name: "deploy", Available: true, Qualified: true,
+			Source: commandpkg.Source{Kind: "extension", ID: "ops", Scope: "workspace"},
+		},
+	})
+	if err != nil {
+		t.Fatalf("BuildCatalog() error = %v", err)
+	}
+
+	t.Run("Should resolve multiple inline skills at whitespace boundaries once", func(t *testing.T) {
+		t.Parallel()
+		invocations, parseErr := commandpkg.ParseSkillInvocations(
+			"Please /review, then /ops:deploy and /review again.",
+			catalog,
+		)
+		if parseErr != nil {
+			t.Fatalf("ParseSkillInvocations() error = %v", parseErr)
+		}
+		if len(invocations) != 2 {
+			t.Fatalf("ParseSkillInvocations() count = %d, want 2", len(invocations))
+		}
+		if invocations[0].Token != "/review" || invocations[1].Token != "/ops:deploy" {
+			t.Fatalf("ParseSkillInvocations() tokens = %#v", invocations)
+		}
+	})
+
+	t.Run("Should resolve markers before sentence punctuation", func(t *testing.T) {
+		t.Parallel()
+		invocations, parseErr := commandpkg.ParseSkillInvocations(
+			"First /review. Then /ops:deploy: continue.",
+			catalog,
+		)
+		if parseErr != nil {
+			t.Fatalf("ParseSkillInvocations() error = %v", parseErr)
+		}
+		if len(invocations) != 2 || invocations[0].Token != "/review" ||
+			invocations[1].Token != "/ops:deploy" {
+			t.Fatalf("ParseSkillInvocations() = %#v, want both punctuated markers", invocations)
+		}
+	})
+
+	t.Run("Should expose browser-compatible offsets after astral Unicode", func(t *testing.T) {
+		t.Parallel()
+		invocations, parseErr := commandpkg.ParseSkillInvocations("🚀 /review now", catalog)
+		if parseErr != nil {
+			t.Fatalf("ParseSkillInvocations() error = %v", parseErr)
+		}
+		if len(invocations) != 1 || invocations[0].Start != 3 || invocations[0].End != 10 {
+			t.Fatalf("ParseSkillInvocations() = %#v, want UTF-16 offsets 3:10", invocations)
+		}
+	})
+
+	t.Run("Should preserve UTF-16 offsets across skipped and repeated markers", func(t *testing.T) {
+		t.Parallel()
+		text := "🚀 /unknown /review/file /review. /review ⚙️ \xff /ops:deploy!"
+		invocations, parseErr := commandpkg.ParseSkillInvocations(text, catalog)
+		if parseErr != nil {
+			t.Fatalf("ParseSkillInvocations() error = %v", parseErr)
+		}
+		if len(invocations) != 2 {
+			t.Fatalf("ParseSkillInvocations() count = %d, want 2", len(invocations))
+		}
+		for index, token := range []string{"/review", "/ops:deploy"} {
+			byteOffset := strings.Index(text, token+[]string{".", "!"}[index])
+			wantStart := len(utf16.Encode([]rune(text[:byteOffset])))
+			wantEnd := wantStart + len(utf16.Encode([]rune(token)))
+			got := invocations[index]
+			if got.Token != token || got.Start != wantStart || got.End != wantEnd {
+				t.Fatalf("invocation = %#v, want %q at %d:%d", got, token, wantStart, wantEnd)
+			}
+		}
+	})
+
+	t.Run("Should leave URLs paths in-word and unknown markers literal", func(t *testing.T) {
+		t.Parallel()
+		invocations, parseErr := commandpkg.ParseSkillInvocations(
+			"https://example.com/review ./review path/review /review/file /unknown",
+			catalog,
+		)
+		if parseErr != nil {
+			t.Fatalf("ParseSkillInvocations() error = %v", parseErr)
+		}
+		if len(invocations) != 0 {
+			t.Fatalf("ParseSkillInvocations() = %#v, want no invocations", invocations)
+		}
+	})
+
+	t.Run("Should reject a recognized reserved command", func(t *testing.T) {
+		t.Parallel()
+		_, parseErr := commandpkg.ParseSkillInvocations("/run now", catalog)
+		if !errors.Is(parseErr, commandpkg.ErrUnavailable) {
+			t.Fatalf("ParseSkillInvocations() error = %v, want ErrUnavailable", parseErr)
+		}
+	})
+
+	t.Run("Should prevent a hook from adding an unadmitted skill identity", func(t *testing.T) {
+		t.Parallel()
+		admitted, parseErr := commandpkg.ParseSkillInvocations("Use /review", catalog)
+		if parseErr != nil {
+			t.Fatalf("ParseSkillInvocations() error = %v", parseErr)
+		}
+		reconciled := commandpkg.ReconcileInvocations("Use /ops:deploy only", admitted)
+		if len(reconciled) != 0 {
+			t.Fatalf("ReconcileInvocations() = %#v, want no widened invocation", reconciled)
+		}
+	})
+
+	t.Run("Should preserve admitted authored offsets when a hook rewrites surrounding text", func(t *testing.T) {
+		t.Parallel()
+		admitted, parseErr := commandpkg.ParseSkillInvocations("Use /review here", catalog)
+		if parseErr != nil {
+			t.Fatalf("ParseSkillInvocations() error = %v", parseErr)
+		}
+		reconciled := commandpkg.ReconcileInvocations("Hook prefix: use /review here", admitted)
+		if len(reconciled) != 1 || reconciled[0].Start != admitted[0].Start ||
+			reconciled[0].End != admitted[0].End {
+			t.Fatalf("ReconcileInvocations() = %#v, want original authored offsets %#v", reconciled, admitted)
+		}
+	})
+}
+
+func TestBuildInvokedSkillsBlock(t *testing.T) {
+	t.Parallel()
+	ref := commandpkg.SkillRef{
+		CommandID: "skill:workspace::review",
+		Name:      "review",
+		Source:    commandpkg.Source{Kind: "workspace", Scope: "workspace"},
+	}
+
+	t.Run("Should render verified instructions with exact source scope", func(t *testing.T) {
+		t.Parallel()
+		block, err := commandpkg.BuildInvokedSkillsBlock([]commandpkg.InvokedSkill{
+			{Ref: ref, Content: "Review carefully."},
+		})
+		if err != nil {
+			t.Fatalf("BuildInvokedSkillsBlock() error = %v", err)
+		}
+		if !strings.Contains(block, `command-id="skill:workspace::review"`) ||
+			!strings.Contains(block, `scope="workspace"`) ||
+			!strings.Contains(block, `command_id="skill:workspace::review"`) ||
+			!strings.Contains(block, "Do not replace command_id with the skill name") ||
+			!strings.Contains(block, "Read only file paths explicitly named by this skill body") ||
+			!strings.Contains(block, "Review carefully.") {
+			t.Fatalf("BuildInvokedSkillsBlock() = %q, want source-bound resource loading and instructions", block)
+		}
+	})
+
+	t.Run("Should reject one skill above its explicit budget", func(t *testing.T) {
+		t.Parallel()
+		_, err := commandpkg.BuildInvokedSkillsBlock([]commandpkg.InvokedSkill{{
+			Ref: ref, Content: strings.Repeat("x", commandpkg.MaxSkillBytes+1),
+		}})
+		if !errors.Is(err, commandpkg.ErrSkillContextTooLarge) {
+			t.Fatalf("BuildInvokedSkillsBlock() error = %v, want ErrSkillContextTooLarge", err)
+		}
+	})
+
+	t.Run("Should reject the combined skill context above its explicit budget", func(t *testing.T) {
+		t.Parallel()
+		_, err := commandpkg.BuildInvokedSkillsBlock([]commandpkg.InvokedSkill{
+			{Ref: ref, Content: strings.Repeat("a", commandpkg.MaxSkillBytes)},
+			{
+				Ref: commandpkg.SkillRef{
+					CommandID: "skill:workspace::deploy",
+					Name:      "deploy",
+					Source:    ref.Source,
+				},
+				Content: strings.Repeat("b", commandpkg.MaxSkillBytes),
+			},
+			{
+				Ref: commandpkg.SkillRef{
+					CommandID: "skill:workspace::inspect",
+					Name:      "inspect",
+					Source:    ref.Source,
+				},
+				Content: strings.Repeat("c", commandpkg.MaxSkillBytes),
+			},
+		})
+		if !errors.Is(err, commandpkg.ErrSkillContextTooLarge) {
+			t.Fatalf("BuildInvokedSkillsBlock() error = %v, want combined ErrSkillContextTooLarge", err)
+		}
+	})
+}
+
+func BenchmarkParseSkillInvocations(b *testing.B) {
+	for _, count := range []int{1, 32, 128} {
+		b.Run(fmt.Sprintf("skills_%d", count), func(b *testing.B) {
+			skills := make([]commandpkg.SkillSpec, count)
+			var text strings.Builder
+			for index := range count {
+				name := fmt.Sprintf("skill-%d", index)
+				skills[index] = commandpkg.SkillSpec{
+					Name: name, Available: true,
+					Source: commandpkg.Source{Kind: "workspace", Scope: "workspace"},
+				}
+				text.WriteString(strings.Repeat("context 🚀 ", 512))
+				text.WriteString(" /" + name + " ")
+			}
+			catalog, err := commandpkg.BuildCatalog(nil, nil, skills)
+			if err != nil {
+				b.Fatal(err)
+			}
+			prompt := text.String()
+			b.ReportAllocs()
+			b.SetBytes(int64(len(prompt)))
+			for b.Loop() {
+				invocations, err := commandpkg.ParseSkillInvocations(prompt, catalog)
+				if err != nil || len(invocations) != count {
+					b.Fatalf("ParseSkillInvocations() count=%d error=%v", len(invocations), err)
+				}
+			}
+		})
+	}
+}

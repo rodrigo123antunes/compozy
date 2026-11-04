@@ -1,0 +1,542 @@
+package task
+
+import (
+	"context"
+	"encoding/json"
+	"errors"
+	"strings"
+	"testing"
+	"time"
+
+	diagnosticcontract "github.com/compozy/compozy/internal/diagnosticcontract"
+	diagnosticitems "github.com/compozy/compozy/internal/diagnostics"
+	eventspkg "github.com/compozy/compozy/internal/events"
+	storepkg "github.com/compozy/compozy/internal/store"
+)
+
+type schedulerControlTestStore struct {
+	*inMemoryManagerStore
+	pause                  SchedulerPauseState
+	activeClaimCount       []int
+	summaries              []storepkg.EventSummary
+	cancelAfterPause       context.CancelFunc
+	requireDeadline        bool
+	starvedRunCount        int
+	escalatingCountCalls   int
+	needsAttentionRunCount int
+	backlog                SchedulerBacklog
+}
+
+var _ taskPauseStore = (*schedulerControlTestStore)(nil)
+var _ schedulerControlStore = (*schedulerControlTestStore)(nil)
+var _ eventSummaryStore = (*schedulerControlTestStore)(nil)
+
+func newSchedulerControlTestStore() *schedulerControlTestStore {
+	return &schedulerControlTestStore{inMemoryManagerStore: newInMemoryManagerStore()}
+}
+
+func (s *schedulerControlTestStore) PauseTask(ctx context.Context, mutation PauseMutation) (Task, error) {
+	if err := ctx.Err(); err != nil {
+		return Task{}, err
+	}
+	record, err := s.GetTask(ctx, mutation.TaskID)
+	if err != nil {
+		return Task{}, err
+	}
+	record.Paused = true
+	record.PausedBy = mutation.Actor
+	record.PausedAt = mutation.PausedAt
+	record.PausedReason = mutation.Reason
+	record.UpdatedAt = mutation.PausedAt
+	s.tasks[record.ID] = record
+	return record, nil
+}
+
+func (s *schedulerControlTestStore) ResumeTask(ctx context.Context, mutation ResumeMutation) (Task, error) {
+	if err := ctx.Err(); err != nil {
+		return Task{}, err
+	}
+	record, err := s.GetTask(ctx, mutation.TaskID)
+	if err != nil {
+		return Task{}, err
+	}
+	record.Paused = false
+	record.PausedBy = ""
+	record.PausedAt = time.Time{}
+	record.PausedReason = ""
+	record.UpdatedAt = mutation.ResumedAt
+	s.tasks[record.ID] = record
+	return record, nil
+}
+
+func (s *schedulerControlTestStore) GetSchedulerPause(ctx context.Context) (SchedulerPauseState, error) {
+	if err := ctx.Err(); err != nil {
+		return SchedulerPauseState{}, err
+	}
+	if err := s.requireStatusDeadline(ctx); err != nil {
+		return SchedulerPauseState{}, err
+	}
+	return s.pause, nil
+}
+
+func (s *schedulerControlTestStore) SetSchedulerPaused(
+	ctx context.Context,
+	actor string,
+	reason string,
+) (SchedulerPauseState, error) {
+	if err := ctx.Err(); err != nil {
+		return SchedulerPauseState{}, err
+	}
+	now := time.Date(2026, 4, 14, 15, 0, 0, 0, time.UTC)
+	s.pause = SchedulerPauseState{Paused: true, PausedBy: actor, Reason: reason, PausedAt: now, UpdatedAt: now}
+	if s.cancelAfterPause != nil {
+		s.cancelAfterPause()
+		s.cancelAfterPause = nil
+	}
+	return s.pause, nil
+}
+
+func (s *schedulerControlTestStore) SetSchedulerResumed(ctx context.Context) (SchedulerPauseState, error) {
+	if err := ctx.Err(); err != nil {
+		return SchedulerPauseState{}, err
+	}
+	now := time.Date(2026, 4, 14, 15, 0, 0, 0, time.UTC)
+	s.pause = SchedulerPauseState{UpdatedAt: now}
+	return s.pause, nil
+}
+
+func (s *schedulerControlTestStore) CountActiveTaskRunClaims(ctx context.Context) (int, error) {
+	if err := ctx.Err(); err != nil {
+		return 0, err
+	}
+	if err := s.requireStatusDeadline(ctx); err != nil {
+		return 0, err
+	}
+	if len(s.activeClaimCount) == 0 {
+		return 0, nil
+	}
+	count := s.activeClaimCount[0]
+	s.activeClaimCount = s.activeClaimCount[1:]
+	return count, nil
+}
+
+func (s *schedulerControlTestStore) CountQueuedTaskRuns(ctx context.Context, _ bool) (int, error) {
+	if err := ctx.Err(); err != nil {
+		return 0, err
+	}
+	if err := s.requireStatusDeadline(ctx); err != nil {
+		return 0, err
+	}
+	count := 0
+	for _, run := range s.runs {
+		if run.Status.Normalize() == TaskRunStatusQueued {
+			count++
+		}
+	}
+	return count, nil
+}
+
+func (s *schedulerControlTestStore) CountPausedTasks(ctx context.Context) (int, error) {
+	if err := ctx.Err(); err != nil {
+		return 0, err
+	}
+	if err := s.requireStatusDeadline(ctx); err != nil {
+		return 0, err
+	}
+	count := 0
+	for _, record := range s.tasks {
+		if record.Paused {
+			count++
+		}
+	}
+	return count, nil
+}
+
+func (s *schedulerControlTestStore) CountEscalatingQueuedTaskRuns(ctx context.Context) (int, error) {
+	if err := ctx.Err(); err != nil {
+		return 0, err
+	}
+	s.escalatingCountCalls++
+	return s.starvedRunCount, nil
+}
+
+func (s *schedulerControlTestStore) CountNeedsAttentionTaskRuns(ctx context.Context) (int, error) {
+	if err := ctx.Err(); err != nil {
+		return 0, err
+	}
+	return s.needsAttentionRunCount, nil
+}
+
+func (s *schedulerControlTestStore) SchedulerBacklog(
+	ctx context.Context,
+	_ SchedulerBacklogQuery,
+) (SchedulerBacklog, error) {
+	if err := ctx.Err(); err != nil {
+		return SchedulerBacklog{}, err
+	}
+	return s.backlog, nil
+}
+
+func (s *schedulerControlTestStore) WriteEventSummary(ctx context.Context, summary storepkg.EventSummary) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	s.summaries = append(s.summaries, summary)
+	return nil
+}
+
+func (s *schedulerControlTestStore) requireStatusDeadline(ctx context.Context) error {
+	if !s.requireDeadline {
+		return nil
+	}
+	if _, ok := ctx.Deadline(); ok {
+		return nil
+	}
+	return errors.New("scheduler status context missing deadline")
+}
+
+func TestSchedulerControls(t *testing.T) {
+	t.Parallel()
+
+	t.Run("Should retain each task owner on queued backlog runs", func(t *testing.T) {
+		t.Parallel()
+
+		store := newSchedulerControlTestStore()
+		store.backlog = SchedulerBacklog{
+			Total: 2,
+			Runs: []SchedulerBacklogRun{
+				{
+					Task: Task{ID: "task-marketing", ProfileID: "profile-marketing"},
+					Run:  Run{ID: "run-marketing", TaskID: "task-marketing"},
+				},
+				{
+					Task: Task{ID: "task-default", ProfileID: storepkg.DefaultProfileID},
+					Run:  Run{ID: "run-default", TaskID: "task-default"},
+				},
+			},
+		}
+		manager := newTaskManagerForTest(t, store)
+		backlog, err := manager.SchedulerBacklog(t.Context(), SchedulerBacklogQuery{}, validActorContext())
+		if err != nil {
+			t.Fatalf("SchedulerBacklog() error = %v", err)
+		}
+		if backlog.Total != 2 || len(backlog.Runs) != 2 {
+			t.Fatalf("SchedulerBacklog() = %#v, want both queued runs", backlog)
+		}
+		for _, item := range backlog.Runs {
+			if item.Run.ProfileID != item.Task.ProfileID {
+				t.Errorf("run %s owner = %q, want %q", item.Run.ID, item.Run.ProfileID, item.Task.ProfileID)
+			}
+		}
+	})
+
+	for _, status := range []Status{TaskStatusCompleted, TaskStatusFailed, TaskStatusCanceled} {
+		t.Run("Should reject pausing "+string(status)+" task", func(t *testing.T) {
+			t.Parallel()
+
+			store := newSchedulerControlTestStore()
+			store.tasks["task-terminal"] = Task{
+				ID:     "task-terminal",
+				Scope:  ScopeGlobal,
+				Title:  "Terminal task",
+				Status: status,
+			}
+			manager := newTaskManagerForTest(t, store)
+
+			_, err := manager.PauseTask(
+				t.Context(),
+				"task-terminal",
+				PauseTaskRequest{Reason: "hold"},
+				validActorContext(),
+			)
+			if !errors.Is(err, ErrInvalidStatusTransition) {
+				t.Fatalf("PauseTask(%s) error = %v, want %v", status, err, ErrInvalidStatusTransition)
+			}
+			item, ok := diagnosticitems.ItemFromError(err)
+			if !ok {
+				t.Fatalf("PauseTask(%s) error = %v, want structured diagnostic", status, err)
+			}
+			if item.Code != diagnosticcontract.CodeTaskRunAlreadyTerminal {
+				t.Fatalf("diagnostic code = %q, want %q", item.Code, diagnosticcontract.CodeTaskRunAlreadyTerminal)
+			}
+			if store.tasks["task-terminal"].Paused {
+				t.Fatal("PauseTask() mutated terminal task pause state")
+			}
+		})
+	}
+
+	t.Run("Should reject an oversized pause event before changing paused state", func(t *testing.T) {
+		t.Parallel()
+
+		store := newSchedulerControlTestStore()
+		store.tasks["task-pause-preflight"] = Task{
+			ID:     "task-pause-preflight",
+			Scope:  ScopeGlobal,
+			Title:  "Pause preflight",
+			Status: TaskStatusReady,
+		}
+		manager := newTaskManagerForTest(t, store)
+
+		_, err := manager.PauseTask(
+			t.Context(),
+			"task-pause-preflight",
+			PauseTaskRequest{Reason: strings.Repeat("<", 12*1024)},
+			validActorContext(),
+		)
+		if !errors.Is(err, ErrPayloadTooLarge) {
+			t.Fatalf("PauseTask() error = %v, want %v", err, ErrPayloadTooLarge)
+		}
+		if store.tasks["task-pause-preflight"].Paused {
+			t.Fatal("PauseTask() mutated paused state before rejecting the event payload")
+		}
+		if got := countTaskEventsByType(store.events, taskEventPaused); got != 0 {
+			t.Fatalf("paused events = %d, want 0", got)
+		}
+	})
+
+	t.Run("Should reject an oversized resume event before changing paused state", func(t *testing.T) {
+		t.Parallel()
+
+		metadata := json.RawMessage(`{"note":"` + strings.Repeat("<", 11_000) + `"}`)
+		if got := len(metadata); got >= MaxMetadataBytes {
+			t.Fatalf("resume metadata = %d bytes, want below %d", got, MaxMetadataBytes)
+		}
+
+		store := newSchedulerControlTestStore()
+		store.tasks["task-resume-preflight"] = Task{
+			ID:     "task-resume-preflight",
+			Scope:  ScopeGlobal,
+			Title:  "Resume preflight",
+			Status: TaskStatusReady,
+			Paused: true,
+		}
+		manager := newTaskManagerForTest(t, store)
+
+		_, err := manager.ResumeTask(
+			t.Context(),
+			"task-resume-preflight",
+			ResumeTaskRequest{Metadata: metadata},
+			validActorContext(),
+		)
+		if !errors.Is(err, ErrPayloadTooLarge) {
+			t.Fatalf("ResumeTask() error = %v, want %v", err, ErrPayloadTooLarge)
+		}
+		if !store.tasks["task-resume-preflight"].Paused {
+			t.Fatal("ResumeTask() mutated paused state before rejecting the event payload")
+		}
+		if got := countTaskEventsByType(store.events, taskEventResumed); got != 0 {
+			t.Fatalf("resumed events = %d, want 0", got)
+		}
+	})
+
+	t.Run("Should redact claim tokens from per-task pause audit data", func(t *testing.T) {
+		t.Parallel()
+
+		const rawToken = "compozy_claim_pause-secret"
+		store := newSchedulerControlTestStore()
+		store.tasks["task-pause-redaction"] = Task{
+			ID:     "task-pause-redaction",
+			Scope:  ScopeGlobal,
+			Title:  "Pause redaction",
+			Status: TaskStatusReady,
+		}
+		manager := newTaskManagerForTest(t, store)
+
+		_, err := manager.PauseTask(
+			t.Context(),
+			"task-pause-redaction",
+			PauseTaskRequest{
+				Reason: "operator supplied " + rawToken,
+				Metadata: json.RawMessage(
+					`{"claim_token":"` + rawToken + `","note":"worker supplied ` + rawToken + `","safe":true}`,
+				),
+			},
+			validActorContext(),
+		)
+		if err != nil {
+			t.Fatalf("PauseTask() error = %v", err)
+		}
+		if got := store.tasks["task-pause-redaction"].PausedReason; strings.Contains(got, rawToken) {
+			t.Fatalf("persisted pause reason = %q, want raw claim token redacted", got)
+		}
+		if got, want := countTaskEventsByType(store.events, taskEventPaused), 1; got != want {
+			t.Fatalf("paused events = %d, want %d", got, want)
+		}
+		if strings.Contains(string(store.events[0].Payload), rawToken) {
+			t.Fatalf("pause event payload leaked raw claim token: %s", store.events[0].Payload)
+		}
+
+		var payload taskPausePayload
+		if err := json.Unmarshal(store.events[0].Payload, &payload); err != nil {
+			t.Fatalf("Unmarshal(pause event payload) error = %v", err)
+		}
+		if strings.Contains(string(payload.Metadata), `"claim_token"`) {
+			t.Fatalf("pause event metadata retained claim_token field: %s", payload.Metadata)
+		}
+		if !strings.Contains(string(payload.Metadata), `"safe":true`) {
+			t.Fatalf("pause event metadata = %s, want preserved safe field", payload.Metadata)
+		}
+	})
+
+	t.Run("Should redact claim tokens from per-task resume audit data", func(t *testing.T) {
+		t.Parallel()
+
+		const rawToken = "compozy_claim_resume-secret"
+		store := newSchedulerControlTestStore()
+		store.tasks["task-resume-redaction"] = Task{
+			ID:     "task-resume-redaction",
+			Scope:  ScopeGlobal,
+			Title:  "Resume redaction",
+			Status: TaskStatusReady,
+			Paused: true,
+		}
+		manager := newTaskManagerForTest(t, store)
+
+		_, err := manager.ResumeTask(
+			t.Context(),
+			"task-resume-redaction",
+			ResumeTaskRequest{
+				Metadata: json.RawMessage(
+					`{"claim_token":"` + rawToken + `","note":"worker supplied ` + rawToken + `","safe":true}`,
+				),
+			},
+			validActorContext(),
+		)
+		if err != nil {
+			t.Fatalf("ResumeTask() error = %v", err)
+		}
+		if got, want := countTaskEventsByType(store.events, taskEventResumed), 1; got != want {
+			t.Fatalf("resumed events = %d, want %d", got, want)
+		}
+		if strings.Contains(string(store.events[0].Payload), rawToken) {
+			t.Fatalf("resume event payload leaked raw claim token: %s", store.events[0].Payload)
+		}
+
+		var payload taskResumePayload
+		if err := json.Unmarshal(store.events[0].Payload, &payload); err != nil {
+			t.Fatalf("Unmarshal(resume event payload) error = %v", err)
+		}
+		if strings.Contains(string(payload.Metadata), `"claim_token"`) {
+			t.Fatalf("resume event metadata retained claim_token field: %s", payload.Metadata)
+		}
+		if !strings.Contains(string(payload.Metadata), `"safe":true`) {
+			t.Fatalf("resume event metadata = %s, want preserved safe field", payload.Metadata)
+		}
+	})
+
+	t.Run("Should complete drain audit after request context is canceled", func(t *testing.T) {
+		t.Parallel()
+
+		ctx, cancel := context.WithCancel(t.Context())
+		defer cancel()
+		store := newSchedulerControlTestStore()
+		store.activeClaimCount = []int{1, 0}
+		store.cancelAfterPause = cancel
+		store.requireDeadline = true
+		manager := newTaskManagerForTest(t, store)
+
+		result, err := manager.DrainScheduler(
+			ctx,
+			SchedulerDrainRequest{Reason: "deploy handoff", Timeout: time.Millisecond},
+			validActorContext(),
+		)
+		if err != nil {
+			t.Fatalf("DrainScheduler() error = %v", err)
+		}
+		if !result.Completed || result.TimedOut || result.RemainingClaims != 0 {
+			t.Fatalf("DrainScheduler() result = %#v, want completed without remaining claims", result)
+		}
+		if !schedulerEventSummariesContain(store.summaries, eventspkg.SchedulerDrainStarted) {
+			t.Fatalf("event summaries = %#v, want %s", store.summaries, eventspkg.SchedulerDrainStarted)
+		}
+		if !schedulerEventSummariesContain(store.summaries, eventspkg.SchedulerDrainCompleted) {
+			t.Fatalf("event summaries = %#v, want %s", store.summaries, eventspkg.SchedulerDrainCompleted)
+		}
+	})
+
+	t.Run("Should hold the public starvation count through pause and resume grace", func(t *testing.T) {
+		t.Parallel()
+
+		asOf := time.Date(2026, 4, 14, 15, 0, 0, 0, time.UTC)
+		store := newSchedulerControlTestStore()
+		store.starvedRunCount = 12
+		manager := newTaskManagerForTestWithOptions(t, store, WithStarvationAge(2*time.Minute))
+
+		store.pause = SchedulerPauseState{
+			Paused:    true,
+			PausedAt:  asOf.Add(-10 * time.Minute),
+			UpdatedAt: asOf.Add(-10 * time.Minute),
+		}
+		paused, err := manager.SchedulerStatus(t.Context(), validActorContext())
+		if err != nil {
+			t.Fatalf("SchedulerStatus(paused) error = %v", err)
+		}
+		if paused.StarvedRunCount != 0 {
+			t.Fatalf("paused StarvedRunCount = %d, want 0", paused.StarvedRunCount)
+		}
+
+		store.pause = SchedulerPauseState{UpdatedAt: asOf.Add(-time.Minute)}
+		grace, err := manager.SchedulerStatus(t.Context(), validActorContext())
+		if err != nil {
+			t.Fatalf("SchedulerStatus(grace) error = %v", err)
+		}
+		if grace.StarvedRunCount != 0 {
+			t.Fatalf("grace StarvedRunCount = %d, want 0", grace.StarvedRunCount)
+		}
+		if store.escalatingCountCalls != 0 {
+			t.Fatalf("escalating count calls = %d, want 0 before grace boundary", store.escalatingCountCalls)
+		}
+
+		store.pause = SchedulerPauseState{UpdatedAt: asOf.Add(-3 * time.Minute)}
+		eligible, err := manager.SchedulerStatus(t.Context(), validActorContext())
+		if err != nil {
+			t.Fatalf("SchedulerStatus(eligible) error = %v", err)
+		}
+		if eligible.StarvedRunCount != 12 {
+			t.Fatalf("eligible StarvedRunCount = %d, want 12", eligible.StarvedRunCount)
+		}
+		if store.escalatingCountCalls != 1 {
+			t.Fatalf("escalating count calls = %d, want 1 at grace boundary", store.escalatingCountCalls)
+		}
+	})
+}
+
+func schedulerEventSummariesContain(summaries []storepkg.EventSummary, eventType string) bool {
+	for _, summary := range summaries {
+		if summary.Type == eventType {
+			return true
+		}
+	}
+	return false
+}
+
+// Invariant: scheduler status reads current ephemeral counters without treating
+// skipped attempts as delivered. Owner: scheduler-control status suite.
+func TestSchedulerStatusShouldExposeRuntimeCounters(t *testing.T) {
+	t.Parallel()
+	manager := newTaskManagerForTestWithOptions(t, newSchedulerControlTestStore())
+	status, err := manager.SchedulerStatus(t.Context(), validActorContext())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if status.Counters != nil {
+		t.Fatal("unbound runtime advertised counters")
+	}
+	counters := SchedulerCounters{Cycles: 1, WakeAttempts: 3, WakeSkipped: 2, WakeSucceeded: 1, CapacityWaitingRuns: 4}
+	manager.SetSchedulerCountersReader(func() SchedulerCounters { return counters })
+	status, err = manager.SchedulerStatus(t.Context(), validActorContext())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if status.Counters == nil || *status.Counters != counters {
+		t.Fatalf("counters = %+v", status.Counters)
+	}
+	counters.Cycles++
+	current, err := manager.SchedulerStatus(t.Context(), validActorContext())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if current.Counters.Cycles != 2 || status.Counters.Cycles != 1 {
+		t.Fatal("status snapshot was stale or aliased")
+	}
+}

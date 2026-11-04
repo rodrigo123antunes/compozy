@@ -1,0 +1,52 @@
+package goal
+
+import (
+	"context"
+)
+
+func (e *Executor) recordContextUsage(
+	ctx context.Context,
+	segment *segmentState,
+	usage ContextUsage,
+) (bool, error) {
+	if !usage.Known {
+		return false, nil
+	}
+	updated, err := e.store.RecordContextUsage(ctx, RecordContextUsageRequest{
+		Key:                  segment.key,
+		ExpectedControlEpoch: segment.checkpoint.ControlEpoch,
+		ExpectedBindingEpoch: segment.checkpoint.BindingEpoch,
+		ExpectedPhase:        segment.checkpoint.Phase,
+		SessionID:            segment.binding.SessionID,
+		BindingHandle:        segment.binding.Handle,
+		Usage:                usage,
+	})
+	if err != nil {
+		return false, err
+	}
+	segment.checkpoint = updated
+	return updated.ContextState == contextStateKnown && updated.UsageSequence != nil &&
+		*updated.UsageSequence == usage.Sequence, nil
+}
+
+func contextUsageSequence(usage *ContextUsage) *int64 {
+	if usage == nil || !usage.Known {
+		return nil
+	}
+	return new(usage.Sequence)
+}
+
+// bindCheckpoint adopts the managed binding before any context observation uses its identity.
+func (e *Executor) bindCheckpoint(ctx context.Context, segment *segmentState) error {
+	updated, err := e.store.BindCheckpoint(ctx, BindCheckpointRequest{
+		Key: segment.key, ExpectedControlEpoch: segment.checkpoint.ControlEpoch,
+		ExpectedBindingEpoch: segment.checkpoint.BindingEpoch, ExpectedPhase: segment.checkpoint.Phase,
+		TaskRunID: segment.input.CorrelationID, SessionID: segment.binding.SessionID,
+		BindingHandle: segment.binding.Handle, BindingEpoch: segment.binding.BindingEpoch,
+	})
+	if err != nil {
+		return err
+	}
+	segment.checkpoint = updated
+	return nil
+}

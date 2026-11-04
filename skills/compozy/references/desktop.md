@@ -1,0 +1,166 @@
+# Desktop app
+
+Use the `compozy app` commands to operate the desktop app on the local machine. This surface has no
+native-tool equivalent.
+
+## Commands
+
+Read current state before acting:
+
+```bash
+compozy app status -o json
+```
+
+The preserved app verbs are `open`, `status`, `retry`, and `diagnose`. Host updates are not
+an app subcommand.
+
+Open or focus the app. The optional argument is an absolute product path such as `/workspaces`, not
+a filesystem path:
+
+```bash
+compozy app open
+compozy app open /workspaces
+```
+
+Check, apply, or cancel runtime and app updates through the single host update command:
+
+```bash
+compozy update --check -o json
+compozy update -o json
+compozy update --cancel -o json
+```
+
+Check and apply results always contain `runtime` and include `app` only when the desktop app is
+installed. Cancel returns `status`, `operation_id`, `message`, and an optional `holder`. A managed
+runtime returns its exact package-manager recommendation without changing the binary. Apply accepts
+`{"targets":["runtime","app"]}` with runtime first; omit targets that are unavailable or managed.
+Apply and cancel are also available through `POST /api/settings/update/apply` and
+`POST /api/settings/update/cancel` over HTTP or UDS; read live state with `GET /api/settings/update`.
+Treat `available`, `applying`, `staged`, `blocked`, `failed`, `updated`, and
+`up-to-date` as the update statuses. A blocked result names the current holder. App status also
+projects the operation ID, phase, and progress when an operation exists.
+
+Retry the current operation or request structured diagnostics:
+
+```bash
+compozy app retry
+compozy app diagnose -o json
+compozy app diagnose --bundle --yes -o json
+compozy app diagnose --bundle --yes --bundle-output ./desktop-diagnostics.tar.gz -o json
+```
+
+`compozy app diagnose -o json` returns the safe `DiagnosticReport`, including the boot ID and
+phase, versions, ownership, current safe error, and any previous crash. It omits raw paths, log
+contents, and secrets. If the app is not running and the control socket is absent, it reads the
+latest persisted report, so it does not require a healthy daemon. A present but unresponsive socket
+returns its control error.
+
+`--bundle` writes a local archive only when `--yes` explicitly confirms the write. The default
+location is `$COMPOZY_HOME/support-bundles/`; `--bundle-output` selects a new `.gz` file path and
+refuses existing files or symbolic links. The archive has `manifest.json` containing the redacted
+report and may include bounded, redacted tails from the current boot's `desktop.log` and
+`desktop-bootstrap.jsonl`. It never includes `compozy.log`, raw logs, databases, configuration,
+credentials, sessions, or transcripts. It is never uploaded automatically and is separate from
+`compozy support bundle`, which is a daemon-owned runtime-support operation.
+
+## Ownership
+
+Treat attachment and ownership separately. Attaching to an existing daemon never transfers
+ownership. Quitting the app never stops any runtime, including one the app started or provisioned.
+Use the runtime's own control surface for an intentional stop.
+
+App updates require consent and restart the desktop process. When both tracks are selected and
+the runtime is desktop-owned, the planner uses one app artifact; the relaunched app updates its
+owned runtime from its verified bundle. Explicit runtime-only requests and standalone runtimes
+keep the runtime update path. A running shell downloads and verifies the app artifact, waits for
+native installer readiness, then restarts. When the shell is absent, the daemon records a staged
+operation for the next launch. The app can replace an app-owned runtime
+after verification when durable provenance still proves ownership. For an operator-managed or
+inconclusively owned runtime, report the install method and its update command; never replace the
+binary through `compozy app`.
+
+## Shell facts
+
+The desktop app is an Electron shell over the daemon-served product UI. A packaged app includes a
+verified runtime, so a clean first run can provision offline. Boot resolves in this order: attach to
+a healthy daemon, start `$COMPOZY_HOME/bin/compozy`, or verify and install the bundled runtime.
+Quitting the shell leaves the daemon running.
+
+On macOS and Linux, a desktop-owned daemon refreshes only `PATH` from the operator's login shell
+(the inherited `SHELL`, else the account's recorded shell) before starting runtime services. Failure preserves the inherited environment. Operator-managed
+daemons and Windows keep their launcher environment.
+
+The product UI is developed and release-verified against Chromium, the engine embedded by Electron.
+Other browsers can open the daemon-served UI on a best-effort basis.
+
+The packaged shell registers daemon-owned `[window_manager.global_shortcuts]`; the default
+`meta+shift+Space` summons and focuses the command palette. Registration truth belongs to each shell,
+so Settings can report a chord in use, unsupported, or blocked by macOS Accessibility permission.
+Plain browsers show these controls as requiring the desktop shell while in-app shortcuts continue to
+work.
+
+## Open transcript paths in the editor
+
+In the desktop app, file paths in assistant messages open in the operator's editor on
+Cmd/Ctrl+click. Browser and remote clients never offer this, and the daemon has no open-file API,
+CLI verb, or native tool. The shell reads `desktop.editor_command` from the daemon's
+`GET /api/settings/general` on every open and runs it as an argument vector, never through a
+shell. When the command is unset, the shell uses the system text editor without line support:
+`open -t` on macOS, `notepad.exe` on Windows, and the `xdg-mime` `text/plain` handler through
+`gtk-launch` on Linux. On macOS and Linux, a bare executable such as `code` resolves against the
+operator's login-shell PATH. On Windows, point the command at the editor's `.exe`, because
+`.cmd` and `.bat` shims are rejected.
+
+The shell asks for native confirmation, with the full path shown, before it opens a file outside
+the session's worktree or workspace root. Symlinks are resolved before this check. It also asks
+before opening anything under `~/.ssh`, `~/.gnupg`, `~/.aws`, `~/.kube`, `~/.docker`,
+`~/.config/gh`, or `~/.netrc`, even inside a root. A root that is the home directory, one of its
+ancestors, or `/` never counts as inside, so User-scope sessions always ask. Network and device
+paths are refused. Agents can read the command with `compozy__config_get`. Only the operator can
+change it, through Settings or `compozy config set`.
+
+## Recovery
+
+When an app update reports `failed` and no operation remains active, the product offers **Retry
+update**. `compozy update` also refreshes and revalidates the release before retrying. Cancellation
+of a staged operation is not a prerequisite for this retry. For a desktop startup failure, run
+`compozy app diagnose -o json`, preserve the reported error, follow its recovery action, then run
+`compozy app retry`. That command retries startup, not the update download. Confirm the result
+with `compozy app status -o json` and the observed daemon version.
+
+A post-swap runtime failure keeps the replacement binary because databases may already have
+migrated. Preserve both binary copies and all databases; inspect the runtime log, resolve the
+reported cause, and retry `compozy daemon start`. A live boot continues across readiness polling
+windows; interrupting the CLI only stops observation. Confirm readiness with structured status.
+An older app preserves a newer compatible runtime, and staged app updates can run before runtime
+bootstrap succeeds. Historical rollback failures clear from live update status after recovery to
+the target runtime version or newer; do not edit the history to clear them.
+
+Automatic repair is limited to disposable desktop metadata and a runtime process proven to be
+desktop-owned. Never stop an operator-managed runtime or delete `compozy.db`, `config.toml`,
+credentials, sessions, or the full home as a recovery step. The desktop has no native-tool
+equivalent; use the local `compozy app` control surface.
+
+After every app mutation, perform a structured status read. Do not infer success from a process,
+window, or human-readable message alone.
+
+## Page zoom
+
+The desktop main window supports the standard page zoom shortcuts: `Command` + `+`, `Command` +
+`-`, and `Command` + `0` on macOS; use `Control` instead of `Command` on Windows and Linux. These
+shortcuts scale the whole product interface. The in-product Window > Zoom action has a different
+purpose: it expands one CompozyOS window inside the desktop workspace.
+
+## Native editing
+
+Editable fields use the platform Edit menu. Cut, copy, paste, and select all use `Command` on macOS
+and `Control` on Windows and Linux.
+
+On Linux, AppImages in `~/Applications` are detected from executable files independently of the
+menu shortcut. A running authenticated desktop shell supplies its installed version. `app open`
+launches a discovered executable directly and captures launch output in `logs/app-launch.log`.
+Packaged Linux startup refreshes the URI association with the current executable and version.
+
+An update whose pre-handoff deadline expired is settled by status reads and daemon recovery;
+reopening the desktop app is unnecessary. A dead or replaced holder process can be canceled
+while `applying`. Installer handoff and runtime replacement remain protected from cancellation.

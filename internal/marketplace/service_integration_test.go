@@ -1,0 +1,234 @@
+//go:build integration
+
+package marketplace
+
+import (
+	"context"
+	"net/http"
+	"net/http/httptest"
+	"strings"
+	"sync"
+	"sync/atomic"
+	"testing"
+	"time"
+
+	"github.com/compozy/compozy/internal/testutil"
+)
+
+func TestCatalogServiceHTTPProjectionIntegration(t *testing.T) {
+	t.Parallel()
+
+	// Invariant: an independent source failure cannot hide another flight or restart it during backoff.
+	// Owner: service refresh publication; canonical HTTP/SQLite integration suite.
+	t.Run("Should finish a healthy source beside a failed source without polling retries", func(t *testing.T) {
+		t.Parallel()
+		started, release := make(chan struct{}), make(chan struct{})
+		var failedCalls, healthyCalls atomic.Int32
+		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if r.URL.Path == "/failed/v3/extensions.json" {
+				failedCalls.Add(1)
+				http.NotFound(w, r)
+				return
+			}
+			if r.URL.Path != "/healthy/v3/extensions.json" {
+				http.NotFound(w, r)
+				return
+			}
+			healthyCalls.Add(1)
+			close(started)
+			select {
+			case <-release:
+			case <-r.Context().Done():
+				return
+			}
+			w.Header().Set("Content-Type", "application/json")
+			if _, err := w.Write([]byte(validExtensionFeed("team-tool", "Team tool"))); err != nil {
+				t.Error(err)
+			}
+		}))
+		t.Cleanup(server.Close)
+		failed, err := NewHTTPSource(server.URL+"/failed", &http.Client{Timeout: time.Second})
+		if err != nil {
+			t.Fatal(err)
+		}
+		healthy, err := NewHTTPSource(server.URL+"/healthy", &http.Client{Timeout: time.Second})
+		if err != nil {
+			t.Fatal(err)
+		}
+		bindings := append(marketplaceTestBindings(t, failed), SourceBinding{
+			Config:  ResolvedSource{Name: "team", Ref: "github:team/plugins", Kind: SourceKindCustom, Enabled: true},
+			Fetcher: healthy,
+		})
+		service, err := NewService(t.Context(), openMarketplaceTestStore(t), bindings, time.Hour, time.Minute)
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() {
+			if err := service.Close(testutil.Context(t)); err != nil {
+				t.Error(err)
+			}
+		})
+		if _, err := service.Refresh(t.Context(), CompozyCatalogSource); err == nil {
+			t.Fatal("unavailable source refreshed successfully")
+		}
+		pending, err := service.Browse(t.Context(), "", 0, 10)
+		if err != nil || !pending.Refreshing || !pending.Stale || pending.ErrorClass == "" {
+			t.Fatalf("pending mixed-source page = %+v, err=%v", pending, err)
+		}
+		select {
+		case <-started:
+		case <-t.Context().Done():
+			t.Fatal("healthy source did not start")
+		}
+		service.flightMu.Lock()
+		flight := service.byName["team"].flight
+		service.flightMu.Unlock()
+		close(release)
+		if _, err := awaitRefreshFlight(t.Context(), flight); err != nil {
+			t.Fatal(err)
+		}
+		settled, err := service.Browse(t.Context(), "", 0, 10)
+		if err != nil || settled.Refreshing || !settled.Stale || settled.ErrorClass == "" ||
+			len(settled.Entries) != 1 || settled.Entries[0].EntryID != "team-tool" {
+			t.Fatalf("settled mixed-source page = %+v, err=%v", settled, err)
+		}
+		entry, err := service.Detail(t.Context(), "", "team-tool")
+		if err != nil || entry.SourceName != "team" {
+			t.Fatalf("unqualified plugin detail = %+v, err=%v", entry, err)
+		}
+		if failedCalls.Load() != 1 || healthyCalls.Load() != 1 {
+			t.Fatalf("read bypassed refresh backoff: failed=%d healthy=%d", failedCalls.Load(), healthyCalls.Load())
+		}
+	})
+
+	t.Run(
+		"Should prune pulled entries and preserve the last good projection across source failures",
+		func(t *testing.T) {
+			t.Parallel()
+
+			feed := &mutableCatalogFeed{
+				body: validExtensionFeed("stable", "Stable extension", "pulled", "Pulled extension"),
+			}
+			server := httptest.NewServer(feed)
+			t.Cleanup(server.Close)
+
+			store := openMarketplaceTestStore(t)
+			source, err := NewHTTPSource(server.URL, &http.Client{Timeout: time.Second})
+			if err != nil {
+				t.Fatalf("NewHTTPSource() error = %v", err)
+			}
+			service, err := NewService(t.Context(), store, marketplaceTestBindings(t, source), time.Hour, time.Minute)
+			if err != nil {
+				t.Fatalf("NewService() error = %v", err)
+			}
+			ctx := testutil.Context(t)
+
+			if _, err := service.Refresh(ctx); err != nil {
+				t.Fatalf("Refresh(valid) error = %v", err)
+			}
+			assertProjectedExtensionIDs(t, ctx, store, "pulled", "stable")
+
+			fresh, err := service.Browse(ctx, "", 0, 10)
+			if err != nil || fresh.Stale || len(fresh.Entries) != 2 ||
+				fresh.Entries[0].EntryID != "pulled" || fresh.Entries[1].EntryID != "stable" {
+				t.Fatalf("Browse(fresh HTTP projection) = %#v, %v", fresh, err)
+			}
+
+			feed.setBody(validExtensionFeed("stable", "Stable extension"))
+			if _, err := service.Refresh(ctx); err != nil {
+				t.Fatalf("Refresh(kill switch) error = %v", err)
+			}
+			assertProjectedExtensionIDs(t, ctx, store, "stable")
+
+			feed.setBody(
+				`{"manifest_version": 3,"generated_at":"2026-07-13T12:00:00Z","entries":[{"entry_id":"broken"}]}`,
+			)
+			if _, err := service.Refresh(
+				ctx,
+			); err == nil ||
+				!strings.Contains(err.Error(), "name is required") {
+				t.Fatalf("Refresh(malformed) error = %v, want required-name validation failure", err)
+			}
+			assertProjectedExtensionIDs(t, ctx, store, "stable")
+
+			server.Close()
+			if _, err := service.Refresh(
+				ctx,
+			); err == nil ||
+				!strings.Contains(err.Error(), "connection refused") {
+				t.Fatalf("Refresh(unavailable) error = %v, want connection-refused transport failure", err)
+			}
+			result, err := service.Browse(ctx, "", 0, 10)
+			if err != nil {
+				t.Fatalf("Browse(stale fallback) error = %v", err)
+			}
+			if !result.Stale || result.ErrorClass != errorClassNetwork {
+				t.Fatalf("Browse(stale fallback) state = %#v, want stale network state", result.Sources)
+			}
+			assertProjectedExtensionIDs(t, ctx, store, "stable")
+			states, err := service.Status(ctx)
+			if err != nil {
+				t.Fatalf("Status() error = %v", err)
+			}
+			if got, want := len(
+				states,
+			), 1; got != want || !states[0].Stale ||
+				states[0].ErrorClass != errorClassNetwork {
+				t.Fatalf("Status() = %#v, want one stale network state", states)
+			}
+		},
+	)
+}
+
+type mutableCatalogFeed struct {
+	mu   sync.RWMutex
+	body string
+}
+
+func (f *mutableCatalogFeed) ServeHTTP(writer http.ResponseWriter, request *http.Request) {
+	if request.URL.Path != "/v3/extensions.json" {
+		http.NotFound(writer, request)
+		return
+	}
+	f.mu.RLock()
+	defer f.mu.RUnlock()
+	writer.Header().Set("Content-Type", "application/json")
+	if _, err := writer.Write([]byte(f.body)); err != nil {
+		return
+	}
+}
+
+func (f *mutableCatalogFeed) setBody(body string) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.body = body
+}
+
+func validExtensionFeed(fields ...string) string {
+	entries := make([]string, 0, len(fields)/2)
+	for index := 0; index < len(fields); index += 2 {
+		entryID := fields[index]
+		name := fields[index+1]
+		entries = append(entries, `{"entry_id":"`+entryID+`","name":"`+name+`",`+
+			`"description":"Integration fixture","version":"1.0.0","install_slug":"compozy/`+entryID+`",`+
+			`"tier":"official","artifact_url":"https://example.test/package.tgz","digest_sha256":"`+strings.Repeat("a", 64)+`"}`)
+	}
+	return `{"manifest_version": 3,"generated_at":"2026-07-13T12:00:00Z","entries":[` +
+		strings.Join(entries, ",") + `]}`
+}
+
+func assertProjectedExtensionIDs(t *testing.T, ctx context.Context, store Store, wantEntryIDs ...string) {
+	t.Helper()
+	page, err := store.BrowseSource(ctx, CompozyCatalogSource, "", 0, 10)
+	if err != nil {
+		t.Fatalf("BrowseSource() error = %v", err)
+	}
+	if got, want := len(page.Entries), len(wantEntryIDs); got != want {
+		t.Fatalf("BrowseSource() count = %d, want %d: %#v", got, want, page)
+	}
+	for index, wantEntryID := range wantEntryIDs {
+		if page.Entries[index].EntryID != wantEntryID {
+			t.Fatalf("BrowseSource()[%d].EntryID = %q, want %q", index, page.Entries[index].EntryID, wantEntryID)
+		}
+	}
+}

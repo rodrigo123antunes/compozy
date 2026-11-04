@@ -1,0 +1,377 @@
+package core
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"maps"
+	"net/http"
+	"os"
+	"slices"
+	"strings"
+
+	"github.com/compozy/compozy/internal/api/contract"
+	"github.com/compozy/compozy/internal/session"
+	workspacepkg "github.com/compozy/compozy/internal/workspace"
+	"github.com/gin-gonic/gin"
+)
+
+// CreateWorkspace registers a workspace.
+func (h *BaseHandlers) CreateWorkspace(c *gin.Context) {
+	var req contract.CreateWorkspaceRequest
+	if err := c.ShouldBindJSON(&req); err != nil {
+		h.respondError(
+			c,
+			http.StatusBadRequest,
+			fmt.Errorf("%s: decode create workspace request: %w", h.transportName(), err),
+		)
+		return
+	}
+
+	rootDir := strings.TrimSpace(req.RootDir)
+	if err := validateAbsolutePathInternal(h.transportName(), "root_dir", rootDir); err != nil {
+		h.respondError(c, http.StatusBadRequest, err)
+		return
+	}
+
+	addDirs := trimStringSliceInternal(req.AddDirs)
+	if err := validateAbsolutePathsInternal(h.transportName(), "add_dirs", addDirs); err != nil {
+		h.respondError(c, http.StatusBadRequest, err)
+		return
+	}
+
+	workspace, err := h.Workspaces.Register(c.Request.Context(), workspacepkg.RegisterOptions{
+		RootDir:        rootDir,
+		Name:           strings.TrimSpace(req.Name),
+		AdditionalDirs: addDirs,
+		DefaultAgent:   strings.TrimSpace(req.DefaultAgent),
+	})
+	if err != nil {
+		h.respondError(c, StatusForWorkspaceError(err), err)
+		return
+	}
+
+	c.JSON(http.StatusCreated, contract.WorkspaceResponse{
+		Workspace: WorkspacePayloadFromWorkspace(workspace),
+	})
+}
+
+// ListWorkspaces returns all registered workspaces.
+func (h *BaseHandlers) ListWorkspaces(c *gin.Context) {
+	archived, err := ParseOptionalBool(c.Query("archived"))
+	if err != nil {
+		h.respondError(c, http.StatusBadRequest, err)
+		return
+	}
+	workspaces, err := h.Workspaces.List(c.Request.Context())
+	if err != nil {
+		h.respondError(c, StatusForWorkspaceError(err), err)
+		return
+	}
+
+	payload := make([]contract.WorkspacePayload, 0, len(workspaces))
+	for _, workspace := range workspaces {
+		if (workspace.ArchivedAt != nil) != archived {
+			continue
+		}
+		payload = append(payload, WorkspacePayloadFromWorkspace(workspace))
+	}
+
+	c.JSON(http.StatusOK, contract.WorkspacesResponse{Workspaces: payload})
+}
+
+// GetWorkspace returns one resolved workspace with related sessions, agents, and skills.
+func (h *BaseHandlers) GetWorkspace(c *gin.Context) {
+	ref := workspaceRefFromRoute(c)
+	resolved, err := h.Workspaces.Resolve(c.Request.Context(), ref)
+	if errors.Is(err, workspacepkg.ErrWorkspaceRootMissing) {
+		var registered workspacepkg.Workspace
+		registered, err = h.Workspaces.Get(c.Request.Context(), ref)
+		if errors.Is(err, workspacepkg.ErrWorkspaceNotFound) {
+			err = workspacepkg.ErrWorkspaceRootMissing
+		}
+		registered.RootMissing = true
+		resolved = workspacepkg.ResolvedWorkspace{
+			Workspace: registered, WorkspaceID: registered.ID, Scope: workspacepkg.ScopeWorkspace,
+		}
+	}
+	if err != nil {
+		h.respondError(c, StatusForWorkspaceError(err), err)
+		return
+	}
+
+	sessions, err := h.Sessions.ListForWorkspace(c.Request.Context(), resolved.WorkspaceID)
+	if err != nil {
+		h.respondError(c, http.StatusInternalServerError, err)
+		return
+	}
+
+	agents, err := h.workspaceDetailAgentEntries(c.Request.Context(), &resolved)
+	if err != nil {
+		h.respondError(c, http.StatusInternalServerError, err)
+		return
+	}
+	profileHints, err := h.workspaceProfileHints(c.Request.Context(), resolved.ProfileDeclarations)
+	if err != nil {
+		h.respondError(c, http.StatusInternalServerError, err)
+		return
+	}
+	sessionPayloads, err := h.decorateSessionOwners(
+		c.Request.Context(),
+		SessionPayloadsForWorkspace(sessions, resolved.WorkspaceID),
+	)
+	if err != nil {
+		h.respondError(c, http.StatusInternalServerError, err)
+		return
+	}
+
+	c.JSON(http.StatusOK, contract.WorkspaceDetailPayload{
+		Workspace:    WorkspacePayloadFromWorkspace(resolved.Workspace),
+		Sessions:     sessionPayloads,
+		Agents:       AgentPayloadsFromEntries(agents),
+		Skills:       WorkspaceSkillPayloads(resolved.Skills),
+		Providers:    SessionProviderOptionPayloadsFromConfig(&resolved.Config),
+		ProfileHints: profileHints,
+	})
+}
+
+func (h *BaseHandlers) workspaceProfileHints(
+	ctx context.Context,
+	declarations []workspacepkg.ProfileDeclaration,
+) ([]contract.WorkspaceProfileHintPayload, error) {
+	if len(declarations) == 0 {
+		return nil, nil
+	}
+	known := map[string]struct{}{profileDefaultName: {}}
+	if h.Profiles != nil {
+		profiles, err := h.Profiles.List(ctx)
+		if err != nil {
+			return nil, fmt.Errorf("api: list profiles for workspace hints: %w", err)
+		}
+		for _, item := range profiles {
+			known[strings.TrimSpace(item.Name)] = struct{}{}
+		}
+	}
+	hints := make([]contract.WorkspaceProfileHintPayload, 0, len(declarations))
+	for _, declaration := range declarations {
+		name := strings.TrimSpace(declaration.Name)
+		if name == "" {
+			continue
+		}
+		if _, exists := known[name]; exists {
+			continue
+		}
+		hints = append(hints, contract.WorkspaceProfileHintPayload{
+			Name:    name,
+			Path:    strings.TrimSpace(declaration.Path),
+			Message: fmt.Sprintf("This workspace declares content for profile %q.", name),
+			Action:  "compozy profile create " + name,
+		})
+	}
+	return hints, nil
+}
+
+func (h *BaseHandlers) workspaceDetailAgentEntries(
+	ctx context.Context,
+	resolved *workspacepkg.ResolvedWorkspace,
+) ([]AgentCatalogEntry, error) {
+	if resolved == nil {
+		return nil, errors.New("api: resolved workspace is required")
+	}
+
+	if resolved.RootMissing {
+		return nil, nil
+	}
+
+	merged := make(map[string]AgentCatalogEntry, len(resolved.Agents))
+	for _, agent := range resolved.Agents {
+		name := strings.TrimSpace(agent.Name)
+		if name == "" {
+			continue
+		}
+		merged[name] = h.agentCatalogEntryFromDef(agent, resolved.ID)
+	}
+
+	if h.AgentCatalog != nil {
+		catalogAgents, err := h.AgentCatalog.ListAgentsForWorkspace(ctx, resolved)
+		if err != nil {
+			if !errors.Is(err, os.ErrNotExist) {
+				return nil, err
+			}
+		}
+		for i := range catalogAgents {
+			entry := &catalogAgents[i]
+			agent := entry.Def
+			name := strings.TrimSpace(agent.Name)
+			if name == "" {
+				continue
+			}
+			if existing, exists := merged[name]; exists {
+				// The workspace scan owns the definition; only the catalog knows who owns it.
+				existing.MemoryOrigin = entry.MemoryOrigin
+				existing.PackageOwned = entry.PackageOwned
+				merged[name] = existing
+				continue
+			}
+			merged[name] = *entry
+		}
+	}
+
+	names := slices.Sorted(maps.Keys(merged))
+
+	agents := make([]AgentCatalogEntry, 0, len(names))
+	for _, name := range names {
+		agents = append(agents, merged[name])
+	}
+	return agents, nil
+}
+
+// UpdateWorkspace updates a registered workspace.
+func (h *BaseHandlers) UpdateWorkspace(c *gin.Context) {
+	workspace, err := h.Workspaces.Get(c.Request.Context(), workspaceRefFromRoute(c))
+	if err != nil {
+		h.respondError(c, StatusForWorkspaceError(err), err)
+		return
+	}
+
+	var req contract.UpdateWorkspaceRequest
+	if err := c.ShouldBindJSON(&req); err != nil {
+		h.respondError(
+			c,
+			http.StatusBadRequest,
+			fmt.Errorf("%s: decode update workspace request: %w", h.transportName(), err),
+		)
+		return
+	}
+
+	var opts workspacepkg.UpdateOptions
+	if req.Name != nil {
+		name := strings.TrimSpace(*req.Name)
+		if name == "" {
+			h.respondError(c, http.StatusBadRequest, fmt.Errorf("%s: name is required", h.transportName()))
+			return
+		}
+		opts.Name = &name
+	}
+	if req.AddDirs != nil {
+		addDirs := trimStringSliceInternal(*req.AddDirs)
+		if err := validateAbsolutePathsInternal(h.transportName(), "add_dirs", addDirs); err != nil {
+			h.respondError(c, http.StatusBadRequest, err)
+			return
+		}
+		opts.AdditionalDirs = &addDirs
+	}
+	if req.DefaultAgent != nil {
+		defaultAgent := strings.TrimSpace(*req.DefaultAgent)
+		opts.DefaultAgent = &defaultAgent
+	}
+
+	if err := h.Workspaces.Update(c.Request.Context(), workspace.ID, opts); err != nil {
+		h.respondError(c, StatusForWorkspaceError(err), err)
+		return
+	}
+
+	updated, err := h.Workspaces.Get(c.Request.Context(), workspace.ID)
+	if err != nil {
+		h.respondError(c, StatusForWorkspaceError(err), err)
+		return
+	}
+
+	c.JSON(http.StatusOK, contract.WorkspaceResponse{
+		Workspace: WorkspacePayloadFromWorkspace(updated),
+	})
+}
+
+// DeleteWorkspace unregisters a workspace.
+func (h *BaseHandlers) DeleteWorkspace(c *gin.Context) {
+	workspace, err := h.Workspaces.Get(c.Request.Context(), workspaceRefFromRoute(c))
+	if err != nil {
+		h.respondError(c, StatusForWorkspaceError(err), err)
+		return
+	}
+
+	if err := h.Workspaces.Unregister(c.Request.Context(), workspace.ID); err != nil {
+		h.respondError(c, StatusForWorkspaceError(err), err)
+		return
+	}
+
+	c.Status(http.StatusNoContent)
+}
+
+// ResolveWorkspace resolves or registers a workspace from a path.
+func (h *BaseHandlers) ResolveWorkspace(c *gin.Context) {
+	var req contract.ResolveWorkspaceRequest
+	if err := c.ShouldBindJSON(&req); err != nil {
+		h.respondError(
+			c,
+			http.StatusBadRequest,
+			fmt.Errorf("%s: decode resolve workspace request: %w", h.transportName(), err),
+		)
+		return
+	}
+
+	path := strings.TrimSpace(req.Path)
+	if err := validateAbsolutePathInternal(h.transportName(), "path", path); err != nil {
+		h.respondError(c, http.StatusBadRequest, err)
+		return
+	}
+
+	resolved, err := h.Workspaces.ResolveOrRegister(c.Request.Context(), path)
+	if err != nil {
+		h.respondError(c, StatusForWorkspaceError(err), err)
+		return
+	}
+
+	c.JSON(http.StatusOK, contract.WorkspaceResponse{
+		Workspace: WorkspacePayloadFromWorkspace(resolved.Workspace),
+	})
+}
+
+func (h *BaseHandlers) validateCreateSessionRequest(req contract.CreateSessionRequest) error {
+	if req.Scope == userScopeValue {
+		if req.Workspace != "" || req.WorkspacePath != "" || req.Worktree != "" || req.NewWorktree != nil {
+			return session.ErrCreateScopeConflict
+		}
+		return validateCreateSessionLineageKind(h.transportName(), req)
+	}
+	if req.Scope != "" && req.Scope != workspaceScopeValue {
+		return errors.New("invalid session scope")
+	}
+
+	if workspacepkg.ParseRef(req.Workspace).Kind == workspacepkg.RefUser {
+		if strings.TrimSpace(req.Worktree) != "" || req.NewWorktree != nil {
+			return workspacepkg.ErrUserScopeWorktreeUnsupported
+		}
+		if req.WorkspacePath != "" {
+			return session.ErrCreateScopeConflict
+		}
+		return validateCreateSessionLineageKind(h.transportName(), req)
+	}
+	if err := validateCreateSessionRequest(h.transportName(), req.Workspace, req.WorkspacePath); err != nil {
+		return err
+	}
+	if err := validateCreateSessionLineageKind(h.transportName(), req); err != nil {
+		return err
+	}
+	hasWorktree := strings.TrimSpace(req.Worktree) != ""
+	hasNewWorktree := req.NewWorktree != nil
+	switch {
+	case hasWorktree && hasNewWorktree:
+		return prefixedError(h.transportName(), "worktree and new_worktree are mutually exclusive")
+	case (hasWorktree || hasNewWorktree) && strings.TrimSpace(req.WorkspacePath) != "":
+		return prefixedError(h.transportName(), "worktree selection requires workspace, not workspace_path")
+	default:
+		return nil
+	}
+}
+
+func (h *BaseHandlers) lookupWorkspaceID(ctx context.Context, ref string) (string, error) {
+	return lookupWorkspaceID(ctx, h.transportName(), h.Workspaces, ref)
+}
+
+// SessionPayloadsForWorkspace filters and converts sessions for one workspace.
+func SessionPayloadsForWorkspace(infos []*session.Info, workspaceID string) []contract.SessionPayload {
+	return SessionPayloadsFromInfos(
+		visibleSessionInfosInternal(filterSessionInfosByWorkspaceIDInternal(infos, workspaceID)),
+	)
+}

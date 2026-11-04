@@ -1,0 +1,186 @@
+package session
+
+import (
+	"context"
+	"errors"
+	"strings"
+)
+
+const (
+	goalBusyPolicyInherit      = "inherit"
+	goalBusyPolicyRejectIfBusy = "reject-if-busy"
+)
+
+// GoalSessionStopHandler pauses session-origin Goals when the operator stops their session.
+type GoalSessionStopHandler interface {
+	StopSessionGoals(context.Context, *Info) error
+}
+
+// stopSessionGoals invokes Goal pause only for explicit operator stop or removal.
+func (m *Manager) stopSessionGoals(ctx context.Context, info *Info) error {
+	if info == nil || info.StopCause != CauseUserRequested {
+		return nil
+	}
+	handler, ok := m.currentGoalCommandHandler().(GoalSessionStopHandler)
+	if !ok {
+		return nil
+	}
+	return handler.StopSessionGoals(ctx, info)
+}
+
+// GoalSessionRemoveHandler cancels Goals before removal of their owning session.
+type GoalSessionRemoveHandler interface {
+	RemoveSessionGoals(context.Context, *Info) error
+}
+
+func (m *Manager) removeSessionGoals(ctx context.Context, info *Info) error {
+	handler, ok := m.currentGoalCommandHandler().(GoalSessionRemoveHandler)
+	if !ok {
+		return nil
+	}
+	return handler.RemoveSessionGoals(ctx, info)
+}
+
+// SetGoalCommandHandler installs the late-bound daemon dispatcher before API servers start.
+func (m *Manager) SetGoalCommandHandler(handler GoalCommandHandler) {
+	if m == nil {
+		return
+	}
+	m.goalCommandMu.Lock()
+	m.goalCommandHandler = handler
+	m.goalCommandMu.Unlock()
+}
+
+func (m *Manager) dispatchGoalCommand(
+	ctx context.Context,
+	req *promptRequest,
+	opts SendPromptOpts,
+) (GoalDispatchDecision, bool, error) {
+	command, matched, parseErr := ParseGoalCommand(req.authoredMessage)
+	if !matched {
+		return GoalDispatchDecision{}, false, nil
+	}
+	ctx, unlockConversation, err := m.lockConversationOperation(ctx, req.target)
+	if err != nil {
+		return GoalDispatchDecision{}, true, err
+	}
+	defer unlockConversation()
+	workspaceID, lookupErr := m.goalCommandWorkspaceID(ctx, req.target)
+	if lookupErr != nil {
+		return GoalDispatchDecision{}, true, lookupErr
+	}
+	if err := opts.Caller.Validate(); err != nil {
+		return GoalDispatchDecision{}, true, err
+	}
+	if err := m.recordPromptInputEvent(ctx, nil, req); err != nil {
+		return GoalDispatchDecision{}, true, err
+	}
+	if parseErr != nil {
+		commandErr, ok := errors.AsType[*GoalCommandError](parseErr)
+		if !ok {
+			return GoalDispatchDecision{}, true, parseErr
+		}
+		return goalErrorDecision(commandErr.Code), true, nil
+	}
+	handler := m.currentGoalCommandHandler()
+	if handler == nil {
+		return GoalDispatchDecision{}, true, errors.New("session: Goal command handler is unavailable")
+	}
+	command.Runtime = cloneRuntimeSelection(req.runtime)
+	decision, err := handler.Handle(ctx, workspaceID, req.target, opts.Caller, command)
+	if err != nil {
+		return GoalDispatchDecision{}, true, err
+	}
+	if err := validateGoalDispatchDecision(decision); err != nil {
+		return GoalDispatchDecision{}, true, err
+	}
+	return decision, true, nil
+}
+
+func (m *Manager) applyGoalCommand(
+	ctx context.Context,
+	req *promptRequest,
+	opts SendPromptOpts,
+) (bool, *SendPromptResult, error) {
+	if !opts.AllowCommands {
+		return false, nil, nil
+	}
+	decision, handled, err := m.dispatchGoalCommand(ctx, req, opts)
+	if err != nil {
+		return false, nil, err
+	}
+	if !handled {
+		return false, nil, nil
+	}
+	switch decision.Kind {
+	case GoalDispatchRespond:
+		return false, &SendPromptResult{Status: managedInputOwnerGoal, Goal: decision.Result}, nil
+	case GoalDispatchPrompt:
+		req.message = decision.RewrittenMessage
+		rejectIfBusy := decision.BusyPolicy == goalBusyPolicyRejectIfBusy
+		req.releaseSlotBeforeHooks = rejectIfBusy
+		return rejectIfBusy, nil, nil
+	default:
+		return false, nil, errors.New("session: Goal dispatcher returned an invalid decision")
+	}
+}
+
+func (m *Manager) goalCommandWorkspaceID(ctx context.Context, sessionID string) (string, error) {
+	if session, ok := m.Get(sessionID); ok {
+		info := session.Info()
+		if info != nil {
+			return strings.TrimSpace(info.WorkspaceID), nil
+		}
+		return "", errors.New("session: Goal command workspace is unavailable")
+	}
+	meta, err := m.readMetaWithContext(ctx, sessionID)
+	if err != nil {
+		return "", err
+	}
+	workspaceID := strings.TrimSpace(meta.WorkspaceID)
+	return workspaceID, nil
+}
+
+func (m *Manager) currentGoalCommandHandler() GoalCommandHandler {
+	if m == nil {
+		return nil
+	}
+	m.goalCommandMu.RLock()
+	defer m.goalCommandMu.RUnlock()
+	return m.goalCommandHandler
+}
+
+func validateGoalDispatchDecision(decision GoalDispatchDecision) error {
+	switch decision.Kind {
+	case GoalDispatchRespond:
+		if decision.Result == nil {
+			return errors.New("session: Goal response decision has no result")
+		}
+		return nil
+	case GoalDispatchPrompt:
+		if strings.TrimSpace(decision.RewrittenMessage) == "" || !decision.BypassGoalParse ||
+			decision.BusyPolicy != goalBusyPolicyRejectIfBusy || decision.BusyReason != GoalReasonDraftRequiresIdle {
+			return errors.New("session: Goal prompt decision is incomplete")
+		}
+		return nil
+	default:
+		return errors.New("session: Goal dispatch kind is invalid")
+	}
+}
+
+func goalErrorDecision(reason GoalReasonCode) GoalDispatchDecision {
+	return GoalDispatchDecision{
+		Kind: GoalDispatchRespond,
+		Result: &GoalCommandResult{
+			Outcome: GoalOutcomeError, ReasonCode: &reason,
+		},
+	}
+}
+
+func goalDraftBusyResult() SendPromptResult {
+	reason := GoalReasonDraftRequiresIdle
+	return SendPromptResult{
+		Status: managedInputOwnerGoal,
+		Goal:   &GoalCommandResult{Outcome: GoalOutcomeError, ReasonCode: &reason},
+	}
+}

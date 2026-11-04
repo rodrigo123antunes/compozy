@@ -1,0 +1,3316 @@
+package modelcatalog
+
+import (
+	"bufio"
+	"bytes"
+	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"io/fs"
+	"net/http"
+	"net/http/httptest"
+	"net/url"
+	"os"
+	"os/exec"
+	"path/filepath"
+	"runtime"
+	"slices"
+	"strings"
+	"sync"
+	"sync/atomic"
+	"testing"
+	"time"
+
+	"github.com/compozy/compozy/internal/acp"
+	compozyconfig "github.com/compozy/compozy/internal/config"
+	"github.com/compozy/compozy/internal/testutil"
+	"github.com/compozy/compozy/internal/vault"
+)
+
+// TestLiveProviderSources verifies discovery at provider I/O boundaries and source-specific capability ownership.
+func TestLiveProviderSources(t *testing.T) {
+	t.Parallel()
+
+	t.Run("Should map Codex OpenAI list output into provider live rows", func(t *testing.T) {
+		t.Parallel()
+
+		var sawAuth atomic.Bool
+		server := liveJSONServer(t, func(r *http.Request) string {
+			if got, want := r.Header.Get("Authorization"), "Bearer sk-codex-test"; got == want {
+				sawAuth.Store(true)
+			}
+			return `{"data":[{"id":"gpt-5.4","name":"GPT-5.4","supportsReasoning":true}]}`
+		})
+		provider := boundSecretProvider("OPENAI_API_KEY", "env:OPENAI_API_KEY")
+		provider.Models.Discovery.Endpoint = server.URL
+		source := newLiveSourceForTest(t, "codex", provider, &LiveProviderSourcesConfig{
+			BaseEnv:        []string{"PATH=/bin", "OPENAI_API_KEY=ambient-secret"},
+			SecretResolver: mapSecretResolver{"env:OPENAI_API_KEY": "sk-codex-test"},
+		})
+
+		rows, err := source.ListModels(testutil.Context(t), ListOptions{ProviderID: "codex", Now: testTime(0)})
+		if err != nil {
+			t.Fatalf("ListModels() error = %v", err)
+		}
+		row := requireSingleRow(t, rows)
+		if !sawAuth.Load() {
+			t.Fatal("Authorization header was not populated from bound_secret credential")
+		}
+		if row.ProviderID != "codex" || row.ModelID != "gpt-5.4" || row.SourceID != "provider_live:codex" {
+			t.Fatalf("row identity = %#v, want codex/gpt-5.4 provider_live:codex", row)
+		}
+		if row.Available == nil || !*row.Available {
+			t.Fatalf("Available = %v, want true", row.Available)
+		}
+		if row.SupportsReasoning == nil || !*row.SupportsReasoning {
+			t.Fatalf("SupportsReasoning = %v, want true", row.SupportsReasoning)
+		}
+		if len(row.ReasoningEfforts) != 0 {
+			t.Fatalf("ReasoningEfforts = %#v, want no invented levels", row.ReasoningEfforts)
+		}
+	})
+
+	t.Run("Should map Claude Anthropic supported models and drop unknown reasoning levels", func(t *testing.T) {
+		t.Parallel()
+
+		server := liveJSONServer(t, func(r *http.Request) string {
+			if got, want := r.Header.Get("x-api-key"), "sk-ant-test"; got != want {
+				t.Fatalf("x-api-key = %q, want %q", got, want)
+			}
+			if got := r.Header.Get("anthropic-version"); got == "" {
+				t.Fatal("anthropic-version header is empty")
+			}
+			return `{"data":[{` +
+				`"id":"claude-sonnet-4-6",` +
+				`"displayName":"Claude Sonnet 4.6",` +
+				`"supportsEffort":true,` +
+				`"supportedEffortLevels":["low","max","xhigh"]` +
+				`}]}`
+		})
+		provider := boundSecretProvider("ANTHROPIC_API_KEY", "env:ANTHROPIC_API_KEY")
+		provider.Models.Discovery.Endpoint = server.URL
+		source := newLiveSourceForTest(t, "claude", provider, &LiveProviderSourcesConfig{
+			BaseEnv:        []string{"PATH=/bin"},
+			SecretResolver: mapSecretResolver{"env:ANTHROPIC_API_KEY": "sk-ant-test"},
+		})
+
+		rows, err := source.ListModels(testutil.Context(t), ListOptions{ProviderID: "claude", Now: testTime(0)})
+		if err != nil {
+			t.Fatalf("ListModels() error = %v", err)
+		}
+		row := requireSingleRow(t, rows)
+		if row.DisplayName != "Claude Sonnet 4.6" {
+			t.Fatalf("DisplayName = %q, want Claude Sonnet 4.6", row.DisplayName)
+		}
+		if !slices.Equal(
+			row.ReasoningEfforts,
+			[]ReasoningEffort{ReasoningEffortLow, ReasoningEffortMax, ReasoningEffortXHigh},
+		) {
+			t.Fatalf("ReasoningEfforts = %#v, want low/max/xhigh", row.ReasoningEfforts)
+		}
+	})
+
+	t.Run("Should retain exact Claude versions and discover only their own advertised effort", func(t *testing.T) {
+		t.Parallel()
+		provider := compozyconfig.BuiltinProviders()["claude"]
+		provider.Command = "claude-acp"
+		provider.AuthMode = compozyconfig.ProviderAuthModeNone
+		modelOption := acp.SessionConfigOption{ID: "model", Category: "model", Kind: acp.SessionConfigOptionKindSelect,
+			CurrentValueID: "claude-fable-5-1[1m]", Values: []acp.SessionConfigOptionValue{
+				{Value: "claude-fable-5-1[1m]", Label: "Fable 5.1"},
+				{Value: "claude-fable-5-1", Label: "Fable 5.1"},
+				{Value: "claude-fable-5", Label: "Fable 5"},
+				{Value: "custom-deployment", Label: "Fable 5.1"},
+			}}
+		effort := acp.SessionConfigOption{
+			ID:             "deliberation",
+			Category:       "thought_level",
+			Kind:           acp.SessionConfigOptionKindSelect,
+			CurrentValueID: "high",
+			Values: []acp.SessionConfigOptionValue{
+				{Value: "default"},
+				{Value: "low"},
+				{Value: "high"},
+				{Value: "future-effort"},
+			},
+		}
+		probe := &fakeACPModelProbe{
+			options: []acp.SessionConfigOption{modelOption},
+			models: map[string][]acp.SessionConfigOption{
+				"claude-fable-5-1": {modelOption, effort},
+				"claude-fable-5-1[1m]": {modelOption, {ID: "effort", Kind: acp.SessionConfigOptionKindSelect,
+					CurrentValueID: "max", Values: []acp.SessionConfigOptionValue{{Value: "max"}}}},
+				"claude-fable-5":    {modelOption},
+				"custom-deployment": {{ID: "mode", Category: "mode"}, {ID: "effort", ReadOnly: true}},
+			},
+		}
+		source := newLiveSourceForTest(
+			t,
+			"claude",
+			provider,
+			&LiveProviderSourcesConfig{BaseEnv: []string{"PATH=/bin"}, ACPProbe: probe},
+		)
+		rows, err := source.ListModels(t.Context(), ListOptions{ProviderID: "claude", Now: testTime(0)})
+		if err != nil {
+			t.Fatal(err)
+		}
+		latest := requireModelRow(t, rows, "claude-fable-5-1")
+		assertClaudeTransportBinding(t, latest, "claude-fable-5-1[1m]")
+		preferred, ok := PreferredTransportBinding(latest.TransportBindings)
+		if !ok || preferred.TransportModelID != "claude-fable-5-1" {
+			t.Fatalf("preferred binding = %#v", preferred)
+		}
+		for _, binding := range latest.TransportBindings {
+			if len(binding.ConfigOptions) != 2 {
+				t.Fatalf("lost inspected options: %#v", binding)
+			}
+			if binding.TransportModelID == "claude-fable-5-1[1m]" && binding.ConfigOptions[1].CurrentValueID != "max" {
+				t.Fatalf("sibling profile replaced: %#v", binding)
+			}
+		}
+		if !slices.Equal(latest.ReasoningEfforts, []ReasoningEffort{"low", "high", "future-effort"}) ||
+			latest.DefaultReasoningEffort == nil || *latest.DefaultReasoningEffort != "high" {
+			t.Fatalf("latest profile = %#v", latest)
+		}
+		older := requireModelRow(t, rows, "claude-fable-5")
+		if len(older.ReasoningEfforts) != 0 {
+			t.Fatalf("leaked effort = %#v", older)
+		}
+		assertClaudeTransportBinding(t, requireModelRow(t, rows, "custom-deployment"), "custom-deployment")
+		custom := requireModelRow(t, rows, "custom-deployment")
+		if custom.TransportBindings[0].ConfigOptions == nil || len(custom.TransportBindings[0].ConfigOptions) != 0 {
+			t.Fatalf("inspected empty snapshot lost: %#v", custom.TransportBindings)
+		}
+		// An advertised provider default must not inherit a static explicit effort.
+		for i := range rows {
+			if rows[i].ModelID == latest.ModelID {
+				rows[i].DefaultReasoningEffort = nil
+			}
+		}
+		rows = append(
+			rows,
+			ModelRow{
+				ProviderID: "claude",
+				ModelID:    latest.ModelID,
+				SourceKind: SourceKindBuiltin,
+				Priority:   PriorityBuiltin,
+				DefaultReasoningEffort: new(
+					ReasoningEffort("low"),
+				),
+			},
+			ModelRow{
+				ProviderID:        "claude",
+				ModelID:           older.ModelID,
+				SourceKind:        SourceKindBuiltin,
+				Priority:          PriorityBuiltin,
+				SupportsReasoning: new(true),
+				ReasoningEfforts:  []ReasoningEffort{"max"},
+			},
+		)
+		merged := MergeRows(rows, MergeOptions{ReasoningApply: map[string]bool{"claude": true}})
+		for _, model := range merged {
+			if model.ModelID == latest.ModelID && model.DefaultReasoningEffort != nil {
+				t.Fatalf("provider default replaced by seed: %#v", model)
+			}
+			if model.ModelID == older.ModelID &&
+				(len(model.ReasoningEfforts) != 0 || model.SupportsReasoning == nil || !*model.SupportsReasoning) {
+				t.Fatalf("observed absence must override seed levels without denying reasoning: %#v", model)
+			}
+		}
+	})
+
+	t.Run("Should preserve Claude logical model ids and provider transport bindings", func(t *testing.T) {
+		t.Parallel()
+
+		provider := compozyconfig.BuiltinProviders()["claude"]
+		provider.Command = "claude-acp"
+		provider.AuthMode = compozyconfig.ProviderAuthModeNone
+		probe := &fakeACPModelProbe{options: []acp.SessionConfigOption{{
+			ID:       "model",
+			Category: "model",
+			Kind:     acp.SessionConfigOptionKindSelect,
+			Values: []acp.SessionConfigOptionValue{
+				{Value: "default", Label: "Default"},
+				{Value: "sonnet", Label: "Sonnet 5"},
+				{Value: "opus[1m]", Label: "Opus 5 1M"},
+				{Value: "haiku", Label: "Haiku 4.5"},
+				{Value: "claude-future-6", Label: "Claude Future 6"},
+			},
+		}}}
+		source := newLiveSourceForTest(t, "claude", provider, &LiveProviderSourcesConfig{
+			BaseEnv:  []string{"PATH=/bin"},
+			ACPProbe: probe,
+		})
+
+		rows, err := source.ListModels(testutil.Context(t), ListOptions{
+			ProviderID: "claude",
+			Now:        testTime(0),
+		})
+		if err != nil {
+			t.Fatalf("ListModels(Claude ACP) error = %v", err)
+		}
+		if got, want := rowModelIDs(rows), []string{
+			"claude-future-6",
+			"claude-haiku-4-5-20251001",
+			"claude-opus-5",
+			"claude-sonnet-5",
+			"default",
+		}; !slices.Equal(got, want) {
+			t.Fatalf("row ids = %#v, want %#v", got, want)
+		}
+		sonnet := requireModelRow(t, rows, "claude-sonnet-5")
+		if sonnet.DisplayName != "Sonnet 5" {
+			t.Fatalf("Claude Sonnet display name = %q, want canonical seed label", sonnet.DisplayName)
+		}
+		assertClaudeTransportBinding(t, requireModelRow(t, rows, "default"), "default")
+		assertClaudeTransportBinding(t, sonnet, "sonnet")
+
+		opus := requireModelRow(t, rows, "claude-opus-5")
+		if opus.DisplayName != "Opus 5 1M" {
+			t.Fatalf("Claude Opus display name = %q, want live label", opus.DisplayName)
+		}
+		assertClaudeTransportBinding(t, opus, "opus[1m]")
+		future := requireModelRow(t, rows, "claude-future-6")
+		assertClaudeTransportBinding(t, future, "claude-future-6")
+	})
+
+	t.Run("Should curate newly shipped Claude aliases under their advertised release ids", func(t *testing.T) {
+		t.Parallel()
+
+		provider := compozyconfig.BuiltinProviders()["claude"]
+		provider.Command = "claude-acp"
+		provider.AuthMode = compozyconfig.ProviderAuthModeNone
+		// Option list captured from claude-agent-acp after Opus 5.5 / Sonnet 5.5 / Fable 5.1
+		// shipped: current models are advertised only as version aliases.
+		probe := &fakeACPModelProbe{options: []acp.SessionConfigOption{{
+			ID:       "model",
+			Category: "model",
+			Kind:     acp.SessionConfigOptionKindSelect,
+			Values: []acp.SessionConfigOptionValue{
+				{Value: "default", Label: "Default (recommended)"},
+				{Value: "opus", Label: "Opus 5.5"},
+				{Value: "custom-deployment", Label: "Fable 5.1"},
+				{Value: "fable", Label: "Fable 5.1"},
+				{Value: "sonnet", Label: "Sonnet 5.5"},
+				{Value: "haiku", Label: "Haiku 4.5"},
+				{Value: "claude-sonnet-5", Label: "Sonnet 5"},
+				{Value: "claude-opus-5", Label: "Opus 5"},
+				{Value: "claude-fable-5", Label: "Fable 5"},
+				{Value: "claude-opus-4-8", Label: "Opus 4.8"},
+			},
+		}}}
+		source := newLiveSourceForTest(t, "claude", provider, &LiveProviderSourcesConfig{
+			BaseEnv:  []string{"PATH=/bin"},
+			ACPProbe: probe,
+		})
+		store := newMemoryStore()
+		service := newTestService(t, store, []Source{NewBuiltinSource(), source})
+		if _, err := service.Refresh(
+			testutil.Context(t),
+			RefreshOptions{ProviderID: "claude", Force: true, Now: testTime(0)},
+		); err != nil {
+			t.Fatalf("Refresh(claude) error = %v", err)
+		}
+		models, err := service.ListModels(testutil.Context(t), ListOptions{
+			ProviderID: "claude",
+			View:       CatalogViewCurated,
+			Now:        testTime(1),
+		})
+		if err != nil {
+			t.Fatalf("ListModels(curated claude) error = %v", err)
+		}
+		featured := make([]string, 0, len(models))
+		curated := make(map[string]Model, len(models))
+		for _, model := range models {
+			curated[model.ModelID] = model
+			if model.Featured {
+				featured = append(featured, model.ModelID)
+			}
+		}
+		slices.Sort(featured)
+		if want := []string{
+			"claude-fable-5-1", "claude-haiku-4-5-20251001", "claude-opus-5-5", "claude-sonnet-5-5",
+		}; !slices.Equal(featured, want) {
+			t.Fatalf("featured curated models = %#v, want provider aliases %#v", featured, want)
+		}
+		for _, pinned := range []string{"claude-opus-5", "claude-sonnet-5", "claude-fable-5", "claude-opus-4-8", "custom-deployment"} {
+			if model, ok := curated[pinned]; !ok || model.Featured {
+				t.Fatalf("pinned release %q = %#v (curated %v), want curated and not featured", pinned, model, ok)
+			}
+		}
+		if _, ok := curated["default"]; ok {
+			t.Fatal("provider default pointer was curated as a model")
+		}
+		if got := curated["claude-opus-5-5"].DisplayName; got != "Opus 5.5" {
+			t.Fatalf("claude-opus-5-5 display name = %q, want live label", got)
+		}
+		if !strings.HasPrefix(models[0].ModelID, "claude-") || !models[0].Featured {
+			t.Fatalf("first curated model = %#v, want a featured provider alias", models[0])
+		}
+		rows, err := source.ListModels(testutil.Context(t), ListOptions{ProviderID: "claude", Now: testTime(2)})
+		if err != nil {
+			t.Fatalf("ListModels(Claude ACP) error = %v", err)
+		}
+		assertClaudeTransportBinding(t, requireModelRow(t, rows, "claude-opus-5-5"), "opus")
+		assertClaudeTransportBinding(t, requireModelRow(t, rows, "claude-sonnet-5-5"), "sonnet")
+		assertClaudeTransportBinding(t, requireModelRow(t, rows, "claude-fable-5-1"), "fable")
+	})
+
+	t.Run("Should publish advertised Claude models with unknown reasoning when option probes fail", func(t *testing.T) {
+		t.Parallel()
+
+		provider := compozyconfig.BuiltinProviders()["claude"]
+		provider.Command = "claude-acp"
+		provider.AuthMode = compozyconfig.ProviderAuthModeNone
+		probe := &fakeACPModelProbe{
+			options: []acp.SessionConfigOption{{
+				ID:       "model",
+				Category: "model",
+				Kind:     acp.SessionConfigOptionKindSelect,
+				Values: []acp.SessionConfigOptionValue{
+					{Value: "opus", Label: "Opus 5.5"},
+					{Value: "claude-sonnet-5", Label: "Sonnet 5"},
+					{Value: "claude-fable-5-1[1m]", Label: "Fable 5.1 1M"},
+				},
+			}},
+			models: map[string][]acp.SessionConfigOption{"opus": {{
+				ID:             "effort",
+				Category:       "thought_level",
+				Kind:           acp.SessionConfigOptionKindSelect,
+				CurrentValueID: "high",
+				Values:         []acp.SessionConfigOptionValue{{Value: "low"}, {Value: "high"}},
+			}}},
+			modelErrors: map[string]error{
+				"claude-sonnet-5":      context.DeadlineExceeded,
+				"claude-fable-5-1[1m]": errors.New("Couldn't confirm model with the API"),
+			},
+		}
+		source := newLiveSourceForTest(t, "claude", provider, &LiveProviderSourcesConfig{
+			BaseEnv:  []string{"PATH=/bin"},
+			ACPProbe: probe,
+		})
+		// The builtin source seeds claude-sonnet-5 with static effort levels.
+		service := newTestService(t, newMemoryStore(), []Source{NewBuiltinSource(), source})
+		service.UpdateMergeOptions(MergeOptions{ReasoningApply: map[string]bool{"claude": true}})
+		if _, err := service.Refresh(
+			testutil.Context(t),
+			RefreshOptions{ProviderID: "claude", Force: true, Now: testTime(0)},
+		); err != nil {
+			t.Fatalf("Refresh(claude) error = %v, want advertised rows despite failed probes", err)
+		}
+		models, err := service.ListModels(testutil.Context(t), ListOptions{
+			ProviderID: "claude",
+			View:       CatalogViewAll,
+			Now:        testTime(1),
+		})
+		if err != nil {
+			t.Fatalf("ListModels(claude) error = %v", err)
+		}
+		byID := make(map[string]Model, len(models))
+		for _, model := range models {
+			byID[model.ModelID] = model
+		}
+		opus := byID["claude-opus-5-5"]
+		if !opus.ReasoningKnown || !slices.Equal(opus.ReasoningEfforts, []ReasoningEffort{"low", "high"}) {
+			t.Fatalf("probed model = %#v, want observed low/high efforts", opus)
+		}
+		for _, modelID := range []string{"claude-sonnet-5", "claude-fable-5-1"} {
+			model, ok := byID[modelID]
+			if !ok || model.Stale || model.Available == nil || !*model.Available {
+				t.Fatalf("unprobed model %q = %#v (listed %v), want fresh and available", modelID, model, ok)
+			}
+			if model.ReasoningKnown || len(model.ReasoningEfforts) != 0 || model.DefaultReasoningEffort != nil {
+				t.Fatalf(
+					"unprobed model %q reasoning = known %v efforts %#v default %v, want unknown without seed levels",
+					modelID, model.ReasoningKnown, model.ReasoningEfforts, model.DefaultReasoningEffort,
+				)
+			}
+			if !strings.Contains(model.LastError, "model options unavailable") {
+				t.Fatalf("unprobed model %q LastError = %q, want probe failure provenance", modelID, model.LastError)
+			}
+		}
+	})
+
+	t.Run(
+		"Should record unavailable Claude runtime when native CLI auth cannot satisfy HTTP discovery",
+		func(t *testing.T) {
+			t.Parallel()
+
+			store := newMemoryStore()
+			source := newLiveSourceForTest(t, "claude", compozyconfig.ProviderConfig{}, &LiveProviderSourcesConfig{
+				BaseEnv: []string{"PATH=/bin", "ANTHROPIC_API_KEY=ambient-secret"},
+			})
+			service := newTestService(t, store, []Source{source})
+
+			statuses, err := service.Refresh(
+				testutil.Context(t),
+				RefreshOptions{ProviderID: "claude", Force: true, Now: testTime(0)},
+			)
+			if !errors.Is(err, ErrAllSourcesFailed) {
+				t.Fatalf("Refresh() error = %v, want ErrAllSourcesFailed", err)
+			}
+			status := requireStatus(t, statuses, "provider_live:claude")
+			if status.RefreshState != RefreshStateFailed {
+				t.Fatalf("RefreshState = %q, want failed", status.RefreshState)
+			}
+			if strings.Contains(status.LastError, "ambient-secret") {
+				t.Fatalf("LastError = %q, want no ambient secret", status.LastError)
+			}
+		},
+	)
+
+	t.Run("Should preserve OpenRouter and Vercel provider model ids", func(t *testing.T) {
+		t.Parallel()
+
+		openRouterServer := liveJSONServer(t, func(r *http.Request) string {
+			if got, want := r.Header.Get("Authorization"), "Bearer sk-router"; got != want {
+				t.Fatalf("OpenRouter Authorization = %q, want %q", got, want)
+			}
+			return `{"data":[{"id":"anthropic/claude-sonnet-4-6","name":"Claude via OpenRouter"}]}`
+		})
+		openRouter := boundSecretProvider("OPENROUTER_API_KEY", "env:OPENROUTER_API_KEY")
+		openRouter.Models.Discovery.Endpoint = openRouterServer.URL
+		routerRows, err := newLiveSourceForTest(t, "openrouter", openRouter, &LiveProviderSourcesConfig{
+			BaseEnv:        []string{"PATH=/bin"},
+			SecretResolver: mapSecretResolver{"env:OPENROUTER_API_KEY": "sk-router"},
+		}).ListModels(testutil.Context(t), ListOptions{ProviderID: "openrouter", Now: testTime(0)})
+		if err != nil {
+			t.Fatalf("OpenRouter ListModels() error = %v", err)
+		}
+		if got, want := requireSingleRow(t, routerRows).ModelID, "anthropic/claude-sonnet-4-6"; got != want {
+			t.Fatalf("OpenRouter ModelID = %q, want %q", got, want)
+		}
+
+		vercelServer := liveJSONServer(t, func(_ *http.Request) string {
+			return `{"data":[{` +
+				`"id":"openai/gpt-5.4",` +
+				`"name":"GPT-5.4",` +
+				`"context_window":1000000,` +
+				`"max_tokens":32000,` +
+				`"pricing":{"input":"0.000001","output":0.000002}` +
+				`}]}`
+		})
+		vercel := compozyconfig.ProviderConfig{}
+		vercel.Models.Discovery.Endpoint = vercelServer.URL
+		vercelRows, err := newLiveSourceForTest(t, "vercel-ai-gateway", vercel, &LiveProviderSourcesConfig{
+			BaseEnv: []string{"PATH=/bin"},
+		}).ListModels(testutil.Context(t), ListOptions{ProviderID: "vercel-ai-gateway", Now: testTime(0)})
+		if err != nil {
+			t.Fatalf("Vercel ListModels() error = %v", err)
+		}
+		vercelRow := requireSingleRow(t, vercelRows)
+		if vercelRow.ModelID != "openai/gpt-5.4" {
+			t.Fatalf("Vercel ModelID = %q, want openai/gpt-5.4", vercelRow.ModelID)
+		}
+		if vercelRow.ContextWindow == nil || *vercelRow.ContextWindow != 1000000 {
+			t.Fatalf("ContextWindow = %v, want 1000000", vercelRow.ContextWindow)
+		}
+		if vercelRow.CostInputPerMillion == nil || *vercelRow.CostInputPerMillion != 1 {
+			t.Fatalf("CostInputPerMillion = %v, want 1", vercelRow.CostInputPerMillion)
+		}
+	})
+
+	t.Run("Should parse Gemini model envelope fields", func(t *testing.T) {
+		t.Parallel()
+
+		server := liveJSONServer(t, func(r *http.Request) string {
+			if got, want := r.Header.Get("x-goog-api-key"), "gemini-key"; got != want {
+				t.Fatalf("x-goog-api-key = %q, want %q", got, want)
+			}
+			return `{"models":[{` +
+				`"name":"models/gemini-3.1-pro",` +
+				`"displayName":"Gemini 3.1 Pro",` +
+				`"inputTokenLimit":1000000,` +
+				`"outputTokenLimit":65536,` +
+				`"supportedGenerationMethods":["generateContent"]` +
+				`}]}`
+		})
+		provider := boundSecretProvider("GEMINI_API_KEY", "env:GEMINI_API_KEY")
+		provider.Models.Discovery.Endpoint = server.URL
+		rows, err := newLiveSourceForTest(t, "gemini", provider, &LiveProviderSourcesConfig{
+			BaseEnv:        []string{"PATH=/bin"},
+			SecretResolver: mapSecretResolver{"env:GEMINI_API_KEY": "gemini-key"},
+		}).ListModels(testutil.Context(t), ListOptions{ProviderID: "gemini", Now: testTime(0)})
+		if err != nil {
+			t.Fatalf("ListModels() error = %v", err)
+		}
+		row := requireSingleRow(t, rows)
+		if row.ModelID != "gemini-3.1-pro" {
+			t.Fatalf("ModelID = %q, want gemini-3.1-pro", row.ModelID)
+		}
+		if row.MaxInputTokens == nil || *row.MaxInputTokens != 1000000 {
+			t.Fatalf("MaxInputTokens = %v, want 1000000", row.MaxInputTokens)
+		}
+		if row.SupportsTools == nil || !*row.SupportsTools {
+			t.Fatalf("SupportsTools = %v, want true from generateContent capability", row.SupportsTools)
+		}
+	})
+
+	t.Run("Should parse Ollama HTTP tags", func(t *testing.T) {
+		t.Parallel()
+
+		server := liveJSONServer(t, func(_ *http.Request) string {
+			return `{"models":[{"name":"llama3:latest","model":"llama3:latest"}]}`
+		})
+		provider := compozyconfig.ProviderConfig{}
+		provider.Models.Discovery.Endpoint = server.URL
+		rows, err := newLiveSourceForTest(t, "ollama", provider, &LiveProviderSourcesConfig{
+			BaseEnv: []string{"PATH=/bin"},
+		}).ListModels(testutil.Context(t), ListOptions{ProviderID: "ollama", Now: testTime(0)})
+		if err != nil {
+			t.Fatalf("ListModels() error = %v", err)
+		}
+		if got, want := requireSingleRow(t, rows).ModelID, "llama3:latest"; got != want {
+			t.Fatalf("ModelID = %q, want %q", got, want)
+		}
+	})
+
+	t.Run("Should classify blocked discovery as permanent and preflight it without probing", func(t *testing.T) {
+		t.Parallel()
+
+		var requests atomic.Int32
+		server := liveJSONServer(t, func(_ *http.Request) string {
+			requests.Add(1)
+			return `{"data":[]}`
+		})
+		openRouter := boundSecretProvider("OPENROUTER_API_KEY", "env:OPENROUTER_API_KEY")
+		openRouter.Models.Discovery.Endpoint = server.URL
+		missingSecret := newLiveSourceForTest(t, "openrouter", openRouter, &LiveProviderSourcesConfig{
+			BaseEnv:        []string{"PATH=/bin"},
+			SecretResolver: mapSecretResolver{},
+		})
+		_, err := missingSecret.ListModels(testutil.Context(t), ListOptions{ProviderID: "openrouter", Now: testTime(0)})
+		if !IsPermanentSourceFailure(err) {
+			t.Fatalf("missing secret ListModels() error = %v, want permanent failure", err)
+		}
+		if err := missingSecret.DiscoveryPreflight(testutil.Context(t)); !errors.Is(err, vault.ErrMissingSecret) {
+			t.Fatalf("missing secret DiscoveryPreflight() error = %v, want vault.ErrMissingSecret", err)
+		}
+		withSecret := newLiveSourceForTest(t, "openrouter", openRouter, &LiveProviderSourcesConfig{
+			BaseEnv:        []string{"PATH=/bin"},
+			SecretResolver: mapSecretResolver{"env:OPENROUTER_API_KEY": "sk-router"},
+		})
+		if err := withSecret.DiscoveryPreflight(testutil.Context(t)); err != nil {
+			t.Fatalf("bound secret DiscoveryPreflight() error = %v, want nil", err)
+		}
+		if got := requests.Load(); got != 0 {
+			t.Fatalf("discovery requests during preflight = %d, want 0", got)
+		}
+
+		unconfigured := newLiveSourceForTest(t, "pi", compozyconfig.ProviderConfig{}, &LiveProviderSourcesConfig{
+			BaseEnv: []string{"PATH=/bin"},
+		})
+		_, err = unconfigured.ListModels(testutil.Context(t), ListOptions{ProviderID: "pi", Now: testTime(0)})
+		if !IsPermanentSourceFailure(err) || !strings.Contains(err.Error(), "no configured model discovery path") {
+			t.Fatalf("unconfigured ListModels() error = %v, want permanent missing discovery path", err)
+		}
+		if err := unconfigured.DiscoveryPreflight(testutil.Context(t)); !IsPermanentSourceFailure(err) {
+			t.Fatalf("unconfigured DiscoveryPreflight() error = %v, want permanent failure", err)
+		}
+
+		if runtime.GOOS == "windows" {
+			return
+		}
+		binDir := t.TempDir()
+		executor := &fakeDiscoveryExecutor{}
+		commandProvider := compozyconfig.ProviderConfig{}
+		commandProvider.Models.Discovery.Command = "compozy-discovery-fixture --json"
+		missingBinary := newLiveSourceForTest(t, "ollama", commandProvider, &LiveProviderSourcesConfig{
+			BaseEnv:         []string{"PATH=" + binDir},
+			CommandExecutor: executor,
+		})
+		err = missingBinary.DiscoveryPreflight(testutil.Context(t))
+		if !errors.Is(err, exec.ErrNotFound) || !IsPermanentSourceFailure(err) {
+			t.Fatalf("missing binary DiscoveryPreflight() error = %v, want permanent exec.ErrNotFound", err)
+		}
+		if err := os.WriteFile(
+			filepath.Join(binDir, "compozy-discovery-fixture"),
+			[]byte("#!/bin/sh\n"),
+			0o755,
+		); err != nil {
+			t.Fatalf("WriteFile(discovery fixture) error = %v", err)
+		}
+		if err := missingBinary.DiscoveryPreflight(testutil.Context(t)); err != nil {
+			t.Fatalf("installed binary DiscoveryPreflight() error = %v, want nil", err)
+		}
+		if got := len(executor.requests); got != 0 {
+			t.Fatalf("discovery commands during preflight = %d, want 0", got)
+		}
+	})
+
+	t.Run("Should preflight the native CLI that ACP discovery resolves without probing", func(t *testing.T) {
+		t.Parallel()
+
+		if runtime.GOOS == "windows" {
+			t.Skip("executable fixtures require Unix semantics")
+		}
+		install := func(t *testing.T, dir string, name string) {
+			t.Helper()
+			if err := os.WriteFile(filepath.Join(dir, name), []byte("#!/bin/sh\n"), 0o755); err != nil {
+				t.Fatalf("WriteFile(%s fixture) error = %v", name, err)
+			}
+		}
+
+		// Claude bridges through the npx launcher, which also needs the native CLI.
+		claudeBin := t.TempDir()
+		install(t, claudeBin, "npx")
+		acpProbe := &fakeACPModelProbe{}
+		claude := newLiveSourceForTest(t, "claude", compozyconfig.ProviderConfig{
+			Command: "npx -y @agentclientprotocol/claude-agent-acp@latest",
+		}, &LiveProviderSourcesConfig{
+			BaseEnv: []string{"PATH=" + claudeBin, "HOME=" + t.TempDir()}, ACPProbe: acpProbe,
+		})
+		err := claude.DiscoveryPreflight(testutil.Context(t))
+		if !errors.Is(err, exec.ErrNotFound) || !IsPermanentSourceFailure(err) {
+			t.Fatalf("missing claude DiscoveryPreflight() error = %v, want permanent exec.ErrNotFound", err)
+		}
+		_, listErr := claude.ListModels(testutil.Context(t), ListOptions{ProviderID: "claude", Now: testTime(0)})
+		if listErr == nil || listErr.Error() != err.Error() {
+			t.Fatalf("ListModels() error = %v, want the preflight cause %v", listErr, err)
+		}
+		install(t, claudeBin, "claude")
+		if err := claude.DiscoveryPreflight(testutil.Context(t)); err != nil {
+			t.Fatalf("installed claude DiscoveryPreflight() error = %v, want nil", err)
+		}
+
+		// Native Codex discovery runs the CLI directly, so the unused npx launcher is not required.
+		codexBin := t.TempDir()
+		codexProbe := &recordingCodexProbe{}
+		codex := newLiveSourceForTest(t, "codex", compozyconfig.BuiltinProviders()["codex"], &LiveProviderSourcesConfig{
+			BaseEnv: []string{"PATH=" + codexBin, "HOME=" + t.TempDir()}, CodexProbe: codexProbe,
+		})
+		err = codex.DiscoveryPreflight(testutil.Context(t))
+		if !errors.Is(err, exec.ErrNotFound) || !IsPermanentSourceFailure(err) {
+			t.Fatalf("missing codex DiscoveryPreflight() error = %v, want permanent exec.ErrNotFound", err)
+		}
+		install(t, codexBin, "codex")
+		if err := codex.DiscoveryPreflight(testutil.Context(t)); err != nil {
+			t.Fatalf("installed codex DiscoveryPreflight() error = %v, want nil without npx", err)
+		}
+
+		if got := len(acpProbe.requests); got != 0 {
+			t.Fatalf("ACP probes = %d, want 0", got)
+		}
+		if got := codexProbe.calls.Load(); got != 0 {
+			t.Fatalf("Codex probes = %d, want 0", got)
+		}
+	})
+
+	t.Run("Should recover HTTP discovery at the next transient backoff", func(t *testing.T) {
+		t.Parallel()
+
+		var healthy atomic.Bool
+		var requests atomic.Int32
+		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			requests.Add(1)
+			if !healthy.Load() {
+				w.WriteHeader(http.StatusServiceUnavailable)
+				return
+			}
+			w.Header().Set("Content-Type", "application/json")
+			if _, err := fmt.Fprint(w, `{"data":[{"id":"gpt-fixture"}]}`); err != nil {
+				t.Errorf("Fprint(response) error = %v", err)
+			}
+		}))
+		t.Cleanup(server.Close)
+		provider := boundSecretProvider("OPENAI_API_KEY", "env:OPENAI_API_KEY")
+		provider.Models.Discovery.Endpoint = server.URL
+		source := newLiveSourceForTest(t, "openai", provider, &LiveProviderSourcesConfig{
+			BaseEnv: []string{"PATH=/bin"}, SecretResolver: mapSecretResolver{"env:OPENAI_API_KEY": "fixture-token"},
+		})
+		service := newTestService(t, newMemoryStore(), []Source{source})
+		opts := RefreshOptions{ProviderID: "openai", SourceID: source.ID(), Now: testTime(0)}
+		statuses, err := service.Refresh(testutil.Context(t), opts)
+		if !errors.Is(err, ErrAllSourcesFailed) {
+			t.Fatalf("Refresh(HTTP 503) error = %v, want ErrAllSourcesFailed", err)
+		}
+		failed := requireStatus(t, statuses, source.ID())
+		if failed.PermanentFailureHeld() || !failed.NextRefresh.Equal(opts.Now.Add(source.TTL())) {
+			t.Fatalf("failed status = %#v, want transient retry at TTL", failed)
+		}
+		healthy.Store(true)
+		opts.Now = failed.NextRefresh.Add(-time.Second)
+		if _, err := service.Refresh(testutil.Context(t), opts); err != nil {
+			t.Fatalf("Refresh(inside backoff) error = %v", err)
+		}
+		if got := requests.Load(); got != 1 {
+			t.Fatalf("HTTP requests during backoff = %d, want 1", got)
+		}
+		opts.Now = failed.NextRefresh
+		statuses, err = service.Refresh(testutil.Context(t), opts)
+		if err != nil {
+			t.Fatalf("Refresh(recovered HTTP) error = %v", err)
+		}
+		if got := requireStatus(
+			t,
+			statuses,
+			source.ID(),
+		); got.RefreshState != RefreshStateSucceeded ||
+			got.RowCount != 1 {
+			t.Fatalf("recovered status = %#v, want one successful model row", got)
+		}
+		if got := requests.Load(); got != 2 {
+			t.Fatalf("HTTP requests after recovery = %d, want 2", got)
+		}
+	})
+
+	t.Run("Should keep a missing command failure identical between preflight and real execution", func(t *testing.T) {
+		t.Parallel()
+		provider := compozyconfig.ProviderConfig{}
+		provider.Models.Discovery.Command = filepath.Join(t.TempDir(), "missing-discovery") + " --json"
+		source := newLiveSourceForTest(
+			t,
+			"ollama",
+			provider,
+			&LiveProviderSourcesConfig{BaseEnv: []string{"PATH=/bin"}},
+		)
+		preflightErr := source.DiscoveryPreflight(testutil.Context(t))
+		if !errors.Is(preflightErr, exec.ErrNotFound) {
+			t.Fatalf("DiscoveryPreflight() error = %v, want exec.ErrNotFound", preflightErr)
+		}
+		_, discoveryErr := source.ListModels(testutil.Context(t), ListOptions{ProviderID: "ollama", Now: testTime(0)})
+		if !errors.Is(discoveryErr, exec.ErrNotFound) || !IsPermanentSourceFailure(discoveryErr) {
+			t.Fatalf("ListModels() error = %v, want permanent exec.ErrNotFound", discoveryErr)
+		}
+		service := newTestService(t, newMemoryStore(), []Source{source})
+		statuses, err := service.Refresh(testutil.Context(t), RefreshOptions{
+			ProviderID: "ollama", SourceID: source.ID(), Now: testTime(0),
+		})
+		if !errors.Is(err, ErrAllSourcesFailed) {
+			t.Fatalf("Refresh() error = %v, want ErrAllSourcesFailed", err)
+		}
+		status := requireStatus(t, statuses, source.ID())
+		if !status.PermanentFailureHeld() || !status.HeldCauseUnchanged(preflightErr) {
+			t.Fatalf("status = %#v, want the unchanged real launch failure held by preflight", status)
+		}
+	})
+
+	t.Run("Should back off a launch failure when the executable itself exists", func(t *testing.T) {
+		t.Parallel()
+		if runtime.GOOS == "windows" {
+			t.Skip("requires a script interpreter fixture")
+		}
+		root := t.TempDir()
+		command := filepath.Join(root, "discovery")
+		if err := os.WriteFile(
+			command,
+			[]byte("#!"+filepath.Join(root, "missing-interpreter")+"\n"),
+			0o755,
+		); err != nil {
+			t.Fatal(err)
+		}
+		provider := compozyconfig.ProviderConfig{}
+		provider.Models.Discovery.Command = command
+		source := newLiveSourceForTest(
+			t,
+			"ollama",
+			provider,
+			&LiveProviderSourcesConfig{BaseEnv: []string{"PATH=/bin"}},
+		)
+		if err := source.DiscoveryPreflight(testutil.Context(t)); err != nil {
+			t.Fatalf("DiscoveryPreflight() error = %v, want existing executable", err)
+		}
+		_, err := source.ListModels(testutil.Context(t), ListOptions{ProviderID: "ollama", Now: testTime(0)})
+		if err == nil || !errors.Is(err, fs.ErrNotExist) || IsPermanentSourceFailure(err) {
+			t.Fatalf("ListModels() error = %v, want transient missing-interpreter launch failure", err)
+		}
+		service := newTestService(t, newMemoryStore(), []Source{source})
+		statuses, err := service.Refresh(testutil.Context(t), RefreshOptions{
+			ProviderID: "ollama", SourceID: source.ID(), Now: testTime(0),
+		})
+		if !errors.Is(err, ErrAllSourcesFailed) {
+			t.Fatalf("Refresh() error = %v, want ErrAllSourcesFailed", err)
+		}
+		if status := requireStatus(t, statuses, source.ID()); status.PermanentFailureHeld() ||
+			!status.NextRefresh.Equal(testTime(0).Add(source.TTL())) {
+			t.Fatalf("launch failure status = %#v, want transient backoff instead of a permanent hold", status)
+		}
+	})
+
+	t.Run("Should park invalid discovery timeouts until configuration changes", func(t *testing.T) {
+		t.Parallel()
+		for _, timeout := range []string{"invalid", "0s", "-1s"} {
+			t.Run("Should reject "+timeout, func(t *testing.T) {
+				t.Parallel()
+				provider := compozyconfig.BuiltinProviders()["codex"]
+				provider.Models.Discovery.Timeout = timeout
+				source := newLiveSourceForTest(t, "codex", provider, &LiveProviderSourcesConfig{})
+				_, err := source.ListModels(t.Context(), ListOptions{ProviderID: "codex", Now: testTime(0)})
+				if !IsPermanentSourceFailure(err) {
+					t.Fatalf("ListModels() = %v, want permanent failure", err)
+				}
+				if err := source.DiscoveryPreflight(t.Context()); !IsPermanentSourceFailure(err) {
+					t.Fatalf("preflight = %v", err)
+				}
+			})
+		}
+	})
+
+	t.Run("Should classify permanent and transient discovery failures", func(t *testing.T) {
+		t.Parallel()
+
+		for _, tc := range []struct {
+			name      string
+			err       error
+			permanent bool
+		}{
+			{name: "HTTP 503", err: errors.New(`model catalog: live discovery for "opencode" returned HTTP 503`)},
+			{name: "exit with 503 output", err: errors.New("exit status 1: HTTP 503 Service Unavailable")},
+			{name: "timeout", err: fmt.Errorf("live discovery timed out: %w", context.DeadlineExceeded)},
+			{name: "process crash", err: errors.New("signal: killed")},
+			{name: "connection refused", err: errors.New("dial tcp 127.0.0.1:11434: connect: connection refused")},
+			{name: "HTTP 403", err: errors.New(`model catalog: live discovery for "openai" returned HTTP 403`)},
+			{name: "generic permission denied", err: errors.New("exit status 1: permission denied")},
+			{
+				name: "filesystem permission denied",
+				err: fmt.Errorf("model catalog: read discovery cache: %w", &fs.PathError{
+					Op: "open", Path: "/tmp/compozy-discovery-cache", Err: fs.ErrPermission,
+				}),
+			},
+			{
+				name:      "login required",
+				err:       fmt.Errorf("exit status 1: %s", "Error: Authentication required. Run 'agent login' first."),
+				permanent: true,
+			},
+			{
+				name:      "executable not on PATH",
+				err:       fmt.Errorf(`acp: start agent "compozy-model-catalog" subprocess: %w`, exec.ErrNotFound),
+				permanent: true,
+			},
+			{
+				name: "absolute executable missing",
+				err: fmt.Errorf("acp: start: %w", &os.PathError{
+					Op: "fork/exec", Path: filepath.Join(t.TempDir(), "missing-acp"), Err: os.ErrNotExist,
+				}),
+				permanent: true,
+			},
+		} {
+			t.Run("Should classify "+tc.name, func(t *testing.T) {
+				t.Parallel()
+				if got := IsPermanentSourceFailure(tc.err); got != tc.permanent {
+					t.Fatalf("IsPermanentSourceFailure(%s) = %t, want %t", tc.name, got, tc.permanent)
+				}
+			})
+		}
+	})
+
+	t.Run("Should aggregate Cursor CLI aliases into logical models", func(t *testing.T) {
+		t.Parallel()
+
+		fixture, err := os.ReadFile("testdata/cursor-agent-models.txt")
+		if err != nil {
+			t.Fatalf("ReadFile(Cursor models fixture) error = %v", err)
+		}
+		executor := &fakeDiscoveryExecutor{result: DiscoveryCommandResult{Stdout: string(fixture)}}
+		provider := compozyconfig.ProviderConfig{HomePolicy: compozyconfig.ProviderHomePolicyOperator}
+		source := newLiveSourceForTest(t, "cursor", provider, &LiveProviderSourcesConfig{
+			BaseEnv:         []string{"PATH=/bin", "HOME=/Users/operator"},
+			CommandExecutor: executor,
+		})
+
+		rows, err := source.ListModels(testutil.Context(t), ListOptions{
+			ProviderID: "cursor",
+			Now:        testTime(0),
+		})
+		if err != nil {
+			t.Fatalf("ListModels() error = %v", err)
+		}
+		if got, want := rowModelIDs(rows), []string{
+			"claude-opus-5",
+			"composer-2.5",
+			"grok-4.5",
+			"grok-4.6",
+		}; !slices.Equal(got, want) {
+			t.Fatalf("row ids = %#v, want %#v", got, want)
+		}
+		if rows[0].DisplayName != "Claude Opus 5 1M" || rows[1].DisplayName != "Composer 2.5" ||
+			rows[2].DisplayName != "Cursor Grok 4.5" || rows[3].DisplayName != "Cursor Grok 4.6" {
+			t.Fatalf("display names = %#v, want logical model labels", []string{
+				rows[0].DisplayName,
+				rows[1].DisplayName,
+				rows[2].DisplayName,
+				rows[3].DisplayName,
+			})
+		}
+		opus := rows[0]
+		if opus.SupportsReasoning == nil || !*opus.SupportsReasoning {
+			t.Fatalf("Opus 5 SupportsReasoning = %v, want true", opus.SupportsReasoning)
+		}
+		if !slices.Equal(opus.ReasoningEfforts, []ReasoningEffort{
+			ReasoningEffortLow,
+			ReasoningEffortMedium,
+			ReasoningEffortHigh,
+			ReasoningEffortXHigh,
+			ReasoningEffortMax,
+		}) {
+			t.Fatalf("Opus 5 ReasoningEfforts = %#v, want all fixture efforts", opus.ReasoningEfforts)
+		}
+		if opus.DefaultReasoningEffort == nil || *opus.DefaultReasoningEffort != ReasoningEffortHigh {
+			t.Fatalf("Opus 5 DefaultReasoningEffort = %v, want high", opus.DefaultReasoningEffort)
+		}
+		if len(opus.ConfigOptions) != 1 || opus.ConfigOptions[0].ID != "thinking" ||
+			opus.ConfigOptions[0].Kind != ModelOptionKindBoolean ||
+			opus.ConfigOptions[0].CurrentBool == nil || *opus.ConfigOptions[0].CurrentBool {
+			t.Fatalf("Opus 5 ConfigOptions = %#v, want thinking=false", opus.ConfigOptions)
+		}
+		assertCursorBinding(t, opus, "claude-opus-5-thinking-high-fast", ReasoningEffortHigh, true, new(true))
+		assertCursorBinding(t, opus, "claude-opus-5-low", ReasoningEffortLow, false, new(false))
+		if got, want := len(opus.TransportBindings), 16; got != want {
+			t.Fatalf("Opus 5 transport bindings = %d, want %d", got, want)
+		}
+
+		grok45 := rows[2]
+		if grok45.SupportsReasoning == nil || !*grok45.SupportsReasoning ||
+			!slices.Equal(grok45.ReasoningEfforts, []ReasoningEffort{
+				ReasoningEffortLow,
+				ReasoningEffortMedium,
+				ReasoningEffortHigh,
+			}) {
+			t.Fatalf("Grok 4.5 reasoning profile = %#v, want low/medium/high", grok45)
+		}
+		assertCursorBinding(t, grok45, "cursor-grok-4.5-high-fast", ReasoningEffortHigh, true, nil)
+		if got, want := len(grok45.TransportBindings), 6; got != want {
+			t.Fatalf("Grok 4.5 transport bindings = %d, want %d", got, want)
+		}
+
+		grok46 := rows[3]
+		if grok46.SupportsReasoning == nil || !*grok46.SupportsReasoning ||
+			!slices.Equal(grok46.ReasoningEfforts, []ReasoningEffort{
+				ReasoningEffortLow,
+				ReasoningEffortMedium,
+				ReasoningEffortHigh,
+				ReasoningEffortXHigh,
+			}) {
+			t.Fatalf("Grok 4.6 reasoning profile = %#v, want low/medium/high/xhigh", grok46.ReasoningEfforts)
+		}
+		if grok46.DefaultReasoningEffort == nil || *grok46.DefaultReasoningEffort != ReasoningEffortHigh {
+			t.Fatalf("Grok 4.6 DefaultReasoningEffort = %v, want high", grok46.DefaultReasoningEffort)
+		}
+		assertCursorBinding(t, grok46, "cursor-grok-4.6-xhigh-fast", ReasoningEffortXHigh, true, nil)
+		if got, want := len(grok46.TransportBindings), 8; got != want {
+			t.Fatalf("Grok 4.6 transport bindings = %d, want %d", got, want)
+		}
+		// Launch-argument providers apply effort through the discovered transport binding.
+		projected := MergeRows(rows, MergeOptions{})
+		for _, model := range projected {
+			if model.ModelID == "grok-4.6" {
+				requireReasoningProfile(t, model, true, grok46.ReasoningEfforts, ReasoningEffortHigh)
+			}
+		}
+
+		if !source.BootstrapOnList() {
+			t.Fatal("BootstrapOnList() = false, want true")
+		}
+		req := executor.singleRequest(t)
+		if req.Command != "cursor-agent" || !slices.Equal(req.Args, []string{"models"}) {
+			t.Fatalf("command = %q %v, want cursor-agent models", req.Command, req.Args)
+		}
+		if got := envValue(req.Env, "HOME"); got != "/Users/operator" {
+			t.Fatalf("HOME = %q, want operator home", got)
+		}
+	})
+
+	t.Run("Should use the resolved native Claude executable for ACP discovery", func(t *testing.T) {
+		t.Parallel()
+		if runtime.GOOS == "windows" {
+			t.Skip("executable symlink fixture requires Unix semantics")
+		}
+
+		binDir := t.TempDir()
+		testExecutable, err := os.Executable()
+		if err != nil {
+			t.Fatalf("os.Executable() error = %v", err)
+		}
+		claudeExecutable := filepath.Join(binDir, "claude")
+		if err := os.Symlink(testExecutable, claudeExecutable); err != nil {
+			t.Fatalf("Symlink(claude executable) error = %v", err)
+		}
+		probe := &fakeACPModelProbe{options: []acp.SessionConfigOption{{
+			ID: "model", Kind: acp.SessionConfigOptionKindSelect,
+			Values: []acp.SessionConfigOptionValue{{Value: "claude-fable-5", Label: "Claude Fable 5"}},
+		}}}
+		provider := compozyconfig.ProviderConfig{
+			Command: "npx -y @agentclientprotocol/claude-agent-acp@latest",
+		}
+		source := newLiveSourceForTest(t, "claude", provider, &LiveProviderSourcesConfig{
+			BaseEnv:  []string{"PATH=" + binDir, "HOME=" + t.TempDir()},
+			ACPProbe: probe,
+		})
+
+		rows, err := source.ListModels(testutil.Context(t), ListOptions{
+			ProviderID: "claude",
+			Now:        testTime(0),
+		})
+		if err != nil {
+			t.Fatalf("ListModels(Claude ACP) error = %v", err)
+		}
+		if got := requireSingleRow(t, rows).ModelID; got != "claude-fable-5" {
+			t.Fatalf("ModelID = %q, want claude-fable-5", got)
+		}
+		req := probe.singleRequest(t)
+		if req.Command != provider.Command {
+			t.Fatalf("ACP discovery command = %q, want %q", req.Command, provider.Command)
+		}
+		if got := envValue(req.Env, "CLAUDE_CODE_EXECUTABLE"); got != claudeExecutable {
+			t.Fatalf("CLAUDE_CODE_EXECUTABLE = %q, want %q", got, claudeExecutable)
+		}
+	})
+
+	t.Run("Should reject a configured Cursor discovery endpoint", func(t *testing.T) {
+		t.Parallel()
+
+		provider := compozyconfig.ProviderConfig{}
+		provider.Models.Discovery.Endpoint = "https://models.example.test/cursor"
+		source := newLiveSourceForTest(t, "cursor", provider, &LiveProviderSourcesConfig{
+			BaseEnv: []string{"PATH=/bin"},
+		})
+
+		_, err := source.ListModels(testutil.Context(t), ListOptions{ProviderID: "cursor", Now: testTime(0)})
+		assertModelCatalogErrorContains(t, err, "requires a model discovery command")
+	})
+
+	t.Run("Should parse OpenCode model command output and apply effective env home policy", func(t *testing.T) {
+		t.Parallel()
+
+		executor := &fakeDiscoveryExecutor{}
+		executor.handle = func(req DiscoveryCommandRequest) (DiscoveryCommandResult, error) {
+			if slices.Equal(req.Args, []string{"--version"}) {
+				return DiscoveryCommandResult{Stdout: "opencode v1.18.33\n"}, nil
+			}
+			return DiscoveryCommandResult{Stdout: "anthropic/claude-sonnet-4-6\nopenai/gpt-5.4\n"}, nil
+		}
+		homePaths, err := compozyconfig.ResolveHomePathsFrom(t.TempDir())
+		if err != nil {
+			t.Fatalf("ResolveHomePathsFrom() error = %v", err)
+		}
+		provider := compozyconfig.BuiltinProviders()["opencode"]
+		provider.EnvPolicy = compozyconfig.ProviderEnvPolicyIsolated
+		provider.HomePolicy = compozyconfig.ProviderHomePolicyIsolated
+		source := newLiveSourceForTest(t, "opencode", provider, &LiveProviderSourcesConfig{
+			HomePaths:       homePaths,
+			BaseEnv:         openCodeFixtureEnv(t, "OPENAI_API_KEY=ambient-secret"),
+			CommandExecutor: executor,
+		})
+
+		rows, err := source.ListModels(testutil.Context(t), ListOptions{ProviderID: "opencode", Now: testTime(0)})
+		if err != nil {
+			t.Fatalf("ListModels() error = %v", err)
+		}
+		if got, want := rowModelIDs(
+			rows,
+		), []string{
+			"anthropic/claude-sonnet-4-6",
+			"openai/gpt-5.4",
+		}; !slices.Equal(
+			got,
+			want,
+		) {
+			t.Fatalf("row ids = %#v, want %#v", got, want)
+		}
+		reqs := executor.allRequests(t)
+		if len(reqs) != 2 {
+			t.Fatalf("len(requests) = %d, want version then listing", len(reqs))
+		}
+		if !slices.Equal(reqs[0].Args, []string{"--version"}) {
+			t.Fatalf("version args = %#v, want [--version]", reqs[0].Args)
+		}
+		if !slices.Equal(reqs[1].Args, []string{"models", "--verbose"}) {
+			t.Fatalf("listing args = %#v, want [models --verbose]", reqs[1].Args)
+		}
+		for _, req := range reqs {
+			if req.Command != reqs[0].Command || !filepath.IsAbs(req.Command) {
+				t.Fatalf("request command = %#v, want shared absolute invocation", req.Command)
+			}
+			if req.Dir != source.workingDir {
+				t.Fatalf("request dir = %q, want %q", req.Dir, source.workingDir)
+			}
+			if !slices.Equal(req.Env, reqs[0].Env) {
+				t.Fatalf("request env differs between version and listing stages")
+			}
+		}
+		req := reqs[1]
+		if envValue(req.Env, "OPENAI_API_KEY") != "" {
+			t.Fatalf("OPENAI_API_KEY = %q, want filtered", envValue(req.Env, "OPENAI_API_KEY"))
+		}
+		if got, want := envValue(req.Env, "HOME"), homePaths.HomeDir+"/providers/opencode"; got != want {
+			t.Fatalf("HOME = %q, want %q", got, want)
+		}
+		if got := envValue(req.Env, "OPENCODE_CONFIG_DIR"); got == "" {
+			t.Fatal("OPENCODE_CONFIG_DIR is empty, want isolated OpenCode config dir")
+		}
+	})
+
+	t.Run("Should apply authored env assignments to both OpenCode discovery stages", func(t *testing.T) {
+		t.Parallel()
+
+		executor := &fakeDiscoveryExecutor{}
+		executor.handle = func(req DiscoveryCommandRequest) (DiscoveryCommandResult, error) {
+			if slices.Equal(req.Args, []string{"--version"}) {
+				return DiscoveryCommandResult{Stdout: "opencode v1.18.33\n"}, nil
+			}
+			return DiscoveryCommandResult{Stdout: "anthropic/claude-sonnet-4-6\n"}, nil
+		}
+		provider := compozyconfig.BuiltinProviders()["opencode"]
+		provider.Command = "OPENCODE_PRIVATE_MARKER=marker opencode acp"
+		provider.CommandIsBuiltin = false
+		source := newLiveSourceForTest(t, "opencode", provider, &LiveProviderSourcesConfig{
+			BaseEnv:         openCodeFixtureEnv(t),
+			CommandExecutor: executor,
+		})
+		rows, err := source.ListModels(testutil.Context(t), ListOptions{ProviderID: "opencode", Now: testTime(0)})
+		if err != nil {
+			t.Fatalf("ListModels() error = %v", err)
+		}
+		if got, want := rowModelIDs(rows), []string{"anthropic/claude-sonnet-4-6"}; !slices.Equal(got, want) {
+			t.Fatalf("row ids = %#v, want %#v", got, want)
+		}
+		reqs := executor.allRequests(t)
+		if len(reqs) != 2 {
+			t.Fatalf("len(requests) = %d, want version then listing", len(reqs))
+		}
+		for index, req := range reqs {
+			if got := envValue(req.Env, "OPENCODE_PRIVATE_MARKER"); got != "marker" {
+				t.Fatalf("requests[%d] OPENCODE_PRIVATE_MARKER = %q, want authored assignment applied", index, got)
+			}
+		}
+	})
+
+	t.Run("Should preserve OpenCode verbose capabilities and advertised custom variants", func(t *testing.T) {
+		t.Parallel()
+		executor := &fakeDiscoveryExecutor{}
+		executor.handle = func(req DiscoveryCommandRequest) (DiscoveryCommandResult, error) {
+			if slices.Equal(req.Args, []string{"--version"}) {
+				return DiscoveryCommandResult{Stdout: "opencode v1.18.33\n"}, nil
+			}
+			return DiscoveryCommandResult{Stdout: `openrouter/x-ai/grok-4.6
+{"name":"Grok 4.6","capabilities":{"reasoning":true},"variants":{"low":{},"medium":{},"high":{},"xhigh":{},"provider-next":{}}}
+opencode/provider-managed
+{"capabilities":{"reasoning":true},"variants":{}}
+`}, nil
+		}
+		source := newLiveSourceForTest(
+			t,
+			"opencode",
+			compozyconfig.BuiltinProviders()["opencode"],
+			&LiveProviderSourcesConfig{BaseEnv: openCodeFixtureEnv(t), CommandExecutor: executor},
+		)
+		rows, err := source.ListModels(t.Context(), ListOptions{Now: testTime(0)})
+		if err != nil {
+			t.Fatal(err)
+		}
+		reqs := executor.allRequests(t)
+		if len(reqs) != 2 {
+			t.Fatalf("len(requests) = %d, want version then listing", len(reqs))
+		}
+		if !slices.Equal(reqs[0].Args, []string{"--version"}) {
+			t.Fatalf("version args = %#v, want [--version]", reqs[0].Args)
+		}
+		if !slices.Equal(reqs[1].Args, []string{"models", "--verbose"}) {
+			t.Fatalf("args = %#v", reqs[1].Args)
+		}
+		models := MergeRows(rows, MergeOptions{ReasoningApply: map[string]bool{"opencode": true}})
+		for _, model := range models {
+			if model.SupportsReasoning == nil || !*model.SupportsReasoning || model.DefaultReasoningEffort != nil {
+				t.Fatalf("profile = %#v", model)
+			}
+			if model.ModelID == "openrouter/x-ai/grok-4.6" {
+				if !slices.Equal(
+					model.ReasoningEfforts,
+					[]ReasoningEffort{"low", "medium", "high", "xhigh", "provider-next"},
+				) {
+					t.Fatalf("efforts = %#v", model.ReasoningEfforts)
+				}
+			} else {
+				if len(model.ReasoningEfforts) != 0 {
+					t.Fatalf("invented efforts = %#v", model.ReasoningEfforts)
+				}
+			}
+		}
+		_, err = parseOpenCodeV1ModelRows("opencode", "provider/model\n{broken json", testTime(0))
+		if err == nil {
+			t.Fatal("malformed metadata published as a capability-free row")
+		}
+	})
+
+	t.Run("Should classify Cursor auth without invalidating healthy models", func(t *testing.T) {
+		t.Parallel()
+		executor := &fakeDiscoveryExecutor{
+			result: DiscoveryCommandResult{ExitCode: 1, Stderr: "Error: Authentication required. Run 'agent login'."},
+			err:    errors.New("discovery command failed: exit status 1"),
+		}
+		source := newLiveSourceForTest(t, "cursor", compozyconfig.BuiltinProviders()["cursor"],
+			&LiveProviderSourcesConfig{CommandExecutor: executor})
+		store := newMemoryStore()
+		service := newTestService(t, store, []Source{source, NewBuiltinSource()})
+		statuses, err := service.Refresh(t.Context(), RefreshOptions{Force: true, Now: testTime(0)})
+		if err != nil {
+			t.Fatalf("Refresh() error = %v, want healthy sources to succeed", err)
+		}
+		status := requireStatus(t, statuses, "provider_live:cursor")
+		if status.FailureReason() != "auth_required" || status.ProviderID != "cursor" {
+			t.Fatalf("status = %#v, reason = %q", status, status.FailureReason())
+		}
+		stored, err := service.ListSourceStatus(t.Context(), StatusOptions{ProviderID: "cursor"})
+		if err != nil || requireStatus(t, stored, source.ID()).FailureReason() != "auth_required" {
+			t.Fatalf("persisted status = %#v, error = %v", stored, err)
+		}
+		models, err := service.ListModels(t.Context(), ListOptions{IncludeStale: true, Now: testTime(0)})
+		if err != nil || len(models) == 0 {
+			t.Fatalf("models = %#v, error = %v, want preserved builtin models", models, err)
+		}
+	})
+
+	t.Run("Should record unavailable OpenCode command status", func(t *testing.T) {
+		t.Parallel()
+
+		executor := &fakeDiscoveryExecutor{
+			result: DiscoveryCommandResult{Stderr: "api_key=opencode-secret missing"},
+			err:    errors.New("exec: opencode not found"),
+		}
+		source := newLiveSourceForTest(t, "opencode", compozyconfig.BuiltinProviders()["opencode"],
+			&LiveProviderSourcesConfig{
+				BaseEnv:         openCodeFixtureEnv(t),
+				CommandExecutor: executor,
+			})
+		store := newMemoryStore()
+		service := newTestService(t, store, []Source{source})
+
+		statuses, err := service.Refresh(
+			testutil.Context(t),
+			RefreshOptions{ProviderID: "opencode", Force: true, Now: testTime(0)},
+		)
+		if !errors.Is(err, ErrAllSourcesFailed) {
+			t.Fatalf("Refresh() error = %v, want ErrAllSourcesFailed", err)
+		}
+		status := requireStatus(t, statuses, "provider_live:opencode")
+		if status.RefreshState != RefreshStateFailed {
+			t.Fatalf("RefreshState = %q, want failed", status.RefreshState)
+		}
+		if strings.Contains(status.LastError, "opencode-secret") || !strings.Contains(status.LastError, "[REDACTED]") {
+			t.Fatalf("LastError = %q, want redacted command detail", status.LastError)
+		}
+	})
+
+	const openCodeV2DiscoveryFixture = `{"location":{"directory":"/tmp/opencode"},"data":[
+{"providerID":"openrouter","id":"acme/coding-default","modelID":"acme/coder-api-v7","canonical":"acme/canon","name":"Coding default","enabled":true,"capabilities":{"tools":false},"limit":{"context":262144,"input":200000,"output":32768},"variants":[{"id":"high"},{"id":"low"},{"id":"provider-next"},{"id":"low"}],"settings":{"api_key":"sentinel-v2-settings"},"cost":[{"per_million":1.5}],"headers":{},"body":{}},
+{"providerID":"other","id":"acme/coding-default","name":"Other default","enabled":true,"status":"deprecated"},
+{"providerID":"openrouter","id":"minimal-model","enabled":true,"limit":{"context":0},"variants":[]},
+{"providerID":"openrouter","id":"acme/coding-default","name":"Coding default duplicate","enabled":true,"capabilities":{"tools":false},"limit":{"context":262144,"input":200000,"output":32768},"variants":[{"id":"high"},{"id":"low"},{"id":"provider-next"}]},
+{"providerID":"openrouter","id":"disabled-model","name":"Disabled","enabled":false}
+]}`
+
+	t.Run("Should select exactly one native OpenCode catalog method per major version", func(t *testing.T) {
+		t.Parallel()
+
+		for _, test := range []struct {
+			name    string
+			version string
+			major   uint64
+		}{
+			{"plain v1", "1.18.33\n", 1},
+			{"prefixed v1", "v1.18.33", 1},
+			{"native v1", "opencode v1.18.33", 1},
+			{"native v2", "opencode v2.0.32\n", 2},
+			{"plain v2", "2.0.32", 2},
+			{"prerelease v2", "v2.1.0-beta.1+fixture", 2},
+		} {
+			t.Run(test.name, func(t *testing.T) {
+				t.Parallel()
+
+				executor := &fakeDiscoveryExecutor{}
+				executor.handle = func(req DiscoveryCommandRequest) (DiscoveryCommandResult, error) {
+					switch {
+					case slices.Equal(req.Args, []string{"--version"}):
+						return DiscoveryCommandResult{Stdout: test.version}, nil
+					case len(req.Args) > 0 && req.Args[0] == "models":
+						return DiscoveryCommandResult{Stdout: "openrouter/acme/coding-default\n"}, nil
+					default:
+						return DiscoveryCommandResult{Stdout: openCodeV2DiscoveryFixture}, nil
+					}
+				}
+				workingDir := filepath.Join(t.TempDir(), "catalog café & #1")
+				if err := os.MkdirAll(workingDir, 0o755); err != nil {
+					t.Fatalf("MkdirAll() error = %v", err)
+				}
+				source := newLiveSourceForTest(t, "opencode", compozyconfig.BuiltinProviders()["opencode"],
+					&LiveProviderSourcesConfig{
+						BaseEnv:         openCodeFixtureEnv(t),
+						CommandExecutor: executor,
+						WorkingDir:      workingDir,
+					})
+				rows, err := source.ListModels(testutil.Context(t), ListOptions{Now: testTime(0)})
+				if err != nil {
+					t.Fatalf("ListModels() error = %v", err)
+				}
+				if len(rows) == 0 {
+					t.Fatal("ListModels() returned no rows")
+				}
+				reqs := executor.allRequests(t)
+				if len(reqs) != 2 {
+					t.Fatalf("len(requests) = %d, want version then exactly one listing", len(reqs))
+				}
+				versionReq, listReq := reqs[0], reqs[1]
+				if !slices.Equal(versionReq.Args, []string{"--version"}) {
+					t.Fatalf("version args = %#v, want [--version]", versionReq.Args)
+				}
+				if versionReq.Command != listReq.Command || listReq.Dir != workingDir ||
+					!slices.Equal(versionReq.Env, listReq.Env) || versionReq.Timeout != listReq.Timeout {
+					t.Fatalf("version and listing stages disagree on invocation: %#v vs %#v", versionReq, listReq)
+				}
+				if test.major == 1 {
+					if !slices.Equal(listReq.Args, []string{"models", "--verbose"}) {
+						t.Fatalf("v1 args = %#v, want [models --verbose]", listReq.Args)
+					}
+					if got, want := rowModelIDs(
+						rows,
+					), []string{
+						"openrouter/acme/coding-default",
+					}; !slices.Equal(
+						got,
+						want,
+					) {
+						t.Fatalf("v1 rows = %#v, want %#v", rows, want)
+					}
+					return
+				}
+				if len(listReq.Args) != 4 || listReq.Args[0] != "api" || listReq.Args[1] != "--standalone" ||
+					listReq.Args[2] != "GET" {
+					t.Fatalf("v2 args = %#v, want [api --standalone GET <path>]", listReq.Args)
+				}
+				rawQuery, found := strings.CutPrefix(listReq.Args[3], "/api/model?")
+				if !found {
+					t.Fatalf("v2 path = %q, want raw model.list path with encoded location", listReq.Args[3])
+				}
+				values, err := url.ParseQuery(rawQuery)
+				if err != nil {
+					t.Fatalf("ParseQuery() error = %v", err)
+				}
+				if got := values.Get("location[directory]"); got != workingDir {
+					t.Fatalf("location[directory] = %q, want %q", got, workingDir)
+				}
+			})
+		}
+	})
+
+	t.Run("Should reject undetectable and unsupported OpenCode versions without listing", func(t *testing.T) {
+		t.Parallel()
+
+		for _, test := range []struct {
+			name    string
+			version string
+			want    string
+		}{
+			{"empty output", "", "model catalog: could not determine OpenCode version"},
+			{"development build", "development", "model catalog: could not determine OpenCode version"},
+			{"diagnostic text", "warning version 2.0.32", "model catalog: could not determine OpenCode version"},
+			{
+				"unsupported major",
+				"opencode v3.0.0",
+				"model catalog: unsupported OpenCode major version 3; supported versions are 1 and 2",
+			},
+		} {
+			t.Run(test.name, func(t *testing.T) {
+				t.Parallel()
+
+				executor := &fakeDiscoveryExecutor{}
+				executor.handle = func(req DiscoveryCommandRequest) (DiscoveryCommandResult, error) {
+					if !slices.Equal(req.Args, []string{"--version"}) {
+						t.Errorf("unexpected listing request %#v after version failure", req.Args)
+					}
+					return DiscoveryCommandResult{Stdout: test.version}, nil
+				}
+				source := newLiveSourceForTest(t, "opencode", compozyconfig.BuiltinProviders()["opencode"],
+					&LiveProviderSourcesConfig{
+						BaseEnv:         openCodeFixtureEnv(t),
+						CommandExecutor: executor,
+					})
+				_, err := source.ListModels(testutil.Context(t), ListOptions{Now: testTime(0)})
+				if err == nil || err.Error() != test.want {
+					t.Fatalf("ListModels() error = %v, want %q", err, test.want)
+				}
+				if got := len(executor.allRequests(t)); got != 1 {
+					t.Fatalf("len(requests) = %d, want only the version probe", got)
+				}
+			})
+		}
+	})
+
+	t.Run("Should fail version execution without a model command", func(t *testing.T) {
+		t.Parallel()
+
+		executor := &fakeDiscoveryExecutor{
+			result: DiscoveryCommandResult{Stderr: "boom"},
+			err:    errors.New("discovery command failed: exit status 1"),
+		}
+		source := newLiveSourceForTest(t, "opencode", compozyconfig.BuiltinProviders()["opencode"],
+			&LiveProviderSourcesConfig{
+				BaseEnv:         openCodeFixtureEnv(t),
+				CommandExecutor: executor,
+			})
+		_, err := source.ListModels(testutil.Context(t), ListOptions{Now: testTime(0)})
+		if err == nil || !strings.Contains(err.Error(), "model catalog: could not determine OpenCode version") {
+			t.Fatalf("ListModels() error = %v, want version failure", err)
+		}
+		if got := len(executor.allRequests(t)); got != 1 {
+			t.Fatalf("len(requests) = %d, want only the version probe", got)
+		}
+	})
+
+	t.Run("Should reject a version probe that prints a banner and exits nonzero", func(t *testing.T) {
+		t.Parallel()
+
+		executor := &fakeDiscoveryExecutor{}
+		executor.handle = func(req DiscoveryCommandRequest) (DiscoveryCommandResult, error) {
+			if !slices.Equal(req.Args, []string{"--version"}) {
+				t.Errorf("unexpected listing request %#v after failed version probe", req.Args)
+				return DiscoveryCommandResult{Stdout: `{"data":[]}`}, nil
+			}
+			return DiscoveryCommandResult{Stdout: "opencode v2.0.32\n", ExitCode: 1}, nil
+		}
+		source := newLiveSourceForTest(t, "opencode", compozyconfig.BuiltinProviders()["opencode"],
+			&LiveProviderSourcesConfig{
+				BaseEnv:         openCodeFixtureEnv(t),
+				CommandExecutor: executor,
+			})
+		_, err := source.ListModels(testutil.Context(t), ListOptions{Now: testTime(0)})
+		if err == nil || !strings.Contains(err.Error(), "could not determine OpenCode version") {
+			t.Fatalf("ListModels() error = %v, want version rejection", err)
+		}
+		if got := len(executor.allRequests(t)); got != 1 {
+			t.Fatalf("len(requests) = %d, want only the version probe", got)
+		}
+	})
+
+	t.Run("Should preserve the listing execution error identity without retrying", func(t *testing.T) {
+		t.Parallel()
+
+		executor := &fakeDiscoveryExecutor{}
+		executor.handle = func(req DiscoveryCommandRequest) (DiscoveryCommandResult, error) {
+			if slices.Equal(req.Args, []string{"--version"}) {
+				return DiscoveryCommandResult{Stdout: "opencode v2.0.32\n"}, nil
+			}
+			return DiscoveryCommandResult{Stderr: "listing failed"}, context.DeadlineExceeded
+		}
+		source := newLiveSourceForTest(t, "opencode", compozyconfig.BuiltinProviders()["opencode"],
+			&LiveProviderSourcesConfig{
+				BaseEnv:         openCodeFixtureEnv(t),
+				CommandExecutor: executor,
+			})
+		_, err := source.ListModels(testutil.Context(t), ListOptions{Now: testTime(0)})
+		if !errors.Is(err, context.DeadlineExceeded) {
+			t.Fatalf("ListModels() error = %v, want listing error identity", err)
+		}
+		if got := len(executor.allRequests(t)); got != 2 {
+			t.Fatalf("len(requests) = %d, want version plus one listing", got)
+		}
+	})
+
+	t.Run("Should reject a mismatched expected OpenCode invocation before execution", func(t *testing.T) {
+		t.Parallel()
+
+		executor := &fakeDiscoveryExecutor{}
+		executor.handle = func(req DiscoveryCommandRequest) (DiscoveryCommandResult, error) {
+			t.Errorf("unexpected discovery request %#v under mismatched fingerprint", req.Args)
+			return DiscoveryCommandResult{}, errors.New("must not execute")
+		}
+		newSource := func(env []string) *LiveProviderSource {
+			return newLiveSourceForTest(t, "opencode", compozyconfig.BuiltinProviders()["opencode"],
+				&LiveProviderSourcesConfig{BaseEnv: env, CommandExecutor: executor})
+		}
+		first := newSource(openCodeFixtureEnv(t))
+		second := newSource(openCodeFixtureEnv(t))
+		firstFingerprint, err := first.CatalogExecutionFingerprint()
+		if err != nil {
+			t.Fatalf("CatalogExecutionFingerprint() error = %v", err)
+		}
+		secondFingerprint, err := second.CatalogExecutionFingerprint()
+		if err != nil {
+			t.Fatalf("CatalogExecutionFingerprint() error = %v", err)
+		}
+		if firstFingerprint == "" || firstFingerprint == secondFingerprint {
+			t.Fatal("distinct selectors share an execution fingerprint")
+		}
+		if got := len(executor.allRequests(t)); got != 0 {
+			t.Fatalf("len(requests) = %d, want no subprocess during fingerprinting", got)
+		}
+		_, err = first.ListModels(testutil.Context(t), ListOptions{
+			ExecutionContext: CatalogExecutionContext{CommandFingerprint: secondFingerprint},
+			Now:              testTime(0),
+		})
+		if err == nil || !strings.Contains(err.Error(), "discovery invocation changed") {
+			t.Fatalf("ListModels() error = %v, want invocation-changed failure", err)
+		}
+		if got := len(executor.allRequests(t)); got != 0 {
+			t.Fatalf("len(requests) = %d, want no execution after mismatch", got)
+		}
+	})
+
+	t.Run("Should map OpenCode v2 selectable identity and metadata", func(t *testing.T) {
+		t.Parallel()
+
+		executor := &fakeDiscoveryExecutor{}
+		executor.handle = func(req DiscoveryCommandRequest) (DiscoveryCommandResult, error) {
+			if slices.Equal(req.Args, []string{"--version"}) {
+				return DiscoveryCommandResult{Stdout: "opencode v2.0.32\n"}, nil
+			}
+			return DiscoveryCommandResult{Stdout: openCodeV2DiscoveryFixture}, nil
+		}
+		source := newLiveSourceForTest(t, "opencode", compozyconfig.BuiltinProviders()["opencode"],
+			&LiveProviderSourcesConfig{
+				BaseEnv:         openCodeFixtureEnv(t),
+				CommandExecutor: executor,
+			})
+		rows, err := source.ListModels(testutil.Context(t), ListOptions{Now: testTime(0)})
+		if err != nil {
+			t.Fatalf("ListModels() error = %v", err)
+		}
+		if got, want := rowModelIDs(rows), []string{
+			"openrouter/acme/coding-default",
+			"openrouter/minimal-model",
+			"other/acme/coding-default",
+		}; !slices.Equal(got, want) {
+			t.Fatalf("row ids = %#v, want %#v", got, want)
+		}
+		coding := rows[0]
+		if coding.ProviderID != "opencode" || coding.DisplayName != "Coding default" ||
+			coding.SourceID != "provider_live:opencode" || coding.Priority != PriorityProviderLive ||
+			!coding.RefreshedAt.Equal(testTime(0)) {
+			t.Fatalf("v2 provenance = %#v", coding)
+		}
+		if coding.Available == nil || !*coding.Available {
+			t.Fatalf("Available = %v, want explicit true", coding.Available)
+		}
+		if coding.SupportsTools == nil || *coding.SupportsTools {
+			t.Fatalf("SupportsTools = %v, want explicit false", coding.SupportsTools)
+		}
+		if value := int64(262144); coding.ContextWindow == nil || *coding.ContextWindow != value {
+			t.Fatalf("ContextWindow = %v, want %d", coding.ContextWindow, value)
+		}
+		if value := int64(200000); coding.MaxInputTokens == nil || *coding.MaxInputTokens != value {
+			t.Fatalf("MaxInputTokens = %v, want %d", coding.MaxInputTokens, value)
+		}
+		if value := int64(32768); coding.MaxOutputTokens == nil || *coding.MaxOutputTokens != value {
+			t.Fatalf("MaxOutputTokens = %v, want %d", coding.MaxOutputTokens, value)
+		}
+		if coding.SupportsReasoning == nil || !*coding.SupportsReasoning || coding.DefaultReasoningEffort != nil {
+			t.Fatalf("reasoning profile = %#v, want supported without invented default", coding)
+		}
+		if !slices.Equal(coding.ReasoningEfforts, []ReasoningEffort{"low", "high", "provider-next"}) {
+			t.Fatalf("efforts = %#v, want deduplicated ordered variants", coding.ReasoningEfforts)
+		}
+		if coding.CostInputPerMillion != nil || coding.CostOutputPerMillion != nil ||
+			coding.CostCacheReadPerMillion != nil || coding.CostCacheWritePerMillion != nil ||
+			coding.CostReasoningPerMillion != nil {
+			t.Fatalf("tiered cost became a scalar price: %#v", coding)
+		}
+		if coding.Deprecated != nil {
+			t.Fatalf("Deprecated = %v, want nil without reported status", coding.Deprecated)
+		}
+		minimal := rows[1]
+		if minimal.ContextWindow != nil || minimal.MaxInputTokens != nil || minimal.MaxOutputTokens != nil ||
+			minimal.SupportsTools != nil || minimal.SupportsReasoning != nil ||
+			len(minimal.ReasoningEfforts) != 0 || minimal.DefaultReasoningEffort != nil {
+			t.Fatalf("unknown v2 metadata invented values: %#v", minimal)
+		}
+		other := rows[2]
+		if other.DisplayName != "Other default" || other.Deprecated == nil || !*other.Deprecated {
+			t.Fatalf("reported deprecated status lost: %#v", other)
+		}
+	})
+
+	t.Run("Should reject incomplete and unsafe OpenCode v2 generations", func(t *testing.T) {
+		t.Parallel()
+
+		for _, test := range []struct {
+			name   string
+			output string
+			want   string
+		}{
+			{"invalid JSON", "{oops", "model catalog: invalid OpenCode v2 model payload"},
+			{"missing data", `{"location":{}}`, "model catalog: invalid OpenCode v2 model payload"},
+			{"null data", `{"data":null}`, "model catalog: invalid OpenCode v2 model payload"},
+			{"wrong-type data", `{"data":{}}`, "model catalog: invalid OpenCode v2 model payload"},
+			{
+				"empty data",
+				`{"data":[]}`,
+				"model catalog: OpenCode v2 returned no enabled model rows",
+			},
+			{
+				"all disabled",
+				`{"data":[{"providerID":"openrouter","id":"m","enabled":false}]}`,
+				"model catalog: OpenCode v2 returned no enabled model rows",
+			},
+			{
+				"missing enabled",
+				`{"data":[{"providerID":"openrouter","id":"m","settings":{"k":"sentinel-secret"}}]}`,
+				"model catalog: invalid OpenCode v2 model payload",
+			},
+			{
+				"nonboolean enabled",
+				`{"data":[{"providerID":"openrouter","id":"m","enabled":"yes"}]}`,
+				"model catalog: invalid OpenCode v2 model payload",
+			},
+			{
+				"blank identity",
+				`{"data":[{"providerID":"","id":"m","enabled":true}]}`,
+				"model catalog: invalid OpenCode v2 model payload",
+			},
+			{
+				"provider slash",
+				`{"data":[{"providerID":"a/b","id":"m","enabled":true}]}`,
+				"model catalog: invalid OpenCode v2 model payload",
+			},
+			{
+				"model hash",
+				`{"data":[{"providerID":"a","id":"m#1","enabled":true}]}`,
+				"model catalog: invalid OpenCode v2 model payload",
+			},
+			{
+				"invalid variant",
+				`{"data":[{"providerID":"a","id":"m","enabled":true,"variants":[{"id":"has space"}]}]}`,
+				"model catalog: invalid OpenCode v2 model payload",
+			},
+			{
+				"negative limit",
+				`{"data":[{"providerID":"a","id":"m","enabled":true,"limit":{"context":-1}}]}`,
+				"model catalog: invalid OpenCode v2 model payload",
+			},
+			{
+				"wrong-type limit",
+				`{"data":[{"providerID":"a","id":"m","enabled":true,"limit":{"context":"big"}}]}`,
+				"model catalog: invalid OpenCode v2 model payload",
+			},
+			{
+				"valid then malformed",
+				`{"data":[{"providerID":"a","id":"m","enabled":true},{"providerID":"a","id":"n"}]}`,
+				"model catalog: invalid OpenCode v2 model payload",
+			},
+		} {
+			t.Run(test.name, func(t *testing.T) {
+				t.Parallel()
+
+				rows, err := parseOpenCodeV2ModelRows("opencode", test.output, testTime(0))
+				if err == nil || !strings.HasPrefix(err.Error(), test.want) {
+					t.Fatalf("parseOpenCodeV2ModelRows() error = %v, want prefix %q", err, test.want)
+				}
+				if len(rows) != 0 {
+					t.Fatalf("parseOpenCodeV2ModelRows() rows = %#v, want none", rows)
+				}
+				if strings.Contains(err.Error(), "sentinel-secret") {
+					t.Fatalf("diagnostic leaks native settings: %v", err)
+				}
+			})
+		}
+	})
+
+	t.Run("Should keep OpenCode discovery opt-out and explicit overrides authoritative", func(t *testing.T) {
+		t.Parallel()
+
+		t.Run("Should keep disabled discovery command-free", func(t *testing.T) {
+			t.Parallel()
+
+			disabled := false
+			provider := compozyconfig.BuiltinProviders()["opencode"]
+			provider.Models.Discovery.Enabled = &disabled
+			executor := &fakeDiscoveryExecutor{}
+			source := newLiveSourceForTest(t, "opencode", provider, &LiveProviderSourcesConfig{
+				BaseEnv:         openCodeFixtureEnv(t),
+				CommandExecutor: executor,
+			})
+			_, err := source.ListModels(testutil.Context(t), ListOptions{Now: testTime(0)})
+			if !errors.Is(err, ErrSourceDisabled) {
+				t.Fatalf("ListModels() error = %v, want disabled", err)
+			}
+			if got := len(executor.allRequests(t)); got != 0 {
+				t.Fatalf("len(requests) = %d, want none", got)
+			}
+		})
+
+		t.Run("Should execute an explicit discovery command unchanged without version probe", func(t *testing.T) {
+			t.Parallel()
+
+			provider := compozyconfig.BuiltinProviders()["opencode"]
+			provider.Models.Discovery.Command = "opencode models --verbose"
+			executor := &fakeDiscoveryExecutor{}
+			executor.handle = func(req DiscoveryCommandRequest) (DiscoveryCommandResult, error) {
+				if slices.Equal(req.Args, []string{"--version"}) {
+					t.Error("explicit discovery must not probe versions")
+				}
+				return DiscoveryCommandResult{Stdout: "acme/model\n"}, nil
+			}
+			source := newLiveSourceForTest(t, "opencode", provider, &LiveProviderSourcesConfig{
+				BaseEnv:         openCodeFixtureEnv(t),
+				CommandExecutor: executor,
+			})
+			rows, err := source.ListModels(testutil.Context(t), ListOptions{Now: testTime(0)})
+			if err != nil {
+				t.Fatalf("ListModels() error = %v", err)
+			}
+			if got := rowModelIDs(rows); !slices.Equal(got, []string{"acme/model"}) {
+				t.Fatalf("row ids = %#v", got)
+			}
+			req := executor.singleRequest(t)
+			if req.Command != "opencode" || !slices.Equal(req.Args, []string{"models", "--verbose"}) {
+				t.Fatalf("explicit request = %#v", req)
+			}
+		})
+
+		t.Run("Should keep an opaque wrapper with explicit override authoritative", func(t *testing.T) {
+			t.Parallel()
+
+			provider := compozyconfig.ProviderConfig{Command: "custom-acp-wrapper"}
+			provider.Models.Discovery.Command = "custom-models --account secondary"
+			executor := &fakeDiscoveryExecutor{
+				result: DiscoveryCommandResult{Stdout: "acme/model\n"},
+			}
+			source := newLiveSourceForTest(t, "opencode", provider, &LiveProviderSourcesConfig{
+				BaseEnv:         openCodeFixtureEnv(t),
+				CommandExecutor: executor,
+			})
+			rows, err := source.ListModels(testutil.Context(t), ListOptions{Now: testTime(0)})
+			if err != nil {
+				t.Fatalf("ListModels() error = %v", err)
+			}
+			if got := rowModelIDs(rows); !slices.Equal(got, []string{"acme/model"}) {
+				t.Fatalf("row ids = %#v", got)
+			}
+			req := executor.singleRequest(t)
+			if req.Command != "custom-models" || !slices.Equal(req.Args, []string{"--account", "secondary"}) {
+				t.Fatalf("override request = %#v", req)
+			}
+		})
+
+		t.Run("Should fail an opaque wrapper without override actionably without probing", func(t *testing.T) {
+			t.Parallel()
+
+			binDir := writeOpenCodeFixture(t)
+			provider := compozyconfig.ProviderConfig{Command: binDir + "/opencode acp --wrapper-only"}
+			executor := &fakeDiscoveryExecutor{}
+			source := newLiveSourceForTest(t, "opencode", provider, &LiveProviderSourcesConfig{
+				BaseEnv:         []string{"PATH=" + binDir, "HOME=" + t.TempDir()},
+				CommandExecutor: executor,
+			})
+			_, err := source.ListModels(testutil.Context(t), ListOptions{Now: testTime(0)})
+			want := "model catalog: OpenCode launch command requires an explicit " +
+				"models.discovery.command or models.discovery.endpoint"
+			if err == nil || err.Error() != want {
+				t.Fatalf("ListModels() error = %v, want %q", err, want)
+			}
+			if got := len(executor.allRequests(t)); got != 0 {
+				t.Fatalf("len(requests) = %d, want none", got)
+			}
+		})
+
+		t.Run("Should keep the overlay explicit-path requirement without discovery", func(t *testing.T) {
+			t.Parallel()
+
+			provider := compozyconfig.ProviderConfig{RuntimeProvider: "opencode"}
+			executor := &fakeDiscoveryExecutor{}
+			source := newLiveSourceForTest(t, "opencode-extra", provider, &LiveProviderSourcesConfig{
+				BaseEnv:         openCodeFixtureEnv(t),
+				CommandExecutor: executor,
+			})
+			_, err := source.ListModels(testutil.Context(t), ListOptions{Now: testTime(0)})
+			if err == nil || !strings.Contains(err.Error(), "requires models.discovery.command") {
+				t.Fatalf("ListModels() error = %v, want explicit discovery requirement", err)
+			}
+			if got := len(executor.allRequests(t)); got != 0 {
+				t.Fatalf("len(requests) = %d, want none", got)
+			}
+		})
+	})
+
+	t.Run("Should preserve OpenCode discovery deadline, ordering, and redaction", func(t *testing.T) {
+		t.Parallel()
+
+		t.Run("Should retain deadline identity on version timeout without listing", func(t *testing.T) {
+			t.Parallel()
+
+			executor := &fakeDiscoveryExecutor{}
+			executor.handle = func(req DiscoveryCommandRequest) (DiscoveryCommandResult, error) {
+				if !slices.Equal(req.Args, []string{"--version"}) {
+					t.Errorf("unexpected listing request %#v after deadline", req.Args)
+				}
+				return DiscoveryCommandResult{}, context.DeadlineExceeded
+			}
+			source := newLiveSourceForTest(t, "opencode", compozyconfig.BuiltinProviders()["opencode"],
+				&LiveProviderSourcesConfig{
+					BaseEnv:         openCodeFixtureEnv(t),
+					CommandExecutor: executor,
+					DefaultTimeout:  50 * time.Millisecond,
+				})
+			ctx, cancel := context.WithTimeout(testutil.Context(t), 50*time.Millisecond)
+			defer cancel()
+			_, err := source.ListModels(ctx, ListOptions{Now: testTime(0)})
+			if !errors.Is(err, context.DeadlineExceeded) {
+				t.Fatalf("ListModels() error = %v, want deadline identity", err)
+			}
+			if got := len(executor.allRequests(t)); got != 1 {
+				t.Fatalf("len(requests) = %d, want only the version probe", got)
+			}
+		})
+
+		t.Run("Should start no second subprocess on cancellation between stages", func(t *testing.T) {
+			t.Parallel()
+
+			executor := &fakeDiscoveryExecutor{}
+			ctx, cancel := context.WithCancel(testutil.Context(t))
+			executor.handle = func(_ DiscoveryCommandRequest) (DiscoveryCommandResult, error) {
+				cancel()
+				return DiscoveryCommandResult{Stdout: "opencode v2.0.32\n"}, nil
+			}
+			source := newLiveSourceForTest(t, "opencode", compozyconfig.BuiltinProviders()["opencode"],
+				&LiveProviderSourcesConfig{
+					BaseEnv:         openCodeFixtureEnv(t),
+					CommandExecutor: executor,
+				})
+			_, err := source.ListModels(ctx, ListOptions{Now: testTime(0)})
+			if !errors.Is(err, context.Canceled) {
+				t.Fatalf("ListModels() error = %v, want cancellation", err)
+			}
+			if got := len(executor.allRequests(t)); got != 1 {
+				t.Fatalf("len(requests) = %d, want only the version probe", got)
+			}
+		})
+
+		t.Run("Should never echo raw output on stderr-free v2 listing failure", func(t *testing.T) {
+			t.Parallel()
+
+			executor := &fakeDiscoveryExecutor{}
+			executor.handle = func(req DiscoveryCommandRequest) (DiscoveryCommandResult, error) {
+				if slices.Equal(req.Args, []string{"--version"}) {
+					return DiscoveryCommandResult{Stdout: "opencode v2.0.32\n"}, nil
+				}
+				return DiscoveryCommandResult{
+					Stdout:   `{"data":[],"settings":{"k":"v"}}`,
+					ExitCode: 1,
+				}, nil
+			}
+			source := newLiveSourceForTest(t, "opencode", compozyconfig.BuiltinProviders()["opencode"],
+				&LiveProviderSourcesConfig{
+					BaseEnv:         openCodeFixtureEnv(t),
+					CommandExecutor: executor,
+				})
+			_, err := source.ListModels(testutil.Context(t), ListOptions{Now: testTime(0)})
+			if err == nil || !strings.Contains(err.Error(), "no diagnostic output") {
+				t.Fatalf("ListModels() error = %v, want stderr-free listing failure", err)
+			}
+			if strings.Contains(err.Error(), `"data"`) {
+				t.Fatalf("listing diagnostic echoes raw response: %v", err)
+			}
+		})
+
+		t.Run("Should never fall back to npm on native permission failure", func(t *testing.T) {
+			t.Parallel()
+			if runtime.GOOS == "windows" {
+				t.Skip("permission failure fixture requires Unix mode bits")
+			}
+
+			permDir := t.TempDir()
+			if err := os.WriteFile(
+				filepath.Join(permDir, "opencode"),
+				[]byte("#!/bin/sh\nexit 0\n"),
+				0o644,
+			); err != nil {
+				t.Fatalf("WriteFile() error = %v", err)
+			}
+			npxLog := filepath.Join(permDir, "npx-calls.log")
+			npxScript := "#!/bin/sh\necho NPM-CALLED >> " + npxLog + "\nexit 1\n"
+			if err := os.WriteFile(filepath.Join(permDir, "npx"), []byte(npxScript), 0o755); err != nil {
+				t.Fatalf("WriteFile() error = %v", err)
+			}
+			executor := &fakeDiscoveryExecutor{}
+			source := newLiveSourceForTest(t, "opencode", compozyconfig.BuiltinProviders()["opencode"],
+				&LiveProviderSourcesConfig{
+					BaseEnv:         []string{"PATH=" + permDir, "HOME=" + t.TempDir()},
+					CommandExecutor: executor,
+				})
+			_, err := source.ListModels(testutil.Context(t), ListOptions{Now: testTime(0)})
+			if err == nil || !errors.Is(err, os.ErrPermission) {
+				t.Fatalf("ListModels() error = %v, want native permission failure", err)
+			}
+			if got := len(executor.allRequests(t)); got != 0 {
+				t.Fatalf("len(requests) = %d, want no subprocess after permission failure", got)
+			}
+			if raw, readErr := os.ReadFile(npxLog); readErr == nil && len(bytes.TrimSpace(raw)) != 0 {
+				t.Fatalf("npm fallback executed after native permission failure: %q", raw)
+			} else if readErr != nil && !os.IsNotExist(readErr) {
+				t.Fatalf("ReadFile() error = %v", readErr)
+			}
+		})
+
+		t.Run("Should never retry another version or installation on listing failure", func(t *testing.T) {
+			t.Parallel()
+
+			executor := &fakeDiscoveryExecutor{}
+			executor.handle = func(req DiscoveryCommandRequest) (DiscoveryCommandResult, error) {
+				if slices.Equal(req.Args, []string{"--version"}) {
+					return DiscoveryCommandResult{Stdout: "opencode v2.0.32\n"}, nil
+				}
+				return DiscoveryCommandResult{
+					Stdout:   "SHOULD NOT ECHO STDOUT",
+					Stderr:   "token=sentinel-list-secret leaked?",
+					ExitCode: 1,
+				}, nil
+			}
+			source := newLiveSourceForTest(t, "opencode", compozyconfig.BuiltinProviders()["opencode"],
+				&LiveProviderSourcesConfig{
+					BaseEnv:         openCodeFixtureEnv(t),
+					CommandExecutor: executor,
+				})
+			_, err := source.ListModels(testutil.Context(t), ListOptions{Now: testTime(0)})
+			if err == nil || !strings.Contains(err.Error(), "exited 1") {
+				t.Fatalf("ListModels() error = %v, want listing exit failure", err)
+			}
+			if strings.Contains(err.Error(), "sentinel-list-secret") ||
+				strings.Contains(err.Error(), "SHOULD NOT ECHO STDOUT") {
+				t.Fatalf("listing diagnostic leaks raw output: %v", err)
+			}
+			if got := len(executor.allRequests(t)); got != 2 {
+				t.Fatalf("len(requests) = %d, want version plus one listing", got)
+			}
+		})
+	})
+
+	t.Run("Should fail closed for Pi without configured discovery path", func(t *testing.T) {
+		t.Parallel()
+
+		source := newLiveSourceForTest(t, "pi", compozyconfig.ProviderConfig{}, &LiveProviderSourcesConfig{
+			BaseEnv: []string{"PATH=/bin"},
+		})
+		store := newMemoryStore()
+		service := newTestService(t, store, []Source{source})
+
+		statuses, err := service.Refresh(
+			testutil.Context(t),
+			RefreshOptions{ProviderID: "pi", Force: true, Now: testTime(0)},
+		)
+		if !errors.Is(err, ErrAllSourcesFailed) {
+			t.Fatalf("Refresh() error = %v, want ErrAllSourcesFailed", err)
+		}
+		status := requireStatus(t, statuses, "provider_live:pi")
+		if status.RefreshState != RefreshStateFailed {
+			t.Fatalf("RefreshState = %q, want failed", status.RefreshState)
+		}
+		if !strings.Contains(status.LastError, "no configured model discovery") {
+			t.Fatalf("LastError = %q, want no configured discovery path", status.LastError)
+		}
+	})
+
+	t.Run("Should discover Agy models with exact identities and no borrowed metadata", func(t *testing.T) {
+		t.Parallel()
+
+		// Synthetic parser/dedup input seeded from the superseded 1.3.0 shape.
+		// The live 1.4.0 server advertises 2 bare IDs (gemini-4-argon,
+		// gemini-3.8-flash) plus a thinking_level option; test logic unchanged.
+		historical := []acp.SessionConfigOptionValue{
+			{Value: "gemini-4-argon-medium", Label: "Argon Medium"},
+			{Value: "gemini-4-argon-high", Label: "Argon High"},
+			{Value: "gemini-4-argon-low", Label: "Argon Low"},
+			{Value: "gemini-3.8-flash-high", Label: "Flash High"},
+			{Value: "gemini-3.8-flash-medium", Label: "Flash Medium"},
+			{Value: "gemini-3.8-flash-low", Label: "Flash Low"},
+		}
+		values := append([]acp.SessionConfigOptionValue(nil), historical...)
+		values = append(values,
+			acp.SessionConfigOptionValue{Value: "gemini-3.8-flash-high", Label: "Flash High"},
+			acp.SessionConfigOptionValue{Value: "gemini-4-argon-low", Label: "Argon Low"},
+			acp.SessionConfigOptionValue{Value: "  ", Label: "Blank"},
+		)
+		for index := range 50 {
+			values = append(values, acp.SessionConfigOptionValue{
+				Value: fmt.Sprintf("agy-scale-%03d", index),
+				Label: fmt.Sprintf("Scale %03d", index),
+			})
+		}
+		probe := &fakeACPModelProbe{options: []acp.SessionConfigOption{{
+			ID:     "model",
+			Kind:   acp.SessionConfigOptionKindSelect,
+			Values: values,
+		}}}
+		builtin := compozyconfig.BuiltinProviders()[liveSourcesAgyKey]
+		if builtin.Models.Default != "" || len(builtin.Models.Curated) != 0 {
+			t.Fatalf("builtin agy models = %#v, want no static seed", builtin.Models)
+		}
+		if strings.TrimSpace(builtin.RuntimeProvider) != "" {
+			t.Fatalf("builtin agy runtime provider = %q, want no cross-provider merge", builtin.RuntimeProvider)
+		}
+		source := newLiveSourceForTest(t, liveSourcesAgyKey, builtin, &LiveProviderSourcesConfig{
+			BaseEnv: []string{
+				"PATH=/bin",
+				"HOME=/tmp/operator-home",
+				"OPENAI_API_KEY=ambient-secret",
+				"GEMINI_API_KEY=ambient-gemini",
+			},
+			ACPProbe:   probe,
+			WorkingDir: t.TempDir(),
+		})
+		rows, err := source.ListModels(testutil.Context(t), ListOptions{
+			ProviderID: liveSourcesAgyKey,
+			Now:        testTime(0),
+		})
+		if err != nil {
+			t.Fatalf("ListModels(Agy ACP) error = %v", err)
+		}
+		wantIDs := []string{
+			"gemini-3.8-flash-high",
+			"gemini-3.8-flash-low",
+			"gemini-3.8-flash-medium",
+			"gemini-4-argon-high",
+			"gemini-4-argon-low",
+			"gemini-4-argon-medium",
+		}
+		for index := range 50 {
+			wantIDs = append(wantIDs, fmt.Sprintf("agy-scale-%03d", index))
+		}
+		slices.Sort(wantIDs)
+		if got := rowModelIDs(rows); !slices.Equal(got, wantIDs) {
+			t.Fatalf("row ids = %#v, want exact deduplicated %#v", got, wantIDs)
+		}
+		for _, row := range rows {
+			if row.ProviderID != liveSourcesAgyKey || row.SourceID != SourceKindProviderLiveID(liveSourcesAgyKey) {
+				t.Fatalf("row identity = %#v, want agy/provider_live:agy", row)
+			}
+			if row.Available == nil || !*row.Available {
+				t.Fatalf("row %q Available = %v, want true", row.ModelID, row.Available)
+			}
+			if row.CostInputPerMillion != nil || row.CostOutputPerMillion != nil ||
+				row.CostCacheReadPerMillion != nil || row.CostCacheWritePerMillion != nil ||
+				row.CostReasoningPerMillion != nil || row.ContextWindow != nil ||
+				row.MaxInputTokens != nil || row.MaxOutputTokens != nil ||
+				row.SupportsReasoning != nil || len(row.ReasoningEfforts) != 0 ||
+				row.DefaultReasoningEffort != nil || row.SupportsTools != nil ||
+				len(row.ConfigOptions) != 0 || len(row.TransportBindings) != 0 {
+				t.Fatalf("row %q carries inferred capability metadata: %#v", row.ModelID, row)
+			}
+		}
+		if got := requireModelRow(t, rows, "gemini-3.8-flash-high").DisplayName; got != "Flash High" {
+			t.Fatalf("Flash High display name = %q, want live label", got)
+		}
+		if !source.BootstrapOnList() {
+			t.Fatal("BootstrapOnList() = false, want true")
+		}
+		req := probe.singleRequest(t)
+		if req.ProviderID != liveSourcesAgyKey || req.Command != strings.TrimSpace(builtin.Command) ||
+			req.Cwd != source.workingDir {
+			t.Fatalf("Agy execution = %#v, want final provider command and working dir", req)
+		}
+		if firstEnvValue(req.Env, "COMPOZY_PROVIDER") != liveSourcesAgyKey ||
+			envValue(req.Env, "OPENAI_API_KEY") != "" || envValue(req.Env, "GEMINI_API_KEY") != "" ||
+			envValue(req.Env, "HOME") != "/tmp/operator-home" {
+			t.Fatalf("Agy environment leaks or drops operator home: %#v", req.Env)
+		}
+		// The discovery seam exposes only command/cwd/env/timeout: no prompt,
+		// authenticate, tool, or MCP surface exists on the probe request.
+		emptyProbe := &fakeACPModelProbe{}
+		emptySource := newLiveSourceForTest(t, liveSourcesAgyKey, builtin, &LiveProviderSourcesConfig{
+			BaseEnv: []string{"PATH=/bin"}, ACPProbe: emptyProbe,
+		})
+		if _, err := emptySource.ListModels(testutil.Context(t), ListOptions{
+			ProviderID: liveSourcesAgyKey,
+			Now:        testTime(1),
+		}); err == nil || !strings.Contains(err.Error(), "did not advertise") {
+			t.Fatalf("ListModels(empty Agy) error = %v, want missing model option", err)
+		}
+
+		disabled := false
+		disabledProvider := builtin
+		disabledProvider.Models.Discovery.Enabled = &disabled
+		disabledSource := newLiveSourceForTest(t, liveSourcesAgyKey, disabledProvider, &LiveProviderSourcesConfig{
+			BaseEnv:  []string{"PATH=/bin"},
+			ACPProbe: probe,
+		})
+		store := newMemoryStore()
+		service := newTestService(t, store, []Source{disabledSource})
+		statuses, err := service.Refresh(
+			testutil.Context(t),
+			RefreshOptions{ProviderID: liveSourcesAgyKey, Force: true, Now: testTime(2)},
+		)
+		if err != nil {
+			t.Fatalf("Refresh(disabled) error = %v", err)
+		}
+		if status := requireStatus(
+			t,
+			statuses,
+			SourceKindProviderLiveID(liveSourcesAgyKey),
+		); status.RefreshState != RefreshStateDisabled {
+			t.Fatalf("RefreshState = %q, want disabled", status.RefreshState)
+		}
+		probe.singleRequest(t)
+		models, err := service.ListModels(testutil.Context(t), ListOptions{
+			ProviderID: liveSourcesAgyKey,
+			View:       CatalogViewAll,
+			Now:        testTime(3),
+		})
+		if err != nil {
+			t.Fatalf("ListModels(disabled) error = %v", err)
+		}
+		if len(models) != 0 {
+			t.Fatalf("disabled source published %d synthetic rows, want none", len(models))
+		}
+	})
+
+	t.Run("Should discover Copilot models and per-model effort from its ACP options", func(t *testing.T) {
+		t.Parallel()
+
+		// Shape recorded from an authenticated paid-plan Copilot CLI 1.0.88
+		// session/new: a "model" select plus a "reasoning_effort" select in the
+		// thought_level category whose values depend on the selected model.
+		modelOption := func(current string) acp.SessionConfigOption {
+			return acp.SessionConfigOption{
+				ID: "model", Label: "Model", Category: "model",
+				Kind: acp.SessionConfigOptionKindSelect, CurrentValueID: current,
+				Values: []acp.SessionConfigOptionValue{
+					{Value: "auto", Label: "Auto"},
+					{Value: "gpt-5.6-luna", Label: "GPT-5.6 Luna"},
+					{Value: "claude-sonnet-5", Label: "Claude Sonnet 5"},
+				},
+			}
+		}
+		effortOption := acp.SessionConfigOption{
+			ID: "reasoning_effort", Label: "Reasoning Effort", Category: "thought_level",
+			Kind: acp.SessionConfigOptionKindSelect, CurrentValueID: "medium",
+			Values: []acp.SessionConfigOptionValue{
+				{Value: "none"}, {Value: "low"}, {Value: "medium"},
+				{Value: "high"}, {Value: "xhigh"}, {Value: "max"},
+			},
+		}
+		sonnetEffort := effortOption
+		sonnetEffort.CurrentValueID = "high"
+		sonnetEffort.Values = []acp.SessionConfigOptionValue{{Value: "low"}, {Value: "medium"}, {Value: "high"}}
+		probe := &fakeACPModelProbe{
+			options: []acp.SessionConfigOption{modelOption("gpt-5.6-luna"), effortOption},
+			models: map[string][]acp.SessionConfigOption{
+				"auto":            {modelOption("auto")},
+				"gpt-5.6-luna":    {modelOption("gpt-5.6-luna"), effortOption},
+				"claude-sonnet-5": {modelOption("claude-sonnet-5"), sonnetEffort},
+			},
+		}
+		builtin := compozyconfig.BuiltinProviders()[liveSourcesCopilotKey]
+		if builtin.Models.Reasoning.Apply != compozyconfig.ReasoningApplyACPOption {
+			t.Fatalf("builtin copilot reasoning apply = %q, want acp_option", builtin.Models.Reasoning.Apply)
+		}
+		source := newLiveSourceForTest(t, liveSourcesCopilotKey, builtin, &LiveProviderSourcesConfig{
+			BaseEnv:    []string{"PATH=/bin", "HOME=/tmp/operator-home", "GH_TOKEN=ambient-secret"},
+			ACPProbe:   probe,
+			WorkingDir: t.TempDir(),
+		})
+		rows, err := source.ListModels(testutil.Context(t), ListOptions{
+			ProviderID: liveSourcesCopilotKey,
+			Now:        testTime(0),
+		})
+		if err != nil {
+			t.Fatalf("ListModels(Copilot ACP) error = %v", err)
+		}
+		if got, want := rowModelIDs(
+			rows,
+		), []string{
+			"auto",
+			"claude-sonnet-5",
+			"gpt-5.6-luna",
+		}; !slices.Equal(
+			got,
+			want,
+		) {
+			t.Fatalf("row ids = %#v, want %#v", got, want)
+		}
+		luna := requireModelRow(t, rows, "gpt-5.6-luna")
+		if luna.SupportsReasoning == nil || !*luna.SupportsReasoning ||
+			!slices.Equal(luna.ReasoningEfforts, []ReasoningEffort{"none", "low", "medium", "high", "xhigh", "max"}) {
+			t.Fatalf("gpt-5.6-luna reasoning = %v %#v, want advertised Copilot efforts", luna.SupportsReasoning,
+				luna.ReasoningEfforts)
+		}
+		if sonnet := requireModelRow(t, rows, "claude-sonnet-5"); sonnet.SupportsReasoning == nil ||
+			!*sonnet.SupportsReasoning ||
+			!slices.Equal(sonnet.ReasoningEfforts, []ReasoningEffort{"low", "medium", "high"}) {
+			t.Fatalf("claude-sonnet-5 reasoning = %v %#v, want its own advertised set", sonnet.SupportsReasoning,
+				sonnet.ReasoningEfforts)
+		}
+		if auto := requireModelRow(t, rows, "auto"); len(auto.ReasoningEfforts) != 0 {
+			t.Fatalf("auto efforts = %#v, want none when Copilot advertises no effort for Auto", auto.ReasoningEfforts)
+		}
+		req := probe.singleRequest(t)
+		if req.Command != strings.TrimSpace(builtin.Command) || envValue(req.Env, "GH_TOKEN") != "" {
+			t.Fatalf("Copilot discovery request = %#v, want builtin command without ambient tokens", req)
+		}
+
+		// A Copilot Free account resolves Auto to one model and advertises no
+		// model select; discovery reports that instead of inventing a catalog.
+		freeProbe := &fakeACPModelProbe{options: []acp.SessionConfigOption{{
+			ID: "allow_all", Category: "permissions", Kind: acp.SessionConfigOptionKindSelect,
+			CurrentValueID: "off", Values: []acp.SessionConfigOptionValue{{Value: "on"}, {Value: "off"}},
+		}}}
+		freeSource := newLiveSourceForTest(t, liveSourcesCopilotKey, builtin, &LiveProviderSourcesConfig{
+			BaseEnv: []string{"PATH=/bin"}, ACPProbe: freeProbe,
+		})
+		if _, err := freeSource.ListModels(testutil.Context(t), ListOptions{
+			ProviderID: liveSourcesCopilotKey,
+			Now:        testTime(1),
+		}); err == nil || !strings.Contains(err.Error(), "did not advertise a model select option") {
+			t.Fatalf("ListModels(Copilot Free) error = %v, want missing model option", err)
+		}
+	})
+
+	t.Run("Should use configured Pi endpoint only when enabled", func(t *testing.T) {
+		t.Parallel()
+
+		server := liveJSONServer(t, func(_ *http.Request) string {
+			return `{"data":[{"id":"anthropic/claude-sonnet-4-6"}]}`
+		})
+		enabled := true
+		provider := compozyconfig.ProviderConfig{}
+		provider.Models.Discovery.Enabled = &enabled
+		provider.Models.Discovery.Endpoint = server.URL
+		rows, err := newLiveSourceForTest(t, "pi", provider, &LiveProviderSourcesConfig{
+			BaseEnv: []string{"PATH=/bin"},
+		}).ListModels(testutil.Context(t), ListOptions{ProviderID: "pi", Now: testTime(0)})
+		if err != nil {
+			t.Fatalf("ListModels() error = %v", err)
+		}
+		if got, want := requireSingleRow(t, rows).ModelID, "anthropic/claude-sonnet-4-6"; got != want {
+			t.Fatalf("ModelID = %q, want %q", got, want)
+		}
+	})
+
+	t.Run("Should record live discovery timeout without blocking indefinitely", func(t *testing.T) {
+		t.Parallel()
+
+		timeoutObserved := make(chan error, 1)
+		provider := compozyconfig.ProviderConfig{}
+		provider.Models.Discovery.Endpoint = "https://models.example.test/discovery"
+		provider.Models.Discovery.Timeout = "20ms"
+		source := newLiveSourceForTest(t, "vercel-ai-gateway", provider, &LiveProviderSourcesConfig{
+			BaseEnv: []string{"PATH=/bin"},
+			HTTPClient: &http.Client{
+				Timeout: time.Second,
+				Transport: modelCatalogRoundTripFunc(func(request *http.Request) (*http.Response, error) {
+					<-request.Context().Done()
+					err := request.Context().Err()
+					timeoutObserved <- err
+					return nil, err
+				}),
+			},
+		})
+		store := newMemoryStore()
+		service := newTestService(t, store, []Source{source})
+
+		statuses, err := service.Refresh(
+			testutil.Context(t),
+			RefreshOptions{ProviderID: "vercel-ai-gateway", Force: true, Now: testTime(0)},
+		)
+		if !errors.Is(err, ErrAllSourcesFailed) {
+			t.Fatalf("Refresh() error = %v, want ErrAllSourcesFailed", err)
+		}
+		if timeoutErr := <-timeoutObserved; !errors.Is(timeoutErr, context.DeadlineExceeded) {
+			t.Fatalf("request context error = %v, want context deadline exceeded", timeoutErr)
+		}
+		status := requireStatus(t, statuses, "provider_live:vercel-ai-gateway")
+		if status.RefreshState != RefreshStateFailed {
+			t.Fatalf("RefreshState = %q, want failed", status.RefreshState)
+		}
+	})
+}
+
+func TestLiveProviderRefreshCoalescing(t *testing.T) {
+	t.Parallel()
+
+	t.Run("Should coalesce concurrent refreshes for the same provider", func(t *testing.T) {
+		t.Parallel()
+
+		source := newBlockingProviderSource("provider_live:codex", "codex")
+		service := newTestService(t, newMemoryStore(), []Source{source})
+		waiterReached := make(chan struct{}, 1)
+		service.onFlightWait = func(string) {
+			select {
+			case waiterReached <- struct{}{}:
+			default:
+			}
+		}
+		ctx := testutil.Context(t)
+		var wg sync.WaitGroup
+		results := make([][]SourceStatus, 2)
+		errs := make([]error, 2)
+		startRefresh := func(index int) {
+			wg.Go(func() {
+				statuses, err := service.Refresh(ctx, RefreshOptions{
+					ProviderID: "codex",
+					Force:      true,
+					Now:        testTime(0),
+				})
+				results[index] = statuses
+				errs[index] = err
+			})
+		}
+		startRefresh(0)
+		waitForBlockingProviderSourceStart(t, source.started, "first provider refresh")
+		startRefresh(1)
+		select {
+		case <-waiterReached:
+		case <-time.After(time.Second):
+			t.Fatalf("timeout waiting for second refresh to register as flight waiter")
+		}
+		source.release()
+		wg.Wait()
+
+		for index, err := range errs {
+			if err != nil {
+				t.Fatalf("Refresh[%d]() error = %v", index, err)
+			}
+		}
+		if got := source.callCount(); got != 1 {
+			t.Fatalf("source calls = %d, want 1", got)
+		}
+		if len(results[0]) != 1 || len(results[1]) != 1 {
+			t.Fatalf("statuses = %#v / %#v, want one status each", results[0], results[1])
+		}
+		if results[0][0].LastRefresh != results[1][0].LastRefresh {
+			t.Fatalf("LastRefresh differs: %s vs %s", results[0][0].LastRefresh, results[1][0].LastRefresh)
+		}
+	})
+
+	t.Run("Should serialize different source scopes without sharing statuses", func(t *testing.T) {
+		t.Parallel()
+
+		firstSource := newBlockingProviderSource("provider_live:codex_a", "codex")
+		secondSource := newBlockingProviderSource("provider_live:codex_b", "codex")
+		service := newTestService(t, newMemoryStore(), []Source{firstSource, secondSource})
+		ctx := testutil.Context(t)
+
+		firstDone := make(chan []SourceStatus, 1)
+		firstErr := make(chan error, 1)
+		go func() {
+			statuses, err := service.Refresh(ctx, RefreshOptions{
+				ProviderID: "codex",
+				SourceID:   firstSource.ID(),
+				Force:      true,
+				Now:        testTime(0),
+			})
+			firstDone <- statuses
+			firstErr <- err
+		}()
+		waitForBlockingProviderSourceStart(t, firstSource.started, "first source refresh")
+
+		secondDone := make(chan []SourceStatus, 1)
+		secondErr := make(chan error, 1)
+		secondRefreshStarted := make(chan struct{})
+		go func() {
+			close(secondRefreshStarted)
+			statuses, err := service.Refresh(ctx, RefreshOptions{
+				ProviderID: "codex",
+				SourceID:   secondSource.ID(),
+				Force:      true,
+				Now:        testTime(1),
+			})
+			secondDone <- statuses
+			secondErr <- err
+		}()
+		waitForBlockingProviderSourceStart(t, secondRefreshStarted, "second source refresh launch")
+		assertBlockingProviderSourceNotStarted(t, secondSource.started, "second source before first release")
+
+		firstSource.release()
+		waitForBlockingProviderSourceStart(t, secondSource.started, "second source after first release")
+		secondSource.release()
+
+		firstStatuses := <-firstDone
+		if err := <-firstErr; err != nil {
+			t.Fatalf("first Refresh() error = %v", err)
+		}
+		secondStatuses := <-secondDone
+		if err := <-secondErr; err != nil {
+			t.Fatalf("second Refresh() error = %v", err)
+		}
+		if got, want := requireStatus(t, firstStatuses, firstSource.ID()).SourceID, firstSource.ID(); got != want {
+			t.Fatalf("first status source = %q, want %q", got, want)
+		}
+		if got, want := requireStatus(t, secondStatuses, secondSource.ID()).SourceID, secondSource.ID(); got != want {
+			t.Fatalf("second status source = %q, want %q", got, want)
+		}
+		if got := firstSource.callCount(); got != 1 {
+			t.Fatalf("first source calls = %d, want 1", got)
+		}
+		if got := secondSource.callCount(); got != 1 {
+			t.Fatalf("second source calls = %d, want 1", got)
+		}
+	})
+
+	t.Run("Should keep stale fallback error text stable and redact details separately", func(t *testing.T) {
+		t.Parallel()
+
+		err := &StaleFallbackError{
+			SourceID: "provider_live:codex",
+			Err:      errors.New("upstream failure sk-secret-value"),
+		}
+		if got := err.Error(); strings.Contains(got, "sk-secret-value") {
+			t.Fatalf("Error() = %q, want stable redacted context", got)
+		}
+		if got := sourceErrorText(err); strings.Contains(got, "sk-secret-value") {
+			t.Fatalf("sourceErrorText() = %q, want redacted upstream details", got)
+		}
+		if got := sourceErrorText(err); !strings.Contains(got, "[REDACTED]") {
+			t.Fatalf("sourceErrorText() = %q, want redaction marker", got)
+		}
+	})
+}
+
+// TestLiveProviderSourceRegistration verifies provider configuration and account-scoped source registration.
+func TestLiveProviderSourceRegistration(t *testing.T) {
+	t.Parallel()
+
+	t.Run("Should discover overlay models with its own execution and transport identity", func(t *testing.T) {
+		t.Parallel()
+		const overlay = "claude-secondary"
+		command := "env CLAUDE_CONFIG_DIR=/account-secondary claude-acp"
+		probe := &fakeACPModelProbe{options: []acp.SessionConfigOption{{
+			ID: "model", Category: "model", Kind: acp.SessionConfigOptionKindSelect,
+			Values: []acp.SessionConfigOptionValue{{Value: "haiku", Label: "Haiku 4.5"}},
+		}}}
+		providers := map[string]compozyconfig.ProviderConfig{overlay: {
+			RuntimeProvider: "claude", Command: command, AuthMode: compozyconfig.ProviderAuthModeNativeCLI,
+			Harness: compozyconfig.ProviderHarnessACP,
+		}}
+		sources, err := NewLiveProviderSources(&LiveProviderSourcesConfig{
+			Providers: providers, ACPProbe: probe, BaseEnv: []string{"PATH=/bin", "ANTHROPIC_API_KEY=ambient-secret"},
+			WorkingDir: t.TempDir(),
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		var source *LiveProviderSource
+		for _, candidate := range sources {
+			if candidate.ID() == SourceKindProviderLiveID(overlay) {
+				source = candidate.(*LiveProviderSource)
+			}
+		}
+		if source == nil {
+			t.Fatal("overlay live source is missing")
+		}
+		rows, err := source.ListModels(t.Context(), ListOptions{ProviderID: overlay, Now: testTime(0)})
+		if err != nil {
+			t.Fatal(err)
+		}
+		row := requireSingleRow(t, rows)
+		if row.ProviderID != overlay || row.SourceID != SourceKindProviderLiveID(overlay) ||
+			row.ModelID != "claude-haiku-4-5-20251001" {
+			t.Fatalf("overlay row = %#v", row)
+		}
+		assertClaudeTransportBinding(t, row, "haiku")
+		request := probe.singleRequest(t)
+		if request.ProviderID != overlay || request.Command != command || request.Cwd != source.workingDir {
+			t.Fatalf("overlay execution = %#v", request)
+		}
+		if firstEnvValue(request.Env, "COMPOZY_PROVIDER") != overlay ||
+			firstEnvValue(request.Env, "ANTHROPIC_API_KEY") != "" {
+			t.Fatalf("overlay environment = %#v", request.Env)
+		}
+		fingerprint, err := source.CatalogExecutionFingerprint()
+		if err != nil {
+			t.Fatal(err)
+		}
+		changedProvider := providers[overlay]
+		changedProvider.Command = "env CLAUDE_CONFIG_DIR=/account-other claude-acp"
+		clone, changed, err := source.CloneWithProvider(changedProvider)
+		if err != nil {
+			t.Fatal(err)
+		}
+		nextFingerprint, err := clone.CatalogExecutionFingerprint()
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !changed || fingerprint == nextFingerprint {
+			t.Fatal("account command change reused discovery identity")
+		}
+	})
+
+	t.Run("Should preserve builtin model mappings under a partial provider override", func(t *testing.T) {
+		t.Parallel()
+
+		builtin := compozyconfig.BuiltinProviders()["claude"]
+		sources, err := NewLiveProviderSources(&LiveProviderSourcesConfig{
+			Providers: map[string]compozyconfig.ProviderConfig{
+				"claude": {
+					AuthMode:     compozyconfig.ProviderAuthModeNone,
+					NoneSecurity: compozyconfig.ProviderNoneSecurityLocalTransport,
+				},
+			},
+		})
+		if err != nil {
+			t.Fatalf("NewLiveProviderSources() error = %v", err)
+		}
+		for _, source := range sources {
+			if source.ID() != SourceKindProviderLiveID("claude") {
+				continue
+			}
+			liveSource, ok := source.(*LiveProviderSource)
+			if !ok {
+				t.Fatalf("Claude source type = %T, want *LiveProviderSource", source)
+			}
+			provider := liveSource.providerSnapshot()
+			if provider.Models.Default != builtin.Models.Default ||
+				len(provider.Models.Curated) != len(builtin.Models.Curated) {
+				t.Fatalf("Claude models = %#v, want preserved builtin mappings", provider.Models)
+			}
+			if provider.Command == "" || provider.EffectiveAuthMode() != compozyconfig.ProviderAuthModeNone {
+				t.Fatalf("Claude provider = %#v, want builtin command plus auth override", provider)
+			}
+			return
+		}
+		t.Fatal("Claude live source is missing")
+	})
+
+	t.Run("Should register core live provider sources", func(t *testing.T) {
+		t.Parallel()
+
+		sources, err := NewLiveProviderSources(&LiveProviderSourcesConfig{
+			Providers: map[string]compozyconfig.ProviderConfig{
+				"ollama": {Command: "ollama serve"},
+				"openai": {
+					Command:  "openai",
+					AuthMode: compozyconfig.ProviderAuthModeBoundSecret,
+					CredentialSlots: []compozyconfig.ProviderCredentialSlot{
+						{Name: "api_key", TargetEnv: "OPENAI_API_KEY", SecretRef: "env:OPENAI_API_KEY", Required: true},
+					},
+				},
+			},
+			BaseEnv: []string{"PATH=/bin"},
+		})
+		if err != nil {
+			t.Fatalf("NewLiveProviderSources() error = %v", err)
+		}
+		sourceIDs := make([]string, 0, len(sources))
+		for _, source := range sources {
+			sourceIDs = append(sourceIDs, source.ID())
+		}
+		for _, want := range []string{
+			"provider_live:agy",
+			"provider_live:codex",
+			"provider_live:cursor",
+			"provider_live:claude",
+			"provider_live:gemini",
+			"provider_live:openrouter",
+			"provider_live:vercel-ai-gateway",
+			"provider_live:opencode",
+			"provider_live:pi",
+			"provider_live:ollama",
+			"provider_live:openai",
+		} {
+			if !slices.Contains(sourceIDs, want) {
+				t.Fatalf("source ids = %#v, want %q registered", sourceIDs, want)
+			}
+		}
+		var cursorSource *LiveProviderSource
+		for _, source := range sources {
+			if source.ID() == SourceKindProviderLiveID("cursor") {
+				var ok bool
+				cursorSource, ok = source.(*LiveProviderSource)
+				if !ok {
+					t.Fatalf("Cursor live source type = %T, want *LiveProviderSource", source)
+				}
+				break
+			}
+		}
+		if cursorSource == nil {
+			t.Fatal("Cursor live source = nil, want registered source")
+		}
+		if !cursorSource.BootstrapOnList() {
+			t.Fatal("Cursor BootstrapOnList() = false, want pre-session discovery")
+		}
+		target, targetErr := cursorSource.discoveryTarget(cursorSource.providerSnapshot())
+		if targetErr != nil {
+			t.Fatalf("Cursor discoveryTarget() error = %v", targetErr)
+		}
+		if target.kind != liveDiscoveryCommand || target.command != cursorModelsCommand {
+			t.Fatalf("Cursor discovery target = %#v, want cursor-agent models command", target)
+		}
+	})
+
+	t.Run("Should derive default endpoint from versioned base URL", func(t *testing.T) {
+		t.Parallel()
+
+		provider := boundSecretProvider("OPENAI_API_KEY", "env:OPENAI_API_KEY")
+		provider.BaseURL = "https://api.openai.test/v1"
+		source := newLiveSourceForTest(t, "openai", provider, &LiveProviderSourcesConfig{
+			BaseEnv:        []string{"PATH=/bin"},
+			SecretResolver: mapSecretResolver{"env:OPENAI_API_KEY": "sk-test"},
+		})
+		target, err := source.discoveryTarget(source.providerSnapshot())
+		if err != nil {
+			t.Fatalf("discoveryTarget() error = %v", err)
+		}
+		if got, want := target.endpoint, "https://api.openai.test/v1/models"; got != want {
+			t.Fatalf("endpoint = %q, want %q", got, want)
+		}
+		if got, want := source.ProviderIDs(), []string{"openai"}; !slices.Equal(got, want) {
+			t.Fatalf("ProviderIDs() = %#v, want %#v", got, want)
+		}
+	})
+
+	t.Run("Should retain an owned provider config snapshot", func(t *testing.T) {
+		t.Parallel()
+
+		enabled := true
+		hidden := false
+		provider := boundSecretProvider("OPENAI_API_KEY", "env:OPENAI_API_KEY")
+		provider.Models.Discovery.Enabled = &enabled
+		provider.Models.Discovery.Endpoint = "https://api.openai.test/v1/models"
+		provider.Models.Curated = []compozyconfig.ProviderModelConfig{{
+			ID:     "gpt-test",
+			Hidden: &hidden,
+		}}
+		source := newLiveSourceForTest(t, "openai", provider, &LiveProviderSourcesConfig{
+			BaseEnv:        []string{"PATH=/bin"},
+			SecretResolver: mapSecretResolver{"env:OPENAI_API_KEY": "sk-test"},
+		})
+		enabled = false
+		hidden = true
+		provider.Models.Discovery.Endpoint = "https://mutated.invalid/models"
+
+		target, err := source.discoveryTarget(source.providerSnapshot())
+		if err != nil {
+			t.Fatalf("discoveryTarget() error = %v", err)
+		}
+		if got, want := target.endpoint, "https://api.openai.test/v1/models"; got != want {
+			t.Fatalf("snapshot discovery endpoint = %q, want %q", got, want)
+		}
+		model := source.provider.Models.Curated[0]
+		if model.Hidden == nil || *model.Hidden {
+			t.Fatalf("snapshot curated hidden = %v, want false", model.Hidden)
+		}
+	})
+}
+
+func TestLiveProviderParsingHelpers(t *testing.T) {
+	t.Parallel()
+
+	t.Run("Should parse object map model payload", func(t *testing.T) {
+		t.Parallel()
+
+		rows, err := parseLiveModelPayload(
+			"custom",
+			[]byte(
+				`{"model-a":{"display_name":"Model A","supports_tools":true,"pricing":{"cache_read":0.0000005,"cache_write":0.000003,"reasoning":0.000004}},`+
+					`"model-b":{`+
+					`"name":"Model B",`+
+					`"reasoning_efforts":["minimal","invalid effort","high"],`+
+					`"default_reasoning_effort":"high"`+
+					`}}`,
+			),
+			testTime(0),
+		)
+		if err != nil {
+			t.Fatalf("parseLiveModelPayload() error = %v", err)
+		}
+		if got, want := rowModelIDs(rows), []string{"model-a", "model-b"}; !slices.Equal(got, want) {
+			t.Fatalf("row ids = %#v, want %#v", got, want)
+		}
+		if rows[0].SupportsTools == nil || !*rows[0].SupportsTools {
+			t.Fatalf("SupportsTools = %v, want true", rows[0].SupportsTools)
+		}
+		if rows[0].CostCacheReadPerMillion == nil || *rows[0].CostCacheReadPerMillion != 0.5 ||
+			rows[0].CostCacheWritePerMillion == nil || *rows[0].CostCacheWritePerMillion != 3 ||
+			rows[0].CostReasoningPerMillion == nil || *rows[0].CostReasoningPerMillion != 4 {
+			t.Fatalf("live five-rate pricing = %#v, want cache-read 0.5/cache-write 3/reasoning 4", rows[0])
+		}
+		if !slices.Equal(rows[1].ReasoningEfforts, []ReasoningEffort{ReasoningEffortMinimal, ReasoningEffortHigh}) {
+			t.Fatalf("ReasoningEfforts = %#v, want minimal/high", rows[1].ReasoningEfforts)
+		}
+		if rows[1].DefaultReasoningEffort == nil || *rows[1].DefaultReasoningEffort != ReasoningEffortHigh {
+			t.Fatalf("DefaultReasoningEffort = %v, want high", rows[1].DefaultReasoningEffort)
+		}
+	})
+
+	t.Run("Should reject empty live payload", func(t *testing.T) {
+		t.Parallel()
+
+		_, err := parseLiveModelPayload("custom", []byte("  "), testTime(0))
+		if err == nil {
+			t.Fatal("parseLiveModelPayload(empty) error = nil, want error")
+		}
+	})
+
+	t.Run("Should reject Cursor output without parseable model rows", func(t *testing.T) {
+		t.Parallel()
+
+		_, err := parseCursorModelRows("cursor", "Available models\n\nTip: use --model <id>", testTime(0))
+		if err == nil || !strings.Contains(err.Error(), "cursor model command returned no model rows") {
+			t.Fatalf("parseCursorModelRows() error = %v, want missing model rows", err)
+		}
+	})
+}
+
+func TestLiveDiscoverySupportTypes(t *testing.T) {
+	t.Parallel()
+
+	t.Run("Should invalidate only Claude model mapping inputs", func(t *testing.T) {
+		t.Parallel()
+
+		claude := compozyconfig.BuiltinProviders()[liveSourcesClaudeKey]
+		claudeSource := newLiveSourceForTest(t, liveSourcesClaudeKey, claude, &LiveProviderSourcesConfig{})
+		metadataOnly := compozyconfig.CloneProviderConfig(claude)
+		metadataOnly.Models.Curated[0].DisplayName = "Metadata-only label"
+		if _, changed, err := claudeSource.CloneWithProvider(metadataOnly); err != nil {
+			t.Fatalf("CloneWithProvider(Claude metadata) error = %v", err)
+		} else if changed {
+			t.Fatal("CloneWithProvider(Claude metadata) changed = true, want false")
+		}
+
+		mapping := compozyconfig.CloneProviderConfig(claude)
+		mapping.Models.Curated[0].ID = "claude-remapped-model"
+		if _, changed, err := claudeSource.CloneWithProvider(mapping); err != nil {
+			t.Fatalf("CloneWithProvider(Claude mapping) error = %v", err)
+		} else if !changed {
+			t.Fatal("CloneWithProvider(Claude mapping) changed = false, want true")
+		}
+
+		cursor := compozyconfig.BuiltinProviders()[liveSourcesCursorKey]
+		cursorSource := newLiveSourceForTest(t, liveSourcesCursorKey, cursor, &LiveProviderSourcesConfig{})
+		cursorMetadata := compozyconfig.CloneProviderConfig(cursor)
+		cursorMetadata.Models.Curated = append(cursorMetadata.Models.Curated, compozyconfig.ProviderModelConfig{
+			ID: "metadata-only",
+		})
+		if _, changed, err := cursorSource.CloneWithProvider(cursorMetadata); err != nil {
+			t.Fatalf("CloneWithProvider(Cursor metadata) error = %v", err)
+		} else if changed {
+			t.Fatal("CloneWithProvider(Cursor metadata) changed = true, want false")
+		}
+	})
+
+	t.Run("Should apply the live refresh TTL without adding provider config state", func(t *testing.T) {
+		t.Parallel()
+
+		provider := compozyconfig.BuiltinProviders()["cursor"]
+		defaultSource := newLiveSourceForTest(t, "cursor", provider, &LiveProviderSourcesConfig{})
+		if got, want := defaultSource.TTL(), DefaultLiveDiscoveryTTL; got != want {
+			t.Fatalf("TTL() = %s, want %s", got, want)
+		}
+
+		customTTL := 37 * time.Second
+		customSource := newLiveSourceForTest(t, "cursor", provider, &LiveProviderSourcesConfig{
+			RefreshTTL: customTTL,
+		})
+		if got := customSource.TTL(); got != customTTL {
+			t.Fatalf("TTL() = %s, want %s", got, customTTL)
+		}
+	})
+
+	t.Run("Should resolve env secret refs", func(t *testing.T) {
+		t.Parallel()
+
+		resolver := EnvSecretResolver{LookupEnv: func(key string) (string, bool) {
+			return map[string]string{"OPENAI_API_KEY": "sk-env"}[key], key == "OPENAI_API_KEY"
+		}}
+		value, err := resolver.ResolveRef(testutil.Context(t), "env:OPENAI_API_KEY")
+		if err != nil {
+			t.Fatalf("ResolveRef() error = %v", err)
+		}
+		if value != "sk-env" {
+			t.Fatalf("value = %q, want sk-env", value)
+		}
+	})
+
+	t.Run("Should reject unsupported secret refs", func(t *testing.T) {
+		t.Parallel()
+
+		_, err := (EnvSecretResolver{}).ResolveRef(testutil.Context(t), "vault:providers/openai/api_key")
+		if !errors.Is(err, vault.ErrUnsupportedSecretRef) {
+			t.Fatalf("ResolveRef(vault) error = %v, want ErrUnsupportedSecretRef", err)
+		}
+	})
+
+	t.Run("Should capture a large native catalog without truncating its final record", func(t *testing.T) {
+		t.Parallel()
+		result, err := (ExecDiscoveryCommandExecutor{}).RunDiscoveryCommand(
+			t.Context(),
+			DiscoveryCommandRequest{
+				ProviderID: "helper",
+				Command:    os.Args[0],
+				Args:       []string{"-test.run=TestLiveDiscoveryHelperProcess"},
+				Env:        append(os.Environ(), "COMPOZY_LIVE_DISCOVERY_HELPER=large"),
+				Timeout:    time.Second,
+			},
+		)
+		if err != nil {
+			t.Fatal(err)
+		}
+		want := `[{"id":"` + strings.Repeat("x", 600000) + `"}]`
+		if result.Stdout != want || result.ExitCode != 0 {
+			t.Fatalf("captured %d bytes, want %d, exit %d", len(result.Stdout), len(want), result.ExitCode)
+		}
+	})
+}
+
+func TestLiveDiscoveryHelperProcess(t *testing.T) {
+	t.Run("Should emit the subprocess discovery fixture", func(t *testing.T) {
+		mode := os.Getenv("COMPOZY_LIVE_DISCOVERY_HELPER")
+		if mode != "large" {
+			return
+		}
+		payload := `[{"id":"` + strings.Repeat("x", 600000) + `"}]`
+		if _, err := fmt.Fprint(os.Stdout, payload); err != nil {
+			t.Fatalf("Fprint(stdout) error = %v", err)
+		}
+		os.Exit(0)
+	})
+}
+
+func liveJSONServer(t *testing.T, body func(*http.Request) string) *httptest.Server {
+	t.Helper()
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, err := fmt.Fprint(w, body(r))
+		if err != nil {
+			t.Errorf("Fprint(response) error = %v", err)
+		}
+	}))
+	t.Cleanup(server.Close)
+	return server
+}
+
+func boundSecretProvider(targetEnv string, secretRef string) compozyconfig.ProviderConfig {
+	return compozyconfig.ProviderConfig{
+		AuthMode: compozyconfig.ProviderAuthModeBoundSecret,
+		CredentialSlots: []compozyconfig.ProviderCredentialSlot{
+			{Name: "api_key", TargetEnv: targetEnv, SecretRef: secretRef, Required: true},
+		},
+	}
+}
+
+func newLiveSourceForTest(
+	t *testing.T,
+	providerID string,
+	provider compozyconfig.ProviderConfig,
+	cfg *LiveProviderSourcesConfig,
+) *LiveProviderSource {
+	t.Helper()
+
+	source, err := NewLiveProviderSource(providerID, provider, cfg)
+	if err != nil {
+		t.Fatalf("NewLiveProviderSource() error = %v", err)
+	}
+	return source
+}
+
+type mapSecretResolver map[string]string
+
+// ResolveRef supplies configured discovery credentials at the secret-store I/O boundary.
+func (r mapSecretResolver) ResolveRef(ctx context.Context, ref string) (string, error) {
+	if ctx == nil {
+		return "", errors.New("context required")
+	}
+	if err := ctx.Err(); err != nil {
+		return "", err
+	}
+	normalized := vault.NormalizeRef(ref)
+	value, ok := r[normalized]
+	if !ok || strings.TrimSpace(value) == "" {
+		return "", fmt.Errorf("%w: %s", vault.ErrMissingSecret, normalized)
+	}
+	return value, nil
+}
+
+type fakeDiscoveryExecutor struct {
+	mu       sync.Mutex
+	result   DiscoveryCommandResult
+	err      error
+	handle   func(DiscoveryCommandRequest) (DiscoveryCommandResult, error)
+	requests []DiscoveryCommandRequest
+}
+
+type fakeACPModelProbe struct {
+	mu          sync.Mutex
+	options     []acp.SessionConfigOption
+	models      map[string][]acp.SessionConfigOption
+	modelErrors map[string]error
+	err         error
+	requests    []ACPModelProbeRequest
+}
+
+// InspectModels supplies isolated per-model snapshots at the ACP discovery I/O boundary.
+func (p *fakeACPModelProbe) InspectModels(
+	_ context.Context,
+	req ACPModelProbeRequest,
+) (acp.SessionModelInspection, error) {
+	p.mu.Lock()
+	p.requests = append(p.requests, req)
+	p.mu.Unlock()
+	return acp.SessionModelInspection{
+		Options:     acp.CloneSessionConfigOptions(p.options),
+		Models:      p.models,
+		ModelErrors: p.modelErrors,
+	}, p.err
+}
+
+func (p *fakeACPModelProbe) singleRequest(t *testing.T) ACPModelProbeRequest {
+	t.Helper()
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if len(p.requests) != 1 {
+		t.Fatalf("len(requests) = %d, want 1", len(p.requests))
+	}
+	return p.requests[0]
+}
+
+func (e *fakeDiscoveryExecutor) RunDiscoveryCommand(
+	_ context.Context,
+	req DiscoveryCommandRequest,
+) (DiscoveryCommandResult, error) {
+	e.mu.Lock()
+	e.requests = append(e.requests, req)
+	handle := e.handle
+	result := e.result
+	err := e.err
+	e.mu.Unlock()
+	if handle != nil {
+		return handle(req)
+	}
+	return result, err
+}
+
+func (e *fakeDiscoveryExecutor) singleRequest(t *testing.T) DiscoveryCommandRequest {
+	t.Helper()
+
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	if len(e.requests) != 1 {
+		t.Fatalf("len(requests) = %d, want 1", len(e.requests))
+	}
+	return e.requests[0]
+}
+
+func (e *fakeDiscoveryExecutor) allRequests(t *testing.T) []DiscoveryCommandRequest {
+	t.Helper()
+
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	return append([]DiscoveryCommandRequest(nil), e.requests...)
+}
+
+// writeOpenCodeFixture creates a resolvable native placeholder that nothing executes.
+func writeOpenCodeFixture(t *testing.T) string {
+	t.Helper()
+
+	binDir := t.TempDir()
+	name := "opencode"
+	if runtime.GOOS == "windows" {
+		name += ".exe"
+	}
+	path := filepath.Join(binDir, name)
+	if err := os.WriteFile(path, []byte("#!/bin/sh\nexit 0\n"), 0o755); err != nil {
+		t.Fatalf("WriteFile(opencode fixture) error = %v", err)
+	}
+	return binDir
+}
+
+func openCodeFixtureEnv(t *testing.T, extra ...string) []string {
+	t.Helper()
+
+	binDir := writeOpenCodeFixture(t)
+	env := []string{"PATH=" + binDir, "HOME=" + t.TempDir()}
+	return append(env, extra...)
+}
+
+type blockingProviderSource struct {
+	id       string
+	provider string
+	started  chan struct{}
+	released chan struct{}
+	calls    atomic.Int64
+	once     sync.Once
+}
+
+func newBlockingProviderSource(id string, provider string) *blockingProviderSource {
+	return &blockingProviderSource{
+		id:       id,
+		provider: provider,
+		started:  make(chan struct{}),
+		released: make(chan struct{}),
+	}
+}
+
+func (s *blockingProviderSource) ID() string {
+	return s.id
+}
+
+func (s *blockingProviderSource) Kind() SourceKind {
+	return SourceKindProviderLive
+}
+
+func (s *blockingProviderSource) Priority() int {
+	return PriorityProviderLive
+}
+
+func (s *blockingProviderSource) CatalogExecutionFingerprint() (string, error) {
+	return CatalogExecutionFingerprint(s.ID(), string(s.Kind())), nil
+}
+
+func (s *blockingProviderSource) ProviderIDs() []string {
+	return []string{s.provider}
+}
+
+func (s *blockingProviderSource) ListModels(_ context.Context, _ ListOptions) ([]ModelRow, error) {
+	s.calls.Add(1)
+	s.once.Do(func() {
+		close(s.started)
+	})
+	<-s.released
+	available := true
+	return []ModelRow{
+		{
+			ProviderID:  s.provider,
+			ModelID:     "gpt-5.4",
+			SourceID:    s.id,
+			SourceKind:  SourceKindProviderLive,
+			Priority:    PriorityProviderLive,
+			Available:   &available,
+			RefreshedAt: testTime(0),
+		},
+	}, nil
+}
+
+func (s *blockingProviderSource) release() {
+	close(s.released)
+}
+
+func (s *blockingProviderSource) callCount() int64 {
+	return s.calls.Load()
+}
+
+func waitForBlockingProviderSourceStart(t *testing.T, started <-chan struct{}, label string) {
+	t.Helper()
+
+	select {
+	case <-started:
+	case <-time.After(time.Second):
+		t.Fatalf("timeout waiting for %s", label)
+	}
+}
+
+func assertBlockingProviderSourceNotStarted(t *testing.T, started <-chan struct{}, label string) {
+	t.Helper()
+
+	select {
+	case <-started:
+		t.Fatalf("%s started unexpectedly", label)
+	default:
+	}
+}
+
+func envValue(env []string, key string) string {
+	for _, entry := range env {
+		currentKey, value, ok := strings.Cut(entry, "=")
+		if ok && currentKey == key {
+			return value
+		}
+	}
+	return ""
+}
+
+func requireModelRow(t *testing.T, rows []ModelRow, modelID string) ModelRow {
+	t.Helper()
+
+	for _, row := range rows {
+		if row.ModelID == modelID {
+			return row
+		}
+	}
+	t.Fatalf("model rows = %#v, want model %q", rowModelIDs(rows), modelID)
+	return ModelRow{}
+}
+
+func assertClaudeTransportBinding(t *testing.T, row ModelRow, transportModelID string) {
+	t.Helper()
+
+	for _, binding := range row.TransportBindings {
+		if binding.TransportModelID == transportModelID {
+			return
+		}
+	}
+	t.Fatalf("row %q missing Claude transport binding %q", row.ModelID, transportModelID)
+}
+
+func assertCursorBinding(
+	t *testing.T,
+	row ModelRow,
+	transportModelID string,
+	effort ReasoningEffort,
+	fast bool,
+	thinking *bool,
+) {
+	t.Helper()
+
+	for _, binding := range row.TransportBindings {
+		if binding.TransportModelID != transportModelID {
+			continue
+		}
+		if binding.ReasoningEffort == nil || *binding.ReasoningEffort != effort {
+			t.Fatalf("binding %q reasoning = %v, want %q", transportModelID, binding.ReasoningEffort, effort)
+		}
+		if binding.Fast == nil || *binding.Fast != fast {
+			t.Fatalf("binding %q fast = %v, want %t", transportModelID, binding.Fast, fast)
+		}
+		if (binding.Thinking == nil) != (thinking == nil) ||
+			(binding.Thinking != nil && *binding.Thinking != *thinking) {
+			t.Fatalf("binding %q thinking = %v, want %v", transportModelID, binding.Thinking, thinking)
+		}
+		if thinking != nil {
+			if len(binding.OptionSelections) != 1 || binding.OptionSelections[0].ID != "thinking" ||
+				binding.OptionSelections[0].BoolValue == nil ||
+				*binding.OptionSelections[0].BoolValue != *thinking {
+				t.Fatalf(
+					"binding %q option selections = %#v, want thinking=%t",
+					transportModelID,
+					binding.OptionSelections,
+					*thinking,
+				)
+			}
+		} else if len(binding.OptionSelections) != 0 {
+			t.Fatalf(
+				"binding %q option selections = %#v, want none",
+				transportModelID,
+				binding.OptionSelections,
+			)
+		}
+		return
+	}
+	t.Fatalf("row %q missing transport binding %q", row.ModelID, transportModelID)
+}
+
+func assertModelCatalogErrorContains(t *testing.T, err error, want string) {
+	t.Helper()
+
+	if err == nil {
+		t.Fatalf("error = nil, want error containing %q", want)
+	}
+	if !strings.Contains(err.Error(), want) {
+		t.Fatalf("error = %v, want error containing %q", err, want)
+	}
+}
+
+func TestCodexCatalogProtocol(t *testing.T) {
+	t.Parallel()
+	t.Run("Should preserve per-model efforts and follow every native catalog page", func(t *testing.T) {
+		t.Parallel()
+		responses := `{"method":"model/updated"}
+{"id":1,"result":{"data":[{"id":"gpt-6-astra","model":"gpt-6-astra","displayName":"GPT-6 Astra","isDefault":true,"supportedReasoningEfforts":[{"reasoningEffort":"low"},{"reasoningEffort":"medium"},{"reasoningEffort":"high"},{"reasoningEffort":"xhigh"},{"reasoningEffort":"max"},{"reasoningEffort":"ultra"}],"defaultReasoningEffort":"medium"}],"nextCursor":"page-2"}}
+{"id":"2","result":{"data":[{"id":"gpt-5.6-luna","supportedReasoningEfforts":[{"reasoningEffort":"low"},{"reasoningEffort":"medium"},{"reasoningEffort":"max"}],"defaultReasoningEffort":"medium"}],"nextCursor":null}}
+`
+		var requests bytes.Buffer
+		client := codexCatalogClient{
+			writer: json.NewEncoder(&requests),
+			reader: bufio.NewScanner(strings.NewReader(responses)),
+		}
+		metadata, err := client.listModels()
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(metadata) != 2 || metadata[0].DefaultReasoningEffort != "medium" ||
+			len(metadata[0].SupportedReasoningEfforts) != 6 ||
+			len(metadata[1].SupportedReasoningEfforts) != 3 {
+			t.Fatalf("metadata = %#v", metadata)
+		}
+		if !strings.Contains(requests.String(), `"cursor":"page-2"`) {
+			t.Fatalf("requests did not follow page: %s", requests.String())
+		}
+		source := newLiveSourceForTest(
+			t,
+			"codex",
+			compozyconfig.BuiltinProviders()["codex"],
+			&LiveProviderSourcesConfig{CodexProbe: fixedCodexProbe{models: metadata}},
+		)
+		rows, err := source.listCodex(t.Context(), nil, time.Second, testTime(0))
+		if err != nil {
+			t.Fatal(err)
+		}
+		models := MergeRows(rows, MergeOptions{ReasoningApply: map[string]bool{"codex": true}})
+		for _, model := range models {
+			if model.ModelID == "gpt-6-astra" {
+				requireReasoningProfile(
+					t,
+					model,
+					true,
+					[]ReasoningEffort{
+						ReasoningEffortLow,
+						ReasoningEffortMedium,
+						ReasoningEffortHigh,
+						ReasoningEffortXHigh,
+						ReasoningEffortMax,
+						ReasoningEffortUltra,
+					},
+					ReasoningEffortMedium,
+				)
+				if !model.Curated || !model.Featured {
+					t.Fatalf("new native default missing from browse: %#v", model)
+				}
+			}
+		}
+	})
+	t.Run("Should retain future provider effort identifiers exactly", func(t *testing.T) {
+		t.Parallel()
+		var models []CodexModelMetadata
+		if err := json.Unmarshal(
+			[]byte(
+				`[{"model":"future-model","supportedReasoningEfforts":[{"reasoningEffort":"Super-High"}],"defaultReasoningEffort":"Super-High"}]`,
+			),
+			&models,
+		); err != nil {
+			t.Fatal(err)
+		}
+		source := newLiveSourceForTest(
+			t,
+			"codex",
+			compozyconfig.BuiltinProviders()["codex"],
+			&LiveProviderSourcesConfig{CodexProbe: fixedCodexProbe{models: models}},
+		)
+		rows, err := source.listCodex(t.Context(), nil, time.Second, testTime(0))
+		if err != nil {
+			t.Fatal(err)
+		}
+		merged := MergeRows(rows, MergeOptions{ReasoningApply: map[string]bool{"codex": true}})
+		requireReasoningProfile(t, requireSingleModel(t, merged), true, []ReasoningEffort{"Super-High"}, "Super-High")
+	})
+	t.Run("Should fail unexpected server requests without waiting for an unanswered request", func(t *testing.T) {
+		t.Parallel()
+		var requests bytes.Buffer
+		client := codexCatalogClient{
+			writer: json.NewEncoder(&requests),
+			reader: bufio.NewScanner(strings.NewReader(`{"id":"server-1","method":"permission/request"}`)),
+		}
+		_, err := client.listModels()
+		if err == nil || !strings.Contains(err.Error(), "unexpected Codex server request") {
+			t.Fatalf("listModels() error = %v", err)
+		}
+	})
+	t.Run("Should fail incomplete pagination instead of publishing a partial catalog", func(t *testing.T) {
+		t.Parallel()
+		responses := `{"id":1,"result":{"data":[{"id":"first"}],"nextCursor":"repeat"}}
+{"id":2,"result":{"data":[],"nextCursor":"repeat"}}
+`
+		var requests bytes.Buffer
+		client := codexCatalogClient{
+			writer: json.NewEncoder(&requests),
+			reader: bufio.NewScanner(strings.NewReader(responses)),
+		}
+		models, err := client.listModels()
+		if err == nil || models != nil {
+			t.Fatalf("listModels() = %#v, %v", models, err)
+		}
+	})
+}
+
+// recordingCodexProbe counts native Codex discovery starts at the process boundary.
+type recordingCodexProbe struct{ calls atomic.Int32 }
+
+func (p *recordingCodexProbe) InspectCodexModels(
+	context.Context,
+	DiscoveryCommandRequest,
+) ([]CodexModelMetadata, error) {
+	p.calls.Add(1)
+	return nil, errors.New("codex probe fixture")
+}
+
+type fixedCodexProbe struct{ models []CodexModelMetadata }
+
+func (p fixedCodexProbe) InspectCodexModels(context.Context, DiscoveryCommandRequest) ([]CodexModelMetadata, error) {
+	return p.models, nil
+}

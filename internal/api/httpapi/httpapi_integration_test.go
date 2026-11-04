@@ -1,0 +1,4627 @@
+//go:build integration
+
+package httpapi
+
+import (
+	"bufio"
+	"bytes"
+	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"io"
+	"net/http"
+	"os"
+	"path/filepath"
+	"slices"
+	"strconv"
+	"strings"
+	"sync"
+	"sync/atomic"
+	"testing"
+	"time"
+
+	"github.com/compozy/compozy/internal/acp"
+	"github.com/compozy/compozy/internal/api/contract"
+	core "github.com/compozy/compozy/internal/api/core"
+	automationpkg "github.com/compozy/compozy/internal/automation"
+	compozyconfig "github.com/compozy/compozy/internal/config"
+	eventspkg "github.com/compozy/compozy/internal/events"
+	"github.com/compozy/compozy/internal/observe"
+	profilepkg "github.com/compozy/compozy/internal/profile"
+	"github.com/compozy/compozy/internal/resources"
+	"github.com/compozy/compozy/internal/session"
+	"github.com/compozy/compozy/internal/store"
+	"github.com/compozy/compozy/internal/store/globaldb"
+	taskpkg "github.com/compozy/compozy/internal/task"
+	e2etest "github.com/compozy/compozy/internal/testutil/e2e"
+	"github.com/compozy/compozy/internal/transcript"
+	vaultpkg "github.com/compozy/compozy/internal/vault"
+	workspacepkg "github.com/compozy/compozy/internal/workspace"
+)
+
+func TestHTTPPromptIdentityRoundTrip(t *testing.T) {
+	t.Run("Should admit concurrent retries once and reject changed content", func(t *testing.T) {
+		runtime := newIntegrationRuntime(t)
+		id := createIntegrationSession(t, runtime)
+		bindIntegrationSessionRuntime(t, runtime, id)
+		if err := runtime.manager.WaitForPromptDrains(t.Context()); err != nil {
+			t.Fatal(err)
+		}
+		held := make(chan acp.AgentEvent, 1)
+		release := sync.OnceFunc(func() {
+			held <- acp.AgentEvent{Type: acp.EventTypeDone, StopReason: "end_turn"}
+			close(held)
+		})
+		defer release()
+		var calls atomic.Int32
+		runtime.driver.mu.Lock()
+		runtime.driver.promptHook = func(_ *session.AgentProcess, req acp.PromptRequest) (<-chan acp.AgentEvent, error) {
+			// Hold the first dispatch even when runtime recovery prepends transcript context.
+			if calls.Add(1) == 1 {
+				return held, nil
+			}
+			done := make(chan acp.AgentEvent, 1)
+			done <- acp.AgentEvent{Type: acp.EventTypeDone, TurnID: req.TurnID}
+			close(done)
+			return done, nil
+		}
+		runtime.driver.mu.Unlock()
+		active, err := runtime.manager.Prompt(t.Context(), id, "hold for HTTP replay")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !runtime.manager.IsPrompting(id) {
+			t.Fatal("held prompt must remain active before concurrent retries")
+		}
+		url := mustURL(runtime.host, runtime.port, "/api/workspaces/ws-workspace/sessions/"+id+"/prompt")
+		body := []byte(
+			`{"message":"one queued effect","mode":"queue","message_id":"msg-http-retry","idempotency_key":"idem-http-retry"}`,
+		)
+		responses := make(chan *http.Response, 2)
+		errorsCh := make(chan error, 2)
+		start := make(chan struct{})
+		for range 2 {
+			go func() {
+				<-start
+				response, requestErr := runtime.client.Post(url, "application/json", bytes.NewReader(body))
+				responses <- response
+				errorsCh <- requestErr
+			}()
+		}
+		close(start)
+		var firstID string
+		replays := 0
+		for range 2 {
+			response := <-responses
+			if requestErr := <-errorsCh; requestErr != nil {
+				t.Fatal(requestErr)
+			}
+			if response.StatusCode != http.StatusAccepted {
+				t.Fatalf("concurrent prompt status = %d: %s", response.StatusCode, readAndCloseHTTPBody(t, response))
+			}
+			var result contract.SendPromptResultResponse
+			decodeHTTPJSON(t, response, &result)
+			if firstID == "" {
+				firstID = result.Prompt.QueueEntryID
+			}
+			if firstID == "" || result.Prompt.QueueEntryID != firstID || result.Prompt.MessageID != "msg-http-retry" {
+				t.Fatalf("concurrent receipt = %#v, first entry %q", result.Prompt, firstID)
+			}
+			if result.Prompt.Replayed {
+				replays++
+			}
+		}
+		if replays != 1 {
+			t.Fatalf("concurrent replay receipts = %d, want 1", replays)
+		}
+		conflict := mustHTTPRequest(t, runtime.client, http.MethodPost, url,
+			bytes.Replace(body, []byte("one queued effect"), []byte("changed effect"), 1), nil)
+		conflictBody := readAndCloseHTTPBody(t, conflict)
+		if conflict.StatusCode != http.StatusConflict || !bytes.Contains(conflictBody, []byte("send_conflict")) {
+			t.Fatalf("content conflict = %d: %s", conflict.StatusCode, conflictBody)
+		}
+		release()
+		for range active {
+		}
+		if err := runtime.manager.WaitForPromptDrains(t.Context()); err != nil {
+			t.Fatal(err)
+		}
+		if calls.Load() != 2 {
+			t.Fatalf("dispatches = %d, want held turn plus one replayed input", calls.Load())
+		}
+		stopIntegrationSession(t, runtime, id)
+	})
+}
+
+func TestHTTPStoppedSystemSessionWorkspaceLifecycle(t *testing.T) {
+	t.Run("Should read and remove persisted stopped system sessions in their owning workspace", func(t *testing.T) {
+		t.Parallel()
+		runtime := newIntegrationRuntime(t)
+		created, err := runtime.manager.Create(t.Context(), new(session.CreateOpts{
+			AgentName: "coder", Workspace: "ws-workspace", Type: session.SessionTypeSystem,
+		}))
+		if err != nil {
+			t.Fatalf("Create(system) error = %v", err)
+		}
+		if err := runtime.manager.Stop(t.Context(), created.ID); err != nil {
+			t.Fatalf("Stop(system) error = %v", err)
+		}
+		info, err := runtime.manager.Status(t.Context(), created.ID)
+		if err != nil || info.State != session.StateStopped || info.Type != session.SessionTypeSystem {
+			t.Fatalf("Status(system) = %#v, %v", info, err)
+		}
+		path := "/api/workspaces/" + info.WorkspaceID + "/sessions/" + created.ID
+		for _, readPath := range []string{"/api/sessions/" + created.ID, path + "?all_profiles=true"} {
+			resp := mustHTTPRequest(t, runtime.client, http.MethodGet,
+				mustURL(runtime.host, runtime.port, readPath), nil, nil)
+			if resp.StatusCode != http.StatusOK {
+				t.Fatalf("GET %s status = %d; body=%s", readPath, resp.StatusCode, readAndCloseHTTPBody(t, resp))
+			}
+			var payload contract.SessionResponse
+			decodeHTTPJSON(t, resp, &payload)
+			if payload.Session.ID != created.ID || payload.Session.State != "stopped" {
+				t.Fatalf("GET %s session = %#v", readPath, payload.Session)
+			}
+		}
+		resp := mustHTTPRequest(t, runtime.client, http.MethodDelete,
+			mustURL(runtime.host, runtime.port, path+"?profile=default"), nil, nil)
+		body := readAndCloseHTTPBody(t, resp)
+		if resp.StatusCode != http.StatusNoContent || len(body) != 0 {
+			t.Fatalf("DELETE system status = %d; body=%s", resp.StatusCode, body)
+		}
+		if _, err := runtime.manager.Status(t.Context(), created.ID); !errors.Is(err, session.ErrSessionNotFound) {
+			t.Fatalf("Status(deleted system) error = %v, want session not found", err)
+		}
+	})
+}
+
+func TestHTTPFullRoundTripWithRealSessionManager(t *testing.T) {
+	runtime := newIntegrationRuntime(t)
+
+	indexResp := mustHTTPRequest(t, runtime.client, http.MethodGet, mustURL(runtime.host, runtime.port, "/"), nil, nil)
+	if indexResp.StatusCode != http.StatusOK {
+		body := readAndCloseHTTPBody(t, indexResp)
+		t.Fatalf("root status = %d, want %d; body=%s", indexResp.StatusCode, http.StatusOK, string(body))
+	}
+	indexBody, err := io.ReadAll(indexResp.Body)
+	closeHTTPBody(t, indexResp.Body)
+	if err != nil {
+		t.Fatalf("io.ReadAll(root) error = %v", err)
+	}
+	if !strings.Contains(string(indexBody), `<div id="app"></div>`) {
+		t.Fatalf("root body = %q, want SPA shell", string(indexBody))
+	}
+
+	deepLinkResp := mustHTTPRequest(
+		t,
+		runtime.client,
+		http.MethodGet,
+		mustURL(runtime.host, runtime.port, "/session/demo"),
+		nil,
+		nil,
+	)
+	if deepLinkResp.StatusCode != http.StatusOK {
+		body := readAndCloseHTTPBody(t, deepLinkResp)
+		t.Fatalf("deep link status = %d, want %d; body=%s", deepLinkResp.StatusCode, http.StatusOK, string(body))
+	}
+	deepLinkBody, err := io.ReadAll(deepLinkResp.Body)
+	closeHTTPBody(t, deepLinkResp.Body)
+	if err != nil {
+		t.Fatalf("io.ReadAll(deep link) error = %v", err)
+	}
+	if !strings.Contains(string(deepLinkBody), `<div id="app"></div>`) {
+		t.Fatalf("deep link body = %q, want SPA shell", string(deepLinkBody))
+	}
+
+	statusResp := mustHTTPRequest(
+		t,
+		runtime.client,
+		http.MethodGet,
+		mustURL(runtime.host, runtime.port, "/api/status"),
+		nil,
+		nil,
+	)
+	if statusResp.StatusCode != http.StatusOK {
+		t.Fatalf("daemon status = %d, want %d", statusResp.StatusCode, http.StatusOK)
+	}
+	var statusPayload contract.StatusPayload
+	decodeHTTPJSON(t, statusResp, &statusPayload)
+	if statusPayload.Daemon.PID <= 0 ||
+		statusPayload.Daemon.HTTPHost != runtime.host ||
+		statusPayload.Daemon.HTTPPort != runtime.port {
+		t.Fatalf(
+			"daemon status payload = %#v, want populated daemon fields for %s:%d",
+			statusPayload,
+			runtime.host,
+			runtime.port,
+		)
+	}
+
+	origin := fmt.Sprintf("http://%s:%d", runtime.host, runtime.port)
+	createResp := mustHTTPRequest(
+		t,
+		runtime.client,
+		http.MethodPost,
+		mustURL(runtime.host, runtime.port, "/api/sessions"),
+		[]byte(`{"agent_name":"coder","name":"demo","workspace_path":"`+runtime.workspace+`"}`),
+		map[string]string{"Origin": origin},
+	)
+	if createResp.StatusCode != http.StatusCreated {
+		body := readAndCloseHTTPBody(t, createResp)
+		t.Fatalf(
+			"create session status = %d, want %d; body=%s",
+			createResp.StatusCode,
+			http.StatusCreated,
+			string(body),
+		)
+	}
+	if got := createResp.Header.Get("Access-Control-Allow-Origin"); got != origin {
+		t.Fatalf("Access-Control-Allow-Origin = %q, want %q", got, origin)
+	}
+	var created struct {
+		Session sessionPayload `json:"session"`
+	}
+	decodeHTTPJSON(t, createResp, &created)
+	if created.Session.ID == "" {
+		t.Fatal("expected created session id")
+	}
+	waitForIntegrationSessionActive(t, runtime.manager, created.Session.ID)
+
+	listResp := mustHTTPRequest(
+		t,
+		runtime.client,
+		http.MethodGet,
+		mustURL(runtime.host, runtime.port, "/api/sessions?all_workspaces=true"),
+		nil,
+		nil,
+	)
+	if listResp.StatusCode != http.StatusOK {
+		t.Fatalf("list sessions status = %d, want %d", listResp.StatusCode, http.StatusOK)
+	}
+	var listed struct {
+		Sessions []sessionPayload `json:"sessions"`
+	}
+	decodeHTTPJSON(t, listResp, &listed)
+	if len(listed.Sessions) != 1 || listed.Sessions[0].ID != created.Session.ID {
+		t.Fatalf("listed sessions = %#v", listed.Sessions)
+	}
+	canonicalWorkspace, err := filepath.EvalSymlinks(runtime.workspace)
+	if err != nil {
+		t.Fatalf("filepath.EvalSymlinks(%q) error = %v", runtime.workspace, err)
+	}
+	if listed.Sessions[0].WorkspaceID == "" || listed.Sessions[0].WorkspacePath != canonicalWorkspace {
+		t.Fatalf("listed session workspace = %#v", listed.Sessions[0])
+	}
+	tasksAfterManualSession, err := runtime.registry.ListTasks(t.Context(), taskpkg.Query{Limit: 10})
+	if err != nil {
+		t.Fatalf("ListTasks(after manual session) error = %v", err)
+	}
+	if len(tasksAfterManualSession) != 0 {
+		t.Fatalf("tasks after manual session = %#v, want none", tasksAfterManualSession)
+	}
+	runsAfterManualSession, err := runtime.registry.ListTaskRunsByStatus(
+		t.Context(),
+		[]taskpkg.RunStatus{
+			taskpkg.TaskRunStatusQueued,
+			taskpkg.TaskRunStatusClaimed,
+			taskpkg.TaskRunStatusStarting,
+			taskpkg.TaskRunStatusRunning,
+		},
+	)
+	if err != nil {
+		t.Fatalf("ListTaskRunsByStatus(after manual session) error = %v", err)
+	}
+	if len(runsAfterManualSession) != 0 {
+		t.Fatalf("open task runs after manual session = %#v, want none", runsAfterManualSession)
+	}
+
+	filteredResp := mustHTTPRequest(
+		t,
+		runtime.client,
+		http.MethodGet,
+		mustURL(runtime.host, runtime.port, "/api/sessions?workspace_id="+created.Session.WorkspaceID),
+		nil,
+		nil,
+	)
+	if filteredResp.StatusCode != http.StatusOK {
+		t.Fatalf("filtered sessions status = %d, want %d", filteredResp.StatusCode, http.StatusOK)
+	}
+	var filtered struct {
+		Sessions []sessionPayload `json:"sessions"`
+	}
+	decodeHTTPJSON(t, filteredResp, &filtered)
+	if len(filtered.Sessions) != 1 || filtered.Sessions[0].ID != created.Session.ID {
+		t.Fatalf("filtered sessions = %#v", filtered.Sessions)
+	}
+
+	promptResp := mustHTTPRequest(
+		t,
+		runtime.client,
+		http.MethodPost,
+		mustURL(runtime.host, runtime.port, "/api/workspaces/ws-workspace/sessions/"+created.Session.ID+"/prompt"),
+		integrationPromptJSON(t, "hello"),
+		nil,
+	)
+	if promptResp.StatusCode != http.StatusOK {
+		body := readAndCloseHTTPBody(t, promptResp)
+		t.Fatalf("prompt status = %d, want %d; body=%s", promptResp.StatusCode, http.StatusOK, string(body))
+	}
+	if got := promptResp.Header.Get("x-vercel-ai-ui-message-stream"); got != "v1" {
+		t.Fatalf("x-vercel-ai-ui-message-stream = %q, want v1", got)
+	}
+	promptBody, err := io.ReadAll(promptResp.Body)
+	closeHTTPBody(t, promptResp.Body)
+	if err != nil {
+		t.Fatalf("io.ReadAll(prompt SSE) error = %v", err)
+	}
+	promptEvents := parseSSE(t, string(promptBody))
+	if len(promptEvents) < 6 {
+		t.Fatalf("prompt SSE events = %d, want at least 6; body=%s", len(promptEvents), string(promptBody))
+	}
+	if promptEvents[len(promptEvents)-1].Event != "" || string(promptEvents[len(promptEvents)-1].Data) != "[DONE]" {
+		t.Fatalf("last prompt record = %#v, want [DONE]", promptEvents[len(promptEvents)-1])
+	}
+
+	eventsResp := mustHTTPRequest(
+		t,
+		runtime.client,
+		http.MethodGet,
+		mustURL(runtime.host, runtime.port, "/api/workspaces/ws-workspace/sessions/"+created.Session.ID+"/events"),
+		nil,
+		nil,
+	)
+	if eventsResp.StatusCode != http.StatusOK {
+		t.Fatalf("session events status = %d, want %d", eventsResp.StatusCode, http.StatusOK)
+	}
+	var events struct {
+		Events []sessionEventPayload `json:"events"`
+	}
+	decodeHTTPJSON(t, eventsResp, &events)
+	if len(events.Events) < 4 {
+		t.Fatalf("persisted session events = %d, want at least 4", len(events.Events))
+	}
+}
+
+func TestHTTPPromptPersistsTerminalEventsAfterClientDisconnect(t *testing.T) {
+	runtime := newIntegrationRuntime(t)
+	sessionID := createIntegrationSession(t, runtime)
+	completeTool := make(chan struct{})
+	releaseTool := sync.OnceFunc(func() { close(completeTool) })
+	t.Cleanup(releaseTool)
+	runtime.driver.promptHook = func(proc *session.AgentProcess, req acp.PromptRequest) (<-chan acp.AgentEvent, error) {
+		events := make(chan acp.AgentEvent, 3)
+		events <- acp.AgentEvent{Type: acp.EventTypeToolCall, SessionID: proc.SessionID,
+			TurnID: req.TurnID, Timestamp: time.Now().UTC(), ToolCallID: "disconnect-tool", Title: "read_file"}
+		go func() {
+			defer close(events)
+			<-completeTool
+			events <- acp.AgentEvent{Type: acp.EventTypeToolResult, SessionID: proc.SessionID,
+				TurnID: req.TurnID, Timestamp: time.Now().UTC(), ToolCallID: "disconnect-tool"}
+			events <- acp.AgentEvent{Type: acp.EventTypeDone, SessionID: proc.SessionID,
+				TurnID: req.TurnID, Timestamp: time.Now().UTC(), StopReason: "end_turn"}
+		}()
+		return events, nil
+	}
+
+	requestCtx, cancel := context.WithCancel(t.Context())
+	t.Cleanup(cancel)
+	req, err := http.NewRequestWithContext(
+		requestCtx,
+		http.MethodPost,
+		mustURL(runtime.host, runtime.port, "/api/workspaces/ws-workspace/sessions/"+sessionID+"/prompt"),
+		strings.NewReader(string(integrationPromptJSON(t, "hello"))),
+	)
+	if err != nil {
+		t.Fatalf("http.NewRequestWithContext() error = %v", err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+
+	resp, err := runtime.client.Do(req)
+	if err != nil {
+		t.Fatalf("client.Do() error = %v", err)
+	}
+	if resp.StatusCode != http.StatusOK {
+		body := readAndCloseHTTPBody(t, resp)
+		t.Fatalf("prompt status = %d, want %d; body=%s", resp.StatusCode, http.StatusOK, string(body))
+	}
+	promptBodyClosed := false
+	disconnectPrompt := func() error {
+		cancel()
+		if promptBodyClosed {
+			return nil
+		}
+		promptBodyClosed = true
+		return resp.Body.Close()
+	}
+	t.Cleanup(func() {
+		if err := disconnectPrompt(); err != nil {
+			t.Errorf("disconnect prompt response body during cleanup: %v", err)
+		}
+	})
+
+	scanner := bufio.NewScanner(resp.Body)
+	seenToolStart := false
+	for scanner.Scan() {
+		line := scanner.Text()
+		if !strings.HasPrefix(line, "data: ") {
+			continue
+		}
+
+		payload := strings.TrimSpace(strings.TrimPrefix(line, "data: "))
+		if payload == "" || payload == "[DONE]" {
+			continue
+		}
+
+		var part struct {
+			Type string `json:"type"`
+		}
+		if err := json.Unmarshal([]byte(payload), &part); err != nil {
+			continue
+		}
+		if part.Type == "tool-input-start" {
+			seenToolStart = true
+			break
+		}
+	}
+	if err := scanner.Err(); err != nil {
+		t.Fatalf("scanner.Err() error = %v", err)
+	}
+	if !seenToolStart {
+		t.Fatal("tool-input-start was not observed before client disconnect")
+	}
+
+	terminalEvents, cancelTerminalEvents, err := runtime.manager.SubscribeSessionEvents(t.Context(), sessionID, 0)
+	if err != nil {
+		t.Fatalf("SubscribeSessionEvents(%q) error = %v", sessionID, err)
+	}
+	defer cancelTerminalEvents()
+	if err := disconnectPrompt(); err != nil {
+		t.Fatalf("disconnect prompt response body: %v", err)
+	}
+	releaseTool()
+	waitForIntegrationTerminalToolEvents(t, terminalEvents)
+
+	events, err := runtime.manager.Events(t.Context(), sessionID, store.EventQuery{})
+	if err != nil {
+		t.Fatalf("Events() error after disconnect = %v", err)
+	}
+	if !integrationPromptEventsContainTerminalToolEvents(events) {
+		t.Fatalf("persisted events after disconnect = %#v, want tool_result and done", events)
+	}
+}
+
+func TestHTTPPromptQueuesConcurrentInputWithoutGhostDispatch(t *testing.T) {
+	runtime := newIntegrationRuntime(t)
+	sessionID := createIntegrationSession(t, runtime)
+
+	firstPromptEntered := make(chan struct{})
+	releaseFirstPrompt := make(chan struct{})
+	releaseFirstPromptWorker := sync.OnceFunc(func() {
+		close(releaseFirstPrompt)
+	})
+	t.Cleanup(releaseFirstPromptWorker)
+	runtime.driver.promptHook = func(proc *session.AgentProcess, req acp.PromptRequest) (<-chan acp.AgentEvent, error) {
+		events := make(chan acp.AgentEvent, 2)
+		go func() {
+			defer close(events)
+			if req.Message == "first prompt" {
+				close(firstPromptEntered)
+				<-releaseFirstPrompt
+			}
+
+			ts := time.Now().UTC()
+			events <- acp.AgentEvent{
+				Type:      acp.EventTypeAgentMessage,
+				SessionID: proc.SessionID,
+				TurnID:    req.TurnID,
+				Timestamp: ts,
+				Text:      req.Message + " reply",
+			}
+			events <- acp.AgentEvent{
+				Type:             acp.EventTypeDone,
+				SessionID:        proc.SessionID,
+				TurnID:           req.TurnID,
+				Timestamp:        ts,
+				StopReason:       string(acp.PromptStopReasonEndTurn),
+				PromptStopReason: acp.PromptStopReasonEndTurn,
+			}
+		}()
+		return events, nil
+	}
+
+	type promptResult struct {
+		resp *http.Response
+		err  error
+	}
+	firstRequestCtx, cancelFirstRequest := context.WithCancel(t.Context())
+	t.Cleanup(cancelFirstRequest)
+	firstRequest, err := http.NewRequestWithContext(
+		firstRequestCtx,
+		http.MethodPost,
+		mustURL(runtime.host, runtime.port, "/api/workspaces/ws-workspace/sessions/"+sessionID+"/prompt"),
+		strings.NewReader(string(integrationPromptJSON(t, "first prompt"))),
+	)
+	if err != nil {
+		t.Fatalf("http.NewRequestWithContext(first prompt) error = %v", err)
+	}
+	firstRequest.Header.Set("Content-Type", "application/json")
+
+	firstResultCh := make(chan promptResult, 1)
+	firstResultJoined := false
+	t.Cleanup(func() {
+		if firstResultJoined {
+			return
+		}
+		releaseFirstPromptWorker()
+		cancelFirstRequest()
+		joinCtx, cancelJoin := context.WithTimeout(context.WithoutCancel(t.Context()), 2*time.Second)
+		defer cancelJoin()
+		select {
+		case result := <-firstResultCh:
+			firstResultJoined = true
+			if result.resp != nil && result.resp.Body != nil {
+				if closeErr := result.resp.Body.Close(); closeErr != nil {
+					t.Errorf("close first prompt response during cleanup: %v", closeErr)
+				}
+			}
+		case <-joinCtx.Done():
+			t.Errorf("first prompt request did not terminate during cleanup: %v", joinCtx.Err())
+		}
+	})
+	go func() {
+		resp, err := runtime.client.Do(firstRequest)
+		firstResultCh <- promptResult{resp: resp, err: err}
+	}()
+
+	firstPromptCtx, cancelFirstPrompt := context.WithTimeout(t.Context(), 2*time.Second)
+	defer cancelFirstPrompt()
+	select {
+	case <-firstPromptEntered:
+	case <-firstPromptCtx.Done():
+		t.Fatalf("wait for first prompt admission: %v", firstPromptCtx.Err())
+	}
+
+	var secondRequest contract.SendPromptRequest
+	if err := json.Unmarshal(integrationPromptJSON(t, "second prompt"), &secondRequest); err != nil {
+		t.Fatalf("decode second request: %v", err)
+	}
+	secondRequest.Mode = contract.PromptModeQueue
+	sessionEvents, cancelSessionEvents, err := runtime.manager.SubscribeSessionEvents(t.Context(), sessionID, 0)
+	if err != nil {
+		t.Fatalf("SubscribeSessionEvents() error = %v", err)
+	}
+	defer cancelSessionEvents()
+	secondResp := mustHTTPRequest(
+		t,
+		runtime.client,
+		http.MethodPost,
+		mustURL(runtime.host, runtime.port, "/api/workspaces/ws-workspace/sessions/"+sessionID+"/prompt"),
+		mustIntegrationJSON(secondRequest),
+		nil,
+	)
+	if secondResp.StatusCode != http.StatusAccepted {
+		body := readAndCloseHTTPBody(t, secondResp)
+		t.Fatalf(
+			"second prompt status = %d, want %d; body=%s",
+			secondResp.StatusCode,
+			http.StatusAccepted,
+			string(body),
+		)
+	}
+	var accepted struct {
+		Prompt contract.SendPromptResultPayload `json:"prompt"`
+	}
+	decodeHTTPJSON(t, secondResp, &accepted)
+	if accepted.Prompt.Status != "queued" || accepted.Prompt.Mode != contract.PromptModeQueue ||
+		accepted.Prompt.QueueEntryID == "" {
+		t.Fatalf("second prompt = %#v, want durable queued input", accepted.Prompt)
+	}
+
+	eventsWhileBusy, err := runtime.manager.Events(t.Context(), sessionID, store.EventQuery{})
+	if err != nil {
+		t.Fatalf("Events(while busy) error = %v", err)
+	}
+	if got, want := countSessionEventsByType(eventsWhileBusy, acp.EventTypeUserMessage), 1; got != want {
+		t.Fatalf("countSessionEventsByType(user_message) while busy = %d, want %d", got, want)
+	}
+
+	releaseFirstPromptWorker()
+
+	firstResultCtx, cancelFirstResult := context.WithTimeout(t.Context(), 2*time.Second)
+	defer cancelFirstResult()
+	var firstResult promptResult
+	select {
+	case firstResult = <-firstResultCh:
+		firstResultJoined = true
+	case <-firstResultCtx.Done():
+		t.Fatalf("wait for first prompt response: %v", firstResultCtx.Err())
+	}
+	if firstResult.err != nil {
+		t.Fatalf("first prompt request error = %v", firstResult.err)
+	}
+	if firstResult.resp == nil {
+		t.Fatal("first prompt response = nil")
+	}
+	if firstResult.resp.StatusCode != http.StatusOK {
+		body := readAndCloseHTTPBody(t, firstResult.resp)
+		t.Fatalf("first prompt status = %d, want %d; body=%s", firstResult.resp.StatusCode, http.StatusOK, string(body))
+	}
+	firstBody, err := io.ReadAll(firstResult.resp.Body)
+	closeHTTPBody(t, firstResult.resp.Body)
+	if err != nil {
+		t.Fatalf("io.ReadAll(first prompt) error = %v", err)
+	}
+	firstEvents := parseSSE(t, string(firstBody))
+	if len(firstEvents) == 0 {
+		t.Fatalf("first prompt SSE events = 0; body=%s", string(firstBody))
+	}
+	if firstEvents[len(firstEvents)-1].Event != "" || string(firstEvents[len(firstEvents)-1].Data) != "[DONE]" {
+		t.Fatalf("last first prompt record = %#v, want [DONE]", firstEvents[len(firstEvents)-1])
+	}
+
+	completionCtx, cancelCompletion := context.WithTimeout(t.Context(), 3*time.Second)
+	defer cancelCompletion()
+	for completed := 0; completed < 2; {
+		select {
+		case event, ok := <-sessionEvents:
+			if !ok {
+				t.Fatal("session events closed before both queued turns completed")
+			}
+			if event.Type == acp.EventTypeDone {
+				completed++
+			}
+		case <-completionCtx.Done():
+			t.Fatalf("wait for queued prompt completion: %v", completionCtx.Err())
+		}
+	}
+	eventsAfterRelease, err := runtime.manager.Events(t.Context(), sessionID, store.EventQuery{})
+	if err != nil {
+		t.Fatalf("Events(after release) error = %v", err)
+	}
+	if got, want := countSessionEventsByType(eventsAfterRelease, acp.EventTypeUserMessage), 2; got != want {
+		t.Fatalf("countSessionEventsByType(user_message) after release = %d, want %d", got, want)
+	}
+}
+
+func TestHTTPSessionTranscriptEndpointWithRealSessionManager(t *testing.T) {
+	runtime := newIntegrationRuntime(t)
+	sessionID := createIntegrationSession(t, runtime)
+	sendPrompt(t, runtime, sessionID, "hello")
+
+	resp := mustHTTPRequest(
+		t,
+		runtime.client,
+		http.MethodGet,
+		mustURL(runtime.host, runtime.port, "/api/workspaces/ws-workspace/sessions/"+sessionID+"/transcript?limit=1"),
+		nil,
+		nil,
+	)
+	if resp.StatusCode != http.StatusOK {
+		body, readErr := io.ReadAll(resp.Body)
+		if readErr != nil {
+			t.Fatalf("read transcript error body: %v", readErr)
+		}
+		if closeErr := resp.Body.Close(); closeErr != nil {
+			t.Fatalf("close transcript error body: %v", closeErr)
+		}
+		t.Fatalf("transcript status = %d, want %d; body=%s", resp.StatusCode, http.StatusOK, string(body))
+	}
+
+	var tail contract.SessionTranscriptResponse
+	decodeHTTPJSON(t, resp, &tail)
+	if len(tail.Entries) != 1 || !tail.HasOlder || tail.NextBeforeSequence == 0 || tail.Limit != 1 {
+		t.Fatalf("tail page = %#v, want one entry and an older cursor", tail)
+	}
+	olderResp := mustHTTPRequest(
+		t,
+		runtime.client,
+		http.MethodGet,
+		mustURL(
+			runtime.host,
+			runtime.port,
+			"/api/workspaces/ws-workspace/sessions/"+sessionID+"/transcript?limit=1&before_sequence="+
+				strconv.FormatInt(tail.NextBeforeSequence, 10),
+		),
+		nil,
+		nil,
+	)
+	if olderResp.StatusCode != http.StatusOK {
+		body, readErr := io.ReadAll(olderResp.Body)
+		if readErr != nil {
+			t.Fatalf("read older transcript error body: %v", readErr)
+		}
+		if closeErr := olderResp.Body.Close(); closeErr != nil {
+			t.Fatalf("close older transcript error body: %v", closeErr)
+		}
+		t.Fatalf("older transcript status = %d, want %d; body=%s", olderResp.StatusCode, http.StatusOK, string(body))
+	}
+	var older contract.SessionTranscriptResponse
+	decodeHTTPJSON(t, olderResp, &older)
+	if len(older.Entries) != 1 || older.HasOlder || older.Limit != 1 {
+		t.Fatalf("older page = %#v, want final one-entry page", older)
+	}
+	if older.Epoch != tail.Epoch || older.Generation != tail.Generation || older.MaxSequence != tail.MaxSequence {
+		t.Fatalf("page identity changed across walk: older=%#v tail=%#v", older, tail)
+	}
+	if older.Entries[0].StartSequence >= tail.Entries[0].StartSequence {
+		t.Fatalf("page cursors overlap or regress: older=%#v tail=%#v", older.Entries, tail.Entries)
+	}
+	entries := append(append([]transcript.Entry(nil), older.Entries...), tail.Entries...)
+	messages := transcript.MessagesFromEntries(entries)
+	if len(messages) != 2 {
+		t.Fatalf("len(messages) = %d, want 2", len(messages))
+	}
+	if got := messages[0].Role; got != transcript.UIRoleUser {
+		t.Fatalf("messages[0].Role = %q, want %q", got, transcript.UIRoleUser)
+	}
+	if got := transcript.UIMessageText(messages[0]); got != "hello" {
+		t.Fatalf("messages[0] text = %q, want %q", got, "hello")
+	}
+	if got := messages[1].Role; got != transcript.UIRoleAssistant {
+		t.Fatalf("messages[1].Role = %q, want %q", got, transcript.UIRoleAssistant)
+	}
+	if !httpTranscriptHasToolPart(messages[1]) {
+		t.Fatalf("messages[1] = %#v, want assistant tool part", messages[1])
+	}
+}
+
+func TestHTTPSessionTranscriptEndpointIncludesSyntheticTurns(t *testing.T) {
+	runtime := newIntegrationRuntime(t)
+	sessionID := createLiveIntegrationSession(t, runtime)
+
+	const promptTimeout = 5 * time.Second
+
+	userCtx, cancelUser := context.WithTimeout(t.Context(), promptTimeout)
+	userEvents, userErr := runtime.manager.Prompt(userCtx, sessionID, "hello")
+	collectIntegrationPromptEvents(t, mustIntegrationPrompt(t, userEvents, userErr), promptTimeout)
+	cancelUser()
+
+	syntheticCtx, cancelSynthetic := context.WithTimeout(t.Context(), promptTimeout)
+	syntheticEvents, syntheticErr := runtime.manager.PromptSynthetic(
+		syntheticCtx,
+		sessionID,
+		session.SyntheticPromptOpts{
+			Message: "daemon wake-up",
+			Metadata: acp.PromptSyntheticMeta{
+				TaskRunID: "run-1",
+				Reason:    "task_run_completed",
+				Summary:   "background work finished",
+			},
+		},
+	)
+	collectIntegrationPromptEvents(t, mustIntegrationPrompt(t, syntheticEvents, syntheticErr), promptTimeout)
+	cancelSynthetic()
+
+	resp := mustHTTPRequest(
+		t,
+		runtime.client,
+		http.MethodGet,
+		mustURL(runtime.host, runtime.port, "/api/workspaces/ws-workspace/sessions/"+sessionID+"/transcript"),
+		nil,
+		nil,
+	)
+	if resp.StatusCode != http.StatusOK {
+		body := readAndCloseHTTPBody(t, resp)
+		t.Fatalf("transcript status = %d, want %d; body=%s", resp.StatusCode, http.StatusOK, string(body))
+	}
+
+	var payload contract.SessionTranscriptResponse
+	decodeHTTPJSON(t, resp, &payload)
+	messages := transcript.MessagesFromEntries(payload.Entries)
+	if len(messages) != 5 {
+		t.Fatalf("len(messages) = %d, want 5", len(messages))
+	}
+	if got := messages[0].Role; got != transcript.UIRoleUser {
+		t.Fatalf("messages[0].Role = %q, want %q", got, transcript.UIRoleUser)
+	}
+	if got := transcript.UIMessageText(messages[0]); got != "hello" {
+		t.Fatalf("messages[0] text = %q, want %q", got, "hello")
+	}
+	if got := messages[2].Role; got != transcript.UIRoleSystem {
+		t.Fatalf("messages[2].Role = %q, want %q", got, transcript.UIRoleSystem)
+	}
+	if got := transcript.UIMessageText(messages[2]); got != "daemon wake-up" {
+		t.Fatalf("messages[2] text = %q, want %q", got, "daemon wake-up")
+	}
+	// Dispatch acknowledgment and agent output are persisted by independent owners.
+	dispatchReceipt, syntheticReply := messages[3], messages[4]
+	if len(dispatchReceipt.Parts) != 1 || dispatchReceipt.Parts[0].Type != "data-compozy-event" {
+		dispatchReceipt, syntheticReply = syntheticReply, dispatchReceipt
+	}
+	if len(dispatchReceipt.Parts) != 1 || dispatchReceipt.Parts[0].Type != "data-compozy-event" {
+		t.Fatalf("dispatchReceipt = %#v, want queue dispatch marker", dispatchReceipt)
+	}
+	var marker acp.AgentEvent
+	if err := json.Unmarshal(dispatchReceipt.Parts[0].Data, &marker); err != nil {
+		t.Fatalf("decode queue dispatch marker: %v", err)
+	}
+	if marker.Title != transcript.MarkerPromptAccepted {
+		t.Fatalf("queue dispatch marker = %q, want %q", marker.Title, transcript.MarkerPromptAccepted)
+	}
+	if got := syntheticReply.Role; got != transcript.UIRoleAssistant {
+		t.Fatalf("syntheticReply.Role = %q, want %q", got, transcript.UIRoleAssistant)
+	}
+	if !httpTranscriptHasToolPart(syntheticReply) {
+		t.Fatalf("syntheticReply = %#v, want assistant tool part", syntheticReply)
+	}
+}
+
+func httpTranscriptHasToolPart(message transcript.UIMessage) bool {
+	for _, part := range message.Parts {
+		if strings.HasPrefix(part.Type, "tool-") || part.Type == "dynamic-tool" {
+			return true
+		}
+	}
+	return false
+}
+
+func TestHTTPResourceMutationRoutesRemainUnavailableWithoutOperatorAuth(t *testing.T) {
+	runtime := e2etest.StartRuntimeHarness(t, &e2etest.RuntimeHarnessOptions{})
+
+	putResp := mustHTTPRequest(
+		t,
+		runtime.HTTPClient,
+		http.MethodPut,
+		runtime.HTTPURL("/api/resources/fixture.resource/demo"),
+		[]byte(`{"scope":{"kind":"global"},"spec":{"enabled":true}}`),
+		nil,
+	)
+	defer func() { closeHTTPBody(t, putResp.Body) }()
+	if putResp.StatusCode != http.StatusNotFound {
+		body := readHTTPBody(t, putResp.Body)
+		t.Fatalf("PUT status = %d, want %d; body=%s", putResp.StatusCode, http.StatusNotFound, string(body))
+	}
+
+	deleteResp := mustHTTPRequest(
+		t,
+		runtime.HTTPClient,
+		http.MethodDelete,
+		runtime.HTTPURL("/api/resources/fixture.resource/demo"),
+		[]byte(`{"expected_version":1}`),
+		nil,
+	)
+	defer func() { closeHTTPBody(t, deleteResp.Body) }()
+	if deleteResp.StatusCode != http.StatusNotFound {
+		body := readHTTPBody(t, deleteResp.Body)
+		t.Fatalf("DELETE status = %d, want %d; body=%s", deleteResp.StatusCode, http.StatusNotFound, string(body))
+	}
+}
+
+// Invariant IT-042: bounded cursor replay drains a 500-event durable gap exactly
+// once, even when the session is already terminal. Owner: HTTP session streaming.
+// Invariant: an empty live log cursor accepts the first persisted sequence regardless of clock skew.
+// Owner: HTTP log streaming over the real observer/SQLite integration runtime.
+func TestHTTPLogsStreamFromEmptyHead(t *testing.T) {
+	t.Parallel()
+	t.Run("Should deliver a newly persisted log with a timestamp before the connection", func(t *testing.T) {
+		t.Parallel()
+		runtime := newIntegrationRuntime(t)
+		probe := &integrationLogHeadProbe{Observer: runtime.observer, head: make(chan int, 1)}
+		runtime.server.handlers.Observer = probe
+		response := mustHTTPRequest(
+			t,
+			runtime.client,
+			http.MethodGet,
+			mustURL(
+				runtime.host,
+				runtime.port,
+				"/api/logs/stream?type=profile.selection_changed&replay=false",
+			),
+			nil,
+			nil,
+		)
+		if response.StatusCode != http.StatusOK {
+			t.Fatalf("log stream status = %d", response.StatusCode)
+		}
+		select {
+		case count := <-probe.head:
+			if count != 0 {
+				t.Fatalf("initial durable head = %d rows, want empty", count)
+			}
+		case <-t.Context().Done():
+			t.Fatal("log stream never read its initial durable head")
+		}
+		event := store.EventSummary{ID: "sum-after-empty-head", Type: "profile.selection_changed",
+			ProfileID: store.DefaultProfileID, Timestamp: time.Date(2000, 1, 1, 0, 0, 0, 0, time.UTC)}
+		event.SetContent(json.RawMessage(`{"name":"profile.selection_changed","profile_name":"default"}`))
+		if err := runtime.registry.WriteEventSummary(t.Context(), event); err != nil {
+			t.Fatal(err)
+		}
+		frames := collectLiveSSE(t, response.Body, 1, 5*time.Second)
+		if len(frames) != 1 || frames[0].Event != event.Type {
+			t.Fatalf("first live log = %#v", frames)
+		}
+		cursor, err := core.ParseLogsCursor(frames[0].ID)
+		if err != nil || cursor.Sequence <= 0 || !cursor.Timestamp.Equal(event.Timestamp) {
+			t.Fatalf("durable cursor = %#v, %v", cursor, err)
+		}
+	})
+}
+
+// This probe observes completion of a real read; all queries and payloads pass through unchanged.
+type integrationLogHeadProbe struct {
+	*observe.Observer
+	head chan int
+	once sync.Once
+}
+
+func (p *integrationLogHeadProbe) QueryEvents(
+	ctx context.Context,
+	query store.EventSummaryQuery,
+) ([]store.EventSummary, error) {
+	rows, err := p.Observer.QueryEvents(ctx, query)
+	p.once.Do(func() { p.head <- len(rows) })
+	return rows, err
+}
+
+func TestHTTPSessionStreamReplaysLargeGap(t *testing.T) {
+	t.Parallel()
+	t.Run("Should replay every durable event across bounded catch-up pages", func(t *testing.T) {
+		t.Parallel()
+		runtime := newIntegrationRuntime(t)
+		runtime.driver.promptHook = func(proc *session.AgentProcess, req acp.PromptRequest) (<-chan acp.AgentEvent, error) {
+			output := make(chan acp.AgentEvent, 501)
+			for i := range 500 {
+				output <- acp.AgentEvent{Type: acp.EventTypeToolCall, SessionID: proc.SessionID,
+					TurnID: req.TurnID, ToolCallID: fmt.Sprintf("gap-%03d", i)}.WithTool("read", json.RawMessage(`{"path":"fixture"}`), false)
+			}
+			output <- acp.AgentEvent{Type: acp.EventTypeDone, SessionID: proc.SessionID, TurnID: req.TurnID,
+				StopReason: string(acp.PromptStopReasonEndTurn), PromptStopReason: acp.PromptStopReasonEndTurn}
+			close(output)
+			return output, nil
+		}
+		id := createIntegrationSession(t, runtime)
+		sendPrompt(t, runtime, id, "large replay gap")
+		stopIntegrationSession(t, runtime, id)
+		durable, err := runtime.manager.Events(t.Context(), id, store.EventQuery{Archive: store.EventArchiveUnarchived})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(durable) < 500 {
+			t.Fatalf("fixture gap too small: %d", len(durable))
+		}
+		cursor := durable[0].Sequence
+		resp := mustHTTPRequest(
+			t,
+			runtime.client,
+			http.MethodGet,
+			mustURL(
+				runtime.host,
+				runtime.port,
+				"/api/workspaces/ws-workspace/sessions/"+id+"/stream?frames=raw&limit=37",
+			),
+			nil,
+			map[string]string{"Last-Event-ID": strconv.FormatInt(cursor, 10)},
+		)
+		if resp.StatusCode != http.StatusOK {
+			t.Fatalf("replay status=%d body=%s", resp.StatusCode, readAndCloseHTTPBody(t, resp))
+		}
+		replay := collectLiveSSE(t, resp.Body, len(durable)-1, 10*time.Second)
+		if len(replay) != len(durable)-1 {
+			t.Fatalf("replay length=%d want %d", len(replay), len(durable)-1)
+		}
+		for i, frame := range replay {
+			if frame.ID != strconv.FormatInt(durable[i+1].Sequence, 10) {
+				t.Fatalf("replay[%d] id=%s want %d", i, frame.ID, durable[i+1].Sequence)
+			}
+		}
+	})
+}
+
+func TestHTTPSessionStreamReconnectsWithLastEventID(t *testing.T) {
+	t.Run("Should replay the retained cursor of a stopped session", func(t *testing.T) {
+		t.Parallel()
+		runtime := newIntegrationRuntime(t)
+		sessionID := createIntegrationSession(t, runtime)
+		sendPrompt(t, runtime, sessionID, "hello")
+		stopIntegrationSession(t, runtime, sessionID)
+
+		streamResp := mustHTTPRequest(
+			t,
+			runtime.client,
+			http.MethodGet,
+			mustURL(
+				runtime.host,
+				runtime.port,
+				"/api/workspaces/ws-workspace/sessions/"+sessionID+"/stream?frames=raw&limit=200",
+			),
+			nil,
+			nil,
+		)
+		if streamResp.StatusCode != http.StatusOK {
+			body := readAndCloseHTTPBody(t, streamResp)
+			t.Fatalf("session stream status = %d, want %d; body=%s", streamResp.StatusCode, http.StatusOK, string(body))
+		}
+		initial := collectLiveSSE(t, streamResp.Body, 7, 2*time.Second)
+		if len(initial) < 7 {
+			t.Fatalf("initial stream events = %d, want 7", len(initial))
+		}
+		if initial[len(initial)-1].Event != session.EventTypeSessionStopped {
+			t.Fatalf("last event = %q, want %q", initial[len(initial)-1].Event, session.EventTypeSessionStopped)
+		}
+
+		headers := map[string]string{"Last-Event-ID": initial[0].ID}
+		replayResp := mustHTTPRequest(
+			t,
+			runtime.client,
+			http.MethodGet,
+			mustURL(
+				runtime.host,
+				runtime.port,
+				"/api/workspaces/ws-workspace/sessions/"+sessionID+"/stream?frames=raw&limit=200",
+			),
+			nil,
+			headers,
+		)
+		if replayResp.StatusCode != http.StatusOK {
+			body := readAndCloseHTTPBody(t, replayResp)
+			t.Fatalf("replay stream status = %d, want %d; body=%s", replayResp.StatusCode, http.StatusOK, string(body))
+		}
+		replayed := collectLiveSSE(t, replayResp.Body, len(initial)-1, 2*time.Second)
+		if len(replayed) != len(initial)-1 {
+			t.Fatalf("replayed events = %d, want %d", len(replayed), len(initial)-1)
+		}
+		if replayed[0].ID != initial[1].ID {
+			t.Fatalf("replayed first id = %q, want %q", replayed[0].ID, initial[1].ID)
+		}
+	})
+
+	// Invariant: replaying a historical stop must not close an active session's
+	// live stream. Owner: HTTP session streaming; canonical reconnect suite.
+	t.Run("Should continue live delivery after replaying a historical stop", func(t *testing.T) {
+		t.Parallel()
+		runtime := newIntegrationRuntime(t)
+		id := createIntegrationSession(t, runtime)
+		sendPrompt(t, runtime, id, "before stop")
+		stopIntegrationSession(t, runtime, id)
+		if _, err := runtime.manager.Resume(t.Context(), id); err != nil {
+			t.Fatal(err)
+		}
+		before, err := runtime.manager.Events(t.Context(), id, store.EventQuery{})
+		if err != nil || len(before) == 0 {
+			t.Fatalf("retained history = %d events, error = %v", len(before), err)
+		}
+		resp := mustHTTPRequest(
+			t,
+			runtime.client,
+			http.MethodGet,
+			mustURL(
+				runtime.host,
+				runtime.port,
+				"/api/workspaces/ws-workspace/sessions/"+id+"/stream?frames=raw&limit=200",
+			),
+			nil,
+			nil,
+		)
+		if resp.StatusCode != http.StatusOK {
+			t.Fatalf("stream status=%d body=%s", resp.StatusCode, readAndCloseHTTPBody(t, resp))
+		}
+		sendPrompt(t, runtime, id, "after resume")
+		after, err := runtime.manager.Events(t.Context(), id, store.EventQuery{})
+		if err != nil || len(after) <= len(before) {
+			t.Fatalf("post-resume history = %d events, before = %d, error = %v", len(after), len(before), err)
+		}
+		replay := collectLiveSSE(t, resp.Body, len(after), 5*time.Second)
+		for index, frame := range replay {
+			if frame.ID != strconv.FormatInt(after[index].Sequence, 10) {
+				t.Fatalf("frame[%d] id=%s want %d", index, frame.ID, after[index].Sequence)
+			}
+		}
+	})
+}
+
+func TestHTTPSessionStreamReconnectPreservesCursorWhenNoNewEventsExistYet(t *testing.T) {
+	t.Run("Should preserve the stream cursor while a prompt is still running", func(t *testing.T) {
+		t.Parallel()
+
+		exerciseHTTPSessionStreamReconnectPreservesCursorWhenNoNewEventsExistYet(t)
+	})
+}
+
+func exerciseHTTPSessionStreamReconnectPreservesCursorWhenNoNewEventsExistYet(t *testing.T) {
+	t.Helper()
+
+	runtime := newIntegrationRuntime(t)
+	sessionID := createIntegrationSession(t, runtime)
+
+	firstEventDelivered := make(chan struct{})
+	releaseRemaining := make(chan struct{})
+	runtime.driver.promptHook = func(proc *session.AgentProcess, req acp.PromptRequest) (<-chan acp.AgentEvent, error) {
+		events := make(chan acp.AgentEvent)
+		go func() {
+			defer close(events)
+
+			ts := time.Now().UTC()
+			events <- acp.AgentEvent{
+				Type:      acp.EventTypeAgentMessage,
+				SessionID: proc.SessionID,
+				TurnID:    req.TurnID,
+				Timestamp: ts,
+				Text:      "first chunk",
+			}
+			close(firstEventDelivered)
+
+			<-releaseRemaining
+
+			ts = time.Now().UTC()
+			events <- acp.AgentEvent{
+				Type:      acp.EventTypeAgentMessage,
+				SessionID: proc.SessionID,
+				TurnID:    req.TurnID,
+				Timestamp: ts,
+				Text:      "second chunk",
+			}
+			events <- acp.AgentEvent{
+				Type:             acp.EventTypeDone,
+				SessionID:        proc.SessionID,
+				TurnID:           req.TurnID,
+				Timestamp:        ts,
+				StopReason:       string(acp.PromptStopReasonEndTurn),
+				PromptStopReason: acp.PromptStopReasonEndTurn,
+			}
+		}()
+		return events, nil
+	}
+
+	type promptRequestResult struct {
+		resp *http.Response
+		err  error
+	}
+	promptRequestCtx, cancelPromptRequest := context.WithCancel(t.Context())
+	defer cancelPromptRequest()
+	promptReq, err := http.NewRequestWithContext(
+		promptRequestCtx,
+		http.MethodPost,
+		mustURL(runtime.host, runtime.port, "/api/workspaces/ws-workspace/sessions/"+sessionID+"/prompt"),
+		strings.NewReader(string(integrationPromptJSON(t, "hello"))),
+	)
+	if err != nil {
+		t.Fatalf("http.NewRequestWithContext(prompt) error = %v", err)
+	}
+	promptReq.Header.Set("Content-Type", "application/json")
+
+	promptResultCh := make(chan promptRequestResult, 1)
+	go func(results chan<- promptRequestResult) {
+		resp, requestErr := runtime.client.Do(promptReq)
+		results <- promptRequestResult{resp: resp, err: requestErr}
+	}(promptResultCh)
+
+	remainingReleased := false
+	releaseRemainingEvents := func() {
+		if remainingReleased {
+			return
+		}
+		close(releaseRemaining)
+		remainingReleased = true
+	}
+	t.Cleanup(releaseRemainingEvents)
+
+	var promptRequest promptRequestResult
+	var promptRequestReady bool
+	var promptWorkerJoined bool
+	var promptResponseBody io.ReadCloser
+	t.Cleanup(func() {
+		if promptResponseBody != nil {
+			closeHTTPBody(t, promptResponseBody)
+		}
+	})
+	closePromptRequestResult := func(result promptRequestResult) error {
+		var terminalErr error
+		if result.err != nil {
+			terminalErr = fmt.Errorf("prompt request: %w", result.err)
+		}
+		if result.resp == nil {
+			if result.err == nil {
+				terminalErr = errors.Join(terminalErr, errors.New("prompt response is nil"))
+			}
+			return terminalErr
+		}
+		if result.resp.StatusCode != http.StatusOK {
+			terminalErr = errors.Join(
+				terminalErr,
+				fmt.Errorf("prompt status = %d, want %d", result.resp.StatusCode, http.StatusOK),
+			)
+		}
+		if result.resp.Body != nil {
+			if closeErr := result.resp.Body.Close(); closeErr != nil {
+				terminalErr = errors.Join(terminalErr, fmt.Errorf("close prompt response body: %w", closeErr))
+			}
+		}
+		return terminalErr
+	}
+	t.Cleanup(func() {
+		cancelPromptRequest()
+		releaseRemainingEvents()
+		if promptWorkerJoined {
+			return
+		}
+		terminalCtx, cancelTerminal := context.WithTimeout(
+			context.WithoutCancel(t.Context()),
+			2*time.Second,
+		)
+		defer cancelTerminal()
+		select {
+		case result := <-promptResultCh:
+			promptWorkerJoined = true
+			if terminalErr := closePromptRequestResult(result); terminalErr != nil {
+				t.Errorf("prompt request cleanup error = %v", terminalErr)
+			}
+		case <-terminalCtx.Done():
+			t.Errorf("prompt request worker did not terminate during cleanup: %v", terminalCtx.Err())
+		}
+	})
+	joinPromptRequest := func(primaryErr error) error {
+		cancelPromptRequest()
+		releaseRemainingEvents()
+		if promptRequestReady {
+			if promptResponseBody == nil {
+				return errors.Join(primaryErr, errors.New("prompt response body is nil"))
+			}
+			closeErr := promptResponseBody.Close()
+			promptResponseBody = nil
+			if closeErr != nil {
+				closeErr = fmt.Errorf("close prompt response body: %w", closeErr)
+			}
+			return errors.Join(primaryErr, closeErr)
+		}
+
+		terminalCtx, cancelTerminal := context.WithTimeout(
+			context.WithoutCancel(t.Context()),
+			2*time.Second,
+		)
+		defer cancelTerminal()
+		select {
+		case result := <-promptResultCh:
+			promptWorkerJoined = true
+			return errors.Join(primaryErr, closePromptRequestResult(result))
+		case <-terminalCtx.Done():
+			return errors.Join(
+				primaryErr,
+				fmt.Errorf("prompt request worker did not terminate: %w", terminalCtx.Err()),
+			)
+		}
+	}
+	requirePromptRequest := func(result promptRequestResult) {
+		promptWorkerJoined = true
+		if result.err != nil {
+			t.Fatalf("prompt request error = %v", closePromptRequestResult(result))
+		}
+		if result.resp == nil {
+			t.Fatal("prompt response = nil")
+		}
+		if result.resp.StatusCode != http.StatusOK {
+			body := readAndCloseHTTPBody(t, result.resp)
+			t.Fatalf("prompt status = %d, want %d; body=%s", result.resp.StatusCode, http.StatusOK, string(body))
+		}
+		promptRequest = result
+		promptRequestReady = true
+		promptResponseBody = result.resp.Body
+	}
+
+	firstEventCtx, cancelFirstEvent := context.WithTimeout(t.Context(), 2*time.Second)
+	defer cancelFirstEvent()
+	firstEventObserved := false
+	for !firstEventObserved {
+		select {
+		case <-firstEventDelivered:
+			firstEventObserved = true
+		case result := <-promptResultCh:
+			requirePromptRequest(result)
+			promptResultCh = nil
+		case <-firstEventCtx.Done():
+			primaryErr := fmt.Errorf("wait for first prompt event: %w", firstEventCtx.Err())
+			t.Fatalf("prompt request failed: %v", joinPromptRequest(primaryErr))
+		}
+	}
+
+	streamResp := mustHTTPRequest(
+		t,
+		runtime.client,
+		http.MethodGet,
+		mustURL(
+			runtime.host,
+			runtime.port,
+			"/api/workspaces/ws-workspace/sessions/"+sessionID+"/stream?frames=raw&limit=200",
+		),
+		nil,
+		nil,
+	)
+	if streamResp.StatusCode != http.StatusOK {
+		body := readAndCloseHTTPBody(t, streamResp)
+		t.Fatalf("session stream status = %d, want %d; body=%s", streamResp.StatusCode, http.StatusOK, string(body))
+	}
+	initial := collectLiveSSE(t, streamResp.Body, 2, 2*time.Second)
+	if len(initial) != 2 {
+		t.Fatalf("initial stream events = %d, want 2", len(initial))
+	}
+	lastEventID := initial[len(initial)-1].ID
+	if lastEventID == "" {
+		t.Fatal("initial last event id is empty")
+	}
+
+	streamSubscriptions := runtime.streamSubscriptions.count(sessionID)
+	replayResp := mustHTTPRequest(
+		t,
+		runtime.client,
+		http.MethodGet,
+		mustURL(
+			runtime.host,
+			runtime.port,
+			"/api/workspaces/ws-workspace/sessions/"+sessionID+"/stream?frames=raw&limit=200",
+		),
+		nil,
+		map[string]string{"Last-Event-ID": lastEventID},
+	)
+	if replayResp.StatusCode != http.StatusOK {
+		body := readAndCloseHTTPBody(t, replayResp)
+		t.Fatalf("replay stream status = %d, want %d; body=%s", replayResp.StatusCode, http.StatusOK, string(body))
+	}
+
+	runtime.streamSubscriptions.waitFor(t, sessionID, streamSubscriptions)
+	releaseRemainingEvents()
+
+	replayed := collectLiveSSE(t, replayResp.Body, 2, 2*time.Second)
+	if len(replayed) != 2 {
+		t.Fatalf("replayed events = %d, want 2", len(replayed))
+	}
+	if replayed[0].ID != "3" || replayed[1].ID != "4" {
+		t.Fatalf("replayed ids = [%q %q], want [\"3\" \"4\"]", replayed[0].ID, replayed[1].ID)
+	}
+	if got, err := strconv.ParseInt(replayed[0].ID, 10, 64); err != nil {
+		t.Fatalf("strconv.ParseInt(replayed[0].ID) error = %v", err)
+	} else if got <= 2 {
+		t.Fatalf("replayed first sequence = %d, want > 2", got)
+	}
+
+	if !promptRequestReady {
+		promptResultCtx, cancelPromptResult := context.WithTimeout(t.Context(), 2*time.Second)
+		defer cancelPromptResult()
+		select {
+		case result := <-promptResultCh:
+			requirePromptRequest(result)
+		case <-promptResultCtx.Done():
+			primaryErr := fmt.Errorf("wait for prompt response: %w", promptResultCtx.Err())
+			t.Fatalf("prompt request failed: %v", joinPromptRequest(primaryErr))
+		}
+	}
+	body, err := io.ReadAll(promptRequest.resp.Body)
+	closeHTTPBody(t, promptResponseBody)
+	promptResponseBody = nil
+	if err != nil {
+		t.Fatalf("io.ReadAll(prompt SSE) error = %v", err)
+	}
+	events := parseSSE(t, string(body))
+	if len(events) == 0 {
+		t.Fatalf("prompt SSE events = 0; body=%s", string(body))
+	}
+	if events[len(events)-1].Event != "" || string(events[len(events)-1].Data) != "[DONE]" {
+		t.Fatalf("last prompt record = %#v, want [DONE]", events[len(events)-1])
+	}
+}
+
+func TestHTTPSessionStopReasonPropagatesToGlobalDBAndAPI(t *testing.T) {
+	t.Run("Should propagate a user stop reason to persistence and HTTP", func(t *testing.T) {
+		t.Parallel()
+
+		exerciseHTTPSessionStopReasonPropagatesToGlobalDBAndAPI(t)
+	})
+}
+
+func exerciseHTTPSessionStopReasonPropagatesToGlobalDBAndAPI(t *testing.T) {
+	t.Helper()
+
+	runtime := newIntegrationRuntime(t)
+	sessionID := createIntegrationSession(t, runtime)
+	bindIntegrationSessionRuntime(t, runtime, sessionID)
+
+	stopIntegrationSession(t, runtime, sessionID)
+
+	sessions, err := runtime.registry.ListSessions(
+		t.Context(),
+		store.SessionListQuery{ReadScope: store.ReadScope{ProfileID: store.DefaultProfileID}, State: "stopped"},
+	)
+	if err != nil {
+		t.Fatalf("runtime.registry.ListSessions() error = %v", err)
+	}
+	if got, want := len(sessions), 1; got != want {
+		t.Fatalf("len(stopped sessions) = %d, want %d", got, want)
+	}
+	if sessions[0].ID != sessionID {
+		t.Fatalf("sessions[0].ID = %q, want %q", sessions[0].ID, sessionID)
+	}
+	if sessions[0].StopReason != store.StopUserCanceled {
+		t.Fatalf("sessions[0].StopReason = %q, want %q", sessions[0].StopReason, store.StopUserCanceled)
+	}
+
+	listResp := mustHTTPRequest(
+		t,
+		runtime.client,
+		http.MethodGet,
+		mustURL(runtime.host, runtime.port, "/api/sessions?all_workspaces=true"),
+		nil,
+		nil,
+	)
+	if listResp.StatusCode != http.StatusOK {
+		body := readAndCloseHTTPBody(t, listResp)
+		t.Fatalf("list sessions status = %d, want %d; body=%s", listResp.StatusCode, http.StatusOK, string(body))
+	}
+	var listed struct {
+		Sessions []sessionPayload `json:"sessions"`
+	}
+	decodeHTTPJSON(t, listResp, &listed)
+	if got, want := len(listed.Sessions), 1; got != want {
+		t.Fatalf("len(listed.Sessions) = %d, want %d", got, want)
+	}
+	if listed.Sessions[0].StopReason != store.StopUserCanceled {
+		t.Fatalf("listed.Sessions[0].StopReason = %q, want %q", listed.Sessions[0].StopReason, store.StopUserCanceled)
+	}
+
+	statusResp := mustHTTPRequest(
+		t,
+		runtime.client,
+		http.MethodGet,
+		mustURL(runtime.host, runtime.port, "/api/workspaces/ws-workspace/sessions/"+sessionID),
+		nil,
+		nil,
+	)
+	if statusResp.StatusCode != http.StatusOK {
+		body := readAndCloseHTTPBody(t, statusResp)
+		t.Fatalf("status session response = %d, want %d; body=%s", statusResp.StatusCode, http.StatusOK, string(body))
+	}
+	var detail struct {
+		Session sessionPayload `json:"session"`
+	}
+	decodeHTTPJSON(t, statusResp, &detail)
+	if detail.Session.ID != sessionID {
+		t.Fatalf("detail.Session.ID = %q, want %q", detail.Session.ID, sessionID)
+	}
+	if detail.Session.StopReason != store.StopUserCanceled {
+		t.Fatalf("detail.Session.StopReason = %q, want %q", detail.Session.StopReason, store.StopUserCanceled)
+	}
+}
+
+func TestHTTPSessionCrashStopReasonPropagatesToGlobalDBAndAPI(t *testing.T) {
+	t.Run("Should propagate an agent crash reason to persistence and HTTP", func(t *testing.T) {
+		t.Parallel()
+
+		exerciseHTTPSessionCrashStopReasonPropagatesToGlobalDBAndAPI(t)
+	})
+}
+
+func exerciseHTTPSessionCrashStopReasonPropagatesToGlobalDBAndAPI(t *testing.T) {
+	t.Helper()
+
+	runtime := newIntegrationRuntime(t)
+	sessionID := createIntegrationSession(t, runtime)
+	bindIntegrationSessionRuntime(t, runtime, sessionID)
+
+	sess, ok := runtime.manager.Get(sessionID)
+	if !ok {
+		t.Fatalf("manager.Get(%q) = missing, want active session", sessionID)
+	}
+	if err := runtime.driver.Crash(sess.Info().ACPSessionID, errors.New("integration crash")); err != nil {
+		t.Fatalf("driver.Crash() error = %v", err)
+	}
+
+	waitForRegistryStopReason(t, runtime, sessionID, store.StopAgentCrashed)
+
+	meta, err := store.ReadSessionMeta(sess.MetaPath())
+	if err != nil {
+		t.Fatalf("ReadSessionMeta(%q) error = %v", sess.MetaPath(), err)
+	}
+	if meta.StopReason == nil {
+		t.Fatal("meta.StopReason = nil, want non-nil")
+	}
+	if *meta.StopReason != store.StopAgentCrashed {
+		t.Fatalf("meta.StopReason = %q, want %q", *meta.StopReason, store.StopAgentCrashed)
+	}
+
+	listResp := mustHTTPRequest(
+		t,
+		runtime.client,
+		http.MethodGet,
+		mustURL(runtime.host, runtime.port, "/api/sessions?all_workspaces=true"),
+		nil,
+		nil,
+	)
+	if listResp.StatusCode != http.StatusOK {
+		body := readAndCloseHTTPBody(t, listResp)
+		t.Fatalf("list sessions status = %d, want %d; body=%s", listResp.StatusCode, http.StatusOK, string(body))
+	}
+	var listed struct {
+		Sessions []sessionPayload `json:"sessions"`
+	}
+	decodeHTTPJSON(t, listResp, &listed)
+	if got, want := len(listed.Sessions), 1; got != want {
+		t.Fatalf("len(listed.Sessions) = %d, want %d", got, want)
+	}
+	if listed.Sessions[0].StopReason != store.StopAgentCrashed {
+		t.Fatalf("listed.Sessions[0].StopReason = %q, want %q", listed.Sessions[0].StopReason, store.StopAgentCrashed)
+	}
+
+	statusResp := mustHTTPRequest(
+		t,
+		runtime.client,
+		http.MethodGet,
+		mustURL(runtime.host, runtime.port, "/api/workspaces/ws-workspace/sessions/"+sessionID),
+		nil,
+		nil,
+	)
+	if statusResp.StatusCode != http.StatusOK {
+		body := readAndCloseHTTPBody(t, statusResp)
+		t.Fatalf("status session response = %d, want %d; body=%s", statusResp.StatusCode, http.StatusOK, string(body))
+	}
+	var detail struct {
+		Session sessionPayload `json:"session"`
+	}
+	decodeHTTPJSON(t, statusResp, &detail)
+	if detail.Session.StopReason != store.StopAgentCrashed {
+		t.Fatalf("detail.Session.StopReason = %q, want %q", detail.Session.StopReason, store.StopAgentCrashed)
+	}
+}
+
+func TestHTTPApprovePermissionFullFlow(t *testing.T) {
+	runtime := newIntegrationRuntimeWithPermissionWait(t, 0)
+	sessionID := createIntegrationSession(t, runtime)
+
+	promptResp := mustHTTPRequest(
+		t,
+		runtime.client,
+		http.MethodPost,
+		mustURL(runtime.host, runtime.port, "/api/workspaces/ws-workspace/sessions/"+sessionID+"/prompt"),
+		integrationPromptJSON(t, "request permission"),
+		nil,
+	)
+	if promptResp.StatusCode != http.StatusOK {
+		body := readAndCloseHTTPBody(t, promptResp)
+		t.Fatalf("prompt status = %d, want %d; body=%s", promptResp.StatusCode, http.StatusOK, string(body))
+	}
+
+	stream := startPermissionPromptStream(t.Context(), promptResp.Body)
+	streamTerminalConsumed := false
+	t.Cleanup(func() {
+		stream.cancel()
+		if streamTerminalConsumed {
+			return
+		}
+		cleanupCtx, cancelCleanup := context.WithTimeout(
+			context.WithoutCancel(t.Context()),
+			permissionPromptStreamJoinTimeout,
+		)
+		defer cancelCleanup()
+		_, consumed, cleanupErr := waitForPermissionPromptStreamResult(cleanupCtx, stream, nil)
+		streamTerminalConsumed = consumed
+		if cleanupErr != nil {
+			t.Errorf("permission prompt stream cleanup error = %v", cleanupErr)
+		}
+	})
+
+	var requestID string
+	requestIDCtx := t.Context()
+	select {
+	case requestID = <-stream.requestID:
+	case <-requestIDCtx.Done():
+		primaryErr := fmt.Errorf("wait for permission request id: %w", requestIDCtx.Err())
+		streamResult, consumed, streamErr := waitForPermissionPromptStreamResult(
+			requestIDCtx,
+			stream,
+			primaryErr,
+		)
+		streamTerminalConsumed = consumed
+		t.Fatalf(
+			"timed out waiting for permission request id: %v; records=%#v",
+			streamErr,
+			streamResult.records,
+		)
+	}
+	if requestID == "" {
+		streamResult, consumed, streamErr := waitForPermissionPromptStreamResult(
+			t.Context(),
+			stream,
+			errors.New("permission request id was not emitted"),
+		)
+		streamTerminalConsumed = consumed
+		t.Fatalf(
+			"permission request id failure = %v; records=%#v",
+			streamErr,
+			streamResult.records,
+		)
+	}
+
+	if primaryErr := approvePermissionForIntegration(t.Context(), runtime, sessionID, requestID); primaryErr != nil {
+		streamResult, consumed, streamErr := waitForPermissionPromptStreamResult(
+			t.Context(),
+			stream,
+			primaryErr,
+		)
+		streamTerminalConsumed = consumed
+		t.Fatalf("permission approval failed: %v; records=%#v", streamErr, streamResult.records)
+	}
+
+	streamResult, consumed, streamErr := waitForPermissionPromptStreamResult(t.Context(), stream, nil)
+	streamTerminalConsumed = consumed
+	if streamErr != nil {
+		t.Fatalf("streamPermissionPrompt() error = %v", streamErr)
+	}
+	records := streamResult.records
+
+	permissionPayloads := extractPermissionPayloads(t, records)
+	if len(permissionPayloads) < 2 {
+		t.Fatalf("permission payloads = %#v, want initial and final permission events", permissionPayloads)
+	}
+	if permissionPayloads[0].RequestID != requestID || permissionPayloads[0].Decision != "" {
+		t.Fatalf("initial permission payload = %#v", permissionPayloads[0])
+	}
+	if permissionPayloads[len(permissionPayloads)-1].Decision != "allow-always" {
+		t.Fatalf("final permission payload = %#v, want allow-always", permissionPayloads[len(permissionPayloads)-1])
+	}
+	if !recordsContainTextDelta(records, "allow-always") {
+		t.Fatalf("records = %#v, want allow-always text delta", records)
+	}
+}
+
+func TestHTTPApprovePermissionTimeout(t *testing.T) {
+	runtime := newIntegrationRuntimeWithPermissionWait(t, 25*time.Millisecond)
+	sessionID := createIntegrationSession(t, runtime)
+
+	promptResp := mustHTTPRequest(
+		t,
+		runtime.client,
+		http.MethodPost,
+		mustURL(runtime.host, runtime.port, "/api/workspaces/ws-workspace/sessions/"+sessionID+"/prompt"),
+		integrationPromptJSON(t, "request permission"),
+		nil,
+	)
+	if promptResp.StatusCode != http.StatusOK {
+		body := readAndCloseHTTPBody(t, promptResp)
+		t.Fatalf("prompt status = %d, want %d; body=%s", promptResp.StatusCode, http.StatusOK, string(body))
+	}
+
+	stream := startPermissionPromptStream(t.Context(), promptResp.Body)
+	streamTerminalConsumed := false
+	t.Cleanup(func() {
+		stream.cancel()
+		if streamTerminalConsumed {
+			return
+		}
+		cleanupCtx, cancelCleanup := context.WithTimeout(
+			context.WithoutCancel(t.Context()),
+			permissionPromptStreamJoinTimeout,
+		)
+		defer cancelCleanup()
+		_, consumed, cleanupErr := waitForPermissionPromptStreamResult(cleanupCtx, stream, nil)
+		streamTerminalConsumed = consumed
+		if cleanupErr != nil {
+			t.Errorf("permission prompt stream cleanup error = %v", cleanupErr)
+		}
+	})
+
+	requestIDCtx := t.Context()
+	var requestID string
+	select {
+	case requestID = <-stream.requestID:
+	case <-requestIDCtx.Done():
+		primaryErr := fmt.Errorf("wait for permission request id: %w", requestIDCtx.Err())
+		streamResult, consumed, streamErr := waitForPermissionPromptStreamResult(
+			requestIDCtx,
+			stream,
+			primaryErr,
+		)
+		streamTerminalConsumed = consumed
+		t.Fatalf(
+			"timed out waiting for permission request id: %v; records=%#v",
+			streamErr,
+			streamResult.records,
+		)
+	}
+	if requestID == "" {
+		streamResult, consumed, streamErr := waitForPermissionPromptStreamResult(
+			t.Context(),
+			stream,
+			errors.New("permission request id was not emitted"),
+		)
+		streamTerminalConsumed = consumed
+		t.Fatalf(
+			"permission request id failure = %v; records=%#v",
+			streamErr,
+			streamResult.records,
+		)
+	}
+
+	streamResult, consumed, streamErr := waitForPermissionPromptStreamResult(t.Context(), stream, nil)
+	streamTerminalConsumed = consumed
+	if streamErr != nil {
+		t.Fatalf("streamPermissionPrompt() error = %v", streamErr)
+	}
+	records := streamResult.records
+
+	permissionPayloads := extractPermissionPayloads(t, records)
+	if len(permissionPayloads) < 2 {
+		t.Fatalf("permission payloads = %#v, want initial and final permission events", permissionPayloads)
+	}
+	if permissionPayloads[len(permissionPayloads)-1].Decision != "reject-once" {
+		t.Fatalf("final permission payload = %#v, want reject-once", permissionPayloads[len(permissionPayloads)-1])
+	}
+	if !recordsContainTextDelta(records, "reject-once") {
+		t.Fatalf("records = %#v, want reject-once text delta", records)
+	}
+}
+
+func TestHTTPAutomationJobsRoundTrip(t *testing.T) {
+	t.Run("Should round trip jobs with the latest failed run", func(t *testing.T) {
+		t.Parallel()
+		runtime := newIntegrationRuntime(t)
+
+		createResp := mustHTTPRequest(
+			t,
+			runtime.client,
+			http.MethodPost,
+			mustURL(runtime.host, runtime.port, "/api/automation/jobs"),
+			[]byte(
+				`{"scope":"global","name":"nightly-review","agent_name":"coder","prompt":"review repo","schedule":{"mode":"every","interval":"1h"}}`,
+			),
+			nil,
+		)
+		if createResp.StatusCode != http.StatusCreated {
+			body := readAndCloseHTTPBody(t, createResp)
+			t.Fatalf(
+				"create job status = %d, want %d; body=%s",
+				createResp.StatusCode,
+				http.StatusCreated,
+				string(body),
+			)
+		}
+		var created contract.JobResponse
+		decodeHTTPJSON(t, createResp, &created)
+		if created.Job.ID == "" {
+			t.Fatal("expected created automation job id")
+		}
+		if created.Job.Source != automationpkg.JobSourceDynamic {
+			t.Fatalf("created job source = %q, want %q", created.Job.Source, automationpkg.JobSourceDynamic)
+		}
+
+		getResp := mustHTTPRequest(
+			t,
+			runtime.client,
+			http.MethodGet,
+			mustURL(runtime.host, runtime.port, "/api/automation/jobs/"+created.Job.ID),
+			nil,
+			nil,
+		)
+		if getResp.StatusCode != http.StatusOK {
+			body := readAndCloseHTTPBody(t, getResp)
+			t.Fatalf("get job status = %d, want %d; body=%s", getResp.StatusCode, http.StatusOK, string(body))
+		}
+		var fetched contract.JobResponse
+		decodeHTTPJSON(t, getResp, &fetched)
+		if fetched.Job.LastRun != nil {
+			t.Fatalf("never-run job last_run = %#v, want absent", fetched.Job.LastRun)
+		}
+		if fetched.Job.NextRun == nil {
+			t.Fatalf("expected next_run for fetched job: %#v", fetched.Job)
+		}
+
+		listResp := mustHTTPRequest(
+			t,
+			runtime.client,
+			http.MethodGet,
+			mustURL(runtime.host, runtime.port, "/api/automation/jobs?scope=global&source=dynamic"),
+			nil,
+			nil,
+		)
+		if listResp.StatusCode != http.StatusOK {
+			body := readAndCloseHTTPBody(t, listResp)
+			t.Fatalf("list jobs status = %d, want %d; body=%s", listResp.StatusCode, http.StatusOK, string(body))
+		}
+		var listed contract.JobsResponse
+		decodeHTTPJSON(t, listResp, &listed)
+		if len(listed.Jobs) != 1 || listed.Jobs[0].ID != created.Job.ID {
+			t.Fatalf("listed jobs = %#v", listed.Jobs)
+		}
+
+		if listed.Jobs[0].LastRun != nil {
+			t.Fatalf("never-run listed job last_run = %#v, want absent", listed.Jobs[0].LastRun)
+		}
+
+		updateResp := mustHTTPRequest(
+			t,
+			runtime.client,
+			http.MethodPatch,
+			mustURL(runtime.host, runtime.port, "/api/automation/jobs/"+created.Job.ID),
+			[]byte(`{"prompt":"review repo now"}`),
+			nil,
+		)
+		if updateResp.StatusCode != http.StatusOK {
+			body := readAndCloseHTTPBody(t, updateResp)
+			t.Fatalf("update job status = %d, want %d; body=%s", updateResp.StatusCode, http.StatusOK, string(body))
+		}
+		var updated contract.JobResponse
+		decodeHTTPJSON(t, updateResp, &updated)
+		if updated.Job.Prompt != "review repo now" {
+			t.Fatalf("updated job prompt = %q, want %q", updated.Job.Prompt, "review repo now")
+		}
+
+		triggerResp := mustHTTPRequest(
+			t,
+			runtime.client,
+			http.MethodPost,
+			mustURL(runtime.host, runtime.port, "/api/automation/jobs/"+created.Job.ID+"/trigger"),
+			nil,
+			nil,
+		)
+		if triggerResp.StatusCode != http.StatusOK {
+			body := readAndCloseHTTPBody(t, triggerResp)
+			t.Fatalf("trigger job status = %d, want %d; body=%s", triggerResp.StatusCode, http.StatusOK, string(body))
+		}
+		var run contract.RunResponse
+		decodeHTTPJSON(t, triggerResp, &run)
+		if run.Run.ID == "" || run.Run.JobID != created.Job.ID {
+			t.Fatalf("trigger run = %#v", run.Run)
+		}
+
+		jobRunsResp := mustHTTPRequest(
+			t,
+			runtime.client,
+			http.MethodGet,
+			mustURL(runtime.host, runtime.port, "/api/automation/jobs/"+created.Job.ID+"/runs"),
+			nil,
+			nil,
+		)
+		if jobRunsResp.StatusCode != http.StatusOK {
+			body := readAndCloseHTTPBody(t, jobRunsResp)
+			t.Fatalf("job runs status = %d, want %d; body=%s", jobRunsResp.StatusCode, http.StatusOK, string(body))
+		}
+		var jobRuns contract.RunsResponse
+		decodeHTTPJSON(t, jobRunsResp, &jobRuns)
+		if !containsAutomationRun(jobRuns.Runs, run.Run.ID) {
+			t.Fatalf("job run history missing %q: %#v", run.Run.ID, jobRuns.Runs)
+		}
+
+		runsResp := mustHTTPRequest(
+			t,
+			runtime.client,
+			http.MethodGet,
+			mustURL(runtime.host, runtime.port, "/api/automation/runs?job_id="+created.Job.ID),
+			nil,
+			nil,
+		)
+		if runsResp.StatusCode != http.StatusOK {
+			body := readAndCloseHTTPBody(t, runsResp)
+			t.Fatalf("list runs status = %d, want %d; body=%s", runsResp.StatusCode, http.StatusOK, string(body))
+		}
+		var runs contract.RunsResponse
+		decodeHTTPJSON(t, runsResp, &runs)
+		if !containsAutomationRun(runs.Runs, run.Run.ID) {
+			t.Fatalf("runs list missing %q: %#v", run.Run.ID, runs.Runs)
+		}
+
+		runResp := mustHTTPRequest(
+			t,
+			runtime.client,
+			http.MethodGet,
+			mustURL(runtime.host, runtime.port, "/api/automation/runs/"+run.Run.ID),
+			nil,
+			nil,
+		)
+		if runResp.StatusCode != http.StatusOK {
+			body := readAndCloseHTTPBody(t, runResp)
+			t.Fatalf("get run status = %d, want %d; body=%s", runResp.StatusCode, http.StatusOK, string(body))
+		}
+		var fetchedRun contract.RunResponse
+		decodeHTTPJSON(t, runResp, &fetchedRun)
+		if fetchedRun.Run.ID != run.Run.ID || fetchedRun.Run.JobID != created.Job.ID {
+			t.Fatalf("fetched run = %#v", fetchedRun.Run)
+		}
+
+		waitForRun := func(id string, status automationpkg.RunStatus) contract.RunPayload {
+			t.Helper()
+			deadline := time.After(2 * time.Second)
+			ticker := time.NewTicker(25 * time.Millisecond)
+			defer ticker.Stop()
+			for {
+				response := mustHTTPRequest(
+					t,
+					runtime.client,
+					http.MethodGet,
+					mustURL(
+						runtime.host,
+						runtime.port,
+						"/api/automation/jobs/"+created.Job.ID+"/runs?limit=1",
+					),
+					nil,
+					nil,
+				)
+				if response.StatusCode != http.StatusOK {
+					body := readAndCloseHTTPBody(t, response)
+					t.Fatalf("latest job run status = %d; body=%s", response.StatusCode, body)
+				}
+				var latest contract.RunsResponse
+				decodeHTTPJSON(t, response, &latest)
+				if len(latest.Runs) == 1 && (id == "" || latest.Runs[0].ID == id) && latest.Runs[0].Status == status {
+					return latest.Runs[0]
+				}
+				select {
+				case <-deadline:
+					t.Fatalf("expected latest run %q with status %q, got %#v", id, status, latest.Runs)
+				case <-ticker.C:
+				}
+			}
+		}
+		waitForRun(run.Run.ID, automationpkg.RunCompleted)
+		if err := os.Remove(filepath.Join(runtime.server.homePaths.AgentsDir, "coder", "AGENT.md")); err != nil {
+			t.Fatalf("remove agent definition before the second run: %v", err)
+		}
+		failedResp := mustHTTPRequest(t, runtime.client, http.MethodPost,
+			mustURL(runtime.host, runtime.port, "/api/automation/jobs/"+created.Job.ID+"/trigger"), nil, nil)
+		if failedResp.StatusCode != http.StatusInternalServerError {
+			body := readAndCloseHTTPBody(t, failedResp)
+			t.Fatalf("trigger unavailable agent status = %d; body=%s", failedResp.StatusCode, body)
+		}
+		var failure contract.ErrorPayload
+		decodeHTTPJSON(t, failedResp, &failure)
+		if failure.Error == "" {
+			t.Fatal("expected unavailable agent failure message")
+		}
+		latest := waitForRun("", automationpkg.RunFailed)
+		if latest.ID == "" || latest.ID == run.Run.ID {
+			t.Fatalf("expected a new failed run, got %#v", latest)
+		}
+		for _, path := range []string{"/api/automation/jobs", "/api/automation/jobs/" + created.Job.ID} {
+			response := mustHTTPRequest(t, runtime.client, http.MethodGet,
+				mustURL(runtime.host, runtime.port, path), nil, nil)
+			if response.StatusCode != http.StatusOK {
+				body := readAndCloseHTTPBody(t, response)
+				t.Fatalf("job summary status = %d; body=%s", response.StatusCode, body)
+			}
+			var summary *contract.AutomationLastRunPayload
+			if path == "/api/automation/jobs" {
+				var result contract.JobsResponse
+				decodeHTTPJSON(t, response, &result)
+				if len(result.Jobs) != 1 {
+					t.Fatalf("listed jobs = %#v", result.Jobs)
+				}
+				summary = result.Jobs[0].LastRun
+			} else {
+				var result contract.JobResponse
+				decodeHTTPJSON(t, response, &result)
+				summary = result.Job.LastRun
+			}
+			if summary == nil || summary.ID != latest.ID || summary.Status != latest.Status ||
+				summary.StartedAt == nil || latest.StartedAt == nil || !summary.StartedAt.Equal(*latest.StartedAt) ||
+				summary.EndedAt == nil || latest.EndedAt == nil || !summary.EndedAt.Equal(*latest.EndedAt) || summary.SkipReason != "" {
+				t.Fatalf("%s last_run = %#v, latest run = %#v", path, summary, latest)
+			}
+		}
+
+		deleteResp := mustHTTPRequest(
+			t,
+			runtime.client,
+			http.MethodDelete,
+			mustURL(runtime.host, runtime.port, "/api/automation/jobs/"+created.Job.ID),
+			nil,
+			nil,
+		)
+		if deleteResp.StatusCode != http.StatusNoContent {
+			body := readAndCloseHTTPBody(t, deleteResp)
+			t.Fatalf(
+				"delete job status = %d, want %d; body=%s",
+				deleteResp.StatusCode,
+				http.StatusNoContent,
+				string(body),
+			)
+		}
+		closeHTTPBody(t, deleteResp.Body)
+
+		emptyResp := mustHTTPRequest(
+			t,
+			runtime.client,
+			http.MethodGet,
+			mustURL(runtime.host, runtime.port, "/api/automation/jobs"),
+			nil,
+			nil,
+		)
+		if emptyResp.StatusCode != http.StatusOK {
+			body := readAndCloseHTTPBody(t, emptyResp)
+			t.Fatalf("final list jobs status = %d, want %d; body=%s", emptyResp.StatusCode, http.StatusOK, string(body))
+		}
+		var empty contract.JobsResponse
+		decodeHTTPJSON(t, emptyResp, &empty)
+		if len(empty.Jobs) != 0 {
+			t.Fatalf("expected no remaining jobs, got %#v", empty.Jobs)
+		}
+	})
+}
+
+func TestHTTPAutomationTriggersWebhookAndHealth(t *testing.T) {
+	runtime := newIntegrationRuntime(t)
+
+	createResp := mustHTTPRequest(
+		t,
+		runtime.client,
+		http.MethodPost,
+		mustURL(runtime.host, runtime.port, "/api/automation/triggers"),
+		[]byte(
+			`{"scope":"global","name":"deploy-review","agent_name":"coder","prompt":"review {{ index .Data \"payload\" }}","event":"webhook","endpoint_slug":"deploy-review","webhook_secret_value":"shared-secret"}`,
+		),
+		nil,
+	)
+	if createResp.StatusCode != http.StatusCreated {
+		body := readAndCloseHTTPBody(t, createResp)
+		t.Fatalf(
+			"create trigger status = %d, want %d; body=%s",
+			createResp.StatusCode,
+			http.StatusCreated,
+			string(body),
+		)
+	}
+	createBody, err := io.ReadAll(createResp.Body)
+	closeHTTPBody(t, createResp.Body)
+	if err != nil {
+		t.Fatalf("io.ReadAll(create trigger response) error = %v", err)
+	}
+	if strings.Contains(string(createBody), "shared-secret") {
+		t.Fatalf("create trigger response leaked webhook secret: %s", string(createBody))
+	}
+	var created contract.TriggerResponse
+	if err := json.Unmarshal(createBody, &created); err != nil {
+		t.Fatalf("json.Unmarshal(create trigger response) error = %v; body=%s", err, string(createBody))
+	}
+	if created.Trigger.ID == "" || created.Trigger.WebhookID == "" {
+		t.Fatalf("created trigger = %#v", created.Trigger)
+	}
+
+	endpoint, err := automationpkg.FormatWebhookEndpoint(created.Trigger.EndpointSlug, created.Trigger.WebhookID)
+	if err != nil {
+		t.Fatalf("FormatWebhookEndpoint() error = %v", err)
+	}
+
+	getResp := mustHTTPRequest(
+		t,
+		runtime.client,
+		http.MethodGet,
+		mustURL(runtime.host, runtime.port, "/api/automation/triggers/"+created.Trigger.ID),
+		nil,
+		nil,
+	)
+	if getResp.StatusCode != http.StatusOK {
+		body := readAndCloseHTTPBody(t, getResp)
+		t.Fatalf("get trigger status = %d, want %d; body=%s", getResp.StatusCode, http.StatusOK, string(body))
+	}
+	getBody, err := io.ReadAll(getResp.Body)
+	closeHTTPBody(t, getResp.Body)
+	if err != nil {
+		t.Fatalf("io.ReadAll(get trigger response) error = %v", err)
+	}
+	if strings.Contains(string(getBody), "shared-secret") {
+		t.Fatalf("get trigger response leaked webhook secret: %s", string(getBody))
+	}
+	var fetched contract.TriggerResponse
+	if err := json.Unmarshal(getBody, &fetched); err != nil {
+		t.Fatalf("json.Unmarshal(get trigger response) error = %v; body=%s", err, string(getBody))
+	}
+	if fetched.Trigger.EndpointSlug != "deploy-review" {
+		t.Fatalf("fetched trigger endpoint_slug = %q, want %q", fetched.Trigger.EndpointSlug, "deploy-review")
+	}
+
+	updateResp := mustHTTPRequest(
+		t,
+		runtime.client,
+		http.MethodPatch,
+		mustURL(runtime.host, runtime.port, "/api/automation/triggers/"+created.Trigger.ID),
+		[]byte(`{"prompt":"triage {{ index .Data \"payload\" }}"}`),
+		nil,
+	)
+	if updateResp.StatusCode != http.StatusOK {
+		body := readAndCloseHTTPBody(t, updateResp)
+		t.Fatalf("update trigger status = %d, want %d; body=%s", updateResp.StatusCode, http.StatusOK, string(body))
+	}
+	updateBody, err := io.ReadAll(updateResp.Body)
+	closeHTTPBody(t, updateResp.Body)
+	if err != nil {
+		t.Fatalf("io.ReadAll(update trigger response) error = %v", err)
+	}
+	if strings.Contains(string(updateBody), "shared-secret") {
+		t.Fatalf("update trigger response leaked webhook secret: %s", string(updateBody))
+	}
+	var updated contract.TriggerResponse
+	if err := json.Unmarshal(updateBody, &updated); err != nil {
+		t.Fatalf("json.Unmarshal(update trigger response) error = %v; body=%s", err, string(updateBody))
+	}
+	if updated.Trigger.Prompt != `triage {{ index .Data "payload" }}` {
+		t.Fatalf("updated trigger prompt = %q", updated.Trigger.Prompt)
+	}
+
+	payload := []byte(`{"payload":"deploy"}`)
+	timestamp := time.Now().UTC()
+	invalidResp := mustHTTPRequest(
+		t,
+		runtime.client,
+		http.MethodPost,
+		mustURL(runtime.host, runtime.port, "/api/webhooks/global/"+endpoint),
+		payload,
+		map[string]string{
+			core.WebhookTimestampHeader:  timestamp.Format(time.RFC3339),
+			core.WebhookSignatureHeader:  "sha256=deadbeef",
+			core.WebhookDeliveryIDHeader: "delivery-invalid",
+		},
+	)
+	if invalidResp.StatusCode != http.StatusUnauthorized {
+		body := readAndCloseHTTPBody(t, invalidResp)
+		t.Fatalf(
+			"invalid webhook status = %d, want %d; body=%s",
+			invalidResp.StatusCode,
+			http.StatusUnauthorized,
+			string(body),
+		)
+	}
+	var invalidPayload contract.ErrorPayload
+	decodeHTTPJSON(t, invalidResp, &invalidPayload)
+	if !strings.Contains(strings.ToLower(invalidPayload.Error), "signature") {
+		t.Fatalf("invalid webhook error = %#v, want signature failure detail", invalidPayload)
+	}
+
+	signature, err := automationpkg.SignWebhookPayload("shared-secret", timestamp, payload)
+	if err != nil {
+		t.Fatalf("SignWebhookPayload() error = %v", err)
+	}
+	validResp := mustHTTPRequest(
+		t,
+		runtime.client,
+		http.MethodPost,
+		mustURL(runtime.host, runtime.port, "/api/webhooks/global/"+endpoint),
+		payload,
+		map[string]string{
+			core.WebhookTimestampHeader:  timestamp.Format(time.RFC3339),
+			core.WebhookSignatureHeader:  signature,
+			core.WebhookDeliveryIDHeader: "delivery-valid",
+		},
+	)
+	if validResp.StatusCode != http.StatusOK {
+		body := readAndCloseHTTPBody(t, validResp)
+		t.Fatalf("valid webhook status = %d, want %d; body=%s", validResp.StatusCode, http.StatusOK, string(body))
+	}
+	var delivery contract.WebhookDeliveryResponse
+	decodeHTTPJSON(t, validResp, &delivery)
+	if delivery.Result.Matched != 1 || len(delivery.Result.Runs) != 1 {
+		t.Fatalf("webhook delivery = %#v", delivery.Result)
+	}
+
+	runID := delivery.Result.Runs[0].ID
+	triggerRunsResp := mustHTTPRequest(
+		t,
+		runtime.client,
+		http.MethodGet,
+		mustURL(runtime.host, runtime.port, "/api/automation/triggers/"+created.Trigger.ID+"/runs"),
+		nil,
+		nil,
+	)
+	if triggerRunsResp.StatusCode != http.StatusOK {
+		body := readAndCloseHTTPBody(t, triggerRunsResp)
+		t.Fatalf("trigger runs status = %d, want %d; body=%s", triggerRunsResp.StatusCode, http.StatusOK, string(body))
+	}
+	var triggerRuns contract.RunsResponse
+	decodeHTTPJSON(t, triggerRunsResp, &triggerRuns)
+	if !containsAutomationRun(triggerRuns.Runs, runID) {
+		t.Fatalf("trigger run history missing %q: %#v", runID, triggerRuns.Runs)
+	}
+
+	runResp := mustHTTPRequest(
+		t,
+		runtime.client,
+		http.MethodGet,
+		mustURL(runtime.host, runtime.port, "/api/automation/runs/"+runID),
+		nil,
+		nil,
+	)
+	if runResp.StatusCode != http.StatusOK {
+		body := readAndCloseHTTPBody(t, runResp)
+		t.Fatalf("get trigger run status = %d, want %d; body=%s", runResp.StatusCode, http.StatusOK, string(body))
+	}
+	var run contract.RunResponse
+	decodeHTTPJSON(t, runResp, &run)
+	if run.Run.TriggerID != created.Trigger.ID {
+		t.Fatalf("trigger run = %#v, want trigger_id %q", run.Run, created.Trigger.ID)
+	}
+
+	healthResp := mustHTTPRequest(
+		t,
+		runtime.client,
+		http.MethodGet,
+		mustURL(runtime.host, runtime.port, "/api/status"),
+		nil,
+		nil,
+	)
+	if healthResp.StatusCode != http.StatusOK {
+		body := readAndCloseHTTPBody(t, healthResp)
+		t.Fatalf("health status = %d, want %d; body=%s", healthResp.StatusCode, http.StatusOK, string(body))
+	}
+	var health contract.StatusPayload
+	decodeHTTPJSON(t, healthResp, &health)
+	if !health.Automation.Enabled || !health.Automation.SchedulerRunning {
+		t.Fatalf("automation health = %#v", health.Automation)
+	}
+	if health.Automation.Triggers.Total != 1 || health.Automation.Triggers.Enabled != 1 {
+		t.Fatalf("automation trigger health = %#v", health.Automation.Triggers)
+	}
+
+	deleteResp := mustHTTPRequest(
+		t,
+		runtime.client,
+		http.MethodDelete,
+		mustURL(runtime.host, runtime.port, "/api/automation/triggers/"+created.Trigger.ID),
+		nil,
+		nil,
+	)
+	if deleteResp.StatusCode != http.StatusNoContent {
+		body := readAndCloseHTTPBody(t, deleteResp)
+		t.Fatalf(
+			"delete trigger status = %d, want %d; body=%s",
+			deleteResp.StatusCode,
+			http.StatusNoContent,
+			string(body),
+		)
+	}
+	closeHTTPBody(t, deleteResp.Body)
+}
+
+func TestHTTPShutdownWaitsForInflightRequests(t *testing.T) {
+	homePaths := newTestHomePaths(t)
+	cfg := compozyconfig.DefaultWithHome(homePaths)
+	cfg.HTTP.Host = "127.0.0.1"
+	cfg.HTTP.Port = freeTCPPort(t)
+
+	entered := make(chan struct{}, 1)
+	release := make(chan struct{})
+	server, err := New(
+		WithHomePaths(homePaths),
+		WithConfig(&cfg),
+		WithHost(cfg.HTTP.Host),
+		WithPort(cfg.HTTP.Port),
+		WithLogger(discardLogger()),
+		WithSessionManager(&stubSessionManager{
+			ListAllFn: func(context.Context) ([]*session.Info, error) {
+				entered <- struct{}{}
+				<-release
+				return []*session.Info{newSessionInfo("sess-1")}, nil
+			},
+		}),
+		WithTaskService(&stubTaskManager{}),
+		WithObserver(stubObserver{
+			HealthFn: func(context.Context) (observe.Health, error) { return observe.Health{Status: "ok"}, nil },
+		}),
+		WithWorkspaceResolver(stubWorkspaceService{}),
+	)
+	if err != nil {
+		t.Fatalf("New() error = %v", err)
+	}
+	if err := server.Start(t.Context()); err != nil {
+		t.Fatalf("Start() error = %v", err)
+	}
+	released := false
+	defer func() {
+		if !released {
+			close(release)
+		}
+		if err := server.Shutdown(t.Context()); err != nil {
+			t.Errorf("server.Shutdown() error = %v", err)
+		}
+	}()
+
+	client := &http.Client{}
+	respCh := make(chan *http.Response, 1)
+	errCh := make(chan error, 1)
+	go func() {
+		resp, err := client.Get(mustURL(cfg.HTTP.Host, server.Port(), "/api/sessions?all_workspaces=true"))
+		if err != nil {
+			errCh <- err
+			return
+		}
+		respCh <- resp
+	}()
+
+	select {
+	case <-entered:
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for in-flight request")
+	}
+
+	shutdownDone := make(chan error, 1)
+	shutdownStarted := registerServerShutdownSignal(t, server)
+	go func() {
+		ctx, cancel := context.WithTimeout(t.Context(), 2*time.Second)
+		defer cancel()
+		shutdownDone <- server.Shutdown(ctx)
+	}()
+	waitForServerSignal(t, shutdownStarted, "HTTP shutdown to start draining")
+	select {
+	case err := <-shutdownDone:
+		t.Fatalf("Shutdown() returned early: %v", err)
+	default:
+	}
+
+	close(release)
+	released = true
+
+	select {
+	case err := <-shutdownDone:
+		if err != nil {
+			t.Fatalf("Shutdown() error = %v", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for shutdown")
+	}
+
+	select {
+	case err := <-errCh:
+		t.Fatalf("request error = %v", err)
+	case resp := <-respCh:
+		if resp.StatusCode != http.StatusOK {
+			body := readAndCloseHTTPBody(t, resp)
+			t.Fatalf("request status = %d, want %d; body=%s", resp.StatusCode, http.StatusOK, string(body))
+		}
+		closeHTTPBody(t, resp.Body)
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for request response")
+	}
+}
+
+func TestHTTPShutdownCancelsPersistentStreams(t *testing.T) {
+	t.Run("Should cancel an active session catalog stream before the shutdown deadline", func(t *testing.T) {
+		t.Parallel()
+
+		homePaths := newTestHomePaths(t)
+		cfg := compozyconfig.DefaultWithHome(homePaths)
+		cfg.HTTP.Host = "127.0.0.1"
+		cfg.HTTP.Port = freeTCPPort(t)
+		events := make(chan session.CatalogEvent)
+		server, err := New(
+			WithHomePaths(homePaths),
+			WithConfig(&cfg),
+			WithHost(cfg.HTTP.Host),
+			WithPort(cfg.HTTP.Port),
+			WithLogger(discardLogger()),
+			WithSessionManager(&stubSessionManager{
+				SubscribeCatalogFn: func(context.Context, session.CatalogScope) (<-chan session.CatalogEvent, func(), error) {
+					return events, func() {}, nil
+				},
+			}),
+			WithTaskService(&stubTaskManager{}),
+			WithObserver(stubObserver{}),
+			WithWorkspaceResolver(stubWorkspaceService{}),
+		)
+		if err != nil {
+			t.Fatalf("New() error = %v", err)
+		}
+		if err := server.Start(t.Context()); err != nil {
+			t.Fatalf("Start() error = %v", err)
+		}
+		t.Cleanup(func() {
+			cleanupCtx, cancelCleanup := context.WithTimeout(context.WithoutCancel(t.Context()), 2*time.Second)
+			defer cancelCleanup()
+			if err := server.Shutdown(cleanupCtx); err != nil {
+				t.Errorf("Shutdown() during cleanup error = %v", err)
+			}
+		})
+
+		streamResponse := mustHTTPRequest(
+			t,
+			&http.Client{},
+			http.MethodGet,
+			mustURL(cfg.HTTP.Host, server.Port(), "/api/sessions/catalog-stream?all_workspaces=true"),
+			nil,
+			nil,
+		)
+		if streamResponse.StatusCode != http.StatusOK {
+			body, readErr := io.ReadAll(streamResponse.Body)
+			closeErr := streamResponse.Body.Close()
+			if responseErr := errors.Join(readErr, closeErr); responseErr != nil {
+				t.Fatalf("read stream error response: %v", responseErr)
+			}
+			t.Fatalf("stream status = %d, want %d; body=%s", streamResponse.StatusCode, http.StatusOK, body)
+		}
+		if contentType := streamResponse.Header.Get("Content-Type"); contentType != "text/event-stream" {
+			closeHTTPBody(t, streamResponse.Body)
+			t.Fatalf("stream content type = %q, want text/event-stream", contentType)
+		}
+
+		streamDone := make(chan error, 1)
+		go func() {
+			_, readErr := io.Copy(io.Discard, streamResponse.Body)
+			streamDone <- errors.Join(readErr, streamResponse.Body.Close())
+		}()
+
+		shutdownCtx, cancel := context.WithTimeout(t.Context(), 500*time.Millisecond)
+		defer cancel()
+		if err := server.Shutdown(shutdownCtx); err != nil {
+			t.Fatalf("Shutdown() error = %v", err)
+		}
+
+		select {
+		case err := <-streamDone:
+			if err != nil {
+				t.Fatalf("stream close error = %v", err)
+			}
+		case <-shutdownCtx.Done():
+			t.Fatalf("stream remained active after shutdown: %v", shutdownCtx.Err())
+		}
+	})
+}
+
+func TestHTTPTaskRoutesRoundTrip(t *testing.T) {
+	runtime := newIntegrationRuntime(t)
+
+	created := createIntegrationTask(t, runtime, []byte(`{
+		"scope":"global",
+		"title":"Ship task routes",
+		"description":"Expose the transport routes",
+		"owner":{"kind":"pool","ref":"ops"},
+		"metadata":{"priority":"high"}
+	}`))
+	if created.ID == "" {
+		t.Fatal("expected created task id")
+	}
+	if created.Scope != taskpkg.ScopeGlobal {
+		t.Fatalf("created scope = %q, want %q", created.Scope, taskpkg.ScopeGlobal)
+	}
+
+	if created.Owner == nil || created.Owner.Kind != taskpkg.OwnerKindPool || created.Owner.Ref != "ops" {
+		t.Fatalf("created owner = %#v, want pool/ops", created.Owner)
+	}
+	if created.Origin.Kind != taskpkg.OriginKindHTTP {
+		t.Fatalf("created origin.kind = %q, want %q", created.Origin.Kind, taskpkg.OriginKindHTTP)
+	}
+	if created.CreatedBy.Ref != "local-user" {
+		t.Fatalf("created created_by.ref = %q, want %q", created.CreatedBy.Ref, "local-user")
+	}
+	if got := strings.TrimSpace(string(created.Metadata)); got != `{"priority":"high"}` {
+		t.Fatalf("created metadata = %s, want %s", got, `{"priority":"high"}`)
+	}
+
+	listResp := mustHTTPRequest(
+		t,
+		runtime.client,
+		http.MethodGet,
+		mustURL(
+			runtime.host,
+			runtime.port,
+			"/api/tasks?scope=global&status=ready&owner_kind=pool&owner_ref=ops",
+		),
+		nil,
+		nil,
+	)
+	if listResp.StatusCode != http.StatusOK {
+		body := readAndCloseHTTPBody(t, listResp)
+		t.Fatalf("list tasks status = %d, want %d; body=%s", listResp.StatusCode, http.StatusOK, string(body))
+	}
+	var listed contract.TasksResponse
+	decodeHTTPJSON(t, listResp, &listed)
+	if len(listed.Tasks) != 1 || listed.Tasks[0].ID != created.ID {
+		t.Fatalf("listed tasks = %#v, want created task", listed.Tasks)
+	}
+
+	getResp := mustHTTPRequest(
+		t,
+		runtime.client,
+		http.MethodGet,
+		mustURL(runtime.host, runtime.port, "/api/tasks/"+created.ID),
+		nil,
+		nil,
+	)
+	if getResp.StatusCode != http.StatusOK {
+		body := readAndCloseHTTPBody(t, getResp)
+		t.Fatalf("get task status = %d, want %d; body=%s", getResp.StatusCode, http.StatusOK, string(body))
+	}
+	var detail contract.TaskDetailResponse
+	decodeHTTPJSON(t, getResp, &detail)
+	if detail.Task.Task.ID != created.ID {
+		t.Fatalf("detail task id = %q, want %q", detail.Task.Task.ID, created.ID)
+	}
+	if len(detail.Task.Children) != 0 || len(detail.Task.Runs) != 0 {
+		t.Fatalf("detail task children/runs = %#v, want empty", detail.Task)
+	}
+
+	updateResp := mustHTTPRequest(
+		t,
+		runtime.client,
+		http.MethodPatch,
+		mustURL(runtime.host, runtime.port, "/api/tasks/"+created.ID),
+		[]byte(`{
+		"title":"Ship task routes now",
+		"description":"Expose the task and run transports everywhere",
+		"clear_owner":true
+	}`),
+		nil,
+	)
+	if updateResp.StatusCode != http.StatusOK {
+		body := readAndCloseHTTPBody(t, updateResp)
+		t.Fatalf("update task status = %d, want %d; body=%s", updateResp.StatusCode, http.StatusOK, string(body))
+	}
+	var updated contract.TaskResponse
+	decodeHTTPJSON(t, updateResp, &updated)
+	if updated.Task.Title != "Ship task routes now" {
+		t.Fatalf("updated title = %q, want %q", updated.Task.Title, "Ship task routes now")
+	}
+	if updated.Task.Description != "Expose the task and run transports everywhere" {
+		t.Fatalf("updated description = %q", updated.Task.Description)
+	}
+
+	if updated.Task.Owner != nil {
+		t.Fatalf("updated owner = %#v, want nil", updated.Task.Owner)
+	}
+
+	updatedListResp := mustHTTPRequest(
+		t,
+		runtime.client,
+		http.MethodGet,
+		mustURL(runtime.host, runtime.port, "/api/tasks?scope=global&status=ready"),
+		nil,
+		nil,
+	)
+	if updatedListResp.StatusCode != http.StatusOK {
+		body := readAndCloseHTTPBody(t, updatedListResp)
+		t.Fatalf(
+			"updated list tasks status = %d, want %d; body=%s",
+			updatedListResp.StatusCode,
+			http.StatusOK,
+			string(body),
+		)
+	}
+	var updatedList contract.TasksResponse
+	decodeHTTPJSON(t, updatedListResp, &updatedList)
+	if len(updatedList.Tasks) != 1 || updatedList.Tasks[0].ID != created.ID {
+		t.Fatalf("updated list tasks = %#v, want created task", updatedList.Tasks)
+	}
+}
+
+func TestHTTPTaskRunLifecycleRoutesRoundTrip(t *testing.T) {
+	t.Run("Should enqueue claim start and complete a task run", func(t *testing.T) {
+		t.Parallel()
+
+		runtime := newIntegrationRuntime(t)
+		created := createIntegrationTask(
+			t,
+			runtime,
+			[]byte(`{"scope":"workspace","workspace":"ws-workspace","title":"Run task routes"}`),
+		)
+
+		enqueueResp := mustHTTPRequest(
+			t,
+			runtime.client,
+			http.MethodPost,
+			mustURL(runtime.host, runtime.port, "/api/tasks/"+created.ID+"/runs"),
+			[]byte(`{"idempotency_key":"enqueue-1"}`),
+			nil,
+		)
+		if enqueueResp.StatusCode != http.StatusCreated {
+			body := readAndCloseHTTPBody(t, enqueueResp)
+			t.Fatalf(
+				"enqueue run status = %d, want %d; body=%s",
+				enqueueResp.StatusCode,
+				http.StatusCreated,
+				string(body),
+			)
+		}
+		var queued contract.TaskRunResponse
+		decodeHTTPJSON(t, enqueueResp, &queued)
+		if queued.Run.Status != taskpkg.TaskRunStatusQueued {
+			t.Fatalf("queued status = %q, want %q", queued.Run.Status, taskpkg.TaskRunStatusQueued)
+		}
+
+		listQueuedResp := mustHTTPRequest(
+			t,
+			runtime.client,
+			http.MethodGet,
+			mustURL(runtime.host, runtime.port, "/api/tasks/"+created.ID+"/runs?status=queued&limit=1"),
+			nil,
+			nil,
+		)
+		if listQueuedResp.StatusCode != http.StatusOK {
+			body := readAndCloseHTTPBody(t, listQueuedResp)
+			t.Fatalf(
+				"list queued runs status = %d, want %d; body=%s",
+				listQueuedResp.StatusCode,
+				http.StatusOK,
+				string(body),
+			)
+		}
+		var queuedList contract.TaskRunsResponse
+		decodeHTTPJSON(t, listQueuedResp, &queuedList)
+		if len(queuedList.Runs) != 1 || queuedList.Runs[0].ID != queued.Run.ID {
+			t.Fatalf("queued runs = %#v, want queued run", queuedList.Runs)
+		}
+
+		startResp := mustHTTPRequest(
+			t,
+			runtime.client,
+			http.MethodPost,
+			mustURL(runtime.host, runtime.port, "/api/task-runs/"+queued.Run.ID+"/start"),
+			[]byte(`{"idempotency_key":"start-1"}`),
+			nil,
+		)
+		if startResp.StatusCode != http.StatusOK {
+			body := readAndCloseHTTPBody(t, startResp)
+			t.Fatalf("start run status = %d, want %d; body=%s", startResp.StatusCode, http.StatusOK, string(body))
+		}
+		var started contract.TaskRunResponse
+		decodeHTTPJSON(t, startResp, &started)
+		if started.Run.Status != taskpkg.TaskRunStatusRunning {
+			t.Fatalf("started status = %q, want %q", started.Run.Status, taskpkg.TaskRunStatusRunning)
+		}
+		if started.Run.SessionID == "" {
+			t.Fatal("expected started run session id")
+		}
+
+		completeResp := mustHTTPRequest(
+			t,
+			runtime.client,
+			http.MethodPost,
+			mustURL(runtime.host, runtime.port, "/api/task-runs/"+queued.Run.ID+"/complete"),
+			[]byte(`{"result":{"ok":true}}`),
+			nil,
+		)
+		if completeResp.StatusCode != http.StatusOK {
+			body := readAndCloseHTTPBody(t, completeResp)
+			t.Fatalf("complete run status = %d, want %d; body=%s", completeResp.StatusCode, http.StatusOK, string(body))
+		}
+		var completed contract.TaskRunResponse
+		decodeHTTPJSON(t, completeResp, &completed)
+		if completed.Run.Status != taskpkg.TaskRunStatusCompleted {
+			t.Fatalf("completed status = %q, want %q", completed.Run.Status, taskpkg.TaskRunStatusCompleted)
+		}
+	})
+
+	t.Run("Should attach a claimed run session and then fail it", func(t *testing.T) {
+		t.Parallel()
+
+		runtime := newIntegrationRuntime(t)
+		created := createIntegrationTask(
+			t,
+			runtime,
+			[]byte(`{"scope":"workspace","workspace":"ws-workspace","title":"Run task routes"}`),
+		)
+		run := enqueueIntegrationTaskRun(t, runtime, created.ID, `{"idempotency_key":"enqueue-2"}`)
+		attachResp := mustHTTPRequest(
+			t,
+			runtime.client,
+			http.MethodPost,
+			mustURL(runtime.host, runtime.port, "/api/task-runs/"+run.ID+"/attach-session"),
+			[]byte(`{"session_id":"sess-resume-1"}`),
+			nil,
+		)
+		if attachResp.StatusCode != http.StatusOK {
+			body := readAndCloseHTTPBody(t, attachResp)
+			t.Fatalf(
+				"attach run session status = %d, want %d; body=%s",
+				attachResp.StatusCode,
+				http.StatusOK,
+				string(body),
+			)
+		}
+		var attached contract.TaskRunResponse
+		decodeHTTPJSON(t, attachResp, &attached)
+		if attached.Run.Status != taskpkg.TaskRunStatusStarting {
+			t.Fatalf("attached status = %q, want %q", attached.Run.Status, taskpkg.TaskRunStatusStarting)
+		}
+		if attached.Run.SessionID != "sess-resume-1" {
+			t.Fatalf("attached session_id = %q, want %q", attached.Run.SessionID, "sess-resume-1")
+		}
+
+		failResp := mustHTTPRequest(
+			t,
+			runtime.client,
+			http.MethodPost,
+			mustURL(runtime.host, runtime.port, "/api/task-runs/"+run.ID+"/fail"),
+			[]byte(`{"error":"boom","metadata":{"step":"attach"}}`),
+			nil,
+		)
+		if failResp.StatusCode != http.StatusOK {
+			body := readAndCloseHTTPBody(t, failResp)
+			t.Fatalf("fail run status = %d, want %d; body=%s", failResp.StatusCode, http.StatusOK, string(body))
+		}
+		var failed contract.TaskRunResponse
+		decodeHTTPJSON(t, failResp, &failed)
+		if failed.Run.Status != taskpkg.TaskRunStatusFailed {
+			t.Fatalf("failed status = %q, want %q", failed.Run.Status, taskpkg.TaskRunStatusFailed)
+		}
+	})
+
+	t.Run("Should cancel one queued task run", func(t *testing.T) {
+		t.Parallel()
+
+		runtime := newIntegrationRuntime(t)
+		created := createIntegrationTask(
+			t,
+			runtime,
+			[]byte(`{"scope":"workspace","workspace":"ws-workspace","title":"Run task routes"}`),
+		)
+		run := enqueueIntegrationTaskRun(t, runtime, created.ID, `{"idempotency_key":"enqueue-3"}`)
+
+		cancelResp := mustHTTPRequest(
+			t,
+			runtime.client,
+			http.MethodPost,
+			mustURL(runtime.host, runtime.port, "/api/task-runs/"+run.ID+"/cancel"),
+			[]byte(`{"reason":"operator cancelled"}`),
+			nil,
+		)
+		if cancelResp.StatusCode != http.StatusOK {
+			body := readAndCloseHTTPBody(t, cancelResp)
+			t.Fatalf("cancel run status = %d, want %d; body=%s", cancelResp.StatusCode, http.StatusOK, string(body))
+		}
+		var cancelled contract.TaskRunResponse
+		decodeHTTPJSON(t, cancelResp, &cancelled)
+		if cancelled.Run.Status != taskpkg.TaskRunStatusCanceled {
+			t.Fatalf("cancelled status = %q, want %q", cancelled.Run.Status, taskpkg.TaskRunStatusCanceled)
+		}
+
+		finalRunsResp := mustHTTPRequest(
+			t,
+			runtime.client,
+			http.MethodGet,
+			mustURL(runtime.host, runtime.port, "/api/tasks/"+created.ID+"/runs"),
+			nil,
+			nil,
+		)
+		if finalRunsResp.StatusCode != http.StatusOK {
+			body := readAndCloseHTTPBody(t, finalRunsResp)
+			t.Fatalf(
+				"final list runs status = %d, want %d; body=%s",
+				finalRunsResp.StatusCode,
+				http.StatusOK,
+				string(body),
+			)
+		}
+		var finalRuns contract.TaskRunsResponse
+		decodeHTTPJSON(t, finalRunsResp, &finalRuns)
+		if len(finalRuns.Runs) != 1 || finalRuns.Runs[0].Status != taskpkg.TaskRunStatusCanceled {
+			t.Fatalf("final runs = %#v, want one cancelled run", finalRuns.Runs)
+		}
+	})
+}
+
+func TestHTTPTaskPublishRunDetailAndLiveRoutesRoundTrip(t *testing.T) {
+	runtime := newIntegrationRuntime(t)
+
+	draft := createIntegrationTask(t, runtime, []byte(`{
+		"scope":"global",
+		"title":"Draft live task routes",
+		"draft":true
+	}`))
+	if draft.Status != taskpkg.TaskStatusDraft {
+		t.Fatalf("draft status = %q, want %q", draft.Status, taskpkg.TaskStatusDraft)
+	}
+
+	publishResp := mustHTTPRequest(
+		t,
+		runtime.client,
+		http.MethodPost,
+		mustURL(runtime.host, runtime.port, "/api/tasks/"+draft.ID+"/publish"),
+		[]byte(`{"idempotency_key":"publish-live-1"}`),
+		nil,
+	)
+	if publishResp.StatusCode != http.StatusOK {
+		body := readAndCloseHTTPBody(t, publishResp)
+		t.Fatalf("publish task status = %d, want %d; body=%s", publishResp.StatusCode, http.StatusOK, string(body))
+	}
+	var published contract.TaskExecutionResponse
+	decodeHTTPJSON(t, publishResp, &published)
+	if published.Task.Status != taskpkg.TaskStatusReady {
+		t.Fatalf("published status = %q, want %q", published.Task.Status, taskpkg.TaskStatusReady)
+	}
+	if published.Run.Status != taskpkg.TaskRunStatusQueued {
+		t.Fatalf("published run status = %q, want %q", published.Run.Status, taskpkg.TaskRunStatusQueued)
+	}
+
+	run := published.Run
+	startResp := mustHTTPRequest(
+		t,
+		runtime.client,
+		http.MethodPost,
+		mustURL(runtime.host, runtime.port, "/api/task-runs/"+run.ID+"/start"),
+		[]byte(`{"idempotency_key":"start-live-1"}`),
+		nil,
+	)
+	if startResp.StatusCode != http.StatusOK {
+		body := readAndCloseHTTPBody(t, startResp)
+		t.Fatalf("start run status = %d, want %d; body=%s", startResp.StatusCode, http.StatusOK, string(body))
+	}
+	var started contract.TaskRunResponse
+	decodeHTTPJSON(t, startResp, &started)
+	if started.Run.Status != taskpkg.TaskRunStatusRunning {
+		t.Fatalf("started run status = %q, want %q", started.Run.Status, taskpkg.TaskRunStatusRunning)
+	}
+
+	runDetailResp := mustHTTPRequest(
+		t,
+		runtime.client,
+		http.MethodGet,
+		mustURL(runtime.host, runtime.port, "/api/task-runs/"+run.ID),
+		nil,
+		nil,
+	)
+	if runDetailResp.StatusCode != http.StatusOK {
+		body := readAndCloseHTTPBody(t, runDetailResp)
+		t.Fatalf("run detail status = %d, want %d; body=%s", runDetailResp.StatusCode, http.StatusOK, string(body))
+	}
+	var runDetail contract.TaskRunDetailResponse
+	decodeHTTPJSON(t, runDetailResp, &runDetail)
+	if runDetail.Run.Run.ID != run.ID {
+		t.Fatalf("run detail run id = %q, want %q", runDetail.Run.Run.ID, run.ID)
+	}
+	if runDetail.Run.Task.ID != draft.ID {
+		t.Fatalf("run detail task id = %q, want %q", runDetail.Run.Task.ID, draft.ID)
+	}
+
+	timelineResp := mustHTTPRequest(
+		t,
+		runtime.client,
+		http.MethodGet,
+		mustURL(runtime.host, runtime.port, "/api/tasks/"+draft.ID+"/timeline?limit=20"),
+		nil,
+		nil,
+	)
+	if timelineResp.StatusCode != http.StatusOK {
+		body := readAndCloseHTTPBody(t, timelineResp)
+		t.Fatalf("timeline status = %d, want %d; body=%s", timelineResp.StatusCode, http.StatusOK, string(body))
+	}
+	var timeline contract.TaskTimelineResponse
+	decodeHTTPJSON(t, timelineResp, &timeline)
+	if len(timeline.Timeline) == 0 {
+		t.Fatal("timeline = empty, want task activity")
+	}
+	foundRunTimeline := false
+	for _, item := range timeline.Timeline {
+		if item.Task.ID != draft.ID {
+			t.Fatalf("timeline task id = %q, want %q", item.Task.ID, draft.ID)
+		}
+		if item.Run != nil && item.Run.ID == run.ID {
+			foundRunTimeline = true
+		}
+	}
+	if !foundRunTimeline {
+		t.Fatalf("timeline = %#v, want run %q in at least one item", timeline.Timeline, run.ID)
+	}
+
+	treeResp := mustHTTPRequest(
+		t,
+		runtime.client,
+		http.MethodGet,
+		mustURL(runtime.host, runtime.port, "/api/tasks/"+draft.ID+"/tree"),
+		nil,
+		nil,
+	)
+	if treeResp.StatusCode != http.StatusOK {
+		body := readAndCloseHTTPBody(t, treeResp)
+		t.Fatalf("tree status = %d, want %d; body=%s", treeResp.StatusCode, http.StatusOK, string(body))
+	}
+	var tree contract.TaskTreeResponse
+	decodeHTTPJSON(t, treeResp, &tree)
+	if tree.Tree.Root.Task.ID != draft.ID {
+		t.Fatalf("tree root id = %q, want %q", tree.Tree.Root.Task.ID, draft.ID)
+	}
+
+	streamResp := mustHTTPRequest(
+		t,
+		runtime.client,
+		http.MethodGet,
+		mustURL(runtime.host, runtime.port, "/api/tasks/"+draft.ID+"/stream?after_sequence=0"),
+		nil,
+		nil,
+	)
+	if streamResp.StatusCode != http.StatusOK {
+		body := readAndCloseHTTPBody(t, streamResp)
+		t.Fatalf("task stream status = %d, want %d; body=%s", streamResp.StatusCode, http.StatusOK, string(body))
+	}
+	if got := streamResp.Header.Get("Content-Type"); !strings.HasPrefix(got, "text/event-stream") {
+		closeHTTPBody(t, streamResp.Body)
+		t.Fatalf("task stream content-type = %q, want text/event-stream", got)
+	}
+	records := collectLiveSSE(t, streamResp.Body, 1, 2*time.Second)
+	if len(records) == 0 {
+		t.Fatal("task stream records = 0, want at least one SSE event")
+	}
+	if records[0].Event != "" {
+		t.Fatalf("task stream first record = %#v, want payload-owned event identity", records[0])
+	}
+	var streamPayload contract.TaskStreamEventPayload
+	if err := json.Unmarshal(records[0].Data, &streamPayload); err != nil {
+		t.Fatalf("json.Unmarshal(task stream event) error = %v; record=%#v", err, records[0])
+	}
+	if streamPayload.Type != "task.created" {
+		t.Fatalf("task stream payload type = %q, want task.created", streamPayload.Type)
+	}
+	if streamPayload.Timeline.Task.ID != draft.ID {
+		t.Fatalf("task stream timeline task id = %q, want %q", streamPayload.Timeline.Task.ID, draft.ID)
+	}
+}
+
+func TestHTTPTaskDashboardInboxApprovalAndTriageRoutesRoundTrip(t *testing.T) {
+	runtime := newIntegrationRuntime(t)
+
+	approvalTask := createIntegrationTask(t, runtime, []byte(`{
+		"scope":"global",
+		"title":"Needs approval",
+		"approval_policy":"manual"
+	}`))
+	if approvalTask.ApprovalState != taskpkg.ApprovalStatePending {
+		t.Fatalf("approval task approval_state = %q, want %q", approvalTask.ApprovalState, taskpkg.ApprovalStatePending)
+	}
+
+	rejectTask := createIntegrationTask(t, runtime, []byte(`{
+		"scope":"global",
+		"title":"Reject me",
+		"approval_policy":"manual"
+	}`))
+	triageTask := createIntegrationTask(t, runtime, []byte(`{
+		"scope":"global",
+		"title":"Archive me"
+	}`))
+	dismissTask := createIntegrationTask(t, runtime, []byte(`{
+		"scope":"global",
+		"title":"Dismiss me"
+	}`))
+
+	dashboardResp := mustHTTPRequest(
+		t,
+		runtime.client,
+		http.MethodGet,
+		mustURL(runtime.host, runtime.port, "/api/observe/tasks/dashboard"),
+		nil,
+		nil,
+	)
+	if dashboardResp.StatusCode != http.StatusOK {
+		body := readAndCloseHTTPBody(t, dashboardResp)
+		t.Fatalf("dashboard status = %d, want %d; body=%s", dashboardResp.StatusCode, http.StatusOK, string(body))
+	}
+	var dashboard contract.TaskDashboardResponse
+	decodeHTTPJSON(t, dashboardResp, &dashboard)
+	if dashboard.Dashboard.Totals.TasksTotal < 4 {
+		t.Fatalf("dashboard tasks_total = %d, want at least 4", dashboard.Dashboard.Totals.TasksTotal)
+	}
+	if dashboard.Dashboard.Totals.AwaitingApprovalTasks < 2 {
+		t.Fatalf(
+			"dashboard awaiting_approval_tasks = %d, want at least 2",
+			dashboard.Dashboard.Totals.AwaitingApprovalTasks,
+		)
+	}
+
+	inboxResp := mustHTTPRequest(
+		t,
+		runtime.client,
+		http.MethodGet,
+		mustURL(runtime.host, runtime.port, "/api/observe/tasks/inbox?lane=approvals&limit=10"),
+		nil,
+		nil,
+	)
+	if inboxResp.StatusCode != http.StatusOK {
+		body := readAndCloseHTTPBody(t, inboxResp)
+		t.Fatalf("inbox approvals status = %d, want %d; body=%s", inboxResp.StatusCode, http.StatusOK, string(body))
+	}
+	var inbox contract.TaskInboxResponse
+	decodeHTTPJSON(t, inboxResp, &inbox)
+	approvalsGroup := requireHTTPInboxGroup(t, inbox.Inbox.Groups, contract.TaskInboxLaneApprovals)
+	if approvalsGroup.Count < 2 {
+		t.Fatalf("approvals count = %d, want at least 2", approvalsGroup.Count)
+	}
+	if !httpInboxGroupHasTask(approvalsGroup, approvalTask.ID) ||
+		!httpInboxGroupHasTask(approvalsGroup, rejectTask.ID) {
+		t.Fatalf("approvals group items = %#v, want approval and reject tasks", approvalsGroup.Items)
+	}
+
+	approveBody := []byte(`{"idempotency_key":"approve-approval-task"}`)
+	approveResp := mustHTTPRequest(
+		t,
+		runtime.client,
+		http.MethodPost,
+		mustURL(runtime.host, runtime.port, "/api/tasks/"+approvalTask.ID+"/approve"),
+		approveBody,
+		nil,
+	)
+	if approveResp.StatusCode != http.StatusCreated {
+		body := readAndCloseHTTPBody(t, approveResp)
+		t.Fatalf("approve status = %d, want %d; body=%s", approveResp.StatusCode, http.StatusCreated, string(body))
+	}
+	var approved contract.TaskExecutionResponse
+	decodeHTTPJSON(t, approveResp, &approved)
+	if approved.Task.ApprovalState != taskpkg.ApprovalStateApproved {
+		t.Fatalf("approved approval_state = %q, want %q", approved.Task.ApprovalState, taskpkg.ApprovalStateApproved)
+	}
+	if approved.Run.Status != taskpkg.TaskRunStatusQueued {
+		t.Fatalf("approved run status = %q, want %q", approved.Run.Status, taskpkg.TaskRunStatusQueued)
+	}
+
+	approveAgainResp := mustHTTPRequest(
+		t,
+		runtime.client,
+		http.MethodPost,
+		mustURL(runtime.host, runtime.port, "/api/tasks/"+approvalTask.ID+"/approve"),
+		approveBody,
+		nil,
+	)
+	if approveAgainResp.StatusCode != http.StatusCreated {
+		body := readAndCloseHTTPBody(t, approveAgainResp)
+		t.Fatalf(
+			"approve again status = %d, want %d; body=%s",
+			approveAgainResp.StatusCode,
+			http.StatusCreated,
+			string(body),
+		)
+	}
+	var approvedAgain contract.TaskExecutionResponse
+	decodeHTTPJSON(t, approveAgainResp, &approvedAgain)
+	if approvedAgain.Run.ID != approved.Run.ID {
+		t.Fatalf("approve again run id = %q, want %q", approvedAgain.Run.ID, approved.Run.ID)
+	}
+
+	rejectResp := mustHTTPRequest(
+		t,
+		runtime.client,
+		http.MethodPost,
+		mustURL(runtime.host, runtime.port, "/api/tasks/"+rejectTask.ID+"/reject"),
+		nil,
+		nil,
+	)
+	if rejectResp.StatusCode != http.StatusOK {
+		body := readAndCloseHTTPBody(t, rejectResp)
+		t.Fatalf("reject status = %d, want %d; body=%s", rejectResp.StatusCode, http.StatusOK, string(body))
+	}
+	var rejected contract.TaskResponse
+	decodeHTTPJSON(t, rejectResp, &rejected)
+	if rejected.Task.ApprovalState != taskpkg.ApprovalStateRejected {
+		t.Fatalf("rejected approval_state = %q, want %q", rejected.Task.ApprovalState, taskpkg.ApprovalStateRejected)
+	}
+
+	readResp := mustHTTPRequest(
+		t,
+		runtime.client,
+		http.MethodPost,
+		mustURL(runtime.host, runtime.port, "/api/tasks/"+triageTask.ID+"/triage/read"),
+		nil,
+		nil,
+	)
+	if readResp.StatusCode != http.StatusOK {
+		body := readAndCloseHTTPBody(t, readResp)
+		t.Fatalf("triage read status = %d, want %d; body=%s", readResp.StatusCode, http.StatusOK, string(body))
+	}
+	var readState contract.TaskTriageStateResponse
+	decodeHTTPJSON(t, readResp, &readState)
+	if !readState.Triage.Read {
+		t.Fatalf("triage read payload = %#v, want read=true", readState.Triage)
+	}
+
+	archiveResp := mustHTTPRequest(
+		t,
+		runtime.client,
+		http.MethodPost,
+		mustURL(runtime.host, runtime.port, "/api/tasks/"+triageTask.ID+"/triage/archive"),
+		nil,
+		nil,
+	)
+	if archiveResp.StatusCode != http.StatusOK {
+		body := readAndCloseHTTPBody(t, archiveResp)
+		t.Fatalf("triage archive status = %d, want %d; body=%s", archiveResp.StatusCode, http.StatusOK, string(body))
+	}
+	var archived contract.TaskTriageStateResponse
+	decodeHTTPJSON(t, archiveResp, &archived)
+	if !archived.Triage.Archived {
+		t.Fatalf("triage archive payload = %#v, want archived=true", archived.Triage)
+	}
+
+	dismissResp := mustHTTPRequest(
+		t,
+		runtime.client,
+		http.MethodPost,
+		mustURL(runtime.host, runtime.port, "/api/tasks/"+dismissTask.ID+"/triage/dismiss"),
+		nil,
+		nil,
+	)
+	if dismissResp.StatusCode != http.StatusOK {
+		body := readAndCloseHTTPBody(t, dismissResp)
+		t.Fatalf("triage dismiss status = %d, want %d; body=%s", dismissResp.StatusCode, http.StatusOK, string(body))
+	}
+	var dismissed contract.TaskTriageStateResponse
+	decodeHTTPJSON(t, dismissResp, &dismissed)
+	if !dismissed.Triage.Dismissed {
+		t.Fatalf("triage dismiss payload = %#v, want dismissed=true", dismissed.Triage)
+	}
+
+	readMissingResp := mustHTTPRequest(
+		t,
+		runtime.client,
+		http.MethodPost,
+		mustURL(runtime.host, runtime.port, "/api/tasks/task-missing/triage/read"),
+		nil,
+		nil,
+	)
+	if readMissingResp.StatusCode != http.StatusNotFound {
+		body := readAndCloseHTTPBody(t, readMissingResp)
+		t.Fatalf(
+			"triage read missing status = %d, want %d; body=%s",
+			readMissingResp.StatusCode,
+			http.StatusNotFound,
+			string(body),
+		)
+	}
+	closeHTTPBody(t, readMissingResp.Body)
+
+	inboxAfterResp := mustHTTPRequest(
+		t,
+		runtime.client,
+		http.MethodGet,
+		mustURL(runtime.host, runtime.port, "/api/observe/tasks/inbox?lane=approvals&limit=10"),
+		nil,
+		nil,
+	)
+	if inboxAfterResp.StatusCode != http.StatusOK {
+		body := readAndCloseHTTPBody(t, inboxAfterResp)
+		t.Fatalf(
+			"inbox approvals after actions status = %d, want %d; body=%s",
+			inboxAfterResp.StatusCode,
+			http.StatusOK,
+			string(body),
+		)
+	}
+	var inboxAfter contract.TaskInboxResponse
+	decodeHTTPJSON(t, inboxAfterResp, &inboxAfter)
+	if got := requireHTTPInboxGroup(t, inboxAfter.Inbox.Groups, contract.TaskInboxLaneApprovals).Count; got != 0 {
+		t.Fatalf("approvals count after approve/reject = %d, want 0", got)
+	}
+
+	archivedInboxResp := mustHTTPRequest(
+		t,
+		runtime.client,
+		http.MethodGet,
+		mustURL(runtime.host, runtime.port, "/api/observe/tasks/inbox?lane=archived&limit=10"),
+		nil,
+		nil,
+	)
+	if archivedInboxResp.StatusCode != http.StatusOK {
+		body := readAndCloseHTTPBody(t, archivedInboxResp)
+		t.Fatalf(
+			"inbox archived status = %d, want %d; body=%s",
+			archivedInboxResp.StatusCode,
+			http.StatusOK,
+			string(body),
+		)
+	}
+	var archivedInbox contract.TaskInboxResponse
+	decodeHTTPJSON(t, archivedInboxResp, &archivedInbox)
+	if !httpInboxGroupHasTask(
+		requireHTTPInboxGroup(t, archivedInbox.Inbox.Groups, contract.TaskInboxLaneArchived),
+		triageTask.ID,
+	) {
+		t.Fatalf("archived inbox groups = %#v, want task %q", archivedInbox.Inbox.Groups, triageTask.ID)
+	}
+}
+
+type integrationRuntime struct {
+	client              *http.Client
+	server              *Server
+	manager             *session.Manager
+	tasks               *taskpkg.Service
+	driver              *integrationDriver
+	observer            *observe.Observer
+	registry            *globaldb.GlobalDB
+	streamSubscriptions *integrationStreamSubscriptionRecorder
+	host                string
+	port                int
+	workspace           string
+}
+
+type integrationTaskSessionExecutor struct {
+	mu      sync.Mutex
+	started int
+}
+
+func (e *integrationTaskSessionExecutor) StartTaskSession(
+	_ context.Context,
+	_ *taskpkg.StartTaskSession,
+) (*taskpkg.SessionRef, error) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	e.started++
+	return &taskpkg.SessionRef{SessionID: fmt.Sprintf("task-sess-%d", e.started)}, nil
+}
+
+func (*integrationTaskSessionExecutor) AttachTaskSession(
+	_ context.Context,
+	_ string,
+	sessionID string,
+) (*taskpkg.SessionRef, error) {
+	return &taskpkg.SessionRef{SessionID: sessionID}, nil
+}
+
+func (*integrationTaskSessionExecutor) RequestTaskStop(context.Context, string, taskpkg.StopReason) error {
+	return nil
+}
+
+func (*integrationTaskSessionExecutor) ForceTaskStop(context.Context, string, taskpkg.StopReason) error {
+	return nil
+}
+
+type integrationNotifierFanout struct {
+	notifiers []session.Notifier
+}
+
+type integrationStreamSubscriptionRecorder struct {
+	mu      sync.Mutex
+	counts  map[string]uint64
+	changed chan struct{}
+}
+
+func newIntegrationStreamSubscriptionRecorder() *integrationStreamSubscriptionRecorder {
+	return &integrationStreamSubscriptionRecorder{
+		counts:  make(map[string]uint64),
+		changed: make(chan struct{}),
+	}
+}
+
+func (*integrationStreamSubscriptionRecorder) OnSessionCreated(context.Context, *session.Session) {}
+
+func (*integrationStreamSubscriptionRecorder) OnSessionStopped(context.Context, *session.Session) {}
+
+func (r *integrationStreamSubscriptionRecorder) OnAgentEvent(
+	_ context.Context,
+	sessionID string,
+	payload any,
+) {
+	event, ok := payload.(acp.AgentEvent)
+	if !ok || event.Type != eventspkg.SessionStreamSubscribed {
+		return
+	}
+
+	r.mu.Lock()
+	r.counts[sessionID]++
+	close(r.changed)
+	r.changed = make(chan struct{})
+	r.mu.Unlock()
+}
+
+func (r *integrationStreamSubscriptionRecorder) count(sessionID string) uint64 {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.counts[sessionID]
+}
+
+func (r *integrationStreamSubscriptionRecorder) waitFor(t *testing.T, sessionID string, after uint64) {
+	t.Helper()
+
+	ctx, cancel := context.WithTimeout(t.Context(), 2*time.Second)
+	defer cancel()
+	for {
+		r.mu.Lock()
+		count := r.counts[sessionID]
+		changed := r.changed
+		r.mu.Unlock()
+		if count > after {
+			return
+		}
+		select {
+		case <-changed:
+		case <-ctx.Done():
+			t.Fatalf(
+				"timed out waiting for stream subscription for session %q after %d subscriptions: %v",
+				sessionID,
+				after,
+				ctx.Err(),
+			)
+		}
+	}
+}
+
+func (f *integrationNotifierFanout) OnSessionCreated(ctx context.Context, sess *session.Session) {
+	for _, notifier := range f.notifiers {
+		notifier.OnSessionCreated(ctx, sess)
+	}
+}
+
+func (f *integrationNotifierFanout) OnSessionStopped(ctx context.Context, sess *session.Session) {
+	for _, notifier := range f.notifiers {
+		notifier.OnSessionStopped(ctx, sess)
+	}
+}
+
+func (f *integrationNotifierFanout) OnAgentEvent(ctx context.Context, sessionID string, event any) {
+	for _, notifier := range f.notifiers {
+		notifier.OnAgentEvent(ctx, sessionID, event)
+	}
+}
+
+type integrationDriver struct {
+	mu             sync.Mutex
+	nextPID        int
+	nextSess       int
+	permissionWait time.Duration
+	promptHook     func(proc *session.AgentProcess, req acp.PromptRequest) (<-chan acp.AgentEvent, error)
+	states         map[*session.AgentProcess]chan struct{}
+	approvals      map[*session.AgentProcess]chan acp.ApproveRequest
+	waitErrs       map[*session.AgentProcess]error
+	bySessionID    map[string]*session.AgentProcess
+}
+
+func newIntegrationDriver(permissionWait time.Duration) *integrationDriver {
+	return &integrationDriver{
+		nextPID:        2000,
+		nextSess:       1,
+		permissionWait: permissionWait,
+		states:         make(map[*session.AgentProcess]chan struct{}),
+		approvals:      make(map[*session.AgentProcess]chan acp.ApproveRequest),
+		waitErrs:       make(map[*session.AgentProcess]error),
+		bySessionID:    make(map[string]*session.AgentProcess),
+	}
+}
+
+func (d *integrationDriver) Start(_ context.Context, opts acp.StartOpts) (*session.AgentProcess, error) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+
+	d.nextPID++
+	d.nextSess++
+	done := make(chan struct{})
+	sessionID := strings.TrimSpace(opts.ResumeSessionID)
+	if sessionID == "" {
+		sessionID = fmt.Sprintf("acp-session-%d", d.nextSess)
+	}
+
+	var proc *session.AgentProcess
+	proc = session.NewAgentProcess(session.AgentProcessOptions{
+		PID:       d.nextPID,
+		AgentName: opts.AgentName,
+		Command:   opts.Command,
+		Cwd:       opts.Cwd,
+		SessionID: sessionID,
+		Caps: acp.Caps{
+			SupportsLoadSession: true,
+		},
+		StartedAt: time.Now().UTC(),
+		Done:      done,
+		Wait: func() error {
+			<-done
+			d.mu.Lock()
+			defer d.mu.Unlock()
+
+			err := d.waitErrs[proc]
+			delete(d.waitErrs, proc)
+			delete(d.states, proc)
+			delete(d.approvals, proc)
+			delete(d.bySessionID, proc.SessionID)
+			return err
+		},
+		ApprovePermission: func(ctx context.Context, req acp.ApproveRequest) error {
+			d.mu.Lock()
+			approvalCh := d.approvals[proc]
+			d.mu.Unlock()
+			if approvalCh == nil {
+				return session.ErrPendingPermissionNotFound
+			}
+
+			select {
+			case approvalCh <- req:
+				return nil
+			case <-ctx.Done():
+				return ctx.Err()
+			}
+		},
+	})
+	d.states[proc] = done
+	d.bySessionID[proc.SessionID] = proc
+	return proc, nil
+}
+
+func (d *integrationDriver) Prompt(
+	ctx context.Context,
+	proc *session.AgentProcess,
+	req acp.PromptRequest,
+) (<-chan acp.AgentEvent, error) {
+	d.mu.Lock()
+	hook := d.promptHook
+	d.mu.Unlock()
+	if hook != nil {
+		return hook(proc, req)
+	}
+
+	if strings.Contains(req.Message, "request permission") {
+		events := make(chan acp.AgentEvent, 6)
+		requestID := req.TurnID + ":tool-1"
+		approvalCh := make(chan acp.ApproveRequest, 1)
+
+		d.mu.Lock()
+		d.approvals[proc] = approvalCh
+		d.mu.Unlock()
+
+		go func() {
+			defer close(events)
+			defer func() {
+				d.mu.Lock()
+				delete(d.approvals, proc)
+				d.mu.Unlock()
+			}()
+
+			raw := mustIntegrationJSON(tPermissionRaw(requestID))
+			ts := time.Now().UTC()
+			events <- (acp.AgentEvent{
+				Type:       "permission",
+				SessionID:  proc.SessionID,
+				TurnID:     req.TurnID,
+				Timestamp:  ts,
+				Title:      "permission request",
+				ToolCallID: "tool-1",
+				Action:     "session/request_permission",
+				Resource:   "/tmp/demo.txt",
+				Raw:        raw,
+			}).WithRequestID(requestID)
+
+			var permissionTimeout <-chan time.Time
+			var permissionTimer *time.Timer
+			if d.permissionWait > 0 {
+				permissionTimer = time.NewTimer(d.permissionWait)
+				permissionTimeout = permissionTimer.C
+				defer permissionTimer.Stop()
+			}
+
+			finalDecision := "reject-once"
+			select {
+			case approval := <-approvalCh:
+				finalDecision = approval.Decision
+			case <-permissionTimeout:
+			case <-ctx.Done():
+				return
+			}
+
+			ts = time.Now().UTC()
+			events <- (acp.AgentEvent{
+				Type:       "permission",
+				SessionID:  proc.SessionID,
+				TurnID:     req.TurnID,
+				Timestamp:  ts,
+				Title:      "permission request",
+				ToolCallID: "tool-1",
+				Action:     "session/request_permission",
+				Resource:   "/tmp/demo.txt",
+				Decision:   finalDecision,
+				Raw:        mustIntegrationJSON(tPermissionRawWithDecision(requestID, finalDecision)),
+			}).WithRequestID(requestID)
+			events <- acp.AgentEvent{
+				Type:      "agent_message",
+				SessionID: proc.SessionID,
+				TurnID:    req.TurnID,
+				Timestamp: ts,
+				Text:      finalDecision,
+			}
+			events <- acp.AgentEvent{
+				Type:       "done",
+				SessionID:  proc.SessionID,
+				TurnID:     req.TurnID,
+				Timestamp:  ts,
+				StopReason: "end_turn",
+			}
+		}()
+		return events, nil
+	}
+
+	ch := make(chan acp.AgentEvent, 4)
+	ch <- acp.AgentEvent{
+		Type:      "agent_message",
+		SessionID: proc.SessionID,
+		TurnID:    req.TurnID,
+		Timestamp: time.Now().UTC(),
+		Text:      req.Message,
+	}
+	ch <- acp.AgentEvent{
+		Type:       "tool_call",
+		SessionID:  proc.SessionID,
+		TurnID:     req.TurnID,
+		Timestamp:  time.Now().UTC(),
+		Title:      "read_file",
+		ToolCallID: "call-1",
+	}
+	ch <- acp.AgentEvent{
+		Type:       "tool_result",
+		SessionID:  proc.SessionID,
+		TurnID:     req.TurnID,
+		Timestamp:  time.Now().UTC(),
+		ToolCallID: "call-1",
+	}
+	ch <- acp.AgentEvent{
+		Type:       "done",
+		SessionID:  proc.SessionID,
+		TurnID:     req.TurnID,
+		Timestamp:  time.Now().UTC(),
+		StopReason: "end_turn",
+	}
+	close(ch)
+	return ch, nil
+}
+
+func countSessionEventsByType(events []store.SessionEvent, want string) int {
+	count := 0
+	for _, event := range events {
+		if event.Type == want {
+			count++
+		}
+	}
+	return count
+}
+
+func (*integrationDriver) VerifyExit(proc *session.AgentProcess) (bool, error) {
+	select {
+	case <-proc.Done():
+		return true, nil
+	default:
+		return false, nil
+	}
+}
+
+func (d *integrationDriver) Cancel(context.Context, *session.AgentProcess) error {
+	return nil
+}
+
+func (d *integrationDriver) Stop(_ context.Context, proc *session.AgentProcess) error {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+
+	done, ok := d.states[proc]
+	if !ok {
+		return nil
+	}
+	select {
+	case <-done:
+	default:
+		close(done)
+	}
+	return nil
+}
+
+func (d *integrationDriver) Crash(acpSessionID string, waitErr error) error {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+
+	proc := d.bySessionID[strings.TrimSpace(acpSessionID)]
+	if proc == nil {
+		return fmt.Errorf("integration driver: session %q not found", acpSessionID)
+	}
+	done := d.states[proc]
+	if done == nil {
+		return fmt.Errorf("integration driver: runtime for session %q not found", acpSessionID)
+	}
+	if waitErr == nil {
+		waitErr = errors.New("integration crash")
+	}
+	d.waitErrs[proc] = waitErr
+	select {
+	case <-done:
+	default:
+		close(done)
+	}
+	return nil
+}
+
+func newIntegrationRuntime(t *testing.T) integrationRuntime {
+	return newIntegrationRuntimeWithPermissionWait(t, 100*time.Millisecond)
+}
+
+func newIntegrationRuntimeWithPermissionWait(t *testing.T, permissionWait time.Duration) integrationRuntime {
+	t.Helper()
+
+	homePaths := newTestHomePaths(t)
+	e2etest.WriteAgentDef(
+		t,
+		homePaths,
+		e2etest.AgentSeed{Name: "coder", Provider: "codex", Permissions: "approve-reads", Prompt: "You are coder."},
+	)
+
+	workspace := t.TempDir()
+	cfg := compozyconfig.DefaultWithHome(homePaths)
+	cfg.HTTP.Host = "127.0.0.1"
+	cfg.HTTP.Port = freeTCPPort(t)
+	cfg.Providers = map[string]compozyconfig.ProviderConfig{
+		"codex": {Command: "fake-agent"},
+	}
+	// Profile-aware resolution reads the fixture's actual home configuration.
+	if err := os.WriteFile(
+		homePaths.ConfigFile,
+		[]byte("[providers.codex]\ncommand = \"fake-agent\"\n"),
+		0o600,
+	); err != nil {
+		t.Fatalf("write integration provider config: %v", err)
+	}
+
+	registry, err := globaldb.OpenGlobalDB(t.Context(), homePaths.DatabaseFile)
+	if err != nil {
+		t.Fatalf("OpenGlobalDB() error = %v", err)
+	}
+	t.Cleanup(func() {
+		if err := registry.Close(context.Background()); err != nil {
+			t.Errorf("registry.Close() error = %v", err)
+		}
+	})
+
+	profiles, err := profilepkg.NewManager(
+		profilepkg.WithStore(registry),
+		profilepkg.WithHomePaths(homePaths),
+		profilepkg.WithLogger(discardLogger()),
+	)
+	if err != nil {
+		t.Fatalf("profile.NewManager() error = %v", err)
+	}
+	streamSubscriptions := newIntegrationStreamSubscriptionRecorder()
+	fanout := &integrationNotifierFanout{notifiers: []session.Notifier{streamSubscriptions}}
+	resolver, err := workspacepkg.NewResolver(
+		registry,
+		workspacepkg.WithHomePaths(homePaths),
+		workspacepkg.WithOperatorHomeDir(t.TempDir()),
+		workspacepkg.WithProfileAvailabilityChecker(profiles),
+		workspacepkg.WithLogger(discardLogger()),
+		workspacepkg.WithConfigLoader(func(string) (compozyconfig.Config, error) { return cfg, nil }),
+		workspacepkg.WithProfileConfigLoader(func(root, profile string) (compozyconfig.Config, error) {
+			return compozyconfig.LoadForHome(
+				homePaths,
+				compozyconfig.WithWorkspaceRoot(root),
+				compozyconfig.WithProfile(profile),
+			)
+		}),
+	)
+	if err != nil {
+		t.Fatalf("workspace.NewResolver() error = %v", err)
+	}
+	if _, err := resolver.Register(t.Context(), workspacepkg.RegisterOptions{
+		RootDir: workspace,
+		Name:    "ws-workspace",
+	}); err != nil {
+		t.Fatalf("workspace.Register(%q) error = %v", workspace, err)
+	}
+	driver := newIntegrationDriver(permissionWait)
+
+	manager, err := session.NewManager(
+		session.WithHomePaths(homePaths),
+		session.WithWorkspaceResolver(resolver),
+		session.WithLogger(discardLogger()),
+		session.WithDriver(driver),
+		session.WithNotifier(fanout),
+		session.WithSessionCatalog(registry),
+		session.WithSessionPromptAdmissionStore(registry),
+		session.WithSessionInputQueueStore(registry),
+	)
+	if err != nil {
+		t.Fatalf("session.NewManager() error = %v", err)
+	}
+	t.Cleanup(func() {
+		ctx, cancel := context.WithTimeout(context.WithoutCancel(t.Context()), 2*time.Second)
+		defer cancel()
+		if err := manager.Shutdown(ctx); err != nil {
+			t.Errorf("manager.Shutdown() error = %v", err)
+		}
+	})
+
+	observer, err := observe.New(
+		t.Context(),
+		observe.WithHomePaths(homePaths),
+		observe.WithRegistry(registry),
+		observe.WithSessionSource(manager),
+		observe.WithLogger(discardLogger()),
+	)
+	if err != nil {
+		t.Fatalf("observe.New() error = %v", err)
+	}
+	fanout.notifiers = append(fanout.notifiers, observer)
+
+	lookupEnv := func(key string) (string, bool) {
+		value, ok := os.LookupEnv(key)
+		return value, ok && strings.TrimSpace(value) != ""
+	}
+	vaultService, err := vaultpkg.NewService(
+		registry,
+		vaultpkg.NewFileKeyProvider(homePaths.HomeDir, lookupEnv),
+		vaultpkg.WithLookupEnv(lookupEnv),
+	)
+	if err != nil {
+		t.Fatalf("vault.NewService() error = %v", err)
+	}
+
+	automationManager, err := automationpkg.New(
+		automationpkg.WithStore(registry),
+		automationpkg.WithSessions(manager),
+		automationpkg.WithWorkspaceResolver(resolver),
+		automationpkg.WithConfig(cfg.Automation),
+		automationpkg.WithLogger(discardLogger()),
+
+		automationpkg.WithWebhookSecretStore(vaultService),
+	)
+	if err != nil {
+		t.Fatalf("automation.New() error = %v", err)
+	}
+	if err := automationManager.Start(t.Context()); err != nil {
+		t.Fatalf("automationManager.Start() error = %v", err)
+	}
+	fanout.notifiers = append(fanout.notifiers, automationManager.SessionObserver())
+	t.Cleanup(func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		defer cancel()
+		if err := automationManager.Shutdown(ctx); err != nil {
+			t.Errorf("automationManager.Shutdown() error = %v", err)
+		}
+	})
+
+	taskExecutor := &integrationTaskSessionExecutor{}
+	taskManager, err := taskpkg.NewManager(
+		taskpkg.WithStore(registry),
+		taskpkg.WithSessionExecutor(taskExecutor),
+	)
+	if err != nil {
+		t.Fatalf("task.NewManager() error = %v", err)
+	}
+
+	resourceKernel, err := resources.NewKernel(registry.DB())
+	if err != nil {
+		t.Fatalf("resources.NewKernel() error = %v", err)
+	}
+	resourceService, err := core.NewOperatorResourceService(&core.ResourceServiceConfig{RawStore: resourceKernel})
+	if err != nil {
+		t.Fatalf("core.NewOperatorResourceService() error = %v", err)
+	}
+
+	server, err := New(
+		WithHomePaths(homePaths),
+		WithConfig(&cfg),
+		WithHost(cfg.HTTP.Host),
+		WithPort(cfg.HTTP.Port),
+		WithLogger(discardLogger()),
+		WithSessionManager(manager),
+		WithSessionCatalog(registry),
+		WithTaskService(taskManager),
+		WithObserver(observer),
+		WithResourceService(resourceService),
+		WithAutomation(automationManager),
+		WithVaultService(vaultService),
+		WithWorkspaceResolver(resolver),
+		WithPollInterval(10*time.Millisecond),
+	)
+	if err != nil {
+		t.Fatalf("httpapi.New() error = %v", err)
+	}
+	if err := server.Start(t.Context()); err != nil {
+		t.Fatalf("server.Start() error = %v", err)
+	}
+	t.Cleanup(func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		defer cancel()
+		if err := server.Shutdown(ctx); err != nil {
+			t.Errorf("server.Shutdown() error = %v", err)
+		}
+	})
+
+	return integrationRuntime{
+		client:              &http.Client{},
+		server:              server,
+		manager:             manager,
+		tasks:               taskManager,
+		driver:              driver,
+		observer:            observer,
+		registry:            registry,
+		streamSubscriptions: streamSubscriptions,
+		host:                cfg.HTTP.Host,
+		port:                server.Port(),
+		workspace:           workspace,
+	}
+}
+
+type permissionStreamPayload struct {
+	RequestID string `json:"request_id"`
+	Decision  string `json:"decision,omitempty"`
+}
+
+type permissionPromptStreamResult struct {
+	records []sseRecord
+	err     error
+}
+
+const permissionPromptStreamJoinTimeout = 2 * time.Second
+
+type permissionPromptStream struct {
+	cancel    context.CancelFunc
+	requestID <-chan string
+	result    <-chan permissionPromptStreamResult
+}
+
+func startPermissionPromptStream(ctx context.Context, body io.ReadCloser) permissionPromptStream {
+	streamCtx, cancel := context.WithCancel(ctx)
+	requestIDCh := make(chan string, 1)
+	resultCh := make(chan permissionPromptStreamResult, 1)
+	go streamPermissionPrompt(streamCtx, body, requestIDCh, resultCh)
+	return permissionPromptStream{
+		cancel:    cancel,
+		requestID: requestIDCh,
+		result:    resultCh,
+	}
+}
+
+func streamPermissionPrompt(
+	ctx context.Context,
+	body io.ReadCloser,
+	requestIDCh chan<- string,
+	resultCh chan<- permissionPromptStreamResult,
+) {
+	var closeOnce sync.Once
+	var closeErr error
+	closeBody := func() {
+		closeOnce.Do(func() {
+			closeErr = body.Close()
+		})
+	}
+	stopCloseOnCancel := context.AfterFunc(ctx, closeBody)
+
+	scanner := bufio.NewScanner(body)
+	records := make([]sseRecord, 0, 8)
+	current := sseRecord{}
+	requestIDSent := false
+
+	for scanner.Scan() {
+		line := scanner.Text()
+		if line == "" {
+			if current.Event != "" || current.ID != "" || len(current.Data) > 0 {
+				records = append(records, current)
+				if !requestIDSent {
+					if payload, ok := extractPermissionPayloadFromRecord(
+						current,
+					); ok && payload.Decision == "" &&
+						payload.RequestID != "" {
+						requestIDCh <- payload.RequestID
+						requestIDSent = true
+					}
+				}
+			}
+			current = sseRecord{}
+			continue
+		}
+		switch {
+		case strings.HasPrefix(line, "id: "):
+			current.ID = strings.TrimPrefix(line, "id: ")
+		case strings.HasPrefix(line, "event: "):
+			current.Event = strings.TrimPrefix(line, "event: ")
+		case strings.HasPrefix(line, "data: "):
+			current.Data = append(current.Data, []byte(strings.TrimPrefix(line, "data: "))...)
+		}
+	}
+	if current.Event != "" || current.ID != "" || len(current.Data) > 0 {
+		records = append(records, current)
+	}
+	if !requestIDSent {
+		requestIDCh <- ""
+	}
+	stopCloseOnCancel()
+	closeBody()
+	resultCh <- permissionPromptStreamResult{
+		records: records,
+		err:     errors.Join(scanner.Err(), closeErr),
+	}
+}
+
+func waitForPermissionPromptStreamResult(
+	ctx context.Context,
+	stream permissionPromptStream,
+	primaryErr error,
+) (permissionPromptStreamResult, bool, error) {
+	if primaryErr == nil {
+		select {
+		case result := <-stream.result:
+			stream.cancel()
+			return result, true, result.err
+		case <-ctx.Done():
+			primaryErr = fmt.Errorf("wait for permission prompt stream: %w", ctx.Err())
+		}
+	}
+	stream.cancel()
+
+	terminalCtx, cancelTerminal := context.WithTimeout(
+		context.WithoutCancel(ctx),
+		permissionPromptStreamJoinTimeout,
+	)
+	defer cancelTerminal()
+	select {
+	case result := <-stream.result:
+		return result, true, errors.Join(primaryErr, result.err)
+	case <-terminalCtx.Done():
+		return permissionPromptStreamResult{}, false, errors.Join(
+			primaryErr,
+			fmt.Errorf("permission prompt stream did not terminate: %w", terminalCtx.Err()),
+		)
+	}
+}
+
+func approvePermissionForIntegration(
+	ctx context.Context,
+	runtime integrationRuntime,
+	sessionID string,
+	requestID string,
+) error {
+	payload := strings.NewReader(fmt.Sprintf(`{"request_id":"%s","decision":"allow-always"}`, requestID))
+	req, err := http.NewRequestWithContext(
+		ctx,
+		http.MethodPost,
+		mustURL(runtime.host, runtime.port, "/api/workspaces/ws-workspace/sessions/"+sessionID+"/approve"),
+		payload,
+	)
+	if err != nil {
+		return fmt.Errorf("create permission approval request: %w", err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+
+	resp, err := runtime.client.Do(req)
+	if err != nil {
+		var closeErr error
+		if resp != nil && resp.Body != nil {
+			if bodyErr := resp.Body.Close(); bodyErr != nil {
+				closeErr = fmt.Errorf("close failed permission approval response body: %w", bodyErr)
+			}
+		}
+		return errors.Join(fmt.Errorf("send permission approval request: %w", err), closeErr)
+	}
+	if resp == nil {
+		return errors.New("permission approval response is nil")
+	}
+
+	body, readErr := io.ReadAll(resp.Body)
+	closeErr := resp.Body.Close()
+	var statusErr error
+	if resp.StatusCode != http.StatusOK {
+		statusErr = fmt.Errorf(
+			"approve status = %d, want %d; body=%s",
+			resp.StatusCode,
+			http.StatusOK,
+			string(body),
+		)
+	}
+	if readErr != nil {
+		readErr = fmt.Errorf("read permission approval response body: %w", readErr)
+	}
+	if closeErr != nil {
+		closeErr = fmt.Errorf("close permission approval response body: %w", closeErr)
+	}
+	return errors.Join(statusErr, readErr, closeErr)
+}
+
+func extractPermissionPayloads(t *testing.T, records []sseRecord) []permissionStreamPayload {
+	t.Helper()
+
+	payloads := make([]permissionStreamPayload, 0, len(records))
+	for _, record := range records {
+		if payload, ok := extractPermissionPayloadFromRecord(record); ok {
+			payloads = append(payloads, payload)
+		}
+	}
+	return payloads
+}
+
+func extractPermissionPayloadFromRecord(record sseRecord) (permissionStreamPayload, bool) {
+	if len(record.Data) == 0 || string(record.Data) == "[DONE]" {
+		return permissionStreamPayload{}, false
+	}
+
+	var envelope struct {
+		Type string                  `json:"type"`
+		Data permissionStreamPayload `json:"data"`
+	}
+	if err := json.Unmarshal(record.Data, &envelope); err != nil || envelope.Type != "data-compozy-permission" {
+		return permissionStreamPayload{}, false
+	}
+	return envelope.Data, true
+}
+
+func recordsContainTextDelta(records []sseRecord, want string) bool {
+	for _, record := range records {
+		if len(record.Data) == 0 || string(record.Data) == "[DONE]" {
+			continue
+		}
+		var payload map[string]any
+		if err := json.Unmarshal(record.Data, &payload); err != nil {
+			continue
+		}
+		if payload["type"] == "text-delta" && payload["delta"] == want {
+			return true
+		}
+	}
+	return false
+}
+
+func tPermissionRaw(requestID string) map[string]any {
+	return map[string]any{
+		"request_id": requestID,
+		"tool_input": map[string]any{"command": "demo"},
+		"options": []map[string]any{
+			{"decision": "allow-once", "kind": "allow_once", "option_id": "allow-once", "label": "allow once"},
+			{"decision": "allow-always", "kind": "allow_always", "option_id": "allow-always", "label": "allow always"},
+			{"decision": "reject-once", "kind": "reject_once", "option_id": "reject-once", "label": "reject once"},
+			{
+				"decision":  "reject-always",
+				"kind":      "reject_always",
+				"option_id": "reject-always",
+				"label":     "reject always",
+			},
+		},
+	}
+}
+
+func tPermissionRawWithDecision(requestID string, decision string) map[string]any {
+	payload := tPermissionRaw(requestID)
+	payload["decision"] = decision
+	return payload
+}
+
+func mustIntegrationJSON(value any) json.RawMessage {
+	data, err := json.Marshal(value)
+	if err != nil {
+		panic(err)
+	}
+	return data
+}
+
+func createIntegrationSession(t *testing.T, runtime integrationRuntime) string {
+	t.Helper()
+	return createIntegrationSessionFromRequest(t, runtime, map[string]any{
+		"agent_name":     "coder",
+		"workspace_path": runtime.workspace,
+	})
+}
+
+func createLiveIntegrationSession(t *testing.T, runtime integrationRuntime) string {
+	t.Helper()
+	return createIntegrationSessionFromRequest(t, runtime, map[string]any{
+		"agent_name":     "coder",
+		"workspace_path": runtime.workspace,
+	})
+}
+
+func createIntegrationSessionFromRequest(
+	t *testing.T,
+	runtime integrationRuntime,
+	request map[string]any,
+) string {
+	t.Helper()
+
+	resp := mustHTTPRequest(
+		t,
+		runtime.client,
+		http.MethodPost,
+		mustURL(runtime.host, runtime.port, "/api/sessions"),
+		mustIntegrationJSON(request),
+		nil,
+	)
+	if resp.StatusCode != http.StatusCreated {
+		body := readAndCloseHTTPBody(t, resp)
+		t.Fatalf("create session status = %d, want %d; body=%s", resp.StatusCode, http.StatusCreated, string(body))
+	}
+	var created struct {
+		Session sessionPayload `json:"session"`
+	}
+	decodeHTTPJSON(t, resp, &created)
+	waitForIntegrationSessionActive(t, runtime.manager, created.Session.ID)
+	return created.Session.ID
+}
+
+func waitForIntegrationSessionActive(t *testing.T, manager *session.Manager, sessionID string) {
+	t.Helper()
+
+	info, err := manager.Status(t.Context(), sessionID)
+	if err != nil {
+		t.Fatalf("Status(%q) error = %v", sessionID, err)
+	}
+	if info != nil && info.State == session.StateActive {
+		return
+	}
+
+	catalogEvents, cancel, err := manager.SubscribeSessionCatalogEvents(
+		t.Context(),
+		session.CatalogScope{AllWorkspaces: true, ReadScope: store.ReadScope{ProfileID: store.DefaultProfileID}},
+	)
+	if err != nil {
+		t.Fatalf("SubscribeSessionCatalogEvents() error = %v", err)
+	}
+	defer cancel()
+
+	info, err = manager.Status(t.Context(), sessionID)
+	if err != nil {
+		t.Fatalf("Status(%q) after catalog subscription error = %v", sessionID, err)
+	}
+	if info != nil && info.State == session.StateActive {
+		return
+	}
+
+	ctx, cancelTimeout := context.WithTimeout(t.Context(), 5*time.Second)
+	defer cancelTimeout()
+	for {
+		select {
+		case event, ok := <-catalogEvents:
+			if !ok {
+				t.Fatalf("session catalog stream closed while waiting for session %q to become active", sessionID)
+			}
+			if event.Kind != session.CatalogEventUpserted || event.SessionID != sessionID {
+				continue
+			}
+
+			info, err = manager.Status(t.Context(), sessionID)
+			if err != nil {
+				t.Fatalf("Status(%q) after catalog event error = %v", sessionID, err)
+			}
+			if info != nil && info.State == session.StateActive {
+				return
+			}
+		case <-ctx.Done():
+			t.Fatalf("session %q did not become active: info=%#v: %v", sessionID, info, ctx.Err())
+		}
+	}
+}
+
+func createIntegrationTask(t *testing.T, runtime integrationRuntime, body []byte) contract.TaskPayload {
+	t.Helper()
+
+	resp := mustHTTPRequest(
+		t,
+		runtime.client,
+		http.MethodPost,
+		mustURL(runtime.host, runtime.port, "/api/tasks"),
+		body,
+		nil,
+	)
+	if resp.StatusCode != http.StatusCreated {
+		body := readAndCloseHTTPBody(t, resp)
+		t.Fatalf("create task status = %d, want %d; body=%s", resp.StatusCode, http.StatusCreated, string(body))
+	}
+	var created contract.TaskResponse
+	decodeHTTPJSON(t, resp, &created)
+	return created.Task
+}
+
+func enqueueIntegrationTaskRun(
+	t *testing.T,
+	runtime integrationRuntime,
+	taskID string,
+	body string,
+) contract.TaskRunPayload {
+	t.Helper()
+
+	resp := mustHTTPRequest(
+		t,
+		runtime.client,
+		http.MethodPost,
+		mustURL(runtime.host, runtime.port, "/api/tasks/"+taskID+"/runs"),
+		[]byte(body),
+		nil,
+	)
+	if resp.StatusCode != http.StatusCreated {
+		payload := readAndCloseHTTPBody(t, resp)
+		t.Fatalf("enqueue run status = %d, want %d; body=%s", resp.StatusCode, http.StatusCreated, string(payload))
+	}
+	var created contract.TaskRunResponse
+	decodeHTTPJSON(t, resp, &created)
+	return created.Run
+}
+
+func requireHTTPInboxGroup(
+	t *testing.T,
+	groups []contract.TaskInboxLaneGroupPayload,
+	lane contract.TaskInboxLane,
+) contract.TaskInboxLaneGroupPayload {
+	t.Helper()
+
+	for _, group := range groups {
+		if group.Lane == lane {
+			return group
+		}
+	}
+	t.Fatalf("task inbox lane %q not found in %#v", lane, groups)
+	return contract.TaskInboxLaneGroupPayload{}
+}
+
+func httpInboxGroupHasTask(group contract.TaskInboxLaneGroupPayload, taskID string) bool {
+	for _, item := range group.Items {
+		if item.Task.ID == taskID {
+			return true
+		}
+	}
+	return false
+}
+
+func sendPrompt(t *testing.T, runtime integrationRuntime, sessionID string, message string) {
+	t.Helper()
+
+	resp := mustHTTPRequest(
+		t,
+		runtime.client,
+		http.MethodPost,
+		mustURL(runtime.host, runtime.port, "/api/workspaces/ws-workspace/sessions/"+sessionID+"/prompt"),
+		integrationPromptJSON(t, message),
+		nil,
+	)
+	if resp.StatusCode != http.StatusOK {
+		body := readAndCloseHTTPBody(t, resp)
+		t.Fatalf("prompt status = %d, want %d; body=%s", resp.StatusCode, http.StatusOK, string(body))
+	}
+	readAndCloseHTTPBody(t, resp)
+}
+
+func integrationPromptJSON(t *testing.T, message string) []byte {
+	t.Helper()
+
+	identity := strings.NewReplacer("/", "-", " ", "-").Replace(t.Name() + "-" + message)
+	return mustIntegrationJSON(map[string]any{
+		"message":         message,
+		"message_id":      "msg-" + identity,
+		"idempotency_key": "idem-" + identity,
+	})
+}
+
+func bindIntegrationSessionRuntime(t *testing.T, runtime integrationRuntime, sessionID string) {
+	t.Helper()
+
+	resp := mustHTTPRequest(
+		t,
+		runtime.client,
+		http.MethodPost,
+		mustURL(runtime.host, runtime.port, "/api/workspaces/ws-workspace/sessions/"+sessionID+"/prompt"),
+		mustIntegrationJSON(map[string]any{
+			"message":         "bind runtime",
+			"message_id":      "msg-bind-runtime",
+			"idempotency_key": "idem-bind-runtime",
+			"runtime":         map[string]any{"provider": "codex"},
+		}),
+		nil,
+	)
+	body := readAndCloseIntegrationResponse(t, resp.Body, "runtime bind prompt")
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("runtime bind prompt status = %d, want %d; body=%s", resp.StatusCode, http.StatusOK, string(body))
+	}
+}
+
+func readAndCloseIntegrationResponse(t *testing.T, body io.ReadCloser, operation string) []byte {
+	t.Helper()
+
+	payload, readErr := io.ReadAll(body)
+	closeErr := body.Close()
+	if readErr != nil {
+		t.Fatalf("read %s response body error = %v", operation, readErr)
+	}
+	if closeErr != nil {
+		t.Fatalf("close %s response body error = %v", operation, closeErr)
+	}
+	return payload
+}
+
+func mustIntegrationPrompt(t *testing.T, events <-chan acp.AgentEvent, err error) <-chan acp.AgentEvent {
+	t.Helper()
+	if err != nil {
+		t.Fatalf("prompt submission error = %v", err)
+	}
+	return events
+}
+
+func collectIntegrationPromptEvents(
+	t *testing.T,
+	events <-chan acp.AgentEvent,
+	timeout time.Duration,
+) []acp.AgentEvent {
+	t.Helper()
+
+	collected := make([]acp.AgentEvent, 0, 4)
+	timer := time.NewTimer(timeout)
+	defer timer.Stop()
+
+Loop:
+	for {
+		select {
+		case event, ok := <-events:
+			if !ok {
+				break Loop
+			}
+			collected = append(collected, event)
+		case <-timer.C:
+			t.Fatalf("timed out waiting for prompt events after %v", timeout)
+		}
+	}
+	if len(collected) == 0 {
+		t.Fatal("prompt events = 0, want completed prompt stream")
+	}
+	if got := collected[len(collected)-1].Type; got != acp.EventTypeDone {
+		t.Fatalf("last prompt event type = %q, want %q", got, acp.EventTypeDone)
+	}
+	return collected
+}
+
+func stopIntegrationSession(t *testing.T, runtime integrationRuntime, sessionID string) {
+	t.Helper()
+
+	resp := mustHTTPRequest(
+		t,
+		runtime.client,
+		http.MethodPost,
+		mustURL(runtime.host, runtime.port, "/api/workspaces/ws-workspace/sessions/"+sessionID+"/stop"),
+		nil,
+		nil,
+	)
+	if resp.StatusCode != http.StatusNoContent {
+		body := readAndCloseHTTPBody(t, resp)
+		t.Fatalf("stop status = %d, want %d; body=%s", resp.StatusCode, http.StatusNoContent, string(body))
+	}
+	closeHTTPBody(t, resp.Body)
+}
+
+func containsAutomationRun(runs []contract.RunPayload, id string) bool {
+	for _, run := range runs {
+		if run.ID == id {
+			return true
+		}
+	}
+	return false
+}
+
+func integrationPromptEventsContainTerminalToolEvents(events []store.SessionEvent) bool {
+	var hasToolResult bool
+	var hasDone bool
+
+	for _, event := range events {
+		switch event.Type {
+		case acp.EventTypeToolResult:
+			hasToolResult = true
+		case acp.EventTypeDone:
+			hasDone = true
+		}
+	}
+
+	return hasToolResult && hasDone
+}
+
+func waitForIntegrationTerminalToolEvents(t *testing.T, events <-chan store.SessionEvent) {
+	t.Helper()
+
+	ctx, cancel := context.WithTimeout(t.Context(), 2*time.Second)
+	defer cancel()
+	var hasToolResult bool
+	var hasDone bool
+	for !hasToolResult || !hasDone {
+		select {
+		case event, ok := <-events:
+			if !ok {
+				t.Fatalf("session event subscription closed before terminal tool events")
+			}
+			switch event.Type {
+			case acp.EventTypeToolResult:
+				hasToolResult = true
+			case acp.EventTypeDone:
+				hasDone = true
+			}
+		case <-ctx.Done():
+			t.Fatalf(
+				"timed out waiting for terminal tool events: tool_result=%t done=%t: %v",
+				hasToolResult,
+				hasDone,
+				ctx.Err(),
+			)
+		}
+	}
+}
+
+func waitForRegistryStopReason(t *testing.T, runtime integrationRuntime, sessionID string, want store.StopReason) {
+	t.Helper()
+
+	if integrationRegistryHasStopReason(t, runtime, sessionID, want) {
+		return
+	}
+
+	catalogEvents, cancel, err := runtime.manager.SubscribeSessionCatalogEvents(
+		t.Context(),
+		session.CatalogScope{AllWorkspaces: true, ReadScope: store.ReadScope{ProfileID: store.DefaultProfileID}},
+	)
+	if err != nil {
+		t.Fatalf("SubscribeSessionCatalogEvents() error = %v", err)
+	}
+	defer cancel()
+
+	if integrationRegistryHasStopReason(t, runtime, sessionID, want) {
+		return
+	}
+
+	ctx, cancelTimeout := context.WithTimeout(t.Context(), 2*time.Second)
+	defer cancelTimeout()
+	for {
+		select {
+		case event, ok := <-catalogEvents:
+			if !ok {
+				t.Fatalf("session catalog stream closed while waiting for stopped session %q", sessionID)
+			}
+			if event.Kind == session.CatalogEventUpserted && event.SessionID == sessionID &&
+				integrationRegistryHasStopReason(t, runtime, sessionID, want) {
+				return
+			}
+		case <-ctx.Done():
+			t.Fatalf("timed out waiting for stopped session %q with stop reason %q: %v", sessionID, want, ctx.Err())
+		}
+	}
+}
+
+func integrationRegistryHasStopReason(
+	t *testing.T,
+	runtime integrationRuntime,
+	sessionID string,
+	want store.StopReason,
+) bool {
+	t.Helper()
+
+	sessions, err := runtime.registry.ListSessions(
+		t.Context(),
+		store.SessionListQuery{ReadScope: store.ReadScope{ProfileID: store.DefaultProfileID}, State: "stopped"},
+	)
+	if err != nil {
+		t.Fatalf("ListSessions(stopped) error = %v", err)
+	}
+	for _, item := range sessions {
+		if item.ID == sessionID && item.StopReason == want {
+			return true
+		}
+	}
+	return false
+}
+
+func TestHTTPSessionLayoutRoundTripWithRealSessionManager(t *testing.T) {
+	t.Run("Should persist folders, moves, and manual order through the real catalog", func(t *testing.T) {
+		runtime := newIntegrationRuntime(t)
+		origin := fmt.Sprintf("http://%s:%d", runtime.host, runtime.port)
+		call := func(method string, path string, body string, wantStatus int, target any) {
+			t.Helper()
+			var payload []byte
+			if body != "" {
+				payload = []byte(body)
+			}
+			resp := mustHTTPRequest(t, runtime.client, method, mustURL(runtime.host, runtime.port, path), payload,
+				map[string]string{"Origin": origin})
+			if resp.StatusCode != wantStatus {
+				t.Fatalf("%s %s status = %d, want %d; body=%s", method, path, resp.StatusCode, wantStatus,
+					readAndCloseHTTPBody(t, resp))
+			}
+			if target == nil {
+				closeHTTPBody(t, resp.Body)
+				return
+			}
+			decodeHTTPJSON(t, resp, target)
+		}
+		createSession := func(name string, folderID string) contract.SessionPayload {
+			t.Helper()
+			body := `{"agent_name":"coder","name":"` + name + `","workspace_path":"` + runtime.workspace + `"`
+			if folderID != "" {
+				body += `,"folder_id":"` + folderID + `"`
+			}
+			var created contract.SessionResponse
+			call(http.MethodPost, "/api/sessions", body+`}`, http.StatusCreated, &created)
+			return created.Session
+		}
+
+		first := createSession("first", "")
+		second := createSession("second", "")
+		layoutPath := "/api/workspaces/" + first.WorkspaceID
+		var folder contract.SessionFolderResponse
+		call(http.MethodPost, layoutPath+"/session-folders", `{"name":"Release"}`, http.StatusCreated, &folder)
+		if folder.Folder.ID == "" || folder.Folder.Name != "Release" {
+			t.Fatalf("created folder = %#v", folder.Folder)
+		}
+
+		var folders contract.SessionFoldersResponse
+		call(http.MethodPost, layoutPath+"/sessions/"+first.ID+"/move",
+			`{"folder_id":"`+folder.Folder.ID+`"}`, http.StatusOK, &folders)
+		if len(folders.Folders) != 1 || folders.Folders[0].SessionCount != 1 {
+			t.Fatalf("folders after move = %#v, want one folder with one session", folders.Folders)
+		}
+		inFolder := createSession("third", folder.Folder.ID)
+		if inFolder.FolderID != folder.Folder.ID {
+			t.Fatalf("created session folder_id = %q, want %q", inFolder.FolderID, folder.Folder.ID)
+		}
+		call(http.MethodPost, "/api/sessions",
+			`{"agent_name":"coder","workspace_path":"`+runtime.workspace+`","folder_id":"sfold-missing"}`,
+			http.StatusNotFound, nil)
+		call(http.MethodPut, layoutPath+"/session-order/sessions",
+			`{"folder_id":"`+folder.Folder.ID+`","session_ids":["`+inFolder.ID+`","`+first.ID+`"]}`,
+			http.StatusOK, nil)
+		call(http.MethodPut, layoutPath+"/session-order/sessions",
+			`{"session_ids":["`+second.ID+`"]}`, http.StatusOK, nil)
+
+		var catalog contract.SessionCatalogResponse
+		call(http.MethodGet, layoutPath+"/sessions?sort=manual", "", http.StatusOK, &catalog)
+		gotOrder := make([]string, 0, len(catalog.Sessions))
+		gotFolders := map[string]string{}
+		for _, item := range catalog.Sessions {
+			gotOrder = append(gotOrder, item.ID)
+			gotFolders[item.ID] = item.FolderID
+		}
+		wantOrder := []string{inFolder.ID, first.ID, second.ID}
+		if !slices.Equal(gotOrder, wantOrder) {
+			t.Fatalf("manual catalog order = %v, want %v", gotOrder, wantOrder)
+		}
+		if gotFolders[first.ID] != folder.Folder.ID || gotFolders[second.ID] != "" {
+			t.Fatalf("catalog folder ids = %v", gotFolders)
+		}
+
+		call(http.MethodDelete, layoutPath+"/session-folders/"+folder.Folder.ID, "", http.StatusOK, &folders)
+		if len(folders.Folders) != 0 {
+			t.Fatalf("folders after delete = %#v, want none", folders.Folders)
+		}
+		var afterDelete contract.SessionCatalogResponse
+		call(http.MethodGet, layoutPath+"/sessions?sort=manual", "", http.StatusOK, &afterDelete)
+		if len(afterDelete.Sessions) != 3 {
+			t.Fatalf("sessions after folder delete = %d, want all 3 kept", len(afterDelete.Sessions))
+		}
+		for _, item := range afterDelete.Sessions {
+			if item.FolderID != "" {
+				t.Fatalf("session %s folder_id = %q after folder delete, want root", item.ID, item.FolderID)
+			}
+		}
+	})
+}
+
+func TestHTTPWorkspaceLayoutRoundTripWithRealSessionManager(t *testing.T) {
+	t.Run("Should persist workspace folders, moves, and order through the real layout store", func(t *testing.T) {
+		runtime := newIntegrationRuntime(t)
+		origin := fmt.Sprintf("http://%s:%d", runtime.host, runtime.port)
+		call := func(method string, path string, body string, wantStatus int, target any) {
+			t.Helper()
+			var payload []byte
+			if body != "" {
+				payload = []byte(body)
+			}
+			resp := mustHTTPRequest(t, runtime.client, method, mustURL(runtime.host, runtime.port, path), payload,
+				map[string]string{"Origin": origin})
+			if resp.StatusCode != wantStatus {
+				t.Fatalf("%s %s status = %d, want %d; body=%s", method, path, resp.StatusCode, wantStatus,
+					readAndCloseHTTPBody(t, resp))
+			}
+			if target == nil {
+				closeHTTPBody(t, resp.Body)
+				return
+			}
+			decodeHTTPJSON(t, resp, target)
+		}
+
+		var folder contract.WorkspaceFolderResponse
+		call(http.MethodPost, "/api/workspace-folders", `{"name":"Clients"}`, http.StatusCreated, &folder)
+		if folder.Folder.ID == "" || folder.Folder.Name != "Clients" {
+			t.Fatalf("created folder = %#v", folder.Folder)
+		}
+		var layout contract.WorkspaceLayoutResponse
+		call(http.MethodPost, "/api/workspace-order/move",
+			`{"workspace_id":"`+runtime.workspace+`","folder_id":"`+folder.Folder.ID+`"}`, http.StatusOK, &layout)
+		if len(layout.Placements) != 1 || layout.Placements[0].FolderID != folder.Folder.ID ||
+			layout.Folders[0].WorkspaceCount != 1 {
+			t.Fatalf("layout after move = %#v", layout)
+		}
+		workspaceID := layout.Placements[0].WorkspaceID
+		call(http.MethodPut, "/api/workspace-order/workspaces", `{"workspace_ids":["@user"]}`, http.StatusOK, &layout)
+		want := []contract.WorkspacePlacementPayload{
+			{WorkspaceID: workspaceID, FolderID: folder.Folder.ID, Position: 0},
+			{WorkspaceID: "@user", Position: 0},
+		}
+		if !slices.Equal(layout.Placements, want) {
+			t.Fatalf("placements = %#v, want %#v", layout.Placements, want)
+		}
+		for _, refused := range []struct {
+			method, path, body, cause string
+			status                    int
+		}{
+			{http.MethodPost, "/api/workspace-order/move", `{"workspace_id":"missing-project"}`,
+				"workspace not found", http.StatusNotFound},
+			{http.MethodPut, "/api/workspace-order/folders", `{"folder_ids":[]}`,
+				"every folder exactly once", http.StatusConflict},
+			{http.MethodGet, "/api/workspace-folders?all_profiles=true", "",
+				"belongs to one profile", http.StatusBadRequest},
+		} {
+			// Profile refusals use the structured profile error envelope; layout
+			// refusals use ErrorPayload. Both must name the cause.
+			var payload json.RawMessage
+			call(refused.method, refused.path, refused.body, refused.status, &payload)
+			if !strings.Contains(string(payload), refused.cause) {
+				t.Fatalf("%s %s error = %s, want it to name %q", refused.method, refused.path, payload, refused.cause)
+			}
+		}
+
+		call(http.MethodDelete, "/api/workspace-folders/"+folder.Folder.ID, "", http.StatusOK, &layout)
+		if len(layout.Folders) != 0 || len(layout.Placements) != 1 || layout.Placements[0].WorkspaceID != "@user" {
+			t.Fatalf("layout after folder delete = %#v", layout)
+		}
+	})
+}

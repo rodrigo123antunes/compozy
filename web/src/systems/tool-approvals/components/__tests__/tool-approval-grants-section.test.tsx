@@ -1,0 +1,411 @@
+import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
+import { fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { delay, http, HttpResponse } from "msw";
+import type { ReactNode } from "react";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+
+import { createMswFetch, createStatefulMswStore } from "@/test/msw-fetch";
+import {
+  terminalToolApprovalGrantFixtures,
+  toolApprovalGrantFixtures,
+} from "@/systems/tool-approvals/mocks/fixtures";
+
+import { ToolApprovalGrantsSection, type ToolApprovalGrant } from "@/systems/tool-approvals";
+
+const WS = "ws_default";
+const TEST_ID = "settings-page-general-tool-approvals";
+const allowGrant = toolApprovalGrantFixtures[0]!;
+const rejectGrant = toolApprovalGrantFixtures[1]!;
+
+const workspaceMock = vi.hoisted(() => ({
+  value: {
+    dataScope: undefined as { kind: "user" } | undefined,
+    runtimeWorkspaceId: "ws_default" as string | null,
+    hasHydrated: true,
+    isLoading: false,
+  },
+}));
+
+vi.mock("@/systems/workspace/hooks/use-active-workspace", () => ({
+  useActiveWorkspace: () => workspaceMock.value,
+}));
+
+function listHandler(grants: ReadonlyArray<ToolApprovalGrant>) {
+  return http.get("/api/tool-approval-grants", () =>
+    HttpResponse.json({ grants, total: grants.length })
+  );
+}
+
+function stubFetch(handlers: ReturnType<typeof http.get>[]) {
+  vi.stubGlobal(
+    "fetch",
+    createMswFetch(() => handlers)
+  );
+}
+
+function renderSection() {
+  const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+  const wrapper = ({ children }: { children: ReactNode }) => (
+    <QueryClientProvider client={queryClient}>{children}</QueryClientProvider>
+  );
+  return render(<ToolApprovalGrantsSection />, { wrapper });
+}
+
+describe("ToolApprovalGrantsSection", () => {
+  beforeEach(() => {
+    workspaceMock.value = {
+      dataScope: undefined,
+      runtimeWorkspaceId: WS,
+      hasHydrated: true,
+      isLoading: false,
+    };
+  });
+
+  afterEach(() => {
+    vi.unstubAllGlobals();
+  });
+
+  it("Should list and revoke User-owned read grants in User scope", async () => {
+    workspaceMock.value = {
+      runtimeWorkspaceId: null,
+      dataScope: { kind: "user" },
+      hasHydrated: true,
+      isLoading: false,
+    };
+    const grant = {
+      ...toolApprovalGrantFixtures[3]!,
+      id: "user-grant",
+      workspace_id: "",
+      access_scope: "read:workspace:ws_proto@p-target",
+    };
+    const store = createStatefulMswStore([grant]);
+    let revokeScope: string | null = null;
+    let revokedID: string | null = null;
+    stubFetch([
+      http.get("/api/tool-approval-grants", ({ request }) => {
+        expect(new URL(request.url).searchParams.get("workspace_id")).toBe("@user");
+        return HttpResponse.json({ grants: store.all(), total: store.all().length });
+      }),
+      http.delete("/api/tool-approval-grants/:id", ({ request, params }) => {
+        revokeScope = new URL(request.url).searchParams.get("workspace_id");
+        revokedID = String(params.id);
+        return store.delete(revokedID)
+          ? new HttpResponse(null, { status: 204 })
+          : HttpResponse.json({ error: "not found" }, { status: 404 });
+      }),
+    ]);
+    renderSection();
+    expect(
+      await screen.findByText("Reads in project ws_proto, profile p-target")
+    ).toBeInTheDocument();
+    fireEvent.click(screen.getByTestId(`tool-approval-grant-revoke-${grant.id}`));
+    fireEvent.click(await screen.findByTestId(`${TEST_ID}-revoke-confirm`));
+    await waitFor(() => expect(revokeScope).toBe("@user"));
+    expect(revokedID).toBe(grant.id);
+    await waitFor(() =>
+      expect(
+        screen.queryByTestId(`tool-approval-grant-decision-${grant.id}`)
+      ).not.toBeInTheDocument()
+    );
+  });
+
+  it("Should keep terminal writes generic while exact exec decisions use terminal copy", async () => {
+    stubFetch([listHandler(terminalToolApprovalGrantFixtures)]);
+    renderSection();
+
+    await waitFor(() => expect(screen.getByTestId(`${TEST_ID}-list`)).toBeInTheDocument());
+
+    const write = terminalToolApprovalGrantFixtures[0]!;
+    const shape = terminalToolApprovalGrantFixtures[1]!;
+    // Exec decisions retain their command-specific reading. Writes use the
+    // ordinary native-tool row because terminal input has no special grant.
+    expect(screen.getByTestId(`${TEST_ID}-terminal-group`)).toHaveTextContent("Terminal");
+    expect(screen.getByTestId(`terminal-grant-row-${shape.id}`)).toHaveTextContent(
+      "Always allowed: this exact command"
+    );
+    expect(screen.getByTestId(`tool-approval-grant-decision-${write.id}`)).toHaveTextContent(
+      "Allowed"
+    );
+    // Plain tool name on the row; the raw id stays one step deeper, on hover.
+    expect(screen.getByText("terminal write")).toHaveAttribute("title", write.tool_id);
+    expect(screen.getByTestId(`tool-approval-grant-scope-${write.id}`)).toHaveTextContent(
+      "Only this exact request"
+    );
+  });
+
+  it("Should revoke a terminal write through the generic confirmation", async () => {
+    const write = terminalToolApprovalGrantFixtures[0]!;
+    const store = createStatefulMswStore([write]);
+    let revokedGrantID: string | undefined;
+    stubFetch([
+      http.get("/api/tool-approval-grants", () =>
+        HttpResponse.json({ grants: store.all(), total: store.all().length })
+      ),
+      http.delete("/api/tool-approval-grants/:id", ({ params }) => {
+        revokedGrantID = String(params.id);
+        return store.delete(revokedGrantID)
+          ? new HttpResponse(null, { status: 204 })
+          : HttpResponse.json({ error: "not found" }, { status: 404 });
+      }),
+    ]);
+    renderSection();
+    await waitFor(() => expect(screen.getByTestId(`${TEST_ID}-list`)).toBeInTheDocument());
+
+    fireEvent.click(screen.getByTestId(`tool-approval-grant-revoke-${write.id}`));
+    fireEvent.click(await screen.findByTestId(`${TEST_ID}-revoke-confirm`));
+
+    await waitFor(() => expect(revokedGrantID).toBe(write.id));
+    expect(
+      screen.queryByTestId(`tool-approval-grant-decision-${write.id}`)
+    ).not.toBeInTheDocument();
+  });
+
+  it("Should keep a terminal rejection in the generic row, where its copy reads right", async () => {
+    const rejectedTerminal = {
+      ...terminalToolApprovalGrantFixtures[1]!,
+      id: "e1f2a3b4-c5d6-4e7f-8a9b-0c1d2e3f4a5b",
+      decision: "reject" as const,
+    };
+    stubFetch([listHandler([rejectedTerminal])]);
+    renderSection();
+
+    await waitFor(() => expect(screen.getByTestId(`${TEST_ID}-list`)).toBeInTheDocument());
+
+    // A rejection is not a grant; calling it "always allowed" would invert it.
+    expect(screen.getByTestId("tool-approval-grant-row")).toBeInTheDocument();
+    expect(
+      screen.queryByTestId(`terminal-grant-row-${rejectedTerminal.id}`)
+    ).not.toBeInTheDocument();
+  });
+
+  it("Should render each remembered decision with its truthful scope and last-used time", async () => {
+    stubFetch([listHandler(toolApprovalGrantFixtures)]);
+    renderSection();
+
+    await waitFor(() => expect(screen.getByTestId(`${TEST_ID}-list`)).toBeInTheDocument());
+
+    expect(screen.getByTitle(allowGrant.tool_id)).toBeInTheDocument();
+    expect(screen.getByTitle(rejectGrant.tool_id)).toBeInTheDocument();
+    expect(screen.getByTestId(`tool-approval-grant-decision-${allowGrant.id}`)).toHaveTextContent(
+      "Allowed"
+    );
+    expect(screen.getByTestId(`tool-approval-grant-decision-${rejectGrant.id}`)).toHaveTextContent(
+      "Blocked"
+    );
+    // The daemon reports each distinct matching scope truthfully.
+    expect(screen.getByText("Claude Code")).toBeInTheDocument();
+    expect(screen.getByText("Cursor")).toBeInTheDocument();
+    expect(screen.getByText("Every request from this agent")).toBeInTheDocument();
+    expect(screen.getByText("Every request, any agent")).toBeInTheDocument();
+    expect(screen.getByText("Only this exact request")).toBeInTheDocument();
+    // A remembered cross-project read names its target, not "this exact request".
+    expect(screen.getByText("Reads in project ws_proto, profile default")).toBeInTheDocument();
+    expect(
+      screen.getByTestId(`tool-approval-grant-last-used-${allowGrant.id}`)
+    ).toBeInTheDocument();
+  });
+
+  it("Should show a workspace-scoped empty state when there are no decisions", async () => {
+    stubFetch([listHandler([])]);
+    renderSection();
+
+    await waitFor(() => expect(screen.getByTestId(`${TEST_ID}-empty`)).toBeInTheDocument());
+    expect(screen.getByTestId(`${TEST_ID}-empty`)).toHaveTextContent(
+      /no remembered decisions yet/i
+    );
+  });
+
+  it("Should surface an error with a retry affordance when the list fails", async () => {
+    stubFetch([
+      http.get("/api/tool-approval-grants", () =>
+        HttpResponse.json({ error: "boom" }, { status: 500 })
+      ),
+    ]);
+    renderSection();
+
+    await waitFor(() => expect(screen.getByTestId(`${TEST_ID}-error`)).toBeInTheDocument());
+    expect(screen.getByRole("button", { name: /retry/i })).toBeInTheDocument();
+  });
+
+  it("Should show the loading state while the list resolves", async () => {
+    stubFetch([
+      http.get("/api/tool-approval-grants", async () => {
+        await delay("infinite");
+        return HttpResponse.json({ grants: [], total: 0 });
+      }),
+    ]);
+    renderSection();
+
+    const loading = await screen.findByTestId(`${TEST_ID}-loading`);
+    expect(loading).toHaveTextContent("Loading remembered decisions");
+    expect(loading.querySelectorAll('[data-slot="listing-row"]').length).toBeGreaterThan(0);
+  });
+
+  it("Should render the empty state without fetching when there is no runtime workspace", async () => {
+    workspaceMock.value = {
+      dataScope: undefined,
+      runtimeWorkspaceId: null,
+      hasHydrated: true,
+      isLoading: false,
+    };
+    stubFetch([listHandler(toolApprovalGrantFixtures)]);
+    renderSection();
+
+    await waitFor(() => expect(screen.getByTestId(`${TEST_ID}-empty`)).toBeInTheDocument());
+    expect(screen.getByTestId(`${TEST_ID}-set-open`)).toBeDisabled();
+  });
+
+  it("Should set an explicit agent-wide decision and render daemon truth", async () => {
+    const store = createStatefulMswStore(toolApprovalGrantFixtures.slice(0, 0));
+    const widerGrant = {
+      ...allowGrant,
+      id: "set-agent-wide",
+      workspace_id: WS,
+      agent_name: "claude-code",
+      tool_id: "compozy__workspace_list",
+      decision: "allow" as const,
+      input_digest: undefined,
+    };
+    let requestBody: unknown;
+    stubFetch([
+      http.get("/api/tool-approval-grants", () =>
+        HttpResponse.json({ grants: store.all(), total: store.all().length })
+      ),
+      http.put("/api/tool-approval-grants", async ({ request }) => {
+        requestBody = await request.json();
+        store.prepend(widerGrant);
+        return HttpResponse.json({ grant: widerGrant });
+      }),
+    ]);
+    renderSection();
+
+    await waitFor(() => expect(screen.getByTestId(`${TEST_ID}-empty`)).toBeInTheDocument());
+    fireEvent.click(screen.getByTestId(`${TEST_ID}-set-open`));
+    expect(await screen.findByTestId("tool-approval-grant-set-confirm")).toBeDisabled();
+
+    fireEvent.click(screen.getByTestId("tool-approval-grant-scope-agent"));
+    fireEvent.change(screen.getByTestId("tool-approval-grant-tool-id"), {
+      target: { value: widerGrant.tool_id },
+    });
+    fireEvent.change(screen.getByTestId("tool-approval-grant-agent-name"), {
+      target: { value: widerGrant.agent_name },
+    });
+    fireEvent.click(screen.getByTestId("tool-approval-grant-decision-allow"));
+    fireEvent.click(screen.getByTestId("tool-approval-grant-set-confirm"));
+
+    await waitFor(() =>
+      expect(screen.getByTestId(`tool-approval-grant-scope-${widerGrant.id}`)).toHaveTextContent(
+        "Every request from this agent"
+      )
+    );
+    expect(requestBody).toEqual({
+      tool_id: widerGrant.tool_id,
+      decision: "allow",
+      scope: "agent",
+      agent_name: widerGrant.agent_name,
+    });
+    expect(screen.queryByTestId("tool-approval-grant-set-dialog")).not.toBeInTheDocument();
+  });
+
+  it("Should keep the wider-decision dialog open when set fails", async () => {
+    stubFetch([
+      listHandler([]),
+      http.put("/api/tool-approval-grants", () =>
+        HttpResponse.json({ error: "set exploded" }, { status: 500 })
+      ),
+    ]);
+    renderSection();
+
+    await waitFor(() => expect(screen.getByTestId(`${TEST_ID}-empty`)).toBeInTheDocument());
+    fireEvent.click(screen.getByTestId(`${TEST_ID}-set-open`));
+    fireEvent.click(screen.getByTestId("tool-approval-grant-scope-tool"));
+    fireEvent.change(screen.getByTestId("tool-approval-grant-tool-id"), {
+      target: { value: "compozy__task_create" },
+    });
+    fireEvent.click(screen.getByTestId("tool-approval-grant-decision-reject"));
+    fireEvent.click(screen.getByTestId("tool-approval-grant-set-confirm"));
+
+    await waitFor(() =>
+      expect(screen.getByTestId("tool-approval-grant-set-error")).toHaveTextContent("set exploded")
+    );
+    expect(screen.getByTestId("tool-approval-grant-set-dialog")).toBeInTheDocument();
+  });
+
+  it("Should revoke a decision after confirmation and remove its row", async () => {
+    const store = createStatefulMswStore(toolApprovalGrantFixtures);
+    stubFetch([
+      http.get("/api/tool-approval-grants", () =>
+        HttpResponse.json({ grants: store.all(), total: store.all().length })
+      ),
+      http.delete("/api/tool-approval-grants/:id", ({ params }) =>
+        store.delete(String(params.id))
+          ? new HttpResponse(null, { status: 204 })
+          : HttpResponse.json({ error: "not found" }, { status: 404 })
+      ),
+    ]);
+    renderSection();
+
+    await waitFor(() =>
+      expect(
+        screen.getByTestId(`tool-approval-grant-decision-${rejectGrant.id}`)
+      ).toBeInTheDocument()
+    );
+
+    // Revoke is a worded control, not an icon-only trash (same as terminal rows).
+    const revoke = screen.getByTestId(`tool-approval-grant-revoke-${rejectGrant.id}`);
+    expect(revoke).toHaveTextContent("Revoke");
+    fireEvent.click(revoke);
+    fireEvent.click(await screen.findByTestId(`${TEST_ID}-revoke-confirm`));
+
+    await waitFor(() =>
+      expect(
+        screen.queryByTestId(`tool-approval-grant-decision-${rejectGrant.id}`)
+      ).not.toBeInTheDocument()
+    );
+    // The other decisions remain.
+    expect(screen.getByTestId(`tool-approval-grant-decision-${allowGrant.id}`)).toBeInTheDocument();
+  });
+
+  it("Should keep the row and report failure when a revoke fails", async () => {
+    stubFetch([
+      listHandler(toolApprovalGrantFixtures),
+      http.delete("/api/tool-approval-grants/:id", () =>
+        HttpResponse.json({ error: "revoke exploded" }, { status: 500 })
+      ),
+    ]);
+    renderSection();
+
+    await waitFor(() =>
+      expect(screen.getByTestId(`tool-approval-grant-revoke-${allowGrant.id}`)).toBeInTheDocument()
+    );
+
+    fireEvent.click(screen.getByTestId(`tool-approval-grant-revoke-${allowGrant.id}`));
+    fireEvent.click(await screen.findByTestId(`${TEST_ID}-revoke-confirm`));
+
+    await waitFor(() =>
+      expect(screen.getByTestId(`${TEST_ID}-revoke-error`)).toHaveTextContent("revoke exploded")
+    );
+    expect(screen.getByTestId(`tool-approval-grant-decision-${allowGrant.id}`)).toBeInTheDocument();
+  });
+
+  it("Should disable confirm and cancel while a revoke is in flight", async () => {
+    stubFetch([
+      listHandler(toolApprovalGrantFixtures),
+      http.delete("/api/tool-approval-grants/:id", async () => {
+        await delay("infinite");
+        return new HttpResponse(null, { status: 204 });
+      }),
+    ]);
+    renderSection();
+
+    await waitFor(() =>
+      expect(screen.getByTestId(`tool-approval-grant-revoke-${allowGrant.id}`)).toBeInTheDocument()
+    );
+
+    fireEvent.click(screen.getByTestId(`tool-approval-grant-revoke-${allowGrant.id}`));
+    fireEvent.click(await screen.findByTestId(`${TEST_ID}-revoke-confirm`));
+
+    await waitFor(() => expect(screen.getByTestId(`${TEST_ID}-revoke-confirm`)).toBeDisabled());
+    expect(screen.getByTestId(`${TEST_ID}-revoke-cancel`)).toBeDisabled();
+  });
+});

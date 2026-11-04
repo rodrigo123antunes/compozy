@@ -1,0 +1,129 @@
+package spec
+
+import (
+	"strings"
+
+	"github.com/compozy/compozy/internal/api/contract"
+	"github.com/getkin/kin-openapi/openapi3"
+)
+
+const specTranscriptIncompatibleDescription = "Transcript projection is incompatible"
+
+func sessionTranscriptOperations() []OperationSpec {
+	operations := []OperationSpec{
+		{
+			Method:      httpMethodGet,
+			Path:        "/api/workspaces/{workspace_id}/sessions/{session_id}/transcript",
+			AppAccess:   AppAccessAllowed,
+			OperationID: "getSessionTranscript",
+			Summary:     "Get a bounded materialized transcript page",
+			Tags:        []string{specSessionsKey},
+			Transports:  []Transport{TransportHTTP, TransportUDS},
+			Parameters: []ParameterSpec{
+				pathParam("workspace_id", "Workspace id"),
+				pathParam("session_id", "Session id"),
+				intQueryParam(
+					"limit",
+					"Maximum page size; defaults to the newest 200 entries and is capped at 1000",
+				),
+				beforeSequenceQueryParam(
+					"Return entries whose stable start sequence is before this cursor",
+				),
+			},
+			Responses: []ResponseSpec{
+				{Status: 200, Description: "OK", Body: contract.SessionTranscriptResponse{}},
+				{Status: 400, Description: specInvalidFilterDescription, Body: contract.ErrorPayload{}},
+				{Status: 404, Description: specSessionNotFoundDescription, Body: contract.ErrorPayload{}},
+				{Status: 500, Description: specInternalServerErrorDescription, Body: contract.ErrorPayload{}},
+				{Status: 503, Description: specTranscriptIncompatibleDescription, Body: contract.ErrorPayload{}},
+			},
+		},
+		{
+			Method:      httpMethodGet,
+			Path:        "/api/workspaces/{workspace_id}/sessions/{session_id}/stream",
+			AppAccess:   AppAccessAllowed,
+			OperationID: "streamSession",
+			Summary:     "Stream raw session events or fenced transcript changes",
+			Tags:        []string{specSessionsKey},
+			Transports:  []Transport{TransportHTTP, TransportUDS},
+			Parameters: []ParameterSpec{
+				pathParam("workspace_id", "Workspace id"),
+				pathParam("session_id", "Session id"),
+				optionalLastEventIDHeaderParam(
+					"Resume after the last applied SSE cursor; transcript reconnects also require epoch and generation",
+				),
+				afterSequenceQueryParam("Initial cursor when Last-Event-ID is not supplied"),
+				enumQueryParam(
+					"frames",
+					"Frame mode; transcript is the default and raw preserves persisted event frames",
+					[]string{contract.SessionStreamFrameRaw, contract.SessionStreamFrameTranscript},
+				),
+				transcriptFenceQueryParam("epoch", "Expected transcript epoch for a fenced reconnect"),
+				transcriptFenceQueryParam(
+					"generation",
+					"Expected materialized projection generation for a fenced reconnect",
+				),
+				intQueryParam("limit", "Maximum entries per transcript snapshot or change batch"),
+			},
+			Responses: []ResponseSpec{
+				{
+					Status:      200,
+					Description: "Session event stream",
+					Bodies:      sessionStreamBodies(),
+					ContentType: specContentTypeEventStream,
+				},
+				{Status: 400, Description: specInvalidFilterDescription, Body: contract.ErrorPayload{}},
+				{Status: 404, Description: specSessionNotFoundDescription, Body: contract.ErrorPayload{}},
+				{Status: 500, Description: specInternalServerErrorDescription, Body: contract.ErrorPayload{}},
+				{Status: 503, Description: specTranscriptIncompatibleDescription, Body: contract.ErrorPayload{}},
+			},
+		},
+	}
+	return append(
+		operations,
+		globalSessionHistoryOperation(operations[0]),
+		globalSessionHistoryOperation(operations[1]),
+	)
+}
+
+// Global history keeps the same paging/navigation contract, scoped by profile
+// and an explicitly workspace-free owner instead of a removed synthetic project.
+func globalSessionHistoryOperation(operation OperationSpec) OperationSpec {
+	operation.Path = strings.Replace(operation.Path, "/workspaces/{workspace_id}", "", 1)
+	operation.OperationID = strings.Replace(operation.OperationID, "Session", "GlobalSession", 1)
+	operation.Summary += " for a Global session"
+	parameters := make([]ParameterSpec, 0, len(operation.Parameters))
+	for _, parameter := range operation.Parameters {
+		if parameter.In != "path" || parameter.Name != specWorkspaceIDKey {
+			parameters = append(parameters, parameter)
+		}
+	}
+	operation.Parameters = withProfileScope(parameters...)
+	return operation
+}
+
+func transcriptFenceQueryParam(name string, description string) ParameterSpec {
+	return ParameterSpec{
+		Name:        name,
+		In:          openapi3.ParameterInQuery,
+		Description: description,
+		Required:    false,
+		Kind:        specIntegerKey,
+		Format:      specFormatInt64,
+	}
+}
+
+func sessionStreamBodies() responseBodies {
+	return overlappingResponseBodiesOf(
+		responseBodyOf[contract.SubagentsSnapshotEvent](),
+		responseBodyOf[contract.SubagentUpdatedEvent](),
+		responseBodyOf[contract.SessionUsageChangedPayload](),
+		responseBodyOf[contract.SessionConsumerDegradedPayload](),
+		responseBodyOf[contract.SessionEventPayload](),
+		responseBodyOf[contract.TranscriptSnapshotPayload](),
+		responseBodyOf[contract.TranscriptDeltaPayload](),
+		responseBodyOf[contract.GoalSnapshotChangedPayload](),
+		responseBodyOf[contract.SessionCommandsChangedPayload](),
+		responseBodyOf[contract.ErrorPayload](),
+	)
+}

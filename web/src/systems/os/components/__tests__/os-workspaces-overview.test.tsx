@@ -1,0 +1,920 @@
+// Suite: OS workspaces overview (Command-Tab switcher)
+// Invariant: one strip layer over one vertical menu layer with roving DOM focus — arrows wrap,
+// typeahead cycles, inert rows are skipped, Escape steps one layer at a time, activation lands
+// root/scope/create/add with a single close, and current markers appear only on a focused
+// project (none under All projects or User, where no project is active).
+// Boundary IN: OsWorkspacesOverview interaction model — tiles, caption, worktree menu, hints.
+// Boundary OUT: active-workspace store semantics, worktree dialog flows, transport, and the
+// strip's scroll physics (no layout in jsdom).
+import { act, fireEvent, render, screen, waitFor } from "@testing-library/react";
+import userEvent from "@testing-library/user-event";
+import { useState, type ReactNode } from "react";
+import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
+import { beforeEach, describe, expect, it, vi } from "vitest";
+import { Dialog, DialogContent, DialogTitle } from "@compozy/ui";
+
+import type {
+  WorkspacePayload,
+  WorktreeListingByWorkspace,
+  WorktreesResponse,
+} from "@/systems/workspace";
+import {
+  discoveredWorktreeFixture,
+  emptyWorktreeListingFixture,
+  nonGitWorktreeListingFixture,
+  scrollableWorktreesListingFixture,
+  worktreeBehindFixture,
+  worktreeErrorFixture,
+  worktreeListingFixture,
+  worktreeMissingFixture,
+  worktreePendingFixture,
+  worktreeReadyDirtyRunningFixture,
+  worktreeSetupFlaggedFixture,
+} from "@/systems/workspace/mocks";
+
+import { OsWorkspacesOverview, type OsWorkspacesOverviewProps } from "../os-workspaces-overview";
+
+import {
+  setWorkspaceArchived,
+  deleteWorkspace,
+  WorkspaceApiError,
+} from "@/systems/workspace/adapters/workspace-api";
+vi.mock("@/systems/workspace/adapters/workspace-api", async importOriginal => ({
+  ...(await importOriginal<typeof import("@/systems/workspace/adapters/workspace-api")>()),
+  setWorkspaceArchived: vi.fn(),
+  deleteWorkspace: vi.fn(),
+}));
+
+const toastMocks = vi.hoisted(() => ({ error: vi.fn(), success: vi.fn() }));
+vi.mock("sonner", () => ({ toast: toastMocks }));
+
+function workspace(id: string, name: string, rootDir: string): WorkspacePayload {
+  return {
+    id,
+    name,
+    root_dir: rootDir,
+    add_dirs: [],
+    created_at: "2026-04-17T08:00:00Z",
+    updated_at: "2026-04-17T17:30:00Z",
+  };
+}
+
+const COMPOZY = workspace("ws_compozy", "compozy", "/Users/ada/dev/compozy");
+const BRANAS = workspace("ws_branas_site", "branas-site", "/Users/ada/dev/branas/site");
+const NOTES = workspace("ws_notes", "notes", "/Users/ada/notes");
+
+/** Listed rows belong to the workspace that lists them, as the daemon guarantees. */
+function listedIn(workspaceId: string, listing: WorktreesResponse): WorktreesResponse {
+  return {
+    ...listing,
+    worktrees: listing.worktrees.map(row => ({ ...row, workspace_id: workspaceId })),
+  };
+}
+
+const LISTINGS: WorktreeListingByWorkspace = {
+  [COMPOZY.id]: listedIn(COMPOZY.id, worktreeListingFixture),
+  [BRANAS.id]: emptyWorktreeListingFixture,
+  [NOTES.id]: nonGitWorktreeListingFixture,
+};
+
+const MIXED_LISTINGS: WorktreeListingByWorkspace = {
+  [COMPOZY.id]: {
+    worktrees: [
+      worktreeSetupFlaggedFixture,
+      worktreePendingFixture,
+      worktreeMissingFixture,
+      worktreeErrorFixture,
+    ],
+    discovered: [discoveredWorktreeFixture],
+    repo: { git_backed: true, git_available: true },
+  },
+  [BRANAS.id]: emptyWorktreeListingFixture,
+  [NOTES.id]: nonGitWorktreeListingFixture,
+};
+
+function renderOverview(overrides: Partial<OsWorkspacesOverviewProps> = {}) {
+  const callbacks = {
+    onOpenChange: vi.fn(),
+    onSelectWorkspace: vi.fn(),
+    onNewWorkspace: vi.fn(),
+    onSelectWorktree: vi.fn(),
+    onCreateWorktree: vi.fn(),
+    onRemoveWorktree: vi.fn(),
+  };
+  const props: OsWorkspacesOverviewProps = {
+    open: true,
+    workspaces: [COMPOZY, BRANAS, NOTES],
+    activeWorkspaceId: COMPOZY.id,
+    reducedMotion: true,
+    worktreesByWorkspace: LISTINGS,
+    userHomeDir: "/Users/ada",
+    selectedWorktreeId: null,
+    ...callbacks,
+    ...overrides,
+  };
+  let currentProps = props;
+  const queryClient = new QueryClient();
+  const view = render(<OsWorkspacesOverview {...props} />, {
+    wrapper: ({ children }: { children: ReactNode }) => (
+      <QueryClientProvider client={queryClient}>{children}</QueryClientProvider>
+    ),
+  });
+  return {
+    ...callbacks,
+    rerenderOverview: (next: Partial<OsWorkspacesOverviewProps>) => {
+      currentProps = { ...currentProps, ...next };
+      view.rerender(<OsWorkspacesOverview {...currentProps} />);
+    },
+  };
+}
+
+function tile(id: string) {
+  return screen.getByTestId(`os-workspace-tile-${id}`);
+}
+
+function caption() {
+  return screen.getByTestId("os-workspaces-caption");
+}
+
+describe("OsWorkspacesOverview", () => {
+  it("Should keep context-menu activation and confirmation keys out of the overview", async () => {
+    const user = userEvent.setup();
+    const callbacks = renderOverview();
+    fireEvent.contextMenu(screen.getByRole("option", { name: "compozy (current)" }));
+    await waitFor(() => expect(screen.getByRole("menu")).toHaveFocus());
+    await user.keyboard("{ArrowDown}{Enter}");
+    const dialog = await screen.findByRole("dialog", { name: "Archive compozy?" });
+    expect(dialog).toBeVisible();
+    expect(callbacks.onSelectWorkspace).not.toHaveBeenCalled();
+    expect(callbacks.onOpenChange).not.toHaveBeenCalled();
+    await user.keyboard("{Enter}");
+    await waitFor(() => expect(dialog).not.toBeInTheDocument());
+    expect(callbacks.onSelectWorkspace).not.toHaveBeenCalled();
+    expect(callbacks.onOpenChange).not.toHaveBeenCalled();
+  });
+  beforeEach(() => vi.clearAllMocks());
+
+  it("Should keep missing folders visible with history selection and lifecycle actions", async () => {
+    const user = userEvent.setup();
+    const { onSelectWorkspace } = renderOverview({
+      workspaces: [{ ...COMPOZY, root_missing: true }],
+    });
+    expect(tile(COMPOZY.id)).toHaveAccessibleName(/Folder not found/);
+    expect(caption()).toHaveTextContent("Folder not found");
+    expect(screen.queryByRole("menuitem", { name: "New worktree" })).not.toBeInTheDocument();
+    await user.click(screen.getByRole("button", { name: "Manage compozy" }));
+    expect(await screen.findByRole("menuitem", { name: "Archive project" })).toBeVisible();
+    expect(screen.getByRole("menuitem", { name: "Remove project" })).toBeVisible();
+    await user.keyboard("{Escape}");
+    await user.dblClick(tile(COMPOZY.id));
+    expect(onSelectWorkspace).toHaveBeenCalledWith(COMPOZY.id);
+  });
+
+  // #1029: a project tile is a project surface: right-click and Shift+F10 open its actions.
+  it("Should open a project's actions from its tile by right-click and Shift+F10", async () => {
+    const user = userEvent.setup();
+    renderOverview();
+    fireEvent.contextMenu(tile(BRANAS.id));
+    expect(await screen.findByRole("menuitem", { name: "Archive project" })).toBeVisible();
+    await user.keyboard("{Escape}");
+    await waitFor(() =>
+      expect(screen.queryByRole("menuitem", { name: "Archive project" })).toBeNull()
+    );
+    tile(COMPOZY.id).focus();
+    await user.keyboard("{Shift>}{F10}{/Shift}");
+    await user.click(await screen.findByRole("menuitem", { name: "Remove project" }));
+    expect(await screen.findByRole("dialog", { name: "Remove compozy?" })).toBeVisible();
+  });
+
+  // A confirm belongs to the project it was opened for: when that project leaves and focus
+  // moves to a neighbor, the confirm closes instead of naming (and acting on) the neighbor.
+  it("Should drop the focused project's confirm when focus moves to another project", async () => {
+    const user = userEvent.setup();
+    const { rerenderOverview } = renderOverview();
+    await user.click(screen.getByRole("button", { name: "Manage compozy" }));
+    await user.click(await screen.findByRole("menuitem", { name: "Archive project" }));
+    expect(await screen.findByRole("dialog", { name: "Archive compozy?" })).toBeVisible();
+
+    rerenderOverview({ workspaces: [BRANAS, NOTES], activeWorkspaceId: BRANAS.id });
+    await waitFor(() =>
+      expect(screen.queryByRole("dialog", { name: "Archive compozy?" })).toBeNull()
+    );
+    expect(screen.queryByRole("dialog", { name: /^Archive / })).toBeNull();
+  });
+
+  it("Should offer lossless archive instead of removal and display refusal blockers", async () => {
+    const user = userEvent.setup();
+    vi.mocked(setWorkspaceArchived).mockRejectedValue(
+      new WorkspaceApiError("Project is busy", 409, "workspace_busy", [
+        { kind: "session", id: "sess-busy", name: "Review changes" },
+      ])
+    );
+    renderOverview();
+    await user.click(screen.getByRole("button", { name: "Manage compozy" }));
+    await user.click(await screen.findByRole("menuitem", { name: "Remove project" }));
+    expect(screen.getByText(/Stopped session history is deleted/)).toBeVisible();
+    await user.click(screen.getByRole("button", { name: "Archive instead" }));
+    await user.click(screen.getByRole("button", { name: "Archive project" }));
+    expect(await screen.findByText("session: Review changes")).toBeVisible();
+    expect(setWorkspaceArchived).toHaveBeenCalledWith(COMPOZY.id, true);
+    expect(deleteWorkspace).not.toHaveBeenCalled();
+    expect(screen.getByRole("dialog", { name: "Archive compozy?" })).toBeVisible();
+  });
+
+  it("Should remove a project only after confirming the dialog", async () => {
+    const user = userEvent.setup();
+    vi.mocked(deleteWorkspace).mockResolvedValue();
+    renderOverview();
+    await user.click(screen.getByRole("button", { name: "Manage compozy" }));
+    await user.click(await screen.findByRole("menuitem", { name: "Remove project" }));
+    expect(deleteWorkspace).not.toHaveBeenCalled();
+    await user.click(screen.getByRole("button", { name: "Remove project" }));
+    await waitFor(() => expect(deleteWorkspace).toHaveBeenCalledWith(COMPOZY.id));
+    await waitFor(() =>
+      expect(screen.queryByRole("dialog", { name: "Remove compozy?" })).not.toBeInTheDocument()
+    );
+  });
+
+  it("Should select ready, missing and discovered rows with bounded select all and clear on Escape", async () => {
+    const user = userEvent.setup();
+    const onRemoveWorktrees = vi.fn();
+    const missing = { ...worktreeMissingFixture, workspace_id: COMPOZY.id };
+    const ready = { ...worktreeBehindFixture, workspace_id: COMPOZY.id };
+    const callbacks = renderOverview({
+      onRemoveWorktrees,
+      worktreesByWorkspace: {
+        [COMPOZY.id]: {
+          worktrees: [ready, missing],
+          discovered: [discoveredWorktreeFixture],
+          repo: { git_backed: true, git_available: true },
+        },
+      },
+    });
+    await user.click(screen.getByText("Select worktrees…"));
+    await user.click(screen.getByRole("menuitemcheckbox", { name: `Select ${missing.name}` }));
+    await user.keyboard("{Control>}a{/Control}");
+    await user.click(screen.getByText("Remove 3 worktrees…"));
+    expect(onRemoveWorktrees.mock.calls[0]?.[0].worktrees).toHaveLength(2);
+    expect(onRemoveWorktrees.mock.calls[0]?.[0].discovered).toEqual([discoveredWorktreeFixture]);
+    expect(callbacks.onSelectWorktree).not.toHaveBeenCalled();
+    await user.keyboard("{Escape}");
+    expect(screen.getByText("Select worktrees…")).toBeInTheDocument();
+    expect(callbacks.onOpenChange).not.toHaveBeenCalledWith(false);
+  });
+
+  it.each(["{Enter}", " "])(
+    "Should activate the focused create action with %s during selection without navigating",
+    async key => {
+      const user = userEvent.setup();
+      const ready = { ...worktreeBehindFixture, workspace_id: COMPOZY.id };
+      const callbacks = renderOverview({
+        onRemoveWorktrees: vi.fn(),
+        worktreesByWorkspace: {
+          [COMPOZY.id]: {
+            worktrees: [ready],
+            discovered: [],
+            repo: { git_backed: true, git_available: true },
+          },
+        },
+      });
+      await user.click(screen.getByText("Select worktrees…"));
+      await user.keyboard("{End}");
+      expect(screen.getByRole("menuitem", { name: "New worktree" })).toHaveFocus();
+      await user.keyboard(key);
+      expect(callbacks.onCreateWorktree).toHaveBeenCalledExactlyOnceWith(COMPOZY.id);
+      expect(callbacks.onSelectWorktree).not.toHaveBeenCalled();
+      expect(callbacks.onSelectWorkspace).not.toHaveBeenCalled();
+    }
+  );
+
+  it("Should return focus to the workspace menubar trigger after closing", async () => {
+    const user = userEvent.setup();
+    function FocusHarness() {
+      const [open, setOpen] = useState(true);
+      return (
+        <>
+          <button type="button" data-slot="os-menubar-workspace">
+            Workspace menu
+          </button>
+          <OsWorkspacesOverview
+            open={open}
+            onOpenChange={setOpen}
+            workspaces={[COMPOZY]}
+            activeWorkspaceId={COMPOZY.id}
+            reducedMotion
+            worktreesByWorkspace={{ [COMPOZY.id]: worktreeListingFixture }}
+            onSelectWorkspace={vi.fn()}
+            onNewWorkspace={vi.fn()}
+          />
+        </>
+      );
+    }
+    render(
+      <QueryClientProvider client={new QueryClient()}>
+        <FocusHarness />
+      </QueryClientProvider>
+    );
+
+    await user.keyboard("{Escape}");
+
+    await waitFor(() =>
+      expect(screen.getByRole("button", { name: "Workspace menu" })).toHaveFocus()
+    );
+  });
+
+  it.each(["project", "worktree"] as const)(
+    "Should hand focus to %s creation without restoring the hidden menubar trigger",
+    async kind => {
+      const title = kind === "project" ? "Add project" : "Create worktree";
+      const user = userEvent.setup();
+      const hiddenFocus: Element[] = [];
+      const recordFocus = (event: FocusEvent) => {
+        const target = event.target;
+        if (target instanceof Element && target.closest('[aria-hidden="true"], [inert]')) {
+          hiddenFocus.push(target);
+        }
+      };
+      function HandoffHarness() {
+        const [open, setOpen] = useState(true);
+        const [creating, setCreating] = useState(false);
+        return (
+          <>
+            <button type="button" data-slot="os-menubar-workspace">
+              Workspace menu
+            </button>
+            <OsWorkspacesOverview
+              open={open}
+              onOpenChange={setOpen}
+              workspaces={[COMPOZY]}
+              activeWorkspaceId={COMPOZY.id}
+              reducedMotion
+              onSelectWorkspace={vi.fn()}
+              onNewWorkspace={() => setCreating(true)}
+              onCreateWorktree={() => setCreating(true)}
+              onRemoveWorktrees={vi.fn()}
+              worktreesByWorkspace={{ [COMPOZY.id]: worktreeListingFixture }}
+            />
+            <Dialog open={creating} onOpenChange={setCreating}>
+              <DialogContent>
+                <DialogTitle>{title}</DialogTitle>
+              </DialogContent>
+            </Dialog>
+          </>
+        );
+      }
+      render(
+        <QueryClientProvider client={new QueryClient()}>
+          <HandoffHarness />
+        </QueryClientProvider>
+      );
+      document.addEventListener("focusin", recordFocus);
+      try {
+        if (kind === "worktree") await user.click(screen.getByText("Select worktrees…"));
+        await user.keyboard("{End}");
+        if (kind === "worktree")
+          expect(screen.getByRole("menuitem", { name: "New worktree" })).toHaveFocus();
+        await user.keyboard("{Enter}");
+        await waitFor(() => expect(screen.getByRole("dialog", { name: title })).toHaveFocus());
+        expect(hiddenFocus).toEqual([]);
+      } finally {
+        document.removeEventListener("focusin", recordFocus);
+      }
+    }
+  );
+
+  it("Should wrap arrow focus across the strip and jump with Home/End", async () => {
+    const user = userEvent.setup();
+    renderOverview();
+    expect(tile(COMPOZY.id)).toHaveFocus();
+
+    // ← from the first tile wraps to the trailing add tile — instantly.
+    await user.keyboard("{ArrowLeft}");
+    expect(screen.getByTestId("os-workspace-tile-add")).toHaveFocus();
+    expect(caption()).toHaveTextContent("New project");
+
+    await user.keyboard("{ArrowRight}");
+    expect(tile(COMPOZY.id)).toHaveFocus();
+    expect(tile(COMPOZY.id)).toHaveAttribute("aria-selected", "true");
+
+    await user.keyboard("{End}");
+    expect(screen.getByTestId("os-workspace-tile-add")).toHaveFocus();
+    await user.keyboard("{Home}");
+    expect(tile(COMPOZY.id)).toHaveFocus();
+    // Home-rooted paths display `~`-contracted in the caption.
+    expect(caption()).toHaveTextContent("~/dev/compozy");
+    expect(caption()).not.toHaveTextContent("/Users/ada");
+  });
+
+  it("Should preserve focused workspace identity when the live list shifts", async () => {
+    const user = userEvent.setup();
+    const callbacks = renderOverview();
+
+    await user.keyboard("{ArrowRight}");
+    expect(tile(BRANAS.id)).toHaveFocus();
+    callbacks.rerenderOverview({ workspaces: [BRANAS, NOTES] });
+    expect(tile(BRANAS.id)).toHaveFocus();
+
+    await user.keyboard("{Enter}");
+    expect(callbacks.onSelectWorkspace).toHaveBeenCalledExactlyOnceWith(BRANAS.id);
+  });
+
+  it("Should focus the nearest workspace when the focused workspace disappears", async () => {
+    const user = userEvent.setup();
+    const callbacks = renderOverview();
+
+    await user.keyboard("{ArrowRight}");
+    expect(tile(BRANAS.id)).toHaveFocus();
+    callbacks.rerenderOverview({ workspaces: [COMPOZY, NOTES] });
+    expect(tile(NOTES.id)).toHaveFocus();
+
+    callbacks.rerenderOverview({ workspaces: [NOTES, COMPOZY] });
+    expect(tile(NOTES.id)).toHaveFocus();
+
+    await user.keyboard("{Enter}");
+    expect(callbacks.onSelectWorkspace).toHaveBeenCalledExactlyOnceWith(NOTES.id);
+  });
+
+  it("Should display worktree row paths home-contracted", async () => {
+    await act(async () => renderOverview());
+    const row = screen.getByTestId(
+      `os-workspaces-worktree-row-${worktreeReadyDirtyRunningFixture.id}`
+    );
+    expect(row).toHaveTextContent("~/");
+    expect(row).not.toHaveTextContent("/Users/ada");
+    expect(row).toHaveAttribute("role", "menuitemradio");
+    expect(row).toHaveAccessibleDescription(/ready.*payments-retry/);
+    expect(screen.getByTestId("os-workspaces-worktree-menu")).toHaveAttribute("role", "menu");
+  });
+
+  it("Should jump by typeahead prefix and cycle a repeated letter through its matches", async () => {
+    const user = userEvent.setup();
+    renderOverview();
+
+    await user.keyboard("n");
+    expect(tile(NOTES.id)).toHaveFocus();
+
+    // "new" matches the add tile: n → notes, repeated n cycles to New.
+    await user.keyboard("n");
+    expect(screen.getByTestId("os-workspace-tile-add")).toHaveFocus();
+  });
+
+  it("Should jump by a non-ASCII workspace-name prefix", async () => {
+    const user = userEvent.setup();
+    renderOverview({
+      workspaces: [{ ...COMPOZY, name: "École" }, BRANAS, NOTES],
+      activeWorkspaceId: BRANAS.id,
+    });
+
+    await user.keyboard("é");
+
+    expect(tile(COMPOZY.id)).toHaveFocus();
+  });
+
+  it("Should trap Tab and Shift+Tab as strip focus movement", async () => {
+    const user = userEvent.setup();
+    renderOverview();
+
+    await user.tab();
+    expect(tile(BRANAS.id)).toHaveFocus();
+
+    await user.tab({ shift: true });
+    expect(tile(COMPOZY.id)).toHaveFocus();
+  });
+
+  it("Should enter the menu on ↓, leave on ↑ at the top, and step Escape one layer at a time", async () => {
+    const user = userEvent.setup();
+    const callbacks = renderOverview();
+
+    await user.keyboard("{ArrowDown}");
+    const firstRow = screen.getByTestId(
+      `os-workspaces-worktree-row-${worktreeReadyDirtyRunningFixture.id}`
+    );
+    expect(firstRow).toHaveFocus();
+
+    await user.keyboard("{ArrowUp}");
+    expect(tile(COMPOZY.id)).toHaveFocus();
+
+    await user.keyboard("{ArrowDown}");
+    expect(firstRow).toHaveFocus();
+
+    // Escape from the menu returns to the strip without closing the overlay.
+    await user.keyboard("{Escape}");
+    expect(tile(COMPOZY.id)).toHaveFocus();
+    expect(callbacks.onOpenChange).not.toHaveBeenCalledWith(false);
+
+    await user.keyboard("{Escape}");
+    expect(callbacks.onOpenChange).toHaveBeenCalledWith(false);
+  });
+
+  it("Should close the kebab popover on Escape before leaving the menu layer", async () => {
+    const user = userEvent.setup();
+    const callbacks = renderOverview();
+
+    await user.keyboard("{ArrowDown}");
+    const kebab = screen.getByTestId(
+      `os-workspaces-worktree-actions-${worktreeReadyDirtyRunningFixture.id}`
+    );
+    // Shift+F10 on the focused row opens its actions popover (a11y contract).
+    await user.keyboard("{Shift>}{F10}{/Shift}");
+    await waitFor(() => expect(kebab).toHaveAttribute("aria-expanded", "true"));
+    expect(
+      await screen.findByTestId(
+        `os-workspaces-worktree-delete-${worktreeReadyDirtyRunningFixture.id}`
+      )
+    ).toBeVisible();
+
+    // First Escape only dismisses the popover; the overlay stays open.
+    await user.keyboard("{Escape}");
+    await waitFor(() => expect(kebab).toHaveAttribute("aria-expanded", "false"));
+    expect(callbacks.onOpenChange).not.toHaveBeenCalledWith(false);
+
+    // The next Escape leaves the menu layer; only the third closes the overlay.
+    await user.keyboard("{Escape}");
+    expect(tile(COMPOZY.id)).toHaveFocus();
+    expect(callbacks.onOpenChange).not.toHaveBeenCalledWith(false);
+    await user.keyboard("{Escape}");
+    expect(callbacks.onOpenChange).toHaveBeenCalledWith(false);
+  });
+
+  it.each(["{Enter}", " "])(
+    "Should keep %s on the worktree actions trigger out of stage activation",
+    async key => {
+      const user = userEvent.setup();
+      const callbacks = renderOverview();
+
+      await user.keyboard("{ArrowDown}");
+      const kebab = screen.getByTestId(
+        `os-workspaces-worktree-actions-${worktreeReadyDirtyRunningFixture.id}`
+      );
+      kebab.focus();
+      await user.keyboard(key);
+
+      await waitFor(() => expect(kebab).toHaveAttribute("aria-expanded", "true"));
+      expect(callbacks.onSelectWorktree).not.toHaveBeenCalled();
+      expect(callbacks.onOpenChange).not.toHaveBeenCalledWith(false);
+    }
+  );
+
+  it("Should skip inert rows while their reasons stay readable in the lane", async () => {
+    const user = userEvent.setup();
+    renderOverview({ worktreesByWorkspace: MIXED_LISTINGS });
+
+    // Inert rows render aria-disabled with a functional reason — never hover-only.
+    const pendingRow = screen.getByTestId(
+      `os-workspaces-worktree-row-${worktreePendingFixture.id}`
+    );
+    expect(pendingRow).toHaveAttribute("aria-disabled", "true");
+    expect(pendingRow).toHaveTextContent("materializing");
+    expect(pendingRow).toHaveAccessibleDescription(/pending.*materializing/);
+    expect(
+      screen.getByTestId(`os-workspaces-worktree-row-${worktreeMissingFixture.id}`)
+    ).toHaveTextContent("directory missing");
+
+    await user.keyboard("{ArrowDown}");
+    expect(
+      screen.getByTestId(`os-workspaces-worktree-row-${worktreeSetupFlaggedFixture.id}`)
+    ).toHaveFocus();
+
+    // ↓ skips pending and lands on the discovered (selectable) row.
+    await user.keyboard("{ArrowDown}");
+    expect(
+      screen.getByTestId(`os-workspaces-worktree-row-discovered:${discoveredWorktreeFixture.path}`)
+    ).toHaveFocus();
+
+    // ↓ again skips missing + error and reaches the create footer row.
+    await user.keyboard("{ArrowDown}");
+    expect(screen.getByTestId("os-workspaces-worktree-create")).toHaveFocus();
+  });
+
+  it("Should activate a tile to the workspace root and close once", async () => {
+    const user = userEvent.setup();
+    const callbacks = renderOverview();
+
+    await user.keyboard("{ArrowRight}{Enter}");
+    expect(callbacks.onSelectWorkspace).toHaveBeenCalledExactlyOnceWith(BRANAS.id);
+    expect(callbacks.onOpenChange).toHaveBeenCalledExactlyOnceWith(false);
+    expect(callbacks.onSelectWorktree).not.toHaveBeenCalled();
+  });
+
+  it("Should scope a worktree row on ↵", async () => {
+    const user = userEvent.setup();
+    const callbacks = renderOverview();
+
+    await user.keyboard("{ArrowDown}{Enter}");
+    expect(callbacks.onSelectWorktree).toHaveBeenCalledTimes(1);
+    const [workspaceId, entry] = callbacks.onSelectWorktree.mock.calls[0] ?? [];
+    expect(workspaceId).toBe(COMPOZY.id);
+    expect(entry?.key).toBe(worktreeReadyDirtyRunningFixture.id);
+    expect(callbacks.onOpenChange).toHaveBeenCalledWith(false);
+    expect(callbacks.onSelectWorkspace).not.toHaveBeenCalled();
+  });
+
+  it("Should preserve focused worktree identity when the live menu shifts", async () => {
+    const user = userEvent.setup();
+    const callbacks = renderOverview();
+
+    await user.keyboard("{ArrowDown}{ArrowDown}");
+    const target = screen.getByTestId(`os-workspaces-worktree-row-${worktreeBehindFixture.id}`);
+    expect(target).toHaveFocus();
+    callbacks.rerenderOverview({
+      worktreesByWorkspace: {
+        ...LISTINGS,
+        [COMPOZY.id]: {
+          ...worktreeListingFixture,
+          worktrees: worktreeListingFixture.worktrees.filter(
+            worktree => worktree.id !== worktreeReadyDirtyRunningFixture.id
+          ),
+        },
+      },
+    });
+    expect(target).toHaveFocus();
+
+    await user.keyboard("{Enter}");
+    const [, entry] = callbacks.onSelectWorktree.mock.calls[0] ?? [];
+    expect(entry?.key).toBe(worktreeBehindFixture.id);
+  });
+
+  it("Should focus the nearest worktree when the focused worktree disappears", async () => {
+    const user = userEvent.setup();
+    const callbacks = renderOverview();
+
+    await user.keyboard("{ArrowDown}");
+    const removed = screen.getByTestId(
+      `os-workspaces-worktree-row-${worktreeReadyDirtyRunningFixture.id}`
+    );
+    expect(removed).toHaveFocus();
+    callbacks.rerenderOverview({
+      worktreesByWorkspace: {
+        ...LISTINGS,
+        [COMPOZY.id]: {
+          ...worktreeListingFixture,
+          worktrees: worktreeListingFixture.worktrees.filter(
+            worktree => worktree.id !== worktreeReadyDirtyRunningFixture.id
+          ),
+        },
+      },
+    });
+    const nearest = screen.getByTestId(`os-workspaces-worktree-row-${worktreeBehindFixture.id}`);
+    expect(nearest).toHaveFocus();
+
+    callbacks.rerenderOverview({
+      worktreesByWorkspace: {
+        ...LISTINGS,
+        [COMPOZY.id]: {
+          ...worktreeListingFixture,
+          worktrees: worktreeListingFixture.worktrees
+            .filter(worktree => worktree.id !== worktreeReadyDirtyRunningFixture.id)
+            .reverse(),
+        },
+      },
+    });
+    expect(nearest).toHaveFocus();
+
+    await user.keyboard("{Enter}");
+    const [, entry] = callbacks.onSelectWorktree.mock.calls[0] ?? [];
+    expect(entry?.key).toBe(worktreeBehindFixture.id);
+  });
+
+  it("Should return focus to the workspace when its live menu becomes empty", async () => {
+    const user = userEvent.setup();
+    const callbacks = renderOverview({ onCreateWorktree: undefined });
+
+    await user.keyboard("{ArrowDown}");
+    expect(
+      screen.getByTestId(`os-workspaces-worktree-row-${worktreeReadyDirtyRunningFixture.id}`)
+    ).toHaveFocus();
+    callbacks.rerenderOverview({
+      worktreesByWorkspace: {
+        ...LISTINGS,
+        [COMPOZY.id]: nonGitWorktreeListingFixture,
+      },
+    });
+    expect(tile(COMPOZY.id)).toHaveFocus();
+
+    await user.keyboard("{Enter}");
+    expect(callbacks.onSelectWorkspace).toHaveBeenCalledExactlyOnceWith(COMPOZY.id);
+  });
+
+  it("Should open the create flow from the menu footer", async () => {
+    const user = userEvent.setup();
+    const callbacks = renderOverview();
+
+    await user.keyboard("{ArrowDown}{End}{Enter}");
+    expect(callbacks.onCreateWorktree).toHaveBeenCalledExactlyOnceWith(COMPOZY.id);
+    expect(callbacks.onOpenChange).toHaveBeenCalledWith(false);
+  });
+
+  it("Should keep picking live with no project focused — the store owns focusing it", async () => {
+    const user = userEvent.setup();
+    const callbacks = renderOverview({ activeWorkspaceId: null });
+
+    expect(screen.queryByText(/All projects is on/)).not.toBeInTheDocument();
+    await user.keyboard("{Enter}");
+    expect(callbacks.onSelectWorkspace).toHaveBeenCalledExactlyOnceWith(COMPOZY.id);
+    expect(callbacks.onOpenChange).toHaveBeenCalledWith(false);
+  });
+
+  it("Should mark the current workspace as root", async () => {
+    await act(async () => renderOverview());
+    expect(tile(COMPOZY.id)).toHaveAttribute("data-current", "root");
+  });
+
+  it("Should move the check into the menu row while the tile carries the branch badge", async () => {
+    await act(async () =>
+      renderOverview({ selectedWorktreeId: worktreeReadyDirtyRunningFixture.id })
+    );
+    expect(tile(COMPOZY.id)).toHaveAttribute("data-current", "wt");
+    expect(
+      screen.getByTestId(`os-workspaces-worktree-row-${worktreeReadyDirtyRunningFixture.id}`)
+    ).toHaveAttribute("aria-checked", "true");
+  });
+
+  it("Should not mark a non-ready worktree as the current scope", async () => {
+    await act(async () =>
+      renderOverview({
+        worktreesByWorkspace: MIXED_LISTINGS,
+        selectedWorktreeId: worktreePendingFixture.id,
+      })
+    );
+
+    expect(tile(COMPOZY.id)).toHaveAttribute("data-current", "root");
+    expect(
+      screen.getByTestId(`os-workspaces-worktree-row-${worktreePendingFixture.id}`)
+    ).toHaveAttribute("aria-checked", "false");
+  });
+
+  it("Should mark only workspaces with working sessions and announce the count", async () => {
+    await act(async () =>
+      renderOverview({ workingSessionsByWorkspace: { [COMPOZY.id]: 1, [BRANAS.id]: 3 } })
+    );
+
+    expect(tile(COMPOZY.id)).toHaveAccessibleName("compozy (current), 1 session working");
+    expect(tile(BRANAS.id)).toHaveAccessibleName("branas-site, 3 sessions working");
+    expect(tile(NOTES.id)).toHaveAccessibleName("notes");
+    expect(tile(BRANAS.id).querySelector('[data-slot="workspace-working-dot"]')).not.toBeNull();
+    expect(tile(NOTES.id).querySelector('[data-slot="workspace-working-dot"]')).toBeNull();
+  });
+
+  it("Should adopt a discovered checkout and delete a ready worktree through their row actions", async () => {
+    const user = userEvent.setup();
+    const callbacks = renderOverview({ worktreesByWorkspace: MIXED_LISTINGS });
+
+    await user.click(
+      screen.getByTestId(`os-workspaces-worktree-row-discovered:${discoveredWorktreeFixture.path}`)
+    );
+    expect(callbacks.onSelectWorktree).toHaveBeenCalledTimes(1);
+    expect(callbacks.onSelectWorktree.mock.calls[0]?.[1]?.key).toBe(
+      `discovered:${discoveredWorktreeFixture.path}`
+    );
+
+    callbacks.rerenderOverview({ worktreesByWorkspace: LISTINGS, open: true });
+    await user.click(
+      screen.getByTestId(`os-workspaces-worktree-actions-${worktreeReadyDirtyRunningFixture.id}`)
+    );
+    const busy = await screen.findByTestId(
+      `os-workspaces-worktree-delete-${worktreeReadyDirtyRunningFixture.id}`
+    );
+    expect(busy).toHaveAttribute("data-disabled");
+    expect(busy).toHaveTextContent("Worktree has an active session");
+    await user.keyboard("{Escape}");
+    await user.click(
+      screen.getByTestId(`os-workspaces-worktree-actions-${worktreeBehindFixture.id}`)
+    );
+    await user.click(
+      await screen.findByTestId(`os-workspaces-worktree-delete-${worktreeBehindFixture.id}`)
+    );
+    expect(callbacks.onRemoveWorktree).toHaveBeenCalledTimes(1);
+    expect(callbacks.onRemoveWorktree.mock.calls[0]?.[1]?.key).toBe(worktreeBehindFixture.id);
+  });
+
+  it("Should show no current marker anywhere with no project focused", async () => {
+    await act(async () => renderOverview({ activeWorkspaceId: null, selectedWorktreeId: null }));
+    expect(tile(COMPOZY.id)).not.toHaveAttribute("data-current");
+    expect(tile(BRANAS.id)).not.toHaveAttribute("data-current");
+    expect(tile(COMPOZY.id)).toHaveAttribute("aria-selected", "false");
+    expect(tile(BRANAS.id)).toHaveAttribute("aria-selected", "false");
+  });
+
+  it("Should report unavailable clipboard access without attempting a copy", async () => {
+    const user = userEvent.setup();
+    const clipboardDescriptor = Object.getOwnPropertyDescriptor(navigator, "clipboard");
+    Object.defineProperty(navigator, "clipboard", { configurable: true, value: undefined });
+    toastMocks.error.mockClear();
+    try {
+      renderOverview();
+      const kebab = screen.getByTestId(
+        `os-workspaces-worktree-actions-${worktreeReadyDirtyRunningFixture.id}`
+      );
+      await user.click(kebab);
+      await user.click(
+        await screen.findByTestId(
+          `os-workspaces-worktree-copy-${worktreeReadyDirtyRunningFixture.id}`
+        )
+      );
+
+      expect(toastMocks.error).toHaveBeenCalledExactlyOnceWith("Could not copy the path");
+    } finally {
+      if (clipboardDescriptor) {
+        Object.defineProperty(navigator, "clipboard", clipboardDescriptor);
+      } else {
+        Reflect.deleteProperty(navigator as unknown as { clipboard?: unknown }, "clipboard");
+      }
+    }
+  });
+
+  it("Should render menu absence truthfully: git+0 → lone create button, non-git → nothing", async () => {
+    const user = userEvent.setup();
+    renderOverview();
+
+    // branas-site is git-backed with zero worktrees: only the dashed button.
+    await user.keyboard("{ArrowRight}");
+    expect(screen.getByTestId("os-workspaces-worktree-new")).toBeInTheDocument();
+    expect(screen.queryByTestId("os-workspaces-worktree-menu")).not.toBeInTheDocument();
+
+    // notes is not git-backed: the affordance is absent, never disabled.
+    await user.keyboard("{ArrowRight}");
+    expect(screen.queryByTestId("os-workspaces-worktree-new")).not.toBeInTheDocument();
+    expect(screen.queryByTestId("os-workspaces-worktree-menu")).not.toBeInTheDocument();
+  });
+
+  it("Should expose every worktree inside the scrolling nest without an overflow jump", async () => {
+    await act(async () =>
+      renderOverview({
+        worktreesByWorkspace: {
+          [COMPOZY.id]: scrollableWorktreesListingFixture,
+          [BRANAS.id]: emptyWorktreeListingFixture,
+          [NOTES.id]: nonGitWorktreeListingFixture,
+        },
+      })
+    );
+
+    const menu = screen.getByTestId("os-workspaces-worktree-menu");
+    const rows = menu.querySelectorAll('[data-slot="os-workspaces-worktree-row"]');
+    expect(rows).toHaveLength(scrollableWorktreesListingFixture.worktrees.length);
+    // Long nests scroll inside the shared frame — the stage never grows past
+    // its cap, and no row folds behind an "All N worktrees" overflow jump.
+    expect(rows[0]?.closest('[data-slot="scroll-area"]')).not.toBeNull();
+    expect(screen.queryByText(/^All \d+ worktrees$/)).not.toBeInTheDocument();
+    // The create row stays reachable below the scroll region, never inside it.
+    const create = screen.getByTestId("os-workspaces-worktree-create");
+    expect(create.closest('[data-slot="scroll-area"]')).toBeNull();
+  });
+
+  it("Should render the one primary and the User identity at zero workspaces", async () => {
+    const user = userEvent.setup();
+    const callbacks = renderOverview({
+      workspaces: [],
+      worktreesByWorkspace: {},
+      activeWorkspaceId: null,
+    });
+
+    expect(
+      screen.getByText("No project folders yet. Sessions run in User until you add one.")
+    ).toBeInTheDocument();
+    expect(caption()).toHaveTextContent("User");
+    expect(caption()).toHaveTextContent("work outside any project");
+    expect(screen.getByTestId("os-workspaces-subtitle")).toHaveTextContent("0 projects");
+
+    await user.click(screen.getByTestId("os-workspaces-new"));
+    expect(callbacks.onNewWorkspace).toHaveBeenCalledTimes(1);
+    expect(callbacks.onOpenChange).toHaveBeenCalledWith(false);
+  });
+
+  it.each(["{Enter}", " "])("Should activate the empty-state button with %s", async key => {
+    const user = userEvent.setup();
+    const callbacks = renderOverview({
+      workspaces: [],
+      worktreesByWorkspace: {},
+      activeWorkspaceId: null,
+    });
+
+    screen.getByTestId("os-workspaces-new").focus();
+    await user.keyboard(key);
+    expect(callbacks.onNewWorkspace).toHaveBeenCalledOnce();
+  });
+
+  it("Should apply the live current workspace when data arrives after an empty mount", async () => {
+    const callbacks = renderOverview({
+      workspaces: [],
+      worktreesByWorkspace: {},
+      activeWorkspaceId: BRANAS.id,
+    });
+
+    await act(async () =>
+      callbacks.rerenderOverview({ workspaces: [COMPOZY, BRANAS], worktreesByWorkspace: LISTINGS })
+    );
+
+    expect(tile(BRANAS.id)).toHaveFocus();
+  });
+
+  it("Should count projects only and singularize one project", async () => {
+    await act(async () =>
+      renderOverview({
+        workspaces: [COMPOZY],
+        worktreesByWorkspace: { [COMPOZY.id]: worktreeListingFixture },
+      })
+    );
+    // Worktrees stay on the tile's own nest; the headline never counts them.
+    expect(screen.getByTestId("os-workspaces-subtitle")).toHaveTextContent(/^1 project$/);
+  });
+});

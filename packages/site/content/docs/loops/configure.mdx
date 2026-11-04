@@ -1,0 +1,165 @@
+---
+title: Configure
+description: Adjust how a Loop runs — its checks, its human gate, its re-attempt strategy, and its stop limits — without changing its structure.
+---
+
+**Configure** is the middle commitment layer: change how a Loop runs without forking it. It opens as
+a sheet over the [detail](/docs/loops/catalog#loop-detail) view and writes a per-Loop config
+overlay — the Loop's structure is untouched.
+
+## What you can tune
+
+The sheet has four groups, all scoped to the checks and limits the Loop already declares:
+
+- **Verification checks** — enable or disable each declared check, and for a generic `command`
+  check, set the project command it runs (a test suite, a linter). Disabling a command check
+  disables its command field. A gate that judges (an `agent-judge` acceptance review) cannot be
+  removed here — that is structure.
+- **Human approval gate** — a single switch to require, or drop, a human approval before the Loop
+  finishes.
+- **Re-attempt strategy** — `failed-only` (the default; retry only what failed), `full-body`
+  (re-run the whole body), or `halt` (end the run on the first node failure without admitting a
+  successor generation). This is where failure handling is chosen, not on the run form.
+- **Stop limits** — the same six numeric limits as the run form's folded Limits panel, each clamped at
+  its daemon ceiling. Configure sets the per-Loop **default**; the run form can still override per
+  run.
+
+**Reset to defaults** restores the definition defaults and `failed-only`. **Save** persists the
+overlay.
+
+## What needs a fork
+
+Configure never changes structure. These belong to the [visual editor](/docs/loops/visual-editor)
+or a definition edit:
+
+- node order or DAG structure;
+- node kinds;
+- input declarations;
+- the contract's terminal states or shape;
+- the goal or definition-of-done.
+
+## How it stores and merges
+
+Configure writes a separate per-Loop config store keyed `(workspace_id, loop_name)` — distinct from
+the definition, which stays filesystem-as-truth. It is read and written through `GET`/`PUT
+/loops/:name/config`, `compozy loop configure`, and `compozy__loop_configure`.
+
+The effective config a run actually uses is a field-by-field merge, bounded by the compile-time
+ceilings. From lowest to highest precedence, its logical sources are:
+
+1. built-in defaults (`builtin`),
+2. the definition (`definition`),
+3. `[loops.defaults.delivery]` or `[loops.defaults.watch]`,
+4. a parent Loop's environment (`inherited_environment`),
+5. this per-Loop configure overlay (`loop_config`),
+6. per-run overrides (`per_run`).
+
+`effective_config.sources` maps each effective field's JSON Pointer, such as `/iteration_cap` or
+`/runtime_defaults/worker/model`, to the source that won. Explicit `0` and `false` values keep their
+source; they are not mistaken for missing overrides. Ordered runtime rules use indexed pointers such
+as `/runtime_rules/0`, while per-run rules use `/run_runtime_rules/0`.
+
+Node reliability resolves more narrowly: authored node fields override the stored per-Loop
+lifecycle layer, which overrides the matching delivery or watch default. The resolved values are
+pinned when work is admitted, so a config reload never rewrites a running attempt. `compozy loop
+inspect -o json` and dry-run report the current effective values and sources. Run status reads the
+effective config from that run's persisted definition snapshot, so later default or overlay changes
+cannot rewrite history.
+
+`GET /loops/:name/config` returns the stored per-Loop override as `config` and the daemon-resolved
+first three layers as `effective_config`. A missing override is `config: null`; it is not a missing
+Loop and does not prevent clients from reading the effective values. Reading or writing config for
+a missing Loop returns `404` and creates no detached override.
+
+Loop `run-agent` workers use Loop-owned `runtime_defaults` and `runtime_rules`; they do not read
+`[[tasks.run.task_runtime_rules]]`. Runtime fields resolve independently and the daemon persists the
+final binder-applied provider, model, reasoning, speed, speed outcome, and provenance on each
+generation output. The
+current web sheet edits checks, gates, re-attempt strategy, and stop limits. Use the structured
+CLI, HTTP, or native-tool config surface to write runtime defaults or rules.
+
+## Use a config file
+
+The two CLI write paths accept the same strict Loop config object as YAML or JSON. Field names use
+`snake_case` in both formats:
+
+```yaml title="loop-config.yaml"
+iteration_cap: 3
+no_progress_window: 10
+gate_max_revisions: 10
+```
+
+Store the file as the Loop's workspace default with `--file`, or apply it only to one run with
+`--config-file`:
+
+```bash
+compozy loop configure --name reviews-watch --file loop-config.yaml --workspace .
+compozy loop run --name reviews-watch --config-file loop-config.yaml --workspace .
+```
+
+Unknown fields fail before the CLI calls the daemon, so a misspelled key cannot create a partial
+override. JSON files use the same field names.
+
+## Lifecycle defaults
+
+`reconcile_interval` sits in the top-level `[loops]` table, above the `[loops.defaults.*]` tables
+described below. It controls how often the daemon repairs execution records left live after a Loop
+has ended:
+
+```toml
+[loops]
+reconcile_interval = "1m"
+```
+
+It defaults to `1m`, must be a positive duration, and requires a daemon restart. The daemon always
+runs the same repair once during startup before task recovery begins.
+
+The current Configure sheet does not edit lifecycle policy. Set these operator defaults under both
+`[loops.defaults.delivery]` and `[loops.defaults.watch]` in `config.toml`:
+
+| Group        | Keys                                             | Shipped defaults          |
+| ------------ | ------------------------------------------------ | ------------------------- |
+| `retry`      | `max_attempts`, `backoff_base`, `backoff_max`    | `3`, `1s`, `30s`          |
+| `liveness`   | `silence_window`                                 | `30m`; `0` disables flags |
+| `resume`     | `death_streak_limit`                             | `3`                       |
+| `predicates` | `cost_limit`                                     | `10000`                   |
+| `waits`      | `admission_attempts`, `admission_retry_interval` | `3`, `60s`                |
+| `requests`   | `expire_after`                                   | empty; author must expire |
+| `admission`  | `tombstone_horizon`                              | `168h`                    |
+| `autopause`  | ordered `{ match, action = "pause" }` rules      | none                      |
+
+`[loops.breaker]` is global rather than per kind because target health is shared within a
+workspace. Its defaults are `threshold = 5` consecutive transport failures and
+`probe_interval = "60s"`. See the [config.toml reference](/docs/configuration/config-toml)
+for complete TOML.
+
+The scalar lifecycle paths and the two breaker paths are available through structured config
+get/set/unset surfaces. For example:
+
+```bash
+compozy config set loops.defaults.delivery.retry.max_attempts 4
+compozy config set loops.reconcile_interval 45s
+compozy config set loops.defaults.delivery.requests.expire_after 72h
+compozy config set loops.breaker.probe_interval 90s
+```
+
+`autopause` is deliberately file-owned: rules are ordered, append-merged, and first match wins, so
+agents cannot mutate them one scalar at a time. Node-level `retry`, `deadline`, and related DSL
+fields remain author-owned structure.
+
+<OperatorNote label="No cost cap">
+  There is no USD field in Configure. Cost is
+  [display-only](/docs/loops/guardrails#cost-is-a-meter-not-a-cap); spend is bounded by the token
+  budget and iteration cap, not by dollars.
+</OperatorNote>
+
+## From an agent
+
+Configure is fully agent-manageable — the same overlay, written structurally:
+
+| Action       | CLI                                | HTTP                      | Native tool                          |
+| ------------ | ---------------------------------- | ------------------------- | ------------------------------------ |
+| Read config  | —                                  | `GET /loops/:name/config` | `compozy__loop_inspect` (definition) |
+| Write config | `compozy loop configure --set k=v` | `PUT /loops/:name/config` | `compozy__loop_configure`            |
+
+See the [`compozy loop`](/docs/cli/loop) CLI and the [Loops API](/docs/api/loops).

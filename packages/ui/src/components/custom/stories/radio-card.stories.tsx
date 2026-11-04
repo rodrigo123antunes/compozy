@@ -1,0 +1,175 @@
+import type { Meta, StoryObj } from "@storybook/react-vite";
+import { useState } from "react";
+
+import { Pill } from "@compozy/ui";
+import { Ban, CpuIcon, Hourglass, ServerIcon, ZapIcon } from "../../../icons";
+import { RadioCard } from "../radio-card";
+
+const meta: Meta<typeof RadioCard> = {
+  title: "components/custom/RadioCard",
+  component: RadioCard,
+  parameters: {
+    layout: "padded",
+    docs: {
+      description: {
+        component:
+          "Single radio choice rendered as a card. Resting state is a `--canvas` card with `shadow-card`; selected state fills with `--selected` and a 1 px inset `--line-strong` ring (no accent).",
+      },
+    },
+  },
+  decorators: [
+    Story => (
+      <div className="w-[480px] bg-background p-4">
+        <Story />
+      </div>
+    ),
+  ],
+};
+
+export default meta;
+type Story = StoryObj<typeof meta>;
+
+interface Provider {
+  id: "anthropic" | "openai" | "local";
+  title: string;
+  description: string;
+  icon: typeof CpuIcon;
+  badge?: string;
+}
+
+const PROVIDERS: ReadonlyArray<Provider> = [
+  {
+    id: "anthropic",
+    title: "Anthropic Claude",
+    description: "Bound to ~/.claude credentials.",
+    icon: CpuIcon,
+    badge: "Default",
+  },
+  { id: "openai", title: "OpenAI", description: "Bound to OPENAI_API_KEY env.", icon: ZapIcon },
+  {
+    id: "local",
+    title: "Local llama.cpp",
+    description: "Connect to a local model server.",
+    icon: ServerIcon,
+  },
+];
+
+/**
+ * Three options stacked in a column; selection state animates only the border + tint.
+ */
+export const ProviderPicker: Story = {
+  args: {},
+  render: () => {
+    const [selected, setSelected] = useState<Provider["id"]>("anthropic");
+    return (
+      <div role="radiogroup" aria-label="Pick a provider" className="flex flex-col gap-2">
+        {PROVIDERS.map(provider => (
+          <RadioCard
+            key={provider.id}
+            title={provider.title}
+            description={provider.description}
+            icon={provider.icon}
+            selected={selected === provider.id}
+            onSelect={() => setSelected(provider.id)}
+            badge={provider.badge ? <Pill tone="brand">{provider.badge}</Pill> : undefined}
+          />
+        ))}
+      </div>
+    );
+  },
+};
+
+/**
+ * Static selected vs unselected for visual diffing.
+ */
+export const SelectedVsRest: Story = {
+  args: {},
+  render: () => (
+    <div role="radiogroup" aria-label="Sample" className="flex flex-col gap-2">
+      <RadioCard
+        title="Selected option"
+        description="`--selected` background + 1 px inset `--line-strong` ring."
+        icon={CpuIcon}
+        selected
+        onSelect={() => undefined}
+      />
+      <RadioCard
+        title="Resting option"
+        description="Hover steps the surface to `--surface-2`."
+        icon={ZapIcon}
+        selected={false}
+        onSelect={() => undefined}
+      />
+    </div>
+  ),
+};
+
+/**
+ * Opt-in 28px icon well from the modal RadioCard contract. Default wells stay
+ * the 20px glyph slot.
+ */
+export const IconWellLg: Story = {
+  args: {},
+  render: () => (
+    <div role="radiogroup" aria-label="Pause mode" className="flex flex-col gap-2">
+      <RadioCard
+        description="Nothing is interrupted. The lane parks once the attempt in flight settles."
+        icon={Hourglass}
+        iconWellSize="lg"
+        onSelect={() => undefined}
+        selected
+        title="Let the current attempt finish"
+      />
+      <RadioCard
+        description="The in-flight attempt is asked to cancel, then the lane parks."
+        icon={Ban}
+        iconWellSize="lg"
+        onSelect={() => undefined}
+        selected={false}
+        title="Ask the current attempt to stop"
+      />
+    </div>
+  ),
+};
+
+/**
+ * Long vault-style refs wrap inside the title slot via `titleClassName`
+ * instead of truncating mid-path.
+ */
+export const WrapFriendlyTitle: Story = {
+  args: {},
+  render: () => (
+    <div role="radiogroup" aria-label="Vault references" className="flex flex-col gap-2">
+      <RadioCard
+        selected
+        onSelect={() => undefined}
+        title={
+          <code className="block break-all font-mono text-mono-id font-normal leading-snug tracking-normal text-fg">
+            vault/mcp/github/personal_access_token_with_a_very_long_operator_facing_ref
+          </code>
+        }
+        titleClassName="overflow-visible whitespace-normal font-normal tracking-normal"
+        badge={
+          <Pill mono size="xs" tone="success">
+            present
+          </Pill>
+        }
+      />
+      <RadioCard
+        selected={false}
+        onSelect={() => undefined}
+        title={
+          <code className="block break-all font-mono text-mono-id font-normal leading-snug tracking-normal text-fg">
+            vault/mcp/short-ref
+          </code>
+        }
+        titleClassName="overflow-visible whitespace-normal font-normal tracking-normal"
+        badge={
+          <Pill mono size="xs" tone="destructive">
+            missing
+          </Pill>
+        }
+      />
+    </div>
+  ),
+};

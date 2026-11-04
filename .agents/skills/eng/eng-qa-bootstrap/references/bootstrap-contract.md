@@ -1,0 +1,157 @@
+# QA Bootstrap Contract
+
+The bootstrap helper writes two canonical artifacts under:
+
+`<qa-output-path>/qa/`
+
+## Required files
+
+- `bootstrap-manifest.json`
+- `bootstrap.env`
+- `scenario-contract.json`
+- `behavioral-scenario-charter.yaml`
+- `journey-log.jsonl`
+- `provider-attempt.json`
+
+## Required manifest fields
+
+```json
+{
+  "schema_version": 1,
+  "scenario_slug": "release-qa",
+  "workspace_path": "/abs/path/to/lab",
+  "qa_output_path": "/abs/path/to/lab/qa-artifacts",
+  "manifest_path": "/abs/path/to/lab/qa-artifacts/qa/bootstrap-manifest.json",
+  "bootstrap_env_path": "/abs/path/to/lab/qa-artifacts/qa/bootstrap.env",
+  "status": {
+    "reused_lab": true,
+    "health": "healthy",
+    "notes": []
+  },
+  "env": {
+    "SCENARIO_SLUG": "release-qa",
+    "WORKSPACE_PATH": "/abs/path/to/lab",
+    "RUNTIME_WORKSPACE_PATH": "/abs/path/to/lab/project",
+    "QA_OUTPUT_PATH": "/abs/path/to/lab/qa-artifacts",
+    "COMPOZY_HOME": "/abs/path/to/lab/.compozy/runtime",
+    "COMPOZY_HTTP_PORT": "2235",
+    "COMPOZY_UDS_PATH": "/abs/path/to/lab/.compozy/runtime/compozyd.sock",
+    "TMUX_BRIDGE_SOCKET": "/abs/path/to/lab/.compozy/runtime/tmux-bridge.sock",
+    "COMPOZY_WEB_API_PROXY_TARGET": "http://127.0.0.1:2235",
+    "PROVIDER_HOME": "/abs/path/to/lab/.provider-home",
+    "PROVIDER_CODEX_HOME": "/abs/path/to/lab/.provider-home/.codex",
+    "BROWSER_MODE": "browser-use",
+    "BROWSER_BLOCKER": "",
+    "SCENARIO_CONTRACT": "/abs/path/to/lab/qa-artifacts/qa/scenario-contract.json",
+    "BEHAVIORAL_CHARTER": "/abs/path/to/lab/qa-artifacts/qa/behavioral-scenario-charter.yaml",
+    "JOURNEY_LOG": "/abs/path/to/lab/qa-artifacts/qa/journey-log.jsonl",
+    "PROVIDER_ATTEMPT": "/abs/path/to/lab/qa-artifacts/qa/provider-attempt.json",
+    "AUDIT_COMMAND": "/abs/path/to/repo/.agents/skills/eng/eng-real-scenario-qa/scripts/audit-qa-evidence.py",
+    "TEARDOWN_COMMAND": "python3 /abs/path/to/repo/.agents/skills/eng/eng-qa-bootstrap/scripts/teardown-qa-env.py --manifest /abs/path/to/lab/qa-artifacts/qa/bootstrap-manifest.json",
+    "PLAYBOOK_REF": "northstar-pay",
+    "KICKOFF_POSTED": "false",
+    "KICKOFF_TIMESTAMP": ""
+  },
+  "browser": {
+    "mode": "browser-use",
+    "blocker": ""
+  },
+  "project_contract": {}
+}
+```
+
+## QA evidence contract files
+
+- `scenario-contract.json` defines the release-grade minimums that downstream QA must satisfy before a `PASS` claim.
+- An explicit `targeted` profile requires only its declared `--required-surface` values; it does not invent agent, Task, artifact-reuse, disruption, or provider minimums for a bounded non-agent journey.
+- `behavioral-scenario-charter.yaml` is JSON-compatible YAML. It must name the startup situation, operator intent, business outcome, agents, task tree, provider plan, cross-surface targets, disruption probes, and artifacts. When `--playbook` was passed, the charter is materialized from the playbook spec and includes `playbook_ref`, `required_deliverables`, and `required_collaboration`.
+- `journey-log.jsonl` is append-only structured evidence. Each meaningful CLI/API/Web/runtime/provider action must add one row.
+- `provider-attempt.json` records live provider-backed proof or the exact blocked boundary. A blocked provider boundary supports a `BLOCKED` result, not a live-provider `PASS`.
+- The auditor writes `qa-audit-report.json` and `qa-audit-report.md`; exit code `2` is a blocking QA failure.
+
+## Playbook scaffolding (when --playbook is passed)
+
+The bootstrap helper additionally writes the following under `WORKSPACE_PATH`:
+
+- `.compozy/playbook.json` — the resolved playbook spec (the canonical structured JSON parsed from `references/playbooks/<ref>.md`).
+- `.compozy/agents/<agent-id>.json` — one file per agent declared by the playbook (id, role, persona, system_prompt, workspace_id, workspace_path, skills, playbook_ref).
+- `.compozy/tasks/open-tasks.json` — array of open tasks with deterministic `runtime_id`, owner_agent, owner_workspace_id, owner_workspace_path, deliverable_type, deliverable_path, review_required_by, playbook_ref.
+- `.compozy/disruption-seeds.json` — playbook disruption_probe_seeds for downstream consumers.
+- `project/` — the only root registered with Compozy for agents under test; it excludes `qa-artifacts/`, manifests, audit contracts, and provider evidence.
+- `project/workspaces/<workspace-name>/README.md` — per-workspace stub README.
+
+`PLAYBOOK_REF` and `KICKOFF_POSTED=false` are written to the manifest env. `eng-real-scenario-qa` Step 4 flips `KICKOFF_POSTED=true` and sets `KICKOFF_TIMESTAMP` after posting the single in-persona kickoff.
+
+## Reuse policy
+
+- Default to a fresh lab for each new QA pass, even when an older lab exists for the same feature or scenario.
+- Reuse a lab only when the caller passes the exact manifest path from the same active QA session or loop continuation.
+- Repair that same-session lab in place before rebuilding when only derived files are missing.
+- Rebuild when the requested manifest is missing, unreadable, or points at missing directories.
+
+## Provider access
+
+The manifest's `provider_access` object records `live_provider`, `resources_enabled`,
+`usage_enabled` and the decision `reason`. The persisted scenario contract owns this
+decision on reuse, including legacy manifests. `feature`, `broad` and playbooks
+require the provider surface. Targeted labs opt in only through
+`--required-surface provider`; other targeted labs never copy operator provider files
+or link global Codex skills/cache. `PROVIDER_CODEX_HOME` still exists as an empty,
+isolated config home so manifest consumers and strict auditing keep working.
+
+Live-provider labs copy only `auth.json`, `installation_id`, and `version.json`
+with mode `0600`, and link global skills/cache. The operator originals are never
+modified. Native CLI commands with `home_policy=operator` still preserve operator
+HOME/login; isolated/brokered commands use the manifest's provider home.
+Bootstrap does not change those launch lanes.
+
+`[provider_usage] enabled = false` is written before the first daemon launch,
+including live-provider labs. `--enable-provider-usage` explicitly enables it and
+requires the provider surface; this choice persists on same-session reuse. Reuse
+of a legacy lab disables collection by default and removes unnecessary copied
+resources. Stop an already-running legacy daemon before upgrading/reusing its lab,
+then restart with the manifest config; bootstrap cannot undo earlier account calls.
+
+## Mandatory launch rules
+
+- Bound-secret, brokered, or explicitly isolated-home provider commands: `HOME="$PROVIDER_HOME" CODEX_HOME="$PROVIDER_CODEX_HOME" <cmd>`
+- `native_cli` providers with `home_policy=operator`: preserve the operator `HOME` / native login state unless the scenario explicitly validates isolated provider-home behavior
+- Web dev server for isolated daemon QA: `COMPOZY_WEB_API_PROXY_TARGET="$COMPOZY_WEB_API_PROXY_TARGET" make web-dev`
+- Config mutations such as `compozy config set` must run sequentially when they target the same isolated home.
+- Before claiming behavior-first QA completion, run `python3 "$AUDIT_COMMAND" --qa-output-path "$QA_OUTPUT_PATH" --strict` and include its result in the verification report.
+- Every long-lived process started against the lab (daemon, `make web-dev`, watchers, browser sessions started outside `agent-browser`'s own lifecycle) must register its PID at `<QA_OUTPUT_PATH>/qa/pids/<name>.pid` right after spawn (`python3 .agents/skills/eng/eng-qa-bootstrap/scripts/qa_process_identity.py --pid "$!" --file "$QA_OUTPUT_PATH/qa/pids/<name>.pid"`). The registry records the process start time and command, which teardown revalidates before each individual signal. Bare legacy PID files and port listeners alone never prove ownership; command-line or open-file evidence must independently identify the lab. Teardown never signals an entire process group.
+
+## Mandatory teardown (process hygiene)
+
+A QA pass is not complete while lab processes are alive. On every terminal path — pass, fail, blocked, or aborted — run:
+
+```bash
+eval "$TEARDOWN_COMMAND"            # single lab, from the manifest
+```
+
+Use `make qa-reap` only for intentional machine-wide stale-lab recovery, not normal cleanup while unrelated runs may be active. `PURGE=1` additionally deletes runtime directories after a clean sweep and requires that deletion to be in scope.
+
+- The teardown stops the daemon gracefully first (`compozy daemon stop` under the lab `COMPOZY_HOME`), kills the lab tmux server, then sweeps survivors (registered PIDs, cmdline references, lab-port listeners, open files under the runtime/provider homes).
+- It writes `<QA_OUTPUT_PATH>/qa/teardown.json` and stamps a `teardown` block into the manifest. `"clean": true` in that block is the required completion evidence.
+- It always removes copied provider files and global Codex skills/cache links, without `PURGE=1`. Evidence lists `provider_resources_removed` and `provider_resource_errors`; a failed removal makes `clean` false and exits 1. Dry-run preserves resources.
+- For leftover copies from earlier labs, run targeted teardown with that lab's manifest, or intentionally run `make qa-reap` for all stale labs. Bare short runtime roots are included. Never remove the operator originals; inspect only path existence, not credential contents. Do not run machine-wide reap while unrelated labs are active.
+- Exception: a lab may stay alive ONLY while the same active session/loop continues using it (reuse policy above). A continuation that ends without reusing the lab inherits the teardown obligation.
+- Exit code `1` (survivors remain) is a blocking failure: diagnose the survivors, do not ignore them.
+- Classify survivors from the final process-liveness check after escalation. An earlier signal permission error remains blocking only while that PID is still alive; a terminated PID must never appear in both `killed` and `survivors`.
+
+## Machine-readable continuation block
+
+Append this block to the end of a QA summary whenever a continuation may need to reuse the lab:
+
+```text
+[QA_BOOTSTRAP]
+manifest_path=/abs/path/to/lab/qa-artifacts/qa/bootstrap-manifest.json
+lab_root=/abs/path/to/lab
+runtime_home=/abs/path/to/lab/.compozy/runtime
+base_url=http://127.0.0.1:2235
+verification_report=/abs/path/to/lab/qa-artifacts/qa/verification-report.md
+health_status=healthy
+[/QA_BOOTSTRAP]
+```
+
+Keep the keys exactly as shown so external loop tooling can parse them deterministically.

@@ -1,0 +1,106 @@
+import { Eyebrow, FormSection, ImmutableIdentity, Input, RequiredMark } from "@compozy/ui";
+
+import type { ProviderDraft } from "../types";
+import type { ProviderDraftChange } from "./provider-edit-form";
+import { ModalSettingsFieldRow } from "./settings-field-row";
+
+interface ProviderGeneralFieldsProps {
+  mode: "create" | "edit";
+  draft: ProviderDraft;
+  onChange: ProviderDraftChange;
+}
+
+/**
+ * Provider basics — name, display name, and the launch command.
+ *
+ * On edit the name renders as `ImmutableIdentity`: `PutSettingsProvider` keys
+ * the overlay by its path name, so renaming is a create, and a disabled input
+ * is forbidden as a data display (`MODAL-STANDARD.md` § Component grammar).
+ */
+export function ProviderGeneralFields({ mode, draft, onChange }: ProviderGeneralFieldsProps) {
+  const isCreate = mode === "create";
+
+  return (
+    <FormSection data-testid="settings-providers-editor-basics" title="Provider basics">
+      {isCreate ? (
+        <ModalSettingsFieldRow
+          control={
+            <Input
+              autoFocus
+              className="w-56 font-mono"
+              data-testid="settings-providers-editor-name-input"
+              onChange={event => onChange(current => ({ ...current, name: event.target.value }))}
+              placeholder="e.g. claude"
+              value={draft.name}
+            />
+          }
+          data-testid="settings-providers-editor-name"
+          help="Lower-case identifier used in agent frontmatter and CLI flags."
+          label={
+            <>
+              Name
+              <RequiredMark />
+            </>
+          }
+        />
+      ) : (
+        <ImmutableIdentity
+          data-testid="settings-providers-editor-identity"
+          hint="Provider identity is immutable — create a new provider to rename it."
+          rows={[{ label: "Provider", mono: true, value: draft.name }]}
+        />
+      )}
+
+      <ModalSettingsFieldRow
+        control={
+          <Input
+            className="w-56"
+            data-testid="settings-providers-editor-display-name-input"
+            onChange={event =>
+              onChange(current => ({ ...current, display_name: event.target.value }))
+            }
+            placeholder="OpenRouter"
+            value={draft.display_name}
+          />
+        }
+        data-testid="settings-providers-editor-display-name"
+        label={
+          <>
+            Display name
+            <Eyebrow className="ml-1.5 text-subtle">optional</Eyebrow>
+          </>
+        }
+      />
+
+      <ModalSettingsFieldRow
+        control={
+          <Input
+            className="w-72 font-mono"
+            data-testid="settings-providers-editor-command-input"
+            onChange={event =>
+              onChange(current => ({
+                ...current,
+                command: event.target.value,
+                command_dirty: true,
+              }))
+            }
+            placeholder="npx @agentclientprotocol/claude-agent-acp@latest"
+            value={draft.command}
+          />
+        }
+        data-testid="settings-providers-editor-command"
+        help={
+          isCreate
+            ? "The program CompozyOS starts to run this agent."
+            : "The program CompozyOS starts to run this agent. Leave empty to use the default."
+        }
+        label={
+          <>
+            Command
+            {isCreate ? <RequiredMark /> : null}
+          </>
+        }
+      />
+    </FormSection>
+  );
+}

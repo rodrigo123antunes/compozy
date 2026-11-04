@@ -1,0 +1,285 @@
+package config
+
+import (
+	"errors"
+	"time"
+
+	"regexp"
+)
+
+const (
+	providerAnthropicKey = "anthropic"
+	providerClaudeKey    = "claude"
+)
+
+const (
+	providerNodeOptionsValue           = "NODE_OPTIONS"
+	providerAnthropicClaudeOpus47Path  = "anthropic/claude-opus-4-7"
+	providerAgyKey                     = "agy"
+	providerClaudeCodeAlias            = "claude-code"
+	providerGeminiKey                  = "gemini"
+	modelClaudeOpus47ID                = "claude-opus-4-7"
+	providerCodexKey                   = "codex"
+	providerCopilotKey                 = "copilot"
+	providerGemini31ProPreviewPath     = "gemini-3.1-pro-preview"
+	providerGlm46Path                  = "glm-4.6"
+	providerGrokAlias                  = "grok"
+	providerGrok4FastNonReasoningValue = "grok-4-fast-non-reasoning"
+	providerHighKey                    = "high"
+	providerKimiAlias                  = "kimi"
+	providerKimiCLIValue               = "kimi-cli"
+	providerKimiCodingValue            = "kimi-coding"
+	providerKimiK2ThinkingValue        = "kimi-k2-thinking"
+	providerMediumKey                  = "medium"
+	providerMoonshotKey                = "moonshot"
+	claudeProviderCommand              = "npx -y @agentclientprotocol/claude-agent-acp@latest"
+	providerOpenaiGpt54Path            = "openai/gpt-5.4"
+	providerOpencodeKey                = "opencode"
+	providerOpenrouterKey              = "openrouter"
+	providerQwenAlias                  = "qwen"
+	providerQwenCodeValue              = "qwen-code"
+	providerQwen36PlusPath             = "qwen3.6-plus"
+	providerVercelAIGatewayValue       = "vercel-ai-gateway"
+	providerXaiKey                     = "xai"
+	providerXaiDotAlias                = "x.ai"
+	providerZaiKey                     = "zai"
+)
+
+var providerSecretRefSegmentPattern = regexp.MustCompile(`^[a-z0-9][a-z0-9_.-]*$`)
+
+// ProviderHarness identifies the runtime strategy used to launch a provider.
+type ProviderHarness string
+
+const (
+	// ProviderHarnessACP launches the configured command directly as an ACP runtime.
+	ProviderHarnessACP ProviderHarness = "acp"
+	// ProviderHarnessPiACP launches pi through the pi-acp adapter and materializes provider settings.
+	ProviderHarnessPiACP ProviderHarness = "pi_acp"
+)
+
+// ProviderAuthMode identifies who owns launch-time provider authentication.
+type ProviderAuthMode string
+
+const (
+	// ProviderAuthModeNativeCLI lets the provider CLI use its own login/session state.
+	ProviderAuthModeNativeCLI ProviderAuthMode = "native_cli"
+	// ProviderAuthModeBoundSecret injects explicitly configured credential slots at launch.
+	ProviderAuthModeBoundSecret ProviderAuthMode = "bound_secret"
+	// ProviderAuthModeNone launches the provider without Compozy-managed credentials.
+	ProviderAuthModeNone ProviderAuthMode = "none"
+)
+
+// ProviderEnvPolicy identifies which daemon environment is inherited by a provider process.
+type ProviderEnvPolicy string
+
+const (
+	// ProviderEnvPolicyFiltered removes secret-shaped daemon variables but keeps operator context.
+	ProviderEnvPolicyFiltered ProviderEnvPolicy = "filtered"
+	// ProviderEnvPolicyIsolated keeps only a fixed operational allowlist.
+	ProviderEnvPolicyIsolated ProviderEnvPolicy = "isolated"
+)
+
+// ProviderHomePolicy identifies whether provider CLI state comes from the operator home or an isolated home.
+type ProviderHomePolicy string
+
+const (
+	// ProviderHomePolicyOperator lets native CLIs read their existing operator login state.
+	ProviderHomePolicyOperator ProviderHomePolicy = "operator"
+	// ProviderHomePolicyIsolated points native CLIs at an Compozy-owned provider home.
+	ProviderHomePolicyIsolated ProviderHomePolicy = "isolated"
+)
+
+// ProviderNoneSecurity identifies why auth_mode=none is safe for a provider.
+type ProviderNoneSecurity string
+
+const (
+	// ProviderNoneSecurityLocalTransport limits unauthenticated providers to local transport.
+	ProviderNoneSecurityLocalTransport ProviderNoneSecurity = "local_transport"
+	// ProviderNoneSecurityExternalIdentity delegates authentication to the provider transport.
+	ProviderNoneSecurityExternalIdentity ProviderNoneSecurity = "external_identity"
+	// ProviderNoneSecurityPublicReadonly permits unauthenticated public read-only providers.
+	ProviderNoneSecurityPublicReadonly ProviderNoneSecurity = "public_readonly"
+)
+
+// ProviderCredentialSlot describes one launch-time secret binding needed by a provider.
+type ProviderCredentialSlot struct {
+	Name      string `toml:"name"`
+	TargetEnv string `toml:"target_env"`
+	SecretRef string `toml:"secret_ref"`
+	Kind      string `toml:"kind,omitempty"`
+	Required  bool   `toml:"required"`
+}
+
+// ModelCatalogConfig controls daemon-owned model catalog sources.
+type ModelCatalogConfig struct {
+	Sources ModelCatalogSourcesConfig `toml:"sources,omitempty"`
+}
+
+// ModelCatalogSourcesConfig groups built-in model catalog sources.
+type ModelCatalogSourcesConfig struct {
+	ModelsDev ModelsDevSourceConfig `toml:"models_dev,omitempty"`
+}
+
+// ModelsDevSourceConfig controls the models.dev catalog source.
+type ModelsDevSourceConfig struct {
+	Enabled  *bool  `toml:"enabled,omitempty"`
+	Endpoint string `toml:"endpoint,omitempty"`
+	TTL      string `toml:"ttl,omitempty"`
+	Timeout  string `toml:"timeout,omitempty"`
+}
+
+// ProviderConfig describes how to launch a provider in ACP mode.
+type ProviderConfig struct {
+	ReviewerMode     string               `toml:"reviewer_mode,omitempty"`
+	SessionEnv       SessionEnv           `toml:"session_env,omitempty"`
+	Command          string               `toml:"command"`
+	CommandIsBuiltin bool                 `toml:"-"                             json:"-" yaml:"-"`
+	SteerCapability  SteerCapability      `toml:"steer_capability,omitempty"`
+	DisplayName      string               `toml:"display_name,omitempty"`
+	Models           ProviderModelsConfig `toml:"models,omitempty"`
+	Harness          ProviderHarness      `toml:"harness,omitempty"`
+	RuntimeProvider  string               `toml:"runtime_provider,omitempty"`
+	Transport        string               `toml:"transport,omitempty"`
+	BaseURL          string               `toml:"base_url,omitempty"`
+	AuthMode         ProviderAuthMode     `toml:"auth_mode,omitempty"`
+	EnvPolicy        ProviderEnvPolicy    `toml:"env_policy,omitempty"`
+	HomePolicy       ProviderHomePolicy   `toml:"home_policy,omitempty"`
+	NoneSecurity     ProviderNoneSecurity `toml:"none_security,omitempty"`
+	AuthStatusCmd    string               `toml:"auth_status_command,omitempty"`
+	AuthLoginCmd     string               `toml:"auth_login_command,omitempty"`
+	AuthACPMethod    string               `toml:"auth_acp_method,omitempty"`
+	SessionMCP       *bool                `toml:"session_mcp,omitempty"`
+	// SessionMCPTransport chooses how per-session stdio MCP servers reach the
+	// agent. "http" serves them through a loopback HTTP bridge for agents that
+	// accept only remote MCP servers over ACP; empty or "stdio" passes them as-is.
+	SessionMCPTransport MCPServerTransport       `toml:"session_mcp_transport,omitempty"`
+	CredentialSlots     []ProviderCredentialSlot `toml:"credential_slots,omitempty"`
+	MCPServers          []MCPServer              `toml:"mcp_servers,omitempty"`
+}
+
+// MCPServerTransport identifies how Compozy reaches an MCP server.
+type MCPServerTransport string
+
+const (
+	// MCPServerTransportStdio launches a local subprocess and talks MCP over stdio.
+	MCPServerTransportStdio MCPServerTransport = "stdio"
+	// MCPServerTransportHTTP talks to a remote streamable HTTP MCP endpoint.
+	MCPServerTransportHTTP MCPServerTransport = "http"
+)
+
+// MCPAuthRegistration identifies the OAuth client registration strategy.
+type MCPAuthRegistration string
+
+const (
+	// MCPAuthRegistrationAuto resolves CIMD before one dynamic-registration attempt.
+	MCPAuthRegistrationAuto MCPAuthRegistration = "auto"
+	// MCPAuthRegistrationPreRegistered uses issuer and client values declared by the operator.
+	MCPAuthRegistrationPreRegistered MCPAuthRegistration = "pre_registered"
+)
+
+// MCPAuthConfig describes OAuth registration policy and optional pre-registered client values for a remote MCP server.
+type MCPAuthConfig struct {
+	Registration    MCPAuthRegistration `json:"registration,omitempty"      yaml:"registration,omitempty"      toml:"registration,omitempty"`
+	IssuerURL       string              `json:"issuer_url,omitempty"        yaml:"issuer_url,omitempty"        toml:"issuer_url,omitempty"`
+	ClientID        string              `json:"client_id,omitempty"         yaml:"client_id,omitempty"         toml:"client_id,omitempty"`
+	ClientSecretRef string              `json:"client_secret_ref,omitempty" yaml:"client_secret_ref,omitempty" toml:"client_secret_ref,omitempty"`
+	Scopes          []string            `json:"scopes,omitempty"            yaml:"scopes,omitempty"            toml:"scopes,omitempty"`
+}
+
+// ResolvedAgent is the effective runtime configuration for a parsed agent definition.
+type ResolvedAgent struct {
+	ReviewerMode    string
+	SessionEnv      SessionEnv
+	Name            string
+	ProfileName     string
+	Provider        string
+	Command         string
+	DisplayName     string
+	Model           string
+	ReasoningEffort string
+	*AgentRuntimeDefaults
+	Tools              []string
+	Toolsets           []string
+	DenyTools          []string
+	Permissions        string
+	Harness            ProviderHarness
+	RuntimeProvider    string
+	Transport          string
+	BaseURL            string
+	AuthMode           ProviderAuthMode
+	EnvPolicy          ProviderEnvPolicy
+	HomePolicy         ProviderHomePolicy
+	NoneSecurity       ProviderNoneSecurity
+	AuthStatusCmd      string
+	AuthLoginCmd       string
+	AuthACPMethod      string
+	ToolPolicyEnforced bool `json:"-"`
+	CommandIsBuiltin   bool `json:"-" toml:"-" yaml:"-"`
+	SessionMCP         bool
+	// SessionMCPOverHTTP bridges stdio session MCP servers through loopback HTTP.
+	SessionMCPOverHTTP bool
+	// PermissionsConfigured reports that the definition set Permissions; false means settings supplied it.
+	// It sits beside SessionMCP so the struct stays under the hugeParam threshold.
+	PermissionsConfigured bool
+	CredentialSlots       []ProviderCredentialSlot
+	MCPServers            []MCPServer
+	Reasoning             ProviderReasoningConfig
+	RuntimeSources        ResolvedRuntimeSources
+	Prompt                string
+}
+
+// ErrProviderUnavailable reports that a requested provider cannot be resolved
+// from the effective workspace/global config.
+var ErrProviderUnavailable = errors.New("provider unavailable")
+
+const (
+	piACPCommand             = "npx -y pi-acp@latest"
+	piACPAuthLoginCommand    = piACPCommand + " --terminal-login"
+	providerAPIKeyCredential = "api_key"
+	defaultModelsDevEndpoint = "https://models.dev/api.json"
+	defaultModelsDevTTL      = "24h"
+	defaultModelsDevTimeout  = "10s"
+)
+
+var builtinProviderAliases = map[string]string{
+	providerClaudeCodeAlias:      providerClaudeKey,
+	"ai-gateway":                 providerVercelAIGatewayValue,
+	"aigateway":                  providerVercelAIGatewayValue,
+	providerKimiAlias:            providerMoonshotKey,
+	"kimi cli":                   providerKimiCLIValue,
+	providerKimiCLIValue:         providerKimiCLIValue,
+	"kimi-code":                  providerKimiCLIValue,
+	providerKimiCodingValue:      providerMoonshotKey,
+	"moonshotai":                 providerMoonshotKey,
+	"open-code":                  providerOpencodeKey,
+	"opencode-ai":                providerOpencodeKey,
+	providerQwenAlias:            providerQwenCodeValue,
+	"qwen cli":                   providerQwenCodeValue,
+	"qwen code":                  providerQwenCodeValue,
+	providerQwenCodeValue:        providerQwenCodeValue,
+	"vercel":                     providerVercelAIGatewayValue,
+	"vercel-gateway":             providerVercelAIGatewayValue,
+	"vercel-ai":                  providerVercelAIGatewayValue,
+	providerVercelAIGatewayValue: providerVercelAIGatewayValue,
+	"z.ai":                       providerZaiKey,
+	"z-ai":                       providerZaiKey,
+	"z_ai":                       providerZaiKey,
+	"glm":                        providerZaiKey,
+	"openrouter-ai":              providerOpenrouterKey,
+	"openrouter-gateway":         providerOpenrouterKey,
+	providerGrokAlias:            providerXaiKey,
+	"x-ai":                       providerXaiKey,
+	providerXaiDotAlias:          providerXaiKey,
+}
+
+// ProviderUsageConfig controls machine-wide provider usage collection.
+type ProviderUsageConfig struct {
+	Enabled         bool                                   `toml:"enabled"`
+	RefreshInterval time.Duration                          `toml:"refresh_interval"`
+	Providers       map[string]ProviderUsageProviderConfig `toml:"providers,omitempty"`
+}
+
+type ProviderUsageProviderConfig struct {
+	Enabled        bool `toml:"enabled"`
+	KeychainAccess bool `toml:"keychain_access,omitempty"`
+}

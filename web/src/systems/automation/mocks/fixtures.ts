@@ -1,0 +1,401 @@
+import type {
+  AutomationJob,
+  AutomationRun,
+  AutomationSuggestion,
+  AutomationTrigger,
+} from "../types";
+import { storyAgentNames, storySessionIds, storyWorkspaceIds } from "@/storybook/fintech-scenario";
+
+const defaultProfileOwner = {
+  profile_id: "00000000000000000000000000",
+  profile_name: "default",
+} as const;
+
+export const automationJobFixtures: AutomationJob[] = [
+  {
+    ...defaultProfileOwner,
+    id: "job_launch_command_digest",
+    name: "launch-command-digest",
+    agent_name: storyAgentNames.product,
+    prompt:
+      "Summarize launch blockers, fresh approvals, and the next cutover milestone for the launch room.",
+    scope: "workspace",
+    workspace_id: storyWorkspaceIds.hq,
+    source: "dynamic",
+    target_kind: "agent",
+    enabled: true,
+    schedule: {
+      mode: "cron",
+      expr: "*/10 * * * *",
+    },
+    retry: {
+      strategy: "none",
+      max_retries: 0,
+      base_delay: "",
+    },
+    fire_limit: {
+      max: 12,
+      window: "1h",
+    },
+    next_run: "2026-04-17T18:20:00Z",
+    scheduler: {
+      job_id: "job_launch_command_digest",
+      registered: true,
+      next_run_at: "2026-04-17T18:20:00Z",
+      last_run_at: "2026-04-17T18:10:01Z",
+      last_scheduled_at: "2026-04-17T18:10:00Z",
+      last_fire_id: "fire_launch_command_digest_001",
+      catch_up_policy: "skip_missed",
+      misfire_grace_seconds: 30,
+      misfire_count: 0,
+      updated_at: "2026-04-17T18:10:01Z",
+    },
+    created_at: "2026-04-17T14:00:00Z",
+    updated_at: "2026-04-17T18:10:00Z",
+  },
+  {
+    ...defaultProfileOwner,
+    id: "job_launch_crm_release",
+    name: "launch-crm-release",
+    agent_name: storyAgentNames.marketing,
+    prompt:
+      "Release the CRM batch once the launch room confirms canary health and approved pricing copy.",
+    scope: "global",
+    source: "dynamic",
+    target_kind: "agent",
+    enabled: true,
+    retry: {
+      strategy: "backoff",
+      max_retries: 3,
+      base_delay: "5s",
+    },
+    fire_limit: {
+      max: 3,
+      window: "30m",
+    },
+    created_at: "2026-04-17T15:00:00Z",
+    updated_at: "2026-04-17T17:58:00Z",
+  },
+];
+
+export const automationTriggerFixtures: AutomationTrigger[] = [
+  {
+    ...defaultProfileOwner,
+    id: "trg_support_sla_breach",
+    name: "support-sla-breach",
+    agent_name: storyAgentNames.support,
+    prompt:
+      "Investigate the support lane when launch-day SLA exceeds {{ .Data.sla_minutes }} minutes and prepare the operator response.",
+    event: "ext.support.launch.sla_breach",
+    filter: {
+      "data.sla_minutes": ">=4",
+    },
+    scope: "workspace",
+    workspace_id: storyWorkspaceIds.support,
+    source: "dynamic",
+    target_kind: "agent",
+    enabled: true,
+    retry: {
+      strategy: "backoff",
+      max_retries: 4,
+      base_delay: "5s",
+    },
+    fire_limit: {
+      max: 12,
+      window: "1h",
+    },
+    endpoint_slug: "support-sla-breach",
+    webhook_id: "wbh_support_sla_breach",
+    webhook_secret_hash: "sha256:support-sla-breach",
+    webhook_secret_present: true,
+    created_at: "2026-04-17T13:00:00Z",
+    updated_at: "2026-04-17T17:45:00Z",
+  },
+  {
+    ...defaultProfileOwner,
+    id: "trg_copy_claims_review",
+    name: "copy-claims-review",
+    agent_name: storyAgentNames.compliance,
+    prompt:
+      "Review any launch copy revision that changes pricing language or merchant guarantees before publish.",
+    event: "ext.marketing.copy.updated",
+    filter: {
+      "data.claim_class": "=pricing",
+    },
+    scope: "workspace",
+    workspace_id: storyWorkspaceIds.growth,
+    source: "dynamic",
+    target_kind: "agent",
+    enabled: true,
+    retry: {
+      strategy: "backoff",
+      max_retries: 2,
+      base_delay: "10s",
+    },
+    fire_limit: {
+      max: 8,
+      window: "1h",
+    },
+    endpoint_slug: "copy-claims-review",
+    webhook_id: "wbh_copy_claims_review",
+    webhook_secret_hash: "sha256:copy-claims-review",
+    webhook_secret_present: true,
+    created_at: "2026-04-17T14:30:00Z",
+    updated_at: "2026-04-17T17:35:00Z",
+  },
+];
+
+/**
+ * Detail-surface triggers: one per shape the page actually branches on — agent
+ * target, loop target, and a webhook event with published public ingress. They
+ * live in the default story workspace so the detail route resolves them.
+ */
+export const automationTriggerDetailFixtures: AutomationTrigger[] = [
+  {
+    ...defaultProfileOwner,
+    id: "trg_summarize_failures",
+    name: "summarize-failures",
+    agent_name: storyAgentNames.release,
+    prompt:
+      'Session {{ .Data.session_id }} (agent {{ .Data.agent_name }}) stopped with reason "{{ .Data.stop_reason }}".\n\nRead the transcript, summarize what went wrong, the likely root cause, and one suggested next step.',
+    event: "session.stopped",
+    filter: { "data.stop_reason": "error" },
+    scope: "workspace",
+    workspace_id: storyWorkspaceIds.hq,
+    source: "dynamic",
+    target_kind: "agent",
+    enabled: true,
+    retry: { strategy: "backoff", max_retries: 2, base_delay: "5s" },
+    fire_limit: { max: 4, window: "1h" },
+    webhook_secret_present: false,
+    created_at: "2026-04-09T09:12:00Z",
+    updated_at: "2026-04-17T16:40:00Z",
+  },
+  {
+    ...defaultProfileOwner,
+    id: "trg_rerun_delivery",
+    name: "rerun-delivery",
+    agent_name: "",
+    prompt: "",
+    event: "session.stopped",
+    filter: { "data.stop_reason": "error" },
+    scope: "workspace",
+    workspace_id: storyWorkspaceIds.hq,
+    source: "dynamic",
+    target_kind: "loop",
+    loop_target: {
+      workspace_id: storyWorkspaceIds.hq,
+      loop_name: "software-delivery",
+      inputs: { implementer: "code_implementer", target_branch: "main" },
+      input_mapping: { slug: "data.session_name" },
+    },
+    enabled: true,
+    retry: { strategy: "backoff", max_retries: 2, base_delay: "5s" },
+    fire_limit: { max: 4, window: "1h" },
+    webhook_secret_present: false,
+    created_at: "2026-04-14T11:02:00Z",
+    updated_at: "2026-04-17T17:05:00Z",
+  },
+  {
+    ...defaultProfileOwner,
+    id: "trg_deploy_webhook",
+    name: "deploy-webhook",
+    agent_name: storyAgentNames.platform,
+    prompt: 'Validate deployment {{ index .Data "sha" }} on {{ index .Data "branch" }}.',
+    event: "webhook",
+    filter: { "data.action": "deploy", "data.branch": "main" },
+    scope: "workspace",
+    workspace_id: storyWorkspaceIds.hq,
+    source: "dynamic",
+    target_kind: "agent",
+    enabled: true,
+    retry: { strategy: "backoff", max_retries: 2, base_delay: "5s" },
+    fire_limit: { max: 6, window: "1h" },
+    endpoint_slug: "deploy",
+    webhook_id: "wbh_abc123",
+    webhook_secret_hash: "sha256:deploy-webhook",
+    webhook_secret_present: true,
+    ingress: {
+      confirmed_at: "2026-04-16T08:00:00Z",
+      confirmed_endpoint_generation: 4,
+      endpoint_generation: 4,
+      reachability: "live",
+      scope_kind: "workspace",
+      subject_id: "trg_deploy_webhook",
+      subject_kind: "webhook_trigger",
+      url: "https://northstar.gateway.test/api/webhooks/workspaces/ws_launch_hq/deploy--wbh_abc123",
+      workspace_id: storyWorkspaceIds.hq,
+    },
+    created_at: "2026-04-12T10:20:00Z",
+    updated_at: "2026-04-17T17:52:00Z",
+  },
+];
+
+export const automationRunFixtures: AutomationRun[] = [
+  {
+    ...defaultProfileOwner,
+    attribution: "recorded",
+    id: "run_launch_command_digest_001",
+    status: "completed",
+    attempt: 1,
+    job_id: "job_launch_command_digest",
+    fire_id: "fire_launch_command_digest_001",
+    session_id: storySessionIds.product,
+    scheduled_at: "2026-04-17T18:10:00Z",
+    started_at: "2026-04-17T18:10:00Z",
+    ended_at: "2026-04-17T18:10:42Z",
+  },
+  {
+    ...defaultProfileOwner,
+    attribution: "recorded",
+    id: "run_support_sla_breach_002",
+    status: "running",
+    attempt: 1,
+    trigger_id: "trg_support_sla_breach",
+    session_id: storySessionIds.support,
+    started_at: "2026-04-17T18:04:00Z",
+  },
+];
+
+/** Canceled runs the scheduler recorded as durable skips (never dispatched). */
+export const automationRunSkipFixtures: AutomationRun[] = [
+  {
+    ...defaultProfileOwner,
+    attribution: "recorded",
+    id: "run_launch_command_digest_003",
+    status: "canceled",
+    attempt: 1,
+    job_id: "job_launch_command_digest",
+    fire_id: "fire_launch_command_digest_003",
+    scheduled_at: "2026-04-17T18:20:00Z",
+    metadata: { reason: "self_overlap" },
+  },
+  {
+    ...defaultProfileOwner,
+    attribution: "recorded",
+    id: "run_launch_command_digest_004",
+    status: "canceled",
+    attempt: 1,
+    job_id: "job_launch_command_digest",
+    fire_id: "fire_launch_command_digest_004",
+    scheduled_at: "2026-04-17T18:30:00Z",
+    metadata: { reason: "misfire_grace_exceeded" },
+  },
+];
+
+export const automationSuggestionFixtures: AutomationSuggestion[] = [
+  {
+    profile_id: defaultProfileOwner.profile_id,
+    created_at: "2026-04-17T16:00:00Z",
+    dedup_key: "launch-command-digest",
+    id: "suggestion_launch_command_digest",
+    payload: {
+      ...automationJobFixtures[0],
+      id: "job_suggested_launch_command_digest",
+      name: "Launch command digest",
+    },
+    source: "catalog",
+    status: "pending",
+    workspace_id: storyWorkspaceIds.hq,
+  },
+  {
+    profile_id: defaultProfileOwner.profile_id,
+    created_at: "2026-04-17T16:05:00Z",
+    dedup_key: "launch-crm-release",
+    id: "suggestion_launch_crm_release",
+    payload: {
+      ...automationJobFixtures[1],
+      id: "job_suggested_launch_crm_release",
+      name: "Launch CRM release",
+      scope: "workspace",
+      workspace_id: storyWorkspaceIds.hq,
+    },
+    source: "catalog",
+    status: "pending",
+    workspace_id: storyWorkspaceIds.hq,
+  },
+  {
+    profile_id: defaultProfileOwner.profile_id,
+    created_at: "2026-04-17T16:10:00Z",
+    dedup_key: "launch-command-digest-accepted",
+    id: "suggestion_launch_command_digest_accepted",
+    payload: {
+      ...automationJobFixtures[0],
+      id: "job_suggested_launch_command_digest_accepted",
+      name: "Accepted launch command digest",
+    },
+    source: "catalog",
+    status: "accepted",
+    workspace_id: storyWorkspaceIds.hq,
+  },
+];
+
+/** Recent-run samples for the detail-surface triggers, one per status shape. */
+export const automationTriggerDetailRunFixtures: AutomationRun[] = [
+  {
+    ...defaultProfileOwner,
+    attribution: "recorded",
+    id: "run_summarize_failures_001",
+    status: "completed",
+    attempt: 1,
+    trigger_id: "trg_summarize_failures",
+    session_id: "sess_release_control",
+    started_at: "2026-04-17T16:38:04Z",
+    ended_at: "2026-04-17T16:38:22Z",
+  },
+  {
+    ...defaultProfileOwner,
+    attribution: "recorded",
+    id: "run_summarize_failures_002",
+    status: "failed",
+    attempt: 2,
+    trigger_id: "trg_summarize_failures",
+    error: "Agent release-manager-agent was not available",
+    started_at: "2026-04-17T12:04:00Z",
+    ended_at: "2026-04-17T12:04:00Z",
+  },
+  {
+    ...defaultProfileOwner,
+    attribution: "recorded",
+    id: "run_rerun_delivery_001",
+    status: "delegated",
+    attempt: 1,
+    trigger_id: "trg_rerun_delivery",
+    loop_run_id: "looprun_8f3a2bce41d07a55",
+    started_at: "2026-04-17T17:02:10Z",
+  },
+  {
+    ...defaultProfileOwner,
+    attribution: "recorded",
+    id: "run_deploy_webhook_002",
+    status: "running",
+    attempt: 1,
+    trigger_id: "trg_deploy_webhook",
+    session_id: "sess_platform_rollout",
+    started_at: "2026-04-17T17:52:00Z",
+  },
+  {
+    ...defaultProfileOwner,
+    attribution: "recorded",
+    id: "run_deploy_webhook_001",
+    status: "completed",
+    attempt: 1,
+    trigger_id: "trg_deploy_webhook",
+    session_id: "sess_platform_rollout",
+    metadata: { delivery_id: "webhook:9ec3d15" },
+    started_at: "2026-04-17T17:50:00Z",
+    ended_at: "2026-04-17T17:50:18Z",
+  },
+  {
+    ...defaultProfileOwner,
+    attribution: "recorded",
+    id: "run_deploy_webhook_003",
+    status: "scheduled",
+    attempt: 1,
+    trigger_id: "trg_deploy_webhook",
+    scheduled_at: "2026-04-17T17:52:30Z",
+  },
+];
+
+export const primaryAutomationJobFixture: AutomationJob = automationJobFixtures[0];
+export const primaryAutomationTriggerFixture: AutomationTrigger = automationTriggerFixtures[0];

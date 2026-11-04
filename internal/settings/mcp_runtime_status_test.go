@@ -1,0 +1,1178 @@
+package settings
+
+import (
+	"context"
+	"errors"
+	"os"
+	"path/filepath"
+	"slices"
+	"strings"
+	"sync"
+	"testing"
+	"time"
+
+	compozyconfig "github.com/compozy/compozy/internal/config"
+	"github.com/compozy/compozy/internal/extensionmcp"
+	mcpauth "github.com/compozy/compozy/internal/mcp/auth"
+	workspacepkg "github.com/compozy/compozy/internal/workspace"
+)
+
+func TestMCPServerItemsIncludeRuntimeStatusAndRemainIsolated(t *testing.T) {
+	t.Parallel()
+
+	// Invariant: extension collection rows and runtime probes share an exact owner-qualified identity; manual collisions fail before file writes.
+	// Owner: Settings collection service; canonical suite: mcp_runtime_status_test.go.
+	t.Run("Should include extension rows and reject reserved manual names without writing config", func(t *testing.T) {
+		t.Parallel()
+		homePaths := testHomePaths(t)
+		writeFile(t, homePaths.ConfigFile, baseSettingsConfig())
+		original := readFile(t, homePaths.ConfigFile)
+		target := mcpauth.Target{Scope: mcpauth.ScopeUser, ServerName: "github", Owner: "extension:github"}
+		runtime := &fakeMCPRuntimeProvider{targets: map[string]mcpauth.Target{}}
+		management := &fakeMCPExtensionManagement{definitions: []MCPExtensionDefinition{
+			{
+				Target: target,
+				Server: compozyconfig.MCPServer{
+					Name:        "github",
+					Owner:       target.Owner,
+					RuntimeName: "github.github",
+					Command:     "github-mcp",
+					SecretEnv:   map[string]string{"TOKEN": "vault:extensions/github/profiles/default/TOKEN"},
+				},
+				Override: extensionmcp.Override{Env: map[string]string{"REGION": "eu"}},
+			},
+		}, nameError: extensionmcp.ErrNameTaken}
+		service := testService(t, homePaths, Dependencies{MCPRuntime: runtime, MCPExtensionManagement: management})
+		envelope, err := service.ListCollection(t.Context(), CollectionRequest{Collection: CollectionMCPServers})
+		if err != nil {
+			t.Fatal(err)
+		}
+		item := findMCPItem(t, envelope.MCPServers, "github")
+		if item.Owner != target.Owner || item.RuntimeName != "github.github" ||
+			item.SourceMetadata.EffectiveSource.Kind != SourceKindExtension ||
+			len(item.SourceMetadata.AvailableTargets) != 0 ||
+			item.Override == nil ||
+			item.Override.Env["REGION"] != "eu" ||
+			runtime.targets["github"] != target {
+			t.Fatalf("extension row lost ownership or probe identity: %#v %#v", item, runtime.targets)
+		}
+		item.Override.Env["REGION"] = "changed"
+		if management.definitions[0].Override.Env["REGION"] != "eu" {
+			t.Fatal("collection exposed mutable backing state")
+		}
+		_, err = service.PutCollectionItem(t.Context(), CollectionItemPutRequest{
+			Collection: CollectionMCPServers, Name: "github.github",
+			MCPServer: &compozyconfig.MCPServer{Name: "github.github", Command: "manual-mcp"},
+		})
+		if !errors.Is(err, ErrUnprocessable) || !errors.Is(err, ErrMCPServerNameTaken) {
+			t.Fatalf("wrong collision error: %v", err)
+		}
+		after, err := os.ReadFile(homePaths.ConfigFile)
+		if err != nil || string(after) != original {
+			t.Fatalf("rejected collision changed config: %v", err)
+		}
+	})
+	t.Run("Should attach daemon-backed runtime status to configured MCP servers", func(t *testing.T) {
+		t.Parallel()
+
+		ctx := t.Context()
+		homePaths := testHomePaths(t)
+		writeFile(t, homePaths.ConfigFile, strings.Join([]string{
+			"[[mcp_servers]]",
+			"name = \"ready-docs\"",
+			"command = \"docs-mcp\"",
+			"",
+			"[[mcp_servers]]",
+			"name = \"linear\"",
+			"transport = \"http\"",
+			"url = \"https://mcp.linear.example/mcp\"",
+			"",
+			"[mcp_servers.auth]",
+			"registration = \"pre_registered\"",
+			"issuer_url = \"https://auth.linear.example\"",
+			"client_id = \"compozy-desktop\"",
+		}, "\n"))
+		runtime := &fakeMCPRuntimeProvider{
+			statuses: map[string]MCPServerRuntimeStatus{
+				"ready-docs": {
+					Configured:      true,
+					Initialized:     true,
+					State:           MCPServerRuntimeStateReady,
+					Probe:           MCPServerProbeSucceeded,
+					ToolCount:       2,
+					ProtocolVersion: "2025-06-18",
+				},
+				"linear": {
+					Configured: true,
+					State:      MCPServerRuntimeStateAuthRequired,
+					Probe:      MCPServerProbeSkipped,
+					Reason:     "mcp_auth_required",
+				},
+			},
+		}
+		service := testService(t, homePaths, Dependencies{MCPRuntime: runtime})
+
+		envelope, err := service.ListCollection(ctx, CollectionRequest{Collection: CollectionMCPServers})
+		if err != nil {
+			t.Fatalf("ListCollection(mcp) error = %v", err)
+		}
+
+		ready := findMCPItem(t, envelope.MCPServers, "ready-docs")
+		if ready.RuntimeStatus == nil {
+			t.Fatal("ready-docs RuntimeStatus = nil, want probe status")
+		}
+		if got, want := ready.RuntimeStatus.State, MCPServerRuntimeStateReady; got != want {
+			t.Fatalf("ready-docs RuntimeStatus.State = %q, want %q", got, want)
+		}
+		if !ready.RuntimeStatus.Initialized || ready.RuntimeStatus.ToolCount != 2 {
+			t.Fatalf("ready-docs RuntimeStatus = %#v, want initialized with 2 tools", ready.RuntimeStatus)
+		}
+		if got, want := ready.RuntimeStatus.ProtocolVersion, "2025-06-18"; got != want {
+			t.Fatalf("ready-docs RuntimeStatus.ProtocolVersion = %q, want %q", got, want)
+		}
+
+		linear := findMCPItem(t, envelope.MCPServers, "linear")
+		if linear.RuntimeStatus == nil {
+			t.Fatal("linear RuntimeStatus = nil, want auth-blocked status")
+		}
+		if got, want := linear.RuntimeStatus.State, MCPServerRuntimeStateAuthRequired; got != want {
+			t.Fatalf("linear RuntimeStatus.State = %q, want %q", got, want)
+		}
+		if got, want := linear.RuntimeStatus.Probe, MCPServerProbeSkipped; got != want {
+			t.Fatalf("linear RuntimeStatus.Probe = %q, want %q", got, want)
+		}
+		if got, want := linear.RuntimeStatus.Reason, "mcp_auth_required"; got != want {
+			t.Fatalf("linear RuntimeStatus.Reason = %q, want %q", got, want)
+		}
+	})
+
+	t.Run("Should deep-clone every mutable MCP item field", func(t *testing.T) {
+		t.Parallel()
+
+		expiresAt := time.Date(2026, 7, 13, 12, 0, 0, 0, time.UTC)
+		updatedAt := expiresAt.Add(-time.Minute)
+		source := MCPServerItem{
+			Args:          []string{"serve"},
+			EnvKeys:       []string{"PROJECT"},
+			SecretEnvKeys: []string{"TOKEN"},
+			Auth: compozyconfig.MCPAuthConfig{
+				Scopes: []string{"read"},
+			},
+			AuthStatus: &mcpauth.Status{
+				Scopes:    []string{"read"},
+				ExpiresAt: &expiresAt,
+				UpdatedAt: &updatedAt,
+			},
+			RuntimeStatus: &MCPServerRuntimeStatus{Reason: "ready"},
+			SourceMetadata: SourceMetadata{
+				ShadowedSources:  []SourceRef{{Kind: SourceKindGlobalConfig}},
+				AvailableTargets: []WriteTargetKind{WriteTargetGlobalConfig},
+			},
+		}
+
+		cloned := cloneMCPServerItem(source)
+		cloned.Args[0] = "changed"
+		cloned.EnvKeys[0] = "changed"
+		cloned.SecretEnvKeys[0] = "changed"
+		cloned.Auth.Scopes[0] = "changed"
+		cloned.AuthStatus.Scopes[0] = "changed"
+		*cloned.AuthStatus.ExpiresAt = time.Time{}
+		*cloned.AuthStatus.UpdatedAt = time.Time{}
+		cloned.RuntimeStatus.Reason = "changed"
+		cloned.SourceMetadata.ShadowedSources[0].Kind = SourceKindGlobalMCPSidecar
+		cloned.SourceMetadata.AvailableTargets[0] = WriteTargetGlobalMCPSidecar
+
+		if source.Args[0] != "serve" || source.EnvKeys[0] != "PROJECT" ||
+			source.SecretEnvKeys[0] != "TOKEN" || source.Auth.Scopes[0] != "read" {
+			t.Fatalf("clone mutated source MCP config fields: %#v", source)
+		}
+		if source.AuthStatus.Scopes[0] != "read" || !source.AuthStatus.ExpiresAt.Equal(expiresAt) ||
+			!source.AuthStatus.UpdatedAt.Equal(updatedAt) {
+			t.Fatalf("clone mutated source auth status: %#v", source.AuthStatus)
+		}
+		if source.RuntimeStatus.Reason != "ready" ||
+			source.SourceMetadata.ShadowedSources[0].Kind != SourceKindGlobalConfig ||
+			source.SourceMetadata.AvailableTargets[0] != WriteTargetGlobalConfig {
+			t.Fatalf("clone mutated source runtime or metadata: %#v", source)
+		}
+	})
+
+	t.Run("Should pass the effective workspace source target to the runtime", func(t *testing.T) {
+		t.Parallel()
+
+		ctx := t.Context()
+		homePaths := testHomePaths(t)
+		workspaceRoot := t.TempDir()
+		writeFile(t, filepath.Join(workspaceRoot, compozyconfig.DirName, compozyconfig.ConfigName), `
+[[mcp_servers]]
+name = "workspace-docs"
+command = "docs-mcp"
+`)
+		runtime := &fakeMCPRuntimeProvider{
+			statuses: map[string]MCPServerRuntimeStatus{
+				"workspace-docs": {
+					Configured: true,
+					State:      MCPServerRuntimeStateDead,
+					Probe:      MCPServerProbeSkipped,
+					Reason:     "backend_dead",
+				},
+			},
+			targets: make(map[string]mcpauth.Target),
+		}
+		service := testService(t, homePaths, Dependencies{
+			MCPRuntime: runtime,
+			WorkspaceResolver: fakeWorkspaceResolver{resolved: map[string]workspacepkg.ResolvedWorkspace{
+				"ws-runtime": {
+					ID: "ws-runtime", RootDir: workspaceRoot,
+				},
+			}},
+		})
+
+		envelope, err := service.ListCollection(ctx, CollectionRequest{
+			Collection:  CollectionMCPServers,
+			Scope:       ScopeWorkspace,
+			WorkspaceID: "ws-runtime",
+		})
+		if err != nil {
+			t.Fatalf("ListCollection(workspace mcp) error = %v", err)
+		}
+		item := findMCPItem(t, envelope.MCPServers, "workspace-docs")
+		if item.RuntimeStatus == nil || item.RuntimeStatus.State != MCPServerRuntimeStateDead {
+			t.Fatalf("workspace runtime status = %#v, want dead", item.RuntimeStatus)
+		}
+		if got, want := runtime.targets["workspace-docs"], (mcpauth.Target{
+			Scope:       mcpauth.ScopeWorkspace,
+			WorkspaceID: "ws-runtime",
+			ServerName:  "workspace-docs",
+		}); got != want {
+			t.Fatalf("runtime target = %#v, want %#v", got, want)
+		}
+	})
+}
+
+func TestMCPServerCollectionBoundsRuntimeProbes(t *testing.T) {
+	t.Parallel()
+
+	t.Run("Should probe no more than four configured MCP servers concurrently", func(t *testing.T) {
+		t.Parallel()
+
+		homePaths := testHomePaths(t)
+		writeFile(t, homePaths.ConfigFile, strings.Join([]string{
+			"[[mcp_servers]]", "name = \"alpha\"", "command = \"alpha-mcp\"", "",
+			"[[mcp_servers]]", "name = \"bravo\"", "command = \"bravo-mcp\"", "",
+			"[[mcp_servers]]", "name = \"charlie\"", "command = \"charlie-mcp\"", "",
+			"[[mcp_servers]]", "name = \"delta\"", "command = \"delta-mcp\"", "",
+			"[[mcp_servers]]", "name = \"echo\"", "command = \"echo-mcp\"",
+		}, "\n"))
+		runtime := newBlockingMCPRuntimeProvider()
+		service := testService(t, homePaths, Dependencies{MCPRuntime: runtime})
+		type listResult struct {
+			envelope CollectionEnvelope
+			err      error
+		}
+		results := make(chan listResult, 1)
+		go func() {
+			envelope, err := service.ListCollection(
+				t.Context(),
+				CollectionRequest{Collection: CollectionMCPServers},
+			)
+			results <- listResult{envelope: envelope, err: err}
+		}()
+
+		for range maxConcurrentMCPRuntimeProbes {
+			select {
+			case <-runtime.entered:
+			case <-time.After(time.Second):
+				t.Fatal("timed out waiting for bounded MCP runtime probes")
+			}
+		}
+		if got := runtime.maxInFlight(); got != maxConcurrentMCPRuntimeProbes {
+			t.Fatalf("max concurrent MCP runtime probes = %d, want %d", got, maxConcurrentMCPRuntimeProbes)
+		}
+		select {
+		case name := <-runtime.entered:
+			t.Fatalf("MCP runtime probe %q exceeded the concurrency bound", name)
+		default:
+		}
+		close(runtime.release)
+
+		select {
+		case result := <-results:
+			if result.err != nil {
+				t.Fatalf("ListCollection(mcp) error = %v", result.err)
+			}
+			if got, want := mcpItemNames(
+				result.envelope.MCPServers,
+			), []string{
+				"alpha",
+				"bravo",
+				"charlie",
+				"delta",
+				"echo",
+			}; !slices.Equal(
+				got,
+				want,
+			) {
+				t.Fatalf("MCP item order = %#v, want %#v", got, want)
+			}
+		case <-time.After(time.Second):
+			t.Fatal("timed out waiting for MCP runtime probe collection")
+		}
+	})
+
+	t.Run("Should return no partial collection after a structural probe error", func(t *testing.T) {
+		t.Parallel()
+
+		homePaths := testHomePaths(t)
+		writeFile(t, homePaths.ConfigFile, strings.Join([]string{
+			"[[mcp_servers]]", "name = \"alpha\"", "command = \"alpha-mcp\"", "",
+			"[[mcp_servers]]", "name = \"bravo\"", "command = \"bravo-mcp\"", "",
+			"[[mcp_servers]]", "name = \"charlie\"", "command = \"charlie-mcp\"", "",
+			"[[mcp_servers]]", "name = \"broken\"", "command = \"broken-mcp\"", "",
+			"[[mcp_servers]]", "name = \"delta\"", "command = \"delta-mcp\"",
+		}, "\n"))
+		runtime := newBlockingMCPRuntimeProvider()
+		runtime.failName = "broken"
+		service := testService(t, homePaths, Dependencies{MCPRuntime: runtime})
+		type listResult struct {
+			envelope CollectionEnvelope
+			err      error
+		}
+		results := make(chan listResult, 1)
+		go func() {
+			envelope, err := service.ListCollection(
+				t.Context(),
+				CollectionRequest{Collection: CollectionMCPServers},
+			)
+			results <- listResult{envelope: envelope, err: err}
+		}()
+
+		for range maxConcurrentMCPRuntimeProbes {
+			select {
+			case <-runtime.entered:
+			case <-time.After(time.Second):
+				t.Fatal("timed out waiting for structural MCP runtime probes")
+			}
+		}
+		close(runtime.release)
+
+		select {
+		case result := <-results:
+			if !errors.Is(result.err, errBlockingMCPRuntime) {
+				t.Fatalf("ListCollection(mcp) error = %v, want structural probe error", result.err)
+			}
+			if result.envelope.Collection != "" || len(result.envelope.MCPServers) != 0 {
+				t.Fatalf("ListCollection(mcp) result = %#v, want no partial collection", result.envelope)
+			}
+		case <-time.After(time.Second):
+			t.Fatal("timed out waiting for structural MCP runtime probe cleanup")
+		}
+		if got, want := runtime.finishedCount(), runtime.startedCount(); got != want {
+			t.Fatalf("completed MCP runtime probes = %d, want %d after cancellation join", got, want)
+		}
+	})
+}
+
+func TestMCPAuthOperationsResolveExactWorkspaceSidecarTarget(t *testing.T) {
+	t.Parallel()
+	// Invariant: selecting an extension never falls through to same-named manual credentials.
+	// Owner: Settings auth target resolution; canonical suite: mcp_runtime_status_test.go.
+	t.Run("Should preserve the extension owner through OAuth operations and callback addressing", func(t *testing.T) {
+		t.Parallel()
+		home := testHomePaths(t)
+		writeFile(t, home.ConfigFile, "[[mcp_servers]]\nname = \"linear\"\ncommand = \"manual-server\"\n")
+		runtime := &recordingMCPAuthRuntime{}
+		service := testService(t, home, Dependencies{MCPAuth: runtime,
+			MCPExtensions: extensionMCPDefinitionStub{}})
+		request := MCPAuthTargetRequest{Scope: ScopeUser, Name: "linear", Owner: "extension:linear"}
+		if _, err := service.GetMCPAuthStatus(t.Context(), request); err != nil {
+			t.Fatal(err)
+		}
+		want := mcpauth.Target{Owner: "extension:linear", Scope: mcpauth.ScopeUser, ServerName: "linear"}
+		if runtime.statusTarget != want || runtime.statusServer.URL != "https://extension.example/mcp" {
+			t.Fatalf("explicit extension resolved to another definition: %#v", runtime.statusTarget)
+		}
+		if _, err := service.BeginMCPAuth(t.Context(), MCPAuthBeginRequest{MCPAuthTargetRequest: request}); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := service.ExchangeMCPAuth(
+			t.Context(),
+			MCPAuthExchangeRequest{MCPAuthTargetRequest: request},
+		); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := service.LogoutMCPAuth(t.Context(), request); err != nil {
+			t.Fatal(err)
+		}
+		if runtime.beginTarget != want || runtime.exchangeTarget != want || runtime.logoutTarget != want ||
+			mcpAuthTargetRequest(want) != request {
+			t.Fatal("OAuth lifecycle or callback request lost the definition owner")
+		}
+		request.Owner = "extension:missing"
+		if _, err := service.GetMCPAuthStatus(t.Context(), request); err == nil {
+			t.Fatal("missing extension fell through to manual credentials")
+		}
+		request.Owner = "manual"
+		if _, err := service.GetMCPAuthStatus(t.Context(), request); err != nil {
+			t.Fatal(err)
+		}
+		if runtime.statusTarget.Owner != "manual" || runtime.statusServer.Command != "manual-server" {
+			t.Fatal("manual definition did not retain its identity")
+		}
+		request.Owner, request.Name = "", "linear.linear"
+		if _, err := service.GetMCPAuthStatus(
+			t.Context(),
+			request,
+		); !errors.Is(err, ErrNotFound) ||
+			runtime.statusTarget.Owner != "manual" {
+			t.Fatalf("owner-less lookup dispatched extension authentication: %v", err)
+		}
+	})
+	t.Run("Should resolve the exact workspace sidecar target for every auth operation", func(t *testing.T) {
+		t.Parallel()
+
+		ctx := t.Context()
+		homePaths := testHomePaths(t)
+		workspaceRoot := t.TempDir()
+		writeFile(t, homePaths.ConfigFile, strings.Join([]string{
+			"[[mcp_servers]]",
+			"name = \"linear\"",
+			"transport = \"http\"",
+			"url = \"https://global.linear.example/mcp\"",
+			"",
+			"[mcp_servers.auth]",
+			"registration = \"pre_registered\"",
+			"issuer_url = \"https://global.linear.example\"",
+			"client_id = \"global-client\"",
+		}, "\n"))
+		writeFile(t, filepath.Join(workspaceRoot, compozyconfig.DirName, compozyconfig.MCPJSONName), `{
+  "mcpServers": {
+    "linear": {
+	  "transport": "http",
+      "url": "https://workspace.linear.example/mcp",
+      "auth": {
+        "registration": "pre_registered",
+        "issuer_url": "https://workspace.linear.example",
+        "client_id": "workspace-client"
+      }
+    }
+  }
+}`)
+		runtime := &recordingMCPAuthRuntime{}
+		service := testService(t, homePaths, Dependencies{
+			WorkspaceResolver: fakeWorkspaceResolver{
+				resolved: map[string]workspacepkg.ResolvedWorkspace{
+					"workspace-a": {
+						ID: "workspace-a", RootDir: workspaceRoot,
+					},
+				},
+			},
+			MCPAuth: runtime,
+		})
+		workspaceTarget := MCPAuthTargetRequest{
+			Scope: ScopeWorkspace, WorkspaceID: "workspace-a", Name: "linear",
+		}
+		authStatus, err := service.GetMCPAuthStatus(ctx, workspaceTarget)
+		if err != nil {
+			t.Fatalf("GetMCPAuthStatus(workspace sidecar) error = %v", err)
+		}
+		if authStatus.Scope != mcpauth.ScopeWorkspace || authStatus.WorkspaceID != "workspace-a" ||
+			authStatus.ServerName != "linear" || authStatus.Status != mcpauth.StatusAuthenticated {
+			t.Fatalf("GetMCPAuthStatus(workspace sidecar) = %#v", authStatus)
+		}
+		if runtime.statusTarget != (mcpauth.Target{
+			Scope: mcpauth.ScopeWorkspace, WorkspaceID: "workspace-a", ServerName: "linear", Owner: "manual",
+		}) ||
+			runtime.statusServer.URL != "https://workspace.linear.example/mcp" ||
+			runtime.statusServer.Auth.ClientID != "workspace-client" {
+			t.Fatalf("workspace status resolution = target:%#v server:%#v", runtime.statusTarget, runtime.statusServer)
+		}
+		begin, err := service.BeginMCPAuth(ctx, MCPAuthBeginRequest{
+			MCPAuthTargetRequest: workspaceTarget,
+			CallbackURL:          "http://127.0.0.1:2123/api/mcp/oauth/callback",
+		})
+		if err != nil {
+			t.Fatalf("BeginMCPAuth(workspace sidecar) error = %v", err)
+		}
+		if begin.AuthorizationURL != "https://workspace.linear.example/authorize?state=public" {
+			t.Fatalf("BeginMCPAuth() = %#v", begin)
+		}
+		if runtime.beginTarget.Scope != mcpauth.ScopeWorkspace ||
+			runtime.beginTarget.WorkspaceID != "workspace-a" ||
+			runtime.beginServer.URL != "https://workspace.linear.example/mcp" ||
+			runtime.beginServer.Auth.ClientID != "workspace-client" {
+			t.Fatalf("workspace begin resolution = target:%#v server:%#v", runtime.beginTarget, runtime.beginServer)
+		}
+
+		status, err := service.ExchangeMCPAuth(ctx, MCPAuthExchangeRequest{
+			MCPAuthTargetRequest: workspaceTarget,
+			RedirectURL:          "https://callback.example/?code=opaque&state=public",
+		})
+		if err != nil {
+			t.Fatalf("ExchangeMCPAuth(workspace) error = %v", err)
+		}
+		if status.WorkspaceID != "workspace-a" || !status.TokenPresent {
+			t.Fatalf("ExchangeMCPAuth(workspace) status = %#v", status)
+		}
+		if runtime.exchangeInput.RedirectURL != "https://callback.example/?code=opaque&state=public" {
+			t.Fatalf("exchange input = %#v", runtime.exchangeInput)
+		}
+		if runtime.exchangeTarget != runtime.beginTarget ||
+			runtime.exchangeServer.URL != "https://workspace.linear.example/mcp" ||
+			runtime.exchangeServer.Auth.ClientID != "workspace-client" {
+			t.Fatalf(
+				"workspace exchange resolution = target:%#v server:%#v",
+				runtime.exchangeTarget,
+				runtime.exchangeServer,
+			)
+		}
+
+		if _, err := service.LogoutMCPAuth(ctx, workspaceTarget); err != nil {
+			t.Fatalf("LogoutMCPAuth(workspace sidecar) error = %v", err)
+		}
+		if runtime.logoutTarget != runtime.beginTarget || runtime.logoutServer.URL != runtime.beginServer.URL {
+			t.Fatalf("logout resolution = target:%#v server:%#v", runtime.logoutTarget, runtime.logoutServer)
+		}
+
+		if _, err := service.CompleteMCPAuthCallback(
+			ctx,
+			"http://127.0.0.1:2123/api/mcp/oauth/callback?code=opaque&state=public",
+		); err != nil {
+			t.Fatalf("CompleteMCPAuthCallback() error = %v", err)
+		}
+		if !strings.Contains(runtime.callbackURL, "code=opaque") {
+			t.Fatalf("callback URL = %q", runtime.callbackURL)
+		}
+		if runtime.callbackTarget != runtime.beginTarget ||
+			runtime.callbackServer.URL != "https://workspace.linear.example/mcp" ||
+			runtime.callbackServer.Auth.ClientID != "workspace-client" {
+			t.Fatalf(
+				"workspace callback resolution = target:%#v server:%#v",
+				runtime.callbackTarget,
+				runtime.callbackServer,
+			)
+		}
+	})
+
+	t.Run("Should resolve the exact workspace-profile sidecar target", func(t *testing.T) {
+		t.Parallel()
+
+		ctx := t.Context()
+		homePaths := testHomePaths(t)
+		workspaceRoot := t.TempDir()
+		writeFile(
+			t,
+			filepath.Join(
+				workspaceRoot,
+				compozyconfig.DirName,
+				compozyconfig.ProfilesDirName,
+				"marketing",
+				compozyconfig.MCPJSONName,
+			),
+			`{"mcpServers":{"linear":{"transport":"http","url":"https://marketing.linear.example/mcp","auth":{"registration":"pre_registered","issuer_url":"https://marketing.linear.example","client_id":"marketing-client"}}}}`,
+		)
+		runtime := &recordingMCPAuthRuntime{}
+		service := testService(t, homePaths, Dependencies{
+			WorkspaceResolver: fakeWorkspaceResolver{resolved: map[string]workspacepkg.ResolvedWorkspace{
+				"workspace-a": {
+					ID: "workspace-a", RootDir: workspaceRoot,
+				},
+			}},
+			MCPAuth: runtime,
+		})
+		request := MCPAuthTargetRequest{
+			Scope: ScopeProfile, WorkspaceID: "workspace-a", ProfileName: "marketing", Name: "linear",
+		}
+		if _, err := service.GetMCPAuthStatus(ctx, request); err != nil {
+			t.Fatalf("GetMCPAuthStatus(workspace profile) error = %v", err)
+		}
+		want := mcpauth.Target{
+			Scope:       mcpauth.ScopeWorkspaceProfile,
+			WorkspaceID: "workspace-a@pf:marketing",
+			ServerName:  "linear",
+			Owner:       "manual",
+		}
+		if runtime.statusTarget != want || runtime.statusServer.URL != "https://marketing.linear.example/mcp" {
+			t.Fatalf(
+				"workspace-profile status resolution = target:%#v server:%#v",
+				runtime.statusTarget,
+				runtime.statusServer,
+			)
+		}
+		if _, err := service.BeginMCPAuth(ctx, MCPAuthBeginRequest{
+			MCPAuthTargetRequest: request,
+			CallbackURL:          "http://127.0.0.1:2123/api/mcp/oauth/callback",
+		}); err != nil {
+			t.Fatalf("BeginMCPAuth(workspace profile) error = %v", err)
+		}
+		if runtime.beginTarget != want {
+			t.Fatalf("workspace-profile begin target = %#v, want %#v", runtime.beginTarget, want)
+		}
+	})
+}
+
+func TestMCPAuthCredentialResolutionOrder(t *testing.T) {
+	t.Parallel()
+	// Invariant: the OAuth credential owner is the scope that declares the effective definition;
+	// reads report the inherited owner labeled, and mutations never retarget a broader scope.
+	// Owner: Settings auth target resolution; canonical suite: mcp_runtime_status_test.go.
+	userServer := strings.Join([]string{
+		"[[mcp_servers]]",
+		"name = \"newrelic\"",
+		"transport = \"http\"",
+		"url = \"https://user.newrelic.example/mcp\"",
+		"",
+		"[mcp_servers.auth]",
+		"registration = \"pre_registered\"",
+		"issuer_url = \"https://user.newrelic.example\"",
+		"client_id = \"user-client\"",
+	}, "\n")
+	newService := func(t *testing.T, workspaceMCPJSON string) (Service, *recordingMCPAuthRuntime) {
+		t.Helper()
+		homePaths := testHomePaths(t)
+		workspaceRoot := t.TempDir()
+		writeFile(t, homePaths.ConfigFile, userServer)
+		if workspaceMCPJSON != "" {
+			writeFile(
+				t,
+				filepath.Join(workspaceRoot, compozyconfig.DirName, compozyconfig.MCPJSONName),
+				workspaceMCPJSON,
+			)
+		}
+		runtime := &recordingMCPAuthRuntime{}
+		return testService(t, homePaths, Dependencies{
+			WorkspaceResolver: fakeWorkspaceResolver{resolved: map[string]workspacepkg.ResolvedWorkspace{
+				"workspace-a": {ID: "workspace-a", RootDir: workspaceRoot},
+			}},
+			MCPAuth: runtime,
+		}), runtime
+	}
+	workspaceRequest := MCPAuthTargetRequest{Scope: ScopeWorkspace, WorkspaceID: "workspace-a", Name: "newrelic"}
+	userTarget := mcpauth.Target{Owner: "manual", Scope: mcpauth.ScopeUser, ServerName: "newrelic"}
+
+	t.Run(
+		"Should report the inherited user credential for a workspace query of a user-declared server",
+		func(t *testing.T) {
+			t.Parallel()
+			service, runtime := newService(t, "")
+			status, err := service.GetMCPAuthStatus(t.Context(), workspaceRequest)
+			if err != nil {
+				t.Fatalf("GetMCPAuthStatus(workspace) error = %v", err)
+			}
+			if runtime.statusTarget != userTarget || runtime.statusServer.URL != "https://user.newrelic.example/mcp" {
+				t.Fatalf(
+					"status target = %#v server = %q, want user declaration",
+					runtime.statusTarget,
+					runtime.statusServer.URL,
+				)
+			}
+			if status.Scope != mcpauth.ScopeUser || status.WorkspaceID != "" || !status.Inherited ||
+				status.Status != mcpauth.StatusAuthenticated {
+				t.Fatalf("GetMCPAuthStatus(workspace) = %#v, want inherited authenticated user record", status)
+			}
+			direct, err := service.GetMCPAuthStatus(
+				t.Context(),
+				MCPAuthTargetRequest{Scope: ScopeUser, Name: "newrelic"},
+			)
+			if err != nil {
+				t.Fatalf("GetMCPAuthStatus(user) error = %v", err)
+			}
+			if direct.Inherited {
+				t.Fatalf("GetMCPAuthStatus(user) = %#v, want the declaring scope unlabeled", direct)
+			}
+		},
+	)
+
+	t.Run("Should reject workspace auth mutations for a user-declared server", func(t *testing.T) {
+		t.Parallel()
+		service, runtime := newService(t, "")
+		_, beginErr := service.BeginMCPAuth(t.Context(), MCPAuthBeginRequest{
+			MCPAuthTargetRequest: workspaceRequest,
+			CallbackURL:          "http://127.0.0.1:2123/api/mcp/oauth/callback",
+		})
+		_, exchangeErr := service.ExchangeMCPAuth(t.Context(), MCPAuthExchangeRequest{
+			MCPAuthTargetRequest: workspaceRequest,
+			RedirectURL:          "https://callback.example/?code=opaque&state=public",
+		})
+		_, logoutErr := service.LogoutMCPAuth(t.Context(), workspaceRequest)
+		for name, err := range map[string]error{"begin": beginErr, "exchange": exchangeErr, "logout": logoutErr} {
+			if !errors.Is(err, ErrValidation) || !strings.Contains(err.Error(), "declared at user scope") ||
+				!strings.Contains(err.Error(), "authorize it at user scope") {
+				t.Fatalf("%s error = %v, want validation error naming the declaring user scope", name, err)
+			}
+		}
+		if runtime.beginTarget != (mcpauth.Target{}) || runtime.exchangeTarget != (mcpauth.Target{}) ||
+			runtime.logoutTarget != (mcpauth.Target{}) {
+			t.Fatal("rejected workspace mutation reached the user credential")
+		}
+	})
+
+	t.Run("Should own the credential at workspace scope when the workspace declares the server", func(t *testing.T) {
+		t.Parallel()
+		service, runtime := newService(t, `{"mcpServers":{"newrelic":{"transport":"http",`+
+			`"url":"https://workspace.newrelic.example/mcp","auth":{"registration":"pre_registered",`+
+			`"issuer_url":"https://workspace.newrelic.example","client_id":"workspace-client"}}}}`)
+		status, err := service.GetMCPAuthStatus(t.Context(), workspaceRequest)
+		if err != nil {
+			t.Fatalf("GetMCPAuthStatus(workspace) error = %v", err)
+		}
+		want := mcpauth.Target{
+			Owner: "manual", Scope: mcpauth.ScopeWorkspace, WorkspaceID: "workspace-a", ServerName: "newrelic",
+		}
+		if runtime.statusTarget != want || status.Inherited || status.Scope != mcpauth.ScopeWorkspace {
+			t.Fatalf("workspace status = %#v target = %#v, want own workspace record", status, runtime.statusTarget)
+		}
+		if _, err := service.BeginMCPAuth(t.Context(), MCPAuthBeginRequest{
+			MCPAuthTargetRequest: workspaceRequest,
+			CallbackURL:          "http://127.0.0.1:2123/api/mcp/oauth/callback",
+		}); err != nil {
+			t.Fatalf("BeginMCPAuth(workspace) error = %v", err)
+		}
+		if runtime.beginTarget != want {
+			t.Fatalf("begin target = %#v, want %#v", runtime.beginTarget, want)
+		}
+	})
+
+	t.Run("Should prefer a profile declaration over the user declaration", func(t *testing.T) {
+		t.Parallel()
+		homePaths := testHomePaths(t)
+		writeFile(t, homePaths.ConfigFile, userServer)
+		writeFile(t, filepath.Join(homePaths.ProfilesDir, "marketing", compozyconfig.MCPJSONName),
+			`{"mcpServers":{"newrelic":{"transport":"http","url":"https://profile.newrelic.example/mcp"}}}`)
+		runtime := &recordingMCPAuthRuntime{}
+		service := testService(t, homePaths, Dependencies{MCPAuth: runtime})
+		status, err := service.GetMCPAuthStatus(t.Context(), MCPAuthTargetRequest{
+			Scope: ScopeProfile, ProfileName: "marketing", Name: "newrelic",
+		})
+		if err != nil {
+			t.Fatalf("GetMCPAuthStatus(profile) error = %v", err)
+		}
+		want := mcpauth.Target{
+			Owner:       "manual",
+			Scope:       mcpauth.ScopeProfile,
+			WorkspaceID: "marketing",
+			ServerName:  "newrelic",
+		}
+		if runtime.statusTarget != want || status.Inherited ||
+			runtime.statusServer.URL != "https://profile.newrelic.example/mcp" {
+			t.Fatalf("profile status = %#v target = %#v, want own profile record", status, runtime.statusTarget)
+		}
+	})
+
+	t.Run("Should label and reject a workspace request for a user-scoped extension server", func(t *testing.T) {
+		t.Parallel()
+		homePaths := testHomePaths(t)
+		runtime := &recordingMCPAuthRuntime{}
+		service := testService(t, homePaths, Dependencies{
+			WorkspaceResolver: fakeWorkspaceResolver{resolved: map[string]workspacepkg.ResolvedWorkspace{
+				"workspace-a": {ID: "workspace-a", RootDir: t.TempDir()},
+			}},
+			MCPAuth: runtime, MCPExtensions: extensionMCPDefinitionStub{},
+		})
+		request := MCPAuthTargetRequest{
+			Scope: ScopeWorkspace, WorkspaceID: "workspace-a", Name: "linear", Owner: "extension:linear",
+		}
+		status, err := service.GetMCPAuthStatus(t.Context(), request)
+		if err != nil {
+			t.Fatalf("GetMCPAuthStatus(extension workspace) error = %v", err)
+		}
+		if status.Scope != mcpauth.ScopeUser || !status.Inherited {
+			t.Fatalf("extension status = %#v, want inherited user record", status)
+		}
+		_, beginErr := service.BeginMCPAuth(t.Context(), MCPAuthBeginRequest{MCPAuthTargetRequest: request})
+		_, exchangeErr := service.ExchangeMCPAuth(t.Context(), MCPAuthExchangeRequest{MCPAuthTargetRequest: request})
+		_, logoutErr := service.LogoutMCPAuth(t.Context(), request)
+		for name, err := range map[string]error{"begin": beginErr, "exchange": exchangeErr, "logout": logoutErr} {
+			if !errors.Is(err, ErrValidation) {
+				t.Fatalf("%s(extension workspace) error = %v, want ErrValidation", name, err)
+			}
+		}
+		if runtime.beginTarget != (mcpauth.Target{}) || runtime.exchangeTarget != (mcpauth.Target{}) ||
+			runtime.logoutTarget != (mcpauth.Target{}) {
+			t.Fatal("rejected extension workspace mutation reached the user credential")
+		}
+	})
+
+	// The default profile layers alias the user and workspace credentials they project, so a
+	// request through either alias owns the declaring credential instead of inheriting it.
+	t.Run("Should report the user credential as owned for a default profile request", func(t *testing.T) {
+		t.Parallel()
+		service, runtime := newService(t, "")
+		request := MCPAuthTargetRequest{Scope: ScopeProfile, ProfileName: "default", Name: "newrelic"}
+		status, err := service.GetMCPAuthStatus(t.Context(), request)
+		if err != nil {
+			t.Fatalf("GetMCPAuthStatus(default profile) error = %v", err)
+		}
+		if runtime.statusTarget != userTarget || status.Scope != mcpauth.ScopeUser || status.Inherited {
+			t.Fatalf("default profile status = %#v target = %#v, want owned user record", status, runtime.statusTarget)
+		}
+		if _, err := service.LogoutMCPAuth(t.Context(), request); err != nil {
+			t.Fatalf("LogoutMCPAuth(default profile) error = %v, want the user credential mutated", err)
+		}
+		if runtime.logoutTarget != userTarget {
+			t.Fatalf("logout target = %#v, want %#v", runtime.logoutTarget, userTarget)
+		}
+	})
+
+	t.Run(
+		"Should report the workspace credential as owned for a workspace default profile request",
+		func(t *testing.T) {
+			t.Parallel()
+			service, runtime := newService(t, `{"mcpServers":{"newrelic":{"transport":"http",`+
+				`"url":"https://workspace.newrelic.example/mcp","auth":{"registration":"pre_registered",`+
+				`"issuer_url":"https://workspace.newrelic.example","client_id":"workspace-client"}}}}`)
+			request := MCPAuthTargetRequest{
+				Scope: ScopeProfile, WorkspaceID: "workspace-a", ProfileName: "default", Name: "newrelic",
+			}
+			status, err := service.GetMCPAuthStatus(t.Context(), request)
+			if err != nil {
+				t.Fatalf("GetMCPAuthStatus(workspace default profile) error = %v", err)
+			}
+			want := mcpauth.Target{
+				Owner: "manual", Scope: mcpauth.ScopeWorkspace, WorkspaceID: "workspace-a", ServerName: "newrelic",
+			}
+			if runtime.statusTarget != want || status.Scope != mcpauth.ScopeWorkspace || status.Inherited {
+				t.Fatalf("workspace default profile status = %#v target = %#v, want owned workspace record",
+					status, runtime.statusTarget)
+			}
+			if _, err := service.LogoutMCPAuth(t.Context(), request); err != nil {
+				t.Fatalf("LogoutMCPAuth(workspace default profile) error = %v, want the workspace credential", err)
+			}
+			if runtime.logoutTarget != want {
+				t.Fatalf("logout target = %#v, want %#v", runtime.logoutTarget, want)
+			}
+		},
+	)
+
+	t.Run("Should mark a user-declared server's credential inherited in a workspace listing", func(t *testing.T) {
+		t.Parallel()
+		service, _ := newService(t, "")
+		listed := func(scope ScopeKind, workspaceID string) *mcpauth.Status {
+			t.Helper()
+			envelope, err := service.ListCollection(t.Context(), CollectionRequest{
+				Collection: CollectionMCPServers, Scope: scope, WorkspaceID: workspaceID,
+			})
+			if err != nil {
+				t.Fatalf("ListCollection(%s) error = %v", scope, err)
+			}
+			for index := range envelope.MCPServers {
+				if envelope.MCPServers[index].Name == "newrelic" {
+					return envelope.MCPServers[index].AuthStatus
+				}
+			}
+			t.Fatalf("ListCollection(%s) has no newrelic item", scope)
+			return nil
+		}
+		if status := listed(ScopeWorkspace, "workspace-a"); status == nil || status.Scope != mcpauth.ScopeUser ||
+			!status.Inherited {
+			t.Fatalf("workspace listing auth status = %#v, want the inherited user record", status)
+		}
+		if status := listed(ScopeUser, ""); status == nil || status.Inherited {
+			t.Fatalf("user listing auth status = %#v, want the declaring scope unlabeled", status)
+		}
+	})
+
+	t.Run("Should report not found when no layer declares the server", func(t *testing.T) {
+		t.Parallel()
+		service, _ := newService(t, "")
+		request := workspaceRequest
+		request.Name = "missing"
+		if _, err := service.GetMCPAuthStatus(t.Context(), request); !errors.Is(err, ErrNotFound) {
+			t.Fatalf("GetMCPAuthStatus(missing) error = %v, want ErrNotFound", err)
+		}
+		if _, err := service.LogoutMCPAuth(t.Context(), request); !errors.Is(err, ErrNotFound) {
+			t.Fatalf("LogoutMCPAuth(missing) error = %v, want ErrNotFound", err)
+		}
+	})
+}
+
+type extensionMCPDefinitionStub struct{}
+
+func (extensionMCPDefinitionStub) ResolveMCPExtensionDefinition(
+	_ context.Context, req MCPAuthTargetRequest,
+) (mcpauth.Target, compozyconfig.MCPServer, bool, error) {
+	if (req.Owner == "extension:linear" && req.Name == "linear") || (req.Owner == "" && req.Name == "linear.linear") {
+		return mcpauth.Target{Owner: "extension:linear", Scope: mcpauth.ScopeUser, ServerName: "linear"},
+			compozyconfig.MCPServer{Name: "linear", Owner: "extension:linear", RuntimeName: "linear.linear",
+				Transport: compozyconfig.MCPServerTransportHTTP, URL: "https://extension.example/mcp"}, true, nil
+	}
+	return mcpauth.Target{}, compozyconfig.MCPServer{}, false, nil
+}
+
+type recordingMCPAuthRuntime struct {
+	statusErr       error
+	statusTarget    mcpauth.Target
+	statusServer    compozyconfig.MCPServer
+	beginTarget     mcpauth.Target
+	beginServer     compozyconfig.MCPServer
+	exchangeTarget  mcpauth.Target
+	exchangeServer  compozyconfig.MCPServer
+	exchangeInput   mcpauth.ExchangeInput
+	logoutTarget    mcpauth.Target
+	logoutServer    compozyconfig.MCPServer
+	callbackTarget  mcpauth.Target
+	callbackServer  compozyconfig.MCPServer
+	callbackURL     string
+	operations      []recordingMCPAuthOperation
+	invalidateCalls int
+	deleteCalls     int
+	invalidateErrs  map[int]error
+	deleteStateErrs map[int]error
+}
+
+type recordingMCPAuthOperation struct {
+	kind   string
+	target mcpauth.Target
+}
+
+const (
+	recordingMCPAuthInvalidate  = "invalidate"
+	recordingMCPAuthDeleteState = "delete_state"
+)
+
+func (r *recordingMCPAuthRuntime) MCPAuthStatus(
+	_ context.Context,
+	target mcpauth.Target,
+	server compozyconfig.MCPServer,
+) (mcpauth.Status, error) {
+	r.statusTarget = target
+	r.statusServer = server
+	return confirmedMCPAuthRuntimeStatus(target), r.statusErr
+}
+
+func (r *recordingMCPAuthRuntime) MCPAuthBegin(
+	_ context.Context,
+	target mcpauth.Target,
+	server compozyconfig.MCPServer,
+	callbackURL string,
+) (mcpauth.BeginResult, error) {
+	r.beginTarget = target
+	r.beginServer = server
+	return mcpauth.BeginResult{
+		AuthorizationURL: "https://workspace.linear.example/authorize?state=public",
+		State:            "public",
+		ExpiresAt:        time.Date(2026, 7, 13, 16, 5, 0, 0, time.UTC),
+		CallbackURL:      callbackURL,
+		ManualSupported:  true,
+	}, nil
+}
+
+func (r *recordingMCPAuthRuntime) MCPAuthBeginStepUp(
+	ctx context.Context,
+	target mcpauth.Target,
+	server compozyconfig.MCPServer,
+	callbackURL string,
+	_ []string,
+	approved bool,
+) (mcpauth.BeginResult, error) {
+	if !approved {
+		return mcpauth.BeginResult{}, errors.New("scope escalation requires approval")
+	}
+	return r.MCPAuthBegin(ctx, target, server, callbackURL)
+}
+
+func (r *recordingMCPAuthRuntime) MCPAuthExchange(
+	_ context.Context,
+	target mcpauth.Target,
+	server compozyconfig.MCPServer,
+	input mcpauth.ExchangeInput,
+) (mcpauth.Status, error) {
+	r.exchangeTarget = target
+	r.exchangeServer = server
+	r.exchangeInput = input
+	return confirmedMCPAuthRuntimeStatus(target), nil
+}
+
+func (r *recordingMCPAuthRuntime) MCPAuthCallbackTarget(string) (mcpauth.Target, error) {
+	return mcpauth.Target{
+		Scope: mcpauth.ScopeWorkspace, WorkspaceID: "workspace-a", ServerName: "linear",
+	}, nil
+}
+
+func (r *recordingMCPAuthRuntime) MCPAuthCompleteCallback(
+	_ context.Context,
+	target mcpauth.Target,
+	server compozyconfig.MCPServer,
+	callbackURL string,
+) (mcpauth.Status, error) {
+	r.callbackTarget = target
+	r.callbackServer = server
+	r.callbackURL = callbackURL
+	return confirmedMCPAuthRuntimeStatus(target), nil
+}
+
+func (r *recordingMCPAuthRuntime) MCPAuthInvalidate(target mcpauth.Target) error {
+	r.operations = append(r.operations, recordingMCPAuthOperation{kind: recordingMCPAuthInvalidate, target: target})
+	r.invalidateCalls++
+	if err := r.invalidateErrs[r.invalidateCalls]; err != nil {
+		return err
+	}
+	return nil
+}
+
+func (r *recordingMCPAuthRuntime) MCPAuthDeleteState(_ context.Context, target mcpauth.Target) error {
+	r.operations = append(r.operations, recordingMCPAuthOperation{kind: recordingMCPAuthDeleteState, target: target})
+	r.deleteCalls++
+	if err := r.deleteStateErrs[r.deleteCalls]; err != nil {
+		return err
+	}
+	return nil
+}
+
+func (r *recordingMCPAuthRuntime) MCPAuthLogout(
+	_ context.Context,
+	target mcpauth.Target,
+	server compozyconfig.MCPServer,
+) (mcpauth.Status, error) {
+	r.logoutTarget = target
+	r.logoutServer = server
+	status := confirmedMCPAuthRuntimeStatus(target)
+	status.Status = mcpauth.StatusNeedsLogin
+	status.TokenPresent = false
+	return status, nil
+}
+
+func confirmedMCPAuthRuntimeStatus(target mcpauth.Target) mcpauth.Status {
+	return mcpauth.Status{
+		ServerName:   target.ServerName,
+		Scope:        target.Scope,
+		WorkspaceID:  target.WorkspaceID,
+		Status:       mcpauth.StatusAuthenticated,
+		TokenPresent: true,
+	}
+}
+
+type fakeMCPRuntimeProvider struct {
+	statuses map[string]MCPServerRuntimeStatus
+	targets  map[string]mcpauth.Target
+}
+
+var errBlockingMCPRuntime = errors.New("blocking MCP runtime failure")
+
+type blockingMCPRuntimeProvider struct {
+	entered  chan string
+	release  chan struct{}
+	failName string
+
+	mu       sync.Mutex
+	inFlight int
+	max      int
+	started  int
+	finished int
+}
+
+func newBlockingMCPRuntimeProvider() *blockingMCPRuntimeProvider {
+	return &blockingMCPRuntimeProvider{
+		entered: make(chan string, maxConcurrentMCPRuntimeProbes+1),
+		release: make(chan struct{}),
+	}
+}
+
+func (f *blockingMCPRuntimeProvider) MCPServerRuntimeStatus(
+	ctx context.Context,
+	_ mcpauth.Target,
+	server compozyconfig.MCPServer,
+) (MCPServerRuntimeStatus, error) {
+	f.mu.Lock()
+	f.inFlight++
+	f.started++
+	if f.inFlight > f.max {
+		f.max = f.inFlight
+	}
+	f.mu.Unlock()
+	defer func() {
+		f.mu.Lock()
+		f.inFlight--
+		f.finished++
+		f.mu.Unlock()
+	}()
+
+	name := strings.TrimSpace(server.Name)
+	select {
+	case f.entered <- name:
+	case <-ctx.Done():
+		return MCPServerRuntimeStatus{}, ctx.Err()
+	}
+	select {
+	case <-f.release:
+		if name == f.failName {
+			return MCPServerRuntimeStatus{}, errBlockingMCPRuntime
+		}
+		return MCPServerRuntimeStatus{
+			Configured: true, Initialized: true, State: MCPServerRuntimeStateReady, Probe: MCPServerProbeSucceeded,
+		}, nil
+	case <-ctx.Done():
+		return MCPServerRuntimeStatus{}, ctx.Err()
+	}
+}
+
+func (f *blockingMCPRuntimeProvider) maxInFlight() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.max
+}
+
+func (f *blockingMCPRuntimeProvider) finishedCount() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.finished
+}
+
+func (f *blockingMCPRuntimeProvider) startedCount() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.started
+}
+
+func mcpItemNames(items []MCPServerItem) []string {
+	names := make([]string, 0, len(items))
+	for _, item := range items {
+		names = append(names, item.Name)
+	}
+	return names
+}
+
+func (f *fakeMCPRuntimeProvider) MCPServerRuntimeStatus(
+	_ context.Context,
+	target mcpauth.Target,
+	server compozyconfig.MCPServer,
+) (MCPServerRuntimeStatus, error) {
+	if f.targets != nil {
+		f.targets[strings.TrimSpace(server.Name)] = target
+	}
+	if status, ok := f.statuses[strings.TrimSpace(server.Name)]; ok {
+		return status, nil
+	}
+	return MCPServerRuntimeStatus{
+		Configured: true,
+		State:      MCPServerRuntimeStateRuntimeUnavailable,
+		Probe:      MCPServerProbeFailed,
+		Reason:     "test_missing_runtime_status",
+	}, nil
+}
+
+// fakeMCPExtensionManagement substitutes the daemon publication/store I/O boundary.
+type fakeMCPExtensionManagement struct {
+	definitions []MCPExtensionDefinition
+	nameError   error
+	update      func(context.Context, MCPAuthTargetRequest, extensionmcp.Override) (MCPExtensionDefinition, error)
+}
+
+func (f *fakeMCPExtensionManagement) ListMCPExtensionDefinitions(
+	context.Context,
+	MCPAuthTargetRequest,
+) ([]MCPExtensionDefinition, error) {
+	return f.definitions, nil
+}
+func (f *fakeMCPExtensionManagement) ValidateManualMCPName(context.Context, MCPAuthTargetRequest) error {
+	return f.nameError
+}
+
+func (f *fakeMCPExtensionManagement) UpdateMCPExtensionOverride(
+	ctx context.Context, req MCPAuthTargetRequest, override extensionmcp.Override,
+) (MCPExtensionDefinition, error) {
+	if f.update != nil {
+		return f.update(ctx, req, override)
+	}
+	return MCPExtensionDefinition{}, errors.New("unexpected MCP override mutation")
+}

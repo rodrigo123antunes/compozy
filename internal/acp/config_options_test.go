@@ -1,0 +1,186 @@
+package acp
+
+import (
+	"errors"
+	"testing"
+
+	acpsdk "github.com/coder/acp-go-sdk"
+)
+
+func TestSessionConfigOptionsFromSDK(t *testing.T) {
+	t.Run("Should convert select boolean and grouped config options", func(t *testing.T) {
+		t.Parallel()
+
+		description := "Choose active model"
+		booleanDescription := "Enable verbose output"
+		modelCategory := acpsdk.SessionConfigOptionCategoryModel
+		grouped := acpsdk.SessionConfigSelectOptionsGrouped{
+			{
+				Group: "frontier",
+				Name:  "Frontier",
+				Options: []acpsdk.SessionConfigSelectOption{
+					{Value: "model-a", Name: "Model A", Description: &description},
+				},
+			},
+		}
+
+		options := sessionConfigOptionsFromSDK([]acpsdk.SessionConfigOption{
+			{
+				Select: &acpsdk.SessionConfigOptionSelect{
+					Id:           "model",
+					Name:         "Model",
+					Description:  &description,
+					Category:     &modelCategory,
+					CurrentValue: "model-a",
+					Options: acpsdk.SessionConfigSelectOptions{
+						Grouped: &grouped,
+					},
+					Type: "select",
+				},
+			},
+			{
+				Boolean: &acpsdk.SessionConfigOptionBoolean{
+					Id:           "verbose",
+					Name:         "Verbose",
+					Description:  &booleanDescription,
+					CurrentValue: true,
+					Type:         "boolean",
+				},
+			},
+			{
+				Select: &acpsdk.SessionConfigOptionSelect{
+					Id:   " ",
+					Name: "Ignored",
+					Type: "select",
+				},
+			},
+		})
+
+		if len(options) != 2 {
+			t.Fatalf("sessionConfigOptionsFromSDK() len = %d, want 2: %#v", len(options), options)
+		}
+		model := options[0]
+		if model.ID != "model" || model.Label != "Model" || model.Description != description ||
+			model.Category != string(
+				modelCategory,
+			) || model.Kind != SessionConfigOptionKindSelect || model.CurrentValueID != "model-a" ||
+			model.CurrentBool != nil {
+			t.Fatalf("model option = %#v", model)
+		}
+		if len(model.Values) != 1 || model.Values[0].Value != "model-a" ||
+			model.Values[0].Description != description || model.Values[0].GroupID != "frontier" ||
+			model.Values[0].GroupLabel != "Frontier" {
+			t.Fatalf("model values = %#v", model.Values)
+		}
+		boolean := options[1]
+		if boolean.ID != "verbose" || boolean.Kind != SessionConfigOptionKindBoolean || boolean.CurrentBool == nil ||
+			!*boolean.CurrentBool || boolean.CurrentValueID != "" || boolean.Description != booleanDescription {
+			t.Fatalf("boolean option = %#v", boolean)
+		}
+	})
+
+	t.Run("Should return nil for absent options", func(t *testing.T) {
+		t.Parallel()
+
+		if got := sessionConfigOptionsFromSDK(nil); got != nil {
+			t.Fatalf("sessionConfigOptionsFromSDK(nil) = %#v, want nil", got)
+		}
+	})
+
+	t.Run("Should find model and reasoning options by standard categories", func(t *testing.T) {
+		t.Parallel()
+
+		categoryOptions := []SessionConfigOption{
+			{
+				ID:       "active_model",
+				Category: string(acpsdk.SessionConfigOptionCategoryModel),
+				Kind:     SessionConfigOptionKindSelect,
+			},
+			{
+				ID:       "thinking",
+				Category: string(acpsdk.SessionConfigOptionCategoryThoughtLevel),
+				Kind:     SessionConfigOptionKindSelect,
+			},
+		}
+		model, modelOK := findModelConfigOption(categoryOptions)
+		if !modelOK || model.ID != "active_model" {
+			t.Fatalf("findModelConfigOption(category) = %#v, %t", model, modelOK)
+		}
+		reasoning, reasoningOK := findReasoningConfigOption(categoryOptions)
+		if !reasoningOK || reasoning.ID != "thinking" {
+			t.Fatalf("findReasoningConfigOption(category) = %#v, %t", reasoning, reasoningOK)
+		}
+	})
+}
+
+func TestConfigOptionMatching(t *testing.T) {
+	t.Parallel()
+
+	options := []SessionConfigOption{
+		{ID: "verbose", Kind: SessionConfigOptionKindBoolean, CurrentBool: new(true)},
+		{
+			ID:             "model",
+			Kind:           SessionConfigOptionKindSelect,
+			CurrentValueID: "model-a",
+			Values:         []SessionConfigOptionValue{{Value: "model-a"}, {Value: "model-b"}},
+		},
+		{
+			ID:             "effort",
+			Kind:           SessionConfigOptionKindSelect,
+			CurrentValueID: "low",
+			Values:         []SessionConfigOptionValue{{Value: "low"}, {Value: "high"}},
+		},
+	}
+
+	t.Run("Should find model and reasoning config options", func(t *testing.T) {
+		t.Parallel()
+
+		model, ok := findModelConfigOption(options)
+		if !ok || model.ID != "model" {
+			t.Fatalf("findModelConfigOption() = %#v, %v", model, ok)
+		}
+		reasoning, ok := findReasoningConfigOption(options)
+		if !ok || reasoning.ID != "effort" {
+			t.Fatalf("findReasoningConfigOption() = %#v, %v", reasoning, ok)
+		}
+	})
+
+	t.Run("Should allow only advertised select option values", func(t *testing.T) {
+		t.Parallel()
+
+		model, ok := findModelConfigOption(options)
+		if !ok {
+			t.Fatal("findModelConfigOption() ok = false, want true")
+		}
+		if !configOptionAllowsValue(model, "model-b") {
+			t.Fatal("configOptionAllowsValue() rejected advertised model")
+		}
+		if configOptionAllowsValue(model, "model-c") {
+			t.Fatal("configOptionAllowsValue() accepted unadvertised model")
+		}
+		if configOptionAllowsValue(options[0], "true") {
+			t.Fatal("configOptionAllowsValue() accepted boolean option as select")
+		}
+	})
+
+	t.Run("Should require an exact advertised model value", func(t *testing.T) {
+		t.Parallel()
+
+		advertised := "grok-4.5[effort=high,fast=true]"
+		options := []SessionConfigOption{{
+			ID:             "model",
+			Kind:           SessionConfigOptionKindSelect,
+			Values:         []SessionConfigOptionValue{{Value: advertised}},
+			CurrentValueID: advertised,
+			Category:       string(acpsdk.SessionConfigOptionCategoryModel),
+		}}
+		if err := ValidateModelConfigValue(options, advertised); err != nil {
+			t.Fatalf("ValidateModelConfigValue(advertised) error = %v", err)
+		}
+		err := ValidateModelConfigValue(options, "cursor-grok-4.5-high")
+		negotiationErr, ok := errors.AsType[*NegotiationError](err)
+		if !ok || negotiationErr.Code != NegotiationCodeModelUnavailable {
+			t.Fatalf("ValidateModelConfigValue(alias) error = %v, want model_unavailable NegotiationError", err)
+		}
+	})
+}

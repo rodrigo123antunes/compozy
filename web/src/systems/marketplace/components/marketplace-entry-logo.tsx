@@ -1,0 +1,200 @@
+import Avatar from "boring-avatars";
+import { Component, createContext, use, useState, type ReactNode } from "react";
+
+import { cn, KindIcon } from "@compozy/ui";
+import { marketplaceIconURL } from "../lib/marketplace-icon";
+
+import {
+  marketplaceBrandKeyFor,
+  marketplaceBrandRegistry,
+} from "../lib/marketplace-brand-registry";
+
+type MarketplaceEntryLogoSize = "sm" | "md" | "lg";
+
+interface MarketplaceEntryLogoEntry {
+  entry_id: string;
+  name: string;
+  icon?: string | null;
+  install_slug?: string | null;
+}
+
+interface MarketplaceEntryLogoProps {
+  entry: MarketplaceEntryLogoEntry;
+  /** sm 24 (shelf) · md 40 (row) · lg 56 (detail lede). */
+  size?: MarketplaceEntryLogoSize;
+  className?: string;
+}
+
+const WELL_CLASS: Record<MarketplaceEntryLogoSize, string> = {
+  sm: "size-(--size-catalog-logo) rounded-sm",
+  md: "size-(--size-provider-logo-well) rounded-md",
+  lg: "size-14 rounded-lg",
+};
+
+const ICON_CLASS: Record<MarketplaceEntryLogoSize, string> = {
+  sm: "size-4",
+  md: "size-7",
+  lg: "size-10",
+};
+
+const BRAND_CLASS: Record<MarketplaceEntryLogoSize, string> = {
+  sm: "size-3.25",
+  md: "size-5",
+  lg: "size-7",
+};
+
+const MONOGRAM_CLASS: Record<MarketplaceEntryLogoSize, string> = {
+  sm: "text-mono-id",
+  md: "text-card-title",
+  lg: "text-detail-h1",
+};
+
+interface MarketplaceMarbleProps {
+  name: string;
+  size: number;
+}
+
+type MarketplaceMarbleRenderer = (props: MarketplaceMarbleProps) => ReactNode;
+
+function renderBoringMarble({ name, size }: MarketplaceMarbleProps): ReactNode {
+  return <Avatar name={name} size={size} square variant="marble" />;
+}
+
+/**
+ * The rung-4 marble generator. Production always uses Boring Avatars; a story can provide a
+ * generator that throws to exercise the monogram fallback without mocking the module.
+ */
+const MarketplaceMarbleContext = createContext<MarketplaceMarbleRenderer>(renderBoringMarble);
+const MarketplaceMarbleProvider = MarketplaceMarbleContext.Provider;
+
+/** Renders the generator inside the logo boundary, so a throw falls back to the monogram. */
+function MarketplaceMarble(props: MarketplaceMarbleProps) {
+  return use(MarketplaceMarbleContext)(props);
+}
+
+const MARBLE_PIXELS: Record<MarketplaceEntryLogoSize, number> = { sm: 24, md: 40, lg: 56 };
+
+const GRAPHEME_SEGMENTER = typeof Intl.Segmenter === "function" ? new Intl.Segmenter() : null;
+
+function firstGrapheme(value: string): string {
+  const trimmed = value.trim();
+  if (trimmed === "") return "?";
+  const first = GRAPHEME_SEGMENTER
+    ? GRAPHEME_SEGMENTER.segment(trimmed)[Symbol.iterator]().next().value?.segment
+    : undefined;
+  return (first ?? Array.from(trimmed)[0] ?? "?").toLocaleUpperCase();
+}
+
+/**
+ * Rung 4 guard: the marble generator is a pure function, so a throw is a bug — but the card must
+ * still show something that identifies the entry, never a generic glyph.
+ */
+class MarketplaceLogoBoundary extends Component<
+  { fallback: ReactNode; children: ReactNode },
+  { failed: boolean }
+> {
+  state = { failed: false };
+
+  static getDerivedStateFromError() {
+    return { failed: true };
+  }
+
+  render() {
+    return this.state.failed ? this.props.fallback : this.props.children;
+  }
+}
+
+/**
+ * Entry logo ladder: feed `icon` → brand mark from the shared inventory → Boring Avatars marble
+ * tile seeded by the entry id → monogram only when the tile fails to render. The marble tile is
+ * the one authorized identity color on a resting row (DESIGN-NOTES Q3).
+ */
+/** Render a CSP-compatible image, then the existing brand or generated fallback on failure. */
+function MarketplaceEntryLogo({ entry, size = "md", className }: MarketplaceEntryLogoProps) {
+  const [failedIcon, setFailedIcon] = useState<string>();
+  const icon = marketplaceIconURL(entry.icon);
+  const brandKey = marketplaceBrandKeyFor(entry);
+  const wellClass = cn(
+    "inline-flex shrink-0 items-center justify-center overflow-hidden text-fg",
+    WELL_CLASS[size],
+    className
+  );
+
+  if (icon && icon !== failedIcon) {
+    return (
+      <span
+        aria-hidden="true"
+        className={cn(wellClass, "bg-surface-2")}
+        data-rung="icon"
+        data-slot="marketplace-entry-logo"
+      >
+        <img
+          alt=""
+          className={cn("block rounded-xs object-contain", ICON_CLASS[size])}
+          decoding="async"
+          loading="lazy"
+          onError={() => setFailedIcon(icon)}
+          referrerPolicy="no-referrer"
+          src={icon}
+        />
+      </span>
+    );
+  }
+
+  if (brandKey) {
+    return (
+      <span
+        aria-hidden="true"
+        className={cn(wellClass, "bg-surface-2")}
+        data-rung="brand"
+        data-slot="marketplace-entry-logo"
+      >
+        <KindIcon
+          className={cn("text-fg", BRAND_CLASS[size])}
+          data-slot="marketplace-entry-brand"
+          kind={brandKey}
+          registry={marketplaceBrandRegistry}
+          size="md"
+          tone="default"
+        />
+      </span>
+    );
+  }
+
+  const monogram = (
+    <span
+      aria-hidden="true"
+      className={cn(
+        wellClass,
+        "bg-surface-2 font-sans font-semibold tracking-tight uppercase",
+        MONOGRAM_CLASS[size]
+      )}
+      data-rung="monogram"
+      data-slot="marketplace-entry-logo"
+    >
+      {firstGrapheme(entry.name)}
+    </span>
+  );
+
+  return (
+    <MarketplaceLogoBoundary fallback={monogram} key={entry.entry_id}>
+      <span
+        aria-hidden="true"
+        className={cn(wellClass, "[&>svg]:size-full")}
+        data-rung="marble"
+        data-slot="marketplace-entry-logo"
+      >
+        <MarketplaceMarble name={entry.entry_id} size={MARBLE_PIXELS[size]} />
+      </span>
+    </MarketplaceLogoBoundary>
+  );
+}
+
+export { MarketplaceEntryLogo, MarketplaceMarbleProvider };
+export type {
+  MarketplaceEntryLogoEntry,
+  MarketplaceEntryLogoProps,
+  MarketplaceEntryLogoSize,
+  MarketplaceMarbleProps,
+  MarketplaceMarbleRenderer,
+};

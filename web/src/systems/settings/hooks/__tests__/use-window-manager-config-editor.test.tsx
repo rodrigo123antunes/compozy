@@ -1,0 +1,434 @@
+// Suite: window-manager config validity
+// Invariant: a draft the daemon would refuse cannot be saved, and the editor can
+// say which value is at fault rather than only that one is. Ranges mirror the
+// web contract; the shortcut rule mirrors `CanonicalShortcuts`, which rejects a
+// chord claimed by two overrides but accepts one that shadows a shipped default.
+// Boundary IN: a config draft.
+// Boundary OUT: the controls that produce it, transport.
+import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
+import { act, renderHook, waitFor } from "@testing-library/react";
+import { createElement, type ReactNode } from "react";
+import { beforeEach, describe, expect, it, vi } from "vitest";
+
+import { type WindowManagerConfig, windowManagerKeys } from "@/systems/os";
+
+const { updateWindowManagerSettings } = vi.hoisted(() => ({
+  updateWindowManagerSettings: vi.fn(),
+}));
+
+vi.mock("../../adapters/window-manager-layouts-api", async importOriginal => {
+  const actual = await importOriginal<typeof import("../../adapters/window-manager-layouts-api")>();
+  return { ...actual, updateWindowManagerSettings };
+});
+
+import { WindowManagerSettingsApplyError } from "../../adapters/window-manager-layouts-api";
+import { windowManagerSettingsConfigToWire } from "../../lib/window-manager-layout-schema";
+import {
+  applyTerminalShortcutPreset,
+  previewTerminalShortcutPreset,
+  revertTerminalShortcutPreset,
+  TERMINAL_SHORTCUT_PRESET,
+} from "../../lib/window-manager-shortcut-preset";
+
+import {
+  useWindowManagerConfigEditor,
+  windowManagerConfigEditorLogic,
+} from "../use-window-manager-config-editor";
+
+const SHORTCUT_DEFAULTS = {
+  "window.close": ["meta+KeyW"],
+  "window.tile.left": ["control+alt+ArrowLeft"],
+  "window.focus.up": ["control+ArrowUp"],
+  "window.focus.down": ["control+ArrowDown"],
+  "window.tile.bottom-left": ["control+alt+KeyJ"],
+  "window.tile.bottom-right": ["control+alt+KeyK"],
+  "sidebar.toggle": ["meta+KeyB"],
+  "window.tab.jump.1": ["meta+Digit1"],
+  "window.tab.jump.2": ["meta+Digit2"],
+  "window.tab.jump.3": ["meta+Digit3"],
+  "window.tab.jump.4": ["meta+Digit4"],
+  "window.tab.jump.5": ["meta+Digit5"],
+  "window.tab.jump.6": ["meta+Digit6"],
+  "window.tab.jump.7": ["meta+Digit7"],
+  "window.tab.jump.8": ["meta+Digit8"],
+  "window.tab.last": ["meta+Digit9"],
+  "desktop.switch.1": ["control+Digit1"],
+  "desktop.switch.2": ["control+Digit2"],
+  "desktop.switch.3": ["control+Digit3"],
+  "desktop.switch.4": ["control+Digit4"],
+  "desktop.switch.5": ["control+Digit5"],
+  "desktop.switch.6": ["control+Digit6"],
+  "desktop.switch.7": ["control+Digit7"],
+  "desktop.switch.8": ["control+Digit8"],
+  "desktop.switch.9": ["control+Digit9"],
+} as const;
+
+const CONFIG: WindowManagerConfig = {
+  newWindowPolicy: "floating",
+  smallViewportPolicy: "stack",
+  focusPolicy: "click_directional",
+  focusWrap: true,
+  focusFollowsPointer: false,
+  raiseOnFocus: true,
+  dragAwayPolicy: "window",
+  groupMoveModifier: "alt",
+  swapModifier: "shift",
+  historyLimit: 100,
+  navStackLimit: 50,
+  closedEntryLimit: 20,
+  desktopTransition: "slide",
+  gaps: { inner: 8, top: 8, right: 8, bottom: 8, left: 8 },
+  snap: { edgeBand: 24, cornerReach: 96, exitSlack: 16, repeatRatios: [0.5, 0.33, 0.67] },
+  bindings: { topCenter: "zoom", bottomCenter: "none" },
+  shortcuts: {},
+  globalShortcuts: {},
+  shortcutDefaults: SHORTCUT_DEFAULTS,
+  effectiveShortcuts: SHORTCUT_DEFAULTS,
+};
+
+const APPLY = {
+  applied: true,
+  lifecycle: "live" as const,
+  apply_record_id: "apply-1",
+  active_generation: 2,
+  active_config_hash: "hash",
+  next_action: "none" as const,
+};
+
+/** Exercise the draft editor with an isolated query cache and replaceable daemon baseline. */
+function renderEditor(initial = CONFIG) {
+  const queryClient = new QueryClient({
+    defaultOptions: { queries: { retry: false }, mutations: { retry: false } },
+  });
+  const wrapper = ({ children }: { children: ReactNode }) =>
+    createElement(QueryClientProvider, { client: queryClient }, children);
+  return {
+    queryClient,
+    ...renderHook(({ baseline }) => useWindowManagerConfigEditor(baseline), {
+      initialProps: { baseline: initial },
+      wrapper,
+    }),
+  };
+}
+
+/** Project validation diagnostics to the editable fields whose saves must be blocked. */
+function fields(problems: ReadonlyArray<{ field: string }>) {
+  return problems.map(problem => problem.field);
+}
+
+describe("useWindowManagerConfigEditor", () => {
+  beforeEach(() => {
+    updateWindowManagerSettings.mockReset();
+    updateWindowManagerSettings.mockImplementation(async (config: WindowManagerConfig) => ({
+      config,
+      apply: APPLY,
+    }));
+  });
+
+  it("Should retain the failed draft and retry it without an extra edit", async () => {
+    updateWindowManagerSettings.mockRejectedValueOnce(new Error("Failed to fetch"));
+    const { result } = renderEditor();
+    act(() =>
+      result.current.setDraft(current => ({
+        ...current,
+        gaps: { inner: 0, top: 0, right: 0, bottom: 0, left: 0 },
+      }))
+    );
+    act(() => result.current.save());
+    await waitFor(() => expect(result.current.error?.message).toBe("Failed to fetch"));
+    expect(result.current.draft.gaps.inner).toBe(0);
+    expect(result.current.canSave).toBe(true);
+    act(() => result.current.save());
+    await waitFor(() => expect(result.current.result?.apply.applied).toBe(true));
+    expect(result.current.error).toBeNull();
+    expect(result.current.dirty).toBe(false);
+    expect(result.current.draft.gaps.inner).toBe(0);
+    expect(updateWindowManagerSettings).toHaveBeenCalledTimes(2);
+    expect(updateWindowManagerSettings.mock.calls[0]?.[0]).toEqual(
+      updateWindowManagerSettings.mock.calls[1]?.[0]
+    );
+  });
+
+  it.each(["edit", "discard"])("Should clear a failed save after %s", async action => {
+    updateWindowManagerSettings.mockRejectedValueOnce(new Error("Failed to fetch"));
+    const { result } = renderEditor();
+    act(() => result.current.setDraft(current => ({ ...current, historyLimit: 101 })));
+    act(() => result.current.save());
+    await waitFor(() => expect(result.current.error).not.toBeNull());
+    act(() => {
+      if (action === "edit")
+        result.current.setDraft(current => ({ ...current, historyLimit: 102 }));
+      else result.current.reset();
+    });
+    expect(result.current.error).toBeNull();
+    expect(result.current.dirty).toBe(action === "edit");
+  });
+
+  it("Should adopt persisted config after apply failure so discard cannot restore an obsolete baseline", async () => {
+    const saved = { ...CONFIG, gaps: { ...CONFIG.gaps, inner: 0 } };
+    updateWindowManagerSettings.mockRejectedValueOnce(
+      new WindowManagerSettingsApplyError({
+        config: saved,
+        apply: { ...APPLY, applied: false, next_action: "retry" },
+      })
+    );
+    const { result } = renderEditor();
+    act(() => result.current.setDraft(saved));
+    act(() => result.current.save());
+    await waitFor(() =>
+      expect(result.current.error).toBeInstanceOf(WindowManagerSettingsApplyError)
+    );
+    expect(result.current.dirty).toBe(false);
+    expect(result.current.canSave).toBe(true);
+    expect(result.current.result?.apply.applied).toBe(false);
+    act(() => result.current.reset());
+    expect(result.current.draft.gaps.inner).toBe(0);
+    expect(result.current.error).toBeNull();
+  });
+
+  it.each(["transport", "application"])(
+    "Should keep a newer edit retryable after an in-flight %s failure",
+    async failure => {
+      let rejectSave!: (error: Error) => void;
+      updateWindowManagerSettings.mockImplementationOnce(
+        () =>
+          new Promise((_, reject) => {
+            rejectSave = reject;
+          })
+      );
+      const { result } = renderEditor();
+      act(() => result.current.setDraft(current => ({ ...current, historyLimit: 101 })));
+      act(() => result.current.save());
+      await waitFor(() => expect(updateWindowManagerSettings).toHaveBeenCalledOnce());
+      act(() => {
+        result.current.setDraft(current => ({ ...current, historyLimit: 102 }));
+        result.current.save();
+      });
+      expect(result.current.canSave).toBe(false);
+      expect(updateWindowManagerSettings).toHaveBeenCalledOnce();
+      const error =
+        failure === "application"
+          ? new WindowManagerSettingsApplyError({
+              config: { ...CONFIG, historyLimit: 101 },
+              apply: { ...APPLY, applied: false, next_action: "retry" },
+            })
+          : new Error("Failed to fetch");
+      await act(async () => rejectSave(error));
+      await waitFor(() => expect(result.current.canSave).toBe(true));
+      expect(result.current.draft.historyLimit).toBe(102);
+      expect(result.current.error).toBeNull();
+      expect(result.current.result?.apply.next_action).toBe(
+        failure === "application" ? "retry" : undefined
+      );
+    }
+  );
+
+  it("Should retain the behavior draft when live shortcut state changes", () => {
+    const { result, rerender } = renderEditor();
+    act(() =>
+      result.current.setDraft(current => ({ ...current, gaps: { ...current.gaps, inner: 0 } }))
+    );
+    rerender({
+      baseline: {
+        ...CONFIG,
+        shortcuts: { "window.close": ["meta+shift+KeyW"] },
+        globalShortcuts: { "palette.summon.global": "meta+shift+Space" },
+      },
+    });
+    expect(result.current.draft.gaps.inner).toBe(0);
+    expect(result.current.canSave).toBe(true);
+    act(() => result.current.reset());
+    expect(result.current.dirty).toBe(false);
+  });
+
+  it("Should preserve every daemon-required limit in the wire config", () => {
+    expect(windowManagerSettingsConfigToWire(CONFIG)).toMatchObject({
+      history_limit: 100,
+      nav_stack_limit: 50,
+      closed_entry_limit: 20,
+    });
+  });
+
+  it("Should preserve a dirty draft when a newer baseline is rendered", () => {
+    const { result, rerender } = renderEditor();
+    act(() => {
+      result.current.setDraft(current => ({ ...current, historyLimit: 101 }));
+    });
+    rerender({ baseline: { ...CONFIG, historyLimit: 99 } });
+
+    expect(result.current.draft.historyLimit).toBe(101);
+    expect(result.current.phase).toBe("dirty");
+  });
+
+  it("Should ignore a late save result after a newer draft transition", () => {
+    const store = windowManagerConfigEditorLogic.createStore({ baseline: CONFIG });
+    let snapshot = store.getInitialSnapshot();
+    const revision = snapshot.context.baselineRevision;
+    [snapshot] = store.transition(snapshot, {
+      type: "draftChanged",
+      draft: { ...CONFIG, historyLimit: 101 },
+    });
+    [snapshot] = store.transition(snapshot, {
+      type: "saveRequested",
+      execute: async () => ({ config: CONFIG, apply: APPLY }),
+    });
+    [snapshot] = store.transition(snapshot, {
+      type: "draftChanged",
+      draft: { ...CONFIG, historyLimit: 102 },
+    });
+    [snapshot] = store.transition(snapshot, {
+      type: "saveSucceeded",
+      result: { config: CONFIG, apply: { ...APPLY, warnings: ["Follow-up required"] } },
+      operation: 1,
+      revision,
+      draftRevision: 1,
+    });
+
+    expect(snapshot.context.draft.historyLimit).toBe(102);
+    expect(snapshot.context.result?.apply.warnings).toEqual(["Follow-up required"]);
+    expect(snapshot.context.phase).toBe("dirty");
+  });
+
+  it("Should allow saving a changed draft that is within range", () => {
+    const { result } = renderEditor();
+    act(() => {
+      result.current.setDraft(current => ({ ...current, historyLimit: 101 }));
+    });
+
+    expect(result.current.problems).toEqual([]);
+    expect(result.current.canSave).toBe(true);
+  });
+
+  it("Should name history limit when it leaves its range", () => {
+    const { result } = renderEditor();
+    act(() => {
+      result.current.setDraft(current => ({ ...current, historyLimit: 501 }));
+    });
+
+    expect(fields(result.current.problems)).toEqual(["historyLimit"]);
+    expect(result.current.canSave).toBe(false);
+  });
+
+  it("Should reject duplicate repeat widths at the daemon's precision", () => {
+    const { result } = renderEditor();
+    act(() => {
+      result.current.setDraft(current => ({
+        ...current,
+        snap: { ...current.snap, repeatRatios: [0.5, 0.5000001] },
+      }));
+    });
+
+    expect(fields(result.current.problems)).toEqual(["repeatRatios"]);
+    expect(result.current.canSave).toBe(false);
+  });
+
+  it("Should name gaps and snap separately when both are out of range", () => {
+    const { result } = renderEditor();
+    act(() => {
+      result.current.setDraft(current => ({
+        ...current,
+        gaps: { ...current.gaps, inner: 90 },
+        snap: { ...current.snap, edgeBand: 2 },
+      }));
+    });
+
+    expect(fields(result.current.problems)).toEqual(["gaps", "snap"]);
+  });
+
+  // Chord collisions are no longer a draft concern: shortcuts left this editor
+  // when they became live daemon-arbitrated writes, and the block an operator
+  // sees is the daemon's own refusal — asserted in the shortcut-table suite.
+
+  it("Should return to the saved config on reset", () => {
+    const { result } = renderEditor();
+    act(() => {
+      result.current.setDraft(current => ({ ...current, historyLimit: 7 }));
+    });
+    expect(result.current.dirty).toBe(true);
+
+    act(() => {
+      result.current.reset();
+    });
+
+    expect(result.current.dirty).toBe(false);
+    expect(result.current.draft.historyLimit).toBe(100);
+  });
+
+  it("Should invalidate every client-scoped window-manager settings cache after a global save", async () => {
+    const { queryClient, result } = renderEditor();
+    const clientKey = windowManagerKeys.config(null, "desktop-1");
+    const globalKey = windowManagerKeys.config();
+    queryClient.setQueryData(clientKey, CONFIG);
+    queryClient.setQueryData(globalKey, CONFIG);
+
+    act(() => {
+      result.current.setDraft(current => ({ ...current, historyLimit: 101 }));
+    });
+    act(() => {
+      result.current.save();
+    });
+
+    await waitFor(() => expect(updateWindowManagerSettings).toHaveBeenCalledTimes(1));
+    await waitFor(() => {
+      expect(queryClient.getQueryState(clientKey)?.isInvalidated).toBe(true);
+      expect(queryClient.getQueryState(globalKey)?.isInvalidated).toBe(true);
+    });
+  });
+});
+
+/**
+ * The preset preview reports rows by label, so it needs the catalog the daemon
+ * would project — every id the preset touches, plus the defaults it displaces.
+ */
+const PRESET_ACTIONS = [
+  ...new Set([...Object.keys(TERMINAL_SHORTCUT_PRESET), ...Object.keys(SHORTCUT_DEFAULTS)]),
+].map(id => ({ id, label: id, section: "Window", source: "core", alias: null }));
+
+describe("Terminal shortcut preset", () => {
+  it("Should preview every changed key and flag layout hazards [UT-063]", () => {
+    const preview = previewTerminalShortcutPreset({}, SHORTCUT_DEFAULTS, PRESET_ACTIONS);
+
+    expect(preview.map(change => change.actionId)).toEqual(Object.keys(TERMINAL_SHORTCUT_PRESET));
+    expect(preview.some(change => change.hazards.includes("altgr"))).toBe(true);
+    expect(
+      preview.find(change => change.actionId === "window.tile.bottom-left")?.hazards
+    ).toContain("displaced-default");
+    expect(preview.find(change => change.actionId === "window.tab.jump")?.before).toEqual([
+      "meta+Digit1..8",
+    ]);
+    expect(preview.find(change => change.actionId === "desktop.switch")?.after).toEqual([
+      "control+Digit1..9",
+      "meta+Digit1..9",
+    ]);
+    const conflicted = previewTerminalShortcutPreset(
+      { "layout.undo": ["control+ArrowLeft"] },
+      SHORTCUT_DEFAULTS,
+      PRESET_ACTIONS
+    );
+    expect(
+      conflicted
+        .find(change => change.actionId === "window.focus.left")
+        ?.conflicts.some(conflict => conflict.kind === "blocked")
+    ).toBe(true);
+  });
+
+  it("Should apply atomically, re-apply idempotently, and restore only touched keys [UT-064]", () => {
+    const before = {
+      "window.close": ["meta+shift+KeyW"],
+      "layout.undo": ["alt+KeyU"],
+    };
+    const applied = applyTerminalShortcutPreset(before);
+    expect(applied.changed).toBe(true);
+    expect(applied.revert).not.toBeNull();
+    expect(applied.overrides["window.close"]).toEqual(TERMINAL_SHORTCUT_PRESET["window.close"]);
+
+    const reapplied = applyTerminalShortcutPreset(applied.overrides);
+    expect(reapplied.changed).toBe(false);
+    expect(reapplied.overrides).toBe(applied.overrides);
+
+    const manuallyEdited = { ...applied.overrides, "layout.undo": ["alt+KeyZ"] };
+    const restored = revertTerminalShortcutPreset(manuallyEdited, applied.revert!);
+    expect(restored["window.close"]).toEqual(["meta+shift+KeyW"]);
+    expect(restored["layout.undo"]).toEqual(["alt+KeyZ"]);
+  });
+});

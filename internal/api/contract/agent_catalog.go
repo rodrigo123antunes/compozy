@@ -1,0 +1,53 @@
+package contract
+
+import "time"
+
+// AgentSessionMetricsPayload contains exact visible-session aggregates for one agent.
+type AgentSessionMetricsPayload struct {
+	Total          int        `json:"total"`
+	Active         int        `json:"active"`
+	Failed         int        `json:"failed"`
+	RuntimeSeconds int64      `json:"runtime_seconds"`
+	LastActivityAt *time.Time `json:"last_activity_at,omitempty"`
+}
+
+// AgentCatalogItemPayload combines one effective definition with its optional
+// runtime session aggregate. Sessions is nil when the session authority is
+// temporarily unavailable.
+type AgentCatalogItemPayload struct {
+	Scopes   []string                    `json:"scopes,omitempty"`
+	Agent    AgentPayload                `json:"agent"`
+	Sessions *AgentSessionMetricsPayload `json:"sessions,omitzero"`
+}
+
+// AgentCatalogFacetsPayload contains fleet-wide values before search, filters,
+// and cursor pagination. Active and Idle are exact only when the enclosing
+// response reports SessionsAvailable.
+type AgentCatalogFacetsPayload struct {
+	Categories []string `json:"categories"`
+	Total      int      `json:"total"`
+	Active     int      `json:"active"`
+	Idle       int      `json:"idle"`
+}
+
+// AgentCatalogResponse is one bounded Global or workspace agent fleet page.
+type AgentCatalogResponse struct {
+	Items             []GroupedAgentCatalogItemPayload `json:"items,omitempty"`
+	NextCursor        string                           `json:"next_cursor"`
+	Diagnostics       []DiagnosticItem                 `json:"diagnostics,omitempty"`
+	Agents            []AgentCatalogItemPayload        `json:"agents"`
+	Page              CountedCursorPagePayload         `json:"page"`
+	Facets            AgentCatalogFacetsPayload        `json:"facets"`
+	SessionsAvailable bool                             `json:"sessions_available"`
+}
+
+// GroupedAgentCatalogItemPayload is one identity shared by identical scoped definitions.
+type GroupedAgentCatalogItemPayload struct {
+	Name             string       `json:"name"`
+	Label            string       `json:"label"`
+	Kind             string       `json:"kind"`
+	DefinitionDigest string       `json:"definition_digest"`
+	Scopes           []string     `json:"scopes"`
+	Active           int          `json:"active"`
+	Agent            AgentPayload `json:"agent"`
+}

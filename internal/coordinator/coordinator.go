@@ -1,0 +1,297 @@
+package coordinator
+
+import (
+	"encoding/json"
+	"slices"
+	"strings"
+	"time"
+
+	compozyconfig "github.com/compozy/compozy/internal/config"
+	"github.com/compozy/compozy/internal/session"
+	"github.com/compozy/compozy/internal/store"
+	taskpkg "github.com/compozy/compozy/internal/task"
+	toolspkg "github.com/compozy/compozy/internal/tools"
+)
+
+const (
+	ReasonRunEnqueued        = "task_run_enqueued"
+	ReasonRecovery           = "recovery"
+	ReasonCoordinatorStopped = "coordinator_stopped"
+
+	DecisionBootstrap        = "bootstrap"
+	DecisionDisabled         = "disabled"
+	DecisionGlobalScope      = "global_scope"
+	DecisionMissingWorkspace = "missing_workspace"
+	DecisionNonExecutableRun = "non_executable_run"
+	DecisionLoopWorker       = "loop_action"
+	DecisionTaskRunMismatch  = "task_run_mismatch"
+	DecisionExisting         = "existing_coordinator"
+	DecisionDenied           = "denied"
+	DecisionFailed           = "failed"
+)
+
+var (
+	// taskToolAllowlist is the orchestration-safe surface granted to coordinator
+	// sessions. Operator lifecycle verbs and coordinator-to-coordinator spawn
+	// are intentionally absent. These must stay aligned with canonical builtin
+	// ToolIDs because lineage permission policies validate concrete tool atoms.
+	taskToolAllowlist = [...]string{
+		toolspkg.ToolIDSessionDescribe.String(),
+		toolspkg.ToolIDTaskRunClaimNext.String(),
+		toolspkg.ToolIDTaskRunHeartbeat.String(),
+		toolspkg.ToolIDTaskRunComplete.String(),
+		toolspkg.ToolIDTaskRunFail.String(),
+		toolspkg.ToolIDTaskRunRelease.String(),
+		toolspkg.ToolIDTaskCreate.String(),
+	}
+)
+
+// ToolAllowlist returns the orchestration-safe tool surface granted to
+// coordinator sessions.
+func ToolAllowlist() []string {
+	tools := slices.Clone(taskToolAllowlist[:])
+	return tools
+}
+
+// Decision describes whether a task run is eligible to bootstrap a workspace
+// coordinator.
+type Decision struct {
+	ShouldBootstrap bool
+	Reason          string
+	ProfileID       string
+	WorkspaceID     string
+	TaskID          string
+	RunID           string
+	WorkflowID      string
+}
+
+// PromptInput captures the first-run situation given to a coordinator session.
+type PromptInput struct {
+	WorkspaceID     string
+	TaskID          string
+	RunID           string
+	WorkflowID      string
+	WorkerWorktrees []WorkerWorktreeBinding
+}
+
+// WorkerWorktreeBinding identifies the worktree assigned to one active worker run.
+type WorkerWorktreeBinding struct {
+	RunID      string
+	WorktreeID string
+}
+
+// DecideBootstrap evaluates the mechanical coordinator bootstrap rules. It
+// does not check for already-running coordinator sessions; that singleton check
+// belongs to the daemon runtime.
+func DecideBootstrap(task taskpkg.Task, run taskpkg.Run, cfg compozyconfig.ResolvedCoordinatorRole) Decision {
+	decision := Decision{
+		ProfileID:   strings.TrimSpace(task.ProfileID),
+		WorkspaceID: strings.TrimSpace(task.WorkspaceID),
+		TaskID:      strings.TrimSpace(task.ID),
+		RunID:       strings.TrimSpace(run.ID),
+		WorkflowID:  workflowIDFromMetadata(run.Metadata),
+	}
+	if !cfg.Enabled {
+		decision.Reason = DecisionDisabled
+		return decision
+	}
+	if strings.TrimSpace(task.ID) == "" ||
+		strings.TrimSpace(run.TaskID) == "" ||
+		strings.TrimSpace(task.ID) != strings.TrimSpace(run.TaskID) {
+		decision.Reason = DecisionTaskRunMismatch
+		return decision
+	}
+	switch task.Scope.Normalize() {
+	case taskpkg.ScopeGlobal:
+		decision.Reason = DecisionGlobalScope
+		return decision
+	case taskpkg.ScopeWorkspace:
+	default:
+		decision.Reason = DecisionMissingWorkspace
+		return decision
+	}
+	if decision.WorkspaceID == "" {
+		decision.Reason = DecisionMissingWorkspace
+		return decision
+	}
+	if run.IsLoopWorker() {
+		decision.Reason = DecisionLoopWorker
+		return decision
+	}
+	if !IsExecutableRunStatus(run.Status) {
+		decision.Reason = DecisionNonExecutableRun
+		return decision
+	}
+	decision.ShouldBootstrap = true
+	decision.Reason = DecisionBootstrap
+	return decision
+}
+
+// IsExecutableRunStatus reports whether a run still represents executable work
+// that may need coordinator orchestration.
+func IsExecutableRunStatus(status taskpkg.RunStatus) bool {
+	switch status.Normalize() {
+	case taskpkg.TaskRunStatusQueued,
+		taskpkg.TaskRunStatusClaimed,
+		taskpkg.TaskRunStatusStarting,
+		taskpkg.TaskRunStatusRunning:
+		return true
+	default:
+		return false
+	}
+}
+
+// ExecutableRunStatuses returns every open run state considered by recovery.
+func ExecutableRunStatuses() []taskpkg.RunStatus {
+	return []taskpkg.RunStatus{
+		taskpkg.TaskRunStatusQueued,
+		taskpkg.TaskRunStatusClaimed,
+		taskpkg.TaskRunStatusStarting,
+		taskpkg.TaskRunStatusRunning,
+	}
+}
+
+// PermissionPolicy returns the restricted coordinator root permission policy.
+func PermissionPolicy() store.SessionPermissionPolicy {
+	policy := store.SessionPermissionPolicy{
+		Tools: ToolAllowlist(),
+	}
+	return store.NormalizeSessionPermissionPolicy(policy)
+}
+
+// ToolAllowed reports whether a concrete tool/action is coordinator-safe.
+func ToolAllowed(tool string) bool {
+	return slices.Contains(ToolAllowlist(), strings.TrimSpace(tool))
+}
+
+// SpawnRoleAllowed reports whether a coordinator may request the given child
+// role through the public safe-spawn API.
+func SpawnRoleAllowed(role string) bool {
+	return strings.TrimSpace(strings.ToLower(role)) != string(session.SessionTypeCoordinator)
+}
+
+// Lineage builds root lineage metadata for a managed coordinator session.
+func Lineage(
+	now time.Time,
+	cfg compozyconfig.ResolvedCoordinatorRole,
+	policy store.SessionPermissionPolicy,
+) *store.SessionLineage {
+	ttl := now.UTC().Add(cfg.TTL)
+	return &store.SessionLineage{
+		SpawnRole:    string(session.SessionTypeCoordinator),
+		TTLExpiresAt: &ttl,
+		SpawnBudget: store.SessionSpawnBudget{
+			MaxChildren: cfg.MaxChildren,
+			MaxDepth:    store.DefaultSpawnMaxDepth,
+			TTLSeconds:  int64(cfg.TTL.Seconds()),
+			// Coordinator uniqueness is enforced by the daemon singleton; this caps managed sessions.
+			MaxActivePerWorkspace: cfg.MaxActiveSessionsPerWorkspace,
+		},
+		PermissionPolicy: store.NormalizeSessionPermissionPolicy(policy),
+	}
+}
+
+// HealthySession reports whether a session snapshot is an active coordinator
+// for the workspace.
+func HealthySession(info *session.Info, workspaceID string, now time.Time) bool {
+	if info == nil {
+		return false
+	}
+	if info.Type != session.SessionTypeCoordinator {
+		return false
+	}
+	if strings.TrimSpace(info.WorkspaceID) != strings.TrimSpace(workspaceID) {
+		return false
+	}
+	switch info.State {
+	case session.StateStarting, session.StateActive:
+	default:
+		return false
+	}
+	lineage := store.NormalizeSessionLineage(info.ID, info.Lineage)
+	if lineage.TTLExpiresAt != nil && !lineage.TTLExpiresAt.After(now.UTC()) {
+		return false
+	}
+	return true
+}
+
+// PromptOverlay assembles the coordinator's first-run situation and available
+// public API surface.
+func PromptOverlay(input PromptInput) string {
+	var b strings.Builder
+	b.WriteString("You are the Compozy workspace coordinator for executable task runs.\n\n")
+	b.WriteString("Current run context:\n")
+	writePromptLine(&b, "workspace_id", input.WorkspaceID)
+	writePromptLine(&b, "task_id", input.TaskID)
+	writePromptLine(&b, "run_id", input.RunID)
+	writePromptLine(&b, "workflow_id", input.WorkflowID)
+	writeWorkerWorktrees(&b, input.WorkerWorktrees)
+	b.WriteString("\nUse public Compozy agent APIs only:\n")
+	b.WriteString("- `" + toolspkg.ToolIDSessionDescribe.String() + "` for the Situation Surface.\n")
+	b.WriteString("- `" + toolspkg.ToolIDTaskCreate.String() + "` to persist follow-up task intent.\n")
+	b.WriteString("- `" + toolspkg.ToolIDTaskRunClaimNext.String() + "`, `" +
+		toolspkg.ToolIDTaskRunHeartbeat.String() + "`, `" +
+		toolspkg.ToolIDTaskRunComplete.String() + "`, `" +
+		toolspkg.ToolIDTaskRunFail.String() + "`, and `" +
+		toolspkg.ToolIDTaskRunRelease.String() + "` for task ownership and terminal status.\n")
+	b.WriteString("- `compozy spawn` for bounded worker delegation.\n")
+	b.WriteString("\nCreating a task only records follow-up intent. The current coordinator run is the active ")
+	b.WriteString("execution boundary, and child work must stay within the allowed task-run and spawn surfaces.\n")
+	b.WriteString("Never spawn another coordinator. ")
+	b.WriteString("Worker delegation must stay inside safe-spawn permissions and task approvals.\n")
+	return strings.TrimSpace(b.String())
+}
+
+func writeWorkerWorktrees(b *strings.Builder, bindings []WorkerWorktreeBinding) {
+	bindings = slices.Clone(bindings)
+	slices.SortFunc(bindings, func(left WorkerWorktreeBinding, right WorkerWorktreeBinding) int {
+		if order := strings.Compare(strings.TrimSpace(left.RunID), strings.TrimSpace(right.RunID)); order != 0 {
+			return order
+		}
+		return strings.Compare(strings.TrimSpace(left.WorktreeID), strings.TrimSpace(right.WorktreeID))
+	})
+	wroteHeading := false
+	for _, binding := range bindings {
+		runID := strings.TrimSpace(binding.RunID)
+		worktreeID := strings.TrimSpace(binding.WorktreeID)
+		if runID == "" || worktreeID == "" {
+			continue
+		}
+		if !wroteHeading {
+			b.WriteString("\nActive worker worktrees:\n")
+			wroteHeading = true
+		}
+		b.WriteString("- run_id: ")
+		b.WriteString(runID)
+		b.WriteString("; worktree_id: ")
+		b.WriteString(worktreeID)
+		b.WriteByte('\n')
+	}
+}
+
+func writePromptLine(b *strings.Builder, key string, value string) {
+	trimmed := strings.TrimSpace(value)
+	if trimmed == "" {
+		return
+	}
+	b.WriteString("- ")
+	b.WriteString(key)
+	b.WriteString(": ")
+	b.WriteString(trimmed)
+	b.WriteByte('\n')
+}
+
+func workflowIDFromMetadata(raw json.RawMessage) string {
+	if len(raw) == 0 {
+		return ""
+	}
+	var metadata map[string]any
+	if err := json.Unmarshal(raw, &metadata); err != nil {
+		return ""
+	}
+	value, ok := metadata["workflow_id"].(string)
+	if !ok {
+		return ""
+	}
+	return strings.TrimSpace(value)
+}

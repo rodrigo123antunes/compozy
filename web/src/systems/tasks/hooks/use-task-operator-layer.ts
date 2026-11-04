@@ -1,0 +1,57 @@
+import { useDeleteTaskExecutionProfile, useSetTaskExecutionProfile } from "./use-task-profile";
+import { submitTaskMutation } from "../lib/task-mutation";
+import type { TaskStreamState } from "../lib/task-stream-state";
+import type { TaskExecutionProfileSetRequest } from "../types";
+
+interface UseTaskOperatorLayerOptions {
+  /** Gate stream diagnostics to the open drawer. */
+  enabled?: boolean;
+  streamErrorMessage?: string | null;
+  streamSeedSequence?: number;
+  streamState?: TaskStreamState;
+}
+
+/**
+ * Operator-layer data for the Inspect drawer and Setup sheet:
+ * execution-profile writes and a status-bearing SSE
+ * probe whose connection state feeds the drawer's Stream pane.
+ *
+ * @see docs/design/opendesign/tasks/TASK-DETAILS-REDESIGN-PLAN.md §4.7–4.8
+ */
+function useTaskOperatorLayer(taskId: string, options: UseTaskOperatorLayerOptions = {}) {
+  const enabled = options.enabled ?? true;
+  const hasTaskId = taskId.trim() !== "";
+  const layerEnabled = enabled && hasTaskId;
+
+  const setProfileMutation = useSetTaskExecutionProfile();
+  const deleteProfileMutation = useDeleteTaskExecutionProfile();
+
+  const handleSetProfile = async (data: TaskExecutionProfileSetRequest) => {
+    await submitTaskMutation(
+      () => setProfileMutation.mutateAsync({ id: taskId, data }),
+      "Setup saved.",
+      "Failed to save setup"
+    );
+  };
+
+  const handleDeleteProfile = async () => {
+    await submitTaskMutation(
+      () => deleteProfileMutation.mutateAsync({ id: taskId }),
+      "Setup cleared.",
+      "Failed to clear setup"
+    );
+  };
+
+  return {
+    handleDeleteProfile,
+    handleSetProfile,
+    isDeleteProfilePending: deleteProfileMutation.isPending,
+    isSetProfilePending: setProfileMutation.isPending,
+    streamErrorMessage: layerEnabled ? (options.streamErrorMessage ?? null) : null,
+    streamSeedSequence: options.streamSeedSequence ?? 0,
+    streamState: layerEnabled ? (options.streamState ?? "idle") : "disabled",
+  };
+}
+
+export { useTaskOperatorLayer };
+export type { UseTaskOperatorLayerOptions };

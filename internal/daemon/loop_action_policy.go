@@ -1,0 +1,257 @@
+package daemon
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"slices"
+	"strings"
+
+	"github.com/compozy/compozy/internal/acp"
+	compozyconfig "github.com/compozy/compozy/internal/config"
+	looppkg "github.com/compozy/compozy/internal/loop"
+	"github.com/compozy/compozy/internal/session"
+	toolspkg "github.com/compozy/compozy/internal/tools"
+	workspacepkg "github.com/compozy/compozy/internal/workspace"
+)
+
+type loopSessionAgentResolver interface {
+	ResolveAgent(name string, resolved *workspacepkg.ResolvedWorkspace) (compozyconfig.AgentDef, error)
+}
+
+type loopSessionPolicyGate struct {
+	profileNames      session.ProfileNameResolver
+	workspaceResolver workspacepkg.RuntimeResolver
+	agentResolver     loopSessionAgentResolver
+}
+
+type loopSessionPolicyResolution struct {
+	workspace workspacepkg.ResolvedWorkspace
+	agent     compozyconfig.ResolvedAgent
+}
+
+func (g *loopSessionPolicyGate) apply(
+	ctx context.Context,
+	opts *session.CreateOpts,
+	agentName string,
+	allowedTools []string,
+) error {
+	_, err := g.applyResolved(ctx, opts, agentName, allowedTools)
+	return err
+}
+
+// applyLoopSessionCWD resolves the CWD only for project sessions: User-scope sessions always
+// run in the configured User work directory and reject a caller directory.
+func applyLoopSessionCWD(opts *session.CreateOpts, resolved *workspacepkg.ResolvedWorkspace) error {
+	if resolved.Scope == workspacepkg.ScopeUser {
+		return nil
+	}
+	cwd, err := session.ResolveSessionCWD(resolved.RootDir, opts.CWD)
+	if err != nil {
+		return err
+	}
+	opts.CWD = cwd
+	return nil
+}
+
+func (g *loopSessionPolicyGate) applyResolved(
+	ctx context.Context,
+	opts *session.CreateOpts,
+	agentName string,
+	allowedTools []string,
+) (loopSessionPolicyResolution, error) {
+	if opts == nil {
+		return loopSessionPolicyResolution{}, errors.New("daemon: loop session options are required")
+	}
+	resolved, err := g.resolveWorkspace(ctx, opts)
+	if err != nil {
+		return loopSessionPolicyResolution{}, err
+	}
+	agentDef, err := g.resolveAgent(agentName, &resolved)
+	if err != nil {
+		return loopSessionPolicyResolution{}, fmt.Errorf(
+			"%w: resolve loop session agent policy for %q: %w",
+			looppkg.ErrValidation,
+			strings.TrimSpace(agentName),
+			err,
+		)
+	}
+	resolvedAgent, err := resolved.Config.ResolveSessionAgentWithRuntime(agentDef, compozyconfig.RuntimeOverrides{
+		Provider:  opts.Provider,
+		Model:     opts.Model,
+		Reasoning: opts.ReasoningEffort,
+	})
+	if err != nil {
+		return loopSessionPolicyResolution{}, fmt.Errorf(
+			"%w: resolve loop session policy for %q: %w",
+			looppkg.ErrValidation,
+			strings.TrimSpace(agentName),
+			err,
+		)
+	}
+	policy := sessionPolicyFromResolvedAgent(resolvedAgent)
+	applySessionPermissionPolicy(opts, policy)
+	if err := applyAllowedToolsNarrowing(opts, allowedTools); err != nil {
+		return loopSessionPolicyResolution{}, err
+	}
+	resolvedAgent.DenyTools = mergeLoopActionDeniedTools(
+		resolvedAgent.DenyTools,
+		opts.DeniedToolsOverride,
+	)
+	if err := applyLoopSessionCWD(opts, &resolved); err != nil {
+		return loopSessionPolicyResolution{}, err
+	}
+	opts.Provider = strings.TrimSpace(resolvedAgent.Provider)
+	opts.Model = strings.TrimSpace(resolvedAgent.Model)
+	opts.ReasoningEffort = strings.TrimSpace(resolvedAgent.ReasoningEffort)
+	if opts.Speed == "" {
+		opts.Speed = resolvedAgent.SpeedValue()
+	}
+	agentOptions := allowedLoopAgentACPOptions(
+		opts.Provider,
+		opts.Permissions,
+		session.ACPOptionSelectionsFromConfig(resolvedAgent.ACPOptionsValue()),
+	)
+	mergedACPOptions, err := session.MergeRuntimeACPOptions(agentOptions, opts.ACPOptions)
+	if err != nil {
+		return loopSessionPolicyResolution{}, fmt.Errorf(
+			"%w: merge loop session ACP options for %q: %w",
+			looppkg.ErrValidation,
+			strings.TrimSpace(agentName),
+			err,
+		)
+	}
+	opts.ACPOptions = mergedACPOptions
+	if runtimeMode := normalizeSessionRuntimeMode(policy.Runtime.Mode); runtimeMode != "" {
+		opts.RuntimeMode = string(runtimeMode)
+	}
+	if permissions := strings.TrimSpace(string(opts.Permissions)); permissions != "" {
+		resolvedAgent.Permissions = permissions
+	}
+	if len(opts.AllowedToolsOverride) > 0 {
+		resolvedAgent.Tools = append([]string(nil), opts.AllowedToolsOverride...)
+		resolvedAgent.Toolsets = nil
+	}
+	return loopSessionPolicyResolution{workspace: resolved, agent: resolvedAgent}, nil
+}
+
+func allowedLoopAgentACPOptions(
+	provider string,
+	permissions compozyconfig.PermissionMode,
+	options []acp.SessionConfigOptionSelection,
+) []acp.SessionConfigOptionSelection {
+	if permissions == compozyconfig.PermissionModeApproveAll {
+		return options
+	}
+	return slices.DeleteFunc(options, func(option acp.SessionConfigOptionSelection) bool {
+		return compozyconfig.IsUnrestrictedACPOption(provider, option.ID, option.ValueID)
+	})
+}
+
+func loopActionTerminalTools() []string {
+	return []string{
+		toolspkg.ToolIDTaskRunComplete.String(),
+		toolspkg.ToolIDTaskRunFail.String(),
+	}
+}
+
+func mergeLoopActionDeniedTools(groups ...[]string) []string {
+	seen := make(map[string]struct{})
+	merged := make([]string, 0)
+	for _, values := range groups {
+		for _, value := range values {
+			trimmed := strings.TrimSpace(value)
+			if trimmed == "" {
+				continue
+			}
+			if _, ok := seen[trimmed]; ok {
+				continue
+			}
+			seen[trimmed] = struct{}{}
+			merged = append(merged, trimmed)
+		}
+	}
+	slices.Sort(merged)
+	return merged
+}
+
+func (g *loopSessionPolicyGate) resolveWorkspace(
+	ctx context.Context,
+	optsInput *session.CreateOpts,
+) (workspacepkg.ResolvedWorkspace, error) {
+	opts := *optsInput
+
+	if g == nil || g.workspaceResolver == nil {
+		return workspacepkg.ResolvedWorkspace{}, workspacepkg.ErrWorkspaceResolverUnavailable
+	}
+	if workspaceID := strings.TrimSpace(opts.Workspace); workspaceID != "" {
+		resolved, err := resolveRuntimeProfileWorkspace(
+			ctx,
+			g.workspaceResolver,
+			g.profileNames,
+			workspaceID,
+			opts.ProfileID,
+		)
+		if err != nil {
+			return workspacepkg.ResolvedWorkspace{}, fmt.Errorf(
+				"daemon: resolve loop session workspace %q: %w",
+				workspaceID,
+				err,
+			)
+		}
+		return resolved, nil
+	}
+	workspacePath := strings.TrimSpace(opts.WorkspacePath)
+	if workspacePath == "" {
+		resolver, ok := g.workspaceResolver.(workspacepkg.UserRuntimeResolver)
+		if !ok {
+			return workspacepkg.ResolvedWorkspace{}, workspacepkg.ErrWorkspaceResolverUnavailable
+		}
+		return resolver.ResolveUser(ctx, opts.ProfileID)
+	}
+	resolved, err := resolveRuntimeProfileWorkspace(
+		ctx,
+		g.workspaceResolver,
+		g.profileNames,
+		workspacePath,
+		opts.ProfileID,
+	)
+	if err != nil {
+		return workspacepkg.ResolvedWorkspace{}, fmt.Errorf(
+			"daemon: resolve loop session workspace path %q: %w",
+			workspacePath,
+			err,
+		)
+	}
+	return resolved, nil
+}
+
+func (g *loopSessionPolicyGate) resolveAgent(
+	agentName string,
+	resolved *workspacepkg.ResolvedWorkspace,
+) (compozyconfig.AgentDef, error) {
+	target := strings.TrimSpace(agentName)
+	if target == "" {
+		return compozyconfig.AgentDef{}, errors.New("daemon: loop session agent name is required")
+	}
+	if g != nil && g.agentResolver != nil {
+		return g.agentResolver.ResolveAgent(target, resolved)
+	}
+	for _, agent := range resolved.Agents {
+		if strings.TrimSpace(agent.Name) == target {
+			return agent, nil
+		}
+	}
+	return compozyconfig.AgentDef{}, fmt.Errorf("%w: %s", workspacepkg.ErrAgentNotAvailable, target)
+}
+
+func sessionPolicyFromResolvedAgent(
+	agent compozyconfig.ResolvedAgent,
+) SessionPolicy {
+	policy := SessionPolicy{
+		Runtime: SessionRuntimePolicy{
+			Permissions: compozyconfig.PermissionMode(strings.TrimSpace(agent.Permissions)),
+		},
+	}
+	return policy
+}

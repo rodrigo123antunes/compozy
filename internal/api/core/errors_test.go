@@ -1,0 +1,486 @@
+package core
+
+import (
+	"context"
+	"database/sql"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"log/slog"
+	"net/http"
+	"net/http/httptest"
+	"os"
+	"strings"
+	"testing"
+
+	"github.com/compozy/compozy/internal/admission"
+	"github.com/compozy/compozy/internal/agentidentity"
+	"github.com/compozy/compozy/internal/api/contract"
+	"github.com/compozy/compozy/internal/diagnostics"
+	looppkg "github.com/compozy/compozy/internal/loop"
+	"github.com/compozy/compozy/internal/session"
+	"github.com/compozy/compozy/internal/store"
+	taskpkg "github.com/compozy/compozy/internal/task"
+	workspacepkg "github.com/compozy/compozy/internal/workspace"
+	"github.com/compozy/compozy/internal/worktree"
+	"github.com/gin-gonic/gin"
+)
+
+func TestRespondErrorCancellation(t *testing.T) {
+	t.Parallel()
+	for _, tc := range []struct {
+		name          string
+		err           error
+		canceled      bool
+		requestStatus int
+		status        int
+	}{
+		{"Should classify wrapped cancellation", fmt.Errorf("read: %w", context.Canceled), false, 500, 499},
+		{"Should classify canceled read commits", sql.ErrTxDone, true, 500, 499},
+		{"Should preserve live double commit errors", sql.ErrTxDone, false, 500, 500},
+		{"Should preserve request deadlines", context.DeadlineExceeded, false, 500, 500},
+		{"Should preserve database lock failures", errors.New("database is locked"), false, 500, 500},
+		{"Should retain server failures after the client disconnects", errors.New("database is locked"), true, 500, 499},
+		{"Should avoid server warnings for disconnected client errors", errors.New("unknown session"), true, 404, 499},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			ctx, cancel := context.WithCancel(t.Context())
+			defer cancel()
+			if tc.canceled {
+				cancel()
+			}
+			var logs strings.Builder
+			h := &BaseHandlers{Logger: slog.New(slog.NewTextHandler(&logs, nil)), MaskInternalErrors: true}
+			response := httptest.NewRecorder()
+			c, _ := gin.CreateTestContext(response)
+			c.Request = httptest.NewRequestWithContext(ctx, http.MethodGet, "/api/sessions", http.NoBody)
+			h.respondError(c, tc.requestStatus, tc.err)
+			if response.Code != tc.status {
+				t.Fatalf("status = %d, want %d", response.Code, tc.status)
+			}
+			var payload contract.ErrorPayload
+			if err := json.Unmarshal(response.Body.Bytes(), &payload); err != nil {
+				t.Fatal(err)
+			}
+			if tc.status == 499 {
+				if payload.Error != context.Canceled.Error() || strings.Contains(logs.String(), "level=ERROR") {
+					t.Fatalf("cancellation = %s, logs = %s", response.Body.String(), logs.String())
+				}
+				if errors.Is(tc.err, context.Canceled) || tc.requestStatus < 500 {
+					if logs.Len() != 0 {
+						t.Fatalf("ordinary cancellation logged a server cause: %s", logs.String())
+					}
+				} else if !strings.Contains(logs.String(), "level=WARN") || !strings.Contains(logs.String(), tc.err.Error()) || !strings.Contains(logs.String(), "original_status=500") {
+					t.Fatalf("disconnected server failure lost its cause: %s", logs.String())
+				}
+			} else if payload.Error != http.StatusText(http.StatusInternalServerError) || !strings.Contains(logs.String(), tc.err.Error()) {
+				t.Fatalf("failure = %s, logs = %s", response.Body.String(), logs.String())
+			}
+		})
+	}
+}
+
+func TestTaskErrorHelpers(t *testing.T) {
+	t.Parallel()
+
+	wrapped := NewTaskValidationError(errors.New("bad input"))
+	if !errors.Is(wrapped, taskpkg.ErrValidation) {
+		t.Fatalf("NewTaskValidationError() = %v, want wrapped task validation sentinel", wrapped)
+	}
+	if got := NewTaskValidationError(nil); got != nil {
+		t.Fatalf("NewTaskValidationError(nil) = %v, want nil", got)
+	}
+
+	tests := []struct {
+		name string
+		err  error
+		want int
+	}{
+		{name: "nil", err: nil, want: http.StatusOK},
+		{name: "invalid scope", err: taskpkg.ErrInvalidScopeBinding, want: http.StatusBadRequest},
+		{name: "immutable field", err: taskpkg.ErrImmutableField, want: http.StatusBadRequest},
+		{name: "run missing", err: taskpkg.ErrTaskRunNotFound, want: http.StatusNotFound},
+		{name: "session missing", err: session.ErrSessionNotFound, want: http.StatusNotFound},
+		{name: "os not exist", err: os.ErrNotExist, want: http.StatusNotFound},
+		{name: "workspace root missing", err: workspacepkg.ErrWorkspaceRootMissing, want: http.StatusGone},
+		{
+			name: "workspace resolver unavailable",
+			err:  workspacepkg.ErrWorkspaceResolverUnavailable,
+			want: http.StatusServiceUnavailable,
+		},
+		{name: "attach forbidden", err: taskpkg.ErrSessionAttachNotAllowed, want: http.StatusConflict},
+		{
+			name: "Should return conflict for a terminal command already in progress",
+			err:  taskpkg.ErrTerminalRunCommandInProgress,
+			want: http.StatusConflict,
+		},
+		{name: "workspace capacity full", err: taskpkg.ErrWorkspaceActiveRunCapReached, want: http.StatusConflict},
+		{name: "default", err: errors.New("boom"), want: http.StatusInternalServerError},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			if got := StatusForTaskError(tt.err); got != tt.want {
+				t.Fatalf("StatusForTaskError(%v) = %d, want %d", tt.err, got, tt.want)
+			}
+		})
+	}
+}
+
+func TestLoopErrorHelpers(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name string
+		err  error
+		want int
+	}{
+		{name: "Should map nil Loop errors to OK", err: nil, want: http.StatusOK},
+		{
+			name: "Should map duplicate Loop definitions to conflict",
+			err:  looppkg.ErrDefinitionExists,
+			want: http.StatusConflict,
+		},
+		{
+			name: "Should map missing Loop definitions to not found",
+			err:  looppkg.ErrDefinitionNotFound,
+			want: http.StatusNotFound,
+		},
+		{
+			name: "Should map Loop validation errors to bad request",
+			err:  looppkg.ErrValidation,
+			want: http.StatusBadRequest,
+		},
+		{
+			name: "Should map read-only Loop definitions to forbidden",
+			err:  looppkg.ErrDefinitionReadOnly,
+			want: http.StatusForbidden,
+		},
+		{
+			name: "Should map invalid Loop transitions to unprocessable entity",
+			err:  looppkg.ErrInvalidTransition,
+			want: http.StatusUnprocessableEntity,
+		},
+		{
+			name: "Should map Loop transition conflicts to conflict",
+			err:  looppkg.ErrTransitionConflict,
+			want: http.StatusConflict,
+		},
+		{
+			name: "Should map Loop catalog cursor errors to bad request",
+			err:  looppkg.ErrCatalogCursorInvalid,
+			want: http.StatusBadRequest,
+		},
+		{
+			name: "Should map missing Loop catalog workspaces to not found",
+			err:  workspacepkg.ErrWorkspaceNotFound,
+			want: http.StatusNotFound,
+		},
+		{
+			name: "Should map missing Loop catalog roots to gone",
+			err:  workspacepkg.ErrWorkspaceRootMissing,
+			want: http.StatusGone,
+		},
+		{
+			name: "Should map unavailable Loop catalogs to service unavailable",
+			err:  looppkg.ErrCatalogUnavailable,
+			want: http.StatusServiceUnavailable,
+		},
+		{
+			name: "Should preserve missing actor identity as unauthorized",
+			err:  agentidentity.ErrIdentityRequired,
+			want: http.StatusUnauthorized,
+		},
+		{
+			name: "Should preserve unavailable actor lookup as service unavailable",
+			err:  agentidentity.ErrIdentityLookupUnavailable,
+			want: http.StatusServiceUnavailable,
+		},
+		{
+			name: "Should map unknown Loop errors to internal server error",
+			err:  errors.New("boom"),
+			want: http.StatusInternalServerError,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			if got := StatusForLoopError(tt.err); got != tt.want {
+				t.Fatalf("StatusForLoopError(%v) = %d, want %d", tt.err, got, tt.want)
+			}
+		})
+	}
+}
+
+func TestRespondErrorFallbackBranches(t *testing.T) {
+	t.Parallel()
+
+	gin.SetMode(gin.TestMode)
+
+	tests := []struct {
+		name       string
+		status     int
+		err        error
+		mask       bool
+		wantErr    string
+		wantStatus int
+	}{
+		{name: "unknown error fallback", status: 0, err: nil, mask: false, wantErr: "unknown error", wantStatus: 200},
+		{
+			name:       "masked internal fallback",
+			status:     599,
+			err:        nil,
+			mask:       true,
+			wantErr:    "internal server error",
+			wantStatus: 599,
+		},
+		{
+			name:       "known draining error remains actionable",
+			status:     http.StatusServiceUnavailable,
+			err:        admission.ErrDraining,
+			mask:       true,
+			wantErr:    admission.ErrDraining.Error(),
+			wantStatus: http.StatusServiceUnavailable,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			recorder := httptest.NewRecorder()
+			ctx, _ := gin.CreateTestContext(recorder)
+			RespondError(ctx, tt.status, tt.err, tt.mask)
+
+			var payload contract.ErrorPayload
+			if err := json.Unmarshal(recorder.Body.Bytes(), &payload); err != nil {
+				t.Fatalf("json.Unmarshal() error = %v", err)
+			}
+			if payload.Error != tt.wantErr {
+				t.Fatalf("payload.Error = %q, want %q", payload.Error, tt.wantErr)
+			}
+			if recorder.Code != tt.wantStatus {
+				t.Fatalf("status = %d, want %d", recorder.Code, tt.wantStatus)
+			}
+		})
+	}
+}
+
+func TestRespondErrorDiagnosticPayload(t *testing.T) {
+	t.Run("Should include redacted diagnostic when error carries one", func(t *testing.T) {
+		// not parallel: gin.SetMode mutates process-global state.
+		gin.SetMode(gin.TestMode)
+		recorder := httptest.NewRecorder()
+		ctx, _ := gin.CreateTestContext(recorder)
+		item := diagnostics.NewItem(diagnostics.ItemSpec{
+			ID:            "api.config_invalid",
+			Code:          contract.CodeConfigInvalid,
+			Category:      contract.CategoryConfig,
+			Title:         "Config invalid",
+			Message:       "config token=api-secret failed",
+			Severity:      contract.SeverityCritical,
+			DataFreshness: contract.FreshnessLive,
+		},
+			diagnostics.WithEvidence(map[string]any{"api_key": "sk-secret"}),
+		)
+		RespondError(
+			ctx,
+			http.StatusUnprocessableEntity,
+			diagnostics.NewStructuredError(item, errors.New("token=cause-secret")),
+			false,
+		)
+		if recorder.Code != http.StatusUnprocessableEntity {
+			t.Fatalf("status = %d, want %d", recorder.Code, http.StatusUnprocessableEntity)
+		}
+
+		var payload contract.ErrorPayload
+		if err := json.Unmarshal(recorder.Body.Bytes(), &payload); err != nil {
+			t.Fatalf("json.Unmarshal() error = %v", err)
+		}
+		if payload.Diagnostic == nil {
+			t.Fatal("payload.Diagnostic = nil, want diagnostic")
+		}
+		if payload.Diagnostic.Code != contract.CodeConfigInvalid {
+			t.Fatalf("payload.Diagnostic.Code = %q, want %q", payload.Diagnostic.Code, contract.CodeConfigInvalid)
+		}
+		if payload.Diagnostic.Evidence["api_key"] != "[REDACTED]" {
+			t.Fatalf(
+				"payload.Diagnostic.Evidence[api_key] = %#v, want redacted",
+				payload.Diagnostic.Evidence["api_key"],
+			)
+		}
+		for _, leaked := range []string{"api-secret", "sk-secret", "cause-secret"} {
+			if body := recorder.Body.String(); strings.Contains(body, leaked) {
+				t.Fatalf("response body = %s leaked %q", body, leaked)
+			}
+		}
+	})
+}
+
+func TestRespondOpenAIErrorRedaction(t *testing.T) {
+	t.Run("Should redact secret-shaped OpenAI error messages", func(t *testing.T) {
+		// not parallel: gin.SetMode mutates process-global state.
+		gin.SetMode(gin.TestMode)
+		recorder := httptest.NewRecorder()
+		ctx, _ := gin.CreateTestContext(recorder)
+
+		RespondOpenAIError(
+			ctx,
+			http.StatusBadRequest,
+			errors.New("provider returned Authorization: Bearer sk-openai-secret"),
+			false,
+		)
+		if recorder.Code != http.StatusBadRequest {
+			t.Fatalf("status = %d, want %d", recorder.Code, http.StatusBadRequest)
+		}
+
+		var payload contract.OpenAIErrorResponse
+		if err := json.Unmarshal(recorder.Body.Bytes(), &payload); err != nil {
+			t.Fatalf("json.Unmarshal() error = %v", err)
+		}
+		if strings.Contains(payload.Error.Message, "sk-openai-secret") {
+			t.Fatalf("payload.Error.Message = %q leaked secret", payload.Error.Message)
+		}
+		if !strings.Contains(payload.Error.Message, "[REDACTED]") {
+			t.Fatalf("payload.Error.Message = %q, want redacted marker", payload.Error.Message)
+		}
+	})
+}
+
+func TestErrorPayloadForError(t *testing.T) {
+	t.Parallel()
+	t.Run("Should expose queue capacity and preserve the edited draft on dispatch refusal", func(t *testing.T) {
+		t.Parallel()
+		full := &store.SessionInputQueueFullError{SessionID: "sess-1", Cap: 3, Count: 3}
+		payload := ErrorPayloadForError(full)
+		if StatusForSessionError(full) != http.StatusConflict || payload.Code != "queue_full" ||
+			payload.Diagnostic == nil {
+			t.Fatalf("queue full payload = %#v", payload)
+		}
+		if payload.Diagnostic.Evidence["queue_cap"] != 3 || payload.Diagnostic.Evidence["queue_count"] != 3 {
+			t.Fatalf("queue capacity evidence = %#v", payload.Diagnostic.Evidence)
+		}
+		// Once dispatch begins, both in-flight and completed sends preserve the refused edit.
+		for _, status := range []string{store.SessionInputQueueStatusDispatching, store.SessionInputQueueStatusSent} {
+			entry := &store.SessionInputNotQueuedError{EntryID: "entry-1", Status: status, Text: "edited draft"}
+			payload = ErrorPayloadForError(entry)
+			if StatusForSessionError(entry) != http.StatusConflict || payload.Code != "entry_dispatching" ||
+				payload.Details["text"] != "edited draft" || payload.Details["entry_id"] != "entry-1" {
+				t.Fatalf("dispatch refusal for %s = %#v", status, payload)
+			}
+		}
+	})
+	t.Run("Should expose actionable session refusals with their HTTP status", func(t *testing.T) {
+		t.Parallel()
+		for _, tc := range []struct {
+			err    error
+			code   string
+			status int
+		}{
+			{workspacepkg.ErrWorkspaceRootMissing, "workspace_root_missing", http.StatusGone},
+			{session.ErrSessionNotFound, "session_not_found", http.StatusNotFound},
+			{store.ErrSessionNotFound, "session_not_found", http.StatusNotFound},
+			{store.ErrSessionInputQueueFull, "queue_full", http.StatusConflict},
+			{store.ErrSessionInputMutationConflict, "send_conflict", http.StatusConflict},
+		} {
+			err := fmt.Errorf("send refused: %w", tc.err)
+			payload := ErrorPayloadForError(err)
+			if payload.Code != tc.code || StatusForSessionError(err) != tc.status {
+				t.Fatalf(
+					"refusal %v = %#v, status=%d; want %s/%d",
+					tc.err,
+					payload,
+					StatusForSessionError(err),
+					tc.code,
+					tc.status,
+				)
+			}
+		}
+	})
+
+	t.Run("Should expose superseded sessions as a structured conflict", func(t *testing.T) {
+		t.Parallel()
+		err := fmt.Errorf("admission: %w", store.ErrSessionSuperseded)
+		payload := ErrorPayloadForError(err)
+		if StatusForSessionError(err) != http.StatusConflict || payload.Code != "session_superseded" {
+			t.Fatalf("superseded refusal = %#v", payload)
+		}
+	})
+
+	t.Run("Should expose the observed turn in a stale prompt fence refusal", func(t *testing.T) {
+		t.Parallel()
+		err := &session.ActiveTurnMismatchError{ExpectedTurnID: "turn-old", CurrentTurnID: "turn-live"}
+		payload := ErrorPayloadForError(err)
+		if StatusForSessionError(err) != http.StatusConflict || payload.Code != "active_turn_mismatch" ||
+			payload.CurrentTurnID != "turn-live" {
+			t.Fatalf("stale fence refusal=%#v", payload)
+		}
+	})
+
+	t.Run("Should preserve the branch holder path in structured worktree refusal details", func(t *testing.T) {
+		t.Parallel()
+
+		const holderPath = "/tmp/compozy/worktrees/payments-retry"
+		payload := ErrorPayloadForError(&worktree.RefusalError{
+			Cause:  worktree.ErrBranchHeld,
+			Detail: holderPath,
+		})
+		if payload.Code != "branch_held_by_worktree" ||
+			payload.Details["detail"] != holderPath ||
+			payload.Details["worktree_path"] != holderPath {
+			t.Fatalf("branch-held refusal payload = %#v, want structured holder path", payload)
+		}
+	})
+
+	t.Run("Should preserve machine-readable Loop lifecycle reason details", func(t *testing.T) {
+		t.Parallel()
+
+		payload := ErrorPayloadForError(&looppkg.ReasonError{
+			Code: looppkg.ReasonCodeAlreadyDecided,
+			Err:  looppkg.ErrTransitionConflict,
+			Meta: map[string]string{
+				looppkg.ReasonMetaActualState:        "quarantined",
+				looppkg.ReasonMetaAllowedTransitions: "requeue,cancel",
+				looppkg.ReasonMetaWinnerActorID:      "operator:alice",
+			},
+		})
+		if payload.Code != string(looppkg.ReasonCodeAlreadyDecided) ||
+			payload.Details[looppkg.ReasonMetaActualState] != "quarantined" ||
+			payload.Details[looppkg.ReasonMetaAllowedTransitions] != "requeue,cancel" ||
+			payload.Details[looppkg.ReasonMetaWinnerActorID] != "operator:alice" {
+			t.Fatalf("Loop lifecycle error payload = %#v", payload)
+		}
+	})
+
+	t.Run("Should redact structured diagnostic secrets in serialized payload", func(t *testing.T) {
+		t.Parallel()
+
+		item := diagnostics.NewItem(diagnostics.ItemSpec{
+			ID:            "stream.daemon_unavailable",
+			Code:          contract.CodeDaemonUnavailable,
+			Category:      contract.CategoryDaemon,
+			Title:         "Daemon unavailable",
+			Message:       "socket token=stream-secret failed",
+			Severity:      contract.SeverityError,
+			DataFreshness: contract.FreshnessOffline,
+		})
+		payload := ErrorPayloadForError(diagnostics.NewStructuredError(item, errors.New("token=cause-secret")))
+		if payload.Diagnostic == nil {
+			t.Fatal("payload.Diagnostic = nil, want diagnostic")
+		}
+		if payload.Diagnostic.Code != contract.CodeDaemonUnavailable {
+			t.Fatalf("payload.Diagnostic.Code = %q, want %q", payload.Diagnostic.Code, contract.CodeDaemonUnavailable)
+		}
+		for _, leaked := range []string{"stream-secret", "cause-secret"} {
+			raw, err := json.Marshal(payload)
+			if err != nil {
+				t.Fatalf("json.Marshal() error = %v", err)
+			}
+			if strings.Contains(string(raw), leaked) {
+				t.Fatalf("payload = %s leaked %q", raw, leaked)
+			}
+		}
+	})
+}

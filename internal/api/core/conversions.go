@@ -1,0 +1,371 @@
+package core
+
+import (
+	"strings"
+	"time"
+
+	"github.com/compozy/compozy/internal/acp"
+	"github.com/compozy/compozy/internal/api/contract"
+	"github.com/compozy/compozy/internal/diagnostics"
+	"github.com/compozy/compozy/internal/session"
+	speedpkg "github.com/compozy/compozy/internal/speed"
+	"github.com/compozy/compozy/internal/store"
+	"github.com/compozy/compozy/internal/workref"
+)
+
+const (
+	maxDiagnosticPayloadBytes = 2048
+)
+
+// SessionPayloadFromInfo converts a session info snapshot into the shared session payload.
+func SessionPayloadFromInfo(info *session.Info) contract.SessionPayload {
+	return sessionPayloadFromInfoAt(info, time.Now().UTC())
+}
+
+func sessionPayloadFromInfoAt(info *session.Info, now time.Time) contract.SessionPayload {
+	scope := workspaceScopeValue
+	if info != nil && info.WorkspaceID == "" {
+		scope = userScopeValue
+	}
+	payload := contract.SessionPayload{
+		Scope: scope}
+	if info == nil {
+		return payload
+	}
+
+	ref := workref.NewPath(info.WorkspaceID, info.Workspace)
+	payload = contract.SessionPayload{
+		EffectiveWorkspaceAccess: info.EffectiveWorkspaceAccess,
+		EffectivePermissions:     info.EffectivePermissions,
+		PermissionModeDegraded:   info.PermissionModeDegraded,
+		Scope:                    scope,
+		InstanceID:               info.InstanceID,
+		Supervision:              session.CloneSupervisionState(info.Supervision),
+		BusyInput:                info.BusyInput,
+		ID:                       info.ID,
+		ProfileID:                strings.TrimSpace(info.ProfileID),
+		Name:                     info.Name,
+		AgentName:                info.AgentName,
+		Runtime:                  sessionRuntimePayloadFromInfo(info),
+		WorkspaceID:              ref.WorkspaceID,
+		WorkspacePath:            ref.WorkspacePath,
+		WorktreeID:               strings.TrimSpace(info.WorktreeID),
+		Type:                     info.Type,
+		State:                    info.State,
+		Badge:                    session.BadgeForInfo(info),
+		BoardColumn:              session.BoardColumnFor(session.BadgeForInfo(info), ""),
+		WaitingOn:                sessionPayloadWaitingOn(info, session.BadgeForInfo(info)),
+		Attachable:               session.AttachableForInfo(info, now),
+		AttachedTo:               strings.TrimSpace(info.AttachedTo),
+		AttachExpiresAt:          cloneTimePtr(info.AttachExpiresAt),
+		TranscriptEpoch:          info.TranscriptEpoch,
+		AttentionChangedAt:       cloneTimePtr(info.AttentionChangedAt),
+		PendingInteractions:      PendingInteractionPayloadsFromStore(info.PendingInteractions),
+		ArchivedAt:               cloneTimePtr(info.ArchivedAt),
+		Later:                    sessionLaterPayload(info.Later),
+		ReturnedFromLaterAt:      cloneTimePtr(info.LaterReturnedAt),
+		StopReason:               info.StopReason,
+		StopCause:                sessionStopCause(info),
+		Verified:                 new(info.State == session.StateStopped),
+		Escalated:                new(info.StopEscalated),
+		Attention:                sessionAttention(info),
+		AttentionDismissible:     session.AttentionDismissible(info),
+		StopDetail:               info.StopDetail,
+		Failure:                  SessionFailurePayloadFromStore(info.Failure),
+		AvailableCommands:        availableCommandPayloads(info.AdvertisedCommands),
+		Lineage:                  contract.SessionLineagePayloadFromStore(info.Lineage),
+		CreatedAt:                info.CreatedAt,
+		UpdatedAt:                info.UpdatedAt,
+	}
+	populateSessionRuntimePayload(&payload, info)
+	if activity := RuntimeActivityPayloadFromSessionMeta(info.Liveness, now); activity != nil {
+		payload.Activity = activity
+	}
+	payload.Derivation = sessionDerivationPayload(info.Derivation)
+	payload.ParentTitle = info.ParentTitle
+	if info.Children != nil {
+		counts := info.Children
+		payload.Children = &contract.SessionChildrenPayload{
+			Total:    counts.Total(),
+			NeedsYou: counts.NeedsYou,
+			Working:  counts.Working,
+			Waiting:  counts.Waiting,
+			InReview: counts.InReview,
+			Done:     counts.Done,
+		}
+	}
+	if info.BoardColumn != "" {
+		payload.BoardColumn = info.BoardColumn
+	}
+	return payload
+}
+
+func populateSessionRuntimePayload(payload *contract.SessionPayload, info *session.Info) {
+	if runtime := runtimeSelectionPayloadFromInfo(info); runtime != nil {
+		requested := info.RequestedRuntime()
+		payload.Runtime.Requested = contract.PromptRuntimeSelectionPayloadFromSelection(&requested)
+		payload.Runtime.LastKnown = runtime
+		if runtimeHasEffectiveSelection(info) {
+			payload.Runtime.Effective = runtime
+		}
+	}
+	if caps := contract.ACPCapsPayloadFromACP(info.ACPCaps, info.ACPCapsKnown); caps != nil {
+		payload.Runtime.ACPCaps = caps
+	}
+}
+
+// SessionPayloadFromStoreInfo converts the persisted session index row into the shared payload.
+func SessionPayloadFromStoreInfo(info *store.SessionInfo) contract.SessionPayload {
+	state := session.State(strings.TrimSpace(info.State))
+	attention := info.AttentionSnapshot()
+	converted := &session.Info{
+		EffectiveWorkspaceAccess: info.EffectiveWorkspaceAccess,
+		ID:                       strings.TrimSpace(info.ID),
+		ProfileID:                strings.TrimSpace(info.ProfileID),
+		Name:                     strings.TrimSpace(info.Name),
+		AgentName:                strings.TrimSpace(info.AgentName),
+		RuntimeStatus:            info.RuntimeStatus,
+		RuntimeTransition:        info.RuntimeTransition,
+		RuntimeFailure:           strings.TrimSpace(info.RuntimeFailure),
+		RuntimeGeneration:        info.RuntimeGeneration,
+		RuntimeRecovery:          info.RuntimeRecoveryValue(),
+		Provider:                 strings.TrimSpace(info.Provider),
+		Model:                    strings.TrimSpace(info.Model),
+		ReasoningEffort:          strings.TrimSpace(info.ReasoningEffort),
+		Speed:                    info.Speed,
+		ACPOptions:               session.ACPOptionSelectionsFromStore(info.ACPOptionsValue()),
+		SpeedResolution:          speedpkg.CloneResolution(info.SpeedResolution),
+		SelectedRuntime:          runtimeSelectionFromStoreInfo(info.SelectedRuntime),
+		RuntimeSelectionRevision: info.RuntimeSelectionRevision,
+		WorkspaceID:              strings.TrimSpace(info.WorkspaceID),
+		WorktreeID:               strings.TrimSpace(info.WorktreeID),
+		Type:                     session.Type(strings.TrimSpace(info.SessionType)),
+		State:                    state,
+		StopReason:               info.StopReason,
+		StopDetail:               strings.TrimSpace(info.StopDetail),
+		StopEscalated:            info.StopEscalated,
+		StopVerificationFailed:   info.StopVerificationFailed,
+		Failure:                  store.CloneSessionFailure(info.Failure),
+		ACPSessionID:             stringPointerValue(info.ACPSessionID),
+		Lineage:                  store.NormalizeSessionLineage(info.ID, info.Lineage),
+		Liveness:                 store.CloneSessionLivenessMeta(info.Liveness),
+		SoulSnapshotID:           strings.TrimSpace(info.SoulSnapshotID),
+		SoulDigest:               strings.TrimSpace(info.SoulDigest),
+		ParentSoulDigest:         strings.TrimSpace(info.ParentSoulDigest),
+		AttachedTo:               strings.TrimSpace(info.AttachedToValue()),
+		AttachExpiresAt:          cloneTimePtr(info.AttachExpiresAtValue()),
+		TranscriptEpoch:          info.TranscriptEpoch,
+		PendingPermissionCount:   attention.PendingPermissionCount,
+		PendingClarifyCount:      attention.PendingClarifyCount,
+		AttentionRevision:        attention.AttentionRevision,
+		LastSettledRevision:      attention.LastSettledRevision,
+		LastSeenRevision:         attention.LastSeenRevision,
+		LastSeenAt:               cloneTimePtr(attention.LastSeenAt),
+		AttentionChangedAt:       cloneTimePtr(attention.AttentionChangedAt),
+		FailureSeenAt:            cloneTimePtr(attention.FailureSeenAt),
+		ArchivedAt:               cloneTimePtr(info.ArchivedAt),
+		Later:                    store.CloneSessionLater(info.LaterState()),
+		LaterReturnedAt:          cloneTimePtr(info.LaterReturnedAtValue()),
+		CreatedAt:                info.CreatedAt,
+		UpdatedAt:                info.UpdatedAt,
+	}
+	return SessionPayloadFromInfo(converted)
+}
+
+// PendingInteractionPayloadsFromStore converts canonical records into sanitized wire payloads.
+func PendingInteractionPayloadsFromStore(values []store.PendingInteraction) []contract.PendingInteractionPayload {
+	result := make([]contract.PendingInteractionPayload, 0, len(values))
+	for _, value := range values {
+		value = store.SanitizePendingInteraction(value)
+		result = append(result, contract.PendingInteractionPayload{
+			InteractionID:     strings.TrimSpace(value.InteractionID),
+			SessionID:         strings.TrimSpace(value.SessionID),
+			ExpiresAt:         cloneTimePtr(value.ExpiresAt),
+			Kind:              strings.TrimSpace(value.Kind),
+			ProviderRequestID: strings.TrimSpace(value.ProviderRequestID),
+			TurnID:            strings.TrimSpace(value.TurnID),
+			Title:             strings.TrimSpace(value.Title),
+			Choices:           append([]string(nil), value.Payload.Choices...),
+			Decisions:         append([]string(nil), value.Payload.Decisions...),
+			ToolID:            strings.TrimSpace(value.Payload.ToolID),
+			Status:            strings.TrimSpace(value.Status),
+			CreatedAt:         value.CreatedAt.UTC(),
+			ResolvedAt:        cloneTimePtr(value.ResolvedAt),
+			Resolution:        strings.TrimSpace(value.Resolution),
+			ResolvedBy:        strings.TrimSpace(value.ResolvedBy),
+		})
+	}
+	return result
+}
+
+func runtimeSelectionPayloadFromInfo(info *session.Info) *contract.RuntimeSelectionPayload {
+	if info == nil || strings.TrimSpace(info.Provider) == "" {
+		return nil
+	}
+	runtime := info.EffectiveRuntime()
+	return &contract.RuntimeSelectionPayload{
+		Provider:        strings.TrimSpace(runtime.Provider),
+		Model:           strings.TrimSpace(runtime.Model),
+		ReasoningEffort: contract.ReasoningEffort(strings.TrimSpace(runtime.ReasoningEffort)),
+		Speed:           runtime.Speed,
+		ACPOptions:      contract.ACPOptionSelectionPayloadsFromACP(runtime.ACPOptions),
+		SpeedResolution: speedpkg.CloneResolution(info.SpeedResolution),
+	}
+}
+
+func runtimeHasEffectiveSelection(info *session.Info) bool {
+	if info == nil {
+		return false
+	}
+	switch info.RuntimeStatus {
+	case session.RuntimeStatusReady, session.RuntimeStatusReconfiguring,
+		session.RuntimeStatusRecovering, session.RuntimeStatusFailed:
+		return true
+	case session.RuntimeStatusUnbound:
+		return info.RuntimeTransition != session.RuntimeTransitionNone
+	default:
+		return false
+	}
+}
+
+func sessionRuntimeRecoveryPayload(value *store.SessionRuntimeRecovery) *contract.SessionRuntimeRecoveryPayload {
+	if value == nil {
+		return nil
+	}
+	return &contract.SessionRuntimeRecoveryPayload{
+		Reason:        value.Reason,
+		Attempt:       value.Attempt,
+		MaxAttempts:   value.MaxAttempts,
+		Generation:    value.Generation,
+		StartedAt:     value.StartedAt.UTC(),
+		LastAttemptAt: value.LastAttemptAt.UTC(),
+		NextAttemptAt: cloneTimePtr(value.NextAttemptAt),
+		LastError:     diagnostics.RedactAndBound(value.LastError, maxDiagnosticPayloadBytes),
+	}
+}
+
+func runtimeSelectionFromStoreInfo(selection *store.SessionRuntimeSelection) *session.RuntimeSelection {
+	if selection == nil {
+		return nil
+	}
+	normalized := store.NormalizeSessionRuntimeSelection(selection)
+	return &session.RuntimeSelection{
+		Provider:        normalized.Provider,
+		Model:           normalized.Model,
+		ReasoningEffort: normalized.ReasoningEffort,
+		Speed:           normalized.Speed,
+		ACPOptions:      session.ACPOptionSelectionsFromStore(normalized.ACPOptions),
+	}
+}
+
+func visibleSessionInfosInternal(infos []*session.Info) []*session.Info {
+	visible := make([]*session.Info, 0, len(infos))
+	for _, info := range infos {
+		if info == nil || info.Type == session.SessionTypeTriage || isInternalSessionInfo(info.Lineage) {
+			continue
+		}
+		visible = append(visible, info)
+	}
+	return visible
+}
+
+func isInternalSessionInfo(lineage *store.SessionLineage) bool {
+	normalized := store.NormalizeSessionLineage("", lineage)
+	return session.IsInternalSpawnRole(normalized.SpawnRole)
+}
+
+func stringPointerValue(value *string) string {
+	if value == nil {
+		return ""
+	}
+	return strings.TrimSpace(*value)
+}
+
+// RuntimeActivityPayloadFromSessionMeta converts persisted session activity metadata into the shared payload.
+func RuntimeActivityPayloadFromSessionMeta(
+	liveness *store.SessionLivenessMeta,
+	now time.Time,
+) *contract.RuntimeActivityPayload {
+	if liveness == nil || liveness.Activity == nil {
+		return nil
+	}
+	activity := store.CloneSessionActivityMeta(liveness.Activity)
+	payload := &contract.RuntimeActivityPayload{
+		TurnID:             activity.TurnID,
+		TurnSource:         activity.TurnSource,
+		TurnStartedAt:      cloneTimePtr(activity.TurnStartedAt),
+		DeadlineAt:         nil,
+		LastActivityAt:     cloneTimePtr(activity.LastActivityAt),
+		LastActivityKind:   activity.LastActivityKind,
+		LastActivityDetail: activity.LastActivityDetail,
+		CurrentTool:        activity.CurrentTool,
+		ToolCallID:         activity.ToolCallID,
+		LastProgressAt:     cloneTimePtr(activity.LastProgressAt),
+		IterationCurrent:   activity.IterationCurrent,
+		IterationMax:       activity.IterationMax,
+		IdleSeconds:        store.SessionActivityIdleSeconds(activity, now),
+	}
+	if !now.IsZero() && activity.TurnStartedAt != nil && !activity.TurnStartedAt.IsZero() {
+		elapsed := now.UTC().Sub(activity.TurnStartedAt.UTC())
+		if elapsed > 0 {
+			payload.ElapsedSeconds = int64(elapsed.Seconds())
+			payload.ElapsedMS = elapsed.Milliseconds()
+		}
+	}
+	return payload
+}
+
+func runtimeActivityPayloadFromEvent(activity *acp.RuntimeActivity) *contract.RuntimeActivityPayload {
+	if activity == nil {
+		return nil
+	}
+	return &contract.RuntimeActivityPayload{
+		TurnID:             strings.TrimSpace(activity.TurnID),
+		TurnSource:         strings.TrimSpace(activity.TurnSource),
+		TurnStartedAt:      cloneTimePtr(activity.TurnStartedAt),
+		DeadlineAt:         cloneTimePtr(activity.DeadlineAt),
+		LastActivityAt:     cloneTimePtr(activity.LastActivityAt),
+		LastActivityKind:   strings.TrimSpace(activity.LastActivityKind),
+		LastActivityDetail: strings.TrimSpace(activity.LastActivityDetail),
+		CurrentTool:        strings.TrimSpace(activity.CurrentTool),
+		ToolCallID:         strings.TrimSpace(activity.ToolCallID),
+		LastProgressAt:     cloneTimePtr(activity.LastProgressAt),
+		IterationCurrent:   activity.IterationCurrent,
+		IterationMax:       activity.IterationMax,
+		IdleSeconds:        activity.IdleSeconds,
+		ElapsedSeconds:     activity.ElapsedSeconds,
+		ElapsedMS:          activity.ElapsedMS,
+	}
+}
+
+// SessionPayloadsFromInfos converts a session list into response payloads.
+func SessionPayloadsFromInfos(infos []*session.Info) []contract.SessionPayload {
+	payload := make([]contract.SessionPayload, 0, len(infos))
+	for _, info := range infos {
+		if info == nil {
+			continue
+		}
+		payload = append(payload, SessionPayloadFromInfo(info))
+	}
+	return payload
+}
+
+func sessionPayloadWaitingOn(info *session.Info, badge session.Badge) session.WaitingOn {
+	if badge != session.BadgeWaiting || info == nil || info.Supervision == nil {
+		return ""
+	}
+	return session.WaitingOnFor(info.Supervision.WorkSignals)
+}
+
+func sessionRuntimePayloadFromInfo(info *session.Info) contract.SessionRuntimePayload {
+	return contract.SessionRuntimePayload{
+		Status:            info.RuntimeStatus,
+		Transition:        info.RuntimeTransition,
+		Failure:           diagnostics.RedactAndBound(info.RuntimeFailure, maxDiagnosticPayloadBytes),
+		Generation:        info.RuntimeGeneration,
+		Recovery:          sessionRuntimeRecoveryPayload(info.RuntimeRecovery),
+		Selected:          contract.PromptRuntimeSelectionPayloadFromSelection(info.SelectedRuntime),
+		SelectionRevision: info.RuntimeSelectionRevision,
+		ACPSessionID:      info.ACPSessionID,
+	}
+}

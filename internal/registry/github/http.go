@@ -1,0 +1,234 @@
+package github
+
+import (
+	"context"
+
+	"errors"
+	"fmt"
+	"io"
+
+	"net/http"
+
+	"strconv"
+	"strings"
+
+	"github.com/compozy/compozy/internal/registry"
+	"github.com/compozy/compozy/internal/retry"
+)
+
+func (c *Client) doRequest(
+	ctx context.Context,
+	rawURL string,
+	accept string,
+) (*http.Response, error) {
+	if c.networkErr != nil {
+		return nil, c.networkErr
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, fmt.Errorf("github: request aborted: %w", err)
+	}
+	if strings.TrimSpace(rawURL) == "" {
+		return nil, errors.New("github: request URL is required")
+	}
+
+	response, err := retry.DoValue(
+		ctx,
+		c.requestRetryPolicy(),
+		retryGitHubRequest,
+		func(ctx context.Context) (*http.Response, error) {
+			request, err := c.newRequest(ctx, rawURL, accept)
+			if err != nil {
+				return nil, &githubRequestAttemptError{cause: err}
+			}
+
+			response, err := c.httpClient.Do(request)
+			if err != nil {
+				return nil, newGitHubTransportAttemptError(ctx, err)
+			}
+
+			if err := c.checkRateLimit(response); err != nil {
+				return nil, &githubRequestAttemptError{cause: err}
+			}
+
+			if shouldRetryStatus(response.StatusCode) {
+				return nil, &githubRequestAttemptError{
+					cause:     fmt.Errorf("github: retryable response status %s", response.Status),
+					response:  response,
+					retryable: true,
+				}
+			}
+
+			return response, nil
+		},
+	)
+	if err != nil {
+		return finishGitHubRequest(ctx, err)
+	}
+	return response, nil
+}
+
+// openDownloadResponse negotiates the API media type for source archives and binary media for release assets.
+func (c *Client) openDownloadResponse(
+	ctx context.Context,
+	repo repoSlug,
+	release *release,
+	selection releaseSelection,
+) (*http.Response, string, int64, error) {
+	switch {
+	case selection.asset != nil:
+		response, err := c.doRequest(
+			ctx,
+			firstNonEmpty(selection.asset.URL, selection.asset.BrowserDownloadURL),
+			acceptBinary,
+		)
+		if err != nil {
+			return nil, "", -1, fmt.Errorf("github: download asset for %q: %w", repo.full, err)
+		}
+		size := int64(-1)
+		if selection.asset.Size > 0 {
+			size = selection.asset.Size
+		}
+		return response, strings.TrimSpace(selection.asset.Digest), size, nil
+	case selection.useTarball:
+		response, err := c.doRequest(ctx, strings.TrimSpace(release.TarballURL), acceptJSON)
+		if err != nil {
+			return nil, "", -1, fmt.Errorf("github: download source archive for %q: %w", repo.full, err)
+		}
+		return response, "", -1, nil
+	default:
+		return nil, "", -1, fmt.Errorf("github: no download candidate resolved for %q", repo.full)
+	}
+}
+
+func finalizeDownloadResponse(
+	response *http.Response,
+	slug string,
+	contentSize int64,
+	maxArchiveSize int64,
+) (_ io.ReadCloser, contentType string, finalSize int64, err error) {
+	if response.StatusCode < http.StatusOK || response.StatusCode >= http.StatusMultipleChoices {
+		err := responseError(response, "download", slug)
+		return nil, "", 0, joinErrors(
+			err,
+			closeResponseBody(response.Body, fmt.Sprintf("download response for %q", slug)),
+		)
+	}
+
+	contentType = strings.TrimSpace(response.Header.Get("Content-Type"))
+	if err := validateDownloadContentType(contentType); err != nil {
+		return nil, "", 0, joinErrors(
+			err,
+			closeResponseBody(response.Body, fmt.Sprintf("download response for %q", slug)),
+		)
+	}
+
+	if response.ContentLength > 0 {
+		if response.ContentLength > maxArchiveSize {
+			return nil, "", 0, joinErrors(
+				fmt.Errorf(
+					"github: download for %q: %w: size=%d limit=%d",
+					slug,
+					registry.ErrArchiveTooLargeCompressed,
+					response.ContentLength,
+					maxArchiveSize,
+				),
+				closeResponseBody(response.Body, fmt.Sprintf("download response for %q", slug)),
+			)
+		}
+		contentSize = response.ContentLength
+	}
+
+	reader, written, err := spoolDownloadResponse(response.Body, slug, maxArchiveSize)
+	closeErr := closeResponseBody(response.Body, fmt.Sprintf("download response for %q", slug))
+	if err != nil {
+		return nil, "", 0, joinErrors(fmt.Errorf("github: spool download for %q: %w", slug, err), closeErr)
+	}
+	if closeErr != nil {
+		return nil, "", 0, errors.Join(closeErr, reader.Close())
+	}
+	if contentSize <= 0 {
+		contentSize = written
+	}
+	response.Body = http.NoBody
+
+	return reader, contentType, contentSize, nil
+}
+
+func (c *Client) newRequest(ctx context.Context, rawURL string, accept string) (*http.Request, error) {
+	request, err := http.NewRequestWithContext(ctx, http.MethodGet, rawURL, http.NoBody)
+	if err != nil {
+		return nil, fmt.Errorf("github: create request %q: %w", rawURL, err)
+	}
+	request.Header.Set("Accept", accept)
+	if token := strings.TrimSpace(c.token); token != "" && c.networkPolicy.IsTrustedOrigin(request.URL) {
+		request.Header.Set("Authorization", "Bearer "+token)
+	}
+	return request, nil
+}
+
+func shouldRetryStatus(statusCode int) bool {
+	return statusCode == http.StatusTooManyRequests || statusCode >= http.StatusInternalServerError
+}
+
+func (c *Client) prepareRetryResponse(response *http.Response, attempt int) {
+	closeErr := closeResponseBody(
+		response.Body,
+		fmt.Sprintf("retry response for %s", requestURLString(response)),
+	)
+	if closeErr != nil && c.logger != nil {
+		c.logger.Debug(
+			"github: close response body before retry",
+			"error",
+			closeErr,
+			"url",
+			requestURLString(response),
+			"attempt",
+			attempt+1,
+		)
+	}
+}
+
+func (c *Client) checkRateLimit(response *http.Response) error {
+	if response == nil {
+		return nil
+	}
+	remainingValue := strings.TrimSpace(response.Header.Get("X-RateLimit-Remaining"))
+	if remainingValue == "" {
+		return nil
+	}
+	remaining, err := strconv.Atoi(remainingValue)
+	if err != nil {
+		if c.logger != nil {
+			c.logger.Debug(
+				"github: invalid X-RateLimit-Remaining header",
+				"value",
+				remainingValue,
+				"error",
+				err,
+				"url",
+				requestURLString(response),
+			)
+		}
+		return nil
+	}
+	if remaining == 0 {
+		if response.StatusCode == http.StatusForbidden || response.StatusCode == http.StatusTooManyRequests {
+			rateLimitErr := fmt.Errorf("%w; set GITHUB_TOKEN for higher limits", ErrRateLimited)
+			return joinErrors(
+				rateLimitErr,
+				closeResponseBody(response.Body, fmt.Sprintf("rate limit response for %s", requestURLString(response))),
+			)
+		}
+		if c.logger != nil {
+			c.logger.Warn(
+				"github: rate limit exhausted after successful response",
+				"status", response.StatusCode,
+				"url", requestURLString(response),
+			)
+		}
+	}
+	if remaining < rateLimitWarnThreshold && c.logger != nil {
+		c.logger.Warn("github: rate limit running low", "remaining", remaining, "url", requestURLString(response))
+	}
+	return nil
+}

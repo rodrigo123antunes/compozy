@@ -1,0 +1,41 @@
+---
+title: "compozy daemon"
+description: "Manage the CompozyOS daemon"
+---
+
+## compozy daemon
+
+Manage the CompozyOS daemon
+
+### Options
+
+```
+  -h, --help   help for daemon
+```
+
+### Options inherited from parent commands
+
+```
+      --json            Emit JSON output
+  -o, --output string   Output format: human, json, jsonl, or toon (default "human")
+```
+
+## Output Formats
+
+This command displays human-readable help and its subcommand list. The inherited `-o, --output` and `--json` flags do not serialize help output.
+
+| Format  | Output                   |
+| ------- | ------------------------ |
+| `human` | Help and subcommand list |
+| `json`  | Not emitted for help     |
+| `jsonl` | Not emitted for help     |
+| `toon`  | Not emitted for help     |
+
+## Subcommands
+
+| Command                                                | Description                                                           |
+| ------------------------------------------------------ | --------------------------------------------------------------------- |
+| [compozy daemon bootstrap](/docs/cli/daemon/bootstrap) | Resolve, provision, and start the desktop runtime                     |
+| [compozy daemon profile](/docs/cli/daemon/profile)     | Capture a runtime profile over the local daemon socket (experimental) |
+| [compozy daemon start](/docs/cli/daemon/start)         | Start the CompozyOS daemon                                            |
+| [compozy daemon stop](/docs/cli/daemon/stop)           | Stop the CompozyOS daemon                                             |

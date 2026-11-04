@@ -1,0 +1,634 @@
+import { subagentRuntimeWords } from "../subagent-row-format";
+import { describe, expect, it } from "vitest";
+
+import {
+  subagentCardLines,
+  subagentChipState,
+  subagentComposerSignal,
+  subagentCounts,
+  subagentDisplay,
+  subagentElapsedClock,
+  subagentGroupClock,
+  subagentGroupGlyph,
+  subagentGroupSummary,
+  subagentLocationRows,
+  subagentRosterGroups,
+  subagentRosterTitle,
+  subagentRuntimeLabel,
+  subagentWaitingBannerRows,
+  sortSubagentsByUrgency,
+} from "../subagent-format";
+import { subagentHoverPreview } from "../subagent-hover-preview";
+import {
+  middleTruncate,
+  subagentWorktreeFacts,
+  SUBAGENT_BRANCH_MAX_CHARS,
+} from "../subagent-worktree-format";
+import { subagentLiveLine, subagentModelLabel, subagentTokenLabel } from "../subagent-row-format";
+import type { SubagentStatus, SubagentView, SubagentWorktreeView } from "../types";
+
+// Suite: subagent presentation rules (pure).
+// Invariant: card lines, elapsed source/format, group copy/span, hover content, banner
+// visibility, chip state and roster order follow `_uiux.md` S1–S3, S5, S9, S10 from the
+// row's own server fields. Owning layer: session subagent view rules. Canonical suite: this file.
+const NO_RUNTIME = { agent: "", provider: "", model: "", reasoning_effort: "", speed: "" };
+const T0 = "2026-10-08T21:00:00.000Z";
+const at = (seconds: number) => new Date(Date.parse(T0) + seconds * 1_000).toISOString();
+
+function subagent(overrides: Partial<SubagentView> = {}): SubagentView {
+  return {
+    id: "sub-1",
+    parent_session_id: "sess-parent",
+    result_preview: "",
+    error: null,
+    child_session_id: "sess-child",
+    origin: "delegated",
+    title: "Audit payment webhooks for retry safety",
+    status: "running",
+    progress: "",
+    runtime: {
+      ...NO_RUNTIME,
+      provider: "claude",
+      model: "opus-5.5",
+      reasoning_effort: "high",
+      speed: "normal",
+    },
+    started_at: T0,
+    settled_at: null,
+    created_at: T0,
+    updated_at: T0,
+    delivery: "none",
+    ...overrides,
+  };
+}
+
+const withStatus = (status: SubagentStatus, id: string, created = 0) =>
+  subagent({
+    id,
+    status,
+    created_at: at(created),
+    settled_at: ["queued", "running", "waiting"].includes(status) ? null : at(60),
+  });
+
+describe("subagentCardLines (UT-W05)", () => {
+  it("Should show live progress on line 2, whitespace collapsed", () => {
+    expect(
+      subagentCardLines(subagent({ progress: "Reading   internal/payments/webhook.go" }))
+    ).toEqual({ lineTwo: "Reading internal/payments/webhook.go", lineTwoTone: "default" });
+  });
+
+  it("Should leave line 2 empty while live without progress: the trail carries the word", () => {
+    expect(subagentCardLines(subagent({ progress: "" }))).toEqual({
+      lineTwo: "",
+      lineTwoTone: "default",
+    });
+    expect(subagentCardLines(subagent({ status: "waiting" })).lineTwo).toBe("");
+  });
+
+  it("Should show the result's first line once completed", () => {
+    const lines = subagentCardLines(
+      subagent({
+        status: "completed",
+        result_preview: "\n\nDrafted notes: 6 changes.\nMore detail",
+      })
+    );
+    expect(lines).toEqual({ lineTwo: "Drafted notes: 6 changes.", lineTwoTone: "default" });
+  });
+
+  it("Should show the error's first line in danger when failed", () => {
+    expect(
+      subagentCardLines(subagent({ status: "failed", error: "3 of 41 specs failed\nstack…" }))
+    ).toEqual({ lineTwo: "3 of 41 specs failed", lineTwoTone: "destructive" });
+    expect(subagentCardLines(subagent({ status: "failed" }))).toEqual({
+      lineTwo: "",
+      lineTwoTone: "destructive",
+    });
+  });
+});
+
+// Invariant: one derived display state per row (glyph, word, tone, settled, clock) drives every
+// subagent surface; running and completed never share a glyph or a word.
+describe("subagent row facts", () => {
+  it.each([
+    ["sonnet", "Sonnet"],
+    ["claude-sonnet-5-5", "Sonnet 5.5"],
+    ["claude-opus-5-5[1m]", "Opus 5.5"],
+    ["claude-sonnet-4-20250514", "Sonnet 4"],
+    ["sonnet-custom", "sonnet-custom"],
+    ["gpt-6-astra", "gpt-6-astra"],
+  ])("Should name the model %s as %s", (model, label) => {
+    expect(subagentModelLabel(model)).toBe(label);
+  });
+
+  it("Should separate a live verb from its object, and fall back to the status word", () => {
+    expect(subagentLiveLine(subagent({ progress: "Running git status" }))).toEqual({
+      verb: "Running",
+      text: "git status",
+      tone: "default",
+    });
+    expect(subagentLiveLine(subagent({ status: "queued" }))?.text).toBe("Queued");
+  });
+
+  it("Should show a failure's first line and nothing once a row is done", () => {
+    expect(subagentLiveLine(subagent({ status: "failed", error: "Stopped\nmore" }))).toMatchObject({
+      text: "Stopped",
+      tone: "destructive",
+    });
+    expect(subagentLiveLine(subagent({ status: "completed" }))).toBeNull();
+  });
+
+  it("Should fall back to the result, and let a resumed child read as working", () => {
+    expect(
+      subagentLiveLine(subagent({ status: "failed", error: null, result_preview: "Partial" }))
+    ).toMatchObject({ text: "Partial", tone: "destructive" });
+    expect(
+      subagentLiveLine(
+        subagent({
+          status: "failed",
+          error: "Old",
+          child_activity: "working",
+          progress: "Reading a",
+        })
+      )
+    ).toEqual({ verb: "", text: "Working", tone: "default" });
+  });
+
+  it("Should compact token counts", () => {
+    expect(subagentTokenLabel(38_200)).toBe("38.2k");
+  });
+});
+
+describe("subagentDisplay", () => {
+  const settled = (overrides: Partial<SubagentView>) =>
+    subagent({ settled_at: at(125), ...overrides });
+
+  it.each<[string, Partial<SubagentView>, string, string, boolean]>([
+    ["queued", { status: "queued" }, "queued", "Queued", false],
+    ["running", { status: "running", work_state: "working" }, "running", "Working", false],
+    [
+      "running, waiting on its own children",
+      { status: "running", work_state: "waiting_for_children" },
+      "delegated",
+      "Waiting on subagents",
+      false,
+    ],
+    ["waiting", { status: "waiting" }, "attention", "Waiting for you", false],
+    ["completed", { status: "completed", settled_at: at(125) }, "done", "Done", true],
+    [
+      "completed, child resumed",
+      { status: "completed", settled_at: at(125), child_activity: "working" },
+      "running",
+      "Working",
+      false,
+    ],
+    [
+      "canceled, child resumed",
+      { status: "canceled", settled_at: at(125), child_activity: "working" },
+      "running",
+      "Working",
+      false,
+    ],
+    [
+      "completed, child idle after delivery",
+      { status: "completed", settled_at: at(125), child_activity: "idle", delivery: "delivered" },
+      "idle",
+      "Idle",
+      true,
+    ],
+    [
+      "completed, child idle after acknowledgement",
+      {
+        status: "completed",
+        settled_at: at(125),
+        child_activity: "idle",
+        delivery: "acknowledged",
+      },
+      "idle",
+      "Idle",
+      true,
+    ],
+    [
+      "completed, child idle with the result still pending",
+      { status: "completed", settled_at: at(125), child_activity: "idle", delivery: "pending" },
+      "done",
+      "Done",
+      true,
+    ],
+    ["failed", { status: "failed", settled_at: at(125) }, "failed", "Failed", false],
+    ["canceled", { status: "canceled", settled_at: at(125) }, "stopped", "Canceled", true],
+    ["interrupted", { status: "interrupted", settled_at: at(125) }, "stopped", "Interrupted", true],
+  ])("Should read %s as its glyph and word", (_name, overrides, glyph, word, isSettled) => {
+    const display = subagentDisplay(subagent(overrides));
+    expect(display).toMatchObject({ glyph, word, settled: isSettled });
+  });
+
+  it("Should give running and completed distinct glyphs, words and clocks", () => {
+    const running = subagentDisplay(subagent());
+    const done = subagentDisplay(settled({ status: "completed" }));
+    expect(running.glyph).not.toBe(done.glyph);
+    expect(running.word).not.toBe(done.word);
+    expect(running.clock).toEqual({ kind: "ticking", startMs: Date.parse(T0) });
+    expect(done.clock).toEqual({ kind: "frozen", ms: 125_000 });
+  });
+
+  it("Should carry the elapsed clock only for Working, Done and Idle, frozen when stale", () => {
+    expect(
+      subagentDisplay(
+        settled({ status: "completed", child_activity: "idle", delivery: "delivered" })
+      ).clock
+    ).toEqual({ kind: "frozen", ms: 125_000 });
+    expect(subagentDisplay(subagent({ updated_at: at(40) }), { stale: true }).clock).toEqual({
+      kind: "frozen",
+      ms: 40_000,
+    });
+    for (const status of ["queued", "waiting"] as const) {
+      expect(subagentDisplay(subagent({ status })).clock).toEqual({ kind: "none" });
+    }
+    for (const status of ["failed", "canceled", "interrupted"] as const) {
+      expect(subagentDisplay(settled({ status })).clock).toEqual({ kind: "none" });
+    }
+  });
+
+  it("Should read provider-native rows with the same glyphs as delegated ones", () => {
+    for (const status of ["running", "completed", "failed"] as const) {
+      const delegated = subagentDisplay(settled({ status }));
+      const native = subagentDisplay(
+        settled({ status, origin: "provider_native", child_session_id: null })
+      );
+      expect(native.glyph).toBe(delegated.glyph);
+      expect(native.word).toBe(delegated.word);
+    }
+  });
+
+  it("Should rank the group glyph attention > failed > working > done", () => {
+    const done = withStatus("completed", "a");
+    const running = withStatus("running", "b");
+    const failed = withStatus("failed", "c");
+    const waiting = withStatus("waiting", "d");
+    expect(subagentGroupGlyph([done])).toBe("done");
+    expect(subagentGroupGlyph([done, running])).toBe("running");
+    expect(subagentGroupGlyph([done, running, failed])).toBe("failed");
+    expect(subagentGroupGlyph([done, running, failed, waiting])).toBe("attention");
+    expect(subagentGroupGlyph([withStatus("canceled", "e")])).toBe("stopped");
+  });
+
+  it("Should order rows waiting > failed > working > queued > settled, newest first within", () => {
+    const rows = [
+      withStatus("completed", "done", 5),
+      withStatus("queued", "queued", 4),
+      withStatus("running", "old-run", 1),
+      withStatus("running", "new-run", 3),
+      withStatus("failed", "failed", 0),
+      withStatus("waiting", "waiting", 2),
+      subagent({
+        id: "resumed",
+        status: "completed",
+        settled_at: at(60),
+        created_at: at(0),
+        child_activity: "working",
+      }),
+    ];
+    expect(sortSubagentsByUrgency(rows).map(row => row.id)).toEqual([
+      "waiting",
+      "failed",
+      "new-run",
+      "old-run",
+      "resumed",
+      "queued",
+      "done",
+    ]);
+  });
+});
+
+describe("subagent rows read agent markdown as plain text (D-09)", () => {
+  it("Should strip markdown from card line 2 and the hover preview", () => {
+    expect(
+      subagentCardLines(
+        subagent({
+          status: "completed",
+          settled_at: at(9),
+          result_preview: "# API Versioning\nbody",
+        })
+      ).lineTwo
+    ).toBe("API Versioning");
+    expect(subagentCardLines(subagent({ progress: "**Planning** the `fix`" })).lineTwo).toBe(
+      "Planning the fix"
+    );
+    expect(
+      subagentHoverPreview(
+        subagent({
+          status: "completed",
+          settled_at: at(9),
+          result_preview:
+            "**Yes—ship it.**\n- see [the PR](https://x.test/1)\nkeep snake_case_names",
+        })
+      )
+    ).toBe("Yes—ship it. see the PR keep snake_case_names");
+  });
+});
+
+describe("subagent elapsed (UT-W06)", () => {
+  it("Should freeze at settled_at and tick from started_at only while live", () => {
+    expect(subagentElapsedClock(subagent({ status: "completed", settled_at: at(52) }))).toEqual({
+      kind: "frozen",
+      ms: 52_000,
+    });
+    expect(subagentElapsedClock(subagent())).toEqual({ kind: "ticking", startMs: Date.parse(T0) });
+    expect(subagentElapsedClock(subagent({ started_at: null }))).toEqual({ kind: "none" });
+  });
+
+  it("Should not tick a stale row: it freezes at the server's updated_at", () => {
+    expect(subagentElapsedClock(subagent({ updated_at: at(161) }), { stale: true })).toEqual({
+      kind: "frozen",
+      ms: 161_000,
+    });
+  });
+});
+
+describe("subagent group (UT-W07)", () => {
+  it("Should count states in words with tone info while live and danger when any failed", () => {
+    const mixed = [
+      withStatus("running", "a"),
+      withStatus("queued", "b"),
+      withStatus("completed", "c"),
+    ];
+    expect(subagentGroupSummary(mixed)).toEqual({
+      label: "3 subagents",
+      summary: "2 working · 1 done",
+      tone: "live",
+      settled: false,
+    });
+    const failed = [...mixed.slice(1), withStatus("failed", "d")];
+    expect(subagentGroupSummary(failed).summary).toBe("1 working · 1 done · 1 failed");
+    expect(subagentGroupSummary(failed).tone).toBe("failed");
+  });
+
+  it("Should add N needs you for a waiting member", () => {
+    const group = [
+      withStatus("running", "a"),
+      withStatus("waiting", "b"),
+      withStatus("completed", "c"),
+    ];
+    expect(subagentGroupSummary(group).summary).toBe("1 working · 1 needs you · 1 done");
+    expect(subagentGroupSummary(group).tone).toBe("live");
+  });
+
+  it("Should span first start to last settle and withhold it while any end is unknown", () => {
+    const settled = [
+      subagent({ id: "a", status: "completed", started_at: at(10), settled_at: at(70) }),
+      subagent({ id: "b", status: "failed", started_at: at(0), settled_at: at(305) }),
+    ];
+    expect(subagentGroupClock(settled)).toEqual({ kind: "frozen", ms: 305_000 });
+    expect(subagentGroupClock([...settled, subagent({ id: "c", started_at: at(5) })])).toEqual({
+      kind: "ticking",
+      startMs: Date.parse(T0),
+    });
+    expect(subagentGroupClock([...settled, subagent({ id: "c" })], { stale: true })).toEqual({
+      kind: "none",
+    });
+    expect(subagentGroupClock([...settled, subagent({ id: "c", started_at: null })])).toEqual({
+      kind: "none",
+    });
+    const resumed = subagent({
+      id: "c",
+      status: "completed",
+      child_activity: "working",
+      started_at: at(5),
+      settled_at: at(20),
+    });
+    expect(subagentGroupClock([...settled, resumed])).toEqual({ kind: "none" });
+  });
+});
+
+describe("subagent hover content (UT-W08)", () => {
+  it("Should render a missing model as Not reported and drop the effort", () => {
+    expect(
+      subagentRuntimeWords(
+        subagent({ runtime: { ...NO_RUNTIME, provider: "claude", reasoning_effort: "high" } }),
+        "Coder"
+      ).modelLabel
+    ).toBe("");
+    expect(
+      subagentRuntimeWords(
+        subagent({ runtime: { ...NO_RUNTIME, model: "opus", reasoning_effort: "high" } }),
+        "Coder"
+      ).modelLabel
+    ).toBe("Opus high");
+    expect(
+      subagentRuntimeLabel(
+        subagent({ runtime: { ...NO_RUNTIME, provider: "claude", reasoning_effort: "high" } })
+      )
+    ).toEqual({
+      model: null,
+      effort: null,
+      fast: false,
+    });
+    expect(
+      subagentRuntimeLabel(
+        subagent({ runtime: { ...NO_RUNTIME, model: "gpt-5.6-sol", speed: "fast" } })
+      )
+    ).toEqual({
+      model: "gpt-5.6-sol",
+      effort: null,
+      fast: true,
+    });
+  });
+
+  it("Should collapse whitespace and cap the preview at 280 characters plus an ellipsis", () => {
+    const long = `Found   2 N+1\nqueries. ${"x".repeat(400)}`;
+    const preview = subagentHoverPreview(subagent({ status: "completed", result_preview: long }));
+    expect(preview.startsWith("Found 2 N+1 queries.")).toBe(true);
+    expect(preview).toHaveLength(281);
+    expect(preview.endsWith("…")).toBe(true);
+    expect(subagentHoverPreview(subagent({ status: "failed", error: "timed out" }))).toBe(
+      "timed out"
+    );
+  });
+
+  it("Should list workspace or worktree only where the child differs from its parent", () => {
+    const parent = { workspace: "compozy", worktree: "main" };
+    expect(subagentLocationRows({ workspace: "compozy", worktree: "main" }, parent)).toEqual([]);
+    expect(
+      subagentLocationRows({ workspace: "compozy", worktree: "subagent/enum" }, parent)
+    ).toEqual([{ label: "Worktree", value: "subagent/enum" }]);
+  });
+});
+
+describe("subagentWaitingBannerRows (UT-W13)", () => {
+  const rows = [
+    withStatus("running", "a"),
+    subagent({ id: "native", origin: "provider_native", child_session_id: null }),
+    withStatus("completed", "c"),
+  ];
+
+  it("Should list live delegated rows only while the parent has no running turn", () => {
+    expect(subagentWaitingBannerRows(rows, false).map(row => row.id)).toEqual(["a"]);
+    expect(subagentWaitingBannerRows(rows, true)).toEqual([]);
+  });
+
+  it("Should stay hidden when only provider-native rows are live", () => {
+    expect(subagentWaitingBannerRows(rows.slice(1), false)).toEqual([]);
+  });
+});
+
+describe("roster order tolerates a row without created_at (N1)", () => {
+  it("Should order newest first by creation, falling back to the last update", () => {
+    const missing = {
+      ...withStatus("running", "no-created", 5),
+      created_at: undefined as unknown as string,
+      updated_at: at(50),
+    };
+    const ordered = subagentRosterGroups([withStatus("running", "older", 1), missing]).live;
+    expect(ordered.map(row => row.id)).toEqual(["no-created", "older"]);
+  });
+});
+
+describe("subagentChipState (UT-W17)", () => {
+  it("Should read live/total with the glyph by urgency", () => {
+    expect(subagentChipState({ live: 3, total: 10, failed: 1, attention: 0 }, true)).toEqual({
+      glyph: "failed",
+      text: "3/10",
+      ariaLabel: "3 of 10 subagents running",
+    });
+    expect(subagentChipState({ live: 3, total: 10, failed: 1, attention: 1 }, true)).toEqual({
+      glyph: "attention",
+      text: "3/10",
+      ariaLabel: "3 of 10 subagents running",
+    });
+    expect(subagentChipState({ live: 2, total: 10, failed: 0, attention: 0 }, true)?.glyph).toBe(
+      "running"
+    );
+  });
+
+  it("Should read delegated when the parent is idle with live subagents", () => {
+    expect(subagentChipState({ live: 2, total: 4, failed: 0, attention: 0 }, false)?.glyph).toBe(
+      "delegated"
+    );
+  });
+
+  it("Should count a waiting subagent as live", () => {
+    const counts = subagentCounts([withStatus("waiting", "a"), withStatus("completed", "b")]);
+    expect(counts).toEqual({ live: 1, total: 2, failed: 0, attention: 1 });
+    expect(subagentChipState(counts, false)?.text).toBe("1/2");
+  });
+
+  it("Should count a settled subagent whose child resumed as live, not by its outcome", () => {
+    const counts = subagentCounts([
+      { ...withStatus("completed", "a"), child_activity: "working" },
+      { ...withStatus("failed", "b"), child_activity: "working" },
+    ]);
+    expect(counts).toEqual({ live: 2, total: 2, failed: 0, attention: 0 });
+    expect(subagentComposerSignal(counts)?.ariaLabel).toBe("Subagents, 2 running");
+  });
+
+  it("Should show the total alone when nothing is live but failures remain", () => {
+    expect(subagentChipState({ live: 0, total: 6, failed: 2, attention: 0 }, false)).toEqual({
+      glyph: "failed",
+      text: "6",
+      ariaLabel: "6 subagents, 2 failed",
+    });
+  });
+
+  it("Should hide once everything settled without failure or attention", () => {
+    expect(subagentChipState({ live: 0, total: 6, failed: 0, attention: 0 }, false)).toBeNull();
+  });
+});
+
+describe("subagentRosterGroups (UT-W19)", () => {
+  it("Should pin failed rows, then live rows waiting first, then previous rows newest first", () => {
+    const groups = subagentRosterGroups([
+      withStatus("completed", "done-old", 1),
+      withStatus("running", "run", 6),
+      withStatus("failed", "failed", 2),
+      withStatus("waiting", "waiting", 3),
+      withStatus("canceled", "canceled", 5),
+      withStatus("interrupted", "interrupted", 4),
+    ]);
+    expect(groups.failed.map(row => row.id)).toEqual(["failed"]);
+    expect(groups.live.map(row => row.id)).toEqual(["waiting", "run"]);
+    expect(groups.previous.map(row => row.id)).toEqual(["canceled", "interrupted", "done-old"]);
+  });
+
+  it("Should title the section with the running count", () => {
+    expect(subagentRosterTitle(2)).toBe("Subagents · 2 running");
+    expect(subagentRosterTitle(0)).toBe("Subagents");
+  });
+});
+
+describe("isolated subagent worktree facts (UT-070, UT-071, UT-072)", () => {
+  const BASE_SHA = "4be1c9d2a7f0e6b13c5d8e9f0a1b2c3d4e5f6a7b";
+  function worktree(overrides: Partial<SubagentWorktreeView> = {}): SubagentWorktreeView {
+    return {
+      id: "wt-1",
+      name: "extract-billing-client-3f9a0c12",
+      branch: "run/extract-billing-client-3f9a0c12",
+      base_ref: "origin/main",
+      base_sha: BASE_SHA,
+      path: "/w/extract-billing-client-3f9a0c12",
+      head_sha: null,
+      commits_ahead: null,
+      dirty_files: null,
+      observed_at: null,
+      pull_request_status: null,
+      pull_request: null,
+      ...overrides,
+    };
+  }
+  const labels = (view: SubagentWorktreeView) => subagentWorktreeFacts(view).map(f => f.label);
+
+  it("Should middle-truncate a long branch to the board width and keep its hash suffix", () => {
+    const truncated = middleTruncate("run/extract-billing-client-3f9a0c12");
+    expect([...truncated]).toHaveLength(SUBAGENT_BRANCH_MAX_CHARS);
+    expect(truncated).toBe("run/extract-billi…3f9a0c12");
+    expect(middleTruncate("run/short")).toBe("run/short");
+  });
+
+  it("Should list only static facts while running: absent, never zero", () => {
+    expect(labels(worktree())).toEqual(["Worktree", "Branch", "Base"]);
+  });
+
+  it("Should show the requested base with the short sha, or the sha alone when none was requested", () => {
+    const base = (view: SubagentWorktreeView) =>
+      subagentWorktreeFacts(view).find(fact => fact.kind === "base");
+    expect(base(worktree())).toMatchObject({ ref: "origin/main", sha: "4be1c9d" });
+    expect(base(worktree({ base_ref: BASE_SHA }))).toMatchObject({ ref: "4be1c9d", sha: null });
+  });
+
+  it("Should snapshot commits, PR and observed time at settle; clean vs changed", () => {
+    const settled = worktree({
+      commits_ahead: 3,
+      dirty_files: 0,
+      observed_at: "2026-10-09T22:41:07Z",
+      pull_request_status: "open",
+      pull_request: { url: "https://x/pull/731", number: 731, state: "open" },
+    });
+    expect(labels(settled)).toEqual(["Worktree", "Branch", "Base", "Commits", "PR", "Observed"]);
+    expect(subagentWorktreeFacts(settled)[3]).toMatchObject({
+      ahead: "3 ahead",
+      changes: { text: "clean", dirty: false },
+    });
+    expect(subagentWorktreeFacts(worktree({ commits_ahead: 0, dirty_files: 4 }))[3]).toMatchObject({
+      ahead: "0 ahead",
+      changes: { text: "4 changed", dirty: true },
+    });
+  });
+
+  it("Should read unknown as PR status unknown and none as No pull request", () => {
+    const pr = (view: SubagentWorktreeView) =>
+      subagentWorktreeFacts(view).find(fact => fact.label === "PR");
+    expect(pr(worktree({ pull_request_status: "unknown" }))).toMatchObject({
+      text: "PR status unknown",
+    });
+    expect(pr(worktree({ pull_request_status: "none" }))).toMatchObject({
+      text: "No pull request",
+    });
+  });
+
+  it("Should keep the PR after a failed git read leaves commits and observed time absent", () => {
+    const failedRead = worktree({
+      pull_request_status: "draft",
+      pull_request: { url: "https://x/pull/731", number: 731, state: "draft" },
+    });
+    expect(labels(failedRead)).toEqual(["Worktree", "Branch", "Base", "PR"]);
+  });
+});

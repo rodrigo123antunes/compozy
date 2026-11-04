@@ -1,0 +1,213 @@
+package skills
+
+import (
+	"fmt"
+	"sync"
+
+	"log/slog"
+
+	"slices"
+	"strings"
+
+	yaml "gopkg.in/yaml.v3"
+)
+
+func stringValue(value any) string {
+	stringValue, ok := value.(string)
+	if !ok {
+		return ""
+	}
+
+	return stringValue
+}
+
+func skillIdentifier(skill *Skill) string {
+	if skill == nil {
+		return "unknown skill"
+	}
+
+	name := strings.TrimSpace(skill.Meta.Name)
+	if name != "" {
+		return name
+	}
+
+	path := strings.TrimSpace(skill.FilePath)
+	if path != "" {
+		return path
+	}
+
+	return "unknown skill"
+}
+
+func stringSliceValue(skill *Skill, scope string, index int, field string, raw any) []string {
+	if raw == nil {
+		return nil
+	}
+
+	items, ok := raw.([]any)
+	if !ok {
+		warnCompozyMetadata(
+			skill,
+			"skills: malformed metadata list field",
+			"scope",
+			scope,
+			"index",
+			index,
+			"field",
+			field,
+			"type",
+			fmt.Sprintf("%T", raw),
+		)
+		return nil
+	}
+
+	values := make([]string, 0, len(items))
+	for itemIndex, item := range items {
+		value, ok := item.(string)
+		if !ok {
+			warnCompozyMetadata(
+				skill,
+				"skills: malformed metadata list item",
+				"scope",
+				scope,
+				"index",
+				index,
+				"field",
+				field,
+				"item_index",
+				itemIndex,
+				"type",
+				fmt.Sprintf("%T", item),
+			)
+			continue
+		}
+
+		values = append(values, value)
+	}
+
+	if len(values) == 0 {
+		return nil
+	}
+
+	return slices.Clip(values)
+}
+
+func stringMapValue(skill *Skill, scope string, index int, field string, raw any) map[string]string {
+	if raw == nil {
+		return nil
+	}
+
+	input, ok := raw.(map[string]any)
+	if !ok {
+		warnCompozyMetadata(
+			skill,
+			"skills: malformed metadata map field",
+			"scope",
+			scope,
+			"index",
+			index,
+			"field",
+			field,
+			"type",
+			fmt.Sprintf("%T", raw),
+		)
+		return nil
+	}
+
+	values := make(map[string]string, len(input))
+	for key, rawValue := range input {
+		value, ok := rawValue.(string)
+		if !ok {
+			warnCompozyMetadata(
+				skill,
+				"skills: malformed metadata map entry",
+				"scope",
+				scope,
+				"index",
+				index,
+				"field",
+				field,
+				"key",
+				key,
+				"type",
+				fmt.Sprintf("%T", rawValue),
+			)
+			continue
+		}
+
+		values[key] = value
+	}
+
+	if len(values) == 0 {
+		return nil
+	}
+
+	return values
+}
+
+func warnCompozyMetadata(skill *Skill, message string, args ...any) {
+	attrs := make([]any, 0, len(args)+4)
+	if skill != nil {
+		if skill.FilePath != "" {
+			attrs = append(attrs, "path", skill.FilePath)
+		}
+		if skill.Meta.Name != "" {
+			attrs = append(attrs, "name", skill.Meta.Name)
+		}
+	}
+	attrs = append(attrs, args...)
+
+	slog.Warn(message, attrs...)
+}
+
+// Warning deduplication retains at most 1024 path/field pairs across transient loaders.
+type unknownFieldWarningCache struct {
+	sync.Mutex
+	seen map[struct{ path, field string }]struct{}
+}
+
+var unknownFieldWarnings unknownFieldWarningCache
+
+func (c *unknownFieldWarningCache) first(path, field string) bool {
+	c.Lock()
+	defer c.Unlock()
+	key := struct{ path, field string }{path, field}
+	if _, seen := c.seen[key]; seen {
+		return false
+	}
+	if len(c.seen) >= 1024 {
+		clear(c.seen)
+	}
+	if c.seen == nil {
+		c.seen = make(map[struct{ path, field string }]struct{})
+	}
+	c.seen[key] = struct{}{}
+	return true
+}
+
+func warnUnknownFields(document *yaml.Node, paths ...string) {
+	if document == nil || len(document.Content) == 0 {
+		return
+	}
+
+	root := document.Content[0]
+	if root.Kind != yaml.MappingNode {
+		return
+	}
+
+	for i := 0; i+1 < len(root.Content); i += 2 {
+		key := strings.TrimSpace(root.Content[i].Value)
+		if _, ok := allowedFrontmatterFields[key]; ok {
+			continue
+		}
+
+		path := "<content>"
+		if len(paths) > 0 {
+			path = paths[0]
+		}
+		if !unknownFieldWarnings.first(path, key) {
+			continue
+		}
+		slog.Warn("skills: unknown frontmatter field", "path", path, "field", key)
+	}
+}

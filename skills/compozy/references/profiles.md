@@ -1,0 +1,157 @@
+# Profiles
+
+## Operating Rule
+
+A profile partitions operator work on one CompozyOS installation. `default` is permanent. Profiles are
+global identities, and the remembered selection is one choice shared by every workspace. A session binds
+the resolved profile at creation, and later selection changes never move that session.
+
+Web keeps one selection for the whole client: switching workspaces or the Global breadth never changes
+it, and every profile-scoped surface reads it. An open Web client keeps its current view when another
+client changes the remembered selection; reloading resolves the remembered choice. All profiles is never
+remembered by the daemon; the browser keeps it across reloads, and Web creation under it lands in the
+remembered profile (`default` until one is chosen), shown by the destination chip.
+Under All profiles the Web works on that remembered profile's desks, so another profile's session,
+terminal, pinned agent, or automation detail opened there lands on them; an explicit switch into one
+profile closes, through the normal reopenable `window.close`, every such window another profile owns
+on each of its desks (every project, All projects, User) the first time that desk is shown after the
+switch; the close is view-only, so another profile's terminal keeps running. A deep link opened while a
+profile is selected keeps its owner banner.
+
+## Resolve And Inspect
+
+Resolution order is root `--profile`, `COMPOZY_PROFILE`, the remembered choice (the Global slot, shared
+by every workspace), then `default`. An archived remembered choice falls back to `default` with the
+`archived_remembered_fallback` note.
+
+Per-workspace choices remembered before this change are a deprecated shim removed in v0.5.0. Upgrading
+seeds an empty Global slot from the most recently remembered workspace choice. Until v0.5.0 the CLI
+still resolves a workspace's legacy slot inside that workspace and prints a deprecation warning, and a
+`PUT /api/profiles/selection` with `scope: "workspace"` returns a `Warning` header. Writing the Global
+choice (`compozy profile use`, `profile create`, or the Web switcher) clears every legacy slot. `daemon`, `doctor`, and `update` ignore profile selection.
+
+`GET /api/profiles/selection` returns the effective `profile` for each remembered lens. When the
+remembered profile is archived, `profile` is `default` and optional `note` is
+`archived_remembered_fallback`. The stored choice remains intact and returns after unarchive.
+
+Use structured profile commands. `list` and `current` are reads; `use` persists the shared choice:
+
+```bash
+compozy profile list -o json
+compozy profile current -o json
+compozy profile use <name> -o json
+```
+
+Inside a managed session, prefer `compozy__profile_list` and `compozy__profile_current`. Their live
+descriptors define the exact schema. They expose the session-bound profile but do not mutate selection.
+
+## Scoped And Aggregate Reads
+
+Work reads use the resolved profile by default. Select another owner with root `--profile`, or request an
+explicit cross-profile view with `--all-profiles`; API and UDS callers use `all_profiles=true`. These two
+choices conflict. Aggregate rows include `profile_name`, and JSONL output starts with a
+`profile_resolution` frame even when no rows match.
+
+A scoped detail read of work owned by another profile returns not found. An aggregate detail read may
+return it with its owner label. Always-on agent instance lists and details accept the aggregate and carry
+`profile_name`; their aggregate `active_count` sums every owner because the cap applies per profile.
+Reads that belong to one profile refuse `all_profiles=true` with `profile_selection_conflict` instead of
+ignoring it: agent definitions (`compozy__agent_list`), agent activity, skill reviews, and terminal
+interactions. Session catalog initial state, replay, and live events follow the same
+scope. Agent-native calls derive their immutable session profile and cannot accept a caller-supplied
+replacement. Sessions an agent creates through `compozy__session_create`, `compozy__session_spawn`,
+`compozy__subagent_delegate`, or the in-session `compozy session create` bind the caller session's
+profile.
+
+A session's profile never changes. To move work started in the wrong profile, use
+`compozy session move-to-profile <id> <profile>` (native `compozy__session_move_to_profile`): it
+copies a stopped session into the target profile as a fork, moves its worktree branch to a new
+worktree owned by that profile, and archives the original, whose history and usage stay put.
+
+Routes that name one session (`/api/workspaces/{workspace_id}/sessions/{session_id}/...` and
+`/api/sessions/{session_id}/owner`) treat that session's profile as authoritative. A selected profile,
+from `profile=` or an authenticated agent session's binding, must own the session or the route returns
+not found. `all_profiles=true` is accepted only on reads; a write answers `profile_selection_conflict`.
+An operator request that selects no profile acts in the owner profile on runtime routes (prompt, stream,
+transcript, events, queue, and the rest of the per-session surface). Detail and lifecycle routes (get,
+rename, delete, stop, archive, later, parent, rewind, monitors, descendants, links, processes) stay
+scoped reads of the resolved profile.
+
+Worktrees are intentionally visible across profiles because they represent workspace filesystem state;
+their rows still identify the owner.
+
+## Lifecycle
+
+Create and identity update are direct local mutations:
+
+```bash
+compozy profile create <name> [--color <hex>] [--icon <name> | --emoji <char>]
+compozy profile update <name> [--color <hex>] [--icon <name> | --emoji <char>]
+```
+
+`--icon` accepts any Lucide icon name (lucide.dev/icons); other values are refused. `--emoji` accepts
+one emoji character.
+
+Rename, archive, and delete are plan-based. The CLI fetches the current plan and submits its
+`plan_revision`; a stale revision must be replanned, never replayed. Rename can include repository
+folders with `--repos all|none|<workspace-ids>`. Archive preserves work and freezes guarded queued work.
+Archive enumerates enabled jobs and triggers, pauses their effective state, and synchronizes the
+scheduler and trigger runtime before completing. This includes dynamic, configuration and extension
+automations; managed definitions keep their source content and receive a disabled operational override.
+Unarchive restores availability but does not re-enable paused automations, including after daemon restart. Delete succeeds only when the
+profile owns no work, and structured or non-interactive use requires `--yes`. Jobs and triggers
+count as owned work even while paused, including configuration and extension definitions. Remove
+them through their owning automation surface before deleting the profile.
+Unarchived agent instances also block deletion. The delete plan inventories archived agent
+instances and profile-owned agent memory files; deletion removes those rows and files through
+the recoverable lifecycle operation, preserving every other profile's memory.
+
+```bash
+compozy profile rename <old> <new> --repos none
+compozy profile archive <name>
+compozy profile unarchive <name>
+compozy profile delete <name> --yes
+```
+
+Inspect durable lifecycle recovery with `compozy profile ops -o json`; retry a failed operation with
+`compozy profile ops retry <op-id> -o json` after correcting its reported cause.
+An unfinished operation reserves its profile, including identity edits, until it completes.
+If archive or a pending lifecycle operation wins a race with session creation, admission returns
+`profile_archived` or `profile_unavailable` with a recovery action. A failed automation attempt
+keeps that guidance in its history. Follow the action, then inspect the profile and job before
+triggering work again; unarchive leaves paused automations disabled.
+If Web opens under that unavailable profile, its layout status explains that recovery is needed.
+Choose an available profile to reach Settings; the status detail retains the operation and CLI remedy.
+
+## Surfaces And Authority
+
+HTTP and UDS share `/api/profiles`, including selection, plan, and operation routes. Remote reads are
+allowed on an enabled tier, but every remote profile-state write returns
+`profile_remote_management_forbidden`. Move the mutation to a local CLI, desktop, HTTP, or UDS surface;
+do not weaken the Gateway tier.
+
+Stable palette actions are `profile.use`, `profile.create`, `profile.update`, `profile.rename`,
+`profile.archive`, `profile.unarchive`, and `profile.delete`. They delegate to the same selection and
+lifecycle surfaces and never replace the plan protocol.
+An attached `profile.use` saves the choice and returns its result before switching the client
+to the requested profile. Other lifecycle commands open the canonical
+Settings dialog: `name` suggests the create name, and `profile` plus `new_name` prefill rename.
+Review the dialog's current plan and confirm there; invoking a command alone does not confirm a
+destructive mutation. Canceling consumes the intent, so reloading does not reopen the action.
+
+## Errors And Events
+
+Profile failures carry `{error:{code,message,action}}`. Preserve all three fields. Follow `action`; for
+`profile_plan_stale`, fetch and review a new plan. Normal events are `profile.created`,
+`profile.identity_updated`, `profile.renamed`, `profile.archived`, `profile.unarchived`,
+`profile.deleted`, and `profile.selection_changed`. Recovery paths use `profile.plan_stale`,
+`profile.lifecycle_op_recovered`, and `profile.lifecycle_op_failed`. Event payloads never carry secret
+references.
+Archive, delete, and lifecycle failure/recovery audit summaries use the permanent operator owner
+because their affected profile may be unavailable for new writes. Their payload retains the affected
+`profile_id` and `profile_name`; observe the all-profiles event stream when following lifecycle changes
+across profiles. Identity edits on archived profiles use that same audit owner; active-profile
+identity events retain their own profile owner.
+
+Profile-scoped Vault refs use `vault:profiles/<profile>/<name>`. Rename rewrites only the Manager's
+explicit rewrite list. Never reconstruct or bulk-edit refs outside the lifecycle surface.

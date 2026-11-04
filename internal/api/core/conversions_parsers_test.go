@@ -1,0 +1,1095 @@
+package core_test
+
+import (
+	"context"
+	"encoding/json"
+	"errors"
+	"net/http"
+	"net/http/httptest"
+	"strings"
+	"testing"
+	"time"
+
+	"github.com/compozy/compozy/internal/acp"
+	"github.com/compozy/compozy/internal/api/contract"
+	"github.com/compozy/compozy/internal/api/core"
+	automationpkg "github.com/compozy/compozy/internal/automation"
+	compozyconfig "github.com/compozy/compozy/internal/config"
+	"github.com/compozy/compozy/internal/heartbeat"
+	"github.com/compozy/compozy/internal/session"
+	"github.com/compozy/compozy/internal/skills"
+	speedpkg "github.com/compozy/compozy/internal/speed"
+	"github.com/compozy/compozy/internal/store"
+	taskpkg "github.com/compozy/compozy/internal/task"
+	"github.com/gin-gonic/gin"
+)
+
+func testEventSummaryWithContent(summary store.EventSummary, content json.RawMessage) store.EventSummary {
+	summary.SetContent(content)
+	return summary
+}
+
+func TestSessionPayloadFromInfo(t *testing.T) {
+	t.Parallel()
+
+	t.Run("Should expose effective permission degradation", func(t *testing.T) {
+		t.Parallel()
+		payload := core.SessionPayloadFromInfo(&session.Info{
+			ID: "degraded", EffectivePermissions: "approve-edits", PermissionModeDegraded: true,
+		})
+		if payload.EffectivePermissions != "approve-edits" || !payload.PermissionModeDegraded {
+			t.Fatalf("permission payload=%+v", payload)
+		}
+		data, err := json.Marshal(payload)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var wire map[string]any
+		if err := json.Unmarshal(data, &wire); err != nil {
+			t.Fatal(err)
+		}
+		if wire["effective_permissions"] != "approve-edits" || wire["permission_mode_degraded"] != true {
+			t.Fatalf("permission wire payload=%s", data)
+		}
+	})
+
+	t.Run("Should expose waiting reasons only for the final waiting badge", func(t *testing.T) {
+		t.Parallel()
+		info := &session.Info{
+			ID:    "sess-waiting",
+			State: session.StateActive,
+			Supervision: &session.SupervisionState{
+				WorkSignals: []session.WorkSignal{{Kind: session.WorkSignalActiveMonitor}},
+			},
+		}
+		payload := core.SessionPayloadFromInfo(info)
+		if payload.Badge != session.BadgeWaiting || payload.WaitingOn != session.WaitingOnMonitor {
+			t.Fatalf("waiting payload = %#v", payload)
+		}
+		reader := sessionHealthPageReaderStub{
+			pageFn: func(context.Context, []*session.Info) (map[string]heartbeat.SessionHealth, error) {
+				return map[string]heartbeat.SessionHealth{
+					info.ID: {SessionID: info.ID, State: heartbeat.SessionHealthStateIdle,
+						Health: heartbeat.SessionHealthDegraded},
+				}, nil
+			},
+		}
+		payloads, err := core.SessionPayloadsWithPageHealth(t.Context(), []*session.Info{info}, reader)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if payloads[0].Badge != session.BadgeUnhealthy || payloads[0].WaitingOn != "" {
+			t.Fatalf("health-overridden payload = %#v", payloads[0])
+		}
+		info.State = session.StateStopped
+		if stopped := core.SessionPayloadFromInfo(info); stopped.WaitingOn != "" {
+			t.Fatalf("stopped waiting reason = %q", stopped.WaitingOn)
+		}
+	})
+
+	t.Run(
+		"Should expose the live or persisted stop cause without classifying active work as stopped",
+		func(t *testing.T) {
+			t.Parallel()
+			for _, tc := range []struct {
+				name string
+				info session.Info
+				want string
+			}{
+				{"active", session.Info{State: session.StateActive}, ""},
+				{"live request", session.Info{State: session.StateStopping, StopCause: session.CauseUserRequested}, "user_requested"},
+				{"persisted user stop", session.Info{State: session.StateStopped, StopReason: store.StopUserCanceled}, "user_requested"},
+				{"persisted inactivity", session.Info{State: session.StateStopped, StopReason: store.StopTimeout, StopDetail: "inactivity"}, "inactivity"},
+				{"persisted deadline", session.Info{State: session.StateStopped, StopReason: store.StopTimeout, StopDetail: "prompt deadline"}, "timeout"},
+				{"completed race", session.Info{State: session.StateStopped, StopReason: store.StopCompleted}, "completed"},
+			} {
+				payload := core.SessionPayloadFromInfo(&tc.info)
+				if payload.StopCause != tc.want {
+					t.Fatalf("%s cause = %q, want %q", tc.name, payload.StopCause, tc.want)
+				}
+			}
+		},
+	)
+
+	t.Run("Should expose durable escalation without claiming unverified stopping is terminal", func(t *testing.T) {
+		t.Parallel()
+		for _, state := range []session.State{session.StateActive, session.StateStopping, session.StateStopped} {
+			info := &session.Info{
+				ID:                     "sess-1",
+				State:                  state,
+				StopEscalated:          true,
+				StopVerificationFailed: state == session.StateStopping,
+			}
+			payload := core.SessionPayloadFromInfo(info)
+			if (payload.Attention == session.StopVerificationFailedCode) != (state == session.StateStopping) {
+				t.Fatalf("attention for %s = %q", state, payload.Attention)
+			}
+			if payload.Escalated == nil || !*payload.Escalated || payload.Verified == nil ||
+				*payload.Verified != (state == session.StateStopped) {
+				t.Fatalf("stop resource for %s = %#v", state, payload)
+			}
+		}
+	})
+
+	for _, tc := range []struct {
+		name string
+		info session.Info
+		want string
+	}{
+		{
+			name: "Should name an early stop as the needs-attention cause on the session payload",
+			info: session.Info{ID: "sess-1", State: session.StateActive, EndedEarlyTurnID: "turn-1"},
+			want: session.EndedEarlyAttentionCode,
+		},
+		{
+			name: "Should omit the early stop behind a running turn",
+			info: session.Info{ID: "sess-1", State: session.StateStarting, EndedEarlyTurnID: "turn-1"},
+		},
+		{
+			name: "Should name an unverified stop before the early stop",
+			info: session.Info{
+				ID: "sess-1", State: session.StateActive, EndedEarlyTurnID: "turn-1", StopVerificationFailed: true,
+			},
+			want: session.StopVerificationFailedCode,
+		},
+		{
+			name: "Should leave a blocked supervision source as the cause before the early stop",
+			info: session.Info{
+				ID: "sess-1", State: session.StateActive, EndedEarlyTurnID: "turn-1",
+				Supervision: &session.SupervisionState{Sources: []session.SignalSourceState{
+					{Kind: session.WorkSignalActiveMonitor, State: "attention"},
+				}},
+			},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			if got := core.SessionPayloadFromInfo(&tc.info).Attention; got != tc.want {
+				t.Fatalf("attention = %q, want %q", got, tc.want)
+			}
+		})
+	}
+
+	t.Run("Should map session info into a sanitized session payload", func(t *testing.T) {
+		t.Parallel()
+
+		now := time.Date(2026, 4, 3, 12, 0, 0, 0, time.UTC)
+		ttl := now.Add(time.Hour)
+		payload := core.SessionPayloadFromInfo(&session.Info{
+			ID:                "sess-1",
+			Name:              "demo",
+			AgentName:         "coder",
+			Provider:          "fake",
+			Model:             "  gpt-test  ",
+			ReasoningEffort:   "  high  ",
+			Speed:             speedpkg.SpeedFast,
+			RuntimeStatus:     session.RuntimeStatusReady,
+			RuntimeTransition: session.RuntimeTransitionLiveConfiguration,
+			SelectedRuntime: &session.RuntimeSelection{
+				Provider:        "claude",
+				Model:           "claude-fable-5",
+				ReasoningEffort: "max",
+				Speed:           speedpkg.SpeedFast,
+				ACPOptions: []acp.SessionConfigOptionSelection{
+					{ID: "context", ValueID: "1m"},
+					{ID: "thinking", BoolValue: new(true)},
+				},
+			},
+			ACPOptions: []acp.SessionConfigOptionSelection{
+				{ID: "context", ValueID: "1m"},
+				{ID: "thinking", BoolValue: new(true)},
+			},
+			RuntimeSelectionRevision: 7,
+			SpeedResolution: &speedpkg.Resolution{
+				Requested: speedpkg.SpeedFast,
+				Status:    speedpkg.ResolutionUnsupported,
+				Reason:    speedpkg.ReasonCapabilityAbsent,
+			},
+			WorkspaceID: "ws_alpha",
+			Workspace:   "/workspace",
+
+			Type: session.SessionTypeSpawned,
+			Lineage: &store.SessionLineage{
+				ParentSessionID:  "sess-root",
+				RootSessionID:    "sess-root",
+				SpawnDepth:       1,
+				SpawnRole:        "worker",
+				TTLExpiresAt:     &ttl,
+				AutoStopOnParent: true,
+				SpawnBudget: store.SessionSpawnBudget{
+					MaxChildren:           2,
+					MaxDepth:              1,
+					TTLSeconds:            3600,
+					MaxActivePerWorkspace: 3,
+				},
+				PermissionPolicy: store.SessionPermissionPolicy{
+					Tools: []string{"edit"},
+				},
+			},
+			State:      session.StateActive,
+			StopReason: store.StopTimeout,
+			StopDetail: "deadline exceeded",
+			Failure: &store.SessionFailure{
+				Kind:            store.FailureTimeout,
+				Summary:         "deadline exceeded",
+				CrashBundlePath: "/tmp/compozy-crash.json",
+			},
+			ACPSessionID: "acp-123",
+			AdvertisedCommands: []store.SessionAdvertisedCommand{{
+				Name:        "compact",
+				Description: "Compact context",
+				Input:       &store.SessionAdvertisedCommandInput{Hint: "optional focus"},
+			}},
+
+			Liveness: &store.SessionLivenessMeta{
+				Activity: &store.SessionActivityMeta{
+					TurnID: "turn-1",
+				},
+			},
+			CreatedAt:    now,
+			UpdatedAt:    now,
+			ACPCapsKnown: true,
+			ACPCaps: acp.Caps{
+				SupportsLoadSession:   true,
+				PromptImage:           true,
+				PromptAudio:           false,
+				PromptEmbeddedContext: true,
+				SupportedModes:        []string{"chat"},
+				ConfigOptions: []acp.SessionConfigOption{
+					{
+						ID:             "reasoning_effort",
+						Label:          "Reasoning effort",
+						Category:       "thought_level",
+						Kind:           acp.SessionConfigOptionKindSelect,
+						CurrentValueID: "high",
+						Values: []acp.SessionConfigOptionValue{
+							{Value: "low", Label: "Low", GroupID: "standard", GroupLabel: "Standard"},
+							{Value: "high", Label: "High", GroupID: "frontier", GroupLabel: "Frontier"},
+						},
+					},
+					{
+						ID:          "thinking",
+						Label:       "Thinking",
+						Category:    "model_config",
+						Kind:        acp.SessionConfigOptionKindBoolean,
+						CurrentBool: new(true),
+					},
+				},
+			},
+		})
+
+		if payload.Runtime.Status != session.RuntimeStatusReady ||
+			payload.Runtime.Transition != session.RuntimeTransitionLiveConfiguration ||
+			payload.Runtime.Effective == nil || payload.Runtime.Effective.Provider != "fake" ||
+			payload.Runtime.Effective.Model != "gpt-test" ||
+			payload.Runtime.Effective.ReasoningEffort != "high" {
+			t.Fatalf("payload runtime = %#v", payload.Runtime)
+		}
+		if payload.Runtime.Effective.Speed != "" ||
+			payload.Runtime.Effective.SpeedResolution == nil ||
+			payload.Runtime.Effective.SpeedResolution.Requested != contract.SpeedFast ||
+			payload.Runtime.Effective.SpeedResolution.Status != speedpkg.ResolutionUnsupported ||
+			payload.Runtime.Effective.SpeedResolution.Reason != speedpkg.ReasonCapabilityAbsent {
+			t.Fatalf(
+				"payload speed fields = %q, %#v, want no effective speed and requested Fast unsupported capability_absent",
+				payload.Runtime.Effective.Speed,
+				payload.Runtime.Effective.SpeedResolution,
+			)
+		}
+		if payload.Runtime.Requested == nil || payload.Runtime.Requested.Speed != contract.SpeedFast ||
+			payload.Runtime.Requested.ReasoningEffort != "high" || payload.Runtime.Requested.Provider != "fake" {
+			t.Fatalf("binding intent = %#v, want retained fake/high/Fast", payload.Runtime.Requested)
+		}
+		if payload.Runtime.Selected == nil || payload.Runtime.Selected.Provider != "claude" ||
+			payload.Runtime.Selected.Model != "claude-fable-5" ||
+			payload.Runtime.Selected.ReasoningEffort != "max" ||
+			payload.Runtime.Selected.Speed != contract.SpeedFast ||
+			len(payload.Runtime.Selected.ACPOptions) != 2 ||
+			payload.Runtime.Selected.ACPOptions[0].ID != "context" ||
+			payload.Runtime.Selected.ACPOptions[0].ValueID != "1m" ||
+			payload.Runtime.Selected.ACPOptions[1].ID != "thinking" ||
+			payload.Runtime.Selected.ACPOptions[1].BoolValue == nil ||
+			!*payload.Runtime.Selected.ACPOptions[1].BoolValue || payload.Runtime.SelectionRevision != 7 {
+			t.Fatalf(
+				"payload selected runtime = %#v revision %d, want Claude selection at revision 7",
+				payload.Runtime.Selected,
+				payload.Runtime.SelectionRevision,
+			)
+		}
+		if payload.Runtime.Effective == nil || len(payload.Runtime.Effective.ACPOptions) != 2 ||
+			payload.Runtime.Effective.ACPOptions[0].ID != "context" ||
+			payload.Runtime.Effective.ACPOptions[0].ValueID != "1m" ||
+			payload.Runtime.Effective.ACPOptions[1].ID != "thinking" ||
+			payload.Runtime.Effective.ACPOptions[1].BoolValue == nil ||
+			!*payload.Runtime.Effective.ACPOptions[1].BoolValue {
+			t.Fatalf("payload effective runtime ACP options = %#v", payload.Runtime.Effective)
+		}
+		if payload.State != session.StateActive || payload.Runtime.ACPSessionID != "acp-123" {
+			t.Fatalf("payload session fields = %#v", payload)
+		}
+		if payload.Type != session.SessionTypeSpawned {
+			t.Fatalf("payload.Type = %q, want %q", payload.Type, session.SessionTypeSpawned)
+		}
+		if payload.Lineage == nil ||
+			payload.Lineage.ParentSessionID != "sess-root" ||
+			payload.Lineage.RootSessionID != "sess-root" ||
+			payload.Lineage.SpawnDepth != 1 ||
+			payload.Lineage.SpawnRole != "worker" ||
+			payload.Lineage.SpawnBudget.MaxChildren != 2 ||
+			payload.Lineage.PermissionPolicy.Tools[0] != "edit" {
+			t.Fatalf("payload.Lineage = %#v", payload.Lineage)
+		}
+		if payload.Activity == nil || payload.Activity.TurnID != "turn-1" {
+			t.Fatalf("activity = %#v", payload.Activity)
+		}
+		if payload.StopReason != store.StopTimeout || payload.StopDetail != "deadline exceeded" {
+			t.Fatalf("payload stop fields = %#v", payload)
+		}
+		if payload.Failure == nil ||
+			payload.Failure.Kind != store.FailureTimeout ||
+			payload.Failure.Summary != "deadline exceeded" ||
+			payload.Failure.CrashBundlePath != "/tmp/compozy-crash.json" {
+			t.Fatalf("payload failure = %#v", payload.Failure)
+		}
+		if payload.Runtime.ACPCaps == nil || !payload.Runtime.ACPCaps.SupportsLoadSession {
+			t.Fatalf("caps = %#v", payload.Runtime.ACPCaps)
+		}
+		if !payload.Runtime.ACPCaps.PromptImage ||
+			payload.Runtime.ACPCaps.PromptAudio ||
+			!payload.Runtime.ACPCaps.PromptEmbeddedContext {
+			t.Fatalf("prompt caps = %#v, want image/context true and audio false", payload.Runtime.ACPCaps)
+		}
+		if len(payload.AvailableCommands) != 1 || payload.AvailableCommands[0].Name != "compact" ||
+			payload.AvailableCommands[0].Input == nil ||
+			payload.AvailableCommands[0].Input.Hint != "optional focus" {
+			t.Fatalf("payload.AvailableCommands = %#v", payload.AvailableCommands)
+		}
+		if got := payload.Runtime.ACPCaps.SupportedModes; len(got) != 1 || got[0] != "chat" {
+			t.Fatalf("supported modes = %#v, want [chat]", got)
+		}
+		if len(payload.Runtime.ACPCaps.ConfigOptions) != 2 {
+			t.Fatalf("config options = %#v", payload.Runtime.ACPCaps.ConfigOptions)
+		}
+		if got := payload.Runtime.ACPCaps.ConfigOptions[0]; got.ID != "reasoning_effort" ||
+			got.CurrentValueID != "high" || got.CurrentBool != nil || got.Category != "thought_level" ||
+			got.Kind != "select" || len(got.Values) != 2 {
+			t.Fatalf("config option payload = %#v", got)
+		}
+		if got := payload.Runtime.ACPCaps.ConfigOptions[0].Values; got[0].Value != "low" || got[1].Value != "high" {
+			t.Fatalf("config option values = %#v, want [low high]", got)
+		}
+		if got := payload.Runtime.ACPCaps.ConfigOptions[0].Values[1]; got.GroupID != "frontier" ||
+			got.GroupLabel != "Frontier" {
+			t.Fatalf("grouped config option value = %#v", got)
+		}
+		if got := payload.Runtime.ACPCaps.ConfigOptions[1]; got.ID != "thinking" ||
+			got.CurrentBool == nil || !*got.CurrentBool || got.CurrentValueID != "" {
+			t.Fatalf("boolean config option payload = %#v", got)
+		}
+	})
+
+	t.Run("Should expose automatic runtime recovery progress", func(t *testing.T) {
+		t.Parallel()
+
+		now := time.Date(2026, 8, 22, 16, 20, 29, 0, time.UTC)
+		nextAttemptAt := now.Add(2 * time.Second)
+		payload := core.SessionPayloadFromInfo(&session.Info{
+			ID:                "sess-recovering",
+			AgentName:         "general",
+			Provider:          "claude",
+			Model:             "claude-fable-5",
+			RuntimeStatus:     session.RuntimeStatusRecovering,
+			RuntimeTransition: session.RuntimeTransitionAutomaticRecovery,
+			RuntimeGeneration: 2,
+			RuntimeRecovery: &store.SessionRuntimeRecovery{
+				Attempt:       2,
+				MaxAttempts:   3,
+				Generation:    3,
+				StartedAt:     now.Add(-time.Second),
+				LastAttemptAt: now,
+				NextAttemptAt: &nextAttemptAt,
+				LastError:     "provider transport disconnected",
+			},
+			State:     session.StateActive,
+			CreatedAt: now,
+			UpdatedAt: now,
+		})
+
+		if payload.Runtime.Generation != 2 || payload.Runtime.Recovery == nil {
+			t.Fatalf("payload runtime = %#v, want generation 2 with recovery", payload.Runtime)
+		}
+		if payload.Runtime.Recovery.Attempt != 2 || payload.Runtime.Recovery.MaxAttempts != 3 ||
+			payload.Runtime.Recovery.Generation != 3 ||
+			payload.Runtime.Recovery.LastError != "provider transport disconnected" ||
+			payload.Runtime.Recovery.NextAttemptAt == nil ||
+			!payload.Runtime.Recovery.NextAttemptAt.Equal(nextAttemptAt) {
+			t.Fatalf("payload runtime recovery = %#v", payload.Runtime.Recovery)
+		}
+		if payload.Runtime.Effective == nil || payload.Runtime.Effective.Provider != "claude" {
+			t.Fatalf("payload effective runtime = %#v, want Claude while recovering", payload.Runtime.Effective)
+		}
+	})
+
+	t.Run("Should retain recorded runtime identity without claiming an active binding", func(t *testing.T) {
+		t.Parallel()
+		for _, state := range []session.State{session.StateActive, session.StateStopped} {
+			payload := core.SessionPayloadFromStoreInfo(&store.SessionInfo{
+				ID: "sess-released", State: string(state), Provider: "codex", Model: "gpt-test",
+				ReasoningEffort: "high", RuntimeStatus: session.RuntimeStatusUnbound,
+			})
+			if payload.Runtime.Effective != nil {
+				t.Fatalf("effective = %#v, want no current binding", payload.Runtime.Effective)
+			}
+			if got := payload.Runtime.LastKnown; got == nil || got.Provider != "codex" ||
+				got.Model != "gpt-test" || got.ReasoningEffort != "high" {
+				t.Fatalf("last known = %#v, want persisted runtime", got)
+			}
+		}
+		fresh := core.SessionPayloadFromInfo(&session.Info{RuntimeStatus: session.RuntimeStatusUnbound})
+		if fresh.Runtime.LastKnown != nil || fresh.Runtime.Effective != nil {
+			t.Fatalf("never-bound runtime = %#v, want no invented history", fresh.Runtime)
+		}
+	})
+
+	t.Run("Should mark stalled session payloads as hung and not attachable", func(t *testing.T) {
+		t.Parallel()
+
+		payload := core.SessionPayloadFromInfo(&session.Info{
+			ID:            "sess-stalled",
+			AgentName:     "coder",
+			Provider:      "fake",
+			RuntimeStatus: session.RuntimeStatusUnbound,
+			State:         session.StateActive,
+			Liveness: &store.SessionLivenessMeta{
+				StallState:  store.SessionStallStateDetected,
+				StallReason: store.SessionStallReasonActivityTimeout,
+			},
+		})
+		if payload.Badge != session.BadgeHung {
+			t.Fatalf("payload.Badge = %q, want %q", payload.Badge, session.BadgeHung)
+		}
+		if payload.Attachable {
+			t.Fatalf("payload.Attachable = true, want false for stalled session")
+		}
+		if payload.Runtime.Effective != nil {
+			t.Fatalf("payload.Runtime.Effective = %#v, want nil while unbound", payload.Runtime.Effective)
+		}
+	})
+
+	t.Run("Should map the durable runtime projection from the session catalog", func(t *testing.T) {
+		t.Parallel()
+
+		info := store.SessionInfo{
+			ID:              "sess-catalog",
+			AgentName:       "coder",
+			Provider:        "codex",
+			Model:           "gpt-5.4",
+			ReasoningEffort: "high",
+			Speed:           speedpkg.SpeedFast,
+			SessionRuntimeDetails: &store.SessionRuntimeDetails{
+				ACPOptions: []store.SessionACPOptionSelection{
+					{ID: "context", ValueID: "1m"},
+					{ID: "thinking", BoolValue: new(true)},
+				},
+			},
+			SelectedRuntime: &store.SessionRuntimeSelection{
+				Provider: "claude",
+				Model:    "claude-opus-5",
+				ACPOptions: []store.SessionACPOptionSelection{
+					{ID: "context", ValueID: "1m"},
+					{ID: "thinking", BoolValue: new(true)},
+				},
+			},
+			RuntimeSelectionRevision: 2,
+			RuntimeStatus:            store.SessionRuntimeReady,
+			RuntimeTransition:        store.SessionRuntimeTransitionLiveConfiguration,
+			WorkspaceID:              "ws-catalog",
+			SessionType:              string(session.SessionTypeUser),
+			State:                    string(session.StateActive),
+			CreatedAt:                time.Date(2026, 4, 3, 12, 0, 0, 0, time.UTC),
+			UpdatedAt:                time.Date(2026, 4, 3, 12, 1, 0, 0, time.UTC),
+		}
+		info.StopEscalated = true
+		info.StopVerificationFailed = true
+		payload := core.SessionPayloadFromStoreInfo(&info)
+		if payload.Escalated == nil || !*payload.Escalated {
+			t.Fatal("catalog lost durable stop escalation")
+		}
+		if payload.Runtime.Status != session.RuntimeStatusReady ||
+			payload.Runtime.Transition != session.RuntimeTransitionLiveConfiguration ||
+			payload.Runtime.Effective == nil || payload.Runtime.Effective.Provider != "codex" ||
+			payload.Runtime.Effective.Model != "gpt-5.4" ||
+			payload.Runtime.Effective.ReasoningEffort != "high" ||
+			payload.Runtime.Effective.Speed != contract.SpeedFast ||
+			len(payload.Runtime.Effective.ACPOptions) != 2 ||
+			payload.Runtime.Effective.ACPOptions[0].ID != "context" ||
+			payload.Runtime.Effective.ACPOptions[0].ValueID != "1m" ||
+			payload.Runtime.Effective.ACPOptions[1].ID != "thinking" ||
+			payload.Runtime.Effective.ACPOptions[1].BoolValue == nil ||
+			!*payload.Runtime.Effective.ACPOptions[1].BoolValue {
+			t.Fatalf("catalog runtime = %#v", payload.Runtime)
+		}
+		if payload.Runtime.Selected == nil || payload.Runtime.Selected.Provider != "claude" ||
+			payload.Runtime.Selected.Model != "claude-opus-5" ||
+			len(payload.Runtime.Selected.ACPOptions) != 2 ||
+			payload.Runtime.Selected.ACPOptions[0].ID != "context" ||
+			payload.Runtime.Selected.ACPOptions[0].ValueID != "1m" ||
+			payload.Runtime.Selected.ACPOptions[1].ID != "thinking" ||
+			payload.Runtime.Selected.ACPOptions[1].BoolValue == nil ||
+			!*payload.Runtime.Selected.ACPOptions[1].BoolValue || payload.Runtime.SelectionRevision != 2 {
+			t.Fatalf(
+				"catalog selected runtime = %#v revision %d",
+				payload.Runtime.Selected,
+				payload.Runtime.SelectionRevision,
+			)
+		}
+		if payload.Runtime.ACPCaps != nil {
+			t.Fatalf("catalog runtime caps = %#v, want nil without a live ACP process", payload.Runtime.ACPCaps)
+		}
+	})
+
+	t.Run("Should retain the last effective runtime after a previously bound session stops", func(t *testing.T) {
+		t.Parallel()
+
+		payload := core.SessionPayloadFromInfo(&session.Info{
+			ID:                "sess-stopped-runtime",
+			AgentName:         "coder",
+			Provider:          "claude",
+			Model:             "claude-fable-5",
+			ReasoningEffort:   "max",
+			Speed:             speedpkg.SpeedNormal,
+			RuntimeStatus:     session.RuntimeStatusUnbound,
+			RuntimeTransition: session.RuntimeTransitionProcessReplacement,
+			State:             session.StateStopped,
+		})
+		if payload.Runtime.Effective == nil || payload.Runtime.Effective.Provider != "claude" ||
+			payload.Runtime.Effective.Model != "claude-fable-5" ||
+			payload.Runtime.Effective.ReasoningEffort != "max" {
+			t.Fatalf("stopped effective runtime = %#v, want last applied Claude runtime", payload.Runtime.Effective)
+		}
+	})
+}
+
+func TestRuntimeActivityPayloadFromSessionMeta(t *testing.T) {
+	t.Parallel()
+
+	now := time.Date(2026, 4, 3, 12, 0, 0, 0, time.UTC)
+	turnStartedAt := now.Add(-2 * time.Minute)
+	lastActivityAt := now.Add(-45 * time.Second)
+	lastProgressAt := now.Add(-15 * time.Second)
+
+	tests := []struct {
+		name   string
+		meta   *store.SessionLivenessMeta
+		assert func(*testing.T, *contract.RuntimeActivityPayload)
+	}{
+		{
+			name: "Should return nil for nil liveness metadata",
+			assert: func(t *testing.T, payload *contract.RuntimeActivityPayload) {
+				t.Helper()
+				if payload != nil {
+					t.Fatalf("RuntimeActivityPayloadFromSessionMeta(nil) = %#v, want nil", payload)
+				}
+			},
+		},
+		{
+			name: "Should return nil for empty liveness metadata",
+			meta: &store.SessionLivenessMeta{},
+			assert: func(t *testing.T, payload *contract.RuntimeActivityPayload) {
+				t.Helper()
+				if payload != nil {
+					t.Fatalf("RuntimeActivityPayloadFromSessionMeta(empty) = %#v, want nil", payload)
+				}
+			},
+		},
+		{
+			name: "Should map populated activity metadata",
+			meta: &store.SessionLivenessMeta{
+				Activity: &store.SessionActivityMeta{
+					TurnID:             " turn-1 ",
+					TurnSource:         " prompt ",
+					TurnStartedAt:      &turnStartedAt,
+					LastActivityAt:     &lastActivityAt,
+					LastActivityKind:   " tool_call ",
+					LastActivityDetail: " running ",
+					CurrentTool:        " edit ",
+					ToolCallID:         " call-1 ",
+					LastProgressAt:     &lastProgressAt,
+					IterationCurrent:   2,
+					IterationMax:       5,
+				},
+			},
+			assert: func(t *testing.T, payload *contract.RuntimeActivityPayload) {
+				t.Helper()
+				if payload == nil {
+					t.Fatal("RuntimeActivityPayloadFromSessionMeta() = nil, want payload")
+					return
+				}
+				if payload.TurnID != "turn-1" ||
+					payload.TurnSource != "prompt" ||
+					payload.LastActivityKind != "tool_call" ||
+					payload.CurrentTool != "edit" ||
+					payload.ToolCallID != "call-1" ||
+					payload.IterationCurrent != 2 ||
+					payload.IterationMax != 5 {
+					t.Fatalf("payload = %#v", payload)
+				}
+				if payload.IdleSeconds != 45 || payload.ElapsedSeconds != 120 {
+					t.Fatalf("payload timing = idle %d elapsed %d", payload.IdleSeconds, payload.ElapsedSeconds)
+				}
+				if payload.TurnStartedAt == nil || !payload.TurnStartedAt.Equal(turnStartedAt) ||
+					payload.LastActivityAt == nil || !payload.LastActivityAt.Equal(lastActivityAt) ||
+					payload.LastProgressAt == nil || !payload.LastProgressAt.Equal(lastProgressAt) {
+					t.Fatalf("payload time pointers = %#v", payload)
+				}
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			payload := core.RuntimeActivityPayloadFromSessionMeta(tt.meta, now)
+			tt.assert(t, payload)
+		})
+	}
+}
+
+func TestAgentPayloadFromDef(t *testing.T) {
+	t.Parallel()
+
+	t.Run("Should convert agent definition to payload", func(t *testing.T) {
+		t.Parallel()
+
+		payload := core.AgentPayloadFromDef(compozyconfig.AgentDef{
+			Name:        "coder",
+			Provider:    "fake",
+			Command:     "codex",
+			Model:       "gpt-test",
+			Tools:       []string{"compozy__skill_view"},
+			Toolsets:    []string{"compozy__catalog"},
+			DenyTools:   []string{"compozy__task_*"},
+			Permissions: "approve-reads",
+			Prompt:      "hello",
+			SourceLayer: "project_profile",
+			ShadowedDefinitions: []compozyconfig.AgentDefinitionRef{
+				{Layer: "profile", Path: "/profiles/marketing/agents/coder/AGENT.md"},
+				{Layer: "user", Path: "/agents/coder/AGENT.md"},
+			},
+			MCPServers: []compozyconfig.MCPServer{{
+				Name:    "memory",
+				Command: "memoryd",
+				Args:    []string{"serve"},
+				Env:     map[string]string{"TOKEN": "secret"},
+			}},
+		})
+
+		if payload.Name != "coder" || payload.Provider != "fake" || len(payload.MCPServers) != 1 {
+			t.Fatalf("payload = %#v", payload)
+		}
+		if got, want := strings.Join(payload.Tools, ","), "compozy__skill_view"; got != want {
+			t.Fatalf("payload tools = %#v, want %q", payload.Tools, want)
+		}
+		if got, want := strings.Join(payload.Toolsets, ","), "compozy__catalog"; got != want {
+			t.Fatalf("payload toolsets = %#v, want %q", payload.Toolsets, want)
+		}
+		if got, want := strings.Join(payload.DenyTools, ","), "compozy__task_*"; got != want {
+			t.Fatalf("payload deny_tools = %#v, want %q", payload.DenyTools, want)
+		}
+		if payload.MCPServers[0].Env["TOKEN"] != compozyconfig.RedactedValue() {
+			t.Fatalf("payload mcp env = %#v", payload.MCPServers[0].Env)
+		}
+		if payload.Layer != "project_profile" || len(payload.Shadows) != 2 ||
+			payload.Shadows[0].Layer != "profile" || payload.Shadows[1].Layer != "user" {
+			t.Fatalf(
+				"payload layer/shadows = %q/%#v, want inspectable precedence evidence",
+				payload.Layer,
+				payload.Shadows,
+			)
+		}
+	})
+}
+
+func TestSessionEventPayloadFromEventIncludesStopDiagnostics(t *testing.T) {
+	t.Run("Should expose actionable provider errors without terminal session diagnostics", func(t *testing.T) {
+		t.Parallel()
+		payload := core.SessionEventPayloadFromEvent(store.SessionEvent{
+			Type:      "error",
+			SessionID: "session",
+			TurnID:    "turn",
+			Content:   `{"type":"error","provider_error":{"code":"provider_auth_required","provider":"claude","next_action":"login","guidance":"login token=hidden-auth","occurrence_count":2,"first_seen_at":"2026-09-05T12:00:00Z","last_seen_at":"2026-09-05T12:01:00Z"}}`,
+		}, &session.Info{State: session.StateActive})
+		if payload.ProviderError == nil || payload.ProviderError.Code != "provider_auth_required" ||
+			payload.ProviderError.NextAction != "login" ||
+			payload.ProviderError.OccurrenceCount != 2 {
+			t.Fatalf("provider error payload = %#v", payload.ProviderError)
+		}
+		if strings.Contains(payload.ProviderError.Guidance, "hidden-auth") {
+			t.Fatal("provider guidance exposed a credential")
+		}
+		if payload.Failure != nil || payload.StopReason != "" {
+			t.Fatalf("nonterminal provider error exposed stop diagnostics: %#v", payload)
+		}
+	})
+
+	t.Parallel()
+
+	t.Run("Should include stop diagnostics from session info", func(t *testing.T) {
+		t.Parallel()
+
+		now := time.Date(2026, 4, 3, 12, 0, 0, 0, time.UTC)
+		payload := core.SessionEventPayloadFromEvent(
+			store.SessionEvent{
+				ID:        "ev-1",
+				SessionID: "sess-1",
+				Sequence:  7,
+				TurnID:    "turn-1",
+				Type:      session.EventTypeSessionStopped,
+				AgentName: "coder",
+				Content:   `{"ok":true}`,
+				Timestamp: now,
+			},
+			&session.Info{
+				WorkspaceID: "ws-alpha",
+				Workspace:   "/workspace",
+				Lineage: &store.SessionLineage{
+					ParentSessionID: "sess-parent",
+					RootSessionID:   "sess-root",
+					SpawnDepth:      2,
+				},
+				StopReason: store.StopAgentCrashed,
+				StopDetail: "driver failed",
+				Failure: &store.SessionFailure{
+					Kind:    store.FailureProcess,
+					Summary: "driver failed",
+				},
+			},
+		)
+
+		if payload.WorkspaceID != "ws-alpha" || payload.WorkspacePath != "/workspace" {
+			t.Fatalf("workspace payload = %#v", payload)
+		}
+		if payload.ParentSessionID != "sess-parent" ||
+			payload.RootSessionID != "sess-root" ||
+			payload.SpawnDepth != 2 {
+			t.Fatalf("lineage payload = %#v", payload)
+		}
+		if payload.StopReason != store.StopAgentCrashed || payload.StopDetail != "driver failed" {
+			t.Fatalf("stop payload = %#v", payload)
+		}
+		if payload.Failure == nil || payload.Failure.Kind != store.FailureProcess {
+			t.Fatalf("failure payload = %#v", payload.Failure)
+		}
+	})
+
+	t.Run("Should preserve correlation when unrelated payload fields are malformed", func(t *testing.T) {
+		t.Parallel()
+
+		leaseUntil := time.Date(2026, 4, 3, 12, 5, 0, 0, time.UTC)
+		payload := core.SessionEventPayloadFromEvent(
+			store.SessionEvent{
+				ID:        "ev-correlation",
+				SessionID: "sess-1",
+				Sequence:  8,
+				TurnID:    "turn-2",
+				Type:      "tool_call",
+				AgentName: "coder",
+				Content:   `{"type":"tool_call","task_id":"task-1","claim_token_hash":"compozy_claim_hash_123","lease_until":"2026-04-03T12:05:00Z","timestamp":"not-a-time"}`,
+				Timestamp: time.Date(2026, 4, 3, 12, 1, 0, 0, time.UTC),
+			},
+			nil,
+		)
+
+		if got, want := payload.TaskID, "task-1"; got != want {
+			t.Fatalf("payload.TaskID = %q, want %q", got, want)
+		}
+		if got, want := payload.ClaimTokenHash, "compozy_claim_hash_123"; got != want {
+			t.Fatalf("payload.ClaimTokenHash = %q, want %q", got, want)
+		}
+		if payload.LeaseUntil == nil || !payload.LeaseUntil.Equal(leaseUntil) {
+			t.Fatalf("payload.LeaseUntil = %v, want %v", payload.LeaseUntil, leaseUntil)
+		}
+	})
+
+	t.Run("Should omit lease until when correlation has no lease", func(t *testing.T) {
+		t.Parallel()
+
+		payload := core.SessionEventPayloadFromEvent(
+			store.SessionEvent{
+				ID:        "ev-no-lease",
+				SessionID: "sess-1",
+				Sequence:  9,
+				TurnID:    "turn-3",
+				Type:      "agent_message",
+				AgentName: "coder",
+				Content:   `{"type":"agent_message","task_id":"task-1"}`,
+				Timestamp: time.Date(2026, 4, 3, 12, 2, 0, 0, time.UTC),
+			},
+			nil,
+		)
+
+		raw, err := json.Marshal(payload)
+		if err != nil {
+			t.Fatalf("json.Marshal() error = %v", err)
+		}
+		if strings.Contains(string(raw), `"lease_until"`) {
+			t.Fatalf("payload JSON = %s, want lease_until to be omitted", raw)
+		}
+	})
+}
+
+func TestLogEventPayloadFromSummaryIncludesLineage(t *testing.T) {
+	t.Parallel()
+
+	t.Run("Should include persisted observe lineage fields", func(t *testing.T) {
+		t.Parallel()
+
+		now := time.Date(2026, 4, 3, 12, 5, 0, 0, time.UTC)
+		payload := core.LogEventPayloadFromSummary(store.EventSummary{
+			ID:              "sum-1",
+			SessionID:       "sess-child",
+			Type:            "agent_message",
+			AgentName:       "coder",
+			Provider:        "codex",
+			Outcome:         "info",
+			ParentSessionID: "sess-parent",
+			RootSessionID:   "sess-root",
+			SpawnDepth:      1,
+			Summary:         "hello",
+			Timestamp:       now,
+		})
+
+		if payload.ParentSessionID != "sess-parent" ||
+			payload.RootSessionID != "sess-root" ||
+			payload.SpawnDepth != 1 ||
+			payload.Provider != "codex" ||
+			payload.Outcome != "info" ||
+			payload.Component != "session" {
+			t.Fatalf("payload lineage = %#v", payload)
+		}
+	})
+
+	t.Run("Should preserve observe event content for global events", func(t *testing.T) {
+		t.Parallel()
+
+		payload := core.LogEventPayloadFromSummary(testEventSummaryWithContent(store.EventSummary{
+			ID:   "sum-global",
+			Type: "settings.changed",
+		}, json.RawMessage(`{"section":"skills","source":"http","operation":"patch"}`)))
+
+		if got, want := string(
+			payload.Content,
+		), `{"section":"skills","source":"http","operation":"patch"}`; got != want {
+			t.Fatalf("payload.Content = %q, want %q", got, want)
+		}
+	})
+}
+
+func TestJobPayloadFromJobCopiesNestedOptionalFields(t *testing.T) {
+	t.Parallel()
+
+	t.Run("Should copy nested optional automation job fields", func(t *testing.T) {
+		t.Parallel()
+
+		now := time.Date(2026, 4, 3, 12, 0, 0, 0, time.UTC)
+		nextRun := now.Add(time.Hour)
+		schedule := automationpkg.ScheduleSpec{Mode: automationpkg.ScheduleModeEvery, Interval: "10m"}
+		owner := taskpkg.Ownership{Kind: taskpkg.OwnerKindPool, Ref: "triage"}
+		jobTask := automationpkg.JobTaskConfig{
+			Title: "Review queue",
+			Owner: &owner,
+		}
+		payload := core.JobPayloadFromJob(automationpkg.Job{
+			ID:        "job-1",
+			ProfileID: "profile-marketing",
+			Scope:     automationpkg.AutomationScopeWorkspace,
+			Name:      "review",
+			AgentName: "coder",
+			Schedule:  &schedule,
+			Task:      &jobTask,
+			Enabled:   true,
+			Source:    automationpkg.JobSourceDynamic,
+			CreatedAt: now,
+			UpdatedAt: now,
+		}, &nextRun, &contract.AutomationSchedulerStatePayload{Registered: true})
+
+		if payload.Schedule == nil || payload.Schedule.Interval != "10m" {
+			t.Fatalf("schedule payload = %#v", payload.Schedule)
+		}
+		if payload.ProfileID != "profile-marketing" {
+			t.Fatalf("payload.ProfileID = %q, want profile-marketing", payload.ProfileID)
+		}
+		if payload.Schedule == &schedule {
+			t.Fatal("JobPayloadFromJob reused schedule input pointer")
+		}
+		if payload.Task == nil || payload.Task.Owner == nil || payload.Task.Owner.Ref != "triage" {
+			t.Fatalf("task payload = %#v", payload.Task)
+		}
+		if payload.Task == &jobTask || payload.Task.Owner == &owner {
+			t.Fatal("JobPayloadFromJob reused nested input pointers")
+		}
+		if payload.NextRun == nil || !payload.NextRun.Equal(nextRun) || payload.Scheduler == nil {
+			t.Fatalf("scheduler payload = next %v scheduler %#v", payload.NextRun, payload.Scheduler)
+		}
+	})
+}
+
+func TestParseSessionEventQueryAndHelpers(t *testing.T) {
+	t.Parallel()
+
+	t.Run("Should parse event and logs helper query parameters", func(t *testing.T) {
+		t.Parallel()
+
+		recorder := httptest.NewRecorder()
+		ginCtx, _ := gin.CreateTestContext(recorder)
+		ginCtx.Request = httptest.NewRequestWithContext(
+			t.Context(),
+			http.MethodGet,
+			"/events?type=agent_message&agent_name=coder&turn_id=turn-1&after_sequence=5&limit=10&since=2026-04-03T12:00:00Z&run=run-1&actor_kind=agent&actor_id=agent:coder&provider=codex&outcome=failure&component=task&error_only=true",
+			http.NoBody,
+		)
+
+		query, err := core.ParseSessionEventQuery(ginCtx)
+		if err != nil {
+			t.Fatalf("ParseSessionEventQuery() error = %v", err)
+		}
+		if query.Type != "agent_message" || query.AgentName != "coder" || query.TurnID != "turn-1" ||
+			query.AfterSequence != 5 ||
+			query.Limit != 10 {
+			t.Fatalf("query = %#v", query)
+		}
+
+		if _, err := core.ParseOptionalTime(""); err != nil {
+			t.Fatalf("ParseOptionalTime(empty) error = %v", err)
+		}
+		if parsed, err := core.ParseOptionalTime("2026-04-03T12:00:00Z"); err != nil || parsed.IsZero() {
+			t.Fatalf("ParseOptionalTime(valid) = %v, %v", parsed, err)
+		}
+		if _, err := core.ParseOptionalTime("bad"); err == nil {
+			t.Fatal("ParseOptionalTime(bad) error = nil, want non-nil")
+		}
+		if value, err := core.ParseOptionalInt("7"); err != nil || value != 7 {
+			t.Fatalf("ParseOptionalInt() = %d, %v", value, err)
+		}
+		if value, err := core.ParseOptionalInt64("9"); err != nil || value != 9 {
+			t.Fatalf("ParseOptionalInt64() = %d, %v", value, err)
+		}
+		if _, err := core.ParseLogsCursor("2026-04-03T12:00:00Z|ev-1"); err != nil {
+			t.Fatalf("ParseLogsCursor() error = %v", err)
+		}
+		observeQuery, err := core.ParseLogsQuery(ginCtx)
+		if err != nil {
+			t.Fatalf("ParseLogsQuery() error = %v", err)
+		}
+		if observeQuery.AgentName != "coder" ||
+			observeQuery.RunID != "run-1" ||
+			observeQuery.ActorKind != "agent" ||
+			observeQuery.ActorID != "agent:coder" ||
+			observeQuery.Provider != "codex" ||
+			observeQuery.Outcome != "failure" ||
+			observeQuery.Component != "task" ||
+			!observeQuery.ErrorOnly ||
+			observeQuery.AfterSequence != 5 {
+			t.Fatalf("observe query = %#v", observeQuery)
+		}
+
+		invalidRecorder := httptest.NewRecorder()
+		invalidContext, _ := gin.CreateTestContext(invalidRecorder)
+		invalidContext.Request = httptest.NewRequestWithContext(
+			t.Context(),
+			http.MethodGet,
+			"/events?since=bad",
+			http.NoBody,
+		)
+		if _, err := core.ParseSessionEventQuery(invalidContext); err == nil {
+			t.Fatal("ParseSessionEventQuery(invalid) error = nil, want non-nil")
+		}
+	})
+}
+
+func TestSkillShadowEntryPayloadFromDomain(t *testing.T) {
+	t.Parallel()
+
+	t.Run("Should normalize domain tiers and preserve zero detected timestamps", func(t *testing.T) {
+		t.Parallel()
+
+		payload := core.SkillShadowEntryPayloadFromDomain(skills.ShadowEntry{
+			Path:             " /tmp/skill/SKILL.md ",
+			Tier:             "agent-local",
+			ResolvedToWinner: true,
+		})
+		if payload.Path != "/tmp/skill/SKILL.md" {
+			t.Fatalf("Path = %q, want %q", payload.Path, "/tmp/skill/SKILL.md")
+		}
+		if payload.Tier != "agent_local" {
+			t.Fatalf("Tier = %q, want %q", payload.Tier, "agent_local")
+		}
+		if !payload.DetectedAt.IsZero() {
+			t.Fatalf("DetectedAt = %v, want zero time", payload.DetectedAt)
+		}
+	})
+}
+
+func TestRespondErrorMaskingModes(t *testing.T) {
+	t.Parallel()
+
+	for _, tc := range []struct {
+		name    string
+		mask    bool
+		wantErr string
+	}{
+		{name: "mask", mask: true, wantErr: http.StatusText(http.StatusInternalServerError)},
+		{name: "expose", mask: false, wantErr: "boom"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			recorder := httptest.NewRecorder()
+			ginCtx, _ := gin.CreateTestContext(recorder)
+
+			core.RespondError(ginCtx, http.StatusInternalServerError, errors.New("boom"), tc.mask)
+
+			var payload contract.ErrorPayload
+			if err := json.Unmarshal(recorder.Body.Bytes(), &payload); err != nil {
+				t.Fatalf("json.Unmarshal() error = %v", err)
+			}
+			if payload.Error != tc.wantErr {
+				t.Fatalf("payload.Error = %q, want %q", payload.Error, tc.wantErr)
+			}
+		})
+	}
+}
+
+func TestPrepareSSESetsHeaders(t *testing.T) {
+	t.Parallel()
+
+	t.Run("Should prepare SSE responses with streaming headers", func(t *testing.T) {
+		t.Parallel()
+
+		recorder := httptest.NewRecorder()
+		ginCtx, _ := gin.CreateTestContext(recorder)
+		ginCtx.Request = httptest.NewRequestWithContext(
+			t.Context(),
+			http.MethodGet,
+			"/stream",
+			http.NoBody,
+		)
+
+		writer, err := core.PrepareSSE(ginCtx)
+		if err != nil {
+			t.Fatalf("PrepareSSE() error = %v", err)
+		}
+		if writer == nil {
+			t.Fatal("PrepareSSE() writer = nil")
+		}
+		if got := recorder.Header().Get("Content-Type"); got != "text/event-stream" {
+			t.Fatalf("Content-Type = %q, want text/event-stream", got)
+		}
+		if got := recorder.Header().Get("Cache-Control"); got != "no-cache" {
+			t.Fatalf("Cache-Control = %q, want no-cache", got)
+		}
+		if recorder.Code != http.StatusOK {
+			t.Fatalf("status = %d, want %d", recorder.Code, http.StatusOK)
+		}
+	})
+}

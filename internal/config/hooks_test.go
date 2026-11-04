@@ -1,0 +1,540 @@
+package config
+
+import (
+	"errors"
+	"os"
+	"path/filepath"
+	"strings"
+	"testing"
+	"time"
+
+	hookspkg "github.com/compozy/compozy/internal/hooks"
+)
+
+func TestAgentHookRetiredMatcherCompatibility(t *testing.T) {
+	t.Parallel()
+	for _, format := range []string{"YAML", "TOML"} {
+		for _, matcherCase := range []struct {
+			name, yaml, toml string
+			wantError        bool
+		}{
+			{name: "Should retain hooks and ignore retired matcher keys", yaml: "workspace_id: ws-1", toml: "workspace_id = 'ws-1'"},
+			{name: "Should reject unknown matcher keys alongside retired keys", yaml: "unknown_matcher: value", toml: "unknown_matcher = 'value'", wantError: true},
+			{name: "Should reject malformed retained matcher values", yaml: "workspace_id: [invalid]", toml: "workspace_id = ['invalid']", wantError: true},
+		} {
+			t.Run(matcherCase.name+" in "+format, func(t *testing.T) {
+				t.Parallel()
+				body := "---\nname: coder\nhooks:\n  - name: observer\n    event: session.post_stop\n    command: /bin/echo\n    matcher:\n      compaction_reason: old\n      compaction_strategy: [old]\n      " + matcherCase.yaml + "\n---\nKeep this prompt.\n"
+				if format == "TOML" {
+					body = "---\nname = 'coder'\n[[hooks]]\nname = 'observer'\nevent = 'session.post_stop'\ncommand = '/bin/echo'\n[hooks.matcher]\ncompaction_reason = 'old'\ncompaction_strategy = ['old']\n" + matcherCase.toml + "\n---\nKeep this prompt.\n"
+				}
+				file := filepath.Join(t.TempDir(), AgentDefinitionFileName)
+				writeFile(t, file, body)
+				agent, err := LoadAgentDefFile(file)
+				if matcherCase.wantError {
+					if err == nil {
+						t.Fatal("LoadAgentDefFile() error = nil, want strict matcher error")
+					}
+				} else {
+					if err != nil {
+						t.Fatalf("LoadAgentDefFile() error = %v", err)
+					}
+					if len(agent.Hooks) != 1 || agent.Hooks[0].Event != hookspkg.HookSessionPostStop ||
+						agent.Hooks[0].Matcher.WorkspaceID != "ws-1" ||
+						agent.Hooks[0].Matcher.AgentName != "coder" ||
+						agent.Prompt != "Keep this prompt." {
+						t.Fatalf("agent = %#v, want retained hook matcher, event and prompt", agent)
+					}
+				}
+				persisted, err := os.ReadFile(file)
+				if err != nil || string(persisted) != body {
+					t.Fatalf("source changed: error=%v contents=%q", err, persisted)
+				}
+			})
+		}
+	}
+}
+
+func TestProfileConfigHookDispatchIsBoundToOwningProfileIT045(t *testing.T) {
+	t.Parallel()
+
+	homePaths, err := ResolveHomePathsFrom(filepath.Join(t.TempDir(), "home"))
+	if err != nil {
+		t.Fatalf("ResolveHomePathsFrom() error = %v", err)
+	}
+	profilePath := filepath.Join(homePaths.ProfilesDir, "marketing", ConfigName)
+	profileConfig := `[[hooks.declarations]]
+name = "marketing-message"
+event = "input.pre_submit"
+mode = "sync"
+
+[hooks.declarations.executor]
+command = "/bin/sh"
+args = ["-c", "printf '{\"message\":\"marketing\"}'"]
+`
+	writeFile(t, profilePath, profileConfig)
+
+	dispatch := func(profileName string) string {
+		t.Helper()
+		options := make([]LoadOption, 0, 1)
+		if profileName != "default" {
+			options = append(options, WithProfile(profileName))
+		}
+		cfg, err := LoadForHome(homePaths, options...)
+		if err != nil {
+			t.Fatalf("LoadForHome(%s) error = %v", profileName, err)
+		}
+		declarations, err := HookDeclarations(cfg.Hooks, nil)
+		if err != nil {
+			t.Fatalf("HookDeclarations(%s) error = %v", profileName, err)
+		}
+		dispatcher := hookspkg.NewHooks(hookspkg.WithConfigDeclarations(declarations))
+		t.Cleanup(dispatcher.Close)
+		if err := dispatcher.Rebuild(t.Context()); err != nil {
+			t.Fatalf("Rebuild(%s) error = %v", profileName, err)
+		}
+		result, err := dispatcher.DispatchInputPreSubmit(t.Context(), hookspkg.InputPreSubmitPayload{
+			Event:   hookspkg.HookInputPreSubmit,
+			Message: "original",
+		})
+		if err != nil {
+			t.Fatalf("DispatchInputPreSubmit(%s) error = %v", profileName, err)
+		}
+		return result.Message
+	}
+	if got := dispatch("default"); got != "original" {
+		t.Fatalf("default dispatch message = %q, want original", got)
+	}
+	if got := dispatch("marketing"); got != "marketing" {
+		t.Fatalf("marketing dispatch message = %q, want marketing", got)
+	}
+
+	writeFile(t, profilePath, profileConfig+"\n[observability]\nenabled = false\n")
+	_, err = LoadForHome(homePaths, WithProfile("marketing"))
+	validation, validationOK := errors.AsType[ValidationError](err)
+	if !validationOK || validation.Code != "profile_config_key_denied" {
+		t.Fatalf("LoadForHome(profile observability) error = %#v, want profile_config_key_denied", err)
+	}
+}
+
+func TestLoadParsesConfigHookDeclarationWithAllFields(t *testing.T) {
+	workspaceRoot, homePaths := prepareHookConfigTestEnv(t)
+	writeFile(t, homePaths.ConfigFile, `
+[[hooks.declarations]]
+name = "audit-tool"
+event = "tool.pre_call"
+mode = "sync"
+required = false
+priority = 640
+timeout = "7s"
+
+[hooks.declarations.matcher]
+tool_id = "compozy__read_file"
+tool_read_only = true
+
+[hooks.declarations.executor]
+command = "/bin/echo"
+args = ["audit"]
+env = { PHASE = "pre" }
+`)
+
+	cfg, err := Load(WithWorkspaceRoot(workspaceRoot))
+	if err != nil {
+		t.Fatalf("Load() error = %v", err)
+	}
+
+	decls, err := HookDeclarations(cfg.Hooks, nil)
+	if err != nil {
+		t.Fatalf("HookDeclarations() error = %v", err)
+	}
+	if got, want := len(decls), 1; got != want {
+		t.Fatalf("len(HookDeclarations()) = %d, want %d", got, want)
+	}
+
+	hook := decls[0]
+	if got, want := hook.Name, "audit-tool"; got != want {
+		t.Fatalf("hook.Name = %q, want %q", got, want)
+	}
+	if got, want := hook.Event, hookspkg.HookToolPreCall; got != want {
+		t.Fatalf("hook.Event = %q, want %q", got, want)
+	}
+	if got, want := hook.Source, hookspkg.HookSourceConfig; got != want {
+		t.Fatalf("hook.Source = %q, want %q", got, want)
+	}
+	if got, want := hook.Mode, hookspkg.HookModeSync; got != want {
+		t.Fatalf("hook.Mode = %q, want %q", got, want)
+	}
+	if got, want := hook.Priority, int32(640); got != want {
+		t.Fatalf("hook.Priority = %d, want %d", got, want)
+	}
+	if got, want := hook.Timeout, 7*time.Second; got != want {
+		t.Fatalf("hook.Timeout = %s, want %s", got, want)
+	}
+	if got, want := hook.ExecutorKind, hookspkg.HookExecutorSubprocess; got != want {
+		t.Fatalf("hook.ExecutorKind = %q, want %q", got, want)
+	}
+	if got, want := hook.Command, "/bin/echo"; got != want {
+		t.Fatalf("hook.Command = %q, want %q", got, want)
+	}
+	if got, want := strings.Join(hook.Args, ","), "audit"; got != want {
+		t.Fatalf("hook.Args = %#v, want %q", hook.Args, want)
+	}
+	if got, want := hook.Env["PHASE"], "pre"; got != want {
+		t.Fatalf("hook.Env[PHASE] = %q, want %q", got, want)
+	}
+	if got, want := hook.Matcher.ToolID, "compozy__read_file"; got != want {
+		t.Fatalf("hook.Matcher.ToolID = %q, want %q", got, want)
+	}
+	if hook.Matcher.ToolReadOnly == nil || !*hook.Matcher.ToolReadOnly {
+		t.Fatalf("hook.Matcher.ToolReadOnly = %#v, want true", hook.Matcher.ToolReadOnly)
+	}
+}
+
+func TestLoadParsesMinimalConfigHookAndAppliesDefaults(t *testing.T) {
+	workspaceRoot, homePaths := prepareHookConfigTestEnv(t)
+	writeFile(t, homePaths.ConfigFile, `
+[[hooks.declarations]]
+name = "workspace-ready"
+event = "session.post_create"
+command = "/bin/echo"
+`)
+
+	cfg, err := Load(WithWorkspaceRoot(workspaceRoot))
+	if err != nil {
+		t.Fatalf("Load() error = %v", err)
+	}
+
+	decls, err := HookDeclarations(cfg.Hooks, nil)
+	if err != nil {
+		t.Fatalf("HookDeclarations() error = %v", err)
+	}
+	if got, want := len(decls), 1; got != want {
+		t.Fatalf("len(HookDeclarations()) = %d, want %d", got, want)
+	}
+
+	hook := decls[0]
+	if got, want := hook.Mode, hookspkg.HookModeAsync; got != want {
+		t.Fatalf("hook.Mode = %q, want %q", got, want)
+	}
+	if got, want := hook.Priority, int32(500); got != want {
+		t.Fatalf("hook.Priority = %d, want %d", got, want)
+	}
+	if hook.PrioritySet {
+		t.Fatal("hook.PrioritySet = true, want false for default priority")
+	}
+	if got, want := hook.ExecutorKind, hookspkg.HookExecutorSubprocess; got != want {
+		t.Fatalf("hook.ExecutorKind = %q, want %q", got, want)
+	}
+}
+
+func TestCloneHookDeclDeepCopiesMatcherPointers(t *testing.T) {
+	t.Parallel()
+
+	t.Run("Should clone matcher pointers independently", func(t *testing.T) {
+		t.Parallel()
+
+		toolReadOnly := true
+		decl := hookspkg.HookDecl{
+			Matcher: hookspkg.HookMatcher{
+				ToolReadOnly: &toolReadOnly,
+				CompactionMatcher: &hookspkg.CompactionMatcher{
+					Trigger: "agent",
+				},
+				Autonomy: &hookspkg.AutonomyMatcher{
+					TaskID: "task-1",
+				},
+			},
+		}
+
+		cloned := cloneHookDecl(decl)
+		cloned.Matcher.Trigger = "requested"
+		cloned.Matcher.Autonomy.TaskID = "task-2"
+		*cloned.Matcher.ToolReadOnly = false
+
+		if got, want := decl.Matcher.Trigger, "agent"; got != want {
+			t.Fatalf("source CompactionMatcher.Trigger = %q, want %q", got, want)
+		}
+		if got, want := decl.Matcher.Autonomy.TaskID, "task-1"; got != want {
+			t.Fatalf("source Autonomy.TaskID = %q, want %q", got, want)
+		}
+		if got, want := *decl.Matcher.ToolReadOnly, true; got != want {
+			t.Fatalf("source ToolReadOnly = %v, want %v", got, want)
+		}
+	})
+}
+
+func TestLoadRejectsInvalidConfigHookEvent(t *testing.T) {
+	workspaceRoot, homePaths := prepareHookConfigTestEnv(t)
+	writeFile(t, homePaths.ConfigFile, `
+[[hooks.declarations]]
+name = "bad-event"
+event = "bad.event"
+command = "/bin/echo"
+`)
+
+	_, err := Load(WithWorkspaceRoot(workspaceRoot))
+	if err == nil {
+		t.Fatal("Load() error = nil, want non-nil")
+	}
+	if !strings.Contains(err.Error(), "hooks.declarations") || !strings.Contains(err.Error(), "bad.event") {
+		t.Fatalf("Load() error = %v, want hooks.declarations invalid event detail", err)
+	}
+}
+
+func TestLoadRejectsRequiredAsyncConfigHook(t *testing.T) {
+	workspaceRoot, homePaths := prepareHookConfigTestEnv(t)
+	writeFile(t, homePaths.ConfigFile, `
+[[hooks.declarations]]
+name = "must-not-async"
+event = "session.post_create"
+mode = "async"
+required = true
+command = "/bin/echo"
+`)
+
+	_, err := Load(WithWorkspaceRoot(workspaceRoot))
+	if err == nil {
+		t.Fatal("Load() error = nil, want non-nil")
+	}
+	if !strings.Contains(err.Error(), "must-not-async") || !strings.Contains(err.Error(), "async") {
+		t.Fatalf("Load() error = %v, want required async detail", err)
+	}
+}
+
+func TestLoadMergesConfigHooksAcrossPrecedenceLevels(t *testing.T) {
+	workspaceRoot, homePaths := prepareHookConfigTestEnv(t)
+	writeFile(t, homePaths.ConfigFile, `
+[[hooks.declarations]]
+name = "global-only"
+event = "session.post_create"
+command = "/bin/global"
+
+[[hooks.declarations]]
+name = "shared"
+event = "session.post_stop"
+command = "/bin/global-shared"
+`)
+	writeFile(t, filepath.Join(workspaceRoot, DirName, ConfigName), `
+[[hooks.declarations]]
+name = "workspace-only"
+event = "input.pre_submit"
+command = "/bin/workspace"
+
+[[hooks.declarations]]
+name = "shared"
+event = "session.post_stop"
+command = "/bin/workspace-shared"
+`)
+
+	cfg, err := Load(WithWorkspaceRoot(workspaceRoot))
+	if err != nil {
+		t.Fatalf("Load() error = %v", err)
+	}
+
+	decls, err := HookDeclarations(cfg.Hooks, nil)
+	if err != nil {
+		t.Fatalf("HookDeclarations() error = %v", err)
+	}
+	if got, want := len(decls), 3; got != want {
+		t.Fatalf("len(HookDeclarations()) = %d, want %d", got, want)
+	}
+
+	got := map[string]hookspkg.HookDecl{}
+	for _, decl := range decls {
+		got[decl.Name] = decl
+	}
+	if _, ok := got["global-only"]; !ok {
+		t.Fatalf("HookDeclarations() missing global-only: %#v", decls)
+	}
+	if _, ok := got["workspace-only"]; !ok {
+		t.Fatalf("HookDeclarations() missing workspace-only: %#v", decls)
+	}
+	if got["shared"].Command != "/bin/workspace-shared" {
+		t.Fatalf("shared command = %q, want %q", got["shared"].Command, "/bin/workspace-shared")
+	}
+}
+
+func TestParseAgentDefParsesHookAndScopesMatcherToAgent(t *testing.T) {
+	t.Parallel()
+
+	agent, err := ParseAgentDef([]byte(`---
+name: coder
+provider: claude
+hooks:
+  - name: prompt-sanitizer
+    event: prompt.post_assemble
+    mode: sync
+    command: /bin/echo
+    args: ["sanitize"]
+---
+
+Keep prompts tight.
+`))
+	if err != nil {
+		t.Fatalf("ParseAgentDef() error = %v", err)
+	}
+	if got, want := len(agent.Hooks), 1; got != want {
+		t.Fatalf("len(agent.Hooks) = %d, want %d", got, want)
+	}
+
+	hook := agent.Hooks[0]
+	if got, want := hook.Name, "prompt-sanitizer"; got != want {
+		t.Fatalf("hook.Name = %q, want %q", got, want)
+	}
+	if got, want := hook.Source, hookspkg.HookSourceAgentDefinition; got != want {
+		t.Fatalf("hook.Source = %q, want %q", got, want)
+	}
+	if got, want := hook.Matcher.AgentName, "coder"; got != want {
+		t.Fatalf("hook.Matcher.AgentName = %q, want %q", got, want)
+	}
+}
+
+func TestParseAgentDefParsesTOMLHookAndScopesMatcherToAgent(t *testing.T) {
+	t.Parallel()
+
+	agent, err := ParseAgentDef([]byte(`---
+name = "reviewer"
+provider = "codex"
+
+[[hooks]]
+name = "review-gate"
+event = "input.pre_submit"
+command = "/bin/echo"
+---
+
+Review carefully.
+`))
+	if err != nil {
+		t.Fatalf("ParseAgentDef() error = %v", err)
+	}
+	if got, want := len(agent.Hooks), 1; got != want {
+		t.Fatalf("len(agent.Hooks) = %d, want %d", got, want)
+	}
+
+	hook := agent.Hooks[0]
+	if got, want := hook.Name, "review-gate"; got != want {
+		t.Fatalf("hook.Name = %q, want %q", got, want)
+	}
+	if got, want := hook.Source, hookspkg.HookSourceAgentDefinition; got != want {
+		t.Fatalf("hook.Source = %q, want %q", got, want)
+	}
+	if got, want := hook.Matcher.AgentName, "reviewer"; got != want {
+		t.Fatalf("hook.Matcher.AgentName = %q, want %q", got, want)
+	}
+}
+
+func TestParseAgentDefRejectsHookScopedToDifferentAgent(t *testing.T) {
+	t.Parallel()
+
+	_, err := ParseAgentDef([]byte(`---
+name: coder
+provider: claude
+hooks:
+  - name: prompt-sanitizer
+    event: prompt.post_assemble
+    command: /bin/echo
+    matcher:
+      agent_name: reviewer
+---
+
+Keep prompts tight.
+`))
+	if err == nil {
+		t.Fatal("ParseAgentDef() error = nil, want non-nil")
+	}
+	if !strings.Contains(err.Error(), "matcher.agent_name") || !strings.Contains(err.Error(), "coder") {
+		t.Fatalf("ParseAgentDef() error = %v, want scoped agent detail", err)
+	}
+}
+
+func TestHookDeclarationsReturnsCombinedConfigAndAgentHooks(t *testing.T) {
+	workspaceRoot, homePaths := prepareHookConfigTestEnv(t)
+	writeFile(t, homePaths.ConfigFile, `
+[[hooks.declarations]]
+name = "global-create"
+event = "session.post_create"
+command = "/bin/global"
+`)
+
+	cfg, err := Load(WithWorkspaceRoot(workspaceRoot))
+	if err != nil {
+		t.Fatalf("Load() error = %v", err)
+	}
+	agent, err := ParseAgentDef([]byte(`---
+name: coder
+provider: claude
+hooks:
+  - name: agent-input
+    event: input.pre_submit
+    command: /bin/echo
+---
+
+Prompt.
+`))
+	if err != nil {
+		t.Fatalf("ParseAgentDef() error = %v", err)
+	}
+
+	decls, err := HookDeclarations(cfg.Hooks, []AgentDef{agent})
+	if err != nil {
+		t.Fatalf("HookDeclarations() error = %v", err)
+	}
+	if got, want := len(decls), 2; got != want {
+		t.Fatalf("len(HookDeclarations()) = %d, want %d", got, want)
+	}
+
+	got := map[string]hookspkg.HookDecl{}
+	for _, decl := range decls {
+		got[decl.Name] = decl
+	}
+	if got["global-create"].Priority != 500 {
+		t.Fatalf("global-create priority = %d, want 500", got["global-create"].Priority)
+	}
+	if got["agent-input"].Priority != 100 {
+		t.Fatalf("agent-input priority = %d, want 100", got["agent-input"].Priority)
+	}
+	if got["agent-input"].Matcher.AgentName != "coder" {
+		t.Fatalf("agent-input matcher.agent_name = %q, want %q", got["agent-input"].Matcher.AgentName, "coder")
+	}
+}
+
+func TestHookDeclarationsReturnsEmptySliceForEmptyHooksSection(t *testing.T) {
+	workspaceRoot, homePaths := prepareHookConfigTestEnv(t)
+	writeFile(t, homePaths.ConfigFile, `
+[hooks]
+`)
+
+	cfg, err := Load(WithWorkspaceRoot(workspaceRoot))
+	if err != nil {
+		t.Fatalf("Load() error = %v", err)
+	}
+
+	decls, err := HookDeclarations(cfg.Hooks, nil)
+	if err != nil {
+		t.Fatalf("HookDeclarations() error = %v", err)
+	}
+	if decls == nil {
+		t.Fatal("HookDeclarations() = nil, want empty slice")
+	}
+	if got := len(decls); got != 0 {
+		t.Fatalf("len(HookDeclarations()) = %d, want 0", got)
+	}
+}
+
+func prepareHookConfigTestEnv(t *testing.T) (string, HomePaths) {
+	t.Helper()
+
+	workspaceRoot := t.TempDir()
+	homeRoot := filepath.Join(t.TempDir(), "home")
+	t.Setenv("COMPOZY_HOME", homeRoot)
+
+	homePaths, err := ResolveHomePaths()
+	if err != nil {
+		t.Fatalf("ResolveHomePaths() error = %v", err)
+	}
+	if err := EnsureHomeLayout(homePaths); err != nil {
+		t.Fatalf("EnsureHomeLayout() error = %v", err)
+	}
+
+	return workspaceRoot, homePaths
+}

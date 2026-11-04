@@ -1,0 +1,180 @@
+"use client";
+
+import { Popover as PopoverPrimitive } from "@base-ui/react/popover";
+import { useMergedRefs } from "@base-ui/utils/useMergedRefs";
+import { AnimatePresence, m } from "motion/react";
+import * as React from "react";
+
+import { defaultDialogInitialFocus } from "../lib/dialog-initial-focus";
+import { MOTION_DURATION_BASE, MOTION_EASE_OUT } from "../lib/motion";
+import { cn } from "../lib/utils";
+import {
+  PopoverMotionContext,
+  type PopoverMotionContextValue,
+  usePopoverMotion,
+} from "./hooks/use-popover-motion";
+import { useInitialState } from "./use-initial-state";
+
+type PopoverRootProps = PopoverPrimitive.Root.Props;
+
+function Popover({
+  open: controlledOpen,
+  defaultOpen = false,
+  onOpenChange,
+  children,
+  ...props
+}: PopoverRootProps) {
+  const actionsRef = React.useRef<PopoverPrimitive.Root.Actions | null>(null);
+  const [uncontrolledOpen, setUncontrolledOpen] = useInitialState(defaultOpen);
+  const isControlled = controlledOpen !== undefined;
+  const open = isControlled ? Boolean(controlledOpen) : uncontrolledOpen;
+
+  const handleOpenChange: NonNullable<PopoverRootProps["onOpenChange"]> = (next, details) => {
+    if (!isControlled) setUncontrolledOpen(next);
+    onOpenChange?.(next, details);
+  };
+
+  const value: PopoverMotionContextValue = { actionsRef, open };
+
+  return (
+    <PopoverPrimitive.Root
+      data-slot="popover"
+      actionsRef={actionsRef}
+      open={open}
+      defaultOpen={defaultOpen}
+      onOpenChange={handleOpenChange}
+      {...props}
+    >
+      <PopoverMotionContext value={value}>{children as React.ReactNode}</PopoverMotionContext>
+    </PopoverPrimitive.Root>
+  );
+}
+
+function PopoverTrigger({ ...props }: PopoverPrimitive.Trigger.Props) {
+  return <PopoverPrimitive.Trigger data-slot="popover-trigger" {...props} />;
+}
+
+type PopoverContentProps = PopoverPrimitive.Popup.Props &
+  Pick<
+    PopoverPrimitive.Positioner.Props,
+    "align" | "alignOffset" | "side" | "sideOffset" | "anchor"
+  >;
+
+function AnimatedPopoverPopup({
+  children,
+  inert,
+  "aria-hidden": ariaHidden,
+  ...props
+}: PopoverPrimitive.Popup.Props) {
+  const { open } = usePopoverMotion();
+
+  return (
+    <PopoverPrimitive.Popup
+      aria-hidden={open ? ariaHidden : true}
+      inert={open ? inert : true}
+      {...props}
+    >
+      {children}
+    </PopoverPrimitive.Popup>
+  );
+}
+
+function PopoverContent({
+  className,
+  align = "center",
+  alignOffset = 0,
+  side = "bottom",
+  sideOffset = 4,
+  anchor,
+  initialFocus,
+  ref,
+  children,
+  ...props
+}: PopoverContentProps) {
+  const { actionsRef, open } = usePopoverMotion();
+  const popupRef = React.useRef<HTMLDivElement | null>(null);
+  const mergedPopupRef = useMergedRefs(popupRef, ref);
+  // A pointer open lands on the popup, so its first control shows no ring. A
+  // keyboard open keeps Base UI's first-tabbable focus, so the ring shows. An
+  // autofocused control keeps focus either way.
+  const resolvedInitialFocus: PopoverPrimitive.Popup.Props["initialFocus"] =
+    initialFocus ??
+    (openType => {
+      const target = defaultDialogInitialFocus(popupRef.current);
+      return openType === "keyboard" && target === popupRef.current ? true : target;
+    });
+
+  const handleExitComplete = () => {
+    actionsRef.current?.unmount();
+  };
+
+  return (
+    <AnimatePresence onExitComplete={handleExitComplete}>
+      {open ? (
+        <PopoverPrimitive.Portal key="popover-portal" keepMounted>
+          <PopoverPrimitive.Positioner
+            align={align}
+            alignOffset={alignOffset}
+            side={side}
+            sideOffset={sideOffset}
+            anchor={anchor}
+            className="isolate z-50"
+          >
+            <AnimatedPopoverPopup
+              ref={mergedPopupRef}
+              data-slot="popover-content"
+              initialFocus={resolvedInitialFocus}
+              render={
+                <m.div
+                  initial={{ opacity: 0, scale: 0.95 }}
+                  animate={{ opacity: 1, scale: 1 }}
+                  exit={{ opacity: 0, scale: 0.95 }}
+                  transition={{ duration: MOTION_DURATION_BASE, ease: MOTION_EASE_OUT }}
+                />
+              }
+              className={cn(
+                "z-50 flex w-72 origin-(--transform-origin) flex-col gap-2.5 rounded-lg bg-popover p-2.5 text-small-body text-fg shadow-pop outline-hidden",
+                className
+              )}
+              {...props}
+            >
+              {children}
+            </AnimatedPopoverPopup>
+          </PopoverPrimitive.Positioner>
+        </PopoverPrimitive.Portal>
+      ) : null}
+    </AnimatePresence>
+  );
+}
+
+function PopoverHeader({ className, ...props }: React.ComponentProps<"div">) {
+  return (
+    <div
+      data-slot="popover-header"
+      className={cn("flex flex-col gap-0.5 text-small-body", className)}
+      {...props}
+    />
+  );
+}
+
+function PopoverTitle({ className, ...props }: PopoverPrimitive.Title.Props) {
+  return (
+    <PopoverPrimitive.Title
+      data-slot="popover-title"
+      className={cn("text-item-title font-medium text-fg", className)}
+      {...props}
+    />
+  );
+}
+
+function PopoverDescription({ className, ...props }: PopoverPrimitive.Description.Props) {
+  return (
+    <PopoverPrimitive.Description
+      data-slot="popover-description"
+      className={cn("text-muted-foreground", className)}
+      {...props}
+    />
+  );
+}
+
+export { Popover, PopoverContent, PopoverDescription, PopoverHeader, PopoverTitle, PopoverTrigger };

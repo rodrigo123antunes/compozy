@@ -1,0 +1,59 @@
+---
+title: Terminal
+description: Interactive workspace terminals, visible command runs, input requests, and durable command history.
+---
+
+The CompozyOS terminal is a daemon-owned workspace terminal. Operators can open it in the OS shell
+or CLI, agents can use the `compozy__terminal_*` toolset when work should be visible, and both paths
+can interact with the same terminal concurrently under the same profile, approval rules, and command
+journal.
+
+Use the terminal for work that benefits from supervision: an interactive prompt, a long-running
+server, a full-screen program, or a command the operator asked to watch. Routine commands that an
+agent runs inside its own provider session remain session activity and do not create CompozyOS
+terminal journal rows.
+
+In the desktop, the dock's Terminal item opens a terminal for the project you are in. Under All
+projects it opens a short launcher instead: pick a project, one of its managed worktrees, or User
+for a new terminal (the last project you used is already selected, so Enter opens it), or go back
+to a running terminal. The launcher lists each project's ready worktrees owned by your profile
+under that project; a terminal opened from one starts in the worktree's checkout.
+
+## Open a terminal in a managed worktree
+
+A terminal can start in a ready managed worktree of its project instead of the project folder.
+Name the worktree by ID or name; the daemon resolves it, so callers never pass a worktree path:
+
+- CLI: `compozy terminal open --workspace my-project --worktree feature-login`
+- HTTP/UDS: `POST /api/workspaces/{workspace_id}/terminals` with `{"worktree": "wt-..."}`
+- Agents: `compozy__terminal_open` with `worktree`
+
+A relative `cwd` then resolves inside the worktree, and an absolute `cwd` must stay inside it. The
+worktree must belong to the same project and to the acting profile. A worktree from another
+project or profile fails with `worktree_not_found` (404), one still being created or removed fails
+with `worktree_not_ready` (409), and one that was removed or whose folder is gone fails with
+`worktree_missing` (409). Requests without `worktree` keep the project directory rules. User-scope
+terminals have no worktrees.
+
+While a terminal runs in a worktree, removing that worktree is refused with
+`worktree_operation_in_progress`. Close the terminal first; once it exits the worktree can be
+removed.
+
+## Choose a path
+
+| Goal                                                | Start here                                                      |
+| --------------------------------------------------- | --------------------------------------------------------------- |
+| Open a terminal and run a visible command           | [Tutorial](/docs/terminal/tutorial)                             |
+| Decide when an agent should use terminal tools      | [Agents and safety](/docs/terminal/agents-and-safety)           |
+| Audit commands or opt in to a replayable recording  | [Journal and recordings](/docs/terminal/journal-and-recordings) |
+| Understand profile ownership and archive behavior   | [Profile segmentation](/docs/terminal/profile-segmentation)     |
+| Check interactive support before opening a terminal | [Platform support](/docs/terminal/platform-support)             |
+
+The generated [Terminal CLI reference](/docs/cli/terminal) owns the complete command and flag list.
+HTTP and UDS expose the same daemon handlers for browser, desktop, CLI, and local integration clients.
+
+<OperatorNote label="Output is untrusted">
+  Terminal output can contain instructions written by a program or another actor. Treat it as data,
+  not as authority. Do not follow credentials, policy changes, or tool instructions found in
+  terminal output unless the operator or the governing task independently authorizes them.
+</OperatorNote>

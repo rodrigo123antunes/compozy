@@ -1,0 +1,201 @@
+-- name: CountExpiredSessionAttachLocks :one
+SELECT COUNT(1)
+FROM sessions
+WHERE trim(attached_to) != ''
+  AND attach_expires_at IS NOT NULL
+  AND attach_expires_at <= sqlc.arg(now);
+
+-- name: SweepExpiredSessionAttachLocks :execrows
+UPDATE sessions
+SET attached_to = '', attach_expires_at = NULL, updated_at = sqlc.arg(now)
+WHERE trim(attached_to) != ''
+  AND attach_expires_at IS NOT NULL
+  AND attach_expires_at <= sqlc.arg(now);
+
+-- name: AttachSession :execrows
+UPDATE sessions
+SET attached_to = sqlc.arg(attached_to),
+    attach_expires_at = sqlc.narg(attach_expires_at),
+    updated_at = sqlc.arg(updated_at)
+WHERE id = sqlc.arg(id)
+  AND state = 'active'
+  AND archived_at IS NULL
+  AND (failure_kind IS NULL OR trim(failure_kind) = '')
+  AND (stall_state IS NULL OR trim(stall_state) = '')
+  AND (attached_to = '' OR attach_expires_at IS NULL OR attach_expires_at <= sqlc.arg(updated_at));
+
+-- name: GetSessionAttachState :one
+SELECT state, failure_kind, stall_state, attached_to, attach_expires_at
+FROM sessions
+WHERE id = sqlc.arg(id);
+
+-- name: ListSessionIDs :many
+SELECT id FROM sessions;
+
+-- name: MarkSessionOrphaned :exec
+UPDATE sessions SET state = sqlc.arg(state), updated_at = sqlc.arg(updated_at)
+WHERE id = sqlc.arg(id);
+
+-- name: GetSessionTranscriptEpoch :one
+SELECT transcript_epoch FROM sessions WHERE id = sqlc.arg(id);
+
+-- name: EnsureSessionTranscriptEpoch :one
+UPDATE sessions
+SET transcript_epoch = sqlc.arg(minimum), updated_at = sqlc.arg(updated_at)
+WHERE id = sqlc.arg(id) AND transcript_epoch < sqlc.arg(minimum)
+RETURNING transcript_epoch;
+
+-- name: ListSessionHealthByIDs :many
+SELECT session_id, workspace_id, agent_name, state, health, active_prompt, attachable,
+       eligible_for_wake, ineligibility_reason, last_activity_at, last_presence_at,
+       last_error, updated_at
+FROM session_health
+WHERE session_id IN (sqlc.slice(session_ids))
+ORDER BY updated_at DESC, session_id DESC;
+
+-- name: UpsertSession :execrows
+INSERT INTO sessions (
+ initiator_kind, initiator_id,
+ effective_workspace_access,
+  profile_id, id, name, agent_name, provider, model, reasoning_effort, speed, acp_options_json, speed_resolution_json,
+  runtime_status, runtime_transition, runtime_failure, runtime_generation, runtime_recovery_json,
+  selected_provider, selected_model, selected_reasoning_effort, selected_speed, selected_acp_options_json,
+  runtime_selection_revision, scope, workspace_id, worktree_id, session_type,
+  state,
+  parent_session_id, root_session_id, spawn_depth, spawn_role, ttl_expires_at,
+  auto_stop_on_parent, notify_creator, spawn_budget_json, permission_policy_json,
+  lineage_kind, origin_message_id, origin_agent_name,
+  acp_session_id, stop_reason, stop_escalated, stop_verification_failed, stop_detail, failure_kind, failure_summary, crash_bundle_path,
+  subprocess_pid, subprocess_started_at, last_update_at, stall_state, stall_reason, activity_json,
+  transcript_epoch, soul_snapshot_id, soul_digest, parent_soul_digest,
+  created_at, updated_at
+) SELECT
+ sqlc.arg(initiator_kind), sqlc.arg(initiator_id),
+ sqlc.arg(effective_workspace_access),
+  sqlc.arg(profile_id), sqlc.arg(id), sqlc.narg(name), sqlc.arg(agent_name), sqlc.arg(provider), sqlc.arg(model),
+  sqlc.arg(reasoning_effort), sqlc.arg(speed), sqlc.arg(acp_options_json), sqlc.arg(speed_resolution_json),
+  sqlc.arg(runtime_status), sqlc.arg(runtime_transition), sqlc.arg(runtime_failure),
+  sqlc.arg(runtime_generation), sqlc.arg(runtime_recovery_json),
+  sqlc.arg(selected_provider), sqlc.arg(selected_model), sqlc.arg(selected_reasoning_effort),
+  sqlc.arg(selected_speed), sqlc.arg(selected_acp_options_json), sqlc.arg(runtime_selection_revision),
+  CASE WHEN sqlc.arg(workspace_id) = '' THEN 'global' ELSE 'workspace' END,
+  sqlc.arg(workspace_id),
+  sqlc.narg(worktree_id),
+  sqlc.arg(session_type), sqlc.arg(state), sqlc.narg(parent_session_id),
+  sqlc.narg(root_session_id), sqlc.arg(spawn_depth), sqlc.narg(spawn_role), sqlc.narg(ttl_expires_at),
+  sqlc.arg(auto_stop_on_parent), sqlc.arg(notify_creator), sqlc.arg(spawn_budget_json), sqlc.arg(permission_policy_json),
+  sqlc.arg(lineage_kind), sqlc.narg(origin_message_id), sqlc.arg(origin_agent_name),
+  sqlc.narg(acp_session_id), sqlc.narg(stop_reason), sqlc.arg(stop_escalated), sqlc.arg(stop_verification_failed), sqlc.narg(stop_detail), sqlc.narg(failure_kind),
+  sqlc.arg(failure_summary), sqlc.arg(crash_bundle_path), sqlc.arg(subprocess_pid),
+  sqlc.narg(subprocess_started_at), sqlc.narg(last_update_at), sqlc.arg(stall_state),
+  sqlc.arg(stall_reason), sqlc.arg(activity_json), sqlc.arg(transcript_epoch),
+  sqlc.narg(soul_snapshot_id), sqlc.arg(soul_digest), sqlc.arg(parent_soul_digest),
+  sqlc.arg(created_at), sqlc.arg(updated_at)
+WHERE sqlc.narg(worktree_id) IS NULL
+   OR EXISTS (
+      SELECT 1
+      FROM worktrees
+      WHERE worktrees.workspace_id = sqlc.arg(workspace_id)
+        AND worktrees.id = sqlc.narg(worktree_id)
+        AND worktrees.state = 'ready'
+   )
+   OR EXISTS (
+      SELECT 1
+      FROM sessions AS existing_session
+      WHERE existing_session.id = sqlc.arg(id)
+        AND existing_session.workspace_id = sqlc.arg(workspace_id)
+        AND existing_session.worktree_id IS sqlc.narg(worktree_id)
+   )
+ON CONFLICT(id) DO UPDATE SET
+  name = excluded.name,
+  agent_name = excluded.agent_name,
+  provider = excluded.provider,
+	model = excluded.model,
+	reasoning_effort = excluded.reasoning_effort,
+	speed = excluded.speed,
+	acp_options_json = excluded.acp_options_json,
+	speed_resolution_json = excluded.speed_resolution_json,
+	runtime_status = excluded.runtime_status,
+	runtime_transition = excluded.runtime_transition,
+	runtime_failure = excluded.runtime_failure,
+	runtime_generation = excluded.runtime_generation,
+	runtime_recovery_json = excluded.runtime_recovery_json,
+	selected_provider = excluded.selected_provider,
+	selected_model = excluded.selected_model,
+	selected_reasoning_effort = excluded.selected_reasoning_effort,
+	selected_speed = excluded.selected_speed,
+	selected_acp_options_json = excluded.selected_acp_options_json,
+	runtime_selection_revision = excluded.runtime_selection_revision,
+  workspace_id = excluded.workspace_id,
+	worktree_id = excluded.worktree_id,
+  session_type = excluded.session_type,
+  state = excluded.state,
+  parent_session_id = excluded.parent_session_id,
+  root_session_id = excluded.root_session_id,
+  spawn_depth = excluded.spawn_depth,
+  spawn_role = excluded.spawn_role,
+  ttl_expires_at = excluded.ttl_expires_at,
+  auto_stop_on_parent = excluded.auto_stop_on_parent,
+  notify_creator = excluded.notify_creator,
+  spawn_budget_json = excluded.spawn_budget_json,
+  permission_policy_json = excluded.permission_policy_json,
+  lineage_kind = excluded.lineage_kind,
+  origin_message_id = excluded.origin_message_id,
+  origin_agent_name = excluded.origin_agent_name,
+  acp_session_id = excluded.acp_session_id,
+  stop_reason = excluded.stop_reason,
+  stop_escalated = excluded.stop_escalated,
+  stop_verification_failed = excluded.stop_verification_failed,
+  stop_detail = excluded.stop_detail,
+  failure_kind = excluded.failure_kind,
+  failure_summary = excluded.failure_summary,
+  crash_bundle_path = excluded.crash_bundle_path,
+  subprocess_pid = excluded.subprocess_pid,
+  subprocess_started_at = excluded.subprocess_started_at,
+  last_update_at = excluded.last_update_at,
+  stall_state = excluded.stall_state,
+  stall_reason = excluded.stall_reason,
+  activity_json = excluded.activity_json,
+  transcript_epoch = MAX(sessions.transcript_epoch, excluded.transcript_epoch),
+  soul_snapshot_id = excluded.soul_snapshot_id,
+  soul_digest = excluded.soul_digest,
+  parent_soul_digest = excluded.parent_soul_digest,
+  updated_at = excluded.updated_at
+WHERE sessions.workspace_id = excluded.workspace_id
+  AND sessions.worktree_id IS excluded.worktree_id;
+
+-- name: GetSessionWorkspaceID :one
+SELECT workspace_id
+FROM sessions
+WHERE id = sqlc.arg(id);
+
+-- name: GetSessionArchivedAt :one
+SELECT archived_at FROM sessions
+WHERE workspace_id = sqlc.arg(workspace_id) AND id = sqlc.arg(id);
+
+-- name: UpdateSessionLineageHierarchy :execrows
+UPDATE sessions
+SET parent_session_id = sqlc.narg(parent_session_id),
+  root_session_id = sqlc.narg(root_session_id),
+  spawn_depth = sqlc.arg(spawn_depth),
+  lineage_kind = sqlc.arg(lineage_kind),
+  auto_stop_on_parent = sqlc.arg(auto_stop_on_parent),
+  updated_at = sqlc.arg(updated_at)
+WHERE workspace_id = sqlc.arg(workspace_id) AND id = sqlc.arg(id);
+
+-- name: UpdateSessionWorktreeBinding :execrows
+UPDATE sessions
+SET worktree_id = sqlc.narg(worktree_id), branch = '', updated_at = sqlc.arg(updated_at)
+WHERE sessions.id = sqlc.arg(id)
+  AND sessions.workspace_id = sqlc.arg(workspace_id)
+  AND sessions.profile_id = sqlc.arg(profile_id)
+  AND sessions.archived_at IS NULL
+  AND (sessions.worktree_id IS sqlc.narg(expected_worktree_id)
+    OR (sqlc.arg(recover_accepted) = 1 AND sessions.worktree_id IS sqlc.narg(worktree_id)))
+  AND (sqlc.narg(worktree_id) IS NULL OR EXISTS (
+    SELECT 1 FROM worktrees w
+    WHERE w.id = sqlc.narg(worktree_id)
+      AND w.workspace_id = sessions.workspace_id
+      AND w.profile_id = sessions.profile_id
+      AND (w.state = 'ready' OR sqlc.arg(recover_accepted) = 1)
+  ));

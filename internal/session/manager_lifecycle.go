@@ -1,0 +1,439 @@
+package session
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"os"
+	"strings"
+
+	"github.com/compozy/compozy/internal/acp"
+	compozyconfig "github.com/compozy/compozy/internal/config"
+	"github.com/compozy/compozy/internal/diagnostics"
+	skillspkg "github.com/compozy/compozy/internal/skills"
+	"github.com/compozy/compozy/internal/store"
+	"github.com/compozy/compozy/internal/transcript"
+	workspacepkg "github.com/compozy/compozy/internal/workspace"
+)
+
+// Create resolves an agent definition, opens the session store, and starts a new runtime session.
+func (m *Manager) Create(ctx context.Context, optsInput *CreateOpts) (_ *Session, err error) {
+	opts := *optsInput
+
+	if ctx == nil {
+		return nil, errors.New("session: create context is required")
+	}
+	if err := m.checkNewWorkAdmission(ctx); err != nil {
+		return nil, err
+	}
+	return m.createSession(ctx, &opts)
+}
+
+func (m *Manager) createSession(ctx context.Context, opts *CreateOpts) (*Session, error) {
+	spec, err := m.prepareCreateStart(ctx, opts)
+	if err != nil {
+		return nil, err
+	}
+
+	return m.startSession(ctx, &spec)
+}
+
+// Stop stops an active session and persists the stopped state to disk.
+func (m *Manager) Stop(ctx context.Context, id string) error {
+	return m.StopWithCause(ctx, id, CauseUserRequested, "")
+}
+
+func (m *Manager) watchProcess(session *Session) {
+	if m == nil || session == nil {
+		return
+	}
+	proc := session.processHandle()
+	if proc == nil {
+		return
+	}
+	ctx, run, ok := m.beginProcessWatch()
+	if !ok {
+		return
+	}
+
+	go func() {
+		defer m.finishProcessWatch(run)
+		select {
+		case <-proc.Done():
+		case <-ctx.Done():
+			select {
+			case <-proc.Done():
+			default:
+				return
+			}
+		}
+		if !session.isCurrentProcess(proc) {
+			return
+		}
+		waitErr := proc.Wait()
+		if err := m.handleProcessExit(context.WithoutCancel(ctx), session, proc, waitErr); err != nil {
+			m.sessionLogger(session).Warn("session: process exit handling failed", "error", err)
+		}
+	}()
+}
+
+func (m *Manager) handleProcessExit(
+	ctx context.Context,
+	session *Session,
+	proc *AgentProcess,
+	waitErr error,
+) error {
+	if session == nil {
+		return nil
+	}
+	if !session.isCurrentProcess(proc) {
+		return nil
+	}
+
+	if pending := session.pendingTurnStop(proc); pending != nil {
+		select {
+		case <-pending:
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+		if !session.isCurrentProcess(proc) {
+			return nil
+		}
+	}
+	state := session.Info().State
+	if state != StateActive && state != StateStopping {
+		return nil
+	}
+	if session.currentPromptCompletion() != nil {
+		m.waitForActivePromptProcessExit(ctx, session, proc)
+		if !session.isCurrentProcess(proc) {
+			return nil
+		}
+		state = session.Info().State
+		if state != StateActive && state != StateStopping {
+			return nil
+		}
+	}
+
+	stopCause, _ := session.stopCauseDetail()
+	if !session.stopWasRequested() && stopCause == CauseNone {
+		switch waitErr {
+		case nil:
+			if session.IsPrompting() {
+				waitErr = errors.New("process exited during active prompt")
+				session.setStopCause(CauseProcessExited)
+				break
+			}
+			session.setStopCause(CauseCompleted)
+		default:
+			session.setStopCause(CauseProcessExited)
+		}
+	}
+
+	return m.finalizeStopped(ctx, session, waitErr)
+}
+
+func (m *Manager) resolveStartMCPServers(
+	ctx context.Context,
+	resolvedWorkspace *workspacepkg.ResolvedWorkspace,
+	agent compozyconfig.AgentDef,
+	base []compozyconfig.MCPServer,
+) ([]compozyconfig.MCPServer, error) {
+	switch {
+	case m.skillRegistry == nil && m.mcpResolver == nil:
+		return append([]compozyconfig.MCPServer(nil), base...), nil
+	case m.skillRegistry == nil || m.mcpResolver == nil:
+		return nil, errors.New("session: skill registry and MCP resolver must be configured together")
+	}
+
+	var activeSkills []*skillspkg.Skill
+	var err error
+	if strings.TrimSpace(agent.Name) != "" {
+		activeSkills, err = m.skillRegistry.ForAgentDef(ctx, resolvedWorkspace, agent)
+	} else {
+		activeSkills, err = m.skillRegistry.ForWorkspace(ctx, resolvedWorkspace)
+	}
+	if err != nil {
+		workspaceID := ""
+		if resolvedWorkspace != nil {
+			workspaceID = resolvedWorkspace.ID
+		}
+		return nil, fmt.Errorf("session: resolve active skills for workspace %q: %w", workspaceID, err)
+	}
+
+	return compozyconfig.MergeMCPServers(base, m.mcpResolver.Resolve(activeSkills)), nil
+}
+
+func appendLifecycleErr(errs []error, err error) []error {
+	if err == nil {
+		return errs
+	}
+	return append(errs, err)
+}
+
+func (m *Manager) beginStoppingSession(ctx context.Context, session *Session) error {
+	if session.Info().State != StateActive {
+		return nil
+	}
+	if err := session.beginStopping(m.now()); err != nil {
+		return err
+	}
+	return m.persistSessionLifecycleState(ctx, session, false)
+}
+
+func (m *Manager) persistStopClassification(ctx context.Context, session *Session, waitErr error) error {
+	stopCause, stopDetailHint := session.stopCauseDetail()
+	stopReason, stopDetail := classifyStopReason(stopCause, waitErr, stopDetailHint)
+	failure := sessionFailureForStop(stopCause, waitErr, stopDetail)
+	var bundleErr error
+	if failure != nil {
+		stderr := ""
+		if proc := session.processHandle(); proc != nil {
+			stderr = proc.Stderr()
+		}
+		if reusable, ok := reusableCrashBundleFailure(session.Info().Failure, failure); ok {
+			failure = reusable
+			if _, err := m.writeCrashBundleAtPath(
+				session,
+				*reusable,
+				waitErr,
+				stderr,
+				reusable.CrashBundlePath,
+			); err != nil {
+				bundleErr = err
+			}
+		} else {
+			failure, bundleErr = m.attachCrashBundleToFailure(ctx, session, failure, waitErr, stderr)
+		}
+	}
+	session.setStopClassification(stopReason, stopDetail)
+	session.setFailure(failure)
+	session.markExited(m.now())
+	persistErr := m.persistSessionLifecycleState(ctx, session, false)
+	if persistErr != nil {
+		persistErr = fmt.Errorf("%w: persist stop classification: %w", ErrRecoveryPersistence, persistErr)
+	}
+	return errors.Join(persistErr, bundleErr)
+}
+
+func (m *Manager) recordProcessExitEvent(
+	ctx context.Context,
+	session *Session,
+	waitErr error,
+	promptOwnsTerminalFailure bool,
+) error {
+	if waitErr == nil {
+		return nil
+	}
+
+	m.dispatchAgentCrashed(ctx, session, session.processHandle(), waitErr)
+	if promptOwnsTerminalFailure {
+		return nil
+	}
+
+	stderr := ""
+	if proc := session.processHandle(); proc != nil {
+		stderr = proc.Stderr()
+	}
+	info := session.Info()
+	failure := store.CloneSessionFailure(info.Failure)
+	errorText := waitErr.Error()
+	if failure != nil {
+		errorText = failureSummary(failure, errorText)
+	}
+	turnID, err := m.newPromptTurnID()
+	if err != nil {
+		return err
+	}
+	event := acp.AgentEvent{
+		Type:      acp.EventTypeError,
+		TurnID:    turnID,
+		Timestamp: m.now(),
+		Error:     errorText,
+		Text:      diagnostics.RedactAndBound(stderr, maxCrashEvidenceBytes),
+		Failure:   failure,
+	}
+	normalized := m.normalizeEvent(session, event.TurnID, event)
+	if err := m.recordEvent(ctx, session, normalized); err != nil {
+		return err
+	}
+	m.notifyAgentEvent(ctx, session, normalized)
+	return nil
+}
+
+func sessionStoppedTranscriptMarker(event acp.AgentEvent) (string, string, map[string]any, bool) {
+	failure := store.CloneSessionFailure(event.Failure)
+	failureKind := store.FailureKind("")
+	if failure != nil {
+		failureKind = failure.Normalize().Kind
+	}
+	summary := firstTrimmedNonEmpty(event.Error, event.Text)
+	evidence := map[string]any{
+		transcriptMarkerEvidenceEventTypeKey: event.Type,
+		"stop_reason":                        event.StopReason,
+		"failure_kind":                       string(failureKind),
+	}
+	switch {
+	case event.StopReason == string(store.StopUserCanceled) || failureKind == store.FailureCanceled:
+		return transcript.MarkerPromptInterrupted,
+			firstTrimmedNonEmpty(summary, "Session interrupted by operator."),
+			evidence,
+			true
+	case event.StopReason == string(store.StopTimeout) || failureKind == store.FailureTimeout:
+		return transcript.MarkerPromptTimeout, firstTrimmedNonEmpty(summary, "Session timed out."), evidence, true
+	case failureKind != "":
+		return transcript.MarkerProviderFailure, firstTrimmedNonEmpty(summary, "Provider failed."), evidence, true
+	default:
+		return "", "", nil, false
+	}
+}
+
+// persistFailedStart retains failed sessions so asynchronous startup errors remain inspectable.
+func (m *Manager) persistFailedStart(
+	ctx context.Context,
+	session *Session,
+	startErr error,
+	notify bool,
+) error {
+	if ctx == nil {
+		return errors.New("session: failed start persistence context is required")
+	}
+	if session == nil || startErr == nil {
+		return nil
+	}
+
+	failure := sessionFailureFromError(startErr, store.FailureStartup)
+	var bundleErr error
+	failure, bundleErr = m.attachCrashBundleToFailure(ctx, session, failure, startErr, "")
+	summary := failureSummary(failure, startErr.Error())
+	stopReason := failureStopReason(failure)
+	now := m.now()
+
+	session.setStopClassification(stopReason, summary)
+	session.setFailure(failure)
+	session.markExited(now)
+	session.markStartFailed(now)
+
+	var errs []error
+	errs = appendLifecycleErr(errs, bundleErr)
+	errs = appendLifecycleErr(errs, m.persistSessionLifecycleState(ctx, session, true))
+	errs = appendLifecycleErr(errs, m.recordFailedStartEvents(ctx, session, failure, startErr, stopReason))
+	if notify {
+		m.notifyFailedStart(ctx, session)
+	}
+	return errors.Join(errs...)
+}
+
+func (m *Manager) notifyFailedStart(ctx context.Context, session *Session) {
+	if m.notifier == nil {
+		return
+	}
+	m.notifier.OnSessionCreated(ctx, session)
+	m.notifier.OnSessionStopped(ctx, session)
+}
+
+// recordFailedStartEvents keeps recoverable ACP load negotiation out of the replay transcript.
+func (m *Manager) recordFailedStartEvents(
+	ctx context.Context,
+	session *Session,
+	failure *store.SessionFailure,
+	startErr error,
+	stopReason store.StopReason,
+) error {
+	turnID, err := m.newPromptTurnID()
+	if err != nil {
+		return err
+	}
+	stopTurnID, err := m.newPromptTurnID()
+	if err != nil {
+		return err
+	}
+	summary := failureSummary(failure, startErr.Error())
+	now := m.now()
+	errorEvent := m.normalizeEvent(session, turnID, acp.AgentEvent{
+		Type:      acp.EventTypeError,
+		TurnID:    turnID,
+		Timestamp: now,
+		Error:     summary,
+		Failure:   store.CloneSessionFailure(failure),
+	})
+	stopEvent := m.normalizeEvent(session, stopTurnID, acp.AgentEvent{
+		Type:       EventTypeSessionStopped,
+		TurnID:     stopTurnID,
+		Timestamp:  now,
+		StopReason: string(stopReason),
+		Error:      summary,
+		Failure:    store.CloneSessionFailure(failure),
+	})
+	if err := errors.Join(
+		m.recordEvent(ctx, session, errorEvent),
+		m.recordEvent(ctx, session, stopEvent),
+	); err != nil {
+		return err
+	}
+	if acp.IsLoadSessionResourceMissing(startErr) || errors.Is(startErr, acp.ErrAgentDoesNotSupportSession) {
+		return nil
+	}
+	if kind, summary, evidence, ok := sessionStoppedTranscriptMarker(stopEvent); ok {
+		return m.recordTranscriptMarker(ctx, session, stopTurnID, transcriptMarkerInput{
+			Kind: kind, Summary: summary, Evidence: evidence,
+		})
+	}
+	return nil
+}
+
+func (m *Manager) closeSessionRecorder(session *Session) error {
+	recorder := session.recorderHandle()
+	if recorder == nil {
+		return nil
+	}
+
+	closeCtx, cancel := m.lifecycleCleanupContext()
+	defer cancel()
+	err := recorder.Close(closeCtx)
+	session.setRecorder(nil)
+	return err
+}
+
+func (m *Manager) markSessionStopped(ctx context.Context, session *Session) error {
+	now := m.now()
+	session.setPendingStopState(true, false)
+	session.clearProcess(now)
+	if err := session.markStopped(now); err != nil {
+		return err
+	}
+	if err := m.persistSessionLifecycleState(ctx, session, false); err != nil {
+		session.setPendingStopState(true, true)
+		return errors.Join(ErrRecoveryPersistence, err)
+	}
+	session.setPendingStopState(false, false)
+	return nil
+}
+
+func (m *Manager) cleanupFailedStart(sessionDir string, recorder EventRecorder, proc *AgentProcess) error {
+	var errs []error
+	if proc != nil {
+		func() {
+			stopCtx, cancel := m.lifecycleCleanupContext()
+			defer cancel()
+			if err := m.driver.Stop(stopCtx, proc); err != nil {
+				errs = append(errs, err)
+			}
+		}()
+	}
+	if recorder != nil {
+		func() {
+			closeCtx, cancel := m.lifecycleCleanupContext()
+			defer cancel()
+			if err := recorder.Close(closeCtx); err != nil {
+				errs = append(errs, err)
+			}
+		}()
+	}
+	if strings.TrimSpace(sessionDir) != "" {
+		if err := os.RemoveAll(sessionDir); err != nil {
+			errs = append(errs, fmt.Errorf("session: remove failed session directory %q: %w", sessionDir, err))
+		}
+	}
+	return errors.Join(errs...)
+}

@@ -1,0 +1,221 @@
+import { Folder } from "@compozy/ui/icons";
+import type { ComponentProps, MouseEvent, ReactNode } from "react";
+
+import { Button, Pill, Skeleton, cn } from "@compozy/ui";
+
+import { MessageClampToggle } from "@/components/assistant-ui/message-clamp-toggle";
+import {
+  MESSAGE_CLAMPED_CLASS,
+  useMessageClamp,
+} from "@/components/assistant-ui/use-message-clamp";
+import {
+  formatMessageTimestamp,
+  formatMessageTimestampFull,
+} from "@/systems/session/lib/format-timestamp";
+
+import {
+  DELETED_SESSION_LABEL,
+  SESSION_MESSAGE_FRAME_CLASS,
+  type SessionMessageOpen,
+  type SessionMessageParty,
+} from "./session-message-party";
+
+/**
+ * "From {title}" / "Reply from {title}" / "Sent to {title}": the title is a
+ * link to the session (Enter opens it, ⌘/Ctrl opens a new window); a deleted
+ * session reads plainly with no link. A party in another workspace adds its
+ * folder and name after the link.
+ */
+export function SessionMessagePartyLabel({
+  verb,
+  party,
+  onOpen,
+}: {
+  verb: string;
+  party: SessionMessageParty;
+  onOpen?: SessionMessageOpen;
+}) {
+  const handleOpen = (event: MouseEvent<HTMLButtonElement>) => {
+    onOpen?.(party, { newWindow: event.metaKey || event.ctrlKey });
+  };
+  // A grid, not a flex row: the verb keeps its width, the folder track yields
+  // only once the title track has shrunk to zero, so a long title ellipsizes
+  // instead of pushing the chips, reply state and time under each other (#1097).
+  return (
+    <span
+      className={cn(
+        "inline-grid items-baseline gap-1 text-transcript-meta whitespace-nowrap text-subtle",
+        party.workspaceName
+          ? "grid-cols-[auto_minmax(0,1fr)_minmax(0,auto)]"
+          : "grid-cols-[auto_minmax(0,1fr)]"
+      )}
+      data-slot="session-message-party"
+    >
+      <span>{verb}</span>
+      {party.pending ? (
+        <Skeleton
+          aria-hidden="true"
+          className="inline-block h-3 w-20 self-center rounded-xs"
+          data-testid="session-message-party-pending"
+        />
+      ) : party.title === null ? (
+        <span
+          className="min-w-0 truncate font-medium text-muted-foreground"
+          data-testid="session-message-party-deleted"
+        >
+          {DELETED_SESSION_LABEL}
+        </span>
+      ) : onOpen ? (
+        <Button
+          type="button"
+          variant="link"
+          size="xs"
+          onClick={handleOpen}
+          title={party.title}
+          // The Button is a flex box, where `truncate` on the box itself never
+          // ellipsizes: the inner text clips and the button fills the track.
+          className="h-auto min-w-0 justify-start px-0 text-transcript-meta font-medium text-fg-strong"
+          data-testid="session-message-party-link"
+        >
+          <span className="truncate">{party.title}</span>
+        </Button>
+      ) : (
+        <span className="min-w-0 truncate font-medium text-fg-strong" title={party.title}>
+          {party.title}
+        </span>
+      )}
+      {party.workspaceName ? (
+        <span
+          className="ml-0.5 inline-flex min-w-0 items-center gap-0.5 self-center overflow-hidden text-transcript-caption text-subtle"
+          data-testid="session-message-party-workspace"
+          title={party.workspaceName}
+        >
+          <Folder aria-hidden="true" className="size-2.75 shrink-0 text-faint" />
+          <span className="truncate">{party.workspaceName}</span>
+        </span>
+      ) : null}
+    </span>
+  );
+}
+
+/** Neutral header chip: the mode (Steered · Interrupted · Superseded) or "Reply requested". */
+export function SessionMessageChip({
+  icon,
+  children,
+  subtle = false,
+}: {
+  icon: ReactNode;
+  children: ReactNode;
+  /** Superseded reads one ink step down. */
+  subtle?: boolean;
+}) {
+  return (
+    <Pill
+      tone="neutral"
+      size="xs"
+      data-testid="session-message-chip"
+      className={cn(
+        "[&>svg]:size-2.75 [&>svg]:text-subtle",
+        subtle ? "text-subtle" : "text-muted-foreground"
+      )}
+    >
+      {icon}
+      {children}
+    </Pill>
+  );
+}
+
+/** Header time, pushed right: `HH:MM` with the full timestamp on hover. */
+export function SessionMessageTime({ timestampMs }: { timestampMs: number | null }) {
+  if (timestampMs === null) return null;
+  return (
+    <time
+      dateTime={new Date(timestampMs).toISOString()}
+      title={formatMessageTimestampFull(timestampMs)}
+      className="ml-auto shrink-0 pl-2 font-mono text-transcript-caption text-faint tabular-nums"
+      data-testid="session-message-time"
+    >
+      {formatMessageTimestamp(timestampMs)}
+    </time>
+  );
+}
+
+export type SessionMessageBodyTone = "default" | "quiet" | "destructive";
+
+const BODY_TONE: Record<SessionMessageBodyTone, string> = {
+  default: "text-fg",
+  quiet: "text-subtle",
+  destructive: "text-destructive",
+};
+
+export interface SessionMessageFrameProps extends Omit<ComponentProps<"article">, "children"> {
+  /** 24px avatar column: the other session's provider mark. */
+  avatar: ReactNode;
+  /** Header content after the avatar: party label and chips. */
+  header: ReactNode;
+  timestampMs: number | null;
+  /** Superseded: the body drops one ink step, never removed. */
+  subdued?: boolean;
+  bodyTone?: SessionMessageBodyTone;
+  /** Below the body: attachments, the truncation note. */
+  footer?: ReactNode;
+  children: ReactNode;
+}
+
+/**
+ * The shared frame of the session message card (S1) and the reply card (S2):
+ * avatar · header (party, chips, time) · body with the operator bubble's
+ * reading type and clamp. Agent-authored, so it sits on the left.
+ */
+export function SessionMessageFrame({
+  avatar,
+  header,
+  timestampMs,
+  subdued = false,
+  bodyTone = "default",
+  footer,
+  children,
+  className,
+  ...props
+}: SessionMessageFrameProps) {
+  const { contentRef, clampable, clamped, expanded, toggle } = useMessageClamp();
+  return (
+    <article
+      data-slot="session-message"
+      data-subdued={subdued || undefined}
+      className={cn(
+        SESSION_MESSAGE_FRAME_CLASS,
+        "grid grid-cols-[24px_minmax(0,1fr)] gap-x-2.5 gap-y-1 py-2.25 pr-3 pl-2.25",
+        className
+      )}
+      {...props}
+    >
+      <span className="row-span-2 self-start">{avatar}</span>
+      <div className="flex min-h-6 min-w-0 items-center gap-1.5">
+        {header}
+        <SessionMessageTime timestampMs={timestampMs} />
+      </div>
+      <div
+        ref={contentRef}
+        data-testid="session-message-body"
+        data-clamped={clamped || undefined}
+        className={cn(
+          "col-start-2 min-w-0 text-transcript-message leading-relaxed [overflow-wrap:anywhere]",
+          // The markdown inside sets its own ink: a superseded body lowers all of it.
+          subdued ? "text-subtle [&_*]:text-subtle" : BODY_TONE[bodyTone],
+          clamped ? MESSAGE_CLAMPED_CLASS : null
+        )}
+      >
+        {children}
+      </div>
+      <MessageClampToggle
+        clampable={clampable}
+        expanded={expanded}
+        onToggle={toggle}
+        testId="session-message-clamp-toggle"
+        className="col-start-2 -ml-1 justify-self-start"
+      />
+      {footer ? <div className="col-start-2 flex min-w-0 flex-col gap-1">{footer}</div> : null}
+    </article>
+  );
+}

@@ -1,0 +1,280 @@
+import {
+  apiClient,
+  apiRequestFailed,
+  defaultApiErrorMessage,
+  requireResponseData,
+} from "@/lib/api-client";
+import type { OperationRequestBody } from "@/lib/api-contract";
+
+import type { WorktreeBranchOutcome, WorktreePayload, WorktreesResponse } from "../types";
+
+export type CreateWorktreeParams = OperationRequestBody<"createWorktree">;
+export type AdoptWorktreeParams = OperationRequestBody<"adoptWorktree">;
+
+/**
+ * Carries the raw response body so `lib/worktree-refusal.ts` can decode the
+ * machine-readable 409 refusal without re-issuing the request.
+ */
+export class WorktreeApiError extends Error {
+  constructor(
+    message: string,
+    public readonly status: number,
+    public readonly body: unknown
+  ) {
+    super(message);
+    this.name = "WorktreeApiError";
+  }
+}
+
+export async function fetchWorktrees(
+  workspaceID: string,
+  options: { refresh?: boolean } = {},
+  signal?: AbortSignal
+): Promise<WorktreesResponse> {
+  const { data, error, response } = await apiClient.GET(
+    "/api/workspaces/{workspace_id}/worktrees",
+    {
+      params: {
+        path: { workspace_id: workspaceID },
+        query: options.refresh === undefined ? undefined : { refresh: options.refresh },
+      },
+      signal,
+    }
+  );
+  if (apiRequestFailed(response, error)) {
+    throw new WorktreeApiError(
+      defaultApiErrorMessage("Failed to fetch worktrees", response, error),
+      response.status,
+      error
+    );
+  }
+
+  return requireResponseData(data, response, "Failed to fetch worktrees");
+}
+
+/**
+ * Every project's adopted worktrees from the store (cached status, no git work,
+ * no discovery), narrowed by the Project filter. Operator only.
+ */
+export async function fetchWorktreesAggregate(
+  workspaceIDs: readonly string[] = [],
+  signal?: AbortSignal
+): Promise<WorktreesResponse> {
+  const { data, error, response } = await apiClient.GET("/api/worktrees", {
+    params: {
+      query: {
+        all_workspaces: true,
+        ...(workspaceIDs.length > 0 ? { workspace_ids: [...workspaceIDs] } : {}),
+      },
+    },
+    signal,
+  });
+  if (apiRequestFailed(response, error)) {
+    throw new WorktreeApiError(
+      defaultApiErrorMessage("Failed to fetch worktrees", response, error),
+      response.status,
+      error
+    );
+  }
+
+  return requireResponseData(data, response, "Failed to fetch worktrees");
+}
+
+/**
+ * Returns the durable pending row. Materialization continues daemon-side after
+ * the 202, so dismissing the dialog never aborts the create.
+ */
+export async function createWorktree(
+  workspaceID: string,
+  params: CreateWorktreeParams,
+  /**
+   * The profile stamped on the worktree. Worktrees stay visible in every
+   * profile, but the row still names the one that created it (US-009.EC-1).
+   */
+  profile?: string,
+  signal?: AbortSignal
+): Promise<WorktreePayload> {
+  const { data, error, response } = await apiClient.POST(
+    "/api/workspaces/{workspace_id}/worktrees",
+    {
+      params: {
+        path: { workspace_id: workspaceID },
+        query: profile ? { profile } : {},
+      },
+      body: params,
+      signal,
+    }
+  );
+  if (apiRequestFailed(response, error)) {
+    throw new WorktreeApiError(
+      defaultApiErrorMessage("Failed to create worktree", response, error),
+      response.status,
+      error
+    );
+  }
+
+  return requireResponseData(data, response, "Failed to create worktree").worktree;
+}
+
+export async function cancelWorktreeCreate(
+  workspaceID: string,
+  worktreeID: string,
+  signal?: AbortSignal
+): Promise<void> {
+  const { error, response } = await apiClient.POST(
+    "/api/workspaces/{workspace_id}/worktrees/{worktree_id}/cancel",
+    {
+      params: { path: { workspace_id: workspaceID, worktree_id: worktreeID } },
+      signal,
+    }
+  );
+  if (apiRequestFailed(response, error)) {
+    throw new WorktreeApiError(
+      defaultApiErrorMessage("Failed to cancel worktree creation", response, error),
+      response.status,
+      error
+    );
+  }
+}
+
+/**
+ * Idempotent. Adopting a registered path whose record is `missing` revalidates
+ * Git identity and restores that record to `ready` — this is the "It's back"
+ * resolution path (US-028 EC-1); a different repository stays refused.
+ */
+export async function adoptWorktree(
+  workspaceID: string,
+  params: AdoptWorktreeParams,
+  signal?: AbortSignal,
+  profile?: string
+): Promise<WorktreePayload> {
+  const { data, error, response } = await apiClient.POST(
+    "/api/workspaces/{workspace_id}/worktrees/adopt",
+    {
+      params: { path: { workspace_id: workspaceID }, query: { profile } },
+      body: params,
+      signal,
+    }
+  );
+  if (apiRequestFailed(response, error)) {
+    throw new WorktreeApiError(
+      defaultApiErrorMessage("Failed to adopt worktree", response, error),
+      response.status,
+      error
+    );
+  }
+
+  return requireResponseData(data, response, "Failed to adopt worktree").worktree;
+}
+
+/**
+ * Explicit escalations for one removal or dismissal. `deleteBranch` opts into
+ * deleting the recorded local branch afterwards; `force` also permits deleting
+ * an unmerged branch (and, for removal, confirms a destructive checkout delete).
+ */
+export interface WorktreeCleanupOptions {
+  force?: boolean;
+  deleteBranch?: boolean;
+  profile?: string;
+}
+
+function cleanupQuery(options: WorktreeCleanupOptions) {
+  return {
+    force: options.force,
+    delete_branch: options.deleteBranch || undefined,
+    profile: options.profile,
+  };
+}
+
+/**
+ * Without `force`, a dirty or unpushed worktree refuses with a 409 risk payload.
+ * Resolves the branch outcome only when `deleteBranch` was requested.
+ */
+export async function removeWorktree(
+  workspaceID: string,
+  worktreeID: string,
+  options: WorktreeCleanupOptions = {},
+  signal?: AbortSignal
+): Promise<WorktreeBranchOutcome | null> {
+  const { data, error, response } = await apiClient.DELETE(
+    "/api/workspaces/{workspace_id}/worktrees/{worktree_id}",
+    {
+      params: {
+        path: { workspace_id: workspaceID, worktree_id: worktreeID },
+        query: cleanupQuery(options),
+      },
+      signal,
+    }
+  );
+  if (apiRequestFailed(response, error)) {
+    throw new WorktreeApiError(
+      defaultApiErrorMessage("Failed to remove worktree", response, error),
+      response.status,
+      error
+    );
+  }
+  return data?.branch ?? null;
+}
+
+/**
+ * Removes a Git-only (discovered) checkout by the path exactly as the listing
+ * reports it; a stale entry only loses its Git metadata and its branch is kept.
+ * Without `force`, a dirty or unpushed checkout refuses with the same 409 risk
+ * payload as record removal.
+ */
+export async function removeDiscoveredWorktree(
+  workspaceID: string,
+  path: string,
+  options: { force?: boolean; expectStale?: boolean } = {},
+  signal?: AbortSignal
+): Promise<void> {
+  const { error, response } = await apiClient.POST(
+    "/api/workspaces/{workspace_id}/worktrees/discovered/remove",
+    {
+      params: { path: { workspace_id: workspaceID } },
+      body: {
+        path,
+        force: options.force || undefined,
+        expect_stale: options.expectStale || undefined,
+      },
+      signal,
+    }
+  );
+  if (apiRequestFailed(response, error)) {
+    throw new WorktreeApiError(
+      defaultApiErrorMessage("Failed to remove discovered worktree", response, error),
+      response.status,
+      error
+    );
+  }
+}
+
+/**
+ * Drops the tombstone record only; sessions and run history are preserved.
+ * Git is touched only when `deleteBranch` opts into deleting the local branch.
+ */
+export async function dismissWorktree(
+  workspaceID: string,
+  worktreeID: string,
+  options: WorktreeCleanupOptions = {},
+  signal?: AbortSignal
+): Promise<WorktreeBranchOutcome | null> {
+  const { data, error, response } = await apiClient.POST(
+    "/api/workspaces/{workspace_id}/worktrees/{worktree_id}/dismiss",
+    {
+      params: {
+        path: { workspace_id: workspaceID, worktree_id: worktreeID },
+        query: cleanupQuery(options),
+      },
+      signal,
+    }
+  );
+  if (apiRequestFailed(response, error)) {
+    throw new WorktreeApiError(
+      defaultApiErrorMessage("Failed to dismiss worktree", response, error),
+      response.status,
+      error
+    );
+  }
+  return data?.branch ?? null;
+}

@@ -1,0 +1,234 @@
+package extensionpkg
+
+import (
+	"context"
+	"maps"
+
+	"slices"
+	"strings"
+
+	compozyconfig "github.com/compozy/compozy/internal/config"
+
+	"github.com/compozy/compozy/internal/store"
+)
+
+// Get returns the current snapshot for one installed extension.
+func (m *Manager) Get(name string) (*Extension, error) {
+	return m.GetForInstance(GlobalInstanceKey(name))
+}
+
+// GetForInstance resolves a workspace dev overlay before a visible published installation.
+func (m *Manager) GetForInstance(key InstanceKey) (*Extension, error) {
+	return m.getForInstance(context.Background(), key)
+}
+
+func (m *Manager) getForInstance(ctx context.Context, key InstanceKey) (*Extension, error) {
+	if m == nil {
+		return nil, ErrManagerRequired
+	}
+	key = key.Normalize()
+	if err := key.Validate(); err != nil {
+		return nil, err
+	}
+	sourceKey, development, err := m.readInstanceSource(ctx, key)
+	if err != nil {
+		return nil, err
+	}
+	m.mu.RLock()
+	ext := m.readInstanceLocked(key, sourceKey)
+	m.mu.RUnlock()
+	if ext != nil {
+		snapshot := m.cloneExtension(ext)
+		if development && m.registry != nil {
+			link, linkErr := m.registry.GetDevLink(key.Name, sourceKey.WorkspaceID)
+			if linkErr == nil {
+				snapshot.DevLink = link
+				_, publishedErr := m.registry.Get(key.Name)
+				snapshot.OverridesPublished = publishedErr == nil
+			}
+		}
+		return snapshot, nil
+	}
+	if m.registry == nil {
+		return nil, &ExtensionNotFoundError{Name: key.Name}
+	}
+	info, err := m.registry.Get(key.Name)
+	if err != nil {
+		return nil, err
+	}
+	return &Extension{
+		Info: *info,
+		Status: ExtensionStatus{
+			Name: info.Name, Version: info.Version, Source: info.Source, Enabled: info.Enabled,
+			WorkspaceID: sourceKey.WorkspaceID,
+		},
+	}, nil
+}
+
+// readInstanceSource retains the owning attachment instead of promoting a
+// package row to an installation in every workspace and profile.
+func (m *Manager) readInstanceSource(ctx context.Context, key InstanceKey) (InstanceKey, bool, error) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	return m.readInstanceSourceLocked(ctx, key)
+}
+
+func (m *Manager) readInstanceSourceLocked(ctx context.Context, key InstanceKey) (InstanceKey, bool, error) {
+	baseKey := key.Normalize()
+	baseKey.ProfileID = ""
+	development := !baseKey.IsGlobal() && m.devExtensions[baseKey] != nil
+	if development {
+		return baseKey, true, nil
+	}
+	if m.registry == nil {
+		return GlobalInstanceKey(key.Name), false, nil
+	}
+	profileID := key.ProfileID
+	if profileID == "" {
+		profileID = store.DefaultProfileID
+	}
+	installation, err := m.registry.ResolveInstallation(ctx, key.Name, InstallationScope{
+		ProfileID: profileID, WorkspaceID: key.WorkspaceID,
+	})
+	if err != nil {
+		return InstanceKey{}, false, err
+	}
+	return InstanceKey{Name: key.Name, ProfileID: installation.Scope.ProfileID,
+		WorkspaceID: installation.Scope.WorkspaceID}, false, nil
+}
+
+func (m *Manager) readInstanceLocked(view, source InstanceKey) *managedExtension {
+	if ext := m.instanceLocked(runtimeKeyForInstallation(view, source)); ext != nil {
+		return ext
+	}
+	return m.instanceLocked(source)
+}
+
+// Explicit default-profile attachments retain a profile runtime identity;
+// only all-profiles installations reuse the unqualified base process.
+func runtimeKeyForInstallation(view, source InstanceKey) InstanceKey {
+	if source.IsProfileScoped() {
+		return source
+	}
+	return ProfileInstanceKey(view.Name, view.ProfileID, source.WorkspaceID)
+}
+
+// ListForWorkspace returns the effective extension registry for one trusted workspace.
+func (m *Manager) ListForWorkspace(workspaceID string) []ExtensionInfo {
+	if m == nil {
+		return nil
+	}
+	workspaceID = strings.TrimSpace(workspaceID)
+	m.mu.RLock()
+	byName := make(map[string]*ExtensionInfo, len(m.extensions)+len(m.devExtensions))
+	developmentNames := make(map[string]struct{})
+	for name, ext := range m.extensions {
+		byName[name] = new(cloneExtensionInfo(&ext.info))
+	}
+	if workspaceID != "" {
+		for key, ext := range m.devExtensions {
+			if key.WorkspaceID == workspaceID {
+				byName[key.Name] = new(ext.info)
+				developmentNames[key.Name] = struct{}{}
+			}
+		}
+	}
+	m.mu.RUnlock()
+	var installedNames map[string]struct{}
+	if m.registry != nil {
+		// A failed authority read hides installed packages but retains the captured dev overlays.
+		names, err := m.registry.workspaceInstallationNames(context.Background(), workspaceID)
+		if err == nil {
+			installedNames = names
+		}
+	}
+	infos := make([]ExtensionInfo, 0, len(byName))
+	for _, info := range byName {
+		if m.registry != nil {
+			_, development := developmentNames[info.Name]
+			_, installed := installedNames[info.Name]
+			if !development && !installed {
+				continue
+			}
+		}
+		infos = append(infos, *info)
+	}
+	slices.SortFunc(infos, func(left, right ExtensionInfo) int {
+		return strings.Compare(left.Name, right.Name)
+	})
+	return infos
+}
+
+// StatusesForWorkspace returns effective status without leaking another workspace's dev instances.
+func (m *Manager) StatusesForWorkspace(workspaceID string) []ExtensionStatus {
+	infos := m.ListForWorkspace(workspaceID)
+	statuses := make([]ExtensionStatus, 0, len(infos))
+	for infoIndex := range infos {
+		snapshot, err := m.GetForInstance(InstanceKey{Name: infos[infoIndex].Name, WorkspaceID: workspaceID})
+		if err == nil {
+			statuses = append(statuses, snapshot.Status)
+		}
+	}
+	return statuses
+}
+
+// List returns every currently known registry row in name order.
+func (m *Manager) List() []ExtensionInfo {
+	if m == nil {
+		return nil
+	}
+
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+
+	infos := make([]ExtensionInfo, 0, len(m.extensions))
+	for _, ext := range m.extensions {
+		infos = append(infos, ext.info)
+	}
+	slices.SortFunc(infos, func(left, right ExtensionInfo) int {
+		return strings.Compare(left.Name, right.Name)
+	})
+	return infos
+}
+
+// Statuses returns the current runtime health snapshot for every known extension.
+func (m *Manager) Statuses() []ExtensionStatus {
+	if m == nil {
+		return nil
+	}
+
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+
+	statuses := make([]ExtensionStatus, 0, len(m.extensions))
+	for _, ext := range m.extensions {
+		statuses = append(statuses, m.statusLocked(ext))
+	}
+	slices.SortFunc(statuses, func(left, right ExtensionStatus) int {
+		return strings.Compare(left.Name, right.Name)
+	})
+	return statuses
+}
+
+// AgentDefinitions returns the currently registered extension agent definitions.
+func (m *Manager) AgentDefinitions() []compozyconfig.AgentDef {
+	if m == nil {
+		return nil
+	}
+
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+
+	var agents []compozyconfig.AgentDef
+	names := slices.Sorted(maps.Keys(m.extensions))
+	for _, name := range names {
+		ext := m.extensions[name]
+		if !ext.registered {
+			continue
+		}
+		for _, agent := range ext.agents {
+			agents = append(agents, compozyconfig.CloneAgentDef(agent))
+		}
+	}
+	return agents
+}

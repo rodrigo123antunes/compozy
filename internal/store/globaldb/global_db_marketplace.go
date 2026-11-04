@@ -1,0 +1,241 @@
+package globaldb
+
+import (
+	"context"
+	"database/sql"
+	"errors"
+	"fmt"
+
+	"github.com/compozy/compozy/internal/store"
+	"github.com/compozy/compozy/internal/store/globaldb/sqlcgen"
+)
+
+var _ store.MarketplaceCatalogRepository = (*MarketplaceRepo)(nil)
+
+// ReplaceMarketplaceCatalog atomically prunes and replaces one catalog source.
+func (r *MarketplaceRepo) ReplaceMarketplaceCatalog(
+	ctx context.Context,
+	replacement store.MarketplaceCatalogReplacement,
+) error {
+	if err := r.checkReady(ctx, "replace marketplace catalog"); err != nil {
+		return err
+	}
+	for _, entry := range replacement.Entries {
+		if entry.Source != replacement.Source {
+			return errors.New("store: marketplace entry source does not match replacement")
+		}
+	}
+	return r.writeBackground(ctx, "replace marketplace catalog", func(ctx context.Context, tx *store.WriteTx) error {
+		return replaceMarketplaceCatalog(ctx, sqlcgen.New(tx), replacement)
+	})
+}
+
+func replaceMarketplaceCatalog(
+	ctx context.Context,
+	queries *sqlcgen.Queries,
+	replacement store.MarketplaceCatalogReplacement,
+) error {
+	claimed, err := queries.ClaimMarketplaceCatalogGeneration(ctx, sqlcgen.ClaimMarketplaceCatalogGenerationParams{
+		Source: replacement.Source, SourceRef: replacement.SourceRef, Generation: replacement.Generation,
+	})
+	if err != nil {
+		return fmt.Errorf("store: claim marketplace source generation: %w", err)
+	}
+	if claimed != 1 {
+		return store.ErrMarketplaceCatalogGenerationStale
+	}
+	if err := queries.DeleteMarketplaceCatalogEntriesBySource(ctx, replacement.Source); err != nil {
+		return fmt.Errorf("store: prune marketplace catalog %q projection: %w", replacement.Source, err)
+	}
+	installable := int64(0)
+	for _, entry := range replacement.Entries {
+		if entry.Installable {
+			installable++
+		}
+		if err := insertMarketplaceCatalogEntry(ctx, queries, entry); err != nil {
+			return err
+		}
+	}
+	kind, diagnostics := replacement.Kind, replacement.DiagnosticsJSON
+	if kind == "" {
+		kind = "feed"
+	}
+	if diagnostics == "" {
+		diagnostics = "[]"
+	}
+	if err := queries.UpsertMarketplaceCatalogStateFresh(ctx, sqlcgen.UpsertMarketplaceCatalogStateFreshParams{
+		SourceRef: replacement.SourceRef, KindOfSource: kind, DocumentDigest: replacement.DocumentDigest,
+		DocumentPath: replacement.DocumentPath, Owner: replacement.Owner, DiagnosticsJson: diagnostics,
+		Source:          replacement.Source,
+		Generation:      replacement.Generation,
+		Revision:        replacement.Revision,
+		Plugins:         int64(len(replacement.Entries)),
+		Installable:     installable,
+		ManifestVersion: replacement.ManifestVersion,
+		GeneratedAt:     marketplaceCatalogNullString(replacement.GeneratedAt),
+		FetchedAt:       replacement.FetchedAt,
+	}); err != nil {
+		return fmt.Errorf("store: upsert marketplace catalog %q state: %w", replacement.Source, err)
+	}
+	return nil
+}
+
+// MarkMarketplaceCatalogStale records a refresh failure without changing entries.
+func (r *MarketplaceRepo) MarkMarketplaceCatalogStale(
+	ctx context.Context, source string, generation int64, errorClass, lastError string,
+) error {
+	if err := r.checkReady(ctx, "mark marketplace catalog stale"); err != nil {
+		return err
+	}
+	changed, err := executeWriteQueryResult(
+		ctx,
+		r.repoBase,
+		"globaldb.MarkMarketplaceCatalogStateStale",
+		func(ctx context.Context, queries *sqlcgen.Queries) (int64, error) {
+			return queries.MarkMarketplaceCatalogStateStale(ctx, sqlcgen.MarkMarketplaceCatalogStateStaleParams{
+				Source: source, Generation: generation, ErrorClass: errorClass, LastError: lastError,
+			})
+		},
+	)
+	if err != nil {
+		return fmt.Errorf("store: mark marketplace catalog %q stale: %w", source, err)
+	}
+	if changed != 1 {
+		return store.ErrMarketplaceCatalogGenerationStale
+	}
+	return nil
+}
+
+// ListMarketplaceCatalogEntries returns deterministic filtered projections.
+func (r *MarketplaceRepo) ListMarketplaceCatalogEntries(
+	ctx context.Context,
+	source string,
+	limit int64,
+) ([]store.MarketplaceCatalogEntry, error) {
+	if err := r.checkReady(ctx, "list marketplace catalog entries"); err != nil {
+		return nil, err
+	}
+	rows, err := r.readQueries.ListMarketplaceCatalogEntries(ctx, sqlcgen.ListMarketplaceCatalogEntriesParams{
+		Source:      source,
+		ResultLimit: limit,
+	})
+	if err != nil {
+		return nil, fmt.Errorf("store: list marketplace catalog %q entries: %w", source, err)
+	}
+	entries := make([]store.MarketplaceCatalogEntry, 0, len(rows))
+	for _, row := range rows {
+		entries = append(entries, marketplaceCatalogEntryFromRow(row))
+	}
+	return entries, nil
+}
+
+// GetMarketplaceCatalogEntry returns one projection by source and entry identity.
+func (r *MarketplaceRepo) GetMarketplaceCatalogEntry(
+	ctx context.Context,
+	source string,
+	entryID string,
+) (store.MarketplaceCatalogEntry, error) {
+	if err := r.checkReady(ctx, "get marketplace catalog entry"); err != nil {
+		return store.MarketplaceCatalogEntry{}, err
+	}
+	row, err := r.readQueries.GetMarketplaceCatalogEntry(ctx, sqlcgen.GetMarketplaceCatalogEntryParams{
+		Source:  source,
+		EntryID: entryID,
+	})
+	if err != nil {
+		return store.MarketplaceCatalogEntry{}, fmt.Errorf(
+			"store: get marketplace catalog %q entry %q: %w",
+			source,
+			entryID,
+			err,
+		)
+	}
+	return marketplaceCatalogEntryFromRow(row), nil
+}
+
+// GetMarketplaceCatalogState returns persisted freshness plus the projected count.
+func (r *MarketplaceRepo) GetMarketplaceCatalogState(
+	ctx context.Context,
+	source string,
+) (store.MarketplaceCatalogState, error) {
+	if err := r.checkReady(ctx, "get marketplace catalog state"); err != nil {
+		return store.MarketplaceCatalogState{}, err
+	}
+	row, err := r.readQueries.GetMarketplaceCatalogState(ctx, source)
+	if err != nil {
+		return store.MarketplaceCatalogState{}, fmt.Errorf("store: get marketplace catalog %q state: %w", source, err)
+	}
+	return marketplaceCatalogStateFromRow(row), nil
+}
+
+func marketplaceCatalogStateFromRow(row sqlcgen.GetMarketplaceCatalogStateRow) store.MarketplaceCatalogState {
+	return store.MarketplaceCatalogState{
+		SourceRef: row.SourceRef, Kind: row.KindOfSource, Enabled: row.Enabled != 0,
+		DocumentDigest: row.DocumentDigest, DocumentPath: row.DocumentPath, Owner: row.Owner,
+		DiagnosticsJSON: row.DiagnosticsJson, Installable: row.Installable, ErrorClass: row.ErrorClass,
+		Source:          row.Source,
+		Generation:      row.Generation,
+		Revision:        row.Revision,
+		ManifestVersion: row.ManifestVersion,
+		GeneratedAt:     row.GeneratedAt.String,
+		FetchedAt:       row.FetchedAt,
+		Stale:           row.Stale != 0,
+		LastError:       row.LastError,
+		EntryCount:      row.EntryCount,
+	}
+}
+
+func insertMarketplaceCatalogEntry(
+	ctx context.Context,
+	queries *sqlcgen.Queries,
+	entry store.MarketplaceCatalogEntry,
+) error {
+	if err := queries.InsertMarketplaceCatalogEntry(ctx, sqlcgen.InsertMarketplaceCatalogEntryParams{
+		Source:         entry.Source,
+		Layout:         entry.Layout,
+		Icon:           entry.Icon,
+		Installable:    int64(boolToInt(entry.Installable)),
+		InstallBlocker: entry.InstallBlocker,
+		ResolvedRef:    entry.ResolvedRef,
+		EntryID:        entry.EntryID,
+		Name:           entry.Name,
+		Description:    entry.Description,
+		Version:        entry.Version,
+		PublishedAt:    marketplaceCatalogNullString(entry.PublishedAt),
+		UpdatedAt:      marketplaceCatalogNullString(entry.UpdatedAt),
+		DigestSha256:   marketplaceCatalogNullString(entry.DigestSHA256),
+		Tier:           marketplaceCatalogNullString(entry.Tier),
+		InstallSlug:    marketplaceCatalogNullString(entry.InstallSlug),
+		PayloadJson:    entry.PayloadJSON,
+		FetchedAt:      entry.FetchedAt,
+	}); err != nil {
+		return fmt.Errorf("store: insert marketplace catalog %q entry %q: %w", entry.Source, entry.EntryID, err)
+	}
+	return nil
+}
+
+func marketplaceCatalogEntryFromRow(row sqlcgen.MarketplaceCatalogEntry) store.MarketplaceCatalogEntry {
+	return store.MarketplaceCatalogEntry{
+		Source:         row.Source,
+		Layout:         row.Layout,
+		Icon:           row.Icon,
+		Installable:    row.Installable != 0,
+		InstallBlocker: row.InstallBlocker,
+		ResolvedRef:    row.ResolvedRef,
+		EntryID:        row.EntryID,
+		Name:           row.Name,
+		Description:    row.Description,
+		Version:        row.Version,
+		PublishedAt:    row.PublishedAt.String,
+		UpdatedAt:      row.UpdatedAt.String,
+		DigestSHA256:   row.DigestSha256.String,
+		Tier:           row.Tier.String,
+		InstallSlug:    row.InstallSlug.String,
+		PayloadJSON:    row.PayloadJson,
+		FetchedAt:      row.FetchedAt,
+	}
+}
+
+func marketplaceCatalogNullString(value string) sql.NullString {
+	return store.SQLNullString(value)
+}

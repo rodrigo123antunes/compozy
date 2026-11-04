@@ -1,0 +1,247 @@
+package daemon
+
+import (
+	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"strings"
+	"time"
+
+	"github.com/compozy/compozy/internal/acp"
+	"github.com/compozy/compozy/internal/api/contract"
+	compozyconfig "github.com/compozy/compozy/internal/config"
+	eventspkg "github.com/compozy/compozy/internal/events"
+	speedpkg "github.com/compozy/compozy/internal/speed"
+	"github.com/compozy/compozy/internal/store"
+)
+
+const (
+	roleResolutionFailedCode = contract.CodeRoleResolutionFailed
+	roleEventWriteTimeout    = 5 * time.Second
+)
+
+type roleEventSummaryWriter interface {
+	WriteEventSummary(context.Context, store.EventSummary) error
+}
+
+type roleInvocationCorrelation struct {
+	ProfileID       string
+	WorkspaceID     string
+	SessionID       string
+	AgentName       string
+	ParentSessionID string
+	RootSessionID   string
+	SpawnDepth      int
+	Event           store.EventCorrelation
+}
+
+type roleInvocationCorrelationContextKey struct{}
+
+type roleAttemptRoute struct {
+	AgentName       string
+	Provider        string
+	Model           string
+	ReasoningEffort string
+	Speed           speedpkg.Speed
+	ACPOptions      []compozyconfig.ACPOptionSelection
+	// Command is the route's account; it is forwarded to the consumer's Command field
+	// and never written to events or logs (only its fingerprint is).
+	Command    string
+	SessionEnv compozyconfig.SessionEnv
+}
+
+type roleFallbackEventPayload struct {
+	Role                       string `json:"role"`
+	Attempt                    int    `json:"attempt"`
+	Provider                   string `json:"provider"`
+	Model                      string `json:"model"`
+	ProviderCommandFingerprint string `json:"provider_command_fingerprint,omitempty"`
+}
+
+type roleResolveErrorEventPayload struct {
+	Role      string `json:"role"`
+	ErrorCode string `json:"error_code"`
+	Agent     string `json:"agent,omitempty"`
+}
+
+func withRoleInvocationCorrelation(ctx context.Context, correlation roleInvocationCorrelation) context.Context {
+	return context.WithValue(ctx, roleInvocationCorrelationContextKey{}, correlation)
+}
+
+func roleInvocationCorrelationFromContext(ctx context.Context, workspaceID string) roleInvocationCorrelation {
+	correlation := roleInvocationCorrelation{WorkspaceID: strings.TrimSpace(workspaceID)}
+	if ctx == nil {
+		return correlation
+	}
+	stored, ok := ctx.Value(roleInvocationCorrelationContextKey{}).(roleInvocationCorrelation)
+	if !ok {
+		return correlation
+	}
+	stored.WorkspaceID = firstRoleValue(stored.WorkspaceID, workspaceID)
+	return stored
+}
+
+// invokeRoleWithFallback owns the role's chain (session.ChainOwnerCaller for every
+// launch it makes). Each callback reports acceptance as
+// session.StartAccepted(err) || value != nil; an accepted attempt ends the chain even
+// when it returned an error.
+func (role *ResolvedRole) invokeRoleWithFallback[T any](
+	ctx context.Context,
+	correlation roleInvocationCorrelation,
+	invoke func(context.Context, roleAttemptRoute) (T, bool, error),
+) (T, error) {
+	var zero T
+	if role == nil {
+		return zero, errors.New("daemon: resolved role is required")
+	}
+	if invoke == nil {
+		return zero, errors.New("daemon: role invocation callback is required")
+	}
+	primary := roleAttemptRoute{
+		AgentName:       strings.TrimSpace(role.AgentName),
+		Provider:        strings.TrimSpace(role.Provider),
+		Model:           strings.TrimSpace(role.Model),
+		ReasoningEffort: strings.TrimSpace(role.ReasoningEffort),
+		Speed:           role.speedValue(),
+		ACPOptions:      compozyconfig.CloneACPOptionSelections(role.acpOptionsValue()),
+	}
+	value, accepted, err := invoke(ctx, primary)
+	if accepted {
+		return value, err
+	}
+	attemptErrors := []error{roleAttemptError(role.Role, 0, err)}
+	for index, fallback := range role.Fallbacks {
+		route := roleAttemptRoute{
+			AgentName:       primary.AgentName,
+			Provider:        strings.TrimSpace(fallback.Provider),
+			Model:           strings.TrimSpace(fallback.Model),
+			ReasoningEffort: strings.TrimSpace(fallback.ReasoningEffort),
+			Speed:           fallback.Speed,
+			ACPOptions:      compozyconfig.CloneACPOptionSelections(fallback.ACPOptions),
+			Command:         strings.TrimSpace(fallback.Command),
+			SessionEnv:      compozyconfig.MergeSessionEnv(nil, fallback.SessionEnv),
+		}
+		attempt := index + 1
+		if eventErr := recordRoleFallbackEvent(ctx, role, correlation, attempt, route); eventErr != nil {
+			return zero, errors.Join(append(attemptErrors, eventErr)...)
+		}
+		value, accepted, err = invoke(ctx, route)
+		if accepted {
+			return value, err
+		}
+		attemptErrors = append(attemptErrors, roleAttemptError(role.Role, attempt, err))
+	}
+	return zero, fmt.Errorf(
+		"daemon: %s role invocation exhausted %d attempt(s): %w",
+		role.Role,
+		len(role.Fallbacks)+1,
+		errors.Join(attemptErrors...),
+	)
+}
+
+// errProviderRefusedTurn marks a turn the provider refused before the agent
+// produced any output, so a remaining fallback route may still run it.
+var errProviderRefusedTurn = errors.New("daemon: provider refused the turn before any output")
+
+// providerRefusedTurnError joins errProviderRefusedTurn onto err when the error
+// event carries a provider refusal ACP already classified.
+func providerRefusedTurnError(event acp.AgentEvent, err error) error {
+	if err == nil || event.ProviderError == nil {
+		return err
+	}
+	switch event.ProviderError.Code {
+	case acp.ProviderErrorAuthRequired, acp.ProviderErrorRateLimited:
+		return errors.Join(errProviderRefusedTurn, err)
+	default:
+		return err
+	}
+}
+
+func roleAttemptError(role compozyconfig.RoleName, attempt int, err error) error {
+	if err == nil {
+		err = errors.New("invocation returned without acceptance")
+	}
+	return fmt.Errorf("%s role attempt %d failed before acceptance: %w", role, attempt, err)
+}
+
+func recordRoleFallbackEvent(
+	ctx context.Context,
+	role *ResolvedRole,
+	correlation roleInvocationCorrelation,
+	attempt int,
+	route roleAttemptRoute,
+) error {
+	if role == nil || role.eventWriter == nil {
+		return nil
+	}
+	content, err := json.Marshal(roleFallbackEventPayload{
+		Role: string(role.Role), Attempt: attempt, Provider: route.Provider, Model: route.Model,
+		ProviderCommandFingerprint: compozyconfig.CommandFingerprint(route.Command),
+	})
+	if err != nil {
+		return fmt.Errorf("daemon: marshal role fallback event: %w", err)
+	}
+	eventCtx, cancel := detachedDaemonOperationContext(ctx, roleEventWriteTimeout)
+	defer cancel()
+	if err := role.eventWriter.WriteEventSummary(eventCtx, daemonEventSummary(store.EventSummary{
+		ProfileID: roleEventProfileID(correlation),
+		SessionID: correlation.SessionID, WorkspaceID: correlation.WorkspaceID,
+		Type: eventspkg.RoleFallbackUsed, AgentName: firstRoleValue(correlation.AgentName, route.AgentName),
+		Outcome:          string(eventspkg.OutcomeFor(eventspkg.RoleFallbackUsed)),
+		EventCorrelation: correlation.Event, ParentSessionID: correlation.ParentSessionID,
+		RootSessionID: correlation.RootSessionID, SpawnDepth: correlation.SpawnDepth,
+		Summary: fmt.Sprintf("%s role fallback attempt %d", role.Role, attempt),
+	}, content)); err != nil {
+		return fmt.Errorf("daemon: record %s: %w", eventspkg.RoleFallbackUsed, err)
+	}
+	return nil
+}
+
+func (r *roleResolver) recordRoleResolveError(
+	ctx context.Context,
+	workspaceID string,
+	role compozyconfig.RoleName,
+	resolveErr error,
+) error {
+	if r == nil || r.events == nil || resolveErr == nil {
+		return nil
+	}
+	correlation := roleInvocationCorrelationFromContext(ctx, workspaceID)
+	errorCode := roleResolutionFailedCode
+	agentName := ""
+	if resolutionErr, ok := errors.AsType[*RoleResolutionError](resolveErr); ok {
+		errorCode = firstRoleValue(resolutionErr.Code, errorCode)
+		agentName = strings.TrimSpace(resolutionErr.Agent)
+	}
+	content, err := json.Marshal(roleResolveErrorEventPayload{
+		Role: string(role), ErrorCode: errorCode, Agent: agentName,
+	})
+	if err != nil {
+		return fmt.Errorf("daemon: marshal role resolution event: %w", err)
+	}
+	eventCtx, cancel := detachedDaemonOperationContext(ctx, roleEventWriteTimeout)
+	defer cancel()
+	if err := r.events.WriteEventSummary(eventCtx, daemonEventSummary(store.EventSummary{
+		ProfileID: roleEventProfileID(correlation),
+		SessionID: correlation.SessionID, WorkspaceID: correlation.WorkspaceID,
+		Type: eventspkg.RoleResolveError, AgentName: firstRoleValue(correlation.AgentName, agentName),
+		Outcome:          string(eventspkg.OutcomeFor(eventspkg.RoleResolveError)),
+		EventCorrelation: correlation.Event, ParentSessionID: correlation.ParentSessionID,
+		RootSessionID: correlation.RootSessionID, SpawnDepth: correlation.SpawnDepth,
+		Summary: fmt.Sprintf("%s role resolution failed: %s", role, errorCode),
+	}, content)); err != nil {
+		return fmt.Errorf("daemon: record %s: %w", eventspkg.RoleResolveError, err)
+	}
+	return nil
+}
+
+func roleEventProfileID(correlation roleInvocationCorrelation) string {
+	if profileID := strings.TrimSpace(correlation.ProfileID); profileID != "" {
+		return profileID
+	}
+	if strings.TrimSpace(correlation.SessionID) != "" {
+		return ""
+	}
+	return store.DefaultProfileID
+}

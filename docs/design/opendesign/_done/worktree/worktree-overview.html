@@ -1,0 +1,347 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="color-scheme" content="dark">
+<title>Workspaces overview · worktrees · CompozyOS</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Geist:wght@400..700&family=JetBrains+Mono:wght@400..700&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="../design-system/ds-core.css">
+<link rel="stylesheet" href="worktree.css">
+<!--
+  worktree-overview · S3 — full-screen workspace cards + Worktrees hover trigger.
+  Spec: .compozy/tasks/worktree-support/_uiux.md §S3 · story US-010.
+  Provenance:
+    production            — os-workspaces-overview.tsx: full-screen overlay, 264px cards
+                            (monogram, name, Current pill, agents · sessions · worktrees,
+                            members, root_dir + Enter), New workspace as the single primary.
+                            Git-backed cards expose a sibling Worktrees trigger because the
+                            card is a button. Hover opens WorktreeHoverSubmenu (320px, right).
+    spec worktree-support — adopted-only counts; same WorktreeSubmenuPanel as S1/S2
+    authorized delta      — artboard restages the overlay inside .scrim--demo; members
+                            show claude + overflow (3 agents). workspaces/ Command-Tab
+                            tiles are a different surface and stay out of this file.
+-->
+<style>
+  a{color:inherit;text-decoration:none}
+  .page{max-width:1120px}
+  .ov-note{font-size:11px;line-height:1.55;color:var(--subtle);max-width:66ch;margin:0 0 14px}
+  .ov-note b{display:block;font-size:11.5px;font-weight:600;color:var(--fg);margin-bottom:2px}
+  .ov-mono{width:28px;height:28px;border-radius:var(--radius-sm);display:grid;place-items:center;
+    background:var(--elevated);border:1px solid var(--line-strong);color:var(--muted);
+    font-family:var(--font-mono);font-size:9.5px;font-weight:600;letter-spacing:.04em}
+  .cur{flex:none;font-size:9.5px;font-weight:600;color:var(--subtle);background:var(--badge-fill);border-radius:var(--radius-xs);padding:1px 6px}
+</style>
+</head>
+<body>
+<div class="shell"><div class="main">
+
+  <header class="w2head" data-od-id="wt-overview-head">
+    <a class="w2-back" href="index.html" aria-label="Back to worktree set"><svg data-lucide="chevron-left"></svg></a>
+    <nav class="w2-crumbs">
+      <a class="w2-crumb" href="index.html">Worktrees</a>
+      <span class="w2-sep">/</span>
+      <span class="w2-title">Workspaces overview</span>
+    </nav>
+    <div class="w2-flex"></div>
+    <div class="w2-actions">
+      <a class="btn" href="worktree-menubar-menu.html">← Menubar</a>
+      <a class="btn" href="worktree-create-dialog.html">Create dialog →</a>
+    </div>
+  </header>
+
+  <div class="scroll"><div class="page">
+
+    <section class="lab-sec" data-od-id="s3-full">
+      <div class="lab-sec__head"><span class="lab-sec__num">01</span><h2 class="lab-sec__t">Overview — Worktrees open</h2>
+        <span class="lab-sec__gist">264px cards · sibling trigger · 320px panel</span></div>
+      <p class="ov-note"><b>Production overlay</b>Cards match <code>os-workspaces-overview.tsx</code>. Click on a card enters the workspace. Git-backed cards keep a sibling <b>Worktrees</b> trigger — hover opens the same panel as S1/S2. notes has no git, so no trigger. “New workspace” is the only primary; “New worktree” lives inside the panel.</p>
+
+      <div class="scrim--demo scrim">
+        <div class="ov-stage" data-od-id="ov-dialog">
+          <div class="ov-head">
+            <div>
+              <h3 id="ov-title">Workspaces</h3>
+              <p data-od-id="ov-subtitle">3 workspaces · 3 agents · 7 worktrees</p>
+            </div>
+            <button class="btn btn--primary" data-od-id="ov-new-workspace"><svg data-lucide="plus"></svg>New workspace</button>
+          </div>
+          <div class="ov-cards">
+
+            <div class="wt-fly" data-wt-fly>
+              <div class="ov-group">
+                <button class="ov-card" data-current data-od-id="ov-ws-compozy" type="button" aria-label="Current workspace compozy. 3 agents · 5 sessions · 7 worktrees">
+                  <span class="ov-card__top">
+                    <span class="ov-mono">CO</span>
+                    <span class="ov-card__name">compozy</span>
+                    <span class="cur">Current</span>
+                  </span>
+                  <span class="ov-card__meta" data-od-id="ov-count-compozy">3 agents · 5 sessions · 7 worktrees</span>
+                  <span class="ov-card__members">
+                    <span class="eyebrow">Members</span>
+                    <span class="ov-avs">
+                      <span class="ov-av" title="claude">C</span>
+                      <span class="ov-av-more">+2</span>
+                    </span>
+                  </span>
+                  <span class="ov-card__foot">
+                    <span class="ov-card__path">~/dev/compozy</span>
+                    <span class="ov-card__enter">Enter<svg data-lucide="arrow-right"></svg></span>
+                  </span>
+                </button>
+                <button class="wt-trig" data-wt-host="compozy" aria-haspopup="menu" aria-expanded="true" aria-label="Worktrees in compozy" data-od-id="ov-wt-compozy">
+                  <svg data-lucide="chevron-right"></svg>
+                  Worktrees
+                  <span class="wt-agg"><span class="d d--run d--pulse"></span>1 active</span>
+                </button>
+              </div>
+              <div class="wt-sub" role="menu" aria-label="Worktrees in compozy" data-wt-sub="compozy" data-od-id="ov-sub-compozy">
+                <div class="wt-sub-row">
+                  <div class="wt-row" role="menuitemradio">
+                    <span class="d d--ok" title="ready"></span>
+                    <span class="wt-row__main">
+                      <span class="wt-row__name"><b>payments-retry</b></span>
+                      <span class="wt-row__line2"><span class="wt-row__path">~/.compozy/worktrees/compozy/payments-retry</span></span>
+                    </span>
+                    <span class="wt-row__trail"><span class="wt-agent"><span class="d d--run d--pulse"></span></span></span>
+                  </div>
+                  <button class="wt-more" aria-label="Actions for payments-retry"><svg data-lucide="ellipsis"></svg></button>
+                </div>
+                <div class="wt-sub-row">
+                  <div class="wt-row" role="menuitemradio">
+                    <span class="d d--ok" title="ready"></span>
+                    <span class="wt-row__main">
+                      <span class="wt-row__name"><b>auth-refresh</b></span>
+                      <span class="wt-row__line2"><span class="wt-row__path">~/.compozy/worktrees/compozy/auth-refresh</span></span>
+                    </span>
+                    <span class="wt-row__trail"><span class="wt-ab"><span class="behind" data-hot>2</span></span></span>
+                  </div>
+                  <button class="wt-more" aria-label="Actions for auth-refresh"><svg data-lucide="ellipsis"></svg></button>
+                </div>
+                <div class="wt-sub-row">
+                  <div class="wt-row" role="menuitemradio">
+                    <span class="d d--ok" title="ready"></span>
+                    <span class="wt-row__main">
+                      <span class="wt-row__name"><b>data-migration</b></span>
+                      <span class="wt-row__line2"><span class="wt-row__path">~/.compozy/worktrees/compozy/data-migration</span></span>
+                    </span>
+                    <span class="wt-row__trail"><span class="wt-flag" aria-label="Setup failed"><svg data-lucide="triangle-alert"></svg></span></span>
+                  </div>
+                  <button class="wt-more" aria-label="Actions for data-migration"><svg data-lucide="ellipsis"></svg></button>
+                </div>
+                <div class="wt-sub-row">
+                  <div class="wt-row" role="menuitemradio">
+                    <span class="d d--ok" title="ready"></span>
+                    <span class="wt-row__main">
+                      <span class="wt-row__name"><b>fix-flaky-e2e</b></span>
+                      <span class="wt-row__line2"><span class="wt-row__path">~/.compozy/worktrees/compozy/fix-flaky-e2e</span></span>
+                    </span>
+                    <span class="wt-row__trail"><span class="wt-merged"><svg data-lucide="git-merge"></svg>Merged</span></span>
+                  </div>
+                  <button class="wt-more" aria-label="Actions for fix-flaky-e2e"><svg data-lucide="ellipsis"></svg></button>
+                </div>
+                <div class="wt-sub-row">
+                  <div class="wt-row" data-inert aria-disabled="true">
+                    <span class="wt-dot" data-state="pending"></span>
+                    <span class="wt-row__main">
+                      <span class="wt-row__name"><b>docs-refresh</b></span>
+                      <span class="wt-row__line2">
+                        <span class="wt-row__path">~/.compozy/worktrees/compozy/docs-refresh</span>
+                        <span class="wt-chip" data-state="pending">pending</span>
+                      </span>
+                    </span>
+                    <span class="wt-row__trail"><span class="wt-inert-why">materializing</span></span>
+                  </div>
+                  <button class="wt-more" aria-label="Actions for docs-refresh"><svg data-lucide="ellipsis"></svg></button>
+                </div>
+                <a class="wt-sub-foot" href="#s3-full"><svg data-lucide="ellipsis"></svg>All 7 worktrees</a>
+                <div class="wt-sub-sep"></div>
+                <a class="wt-sub-foot" href="worktree-create-dialog.html" data-od-id="ov-new-wt-compozy"><svg data-lucide="plus"></svg>New worktree</a>
+              </div>
+            </div>
+
+            <div class="wt-fly" data-wt-fly>
+              <div class="ov-group">
+                <button class="ov-card" data-od-id="ov-ws-branas" type="button" aria-label="Switch to branas-site. 1 agent · 2 sessions">
+                  <span class="ov-card__top">
+                    <span class="ov-mono">BR</span>
+                    <span class="ov-card__name">branas-site</span>
+                  </span>
+                  <span class="ov-card__meta">1 agent · 2 sessions</span>
+                  <span class="ov-card__foot">
+                    <span class="ov-card__path">~/dev/branas/site</span>
+                    <span class="ov-card__enter">Enter<svg data-lucide="arrow-right"></svg></span>
+                  </span>
+                </button>
+                <button class="wt-trig" data-wt-host="branas" aria-haspopup="menu" aria-expanded="false" aria-label="Worktrees in branas-site">
+                  <svg data-lucide="chevron-right"></svg>
+                  Worktrees
+                </button>
+              </div>
+              <div class="wt-sub" role="menu" aria-label="Worktrees in branas-site" data-wt-sub="branas" hidden>
+                <a class="wt-sub-foot" href="worktree-create-dialog.html"><svg data-lucide="plus"></svg>New worktree</a>
+              </div>
+            </div>
+
+            <div class="ov-group">
+              <button class="ov-card" data-od-id="ov-ws-notes" type="button" aria-label="Switch to notes. 1 session">
+                <span class="ov-card__top">
+                  <span class="ov-mono">NO</span>
+                  <span class="ov-card__name">notes</span>
+                </span>
+                <span class="ov-card__meta">1 session</span>
+                <span class="ov-card__foot">
+                  <span class="ov-card__path">~/notes</span>
+                  <span class="ov-card__enter">Enter<svg data-lucide="arrow-right"></svg></span>
+                </span>
+              </button>
+            </div>
+
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <section class="lab-sec" data-od-id="s3-resting">
+      <div class="lab-sec__head"><span class="lab-sec__num">02</span><h2 class="lab-sec__t">Resting — trigger closed</h2>
+        <span class="lab-sec__gist">no expand/collapse · trigger stays on git-backed cards</span></div>
+      <p class="ov-note"><b>Closed state</b>There is no nest under the card. The Worktrees trigger stays visible on git-backed cards and carries the live-agent aggregate. branas-site has zero activity — chevron + label only. notes is the card alone.</p>
+
+      <div class="scrim--demo scrim">
+        <div class="ov-stage" data-od-id="ov-dialog-resting">
+          <div class="ov-head">
+            <div>
+              <h3 id="ov-title-2">Workspaces</h3>
+              <p>3 workspaces · 3 agents · 7 worktrees</p>
+            </div>
+            <button class="btn btn--primary"><svg data-lucide="plus"></svg>New workspace</button>
+          </div>
+          <div class="ov-cards">
+            <div class="ov-group">
+              <button class="ov-card" data-current type="button">
+                <span class="ov-card__top">
+                  <span class="ov-mono">CO</span>
+                  <span class="ov-card__name">compozy</span>
+                  <span class="cur">Current</span>
+                </span>
+                <span class="ov-card__meta">3 agents · 5 sessions · 7 worktrees</span>
+                <span class="ov-card__foot">
+                  <span class="ov-card__path">~/dev/compozy</span>
+                  <span class="ov-card__enter">Enter<svg data-lucide="arrow-right"></svg></span>
+                </span>
+              </button>
+              <button class="wt-trig" aria-haspopup="menu" aria-expanded="false" aria-label="Worktrees in compozy">
+                <svg data-lucide="chevron-right"></svg>
+                Worktrees
+                <span class="wt-agg"><span class="d d--run d--pulse"></span>1 active</span>
+              </button>
+            </div>
+            <div class="ov-group">
+              <button class="ov-card" type="button">
+                <span class="ov-card__top">
+                  <span class="ov-mono">BR</span>
+                  <span class="ov-card__name">branas-site</span>
+                </span>
+                <span class="ov-card__meta">1 agent · 2 sessions</span>
+                <span class="ov-card__foot">
+                  <span class="ov-card__path">~/dev/branas/site</span>
+                  <span class="ov-card__enter">Enter<svg data-lucide="arrow-right"></svg></span>
+                </span>
+              </button>
+              <button class="wt-trig" aria-haspopup="menu" aria-expanded="false" aria-label="Worktrees in branas-site">
+                <svg data-lucide="chevron-right"></svg>
+                Worktrees
+              </button>
+            </div>
+            <div class="ov-group">
+              <button class="ov-card" type="button">
+                <span class="ov-card__top">
+                  <span class="ov-mono">NO</span>
+                  <span class="ov-card__name">notes</span>
+                </span>
+                <span class="ov-card__meta">1 session</span>
+                <span class="ov-card__foot">
+                  <span class="ov-card__path">~/notes</span>
+                  <span class="ov-card__enter">Enter<svg data-lucide="arrow-right"></svg></span>
+                </span>
+              </button>
+            </div>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <section class="lab-sec" data-od-id="s3-discovered">
+      <div class="lab-sec__head"><span class="lab-sec__num">03</span><h2 class="lab-sec__t">Discovered-only repo</h2>
+        <span class="lab-sec__gist">first scan · no adopted count · Adopt in the panel</span></div>
+      <p class="ov-note"><b>Before adoption</b>compozy at first scan: one external worktree, nothing adopted. The count stays off the card (adopted only). The trigger still opens the panel; Adopt (or selecting the row) opens the S1 §05 confirm.</p>
+
+      <div class="scrim--demo scrim">
+        <div class="ov-stage" data-od-id="ov-dialog-discovered">
+          <div class="ov-head">
+            <div>
+              <h3 id="ov-title-3">Workspaces</h3>
+              <p>1 workspace · 3 agents</p>
+            </div>
+            <button class="btn btn--primary"><svg data-lucide="plus"></svg>New workspace</button>
+          </div>
+          <div class="ov-cards">
+            <div class="wt-fly" data-wt-static>
+              <div class="ov-group">
+                <button class="ov-card" data-current data-od-id="ov-ws-discovered-only" type="button">
+                  <span class="ov-card__top">
+                    <span class="ov-mono">CO</span>
+                    <span class="ov-card__name">compozy</span>
+                    <span class="cur">Current</span>
+                  </span>
+                  <span class="ov-card__meta">3 agents · 5 sessions</span>
+                  <span class="ov-card__foot">
+                    <span class="ov-card__path">~/dev/compozy</span>
+                    <span class="ov-card__enter">Enter<svg data-lucide="arrow-right"></svg></span>
+                  </span>
+                </button>
+                <button class="wt-trig" data-wt-host="compozy-disc" aria-haspopup="menu" aria-expanded="true" aria-label="Worktrees in compozy">
+                  <svg data-lucide="chevron-right"></svg>
+                  Worktrees
+                </button>
+              </div>
+              <div class="wt-sub" role="menu" aria-label="Worktrees in compozy" data-wt-sub="compozy-disc">
+                <div class="wt-sub-row">
+                  <div class="wt-row" data-state="discovered" role="menuitemradio">
+                    <span class="wt-dot" data-state="discovered"></span>
+                    <span class="wt-row__main">
+                      <span class="wt-row__name"><b>spike-sqlite-vacuum</b></span>
+                      <span class="wt-row__line2">
+                        <span class="wt-row__path">../compozy-spike</span>
+                        <span class="wt-chip" data-state="discovered">discovered</span>
+                      </span>
+                    </span>
+                    <span class="wt-row__trail"><span class="wt-adopt">Adopt</span></span>
+                  </div>
+                  <button class="wt-more" aria-label="Actions for spike-sqlite-vacuum"><svg data-lucide="ellipsis"></svg></button>
+                </div>
+                <div class="wt-sub-sep"></div>
+                <a class="wt-sub-foot" href="worktree-create-dialog.html"><svg data-lucide="plus"></svg>New worktree</a>
+              </div>
+            </div>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <p style="font-size:11px;color:var(--faint);border-top:1px solid var(--line);padding-top:14px;max-width:66ch">
+      S3 of the worktree set — same <code>WorktreeSubmenuPanel</code> as
+      <a href="worktree-nav-switcher.html" style="color:var(--subtle)">S1</a> and
+      <a href="worktree-menubar-menu.html" style="color:var(--subtle)">S2</a>.
+      Spec <span class="mono">.compozy/tasks/worktree-support/_uiux.md §S3</span> · content illustrative, runtime truth owns final values.
+    </p>
+
+  </div></div>
+</div></div>
+<script src="https://unpkg.com/lucide@latest/dist/umd/lucide.min.js"></script>
+<script src="worktree.js"></script>
+<script>lucide.createIcons();</script>
+</body>
+</html>

@@ -1,0 +1,94 @@
+---
+title: Marketplace
+description: Browse the extension catalog, inspect an entry, and install its capabilities.
+---
+
+Open Marketplace to browse one catalog of extensions. An extension can provide MCP servers,
+skills, tools, profiles, or other capabilities; its contents describe what you are installing.
+Search narrows the catalog. Installed entries stay marked in place, and the installed count opens
+[Installed](/docs/marketplace/installed), where you manage your local extensions.
+
+<OperatorNote>
+  Start the daemon before using Marketplace in the app or through the CLI and API. The public
+  [catalog](/marketplace) is a build-time snapshot; your daemon owns the active catalog and
+  installed state.
+</OperatorNote>
+
+## Browse And Inspect
+
+The app opens the catalog at `/marketplace`. Select an entry to inspect its description, contents,
+version, source, and trust decision. With one source, entries appear in a flat grid; multiple sources
+have separate sections. Refresh fetches the latest catalog. If a source is unreachable, cached
+entries remain visible with their stale status. An unavailable source is not an empty catalog.
+
+The refresh warning names each failed source. Healthy sources remain current, and Retry clears the
+warning once acquisition succeeds. Catalog logos shipped with the app load from its own assets;
+supported inline PNG, SVG and WebP icons also render. Other remote icon URLs use the entry's brand
+mark or generated tile without making an external image request. Updating the app updates its
+shipped logos; refreshing the catalog alone does not download new logo files.
+
+The HTTP and UDS interfaces expose the same catalog:
+
+```http
+GET /api/marketplace?q=herdr&limit=20
+GET /api/marketplace/entries/herdr-bridge?source=compozy-catalog
+```
+
+A page contains `items`, the filtered `total`, `sources`, `revision`, and `stale`, plus `next_cursor`
+when more entries remain. Pass the cursor unchanged with the same query, profile, and workspace.
+If the server returns `marketplace_cursor_stale` with `restart: true`, discard the earlier pages and
+start again. Identical refreshes retain the content revision. While `refreshing` is true,
+read the complete catalog again to observe pending source work; one failed source does not
+stop another source from finishing. When `refreshing` is absent or false, pending work has
+settled, even if `stale` and source errors remain.
+
+An entry is identified by `(source_ref, entry_id)`. Installed state joins on that origin, not a display
+name. Use `installed_name` when selecting a specific local installation. Entries without catalog
+provenance still appear in Installed. Follow the returned `manage_path` for management.
+
+Curated catalogs publish minimum CompozyOS versions alongside the feed. Incompatible entries
+remain readable with `installable: false` and an `install_blocker` reason; the app disables Install.
+Refresh after the publisher corrects a package. Older catalogs without these requirements are still
+readable, and package inspection and installation always enforce the packaged minimum version.
+
+## Install An Extension
+
+Choose Install on an entry whose trust decision allows installation. Entries that need configuration
+request their declared inputs before completing installation. Add also supports installation from
+GitHub or a local folder. Use the entry's `install_slug` for CLI installation:
+
+```bash
+compozy extension install compozy/herdr-bridge -o json
+compozy extension provenance herdr-bridge -o json
+```
+
+For curated entries, the daemon downloads the exact HTTPS `artifact_url`, verifies `digest_sha256`
+before extraction, and records provenance. A mismatch returns `extension_archive_digest_mismatch`
+and does not install the package; `--allow-unverified` cannot bypass it. The pre-install trust report
+and a verified download are separate facts.
+
+A non-curated install requires both daemon policy and explicit consent:
+
+```bash
+compozy config set extensions.trust.allow_unverified true -o json
+compozy config reload -o json
+compozy extension install acme/private-extension --allow-unverified --yes -o json
+```
+
+If policy blocks the request, inspect `extension_unverified_policy_blocked` and its repair action.
+Do not infer runtime readiness from successful installation: a capability may still require inputs
+or authorization. MCP configuration and authorization are described in [MCP catalog operations](/docs/marketplace/mcp-catalog).
+
+## CLI Discovery
+
+The existing CLI verbs remain available. Inspect their structured output before choosing an install target:
+
+```bash
+compozy marketplace search "herdr" -o json
+compozy marketplace info herdr-bridge --source compozy-catalog -o json
+compozy marketplace refresh -o json
+```
+
+CLI discovery uses the same catalog as the app. Continue with the returned cursor and the same
+query and scope; obsolete kind selectors and two-argument info requests fail validation.
+For route parameters and response shapes, use the generated [Marketplace API reference](/docs/api/marketplace).

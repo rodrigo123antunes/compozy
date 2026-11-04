@@ -1,0 +1,16 @@
+{
+    "title": "Skill",
+    "pages": [
+        "index",
+        "create",
+        "disable",
+        "enable",
+        "expose",
+        "info",
+        "list",
+        "sources",
+        "unexpose",
+        "view",
+        "where"
+    ]
+}

@@ -1,0 +1,493 @@
+package daemon
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"slices"
+	"strings"
+
+	"github.com/compozy/compozy/internal/agentinstance"
+	compozyconfig "github.com/compozy/compozy/internal/config"
+	extensionpkg "github.com/compozy/compozy/internal/extension"
+	"github.com/compozy/compozy/internal/session"
+	"github.com/compozy/compozy/internal/store"
+	toolspkg "github.com/compozy/compozy/internal/tools"
+	workspacepkg "github.com/compozy/compozy/internal/workspace"
+	"github.com/compozy/compozy/internal/workspaceaccess"
+)
+
+type nativeToolPolicyResolverDeps struct {
+	Config            *compozyconfig.Config
+	Sessions          nativeToolPolicySessionReader
+	WorkspaceResolver nativeToolPolicyWorkspaceResolver
+	ProfileNames      session.ProfileNameResolver
+	AgentResolver     nativeToolPolicyAgentResolver
+	ExtensionRegistry *extensionpkg.Registry
+	ApprovalAvailable bool
+	MCPSourceGrants   nativeToolPolicyMCPSourceGrants
+}
+
+// nativeToolPolicyMCPSourceGrants lists MCP sources the operator authorized for one resolved scope.
+type nativeToolPolicyMCPSourceGrants func(context.Context, toolspkg.Scope) ([]toolspkg.SourceGrant, error)
+
+type nativeToolPolicySessionReader interface {
+	Status(ctx context.Context, id string) (*session.Info, error)
+}
+
+type nativeToolPolicyWorkspaceResolver interface {
+	ResolveAgentConfig(ctx context.Context, workspaceRef, profileName string) (workspacepkg.ResolvedAgentConfig, error)
+}
+
+type nativeToolPolicyAgentResolver interface {
+	ResolvePolicyAgent(name string, resolved *workspacepkg.ResolvedAgentConfig) (compozyconfig.AgentDef, error)
+}
+
+type nativeToolPolicyResolver struct {
+	instanceCallers   agentinstance.CallerReader
+	cfg               *compozyconfig.Config
+	sessions          nativeToolPolicySessionReader
+	workspaceResolver nativeToolPolicyWorkspaceResolver
+	profileNames      session.ProfileNameResolver
+	agentResolver     nativeToolPolicyAgentResolver
+	extensionRegistry *extensionpkg.Registry
+	approvalAvailable bool
+	mcpSourceGrants   nativeToolPolicyMCPSourceGrants
+}
+
+var _ toolspkg.PolicyInputResolver = (*nativeToolPolicyResolver)(nil)
+
+func newNativeToolPolicyResolver(deps nativeToolPolicyResolverDeps) (*nativeToolPolicyResolver, error) {
+	if deps.Config == nil {
+		return nil, errors.New("daemon: native tool policy config is required")
+	}
+	return &nativeToolPolicyResolver{
+		cfg:               deps.Config,
+		sessions:          deps.Sessions,
+		workspaceResolver: deps.WorkspaceResolver,
+		profileNames:      deps.ProfileNames,
+		agentResolver:     deps.AgentResolver,
+		extensionRegistry: deps.ExtensionRegistry,
+		approvalAvailable: deps.ApprovalAvailable,
+		mcpSourceGrants:   deps.MCPSourceGrants,
+	}, nil
+}
+
+func newNativeToolPolicyResolverForBoot(state *bootState) (*nativeToolPolicyResolver, error) {
+	resolver, err := newNativeToolPolicyResolver(nativeToolPolicyResolverDeps{
+		Config:            &state.cfg,
+		Sessions:          state.sessions,
+		WorkspaceResolver: state.workspaceResolver,
+		ProfileNames:      state.profiles,
+		AgentResolver: agentCatalogDependency(state.agentCatalog, agentSidecarCatalogs{
+			soul:      state.soulCatalog,
+			heartbeat: state.heartbeatCatalog,
+		}),
+		ExtensionRegistry: extensionRegistryDependency(state.registry),
+		ApprovalAvailable: true,
+		MCPSourceGrants: func(ctx context.Context, scope toolspkg.Scope) ([]toolspkg.SourceGrant, error) {
+			return operatorAuthorizedMCPSourceGrants(ctx, state, scope)
+		},
+	})
+	if err != nil {
+		return nil, err
+	}
+	if provider, ok := state.registry.(instanceRepositoryProvider); ok {
+		resolver.instanceCallers = provider.Instances()
+	}
+	return resolver, nil
+}
+
+func (r *nativeToolPolicyResolver) Resolve(ctx context.Context, scope toolspkg.Scope) (toolspkg.PolicyInputs, error) {
+	if r == nil || r.cfg == nil {
+		return toolspkg.PolicyInputs{}, errors.New("daemon: native tool policy resolver is not configured")
+	}
+	resolvedScope := normalizeToolPolicyScope(scope)
+	info, err := r.sessionInfo(ctx, resolvedScope.SessionID)
+	if err != nil {
+		return toolspkg.PolicyInputs{}, err
+	}
+	if info != nil {
+		resolvedScope = fillToolPolicyScopeFromSession(resolvedScope, info)
+	}
+	resolvedWorkspace, cfg, err := r.resolveWorkspaceConfig(ctx, resolvedScope)
+	if err != nil {
+		return toolspkg.PolicyInputs{}, err
+	}
+	inputs, err := nativeToolPolicyInputs(cfg)
+	if err != nil {
+		return toolspkg.PolicyInputs{}, err
+	}
+	inputs.ApprovalAvailable = r.approvalAvailable
+	if err := r.applyBundledExtensionTrust(&inputs); err != nil {
+		return toolspkg.PolicyInputs{}, err
+	}
+	if resolvedWorkspace != nil {
+		if err := r.applyDevelopmentExtensionTrust(&inputs, resolvedWorkspace.ID); err != nil {
+			return toolspkg.PolicyInputs{}, err
+		}
+	}
+	if err := r.applyMCPSourceGrants(ctx, &inputs, resolvedScope); err != nil {
+		return toolspkg.PolicyInputs{}, err
+	}
+	if err := applyLoopExtensionOwnerGrant(ctx, &inputs, resolvedScope); err != nil {
+		return toolspkg.PolicyInputs{}, err
+	}
+	if err := r.applyInstanceToolPolicy(ctx, &inputs, info); err != nil {
+		return toolspkg.PolicyInputs{}, err
+	}
+	if err := applySessionToolPolicy(&inputs, info); err != nil {
+		return toolspkg.PolicyInputs{}, err
+	}
+	if resolvedScope.AgentName != "" &&
+		workspaceaccess.ActorKind(resolvedScope.ActorKind) != workspaceaccess.ActorDaemon {
+		if err := r.applyAgentToolPolicy(&inputs, resolvedScope.AgentName, resolvedWorkspace, cfg); err != nil {
+			if inputs.Session.Enforced && errors.Is(err, workspacepkg.ErrAgentNotAvailable) {
+				applySessionPermissionLevel(&inputs, info)
+				return inputs, nil
+			}
+			return toolspkg.PolicyInputs{}, err
+		}
+	}
+	applySessionPermissionLevel(&inputs, info)
+	return inputs, nil
+}
+
+// applySessionPermissionLevel decides native tools at the level the session
+// actually runs at, which the provider gate also uses: an always-on default, a
+// narrowed delegation, or a degraded auto. Without it an undeclared always-on
+// agent would run native tools at the global mode while its provider asks at
+// approve-edits. Triage keeps its read-only level.
+func applySessionPermissionLevel(inputs *toolspkg.PolicyInputs, info *session.Info) {
+	if info == nil || info.Type == session.SessionTypeTriage {
+		return
+	}
+	if mode := strings.TrimSpace(info.EffectivePermissions); mode != "" {
+		inputs.SystemPermissionMode = nativeToolPermissionMode(compozyconfig.PermissionMode(mode))
+	}
+}
+
+func (r *nativeToolPolicyResolver) applyMCPSourceGrants(
+	ctx context.Context,
+	inputs *toolspkg.PolicyInputs,
+	scope toolspkg.Scope,
+) error {
+	if r.mcpSourceGrants == nil {
+		return nil
+	}
+	grants, err := r.mcpSourceGrants(ctx, scope)
+	if err != nil {
+		return err
+	}
+	for _, grant := range grants {
+		if !sourceGrantExists(inputs.AllowSources, grant) {
+			inputs.AllowSources = append(inputs.AllowSources, grant)
+		}
+	}
+	return nil
+}
+
+func (r *nativeToolPolicyResolver) applyBundledExtensionTrust(inputs *toolspkg.PolicyInputs) error {
+	if r == nil || r.extensionRegistry == nil {
+		return nil
+	}
+	names, err := r.extensionRegistry.EnabledBundledNames()
+	if err != nil {
+		return fmt.Errorf("daemon: list bundled extension tool policy sources: %w", err)
+	}
+	for _, name := range names {
+		if err := grantTrustedExtensionSource(inputs, name, "bundled_extension_source"); err != nil {
+			return fmt.Errorf("daemon: bundled extension source %q: %w", name, err)
+		}
+	}
+	return nil
+}
+
+func (r *nativeToolPolicyResolver) applyDevelopmentExtensionTrust(
+	inputs *toolspkg.PolicyInputs,
+	workspaceID string,
+) error {
+	if r == nil || r.extensionRegistry == nil || strings.TrimSpace(workspaceID) == "" {
+		return nil
+	}
+	names, err := r.extensionRegistry.DevLinkNamesForWorkspace(workspaceID)
+	if err != nil {
+		return fmt.Errorf("daemon: list development extension tool policy sources: %w", err)
+	}
+	for _, name := range names {
+		if err := grantTrustedExtensionSource(inputs, name, "development_extension_source"); err != nil {
+			return fmt.Errorf("daemon: development extension source %q: %w", name, err)
+		}
+	}
+	return nil
+}
+
+func grantTrustedExtensionSource(
+	inputs *toolspkg.PolicyInputs,
+	name string,
+	field string,
+) error {
+	grant := toolspkg.SourceGrant{
+		Kind:  toolspkg.SourceExtension,
+		Owner: strings.TrimSpace(name),
+	}
+	if err := grant.Validate(field); err != nil {
+		return err
+	}
+	if !sourceGrantExists(inputs.TrustedSources, grant) {
+		inputs.TrustedSources = append(inputs.TrustedSources, grant)
+	}
+	if !sourceGrantExists(inputs.AllowSources, grant) {
+		inputs.AllowSources = append(inputs.AllowSources, grant)
+	}
+	return nil
+}
+
+func sourceGrantExists(grants []toolspkg.SourceGrant, target toolspkg.SourceGrant) bool {
+	return slices.Contains(grants, target)
+}
+
+func applyLoopExtensionOwnerGrant(
+	ctx context.Context,
+	inputs *toolspkg.PolicyInputs,
+	scope toolspkg.Scope,
+) error {
+	if workspaceaccess.ActorKind(scope.ActorKind) != workspaceaccess.ActorDaemon {
+		return nil
+	}
+	owner := toolspkg.TrustedExtensionOwner(ctx)
+	if owner == "" {
+		return nil
+	}
+	grant := toolspkg.SourceGrant{Kind: toolspkg.SourceExtension, Owner: owner}
+	if err := grant.Validate("loop_extension_owner"); err != nil {
+		return err
+	}
+	if !sourceGrantExists(inputs.AllowSources, grant) {
+		inputs.AllowSources = append(inputs.AllowSources, grant)
+	}
+	return nil
+}
+
+func (r *nativeToolPolicyResolver) sessionInfo(
+	ctx context.Context,
+	sessionID string,
+) (*session.Info, error) {
+	if strings.TrimSpace(sessionID) == "" || r.sessions == nil {
+		return nil, nil
+	}
+	info, err := r.sessions.Status(ctx, sessionID)
+	if err == nil {
+		return info, nil
+	}
+	if errors.Is(err, session.ErrSessionNotFound) {
+		return nil, nil
+	}
+	return nil, fmt.Errorf("daemon: resolve session tool policy %q: %w", sessionID, err)
+}
+
+// resolveWorkspaceConfig loads policy inputs without skill discovery and retains the session profile identity.
+func (r *nativeToolPolicyResolver) resolveWorkspaceConfig(
+	ctx context.Context,
+	scope toolspkg.Scope,
+) (*workspacepkg.ResolvedAgentConfig, *compozyconfig.Config, error) {
+	cfg := r.cfg
+	workspaceID := strings.TrimSpace(scope.WorkspaceID)
+	if strings.TrimSpace(workspaceID) == "" {
+		return nil, cfg, nil
+	}
+	if r.workspaceResolver == nil {
+		return nil, cfg, nil
+	}
+	profileName := ""
+	if scope.ProfileID != "" {
+		var profileErr error
+		profileName, profileErr = resolvePromptSkillsProfileName(ctx, r.profileNames, scope.ProfileID)
+		if profileErr != nil {
+			return nil, nil, fmt.Errorf("daemon: resolve tool policy profile %q: %w", scope.ProfileID, profileErr)
+		}
+	}
+	resolved, err := r.workspaceResolver.ResolveAgentConfig(ctx, workspaceID, profileName)
+	if err != nil {
+		return nil, nil, fmt.Errorf("daemon: resolve workspace tool policy %q: %w", workspaceID, err)
+	}
+	if scope.ProfileID != "" {
+		resolved.ProfileID = scope.ProfileID
+	}
+	return &resolved, &resolved.Config, nil
+}
+
+// applyAgentToolPolicy applies resolved agent restrictions and an explicitly configured permission mode.
+func (r *nativeToolPolicyResolver) applyAgentToolPolicy(
+	inputs *toolspkg.PolicyInputs,
+	agentName string,
+	resolvedWorkspace *workspacepkg.ResolvedAgentConfig,
+	cfg *compozyconfig.Config,
+) error {
+	agent, err := r.resolveAgent(agentName, resolvedWorkspace)
+	if err != nil {
+		return err
+	}
+	resolvedAgent, err := cfg.ResolveAgent(agent)
+	if err != nil {
+		return fmt.Errorf("daemon: resolve agent tool policy %q: %w", agentName, err)
+	}
+	policy, err := resolvedAgentToolPolicy(resolvedAgent)
+	if err != nil {
+		return err
+	}
+	inputs.Agent = policy
+	if strings.TrimSpace(resolvedAgent.Permissions) != "" {
+		inputs.SystemPermissionMode = nativeToolPermissionMode(compozyconfig.PermissionMode(resolvedAgent.Permissions))
+	}
+	return nil
+}
+
+// resolveAgent uses the policy catalog when available and otherwise resolves from the workspace snapshot.
+func (r *nativeToolPolicyResolver) resolveAgent(
+	agentName string,
+	resolvedWorkspace *workspacepkg.ResolvedAgentConfig,
+) (compozyconfig.AgentDef, error) {
+	if r.agentResolver != nil {
+		agent, err := r.agentResolver.ResolvePolicyAgent(agentName, resolvedWorkspace)
+		if err != nil {
+			return compozyconfig.AgentDef{}, fmt.Errorf("daemon: resolve agent tool policy %q: %w", agentName, err)
+		}
+		return agent, nil
+	}
+	agent, err := resolvePolicyAgentFromWorkspaceSnapshot(agentName, resolvedWorkspace)
+	if err != nil {
+		return compozyconfig.AgentDef{}, fmt.Errorf("daemon: resolve agent tool policy %q: %w", agentName, err)
+	}
+	return agent, nil
+}
+
+func resolvedAgentToolPolicy(resolved compozyconfig.ResolvedAgent) (toolspkg.AgentToolPolicy, error) {
+	tools, err := toolspkg.ParseToolPatterns(resolved.Tools)
+	if err != nil {
+		return toolspkg.AgentToolPolicy{}, fmt.Errorf("daemon: agent %q tools: %w", resolved.Name, err)
+	}
+	denyTools, err := toolspkg.ParseToolPatterns(resolved.DenyTools)
+	if err != nil {
+		return toolspkg.AgentToolPolicy{}, fmt.Errorf("daemon: agent %q deny_tools: %w", resolved.Name, err)
+	}
+	toolsets, err := parseAgentToolsets(resolved)
+	if err != nil {
+		return toolspkg.AgentToolPolicy{}, err
+	}
+	return toolspkg.AgentToolPolicy{
+		Enforced:  resolved.ToolPolicyEnforced,
+		Tools:     tools,
+		Toolsets:  toolsets,
+		DenyTools: denyTools,
+	}, nil
+}
+
+func parseAgentToolsets(resolved compozyconfig.ResolvedAgent) ([]toolspkg.ToolsetID, error) {
+	toolsets := make([]toolspkg.ToolsetID, 0, len(resolved.Toolsets))
+	for i, raw := range resolved.Toolsets {
+		id := toolspkg.ToolsetID(strings.TrimSpace(raw))
+		if err := id.Validate(); err != nil {
+			return nil, fmt.Errorf("daemon: agent %q toolsets[%d]: %w", resolved.Name, i, err)
+		}
+		toolsets = append(toolsets, id)
+	}
+	return toolsets, nil
+}
+
+func applySessionToolPolicy(inputs *toolspkg.PolicyInputs, info *session.Info) error {
+	if info == nil {
+		return nil
+	}
+	inputs.AlwaysOnLineage = inputs.AlwaysOnLineage || info.InstanceID != ""
+	if info.Type == session.SessionTypeTriage {
+		inputs.TriageReadOnly = true
+		inputs.ApprovalAvailable = false
+		inputs.SystemPermissionMode = toolspkg.PermissionModeApproveReads
+		return nil
+	}
+	switch info.Type {
+	case session.SessionTypeSpawned, session.SessionTypeCoordinator:
+	default:
+		return nil
+	}
+	lineage := store.NormalizeSessionLineage(info.ID, info.Lineage)
+	if lineage == nil {
+		return nil
+	}
+	return applyConcreteSessionToolPolicy(inputs, info.ID, lineage.PermissionPolicy)
+}
+
+func applyConcreteSessionToolPolicy(
+	inputs *toolspkg.PolicyInputs,
+	sessionID string,
+	ceiling store.SessionPermissionPolicy,
+) error {
+	policy := store.NormalizeSessionPermissionPolicy(ceiling)
+	filtered, dropped := toolspkg.DropRetiredToolReferences(toolspkg.ToolPolicy{Tools: policy.Tools})
+	toolspkg.WarnRetiredToolReferences("session:"+sessionID, dropped)
+	policy.Tools = filtered.Tools
+	ids := make([]toolspkg.ToolID, 0, len(policy.Tools))
+	for i, raw := range policy.Tools {
+		id := toolspkg.ToolID(strings.TrimSpace(raw))
+		if err := id.Validate(); err != nil {
+			return fmt.Errorf("daemon: session %q lineage tools[%d]: %w", sessionID, i, err)
+		}
+		ids = append(ids, id)
+	}
+	inputs.Session = toolspkg.SessionToolPolicy{
+		Enforced: true,
+		Tools:    ids,
+	}
+	return nil
+}
+
+func normalizeToolPolicyScope(scope toolspkg.Scope) toolspkg.Scope {
+	return toolspkg.Scope{
+		ProfileID:   strings.TrimSpace(scope.ProfileID),
+		WorkspaceID: strings.TrimSpace(scope.WorkspaceID),
+		SessionID:   strings.TrimSpace(scope.SessionID),
+		AgentName:   strings.TrimSpace(scope.AgentName),
+		ActorKind:   strings.TrimSpace(scope.ActorKind),
+		Operator:    scope.Operator,
+	}
+}
+
+func fillToolPolicyScopeFromSession(scope toolspkg.Scope, info *session.Info) toolspkg.Scope {
+	if info == nil {
+		return scope
+	}
+	if strings.TrimSpace(scope.SessionID) == "" {
+		scope.SessionID = strings.TrimSpace(info.ID)
+	}
+	if strings.TrimSpace(scope.ProfileID) == "" {
+		scope.ProfileID = strings.TrimSpace(info.ProfileID)
+	}
+	if strings.TrimSpace(scope.WorkspaceID) == "" {
+		scope.WorkspaceID = strings.TrimSpace(info.WorkspaceID)
+	}
+	if strings.TrimSpace(scope.AgentName) == "" {
+		scope.AgentName = strings.TrimSpace(info.AgentName)
+	}
+	return scope
+}
+
+func (r *nativeToolPolicyResolver) applyInstanceToolPolicy(
+	ctx context.Context,
+	inputs *toolspkg.PolicyInputs,
+	info *session.Info,
+) error {
+	if info != nil && r.instanceCallers != nil {
+		caller, err := r.instanceCallers.InstanceCaller(ctx, info.ID)
+		if err != nil {
+			return err
+		}
+		if caller.InstanceID != "" {
+			inputs.AlwaysOnLineage = true
+			if err := applyConcreteSessionToolPolicy(inputs, info.ID, caller.PermissionPolicy); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
+}

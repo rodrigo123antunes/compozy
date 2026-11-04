@@ -1,0 +1,11 @@
+{
+    "ignore": {
+        "files": ["src/generated/**"],
+        "overrides": [
+            {
+                "files": ["src/**/*.proto.tsx"],
+                "rules": ["react-doctor/only-export-components"]
+            }
+        ]
+    }
+}

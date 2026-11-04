@@ -1,0 +1,9 @@
+export { Hero } from "./hero";
+export { SupportedAgents } from "./supported-agents";
+export { BentoSection } from "./bento-section";
+export { AutonomyKernelSection } from "./autonomy-kernel-section";
+export { FeaturesSection } from "./features-section";
+export { ExtensibilitySection } from "./extensibility-section";
+export { InstallSection } from "./install-section";
+export { Comparison } from "./comparison";
+export { FinalCta } from "./final-cta";

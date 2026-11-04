@@ -1,0 +1,184 @@
+package core
+
+import (
+	"errors"
+	"fmt"
+
+	"strings"
+
+	"github.com/compozy/compozy/internal/api/contract"
+
+	compozyconfig "github.com/compozy/compozy/internal/config"
+
+	settingspkg "github.com/compozy/compozy/internal/settings"
+	"github.com/gin-gonic/gin"
+)
+
+func parsePutSettingsMCPServerRequest(c *gin.Context) (settingspkg.CollectionItemPutRequest, error) {
+	var body struct {
+		Server          *contract.SettingsMCPServerPayload             `json:"server"`
+		SecretValues    *contract.SettingsMCPSecretValuesPayload       `json:"secret_values,omitzero"`
+		PreserveSecrets *contract.SettingsMCPSecretPreservationPayload `json:"preserve_secrets,omitzero"`
+		PreserveEnv     []string                                       `json:"preserve_env,omitempty"`
+	}
+	if err := c.ShouldBindJSON(&body); err != nil {
+		return settingspkg.CollectionItemPutRequest{}, NewSettingsValidationError(
+			fmt.Errorf("decode MCP server settings request: %w", err),
+		)
+	}
+	if body.Server == nil {
+		return settingspkg.CollectionItemPutRequest{}, NewSettingsValidationError(
+			errors.New("mcp-servers.server is required"),
+		)
+	}
+	req, err := parseSettingsCollectionRequest(c, settingspkg.CollectionMCPServers)
+	if err != nil {
+		return settingspkg.CollectionItemPutRequest{}, err
+	}
+	name, err := requiredSettingsPathValue(c.Param("name"), "name")
+	if err != nil {
+		return settingspkg.CollectionItemPutRequest{}, err
+	}
+	bodyName := strings.TrimSpace(body.Server.Name)
+	if bodyName != "" && bodyName != name {
+		return settingspkg.CollectionItemPutRequest{}, NewSettingsValidationError(
+			fmt.Errorf("mcp-servers.server.name must match path name %q", name),
+		)
+	}
+	target, err := parseSettingsTarget(c.Query("target"))
+	if err != nil {
+		return settingspkg.CollectionItemPutRequest{}, err
+	}
+	server := compozyconfig.MCPServer{
+		Name:      name,
+		Transport: compozyconfig.MCPServerTransport(strings.TrimSpace(body.Server.Transport)),
+		Command:   strings.TrimSpace(body.Server.Command),
+		Args:      cloneStrings(body.Server.Args),
+		Env:       cloneStringMap(body.Server.Env),
+		Headers:   cloneStringMap(body.Server.Headers),
+		SecretEnv: cloneStringMap(body.Server.SecretEnv),
+		URL:       strings.TrimSpace(body.Server.URL),
+	}
+	if body.Server.Auth != nil {
+		server.Auth = compozyconfig.MCPAuthConfig{
+			Registration:    compozyconfig.MCPAuthRegistration(strings.TrimSpace(body.Server.Auth.Registration)),
+			IssuerURL:       strings.TrimSpace(body.Server.Auth.IssuerURL),
+			ClientID:        strings.TrimSpace(body.Server.Auth.ClientID),
+			ClientSecretRef: strings.TrimSpace(body.Server.Auth.ClientSecretRef),
+			Scopes:          cloneStrings(body.Server.Auth.Scopes),
+		}
+	}
+	// Full validation belongs to the resolved definition: owned overrides may omit the package's transport and command.
+	if err := compozyconfig.ValidateMCPServerName(name); err != nil {
+		return settingspkg.CollectionItemPutRequest{}, NewSettingsValidationError(err)
+	}
+
+	return settingspkg.CollectionItemPutRequest{
+		CollectionRequest:     req,
+		Name:                  name,
+		Target:                target,
+		MCPServer:             &server,
+		MCPSecrets:            mcpSecretValuesFromPayload(body.SecretValues),
+		MCPSecretPreservation: mcpSecretPreservationFromPayload(body.PreserveSecrets),
+		MCPEnvPreservation:    cloneStrings(body.PreserveEnv),
+	}, nil
+}
+
+func parsePutSettingsHookRequest(c *gin.Context) (settingspkg.CollectionItemPutRequest, error) {
+	var body struct {
+		Declaration *contract.SettingsHookDeclarationPayload `json:"declaration"`
+	}
+	if err := c.ShouldBindJSON(&body); err != nil {
+		return settingspkg.CollectionItemPutRequest{}, NewSettingsValidationError(
+			fmt.Errorf("decode hook settings request: %w", err),
+		)
+	}
+	if body.Declaration == nil {
+		return settingspkg.CollectionItemPutRequest{}, NewSettingsValidationError(
+			errors.New("hooks.declaration is required"),
+		)
+	}
+	req, err := parseSettingsCollectionRequest(c, settingspkg.CollectionHooks)
+	if err != nil {
+		return settingspkg.CollectionItemPutRequest{}, err
+	}
+	name, err := requiredSettingsPathValue(c.Param("name"), "name")
+	if err != nil {
+		return settingspkg.CollectionItemPutRequest{}, err
+	}
+	bodyName := strings.TrimSpace(body.Declaration.Name)
+	if bodyName != "" && bodyName != name {
+		return settingspkg.CollectionItemPutRequest{}, NewSettingsValidationError(
+			fmt.Errorf("hooks.declaration.name must match path name %q", name),
+		)
+	}
+	declaration := *body.Declaration
+	declaration.Name = name
+	decl, err := hookDeclarationFromPayload(declaration)
+	if err != nil {
+		return settingspkg.CollectionItemPutRequest{}, err
+	}
+	return settingspkg.CollectionItemPutRequest{
+		CollectionRequest: req,
+		Name:              name,
+		Hook:              &decl,
+	}, nil
+}
+
+func parseSettingsScope(rawScope string, rawWorkspaceID string) (settingspkg.ScopeKind, string, error) {
+	scope := settingspkg.ScopeKind(strings.TrimSpace(rawScope))
+	if scope == "" {
+		scope = settingspkg.ScopeUser
+	}
+	if err := scope.Validate(); err != nil {
+		return "", "", NewSettingsValidationError(err)
+	}
+	return scope, strings.TrimSpace(rawWorkspaceID), nil
+}
+
+func parseSettingsOwner(c *gin.Context) (settingspkg.ScopeKind, string, string, error) {
+	rawScope := strings.TrimSpace(c.Query("scope"))
+	profileName := strings.TrimSpace(c.Query("profile"))
+	if rawScope == "" && profileName != "" && profileName != profileDefaultName {
+		rawScope = string(settingspkg.ScopeProfile)
+	}
+	scope, workspaceID, err := parseSettingsScope(rawScope, c.Query("workspace_id"))
+	if err != nil {
+		return "", "", "", err
+	}
+	if scope == settingspkg.ScopeProfile {
+		if profileName == "" || profileName == profileDefaultName {
+			return "", "", "", NewSettingsValidationError(
+				errors.New("settings.profile is required for profile scope"),
+			)
+		}
+		if err := compozyconfig.ValidateResourceProfileName(profileName); err != nil {
+			return "", "", "", NewSettingsValidationError(err)
+		}
+		return scope, workspaceID, profileName, nil
+	}
+	return scope, workspaceID, "", nil
+}
+
+func parseSettingsTarget(raw string) (settingspkg.TargetSelector, error) {
+	target := settingspkg.TargetSelector(strings.TrimSpace(raw))
+	if target == "" {
+		target = settingspkg.TargetAuto
+	}
+	switch target {
+	case settingspkg.TargetAuto, settingspkg.TargetConfig, settingspkg.TargetSidecar:
+		return target, nil
+	default:
+		return "", NewSettingsValidationError(
+			fmt.Errorf("settings.target must be one of %q, %q, %q", "auto", "config", "sidecar"),
+		)
+	}
+}
+
+func requiredSettingsPathValue(raw string, field string) (string, error) {
+	value := strings.TrimSpace(raw)
+	if value == "" {
+		return "", NewSettingsValidationError(fmt.Errorf("%s is required", field))
+	}
+	return value, nil
+}

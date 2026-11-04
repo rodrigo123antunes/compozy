@@ -1,0 +1,253 @@
+package daemon
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"strings"
+
+	"github.com/compozy/compozy/internal/acp"
+	compozyconfig "github.com/compozy/compozy/internal/config"
+	"github.com/compozy/compozy/internal/session"
+	skillspkg "github.com/compozy/compozy/internal/skills"
+	"github.com/compozy/compozy/internal/store"
+	workspacepkg "github.com/compozy/compozy/internal/workspace"
+)
+
+type promptSkillsRegistry interface {
+	ForWorkspace(ctx context.Context, resolved *workspacepkg.ResolvedWorkspace) ([]*skillspkg.Skill, error)
+	ForAgentSession(
+		ctx context.Context,
+		resolved *workspacepkg.ResolvedWorkspace,
+		agentName string,
+		sessionID string,
+	) ([]*skillspkg.Skill, error)
+	ForAgentDefSession(
+		ctx context.Context,
+		resolved *workspacepkg.ResolvedWorkspace,
+		agent compozyconfig.AgentDef,
+		sessionID string,
+	) ([]*skillspkg.Skill, error)
+}
+
+type promptSkillsWorkspaceResolver interface {
+	Resolve(ctx context.Context, target string) (workspacepkg.ResolvedWorkspace, error)
+}
+
+type promptSkillsProfileWorkspaceResolver interface {
+	ResolveForProfile(
+		ctx context.Context,
+		target string,
+		profileName string,
+	) (workspacepkg.ResolvedWorkspace, error)
+}
+
+type skillsCatalogAugmenter struct {
+	registry          promptSkillsRegistry
+	agentResolver     func() session.AgentResolver
+	workspaceResolver func() promptSkillsWorkspaceResolver
+	profileNames      session.ProfileNameResolver
+}
+
+func newSkillsCatalogAugmenter(
+	registry promptSkillsRegistry,
+	agentResolver func() session.AgentResolver,
+	workspaceResolver func() promptSkillsWorkspaceResolver,
+	profileNames session.ProfileNameResolver,
+) session.PromptInputAugmenter {
+	augmenter := newSkillsCatalogAugmenterState(registry, agentResolver, workspaceResolver, profileNames)
+	if augmenter == nil {
+		return nil
+	}
+	return augmenter.Augment
+}
+
+func newSkillsCatalogAugmenterState(
+	registry promptSkillsRegistry,
+	agentResolver func() session.AgentResolver,
+	workspaceResolver func() promptSkillsWorkspaceResolver,
+	profileNames session.ProfileNameResolver,
+) *skillsCatalogAugmenter {
+	if registry == nil {
+		return nil
+	}
+
+	augmenter := &skillsCatalogAugmenter{
+		registry:          registry,
+		agentResolver:     agentResolver,
+		workspaceResolver: workspaceResolver,
+		profileNames:      profileNames,
+	}
+	return augmenter
+}
+
+func (a *skillsCatalogAugmenter) Augment(ctx context.Context, sess *session.Session, message string) (string, error) {
+	return a.augment(ctx, sess, message, nil)
+}
+
+func (a *skillsCatalogAugmenter) AugmentWithPolicy(
+	ctx context.Context,
+	sess *session.Session,
+	message string,
+	resolved *ResolvedHarnessContext,
+) (string, error) {
+	if resolved == nil {
+		return a.augment(ctx, sess, message, nil)
+	}
+	return a.augment(ctx, sess, message, resolved.Policy.SkillInjectionFilter)
+}
+
+func (a *skillsCatalogAugmenter) augment(
+	ctx context.Context,
+	sess *session.Session,
+	message string,
+	filter SkillInjectionFilter,
+) (string, error) {
+	if a == nil || a.registry == nil || sess == nil || sess.NativeToolsUnavailable() {
+		return message, nil
+	}
+
+	info := sess.Info()
+	if info == nil {
+		return message, nil
+	}
+
+	workspace, err := resolvePromptSkillsWorkspace(
+		ctx, a.workspaceResolver, a.profileNames, info.ProfileID, info.WorkspaceID, info.Workspace,
+	)
+	if err != nil {
+		return "", fmt.Errorf("daemon: resolve prompt skills workspace: %w", err)
+	}
+
+	var skills []*skillspkg.Skill
+	agent := sess.AgentDefinition()
+	if strings.TrimSpace(agent.Name) != "" {
+		skills, err = a.skillsForSessionAgent(ctx, workspace, agent, info.ID)
+	} else {
+		skills, err = a.registry.ForWorkspace(ctx, workspace)
+	}
+	if err != nil {
+		return "", fmt.Errorf("daemon: load current skills catalog for session %q: %w", info.ID, err)
+	}
+
+	filtered := make([]*skillspkg.Skill, 0, len(skills))
+	for _, skill := range skills {
+		if skill != nil && (filter == nil || filter(skill)) {
+			filtered = append(filtered, skill)
+		}
+	}
+	catalog := skillspkg.BuildCurrentCatalogWithinBudget(filtered, startupSkillsSectionBudget)
+	acp.RegisterPromptSection(ctx, acp.PromptSection{
+		Key: "skills", Content: catalog,
+		StartupContent:   skillspkg.BuildCatalogWithinBudget(filtered, startupSkillsSectionBudget),
+		UnchangedContent: skillspkg.BuildCurrentCatalogUnchanged(),
+	})
+	if strings.TrimSpace(catalog) == "" {
+		return message, nil
+	}
+	if strings.TrimSpace(message) == "" {
+		return catalog, nil
+	}
+	return catalog + "\n\n" + message, nil
+}
+
+func (a *skillsCatalogAugmenter) skillsForSessionAgent(
+	ctx context.Context,
+	workspace *workspacepkg.ResolvedWorkspace,
+	agent compozyconfig.AgentDef,
+	sessionID string,
+) ([]*skillspkg.Skill, error) {
+	return (sessionAgentProjection[[]*skillspkg.Skill]{
+		agent:                 agent,
+		hasConcreteDefinition: true,
+		workspace:             workspace,
+		agentResolver:         a.agentResolver,
+		byName: func(agentName string) ([]*skillspkg.Skill, error) {
+			return a.registry.ForAgentSession(ctx, workspace, agentName, sessionID)
+		},
+		byDefinition: func(resolvedAgent compozyconfig.AgentDef) ([]*skillspkg.Skill, error) {
+			return a.registry.ForAgentDefSession(ctx, workspace, resolvedAgent, sessionID)
+		},
+	}).resolve()
+}
+
+func resolvePromptSkillsWorkspace(
+	ctx context.Context,
+	resolverGetter func() promptSkillsWorkspaceResolver,
+	profileNames session.ProfileNameResolver,
+	profileID string,
+	workspaceID string,
+	workspaceRoot string,
+) (*workspacepkg.ResolvedWorkspace, error) {
+	target := firstTrimmed(workspaceID, workspaceRoot)
+	var resolver promptSkillsWorkspaceResolver
+	if resolverGetter != nil {
+		resolver = resolverGetter()
+	}
+	if resolver != nil && target != "" {
+		trimmedProfileID := strings.TrimSpace(profileID)
+		var resolved workspacepkg.ResolvedWorkspace
+		var err error
+		if trimmedProfileID == "" {
+			resolved, err = resolver.Resolve(ctx, target)
+		} else {
+			profileName, profileErr := resolvePromptSkillsProfileName(ctx, profileNames, trimmedProfileID)
+			if profileErr != nil {
+				return nil, fmt.Errorf("daemon: resolve session profile %q: %w", trimmedProfileID, profileErr)
+			}
+			profileResolver, ok := resolver.(promptSkillsProfileWorkspaceResolver)
+			if !ok {
+				return nil, errors.New("daemon: workspace resolver does not support profile layers")
+			}
+			resolved, err = profileResolver.ResolveForProfile(ctx, target, profileName)
+		}
+		if err == nil {
+			if trimmedProfileID != "" {
+				resolved.ProfileID = trimmedProfileID
+			}
+			return &resolved, nil
+		}
+		if isContextError(err) {
+			return nil, err
+		}
+		if trimmedProfileID != "" && trimmedProfileID != store.DefaultProfileID {
+			return nil, fmt.Errorf("daemon: resolve session profile workspace: %w", err)
+		}
+	}
+
+	if target == "" {
+		return nil, nil
+	}
+	return &workspacepkg.ResolvedWorkspace{
+		ID:        strings.TrimSpace(workspaceID),
+		RootDir:   strings.TrimSpace(workspaceRoot),
+		ProfileID: strings.TrimSpace(profileID),
+	}, nil
+}
+
+func resolvePromptSkillsProfileName(
+	ctx context.Context,
+	profileNames session.ProfileNameResolver,
+	profileID string,
+) (string, error) {
+	if profileNames != nil {
+		return profileNames.ProfileName(ctx, profileID)
+	}
+	if profileID == store.DefaultProfileID {
+		return daemonDefaultProfileName, nil
+	}
+	return "", errors.New("daemon: profile name resolver is required for session skill resolution")
+}
+
+func firstTrimmed(values ...string) string {
+	for _, value := range values {
+		if trimmed := strings.TrimSpace(value); trimmed != "" {
+			return trimmed
+		}
+	}
+	return ""
+}
+
+func isContextError(err error) bool {
+	return errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded)
+}

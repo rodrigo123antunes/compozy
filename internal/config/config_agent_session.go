@@ -1,0 +1,247 @@
+package config
+
+import (
+	"strings"
+	"time"
+)
+
+// AgentsConfig holds authored agent context settings.
+type AgentsConfig struct {
+	AlwaysOn  AlwaysOnConfig  `toml:"always_on"`
+	Soul      SoulConfig      `toml:"soul"`
+	Heartbeat HeartbeatConfig `toml:"heartbeat"`
+	// Overrides replaces selected runtime fields of an effective agent definition by name
+	// without forking its prompt. Operator-authored config only; see agent_overrides.go.
+	Overrides map[string]AgentOverride `toml:"overrides,omitempty"`
+}
+
+// SoulConfig controls optional SOUL.md parsing and projection limits.
+type SoulConfig struct {
+	Enabled                bool  `toml:"enabled"`
+	MaxBodyBytes           int64 `toml:"max_body_bytes"`
+	ContextProjectionBytes int64 `toml:"context_projection_bytes"`
+}
+
+const minSoulContextProjectionBytes int64 = 256
+
+// HeartbeatConfig controls optional HEARTBEAT.md wake-policy parsing and runtime bounds.
+type HeartbeatConfig struct {
+	Sources                      HeartbeatSourcesConfig `toml:"sources"`
+	TriageModels                 map[string]string      `toml:"triage_models"`
+	MaxInterval                  time.Duration          `toml:"max_interval"`
+	MaxConcurrentTriage          int                    `toml:"max_concurrent_triage"`
+	QuietBackoffCap              time.Duration          `toml:"quiet_backoff_cap"`
+	FatigueLimit                 int                    `toml:"fatigue_limit"`
+	Enabled                      bool                   `toml:"enabled"`
+	MaxBodyBytes                 int64                  `toml:"max_body_bytes"`
+	ContextProjectionBytes       int64                  `toml:"context_projection_bytes"`
+	MinInterval                  time.Duration          `toml:"min_interval"`
+	DefaultInterval              time.Duration          `toml:"default_interval"`
+	WakeCooldown                 time.Duration          `toml:"wake_cooldown"`
+	MaxWakesPerCycle             int                    `toml:"max_wakes_per_cycle"`
+	ActiveSessionOnly            bool                   `toml:"active_session_only"`
+	AllowActiveHoursPreferences  bool                   `toml:"allow_active_hours_preferences"`
+	WakeEventRetention           time.Duration          `toml:"wake_event_retention"`
+	SessionHealthStaleAfter      time.Duration          `toml:"session_health_stale_after"`
+	SessionHealthHookMinInterval time.Duration          `toml:"session_health_hook_min_interval"`
+}
+
+// LimitsConfig defines runtime safety bounds.
+type LimitsConfig struct {
+	MaxConcurrentAgents int `toml:"max_concurrent_agents"`
+}
+
+// SessionConfig defines session-scoped runtime controls.
+type SessionConfig struct {
+	Restart      SessionRestartConfig      `toml:"restart"`
+	AuthRecovery SessionAuthRecoveryConfig `toml:"auth_recovery"`
+	Stop         SessionStopConfig         `toml:"stop"`
+	Limits       SessionLimitsConfig       `toml:"limits"`
+	Supervision  SessionSupervisionConfig  `toml:"supervision"`
+	BusyInput    SessionBusyInputConfig    `toml:"busy_input"`
+	Messaging    SessionMessagingConfig    `toml:"messaging"`
+	Attachments  SessionAttachmentsConfig  `toml:"attachments"`
+	Derive       SessionDeriveConfig       `toml:"derive"`
+}
+
+// SessionStopConfig bounds the cooperative phase before process termination.
+type SessionStopConfig struct {
+	CooperativeGrace time.Duration `toml:"cooperative_grace"`
+}
+
+// SessionAttachmentsConfig controls persisted session-attachment admission and retention.
+type SessionAttachmentsConfig struct {
+	MaxFileBytes      int64                             `toml:"max_file_bytes"`
+	MaxFilesPerPrompt int                               `toml:"max_files_per_prompt"`
+	AllowedMIME       []string                          `toml:"allowed_mime"`
+	Retention         SessionAttachmentsRetentionConfig `toml:"retention"`
+}
+
+// SessionAttachmentsRetentionConfig controls disk bounds for stored attachments.
+type SessionAttachmentsRetentionConfig struct {
+	MaxCount int           `toml:"max_count"`
+	MaxBytes int64         `toml:"max_bytes"`
+	MaxAge   time.Duration `toml:"max_age"`
+}
+
+// SessionLimitsConfig holds the released session.limits keys.
+type SessionLimitsConfig struct {
+	// Timeout is deprecated and enforced by no session; it stays readable and
+	// writable until its removal in v0.5.0. Idle sessions use
+	// SessionSupervisionConfig.IdleReleaseAfter.
+	Timeout time.Duration `toml:"timeout,omitempty"`
+}
+
+// SessionSupervisionConfig defines runtime activity monitoring controls applied to sessions.
+type SessionSupervisionConfig struct {
+	compatibilityQuietPolicy  *QuietPolicy
+	ActivityHeartbeatInterval time.Duration `toml:"activity_heartbeat_interval,omitempty"`
+	ProgressNotifyInterval    time.Duration `toml:"progress_notify_interval,omitempty"`
+	PromptDeadline            time.Duration `toml:"prompt_deadline,omitempty"`
+	QuietAfter                time.Duration `toml:"quiet_after"`
+	StopGrace                 time.Duration `toml:"stop_grace"`
+	// IdleReleaseAfter releases the agent process of a session that has no turn in
+	// flight and no work for this long; the next prompt rebinds it. Zero disables.
+	IdleReleaseAfter   time.Duration `toml:"idle_release_after"`
+	TimeoutCancelGrace time.Duration `toml:"timeout_cancel_grace,omitempty"`
+}
+
+// SessionBusyInputConfig controls operator input submitted while a turn is active.
+type SessionBusyInputConfig struct {
+	DefaultMode  string `toml:"default_mode,omitempty"`
+	QueueCap     int    `toml:"queue_cap,omitempty"`
+	MaxTextBytes int    `toml:"max_text_bytes,omitempty"`
+}
+
+const (
+	minSessionBusyInputQueueCap  = 1
+	maxSessionBusyInputQueueCap  = 1000
+	minSessionBusyInputTextBytes = 512
+	maxSessionBusyInputTextBytes = 1 << 20
+)
+
+// PermissionMode is the static permission policy applied by the daemon.
+type PermissionMode string
+
+// Rank orders valid modes from least to most permissive; invalid modes rank below all valid modes.
+func (m PermissionMode) Rank() int {
+	switch m {
+	case PermissionModeDenyAll:
+		return 0
+	case PermissionModeApproveReads:
+		return 1
+	case PermissionModeApproveEdits:
+		return 2
+	case PermissionModeAuto:
+		return 3
+	case PermissionModeApproveAll:
+		return 4
+	default:
+		return -1
+	}
+}
+
+const (
+	// DefaultAgentName is the bootstrap agent name used across the system.
+	DefaultAgentName                          = "general"
+	PermissionModeDenyAll      PermissionMode = "deny-all"
+	PermissionModeApproveReads PermissionMode = "approve-reads"
+	PermissionModeApproveAll   PermissionMode = "approve-all"
+	PermissionModeApproveEdits PermissionMode = "approve-edits"
+	PermissionModeAuto         PermissionMode = "auto"
+	// DefaultObservabilityAgentProbeTimeout bounds daemon health probes for configured agents.
+	DefaultObservabilityAgentProbeTimeout = 2 * time.Second
+)
+
+// AlwaysOnDefaultPermissionMode is the level an always-on instance session runs at when neither
+// its definition nor an operator override sets one.
+const AlwaysOnDefaultPermissionMode = PermissionModeApproveEdits
+
+// PermissionsConfig defines the global default permission policy.
+type PermissionsConfig struct {
+	Mode               PermissionMode `toml:"mode"`
+	ProviderFullAccess bool           `toml:"provider_full_access,omitempty"`
+}
+
+const acpModeAuto = "auto"
+
+const (
+	// CopilotAllowAllOptionID is the GitHub Copilot CLI ACP option that approves every tool, path, and URL.
+	CopilotAllowAllOptionID = "allow_all"
+	// CopilotAllowAllOn is the CopilotAllowAllOptionID value that turns approvals off.
+	CopilotAllowAllOn = "on"
+	// copilotAutopilotMode is the GitHub Copilot CLI mode that enables allow-all for the session.
+	copilotAutopilotMode = "https://agentclientprotocol.com/protocol/session-modes#autopilot"
+)
+
+// IsUnrestrictedACPMode reports provider mode IDs that bypass the provider's normal sandbox or approvals.
+func IsUnrestrictedACPMode(provider, mode string) bool {
+	provider = strings.ToLower(strings.TrimSpace(provider))
+	mode = strings.ToLower(strings.TrimSpace(mode))
+	if provider == "claude" && mode == acpModeAuto {
+		return false
+	}
+	switch mode {
+	case "agent-full-access",
+		"full-access",
+		"full_access",
+		"bypasspermissions",
+		"bypass_permissions",
+		"yolo",
+		acpModeAuto,
+		copilotAutopilotMode:
+		return true
+	default:
+		return false
+	}
+}
+
+// IsUnrestrictedACPOption reports ACP config selections that bypass the
+// provider's normal sandbox or approvals: an unrestricted mode, or an
+// approval option switched to approve everything.
+func IsUnrestrictedACPOption(provider, optionID, valueID string) bool {
+	switch strings.ToLower(strings.TrimSpace(optionID)) {
+	case "mode":
+		return IsUnrestrictedACPMode(provider, valueID)
+	case CopilotAllowAllOptionID:
+		return strings.EqualFold(strings.TrimSpace(valueID), CopilotAllowAllOn)
+	default:
+		return false
+	}
+}
+
+// ObservabilityConfig controls global event retention settings.
+type ObservabilityConfig struct {
+	Enabled           bool                          `toml:"enabled"`
+	RetentionDays     int                           `toml:"retention_days"`
+	MaxGlobalBytes    int64                         `toml:"max_global_bytes"`
+	AgentProbeTimeout time.Duration                 `toml:"agent_probe_timeout"`
+	Transcripts       ObservabilityTranscriptConfig `toml:"transcripts"`
+}
+
+// ObservabilityTranscriptConfig configures transcript capture and retention.
+type ObservabilityTranscriptConfig struct {
+	Enabled            bool  `toml:"enabled"`
+	SegmentBytes       int   `toml:"segment_bytes"`
+	MaxBytesPerSession int64 `toml:"max_bytes_per_session"`
+}
+
+func (c HeartbeatConfig) IsZero() bool {
+	return c.Sources.IsZero() && len(c.TriageModels) == 0 &&
+		c.MaxInterval == 0 &&
+		c.MaxConcurrentTriage == 0 &&
+		c.QuietBackoffCap == 0 &&
+		c.FatigueLimit == 0 &&
+		!c.Enabled &&
+		c.MaxBodyBytes == 0 &&
+		c.ContextProjectionBytes == 0 &&
+		c.MinInterval == 0 &&
+		c.DefaultInterval == 0 &&
+		c.WakeCooldown == 0 &&
+		c.MaxWakesPerCycle == 0 &&
+		!c.ActiveSessionOnly &&
+		!c.AllowActiveHoursPreferences &&
+		c.WakeEventRetention == 0 &&
+		c.SessionHealthStaleAfter == 0 &&
+		c.SessionHealthHookMinInterval == 0
+}

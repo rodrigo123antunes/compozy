@@ -1,0 +1,234 @@
+-- name: InsertWorktree :exec
+INSERT INTO worktrees (
+  profile_id,
+  id, workspace_id, name, branch, path, git_dir, state, pending_phase, origin,
+  setup_state, setup_error, base_ref, created_branch, run_namespace, created_head,
+  run_id, created_at, updated_at
+) VALUES (
+  sqlc.arg(profile_id),
+  sqlc.arg(id), sqlc.arg(workspace_id), sqlc.arg(name), sqlc.arg(branch), sqlc.arg(path),
+  sqlc.arg(git_dir), sqlc.arg(state), sqlc.arg(pending_phase), sqlc.arg(origin),
+  sqlc.arg(setup_state), sqlc.arg(setup_error), sqlc.arg(base_ref), sqlc.arg(created_branch),
+  sqlc.arg(run_namespace), sqlc.arg(created_head), sqlc.arg(run_id), sqlc.arg(created_at),
+  sqlc.arg(updated_at)
+);
+
+-- name: GetWorktreeByName :one
+SELECT * FROM worktrees
+WHERE workspace_id = sqlc.arg(workspace_id)
+  AND name = sqlc.arg(name)
+  AND state <> 'dismissed'
+LIMIT 1;
+
+-- name: GetWorktreeByID :one
+SELECT * FROM worktrees
+WHERE workspace_id = sqlc.arg(workspace_id)
+  AND id = sqlc.arg(worktree_id)
+LIMIT 1;
+
+-- name: GetLiveWorktreeByPath :one
+SELECT * FROM worktrees
+WHERE workspace_id = sqlc.arg(workspace_id)
+  AND path = sqlc.arg(path)
+  AND state NOT IN ('removed', 'dismissed')
+LIMIT 1;
+
+-- name: CountLiveWorktreesByPath :one
+SELECT COUNT(*) FROM worktrees
+WHERE path = sqlc.arg(path)
+  AND state NOT IN ('removed', 'dismissed');
+
+-- name: ListWorktrees :many
+SELECT * FROM worktrees
+WHERE workspace_id = sqlc.arg(workspace_id)
+  AND state <> 'dismissed'
+ORDER BY created_at, id;
+
+-- name: ListRecoverableWorktrees :many
+SELECT * FROM worktrees
+WHERE state IN ('pending', 'removing', 'missing')
+  OR (state = 'failed' AND create_rollback_error <> '')
+ORDER BY workspace_id, created_at, id;
+
+-- name: DeletePendingWorktree :execrows
+DELETE FROM worktrees
+WHERE workspace_id = sqlc.arg(workspace_id)
+  AND id = sqlc.arg(worktree_id)
+  AND state = 'pending';
+
+-- name: DeleteRunMaterialization :execrows
+DELETE FROM worktrees
+WHERE workspace_id = sqlc.arg(workspace_id)
+  AND id = sqlc.arg(worktree_id)
+  AND run_id = sqlc.arg(run_id)
+  AND origin = 'per_run'
+  AND state IN ('pending', 'ready');
+
+-- name: TombstoneBoundRunMaterialization :execrows
+UPDATE worktrees SET state = 'removed', updated_at = sqlc.arg(updated_at)
+WHERE worktrees.workspace_id = sqlc.arg(workspace_id) AND worktrees.id = sqlc.arg(worktree_id)
+  AND worktrees.run_id = sqlc.arg(run_id) AND worktrees.origin = 'per_run' AND worktrees.state IN ('pending', 'ready')
+  AND EXISTS (SELECT 1 FROM sessions WHERE sessions.workspace_id = worktrees.workspace_id
+    AND sessions.worktree_id = worktrees.id);
+
+-- name: UpdatePendingWorktree :execrows
+UPDATE worktrees SET
+  pending_phase = sqlc.arg(pending_phase),
+  branch = sqlc.arg(branch),
+  git_dir = sqlc.arg(git_dir),
+  base_ref = sqlc.arg(base_ref),
+  created_branch = sqlc.arg(created_branch),
+  run_namespace = sqlc.arg(run_namespace),
+  created_head = sqlc.arg(created_head),
+  updated_at = sqlc.arg(updated_at)
+WHERE workspace_id = sqlc.arg(workspace_id)
+  AND id = sqlc.arg(worktree_id)
+  AND state = 'pending';
+
+-- name: CompleteWorktreeCreate :execrows
+UPDATE worktrees SET
+  state = 'ready',
+  pending_phase = '',
+  setup_state = sqlc.arg(setup_state),
+  setup_error = sqlc.arg(setup_error),
+  updated_at = sqlc.arg(updated_at)
+WHERE workspace_id = sqlc.arg(workspace_id)
+  AND id = sqlc.arg(worktree_id)
+  AND state = 'pending';
+
+-- name: CompareAndSwapWorktreeState :execrows
+UPDATE worktrees SET
+  state = sqlc.arg(next_state),
+  removal_mode = CASE WHEN sqlc.arg(next_state) = 'removing' THEN removal_mode ELSE '' END,
+  updated_at = sqlc.arg(updated_at)
+WHERE worktrees.workspace_id = sqlc.arg(workspace_id)
+  AND worktrees.id = sqlc.arg(worktree_id)
+  AND worktrees.state = sqlc.arg(expected_state)
+  AND (
+    sqlc.arg(next_state) <> 'removing'
+    OR NOT EXISTS (
+      SELECT 1 FROM worktree_exit_ops
+	  WHERE worktree_exit_ops.workspace_id = sqlc.arg(workspace_id)
+	    AND worktree_exit_ops.worktree_id = sqlc.arg(worktree_id)
+		AND worktree_exit_ops.state = 'running'
+    )
+  );
+
+-- name: FailWorktreeCreate :execrows
+UPDATE worktrees SET
+  state = 'failed',
+  create_error = sqlc.arg(create_error),
+  create_rollback_error = sqlc.arg(create_rollback_error),
+  updated_at = sqlc.arg(updated_at)
+WHERE workspace_id = sqlc.arg(workspace_id)
+  AND id = sqlc.arg(worktree_id)
+  AND state = 'pending';
+
+-- name: CompleteFailedWorktreeCreateRollback :execrows
+UPDATE worktrees SET
+  create_rollback_error = '',
+  updated_at = sqlc.arg(updated_at)
+WHERE workspace_id = sqlc.arg(workspace_id)
+  AND id = sqlc.arg(worktree_id)
+  AND state = 'failed';
+
+-- name: SetWorktreeState :execrows
+UPDATE worktrees SET
+  state = sqlc.arg(state),
+  removal_mode = CASE WHEN sqlc.arg(state) = 'removing' THEN removal_mode ELSE '' END,
+  updated_at = sqlc.arg(updated_at)
+WHERE workspace_id = sqlc.arg(workspace_id)
+  AND id = sqlc.arg(worktree_id);
+
+-- name: FenceWorktreeRemoval :execrows
+UPDATE worktrees SET
+  state = 'removing',
+  removal_mode = sqlc.arg(removal_mode),
+  updated_at = sqlc.arg(updated_at)
+WHERE worktrees.workspace_id = sqlc.arg(workspace_id)
+  AND worktrees.id = sqlc.arg(worktree_id)
+  AND worktrees.state = 'ready'
+  AND NOT EXISTS (
+    SELECT 1 FROM worktree_exit_ops
+    WHERE worktree_exit_ops.workspace_id = sqlc.arg(workspace_id)
+      AND worktree_exit_ops.worktree_id = sqlc.arg(worktree_id)
+      AND worktree_exit_ops.state = 'running'
+  );
+
+-- name: UpsertWorktreeStatus :execrows
+INSERT INTO worktree_status (
+  worktree_id, branch, detached, head_sha, dirty_files, insertions, deletions,
+  has_upstream, ahead, behind, read_error, refreshed_at
+)
+SELECT id, sqlc.narg(branch), sqlc.narg(detached), sqlc.narg(head_sha),
+  sqlc.narg(dirty_files), sqlc.narg(insertions), sqlc.narg(deletions),
+  sqlc.narg(has_upstream), sqlc.narg(ahead), sqlc.narg(behind),
+  sqlc.arg(read_error), sqlc.narg(refreshed_at)
+FROM worktrees
+WHERE workspace_id = sqlc.arg(workspace_id) AND id = sqlc.arg(worktree_id)
+ON CONFLICT(worktree_id) DO UPDATE SET
+  branch = excluded.branch,
+  detached = excluded.detached,
+  head_sha = excluded.head_sha,
+  dirty_files = excluded.dirty_files,
+  insertions = excluded.insertions,
+  deletions = excluded.deletions,
+  has_upstream = excluded.has_upstream,
+  ahead = excluded.ahead,
+  behind = excluded.behind,
+  read_error = excluded.read_error,
+  refreshed_at = excluded.refreshed_at;
+
+-- name: GetWorktreeStatus :one
+SELECT ws.* FROM worktree_status ws
+JOIN worktrees w ON w.id = ws.worktree_id
+WHERE w.workspace_id = sqlc.arg(workspace_id) AND w.id = sqlc.arg(worktree_id);
+
+-- name: InsertWorktreeExitOperation :exec
+INSERT INTO worktree_exit_ops (
+  op_id, workspace_id, worktree_id, action, state, started_at, finished_at
+) VALUES (
+  sqlc.arg(op_id), sqlc.arg(workspace_id), sqlc.arg(worktree_id), sqlc.arg(action),
+  sqlc.arg(state), sqlc.arg(started_at), sqlc.narg(finished_at)
+);
+
+-- name: FinishWorktreeExitOperation :execrows
+UPDATE worktree_exit_ops SET state = sqlc.arg(state), finished_at = sqlc.arg(finished_at)
+WHERE workspace_id = sqlc.arg(workspace_id)
+  AND worktree_id = sqlc.arg(worktree_id)
+  AND op_id = sqlc.arg(op_id)
+  AND state = 'running';
+
+-- name: ListRunningWorktreeExitOperations :many
+SELECT * FROM worktree_exit_ops
+WHERE state = 'running'
+ORDER BY started_at, op_id;
+
+-- name: FailRunningWorktreeExitOperations :exec
+UPDATE worktree_exit_ops SET state = 'failed', finished_at = sqlc.arg(finished_at)
+WHERE state = 'running';
+
+-- name: ListWorktreesAggregate :many
+SELECT * FROM worktrees WHERE state <> 'dismissed' ORDER BY created_at, id;
+
+-- name: RemoveMissingWorktree :execrows
+UPDATE worktrees SET state = 'dismissed', updated_at = sqlc.arg(updated_at)
+WHERE worktrees.workspace_id = sqlc.arg(workspace_id) AND worktrees.id = sqlc.arg(worktree_id) AND worktrees.state = 'missing'
+  AND NOT EXISTS (
+    SELECT 1 FROM sessions
+    WHERE sessions.workspace_id = worktrees.workspace_id AND sessions.worktree_id = worktrees.id
+      AND sessions.archived_at IS NULL
+  )
+  AND NOT EXISTS (
+    SELECT 1 FROM worktree_exit_ops
+    WHERE worktree_exit_ops.workspace_id = worktrees.workspace_id
+      AND worktree_exit_ops.worktree_id = worktrees.id
+      AND worktree_exit_ops.state = 'running'
+  );
+
+-- name: HasUnarchivedWorktreeSession :one
+SELECT CAST(EXISTS (
+  SELECT 1 FROM sessions
+  WHERE sessions.workspace_id = sqlc.arg(workspace_id) AND sessions.worktree_id = sqlc.arg(worktree_id)
+    AND sessions.archived_at IS NULL
+) AS INTEGER) AS bound;

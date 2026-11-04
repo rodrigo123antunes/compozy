@@ -1,0 +1,449 @@
+package transcript
+
+import (
+	"encoding/json"
+	"os"
+	"os/exec"
+	"strings"
+	"testing"
+	"time"
+	"unicode/utf8"
+
+	"github.com/compozy/compozy/internal/acp"
+	"github.com/compozy/compozy/internal/diagnostics"
+	redactpkg "github.com/compozy/compozy/internal/redact"
+	"github.com/compozy/compozy/internal/store"
+)
+
+func TestTranscriptRedactsSecretsAcrossDisplaySurfaces(t *testing.T) {
+	t.Parallel()
+
+	runtimeSecret := "sk-transcript-display-secret-123456"
+	unregisteredProviderSecret := "sk-ant-api03-abcdefghijklmnopqrstuv"
+	cleanup := diagnostics.RegisterDynamicSecret(runtimeSecret)
+	t.Cleanup(cleanup)
+
+	t.Run("Should redact live event payloads before UI projection", func(t *testing.T) {
+		t.Parallel()
+
+		leaks := []string{
+			runtimeSecret,
+			unregisteredProviderSecret,
+			"text-secret",
+			"compozy_claim_live_123",
+			"bearer-secret",
+			"failure-secret",
+			"runtime-secret",
+			"raw-secret",
+			"raw-private-camel",
+			"tool-name-secret",
+			"tool-input-secret",
+			"tool-credential-secret",
+			"attachment-name-secret",
+			"compozy_claim_attachment_123",
+		}
+		event := (acp.AgentEvent{
+			Type:      acp.EventTypeAgentMessage,
+			SessionID: "sess-redact",
+			TurnID:    "turn-redact",
+			Timestamp: time.Date(2026, 5, 19, 10, 0, 0, 0, time.UTC),
+			Text:      "assistant stdout " + runtimeSecret + " token=text-secret compozy_claim_live_123",
+			Error:     "Bearer bearer-secret",
+			Failure: &store.SessionFailure{
+				Kind:    store.FailurePrompt,
+				Summary: "secret_binding=failure-secret",
+			},
+			Runtime: &acp.RuntimeActivity{
+				LastActivityDetail: "token=runtime-secret",
+			},
+			Raw: json.RawMessage(
+				`{"access_token":"raw-secret","privateKey":"raw-private-camel","note":"` + runtimeSecret + `","opaque":"` + unregisteredProviderSecret + `"}`,
+			),
+		}).WithTool(
+			"token=tool-name-secret",
+			json.RawMessage(
+				`{"apiKey":"tool-input-secret","credential":"tool-credential-secret","command":"echo ok"}`,
+			),
+			false,
+		).WithAttachments([]acp.EventAttachment{{
+			ID:       "att-redact",
+			Name:     "token=attachment-name-secret compozy_claim_attachment_123.png",
+			MIMEType: "image/png",
+		}})
+
+		assertNoDisplayLeaks(t, RedactAgentEvent(event), leaks)
+		assertNoDisplayLeaks(t, UIAgentEventPayloadFromEvent(event), leaks)
+	})
+
+	t.Run("Should redact stored tool output before transcript and chat replay", func(t *testing.T) {
+		t.Parallel()
+
+		leaks := []string{
+			runtimeSecret,
+			"stdout-secret",
+			"stderr-secret",
+			"content-secret",
+			"raw-binding",
+			"raw-secret",
+			"input-secret",
+			"compozy_claim_tool_123",
+		}
+		payload, err := MarshalAgentEvent(acp.AgentEvent{
+			Type:      acp.EventTypeToolResult,
+			SessionID: "sess-redact",
+			TurnID:    "turn-redact",
+			Timestamp: time.Date(2026, 5, 19, 10, 0, 1, 0, time.UTC),
+			Title:     "Bash",
+			Raw: json.RawMessage(`{
+				"sessionUpdate":"tool_call_update",
+				"status":"completed",
+				"rawOutput":{
+					"stdout":"runtime ` + runtimeSecret + ` token=stdout-secret compozy_claim_tool_123",
+					"stderr":"Bearer stderr-secret",
+					"content":"secret_binding=raw-binding",
+					"api_key":"raw-secret"
+				},
+				"content":[{"type":"content","content":{"type":"text","text":"token=content-secret ` + runtimeSecret + `"}}],
+				"_meta":{"claudeCode":{"toolName":"Bash"}},
+				"rawInput":{"api_key":"input-secret","command":"echo ok"}
+			}`),
+		})
+		if err != nil {
+			t.Fatalf("MarshalAgentEvent() error = %v", err)
+		}
+		assertNoDisplayLeaks(t, payload, leaks)
+
+		events := []store.SessionEvent{{
+			ID:        "ev-redact-tool",
+			SessionID: "sess-redact",
+			TurnID:    "turn-redact",
+			Sequence:  1,
+			Type:      acp.EventTypeToolResult,
+			Content:   payload,
+			Timestamp: time.Date(2026, 5, 19, 10, 0, 1, 0, time.UTC),
+		}}
+		transcriptMessages, err := Assemble(events)
+		if err != nil {
+			t.Fatalf("Assemble() error = %v", err)
+		}
+		assertNoDisplayLeaks(t, transcriptMessages, leaks)
+
+		uiMessages, err := ToUIMessages(events)
+		if err != nil {
+			t.Fatalf("ToUIMessages() error = %v", err)
+		}
+		assertNoDisplayLeaks(t, uiMessages, leaks)
+	})
+}
+
+func TestTranscriptRuntimeMarkers(t *testing.T) {
+	t.Parallel()
+
+	timestamp := time.Date(2026, 5, 19, 12, 0, 0, 0, time.UTC)
+	tests := []struct {
+		name    string
+		turnID  string
+		kind    string
+		summary string
+		want    string
+	}{
+		{
+			name:    "Should render timeout marker from canonical marker event",
+			turnID:  "turn-timeout",
+			kind:    MarkerPromptTimeout,
+			summary: "Runtime activity timed out (30 seconds idle).",
+			want:    "Runtime activity timed out (30 seconds idle).",
+		},
+		{
+			name:    "Should render unhealthy marker from canonical marker event",
+			turnID:  "turn-unhealthy",
+			kind:    MarkerSessionUnhealthy,
+			summary: "Runtime health check failed; prompt may be stalled.",
+			want:    "Runtime health check failed; prompt may be stalled.",
+		},
+		{
+			name:    "Should render interrupted marker from canonical marker event",
+			turnID:  "turn-interrupt",
+			kind:    MarkerPromptInterrupted,
+			summary: "operator interrupted the turn",
+			want:    "operator interrupted the turn",
+		},
+	}
+
+	for index, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+
+			marker, err := NewMarker(
+				test.kind,
+				test.summary,
+				timestamp.Add(time.Duration(index)*time.Second),
+				map[string]any{"failure_count": 2},
+			)
+			if err != nil {
+				t.Fatalf("NewMarker() error = %v", err)
+			}
+			event, err := marker.AgentEvent("sess-marker", test.turnID)
+			if err != nil {
+				t.Fatalf("AgentEvent() error = %v", err)
+			}
+			events := []store.SessionEvent{
+				mustUIAgentSessionEvent(
+					t,
+					"ev-marker-"+test.turnID,
+					int64(index+1),
+					event.Timestamp,
+					event,
+				),
+			}
+			transcriptMessages, err := Assemble(events)
+			if err != nil {
+				t.Fatalf("Assemble() error = %v", err)
+			}
+			if got, want := len(transcriptMessages), 1; got != want {
+				t.Fatalf("len(transcriptMessages) = %d, want %d; messages=%#v", got, want, transcriptMessages)
+			}
+			if got, want := transcriptMessages[0].Role, RoleSystem; got != want {
+				t.Fatalf("transcript role = %q, want %q", got, want)
+			}
+			if got := transcriptMessages[0].Content; got != test.want {
+				t.Fatalf("transcript content = %q, want %q", got, test.want)
+			}
+
+			uiMessages, err := ToUIMessages(events)
+			if err != nil {
+				t.Fatalf("ToUIMessages() error = %v", err)
+			}
+			if got, want := len(uiMessages), 1; got != want {
+				t.Fatalf("len(uiMessages) = %d, want %d; messages=%#v", got, want, uiMessages)
+			}
+			if got, want := uiMessages[0].Role, UIRoleAssistant; got != want {
+				t.Fatalf("UI role = %q, want %q", got, want)
+			}
+			if got, want := len(uiMessages[0].Parts), 1; got != want {
+				t.Fatalf("UI marker parts = %d, want %d; parts=%#v", got, want, uiMessages[0].Parts)
+			}
+			markerPart := uiMessages[0].Parts[0]
+			if got, want := markerPart.Type, uiPartDataEvent; got != want {
+				t.Fatalf("UI marker part type = %q, want %q", got, want)
+			}
+			var payload struct {
+				Type string `json:"type"`
+				Raw  struct {
+					Kind       string         `json:"kind"`
+					OccurredAt string         `json:"occurred_at"`
+					Summary    string         `json:"summary"`
+					Evidence   map[string]any `json:"evidence"`
+				} `json:"raw"`
+			}
+			if err := json.Unmarshal(markerPart.Data, &payload); err != nil {
+				t.Fatalf("UI marker data payload = %q, unmarshal error = %v", markerPart.Data, err)
+			}
+			if got, want := payload.Type, event.Type; got != want {
+				t.Fatalf("UI marker event type = %q, want %q", got, want)
+			}
+			if got, want := payload.Raw.Kind, test.kind; got != want {
+				t.Fatalf("UI marker raw kind = %q, want %q", got, want)
+			}
+			if got, want := payload.Raw.Summary, test.want; got != want {
+				t.Fatalf("UI marker raw summary = %q, want %q", got, want)
+			}
+			gotOccurred, err := time.Parse(time.RFC3339Nano, payload.Raw.OccurredAt)
+			if err != nil {
+				t.Fatalf("UI marker raw occurred_at = %q, parse error = %v", payload.Raw.OccurredAt, err)
+			}
+			if !gotOccurred.Equal(marker.OccurredAt) {
+				t.Fatalf("UI marker raw occurred_at = %s, want %s", gotOccurred, marker.OccurredAt)
+			}
+			if got, want := payload.Raw.Evidence["failure_count"], float64(2); got != want {
+				t.Fatalf(
+					"UI marker raw evidence[failure_count] = %v, want %v; evidence=%#v",
+					got,
+					want,
+					payload.Raw.Evidence,
+				)
+			}
+		})
+	}
+}
+
+// Invariant (issue #923): marker identity handles survive redaction so each
+// delivered message keeps its own identity; secrets in evidence still do not.
+func TestTranscriptMarkerEvidenceIdentity(t *testing.T) {
+	t.Parallel()
+
+	t.Run("Should keep distinct ULID-shaped identities while redacting evidence secrets", func(t *testing.T) {
+		t.Parallel()
+
+		occurredAt := time.Date(2026, 10, 23, 17, 3, 2, 0, time.UTC)
+		identities := []string{"wake_01M5MV5SVJGJVBC5P1278DP0KA", "wake_01M5MV6A9XKQ2RTB7W3HZC4D8E"}
+		for _, identity := range identities {
+			marker, err := NewMarker(MarkerPromptSteered, "Subagent finished.", occurredAt, map[string]any{
+				"kind":           "subagent_wake",
+				"message_id":     identity,
+				"queue_entry_id": "inq_01M5MV7B2YLR3SUC8X4JAD5E9F",
+				"note":           "opaque sk-ant-api03-abcdefghijklmnopqrstuv",
+				"token_id":       "compozy_claim_identity_123",
+			})
+			if err != nil {
+				t.Fatalf("NewMarker() error = %v", err)
+			}
+			event, err := marker.AgentEvent("sess-identity", "turn-identity")
+			if err != nil {
+				t.Fatalf("AgentEvent() error = %v", err)
+			}
+			parsed, ok := ParseMarker(RedactAgentEvent(event).Raw)
+			if !ok {
+				t.Fatalf("ParseMarker(%s) = false", event.Raw)
+			}
+			if got := parsed.Evidence["message_id"]; got != identity {
+				t.Fatalf("evidence[message_id] = %v, want %q", got, identity)
+			}
+			if got, want := parsed.Evidence["queue_entry_id"], "inq_01M5MV7B2YLR3SUC8X4JAD5E9F"; got != want {
+				t.Fatalf("evidence[queue_entry_id] = %v, want %q", got, want)
+			}
+			for _, key := range []string{"note", "token_id"} {
+				if got, _ := parsed.Evidence[key].(string); strings.Contains(got, "sk-ant-api03") ||
+					strings.Contains(got, "claim_identity_123") {
+					t.Fatalf("evidence[%s] = %q, want secret redacted", key, got)
+				}
+			}
+		}
+	})
+}
+
+func TestTranscriptCompactionRedaction(t *testing.T) {
+	const helperEnv = "COMPOZY_TEST_COMPACTION_REDACTION_DISABLED"
+	if os.Getenv(helperEnv) == "1" {
+		redactpkg.SnapshotEnabled(false)
+	} else {
+		t.Run("Should protect compaction with additive redaction disabled", func(t *testing.T) {
+			t.Parallel()
+			cmd := exec.CommandContext(t.Context(), os.Args[0], "-test.run=^TestTranscriptCompactionRedaction$")
+			cmd.Env = append(os.Environ(), helperEnv+"=1")
+			if output, err := cmd.CombinedOutput(); err != nil {
+				t.Fatalf("disabled redaction subprocess: %v\n%s", err, output)
+			}
+		})
+	}
+
+	if os.Getenv(helperEnv) != "1" {
+		for _, test := range []struct {
+			name    string
+			summary string
+		}{
+			{
+				name:    "Should bound summaries expanded by final secret redaction",
+				summary: strings.Repeat("token=x ", 2048),
+			},
+			{
+				name:    "Should retain valid UTF-8 when final secret redaction expands summaries",
+				summary: "token=x " + strings.Repeat("界", 5458),
+			},
+		} {
+			t.Run(test.name, func(t *testing.T) {
+				t.Parallel()
+				observation := &acp.CompactionObservation{
+					CompactionID: "bounded", Status: "completed", Summary: test.summary, Terminal: true,
+				}
+				event := acp.AgentEvent{Type: acp.EventTypeCompaction, Compaction: observation}
+				redacted := RedactAgentEvent(event)
+				stored, err := MarshalAgentEvent(event)
+				if err != nil {
+					t.Fatalf("MarshalAgentEvent() error = %v", err)
+				}
+				var payload canonicalEventPayload
+				if err := json.Unmarshal([]byte(stored), &payload); err != nil {
+					t.Fatalf("decode canonical compaction: %v", err)
+				}
+				canonical := canonicalEventPayload{Type: acp.EventTypeCompaction, Summary: test.summary}
+				redactCanonicalPayload(&canonical)
+				for _, summary := range []string{redacted.Compaction.Summary, payload.Summary, canonical.Summary} {
+					if len(summary) > 16*1024 || !utf8.ValidString(summary) ||
+						!strings.HasSuffix(summary, " [summary truncated]") ||
+						strings.Contains(summary, "token=x") || !strings.Contains(summary, "token=[REDACTED]") {
+						t.Fatalf("summary bytes=%d valid=%t, want bounded redacted UTF-8 with truncation marker",
+							len(summary), utf8.ValidString(summary))
+					}
+				}
+				if payload.Summary != redacted.Compaction.Summary || canonical.Summary != payload.Summary ||
+					observation.Summary != test.summary {
+					t.Fatal("live and persisted summaries must agree without mutating the source")
+				}
+			})
+		}
+	}
+
+	t.Run("Should redact snapshot fields without mutating the source event", func(t *testing.T) {
+		t.Parallel()
+		observation := &acp.CompactionObservation{
+			CompactionID: "c1 COMPOZY_CLAIM_id-secret",
+			Status:       "_paused COMPOZY_CLAIM_status-secret",
+			Summary:      "preserved summary COMPOZY_CLAIM_secret-value token=summary-secret",
+			Error:        "preserved error COMPOZY_CLAIM_error-value token=error-secret",
+			Terminal:     true,
+		}
+		original := *observation
+		redacted := RedactAgentEvent(acp.AgentEvent{Type: acp.EventTypeCompaction, Compaction: observation})
+		assertNoDisplayLeaks(t, redacted, []string{
+			"COMPOZY_CLAIM_id-secret", "COMPOZY_CLAIM_status-secret", "COMPOZY_CLAIM_secret-value",
+			"COMPOZY_CLAIM_error-value", "summary-secret", "error-secret",
+		})
+		if redacted.Compaction == observation || *observation != original {
+			t.Fatal("RedactAgentEvent mutated or retained the source compaction pointer")
+		}
+		if redacted.Compaction.CompactionID != "c1 compozy_claim_[REDACTED]" ||
+			redacted.Compaction.Status != "_paused compozy_claim_[REDACTED]" || !redacted.Compaction.Terminal {
+			t.Fatalf(
+				"redacted compaction = %#v, want retained structural values and terminal state",
+				redacted.Compaction,
+			)
+		}
+		payload := canonicalEventPayload{
+			CompactionID: original.CompactionID, Status: original.Status,
+			Summary: original.Summary, Error: original.Error,
+		}
+		redactCanonicalPayload(&payload)
+		assertNoDisplayLeaks(t, payload, []string{
+			"COMPOZY_CLAIM_id-secret", "COMPOZY_CLAIM_status-secret", "COMPOZY_CLAIM_secret-value",
+			"COMPOZY_CLAIM_error-value", "summary-secret", "error-secret",
+		})
+	})
+
+	t.Run("Should protect raw unknown updates while retaining their JSON shape", func(t *testing.T) {
+		t.Parallel()
+		raw := json.RawMessage(
+			`{"sessionUpdate":"vendor_update","opaque":"COMPOZY_CLAIM_raw-value","compaction_id":"COMPOZY_CLAIM_raw-id-value","detail":{"summary":"token=summary-secret","apiKey":"raw-key-secret","count":3}}`,
+		)
+		event := RedactAgentEvent(acp.AgentEvent{Type: acp.EventTypeSystem, Raw: raw})
+		assertNoDisplayLeaks(
+			t,
+			event,
+			[]string{"COMPOZY_CLAIM_raw-value", "COMPOZY_CLAIM_raw-id-value", "summary-secret", "raw-key-secret"},
+		)
+		payload := canonicalEventPayload{Raw: raw}
+		redactCanonicalPayload(&payload)
+		assertNoDisplayLeaks(
+			t,
+			payload,
+			[]string{"COMPOZY_CLAIM_raw-value", "COMPOZY_CLAIM_raw-id-value", "summary-secret", "raw-key-secret"},
+		)
+		var decoded struct {
+			SessionUpdate string `json:"sessionUpdate"`
+			Detail        struct {
+				Count int `json:"count"`
+			} `json:"detail"`
+		}
+		if err := json.Unmarshal(event.Raw, &decoded); err != nil {
+			t.Fatalf("json.Unmarshal(redacted.Raw): %v", err)
+		}
+		if event.Type != acp.EventTypeSystem || decoded.SessionUpdate != "vendor_update" || decoded.Detail.Count != 3 {
+			t.Fatalf("redacted unknown update = %#v, want retained discriminator and count", decoded)
+		}
+		if string(
+			raw,
+		) != `{"sessionUpdate":"vendor_update","opaque":"COMPOZY_CLAIM_raw-value","compaction_id":"COMPOZY_CLAIM_raw-id-value","detail":{"summary":"token=summary-secret","apiKey":"raw-key-secret","count":3}}` {
+			t.Fatal("RedactAgentEvent mutated original raw JSON")
+		}
+	})
+}

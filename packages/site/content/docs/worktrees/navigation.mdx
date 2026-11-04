@@ -1,0 +1,95 @@
+---
+title: Navigation and Selection
+description: Select a Worktree or change an idle session’s environment without changing its conversation.
+---
+
+Worktrees appear beneath their parent workspace. Selecting one scopes Worktree-aware views in that
+window; it does not create daemon-global "current Worktree" state and does not change another window.
+
+## Select in Web
+
+1. Open the workspace switcher.
+2. Expand a Git-backed workspace.
+3. Select a ready Worktree.
+4. Open its detail view to read branch, dirty files, upstream position, pull-request state, and agent
+   activity.
+
+Expected result: the window keeps the same `workspace_id` and stores the selected `worktree_id` in
+its route. Refreshing the page restores that nested selection. A missing selection resolves to the
+Worktree recovery view; it never silently falls back to the workspace root.
+
+Clean discovered checkouts are selectable; selecting one opens the adoption confirmation before
+CompozyOS binds work to it. Stale or unavailable discoveries stay inert. Pending, failed, missing,
+removing, removed, and dismissed records cannot host new work.
+
+## Start a session in an existing Worktree
+
+```bash
+compozy session new --workspace . --worktree feature-auth --agent general -o json
+```
+
+Expected result includes the same workspace and a resolved Worktree binding:
+
+```json
+{
+  "workspace_id": "ws_01...",
+  "workspace_path": "/src/acme",
+  "worktree_id": "wt_01..."
+}
+```
+
+The daemon resolves the Worktree's canonical path before the first prompt, while the public session
+record keeps the parent workspace path and the resolved `worktree_id`. The session keeps the parent
+workspace's agents, skills, configuration overlay, and permission mode.
+
+## Create and bind in one request
+
+```bash
+compozy session new --workspace . --new-worktree feature-api --agent general -o json
+```
+
+CompozyOS materializes the Worktree to `ready` before it creates the session. A setup-command failure
+leaves a usable `ready` Worktree with `setup_state: "failed"` and a bounded `setup_error`; the session
+can still bind to it.
+
+`--worktree`, `--new-worktree`, and `--cwd` are mutually exclusive. An empty Worktree selector means
+the workspace root only where the owning session API explicitly defines that choice.
+
+## Change an existing session's environment
+
+Open the environment control in the session composer and choose **Use worktree…**. For a bound
+session, choose **Change worktree…** or **Use workspace root**. The session must be idle, and the
+target must be a ready Worktree in the same workspace and profile. **New worktree…** creates a
+checkout first; confirm **Use worktree** after it is ready.
+
+The session ID, transcript, window, and session-list row stay the same. Branch, pull-request,
+worktree status, and delivery controls reflect the selected environment. Files and uncommitted
+changes stay in their original checkouts. The daemon verifies that the previous provider process
+has exited before accepting the new execution directory. The next turn resumes the conversation
+in that root, using native provider resume when supported or bounded transcript replay otherwise,
+and includes a one-time notice that the working directory changed.
+
+```bash
+compozy session worktree bind <session> feature-auth
+compozy session worktree bind <session> feature-api --expected-worktree <current-worktree-id>
+compozy session worktree unbind <session>
+```
+
+`--expected-worktree` detects concurrent changes; an explicit empty value expects the workspace
+root. A busy session returns `session_busy` immediately, including an agent attempting to bind
+itself during its own turn. There is no deferred binding. Archived sessions, system roles,
+task/Loop/review/subagent-owned execution, and User-scope sessions cannot change environments.
+
+The HTTP and UDS surfaces return the same session through
+`PUT /api/workspaces/{ws}/sessions/{id}/worktree` with `{ "worktree": "feature-auth",
+"expected_worktree_id": "" }`, or `DELETE` on that path with an optional
+`expected_worktree_id` query parameter. App tokens cannot call these operations.
+
+An interrupted durable binding transition is recovered on restart. A missing checkout never
+silently falls back to the workspace root; explicitly choose **Use workspace root** to leave it.
+
+## Fork into another Worktree
+
+**Fork into a worktree…**, `/worktree`, and `/worktree-fork` retain their existing behavior: they
+create a fresh session and leave the original session, transcript, and environment unchanged.
+Use them when you want a separate conversation instead of moving the current session's execution.

@@ -1,0 +1,39 @@
+package spec
+
+import (
+	"github.com/compozy/compozy/internal/api/contract"
+	"github.com/compozy/compozy/internal/workspaceaccess"
+	"github.com/getkin/kin-openapi/openapi3"
+)
+
+func describeTaskBlockedReasonsProperty(schema *openapi3.Schema) {
+	if schema == nil || schema.Properties == nil {
+		return
+	}
+	property := schema.Properties["blocked_reasons"]
+	if property == nil || property.Value == nil {
+		return
+	}
+	property.Value.Description = "Read projection of current blocking causes; mutation responses may omit it."
+}
+
+func customizeSchedulerDrainRequestSchema(schema *openapi3.Schema) {
+	if schema == nil || schema.Properties == nil {
+		return
+	}
+	timeoutSeconds := schema.Properties["timeout_seconds"]
+	if timeoutSeconds == nil || timeoutSeconds.Value == nil {
+		return
+	}
+	timeoutSeconds.Value.
+		WithMin(0).
+		WithMax(float64(contract.SchedulerDrainTimeoutMaxSeconds))
+}
+
+func customizeUserScopeInputSchema(schema *openapi3.Schema) {
+	if schema == nil || schema.Properties["scope"] == nil || schema.Properties["scope"].Value == nil {
+		return
+	}
+	scope := schema.Properties["scope"].Value
+	scope.Enum = append(scope.Enum, "user", workspaceaccess.UserSelector)
+}

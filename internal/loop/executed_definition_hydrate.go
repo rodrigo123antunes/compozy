@@ -1,0 +1,53 @@
+package loop
+
+import (
+	"fmt"
+	"strings"
+
+	"github.com/compozy/compozy/internal/loop/dsl/refs"
+)
+
+func hydrateExecutedDefinitionSnapshot(
+	envelope *executedDefinitionSnapshot,
+) (*ResolvedDefinition, error) {
+	resolved := &ResolvedDefinition{
+		Definition:             envelope.Definition,
+		DefinitionVersion:      envelope.DefinitionVersion,
+		InstalledFromExtension: strings.TrimSpace(envelope.InstalledFromExtension),
+		ExtensionOwner:         strings.TrimSpace(envelope.ExtensionOwner),
+		Templates:              map[string]*refs.Template{},
+		Conditions:             map[string]*refs.Condition{},
+		ToolSchemas:            cloneToolSchemaSnapshots(envelope.ToolSchemas),
+		WatchEventsContracts:   cloneWatchEventsContracts(envelope.WatchEventsContracts),
+		Defaults:               envelope.Defaults,
+		EffectiveConfig:        cloneEffectiveConfig(envelope.EffectiveConfig),
+		compiled:               true,
+	}
+	definition := resolved.Definition
+	definition.Normalize()
+	resolved.Definition = definition
+	if len(envelope.TemplateSources) == 0 && len(envelope.ConditionSources) == 0 {
+		return resolved, nil
+	}
+	context := newLintContext(definition, &DefinitionLinter{})
+	// Persisted snapshots were compiled with the historical implicit run-loop schema.
+	// Keep that namespace while rebuilding their template manifest.
+	context.legacyRunLoopOutputSchema = true
+	context.indexGraphTrusted()
+	if err := compileContract(resolved, definition, context, context.namespace(false, false)); err != nil {
+		return nil, fmt.Errorf("loop: hydrate executed contract: %w", err)
+	}
+	if err := compileStarts(resolved, definition, context); err != nil {
+		return nil, fmt.Errorf("loop: hydrate executed starts: %w", err)
+	}
+	for _, node := range definition.Graph.Nodes {
+		namespace := context.namespaceForNode(node.ID, context.hasTriggerStart())
+		if err := compileNode(resolved, node, namespace, context); err != nil {
+			return nil, fmt.Errorf("loop: hydrate executed node %s: %w", node.ID, err)
+		}
+	}
+	if err := compileSubLoopBodies(resolved, definition, nil, true); err != nil {
+		return nil, fmt.Errorf("loop: hydrate executed sub-loops: %w", err)
+	}
+	return resolved, nil
+}

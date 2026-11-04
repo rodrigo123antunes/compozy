@@ -1,49 +1,13 @@
-import type { ReactElement } from "react";
+import { createFileRoute } from "@tanstack/react-router";
 
-import {
-  createFileRoute,
-  Outlet,
-  useRouter,
-  type ErrorComponentProps,
-  type NotFoundRouteProps,
-} from "@tanstack/react-router";
-
-import { AppShellBoundary, AppShellContainer, AppShellErrorBoundary } from "@/systems/app-shell";
+import { preloadAppRoute, prepareAppProfile } from "./_app/-app-preload";
+import { DesktopShell, DesktopShellSkeleton, OsRouteNotFound } from "@/systems/os";
 
 export const Route = createFileRoute("/_app")({
-  component: AppLayoutRoute,
-  errorComponent: AppRouteErrorBoundary,
-  notFoundComponent: AppRouteNotFoundBoundary,
+  beforeLoad: ({ context }) => prepareAppProfile(context.queryClient),
+  loader: ({ context }) => preloadAppRoute(context.queryClient),
+  component: DesktopShell,
+  // Shown only when identity and workspace reads outlast the router's pending threshold.
+  pendingComponent: DesktopShellSkeleton,
+  notFoundComponent: OsRouteNotFound,
 });
-
-function AppLayoutRoute(): ReactElement {
-  return (
-    <AppShellContainer>
-      <Outlet />
-    </AppShellContainer>
-  );
-}
-
-function AppRouteErrorBoundary({ error, reset }: ErrorComponentProps): ReactElement {
-  const router = useRouter();
-  return (
-    <AppShellErrorBoundary
-      error={error}
-      onRetry={() => {
-        reset();
-        void router.invalidate({ forcePending: true });
-      }}
-    />
-  );
-}
-
-function AppRouteNotFoundBoundary({ data: _data }: NotFoundRouteProps): ReactElement {
-  return (
-    <AppShellBoundary
-      description="The requested route does not exist in the daemon web UI."
-      eyebrow="Not found"
-      testId="app-route-not-found"
-      title="Page not found"
-    />
-  );
-}

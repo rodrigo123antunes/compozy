@@ -1,0 +1,333 @@
+package httpapi
+
+import (
+	"io/fs"
+	"log/slog"
+	"time"
+
+	authproviders "github.com/compozy/compozy/internal/providers"
+
+	"github.com/compozy/compozy/internal/agentmemory"
+
+	"github.com/compozy/compozy/internal/api/core"
+	"github.com/compozy/compozy/internal/cmdpalette"
+	compozyconfig "github.com/compozy/compozy/internal/config"
+	"github.com/compozy/compozy/internal/doctor"
+	"github.com/compozy/compozy/internal/gateway"
+	"github.com/compozy/compozy/internal/session"
+	"github.com/compozy/compozy/internal/store"
+	toolspkg "github.com/compozy/compozy/internal/tools"
+	"github.com/compozy/compozy/internal/workspaceaccess"
+	"github.com/gin-gonic/gin"
+)
+
+const (
+	handlersLocalhostKey               = "localhost"
+	defaultGatewayIngressRequestLimit  = 60
+	defaultGatewayIngressRequestWindow = time.Minute
+)
+
+type handlerConfig struct {
+	agentInstances        *core.AgentInstanceAPI
+	sessions              core.SessionManager
+	drainController       core.DaemonDrainController
+	subagents             session.SubagentService
+	sessionMonitors       core.SessionMonitorService
+	sessionProcesses      core.SessionProcessService
+	sessionCatalog        core.SessionCatalog
+	taskDesignations      core.TaskDesignationStore
+	skillExposureStore    store.SkillExposureRepository
+	skillExposureEvents   store.EventSummaryStore
+	tasks                 core.TaskService
+	observer              core.Observer
+	schemaStreams         core.SchemaStreamStatusReader
+	resources             core.ResourceService
+	windowManager         core.WindowManagerProvider
+	terminal              core.TerminalProvider
+	automation            core.AutomationManager
+	loops                 core.LoopService
+	profiles              core.ProfileService
+	supportBundles        core.SupportBundleService
+	tools                 core.ToolRegistry
+	toolArtifacts         toolspkg.ToolArtifactStore
+	sessionAttachments    core.SessionAttachmentStore
+	sessionFiles          core.SessionFileSearcher
+	toolsets              core.ToolsetRegistry
+	toolApprovals         core.ToolApprovalIssuer
+	approvalGrants        core.ToolApprovalGrantService
+	approvalCoordinator   toolspkg.ApprovalCoordinator
+	cmdPalette            cmdpalette.Registry
+	clarify               toolspkg.ClarifyBroker
+	settings              core.SettingsService
+	settingsRestart       core.SettingsRestartController
+	settingsUpdate        core.SettingsUpdateController
+	vault                 core.VaultService
+	workspaces            core.WorkspaceService
+	worktrees             core.WorktreeService
+	workspaceAccess       workspaceaccess.Policy
+	onboarding            core.OnboardingStore
+	agentCatalog          core.AgentCatalog
+	agentSync             core.AgentDefinitionSync
+	contextWindowResolver core.ContextWindowResolver
+	modelCatalog          core.ModelCatalogService
+	providerUsage         core.ProviderUsageService
+	marketplaceCatalog    core.MarketplaceCatalogService
+	agentContext          core.AgentContextService
+	coordinatorRole       core.CoordinatorRoleResolver
+	roles                 core.RolesStatusProvider
+	soulAuthoring         core.SoulAuthoringService
+	agentMemory           *agentmemory.Store
+	soulHistoryPurger     core.SoulHistoryPurger
+	soulRefresher         core.SoulRefresher
+	heartbeatAuthor       core.HeartbeatAuthoringService
+	heartbeatPurger       core.HeartbeatHistoryPurger
+	heartbeatStatus       core.HeartbeatStatusService
+	heartbeatWake         core.HeartbeatWakeService
+	sessionHealth         core.SessionHealthReader
+	wakeEvents            core.HeartbeatWakeEventReader
+	skillsRegistry        core.SkillsRegistry
+	skillResources        core.SkillResourceSyncer
+	runtimeMemory         doctor.RuntimeMemorySnapshotSource
+	hostLoad              doctor.HostLoadSnapshotSource
+	deadEntities          doctor.DeadEntitySource
+	appTokens             core.AppTokenManager
+	openAPI               *core.OpenAPIDocument
+	gateway               core.GatewayService
+	gatewayAdmission      gateway.AdmissionController
+	deviceAuth            gateway.DeviceAuthenticator
+	authLimiter           *gateway.AuthFailureLimiter
+	ingressLimiter        *gateway.IngressRateLimiter
+	surfaceSet            SurfaceSet
+	staticFS              fs.FS
+	homePaths             compozyconfig.HomePaths
+	config                compozyconfig.Config
+	boundHost             string
+	logger                *slog.Logger
+	startedAt             time.Time
+	now                   func() time.Time
+	pollInterval          time.Duration
+	agentLoader           core.AgentLoader
+	httpPort              int
+	resourceAuth          []gin.HandlerFunc
+	extensions            ExtensionService
+
+	onProviderAuthSuccess func()
+	providerAuthVerdicts  *authproviders.AuthVerdicts
+}
+
+// Handlers expose request/response and SSE endpoints for the Compozy API.
+type Handlers struct {
+	*core.BaseHandlers
+	staticFS         fs.FS
+	resourceAuth     []gin.HandlerFunc
+	Extensions       ExtensionService
+	boundHost        string
+	deviceAuth       gateway.DeviceAuthenticator
+	gatewayAdmission gateway.AdmissionController
+	authLimiter      *gateway.AuthFailureLimiter
+	ingressLimiter   *gateway.IngressRateLimiter
+}
+
+const (
+	defaultGatewayAuthFailureLimit  = 10
+	defaultGatewayAuthFailureWindow = time.Minute
+)
+
+func newDefaultGatewayAuthFailureLimiter() *gateway.AuthFailureLimiter {
+	return gateway.NewAuthFailureLimiter(
+		defaultGatewayAuthFailureLimit,
+		defaultGatewayAuthFailureWindow,
+		func() time.Time { return time.Now().UTC() },
+	)
+}
+
+func newHandlers(cfg *handlerConfig) *Handlers {
+	if cfg == nil {
+		cfg = &handlerConfig{}
+	}
+
+	if cfg.pollInterval <= 0 {
+		cfg.pollInterval = defaultPollInterval
+	}
+	if cfg.httpPort <= 0 {
+		cfg.httpPort = cfg.config.HTTP.Port
+	}
+	boundHost := handlerBoundHost(cfg)
+	authLimiter := cfg.authLimiter
+	if authLimiter == nil {
+		authLimiter = newDefaultGatewayAuthFailureLimiter()
+	}
+	ingressLimiter := cfg.ingressLimiter
+	if ingressLimiter == nil {
+		ingressLimiter = gateway.NewIngressRateLimiter(
+			defaultGatewayIngressRequestLimit,
+			defaultGatewayIngressRequestWindow,
+			func() time.Time { return time.Now().UTC() },
+		)
+	}
+	gatewayAdmission := cfg.gatewayAdmission
+	if gatewayAdmission == nil {
+		if admission, ok := cfg.gateway.(gateway.AdmissionController); ok {
+			gatewayAdmission = admission
+		}
+	}
+
+	return &Handlers{
+		BaseHandlers:     core.NewBaseHandlers(coreHandlerConfig(cfg, boundHost)),
+		staticFS:         cfg.staticFS,
+		resourceAuth:     append([]gin.HandlerFunc(nil), cfg.resourceAuth...),
+		Extensions:       cfg.extensions,
+		boundHost:        boundHost,
+		deviceAuth:       cfg.deviceAuth,
+		gatewayAdmission: gatewayAdmission,
+		authLimiter:      authLimiter,
+		ingressLimiter:   ingressLimiter,
+	}
+}
+
+func coreHandlerConfig(cfg *handlerConfig, boundHost string) *core.BaseHandlerConfig {
+	config := coreHandlerDependencies(cfg)
+
+	coreConfig := cfg.config
+	coreConfig.HTTP.Host = boundHost
+	config.TransportName = "httpapi"
+	config.MaskInternalErrors = true
+	config.IncludeSessionWorkspaceInSSE = true
+	config.SkillExposures = cfg.skillExposureStore
+	config.SkillExposureEvents = cfg.skillExposureEvents
+	config.GatewayPairingSource = gatewayPairingSource(cfg.surfaceSet)
+	config.Config = coreConfig
+	config.Logger = cfg.logger
+	config.StartedAt = cfg.startedAt
+	config.Now = cfg.now
+	config.PollInterval = cfg.pollInterval
+	config.HTTPPort = cfg.httpPort
+	return config
+}
+
+func coreHandlerDependencies(cfg *handlerConfig) *core.BaseHandlerConfig {
+	return &core.BaseHandlerConfig{
+		SoulAuthoring:          cfg.soulAuthoring,
+		AgentMemory:            cfg.agentMemory,
+		SoulHistoryPurger:      cfg.soulHistoryPurger,
+		SoulRefresher:          cfg.soulRefresher,
+		HeartbeatAuthoring:     cfg.heartbeatAuthor,
+		HeartbeatHistoryPurger: cfg.heartbeatPurger,
+		HeartbeatStatus:        cfg.heartbeatStatus,
+		AgentInstances:         cfg.agentInstances,
+		HeartbeatWake:          cfg.heartbeatWake,
+		HeartbeatWakeEvents:    cfg.wakeEvents,
+		Sessions:               cfg.sessions,
+		SessionAcceptance:      sessionAcceptanceManager(cfg.sessions),
+		DrainController:        cfg.drainController,
+		Subagents:              cfg.subagents,
+		SessionMonitors:        cfg.sessionMonitors,
+		SessionProcesses:       cfg.sessionProcesses,
+		SessionCatalog:         cfg.sessionCatalog,
+		TaskDesignations:       cfg.taskDesignations,
+		Tasks:                  cfg.tasks,
+		Observer:               cfg.observer,
+		SchemaStreams:          cfg.schemaStreams,
+		Resources:              cfg.resources,
+		WindowManager:          cfg.windowManager,
+		Terminal:               cfg.terminal,
+		Extensions:             cfg.extensions,
+		Automation:             cfg.automation,
+		Loops:                  cfg.loops,
+		Profiles:               cfg.profiles,
+		SupportBundles:         cfg.supportBundles,
+		Tools:                  cfg.tools,
+		ToolArtifacts:          cfg.toolArtifacts,
+		SessionAttachments:     cfg.sessionAttachments,
+		SessionFiles:           cfg.sessionFiles,
+		Toolsets:               cfg.toolsets,
+		ToolApprovals:          cfg.toolApprovals,
+		ApprovalGrants:         cfg.approvalGrants,
+		ApprovalCoordinator:    cfg.approvalCoordinator,
+		CmdPalette:             cfg.cmdPalette,
+		Clarify:                cfg.clarify,
+		OnProviderAuthSuccess:  cfg.onProviderAuthSuccess,
+		ProviderAuthVerdicts:   cfg.providerAuthVerdicts,
+		Settings:               cfg.settings,
+		SettingsRestart:        cfg.settingsRestart,
+		SettingsUpdate:         cfg.settingsUpdate,
+		Vault:                  cfg.vault,
+		Workspaces:             cfg.workspaces,
+		Worktrees:              cfg.worktrees,
+		WorkspaceAccess:        cfg.workspaceAccess,
+		Onboarding:             cfg.onboarding,
+		AgentCatalog:           cfg.agentCatalog,
+		AgentDefinitionSync:    cfg.agentSync,
+		ContextWindowResolver:  cfg.contextWindowResolver,
+		ModelCatalog:           cfg.modelCatalog,
+		ProviderUsage:          cfg.providerUsage,
+		MarketplaceCatalog:     cfg.marketplaceCatalog,
+		AgentContextService:    cfg.agentContext,
+		CoordinatorRole:        cfg.coordinatorRole,
+		Roles:                  cfg.roles,
+		SessionHealth:          cfg.sessionHealth,
+		SkillsRegistry:         cfg.skillsRegistry,
+		SkillResources:         cfg.skillResources,
+		RuntimeMemory:          cfg.runtimeMemory,
+		HostLoad:               cfg.hostLoad,
+		DeadEntities:           cfg.deadEntities,
+		AppTokens:              cfg.appTokens,
+		OpenAPI:                cfg.openAPI,
+		Gateway:                cfg.gateway,
+		HomePaths:              cfg.homePaths,
+		AgentLoader:            cfg.agentLoader,
+	}
+}
+
+func gatewayPairingSource(surfaceSet SurfaceSet) string {
+	switch surfaceSet {
+	case SurfaceSetLocal:
+		return string(gateway.PairingSourceLocal)
+	case SurfaceSetPrivate:
+		return string(gateway.PairingSourcePrivate)
+	default:
+		return ""
+	}
+}
+
+func sessionAcceptanceManager(manager core.SessionManager) core.SessionAcceptanceManager {
+	accepted, ok := manager.(core.SessionAcceptanceManager)
+	if !ok {
+		return nil
+	}
+	return accepted
+}
+
+func (h *Handlers) setStreamDone(done <-chan struct{}) {
+	if h != nil && h.BaseHandlers != nil {
+		h.SetStreamDone(done)
+	}
+}
+
+func (h *Handlers) setHTTPPort(port int) {
+	if h != nil && h.BaseHandlers != nil {
+		h.SetHTTPPort(port)
+	}
+}
+
+func (h *Handlers) resourceAuthMiddleware() []gin.HandlerFunc {
+	if h == nil || len(h.resourceAuth) == 0 {
+		return nil
+	}
+	return append([]gin.HandlerFunc(nil), h.resourceAuth...)
+}
+
+func (h *Handlers) privilegedMutationGuard() gin.HandlerFunc {
+	boundHost := ""
+	if h != nil {
+		boundHost = h.boundHost
+	}
+	loopback := loopbackMutationGuard(boundHost)
+	return func(c *gin.Context) {
+		if c.GetString(appTokenOriginKey) != "" {
+			core.RespondAppTokenError(c, gateway.ErrAppTokenRouteForbidden, true)
+			return
+		}
+		loopback(c)
+	}
+}

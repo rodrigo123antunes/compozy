@@ -1,0 +1,57 @@
+-- name: UpsertExtensionEnvBinding :exec
+INSERT INTO extension_env_bindings (
+  extension_name, profile_id, workspace_id, env_name, secret_ref, input_id, active, mcp_server, header_name, kind, created_at, updated_at
+) VALUES (
+  sqlc.arg(extension_name), sqlc.arg(profile_id), sqlc.arg(workspace_id), sqlc.arg(env_name), sqlc.arg(secret_ref),
+  sqlc.arg(input_id), sqlc.arg(active),
+  sqlc.arg(mcp_server), sqlc.arg(header_name), sqlc.arg(kind), sqlc.arg(created_at), sqlc.arg(updated_at)
+)
+ON CONFLICT(extension_name, profile_id, workspace_id, env_name) DO UPDATE SET
+  secret_ref = excluded.secret_ref,
+  input_id = excluded.input_id,
+  active = excluded.active,
+  mcp_server = excluded.mcp_server,
+  header_name = excluded.header_name,
+  kind = excluded.kind,
+  updated_at = excluded.updated_at;
+
+-- name: ListExtensionEnvBindings :many
+SELECT extension_name, profile_id, workspace_id, env_name, secret_ref, input_id, active, mcp_server, header_name, kind, created_at, updated_at
+FROM extension_env_bindings
+WHERE extension_name = sqlc.arg(extension_name)
+  AND profile_id = sqlc.arg(profile_id)
+  AND workspace_id = sqlc.arg(workspace_id)
+ORDER BY env_name ASC;
+
+-- name: CountExtensionEnvBindingsBySecretRef :one
+SELECT COUNT(*)
+FROM extension_env_bindings
+WHERE secret_ref = sqlc.arg(secret_ref);
+
+-- name: DeleteExtensionEnvBinding :execrows
+DELETE FROM extension_env_bindings
+WHERE extension_name = sqlc.arg(extension_name)
+  AND profile_id = sqlc.arg(profile_id)
+  AND workspace_id = sqlc.arg(workspace_id)
+  AND env_name = sqlc.arg(env_name);
+
+-- name: DeleteExtensionEnvBindings :execrows
+DELETE FROM extension_env_bindings
+WHERE extension_name = sqlc.arg(extension_name)
+  AND profile_id = sqlc.arg(profile_id)
+  AND workspace_id = sqlc.arg(workspace_id);
+
+-- name: ListExtensionEnvSecretRefsByWorkspace :many
+SELECT DISTINCT secret_ref
+FROM extension_env_bindings
+WHERE workspace_id = sqlc.arg(workspace_id)
+ORDER BY secret_ref ASC;
+
+-- name: DeleteExtensionEnvBindingsByWorkspace :execrows
+DELETE FROM extension_env_bindings
+WHERE workspace_id = sqlc.arg(workspace_id);
+
+-- name: ListExtensionEnvBindingScopes :many
+SELECT DISTINCT profile_id, workspace_id FROM extension_env_bindings
+WHERE extension_name = sqlc.arg(extension_name)
+ORDER BY profile_id, workspace_id;

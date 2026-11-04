@@ -1,0 +1,275 @@
+package observe
+
+import (
+	"cmp"
+	"context"
+	"errors"
+	"fmt"
+	"os"
+	"path/filepath"
+	"slices"
+	"strings"
+
+	"github.com/compozy/compozy/internal/session"
+	speedpkg "github.com/compozy/compozy/internal/speed"
+	"github.com/compozy/compozy/internal/store"
+)
+
+// Reconcile scans the sessions directory and reconciles the global session index.
+func (o *Observer) Reconcile(ctx context.Context) (store.ReconcileResult, error) {
+	recovered, err := o.loadSessionMetadata(ctx)
+	if err != nil {
+		return store.ReconcileResult{}, err
+	}
+
+	sessions := make([]store.SessionInfo, 0, len(recovered))
+	creationIndexed := make([]string, 0)
+	for index := range recovered {
+		recoveredSession := &recovered[index]
+		created, err := o.reconcileRecoveredSessionCreation(ctx, recoveredSession)
+		if err != nil {
+			return store.ReconcileResult{}, err
+		}
+		if created {
+			creationIndexed = append(creationIndexed, recoveredSession.ID)
+		}
+		sessions = append(sessions, recoveredSession.SessionInfo)
+	}
+
+	result, err := o.registry.ReconcileSessions(ctx, sessions)
+	if err != nil {
+		return store.ReconcileResult{}, fmt.Errorf("observe: reconcile sessions: %w", err)
+	}
+	result.Indexed = append(result.Indexed, creationIndexed...)
+	slices.Sort(result.Indexed)
+
+	return result, nil
+}
+
+type recoveredSession struct {
+	store.SessionInfo
+	creationProfile  *store.SessionCreationProfile
+	creationIdentity *store.SessionCreationIdentity
+}
+
+func (o *Observer) reconcileRecoveredSessionCreation(
+	ctx context.Context,
+	recovered *recoveredSession,
+) (bool, error) {
+	if recovered == nil {
+		return false, errors.New("observe: recovered session is required")
+	}
+	if recovered.creationProfile == nil && recovered.creationIdentity == nil {
+		return false, nil
+	}
+	if recovered.creationProfile == nil || recovered.creationIdentity == nil {
+		return false, fmt.Errorf("observe: incomplete session creation metadata for %q", recovered.ID)
+	}
+	creationStore, ok := o.registry.(store.SessionCreationStore)
+	if !ok {
+		return false, fmt.Errorf("observe: session creation store is unavailable for %q", recovered.ID)
+	}
+	profileRef, err := creationStore.PutSessionCreationProfile(ctx, *recovered.creationProfile)
+	if err != nil {
+		return false, fmt.Errorf("observe: persist session creation profile for %q: %w", recovered.ID, err)
+	}
+	if profileRef != recovered.creationIdentity.CreationProfileRef {
+		return false, fmt.Errorf("observe: session creation profile ref changed for %q", recovered.ID)
+	}
+	registration, err := creationStore.RegisterSessionWithCreationIdentity(
+		ctx,
+		&(recovered.SessionInfo),
+		*recovered.creationIdentity,
+	)
+	if err != nil {
+		return false, fmt.Errorf("observe: register session creation identity for %q: %w", recovered.ID, err)
+	}
+	return registration.Created, nil
+}
+
+func (o *Observer) loadSessionMetadata(ctx context.Context) ([]recoveredSession, error) {
+	entries, err := os.ReadDir(o.homePaths.SessionsDir)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return nil, nil
+		}
+		return nil, fmt.Errorf("observe: read sessions directory %q: %w", o.homePaths.SessionsDir, err)
+	}
+
+	sessions := make([]recoveredSession, 0, len(entries))
+	for _, entry := range entries {
+		if !entry.IsDir() {
+			continue
+		}
+		recovered, ok := o.loadRecoveredSession(ctx, entry.Name())
+		if ok {
+			sessions = append(sessions, recovered)
+		}
+	}
+
+	slices.SortFunc(sessions, func(a, b recoveredSession) int {
+		return cmp.Compare(a.ID, b.ID)
+	})
+
+	return sessions, nil
+}
+
+func (o *Observer) loadRecoveredSession(ctx context.Context, entryName string) (recoveredSession, bool) {
+	sessionDir := filepath.Join(o.homePaths.SessionsDir, entryName)
+	metaPath := store.SessionMetaFile(sessionDir)
+	meta, err := store.ReadSessionMeta(metaPath)
+	if err != nil {
+		if !errors.Is(err, os.ErrNotExist) {
+			o.logger.Warn(
+				"observe: skipping unreadable session metadata",
+				"session_id", strings.TrimSpace(entryName),
+				"path", metaPath,
+				"error", err,
+			)
+		}
+		return recoveredSession{}, false
+	}
+
+	sessionID := strings.TrimSpace(meta.ID)
+	if reason := session.RecoveryMetadataSkipReason(&meta); reason != "" {
+		o.warnSkippedSessionRecovery(&meta, reason)
+		return recoveredSession{}, false
+	}
+	if strings.TrimSpace(meta.Provider) == "" {
+		o.logger.Warn(
+			"observe: skipping invalid session metadata",
+			"session_id", sessionID,
+			"path", metaPath,
+			"error", "session provider is required",
+		)
+		return recoveredSession{}, false
+	}
+	ownerAuthoritative, err := o.verifyRecoveredSessionOwner(ctx, entryName, &meta)
+	if err != nil {
+		o.logger.Warn(
+			"observe: skipping session with unverified durable owner",
+			"session_id", sessionID,
+			"path", metaPath,
+			"error", err,
+		)
+		return recoveredSession{}, false
+	}
+	if ownerAuthoritative && meta.WorktreeTransition != nil && meta.WorktreeTransition.Pending {
+		bindingStore, ok := o.registry.(store.SessionWorktreeBindingStore)
+		if !ok {
+			o.logger.Warn("observe: worktree binding recovery store is unavailable", "session_id", sessionID)
+			return recoveredSession{}, false
+		}
+		if err := store.RecoverSessionWorktreeTransition(ctx, bindingStore, metaPath, &meta); err != nil {
+			o.logger.Warn("observe: cannot recover worktree binding", "session_id", sessionID, "error", err)
+			return recoveredSession{}, false
+		}
+	}
+	normalized := o.normalizeRecoveredMeta(metaPath, &meta, ownerAuthoritative)
+	return recoveredSessionFromMeta(&normalized), true
+}
+
+func (o *Observer) warnSkippedSessionRecovery(meta *store.SessionMeta, reason string) {
+	sessionID := strings.TrimSpace(meta.ID)
+	o.mu.Lock()
+	if o.recoverySkipped == nil {
+		o.recoverySkipped = make(map[string]struct{})
+	}
+	_, logged := o.recoverySkipped[sessionID]
+	o.recoverySkipped[sessionID] = struct{}{}
+	o.mu.Unlock()
+	if logged {
+		return
+	}
+	spawnRole := ""
+	if meta.Lineage != nil {
+		spawnRole = meta.Lineage.SpawnRole
+	}
+	o.logger.Warn("observe.session_recovery_skipped",
+		"session_id", sessionID,
+		"session_type", meta.SessionType,
+		"spawn_role", spawnRole,
+		"reason", reason,
+	)
+}
+
+func recoveredSessionFromMeta(meta *store.SessionMeta) recoveredSession {
+	stopReason := store.StopReason("")
+	if meta.StopReason != nil {
+		stopReason = *meta.StopReason
+	}
+	selectedRuntime, selectionRevision := store.SessionRuntimeSelectionStateValues(meta.RuntimeSelectionValue())
+	recovered := recoveredSession{
+		InitiatorKind:            meta.InitiatorKind,
+		InitiatorID:              meta.InitiatorID,
+		ID:                       meta.ID,
+		ProfileID:                meta.ProfileID,
+		Name:                     meta.Name,
+		AgentName:                meta.AgentName,
+		Provider:                 meta.Provider,
+		Model:                    strings.TrimSpace(meta.Model),
+		ReasoningEffort:          strings.TrimSpace(meta.ReasoningEffort),
+		Speed:                    meta.Speed,
+		SpeedResolution:          speedpkg.CloneResolution(meta.SpeedResolution),
+		RuntimeStatus:            meta.RuntimeStatus,
+		RuntimeTransition:        meta.RuntimeTransition,
+		RuntimeFailure:           meta.RuntimeFailureValue(),
+		RuntimeGeneration:        meta.RuntimeGeneration,
+		SelectedRuntime:          selectedRuntime,
+		RuntimeSelectionRevision: selectionRevision,
+		WorkspaceID:              meta.WorkspaceID,
+		WorktreeID:               meta.WorktreeIDValue(),
+		SessionType:              meta.SessionType,
+		Lineage:                  store.CloneSessionLineage(meta.Lineage),
+		State:                    meta.State,
+		ACPSessionID:             meta.ACPSessionID,
+		StopReason:               stopReason,
+		StopEscalated:            meta.StopEscalated,
+		StopVerificationFailed:   meta.StopVerificationFailed,
+		StopDetail:               meta.StopDetail,
+		Failure:                  store.CloneSessionFailure(meta.Failure),
+		Liveness:                 store.CloneSessionLivenessMeta(meta.Liveness),
+
+		SoulSnapshotID:   strings.TrimSpace(meta.SoulSnapshotID),
+		SoulDigest:       strings.TrimSpace(meta.SoulDigest),
+		ParentSoulDigest: strings.TrimSpace(meta.ParentSoulDigest),
+		CreatedAt:        meta.CreatedAt,
+		UpdatedAt:        meta.UpdatedAt}
+	recovered.SetACPOptions(meta.ACPOptionsValue())
+	recovered.SetRuntimeRecovery(meta.RuntimeRecoveryValue())
+	if meta.CreationProfile != nil {
+		profile := store.NormalizeSessionCreationProfile(*meta.CreationProfile)
+		identity := store.SessionCreationIdentity{
+			CreationProfileRef: strings.TrimSpace(meta.CreationProfileRef),
+			PolicySpecDigest:   strings.TrimSpace(meta.PolicySpecDigest),
+			CreationDigest:     strings.TrimSpace(meta.CreationDigest),
+		}
+		recovered.creationProfile = &profile
+		recovered.creationIdentity = &identity
+	}
+	return recovered
+}
+
+func (o *Observer) normalizeRecoveredMeta(
+	path string,
+	meta *store.SessionMeta,
+	ownerAuthoritative bool,
+) store.SessionMeta {
+	normalized, changed := session.ClassifyInactiveMetaForRecovery(o.now(), meta)
+	if meta == nil || !changed || !ownerAuthoritative {
+		return normalized
+	}
+
+	normalized.UpdatedAt = o.now()
+	if err := store.WriteSessionMeta(path, &normalized); err != nil {
+		o.logger.Warn(
+			"observe: persist recovered session classification failed",
+			"session_id", strings.TrimSpace(meta.ID),
+			"path", path,
+			"error", err,
+		)
+		return session.AnnotateUnpersistedRecovery(&normalized, err)
+	}
+
+	return normalized
+}

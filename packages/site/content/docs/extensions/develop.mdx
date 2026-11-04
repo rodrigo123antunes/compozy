@@ -1,0 +1,729 @@
+---
+title: Develop Extensions
+description: The authoring loop for code-backed and resource-only CompozyOS extensions — build, validate, dev, reload, logs, and publish.
+---
+
+Code-backed extensions declare behavior through an SDK. Resource-only extensions declare static kit
+resources in `extension.toml`. Both become immutable generations that use the same development loop.
+
+An extension is one installable unit of runtime behavior. A **subprocess extension** runs your code
+over JSON-RPC and can call the daemon through the Host API. A **resource-only extension** ships files
+CompozyOS already knows how to load and runs nothing.
+
+New here? [Build your first extension](/docs/guides/build-your-first-extension) gets you to a
+working tool in three commands. This page is the loop around it.
+
+## The loop
+
+<Mermaid
+  chart={`flowchart LR
+init["extension init"] --> code["write code"]
+code --> build["extension build"]
+build --> validate["extension validate"]
+validate --> dev["extension dev"]
+dev --> invoke["invoke / observe"]
+invoke --> edit["edit"]
+edit --> reload["extension reload"]
+reload --> invoke
+invoke --> publish["extension publish"]`}
+  caption="Author-owned verbs. Only publish and install cross into distribution; everything left of it is local and trust-free."
+/>
+
+| Verb                         | Daemon required | What it does                                                          |
+| ---------------------------- | --------------- | --------------------------------------------------------------------- |
+| `compozy extension init`     | no              | Writes a project from an embedded template.                           |
+| `compozy extension build`    | no              | Builds code or validates static resources, then emits a generation.   |
+| `compozy extension validate` | no              | Reads a bundle and reports issues plus derived consent. Runs no code. |
+| `compozy extension dev`      | yes             | Builds and links your source to the current workspace.                |
+| `compozy extension reload`   | yes             | Builds and atomically swaps the running generation.                   |
+| `compozy extension logs`     | yes             | Reads or follows one instance's redacted stderr ring.                 |
+| `compozy extension publish`  | no              | Uploads a generation to a GitHub release with a digest sidecar.       |
+
+Every verb supports `-o human|json|jsonl|toon`. Exact flags:
+[Extension CLI Reference](/docs/cli/extension).
+
+## Start from a template
+
+```bash
+compozy extension init my-ext --template tool-provider-go
+```
+
+| Template                   | Language   | Shows                                                              |
+| -------------------------- | ---------- | ------------------------------------------------------------------ |
+| `tool-provider-ts`         | TypeScript | One tool with a typed handler. Default template.                   |
+| `tool-provider-go`         | Go         | The same tool with Go generics.                                    |
+| `view-provider-ts`         | TypeScript | A programmable command-palette view with React.                    |
+| `loop-watch-source-go`     | Go         | The `loop.watch_source` provide surface.                           |
+| `heartbeat-source-go`      | Go         | Check-in source polling with bounded keyed items and opaque state. |
+| `connectivity-provider-go` | Go         | A Gateway connectivity provider.                                   |
+| `connectivity-provider-ts` | TypeScript | A Gateway connectivity provider.                                   |
+
+Templates carry no manifest. They carry `package.json`/`go.mod`, a source file, and nothing else.
+
+The published SDKs are [`@compozy/extension-sdk`](https://www.npmjs.com/package/@compozy/extension-sdk)
+on npm and `github.com/compozy/compozy/sdk/go` as a Go module. Both are versioned with the daemon;
+`build` stamps the compatibility floor from the SDK you compiled against.
+
+## Declare once, in code
+
+Identity, schemas, permissions, tools, and hooks are declared in one place:
+
+```go
+extension := compozysdk.NewExtension(compozysdk.ExtensionDefinition{
+	Name:        "hello",
+	Version:     "0.1.0",
+	Description: "Search extension-owned data",
+	Subprocess:  compozysdk.DescribeSubprocess{Command: "./bin"},
+	Permissions: compozysdk.PermissionsConfig{
+		Requires: []compozysdk.HostAPIMethod{"sessions/list"},
+	},
+})
+
+compozysdk.Tool[searchInput](extension, "search", compozysdk.ToolOptions{
+	Description: "Search extension-owned data",
+	ReadOnly:    true,
+	InputSchema: searchInputSchema,
+}, handleSearch)
+```
+
+`build` starts your binary with the `__describe` argument, reads the contract it prints, and writes
+`extension.toml` from it. There is no second declaration to keep in sync, so the schema-digest drift
+that a hand-written manifest allowed cannot occur.
+
+Registering a tool adds `tool.provider` to `capabilities.provides` automatically.
+
+## Start from a resource-only manifest
+
+A resource-only source has no `package.json` or `go.mod`. Write `extension.toml` and declare at least
+one skill, agent, Loop, automation, or layout path:
+
+```toml title="extension.toml"
+[extension]
+name = "hello-resources"
+version = "0.1.0"
+min_compozy_version = "0.3.0-beta.13"
+
+[[resources.agents]]
+path = "agents"
+```
+
+```md title="agents/hello/AGENT.md"
+---
+name: hello
+---
+
+You are hello.
+```
+
+Use the same loop as a code-backed extension:
+
+```bash
+compozy extension build .
+compozy extension dev .
+compozy extension reload hello-resources .
+compozy extension dev . --watch
+```
+
+This build reads and validates the manifest, copies the declared resource trees, and publishes the
+generation. It runs no build or describe command. A manifest that declares a subprocess, runtime
+capabilities, Host API permissions, hooks, tools, MCP servers, command groups, or
+dynamic resource publication still needs `package.json` or `go.mod` and an SDK declaration.
+
+## Build and validate
+
+```bash
+compozy extension build
+```
+
+```json
+{
+  "name": "hello",
+  "generation_hash": "cc1358b134cbf3394c562604dc17ad10b41c5478d32f01d3acb4c1f7e61b6b13",
+  "generation_dir": "/work/hello/dist/gen-cc1358…",
+  "manifest_path": "/work/hello/dist/gen-cc1358…/extension.toml"
+}
+```
+
+Every build lands in an immutable `dist/gen-<hash>` directory. The hash is the checksum of that tree
+and is the only generation identity any surface accepts — no path, symlink, or staging directory
+substitutes for it. Builds never mutate a prior generation, and identical source produces a
+byte-identical manifest.
+
+For code-backed sources, build detects the toolchain: a `package.json` `build` script runs through Bun
+or npm, and a `go.mod` runs `go build`. Override with `--build-command`, raise the describe timeout
+with `--timeout`, and move the generation root with `--output-dir` (a custom output root is for
+standalone packaging — only `<source>/dist` can back a dev link). Resource-only sources do not accept
+`--build-command` because their build never executes code.
+
+```bash
+compozy extension validate ./dist/gen-cc1358…
+```
+
+`validate` reads the bundle without executing anything and reports positioned issues plus the consent
+areas an operator will see. See [Extension Permissions](/docs/extensions/permissions).
+
+## Dev, reload, logs
+
+```bash
+compozy extension dev .
+```
+
+`dev` builds, then links the generation to the current workspace. There is no trust prompt, no
+`allow_unverified` policy, and no marketplace vocabulary anywhere in the flow: it is your source, in
+your workspace.
+
+A dev link is an **overlay**, not an install. It lives in its own side table and never displaces a
+published installation of the same name; while both exist, reads report `overrides_published: true`
+alongside `dev`, `origin_path`, `generation_hash`, and `workspace_id`.
+
+```bash
+compozy extension reload my-ext .
+compozy extension dev . --watch
+compozy extension logs my-ext --follow
+```
+
+- `reload` builds a new generation and swaps atomically. If the new generation fails to activate, the
+  **last-good** generation keeps serving and status reports `activation_failed` with the running
+  generation in `last_error`. If local build or resource validation fails, reload is never sent and
+  the current generation stays active. A broken edit never takes the extension down.
+- `--watch` polls the source tree every `extensions.dev.watch_interval` (default `2s`), skipping
+  `.git`, `dist`, and `node_modules`. The watcher is client-side; the daemon never watches author
+  directories.
+- `logs` reads a bounded 256 KiB per-instance ring fed from subprocess stderr, redacted at ingestion
+  so no transport ever sees a configured secret. Each read returns an opaque `stream_epoch`; resume
+  with both `--after <sequence>` and `--stream-epoch <epoch>`. `--follow` consumes `extension_log`
+  deltas and atomically replaces the snapshot on `extension_log_reset`. The ring is live retention,
+  not durable history. In JSONL follow output, reset is an explicit record with
+  `event: "extension_log_reset"`, `stream_epoch`, and the replacement `logs` array, even when empty.
+
+### Instances
+
+Every runtime surface is keyed by **instance** — extension name plus workspace. The published
+installation is the global instance (empty workspace); each dev link is a workspace instance.
+Subprocess, coordinator, last-good generation, log ring, status, and events are per instance, so two
+workspaces linking the same extension share nothing.
+
+Declared agents, skills, Loops, automations, and layouts follow the same boundary. Resources from an
+enabled published installation enter the global catalogs; resources from an active dev link enter
+only the linked workspace's catalogs and workspace detail. Reload replaces that workspace snapshot
+atomically, and unlinking removes it without changing the published installation.
+
+The workspace is bound server-side from the operator's resolved workspace or an agent session's
+trusted scope — never from a request body or tool input. Global-instance logs are operator-transport
+only: `compozy extension logs <name> --global`.
+
+Instance-acting verbs — `reload`, `logs`, `remove` — infer the workspace from the directory you run
+them in, or take `--workspace`. `compozy extension list` and `compozy extension status` read the
+global installed set by default; pass `--workspace <workspace>` to inspect the effective workspace
+instance, including a dev overlay. The same scoped read is available through
+`GET /api/extensions?workspace=<id>` and through an agent caller whose session binds the workspace.
+`compozy tool invoke` also defaults to global scope — pass `--workspace .` to reach a dev-linked
+extension's tools.
+
+Origin paths are canonicalized and must resolve inside the workspace root at link time and on every
+load. A missing or escaping origin loads as `state: error` with `failure_code: missing_origin`; the
+daemon never crashes boot and never runs a binary outside the recorded generation directory.
+
+```bash
+compozy extension remove my-ext
+```
+
+Inside a workspace this unlinks the overlay only, and the published installation resumes. `--global`
+removes the published installation. A completed unlink releases this workspace instance's MCP
+runtime names and overrides across its profiles. Failure to persist the unlink event or release the
+names restores the dev link and secret bindings. The published installation's names are unaffected.
+
+Failed dev activation or publication releases newly allocated MCP names only after the previous
+link is restored. Names allocated before the attempted change remain stable.
+
+## Ship it
+
+```bash
+compozy extension publish ./dist/gen-<hash> --repository acme/hello --tag v0.1.0
+compozy extension install github:acme/hello@v0.1.0
+```
+
+No pull request to CompozyOS, no catalog entry required. Full flow, digest semantics, and source
+options: [Publish an Extension](/docs/extensions/publish).
+
+## Tool IDs
+
+An extension tool's canonical ID is:
+
+```text
+ext__<extension>__<tool>
+```
+
+Each segment is lowercased; `[a-z0-9]` is kept, every other run of characters collapses to a single
+`_`, and leading/trailing underscores are trimmed. `__` is the reserved separator and may not appear
+inside a segment.
+
+| Extension name | Handler       | Tool ID                   |
+| -------------- | ------------- | ------------------------- |
+| `hello`        | `search`      | `ext__hello__search`      |
+| `notes`        | `list_recent` | `ext__notes__list_recent` |
+| `my-ext`       | `run-check`   | `ext__my_ext__run_check`  |
+
+Agents call that ID directly. Operators can call the same tool through a friendlier verb — see
+[Extension Commands](/docs/extensions/commands).
+
+## Provide surfaces
+
+`capabilities.provides` declares which runtime interfaces the extension implements. The set is closed
+and validated at build, install, and load.
+
+| Provide                 | CompozyOS calls the extension with                                       | Public |
+| ----------------------- | ------------------------------------------------------------------------ | ------ |
+| `tool.provider`         | `provide_tools`, `tools/call`                                            | yes    |
+| `model.source`          | `models/list`                                                            | yes    |
+| `loop.watch_source`     | `watch/poll`                                                             | yes    |
+| `heartbeat.source`      | `heartbeat/source_poll`                                                  | yes    |
+| `view.provider`         | `view/open`, `view/event`, `view/close`                                  | yes    |
+| `connectivity.provider` | `connectivity/establish`, `connectivity/status`, `connectivity/teardown` | yes    |
+| `forge.provider`        | `forge/capabilities`, `forge/status`, `forge/pr_create`                  | yes    |
+
+Missing a required service method for a declared provide fails the build. Declaring a value outside
+this set fails manifest load with the valid set in the error.
+
+### View providers
+
+A view provider owns the behavior behind a programmable command-palette view. Start from
+`view-provider-ts`, declare the view with `program: true`, and register its React component with
+`registerReactViews`. The helper implements `view/open`, `view/event`, and `view/close` and adds
+`view.provider` to the generated manifest.
+
+Programmable views are TypeScript-only in this release. Building one with the Go SDK fails with
+`views[<index>].program: view programs require a TypeScript extension this release`.
+
+Each attached client gets an isolated session. CompozyOS cancels superseded work through the
+handler's `AbortSignal`, closes the session when the palette, client, extension, or workspace goes
+away, and keeps the last safe frame visible during a short provider failure. Declare `view/patch`
+only when the provider needs to push a frame between user events. See
+[Command Palette Contributions](/docs/extensions/cmd-palette#programmable-views) for the React
+component and lifecycle contract.
+
+### Model source extensions
+
+An extension declaring `model.source` enriches the daemon-owned provider model catalog. It
+contributes source rows only; the daemon owns persistence, merge, and curation policy.
+
+CompozyOS dispatches `models/list` whenever the catalog refreshes the `extension:<slug>` source for a
+provider the extension declares. The slug derives from the extension name and must match
+`^[a-z0-9][a-z0-9_-]*$`; manifests that do not normalize cleanly are rejected at install.
+
+Rows may carry `deprecated`, `hidden`, `featured`, and nullable `release_date` curation metadata,
+validated through the same
+[catalog merge and curation policy](/docs/agents/model-catalog). Invalid rows produce a
+recorded source status with a redacted `last_error` instead of corrupting the merged projection.
+Refresh runs under a daemon-enforced deadline using the provider's auth, env, and home policy, and
+concurrent refreshes for one provider coalesce into a single result.
+
+Reading the merged catalog from an extension needs `models/list` and `models/status`; triggering a
+refresh needs `models/refresh`. None of those are inside the published-source ceiling, so a
+`model.source` extension is a local, workspace, or bundled install today.
+
+The authorization layer classifies `models/list` and `models/status` under `model.read`, and
+`models/refresh` under `model.write`. Operator-facing consent renders those areas as `model:read`
+and `model:write`; authors still declare only the method paths in `permissions.requires`.
+
+### Connectivity providers
+
+A connectivity provider publishes a verified route to one daemon-owned Gateway tier listener. Start
+from `connectivity-provider-go` or `connectivity-provider-ts`; both templates register the public
+`connectivity.provider` capability and its three service methods.
+
+The daemon calls `connectivity/establish` with a tier, a loopback `forward_target`, an opaque
+`challenge_path`, and a deadline. Forward the assigned tier to that target without rewriting the
+challenge path, then return the current `tier`, `health`, and HTTPS `endpoints`. Each endpoint names
+its URL, scheme, and whether it is `stable` or `ephemeral`. `connectivity/status` returns the same
+reachability shape for one tier. `connectivity/teardown` stops that tier before its deadline and
+returns `stopped: true` only after forwarding has ended.
+
+Provider output is not proof. CompozyOS requests the challenge through every returned endpoint and
+requires the exact nonce from the assigned tier listener. It validates TLS, follows no redirects,
+bounds the response and request time, and blocks public endpoints that resolve inward. A failed
+challenge leaves the tier unadvertised and marks the provider degraded.
+
+A private endpoint may additionally return `verification_address`, a literal loopback IP and
+non-zero port carrying a raw TCP relay to that exact endpoint. Use this only for an isolated network
+stack that the host cannot dial directly. Forward opaque TLS bytes without terminating TLS or
+rewriting HTTP; the daemon keeps the advertised URL for certificate authentication and challenge
+validation. Bind only to loopback, fix the destination to the endpoint, bound connections and
+shutdown, return the same address in status, and close it during teardown. The field is optional;
+providers that omit it retain the host-network verification path. Public endpoints cannot use it.
+
+Connectivity providers have stricter trust rules than ordinary extensions:
+
+- Install them globally. Workspace-scoped sources are rejected.
+- Declare `gateway.private`, `gateway.public`, or both in `[gateway].permissions`. The normalized
+  permission list becomes the digest confirmed through the extension lifecycle. A provider cannot
+  start for an undeclared tier.
+- Expect that digest and install source to be read again from the live registry whenever Gateway
+  enables the provider and whenever the daemon boots. An update that changes the digest requires
+  fresh confirmation before provider code can affect reachability.
+- Support independent private and public calls, but expect only one selected provider per tier.
+
+Use the generated [Gateway API reference](/docs/api/gateway) to select a provider for a tier and pass
+the exact current digest. Use [Gateway security](/docs/gateway/security) to understand which routes
+can be published, and the bundled [Tailscale extension](/docs/gateway/tailscale) as the reference
+implementation. The provider never adds a Host API method; all three calls are initiated by the
+daemon.
+
+### Forge providers
+
+A forge provider translates Git remote state into pull-request capabilities for the
+[Worktree assisted exit](/docs/worktrees/assisted-exit). Register all three handlers with
+`ForgeProvider` in Go or `registerForgeProvider` in TypeScript; registration adds
+`forge.provider` and reserves its service names atomically.
+
+| Method               | Request                                                                 | Response contract                                                                                                                         |
+| -------------------- | ----------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------- |
+| `forge/capabilities` | `remote_urls`                                                           | Served remote, availability, provider vocabulary, draft support, compare template, template paths, default branch, and credential source. |
+| `forge/status`       | `remote_urls`, `branch`, optional `base`/`head_sha`                     | Provider, pull-request number/state/URL, merged evidence, fetch time, and optional exact head/base/SHA/draft evidence.                    |
+| `forge/pr_create`    | `remote_urls`, `head`, `base`, `title`, body/draft, optional `head_sha` | `created` or `opened_existing`, plus a positive number and absolute URL.                                                                  |
+
+When `served` is true, capabilities must name `provider`, `served_remote`, `request_noun`,
+`open_action_label`, and `view_action_label`. `compare_url_template` uses `{base}` and `{head}`;
+`supports_draft` decides whether the Worktree surface offers draft creation. `template_paths` is an
+ordered set of repository-relative candidates. Treat every template as untrusted plain text.
+
+An available provider reports `credential_source` as `binding` or `gh`. An unavailable result uses
+only `credential_absent`, `credential_expired`, `rate_limited`, or `unsupported_remote`. Never return
+credential values in a result or error. Pull-request creation must be idempotent by open head branch:
+return `opened_existing` instead of creating a duplicate.
+
+A `rate_limited` capabilities or status result may carry `retry_after`, the time the forge accepts
+requests again. The daemon then stops calling that provider for any forge read, including explicit
+refreshes, until that time (one minute when `retry_after` is absent), and serves cached pull request
+facts marked with the cause. Report `rate_limited` only for a real quota refusal; a permission refusal
+is an ordinary failure. The daemon reuses an available capabilities answer for the same remotes for
+ten minutes, until the provider restarts.
+
+A `forge/status` response may also report `checks` (state, passed/failed/pending counts and at most
+64 `failed_names`), `reviews`, `review_decision`, `mergeable`, `updated_at`, and `selection`
+(`complete` or `incomplete`). Omitted facts remain unknown. Checks describe the reported `head_sha`.
+`reviews` holds `items` (at most 100, each with `id`, `state`, and optional `author`, `is_bot`,
+`submitted_at`, and `commit`), `threads` (at most 100 unresolved threads, newest last, each with `id` and
+the optional `commit` it was opened on, which must not follow the head), `unresolved_threads`, and
+`truncated` when the provider stopped early. `unresolved_threads` may exceed the `threads` it lists only
+with `truncated`. `state` is `approved`, `changes_requested`, `commented`, or `dismissed`, and review
+text is never carried. A provider that omits `reviews` still works: pull request monitors report reviews
+as not observable. A provider that serves reviews but failed to read them this time sets
+`reviews_unavailable` instead, which monitors treat as a passing failure rather than a missing capability.
+A failed response with `cause` may include `retry_after` as an RFC 3339 timestamp; it is invalid without
+a cause. Existing providers may omit all eight fields.
+
+Managed delivery supplies `base` and `head_sha` to reconcile the exact reviewed candidate.
+For that request, return the observed `head`, `base`, `head_sha`, and `draft`; missing evidence
+prevents reuse. A `forge/pr_create` request with `head_sha` must reuse only an open request
+matching the head branch, base, commit and requested draft state, or reject the conflict.
+Ordinary requests without that field retain the existing branch-based contract.
+
+The bundled `forge-github` provider serves `github.com`, supports drafts, and resolves a bound
+`GITHUB_TOKEN` before the operator's `gh auth token`. See the assisted-exit guide for secret binding
+and the zero-credential browser path.
+
+## Call the Host API
+
+Declare the methods you call in one list:
+
+```go
+Permissions: compozysdk.PermissionsConfig{
+	Requires: []compozysdk.HostAPIMethod{"sessions/list", "skills/list"},
+},
+```
+
+CompozyOS derives the operator-facing consent areas from that list and enforces it per call. The full
+closed catalog, the derived areas, and the ceiling applied per install source are in
+[Extension Permissions](/docs/extensions/permissions).
+
+### Paged collection results
+
+These methods return bounded envelopes, not bare arrays. Continue with the cursor from the envelope
+while keeping the same workspace and filters, and read the collection field together with its page
+metadata.
+
+| Host API method       | Result envelope                                                 |
+| --------------------- | --------------------------------------------------------------- |
+| `tasks`               | `TasksResponse` with `tasks`, `page`, and `facets`              |
+| `automation/jobs`     | `AutomationJobsResult` with `jobs` and `page`                   |
+| `automation/triggers` | `AutomationTriggersResult` with redacted `triggers` and `page`  |
+| `tasks/inbox`         | `TaskInbox` with `groups`, `page`, facets, and aggregate totals |
+
+The generated SDK contracts bind these result types, so code that expects an array fails at compile
+time instead of silently dropping pagination metadata.
+
+### Paged task-run results
+
+Declare `tasks/runs/result` when an extension needs the exact bytes behind a task-run `result_ref`.
+It belongs to `task:read` and accepts the workspace, run ID, byte offset, and page limit. The
+`TaskRunResultPage` response carries base64 bytes, exact byte counts, optional `next_offset`, and
+`eof`. Keep the same workspace and run while paging, and decode after joining bytes when the result
+is UTF-8 text.
+
+### Ask the operator a question
+
+A tool-provider extension may declare `clarify/ask` and call it only while handling an active
+daemon-issued `tools/call`. The Go SDK keeps the invocation authority internal and exposes
+`ToolRequest.AskClarification(ctx, ClarifyQuestion{Question: "…", Choices: []string{"…"}})`. The call
+blocks until the operator answers, a finite `[tools.clarify] timeout` returns the fallback sentinel, or the tool
+call is canceled.
+
+The daemon binds each invocation to the extension and active session, derives workspace and agent
+scope itself, and drops the binding when the tool call finishes. Extension code supplies only the
+question and optional choices; it cannot select another session or forge invocation authority.
+
+### Publish declarative resources
+
+A subprocess extension can publish strict resource records — window layouts today — through the
+generic resource Host API. Declare the methods, the families, and the widest requested scope:
+
+```toml
+[permissions]
+requires = ["resources/list", "resources/get", "resources/snapshot"]
+
+[resources.publish]
+families = ["window_layouts"]
+max_scope = "workspace"
+```
+
+The family `window_layouts` grants only the `window_layout` resource kind. Use
+`max_scope = "global"` only when the extension must publish global layouts; the source tier, operator
+policy under `[extensions.resources]`, and the runtime session can each narrow the request further.
+
+`resources/snapshot` replaces that extension source's complete desired-state snapshot: advance
+`source_version` monotonically and include every record the source still owns, because omitted
+records are removed. Every submitted spec passes the canonical strict codec before persistence —
+unknown fields, invalid topology, mismatched workspace binding, or an ungranted kind or scope reject
+the snapshot atomically. The Go and TypeScript SDKs use the same generic resource record shape; no
+window-manager-specific SDK method exists.
+
+### Authored context
+
+Soul, Heartbeat, and session health are reachable behind per-method grants. Extensions cannot bypass
+managed authoring — direct file writes from extension code, hooks, tools, MCP sidecars are forbidden.
+
+| Host API method             | Notes                                                                                  |
+| --------------------------- | -------------------------------------------------------------------------------------- |
+| `agents/soul/get`           | Full resolved persona for the named agent or the caller.                               |
+| `agents/soul/validate`      | Checks a proposed body or the current `SOUL.md` without writing.                       |
+| `agents/soul/put`           | Managed write through the authoring service; requires `expected_digest`.               |
+| `agents/soul/delete`        | Managed delete with `expected_digest`.                                                 |
+| `agents/soul/history`       | Bounded revision history.                                                              |
+| `agents/soul/rollback`      | Replays a prior revision through validation and CAS; cannot restore forbidden content. |
+| `agents/heartbeat/get`      | Latest valid policy snapshot.                                                          |
+| `agents/heartbeat/validate` | Checks a proposed body without writing.                                                |
+| `agents/heartbeat/put`      | Managed write with `expected_digest`. HTTP `If-Match` is rejected.                     |
+| `agents/heartbeat/delete`   | Managed delete with `expected_digest`.                                                 |
+| `agents/heartbeat/history`  | Bounded revision history.                                                              |
+| `agents/heartbeat/rollback` | Replays a prior revision through validation and CAS.                                   |
+| `agents/heartbeat/status`   | Policy, wake state, and session-health composition.                                    |
+| `agents/heartbeat/wake`     | Advisory wake for an eligible session; never claims work or renews leases.             |
+| `sessions/health/get`       | Metadata-only health for one session.                                                  |
+
+Read and write grants are separate areas, so a read-only review extension ships without ever
+requesting mutation rights.
+
+Authored context also fires observation hooks — `agent.soul.snapshot.resolved`,
+`agent.soul.mutation.after`, `agent.heartbeat.policy.resolved`, `agent.heartbeat.wake.before` (the
+only sync-eligible one; `cancel: true` vetoes `timer` and `instance_check` wakes,
+while legacy wake sources ignore cancellation), `agent.heartbeat.wake.after`, and
+`session.health.update.after`. Their payloads carry compact provenance — snapshot ids, digests,
+redacted actor and origin — and never raw `SOUL.md`/`HEARTBEAT.md` bodies, raw claim tokens, or full
+prompt transcripts.
+
+For proactive wake cancellation, hooks may return `{"cancel":true,"reason":"maintenance_window"}`.
+The persisted wake event keeps `hook_cancelled` as its reason and records the supplied text in
+`detail`, redacted and bounded to 300 bytes. An omitted reason still cancels the check.
+
+Agents can reach the same managed services through three native tools:
+
+| Tool ID                           | Purpose                                            |
+| --------------------------------- | -------------------------------------------------- |
+| `compozy__session_health`         | Read health, attachability, and wake eligibility.  |
+| `compozy__agent_heartbeat_status` | Read Heartbeat policy and wake-state summary.      |
+| `compozy__agent_heartbeat_wake`   | Request one advisory wake for an eligible session. |
+
+Soul authoring remains on its dedicated CLI, HTTP, UDS, and Host API surfaces; there is no native
+Soul tool.
+
+## Ship resources, not only code
+
+Any extension may ship a static kit that the daemon publishes while the extension is enabled:
+skills, agent directories, automation TOML, layout JSON, loops, hooks, and MCP servers. Paths resolve
+inside the extension root and may not escape it; `{{config_dir}}` expands to that root and
+`{{env:NAME}}` reads the daemon process environment.
+
+Field-by-field reference: [Extension Manifest](/docs/extensions/manifest).
+
+### Hooks
+
+Extension hooks carry source `extension` and default priority `300`, which places them after config
+hooks and before agent-definition hooks. A subprocess hook reads one payload from stdin and writes a
+patch to stdout; do not point a hook declaration at a long-running server mode.
+
+See [Hook Declaration Format](/docs/hooks/declaration).
+
+### Agents, automation, and layouts
+
+Declare each agent collection as a directory whose direct children are agent directories:
+
+```text
+review-pack/
+  extension.toml
+  agents/reviewer/{AGENT.md,mcp.json,capabilities.toml,SOUL.md,HEARTBEAT.md}
+  automation/review.toml
+  layouts/two-up.json
+```
+
+Each direct agent directory must contain `AGENT.md`. Optional `SOUL.md` and `HEARTBEAT.md` sidecars
+are parsed with the same strict authored-context loaders used elsewhere; `mcp.json`,
+`capabilities.toml`, and `capabilities/` retain their normal meaning. Enable fails before publication
+when a shipped agent name conflicts with a visible agent or a reserved builtin name.
+
+Automation declarations are TOML files. Jobs and triggers must target an agent shipped by the same
+extension:
+
+```toml
+[[jobs]]
+name = "weekly-review"
+agent = "reviewer"
+prompt = "Review the current workspace and report risks."
+
+[jobs.schedule]
+mode = "cron"
+expr = "0 9 * * 1"
+```
+
+Layout declarations are strict `window_layout` JSON resources. A minimal global template starts
+with the versioned resource and snapshot shapes:
+
+```json
+{
+  "version": 1,
+  "id": "two-up",
+  "display_name": "Two up",
+  "participant_slots": ["primary", "secondary"],
+  "document": {
+    "version": 2,
+    "workspace_id": "",
+    "desktops": [
+      {
+        "id": "desktop-default",
+        "name": "Desktop 1",
+        "purpose": "standard",
+        "groups": [],
+        "floating": []
+      }
+    ],
+    "windows": {},
+    "overrides": {}
+  }
+}
+```
+
+Install enables the package by default. Per-profile enablement and placement decide which agents,
+sidecars, automation, and layouts are published. Use `compozy extension inventory <extension>` to
+inspect the unscoped shipped-versus-live projection; use profile detail and enablement surfaces for
+profile-specific state.
+
+## Runtime failure and recovery
+
+The supervisor monitors health checks and process exits. On failure CompozyOS records the failure,
+applies exponential restart backoff, and relaunches the subprocess. After repeated consecutive
+failures it disables the extension, unregisters its resources, marks it inactive, and stores the last
+error.
+
+`compozy extension status <name>` reports the honest picture, including `consecutive_failures` and
+`restart_backoff_ms`, so a crash-looping extension is distinguishable from a stably-failed one.
+
+- `enable` and `disable` reload the manager while the daemon is running.
+- Daemon shutdown sends a cooperative `shutdown` first, then escalates through the subprocess layer.
+- A dev instance that fails activation keeps its last-good generation running.
+
+## Examples
+
+`sdk/examples/` in the CompozyOS repository holds runnable extensions that import only the published
+SDKs:
+
+| Example                        | Shows                                                                                             |
+| ------------------------------ | ------------------------------------------------------------------------------------------------- |
+| `sdk/examples/clarify-tool`    | A Go tool provider that asks the operator a question (unbounded wait by default).                 |
+| `sdk/examples/notes-commands`  | Contributed operator commands: a flat leaf, a declared group, a nested leaf, and projected flags. |
+| `sdk/examples/prompt-enhancer` | A TypeScript extension with both a `prompt.post_assemble` hook and a persistent subprocess.       |
+
+## Related
+
+- [Build your first extension](/docs/guides/build-your-first-extension)
+- [Extension Manifest](/docs/extensions/manifest)
+- [Extension Permissions](/docs/extensions/permissions)
+- [Extension Commands](/docs/extensions/commands)
+- [Publish an Extension](/docs/extensions/publish)
+- [Install Extensions](/docs/extensions/install)
+- [Extension CLI Reference](/docs/cli/extension)
+
+### Check-in source polling
+
+Declare `heartbeat.source` and register kinds with `extension.HeartbeatSource` in Go or
+`extension.heartbeatSource` in TypeScript. Both helpers include `heartbeat_source_kinds`
+in describe and initialize results and negotiate `heartbeat/source_poll`.
+Each kind declares `kind`, `title`, optional `description`, and `params_schema`.
+The catalog prefixes the local kind with the extension name, for example `example/issues`.
+
+Each item requires a unique stable `key` matching `[A-Za-z0-9][A-Za-z0-9._:/#@+-]{0,199}` (ASCII, at most 200 bytes) and a nonempty `title` of at most 200 Unicode characters. `summary` is at most 1 KiB; the daemon shortens longer summaries at a UTF-8 boundary. `attributes` JSON is at most 2 KiB, and `url` is at most 2 KiB of UTF-8. Invalid keys, titles, attributes or URLs fail the poll with `source_output_invalid`. `[agents.heartbeat.sources].max_output_bytes` caps script stdout and the encoded extension result before summary shortening (`source_output_too_large`); `max_state_bytes` bounds opaque state. Item text is redacted and fenced as untrusted input before triage.
+
+The daemon validates `context.sources[].with` against `params_schema` before polling.
+The request contains `version: 1`, `source_id`, the local `kind`, `params`, committed `state`,
+`limits` (`max_items`, `max_summary_bytes`, `max_state_bytes`), `workspace` (`id`, `root_dir`),
+`now`, and `dry_run`. Return `{items: [], state, more: false}`. Items have a stable `key`,
+`title`, and optional `summary`, `url`, and `attributes`. Omit `state` to keep the cursor.
+Advance it only over returned items; the daemon commits it with the completed check.
+Dry runs must not mutate provider state. Return JSON-RPC error data `{code: "rate_limited"}`
+for rate limiting. Other process failures become `source_extension_failed`.
+
+Kinds resolve within the selected workspace and profile. User scope uses the profile-global
+instance; an extension enabled only in another workspace is unavailable. Discover available
+kinds and limits with `compozy agent heartbeat sources <agent> --workspace <workspace> -o json`
+or `compozy__agent_heartbeat_sources`.
+
+## New GitHub issues source
+
+The bundled `forge-github` extension also provides `forge-github/issues` for agent check-ins.
+Declare it in `HEARTBEAT.md`:
+
+```yaml
+context:
+  sources:
+    - id: new-issues
+      kind: forge-github/issues
+      with:
+        repo: compozy/compozy
+        labels: [bug]
+        exclude_labels: [wontfix]
+        backfill: "0s"
+```
+
+All four parameters are optional. `repo` is `owner/repo`; when omitted, the source uses the
+instance workspace's GitHub `origin` remote. Without a GitHub origin, set `with.repo` explicitly.
+`labels` requires every listed label, and `exclude_labels` rejects an issue with any listed label;
+both filters run client-side and ignore case.
+
+The first successful poll records the highest open issue number without reporting existing issues.
+Set `backfill` to a non-negative duration such as `"24h"` to include open issues created within that
+window on the first poll. Later polls return open issues above the saved `max_number` watermark,
+oldest first, within the requested item limit. `more: true` leaves remaining issues for the next
+check. Filtered issues advance the watermark; pull requests and issues closed before collection
+are excluded. This source watches creation, not edits or reopened older issues.
+
+Each item has key `owner/repo#number`, title, URL, and a body summary of at most 400 characters,
+also bounded by the poll's summary byte budget. Attributes include `number`, `author`, `labels`,
+`body_excerpt` (at most 400 characters), and `linked_open_prs`. Each linked PR includes `number`,
+`title`, `url`, and `closes`: closing references set it to `true`, other cross-references to `false`.
+Only open PRs appear, deduplicated by URL. Each issue reads at most five closing references and
+ten cross-reference timeline events, so this is bounded coverage rather than an exhaustive PR list.
+
+Authentication uses the same bound `GITHUB_TOKEN`, then `gh auth token`, as the forge provider.
+A missing sign-in yields `source_credential_absent` with a `gh auth login` hint; HTTP 401 yields
+`source_credential_expired`, and GitHub rate limits yield `source_rate_limited`. A failed poll
+leaves the saved watermark unchanged. Source state belongs to each agent instance; the provider
+keeps no local cursor and a dry run does not consume issues.

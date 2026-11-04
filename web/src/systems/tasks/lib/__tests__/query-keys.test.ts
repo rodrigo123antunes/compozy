@@ -1,0 +1,263 @@
+import { describe, expect, it } from "vitest";
+
+import { PROFILE_AGGREGATE } from "@/systems/profiles";
+
+import { tasksKeys } from "../query-keys";
+
+describe("tasksKeys", () => {
+  it("namespaces all keys under tasks", () => {
+    expect(tasksKeys.all).toEqual(["tasks"]);
+    expect(tasksKeys.lists()).toEqual(["tasks", "list"]);
+    expect(tasksKeys.details()).toEqual(["tasks", "detail"]);
+    expect(tasksKeys.runsRoot()).toEqual(["tasks", "runs"]);
+    expect(tasksKeys.timelineRoot()).toEqual(["tasks", "timeline"]);
+    expect(tasksKeys.treeRoot()).toEqual(["tasks", "tree"]);
+    expect(tasksKeys.runDetails()).toEqual(["tasks", "run-detail"]);
+    expect(tasksKeys.runResults()).toEqual(["tasks", "run-result"]);
+    expect(tasksKeys.triageRoot()).toEqual(["tasks", "triage"]);
+  });
+
+  it("produces stable list keys from filter input", () => {
+    expect(
+      tasksKeys.list({
+        scope: "workspace",
+        workspace: "ws_alpha",
+        worktree: "wt_payments",
+        status: "ready",
+        priority: "high",
+        include_drafts: true,
+        include_loop: true,
+        loop_run_id: "looprun-8f3ab2c1d4e5f607",
+        approval_state: "pending",
+        owner_kind: "human",
+        owner_ref: "op",
+        parent_task_id: "task_parent",
+        query: "review",
+        sort: "priority",
+        cursor: "ignored-cursor",
+        limit: 50,
+        profile: "marketing",
+      })
+    ).toEqual([
+      "tasks",
+      "list",
+      // A bounded read carries no aggregate axis.
+      "",
+      "workspace",
+      "ws_alpha",
+      // Worktree scope is part of the key so two window scopes never share a
+      // cache entry.
+      "wt_payments",
+      "ready",
+      "high",
+      "1",
+      // Reveal state is part of the key: a revealed list and a calm list are
+      // different populations with different facets and cursors.
+      "1",
+      "looprun-8f3ab2c1d4e5f607",
+      "pending",
+      "human",
+      "op",
+      "task_parent",
+      "review",
+      "priority",
+      "50",
+      "marketing",
+    ]);
+
+    expect(tasksKeys.list()).toEqual(["tasks", "list", ...Array.from({ length: 17 }, () => "")]);
+
+    // All projects is its own population, and each Project filter narrows it to
+    // another one; the filter's order never forks the cache.
+    expect(tasksKeys.list({ all_workspaces: true })[2]).toBe("all");
+    expect(
+      tasksKeys.list({ all_workspaces: true, workspace_ids: ["ws_b", "@user", "ws_b"] })[2]
+    ).toBe("all,@user,ws_b");
+    expect(tasksKeys.list({ all_workspaces: true, workspace_ids: ["@user", "ws_b"] })).toEqual(
+      tasksKeys.list({ all_workspaces: true, workspace_ids: ["ws_b", "@user"] })
+    );
+    expect(tasksKeys.list({ all_workspaces: true })).not.toEqual(tasksKeys.list({}));
+
+    // The calm default sends no include flag at all, so it must not collide
+    // with an explicit reveal.
+    expect(tasksKeys.list({ scope: "workspace" })).not.toEqual(
+      tasksKeys.list({ scope: "workspace", include_loop: true })
+    );
+
+    // Two profiles reading one workspace are two catalogs; the aggregate is a
+    // third, and never `default`'s.
+    expect(tasksKeys.list({ profile: "marketing" })).not.toEqual(
+      tasksKeys.list({ profile: "default" })
+    );
+    expect(tasksKeys.list({ all_profiles: true })).not.toEqual(
+      tasksKeys.list({ profile: "default" })
+    );
+    expect(tasksKeys.list({ all_profiles: true }).at(-1)).toBe(PROFILE_AGGREGATE);
+    expect(tasksKeys.list({ scope: "workspace", sort: "recent", cursor: "first" })).toEqual(
+      tasksKeys.list({ scope: "workspace", sort: "recent", cursor: "second" })
+    );
+    expect(tasksKeys.list({ sort: "recent" })).not.toEqual(tasksKeys.list({ sort: "priority" }));
+  });
+
+  it("distinguishes detail, run, timeline, tree, and run-detail keys by id", () => {
+    expect(tasksKeys.detail("task_1")).toEqual(["tasks", "detail", "task_1"]);
+    expect(tasksKeys.detail("task_1", { all_profiles: true })).toEqual([
+      "tasks",
+      "detail",
+      "task_1",
+      PROFILE_AGGREGATE,
+    ]);
+    expect(tasksKeys.runs("task_1", { status: "running", limit: 5 })).toEqual([
+      "tasks",
+      "runs",
+      "task_1",
+      "running",
+      "",
+      "5",
+      "",
+    ]);
+    expect(tasksKeys.timeline("task_1", { after_sequence: 12, limit: 50 })).toEqual([
+      "tasks",
+      "timeline",
+      "task_1",
+      "12",
+      "50",
+      "",
+    ]);
+    expect(tasksKeys.tree("task_1", { profile: "default" })).toEqual([
+      "tasks",
+      "tree",
+      "task_1",
+      "default",
+    ]);
+    expect(tasksKeys.runDetail("run_1")).toEqual(["tasks", "run-detail", "run_1"]);
+    expect(
+      tasksKeys.runResult("ws_1", "run_1", "sha256:a", 16_384, 16_384, { profile: "default" })
+    ).toEqual(["tasks", "run-result", "ws_1", "run_1", "sha256:a", 16_384, 16_384, "default"]);
+    expect(
+      tasksKeys.runResult("ws_1", "run_1", "sha256:a", 0, 16_384, { profile: "default" })
+    ).not.toEqual(
+      tasksKeys.runResult("ws_2", "run_1", "sha256:a", 0, 16_384, { profile: "default" })
+    );
+  });
+
+  it("serializes dashboard and inbox filters stably", () => {
+    expect(
+      tasksKeys.dashboard({ scope: "workspace", workspace: "ws_alpha", worktree: "wt_alpha" })
+    ).toEqual(["tasks", "dashboard", "", "workspace", "ws_alpha", "wt_alpha", "", "", "", ""]);
+    // All projects reads every task; the empty-scope (omission) read must not share its entry.
+    expect(tasksKeys.dashboard({ all_workspaces: true })).not.toEqual(tasksKeys.dashboard({}));
+
+    expect(
+      tasksKeys.inbox({
+        scope: "workspace",
+        workspace: "ws_alpha",
+        worktree: "wt_alpha",
+        lane: "approvals",
+        status: "ready",
+        priority: "urgent",
+        unread: true,
+        cursor: "ignored-cursor",
+        limit: 20,
+      })
+    ).toEqual([
+      "tasks",
+      "inbox",
+      "workspace",
+      "ws_alpha",
+      "",
+      "wt_alpha",
+      "",
+      "",
+      "approvals",
+      "ready",
+      "urgent",
+      "1",
+      "",
+      "20",
+      "",
+    ]);
+    // The All projects Project filter partitions the inbox cache like the catalog.
+    expect(tasksKeys.inbox({ all_workspaces: true, workspace_ids: ["ws_alpha"] })).not.toEqual(
+      tasksKeys.inbox({ all_workspaces: true, workspace_ids: ["@user"] })
+    );
+    expect(tasksKeys.inbox({ lane: "approvals", cursor: "first" })).toEqual(
+      tasksKeys.inbox({ lane: "approvals", cursor: "second" })
+    );
+    expect(tasksKeys.dashboard({ worktree: "wt_alpha" })).not.toEqual(
+      tasksKeys.dashboard({ worktree: "wt_beta" })
+    );
+    expect(tasksKeys.inbox({ worktree: "wt_alpha" })).not.toEqual(
+      tasksKeys.inbox({ worktree: "wt_beta" })
+    );
+    // The dashboard and inbox are profile-owned reads too, so the lens separates
+    // them the same way the workspace does.
+    expect(tasksKeys.dashboard({ profile: "marketing" })).not.toEqual(
+      tasksKeys.dashboard({ profile: "default" })
+    );
+    expect(tasksKeys.inbox({ all_profiles: true })).not.toEqual(
+      tasksKeys.inbox({ profile: "default" })
+    );
+    expect(tasksKeys.dashboard({ all_profiles: true }).at(-1)).toBe(PROFILE_AGGREGATE);
+    expect(tasksKeys.inbox({ all_profiles: true }).at(-1)).toBe(PROFILE_AGGREGATE);
+  });
+
+  it("Should namespace orchestration roots", () => {
+    const identity = { agentName: "worker", sessionId: "session_1" };
+
+    expect(tasksKeys.profilesRoot()).toEqual(["tasks", "profile"]);
+    expect(tasksKeys.reviewsRoot()).toEqual(["tasks", "reviews"]);
+    expect(tasksKeys.streamsRoot()).toEqual(["tasks", "stream"]);
+    expect(tasksKeys.agentContextsRoot()).toEqual(["tasks", "agent-context"]);
+    expect(tasksKeys.agentContext(identity)).toEqual([
+      "tasks",
+      "agent-context",
+      "session_1",
+      "worker",
+    ]);
+    expect(tasksKeys.agentContext(identity)).not.toEqual(
+      tasksKeys.agentContext({ ...identity, sessionId: "session_2" })
+    );
+    expect(tasksKeys.agentContext(identity)).not.toEqual(
+      tasksKeys.agentContext({ ...identity, agentName: "reviewer" })
+    );
+  });
+
+  it("Should bind profile keys to a task id", () => {
+    expect(tasksKeys.profile("task_1")).toEqual(["tasks", "profile", "task_1"]);
+  });
+
+  it("Should distinguish run, task, and detail review keys", () => {
+    expect(
+      tasksKeys.reviewsByRun("run_1", {
+        status: "in_review",
+        reviewer_session_id: "sess_a",
+        limit: 5,
+      })
+    ).toEqual(["tasks", "reviews", "run", "run_1", "in_review", "sess_a", "5", ""]);
+
+    expect(tasksKeys.reviewsByTask("task_1", { status: "recorded" })).toEqual([
+      "tasks",
+      "reviews",
+      "task",
+      "task_1",
+      "recorded",
+      "",
+      "",
+      "",
+    ]);
+
+    expect(tasksKeys.reviewDetail("review_1")).toEqual(["tasks", "reviews", "detail", "review_1"]);
+  });
+
+  it("Should encode stream resume cursor", () => {
+    expect(tasksKeys.stream("task_1", { after_sequence: 12 })).toEqual([
+      "tasks",
+      "stream",
+      "task_1",
+      "12",
+      "",
+    ]);
+    expect(tasksKeys.stream("task_1")).toEqual(["tasks", "stream", "task_1", "", ""]);
+  });
+});

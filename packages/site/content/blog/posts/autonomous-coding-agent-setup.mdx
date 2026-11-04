@@ -1,0 +1,263 @@
+---
+title: "Coding Agent Task Briefs You Can Actually Review"
+description: "Write a coding agent task brief with concrete acceptance criteria, staged permissions, and a review record. Work through a pagination bug from prompt to proof."
+date: 2026-09-11
+updated: 2026-09-11
+category: runtime
+tags:
+  - coding-agents
+  - code-review
+  - permissions
+  - developer-workflow
+author: pedronauck
+cover: ../covers/reviewable-agent-work.webp
+---
+
+“Fix pagination” sounds like a small assignment. An agent can change a query, add a passing test,
+and return a confident summary. You open the application, select a filter, click Next, and discover
+that page two contains records you explicitly excluded.
+
+The patch may implement exactly the behavior its test describes. The missing piece is the agreement
+about what the user should experience. A more capable model might infer that agreement, but a
+reviewer should not have to infer it a second time from the finished diff.
+
+A useful coding agent task brief sets a clear finish line, asks for evidence at that finish line, and gives
+the reviewer enough context to reject a plausible but incomplete result. Here is a workflow you can
+adapt to your own repository, followed by the CompozyOS controls that support it. The pagination
+example is illustrative; it is not a reported CompozyOS bug or a measured agent run.
+
+## Write the acceptance example before the instructions
+
+Start with a situation someone can reproduce. For our example, an issue list has a status filter
+and pagination. The reported failure is: select Closed, move to page two, and open issues appear.
+The desired behavior is: navigation preserves the selected filter, including when a person opens
+the page-two URL directly.
+
+That last clause changes the task. A patch that keeps `status` in local component state could
+appear to work during one browser session while a shared URL still returns the wrong results.
+Putting direct navigation in the brief tells the implementer and reviewer where the behavior
+belongs: the route's state must describe the requested result set.
+
+This does not require prescribing a particular router or state library. Name the behavior, then
+ask the agent to find the repository's existing owner. The distinction matters because specifying
+an implementation too early can make the agent prove your proposed design instead of solving the
+reported problem.
+
+Use the following brief as a starting point. Replace the illustrative paths and scenario with
+verified facts from your project before submitting it.
+
+```text
+Task: Preserve the issue status filter across pagination.
+
+Problem
+At /issues?status=closed, clicking Next loses the status filter.
+A person expecting closed issues sees open issues on page two.
+
+Expected behavior
+1. Select Closed and click Next: the URL and results remain filtered.
+2. Open that page-two URL directly: it returns the same filtered page.
+3. Use Back, then Forward: the selected filter matches the URL/results.
+4. Select a filter with no results: show the existing empty state.
+5. Change the filter while on page two: use the repository's existing
+   rule for resetting or retaining the page; identify that rule first.
+
+Scope
+Inspect the issue-list route, query construction, and pagination control.
+Likely files: src/routes/issues.tsx and src/issues/query.ts.
+These paths are starting points, not an instruction to ignore callers.
+Preserve unrelated working-tree changes. Do not add a dependency,
+change the API, or redesign the list to resolve this bug.
+
+First response
+Locate the owner of filter/page state and the existing test suite.
+Explain how the filter is lost, with file references.
+If the reported failure is absent, show the reproduction result.
+Do not make edits during this diagnosis phase.
+
+Implementation and verification
+After the diagnosis is accepted, make the smallest coherent fix.
+Add coverage for the behavior in its existing owning suite.
+Run the repository's required checks and the browser scenario above.
+If a required check cannot run, report it as unverified with the cause.
+
+Delivery
+Return the changed behavior, changed files, verification commands and
+results, the revision checked, remaining uncertainty, and a link/path
+to the evidence. Do not commit, push, merge, or publish this task.
+```
+
+A brief this size is worthwhile for a behavior that crosses a URL, component, and data query. A
+one-line typo correction should have a much shorter brief. Scale the instructions to the number
+of decisions the agent would otherwise have to guess.
+
+When choosing between tools, give each candidate the same brief. The
+[coding agent comparison guide](/blog/cursor-vs-claude-code/) adds isolated starting points
+and a scorecard that counts human review and repair.
+
+## Make the first checkpoint a diagnosis
+
+Before editing, have the agent trace one failing request through the application. Where does the
+filter enter? Which value does Next preserve? What does the data loader receive? A useful diagnosis
+might identify that a pagination link creates a new query string containing only `page`, dropping
+the existing `status` value.
+
+“The pagination code needs refactoring” is weaker. It offers no failure condition and leaves the
+reviewer unable to tell whether the proposed refactor addresses the report. Ask for the smallest
+explanation that connects an action to its incorrect result.
+
+This checkpoint is also where the agent should find the existing suite. In the example, a test of
+an issue-query helper may verify that a supplied status becomes a request parameter. That test
+cannot establish that the pagination control supplied the status in the first place. The
+navigation contract needs coverage at the layer that owns navigation.
+
+Avoid prescribing a new end-to-end test file as the default answer. There may already be a route
+integration suite that exercises this exact interaction. Use it, then walk the real application
+to confirm the experience. Two checks of different claims are useful; multiple tests asserting
+the same internal helper call are usually less so.
+
+## Put authority in configuration
+
+The brief's “do not edit” instruction helps the model understand the phase. Runtime policy decides
+which governed operations are allowed. In CompozyOS, you can create a reusable diagnosis agent at
+`.compozy/agents/change-investigator/AGENT.md`:
+
+```markdown
+---
+name: change-investigator
+permissions: approve-reads
+---
+
+Investigate the requested behavior before proposing a change.
+Cite the relevant files and explain a concrete failure condition.
+Identify the existing verification suite and any reproduction gaps.
+Do not edit files during diagnosis. Request a decision if the task
+requires authority that the current session does not have.
+```
+
+This uses the configured provider. It assumes an installed daemon and an authenticated provider;
+the [installation guide](/docs/getting-started/installation) covers that setup. From the repository
+root, create a session and submit the diagnosis task:
+
+```bash
+compozy session new --cwd "$PWD" --agent change-investigator --name pagination-diagnosis
+compozy session prompt sess_1234 \
+  "Diagnose why the issue status filter is lost on pagination. Read the task brief and relevant source; return the cause and owning test suite without editing."
+```
+
+Replace `sess_1234` with the returned session ID, and give the agent the actual brief as part of
+your prompt or a readable repository file. Creating the session allocates its record; the first
+prompt starts provider work.
+
+The policy has a detail worth knowing before you depend on it. With `approve-reads`, CompozyOS's
+direct ACP file-read operation is allowed, while direct writes and terminal creation are blocked.
+On the separate ACP permission-request path, recognized reads are allowed and other eligible
+requests can ask for a decision. **A blocked direct operation does not become executable merely
+because you intended to approve it later.** This behavior is visible in the
+[permission implementation](https://github.com/compozy/compozy/blob/9a792f51a72009645eb063c6a33a4eb0efc66b3a/internal/acp/permission.go#L152).
+
+When a request is actually pending, inspect it before deciding:
+
+```bash
+compozy session interactions sess_1234 -o json
+compozy session approve sess_1234 \
+  --request-id req_1234 \
+  --turn-id turn_1234 \
+  --decision allow-once
+```
+
+Use the IDs and offered decision from that request. The request identifies the action being
+authorized; it does not approve the eventual patch. On these ACP paths, `deny-all` rejects instead
+of asking, while `approve-all` permits eligible actions automatically. Other native-tool and
+cross-workspace decisions have their own rules in the [permission guide](/docs/sessions/permissions).
+Choose the mode you intend for implementation instead of treating a diagnosis policy as a universal
+editing mode.
+
+For example, after accepting the diagnosis, create a separate implementation agent with an
+appropriate policy and pass it the brief plus the diagnosis. Reusing the same workspace preserves
+the files; the new session still needs the task context. If you choose `approve-all`, the brief's
+no-publish rule remains an instruction, not an enforcement claim about every executable the
+provider might run.
+
+A Git worktree helps separate the patch from other development. The default local execution
+environment still runs on the host. Use operating-system or container isolation if you need
+another execution boundary, and inspect the [cross-workspace policy](/docs/sessions/permissions#cross-workspace-access)
+before assuming a permission mode confines all work to one repository.
+
+## Review the route that the green test missed
+
+Suppose the agent reports that its issue-query test passed. The following illustrative assertions
+could all be true while the user still gets the wrong page:
+
+```text
+Query helper receives status=closed -> sends status=closed: PASS
+Pagination link includes page=2: PASS
+Rendered issue row shows the supplied title: PASS
+```
+
+The missing connection is visible in one browser action:
+
+```text
+Before clicking Next: /issues?status=closed&page=1
+After clicking Next:  /issues?page=2
+Expected:            /issues?status=closed&page=2
+```
+
+The reviewer now has a specific rejection: the implementation drops a user-selected constraint
+at navigation. “Needs more tests” would send the agent hunting. “Preserve the filter in the
+page-two URL and exercise direct navigation to it” tells it what remains wrong and how to prove
+the repair.
+
+Run the scenario against the actual changed revision. If the agent makes another relevant edit
+after the browser check, that check no longer establishes the final behavior. Conversely, an
+unrelated wording edit does not require rerunning the whole application suite. Evidence is useful
+when you know exactly which inputs it checked.
+
+## Ask for an acceptance record you can challenge
+
+If the session ends before that record exists, inspect the retained work before starting another
+writer. The [session recovery guide](/blog/defining-agent-sessions-compozyos/) shows how to
+separate a stopped process from a preserved patch and an unfinished check.
+
+A final message should let another developer continue the review without reconstructing the
+agent's entire conversation. This is a reusable format, with deliberately unfilled results:
+
+```text
+Task: Preserve issue filters across pagination
+Revision / working-tree reference: [exact revision and diff]
+
+Behavior changed:
+[What a person now observes, including direct navigation]
+
+Evidence:
+- Owning regression suite: [command, result, checked revision]
+- Required repository checks: [commands, results]
+- Browser scenario: [steps, observed URLs/results, evidence path]
+
+Review:
+- Scope stayed within: [files/modules]
+- Unverified: [specific claim, or none]
+- Remaining work: [concrete action, or none]
+- Acceptance decision: [pending / accepted / rejected, with reason]
+```
+
+Keep “pending” until someone has assessed the evidence. A test command written in a message is
+not its result, a screenshot of page one does not prove pagination, and an idle session does not
+mean a patch is accepted.
+
+If the work belongs to a CompozyOS **task run**, the runtime can retain the review decision against
+that run. Ordinary session work does not automatically create a task-run review. For an existing
+terminal run, an operator can request and inspect one:
+
+```bash
+compozy task review request run_1234 --policy on_success \
+  --reason "Check filter preservation against the acceptance brief"
+compozy task review list --run run_1234 -o json
+```
+
+A rejected task-run verdict can enqueue a linked continuation; the
+[review-gate reference](/docs/autonomy/review-gate) documents submission, reviewer binding, and
+idempotency. Supply the missing behavior in that verdict so the continuation has a precise job.
+
+The practical finish line for this task is small: the filtered page-two URL works, the owning
+regression check covers it, and the evidence belongs to the patch under review. The agent's
+confidence is no longer the thing you have to evaluate. You can open the URL and inspect the result.

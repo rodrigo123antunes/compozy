@@ -1,0 +1,262 @@
+package session
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"log/slog"
+	"strings"
+	"time"
+
+	"github.com/compozy/compozy/internal/acp"
+	compozyconfig "github.com/compozy/compozy/internal/config"
+)
+
+// resolveSessionStartRuntime fingerprints the configured command before adapter rewriting.
+func (m *Manager) resolveSessionStartRuntime(
+	ctx context.Context,
+	spec *sessionStartSpec,
+	dropInheritedUnrestricted bool,
+) (sessionStartRuntime, error) {
+	artifacts, err := m.resolveWorkspaceAgentArtifactsForSession(spec.agentName, spec.sessionType, &spec.workspace)
+	if err != nil {
+		return sessionStartRuntime{}, fmt.Errorf("session: resolve workspace agent %q: %w", spec.agentName, err)
+	}
+	agentDef := artifacts.Agent
+	if spec.startAction == sessionStartActionResume && spec.acceptedRoute != nil {
+		m.applyResumeRouteAffinity(ctx, spec, agentDef)
+	}
+	runtimeConfig := spec.workspace.Config
+	if spec.sessionType == SessionTypeTriage {
+		runtimeConfig.Permissions.ProviderFullAccess = false
+		runtimeConfig.Permissions.Mode = compozyconfig.PermissionModeApproveReads
+		spec.permissions = compozyconfig.PermissionModeApproveReads
+		agentDef = compozyconfig.CloneAgentDef(agentDef)
+		agentDef.Permissions = string(compozyconfig.PermissionModeApproveReads)
+	}
+	resolved, err := runtimeConfig.ResolveSessionAgentWithRuntime(agentDef, compozyconfig.RuntimeOverrides{
+		Provider: spec.provider, Model: spec.model, Reasoning: spec.reasoningEffort, Command: spec.command,
+		SessionEnv: spec.sessionEnv,
+	})
+	if err != nil {
+		return sessionStartRuntime{}, fmt.Errorf("session: resolve session agent %q: %w", spec.agentName, err)
+	}
+	if spec.sessionType == SessionTypeTriage {
+		provider := resolved.Provider
+		if model := runtimeConfig.Agents.Heartbeat.TriageModels[provider]; model != "" {
+			spec.model, spec.provider = model, resolved.Provider
+			resolved, err = runtimeConfig.ResolveSessionAgentWithRuntime(agentDef, compozyconfig.RuntimeOverrides{
+				Provider:   spec.provider,
+				Model:      spec.model,
+				Reasoning:  spec.reasoningEffort,
+				Command:    spec.command,
+				SessionEnv: spec.sessionEnv,
+			})
+			if err != nil {
+				return sessionStartRuntime{}, fmt.Errorf("session: resolve triage model: %w", err)
+			}
+		}
+	}
+	resolved, err = m.resolveSpawnProviderCommand(ctx, spec, agentDef, resolved, map[string]bool{spec.sessionID: true})
+	if err != nil {
+		return sessionStartRuntime{}, err
+	}
+	resolved.ProfileName = strings.TrimSpace(spec.workspace.ProfileName)
+	if err := spec.validateRuntimeOverrides(); err != nil {
+		return sessionStartRuntime{}, fmt.Errorf("session: validate runtime overrides for %q: %w", spec.sessionID, err)
+	}
+	if err := spec.applyResolvedReasoningEffort(resolved); err != nil {
+		return sessionStartRuntime{}, err
+	}
+	if err := spec.applyResolvedRuntimeDefaults(
+		resolved,
+		m.startPermissions(startSpecPermissions(spec, resolved.Permissions)),
+		agentDef.ACPOptionsValue(),
+		dropInheritedUnrestricted,
+	); err != nil {
+		return sessionStartRuntime{}, err
+	}
+	if err := spec.applyAllowedToolsOverride(&resolved, m.toolsetCatalog); err != nil {
+		return sessionStartRuntime{}, fmt.Errorf("session: apply allowed tools for %q: %w", spec.sessionID, err)
+	}
+	if err := spec.applyDeniedToolsOverride(&resolved); err != nil {
+		return sessionStartRuntime{}, fmt.Errorf("session: apply denied tools for %q: %w", spec.sessionID, err)
+	}
+	if err := m.applyInstanceCeiling(ctx, spec, &resolved); err != nil {
+		return sessionStartRuntime{}, err
+	}
+	spec.commandFingerprint = providerCommandFingerprint(resolved.Command)
+	return sessionStartRuntime{
+		nativeToolsUnavailable: resolved.Harness == compozyconfig.ProviderHarnessPiACP,
+		agent:                  resolved,
+		agentDef:               compozyconfig.CloneAgentDef(agentDef),
+	}, nil
+}
+
+func (m *Manager) prepareAcceptedSessionRuntime(
+	ctx context.Context,
+	spec *sessionStartSpec,
+	runtime *sessionStartRuntime,
+	updatedAt time.Time,
+) error {
+	if runtime == nil {
+		return fmt.Errorf("session: accepted runtime is required")
+	}
+	if err := m.prepareAcceptedSessionDefinition(ctx, spec, runtime, updatedAt); err != nil {
+		return err
+	}
+
+	var err error
+	runtime.mcpServers, err = m.sessionMCPServers(ctx, spec, runtime.agent, runtime.agentDef)
+	if err != nil {
+		return fmt.Errorf("session: resolve MCP servers for %q: %w", spec.sessionID, err)
+	}
+	return nil
+}
+
+func (m *Manager) prepareAcceptedSessionDefinition(
+	ctx context.Context,
+	spec *sessionStartSpec,
+	runtime *sessionStartRuntime,
+	updatedAt time.Time,
+) error {
+	if runtime == nil {
+		return fmt.Errorf("session: accepted runtime is required")
+	}
+	artifacts, err := m.resolveWorkspaceAgentArtifactsForSession(spec.agentName, spec.sessionType, &spec.workspace)
+	if err != nil {
+		return fmt.Errorf("session: resolve workspace agent %q: %w", spec.agentName, err)
+	}
+	if err := m.prepareSessionStartSoul(ctx, spec, &artifacts, updatedAt); err != nil {
+		return fmt.Errorf("session: prepare soul for %q: %w", spec.sessionID, err)
+	}
+	if runtime.agent.Harness == compozyconfig.ProviderHarnessPiACP {
+		// Pi confirms extension tools before assembling its startup guidance.
+		return nil
+	}
+	return m.assembleAcceptedStartupDefinition(ctx, spec, runtime, updatedAt)
+}
+
+// assembleAcceptedStartupDefinition builds the provider-aware startup prompt for an
+// already-prepared soul; fallback attempts reuse it after re-resolving their route.
+func (m *Manager) assembleAcceptedStartupDefinition(
+	ctx context.Context,
+	spec *sessionStartSpec,
+	runtime *sessionStartRuntime,
+	updatedAt time.Time,
+) error {
+	agentDef := compozyconfig.CloneAgentDef(runtime.agentDef)
+	startupCtx := spec.startupPromptContext(updatedAt)
+	if err := m.populateStartupInstanceIdentity(ctx, &startupCtx); err != nil {
+		return err
+	}
+	startupCtx.NativeToolsUnavailable = runtime.nativeToolsUnavailable
+	if strings.TrimSpace(startupCtx.AgentName) == "" {
+		startupCtx.AgentName = strings.TrimSpace(agentDef.Name)
+	}
+	if strings.TrimSpace(startupCtx.Provider) == "" {
+		startupCtx.Provider = strings.TrimSpace(runtime.agent.Provider)
+	}
+	if strings.TrimSpace(startupCtx.Model) == "" {
+		startupCtx.Model = strings.TrimSpace(runtime.agent.Model)
+	}
+	startupCtx.ProviderHomePolicy = runtime.agent.HomePolicy
+	startupPrompt, manifest, err := m.startupPrompt(
+		ctx,
+		spec.startupSessionContext(updatedAt),
+		startupCtx,
+		agentDef,
+		&spec.workspace,
+	)
+	if err != nil {
+		return fmt.Errorf("session: assemble startup prompt for %q: %w", spec.sessionID, err)
+	}
+	assembledPrompt := startupPrompt
+	if m.startupOverlay != nil {
+		startupPrompt, err = m.startupOverlay.Apply(ctx, startupCtx, startupPrompt)
+		if err != nil {
+			return fmt.Errorf("session: apply startup prompt overlay: %w", err)
+		}
+	}
+	agentDef.Prompt = strings.TrimSpace(startupPrompt)
+	if overlay := strings.TrimSpace(spec.promptOverlay); overlay != "" {
+		if strings.TrimSpace(agentDef.Prompt) == "" {
+			agentDef.Prompt = overlay
+		} else {
+			agentDef.Prompt = strings.TrimSpace(agentDef.Prompt) + "\n\n" + overlay
+		}
+	}
+	if agentDef.Prompt != assembledPrompt {
+		manifest = acp.OpaqueStartupManifest(agentDef.Prompt, manifest.HookModified)
+	}
+	runtime.startupManifest = manifest
+	runtime.agentDef = compozyconfig.CloneAgentDef(agentDef)
+	runtime.agent.Prompt = agentDef.Prompt
+	return nil
+}
+
+func (s *sessionStartSpec) validateRuntimeOverrides() error {
+	providerOverride := strings.TrimSpace(s.provider)
+	modelOverride := strings.TrimSpace(s.model)
+	reasoningEffort := strings.TrimSpace(s.reasoningEffort)
+	if modelOverride != "" && providerOverride == "" {
+		return fmt.Errorf("%w when model is set", ErrRuntimeOverrideProviderRequired)
+	}
+	if reasoningEffort == "" {
+		return nil
+	}
+	if providerOverride == "" {
+		return fmt.Errorf("%w when reasoning_effort is set", ErrRuntimeOverrideProviderRequired)
+	}
+	return ValidateReasoningEffort(reasoningEffort)
+}
+
+// startLogger retains the attempted route even while an existing session holds its previous binding.
+func (s *sessionStartSpec) startLogger(m *Manager) *slog.Logger {
+	logger := slog.Default()
+	if m != nil && m.logger != nil {
+		logger = m.logger
+	}
+	return logger.With(
+		"session_id", strings.TrimSpace(s.sessionID),
+		"agent_name", strings.TrimSpace(s.agentName),
+		"provider", strings.TrimSpace(s.provider),
+		"workspace_id", strings.TrimSpace(s.workspace.ID),
+		"provider_command_fingerprint", s.commandFingerprint,
+	)
+}
+
+func (m *Manager) populateStartupInstanceIdentity(ctx context.Context, startupCtx *StartupPromptContext) error {
+	if startupCtx.InstanceID == "" {
+		current, err := m.Status(ctx, startupCtx.SessionID)
+		if err != nil && !errors.Is(err, ErrSessionNotFound) {
+			return fmt.Errorf("session: resolve startup instance: %w", err)
+		}
+		if current != nil {
+			startupCtx.InstanceID = current.InstanceID
+		}
+	}
+	if startupCtx.InstanceID == "" && startupCtx.Lineage != nil {
+		seen := map[string]bool{startupCtx.SessionID: true}
+		parentID := startupCtx.Lineage.ParentSessionID
+		for parentID != "" && !seen[parentID] {
+			seen[parentID] = true
+			parent, err := m.Status(ctx, parentID)
+			if errors.Is(err, ErrSessionNotFound) {
+				break
+			}
+			if err != nil {
+				return fmt.Errorf("session: resolve startup instance lineage: %w", err)
+			}
+			if parent.InstanceID != "" {
+				startupCtx.AncestorInstanceID = parent.InstanceID
+				break
+			}
+			if parent.Lineage == nil {
+				break
+			}
+			parentID = parent.Lineage.ParentSessionID
+		}
+	}
+	return nil
+}

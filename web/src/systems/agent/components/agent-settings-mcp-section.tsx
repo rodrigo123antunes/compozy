@@ -1,0 +1,19 @@
+import { Plug } from "@compozy/ui/icons";
+
+import { FormSection } from "@compozy/ui";
+
+import type { AgentPayload } from "../types";
+import { AgentMcpServersPanel } from "./agent-mcp-servers-panel";
+
+export function AgentSettingsMcpSection({ agent }: { agent: AgentPayload }) {
+  return (
+    <FormSection
+      data-testid="agent-settings-mcp"
+      icon={Plug}
+      title="MCP servers"
+      help="MCP servers are defined in the agent file."
+    >
+      <AgentMcpServersPanel agent={agent} bare />
+    </FormSection>
+  );
+}

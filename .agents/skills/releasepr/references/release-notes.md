@@ -15,6 +15,17 @@ using `git-cliff` (config: `cliff.toml` in the repo). Use Conventional Commits:
 If no commit since the last tag warrants a bump, no release PR is produced.
 Force a release anyway with `pr-release pr-release --force`.
 
+## Declaring the next version with `Release-As`
+
+When the next version is a product decision rather than a commit-type bump
+(for example, the first stable release after a beta line), add a
+`Release-As: X.Y.Z` footer to any commit after the nearest stable release tag
+(releasepr v0.0.31+). It must be strict SemVer, not lower than the computed
+`git-cliff` version, and agree with every other footer in the range. Squash
+merges keep it when the squash message includes commit messages. Prereleases cut
+after the footer keep it in range; the next stable tag retires it.
+Never fake a `BREAKING CHANGE` to force a version.
+
 Never hand-write a commit whose subject starts with `release:` or
 `ci(release):` on the default branch — that prefix triggers the production
 release job (see `release-workflow.md`).
@@ -48,6 +59,12 @@ pr-release add-note --title "Drop Node 16" --type breaking --body "Node 18+ requ
    is created if missing so the directory stays tracked.
 3. The current release section lands in `RELEASE_BODY.md` (GitHub Release body)
    and is prepended to the historical `RELEASE_NOTES.md`.
+
+Explicit releases use `release-body` instead of reusing `RELEASE_BODY.md`.
+The command scopes both `git-cliff` commits and custom notes to the
+`release_git_range` emitted by `plan`, so every published release, including
+the first stable after a beta line, stays incremental. The committed
+`CHANGELOG.md` follows the consumer's `cliff.toml` tag filters.
 
 Archiving is transactional: a move failure rolls back prior moves. Do not
 manually move files out of `.release-notes/` mid-release — let the tool archive

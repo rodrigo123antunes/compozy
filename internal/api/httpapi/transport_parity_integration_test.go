@@ -1,0 +1,1521 @@
+//go:build integration
+
+package httpapi
+
+import (
+	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"io"
+	"net/http"
+	"net/url"
+	"os"
+	"path/filepath"
+	"reflect"
+	"runtime"
+	"slices"
+	"strings"
+	"testing"
+	"time"
+
+	compozycontract "github.com/compozy/compozy/internal/api/contract"
+	apispec "github.com/compozy/compozy/internal/api/spec"
+	apitest "github.com/compozy/compozy/internal/api/testutil"
+	automationpkg "github.com/compozy/compozy/internal/automation"
+	compozyconfig "github.com/compozy/compozy/internal/config"
+	extensionpkg "github.com/compozy/compozy/internal/extension"
+	storepkg "github.com/compozy/compozy/internal/store"
+	"github.com/compozy/compozy/internal/store/globaldb"
+	taskpkg "github.com/compozy/compozy/internal/task"
+	"github.com/compozy/compozy/internal/testutil/acpmock"
+	e2etest "github.com/compozy/compozy/internal/testutil/e2e"
+	workspacepkg "github.com/compozy/compozy/internal/workspace"
+	tomltree "github.com/pelletier/go-toml"
+)
+
+const (
+	transportApprovalAgentName = "transport-approver"
+	transportAutomationAgent   = "transport-automation-runner"
+	transportFaultyAgent       = "transport-faulty-runner"
+	transportOverrideProvider  = "qa-transport-override"
+)
+
+func TestHTTPTransportApprovalFlowUsesSharedRuntimeHarness(t *testing.T) {
+	acpmock.RequireDriver(t)
+	t.Parallel()
+
+	runtimeHarness := e2etest.StartRuntimeHarness(t, &e2etest.RuntimeHarnessOptions{
+		MockAgents: []e2etest.MockAgentSpec{{
+			FixturePath:  transportMockFixturePath(t, "permission_env_fixture.json"),
+			FixtureAgent: "approver",
+			AgentName:    transportApprovalAgentName,
+		}},
+	})
+
+	clients, err := runtimeHarness.TransportClients()
+	if err != nil {
+		t.Fatalf("TransportClients() error = %v", err)
+	}
+
+	ctx, cancel := context.WithTimeout(t.Context(), 20*time.Second)
+	defer cancel()
+
+	session, err := runtimeHarness.CreateSession(ctx, compozycontract.CreateSessionRequest{
+		AgentName:     transportApprovalAgentName,
+		WorkspacePath: runtimeHarness.WorkspaceRoot,
+	})
+	if err != nil {
+		t.Fatalf("CreateSession() error = %v", err)
+	}
+	session = waitForHTTPTransportSessionActive(t, ctx, runtimeHarness, session)
+
+	var approvedRequestID string
+	events, err := runtimeHarness.PromptSessionHTTPWithEvents(
+		ctx,
+		session.ID,
+		"request permission",
+		func(record e2etest.SSEEvent) error {
+			payload, ok := e2etest.PermissionPayloadFromSSE(record)
+			if !ok || payload.Decision != "" || approvedRequestID != "" {
+				return nil
+			}
+			approvedRequestID = payload.RequestID
+			return runtimeHarness.ApproveSessionPermission(ctx, session.ID, compozycontract.ApproveSessionRequest{
+				RequestID: payload.RequestID,
+				Decision:  "allow-always",
+			})
+		},
+	)
+	if err != nil {
+		t.Fatalf("PromptSessionHTTPWithEvents() error = %v", err)
+	}
+	if approvedRequestID == "" {
+		t.Fatal("approvedRequestID = empty, want pending permission request")
+	}
+
+	payloads := e2etest.PermissionPayloads(events)
+	if got, want := len(payloads), 2; got != want {
+		t.Fatalf("len(permission payloads) = %d, want %d; payloads=%#v", got, want, payloads)
+	}
+	if got, want := payloads[0].RequestID, approvedRequestID; got != want {
+		t.Fatalf("payloads[0].RequestID = %q, want %q", got, want)
+	}
+	if got := payloads[len(payloads)-1].Decision; got != "allow-always" {
+		t.Fatalf("final permission decision = %q, want %q", got, "allow-always")
+	}
+	if !e2etest.RecordsContainTextDelta(events, "allow-always") {
+		t.Fatalf("prompt events = %#v, want allow-always text delta", events)
+	}
+
+	sessionResp := mustHTTPRequest(
+		t,
+		clients.HTTPClient,
+		http.MethodGet,
+		runtimeHarness.HTTPURL(transportHarnessSessionPath(t, runtimeHarness, session.ID, "")),
+		nil,
+		nil,
+	)
+	if sessionResp.StatusCode != http.StatusOK {
+		body := readAndCloseHTTPBody(t, sessionResp)
+		t.Fatalf("session status = %d, want %d; body=%s", sessionResp.StatusCode, http.StatusOK, string(body))
+	}
+	var detail struct {
+		Session sessionPayload `json:"session"`
+	}
+	decodeHTTPJSON(t, sessionResp, &detail)
+	if got, want := detail.Session.ID, session.ID; got != want {
+		t.Fatalf("detail.Session.ID = %q, want %q", got, want)
+	}
+}
+
+func TestHTTPTransportSessionProviderLifecycle(t *testing.T) {
+	acpmock.RequireDriver(t)
+	t.Parallel()
+
+	runtimeHarness := e2etest.StartRuntimeHarness(t, &e2etest.RuntimeHarnessOptions{
+		MockAgents: []e2etest.MockAgentSpec{{
+			FixturePath:  transportMockFixturePath(t, "automation_task_fixture.json"),
+			FixtureAgent: "automation-runner",
+			AgentName:    transportAutomationAgent,
+		}},
+	})
+
+	registration, ok := runtimeHarness.MockAgentRegistration(transportAutomationAgent)
+	if !ok {
+		t.Fatalf("MockAgentRegistration(%q) not found", transportAutomationAgent)
+	}
+	ctx, cancel := context.WithTimeout(t.Context(), 20*time.Second)
+	defer cancel()
+
+	t.Run("Should return an unbound runtime through create and read", func(t *testing.T) {
+		var created compozycontract.SessionResponse
+		if err := runtimeHarness.HTTPJSON(ctx, http.MethodPost, "/api/sessions", compozycontract.CreateSessionRequest{
+			AgentName:     transportAutomationAgent,
+			WorkspacePath: runtimeHarness.WorkspaceRoot,
+		}, &created); err != nil {
+			t.Fatalf("HTTP create session error = %v", err)
+		}
+		if created.Session.ID == "" {
+			t.Fatal("HTTP create session id = empty, want non-empty")
+		}
+		if created.Session.Runtime.Status != "unbound" || created.Session.Runtime.Effective != nil {
+			t.Fatalf("HTTP create runtime = %#v, want unbound without effective selection", created.Session.Runtime)
+		}
+		created.Session = waitForHTTPTransportSessionActive(t, ctx, runtimeHarness, created.Session)
+
+		var detail compozycontract.SessionResponse
+		if err := runtimeHarness.HTTPJSON(
+			ctx,
+			http.MethodGet,
+			transportHarnessSessionPath(t, runtimeHarness, created.Session.ID, ""),
+			nil,
+			&detail,
+		); err != nil {
+			t.Fatalf("HTTP get session error = %v", err)
+		}
+		if detail.Session.Runtime.Status != created.Session.Runtime.Status ||
+			detail.Session.Runtime.Effective != nil {
+			t.Fatalf(
+				"HTTP detail runtime = %#v, want unbound without effective selection",
+				detail.Session.Runtime,
+			)
+		}
+	})
+
+	t.Run("Should return conflict when attaching a stopped session", func(t *testing.T) {
+		writeTransportProviderOverrideConfig(
+			t,
+			runtimeHarness.WorkspaceRoot,
+			transportOverrideProvider,
+			registration.Command,
+			true,
+		)
+
+		var created compozycontract.SessionResponse
+		if err := runtimeHarness.HTTPJSON(ctx, http.MethodPost, "/api/sessions", compozycontract.CreateSessionRequest{
+			AgentName:     transportAutomationAgent,
+			WorkspacePath: runtimeHarness.WorkspaceRoot,
+		}, &created); err != nil {
+			t.Fatalf("HTTP create session error = %v", err)
+		}
+		created.Session = waitForHTTPTransportSessionActive(t, ctx, runtimeHarness, created.Session)
+
+		stopResp := mustHTTPRequest(
+			t,
+			runtimeHarness.HTTPClient,
+			http.MethodPost,
+			runtimeHarness.HTTPURL(transportHarnessSessionPath(t, runtimeHarness, created.Session.ID, "/stop")),
+			nil,
+			nil,
+		)
+		body, readErr := io.ReadAll(stopResp.Body)
+		closeErr := stopResp.Body.Close()
+		if readErr != nil {
+			t.Fatalf("read HTTP stop response body error = %v", readErr)
+		}
+		if closeErr != nil {
+			t.Fatalf("close HTTP stop response body error = %v", closeErr)
+		}
+		if stopResp.StatusCode != http.StatusNoContent {
+			t.Fatalf(
+				"HTTP stop session status = %d, want %d; body=%s",
+				stopResp.StatusCode,
+				http.StatusNoContent,
+				string(body),
+			)
+		}
+
+		writeTransportProviderOverrideConfig(
+			t,
+			runtimeHarness.WorkspaceRoot,
+			transportOverrideProvider,
+			registration.Command,
+			false,
+		)
+
+		resumeResp := mustHTTPRequest(
+			t,
+			runtimeHarness.HTTPClient,
+			http.MethodPost,
+			runtimeHarness.HTTPURL(
+				transportHarnessSessionPath(t, runtimeHarness, created.Session.ID, "/attach"),
+			),
+			nil,
+			nil,
+		)
+		resumeBody, err := io.ReadAll(resumeResp.Body)
+		resumeCloseErr := resumeResp.Body.Close()
+		if err != nil {
+			t.Fatalf("read HTTP resume body error = %v", err)
+		}
+		if resumeCloseErr != nil {
+			t.Fatalf("close HTTP resume body error = %v", resumeCloseErr)
+		}
+		if resumeResp.StatusCode != http.StatusConflict {
+			t.Fatalf(
+				"HTTP attach status = %d, want %d; body=%s",
+				resumeResp.StatusCode,
+				http.StatusConflict,
+				string(resumeBody),
+			)
+		}
+
+		var payload struct {
+			Error string `json:"error"`
+		}
+		if err := json.Unmarshal(resumeBody, &payload); err != nil {
+			t.Fatalf("Unmarshal(resume body) error = %v; body=%s", err, string(resumeBody))
+		}
+
+		if !strings.Contains(payload.Error, created.Session.ID) {
+			t.Fatalf("HTTP attach error = %s, want session id %q", payload.Error, created.Session.ID)
+		}
+		if !strings.Contains(payload.Error, "not attachable") {
+			t.Fatalf("HTTP attach error = %s, want attachability context", payload.Error)
+		}
+	})
+}
+
+func TestHTTPTransportWebhookIngressUsesSharedRuntimeHarness(t *testing.T) {
+	acpmock.RequireDriver(t)
+	t.Parallel()
+
+	runtimeHarness := e2etest.StartRuntimeHarness(t, &e2etest.RuntimeHarnessOptions{
+		ConfigSeed: e2etest.ConfigSeedOptions{
+			DefaultAgent: transportAutomationAgent,
+		},
+		MockAgents: []e2etest.MockAgentSpec{{
+			FixturePath:  transportMockFixturePath(t, "automation_task_fixture.json"),
+			FixtureAgent: "automation-runner",
+			AgentName:    transportAutomationAgent,
+		}},
+	})
+
+	ctx, cancel := context.WithTimeout(t.Context(), 20*time.Second)
+	defer cancel()
+
+	trigger, endpoint := seedTransportWebhookTrigger(t, ctx, runtimeHarness)
+	payload := []byte(`{"payload":"deploy","branch":"main"}`)
+	delivery, err := runtimeHarness.DeliverGlobalWebhook(
+		ctx,
+		endpoint,
+		"shared-secret",
+		payload,
+		"delivery-http-transport",
+		time.Now().UTC(),
+	)
+	if err != nil {
+		t.Fatalf("DeliverGlobalWebhook() error = %v", err)
+	}
+	if got, want := len(delivery.Runs), 1; got != want {
+		t.Fatalf("len(delivery.Runs) = %d, want %d; delivery=%#v", got, want, delivery)
+	}
+
+	httpRun := waitForHTTPAutomationRun(t, ctx, runtimeHarness, delivery.Runs[0].ID)
+	if err := e2etest.ValidateWebhookRunProjection(delivery, httpRun); err != nil {
+		t.Fatalf("ValidateWebhookRunProjection() error = %v", err)
+	}
+	if got, want := httpRun.TriggerID, trigger.ID; got != want {
+		t.Fatalf("httpRun.TriggerID = %q, want %q", got, want)
+	}
+	if httpRun.SessionID == "" {
+		t.Fatalf("httpRun.SessionID = %q, want non-empty session linkage", httpRun.SessionID)
+	}
+}
+
+func TestHTTPTransportPromptFailureProjectionUsesSharedRuntimeHarness(t *testing.T) {
+	acpmock.RequireDriver(t)
+	t.Parallel()
+
+	runtimeHarness := e2etest.StartRuntimeHarness(t, &e2etest.RuntimeHarnessOptions{
+		MockAgents: []e2etest.MockAgentSpec{{
+			FixturePath:  transportMockFixturePath(t, "driver_fault_fixture.json"),
+			FixtureAgent: "faulty",
+			AgentName:    transportFaultyAgent,
+		}},
+	})
+
+	ctx, cancel := context.WithTimeout(t.Context(), 20*time.Second)
+	defer cancel()
+
+	session, err := runtimeHarness.CreateSession(ctx, compozycontract.CreateSessionRequest{
+		AgentName:     transportFaultyAgent,
+		WorkspacePath: runtimeHarness.WorkspaceRoot,
+	})
+	if err != nil {
+		t.Fatalf("CreateSession() error = %v", err)
+	}
+	session = waitForHTTPTransportSessionActive(t, ctx, runtimeHarness, session)
+
+	stream, err := runtimeHarness.PromptSessionHTTP(ctx, session.ID, "trigger invalid frame")
+	if err != nil {
+		t.Fatalf("PromptSessionHTTP() error = %v", err)
+	}
+	if !e2etest.RecordsContainTextDelta(stream, "partial before invalid frame") {
+		t.Fatalf("HTTP prompt stream = %#v, want partial assistant delta", stream)
+	}
+	if !httpSSEContainsEvent(stream, "error") {
+		t.Fatalf("HTTP prompt stream = %#v, want error event", stream)
+	}
+
+	var eventsResp compozycontract.SessionEventsResponse
+	if err := runtimeHarness.HTTPJSON(
+		ctx,
+		http.MethodGet,
+		transportHarnessSessionPath(t, runtimeHarness, session.ID, "/events"),
+		nil,
+		&eventsResp,
+	); err != nil {
+		t.Fatalf("HTTP session events error = %v", err)
+	}
+	if !httpSessionEventsContainType(eventsResp.Events, "error") {
+		t.Fatalf("HTTP session events = %#v, want error projection", eventsResp.Events)
+	}
+}
+
+func waitForHTTPTransportSessionActive(
+	t testing.TB,
+	ctx context.Context,
+	harness *e2etest.RuntimeHarness,
+	accepted compozycontract.SessionPayload,
+) compozycontract.SessionPayload {
+	t.Helper()
+	active, err := harness.WaitForSessionActive(ctx, accepted.ID)
+	if err != nil {
+		t.Fatalf("WaitForSessionActive(%q) error = %v; accepted=%#v", accepted.ID, err, accepted)
+	}
+	return active
+}
+
+func transportHarnessSessionPath(
+	t testing.TB,
+	harness *e2etest.RuntimeHarness,
+	sessionID string,
+	suffix string,
+) string {
+	t.Helper()
+
+	workspaceID := strings.TrimSpace(harness.WorkspaceID)
+	if workspaceID == "" {
+		t.Fatal("runtime harness WorkspaceID = empty")
+	}
+	return "/api/workspaces/" + url.PathEscape(workspaceID) +
+		"/sessions/" + url.PathEscape(sessionID) + suffix
+}
+
+func TestHTTPTransportExtensionParityMatchesUDS(t *testing.T) {
+	t.Run("Should preserve extension behavior across HTTP, UDS, and CLI", testHTTPTransportExtensionParityMatchesUDS)
+}
+
+// Invariant: one task catalog query has identical calm-default and Loop-filter semantics over
+// real HTTP, UDS, and CLI transports. The native-tool suite reuses the same semantic matcher.
+func TestHTTPTransportTaskLoopCatalogParity(t *testing.T) {
+	acpmock.RequireDriver(t)
+	t.Parallel()
+
+	runtimeHarness := e2etest.StartRuntimeHarness(t, &e2etest.RuntimeHarnessOptions{})
+	ctx, cancel := context.WithTimeout(t.Context(), 20*time.Second)
+	defer cancel()
+	seedTransportTaskLoopCatalog(t, ctx, runtimeHarness)
+
+	queries := []struct {
+		name    string
+		path    string
+		cliArgs []string
+		assert  func(testing.TB, compozycontract.TasksResponse)
+	}{
+		{
+			name:    "Should exclude Loop records by default",
+			path:    transportTaskListPath(runtimeHarness.WorkspaceID, "", false),
+			cliArgs: transportTaskListCLIArgs(runtimeHarness.WorkspaceID),
+			assert: func(t testing.TB, response compozycontract.TasksResponse) {
+				t.Helper()
+				if len(response.Tasks) != 1 || response.Tasks[0].ID != "task-transport-visible" ||
+					response.Page.Total != 1 {
+					t.Fatalf("calm task catalog = %#v, want only the operator task", response)
+				}
+			},
+		},
+		{
+			name:    "Should include complete coordinator and cell provenance",
+			path:    transportTaskListPath(runtimeHarness.WorkspaceID, "", true),
+			cliArgs: transportTaskListCLIArgs(runtimeHarness.WorkspaceID, "--include-loop"),
+			assert:  assertTransportIncludedLoopCatalog,
+		},
+		{
+			name: "Should collapse three attempts into one Loop cell",
+			path: transportTaskListPath(runtimeHarness.WorkspaceID, apitest.TaskLoopParityRunID, false),
+			cliArgs: transportTaskListCLIArgs(
+				runtimeHarness.WorkspaceID, "--loop-run", apitest.TaskLoopParityRunID,
+			),
+			assert: apitest.AssertLoopRunTaskCatalog,
+		},
+	}
+
+	for _, query := range queries {
+		t.Run(query.name, func(t *testing.T) {
+			var httpPayload compozycontract.TasksResponse
+			if err := runtimeHarness.HTTPJSON(ctx, http.MethodGet, query.path, nil, &httpPayload); err != nil {
+				t.Fatalf("HTTP task list error = %v", err)
+			}
+			var udsPayload compozycontract.TasksResponse
+			if err := runtimeHarness.UDSJSON(ctx, http.MethodGet, query.path, nil, &udsPayload); err != nil {
+				t.Fatalf("UDS task list error = %v", err)
+			}
+			var cliPayload compozycontract.TasksResponse
+			if err := runtimeHarness.CLI.RunJSONInDir(
+				ctx, runtimeHarness.WorkspaceRoot, &cliPayload, query.cliArgs...,
+			); err != nil {
+				t.Fatalf("CLI task list error = %v", err)
+			}
+			for transport, payload := range map[string]compozycontract.TasksResponse{
+				"HTTP": httpPayload, "UDS": udsPayload, "CLI": cliPayload,
+			} {
+				query.assert(t, payload)
+				if !reflect.DeepEqual(httpPayload, payload) {
+					t.Fatalf("%s task catalog = %#v, want HTTP parity %#v", transport, payload, httpPayload)
+				}
+			}
+		})
+	}
+
+	t.Run("Should return a scoped empty body for a foreign Loop run", func(t *testing.T) {
+		path := transportTaskListPath(runtimeHarness.WorkspaceID, "looprun-transport-foreign", false)
+		for transport, client := range map[string]*http.Client{
+			"HTTP": runtimeHarness.HTTPClient,
+			"UDS":  runtimeHarness.UDSClient,
+		} {
+			endpoint := runtimeHarness.HTTPURL(path)
+			if transport == "UDS" {
+				endpoint = runtimeHarness.UDSURL(path)
+			}
+			response := mustHTTPRequest(t, client, http.MethodGet, endpoint, nil, nil)
+			if response.StatusCode != http.StatusOK {
+				body := readAndCloseHTTPBody(t, response)
+				t.Fatalf(
+					"%s foreign Loop status = %d, want %d; body=%s",
+					transport,
+					response.StatusCode,
+					http.StatusOK,
+					body,
+				)
+			}
+			var payload compozycontract.TasksResponse
+			decodeHTTPJSON(t, response, &payload)
+			assertScopedEmptyTaskCatalog(t, transport, payload)
+		}
+		var cliPayload compozycontract.TasksResponse
+		if err := runtimeHarness.CLI.RunJSONInDir(
+			ctx,
+			runtimeHarness.WorkspaceRoot,
+			&cliPayload,
+			transportTaskListCLIArgs(
+				runtimeHarness.WorkspaceID, "--loop-run", "looprun-transport-foreign",
+			)...,
+		); err != nil {
+			t.Fatalf("CLI foreign Loop list error = %v, want exit 0", err)
+		}
+		assertScopedEmptyTaskCatalog(t, "CLI", cliPayload)
+	})
+
+	t.Run("Should keep catalog and detail provenance identical after relational retention", func(t *testing.T) {
+		var catalog compozycontract.TasksResponse
+		if err := runtimeHarness.HTTPJSON(
+			ctx,
+			http.MethodGet,
+			transportTaskListPath(runtimeHarness.WorkspaceID, "", true),
+			nil,
+			&catalog,
+		); err != nil {
+			t.Fatalf("HTTP included task list error = %v", err)
+		}
+		byID := make(map[string]compozycontract.TaskCatalogItemPayload, len(catalog.Tasks))
+		for _, item := range catalog.Tasks {
+			byID[item.ID] = item
+		}
+		for _, taskID := range []string{
+			apitest.TaskLoopParityCoordinatorID,
+			apitest.TaskLoopParityCellID,
+			"task-loop-transport-retained",
+		} {
+			var detail compozycontract.TaskDetailResponse
+			if err := runtimeHarness.HTTPJSON(
+				ctx, http.MethodGet, "/api/tasks/"+url.PathEscape(taskID), nil, &detail,
+			); err != nil {
+				t.Fatalf("HTTP task detail %q error = %v", taskID, err)
+			}
+			if !reflect.DeepEqual(detail.Task.Task.Loop, byID[taskID].Loop) {
+				t.Fatalf(
+					"task %q detail Loop = %#v, want catalog parity %#v",
+					taskID,
+					detail.Task.Task.Loop,
+					byID[taskID].Loop,
+				)
+			}
+		}
+		retained := byID["task-loop-transport-retained"].Loop
+		if retained == nil || retained.RunID != "looprun-transport-retained" ||
+			retained.Role != compozycontract.LoopProvenanceRoleCell || retained.LoopName != "" {
+			t.Fatalf("retention-degraded Loop provenance = %#v, want relational run/role without name", retained)
+		}
+	})
+}
+
+func testHTTPTransportExtensionParityMatchesUDS(t *testing.T) {
+	acpmock.RequireDriver(t)
+	t.Parallel()
+
+	runtimeHarness := e2etest.StartRuntimeHarness(t, &e2etest.RuntimeHarnessOptions{
+		ConfigSeed: e2etest.ConfigSeedOptions{Mutate: func(cfg *compozyconfig.Config) {
+			cfg.Extensions.Trust.AllowUnverified = true
+		}},
+	})
+
+	ctx, cancel := context.WithTimeout(t.Context(), 20*time.Second)
+	defer cancel()
+
+	portablePath, err := filepath.Abs(filepath.Join("..", "..", "extension", "testdata", "agent-plugin-conformant"))
+	if err != nil {
+		t.Fatalf("filepath.Abs(agent-plugin-conformant) error = %v", err)
+	}
+	installed, err := runtimeHarness.InstallExtension(ctx, compozycontract.InstallExtensionRequest{
+		Source:          compozycontract.InstallExtensionSourceLocalPath,
+		Ref:             portablePath,
+		AllowUnverified: true,
+	})
+	if err != nil {
+		t.Fatalf("InstallExtension(portable) error = %v", err)
+	}
+	if installed.Format != "agent-plugin" || len(installed.Diagnostics) == 0 {
+		t.Fatalf("installed portable extension = %#v, want format and recorded diagnostics", installed)
+	}
+
+	clients, err := runtimeHarness.TransportClients()
+	if err != nil {
+		t.Fatalf("TransportClients() error = %v", err)
+	}
+
+	httpListResp := mustHTTPRequest(
+		t,
+		clients.HTTPClient,
+		http.MethodGet,
+		runtimeHarness.HTTPURL("/api/extensions"),
+		nil,
+		nil,
+	)
+	if httpListResp.StatusCode != http.StatusOK {
+		body := readAndCloseHTTPBody(t, httpListResp)
+		t.Fatalf(
+			"HTTP list extensions status = %d, want %d; body=%s",
+			httpListResp.StatusCode,
+			http.StatusOK,
+			string(body),
+		)
+	}
+	var httpList compozycontract.ExtensionsResponse
+	decodeHTTPJSON(t, httpListResp, &httpList)
+
+	var udsList compozycontract.ExtensionsResponse
+	if err := runtimeHarness.UDSJSON(ctx, http.MethodGet, "/api/extensions", nil, &udsList); err != nil {
+		t.Fatalf("UDS list extensions error = %v", err)
+	}
+	sortExtensionsByName(httpList.Extensions)
+	sortExtensionsByName(udsList.Extensions)
+	if !extensionsSemanticallyEqual(httpList.Extensions, udsList.Extensions) {
+		t.Fatalf("HTTP extensions = %#v, want UDS parity %#v", httpList.Extensions, udsList.Extensions)
+	}
+	var cliList []compozycontract.ExtensionPayload
+	if err := clients.CLI.RunJSONInDir(
+		ctx,
+		runtimeHarness.WorkspaceRoot,
+		&cliList,
+		"extension", "list", "-o", "json",
+	); err != nil {
+		t.Fatalf("CLI list extensions error = %v", err)
+	}
+	sortExtensionsByName(cliList)
+	if !extensionsSemanticallyEqual(httpList.Extensions, cliList) {
+		t.Fatalf("HTTP extensions = %#v, want CLI parity %#v", httpList.Extensions, cliList)
+	}
+
+	extensionName := installed.Name
+
+	httpStatusResp := mustHTTPRequest(
+		t,
+		clients.HTTPClient,
+		http.MethodGet,
+		runtimeHarness.HTTPURL("/api/extensions/"+url.PathEscape(extensionName)),
+		nil,
+		nil,
+	)
+	if httpStatusResp.StatusCode != http.StatusOK {
+		body := readAndCloseHTTPBody(t, httpStatusResp)
+		t.Fatalf("HTTP extension status = %d, want %d; body=%s", httpStatusResp.StatusCode, http.StatusOK, string(body))
+	}
+	var httpStatus compozycontract.ExtensionResponse
+	decodeHTTPJSON(t, httpStatusResp, &httpStatus)
+
+	var udsStatus compozycontract.ExtensionResponse
+	if err := runtimeHarness.UDSJSON(
+		ctx,
+		http.MethodGet,
+		"/api/extensions/"+url.PathEscape(extensionName),
+		nil,
+		&udsStatus,
+	); err != nil {
+		t.Fatalf("UDS extension status error = %v", err)
+	}
+	if !extensionSemanticallyEqual(httpStatus.Extension, udsStatus.Extension) {
+		t.Fatalf("HTTP extension = %#v, want UDS parity %#v", httpStatus.Extension, udsStatus.Extension)
+	}
+	var cliStatus compozycontract.ExtensionPayload
+	if err := clients.CLI.RunJSONInDir(
+		ctx,
+		runtimeHarness.WorkspaceRoot,
+		&cliStatus,
+		"extension", "status", extensionName, "-o", "json",
+	); err != nil {
+		t.Fatalf("CLI extension status error = %v", err)
+	}
+	if !extensionSemanticallyEqual(httpStatus.Extension, cliStatus) {
+		t.Fatalf("HTTP extension = %#v, want CLI parity %#v", httpStatus.Extension, cliStatus)
+	}
+
+	inventoryPath := "/api/extensions/" + url.PathEscape(extensionName) + "/inventory"
+	var httpInventory compozycontract.ExtensionInventoryPayload
+	if err := runtimeHarness.HTTPJSON(ctx, http.MethodGet, inventoryPath, nil, &httpInventory); err != nil {
+		t.Fatalf("HTTP extension inventory error = %v", err)
+	}
+	var udsInventory compozycontract.ExtensionInventoryPayload
+	if err := runtimeHarness.UDSJSON(ctx, http.MethodGet, inventoryPath, nil, &udsInventory); err != nil {
+		t.Fatalf("UDS extension inventory error = %v", err)
+	}
+	if !reflect.DeepEqual(httpInventory, udsInventory) {
+		t.Fatalf("HTTP extension inventory = %#v, want UDS parity %#v", httpInventory, udsInventory)
+	}
+	var cliInventory compozycontract.ExtensionInventoryPayload
+	if err := clients.CLI.RunJSONInDir(
+		ctx,
+		runtimeHarness.WorkspaceRoot,
+		&cliInventory,
+		"extension", "inventory", extensionName, "-o", "json",
+	); err != nil {
+		t.Fatalf("CLI extension inventory error = %v", err)
+	}
+	if !reflect.DeepEqual(httpInventory, cliInventory) {
+		t.Fatalf("HTTP extension inventory = %#v, want CLI parity %#v", httpInventory, cliInventory)
+	}
+	if httpInventory.Format != "agent-plugin" || len(httpInventory.Diagnostics) == 0 {
+		t.Fatalf("portable inventory = %#v, want format and recorded diagnostics", httpInventory)
+	}
+
+	assertTransportErrorParity := func(method, path string) []byte {
+		t.Helper()
+		httpResponse := mustHTTPRequest(
+			t, clients.HTTPClient, method, runtimeHarness.HTTPURL(path), nil, nil,
+		)
+		udsResponse := mustHTTPRequest(
+			t, clients.UDSClient, method, runtimeHarness.UDSURL(path), nil, nil,
+		)
+		httpBody := readAndCloseHTTPBody(t, httpResponse)
+		udsBody := readAndCloseHTTPBody(t, udsResponse)
+		if httpResponse.StatusCode < http.StatusBadRequest {
+			t.Fatalf("HTTP %s %s status = %d, want error; body=%s", method, path, httpResponse.StatusCode, httpBody)
+		}
+		if httpResponse.StatusCode != udsResponse.StatusCode || !reflect.DeepEqual(httpBody, udsBody) {
+			t.Fatalf(
+				"HTTP error = status %d body %s, want UDS parity status %d body %s",
+				httpResponse.StatusCode,
+				string(httpBody),
+				udsResponse.StatusCode,
+				string(udsBody),
+			)
+		}
+		return httpBody
+	}
+	assertCLIErrorParity := func(want []byte, args ...string) {
+		t.Helper()
+		stdout, stderr, err := clients.CLI.RunInDir(ctx, runtimeHarness.WorkspaceRoot, args...)
+		if err == nil {
+			t.Fatalf("CLI %q error = nil, want failure", strings.Join(args, " "))
+		}
+		if strings.TrimSpace(stdout) != "" || strings.TrimSpace(stderr) != strings.TrimSpace(string(want)) {
+			t.Fatalf(
+				"CLI %q stdout=%q stderr=%q, want structured error %s",
+				strings.Join(args, " "),
+				stdout,
+				stderr,
+				string(want),
+			)
+		}
+	}
+	missingBody := assertTransportErrorParity(http.MethodGet, "/api/extensions/missing-portable-package")
+	assertCLIErrorParity(
+		missingBody,
+		"extension", "status", "missing-portable-package", "-o", "json",
+	)
+	for _, legacy := range []string{"enable", "disable"} {
+		legacyPath := "/api/extensions/" + url.PathEscape(extensionName) + "/" + legacy
+		requests := []struct {
+			transport string
+			request   func() *http.Response
+		}{
+			{
+				transport: "HTTP",
+				request: func() *http.Response {
+					return mustHTTPRequest(
+						t,
+						clients.HTTPClient,
+						http.MethodPost,
+						runtimeHarness.HTTPURL(legacyPath),
+						nil,
+						nil,
+					)
+				},
+			},
+			{
+				transport: "UDS",
+				request: func() *http.Response {
+					return mustHTTPRequest(
+						t,
+						clients.UDSClient,
+						http.MethodPost,
+						runtimeHarness.UDSURL(legacyPath),
+						nil,
+						nil,
+					)
+				},
+			},
+		}
+		for _, item := range requests {
+			t.Run("Should reject "+item.transport+" legacy "+legacy, func(t *testing.T) {
+				response := item.request()
+				body := readAndCloseHTTPBody(t, response)
+				if response.StatusCode != http.StatusNotFound {
+					t.Fatalf(
+						"%s legacy %s status = %d, want 404; body=%s",
+						item.transport,
+						legacy,
+						response.StatusCode,
+						body,
+					)
+				}
+				if got, want := strings.TrimSpace(string(body)), "404 page not found"; got != want {
+					t.Fatalf("%s legacy %s error body = %q, want %q", item.transport, legacy, got, want)
+				}
+			})
+		}
+	}
+
+	enablementPath := "/api/extensions/" + url.PathEscape(extensionName) + "/enablement"
+	enablementRequest := compozycontract.SetExtensionEnablementRequest{Profile: "default", Enabled: false}
+	var httpEnablement compozycontract.ExtensionEnablementPayload
+	if err := runtimeHarness.HTTPJSON(
+		ctx,
+		http.MethodPut,
+		enablementPath,
+		enablementRequest,
+		&httpEnablement,
+	); err != nil {
+		t.Fatalf("HTTP disable extension in profile error = %v", err)
+	}
+	var udsEnablement compozycontract.ExtensionEnablementPayload
+	if err := runtimeHarness.UDSJSON(
+		ctx,
+		http.MethodPut,
+		enablementPath,
+		enablementRequest,
+		&udsEnablement,
+	); err != nil {
+		t.Fatalf("UDS disable extension in profile error = %v", err)
+	}
+	if !reflect.DeepEqual(httpEnablement, udsEnablement) {
+		t.Fatalf("HTTP enablement = %#v, want UDS parity %#v", httpEnablement, udsEnablement)
+	}
+	var cliEnablement compozycontract.ExtensionEnablementPayload
+	if err := clients.CLI.RunJSONInDir(
+		ctx,
+		runtimeHarness.WorkspaceRoot,
+		&cliEnablement,
+		"extension", "disable", extensionName, "--profile", "default", "-o", "json",
+	); err != nil {
+		t.Fatalf("CLI disable extension in profile error = %v", err)
+	}
+	if !reflect.DeepEqual(httpEnablement, cliEnablement) {
+		t.Fatalf("HTTP enablement = %#v, want CLI parity %#v", httpEnablement, cliEnablement)
+	}
+	if httpEnablement.Profile != "default" || httpEnablement.Enabled {
+		t.Fatalf("profile enablement = %#v, want default disabled", httpEnablement)
+	}
+
+	logsPath := "/api/extensions/" + url.PathEscape(extensionName) + "/logs"
+	httpLogsResp := mustHTTPRequest(
+		t,
+		clients.HTTPClient,
+		http.MethodGet,
+		runtimeHarness.HTTPURL(logsPath),
+		nil,
+		nil,
+	)
+	if httpLogsResp.StatusCode != http.StatusOK {
+		body := readAndCloseHTTPBody(t, httpLogsResp)
+		t.Fatalf(
+			"HTTP extension logs status = %d, want %d; body=%s",
+			httpLogsResp.StatusCode,
+			http.StatusOK,
+			string(body),
+		)
+	}
+	var httpLogs compozycontract.ExtensionLogsResponse
+	decodeHTTPJSON(t, httpLogsResp, &httpLogs)
+	var udsLogs compozycontract.ExtensionLogsResponse
+	if err := runtimeHarness.UDSJSON(ctx, http.MethodGet, logsPath, nil, &udsLogs); err != nil {
+		t.Fatalf("UDS extension logs error = %v", err)
+	}
+	if strings.TrimSpace(httpLogs.StreamEpoch) == "" || !reflect.DeepEqual(httpLogs, udsLogs) {
+		t.Fatalf("HTTP extension logs = %#v, want identified UDS parity %#v", httpLogs, udsLogs)
+	}
+	for _, entry := range httpLogs.Logs {
+		if entry.StreamEpoch != httpLogs.StreamEpoch {
+			t.Fatalf(
+				"HTTP extension log epoch = %q, want snapshot epoch %q",
+				entry.StreamEpoch,
+				httpLogs.StreamEpoch,
+			)
+		}
+	}
+}
+
+func TestHTTPInstallPortableManifestContract(t *testing.T) {
+	acpmock.RequireDriver(t)
+	t.Parallel()
+
+	runtimeHarness := e2etest.StartRuntimeHarness(t, &e2etest.RuntimeHarnessOptions{
+		ConfigSeed: e2etest.ConfigSeedOptions{Mutate: func(cfg *compozyconfig.Config) {
+			cfg.Extensions.Trust.AllowUnverified = true
+		}},
+	})
+	ctx, cancel := context.WithTimeout(t.Context(), 20*time.Second)
+	defer cancel()
+
+	database, err := globaldb.OpenGlobalDB(ctx, runtimeHarness.HomePaths.DatabaseFile)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		if err := database.Close(context.Background()); err != nil {
+			t.Error(err)
+		}
+	})
+	registry := extensionpkg.NewRegistry(database.DB())
+
+	clientLayout := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(clientLayout, ".claude-plugin"), 0o700); err != nil {
+		t.Fatalf("MkdirAll(.claude-plugin) error = %v", err)
+	}
+	if err := os.WriteFile(
+		filepath.Join(clientLayout, ".claude-plugin", "plugin.json"),
+		[]byte(`{}`),
+		0o600,
+	); err != nil {
+		t.Fatalf("WriteFile(.claude-plugin/plugin.json) error = %v", err)
+	}
+	notManifest := t.TempDir()
+	unrelatedManifest := `{"$schema":"https://example.com/other/plugin.schema.json","name":"unrelated"}`
+	if err := os.WriteFile(filepath.Join(notManifest, "plugin.json"), []byte(unrelatedManifest), 0o600); err != nil {
+		t.Fatalf("WriteFile(plugin.json) error = %v", err)
+	}
+
+	for _, testCase := range []struct {
+		name string
+		path string
+		code string
+	}{
+		{
+			name: "Should reject a malformed client manifest",
+			path: clientLayout,
+			code: "extension_agent_plugin_manifest_invalid",
+		},
+		{
+			name: "Should reject an unrelated directory",
+			path: notManifest,
+			code: "extension_agent_plugin_not_manifest",
+		},
+	} {
+		t.Run(testCase.name, func(t *testing.T) {
+			before, err := registry.List()
+			if err != nil {
+				t.Fatalf("ListExtensions(before) error = %v", err)
+			}
+			requestBody, err := json.Marshal(compozycontract.InstallExtensionRequest{
+				Source:          compozycontract.InstallExtensionSourceLocalPath,
+				Ref:             testCase.path,
+				AllowUnverified: true,
+			})
+			if err != nil {
+				t.Fatalf("json.Marshal(install request) error = %v", err)
+			}
+			response := mustHTTPRequest(
+				t,
+				runtimeHarness.HTTPClient,
+				http.MethodPost,
+				runtimeHarness.HTTPURL("/api/extensions"),
+				requestBody,
+				nil,
+			)
+			if response.StatusCode != http.StatusUnprocessableEntity {
+				body := readAndCloseHTTPBody(t, response)
+				t.Fatalf("HTTP install status = %d, want 422; body=%s", response.StatusCode, string(body))
+			}
+			if testCase.code == "extension_agent_plugin_manifest_invalid" {
+				var payload compozycontract.ExtensionValidationErrorPayload
+				decodeHTTPJSON(t, response, &payload)
+				if payload.Diagnostic == nil || payload.Diagnostic.Code != testCase.code || len(payload.Issues) == 0 {
+					t.Fatalf(
+						"HTTP manifest validation error = %#v, want %q and validation issues",
+						payload,
+						testCase.code,
+					)
+				}
+			} else {
+				var payload compozycontract.ExtensionOperationErrorPayload
+				decodeHTTPJSON(t, response, &payload)
+				if payload.Code != testCase.code {
+					t.Fatalf("HTTP install error code = %q, want %q", payload.Code, testCase.code)
+				}
+			}
+			installed, err := registry.List()
+			if err != nil {
+				t.Fatalf("ListExtensions() error = %v", err)
+			}
+			if !reflect.DeepEqual(installed, before) {
+				t.Fatalf("installed extensions = %#v, want registry unchanged from %#v", installed, before)
+			}
+		})
+	}
+
+	for _, layout := range []string{"claude-plugin", "codex-plugin", "cursor-plugin"} {
+		t.Run("Should install a valid "+layout+" package with its recorded layout", func(t *testing.T) {
+			t.Parallel()
+			root := t.TempDir()
+			directory := filepath.Join(root, "."+layout)
+			if err := os.MkdirAll(directory, 0o700); err != nil {
+				t.Fatal(err)
+			}
+			name := "client-" + layout
+			manifest, err := json.Marshal(map[string]any{"name": name, "version": "1.0.0", "hooks": map[string]any{}})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(filepath.Join(directory, "plugin.json"), manifest, 0o600); err != nil {
+				t.Fatal(err)
+			}
+			body, err := json.Marshal(
+				compozycontract.InstallExtensionRequest{
+					Source:          compozycontract.InstallExtensionSourceLocalPath,
+					Ref:             root,
+					AllowUnverified: true,
+				},
+			)
+			if err != nil {
+				t.Fatal(err)
+			}
+			response := mustHTTPRequest(
+				t,
+				runtimeHarness.HTTPClient,
+				http.MethodPost,
+				runtimeHarness.HTTPURL("/api/extensions"),
+				body,
+				nil,
+			)
+			if response.StatusCode != http.StatusCreated {
+				t.Fatalf("client install status = %d: %s", response.StatusCode, readAndCloseHTTPBody(t, response))
+			}
+			var payload compozycontract.ExtensionResponse
+			decodeHTTPJSON(t, response, &payload)
+			if payload.Extension.Name != name || payload.Extension.Layout != layout ||
+				payload.Extension.Contents.Hooks != 0 {
+				t.Fatalf("client payload = %#v", payload)
+			}
+			found := false
+			for _, diagnostic := range payload.Extension.Diagnostics {
+				if diagnostic.Code == "client_component_ignored" {
+					found = true
+				}
+			}
+			if !found {
+				t.Fatalf("ignored hooks diagnostic missing: %#v", payload.Extension.Diagnostics)
+			}
+			installed, err := registry.Get(name)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if installed.Provenance.Layout != layout {
+				t.Fatalf("persisted layout = %q", installed.Provenance.Layout)
+			}
+		})
+	}
+}
+
+func TestHTTPTransportTaskSurfaceMatchesDocumentedSpecOperations(t *testing.T) {
+	t.Parallel()
+
+	engine := newTestRouter(t, newTestHandlers(t, &stubSessionManager{}, stubObserver{}, newTestHomePaths(t)))
+	got := apitest.RoutesFromEngine(engine.Routes(), isDocumentedHTTPTaskRoute)
+	want := apitest.DocumentedRoutesForTransport(apispec.TransportHTTP, isDocumentedHTTPTaskRoute)
+
+	if !slices.Equal(got, want) {
+		t.Fatalf("HTTP task routes = %v, want documented task routes %v", got, want)
+	}
+}
+
+func TestHTTPTransportProfileSurfaceMatchesDocumentedSpecOperations(t *testing.T) {
+	t.Parallel()
+	t.Run("Should match the documented profile surface", func(t *testing.T) {
+		t.Parallel()
+		engine := newTestRouter(t, newTestHandlers(t, &stubSessionManager{}, stubObserver{}, newTestHomePaths(t)))
+		got := apitest.ProfileRoutesFromEngine(engine.Routes())
+		want := apitest.DocumentedProfileRoutesForTransport(apispec.TransportHTTP)
+		if !slices.Equal(got, want) {
+			t.Fatalf("HTTP profile routes = %v, want documented profile routes %v", got, want)
+		}
+	})
+}
+
+func seedTransportWebhookTrigger(
+	t testing.TB,
+	ctx context.Context,
+	harness *e2etest.RuntimeHarness,
+) (compozycontract.TriggerPayload, string) {
+	t.Helper()
+
+	state, err := harness.SeedAutomationFixtures(ctx, e2etest.AutomationFixtureSeed{
+		Triggers: []compozycontract.CreateTriggerRequest{{
+			Scope:              automationpkg.AutomationScopeGlobal,
+			Name:               "deploy-review",
+			AgentName:          transportAutomationAgent,
+			Prompt:             `Review payload {{ index .Data "payload" }} for {{ index .Data "branch" }}`,
+			Event:              "webhook",
+			EndpointSlug:       "deploy-review",
+			WebhookSecretValue: "shared-secret",
+		}},
+	})
+	if err != nil {
+		t.Fatalf("SeedAutomationFixtures() error = %v", err)
+	}
+	if got, want := len(state.Triggers), 1; got != want {
+		t.Fatalf("len(state.Triggers) = %d, want %d", got, want)
+	}
+
+	endpoint, err := automationpkg.FormatWebhookEndpoint(
+		state.Triggers[0].EndpointSlug,
+		state.Triggers[0].WebhookID,
+	)
+	if err != nil {
+		t.Fatalf("FormatWebhookEndpoint() error = %v", err)
+	}
+	return state.Triggers[0], endpoint
+}
+
+func waitForHTTPAutomationRun(
+	t testing.TB,
+	ctx context.Context,
+	harness *e2etest.RuntimeHarness,
+	runID string,
+) compozycontract.RunPayload {
+	t.Helper()
+
+	waitCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
+	ticker := time.NewTicker(25 * time.Millisecond)
+	defer ticker.Stop()
+
+	var (
+		lastErr  error
+		lastSeen string
+	)
+	for {
+		var response compozycontract.RunResponse
+		err := harness.HTTPJSON(waitCtx, http.MethodGet, "/api/automation/runs/"+url.PathEscape(runID), nil, &response)
+		if err == nil && response.Run.ID == runID {
+			return response.Run
+		}
+		lastErr = err
+		lastSeen = response.Run.ID
+		select {
+		case <-waitCtx.Done():
+			t.Fatalf(
+				"waitForHTTPAutomationRun(%q) timed out: %v; last error=%v last run=%q",
+				runID,
+				waitCtx.Err(),
+				lastErr,
+				lastSeen,
+			)
+		case <-ticker.C:
+		}
+	}
+}
+
+func sortExtensionsByName(values []compozycontract.ExtensionPayload) {
+	slices.SortFunc(values, func(left, right compozycontract.ExtensionPayload) int {
+		switch {
+		case left.Name < right.Name:
+			return -1
+		case left.Name > right.Name:
+			return 1
+		default:
+			return 0
+		}
+	})
+}
+
+func extensionsSemanticallyEqual(left, right []compozycontract.ExtensionPayload) bool {
+	return slices.EqualFunc(left, right, extensionSemanticallyEqual)
+}
+
+func extensionSemanticallyEqual(left, right compozycontract.ExtensionPayload) bool {
+	left = normalizeExtensionPayload(left)
+	right = normalizeExtensionPayload(right)
+	return reflect.DeepEqual(left, right)
+}
+
+func normalizeExtensionPayload(value compozycontract.ExtensionPayload) compozycontract.ExtensionPayload {
+	value.Capabilities = normalizeStrings(value.Capabilities)
+	value.Permissions = normalizeStrings(value.Permissions)
+	value.RequiresEnv = normalizeStrings(value.RequiresEnv)
+	value.MissingEnv = normalizeStrings(value.MissingEnv)
+	return value
+}
+
+func normalizeStrings(values []string) []string {
+	if len(values) == 0 {
+		return nil
+	}
+	return append([]string(nil), values...)
+}
+
+func transportMockFixturePath(t testing.TB, name string) string {
+	t.Helper()
+
+	_, file, _, ok := runtime.Caller(0)
+	if !ok {
+		t.Fatal("runtime.Caller(0) failed")
+	}
+	return filepath.Join(filepath.Dir(file), "..", "..", "testutil", "acpmock", "testdata", name)
+}
+
+func writeTransportProviderOverrideConfig(
+	t testing.TB,
+	workspaceRoot string,
+	providerName string,
+	command string,
+	includeProvider bool,
+) {
+	t.Helper()
+
+	configDir := filepath.Join(workspaceRoot, compozyconfig.DirName)
+	if err := os.MkdirAll(configDir, 0o755); err != nil {
+		t.Fatalf("os.MkdirAll(%q) error = %v", configDir, err)
+	}
+
+	configPath := filepath.Join(configDir, compozyconfig.ConfigName)
+	tree, err := loadTransportProviderOverrideTree(configPath)
+	if err != nil {
+		t.Fatalf("load transport override config %q error = %v", configPath, err)
+	}
+
+	providerPath := []string{"providers", strings.TrimSpace(providerName)}
+	if includeProvider {
+		if tree.GetPath(providerPath) != nil {
+			if err := tree.DeletePath(providerPath); err != nil {
+				t.Fatalf("DeletePath(%v) error = %v", providerPath, err)
+			}
+		}
+		tree.SetPath(append(providerPath, "command"), strings.TrimSpace(command))
+		tree.SetPath(append(providerPath, "models", "default"), "transport-override-model")
+		credentialSlot, err := tomltree.TreeFromMap(map[string]any{
+			"name":       "api_key",
+			"target_env": "TRANSPORT_OVERRIDE_API_KEY",
+			"secret_ref": "env:TRANSPORT_OVERRIDE_API_KEY",
+			"kind":       "api_key",
+			"required":   false,
+		})
+		if err != nil {
+			t.Fatalf("TreeFromMap(credential slot) error = %v", err)
+		}
+		tree.SetPath(append(providerPath, "credential_slots"), []*tomltree.Tree{credentialSlot})
+	} else {
+		if tree.GetPath(providerPath) != nil {
+			if err := tree.DeletePath(providerPath); err != nil {
+				t.Fatalf("DeletePath(%v) error = %v", providerPath, err)
+			}
+		}
+		if providers, ok := tree.GetPath([]string{"providers"}).(*tomltree.Tree); ok && len(providers.Keys()) == 0 {
+			if err := tree.Delete("providers"); err != nil {
+				t.Fatalf("Delete(providers) error = %v", err)
+			}
+		}
+	}
+
+	rendered, err := tree.ToTomlString()
+	if err != nil {
+		t.Fatalf("ToTomlString(%q) error = %v", configPath, err)
+	}
+	if err := os.WriteFile(configPath, []byte(rendered), 0o600); err != nil {
+		t.Fatalf("os.WriteFile(%q) error = %v", configPath, err)
+	}
+}
+
+func loadTransportProviderOverrideTree(configPath string) (*tomltree.Tree, error) {
+	contents, err := os.ReadFile(configPath)
+	switch {
+	case err == nil:
+		if strings.TrimSpace(string(contents)) == "" {
+			return tomltree.TreeFromMap(map[string]any{})
+		}
+		return tomltree.LoadBytes(contents)
+	case errors.Is(err, os.ErrNotExist):
+		return tomltree.TreeFromMap(map[string]any{})
+	default:
+		return nil, err
+	}
+}
+
+func httpSSEContainsEvent(records []e2etest.SSEEvent, want string) bool {
+	for _, record := range records {
+		if record.Event == want {
+			return true
+		}
+	}
+	return false
+}
+
+type httpSessionEventContent struct {
+	Type string `json:"type"`
+}
+
+func httpSessionEventsContainType(events []compozycontract.SessionEventPayload, want string) bool {
+	for _, event := range events {
+		var payload httpSessionEventContent
+		if err := json.Unmarshal([]byte(event.Content), &payload); err != nil {
+			continue
+		}
+		if payload.Type == want {
+			return true
+		}
+	}
+	return false
+}
+
+func isDocumentedHTTPTaskRoute(path string) bool {
+	return strings.HasPrefix(path, "/api/tasks") ||
+		strings.HasPrefix(path, "/api/task-runs") ||
+		strings.HasPrefix(path, "/api/observe/tasks")
+}
+
+func normalizeSpecRoutePath(path string) string {
+	parts := strings.Split(path, "/")
+	for i, part := range parts {
+		if strings.HasPrefix(part, "{") && strings.HasSuffix(part, "}") && len(part) > 2 {
+			parts[i] = ":" + part[1:len(part)-1]
+		}
+	}
+	return strings.Join(parts, "/")
+}
+
+func transportTaskListPath(workspaceID string, loopRunID string, includeLoop bool) string {
+	values := url.Values{
+		"scope":     {string(taskpkg.CatalogScopeWorkspace)},
+		"workspace": {workspaceID},
+		"limit":     {"10"},
+	}
+	if includeLoop {
+		values.Set("include_loop", "true")
+	}
+	if strings.TrimSpace(loopRunID) != "" {
+		values.Set("loop_run_id", loopRunID)
+	}
+	return "/api/tasks?" + values.Encode()
+}
+
+func transportTaskListCLIArgs(workspaceID string, filters ...string) []string {
+	args := []string{"task", "list", "--scope", "workspace", "--workspace", workspaceID}
+	args = append(args, filters...)
+	return append(args, "--limit", "10", "-o", "json")
+}
+
+func assertTransportIncludedLoopCatalog(t testing.TB, response compozycontract.TasksResponse) {
+	t.Helper()
+
+	if response.Page.Total != 4 || len(response.Tasks) != 4 {
+		t.Fatalf("included task catalog = %#v, want operator and three Loop records", response)
+	}
+	byID := make(map[string]compozycontract.TaskCatalogItemPayload, len(response.Tasks))
+	for _, item := range response.Tasks {
+		byID[item.ID] = item
+	}
+	apitest.AssertLoopTaskProvenance(
+		t, byID[apitest.TaskLoopParityCoordinatorID], compozycontract.LoopProvenanceRoleCoordinator,
+	)
+	apitest.AssertLoopTaskProvenance(
+		t, byID[apitest.TaskLoopParityCellID], compozycontract.LoopProvenanceRoleCell,
+	)
+	retained := byID["task-loop-transport-retained"].Loop
+	if retained == nil || retained.RunID != "looprun-transport-retained" ||
+		retained.Role != compozycontract.LoopProvenanceRoleCell || retained.LoopName != "" {
+		t.Fatalf("included retained Loop provenance = %#v, want relational degradation", retained)
+	}
+	if len(response.Facets.Statuses) != 1 || response.Facets.Statuses[0].Count != 4 {
+		t.Fatalf("included status facets = %#v, want coherent total 4", response.Facets.Statuses)
+	}
+}
+
+func assertScopedEmptyTaskCatalog(t testing.TB, transport string, payload compozycontract.TasksResponse) {
+	t.Helper()
+	if payload.Page.Total != 0 || payload.Page.HasMore || payload.Page.NextCursor != "" ||
+		len(payload.Tasks) != 0 || len(payload.Facets.Statuses) != 0 || len(payload.Facets.Owners) != 0 {
+		t.Fatalf("%s foreign Loop body = %#v, want scoped empty catalog", transport, payload)
+	}
+}
+
+func seedTransportTaskLoopCatalog(
+	t testing.TB,
+	ctx context.Context,
+	harness *e2etest.RuntimeHarness,
+) {
+	t.Helper()
+
+	database, err := globaldb.OpenGlobalDB(ctx, harness.HomePaths.DatabaseFile)
+	if err != nil {
+		t.Fatalf("OpenGlobalDB(task transport fixture) error = %v", err)
+	}
+	t.Cleanup(func() {
+		closeCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		if err := database.Close(closeCtx); err != nil {
+			t.Errorf("Close(task transport fixture DB) error = %v", err)
+		}
+	})
+
+	now := time.Date(2026, 8, 20, 15, 0, 0, 0, time.UTC)
+	human := taskpkg.ActorIdentity{Kind: taskpkg.ActorKindHuman, Ref: "transport-operator"}
+	loopActor := taskpkg.ActorIdentity{Kind: taskpkg.ActorKindDaemon, Ref: "loop-coordinator"}
+	humanOrigin := taskpkg.Origin{Kind: taskpkg.OriginKindCLI, Ref: "transport-fixture"}
+	loopOrigin := taskpkg.Origin{Kind: taskpkg.OriginKindDaemon, Ref: "loop-coordinator"}
+	completedTask := func(id, title, workspaceID, parentID string, actor taskpkg.ActorIdentity, origin taskpkg.Origin) taskpkg.Task {
+		return taskpkg.Task{
+			ID: id, ProfileID: storepkg.DefaultProfileID, Identifier: id,
+			Scope: taskpkg.ScopeWorkspace, WorkspaceID: workspaceID,
+			ParentTaskID: parentID, Title: title, Priority: taskpkg.DefaultPriority,
+			MaxAttempts: taskpkg.DefaultTaskMaxAttempts, Status: taskpkg.TaskStatusCompleted,
+			ApprovalPolicy: taskpkg.ApprovalPolicyNone, ApprovalState: taskpkg.ApprovalStateNotRequired,
+			CreatedBy: actor, Origin: origin, CreatedAt: now, UpdatedAt: now, ClosedAt: now,
+		}
+	}
+	coordinatorID := apitest.TaskLoopParityCoordinatorID
+	visible := completedTask(
+		"task-transport-visible",
+		"Visible operator task",
+		harness.WorkspaceID,
+		"",
+		human,
+		humanOrigin,
+	)
+	coordinator := completedTask(
+		coordinatorID,
+		"Transport Loop coordinator",
+		harness.WorkspaceID,
+		"",
+		loopActor,
+		loopOrigin,
+	)
+	coordinator.Metadata = json.RawMessage(
+		`{"loop_run_id":"looprun-transport-parity","loop_name":"transport-parity"}`,
+	)
+	cell := completedTask(
+		apitest.TaskLoopParityCellID, "Transport Loop cell", harness.WorkspaceID, coordinatorID, loopActor, loopOrigin,
+	)
+	cell.Metadata = json.RawMessage(
+		`{"loop_run_id":"looprun-transport-parity","loop_name":"transport-parity","generation":2,"node_id":"review","item_index":0}`,
+	)
+	retained := completedTask(
+		"task-loop-transport-retained", "Retained Loop cell", harness.WorkspaceID, coordinatorID, loopActor, loopOrigin,
+	)
+	for _, record := range []taskpkg.Task{visible, coordinator, cell, retained} {
+		if err := database.CreateTask(ctx, record); err != nil {
+			t.Fatalf("CreateTask(%q) error = %v", record.ID, err)
+		}
+	}
+
+	foreignRoot := t.TempDir()
+	if err := database.InsertWorkspace(ctx, workspacepkg.Workspace{
+		RootDir: foreignRoot, Name: "transport-foreign", CreatedAt: now, UpdatedAt: now,
+	}); err != nil {
+		t.Fatalf("InsertWorkspace(foreign) error = %v", err)
+	}
+	foreignWorkspace, err := database.GetWorkspaceByPath(ctx, foreignRoot)
+	if err != nil {
+		t.Fatalf("GetWorkspaceByPath(foreign) error = %v", err)
+	}
+	foreign := completedTask(
+		"task-loop-transport-foreign", "Foreign Loop cell", foreignWorkspace.ID, "", loopActor, loopOrigin,
+	)
+	foreign.Metadata = json.RawMessage(`{"loop_run_id":"looprun-transport-foreign","loop_name":"foreign"}`)
+	if err := database.CreateTask(ctx, foreign); err != nil {
+		t.Fatalf("CreateTask(foreign) error = %v", err)
+	}
+
+	actor, err := taskpkg.DeriveDaemonActorContext("transport-fixture", "transport-fixture")
+	if err != nil {
+		t.Fatalf("DeriveDaemonActorContext() error = %v", err)
+	}
+	importRun := func(run taskpkg.Run) {
+		t.Helper()
+		command, err := taskpkg.NewTerminalRunHistoryImport(run, actor)
+		if err != nil {
+			t.Fatalf("NewTerminalRunHistoryImport(%q) error = %v", run.ID, err)
+		}
+		if err := database.ImportTerminalRunHistory(ctx, &command); err != nil {
+			t.Fatalf("ImportTerminalRunHistory(%q) error = %v", run.ID, err)
+		}
+	}
+	newRun := func(id, taskID, workspaceID, loopRunID string, kind taskpkg.RunKind, attempt int32) taskpkg.Run {
+		queuedAt := now.Add(time.Duration(attempt) * time.Minute)
+		return taskpkg.Run{
+			ID: id, ProfileID: storepkg.DefaultProfileID, TaskID: taskID,
+			WorkspaceID: workspaceID, Attempt: attempt,
+			RunKind: kind, Status: taskpkg.TaskRunStatusCompleted, LoopRunID: loopRunID,
+			Origin: loopOrigin,
+			Metadata: json.RawMessage(fmt.Sprintf(
+				`{"loop_run_id":%q,"loop_name":"transport-parity","generation":2,"node_id":"review","item_index":0}`,
+				loopRunID,
+			)),
+			QueuedAt: queuedAt, EndedAt: queuedAt.Add(time.Second),
+		}
+	}
+	importRun(newRun(
+		"run-loop-transport-coordinator", coordinator.ID, harness.WorkspaceID,
+		apitest.TaskLoopParityRunID, taskpkg.RunKindCoordinator, 1,
+	))
+	previousRunID := ""
+	for attempt := int32(1); attempt <= 3; attempt++ {
+		run := newRun(
+			fmt.Sprintf("run-loop-transport-cell-%d", attempt), cell.ID, harness.WorkspaceID,
+			apitest.TaskLoopParityRunID, taskpkg.RunKindWorker, attempt,
+		)
+		run.PreviousRunID = previousRunID
+		importRun(run)
+		previousRunID = run.ID
+	}
+	retainedRun := newRun(
+		"run-loop-transport-retained", retained.ID, harness.WorkspaceID,
+		"looprun-transport-retained", taskpkg.RunKindWorker, 1,
+	)
+	retainedRun.Metadata = nil
+	importRun(retainedRun)
+	importRun(newRun(
+		"run-loop-transport-foreign", foreign.ID, foreignWorkspace.ID,
+		"looprun-transport-foreign", taskpkg.RunKindWorker, 1,
+	))
+}

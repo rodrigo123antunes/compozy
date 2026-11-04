@@ -1,0 +1,225 @@
+---
+title: CompozyOS documentation
+description: The system around the agent, already built. What comes built in, and where to start for your job.
+icon: BookOpen
+---
+
+Getting real, continuous work out of AI agents is still an engineering project: loops, triggers,
+cron, permissions, approvals, observability, and the glue scripts that hold them together.
+CompozyOS turns that entire agent stack into one product, a complete environment to create,
+automate, and supervise agent work without scripts, plugin chains, or orchestration frameworks.
+
+These docs cover the runtime you install and the surfaces you drive it from. CompozyOS runs the
+agent CLIs you already use (Claude Code, Codex, and Cursor among them) as daemon-owned sessions,
+and the loops, triggers, permissions, automation, and supervision around them come built in.
+
+_Why it holds:_ one runtime, one state model. Loops and approvals are core objects, not
+plugins. In practice, a prompt keeps running after a viewer disconnects, its events stay
+inspectable, workspace policy still applies, and people or agents operate the same state through
+structured surfaces.
+
+## Choose your path
+
+The docs serve three jobs. Start with yours — every path stays inside the same system, so the deeper
+pages are always one link away.
+
+<PathGrid>
+  <PathCard
+    label="People running agent work"
+    title="Start and steer agent work"
+    description="Install the runtime, start your first session, and watch work finish. Sessions stay durable and inspectable — nothing lives in a throwaway terminal tab."
+  >
+    <PathLink href="/docs/getting-started/installation" icon="Rocket" cta>
+      Install the runtime
+    </PathLink>
+    <PathLink href="/docs/getting-started/quick-start" icon="Play">
+      Quick start
+    </PathLink>
+    <PathLink href="/docs/getting-started/first-agent" icon="Bot">
+      Your first agent
+    </PathLink>
+    <PathLink href="/docs/getting-started/web-ui" icon="AppWindow">
+      The web UI
+    </PathLink>
+  </PathCard>
+  <PathCard
+    label="Agent & runtime developers"
+    title="Build on the runtime"
+    description="Extensions, hooks, skills, tools, and SDKs plug into daemon-owned registries and public contracts. Anything the UI can do, an agent can do through CLI, HTTP, or UDS."
+  >
+    <PathLink href="/docs/extensions/develop" icon="Puzzle" cta>
+      Build an extension
+    </PathLink>
+    <PathLink href="/docs/skills/skill-md" icon="FileCode">
+      Author a skill
+    </PathLink>
+    <PathLink href="/docs/tools/toolsets" icon="Plug">
+      Tools and toolsets
+    </PathLink>
+    <PathLink href="/docs/cli" icon="Terminal">
+      CLI reference
+    </PathLink>
+  </PathCard>
+
+  <PathCard
+    label="Evaluators"
+    title="See what ships today"
+    description="Real use cases and runnable examples, each grounded in a shipped mechanism and labeled with honest maturity. No roadmap dressed as product."
+  >
+    <PathLink href="/docs/use-cases" icon="Workflow" cta>
+      Read the use cases
+    </PathLink>
+    <PathLink href="/docs/examples" icon="FlaskConical">
+      Run an example
+    </PathLink>
+    <PathLink href="/marketplace" icon="Store">
+      Browse the marketplace
+    </PathLink>
+  </PathCard>
+</PathGrid>
+
+## What "batteries included" means here
+
+Everything in these docs shares one daemon-owned state: a task can start a session, permissions
+bound it, and another agent can continue the work without rebuilding context by hand.
+
+```bash
+# no Docker, no Postgres — one local binary
+compozy daemon start
+```
+
+## How the docs are organized
+
+One sidebar, ordered by journey: start, do, understand, automate, extend, operate, and look up. Task-oriented content sits above concepts; the generated references collapse to
+two rows until you need them.
+
+<GroupIndex>
+  <GroupRow name="Start here">
+    [Getting started](/docs/getting-started) and [migration](/docs/migration) — install, run the
+    quick start, meet your first agent.
+  </GroupRow>
+  <GroupRow name="Guides & examples">
+    Task-first material: [guides](/docs/guides) for a job to be done, [examples](/docs/examples) you
+    can run as shipped, and [use cases](/docs/use-cases) that show whole journeys.
+  </GroupRow>
+
+  <GroupRow name="Core concepts">
+    [Sessions](/docs/sessions), [agents](/docs/agents), [autonomy](/docs/autonomy),
+    [workspaces](/docs/workspaces), and [profiles](/docs/profiles).
+  </GroupRow>
+  <GroupRow name="Automation">
+    [Automations](/docs/automation) that start on schedules, events, and links, plus goal-seeking
+    [Loops](/docs/loops).
+  </GroupRow>
+  <GroupRow name="Extensibility">
+    How the system grows: the [marketplace](/docs/marketplace), [skills](/docs/skills),
+    [tools](/docs/tools), [resources](/docs/resources), [extensions](/docs/extensions), and
+    [hooks](/docs/hooks).
+  </GroupRow>
+  <GroupRow name="Operations">
+    Running the daemon well: [operations](/docs/operations) and every
+    [configuration](/docs/configuration) surface, from `config.toml` to file locations.
+  </GroupRow>
+  <GroupRow name="Reference">
+    Generated from the runtime, never paraphrased: the [CLI reference](/docs/cli) and the [API
+    reference](/docs/api).
+  </GroupRow>
+</GroupIndex>
+
+## The problem CompozyOS solves
+
+Most agent CLIs are excellent at doing work inside one session, but weak at everything around the
+session:
+
+- the run disappears when the terminal closes
+- there is no clean replay or audit trail
+- each project needs its own context, defaults, and guardrails
+- coordinating multiple specialized agents turns into custom glue code
+- operators end up stitching together scripts, logs, and dashboards that never become a product
+
+CompozyOS ships that missing layer already built. The loops, triggers, permissions,
+approvals, and supervision come built in, and the agent CLIs you already use keep running as they
+are.
+
+## What the CompozyOS runtime adds
+
+### Run real agent CLIs as durable work
+
+CompozyOS does not reimplement agent logic behind API wrappers. It orchestrates real agent CLIs as
+managed sessions, so Claude Code stays Claude Code, Codex stays Codex, and Cursor stays
+Cursor.
+
+That matters because you keep the native tools, context behavior, and interaction style of each
+agent instead of flattening everything into one abstraction layer.
+
+### Keep sessions durable, replayable, and auditable
+
+Each session becomes a durable unit of work. While it is active, another client can acquire an
+attach lease with `compozy session resume`. After it stops, its status, recap, event history, and
+transcript remain available, and a normal prompt can restart the provider against the same history.
+
+Instead of losing the context after a crash, restart, or handoff, CompozyOS keeps the operational record
+around the work itself.
+
+### Standardize behavior per workspace
+
+CompozyOS layers configuration and skills around the workspace, so each project can carry its
+own defaults without forcing one global setup to fit every team and repository.
+
+That gives operators a cleaner way to keep agent behavior consistent without rebuilding prompts and
+context on every run.
+
+### Operate through shared control surfaces
+
+The same daemon-owned state is available through the CLI, HTTP/SSE, UDS, and the web UI. Managed
+agents use policy-filtered native tools, and trusted external MCP clients can receive a
+workspace-bound Host API projection through `compozy mcp serve`. Sessions, tasks, automation,
+and observability stay in one control plane instead of separate stores.
+
+## Why CompozyOS vs. other models
+
+The AI agent ecosystem is crowded. The useful question is not "which project exists," but "which
+operating model are you actually buying into?"
+
+CompozyOS combines local agent execution, durable state, workspace policy, tasks, Loops,
+automation, extensibility, an OS shell, and optional Live coordination. That integrated operating
+model is a different lane from a channel-native assistant, hosted gateway, standalone agent
+framework, or tool protocol.
+
+| Operating model                             | Best fit                                                                                                                | Where CompozyOS differs                                                                                             |
+| ------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------- |
+| Personal assistant or channel-native helper | You want one assistant persona inside chat tools and user-facing channels.                                              | CompozyOS focuses on durable work, shared state, policy, and coordination across agents.                            |
+| Hosted or multi-tenant gateway              | You need a centralized hosted control plane and shared tenancy.                                                         | CompozyOS is local-first and self-managed on the machine doing the work.                                            |
+| Agent framework                             | You want to build custom reasoning graphs or orchestration from application code.                                       | CompozyOS manages existing agent CLIs and also owns deterministic Loops, tasks, and runtime state.                  |
+| Tool protocol only                          | You need an agent to call tools and read resources.                                                                     | MCP integrates into CompozyOS; tool access is one part of a system that also owns execution, state, and governance. |
+| Agent operating system                      | You want loops, triggers, permissions, automation, and supervision built in instead of assembled and maintained by you. | This is CompozyOS's primary lane.                                                                                   |
+
+Most alternatives optimize for one of these lanes: assistant surface, hosted gateway, framework for
+custom orchestration, or protocol for tool access. CompozyOS connects those operational concerns
+around one daemon-owned state model.
+
+### When CompozyOS is the right choice
+
+CompozyOS is a strong fit when you:
+
+- run real agent CLIs and need them to behave like durable work instead of ephemeral chat
+- want replay, auditability, and observability without bolting on external control planes
+- need project-specific policies and behavior without rebuilding prompts every time
+- need people, managed agents, and trusted integrations to operate the same runtime state
+- need specialized agents to hand work through tasks and review gates
+
+### When another lane may fit better
+
+- Choose a channel-native assistant product if the main job is user-facing help inside chat tools.
+- Choose a hosted gateway if the main job is centralized multi-tenant operations.
+- Choose an agent framework if the main job is building custom orchestration logic from the ground up.
+- Choose a protocol-only layer if the problem is tool connectivity, not runtime control or coordination.
+
+CompozyOS exists for the gap between those categories: the whole agent stack delivered as one
+product, with a coordination wire boundary that does not have to stay CompozyOS-only.
+
+## What CompozyOS is not
+
+- **Not an agent framework.** CompozyOS does not ask you to rebuild your agents as chains, graphs, or wrapper abstractions.
+- **Not an API wrapper.** The point is to keep real agent CLIs intact, not to flatten them into thin model calls.
+- **Not a hosted control plane.** CompozyOS is local-first. The runtime lives on your machine and keeps data close to the workspace.

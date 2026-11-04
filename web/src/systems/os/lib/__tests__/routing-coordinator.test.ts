@@ -1,0 +1,1402 @@
+// Suite: routing coordinator
+// Invariant: URL reconciliation mutates only the daemon-facing controller, route intent survives
+// hydration, command fences, and in-flight authority races, and user causes produce exactly one
+// history write.
+// Owning layer: the sole URL ↔ window-manager bridge.
+import { describe, expect, it, vi } from "vitest";
+
+import type { OsHydration, OsOpenTarget, OsWindow, OsWindowRoute } from "../os-types";
+import { RoutingCoordinator, type OsRouterPort } from "../routing-coordinator";
+import type { WindowManagerClientView } from "../window-manager-types";
+
+function route(pathname: string, search: Record<string, unknown> = {}): OsWindowRoute {
+  return { pathname, search };
+}
+
+/** Window IDs are opaque (ADR-010); the store mock keys them deterministically per fixture. */
+function testWindowId(app: OsWindow["app"], instanceKey?: string | null): string {
+  return instanceKey ? `w-${app}-${instanceKey}` : `w-${app}`;
+}
+
+function windowFixture(
+  app: OsWindow["app"],
+  pathname: string,
+  instanceKey: string | null = null,
+  id = testWindowId(app, instanceKey)
+): OsWindow {
+  return {
+    id,
+    app,
+    instanceKey,
+    route: route(pathname),
+    navStack: [],
+    pinned: false,
+    desktopId: "desktop:main",
+    placement: "floating",
+    rect: { x: 40, y: 40, w: 720, h: 480 },
+    layer: 1,
+    minimized: false,
+    zoomed: false,
+    groupId: null,
+    nodeId: null,
+    stackId: null,
+    stackActive: false,
+    parentAxis: null,
+  };
+}
+
+function createStore(initialWindows: readonly OsWindow[] = []) {
+  const windows = Object.fromEntries(initialWindows.map(window => [window.id, window]));
+  let focusedId = initialWindows.at(-1)?.id ?? null;
+  let focusOrder = initialWindows.map(window => window.id).reverse();
+  const focus = (id: string) => {
+    focusedId = id;
+    focusOrder = [id, ...focusOrder.filter(candidate => candidate !== id)];
+  };
+  let client: WindowManagerClientView | null = {
+    workspaceId: "workspace:test",
+    clientId: "client:web",
+    activeDesktopId: "desktop:main",
+    focusedWindowId: focusedId,
+    focusOrder,
+    stackActive: {},
+    connectedAt: "2026-07-22T00:00:00Z",
+    presentationRevision: 1,
+  };
+  let hydration: OsHydration = "live";
+  let lifecycleResult: Promise<boolean> | null = null;
+  let resolveLifecycle: ((accepted: boolean) => void) | null = null;
+
+  const commandOutcome = (apply: () => void) => {
+    const completion = lifecycleResult ?? Promise.resolve(true);
+    if (lifecycleResult === null) apply();
+    else void completion.then(accepted => accepted && apply());
+    return { accepted: true, completion };
+  };
+
+  const openOrFocus = vi.fn((target: OsOpenTarget) => {
+    const instanceKey = target.instanceKey ?? null;
+    const matchesTarget = (window: OsWindow) =>
+      window.app === target.app && (instanceKey === null || window.instanceKey === instanceKey);
+    const existing =
+      focusOrder
+        .map(id => windows[id])
+        .find((window): window is OsWindow => window !== undefined && matchesTarget(window)) ??
+      Object.values(windows)
+        .sort((left, right) => left.id.localeCompare(right.id))
+        .find(matchesTarget);
+    const id = existing?.id ?? testWindowId(target.app, target.instanceKey);
+    return {
+      windowId: id,
+      ...commandOutcome(() => {
+        const current = windows[id];
+        windows[id] =
+          current ??
+          windowFixture(
+            target.app,
+            target.route?.pathname ?? (target.app === "dashboard" ? "/" : `/${target.app}`),
+            target.instanceKey ?? null
+          );
+        if (target.route) windows[id] = { ...windows[id], route: target.route };
+        focus(id);
+      }),
+    };
+  });
+  const focusWindow = vi.fn((id: string) =>
+    commandOutcome(() => {
+      if (windows[id]) focus(id);
+    })
+  );
+  const closeWindow = vi.fn(async (id: string) => {
+    if (lifecycleResult !== null && !(await lifecycleResult)) return false;
+    delete windows[id];
+    focusOrder = focusOrder.filter(candidate => candidate !== id);
+    if (focusedId === id) {
+      const successor = focusOrder[0] ?? null;
+      if (successor === null) focusedId = null;
+      else focus(successor);
+    }
+    return true;
+  });
+  const minimizeWindow = vi.fn(async (id: string) => {
+    if (lifecycleResult !== null && !(await lifecycleResult)) return false;
+    if (!windows[id]) return false;
+    windows[id] = { ...windows[id], minimized: true };
+    if (focusedId === id) {
+      const successor =
+        focusOrder.find(candidate => candidate !== id && !windows[candidate]?.minimized) ?? null;
+      if (successor === null) focusedId = null;
+      else focus(successor);
+    }
+    return true;
+  });
+  const zoomWindow = vi.fn((id: string) =>
+    commandOutcome(() => {
+      if (windows[id]) focus(id);
+    })
+  );
+  const navigateWindow = vi.fn((id: string, nextRoute: OsWindowRoute) =>
+    commandOutcome(() => {
+      if (windows[id]) windows[id] = { ...windows[id], route: nextRoute };
+    })
+  );
+  const popWindowRoute = vi.fn((id: string) =>
+    commandOutcome(() => {
+      const win = windows[id];
+      const parent = win?.navStack.at(-1);
+      if (win && parent) {
+        windows[id] = { ...win, route: parent, navStack: win.navStack.slice(0, -1) };
+      }
+    })
+  );
+  const retargetWindow = vi.fn((id: string, instanceKey: string, nextRoute: OsWindowRoute) =>
+    commandOutcome(() => {
+      if (windows[id]) {
+        windows[id] = { ...windows[id], instanceKey, route: nextRoute, navStack: [] };
+      }
+    })
+  );
+  const restoreWindow = vi.fn((id: string) =>
+    commandOutcome(() => {
+      if (windows[id]) {
+        windows[id] = { ...windows[id], minimized: false };
+        focus(id);
+      }
+    })
+  );
+  const resetWorkspace = () => {
+    for (const id of Object.keys(windows)) delete windows[id];
+    focusedId = null;
+    focusOrder = [];
+  };
+  const setAuthoritativeFocus = (id: string, nextRoute?: OsWindowRoute) => {
+    if (nextRoute && windows[id]) windows[id] = { ...windows[id], route: nextRoute };
+    focus(id);
+  };
+  const setClientConnected = (connected: boolean) => {
+    client = connected
+      ? {
+          workspaceId: "workspace:test",
+          clientId: "client:web",
+          activeDesktopId: "desktop:main",
+          focusedWindowId: focusedId,
+          focusOrder,
+          stackActive: {},
+          connectedAt: "2026-07-22T00:00:00Z",
+          presentationRevision: 2,
+        }
+      : null;
+  };
+  const state = {
+    get windows() {
+      return windows;
+    },
+    get focusedId() {
+      return focusedId;
+    },
+    get client() {
+      return client;
+    },
+    get hydration() {
+      return hydration;
+    },
+    openOrFocus,
+    focusWindow,
+    restoreWindow,
+    closeWindow,
+    minimizeWindow,
+    zoomWindow,
+    navigateWindow,
+    retargetWindow,
+    popWindowRoute,
+  };
+
+  return {
+    getState: () => state,
+    openOrFocus,
+    focusWindow,
+    restoreWindow,
+    closeWindow,
+    minimizeWindow,
+    zoomWindow,
+    navigateWindow,
+    retargetWindow,
+    popWindowRoute,
+    deferLifecycle: () => {
+      lifecycleResult = new Promise<boolean>(resolve => {
+        resolveLifecycle = resolve;
+      });
+    },
+    settleLifecycle: (accepted: boolean) => {
+      resolveLifecycle?.(accepted);
+      resolveLifecycle = null;
+    },
+    resetWorkspace,
+    setAuthoritativeFocus,
+    setClientConnected,
+    setHydration: (next: OsHydration) => {
+      hydration = next;
+    },
+    resumeLifecycle: () => {
+      lifecycleResult = null;
+    },
+    spies: {
+      openOrFocus,
+      focusWindow,
+      restoreWindow,
+      closeWindow,
+      minimizeWindow,
+      zoomWindow,
+      navigateWindow,
+      retargetWindow,
+      popWindowRoute,
+    },
+  };
+}
+
+function createCoordinator(initialWindows: readonly OsWindow[] = []) {
+  const store = createStore(initialWindows);
+  const router: OsRouterPort = {
+    navigate: vi.fn(),
+    replace: vi.fn(),
+  };
+  return {
+    coordinator: new RoutingCoordinator(store, router),
+    router,
+    store,
+  };
+}
+
+describe("RoutingCoordinator", () => {
+  it.each(["/loops", "/loop-runs", "/loops/studio-onboarding-review"])(
+    "Should honor the breadcrumb destination when the history parent is %s",
+    async parent => {
+      const loop = windowFixture("loops", "/loop-runs");
+      loop.navStack = [route(parent)];
+      const { coordinator, router, store } = createCoordinator([loop]);
+      coordinator.reportRouteMatch(loop.route);
+      coordinator.completeHydration();
+
+      coordinator.noteNavigateMode("pop");
+      coordinator.reportRouteMatch(route("/loops"));
+      await Promise.resolve();
+
+      const settled = store.getState().windows[loop.id];
+      expect(settled.route).toEqual(route("/loops"));
+      expect(settled.navStack).toEqual(parent === "/loops" ? [] : [route(parent)]);
+      expect(router.navigate).not.toHaveBeenCalled();
+      expect(router.replace).not.toHaveBeenCalled();
+    }
+  );
+
+  it("Should hold a deep link until hydration then reconcile it without writing history", () => {
+    const { coordinator, router, store } = createCoordinator();
+
+    coordinator.reportRouteMatch(route("/tasks/task-42"));
+    expect(store.spies.openOrFocus).not.toHaveBeenCalled();
+
+    coordinator.completeHydration();
+
+    expect(store.spies.openOrFocus).toHaveBeenCalledWith({
+      app: "tasks",
+      instanceKey: undefined,
+      route: route("/tasks/task-42"),
+    });
+    expect(router.navigate).not.toHaveBeenCalled();
+    expect(router.replace).not.toHaveBeenCalled();
+  });
+
+  it("Should preserve initial route intent through workspace binding and consume it once", () => {
+    const { coordinator, router, store } = createCoordinator();
+    const deepLink = route("/tasks/task-42", { panel: "activity" });
+
+    coordinator.reportRouteMatch(deepLink);
+    coordinator.beginWorkspaceSwitch();
+    coordinator.completeHydration();
+
+    expect(store.spies.openOrFocus).toHaveBeenCalledOnce();
+    expect(store.spies.openOrFocus).toHaveBeenCalledWith({
+      app: "tasks",
+      instanceKey: undefined,
+      route: deepLink,
+    });
+
+    store.resetWorkspace();
+    coordinator.beginWorkspaceSwitch();
+    coordinator.completeHydration();
+
+    expect(store.spies.openOrFocus).toHaveBeenCalledOnce();
+    expect(router.navigate).toHaveBeenCalledOnce();
+    expect(router.navigate).toHaveBeenCalledWith(route("/"));
+  });
+
+  it("Should reconcile an existing route and focus through one semantic transition", () => {
+    const tasks = windowFixture("tasks", "/tasks");
+    const settings = windowFixture("settings", "/settings/general");
+    const { coordinator, router, store } = createCoordinator([tasks, settings]);
+    coordinator.completeHydration();
+    vi.mocked(router.replace).mockClear();
+
+    coordinator.reportRouteMatch(route("/tasks/task-42"));
+
+    expect(store.spies.openOrFocus).toHaveBeenCalledOnce();
+    expect(store.spies.openOrFocus).toHaveBeenCalledWith({
+      app: "tasks",
+      instanceKey: undefined,
+      route: route("/tasks/task-42"),
+    });
+    expect(store.getState().focusedId).toBe(tasks.id);
+    expect(store.getState().windows[tasks.id]?.route).toEqual(route("/tasks/task-42"));
+    expect(store.spies.focusWindow).not.toHaveBeenCalled();
+    expect(store.spies.navigateWindow).not.toHaveBeenCalled();
+    expect(router.navigate).not.toHaveBeenCalled();
+    expect(router.replace).not.toHaveBeenCalled();
+  });
+
+  it("Should carry a same-window link's search into the window location (Automations create link)", () => {
+    // The Automations empty state links to `/automations?create=1&start=schedule`
+    // from inside its own window; the editor seed is read from the WM location.
+    const automations = windowFixture("automations", "/automations");
+    const { coordinator, store } = createCoordinator([automations]);
+    coordinator.completeHydration();
+
+    coordinator.reportRouteMatch(route("/automations", { create: "1", start: "schedule" }));
+
+    expect(store.getState().windows[automations.id]?.route).toEqual(
+      route("/automations", { create: "1", start: "schedule" })
+    );
+  });
+
+  it("[UT-042] Should reconcile a Tasks deep link through the most-recently-focused instance", () => {
+    const older = windowFixture("tasks", "/tasks", null, "w-tasks-older");
+    const mostRecent = windowFixture("tasks", "/tasks", null, "w-tasks-most-recent");
+    const { coordinator, router, store } = createCoordinator([older, mostRecent]);
+    coordinator.completeHydration();
+    vi.mocked(router.replace).mockClear();
+    const deepLink = route("/tasks/task-42", { view: "board" });
+
+    coordinator.reportRouteMatch(deepLink);
+
+    expect(store.spies.openOrFocus).toHaveBeenCalledWith({
+      app: "tasks",
+      instanceKey: undefined,
+      route: deepLink,
+    });
+    expect(store.getState().focusedId).toBe(mostRecent.id);
+    expect(store.getState().windows[mostRecent.id]?.route).toEqual(deepLink);
+    expect(store.getState().windows[older.id]?.route).toEqual(older.route);
+    expect(router.navigate).not.toHaveBeenCalled();
+    expect(router.replace).not.toHaveBeenCalled();
+  });
+
+  it("Should keep an accepted route intent authoritative until reconciliation completes", async () => {
+    const tasks = windowFixture("tasks", "/tasks");
+    const settings = windowFixture("settings", "/settings/general");
+    const { coordinator, router, store } = createCoordinator([tasks, settings]);
+    coordinator.completeHydration();
+    vi.mocked(router.replace).mockClear();
+    store.deferLifecycle();
+
+    coordinator.reportRouteMatch(route("/tasks/task-42"));
+    coordinator.reportAuthoritativeState();
+    coordinator.reportRouteMatch(route("/tasks/task-42"));
+
+    expect(router.replace).not.toHaveBeenCalled();
+    expect(store.spies.openOrFocus).toHaveBeenCalledOnce();
+
+    store.settleLifecycle(true);
+    await vi.waitFor(() => expect(store.getState().focusedId).toBe(tasks.id));
+
+    expect(router.replace).not.toHaveBeenCalled();
+    expect(router.navigate).not.toHaveBeenCalled();
+  });
+
+  it("Should preserve an unavailable route intent for authoritative recovery", () => {
+    const tasks = windowFixture("tasks", "/tasks");
+    const settings = windowFixture("settings", "/settings/general");
+    const { coordinator, router, store } = createCoordinator([tasks, settings]);
+    coordinator.completeHydration();
+    vi.mocked(router.replace).mockClear();
+    store.openOrFocus.mockReturnValueOnce({
+      windowId: tasks.id,
+      accepted: false,
+      completion: Promise.resolve(false),
+    });
+    const deepLink = route("/tasks/task-42");
+
+    coordinator.reportRouteMatch(deepLink);
+
+    expect(router.replace).not.toHaveBeenCalled();
+
+    coordinator.reportAuthoritativeState();
+
+    expect(store.openOrFocus).toHaveBeenCalledTimes(2);
+  });
+
+  it("Should wait for live hydration before opening a session route", () => {
+    const { coordinator, router, store } = createCoordinator();
+    const deepLink = route("/agents/general/sessions/sess-created");
+    coordinator.completeHydration();
+    store.setHydration("pending");
+
+    coordinator.reportRouteMatch(deepLink);
+
+    expect(store.openOrFocus).not.toHaveBeenCalled();
+    expect(router.replace).not.toHaveBeenCalled();
+
+    store.setHydration("live");
+    coordinator.reportAuthoritativeState();
+
+    expect(store.openOrFocus).toHaveBeenCalledOnce();
+    expect(store.openOrFocus).toHaveBeenCalledWith({
+      app: "session",
+      instanceKey: "sess-created",
+      route: deepLink,
+    });
+  });
+
+  it("Should retry a session route after an accepted open finishes unapplied", async () => {
+    const { coordinator, router, store } = createCoordinator();
+    const deepLink = route("/agents/general/sessions/sess-created");
+    coordinator.completeHydration();
+    store.deferLifecycle();
+
+    coordinator.reportRouteMatch(deepLink);
+    store.settleLifecycle(false);
+    await vi.waitFor(() => expect(store.openOrFocus).toHaveBeenCalledOnce());
+
+    expect(router.replace).not.toHaveBeenCalled();
+
+    store.resumeLifecycle();
+    coordinator.reportAuthoritativeState();
+
+    const createdSession = Object.values(store.getState().windows).find(
+      window => window.app === "session" && window.instanceKey === "sess-created"
+    );
+    expect(store.openOrFocus).toHaveBeenCalledTimes(2);
+    expect(createdSession).toBeDefined();
+    expect(store.getState().focusedId).toBe(createdSession?.id);
+  });
+
+  it("Should preserve an explicit route while its semantic focus is pending", async () => {
+    const session = windowFixture(
+      "session",
+      "/agents/general/sessions/sess-route-intent",
+      "sess-route-intent"
+    );
+    const marketplace = windowFixture("marketplace", "/marketplace/skills");
+    const { coordinator, router, store } = createCoordinator([session, marketplace]);
+    coordinator.completeHydration();
+    vi.mocked(router.replace).mockClear();
+    store.deferLifecycle();
+
+    coordinator.reportRouteMatch(session.route);
+    coordinator.reportAuthoritativeState();
+
+    expect(store.spies.openOrFocus).toHaveBeenCalledOnce();
+    expect(router.replace).not.toHaveBeenCalled();
+
+    store.settleLifecycle(true);
+    await vi.waitFor(() => expect(store.getState().focusedId).toBe(session.id));
+    coordinator.reportAuthoritativeState();
+
+    expect(router.replace).not.toHaveBeenCalled();
+  });
+
+  it("Should consume a desktop default-view intent and focus Home after hydration", async () => {
+    const settings = windowFixture("settings", "/settings/general");
+    const { coordinator, router, store } = createCoordinator([settings]);
+    store.setHydration("pending");
+
+    coordinator.reportRouteMatch(route("/", { _compozy_desktop_default: 1 }));
+    coordinator.completeHydration();
+    coordinator.reportRouteMatch(route("/"));
+    coordinator.beginWorkspaceSwitch();
+    coordinator.reportRouteMatch(route("/"));
+    coordinator.completeHydration();
+
+    expect(router.replace).toHaveBeenCalledTimes(2);
+    expect(router.replace).toHaveBeenLastCalledWith(route("/"));
+    expect(store.spies.openOrFocus).not.toHaveBeenCalled();
+
+    store.setHydration("live");
+    coordinator.reportAuthoritativeState();
+
+    expect(store.spies.openOrFocus).toHaveBeenCalledWith({ app: "dashboard", route: route("/") });
+    await vi.waitFor(() => expect(store.getState().focusedId).toBe("w-dashboard"));
+  });
+
+  it("Should leave an empty desktop alone when the desktop URL lands while Home lives on another desktop", () => {
+    const elsewhere = { ...windowFixture("dashboard", "/"), desktopId: "desktop:other" };
+    const focusedHere = windowFixture("tasks", "/tasks");
+    const { coordinator, store } = createCoordinator([elsewhere, focusedHere]);
+    coordinator.completeHydration();
+
+    // Switching to an empty desktop reports `/`: focusing the other desktop's
+    // Home would switch the client straight back.
+    coordinator.reportRouteMatch(route("/"));
+
+    expect(store.spies.openOrFocus).not.toHaveBeenCalled();
+    expect(store.spies.focusWindow).not.toHaveBeenCalled();
+  });
+
+  it("Should still focus Home for the desktop URL when it lives on the active desktop", async () => {
+    const home = windowFixture("dashboard", "/");
+    const tasks = windowFixture("tasks", "/tasks");
+    const { coordinator, store } = createCoordinator([home, tasks]);
+    coordinator.completeHydration();
+
+    coordinator.reportRouteMatch(route("/"));
+
+    expect(store.spies.openOrFocus).toHaveBeenCalledWith({ app: "dashboard", route: route("/") });
+    await vi.waitFor(() => expect(store.getState().focusedId).toBe(home.id));
+  });
+
+  it("Should push exactly once after a user opens an app", async () => {
+    const { coordinator, router } = createCoordinator();
+    coordinator.completeHydration();
+
+    const id = await coordinator.userOpen({ app: "settings", route: route("/settings/layouts") });
+
+    expect(id).toBe("w-settings");
+    expect(router.navigate).toHaveBeenCalledOnce();
+    expect(router.navigate).toHaveBeenCalledWith(route("/settings/layouts"));
+  });
+
+  it("Should hold user route intent until window commands become available", () => {
+    const { coordinator, router, store } = createCoordinator();
+    coordinator.completeHydration();
+    store.setClientConnected(false);
+    const settingsRoute = route("/settings/general");
+
+    coordinator.userNavigate(settingsRoute);
+    coordinator.reportRouteMatch(settingsRoute);
+
+    expect(router.navigate).toHaveBeenCalledOnce();
+    expect(router.navigate).toHaveBeenCalledWith(settingsRoute);
+    expect(store.spies.openOrFocus).not.toHaveBeenCalled();
+
+    store.setClientConnected(true);
+    coordinator.reportAuthoritativeState();
+
+    expect(store.spies.openOrFocus).toHaveBeenCalledOnce();
+    expect(store.spies.openOrFocus).toHaveBeenCalledWith({
+      app: "settings",
+      instanceKey: undefined,
+      route: settingsRoute,
+    });
+  });
+
+  it("Should reconcile a user navigation whose location is already current", () => {
+    const settings = windowFixture("settings", "/settings/general");
+    const { coordinator, router, store } = createCoordinator([settings]);
+    coordinator.completeHydration();
+    vi.mocked(router.replace).mockClear();
+    const profiles = route("/settings/profiles");
+
+    // No route report follows: the router treats a same-location navigation as a no-op.
+    coordinator.userNavigate(profiles);
+
+    expect(router.navigate).toHaveBeenCalledOnce();
+    expect(router.navigate).toHaveBeenCalledWith(profiles);
+    expect(store.spies.openOrFocus).toHaveBeenCalledOnce();
+    expect(store.spies.openOrFocus).toHaveBeenCalledWith({
+      app: "settings",
+      instanceKey: undefined,
+      route: profiles,
+    });
+    expect(store.getState().windows[settings.id]?.route).toEqual(profiles);
+  });
+
+  it("Should preserve a consumed window route when its opening command completes", async () => {
+    // Invariant: an accepted open reflects the current window route, including consumed intents.
+    // Owner: the URL/window-manager bridge; canonical suite: RoutingCoordinator.
+    const settings = windowFixture("settings", "/settings/profiles");
+    const { coordinator, router, store } = createCoordinator([settings]);
+    coordinator.completeHydration();
+    const consumed = route("/settings/profiles");
+
+    const pending = coordinator.userOpen({
+      app: "settings",
+      route: route("/settings/profiles", { flow: "create", name: "dispatch-notes" }),
+    });
+    store.setAuthoritativeFocus(settings.id, consumed);
+    await expect(pending).resolves.toBe(settings.id);
+
+    expect(router.navigate).toHaveBeenCalledOnce();
+    expect(router.navigate).toHaveBeenCalledWith(consumed);
+  });
+
+  it("Should let a newer user navigation supersede a pending open's history write", async () => {
+    const settings = windowFixture("settings", "/settings/profiles");
+    const { coordinator, router, store } = createCoordinator([settings]);
+    coordinator.completeHydration();
+    vi.mocked(router.replace).mockClear();
+    const general = route("/settings/general");
+    const profiles = route("/settings/profiles");
+    store.deferLifecycle();
+
+    const pending = coordinator.userOpen({ app: "settings", route: general });
+    // The runtime projects the navigate before the daemon answers (route intent).
+    store.setAuthoritativeFocus(settings.id, general);
+    expect(router.navigate).not.toHaveBeenCalled();
+
+    // The operator picks Profiles while the daemon still holds the open.
+    coordinator.userNavigate(profiles);
+    expect(router.navigate).toHaveBeenCalledOnce();
+    expect(router.navigate).toHaveBeenCalledWith(profiles);
+
+    store.settleLifecycle(true);
+    await expect(pending).resolves.toBe(settings.id);
+
+    expect(router.navigate).toHaveBeenCalledOnce();
+    expect(store.spies.openOrFocus).toHaveBeenLastCalledWith({
+      app: "settings",
+      instanceKey: undefined,
+      route: profiles,
+    });
+    expect(store.getState().windows[settings.id]?.route).toEqual(profiles);
+  });
+
+  it("Should let a route the coordinator did not write supersede a pending open's history write", async () => {
+    const settings = windowFixture("settings", "/settings/layouts");
+    const { coordinator, router, store } = createCoordinator([settings]);
+    coordinator.completeHydration();
+    vi.mocked(router.replace).mockClear();
+    const general = route("/settings/general");
+    const profiles = route("/settings/profiles");
+    store.deferLifecycle();
+
+    const pending = coordinator.userOpen({ app: "settings", route: general });
+    store.setAuthoritativeFocus(settings.id, general);
+
+    // An in-window link changed the location; its own navigation wrote history.
+    coordinator.reportRouteMatch(profiles);
+
+    store.settleLifecycle(true);
+    await expect(pending).resolves.toBe(settings.id);
+
+    expect(router.navigate).not.toHaveBeenCalled();
+    expect(store.spies.openOrFocus).toHaveBeenLastCalledWith({
+      app: "settings",
+      instanceKey: undefined,
+      route: profiles,
+    });
+    expect(store.getState().windows[settings.id]?.route).toEqual(profiles);
+  });
+
+  it("Should let a link route own the single focus transition and history write", async () => {
+    const tasks = windowFixture("tasks", "/tasks");
+    const settings = windowFixture("settings", "/settings/general");
+    const { coordinator, router, store } = createCoordinator([tasks, settings]);
+    coordinator.completeHydration();
+    vi.mocked(router.replace).mockClear();
+
+    await coordinator.userFocus(tasks.id, { viaLink: true });
+
+    expect(store.spies.focusWindow).not.toHaveBeenCalled();
+    expect(store.getState().focusedId).toBe(settings.id);
+
+    coordinator.reportRouteMatch(route("/tasks/task-42"));
+
+    expect(store.spies.openOrFocus).toHaveBeenCalledOnce();
+    expect(store.getState().focusedId).toBe(tasks.id);
+    expect(store.getState().windows[tasks.id]?.route).toEqual(route("/tasks/task-42"));
+    expect(router.navigate).not.toHaveBeenCalled();
+    expect(router.replace).not.toHaveBeenCalled();
+  });
+
+  it("Should activate a focused window when it is an inactive stack member", async () => {
+    const agents = {
+      ...windowFixture("agents", "/agents"),
+      stackId: "stack:main",
+      stackActive: true,
+    };
+    const tasks = {
+      ...windowFixture("tasks", "/tasks"),
+      stackId: "stack:main",
+      stackActive: false,
+    };
+    const { coordinator, router, store } = createCoordinator([agents, tasks]);
+    coordinator.completeHydration();
+    vi.mocked(router.replace).mockClear();
+
+    await expect(coordinator.userFocus(tasks.id)).resolves.toBe(true);
+
+    expect(store.spies.focusWindow).toHaveBeenCalledOnce();
+    expect(store.spies.focusWindow).toHaveBeenCalledWith(tasks.id);
+    expect(router.navigate).toHaveBeenCalledOnce();
+    expect(router.navigate).toHaveBeenCalledWith(tasks.route);
+  });
+
+  it("Should replace once when authoritative focus moves to a different route", () => {
+    const tasks = windowFixture("tasks", "/tasks");
+    const settings = windowFixture("settings", "/settings/general");
+    const { coordinator, router, store } = createCoordinator([tasks, settings]);
+    coordinator.reportRouteMatch(settings.route);
+    coordinator.completeHydration();
+    const authoritativeRoute = route("/tasks/task-42", {
+      panel: "activity",
+      filters: { owner: "me", state: "open" },
+    });
+
+    store.setAuthoritativeFocus("app:pending");
+    coordinator.reportAuthoritativeState();
+
+    expect(router.replace).not.toHaveBeenCalled();
+
+    store.setAuthoritativeFocus(tasks.id, authoritativeRoute);
+    store.setClientConnected(false);
+    coordinator.reportAuthoritativeState();
+
+    expect(router.replace).not.toHaveBeenCalled();
+
+    store.setClientConnected(true);
+    coordinator.reportAuthoritativeState();
+    coordinator.reportAuthoritativeState();
+
+    expect(router.replace).toHaveBeenCalledOnce();
+    expect(router.replace).toHaveBeenCalledWith(authoritativeRoute);
+    expect(router.navigate).not.toHaveBeenCalled();
+
+    store.setAuthoritativeFocus(
+      tasks.id,
+      route("/tasks/task-42", {
+        filters: { state: "open", owner: "me" },
+        panel: "activity",
+      })
+    );
+    coordinator.reportAuthoritativeState();
+
+    expect(router.replace).toHaveBeenCalledOnce();
+  });
+
+  it("Should keep a held decision route through hydration and authoritative focus", () => {
+    const tasks = windowFixture("tasks", "/tasks");
+    const { coordinator, router, store } = createCoordinator([tasks]);
+    const decision = route("/agents/general/sessions/sess-1", { workspaceSwitch: "confirm" });
+
+    coordinator.holdRoute(decision);
+    coordinator.completeHydration();
+    store.setAuthoritativeFocus(tasks.id, tasks.route);
+    coordinator.reportAuthoritativeState();
+
+    expect(router.replace).not.toHaveBeenCalled();
+    expect(router.navigate).not.toHaveBeenCalled();
+    expect(store.spies.openOrFocus).not.toHaveBeenCalled();
+
+    coordinator.releaseRouteHold();
+    coordinator.reportAuthoritativeState();
+
+    expect(router.replace).toHaveBeenCalledOnce();
+    expect(router.replace).toHaveBeenCalledWith(tasks.route);
+  });
+
+  it("Should zoom an inactive window with one command and one history write", async () => {
+    const tasks = windowFixture("tasks", "/tasks");
+    const settings = windowFixture("settings", "/settings/general");
+    const { coordinator, router, store } = createCoordinator([tasks, settings]);
+    coordinator.completeHydration();
+
+    await coordinator.userZoom(tasks.id);
+
+    expect(store.spies.zoomWindow).toHaveBeenCalledOnce();
+    expect(store.spies.zoomWindow).toHaveBeenCalledWith(tasks.id);
+    expect(store.spies.focusWindow).not.toHaveBeenCalled();
+    expect(router.navigate).toHaveBeenCalledOnce();
+    expect(router.navigate).toHaveBeenCalledWith(tasks.route);
+  });
+
+  it("Should not write duplicate history when zooming the focused window", async () => {
+    const tasks = windowFixture("tasks", "/tasks");
+    const { coordinator, router, store } = createCoordinator([tasks]);
+    coordinator.completeHydration();
+
+    await coordinator.userZoom(tasks.id);
+
+    expect(store.spies.zoomWindow).toHaveBeenCalledOnce();
+    expect(router.navigate).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    {
+      action: "close" as const,
+      invoke: (coordinator: RoutingCoordinator, id: string) => coordinator.userClose(id),
+    },
+    {
+      action: "minimize" as const,
+      invoke: (coordinator: RoutingCoordinator, id: string) => coordinator.userMinimize(id),
+    },
+  ])("Should navigate after the authoritative $action confirmation", async ({ invoke }) => {
+    const tasks = windowFixture("tasks", "/tasks");
+    const settings = windowFixture("settings", "/settings/general");
+    const { coordinator, router, store } = createCoordinator([tasks, settings]);
+    coordinator.completeHydration();
+    store.deferLifecycle();
+
+    const pending = invoke(coordinator, settings.id);
+
+    expect(router.navigate).not.toHaveBeenCalled();
+
+    store.settleLifecycle(true);
+    await pending;
+
+    expect(router.navigate).toHaveBeenCalledOnce();
+    expect(router.navigate).toHaveBeenCalledWith(tasks.route);
+  });
+
+  it("Should keep history unchanged when a close command is rejected", async () => {
+    const settings = windowFixture("settings", "/settings/general");
+    const { coordinator, router, store } = createCoordinator([settings]);
+    coordinator.completeHydration();
+    store.deferLifecycle();
+
+    const pending = coordinator.userClose(settings.id);
+    store.settleLifecycle(false);
+    await pending;
+
+    expect(router.navigate).not.toHaveBeenCalled();
+    expect(store.getState().windows[settings.id]).toBeDefined();
+  });
+
+  it("Should keep history unchanged when an open command is rejected", async () => {
+    const { coordinator, router, store } = createCoordinator();
+    coordinator.completeHydration();
+    store.deferLifecycle();
+
+    const pending = coordinator.userOpen({ app: "settings", route: route("/settings/layouts") });
+
+    expect(router.navigate).not.toHaveBeenCalled();
+    store.settleLifecycle(false);
+    await expect(pending).resolves.toBeNull();
+    expect(router.navigate).not.toHaveBeenCalled();
+  });
+
+  it("Should defer focus history until the semantic command completes", async () => {
+    const tasks = windowFixture("tasks", "/tasks");
+    const settings = windowFixture("settings", "/settings/general");
+    const { coordinator, router, store } = createCoordinator([tasks, settings]);
+    coordinator.completeHydration();
+    vi.mocked(router.replace).mockClear();
+    store.deferLifecycle();
+
+    const pending = coordinator.userFocus(tasks.id);
+
+    expect(router.navigate).not.toHaveBeenCalled();
+    store.settleLifecycle(true);
+    await expect(pending).resolves.toBe(true);
+    expect(router.navigate).toHaveBeenCalledOnce();
+    expect(router.navigate).toHaveBeenCalledWith(tasks.route);
+  });
+
+  it("Should keep history unchanged when a zoom command is rejected", async () => {
+    const tasks = windowFixture("tasks", "/tasks");
+    const settings = windowFixture("settings", "/settings/general");
+    const { coordinator, router, store } = createCoordinator([tasks, settings]);
+    coordinator.completeHydration();
+    vi.mocked(router.replace).mockClear();
+    store.deferLifecycle();
+
+    const pending = coordinator.userZoom(tasks.id);
+
+    expect(router.navigate).not.toHaveBeenCalled();
+    store.settleLifecycle(false);
+    await expect(pending).resolves.toBe(false);
+    expect(router.navigate).not.toHaveBeenCalled();
+  });
+
+  it("Should retarget the current window in place with one history write", async () => {
+    const current = windowFixture("session", "/agents/coder/sessions/sess-a", "sess-a");
+    const { coordinator, router, store } = createCoordinator([current]);
+    coordinator.completeHydration();
+    vi.mocked(router.replace).mockClear();
+
+    const target = route("/agents/coder/sessions/sess-b");
+    await expect(
+      coordinator.userRetarget(current.id, {
+        app: "session",
+        instanceKey: "sess-b",
+        route: target,
+      })
+    ).resolves.toBe(true);
+
+    expect(store.spies.retargetWindow).toHaveBeenCalledWith(current.id, "sess-b", target);
+    expect(store.spies.openOrFocus).not.toHaveBeenCalled();
+    expect(router.navigate).toHaveBeenCalledOnce();
+    expect(router.navigate).toHaveBeenCalledWith(target);
+    expect(store.getState().windows[current.id]?.instanceKey).toBe("sess-b");
+  });
+
+  it("Should let the latest overlapping retarget own browser history", async () => {
+    const current = windowFixture("terminal", "/terminals/term-a", "term-a");
+    const { coordinator, router, store } = createCoordinator([current]);
+    coordinator.completeHydration();
+    vi.mocked(router.replace).mockClear();
+    let settleFirst: ((accepted: boolean) => void) | undefined;
+    let settleSecond: ((accepted: boolean) => void) | undefined;
+    const firstCompletion = new Promise<boolean>(resolve => {
+      settleFirst = resolve;
+    });
+    const secondCompletion = new Promise<boolean>(resolve => {
+      settleSecond = resolve;
+    });
+    store.retargetWindow
+      .mockReturnValueOnce({ accepted: true, completion: firstCompletion })
+      .mockReturnValueOnce({ accepted: true, completion: secondCompletion });
+    const firstRoute = route("/terminals/term-b");
+    const latestRoute = route("/terminals/term-c");
+
+    const first = coordinator.userRetarget(current.id, {
+      app: "terminal",
+      instanceKey: "term-b",
+      route: firstRoute,
+    });
+    const latest = coordinator.userRetarget(current.id, {
+      app: "terminal",
+      instanceKey: "term-c",
+      route: latestRoute,
+    });
+    settleSecond?.(true);
+    await expect(latest).resolves.toBe(true);
+    settleFirst?.(true);
+    await expect(first).resolves.toBe(true);
+
+    expect(router.navigate).toHaveBeenCalledOnce();
+    expect(router.navigate).toHaveBeenCalledWith(latestRoute);
+  });
+
+  it("Should focus the target session's existing window instead of duplicating it", async () => {
+    const current = windowFixture("session", "/agents/coder/sessions/sess-a", "sess-a");
+    const other = windowFixture("session", "/agents/coder/sessions/sess-b", "sess-b");
+    const { coordinator, router, store } = createCoordinator([current, other]);
+    coordinator.completeHydration();
+    vi.mocked(router.replace).mockClear();
+
+    await expect(
+      coordinator.userRetarget(current.id, {
+        app: "session",
+        instanceKey: "sess-b",
+        route: route("/agents/coder/sessions/sess-b"),
+      })
+    ).resolves.toBe(true);
+
+    expect(store.spies.retargetWindow).not.toHaveBeenCalled();
+    expect(store.spies.focusWindow).toHaveBeenCalledWith(other.id);
+    expect(router.navigate).toHaveBeenCalledOnce();
+    expect(router.navigate).toHaveBeenCalledWith(other.route);
+    expect(store.getState().windows[current.id]?.instanceKey).toBe("sess-a");
+  });
+
+  it("Should reconcile an existing target window to the requested route", async () => {
+    const current = windowFixture("session", "/agents/coder/sessions/sess-a", "sess-a");
+    const other = windowFixture("session", "/agents/coder/sessions/sess-b/child", "sess-b");
+    const { coordinator, router, store } = createCoordinator([current, other]);
+    coordinator.completeHydration();
+    vi.mocked(router.replace).mockClear();
+    const target = route("/agents/coder/sessions/sess-b");
+
+    await expect(
+      coordinator.userRetarget(current.id, {
+        app: "session",
+        instanceKey: "sess-b",
+        route: target,
+      })
+    ).resolves.toBe(true);
+
+    expect(store.getState().focusedId).toBe(other.id);
+    expect(store.getState().windows[other.id]?.route).toEqual(target);
+    expect(store.getState().windows[current.id]?.instanceKey).toBe("sess-a");
+    expect(router.navigate).toHaveBeenCalledOnce();
+    expect(router.navigate).toHaveBeenCalledWith(target);
+  });
+
+  it("Should retire a background session without changing the focused route", async () => {
+    const focused = windowFixture("session", "/agents/coder/sessions/kept", "kept");
+    const deleted = windowFixture("session", "/agents/coder/sessions/deleted", "deleted");
+    const { coordinator, router, store } = createCoordinator([deleted, focused]);
+    coordinator.completeHydration();
+    await coordinator.userRetireSession(deleted.id);
+    expect(store.getState().windows[deleted.id]?.instanceKey).toBe("");
+    expect(store.getState().focusedId).toBe(focused.id);
+    expect(router.navigate).not.toHaveBeenCalled();
+  });
+
+  it("Should keep the session a window moved on to when retiring the previous one", async () => {
+    const current = windowFixture("session", "/agents/coder/sessions/next", "next");
+    const { coordinator, store } = createCoordinator([current]);
+    coordinator.completeHydration();
+
+    await expect(coordinator.userRetireSession(current.id, "previous")).resolves.toBe(false);
+
+    expect(store.spies.retargetWindow).not.toHaveBeenCalled();
+    expect(store.getState().windows[current.id]?.instanceKey).toBe("next");
+  });
+
+  it("Should not push the empty route over a retarget that started while retiring", async () => {
+    const current = windowFixture("session", "/agents/coder/sessions/sess-a", "sess-a");
+    const { coordinator, router, store } = createCoordinator([current]);
+    coordinator.completeHydration();
+    let finishRetire = (_done: boolean) => {};
+    const pending = new Promise<boolean>(resolve => (finishRetire = resolve));
+    store.spies.retargetWindow.mockImplementationOnce(() => ({
+      accepted: true,
+      completion: pending,
+    }));
+    const next = route("/agents/coder/sessions/sess-b");
+
+    const retiring = coordinator.userRetireSession(current.id, "sess-a");
+    await coordinator.userRetarget(current.id, {
+      app: "session",
+      instanceKey: "sess-b",
+      route: next,
+    });
+    vi.mocked(router.navigate).mockClear();
+    finishRetire(true);
+
+    await expect(retiring).resolves.toBe(true);
+    expect(router.navigate).not.toHaveBeenCalled();
+  });
+
+  it("Should keep the history entry of a retarget pending while a background window retires", async () => {
+    const focused = windowFixture("session", "/agents/coder/sessions/sess-a", "sess-a");
+    const background = windowFixture("session", "/agents/coder/sessions/gone", "gone");
+    const { coordinator, router, store } = createCoordinator([background, focused]);
+    coordinator.completeHydration();
+    let finishRetarget = (_done: boolean) => {};
+    const pending = new Promise<boolean>(resolve => (finishRetarget = resolve));
+    store.spies.retargetWindow.mockImplementationOnce(() => ({
+      accepted: true,
+      completion: pending,
+    }));
+    const next = route("/agents/coder/sessions/sess-b");
+
+    const retargeting = coordinator.userRetarget(focused.id, {
+      app: "session",
+      instanceKey: "sess-b",
+      route: next,
+    });
+    await coordinator.userRetireSession(background.id, "gone");
+    finishRetarget(true);
+    await retargeting;
+
+    expect(router.navigate).toHaveBeenCalledWith(next);
+  });
+
+  it("Should retire a session tab onto the empty route without closing the window", async () => {
+    const current = windowFixture("session", "/agents/coder/sessions/sess-a", "sess-a");
+    const { coordinator, router, store } = createCoordinator([current]);
+    coordinator.completeHydration();
+    vi.mocked(router.replace).mockClear();
+    const empty = route("/sessions");
+
+    await expect(coordinator.userRetireSession(current.id)).resolves.toBe(true);
+
+    expect(store.spies.retargetWindow).toHaveBeenCalledWith(current.id, "", empty);
+    expect(store.spies.closeWindow).not.toHaveBeenCalled();
+    expect(store.spies.openOrFocus).not.toHaveBeenCalled();
+    expect(router.navigate).toHaveBeenCalledOnce();
+    expect(router.navigate).toHaveBeenCalledWith(empty);
+    expect(store.getState().windows[current.id]?.instanceKey).toBe("");
+  });
+
+  describe("new session landing (#825)", () => {
+    const created = {
+      app: "session" as const,
+      instanceKey: "sess-new",
+      route: route("/agents/coder/sessions/sess-new"),
+    };
+    const sessionWindow = (key: string | null, overrides: Partial<OsWindow> = {}): OsWindow => ({
+      ...windowFixture("session", key ? `/agents/coder/sessions/${key}` : "/sessions", key),
+      stackActive: true,
+      ...overrides,
+    });
+
+    it("Should select the new session in the focused Session window and keep it focused", async () => {
+      const tasks = windowFixture("tasks", "/tasks");
+      const focused = sessionWindow("sess-a");
+      const { coordinator, router, store } = createCoordinator([tasks, focused]);
+      coordinator.completeHydration();
+      vi.mocked(router.replace).mockClear();
+
+      await expect(coordinator.userOpenCreatedSession(created)).resolves.toBe(focused.id);
+
+      expect(store.spies.retargetWindow).toHaveBeenCalledWith(
+        focused.id,
+        created.instanceKey,
+        created.route
+      );
+      expect(store.spies.openOrFocus).not.toHaveBeenCalled();
+      expect(store.spies.focusWindow).not.toHaveBeenCalled();
+      expect(store.getState().focusedId).toBe(focused.id);
+      expect(router.navigate).toHaveBeenCalledOnce();
+      expect(router.navigate).toHaveBeenCalledWith(created.route);
+    });
+
+    it.each([
+      ["visible", false, "focusWindow"],
+      ["minimized", true, "restoreWindow"],
+    ] as const)(
+      "Should bring a %s unfocused Session window forward with the new session",
+      async (_label, minimized, activation) => {
+        const session = sessionWindow("sess-a", { minimized });
+        const tasks = windowFixture("tasks", "/tasks");
+        const { coordinator, router, store } = createCoordinator([session, tasks]);
+        coordinator.completeHydration();
+        vi.mocked(router.replace).mockClear();
+
+        await expect(coordinator.userOpenCreatedSession(created)).resolves.toBe(session.id);
+
+        expect(store.spies[activation]).toHaveBeenCalledWith(session.id);
+        expect(store.spies.openOrFocus).not.toHaveBeenCalled();
+        const landed = store.getState().windows[session.id];
+        expect(landed?.instanceKey).toBe(created.instanceKey);
+        expect(landed?.minimized).toBe(false);
+        expect(store.getState().focusedId).toBe(session.id);
+        expect(router.navigate).toHaveBeenCalledOnce();
+        expect(router.navigate).toHaveBeenCalledWith(created.route);
+      }
+    );
+
+    it("Should prefer an empty Session window, then the most recently focused one", async () => {
+      const older = sessionWindow("sess-a", { id: "w-session-older" });
+      const empty = sessionWindow(null, { id: "w-session-empty" });
+      const recent = sessionWindow("sess-b", { id: "w-session-recent" });
+      const tasks = windowFixture("tasks", "/tasks");
+      const withEmpty = createCoordinator([empty, older, recent, tasks]);
+      withEmpty.coordinator.completeHydration();
+
+      await expect(withEmpty.coordinator.userOpenCreatedSession(created)).resolves.toBe(empty.id);
+
+      const withoutEmpty = createCoordinator([recent, older, tasks]);
+      withoutEmpty.coordinator.completeHydration();
+
+      await expect(withoutEmpty.coordinator.userOpenCreatedSession(created)).resolves.toBe(
+        older.id
+      );
+      expect(withoutEmpty.store.getState().windows[recent.id]?.instanceKey).toBe("sess-b");
+    });
+
+    it.each([
+      ["no Session window exists", [windowFixture("tasks", "/tasks")], {}],
+      [
+        "the only Session window is on another desktop",
+        [sessionWindow("sess-a", { desktopId: "desktop:other" }), windowFixture("tasks", "/tasks")],
+        {},
+      ],
+      ["the only Session window is pinned", [sessionWindow("sess-a", { pinned: true })], {}],
+      [
+        "the launcher asked for a split",
+        [sessionWindow("sess-a")],
+        { placement: "split" as const },
+      ],
+      [
+        "the launcher asked for a new instance",
+        [sessionWindow("sess-a")],
+        { forceNewInstance: true },
+      ],
+    ])("Should open a new Session window when %s", async (_label, windows, options) => {
+      const { coordinator, router, store } = createCoordinator(windows);
+      coordinator.completeHydration();
+      vi.mocked(router.replace).mockClear();
+      const target = { ...created, ...options };
+
+      await coordinator.userOpenCreatedSession(target);
+
+      expect(store.spies.retargetWindow).not.toHaveBeenCalled();
+      expect(store.spies.openOrFocus).toHaveBeenCalledWith(target);
+      expect(router.navigate).toHaveBeenCalledOnce();
+    });
+
+    type Gesture =
+      | "activate another window"
+      | "focus the active window"
+      | "close the focused window";
+    const gestures: Record<
+      Gesture,
+      { run: (coordinator: RoutingCoordinator) => Promise<boolean>; focused: string }
+    > = {
+      "activate another window": {
+        run: coordinator => coordinator.userActivateWindow("w-settings"),
+        focused: "w-settings",
+      },
+      "focus the active window": {
+        run: coordinator => coordinator.userFocus("w-tasks"),
+        focused: "w-tasks",
+      },
+      "close the focused window": {
+        run: coordinator => coordinator.userClose("w-tasks"),
+        focused: "w-settings",
+      },
+    };
+
+    it.each(
+      (["direct", "route"] as const).flatMap(path =>
+        (Object.keys(gestures) as Gesture[]).map(gesture => [path, gesture] as const)
+      )
+    )(
+      "Should not pull focus back when a %s landing is pending and the operator chooses to %s",
+      async (path, gesture) => {
+        const session = sessionWindow("sess-a");
+        const settings = windowFixture("settings", "/settings/general");
+        const tasks = { ...windowFixture("tasks", "/tasks"), stackActive: true };
+        const { coordinator, router, store } = createCoordinator([session, settings, tasks]);
+        coordinator.completeHydration();
+        let settleRetarget: ((applied: boolean) => void) | undefined;
+        store.retargetWindow.mockReturnValueOnce({
+          accepted: true,
+          completion: new Promise<boolean>(resolve => {
+            settleRetarget = resolve;
+          }),
+        });
+
+        let landing: Promise<string | null> | undefined;
+        if (path === "direct") {
+          landing = coordinator.userOpenCreatedSession(created);
+        } else {
+          coordinator.noteCreatedSession(created.instanceKey);
+          coordinator.reportRouteMatch(created.route);
+        }
+        expect(store.spies.retargetWindow).toHaveBeenCalledWith(
+          session.id,
+          created.instanceKey,
+          created.route
+        );
+        // The operator makes a newer choice while the retarget waits on the daemon.
+        await gestures[gesture].run(coordinator);
+        vi.mocked(router.navigate).mockClear();
+        settleRetarget?.(true);
+        await landing;
+        await Promise.resolve();
+
+        expect(store.spies.focusWindow).not.toHaveBeenCalledWith(session.id);
+        expect(store.spies.restoreWindow).not.toHaveBeenCalled();
+        expect(store.getState().focusedId).toBe(gestures[gesture].focused);
+        expect(router.navigate).not.toHaveBeenCalled();
+      }
+    );
+
+    it("Should choose again when another client closes the host before the landing", async () => {
+      const session = sessionWindow("sess-a");
+      const tasks = windowFixture("tasks", "/tasks");
+      const { coordinator, router, store } = createCoordinator([session, tasks]);
+      coordinator.completeHydration();
+      vi.mocked(router.replace).mockClear();
+      store.retargetWindow.mockImplementationOnce(() => ({
+        accepted: true,
+        // The daemon rejects the retarget: a peer closed the window first.
+        completion: store.closeWindow(session.id).then(() => false),
+      }));
+
+      const landed = await coordinator.userOpenCreatedSession(created);
+
+      expect(store.spies.openOrFocus).toHaveBeenCalledExactlyOnceWith(created);
+      expect(landed).toBe(testWindowId("session", created.instanceKey));
+      expect(store.getState().windows[landed ?? ""]?.instanceKey).toBe(created.instanceKey);
+      expect(router.navigate).toHaveBeenCalledExactlyOnceWith(created.route);
+    });
+
+    it("Should open the session the ordinary way when a surviving host refuses the landing", async () => {
+      const session = sessionWindow("sess-a");
+      const tasks = windowFixture("tasks", "/tasks");
+      const { coordinator, router, store } = createCoordinator([session, tasks]);
+      coordinator.completeHydration();
+      vi.mocked(router.replace).mockClear();
+      store.retargetWindow.mockImplementationOnce(() => ({
+        accepted: true,
+        completion: Promise.resolve(false),
+      }));
+
+      const landed = await coordinator.userOpenCreatedSession(created);
+
+      expect(store.getState().windows[session.id]).toBeDefined();
+      expect(store.spies.openOrFocus).toHaveBeenCalledExactlyOnceWith(created);
+      expect(landed).toBe(testWindowId("session", created.instanceKey));
+      expect(router.navigate).toHaveBeenCalledExactlyOnceWith(created.route);
+    });
+
+    it("Should focus the window that already owns the new session", async () => {
+      const owner = sessionWindow("sess-new");
+      const focused = sessionWindow("sess-a");
+      const { coordinator, store } = createCoordinator([owner, focused]);
+      coordinator.completeHydration();
+
+      await expect(coordinator.userOpenCreatedSession(created)).resolves.toBe(owner.id);
+
+      expect(store.spies.retargetWindow).not.toHaveBeenCalled();
+      expect(store.getState().windows[focused.id]?.instanceKey).toBe("sess-a");
+      expect(store.getState().focusedId).toBe(owner.id);
+    });
+
+    it("Should land a dialog-created session's route in the Session window without writing history", async () => {
+      const session = sessionWindow("sess-a");
+      const tasks = windowFixture("tasks", "/tasks");
+      const { coordinator, router, store } = createCoordinator([session, tasks]);
+      coordinator.completeHydration();
+      vi.mocked(router.replace).mockClear();
+
+      coordinator.noteCreatedSession(created.instanceKey);
+      coordinator.reportRouteMatch(created.route);
+      await vi.waitFor(() => expect(store.getState().focusedId).toBe(session.id));
+
+      expect(store.spies.retargetWindow).toHaveBeenCalledWith(
+        session.id,
+        created.instanceKey,
+        created.route
+      );
+      expect(store.spies.openOrFocus).not.toHaveBeenCalled();
+      expect(router.navigate).not.toHaveBeenCalled();
+    });
+
+    it("Should keep the created-session intent through a workspace switch", async () => {
+      const { coordinator, store } = createCoordinator([windowFixture("tasks", "/tasks")]);
+      coordinator.completeHydration();
+
+      coordinator.noteCreatedSession(created.instanceKey);
+      coordinator.beginWorkspaceSwitch();
+      coordinator.reportRouteMatch(created.route);
+      store.resetWorkspace();
+      const target = sessionWindow(null, { id: "w-session-target" });
+      store.getState().windows[target.id] = target;
+      coordinator.completeHydration();
+      await vi.waitFor(() => expect(store.getState().focusedId).toBe(target.id));
+
+      expect(store.getState().windows[target.id]?.instanceKey).toBe(created.instanceKey);
+      expect(store.spies.openOrFocus).not.toHaveBeenCalled();
+    });
+
+    it("Should keep the created-session intent from an older pending reconciliation", async () => {
+      const session = sessionWindow("sess-a");
+      const { coordinator, store } = createCoordinator([session]);
+      coordinator.completeHydration();
+      store.setHydration("pending");
+      coordinator.reportRouteMatch(route("/tasks"));
+
+      coordinator.noteCreatedSession(created.instanceKey);
+      // The older route reconciles first, once commands become available.
+      store.setHydration("live");
+      coordinator.reportAuthoritativeState();
+      await vi.waitFor(() => expect(store.getState().focusedId).toBe("w-tasks"));
+      coordinator.reportRouteMatch(created.route);
+      await vi.waitFor(() => expect(store.getState().focusedId).toBe(session.id));
+
+      expect(store.getState().windows[session.id]?.instanceKey).toBe(created.instanceKey);
+      expect(store.spies.openOrFocus).not.toHaveBeenCalledWith(
+        expect.objectContaining({ instanceKey: created.instanceKey })
+      );
+    });
+
+    it("Should keep opening a deep link to an unopened session in its own window", () => {
+      const session = sessionWindow("sess-a");
+      const { coordinator, store } = createCoordinator([session]);
+      coordinator.completeHydration();
+
+      coordinator.noteCreatedSession("sess-other");
+      coordinator.reportRouteMatch(created.route);
+      coordinator.reportRouteMatch(route("/agents/coder/sessions/sess-other"));
+
+      expect(store.spies.retargetWindow).not.toHaveBeenCalled();
+      expect(store.spies.openOrFocus).toHaveBeenCalledTimes(2);
+      expect(store.getState().windows[session.id]?.instanceKey).toBe("sess-a");
+    });
+  });
+});

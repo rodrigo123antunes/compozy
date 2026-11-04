@@ -1,0 +1,197 @@
+package store
+
+import (
+	"encoding/json"
+	"strings"
+	"testing"
+
+	"github.com/compozy/compozy/internal/workspaceaccess"
+
+	speedpkg "github.com/compozy/compozy/internal/speed"
+)
+
+func TestSessionCreationProfileShouldBindRuntimePolicyToVersionedIdentity(t *testing.T) {
+	t.Parallel()
+
+	t.Run("Should bind User ownership to its immutable profile", func(t *testing.T) {
+		t.Parallel()
+		profile := validSessionCreationProfile(t)
+		profile.Version = UserSessionCreationProfileVersion
+		profile.WorkspaceID = workspaceaccess.UserSelector
+		ref, err := profile.Ref()
+		if err != nil {
+			t.Fatal(err)
+		}
+		profile.ProfileID = "another-profile"
+		other, err := profile.Ref()
+		if err != nil {
+			t.Fatal(err)
+		}
+		if ref == other {
+			t.Fatal("User profile does not bind its owner")
+		}
+		profile.WorktreeRef = "worktree"
+		if err := profile.Validate(); err == nil {
+			t.Fatal("User accepted a worktree")
+		}
+	})
+
+	t.Run("Should preserve the current canonical profile and its identity", func(t *testing.T) {
+		t.Parallel()
+		const payload = `{"version":6,"agent_name":"worker","provider":"codex","speed":"normal","profile_id":"00000000000000000000000000","workspace_id":"workspace:test","cwd":"/workspace","permissions":"approve-all"}`
+		var profile SessionCreationProfile
+		if err := json.Unmarshal([]byte(payload), &profile); err != nil {
+			t.Fatal(err)
+		}
+		canonical, err := profile.CanonicalJSON()
+		if err != nil {
+			t.Fatal(err)
+		}
+		if string(canonical) != payload {
+			t.Fatalf("canonical profile = %s, want unchanged canonical payload", canonical)
+		}
+		ref, err := profile.Ref()
+		if err != nil {
+			t.Fatal(err)
+		}
+		if ref != "profile:sha256:"+sha256Hex([]byte(payload)) {
+			t.Fatalf("reference = %s, want original content address", ref)
+		}
+	})
+
+	t.Run("Should persist typed runtime defaults in the canonical version six profile", func(t *testing.T) {
+		t.Parallel()
+
+		profile := validSessionCreationProfile(t)
+		profile.ACPOptions = []SessionACPOptionSelection{{ID: "thinking", BoolValue: new(true)}}
+		payload, err := profile.CanonicalJSON()
+		if err != nil {
+			t.Fatalf("CanonicalJSON() error = %v", err)
+		}
+		encoded := string(payload)
+		if !strings.Contains(encoded, `"version":6`) ||
+			!strings.Contains(encoded, `"speed":"normal"`) ||
+			!strings.Contains(encoded, `"acp_options":[{"id":"thinking","bool_value":true}]`) ||
+			!strings.Contains(encoded, `"profile_id":"00000000000000000000000000"`) {
+			t.Fatalf("CanonicalJSON() = %s, want version 6 with typed runtime defaults", encoded)
+		}
+		var decoded SessionCreationProfile
+		if err := json.Unmarshal(payload, &decoded); err != nil {
+			t.Fatalf("json.Unmarshal(CanonicalJSON()) error = %v", err)
+		}
+		if decoded.Version != SessionCreationProfileVersion || decoded.Speed != speedpkg.SpeedNormal ||
+			len(decoded.ACPOptions) != 1 || decoded.ACPOptions[0].ID != "thinking" ||
+			decoded.ACPOptions[0].BoolValue == nil || !*decoded.ACPOptions[0].BoolValue {
+			t.Fatalf("decoded creation profile = %#v, want structural typed runtime fields", decoded)
+		}
+	})
+
+	t.Run("Should change the immutable profile reference when speed changes", func(t *testing.T) {
+		t.Parallel()
+
+		normal := validSessionCreationProfile(t)
+		fast := normal
+		fast.Speed = speedpkg.SpeedFast
+		normalRef, err := normal.Ref()
+		if err != nil {
+			t.Fatalf("normal Ref() error = %v", err)
+		}
+		fastRef, err := fast.Ref()
+		if err != nil {
+			t.Fatalf("fast Ref() error = %v", err)
+		}
+		if normalRef == fastRef {
+			t.Fatalf("profile refs = %q, want speed-specific identities", normalRef)
+		}
+	})
+
+	t.Run("Should change the immutable profile reference when an ACP option changes", func(t *testing.T) {
+		t.Parallel()
+
+		withoutOption := validSessionCreationProfile(t)
+		withOption := withoutOption
+		withOption.ACPOptions = []SessionACPOptionSelection{{ID: "thinking", BoolValue: new(true)}}
+		withoutRef, err := withoutOption.Ref()
+		if err != nil {
+			t.Fatalf("without option Ref() error = %v", err)
+		}
+		withRef, err := withOption.Ref()
+		if err != nil {
+			t.Fatalf("with option Ref() error = %v", err)
+		}
+		if withoutRef == withRef {
+			t.Fatalf("profile refs = %q, want ACP-option-specific identities", withoutRef)
+		}
+	})
+
+	t.Run("Should change every derived identity when profile identity changes", func(t *testing.T) {
+		t.Parallel()
+
+		defaultProfile := validSessionCreationProfile(t)
+		otherProfile := defaultProfile
+		otherProfile.ProfileID = "01K3PROFILEIDENTITY00000001"
+		options := SessionCreationOptions{
+			SessionID:   "sess-profile-witness",
+			SessionType: "user",
+		}
+
+		defaultRef, err := defaultProfile.Ref()
+		if err != nil {
+			t.Fatalf("default Ref() error = %v", err)
+		}
+		otherRef, err := otherProfile.Ref()
+		if err != nil {
+			t.Fatalf("other Ref() error = %v", err)
+		}
+		defaultPolicy, err := defaultProfile.PolicySpecDigest()
+		if err != nil {
+			t.Fatalf("default PolicySpecDigest() error = %v", err)
+		}
+		otherPolicy, err := otherProfile.PolicySpecDigest()
+		if err != nil {
+			t.Fatalf("other PolicySpecDigest() error = %v", err)
+		}
+		defaultCreation, err := defaultProfile.CreationDigest(options)
+		if err != nil {
+			t.Fatalf("default CreationDigest() error = %v", err)
+		}
+		otherCreation, err := otherProfile.CreationDigest(options)
+		if err != nil {
+			t.Fatalf("other CreationDigest() error = %v", err)
+		}
+		if defaultRef == otherRef || defaultPolicy == otherPolicy || defaultCreation == otherCreation {
+			t.Fatalf("profile identity did not bind every digest: refs=%t policies=%t creations=%t",
+				defaultRef == otherRef, defaultPolicy == otherPolicy, defaultCreation == otherCreation)
+		}
+	})
+
+	t.Run("Should reject version two and unsupported speeds", func(t *testing.T) {
+		t.Parallel()
+
+		versionTwo := validSessionCreationProfile(t)
+		versionTwo.Version = 2
+		if err := versionTwo.Validate(); err == nil ||
+			!strings.Contains(err.Error(), "unsupported session creation profile version 2") {
+			t.Fatalf("Validate(version 2) error = %v, want hard-cut version rejection", err)
+		}
+
+		invalidSpeed := validSessionCreationProfile(t)
+		invalidSpeed.Speed = speedpkg.Speed("turbo")
+		if err := invalidSpeed.Validate(); err == nil || !strings.Contains(err.Error(), "expected normal or fast") {
+			t.Fatalf("Validate(turbo) error = %v, want closed speed rejection", err)
+		}
+	})
+}
+
+func validSessionCreationProfile(t *testing.T) SessionCreationProfile {
+	t.Helper()
+	return SessionCreationProfile{
+		Version:     SessionCreationProfileVersion,
+		AgentName:   "worker",
+		Provider:    "codex",
+		ProfileID:   DefaultProfileID,
+		WorkspaceID: "workspace:test",
+		CWD:         "/workspace",
+		Permissions: "approve-all",
+	}
+}

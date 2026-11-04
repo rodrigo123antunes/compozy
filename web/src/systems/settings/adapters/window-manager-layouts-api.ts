@@ -1,0 +1,354 @@
+import {
+  parseWindowManagerSettingsApply,
+  parseSettingsWindowManagerSection,
+  fetchWindowManagerSnapshot,
+  type WindowManagerConfig,
+  windowManagerApplyFailed,
+  windowManagerApplyMessage,
+  type WindowManagerSettingsApply,
+} from "@/systems/os";
+
+import { apiBaseUrl, runtimeFetch } from "@/lib/api-client";
+
+import {
+  parseWindowManagerLayoutApply,
+  parseWindowManagerLayoutDocument,
+  parseWindowManagerLayoutPreview,
+  parseWindowManagerLayoutResource,
+  parseWindowManagerLayoutResources,
+  parseWindowManagerLayoutValidation,
+  windowManagerLayoutDocumentToWire,
+  windowManagerProfileToWire,
+  windowManagerSettingsConfigToWire,
+} from "../lib/window-manager-layout-schema";
+import type {
+  WindowManagerLayoutApplyResult,
+  WindowManagerLayoutDocument,
+  WindowManagerLayoutPreview,
+  WindowManagerLayoutProfile,
+  WindowManagerLayoutResourceRecord,
+  WindowManagerLayoutScopeKind,
+  WindowManagerLayoutState,
+  WindowManagerLayoutValidation,
+} from "../lib/window-manager-layout-types";
+import { windowManagerSnapshotToLayoutState } from "../lib/window-manager-layout-projection";
+
+export class WindowManagerLayoutsApiError extends Error {
+  constructor(
+    message: string,
+    public readonly status: number
+  ) {
+    super(message);
+    this.name = "WindowManagerLayoutsApiError";
+  }
+}
+
+function workspacePath(workspaceId: string): string {
+  const normalized = workspaceId.trim();
+  if (normalized === "") {
+    throw new WindowManagerLayoutsApiError("Workspace ID is required.", 400);
+  }
+  return `/api/workspaces/${encodeURIComponent(normalized)}/window-manager`;
+}
+
+/**
+ * Layouts are read and applied against one profile's desks, so the profile is
+ * named on every call rather than left to the daemon's `default` fallback.
+ */
+function layoutUrl(workspaceId: string, profile: string, suffix: string): string {
+  const normalizedProfile = profile.trim();
+  if (normalizedProfile === "") {
+    throw new WindowManagerLayoutsApiError("Profile is required.", 400);
+  }
+  const query = new URLSearchParams({ profile: normalizedProfile });
+  return `${workspacePath(workspaceId)}${suffix}?${query.toString()}`;
+}
+
+async function responseJson(response: Response): Promise<unknown> {
+  try {
+    return await response.json();
+  } catch {
+    throw new WindowManagerLayoutsApiError("CompozyOS returned invalid JSON.", response.status);
+  }
+}
+
+function errorMessage(value: unknown, fallback: string): string {
+  if (value !== null && typeof value === "object") {
+    const candidate = Reflect.get(value, "error");
+    if (typeof candidate === "string" && candidate.trim() !== "") return candidate;
+  }
+  return fallback;
+}
+
+async function requireJson(response: Response, fallback: string): Promise<unknown> {
+  const body = await responseJson(response);
+  if (response.ok) return body;
+  throw new WindowManagerLayoutsApiError(
+    errorMessage(body, `${fallback} (${response.status})`),
+    response.status
+  );
+}
+
+/** Encode a settings mutation as JSON while preserving cancellation at the transport boundary. */
+function jsonRequest(body: unknown, signal?: AbortSignal): RequestInit {
+  return {
+    body: JSON.stringify(body),
+    headers: { "content-type": "application/json" },
+    signal,
+  };
+}
+
+export interface WindowManagerSettingsSaveResult {
+  config: WindowManagerConfig;
+  apply: WindowManagerSettingsApply;
+}
+
+/** Keeps the canonical saved config available when only runtime application failed. */
+export class WindowManagerSettingsApplyError extends Error {
+  constructor(public readonly result: WindowManagerSettingsSaveResult) {
+    super(windowManagerApplyMessage(result.apply));
+    this.name = "WindowManagerSettingsApplyError";
+  }
+}
+
+/** Persist behavior without replacing live-edited shortcuts and preserve the daemon apply receipt. */
+export async function updateWindowManagerSettings(
+  config: WindowManagerConfig,
+  signal?: AbortSignal
+): Promise<WindowManagerSettingsSaveResult> {
+  let response: Response;
+  try {
+    response = await runtimeFetch(`${apiBaseUrl}/api/settings/window-manager`, {
+      ...jsonRequest(
+        { config: windowManagerSettingsConfigToWire(config), preserve_shortcuts: true },
+        signal
+      ),
+      method: "PATCH",
+    });
+  } catch (cause) {
+    if (signal?.aborted) throw cause;
+    throw new WindowManagerLayoutsApiError(
+      "Unable to reach CompozyOS. Check the connection and retry; your changes are kept.",
+      0
+    );
+  }
+  const body = await responseJson(response);
+  if (!response.ok) {
+    throw new WindowManagerLayoutsApiError(
+      `${errorMessage(body, `Unable to save settings (${response.status})`)}. Your changes are kept. Retry when the problem is resolved, or discard your changes.`,
+      response.status
+    );
+  }
+  if (body === null || typeof body !== "object") {
+    throw new WindowManagerLayoutsApiError(
+      "CompozyOS returned an invalid settings result.",
+      response.status
+    );
+  }
+  const { apply, ...section } = body as Record<string, unknown>;
+  let result: WindowManagerSettingsSaveResult;
+  try {
+    result = {
+      config: parseSettingsWindowManagerSection(section).config,
+      apply: parseWindowManagerSettingsApply(apply),
+    };
+  } catch {
+    throw new WindowManagerLayoutsApiError(
+      "The save result could not be verified. Reload settings before retrying; your changes are kept.",
+      response.status
+    );
+  }
+  if (windowManagerApplyFailed(result.apply)) throw new WindowManagerSettingsApplyError(result);
+  return result;
+}
+
+export async function exportWindowManagerLayout(
+  workspaceId: string,
+  profile: string,
+  signal?: AbortSignal
+): Promise<WindowManagerLayoutDocument> {
+  const response = await runtimeFetch(
+    `${apiBaseUrl}${layoutUrl(workspaceId, profile, "/layout")}`,
+    {
+      signal,
+    }
+  );
+  return parseWindowManagerLayoutDocument(
+    await requireJson(response, "Unable to export the current layout")
+  );
+}
+
+export async function getWindowManagerLayoutState(
+  workspaceId: string,
+  profile: string,
+  signal?: AbortSignal
+): Promise<WindowManagerLayoutState> {
+  return windowManagerSnapshotToLayoutState(
+    await fetchWindowManagerSnapshot(workspaceId, profile, signal)
+  );
+}
+
+export async function validateWindowManagerLayout(
+  workspaceId: string,
+  profile: string,
+  document: WindowManagerLayoutDocument,
+  signal?: AbortSignal
+): Promise<WindowManagerLayoutValidation> {
+  const response = await runtimeFetch(
+    `${apiBaseUrl}${layoutUrl(workspaceId, profile, "/layout/validate")}`,
+    {
+      ...jsonRequest(
+        {
+          workspace_id: workspaceId,
+          document: windowManagerLayoutDocumentToWire({
+            ...document,
+            workspaceId,
+          }),
+        },
+        signal
+      ),
+      method: "POST",
+    }
+  );
+  return parseWindowManagerLayoutValidation(
+    await requireJson(response, "Unable to validate the layout")
+  );
+}
+
+export async function previewWindowManagerLayout(
+  workspaceId: string,
+  profile: string,
+  revision: number,
+  document: WindowManagerLayoutDocument,
+  clientId?: string,
+  signal?: AbortSignal
+): Promise<WindowManagerLayoutPreview> {
+  const response = await runtimeFetch(
+    `${apiBaseUrl}${layoutUrl(workspaceId, profile, "/preview")}`,
+    {
+      ...jsonRequest(
+        {
+          workspace_id: workspaceId,
+          command_id: "layout.replace",
+          expected_revision: revision,
+          ...(clientId ? { client_id: clientId } : {}),
+          actor: { kind: "web", id: clientId ?? "settings" },
+          origin: "web-settings",
+          payload: {
+            document: windowManagerLayoutDocumentToWire({
+              ...document,
+              workspaceId,
+            }),
+          },
+        },
+        signal
+      ),
+      method: "POST",
+    }
+  );
+  return parseWindowManagerLayoutPreview(
+    await requireJson(response, "Unable to preview the layout")
+  );
+}
+
+export async function applyWindowManagerLayout(
+  workspaceId: string,
+  profile: string,
+  revision: number,
+  document: WindowManagerLayoutDocument,
+  clientId?: string,
+  signal?: AbortSignal
+): Promise<WindowManagerLayoutApplyResult> {
+  const response = await runtimeFetch(
+    `${apiBaseUrl}${layoutUrl(workspaceId, profile, "/layout")}`,
+    {
+      ...jsonRequest(
+        {
+          workspace_id: workspaceId,
+          expected_revision: revision,
+          ...(clientId ? { client_id: clientId } : {}),
+          actor: { kind: "web", id: clientId ?? "settings" },
+          origin: "web-settings",
+          document: windowManagerLayoutDocumentToWire({
+            ...document,
+            workspaceId,
+          }),
+        },
+        signal
+      ),
+      method: "PUT",
+    }
+  );
+  return parseWindowManagerLayoutApply(await requireJson(response, "Unable to apply the layout"));
+}
+
+export async function listWindowManagerLayoutProfiles(
+  workspaceId: string,
+  profile: string,
+  signal?: AbortSignal
+): Promise<WindowManagerLayoutResourceRecord[]> {
+  const response = await runtimeFetch(
+    `${apiBaseUrl}${layoutUrl(workspaceId, profile, "/layout-profiles")}`,
+    {
+      signal,
+    }
+  );
+  return parseWindowManagerLayoutResources(
+    await requireJson(response, "Unable to list layout profiles")
+  );
+}
+
+export async function putWindowManagerLayoutProfile(
+  profile: WindowManagerLayoutProfile,
+  scope: WindowManagerLayoutScopeKind,
+  workspaceId: string,
+  ownerProfile: string,
+  expectedVersion: number,
+  signal?: AbortSignal
+): Promise<WindowManagerLayoutResourceRecord> {
+  const scopedDocument = {
+    ...profile.document,
+    workspaceId: scope === "workspace" ? workspaceId : "",
+  };
+  const response = await runtimeFetch(
+    `${apiBaseUrl}${layoutUrl(workspaceId, ownerProfile, `/layout-profiles/${encodeURIComponent(profile.id)}`)}`,
+    {
+      ...jsonRequest(
+        {
+          scope: {
+            kind: scope,
+            ...(scope === "workspace" ? { id: workspaceId } : {}),
+          },
+          expected_version: expectedVersion,
+          spec: windowManagerProfileToWire({
+            ...profile,
+            document: scopedDocument,
+          }),
+        },
+        signal
+      ),
+      method: "PUT",
+    }
+  );
+  return parseWindowManagerLayoutResource(
+    await requireJson(response, "Unable to save the layout profile")
+  );
+}
+
+export async function deleteWindowManagerLayoutProfile(
+  workspaceId: string,
+  ownerProfile: string,
+  id: string,
+  expectedVersion: number,
+  signal?: AbortSignal
+): Promise<void> {
+  const response = await runtimeFetch(
+    `${apiBaseUrl}${layoutUrl(workspaceId, ownerProfile, `/layout-profiles/${encodeURIComponent(id)}`)}`,
+    {
+      ...jsonRequest({ expected_version: expectedVersion }, signal),
+      method: "DELETE",
+    }
+  );
+  if (response.status === 204) return;
+  await requireJson(response, "Unable to delete the layout profile");
+}

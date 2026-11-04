@@ -1,0 +1,82 @@
+"use client";
+
+import * as React from "react";
+
+import { cn } from "../../lib/utils";
+
+export type MarkerTone = "neutral" | "destructive" | "warning" | "info";
+
+export interface MarkerProps extends React.ComponentProps<"div"> {
+  /** Signal tone carried by the glyph only — the sentence stays neutral. */
+  tone?: MarkerTone;
+  /** 12px leading glyph (lucide icon element). */
+  icon?: React.ReactNode;
+  children: React.ReactNode;
+}
+
+const TONE_ICON: Record<MarkerTone, string> = {
+  neutral: "text-faint",
+  destructive: "text-destructive",
+  warning: "text-warning",
+  info: "text-info",
+};
+
+/**
+ * One-line system event in the transcript — replaces every in-transcript Alert
+ * card: a 12px tone glyph plus one muted sentence. Tone lives in the glyph,
+ * never in the text or a background; `<b>` inside the sentence carries the
+ * subject at `--color-muted-foreground`. Compose `MarkerMeta` for raw kind strings or ×N counts.
+ */
+function Marker({ tone = "neutral", icon, children, className, ...props }: MarkerProps) {
+  return (
+    <div
+      data-slot="marker"
+      data-tone={tone}
+      className={cn(
+        "flex min-h-transcript-row min-w-0 items-start gap-transcript-inline-gap px-1 py-0.5",
+        "text-transcript-body leading-normal text-subtle",
+        className
+      )}
+      {...props}
+    >
+      {icon ? (
+        <span
+          aria-hidden="true"
+          data-slot="marker-icon"
+          className={cn("mt-0.5 shrink-0 *:[svg]:size-3", TONE_ICON[tone])}
+        >
+          {icon}
+        </span>
+      ) : null}
+      <span
+        data-slot="marker-body"
+        className="min-w-0 [&_b]:font-medium [&_b]:text-muted-foreground [&_strong]:font-medium [&_strong]:text-muted-foreground"
+      >
+        {children}
+      </span>
+    </div>
+  );
+}
+
+export interface MarkerMetaProps extends React.ComponentProps<"span"> {
+  children: React.ReactNode;
+}
+
+/**
+ * Faint meta inside a marker sentence — raw kind strings, ×N counts. Sans, so
+ * the transcript reads as language; wrap the child in `<MonoId>` when the
+ * reader has to match an identifier character by character.
+ */
+function MarkerMeta({ children, className, ...props }: MarkerMetaProps) {
+  return (
+    <span
+      data-slot="marker-meta"
+      className={cn("text-transcript-body text-faint tabular-nums", className)}
+      {...props}
+    >
+      {children}
+    </span>
+  );
+}
+
+export { Marker, MarkerMeta };

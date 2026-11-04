@@ -1,0 +1,183 @@
+import { toast } from "@compozy/ui";
+
+import {
+  useCancelTaskRun,
+  useForceFailTaskRun,
+  useForceReleaseTaskRun,
+  useRetryTaskRun,
+} from "./use-task-run-actions";
+import { useTaskRunDetail, useTaskRunInspect } from "./use-task-live";
+import { useRecoverTaskRun } from "./use-task-run-recovery";
+import { useTaskRunReviews } from "./use-task-reviews";
+import { useTask } from "./use-tasks";
+
+interface UseTaskRunPageOptions {
+  enableTaskDetail?: boolean;
+  enableInspect?: boolean;
+  enableRunReviews?: boolean;
+  liveDataEnabled?: boolean;
+}
+
+function useTaskRunPage(taskId: string, runId: string, options: UseTaskRunPageOptions = {}) {
+  const hasRunId = Boolean(runId);
+  const enableTaskDetail = options.enableTaskDetail ?? true;
+  const enableInspect = options.enableInspect ?? true;
+  const enableRunReviews = options.enableRunReviews ?? true;
+  const liveDataEnabled = options.liveDataEnabled ?? true;
+
+  const runQuery = useTaskRunDetail(runId, {
+    enabled: hasRunId && liveDataEnabled,
+    refetchIntervalMs: liveDataEnabled ? undefined : false,
+  });
+  const run = runQuery.data ?? null;
+  const authoritativeTaskId = run?.run.task_id ?? run?.task?.id ?? "";
+  const routeTaskMismatch = Boolean(authoritativeTaskId && authoritativeTaskId !== taskId);
+  const runStatus = run?.run?.status;
+  const isLive =
+    runStatus === "running" ||
+    runStatus === "starting" ||
+    runStatus === "claimed" ||
+    runStatus === "queued";
+  const refetchIntervalMs = isLive && liveDataEnabled ? undefined : false;
+  const inspectQuery = useTaskRunInspect(runId, {
+    enabled: hasRunId && enableInspect && liveDataEnabled,
+    refetchIntervalMs,
+  });
+  const taskQuery = useTask(authoritativeTaskId, {
+    enabled: Boolean(authoritativeTaskId) && enableTaskDetail && liveDataEnabled,
+    refetchIntervalMs,
+  });
+  const reviewsQuery = useTaskRunReviews(
+    runId,
+    {},
+    {
+      enabled: hasRunId && enableRunReviews && liveDataEnabled,
+      refetchIntervalMs,
+    }
+  );
+  const cancelMutation = useCancelTaskRun();
+  const forceReleaseMutation = useForceReleaseTaskRun();
+  const forceFailMutation = useForceFailTaskRun();
+  const recoverMutation = useRecoverTaskRun();
+  const retryMutation = useRetryTaskRun();
+
+  const inspect = inspectQuery.data ?? null;
+  const task = taskQuery.data ?? null;
+  const session = run?.session ?? null;
+  const summary = run?.summary ?? null;
+
+  const fatalError = !hasRunId
+    ? new Error("Missing run id")
+    : routeTaskMismatch
+      ? new Error(`Task run not found: ${runId}`)
+      : (runQuery.error ?? null);
+
+  const handleCancelRun = async () => {
+    if (!hasRunId) {
+      return;
+    }
+
+    try {
+      await cancelMutation.mutateAsync({ runId });
+      toast.success("Run canceled.");
+    } catch (error) {
+      console.error("Failed to cancel task run", error);
+      toast.error("Couldn't cancel this run.");
+    }
+  };
+
+  const handleForceReleaseRun = async (reason?: string) => {
+    if (!hasRunId) return;
+    try {
+      await forceReleaseMutation.mutateAsync({
+        runId,
+        data: { reason: reason?.trim() || undefined },
+      });
+      toast.success("Run released.");
+    } catch (error) {
+      console.error("Failed to release task run", error);
+      toast.error("Couldn't release this run.");
+    }
+  };
+
+  const handleForceFailRun = async (reason: string) => {
+    if (!hasRunId) return;
+    try {
+      await forceFailMutation.mutateAsync({ runId, data: { reason: reason.trim() } });
+      toast.success("Run failed.");
+    } catch (error) {
+      console.error("Failed to force-fail task run", error);
+      toast.error("Couldn't mark this run as failed.");
+    }
+  };
+
+  const handleRetryRun = async () => {
+    if (!hasRunId) {
+      return;
+    }
+
+    try {
+      await retryMutation.mutateAsync({ runId });
+      toast.success("Retry queued.");
+    } catch (error) {
+      console.error("Failed to retry task run", error);
+      toast.error("Couldn't queue a retry.");
+    }
+  };
+
+  const handleRecoverRun = async () => {
+    if (!hasRunId || !authoritativeTaskId || recoverMutation.isPending) {
+      return;
+    }
+
+    try {
+      await recoverMutation.mutateAsync({ runId, taskId: authoritativeTaskId });
+      toast.success("Run recovered.");
+    } catch (error) {
+      console.error("Failed to recover task run", error);
+      toast.error("Couldn't recover this run.");
+    }
+  };
+
+  const reviews = reviewsQuery.data ?? [];
+
+  return {
+    fatalError,
+    handleCancelRun,
+    handleForceFailRun,
+    handleForceReleaseRun,
+    handleRecoverRun,
+    handleRetryLoad: () => runQuery.refetch(),
+    handleRetryRun,
+    isCancelPending: cancelMutation.isPending,
+    isForceFailPending: forceFailMutation.isPending,
+    isForceReleasePending: forceReleaseMutation.isPending,
+    isLive,
+    isRecoverPending: recoverMutation.isPending,
+    isRetryPending: retryMutation.isPending,
+    inspect,
+    inspectError: inspectQuery.error ?? null,
+    // The secondary reads wait on no data yet too, and on nothing the caller opted out of.
+    inspectLoading: hasRunId && enableInspect && inspectQuery.isPending && !inspect,
+    notFound:
+      routeTaskMismatch || (runQuery.isError && runQuery.error?.message?.includes("not found")),
+    reviews,
+    reviewsError: reviewsQuery.error ?? null,
+    reviewsLoading: hasRunId && enableRunReviews && reviewsQuery.isPending && reviews.length === 0,
+    run,
+    runError: runQuery.error ?? null,
+    runId,
+    // `isPending`, not `isLoading`: a suspended window disables the read, and a disabled read with
+    // no data yet is still waiting, not a missing run.
+    runLoading: hasRunId && runQuery.isPending && !run,
+    session,
+    summary,
+    task,
+    taskError: taskQuery.error ?? null,
+    taskId: authoritativeTaskId,
+    taskLoading: taskQuery.isLoading && !task,
+  };
+}
+
+export { useTaskRunPage };
+export type { UseTaskRunPageOptions };

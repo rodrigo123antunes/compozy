@@ -1,0 +1,180 @@
+package extensionpkg
+
+import (
+	"context"
+	"log/slog"
+	"strings"
+	"time"
+
+	compozyconfig "github.com/compozy/compozy/internal/config"
+	"github.com/compozy/compozy/internal/resources"
+	"github.com/compozy/compozy/internal/subprocess"
+	"github.com/compozy/compozy/internal/toolruntime"
+	workspacepkg "github.com/compozy/compozy/internal/workspace"
+)
+
+// WithHomePaths binds extension-owned runtime data to the daemon's canonical home layout.
+func WithHomePaths(paths compozyconfig.HomePaths) Option {
+	return func(manager *Manager) {
+		manager.homePaths = paths
+	}
+}
+
+// SecretRefResolver resolves env: and vault: refs for extension launch bindings.
+type SecretRefResolver interface {
+	ResolveRef(context.Context, string) (string, error)
+}
+
+// ProfileNameResolver resolves an active profile identity for runtime scope binding.
+type ProfileNameResolver interface {
+	ProfileName(context.Context, string) (string, error)
+}
+
+// WithCapabilityChecker injects the grant evaluator used for Host API authorization.
+func WithCapabilityChecker(checker *CapabilityChecker) Option {
+	return func(manager *Manager) {
+		manager.capChecker = checker
+	}
+}
+
+// WithLifecycleEventSink injects the append-only lifecycle observer used by manager-owned call sites.
+func WithLifecycleEventSink(sink LifecycleEventSink) Option {
+	return func(manager *Manager) {
+		manager.lifecycleEventSink = sink
+	}
+}
+
+// WithSourceSessionManager injects the resource source-session manager used to
+// activate extension nonces for snapshot publication.
+func WithSourceSessionManager(manager resources.SourceSessionManager) Option {
+	return func(mgr *Manager) {
+		mgr.sourceSessions = manager
+	}
+}
+
+// WithWorkspaceResolver binds workspace-scoped extension sessions to the registered
+// workspace that owns their manifest path.
+func WithWorkspaceResolver(resolver workspacepkg.RuntimeResolver) Option {
+	return func(manager *Manager) {
+		manager.workspaceResolver = resolver
+	}
+}
+
+// WithProcessRegistry injects shared tool process ownership tracking.
+func WithProcessRegistry(registry *toolruntime.Registry) Option {
+	return func(manager *Manager) {
+		manager.processRegistry = registry
+	}
+}
+
+// WithLogger injects the logger used for extension diagnostics.
+func WithLogger(logger *slog.Logger) Option {
+	return func(manager *Manager) {
+		manager.logger = logger
+	}
+}
+
+// WithNow overrides the manager clock, mainly for tests.
+func WithNow(now func() time.Time) Option {
+	return func(manager *Manager) {
+		manager.now = now
+	}
+}
+
+// WithGetenv overrides environment lookup used for manifest template expansion.
+func WithGetenv(getenv func(string) string) Option {
+	return func(manager *Manager) {
+		manager.getenv = getenv
+	}
+}
+
+// WithCompozyExecutableResolver overrides the binary used by {{compozy_executable}} manifest templates.
+func WithCompozyExecutableResolver(resolver func() (string, error)) Option {
+	return func(manager *Manager) {
+		manager.compozyExecutable = resolver
+	}
+}
+
+// WithSecretResolver injects the daemon vault resolver used for extension secret env bindings.
+func WithSecretResolver(resolver SecretRefResolver) Option {
+	return func(manager *Manager) {
+		manager.secretResolver = resolver
+	}
+}
+
+// WithEnvBindingStore injects instance-scoped operator bindings used at process launch.
+func WithEnvBindingStore(store EnvBindingStore) Option {
+	return func(manager *Manager) {
+		manager.envBindings = store
+	}
+}
+
+// WithProfileNameResolver binds profile-scoped subprocesses to canonical profile names.
+func WithProfileNameResolver(resolver ProfileNameResolver) Option {
+	return func(manager *Manager) {
+		manager.profileNames = resolver
+	}
+}
+
+// WithHostMethodHandler registers one Host API method handler for launched extensions.
+func WithHostMethodHandler(method string, handler subprocess.HandlerFunc) Option {
+	return func(manager *Manager) {
+		if manager.hostMethods == nil {
+			manager.hostMethods = make(map[string]subprocess.HandlerFunc)
+		}
+		manager.hostMethods[strings.TrimSpace(method)] = handler
+	}
+}
+
+// WithInitializeTimeout overrides the initialize handshake timeout.
+func WithInitializeTimeout(timeout time.Duration) Option {
+	return func(manager *Manager) {
+		manager.initializeTimeout = timeout
+	}
+}
+
+// WithHealthCheckTimeout overrides the negotiated health probe timeout.
+func WithHealthCheckTimeout(timeout time.Duration) Option {
+	return func(manager *Manager) {
+		manager.healthCheckTimeout = timeout
+	}
+}
+
+// WithDefaultHookTimeout overrides the negotiated default hook timeout.
+func WithDefaultHookTimeout(timeout time.Duration) Option {
+	return func(manager *Manager) {
+		manager.defaultHookTimeout = timeout
+	}
+}
+
+// WithSubprocessSignalGrace overrides the SIGTERM -> SIGKILL grace interval.
+func WithSubprocessSignalGrace(timeout time.Duration) Option {
+	return func(manager *Manager) {
+		manager.subprocessSignalGrace = timeout
+	}
+}
+
+func withProcessLauncher(launcher processLauncher) Option {
+	return func(manager *Manager) {
+		manager.launch = launcher
+	}
+}
+
+func withRestartBackoffMax(maximum time.Duration) Option {
+	return func(manager *Manager) {
+		manager.restartBackoffMax = maximum
+	}
+}
+
+func withRestartFailureThreshold(threshold int) Option {
+	return func(manager *Manager) {
+		manager.restartFailureThreshold = threshold
+	}
+}
+
+func withHealthPollBounds(floor, ceiling time.Duration) Option {
+	return func(manager *Manager) {
+		manager.healthPollFloor = floor
+		manager.healthPollCeiling = ceiling
+	}
+}

@@ -1,0 +1,316 @@
+package contract
+
+import (
+	"time"
+
+	"github.com/compozy/compozy/internal/extensioninput"
+
+	"github.com/compozy/compozy/internal/resources"
+	toolspkg "github.com/compozy/compozy/internal/tools"
+)
+
+// InstallExtensionSource is the closed distribution-source union.
+type InstallExtensionSource string
+
+const (
+	InstallExtensionSourceCurated     InstallExtensionSource = "curated"
+	InstallExtensionSourceMarketplace InstallExtensionSource = "marketplace"
+	InstallExtensionSourceGitHub      InstallExtensionSource = "github"
+	InstallExtensionSourceGit         InstallExtensionSource = "git"
+	InstallExtensionSourceLocalPath   InstallExtensionSource = "local_path"
+)
+
+// InstallExtensionRequest is the shared extension install request payload.
+type InstallExtensionRequest struct {
+	Scope                string                          `json:"scope,omitempty"`
+	WorkspaceID          string                          `json:"workspace_id,omitempty"`
+	Profile              string                          `json:"profile,omitempty"`
+	Inputs               map[string]extensioninput.Value `json:"inputs,omitempty"`
+	ExpectedDigest       string                          `json:"expected_digest,omitempty"`
+	Source               InstallExtensionSource          `json:"source"`
+	Ref                  string                          `json:"ref"`
+	Version              string                          `json:"version,omitempty"`
+	Asset                string                          `json:"asset,omitempty"`
+	AllowUnverified      bool                            `json:"allow_unverified,omitzero"`
+	ConfirmGatewayDigest string                          `json:"confirm_gateway_digest,omitempty"`
+}
+
+// ExtensionValidationErrorPayload reports positioned extension validation failures.
+type ExtensionValidationErrorPayload struct {
+	Error      string            `json:"error"`
+	Diagnostic *DiagnosticItem   `json:"diagnostic,omitzero"`
+	Issues     []ValidationIssue `json:"issues"`
+}
+
+// ExtensionOperationErrorPayload is the deterministic extension lifecycle error envelope.
+type ExtensionOperationErrorPayload struct {
+	InputDefinitions []MarketplaceInputPayload `json:"input_definitions,omitempty"`
+	InstalledOrigin  *MarketplaceOriginPayload `json:"installed_origin,omitzero"`
+	ListedDigest     string                    `json:"listed_digest,omitempty"`
+	FetchedDigest    string                    `json:"fetched_digest,omitempty"`
+	InputID          string                    `json:"input_id,omitempty"`
+	Inputs           []string                  `json:"inputs,omitempty"`
+	MissingEnv       []string                  `json:"missing_env,omitempty"`
+	Error            string                    `json:"error"`
+	Code             string                    `json:"code"`
+	Diagnostic       *DiagnosticItem           `json:"diagnostic,omitzero"`
+	CurrentDigest    string                    `json:"current_digest,omitempty"`
+	Agents           []string                  `json:"agents,omitempty"`
+	EnvName          string                    `json:"env_name,omitempty"`
+	DeclaredEnv      []string                  `json:"declared_env,omitempty"`
+}
+
+// UpdateExtensionRequest is the shared marketplace extension update payload.
+type UpdateExtensionRequest struct {
+	Scope                string                          `json:"scope,omitempty"`
+	WorkspaceID          string                          `json:"workspace_id,omitempty"`
+	Profile              string                          `json:"profile,omitempty"`
+	Inputs               map[string]extensioninput.Value `json:"inputs,omitempty"`
+	Version              string                          `json:"version,omitempty"`
+	CheckOnly            bool                            `json:"check_only,omitzero"`
+	AllowUnverified      bool                            `json:"allow_unverified,omitzero"`
+	ConfirmGatewayDigest string                          `json:"confirm_gateway_digest,omitempty"`
+}
+
+// UpdateExtensionsRequest selects one or more managed extension updates.
+type UpdateExtensionsRequest struct {
+	Scope           string                          `json:"scope,omitempty"`
+	WorkspaceID     string                          `json:"workspace_id,omitempty"`
+	Profile         string                          `json:"profile,omitempty"`
+	Inputs          map[string]extensioninput.Value `json:"inputs,omitempty"`
+	Names           []string                        `json:"names,omitempty"`
+	All             bool                            `json:"all,omitzero"`
+	Version         string                          `json:"version,omitempty"`
+	CheckOnly       bool                            `json:"check_only,omitzero"`
+	AllowUnverified bool                            `json:"allow_unverified,omitzero"`
+}
+
+// DevLinkExtensionRequest links one immutable generation under the caller's trusted workspace.
+type DevLinkExtensionRequest struct {
+	OriginPath           string `json:"origin_path"`
+	GenerationHash       string `json:"generation_hash"`
+	ConfirmGatewayDigest string `json:"confirm_gateway_digest,omitempty"`
+}
+
+// ReloadExtensionRequest swaps one dev-linked extension to an immutable generation.
+type ReloadExtensionRequest struct {
+	GenerationHash       string `json:"generation_hash"`
+	ConfirmGatewayDigest string `json:"confirm_gateway_digest,omitempty"`
+}
+
+// EnableExtensionRequest carries digest-exact gateway permission consent.
+type EnableExtensionRequest struct {
+	ConfirmGatewayDigest string `json:"confirm_gateway_digest,omitempty"`
+}
+
+// ExtensionSecretBindingInput is one write-only value or existing Vault binding.
+type ExtensionSecretBindingInput struct {
+	EnvName    string  `json:"env_name"`
+	Value      *string `json:"value,omitzero"`
+	VaultRef   *string `json:"vault_ref,omitzero"`
+	MCPServer  string  `json:"mcp_server,omitempty"`
+	HeaderName string  `json:"header_name,omitempty"`
+}
+
+// SetExtensionSecretsRequest updates one or more declared environment bindings.
+type SetExtensionSecretsRequest struct {
+	Bindings []ExtensionSecretBindingInput `json:"bindings"`
+}
+
+// ExtensionSecretsPayload exposes binding presence without refs or values.
+type ExtensionSecretsPayload struct {
+	DeclaredEnv  []string                        `json:"declared_env"`
+	BoundEnvKeys []string                        `json:"bound_env_keys"`
+	Bindings     []ExtensionSecretBindingPayload `json:"bindings"`
+}
+
+// ExtensionSecretBindingPayload reports one bound key without exposing its Vault ref or value.
+type ExtensionSecretBindingPayload struct {
+	EnvName    string `json:"env_name"`
+	Stale      bool   `json:"stale"`
+	MCPServer  string `json:"mcp_server,omitempty"`
+	HeaderName string `json:"header_name,omitempty"`
+}
+
+// ExtensionLogPayload is one redacted per-instance stderr record.
+type ExtensionLogPayload struct {
+	Sequence       int64     `json:"sequence"`
+	Timestamp      time.Time `json:"timestamp"`
+	Message        string    `json:"message"`
+	GenerationHash string    `json:"generation_hash,omitempty"`
+	StreamEpoch    string    `json:"stream_epoch"`
+}
+
+// ExtensionTrustReportPayload records the trust decision for an extension.
+type ExtensionTrustReportPayload struct {
+	Decision         string           `json:"decision"`
+	RegistryTier     string           `json:"registry_tier"`
+	ChecksumVerified bool             `json:"checksum_verified"`
+	AllowUnverified  bool             `json:"allow_unverified"`
+	Warnings         []DiagnosticItem `json:"warnings,omitempty"`
+}
+
+// ExtensionProvenancePayload contains the persisted source and trust record.
+type ExtensionProvenancePayload struct {
+	SourceName          string                       `json:"source_name,omitempty"`
+	SourceRef           string                       `json:"source_ref,omitempty"`
+	EntryID             string                       `json:"entry_id,omitempty"`
+	ResolvedRef         string                       `json:"resolved_ref,omitempty"`
+	Layout              string                       `json:"layout,omitempty"`
+	Slug                string                       `json:"slug,omitempty"`
+	CatalogEntryID      string                       `json:"catalog_entry_id,omitempty"`
+	InstalledFrom       string                       `json:"installed_from"`
+	SourceURL           string                       `json:"source_url,omitempty"`
+	ChecksumSHA256      string                       `json:"checksum_sha256"`
+	ArchiveDigestSHA256 string                       `json:"archive_digest_sha256,omitempty"`
+	DigestMatched       bool                         `json:"digest_matched"`
+	ChecksumVerified    bool                         `json:"checksum_verified"`
+	RegistryTier        string                       `json:"registry_tier"`
+	Permissions         []string                     `json:"permissions,omitempty"`
+	InstalledAt         time.Time                    `json:"installed_at"`
+	InstalledBy         string                       `json:"installed_by"`
+	AllowUnverified     bool                         `json:"allow_unverified"`
+	Warnings            []DiagnosticItem             `json:"warnings,omitempty"`
+	Trust               *ExtensionTrustReportPayload `json:"trust,omitzero"`
+}
+
+// ExtensionPayload is the shared extension response payload surfaced by CLI APIs.
+type ExtensionPayload struct {
+	Description                 string                            `json:"description,omitempty"`
+	InstallationProfile         string                            `json:"installation_profile,omitempty"`
+	Layout                      string                            `json:"layout,omitempty"`
+	MCPServers                  []MarketplaceServerPayload        `json:"mcp_servers,omitempty"`
+	Inputs                      []ExtensionInputStatePayload      `json:"inputs,omitempty"`
+	MissingInputs               []string                          `json:"missing_inputs,omitempty"`
+	Contents                    ExtensionContentsPayload          `json:"contents"`
+	Origin                      *MarketplaceOriginPayload         `json:"origin,omitzero"`
+	Name                        string                            `json:"name"`
+	Profile                     string                            `json:"profile"`
+	WorkspaceID                 string                            `json:"workspace_id,omitempty"`
+	Version                     string                            `json:"version"`
+	Type                        string                            `json:"type"`
+	Format                      string                            `json:"format"`
+	Source                      string                            `json:"source"`
+	Enabled                     bool                              `json:"enabled"`
+	State                       string                            `json:"state"`
+	Capabilities                []string                          `json:"capabilities,omitempty"`
+	Permissions                 []string                          `json:"permissions,omitempty"`
+	RequiresEnv                 []string                          `json:"requires_env,omitempty"`
+	MissingEnv                  []string                          `json:"missing_env,omitempty"`
+	BoundEnvKeys                []string                          `json:"bound_env_keys,omitempty"`
+	GatewayRequirementDigest    string                            `json:"gateway_requirement_digest,omitempty"`
+	GatewayConfirmationRequired bool                              `json:"gateway_confirmation_required"`
+	PID                         int                               `json:"pid,omitzero"`
+	UptimeSeconds               int64                             `json:"uptime_seconds,omitzero"`
+	Health                      string                            `json:"health,omitempty"`
+	HealthMessage               string                            `json:"health_message,omitempty"`
+	LastError                   string                            `json:"last_error,omitempty"`
+	FailureCode                 string                            `json:"failure_code,omitempty"`
+	ConsecutiveFailures         int                               `json:"consecutive_failures"`
+	RestartBackoffMS            int64                             `json:"restart_backoff_ms"`
+	GenerationHash              string                            `json:"generation_hash,omitempty"`
+	Dev                         bool                              `json:"dev,omitzero"`
+	OverridesPublished          bool                              `json:"overrides_published,omitzero"`
+	OriginPath                  string                            `json:"origin_path,omitempty"`
+	UpdateAvailable             bool                              `json:"update_available"`
+	RemoteVersion               string                            `json:"remote_version,omitempty"`
+	DigestMatched               bool                              `json:"digest_matched"`
+	DaemonRunning               bool                              `json:"daemon_running"`
+	Provenance                  *ExtensionProvenancePayload       `json:"provenance,omitzero"`
+	Marketplace                 *MarketplaceListingPayload        `json:"marketplace,omitzero"`
+	Trust                       *ExtensionTrustReportPayload      `json:"trust,omitzero"`
+	Diagnostics                 []DiagnosticItem                  `json:"diagnostics,omitempty"`
+	DeclaredProfiles            []ExtensionDeclaredProfilePayload `json:"declared_profiles,omitempty"`
+	Placements                  []ExtensionPlacementPayload       `json:"placements,omitempty"`
+	DormantPlacements           []ExtensionPlacementPayload       `json:"dormant_placements,omitempty"`
+}
+
+// ExtensionDeclaredProfilePayload reports one manifest-declared profile and its live setup state.
+type ExtensionDeclaredProfilePayload struct {
+	Name   string `json:"name"`
+	Exists bool   `json:"exists"`
+	// CreatedByExtension requires confirmed creation provenance; unknown historical origin is false.
+	CreatedByExtension     bool                           `json:"created_by_extension"`
+	NeedsSetup             bool                           `json:"needs_setup"`
+	CredentialRequirements []ProfileCredentialRequirement `json:"credential_requirements,omitempty"`
+}
+
+// ExtensionPlacementPayload is one row in the extension resource placement matrix.
+type ExtensionPlacementPayload struct {
+	Kind         string `json:"kind"`
+	Resource     string `json:"resource"`
+	Profile      string `json:"profile,omitempty"`
+	Dormant      bool   `json:"dormant"`
+	CreateAction string `json:"create_action,omitempty"`
+}
+
+// ExtensionEnableResult is the committed enable action result.
+type ExtensionEnableResult struct {
+	Extension         ExtensionPayload `json:"extension"`
+	AutomationStarted []string         `json:"automation_started"`
+}
+
+// ExtensionKitItemPayload is one shipped or live extension resource.
+type ExtensionKitItemPayload struct {
+	Kind resources.ResourceKind `json:"kind"`
+	ID   string                 `json:"id"`
+	Name string                 `json:"name"`
+	Live bool                   `json:"live"`
+}
+
+// ExtensionInventoryPayload is the shipped/live union for one extension.
+type ExtensionInventoryPayload struct {
+	Extension   string                    `json:"extension"`
+	Format      string                    `json:"format"`
+	Enabled     bool                      `json:"enabled"`
+	Items       []ExtensionKitItemPayload `json:"items"`
+	Diagnostics []DiagnosticItem          `json:"diagnostics,omitempty"`
+}
+
+// ExtensionKitChange identifies how enable reconciliation will mutate one resource.
+type ExtensionKitChange string
+
+const (
+	ExtensionKitChangeAdded   ExtensionKitChange = "added"
+	ExtensionKitChangeChanged ExtensionKitChange = "changed"
+	ExtensionKitChangeRemoved ExtensionKitChange = "removed"
+)
+
+// ExtensionKitChangePayload is one resource delta in an enable preview.
+type ExtensionKitChangePayload struct {
+	Kind   resources.ResourceKind `json:"kind"`
+	ID     string                 `json:"id"`
+	Name   string                 `json:"name"`
+	Change ExtensionKitChange     `json:"change"`
+}
+
+// ExtensionEnablePreviewPayload is the mutation-free enable projection.
+type ExtensionEnablePreviewPayload struct {
+	MissingInputs               []string                    `json:"missing_inputs"`
+	Extension                   string                      `json:"extension"`
+	Changes                     []ExtensionKitChangePayload `json:"changes"`
+	AgentConflicts              []string                    `json:"agent_conflicts"`
+	MissingEnv                  []string                    `json:"missing_env"`
+	AutomationStarting          []string                    `json:"automation_starting"`
+	GatewayRequirementDigest    string                      `json:"gateway_requirement_digest"`
+	GatewayConfirmationRequired bool                        `json:"gateway_confirmation_required"`
+}
+
+// ExtensionCommandPayload is one executable command leaf projected from an active extension tool.
+type ExtensionCommandPayload struct {
+	Extension        string                 `json:"extension"`
+	Verb             string                 `json:"verb"`
+	ToolID           string                 `json:"tool_id"`
+	Summary          string                 `json:"summary"`
+	Example          string                 `json:"example,omitempty"`
+	Flags            []toolspkg.CommandFlag `json:"flags"`
+	RiskClass        toolspkg.RiskClass     `json:"risk_class"`
+	ApprovalRequired bool                   `json:"approval_required"`
+}
+
+// ExtensionCommandGroupPayload is one non-executable command presentation group.
+type ExtensionCommandGroupPayload struct {
+	Extension string `json:"extension"`
+	Path      string `json:"path"`
+	Summary   string `json:"summary"`
+}

@@ -1,0 +1,215 @@
+import { Link } from "@tanstack/react-router";
+import { AlertCircle, WifiOff } from "@compozy/ui/icons";
+
+import { Button, Empty, Spinner } from "@compozy/ui";
+
+import type {
+  SessionFailurePayload,
+  SessionState,
+  SessionTranscriptThreadStatus,
+} from "@/systems/session";
+
+import { formatMessageError } from "./session-thread-error";
+import { SessionTranscriptSkeleton } from "./session-thread-skeleton";
+import { useSessionThreadReadOnly } from "./hooks/use-session-thread-read-only";
+import { AgentIdentityLabel } from "@/systems/agent/components/agent-identity-mark";
+import { useAgentIdentityView } from "@/systems/agent/hooks/use-agent-identity-view";
+
+const STATE_PANE_FRAME = "flex min-h-full w-full min-w-0 flex-1 items-center justify-center py-12";
+const RUNTIME_RECOVERY_FAILURE_KINDS = new Set<SessionFailurePayload["kind"]>([
+  "provider_auth_failure",
+  "handshake_failure",
+  "transport_failure",
+  "timeout",
+]);
+
+/**
+ * Empty transcript pane — shown ONLY when the fetch succeeded and nothing has been said
+ * yet (zero messages, or only status events that render no row). One plain line; the
+ * composer below is the call to action when this surface permits input.
+ */
+function ThreadEmpty({ agentName }: { agentName: string }) {
+  const readOnly = useSessionThreadReadOnly();
+  return (
+    <div className={STATE_PANE_FRAME}>
+      <p className="max-w-md text-center text-small-body text-muted-foreground">
+        {readOnly ? (
+          "No messages in this history."
+        ) : (
+          <>
+            Send <AgentIdentityLabel name={agentName} /> a message to get started.
+          </>
+        )}
+      </p>
+    </div>
+  );
+}
+
+function ThreadStarting({ agentName }: { agentName: string }) {
+  const { label } = useAgentIdentityView(agentName);
+  return (
+    <Empty
+      aria-live="polite"
+      className={STATE_PANE_FRAME}
+      data-testid="thread-session-starting"
+      description="Your session is saved. You can type once it's ready."
+      icon={<Spinner aria-hidden="true" className="size-3.75 text-info" />}
+      role="status"
+      size="compact"
+      title={`Getting ${label} ready…`}
+    />
+  );
+}
+
+function ThreadStartupFailure({
+  agentName,
+  failure,
+}: {
+  agentName: string;
+  failure: SessionFailurePayload;
+}) {
+  const { label } = useAgentIdentityView(agentName);
+  const detail = failure.summary?.trim() || "The agent didn't start.";
+  return (
+    <Empty
+      action={
+        RUNTIME_RECOVERY_FAILURE_KINDS.has(failure.kind) ? (
+          <Button
+            nativeButton={false}
+            render={
+              <Link
+                params={{ name: agentName }}
+                search={{ section: "runtime" }}
+                to="/agents/$name/settings"
+              />
+            }
+            size="sm"
+            variant="secondary"
+          >
+            Check agent settings
+          </Button>
+        ) : null
+      }
+      className={STATE_PANE_FRAME}
+      data-testid="thread-session-startup-failure"
+      description={detail}
+      icon={AlertCircle}
+      role="alert"
+      size="compact"
+      title={`${label} couldn't start`}
+    />
+  );
+}
+
+/**
+ * Retryable error pane — shown when the transcript fetch failed. The raw
+ * detail stays behind "Details"; the recovery action refetches the transcript.
+ */
+function ThreadError({ error, onRetry }: { error: Error | null; onRetry: () => void }) {
+  const detail = formatMessageError(error);
+  return (
+    <Empty
+      action={
+        <Button
+          type="button"
+          size="sm"
+          variant="secondary"
+          onClick={onRetry}
+          data-testid="thread-transcript-error-retry"
+        >
+          Try again
+        </Button>
+      }
+      cause={detail ? <span data-testid="thread-transcript-error-detail">{detail}</span> : null}
+      className={STATE_PANE_FRAME}
+      data-testid="thread-transcript-error"
+      description="Your history is saved. Try again in a moment."
+      icon={AlertCircle}
+      role="alert"
+      size="compact"
+      title="Couldn't load this conversation"
+    />
+  );
+}
+
+/**
+ * Never loaded, and the live stream gave up (US-018.AC-2): the pane says the
+ * conversation didn't sync and how many tries, and offers Try again — it never
+ * poses as an empty session. Nothing is lost: the history is saved.
+ */
+function ThreadSyncFailed({ attempts, onRetry }: { attempts: number; onRetry: () => void }) {
+  return (
+    <Empty
+      action={
+        <Button
+          type="button"
+          size="sm"
+          onClick={onRetry}
+          variant="secondary"
+          data-testid="thread-transcript-sync-failed-retry"
+        >
+          Try again
+        </Button>
+      }
+      className={STATE_PANE_FRAME}
+      data-testid="thread-transcript-sync-failed"
+      description={`Couldn't connect after ${attempts} tries. Your history is saved.`}
+      icon={WifiOff}
+      role="alert"
+      size="compact"
+      title="This conversation didn't sync"
+    />
+  );
+}
+
+/**
+ * State branch for an empty-count transcript: `pending` → transcript skeleton (message rows, so
+ * a loading session is never mistaken for an empty one), `error` → retryable
+ * pane, a dead live stream → sync-failed pane, `success` → empty-state copy. Extracted so
+ * the states are unit-testable in isolation from the assistant-ui runtime that wraps the
+ * message rows.
+ */
+export function ThreadStatePane({
+  status,
+  agentName,
+  error,
+  onRetry,
+  sessionState,
+  failure,
+  startupFailed,
+  isSessionRunning = false,
+  syncFailure = null,
+}: {
+  status: SessionTranscriptThreadStatus;
+  agentName: string;
+  error: Error | null;
+  onRetry: () => void;
+  sessionState?: SessionState;
+  failure?: SessionFailurePayload | null;
+  startupFailed?: boolean;
+  isSessionRunning?: boolean;
+  /** Retries exhausted on the live stream; `attempts` names how many. */
+  syncFailure?: { attempts: number; retry: () => void } | null;
+}) {
+  if (sessionState === "starting") {
+    return <ThreadStarting agentName={agentName} />;
+  }
+  if (startupFailed && failure) {
+    return <ThreadStartupFailure agentName={agentName} failure={failure} />;
+  }
+  if (status === "pending") {
+    return <SessionTranscriptSkeleton />;
+  }
+  if (status === "error") {
+    return <ThreadError error={error} onRetry={onRetry} />;
+  }
+  if (syncFailure) {
+    return <ThreadSyncFailed attempts={syncFailure.attempts} onRetry={syncFailure.retry} />;
+  }
+  if (isSessionRunning) {
+    // The sole live-status indicator lives between the viewport and composer.
+    // Keep this viewport blank until durable transcript content arrives.
+    return null;
+  }
+  return <ThreadEmpty agentName={agentName} />;
+}

@@ -1,0 +1,187 @@
+package session
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"strings"
+	"time"
+
+	"github.com/compozy/compozy/internal/acp"
+	compozyconfig "github.com/compozy/compozy/internal/config"
+	hookspkg "github.com/compozy/compozy/internal/hooks"
+	"github.com/compozy/compozy/internal/store"
+	"github.com/compozy/compozy/internal/workref"
+)
+
+type sessionStartRuntime struct {
+	nativeToolsUnavailable bool
+	// startupRebuilt marks a startup definition reassembled for a switched provider or model.
+	startupRebuilt  bool
+	startupManifest acp.StartupManifest
+	agent           compozyconfig.ResolvedAgent
+	agentDef        compozyconfig.AgentDef
+	mcpServers      []compozyconfig.MCPServer
+}
+
+type sessionStartStorage struct {
+	sessionDir string
+	metaPath   string
+	dbPath     string
+	recorder   EventRecorder
+}
+
+const (
+	sessionStartActionCreate = "create"
+	sessionStartActionResume = "resume"
+)
+
+func (m *Manager) prepareResumeStart(ctx context.Context, source *store.SessionMeta) (sessionStartSpec, error) {
+	if source == nil {
+		return sessionStartSpec{}, errors.New("session: resume metadata is required")
+	}
+	if m.hasPendingStopSettlement(source.ID) {
+		return sessionStartSpec{}, fmt.Errorf(
+			"%w: recovered stop for %s has pending persistence",
+			ErrRecoveryPersistence,
+			source.ID,
+		)
+	}
+	if State(source.State) == StateStopping ||
+		(source.Liveness != nil && source.Liveness.SubprocessPID > 0 && !inactiveProcessExitVerified(source)) {
+		return sessionStartSpec{}, fmt.Errorf(
+			"%w: cannot resume %s before process exit",
+			ErrStopVerificationFailed,
+			source.ID,
+		)
+	}
+	meta, err := m.dispatchSessionPreResume(ctx, source)
+	if err != nil {
+		return sessionStartSpec{}, fmt.Errorf("session: dispatch pre-resume for %q: %w", meta.ID, err)
+	}
+
+	resolvedWorkspace, err := m.resolveResumeWorkspace(ctx, &meta)
+	if err != nil {
+		return sessionStartSpec{}, fmt.Errorf("session: resolve resume workspace for %q: %w", meta.ID, err)
+	}
+	worktreeID, worktreeRoot, err := m.resolveSessionWorktree(ctx, resolvedWorkspace.ID, meta.WorktreeIDValue())
+	if err != nil {
+		return sessionStartSpec{}, fmt.Errorf("session: resolve resume worktree for %q: %w", meta.ID, err)
+	}
+	executionRoot := resolvedWorkspace.RootDir
+	if worktreeRoot != "" {
+		executionRoot = worktreeRoot
+	}
+	cwd, err := resumeSessionCWD(&meta, executionRoot)
+	if err != nil {
+		return sessionStartSpec{}, fmt.Errorf("session: validate resume cwd for %q: %w", meta.ID, err)
+	}
+	spec, err := sessionStartSpecFromMeta(&meta, &resolvedWorkspace, cwd)
+	if err != nil {
+		return sessionStartSpec{}, fmt.Errorf("session: build resume start spec for %q: %w", meta.ID, err)
+	}
+	spec.worktreeID = worktreeID
+	spec.worktreeRoot = worktreeRoot
+	spec.postEvent = hookspkg.HookSessionPostResume
+	spec.startAction = sessionStartActionResume
+	spec.includePromptUpdatedAt = true
+	spec.preserveStopReason = sessionMetaStopReason(&meta) == store.StopAgentCrashed
+	spec.acpSessionID = derefString(meta.ACPSessionID)
+	if spec.acpSessionID != "" {
+		spec.acceptedRoute = store.CloneSessionAcceptedRoute(meta.AcceptedRoute)
+	}
+	spec.restartBoundary = store.CloneSessionRestartCheckpoint(meta.RestartBoundary)
+	spec.stopReason = sessionMetaStopReason(&meta)
+	spec.stopDetail = strings.TrimSpace(meta.StopDetail)
+	spec.failure = store.CloneSessionFailure(meta.Failure)
+	return spec, nil
+}
+
+func resumeSessionCWD(meta *store.SessionMeta, executionRoot string) (string, error) {
+	requested := executionRoot
+	if meta == nil {
+		return ResolveSessionCWD(executionRoot, requested)
+	}
+	if cwd := strings.TrimSpace(meta.CWDValue()); cwd != "" {
+		requested = cwd
+	} else if meta.CreationProfile != nil {
+		requested = strings.TrimSpace(meta.CreationProfile.CWD)
+	}
+	return ResolveSessionCWD(executionRoot, requested)
+}
+
+func (m *Manager) startSession(ctx context.Context, spec *sessionStartSpec) (_ *Session, err error) {
+	accepted, err := m.acceptSessionStart(ctx, ctx, spec)
+	if err != nil {
+		return nil, err
+	}
+	if err := m.runAcceptedSessionStartAndDispatch(accepted); err != nil {
+		return nil, err
+	}
+	return accepted.session, nil
+}
+
+// startAgentProcess attributes launch failures to the attempted route rather than the previous binding.
+func (m *Manager) startAgentProcess(
+	ctx context.Context,
+	spec *sessionStartSpec,
+	startOpts acp.StartOpts,
+) (*AgentProcess, error) {
+	logger := spec.startLogger(m).With("resolved_provider", startOpts.ProviderName)
+	logger.Info("session.provider_route.selected", "phase", spec.startAction, "attempt", spec.fallbackAttempt)
+	proc, err := m.driver.Start(ctx, startOpts)
+	if err != nil {
+		logger.Warn("session.start.driver_start_failed", "phase", spec.startAction, "error", err)
+		return proc, startupFailure(
+			"agent runtime startup failed",
+			fmt.Errorf("session: %s agent for %q: %w", spec.startAction, spec.sessionID, err),
+		)
+	}
+	return proc, nil
+}
+
+func (s *sessionStartSpec) startupSessionContext(updatedAt time.Time) hookspkg.SessionContext {
+	ref := workref.NewRoot(s.workspace.ID, s.workspace.RootDir)
+	ctx := hookspkg.SessionContext{
+		ProfileID:             strings.TrimSpace(s.profileID),
+		SessionID:             strings.TrimSpace(s.sessionID),
+		SessionName:           strings.TrimSpace(s.sessionName),
+		SessionType:           string(normalizeSessionType(s.sessionType)),
+		AgentName:             strings.TrimSpace(s.agentName),
+		WorkspaceID:           ref.WorkspaceID,
+		Workspace:             ref.Workspace,
+		SessionRuntimeContext: hookspkg.NewSessionRuntimeContext(s.worktreeID, s.acpSessionID),
+		State:                 string(StateStarting),
+		SessionSoulContext: hookSessionSoulContext(
+			s.soulSnapshotID,
+			s.soulDigest,
+		),
+		CreatedAt: s.createdAt,
+	}
+	if s.includePromptUpdatedAt {
+		ctx.UpdatedAt = updatedAt
+	}
+	return ctx
+}
+
+func (s *sessionStartSpec) startupPromptContext(updatedAt time.Time) StartupPromptContext {
+	ref := workref.NewRoot(s.workspace.ID, s.workspace.RootDir)
+	return StartupPromptContext{
+		InstanceID:   s.instanceID,
+		SessionID:    strings.TrimSpace(s.sessionID),
+		ProfileID:    strings.TrimSpace(s.profileID),
+		SessionName:  strings.TrimSpace(s.sessionName),
+		AgentName:    strings.TrimSpace(s.agentName),
+		Provider:     strings.TrimSpace(s.provider),
+		Model:        strings.TrimSpace(s.model),
+		WorkspaceID:  ref.WorkspaceID,
+		Workspace:    ref.Workspace,
+		WorktreeID:   strings.TrimSpace(s.worktreeID),
+		SessionType:  normalizeSessionType(s.sessionType),
+		SpawnRole:    store.NormalizeSessionLineage(s.sessionID, s.lineage).SpawnRole,
+		Lineage:      store.NormalizeSessionLineage(s.sessionID, s.lineage),
+		SoulSnapshot: cloneSoulSnapshotPointer(s.soulSnapshot),
+		CreatedAt:    s.createdAt,
+		UpdatedAt:    updatedAt,
+	}
+}

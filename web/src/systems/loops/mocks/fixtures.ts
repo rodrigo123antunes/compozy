@@ -1,0 +1,457 @@
+import type {
+  LoopCatalogEntry,
+  LoopContract,
+  LoopDefinition,
+  LoopDetail,
+  LoopRun,
+  LoopRunAggregates,
+} from "../types";
+import { isTerminalLoopStatus } from "../lib/loop-formatters";
+import { heroEffectiveLifecycle, heroRunFixtures } from "./fixture-hero-path";
+import { fixtureGraph } from "./fixture-graph";
+import { graphByName } from "./fixture-graphs";
+import { qualityGateGraph } from "./fixture-quality-gate";
+import { buildLoopRunDetailFixtures } from "./fixture-run-details";
+
+export const MOCK_WORKSPACE_ID = "ws_default";
+
+const implementTasksContract: LoopContract = {
+  goal: "Implement every authored task under .compozy/tasks/{{ .inputs.slug }} in dependency order.",
+  definition_of_done:
+    "Every loaded task completed implementation, task-level validation, tracking updates, and every conductor-created worker stopped.",
+  iteration_cap: 50,
+  budget: { tokens: 0, wall_clock_sec: 0, on_exceeded: "halt" },
+  no_progress: { window: 3 },
+  terminal_states: ["done", "no-op", "blocked", "failed", "exhausted", "stalled"],
+};
+
+const qualityGateContract: LoopContract = {
+  goal: "Exercise generic review, verification, and approval controls.",
+  definition_of_done: "Every configured gate passes.",
+  iteration_cap: 50,
+  budget: { tokens: 500_000, wall_clock_sec: 3_600, on_exceeded: "halt" },
+  no_progress: { window: 3 },
+  boundaries: ["Do not touch unrelated packages."],
+  constraints: ["No destructive git."],
+  terminal_states: ["done", "no-op", "blocked", "failed", "exhausted", "stalled"],
+  verification: [
+    {
+      id: "verify_build",
+      type: "command",
+      check: "npm test",
+      expect: "exit 0",
+    },
+    {
+      id: "acceptance_review",
+      type: "agent-judge",
+      agent: "reviewer",
+      rubric: "The change satisfies the goal and definition of done.",
+    },
+  ],
+};
+
+const reviewContract: LoopContract = {
+  goal: "Review the work for the named task and remediate every valid finding.",
+  definition_of_done:
+    "A new agent review round returns no issues after earlier findings were triaged, remediated, verified, and finalized.",
+  stop_when: "nodes.review.status == 'succeeded' && size(nodes.review.output.issues) == 0",
+  iteration_cap: 3,
+  budget: { tokens: 0, wall_clock_sec: 0, on_exceeded: "escalate" },
+  no_progress: { window: 2 },
+};
+
+/** A round the run has actually reached, with a step count that fits inside it. */
+function defaultProgress(generation: number): LoopRun["progress"] {
+  if (generation <= 0) return { round: 0, steps_done: 0, steps_total: 4 };
+  return { round: generation, steps_done: 2, steps_total: 4 };
+}
+
+function buildRun(
+  overrides: Partial<LoopRun> & Pick<LoopRun, "id" | "loop_name" | "status">
+): LoopRun {
+  const definitionVersion = overrides.loop_name === "quality-gate-demo" ? 4 : 0;
+  return {
+    profile_name: "default",
+    profile_id: "00000000000000000000000000",
+    workspace_id: MOCK_WORKSPACE_ID,
+    historical: false,
+    completion_state: "complete",
+    generation: 3,
+    iteration_cap: 50,
+    tokens_used: 128_400,
+    pause_requested: false,
+    budget_tokens: 500_000,
+    budget_wall_sec: 3_600,
+    budget_on_exceeded: "halt",
+    reattempt_strategy: "failed_only",
+    created_at: "2026-07-05T12:00:00Z",
+    started_at: "2026-07-05T12:00:00Z",
+    last_progress_at: "2026-07-05T12:18:00Z",
+    definition_version: definitionVersion,
+    definition_digest: "sha256:mock-loop-definition",
+    start_metadata: {},
+    ...overrides,
+    // Server-owned step/round progress (B-001): the roster reads it, never
+    // derives it — which is exactly why the fixture cannot leave it behind when
+    // a caller moves the run to another round. A fixed `round: 3` under a
+    // `generation: 1` run is a row the daemon could never emit, and the roster
+    // renders `run.progress` verbatim, so it would ship as a visible lie.
+    progress: overrides.progress ?? defaultProgress(overrides.generation ?? 3),
+    forks: overrides.forks ?? [],
+  };
+}
+
+export const loopRunFixtures: LoopRun[] = [
+  // Live runs (Active table + KPIs).
+  buildRun({
+    id: "looprun_running",
+    loop_name: "implement-tasks",
+    status: "running",
+    generation: 1,
+    tokens_used: 412_000,
+    budget_tokens: 2_000_000,
+    started_origin_kind: "schedule",
+    inputs: { slug: "loops-catalog-api" },
+  }),
+  buildRun({
+    id: "looprun_review_running",
+    loop_name: "review-and-fix",
+    status: "running",
+    iteration_cap: 3,
+    budget_tokens: 0,
+    budget_wall_sec: 0,
+    budget_on_exceeded: "escalate",
+    tokens_used: 68_000,
+    generation: 2,
+    started_origin_kind: "cli",
+    inputs: {
+      task_name: "billing-webhooks",
+      reviewer: "reviewer",
+      fixer: "review_fixer",
+      auto_commit: false,
+    },
+  }),
+  buildRun({
+    id: "looprun_needs_approval",
+    loop_name: "quality-gate-demo",
+    status: "needs-approval",
+    // The server-owned attention summary is what puts a run in the needs-you
+    // group (`groupOf` in `lib/loop-runs-view.ts`). Without it the roster's
+    // whole ranking — needs-you, then active, then terminal — never appeared,
+    // and the run that was waiting on a person sat inside "Active".
+    attention: { kind: "approval", count: 1, since: "2026-07-05T12:15:00Z" },
+    active_gate_id: "aplicar-correcoes",
+    generation: 3,
+    tokens_used: 1_100_000,
+    budget_tokens: 2_000_000,
+    started_origin_kind: "cli",
+    inputs: { goal: "Review billing webhook delivery" },
+  }),
+  buildRun({
+    id: "looprun_paused",
+    loop_name: "review-and-fix",
+    status: "paused",
+    iteration_cap: 3,
+    budget_tokens: 0,
+    budget_on_exceeded: "escalate",
+    tokens_used: 74_000,
+    generation: 2,
+    pause_requested: true,
+    started_origin_kind: "manual",
+    inputs: { task_name: "session-auth", reviewer: "reviewer", fixer: "review_fixer" },
+  }),
+  buildRun({
+    id: "looprun_queued",
+    loop_name: "implement-tasks",
+    status: "queued",
+    generation: 0,
+    tokens_used: 0,
+    budget_tokens: 2_000_000,
+    started_origin_kind: "cli",
+    inputs: { slug: "search-reindex" },
+  }),
+  // Terminal runs (Past table). `done` rows land today for the "Done today" KPI.
+  buildRun({
+    id: "looprun_done_today",
+    loop_name: "implement-tasks",
+    status: "done",
+    generation: 1,
+    tokens_used: 520_000,
+    budget_tokens: 2_000_000,
+    started_origin_kind: "cli",
+    last_progress_at: "2026-07-05T15:41:00Z",
+    inputs: { slug: "search-reindex" },
+  }),
+  buildRun({
+    id: "looprun_done_review",
+    loop_name: "review-and-fix",
+    status: "done",
+    iteration_cap: 3,
+    budget_tokens: 0,
+    budget_on_exceeded: "escalate",
+    tokens_used: 96_000,
+    generation: 3,
+    started_origin_kind: "native_tool",
+    last_progress_at: "2026-07-05T11:02:00Z",
+    inputs: { task_name: "loop-catalog", reviewer: "reviewer", fixer: "review_fixer" },
+  }),
+  buildRun({
+    id: "looprun_no-op",
+    loop_name: "quality-gate-demo",
+    status: "no-op",
+    iteration_cap: 50,
+    budget_tokens: 2_000_000,
+    tokens_used: 12_000,
+    generation: 1,
+    started_origin_kind: "cli",
+    inputs: { goal: "Exercise a no-op gate path" },
+  }),
+  buildRun({
+    id: "looprun_blocked",
+    loop_name: "quality-gate-demo",
+    status: "blocked",
+    generation: 2,
+    tokens_used: 140_000,
+    budget_tokens: 2_000_000,
+    started_origin_kind: "cli",
+    inputs: { goal: "Exercise a blocked gate path" },
+  }),
+  buildRun({
+    id: "looprun_failed",
+    loop_name: "implement-tasks",
+    status: "failed",
+    generation: 1,
+    tokens_used: 340_000,
+    budget_tokens: 2_000_000,
+    started_origin_kind: "schedule",
+    inputs: { slug: "task-action-failure" },
+  }),
+  buildRun({
+    id: "looprun_exhausted",
+    loop_name: "quality-gate-demo",
+    status: "exhausted",
+    generation: 50,
+    best_generation: 12,
+    best_score: 0.88,
+    iteration_cap: 50,
+    tokens_used: 1_900_000,
+    budget_tokens: 2_000_000,
+    started_origin_kind: "cli",
+    inputs: { goal: "Exercise iteration exhaustion" },
+  }),
+  buildRun({
+    id: "looprun_exhausted_budget",
+    loop_name: "implement-tasks",
+    status: "exhausted",
+    generation: 1,
+    tokens_used: 2_000_000,
+    budget_tokens: 2_000_000,
+    started_origin_kind: "manual",
+    inputs: { slug: "token-budget" },
+  }),
+  buildRun({
+    id: "looprun_stalled",
+    loop_name: "quality-gate-demo",
+    status: "stalled",
+    generation: 4,
+    best_generation: 2,
+    best_score: 0.76,
+    tokens_used: 610_000,
+    budget_tokens: 2_000_000,
+    started_origin_kind: "cli",
+    inputs: { goal: "Exercise no-progress detection" },
+  }),
+  buildRun({
+    id: "looprun_stalled_review",
+    loop_name: "review-and-fix",
+    status: "stalled",
+    iteration_cap: 3,
+    budget_tokens: 0,
+    budget_on_exceeded: "escalate",
+    tokens_used: 152_000,
+    generation: 3,
+    started_origin_kind: "http",
+    inputs: { task_name: "billing-reports", reviewer: "reviewer", fixer: "review_fixer" },
+  }),
+  ...heroRunFixtures,
+];
+
+const terminalRunCount = loopRunFixtures.filter(run => isTerminalLoopStatus(run.status)).length;
+
+export const loopRunAggregatesFixture: LoopRunAggregates = {
+  total: loopRunFixtures.length,
+  live: loopRunFixtures.length - terminalRunCount,
+  terminal: terminalRunCount,
+  succeeded: 2,
+  failed: 1,
+  historical: 0,
+};
+
+function loopRunFixture(id: string): LoopRun {
+  const run = loopRunFixtures.find(candidate => candidate.id === id);
+  if (!run) throw new Error(`Missing Loop run fixture ${id}`);
+  return run;
+}
+
+export const loopCatalogFixtures: LoopCatalogEntry[] = [
+  {
+    name: "implement-tasks",
+    source: "marketplace",
+    version: 0,
+    description: "Implement pending CompozyOS task files directly or through a task conductor.",
+    catalog: {
+      category: "Engineering",
+      use_when:
+        "You have authored tasks under .compozy/tasks/<slug> and want them implemented in dependency order, directly or through a conductor.",
+      keywords: ["tasks", "implement", "orchestrate", "engineering"],
+    },
+    contract: implementTasksContract,
+    inputs: {
+      slug: { type: "string", required: true },
+      mode: {
+        type: "string",
+        required: false,
+        enum: ["per-task", "orchestrated"],
+        default: "per-task",
+      },
+      implementer: { type: "agent", required: false, default: "code_implementer" },
+      orchestrator: { type: "agent", required: false, default: "orchestrator" },
+      auto_commit: { type: "boolean", required: false, default: false },
+      orchestrator_runtime: { type: "runtime", required: false },
+      backend_runtime: { type: "runtime", required: false },
+      frontend_runtime: { type: "runtime", required: false },
+      default_runtime: { type: "runtime", required: false },
+    },
+    start: [
+      { kind: "manual" },
+      { kind: "cli" },
+      { kind: "http" },
+      { kind: "uds" },
+      { kind: "native_tool" },
+      { kind: "schedule" },
+    ],
+    last_run: loopRunFixture("looprun_running"),
+    aggregate_30d: { runs: 42, succeeded: 38, failed: 4 },
+    success_rate_30d: 0.9,
+  },
+  {
+    name: "review-and-fix",
+    source: "marketplace",
+    version: 0,
+    description:
+      "Review a named task with an agent, write inspectable findings, and remediate them until a round comes back clean.",
+    catalog: {
+      category: "Engineering",
+      use_when:
+        "You want the work on a task reviewed by an agent and every finding remediated until a round comes back clean.",
+      keywords: ["reviews", "agents", "artifacts", "remediate"],
+    },
+    contract: reviewContract,
+    inputs: {
+      task_name: { type: "string", required: true },
+      reviewer: { type: "agent", required: false, default: "reviewer" },
+      fixer: { type: "agent", required: false, default: "review_fixer" },
+      auto_commit: { type: "boolean", required: false, default: false },
+    },
+    start: [
+      { kind: "manual" },
+      { kind: "cli" },
+      { kind: "http" },
+      { kind: "uds" },
+      { kind: "native_tool" },
+      { kind: "trigger" },
+      { kind: "webhook" },
+    ],
+    last_run: loopRunFixture("looprun_review_running"),
+    aggregate_30d: { runs: 9, succeeded: 9, failed: 0 },
+    success_rate_30d: 1,
+  },
+];
+
+function buildDefinition(entry: LoopCatalogEntry): LoopDefinition {
+  return {
+    apiVersion: "compozy.loop/v1",
+    kind: "Loop",
+    meta: {
+      name: entry.name,
+      description: entry.description,
+      version: entry.version,
+      catalog: entry.catalog,
+    },
+    contract: entry.contract,
+    concurrency: entry.name === "quality-gate-demo" ? undefined : "forbid",
+    graph: graphByName[entry.name] ?? fixtureGraph([], []),
+    inputs: entry.inputs,
+    start: entry.start,
+  };
+}
+
+export const loopDetailFixtures: LoopDetail[] = loopCatalogFixtures.map(entry => ({
+  name: entry.name,
+  source: entry.source,
+  version: entry.version,
+  description: entry.description,
+  catalog: entry.catalog,
+  definition: buildDefinition(entry),
+  effective_lifecycle: heroEffectiveLifecycle,
+}));
+
+export const qualityGateDetail: LoopDetail = {
+  name: "quality-gate-demo",
+  source: "workspace",
+  version: 4,
+  description: "Exercise generic gate states in stories and tests.",
+  catalog: {
+    category: "Testing",
+    use_when: "You need a custom Loop fixture that exercises gate controls.",
+    keywords: ["gates", "review", "approval"],
+  },
+  definition: {
+    apiVersion: "compozy.loop/v1",
+    kind: "Loop",
+    meta: {
+      name: "quality-gate-demo",
+      description: "Exercise generic gate states in stories and tests.",
+      version: 4,
+      catalog: {
+        category: "Testing",
+        use_when: "You need a custom Loop fixture that exercises gate controls.",
+        keywords: ["gates", "review", "approval"],
+      },
+    },
+    contract: qualityGateContract,
+    graph: qualityGateGraph,
+    inputs: {
+      goal: { type: "string", required: true, description: "What to accomplish." },
+      max_files: { type: "number", required: false, default: 20 },
+    },
+    start: [
+      { kind: "manual" },
+      { kind: "cli" },
+      { kind: "http" },
+      { kind: "uds" },
+      { kind: "native_tool" },
+      { kind: "schedule" },
+    ],
+  },
+  effective_lifecycle: heroEffectiveLifecycle,
+};
+
+export const loopDetailByName = new Map(
+  [...loopDetailFixtures, qualityGateDetail].map(detail => [detail.name, detail])
+);
+
+export const loopRunDetailFixtures = buildLoopRunDetailFixtures(loopRunFixtures, loopDetailByName);
+
+export const loopRunDetailByRunId = new Map(
+  loopRunDetailFixtures.map(detail => [detail.run.id, detail])
+);
+
+// Settings and canvas annotations answer a different question from the runs
+// above, and live in their own file. Re-exported so every existing consumer of
+// this barrel keeps working.
+export {
+  loopAnnotationsFixture,
+  loopConfigFixture,
+  loopEffectiveConfigFixture,
+} from "./fixtures-config";

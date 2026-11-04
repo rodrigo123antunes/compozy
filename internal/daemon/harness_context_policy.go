@@ -1,0 +1,73 @@
+package daemon
+
+import "github.com/compozy/compozy/internal/session"
+
+func (r *HarnessContextResolver) resolveSections(sessionCtx HarnessSessionContext) []HarnessPromptSection {
+	sections := make([]HarnessPromptSection, 0, 6)
+	if r.runtime.RuntimeIdentityPromptSectionEnabled {
+		sections = append(sections, HarnessPromptSectionRuntimeIdentity)
+	}
+	if r.runtime.SituationPromptSectionEnabled && !inputOnlyHarnessRole(sessionCtx.SpawnRole) {
+		sections = append(sections, HarnessPromptSectionSituation)
+	}
+	if r.runtime.SkillsPromptSectionEnabled && !inputOnlyHarnessRole(sessionCtx.SpawnRole) {
+		sections = append(sections, HarnessPromptSectionSkills)
+	}
+	if r.runtime.ToolsPromptSectionEnabled && !inputOnlyHarnessRole(sessionCtx.SpawnRole) {
+		sections = append(sections, HarnessPromptSectionTools)
+	}
+	return sections
+}
+
+func (r *HarnessContextResolver) resolveAugmenters(
+	surface ResolutionSurface,
+	sessionCtx HarnessSessionContext,
+	turnCtx HarnessTurnContext,
+) []HarnessAugmenter {
+	if surface != ResolutionSurfaceTurn {
+		return nil
+	}
+	augmenters := make([]HarnessAugmenter, 0, 4)
+	if r.runtime.SkillsAugmenter && !inputOnlyHarnessRole(sessionCtx.SpawnRole) {
+		augmenters = append(augmenters, HarnessAugmenterSkills)
+	}
+	if turnCtx.Origin != TurnOriginUser {
+		return augmenters
+	}
+	if r.runtime.SituationAugmenter && !inputOnlyHarnessRole(sessionCtx.SpawnRole) {
+		augmenters = append(augmenters, HarnessAugmenterSituation)
+	}
+	return augmenters
+}
+
+func (r *HarnessContextResolver) resolveReentry(turnCtx HarnessTurnContext) ReentryMode {
+	if turnCtx.Origin == TurnOriginSynthetic {
+		return ReentryModeSynthetic
+	}
+	return ReentryModeNone
+}
+
+func (r *HarnessContextResolver) resolveDetachedRunMode(
+	sessionCtx HarnessSessionContext,
+	turnCtx HarnessTurnContext,
+) DetachedRunMode {
+	if !r.runtime.DetachedTaskRuntimeEnabled {
+		return DetachedRunModeNone
+	}
+	if turnCtx.Detached == nil {
+		return DetachedRunModeNone
+	}
+	if sessionCtx.SessionClass == SessionClassSystem {
+		return DetachedRunModeTaskRuntime
+	}
+	return DetachedRunModeNone
+}
+
+func inputOnlyHarnessRole(role string) bool {
+	switch role {
+	case session.SpawnRoleAutoTitle:
+		return true
+	default:
+		return false
+	}
+}

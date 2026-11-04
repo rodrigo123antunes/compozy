@@ -1,0 +1,173 @@
+import { render, screen } from "@testing-library/react";
+import { describe, expect, it, vi } from "vitest";
+
+vi.mock("@tanstack/react-router", async importOriginal => {
+  const actual = await importOriginal<typeof import("@tanstack/react-router")>();
+  return {
+    ...actual,
+    Link: ({ to, params, children, ...props }: Record<string, unknown>) => (
+      <a
+        href={typeof to === "string" ? to : "#"}
+        data-params={JSON.stringify(params)}
+        {...(props as Record<string, unknown>)}
+      >
+        {children as React.ReactNode}
+      </a>
+    ),
+  };
+});
+
+const { TaskCard: TaskCardRow } = await import("../task-card");
+
+// Rows render inside the Tasks table body.
+function TaskCard(props: React.ComponentProps<typeof TaskCardRow>) {
+  return (
+    <table>
+      <tbody>
+        <TaskCardRow {...props} />
+      </tbody>
+    </table>
+  );
+}
+type TaskListItem = import("../../types").TaskListItem;
+
+function buildTask(overrides: Partial<TaskListItem> = {}): TaskListItem {
+  return {
+    id: "task_001",
+    title: "Summarize feedback",
+    identifier: "TASK-1",
+    status: "in_progress",
+    scope: "workspace",
+    origin: { kind: "web", ref: "op" },
+    created_at: "2026-04-11T09:00:00Z",
+    updated_at: "2026-04-11T09:00:00Z",
+    created_by: { kind: "human", ref: "op" },
+    owner: { kind: "agent_session", ref: "Coder" },
+    priority: "high",
+    child_count: 2,
+    dependency_count: 1,
+    active_run: {
+      id: "run_001",
+      task_id: "task_001",
+      attempt: 2,
+      max_attempts: 3,
+      status: "running",
+      queued_at: "2026-04-11T09:00:00Z",
+    },
+    ...overrides,
+  } as TaskListItem;
+}
+
+describe("TaskCard", () => {
+  it("Should render enriched task data inline through the meta slot", () => {
+    const { container } = render(<TaskCard task={buildTask()} />);
+
+    expect(screen.getByTestId("task-card-task_001")).toBeInTheDocument();
+    expect(screen.getByText("TASK-1")).toBeInTheDocument();
+    expect(screen.getByText("Summarize feedback")).toBeInTheDocument();
+    expect(screen.getByRole("img", { name: "Coder" })).toBeInTheDocument();
+    expect(screen.getByTestId("task-card-owner-task_001")).toContainElement(
+      screen.getByRole("img", { name: "Coder" })
+    );
+    expect(screen.getByTestId("task-card-attempt-task_001")).toHaveTextContent("attempt 2 of 3");
+    expect(screen.getByTestId("task-card-children-task_001")).toHaveTextContent("2 subtasks");
+    expect(screen.getByTestId("task-card-deps-task_001")).toHaveTextContent("Waits on 1 task");
+    expect(container.querySelector('[data-slot="state-glyph"]')).toHaveAttribute(
+      "data-state",
+      "running"
+    );
+    expect(screen.getByText("In progress")).toBeInTheDocument();
+    expect(screen.getByText("High")).toBeInTheDocument();
+  });
+
+  it("Should link the main region to /tasks/$id", () => {
+    render(<TaskCard task={buildTask()} />);
+
+    const link = screen.getByRole("link", { name: "Open Summarize feedback" });
+    expect(link).toHaveAttribute("href", "/tasks/$id");
+    expect(link).toHaveAttribute("data-params", JSON.stringify({ id: "task_001" }));
+  });
+
+  it("Should render the failed-run error inline in the meta row (no inline retry button)", () => {
+    render(
+      <TaskCard
+        task={buildTask({
+          status: "failed",
+          active_run: {
+            resolved_worktree_mode: "none",
+            id: "run_002",
+            task_id: "task_001",
+            attempt: 3,
+            max_attempts: 3,
+            recovery_count: 0,
+            status: "failed",
+            queued_at: "2026-04-11T09:00:00Z",
+            error: "rate-limited by upstream",
+          },
+        })}
+      />
+    );
+
+    expect(screen.getByTestId("task-card-error-task_001")).toHaveTextContent(
+      "rate-limited by upstream"
+    );
+    expect(screen.queryByTestId("task-card-retry-task_001")).not.toBeInTheDocument();
+  });
+
+  it("Should not render a publish button on draft rows (publish lives on the detail header)", () => {
+    render(<TaskCard task={buildTask({ status: "draft", draft: true, active_run: null })} />);
+    expect(screen.queryByTestId("task-card-publish-task_001")).not.toBeInTheDocument();
+  });
+
+  it("Should name a blocked task in its status column with the attention glyph", () => {
+    const { container } = render(
+      <TaskCard task={buildTask({ status: "blocked", active_run: null })} />
+    );
+    expect(screen.getByTestId("task-card-task_001")).toHaveAttribute("data-status", "blocked");
+    expect(screen.getByText("Blocked")).toBeInTheDocument();
+    expect(container.querySelector('[data-slot="state-glyph"]')).toHaveAttribute(
+      "data-state",
+      "attention"
+    );
+  });
+
+  it("Should carry needs_attention as its own truthful status, distinct from blocked", () => {
+    render(<TaskCard task={buildTask({ status: "needs_attention", active_run: null })} />);
+
+    expect(screen.getByTestId("task-card-task_001")).toHaveAttribute(
+      "data-status",
+      "needs_attention"
+    );
+    expect(screen.getByText("Needs attention")).toBeInTheDocument();
+    expect(screen.queryByText("Blocked")).not.toBeInTheDocument();
+  });
+
+  // Loop execution records leave the default listing entirely and render through
+  // TaskLoopRow when revealed; their identity + attempt contract is owned by
+  // `tasks-list-row.test.tsx`.
+  it("Should delegate a Loop execution record to the revealed loop row", () => {
+    const { container } = render(
+      <TaskCard
+        task={buildTask({
+          id: "loop.looprun-8f3ab2c1d4e5f607.g1.node.revisor-perf.0",
+          identifier: undefined,
+          active_run: null,
+          loop: {
+            role: "cell",
+            run_id: "looprun-8f3ab2c1d4e5f607",
+            loop_name: "revisao-paralela",
+            generation: 1,
+            node_id: "revisor-perf",
+          },
+        })}
+      />
+    );
+
+    // Asserted through what an operator sees rather than through slot names: the
+    // record reads as its Loop provenance and links to the run, which is the
+    // routing decision this case owns.
+    expect(screen.getByRole("link")).toHaveAttribute("href", "/loop-runs/$runId");
+    expect(container).toHaveTextContent("revisao-paralela · round 1 · step revisor-perf");
+    expect(container.querySelector('[data-slot="tasks-list-row"]')).toBeNull();
+  });
+});

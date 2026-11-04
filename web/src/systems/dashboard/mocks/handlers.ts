@@ -1,16 +1,28 @@
-import { http, HttpResponse, type HttpHandler } from "msw";
+import { HttpResponse, type HttpHandler } from "msw";
+import { compozyApiMock } from "@/storybook/openapi-msw";
 
-import type { DashboardPayload } from "../types";
-import { dashboardFixture } from "./fixtures";
+import { activityEntriesFixture, activityRollupFixture } from "./activity-fixtures";
+import { homeActivityFixture, homeOverviewFixture } from "./fixtures";
 
-export interface DashboardHandlerOptions {
-  dashboard?: DashboardPayload;
-}
-
-export function createDashboardHandlers(options: DashboardHandlerOptions = {}): HttpHandler[] {
-  const dashboard = options.dashboard ?? dashboardFixture;
-
-  return [http.get("/api/ui/dashboard", () => HttpResponse.json({ dashboard }))];
-}
-
-export const handlers = createDashboardHandlers();
+export const handlers: HttpHandler[] = [
+  compozyApiMock.get("/api/observe/overview", () =>
+    HttpResponse.json({ overview: homeOverviewFixture })
+  ),
+  compozyApiMock.get("/api/permissions/rollup", ({ request }) =>
+    HttpResponse.json(
+      activityRollupFixture(new URL(request.url).searchParams.get("unattended") === "true")
+    )
+  ),
+  compozyApiMock.get("/api/permissions", ({ request }) =>
+    HttpResponse.json({
+      entries: activityEntriesFixture(
+        new URL(request.url).searchParams.get("unattended") === "true"
+      ),
+    })
+  ),
+  compozyApiMock.get("/api/logs", ({ request }) => {
+    const limit = Number(new URL(request.url).searchParams.get("limit"));
+    const events = limit > 0 ? homeActivityFixture.slice(0, limit) : homeActivityFixture;
+    return HttpResponse.json({ events });
+  }),
+];

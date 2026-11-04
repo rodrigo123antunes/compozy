@@ -1,0 +1,124 @@
+package contextusage
+
+import (
+	"time"
+
+	"github.com/compozy/compozy/internal/store"
+)
+
+type UsageEvent struct {
+	Sequence int64
+	At       time.Time
+	TurnID   string
+	Usage    store.TokenUsage
+}
+
+type Delivery struct {
+	Sequence int64
+	At       time.Time
+	SentAt   time.Time
+	TurnID   string
+	Estimate string
+	Spans    []Span
+}
+
+type Span struct {
+	Key, Kind, Delivery, Name             string
+	Bytes                                 int64
+	Tokens                                *int64
+	Unchanged, StartupDedup, HookModified bool
+}
+
+type ContextAfter struct {
+	Used     int64
+	Size     *int64
+	Sequence int64
+}
+
+type ClearedBy struct {
+	CompactionID string
+	Sequence     int64
+}
+
+type Compaction struct {
+	ContextAfter *ContextAfter
+	Sequence     int64
+	At           time.Time
+	TurnID       string
+	CompactionID string
+	Trigger      string
+	Status       string
+	Used, Size   *int64
+}
+
+type SettledTurn struct {
+	TurnID   string
+	Sequence int64
+}
+
+type Input struct {
+	WorkTime           WorkTime
+	UsageEvents        []UsageEvent
+	Deliveries         []Delivery
+	Compactions        []Compaction
+	Settled            *SettledTurn
+	CatalogWindow      *int64
+	CompactionBoundary *int64
+	ClearedBy          *ClearedBy
+	Available          bool
+}
+
+type WorkTime struct {
+	ActiveDurationMS    int64
+	TurnCount           int64
+	LastCompletedTurnID string
+}
+
+type State string
+
+const (
+	StateReported      State = "reported"
+	StateEstimatedSize State = "estimated_size"
+	StateUnknown       State = "unknown"
+	StateUnavailable   State = "unavailable"
+)
+
+type ContextUsage struct {
+	State          State
+	Used, Size     *int64
+	Ratio          *float64
+	SizeSource     string
+	Stale          *bool
+	Sequence       *int64
+	ReportedTurnID string
+	ReportedAt     *time.Time
+	Injected       *Injected
+	ClearedBy      *ClearedBy
+}
+
+type Injected struct {
+	Estimate string
+	Tokens   int64
+	Stale    bool
+	Rows     []Row
+}
+
+type Row struct {
+	Key, Label, Kind, Delivery, Name string
+	OwnerKind                        string
+	Bytes                            int64
+	Tokens                           *int64
+	DeliveredTurnID                  string
+	DeliverySequence                 int64
+	SentAt                           time.Time
+	LastSeenTurnID                   string
+	Unchanged, Stale, HookModified   bool
+}
+
+type Turn struct {
+	TurnID        string
+	Sequence      int64
+	Usage         *store.TokenUsage
+	UsageSequence *int64
+	Injected      *Delivery
+}

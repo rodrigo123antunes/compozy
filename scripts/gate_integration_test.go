@@ -1,0 +1,889 @@
+//go:build integration
+
+package scripts
+
+import (
+	"encoding/json"
+	"errors"
+	"os"
+	"os/exec"
+	"path/filepath"
+	"strconv"
+	"strings"
+	"testing"
+	"time"
+)
+
+func TestGateEvidenceBehavior(t *testing.T) {
+	t.Parallel()
+
+	// Keep each case's Git state isolated while paying seed initialization once.
+	template := newGateTestRepo(t)
+	newRepo := func(t *testing.T) string {
+		t.Helper()
+		repo := t.TempDir()
+		if err := os.CopyFS(repo, os.DirFS(template)); err != nil {
+			t.Fatalf("copy gate repository fixture: %v", err)
+		}
+		return repo
+	}
+
+	for _, mode := range []struct{ command, target string }{
+		{command: "codegen", target: "codegen-check"},
+		{command: "generate", target: "codegen"},
+	} {
+		t.Run(
+			"Should reuse "+mode.command+" evidence only while sources and artifacts remain valid",
+			func(t *testing.T) {
+				t.Parallel()
+
+				repo := newRepo(t)
+				callsPath := filepath.Join(t.TempDir(), "codegen-calls")
+				write := func(name, content string) {
+					t.Helper()
+					if err := os.WriteFile(filepath.Join(repo, name), []byte(content), 0o644); err != nil {
+						t.Fatalf("write %s: %v", name, err)
+					}
+				}
+				write(".gitignore", "/.cache/\n")
+				write("go.mod", "module fixture\n\ngo 1.26.0\n")
+				goFlags := ""
+				write("generated.txt", "seed\n")
+				write(
+					"Makefile",
+					mode.target+":\n\t@echo check >> \"$$GATE_TEST_CALLS\"\n\t@cmp seed.txt generated.txt\n",
+				)
+				check := func(wantCalls int, wantFailure bool) {
+					t.Helper()
+					output, err := runGate(
+						t,
+						repo,
+						[]string{"GATE_TEST_CALLS=" + callsPath, "GOFLAGS=" + goFlags},
+						mode.command,
+					)
+					if (err != nil) != wantFailure {
+						t.Fatalf("codegen error = %v, want failure %t; output:\n%s", err, wantFailure, output)
+					}
+					calls := strings.Fields(readFile(t, callsPath))
+					if len(calls) != wantCalls {
+						t.Fatalf("codegen invocations = %d, want %d; output:\n%s", len(calls), wantCalls, output)
+					}
+				}
+
+				check(1, false)
+				check(1, false)
+				write("generated.txt", "drift\n")
+				check(2, true)
+				check(3, true)
+				write("generated.txt", "seed\n")
+				check(4, false)
+				check(4, false)
+				if err := os.Remove(filepath.Join(repo, "generated.txt")); err != nil {
+					t.Fatalf("remove generated artifact: %v", err)
+				}
+				check(5, true)
+				write("generated.txt", "seed\n")
+				write("seed.txt", "changed source\n")
+				check(6, true)
+				write("generated.txt", "changed source\n")
+				check(7, false)
+				check(7, false)
+				goFlags = "-tags=changed_codegen_context"
+				check(8, false)
+				check(8, false)
+			},
+		)
+	}
+
+	t.Run("Should fail the lane when tee cannot capture its log", func(t *testing.T) {
+		t.Parallel()
+
+		repo := newRepo(t)
+		fakeBin := t.TempDir()
+		callsPath := filepath.Join(t.TempDir(), "make-calls")
+		writeExecutable(t, fakeBin, "make", `#!/bin/sh
+printf '%s\n' "$*" >> "$GATE_TEST_CALLS"
+exit 0
+`)
+		writeExecutable(t, fakeBin, "tee", `#!/bin/sh
+cat >/dev/null
+exit 23
+`)
+
+		output, err := runGate(t, repo, []string{
+			"GATE_TEST_CALLS=" + callsPath,
+			"PATH=" + fakeBin + ":" + os.Getenv("PATH"),
+		}, "full")
+		if err == nil {
+			t.Fatalf("expected tee failure, output:\n%s", output)
+		}
+
+		exitErr, exitErrMatched := errors.AsType[*exec.ExitError](err)
+		if !exitErrMatched {
+			t.Fatalf("expected gate exit error, got %T: %v", err, err)
+		}
+		if exitErr.ExitCode() != 23 {
+			t.Fatalf("expected tee exit code 23, got %d; output:\n%s", exitErr.ExitCode(), output)
+		}
+
+		record := readFile(t, filepath.Join(repo, ".cache", "gate", "full.json"))
+		if !strings.Contains(record, `"result": "fail"`) {
+			t.Fatalf("expected failed evidence record, got:\n%s", record)
+		}
+		if strings.Contains(record, `"result": "pass"`) {
+			t.Fatalf("tee failure must not produce passing evidence, got:\n%s", record)
+		}
+	})
+
+	t.Run("Should fail safely when no merge base is usable", func(t *testing.T) {
+		t.Parallel()
+
+		repo := newRepo(t)
+		fakeBin := t.TempDir()
+		callsPath := filepath.Join(t.TempDir(), "make-calls")
+		writeExecutable(t, fakeBin, "make", `#!/bin/sh
+printf '%s\n' "$*" >> "$GATE_TEST_CALLS"
+exit 0
+`)
+
+		output, err := runGate(t, repo, []string{
+			"GATE_BASE=refs/heads/missing-gate-base",
+			"GATE_TEST_CALLS=" + callsPath,
+			"PATH=" + fakeBin + ":" + os.Getenv("PATH"),
+		}, "auto")
+		if err == nil {
+			t.Fatalf("expected classification failure without a merge base; output:\n%s", output)
+		}
+		if !strings.Contains(output, "no usable merge base") {
+			t.Fatalf("expected explicit merge-base reason, got:\n%s", output)
+		}
+		if !strings.Contains(output, "cannot classify the local gate") {
+			t.Fatalf("expected actionable classification error, got:\n%s", output)
+		}
+		calls, readErr := os.ReadFile(callsPath)
+		if readErr != nil && !os.IsNotExist(readErr) {
+			t.Fatalf("read gate calls: %v", readErr)
+		}
+		if strings.Contains(string(calls), "verify") {
+			t.Fatalf("missing merge base must not invoke local full verification; calls:\n%s", calls)
+		}
+	})
+
+	t.Run("Should keep sensitive config changes in local scoped lanes", func(t *testing.T) {
+		t.Parallel()
+
+		repo := newRepo(t)
+		writeConfigChange(t, repo)
+
+		fakeBin := t.TempDir()
+		callsPath := filepath.Join(t.TempDir(), "gate-calls")
+		writeExecutable(t, fakeBin, "make", `#!/bin/sh
+printf 'make %s\n' "$*" >> "$GATE_TEST_CALLS"
+exit 0
+`)
+		writeExecutable(t, fakeBin, "go", `#!/bin/sh
+printf 'go %s\n' "$*" >> "$GATE_TEST_CALLS"
+exit 0
+`)
+
+		output, err := runGate(t, repo, []string{
+			"GATE_TEST_CALLS=" + callsPath,
+			"PATH=" + fakeBin + ":" + os.Getenv("PATH"),
+		}, "auto")
+		if err != nil {
+			t.Fatalf("expected scoped gate to succeed: %v\n%s", err, output)
+		}
+		calls := readFile(t, callsPath)
+		if strings.Contains(calls, "make verify") {
+			t.Fatalf("sensitive change must not invoke the local full gate; calls:\n%s", calls)
+		}
+		if !strings.Contains(calls, "make go-lint") {
+			t.Fatalf("expected scoped Go lint lane; calls:\n%s", calls)
+		}
+		if !strings.Contains(calls, "go test -race") || !strings.Contains(calls, "./internal/config/...") {
+			t.Fatalf("expected scoped config race tests; calls:\n%s", calls)
+		}
+		if !strings.Contains(calls, "-timeout 45m") {
+			t.Fatalf("expected contention-safe Go test timeout; calls:\n%s", calls)
+		}
+		if !strings.Contains(output, "PR CI") {
+			t.Fatalf("expected delegated full-gate ownership in output; got:\n%s", output)
+		}
+	})
+
+	t.Run("Should collapse redundant Go scopes when the whole module is required", func(t *testing.T) {
+		t.Parallel()
+
+		repo := newRepo(t)
+		packageDir := filepath.Join(repo, "internal", strings.Repeat("wide-scope-", 20))
+		if err := os.MkdirAll(packageDir, 0o755); err != nil {
+			t.Fatalf("create package directory: %v", err)
+		}
+		for index := range 1024 {
+			path := filepath.Join(packageDir, "source"+strconv.Itoa(index)+".go")
+			if err := os.WriteFile(path, []byte("package fixture\n"), 0o644); err != nil {
+				t.Fatalf("write package source: %v", err)
+			}
+		}
+		runCommand(t, repo, "git", "add", "internal")
+		runCommand(t, repo, "git", "-c", "user.name=Gate Test", "-c", "user.email=gate-test@example.com",
+			"commit", "--quiet", "-m", "seed package")
+		if err := os.RemoveAll(packageDir); err != nil {
+			t.Fatalf("remove package directory: %v", err)
+		}
+		writeConfigChange(t, repo)
+		if err := os.WriteFile(
+			filepath.Join(repo, "go.mod"),
+			[]byte("module gate.test\n\ngo 1.26\n"),
+			0o644,
+		); err != nil {
+			t.Fatalf("write module change: %v", err)
+		}
+
+		output, err := runGate(t, repo, nil, "plan")
+		if err != nil {
+			t.Fatalf("plan: %v\n%s", err, output)
+		}
+		if !strings.Contains(output, "[gate] go scopes: ./... \n") {
+			t.Fatalf("expected whole-module scope, got:\n%s", output)
+		}
+		if !strings.Contains(output, "COMPOZY_GO_LINT_SCOPES='./... '") || strings.Contains(output, "Broken pipe") {
+			t.Fatalf("whole-module scope must subsume all package scopes without pipe errors, got:\n%s", output)
+		}
+	})
+
+	t.Run("Should preserve the fingerprint after committing identical content", func(t *testing.T) {
+		t.Parallel()
+
+		repo := newRepo(t)
+		if err := os.WriteFile(filepath.Join(repo, "seed.txt"), []byte("updated\n"), 0o644); err != nil {
+			t.Fatalf("update repository seed: %v", err)
+		}
+
+		before, err := runGate(t, repo, nil, "fingerprint")
+		if err != nil {
+			t.Fatalf("fingerprint before commit: %v\n%s", err, before)
+		}
+		runCommand(t, repo, "git", "add", "seed.txt")
+		runCommand(
+			t,
+			repo,
+			"git",
+			"-c",
+			"user.name=Gate Test",
+			"-c",
+			"user.email=gate-test@example.com",
+			"commit",
+			"--quiet",
+			"-m",
+			"update seed",
+		)
+		after, err := runGate(t, repo, nil, "fingerprint")
+		if err != nil {
+			t.Fatalf("fingerprint after commit: %v\n%s", err, after)
+		}
+		if before != after {
+			t.Fatalf("fingerprint changed after content-identical commit: before %q, after %q", before, after)
+		}
+	})
+
+	t.Run("Should rerun a passing lane when its evidence log is missing", func(t *testing.T) {
+		t.Parallel()
+
+		repo := newRepo(t)
+		fakeBin := t.TempDir()
+		callsPath := filepath.Join(t.TempDir(), "make-calls")
+		writeExecutable(t, fakeBin, "make", `#!/bin/sh
+printf '%s\n' "$*" >> "$GATE_TEST_CALLS"
+exit 0
+`)
+		env := []string{
+			"GATE_TEST_CALLS=" + callsPath,
+			"PATH=" + fakeBin + ":" + os.Getenv("PATH"),
+		}
+
+		if output, err := runGate(t, repo, env, "full"); err != nil {
+			t.Fatalf("first full lane: %v\n%s", err, output)
+		}
+		record := readFile(t, filepath.Join(repo, ".cache", "gate", "full.json"))
+		logPath := jsonRecordField(t, record, "log")
+		if err := os.Remove(filepath.Join(repo, logPath)); err != nil {
+			t.Fatalf("remove evidence log: %v", err)
+		}
+		if output, err := runGate(t, repo, env, "full"); err != nil {
+			t.Fatalf("second full lane: %v\n%s", err, output)
+		}
+		calls := strings.Fields(readFile(t, callsPath))
+		if len(calls) != 2 {
+			t.Fatalf("expected missing log to force two make invocations, got %d: %v", len(calls), calls)
+		}
+	})
+
+	t.Run("Should classify every sensitive surface without a local full gate", func(t *testing.T) {
+		t.Parallel()
+
+		cases := []struct {
+			path string
+			want string
+		}{
+			{path: "catalog/extensions.json", want: "catalog lanes"},
+			{path: "catalog/packages/herdr-bridge/README.md", want: "catalog lanes"},
+			{path: "catalog/packages/herdr-bridge/bridge.py", want: "catalog lanes"},
+			{path: "catalog/artifacts/herdr-bridge-v0.3.3.tar.gz", want: "catalog lanes"},
+			{path: "go.mod", want: "go scopes: ./..."},
+			{path: ".goreleaser.yml", want: "go scopes: ./..."},
+			{path: "bun.lock", want: "js lane: all workspaces"},
+			{path: "patches/swr@2.5.1.patch", want: "js lane: all workspaces"},
+			{path: "Makefile", want: "tooling lanes"},
+			{path: ".air.toml", want: "go scopes: ./scripts/devreadiness"},
+			{path: "scripts/dev.sh", want: "go scopes: ./scripts/devreadiness"},
+			{path: "lint-plugins/ui-primitive-reuse.mjs", want: "js filters: ./lint-plugins"},
+			{path: "sdk/client/src/index.ts", want: "js filters: ./sdk/client"},
+			{path: "packages/ui/src/exports/shell.ts", want: "js filters: ./lint-plugins ./packages/ui"},
+			{path: "schema.sql", want: "codegen lane"},
+			{path: "openapi/schema.yaml", want: "codegen lane"},
+			{path: "packages/ui/src/tokens.css", want: "codegen lane"},
+			{path: "config.toml", want: "go scopes: ./..."},
+			{path: "extensions/spec-cycle/skills/example.md", want: "go scopes: ./extensions/..."},
+			{path: "skills/content.go", want: "go scopes: ./skills/..."},
+			{path: "desktop/schema/config.ts", want: "js filters: ./desktop"},
+			{path: "main.go", want: "go scopes: ./..."},
+			{path: "vitest.config.ts", want: "js lane: all workspaces"},
+			{path: ".vscode/tasks.json", want: "no-lane"},
+			{path: ".repoclone.rc", want: "no-lane"},
+			{path: "skills-lock.json", want: "no-lane"},
+			{path: "skeeper.lock", want: "no-lane"},
+			{path: "imgs/how-it-works-flow.svg", want: "would run: nothing (docs/instructions only)"},
+		}
+		for _, tc := range cases {
+			t.Run("Should classify "+tc.path, func(t *testing.T) {
+				t.Parallel()
+				repo := newRepo(t)
+				path := filepath.Join(repo, filepath.FromSlash(tc.path))
+				if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+					t.Fatalf("create parent: %v", err)
+				}
+				if err := os.WriteFile(path, []byte("changed\n"), 0o644); err != nil {
+					t.Fatalf("write changed file: %v", err)
+				}
+				output, err := runGate(t, repo, nil, "plan")
+				if err != nil {
+					t.Fatalf("plan: %v\n%s", err, output)
+				}
+				if strings.Contains(output, "make verify") {
+					t.Fatalf("sensitive path planned local full verification:\n%s", output)
+				}
+				if strings.Contains(output, "would stop:") {
+					t.Fatalf("known path was not safely classified:\n%s", output)
+				}
+				if strings.HasPrefix(tc.path, "catalog/") {
+					for _, command := range []string{
+						"would run: go run ./cmd/compozy-catalog validate ./catalog",
+						"would run: python3 -B -m unittest discover -s catalog/packages/herdr-bridge/tests -v",
+					} {
+						if !strings.Contains(output, command) {
+							t.Fatalf("catalog plan omitted %q:\n%s", command, output)
+						}
+					}
+				}
+				if !strings.Contains(output, tc.want) {
+					t.Fatalf("expected %q for %s, got:\n%s", tc.want, tc.path, output)
+				}
+			})
+		}
+	})
+
+	t.Run("Should select the owning Go lanes for nested module changes", func(t *testing.T) {
+		t.Parallel()
+		for _, module := range []string{
+			"sdk/go", "sdk/examples/notes-commands", "sdk/examples/clarify-tool",
+			"internal/extension/testdata/command-fixture-go",
+			"internal/extension/testdata/palette-fixture-go", "magefiles",
+		} {
+			for _, name := range []string{"main.go", "go.mod", "go.sum"} {
+				t.Run("Should classify "+module+"/"+name, func(t *testing.T) {
+					t.Parallel()
+					repo := newRepo(t)
+					dir := filepath.Join(repo, module)
+					if err := os.MkdirAll(dir, 0o755); err != nil {
+						t.Fatal(err)
+					}
+					if err := os.WriteFile(filepath.Join(dir, name), []byte("changed\n"), 0o644); err != nil {
+						t.Fatal(err)
+					}
+					output, err := runGate(t, repo, nil, "plan")
+					if err != nil {
+						t.Fatalf("plan: %v\n%s", err, output)
+					}
+					want := "COMPOZY_GO_LINT_SCOPES='./" + module + "/...' make go-lint"
+					if !strings.Contains(output, want) {
+						t.Fatalf("missing %q:\n%s", want, output)
+					}
+					switch {
+					case module == "magefiles":
+						want = "-tags=mage ./magefiles"
+					case strings.HasPrefix(module, "internal/"):
+						want = "make go-fixture-check GO_FIXTURE_MODULE=" + module
+						if strings.Contains(output, "./internal/extension/...") {
+							t.Fatalf("fixture selected unrelated extension tests:\n%s", output)
+						}
+					default:
+						want = "go -C " + module + " test -race"
+					}
+					if !strings.Contains(output, want) {
+						t.Fatalf("missing tests %q:\n%s", want, output)
+					}
+					if strings.Contains(output, "js filters:") || strings.Contains(output, "would stop:") {
+						t.Fatalf("Go-only change misclassified:\n%s", output)
+					}
+				})
+			}
+		}
+	})
+
+	t.Run("Should reuse root lint evidence for module and Mage lanes", func(t *testing.T) {
+		t.Parallel()
+		repo := newRepo(t)
+		for _, path := range []string{".golangci.yml", "sdk/go/main.go", "magefiles/main.go", "internal/extension/testdata/command-fixture-go/main.go"} {
+			dest := filepath.Join(repo, path)
+			if err := os.MkdirAll(filepath.Dir(dest), 0o755); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(dest, []byte("changed\n"), 0o644); err != nil {
+				t.Fatal(err)
+			}
+		}
+		fakeBin := t.TempDir()
+		calls := filepath.Join(t.TempDir(), "calls")
+		writeExecutable(t, fakeBin, "make", `#!/bin/sh
+printf '%s\n' "$*" >> "$GATE_TEST_CALLS"
+`)
+		writeExecutable(t, fakeBin, "go", "#!/bin/sh\nexit 0\n")
+		output, err := runGate(
+			t,
+			repo,
+			[]string{"PATH=" + fakeBin + ":" + os.Getenv("PATH"), "GATE_TEST_CALLS=" + calls},
+			"auto",
+		)
+		if err != nil {
+			t.Fatalf("gate: %v\n%s", err, output)
+		}
+		if got := strings.Count(readFile(t, calls), "go-lint"); got != 1 {
+			t.Fatalf("lint calls = %d, want 1:\n%s", got, output)
+		}
+		if !strings.Contains(readFile(t, calls), "go-fixture-check") {
+			t.Fatal("fixture build/vet was skipped with duplicate lint")
+		}
+		readRecord := func(id string) map[string]any {
+			t.Helper()
+			var record map[string]any
+			if err := json.Unmarshal(
+				[]byte(readFile(t, filepath.Join(repo, ".cache/gate", id+".json"))),
+				&record,
+			); err != nil {
+				t.Fatal(err)
+			}
+			return record
+		}
+		root := readRecord("go-lint")
+		for _, id := range []string{"sdk-go-lint", "mage-lint", "internal-extension-testdata-command-fixture-go-lint"} {
+			record := readRecord(id)
+			if record["result"] != "pass" || record["fingerprint"] != root["fingerprint"] ||
+				record["log"] != root["log"] {
+				t.Fatalf("%s evidence does not reference successful root lint: %v; root %v", id, record, root)
+			}
+		}
+	})
+
+	t.Run("Should verify recorded root scopes before reusing module lint evidence", func(t *testing.T) {
+		t.Parallel()
+		for _, tc := range []struct {
+			name, scope string
+			wantCalls   int
+		}{
+			{"Should run module lint after a narrow root run", "./internal/api/...", 2},
+			{"Should reuse a recorded full root run", "./...", 0},
+		} {
+			t.Run(tc.name, func(t *testing.T) {
+				t.Parallel()
+				repo := newRepo(t)
+				for _, path := range []string{".golangci.yml", "sdk/go/main.go", "magefiles/main.go", ".gitignore"} {
+					dest := filepath.Join(repo, path)
+					if err := os.MkdirAll(filepath.Dir(dest), 0o755); err != nil {
+						t.Fatal(err)
+					}
+					if err := os.WriteFile(dest, []byte("/.cache/\n"), 0o644); err != nil {
+						t.Fatal(err)
+					}
+				}
+				fingerprint, err := runGate(t, repo, nil, "fingerprint")
+				if err != nil {
+					t.Fatalf("fingerprint: %v\n%s", err, fingerprint)
+				}
+				logPath := filepath.Join(t.TempDir(), "root-lint.log")
+				if err := os.WriteFile(logPath, []byte("0 issues.\n"), 0o644); err != nil {
+					t.Fatal(err)
+				}
+				record := map[string]any{
+					"gate": "go-lint", "fingerprint": strings.TrimSpace(fingerprint), "result": "pass",
+					"command": "env COMPOZY_GO_LINT_SCOPES=" + tc.scope + "  make go-lint", "log": logPath,
+				}
+				data, err := json.MarshalIndent(record, "", "  ")
+				if err != nil {
+					t.Fatal(err)
+				}
+				recordDir := filepath.Join(repo, ".cache/gate")
+				if err := os.MkdirAll(recordDir, 0o755); err != nil {
+					t.Fatal(err)
+				}
+				if err := os.WriteFile(filepath.Join(recordDir, "go-lint.json"), data, 0o644); err != nil {
+					t.Fatal(err)
+				}
+				fakeBin := t.TempDir()
+				calls := filepath.Join(t.TempDir(), "calls")
+				if err := os.WriteFile(calls, nil, 0o644); err != nil {
+					t.Fatal(err)
+				}
+				writeExecutable(t, fakeBin, "make", `#!/bin/sh
+printf '%s %s\n' "$COMPOZY_GO_LINT_SCOPES" "$*" >> "$GATE_TEST_CALLS"
+`)
+				writeExecutable(t, fakeBin, "go", "#!/bin/sh\nexit 0\n")
+				output, err := runGate(
+					t,
+					repo,
+					[]string{"PATH=" + fakeBin + ":" + os.Getenv("PATH"), "GATE_TEST_CALLS=" + calls},
+					"auto",
+				)
+				if err != nil {
+					t.Fatalf("gate: %v\n%s", err, output)
+				}
+				if !strings.Contains(output, "SKIP go-lint") {
+					t.Fatalf("root record was not current:\n%s", output)
+				}
+				actualCalls := readFile(t, calls)
+				if got := strings.Count(actualCalls, "go-lint"); got != tc.wantCalls {
+					t.Fatalf("lint calls = %d, want %d:\n%s", got, tc.wantCalls, output)
+				}
+				for _, module := range []string{"sdk/go", "magefiles"} {
+					id := strings.ReplaceAll(module, "/", "-") + "-lint"
+					if module == "magefiles" {
+						id = "mage-lint"
+					}
+					var inherited map[string]any
+					if err := json.Unmarshal(
+						[]byte(readFile(t, filepath.Join(recordDir, id+".json"))),
+						&inherited,
+					); err != nil {
+						t.Fatal(err)
+					}
+					if tc.wantCalls == 0 {
+						if inherited["log"] != logPath {
+							t.Fatalf("full-scope evidence not reused for %s: %v", module, inherited)
+						}
+					} else if !strings.Contains(actualCalls, "./"+module+"/... go-lint") || inherited["log"] == logPath {
+						t.Fatalf(
+							"narrow evidence propagated to %s: calls %s, record %v",
+							module,
+							actualCalls,
+							inherited,
+						)
+					}
+				}
+			})
+		}
+	})
+
+	t.Run("Should route Go-only example assets to Go lanes", func(t *testing.T) {
+		t.Parallel()
+		repo := newRepo(t)
+		module := "sdk/examples/notes-commands"
+		dir := filepath.Join(repo, module)
+		if err := os.MkdirAll(dir, 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(
+			filepath.Join(dir, "go.mod"),
+			[]byte("module example\n\ngo 1.26.4\n"),
+			0o644,
+		); err != nil {
+			t.Fatal(err)
+		}
+		runCommand(t, repo, "git", "add", "sdk")
+		runCommand(
+			t,
+			repo,
+			"git",
+			"-c",
+			"user.name=Gate Test",
+			"-c",
+			"user.email=gate-test@example.com",
+			"commit",
+			"--quiet",
+			"-m",
+			"seed Go example",
+		)
+		if err := os.WriteFile(filepath.Join(dir, "template.html"), []byte("embedded template"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		output, err := runGate(t, repo, nil, "plan")
+		if err != nil {
+			t.Fatalf("plan: %v\n%s", err, output)
+		}
+		for _, want := range []string{"COMPOZY_GO_LINT_SCOPES='./" + module + "/...'", "go -C " + module + " test -race"} {
+			if !strings.Contains(output, want) {
+				t.Fatalf("missing %q:\n%s", want, output)
+			}
+		}
+		if strings.Contains(output, "js filters:") {
+			t.Fatalf("Go asset selected nonexistent JS package:\n%s", output)
+		}
+	})
+
+	t.Run("Should retain JavaScript lanes for a mixed SDK example", func(t *testing.T) {
+		t.Parallel()
+		repo := newRepo(t)
+		dir := filepath.Join(repo, "sdk/examples/notes-commands")
+		if err := os.MkdirAll(dir, 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(dir, "package.json"), []byte("{}"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		runCommand(t, repo, "git", "add", "sdk")
+		runCommand(
+			t,
+			repo,
+			"git",
+			"-c",
+			"user.name=Gate Test",
+			"-c",
+			"user.email=gate-test@example.com",
+			"commit",
+			"--quiet",
+			"-m",
+			"seed mixed example",
+		)
+		if err := os.WriteFile(filepath.Join(dir, "main.go"), []byte("package main"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		output, err := runGate(t, repo, nil, "plan")
+		if err != nil {
+			t.Fatalf("plan: %v\n%s", err, output)
+		}
+		for _, want := range []string{"js filters: ./sdk/examples/notes-commands", "COMPOZY_GO_LINT_SCOPES='./sdk/examples/notes-commands/...'"} {
+			if !strings.Contains(output, want) {
+				t.Fatalf("missing %q:\n%s", want, output)
+			}
+		}
+	})
+
+	t.Run("Should reject unknown assets before running classified lanes", func(t *testing.T) {
+		t.Parallel()
+
+		repo := newRepo(t)
+		if err := os.Mkdir(filepath.Join(repo, "imgs"), 0o755); err != nil {
+			t.Fatalf("create image directory: %v", err)
+		}
+		for _, path := range []string{".goreleaser.yml", "imgs/how-it-works-flow.svg", "imgs/unclassified.bin"} {
+			if err := os.WriteFile(
+				filepath.Join(repo, filepath.FromSlash(path)),
+				[]byte("changed\n"),
+				0o644,
+			); err != nil {
+				t.Fatalf("write changed file: %v", err)
+			}
+		}
+		fakeBin := t.TempDir()
+		callsPath := filepath.Join(t.TempDir(), "gate-calls")
+		for _, command := range []string{"make", "go"} {
+			writeExecutable(t, fakeBin, command, `#!/bin/sh
+printf '%s\n' "$*" >> "$GATE_TEST_CALLS"
+exit 0
+`)
+		}
+		output, err := runGate(t, repo, []string{
+			"GATE_TEST_CALLS=" + callsPath,
+			"PATH=" + fakeBin + ":" + os.Getenv("PATH"),
+		}, "auto")
+		if err == nil {
+			t.Fatalf("unknown asset must block the gate, output:\n%s", output)
+		}
+		if !strings.Contains(output, "unclassified: imgs/unclassified.bin") ||
+			!strings.Contains(output, "cannot safely classify 1 changed path(s)") {
+			t.Fatalf("expected only the unknown asset to block classification:\n%s", output)
+		}
+		if _, statErr := os.Stat(callsPath); !errors.Is(statErr, os.ErrNotExist) {
+			t.Fatalf("unknown asset must prevent lane execution, stat error = %v", statErr)
+		}
+	})
+
+	t.Run("Should wait for a machine capacity slot before running affected lanes", func(t *testing.T) {
+		t.Parallel()
+
+		repo := newRepo(t)
+		writeConfigChange(t, repo)
+		fakeBin := t.TempDir()
+		writeExecutable(t, fakeBin, "make", "#!/bin/sh\nexit 0\n")
+		writeExecutable(t, fakeBin, "go", "#!/bin/sh\nexit 0\n")
+		slotRoot := t.TempDir()
+		heldSlot := filepath.Join(slotRoot, "slot-1")
+		if err := os.Mkdir(heldSlot, 0o755); err != nil {
+			t.Fatalf("hold capacity slot: %v", err)
+		}
+		if err := os.WriteFile(
+			filepath.Join(heldSlot, "pid"),
+			[]byte(strconv.Itoa(os.Getpid())+"\n"),
+			0o644,
+		); err != nil {
+			t.Fatalf("write slot owner: %v", err)
+		}
+		released := make(chan error, 1)
+		go func() {
+			time.Sleep(1500 * time.Millisecond)
+			if err := os.Remove(filepath.Join(heldSlot, "pid")); err != nil {
+				released <- err
+				return
+			}
+			released <- os.Remove(heldSlot)
+		}()
+
+		output, err := runGate(t, repo, []string{
+			"COMPOZY_GATE_MAX_CONCURRENT=1",
+			"COMPOZY_GATE_SLOT_DIR=" + slotRoot,
+			"PATH=" + fakeBin + ":" + os.Getenv("PATH"),
+		}, "auto")
+		if releaseErr := <-released; releaseErr != nil {
+			t.Fatalf("release held capacity slot: %v", releaseErr)
+		}
+		if err != nil {
+			t.Fatalf("gate after capacity wait: %v\n%s", err, output)
+		}
+		if !strings.Contains(output, "waiting for one of 1 machine capacity slots") {
+			t.Fatalf("expected visible capacity wait, got:\n%s", output)
+		}
+	})
+}
+
+func writeConfigChange(t *testing.T, repo string) {
+	t.Helper()
+
+	configDir := filepath.Join(repo, "internal", "config")
+	if err := os.MkdirAll(configDir, 0o755); err != nil {
+		t.Fatalf("create config directory: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(configDir, "config.go"), []byte("package config\n"), 0o644); err != nil {
+		t.Fatalf("write config change: %v", err)
+	}
+}
+
+func newGateTestRepo(t *testing.T) string {
+	t.Helper()
+
+	repo := t.TempDir()
+	if err := os.Mkdir(filepath.Join(repo, "scripts"), 0o755); err != nil {
+		t.Fatalf("create scripts directory: %v", err)
+	}
+	gateSource, err := os.ReadFile("gate.sh")
+	if err != nil {
+		t.Fatalf("read gate script: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(repo, "scripts", "gate.sh"), gateSource, 0o755); err != nil {
+		t.Fatalf("write gate script: %v", err)
+	}
+	runtimeSource, err := os.ReadFile("gate_runtime.sh")
+	if err != nil {
+		t.Fatalf("read gate runtime support: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(repo, "scripts", "gate_runtime.sh"), runtimeSource, 0o755); err != nil {
+		t.Fatalf("write gate runtime support: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(repo, "seed.txt"), []byte("seed\n"), 0o644); err != nil {
+		t.Fatalf("write repository seed: %v", err)
+	}
+
+	runCommand(t, repo, "git", "init", "--quiet")
+	runCommand(t, repo, "git", "add", "scripts/gate.sh", "scripts/gate_runtime.sh", "seed.txt")
+	runCommand(
+		t,
+		repo,
+		"git",
+		"-c",
+		"user.name=Gate Test",
+		"-c",
+		"user.email=gate-test@example.com",
+		"commit",
+		"--quiet",
+		"-m",
+		"seed",
+	)
+	return repo
+}
+
+func writeExecutable(t *testing.T, directory, name, contents string) {
+	t.Helper()
+	if err := os.WriteFile(filepath.Join(directory, name), []byte(contents), 0o755); err != nil {
+		t.Fatalf("write fake %s: %v", name, err)
+	}
+}
+
+func runGate(t *testing.T, repo string, extraEnv []string, mode string) (string, error) {
+	t.Helper()
+	cmd := exec.CommandContext(t.Context(), "bash", "scripts/gate.sh", mode)
+	cmd.Dir = repo
+	cmd.Env = replaceEnv(os.Environ(), append([]string{
+		"GATE_BASE=HEAD",
+		"COMPOZY_GATE_SLOT_DIR=" + filepath.Join(repo, ".cache", "gate-test-slots"),
+	}, extraEnv...)...)
+	output, err := cmd.CombinedOutput()
+	return string(output), err
+}
+
+func replaceEnv(base []string, replacements ...string) []string {
+	values := make(map[string]string, len(base)+len(replacements))
+	for _, entry := range base {
+		key, _, _ := strings.Cut(entry, "=")
+		values[key] = entry
+	}
+	for _, entry := range replacements {
+		key, _, _ := strings.Cut(entry, "=")
+		values[key] = entry
+	}
+	result := make([]string, 0, len(values))
+	for _, entry := range values {
+		result = append(result, entry)
+	}
+	return result
+}
+
+func jsonRecordField(t *testing.T, record, field string) string {
+	t.Helper()
+	prefix := `"` + field + `": "`
+	start := strings.Index(record, prefix)
+	if start < 0 {
+		t.Fatalf("record field %q missing:\n%s", field, record)
+	}
+	value := record[start+len(prefix):]
+	end := strings.IndexByte(value, '"')
+	if end < 0 {
+		t.Fatalf("record field %q is unterminated:\n%s", field, record)
+	}
+	return value[:end]
+}
+
+func runCommand(t *testing.T, directory, name string, args ...string) {
+	t.Helper()
+	cmd := exec.CommandContext(t.Context(), name, args...)
+	cmd.Dir = directory
+	if output, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("run %s %s: %v\n%s", name, strings.Join(args, " "), err, output)
+	}
+}
+
+func readFile(t *testing.T, path string) string {
+	t.Helper()
+	contents, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read %s: %v", path, err)
+	}
+	return string(contents)
+}
